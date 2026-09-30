@@ -5834,9 +5834,11 @@ function Resolve-BRAVOArchiveSpaceDecision {
     #     Phase 0 §5.2/decision #5);
     #   - per-компонент ARCHIVE_DESTINATION (RequiresFreeSpace=true,
     #     RequirementGranularity=Entity, RequiredGB з уже обчисленого
-    #     Get-BRAVOArchiveEstimatedSpaceRequirement; компонент без валідної
-    #     історії свідомо залишає RequiredGB невідомим — bootstrap,
-    #     GroupRequirementState=Unknown, safe floor fallback).
+    #     Get-BRAVOArchiveEstimatedSpaceRequirement; з 5.2.4 компонент без
+    #     валідної історії несе вимогу з нестиснутого розміру джерела, і
+    #     RequiredGB лишається невідомим лише коли джерело виміряти не
+    #     вдалось — тоді GroupRequirementState=Unknown, safe floor fallback
+    #     BelowFallbackFloorNoEstimate).
     #
     # ВАЖЛИВО (5.2.4, замінює рішення reviewer #2 від 2026-08-30):
     # RequirementPolicy='ArchivePeakSafe'. MinimumFreeSpaceGB — захист
@@ -6607,7 +6609,9 @@ function Main {
     # Розрахункова перевірка поверх фіксованого порогу вище: скільки місця
     # реально потребує ЦЕЙ backup (за розміром останнього валідного архіву
     # кожного компонента + запас), а не лише "диск ОС не забитий впритул".
-    # Компонент без історії пропускається (bootstrap), не блокує прогін.
+    # Компонент без історії з 5.2.4 оцінюється доведеною верхньою межею з
+    # розміру джерела; без вимоги лишається лише компонент, джерело якого
+    # виміряти не вдалось.
     try {
         $archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement `
             -EnabledArchives $enabledArchives `

@@ -2,6 +2,23 @@
 
 ## Не випущено (developer)
 
+- **Документація: поріг здоров'я і операційна вимога у перевірці вільного місця (T026).**
+  README (розділ 3.3 і «Оновлення з 5.2.2 і раніше»), `OPERATIONS.md` (розділи
+  `40` і `60`) та `docs/MANUAL_RUN_CONSOLE_UX.md` досі описували поведінку 5.2.3:
+  нібито below-floor при достатній оцінці блокує архівацію
+  (`BelowFloorEstimateNotPeakSafe`), а компонент без історії пропускається
+  оцінкою. Тепер вони відповідають чинному коду: Archive викликає класифікатор з
+  `RequirementPolicy = 'ArchivePeakSafe'`, `MinimumFreeSpaceGB` для archive
+  destination — поріг здоров'я, і відома вимога, що вміщається в доступне місце,
+  дає `WARNING` `BelowHealthFloorButRequirementSatisfied` без блокування (код
+  `10`). Блокують (код `40`) `EstimatedRequirementNotMet` і
+  `BelowFallbackFloorNoEstimate` (вимогу визначити не вдалось, вільного менше за
+  поріг). Застарілі коментарі в `BRAVO.DiskSpace.psm1`,
+  `BRAVO.Archive.Runtime.ps1` і self-test виправлено; runtime-поведінка не
+  змінювалась. Нова перевірка `Documentation/ReadmeArchiveBelowFloorMatchesPeakSafePolicy`
+  витягує політику Archive, блокуючу below-floor політику та назви причин із
+  production-коду й падає, якщо README чи `OPERATIONS.md` розходяться з ними.
+
 - **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
   `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
   ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від

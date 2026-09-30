@@ -1091,35 +1091,80 @@
         -Name "Documentation/ReadmeNeverAdvisesDeletingManifest" `
         -Failure "README.md не повинен радити видаляти маніфест цілісності — це вимикає перевірку, а не усуває причину"
 
-    # T026: README (розділ про оновлення з 5.2.2) після 5.2.4 обіцяв, що
-    # below-floor при достатній оцінці БЛОКУЄ архівацію причиною
-    # BelowFloorEstimateNotPeakSafe. Так поводилась лише 5.2.3; з 5.2.4
-    # Resolve-BRAVOArchiveSpaceDecision передає класифікатору
-    # RequirementPolicy='ArchivePeakSafe', і той самий вхід дає WARNING
-    # BelowHealthFloorButRequirementSatisfied без блокування (Archive/A24).
-    # Застаріла обіцянка блоку штовхає оператора знижувати поріг або
-    # звільняти місце без потреби. Перевірка прив'язана до коду: вона
-    # вимагає правильного опису лише доки production-виклик Archive
-    # лишається на ArchivePeakSafe.
+    # T026: README (розділи 3.3 і «Оновлення з 5.2.2») та OPERATIONS.md
+    # (розділ 40, «Archive preflight») після 5.2.4 описували поведінку 5.2.3:
+    # below-floor при достатній оцінці нібито БЛОКУЄ архівацію причиною
+    # BelowFloorEstimateNotPeakSafe, а компонент без історії «пропускається»
+    # оцінкою. З 5.2.4 Resolve-BRAVOArchiveSpaceDecision передає
+    # класифікатору RequirementPolicy='ArchivePeakSafe', і відома вимога, що
+    # вміщається, дає WARNING BelowHealthFloorButRequirementSatisfied без
+    # блокування (Archive/A24). Застаріла обіцянка блоку штовхає оператора
+    # знижувати поріг або звільняти місце без потреби.
+    #
+    # Перевірка прив'язана до коду, а не до зафіксованих рядків: політику
+    # Archive, назву політики, яка блокує below-floor, і назви причин вона
+    # ВИТЯГУЄ з production-коду. Тож вона падає, якщо (а) Archive перейде на
+    # блокуючу політику, (б) у класифікаторі зміниться назва політики чи
+    # причини, а документація лишиться старою, або (в) документація
+    # розійдеться з кодом.
+    $diskSpaceModuleTextForDoc = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psm1"),
+        [Text.Encoding]::UTF8
+    )
     $archiveRuntimeTextForDiskSpaceDoc = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
         [Text.Encoding]::UTF8
     )
-    $archiveUsesPeakSafePolicy = [regex]::IsMatch(
-        $archiveRuntimeTextForDiskSpaceDoc,
-        "(?m)^\s*RequirementPolicy\s*=\s*'ArchivePeakSafe'\s*$"
+    $operationsTextForDiskSpaceDoc = [IO.File]::ReadAllText(
+        (Join-Path $root "OPERATIONS.md"),
+        [Text.Encoding]::UTF8
     )
+    # Рядки коментарів не враховуються: якір на початок рядка + лише пробіли.
+    $archivePolicyMatches = [regex]::Matches(
+        $archiveRuntimeTextForDiskSpaceDoc,
+        "(?m)^\s*RequirementPolicy\s*=\s*'([A-Za-z]+)'\s*$"
+    )
+    $archiveRequirementPolicy = if ($archivePolicyMatches.Count -eq 1) { $archivePolicyMatches[0].Groups[1].Value } else { $null }
+    $blockingBelowFloorMatch = [regex]::Match(
+        $diskSpaceModuleTextForDoc,
+        "if \(\`$RequirementPolicy -eq '([A-Za-z]+)'\) \{\s*\`$groupStatus = 'Error'; \`$groupBlocks = \`$true; \`$groupReason = '([A-Za-z]+)'"
+    )
+    $satisfiedBelowFloorMatches = [regex]::Matches(
+        $diskSpaceModuleTextForDoc,
+        "\`$groupStatus = 'Warning'; \`$groupBlocks = \`$false; \`$groupReason = '([A-Za-z]+)'"
+    )
+    $requirementNotMetMatches = [regex]::Matches(
+        $diskSpaceModuleTextForDoc,
+        "\`$groupStatus = 'Error'; \`$groupBlocks = \`$true; \`$groupReason = '(EstimatedRequirementNotMet)'"
+    )
+    $diskSpaceContractExtracted = (
+        -not [string]::IsNullOrEmpty($archiveRequirementPolicy) -and
+        $blockingBelowFloorMatch.Success -and
+        $satisfiedBelowFloorMatches.Count -eq 1 -and
+        $requirementNotMetMatches.Count -ge 1
+    )
+    $diskSpaceDocsMatchCode = $false
+    if ($diskSpaceContractExtracted) {
+        $blockingBelowFloorPolicy = $blockingBelowFloorMatch.Groups[1].Value
+        $blockingBelowFloorReason = $blockingBelowFloorMatch.Groups[2].Value
+        $satisfiedBelowFloorReason = $satisfiedBelowFloorMatches[0].Groups[1].Value
+        $staleBlockPattern = '(?i)блок[а-яіїєґ'']*[^.;]{0,200}' + [regex]::Escape($blockingBelowFloorReason)
+        $staleBootstrapPattern = '(?i)без\s+(валідної\s+)?історії[^.]{0,120}пропускається'
+        $diskSpaceDocsMatchCode = ($archiveRequirementPolicy -ne $blockingBelowFloorPolicy)
+        foreach ($diskSpaceDocText in @($readmeTextForDocFixes, $operationsTextForDiskSpaceDoc)) {
+            if (-not $diskSpaceDocText.Contains($archiveRequirementPolicy) -or
+                -not $diskSpaceDocText.Contains($satisfiedBelowFloorReason) -or
+                -not $diskSpaceDocText.Contains('EstimatedRequirementNotMet') -or
+                [regex]::IsMatch($diskSpaceDocText, $staleBlockPattern) -or
+                [regex]::IsMatch($diskSpaceDocText, $staleBootstrapPattern)) {
+                $diskSpaceDocsMatchCode = $false
+            }
+        }
+    }
     Test-BRAVOCondition `
-        -Condition (
-            $archiveUsesPeakSafePolicy -and
-            $readmeTextForDocFixes.Contains('BelowHealthFloorButRequirementSatisfied') -and
-            -not [regex]::IsMatch(
-                $readmeTextForDocFixes,
-                '(?i)блок[а-яіїєґ'']*[^.;]{0,200}BelowFloorEstimateNotPeakSafe'
-            )
-        ) `
+        -Condition ($diskSpaceContractExtracted -and $diskSpaceDocsMatchCode) `
         -Name "Documentation/ReadmeArchiveBelowFloorMatchesPeakSafePolicy" `
-        -Failure "README.md має описувати below-floor при достатній вимозі як WARNING BelowHealthFloorButRequirementSatisfied (Archive на RequirementPolicy='ArchivePeakSafe'), а не обіцяти блок BelowFloorEstimateNotPeakSafe"
+        -Failure "README.md і OPERATIONS.md мають описувати поточну політику Archive (RequirementPolicy з BRAVO.Archive.Runtime.ps1, не блокуючу below-floor у BRAVO.DiskSpace.psm1): below-floor при виконаній вимозі — WARNING $(if ($satisfiedBelowFloorMatches.Count -gt 0) { $satisfiedBelowFloorMatches[0].Groups[1].Value } else { '<не знайдено в коді>' }) без блокування, блокує EstimatedRequirementNotMet; без обіцянки блоку $(if ($blockingBelowFloorMatch.Success) { $blockingBelowFloorMatch.Groups[2].Value } else { '<не знайдено в коді>' }) і без тези, що компонент без історії пропускається оцінкою. Витягнуто з коду: policy=$archiveRequirementPolicy"
 
     # Зовнішнє рев'ю 2026-08-05, P1: SECURITY.md публікував порядок
     # повідомлення про вразливості із заглушками "[заповнити]" замість SLA.
