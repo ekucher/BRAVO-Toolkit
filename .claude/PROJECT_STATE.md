@@ -122,11 +122,11 @@ Wave A (merged 2026-09-30):
   acceptance **не виконувався**. «Runtime реалізовано» ≠ «міграцію парку
   прийнято» ≠ «release governance завершено».
 * **#154** (EPIC Config v2) — open. B0–B4, B6 виконано.
-  * **B5** (міграція парку) — **не виконано**. DEV-LIMS pilot
+  * **B5** (міграція парку) — **не виконано**. Pilot на пілотному сервері
     2026-09-29: 12/13 критеріїв PASS, `Result: PILOT NOT ACCEPTED` лише через
     `SelfTestPass=false` (`Notifications/PublicIPLookupEnabledByDefault` —
     передіснуюча site-policy розбіжність; `SemanticParityZeroDiff=true`,
-    `HealthPass=true`). Докази: `C:\ProgramData\BRAVO\ConfigV2PilotEvidence\DEV-LIMS-20260928-215036`.
+    `HealthPass=true`). Докази: `C:\ProgramData\BRAVO\ConfigV2PilotEvidence\<pilot-id>`.
     Решта парку не мігрована. **CI не може довести B5** — pilot-artifact
     self-test працює на синтетичному InstallRoot.
   * **B7** (матриця регресій 5.3-шляху + parity як required gate) — у
@@ -152,7 +152,7 @@ Wave A (merged 2026-09-30):
 * Acceptance-issue на реальних хостах: #152, #155, #158, #188 — open, не
   автономні.
 
-## DEV-LIMS: невирішене після pilot (стан 2026-09-29; з цієї сесії не перевірялось)
+## Пілотний сервер: невирішене після pilot (стан 2026-09-29; з цієї сесії не перевірялось)
 
 * Виправити `PublicIPLookupEnabled` окремим кроком, повторити
   `-Validate`/`-Accept` до чистого `PILOT ACCEPTED`.
@@ -160,7 +160,7 @@ Wave A (merged 2026-09-30):
   (посерверна чи загальна).
 * Прибрати слід: Scheduled Task `BRAVO-Agent-Runner` зі збереженим
   паролем `Admin`, `C:\Temp\BRAVO_UPDATE\`, встановлений Git for Windows.
-* Крок 6 (фізичне видалення `BRAVO.config` на DEV-LIMS) — не виконано,
+* Крок 6 (фізичне видалення `BRAVO.config` на пілотному сервері) — не виконано,
   потребує окремої авторизації.
 
 ## Класифікація 5.3 (лише класифікація; без promote/tag/release)
@@ -176,7 +176,7 @@ BLOCKED.
 | ENGINEERING READY | CI зелений на HEAD `developer` | ТАК (push-прогін `4a54d34`) |
 | ENGINEERING READY | Немає відкритих bug-issue щодо коректності runtime без рішення | НІ — 27 `bug`-issue #279–#307; draft-фікси #308–#310 |
 | ENGINEERING READY | Відкриті Wave A PR (#259/#260/#261/#263) завершено | НІ — чекають рішення щодо Codex раунду 2 |
-| OPERATIONAL ACCEPTANCE | B5: pilot `PILOT ACCEPTED` + мігровані хости парку з доказами | НІ — DEV-LIMS `PILOT NOT ACCEPTED`, парк не мігровано |
+| OPERATIONAL ACCEPTANCE | B5: pilot `PILOT ACCEPTED` + мігровані хости парку з доказами | НІ — пілотний сервер: `PILOT NOT ACCEPTED`, парк не мігровано |
 | OPERATIONAL ACCEPTANCE | Acceptance-issue на реальних хостах (#152/#155/#158/#188) | НІ — open |
 | RELEASE | `VERSION.json` provenance відповідає HEAD | НІ — `sourceCommit` `d77f3b4` ≠ `4a54d34` → `PROVENANCE_STALE` у `ci/New-BRAVOReleaseArtifact.ps1` |
 | RELEASE | Прийнятий RC | НІ — `v5.3.0-rc.1` (commit `3a87079`) immutable, приймання не проходив; наступний кандидат — `rc.2`, не створено |
@@ -221,7 +221,7 @@ PENDING (не розпочато для парку); **RELEASE BLOCKED**.
 ```
 
 Паралельно, лише за рішенням власника: draft-фікси #308–#310; питання
-#279–#281; DEV-LIMS (розділ вище).
+#279–#281; пілотний сервер (розділ вище).
 
 ## Корисні технічні нотатки
 

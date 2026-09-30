@@ -1114,7 +1114,7 @@ CI там тримається лише дисципліною. Для `master` 
 застосуванням перечитати live-стан, бо хтось міг уже створити правило):
 
 ```text
-gh api -X PUT repos/ekucher/BRAVO-Toolkit/branches/developer/protection \
+gh api -X PUT repos/<owner>/BRAVO-Toolkit/branches/developer/protection \
   -H "Accept: application/vnd.github+json" --input developer.json
 ```
 
@@ -1155,7 +1155,7 @@ live-прив'язку `master`: статус із тим самим ім'ям �
 робиться:
 
 ```text
-curl -sS https://api.github.com/repos/ekucher/BRAVO-Toolkit/branches/developer
+curl -sS https://api.github.com/repos/<owner>/BRAVO-Toolkit/branches/developer
 ```
 
 Очікувано `protected: true` і рівно сім імен у
@@ -1168,10 +1168,10 @@ curl -sS https://api.github.com/repos/ekucher/BRAVO-Toolkit/branches/developer
 додати перевірку й на `master`, змінювати треба **лише** перелік
 required checks, не чіпаючи налаштувань, яких сесія не бачить (`strict`,
 `enforce_admins`, вимога PR). Спершу зберегти поточний стан
-(`gh api repos/ekucher/BRAVO-Toolkit/branches/master/protection`), потім:
+(`gh api repos/<owner>/BRAVO-Toolkit/branches/master/protection`), потім:
 
 ```text
-gh api -X PATCH repos/ekucher/BRAVO-Toolkit/branches/master/protection/required_status_checks \
+gh api -X PATCH repos/<owner>/BRAVO-Toolkit/branches/master/protection/required_status_checks \
   -H "Accept: application/vnd.github+json" --input master-add-config-parity.json
 ```
 
