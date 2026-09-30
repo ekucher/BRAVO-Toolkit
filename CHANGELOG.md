@@ -11,8 +11,11 @@
   збільшення лічильника WARNING, а збій доставки лишається окремою подією. Інші
   виклики `Send-BRAVONotification` без перемикача поводяться як раніше. Єдина
   відмінність для оператора: відомості про хост для тексту сповіщення тепер
-  збираються й тоді, коли webhook не налаштовано. Новий самотест
-  `DataRestore/NotificationMissingEndpointSkipsWithoutWarningCount`.
+  збираються й тоді, коли webhook не налаштовано. Нові самотести
+  `DataRestore/NotificationMissingEndpointSkipsWithoutWarningCount` і
+  `DataRestore/NotificationDeliveryFailureCountsWarning`: збій доставки при
+  налаштованому webhook, на відміну від ненастроєного, збільшує лічильник
+  WARNING рівно на 1 і не виходить за межі функції.
 
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
