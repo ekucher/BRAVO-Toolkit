@@ -282,6 +282,20 @@
   `Archive/StepHistoryPayloadUsesToArrayNotArraySubexpression` тепер
   надлишкова, але лишається до рішення власника.
 
+  Після другого раунду review детектор переписано як одну потокову модель з
+  нерухомою точкою замість набору точкових патернів: джерело (`New-Object` з
+  типом лише з `-TypeName`, зокрема `Microsoft.PowerShell.Utility\New-Object`)
+  → присвоєння (ліва частина `[object]`/`[psobject]` обгортку зберігає,
+  `[object[]]`/`[List[object]]` — знімає) → аліас → властивість/елемент і
+  read-back з них → прив'язка параметра (іменна з `AliasAttribute`,
+  позиційна) → параметр-пересилання → аргумент-вираз `(New-Object ...)` чи
+  `(Get-X)` → вихід функції лише з реально емітованого `,$x` чи виклику →
+  sink `@()`. `[List[object]]::new()` джерелом не є. Фікстура отримала пару
+  «небезпечна / безпечна» форма на кожен клас, а нова
+  `Governance/GenericObjectListBinderPremisesHold` перевіряє рантайм-передумови
+  моделі на хості CI (PS 5.1). На поточному дереві знахідок немає; на знімку
+  до виправлення PR #225 — рівно ті самі три входження.
+
 - **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —
