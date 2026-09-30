@@ -114,7 +114,8 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 облікові дані в `BRAVO_ARCHIV`, webhook у `BRAVO_HEALTH`, некоректні
 параметри установи — повна таблиця в README.md, розділ 4, підрозділ
 «Джерела конфігурації та секретів у 5.3». Якщо запуск іде з явним
-`-ConfigPath` на legacy `BRAVO.config`, помилка може походити з нього — це
+`-ConfigPath` на legacy `BRAVO.config` (або це `BRAVO_OPERATIONS_HEARTBEAT`,
+а `BRAVO.config` лежить у каталозі runtime), помилка може походити з нього — це
 сумісність на час міграції, а не джерело конфігурації 5.3 (там само,
 «Міграція — legacy `BRAVO.config`»).
 
@@ -166,6 +167,11 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 **Виправлення.** Виправити названий у помилці ключ через override у
 `BRAVO.local.config`; відсутній секрет — через
 `BRAVO_CREDENTIALS_SETUP.ps1` (розділ [`31`](#31--недоступні-credentials)).
+Виняток — некоректна назва, код установи чи префікс архівів у **наявному**
+записі Credential Manager: запис має пріоритет над конфігурацією, тож
+override у `BRAVO.local.config` не допоможе, а `-Action Ensure` на такому
+записі завершується помилкою замість заміни. Перезапишіть запис:
+`.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Set -Component Institution -StoreFor Both`.
 Не правте legacy `BRAVO.config` як обхідний шлях: перенесіть його
 відмінності в `BRAVO.local.config` (README.md, розділ 10). Після правки —
 повторний `-ValidateOnly` до чистого результату.

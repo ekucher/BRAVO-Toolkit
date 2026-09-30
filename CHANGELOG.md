@@ -263,9 +263,14 @@
   установи в `BRAVO_ARCHIV` — `1`. Відповідно виправлено рядки `30`/`31`
   матриці діагностики README, розділи `30`/`31` `OPERATIONS.md` і
   `SECURITY.md` (розділи 3 і 6); вони посилаються на канонічний підрозділ
-  замість власних формулювань. Задокументовано відому розбіжність: явний
-  `-ConfigPath` на legacy `BRAVO.config` досі виконує його як основний шар.
-  Runtime не змінено.
+  замість власних формулювань. Задокументовано відомі розбіжності: явний
+  `-ConfigPath` на legacy `BRAVO.config` досі виконує його як основний шар,
+  а `BRAVO_OPERATIONS_HEARTBEAT.ps1` виконує `BRAVO.config` з каталогу
+  runtime і без `-ConfigPath`; пріоритет Credential Manager для параметрів
+  установи застосовують не всі скрипти (`BRAVO_NOTIFICATION_TEST`,
+  `BRAVO_RESTORE_TEST` беруть `bravoSettings.*`). Для некоректного наявного
+  запису установи (`30`) `OPERATIONS.md` радить `-Action Set`, а не
+  `Ensure`. Runtime не змінено.
 - **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —
