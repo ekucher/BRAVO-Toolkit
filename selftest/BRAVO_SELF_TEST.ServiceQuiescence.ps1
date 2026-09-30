@@ -734,14 +734,20 @@ function Write-HealthLog { param($Message, $Level) }
 function Get-Service {
     param($Name, $DisplayName, $ErrorAction)
     $svc = [pscustomobject]@{ Name = [string]$Name; Status = [System.ServiceProcess.ServiceControllerStatus]::Stopped }
+    # Сучасний .NET (>= 4.6.1): ServiceController має StartType.
+    if ([string]$Name -eq 'BravoStartTypeDisabled') { Add-Member -InputObject $svc -MemberType NoteProperty -Name StartType -Value 'Disabled' }
+    if ([string]$Name -eq 'BravoStartTypeAutomatic') { Add-Member -InputObject $svc -MemberType NoteProperty -Name StartType -Value 'Automatic' }
     Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { } -Force
     return $svc
 }
 function Get-BRAVOWmiInstance {
     param($ClassName)
+    if ($script:startTypeWmiFails) { throw 'WMI недоступний (stub)' }
     return @(
         [pscustomobject]@{ Name = 'BravoDisabled'; StartMode = 'Disabled' },
-        [pscustomobject]@{ Name = 'BravoAuto'; StartMode = 'Auto' }
+        [pscustomobject]@{ Name = 'BravoAuto'; StartMode = 'Auto' },
+        [pscustomobject]@{ Name = 'BravoStartTypeDisabled'; StartMode = 'Auto' },
+        [pscustomobject]@{ Name = 'BravoStartTypeAutomatic'; StartMode = 'Disabled' }
     )
 }
 '@
@@ -749,8 +755,9 @@ function Get-BRAVOWmiInstance {
         -SourceText ($startTypeStubs + "`n" + $healthRuntimeTextForQuiescence) `
         -FunctionNames @('Write-HealthLog', 'Get-Service', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled', 'Get-ManagedServiceHealthIssues')
     $startTypeProbe = {
-        param($ServiceName)
+        param($ServiceName, [bool]$WmiFails = $false)
         Set-StrictMode -Version 2.0
+        $script:startTypeWmiFails = $WmiFails
         $script:backupMonitoring = @{ CheckManagedServices = $true }
         $script:maintenanceSettings = [pscustomobject]@{
             Services = [pscustomobject]@{ BravoName = $ServiceName; ExchangeApiName = ''; BravoWebEnabled = $false; BravoWebCandidates = @() }
@@ -769,6 +776,21 @@ function Get-BRAVOWmiInstance {
         ) `
         -Name "Health/ManagedServiceStartTypeMissingDoesNotThrowUnderStrictMode" `
         -Failure "Get-ManagedServiceHealthIssues має читати StartType через PSObject.Properties: ServiceController без StartType (.NET < 4.6.1) не повинен кидати виняток під StrictMode 2.0, а тип запуску має братись із WMI (Disabled -> пропуск, Auto -> проблема). Отримано: Disabled(Thrown='$($startTypeDisabled.Thrown)', Issues=$($startTypeDisabled.IssueCount)), Auto(Thrown='$($startTypeAuto.Thrown)', Issues=$($startTypeAuto.IssueCount))"
+
+    # Решта матриці #295: наявний StartType має пріоритет над WMI (обидва
+    # напрями), а збій WMI без StartType не обриває Health — служба
+    # перевіряється як не-Disabled.
+    $startTypePresentDisabled = & $startTypeModule $startTypeProbe 'BravoStartTypeDisabled'
+    $startTypePresentAutomatic = & $startTypeModule $startTypeProbe 'BravoStartTypeAutomatic'
+    $startTypeWmiFailure = & $startTypeModule $startTypeProbe 'BravoAuto' $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $startTypePresentDisabled.Thrown -and $startTypePresentDisabled.IssueCount -eq 0 -and
+            $null -eq $startTypePresentAutomatic.Thrown -and $startTypePresentAutomatic.IssueCount -eq 1 -and
+            $null -eq $startTypeWmiFailure.Thrown -and $startTypeWmiFailure.IssueCount -eq 1
+        ) `
+        -Name "Health/ManagedServiceStartTypePresentAndWmiFailureUnderStrictMode" `
+        -Failure "Get-ManagedServiceHealthIssues під StrictMode 2.0: наявний StartType має пріоритет над WMI (Disabled -> пропуск, Automatic -> проблема), а збій WMI без StartType не кидає виняток. Отримано: StartType=Disabled(Thrown='$($startTypePresentDisabled.Thrown)', Issues=$($startTypePresentDisabled.IssueCount)), StartType=Automatic(Thrown='$($startTypePresentAutomatic.Thrown)', Issues=$($startTypePresentAutomatic.IssueCount)), WMI-збій(Thrown='$($startTypeWmiFailure.Thrown)', Issues=$($startTypeWmiFailure.IssueCount))"
 
     $healthWatchdogInvokeIndex = $healthRuntimeTextForQuiescence.IndexOf('$quiescenceWatchdogIssues = @(Invoke-BRAVOServiceQuiescenceWatchdog)')
     $healthManagedServicesIndex = $healthRuntimeTextForQuiescence.IndexOf('$serviceHealthIssues = @($quiescenceWatchdogIssues) + @(Get-ManagedServiceHealthIssues)')
