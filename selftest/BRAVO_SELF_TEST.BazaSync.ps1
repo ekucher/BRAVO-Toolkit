@@ -12,6 +12,7 @@
     # regression. Categories A-G per safety-review specification.
     # =====================================================================
     try {
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ConfigDefinesBazaBlock') { try {
         Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
         Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1") -Force -ErrorAction Stop
         Import-Module -Name (Join-Path $root "modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1") -Force -ErrorAction Stop
@@ -288,6 +289,8 @@
             $mutTypoResult3.MutationViolations[0].RelativePath -eq 'verified.txt' -and
             $mutTypoSession3.State.PutFilesCallCount -eq 0
         ) -Name 'BazaSync/ExplicitValidFailPolicyMutationBehaviorUnchanged' -Failure "явне MutationPolicy='Fail' на тій самій мутації має лишатись MUTATION_VIOLATION без upload (regression); Status=$($mutTypoResult3.Status),Violations=$($mutTypoResult3.MutationViolations.Count),PutFiles=$($mutTypoSession3.State.PutFilesCallCount)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ConfigDefinesBazaBlock' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ConfigContractInvalidMutationPolicyRejected' -DependsOn 'BazaSync/ConfigDefinesBazaBlock') { try {
 
         # D. Config-рівень (Get-BRAVOBazaSettingsEffective): невалідне
         # значення відхиляється fail-closed з точним іменем ключа й
@@ -529,6 +532,8 @@
         $skippedHealth = Get-BRAVOBazaFastHealthResult -SyncResult $skippedResult
         Test-BRAVOCondition -Condition ($skippedHealth.Healthy -eq $true -and $skippedHealth.Level -eq 'INFO') `
             -Name 'BazaSync/SkippedConcurrentIsHealthyInfoNotAlert' -Failure 'SKIPPED_CONCURRENT не повинен бути alert -- це ознака активної роботи іншого процесу'
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ConfigContractInvalidMutationPolicyRejected' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/PerformancePlanScalesWithNewFilesNotTotalFiles' -DependsOn 'BazaSync/ConfigDefinesBazaBlock') { try {
 
         # =======================================================================
         # PERFORMANCE REGRESSION (section 22)
@@ -690,6 +695,8 @@
             -Name 'BazaSync/IncompleteStateSaveFailureIsNotHealthy' -Failure "INCOMPLETE з Failed=0/Pending=0 (збій Save-BRAVOBazaState ПІСЛЯ успішних upload-ів) має бути Healthy=false; отримано Healthy=$($drP12FastHealth.Healthy)"
         Test-BRAVOCondition -Condition ($drP12FastHealth.Message -notmatch 'актуальна') `
             -Name 'BazaSync/IncompleteWithZeroFailedNeverSaysCloudCurrent' -Failure "повідомлення НЕ має стверджувати актуальність хмарної копії; отримано: $($drP12FastHealth.Message)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/PerformancePlanScalesWithNewFilesNotTotalFiles' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/UnknownStatusFailsVisible' -DependsOn 'BazaSync/ConfigDefinesBazaBlock') { try {
 
         $drP12UnknownResult = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId 'x' -StartedUtc (Get-Date) -CutoffUtc (Get-Date)
         $drP12UnknownResult.Status = 'SOME_FUTURE_STATUS_NOBODY_HANDLES'
@@ -872,6 +879,8 @@
             (@($drP2NameResult.IncompatibleFiles).Count -eq 1) -and
             ($drP2NameResult.IncompatibleFiles[0].RelativePath -match [regex]::Escape($drUtf8Name.Substring(0, 20)))
         ) -Name 'BazaSync/FilenameCompatCompatibleCandidateStillUploads' -Failure "очікувався рівно 1 upload (normal.txt) і 1 явний incompatible-результат; Uploaded=$($drP2NameResult.Uploaded) PutFiles=$($drP2NameSession.State.PutFilesCallCount) Incompatible=$(@($drP2NameResult.IncompatibleFiles).Count)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/UnknownStatusFailsVisible' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/FilenameCompatIncompatibleProducesExplicitResult' -DependsOn 'BazaSync/UnknownStatusFailsVisible') { try {
 
         $drP2NameHealth = Get-BRAVOBazaFastHealthResult -SyncResult $drP2NameResult
         Test-BRAVOCondition -Condition ($drP2NameHealth.Healthy -eq $false -and $drP2NameHealth.Message -match [regex]::Escape($drUtf8Name.Substring(0, 20))) `
@@ -1016,6 +1025,8 @@
             $drCfgDefaults.SynchronizeBeforeHealth -eq $true -and $drCfgDefaults.FastHealthEnabled -eq $true
         ) -Name 'BazaSync/ConfigContractDefaultsDoNotThrow' -Failure "відсутність BAZA-ключів має давати типові true/true без помилки; Error=$drCfgError4"
         $global:backupMonitoring = $null
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/FilenameCompatIncompatibleProducesExplicitResult' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/NoDeleteAnywhereInIncrementalEngine' -DependsOn 'BazaSync/FilenameCompatIncompatibleProducesExplicitResult') { try {
 
         # =======================================================================
         # DEEP REVIEW acceptance 10: жодного -delete / remote-видалення даних
@@ -1252,6 +1263,8 @@
         ) -Name 'BazaSync/ExistingRemoteSameSizeMarksVerifiedWithoutUpload' -Failure "кандидат із уже наявним remote-файлом того самого розміру має стати Verified=true БЕЗ передачі; Status=$($hr3RecResult.Status) Recovered=$($hr3RecResult.RecoveredRemote) Uploaded=$($hr3RecResult.Uploaded)"
         Test-BRAVOCondition -Condition ($hr3RecSession.State.PutFilesCallCount -eq 0) `
             -Name 'BazaSync/ExistingRemoteSameSizeMakesZeroPutFilesCalls' -Failure "нуль PutFiles для recovered кандидата; отримано $($hr3RecSession.State.PutFilesCallCount)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/NoDeleteAnywhereInIncrementalEngine' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ExistingRemoteMismatchReturnsRemoteConflict' -DependsOn 'BazaSync/PerformancePlanScalesWithNewFilesNotTotalFiles', 'BazaSync/UnknownStatusFailsVisible') { try {
 
         # remote-файл існує з ІНШИМ розміром -> REMOTE_CONFLICT, без перезапису
         $hr3ConfRoot = Join-Path $bazaSyncTestRoot "HR3_Conflict"
@@ -1539,6 +1552,8 @@
             $hr4PerStateAfter.State.Files.ContainsKey('drifted2.txt') -and
             [bool]$hr4PerStateAfter.State.Files['drifted2.txt'].Verified -eq $false
         ) -Name 'BazaSync/PeriodicFullAuditSameSizeDriftIsNotRecovered' -Failure "періодичний audit-pending drift (same size) НЕ recovery-иться: AUDIT_DRIFT, 0 PutFiles, Verified лишається false; Status=$($hr4PerResult2.Status) PutFiles=$($hr4PerSession2.State.PutFilesCallCount)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ExistingRemoteMismatchReturnsRemoteConflict' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/AuditPendingDoesNotAdvanceLastSuccessfulSyncUtc' -DependsOn 'BazaSync/ExistingRemoteMismatchReturnsRemoteConflict') { try {
 
         Test-BRAVOCondition -Condition (
             -not [string]::IsNullOrWhiteSpace($hr4PerProvenanceUtc) -and
@@ -1837,6 +1852,8 @@
             $hr6MisHealth.Healthy -eq $false -and $hr6MisHealth.Level -eq 'CRITICAL' -and
             $hr6MisHealth.Message -match 'gone\.txt'
         ) -Name 'BazaSync/PersistedAuditDriftMissingLocalRemainsUnhealthy' -Failure "Health для missing-local блокера: CRITICAL з точним шляхом; Healthy=$($hr6MisHealth.Healthy) Message=$($hr6MisHealth.Message)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/AuditPendingDoesNotAdvanceLastSuccessfulSyncUtc' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/PersistedAuditDriftMissingLocalDoesNotAdvanceProvenance' -DependsOn 'BazaSync/AuditPendingDoesNotAdvanceLastSuccessfulSyncUtc') { try {
 
         $hr6MisStateAfter2 = Read-BRAVOBazaState -Path $hr6MisStatePath
         Test-BRAVOCondition -Condition (
@@ -2155,6 +2172,8 @@
             @($mrFailResult.StateRemoved).Count -eq 0 -and
             $null -ne $mrStateAfterFail.State.Files['doc1.pdf']
         ) -Name 'BazaSync/ReconcileMoveFailureKeepsStateEntry' -Failure 'збій MoveFile має лишати state-запис неторкнутим (fail-closed: довіра знімається лише після успішного rename)'
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/PersistedAuditDriftMissingLocalDoesNotAdvanceProvenance' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ReconcileRenamesRemoteAndRemovesStateEntry' -DependsOn 'BazaSync/PersistedAuditDriftMissingLocalDoesNotAdvanceProvenance') { try {
 
         # Успішний reconcile обох мутацій: старі remote-версії перейменовано
         # у *.replaced_*, ключі прибрано, keep.txt неторкнутий, ЖОДНОГО
@@ -2210,6 +2229,7 @@
         Test-BRAVOCondition -Condition (
             $mrReconcileEntrypointText -match '\$acceptList\s*=\s*@\(if\s'
         ) -Name 'BazaSync/ReconcileAcceptListAssignmentStaysArrayWrapped' -Failure 'BRAVO_BAZA_RECONCILE: $acceptList має присвоюватися як @(if ...) — if-вираз без обгортки розгортає одноелементний масив у скаляр і .Count падає під StrictMode 2.0'
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ReconcileRenamesRemoteAndRemovesStateEntry' } }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

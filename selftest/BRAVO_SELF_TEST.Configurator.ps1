@@ -26,6 +26,7 @@
 # зміною — явний LIMSRoot/BackupRoot замість AUTO (той самий text-replace
 # прийом, що ConfigLoader.ps1), а не реальний $root.
 
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/Schema1') { try {
 $configuratorModuleRoot = Join-Path $root 'modules\BRAVO.Configurator'
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Schema.psm1') -Force
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Effective.psm1') -Force
@@ -384,6 +385,8 @@ try {
 } finally {
     Remove-Item -LiteralPath $configuratorPersistScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/Schema1' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/Persistence' -DependsOn 'Configurator/Schema1') { try {
 
 # ===== P2-A.7: hermetic Backup forced-failure (§Stage='Backup') =====
 # Крок 11 (Copy-Item production -> .bak) провалюється, якщо WRITE у
@@ -756,6 +759,8 @@ Test-BRAVOCondition (
 ) `
     'Configurator Presets: Current — no-op (жодне override-значення не змінюється)' `
     "Count=$($configuratorPresetCurrent.Count)/$($configuratorPresetBaseModel.Count) Console=$($configuratorPresetCurrentConsole[0].OverrideValue) SftpOverridePresent=$($configuratorPresetCurrentSftp[0].OverridePresent)"
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/Persistence' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/Presets' -DependsOn 'Configurator/Persistence') { try {
 
 # ===== feat/bravo-configurator-preset-baza-local: BAZA_*_LOCAL/BAZA_*_SFTP
 # preset-контракт (§ user-approved manual acceptance follow-up, item 13) =====
@@ -958,6 +963,8 @@ $nestedDirtyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchem
 Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModel -BaselineOverrides $nestedDirtyBaseline)) `
     'Configurator/NestedBaselineUntouchedIsNotDirty: вкладена (Node) baseline, модель нею ж побудована й не торкана -> false' `
     "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModel -BaselineOverrides $nestedDirtyBaseline)"
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/Presets' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/ConfiguratorNestedBaselineChangedIsDirty' -DependsOn 'Configurator/Presets') { try {
 
 # A2 / Configurator/NestedBaselineChangedIsDirty: змінити один вкладений
 # leaf -> true.
@@ -1195,6 +1202,8 @@ try {
 } finally {
     Remove-Item -LiteralPath $configuratorNoConfigRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/ConfiguratorNestedBaselineChangedIsDirty' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/Authorization' -DependsOn 'Configurator/Schema1') { try {
 
 
 # =====================================================================
@@ -1654,6 +1663,8 @@ try {
         Remove-Item -LiteralPath $nestedDeniedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/Authorization' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/MutationPolicyRecoveryDescriptorExists' -DependsOn 'Configurator/Schema1') { try {
 
 # =====================================================================
 # PR #224 review, четверте коло (P2): backupMonitoring.SFTP.BAZA.MutationPolicy
@@ -2244,6 +2255,8 @@ try {
         Remove-Item -LiteralPath $vrNcValidScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/MutationPolicyRecoveryDescriptorExists' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/MultiRepresentationValidFlatInvalidNestedProducesRecoveryRow' -DependsOn 'Configurator/Schema1') { try {
 
 # =====================================================================
 # Codex review PR #224 (P2, "Inspect every representation when
@@ -2791,6 +2804,8 @@ try {
         [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $dnCompletenessOriginalEnv)
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/MultiRepresentationValidFlatInvalidNestedProducesRecoveryRow' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/OversizedCatalogIntegerOverridePreviewDoesNotThrow' -DependsOn 'Configurator/Schema1') { try {
 
 # =====================================================================
 # PR #224 review, шосте коло (P2, "IntegerRange overflow hardening"):
@@ -3485,6 +3500,8 @@ try {
         Remove-Item -LiteralPath $r4RoundTripScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/OversizedCatalogIntegerOverridePreviewDoesNotThrow' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configurator/Merge' -DependsOn 'Configurator/Schema1') { try {
 
 # =====================================================================
 # Codex review PR #224 (P2, "Remove nested duplicates when clearing a
@@ -3860,3 +3877,4 @@ try {
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====
 Remove-Item -LiteralPath $configuratorFixtureRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/Merge' } }

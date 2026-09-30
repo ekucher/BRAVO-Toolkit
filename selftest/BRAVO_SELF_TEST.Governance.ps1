@@ -9,6 +9,7 @@
 # Зовнішніх source-text залежностей не має: всі документи й конфіги
 # читаються локально в цьому фрагменті.
 
+    if (Enter-BRAVOSelfTestSection -Name 'Governance/Documentation') { try {
     # P2.4 аудиту: SECURITY.md — обов'язковий, легко забути оновити після
     # security-релевантних змін. Перевіряємо лише структуру (розділи є),
     # не зміст — зміст неможливо валідувати автоматично.
@@ -410,6 +411,8 @@
         -Condition ($securityProtocolScannedCount -gt 0 -and $securityProtocolOverwrites.Count -eq 0) `
         -Name "StaticAnalysis/SecurityProtocolAssignmentsAreAdditive" `
         -Failure "production-код мусить вмикати протоколи адитивно ([Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor ... або Enable-BRAVOTls12); пряме присвоєння затирає вже ввімкнені протоколи (перевірено файлів: $securityProtocolScannedCount): $($securityProtocolOverwrites -join ', ')"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/Documentation' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Governance/Documentation.ThreatModelExists') { try {
 
     # Аудит P5: threat model як окремий документ із чесним розділом
     # залишкового ризику для кожного сценарію.
@@ -1006,6 +1009,8 @@
             -Name "ReleasePolicy/StableVersionPromotion[$($scenario.Label)]" `
             -Failure "Test-BRAVOStableVersionPromotion('$($scenario.Head)' vs '$($scenario.Master)') має дати $($scenario.ExpectFailures) порушень; отримано $(@($scenarioFailures).Count): $($scenarioFailures -join ' | ')"
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/Documentation.ThreatModelExists' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Governance/ReleasePolicy' -DependsOn 'Governance/Documentation.ThreatModelExists') { try {
 
     # ROADMAP P0.2 (repository identity): ім'я head-гілки не ідентифікує
     # репозиторій — fork з гілкою 'developer'/'hotfix/*' не повинен
@@ -1207,6 +1212,8 @@
         -Condition ($foundStaleClaims.Count -eq 0) `
         -Name "Documentation/ThreatModelHasNoStaleResidualRisk" `
         -Failure "THREAT_MODEL.md містить твердження про залишковий ризик, який код уже закрив: $($foundStaleClaims -join '; ')"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/ReleasePolicy' } }
+if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkflowJobs') { try {
 
 # =====================================================================
 # #149: перелік required checks у RELEASE_POLICY.md §13.3 мусить
@@ -1228,6 +1235,7 @@
 # суцільному пошуку підрядка перевірка спрацьовувала б на власному
 # поясненні.
 & {
+    if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListUsesPullRequestNames') { try {
     $requiredChecksPolicyText = [IO.File]::ReadAllText(
         (Join-Path $root 'RELEASE_POLICY.md'), [Text.Encoding]::UTF8)
     $requiredChecksWorkflowText = [IO.File]::ReadAllText(
@@ -2196,6 +2204,8 @@
         -Name "ReleaseGate/PullRequestWorkflowInvokesCutoverGateUnconditionally" `
         -Failure "config-parity.yml (issue #216, H-1) мусить викликати ci\Test-BRAVOConfigV2CutoverGatesOnPullRequest.ps1 — інакше гейт LEGACY_CONFIG_REMOVED/AUTOEXEC і далі спрацьовує лише при tag/workflow_dispatch, ніколи на pull_request"
 }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListUsesPullRequestNames' } }
+if (Enter-BRAVOSelfTestSection -Name 'Governance/ConfigParity') { try {
 
 # =====================================================================
 # Health — Config V2 контракт (issue #216, §9 п.9): Health був єдиним
@@ -2332,8 +2342,11 @@ Test-BRAVOCondition `
     ) `
     -Name "Deploy/OwnershipDocumentedForOperator" `
     -Failure "deploy\README.md мусить описувати межу володіння site-конфігурацією — інакше контракт існує лише в коді"
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/ConfigParity' } }
 
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkflowJobs' } }
+if (Enter-BRAVOSelfTestSection -Name 'Governance/Deploy') { try {
 
 # --- #152: гейт релізу в скриптах розкатки ---------------------------------
 # Дефект, який закриває цей блок: prerelease-комплект розгортався в установі
@@ -2650,6 +2663,8 @@ Test-BRAVOCondition `
         -Name "Governance/OsAcceptanceMatrixClassifiesUnavailableSelfTest" `
         -Failure "матриця §9.4 мусить окремо класифікувати недоступність self-test на жорстко налаштованому хості — інакше провал приймання й обмеження хоста виглядають однаково"
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/Deploy' } }
+if (Enter-BRAVOSelfTestSection -Name 'Governance/ValidateOnlyNeverPersistsDiscoveryBaseline') { try {
 
 & {
     # Configuration v2 Pilot Preparation (незалежний аудит, 2026-09-16):
@@ -2716,3 +2731,4 @@ Test-BRAVOCondition `
         -Name "Governance/ValidateOnlyMigratedDiscoveryBaselineGuardPatternIsMeaningful" `
         -Failure "перевірка вище не відрізняє захищений виклик Import-BRAVODiscoveryBaseline від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/ValidateOnlyNeverPersistsDiscoveryBaseline' } }

@@ -6,6 +6,7 @@
 # baseline 93 тести DataRestore/*, рядки 7979-11279 оригінального файлу на
 # момент витягнення).
 
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/PathGuardsFailClosed') { try {
     # ============================================================
     # BRAVO_DATA_RESTORE (rc.2): поведінкові тести чистих функцій
     # відновлення даних. Функції витягуються з runtime за AST в
@@ -869,6 +870,8 @@ function Stop-Process {
             Remove-Item -LiteralPath $moveAsideFailureRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/PathGuardsFailClosed' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/CurrentComponentRollbackFailurePreservesPrerestoreCopy' -DependsOn 'DataRestore/PathGuardsFailClosed') { try {
 
     # --- 6.3. Restore safety review (PR #40): відкат САМОГО поточного
     # компонента, що провалився, теж може не завершитись — статус має
@@ -1498,6 +1501,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Remove-Item -LiteralPath $probeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/CurrentComponentRollbackFailurePreservesPrerestoreCopy' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/SftpStagingFreeSpaceRequirementDeclaresProbeDirectory' -DependsOn 'Root/Version', 'DataRestore/CurrentComponentRollbackFailurePreservesPrerestoreCopy') { try {
 
     # --- 6.10.1. B4 acceptance defect (9257157/PHASE 3): SFTP staging
     # free-space requirement (stagingRequirements) МАЄ оголошувати
@@ -2011,6 +2016,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/OutOfPlaceAclFailureCleansUpBeforeAbortingBeforeExtraction" `
         -Failure "при провалі захисного ACL: спершу спроба прибрати ЩОЙНО СТВОРЕНИЙ (цим прогоном) порожній корінь, потім Stop-BRAVODataRestoreRun — усе це СТРОГО до циклу відновлення компонентів (extraction не повинна викликатись)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/SftpStagingFreeSpaceRequirementDeclaresProbeDirectory' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/InPlacePlanUsesCanonicalRestoreTargetWhenBackupSourceMissing' -DependsOn 'DataRestore/PathGuardsFailClosed') { try {
 
     # --- 6.18. Third restore safety review (PR #40): InPlace restore-target
     # має братись із canonical discovery (RestoreTargetDirectories), а не
@@ -2803,6 +2810,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/ManagedServiceQueryFailureFailsClosed" `
         -Failure "Stop-BRAVODataRestoreServices/Test-BRAVODataRestoreServicesAllStopped мають трактувати null АБО виняток від Get-Service для Managed-запису як провал тиші (unsafe/failure), а не мовчазний 'continue'; unmanaged-записи лишаються повністю ігнорованими, а нормальна Running-служба й далі зупиняється без помилок"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/InPlacePlanUsesCanonicalRestoreTargetWhenBackupSourceMissing' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/RestoreServicesUsesRestartIntentNotLiteralWasRunning' -DependsOn 'DataRestore/PathGuardsFailClosed') { try {
 
     # --- 7.2a. P2: Restore-BRAVODataRestoreServices відновлює службу за
     # ShouldRestartAfterRestore (намір "працювати": Running АБО StartPending
@@ -3608,6 +3617,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/NotificationDeliveryFailureCountsWarning" `
         -Failure "збій доставки (endpoint налаштовано, транспорт кидає) має збільшити лічильник WARNING рівно на 1, записати причину й не виходити за межі функції — і не плутатися з ненастроєним webhook; отримано: $($dataRestoreNotificationProbe.DeliveryFailure | ConvertTo-Json -Compress -Depth 3)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/RestoreServicesUsesRestartIntentNotLiteralWasRunning' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/NotificationCriticalRoutesToAlerts' -DependsOn 'DataRestore/RestoreServicesUsesRestartIntentNotLiteralWasRunning') { try {
 
     Test-BRAVOCondition `
         -Condition (
@@ -4384,3 +4395,4 @@ try {
             }
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/NotificationCriticalRoutesToAlerts' } }

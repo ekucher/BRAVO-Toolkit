@@ -14,6 +14,7 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 — НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/OriginalExceptionMessageNotLost') { try {
 $configLoaderPath = Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'
 $configLoaderScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_CONFIG_LOADER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -569,6 +570,8 @@ try {
 } finally {
     Remove-Item -LiteralPath $busyWaitScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/OriginalExceptionMessageNotLost' } }
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic') { try {
 
 # ============================================================
 # backupMonitoring.SuccessDedupMinutes (5.2.1): loader-нормалізація вікна
@@ -1472,6 +1475,8 @@ try {
 } finally {
     Remove-Item -LiteralPath $reqAdminBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic' } }
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/RequireAdministratorMissingBlocks' -DependsOn 'ConfigLoader/OriginalExceptionMessageNotLost', 'ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic') { try {
 
 # --- ConfigLoader/RequireAdministratorMissingBlocks: викликає
 # Test-BRAVOEffectiveSecurityInvariants НАПРЯМУ у чистому процесі (без
@@ -2369,6 +2374,8 @@ Test-BRAVOCondition `
         Remove-Item -LiteralPath $strictnessBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/RequireAdministratorMissingBlocks' } }
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/Authorization' -DependsOn 'ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic') { try {
 
 # =====================================================================
 # Wave 2 (#216): атомарність авторизаційного шару BRAVO.local.config
@@ -3062,3 +3069,4 @@ try {
         -Name "ConfigLoader/MalformedLocalConfigEmptyKeyFailsClosed" `
         -Failure "BRAVO.local.config з порожнім ключем поруч із валідним override мусить fail closed ЦІЛИМ шаром (атомарно) — сусідній archiveRetentionDays=999 НЕ повинен потрапити в ефективний `$global:-стан; отримано: $malformedEmptyKeyResult"
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/Authorization' } }

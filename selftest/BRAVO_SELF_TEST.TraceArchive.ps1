@@ -114,6 +114,7 @@ function Get-BRAVODirectories {
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_TRACE_ARCHIVE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
     try {
+        if (Enter-BRAVOSelfTestSection -Name 'TraceArchive/BacklogGroupsByNameDateOldestFirst') { try {
         $taTrace = Join-Path $traceArchiveTestRoot "Trace"
         [void](New-Item -ItemType Directory -Path $taTrace -Force)
 
@@ -421,6 +422,8 @@ function Get-BRAVODirectories {
             -not $taOwnFailThrew -and
             @($taOwnFailSession.State.MoveFileCalls).Count -eq 0
         ) -Name 'TraceArchive/OwnLogUploadFailureIsBestEffortNoThrow' -Failure "збій передачі власного логу не має кидати виняток назовні (лише WARNING) і не має чіпати remote-фінал"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'TraceArchive/BacklogGroupsByNameDateOldestFirst' } }
+        if (Enter-BRAVOSelfTestSection -Name 'TraceArchive/OrchestratorSftpFailureKeepsMdzAndSources') { try {
 
         # --- Оркестратор e2e на фейковій SFTP: повний success видаляє .out,
         # локальний MDZ ЗАЛИШАЄТЬСЯ; SFTP fail зберігає все; retry без дублікатів ---
@@ -769,6 +772,8 @@ function Get-BRAVODirectories {
         Test-BRAVOCondition -Condition ($rvBadSidecarSizeResult.Current -eq $false) `
             -Name 'TraceArchive/RemoteVerifyWrongSidecarSizeBlocksSkip' `
             -Failure "невірний розмір remote-sidecar має давати Current=false; факт: Current=$($rvBadSidecarSizeResult.Current) Reason=$($rvBadSidecarSizeResult.Reason)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'TraceArchive/OrchestratorSftpFailureKeepsMdzAndSources' } }
+        if (Enter-BRAVOSelfTestSection -Name 'TraceArchive/RemoteVerifySftpExceptionFailsClosedWithoutThrow' -DependsOn 'TraceArchive/OrchestratorSftpFailureKeepsMdzAndSources') { try {
 
         # (vi) SFTP-виклик кидає виняток (наприклад, обрив з'єднання) -> Current=false, без пробросу винятку назовні.
         $rvThrowSession = New-Object psobject
@@ -1107,6 +1112,8 @@ function Get-BRAVODirectories {
             $taDryRunText.Contains("Get-BRAVOTraceArchiveBacklog") -and
             $taDryRunText.Contains('CompressedLogDeletionEnabled')
         ) -Name 'TraceArchive/DryRunPlansTracePipelineReadOnly' -Failure "BRAVO_DRY_RUN має PLAN-рядки Trace (джерела/would update/would upload/would delete) на КАНОНІЧНІЙ Get-BRAVOTraceArchiveBacklog і показує стан CompressedLogDeletionEnabled"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'TraceArchive/RemoteVerifySftpExceptionFailsClosedWithoutThrow' } }
+        if (Enter-BRAVOSelfTestSection -Name 'TraceArchive/EmptyDateDirNoneIsNoop') { try {
 
         # ===== Порожні legacy каталоги-дати видаляються негайно, незалежно
         # від віку; непорожні лишаються недоторканими для звичайного
@@ -1272,6 +1279,7 @@ function Get-BRAVODirectories {
             $taTasksInstallText -notmatch '(?i)BRAVO_TRACE' -and
             $taTasksInstallText -notmatch '(?i)TRACE_ROTATE|TRACE_UPLOAD'
         ) -Name 'TraceArchive/NoDedicatedTraceScheduledTask' -Failure "BRAVO_TASKS_INSTALL не повинен створювати окремих Trace-тасків — Trace обробляє лише BRAVO_MAINTENANCE"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'TraceArchive/EmptyDateDirNoneIsNoop' } }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$traceArchiveTestRoot) -and (Test-Path -LiteralPath $traceArchiveTestRoot)) {
             Remove-Item -LiteralPath $traceArchiveTestRoot -Recurse -Force -ErrorAction SilentlyContinue
