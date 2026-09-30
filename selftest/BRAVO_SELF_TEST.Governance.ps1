@@ -1854,7 +1854,9 @@
                         $broken.Add(('{0}:{1}: файл не існує -> {2}' -f $mdPath, $item.Number, $target))
                         continue
                     }
-                    if ($fragment.Length -gt 0 -and $resolved.EndsWith('.md') -and
+                    # Розширення Markdown — без урахування регістру (GitHub
+                    # рендерить і GUIDE.MD), як і при відборі документів.
+                    if ($fragment.Length -gt 0 -and $resolved -match '\.md$' -and
                         (Test-Path -LiteralPath (Join-Path $Root $resolved) -PathType Leaf)) {
                         if (-not $anchorCache.ContainsKey($resolved)) {
                             $anchorCache[$resolved] = Get-BRAVODocLinkAnchorSet -FullPath (Join-Path $Root $resolved)
@@ -2086,7 +2088,7 @@
         # Назва документа: `X.md`, X.md (від кореня репозиторію) або
         # посилання [X.md](ціль) / [`X.md`](ціль) — тоді перевіряється ЦІЛЬ,
         # розібрана як у навігаційному посиланні (від каталогу документа).
-        $docName = '(?<doc>(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.md)'
+        $docName = '(?<doc>(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?i:md))'
         $doc = '(?:\[`?' + $docName + '`?\]\((?<dest>[^)\s]*)\)|`?' + $docName + '`?)'
         $docOf = {
             param($Match)
@@ -2194,6 +2196,7 @@
             ForEach-Object { $_.FullName.Substring($rootFull.Length + 1).Replace('\', '/') } |
             Where-Object { $_ -notmatch '^\.git(/|$)' })
     }
+    # -match без урахування регістру: GUIDE.MD — теж Markdown.
     $docLinkMarkdownPath = @($docLinkKnownPath | Where-Object { $_ -match '\.md$' })
     $docLinkBroken = @(Find-BRAVOBrokenDocLink -Root $root -MarkdownPath $docLinkMarkdownPath -KnownPath $docLinkKnownPath)
     Test-BRAVOCondition `
@@ -2379,6 +2382,8 @@
                     '',
                     '[r]: ../README.md'
                 ) -join "`n"), $utf8NoBom)
+        # Розширення .MD великими — теж Markdown.
+        [IO.File]::WriteAllText((Join-Path $docFixtureRoot 'docs\UPPER.MD'), "# Верхній`n`n## 1. Перший`n", $utf8NoBom)
         # Посилання на розділи з документа в підкаталозі: ціль посилання —
         # від каталогу документа; заголовки `5)` і `3\.`.
         [IO.File]::WriteAllText((Join-Path $docFixtureRoot 'docs\sections.md'), (@(
@@ -2512,10 +2517,11 @@
                     '',
                     '$m[0][1] і [A-Z][a-z]+ у прозі; [посібник][1] і [guide][missing-word].',
                     '[ok-h2](docs/guide.md#html-h2) [ok-span](docs/guide.md#span-id) [bad-span-name](docs/guide.md#span-name)',
-                    '[ok-multi-setext](docs/guide.md#багато-рядківзаголовок-setext) [bad-multi-setext](docs/guide.md#багато-рядків-заголовок-setext) [ok-ref-heading](docs/guide.md#посилання-ref-text-тут)'
+                    '[ok-multi-setext](docs/guide.md#багато-рядківзаголовок-setext) [bad-multi-setext](docs/guide.md#багато-рядків-заголовок-setext) [ok-ref-heading](docs/guide.md#посилання-ref-text-тут)',
+                    '[ok-upper-md](docs/UPPER.MD#1-перший) [bad-upper-md](docs/UPPER.MD#немає) — `docs/UPPER.MD`, розділ 1; `docs/UPPER.MD`, розділ 2.'
                 ) -join "`n"), $utf8NoBom)
         $docFixtureKnown = @('README.md', 'VERSION.json', 'docs/guide.md', 'docs/spec(v2).md', 'modules/BRAVO.Fixture/BRAVO.Fixture.psm1',
-            'modules/BRAVO.Fixture.Sub/BRAVO.Fixture.Sub.psm1', 'modules/BRAVO.Fixture/BRAVO.Fixture.Nested.psm1', 'docs/sections.md',
+            'modules/BRAVO.Fixture.Sub/BRAVO.Fixture.Sub.psm1', 'modules/BRAVO.Fixture/BRAVO.Fixture.Nested.psm1', 'docs/sections.md', 'docs/UPPER.MD',
             'selftest/BRAVO_SELF_TEST.Fixture.ps1')
 
         $linkFixtureResult = @(Find-BRAVOBrokenDocLink -Root $docFixtureRoot -MarkdownPath @('README.md', 'docs/guide.md') -KnownPath $docFixtureKnown)
@@ -2551,6 +2557,7 @@
             'README.md:111: файл не існує -> docs/missing-quote-def.md',
             'README.md:120: якір не існує -> docs/guide.md#span-name',
             'README.md:121: якір не існує -> docs/guide.md#багато-рядків-заголовок-setext',
+            'README.md:122: якір не існує -> docs/UPPER.MD#немає',
             'README.md:26: reference-визначення не існує -> [missing-label]',
             'README.md:119: reference-визначення не існує -> [1]',
             'README.md:119: reference-визначення не існує -> [missing-word]'
@@ -2629,6 +2636,7 @@
             'README.md:83: розділу 11 немає в docs/guide.md -> Розділ 11 [docs/guide.md](docs/guide.md)',
             'README.md:83: розділу 13 немає в docs/guide.md -> [docs/guide.md](docs/guide.md) розділ 13',
             'README.md:108: розділу 3 немає в docs/guide.md -> [README.md](docs/guide.md), розділ 3',
+            'README.md:122: розділу 2 немає в docs/UPPER.MD -> `docs/UPPER.MD`, розділ 2',
             'docs/sections.md:1: документа не існує -> розділ 1 [README.md](README.md)',
             'docs/sections.md:1: розділу 9 немає в docs/guide.md -> [guide.md](/docs/guide.md), розділ 9',
             'docs/sections.md:8: розділу 6 немає в docs/sections.md -> §6'
