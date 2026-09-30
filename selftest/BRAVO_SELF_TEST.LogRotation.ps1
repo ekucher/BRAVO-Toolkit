@@ -339,6 +339,74 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             -Name "RangeId/06-MissingSystemFileProducesWarning" `
             -Failure "відсутній authoritative системний range_id_log.json має давати WARNING з фактичним шляхом без пошуку копій"
 
+        # StrictMode 2.0: JSON із перевищеним порогом, але без верхньорівневого
+        # `time`, не має обривати Test-RangeIdUsage винятком (обрив нічного
+        # прогону без сповіщення); наявний `time` потрапляє в alert.
+        $rangeTimeFixtureDirectory = Join-Path $rotationTestRoot 'rangetime'
+        [void][IO.Directory]::CreateDirectory($rangeTimeFixtureDirectory)
+        $rangeNoTimePath = Join-Path $rangeTimeFixtureDirectory 'range_no_time.json'
+        $rangeWithTimePath = Join-Path $rangeTimeFixtureDirectory 'range_with_time.json'
+        [IO.File]::WriteAllText($rangeNoTimePath, '{"critical":[{"file":"R1","filled":95}]}', (New-Object System.Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($rangeWithTimePath, '{"time":"2026-09-30 03:00","critical":[{"file":"R1","filled":95}]}', (New-Object System.Text.UTF8Encoding($false)))
+        $rangeTimeProbe = {
+            param($Path)
+            Set-StrictMode -Version 2.0
+            $script:rangeAlerts = New-Object System.Collections.Generic.List[string]
+            function Write-Log {
+                param($Message, $Level, [switch]$NoTimestamp, [switch]$NoConsole)
+                $null = $NoTimestamp
+                $null = $NoConsole
+            }
+            function Send-SlackAlert { param($Message, [switch]$IsCritical) $script:rangeAlerts.Add([string]$Message) }
+            function ConvertFrom-BRAVOJson { param([Parameter(ValueFromPipeline = $true)]$InputObject) process { $InputObject | ConvertFrom-Json } }
+            function Format-BRAVOUkrainianCount { param([int]$Count, [string]$One, [string]$Few, [string]$Many) return "$Count" }
+            function Format-BRAVONotificationListSummary { param($ExampleLines, $TotalCount, $RemainderNounOne, $RemainderNounFew, $RemainderNounMany) return @($ExampleLines) }
+            $thrown = $null
+            $result = $null
+            try { $result = Test-RangeIdUsage -Path $Path -ThresholdPercent 80 } catch { $thrown = $_.Exception.Message }
+            [pscustomobject]@{ Thrown = $thrown; HasIssue = ($null -ne $result -and [bool]$result.HasIssue); Alert = ($script:rangeAlerts -join "`n") }
+        }
+        $rangeNoTimeResult = & $rangeIdUsageModule $rangeTimeProbe $rangeNoTimePath
+        $rangeWithTimeResult = & $rangeIdUsageModule $rangeTimeProbe $rangeWithTimePath
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $rangeNoTimeResult.Thrown -and
+                $rangeNoTimeResult.HasIssue -and
+                -not $rangeNoTimeResult.Alert.Contains('Час оновлення даних') -and
+                $null -eq $rangeWithTimeResult.Thrown -and
+                $rangeWithTimeResult.Alert.Contains('Час оновлення даних: 2026-09-30 03:00')
+            ) `
+            -Name "RangeId/07-MissingTimeFieldDoesNotThrowUnderStrictMode" `
+            -Failure "Test-RangeIdUsage має читати необов'язкове поле time через PSObject.Properties: JSON без time із перевищеним порогом не повинен кидати виняток під StrictMode 2.0, а наявний time має потрапляти в alert"
+
+        # Решта матриці #288 під тим самим StrictMode 2.0: `time` = null,
+        # записи без `filled` / без `file` (пропускаються) і поріг, який
+        # не перевищено, — жоден варіант не кидає виняток.
+        $rangeNullTimePath = Join-Path $rangeTimeFixtureDirectory 'range_null_time.json'
+        $rangePartialEntriesPath = Join-Path $rangeTimeFixtureDirectory 'range_partial_entries.json'
+        $rangeBelowThresholdPath = Join-Path $rangeTimeFixtureDirectory 'range_below_threshold.json'
+        [IO.File]::WriteAllText($rangeNullTimePath, '{"time":null,"critical":[{"file":"R1","filled":95}]}', (New-Object System.Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($rangePartialEntriesPath, '{"critical":[{"file":"R1"},{"filled":99},null,{"file":"R2","filled":95}]}', (New-Object System.Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($rangeBelowThresholdPath, '{"critical":[{"file":"R1","filled":50}]}', (New-Object System.Text.UTF8Encoding($false)))
+        $rangeNullTimeResult = & $rangeIdUsageModule $rangeTimeProbe $rangeNullTimePath
+        $rangePartialEntriesResult = & $rangeIdUsageModule $rangeTimeProbe $rangePartialEntriesPath
+        $rangeBelowThresholdResult = & $rangeIdUsageModule $rangeTimeProbe $rangeBelowThresholdPath
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $rangeNullTimeResult.Thrown -and
+                $rangeNullTimeResult.HasIssue -and
+                -not $rangeNullTimeResult.Alert.Contains('Час оновлення даних') -and
+                $null -eq $rangePartialEntriesResult.Thrown -and
+                $rangePartialEntriesResult.HasIssue -and
+                $rangePartialEntriesResult.Alert.Contains('R2') -and
+                -not $rangePartialEntriesResult.Alert.Contains('R1') -and
+                $null -eq $rangeBelowThresholdResult.Thrown -and
+                -not $rangeBelowThresholdResult.HasIssue -and
+                $rangeBelowThresholdResult.Alert.Length -eq 0
+            ) `
+            -Name "RangeId/08-NullTimeAndPartialEntriesUnderStrictMode" `
+            -Failure ("Test-RangeIdUsage під StrictMode 2.0: time=null не додає рядок часу, записи без file/filled пропускаються, поріг не перевищено — без alert; жоден варіант не кидає виняток. Факт: null-time='" + $rangeNullTimeResult.Thrown + "', partial='" + $rangePartialEntriesResult.Thrown + "', below='" + $rangeBelowThresholdResult.Thrown + "'")
+
         # --- Test 3: відсутній bravo.ini -> помилка з назвою шляху, без
         # мовчазного fallback на каталог поруч із bravo.exe ---
         $test3SystemRoot = Join-Path $rotationTestRoot "test03\Windows"
