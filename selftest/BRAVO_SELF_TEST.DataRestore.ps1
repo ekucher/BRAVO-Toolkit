@@ -285,6 +285,30 @@ function Stop-Process {
             -Name "DataRestore/PlanRejectsUnsafeOutOfPlaceTargets" `
             -Failure "Get-BRAVODataRestorePlan має відхиляти -TargetPath, що перетинається із захищеним розташуванням у БУДЬ-ЯКУ сторону вкладеності (BackupRoot/RuntimeRoot/staging/live-джерело), відносний шлях і непорожню ціль компонента"
 
+        # Диск-відносне ('C:restore') і корінь-відносне ('\restore') значення
+        # IsPathRooted вважає rooted, але вони резолвяться відносно
+        # поточного каталогу/диска процесу (елевований — System32).
+        $planDriveRelative = & $planInvoke $dataRestoreModule 'OutOfPlace' 'C:restore' $planBackupRoot $planRuntimeRoot $planStagingRoot $planDefinitions
+        $planRootRelative = & $planInvoke $dataRestoreModule 'OutOfPlace' '\restore' $planBackupRoot $planRuntimeRoot $planStagingRoot $planDefinitions
+        Test-BRAVOCondition `
+            -Condition (
+                -not $planDriveRelative.Success -and
+                -not $planRootRelative.Success -and
+                ([string]$planDriveRelative.Error).Contains('повністю кваліфікованим') -and
+                ([string]$planRootRelative.Error).Contains('повністю кваліфікованим')
+            ) `
+            -Name "DataRestore/PlanRejectsDriveAndRootRelativeTargetPath" `
+            -Failure "Get-BRAVODataRestorePlan (OutOfPlace) має відхиляти диск-відносне 'C:restore' і корінь-відносне '\restore' -TargetPath (IsPathRooted їх пропускає)"
+
+        # -TargetPath перевіряється ще ДО UAC-релаунчу, де робочий каталог —
+        # C:\Windows\System32.
+        $targetGuardIndex = $dataRestoreRuntimeTextForTests.IndexOf('Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value ([Environment]::ExpandEnvironmentVariables($TargetPath))')
+        $relaunchIndex = $dataRestoreRuntimeTextForTests.IndexOf('Start-Process powershell.exe -ArgumentList $elevatedArguments')
+        Test-BRAVOCondition `
+            -Condition ($targetGuardIndex -gt 0 -and $relaunchIndex -gt $targetGuardIndex) `
+            -Name "DataRestore/TargetPathValidatedBeforeElevation" `
+            -Failure "-TargetPath має проходити Test-BRAVODataRestoreFullyQualifiedWindowsPath ДО Start-Process -Verb RunAs, інакше диск-/корінь-відносне значення резолвиться в System32 елевованого процесу"
+
         # Fourth restore safety review (PR #40): наперед існуюча, але
         # ПОРОЖНЯ ціль компонента теж має відхилятись (не лише непорожня) —
         # інакше runtime не міг би достовірно відрізнити "каталог створив
