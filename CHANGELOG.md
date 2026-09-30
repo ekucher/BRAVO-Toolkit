@@ -41,6 +41,16 @@
   `RangeId/08-NullTimeAndPartialEntriesUnderStrictMode` (`time = null`, записи без
   `file`/`filled`, поріг не перевищено).
 
+- **Fix: Health не падає на хостах без `ServiceController.StartType` (#295).**
+  `Get-ManagedServiceHealthIssues` читав `$service.StartType` напряму; властивість
+  з'явилась лише в .NET 4.6.1, тож на Server 2012 R2 із .NET 4.5.x під
+  `Set-StrictMode -Version 2.0` кожен Health (зокрема post-backup) завершувався exit `90`
+  без сповіщення, а WMI-fallback на `StartMode` не виконувався. Тепер `StartType` читається
+  через `PSObject.Properties`, і за його відсутності тип запуску береться з WMI. Нові
+  self-test перевірки: `Health/ManagedServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `Health/ManagedServiceStartTypePresentAndWmiFailureUnderStrictMode` (наявний `StartType`
+  має пріоритет над WMI; збій WMI не обриває Health). Аналогічні звернення поза Health
+  відстежуються в #319.
 - **Документація: операторські розділи про сповіщення перекладено
   українською, виправлено латинські літери в українських словах (A10).**
   Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
