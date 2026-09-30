@@ -10,11 +10,11 @@
 # $root, Test-BRAVOCondition, New-BRAVOSelfTestRuntimeModule,
 # $script:failures.
 #
-# ЕКСПОРТОВАНА ЗАЛЕЖНІСТЬ: $logRotationModule, створений тут, ДАЛІ
-# використовується в моноліті ПІСЛЯ цього фрагмента (Maintenance
-# lock-probe тести). Dot-sourcing виконується в скоупі викликача, тому
-# змінна переживає фрагмент -- не перетворюйте цей файл на функцію чи
-# окремий scope без міграції тих споживачів.
+# $logRotationModule, створений тут, -- ВЛАСНА фікстура фрагмента. Корінь
+# і інші фрагменти її не читають (#219): lock-probe тести Maintenance
+# будують власну екстракцію Get-BRAVOFileLockingProcess, бо -Suite без
+# LogRotation інакше падав на невизначеній змінній. Міжsuite-читання
+# стереже Framework/SelectiveSuitesHaveNoCrossSuiteDependency.
 #
 # ПРИХОВАНА ЗАЛЕЖНІСТЬ: $maintenanceScriptText -- локальне перечитування
 # (той самий вміст файлу, immutable протягом self-test-прогону).

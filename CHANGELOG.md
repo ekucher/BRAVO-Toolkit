@@ -2,6 +2,28 @@
 
 ## Не випущено (developer)
 
+- **Self-test: кожен `-Suite` самодостатній (#219, частина A).** Кореневе тіло
+  `BRAVO_SELF_TEST.ps1` виконується завжди, але читало змінні, які визначали лише
+  gated-фрагменти, а фрагмент `TraceArchive` викликав функцію з фрагмента `BazaSync`.
+  У повному прогоні це працювало, бо фрагменти вже виконались. Натомість будь-який
+  `-Suite` без `ManifestStorage`, `LogRotation`, `ConsoleUX` чи `BazaSync` падав під
+  `Set-StrictMode` ще до обраного suite. Виправлено всі залежності:
+  корінь читає власний `$maintenanceScriptText` (той самий файл
+  `BRAVO.Maintenance.Runtime.ps1`) замість `$maintenanceScriptTextForManifestStorage`;
+  Range ID-тести мають власний тимчасовий каталог із прибиранням у `finally`
+  замість `$manifestStorageTestRoot`; lock-probe `Maintenance/LockedLogNamesHoldingProcess`
+  будує власну екстракцію `Get-BRAVOFileLockingProcess` замість `$logRotationModule`;
+  дві структурні перевірки `Console/ManualExit*`, що читають `$waitManualExitText`,
+  перенесено у фрагмент `ConsoleUX`, який цей текст витягує;
+  `New-BRAVOSelfTestFakeBazaSession` визначено в bootstrap-і кореня, спільному для
+  `BazaSync` і `TraceArchive`, а `TraceArchive` сам завантажує `Tools\WinSCPnet.dll`
+  (тим самим ідемпотентним гардом, що й `BazaSync`) для `WinSCP.TransferOptions`.
+  Повний прогін виконує ті самі перевірки з тими самими іменами; дві перевірки `Console/ManualExit*` тепер зараховуються до suite `ConsoleUX`.
+  Нові перевірки `Framework/SelectiveSuitesHaveNoCrossSuiteDependency` (статичний
+  AST-аналіз: змінна чи функція, яку визначає лише gated-фрагмент, не читається ні
+  коренем, ні іншим фрагментом) і `Framework/SelectiveSuitesHaveNoCrossSuiteDependencyIsMeaningful`
+  (guard знаходить синтетичну залежність і мовчить на чистому варіанті). Runtime-код
+  не змінювався.
 - **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
   `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
   ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
