@@ -12,7 +12,11 @@
   змінюється; перевірка захищає від майбутньої регресії, за якої підмінений 7-Zip чи
   WinSCP пройшов би перевірку цілісності проти чужого маніфесту. Нові self-test
   перевірки: `ConfigLoader/ToolManifestPathRedirectionBlocks`,
-  `ConfigLoader/ToolManifestPathCanonicalAllowed`.
+  `ConfigLoader/ToolManifestPathCanonicalAllowed`;
+  `ConfigLoader/ToolManifestPathEdgeCasesFailClosed` фіксує крайові випадки:
+  порожній і синтаксично зіпсований шлях та `..` за межі `Tools\` блокуються,
+  а `..`, що після нормалізації веде до того самого канонічного файла,
+  допускається.
 
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не

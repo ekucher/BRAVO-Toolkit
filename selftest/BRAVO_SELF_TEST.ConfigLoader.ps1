@@ -1579,6 +1579,33 @@ Test-BRAVOCondition `
     -Name "ConfigLoader/ToolManifestPathCanonicalAllowed" `
     -Failure "канонічний toolIntegritySettings.ManifestPath (<toolsPath>\TOOLS_MANIFEST.json) не повинен блокуватись; отримано: $toolManifestCanonicalResult"
 
+# Крайові випадки T001 в одному дочірньому процесі: порожній і
+# синтаксично зіпсований ManifestPath блокуються (fail-closed: жодне з них
+# derivation не виробляє); сегменти '..', що після GetFullPath дають той
+# самий канонічний файл, допускаються навмисно (це той самий шлях), а
+# '..', що виводить за межі Tools\, блокується.
+$toolManifestEdgeProbeCommand = (
+    $toolManifestProbePrefix +
+    "`$edgeCases = [ordered]@{ " +
+    "'empty' = ''; " +
+    "'malformed' = 'C:\bad:name|<>\TOOLS_MANIFEST.json'; " +
+    "'dotCanonical' = (Join-Path `$global:toolsPath '..\Tools\TOOLS_MANIFEST.json'); " +
+    "'dotEscape' = (Join-Path `$global:toolsPath '..\Other\TOOLS_MANIFEST.json') }; " +
+    "`$edgeOutcomes = foreach (`$edgeName in @(`$edgeCases.Keys)) { " +
+    "`$global:toolIntegritySettings = @{ Mode = 'Enforce'; ManifestPath = `$edgeCases[`$edgeName] }; " +
+    "try { Test-BRAVOEffectiveSecurityInvariants; `$edgeName + '=NO-THROW' } " +
+    "catch { if ([string]`$_.Exception.Message -like '*toolIntegritySettings.ManifestPath*') { `$edgeName + '=BLOCKED' } else { `$edgeName + '=OTHER' } } }; " +
+    "`$edgeOutcomes -join ';' } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$toolManifestEdgeResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestEdgeProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition ($toolManifestEdgeResult -eq 'empty=BLOCKED;malformed=BLOCKED;dotCanonical=NO-THROW;dotEscape=BLOCKED') `
+    -Name "ConfigLoader/ToolManifestPathEdgeCasesFailClosed" `
+    -Failure "порожній і зіпсований ManifestPath та '..' за межі Tools\ мають блокуватись, а '..', що веде до канонічного файла, — ні; отримано: $toolManifestEdgeResult"
+
 # ============================================================
 # Issue #216, Wave 2 review-фікс: backupMonitoring.SFTP.BAZA.Mode/
 # .MutationPolicy — owner-decision листи, для яких DENY_SECURITY_CONTROL
