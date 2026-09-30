@@ -5625,7 +5625,10 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     #     операцію (Resolve-BRAVOArchiveSpaceDecision нижче), тож цю діру
     #     довелось закрити по-справжньому.
     # Джерело, розмір якого виміряти не вдалось (шлях недоступний, порожній
-    # або не заданий), лишає компонент без вимоги — як і до 5.2.4.
+    # або не заданий), лишає компонент без вимоги — як і до 5.2.4. Так само
+    # без вимоги лишається джерело, виміряне успішно з нульовим розміром
+    # (порожній каталог або лише файли нульової довжини): sourceBytes -eq 0
+    # не дає верхньої оцінки, і SourceUpperBoundBytes/EstimatedBytes = $null.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object[]]$EnabledArchives,
@@ -5836,9 +5839,10 @@ function Resolve-BRAVOArchiveSpaceDecision {
     #     RequirementGranularity=Entity, RequiredGB з уже обчисленого
     #     Get-BRAVOArchiveEstimatedSpaceRequirement; з 5.2.4 компонент без
     #     валідної історії несе вимогу з нестиснутого розміру джерела, і
-    #     RequiredGB лишається невідомим лише коли джерело виміряти не
-    #     вдалось — тоді GroupRequirementState=Unknown, safe floor fallback
-    #     BelowFallbackFloorNoEstimate).
+    #     RequiredGB лишається невідомим, коли джерело виміряти не вдалось
+    #     або виміряний розмір нульовий (порожнє джерело чи лише файли
+    #     нульової довжини) — тоді GroupRequirementState=Unknown, safe floor
+    #     fallback BelowFallbackFloorNoEstimate).
     #
     # ВАЖЛИВО (5.2.4, замінює рішення reviewer #2 від 2026-08-30):
     # RequirementPolicy='ArchivePeakSafe'. MinimumFreeSpaceGB — захист
@@ -6621,7 +6625,8 @@ function Main {
     # кожного компонента + запас), а не лише "диск ОС не забитий впритул".
     # Компонент без історії з 5.2.4 оцінюється верхньою оцінкою з
     # розміру джерела; без вимоги лишається лише компонент, джерело якого
-    # виміряти не вдалось.
+    # виміряти не вдалось або виміряний розмір якого нульовий (порожнє
+    # джерело чи лише файли нульової довжини).
     try {
         $archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement `
             -EnabledArchives $enabledArchives `
