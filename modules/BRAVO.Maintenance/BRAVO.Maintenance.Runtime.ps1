@@ -2670,10 +2670,15 @@ function Test-RangeIdUsage {
         }
 
     $sourceFileName = [System.IO.Path]::GetFileName($Path)
+    # `time` необов'язкове: під StrictMode 2.0 пряме $rangeData.time для
+    # відсутньої властивості кидає виняток (обрив нічного прогону), тому
+    # читаємо через PSObject.Properties, як і решту полів.
+    $rangeTimeProperty = $rangeData.PSObject.Properties['time']
+    $rangeTime = if ($rangeTimeProperty) { $rangeTimeProperty.Value } else { $null }
     $message = "Перевищено поріг використання діапазонів ID (${thresholdText}%):`n$($alertLines -join "`n")"
     $message += "`nФайл: $sourceFileName"
-    if ($rangeData.time) {
-        $message += "`nЧас оновлення даних: $($rangeData.time)"
+    if ($rangeTime) {
+        $message += "`nЧас оновлення даних: $rangeTime"
     }
 
     # Повний перелік діапазонів — у журналі; операторський alert —
@@ -2688,8 +2693,8 @@ function Test-RangeIdUsage {
         ''
         "Файл: $sourceFileName"
     )
-    if ($rangeData.time) {
-        $rangeAlertCompactLines += "Час оновлення даних: $($rangeData.time)"
+    if ($rangeTime) {
+        $rangeAlertCompactLines += "Час оновлення даних: $rangeTime"
     }
 
     Write-Log $message -Level "WARNING" -NoConsole
