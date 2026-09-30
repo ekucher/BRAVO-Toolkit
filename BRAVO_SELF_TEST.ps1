@@ -1459,7 +1459,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     # лишаються видимими як WARNING, але не інкрементують лічильник
     # попереджень. Інакше кожен успішний прогін на невідновленому сервері
     # назавжди завершувався б кодом 10 (SuccessWithWarnings) зі статусом
-    # ЧАСТКОВО — саме це й спостерігалось на SERV_HRDL_1 (останнє оновлення
+    # ЧАСТКОВО — саме це й спостерігалось на SRV-LAB7 (останнє оновлення
     # Windows 1109 дн. тому).
     $loggingModuleSourceText = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.Logging\BRAVO.Logging.psm1"), [Text.Encoding]::UTF8)
@@ -4126,7 +4126,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Operation "BAZA_APP — 50 ФАЙЛІВ НЕ СИНХРОНІЗОВАНО" `
         -ActionText "скоротити назви зазначених файлів." `
         -InstitutionName "ТЕСТОВА УСТАНОВА BRAVO" `
-        -InstitutionCode "00702245" `
+        -InstitutionCode "00000000" `
         -HostInformation $notifyHostPublic `
         -ResultLines $bazaLines `
         -Timestamp ([datetime]"2026-08-09T12:00:07") `
@@ -4325,7 +4325,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "Notifications/PayloadGuardLeavesSmallMessagesUntouched" `
         -Failure "малий payload має проходити без змін і без truncation-suffix"
-    # Регресія 5.2.1-rc.8 (ХРДЛ 2026-08-27): одно-chunk результат конвертора
+    # Регресія 5.2.1-rc.8 (ЛАБОРАТОРІЯ-7 2026-08-27): одно-chunk результат конвертора
     # присвоювався без зовнішнього @(...) і PowerShell 5.1 розгортав його в
     # скаляр-[string]; наступний .Count під Set-StrictMode 2.0 кидав
     # PropertyNotFoundException і логував хибний ERROR про недоставлене
@@ -4589,7 +4589,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Notifications/SlackNeverFallsBackToProviderWideWebhook" `
         -Failure "для Slack відсутній route-специфічний credential мусить давати THROW навіть при наявному legacy BRAVO_SLACK_URL, і legacy-запис не повинен ЧИТАТИСЬ взагалі — жодного provider-wide fallback і жодного fallback між каналами GENERAL/ALERTS"
     # --- Dry-run має перевіряти РІВНО ті записи Credential Manager, які
-    # читає runtime. Регресія з логів SERV_HRDL_1 (2026-08-24): сервер
+    # читає runtime. Регресія з логів SRV-LAB7 (2026-08-24): сервер
     # налаштовано на route-специфічні webhook-и, BRAVO_DISCORD_URL відсутній —
     # сповіщення працювали, а dry-run звітував [FAIL] і зупиняв BRAVO_SETUP
     # fail-closed.
@@ -8894,7 +8894,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "BackupConsistency/VSSDiskshadowRunsExactlyOnce" `
         -Failure "сценарій diskshadow.exe має завершуватися EXIT, запускатися лише через Start-BRAVOProcessOutputCapture і не покладатися на англомовний текст виводу"
 
-    # 5.2.1 (реальний звіт SERVER-01/Тернопіль): без SET METADATA
+    # 5.2.1 (реальний звіт SERVER-01/Лабораторія-12): без SET METADATA
     # diskshadow.exe у backup-контексті писав metadata-.cab з автоіменем
     # (NN-DD.MM.YYYY-HH_--_HOSTNAME.cab) у робочий каталог планової
     # задачі — файли накопичувались у C:\Program Files\BRAVO-Toolkit.
@@ -10727,7 +10727,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Failure 'рішення про відкладення й повернення Deferred мають бути поза try/catch: інакше помилка у формуванні результату скасовує вже ухвалене відкладення'
 
         # 5.2.1: BAZASync (:00, ~16-17 хв) систематично накривав слот Health
-        # :15 — усі денні прогони відкладались без повтору (ДНДІЛДВСЕ,
+        # :15 — усі денні прогони відкладались без повтору (ЛАБОРАТОРІЯ-6,
         # 25-27.08.2026). Перед відкладенням Health мусить обмежено чекати
         # звільнення архівації (BusyWaitMinutes з loader-дефолтом), і лише
         # після дедлайна повертати Deferred.
@@ -13223,7 +13223,7 @@ try {
         -Name "Health/ServerSideHashFallbackIsInfoNotWarning" `
         -Failure "фолбек на .sha512-файл — це успішна перевірка іншим методом, а не WARNING; має логуватись як INFO"
 
-    # 5.2.1 (реальний алерт SERV_HRDL_1 23:03): активний WinSCP.com іншої
+    # 5.2.1 (реальний алерт SRV-LAB7 23:03): активний WinSCP.com іншої
     # BRAVO-операції робив SFTP health-check CRITICAL «ПОТРІБНА ДІЯ».
     # Transient-конкуренція = ВІДКЛАДЕННЯ: pre-check зайнятості ДО
     # конфігураційних/мережевих кроків -> WARNING + return без issues,
@@ -18920,7 +18920,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # -> severity сповіщення WARNING -> оператор бачив жовте "ПОТРІБНА ДІЯ:
     # перевірити журнал" при повністю зеленому списку етапів. Це констатація
     # свідомої дії оператора, а не аномалія -> INFO.
-    # 5.2.1 (рішення власника, реальний денний прогін ТЕРНОПІЛЬСЬКА РДЛ
+    # 5.2.1 (рішення власника, реальний денний прогін ЛАБОРАТОРІЯ-12
     # 2026-08-26): гілка "Реставрацію пропущено ... поза дозволеним вікном"
     # — ТОЙ САМИЙ клас хибного «ПОТРІБНА ДІЯ» (слот не втрачається:
     # підхоплюється нічним Maintenance у вікні / boot-Recovery) — теж INFO;
@@ -18946,7 +18946,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             -not $restoreSkippedByWindowWindow.Contains('-Level "WARNING"')
         ) `
         -Name "Maintenance/RestoreWindowSkipsAreInfoNotWarning" `
-        -Failure "обидві гілки поза вікном ('Примусова реставрація...' і 'Реставрацію пропущено...') мають логуватись як INFO — слот не втрачається (нічний Maintenance/boot-Recovery), а WARNING давав хибне «ПОТРІБНА ДІЯ» з exit 10 при зеленому прогоні (Тернопіль 2026-08-26)"
+        -Failure "обидві гілки поза вікном ('Примусова реставрація...' і 'Реставрацію пропущено...') мають логуватись як INFO — слот не втрачається (нічний Maintenance/boot-Recovery), а WARNING давав хибне «ПОТРІБНА ДІЯ» з exit 10 при зеленому прогоні (Лабораторія-12 2026-08-26)"
 
     # --- РЕГРЕСІЯ (реальний DEV-LIMS прогін 20:29): підсумок показав
     # "Кроків: 8" при "Успішно: 9" + "Пропущено: 4" — арифметично
