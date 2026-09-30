@@ -159,29 +159,32 @@
   `telegram-ci-summary-test.yml`.
 
 - **Загортання `List[object]` у `@()` тепер ловить один guard на весь
-  репозиторій, а не точкові перевірки.** `@($x)`, де `$x` — список
+  репозиторій, а не точкові перевірки.** `@($x)`, де `$x` тримає
   `System.Collections.Generic.List[object]`, створений через `New-Object`,
-  кидає `ArgumentException "Argument types do not match"` і у Windows
-  PowerShell 5.1, і в PowerShell 7. У PR #225 саме так зведена
-  generation-подія Archive і дві health-події не доходили в Operations на
-  кожному прогоні. Раніше цей клас тримався коментарями біля окремих
-  змінних і одним точковим guard-ом, які нове входження не бачили.
+  кидає `ArgumentException "Argument types do not match"`
+  (`PSToObjectArrayBinder`) і у Windows PowerShell 5.1, і в PowerShell 7 —
+  незалежно від вмісту списку й від `Set-StrictMode`. Тригер — PSObject-обгортка
+  виводу `New-Object`: вона переживає присвоєння, аліас, `return ,$list`,
+  передачу в параметр без типу чи `[object]`, зберігання у властивості
+  (`@($group.Owners)`) та в елементі словника (`@($byKey[$k])`). Безпечні
+  `.ToArray()`, каст `[object[]]`, параметр `[object[]]`/`[array]`/`[List[object]]`,
+  `List[psobject]` та інші generic-типи. У PR #225 саме цей клас не давав
+  generation-події Archive і двом health-подіям дійти в Operations; до того
+  він тримався коментарями біля окремих змінних і одним точковим guard-ом.
 
   Нова перевірка self-test `Governance/GenericObjectListNeverWrappedInArraySubexpression`
-  розбирає AST усіх PowerShell-файлів репозиторію (той самий перелік, що
-  аналізує CI) і падає з `файл:рядок` на `@(<такий список>)` — зокрема
-  через аліас, `$script:`-змінну, `return ,$list` і параметр без типу.
-  Перевірка `Governance/GenericObjectListBinderGuardIsMeaningful` тримає
-  її непорожньою на синтетичній фікстурі. На поточному дереві знахідок
-  немає; на знімку до виправлення PR #225 guard знаходить усі три
-  історичні входження. Поведінка рантайму не змінюється. Забороняюча
-  половина точкового `Archive/StepHistoryPayloadUsesToArrayNotArraySubexpression`
-  тепер надлишкова, але лишається до рішення власника.
-  Після загортання runtime у `Invoke-BRAVO<X>` (T010) список, створений в
-  обгортці, читається вкладеними функціями за динамічним scope; detector
-  шукає джерело по всьому ланцюгу охоплюючих функцій (параметр вкладеної
-  функції з тим самим ім'ям затінює змінну обгортки), а фікстура містить
-  форми всередині обгортки. Без цього такі входження лишались невидимими.
+  розбирає AST усіх PowerShell-файлів із `Get-BRAVOAnalyzableFile` (той самий
+  перелік, що аналізує CI) і падає з `файл:рядок` і причиною на кожне таке
+  `@()`, зокрема у вкладених функціях обгортки `Invoke-BRAVO<X>` (T010), де
+  список читається за динамічним scope. Властивість зіставляється за іменем
+  лише в межах того самого файлу. `Governance/GenericObjectListBinderGuardIsMeaningful`
+  тримає детектор непорожнім на синтетичній фікстурі з небезпечними й
+  безпечними формами. На поточному дереві знахідок немає; на знімку до
+  виправлення PR #225 guard знаходить усі три історичні входження. Поведінка
+  рантайму не змінюється. Забороняюча половина точкового
+  `Archive/StepHistoryPayloadUsesToArrayNotArraySubexpression` тепер
+  надлишкова, але лишається до рішення власника.
+
 - **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —

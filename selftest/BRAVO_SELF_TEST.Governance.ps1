@@ -2740,17 +2740,24 @@ Test-BRAVOCondition `
 # Ім'я змінної нормалізується через VariablePath.UserPath зі зрізанням
 # префікса scope ($script:X і X — одна змінна), а не через DriveName:
 # для $script:X DriveName порожній, і саме на цьому спроба загального
-# guard-а в PR #225 дала 2192 хибні спрацювання. Збіг лише за іменем
-# члена ($o.Items) навмисно не перевіряється — між непов'язаними файлами
-# він дає хибні спрацювання.
+# guard-а в PR #225 дала 2192 хибні спрацювання. PSObject-обгортка
+# переживає й зберігання списку у властивості чи елементі словника:
+# @($group.Owners) і @($byKey[$k]) кидають так само. Властивість
+# зіставляється за іменем лише в межах того самого файлу (між
+# непов'язаними файлами збіг за іменем члена дає хибні спрацювання),
+# елемент словника — за іменем змінної-словника з тим самим scope-правилом,
+# що й для звичайної змінної.
 & {
     function Find-BRAVOObjectListArraySubexpression {
         <#
             Повертає рядки "<Name>:<рядок>: <вираз> (<причина>)" для кожного
             @(<змінна>), де змінна тримає New-Object ...List[object] (у тому
-            самому scope, через аліас або через return ,$list), і для
+            самому scope, через аліас або через return ,$list), для
             @($Param), куди хоч один виклик передає такий список у параметр
-            без типу чи з типом [object]/[psobject].
+            без типу чи з типом [object]/[psobject], для @($x.<Властивість>),
+            якій у тому самому файлі присвоєно такий список (ключ
+            hashtable-літерала або $x.<Властивість> = ...), і для
+            @($словник[...]), елементу якого присвоєно такий список.
             -Source: об'єкти з властивостями Name і Text.
         #>
         param([Parameter(Mandatory = $true)][object[]]$Source)
@@ -2831,15 +2838,37 @@ Test-BRAVOCondition `
         foreach ($sourceItem in $Source) {
             $unitAst = [System.Management.Automation.Language.Parser]::ParseInput([string]$sourceItem.Text, [ref]$null, [ref]$null)
             $unitSources = @{}
+            $unitMembers = @{}
             $unitAssignments = @($unitAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
             foreach ($assignment in $unitAssignments) {
-                if ($assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
                 if (-not (& $isNewObjectList $assignment.Right)) { continue }
+                # $byKey[$k] = New-Object ...: джерелом стає елемент словника
+                # (ключ '[]<ім'я>'), а не сама змінна-словник.
+                if ($assignment.Left -is [System.Management.Automation.Language.IndexExpressionAst] -and
+                    $assignment.Left.Target -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                    $indexPath = $assignment.Left.Target.VariablePath.UserPath
+                    $indexScope = if ($indexPath -match '^(script|global):') { '<script>' } else { & $getScopeName $assignment }
+                    $unitSources[$indexScope + '|[]' + (& $getNormalizedName $indexPath)] = $true
+                    continue
+                }
+                if ($assignment.Left -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                    $assignment.Left.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                    $unitMembers[$assignment.Left.Member.Value.ToLowerInvariant()] = $true
+                    continue
+                }
+                if ($assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
                 $leftPath = $assignment.Left.VariablePath.UserPath
                 $leftScope = if ($leftPath -match '^(script|global):') { '<script>' } else { & $getScopeName $assignment }
                 $unitSources[$leftScope + '|' + (& $getNormalizedName $leftPath)] = $true
             }
-            [void]$units.Add([pscustomobject]@{ Name = [string]$sourceItem.Name; Ast = $unitAst; Sources = $unitSources; Assignments = $unitAssignments })
+            foreach ($hashtableNode in @($unitAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true))) {
+                foreach ($pair in $hashtableNode.KeyValuePairs) {
+                    if ($pair.Item1 -is [System.Management.Automation.Language.StringConstantExpressionAst] -and (& $isNewObjectList $pair.Item2)) {
+                        $unitMembers[$pair.Item1.Value.ToLowerInvariant()] = $true
+                    }
+                }
+            }
+            [void]$units.Add([pscustomobject]@{ Name = [string]$sourceItem.Name; Ast = $unitAst; Sources = $unitSources; Members = $unitMembers; Assignments = $unitAssignments })
         }
         $propagateAliases = {
             param($Unit)
@@ -2952,6 +2981,23 @@ Test-BRAVOCondition `
                     $onlyStatement.PipelineElements.Count -ne 1 -or
                     $onlyStatement.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { continue }
                 $wrappedNode = & $unwrapExpression $onlyStatement
+                $storedReason = $null
+                if ($wrappedNode -is [System.Management.Automation.Language.IndexExpressionAst] -and
+                    $wrappedNode.Target -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                    if (& $hasSource $unit.Sources $arrayNode ('[]' + (& $getNormalizedName $wrappedNode.Target.VariablePath.UserPath))) {
+                        $storedReason = 'елемент словника тримає New-Object List[object]'
+                    }
+                } elseif ($wrappedNode -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                    $wrappedNode -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    $wrappedNode.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                    if ($unit.Members.ContainsKey($wrappedNode.Member.Value.ToLowerInvariant())) {
+                        $storedReason = 'властивості в цьому файлі присвоєно New-Object List[object]'
+                    }
+                }
+                if ($null -ne $storedReason) {
+                    [void]$findings.Add($unit.Name + ':' + $arrayNode.Extent.StartLineNumber + ': ' + $arrayNode.Extent.Text + ' (' + $storedReason + ')')
+                    continue
+                }
                 if ($wrappedNode -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
                 $sinkScope = & $getScopeName $arrayNode
                 $sinkName = & $getNormalizedName $wrappedNode.VariablePath.UserPath
@@ -3002,10 +3048,11 @@ Test-BRAVOCondition `
             $(if ($binderGateFindings.Count -gt 0) { $binderGateFindings -join '; ' } else { '<немає>' }))
 
     # --- Governance/GenericObjectListBinderGuardIsMeaningful ---
-    # Негативний контроль: шість форм, які під PowerShell дійсно кидають
-    # (локальна змінна, $script:, аліас, параметр без типу, return ,$list),
+    # Негативний контроль: форми, які під PowerShell дійсно кидають
+    # (локальна змінна, $script:, аліас, параметр без типу чи [object],
+    # return ,$list, змінна обгортки T010, властивість, елемент словника),
     # мусять знаходитись, а безпечні форми (.ToArray(), параметр
-    # [object[]], список [psobject], сирий виклик @(Get-X)) — ні.
+    # [object[]], список [psobject], сирий виклик @(Get-X), @($d.Keys)) — ні.
     $binderGateFixture = @'
 $script:History = New-Object System.Collections.Generic.List[object]
 function Get-LocalForm { $items = New-Object System.Collections.Generic.List[object]; return @($items) }
@@ -3026,14 +3073,20 @@ function Invoke-RuntimeWrapper3 { $items = New-Object System.Collections.Generic
 function Invoke-RuntimeWrapper4 { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedTyped([object[]]$Items) { return @($Items) }; Get-NestedTyped -Items $items }
 function Invoke-RuntimeWrapper5 { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedAlias { $copy = $items; return @($copy) }; return $null }
 function Invoke-RuntimeWrapper6 { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedObj([object]$Items) { return @($Items) }; Get-NestedObj -Items $items }
+function Get-PropertyForm { $group = [pscustomobject]@{ Owners = (New-Object System.Collections.Generic.List[object]) }; return @($group.Owners) }
+function Get-PropertyAssignedForm { $state = @{}; $state.Pending = New-Object System.Collections.Generic.List[object]; return @($state.Pending) }
+function Get-DictionaryForm { $byKey = @{}; $byKey['a'] = New-Object System.Collections.Generic.List[object]; return @($byKey['a']) }
+function Get-SafePropertyToArray { $group = [pscustomobject]@{ Owners = (New-Object System.Collections.Generic.List[object]) }; return @($group.Owners.ToArray()) }
+function Get-SafeDictionaryKeys { $byKey = @{}; $byKey['a'] = New-Object System.Collections.Generic.List[object]; return @($byKey.Keys) }
+function Get-SafePsObjectProperty { $group = [pscustomobject]@{ Rows = (New-Object System.Collections.Generic.List[psobject]) }; return @($group.Rows) }
 '@
     $binderGateFixtureFindings = Find-BRAVOObjectListArraySubexpression -Source @(
         [pscustomobject]@{ Name = 'fixture'; Text = $binderGateFixture })
     $binderGateFixtureLines = @($binderGateFixtureFindings | ForEach-Object { [int](($_ -split ':')[1]) } | Sort-Object)
     Test-BRAVOCondition `
-        -Condition (($binderGateFixtureLines -join ',') -eq '2,3,4,5,8,14,15,18,19') `
+        -Condition (($binderGateFixtureLines -join ',') -eq '2,3,4,5,8,14,15,18,19,20,21,22') `
         -Name "Governance/GenericObjectListBinderGuardIsMeaningful" `
-        -Failure ("detector binder-гейту має знаходити рівно рядки 2,3,4,5,8,14,15,18,19 синтетичної фікстури (14-19 — форми всередині обгортки Invoke-BRAVO<X> після T010) " +
+        -Failure ("detector binder-гейту має знаходити рівно рядки 2,3,4,5,8,14,15,18,19,20,21,22 синтетичної фікстури (14-19 — форми всередині обгортки Invoke-BRAVO<X> після T010; 20-22 — список у властивості й елементі словника) " +
             "(небезпечні форми) і не знаходити безпечні; фактично: " +
             $(if ($binderGateFixtureFindings.Count -gt 0) { $binderGateFixtureFindings -join '; ' } else { '<нічого>' }))
 }
