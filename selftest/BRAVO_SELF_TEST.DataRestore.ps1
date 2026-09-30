@@ -3801,3 +3801,586 @@ function Get-BRAVOOSSupportTier {
         ) `
         -Name "DataRestore/OSSupportGateAppliedBeforeAnyAction" `
         -Failure "Головний потік BRAVO.DataRestore.Runtime.ps1 має викликати Invoke-BRAVODataRestoreOSSupportGate і виходити з його ExitCode до режиму -ListGenerations і до захоплення operation lock"
+
+    # ============================================================
+    # T011: поведінкова перевірка оркестрації DataRestore.
+    #
+    # Фази InPlace (знімок служб -> маркер -> зупинка -> move-aside ->
+    # розпакування -> відновлення служб у finally -> Health) і OutOfPlace
+    # (служби не чіпаються), відмови ДО деструктивної фази, після зупинки
+    # служб і під час розпакування, прибирання у finally та фінальний код.
+    # Повний прогін Invoke-BRAVODataRestore неможливий без конфігурації,
+    # архівів, служб і прав адміністратора, тому дочірній процес збирає
+    # runtime з ДОСЛІВНОГО тексту BRAVO.DataRestore.Runtime.ps1 (AST):
+    # справжні функції тіла (знімок служб, quiescence, зупинка/запуск через
+    # Invoke-BRAVODataRestoreServiceStateChange, вибір компонентів,
+    # контрольований abort, Send-BRAVODataRestoreNotification), справжня
+    # оркестрація від Initialize-BRAVOConsole до фінального exit (lock,
+    # pipeline, catch, finally відновлення служб, Resolve-BRAVOExitCode,
+    # вибір severity сповіщення) і справжній зовнішній finally. Преамбулу
+    # (імпорт модулів, конфігурацію, елевацію) замінює seed змінних плюс
+    # дослівні top-level присвоєння стану прогону.
+    #
+    # Межа стабів сповіщень (після BRAVO-T023, PR #275): обгортка
+    # Send-BRAVODataRestoreNotification і справжній
+    # New-BRAVOOperatorNotificationMessage (BRAVO.Notifications) виконуються;
+    # стабовано лише транспорт Send-BRAVONotification — з ДОСЛІВНИМ
+    # param-блоком канонічної функції (AST), тож розбіжність сигнатури
+    # виклику ламає тест — і Get-HostInformation (мережевий lookup IP).
+    # Маршрут/endpoint/payload самої доставки покриває окремий тест
+    # DataRestore/NotificationUsesCanonicalRoute* вище. Служби, lock, маркер
+    # quiescence, 7-Zip, move-aside/rollback і Health — стаби, що пишуть
+    # події у журнал. Зібраний runtime запускається через справжній
+    # Invoke-BRAVODataRestoreEntrypoint (& runtime, $LASTEXITCODE,
+    # catch -> 90). Стаби живуть лише в дочірньому процесі; реальні служби,
+    # мережа й webhook не чіпаються.
+    # ============================================================
+    & {
+        $dataRestoreOrchestrationRoot = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_DATA_RESTORE_ORCHESTRATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void][IO.Directory]::CreateDirectory($dataRestoreOrchestrationRoot)
+            $dataRestoreOrchestrationStubs = @'
+function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
+function New-ProbeServiceObject {
+    param([string]$Name)
+    $probeService = [pscustomobject]@{ Name = $Name; DisplayName = $Name; Status = [string]$script:ProbeServices[$Name]; StartType = 'Automatic' }
+    $probeService | Add-Member -MemberType ScriptMethod -Name Refresh -Value { $this.Status = [string]$script:ProbeServices[$this.Name] }
+    return $probeService
+}
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    if ([string]::IsNullOrEmpty($Name)) {
+        return @($script:ProbeServices.Keys | Sort-Object | ForEach-Object { New-ProbeServiceObject -Name $_ })
+    }
+    if (-not $script:ProbeServices.ContainsKey($Name)) { throw "self-test: невідома служба $Name" }
+    return (New-ProbeServiceObject -Name $Name)
+}
+function Start-Service {
+    param([string]$Name, $WarningAction, $ErrorAction, $ErrorVariable)
+    Add-ProbeEvent "START $Name"
+    $script:ProbeServices[$Name] = 'Running'
+}
+function Stop-Service {
+    param([string]$Name, [switch]$Force, $WarningAction, $ErrorAction, $ErrorVariable)
+    Add-ProbeEvent "STOP $Name"
+    $script:ProbeServices[$Name] = 'Stopped'
+}
+function Get-BRAVOWmiInstance { param($ClassName, $Filter) return [pscustomobject]@{ StartMode = 'Auto' } }
+function Get-Process { param($Name, $Id, $ErrorAction) }
+function Stop-Process { param([switch]$Force) Add-ProbeEvent 'STOP-PROCESS' }
+function Start-Sleep { param($Seconds, $Milliseconds) }
+function Write-BRAVOLog {
+    param([string]$Message, [string]$Level = 'INFO', [string]$Component, [switch]$Console)
+    if ($Level -eq 'ERROR' -or $Level -eq 'WARNING') { Add-ProbeEvent ("LOG-{0} {1}" -f $Level, $Message) }
+}
+# T019: gate рівня підтримки ОС (справжній Invoke-BRAVODataRestoreOSSupportGate
+# лишається в збірці): стаб «Supported» не блокує прогін.
+function Get-BRAVOOSSupportTier {
+    return [pscustomobject]@{ Tier = 'Supported'; OperatingSystem = 'self-test'; OperatingSystemVersion = '10.0'; Build = '0'; PowerShellVersion = '5.1'; DotNetRelease = '0'; Message = '' }
+}
+# T006: legacy BOM-у-паролі fallback (BRAVO.ArchiveHelpers) у пробі не імпортується;
+# сценарії проби його не використовують: fallback не спрацьовує, рядків сповіщення немає.
+function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, $Collector, $Logger) return $false }
+function Get-BRAVOLegacyBomFallbackNotificationLines { param($ArchiveNames) return @() }
+function Initialize-BRAVOConsole { }
+function Initialize-BRAVOProgress { param($Enabled) }
+function Write-BRAVOHeader { param($Title, $Institution, $InstitutionCode, $Mode) }
+function Write-BRAVOResultSection { param($Title) }
+function Write-BRAVOResultNote { param($Text) }
+function Write-BRAVOResultField { param($Label, $Value) }
+function Write-BRAVOResultFooter { param($LogFile) }
+function Write-BRAVOResultHeader {
+    param($Status, $StatusColor, $ExitCode, $ExitCodeName, $Reason)
+    Add-ProbeEvent ("RESULT {0} {1}" -f $Status, $ExitCode)
+}
+function Write-BRAVOOperationResult {
+    param([string]$Name, [string]$Status, $Duration, $Details)
+    Add-ProbeEvent ("OP {0} {1}" -f $Name, $Status)
+}
+function Format-BRAVOFileSize { param($Bytes) return 'self-test' }
+function Format-BRAVODuration { param($Duration) return 'self-test' }
+function Test-BRAVODataRestoreToolIntegrity { param($ToolNames) return [pscustomobject]@{ Problems = @(); Mode = 'Enforce' } }
+function Initialize-BRAVOCredentialManager { }
+function Get-BRAVOCredentialSecret { param($Target) return 'self-test-placeholder' }
+function Enter-BRAVODataRestoreOperationLock {
+    Add-ProbeEvent 'LOCK-ENTER'
+    return [pscustomobject]@{ Success = $true; Stream = $null; Path = 'self-test-lock'; Error = $null }
+}
+function Exit-BRAVODataRestoreOperationLock { Add-ProbeEvent 'LOCK-EXIT' }
+function Get-BRAVORestoreGenerationManifest {
+    param($BackupRoot, $RequestedGenerationId)
+    return [pscustomobject]@{ Manifest = $script:ProbeManifest; SkippedManifests = @() }
+}
+function ConvertTo-BRAVORebasedLocalGenerationManifest { param($Manifest, $ComponentTypes, $ArchiveDefinitions) return $Manifest }
+function Get-BRAVODataRestorePlan {
+    param($ComponentTypes, $RestoreMode, $RequestedTargetPath, $BackupRoot, $RuntimeRootPath, $StagingRoot, $ArchiveDefinitions, $RestoreTargetDirectories, $RunStamp)
+    if ($RestoreMode -eq 'InPlace') {
+        return [pscustomobject]@{ Success = $true; Error = $null; TargetRoot = $null; Components = @([pscustomobject]@{
+                    Type = 'MODEL'; TargetDirectory = $script:ProbeLiveDirectory; LiveSourceDirectory = $script:ProbeLiveDirectory
+                    PrerestoreDirectory = ($script:ProbeLiveDirectory + '.prerestore_selftest') }) }
+    }
+    return [pscustomobject]@{ Success = $true; Error = $null; TargetRoot = $RequestedTargetPath; Components = @([pscustomobject]@{
+                Type = 'MODEL'; TargetDirectory = (Join-Path $RequestedTargetPath 'MODEL'); LiveSourceDirectory = $script:ProbeLiveDirectory
+                PrerestoreDirectory = $null }) }
+}
+function Get-BRAVOVerifiedGenerationArchive {
+    param($Manifest, $Component, $NameTemplate, $ComponentDirectory)
+    return [pscustomobject]@{ FullName = $script:ProbeArchivePath; Name = (Split-Path -Leaf $script:ProbeArchivePath) }
+}
+function Test-SevenZipArchiveIntegrity {
+    Add-ProbeEvent 'INTEGRITY'
+    return ($script:ProbeScenario -ne 'InPlaceIntegrityFails')
+}
+function Get-BRAVOSevenZipArchiveInventory { return [pscustomobject]@{ Success = $true; FileCount = 1; DirectoryCount = 0; TotalUncompressedBytes = 1; Description = '' } }
+function Test-BRAVODataRestoreFreeSpace { param($Requirements, $MinimumFreeGigabytes) return [pscustomobject]@{ Success = $true; Notes = @(); Problems = @() } }
+function Write-BRAVOServiceQuiescenceState {
+    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed)
+    Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
+}
+function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
+function Set-BRAVOServiceQuiescenceRestartSuppressed { param([bool]$Suppressed) Add-ProbeEvent 'MARKER-SUPPRESS' }
+function Invoke-BRAVODataRestoreMoveAside {
+    param($LiveDirectory, $PrerestoreDirectory)
+    Add-ProbeEvent 'MOVE-ASIDE'
+    if ($script:ProbeScenario -eq 'InPlaceMoveAsideFails') {
+        return [pscustomobject]@{ Success = $false; Performed = $false; Error = 'self-test: імітована відмова move-aside' }
+    }
+    return [pscustomobject]@{ Success = $true; Performed = $true; Error = $null }
+}
+function Undo-BRAVODataRestoreMoveAside {
+    param($LiveDirectory, $PrerestoreDirectory, $MoveAsidePerformed, $TargetCreatedByThisRun)
+    Add-ProbeEvent 'ROLLBACK'
+    return [pscustomobject]@{ Success = $true; Error = $null }
+}
+function Copy-BRAVODataRestoreDirectoryAcl { param($SourceDirectory, $DestinationDirectory) }
+function Set-BRAVODataRestoreCreatedDirectoryAcl { param($Path) }
+function Invoke-BRAVOSevenZipExtraction {
+    Add-ProbeEvent 'EXTRACT'
+    if ($script:ProbeScenario -eq 'InPlaceThrowInExtraction') { throw 'self-test: імітований збій розпакування' }
+    return [pscustomobject]@{ Success = $true; Description = '' }
+}
+function Test-BRAVODataRestoreExtractionResult { param($TargetDirectory, $Inventory) return [pscustomobject]@{ Success = $true; FileCount = 1; ByteCount = 1; Problems = @() } }
+function Invoke-BRAVODataRestorePostHealth { Add-ProbeEvent 'HEALTH'; return 0 }
+function Get-HostInformation { return [pscustomobject]@{ MachineName = 'self-test-host'; LocalIP = '192.0.2.10'; PublicIP = 'вимкнено' } }
+function Wait-BRAVOManualExit { param([switch]$NoPause) Add-ProbeEvent 'MANUAL-EXIT' }
+'@
+            # Тіло транспортного стабу; param-блок (разом з атрибутами) проба
+            # бере ДОСЛІВНО з канонічної Send-BRAVONotification.
+            $dataRestoreOrchestrationTransportBody = @'
+    Add-ProbeEvent "NOTIFY $Severity"
+    Add-ProbeEvent ("NOTIFY-TEXT " + ($Message -replace '\r?\n', ' || '))
+    if ($script:ProbeScenario -eq 'InPlaceNotificationThrows') { throw 'self-test: імітований збій доставки сповіщення' }
+    return [pscustomobject]@{ Sent = $true; Route = 'self-test'; Reason = $null }
+'@
+            $dataRestoreOrchestrationSeed = @'
+$script:ScriptVersion = 'self-test'
+$script:ScriptBuildId = 'self-test'
+$bravoScriptDirectory = $probeWorkRoot
+$global:runtimeLogRoot = Join-Path $probeWorkRoot 'logs'
+$backupRootPath = Join-Path $probeWorkRoot 'backup'
+$arcPath = 'self-test-7za'
+$winSCPScriptEncoding = 'UTF8'
+$bravoSettings = [pscustomobject]@{ InstitutionName = 'self-test'; InstitutionCode = 'SELFTEST'; NotificationMode = 'errors_only'; NotificationProvider = 'discord' }
+$credentialSettings = @{ Targets = @{ ArchivePassword = 'BRAVO_SELF_TEST_TARGET' } }
+$backupMonitoring = @{ NotificationRouting = @{ SUCCESS = 'general'; WARNING = 'alerts'; ERROR = 'alerts'; CRITICAL = 'alerts' }; NotificationCredentialTargets = @{}; NotificationRequestTimeoutSeconds = 30 }
+$progressSettings = @{ SevenZipTimeoutSeconds = 1 }
+$maintenanceSettings = @{
+    Services = @{ BravoName = 'BRAVO'; ExchangeApiName = 'exchangAPI'; BravoWebEnabled = $true; BravoWebCandidates = @('BravoWeb'); StartTimeoutSeconds = 1; StopTimeoutSeconds = 1; PollIntervalSeconds = 1 }
+    Limits = @{ MinimumFreeSpaceGB = 0 }
+}
+$script:ProbeLiveDirectory = Join-Path (Join-Path $probeWorkRoot 'lims') 'Model'
+$probeComponentDirectory = Join-Path $backupRootPath 'MODEL'
+[void][IO.Directory]::CreateDirectory($probeComponentDirectory)
+$script:ProbeArchivePath = Join-Path $probeComponentDirectory 'MODEL_20260101_000000.7z'
+$probeHashPath = $script:ProbeArchivePath + '.sha512'
+[IO.File]::WriteAllText($script:ProbeArchivePath, 'self-test')
+[IO.File]::WriteAllText($probeHashPath, 'self-test')
+$global:archiveDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Source = (Join-Path $script:ProbeLiveDirectory '*'); Destination = $probeComponentDirectory; NameTemplate = 'MODEL_{0}.7z' })
+$global:bravoDiscoveryResult = [pscustomobject]@{ MODEL_SOURCE = $script:ProbeLiveDirectory; BLOG_SOURCE = ''; BRAVOEXCH_SOURCE = '' }
+$script:ProbeManifest = [pscustomobject]@{
+    generationId = '20260101_000000'
+    components = [pscustomobject]@{
+        MODEL = [pscustomobject]@{ Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true; ArchivePath = $script:ProbeArchivePath; HashPath = $probeHashPath; SHA512 = ''; ArchiveSize = 1 }
+    }
+}
+'@
+            $dataRestoreOrchestrationProbeScript = @'
+param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
+$ErrorActionPreference = 'Stop'
+$probeResultPath = Join-Path $ProbeRoot 'result.json'
+$probeUtf8 = New-Object Text.UTF8Encoding($false)
+try {
+    Remove-Item -Path 'Env:BRAVO_DATARESTORE_TEST_HOOKS', 'Env:BRAVO_DATARESTORE_TEST_FAILPOINT' -ErrorAction SilentlyContinue
+    $probeRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $RepositoryRoot 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $probeParseErrors = $null
+    $probeAst = [Management.Automation.Language.Parser]::ParseInput($probeRuntimeText, [ref]$null, [ref]$probeParseErrors)
+    if (@($probeParseErrors).Count -gt 0) { throw "runtime не парситься: $($probeParseErrors[0].Message)" }
+    $probeWrapper = @($probeAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVODataRestore'
+        }) | Select-Object -First 1
+    if ($null -eq $probeWrapper) { throw 'у runtime немає функції Invoke-BRAVODataRestore' }
+    $probeOuterTry = @($probeWrapper.Body.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.TryStatementAst]
+        }) | Select-Object -First 1
+    if ($null -eq $probeOuterTry -or $null -eq $probeOuterTry.Finally) { throw 'у тілі немає зовнішнього try/finally' }
+    $probeStatements = @($probeOuterTry.Body.Statements)
+    $probeMainStart = -1
+    $probeConfigTry = -1
+    for ($probeIndex = 0; $probeIndex -lt $probeStatements.Count; $probeIndex++) {
+        if ($probeConfigTry -lt 0 -and $probeStatements[$probeIndex] -is [Management.Automation.Language.TryStatementAst] -and
+            $probeStatements[$probeIndex].Extent.Text.Contains('Import-BravoConfiguration')) {
+            $probeConfigTry = $probeIndex
+        }
+        if ($probeStatements[$probeIndex].Extent.Text -match '^Initialize-BRAVOConsole\s*$') {
+            $probeMainStart = $probeIndex
+            break
+        }
+    }
+    if ($probeConfigTry -lt 0) { throw 'у тілі немає try завантаження конфігурації' }
+    if ($probeMainStart -lt 0) { throw 'у тілі немає Initialize-BRAVOConsole (початок головного потоку)' }
+
+    # Транспортний стаб із дослівною сигнатурою канонічної
+    # Send-BRAVONotification (атрибути + param-блок з AST).
+    $probeNotificationsText = [IO.File]::ReadAllText(
+        (Join-Path $RepositoryRoot 'modules\BRAVO.Notifications\BRAVO.Notifications.psm1'), [Text.Encoding]::UTF8)
+    $probeTransport = [Management.Automation.Language.Parser]::ParseInput($probeNotificationsText, [ref]$null, [ref]$null).Find({
+            param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Send-BRAVONotification'
+        }, $true)
+    if ($null -eq $probeTransport -or $null -eq $probeTransport.Body.ParamBlock) { throw 'у BRAVO.Notifications немає Send-BRAVONotification з param-блоком' }
+    $probeStubs = @(
+        [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'stubs.ps1'), [Text.Encoding]::UTF8),
+        'function Send-BRAVONotification {',
+        (@($probeTransport.Body.ParamBlock.Attributes | ForEach-Object { $_.Extent.Text }) -join "`n"),
+        $probeTransport.Body.ParamBlock.Extent.Text,
+        [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'transport.ps1'), [Text.Encoding]::UTF8),
+        '}'
+    ) -join "`n"
+    $probeStubNames = @{}
+    foreach ($probeStubAst in @([Management.Automation.Language.Parser]::ParseInput($probeStubs, [ref]$null, [ref]$null).EndBlock.Statements)) {
+        if ($probeStubAst -is [Management.Automation.Language.FunctionDefinitionAst]) { $probeStubNames[$probeStubAst.Name] = $true }
+    }
+    # Справжні функції: top-level файлу (крім обгортки) і тіла до головного
+    # потоку (крім затінених стабами). Дослівні присвоєння змінних
+    # преамбули — ті, що після try конфігурації, і весь $script:-стан
+    # прогону (елевацію, ідентичність і конфігурацію замінює seed).
+    $probeFunctionTexts = New-Object System.Collections.Generic.List[string]
+    foreach ($probeStatement in @($probeAst.EndBlock.Statements)) {
+        if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $probeStatement.Name -ne 'Invoke-BRAVODataRestore' -and -not $probeStubNames.ContainsKey($probeStatement.Name)) {
+            $probeFunctionTexts.Add($probeStatement.Extent.Text)
+        }
+    }
+    $probeStateTexts = New-Object System.Collections.Generic.List[string]
+    for ($probeIndex = 0; $probeIndex -lt $probeMainStart; $probeIndex++) {
+        $probeStatement = $probeStatements[$probeIndex]
+        if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst]) {
+            if (-not $probeStubNames.ContainsKey($probeStatement.Name)) { $probeFunctionTexts.Add($probeStatement.Extent.Text) }
+        } elseif ($probeStatement -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $probeStatement.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+            ($probeIndex -gt $probeConfigTry -or $probeStatement.Left.VariablePath.IsScript)) {
+            $probeStateTexts.Add($probeStatement.Extent.Text)
+        }
+    }
+    # Дослівний головний потік до кінця зовнішнього try (включно з exit).
+    # Затінені стабами визначення функцій усередині нього замінюються
+    # пробілами, інакше вони перевизначили б стаб під час виконання.
+    $probeRegionStart = $probeStatements[$probeMainStart].Extent.StartOffset
+    $probeRegionEnd = $probeStatements[$probeStatements.Count - 1].Extent.EndOffset
+    $probeRegion = New-Object Text.StringBuilder($probeRuntimeText.Substring($probeRegionStart, $probeRegionEnd - $probeRegionStart))
+    foreach ($probeDefinition in @($probeOuterTry.Body.FindAll({
+                    param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object {
+                $_.Extent.StartOffset -ge $probeRegionStart -and $probeStubNames.ContainsKey($_.Name)
+            })) {
+        $probeLength = $probeDefinition.Extent.EndOffset - $probeDefinition.Extent.StartOffset
+        [void]$probeRegion.Remove($probeDefinition.Extent.StartOffset - $probeRegionStart, $probeLength)
+        [void]$probeRegion.Insert($probeDefinition.Extent.StartOffset - $probeRegionStart, (' ' * $probeLength))
+    }
+
+    $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
+    $probeServiceTable = if ($Scenario -eq 'InPlaceThrowInExtraction') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Running' }"
+    } else {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
+    }
+    $probeScenarioSeed = @(
+        ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
+        ('$script:ProbeScenario = ''{0}''' -f $Scenario.Replace("'", "''")),
+        ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
+        ('$script:ProbeServices = {0}' -f $probeServiceTable)
+    ) -join "`n"
+    $probeGenerated = @(
+        $probeAst.ParamBlock.Extent.Text,
+        'function Invoke-BRAVODataRestoreOrchestrationProbe {',
+        'Set-StrictMode -Version 2.0',
+        ($probeFunctionTexts -join "`n`n"),
+        $probeStubs,
+        $probeScenarioSeed,
+        [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
+        ($probeStateTexts -join "`n"),
+        'try {',
+        $probeRegion.ToString(),
+        ('} finally ' + $probeOuterTry.Finally.Extent.Text),
+        '}',
+        'Invoke-BRAVODataRestoreOrchestrationProbe'
+    ) -join "`n"
+    $probeGeneratedPath = Join-Path $ProbeRoot 'runtime.ps1'
+    [IO.File]::WriteAllText($probeGeneratedPath, $probeGenerated, (New-Object Text.UTF8Encoding($true)))
+
+    foreach ($probeModule in @('BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.DataRestore')) {
+        Import-Module -Name (Join-Path $RepositoryRoot "modules\$probeModule\$probeModule.psd1") -Force
+    }
+    & (Get-Module -Name 'BRAVO.DataRestore') { param($Path) $script:runtimePath = $Path } $probeGeneratedPath
+    $probeParameters = @{
+        RuntimeRoot = $ProbeRoot
+        EntryScriptPath = (Join-Path $ProbeRoot 'BRAVO_DATA_RESTORE.ps1')
+        Component = 'All'
+        Source = 'Local'
+        Force = $true
+        NoPause = $true
+    }
+    if ($Scenario -eq 'OutOfPlace') {
+        $probeParameters['Mode'] = 'OutOfPlace'
+        $probeParameters['TargetPath'] = (Join-Path $ProbeRoot 'target')
+    } else {
+        $probeParameters['Mode'] = 'InPlace'
+    }
+    $global:LASTEXITCODE = 77
+    $probeErrors = $null
+    $ErrorActionPreference = 'Continue'
+    $probeExitCode = Invoke-BRAVODataRestoreEntrypoint -Parameters $probeParameters -ErrorVariable probeErrors 2>$null
+    $probeEvents = @()
+    if (Test-Path -LiteralPath $probeEventsPath -PathType Leaf) {
+        $probeEvents = @([IO.File]::ReadAllLines($probeEventsPath, [Text.Encoding]::UTF8))
+    }
+    $probeResult = [pscustomobject]@{
+        ExitCode = [int]$probeExitCode
+        ExitCodeName = [string](Get-BRAVOExitCodeName -Code ([int]$probeExitCode))
+        Events = $probeEvents
+        Errors = @(@($probeErrors) | ForEach-Object { [string]$_ })
+    }
+} catch {
+    $probeResult = [pscustomobject]@{ ProbeError = [string]$_.Exception.Message }
+}
+[IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
+'@
+            $dataRestoreOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
+            [IO.File]::WriteAllText((Join-Path $dataRestoreOrchestrationRoot 'stubs.ps1'), $dataRestoreOrchestrationStubs, $dataRestoreOrchestrationUtf8)
+            [IO.File]::WriteAllText((Join-Path $dataRestoreOrchestrationRoot 'transport.ps1'), $dataRestoreOrchestrationTransportBody, $dataRestoreOrchestrationUtf8)
+            [IO.File]::WriteAllText((Join-Path $dataRestoreOrchestrationRoot 'seed.ps1'), $dataRestoreOrchestrationSeed, $dataRestoreOrchestrationUtf8)
+            $dataRestoreOrchestrationProbePath = Join-Path $dataRestoreOrchestrationRoot 'probe.ps1'
+            [IO.File]::WriteAllText($dataRestoreOrchestrationProbePath, $dataRestoreOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
+            $dataRestoreOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            $dataRestoreOrchestrationResults = @{}
+            foreach ($dataRestoreOrchestrationScenario in @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace')) {
+                $dataRestoreOrchestrationScenarioRoot = Join-Path $dataRestoreOrchestrationRoot $dataRestoreOrchestrationScenario
+                [void][IO.Directory]::CreateDirectory($dataRestoreOrchestrationScenarioRoot)
+                # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
+                # не дозволяє нових Bypass-місць; той самий підхід, що в T011
+                # Archive): дочірній процес успадковує політику батьківського
+                # прогону self-test.
+                $null = & $dataRestoreOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                    -File $dataRestoreOrchestrationProbePath `
+                    -Scenario $dataRestoreOrchestrationScenario -RepositoryRoot $root -ProbeRoot $dataRestoreOrchestrationScenarioRoot
+                $dataRestoreOrchestrationResultPath = Join-Path $dataRestoreOrchestrationScenarioRoot 'result.json'
+                $dataRestoreOrchestrationResults[$dataRestoreOrchestrationScenario] = if (Test-Path -LiteralPath $dataRestoreOrchestrationResultPath -PathType Leaf) {
+                    [IO.File]::ReadAllText($dataRestoreOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                } else {
+                    [pscustomobject]@{ ProbeError = "проба не записала result.json (код виходу $LASTEXITCODE)" }
+                }
+            }
+            $dataRestoreOrchestrationEvents = {
+                param($Result)
+                if ($null -ne $Result.PSObject.Properties['ProbeError']) { return @() }
+                return @($Result.Events | ForEach-Object { [string]$_ })
+            }
+            $dataRestoreOrchestrationEventIndex = {
+                param([object[]]$Events, [string]$Pattern)
+                for ($eventIndex = 0; $eventIndex -lt $Events.Count; $eventIndex++) {
+                    if ([string]$Events[$eventIndex] -match $Pattern) { return $eventIndex }
+                }
+                return -1
+            }
+            # Події, що визначають контракт фаз (журнал, текст сповіщення і
+            # проміжні OP-рядки вибору/перевірки generation сюди не входять).
+            $dataRestoreOrchestrationPhasePattern = '^(LOCK-|MARKER-|STOP |START |INTEGRITY$|MOVE-ASIDE$|EXTRACT$|ROLLBACK$|HEALTH$|RESULT |NOTIFY |MANUAL-EXIT$|OP (Знімок стану служб|Зупинка служб|Відновлення .+|Health після відновлення) (OK|FAIL|WARN|SKIPPED)$)'
+            $dataRestoreOrchestrationPhases = {
+                param([object[]]$Events)
+                return @($Events | Where-Object { $_ -match $dataRestoreOrchestrationPhasePattern })
+            }
+
+            # (1) Щасливий InPlace: перевірка архіву -> знімок -> маркер (лише
+            # служби з наміром відновлення) -> зупинка BravoWeb, exchangAPI,
+            # BRAVO -> крок зупинки -> move-aside -> розпакування -> компонент OK
+            # -> запуск у зворотному порядку -> крок відновлення служб -> маркер
+            # прибрано -> lock звільнено -> Health -> підсумок 0 -> сповіщення
+            # SUCCESS (InPlace шле SUCCESS навіть за errors_only) -> пауза
+            # зовнішнього finally; Invoke-BRAVODataRestoreEntrypoint повертає 0.
+            # Сповіщення проходить крізь справжню обгортку й справжній
+            # New-BRAVOOperatorNotificationMessage: текст несе рядок компонента.
+            $dataRestoreHappy = $dataRestoreOrchestrationResults['InPlaceHappy']
+            $dataRestoreHappyEvents = @(& $dataRestoreOrchestrationEvents $dataRestoreHappy)
+            $dataRestoreHappyPhases = @(& $dataRestoreOrchestrationPhases $dataRestoreHappyEvents)
+            $dataRestoreExpectedHappyPhases = @(
+                'LOCK-ENTER',
+                'INTEGRITY',
+                'OP Знімок стану служб OK',
+                'MARKER-WRITE BravoWeb,exchangAPI,BRAVO',
+                'STOP BravoWeb',
+                'STOP exchangAPI',
+                'STOP BRAVO',
+                'OP Зупинка служб OK',
+                'MOVE-ASIDE',
+                'EXTRACT',
+                'OP Відновлення MODEL OK',
+                'START BRAVO',
+                'START exchangAPI',
+                'START BravoWeb',
+                'OP Відновлення стану служб OK',
+                'MARKER-CLEAR',
+                'LOCK-EXIT',
+                'HEALTH',
+                'OP Health після відновлення OK',
+                'RESULT УСПІШНО 0',
+                'NOTIFY SUCCESS',
+                'MANUAL-EXIT'
+            )
+            $dataRestoreHappyNotificationText = @($dataRestoreHappyEvents | Where-Object { $_ -like 'NOTIFY-TEXT *' })
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $dataRestoreHappy.PSObject.Properties['ProbeError'] -and
+                    $dataRestoreHappy.ExitCode -eq 0 -and
+                    $dataRestoreHappy.ExitCodeName -eq 'Success' -and
+                    ($dataRestoreHappyPhases -join '|') -ceq ($dataRestoreExpectedHappyPhases -join '|') -and
+                    $dataRestoreHappyNotificationText.Count -eq 1 -and
+                    $dataRestoreHappyNotificationText[0].Contains('MODEL: RESTORED') -and
+                    @($dataRestoreHappyEvents | Where-Object { $_ -like 'LOG-ERROR *' }).Count -eq 0
+                ) `
+                -Name "DataRestore/OrchestrationInPlaceRunsPhasesInContractOrder" `
+                -Failure "InPlace на щасливому шляху має пройти фази в затвердженому порядку (зупинка служб до move-aside, запуск у зворотному порядку після розпакування, маркер прибрано, lock звільнено до Health), надіслати одне SUCCESS-сповіщення з рядком компонента, без ERROR у журналі, і завершитися кодом 0; проба: $($dataRestoreHappy | ConvertTo-Json -Compress -Depth 4)"
+
+            # (2) Відмова ДО деструктивної фази (7-Zip integrity): служби не
+            # знімаються, не зупиняються й не запускаються, маркер не пишеться,
+            # move-aside/розпакування не починаються, lock звільнено; код 41
+            # (IntegrityTestFailed), підсумок ПОМИЛКА, сповіщення CRITICAL.
+            $dataRestoreIntegrity = $dataRestoreOrchestrationResults['InPlaceIntegrityFails']
+            $dataRestoreIntegrityPhases = @(& $dataRestoreOrchestrationPhases @(& $dataRestoreOrchestrationEvents $dataRestoreIntegrity))
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $dataRestoreIntegrity.PSObject.Properties['ProbeError'] -and
+                    $dataRestoreIntegrity.ExitCode -eq 41 -and
+                    $dataRestoreIntegrity.ExitCodeName -eq 'IntegrityTestFailed' -and
+                    ($dataRestoreIntegrityPhases -join '|') -ceq (@('LOCK-ENTER', 'INTEGRITY', 'LOCK-EXIT', 'RESULT ПОМИЛКА 41', 'NOTIFY CRITICAL', 'MANUAL-EXIT') -join '|')
+                ) `
+                -Name "DataRestore/OrchestrationFailureBeforeRestoreLeavesServicesUntouched" `
+                -Failure "відмова перевірки архіву до деструктивної фази InPlace не повинна торкатися служб, маркера чи даних: лише lock -> перевірка -> звільнення lock, код 41 (IntegrityTestFailed), CRITICAL; проба: $($dataRestoreIntegrity | ConvertTo-Json -Compress -Depth 4)"
+
+            # (3) Відмова move-aside ПІСЛЯ зупинки служб, але до будь-якої
+            # мутації даних: rollback НЕ виконується (live-каталог не
+            # торкався), розпакування не починається, finally запускає служби
+            # у зворотному порядку, маркер прибрано, lock звільнено; код 43.
+            $dataRestoreMoveAside = $dataRestoreOrchestrationResults['InPlaceMoveAsideFails']
+            $dataRestoreMoveAsidePhases = @(& $dataRestoreOrchestrationPhases @(& $dataRestoreOrchestrationEvents $dataRestoreMoveAside))
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $dataRestoreMoveAside.PSObject.Properties['ProbeError'] -and
+                    $dataRestoreMoveAside.ExitCode -eq 43 -and
+                    $dataRestoreMoveAside.ExitCodeName -eq 'RestoreFailed' -and
+                    ($dataRestoreMoveAsidePhases -join '|') -ceq (@(
+                            'LOCK-ENTER', 'INTEGRITY', 'OP Знімок стану служб OK', 'MARKER-WRITE BravoWeb,exchangAPI,BRAVO',
+                            'STOP BravoWeb', 'STOP exchangAPI', 'STOP BRAVO', 'OP Зупинка служб OK',
+                            'MOVE-ASIDE', 'OP Відновлення MODEL FAIL',
+                            'START BRAVO', 'START exchangAPI', 'START BravoWeb', 'OP Відновлення стану служб OK',
+                            'MARKER-CLEAR', 'LOCK-EXIT', 'RESULT ПОМИЛКА 43', 'NOTIFY CRITICAL', 'MANUAL-EXIT') -join '|')
+                ) `
+                -Name "DataRestore/OrchestrationMoveAsideFailureRestartsServicesWithoutRollback" `
+                -Failure "відмова move-aside після зупинки служб не повинна відкочувати незмінений live-каталог чи розпаковувати; finally має запустити служби, прибрати маркер і звільнити lock, код 43 (RestoreFailed); проба: $($dataRestoreMoveAside | ConvertTo-Json -Compress -Depth 4)"
+
+            # (4) Виняток під час розпакування: компонент відкочено, finally
+            # усе одно запускає служби, що працювали до прогону (після збою й
+            # до звільнення lock), маркер прибрано; контрольований abort дає
+            # RestoreFailed (43) за контрактом BRAVO.ExitCodes — жодного
+            # «успіху»: компонент не OK, Health не запускається, підсумок
+            # ПОМИЛКА, сповіщення CRITICAL, а не SUCCESS.
+            $dataRestoreThrow = $dataRestoreOrchestrationResults['InPlaceThrowInExtraction']
+            $dataRestoreThrowEvents = @(& $dataRestoreOrchestrationEvents $dataRestoreThrow)
+            $dataRestoreThrowComponentFail = & $dataRestoreOrchestrationEventIndex $dataRestoreThrowEvents '^OP Відновлення MODEL FAIL$'
+            $dataRestoreThrowRollback = & $dataRestoreOrchestrationEventIndex $dataRestoreThrowEvents '^ROLLBACK$'
+            $dataRestoreThrowServicesStep = & $dataRestoreOrchestrationEventIndex $dataRestoreThrowEvents '^OP Відновлення стану служб OK$'
+            $dataRestoreThrowMarkerClear = & $dataRestoreOrchestrationEventIndex $dataRestoreThrowEvents '^MARKER-CLEAR$'
+            $dataRestoreThrowLockExit = & $dataRestoreOrchestrationEventIndex $dataRestoreThrowEvents '^LOCK-EXIT$'
+            $dataRestoreThrowStarts = @(foreach ($dataRestoreOrchestrationServiceName in @('BRAVO', 'BravoWeb')) { & $dataRestoreOrchestrationEventIndex $dataRestoreThrowEvents ('^START {0}$' -f $dataRestoreOrchestrationServiceName) })
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $dataRestoreThrow.PSObject.Properties['ProbeError'] -and
+                    $dataRestoreThrow.ExitCode -eq 43 -and
+                    $dataRestoreThrow.ExitCodeName -eq 'RestoreFailed' -and
+                    @($dataRestoreThrowEvents | Where-Object { $_ -like 'LOG-ERROR *self-test: імітований збій розпакування*' }).Count -gt 0 -and
+                    $dataRestoreThrowRollback -ge 0 -and
+                    $dataRestoreThrowComponentFail -gt $dataRestoreThrowRollback -and
+                    @($dataRestoreThrowStarts | Where-Object { $_ -le $dataRestoreThrowComponentFail -or $_ -ge $dataRestoreThrowServicesStep }).Count -eq 0 -and
+                    $dataRestoreThrowMarkerClear -gt $dataRestoreThrowServicesStep -and
+                    $dataRestoreThrowLockExit -gt $dataRestoreThrowMarkerClear -and
+                    @($dataRestoreThrowEvents | Where-Object { $_ -ceq 'RESULT ПОМИЛКА 43' }).Count -eq 1 -and
+                    @($dataRestoreThrowEvents | Where-Object { $_ -ceq 'NOTIFY CRITICAL' }).Count -eq 1 -and
+                    @($dataRestoreThrowEvents | Where-Object {
+                            $_ -eq 'OP Відновлення MODEL OK' -or $_ -eq 'HEALTH' -or $_ -eq 'NOTIFY SUCCESS' -or $_ -like 'RESULT УСПІШНО*'
+                        }).Count -eq 0 -and
+                    $dataRestoreThrowEvents.Count -gt 0 -and
+                    $dataRestoreThrowEvents[$dataRestoreThrowEvents.Count - 1] -eq 'MANUAL-EXIT'
+                ) `
+                -Name "DataRestore/OrchestrationRestoresServicesWhenRestoreThrows" `
+                -Failure "виняток під час розпакування InPlace має пройти крізь rollback і finally служб: служби, що працювали до прогону, запущено, маркер прибрано, lock звільнено, код 43 (RestoreFailed) без жодного звіту про успіх; проба: $($dataRestoreThrow | ConvertTo-Json -Compress -Depth 4)"
+
+            # (5) Служба, що була зупинена ДО прогону (exchangAPI), не
+            # потрапляє в маркер, не зупиняється й не запускається
+            # відновленням; на щасливому шляху (працювала) — запускається.
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $dataRestoreThrow.PSObject.Properties['ProbeError'] -and
+                    (@($dataRestoreThrowEvents | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BravoWeb,BRAVO' -and
+                    @($dataRestoreThrowEvents | Where-Object { $_ -ceq 'STOP exchangAPI' -or $_ -ceq 'START exchangAPI' }).Count -eq 0 -and
+                    @($dataRestoreHappyEvents | Where-Object { $_ -ceq 'START exchangAPI' }).Count -eq 1
+                ) `
+                -Name "DataRestore/OrchestrationRestoreSkipsServicesStoppedBeforeRun" `
+                -Failure "відновлення служб DataRestore має запускати лише служби з наміром 'працювати' на момент знімка (зупинена exchangAPI не запускається й не пишеться в маркер); події: $($dataRestoreThrowEvents -join ' || ')"
+
+            # (6) Збій доставки сповіщення ніколи не змінює результат
+            # відновлення: код обчислено й підсумок надруковано ДО сповіщення,
+            # обгортка перехоплює виняток транспорту (WARNING), прогін
+            # завершується кодом 0 і проходить зовнішній finally.
+            $dataRestoreNotifyThrow = $dataRestoreOrchestrationResults['InPlaceNotificationThrows']
+            $dataRestoreNotifyThrowEvents = @(& $dataRestoreOrchestrationEvents $dataRestoreNotifyThrow)
+            $dataRestoreNotifyThrowPhases = @(& $dataRestoreOrchestrationPhases $dataRestoreNotifyThrowEvents)
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $dataRestoreNotifyThrow.PSObject.Properties['ProbeError'] -and
+                    $dataRestoreNotifyThrow.ExitCode -eq 0 -and
+                    ($dataRestoreNotifyThrowPhases -join '|') -ceq ($dataRestoreExpectedHappyPhases -join '|') -and
+                    @($dataRestoreNotifyThrowEvents | Where-Object { $_ -like 'LOG-WARNING *self-test: імітований збій доставки сповіщення*' }).Count -eq 1
+                ) `
+                -Name "DataRestore/OrchestrationNotificationFailureKeepsRestoreResult" `
+                -Failure "виняток транспорту сповіщення має лишатися WARNING у журналі без зміни коду завершення (0) і без пропуску зовнішнього finally; проба: $($dataRestoreNotifyThrow | ConvertTo-Json -Compress -Depth 4)"
+
+            # (7) OutOfPlace не торкається служб: ані знімка, ані маркера, ані
+            # зупинки/запуску, ані Health — лише розпакування в нову ціль і код
+            # 0; успішний OutOfPlace за errors_only не шле сповіщення.
+            $dataRestoreOutOfPlace = $dataRestoreOrchestrationResults['OutOfPlace']
+            $dataRestoreOutOfPlacePhases = @(& $dataRestoreOrchestrationPhases @(& $dataRestoreOrchestrationEvents $dataRestoreOutOfPlace))
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $dataRestoreOutOfPlace.PSObject.Properties['ProbeError'] -and
+                    $dataRestoreOutOfPlace.ExitCode -eq 0 -and
+                    ($dataRestoreOutOfPlacePhases -join '|') -ceq (@('LOCK-ENTER', 'INTEGRITY', 'EXTRACT', 'OP Відновлення MODEL OK', 'LOCK-EXIT', 'RESULT УСПІШНО 0', 'MANUAL-EXIT') -join '|')
+                ) `
+                -Name "DataRestore/OrchestrationOutOfPlaceLeavesServicesUntouched" `
+                -Failure "OutOfPlace не повинен знімати стан, зупиняти чи запускати служби або писати маркер quiescence — лише розпакувати компонент і завершитися кодом 0 без SUCCESS-сповіщення за errors_only; проба: $($dataRestoreOutOfPlace | ConvertTo-Json -Compress -Depth 4)"
+        } finally {
+            if (Test-Path -LiteralPath $dataRestoreOrchestrationRoot -PathType Container) {
+                Remove-Item -LiteralPath $dataRestoreOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
