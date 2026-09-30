@@ -452,6 +452,40 @@
   PR-прогін цього не бачив. Тексти повідомлень переведено на ASCII (англійською);
   логіка, умови, коди виходу й політика релізу не змінювались.
 
+- **Документацію звірено з кодом, а self-test ловить биті посилання,
+  застарілі назви функцій, шляхи, модулі й номери розділів (T027, аудит
+  5.2.4).** Свіжа інвентаризація всіх 38 tracked `*.md` на `developer`
+  знайшла одне механічно перевірюване биття — `SECURITY.md` називав
+  функцію SFTP-перевірки `BRAVO_DRY_RUN.ps1` старою назвою
+  `Test-SftpReadOnlyAccess` замість `Test-SftpDestinationAccess`; решту
+  виправлень знайдено звіркою тексту з кодом:
+  - `SECURITY.md`: файл стану захисту від відкату версії лежить у
+    `C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json`, а не в `LOGS`.
+  - `OPERATIONS.md`: before-архів реставрації MODEL для ручного
+    відновлення лежить у `<BackupRoot>\MODEL\`, а не в `<ArchiveRoot>`
+    (поняття `ArchiveRoot` прибрано).
+  - `README.md`, розділ 8: таблиця Планувальника перелічує всі шість
+    завдань `BRAVO_TASKS_INSTALL.ps1`, а не три — додано
+    `BRAVO_RESTORE_VERIFY`, `BRAVO_RESTORE_RECOVERY` (лише профіль
+    робочого часу) і `BRAVO BAZA Synchronization` (лише з BAZA SFTP).
+  - `RELEASE_CHECKLIST.md`: release artifact уже збирає workflow
+    `release-artifact`, а restore drill уже входить до типового набору
+    завдань — обидва пункти більше не значаться неавтоматизованими.
+
+  Нові перевірки фрагмента Governance розрізняють рід посилання:
+  `Documentation/RelativeLinksResolve` — навігаційні посилання й `#якорі`
+  в усіх tracked `*.md`, включно з історичними;
+  `Documentation/InlineReferencesResolve` — функції `Verb-Noun`, шляхи
+  репозиторію й модулі `BRAVO.*` в inline-коді живих документів
+  (історичні CHANGELOG/ROADMAP/`docs/`/`.claude/`, fenced-приклади,
+  placeholder-и й runtime-шляхи не перевіряються за побудовою);
+  `Documentation/InlineReferenceExceptionsAreCurrent` — реєстр
+  історичних/запланованих/зовнішніх згадок із категоріями не накопичує
+  мертвих записів; `Documentation/SectionNumberReferencesResolve` —
+  «розділ N» з явно названим документом і `§N` ведуть на єдиний наявний
+  розділ. Кожна перевірка повідомляє `файл:рядок` і має негативний
+  контроль на фікстурі (`...CheckIsMeaningful`).
+
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
   у версії 5.3 `BRAVO.config` не повинен читатися, шукатися, виконуватися
