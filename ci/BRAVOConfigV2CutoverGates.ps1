@@ -91,7 +91,12 @@ function Get-BRAVOConfigLoaderCallerRelativePath {
         ім'я) статичний AST не бачить — той самий свідомий межовий
         випадок, що й у гейті LEGACY_READER_ISOLATION (#239).
 
-        Повертає [pscustomobject]@{ CallerRelativePath; ParseFailures }:
+        Кожен AST-виклик додатково класифікується: FlaglessCall — виклик,
+        який НЕ прив'язує -DisallowLegacyPrimaryAutoDetect (відсутній або
+        явно :$false/:0), або splat-виклик, прапорець якого статично не
+        довести (fail closed). Формат елемента — '<відносний шлях>:<рядок>'.
+
+        Повертає [pscustomobject]@{ CallerRelativePath; FlaglessCall; ParseFailures }:
         відносні шляхи нормалізовано до '\'-роздільника (форма переліку
         Get-BRAVOProductionEntryPointRelativePath незалежно від ОС
         прогону). Файл, який парсер не розібрав, НЕ пропускається мовчки —
@@ -119,6 +124,7 @@ function Get-BRAVOConfigLoaderCallerRelativePath {
     }
 
     $callers = New-Object System.Collections.Generic.List[string]
+    $flaglessCalls = New-Object System.Collections.Generic.List[string]
     $parseFailures = New-Object System.Collections.Generic.List[string]
     foreach ($candidateFile in $candidateFiles) {
         $relativePath = $candidateFile.FullName.Substring($resolvedRoot.Length).TrimStart('\', '/').Replace('/', '\')
@@ -139,10 +145,27 @@ function Get-BRAVOConfigLoaderCallerRelativePath {
         if ($loaderCalls.Count -gt 0) {
             [void]$callers.Add($relativePath)
         }
+        foreach ($loaderCall in $loaderCalls) {
+            $flagBound = $false
+            foreach ($callElement in @($loaderCall.CommandElements)) {
+                if ($callElement -is [System.Management.Automation.Language.CommandParameterAst] -and
+                    [string]::Equals($callElement.ParameterName, 'DisallowLegacyPrimaryAutoDetect', [StringComparison]::OrdinalIgnoreCase)) {
+                    $flagArgumentText = if ($null -ne $callElement.Argument) { [string]$callElement.Argument.Extent.Text } else { '' }
+                    $flagBound = -not ($flagArgumentText -match '^\$?(false|0)$')
+                }
+            }
+            # Splat без явного прапорця статично не довести — fail closed;
+            # явний прапорець поруч зі splat однозначний (дубль параметра
+            # у splat — помилка прив'язки, а не тихе :$false).
+            if (-not $flagBound) {
+                [void]$flaglessCalls.Add($relativePath + ':' + $loaderCall.Extent.StartLineNumber)
+            }
+        }
     }
 
     return [pscustomobject]@{
         CallerRelativePath = @($callers.ToArray())
+        FlaglessCall       = @($flaglessCalls.ToArray())
         ParseFailures      = @($parseFailures.ToArray())
     }
 }
@@ -195,6 +218,29 @@ function Test-BRAVOConfigLoaderCallerCompleteness {
             'міг би виконуватись без наміру оператора. Внесіть кожен у перелік (і передайте -DisallowLegacyPrimaryAutoDetect) ' +
             'або, для НЕ-production тестового harness-у, у Get-BRAVOConfigLoaderSanctionedNonProductionCallerRelativePath з обґрунтуванням: ' +
             ([string]::Join(', ', $unlistedCallers))
+        )
+    }
+
+    # Файл у переліку ще не означає, що КОЖЕН його виклик передає прапорець:
+    # гейт LEGACY_CONFIG_AUTOEXEC бачить лише перший текстовий збіг. Тут
+    # кожен AST-виклик у production-entrypoint (санкціонований тестовий
+    # harness навмисно викликає loader і без прапорця) мусить прив'язувати
+    # -DisallowLegacyPrimaryAutoDetect.
+    $sanctionedCallers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($sanctionedRelativePath in @($SanctionedNonProductionCallerRelativePath)) {
+        if (-not [string]::IsNullOrWhiteSpace($sanctionedRelativePath)) {
+            [void]$sanctionedCallers.Add($sanctionedRelativePath.Replace('/', '\'))
+        }
+    }
+    $productionFlaglessCalls = @($callerScan.FlaglessCall | Where-Object {
+            -not $sanctionedCallers.Contains($_.Substring(0, $_.LastIndexOf(':')))
+        })
+    if ($productionFlaglessCalls.Count -gt 0) {
+        [void]$failures.Add(
+            'Гейт CONFIG_LOADER_CALLER_COMPLETENESS (issue #154, B7): ' + $productionFlaglessCalls.Count +
+            ' виклик(и) Import-BravoConfiguration у production-коді не прив''язують -DisallowLegacyPrimaryAutoDetect ' +
+            '(відсутній, явно :$false/:0 або splat, який статично не довести) — auto-derived BRAVO.config поруч виконався б: ' +
+            ([string]::Join(', ', $productionFlaglessCalls))
         )
     }
 

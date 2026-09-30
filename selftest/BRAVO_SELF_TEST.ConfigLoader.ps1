@@ -3635,7 +3635,7 @@ try {
             "`$global:lunchArchiveCleanupPath = '$($b7MigrationLunchDir.Replace("'", "''"))'`r`n" +
             "`$global:maintenanceSettings['Limits']['ExcludedDrives'] = @('X:\', 'Y:\')`r`n" +
             "`$global:maintenanceSettings['Restore']['Time'] = '22:30'`r`n" +
-            "`$global:smbSettings['RootPath'] = '\\LAB-SERVER-01\bravo'`r`n" +
+            "`$global:smbSettings['RootPath'] = '\\server\bravo-b7'`r`n" +
             "`$global:archiveRetentionDays = 365`r`n" +
             "`$global:lunchArchiveCleanupDirectories = @('MODEL')`r`n"
         $b7MigrationLegacyPath = Join-Path $b7MigrationRoot 'BRAVO.config'
@@ -3719,7 +3719,7 @@ try {
             [int]$b7Before.RawSnapshot['archiveRetentionDays'] -eq 365 -and
             [int]$b7After.RawSnapshot['archiveRetentionDays'] -eq 365 -and
             [string]$b7After.RawSnapshot['maintenanceSettings']['Restore']['Time'] -eq '22:30' -and
-            [string]$b7After.RawSnapshot['smbSettings']['RootPath'] -eq '\\LAB-SERVER-01\bravo' -and
+            [string]$b7After.RawSnapshot['smbSettings']['RootPath'] -eq '\\server\bravo-b7' -and
             $b7After.RawSnapshot['hostInformationSettings']['PublicIPLookupEnabled'] -eq $false -and
             (@($b7After.RawSnapshot['maintenanceSettings']['Limits']['ExcludedDrives']) -join '|') -eq 'X:\|Y:\' -and
             $b7After.RawSnapshot['lunchArchiveCleanupDirectories'] -isnot [string] -and

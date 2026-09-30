@@ -2300,6 +2300,40 @@
         Remove-Item -LiteralPath $callerCompletenessHarnessFixture -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CallerCompletenessDetectsFlaglessCallInListedEntrypoint ---
+    # Файл у переліку з ПЕРШИМ викликом із прапорцем проходить текстовий
+    # гейт LEGACY_CONFIG_AUTOEXEC, навіть якщо далі є другий виклик без
+    # прапорця, з явним :$false або через splat без прапорця. Кожен
+    # AST-виклик у production-entrypoint мусить прив'язувати прапорець.
+    $callerCompletenessFlaglessFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall + "`r`nfunction Invoke-Second { Import-BravoConfiguration -ConfigRoot Y }"
+        'entry2.ps1' = $callerCompletenessListedCall + "`r`nImport-BravoConfiguration -ConfigRoot Y -DisallowLegacyPrimaryAutoDetect:`$false"
+        'entry3.ps1' = "`$loaderArgs = @{ ConfigRoot = 'Y' }`r`nImport-BravoConfiguration @loaderArgs"
+    }
+    $callerCompletenessFlaggedFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall + "`r`nfunction Invoke-Second { Import-BravoConfiguration -ConfigRoot Y -DisallowLegacyPrimaryAutoDetect:`$true }"
+        'entry2.ps1' = "`$loaderArgs = @{ ConfigRoot = 'Y' }`r`nImport-BravoConfiguration @loaderArgs -DisallowLegacyPrimaryAutoDetect"
+    }
+    try {
+        $callerCompletenessFlaglessResult = Test-BRAVOConfigLoaderCallerCompleteness -Root $callerCompletenessFlaglessFixture -ProductionEntryPointRelativePath @('entry.ps1', 'entry2.ps1', 'entry3.ps1')
+        $callerCompletenessFlaggedResult = Test-BRAVOConfigLoaderCallerCompleteness -Root $callerCompletenessFlaggedFixture -ProductionEntryPointRelativePath @('entry.ps1', 'entry2.ps1')
+        $callerCompletenessFlaglessText = [string]::Join(' | ', @($callerCompletenessFlaglessResult.Failures))
+        Test-BRAVOCondition `
+            -Condition (
+                -not $callerCompletenessFlaglessResult.Passed -and
+                $callerCompletenessFlaglessText.Contains('entry.ps1:2') -and
+                $callerCompletenessFlaglessText.Contains('entry2.ps1:2') -and
+                $callerCompletenessFlaglessText.Contains('entry3.ps1:2') -and
+                -not $callerCompletenessFlaglessText.Contains('entry.ps1:1') -and
+                $callerCompletenessFlaggedResult.Passed
+            ) `
+            -Name "ReleaseGate/CallerCompletenessDetectsFlaglessCallInListedEntrypoint" `
+            -Failure "кожен виклик Import-BravoConfiguration у переліченому production-entrypoint мусить прив'язувати -DisallowLegacyPrimaryAutoDetect (другий виклик без прапорця, :`$false і splat без прапорця — FAIL; :`$true і splat із явним прапорцем — PASS); отримано Flagless.Failures=$callerCompletenessFlaglessText Flagged.Passed=$($callerCompletenessFlaggedResult.Passed) Flagged.Failures=$([string]::Join(' | ', @($callerCompletenessFlaggedResult.Failures)))"
+    } finally {
+        Remove-Item -LiteralPath $callerCompletenessFlaglessFixture -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $callerCompletenessFlaggedFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CallerCompletenessFailsClosedOnParseError ---
     $callerCompletenessParseFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
         'entry.ps1' = $callerCompletenessListedCall
