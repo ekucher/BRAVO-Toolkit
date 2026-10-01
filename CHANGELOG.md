@@ -34,6 +34,54 @@
   `Health/ManagedServiceStartTypePresentAndWmiFailureUnderStrictMode` (наявний `StartType`
   має пріоритет над WMI; збій WMI не обриває Health). Аналогічні звернення поза Health
   відстежуються в #319.
+
+- **Config V2 B7: heartbeat більше не виконує підкладений `BRAVO.config`; регресійна
+  матриця 5.3-шляху (#154).** `BRAVO_OPERATIONS_HEARTBEAT.ps1` (з'явився в PR #225,
+  після формування переліку AUTOEXEC-цілей) викликав `Import-BravoConfiguration`
+  без `-DisallowLegacyPrimaryAutoDetect`: `BRAVO.config`, що лежав поруч із
+  комплектом, виконувався як primary-шар без наміру оператора. Тепер heartbeat
+  передає прапорець так само, як інші операторські entrypoint-и (явний
+  `-ConfigPath` лишається авторитетним), і внесений до канонічного переліку
+  `Get-BRAVOProductionEntryPointRelativePath` (`ci\BRAVOConfigV2CutoverGates.ps1`).
+  Щоб наступний новий entrypoint не випав так само, додано окремий гейт
+  `CONFIG_LOADER_CALLER_COMPLETENESS` (`Test-BRAVOConfigLoaderCallerCompleteness`):
+  AST-перелік фактичних викликачів `Import-BravoConfiguration` серед кореневих
+  `*.ps1` і `modules\` мусить дорівнювати переліку AUTOEXEC-цілей плюс єдиному
+  санкціонованому винятку — тестовому harness-у `BRAVO_SELF_TEST.ps1`. Коментарі,
+  рядкові літерали й визначення функції викликом не вважаються; файл, який не
+  розібрав парсер, провалює гейт. Крім того, кожен AST-виклик у переліченому
+  production-entrypoint мусить прив'язувати `-DisallowLegacyPrimaryAutoDetect`:
+  другий виклик без прапорця, явний `:$false` чи splat без прапорця провалюють гейт
+  (текстовий `LEGACY_CONFIG_AUTOEXEC` бачить лише перший збіг у файлі). Непрямі
+  виклики (`& $name`, аліаси) і текст дочірніх процесів лишаються поза AST-гейтом
+  (#239); відомий такий випадок — дочірній процес Configurator (#320). Гейти `LEGACY_CONFIG_AUTOEXEC` і
+  `LEGACY_READER_ISOLATION` не змінено. Новий гейт виконують ті самі споживачі —
+  PR-workflow `config-parity.yml` і збірка release-артефакту.
+
+  Регресійна матриця B7 у self-test (усе через канонічний `Import-BravoConfiguration`,
+  знімок за `Get-BRAVOEffectiveConfigurationVariableName`, реальний
+  `deploy\Get-BRAVOConfigSiteDelta.ps1`; другої моделі конфігурації немає):
+  `ConfigLoader/B7CallSiteCanonicalSnapshot*` — точний виклик loader-а з Archive,
+  Maintenance, Health, DataRestore runtime-ів і heartbeat, узятий з AST, дає той
+  самий повний знімок, що й еталон, і не виконує підкладений `BRAVO.config`;
+  `ConfigLoader/B7LocalOverride*On53Path` — заміна масиву, явний `@()`, скаляри
+  зі збереженням типу, вкладений вузол зі збереженням сусідів без `BRAVO.config`;
+  `ConfigLoader/B7LocalConfigDenyClassLeavesRejectedEvenAtDefault` — кожен
+  `DENY_*`-лист реєстру авторизації відхиляється навіть із дефолтним значенням;
+  `ConfigLoader/B7LocalConfigDerivedSecurityKeysRejected` і
+  `...ToolIntegrityNodeRejected` — `toolIntegritySettings.ManifestPath`/`Mode`,
+  `toolsPath`, шляхи виконуваних файлів, `stateRoot`, шлях lock через
+  `BRAVO.local.config` відхиляються як невідомі ключі без часткового застосування
+  (закріплює твердження T001 вище тестом); `ConfigLoader/B7MalformedLocalConfig*`
+  і `B7UnknownLocalKeyNamesKeyAndConfigRootOn53Path` — діагностика називає файл або
+  ConfigRoot і ключ; `ConfigLoader/B7Migration*` — репрезентативний 5.2
+  `BRAVO.config` із site-перевизначеннями, мігрований реальним інструментом, дає
+  той самий повний ефективний знімок, дельта детермінована, повторна міграція вже
+  мігрованого сервера нічого не додає. У `BRAVO_SELF_TEST.Governance.ps1` —
+  `ReleaseGate/CallerCompleteness*`, `ReleaseGate/CutoverGatesEnforceCallerCompleteness`
+  і `ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget` (гейт на фактичному
+  вмісті кожної цілі). `RUNTIME_MANIFEST.json` оновлено для змінених файлів.
+
 - **Документація: операторські розділи про сповіщення перекладено
   українською, виправлено латинські літери в українських словах (A10).**
   Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
@@ -55,6 +103,29 @@
   містять латинську `i`, навмисно не змінено: оператор шукає їх у логах
   саме в такому вигляді. Runtime-код не змінювався;
   `RUNTIME_MANIFEST.json` не зачеплено.
+- **Документація: поріг здоров'я і операційна вимога у перевірці вільного місця (T026).**
+  README (розділ 3.3 і «Оновлення з 5.2.2 і раніше»), `OPERATIONS.md` (розділи
+  `40` і `60`) та `docs/MANUAL_RUN_CONSOLE_UX.md` досі описували поведінку 5.2.3:
+  нібито below-floor при достатній оцінці блокує архівацію
+  (`BelowFloorEstimateNotPeakSafe`), а компонент без історії пропускається
+  оцінкою. Тепер вони відповідають чинному коду: Archive викликає класифікатор з
+  `RequirementPolicy = 'ArchivePeakSafe'`, `MinimumFreeSpaceGB` для archive
+  destination — поріг здоров'я, і відома вимога, що вміщається в доступне місце,
+  дає `WARNING` `BelowHealthFloorButRequirementSatisfied` без блокування (код
+  `10`). Блокують (код `40`) `EstimatedRequirementNotMet` і
+  `BelowFallbackFloorNoEstimate` (вимогу визначити не вдалось, вільного менше за
+  поріг). Задокументовано два винятки: порожнє чи нульове джерело без історії
+  дає невідому вимогу (запасний гейт за порогом), а для archive destination
+  на UNC-шляху ємність не вимірюється — `CapacityUnknownRemote` без
+  блокування. Застарілі коментарі в `BRAVO.DiskSpace.psm1`,
+  `BRAVO.Archive.Runtime.ps1` і self-test виправлено; runtime-поведінка не
+  змінювалась. Нова перевірка `Documentation/ReadmeArchiveBelowFloorMatchesPeakSafePolicy`
+  витягує політику Archive, блокуючу below-floor політику та назви причин із
+  production-коду й падає, якщо README чи `OPERATIONS.md` розходяться з ними; кожне визначення
+  `BelowHealthFloorButRequirementSatisfied` (рядок таблиці README, пункт у
+  `OPERATIONS.md`) має описувати причину як неблокуючу. Для destination нижче порогу
+  документація веде до operational-рядка з будь-якою причиною, а не лише до
+  неблокуючої.
 
 - **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
   `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
@@ -302,6 +373,99 @@
   `Scheduler/OperationLockWaitTimeoutIsExplicitFailure`,
   `Scheduler/OperationLockWaitCallersUseTaskBudget`,
   `Archive/OrchestrationLockWaitTimeoutEndsWithSkippedLockBusy`.
+- **Загортання `List[object]` у `@()` тепер ловить один guard на весь
+  репозиторій, а не точкові перевірки.** `@($x)`, де `$x` тримає
+  `System.Collections.Generic.List[object]`, створений через `New-Object`,
+  кидає `ArgumentException "Argument types do not match"`
+  (`PSToObjectArrayBinder`) і у Windows PowerShell 5.1, і в PowerShell 7 —
+  незалежно від вмісту списку й від `Set-StrictMode`. Тригер — PSObject-обгортка
+  виводу `New-Object`: вона переживає присвоєння, аліас, `return ,$list`,
+  передачу в параметр без типу чи `[object]`, зберігання у властивості
+  (`@($group.Owners)`) та в елементі словника (`@($byKey[$k])`). Безпечні
+  `.ToArray()`, каст `[object[]]`, параметр `[object[]]`/`[array]`/`[List[object]]`,
+  `List[psobject]` та інші generic-типи. У PR #225 саме цей клас не давав
+  generation-події Archive і двом health-подіям дійти в Operations; до того
+  він тримався коментарями біля окремих змінних і одним точковим guard-ом.
+
+  Нова перевірка self-test `Governance/GenericObjectListNeverWrappedInArraySubexpression`
+  розбирає AST усіх PowerShell-файлів із `Get-BRAVOAnalyzableFile` (той самий
+  перелік, що аналізує CI) і падає з `файл:рядок` і причиною на кожне таке
+  `@()`, зокрема у вкладених функціях обгортки `Invoke-BRAVO<X>` (T010), де
+  список читається за динамічним scope. Властивість зіставляється за іменем
+  лише в межах того самого файлу. `Governance/GenericObjectListBinderGuardIsMeaningful`
+  тримає детектор непорожнім на синтетичній фікстурі з небезпечними й
+  безпечними формами. За review детектор також простежує ланцюги
+  `return ,$v` до нерухомої точки, аліас списку в елемент словника чи
+  властивість, `$global:`-джерела з інших файлів, значення параметра за
+  замовчуванням і тип `[System.Management.Automation.PSObject]`; зіставляє
+  позиційні аргументи з параметрами за порядком позицій, бере тип параметра
+  з самого визначення функції (однойменні функції в різних файлах не
+  перезаписують одна одну) і враховує затінення зовнішнього списку
+  локальним присвоєнням. На поточному дереві знахідок немає; на знімку до
+  виправлення PR #225 guard знаходить усі три історичні входження. Поведінка
+  рантайму не змінюється. Забороняюча половина точкового
+  `Archive/StepHistoryPayloadUsesToArrayNotArraySubexpression` тепер
+  надлишкова, але лишається до рішення власника.
+
+  Після другого раунду review детектор переписано як одну потокову модель з
+  нерухомою точкою замість набору точкових патернів: джерело (`New-Object` з
+  типом лише з `-TypeName`, зокрема `Microsoft.PowerShell.Utility\New-Object`)
+  → присвоєння (ліва частина `[object]`/`[psobject]` обгортку зберігає,
+  `[object[]]`/`[List[object]]` — знімає) → аліас → властивість/елемент і
+  read-back з них → прив'язка параметра (іменна з `AliasAttribute`,
+  позиційна) → параметр-пересилання → аргумент-вираз `(New-Object ...)` чи
+  `(Get-X)` → вихід функції лише з реально емітованого `,$x` чи виклику →
+  sink `@()`. `[List[object]]::new()` джерелом не є. Фікстура отримала пару
+  «небезпечна / безпечна» форма на кожен клас, а нова
+  `Governance/GenericObjectListBinderPremisesHold` перевіряє рантайм-передумови
+  моделі на хості CI (PS 5.1). Незалежне review моделі додало до неї три
+  правила того ж виду: значення присвоєного `if`/`try`/`switch`/циклу і `$( ... )`
+  — те, що реально емітують їхні гілки (команда цілою, `,$x` — списком, голий
+  список — розгорнутим); `$d['K']` і `$d.K` — одне місце, словник-властивість
+  `$o.P[...]` — теж місце; `return (,$x)` і `$w = ,$list; return $w` зберігають
+  список, а `$p = (,$x)` і `@($w)` безпечні. Третій раунд review додав
+  прив'язку зі splatting `@p` (ключі літерала чи збережені `$p['K']`/`$p.K`),
+  з конвеєра в параметр `ValueFromPipeline`, статичні `Set-Alias`/`New-Alias`,
+  окремі місця для `$script:x` і `$global:x` та вихід функції за визначенням
+  (виклик резолвиться до функції з власного файлу, інакше — до всіх
+  однойменних). Четвертий раунд додав ланцюгове присвоєння
+  `$a = $b = <список>`, `Write-Output -NoEnumerate`, індекс обгортки `$w[0]`
+  і затінення лише домінуючим присвоєнням (умовне `if (...) { $x = @() }`
+  список не знімає). Передумови тепер виконуються кожна окремо під
+  `Set-StrictMode -Version Latest`, а неекранований `$x` у повідомленні
+  перевірки, що валив CI на PS 5.1, прибрано; побудова правил переписана на
+  хеш-таблиці, що скоротило час перевірки приблизно в 2,5 раза. П'ятий раунд
+  прибрав два консервативні хибні спрацювання: копія `$copy = $items`,
+  доведено раніша за кожне присвоєння списку в тому самому блоці (без циклу,
+  параметра й зовнішнього джерела), більше не позначається, а функція з
+  двома безумовними емісіями (`,$list; 'tail'`) віддає масив — `@($v)`
+  безпечний, а `$v[0]` і конвеєр ловляться. Решта оголошених меж — у
+  коментарі guard-а. На поточному дереві знахідок немає;
+  на знімку до виправлення PR #225 — рівно ті самі три входження.
+
+- **Документація: канонічний опис джерел конфігурації та секретів 5.3 (T033).**
+  README, розділ 4, отримав єдиний підрозділ «Джерела конфігурації та
+  секретів у 5.3»: контракт runtime (built-in дефолти + `BRAVO.local.config`
+  + Windows Credential Manager + деривація), окремо — секрети (лише
+  Credential Manager; конфігурація містить тільки імена записів),
+  параметри установи (Credential Manager, інакше `bravoSettings.*` або
+  built-in placeholder) і міграція legacy `BRAVO.config` (лише
+  `deploy\Get-BRAVOConfigSiteDelta.ps1`, не runtime-fallback). Додано
+  таблицю фактичної поведінки кожного скрипта за відсутнього секрету:
+  код не завжди `31` — відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV`
+  дають `30`, webhook у `BRAVO_HEALTH` — `30`, SFTP/SMB у `BRAVO_HEALTH` —
+  `70`, пароль архівів у `BRAVO_RESTORE_TEST` — `90`, некоректні параметри
+  установи в `BRAVO_ARCHIV` — `1`. Відповідно виправлено рядки `30`/`31`
+  матриці діагностики README, розділи `30`/`31` `OPERATIONS.md` і
+  `SECURITY.md` (розділи 3 і 6); вони посилаються на канонічний підрозділ
+  замість власних формулювань. Задокументовано відомі розбіжності: явний
+  `-ConfigPath` на legacy `BRAVO.config` досі виконує його як основний шар
+  (виконання сусіднього `BRAVO.config` ручним `BRAVO_OPERATIONS_HEARTBEAT.ps1`
+  без `-ConfigPath` виправлено окремо в PR #317); пріоритет Credential Manager для параметрів
+  установи застосовують не всі скрипти (`BRAVO_NOTIFICATION_TEST`,
+  `BRAVO_RESTORE_TEST` беруть `bravoSettings.*`). Для некоректного наявного
+  запису установи (`30`) `OPERATIONS.md` радить `-Action Set`, а не
+  `Ensure`. Runtime не змінено.
 - **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —

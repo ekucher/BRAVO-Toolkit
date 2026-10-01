@@ -66,13 +66,22 @@ Advisories → *Report a vulnerability*. Звіт видно лише супро
 ## 3. Модель секретів
 
 Секрети (SFTP login/password, SMB login/password, пароль архівів 7-Zip,
-Slack/Discord webhook URL, назва та код установи) зберігаються **лише** у
-Windows Credential Manager — окремо для поточного адміністратора
+Slack/Discord webhook URL, секрети BSYSTEM Operations) runtime 5.3 читає
+**лише** з Windows Credential Manager — окремо для поточного адміністратора
 (ручні запуски) і для `NT AUTHORITY\SYSTEM` (заплановані завдання),
 `-StoreFor Both` при `BRAVO_CREDENTIALS_SETUP.ps1`/`BRAVO_SETUP.ps1`.
-`BRAVO.config` містить лише fallback-значення назви установи, коду й
-префікса архівів для першого запуску — реальні секрети в конфігураційний
-файл ніколи не записуються (розділ 4 README.md).
+Виняток за походженням — API-ключ BSYSTEM Operations: його видає бекенд
+Operations під час enrollment, runtime записує його в Credential Manager
+облікового запису процесу й далі читає звідти; оператор провізіонує лише
+bootstrap-секрет.
+Конфігурація (`BRAVO.local.config`) містить лише імена записів
+(`credentialSettings.Targets.*`); секрет у конфігураційний файл не
+записується і з нього не читається. Назва, код установи й префікс архівів
+не є секретами: вони теж зберігаються в Credential Manager, але мають
+запасне значення з конфігурації. Legacy `BRAVO.config` не є джерелом ні
+секретів, ні конфігурації 5.3. Канонічний опис джерел і поведінки за
+відсутнього секрету — README.md, розділ 4, підрозділ «Джерела конфігурації
+та секретів у 5.3».
 
 Захист під час виконання:
 
@@ -434,8 +443,10 @@ Windows Credential Manager прив'язаний до облікового за�
 створений для поточного адміністратора, недоступний `SYSTEM`, і навпаки.
 `-StoreFor Both` створює обидва записи явно. Якщо забути про це при
 ручному налаштуванні (лише `CurrentUser`), заплановане завдання під
-`SYSTEM` не побачить credentials і впаде з кодом `31`
-(`CredentialsUnavailable`).
+`SYSTEM` не побачить credentials. Код завершення залежить від скрипта й
+секрету — здебільшого `31` (`CredentialsUnavailable`), але, наприклад,
+відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV` дають `30`; таблиця —
+README.md, розділ 4.
 
 Не використовується `gMSA` (group Managed Service Account) — кожен сервер
 має власні незалежні записи Credential Manager під локальним `SYSTEM`,
