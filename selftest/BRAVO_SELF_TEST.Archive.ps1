@@ -673,6 +673,14 @@ function Write-BRAVODiskSpaceDecisionLog { param($Results, $Logger) }
 function Get-BRAVOFiles { param($Path, $Filter) return @() }
 function Import-BRAVODiscoveryBaseline { param($StateRoot, $RuntimeRoot) return [pscustomobject]@{ Problems = @(); Baseline = $null; Source = 'self-test' } }
 function Test-BRAVODiscoveryComponentDrift { param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents) return @() }
+function Resolve-BRAVOBackupComponentScope {
+    param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents)
+    return [pscustomobject]@{ Components = [ordered]@{}; Planned = @(); NotInstalled = @(); EffectiveEnabledComponents = $EnabledComponents; EmptyComposition = $false; Findings = @() }
+}
+function Update-BRAVODiscoveryBaselineFromScope {
+    param($DiscoveryResult, $ScopeResult, $StateRoot, $RuntimeRoot)
+    return [pscustomobject]@{ Action = 'Unchanged'; AddedComponents = @(); Path = $null }
+}
 function Test-PathWithLog { param($Path, $Description, $CreateIfMissing) return $true }
 function Show-PathCheckSummary { param($CheckedPaths, $AllPathsExist) }
 function Test-BRAVOFileSystemWriteProbe { param($Path) return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null } }
