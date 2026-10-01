@@ -3664,6 +3664,11 @@ try {
                     $script:dataRestoreWarningCount++
                 }
             }
+            # #333: живий чужий власник (Maintenance/DataRestore ще працює) —
+            # його маркер не зливаємо й не перезаписуємо: аборт ДО будь-яких змін.
+            if ($orphanContext.OwnerAlive -or [string]$orphanRepair.Status -eq 'OwnerAlive') {
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ("ownership-маркер служб належить живому процесу ({0}) — одночасний restore заборонено (#333); дочекайтеся його завершення" -f $orphanContext.Owner)
+            }
             $heldDisabledNames = @()
             if ([string]$orphanRepair.Status -eq 'HeldSuppressed' -or [string]$orphanRepair.Status -eq 'RepairFailed') {
                 $heldDisabledNames = @(@($orphanContext.HeldSnapshot) | ForEach-Object { [string]$_.Name })
@@ -3722,8 +3727,10 @@ try {
             $stageStartedAt = Get-Date
             $script:dataRestoreServicesStopped = $true
             # Ownership-маркер зупинки служб — ПЕРЕД quiescence (та сама
-            # консервативна семантика, що й прапорець вище). Пишуться лише
-            # служби з наміром відновлення (ShouldRestartAfterRestore).
+            # консервативна семантика, що й прапорець вище). У маркері —
+            # служби з наміром відновлення (ShouldRestartAfterRestore); якщо
+            # наміру немає, але є знімок типів запуску, — усі керовані служби
+            # з RestartIntent=false.
             # Маркер ОДРАЗУ -RestartSuppressed: якщо цей процес загине
             # ЖОРСТКО (kill/BSOD/живлення) посеред деструктивної фази, live
             # filesystem лишиться в невизначеному стані, і Health-watchdog
@@ -3732,9 +3739,9 @@ try {
             # алертитиме CRITICAL про потребу ручного відновлення.
             # Restart-intent для оператора продубльовано в лог-файлі цього
             # прогону (аудиторський запис вище). Збій запису = аборт
-            # (fail-closed). Якщо намір відновлення порожній (жодна керована
-            # служба не працювала на момент знімка — типово для тестових/
-            # ізольованих прогонів), маркер не потрібен: без нього watchdog
+            # (fail-closed). Маркер не пишеться лише коли немає ні наміру
+            # відновлення, ні знімка типів запуску (власного чи чужого) —
+            # типово для тестових/ізольованих прогонів: без маркера watchdog
             # і так ніколи не діє.
             #
             # #333: тимчасове утримання від автостарту (start type -> Disabled)
@@ -3779,6 +3786,20 @@ try {
                 } catch {
                     Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "не вдалося записати ownership-маркер зупинки служб (без нього аварійне переривання лишило б служби зупиненими «мовчазно», без сліду власника і CRITICAL-алерту Health): $($_.Exception.Message)"
                 }
+            }
+            # Записи знімка поза канонічним набором (стороннє редагування чужого
+            # маркера) не утримуємо й не повертаємо — лише попередження.
+            $unallowedSnapshot = @($script:dataRestoreStartTypeSnapshot | Where-Object {
+                    $entryName = [string]$_.Name
+                    @($script:dataRestoreAllowedServiceNames | Where-Object { $_ -ieq $entryName }).Count -eq 0
+                })
+            if ($unallowedSnapshot.Count -gt 0) {
+                Write-DataRestoreLog -Message ("Записи знімка типів запуску поза керованим набором служб проігноровано (можливе стороннє редагування маркера): {0}" -f (@($unallowedSnapshot | ForEach-Object { [string]$_.Name }) -join ', ')) -Level 'WARNING'
+                $script:dataRestoreWarningCount++
+                $script:dataRestoreStartTypeSnapshot = @($script:dataRestoreStartTypeSnapshot | Where-Object {
+                        $entryName = [string]$_.Name
+                        @($script:dataRestoreAllowedServiceNames | Where-Object { $_ -ieq $entryName }).Count -gt 0
+                    })
             }
             if ($script:dataRestoreStartTypeSnapshot.Count -gt 0) {
                 $startModeSuppression = Suspend-BRAVOServiceAutostart -Snapshot $script:dataRestoreStartTypeSnapshot

@@ -18,7 +18,9 @@
   блокує: його знімок зливається, служби з `RestartIntent` запускаються після успішного restore.
   При незавершеному rollback служби свідомо лишаються `Disabled` (код 43). Збій знімка/утримання
   скасовує restore до змін даних. Новий експорт `Get-BRAVOForeignServiceQuiescenceContext`
-  (BRAVO.System). Self-test: `DataRestore/StartMode*` (звичайна служба, Manual-зупинена,
+  (BRAVO.System). Відновлення після аварійного прогону дає попередження, тож успішний restore
+  завершується кодом `10` (SuccessWithWarnings); маркер живого власника блокує прогін (`43`) до
+  будь-яких змін; записи знімка поза керованим набором служб ігноруються. Self-test: `DataRestore/StartMode*` (звичайна служба, Manual-зупинена,
   delayed automatic, вимкнена оператором, чужий знімок suppressed/repairable, відсутній знімок,
   зіпсований маркер, збій restore, збій старту служби).
 

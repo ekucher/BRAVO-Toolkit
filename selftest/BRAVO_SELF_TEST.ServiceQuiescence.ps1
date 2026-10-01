@@ -1627,31 +1627,34 @@ function Restore-BRAVOServiceStartTypeSnapshot {
         # порядку: Repair до знімка служб; знімок -> маркер зі знімком -> Suspend;
         # у finally Restore типів ПЕРЕД стартом служб. Поведінку перевіряють
         # DataRestore/StartMode* (Orchestration-проба).
-        $dataRestoreContractNames = @(
-            'Repair-BRAVOOrphanedServiceStartTypes', 'New-BRAVOServiceStartTypeSnapshot', 'Suspend-BRAVOServiceAutostart',
-            'Confirm-BRAVOServicesQuiesced', 'Restore-BRAVOServiceStartTypeSnapshot', 'Get-BRAVOForeignServiceQuiescenceContext')
-        $dataRestoreContractMissing = @($dataRestoreContractNames | Where-Object { $dataRestoreTextForStartMode.IndexOf($_) -lt 0 })
-        $dataRestoreRepairIndex = $dataRestoreTextForStartMode.IndexOf('$orphanRepair = Repair-BRAVOOrphanedServiceStartTypes')
-        $dataRestoreSnapshotIndex = $dataRestoreTextForStartMode.IndexOf('$script:dataRestoreServiceSnapshot = Get-BRAVODataRestoreServiceSnapshot')
-        $dataRestoreHoldSnapshotIndex = $dataRestoreTextForStartMode.IndexOf('New-BRAVOServiceStartTypeSnapshot -ServiceNames')
-        $dataRestoreMarkerIndex = $dataRestoreTextForStartMode.IndexOf('$writtenMarkerState = Write-BRAVOServiceQuiescenceState')
-        $dataRestoreSuspendIndex = $dataRestoreTextForStartMode.IndexOf('Suspend-BRAVOServiceAutostart -Snapshot')
-        $dataRestoreRestoreModesIndex = $dataRestoreTextForStartMode.IndexOf('$startModeRestore = Restore-BRAVOServiceStartTypeSnapshot')
-        $dataRestoreStartServicesIndex = $dataRestoreTextForStartMode.IndexOf('$startFailures = @(Restore-BRAVODataRestoreServices')
+        # Порядок перевіряється за AST CommandAst (імена викликів), а не за іменами локальних змінних.
+        $dataRestoreContractAst = [Management.Automation.Language.Parser]::ParseInput($dataRestoreTextForStartMode, [ref]$null, [ref]$null)
+        $dataRestoreContractOrder = @(
+            'Repair-BRAVOOrphanedServiceStartTypes', 'Get-BRAVODataRestoreServiceSnapshot', 'New-BRAVOServiceStartTypeSnapshot',
+            'Write-BRAVOServiceQuiescenceState', 'Suspend-BRAVOServiceAutostart', 'Confirm-BRAVOServicesQuiesced',
+            'Restore-BRAVOServiceStartTypeSnapshot', 'Restore-BRAVODataRestoreServices')
+        $dataRestoreContractOffsets = @($dataRestoreContractOrder | ForEach-Object {
+                $contractName = $_
+                $contractCall = @($dataRestoreContractAst.FindAll({
+                            param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq $contractName
+                        }, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
+                if ($contractCall.Count -eq 0) { -1 } else { $contractCall[0].Extent.StartOffset }
+            })
+        $dataRestoreContractMissing = @(for ($contractIndex = 0; $contractIndex -lt $dataRestoreContractOrder.Count; $contractIndex++) {
+                if ($dataRestoreContractOffsets[$contractIndex] -lt 0) { $dataRestoreContractOrder[$contractIndex] }
+            })
+        $dataRestoreContractOrdered = $true
+        for ($contractIndex = 1; $contractIndex -lt $dataRestoreContractOffsets.Count; $contractIndex++) {
+            if ($dataRestoreContractOffsets[$contractIndex] -le $dataRestoreContractOffsets[$contractIndex - 1]) { $dataRestoreContractOrdered = $false }
+        }
         Test-BRAVOCondition `
             -Condition (
-                $dataRestoreContractMissing.Count -eq 0 -and
-                $dataRestoreRepairIndex -ge 0 -and $dataRestoreSnapshotIndex -gt $dataRestoreRepairIndex -and
-                $dataRestoreHoldSnapshotIndex -gt $dataRestoreSnapshotIndex -and
-                $dataRestoreMarkerIndex -gt $dataRestoreHoldSnapshotIndex -and
-                $dataRestoreSuspendIndex -gt $dataRestoreMarkerIndex -and
-                $dataRestoreRestoreModesIndex -gt $dataRestoreSuspendIndex -and
-                $dataRestoreStartServicesIndex -gt $dataRestoreRestoreModesIndex -and
+                $dataRestoreContractMissing.Count -eq 0 -and $dataRestoreContractOrdered -and
                 $dataRestoreTextForStartMode -notmatch 'sc\.exe' -and
                 $dataRestoreTextForStartMode -notmatch 'HKLM:'
             ) `
             -Name "ServiceQuiescence/DataRestoreUsesCanonicalStartTypeHoldContract" `
-            -Failure "DataRestore має викликати канонічні функції BRAVO.System (відсутні: $($dataRestoreContractMissing -join ', ')) у порядку Repair -> знімок служб -> знімок типів -> маркер -> Suspend -> Restore типів -> старт служб, без власних sc.exe/реєстру"
+            -Failure "DataRestore має викликати канонічні функції BRAVO.System (відсутні: $($dataRestoreContractMissing -join ', ')) у порядку Repair -> знімок служб -> знімок типів -> маркер -> Suspend -> Confirm -> Restore типів -> старт служб, без власних sc.exe/реєстру"
     } finally {
         Remove-Item -LiteralPath $startModeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
