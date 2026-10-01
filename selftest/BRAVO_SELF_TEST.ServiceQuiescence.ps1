@@ -900,6 +900,21 @@ function Start-Sleep { param($Seconds) }
             'Repair-BRAVOOrphanedServiceStartTypes',
             'Confirm-BRAVOServicesQuiesced'
         )
+    # New-Module імпортує заглушки в глобальну область. Заглушка Start-Sleep
+    # потрібна лише всередині модуля (виклики в ньому резолвляться в модулі й
+    # без глобальної копії); глобальна копія гасила справжні паузи наступних
+    # suite (TraceArchive/GraceCompletionExpiry...), тож прибираємо її одразу.
+    $startModeLeakedSleep = Get-Command -Name 'Start-Sleep' -CommandType Function -ErrorAction SilentlyContinue
+    if ($null -ne $startModeLeakedSleep -and $startModeLeakedSleep.ModuleName -eq $startModeModule.Name) {
+        Remove-Item -Path 'function:Start-Sleep' -Force -ErrorAction Stop
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [string](Get-Command -Name 'Start-Sleep').ModuleName -ne $startModeModule.Name -and
+            [string](& $startModeModule { (Get-Command -Name 'Start-Sleep').CommandType }) -eq 'Function'
+        ) `
+        -Name "ServiceQuiescence/StartModeSleepStubDoesNotLeakIntoSession" `
+        -Failure "заглушка Start-Sleep тестів #297 має діяти лише всередині тестового модуля, а не в сесії self-test"
     $startModeTestRoot = Join-Path ([IO.Path]::GetTempPath()) (
         "bravo_selftest_startmode_{0}" -f ([guid]::NewGuid().ToString("N"))
     )

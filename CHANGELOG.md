@@ -52,7 +52,8 @@
   `ServiceQuiescence/WatchdogRestoresStartTypesBeforeStartingServices`,
   `ServiceQuiescence/MaintenanceOrdersRepairSuppressRecheckRestore`,
   `ServiceQuiescence/MarkerWriteNeverDropsForeignStartTypeSnapshot`,
-  `ServiceQuiescence/MaintenanceRechecksClassificationAfterLock`.
+  `ServiceQuiescence/MaintenanceRechecksClassificationAfterLock`,
+  `ServiceQuiescence/StartModeSleepStubDoesNotLeakIntoSession`.
 
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який

@@ -8343,7 +8343,7 @@ if ([string]$script:startModeRepairResult.Status -eq 'OwnerAlive') {
         $reExchangeEnabled -ne [bool]$exchangAPIServiceEnabled -or
         $reWebEnabled -ne [bool]$BravoWebMaintenanceEnabled) {
         Write-Log -Message "Класифікація служб змінилась, поки очікувався lock (інший прогін тимчасово утримував служби Disabled, #297): Bravo $BravoMaintenanceEnabled->$reBravoEnabled, exchangAPI $exchangAPIServiceEnabled->$reExchangeEnabled, Web $BravoWebMaintenanceEnabled->$reWebEnabled. Рішення цього прогону обчислені зі застарілих даних — прогін завершено без дій, наступний запуск повторить" -Level "WARNING"
-        try { $script:maintenanceOperationLock.Dispose() } catch { }
+        Exit-BRAVOMaintenanceOperationLock
         Complete-BRAVOProgress
         exit (Resolve-BRAVOExitCode -LockBusy)
     }
