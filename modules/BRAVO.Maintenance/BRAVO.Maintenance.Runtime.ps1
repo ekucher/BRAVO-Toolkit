@@ -4612,7 +4612,7 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                 try {
                     $runtimeLogSyncResult = Sync-BRAVORuntimeLogsToSftp `
                         -Session $ownLogUploadSession `
-                        -LocalLogRoot ([string]$global:runtimeLogRoot) `
+                        -LocalLogRoot ([string]$runtimeLogRoot) `
                         -RemoteDirectory ([string]$sftpDirectories.RuntimeLogs)
                     $runtimeLogSyncMessage = "Журнали toolkit на SFTP: вивантажено $($runtimeLogSyncResult.Uploaded), без змін $($runtimeLogSyncResult.Unchanged), помилок $($runtimeLogSyncResult.Failed)"
                     if ($runtimeLogSyncResult.Failed -gt 0) {
