@@ -21,14 +21,14 @@
 
 | Кандидат | Дата | Сервер(и) | Обсяг | Результат |
 |---|---|---|---|---|
-| rc.4 / rc.5 | 2026-08-24 | `SERV_HRDL_1`, `WIN-44OBNQ3R3OB` | повний acceptance (backup, SFTP, Health) | PASS |
+| rc.4 / rc.5 | 2026-08-24 | `SRV-LAB7`, `SRV-LAB1` | повний acceptance (backup, SFTP, Health) | PASS |
 | rc.6 | 2026-08-25 | — | фіксований поріг місця блокував backup | FAIL → rc.7 |
-| rc.7 | 2026-08-25 | `WIN-42Q5558LQC9` | повний end-to-end: backup MODEL/BLOG/BRAVOEXCH, SFTP 7/7, Health OK | PASS |
-| rc.8 | 2026-08-25 22:03–22:24 | ДНДІЛДВСЕ (сервер інциденту exit 43) | `-ForceRestore`: bravocmd exit 0, Compare-FileSizes Critical=0, Rollback=NONE, служби відновлено, Trace-pipeline OK | PASS |
+| rc.7 | 2026-08-25 | `SRV-LAB11` | повний end-to-end: backup MODEL/BLOG/BRAVOEXCH, SFTP 7/7, Health OK | PASS |
+| rc.8 | 2026-08-25 22:03–22:24 | ЛАБОРАТОРІЯ-6 (сервер інциденту exit 43) | `-ForceRestore`: bravocmd exit 0, Compare-FileSizes Critical=0, Rollback=NONE, служби відновлено, Trace-pipeline OK | PASS |
 | rc.9 / rc.10 | — | — | замінені наступним кандидатом до acceptance | n/a |
-| rc.11 | 2026-08-26 | ДНДІЛДВСЕ | виявлено подвійну реставрацію після `-ForceRestore` | FAIL → rc.12 |
-| rc.12 | 2026-08-26 01:29 / 01:52 / 01:58 | ДНДІЛДВСЕ | forced-реставрація + два наступні звичайні запуски: квоту спожито, повтору НЕМАЄ (негативний тест квоти) | PASS (UX-зауваження → rc.13) |
-| rc.13 | 2026-08-26 | ДНДІЛДВСЕ (Server 2022, Supported), Львівська РДЛ (включно з хостом Server 2016, LegacyBestEffort) | повний maintenance-цикл нової поверхні rc.9–rc.13 | PASS |
+| rc.11 | 2026-08-26 | ЛАБОРАТОРІЯ-6 | виявлено подвійну реставрацію після `-ForceRestore` | FAIL → rc.12 |
+| rc.12 | 2026-08-26 01:29 / 01:52 / 01:58 | ЛАБОРАТОРІЯ-6 | forced-реставрація + два наступні звичайні запуски: квоту спожито, повтору НЕМАЄ (негативний тест квоти) | PASS (UX-зауваження → rc.13) |
+| rc.13 | 2026-08-26 | ЛАБОРАТОРІЯ-6 (Server 2022, Supported), Лабораторія-11 (включно з хостом Server 2016, LegacyBestEffort) | повний maintenance-цикл нової поверхні rc.9–rc.13 | PASS |
 
 Підтверджена нова поверхня rc.9–rc.13 на реальних серверах (26.08):
 

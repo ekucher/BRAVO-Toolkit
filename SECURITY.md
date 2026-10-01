@@ -66,13 +66,22 @@ Advisories → *Report a vulnerability*. Звіт видно лише супро
 ## 3. Модель секретів
 
 Секрети (SFTP login/password, SMB login/password, пароль архівів 7-Zip,
-Slack/Discord webhook URL, назва та код установи) зберігаються **лише** у
-Windows Credential Manager — окремо для поточного адміністратора
+Slack/Discord webhook URL, секрети BSYSTEM Operations) runtime 5.3 читає
+**лише** з Windows Credential Manager — окремо для поточного адміністратора
 (ручні запуски) і для `NT AUTHORITY\SYSTEM` (заплановані завдання),
 `-StoreFor Both` при `BRAVO_CREDENTIALS_SETUP.ps1`/`BRAVO_SETUP.ps1`.
-`BRAVO.config` містить лише fallback-значення назви установи, коду й
-префікса архівів для першого запуску — реальні секрети в конфігураційний
-файл ніколи не записуються (розділ 4 README.md).
+Виняток за походженням — API-ключ BSYSTEM Operations: його видає бекенд
+Operations під час enrollment, runtime записує його в Credential Manager
+облікового запису процесу й далі читає звідти; оператор провізіонує лише
+bootstrap-секрет.
+Конфігурація (`BRAVO.local.config`) містить лише імена записів
+(`credentialSettings.Targets.*`); секрет у конфігураційний файл не
+записується і з нього не читається. Назва, код установи й префікс архівів
+не є секретами: вони теж зберігаються в Credential Manager, але мають
+запасне значення з конфігурації. Legacy `BRAVO.config` не є джерелом ні
+секретів, ні конфігурації 5.3. Канонічний опис джерел і поведінки за
+відсутнього секрету — README.md, розділ 4, підрозділ «Джерела конфігурації
+та секретів у 5.3».
 
 Захист під час виконання:
 
@@ -257,12 +266,14 @@ tasks.
 ще не було.
 
 Тому сервер запам'ятовує найвищу версію, яку на ньому запускали
-(`LOGS\BRAVO_VERSION_STATE.json`: `highestVersion`, `sourceCommit`,
-`recordedAt`), і відмовляється виконувати старішу. Свідомий відкат —
-через `BRAVO_ALLOW_DOWNGRADE=1`.
+(`highestVersion`, `sourceCommit`, `recordedAt` у
+`C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json` — каталог
+`CommonApplicationData`, а не `LOGS`), і відмовляється виконувати
+старішу. Свідомий відкат — через `BRAVO_ALLOW_DOWNGRADE=1`.
 
-Чесна межа: файл стану лежить поруч із логами, і той, хто має права
-підмінити комплект, зазвичай має права й видалити цей файл. Перевірка не
+Чесна межа: файл стану лежить поза комплектом, у звичайному каталозі
+стану, і той, хто має права підмінити комплект, зазвичай має права й
+видалити цей файл. Перевірка не
 робить відкат неможливим — вона робить його помітним і таким, що
 потребує ще однієї свідомої дії. Проти випадкового відкату (розгорнули не
 той архів) вона працює повністю. На відміну від маніфеста, пошкоджений
@@ -432,8 +443,10 @@ Windows Credential Manager прив'язаний до облікового за�
 створений для поточного адміністратора, недоступний `SYSTEM`, і навпаки.
 `-StoreFor Both` створює обидва записи явно. Якщо забути про це при
 ручному налаштуванні (лише `CurrentUser`), заплановане завдання під
-`SYSTEM` не побачить credentials і впаде з кодом `31`
-(`CredentialsUnavailable`).
+`SYSTEM` не побачить credentials. Код завершення залежить від скрипта й
+секрету — здебільшого `31` (`CredentialsUnavailable`), але, наприклад,
+відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV` дають `30`; таблиця —
+README.md, розділ 4.
 
 Не використовується `gMSA` (group Managed Service Account) — кожен сервер
 має власні незалежні записи Credential Manager під локальним `SYSTEM`,
@@ -461,17 +474,21 @@ manifest із хешами файлів — цілісність самого re
   SFTP-призначення (немає immutable-сховища).
 - SFTP/SMB key-based автентифікація, `AppLocker`/`WDAC`, `gMSA` — не
   реалізовано.
-- GitHub branch protection **увімкнено** для `master` і `developer`
-  з 2026-08-26 (репозиторій став публічним, і обмеження тарифного плану
-  зникло): зміни лише через Pull Request, required status checks,
-  заборона force push і видалення гілки, `enforce_admins`. Фактичний
-  перелік обов'язкових перевірок — `RELEASE_POLICY.md`, розділ 13.
-  Відомий залишковий розрив: `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`
-  виконується в CI, але ще не входить до обов'язкових перевірок, тож
-  провалений E2E-тест відновлення технічно не блокує merge.
+- GitHub branch protection — бажана політика: обидві гілки захищені
+  (канон required checks і дія власника — `RELEASE_POLICY.md`,
+  розділи 13.3 і 13.4). Перевірений стан (через GitHub REST API 2026-09-30,
+  мусить бути перечитано перед рішенням): `master` — protected, шість
+  required checks, включно з `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`;
+  `strict`, `enforce_admins`, вимогу PR і заборону force push/видалення
+  з автоматичної сесії не перевірено (HTTP 403). `developer` — **не
+  protected**: merge з червоним CI, зокрема з проваленим E2E-тестом
+  відновлення, технічно нічим не заблоковано. Це відкритий розрив, доки
+  власник не застосує захист і його не буде перевірено live.
 - Захист тегів `refs/tags/v*` (заборона видалення, force-update і
-  тихого перестворення) — ще не налаштований, хоча теги запускають
-  генерацію release-артефакту й тому входять у корінь довіри.
+  тихого перестворення) — налаштований: ruleset
+  `protected-release-tags`, `enforcement: active`, порожній bypass-list
+  (перевірено через GitHub REST API 2026-09-30; конфігурація —
+  `RELEASE_POLICY.md` §16.2).
 
 ## 8.1. CI (аудит AUD-001)
 
@@ -494,10 +511,13 @@ GitHub Actions (`.github/workflows/ci.yml`), раннер `windows-latest`
 - сканування секретів (`gitleaks`, окрема Linux-джоба — самому
   скануванню вмісту git-історії ОС не важлива).
 
-**Явно НЕ ввімкнено:** required status checks і заборона прямого push у
-`master` (GitHub branch protection) — CI лише запускається й показує
-статус, але поки не блокує merge технічно. Причина — не забутий крок, а
-обмеження тарифного плану GitHub (розділ 8 вище).
+**Що з цього блокує merge технічно** (перевірено через GitHub REST API
+2026-09-30, мусить бути перечитано перед рішенням): для PR у `master`
+required status checks увімкнено (шість, `RELEASE_POLICY.md` §13.3); для
+`developer` — ні, там CI лише показує статус (розділ 8 вище). Попередня
+редакція цього абзацу пояснювала відсутність захисту обмеженням
+тарифного плану — після переходу репозиторію в публічний режим це
+пояснення застаріло.
 
 ## 8.2. Статичний аналіз: блокуючий security-набір
 
@@ -533,7 +553,7 @@ Credential Manager або необхідний міст до .NET/зовнішн
 `Invoke-BRAVOSevenZipExtraction` (`BRAVO.Compatibility`);
 `Test-SevenZipArchiveIntegrity` (`BRAVO.ArchiveHelpers`);
 `Read-SecretEntries`, `Restore-CredentialOperationSnapshots`
-(`BRAVO_CREDENTIALS_SETUP.ps1`); `Test-SftpReadOnlyAccess`,
+(`BRAVO_CREDENTIALS_SETUP.ps1`); `Test-SftpDestinationAccess`,
 `Test-SmbReadOnlyAccess` (`BRAVO_DRY_RUN.ps1`). Плюс три suppressions
 для **хибних спрацювань** правила на параметрах, чия назва містить
 «Credential», але які не є секретом (`$CredentialSettings`,

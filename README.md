@@ -259,9 +259,14 @@ $global:pathSettings = @{
 > built-in дефолти в 5.3 — це код комплекту, а не файл; будь-яке
 > відхилення від дефолту задається через **`BRAVO.local.config`**
 > (data-only, `'dot.path' = значення`, шаблон — `BRAVO.local.config.example`),
-> а секрети — через Windows Credential Manager. `BRAVO.config` лишається
-> актуальним лише для інсталяцій, що ще мігрують з 5.2 (розділ 10) —
-> нову production-інсталяцію 5.3 наводьте без нього.
+> а секрети — через Windows Credential Manager. За контрактом 5.3 legacy
+> `BRAVO.config` (5.2) читає лише migration-інструментарій (розділ 10) — нову
+> production-інсталяцію 5.3 наводьте без нього. Виняток на час міграції:
+> production-скрипт, запущений з явним `-ConfigPath` на legacy-файл (зокрема
+> завдання Планувальника, встановлене з таким аргументом), досі виконує його
+> як основний шар конфігурації.
+> Канонічний опис джерел конфігурації й секретів —
+> розділ 4, підрозділ «Джерела конфігурації та секретів у 5.3».
 
 Рекомендований спосіб — `.\BRAVO_CONFIGURATOR.ps1`: інтерактивний GUI поверх
 `BRAVO.local.config` — schema-driven форма з усіма 138 override-ключами,
@@ -470,43 +475,114 @@ backup — лише пише `WARNING` у журнал (`Write-Log`) і підн
 потрапляє в лічильник попереджень і, відповідно, у Slack/Discord-
 сповіщення після backup.
 
-### 3.3. Розрахункова перевірка вільного місця
+### 3.3. Перевірка вільного місця: поріг здоров'я і операційна вимога
 
-Фіксований поріг `maintenanceSettings.Limits.MinimumFreeSpaceGB`
-(типово 20 GB на кожному локальному Fixed-диску) — загальний захист від
-переповнення диска, а не оцінка того, скільки місця реально потребує
-найближчий backup. Джерела MODEL/BLOG/BRAVOEXCH ростуть з часом, тому
-перед архівацією `BRAVO_ARCHIV` додатково рахує **розрахункову потребу**:
-розмір останнього hash-підтвердженого валідного архіву кожного
-увімкненого компонента (той самий канонічний reader історії, що й
-`SizeSanity` у розділі 3.2) плюс запас на зростання:
+Перевірку перед архівацією (`BRAVO_ARCHIV`) виконує спільний класифікатор
+`modules/BRAVO.DiskSpace`. Він розрізняє дві незалежні речі:
+
+- **поріг здоров'я тому** `maintenanceSettings.Limits.MinimumFreeSpaceGB`
+  (типово 20 GB) — загальний захист від переповнення диска. Сам по собі він
+  **не** визначає, чи можна виконати операцію;
+- **операційну вимогу** — скільки місця реально потребує найближчий backup
+  на кожному archive destination.
+
+Вимогу рахує `BRAVO_ARCHIV` окремо для кожного увімкненого компонента
+(MODEL/BLOG/BRAVOEXCH):
+
+- є валідна історія — розмір останнього hash-підтвердженого валідного архіву
+  (той самий канонічний reader історії, що й `SizeSanity` у розділі 3.2) плюс
+  запас на зростання, але не більше за оцінку за розміром джерела нижче;
+- історії немає (перший запуск, bootstrap) — оцінка за розміром джерела:
+  сума `Length` усіх файлів джерела плюс 2% на накладні витрати 7-Zip, якщо
+  ця сума більша за нуль;
+- історії немає, а розмір джерела виміряти не вдалось **або він нульовий**
+  (порожнє джерело чи лише файли нульової довжини) — вимога невідома, і для
+  тому діє запасний гейт за порогом (`BelowFallbackFloorNoEstimate` у
+  таблиці нижче). Тож перший backup порожнього джерела може бути
+  заблокований, якщо залишок на томі менший за `MinimumFreeSpaceGB`.
+
+Обидві оцінки — евристика, а не гарантована верхня межа. Оцінка за розміром
+джерела рахує лише вміст файлів і не враховує окремо метадані контейнера
+7-Zip (заголовки та імена кожного файлу): для джерела з дуже великою
+кількістю дрібних файлів або довгими шляхами ці метадані можуть перевищити
+2% від обсягу даних, і архів вийде більшим за оцінку. Тож на таких джерелах
+не тримайте archive destination впритул до розрахункової потреби: тримайте
+запас понад неї самостійно. `MinimumFreeSpaceGB` такого запасу не гарантує —
+за `ArchivePeakSafe` і поточне вільне місце нижче порогу, і прогнозований
+залишок після backup нижче порогу є лише попередженнями, тож прогін може
+піти з мінімальним запасом понад заниженою оцінкою.
 
 | Поле (`maintenanceSettings.Limits`) | Призначення |
 |---|---|
 | `EstimatedSpaceMarginPercent` | запас у % понад розмір останнього валідного архіву (типово 25); опційний — старі `BRAVO.config` без нього отримують дефолт у коді завантаження |
 
-Правила:
+Компоненти на одному томі сумуються в одну вимогу. Архівація викликає
+класифікатор з політикою `RequirementPolicy = 'ArchivePeakSafe'`, тож для
+archive destination на локальному томі рішення таке:
 
-- компоненти на одному фізичному диску сумуються в один розрахунок;
-- компонент без валідної історії (перший запуск, bootstrap) з оцінки
-  пропускається — не блокує прогін;
-- **недостатність за оцінкою завжди блокує** backup, навіть якщо
-  фіксований поріг проходить;
-- у зворотний бік: якщо диск нижче фіксованого порогу, але розрахункова
-  потреба для ТОГО САМОГО диска доведено покрита, провал порогу
-  знижується до `WARNING` у лозі (backup не блокується). Диск без
-  жодного оціненого компонента лишається під фіксованим порогом без
-  послаблень.
+| Стан тому призначення | Reason у лозі | Наслідок |
+|---|---|---|
+| вимога відома і більша за доступне місце (або вимога невідома, але вже відома її частина — сума відомих вимог інших компонентів тому — більша за доступне місце) | `EstimatedRequirementNotMet` | блокує, код `40` |
+| вимога відома і вміщається, але вільного менше за `MinimumFreeSpaceGB` | `BelowHealthFloorButRequirementSatisfied` | `WARNING`, **не блокує** |
+| вимога відома, вміщається, вільне вище порогу, але після backup залишок буде нижче порогу | `ProjectedBelowHealthFloor` | `WARNING`, не блокує |
+| вимога хоча б одного компонента на томі невідома, і залишок після відомих вимог решти компонентів (`ResidualAvailableGB` = вільне місце мінус сума відомих вимог) менший за `MinimumFreeSpaceGB` | `BelowFallbackFloorNoEstimate` | блокує, код `40` |
 
-Перевірка діє лише в archive preflight (`BRAVO_ARCHIV`); Maintenance
-перевіряє тільки фіксований поріг. Операторська інтерпретація
-результатів — в `OPERATIONS.md`, розділ `40`, підрозділ «Archive
-preflight: перевірка вільного місця».
+Тобто відома вимога, яка вміщається в доступне місце, **не блокується лише
+через те**, що вільного менше за `MinimumFreeSpaceGB`: поріг тут —
+сигнал здоров'я, і прогін продовжується з кодом `10` (`SuccessWithWarnings`).
+Поріг діє як гейт операції лише для destination без визначеної вимоги, і
+тоді з порогом порівнюється не поточне вільне місце, а залишок після відомих
+вимог (`ResidualAvailableGB` у рядку `DiskSpace ...`). Приклад: вільно 30 GB,
+поріг 20 GB, на томі два компоненти — одному потрібно 15 GB, вимога другого
+невідома. Залишок 30 − 15 = 15 GB менший за поріг, тож архівація блокується
+з `BelowFallbackFloorNoEstimate`, хоча вільного місця більше за поріг.
+
+**Archive destination на UNC-шляху** (`\\server\share\...`) таблиця вище не
+описує. Архівація не передає класифікатору ємність мережевого ресурсу, тож
+він фіксує її як невідому й повертає `CapacityUnknownRemote` (`WARNING`, не
+блокує) ще до порівняння вимоги з місцем: навіть відома вимога з доступним
+місцем на ресурсі не порівнюється, і ця перевірка **не захищає** мережевий
+ресурс від переповнення — стежте за його вільним місцем окремо. Недоступний
+UNC-шлях і далі блокує (перевірка доступу йде перед перевіркою місця).
+
+Окремо від archive destination архівація робить health-only огляд **усіх**
+локальних Fixed-дисків, зокрема й тих, що самі є archive destination. Цей
+огляд оцінює лише поріг здоров'я: нестача дає `WARNING`
+`BelowHealthFloorNoFreeSpaceRequirement` для health-only запису тому (виду
+`D:\: BelowHealthFloorNoFreeSpaceRequirement`). Тому для destination нижче
+порогу в журналі може бути два рядки: цей health-only і operational-рядок
+`<шляхи destination>: <причина>`. Його причина залежить від вимоги:
+`BelowHealthFloorButRequirementSatisfied`, якщо відома вимога вміщається
+(не блокує), або блокуючі `EstimatedRequirementNotMet` чи
+`BelowFallbackFloorNoEstimate`. Сама причина
+`BelowHealthFloorNoFreeSpaceRequirement` означає результат health-only
+огляду, а не те, що архівація на цей диск не пише.
+
+Виняток — малий том, загальна ємність якого менша за `MinimumFreeSpaceGB`:
+такий поріг недосяжний за побудовою, тож health-only оцінка замінює його на
+10% ємності тому (фактичне значення — у `Flags` рядка `DiskSpace ...` як
+`DegradedHealthFloorGB=...`). Попередження тоді з'являється лише нижче
+цього зниженого порогу і має причину `BelowDegradedHealthFloorSmallVolume`.
+Знижений поріг стосується лише health-only оцінки, не archive destination.
+
+Health-only попередження `maintenanceSettings.Limits.ExcludedDrives` може
+придушити. На operational-блокування `ExcludedDrives` не впливає.
+
+`BRAVO_MAINTENANCE` використовує той самий класифікатор з політикою
+`MaintenanceExactOnly`. Точної вимоги для нього немає, тому на томі
+`LIMSRoot` поріг діє як гейт: нестача дає `BelowFallbackFloorNoEstimate` і
+код `60`.
+
+Операторська інтерпретація результатів — в `OPERATIONS.md`, розділ `40`,
+підрозділ «Archive preflight: перевірка вільного місця».
 
 ## 4. Параметри установи та секрети
 
-Наступні значення зберігаються у Windows Credential Manager, тому їх не потрібно
-знову вписувати у config після оновлення:
+Секрети й параметри установи зберігаються у Windows Credential Manager, тому
+їх не потрібно знову вписувати в конфігурацію після оновлення. Звідки саме
+runtime бере кожне значення і що буває, коли його немає, — підрозділ
+[«Джерела конфігурації та секретів у 5.3»](#джерела-конфігурації-та-секретів-у-53)
+нижче; це єдиний канонічний опис, інші документи посилаються на нього.
 
 | Target Credential Manager | Значення |
 |---|---|
@@ -522,10 +598,157 @@ preflight: перевірка вільного місця».
 | `BRAVO_SLACK_ALERTS_URL` | Slack webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
 | `BRAVO_DISCORD_GENERAL_URL` | Discord webhook — лише штатні (SUCCESS) сповіщення |
 | `BRAVO_DISCORD_ALERTS_URL` | Discord webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
+| `BRAVO_OPERATIONS_BOOTSTRAP_SECRET` | bootstrap-секрет enrollment BSYSTEM Operations |
+| `BRAVO_OPERATIONS_API_KEY` | API-ключ BSYSTEM Operations (записує сам runtime після enrollment) |
 
-Значення `InstitutionName`, `InstitutionCode` і `ArchivePrefix` у
-`BRAVO.config` — лише fallback для першого запуску. Після налаштування
-використовуються записи Credential Manager.
+### Джерела конфігурації та секретів у 5.3
+
+**Контракт runtime 5.3:**
+
+```text
+канонічні built-in дефолти (код комплекту)
+  + BRAVO.local.config (лише дозволені не-секретні site-override)
+  + Windows Credential Manager (секрети й параметри установи)
+  + автоматичне визначення на машині (Discovery) для AUTO-шляхів
+  + детермінована деривація
+  = ефективна конфігурація
+```
+
+`BRAVO.config` у цьому контракті **не є джерелом конфігурації**: штатний
+запуск 5.3 (без `-ConfigPath`) не виконує його, навіть якщо файл фізично
+лежить поруч, — завантажувач лише попереджає про знайдений файл. Виняток —
+явний `-ConfigPath` (підрозділ «Міграція — legacy `BRAVO.config`» нижче);
+з PR #317 це стосується й ручного `BRAVO_OPERATIONS_HEARTBEAT.ps1`, який
+раніше виконував сусідній файл і без `-ConfigPath`. Секретів він не постачає за жодних умов.
+
+#### Runtime 5.3 — не-секретна конфігурація
+
+1. Канонічні built-in дефолти — код комплекту (`modules\BRAVO.Configuration`).
+2. `BRAVO.local.config` — лише ті dot-path, які реєстр авторизації дозволяє
+   як site-override. Неавторизований або некоректний за типом ключ зупиняє
+   завантаження ще до злиття — жоден override із файлу тоді не
+   застосовується частково (єдиний виняток — свідоме послаблення через
+   `BRAVO_ALLOW_WEAKENED_SECURITY=1` для ключів, які реєстр дозволяє так
+   послабити).
+3. Детермінована деривація (ефективні корені, шляхи, `storageEffective` тощо)
+   з результату злиття. Для шляхів, лишених порожніми (AUTO, як built-in
+   `pathSettings.LIMSRoot = ""`), вона бере автоматичне визначення на машині:
+   `Resolve-BRAVOEffectiveLimsRoot` і `Resolve-BRAVOInstallationDiscovery`
+   (`modules\BRAVO.Discovery`) читають служби Windows (`Win32_Service`),
+   активний `bravo.ini` і стан файлової системи. Тому зміна служби чи
+   `bravo.ini` може змінити ефективну конфігурацію без зміни жодного з
+   перелічених файлів; явно заданий шлях Discovery не перевизначає.
+
+#### Runtime 5.3 — секрети
+
+Пароль архівів, SFTP- і SMB-логін/пароль, webhook-и Slack/Discord,
+bootstrap-секрет BSYSTEM Operations мають **єдине** джерело — Windows
+Credential Manager того облікового запису, від якого запущено процес:
+адміністратора для ручних запусків, `SYSTEM` для завдань Планувальника
+(тому `-StoreFor Both`). Змінні середовища, аргументи командного рядка,
+`BRAVO.local.config` і `BRAVO.config` секретів не постачають.
+
+API-ключ BSYSTEM Operations оператор не створює: його видає бекенд Operations
+у відповіді на enrollment (або reissue), і runtime сам записує його
+(`Set-BRAVOCredential`) у Credential Manager облікового запису процесу, а далі
+читає лише звідти. Credential Manager для нього — постійне сховище, а не
+першоджерело; `BRAVO_CREDENTIALS_SETUP.ps1` (компонент `Operations`)
+провізіонує лише bootstrap-секрет, тож `-StoreFor Both` API-ключ не створює.
+
+Конфігурація містить лише **ім'я запису** (reference metadata) —
+`credentialSettings.Targets.<Ключ>`; перевизначити його в
+`BRAVO.local.config` дозволено, але зазвичай не потрібно. Якщо ключ порожній,
+runtime бере канонічне ім'я з таблиці вище (`BRAVO_7Z_PASSWORD`,
+`BRAVO_SFTP_*`, `BRAVO_SMB_*`, `BRAVO_<SLACK|DISCORD>_<GENERAL|ALERTS>_URL`).
+Для `OperationsApiKey`/`OperationsBootstrapSecret` такої підстановки в коді
+немає: діє ім'я з built-in дефолту. Пошуку секрету під іншим ім'ям немає:
+заданий target — єдиний кандидат, а webhook не підміняється ні legacy
+provider-wide записом, ні записом іншого каналу (підрозділ «Маршрутизація
+сповіщень» нижче). Порожній запис дорівнює відсутньому.
+
+#### Runtime 5.3 — параметри установи
+
+`InstitutionName`, `InstitutionCode`, `ArchivePrefix` — не секрети, тому
+мають запасне джерело:
+
+1. запис Credential Manager (`credentialSettings.Targets.InstitutionName`
+   тощо; порожній ключ → `BRAVO_INSTITUTION_NAME`, `BRAVO_INSTITUTION_CODE`,
+   `BRAVO_ARCHIVE_PREFIX`);
+2. лише якщо запису немає або він порожній — `bravoSettings.<Параметр>` з
+   ефективної конфігурації: override у `BRAVO.local.config`, інакше built-in
+   placeholder (`УСТАНОВА`, `00000000`, `lab_v2412`).
+
+Цей порядок застосовують `BRAVO_ARCHIV`, `BRAVO_HEALTH`, `BRAVO_MAINTENANCE`,
+`BRAVO_DATA_RESTORE`, `BRAVO_OPERATIONS_HEARTBEAT` і `BRAVO_DRY_RUN`
+(`Import-BRAVOInstitutionSettings`): у них запис Credential Manager завжди має
+пріоритет — щойно він є, `bravoSettings.*` для цього параметра ігнорується.
+Обране значення проходить
+ту саму валідацію формату; некоректне значення або недоступний Credential
+Manager зупиняють запуск. Placeholder формально валідний, тому production-
+скрипти **не попереджають**, що працюють на ньому; джерело кожного параметра
+(`CredentialManager` чи `ConfigurationFallback`, останнє — як `WARN`) показує
+`.\BRAVO_DRY_RUN.ps1`.
+
+Інші скрипти Credential Manager для цих параметрів не читають і беруть
+`bravoSettings.*` (override або placeholder) навіть за наявного запису:
+`BRAVO_NOTIFICATION_TEST` і `BRAVO_RESTORE_TEST` — у тексті своїх сповіщень,
+`BRAVO_SETUP`, `BRAVO_BAZA_RECONCILE` і `BRAVO_TASKS_INSTALL` — у заголовку
+консолі.
+
+#### Відсутній секрет: що робить кожен компонент
+
+Компонент, якому бракує секрету, не намагається працювати без нього. Код
+завершення при цьому **не завжди `31`** — він залежить від скрипта:
+
+| Скрипт | Відсутній запис | Поведінка | Код |
+|---|---|---|---|
+| `BRAVO_ARCHIV` | пароль архівів | архіви не створюються | `31` (або `30`, якщо одночасно є помилка конфігурації, — вона має вищий пріоритет) |
+| `BRAVO_ARCHIV` | SFTP- або SMB-логін/пароль | відповідна передача пропускається як помилка конфігурації; локальна архівація продовжується | `30` |
+| `BRAVO_ARCHIV` | webhook | сповіщення не надсилається, причина — у журналі; архівація не зупиняється | — |
+| `BRAVO_ARCHIV` | параметри установи (некоректні або Credential Manager недоступний) | запуск зупиняється | `1` (поза контрактом `BRAVO.ExitCodes`) |
+| `BRAVO_MAINTENANCE` | пароль архівів | запуск зупиняється до будь-яких дій | `31` |
+| `BRAVO_MAINTENANCE` | webhook потрібного каналу (режим сповіщень не `none`) | запуск зупиняється | `31` |
+| `BRAVO_MAINTENANCE` | SFTP-логін/пароль | SFTP-частина trace-архівації й вивантаження власного журналу пропускається з `WARNING` | — |
+| `BRAVO_HEALTH` | webhook потрібного каналу (режим сповіщень не `none`) | перевірки не виконуються | `30` |
+| `BRAVO_HEALTH` | SFTP- або SMB-логін/пароль | відповідна перевірка фіксується як проблема | `70` |
+| `BRAVO_DATA_RESTORE` | пароль архівів; SFTP-логін/пароль для `-Source SFTP` | відновлення не починається | `31` |
+| `BRAVO_RESTORE_TEST` | пароль архівів | drill не виконується | `90` |
+| `BRAVO_BAZA_RECONCILE` | SFTP-логін/пароль | перегляд мутацій (`-ListOnly` або запуск без `-Accept`/`-AcceptAll`) облікових даних не читає й завершується `0`; не виконується лише прийняття мутацій (`-Accept`/`-AcceptAll`) | `31` (лише в режимі прийняття) |
+| `BRAVO_NOTIFICATION_TEST` | webhook | тест не пройдено | `31` |
+| BSYSTEM Operations (усі runtime) | API-ключ і bootstrap-секрет | `WARNING` у журналі; події буферизуються в локальному outbox (`%ProgramData%\BRAVO\State\Outbox`) до enrollment, але не більше 500: найстаріші витісняються в `Outbox\DeadLetter` (зберігаються 200 найновіших), звідки після enrollment автоматично не доставляються | — |
+
+«—» означає, що відсутній секрет не має власного коду завершення: код
+визначають інші результати прогону.
+
+Некоректні параметри установи чи недоступний під час їх читання Credential
+Manager у `BRAVO_MAINTENANCE`, `BRAVO_HEALTH`, `BRAVO_DATA_RESTORE` і
+`BRAVO_OPERATIONS_HEARTBEAT` — помилка конфігурації (`30`); у `BRAVO_ARCHIV`
+— `1` (див. таблицю). Коди — розділ 12 «Коди завершення production-скриптів».
+
+#### Міграція — legacy `BRAVO.config`
+
+За контрактом legacy `BRAVO.config` (5.2) читає лише ізольований migration-
+інструментарій: `.\deploy\Get-BRAVOConfigSiteDelta.ps1` порівнює його з
+канонічними дефолтами й друкує site-відмінності у форматі dot-path для
+перенесення в `BRAVO.local.config` (процедура — розділ 10). Секрети з
+`BRAVO.config` не мігрують: runtime їх звідти не читає, а пароль у
+`archiveParams`/`Maintenance.Archiver.Parameters` вважається помилкою
+конфігурації.
+Параметри установи переносяться в Credential Manager
+(`.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Institution -StoreFor Both`),
+а не в `BRAVO.local.config`.
+
+Не використовуйте `BRAVO.config` як runtime-fallback. **Відома розбіжність
+коду з контрактом:** production-скрипти досі приймають явний `-ConfigPath`
+на legacy `BRAVO.config` і тоді виконують його як основний шар
+(дефолти < `BRAVO.config` < `BRAVO.local.config`); завдання Планувальника,
+встановлені з явним `-ConfigPath`, передають його щоразу. Це лише
+сумісність на час міграції, а не підтримуване джерело конфігурації 5.3:
+після перенесення відмінностей перевстановіть завдання без `-ConfigPath`
+(`.\BRAVO_TASKS_INSTALL.ps1`). Ручний `BRAVO_OPERATIONS_HEARTBEAT.ps1`
+до PR #317 не вимикав автопідхоплення legacy-файлу і без `-ConfigPath`
+виконував `BRAVO.config` з каталогу runtime; тепер він поводиться так само,
+як інші скрипти.
 
 ### Маршрутизація сповіщень (GENERAL/ALERTS)
 
@@ -877,6 +1100,9 @@ Maintenance, окреме Recovery-завдання не реєструєтьс�
 | `BRAVO_ARCHIV` | щодня `23:00` | архівація та передача копій |
 | `BRAVO_MAINTENANCE` | щодня `23:55` | обслуговування BRAVO |
 | `BRAVO_ARCHIV_HEALTH` | кожні 240 хв. від `00:30` | контроль служб і локальних/SFTP/SMB копій |
+| `BRAVO_RESTORE_VERIFY` | щотижня, субота `04:00` | restore drill (розділ 6.1) |
+| `BRAVO_RESTORE_RECOVERY` | при старті сервера | підхоплення пропущеної реставрації моделі; лише профіль робочого часу (`Restore.BootRestoreMode = "HoldServices"`) |
+| `BRAVO BAZA Synchronization` | кожні 4 год. від `00:00` | синхронізація `BAZA_APP`/`BAZA_WWW` із SFTP; лише коли ввімкнено BAZA SFTP |
 | `BRAVO_ARCHIV_CATCHUP` | після старту Windows, затримка 7 хв. | пропущена нічна копія (сервер був вимкнений о `23:00`) |
 
 `BRAVO_ARCHIV_CATCHUP` запускає `BRAVO_ARCHIV.ps1 -CatchUpMissedBackup`.
@@ -1031,7 +1257,8 @@ UAC — можливий подальший крок, якщо той самий
    `'dot.path' = значення`). Старий `BRAVO.config` при цьому не
    видаляйте — використайте його явним `-ConfigPath` лише як джерело
    для порівняння нижче; у звичайному (AUTO, без `-ConfigPath`)
-   виконанні 5.3-скрипти його все одно ігнорують. Це одноразова
+   виконанні 5.3-скрипти його все одно ігнорують (з PR #317 — і
+   `BRAVO_OPERATIONS_HEARTBEAT.ps1`). Це одноразова
    міграція за установу, не за кожне оновлення.
 
    Шукати ці відмінності вручну не потрібно —
@@ -1067,13 +1294,14 @@ UAC — можливий подальший крок, якщо той самий
 запитуються і не перезаписуються. Завдання оновлюються відповідно до поточного
 `schedulerSettings`.
 
-### Оновлення до 5.2.3: перевірка `ExcludedDrives` і `MinimumFreeSpaceGB`
+### Оновлення з 5.2.2 і раніше: перевірка `ExcludedDrives` і `MinimumFreeSpaceGB`
 
-5.2.3 переводить перевірку вільного місця (`BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`)
-на operation-aware політику — детально в `CHANGELOG.md` (розділ 5.2.3-dev.1).
-Перед оновленням production-сервера перевірте:
+5.2.3 перевела перевірку вільного місця (`BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`)
+на operation-aware політику, 5.2.4 скоригувала її для архівації — детально в
+`CHANGELOG.md` (розділи 5.2.3-dev.1 і 5.2.4-rc.1). Перед оновленням
+production-сервера перевірте:
 
-- Якщо `Maintenance.Limits.ExcludedDrives` містить диск, доданий саме як обхід
+- Якщо `maintenanceSettings.Limits.ExcludedDrives` містить диск, доданий саме як обхід
   старого false-positive блокування (мало вільного місця на непов'язаному
   диску) — після 5.2.3 таке виключення більше не потрібне і його можна прибрати.
   Але якщо той самий диск реально є archive destination чи `LIMSRoot`
@@ -1081,11 +1309,22 @@ UAC — можливий подальший крок, якщо той самий
   (`ExcludedDrives` тепер придушує лише health-попередження, не operational
   block).
 - Сервери, де архівація проходила через below-floor relaxation
-  (`Merge-BRAVOArchiveSpaceCheckResults` у 5.2.1/5.2.2 — доступно трохи менше
-  за `MinimumFreeSpaceGB`, але розрахункова оцінка достатня), після 5.2.3
-  почнуть блокуватись на цьому кроці (`BelowFloorEstimateNotPeakSafe`) — це
-  свідоме посилення політики. Перевірте фактичне вільне місце на archive
-  destination відносно `MinimumFreeSpaceGB` заздалегідь.
+  (`Merge-BRAVOArchiveSpaceCheckResults` у 5.2.1/5.2.2 — доступно менше за
+  `MinimumFreeSpaceGB`, але розрахункова оцінка достатня), проходять і далі:
+  з 5.2.4 архівація використовує політику `ArchivePeakSafe`, і для archive
+  destination `MinimumFreeSpaceGB` — поріг здоров'я тому, а не гейт операції.
+  Якщо розрахункова вимога вміщається в доступне місце, прогін **не блокується**:
+  у лозі з'являється рядок `DiskSpace ... Status=Warning Blocks=False
+  Reason=BelowHealthFloorButRequirementSatisfied` і `WARNING` виду
+  `<шляхи>: BelowHealthFloorButRequirementSatisfied`, крок `Перевірка вільного
+  місця` лишається `OK`, а успішний прогін завершується кодом `10`
+  (`SuccessWithWarnings`). Через нестачу місця блокують (код `40`,
+  `LocalArchiveFailed`) лише невиконана вимога (`EstimatedRequirementNotMet`)
+  і archive destination без визначеної вимоги, залишок якого після відомих
+  вимог інших компонентів тому нижчий за поріг (`BelowFallbackFloorNoEstimate`).
+  Причину `BelowFloorEstimateNotPeakSafe` видавала лише 5.2.3;
+  production-виклики 5.2.4 і новіших її не породжують — побачивши її в лозі,
+  перевірте, чи оновлення справді застосувалось.
 
 ## 11. Якщо вручну працює, а за розкладом — ні
 
@@ -1364,8 +1603,8 @@ health > лише попередження. Код `90` має найвищий 
 | Код | Найімовірніша причина | Де дивитись |
 |---|---|---|
 | `20` | Інший екземпляр Archive/Maintenance ще виконується | `C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock` (JSON: `pid`, `hostname`, `operation`, `startedAt`, `GenerationId`); збільшіть `OperationLockWaitMinutes`, якщо це штатне перекриття довгих завдань |
-| `30` | Некоректний/відсутній розділ `BRAVO.config` (`maintenanceSettings`, `pathSettings` тощо) | Перший `[ERROR]` одразу після `=== ПЕРЕВІРКА СУМІСНОСТІ СИСТЕМИ ===`; `.\BRAVO_SETUP.ps1 -ValidateOnly` відтворює ту саму перевірку без production-дій |
-| `31` | Відсутній або порожній запис Credential Manager для потрібного компонента | Рядок `credentialInitializationError`/`archiveCredentialInitializationError` у консольному виводі; `.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Test -Component Required -StoreFor Both` |
+| `30` | Ефективна конфігурація (built-in дефолти + `BRAVO.local.config`) не пройшла валідацію або ОС у рівні `Unsupported`; також відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV` і відсутній webhook у `BRAVO_HEALTH` (розділ 4, «Відсутній секрет: що робить кожен компонент») | Перший `[ERROR]` одразу після `=== ПЕРЕВІРКА СУМІСНОСТІ СИСТЕМИ ===`; `.\BRAVO_SETUP.ps1 -ValidateOnly` відтворює ту саму перевірку без production-дій. Облікові дані діагностуються в інших місцях: у `BRAVO_ARCHIV` — `[ERROR]` `Помилка конфiгурацiї SFTP: …` / `Помилка конфігурації NAS/SMB: …` у секції перевірки конфігурації SFTP чи NAS/SMB (далі `WARNING` про пропуск передачі); у `BRAVO_HEALTH` — `[ERROR]` `Некоректно налаштовано канал повідомлень або його webhook у Credential Manager` у `BRAVO_ARCHIV_HEALTH_*.log` |
+| `31` | Відсутній або порожній запис Credential Manager: пароль архівів (`BRAVO_ARCHIV`, `BRAVO_MAINTENANCE`, `BRAVO_DATA_RESTORE`), webhook (`BRAVO_MAINTENANCE`, `BRAVO_NOTIFICATION_TEST`), SFTP (`BRAVO_DATA_RESTORE`; `BRAVO_BAZA_RECONCILE` лише з `-Accept`/`-AcceptAll`). Не кожен відсутній секрет дає `31` — повна таблиця в розділі 4 | Повідомлення «запис Credential Manager '<target>' не знайдено або він порожній» у консолі/журналі (у `BRAVO_ARCHIV` його несуть `archiveCredentialInitializationError`/`credentialInitializationError`); `.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Test -Component Required -StoreFor Both` |
 | `32` | SHA-256 файлу в `Tools/` не збігається з еталонним `TOOLS_MANIFEST.json`, або маніфест відсутній/пошкоджений | Рядок `ЦIЛIСНIСТЬ IНСТРУМЕНТIВ ПОРУШЕНО` на старті логу. Якщо оновлення інструментів свідоме — оновіть маніфест на робочій станції (`ci\Update-BRAVOToolsManifest.ps1 -Apply`), перегляньте `git diff`, розгорніть новий комплект. Якщо ні — це можлива підміна: заплановане завдання виконується від `SYSTEM`, тому інструмент отримав би найвищі права |
 | `33` | SHA-256 файлу комплекту не збігається з `RUNTIME_MANIFEST.json`, файл відсутній, або в комплекті з'явився сторонній `.ps1`/`.psm1` | Рядок `ЦІЛІСНІСТЬ КОМПЛЕКТУ ПОРУШЕНО` — це найперше, що виводиться, ще до завантаження модулів. Якщо оновлення коду свідоме: `ci\Update-BRAVORuntimeManifest.ps1 -Apply` на робочій станції, `git diff`, розгортання нового комплекту |
 | `34` | `BRAVO.config` вимикає перевірку цілісності інструментів (`Mode = "Warn"`) або VSS-узгодженість (`backupConsistency.Mode ≠ "VSS"`) | Рядок `КОНФІГУРАЦІЯ ПОСЛАБЛЮЄ ЗАХИСТ` на старті. Конфігурація не входить до `RUNTIME_MANIFEST.json` (вона різна на кожному сервері), тому ці перемикачі перевіряються окремо — розбором AST, без виконання файлу. Якщо послаблення свідоме й тимчасове, встановіть `BRAVO_ALLOW_WEAKENED_SECURITY=1`: тоді воно лишає слід поза комплектом |
@@ -1377,7 +1616,7 @@ health > лише попередження. Код `90` має найвищий 
 | `42` | SHA512 generation/verification failed після успішного `7z t` | Компонент `HASH`; тимчасові артефакти поточної generation прибираються, попередній valid backup лишається незмінним |
 | `50` | SFTP: з'єднання, автентифікація або передача файлу | Секція `ЗАВАНТАЖЕННЯ АРХІВІВ НА SFTP` / `СИНХРОНІЗАЦІЯ BAZA НА SFTP`; перевірте `sftpHostKey` fingerprint і мережевий доступ до TCP 22 |
 | `51` | SMB/NAS: недоступний UNC-шлях або облікові дані | Секція `КОПІЮВАННЯ АРХІВІВ НА NAS/SMB`; перевірте доступність UNC-шляху від `SYSTEM` через `BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess` |
-| `60` | Maintenance: служби, диск, файлове господарство — усе, що не потрапляє під `40`/`41` | Секція, де `Результат: ПОМИЛКА` вперше з'являється в `BRAVO_MAINTENANCE_*.log`; часто — недостатньо вільного місця (`Limits.MinimumFreeSpaceGB`; у Maintenance діє лише фіксований поріг, без розрахункового послаблення з розділу 3.3) або служба не в стані `Running` |
+| `60` | Maintenance: служби, диск, файлове господарство — усе, що не потрапляє під `40`/`41` | Секція, де `Результат: ПОМИЛКА` вперше з'являється в `BRAVO_MAINTENANCE_*.log`; часто — недостатньо вільного місця на томі `LIMSRoot` (`BelowFallbackFloorNoEstimate`: точної вимоги в Maintenance немає, тому `Limits.MinimumFreeSpaceGB` там діє як гейт — розділ 3.3) або служба не в стані `Running` |
 | `70` | Health-check: локальні/SFTP/SMB копії застаріли, або керована служба не працює | `BRAVO_ARCHIV_HEALTH_*.log`, рядки `[ERROR] Проблема ...`; дивіться `LocalVerified`/`SftpVerified`/`SmbVerified`, якщо результат читається програмно |
 | `90` | Непередбачений виняток, якого runtime не встиг категоризувати | `Write-Error`/останній `[ERROR]` перед аварійним завершенням; часто вказує на прогалину в конфігурації, яку варто завести як окремий issue, а не лише перезапустити завдання |
 

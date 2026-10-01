@@ -743,7 +743,7 @@ function ConvertTo-BRAVONotificationPayloadText {
     # Unary comma зберігає масивність крізь pipeline-повернення: `return @(...)`
     # з одним chunk-ом PowerShell 5.1 розгортає у скаляр-[string], і `.Count`
     # у викликача під Set-StrictMode 2.0 кидає PropertyNotFoundException
-    # (спостережено 2026-08-27 на ХРДЛ: хибний ERROR «Не вдалося відправити
+    # (спостережено 2026-08-27 на ЛАБОРАТОРІЯ-7: хибний ERROR «Не вдалося відправити
     # сповіщення про несумісні імена BAZA_APP» після фактично доставленого
     # webhook-повідомлення).
     if ($Provider.ToLowerInvariant() -eq "discord") {

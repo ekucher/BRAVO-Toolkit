@@ -204,6 +204,29 @@ $taskInstallerText = [IO.File]::ReadAllText(
         -Name "ConsoleUX/14-ManualPauseWaitsForKey" `
         -Failure "Wait-BRAVOManualExit має справді чекати на клавішу в інтерактивному режимі без -NoPause"
 
+    # Перенесено з кореня (#219): обидві структурні перевірки читають
+    # $waitManualExitText, який витягує саме цей фрагмент; корінь, що
+    # виконується завжди, не може залежати від змінної gated-фрагмента.
+    # --- Structural: [Console]::IsInputRedirected більше НЕ окрема
+    # самостійна pre-check причина відхилити операторську консоль ДО
+    # спроби RawUI.ReadKey (реальний DEV-LIMS баг); UserInteractive
+    # лишається єдиною такою причиною.
+    Test-BRAVOCondition `
+        -Condition (
+            -not $waitManualExitText.Contains('[Console]::IsInputRedirected') -and
+            $waitManualExitText.Contains('[Environment]::UserInteractive')
+        ) `
+        -Name 'Console/ManualExitDoesNotPreSkipSolelyForInputRedirected' `
+        -Failure 'Wait-BRAVOManualExit НЕ повинна містити самостійну перевірку [Console]::IsInputRedirected — реальний DEV-LIMS MANUAL-запуск довів, що вона помилково відхиляла справжню операторську консоль до спроби RawUI.ReadKey'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $waitManualExitText.Contains('$Host.UI.RawUI.ReadKey(') -and
+            $waitManualExitText.Contains('[void](Read-Host)')
+        ) `
+        -Name 'Console/ManualExitUsesRawUIWithReadHostFallback' `
+        -Failure 'Wait-BRAVOManualExit має спершу пробувати $Host.UI.RawUI.ReadKey(...), з фолбеком на Read-Host — той самий контракт, що й раніше'
+
     # 15. Health: фінальний підсумок включає Перевірок/Успішно/Попереджень/
     # Помилок — не лише голий Статус.
     Test-BRAVOCondition `
