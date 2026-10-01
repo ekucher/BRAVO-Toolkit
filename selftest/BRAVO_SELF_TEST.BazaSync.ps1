@@ -2361,6 +2361,11 @@
                         $ConnectionTimeoutSeconds, $OperationTimeoutSeconds, $MutationPolicy, $AutoArchiveMutationThreshold,
                         [switch]$BootstrapIfNeeded, $FullAuditProvider, $FullAuditEveryDays, [switch]$ForceFullAudit, [switch]$WriteCheckpoint)
                     $script:EngineSessionCalls++
+                    if ($script:ForceSkippedConcurrent) {
+                        $sk = New-BRAVOBazaSyncResult -Component $Component -CycleId (New-BRAVOBazaCycleId) -StartedUtc (Get-Date).ToUniversalTime() -CutoffUtc (Get-Date).ToUniversalTime()
+                        $sk.Status = 'SKIPPED_CONCURRENT'
+                        return $sk
+                    }
                     $cycleId = New-BRAVOBazaCycleId
                     $startedUtc = (Get-Date).ToUniversalTime()
                     $lock = Enter-BRAVOBazaSyncLock -StateRoot $StateRoot -Component $Component
@@ -2593,11 +2598,37 @@
                 if ($null -ne $sbHeldLock.Stream) { $sbHeldLock.Stream.Dispose() }
             }
             Test-BRAVOCondition -Condition (
-                $sbHeldLock.Success -eq $true -and $sbRun11.Result.Success -eq $false -and
+                $sbHeldLock.Success -eq $true -and
                 $sbRun11.Result.Results.SyncOutcomes['BAZA_APP'].Status -match '^(SKIPPED_CONCURRENT|ERROR)$' -and
                 $sbSession11.State.PutFilesCallCount -eq 0 -and $sbRun11.LegacyCalls -eq 0
             ) -Name 'BazaSync/SyncBazaRespectsSharedComponentSyncLock' `
               -Failure "-SyncBAZA має брати той самий lock компонента, що Main/Health: при зайнятому lock нічого не передається; Status=$($sbRun11.Result.Results.SyncOutcomes['BAZA_APP'].Status)"
+
+            # 11b. SKIPPED_CONCURRENT (Health тримає lock) — НЕ збій -SyncBAZA (INFO, exit 0), нічого не передано
+            $sbCase11b = & $sbNewCase 'SkippedConcurrent'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase11b.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession11b = New-BRAVOSelfTestFakeBazaSession
+            & $sbModule { $script:ForceSkippedConcurrent = $true }
+            try { $sbRun11b = & $sbRun $sbModule $sbCase11b.Local $sbCase11b.State $sbSession11b } finally { & $sbModule { $script:ForceSkippedConcurrent = $false } }
+            Test-BRAVOCondition -Condition (
+                $sbRun11b.Result.Success -eq $true -and
+                $sbRun11b.Result.Results.SyncOutcomes['BAZA_APP'].Status -eq 'SKIPPED_CONCURRENT' -and
+                $sbRun11b.Result.Results.SyncOutcomes['BAZA_APP'].Success -eq $false -and
+                $sbRun11b.Result.Results.BAZA_APP.Success -eq $true -and
+                $sbSession11b.State.PutFilesCallCount -eq 0 -and $sbRun11b.LegacyCalls -eq 0
+            ) -Name 'BazaSync/SyncBazaSkippedConcurrentIsInfoNotFailure' `
+              -Failure "SKIPPED_CONCURRENT у -SyncBAZA (lock тримає Health) не має давати exit 50; Success=$($sbRun11b.Result.Success)"
+
+            # 12. Mode присутній, але порожній/пробільний -> типовий IncrementalAppendOnly (не fail-closed)
+            $sbCase12 = & $sbNewCase 'EmptyMode'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase12.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession12 = New-BRAVOSelfTestFakeBazaSession
+            $sbRun12 = & $sbRun $sbModule $sbCase12.Local $sbCase12.State $sbSession12 '  '
+            Test-BRAVOCondition -Condition (
+                $sbRun12.Result.Success -eq $true -and $sbRun12.EngineCalls -eq 1 -and $sbRun12.LegacyCalls -eq 0 -and
+                $sbRun12.Result.Results.SyncOutcomes['BAZA_APP'].Mode -eq 'IncrementalAppendOnly'
+            ) -Name 'BazaSync/SyncBazaEmptyModeTreatedAsDefaultIncremental' `
+              -Failure "порожній/пробільний BAZA.Mode має означати типовий IncrementalAppendOnly; Mode=$($sbRun12.Result.Results.SyncOutcomes['BAZA_APP'].Mode) Error=$($sbRun12.Result.Results.BAZA_APP.Error)"
         } finally {
             Remove-Module -ModuleInfo $sbModule -ErrorAction SilentlyContinue
             if ($sbHadBackupMonitoring) { $global:backupMonitoring = $sbSavedBackupMonitoring } else { Remove-Variable -Name backupMonitoring -Scope Global -ErrorAction SilentlyContinue }

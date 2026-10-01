@@ -5423,11 +5423,17 @@ function Invoke-BRAVOBazaCanonicalSync {
         [string]$ComponentName = 'BAZA'
     )
 
-    $mode = [string](Get-BRAVOBazaSyncModeEffective)
+    $mode = ([string](Get-BRAVOBazaSyncModeEffective)).Trim()
+    # Порожній/пробільний/$null Mode = типовий режим (як у Get-BRAVOBazaSyncModeEffective-
+    # семантиці "не задано"); fail-closed лише для непорожнього невідомого значення.
+    if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'IncrementalAppendOnly' }
     $outcome = [pscustomobject]@{
         Component = $Component
         Mode = $mode
         Success = $false
+        # Skipped: SKIPPED_CONCURRENT (інший процес зараз синхронізує компонент) — не помилка
+        # для -SyncBAZA (Health трактує так само: INFO), але й не успіх циклу.
+        Skipped = $false
         Status = 'ERROR'
         SyncResult = $null
         Degraded = $false
@@ -5442,6 +5448,7 @@ function Invoke-BRAVOBazaCanonicalSync {
         $outcome.SyncResult = $syncResult
         $outcome.Status = [string]$syncResult.Status
         $outcome.Success = ($outcome.Status -eq 'COMPLETE')
+        $outcome.Skipped = ($outcome.Status -eq 'SKIPPED_CONCURRENT')
         $outcome.Completed = [int]($syncResult.Uploaded + $syncResult.AlreadyVerified)
         $outcome.Remaining = [int]$syncResult.Failed
         $outcome.IncompatibleNames = @($syncResult.IncompatibleFiles).Count
@@ -5573,7 +5580,9 @@ function Invoke-ManualBAZASFTPSynchronization {
             -LocalDirectory $syncTarget.Source `
             -RemoteDirectory $syncTarget.Destination `
             -ComponentName $syncTarget.Name
-        $syncSuccess = [bool]$canonicalOutcome.Success
+        # SKIPPED_CONCURRENT (напр. Health тримає lock компонента) — INFO, не збій -SyncBAZA.
+        $syncSkipped = [bool]$canonicalOutcome.Skipped
+        $syncSuccess = ([bool]$canonicalOutcome.Success -or $syncSkipped)
         $manualResults.SyncOutcomes[$syncTarget.Name] = $canonicalOutcome
         $targetResult = $manualResults[$syncTarget.Name]
         $targetResult.Attempted = $true
@@ -5582,7 +5591,11 @@ function Invoke-ManualBAZASFTPSynchronization {
         $targetResult.Completed = [int]$canonicalOutcome.Completed
         $targetResult.Remaining = [int]$canonicalOutcome.Remaining
         $targetResult.IncompatibleNames = [int]$canonicalOutcome.IncompatibleNames
-        if ($syncSuccess) {
+        if ($syncSkipped) {
+            $targetResult.Degraded = $true
+            $targetResult.Error = 'пропущено: інший процес синхронізує компонент (lock зайнято)'
+            Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю $($syncTarget.Name) пропущено: інший процес зараз синхронізує компонент; наступний цикл BAZASync повторить" -Level "INFO"
+        } elseif ($syncSuccess) {
             Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю $($syncTarget.Name) на SFTP завершено успiшно ($($canonicalOutcome.Mode): $($canonicalOutcome.Status))" -Level "SUCCESS"
         } else {
             $syncFailed = $true
