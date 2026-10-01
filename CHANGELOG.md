@@ -2,7 +2,6 @@
 
 ## Не випущено (developer)
 
-<<<<<<< HEAD
 - **Fix: заглушки вбудованих команд self-test не витікають між suite (#337).**
   `New-BRAVOSelfTestRuntimeModule` (голий `New-Module`) матеріалізує функції-заглушки
   (`Get-Service`, `Start-Service`, `Stop-Service`, `Get-Process`, `Stop-Process`,
@@ -23,7 +22,6 @@
   Start-Process, а також Invoke-RestMethod і global-аліаса Get-Date),
   `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ProbeStubsActiveInsideSuite`,
   `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation`.
-=======
 - **Fix: self-test `TraceArchive/GraceCompletionExpiry*` не залежить від швидкості runner-а (#338).**
   Fixture виставляв `LastWriteTime` джерела за 2 с до grace-межі й перетинав межу реальним
   `Start-Sleep`; на повільному runner-і джерело вже було за межею на кроці-передумові, видалялось,
@@ -32,7 +30,6 @@
   (тимчасова підміна `Get-Date` у модулі на час кроку: без параметрів — реальний час + зсув 0/+2 год,
   з параметрами — штатний), без очікування. Читання `state.json` захищене `Test-Path`, тож збій
   перевірки дає чисте `[FAIL]`, а не виняток секції. Production-код і маніфест не змінено.
->>>>>>> origin/fix/338-tracearchive-deterministic
 
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
