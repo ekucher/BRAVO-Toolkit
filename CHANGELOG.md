@@ -19,7 +19,9 @@
   `Invoke-BRAVOBazaComponentSyncSession`). Побічно: у legacy-режимі Main тепер
   завжди ініціалізує `$script:bazaAppSyncResult`/`$script:bazaWWWSyncResult`.
   `SKIPPED_CONCURRENT` у `-SyncBAZA` (lock компонента тримає Health) — INFO без збою,
-  як і в Health; порожній/пробільний `BAZA.Mode` = типовий `IncrementalAppendOnly`.
+  як і в Health, але підсумок запуску й Operations-подія (`runOutcome`) кажуть
+  «ПРОПУЩЕНО (інший процес синхронізує компонент)», а не «УСПІШНО»
+  (`BazaSync/SyncBazaSkippedConcurrentRunOutcomeIsSkippedNotSuccess`); порожній/пробільний `BAZA.Mode` = типовий `IncrementalAppendOnly`.
   `docs/BAZA_SFTP_ACCEPTANCE.md` і README оновлено. Нові self-test перевірки:
   `BazaSync/SyncBazaSkippedConcurrentIsInfoNotFailure`, `BazaSync/SyncBazaEmptyModeTreatedAsDefaultIncremental`,
   `BazaSync/SyncBazaAndMainResolveToSameCanonicalDispatcher`,

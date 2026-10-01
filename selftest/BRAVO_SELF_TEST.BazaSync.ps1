@@ -2309,7 +2309,8 @@
         # --- Поведінкова матриця ЧЕРЕЗ вхідну функцію -SyncBAZA ---------------
         $sbNeededFunctions = @(
             'Invoke-BRAVOBazaCanonicalSync', 'Invoke-BRAVOBazaIncrementalSync',
-            'Invoke-ManualBAZASFTPSynchronization', 'New-BRAVOTransferOperationResult'
+            'Invoke-ManualBAZASFTPSynchronization', 'New-BRAVOTransferOperationResult',
+            'Get-BRAVOManualSyncRunOutcomeLabel'
         )
         $sbDefinitions = (@($sbNeededFunctions | ForEach-Object { $sbFunctionAsts[$_].Extent.Text }) -join "`n`n")
         $sbSavedBackupMonitoring = $null
@@ -2619,6 +2620,21 @@
                 $sbSession11b.State.PutFilesCallCount -eq 0 -and $sbRun11b.LegacyCalls -eq 0
             ) -Name 'BazaSync/SyncBazaSkippedConcurrentIsInfoNotFailure' `
               -Failure "SKIPPED_CONCURRENT у -SyncBAZA (lock тримає Health) не має давати exit 50; Success=$($sbRun11b.Result.Success)"
+
+            # 11c. Пропуск — не "УСПІШНО": підсумок запуску й Operations-подія кажуть ПРОПУЩЕНО
+            $sbLabel = { param($R) & $sbModule { param($X) Get-BRAVOManualSyncRunOutcomeLabel -ManualSyncResult $X } $R }
+            $sbLabel11b = & $sbLabel $sbRun11b.Result
+            $sbLabel1 = & $sbLabel $sbRun1.Result
+            $sbLabelFailedAndSkipped = & $sbLabel ([pscustomobject]@{ Success = $false; Skipped = $true; Results = $null })
+            $sbLabelLegacyShape = & $sbLabel ([pscustomobject]@{ Success = $true; Results = $null })
+            Test-BRAVOCondition -Condition (
+                $sbRun11b.Result.Skipped -eq $true -and $sbLabel11b -like 'ПРОПУЩЕНО*' -and
+                $sbRun1.Result.Skipped -eq $false -and $sbLabel1 -eq 'УСПІШНО' -and
+                $sbLabelFailedAndSkipped -eq 'ПОМИЛКА' -and $sbLabelLegacyShape -eq 'УСПІШНО' -and
+                $sbArchiveText.Contains('runOutcome = $manualSyncOutcomeLabel') -and
+                $sbArchiveText.Contains('Синхронізація BAZA (-SyncBAZA): $manualSyncOutcomeLabel')
+            ) -Name 'BazaSync/SyncBazaSkippedConcurrentRunOutcomeIsSkippedNotSuccess' `
+              -Failure "SKIPPED_CONCURRENT у -SyncBAZA: exit 0, але runOutcome має бути ПРОПУЩЕНО, не УСПІШНО; skipped='$sbLabel11b' success='$sbLabel1' failed+skipped='$sbLabelFailedAndSkipped'"
 
             # 12. Mode присутній, але порожній/пробільний -> типовий IncrementalAppendOnly (не fail-closed)
             $sbCase12 = & $sbNewCase 'EmptyMode'

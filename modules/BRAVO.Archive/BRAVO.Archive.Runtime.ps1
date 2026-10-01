@@ -5487,6 +5487,19 @@ function Invoke-BRAVOBazaCanonicalSync {
     return $outcome
 }
 
+# #292 (рев'ю merge train): SKIPPED_CONCURRENT у -SyncBAZA дає exit 0, але
+# підсумок запуску має казати "ПРОПУЩЕНО", а не "УСПІШНО" — інакше завислий
+# власник lock непомітно блокує кожен цикл, а журнал і Operations-подія зелені.
+function Get-BRAVOManualSyncRunOutcomeLabel {
+    param([Parameter(Mandatory = $true)][object]$ManualSyncResult)
+    if (-not [bool]$ManualSyncResult.Success) { return 'ПОМИЛКА' }
+    $skippedProperty = $ManualSyncResult.PSObject.Properties['Skipped']
+    if ($null -ne $skippedProperty -and [bool]$skippedProperty.Value) {
+        return 'ПРОПУЩЕНО (інший процес синхронізує компонент)'
+    }
+    return 'УСПІШНО'
+}
+
 function Invoke-ManualBAZASFTPSynchronization {
     Write-BRAVOLog -Component 'SFTP' -Message "==="
     Write-BRAVOLog -Component 'SFTP' -Message "=== РУЧНА СИНХРОНIЗАЦIЯ BAZA_APP / BAZA_WWW НА SFTP ==="
@@ -5567,6 +5580,7 @@ function Invoke-ManualBAZASFTPSynchronization {
         -RemoteDirectories @($syncTargets | ForEach-Object { [string]$_.Destination })
 
     $syncFailed = $sourceConfigurationFailed
+    $anySyncSkipped = $false
     $syncIndex = 0
     foreach ($syncTarget in $syncTargets) {
         $syncIndex++
@@ -5592,6 +5606,7 @@ function Invoke-ManualBAZASFTPSynchronization {
         $targetResult.Remaining = [int]$canonicalOutcome.Remaining
         $targetResult.IncompatibleNames = [int]$canonicalOutcome.IncompatibleNames
         if ($syncSkipped) {
+            $anySyncSkipped = $true
             $targetResult.Degraded = $true
             $targetResult.Error = 'пропущено: інший процес синхронізує компонент (lock зайнято)'
             Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю $($syncTarget.Name) пропущено: інший процес зараз синхронізує компонент; наступний цикл BAZASync повторить" -Level "INFO"
@@ -5604,7 +5619,9 @@ function Invoke-ManualBAZASFTPSynchronization {
         }
     }
 
-    return [pscustomobject]@{ Success = (-not $syncFailed); Results = $manualResults }
+    # Skipped: хоча б один компонент SKIPPED_CONCURRENT — exit 0 (не збій), але
+    # результат запуску НЕ "УСПІШНО": нічого не передано, хмарна копія не оновлена.
+    return [pscustomobject]@{ Success = (-not $syncFailed); Skipped = $anySyncSkipped; Results = $manualResults }
 }
 
 function Get-BRAVOArchiveFreeSpaceResult {
@@ -6434,12 +6451,13 @@ function Main {
         $manualSyncStarted = Get-Date
         $manualSyncResult = Invoke-ManualBAZASFTPSynchronization
         $manualSyncSuccess = [bool]$manualSyncResult.Success
+        $manualSyncOutcomeLabel = Get-BRAVOManualSyncRunOutcomeLabel -ManualSyncResult $manualSyncResult
         $manualSyncFinished = Get-Date
         $manualSyncDuration = $manualSyncFinished - $manualSyncStarted
 
         Write-Log "==="
         Write-Log "=== ЗАВЕРШЕННЯ РУЧНОЇ СИНХРОНIЗАЦIЇ BAZA_APP / BAZA_WWW ==="
-        Write-Log "Результат: $(if ($manualSyncSuccess) {'УСПIШНО'} else {'ПОМИЛКА'})" -NoTimestamp
+        Write-Log "Результат: $manualSyncOutcomeLabel" -NoTimestamp
         Write-Log "Тривалiсть: $($manualSyncDuration.ToString($durationFormat))" -NoTimestamp
         Write-Log "Лог-файл: $logFile" -NoTimestamp
         # -SyncBAZA — це суто SFTP-операція за визначенням.
@@ -6463,10 +6481,10 @@ function Main {
                 @($manualEventComponents.Keys | Sort-Object) | ForEach-Object { "${_}=$($manualEventComponents[$_].status)" }
             ) -join '; '
             $script:archiveFinalOperationsEventContext = @{
-                Message = "Синхронізація BAZA (-SyncBAZA): $(if ($manualSyncSuccess) { 'УСПІШНО' } else { 'ПОМИЛКА' })$(if ($manualEventStatuses) { " ($manualEventStatuses)" }), код завершення $($script:processExitCode)"
+                Message = "Синхронізація BAZA (-SyncBAZA): $manualSyncOutcomeLabel$(if ($manualEventStatuses) { " ($manualEventStatuses)" }), код завершення $($script:processExitCode)"
                 Details = @{
                     syncBaza = $true
-                    runOutcome = $(if ($manualSyncSuccess) { 'УСПІШНО' } else { 'ПОМИЛКА' })
+                    runOutcome = $manualSyncOutcomeLabel
                     components = $manualEventComponents
                     durationMs = [Math]::Round($manualSyncDuration.TotalMilliseconds)
                 }
