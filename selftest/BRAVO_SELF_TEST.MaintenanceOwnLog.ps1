@@ -89,7 +89,7 @@ function Get-BRAVOSystemRangeIdLogPath {
     return $script:maintOwnLogTestState.RangeIdLogPath
 }
 function Test-BRAVOOwnLogSftpCredentialAvailable {
-    return (-not $script:maintOwnLogTestState.CredentialsMissing)
+    return (-not $script:maintOwnLogTestState.SftpLoginAbsent)
 }
 function Sync-BRAVORuntimeLogsToSftp {
     param($Session, [string]$LocalLogRoot, [string]$RemoteDirectory)
@@ -122,20 +122,20 @@ function Invoke-BRAVOSelfTestMaintenanceOwnLogUploadScenario {
         [bool]$ConnectShouldReturnNull = $false,
         [bool]$ConnectShouldThrow = $false,
         [bool]$SendShouldThrow = $false,
-        [bool]$CredentialsMissing = $false,
+        [bool]$SftpLoginAbsent = $false,
         [bool]$SyncShouldThrow = $false,
         [int]$InvokeTimes = 1
     )
     & $Module {
         param($enabled, $sftpEnabled, $defineConfig, $logFilePath, $rangeIdLogPath,
             $mutateLiveFileAfterHash, $connectShouldReturnNull, $connectShouldThrow, $sendShouldThrow,
-            $credentialsMissing, $syncShouldThrow, $invokeTimes)
+            $sftpLoginAbsent, $syncShouldThrow, $invokeTimes)
         $script:maintOwnLogTestState = [pscustomobject]@{
             ConnectCalls             = 0
             SendCalls                = 0
             SyncCalls                = 0
             SyncRemoteDirectory      = $null
-            CredentialsMissing       = $credentialsMissing
+            SftpLoginAbsent       = $sftpLoginAbsent
             SyncShouldThrow          = $syncShouldThrow
             SendCallPaths            = (New-Object System.Collections.Generic.List[string])
             SendCallContents         = (New-Object System.Collections.Generic.List[object])
@@ -182,7 +182,7 @@ function Invoke-BRAVOSelfTestMaintenanceOwnLogUploadScenario {
         }
     } $Enabled $SftpEnabled $DefineConfig $LogFilePath $RangeIdLogPath `
         $MutateLiveFileAfterHash $ConnectShouldReturnNull $ConnectShouldThrow $SendShouldThrow `
-        $CredentialsMissing $SyncShouldThrow $InvokeTimes
+        $SftpLoginAbsent $SyncShouldThrow $InvokeTimes
 }
 
 # (a) Тумблер окремої копії логу вимкнений (дефолт), SFTP увімкнено і
@@ -204,7 +204,7 @@ Test-BRAVOCondition (
 
 # (a3) SFTP увімкнено, але креденшлів у Credential Manager немає ->
 # вивантаження пропускається без спроби з'єднання.
-$maintOwnLogNoCredentials = Invoke-BRAVOSelfTestMaintenanceOwnLogUploadScenario -Module $maintenanceOwnLogModule -Enabled $true -CredentialsMissing $true -LogFilePath $maintenanceOwnLogFile
+$maintOwnLogNoCredentials = Invoke-BRAVOSelfTestMaintenanceOwnLogUploadScenario -Module $maintenanceOwnLogModule -Enabled $true -SftpLoginAbsent $true -LogFilePath $maintenanceOwnLogFile
 Test-BRAVOCondition (
     $maintOwnLogNoCredentials.ConnectCalls -eq 0 -and $maintOwnLogNoCredentials.SendCalls -eq 0 -and $maintOwnLogNoCredentials.SyncCalls -eq 0
 ) -Name 'Maintenance/RuntimeLogUploadSkippedWithoutCredentials' `
