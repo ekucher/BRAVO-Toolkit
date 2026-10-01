@@ -374,17 +374,20 @@ BRAVO.config (опційно) < BRAVO.local.config (опційно)`. Детал
 нормальному production-виконанні взагалі — legacy `BRAVO.config`
 допускається лише для міграції 5.2→5.3, міграційних тестів/фікстур,
 доказів паритету й історичної документації. Це реалізовано в рантаймі
-для фіксованого переліку 14 production-runtime і operator-entrypoint-ів
+для фіксованого переліку 15 production-runtime і operator-entrypoint-ів
 (`Get-BRAVOProductionEntryPointRelativePath` у
 `ci/BRAVOConfigV2CutoverGates.ps1`): вони передають
 `-DisallowLegacyPrimaryAutoDetect` у `Import-BravoConfiguration`
 (`BRAVO_CONFIG_LOADER.ps1`, issue #216 Wave B), а кореневий `BRAVO.config`
-прибрано з release-пакета (issue #154 крок B4-2). Відомий розрив
-(перевірено за кодом `developer` `4a54d34`, 2026-09-30):
-`BRAVO_OPERATIONS_HEARTBEAT.ps1`, доданий пізніше (PR #225), викликає
-`Import-BravoConfiguration` **без** цього прапорця й у фіксований перелік
-гейту `LEGACY_CONFIG_AUTOEXEC` не входить; виправлення й інваріант
-повноти переліку — частина B7 (#154). Реалізація рантайму — не те саме,
+прибрано з release-пакета (issue #154 крок B4-2). Розрив із
+`BRAVO_OPERATIONS_HEARTBEAT.ps1` (доданий пізніше в PR #225 і викликав
+`Import-BravoConfiguration` без прапорця) закрито в PR #317 (B7, #154):
+heartbeat передає прапорець і входить до переліку, а гейт
+`CONFIG_LOADER_CALLER_COMPLETENESS` вимагає, щоб перелік дорівнював
+фактичним AST-викликачам і кожен виклик у переліченому entrypoint
+прив'язував прапорець (перевірено за кодом `developer` `610e93f`,
+2026-10-01). Непрямі виклики й дочірні процеси — поза гейтом (#239,
+#320). Реалізація рантайму — не те саме,
 що прийнята міграція парку (B5) чи завершене release-governance. Повний перелік
 залишкових gaps, історія D2-дизайну (B1–B3) і DoD regression matrix —
 `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md` (там же — банер про

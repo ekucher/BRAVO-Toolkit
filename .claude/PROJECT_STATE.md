@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — поточний стан проекту
 
-Останню перевірку виконано: 2026-09-30 ~18:00 UTC (Git + GitHub REST API, лише читання).
+Останню перевірку виконано: 2026-10-01 (після merge train) (Git + GitHub REST API, лише читання).
 
 Кожне змінне твердження нижче має дату й метод перевірки. Це знімок, а не
 гарантія: **перечитати перед дією**. Порядок джерел істини — розділ
@@ -13,12 +13,12 @@
 
 ## State baseline SHA
 
-`4a54d34f2a71cc0ce24e7b8c2a0979e3007ba12a` — `developer`, Merge PR #262
-(перевірено `git ls-remote` / `GET /branches/developer`, 2026-09-30).
+`610e93f80a947d01c8c3e452694a02be0ca05b4a` — `developer`, Merge PR #315
+(перевірено `GET /branches/developer`, 2026-10-01).
 
-Попередній baseline — `28e6fcd` (2026-09-29). Між ними влито: PR #270,
-#271 (Telegram), потяг #272–#278, Wave A #267, #268, #258, #262 (деталі
-нижче).
+Попередній baseline — `4a54d34` (2026-09-30). Між ними merge train
+2026-09-30/10-01 влив 13 PR (деталі нижче). Цей файл приходить окремим
+PR #318 поверх `610e93f`; його merge-коміт не змінює runtime.
 
 Це commit `developer`, відносно якого перевірено handoff; він не мусить
 дорівнювати commit-у, що містить сам файл. Якщо `origin/developer` пішов
@@ -32,14 +32,15 @@ git branch --show-current
 git rev-parse HEAD origin/developer origin/master
 ```
 
-## Live-стан (перевірено 2026-09-30, перечитати перед дією)
+## Live-стан (перевірено 2026-10-01, перечитати перед дією)
 
 | Об'єкт | Значення | Метод |
 | --- | --- | --- |
-| `origin/developer` | `4a54d34` | `GET /branches/developer` |
-| `origin/master` | `f8fa5aa` (stable `5.2.4`, `VERSION.json.sourceCommit` `91db94c`) | `GET /branches/master` |
-| `developer` `VERSION.json` | `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (319 комітів позаду HEAD) | файл у дереві |
-| CI push-прогін `developer` `4a54d34` | 5 перевірок ` (push)` + `Telegram CI summary` — усі success | `GET /commits/4a54d34/check-runs` |
+| `origin/developer` | `610e93f` | `GET /branches/developer` |
+| `origin/master` | `f8fa5aa` (stable `5.2.4`) | `GET /branches/master` |
+| `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (416 комітів позаду `610e93f`) | файл у дереві |
+| CI push-прогін `developer` `610e93f` | 5 перевірок ` (push)` + `Telegram CI summary` — усі success | `GET /commits/610e93f/check-runs` |
+| Теги 5.3 | лише `v5.3.0-rc.1` | `git ls-remote --tags` |
 
 ## Branch protection — бажане проти перевіреного
 
@@ -48,24 +49,22 @@ git rev-parse HEAD origin/developer origin/master
 `/mnt/project-files/bravo-backlog/branch-protection-payloads/`
 (`developer.json`, `master-add-config-parity.json`; поза репозиторієм).
 
-Перевірений стан (GitHub REST API, 2026-09-30, перечитати перед дією):
+Перевірений стан (GitHub REST API, 2026-10-01, перечитати перед дією):
 
-* `master` — `protected: true`; required checks (`enforcement_level:
-  everyone`) рівно шість: `Parser / BOM / JSON`, `PSScriptAnalyzer`,
-  `BRAVO_SELF_TEST.ps1`, `Secret scanning (gitleaks)`,
-  `GitGuardian Security Checks`, `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`.
-  `strict`, `enforce_admins`, вимога PR, заборона force push/видалення —
-  **не перевірювані з сесії** (`GET .../protection` → 403,
-  потрібен `administration=read`).
+* `master` — `protected: true`; required checks рівно шість:
+  `Parser / BOM / JSON`, `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`,
+  `Secret scanning (gitleaks)`, `GitGuardian Security Checks`,
+  `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`. `strict`, `enforce_admins`, вимога
+  PR, заборона force push/видалення — **не перевірювані з сесії**
+  (`GET .../protection` → 403, потрібен `administration=read`).
 * `developer` — **НЕ protected** (`protected: false`, `contexts: []`,
   `GET /rules/branches/developer` → `[]`). Ніщо технічно не блокує merge
-  з червоним CI.
-* Теги — ruleset `protected-release-tags` (id 23541829): `active`,
-  `refs/tags/v*`, `deletion`/`non_fast_forward`/`update`, bypass порожній.
+  з червоним CI; merge train 2026-09-30/10-01 тримав гейт (8/8 exact-head
+  перевірок, 0 відкритих тредів, зелений post-merge CI) процедурно.
+* Теги — ruleset `protected-release-tags`: `active`, `refs/tags/v*`.
 * `Config parity (BRAVO_CONFIG_LOADER)` — створюється на кожному
-  `pull_request` (`config-parity.yml`: тригер без фільтрів, крок N/A →
-  `exit 0`; live-підтверджено на PR #263, #310); на push не створюється;
-  **ще не required** ні на `master`, ні на `developer`.
+  `pull_request`, на push не створюється; **ще не required** ні на
+  `master`, ні на `developer`.
 
 **OWNER ACTION REQUIRED:** створити захист `developer` (6 канонічних +
 `Config parity`, `strict: false`, `enforce_admins: true`, PR без
@@ -74,83 +73,66 @@ git rev-parse HEAD origin/developer origin/master
 власника, не застосовано. Записувати «застосовано» лише після
 live-перевірки `GET /branches/{b}`.
 
-## Злите з попереднього baseline (перевірено `GET /pulls/{n}`, 2026-09-30)
+## Злите з попереднього baseline (перевірено `GET /pulls/{n}`, 2026-10-01)
 
-Telegram-підсумок CI (merged 2026-09-29):
+Merge train 2026-09-30/10-01 (звичайні merge-коміти, у такому порядку;
+кожен — 8/8 exact-head перевірок, 0 відкритих тредів, зелений push-CI
+на `developer` після merge):
 
-* PR #270 `c440c2e` — `.github/workflows/telegram-ci-summary.yml`,
-  notifier лише на push у `developer`, без checkout коду.
-* PR #271 `f12e57a` — без авто-повторів `sendMessage`, значки
-  `waiting`/`requested`; закрив два post-merge P2 з #270.
-  Відкритих follow-up-ів щодо Telegram не знайдено.
+| PR | Merge | Зміст |
+| --- | --- | --- |
+| #313 | `ec49423` | правило проти реальних ідентифікаторів у `.claude/CLAUDE.md` |
+| #308 | `1e884f7` | #304: DataRestore відхиляє диск-/корінь-відносний `-TargetPath` |
+| #309 | `79655b0` | #288: `time` у `Test-RangeIdUsage` під StrictMode |
+| #310 | `be9abc7` | #295: `StartType` під StrictMode у Health |
+| #317 | `347533a` | #154 B7: heartbeat не виконує підкладений `BRAVO.config`; гейт `CONFIG_LOADER_CALLER_COMPLETENESS`; матриця регресій 5.3-шляху |
+| #259 | `75d41d2` | A5+A6: dataflow-guard `@(List[object])` під StrictMode |
+| #261 | `8c81a54` | T026: формулювання ArchivePeakSafe і нульового джерела |
+| #260 | `d1573c6` | T033: джерела конфігурації та секретів 5.3 |
+| #263 | `4916dd5` | T027: шар розбору Markdown і перевірка посилань |
+| #311 | `cd421e7` | #219 A: самодостатні вибіркові suite |
+| #312 | `d17b062` | #219 B: секційна ізоляція фатальних винятків |
+| #315 | `610e93f` | реальні назви установ, хостів і коди замінено вигаданими |
 
-Потяг #272–#278 (merged 2026-09-30, фінальний merge `e90dd00` = PR #277):
+Codex перестав рев'юїти 2026-09-30 ~22:13 UTC (вичерпано ліміт). Після
+цього незалежне рев'ю виконувалось окремими агентами.
 
-* #272 `7764a9d` — T001, блок перенаправленого `toolIntegritySettings.ManifestPath`;
-* #273 `be7d390` — T021, походження бінарників у `TOOLS_MANIFEST.json`;
-* #274 `c0eb84f`, #275 `bd23d4c` — T023, одна реалізація нотифікацій;
-* #276 `de5cefd` — T011 Archive Main; #278 `fd6ef71` — статус-файл Archive при збої;
-* #277 `e90dd00` — T011 Health.
-
-Wave A (merged 2026-09-30):
-
-* #267 `4af465c` — T011 Maintenance; #268 `323026e` — T011 DataRestore;
-* #258 `1d982ab` — T025 scheduler lock-wait; #262 `4a54d34` — A10 мовний аудит документації.
-
-## Відкриті PR (перевірено `GET /pulls?state=open`, 2026-09-30)
+## Відкриті PR (перевірено `GET /pulls?state=open`, 2026-10-01)
 
 | PR | Стан | Зміст | Що потрібно |
 | --- | --- | --- | --- |
-| #259 | ready, `7abc039` | A5+A6: guard `@(List[object])` під StrictMode | рішення власника щодо Codex раунду 2, потім merge |
-| #260 | ready, `4932c16` | T033: пріоритет Credential Manager | те саме |
-| #261 | ready, `1f075dc` | T026: формулювання ArchivePeakSafe | те саме |
-| #263 | ready, `dd3162e` | T027: хибні посилання + CI-перевірка | те саме |
-| #311 | draft, base `developer` | #219 частина A: самодостатні вибіркові suite | review → ready → merge власником |
-| #312 | draft, base `claude/project-thread-fzdylk` (= #311) | #219 частина B: секційна ізоляція фатальних винятків | після #311; перенацілити base на `developer` |
-| #308 | draft | #304: відхиляти диск-/корінь-відносний `-TargetPath` (DataRestore) | review |
-| #309 | draft | #288: `time` у `Test-RangeIdUsage` під StrictMode (Maintenance) | review |
-| #310 | draft | #295: `StartType` під StrictMode (Health) | review |
+| #318 | draft → цей файл | governance: бажана політика проти live-стану | merge останнім у train |
+| #323 | draft, base `developer` | #322: пропущена нічна копія після старту сервера | поза merge train; review |
 
-Жоден із #259/#260/#261/#263 **не злито**. Codex залишив коментарі
-раунду 2 на поточних head-ах (2026-09-30 ~16:00–17:06 UTC); рішення,
-чи опрацьовувати їх до merge, — за власником.
+## Issue (перевірено `GET /issues/{n}`, 2026-10-01)
 
-## Issue (перевірено `GET /issues/{n}`, 2026-09-30)
+Закрито в merge train: **#304**, **#288**, **#295**, **#219** (обидві
+частини злито; кожна вимога перевірена в коментарі закриття).
 
-* **#216** (P0 cutover) — closed/completed 2026-09-28. Runtime-cutover
-  реалізовано для фіксованого переліку 14 entrypoint-ів; real-server
-  acceptance **не виконувався**. «Runtime реалізовано» ≠ «міграцію парку
-  прийнято» ≠ «release governance завершено».
-* **#154** (EPIC Config v2) — open. B0–B4, B6 виконано.
-  * **B5** (міграція парку) — **не виконано**. Pilot на пілотному сервері
-    2026-09-29: 12/13 критеріїв PASS, `Result: PILOT NOT ACCEPTED` лише через
-    `SelfTestPass=false` (`Notifications/PublicIPLookupEnabledByDefault` —
-    передіснуюча site-policy розбіжність; `SemanticParityZeroDiff=true`,
-    `HealthPass=true`). Докази: `C:\ProgramData\BRAVO\ConfigV2PilotEvidence\<pilot-id>`.
-    Решта парку не мігрована. **CI не може довести B5** — pilot-artifact
-    self-test працює на синтетичному InstallRoot.
-  * **B7** (матриця регресій 5.3-шляху + parity як required gate) — у
-    роботі: локальна гілка `claude/b7-config-regression-matrix`
-    (worktree `/home/claude/wc-b7`, від `4a54d34`; на remote станом на
-    2026-09-30 відсутня, PR немає). Інвентар прогалин —
-    `/mnt/project-files/bravo-backlog/wave-c-evidence.md` §4, зокрема
-    підтверджений розрив: `BRAVO_OPERATIONS_HEARTBEAT.ps1` викликає
-    `Import-BravoConfiguration` без `-DisallowLegacyPrimaryAutoDetect` і
-    не входить у перелік гейту `LEGACY_CONFIG_AUTOEXEC`.
-* **#219** (self-test resilience) — open; заплановано двома PR:
-  частина A = #311, частина B = #312 (обидва draft).
+* **#216** (P0 cutover) — closed 2026-09-28. Runtime-cutover
+  реалізовано; real-server acceptance **не виконувався**.
+* **#154** (EPIC Config v2) — open. B0–B4, B6 виконано; **B7** — матрицю
+  злито (#317), але parity ще не required check (немає захисту
+  `developer`).
+  * **B5** (міграція парку) — **не виконано**. Pilot 2026-09-29: 12/13
+    критеріїв PASS, `Result: PILOT NOT ACCEPTED` лише через
+    `SelfTestPass=false` (`Notifications/PublicIPLookupEnabledByDefault`).
+    Решта парку не мігрована. **CI не може довести B5.**
 * **#239** (8 відомих обмежень гейту `LEGACY_READER_ISOLATION`) — open,
-  **відкладено без змін**: рішення власника — жодних інкрементальних
-  патчів, лише окремий dataflow-дизайн. Не закривати.
-* **#279** (bug, Archive: оцінка «розмір джерела + 2%» не обмежує
-  метадані 7-Zip), **#280** (question, Operations outbox → DeadLetter
-  після enrollment), **#281** (question, коли прибрати виконання legacy
-  `BRAVO.config` через явний `-ConfigPath`) — нові, чекають рішення
-  власника. #281 логічно після B5.
-* Відкриті `bug`-issue: 27 у діапазоні #279–#307 (#307 — апостроф
-  U+2019 ламає згенерований `BRAVO.local.config`, fail-closed).
-* Acceptance-issue на реальних хостах: #152, #155, #158, #188 — open, не
-  автономні.
+  відкладено: лише окремий dataflow-дизайн. Відомий непрямий випадок —
+  дочірній процес Configurator (#320).
+* **#279**, **#280**, **#281** — open, чекають рішення власника (документацію
+  #279/#280 виправлено в #261/#260, runtime-питання лишились).
+* Нові з merge train: **#319** (пряме `StartType` поза Health), **#320**
+  (Configurator виконує застарілий `BRAVO.config` у дочірньому процесі).
+* Відкриті `bug`-issue без фіксу: #282–#287, #289–#294, #296–#303,
+  #305–#307 (перевалідовано 2026-09-30 на `4a54d34`; runtime-зміни train
+  їх не зачіпають), а також #319–#322.
+* Дизайни, чекають рішення/реалізації: #314 (автовідновлення служб),
+  #316 (закриття BIS перед реставрацією, після #314 хвилі 2).
+* Acceptance-issue на реальних хостах: #152 (тег `v5.2.0-rc.2` досі
+  відсутній), #155, #158 (чекліст виправлено 2026-10-01: baseline
+  фіксується без `-ValidateOnly`) — open, не автономні.
 
 ## Пілотний сервер: невирішене після pilot (стан 2026-09-29; з цієї сесії не перевірялось)
 
@@ -165,26 +147,25 @@ Wave A (merged 2026-09-30):
 
 ## Класифікація 5.3 (лише класифікація; без promote/tag/release)
 
-Стан на `developer` `4a54d34`, 2026-09-30. Рівні послідовні: ENGINEERING
+Стан на `developer` `610e93f`, 2026-10-01. Рівні послідовні: ENGINEERING
 READY → OPERATIONAL ACCEPTANCE (PENDING → ACCEPTED) → зняття RELEASE
 BLOCKED.
 
 | Рівень | Критерій | Вердикт зараз |
 | --- | --- | --- |
-| ENGINEERING READY | Runtime-cutover Config V2 (#216) у всіх production-entrypoint-ах | ЧАСТКОВО: 14 з переліку — так; `BRAVO_OPERATIONS_HEARTBEAT.ps1` — ні |
-| ENGINEERING READY | B7: матриця регресій 5.3-шляху в required-наборі | НІ — у роботі, гілка локальна, PR немає |
-| ENGINEERING READY | CI зелений на HEAD `developer` | ТАК (push-прогін `4a54d34`) |
-| ENGINEERING READY | Немає відкритих bug-issue щодо коректності runtime без рішення | НІ — 27 `bug`-issue #279–#307; draft-фікси #308–#310 |
-| ENGINEERING READY | Відкриті Wave A PR (#259/#260/#261/#263) завершено | НІ — чекають рішення щодо Codex раунду 2 |
-| OPERATIONAL ACCEPTANCE | B5: pilot `PILOT ACCEPTED` + мігровані хости парку з доказами | НІ — пілотний сервер: `PILOT NOT ACCEPTED`, парк не мігровано |
-| OPERATIONAL ACCEPTANCE | Acceptance-issue на реальних хостах (#152/#155/#158/#188) | НІ — open |
-| RELEASE | `VERSION.json` provenance відповідає HEAD | НІ — `sourceCommit` `d77f3b4` ≠ `4a54d34` → `PROVENANCE_STALE` у `ci/New-BRAVOReleaseArtifact.ps1` |
-| RELEASE | Прийнятий RC | НІ — `v5.3.0-rc.1` (commit `3a87079`) immutable, приймання не проходив; наступний кандидат — `rc.2`, не створено |
+| ENGINEERING READY | Runtime-cutover Config V2 (#216) у всіх production-entrypoint-ах | ТАК для прямих викликів (гейт `CONFIG_LOADER_CALLER_COMPLETENESS`, #317); непрямі виклики — #239, Configurator — #320 |
+| ENGINEERING READY | B7: матриця регресій 5.3-шляху в required-наборі | ЧАСТКОВО — матриця в `BRAVO_SELF_TEST.ps1` (required на `master`), але `developer` без захисту |
+| ENGINEERING READY | CI зелений на HEAD `developer` | ТАК (push-прогін `610e93f`) |
+| ENGINEERING READY | Немає відкритих bug-issue щодо коректності runtime без рішення | НІ — 23 `bug`-issue у #282–#307 і ще #319–#322 |
+| OPERATIONAL ACCEPTANCE | B5: pilot `PILOT ACCEPTED` + мігровані хости парку з доказами | НІ — `PILOT NOT ACCEPTED`, парк не мігровано |
+| OPERATIONAL ACCEPTANCE | Acceptance-issue на реальних хостах (#152/#155/#158) | НІ — open |
+| RELEASE | `VERSION.json` provenance відповідає HEAD | НІ — `sourceCommit` `d77f3b4` ≠ `610e93f` → `PROVENANCE_STALE` |
+| RELEASE | Прийнятий RC | НІ — `v5.3.0-rc.1` immutable, приймання не проходив; `rc.2` не створено |
 | RELEASE | Захист `developer` застосовано й перевірено live | НІ — OWNER ACTION REQUIRED (§13.4) |
 | RELEASE | Питання #281 вирішено | НІ — open |
 
-**Підсумок:** ENGINEERING READY — не досягнуто; OPERATIONAL ACCEPTANCE —
-PENDING (не розпочато для парку); **RELEASE BLOCKED**.
+**Підсумок:** ENGINEERING READY — не досягнуто (відкриті runtime-баги);
+OPERATIONAL ACCEPTANCE — PENDING; **RELEASE BLOCKED**.
 
 ## Жорсткі зупинки (hard stops)
 
@@ -197,31 +178,26 @@ PENDING (не розпочато для парку); **RELEASE BLOCKED**.
 * Без явної авторизації користувача в поточному завданні: жодних
   commit, push, force-push, amend, reset, rebase, merge, змін branch
   protection, tag, release, видалення гілок.
-* Merge з автоматичної сесії без approving review відхиляє класифікатор
-  дозволів harness-а (`[Merge Without Review]`) — це не політика
-  репозиторію; довести PR до green/mergeable і передати merge власнику.
+* Merge з автоматичної сесії — лише за явною авторизацією власника на
+  конкретний перелік PR (як merge train 2026-09-30/10-01); без неї
+  довести PR до green/mergeable і передати merge власнику.
 
 ## NEXT ACTION
 
 ```text
-1. Власник вирішує щодо Codex раунду 2 на #263/#260/#261/#259
-   (опрацювати чи прийняти як є). Потім довести ці PR до green
-   і передати merge власнику в порядку #263 -> #260 -> #261 -> #259,
-   перечитуючи base після кожного merge.
-2. #311 (частина A #219): review, draft -> ready, merge власником;
-   потім #312 перенацілити на developer, review, merge власником.
-3. B7: у /home/claude/wc-b7 (гілка claude/b7-config-regression-matrix)
-   закрити прогалини з wave-c-evidence.md §4 (починаючи з heartbeat
-   + інваріанта повноти переліку AUTOEXEC), повний self-test,
-   PR у developer лише з авторизацією на push.
-4. Власник застосовує захист developer за RELEASE_POLICY.md §13.4;
+1. Власник застосовує захист developer за RELEASE_POLICY.md §13.4;
    сесія після цього перечитує GET /branches/developer і лише тоді
    оновлює §13.3 та цей файл.
+2. Власник вирішує щодо #279/#280/#281 і пріоритету runtime-багів
+   #282–#307, #319–#322; фікси — окремими PR у developer.
+3. B5: довести pilot до PILOT ACCEPTED (PublicIPLookupEnabled),
+   рішення про модель міграції парку. До доказів B5 — hard stop нижче.
+4. #314 хвиля 1 (після «починай» власника), потім #316.
 Перед кроком 1 перечитати: git rev-parse origin/developer, GET /pulls?state=open.
 ```
 
-Паралельно, лише за рішенням власника: draft-фікси #308–#310; питання
-#279–#281; пілотний сервер (розділ вище).
+Merge `developer` → `master`, теги, RC/stable release, GitHub Release і
+розгортання — лише за окремим рішенням власника.
 
 ## Корисні технічні нотатки
 

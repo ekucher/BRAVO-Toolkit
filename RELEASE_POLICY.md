@@ -1009,8 +1009,8 @@ branch protection зіставляє required checks за ІМЕНЕМ, і пі�
 заново. Запис «застосовано» з'являється тут лише після live-перевірки
 через GitHub API або UI — з датою й методом.
 
-Перевірений live-стан (перевірено через GitHub REST API 2026-09-30,
-`developer` = `4a54d34`, `master` = `f8fa5aa`; мусить бути перечитано
+Перевірений live-стан (перевірено через GitHub REST API 2026-10-01,
+`developer` = `610e93f`, `master` = `f8fa5aa`; мусить бути перечитано
 перед рішенням):
 
 | Налаштування | `master` | `developer` |
@@ -1118,7 +1118,7 @@ gh api -X PUT repos/<owner>/BRAVO-Toolkit/branches/developer/protection \
   -H "Accept: application/vnd.github+json" --input developer.json
 ```
 
-`developer.json`:
+Payload для `developer` (файл developer.json у каталозі payload-ів):
 
 ```json
 {
@@ -1175,7 +1175,7 @@ gh api -X PATCH repos/<owner>/BRAVO-Toolkit/branches/master/protection/required_
   -H "Accept: application/vnd.github+json" --input master-add-config-parity.json
 ```
 
-`master-add-config-parity.json`:
+Payload для додавання Config parity на `master` (файл master-add-config-parity.json):
 
 ```json
 {

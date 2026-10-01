@@ -475,8 +475,8 @@ manifest із хешами файлів — цілісність самого re
 - SFTP/SMB key-based автентифікація, `AppLocker`/`WDAC`, `gMSA` — не
   реалізовано.
 - GitHub branch protection — бажана політика: обидві гілки захищені
-  (канон required checks і дія власника — `RELEASE_POLICY.md`
-  §13.3–§13.4). Перевірений стан (через GitHub REST API 2026-09-30,
+  (канон required checks і дія власника — `RELEASE_POLICY.md`,
+  розділи 13.3 і 13.4). Перевірений стан (через GitHub REST API 2026-09-30,
   мусить бути перечитано перед рішенням): `master` — protected, шість
   required checks, включно з `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`;
   `strict`, `enforce_admins`, вимогу PR і заборону force push/видалення
