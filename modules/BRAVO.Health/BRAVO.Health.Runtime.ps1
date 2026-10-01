@@ -1295,6 +1295,26 @@ function Get-BRAVOHealthBackupStaleReason {
     return $null
 }
 
+function Test-BRAVOHealthCatchUpRunIsAttempt {
+    # Boot catch-up (-CatchUpMissedBackup), що вирішив «копія не потрібна»,
+    # завершується кодом 0 і НЕ оновлює status-файл Archive (#323). Такий
+    # запуск не є спробою архівації: інакше класифікатор бачить
+    # FinishedAt < LastRunTime і хибно пише «завершився достроково», ховаючи
+    # справжню причину. Спроба = ненульовий LastTaskResult (збій, виконується)
+    # або status-файл, записаний після старту catch-up. Без status-файла
+    # успішний catch-up вважається no-op (діагностика бере основне завдання).
+    param(
+        [AllowNull()][object]$CatchUpInfo,
+        [AllowNull()][object]$ArchiveStatus
+    )
+
+    if ($null -eq $CatchUpInfo -or $null -eq $CatchUpInfo.LastRunTime) { return $false }
+    $result = $CatchUpInfo.LastTaskResult
+    if ($null -ne $result -and [int64]$result -ne 0) { return $true }
+    if ($null -eq $ArchiveStatus -or $null -eq $ArchiveStatus.FinishedAt) { return $false }
+    return ([datetime]$ArchiveStatus.FinishedAt) -ge ([datetime]$CatchUpInfo.LastRunTime)
+}
+
 function Get-BRAVOHealthBackupStaleDiagnosis {
     # Best-effort обгортка: кожне читання (планувальник COM/ScheduledTasks,
     # status-файл) у власному try/catch — збій пропускає відповідну перевірку
@@ -1343,26 +1363,6 @@ function Get-BRAVOHealthBackupStaleDiagnosis {
         Write-HealthLog "Діагностика generation: стан завдання не прочитано: $($_.Exception.Message)" -Level 'WARNING'
     }
 
-    # Catch-up завдання (BackupCatchUp) може тримати останню спробу: класифікуємо
-    # те завдання, чий валідний LastRunTime новіший; відсутнє/нечитабельне — основне.
-    try {
-        $catchUp = $schedulerSettings.BackupCatchUp
-        if ($null -ne $catchUp -and [bool]$catchUp.Enabled -and -not [string]::IsNullOrWhiteSpace([string]$catchUp.TaskName)) {
-            $catchUpInfo = & $readTask ([string]$catchUp.TaskName)
-            $catchUpRun = $catchUpInfo.LastRunTime
-            if ($catchUpInfo.Exists -and $null -ne $catchUpRun -and ([datetime]$catchUpRun).Year -ge 2000) {
-                $mainRun = if ($null -ne $taskInfo) { $taskInfo.LastRunTime } else { $null }
-                if ($null -eq $mainRun -or ([datetime]$mainRun).Year -lt 2000 -or
-                    ([datetime]$catchUpRun).ToUniversalTime() -gt ([datetime]$mainRun).ToUniversalTime()) {
-                    $taskInfo = $catchUpInfo
-                    $taskName = [string]$catchUp.TaskName
-                }
-            }
-        }
-    } catch {
-        Write-HealthLog "Діагностика generation: catch-up завдання не прочитано: $($_.Exception.Message)" -Level 'WARNING'
-    }
-
     $archiveStatus = $null
     try {
         $statusResult = Get-BRAVOOperationStatus -Path (Get-BRAVOOperationStatusPath -StateRoot $stateRoot -Operation Archive)
@@ -1379,6 +1379,29 @@ function Get-BRAVOHealthBackupStaleDiagnosis {
     } catch {
         $archiveStatus = $null
         Write-HealthLog "Діагностика generation: status-файл Archive не прочитано: $($_.Exception.Message)" -Level 'WARNING'
+    }
+
+    # Catch-up завдання (BackupCatchUp) може тримати останню спробу: класифікуємо
+    # те завдання, чий валідний LastRunTime новіший; відсутнє/нечитабельне — основне.
+    # Catch-up, що вирішив «копія не потрібна», спробою не є (див.
+    # Test-BRAVOHealthCatchUpRunIsAttempt).
+    try {
+        $catchUp = $schedulerSettings.BackupCatchUp
+        if ($null -ne $catchUp -and [bool]$catchUp.Enabled -and -not [string]::IsNullOrWhiteSpace([string]$catchUp.TaskName)) {
+            $catchUpInfo = & $readTask ([string]$catchUp.TaskName)
+            $catchUpRun = $catchUpInfo.LastRunTime
+            if ($catchUpInfo.Exists -and $null -ne $catchUpRun -and ([datetime]$catchUpRun).Year -ge 2000) {
+                $mainRun = if ($null -ne $taskInfo) { $taskInfo.LastRunTime } else { $null }
+                $catchUpNewer = $null -eq $mainRun -or ([datetime]$mainRun).Year -lt 2000 -or
+                    ([datetime]$catchUpRun).ToUniversalTime() -gt ([datetime]$mainRun).ToUniversalTime()
+                if ($catchUpNewer -and (Test-BRAVOHealthCatchUpRunIsAttempt -CatchUpInfo $catchUpInfo -ArchiveStatus $archiveStatus)) {
+                    $taskInfo = $catchUpInfo
+                    $taskName = [string]$catchUp.TaskName
+                }
+            }
+        }
+    } catch {
+        Write-HealthLog "Діагностика generation: catch-up завдання не прочитано: $($_.Exception.Message)" -Level 'WARNING'
     }
 
     try {

@@ -11614,6 +11614,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
             'Get-BRAVOHealthBackupStaleReason',
+            'Test-BRAVOHealthCatchUpRunIsAttempt',
             'Get-BRAVOHealthBackupStaleDiagnosis',
             'Get-BRAVOHealthManifestFailedStage',
             'Get-BackupHealthIssues'
@@ -11734,11 +11735,17 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         $stateRoot = 'x'
         $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'SELFTEST_MAIN' }; BackupCatchUp = [pscustomobject]@{ Enabled = $true; TaskName = 'SELFTEST_CATCHUP' } }
         function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
-        function Get-BRAVOOperationStatus { param($Path) throw 'self-test: status недоступний' }
+        function Get-BRAVOOperationStatus {
+            param($Path)
+            # catchup-noop: status-файл від справжнього прогону ДО старту catch-up (#323: no-op catch-up його не оновлює).
+            if ($script:mode -eq 'catchup-noop') { return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = [pscustomobject]@{ exitCode = 0; exitCodeName = 'OK'; finishedAt = (Get-Date).AddHours(-29) } } }
+            throw 'self-test: status недоступний'
+        }
         function Get-BRAVOScheduledTaskState {
             param($TaskPath, $TaskName)
             $run = if ($TaskName -eq 'SELFTEST_MAIN') { (Get-Date).AddHours(-30) } else { (Get-Date).AddHours(-1) }
             $result = if ($TaskName -eq 'SELFTEST_MAIN') { 0 } else { -2147024891 }
+            if ($script:mode -eq 'catchup-noop') { $result = if ($TaskName -eq 'SELFTEST_MAIN') { 20 } else { 0 } }
             if ($TaskName -eq 'SELFTEST_CATCHUP' -and $script:mode -eq 'catchup-missing') { throw 'self-test: catch-up недоступне' }
             if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'catchup-missing') { $run = (Get-Date).AddHours(-3); $result = 20 }
             if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'main-newer') { $run = (Get-Date).AddMinutes(-20); $result = 20 }
@@ -11750,18 +11757,21 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         $missing = & $diag
         $script:mode = 'main-newer'
         $mainNewer = & $diag
+        $script:mode = 'catchup-noop'
+        $catchUpNoOp = & $diag
         $nullStage = Get-BRAVOHealthManifestFailedStage -Manifest ([pscustomobject]@{ components = [pscustomobject]@{ MODEL = $null; BLOG = [pscustomobject]@{ ErrorStage = 'CREATE' } } })
-        [pscustomobject]@{ CatchUpNewer = $newer; CatchUpMissing = $missing; MainNewer = $mainNewer; NullStage = $nullStage }
+        [pscustomobject]@{ CatchUpNewer = $newer; CatchUpMissing = $missing; MainNewer = $mainNewer; CatchUpNoOp = $catchUpNoOp; NullStage = $nullStage }
     }
     Test-BRAVOCondition `
         -Condition (
             $staleCatchUp.CatchUpNewer -match 'SELFTEST_CATCHUP' -and $staleCatchUp.CatchUpNewer -match '0x80070005' -and
             $staleCatchUp.CatchUpMissing -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpMissing -match '0x00000014' -and
             $staleCatchUp.MainNewer -match 'SELFTEST_MAIN' -and $staleCatchUp.MainNewer -match '0x00000014' -and
+            $staleCatchUp.CatchUpNoOp -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpNoOp -match '0x00000014' -and
             $staleCatchUp.NullStage -eq 'BLOG/CREATE'
         ) `
         -Name 'Health/StaleGenerationCatchUpTaskAndNullComponent' `
-        -Failure "діагностика бере новіше з основного/catch-up завдань (відсутнє catch-up → основне), null-компонент manifest пропускається без винятку: $($staleCatchUp | ConvertTo-Json -Compress)"
+        -Failure "діагностика бере новіше з основного/catch-up завдань (відсутнє catch-up або no-op catch-up без нового status → основне), null-компонент manifest пропускається без винятку: $($staleCatchUp | ConvertTo-Json -Compress)"
 
     $staleCorrupt = & $staleReasonModule {
         Set-StrictMode -Version Latest
@@ -11941,6 +11951,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
             'Get-BRAVOHealthBackupStaleReason',
+            'Test-BRAVOHealthCatchUpRunIsAttempt',
             'Get-BRAVOHealthBackupStaleDiagnosis',
             'Get-BRAVOHealthManifestFailedStage',
             'Get-BackupHealthIssues'
