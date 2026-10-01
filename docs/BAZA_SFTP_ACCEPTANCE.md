@@ -35,10 +35,15 @@ SHA і не застаріває після кожного release stamp. Кон
 3. **На час прогону вимкніть планові завдання** BRAVO у Task Scheduler
    (Backup / Health / BAZASync) — кожен цикл запускається вручну і не
    повинен перетинатися з плановим. Після прогону — увімкнути назад.
-4. **НЕ використовуйте `BRAVO_ARCHIV.ps1 -SyncBAZA`** під час acceptance:
-   це окремий **legacy**-шлях (повний WinSCP `synchronize`), який іде повз
-   двигун, що тестується, не оновлює його state і «вилікує» навмисно
-   створені drift-фікстури, зіпсувавши сценарії 5–9.
+4. **Не запускайте `BRAVO_ARCHIV.ps1 -SyncBAZA` під час acceptance.** Починаючи
+   з #292 `-SyncBAZA` (як і основний прогін Archive) йде через той самий
+   канонічний двигун `Invoke-BRAVOBazaCanonicalSync`: при
+   `Mode = "IncrementalAppendOnly"` діють append-only контракт, MutationPolicy,
+   remote conflict, audit drift і оновлення state, а legacy `synchronize -mirror`
+   лишається лише за явного `Mode = "Legacy"`. Тому `-SyncBAZA` більше не
+   «вилікує» drift-фікстури повз двигун, але він усе одно додатково змінює
+   state/lock і може перетнутися з циклом сценарію — на час прогону
+   вимкніть і його (завдання BAZASync).
 5. **Двигун ніколи не видаляє remote-дані.** Усі тестові файли, залиті на
    SFTP, наприкінці прибираються **вручну** через WinSCP (розділ 11).
 6. Тестові файли кладемо в окремий підкаталог `TESTACC\` всередині

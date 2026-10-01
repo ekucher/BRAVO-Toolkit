@@ -1596,7 +1596,8 @@ function Get-BRAVODataRestoreServiceSnapshot {
             } catch {
                 $serviceInfo = $null
             }
-            $startMode = if ($serviceInfo) { [string]$serviceInfo.StartMode } else { [string]$service.StartType }
+            # StartType відсутній на .NET < 4.6.1 (#319): безпечне читання.
+            $startMode = if ($serviceInfo) { [string]$serviceInfo.StartMode } else { [string](Get-BRAVOServiceStartMode -Service $service -NoWmiQuery).StartMode }
         }
         [pscustomobject]@{
             Exists = ($null -ne $service)
@@ -3671,7 +3672,8 @@ try {
                             @{ Name = [string]$_.Name; RestartIntent = $true }
                         }) `
                         -LogFile ([string]$script:dataRestoreLogFile) `
-                        -RestartSuppressed)
+                        -RestartSuppressed `
+                        -PreserveForeignStartTypeSnapshot)
                     $script:dataRestoreQuiescenceMarkerWritten = $true
                 } catch {
                     Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "не вдалося записати ownership-маркер зупинки служб (без нього аварійне переривання лишило б служби зупиненими «мовчазно», без сліду власника і CRITICAL-алерту Health): $($_.Exception.Message)"
