@@ -843,9 +843,19 @@ function Get-BRAVODirectories {
         # Зовнішнє тамперування stored-розміру джерела (симулює
         # розсинхронізований/застарілий маркер) — БЕЗ канонічного
         # Write-BRAVOTraceGraceCompletionState, навмисно "брудний" запис.
-        $taP7StaleJson = Get-Content -LiteralPath $taP7StaleStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $taP7StaleJson.entries.'20260902'.sources[0].size = 999999
-        [IO.File]::WriteAllText($taP7StaleStatePath, ($taP7StaleJson | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+        # #338: відсутній state.json (збій першого прогону) не має обривати секцію
+        # винятком — тампер лише за наявності файлу, інакше умова нижче дає чистий [FAIL].
+        $taP7StaleTampered = $false
+        if (Test-Path -LiteralPath $taP7StaleStatePath) {
+            try {
+                $taP7StaleJson = Get-Content -LiteralPath $taP7StaleStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $taP7StaleJson.entries.'20260902'.sources[0].size = 999999
+                [IO.File]::WriteAllText($taP7StaleStatePath, ($taP7StaleJson | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+                $taP7StaleTampered = $true
+            } catch {
+                $taP7StaleTampered = $false
+            }
+        }
         $taP7StaleSession2 = New-BRAVOSelfTestFakeBazaSession -SeedRemoteState $taP7StaleSession1.State
         $taP7StaleResult2 = & $traceArchiveModule {
             param($d, $z, $ap, $p, $s, $rd, $grace, $statePath)
@@ -854,10 +864,11 @@ function Get-BRAVODirectories {
                 -Session $s -RemoteDirectory $rd -RawSourceRetentionDays $grace -GraceCompletionStatePath $statePath
         } $taP7StaleDir $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taP7StaleSession2 'trace' 7 $taP7StaleStatePath
         Test-BRAVOCondition -Condition (
+            $taP7StaleTampered -and
             [int]$taP7StaleResult2.Uploaded -eq 1 -and
             [int]$taP7StaleResult2.Errors -eq 0 -and
             @($taP7StaleSession2.State.PutFilesCalledFor).Count -eq 2
-        ) -Name 'TraceArchive/GraceCompletionMismatchedStateTriggersSafeReprocess' -Failure "розбіжність stored-розміру джерела з реальним файлом має ЗАПУСТИТИ повторну повну обробку (fail-safe), а не помилковий skip; факт: uploaded=$($taP7StaleResult2.Uploaded) putCalls=$(@($taP7StaleSession2.State.PutFilesCalledFor).Count)"
+        ) -Name 'TraceArchive/GraceCompletionMismatchedStateTriggersSafeReprocess' -Failure "розбіжність stored-розміру джерела з реальним файлом має ЗАПУСТИТИ повторну повну обробку (fail-safe), а не помилковий skip; факт: tampered=$taP7StaleTampered stateExists=$(Test-Path -LiteralPath $taP7StaleStatePath) uploaded=$($taP7StaleResult2.Uploaded) putCalls=$(@($taP7StaleSession2.State.PutFilesCalledFor).Count)"
 
         # --- C: невідома/пошкоджена схема state -> fail-safe reprocess, без падіння.
         $taP7CorruptDir = Join-Path $traceArchiveTestRoot "grace-completion-corrupt\Trace"
