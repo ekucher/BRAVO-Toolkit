@@ -42,7 +42,7 @@ git rev-parse HEAD origin/developer origin/master
 | `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (далеко позаду `b0f3b2e`) | файл у дереві |
 | CI push-прогін `developer` `b0f3b2e` | 5 перевірок ` (push)` + `Telegram CI summary` — усі success | `GET /commits/b0f3b2e/check-runs` |
 | Теги 5.3 | лише `v5.3.0-rc.1` | `git ls-remote --tags` |
-| Відкриті PR | 4: #331 (цей файл), #332, #334, #336 — усі, крім #331, draft | `GET /pulls?state=open` |
+| Відкриті PR | 5: #331 (цей файл), #332, #334, #336, #339 — усі, крім #331, draft | `GET /pulls?state=open` |
 | Відкриті issue | 36 (без PR) | `GET /issues?state=open` |
 
 ## Branch protection — бажане проти перевіреного
@@ -117,6 +117,7 @@ exact-head PR #324; один повторний запуск — 6/6 success); �
 | #332 | draft | Maintenance: вивантаження всіх журналів toolkit на SFTP (новий листок `sftpDirectories.RuntimeLogs`) | окреме рішення власника про merge; поза train |
 | #334 | draft | резервне копіювання лише встановлених компонентів (#282) | окремий тред; рішення власника |
 | #336 | draft | гейт оновлювача приймає exit 10 `BRAVO_SETUP` як PASS WITH WARNING (#330) | рев'ю й рішення власника; поза train |
+| #339 | draft | retention не видаляє COMPLETE-генерацію як «невдалу» (#335) | окремий тред; рішення власника |
 
 ## Issue (перевірено `GET /issues/{n}`, 2026-10-01)
 
@@ -135,7 +136,7 @@ merge commit, SHA `developer`, CI і scope). Раніше закрито: #304, 
   запуску, продовження #297), **#337** (заглушки self-test витікають у
   глобальну сесію), **#338** (нестабільний `TraceArchive/GraceCompletionExpiry*`).
   Інший тред відкрив **#335** (retention видаляє COMPLETE-генерацію як
-  «невдалу»).
+  «невдалу»); фікс у draft PR #339.
 * **#154** (EPIC Config v2) — open. B0–B4, B6 виконано; **B7** — матрицю
   злито (#317), але parity ще не required check (немає захисту
   `developer`).
