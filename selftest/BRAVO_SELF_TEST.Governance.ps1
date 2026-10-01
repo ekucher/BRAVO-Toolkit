@@ -3961,6 +3961,103 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/ConfigParity') { try {
     } finally {
         Remove-Item -LiteralPath $autoExecMirrorRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+
+    # =====================================================================
+    # ReleaseGate/GeneratedLoaderCallText* (issue #320): цільовий guard для
+    # ТЕКСТУ дочірніх скриптів. Configurator.Effective генерував і виконував
+    # "Import-BravoConfiguration -ConfigRoot ... -PassThru" без прапорця;
+    # CommandAst-орієнтовані гейти AUTOEXEC/CALLER_COMPLETENESS рядковий
+    # літерал не бачать. Межі guard-а (літеральний текст у одному рядковому
+    # літералі; склеєні/зчитані з файлу/поза обсягом - не бачить) описані в
+    # Test-BRAVOGeneratedLoaderCallText; поведінкову гарантію дає
+    # Configurator/LegacyConfig/* (реальний дочірній процес).
+    # =====================================================================
+    $generatedTextFlagged = "function New-Child {`r`n    `$lines = @(`r`n        '    `$null = Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect -PassThru'`r`n    )`r`n}`r`n"
+
+    # --- ReleaseGate/GeneratedLoaderCallTextFlagsFlaglessChildScript ---
+    $generatedTextFlaglessFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'modules\BRAVO.Fake\BRAVO.Fake.psm1' = "function New-Child {`r`n    `$lines = @(`r`n        '    `$null = Import-BravoConfiguration -ConfigRoot X -PassThru'`r`n    )`r`n}`r`n"
+    }
+    try {
+        $generatedTextFlaglessResult = Test-BRAVOGeneratedLoaderCallText -Root $generatedTextFlaglessFixture
+        Test-BRAVOCondition `
+            -Condition (
+                -not $generatedTextFlaglessResult.Passed -and
+                @($generatedTextFlaglessResult.FlaglessText | Where-Object { $_.StartsWith('modules\BRAVO.Fake\BRAVO.Fake.psm1:') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/GeneratedLoaderCallTextFlagsFlaglessChildScript" `
+            -Failure "рядковий літерал з Import-BravoConfiguration -ConfigRoot ... -PassThru без -DisallowLegacyPrimaryAutoDetect (форма дочірнього скрипта Configurator.Effective до #320) мусить провалювати GENERATED_LOADER_CALL_TEXT; отримано Passed=$($generatedTextFlaglessResult.Passed) Flagless=$($generatedTextFlaglessResult.FlaglessText -join ', ')"
+    } finally {
+        Remove-Item -LiteralPath $generatedTextFlaglessFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/GeneratedLoaderCallTextAcceptsFlaggedAndRejectsFalseBinding ---
+    $generatedTextFlaggedFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'modules\BRAVO.Fake\BRAVO.Fake.psm1' = $generatedTextFlagged
+        'BRAVO_HERE.ps1' = "`$child = @'`r`nImport-BravoConfiguration ```r`n    -ConfigRoot X ```r`n    -DisallowLegacyPrimaryAutoDetect`r`n'@`r`n"
+    }
+    $generatedTextFalseFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'modules\BRAVO.Fake\BRAVO.Fake.psm1' = "function New-Child {`r`n    '`$null = Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect:`$false -PassThru'`r`n}`r`n"
+        'BRAVO_HERE2.ps1' = "`$child = @'`r`nImport-BravoConfiguration -ConfigRoot X`r`n# -DisallowLegacyPrimaryAutoDetect у ІНШОМУ рядку не рахується`r`n'@`r`n"
+    }
+    try {
+        $generatedTextFlaggedResult = Test-BRAVOGeneratedLoaderCallText -Root $generatedTextFlaggedFixture
+        $generatedTextFalseResult = Test-BRAVOGeneratedLoaderCallText -Root $generatedTextFalseFixture
+        Test-BRAVOCondition `
+            -Condition (
+                $generatedTextFlaggedResult.Passed -and
+                -not $generatedTextFalseResult.Passed -and
+                @($generatedTextFalseResult.FlaglessText).Count -eq 2
+            ) `
+            -Name "ReleaseGate/GeneratedLoaderCallTextAcceptsFlaggedAndRejectsFalseBinding" `
+            -Failure "літерал із прапорцем (у т.ч. here-string із backtick-продовженням) мусить проходити; :`$false і прапорець в іншому логічному рядку - ні; Flagged.Passed=$($generatedTextFlaggedResult.Passed) FalseFlagless=$($generatedTextFalseResult.FlaglessText -join ', ')"
+    } finally {
+        Remove-Item -LiteralPath $generatedTextFlaggedFixture -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $generatedTextFalseFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/GeneratedLoaderCallTextIgnoresCommentsAndSanctioned ---
+    $generatedTextSanctionedFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'modules\BRAVO.Fake\BRAVO.Fake.psm1' = "# '`$null = Import-BravoConfiguration -ConfigRoot X -PassThru'`r`nfunction Get-X { 1 }`r`n"
+        'BRAVO_SELF_TEST.ps1' = "`$child = 'Import-BravoConfiguration -ConfigRoot X'`r`n"
+    }
+    try {
+        $generatedTextSanctionedResult = Test-BRAVOGeneratedLoaderCallText -Root $generatedTextSanctionedFixture
+        Test-BRAVOCondition `
+            -Condition ($generatedTextSanctionedResult.Passed) `
+            -Name "ReleaseGate/GeneratedLoaderCallTextIgnoresCommentsAndSanctioned" `
+            -Failure "коментар не є рядковим літералом, а BRAVO_SELF_TEST.ps1 - санкціонований harness; обидва не сміють провалювати GENERATED_LOADER_CALL_TEXT; Flagless=$($generatedTextSanctionedResult.FlaglessText -join ', ')"
+    } finally {
+        Remove-Item -LiteralPath $generatedTextSanctionedFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/GeneratedLoaderCallTextHoldsOnRepositoryTree ---
+    # Фактичне дерево (кореневі *.ps1 і modules\): жоден generated-текст
+    # поза санкціонованим переліком не викликає loader без прапорця.
+    # До #320 провалювався на BRAVO.Configurator.Effective.psm1.
+    $generatedTextRepositoryResult = Test-BRAVOGeneratedLoaderCallText -Root $root
+    Test-BRAVOCondition `
+        -Condition ($generatedTextRepositoryResult.Passed) `
+        -Name "ReleaseGate/GeneratedLoaderCallTextHoldsOnRepositoryTree" `
+        -Failure "дочірні скрипти, згенеровані кодом комплекту, мусять передавати -DisallowLegacyPrimaryAutoDetect; Failures=$($generatedTextRepositoryResult.Failures -join ' | ')"
+
+    # --- ReleaseGate/CutoverGatesEnforceGeneratedLoaderCallText ---
+    $generatedTextCutoverFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall
+        'modules\BRAVO.Fake\BRAVO.Fake.psm1' = "function New-Child {`r`n    '`$null = Import-BravoConfiguration -ConfigRoot X -PassThru'`r`n}`r`n"
+    }
+    try {
+        $generatedTextCutoverResult = Test-BRAVOConfigV2CutoverGates -Root $generatedTextCutoverFixture -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $generatedTextCutoverResult.Passed -and
+                @($generatedTextCutoverResult.Failures | Where-Object { $_.Contains('GENERATED_LOADER_CALL_TEXT') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGatesEnforceGeneratedLoaderCallText" `
+            -Failure "Test-BRAVOConfigV2CutoverGates (release-artifact + PR-workflow) мусить застосовувати GENERATED_LOADER_CALL_TEXT; Failures=$($generatedTextCutoverResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $generatedTextCutoverFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # =====================================================================
