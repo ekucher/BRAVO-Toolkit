@@ -27,6 +27,11 @@
   не обходить виключені каталоги (LOGS/MODEL/BAZA...): `Rollback/UnsafeManifestKeysRejectedLoudlyAndNothingOutsideRootTouched`,
   `Rollback/ResolvedTargetMustStayUnderRoot`, `Rollback/VerificationSkipsExcludedDirsButStillCatchesStrayScripts`,
   `Rollback/TreeWalkDoesNotEnterExcludedDirs`.
+  Оркестратор відкату `Invoke-BRAVODeployUpdaterRollback` тепер виконується в self-test
+  реально (фейкові guard/BRAVO_SETUP у старому комплекті): порядок guard → Scheduler →
+  ValidateOnly зі старого комплекту, exit 10 не є збоєм відкату, а збій кожного кроку
+  стає проблемою відкату (exit 2): `Rollback/UpdaterOrchestrationReRegistersSchedulerFromRestoredKit`,
+  `Rollback/UpdaterOrchestrationAcceptsSetupWarningExit10`, `Rollback/UpdaterOrchestrationReportsEveryFailedStep`.
 
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який

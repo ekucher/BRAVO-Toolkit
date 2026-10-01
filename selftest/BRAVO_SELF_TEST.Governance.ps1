@@ -6188,6 +6188,95 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
         if (Test-Path -LiteralPath $sb2) { Remove-Item -LiteralPath $sb2 -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
+    # --- поведінкова перевірка оркестратора відкату (рев'ю merge train) ---
+    # Invoke-BRAVODeployUpdaterRollback виконується реально: фейкові
+    # BRAVO_RUNTIME_GUARD.ps1/BRAVO_SETUP.ps1 у старому комплекті пишуть журнал
+    # викликів і повертають задані коди. Перевіряється: Scheduler і ValidateOnly
+    # перереєструються зі ВІДНОВЛЕНОГО комплекту після guard; exit 10 (PASS WITH
+    # WARNING) не є збоєм відкату; ненульовий guard, збій Scheduler чи
+    # ValidateOnly і чужа VERSION.json дають проблему відкату (=> exit 2).
+    $sb3 = Join-Path ([IO.Path]::GetTempPath()) ('bravo_rb289c_' + [guid]::NewGuid().ToString('N'))
+    try {
+        $orchAst = [System.Management.Automation.Language.Parser]::ParseInput($updaterText, [ref]$null, [ref]$null)
+        $orchFn = $orchAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-BRAVODeployUpdaterRollback' }, $true)
+        . ([scriptblock]::Create($orchFn.Extent.Text))
+        function Write-Note { param([string]$T) }
+        $orchLog = Join-Path $sb3 'calls.log'
+        $orchCtl = Join-Path $sb3 'codes.json'
+        $orchGuard = "`$c = [IO.File]::ReadAllText('$orchCtl') | ConvertFrom-Json`r`n" +
+            "[IO.File]::AppendAllText('$orchLog', ('guard:' + (Get-Location).Path + [Environment]::NewLine))`r`nexit [int]`$c.Guard`r`n"
+        $orchSetup = "param([string]`$Action, [switch]`$ValidateOnly, [switch]`$NoPause)`r`n" +
+            "`$c = [IO.File]::ReadAllText('$orchCtl') | ConvertFrom-Json`r`n" +
+            "`$m = if (`$ValidateOnly) { 'ValidateOnly' } else { `$Action }`r`n" +
+            "[IO.File]::AppendAllText('$orchLog', ('setup:' + `$m + ':' + (Get-Content -LiteralPath (Join-Path (Get-Location).Path 'VERSION.json') -Raw | ConvertFrom-Json).packageVersion + [Environment]::NewLine))`r`n" +
+            "exit [int]`$c.`$m`r`n"
+        $orchRun = {
+            param([int]$Guard, [int]$Scheduler, [int]$Validate, [string]$StagedVersion)
+            if (Test-Path -LiteralPath $sb3) { Remove-Item -LiteralPath $sb3 -Recurse -Force }
+            [void][IO.Directory]::CreateDirectory($sb3)
+            $RuntimeRoot = Join-Path $sb3 'runtime'; $BackupRoot = Join-Path $sb3 'backup'; $staged = Join-Path $sb3 'staged'
+            $excludeFiles = $script:RbExF; $excludeDirs = $script:RbExD
+            $currentVersion = [pscustomobject]@{ packageVersion = '5.2.0' }
+            Write-RbFile $sb3 'codes.json' ((@{ Guard = $Guard; Scheduler = $Scheduler; ValidateOnly = $Validate } | ConvertTo-Json))
+            Write-RbFile $RuntimeRoot 'BRAVO_RUNTIME_GUARD.ps1' $orchGuard
+            Write-RbFile $RuntimeRoot 'BRAVO_SETUP.ps1' $orchSetup
+            Write-RbFile $RuntimeRoot 'A.ps1' 'A-old'
+            Write-RbFile $RuntimeRoot 'VERSION.json' '{"packageVersion":"5.2.0"}'
+            Write-RbManifest -Root $RuntimeRoot -Rels @('BRAVO_RUNTIME_GUARD.ps1', 'BRAVO_SETUP.ps1', 'A.ps1', 'VERSION.json')
+            Copy-RbTree -From $RuntimeRoot -To $BackupRoot
+            if ($StagedVersion) { Write-RbFile $BackupRoot 'VERSION.json' ('{"packageVersion":"' + $StagedVersion + '"}') }
+            Write-RbFile $staged 'A.ps1' 'A-new'
+            Write-RbFile $staged 'C.ps1' 'C-new'
+            Write-RbFile $staged 'VERSION.json' '{"packageVersion":"5.3.0"}'
+            Write-RbManifest -Root $staged -Rels @('A.ps1', 'C.ps1', 'VERSION.json')
+            Copy-RbTree -From $staged -To $RuntimeRoot
+            $script:RollbackProblems = @('not-run')
+            Invoke-BRAVODeployUpdaterRollback | Out-Null
+            $calls = @()
+            if ([IO.File]::Exists($orchLog)) { $calls = @([IO.File]::ReadAllLines($orchLog) | Where-Object { $_ }) }
+            return [pscustomobject]@{
+                Problems = @($script:RollbackProblems)
+                Calls = $calls
+                RuntimeRoot = $RuntimeRoot
+                A = (Read-RbFile $RuntimeRoot 'A.ps1')
+                C = (Read-RbFile $RuntimeRoot 'C.ps1')
+            }
+        }
+
+        $okRun = & $orchRun 0 0 0 ''
+        Test-BRAVOCondition `
+            -Condition (
+                @($okRun.Problems).Count -eq 0 -and $okRun.A -eq 'A-old' -and $null -eq $okRun.C -and
+                @($okRun.Calls).Count -eq 3 -and $okRun.Calls[0] -like 'guard:*' -and
+                $okRun.Calls[1] -eq 'setup:Scheduler:5.2.0' -and $okRun.Calls[2] -eq 'setup:ValidateOnly:5.2.0'
+            ) `
+            -Name "Rollback/UpdaterOrchestrationReRegistersSchedulerFromRestoredKit" `
+            -Failure "успішний відкат: без проблем, A старий, C видалено, guard -> Scheduler -> ValidateOnly зі старого комплекту (5.2.0); Problems=$(@($okRun.Problems) -join ' | ') Calls=$(@($okRun.Calls) -join ' | ')"
+
+        $warnRun = & $orchRun 0 10 10 ''
+        Test-BRAVOCondition `
+            -Condition (@($warnRun.Problems).Count -eq 0 -and @($warnRun.Calls).Count -eq 3) `
+            -Name "Rollback/UpdaterOrchestrationAcceptsSetupWarningExit10" `
+            -Failure "BRAVO_SETUP exit 10 (PASS WITH WARNING) після відкату не є збоєм відкату; Problems=$(@($warnRun.Problems) -join ' | ')"
+
+        $guardRun = & $orchRun 33 0 0 ''
+        $schedRun = & $orchRun 0 1 0 ''
+        $validRun = & $orchRun 0 0 1 ''
+        $verRun = & $orchRun 0 0 0 '5.3.0'
+        Test-BRAVOCondition `
+            -Condition (
+                @($guardRun.Problems | Where-Object { $_ -like 'guard*33' }).Count -eq 1 -and
+                @($schedRun.Problems | Where-Object { $_ -like '*Scheduler*exit 1' }).Count -eq 1 -and
+                @($validRun.Problems | Where-Object { $_ -like '*ValidateOnly*exit 1' }).Count -eq 1 -and
+                @($verRun.Problems | Where-Object { $_ -like 'VERSION.json*' }).Count -eq 1
+            ) `
+            -Name "Rollback/UpdaterOrchestrationReportsEveryFailedStep" `
+            -Failure "кожен збій після відновлення (guard, Scheduler, ValidateOnly, VERSION.json) мусить ставати проблемою відкату (=> exit 2); guard=$(@($guardRun.Problems) -join ' | ') sched=$(@($schedRun.Problems) -join ' | ') valid=$(@($validRun.Problems) -join ' | ') ver=$(@($verRun.Problems) -join ' | ')"
+    } finally {
+        $script:RollbackProblems = @()
+        if (Test-Path -LiteralPath $sb3) { Remove-Item -LiteralPath $sb3 -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
     # --- структурні перевірки оркестратора ---
     $fnStart = $updaterText.IndexOf('function Invoke-BRAVODeployUpdaterRollback')
     $fnEnd = $updaterText.IndexOf('$script:DeployStarted = $false', [Math]::Max($fnStart, 0))
