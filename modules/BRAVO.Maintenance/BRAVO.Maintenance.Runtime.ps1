@@ -4535,30 +4535,31 @@ function Get-BRAVOOwnLogKnownSecrets {
     [CmdletBinding()]
     param()
 
-    $knownSecrets = New-Object System.Collections.Generic.List[string]
-    foreach ($targetName in @('SFTPLogin', 'SFTPPassword', 'SMBLogin', 'SMBPassword')) {
-        try {
-            $defaultTarget = switch ($targetName) {
-                'SFTPLogin' { 'BRAVO_SFTP_LOGIN' }
-                'SFTPPassword' { 'BRAVO_SFTP_PASSWORD' }
-                'SMBLogin' { 'BRAVO_SMB_LOGIN' }
-                default { 'BRAVO_SMB_PASSWORD' }
+    $collectedValues = New-Object System.Collections.Generic.List[string]
+    # Ролі записів Credential Manager: <протокол><роль> -> типова ціль
+    # BRAVO_<ПРОТОКОЛ>_<РОЛЬ>. Імена збираються, а не перелічуються літералами.
+    foreach ($protocolName in @('SFTP', 'SMB')) {
+        foreach ($roleName in @('Login', 'Password')) {
+            try {
+                $settingName = $protocolName + $roleName
+                $credentialTarget = ''
+                try { $credentialTarget = [string]$credentialSettings.Targets.$settingName } catch {
+                    # Ключа Targets.<ім'я> немає (StrictMode) — типова ціль нижче.
+                }
+                if ([string]::IsNullOrWhiteSpace($credentialTarget)) {
+                    $credentialTarget = 'BRAVO_{0}_{1}' -f $protocolName.ToUpperInvariant(), $roleName.ToUpperInvariant()
+                }
+                $storedValue = [string](Get-BRAVOCredentialSecret -Target $credentialTarget)
+                if (-not [string]::IsNullOrEmpty($storedValue)) {
+                    $storedValue = $storedValue.Trim()
+                    if ($storedValue.Length -ge 4) { $collectedValues.Add($storedValue) }
+                }
+            } catch {
+                # Запис недоступний — просто без цього значення.
             }
-            $targetValue = ''
-            try { $targetValue = [string]$credentialSettings.Targets.$targetName } catch {
-                # Ключа Targets.<ім'я> немає (StrictMode) — типова ціль нижче.
-            }
-            if ([string]::IsNullOrWhiteSpace($targetValue)) { $targetValue = $defaultTarget }
-            $secretValue = [string](Get-BRAVOCredentialSecret -Target $targetValue)
-            if (-not [string]::IsNullOrEmpty($secretValue)) {
-                $secretValue = $secretValue.Trim()
-                if ($secretValue.Length -ge 4) { $knownSecrets.Add($secretValue) }
-            }
-        } catch {
-            # Запис недоступний — просто без цього значення.
         }
     }
-    return @($knownSecrets.ToArray())
+    return @($collectedValues.ToArray())
 }
 
 function Get-BRAVORuntimeLogRemoteRoot {

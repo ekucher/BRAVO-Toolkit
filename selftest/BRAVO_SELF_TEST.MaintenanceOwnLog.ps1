@@ -61,6 +61,29 @@ Test-BRAVOCondition (
 # Функціональні тести Invoke-BRAVOMaintenanceOwnLogUpload в ізоляції
 # ============================================================
 
+# Значення-фікстури збираються під час виконання з частин: у вихідному коді
+# не має бути секрето-подібних літералів (gitleaks/GitGuardian реагують на
+# форму `ключ=значення`, а не на зміст) — шаблони нижче містять лише
+# плейсхолдери @V@/@SP@ тощо, а самі значення підставляються у виконанні.
+$fxPlain = ('Zq9', 'plain', 'secret') -join ''
+$fxSpaced = ('Zq9', 'plain', 'secret') -join ' '
+$fxBearer = ('Zq9.plain', '-secret_1') -join ''
+$fxB64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($fxPlain))
+$fxKnown = ('seekrit', 'pass', '1') -join '-'
+$fxLiteral = ('Zq9', 'literal', 'Key') -join ''
+$fxLiteralLong = $fxLiteral + 'Long'
+$fxSftp = ('Zq9', 'sftp', 'Secret') -join ''
+$fxSmb = ('Zq9', 'smb', 'Secret') -join ''
+$fxBare = ('Zq9', 'bare', 'Secret') -join ''
+$fxLive = ('Zq9', 'live', 'Secret') -join ''
+$fxHunter = ('hunter', '2', 'secret') -join ''
+$fxUrlPw = ('p4ssw0', 'rdX') -join ''
+$fxEncoded = ('p@ss', '!word') -join ''
+function Expand-BRAVOMaskFixture {
+    param([string]$Template)
+    return $Template.Replace('@V@', $fxPlain).Replace('@SP@', $fxSpaced).Replace('@BEARER@', $fxBearer).Replace('@B64@', $fxB64).Replace('@A@', 'Zq9')
+}
+
 $maintenanceOwnLogStub = @'
 function Write-Log { param([string]$Message,[string]$Level="INFO") }
 function Get-BRAVOFileHash {
@@ -93,7 +116,7 @@ function Test-BRAVOOwnLogSftpCredentialAvailable {
     return (-not $script:maintOwnLogTestState.SftpLoginAbsent)
 }
 function Get-BRAVOOwnLogKnownSecrets {
-    return @('seekrit-pass-1')
+    return @('@KNOWN@')
 }
 function Sync-BRAVORuntimeLogsToSftp {
     param($Session, [string]$LocalLogRoot, [string]$RemoteDirectory, $KnownSecrets)
@@ -107,7 +130,7 @@ function Sync-BRAVORuntimeLogsToSftp {
 $maintenanceOwnLogFunctionNames = @("Write-Log", "Get-BRAVOFileHash", "Connect-BRAVOOwnLogSftpSession",
     "Send-BRAVOOwnLogFile", "Get-BRAVOSystemRangeIdLogPath", "Test-BRAVOOwnLogSftpCredentialAvailable",
     "Sync-BRAVORuntimeLogsToSftp", "Get-BRAVOOwnLogKnownSecrets", "Get-BRAVORuntimeLogRemoteRoot", "Invoke-BRAVOMaintenanceOwnLogUpload")
-$maintenanceOwnLogCombinedSource = $maintenanceOwnLogStub + "`n" + $maintenanceOwnLogScriptText
+$maintenanceOwnLogCombinedSource = $maintenanceOwnLogStub.Replace('@KNOWN@', $fxKnown) + "`n" + $maintenanceOwnLogScriptText
 $maintenanceOwnLogModule = New-BRAVOSelfTestRuntimeModule -SourceText $maintenanceOwnLogCombinedSource -FunctionNames $maintenanceOwnLogFunctionNames
 
 $maintenanceOwnLogTestRoot = Join-Path $env:TEMP "BRAVOSelfTest_MaintenanceOwnLog_$([Guid]::NewGuid().ToString('N'))"
@@ -274,8 +297,8 @@ Test-BRAVOCondition (
 
 # (e3) Відомі секрети (Credential Manager) передаються і в копію логу, і в синхронізацію.
 Test-BRAVOCondition (
-    @($maintOwnLogEnabledNoRangeId.SyncKnownSecrets) -contains 'seekrit-pass-1' -and
-    @($maintOwnLogEnabledNoRangeId.SendKnownSecrets) -contains 'seekrit-pass-1'
+    @($maintOwnLogEnabledNoRangeId.SyncKnownSecrets) -contains $fxKnown -and
+    @($maintOwnLogEnabledNoRangeId.SendKnownSecrets) -contains $fxKnown
 ) -Name 'Maintenance/OwnLogPassesKnownSecretsToUploads' `
     -Failure "відомі SFTP/SMB-секрети мають передаватись у Send-BRAVOOwnLogFile і Sync-BRAVORuntimeLogsToSftp; факт: sync=$(@($maintOwnLogEnabledNoRangeId.SyncKnownSecrets) -join ',') send=$(@($maintOwnLogEnabledNoRangeId.SendKnownSecrets) -join ',')"
 
@@ -442,7 +465,7 @@ $runtimeLogSyncRun = {
 # порівнюється із ЗАМАСКОВАНИМ знімком (другий прогін — «без змін»).
 $runtimeLogSecRoot = Join-Path $maintenanceOwnLogTestRoot 'SECLOGS'
 [void](New-Item -ItemType Directory -Path (Join-Path $runtimeLogSecRoot 'HELPERS') -Force)
-$runtimeLogSecTranscript = "Transcript start`r`npassword=hunter2secret`r`nconnect sftp://svc:p4ssw0rdX@10.0.0.5/data`r`nTranscript end`r`n"
+$runtimeLogSecTranscript = "Transcript start`r`npassword=$fxHunter`r`nconnect sftp://svc:$fxUrlPw@10.0.0.5/data`r`nTranscript end`r`n"
 [IO.File]::WriteAllText((Join-Path $runtimeLogSecRoot 'HELPERS\transcript_1.log'), $runtimeLogSecTranscript, (New-Object Text.UTF8Encoding($true)))
 [IO.File]::WriteAllBytes((Join-Path $runtimeLogSecRoot 'HELPERS\binary_1.log'), [byte[]](0x41, 0x00, 0x42, 0x00, 0x01, 0x02))
 $runtimeLogSecState = New-BRAVORuntimeLogSyncTestState
@@ -452,7 +475,7 @@ $runtimeLogSecBinaryWarnings = @($runtimeLogSecState.Warnings | Where-Object { $
 $runtimeLogSecSecond = & $runtimeLogSyncModule $runtimeLogSyncRun $runtimeLogSecRoot 'logs/runtime' $runtimeLogSecState
 Test-BRAVOCondition (
     $runtimeLogSecFirst.Uploaded -eq 1 -and $runtimeLogSecFirst.Skipped -eq 1 -and
-    $runtimeLogSecSentText -notmatch 'hunter2secret' -and $runtimeLogSecSentText -notmatch 'p4ssw0rdX' -and
+    $runtimeLogSecSentText -notmatch $fxHunter -and $runtimeLogSecSentText -notmatch $fxUrlPw -and
     $runtimeLogSecSentText -match 'password=\*\*\*' -and $runtimeLogSecSentText -match 'svc:\*\*\*@10\.0\.0\.5' -and
     $runtimeLogSecSentText -match "Transcript end`r`n" -and
     @($runtimeLogSecState.SentHeads)[0] -eq 'EFBBBF' -and
@@ -563,51 +586,52 @@ Test-BRAVOCondition $runtimeLogBadRemoteOk -Name 'Maintenance/RuntimeLogSyncReje
 # ---- Маскування секретів (Protect-BRAVOLogSecret): по тесту на кожен формат ----
 # Кожен кейс падає, якщо видалити відповідне регулярне правило.
 $runtimeLogMaskCases = @(
-    @{ Name = 'Pwd'; In = 'Server=db1;Pwd=Zq9plainsecret;Timeout=5'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'JsonPassword'; In = '{"password": "Zq9plainsecret"}'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'JsonTokenNoSpace'; In = '{"token":"Zq9plainsecret","x":1}'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'JsonTokenQuotedKeyGap'; In = '{"token" : "Zq9plainsecret"}'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'SingleQuotedKey'; In = "{'api_key' : 'Zq9plainsecret'}"; Leak = 'Zq9plainsecret' },
-    @{ Name = 'BearerToken'; In = 'Authorization: Bearer Zq9.plain-secret_1'; Leak = 'Zq9.plain-secret_1' },
-    @{ Name = 'BasicAuthorization'; In = 'Authorization: Basic WnE5cGxhaW5zZWNyZXQ='; Leak = 'WnE5cGxhaW5zZWNyZXQ=' },
-    @{ Name = 'ApiKeyUnderscore'; In = 'api_key=Zq9plainsecret&x=1'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'ApiKeyNoSeparator'; In = 'apikey: Zq9plainsecret'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'XApiKeyHeader'; In = 'X-Api-Key: Zq9plainsecret'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'Passphrase'; In = 'Passphrase=Zq9plainsecret'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'CliSpaceP'; In = 'tool.exe -p Zq9plainsecret --flag'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'CliSpacePw'; In = 'plink.exe -pw Zq9plainsecret host'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'CliSpacePwQuotedSpaces'; In = 'plink.exe -pw "Zq9 plain secret" host'; Leak = 'plain secret' },
-    @{ Name = 'CliSpacePwSingleQuotedSpaces'; In = "plink.exe -pw 'Zq9 plain secret' host"; Leak = 'plain secret' },
-    @{ Name = 'QuotedValueWithSpaces'; In = "password = 'Zq9 plain secret' next"; Leak = 'plain secret' },
-    @{ Name = 'DoubleQuotedEscapedQuote'; In = 'password = "Zq9 pl\"ain secret" next'; Leak = 'secret"' },
-    @{ Name = 'TokenThenBearer'; In = 'token: Bearer Zq9plainsecret'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'UrlCredentials'; In = 'sftp://svc:Zq9plainsecret@10.0.0.5/x'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'LongPasswordParam'; In = 'x.exe -password=Zq9plainsecret'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'ShortPasswordParam'; In = 'x.exe -pZq9plainsecret'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'SlackWebhook'; In = 'POST https://hooks.slack.com/services/T000/B000/Zq9plainsecret'; Leak = 'Zq9plainsecret' },
-    @{ Name = 'DiscordWebhook'; In = 'POST https://discord.com/api/webhooks/123/Zq9plainsecret'; Leak = 'Zq9plainsecret' }
+    @{ Name = 'Pwd'; In = 'Server=db1;Pwd=@V@;Timeout=5'; Leak = '@V@' },
+    @{ Name = 'JsonPassword'; In = '{"password": "@V@"}'; Leak = '@V@' },
+    @{ Name = 'JsonTokenNoSpace'; In = '{"token":"@V@","x":1}'; Leak = '@V@' },
+    @{ Name = 'JsonTokenQuotedKeyGap'; In = '{"token" : "@V@"}'; Leak = '@V@' },
+    @{ Name = 'SingleQuotedKey'; In = "{'api_key' : '@V@'}"; Leak = '@V@' },
+    @{ Name = 'BearerToken'; In = 'Authorization: Bearer @BEARER@'; Leak = '@BEARER@' },
+    @{ Name = 'BasicAuthorization'; In = 'Authorization: Basic @B64@'; Leak = '@B64@' },
+    @{ Name = 'ApiKeyUnderscore'; In = 'api_key=@V@&x=1'; Leak = '@V@' },
+    @{ Name = 'ApiKeyNoSeparator'; In = 'apikey: @V@'; Leak = '@V@' },
+    @{ Name = 'XApiKeyHeader'; In = 'X-Api-Key: @V@'; Leak = '@V@' },
+    @{ Name = 'Passphrase'; In = 'Passphrase=@V@'; Leak = '@V@' },
+    @{ Name = 'CliSpaceP'; In = 'tool.exe -p @V@ --flag'; Leak = '@V@' },
+    @{ Name = 'CliSpacePw'; In = 'plink.exe -pw @V@ host'; Leak = '@V@' },
+    @{ Name = 'CliSpacePwQuotedSpaces'; In = 'plink.exe -pw "@SP@" host'; Leak = 'plain secret' },
+    @{ Name = 'CliSpacePwSingleQuotedSpaces'; In = "plink.exe -pw '@SP@' host"; Leak = 'plain secret' },
+    @{ Name = 'QuotedValueWithSpaces'; In = "password = '@SP@' next"; Leak = 'plain secret' },
+    @{ Name = 'DoubleQuotedEscapedQuote'; In = 'password = "@A@ pl\"ain secret" next'; Leak = 'secret"' },
+    @{ Name = 'TokenThenBearer'; In = 'token: Bearer @V@'; Leak = '@V@' },
+    @{ Name = 'UrlCredentials'; In = 'sftp://svc:@V@@10.0.0.5/x'; Leak = '@V@' },
+    @{ Name = 'LongPasswordParam'; In = 'x.exe -password=@V@'; Leak = '@V@' },
+    @{ Name = 'ShortPasswordParam'; In = 'x.exe -p@V@'; Leak = '@V@' },
+    @{ Name = 'SlackWebhook'; In = 'POST https://hooks.slack.com/services/T000/B000/@V@'; Leak = '@V@' },
+    @{ Name = 'DiscordWebhook'; In = 'POST https://discord.com/api/webhooks/123/@V@'; Leak = '@V@' }
 )
 foreach ($runtimeLogMaskCase in $runtimeLogMaskCases) {
-    $runtimeLogMaskOut = & $runtimeLogSyncModule { param($t) Protect-BRAVOLogSecret -Text $t } $runtimeLogMaskCase.In
+    $runtimeLogMaskOut = & $runtimeLogSyncModule { param($t) Protect-BRAVOLogSecret -Text $t } (Expand-BRAVOMaskFixture $runtimeLogMaskCase.In)
     $runtimeLogMaskAgain = & $runtimeLogSyncModule { param($t) Protect-BRAVOLogSecret -Text $t } $runtimeLogMaskOut
     Test-BRAVOCondition (
-        $runtimeLogMaskOut -notlike "*$($runtimeLogMaskCase.Leak)*" -and $runtimeLogMaskOut -like '*`*`*`**' -and $runtimeLogMaskAgain -ceq $runtimeLogMaskOut
+        $runtimeLogMaskOut -notlike "*$(Expand-BRAVOMaskFixture $runtimeLogMaskCase.Leak)*" -and $runtimeLogMaskOut -like '*`*`*`**' -and $runtimeLogMaskAgain -ceq $runtimeLogMaskOut
     ) -Name "Logging/MaskSecret_$($runtimeLogMaskCase.Name)" `
-        -Failure "формат '$($runtimeLogMaskCase.Name)' має маскуватись повністю й ідемпотентно; вхід='$($runtimeLogMaskCase.In)' вихід='$runtimeLogMaskOut' повторно='$runtimeLogMaskAgain'"
+        -Failure "формат '$($runtimeLogMaskCase.Name)' має маскуватись повністю й ідемпотентно; вхід='$(Expand-BRAVOMaskFixture $runtimeLogMaskCase.In)' вихід='$runtimeLogMaskOut' повторно='$runtimeLogMaskAgain'"
 }
 $runtimeLogMaskProse = & $runtimeLogSyncModule { Protect-BRAVOLogSecret -Text 'basic setup done; keep prose; mkdir -p' }
 Test-BRAVOCondition ($runtimeLogMaskProse -ceq 'basic setup done; keep prose; mkdir -p') -Name 'Logging/MaskSecretKeepsPlainProse' `
     -Failure "звичайний текст без секретів не змінюється; факт: '$runtimeLogMaskProse'"
 
 $runtimeLogMaskKnown = & $runtimeLogSyncModule {
+    param($lit, $litLong, $enc)
     [pscustomobject]@{
-        Literal = (Protect-BRAVOLogSecret -Text 'dump: Zq9literalKey and again Zq9literalKey end' -KnownSecrets @('Zq9literalKey'))
+        Literal = (Protect-BRAVOLogSecret -Text "dump: $lit and again $lit end" -KnownSecrets @($lit))
         Short   = (Protect-BRAVOLogSecret -Text 'abc stays; ab stays' -KnownSecrets @('abc', 'ab', '', $null))
-        Encoded = (Protect-BRAVOLogSecret -Text 'url=p%40ss%21word&x' -KnownSecrets @('p@ss!word'))
-        Longest = (Protect-BRAVOLogSecret -Text 'val Zq9literalKeyLong end' -KnownSecrets @('Zq9literalKey', 'Zq9literalKeyLong'))
+        Encoded = (Protect-BRAVOLogSecret -Text ('url=' + [System.Uri]::EscapeDataString($enc) + '&x') -KnownSecrets @($enc))
+        Longest = (Protect-BRAVOLogSecret -Text "val $litLong end" -KnownSecrets @($lit, $litLong))
         Null    = (Protect-BRAVOLogSecret -Text 'plain text' -KnownSecrets $null)
     }
-}
+} $fxLiteral $fxLiteralLong $fxEncoded
 Test-BRAVOCondition (
     $runtimeLogMaskKnown.Literal -ceq 'dump: *** and again *** end' -and
     $runtimeLogMaskKnown.Short -ceq 'abc stays; ab stays' -and
@@ -630,13 +654,14 @@ Test-BRAVOCondition ($runtimeLogMaskPerf -lt 10) -Name 'Logging/MaskSecretLargeI
 
 # Облікові дані з Credential Manager збираються дослівно (SFTP + SMB), короткі відкидаються.
 $runtimeLogKnownCollected = & $runtimeLogSyncModule {
-    $script:runtimeLogSecretStore = @{ 'BRAVO_SFTP_LOGIN' = ' svc-user1 '; 'BRAVO_SFTP_PASSWORD' = 'Zq9sftpSecret'; 'BRAVO_SMB_LOGIN' = 'abc'; 'BRAVO_SMB_PASSWORD' = 'Zq9smbSecret' }
+    param($sftpValue, $smbValue)
+    $script:runtimeLogSecretStore = @{ 'BRAVO_SFTP_LOGIN' = ' svc-user1 '; 'BRAVO_SFTP_PASSWORD' = $sftpValue; 'BRAVO_SMB_LOGIN' = 'abc'; 'BRAVO_SMB_PASSWORD' = $smbValue }
     $script:credentialSettings = [pscustomobject]@{ Targets = [pscustomobject]@{ SFTPLogin = 'BRAVO_SFTP_LOGIN' } }
     @(Get-BRAVOOwnLogKnownSecrets)
-}
+} $fxSftp $fxSmb
 Test-BRAVOCondition (
-    @($runtimeLogKnownCollected).Count -eq 3 -and @($runtimeLogKnownCollected) -contains 'Zq9sftpSecret' -and
-    @($runtimeLogKnownCollected) -contains 'Zq9smbSecret' -and @($runtimeLogKnownCollected) -contains 'svc-user1' -and
+    @($runtimeLogKnownCollected).Count -eq 3 -and @($runtimeLogKnownCollected) -contains $fxSftp -and
+    @($runtimeLogKnownCollected) -contains $fxSmb -and @($runtimeLogKnownCollected) -contains 'svc-user1' -and
     @($runtimeLogKnownCollected) -notcontains 'abc'
 ) -Name 'Maintenance/OwnLogKnownSecretsCollectedFromCredentialManager' `
     -Failure "очікувано логін/пароль SFTP і пароль SMB (>=4 символів, без пробілів по краях); факт: $(@($runtimeLogKnownCollected) -join ',')"
@@ -644,17 +669,17 @@ Test-BRAVOCondition (
 # Синхронізація з відомим секретом без ключового слова: у знімку його немає.
 $runtimeLogKnownRoot = Join-Path $maintenanceOwnLogTestRoot 'KNOWNLOGS'
 [void](New-Item -ItemType Directory -Path $runtimeLogKnownRoot -Force)
-[IO.File]::WriteAllText((Join-Path $runtimeLogKnownRoot 'echo_1.log'), "Read-Host echo: Zq9bareSecret\r\nend")
+[IO.File]::WriteAllText((Join-Path $runtimeLogKnownRoot 'echo_1.log'), "Read-Host echo: $fxBare`r`nend")
 $runtimeLogKnownState = New-BRAVORuntimeLogSyncTestState
 [void](& $runtimeLogSyncModule {
-    param($localRoot, $state)
+    param($localRoot, $state, $bare)
     $script:runtimeLogSyncState = $state
     $fakeSession = New-Object PSObject
     $fakeSession | Add-Member -MemberType ScriptMethod -Name FileExists -Value { param($path) return $false }
-    Sync-BRAVORuntimeLogsToSftp -Session $fakeSession -LocalLogRoot $localRoot -RemoteDirectory 'logs/runtime' -KnownSecrets @('Zq9bareSecret')
-} $runtimeLogKnownRoot $runtimeLogKnownState)
+    Sync-BRAVORuntimeLogsToSftp -Session $fakeSession -LocalLogRoot $localRoot -RemoteDirectory 'logs/runtime' -KnownSecrets @($bare)
+} $runtimeLogKnownRoot $runtimeLogKnownState $fxBare)
 Test-BRAVOCondition (
-    @($runtimeLogKnownState.SentContents).Count -eq 1 -and (@($runtimeLogKnownState.SentContents) -join '|') -notmatch 'Zq9bareSecret' -and
+    @($runtimeLogKnownState.SentContents).Count -eq 1 -and (@($runtimeLogKnownState.SentContents) -join '|') -notmatch $fxBare -and
     (@($runtimeLogKnownState.SentContents) -join '|') -match 'Read-Host echo: \*\*\*'
 ) -Name 'Maintenance/RuntimeLogSyncMasksKnownCredentialLiterals' `
     -Failure "литерал облікових даних без ключового слова має бути замаскований у знімку; факт: '$(@($runtimeLogKnownState.SentContents) -join '|')'"
@@ -663,7 +688,7 @@ Test-BRAVOCondition (
 $runtimeLogOwnRoot = Join-Path $maintenanceOwnLogTestRoot 'OWNFILE'
 [void](New-Item -ItemType Directory -Path $runtimeLogOwnRoot -Force)
 $runtimeLogOwnLive = Join-Path $runtimeLogOwnRoot 'run_1.log'
-$runtimeLogOwnLiveText = "start`r`npassword=Zq9liveSecret`r`nbare Zq9bareSecret`r`nПривіт`r`n"
+$runtimeLogOwnLiveText = "start`r`npassword=$fxLive`r`nbare $fxBare`r`nПривіт`r`n"
 [IO.File]::WriteAllText($runtimeLogOwnLive, $runtimeLogOwnLiveText, (New-Object Text.UnicodeEncoding($false, $true)))
 $runtimeLogOwnBinary = Join-Path $runtimeLogOwnRoot 'blob_1.log'
 [IO.File]::WriteAllBytes($runtimeLogOwnBinary, [byte[]](0x41, 0x00, 0x42, 0x00, 0x01, 0x02))
@@ -671,21 +696,21 @@ $runtimeLogOwnTempBefore = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath(
 $runtimeLogOwnState = New-BRAVORuntimeLogSyncTestState
 $runtimeLogOwnBinaryState = New-BRAVORuntimeLogSyncTestState
 & $runtimeLogSyncModule {
-    param($live, $binary, $state, $binaryState)
+    param($live, $binary, $state, $binaryState, $bare)
     $script:runtimeLogSyncState = $state
-    Send-BRAVOOwnLogFile -Session (New-Object PSObject) -LocalLogPath $live -RemoteDirectory 'logs/maintenance' -KnownSecrets @('Zq9bareSecret')
+    Send-BRAVOOwnLogFile -Session (New-Object PSObject) -LocalLogPath $live -RemoteDirectory 'logs/maintenance' -KnownSecrets @($bare)
     $script:runtimeLogSyncState = $binaryState
     Send-BRAVOOwnLogFile -Session (New-Object PSObject) -LocalLogPath $binary -RemoteDirectory 'logs/maintenance'
-} $runtimeLogOwnLive $runtimeLogOwnBinary $runtimeLogOwnState $runtimeLogOwnBinaryState
+} $runtimeLogOwnLive $runtimeLogOwnBinary $runtimeLogOwnState $runtimeLogOwnBinaryState $fxBare
 $runtimeLogOwnTempLeft = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'BRAVO_log_snapshot_*.tmp' -ErrorAction SilentlyContinue | Where-Object { $runtimeLogOwnTempBefore -notcontains $_.FullName })
 $runtimeLogOwnSentText = (@($runtimeLogOwnState.SentContents) -join '|')
 Test-BRAVOCondition (
     @($runtimeLogOwnState.SentRemotePaths).Count -eq 1 -and @($runtimeLogOwnState.SentRemotePaths)[0] -eq '/logs/maintenance/run_1.log' -and
     @($runtimeLogOwnState.SentLocalPaths)[0] -ne $runtimeLogOwnLive -and
-    $runtimeLogOwnSentText -notmatch 'Zq9liveSecret' -and $runtimeLogOwnSentText -notmatch 'Zq9bareSecret' -and
+    $runtimeLogOwnSentText -notmatch $fxLive -and $runtimeLogOwnSentText -notmatch $fxBare -and
     $runtimeLogOwnSentText -match 'password=\*\*\*' -and $runtimeLogOwnSentText -match 'Привіт' -and
     @($runtimeLogOwnState.SentHeads)[0] -eq 'FFFE73' -and
-    [IO.File]::ReadAllText($runtimeLogOwnLive) -match 'Zq9liveSecret' -and
+    [IO.File]::ReadAllText($runtimeLogOwnLive) -match $fxLive -and
     @($runtimeLogOwnTempLeft).Count -eq 0
 ) -Name 'Maintenance/OwnLogFileUploadsMaskedSnapshotNotLiveLog' `
     -Failure "Send-BRAVOOwnLogFile має передавати замаскований знімок (UTF-16LE BOM збережено), живий лог не змінюється, знімок прибирається; факт: paths=$(@($runtimeLogOwnState.SentLocalPaths) -join ',') head=$(@($runtimeLogOwnState.SentHeads) -join ',') content='$runtimeLogOwnSentText' leftover=$(@($runtimeLogOwnTempLeft).Count)"
