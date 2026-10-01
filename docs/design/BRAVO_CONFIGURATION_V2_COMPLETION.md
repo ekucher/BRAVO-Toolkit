@@ -2705,7 +2705,7 @@ native/default-only v2-інсталяція, що пізніше створює 
   legacy-локальний шар `BRAVO.local.config`; змішаний legacy/v2 стан;
   недійсний v2-шар; невідомий формат; незавершений/не-`Committed`
   журнал міграції; невирішений намір EXPLICIT-шляху. Зокрема:
-  `journal existує І journal != Committed` продовжує означати
+  `journal існує І journal != Committed` продовжує означати
   «потрібне відновлення/preflight, native/default-only shortcut
   недоступний» — це зберігає інваріанти транзакції з розділу
   «Активація міграції та відкат» вище без винятку.

@@ -7652,10 +7652,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # який перевіряє РЕАЛЬНИЙ виклик-сайт Archive (Resolve-BRAVOArchiveSpaceDecision)
     # наскрізно:
     #   MergeSpaceResultsOverridesFloorWhenEstimateCoversDrive
-    #       -> ІНВЕРТОВАНО в A24 (below-floor-але-достатньо тепер БЛОКУЄ
-    #          BelowFloorEstimateNotPeakSafe — навмисна зміна поведінки,
-    #          не регресія; той самий вхід під PeakSafeEstimate=true
-    #          лишається ALLOW+WARNING — доведено в A25)
+    #       -> A24 (у 5.2.3 інвертовано: below-floor-але-достатньо
+    #          БЛОКУВАВ BelowFloorEstimateNotPeakSafe; з 5.2.4 Archive
+    #          використовує ArchivePeakSafe, і A24 знову перевіряє ALLOW +
+    #          WARNING BelowHealthFloorButRequirementSatisfied)
     #   MergeSpaceResultsKeepsFloorBlockingWithoutEstimate      -> A5
     #   MergeSpaceResultsKeepsFloorBlockingWhenEstimateAlsoInsufficient -> A4/A10
     #   MergeSpaceResultsEstimatedFailureBlocksEvenWhenFloorPasses -> A4
@@ -24462,7 +24462,12 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework' -DependsOn 'Tail/Isolation
         $syntheticFilePath = Join-Path $tempRoot "Phase0Only.json"
         $syntheticFileContent = '{ "phase0": true,'
         [IO.File]::WriteAllText($syntheticFilePath, $syntheticFileContent, (New-Object Text.UTF8Encoding($false)))
-        $syntheticFileHash = (Get-BRAVOFileHash -Path $syntheticFilePath -Algorithm SHA256).Hash.ToUpperInvariant()
+        # Module-qualified (#219): Clear-BRAVOSelfTestOwnedRuntimeModules
+        # прибирає глобальний Function:Get-BRAVOFileHash, який експортують
+        # runtime-модулі фрагментів TraceArchive/MaintenanceOwnLog, і з ним
+        # зникає експорт Compatibility; у вибірковому -Suite його ніхто не
+        # повертає.
+        $syntheticFileHash = (BRAVO.Compatibility\Get-BRAVOFileHash -Path $syntheticFilePath -Algorithm SHA256).Hash.ToUpperInvariant()
 
         # Дописати новий запис у TEMP-копію RUNTIME_MANIFEST.json (НЕ у
         # repository-файл) — реальний SHA256 щойно записаних байтів,
