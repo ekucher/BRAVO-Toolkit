@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — поточний стан проекту
 
-Останню перевірку виконано: 2026-10-01 (після merge train) (Git + GitHub REST API, лише читання).
+Останню перевірку виконано: 2026-10-01 (після Production Safety Wave) (Git + GitHub REST API, лише читання).
 
 Кожне змінне твердження нижче має дату й метод перевірки. Це знімок, а не
 гарантія: **перечитати перед дією**. Порядок джерел істини — розділ
@@ -13,12 +13,14 @@
 
 ## State baseline SHA
 
-`610e93f80a947d01c8c3e452694a02be0ca05b4a` — `developer`, Merge PR #315
+`4f732e5ee95d263454efc99ce9b3c2ae41965cc2` — `developer`, Merge PR #318
 (перевірено `GET /branches/developer`, 2026-10-01).
 
-Попередній baseline — `4a54d34` (2026-09-30). Між ними merge train
-2026-09-30/10-01 влив 12 PR (деталі нижче). Цей файл приходить окремим
-PR #318 поверх `610e93f`; його merge-коміт не змінює runtime.
+Попередній baseline — `610e93f` (Merge PR #315); #318 змінив лише цей
+файл і governance-документи, runtime той самий. Ще раніше — `4a54d34`
+(2026-09-30); між ними merge train 2026-09-30/10-01 влив 13 PR (деталі
+нижче). Production Safety Wave 2026-10-01 нічого не зливала: усі її PR
+відкриті (див. «Відкриті PR»).
 
 Це commit `developer`, відносно якого перевірено handoff; він не мусить
 дорівнювати commit-у, що містить сам файл. Якщо `origin/developer` пішов
@@ -36,10 +38,10 @@ git rev-parse HEAD origin/developer origin/master
 
 | Об'єкт | Значення | Метод |
 | --- | --- | --- |
-| `origin/developer` | `610e93f` | `GET /branches/developer` |
+| `origin/developer` | `4f732e5` | `GET /branches/developer` |
 | `origin/master` | `f8fa5aa` (stable `5.2.4`) | `GET /branches/master` |
-| `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (416 комітів позаду `610e93f`) | файл у дереві |
-| CI push-прогін `developer` `610e93f` | 5 перевірок ` (push)` + `Telegram CI summary` — усі success | `GET /commits/610e93f/check-runs` |
+| `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (далеко позаду `4f732e5`) | файл у дереві |
+| CI push-прогін `developer` `4f732e5` | 5 перевірок ` (push)` + `Telegram CI summary` — усі success | `GET /commits/4f732e5/check-runs` |
 | Теги 5.3 | лише `v5.3.0-rc.1` | `git ls-remote --tags` |
 
 ## Branch protection — бажане проти перевіреного
@@ -93,6 +95,7 @@ Merge train 2026-09-30/10-01 (звичайні merge-коміти, у таком
 | #311 | `cd421e7` | #219 A: самодостатні вибіркові suite |
 | #312 | `d17b062` | #219 B: секційна ізоляція фатальних винятків |
 | #315 | `610e93f` | реальні назви установ, хостів і коди замінено вигаданими |
+| #318 | `4f732e5` | governance: бажана політика проти live-стану (цей файл) |
 
 Codex перестав рев'юїти 2026-09-30 ~22:13 UTC (вичерпано ліміт). Після
 цього незалежне рев'ю виконувалось окремими агентами.
@@ -101,8 +104,25 @@ Codex перестав рев'юїти 2026-09-30 ~22:13 UTC (вичерпано
 
 | PR | Стан | Зміст | Що потрібно |
 | --- | --- | --- | --- |
-| #318 | draft → цей файл | governance: бажана політика проти live-стану | merge останнім у train |
-| #323 | draft, base `developer` | #322: пропущена нічна копія після старту сервера | поза merge train; review |
+Production Safety Wave 2026-10-01: сім PR у `developer`, кожен — зелений
+CI на exact head, незалежне рев'ю 0 P1 / 0 P2, mergeable. **Жоден не
+злитий**: merge потребує нового рішення власника.
+
+| PR | Issue | Зміст |
+| --- | --- | --- |
+| #323 | #322 (частково) | boot catch-up пропущеної нічної копії (`BRAVO_ARCHIV_CATCHUP`) |
+| #324 | #289 | точний відкат `Update-BRAVOServer.ps1` + перереєстрація Scheduler |
+| #325 | #319 | helper `Get-BRAVOServiceStartMode` замість прямого `StartType` |
+| #326 | #321 | `-ForceRestore` при Disabled-службі BRAVO; INFO очікування lock |
+| #327 | #292 | `-SyncBAZA` через канонічний incremental-рушій |
+| #328 | #320 | Configurator не виконує legacy `BRAVO.config` |
+| #329 | #297 | тимчасовий Disabled служб на вікно реставрації зі знімком типів |
+
+Порядок merge і конфлікти між PR — у фінальному звіті хвилі
+(`/mnt/project-files/bravo-backlog/production-safety-wave-2026-10-01.md`,
+поза репозиторієм). Завжди конфліктують `CHANGELOG.md`,
+`RUNTIME_MANIFEST.json` (перегенерувати після кожного merge) і
+`FunctionsToExport` у `BRAVO.System.psd1` (#323, #325, #329 — об'єднання).
 
 ## Issue (перевірено `GET /issues/{n}`, 2026-10-01)
 
@@ -123,11 +143,14 @@ Codex перестав рев'юїти 2026-09-30 ~22:13 UTC (вичерпано
   дочірній процес Configurator (#320).
 * **#279**, **#280**, **#281** — open, чекають рішення власника (документацію
   #279/#280 виправлено в #261/#260, runtime-питання лишились).
-* Нові з merge train: **#319** (пряме `StartType` поза Health), **#320**
-  (Configurator виконує застарілий `BRAVO.config` у дочірньому процесі).
-* Відкриті `bug`-issue без фіксу: #282–#287, #289–#294, #296–#303,
-  #305–#307 (перевалідовано 2026-09-30 на `4a54d34`; runtime-зміни train
-  їх не зачіпають), а також #319–#322.
+* Production Safety Wave 2026-10-01 — **FIX IMPLEMENTED / MERGE READY**
+  (issue відкриті до merge): #289, #292, #297, #319, #320, #321; #322 —
+  частково (boot catch-up), решта пунктів у коментарі issue.
+* Нове з хвилі: **#330** (гейт `Update-BRAVOServer` відкочує оновлення,
+  коли `BRAVO_SETUP` повертає exit 10).
+* Відкриті `bug`-issue без фіксу: #282–#287, #290, #291, #293, #294,
+  #296, #298–#303, #305–#307 (перевалідовано 2026-09-30 на `4a54d34`), а
+  також #330.
 * Дизайни, чекають рішення/реалізації: #314 (автовідновлення служб),
   #316 (закриття BIS перед реставрацією, після #314 хвилі 2).
 * Acceptance-issue на реальних хостах: #152 (тег `v5.2.0-rc.2` досі
@@ -147,19 +170,19 @@ Codex перестав рев'юїти 2026-09-30 ~22:13 UTC (вичерпано
 
 ## Класифікація 5.3 (лише класифікація; без promote/tag/release)
 
-Стан на `developer` `610e93f`, 2026-10-01. Рівні послідовні: ENGINEERING
+Стан на `developer` `4f732e5`, 2026-10-01. Рівні послідовні: ENGINEERING
 READY → OPERATIONAL ACCEPTANCE (PENDING → ACCEPTED) → зняття RELEASE
 BLOCKED.
 
 | Рівень | Критерій | Вердикт зараз |
 | --- | --- | --- |
-| ENGINEERING READY | Runtime-cutover Config V2 (#216) у всіх production-entrypoint-ах | ТАК для прямих викликів (гейт `CONFIG_LOADER_CALLER_COMPLETENESS`, #317); непрямі виклики — #239, Configurator — #320 |
+| ENGINEERING READY | Runtime-cutover Config V2 (#216) у всіх production-entrypoint-ах | ТАК для прямих викликів (гейт `CONFIG_LOADER_CALLER_COMPLETENESS`, #317); непрямі виклики — #239, Configurator — #320 (фікс у PR #328, не злитий) |
 | ENGINEERING READY | B7: матриця регресій 5.3-шляху в required-наборі | ЧАСТКОВО — матриця в `BRAVO_SELF_TEST.ps1` (required на `master`), але `developer` без захисту |
-| ENGINEERING READY | CI зелений на HEAD `developer` | ТАК (push-прогін `610e93f`) |
-| ENGINEERING READY | Немає відкритих bug-issue щодо коректності runtime без рішення | НІ — 23 `bug`-issue у #282–#307 і ще #319–#322 |
+| ENGINEERING READY | CI зелений на HEAD `developer` | ТАК (push-прогін `4f732e5`) |
+| ENGINEERING READY | Немає відкритих bug-issue щодо коректності runtime без рішення | НІ — фікси #289/#292/#297/#319/#320/#321 готові, але не злиті; без фіксу — 20 `bug`-issue у #282–#307 і #330 |
 | OPERATIONAL ACCEPTANCE | B5: pilot `PILOT ACCEPTED` + мігровані хости парку з доказами | НІ — `PILOT NOT ACCEPTED`, парк не мігровано |
 | OPERATIONAL ACCEPTANCE | Acceptance-issue на реальних хостах (#152/#155/#158) | НІ — open |
-| RELEASE | `VERSION.json` provenance відповідає HEAD | НІ — `sourceCommit` `d77f3b4` ≠ `610e93f` → `PROVENANCE_STALE` |
+| RELEASE | `VERSION.json` provenance відповідає HEAD | НІ — `sourceCommit` `d77f3b4` ≠ `4f732e5` → `PROVENANCE_STALE` |
 | RELEASE | Прийнятий RC | НІ — `v5.3.0-rc.1` immutable, приймання не проходив; `rc.2` не створено |
 | RELEASE | Захист `developer` застосовано й перевірено live | НІ — OWNER ACTION REQUIRED (§13.4) |
 | RELEASE | Питання #281 вирішено | НІ — open |
@@ -185,14 +208,17 @@ OPERATIONAL ACCEPTANCE — PENDING; **RELEASE BLOCKED**.
 ## NEXT ACTION
 
 ```text
-1. Власник застосовує захист developer за RELEASE_POLICY.md §13.4;
+1. Власник авторизує merge train Production Safety Wave (#323–#329)
+   у порядку з фінального звіту хвилі; після кожного merge —
+   перегенерувати RUNTIME_MANIFEST.json, exact-head CI зелений.
+2. Власник застосовує захист developer за RELEASE_POLICY.md §13.4;
    сесія після цього перечитує GET /branches/developer і лише тоді
    оновлює §13.3 та цей файл.
-2. Власник вирішує щодо #279/#280/#281 і пріоритету runtime-багів
-   #282–#307, #319–#322; фікси — окремими PR у developer.
-3. B5: довести pilot до PILOT ACCEPTED (PublicIPLookupEnabled),
+3. Власник вирішує щодо #279/#280/#281, #330 і пріоритету решти
+   runtime-багів #282–#307; фікси — окремими PR у developer.
+4. B5: довести pilot до PILOT ACCEPTED (PublicIPLookupEnabled),
    рішення про модель міграції парку. До доказів B5 — hard stop нижче.
-4. #314 хвиля 1 (після «починай» власника), потім #316.
+5. #314 хвиля 1 (після «починай» власника), потім #316.
 Перед кроком 1 перечитати: git rev-parse origin/developer, GET /pulls?state=open.
 ```
 
