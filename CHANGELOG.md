@@ -443,6 +443,29 @@
   коментарі guard-а. На поточному дереві знахідок немає;
   на знімку до виправлення PR #225 — рівно ті самі три входження.
 
+- **Документація: канонічний опис джерел конфігурації та секретів 5.3 (T033).**
+  README, розділ 4, отримав єдиний підрозділ «Джерела конфігурації та
+  секретів у 5.3»: контракт runtime (built-in дефолти + `BRAVO.local.config`
+  + Windows Credential Manager + деривація), окремо — секрети (лише
+  Credential Manager; конфігурація містить тільки імена записів),
+  параметри установи (Credential Manager, інакше `bravoSettings.*` або
+  built-in placeholder) і міграція legacy `BRAVO.config` (лише
+  `deploy\Get-BRAVOConfigSiteDelta.ps1`, не runtime-fallback). Додано
+  таблицю фактичної поведінки кожного скрипта за відсутнього секрету:
+  код не завжди `31` — відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV`
+  дають `30`, webhook у `BRAVO_HEALTH` — `30`, SFTP/SMB у `BRAVO_HEALTH` —
+  `70`, пароль архівів у `BRAVO_RESTORE_TEST` — `90`, некоректні параметри
+  установи в `BRAVO_ARCHIV` — `1`. Відповідно виправлено рядки `30`/`31`
+  матриці діагностики README, розділи `30`/`31` `OPERATIONS.md` і
+  `SECURITY.md` (розділи 3 і 6); вони посилаються на канонічний підрозділ
+  замість власних формулювань. Задокументовано відомі розбіжності: явний
+  `-ConfigPath` на legacy `BRAVO.config` досі виконує його як основний шар
+  (виконання сусіднього `BRAVO.config` ручним `BRAVO_OPERATIONS_HEARTBEAT.ps1`
+  без `-ConfigPath` виправлено окремо в PR #317); пріоритет Credential Manager для параметрів
+  установи застосовують не всі скрипти (`BRAVO_NOTIFICATION_TEST`,
+  `BRAVO_RESTORE_TEST` беруть `bravoSettings.*`). Для некоректного наявного
+  запису установи (`30`) `OPERATIONS.md` радить `-Action Set`, а не
+  `Ensure`. Runtime не змінено.
 - **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —

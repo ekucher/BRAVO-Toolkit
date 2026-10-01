@@ -259,9 +259,14 @@ $global:pathSettings = @{
 > built-in дефолти в 5.3 — це код комплекту, а не файл; будь-яке
 > відхилення від дефолту задається через **`BRAVO.local.config`**
 > (data-only, `'dot.path' = значення`, шаблон — `BRAVO.local.config.example`),
-> а секрети — через Windows Credential Manager. `BRAVO.config` лишається
-> актуальним лише для інсталяцій, що ще мігрують з 5.2 (розділ 10) —
-> нову production-інсталяцію 5.3 наводьте без нього.
+> а секрети — через Windows Credential Manager. За контрактом 5.3 legacy
+> `BRAVO.config` (5.2) читає лише migration-інструментарій (розділ 10) — нову
+> production-інсталяцію 5.3 наводьте без нього. Виняток на час міграції:
+> production-скрипт, запущений з явним `-ConfigPath` на legacy-файл (зокрема
+> завдання Планувальника, встановлене з таким аргументом), досі виконує його
+> як основний шар конфігурації.
+> Канонічний опис джерел конфігурації й секретів —
+> розділ 4, підрозділ «Джерела конфігурації та секретів у 5.3».
 
 Рекомендований спосіб — `.\BRAVO_CONFIGURATOR.ps1`: інтерактивний GUI поверх
 `BRAVO.local.config` — schema-driven форма з усіма 138 override-ключами,
@@ -573,8 +578,11 @@ Health-only попередження `maintenanceSettings.Limits.ExcludedDrives`
 
 ## 4. Параметри установи та секрети
 
-Наступні значення зберігаються у Windows Credential Manager, тому їх не потрібно
-знову вписувати у config після оновлення:
+Секрети й параметри установи зберігаються у Windows Credential Manager, тому
+їх не потрібно знову вписувати в конфігурацію після оновлення. Звідки саме
+runtime бере кожне значення і що буває, коли його немає, — підрозділ
+[«Джерела конфігурації та секретів у 5.3»](#джерела-конфігурації-та-секретів-у-53)
+нижче; це єдиний канонічний опис, інші документи посилаються на нього.
 
 | Target Credential Manager | Значення |
 |---|---|
@@ -590,10 +598,157 @@ Health-only попередження `maintenanceSettings.Limits.ExcludedDrives`
 | `BRAVO_SLACK_ALERTS_URL` | Slack webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
 | `BRAVO_DISCORD_GENERAL_URL` | Discord webhook — лише штатні (SUCCESS) сповіщення |
 | `BRAVO_DISCORD_ALERTS_URL` | Discord webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
+| `BRAVO_OPERATIONS_BOOTSTRAP_SECRET` | bootstrap-секрет enrollment BSYSTEM Operations |
+| `BRAVO_OPERATIONS_API_KEY` | API-ключ BSYSTEM Operations (записує сам runtime після enrollment) |
 
-Значення `InstitutionName`, `InstitutionCode` і `ArchivePrefix` у
-`BRAVO.config` — лише fallback для першого запуску. Після налаштування
-використовуються записи Credential Manager.
+### Джерела конфігурації та секретів у 5.3
+
+**Контракт runtime 5.3:**
+
+```text
+канонічні built-in дефолти (код комплекту)
+  + BRAVO.local.config (лише дозволені не-секретні site-override)
+  + Windows Credential Manager (секрети й параметри установи)
+  + автоматичне визначення на машині (Discovery) для AUTO-шляхів
+  + детермінована деривація
+  = ефективна конфігурація
+```
+
+`BRAVO.config` у цьому контракті **не є джерелом конфігурації**: штатний
+запуск 5.3 (без `-ConfigPath`) не виконує його, навіть якщо файл фізично
+лежить поруч, — завантажувач лише попереджає про знайдений файл. Виняток —
+явний `-ConfigPath` (підрозділ «Міграція — legacy `BRAVO.config`» нижче);
+з PR #317 це стосується й ручного `BRAVO_OPERATIONS_HEARTBEAT.ps1`, який
+раніше виконував сусідній файл і без `-ConfigPath`. Секретів він не постачає за жодних умов.
+
+#### Runtime 5.3 — не-секретна конфігурація
+
+1. Канонічні built-in дефолти — код комплекту (`modules\BRAVO.Configuration`).
+2. `BRAVO.local.config` — лише ті dot-path, які реєстр авторизації дозволяє
+   як site-override. Неавторизований або некоректний за типом ключ зупиняє
+   завантаження ще до злиття — жоден override із файлу тоді не
+   застосовується частково (єдиний виняток — свідоме послаблення через
+   `BRAVO_ALLOW_WEAKENED_SECURITY=1` для ключів, які реєстр дозволяє так
+   послабити).
+3. Детермінована деривація (ефективні корені, шляхи, `storageEffective` тощо)
+   з результату злиття. Для шляхів, лишених порожніми (AUTO, як built-in
+   `pathSettings.LIMSRoot = ""`), вона бере автоматичне визначення на машині:
+   `Resolve-BRAVOEffectiveLimsRoot` і `Resolve-BRAVOInstallationDiscovery`
+   (`modules\BRAVO.Discovery`) читають служби Windows (`Win32_Service`),
+   активний `bravo.ini` і стан файлової системи. Тому зміна служби чи
+   `bravo.ini` може змінити ефективну конфігурацію без зміни жодного з
+   перелічених файлів; явно заданий шлях Discovery не перевизначає.
+
+#### Runtime 5.3 — секрети
+
+Пароль архівів, SFTP- і SMB-логін/пароль, webhook-и Slack/Discord,
+bootstrap-секрет BSYSTEM Operations мають **єдине** джерело — Windows
+Credential Manager того облікового запису, від якого запущено процес:
+адміністратора для ручних запусків, `SYSTEM` для завдань Планувальника
+(тому `-StoreFor Both`). Змінні середовища, аргументи командного рядка,
+`BRAVO.local.config` і `BRAVO.config` секретів не постачають.
+
+API-ключ BSYSTEM Operations оператор не створює: його видає бекенд Operations
+у відповіді на enrollment (або reissue), і runtime сам записує його
+(`Set-BRAVOCredential`) у Credential Manager облікового запису процесу, а далі
+читає лише звідти. Credential Manager для нього — постійне сховище, а не
+першоджерело; `BRAVO_CREDENTIALS_SETUP.ps1` (компонент `Operations`)
+провізіонує лише bootstrap-секрет, тож `-StoreFor Both` API-ключ не створює.
+
+Конфігурація містить лише **ім'я запису** (reference metadata) —
+`credentialSettings.Targets.<Ключ>`; перевизначити його в
+`BRAVO.local.config` дозволено, але зазвичай не потрібно. Якщо ключ порожній,
+runtime бере канонічне ім'я з таблиці вище (`BRAVO_7Z_PASSWORD`,
+`BRAVO_SFTP_*`, `BRAVO_SMB_*`, `BRAVO_<SLACK|DISCORD>_<GENERAL|ALERTS>_URL`).
+Для `OperationsApiKey`/`OperationsBootstrapSecret` такої підстановки в коді
+немає: діє ім'я з built-in дефолту. Пошуку секрету під іншим ім'ям немає:
+заданий target — єдиний кандидат, а webhook не підміняється ні legacy
+provider-wide записом, ні записом іншого каналу (підрозділ «Маршрутизація
+сповіщень» нижче). Порожній запис дорівнює відсутньому.
+
+#### Runtime 5.3 — параметри установи
+
+`InstitutionName`, `InstitutionCode`, `ArchivePrefix` — не секрети, тому
+мають запасне джерело:
+
+1. запис Credential Manager (`credentialSettings.Targets.InstitutionName`
+   тощо; порожній ключ → `BRAVO_INSTITUTION_NAME`, `BRAVO_INSTITUTION_CODE`,
+   `BRAVO_ARCHIVE_PREFIX`);
+2. лише якщо запису немає або він порожній — `bravoSettings.<Параметр>` з
+   ефективної конфігурації: override у `BRAVO.local.config`, інакше built-in
+   placeholder (`УСТАНОВА`, `00000000`, `lab_v2412`).
+
+Цей порядок застосовують `BRAVO_ARCHIV`, `BRAVO_HEALTH`, `BRAVO_MAINTENANCE`,
+`BRAVO_DATA_RESTORE`, `BRAVO_OPERATIONS_HEARTBEAT` і `BRAVO_DRY_RUN`
+(`Import-BRAVOInstitutionSettings`): у них запис Credential Manager завжди має
+пріоритет — щойно він є, `bravoSettings.*` для цього параметра ігнорується.
+Обране значення проходить
+ту саму валідацію формату; некоректне значення або недоступний Credential
+Manager зупиняють запуск. Placeholder формально валідний, тому production-
+скрипти **не попереджають**, що працюють на ньому; джерело кожного параметра
+(`CredentialManager` чи `ConfigurationFallback`, останнє — як `WARN`) показує
+`.\BRAVO_DRY_RUN.ps1`.
+
+Інші скрипти Credential Manager для цих параметрів не читають і беруть
+`bravoSettings.*` (override або placeholder) навіть за наявного запису:
+`BRAVO_NOTIFICATION_TEST` і `BRAVO_RESTORE_TEST` — у тексті своїх сповіщень,
+`BRAVO_SETUP`, `BRAVO_BAZA_RECONCILE` і `BRAVO_TASKS_INSTALL` — у заголовку
+консолі.
+
+#### Відсутній секрет: що робить кожен компонент
+
+Компонент, якому бракує секрету, не намагається працювати без нього. Код
+завершення при цьому **не завжди `31`** — він залежить від скрипта:
+
+| Скрипт | Відсутній запис | Поведінка | Код |
+|---|---|---|---|
+| `BRAVO_ARCHIV` | пароль архівів | архіви не створюються | `31` (або `30`, якщо одночасно є помилка конфігурації, — вона має вищий пріоритет) |
+| `BRAVO_ARCHIV` | SFTP- або SMB-логін/пароль | відповідна передача пропускається як помилка конфігурації; локальна архівація продовжується | `30` |
+| `BRAVO_ARCHIV` | webhook | сповіщення не надсилається, причина — у журналі; архівація не зупиняється | — |
+| `BRAVO_ARCHIV` | параметри установи (некоректні або Credential Manager недоступний) | запуск зупиняється | `1` (поза контрактом `BRAVO.ExitCodes`) |
+| `BRAVO_MAINTENANCE` | пароль архівів | запуск зупиняється до будь-яких дій | `31` |
+| `BRAVO_MAINTENANCE` | webhook потрібного каналу (режим сповіщень не `none`) | запуск зупиняється | `31` |
+| `BRAVO_MAINTENANCE` | SFTP-логін/пароль | SFTP-частина trace-архівації й вивантаження власного журналу пропускається з `WARNING` | — |
+| `BRAVO_HEALTH` | webhook потрібного каналу (режим сповіщень не `none`) | перевірки не виконуються | `30` |
+| `BRAVO_HEALTH` | SFTP- або SMB-логін/пароль | відповідна перевірка фіксується як проблема | `70` |
+| `BRAVO_DATA_RESTORE` | пароль архівів; SFTP-логін/пароль для `-Source SFTP` | відновлення не починається | `31` |
+| `BRAVO_RESTORE_TEST` | пароль архівів | drill не виконується | `90` |
+| `BRAVO_BAZA_RECONCILE` | SFTP-логін/пароль | перегляд мутацій (`-ListOnly` або запуск без `-Accept`/`-AcceptAll`) облікових даних не читає й завершується `0`; не виконується лише прийняття мутацій (`-Accept`/`-AcceptAll`) | `31` (лише в режимі прийняття) |
+| `BRAVO_NOTIFICATION_TEST` | webhook | тест не пройдено | `31` |
+| BSYSTEM Operations (усі runtime) | API-ключ і bootstrap-секрет | `WARNING` у журналі; події буферизуються в локальному outbox (`%ProgramData%\BRAVO\State\Outbox`) до enrollment, але не більше 500: найстаріші витісняються в `Outbox\DeadLetter` (зберігаються 200 найновіших), звідки після enrollment автоматично не доставляються | — |
+
+«—» означає, що відсутній секрет не має власного коду завершення: код
+визначають інші результати прогону.
+
+Некоректні параметри установи чи недоступний під час їх читання Credential
+Manager у `BRAVO_MAINTENANCE`, `BRAVO_HEALTH`, `BRAVO_DATA_RESTORE` і
+`BRAVO_OPERATIONS_HEARTBEAT` — помилка конфігурації (`30`); у `BRAVO_ARCHIV`
+— `1` (див. таблицю). Коди — розділ 12 «Коди завершення production-скриптів».
+
+#### Міграція — legacy `BRAVO.config`
+
+За контрактом legacy `BRAVO.config` (5.2) читає лише ізольований migration-
+інструментарій: `.\deploy\Get-BRAVOConfigSiteDelta.ps1` порівнює його з
+канонічними дефолтами й друкує site-відмінності у форматі dot-path для
+перенесення в `BRAVO.local.config` (процедура — розділ 10). Секрети з
+`BRAVO.config` не мігрують: runtime їх звідти не читає, а пароль у
+`archiveParams`/`Maintenance.Archiver.Parameters` вважається помилкою
+конфігурації.
+Параметри установи переносяться в Credential Manager
+(`.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Institution -StoreFor Both`),
+а не в `BRAVO.local.config`.
+
+Не використовуйте `BRAVO.config` як runtime-fallback. **Відома розбіжність
+коду з контрактом:** production-скрипти досі приймають явний `-ConfigPath`
+на legacy `BRAVO.config` і тоді виконують його як основний шар
+(дефолти < `BRAVO.config` < `BRAVO.local.config`); завдання Планувальника,
+встановлені з явним `-ConfigPath`, передають його щоразу. Це лише
+сумісність на час міграції, а не підтримуване джерело конфігурації 5.3:
+після перенесення відмінностей перевстановіть завдання без `-ConfigPath`
+(`.\BRAVO_TASKS_INSTALL.ps1`). Ручний `BRAVO_OPERATIONS_HEARTBEAT.ps1`
+до PR #317 не вимикав автопідхоплення legacy-файлу і без `-ConfigPath`
+виконував `BRAVO.config` з каталогу runtime; тепер він поводиться так само,
+як інші скрипти.
 
 ### Маршрутизація сповіщень (GENERAL/ALERTS)
 
@@ -1089,7 +1244,8 @@ UAC — можливий подальший крок, якщо той самий
    `'dot.path' = значення`). Старий `BRAVO.config` при цьому не
    видаляйте — використайте його явним `-ConfigPath` лише як джерело
    для порівняння нижче; у звичайному (AUTO, без `-ConfigPath`)
-   виконанні 5.3-скрипти його все одно ігнорують. Це одноразова
+   виконанні 5.3-скрипти його все одно ігнорують (з PR #317 — і
+   `BRAVO_OPERATIONS_HEARTBEAT.ps1`). Це одноразова
    міграція за установу, не за кожне оновлення.
 
    Шукати ці відмінності вручну не потрібно —
@@ -1434,8 +1590,8 @@ health > лише попередження. Код `90` має найвищий 
 | Код | Найімовірніша причина | Де дивитись |
 |---|---|---|
 | `20` | Інший екземпляр Archive/Maintenance ще виконується | `C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock` (JSON: `pid`, `hostname`, `operation`, `startedAt`, `GenerationId`); збільшіть `OperationLockWaitMinutes`, якщо це штатне перекриття довгих завдань |
-| `30` | Некоректний/відсутній розділ `BRAVO.config` (`maintenanceSettings`, `pathSettings` тощо) | Перший `[ERROR]` одразу після `=== ПЕРЕВІРКА СУМІСНОСТІ СИСТЕМИ ===`; `.\BRAVO_SETUP.ps1 -ValidateOnly` відтворює ту саму перевірку без production-дій |
-| `31` | Відсутній або порожній запис Credential Manager для потрібного компонента | Рядок `credentialInitializationError`/`archiveCredentialInitializationError` у консольному виводі; `.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Test -Component Required -StoreFor Both` |
+| `30` | Ефективна конфігурація (built-in дефолти + `BRAVO.local.config`) не пройшла валідацію або ОС у рівні `Unsupported`; також відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV` і відсутній webhook у `BRAVO_HEALTH` (розділ 4, «Відсутній секрет: що робить кожен компонент») | Перший `[ERROR]` одразу після `=== ПЕРЕВІРКА СУМІСНОСТІ СИСТЕМИ ===`; `.\BRAVO_SETUP.ps1 -ValidateOnly` відтворює ту саму перевірку без production-дій. Облікові дані діагностуються в інших місцях: у `BRAVO_ARCHIV` — `[ERROR]` `Помилка конфiгурацiї SFTP: …` / `Помилка конфігурації NAS/SMB: …` у секції перевірки конфігурації SFTP чи NAS/SMB (далі `WARNING` про пропуск передачі); у `BRAVO_HEALTH` — `[ERROR]` `Некоректно налаштовано канал повідомлень або його webhook у Credential Manager` у `BRAVO_ARCHIV_HEALTH_*.log` |
+| `31` | Відсутній або порожній запис Credential Manager: пароль архівів (`BRAVO_ARCHIV`, `BRAVO_MAINTENANCE`, `BRAVO_DATA_RESTORE`), webhook (`BRAVO_MAINTENANCE`, `BRAVO_NOTIFICATION_TEST`), SFTP (`BRAVO_DATA_RESTORE`; `BRAVO_BAZA_RECONCILE` лише з `-Accept`/`-AcceptAll`). Не кожен відсутній секрет дає `31` — повна таблиця в розділі 4 | Повідомлення «запис Credential Manager '<target>' не знайдено або він порожній» у консолі/журналі (у `BRAVO_ARCHIV` його несуть `archiveCredentialInitializationError`/`credentialInitializationError`); `.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Test -Component Required -StoreFor Both` |
 | `32` | SHA-256 файлу в `Tools/` не збігається з еталонним `TOOLS_MANIFEST.json`, або маніфест відсутній/пошкоджений | Рядок `ЦIЛIСНIСТЬ IНСТРУМЕНТIВ ПОРУШЕНО` на старті логу. Якщо оновлення інструментів свідоме — оновіть маніфест на робочій станції (`ci\Update-BRAVOToolsManifest.ps1 -Apply`), перегляньте `git diff`, розгорніть новий комплект. Якщо ні — це можлива підміна: заплановане завдання виконується від `SYSTEM`, тому інструмент отримав би найвищі права |
 | `33` | SHA-256 файлу комплекту не збігається з `RUNTIME_MANIFEST.json`, файл відсутній, або в комплекті з'явився сторонній `.ps1`/`.psm1` | Рядок `ЦІЛІСНІСТЬ КОМПЛЕКТУ ПОРУШЕНО` — це найперше, що виводиться, ще до завантаження модулів. Якщо оновлення коду свідоме: `ci\Update-BRAVORuntimeManifest.ps1 -Apply` на робочій станції, `git diff`, розгортання нового комплекту |
 | `34` | `BRAVO.config` вимикає перевірку цілісності інструментів (`Mode = "Warn"`) або VSS-узгодженість (`backupConsistency.Mode ≠ "VSS"`) | Рядок `КОНФІГУРАЦІЯ ПОСЛАБЛЮЄ ЗАХИСТ` на старті. Конфігурація не входить до `RUNTIME_MANIFEST.json` (вона різна на кожному сервері), тому ці перемикачі перевіряються окремо — розбором AST, без виконання файлу. Якщо послаблення свідоме й тимчасове, встановіть `BRAVO_ALLOW_WEAKENED_SECURITY=1`: тоді воно лишає слід поза комплектом |

@@ -109,9 +109,14 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 `=== ПЕРЕВІРКА СУМІСНОСТІ СИСТЕМИ ===`.
 
 **Що означає.** Ефективна конфігурація (built-in дефолти +
-`BRAVO.local.config`, або legacy `BRAVO.config` за явним `-ConfigPath`
-на інсталяціях, що ще мігрують з 5.2 — issue #216) не пройшла валідацію,
-або ОС/PowerShell у рівні `Unsupported`.
+`BRAVO.local.config`) не пройшла валідацію, або ОС/PowerShell у рівні
+`Unsupported`. Той самий код дає частина відсутніх секретів: SFTP/SMB-
+облікові дані в `BRAVO_ARCHIV`, webhook у `BRAVO_HEALTH`, некоректні
+параметри установи — повна таблиця в README.md, розділ 4, підрозділ
+«Джерела конфігурації та секретів у 5.3». Якщо запуск іде з явним
+`-ConfigPath` на legacy `BRAVO.config`, помилка може походити з нього — це
+сумісність на час міграції, а не джерело конфігурації 5.3 (там само,
+«Міграція — legacy `BRAVO.config`»).
 
 > **Гола `.NET`-помилка замість зрозумілого повідомлення (виправлено
 > 2026-08-24).** Якщо `BRAVO_SETUP.ps1`/`BRAVO_SELF_TEST.ps1`/
@@ -134,8 +139,7 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 > співставлення з чужим сервісом) — з 2026-08-24 приймає обидва відомі
 > реальні варіанти написання, `"BRAVO Service"` і `"BRAVO Server"`
 > (`maintenanceSettings.Services.BravoDisplayName`, за замовчуванням
-> масив з обома; override — через `BRAVO.local.config`, на 5.2-інсталяції,
-> що ще мігрує, — через `BRAVO.config`). Якщо на вашому сервері
+> масив з обома; override — через `BRAVO.local.config`). Якщо на вашому сервері
 > DisplayName інший за обидва — допишіть його третім елементом списку
 > (не замінюйте наявні два).
 
@@ -159,10 +163,17 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 
 Відтворює ту саму перевірку без production-дій і без елевації.
 
-**Виправлення.** Виправити названий у помилці розділ ефективної
-конфігурації — override у `BRAVO.local.config`, або, на 5.2-інсталяції,
-що ще мігрує, у `BRAVO.config`. Після правки — повторний `-ValidateOnly`
-до чистого результату.
+**Виправлення.** Виправити названий у помилці ключ через override у
+`BRAVO.local.config`; відсутній секрет — через
+`BRAVO_CREDENTIALS_SETUP.ps1` (розділ [`31`](#31--недоступні-credentials)).
+Виняток — некоректна назва, код установи чи префікс архівів у **наявному**
+записі Credential Manager: запис має пріоритет над конфігурацією, тож
+override у `BRAVO.local.config` не допоможе, а `-Action Ensure` на такому
+записі завершується помилкою замість заміни. Перезапишіть запис:
+`.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Set -Component Institution -StoreFor Both`.
+Не правте legacy `BRAVO.config` як обхідний шлях: перенесіть його
+відмінності в `BRAVO.local.config` (README.md, розділ 10). Після правки —
+повторний `-ValidateOnly` до чистого результату.
 
 **Ескалація.** Якщо `-ValidateOnly` зелений, а production-запуск усе
 одно дає `30` — це розбіжність контекстів (див.
@@ -172,16 +183,23 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 
 ## `31` — недоступні credentials
 
-**Симптом.** `credentialInitializationError` або
-`archiveCredentialInitializationError` у консольному виводі.
+**Симптом.** Повідомлення про відсутній або порожній запис Credential
+Manager з іменем target у консолі чи журналі.
 
 **Що означає.** Немає або порожній запис Windows Credential Manager для
 потрібного компонента — найчастіше він створений для адміністратора,
-але не для `SYSTEM`.
+але не для `SYSTEM`. Код `31` дають пароль архівів (`BRAVO_ARCHIV`,
+`BRAVO_MAINTENANCE`, `BRAVO_DATA_RESTORE`), webhook (`BRAVO_MAINTENANCE`,
+`BRAVO_NOTIFICATION_TEST`) і SFTP-облікові дані (`BRAVO_DATA_RESTORE`;
+`BRAVO_BAZA_RECONCILE` — лише під час прийняття мутацій через
+`-Accept`/`-AcceptAll`, перегляд без облікових даних завершується `0`).
+Відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV` дають `30`, у
+`BRAVO_HEALTH` — `70`; повна таблиця — README.md, розділ 4,
+підрозділ «Джерела конфігурації та секретів у 5.3».
 
-**Чого не робити.** Не вписувати пароль у `BRAVO.local.config` (чи в
-legacy `BRAVO.config`). Секрети в конфігурацію не записуються ніколи
-(SECURITY.md, розділ 3).
+**Чого не робити.** Не вписувати секрет у `BRAVO.local.config` чи legacy
+`BRAVO.config`: runtime 5.3 читає секрети лише з Credential Manager, а
+конфігурація містить тільки імена записів (SECURITY.md, розділ 3).
 
 **Діагностика.**
 
