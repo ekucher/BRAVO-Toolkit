@@ -530,3 +530,42 @@ function Test-BRAVOSelfTestDuplicateDefinition {
         -Condition ($selfTestNoPauseElapsed.TotalSeconds -lt 2) `
         -Name "ConsoleUX/30-SelfTestNoPauseStillReturnsImmediately" `
         -Failure "Wait-BRAVOManualExit -NoPause (та сама функція, яку BRAVO_SELF_TEST.ps1 викликає наприкінці) має повертатися миттєво; зайняло $($selfTestNoPauseElapsed.TotalSeconds) с"
+
+    # 31. Очікувані ERROR/WARNING змодельованих сценаріїв self-test не
+    # друкуються червоним/жовтим між рядками [PASS]: під
+    # BRAVO_SELFTEST_SIMULATED_OUTPUT=1 BRAVO.Console приглушує їх до DarkGray,
+    # без змінної (production) кольори Red/Yellow лишаються. BRAVO_SELF_TEST.ps1
+    # виставляє змінну перед зовнішнім try і відновлює її у finally.
+    $detailColorModule = @(Get-Module -Name 'BRAVO.Console') | Select-Object -First 1
+    if ($null -eq $detailColorModule) {
+        $detailColorModule = Import-Module -Name (Join-Path $root 'modules\BRAVO.Console\BRAVO.Console.psd1') -Force -PassThru -ErrorAction Stop
+    }
+    $detailColorPrevious = [Environment]::GetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT')
+    try {
+        [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', '1')
+        $detailColorSelfTestRed = & $detailColorModule { Resolve-BRAVOConsoleDetailColor -Color ([ConsoleColor]::Red) }
+        $detailColorSelfTestYellow = & $detailColorModule { Resolve-BRAVOConsoleDetailColor -Color ([ConsoleColor]::Yellow) }
+        $detailColorSelfTestGreen = & $detailColorModule { Resolve-BRAVOConsoleDetailColor -Color ([ConsoleColor]::Green) }
+        [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', $null)
+        $detailColorProductionRed = & $detailColorModule { Resolve-BRAVOConsoleDetailColor -Color ([ConsoleColor]::Red) }
+        $detailColorProductionYellow = & $detailColorModule { Resolve-BRAVOConsoleDetailColor -Color ([ConsoleColor]::Yellow) }
+    } finally {
+        [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', $detailColorPrevious)
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $detailColorSelfTestRed -eq [ConsoleColor]::DarkGray -and
+            $detailColorSelfTestYellow -eq [ConsoleColor]::DarkGray -and
+            $detailColorSelfTestGreen -eq [ConsoleColor]::Green -and
+            $detailColorProductionRed -eq [ConsoleColor]::Red -and
+            $detailColorProductionYellow -eq [ConsoleColor]::Yellow
+        ) `
+        -Name "ConsoleUX/31-SelfTestSimulatedErrorsNotRed" `
+        -Failure "під BRAVO_SELFTEST_SIMULATED_OUTPUT=1 Red/Yellow деталі мають ставати DarkGray (інші кольори без змін), без змінної — лишатися Red/Yellow; отримано: self-test Red=$detailColorSelfTestRed, Yellow=$detailColorSelfTestYellow, Green=$detailColorSelfTestGreen; production Red=$detailColorProductionRed, Yellow=$detailColorProductionYellow"
+
+    $selfTestSimulatedSetIndex = $selfTestScriptText.IndexOf("[Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', '1')")
+    $selfTestSimulatedRestoreIndex = $selfTestScriptText.IndexOf("[Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', `$script:selfTestSimulatedOutputPrevious)")
+    Test-BRAVOCondition `
+        -Condition ($selfTestSimulatedSetIndex -ge 0 -and $selfTestSimulatedRestoreIndex -gt $selfTestSimulatedSetIndex) `
+        -Name "ConsoleUX/32-SelfTestSetsAndRestoresSimulatedOutputFlag" `
+        -Failure "BRAVO_SELF_TEST.ps1 має виставляти BRAVO_SELFTEST_SIMULATED_OUTPUT=1 перед зовнішнім try і відновлювати попереднє значення у finally"

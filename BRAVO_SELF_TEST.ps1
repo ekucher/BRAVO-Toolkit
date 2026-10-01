@@ -1662,6 +1662,15 @@ function Get-BRAVOSelfTestOwnSourceAst {
 # секціями або збій самого звіту закінчується звітом (чи мінімальним
 # "SELF-TEST FAILED") і ненульовим кодом, а не необробленим винятком.
 # Відступи тіла навмисно не змінено, щоб diff лишився оглядовим.
+#
+# Очікувані ERROR/WARNING змодельованих сценаріїв (Write-Log -> BRAVO.Console)
+# на час прогону друкуються DarkGray, а не червоним/жовтим: між рядками [PASS]
+# вони виглядали як справжні помилки. Вердикт ([FAIL], SELF-TEST FAILED)
+# друкується напряму і лишається червоним. Попереднє значення змінної
+# відновлюється першим рядком зовнішнього finally, щоб консоль, з якої
+# запускали self-test, не успадкувала приглушені кольори.
+$script:selfTestSimulatedOutputPrevious = [Environment]::GetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT')
+[Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', '1')
 try {
 try {
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
@@ -27437,6 +27446,7 @@ Complete-BRAVOSelfTestReport
 } catch {
     Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $_
 } finally {
+    [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', $script:selfTestSimulatedOutputPrevious)
     # Штатний шлях завершується exit усередині Complete-BRAVOHelperLog
     # (ReportIssued уже $true). Сюди без звіту потрапляє лише прогін,
     # що вийшов із тіла в обхід catch — він теж не може дати код 0.
