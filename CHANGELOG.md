@@ -1,5 +1,26 @@
 # Changelog
 
+## 5.2.5-rc.1 — 2026-10-01
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12).
+
+- **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
+  На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
+  піднімає помилку провайдера замість `$false`; під `$ErrorActionPreference = 'Stop'`
+  self-test 5.2.4 обривався з `[FAIL] Fatal` одразу після
+  `DataRestore/PlanInPlaceUsesDiscoveryAndPrerestoreName`, а решта DataRestore-перевірок не
+  виконувалась. Windows CI цього не бачив: там тестове ім'я хоста не резолвиться.
+  Додано helper `Get-BRAVODataRestorePathProbe` (`-ErrorAction Stop` + try/catch ->
+  `Exists`/`Error`); через нього йдуть write-probe free-space preflight (з захистом від
+  нескінченного циклу на корені тому/share), перевірка `-TargetPath` і цілі компонента в
+  `Get-BRAVODataRestorePlan` (недоступність -> класифікована відмова плану, fail-closed) та
+  перевірка out-of-place кореня перед створенням (`RestoreFailed` замість некатегоризованого
+  винятку). Self-test імітує недосяжний хост заглушкою `Test-Path` у script-scope
+  self-test-модуля, тож CI проходить той самий шлях, що й доменний сервер. Нові перевірки:
+  `DataRestore/PlanClassifiesUnreachableUncTarget`,
+  `DataRestore/UnreachableUncTargetIsClassifiedNotFatal`,
+  `DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors`.
+
 ## 5.2.4 — 2026-09-13
 
 Stable promotion від прийнятого `5.2.4-rc.1` (нижче) — real-server acceptance
