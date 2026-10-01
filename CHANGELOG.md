@@ -2,6 +2,24 @@
 
 ## Не випущено (developer)
 
+- **Fix: автоматичний відкат `Update-BRAVOServer.ps1` точний, а не «старе поверх нового» (#289).**
+  Відкат копіював backup поверх runtime без видалення: файли, додані новим релізом, лишалися,
+  відновлений старий `RUNTIME_MANIFEST.json` їх не знав, і `BRAVO_RUNTIME_GUARD` блокував
+  Archive/Maintenance/Health/DataRestore кодом `33`, хоча robocopy звітував про успіх. Крім того,
+  задачі Планувальника лишалися такими, як їх зареєстрував новий реліз. Тепер
+  `deploy\BRAVO.Deploy.Rollback.ps1` (PowerShell без robocopy) відновлює owned-набір дзеркально:
+  staged-файли ∪ ключі нового й старого manifest мінус виключення розгортання (`BRAVO.config`,
+  `BRAVO.local.config`, `LOGS`, `MODEL` тощо); додані новим релізом файли видаляються, змінені й
+  видалені повертаються з backup. Відкат успішний (exit `1`) лише коли хеші runtime == старий
+  manifest, `VERSION.json` стара, guard `0`, `BRAVO_SETUP -Action Scheduler` повторно виконано зі
+  старого комплекту і `-ValidateOnly` пройшов; інакше exit `2` «ВІДКАТ НЕ ВДАВСЯ». Нові self-test
+  перевірки: `Rollback/PremiseNewReleaseBreaksOldManifest`, `Rollback/ChangedFilesRestoredToOldContent`,
+  `Rollback/FilesAddedByNewReleaseRemoved`, `Rollback/FileDeletedByNewReleaseIsRestored`,
+  `Rollback/RuntimeEqualsOldManifestAfterRollback`, `Rollback/OperatorOwnedStateSurvivesUntouched`,
+  `Rollback/VerificationDetectsStrayScriptAndHashDrift`,
+  `Rollback/UpdaterUsesExactRestoreNotRobocopyOverlay`,
+  `Rollback/UpdaterReRegistersSchedulerAndFailsLoudly`.
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях

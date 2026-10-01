@@ -5989,4 +5989,165 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
         -Name "Governance/GenericObjectListBinderPremisesHold" `
         -Failure ("рантайм не збігається з моделлю детектора binder-гейту (джерела, перенос, безпечні форми): " + ($binderGatePremiseMismatches -join '; '))
 }
+
+# =====================================================================
+# Точний відкат Update-BRAVOServer.ps1 (#289)
+# =====================================================================
+# Раніше відкат копіював backup ПОВЕРХ runtime без видалення: файли нового
+# релізу лишались, старий RUNTIME_MANIFEST.json їх не знав, а guard блокував
+# Archive/Maintenance/Health/DataRestore кодом 33. Логіка набору файлів тепер у
+# deploy\BRAVO.Deploy.Rollback.ps1 (без robocopy) і виконується тут реально, на
+# будь-якій ОС. Блок — у власній області (& { ... }) за конвенцією #163.
+& {
+    $rollbackPath = Join-Path (Join-Path $root 'deploy') 'BRAVO.Deploy.Rollback.ps1'
+    $updaterText = [IO.File]::ReadAllText((Join-Path (Join-Path $root 'deploy') 'Update-BRAVOServer.ps1'), [Text.Encoding]::UTF8)
+    . $rollbackPath
+
+    $sandbox = Join-Path ([IO.Path]::GetTempPath()) ('bravo_rb289_' + [guid]::NewGuid().ToString('N'))
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    function Write-RbFile { param([string]$Root, [string]$Rel, [string]$Text)
+        $full = Join-Path $Root ($Rel -replace '\\', [IO.Path]::DirectorySeparatorChar)
+        $dir = [IO.Path]::GetDirectoryName($full)
+        if (-not [IO.Directory]::Exists($dir)) { [void][IO.Directory]::CreateDirectory($dir) }
+        [IO.File]::WriteAllText($full, $Text, $utf8)
+    }
+    function Write-RbManifest { param([string]$Root, [string[]]$Rels)
+        $files = [ordered]@{}
+        foreach ($r in $Rels) {
+            $files[$r] = Get-BRAVODeployFileSha256 -Path (Join-Path $Root ($r -replace '\\', [IO.Path]::DirectorySeparatorChar))
+        }
+        Write-RbFile -Root $Root -Rel 'RUNTIME_MANIFEST.json' -Text ((@{ schemaVersion = 1; files = $files } | ConvertTo-Json -Depth 4))
+    }
+    function Read-RbFile { param([string]$Root, [string]$Rel)
+        $full = Join-Path $Root ($Rel -replace '\\', [IO.Path]::DirectorySeparatorChar)
+        if (-not [IO.File]::Exists($full)) { return $null }
+        return [IO.File]::ReadAllText($full)
+    }
+    function Copy-RbTree { param([string]$From, [string]$To)
+        # Імітація розгортання/backup поверх (без видалення), з виключеннями.
+        foreach ($f in [IO.Directory]::GetFiles($From, '*', [IO.SearchOption]::AllDirectories)) {
+            $rel = $f.Substring($From.Length + 1)
+            $key = ConvertTo-BRAVODeployRelativeKey -Path $rel
+            if (Test-BRAVODeployPathExcluded -RelativeKey $key -ExcludeFiles $script:RbExF -ExcludeDirs $script:RbExD) { continue }
+            $dst = Join-Path $To $rel
+            $d = [IO.Path]::GetDirectoryName($dst)
+            if (-not [IO.Directory]::Exists($d)) { [void][IO.Directory]::CreateDirectory($d) }
+            [IO.File]::Copy($f, $dst, $true)
+        }
+    }
+    $script:RbExF = @('BRAVO.config', 'BRAVO.local.config', 'TOOLS_INTEGRITY.json', 'WinSCP.ini', 'BRAVO_OPERATION.lock')
+    $script:RbExD = @('LOGS', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA', 'BAZA_WWW', 'artifacts')
+
+    try {
+        $rt = Join-Path $sandbox 'runtime'; $new = Join-Path $sandbox 'staged'; $bak = Join-Path $sandbox 'backup'
+
+        # --- старий реліз: A, B, D (+ manifest); site-стан оператора ---
+        Write-RbFile $rt 'A.ps1' 'A-old'
+        Write-RbFile $rt 'B.ps1' 'B-old'
+        Write-RbFile $rt 'modules\M\D.psm1' 'D-old'
+        Write-RbManifest -Root $rt -Rels @('A.ps1', 'B.ps1', 'modules\M\D.psm1')
+        Write-RbFile $rt 'BRAVO.local.config' 'site-old'
+        Write-RbFile $rt 'BRAVO.config' 'cfg-old'
+        Write-RbFile $rt 'LOGS\x.log' 'log-old'
+        Write-RbFile $rt 'MODEL\state.dat' 'model-old'
+        Write-RbFile $rt 'notes_operator.txt' 'op-old'
+        Write-RbFile $rt 'sitelocal\custom.txt' 'site-script'   # файл оператора поза manifest
+
+        # --- backup (як robocopy, LOGS виключено) ---
+        $script:RbExD = @('LOGS')   # backup виключає лише LOGS
+        Copy-RbTree -From $rt -To $bak
+        $script:RbExD = @('LOGS', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA', 'BAZA_WWW', 'artifacts')
+
+        # --- новий реліз: A, B змінено, C додано, D видалено ---
+        Write-RbFile $new 'A.ps1' 'A-new'
+        Write-RbFile $new 'B.ps1' 'B-new'
+        Write-RbFile $new 'C.ps1' 'C-new'
+        Write-RbFile $new 'deploy\E.ps1' 'E-new'
+        Write-RbFile $new 'docs\NEW.md' 'doc-new'
+        Write-RbFile $new 'BRAVO.config' 'cfg-NEW-from-artifact'
+        Write-RbManifest -Root $new -Rels @('A.ps1', 'B.ps1', 'C.ps1', 'deploy\E.ps1')
+
+        # --- розгортання поверх (без видалення) + дія оператора/сервера ---
+        Copy-RbTree -From $new -To $rt
+        Remove-Item -LiteralPath (Join-Path $rt 'modules\M\D.psm1') -Force   # "новий реліз видалив D"
+        Write-RbFile $rt 'LOGS\x.log' 'log-grew-after-deploy'
+        Write-RbFile $rt 'BRAVO.local.config' 'site-edited-after-deploy'
+
+        $before = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $rt -ManifestPath (Join-Path $bak 'RUNTIME_MANIFEST.json')
+        Test-BRAVOCondition `
+            -Condition (-not $before.IsMatch) `
+            -Name "Rollback/PremiseNewReleaseBreaksOldManifest" `
+            -Failure "передумова тесту: розгорнутий новий реліз мусить розходитись зі старим manifest (C, E, A, B, D), інакше тест порожній"
+
+        $rep = Invoke-BRAVODeployExactRestore -RuntimeRoot $rt -BackupRoot $bak -StagedRoot $new `
+            -ExcludeFiles $script:RbExF -ExcludeDirs $script:RbExD
+        $after = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $rt -ManifestPath (Join-Path $bak 'RUNTIME_MANIFEST.json')
+
+        Test-BRAVOCondition `
+            -Condition (@($rep.Errors).Count -eq 0 -and (Read-RbFile $rt 'A.ps1') -eq 'A-old' -and (Read-RbFile $rt 'B.ps1') -eq 'B-old') `
+            -Name "Rollback/ChangedFilesRestoredToOldContent" `
+            -Failure "після відкату A і B мусять бути старими (A-old/B-old), помилок відновлення немає"
+
+        Test-BRAVOCondition `
+            -Condition ($null -eq (Read-RbFile $rt 'C.ps1') -and $null -eq (Read-RbFile $rt 'deploy\E.ps1') -and $null -eq (Read-RbFile $rt 'docs\NEW.md')) `
+            -Name "Rollback/FilesAddedByNewReleaseRemoved" `
+            -Failure "файли, додані новим релізом (C.ps1, deploy\E.ps1, docs\NEW.md), мусять зникнути — інакше guard дасть exit 33 (#289)"
+
+        Test-BRAVOCondition `
+            -Condition ((Read-RbFile $rt 'modules\M\D.psm1') -eq 'D-old') `
+            -Name "Rollback/FileDeletedByNewReleaseIsRestored" `
+            -Failure "файл D, якого немає після нового релізу, мусить повернутися зі старого комплекту"
+
+        Test-BRAVOCondition `
+            -Condition ($after.IsMatch -and @($after.Problems).Count -eq 0) `
+            -Name "Rollback/RuntimeEqualsOldManifestAfterRollback" `
+            -Failure ("runtime після відкату мусить збігатися зі старим manifest і не мати сторонніх скриптів (guard-критерій): " + (@($after.Problems) -join '; '))
+
+        Test-BRAVOCondition `
+            -Condition (
+                (Read-RbFile $rt 'BRAVO.local.config') -eq 'site-edited-after-deploy' -and
+                (Read-RbFile $rt 'BRAVO.config') -eq 'cfg-old' -and
+                (Read-RbFile $rt 'LOGS\x.log') -eq 'log-grew-after-deploy' -and
+                (Read-RbFile $rt 'MODEL\state.dat') -eq 'model-old' -and
+                (Read-RbFile $rt 'notes_operator.txt') -eq 'op-old' -and
+                (Read-RbFile $rt 'sitelocal\custom.txt') -eq 'site-script'
+            ) `
+            -Name "Rollback/OperatorOwnedStateSurvivesUntouched" `
+            -Failure "відкат не має чіпати BRAVO.local.config, BRAVO.config, LOGS, MODEL, файли й каталоги оператора (контракт власності розгортання)"
+
+        # Верифікація має ловити і зайвий скрипт, і зміну вмісту (loud failure).
+        Write-RbFile $rt 'leftover.ps1' 'x'
+        $v1 = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $rt -ManifestPath (Join-Path $bak 'RUNTIME_MANIFEST.json')
+        Remove-Item -LiteralPath (Join-Path $rt 'leftover.ps1') -Force
+        Write-RbFile $rt 'A.ps1' 'A-tampered'
+        $v2 = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $rt -ManifestPath (Join-Path $bak 'RUNTIME_MANIFEST.json')
+        Test-BRAVOCondition `
+            -Condition (-not $v1.IsMatch -and -not $v2.IsMatch) `
+            -Name "Rollback/VerificationDetectsStrayScriptAndHashDrift" `
+            -Failure "верифікація відкату мусить відхиляти сторонній скрипт і розбіжність хешу"
+    } finally {
+        if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- структурні перевірки оркестратора ---
+    $rbStart = $updaterText.IndexOf('ПРОВАЛ ГЕЙТА')
+    $rbText = ''
+    if ($rbStart -ge 0) { $rbText = $updaterText.Substring($rbStart) }
+    Test-BRAVOCondition `
+        -Condition (
+            $updaterText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Deploy.Rollback.ps1'") -and
+            $rbText.Contains('Invoke-BRAVODeployExactRestore') -and
+            $rbText.Contains('Test-BRAVODeployRuntimeMatchesManifest') -and
+            -not ($rbText -match '(?m)^\s*\$rcBack\s*=\s*robocopy')
+        ) `
+        -Name "Rollback/UpdaterUsesExactRestoreNotRobocopyOverlay" `
+        -Failure "відкат Update-BRAVOServer.ps1 мусить викликати Invoke-BRAVODeployExactRestore і верифікацію manifest, а не robocopy backup поверх runtime (#289)"
+    Test-BRAVOCondition `
+        -Condition (
+            $rbText.Contains('-Action Scheduler') -and $rbText.Contains('-ValidateOnly') -and
+            $rbText.Contains('ВІДКАТ НЕ ВДАВСЯ') -and $rbText.Contains('exit 2')
+        ) `
+        -Name "Rollback/UpdaterReRegistersSchedulerAndFailsLoudly" `
+        -Failure "після відкату мусить повторно виконуватись BRAVO_SETUP -Action Scheduler + -ValidateOnly зі старого комплекту, а будь-який збій відкату — exit 2 'ВІДКАТ НЕ ВДАВСЯ' (#289)"
+}
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/GenericObjectListBinderGate' } }
