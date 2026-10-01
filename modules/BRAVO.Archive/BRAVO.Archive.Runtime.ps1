@@ -1353,6 +1353,200 @@ function Test-BRAVOGenerationManifestVerified {
     return $true
 }
 
+function Resolve-BRAVORetentionGenerationManifest {
+    # Retention має бачити ті самі файли generation, що й відновлення
+    # (#335). Шляхи в manifest-і абсолютні; після перенесення сховища на
+    # інший диск/корінь (задокументований DR-сценарій) вони вказують у
+    # нікуди, хоча архіви лежать у канонічному каталозі компонента. Тому
+    # використовується та сама canonical rebasing-політика, що в
+    # BRAVO_DATA_RESTORE і BRAVO_RESTORE_TEST
+    # (ConvertTo-BRAVORebasedLocalGenerationManifest: лише leaf-ім'я +
+    # archiveDefinitions[Type].Destination). Записаний шлях лишається в
+    # пріоритеті, якщо файл за ним існує і лежить у BackupRoot: так
+    # generation, створена до зміни каталогу компонента, не губить свої
+    # файли. Без ArchiveDefinitions manifest повертається без змін.
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [object[]]$ArchiveDefinitions
+    )
+
+    $componentNames = @()
+    if ($null -ne $Manifest.PSObject.Properties['components'] -and $null -ne $Manifest.components) {
+        $componentNames = @($Manifest.components.PSObject.Properties | ForEach-Object { $_.Name })
+    }
+    if ($componentNames.Count -eq 0 -or $null -eq $ArchiveDefinitions -or $ArchiveDefinitions.Count -eq 0) {
+        return $Manifest
+    }
+
+    $resolvedManifest = ConvertTo-BRAVORebasedLocalGenerationManifest `
+        -Manifest $Manifest `
+        -ComponentTypes $componentNames `
+        -ArchiveDefinitions @($ArchiveDefinitions)
+    foreach ($componentProperty in @($Manifest.components.PSObject.Properties)) {
+        $resolvedComponent = $resolvedManifest.components.PSObject.Properties[$componentProperty.Name].Value
+        foreach ($fieldName in @('ArchivePath', 'HashPath')) {
+            $recordedProperty = $componentProperty.Value.PSObject.Properties[$fieldName]
+            if ($null -eq $recordedProperty) { continue }
+            $recordedPath = [string]$recordedProperty.Value
+            if (-not [string]::IsNullOrWhiteSpace($recordedPath) -and
+                (Test-Path -LiteralPath $recordedPath -PathType Leaf) -and
+                (Test-BRAVOBackupArtifactPathSafe -Path $recordedPath -BackupRoot $BackupRoot)) {
+                $resolvedComponent.$fieldName = $recordedPath
+            }
+        }
+    }
+    return $resolvedManifest
+}
+
+function Get-BRAVOUnreferencedBackupArchives {
+    # Архіви в канонічних каталогах компонентів, на які не посилається
+    # жоден придатний generation manifest: архіви версій до generation-
+    # схеми, архіви з пошкодженим/невідповідним manifest-ом, залишки
+    # ручних дій. Лише звіт (#335, рішення власника 2026-10-01):
+    # автоматично такі файли не видаляються.
+    param(
+        [object[]]$ArchiveDefinitions,
+        [hashtable]$ReferencedArchiveNames
+    )
+
+    $count = 0
+    [long]$sizeBytes = 0
+    $filter = if (-not [string]::IsNullOrWhiteSpace([string]$archiveFileFilter)) { [string]$archiveFileFilter } else { '*.mdz' }
+    $seenDirectories = @{}
+    foreach ($definition in @($ArchiveDefinitions)) {
+        $destination = [string]$definition.Destination
+        if ([string]::IsNullOrWhiteSpace($destination) -or $seenDirectories.ContainsKey($destination)) { continue }
+        $seenDirectories[$destination] = $true
+        if (-not (Test-Path -LiteralPath $destination -PathType Container)) { continue }
+        foreach ($archive in @(Get-BRAVOFiles -LiteralPath $destination -Filter $filter)) {
+            if ($archive.PSIsContainer) { continue }
+            if ($null -ne $ReferencedArchiveNames -and $ReferencedArchiveNames.ContainsKey($archive.Name)) { continue }
+            $count++
+            $sizeBytes += [long]$archive.Length
+        }
+    }
+    return [pscustomobject]@{ Count = $count; SizeBytes = $sizeBytes }
+}
+
+function Resolve-BRAVORetentionDailyCopySelection {
+    # retentionDailyCopySelection (#335): яку з кількох COMPLETE копій
+    # одного дня лишати після retentionAllCopiesDays. 'Latest' — останню
+    # за день (зазвичай нічну); 'HH:mm' — найближчу до цього часу (для
+    # нічного прогону, що стартує вже після опівночі). Будь-що інше не
+    # застосовується: Valid=$false, і викликач бере Latest.
+    param([object]$Value)
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrEmpty($text) -or
+        [string]::Equals($text, 'Latest', [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ Mode = 'Latest'; Time = $null; Valid = $true }
+    }
+    if ($text -match '^(?<Hour>[01]?\d|2[0-3]):(?<Minute>[0-5]\d)$') {
+        $time = New-Object TimeSpan -ArgumentList ([int]$Matches.Hour), ([int]$Matches.Minute), 0
+        return [pscustomobject]@{ Mode = 'Time'; Time = $time; Valid = $true }
+    }
+    return [pscustomobject]@{ Mode = 'Latest'; Time = $null; Valid = $false }
+}
+
+function Get-BRAVORetentionDailyKeeperIds {
+    # По одній generation на календарний день (за StartedAt), обраній за
+    # Resolve-BRAVORetentionDailyCopySelection. Повертає hashtable
+    # GenerationId -> $true. Рівновіддалені від заданого часу копії —
+    # лишається пізніша.
+    param(
+        [object[]]$Records,
+        [Parameter(Mandatory = $true)][object]$Selection
+    )
+
+    $keepers = @{}
+    foreach ($dayGroup in @($Records | Where-Object { $null -ne $_ } | Group-Object { $_.StartedAt.Date.ToString('yyyyMMdd') })) {
+        $ordered = @($dayGroup.Group | Sort-Object StartedAt -Descending)
+        $keeper = $ordered[0]
+        if ([string]$Selection.Mode -eq 'Time') {
+            $bestDistance = $null
+            foreach ($candidate in $ordered) {
+                $distance = [math]::Abs(($candidate.StartedAt.TimeOfDay - $Selection.Time).TotalMinutes)
+                if ($null -eq $bestDistance -or $distance -lt $bestDistance) {
+                    $bestDistance = $distance
+                    $keeper = $candidate
+                }
+            }
+        }
+        $keepers[[string]$keeper.GenerationId] = $true
+    }
+    return $keepers
+}
+
+function Get-BRAVORetentionCalendarKeeperIds {
+    # Схема Д/Т/М/Р (retentionScheme = 'Calendar', #335, рішення власника
+    # 2026-10-01). Спершу з кожного дня береться одна копія
+    # (Get-BRAVORetentionDailyKeeperIds), далі лишаються:
+    #   Daily   — копії Daily найновіших днів;
+    #   Weekly  — найновіша денна копія кожного з Weekly найновіших тижнів
+    #             (тиждень з понеділка);
+    #   Monthly — найновіша денна копія кожного з Monthly найновіших місяців;
+    #   Yearly  — найновіша денна копія кожного з Yearly найновіших років.
+    # Поточні тиждень/місяць/рік теж рахуються: це лише лишає більше копій.
+    # Повертає hashtable GenerationId -> $true.
+    param(
+        [object[]]$Records,
+        [Parameter(Mandatory = $true)][object]$Selection,
+        [int]$Daily,
+        [int]$Weekly,
+        [int]$Monthly,
+        [int]$Yearly
+    )
+
+    $keepers = @{}
+    $dailyKeeperIds = Get-BRAVORetentionDailyKeeperIds -Records $Records -Selection $Selection
+    $dayCopies = @($Records | Where-Object {
+        $null -ne $_ -and $dailyKeeperIds.ContainsKey([string]$_.GenerationId)
+    } | Sort-Object StartedAt -Descending)
+
+    foreach ($dayCopy in @($dayCopies | Select-Object -First ([math]::Max(0, $Daily)))) {
+        $keepers[[string]$dayCopy.GenerationId] = $true
+    }
+    $periods = @(
+        @{ Count = $Weekly; Key = { param($d) $d.Date.AddDays(-((([int]$d.DayOfWeek) + 6) % 7)).ToString('yyyyMMdd') } },
+        @{ Count = $Monthly; Key = { param($d) $d.ToString('yyyyMM') } },
+        @{ Count = $Yearly; Key = { param($d) $d.ToString('yyyy') } }
+    )
+    foreach ($period in $periods) {
+        if ($period.Count -le 0) { continue }
+        $seenPeriods = @{}
+        foreach ($dayCopy in $dayCopies) {
+            $periodKey = & $period.Key $dayCopy.StartedAt
+            if ($seenPeriods.ContainsKey($periodKey)) { continue }
+            if ($seenPeriods.Count -ge $period.Count) { break }
+            $seenPeriods[$periodKey] = $true
+            $keepers[[string]$dayCopy.GenerationId] = $true
+        }
+    }
+    return $keepers
+}
+
+function Get-BRAVORetentionIntegerSetting {
+    # Ціле налаштування retention без падіння під StrictMode на старому
+    # конфігу: відсутнє, некоректне чи від'ємне значення = Default.
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [int]$Default,
+        [switch]$AllowZero
+    )
+
+    $value = Get-Variable -Name $Name -ValueOnly -ErrorAction SilentlyContinue
+    try {
+        if ($null -ne $value) {
+            $number = [int]$value
+            if ($number -gt 0 -or ($AllowZero -and $number -eq 0)) { return $number }
+        }
+    } catch {
+        # Некоректне число не дає права видаляти більше.
+    }
+    return $Default
+}
+
 function Remove-BRAVOExpiredBackupGenerations {
     param(
         [Parameter(Mandatory = $true)][string]$BackupRoot,
@@ -1371,13 +1565,19 @@ function Remove-BRAVOExpiredBackupGenerations {
         # тихо обгортається назад у НОВИЙ PSReference замість звичайного
         # int; наступний $x++/$x += кидає "operator works only on numbers"
         # (підтверджено реальним запуском — саме так спершу й було зроблено).
-        [ref]$RemovedGenerationCount
+        [ref]$RemovedGenerationCount,
+        # Канонічні каталоги компонентів (#335): rebasing шляхів manifest-а
+        # як у відновленні і звіт про архіви без manifest-а. Без параметра
+        # шляхи беруться з manifest-а як є, а звіт не будується.
+        [object[]]$ArchiveDefinitions
     )
 
     if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return $false }
     $deletedGenerationCount = 0
     $deletedVerifiedExpiredCount = 0
     $deletedFailedIncompleteCount = 0
+    $corruptGenerationIds = @()
+    $failedDeletionIds = @()
     try {
         $validRetentionDays = if ($RetentionDays -gt 0) { $RetentionDays } else { 183 }
         $invalidRetentionDays = if ($failedArchiveRetentionDays -gt 0) { [int]$failedArchiveRetentionDays } else { 30 }
@@ -1385,11 +1585,11 @@ function Remove-BRAVOExpiredBackupGenerations {
         $invalidCutoff = (Get-Date).AddDays(-$invalidRetentionDays)
         $records = @()
         # dev.14: MANIFESTS-first reader (з fallback на legacy корінь
-        # BackupRoot) вирішує, ЯКИЙ вміст (Status/StartedAt/VerifiedComplete)
-        # керує рішенням про видалення generation. ManifestPath нижче — лише
-        # шлях ЦІЄЇ конкретної, обраної для рішення копії; фактичне видалення
-        # (нижче) не покладається на це поле — воно шукає й прибирає ВСІ
-        # фізичні копії manifest-а через Get-BRAVOBackupGenerationManifestPhysicalFiles.
+        # BackupRoot) вирішує, ЯКИЙ вміст (Status/StartedAt) керує рішенням
+        # про видалення generation. ManifestPath нижче — лише шлях ЦІЄЇ
+        # конкретної, обраної для рішення копії; фактичне видалення (нижче)
+        # не покладається на це поле — воно шукає й прибирає ВСІ фізичні
+        # копії manifest-а через Get-BRAVOBackupGenerationManifestPhysicalFiles.
         foreach ($manifestFile in @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $BackupRoot)) {
             try {
                 $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
@@ -1426,33 +1626,117 @@ function Remove-BRAVOExpiredBackupGenerations {
                 $records += [pscustomobject]@{
                     GenerationId = $generationId
                     Status = [string]$manifest.status
+                    IsComplete = ([string]$manifest.status -eq 'COMPLETE')
                     StartedAt = $startedAt
-                    Manifest = $manifest
+                    Manifest = Resolve-BRAVORetentionGenerationManifest `
+                        -Manifest $manifest `
+                        -BackupRoot $BackupRoot `
+                        -ArchiveDefinitions $ArchiveDefinitions
                     ManifestPath = $manifestFile.FullName
-                    VerifiedComplete = Test-BRAVOGenerationManifestVerified -Manifest $manifest
                 }
             } catch {
                 Write-BRAVOLog -Component 'CLEANUP' -Message "Generation manifest збережено без змін через parse error: $($manifestFile.FullName) ($($_.Exception.Message))" -Level 'WARNING'
             }
         }
 
+        # Захищені generation (#335): N найновіших COMPLETE, що СЬОГОДНІ
+        # проходять повну перевірку (архів + hash-файл + SHA512). SHA512
+        # рахується лише тут і лише доки не знайдено N цілих копій — не для
+        # усього сховища щоночі. COMPLETE generation, що не пройшла
+        # перевірку, не захищається, але й ніколи не потрапляє в гілку
+        # невдалих: пошкодження — привід для попередження, а не для
+        # прибирання.
         $minimumRetainedCount = if ($minimumRetainedVerifiedBackups -gt 0) {
             [int]$minimumRetainedVerifiedBackups
         } else { 1 }
-        $protectedGenerationIds = @(
-            $records |
-                Where-Object { $_.VerifiedComplete } |
-                Sort-Object StartedAt -Descending |
-                Select-Object -First $minimumRetainedCount |
-                ForEach-Object { $_.GenerationId }
-        )
+        $protectedGenerationIds = @()
+        foreach ($record in @($records | Where-Object { $_.IsComplete } | Sort-Object StartedAt -Descending)) {
+            if ($protectedGenerationIds.Count -ge $minimumRetainedCount) { break }
+            if (Test-BRAVOGenerationManifestVerified -Manifest $record.Manifest) {
+                $protectedGenerationIds += $record.GenerationId
+                continue
+            }
+            $corruptGenerationIds += $record.GenerationId
+            Write-BRAVOLog -Component 'CLEANUP' -Message (
+                "Резервна копія $($record.GenerationId) має статус COMPLETE, але не пройшла перевірку " +
+                "(архів чи hash-файл відсутній або SHA512 не збігається). Вона не рахується серед " +
+                "$minimumRetainedCount захищених копій і не видаляється як невдала"
+            ) -Level 'WARNING'
+        }
+
+        # Проріджування (#335, рішення власника 2026-10-01): якщо копії
+        # робляться кілька разів на день, COMPLETE копії старші за
+        # retentionAllCopiesDays лишаються по одній на день
+        # (retentionDailyCopySelection). Діє лише при enableArchiveDeletion,
+        # як і будь-яке видалення COMPLETE generation. Значення читаються
+        # через Get-Variable: старий конфіг без цих листів не повинен
+        # падати під StrictMode.
+        $allCopiesDays = Get-BRAVORetentionIntegerSetting -Name 'retentionAllCopiesDays' -Default 30
+        $allCopiesCutoff = (Get-Date).AddDays(-$allCopiesDays)
+        $dailySelection = Resolve-BRAVORetentionDailyCopySelection `
+            -Value (Get-Variable -Name 'retentionDailyCopySelection' -ValueOnly -ErrorAction SilentlyContinue)
+        if (-not $dailySelection.Valid) {
+            Write-BRAVOLog -Component 'CLEANUP' -Message (
+                "retentionDailyCopySelection має некоректне значення; очікується 'Latest' або час 'HH:mm'. " +
+                "Застосовано 'Latest' (лишається остання копія за день)"
+            ) -Level 'WARNING'
+        }
+        $dailyKeeperIds = Get-BRAVORetentionDailyKeeperIds `
+            -Records @($records | Where-Object { $_.IsComplete -and $_.StartedAt -lt $allCopiesCutoff }) `
+            -Selection $dailySelection
+        $deletedThinnedCount = 0
+
+        # Схема зберігання COMPLETE копій: 'Age' (типово) — за
+        # archiveRetentionDays; 'Calendar' — Д/Т/М/Р без межі за віком.
+        # Обидві діють лише при enableArchiveDeletion (типово вимкнено).
+        $schemeValue = [string](Get-Variable -Name 'retentionScheme' -ValueOnly -ErrorAction SilentlyContinue)
+        $calendarScheme = [string]::Equals($schemeValue.Trim(), 'Calendar', [StringComparison]::OrdinalIgnoreCase)
+        $calendarKeeperIds = @{}
+        if ($calendarScheme) {
+            $calendarDaily = Get-BRAVORetentionIntegerSetting -Name 'retentionDailyCopies' -Default 14 -AllowZero
+            $calendarWeekly = Get-BRAVORetentionIntegerSetting -Name 'retentionWeeklyCopies' -Default 8 -AllowZero
+            $calendarMonthly = Get-BRAVORetentionIntegerSetting -Name 'retentionMonthlyCopies' -Default 6 -AllowZero
+            $calendarYearly = Get-BRAVORetentionIntegerSetting -Name 'retentionYearlyCopies' -Default 0 -AllowZero
+            if (($calendarDaily + $calendarWeekly + $calendarMonthly + $calendarYearly) -le 0) {
+                # Схема без жодної копії видалила б усю історію, крім
+                # захищених: найімовірніше помилка конфігурації.
+                $calendarScheme = $false
+                Write-BRAVOLog -Component 'CLEANUP' -Message (
+                    "retentionScheme = 'Calendar', але всі retentionDailyCopies/WeeklyCopies/MonthlyCopies/YearlyCopies " +
+                    "дорівнюють 0. Застосовано схему за віком (archiveRetentionDays)"
+                ) -Level 'WARNING'
+            } else {
+                $calendarKeeperIds = Get-BRAVORetentionCalendarKeeperIds `
+                    -Records @($records | Where-Object { $_.IsComplete }) `
+                    -Selection $dailySelection `
+                    -Daily $calendarDaily -Weekly $calendarWeekly `
+                    -Monthly $calendarMonthly -Yearly $calendarYearly
+                Write-BRAVOLog -Component 'CLEANUP' -Message (
+                    "Схема зберігання Д/Т/М/Р: $calendarDaily/$calendarWeekly/$calendarMonthly/$calendarYearly; " +
+                    "усі копії за останні $allCopiesDays днів; видалення " +
+                    $(if ([bool]$enableArchiveDeletion) { 'увімкнено' } else { 'вимкнено (enableArchiveDeletion = $false)' })
+                ) -Level 'INFO'
+            }
+        }
 
         foreach ($record in @($records | Sort-Object StartedAt)) {
             if ($record.GenerationId -eq $CurrentGenerationId) { continue }
+            # Гілку визначає записаний статус прогону, а не сьогоднішня
+            # перевірка (#335): COMPLETE видаляється лише за строком
+            # зберігання і лише при enableArchiveDeletion; невдала чи
+            # незавершена — за failedArchiveRetentionDays.
             $deleteGeneration = $false
-            if ($record.VerifiedComplete) {
+            $thinnedCopy = $false
+            if ($record.IsComplete -and $calendarScheme) {
                 $deleteGeneration = [bool]$enableArchiveDeletion -and
-                    $record.StartedAt -lt $validCutoff -and
+                    $record.StartedAt -lt $allCopiesCutoff -and
+                    -not $calendarKeeperIds.ContainsKey([string]$record.GenerationId) -and
+                    $record.GenerationId -notin $protectedGenerationIds
+            } elseif ($record.IsComplete) {
+                $thinnedCopy = $record.StartedAt -lt $allCopiesCutoff -and
+                    -not $dailyKeeperIds.ContainsKey([string]$record.GenerationId)
+                $deleteGeneration = [bool]$enableArchiveDeletion -and
+                    ($record.StartedAt -lt $validCutoff -or $thinnedCopy) -and
                     $record.GenerationId -notin $protectedGenerationIds
             } else {
                 $deleteGeneration = [bool]$enableFailedArchiveDeletion -and
@@ -1460,35 +1744,94 @@ function Remove-BRAVOExpiredBackupGenerations {
             }
             if (-not $deleteGeneration) { continue }
 
-            Show-ArchiveCleanupSection -SectionShown $CleanupSectionShown
-            foreach ($component in @(Get-BRAVOGenerationManifestComponents -Manifest $record.Manifest)) {
-                foreach ($artifactPath in @([string]$component.ArchivePath, [string]$component.HashPath)) {
-                    if ([string]::IsNullOrWhiteSpace($artifactPath) -or
-                        -not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) { continue }
-                    if (-not (Test-BRAVOBackupArtifactPathSafe -Path $artifactPath -BackupRoot $BackupRoot)) {
-                        throw "manifest references artifact outside BackupRoot: $artifactPath"
+            # Помилка на одній generation не зупиняє решту (#335): інакше
+            # один заблокований файл блокував би прибирання щоночі.
+            try {
+                # Усі шляхи перевіряються ДО першого видалення: generation
+                # з артефактом поза BackupRoot не чіпається взагалі.
+                $artifactPaths = @()
+                $missingArtifactCount = 0
+                foreach ($component in @(Get-BRAVOGenerationManifestComponents -Manifest $record.Manifest)) {
+                    foreach ($artifactPath in @([string]$component.ArchivePath, [string]$component.HashPath)) {
+                        if ([string]::IsNullOrWhiteSpace($artifactPath)) { continue }
+                        if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+                            $missingArtifactCount++
+                            continue
+                        }
+                        if (-not (Test-BRAVOBackupArtifactPathSafe -Path $artifactPath -BackupRoot $BackupRoot)) {
+                            throw "manifest references artifact outside BackupRoot: $artifactPath"
+                        }
+                        $artifactPaths += $artifactPath
                     }
+                }
+
+                Show-ArchiveCleanupSection -SectionShown $CleanupSectionShown
+                foreach ($artifactPath in $artifactPaths) {
                     Remove-Item -LiteralPath $artifactPath -Force -ErrorAction Stop
                 }
+                # Manifest видаляється останнім і лише після того, як усі
+                # знайдені архіви цієї generation видалено. Якщо видалення
+                # архіву впало, manifest лишається, і наступний прогін
+                # доведе generation до кінця, а не залишить сирітські архіви.
+                # dev.14: видаляється КОЖНА фізична копія manifest-а цієї
+                # generation (MANIFESTS і, за наявності, legacy-корінь), а не
+                # лише та, яку MANIFESTS-first reader повернув для рішення про
+                # видалення. Інакше conflict-копія в іншому розташуванні
+                # переживає видалення й на наступному запуску "воскрешає"
+                # видалену generation через legacy fallback читання.
+                foreach ($physicalManifest in @(
+                    Get-BRAVOBackupGenerationManifestPhysicalFiles `
+                        -BackupRoot $BackupRoot `
+                        -GenerationId $record.GenerationId
+                )) {
+                    Remove-Item -LiteralPath $physicalManifest.FullName -Force -ErrorAction Stop
+                }
+                $missingNote = if ($missingArtifactCount -gt 0) { "; файлів, яких уже не було: $missingArtifactCount" } else { '' }
+                $thinnedNote = if ($record.IsComplete -and $calendarScheme) {
+                    '; поза схемою Д/Т/М/Р'
+                } elseif ($record.IsComplete -and $thinnedCopy -and $record.StartedAt -ge $validCutoff) {
+                    '; не остання копія за день, старша за retentionAllCopiesDays'
+                } else { '' }
+                Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено backup generation $($record.GenerationId) ($($record.Status))$thinnedNote$missingNote" -Level 'SUCCESS'
+                if ($thinnedNote) {
+                    $deletedThinnedCount++
+                } elseif ($record.IsComplete) {
+                    $deletedVerifiedExpiredCount++
+                } else {
+                    $deletedFailedIncompleteCount++
+                }
+                $deletedGenerationCount++
+            } catch {
+                $failedDeletionIds += $record.GenerationId
+                Write-BRAVOLog -Component 'CLEANUP' -Message (
+                    "Не вдалося видалити backup generation $($record.GenerationId): $($_.Exception.Message). " +
+                    "Manifest збережено, решта generation обробляється далі"
+                ) -Level 'ERROR'
             }
-            # dev.14: видаляється КОЖНА фізична копія manifest-а цієї
-            # generation (MANIFESTS і, за наявності, legacy-корінь), а не
-            # лише та, яку MANIFESTS-first reader повернув для рішення про
-            # видалення. Інакше conflict-копія в іншому розташуванні
-            # переживає видалення й на наступному запуску "воскрешає"
-            # видалену generation через legacy fallback читання.
-            foreach ($physicalManifest in @(
-                Get-BRAVOBackupGenerationManifestPhysicalFiles `
-                    -BackupRoot $BackupRoot `
-                    -GenerationId $record.GenerationId
-            )) {
-                Remove-Item -LiteralPath $physicalManifest.FullName -Force -ErrorAction Stop
-            }
-            Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено backup generation $($record.GenerationId) ($($record.Status))" -Level 'SUCCESS'
-            if ($record.VerifiedComplete) { $deletedVerifiedExpiredCount++ } else { $deletedFailedIncompleteCount++ }
-            $deletedGenerationCount++
         }
         if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
+
+        $unreferencedArchives = [pscustomobject]@{ Count = 0; SizeBytes = [long]0 }
+        if ($null -ne $ArchiveDefinitions -and $ArchiveDefinitions.Count -gt 0) {
+            $referencedArchiveNames = @{}
+            foreach ($record in $records) {
+                foreach ($component in @(Get-BRAVOGenerationManifestComponents -Manifest $record.Manifest)) {
+                    $archiveName = Get-BRAVOVerifiedArtifactLeafName -Value ([string]$component.ArchivePath)
+                    if ($null -ne $archiveName) { $referencedArchiveNames[$archiveName] = $true }
+                }
+            }
+            $unreferencedArchives = Get-BRAVOUnreferencedBackupArchives `
+                -ArchiveDefinitions $ArchiveDefinitions `
+                -ReferencedArchiveNames $referencedArchiveNames
+            if ($unreferencedArchives.Count -gt 0) {
+                Write-BRAVOLog -Component 'CLEANUP' -Message (
+                    "Архівів без generation manifest-а: $($unreferencedArchives.Count) " +
+                    "($([math]::Round($unreferencedArchives.SizeBytes / 1GB, 2)) ГБ). " +
+                    "Автоматично не видаляються; перевірте їх вручну"
+                ) -Level 'INFO'
+            }
+        }
+
         # Один підсумковий рядок на прогін: скільки generation оцінено,
         # скільки захищено мінімальним порогом verified-копій (і які саме —
         # для forensic-діагностики), скільки реально видалено з розбивкою за
@@ -1499,150 +1842,18 @@ function Remove-BRAVOExpiredBackupGenerations {
         # "{0}/{1}/{2}" (діагностика без чисел, помічено на acceptance).
         Write-BRAVOLog -Component 'CLEANUP' -Message (
             ("Аудит retention: generation оцінено={0}; захищено (verified)={1} [{2}]; " +
-             "видалено (verified, прострочено)={3}; видалено (failed/incomplete, прострочено)={4}") -f
+             "пошкоджено (COMPLETE, не пройшли перевірку)={3}; " +
+             "видалено (COMPLETE, прострочено)={4}; видалено (проріджено або поза схемою Д/Т/М/Р)={5}; " +
+             "видалено (failed/incomplete, прострочено)={6}; " +
+             "помилок видалення={7}; архівів без manifest-а={8}") -f
             $records.Count, $protectedGenerationIds.Count, ($protectedGenerationIds -join ', '),
-            $deletedVerifiedExpiredCount, $deletedFailedIncompleteCount
+            $corruptGenerationIds.Count, $deletedVerifiedExpiredCount, $deletedThinnedCount,
+            $deletedFailedIncompleteCount, $failedDeletionIds.Count, $unreferencedArchives.Count
         ) -Level 'INFO'
-        return $true
+        return ($failedDeletionIds.Count -eq 0)
     } catch {
         if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
         Write-BRAVOLog -Component 'CLEANUP' -Message "Generation-aware retention failed: $($_.Exception.Message)" -Level 'ERROR'
-        return $false
-    }
-}
-
-function Remove-OldBackupSets {
-    param(
-        [string]$Path,
-        [int]$RetentionDays,
-        [string]$Component,
-        [ref]$CleanupSectionShown
-    )
-
-    $failedArchiveDeletionEnabled = ($null -eq $enableFailedArchiveDeletion) -or [bool]$enableFailedArchiveDeletion
-    if (-not $enableArchiveDeletion -and -not $failedArchiveDeletionEnabled) {
-        return $true
-    }
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-        Write-BRAVOLog -Component 'CLEANUP' -Message "Шлях архівів не знайдено: $Path" -Level "WARNING"
-        return $false
-    }
-
-    try {
-        $invalidRetentionDays = if ($null -ne $failedArchiveRetentionDays) {
-            [math]::Max(1, [int]$failedArchiveRetentionDays)
-        } else {
-            30
-        }
-        $invalidCutoff = (Get-Date).AddDays(-$invalidRetentionDays)
-        # Захист для старих конфігів без archiveRetentionDays: ніколи не
-        # зменшуємо строк зберігання до одного дня через значення $null/0.
-        $validRetentionDays = if ($RetentionDays -gt 0) {
-            [int]$RetentionDays
-        } else {
-            183
-        }
-        $validCutoff = (Get-Date).AddDays(-$validRetentionDays)
-        $validSets = @()
-        foreach ($archive in @(Get-BRAVOFiles -Path $Path -Filter $archiveFileFilter)) {
-            $hashPath = "$($archive.FullName)$hashFileExtension"
-            $setValid = $false
-            $invalidReason = ""
-            try {
-                if (-not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
-                    throw "відсутній hash-файл"
-                }
-                $hashText = ([System.IO.File]::ReadAllText($hashPath)).Trim([char]0xFEFF).Trim()
-                if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$') {
-                    throw "некоректний формат hash-файлу"
-                }
-                if ($Matches.FileName -cne $archive.Name) {
-                    throw "hash-файл належить іншому архіву"
-                }
-                $expectedHash = $Matches.Hash.ToUpperInvariant()
-                $actualHash = (Get-BRAVOFileHash -Path $archive.FullName -Algorithm SHA512).Hash.ToUpperInvariant()
-                if ($actualHash -cne $expectedHash) {
-                    throw "SHA512 не збігається"
-                }
-                $setValid = $true
-            } catch {
-                $invalidReason = $_.Exception.Message
-            }
-
-            if ($setValid) {
-                $validSets += [pscustomobject]@{
-                    Archive = $archive
-                    HashPath = $hashPath
-                }
-            } elseif ($failedArchiveDeletionEnabled -and $archive.LastWriteTime -lt $invalidCutoff) {
-                Show-ArchiveCleanupSection -SectionShown $CleanupSectionShown
-                Write-BRAVOLog -Component 'CLEANUP' -Message "Видалення непридатного комплекту ${Component}, старшого за $invalidRetentionDays днів: $($archive.Name) — $invalidReason" -Level "WARNING"
-                Remove-Item -LiteralPath $archive.FullName -Force -ErrorAction Stop
-                if (Test-Path -LiteralPath $hashPath -PathType Leaf) {
-                    Remove-Item -LiteralPath $hashPath -Force -ErrorAction Stop
-                }
-            } else {
-                Write-BRAVOLog -Component 'CLEANUP' -Message "Непридатний комплект збережено для діагностики: $($archive.Name) — $invalidReason" -Level "WARNING"
-            }
-        }
-        $validSets = @($validSets | Sort-Object { $_.Archive.LastWriteTime } -Descending)
-
-        foreach ($orphanHash in @(Get-BRAVOFiles -Path $Path -Filter "*$hashFileExtension")) {
-            $archivePath = $orphanHash.FullName.Substring(0, $orphanHash.FullName.Length - $hashFileExtension.Length)
-            if ($failedArchiveDeletionEnabled -and
-                -not (Test-Path -LiteralPath $archivePath -PathType Leaf) -and
-                $orphanHash.LastWriteTime -lt $invalidCutoff) {
-                Show-ArchiveCleanupSection -SectionShown $CleanupSectionShown
-                Remove-Item -LiteralPath $orphanHash.FullName -Force -ErrorAction Stop
-                Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено застарілий hash-файл без архіву: $($orphanHash.Name)" -Level "WARNING"
-            }
-        }
-
-        if (-not $enableArchiveDeletion) {
-            return $true
-        }
-
-        # Зберігання коректних комплектів визначається календарним віком, а не
-        # кількістю запусків: додатковий ручний бекап не скорочує строк зберігання.
-        #
-        # Інваріант (аудит P1.7): retention, прив'язаний лише до днів, міг
-        # видалити останні перевірені покоління після серії невдалих backup,
-        # якщо всі valid-комплекти виявлялись старшими за cutoff. $validSets
-        # уже відсортовано за спаданням LastWriteTime (найновіші перші), тому
-        # Select-Object -Skip лишає N найновіших недоторканими незалежно від
-        # їхнього віку.
-        $minimumRetainedCount = if ($null -ne $minimumRetainedVerifiedBackups -and
-            [int]$minimumRetainedVerifiedBackups -gt 0) {
-            [int]$minimumRetainedVerifiedBackups
-        } else {
-            1
-        }
-        $protectedSets = @($validSets | Select-Object -First $minimumRetainedCount)
-        $deletionCandidates = @($validSets | Select-Object -Skip $minimumRetainedCount)
-        $protectedFromExpiry = @($protectedSets | Where-Object {
-            $_.Archive.LastWriteTime -lt $validCutoff
-        })
-        foreach ($protectedSet in $protectedFromExpiry) {
-            Write-BRAVOLog -Component 'CLEANUP' -Message "Комплект ${Component} старший за $validRetentionDays днів, але збережений — це одна з останніх $minimumRetainedCount перевірених копій: $($protectedSet.Archive.Name)" -Level "WARNING"
-        }
-        $setsToDelete = @($deletionCandidates | Where-Object {
-            $_.Archive.LastWriteTime -lt $validCutoff
-        })
-        foreach ($set in $setsToDelete) {
-            Show-ArchiveCleanupSection -SectionShown $CleanupSectionShown
-            # Спочатку видаляється великий архів. Якщо видалення hash-файлу
-            # не вдасться, залишиться лише безпечний сирота, а не архів без hash.
-            Remove-Item -LiteralPath $set.Archive.FullName -Force -ErrorAction Stop
-            try {
-                Remove-Item -LiteralPath $set.HashPath -Force -ErrorAction Stop
-            } catch {
-                Write-BRAVOLog -Component 'CLEANUP' -Message "Архів видалено, але не вдалося видалити його hash-файл $($set.HashPath): $($_.Exception.Message)" -Level "WARNING"
-            }
-            Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено комплект ${Component}, старший за $validRetentionDays днів: $($set.Archive.Name)" -Level "SUCCESS"
-        }
-        return $true
-    } catch {
-        Write-BRAVOLog -Component 'CLEANUP' -Message "Помилка очищення комплектів ${Component}: $($_.Exception.Message)" -Level "ERROR"
         return $false
     }
 }
@@ -7961,7 +8172,8 @@ function Main {
                 -CurrentGenerationId $generationId `
                 -RetentionDays $effectiveArchiveRetentionDays `
                 -CleanupSectionShown ([ref]$archiveCleanupSectionShown) `
-                -RemovedGenerationCount ([ref]$generationCleanupDeletedCount))) {
+                -RemovedGenerationCount ([ref]$generationCleanupDeletedCount) `
+                -ArchiveDefinitions @($archiveDefinitions))) {
             $operationFailed = $true
             $generationCleanupSucceeded = $false
         }

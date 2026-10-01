@@ -312,6 +312,22 @@
     # 'enableFailedArchiveDeletion' = $true
     # 'enableOrphanTempCleanup' = $true
     # 'orphanTempRetentionHours' = 48
+    # Кілька копій за день: молодші за retentionAllCopiesDays зберігаються
+    # всі, старші проріджуються до однієї за день (діє при
+    # enableArchiveDeletion = $true). retentionDailyCopySelection:
+    # 'Latest' — остання за день (зазвичай нічна); 'HH:mm' (наприклад
+    # '23:00') — найближча до цього часу.
+    # 'retentionAllCopiesDays' = 30
+    # 'retentionDailyCopySelection' = 'Latest'
+    # Схема зберігання (діє лише при enableArchiveDeletion = $true):
+    # 'Age' — за archiveRetentionDays (типово); 'Calendar' — Д/Т/М/Р:
+    # Д останніх днів, Т тижнів, М місяців, Р років, по одній копії
+    # на період. Копії, молодші за retentionAllCopiesDays, лишаються всі.
+    # 'retentionScheme' = 'Calendar'
+    # 'retentionDailyCopies' = 14
+    # 'retentionWeeklyCopies' = 8
+    # 'retentionMonthlyCopies' = 6
+    # 'retentionYearlyCopies' = 0
     # Разове очищення legacy-каталогу архівів (сумісність):
     # 'enableLunchArchiveCleanup' = $true
     # 'lunchArchiveCleanupPath' = 'E:\Archiv'

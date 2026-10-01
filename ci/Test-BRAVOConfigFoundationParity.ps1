@@ -531,6 +531,18 @@ $knownIntentionalDiffPrefixes = @(
     'schedulerSettings.BackupCatchUp.ScriptPath',
     'schedulerSettings.BackupCatchUp.StartupDelayMinutes',
     'schedulerSettings.BackupCatchUp.TaskName',
+    # Retention (#335, рішення власника 2026-10-01) — сім нових canonical
+    # leaves: проріджування старших копій до однієї на день і схема
+    # Д/Т/М/Р. У BEFORE (42cf9ad) їх не існує (BEFORE=<<ABSENT>>); типові
+    # значення (retentionScheme=Age, enableArchiveDeletion=$false без змін)
+    # поведінку не змінюють. Перелічено ПОІМЕННО за тим самим правилом.
+    'retentionAllCopiesDays',
+    'retentionDailyCopySelection',
+    'retentionScheme',
+    'retentionDailyCopies',
+    'retentionWeeklyCopies',
+    'retentionMonthlyCopies',
+    'retentionYearlyCopies',
     # Секція 5, задокументований canonical-default фікс (перевірено
     # окремим self-test ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults):
     # "E:\Archiv" (застарілий placeholder BRAVO.config) -> "" (canonical).

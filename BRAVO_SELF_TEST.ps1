@@ -7885,44 +7885,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $archiveScriptText.Contains('$record.GenerationId -eq $CurrentGenerationId') -and
             $archiveScriptText.Contains('$record.GenerationId -notin $protectedGenerationIds') -and
             $archiveScriptText.Contains('minimumRetainedVerifiedBackups') -and
-            $archiveScriptText.Contains('Select-Object -First $minimumRetainedCount') -and
+            $archiveScriptText.Contains('$protectedGenerationIds.Count -ge $minimumRetainedCount') -and
             $bravoConfigTextForRetention.Contains('$global:minimumRetainedVerifiedBackups')
         ) `
         -Name "BackupConsistency/RetentionNeverDeletesLastVerified" `
         -Failure "generation-aware retention має захищати current і N найновіших verified COMPLETE generations незалежно від archiveRetentionDays"
-
-    # Archive.Runtime.ps1 безумовно запускає Main при dot-source, тому саму
-    # функцію Remove-OldBackupSets тут викликати небезпечно. Натомість
-    # відтворюємо той самий алгоритм відбору (Select-Object -First/-Skip на
-    # відсортованому за спаданням часу списку) на синтетичних даних — це
-    # функціональна, а не текстова перевірка інваріанту "останню перевірену
-    # копію не видаляти", яку одна лише текстова перевірка вище довести не може.
-    # Навмисно всі три "покоління" старші за cutoff — саме такий сценарій
-    # (серія невдалих backup, лише старі перевірені копії) і був не захищений
-    # до цього виправлення: без Select-Object -First найновіший теж потрапляв
-    # у $setsToDelete.
-    $retentionSimulationSets = @(
-        [pscustomobject]@{ Name = "gen1_newest"; LastWriteTime = (Get-Date).AddDays(-190) },
-        [pscustomobject]@{ Name = "gen2_old"; LastWriteTime = (Get-Date).AddDays(-200) },
-        [pscustomobject]@{ Name = "gen3_oldest"; LastWriteTime = (Get-Date).AddDays(-400) }
-    ) | Sort-Object LastWriteTime -Descending
-    $retentionSimulationCutoff = (Get-Date).AddDays(-183)
-    $retentionSimulationProtected = @($retentionSimulationSets | Select-Object -First 1)
-    $retentionSimulationCandidates = @($retentionSimulationSets | Select-Object -Skip 1)
-    $retentionSimulationToDelete = @($retentionSimulationCandidates | Where-Object {
-        $_.LastWriteTime -lt $retentionSimulationCutoff
-    })
-    Test-BRAVOCondition `
-        -Condition (
-            $retentionSimulationProtected.Count -eq 1 -and
-            $retentionSimulationProtected[0].Name -eq "gen1_newest" -and
-            $retentionSimulationToDelete.Count -eq 2 -and
-            ($retentionSimulationToDelete.Name -contains "gen2_old") -and
-            ($retentionSimulationToDelete.Name -contains "gen3_oldest") -and
-            -not ($retentionSimulationToDelete.Name -contains "gen1_newest")
-        ) `
-        -Name "BackupConsistency/RetentionSelectionAlgorithm" `
-        -Failure "алгоритм відбору на видалення (Select-Object -First/-Skip найновіших перевірених комплектів) має завжди виключати найновіший комплект, навіть коли він старший за retention cutoff"
 
     $generationVerifierModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $archiveScriptText `
@@ -24220,12 +24187,12 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $archiveNewSha512HashCallAsts.Count -eq 1 -and
-            $archiveGetFileHashCallAsts.Count -eq 4 -and
+            $archiveGetFileHashCallAsts.Count -eq 3 -and
             $null -ne $archiveHashWorkCallAst -and
             $archiveHashWorkCallAst.Extent.StartOffset -eq $archiveNewSha512HashCallAsts[0].Extent.StartOffset
         ) `
         -Name 'Archive/HashBusinessCallsRemainUnchanged' `
-        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
+        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 3 рази (четвертий виклик був у мертвій Remove-OldBackupSets, видаленій у #335); знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' } }
 
     # Archive (P2-1/P2-5, PR #136 review): рекурсивне впорядкування SFTP-

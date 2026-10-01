@@ -1707,9 +1707,35 @@ checks, acceptance) — у `RELEASE_POLICY.md` у корені репозито�
 - перед production-змінами завжди виконуйте self-test, `-ValidateOnly` і
   dry-run;
 - `enableArchiveDeletion` ніколи не видаляє останні `minimumRetainedVerifiedBackups`
-  (за замовчуванням `1`) перевірених (SHA512 збігається) комплектів кожного
-  компонента, навіть якщо вони старші за `archiveRetentionDays` — серія
-  невдалих backup не повинна лишити компонент без жодної придатної копії;
+  (за замовчуванням `2`) COMPLETE generation, що проходять повну перевірку
+  (архів і hash-файл кожного компонента на місці, SHA512 збігається), навіть
+  якщо вони старші за `archiveRetentionDays`. Захист рахується по generation
+  цілком, а не окремо по компонентах — серія невдалих backup не повинна
+  лишити сервер без жодної придатної копії;
+- гілку видалення визначає записаний статус прогону: COMPLETE generation
+  видаляється лише за `archiveRetentionDays` і лише при
+  `enableArchiveDeletion = $true`; generation, що не завершилась COMPLETE, —
+  за `failedArchiveRetentionDays` при `enableFailedArchiveDeletion`.
+  COMPLETE generation, що сьогодні не проходить перевірку, лише дає WARNING
+  про пошкоджену копію і ніколи не видаляється як невдала;
+- шляхи до архівів retention шукає так само, як відновлення: за записаним
+  шляхом, а якщо його немає — у канонічному каталозі компонента (сховище,
+  перенесене на інший диск). Manifest видаляється лише після всіх знайдених
+  архівів своєї generation; помилка на одній generation не зупиняє решту.
+  Архіви без generation manifest-а лише рахуються в рядку «Аудит retention»
+  і автоматично не видаляються;
+- якщо копії робляться кілька разів на день, COMPLETE копії, старші за
+  `retentionAllCopiesDays` (типово `30`), проріджуються до однієї за день
+  (лише при `enableArchiveDeletion = $true`). Яку саме лишати, задає
+  `retentionDailyCopySelection`: `Latest` (типово, остання за день, зазвичай
+  нічна) або час `HH:mm`, наприклад `23:00` — тоді лишається найближча до
+  нього копія. Некоректне значення дає WARNING і працює як `Latest`;
+- `retentionScheme` обирає схему зберігання COMPLETE копій: `Age` (типово) —
+  за `archiveRetentionDays`; `Calendar` — Д/Т/М/Р: `retentionDailyCopies`
+  останніх днів, `retentionWeeklyCopies` тижнів, `retentionMonthlyCopies`
+  місяців і `retentionYearlyCopies` років (типово 14/8/6/0), по одній копії на
+  період, без межі за віком. Обидві схеми діють лише при
+  `enableArchiveDeletion = $true`, яке типово вимкнене;
 - помилки завантаження `BRAVO.config` і читання Credential Manager
   (SFTP/SMB/архів/webhook) маскуються `Protect-BRAVOLogSecret` одразу при
   захопленні винятку, а не лише при подальшому записі в лог — ці

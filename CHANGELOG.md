@@ -2,6 +2,48 @@
 
 ## Не випущено (developer)
 
+- **Fix: retention більше не видаляє COMPLETE generation як «невдалу» (#335).**
+  `Remove-BRAVOExpiredBackupGenerations` визначав гілку видалення сьогоднішньою повторною
+  перевіркою, а не записаним статусом прогону. Через це COMPLETE generation, у якої один
+  компонент пошкоджено або архіви лежать не за записаним абсолютним шляхом (сховище
+  перенесено на інший диск), видалялась через `failedArchiveRetentionDays` навіть при
+  `enableArchiveDeletion = $false`: разом із цілими архівами інших компонентів, а після
+  перенесення — лише manifest-и, з архівами-сиротами назавжди. Тепер:
+  - COMPLETE видаляється лише за `archiveRetentionDays`; пошкоджена COMPLETE дає WARNING;
+  - шляхи перебудовуються тією самою політикою, що у відновленні
+    (`ConvertTo-BRAVORebasedLocalGenerationManifest`), через новий
+    `Resolve-BRAVORetentionGenerationManifest`;
+  - manifest видаляється лише після всіх знайдених архівів; помилка на одній generation
+    не зупиняє прибирання решти;
+  - SHA512 рахується лише для пошуку `minimumRetainedVerifiedBackups` захищених копій,
+    а не для всього сховища щоночі;
+  - архіви без manifest-а (`Get-BRAVOUnreferencedBackupArchives`) рахуються в рядку
+    «Аудит retention» і не видаляються;
+  - нове: кілька копій за день старші за `retentionAllCopiesDays` (типово 30)
+    проріджуються до однієї за день; яку лишати — `retentionDailyCopySelection`
+    (`Latest` або `HH:mm`). Діє лише при `enableArchiveDeletion = $true`;
+  - нове: схема зберігання Д/Т/М/Р (`retentionScheme = 'Calendar'`,
+    `retentionDailyCopies`/`WeeklyCopies`/`MonthlyCopies`/`YearlyCopies`, типово 14/8/6/0).
+    Типово `retentionScheme = 'Age'` і `enableArchiveDeletion = $false`, тож поведінка
+    без явного налаштування не змінюється.
+  Сім нових канонічних листів (6 ALLOW_SITE, `retentionScheme` ALLOW_WITH_VALIDATOR
+  `Enum:Age,Calendar`): контракт 277 -> 284.
+  Видалено функцію `Remove-OldBackupSets`, яка ніде не викликалась, і її симуляційний
+  self-test `BackupConsistency/RetentionSelectionAlgorithm`. README виправлено: типово
+  `minimumRetainedVerifiedBackups = 2`, захист рахується по generation. Тест
+  `BackupConsistency/CorruptNewestGenerationFallsToFailedBranchAndOlderVerifiedSurvives`
+  перейменовано на `BackupConsistency/CorruptNewestGenerationIsNotProtectedAndOlderVerifiedSurvives`.
+  Нові self-test перевірки: `BackupConsistency/CompleteGenerationIsNeverDeletedAsFailed`,
+  `BackupConsistency/FailedGenerationStillExpiresByFailedRetention`,
+  `BackupConsistency/RelocatedRepositoryKeepsCompleteManifests`,
+  `BackupConsistency/RelocatedRepositoryExpiryDeletesArchivesWithManifest`,
+  `BackupConsistency/RetentionFailureOnOneGenerationDoesNotStopOthers`,
+  `BackupConsistency/UnreferencedArchivesAreReportedNotDeleted`,
+  `BackupConsistency/OlderCopiesThinnedToOnePerDay`,
+  `BackupConsistency/ThinningRequiresArchiveDeletionEnabled`,
+  `BackupConsistency/CalendarSchemeDeletesNothingByDefault`,
+  `BackupConsistency/CalendarSchemeKeepsDailyWeeklyMonthlyYearly`.
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`

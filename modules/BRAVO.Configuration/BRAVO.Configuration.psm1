@@ -314,6 +314,13 @@ function Get-BRAVODefaultConfiguration {
         enableFailedArchiveDeletion = $true
         enableOrphanTempCleanup = $true
         orphanTempRetentionHours = 48
+        retentionAllCopiesDays = 30
+        retentionDailyCopySelection = "Latest"
+        retentionScheme = "Age"
+        retentionDailyCopies = 14
+        retentionWeeklyCopies = 8
+        retentionMonthlyCopies = 6
+        retentionYearlyCopies = 0
         enableLunchArchiveCleanup = $false
         lunchArchiveCleanupPath = ""
         lunchArchiveCleanupDirectories = @("MODEL", "BLOG", "BRAVOEXCH")

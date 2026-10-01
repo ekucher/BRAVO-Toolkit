@@ -513,12 +513,12 @@ function Test-BRAVOConfigurationOverrideSchema {
 # узагалі й проходить повз цей шар так само, як повз type-перевірку.
 # Це свідоме узгодження з D3, не недогляд (WAVE2-CONTRACT.md, розділ 5/11.3).
 #
-# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 277 канонічних листів (а не
+# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 284 канонічних листів (а не
 # лише на DENY/VALIDATOR-підмножину) — навмисно: WAVE2-CONTRACT.md
 # (розділ 8/11.3) вимагає, щоб кожен НОВИЙ канонічний лист отримував
 # явне класифікаційне рішення (навіть якщо це явний ALLOW_SITE), а не
 # мовчазний allow-by-omission. Повнота реєстру перевіряється в
-# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "277/277
+# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "284/284
 # coverage" — фейлить, якщо реєстр і канонічна схема розійшлися в
 # обидва боки: зайвий запис АБО відсутній запис); у цьому модулі немає
 # окремої функції з такою назвою.
@@ -853,6 +853,18 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'progressSettings.ShowRobocopyOutput' = @{ Class = 'ALLOW_SITE' }
     'progressSettings.ShowSevenZipOutput' = @{ Class = 'ALLOW_SITE' }
     'progressSettings.ShowWinSCPOutput' = @{ Class = 'ALLOW_SITE' }
+    # Проріджування кількох копій за день (#335, рішення власника
+    # 2026-10-01): site-рішення про глибину історії. Некоректне значення
+    # retentionDailyCopySelection рантайм не застосовує: WARNING і Latest.
+    'retentionAllCopiesDays' = @{ Class = 'ALLOW_SITE' }
+    'retentionDailyCopySelection' = @{ Class = 'ALLOW_SITE' }
+    # Схема Д/Т/М/Р (#335). Age — попередня поведінка за
+    # archiveRetentionDays; Calendar — Д/Т/М/Р. Кількості — site-рішення.
+    'retentionScheme' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:Age,Calendar' }
+    'retentionDailyCopies' = @{ Class = 'ALLOW_SITE' }
+    'retentionWeeklyCopies' = @{ Class = 'ALLOW_SITE' }
+    'retentionMonthlyCopies' = @{ Class = 'ALLOW_SITE' }
+    'retentionYearlyCopies' = @{ Class = 'ALLOW_SITE' }
     'requireAdministrator' = @{ Class = 'DENY_SECURITY_CONTROL'; WeakeningOverride = 'ExistingSecurityEscapeHatch' }
     'restoreVerifySettings.MaxVerificationAgeHours' = @{ Class = 'ALLOW_SITE' }
     'restoreVerifySettings.MinimumFileCount' = @{ Class = 'ALLOW_SITE' }

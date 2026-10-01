@@ -336,6 +336,12 @@ function Write-BRAVOLog {
         -SourceText ($archiveRuntimeTextForSizeSanity + [Environment]::NewLine + $manifestStorageLogStub) `
         -FunctionNames @(
             'Remove-BRAVOExpiredBackupGenerations',
+            'Resolve-BRAVORetentionGenerationManifest',
+            'Get-BRAVOUnreferencedBackupArchives',
+            'Resolve-BRAVORetentionDailyCopySelection',
+            'Get-BRAVORetentionDailyKeeperIds',
+            'Get-BRAVORetentionCalendarKeeperIds',
+            'Get-BRAVORetentionIntegerSetting',
             'Get-BRAVOGenerationManifestComponents',
             'Test-BRAVOGenerationManifestVerified',
             'Show-ArchiveCleanupSection',
@@ -450,7 +456,8 @@ function Write-BRAVOLog {
     # запису .sha512) не повинна витісняти справді валідну СТАРІШУ
     # generation із захищеного (protected) набору. VerifiedComplete
     # переперевіряє SHA512 на диску (не лише вірить полю status), тому
-    # пошкоджена generation падає у failed/incomplete-гілку, а старша валідна
+    # пошкоджена generation не захищається і видаляється лише за строком
+    # зберігання (#335: не гілкою невдалих), а старша валідна
     # лишається захищеною — цей сценарій раніше не мав ЄДИНОГО end-to-end
     # тесту (окремо тестувались пошкодження хешу й окремо selection-алгоритм).
     $corruptNewestTestRoot = Join-Path `
@@ -517,8 +524,8 @@ function Write-BRAVOLog {
                     (Test-Path -LiteralPath $olderValidFiles.ArchivePath) -and
                     (Test-Path -LiteralPath $olderValidFiles.HashPath)
                 ) `
-                -Name "BackupConsistency/CorruptNewestGenerationFallsToFailedBranchAndOlderVerifiedSurvives" `
-                -Failure "пошкоджена НАЙНОВІША generation (SHA512 не збігається) має падати у failed/incomplete-гілку і видалятись за failedArchiveRetentionDays, а СТАРІША справді валідна generation має лишатись захищеною, попри те, що вона хронологічно старіша"
+                -Name "BackupConsistency/CorruptNewestGenerationIsNotProtectedAndOlderVerifiedSurvives" `
+                -Failure "пошкоджена НАЙНОВІША generation (SHA512 не збігається) не повинна рахуватися серед захищених і видаляється лише за строком зберігання, а СТАРІША справді валідна generation має лишатись захищеною, попри те, що вона хронологічно старіша"
         } finally {
             Remove-Item -Path Variable:\global:enableArchiveDeletion, `
                 Variable:\global:enableFailedArchiveDeletion, `
@@ -530,6 +537,353 @@ function Write-BRAVOLog {
     } finally {
         if (Test-Path -LiteralPath $corruptNewestTestRoot) {
             Remove-Item -LiteralPath $corruptNewestTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- #335: гілку видалення визначає записаний статус прогону, а не
+    # сьогоднішня перевірка; шляхи manifest-а перебудовуються як у
+    # відновленні; помилка на одній generation не зупиняє інші; архіви без
+    # manifest-а лише рахуються. Реальна Remove-BRAVOExpiredBackupGenerations
+    # на тимчасовому дереві MODEL\ + BLOG\ + MANIFESTS\.
+    function New-BRAVORetentionComponentFixture {
+        param(
+            [string]$Root,
+            [string]$GenerationId,
+            [datetime]$StartedAt,
+            [string]$Status = 'COMPLETE',
+            [string[]]$Components = @('MODEL', 'BLOG'),
+            [string[]]$CorruptComponents = @(),
+            # Корінь, записаний у manifest (інший диск до перенесення).
+            [string]$RecordedRoot
+        )
+        $recordRoot = if ([string]::IsNullOrWhiteSpace($RecordedRoot)) { $Root } else { $RecordedRoot }
+        $componentsJson = @()
+        foreach ($component in $Components) {
+            $directory = Join-Path $Root $component
+            [void][IO.Directory]::CreateDirectory($directory)
+            $archiveName = "{0}_{1}.mdz" -f $component, $GenerationId
+            $archivePath = Join-Path $directory $archiveName
+            [IO.File]::WriteAllText($archivePath, ("payload-{0}-{1}" -f $component, $GenerationId))
+            $hash = (Get-BRAVOFileHash -Path $archivePath -Algorithm SHA512).Hash
+            [IO.File]::WriteAllText($archivePath + '.sha512', ("{0} *{1}" -f $hash.ToLowerInvariant(), $archiveName))
+            if ($CorruptComponents -contains $component) {
+                [IO.File]::AppendAllText($archivePath, 'corruption')
+            }
+            $recordedArchivePath = Join-Path (Join-Path $recordRoot $component) $archiveName
+            $componentsJson += (
+                '"{0}":{{"CreateSuccess":true,"IntegritySuccess":true,"HashSuccess":true,' +
+                '"ArchivePath":"{1}","HashPath":"{2}"}}'
+            ) -f $component, $recordedArchivePath.Replace('\', '\\'), ($recordedArchivePath + '.sha512').Replace('\', '\\')
+        }
+        [void][IO.Directory]::CreateDirectory((Join-Path $Root 'MANIFESTS'))
+        $manifestPath = Join-Path $Root ("MANIFESTS\BRAVO_BACKUP_{0}.json" -f $GenerationId)
+        [IO.File]::WriteAllText($manifestPath, (
+            '{{"generationId":"{0}","status":"{1}","startedAt":"{2}","components":{{{3}}}}}' -f
+            $GenerationId, $Status, $StartedAt.ToString('yyyy-MM-ddTHH:mm:ss'), ($componentsJson -join ',')
+        ))
+        return $manifestPath
+    }
+
+    function Invoke-BRAVORetentionFixtureCleanup {
+        param([string]$Root, [string]$CurrentGenerationId, [object[]]$ArchiveDefinitions)
+        $sectionShown = $false
+        return (& $retentionCleanupModule {
+            param($BackupRoot, $CurrentId, $Definitions, $SectionShownRef)
+            Remove-BRAVOExpiredBackupGenerations `
+                -BackupRoot $BackupRoot `
+                -CurrentGenerationId $CurrentId `
+                -RetentionDays 183 `
+                -CleanupSectionShown $SectionShownRef `
+                -ArchiveDefinitions $Definitions
+        } $Root $CurrentGenerationId $ArchiveDefinitions ([ref]$sectionShown))
+    }
+
+    function Get-BRAVORetentionFixtureDefinitions {
+        param([string]$Root)
+        return @(
+            @{ Type = 'MODEL'; Destination = (Join-Path $Root 'MODEL') },
+            @{ Type = 'BLOG'; Destination = (Join-Path $Root 'BLOG') }
+        )
+    }
+
+    $retentionStatusTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_RETENTION_STATUS_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    $global:enableFailedArchiveDeletion = $true
+    $global:failedArchiveRetentionDays = 30
+    $global:minimumRetainedVerifiedBackups = 2
+    $global:progressSettings = $null
+    try {
+        # Сценарій 1: COMPLETE generation 41 дня з пошкодженим BLOG при
+        # enableArchiveDeletion=$false. Раніше вона йшла у гілку невдалих
+        # і видалялась разом із цілим MODEL.
+        $global:enableArchiveDeletion = $false
+        $statusRoot = Join-Path $retentionStatusTestRoot 'corrupt-component'
+        $corruptComponentManifest = New-BRAVORetentionComponentFixture -Root $statusRoot `
+            -GenerationId '20260821_230000' -StartedAt (Get-Date).AddDays(-41) -CorruptComponents @('BLOG')
+        [void](New-BRAVORetentionComponentFixture -Root $statusRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
+        [void](New-BRAVORetentionComponentFixture -Root $statusRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $corruptComponentOk = Invoke-BRAVORetentionFixtureCleanup -Root $statusRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $statusRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $corruptComponentOk -eq $true -and
+                (Test-Path -LiteralPath $corruptComponentManifest) -and
+                (Test-Path -LiteralPath (Join-Path $statusRoot 'MODEL\MODEL_20260821_230000.mdz')) -and
+                (Test-Path -LiteralPath (Join-Path $statusRoot 'BLOG\BLOG_20260821_230000.mdz'))
+            ) `
+            -Name "BackupConsistency/CompleteGenerationIsNeverDeletedAsFailed" `
+            -Failure "COMPLETE generation, що сьогодні не проходить перевірку, не повинна видалятися гілкою failedArchiveRetentionDays (особливо при enableArchiveDeletion=false): разом із пошкодженим компонентом зникали цілі архіви інших компонентів"
+
+        # Невдала (не COMPLETE) generation старша за 30 днів і далі
+        # прибирається, навіть коли enableArchiveDeletion вимкнено.
+        $failedStatusManifest = New-BRAVORetentionComponentFixture -Root $statusRoot `
+            -GenerationId '20260801_230000' -StartedAt (Get-Date).AddDays(-61) -Status 'FAILED'
+        $failedStatusOk = Invoke-BRAVORetentionFixtureCleanup -Root $statusRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $statusRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $failedStatusOk -eq $true -and
+                -not (Test-Path -LiteralPath $failedStatusManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path $statusRoot 'MODEL\MODEL_20260801_230000.mdz')) -and
+                (Test-Path -LiteralPath $corruptComponentManifest)
+            ) `
+            -Name "BackupConsistency/FailedGenerationStillExpiresByFailedRetention" `
+            -Failure "generation зі статусом не COMPLETE, старша за failedArchiveRetentionDays, має видалятися разом з архівами незалежно від enableArchiveDeletion"
+
+        # Сценарій 2: сховище перенесено, manifest-и вказують на старий
+        # корінь. Відновлення бачить архіви в канонічних каталогах — retention
+        # має бачити їх так само: не видаляти manifest-и COMPLETE generation
+        # при enableArchiveDeletion=$false і не лишати сиріт при $true.
+        $relocatedRoot = Join-Path $retentionStatusTestRoot 'relocated'
+        $relocatedOldRoot = Join-Path $retentionStatusTestRoot 'old-disk-that-no-longer-exists'
+        $relocatedExpiredManifest = New-BRAVORetentionComponentFixture -Root $relocatedRoot `
+            -GenerationId '20260301_230000' -StartedAt (Get-Date).AddDays(-200) -RecordedRoot $relocatedOldRoot
+        $relocatedMidManifest = New-BRAVORetentionComponentFixture -Root $relocatedRoot `
+            -GenerationId '20260815_230000' -StartedAt (Get-Date).AddDays(-47) -RecordedRoot $relocatedOldRoot
+        [void](New-BRAVORetentionComponentFixture -Root $relocatedRoot -GenerationId '20260930_230000' `
+            -StartedAt (Get-Date).AddDays(-1) -RecordedRoot $relocatedOldRoot)
+        [void](New-BRAVORetentionComponentFixture -Root $relocatedRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $relocatedDefinitions = Get-BRAVORetentionFixtureDefinitions -Root $relocatedRoot
+        $relocatedKeepOk = Invoke-BRAVORetentionFixtureCleanup -Root $relocatedRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions $relocatedDefinitions
+        Test-BRAVOCondition `
+            -Condition (
+                $relocatedKeepOk -eq $true -and
+                (Test-Path -LiteralPath $relocatedExpiredManifest) -and
+                (Test-Path -LiteralPath $relocatedMidManifest)
+            ) `
+            -Name "BackupConsistency/RelocatedRepositoryKeepsCompleteManifests" `
+            -Failure "після перенесення сховища manifest-и COMPLETE generation не повинні видалятися як невдалі лише тому, що записаний абсолютний шлях більше не існує"
+
+        $global:enableArchiveDeletion = $true
+        $relocatedDeleteOk = Invoke-BRAVORetentionFixtureCleanup -Root $relocatedRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions $relocatedDefinitions
+        Test-BRAVOCondition `
+            -Condition (
+                $relocatedDeleteOk -eq $true -and
+                -not (Test-Path -LiteralPath $relocatedExpiredManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path $relocatedRoot 'MODEL\MODEL_20260301_230000.mdz')) -and
+                -not (Test-Path -LiteralPath (Join-Path $relocatedRoot 'BLOG\BLOG_20260301_230000.mdz.sha512')) -and
+                (Test-Path -LiteralPath $relocatedMidManifest) -and
+                (Test-Path -LiteralPath (Join-Path $relocatedRoot 'MODEL\MODEL_20260930_230000.mdz'))
+            ) `
+            -Name "BackupConsistency/RelocatedRepositoryExpiryDeletesArchivesWithManifest" `
+            -Failure "прострочена generation у перенесеному сховищі має видалятися разом з архівами з канонічних каталогів компонентів, а не лише manifest-ом (інакше архіви лишаються сиротами назавжди)"
+
+        # Сценарій 3: помилка на одній generation (артефакт поза BackupRoot)
+        # не зупиняє прибирання наступних; manifest проблемної generation
+        # лишається, функція повертає $false.
+        $isolationRoot = Join-Path $retentionStatusTestRoot 'isolation'
+        $outsideRoot = Join-Path $retentionStatusTestRoot 'outside'
+        [void][IO.Directory]::CreateDirectory((Join-Path $outsideRoot 'MODEL'))
+        $outsideArchive = Join-Path $outsideRoot 'MODEL\MODEL_20260101_230000.mdz'
+        [IO.File]::WriteAllText($outsideArchive, 'outside payload')
+        [void][IO.Directory]::CreateDirectory((Join-Path $isolationRoot 'MANIFESTS'))
+        $outsideManifest = Join-Path $isolationRoot 'MANIFESTS\BRAVO_BACKUP_20260101_230000.json'
+        [IO.File]::WriteAllText($outsideManifest, (
+            '{{"generationId":"20260101_230000","status":"FAILED","startedAt":"{0}","components":{{"MODEL":{{"ArchivePath":"{1}","HashPath":""}}}}}}' -f
+            (Get-Date).AddDays(-270).ToString('yyyy-MM-ddTHH:mm:ss'), $outsideArchive.Replace('\', '\\')
+        ))
+        $isolationLaterManifest = New-BRAVORetentionComponentFixture -Root $isolationRoot `
+            -GenerationId '20260201_230000' -StartedAt (Get-Date).AddDays(-240) -Status 'FAILED'
+        [void](New-BRAVORetentionComponentFixture -Root $isolationRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $isolationOk = Invoke-BRAVORetentionFixtureCleanup -Root $isolationRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions @()
+        Test-BRAVOCondition `
+            -Condition (
+                $isolationOk -eq $false -and
+                (Test-Path -LiteralPath $outsideManifest) -and
+                (Test-Path -LiteralPath $outsideArchive) -and
+                -not (Test-Path -LiteralPath $isolationLaterManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path $isolationRoot 'MODEL\MODEL_20260201_230000.mdz'))
+            ) `
+            -Name "BackupConsistency/RetentionFailureOnOneGenerationDoesNotStopOthers" `
+            -Failure "помилка видалення однієї generation має позначати прогін як невдалий, лишати її manifest і НЕ зупиняти прибирання наступних прострочених generation"
+
+        # Сценарій 4: архіви без manifest-а лише рахуються.
+        $orphanReportRoot = Join-Path $retentionStatusTestRoot 'orphan-report'
+        [void](New-BRAVORetentionComponentFixture -Root $orphanReportRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $legacyArchive = Join-Path $orphanReportRoot 'MODEL\MODEL_legacy_20250101.mdz'
+        [IO.File]::WriteAllText($legacyArchive, 'legacy payload')
+        $orphanReport = & $retentionCleanupModule {
+            param($Definitions)
+            Get-BRAVOUnreferencedBackupArchives `
+                -ArchiveDefinitions $Definitions `
+                -ReferencedArchiveNames @{ 'MODEL_20261001_230000.mdz' = $true; 'BLOG_20261001_230000.mdz' = $true }
+        } (Get-BRAVORetentionFixtureDefinitions -Root $orphanReportRoot)
+        $orphanReportOk = Invoke-BRAVORetentionFixtureCleanup -Root $orphanReportRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $orphanReportRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $orphanReport.Count -eq 1 -and
+                $orphanReport.SizeBytes -eq (Get-Item -LiteralPath $legacyArchive).Length -and
+                $orphanReportOk -eq $true -and
+                (Test-Path -LiteralPath $legacyArchive)
+            ) `
+            -Name "BackupConsistency/UnreferencedArchivesAreReportedNotDeleted" `
+            -Failure "архіви без generation manifest-а мають рахуватися у звіті retention і ніколи не видалятися автоматично"
+
+        # Сценарій 5: кілька копій за день. Молодші за
+        # retentionAllCopiesDays лишаються всі; старші — одна за день
+        # (Latest або найближча до HH:mm). Невалідне значення = Latest.
+        function New-BRAVOThinningFixture {
+            param([string]$Root)
+            $oldDay = (Get-Date).Date.AddDays(-40)
+            $recentDay = (Get-Date).Date.AddDays(-10)
+            $fixture = @{}
+            foreach ($slot in @(
+                @{ Key = 'OldLunch'; Id = $oldDay.ToString('yyyyMMdd') + '_130000'; At = $oldDay.AddHours(13) },
+                @{ Key = 'OldNight'; Id = $oldDay.ToString('yyyyMMdd') + '_230000'; At = $oldDay.AddHours(23) },
+                @{ Key = 'RecentLunch'; Id = $recentDay.ToString('yyyyMMdd') + '_130000'; At = $recentDay.AddHours(13) },
+                @{ Key = 'RecentNight'; Id = $recentDay.ToString('yyyyMMdd') + '_230000'; At = $recentDay.AddHours(23) }
+            )) {
+                $fixture[$slot.Key] = New-BRAVORetentionComponentFixture -Root $Root `
+                    -GenerationId $slot.Id -StartedAt $slot.At -Components @('MODEL')
+            }
+            [void](New-BRAVORetentionComponentFixture -Root $Root -GenerationId '20990101_230000' `
+                -StartedAt (Get-Date).AddMinutes(-5) -Components @('MODEL'))
+            [void](New-BRAVORetentionComponentFixture -Root $Root -GenerationId '20990102_230000' `
+                -StartedAt (Get-Date).AddMinutes(-1) -Components @('MODEL'))
+            return $fixture
+        }
+        $global:enableArchiveDeletion = $true
+        $global:retentionAllCopiesDays = 30
+        $thinningResults = @{}
+        foreach ($selectionCase in @(
+            @{ Name = 'Latest'; Value = 'Latest'; Keep = 'OldNight'; Drop = 'OldLunch' },
+            @{ Name = 'Time'; Value = '13:00'; Keep = 'OldLunch'; Drop = 'OldNight' },
+            @{ Name = 'Invalid'; Value = 'вночі'; Keep = 'OldNight'; Drop = 'OldLunch' }
+        )) {
+            $global:retentionDailyCopySelection = $selectionCase.Value
+            $thinningRoot = Join-Path $retentionStatusTestRoot ("thinning-" + $selectionCase.Name)
+            $thinningFixture = New-BRAVOThinningFixture -Root $thinningRoot
+            $thinningOk = Invoke-BRAVORetentionFixtureCleanup -Root $thinningRoot `
+                -CurrentGenerationId '20990102_230000' -ArchiveDefinitions @(@{ Type = 'MODEL'; Destination = (Join-Path $thinningRoot 'MODEL') })
+            $thinningResults[$selectionCase.Name] = (
+                $thinningOk -eq $true -and
+                (Test-Path -LiteralPath $thinningFixture[$selectionCase.Keep]) -and
+                -not (Test-Path -LiteralPath $thinningFixture[$selectionCase.Drop]) -and
+                (Test-Path -LiteralPath $thinningFixture['RecentLunch']) -and
+                (Test-Path -LiteralPath $thinningFixture['RecentNight'])
+            )
+        }
+        Test-BRAVOCondition `
+            -Condition ($thinningResults['Latest'] -and $thinningResults['Time'] -and $thinningResults['Invalid']) `
+            -Name "BackupConsistency/OlderCopiesThinnedToOnePerDay" `
+            -Failure "копії старші за retentionAllCopiesDays мають лишатися по одній за день (Latest — остання, HH:mm — найближча до часу, невалідне значення — Latest), а молодші — усі; результати: Latest=$($thinningResults['Latest']) Time=$($thinningResults['Time']) Invalid=$($thinningResults['Invalid'])"
+
+        $global:enableArchiveDeletion = $false
+        $global:retentionDailyCopySelection = 'Latest'
+        $thinningOffRoot = Join-Path $retentionStatusTestRoot 'thinning-off'
+        $thinningOffFixture = New-BRAVOThinningFixture -Root $thinningOffRoot
+        [void](Invoke-BRAVORetentionFixtureCleanup -Root $thinningOffRoot `
+            -CurrentGenerationId '20990102_230000' -ArchiveDefinitions @(@{ Type = 'MODEL'; Destination = (Join-Path $thinningOffRoot 'MODEL') }))
+        Test-BRAVOCondition `
+            -Condition (Test-Path -LiteralPath $thinningOffFixture['OldLunch']) `
+            -Name "BackupConsistency/ThinningRequiresArchiveDeletionEnabled" `
+            -Failure "проріджування видаляє COMPLETE копії, тому при enableArchiveDeletion=false воно не повинне видаляти нічого"
+
+        # Сценарій 6: схема Д/Т/М/Р (retentionScheme = 'Calendar').
+        # 400 нічних копій; Д=7, Т=4, М=3, Р=2, усі копії лише за 7 днів.
+        function New-BRAVOCalendarFixture {
+            param([string]$Root)
+            $manifests = @{}
+            for ($age = 400; $age -ge 0; $age--) {
+                $at = (Get-Date).Date.AddDays(-$age).AddHours(23)
+                if ($at -gt (Get-Date)) { $at = (Get-Date).AddMinutes(-$age - 1) }
+                $id = $at.ToString('yyyyMMdd_HHmmss')
+                $manifests[$at.Date.ToString('yyyyMMdd')] = New-BRAVORetentionComponentFixture -Root $Root `
+                    -GenerationId $id -StartedAt $at -Components @('MODEL')
+            }
+            return $manifests
+        }
+        $global:retentionScheme = 'Calendar'
+        $global:retentionAllCopiesDays = 7
+        $global:retentionDailyCopySelection = 'Latest'
+        $global:retentionDailyCopies = 7
+        $global:retentionWeeklyCopies = 4
+        $global:retentionMonthlyCopies = 3
+        $global:retentionYearlyCopies = 2
+        $calendarToday = (Get-Date).Date
+        $calendarLastSunday = $calendarToday.AddDays(-(([int]$calendarToday.DayOfWeek + 7) % 7))
+        if ($calendarLastSunday -eq $calendarToday) { $calendarLastSunday = $calendarToday.AddDays(-7) }
+        $calendarWeekKept = $calendarLastSunday.AddDays(-14)
+        $calendarMonthKept = (New-Object DateTime -ArgumentList $calendarToday.Year, $calendarToday.Month, 1).AddMonths(-1).AddDays(-1)
+        $calendarYearKept = New-Object DateTime -ArgumentList ($calendarToday.Year - 1), 12, 31
+        $calendarDropped = $calendarToday.AddDays(-45)
+        while ($calendarDropped.DayOfWeek -eq [DayOfWeek]::Sunday -or $calendarDropped.AddDays(1).Day -eq 1 -or
+            ($calendarDropped.Month -eq 12 -and $calendarDropped.Day -eq 31)) {
+            $calendarDropped = $calendarDropped.AddDays(-1)
+        }
+
+        $global:enableArchiveDeletion = $false
+        $calendarOffRoot = Join-Path $retentionStatusTestRoot 'calendar-off'
+        $calendarOffFixture = New-BRAVOCalendarFixture -Root $calendarOffRoot
+        $calendarOffCurrent = [IO.Path]::GetFileNameWithoutExtension($calendarOffFixture[$calendarToday.ToString('yyyyMMdd')]).Substring('BRAVO_BACKUP_'.Length)
+        [void](Invoke-BRAVORetentionFixtureCleanup -Root $calendarOffRoot `
+            -CurrentGenerationId $calendarOffCurrent -ArchiveDefinitions @(@{ Type = 'MODEL'; Destination = (Join-Path $calendarOffRoot 'MODEL') }))
+        $calendarOffLeft = @(Get-ChildItem -LiteralPath (Join-Path $calendarOffRoot 'MANIFESTS') -Filter 'BRAVO_BACKUP_*.json').Count
+        Test-BRAVOCondition `
+            -Condition ($calendarOffLeft -eq 401) `
+            -Name "BackupConsistency/CalendarSchemeDeletesNothingByDefault" `
+            -Failure "схема Д/Т/М/Р при enableArchiveDeletion=false (типове значення) не повинна видаляти жодної копії; лишилось $calendarOffLeft з 401"
+
+        $global:enableArchiveDeletion = $true
+        $calendarRoot = Join-Path $retentionStatusTestRoot 'calendar-on'
+        $calendarFixture = New-BRAVOCalendarFixture -Root $calendarRoot
+        $calendarCurrent = [IO.Path]::GetFileNameWithoutExtension($calendarFixture[$calendarToday.ToString('yyyyMMdd')]).Substring('BRAVO_BACKUP_'.Length)
+        $calendarOk = Invoke-BRAVORetentionFixtureCleanup -Root $calendarRoot `
+            -CurrentGenerationId $calendarCurrent -ArchiveDefinitions @(@{ Type = 'MODEL'; Destination = (Join-Path $calendarRoot 'MODEL') })
+        $calendarLeft = @(Get-ChildItem -LiteralPath (Join-Path $calendarRoot 'MANIFESTS') -Filter 'BRAVO_BACKUP_*.json').Count
+        $calendarExpectations = [ordered]@{
+            Yesterday = (Test-Path -LiteralPath $calendarFixture[$calendarToday.AddDays(-1).ToString('yyyyMMdd')])
+            WeekKept = (Test-Path -LiteralPath $calendarFixture[$calendarWeekKept.ToString('yyyyMMdd')])
+            MonthKept = (Test-Path -LiteralPath $calendarFixture[$calendarMonthKept.ToString('yyyyMMdd')])
+            YearKept = (Test-Path -LiteralPath $calendarFixture[$calendarYearKept.ToString('yyyyMMdd')])
+            Dropped = -not (Test-Path -LiteralPath $calendarFixture[$calendarDropped.ToString('yyyyMMdd')])
+            Bounded = ($calendarLeft -le 16)
+        }
+        Test-BRAVOCondition `
+            -Condition ($calendarOk -eq $true -and @($calendarExpectations.Values | Where-Object { -not $_ }).Count -eq 0) `
+            -Name "BackupConsistency/CalendarSchemeKeepsDailyWeeklyMonthlyYearly" `
+            -Failure "схема Д/Т/М/Р 7/4/3/2 має лишати останні дні, кінець тижнів, місяців і років та видаляти решту; лишилось $calendarLeft; $([string]::Join(', ', @($calendarExpectations.Keys | ForEach-Object { '{0}={1}' -f $_, $calendarExpectations[$_] })))"
+    } finally {
+        Remove-Item -Path Variable:\global:enableArchiveDeletion, `
+            Variable:\global:enableFailedArchiveDeletion, `
+            Variable:\global:failedArchiveRetentionDays, `
+            Variable:\global:minimumRetainedVerifiedBackups, `
+            Variable:\global:progressSettings, `
+            Variable:\global:retentionAllCopiesDays, `
+            Variable:\global:retentionDailyCopySelection, `
+            Variable:\global:retentionScheme, `
+            Variable:\global:retentionDailyCopies, `
+            Variable:\global:retentionWeeklyCopies, `
+            Variable:\global:retentionMonthlyCopies, `
+            Variable:\global:retentionYearlyCopies `
+            -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $retentionStatusTestRoot) {
+            Remove-Item -LiteralPath $retentionStatusTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
