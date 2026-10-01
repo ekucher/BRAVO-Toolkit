@@ -6130,24 +6130,47 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
     }
 
     # --- структурні перевірки оркестратора ---
-    $rbStart = $updaterText.IndexOf('ПРОВАЛ ГЕЙТА')
-    $rbText = ''
-    if ($rbStart -ge 0) { $rbText = $updaterText.Substring($rbStart) }
+    $fnStart = $updaterText.IndexOf('function Invoke-BRAVODeployUpdaterRollback')
+    $fnEnd = $updaterText.IndexOf('$script:DeployStarted = $false', [Math]::Max($fnStart, 0))
+    $fnText = ''
+    if ($fnStart -ge 0 -and $fnEnd -gt $fnStart) { $fnText = $updaterText.Substring($fnStart, $fnEnd - $fnStart) }
+    $gateStart = $updaterText.IndexOf('ПРОВАЛ ГЕЙТА')
+    $gateText = ''
+    if ($gateStart -ge 0) { $gateText = $updaterText.Substring($gateStart) }
     Test-BRAVOCondition `
         -Condition (
             $updaterText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Deploy.Rollback.ps1'") -and
-            $rbText.Contains('Invoke-BRAVODeployExactRestore') -and
-            $rbText.Contains('Test-BRAVODeployRuntimeMatchesManifest') -and
-            -not ($rbText -match '(?m)^\s*\$rcBack\s*=\s*robocopy')
+            $fnText.Contains('Invoke-BRAVODeployExactRestore') -and
+            $fnText.Contains('Test-BRAVODeployRuntimeMatchesManifest') -and
+            $gateText.Contains('Invoke-BRAVODeployUpdaterRollback') -and
+            -not ($updaterText -match '(?m)^\s*\$rcBack\s*=\s*robocopy')
         ) `
         -Name "Rollback/UpdaterUsesExactRestoreNotRobocopyOverlay" `
         -Failure "відкат Update-BRAVOServer.ps1 мусить викликати Invoke-BRAVODeployExactRestore і верифікацію manifest, а не robocopy backup поверх runtime (#289)"
     Test-BRAVOCondition `
         -Condition (
-            $rbText.Contains('-Action Scheduler') -and $rbText.Contains('-ValidateOnly') -and
-            $rbText.Contains('ВІДКАТ НЕ ВДАВСЯ') -and $rbText.Contains('exit 2')
+            $fnText.Contains('-Action Scheduler') -and $fnText.Contains('-ValidateOnly') -and
+            $gateText.Contains('ВІДКАТ НЕ ВДАВСЯ') -and $gateText.Contains('exit 2')
         ) `
         -Name "Rollback/UpdaterReRegistersSchedulerAndFailsLoudly" `
         -Failure "після відкату мусить повторно виконуватись BRAVO_SETUP -Action Scheduler + -ValidateOnly зі старого комплекту, а будь-який збій відкату — exit 2 'ВІДКАТ НЕ ВДАВСЯ' (#289)"
+
+    # Збій після початку розгортання теж відкочується тим самим шляхом.
+    $backupPos = $updaterText.IndexOf('robocopy backup завершився')
+    $flagPos = $updaterText.IndexOf('$script:DeployStarted = $true')
+    $deployPos = $updaterText.IndexOf('$rcDeploy = robocopy')
+    $catchPos = $updaterText.LastIndexOf('} catch {')
+    $catchText = ''
+    if ($catchPos -ge 0) { $catchText = $updaterText.Substring($catchPos) }
+    Test-BRAVOCondition `
+        -Condition (
+            $backupPos -ge 0 -and $backupPos -lt $flagPos -and $flagPos -lt $deployPos -and
+            $catchText.Contains('$script:DeployStarted') -and
+            $catchText.Contains('Invoke-BRAVODeployUpdaterRollback') -and
+            $catchText.Contains('$script:RollbackFailed = $true') -and
+            $updaterText.Contains('if ($script:RollbackFailed) { exit 2 }')
+        ) `
+        -Name "Rollback/UpdaterRollsBackOnFailureAfterDeployStarted" `
+        -Failure "виняток/збій robocopy після backup і до проходження гейтів мусить запускати той самий точний відкат (прапорець DeployStarted між backup і розгортанням, відкат у catch, exit 2 при невдачі) — інакше лишається напіврозгорнутий комплект із exit 33 (#289)"
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/GenericObjectListBinderGate' } }

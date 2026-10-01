@@ -19,6 +19,9 @@
   `Rollback/VerificationDetectsStrayScriptAndHashDrift`,
   `Rollback/UpdaterUsesExactRestoreNotRobocopyOverlay`,
   `Rollback/UpdaterReRegistersSchedulerAndFailsLoudly`.
+  Той самий відкат (з тими самими критеріями успіху й контрактом exit `1`/`2`) тепер запускається і
+  при винятку чи збої robocopy розгортання після backup (раніше catch завершував exit `1` з
+  напіврозгорнутим комплектом): `Rollback/UpdaterRollsBackOnFailureAfterDeployStarted`.
 
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
