@@ -11684,6 +11684,34 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Health/StaleGenerationReasonClassifier' `
         -Failure "класифікатор причин (завдання відсутнє/вимкнене/INCOMPLETE/код/не запускалося/достроково/статус/нічого; помилка читання пропускає перевірку): $($staleReasons | ConvertTo-Json -Compress)"
 
+    $staleCorrupt = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        $script:corruptLog = New-Object System.Collections.Generic.List[string]
+        function Write-HealthLog { param($Message, $Level) [void]$script:corruptLog.Add("$Level|$Message") }
+        $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+        $stateRoot = 'x'
+        function Get-BRAVOScheduledTaskState {
+            param($TaskPath, $TaskName)
+            return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = (Get-Date).AddHours(-1); LastTaskResult = (-2147024891) } }
+        }
+        function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+        function Get-BRAVOOperationStatus { param($Path) return [pscustomobject]@{ Exists = $true; Corrupt = $true; State = $null; Reason = 'self-test: зіпсований JSON' } }
+        $thrown = $false
+        $diagnosis = $null
+        try {
+            $diagnosis = Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $null -LatestCompleteUtc $null -NowUtc (Get-Date).ToUniversalTime() -MaxAge ([timespan]::FromHours(24))
+        } catch { $thrown = $true }
+        [pscustomobject]@{ Thrown = $thrown; Diagnosis = $diagnosis; Log = @($script:corruptLog) }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $staleCorrupt.Thrown -and
+            $staleCorrupt.Diagnosis -match '0x80070005' -and
+            @($staleCorrupt.Log | Where-Object { $_ -match '^WARNING\|Діагностика generation: status-файл Archive пошкоджений: self-test: зіпсований JSON$' }).Count -eq 1
+        ) `
+        -Name 'Health/StaleGenerationCorruptStatusLogsWarning' `
+        -Failure "пошкоджений status-файл Archive: WARNING у лог, інші правила працюють, без винятку: $($staleCorrupt | ConvertTo-Json -Compress)"
+
     $staleFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_HEALTH_STALE_REASON_{0}' -f [guid]::NewGuid().ToString('N'))
     try {
         [void][IO.Directory]::CreateDirectory($staleFixtureRoot)

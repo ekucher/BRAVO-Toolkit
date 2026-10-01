@@ -1329,6 +1329,8 @@ function Get-BRAVOHealthBackupStaleDiagnosis {
                 ExitCodeName = [string]$statusState.exitCodeName
                 FinishedAt = [datetime]$statusState.finishedAt
             }
+        } elseif ($statusResult.Exists) {
+            Write-HealthLog "Діагностика generation: status-файл Archive пошкоджений: $($statusResult.Reason)" -Level 'WARNING'
         }
     } catch {
         $archiveStatus = $null
