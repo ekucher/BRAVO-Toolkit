@@ -783,6 +783,24 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
             Add-Member -InputObject $ownedEntry -MemberType NoteProperty -Name 'Cleaned' -Value $true -Force
         }
     }
+    # Підмітання: жодна функція, прив'язана до модуля з діапазону (для
+    # фінального виклику — до БУДЬ-ЯКОГО зареєстрованого модуля, включно з
+    # уже прибраними й помилково відновленими з -FunctionBaseline чи самим
+    # suite), не лишається у Function:-drive. Ім'я модуля — унікальний GUID,
+    # тож чужу функцію це не зачепить.
+    $sweepModuleNames = @{}
+    for ($sweepIndex = $StartIndex; $sweepIndex -lt $script:BRAVOSelfTestOwnedRuntimeModules.Count; $sweepIndex++) {
+        $sweepModuleNames[[string]$script:BRAVOSelfTestOwnedRuntimeModules[$sweepIndex].Module.Name] = $true
+    }
+    if ($sweepModuleNames.Count -gt 0) {
+        foreach ($sweepFunction in @(Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)) {
+            if (-not [string]::IsNullOrEmpty([string]$sweepFunction.ModuleName) -and $sweepModuleNames.ContainsKey([string]$sweepFunction.ModuleName)) {
+                foreach ($sweepScope in @('global:', 'script:', '')) {
+                    Remove-Item -Path ('function:' + $sweepScope + $sweepFunction.Name) -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
 }
 
 # #337: канонічний життєвий цикл ізоляції suite. Заглушки вбудованих команд
