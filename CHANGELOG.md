@@ -21,7 +21,12 @@
   Stop-Process, Invoke-WebRequest, Start-Sleep, Get-CimInstance, Get-WmiObject,
   Start-Process, а також Invoke-RestMethod і global-аліаса Get-Date),
   `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ProbeStubsActiveInsideSuite`,
-  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation`.
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation`,
+  `Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs` (реальний Enter/Complete
+  для `Suite/*` у дочірньому процесі). Стан затінення читається прямо з Function:/Alias:
+  (без `Get-Command` для відсутніх імен — дорогий пошук модулів), підмітання функцій
+  зареєстрованих модулів виконується й у фінальному `Clear-...`, збій відновлення
+  реєструється як збій секції, а не виходить із `finally`.
 
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в

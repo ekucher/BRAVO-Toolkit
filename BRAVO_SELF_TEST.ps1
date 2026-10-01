@@ -758,25 +758,32 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
         [int]$StartIndex = 0,
         [hashtable]$FunctionBaseline = $null
     )
+    $clearProblems = New-Object System.Collections.Generic.List[string]
     for ($ownedIndex = $StartIndex; $ownedIndex -lt $script:BRAVOSelfTestOwnedRuntimeModules.Count; $ownedIndex++) {
         $ownedEntry = $script:BRAVOSelfTestOwnedRuntimeModules[$ownedIndex]
         # Strict-safe: записи реєстру з інших джерел (проби) можуть не мати
         # прапорця Cleaned.
         $cleanedProperty = $ownedEntry.PSObject.Properties['Cleaned']
         if ($null -ne $cleanedProperty -and $cleanedProperty.Value) { continue }
-        $ownerModuleName = $ownedEntry.Module.Name
-        foreach ($functionName in @($ownedEntry.FunctionNames)) {
-            $currentCommand = Get-Command -Name $functionName -ErrorAction SilentlyContinue
-            if ($null -ne $currentCommand -and
-                $currentCommand.CommandType -eq [Management.Automation.CommandTypes]::Function -and
-                $currentCommand.ModuleName -eq $ownerModuleName) {
-                Remove-Item -Path "function:$functionName" -Force -ErrorAction Stop
-                if ($null -ne $FunctionBaseline -and $FunctionBaseline.ContainsKey($functionName)) {
-                    Set-Item -Path "function:global:$functionName" -Value $FunctionBaseline[$functionName] -Force
+        # Збій на одному записі не має пропускати решту записів і підмітання
+        # нижче: збираємо проблеми й кидаємо один виняток наприкінці.
+        try {
+            $ownerModuleName = $ownedEntry.Module.Name
+            foreach ($functionName in @($ownedEntry.FunctionNames)) {
+                # Пряме читання Function:-drive (хеш-пошук) замість Get-Command:
+                # Get-Command для відсутнього імені запускає дорогий пошук модулів.
+                $currentFunction = Get-Item -LiteralPath ('function:' + $functionName) -ErrorAction SilentlyContinue
+                if ($null -ne $currentFunction -and $currentFunction.ModuleName -eq $ownerModuleName) {
+                    Remove-Item -Path "function:$functionName" -Force -ErrorAction Stop
+                    if ($null -ne $FunctionBaseline -and $FunctionBaseline.ContainsKey($functionName)) {
+                        Set-Item -Path "function:global:$functionName" -Value $FunctionBaseline[$functionName] -Force
+                    }
                 }
             }
+            Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
+        } catch {
+            [void]$clearProblems.Add($_.Exception.Message)
         }
-        Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
         if ($null -ne $cleanedProperty) {
             $cleanedProperty.Value = $true
         } else {
@@ -800,6 +807,9 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
                 }
             }
         }
+    }
+    if ($clearProblems.Count -gt 0) {
+        throw ('прибирання runtime-модулів: ' + [string]::Join(' | ', $clearProblems.ToArray()))
     }
 }
 
@@ -830,24 +840,22 @@ function Get-BRAVOSelfTestWatchedBuiltinCommandNames {
 }
 
 function Get-BRAVOSelfTestBuiltinCommandState {
-    # Фактична резолюція імені: CommandType + модуль/джерело, а для функції
-    # ще й посилання на ScriptBlock (заміна функції функцією з тим самим
-    # ModuleName теж має бути помітною).
+    # Стан затінення імені: чи є за ним function/alias у відповідних drive
+    # (прямий хеш-пошук, без Get-Command: той для відсутнього імені запускає
+    # дорогий пошук модулів — на Windows це давало десятки секунд на suite).
+    # Cmdlet/зовнішня команда без затінення = '<none>'; заміна cmdlet на
+    # function чи alias завжди змінює цей стан. Для функції ще й посилання на
+    # ScriptBlock (заміна функції функцією з тим самим ModuleName теж видима).
     param([Parameter(Mandatory = $true)][string]$Name)
-    $resolvedCommand = Get-Command -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $resolvedCommand) {
-        return [pscustomobject]@{ Name = $Name; Key = '<absent>'; Command = $null; ScriptBlock = $null }
+    $aliasItem = Get-Item -LiteralPath ('alias:' + $Name) -ErrorAction SilentlyContinue
+    if ($null -ne $aliasItem) {
+        return [pscustomobject]@{ Name = $Name; Key = ('Alias|' + $aliasItem.Definition); Kind = 'Alias'; Definition = [string]$aliasItem.Definition; ScriptBlock = $null }
     }
-    $resolvedScriptBlock = $null
-    if ($resolvedCommand.CommandType -eq [Management.Automation.CommandTypes]::Function) {
-        $resolvedScriptBlock = $resolvedCommand.ScriptBlock
+    $functionItem = Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue
+    if ($null -ne $functionItem) {
+        return [pscustomobject]@{ Name = $Name; Key = ('Function|' + $functionItem.ModuleName); Kind = 'Function'; Definition = ''; ScriptBlock = $functionItem.ScriptBlock }
     }
-    return [pscustomobject]@{
-        Name        = $Name
-        Key         = ('{0}|{1}|{2}' -f $resolvedCommand.CommandType, $resolvedCommand.ModuleName, $resolvedCommand.Source)
-        Command     = $resolvedCommand
-        ScriptBlock = $resolvedScriptBlock
-    }
+    return [pscustomobject]@{ Name = $Name; Key = '<none>'; Kind = 'None'; Definition = ''; ScriptBlock = $null }
 }
 
 function Test-BRAVOSelfTestBuiltinCommandStateEqual {
@@ -861,13 +869,12 @@ function New-BRAVOSelfTestSuiteIsolationSnapshot {
     foreach ($watchedName in @(Get-BRAVOSelfTestWatchedBuiltinCommandNames)) {
         $commandStates[$watchedName] = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
     }
-    $functionBaseline = @{}
-    foreach ($existingFunction in @(Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)) {
-        $functionBaseline[$existingFunction.Name] = $existingFunction.ScriptBlock
-    }
+    # Єдине перелічення Function: на suite (початкові визначення для
+    # відновлення функції, яку затінила прибрана заглушка).
+    # Хеш-таблиця будується ліниво, лише якщо suite зареєстрував модулі.
     return [pscustomobject]@{
         CommandStates    = $commandStates
-        FunctionBaseline = $functionBaseline
+        FunctionList     = @(Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)
         OwnedStartIndex  = $script:BRAVOSelfTestOwnedRuntimeModules.Count
     }
 }
@@ -884,7 +891,13 @@ function Restore-BRAVOSelfTestSuiteIsolation {
     )
     $residualProblems = New-Object System.Collections.Generic.List[string]
     try {
-        Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $Snapshot.OwnedStartIndex -FunctionBaseline $Snapshot.FunctionBaseline
+        $restoreFunctionBaseline = @{}
+        if ($script:BRAVOSelfTestOwnedRuntimeModules.Count -gt $Snapshot.OwnedStartIndex) {
+            foreach ($baselineFunction in $Snapshot.FunctionList) {
+                $restoreFunctionBaseline[$baselineFunction.Name] = $baselineFunction.ScriptBlock
+            }
+        }
+        Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $Snapshot.OwnedStartIndex -FunctionBaseline $restoreFunctionBaseline
     } catch {
         [void]$residualProblems.Add("прибирання runtime-модулів: $($_.Exception.Message)")
     }
@@ -893,31 +906,16 @@ function Restore-BRAVOSelfTestSuiteIsolation {
         $currentState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
         if (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $currentState) { continue }
         try {
-            # Зняти всі затінюючі function/alias (можуть бути в кількох
-            # областях) — доки резолюція не збіжиться або затінення не зникне.
-            for ($shadowPass = 0; $shadowPass -lt 6; $shadowPass++) {
-                $shadowCommand = Get-Command -Name $watchedName -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($null -eq $shadowCommand) { break }
-                if ($shadowCommand.CommandType -eq [Management.Automation.CommandTypes]::Alias) {
-                    Remove-Item -Path ("alias:" + $watchedName) -Force -ErrorAction Stop
-                } elseif ($shadowCommand.CommandType -eq [Management.Automation.CommandTypes]::Function) {
-                    Remove-Item -Path ("function:" + $watchedName) -Force -ErrorAction Stop
-                } else {
-                    break
-                }
-                $afterRemoval = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
-                if (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $afterRemoval) { break }
+            # Зняти затінюючі alias/function (можуть бути в кількох областях).
+            foreach ($shadowScope in @('global:', 'script:', '')) {
+                Remove-Item -Path ('alias:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path ('function:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
             }
-            # Початкова команда була функцією/аліасом (напр. харнес-обгортка)
-            # і зникла чи змінилась — повернути її.
-            $afterShadowRemoval = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
-            if (-not (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $afterShadowRemoval) -and
-                $null -ne $baselineState.Command) {
-                if ($baselineState.Command.CommandType -eq [Management.Automation.CommandTypes]::Function) {
-                    Set-Item -Path ("function:global:" + $watchedName) -Value $baselineState.ScriptBlock -Force
-                } elseif ($baselineState.Command.CommandType -eq [Management.Automation.CommandTypes]::Alias) {
-                    Set-Alias -Name $watchedName -Value $baselineState.Command.Definition -Scope Global -Force
-                }
+            # Початкова команда була функцією/аліасом — повернути її.
+            if ($baselineState.Kind -eq 'Function') {
+                Set-Item -Path ('function:global:' + $watchedName) -Value $baselineState.ScriptBlock -Force
+            } elseif ($baselineState.Kind -eq 'Alias') {
+                Set-Alias -Name $watchedName -Value $baselineState.Definition -Scope Global -Force
             }
         } catch {
             [void]$residualProblems.Add("${watchedName}: не вдалося зняти затінення — $($_.Exception.Message)")
@@ -1595,12 +1593,19 @@ function Complete-BRAVOSelfTestSection {
                 -Message ("межі секцій порушено: закривається '{0}', відкрита '{1}'" -f $Name,
                     $(if ($null -ne $closingSection) { $closingSection.Name } else { '' })))
     }
-    $script:BRAVOSelfTestSectionStack.RemoveAt($sectionStackDepth - 1)
     if ($null -ne $closingSection.SuiteIsolation) {
         # finally-шлях: ізоляція відновлюється і після перерваного suite.
-        [void](Restore-BRAVOSelfTestSuiteIsolation -Snapshot $closingSection.SuiteIsolation -Label $Name)
-        $closingSection.SuiteIsolation = $null
+        # Виняток не має вийти з finally до Status/DurationMs/Assert...Intact:
+        # реєструється як збій секції (вона ще на стеку).
+        try {
+            [void](Restore-BRAVOSelfTestSuiteIsolation -Snapshot $closingSection.SuiteIsolation -Label $Name)
+        } catch {
+            Register-BRAVOSelfTestSectionFault -ErrorRecord $_
+        } finally {
+            $closingSection.SuiteIsolation = $null
+        }
     }
+    $script:BRAVOSelfTestSectionStack.RemoveAt($sectionStackDepth - 1)
     if ($closingSection.Status -eq 'Running') { $closingSection.Status = 'Completed' }
     # Enter-BRAVOSelfTestSuite лишається єдиним власником suite-span:
     # перервана секція фрагмента не повинна лишити атрибуцію "мертвому" suite.
@@ -26909,6 +26914,25 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/PassOmega' -Failure 'n/a'
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Omega' } }
 '@
             }
+            StubIsolation = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Suite/Gamma') { try {
+    Enter-BRAVOSelfTestSuite -Name 'Gamma'
+    [void](New-Module -ScriptBlock { function Start-Sleep { 'stub' }; function Get-Service { 'stub' } })
+    Set-Alias -Name Get-Date -Value Get-Process -Scope Global
+    Test-BRAVOCondition -Condition ((Start-Sleep) -eq 'stub') -Name 'Probe/StubActiveInSuite' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Gamma' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AfterStub') { try {
+    Test-BRAVOCondition -Condition (-not (Test-Path 'function:Start-Sleep') -and -not (Test-Path 'function:Get-Service') -and -not (Test-Path 'alias:Get-Date')) -Name 'Probe/StubGoneAfterSuite' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterStub' } }
+'@
+                Tail = @'
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Omega') { try {
+Test-BRAVOCondition -Condition $true -Name 'Probe/StubOmega' -Failure 'n/a'
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Omega' } }
+'@
+            }
             MultiFault = @{
                 Pre  = ''
                 Main = @'
@@ -27142,6 +27166,14 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/TailAfterBoundaryRuns' -Failur
             -Name 'Framework/SectionIsolation.CleanRunPasses' `
             -EnvironmentLimitation (& $isolationRestriction 'Pass') `
             -Failure ('каркас без збоїв має дати код 0 і SELF-TEST PASSED: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'StubIsolation' 0 @('[PASS] Probe/StubActiveInSuite', '[PASS] Probe/StubGoneAfterSuite',
+                'SELF-TEST PASSED') @('SELF-TEST FAILED', 'Framework/SuiteIsolation'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs' `
+            -EnvironmentLimitation (& $isolationRestriction 'StubIsolation') `
+            -Failure ('реальний Enter/Complete для Suite/* має прибрати заглушки вбудованих команд (Start-Sleep, Get-Service, alias Get-Date): ' + [string]::Join('; ', $isolationProblems))
 
         $isolationProblems = @(& $isolationMismatch 'MultiFault' 1 @('[PASS] Probe/AlphaBefore', '[PASS] Probe/BetaBefore',
                 '[PASS] Probe/GammaBefore', '[PASS] Probe/DeltaRuns', '[PASS] Probe/TailOmegaRuns', 'SELF-TEST FAILED',
