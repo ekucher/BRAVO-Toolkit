@@ -35,6 +35,18 @@
   `Maintenance/RuntimeLogSyncSkipsReparsePoints`,
   `Maintenance/RuntimeLogSyncAllowsReparsePointAsLogsRoot`,
   `Maintenance/RuntimeLogSyncRejectsUnsafeRemoteRoot`.
+  Маскування `Protect-BRAVOLogSecret` розширено: `Pwd=`, `Passphrase=`, `api_key`/`apikey`/`X-Api-Key`,
+  JSON `"password": "x"` / `"token":"x"` (будь-яке лапкування й пробіли), значення в лапках із
+  пробілами, `Bearer <токен>`, `Authorization: Basic ...`, CLI-форми `-p значення` / `-pw значення`;
+  правила ідемпотентні й лінійні (без катастрофічного відкату на великих файлах). Додатково
+  налаштовані SFTP/SMB-облікові дані (логін/пароль із Credential Manager, довжина від 4) замінюються
+  дослівно у кожному знімку (`-KnownSecrets`). Копія логу прогону (`Send-BRAVOOwnLogFile`) тепер
+  також іде замаскованим знімком, а не сирим живим файлом; `sftpDirectories.RuntimeLogs`
+  перевіряється ДО SFTP-логіну (небезпечне значення без копії логу прогону — без з'єднання).
+  Нові перевірки: `Logging/MaskSecret_*` (по одній на формат), `Logging/MaskKnownSecretLiterals`,
+  `Logging/MaskSecretLargeInputNoCatastrophicBacktracking`,
+  `Maintenance/OwnLogFileUploadsMaskedSnapshotNotLiveLog`, `Maintenance/OwnLogFileSkipsNonTextAndCleansSnapshot`,
+  `Maintenance/OwnLogBadRuntimeRootDoesNotConnect`, `Maintenance/OwnLogPassesKnownSecretsToUploads`.
 
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в

@@ -4486,8 +4486,10 @@ function Send-BRAVOOwnLogFile {
         # константним локальним ім'ям (range_id_log.json) передається
         # унікальне ім'я з run-id, щоб прогони не перезаписували один одного.
         [string]$RemoteFileName,
-        [AllowNull()][scriptblock]$Logger
+        [AllowNull()][scriptblock]$Logger,
+        [AllowNull()][string[]]$KnownSecrets
     )
+    $ownLogSnapshotPath = $null
     try {
         if (-not (Test-Path -LiteralPath $LocalLogPath -PathType Leaf)) { return }
         if ([string]::IsNullOrWhiteSpace($RemoteFileName)) {
@@ -4498,9 +4500,19 @@ function Send-BRAVOOwnLogFile {
         if (-not [string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) {
             New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $normalizedRemoteDirectory
         }
+        # На SFTP іде ЗАМАСКОВАНИЙ знімок, а не сирий живий файл (той самий
+        # шлях, що й у Sync-BRAVORuntimeLogsToSftp): розмір/hash/передача
+        # відбуваються лише на знімку, живий лог після цього не читається.
+        $ownLogSnapshotPath = Join-Path ([System.IO.Path]::GetTempPath()) `
+            ("BRAVO_log_snapshot_{0}.tmp" -f [guid]::NewGuid().ToString('N'))
+        $ownLogSnapshot = New-BRAVOMaskedLogSnapshot -SourcePath $LocalLogPath -SnapshotPath $ownLogSnapshotPath -KnownSecrets $KnownSecrets
+        if (-not $ownLogSnapshot.Success) {
+            Write-Log "Власний лог: $LocalLogPath не вивантажено (не вдалося зняти замаскований знімок: $($ownLogSnapshot.Error))." -Level "WARNING"
+            return
+        }
         $ownLogResult = Send-BRAVOTraceArchiveFile `
             -Session $Session `
-            -LocalPath $LocalLogPath `
+            -LocalPath $ownLogSnapshotPath `
             -RemoteFinalPath "$remoteRoot/$RemoteFileName" `
             -Logger $Logger
         if (-not $ownLogResult.Success) {
@@ -4508,7 +4520,62 @@ function Send-BRAVOOwnLogFile {
         }
     } catch {
         Write-Log "Власний лог: передача $LocalLogPath не вдалася: $($_.Exception.Message)" -Level "WARNING"
+    } finally {
+        if ($null -ne $ownLogSnapshotPath -and (Test-Path -LiteralPath $ownLogSnapshotPath -PathType Leaf)) {
+            Remove-Item -LiteralPath $ownLogSnapshotPath -Force -ErrorAction SilentlyContinue
+        }
     }
+}
+
+function Get-BRAVOOwnLogKnownSecrets {
+    # Литеральні значення налаштованих SFTP/SMB-облікових даних (логін і
+    # пароль) із Credential Manager — для дослівної заміни у знімках
+    # журналів перед вивантаженням (Protect-BRAVOLogSecret -KnownSecrets).
+    # Fail-soft: недоступний запис просто не потрапляє в список.
+    [CmdletBinding()]
+    param()
+
+    $knownSecrets = New-Object System.Collections.Generic.List[string]
+    foreach ($targetName in @('SFTPLogin', 'SFTPPassword', 'SMBLogin', 'SMBPassword')) {
+        try {
+            $defaultTarget = switch ($targetName) {
+                'SFTPLogin' { 'BRAVO_SFTP_LOGIN' }
+                'SFTPPassword' { 'BRAVO_SFTP_PASSWORD' }
+                'SMBLogin' { 'BRAVO_SMB_LOGIN' }
+                default { 'BRAVO_SMB_PASSWORD' }
+            }
+            $targetValue = ''
+            try { $targetValue = [string]$credentialSettings.Targets.$targetName } catch {
+                # Ключа Targets.<ім'я> немає (StrictMode) — типова ціль нижче.
+            }
+            if ([string]::IsNullOrWhiteSpace($targetValue)) { $targetValue = $defaultTarget }
+            $secretValue = [string](Get-BRAVOCredentialSecret -Target $targetValue)
+            if (-not [string]::IsNullOrEmpty($secretValue)) {
+                $secretValue = $secretValue.Trim()
+                if ($secretValue.Length -ge 4) { $knownSecrets.Add($secretValue) }
+            }
+        } catch {
+            # Запис недоступний — просто без цього значення.
+        }
+    }
+    return @($knownSecrets.ToArray())
+}
+
+function Get-BRAVORuntimeLogRemoteRoot {
+    # Нормалізує і перевіряє sftpDirectories.RuntimeLogs. Повертає
+    # '/сегмент/...' або $null, якщо значення порожнє, дорівнює кореню SFTP
+    # чи містить сегмент '.', '..' або порожній сегмент. Чиста функція без
+    # побічних ефектів — викликається і ДО SFTP-логіну, і в Sync.
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$RemoteDirectory)
+
+    $normalized = ([string]$RemoteDirectory).Trim().Replace('\', '/').Trim('/')
+    if ($normalized.Length -eq 0) { return $null }
+    $segments = @($normalized.Split('/') | ForEach-Object { $_.Trim() })
+    foreach ($segment in $segments) {
+        if ($segment -eq '..' -or $segment -eq '.' -or $segment.Length -eq 0) { return $null }
+    }
+    return "/$($segments -join '/')"
 }
 
 function Test-BRAVOOwnLogSftpCredentialAvailable {
@@ -4544,7 +4611,8 @@ function New-BRAVOMaskedLogSnapshot {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$SourcePath,
-        [Parameter(Mandatory = $true)][string]$SnapshotPath
+        [Parameter(Mandatory = $true)][string]$SnapshotPath,
+        [AllowNull()][string[]]$KnownSecrets
     )
 
     try {
@@ -4577,7 +4645,7 @@ function New-BRAVOMaskedLogSnapshot {
         }
 
         $text = $encoding.GetString($bytes, $preamble.Count, $bytes.Length - $preamble.Count)
-        $masked = Protect-BRAVOLogSecret -Text $text
+        $masked = Protect-BRAVOLogSecret -Text $text -KnownSecrets $KnownSecrets
         if ($null -eq $masked) { $masked = '' }
         $maskedBytes = $encoding.GetBytes($masked)
         $outputBytes = New-Object byte[] ($preamble.Count + $maskedBytes.Length)
@@ -4615,7 +4683,8 @@ function Sync-BRAVORuntimeLogsToSftp {
     param(
         [Parameter(Mandatory = $true)]$Session,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$LocalLogRoot,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RemoteDirectory
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RemoteDirectory,
+        [AllowNull()][string[]]$KnownSecrets
     )
 
     $result = [pscustomobject]@{ Uploaded = 0; Unchanged = 0; Failed = 0; Skipped = 0; Rejected = $false; FirstError = $null }
@@ -4623,18 +4692,12 @@ function Sync-BRAVORuntimeLogsToSftp {
         -not (Test-Path -LiteralPath $LocalLogRoot -PathType Container)) {
         return $result
     }
-    $normalizedRemoteDirectory = ([string]$RemoteDirectory).Trim().Replace('\', '/').Trim('/')
-    $remoteSegments = @($normalizedRemoteDirectory.Split('/') | ForEach-Object { $_.Trim() })
-    $remoteRootRejected = ($normalizedRemoteDirectory.Length -eq 0)
-    foreach ($remoteSegment in $remoteSegments) {
-        if ($remoteSegment -eq '..' -or $remoteSegment -eq '.' -or $remoteSegment.Length -eq 0) { $remoteRootRejected = $true }
-    }
-    if ($remoteRootRejected) {
+    $remoteRoot = Get-BRAVORuntimeLogRemoteRoot -RemoteDirectory $RemoteDirectory
+    if ($null -eq $remoteRoot) {
         $result.Rejected = $true
         Write-Log "Журнали toolkit: sftpDirectories.RuntimeLogs='$RemoteDirectory' відхилено (порожнє значення, '.', '..' або корінь SFTP недопустимі) — вивантаження пропущено." -Level "WARNING"
         return $result
     }
-    $remoteRoot = "/$($remoteSegments -join '/')"
     $localRootItem = Get-Item -LiteralPath $LocalLogRoot -Force -ErrorAction Stop
     # Сам корінь журналів МОЖЕ бути junction/symlink (штатне налаштування
     # адміна, напр. LOGS на іншому диску): обходимо його за НЕрозв'язаним
@@ -4679,7 +4742,7 @@ function Sync-BRAVORuntimeLogsToSftp {
             # замаскований вміст.
             $snapshotPath = Join-Path ([System.IO.Path]::GetTempPath()) `
                 ("BRAVO_log_snapshot_{0}.tmp" -f [guid]::NewGuid().ToString('N'))
-            $snapshotResult = New-BRAVOMaskedLogSnapshot -SourcePath $localFile.FullName -SnapshotPath $snapshotPath
+            $snapshotResult = New-BRAVOMaskedLogSnapshot -SourcePath $localFile.FullName -SnapshotPath $snapshotPath -KnownSecrets $KnownSecrets
             if (-not $snapshotResult.Success) {
                 $result.Skipped++
                 Write-Log "Журнали toolkit: '$relativePath' не вивантажено (не вдалося зняти замаскований знімок: $($snapshotResult.Error))." -Level "WARNING"
@@ -4776,6 +4839,16 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
             Write-Log "Журнали toolkit: SFTP-креденшли в Credential Manager недоступні — вивантаження пропущено" -Level "INFO"
             return
         }
+        # Remote-корінь журналів перевіряється ДО SFTP-логіну: з небезпечним
+        # значенням (порожнє, '.', '..', корінь) каталог журналів не
+        # вивантажується; якщо й окрема копія логу прогону вимкнена —
+        # з'єднання не відкривається взагалі.
+        $runtimeLogsRemoteRoot = Get-BRAVORuntimeLogRemoteRoot -RemoteDirectory ([string]$sftpDirectories.RuntimeLogs)
+        if ($null -eq $runtimeLogsRemoteRoot) {
+            Write-Log "Журнали toolkit: sftpDirectories.RuntimeLogs='$([string]$sftpDirectories.RuntimeLogs)' відхилено (порожнє значення, '.', '..' або корінь SFTP недопустимі) — вивантаження каталогу журналів пропущено." -Level "WARNING"
+            if (-not $ownLogFileUploadEnabled) { return }
+        }
+        $ownLogKnownSecrets = Get-BRAVOOwnLogKnownSecrets
 
         $ownLogUploadSession = $null
         $ownRangeIdLogSnapshotPath = $null
@@ -4790,7 +4863,8 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                         -Session $ownLogUploadSession `
                         -LocalLogPath $LOG_FILE `
                         -RemoteDirectory $ownLogRemoteDirectory `
-                        -Logger $null
+                        -Logger $null `
+                        -KnownSecrets $ownLogKnownSecrets
 
                     # R3-3 (round-3 review): range_id_log.json пише служба
                     # BRAVO КОНКУРЕНТНО з цим прогоном (toolkit його лише
@@ -4818,7 +4892,8 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                                 -LocalLogPath $ownRangeIdLogSnapshotPath `
                                 -RemoteDirectory $ownLogRemoteDirectory `
                                 -RemoteFileName ("range_id_log_{0}.json" -f $maintenanceLogRunId) `
-                                -Logger $null
+                                -Logger $null `
+                                -KnownSecrets $ownLogKnownSecrets
                         } catch {
                             Write-Log "Власний лог: не вдалося створити знімок range_id_log.json: $($_.Exception.Message)" -Level "WARNING"
                         }
@@ -4827,12 +4902,13 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
             } catch {
                 Write-Log "Власний лог: вивантаження на SFTP не вдалося: $($_.Exception.Message)" -Level "WARNING"
             }
-            if ($null -ne $ownLogUploadSession) {
+            if ($null -ne $ownLogUploadSession -and $null -ne $runtimeLogsRemoteRoot) {
                 try {
                     $runtimeLogSyncResult = Sync-BRAVORuntimeLogsToSftp `
                         -Session $ownLogUploadSession `
                         -LocalLogRoot ([string]$runtimeLogRoot) `
-                        -RemoteDirectory ([string]$sftpDirectories.RuntimeLogs)
+                        -RemoteDirectory ([string]$sftpDirectories.RuntimeLogs) `
+                        -KnownSecrets $ownLogKnownSecrets
                     if (-not $runtimeLogSyncResult.Rejected) {
                         $runtimeLogSyncMessage = "Журнали toolkit на SFTP: вивантажено $($runtimeLogSyncResult.Uploaded), без змін $($runtimeLogSyncResult.Unchanged), пропущено $($runtimeLogSyncResult.Skipped), помилок $($runtimeLogSyncResult.Failed)"
                         if ($runtimeLogSyncResult.Failed -gt 0) {

@@ -62,21 +62,57 @@ function Get-BRAVOLogSeverityValue {
 
 function Protect-BRAVOLogSecret {
     [CmdletBinding()]
-    param([AllowEmptyString()][AllowNull()][string]$Text)
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Text,
+        # Відомі литеральні значення секретів (налаштовані SFTP/SMB-облікові
+        # дані): замінюються дослівно ПЕРЕД регулярними правилами, тож
+        # маскуються навіть без ключового слова поруч (Read-Host-луна,
+        # довільний дамп). Значення коротші за 4 символи ігноруються.
+        [AllowNull()][string[]]$KnownSecrets
+    )
 
     if ([string]::IsNullOrEmpty($Text)) {
         return $Text
     }
 
     $sanitized = $Text
+    if ($null -ne $KnownSecrets) {
+        $knownValues = @{}
+        foreach ($knownSecret in $KnownSecrets) {
+            if ([string]::IsNullOrEmpty($knownSecret) -or $knownSecret.Length -lt 4) { continue }
+            $knownValues[$knownSecret] = $true
+            # URL-кодована форма (пароль у sftp://user:pw@host кодується).
+            $encodedSecret = [System.Uri]::EscapeDataString($knownSecret)
+            if ($encodedSecret.Length -ge 4) { $knownValues[$encodedSecret] = $true }
+        }
+        # Довші значення першими: короткий секрет не повинен розірвати довший.
+        foreach ($knownValue in @($knownValues.Keys | Sort-Object -Property Length -Descending)) {
+            $sanitized = $sanitized.Replace([string]$knownValue, '***')
+        }
+    }
     # Облікові дані всередині URL: sftp://user:password@host -> sftp://user:***@host
-    $sanitized = $sanitized -replace '(?i)([a-z][a-z0-9+.-]*://[^:/\s@]+):[^@\s]+@', '$1:***@'
+    # (?<!...) — схема починається на початку «слова»: без нього довгий рядок
+    # [a-z0-9+.-] без пробілів давав би квадратичний перебір.
+    $sanitized = $sanitized -replace '(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*://[^:/\s@]+):[^@\s]+@', '$1:***@'
     # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
     $sanitized = $sanitized -replace '(?i)(-password=)(?:"[^"]*"|\S+)', '$1***'
-    # (?!ath|assword) — інакше це правило повторно "з'їдає" вже замасковане
+    # Пробільна форма `-p значення` / `-pw значення` / `-password значення`
+    # (значення в лапках може містити пробіли). Іде ПЕРЕД короткою формою
+    # `-pЗНАЧЕННЯ`, інакше та з'їла б `-pw` і залишила б пароль після пробілу.
+    $sanitized = $sanitized -replace '(?im)((?:^|\s)-(?:p|pw|password)[ \t]+)(?:"[^"\r\n]*"|\x27[^\x27\r\n]*\x27|\S+)', '$1***'
+    # (?!ath|assword|w\s) — інакше це правило повторно "з'їдає" вже замасковане
     # -password=*** з рядка вище, розпізнавши його як коротку форму -p.
-    $sanitized = $sanitized -replace '(?i)(\s-p)(?!ath|assword)(?:"[^"]*"|\S+)', '$1***'
-    $sanitized = $sanitized -replace '(?i)((?:password|passwd|secret|token)\s*[:=]\s*)(?:"[^"]*"|\S+)', '$1***'
+    $sanitized = $sanitized -replace '(?i)(\s-p)(?!ath|assword|w\s)(?:"[^"]*"|\S+)', '$1***'
+    # Authorization: Bearer <token> та Authorization: Basic <credentials> — ДО ключового
+    # правила, інакше `token: Bearer abc` лишив би хвіст `abc`.
+    $sanitized = $sanitized -replace '(?i)(\bbearer[ \t]+)[A-Za-z0-9._~+/=-]+', '$1***'
+    $sanitized = $sanitized -replace '(?i)(\bauthorization[ \t]*[:=][ \t]*basic[ \t]+)\S+', '$1***'
+    # Ключ пароля з будь-яким лапкуванням/пробілами: Pwd=, Passphrase=, api_key,
+    # JSON "password": "x", значення в лапках (в т.ч. з пробілами; \" всередині
+    # значення дозволений; вже замасковане `***` повторно не чіпається — ідемпотентність).
+    # Альтернативи не перетинаються за першим символом і
+    # не виходять за межі рядка — без катастрофічного відкату на великих файлах.
+    $sanitized = $sanitized -replace '(?i)(["\x27]?(?:password|passwd|pwd|passphrase|secret|token|api[_-]?key)["\x27]?[ \t]*[:=][ \t]*)(?!\*\*\*(?:[\s,;}\]]|$))(?:"(?:[^"\\\r\n]|\\.)*"|\x27[^\x27\r\n]*\x27|\S+)', '$1***'
     # Webhook URL — сам bearer-секрет, без user:pass@; підтримувані провайдери
     # (Send-BRAVOWebhookNotification -Provider slack|discord) мають токен
     # прямо у шляху, а не в окремому параметрі.
