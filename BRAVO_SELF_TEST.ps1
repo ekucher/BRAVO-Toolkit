@@ -7104,10 +7104,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # який перевіряє РЕАЛЬНИЙ виклик-сайт Archive (Resolve-BRAVOArchiveSpaceDecision)
     # наскрізно:
     #   MergeSpaceResultsOverridesFloorWhenEstimateCoversDrive
-    #       -> ІНВЕРТОВАНО в A24 (below-floor-але-достатньо тепер БЛОКУЄ
-    #          BelowFloorEstimateNotPeakSafe — навмисна зміна поведінки,
-    #          не регресія; той самий вхід під PeakSafeEstimate=true
-    #          лишається ALLOW+WARNING — доведено в A25)
+    #       -> A24 (у 5.2.3 інвертовано: below-floor-але-достатньо
+    #          БЛОКУВАВ BelowFloorEstimateNotPeakSafe; з 5.2.4 Archive
+    #          використовує ArchivePeakSafe, і A24 знову перевіряє ALLOW +
+    #          WARNING BelowHealthFloorButRequirementSatisfied)
     #   MergeSpaceResultsKeepsFloorBlockingWithoutEstimate      -> A5
     #   MergeSpaceResultsKeepsFloorBlockingWhenEstimateAlsoInsufficient -> A4/A10
     #   MergeSpaceResultsEstimatedFailureBlocksEvenWhenFloorPasses -> A4

@@ -20,8 +20,8 @@ VERSION.json:
   sourceCommit:    0a51d9780c114130f9e4c7b325d4926f8f20c8bb
 ```
 
-`sourceCommit` вказує на batьківський коміт `0a51d97` (PR #48, канонічний
-ROADMAP.md) — стандартний self-referencing patern stamp-коміту. Якщо перед
+`sourceCommit` вказує на батьківський коміт `0a51d97` (PR #48, канонічний
+ROADMAP.md) — стандартний self-referencing патерн stamp-коміту. Якщо перед
 реальним прогоном додасться ще хоч один коміт на `developer` (включно з
 docs-only) — **обов'язково перестемпити** (`ci\Update-BRAVOVersionStamp.ps1
 -Apply`) перед стартом, інакше evidence-документ знову описуватиме не той

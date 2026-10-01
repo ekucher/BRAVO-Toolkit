@@ -1468,7 +1468,7 @@ function Import-BravoConfiguration {
         # Import-BravoConfiguration має прямих викликачів двох класів (Wave
         # B, issue #216):
         #
-        #   ПЕРЕДАЮТЬ прапорець (14, production/operator entrypoint-и —
+        #   ПЕРЕДАЮТЬ прапорець (15, production/operator entrypoint-и —
         #   оператор НЕ очікує, що підкладений поруч BRAVO.config мовчки
         #   стане primary-шаром): 4 канонічні production runtime-
         #   entrypoint-и (Archive/Health/Maintenance/DataRestore через
@@ -1479,7 +1479,10 @@ function Import-BravoConfiguration {
         #   BRAVO_NOTIFICATION_TEST.ps1, BRAVO_RESTORE_TEST.ps1,
         #   BRAVO_TASKS_DIAGNOSE.ps1, BRAVO_TASKS_INSTALL.ps1,
         #   BRAVO_TASKS_UNINSTALL.ps1 — усі це штатні інструменти
-        #   оператора, а не migration-tooling.
+        #   оператора, а не migration-tooling. Issue #154 (B7): 15-й —
+        #   BRAVO_OPERATIONS_HEARTBEAT.ps1 (до B7 викликав цю функцію без
+        #   прапорця). Канонічний перелік і AST-інваріант його повноти —
+        #   ci\BRAVOConfigV2CutoverGates.ps1.
         #
         #   НЕ передають прапорець (migration/deploy-інструментарій, де
         #   читання РЕАЛЬНОГО поточного/site BRAVO.config — сама мета
