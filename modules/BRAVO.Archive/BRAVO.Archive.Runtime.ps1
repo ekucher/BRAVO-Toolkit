@@ -483,7 +483,11 @@ $compatibilityMode = $false  # Автоматично визначається �
 $configuredOutputEncoding = [System.Text.Encoding]::GetEncoding($consoleSettings.OutputEncodingCodePage)
 $global:OutputEncoding = $configuredOutputEncoding
 try {
-    [Console]::OutputEncoding = $configuredOutputEncoding
+    # Див. Test-BRAVOConsoleCodePageChangeSafe: UTF-8 у консолі SYSTEM на
+    # Windows до 10 ламає Write-Host з кирилицею (Win32 0x1F).
+    if (Test-BRAVOConsoleCodePageChangeSafe -CodePage $configuredOutputEncoding.CodePage) {
+        [Console]::OutputEncoding = $configuredOutputEncoding
+    }
 } catch {
     # Деякі PowerShell-hosts і запуски через Task Scheduler не мають
     # дійсного консольного дескриптора. Кодування зовнішніх команд уже

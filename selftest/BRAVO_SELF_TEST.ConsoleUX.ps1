@@ -507,3 +507,29 @@ function Test-BRAVOSelfTestDuplicateDefinition {
         -Condition ($selfTestNoPauseElapsed.TotalSeconds -lt 2) `
         -Name "ConsoleUX/30-SelfTestNoPauseStillReturnsImmediately" `
         -Failure "Wait-BRAVOManualExit -NoPause (та сама функція, яку BRAVO_SELF_TEST.ps1 викликає наприкінці) має повертатися миттєво; зайняло $($selfTestNoPauseElapsed.TotalSeconds) с"
+
+    # 31. Консоль SYSTEM (сесія 0) на Windows до 10 з кодовою сторінкою
+    # 65001 не може вивести кирилицю (Win32 0x1F) — заплановані завдання
+    # падали з кодом 1 до відкриття логу. Кодову сторінку консолі там не
+    # перемикаємо; Windows 10+ та інтерактивні запуски — без змін.
+    if (-not (Get-Command -Name Test-BRAVOConsoleCodePageChangeSafe -ErrorAction SilentlyContinue)) {
+        Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -ErrorAction Stop
+    }
+    $legacyConsoleOs = [Version]'6.2.9200'
+    $modernConsoleOs = [Version]'10.0.17763'
+    Test-BRAVOCondition `
+        -Condition (
+            (-not (Test-BRAVOConsoleCodePageChangeSafe -CodePage 65001 -OSVersion $legacyConsoleOs -UserInteractive $false)) -and
+            (Test-BRAVOConsoleCodePageChangeSafe -CodePage 65001 -OSVersion $legacyConsoleOs -UserInteractive $true) -and
+            (Test-BRAVOConsoleCodePageChangeSafe -CodePage 65001 -OSVersion $modernConsoleOs -UserInteractive $false) -and
+            (Test-BRAVOConsoleCodePageChangeSafe -CodePage 866 -OSVersion $legacyConsoleOs -UserInteractive $false)
+        ) `
+        -Name "ConsoleUX/31-LegacySystemConsoleKeepsCodePage" `
+        -Failure "Test-BRAVOConsoleCodePageChangeSafe має забороняти 65001 лише на Windows < 10 у неінтерактивній сесії"
+    Test-BRAVOCondition `
+        -Condition (
+            $compatibilityScriptText.Contains('if (-not (Test-BRAVOConsoleCodePageChangeSafe -CodePage $CodePage)) {') -and
+            $archiveScriptText.Contains('if (Test-BRAVOConsoleCodePageChangeSafe -CodePage $configuredOutputEncoding.CodePage) {')
+        ) `
+        -Name "ConsoleUX/32-ConsoleCodePageSwitchIsGuarded" `
+        -Failure "Initialize-BRAVOConsoleEncoding і налаштування консолі Archive мають перевіряти Test-BRAVOConsoleCodePageChangeSafe перед [Console]::OutputEncoding"

@@ -1,5 +1,19 @@
 # Changelog
 
+## 5.2.5-rc.3 — 2026-10-02
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.2` (нижче).
+
+- **Fix: на Windows Server 2012/2012 R2 заплановані завдання завершувались з кодом 1 без логу.**
+  Runtime перемикав кодову сторінку консолі на UTF-8 (65001). У консолі SYSTEM (сесія 0)
+  на Windows до 10 після цього перший `Write-Host` з кирилицею падав з Win32 `0x1F`
+  ("A device attached to the system is not functioning"), тож `BRAVO_ARCHIV`,
+  `BRAVO_ARCHIV_HEALTH` і `BRAVO_MAINTENANCE` гинули до відкриття журналу. Ручний запуск
+  з консолі адміністратора дефекту не показував. Новий `Test-BRAVOConsoleCodePageChangeSafe`
+  (BRAVO.Compatibility): на Windows < 10 у неінтерактивній сесії кодова сторінка консолі не
+  змінюється (`$OutputEncoding` для зовнішніх програм — як і раніше); Windows 10+ та
+  інтерактивні запуски — без змін. Дефект присутній і в `5.2.4`.
+
 ## 5.2.5-rc.2 — 2026-10-01
 
 Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.1` (нижче).

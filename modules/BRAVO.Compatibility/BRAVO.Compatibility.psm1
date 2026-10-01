@@ -17,6 +17,28 @@ function Assert-BRAVOPowerShellCompatibility {
     }
 }
 
+# Чи безпечно перемикати кодову сторінку самої консолі. На Windows до 10
+# (Server 2012/2012 R2, Windows 8.1) консоль із кодовою сторінкою 65001
+# не може вивести не-ASCII текст: WriteConsole повертає ERROR_GEN_FAILURE
+# (31, "A device attached to the system is not functioning"), і перший же
+# Write-Host з кирилицею обриває скрипт. У ручному запуску консоль із
+# TrueType-шрифтом це переживає, а консоль SYSTEM у сесії 0 (заплановані
+# завдання) — ні: завдання завершувались з кодом 1 ще до відкриття логу.
+# Тому на старих ОС у неінтерактивній сесії кодову сторінку консолі не
+# чіпаємо: Write-Host виводить Unicode через WriteConsoleW і без неї.
+function Test-BRAVOConsoleCodePageChangeSafe {
+    [CmdletBinding()]
+    param(
+        [int]$CodePage = 65001,
+        [Version]$OSVersion = [Environment]::OSVersion.Version,
+        [bool]$UserInteractive = [Environment]::UserInteractive
+    )
+
+    if ($CodePage -ne 65001) { return $true }
+    if ($OSVersion.Major -ge 10) { return $true }
+    return $UserInteractive
+}
+
 function Initialize-BRAVOConsoleEncoding {
     [CmdletBinding()]
     param([int]$CodePage = 65001)
@@ -33,6 +55,9 @@ function Initialize-BRAVOConsoleEncoding {
         # програмами, а Console.OutputEncoding узгоджує кодову сторінку
         # самого вікна консолі. Помилка в сеансі без консолі не є критичною.
         $global:OutputEncoding = $consoleEncoding
+        if (-not (Test-BRAVOConsoleCodePageChangeSafe -CodePage $CodePage)) {
+            return $false
+        }
         try {
             [Console]::OutputEncoding = $consoleEncoding
         } catch {
