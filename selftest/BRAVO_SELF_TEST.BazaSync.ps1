@@ -613,15 +613,21 @@
         # =======================================================================
         $bazaArchiveScriptText = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
 
+        # #292: call sites Main/-SyncBAZA тепер ходять через ЄДИНИЙ диспетчер
+        # Invoke-BRAVOBazaCanonicalSync; incremental- і legacy-виклики живуть
+        # лише всередині нього (AST-guard: BazaSync/NoProductionBazaSyncPathBypassesCanonicalDispatcher).
         foreach ($component in @(
-            @{ Key = 'BAZA_APP'; IncrementalCall = "Invoke-BRAVOBazaIncrementalSync -Component 'BAZA_APP'"; LegacyCall = 'Sync-FolderToSFTP -WinSCPPath $winSCPPath -RepositorySFTPUrl $sftpUrl -HostKey $sftpHostKey -LocalDirectory $bazaAppPaths.Source' }
-            @{ Key = 'BAZA_WWW'; IncrementalCall = "Invoke-BRAVOBazaIncrementalSync -Component 'BAZA_WWW'"; LegacyCall = '$bazaWWWSFTPSync = Sync-FolderToSFTP `' }
+            @{ Key = 'BAZA_APP'; CanonicalCall = "Invoke-BRAVOBazaCanonicalSync -Component 'BAZA_APP'" }
+            @{ Key = 'BAZA_WWW'; CanonicalCall = "Invoke-BRAVOBazaCanonicalSync -Component 'BAZA_WWW'" }
         )) {
-            Test-BRAVOCondition -Condition ($bazaArchiveScriptText.Contains($component.IncrementalCall)) `
-                -Name "BazaSync/Archive$($component.Key)UsesIncrementalSyncFunction" -Failure "не знайдено виклик $($component.IncrementalCall) в Archive.Runtime.ps1"
-            Test-BRAVOCondition -Condition ($bazaArchiveScriptText.Contains($component.LegacyCall)) `
-                -Name "BazaSync/Archive$($component.Key)PreservesLegacySyncFolderToSFTPPath" -Failure "legacy Sync-FolderToSFTP шлях для $($component.Key) має лишитись незмінним (backward-compat fallback при Mode != IncrementalAppendOnly)"
+            Test-BRAVOCondition -Condition ($bazaArchiveScriptText.Contains($component.CanonicalCall)) `
+                -Name "BazaSync/Archive$($component.Key)UsesCanonicalSyncDispatcher" -Failure "не знайдено виклик $($component.CanonicalCall) в Archive.Runtime.ps1"
         }
+        Test-BRAVOCondition -Condition (
+            $bazaArchiveScriptText.Contains('Invoke-BRAVOBazaIncrementalSync -Component $Component -LocalDirectory $LocalDirectory -RemoteDirectory $RemoteDirectory') -and
+            $bazaArchiveScriptText.Contains('$legacySuccess = Sync-FolderToSFTP `')
+        ) -Name 'BazaSync/CanonicalDispatcherPreservesIncrementalAndLegacyBranches' `
+            -Failure 'Invoke-BRAVOBazaCanonicalSync має містити і incremental-виклик, і legacy Sync-FolderToSFTP (backward-compat при явному Mode=Legacy)'
 
         Test-BRAVOCondition -Condition (
             $bazaArchiveScriptText.Contains('$bazaSyncResultsForHealth = @{}') -and
@@ -2230,6 +2236,424 @@
             $mrReconcileEntrypointText -match '\$acceptList\s*=\s*@\(if\s'
         ) -Name 'BazaSync/ReconcileAcceptListAssignmentStaysArrayWrapped' -Failure 'BRAVO_BAZA_RECONCILE: $acceptList має присвоюватися як @(if ...) — if-вираз без обгортки розгортає одноелементний масив у скаляр і .Count падає під StrictMode 2.0'
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ReconcileRenamesRemoteAndRemovesStateEntry' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/SyncBazaUsesCanonicalEngine') { try {
+        # =======================================================================
+        # #292: -SyncBAZA (задача BAZASync, кожні 4 год) і Main ділять ОДИН
+        # канонічний двигун. Раніше -SyncBAZA завжди йшов у legacy
+        # Sync-FolderToSFTP (`synchronize remote -mirror`) повз
+        # IncrementalAppendOnly/MutationPolicy: локально зіпсований файл
+        # перезаписував перевірену remote-копію.
+        # BEGIN SYNCBAZA-CANONICAL
+        # =======================================================================
+        & {
+        $sbArchiveText = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
+        $sbAst = [System.Management.Automation.Language.Parser]::ParseInput($sbArchiveText, [ref]$null, [ref]$null)
+        $sbFunctionAsts = @{}
+        foreach ($sbFn in @($sbAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+            if (-not $sbFunctionAsts.ContainsKey($sbFn.Name)) { $sbFunctionAsts[$sbFn.Name] = $sbFn }
+        }
+
+        # --- Структурні guard-и: один диспетчер, жодного обхідного шляху ------
+        $sbCanonicalAst = $sbFunctionAsts['Invoke-BRAVOBazaCanonicalSync']
+        $sbManualAst = $sbFunctionAsts['Invoke-ManualBAZASFTPSynchronization']
+        $sbMainAst = $sbFunctionAsts['Main']
+        $sbCommandsIn = {
+            param($Ast, $CommandName)
+            if ($null -eq $Ast) { return @() }
+            return @($Ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq $CommandName
+            }, $true))
+        }
+        Test-BRAVOCondition -Condition (
+            $null -ne $sbCanonicalAst -and $null -ne $sbManualAst -and $null -ne $sbMainAst -and
+            @(& $sbCommandsIn $sbManualAst 'Invoke-BRAVOBazaCanonicalSync').Count -ge 1 -and
+            @(& $sbCommandsIn $sbMainAst 'Invoke-BRAVOBazaCanonicalSync').Count -ge 2
+        ) -Name 'BazaSync/SyncBazaAndMainResolveToSameCanonicalDispatcher' `
+          -Failure '-SyncBAZA (Invoke-ManualBAZASFTPSynchronization) і Main мають викликати ОДНУ функцію Invoke-BRAVOBazaCanonicalSync (Main — для BAZA_APP і BAZA_WWW) — інакше "Main = безпечний двигун, -SyncBAZA = legacy" знову можливе'
+
+        $sbOutsideCanonical = {
+            param($CommandName)
+            return @(@(& $sbCommandsIn $sbAst $CommandName) | Where-Object {
+                $p = $_.Parent
+                while ($null -ne $p -and -not ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $p.Name -eq 'Invoke-BRAVOBazaCanonicalSync')) { $p = $p.Parent }
+                $null -eq $p
+            })
+        }
+        $sbLegacyOutside = @(& $sbOutsideCanonical 'Sync-FolderToSFTP')
+        $sbIncrementalOutside = @(& $sbOutsideCanonical 'Invoke-BRAVOBazaIncrementalSync')
+        Test-BRAVOCondition -Condition (
+            $sbLegacyOutside.Count -eq 0 -and $sbIncrementalOutside.Count -eq 0 -and
+            @(& $sbCommandsIn $sbCanonicalAst 'Sync-FolderToSFTP').Count -eq 1 -and
+            @(& $sbCommandsIn $sbCanonicalAst 'Invoke-BRAVOBazaIncrementalSync').Count -eq 1
+        ) -Name 'BazaSync/NoProductionBazaSyncPathBypassesCanonicalDispatcher' `
+          -Failure "Sync-FolderToSFTP та Invoke-BRAVOBazaIncrementalSync для BAZA мають викликатися ЛИШЕ з Invoke-BRAVOBazaCanonicalSync; поза ним: legacy=$($sbLegacyOutside.Count) incremental=$($sbIncrementalOutside.Count)"
+
+        $sbCanonicalText = if ($null -ne $sbCanonicalAst) { $sbCanonicalAst.Extent.Text } else { '' }
+        Test-BRAVOCondition -Condition (
+            $sbCanonicalText.Contains("`$mode -eq 'IncrementalAppendOnly'") -and
+            $sbCanonicalText.Contains("`$mode -eq 'Legacy'") -and
+            $sbCanonicalText.Contains('невідомий backupMonitoring.SFTP.BAZA.Mode') -and
+            $sbCanonicalText.Contains("-eq 'COMPLETE'")
+        ) -Name 'BazaSync/CanonicalDispatcherLegacyOnlyOnExplicitModeAndFailsClosed' `
+          -Failure 'Invoke-BRAVOBazaCanonicalSync: legacy mirror лише за явного Mode=Legacy, невідомий Mode — fail-closed (не legacy), успіх incremental лише COMPLETE'
+
+        Test-BRAVOCondition -Condition (
+            $sbArchiveText.Contains('$script:processExitCode = if ($manualSyncSuccess) { 0 } else { Resolve-BRAVOExitCode -SftpFailed }') -and
+            $sbArchiveText.Contains('$manualSyncSuccess = [bool]$manualSyncResult.Success') -and
+            $sbArchiveText.Contains('$script:archiveFinalOperationsEventContext = @{') -and
+            $sbArchiveText.Contains('syncBaza = $true')
+        ) -Name 'BazaSync/SyncBazaFailureMapsToSftpFailedExitAndOperationsEvent' `
+          -Failure '-SyncBAZA: не-COMPLETE результат двигуна має давати exit SftpFailed (50) через $manualSyncResult.Success і нести статус двигуна у фінальній Operations-події'
+
+        # --- Поведінкова матриця ЧЕРЕЗ вхідну функцію -SyncBAZA ---------------
+        $sbNeededFunctions = @(
+            'Invoke-BRAVOBazaCanonicalSync', 'Invoke-BRAVOBazaIncrementalSync',
+            'Invoke-ManualBAZASFTPSynchronization', 'New-BRAVOTransferOperationResult',
+            'Get-BRAVOManualSyncRunOutcomeLabel'
+        )
+        $sbDefinitions = (@($sbNeededFunctions | ForEach-Object { $sbFunctionAsts[$_].Extent.Text }) -join "`n`n")
+        $sbSavedBackupMonitoring = $null
+        $sbHadBackupMonitoring = Test-Path -LiteralPath 'Variable:global:backupMonitoring'
+        if ($sbHadBackupMonitoring) { $sbSavedBackupMonitoring = $global:backupMonitoring }
+        $sbSavedStateRoot = $null
+        $sbHadStateRoot = Test-Path -LiteralPath 'Variable:global:stateRoot'
+        if ($sbHadStateRoot) { $sbSavedStateRoot = $global:stateRoot }
+        $sbModule = New-Module -ScriptBlock {}
+        try {
+            # Dot-source у scope модуля: визначення функцій/змінних мають пережити виклик.
+            $sbDefinitionScript = [scriptblock]::Create(@'
+                $script:LegacyMirrorCalls = 0
+                $script:EngineSessionCalls = 0
+                $script:EngineSession = $null
+                $script:AuditProvider = $null
+                $script:Messages = New-Object System.Collections.Generic.List[string]
+                $sftpUrl = 'sftp://192.0.2.10'
+                $sftpHostKey = 'ssh-ed25519 256 fake'
+                $winSCPPath = 'C:\fake\Tools\WinSCP.com'
+                $winSCPAssemblyPath = 'C:\fake\Tools\WinSCPnet.dll'
+                $sftpConnectionTimeoutSeconds = 30
+                $componentSettings = @{ Synchronization = @{ BAZA_APP_SFTP = $true; BAZA_WWW_SFTP = $false } }
+                $bazaAppPaths = @{ Source = '' }
+                $bazaWWWPaths = @{ Source = '' }
+                $bazaWWWDetection = @{ Success = $false; Reason = 'не використовується' }
+                $sftpDirectories = @{ BAZA = 'baza_app'; BAZAWWW = 'baza_www' }
+                function Write-BRAVOLog { param($Component, $Message, $Level, [switch]$NoTimestamp) [void]$script:Messages.Add([string]$Message) }
+                function Show-ScriptProgress { param($Status, $PercentComplete, [switch]$Completed) }
+                function Test-PathWithLog { param($Path, $Description, $CreateIfMissing) return (Test-Path -LiteralPath $Path) }
+                function Test-SFTPConfig { param([switch]$SynchronizationOnly, [switch]$BAZAOnly) return $true }
+                function Test-SFTPConnection { param($WinSCPPath, $RepositorySFTPUrl, $HostKey) return $true }
+                function Initialize-BRAVOSFTPRemoteDirectories { param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $RemoteDirectories) }
+                function Get-BRAVOWinSCPDotNetComponents { param($WinSCPAssemblyPath, $WinSCPPath) return [pscustomobject]@{ AssemblyPath = 'C:\fake\WinSCPnet.dll'; ExecutablePath = 'C:\fake\winscp.exe' } }
+                function New-BRAVOBazaArchiveFullAuditProvider { param($LocalDirectory, $RemotePath, $RepositorySFTPUrl, $HostKey) return $script:AuditProvider }
+                # Legacy `synchronize remote -mirror -criteria=time,size`: remote
+                # приводиться до local (перезапис за розміром), без MutationPolicy.
+                function Sync-FolderToSFTP {
+                    param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $LocalDirectory, $RemoteDirectory, $ComponentName)
+                    $script:LegacyMirrorCalls++
+                    foreach ($f in @(Get-ChildItem -LiteralPath $LocalDirectory -File)) {
+                        $script:EngineSession.State.RemoteSizes["/$($RemoteDirectory.Trim('/'))/$($f.Name)"] = [int64]$f.Length
+                    }
+                    $script:lastBAZASyncOutcome = $null
+                    return $true
+                }
+                # Справжній двигун + machine-wide lock; лише WinSCP-сесія замінена фейком.
+                function Invoke-BRAVOBazaComponentSyncSession {
+                    param($Component, $LocalDirectory, $RemoteRootPath, $RepositorySFTPUrl, $HostKey, $WinSCPAssemblyPath, $WinSCPExecutablePath, $StateRoot,
+                        $ConnectionTimeoutSeconds, $OperationTimeoutSeconds, $MutationPolicy, $AutoArchiveMutationThreshold,
+                        [switch]$BootstrapIfNeeded, $FullAuditProvider, $FullAuditEveryDays, [switch]$ForceFullAudit, [switch]$WriteCheckpoint)
+                    $script:EngineSessionCalls++
+                    if ($script:ForceSkippedConcurrent) {
+                        $sk = New-BRAVOBazaSyncResult -Component $Component -CycleId (New-BRAVOBazaCycleId) -StartedUtc (Get-Date).ToUniversalTime() -CutoffUtc (Get-Date).ToUniversalTime()
+                        $sk.Status = 'SKIPPED_CONCURRENT'
+                        return $sk
+                    }
+                    $cycleId = New-BRAVOBazaCycleId
+                    $startedUtc = (Get-Date).ToUniversalTime()
+                    $lock = Enter-BRAVOBazaSyncLock -StateRoot $StateRoot -Component $Component
+                    if (-not $lock.Success) {
+                        $r = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
+                        $r.Status = if ($lock.Classification -eq 'Busy') { 'SKIPPED_CONCURRENT' } else { 'ERROR' }
+                        $r.Error = [string]$lock.Error
+                        return $r
+                    }
+                    try {
+                        return Invoke-BRAVOBazaSynchronization -Component $Component -LocalDirectory $LocalDirectory -RemoteRootPath $RemoteRootPath `
+                            -Session $script:EngineSession -StateRoot $StateRoot -MutationPolicy $MutationPolicy `
+                            -AutoArchiveMutationThreshold $AutoArchiveMutationThreshold -BootstrapIfNeeded:$BootstrapIfNeeded `
+                            -FullAuditProvider $FullAuditProvider -FullAuditEveryDays $FullAuditEveryDays -ForceFullAudit:$ForceFullAudit
+                    } finally { $lock.Stream.Dispose() }
+                }
+'@ + "`n" + $sbDefinitions)
+            . $sbModule.NewBoundScriptBlock($sbDefinitionScript)
+
+            $sbRun = {
+                param($Module, $Local, $State, $Session, $Mode = 'IncrementalAppendOnly', [int]$Threshold = 0, $AuditProvider = $null)
+                $global:stateRoot = $State
+                $global:backupMonitoring = @{
+                    SFTP = @{
+                        SynchronizationTimeoutSeconds = 60; OperationTimeoutSeconds = 60
+                        BAZA = @{ Mode = $Mode; MutationPolicy = 'Fail'; StateRoot = $State; FullAuditEnabled = $true; FullAuditEveryDays = 7; AutoArchiveMutationThreshold = $Threshold }
+                    }
+                }
+                $noOp = {
+                    param($Snapshot)
+                    return [pscustomobject]@{ Success = $true; Error = $null; AlreadyMatchingRelativePaths = @(); LocalSizes = @{}; LastWriteTimesUtc = @{} }
+                }
+                $provider = if ($null -ne $AuditProvider) { $AuditProvider } else { $noOp }
+                & $Module {
+                    param($L, $S, $P)
+                    $script:bazaAppPaths = @{ Source = $L }
+                    $script:EngineSession = $S
+                    $script:AuditProvider = $P
+                    $script:LegacyMirrorCalls = 0
+                    $script:EngineSessionCalls = 0
+                } $Local $Session $provider
+                $result = & $Module { Invoke-ManualBAZASFTPSynchronization }
+                $calls = & $Module { [pscustomobject]@{ Legacy = $script:LegacyMirrorCalls; Engine = $script:EngineSessionCalls } }
+                return [pscustomobject]@{ Result = $result; LegacyCalls = $calls.Legacy; EngineCalls = $calls.Engine }
+            }
+            $sbNewCase = {
+                param($Name)
+                $caseRoot = Join-Path $bazaSyncTestRoot "SB_$Name"
+                $caseLocal = Join-Path $caseRoot 'local'
+                New-Item -ItemType Directory -Path $caseLocal -Force | Out-Null
+                return [pscustomobject]@{ Local = $caseLocal; State = (Join-Path $caseRoot 'state') }
+            }
+
+            # 1. Новий файл + стан incremental-двигуна оновлюється через -SyncBAZA
+            $sbCase1 = & $sbNewCase 'New'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase1.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession1 = New-BRAVOSelfTestFakeBazaSession
+            $sbRun1 = & $sbRun $sbModule $sbCase1.Local $sbCase1.State $sbSession1
+            $sbStatePath1 = Get-BRAVOBazaStatePath -StateRoot $sbCase1.State -Component 'BAZA_APP'
+            $sbState1 = Read-BRAVOBazaState -Path $sbStatePath1
+            Test-BRAVOCondition -Condition (
+                $sbRun1.Result.Success -eq $true -and $sbRun1.Result.Results.SyncOutcomes['BAZA_APP'].Status -eq 'COMPLETE' -and
+                $sbRun1.Result.Results.SyncOutcomes['BAZA_APP'].Mode -eq 'IncrementalAppendOnly' -and
+                $sbRun1.LegacyCalls -eq 0 -and $sbRun1.EngineCalls -eq 1 -and
+                [int64]$sbSession1.State.RemoteSizes['/baza_app/a.txt'] -eq 100 -and
+                $sbState1.Exists -and $sbState1.State.Files.ContainsKey('a.txt') -and [bool]$sbState1.State.Files['a.txt'].Verified -and
+                -not [string]::IsNullOrWhiteSpace([string]$sbState1.State.LastSuccessfulSyncUtc)
+            ) -Name 'BazaSync/SyncBazaNewRemoteFileUploadedViaIncrementalEngineAndStateUpdated' `
+              -Failure "-SyncBAZA має передати новий файл через incremental-двигун (не legacy) і оновити incremental-стан; Success=$($sbRun1.Result.Success) Legacy=$($sbRun1.LegacyCalls) Engine=$($sbRun1.EngineCalls)"
+
+            # 2. Без змін: нуль передач, успіх
+            $sbSession2 = New-BRAVOSelfTestFakeBazaSession -SeedRemoteState $sbSession1.State
+            $sbRun2 = & $sbRun $sbModule $sbCase1.Local $sbCase1.State $sbSession2
+            Test-BRAVOCondition -Condition (
+                $sbRun2.Result.Success -eq $true -and $sbSession2.State.PutFilesCallCount -eq 0 -and $sbRun2.LegacyCalls -eq 0
+            ) -Name 'BazaSync/SyncBazaUnchangedFileMakesNoTransfer' -Failure "-SyncBAZA без змін: нуль PutFiles, успіх; PutFiles=$($sbSession2.State.PutFilesCallCount) Status=$($sbRun2.Result.Results.SyncOutcomes['BAZA_APP'].Status) Error=$($sbRun2.Result.Results.BAZA_APP.Error)"
+
+            # 3. Локально змінений вже підтверджений файл: MUTATION_VIOLATION =
+            #    ПОМИЛКА, remote-копія НЕ перезаписана, стан не просунуто.
+            $sbProvenance = {
+                param($Path)
+                $r = Read-BRAVOBazaState -Path $Path
+                if ($r.Exists -and -not $r.Corrupt) { return [string]$r.State.LastSuccessfulSyncUtc }
+                return ''
+            }
+            $sbProvenanceBefore = & $sbProvenance $sbStatePath1
+            [IO.File]::WriteAllBytes((Join-Path $sbCase1.Local 'a.txt'), (New-Object byte[] 999))
+            $sbSession3 = New-BRAVOSelfTestFakeBazaSession -SeedRemoteState $sbSession1.State
+            $sbRun3 = & $sbRun $sbModule $sbCase1.Local $sbCase1.State $sbSession3
+            Test-BRAVOCondition -Condition (
+                $sbRun3.Result.Success -eq $false -and
+                $sbRun3.Result.Results.SyncOutcomes['BAZA_APP'].Status -eq 'MUTATION_VIOLATION' -and
+                $sbRun3.Result.Results.BAZA_APP.Success -eq $false -and
+                [string]$sbRun3.Result.Results.BAZA_APP.Error -match 'a\.txt' -and
+                [int64]$sbSession3.State.RemoteSizes['/baza_app/a.txt'] -eq 100 -and
+                $sbSession3.State.PutFilesCallCount -eq 0 -and $sbRun3.LegacyCalls -eq 0 -and
+                (& $sbProvenance $sbStatePath1) -eq $sbProvenanceBefore
+            ) -Name 'BazaSync/SyncBazaMutationViolationFailsAndRemoteGoodCopyNotOverwritten' `
+              -Failure "-SyncBAZA: локально змінений підтверджений файл має дати MUTATION_VIOLATION=ПОМИЛКА, remote лишається 100 байт, нуль PutFiles/legacy, provenance не просунуто; Success=$($sbRun3.Result.Success) Status=$($sbRun3.Result.Results.SyncOutcomes['BAZA_APP'].Status) Remote=$($sbSession3.State.RemoteSizes['/baza_app/a.txt']) Legacy=$($sbRun3.LegacyCalls)"
+
+            # 4. Remote змінено поза BRAVO при незмінному local: -SyncBAZA не
+            #    перезаписує (append-only), remote лишається як є.
+            $sbSession4 = New-BRAVOSelfTestFakeBazaSession -SeedRemoteState $sbSession1.State
+            [IO.File]::WriteAllBytes((Join-Path $sbCase1.Local 'a.txt'), (New-Object byte[] 100))
+            $sbSession4.State.RemoteSizes['/baza_app/a.txt'] = [int64]7
+            $sbRun4 = & $sbRun $sbModule $sbCase1.Local $sbCase1.State $sbSession4
+            Test-BRAVOCondition -Condition (
+                $sbSession4.State.PutFilesCallCount -eq 0 -and [int64]$sbSession4.State.RemoteSizes['/baza_app/a.txt'] -eq 7 -and $sbRun4.LegacyCalls -eq 0
+            ) -Name 'BazaSync/SyncBazaRemoteChangedFileIsNeverBlindlyMirrored' `
+              -Failure "-SyncBAZA не має 'вирівнювати' змінений на remote файл перезаписом (legacy mirror); PutFiles=$($sbSession4.State.PutFilesCallCount) Remote=$($sbSession4.State.RemoteSizes['/baza_app/a.txt'])"
+
+            # 5. Same-name конфлікт: новий local-файл, remote-ім'я зайняте іншим розміром
+            $sbCase5 = & $sbNewCase 'Conflict'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase5.Local -RelativePath 'base.txt' -SizeBytes 40)
+            [void](& $sbRun $sbModule $sbCase5.Local $sbCase5.State (New-BRAVOSelfTestFakeBazaSession))
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase5.Local -RelativePath 'b.txt' -SizeBytes 100)
+            $sbSession5 = New-BRAVOSelfTestFakeBazaSession
+            $sbSession5.State.RemoteSizes['/baza_app/b.txt'] = [int64]55
+            $sbRun5 = & $sbRun $sbModule $sbCase5.Local $sbCase5.State $sbSession5
+            Test-BRAVOCondition -Condition (
+                $sbRun5.Result.Success -eq $false -and
+                $sbRun5.Result.Results.SyncOutcomes['BAZA_APP'].Status -eq 'REMOTE_CONFLICT' -and
+                [int64]$sbSession5.State.RemoteSizes['/baza_app/b.txt'] -eq 55 -and
+                $sbSession5.State.PutFilesCallCount -eq 0 -and $sbRun5.LegacyCalls -eq 0
+            ) -Name 'BazaSync/SyncBazaRemoteConflictFailsWithoutOverwrite' `
+              -Failure "-SyncBAZA: same-name конфлікт має дати REMOTE_CONFLICT=ПОМИЛКА без перезапису; Status=$($sbRun5.Result.Results.SyncOutcomes['BAZA_APP'].Status) Error=$($sbRun5.Result.Results.BAZA_APP.Error) Remote=$($sbSession5.State.RemoteSizes['/baza_app/b.txt'])"
+
+            # 6. Несумісне ім'я: сумісні файли передано, цикл — ПОМИЛКА
+            $sbCase6 = & $sbNewCase 'Incompatible'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase6.Local -RelativePath 'seed.txt' -SizeBytes 10)
+            [void](& $sbRun $sbModule $sbCase6.Local $sbCase6.State (New-BRAVOSelfTestFakeBazaSession))
+            $sbLongName = ('a' * 250) + '.txt'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase6.Local -RelativePath $sbLongName -SizeBytes 20)
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase6.Local -RelativePath 'ok_new.txt' -SizeBytes 30)
+            $sbSession6 = New-BRAVOSelfTestFakeBazaSession
+            $sbRun6 = & $sbRun $sbModule $sbCase6.Local $sbCase6.State $sbSession6
+            Test-BRAVOCondition -Condition (
+                $sbRun6.Result.Success -eq $false -and
+                $sbRun6.Result.Results.SyncOutcomes['BAZA_APP'].Status -eq 'INCOMPATIBLE_NAME' -and
+                [int]$sbRun6.Result.Results.BAZA_APP.IncompatibleNames -eq 1 -and
+                [int64]$sbSession6.State.RemoteSizes['/baza_app/ok_new.txt'] -eq 30 -and
+                -not $sbSession6.State.RemoteSizes.ContainsKey("/baza_app/$sbLongName") -and $sbRun6.LegacyCalls -eq 0
+            ) -Name 'BazaSync/SyncBazaIncompatibleNameFailsButCompatibleFilesTransferred' `
+              -Failure "-SyncBAZA: несумісне ім'я -> INCOMPATIBLE_NAME=ПОМИЛКА, сумісні файли передано; Status=$($sbRun6.Result.Results.SyncOutcomes['BAZA_APP'].Status)"
+
+            # 7. AUDIT_DRIFT
+            $sbCase7 = & $sbNewCase 'AuditDrift'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase7.Local -RelativePath 'drifted.txt' -SizeBytes 100)
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase7.Local -RelativePath 'other.txt' -SizeBytes 60)
+            $sbDriftLocal = $sbCase7.Local
+            $sbDriftProvider = {
+                param($Snapshot)
+                $pending = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $sbDriftLocal 'drifted.txt'); Action = 'UploadUpdate'; Reason = 'розбіжність часу (той самий розмір)' }
+                return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pending) -LocalDirectory $sbDriftLocal -LocalSnapshot $Snapshot
+            }.GetNewClosure()
+            $sbSession7 = New-BRAVOSelfTestFakeBazaSession
+            $sbSession7.State.RemoteSizes['/baza_app/drifted.txt'] = [int64]100
+            $sbRun7 = & $sbRun $sbModule $sbCase7.Local $sbCase7.State $sbSession7 'IncrementalAppendOnly' 0 $sbDriftProvider
+            Test-BRAVOCondition -Condition (
+                $sbRun7.Result.Success -eq $false -and
+                $sbRun7.Result.Results.SyncOutcomes['BAZA_APP'].Status -eq 'AUDIT_DRIFT' -and
+                $sbSession7.State.PutFilesCallCount -eq 0 -and $sbRun7.LegacyCalls -eq 0
+            ) -Name 'BazaSync/SyncBazaAuditDriftFailsWithoutOverwrite' `
+              -Failure "-SyncBAZA: Full Audit drift має дати AUDIT_DRIFT=ПОМИЛКА без перезапису; Status=$($sbRun7.Result.Results.SyncOutcomes['BAZA_APP'].Status) PutFiles=$($sbSession7.State.PutFilesCallCount)"
+
+            # 8. MUTATION_AUTO_ARCHIVED (поріг > 0): rename-preserve, нова версія — наступним циклом
+            $sbCase8 = & $sbNewCase 'AutoArchive'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase8.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession8 = New-BRAVOSelfTestFakeBazaSession
+            [void](& $sbRun $sbModule $sbCase8.Local $sbCase8.State $sbSession8 'IncrementalAppendOnly' 1)
+            [IO.File]::WriteAllBytes((Join-Path $sbCase8.Local 'a.txt'), (New-Object byte[] 150))
+            $sbRun8 = & $sbRun $sbModule $sbCase8.Local $sbCase8.State $sbSession8 'IncrementalAppendOnly' 1
+            $sbRenamed8 = @($sbSession8.State.MoveFileCalls | Where-Object { $_ -match '/baza_app/a\.txt -> /baza_app/a\.txt\.replaced_' })
+            $sbRun8b = & $sbRun $sbModule $sbCase8.Local $sbCase8.State $sbSession8 'IncrementalAppendOnly' 1
+            Test-BRAVOCondition -Condition (
+                $sbRun8.Result.Results.SyncOutcomes['BAZA_APP'].Status -eq 'MUTATION_AUTO_ARCHIVED' -and
+                $sbRenamed8.Count -eq 1 -and $sbRun8.LegacyCalls -eq 0 -and
+                $sbRun8b.Result.Success -eq $true -and [int64]$sbSession8.State.RemoteSizes['/baza_app/a.txt'] -eq 150 -and
+                @($sbSession8.State.RemoteSizes.Keys | Where-Object { $_ -match '^/baza_app/a\.txt\.replaced_' }).Count -eq 1
+            ) -Name 'BazaSync/SyncBazaMutationAutoArchivedPreservesOldRemoteThenUploadsNewVersion' `
+              -Failure "-SyncBAZA з AutoArchiveMutationThreshold: стара remote-версія зберігається (rename *.replaced_*), нова заливається НАСТУПНИМ циклом; Status=$($sbRun8.Result.Results.SyncOutcomes['BAZA_APP'].Status) Renames=$($sbRenamed8.Count) Next=$($sbRun8b.Result.Success)"
+
+            # 9. За явного Mode=Legacy той самий сценарій (локально змінений файл)
+            #    ПЕРЕЗАПИСУЄ remote — поведінка, яку до #292 мав кожен -SyncBAZA.
+            #    Тест фіксує, що legacy лишився лише за явним вибором.
+            $sbCase9 = & $sbNewCase 'LegacyExplicit'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase9.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession9 = New-BRAVOSelfTestFakeBazaSession
+            $sbSession9.State.RemoteSizes['/baza_app/a.txt'] = [int64]100
+            [IO.File]::WriteAllBytes((Join-Path $sbCase9.Local 'a.txt'), (New-Object byte[] 999))
+            $sbRun9 = & $sbRun $sbModule $sbCase9.Local $sbCase9.State $sbSession9 'Legacy'
+            Test-BRAVOCondition -Condition (
+                $sbRun9.LegacyCalls -eq 1 -and $sbRun9.EngineCalls -eq 0 -and
+                [int64]$sbSession9.State.RemoteSizes['/baza_app/a.txt'] -eq 999 -and
+                $sbRun9.Result.Results.SyncOutcomes['BAZA_APP'].Mode -eq 'Legacy'
+            ) -Name 'BazaSync/SyncBazaLegacyMirrorOnlyWhenModeExplicitlyLegacy' `
+              -Failure "legacy mirror (перезапис remote) допустимий лише за явного BAZA.Mode=Legacy; Legacy=$($sbRun9.LegacyCalls) Engine=$($sbRun9.EngineCalls)"
+
+            # 9b. Контр-доказ: той самий сценарій у типовому режимі — remote ЦІЛИЙ
+            $sbCase9b = & $sbNewCase 'LegacyContrast'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase9b.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession9b = New-BRAVOSelfTestFakeBazaSession
+            [void](& $sbRun $sbModule $sbCase9b.Local $sbCase9b.State $sbSession9b)
+            [IO.File]::WriteAllBytes((Join-Path $sbCase9b.Local 'a.txt'), (New-Object byte[] 999))
+            $sbRun9b = & $sbRun $sbModule $sbCase9b.Local $sbCase9b.State $sbSession9b
+            Test-BRAVOCondition -Condition (
+                $sbRun9b.LegacyCalls -eq 0 -and [int64]$sbSession9b.State.RemoteSizes['/baza_app/a.txt'] -eq 100 -and $sbRun9b.Result.Success -eq $false
+            ) -Name 'BazaSync/SyncBazaDefaultModeKeepsGoodRemoteCopyUnlikeLegacyMirror' `
+              -Failure "у типовому режимі той самий сценарій не має перезаписати remote (100 байт); Remote=$($sbSession9b.State.RemoteSizes['/baza_app/a.txt'])"
+
+            # 10. Невідомий Mode: fail-closed, не деградує до legacy mirror
+            $sbCase10 = & $sbNewCase 'UnknownMode'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase10.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession10 = New-BRAVOSelfTestFakeBazaSession
+            $sbRun10 = & $sbRun $sbModule $sbCase10.Local $sbCase10.State $sbSession10 'IncrementalAppendOnlyTypo'
+            Test-BRAVOCondition -Condition (
+                $sbRun10.Result.Success -eq $false -and $sbRun10.LegacyCalls -eq 0 -and $sbRun10.EngineCalls -eq 0 -and
+                $sbSession10.State.PutFilesCallCount -eq 0 -and [string]$sbRun10.Result.Results.BAZA_APP.Error -match 'невідомий'
+            ) -Name 'BazaSync/SyncBazaUnknownModeFailsClosedInsteadOfLegacyMirror' `
+              -Failure "-SyncBAZA з невідомим Mode має завершитися помилкою, а не мовчки піти в legacy mirror; Legacy=$($sbRun10.LegacyCalls)"
+
+            # 11. Спільний machine-wide lock компонента: зайнятий -> нічого не передано, ПОМИЛКА
+            $sbCase11 = & $sbNewCase 'Lock'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase11.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbHeldLock = Enter-BRAVOBazaSyncLock -StateRoot $sbCase11.State -Component 'BAZA_APP'
+            $sbSession11 = New-BRAVOSelfTestFakeBazaSession
+            try {
+                $sbRun11 = & $sbRun $sbModule $sbCase11.Local $sbCase11.State $sbSession11
+            } finally {
+                if ($null -ne $sbHeldLock.Stream) { $sbHeldLock.Stream.Dispose() }
+            }
+            Test-BRAVOCondition -Condition (
+                $sbHeldLock.Success -eq $true -and
+                $sbRun11.Result.Results.SyncOutcomes['BAZA_APP'].Status -match '^(SKIPPED_CONCURRENT|ERROR)$' -and
+                $sbSession11.State.PutFilesCallCount -eq 0 -and $sbRun11.LegacyCalls -eq 0
+            ) -Name 'BazaSync/SyncBazaRespectsSharedComponentSyncLock' `
+              -Failure "-SyncBAZA має брати той самий lock компонента, що Main/Health: при зайнятому lock нічого не передається; Status=$($sbRun11.Result.Results.SyncOutcomes['BAZA_APP'].Status)"
+
+            # 11b. SKIPPED_CONCURRENT (Health тримає lock) — НЕ збій -SyncBAZA (INFO, exit 0), нічого не передано
+            $sbCase11b = & $sbNewCase 'SkippedConcurrent'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase11b.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession11b = New-BRAVOSelfTestFakeBazaSession
+            & $sbModule { $script:ForceSkippedConcurrent = $true }
+            try { $sbRun11b = & $sbRun $sbModule $sbCase11b.Local $sbCase11b.State $sbSession11b } finally { & $sbModule { $script:ForceSkippedConcurrent = $false } }
+            Test-BRAVOCondition -Condition (
+                $sbRun11b.Result.Success -eq $true -and
+                $sbRun11b.Result.Results.SyncOutcomes['BAZA_APP'].Status -eq 'SKIPPED_CONCURRENT' -and
+                $sbRun11b.Result.Results.SyncOutcomes['BAZA_APP'].Success -eq $false -and
+                $sbRun11b.Result.Results.BAZA_APP.Success -eq $true -and
+                $sbSession11b.State.PutFilesCallCount -eq 0 -and $sbRun11b.LegacyCalls -eq 0
+            ) -Name 'BazaSync/SyncBazaSkippedConcurrentIsInfoNotFailure' `
+              -Failure "SKIPPED_CONCURRENT у -SyncBAZA (lock тримає Health) не має давати exit 50; Success=$($sbRun11b.Result.Success)"
+
+            # 11c. Пропуск — не "УСПІШНО": підсумок запуску й Operations-подія кажуть ПРОПУЩЕНО
+            $sbLabel = { param($R) & $sbModule { param($X) Get-BRAVOManualSyncRunOutcomeLabel -ManualSyncResult $X } $R }
+            $sbLabel11b = & $sbLabel $sbRun11b.Result
+            $sbLabel1 = & $sbLabel $sbRun1.Result
+            $sbLabelFailedAndSkipped = & $sbLabel ([pscustomobject]@{ Success = $false; Skipped = $true; Results = $null })
+            $sbLabelLegacyShape = & $sbLabel ([pscustomobject]@{ Success = $true; Results = $null })
+            Test-BRAVOCondition -Condition (
+                $sbRun11b.Result.Skipped -eq $true -and $sbLabel11b -like 'ПРОПУЩЕНО*' -and
+                $sbRun1.Result.Skipped -eq $false -and $sbLabel1 -eq 'УСПІШНО' -and
+                $sbLabelFailedAndSkipped -eq 'ПОМИЛКА' -and $sbLabelLegacyShape -eq 'УСПІШНО' -and
+                $sbArchiveText.Contains('runOutcome = $manualSyncOutcomeLabel') -and
+                $sbArchiveText.Contains('Синхронізація BAZA (-SyncBAZA): $manualSyncOutcomeLabel')
+            ) -Name 'BazaSync/SyncBazaSkippedConcurrentRunOutcomeIsSkippedNotSuccess' `
+              -Failure "SKIPPED_CONCURRENT у -SyncBAZA: exit 0, але runOutcome має бути ПРОПУЩЕНО, не УСПІШНО; skipped='$sbLabel11b' success='$sbLabel1' failed+skipped='$sbLabelFailedAndSkipped'"
+
+            # 12. Mode присутній, але порожній/пробільний -> типовий IncrementalAppendOnly (не fail-closed)
+            $sbCase12 = & $sbNewCase 'EmptyMode'
+            [void](New-BRAVOSelfTestBazaFile -Directory $sbCase12.Local -RelativePath 'a.txt' -SizeBytes 100)
+            $sbSession12 = New-BRAVOSelfTestFakeBazaSession
+            $sbRun12 = & $sbRun $sbModule $sbCase12.Local $sbCase12.State $sbSession12 '  '
+            Test-BRAVOCondition -Condition (
+                $sbRun12.Result.Success -eq $true -and $sbRun12.EngineCalls -eq 1 -and $sbRun12.LegacyCalls -eq 0 -and
+                $sbRun12.Result.Results.SyncOutcomes['BAZA_APP'].Mode -eq 'IncrementalAppendOnly'
+            ) -Name 'BazaSync/SyncBazaEmptyModeTreatedAsDefaultIncremental' `
+              -Failure "порожній/пробільний BAZA.Mode має означати типовий IncrementalAppendOnly; Mode=$($sbRun12.Result.Results.SyncOutcomes['BAZA_APP'].Mode) Error=$($sbRun12.Result.Results.BAZA_APP.Error)"
+        } finally {
+            Remove-Module -ModuleInfo $sbModule -ErrorAction SilentlyContinue
+            if ($sbHadBackupMonitoring) { $global:backupMonitoring = $sbSavedBackupMonitoring } else { Remove-Variable -Name backupMonitoring -Scope Global -ErrorAction SilentlyContinue }
+            if ($sbHadStateRoot) { $global:stateRoot = $sbSavedStateRoot } else { Remove-Variable -Name stateRoot -Scope Global -ErrorAction SilentlyContinue }
+        }
+        }
+        # END SYNCBAZA-CANONICAL
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/SyncBazaUsesCanonicalEngine' } }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

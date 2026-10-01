@@ -131,6 +131,79 @@
   `Maintenance/ForceRestoreDisabledKillsStrayBis` (сторонній `Bis` завершується й за
   `-ForceRestore` + Disabled, спільним хелпером `Stop-BRAVOMaintenanceStrayProcess`).
 
+- **Fix: `BRAVO_ARCHIV -SyncBAZA` більше не обходить IncrementalAppendOnly і MutationPolicy (#292).**
+  Задача BAZASync (кожні 4 год) запускала `-SyncBAZA`, який завжди викликав
+  legacy `Sync-FolderToSFTP` (`synchronize remote -mirror`): локально зіпсований
+  чи зашифрований файл BAZA перезаписував перевірену remote-копію, а
+  incremental-стан не оновлювався. Тепер Main і `-SyncBAZA` викликають ОДНУ
+  функцію `Invoke-BRAVOBazaCanonicalSync`: при `Mode = "IncrementalAppendOnly"`
+  (типовий) діють append-only контракт, MutationPolicy, remote conflict, audit
+  drift, несумісні імена, mutation archive та оновлення стану; legacy mirror
+  лишається лише за явного `Mode = "Legacy"`, а невідомий `Mode` завершується
+  помилкою замість тихого переходу на legacy. Будь-який не-`COMPLETE` статус
+  (`MUTATION_VIOLATION`, `REMOTE_CONFLICT`, `AUDIT_DRIFT`, `INCOMPATIBLE_NAME`,
+  `MUTATION_AUTO_ARCHIVED`) у `-SyncBAZA` дає exit 50, а
+  фінальна Operations-подія `-SyncBAZA` тепер несе режим і статус двигуна по
+  компонентах. Lock компонента спільний з Main/Health (той самий
+  `Invoke-BRAVOBazaComponentSyncSession`). Побічно: у legacy-режимі Main тепер
+  завжди ініціалізує `$script:bazaAppSyncResult`/`$script:bazaWWWSyncResult`.
+  `SKIPPED_CONCURRENT` у `-SyncBAZA` (lock компонента тримає Health) — INFO без збою,
+  як і в Health, але підсумок запуску й Operations-подія (`runOutcome`) кажуть
+  «ПРОПУЩЕНО (інший процес синхронізує компонент)», а не «УСПІШНО»
+  (`BazaSync/SyncBazaSkippedConcurrentRunOutcomeIsSkippedNotSuccess`); порожній/пробільний `BAZA.Mode` = типовий `IncrementalAppendOnly`.
+  `docs/BAZA_SFTP_ACCEPTANCE.md` і README оновлено. Нові self-test перевірки:
+  `BazaSync/SyncBazaSkippedConcurrentIsInfoNotFailure`, `BazaSync/SyncBazaEmptyModeTreatedAsDefaultIncremental`,
+  `BazaSync/SyncBazaAndMainResolveToSameCanonicalDispatcher`,
+  `BazaSync/NoProductionBazaSyncPathBypassesCanonicalDispatcher`,
+  `BazaSync/CanonicalDispatcherLegacyOnlyOnExplicitModeAndFailsClosed`,
+  `BazaSync/SyncBazaFailureMapsToSftpFailedExitAndOperationsEvent`,
+  `BazaSync/SyncBazaNewRemoteFileUploadedViaIncrementalEngineAndStateUpdated`,
+  `BazaSync/SyncBazaUnchangedFileMakesNoTransfer`,
+  `BazaSync/SyncBazaMutationViolationFailsAndRemoteGoodCopyNotOverwritten`,
+  `BazaSync/SyncBazaRemoteChangedFileIsNeverBlindlyMirrored`,
+  `BazaSync/SyncBazaRemoteConflictFailsWithoutOverwrite`,
+  `BazaSync/SyncBazaIncompatibleNameFailsButCompatibleFilesTransferred`,
+  `BazaSync/SyncBazaAuditDriftFailsWithoutOverwrite`,
+  `BazaSync/SyncBazaMutationAutoArchivedPreservesOldRemoteThenUploadsNewVersion`,
+  `BazaSync/SyncBazaLegacyMirrorOnlyWhenModeExplicitlyLegacy`,
+  `BazaSync/SyncBazaDefaultModeKeepsGoodRemoteCopyUnlikeLegacyMirror`,
+  `BazaSync/SyncBazaUnknownModeFailsClosedInsteadOfLegacyMirror`,
+  `BazaSync/SyncBazaRespectsSharedComponentSyncLock`; замінено застарілі текстові
+  перевірки call sites на `BazaSync/ArchiveBAZA_APPUsesCanonicalSyncDispatcher`,
+  `BazaSync/ArchiveBAZA_WWWUsesCanonicalSyncDispatcher`,
+  `BazaSync/CanonicalDispatcherPreservesIncrementalAndLegacyBranches`.
+
+- **Fix: автоматичний відкат `Update-BRAVOServer.ps1` точний, а не «старе поверх нового» (#289).**
+  Відкат копіював backup поверх runtime без видалення: файли, додані новим релізом, лишалися,
+  відновлений старий `RUNTIME_MANIFEST.json` їх не знав, і `BRAVO_RUNTIME_GUARD` блокував
+  Archive/Maintenance/Health/DataRestore кодом `33`, хоча robocopy звітував про успіх. Крім того,
+  задачі Планувальника лишалися такими, як їх зареєстрував новий реліз. Тепер
+  `deploy\BRAVO.Deploy.Rollback.ps1` (PowerShell без robocopy) відновлює owned-набір дзеркально:
+  staged-файли ∪ ключі нового й старого manifest мінус виключення розгортання (`BRAVO.config`,
+  `BRAVO.local.config`, `LOGS`, `MODEL` тощо); додані новим релізом файли видаляються, змінені й
+  видалені повертаються з backup. Відкат успішний (exit `1`) лише коли хеші runtime == старий
+  manifest, `VERSION.json` стара, guard `0`, `BRAVO_SETUP -Action Scheduler` повторно виконано зі
+  старого комплекту і `-ValidateOnly` пройшов; інакше exit `2` «ВІДКАТ НЕ ВДАВСЯ». Нові self-test
+  перевірки: `Rollback/PremiseNewReleaseBreaksOldManifest`, `Rollback/ChangedFilesRestoredToOldContent`,
+  `Rollback/FilesAddedByNewReleaseRemoved`, `Rollback/FileDeletedByNewReleaseIsRestored`,
+  `Rollback/RuntimeEqualsOldManifestAfterRollback`, `Rollback/OperatorOwnedStateSurvivesUntouched`,
+  `Rollback/VerificationDetectsStrayScriptAndHashDrift`,
+  `Rollback/UpdaterUsesExactRestoreNotRobocopyOverlay`,
+  `Rollback/UpdaterReRegistersSchedulerAndFailsLoudly`.
+  Той самий відкат (з тими самими критеріями успіху й контрактом exit `1`/`2`) тепер запускається і
+  при винятку чи збої robocopy розгортання після backup (раніше catch завершував exit `1` з
+  напіврозгорнутим комплектом): `Rollback/UpdaterRollsBackOnFailureAfterDeployStarted`.
+  Ключі manifest з `..`, кореневою, дисковою чи UNC формою відхиляються гучно (відкат не вдався, exit `2`), а
+  повний шлях цілі мусить лишатися під RuntimeRoot до будь-якого видалення/копіювання; верифікація відкату
+  не обходить виключені каталоги (LOGS/MODEL/BAZA...): `Rollback/UnsafeManifestKeysRejectedLoudlyAndNothingOutsideRootTouched`,
+  `Rollback/ResolvedTargetMustStayUnderRoot`, `Rollback/VerificationSkipsExcludedDirsButStillCatchesStrayScripts`,
+  `Rollback/TreeWalkDoesNotEnterExcludedDirs`.
+  Оркестратор відкату `Invoke-BRAVODeployUpdaterRollback` тепер виконується в self-test
+  реально (фейкові guard/BRAVO_SETUP у старому комплекті): порядок guard → Scheduler →
+  ValidateOnly зі старого комплекту, exit 10 не є збоєм відкату, а збій кожного кроку
+  стає проблемою відкату (exit 2): `Rollback/UpdaterOrchestrationReRegistersSchedulerFromRestoredKit`,
+  `Rollback/UpdaterOrchestrationAcceptsSetupWarningExit10`, `Rollback/UpdaterOrchestrationReportsEveryFailedStep`.
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях
