@@ -11652,7 +11652,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $staleReasons.NotRegistered -eq 'завдання BRAVO_ARCHIV не встановлене' -and
             $staleReasons.Disabled -eq 'завдання BRAVO_ARCHIV вимкнене' -and
             $staleReasons.Incomplete -match 'G-NEW' -and $staleReasons.Incomplete -match 'INCOMPLETE' -and $staleReasons.Incomplete -match 'MODEL/SHA512' -and
-            $staleReasons.IncompleteOlder -eq $null -and
+            $null -eq $staleReasons.IncompleteOlder -and
             $staleReasons.BadResult -match '0x80070005' -and $staleReasons.BadResult -match 'TEST_NAME' -and
             @($staleReasons.RunningCodes | Where-Object { $null -ne $_ }).Count -eq 0 -and
             $staleReasons.NotRun -match '^завдання не запускалося з \d\d\.\d\d\.\d{4} \d\d:\d\d$' -and
