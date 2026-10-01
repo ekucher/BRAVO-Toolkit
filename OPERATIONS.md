@@ -1001,7 +1001,8 @@ Start-Service '<BravoWebName>'
 
 Тип запуску (#333): на час restore DataRestore тимчасово переводить
 керовані служби в `Disabled` (початкові типи лежать у маркері
-`BRAVO_SERVICE_QUIESCENCE.json`, поле `startTypeSnapshot`). Якщо в журналі
+`%ProgramData%\BRAVO\State\BRAVO_SERVICE_QUIESCENCE.json`, поле
+`startTypeSnapshot`). Якщо в журналі
 є рядок «Служби лишаються Disabled (утримання від автостарту, #333)»
 (код `43` при незавершеному rollback) — такі служби `Disabled` через
 аварію, а не через адміністратора. ПІСЛЯ ручного відновлення моделі й ПЕРЕД
