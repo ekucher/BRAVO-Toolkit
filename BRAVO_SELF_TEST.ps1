@@ -4330,7 +4330,9 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # Провал реставрації, що потребував відкату, мапиться на
             # RestoreFailed (43) — окремо від збою СТВОРЕННЯ архіву (40).
             $maintenanceRuntimeTextForExitCodes.Contains('-RestoreFailed:$script:restoreFailed') -and
-            # 11 точок restoreArchiveFailed; 10 точок restoreIntegrityFailed.
+            # 13 точок restoreArchiveFailed (11 + 2 від #297: скасування
+            # реставрації перед before-архівом і перед bravocmd, коли служби
+            # не гарантовано зупинені); 10 точок restoreIntegrityFailed.
             # +1 integrity проти fix/repair-rollback-false-positive:
             # Invoke-BRAVOModelRestoreRecovery після успішного відкату повторно
             # валідує модель і, якщо вона ВСЕ ОДНО не консистентна, позначає
@@ -4339,7 +4341,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # 7z t» / «не вдалося створити SHA512») злито в одну гілку
             # Verify-Backup (7z t + SHA512); збій 7z t і далі виставляє
             # restoreIntegrityFailed у Test-BRAVOMaintenanceSevenZipArchiveIntegrity.
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 11) -and
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 13) -and
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 10)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
@@ -10761,6 +10763,130 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Name "Maintenance/RestoreExecutionRevalidatesWindowAtBarrier" `
             -Failure "Test-BRAVORestoreExecutionStillAllowed (спільна для обох TOCTOU-бар'єрів перед bravocmd.exe) має дозволяти автоматичну реставрацію лише всередині вікна ЗАРАЗ (не за старим знімком часу з початку прогону), і завжди дозволяти -ForceRestore незалежно від вікна"
 
+        # --- #321: -ForceRestore + служба BRAVO з типом запуску Disabled.
+        # Раніше $BravoMaintenanceEnabled=$false глушив -ForceRestore:
+        # реставрація мовчки пропускалась зі статусом УСПІШНО. Рішення
+        # винесене в чисту функцію Get-BRAVOMaintenanceRestoreDecision —
+        # перевіряємо її на значеннях (реальний текст runtime), а проводку
+        # (заголовок, каталог, ворота, INFO, відсутність старту служби)
+        # — структурно в межах конкретних фрагментів. Дочірній scope: ліміт
+        # змінних на область flat-файлу (#163).
+        & {
+            param([string]$RuntimeText)
+            $forceDisabledModule = New-BRAVOSelfTestRuntimeModule `
+                -SourceText $RuntimeText `
+                -FunctionNames @('Get-BRAVOMaintenanceRestoreDecision')
+            # Enabled/Disabled/Force/AutomaticDue/WindowOpen/BootIgnores -> Should/OnDisabled.
+            # 'Automatic Running/Stopped' і 'Manual Stopped' для рішення — той самий
+            # Enabled=true (StartMode != Disabled); різниця станів Running/Stopped
+            # живе в проводці нижче (зупинка/старт за serviceWasRunning).
+            $forceDisabledScenarios = @(
+                @{ Label = 'Force+Automatic'; Args = @($true, $false, $true, $false, $false, $false); Should = $true; OnDisabled = $false },
+                @{ Label = 'Force+Manual'; Args = @($true, $false, $true, $false, $false, $false); Should = $true; OnDisabled = $false },
+                @{ Label = 'Force+Disabled'; Args = @($false, $true, $true, $false, $false, $false); Should = $true; OnDisabled = $true },
+                @{ Label = 'Force+Disabled+OutsideWindow'; Args = @($false, $true, $true, $true, $false, $false); Should = $true; OnDisabled = $true },
+                @{ Label = 'Normal+Disabled'; Args = @($false, $true, $false, $false, $false, $false); Should = $false; OnDisabled = $false },
+                @{ Label = 'AutomaticDueInWindow+Disabled'; Args = @($false, $true, $false, $true, $true, $false); Should = $false; OnDisabled = $false },
+                @{ Label = 'BootRecovery+Disabled'; Args = @($false, $true, $false, $true, $false, $true); Should = $false; OnDisabled = $false },
+                @{ Label = 'Force+NotInstalled'; Args = @($false, $false, $true, $false, $false, $false); Should = $false; OnDisabled = $false },
+                @{ Label = 'AutomaticInWindow+Enabled'; Args = @($true, $false, $false, $true, $true, $false); Should = $true; OnDisabled = $false },
+                @{ Label = 'AutomaticOutsideWindow+Enabled'; Args = @($true, $false, $false, $true, $false, $false); Should = $false; OnDisabled = $false }
+            )
+            foreach ($forceDisabledScenario in $forceDisabledScenarios) {
+                $forceDisabledDecision = & $forceDisabledModule {
+                    param($a)
+                    Get-BRAVOMaintenanceRestoreDecision `
+                        -BravoMaintenanceEnabled $a[0] -BravoServiceDisabled $a[1] -ForceRestore $a[2] `
+                        -automaticRestoreDue $a[3] -restoreWindowOpen $a[4] -bootRestoreIgnoresWindow $a[5]
+                } $forceDisabledScenario.Args
+                Test-BRAVOCondition `
+                    -Condition (
+                        [bool]$forceDisabledDecision.ShouldRestore -eq $forceDisabledScenario.Should -and
+                        [bool]$forceDisabledDecision.RestoreOnDisabledBravo -eq $forceDisabledScenario.OnDisabled
+                    ) `
+                    -Name "Maintenance/RestoreDecision[$($forceDisabledScenario.Label)]" `
+                    -Failure "Get-BRAVOMaintenanceRestoreDecision[$($forceDisabledScenario.Label)]: очікувалось ShouldRestore=$($forceDisabledScenario.Should), RestoreOnDisabledBravo=$($forceDisabledScenario.OnDisabled); отримано $($forceDisabledDecision.ShouldRestore)/$($forceDisabledDecision.RestoreOnDisabledBravo) — -ForceRestore при Disabled має виконувати реставрацію, звичайний Maintenance при Disabled — ні"
+            }
+
+            # Проводка: caller передає саме Disabled-стан у рішення.
+            Test-BRAVOCondition `
+                -Condition (
+                    $RuntimeText.Contains('-BravoServiceDisabled ([bool]$BravoServiceDisabledBySystem)') -and
+                    $RuntimeText.Contains('$shouldRestore = [bool]$restoreDecision.ShouldRestore') -and
+                    $RuntimeText.Contains('$restoreOnDisabledBravo = [bool]$restoreDecision.RestoreOnDisabledBravo')
+                ) `
+                -Name 'Maintenance/ForceRestoreDisabledDecisionIsWired' `
+                -Failure 'прогін має обчислювати $shouldRestore/$restoreOnDisabledBravo через Get-BRAVOMaintenanceRestoreDecision зі станом Disabled служби BRAVO'
+
+            # Заголовок: «АКТИВОВАНА» показується й коли компонент BRAVO вимкнено.
+            $headerDisabledIndex = $RuntimeText.IndexOf('if (-not $BravoMaintenanceEnabled -and $restoreOnDisabledBravo) {')
+            $headerNormalIndex = $RuntimeText.IndexOf('if ($BravoMaintenanceEnabled) {', [Math]::Max(0, $headerDisabledIndex))
+            $headerDisabledWindow = if ($headerDisabledIndex -ge 0 -and $headerNormalIndex -gt $headerDisabledIndex) {
+                $RuntimeText.Substring($headerDisabledIndex, $headerNormalIndex - $headerDisabledIndex)
+            } else { '' }
+            Test-BRAVOCondition `
+                -Condition (
+                    $headerDisabledIndex -ge 0 -and
+                    $headerDisabledWindow.Contains('Write-Log -Message "Реставрація моделі: АКТИВОВАНА ($restoreReason)" -NoTimestamp') -and
+                    $headerDisabledWindow.Contains('-Level "INFO"') -and
+                    -not $headerDisabledWindow.Contains('-Level "WARNING"')
+                ) `
+                -Name 'Maintenance/ForceRestoreDisabledHeaderShowsActivated' `
+                -Failure 'при -ForceRestore + Disabled заголовок має містити «Реставрація моделі: АКТИВОВАНА (Примусово)» (restoreReason), без WARNING'
+
+            # Ворота реставрації й каталог архівів пропускають Disabled-випадок.
+            Test-BRAVOCondition `
+                -Condition (
+                    $RuntimeText.Contains('if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -ne "Running") {') -and
+                    $RuntimeText.Contains('$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {') -and
+                    $RuntimeText -match '(?s)\} elseif \(\$restoreOnDisabledBravo\) \{[^}]{0,400}\$dirsToCreate \+= \$ARC_DIR' -and
+                    $RuntimeText.Contains('elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {')
+                ) `
+                -Name 'Maintenance/ForceRestoreDisabledEntersRestoreSequence' `
+                -Failure 'ворота restore sequence, читання стану служби, каталог $ARC_DIR і fail-closed гілка «служба все ще працює» мають враховувати $restoreOnDisabledBravo'
+
+            # Disabled-інваріант: служба лишається зупиненою й Disabled — жодного
+            # старту (serviceWasRunning.Bravo залежить лише від $BravoMaintenanceEnabled),
+            # жодної зміни StartupType, INFO (не WARNING) лише після УСПІШНОЇ реставрації.
+            $serviceWasRunningIndex = $RuntimeText.IndexOf('$serviceWasRunning = @{')
+            $serviceWasRunningWindow = if ($serviceWasRunningIndex -ge 0) {
+                $RuntimeText.Substring($serviceWasRunningIndex, [Math]::Min(400, $RuntimeText.Length - $serviceWasRunningIndex))
+            } else { '' }
+            $successBranchIndex = $RuntimeText.IndexOf('if ($restoreTrulySucceeded) {')
+            $failureBranchIndex = $RuntimeText.IndexOf('# Реставрація НЕ успішна: bravocmd перервано/впав', [Math]::Max(0, $successBranchIndex))
+            $successBranchWindow = if ($successBranchIndex -ge 0 -and $failureBranchIndex -gt $successBranchIndex) {
+                $RuntimeText.Substring($successBranchIndex, $failureBranchIndex - $successBranchIndex)
+            } else { '' }
+            Test-BRAVOCondition `
+                -Condition (
+                    $serviceWasRunningWindow.Contains('Bravo = $BravoMaintenanceEnabled -and') -and
+                    -not $serviceWasRunningWindow.Contains('restoreOnDisabledBravo') -and
+                    $RuntimeText.Contains('$serviceWasRunning.Bravo = $BravoMaintenanceEnabled') -and
+                    $RuntimeText -notmatch 'Set-Service|-StartupType|Start-Service\s+-Name\s+\$BravoServiceName' -and
+                    $successBranchWindow.Contains('$restoreDisabledBravoInfo = "Реставрацію виконано; служба $BravoServiceName має тип Disabled — не запускалась"') -and
+                    $successBranchWindow -match '(?s)if \(\$restoreOnDisabledBravo\) \{.{0,900}?Write-Log -Message \$restoreDisabledBravoInfo -Level "INFO"' -and
+                    $RuntimeText.Contains('$restoreStepDetails += " | $restoreDisabledBravoInfo"')
+                ) `
+                -Name 'Maintenance/ForceRestoreDisabledKeepsServiceStoppedAndInfoOnly' `
+                -Failure 'Disabled-служба не має ні зупинятись/стартувати, ні змінювати StartupType (serviceWasRunning.Bravo лише від $BravoMaintenanceEnabled); INFO «Реставрацію виконано; служба BRAVO має тип Disabled — не запускалась» — лише в гілці успішної реставрації, рівнем INFO, і в Details кроку'
+
+            # Stray Bis може тримати файли моделі під bravocmd: при Disabled+Force
+            # той самий спільний хелпер викликається в Disabled-гілці зупинки.
+            $strayDisabledIndex = $RuntimeText.IndexOf('} elseif ($BravoServiceDisabledBySystem) {')
+            $strayDisabledWindow = if ($strayDisabledIndex -ge 0) {
+                $RuntimeText.Substring($strayDisabledIndex, [Math]::Min(700, $RuntimeText.Length - $strayDisabledIndex))
+            } else { '' }
+            Test-BRAVOCondition `
+                -Condition (
+                    $RuntimeText.Contains('function Stop-BRAVOMaintenanceStrayProcess {') -and
+                    $RuntimeText.Contains('$processNames = @("Bis")') -and
+                    $strayDisabledWindow -match '(?s)if \(\$restoreOnDisabledBravo\) \{.{0,400}?Stop-BRAVOMaintenanceStrayProcess' -and
+                    ([regex]::Matches($RuntimeText, 'Stop-BRAVOMaintenanceStrayProcess')).Count -ge 3
+                ) `
+                -Name 'Maintenance/ForceRestoreDisabledKillsStrayBis' `
+                -Failure 'при -ForceRestore + Disabled має завершуватись сторонній Bis тим самим хелпером Stop-BRAVOMaintenanceStrayProcess'
+        } $maintenanceRestoreWindowText
+
         # Structural: обидва бар'єри реально СТОЯТЬ там, де мають — перед
         # входом у restore sequence і безпосередньо перед bravocmd.exe, а не
         # десь-інде чи взагалі відсутні. AST-звуження до конкретних
@@ -10768,7 +10894,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # файлу) — не "чи існує рядок десь у файлі", а "чи стоїть він у
         # правильному місці відносно правильних сусідів".
         $barrier1WindowStart = $maintenanceRestoreWindowText.IndexOf(
-            '$bravoStatus = if ($BravoMaintenanceEnabled) { (Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
+            '$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { (Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
         )
         $barrier1EntryIndex = $maintenanceRestoreWindowText.IndexOf(
             "if (`$shouldRestore) {", [Math]::Max(0, $barrier1WindowStart)
@@ -13093,9 +13219,16 @@ function Write-BRAVOStepResult {
     Add-ProbeEvent ("STEP {0}/{1} {2} {3}" -f $Current, $Total, $Name, $Status)
 }
 function Write-BRAVOServiceQuiescenceState {
-    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed)
+    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
     Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
 }
+# #297: утримання від автостарту. Стаби повертають порожній знімок (жодних
+# змін start type, жодних подій у журналі проби) — оркестрація кроків і
+# порядок подій лишаються рівно тими, що були до #297.
+function New-BRAVOServiceStartTypeSnapshot { param([string[]]$ServiceNames) return @() }
+function Suspend-BRAVOServiceAutostart { param([object[]]$Snapshot) return [pscustomobject]@{ Applied = @(); Failed = @() } }
+function Restore-BRAVOServiceStartTypeSnapshot { param([object[]]$Snapshot, [string[]]$AllowedServiceNames) return [pscustomobject]@{ Restored = @(); Unchanged = @(); Foreign = @(); Failed = @() } }
+function Confirm-BRAVOServicesQuiesced { param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds) return [pscustomobject]@{ Ok = $true; Offenders = @(); StoppedAgain = @() } }
 function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
 function Set-BRAVOServiceQuiescenceRestartSuppressed { param([bool]$Suppressed) }
 function Enter-BRAVOMaintenanceOperationLock {
@@ -13191,6 +13324,7 @@ $missedRestoreDue = $false
 $restoreWindowOpen = $true
 $bootRestoreIgnoresWindow = $false
 $shouldRestore = $false
+$restoreOnDisabledBravo = $false
 $restoreReason = ''
 $weeklyRestoreQuotaConsumed = $false
 $restoreSkippedByWindow = $false
@@ -13321,7 +13455,10 @@ try {
         ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
         ('$script:ProbeServices = {0}' -f $probeServiceTable),
         ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' })),
-        ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' }))
+        ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' })),
+        # #297: результат раннього самовідновлення типів запуску (у production
+        # його виставляє преамбула, яку seed замінює).
+        '$script:startModeRepairResult = [pscustomobject]@{ Status = ''NoMarker''; Owner = $null; Snapshot = @(); Restored = @(); Failed = @(); Foreign = @() }'
     ) -join "`n"
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
@@ -21426,6 +21563,135 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
         -Name "Scheduler/OperationLockWaitTimeoutIsExplicitFailure" `
         -Failure "зайнятий lock при вичерпаному бюджеті задачі має давати негайну відмову з поясненням обмеження (Archive -> SkippedLockBusy); помилка: $lockBudgetRunError; Archive: $($lockBudgetArchiveResult.Error); Maintenance: $($lockBudgetMaintenanceResult.Error)"
 
+    # #321: очікування lock Maintenance було мовчазним (30 хв без жодного
+    # рядка у проді). Поведінково, зі справжнім Enter-BRAVOMaintenanceOperationLock:
+    # lock зайнятий -> рівно ОДИН INFO на початку очікування (метадані власника з
+    # JSON: operation/pid/startedAt; нечитабельний JSON не валить захоплення) і
+    # рівно ОДИН INFO після отримання з тривалістю очікування — без
+    # покрокового спаму кожні 30 с і без WARNING (лічильник попереджень не
+    # змінюється). Start-Sleep підмінено: на 3-му опитуванні holder відпускає lock.
+    & {
+        $lockLogStubs = @'
+function Start-Sleep {
+    param([int]$Seconds)
+    $script:LockLogSleepCalls++
+    if ($script:LockLogSleepCalls -ge 3 -and $null -ne $script:LockLogHolder) {
+        $script:LockLogHolder.Dispose()
+        $script:LockLogHolder = $null
+    }
+}
+function Write-Log { param([Parameter(Position = 0)]$Message, $Level) $script:LockLogEntries.Add(('{0}|{1}' -f $Level, $Message)) }
+function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $script:LockLogSleepCalls = 0; $script:LockLogEntries = New-Object 'System.Collections.Generic.List[string]' }
+'@
+        $lockLogRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_321_LOCKLOG_{0}" -f [guid]::NewGuid().ToString("N"))
+        $lockLogStubNames = @('Start-Sleep', 'Write-Log', 'Set-LockLogHolder')
+        $lockLogPriorFunctions = @{}
+        foreach ($lockLogStubName in $lockLogStubNames) {
+            $lockLogPriorItem = Get-Item -LiteralPath "function:$lockLogStubName" -ErrorAction SilentlyContinue
+            if ($null -ne $lockLogPriorItem) { $lockLogPriorFunctions[$lockLogStubName] = $lockLogPriorItem.ScriptBlock }
+        }
+        $lockLogModule = $null
+        $lockLogRunError = $null
+        $lockLogRuns = @{}
+        try {
+            [void](New-Item -ItemType Directory -Path $lockLogRoot -Force -ErrorAction Stop)
+            $lockLogModule = New-BRAVOSelfTestRuntimeModule `
+                -SourceText ($lockLogStubs + "`n" + $maintenanceScriptText) `
+                -FunctionNames @('Start-Sleep', 'Write-Log', 'Set-LockLogHolder', 'Enter-BRAVOMaintenanceOperationLock')
+            foreach ($lockLogCase in @('Readable', 'Unreadable', 'PartialJson')) {
+                $lockLogPath = Join-Path $lockLogRoot "BRAVO_OPERATION_$lockLogCase.lock"
+                # Readable/PartialJson: holder тримає FileShare.Read (як справжній lock) —
+                # peek можливий; Unreadable: FileShare.None — peek неможливий.
+                $lockLogShare = if ($lockLogCase -eq 'Unreadable') { [System.IO.FileShare]::None } else { [System.IO.FileShare]::Read }
+                $lockLogHolder = [System.IO.File]::Open($lockLogPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, $lockLogShare)
+                $lockLogJson = switch ($lockLogCase) {
+                    'Readable' { '{"pid":4242,"operation":"Archive","hostname":"SRV-LAB1","startedAt":"2026-09-30T23:00:00.0000000+03:00","generationId":null}' }
+                    'PartialJson' { '{"pid":7}' }
+                    default { '' }
+                }
+                if ($lockLogJson) {
+                    $lockLogBytes = [System.Text.Encoding]::UTF8.GetBytes($lockLogJson)
+                    $lockLogHolder.Write($lockLogBytes, 0, $lockLogBytes.Length)
+                    $lockLogHolder.Flush()
+                }
+                $lockLogRuns[$lockLogCase] = & $lockLogModule {
+                    param($LockPath, $Holder)
+                    Set-LockLogHolder -Holder $Holder
+                    $script:operationLockSettings = @{ Path = $LockPath }
+                    $script:schedulerSettings = @{
+                        OperationLockWaitMinutes = 360
+                        Maintenance = @{ ExecutionTimeLimitHours = 12 }
+                    }
+                    $script:ScriptVersion = 'self-test'
+                    $script:ConfigPath = 'self-test'
+                    $lockLogResult = Enter-BRAVOMaintenanceOperationLock -TaskType 'Maintenance'
+                    if ($null -ne $lockLogResult.Stream) { $lockLogResult.Stream.Dispose() }
+                    [pscustomobject]@{
+                        Success = [bool]$lockLogResult.Success
+                        Error = [string]$lockLogResult.Error
+                        SleepCalls = $script:LockLogSleepCalls
+                        Entries = @($script:LockLogEntries)
+                    }
+                } $lockLogPath $lockLogHolder
+            }
+        } catch {
+            $lockLogRunError = $_.Exception.Message
+        } finally {
+            Remove-Item -LiteralPath $lockLogRoot -Recurse -Force -ErrorAction SilentlyContinue
+            if ($null -ne $lockLogModule) {
+                foreach ($lockLogStubName in $lockLogStubNames) {
+                    $lockLogLeakedItem = Get-Item -LiteralPath "function:$lockLogStubName" -ErrorAction SilentlyContinue
+                    if ($null -ne $lockLogLeakedItem -and $lockLogLeakedItem.ModuleName -eq $lockLogModule.Name) {
+                        Remove-Item -LiteralPath "function:$lockLogStubName" -Force -ErrorAction Stop
+                        if ($lockLogPriorFunctions.ContainsKey($lockLogStubName)) {
+                            Set-Item -LiteralPath "function:$lockLogStubName" -Value $lockLogPriorFunctions[$lockLogStubName]
+                        }
+                    }
+                }
+            }
+        }
+        $lockLogSummary = @{}
+        foreach ($lockLogCase in @('Readable', 'Unreadable', 'PartialJson')) {
+            $lockLogRun = if ($lockLogRuns.ContainsKey($lockLogCase)) { $lockLogRuns[$lockLogCase] } else { $null }
+            $lockLogEntries = if ($null -ne $lockLogRun) { @($lockLogRun.Entries) } else { @() }
+            $lockLogSummary[$lockLogCase] = [pscustomobject]@{
+                Run = $lockLogRun
+                Waiting = @($lockLogEntries | Where-Object { $_ -like 'INFO|Очікую звільнення*' })
+                Acquired = @($lockLogEntries | Where-Object { $_ -like 'INFO|Операційний lock отримано після очікування*' })
+                Warnings = @($lockLogEntries | Where-Object { $_ -like 'WARNING|*' -or $_ -like 'ERROR|*' })
+            }
+        }
+        $lockLogReadable = $lockLogSummary['Readable']
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $lockLogRunError -and
+                $null -ne $lockLogReadable.Run -and $lockLogReadable.Run.Success -and
+                $lockLogReadable.Run.SleepCalls -ge 3 -and
+                $lockLogReadable.Waiting.Count -eq 1 -and
+                $lockLogReadable.Acquired.Count -eq 1 -and
+                $lockLogReadable.Warnings.Count -eq 0 -and
+                $lockLogReadable.Waiting[0].Contains('pid=4242') -and
+                $lockLogReadable.Waiting[0].Contains('operation=Archive') -and
+                $lockLogReadable.Waiting[0].Contains('startedAt=2026-09-30')
+            ) `
+            -Name 'Maintenance/OperationLockWaitLogsOnceWithHolderAndDuration' `
+            -Failure "очікування lock має давати рівно один INFO на початку (з operation/pid/startedAt власника) і один INFO після отримання з тривалістю, без покрокового спаму й без WARNING; помилка: $lockLogRunError; опитувань: $(if ($null -ne $lockLogReadable.Run) { $lockLogReadable.Run.SleepCalls }); wait=$($lockLogReadable.Waiting.Count); acquired=$($lockLogReadable.Acquired.Count); warnings=$($lockLogReadable.Warnings.Count)"
+        $lockLogUnreadable = $lockLogSummary['Unreadable']
+        $lockLogPartial = $lockLogSummary['PartialJson']
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $lockLogUnreadable.Run -and $lockLogUnreadable.Run.Success -and
+                $lockLogUnreadable.Waiting.Count -eq 1 -and $lockLogUnreadable.Waiting[0].Contains('невідомо') -and
+                $lockLogUnreadable.Acquired.Count -eq 1 -and
+                $null -ne $lockLogPartial.Run -and $lockLogPartial.Run.Success -and
+                $lockLogPartial.Waiting.Count -eq 1 -and $lockLogPartial.Waiting[0].Contains('pid=7') -and
+                $lockLogPartial.Acquired.Count -eq 1 -and
+                $lockLogUnreadable.Warnings.Count -eq 0 -and $lockLogPartial.Warnings.Count -eq 0
+            ) `
+            -Name 'Maintenance/OperationLockWaitLogToleratesUnreadableHolder' `
+            -Failure 'нечитабельний/неповний JSON власника lock не має валити захоплення lock чи прибирати INFO очікування (strict mode)'
+    }
+
     # Виклик-площини: кожен прогін передає СВОЮ задачу (-SyncBAZA ->
     # BAZASync, -RunMissedRestoreOnly -> Recovery), Archive імпортує
     # BRAVO.System, а старе необмежене читання OperationLockWaitMinutes не
@@ -21827,7 +22093,7 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
     # не чіпаються).
     $bootRestoreStartTypeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $systemSourceTextForScheduler `
-        -FunctionNames @('Set-BRAVOBootRestoreServiceStartType')
+        -FunctionNames @('Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
     $bootRestoreStartTypeProbe = & $bootRestoreStartTypeModule {
         $script:BRAVOSelfTestStartTypeStates = @{
             SVC_AUTO_PLAIN   = @{ StartType = 'Automatic'; Delayed = $false }
