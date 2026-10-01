@@ -7,6 +7,7 @@ param(
     [switch]$NotifyOnSuccess,
     [switch]$NoSlack,
     [switch]$SkipIfBackupTaskRunning,
+    [switch]$CatchUpMissedBackup,
     [switch]$NoPause
 )
 
@@ -162,6 +163,7 @@ $parameters = @{
     SyncBAZA = $SyncBAZA; HealthCheckOnly = $HealthCheckOnly
     ForceNotification = $ForceNotification; NotifyOnSuccess = $NotifyOnSuccess
     NoSlack = $NoSlack; SkipIfBackupTaskRunning = $SkipIfBackupTaskRunning
+    CatchUpMissedBackup = $CatchUpMissedBackup
     NoPause = $NoPause; RuntimeRoot = $PSScriptRoot; EntryScriptPath = $PSCommandPath
 }
 exit (Invoke-BRAVOArchiveEntrypoint -Parameters $parameters)

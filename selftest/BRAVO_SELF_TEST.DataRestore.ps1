@@ -3994,7 +3994,7 @@ function Test-SevenZipArchiveIntegrity {
 function Get-BRAVOSevenZipArchiveInventory { return [pscustomobject]@{ Success = $true; FileCount = 1; DirectoryCount = 0; TotalUncompressedBytes = 1; Description = '' } }
 function Test-BRAVODataRestoreFreeSpace { param($Requirements, $MinimumFreeGigabytes) return [pscustomobject]@{ Success = $true; Notes = @(); Problems = @() } }
 function Write-BRAVOServiceQuiescenceState {
-    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed)
+    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [switch]$PreserveForeignStartTypeSnapshot)
     Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
 }
 function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }

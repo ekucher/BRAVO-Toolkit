@@ -430,6 +430,29 @@ function Resolve-BRAVOConfigurationDerivation {
             0
         }
     }
+    # BackupCatchUp (#322): boot-завдання BRAVO_ARCHIV_CATCHUP робить
+    # пропущену нічну копію, якщо сервер був вимкнений о Backup.DailyAt
+    # (рішення власника 2026-09-30: через 5-10 хв після старту ОС). Вузол
+    # повністю похідний, як Recovery.Enabled/ScriptPath: канонічних листів
+    # конфігурації не додає. Завдання вимкнене, коли вимкнений сам Backup,
+    # і на профілі робочого часу (Recovery.Enabled): там boot-Recovery вже
+    # виконує пропущений Backup після Maintenance. Те саме правило для
+    # legacy-конфігурації — у BRAVO_CONFIG_LOADER.ps1.
+    $backupTaskEnabled = $global:schedulerSettings.Contains('Backup') -and
+        $global:schedulerSettings.Backup -is [hashtable] -and
+        [bool]$global:schedulerSettings.Backup.Enabled
+    $recoveryTaskEnabled = $global:schedulerSettings.Contains('Recovery') -and
+        $global:schedulerSettings.Recovery -is [hashtable] -and
+        $global:schedulerSettings.Recovery.Contains('Enabled') -and
+        [bool]$global:schedulerSettings.Recovery.Enabled
+    $global:schedulerSettings.BackupCatchUp = @{
+        Enabled = ($backupTaskEnabled -and -not $recoveryTaskEnabled)
+        TaskName = "BRAVO_ARCHIV_CATCHUP"
+        Description = "Пропущена нічна архівація BRAVO після старту сервера"
+        StartupDelayMinutes = 7
+        ExecutionTimeLimitHours = 30
+        ScriptPath = Join-Path $runtimeRoot "BRAVO_ARCHIV.ps1"
+    }
     if ($global:schedulerSettings.Contains('BAZASync') -and $global:schedulerSettings.BAZASync -is [hashtable]) {
         # BAZASync — суто SFTP-синхронізація BAZA_APP/BAZA_WWW.
         # Enabled береться з канонічного $bazaSyncEffective (APP_SFTP OR

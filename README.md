@@ -1103,6 +1103,16 @@ Maintenance, окреме Recovery-завдання не реєструєтьс�
 | `BRAVO_RESTORE_VERIFY` | щотижня, субота `04:00` | restore drill (розділ 6.1) |
 | `BRAVO_RESTORE_RECOVERY` | при старті сервера | підхоплення пропущеної реставрації моделі; лише профіль робочого часу (`Restore.BootRestoreMode = "HoldServices"`) |
 | `BRAVO BAZA Synchronization` | кожні 4 год. від `00:00` | синхронізація `BAZA_APP`/`BAZA_WWW` із SFTP; лише коли ввімкнено BAZA SFTP |
+| `BRAVO_ARCHIV_CATCHUP` | після старту Windows, затримка 7 хв. | пропущена нічна копія (сервер був вимкнений о `23:00`) |
+
+`BRAVO_ARCHIV_CATCHUP` запускає `BRAVO_ARCHIV.ps1 -CatchUpMissedBackup`.
+Копія робиться, лише якщо після останнього слоту `Backup.DailyAt` немає
+COMPLETE-копії і до наступного слоту більше 60 хв.; інакше прогін
+завершується за кілька секунд з кодом `0`, без сповіщення. Рішення
+приймається після отримання спільного lock, тож якщо в цей час іде
+звичайна нічна копія, друга не робиться. Затримка фіксована: 7 хв.
+На профілі робочого часу (`BootRestoreMode = "HoldServices"`) завдання
+вимкнене: там пропущений backup уже виконує `BRAVO_RESTORE_RECOVERY`.
 
 Архівація, maintenance і health-check використовують спільний
 `C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock`. Якщо інша операція вже працює, наступна не накладається
@@ -1218,7 +1228,9 @@ UAC — можливий подальший крок, якщо той самий
 і для них.
 
 Додатковий параметр архівації `-SyncBAZA` примусово запитує синхронізацію BAZA,
-якщо її дозволяє конфігурація. Для maintenance доступні службові перемикачі
+якщо її дозволяє конфігурація. Він використовує той самий канонічний двигун, що й основний прогін
+(`Invoke-BRAVOBazaCanonicalSync`: IncrementalAppendOnly, MutationPolicy, remote conflict);
+legacy `synchronize -mirror` застосовується лише за явного `backupMonitoring.SFTP.BAZA.Mode = "Legacy"`. Для maintenance доступні службові перемикачі
 `-ForceRestore`, `-DisableSizeCheck`, `-EnableAllSlack`, `-DisableAllSlack`,
 `-AutoShutdown on|off` і `-ArchiveAfterMaintenance on|off`; змінювати їх слід
 лише з розумінням впливу на production.

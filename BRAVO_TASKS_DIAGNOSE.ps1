@@ -66,7 +66,7 @@ function Get-BRAVOTaskResultDescription {
 
 function Format-BRAVODiagnoseTaskNextRun {
     param(
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")]
         [string]$TaskType,
         $TaskSettings,
         $NextRunTime
@@ -76,7 +76,7 @@ function Format-BRAVODiagnoseTaskNextRun {
         TaskType = $TaskType
         NextRunTime = $NextRunTime
     }
-    if ($TaskType -eq "Recovery") {
+    if ($TaskType -eq "Recovery" -or $TaskType -eq "BackupCatchUp") {
         $nextRunArguments.StartupDelayMinutes = [int]$TaskSettings.StartupDelayMinutes
     }
 
@@ -415,8 +415,9 @@ try {
         Recovery      = @('-NoPause', '-RunMissedRestoreOnly')
         BAZASync      = @('-NoPause', '-SyncBAZA')
         RestoreVerify = @('-NoPause', '-NotifyOnSuccess')
+        BackupCatchUp = @('-NoPause', '-CatchUpMissedBackup')
     }
-    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")) {
+    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")) {
         $settings = $schedulerSettings[$taskType]
         if ($null -eq $settings -or -not [bool]$settings.Enabled) {
             Write-Host "[SKIP] ${taskType}: вимкнено в конфігурації" -ForegroundColor Gray

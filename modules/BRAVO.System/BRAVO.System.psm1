@@ -58,7 +58,9 @@ function Format-BRAVOSchedulerNextRun {
     # Restore.BootRestoreMode="HoldServices"); daily-trigger о WindowStart
     # прибрано — на 24/7-профілі пропущений слот підхоплює щонічне
     # Maintenance, а саме Recovery-завдання вимкнене.
-    if ($TaskType -eq 'Recovery') {
+    # BackupCatchUp — так само лише boot-trigger (підхоплення пропущеної
+    # нічної архівації).
+    if ($TaskType -eq 'Recovery' -or $TaskType -eq 'BackupCatchUp') {
         if ($StartupDelayMinutes -gt 0) {
             return "після наступного старту Windows; затримка $StartupDelayMinutes хв."
         }
@@ -76,6 +78,79 @@ function Format-BRAVOSchedulerNextRun {
         # помилка діагностики — трактуємо як 'невідомо' (значення нижче).
     }
     return 'невідомо'
+}
+
+function Get-BRAVOBackupCatchUpDecision {
+    # Рішення boot-завдання BackupCatchUp (BRAVO_ARCHIV -CatchUpMissedBackup):
+    # чи був пропущений останній щоденний слот Backup.DailyAt. Чиста функція
+    # без I/O, щоб self-test перевіряв саме правило.
+    #
+    # Слот вважається виконаним, якщо остання COMPLETE-копія
+    # (BRAVO_TASK_EXECUTION_STATE.json -> Backup) не старша за цей слот.
+    # Відсутній запис = копії не було, тож копія робиться. Якщо до
+    # наступного планового слоту лишилось не більше NextSlotGuardMinutes,
+    # підхоплення не потрібне: копію зробить звичайний запуск.
+    #
+    # Межові випадки (детерміновані, закріплені self-test):
+    #  - LastSuccess == початок слоту вважається виконаним слотом (-ge);
+    #  - Now у перші SlotStartGraceMinutes хв. після слоту (включно з
+    #    Now == DailyAt): Планувальник саме зараз запускає звичайний
+    #    BRAVO_ARCHIV, тож підхоплення поступається йому (інакше, виграв
+    #    би підхоплення lock, звичайний прогін після нього зробив би другу
+    #    копію); якщо звичайний прогін завершиться без COMPLETE, наступний
+    #    boot-запуск або наступний слот це покриє;
+    #  - до наступного слоту рівно NextSlotGuardMinutes хв. = пропуск (-le);
+    #  - LastSuccess відсутній ($null; стану немає або він пошкоджений) =
+    #    копії не було, отже копія робиться: хост без жодної COMPLETE-копії
+    #    не повинен лишатися без неї.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Now,
+        [Parameter(Mandatory = $true)][string]$DailyAt,
+        [AllowNull()]$LastSuccess,
+        [int]$NextSlotGuardMinutes = 60,
+        [int]$SlotStartGraceMinutes = 2
+    )
+
+    $slotTime = [TimeSpan]::Zero
+    if (-not [TimeSpan]::TryParse($DailyAt, [ref]$slotTime) -or
+        $slotTime -lt [TimeSpan]::Zero -or $slotTime.TotalHours -ge 24) {
+        throw "Backup.DailyAt повинен мати формат HH:mm: '$DailyAt'"
+    }
+    $previousSlot = $Now.Date.Add($slotTime)
+    if ($previousSlot -gt $Now) {
+        $previousSlot = $previousSlot.AddDays(-1)
+    }
+    $nextSlot = $previousSlot.AddDays(1)
+    $lastSuccessTime = $null
+    if ($LastSuccess -is [datetime]) {
+        $lastSuccessTime = [datetime]$LastSuccess
+    }
+    $lastSuccessText = if ($null -ne $lastSuccessTime) {
+        $lastSuccessTime.ToString('dd.MM.yyyy HH:mm')
+    } else {
+        'немає даних'
+    }
+
+    $run = $false
+    if ($null -ne $lastSuccessTime -and $lastSuccessTime -ge $previousSlot) {
+        $reason = "копія за слот $($previousSlot.ToString('dd.MM.yyyy HH:mm')) уже є (остання успішна $lastSuccessText)"
+    } elseif (($Now - $previousSlot).TotalMinutes -lt $SlotStartGraceMinutes) {
+        $reason = "плановий запуск $($previousSlot.ToString('dd.MM.yyyy HH:mm')) саме стартує, копію зробить він"
+    } elseif (($nextSlot - $Now).TotalMinutes -le $NextSlotGuardMinutes) {
+        $reason = "до планового запуску $($nextSlot.ToString('dd.MM.yyyy HH:mm')) не більше $NextSlotGuardMinutes хв, копію зробить він"
+    } else {
+        $run = $true
+        $reason = "пропущено слот $($previousSlot.ToString('dd.MM.yyyy HH:mm')) (остання успішна копія: $lastSuccessText)"
+    }
+
+    return [pscustomobject]@{
+        Run = $run
+        PreviousSlot = $previousSlot
+        NextSlot = $nextSlot
+        LastSuccess = $lastSuccessTime
+        Reason = $reason
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -339,10 +414,45 @@ function Write-BRAVOServiceQuiescenceState {
         [Parameter(Mandatory = $true)][ValidateSet('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE')][string]$Owner,
         [Parameter(Mandatory = $true)][object[]]$Services,
         [string]$LogFile,
-        [switch]$RestartSuppressed
+        [switch]$RestartSuppressed,
+        # #297: точні початкові start type служб, які власник тимчасово
+        # переводить у Disabled на час restore (@{ Name; StartMode }).
+        # Пишеться ДО зміни (write-ahead) — див. Suspend-BRAVOServiceAutostart.
+        [object[]]$StartTypeSnapshot = @(),
+        # #297: поведінка, коли на диску вже є ЧУЖИЙ маркер з непорожнім
+        # startTypeSnapshot (попередній прогін загинув/його служби свідомо
+        # утримано Disabled): його знімок — єдиний запис справжніх початкових
+        # типів. Без цього прапорця запис ВІДХИЛЯЄТЬСЯ (throw, fail-closed:
+        # власник-Maintenance абортує зупинку служб гучною критичною
+        # помилкою, а маркер лишається недоторканим — перезапис загубив би
+        # типи, і служби лишились би Disabled назавжди, а наступні прогони
+        # прийняли б їх за вимкнені оператором). З прапорцем (DataRestore:
+        # його робота — саме ручне відновлення й блокувати її не можна)
+        # записи чужого знімка переносяться в новий маркер; для тієї самої
+        # служби чинний старий запис (він містить справжній оригінал).
+        [switch]$PreserveForeignStartTypeSnapshot
     )
 
     $statePath = Get-BRAVOServiceQuiescenceStatePath
+    $existingState = $null
+    try { $existingState = Read-BRAVOServiceQuiescenceState } catch { $existingState = $null }
+    if ($null -ne $existingState -and
+        @($existingState.startTypeSnapshot).Count -gt 0 -and
+        -not (Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess -State $existingState)) {
+        if (-not $PreserveForeignStartTypeSnapshot) {
+            throw "Існуючий ownership-маркер ($($existingState.owner), PID $($existingState.pid)) містить знімок початкових типів запуску служб (#297) — він не перезаписується, щоб не втратити типи (потрібне відновлення: Health-watchdog або ручне, код 43)"
+        }
+        $mergedSnapshot = @()
+        foreach ($oldEntry in @($existingState.startTypeSnapshot)) {
+            $mergedSnapshot += [pscustomobject]@{ Name = [string]$oldEntry.Name; StartMode = [string]$oldEntry.StartMode }
+        }
+        foreach ($newEntry in @($StartTypeSnapshot)) {
+            if (@($mergedSnapshot | Where-Object { $_.Name -ieq [string]$newEntry.Name }).Count -eq 0) {
+                $mergedSnapshot += [pscustomobject]@{ Name = [string]$newEntry.Name; StartMode = [string]$newEntry.StartMode }
+            }
+        }
+        $StartTypeSnapshot = @($mergedSnapshot)
+    }
     $stateDirectory = Split-Path -Path $statePath -Parent
     if (-not [IO.Directory]::Exists($stateDirectory)) {
         [void][IO.Directory]::CreateDirectory($stateDirectory)
@@ -358,6 +468,9 @@ function Write-BRAVOServiceQuiescenceState {
         restartSuppressed = [bool]$RestartSuppressed
         services = @($Services | ForEach-Object {
             [ordered]@{ Name = [string]$_.Name; RestartIntent = [bool]$_.RestartIntent }
+        })
+        startTypeSnapshot = @($StartTypeSnapshot | ForEach-Object {
+            [ordered]@{ Name = [string]$_.Name; StartMode = [string]$_.StartMode }
         })
     }
     $temporaryStatePath = Join-Path $stateDirectory ('.BRAVO_SERVICE_QUIESCENCE_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
@@ -421,6 +534,27 @@ function Read-BRAVOServiceQuiescenceState {
             return $null
         }
     }
+    # #297: startTypeSnapshot — НЕОБОВ'ЯЗКОВЕ поле (маркери старіших версій
+    # його не мають). Нормалізуємо: після Read властивість завжди існує й
+    # містить лише валідні записи (відомий StartMode). Зіпсований запис
+    # знімка відкидається, а не робить увесь маркер невалідним — інакше
+    # watchdog утратив би можливість стартувати служби.
+    $validSnapshot = @()
+    $snapshotProperty = $state.PSObject.Properties['startTypeSnapshot']
+    if ($null -ne $snapshotProperty) {
+        foreach ($snapshotEntry in @($snapshotProperty.Value)) {
+            if ($null -ne $snapshotEntry -and
+                $null -ne $snapshotEntry.PSObject.Properties['Name'] -and
+                $null -ne $snapshotEntry.PSObject.Properties['StartMode'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$snapshotEntry.Name) -and
+                [string]$snapshotEntry.StartMode -in @('Automatic', 'AutomaticDelayed', 'Manual')) {
+                $validSnapshot += [pscustomobject]@{ Name = [string]$snapshotEntry.Name; StartMode = [string]$snapshotEntry.StartMode }
+            }
+        }
+        $snapshotProperty.Value = @($validSnapshot)
+    } else {
+        Add-Member -InputObject $state -NotePropertyName 'startTypeSnapshot' -NotePropertyValue @() -Force
+    }
     return $state
 }
 
@@ -477,7 +611,8 @@ function Set-BRAVOServiceQuiescenceRestartSuppressed {
         -Owner ([string]$state.owner) `
         -Services $services `
         -LogFile ([string]$state.logFile) `
-        -RestartSuppressed
+        -RestartSuppressed `
+        -StartTypeSnapshot @($state.startTypeSnapshot)
 }
 
 function Test-BRAVOProcessAlive {
@@ -526,6 +661,107 @@ function Get-BRAVOServiceDelayedAutoStart {
     return ([int]$properties.DelayedAutostart -eq 1)
 }
 
+function Get-BRAVOServiceStartMode {
+    # Єдиний канонічний читач типу запуску служби Windows (#319).
+    # ServiceController.StartType існує лише з .NET Framework 4.6.1, а
+    # Windows PowerShell 5.1 може працювати на .NET 4.5.2+: під
+    # Set-StrictMode -Version 2.0 пряме звернення до відсутньої властивості
+    # кидає PropertyNotFoundStrict. Порядок джерел:
+    #   1) StartType службового об'єкта (через PSObject.Properties) — має
+    #      пріоритет, коли присутній і розпізнаний;
+    #   2) -FallbackStartMode — значення Win32_Service.StartMode, яке
+    #      викликач уже отримав (щоб не робити другий WMI-запит);
+    #   3) WMI/CIM Win32_Service через Get-BRAVOWmiInstance (BRAVO.Compatibility),
+    #      якщо не вказано -NoWmiQuery.
+    # Значення нормалізується до Automatic/Manual/Disabled; WMI 'Auto' ->
+    # Automatic. Delayed Start тут НЕ розрізняється (його читає окремо
+    # Get-BRAVOServiceDelayedAutoStart з реєстру). Функція не кидає виняток:
+    # якщо джерел немає або значення нерозпізнане, StartMode = 'Unknown', а
+    # FailureReason пояснює чому.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Service,
+        [string]$FallbackStartMode,
+        [switch]$NoWmiQuery
+    )
+
+    $normalize = {
+        param($Value)
+        if ($null -eq $Value) { return $null }
+        switch (([string]$Value).Trim().ToLowerInvariant()) {
+            'automatic' { return 'Automatic' }
+            'auto' { return 'Automatic' }
+            'manual' { return 'Manual' }
+            'disabled' { return 'Disabled' }
+            default { return $null }
+        }
+    }
+
+    $serviceName = ''
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $Service) {
+        $nameProperty = $Service.PSObject.Properties['Name']
+        if ($null -ne $nameProperty -and $null -ne $nameProperty.Value) {
+            $serviceName = [string]$nameProperty.Value
+        }
+    }
+    $makeResult = {
+        param([string]$Mode, [string]$Source)
+        [pscustomobject]@{
+            Name = $serviceName
+            StartMode = $Mode
+            Source = $Source
+            FailureReason = if ($Mode -eq 'Unknown') { ($reasons -join '; ') } else { $null }
+        }
+    }
+
+    if ($null -eq $Service) {
+        [void]$reasons.Add('службовий об''єкт не передано')
+        return (& $makeResult 'Unknown' 'None')
+    }
+
+    $startTypeProperty = $Service.PSObject.Properties['StartType']
+    if ($null -eq $startTypeProperty) {
+        [void]$reasons.Add('властивість StartType відсутня (.NET Framework < 4.6.1)')
+    } else {
+        $mode = & $normalize $startTypeProperty.Value
+        if ($null -ne $mode) { return (& $makeResult $mode 'StartType') }
+        [void]$reasons.Add("StartType порожній або нерозпізнаний: '$([string]$startTypeProperty.Value)'")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($FallbackStartMode)) {
+        $mode = & $normalize $FallbackStartMode
+        if ($null -ne $mode) { return (& $makeResult $mode 'FallbackStartMode') }
+        [void]$reasons.Add("FallbackStartMode нерозпізнаний: '$FallbackStartMode'")
+    }
+
+    if ($NoWmiQuery) {
+        [void]$reasons.Add('WMI-запит вимкнено (-NoWmiQuery)')
+    } elseif ([string]::IsNullOrWhiteSpace($serviceName)) {
+        [void]$reasons.Add('ім''я служби невідоме — WMI-запит неможливий')
+    } elseif ($null -eq (Get-Command -Name 'Get-BRAVOWmiInstance' -ErrorAction SilentlyContinue)) {
+        [void]$reasons.Add('Get-BRAVOWmiInstance (BRAVO.Compatibility) недоступна')
+    } else {
+        try {
+            $escapedName = $serviceName.Replace("'", "''")
+            $serviceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
+                Select-Object -First 1
+            $startModeProperty = if ($null -ne $serviceInfo) { $serviceInfo.PSObject.Properties['StartMode'] } else { $null }
+            if ($null -eq $startModeProperty) {
+                [void]$reasons.Add('WMI не повернув Win32_Service.StartMode')
+            } else {
+                $mode = & $normalize $startModeProperty.Value
+                if ($null -ne $mode) { return (& $makeResult $mode 'WMI') }
+                [void]$reasons.Add("WMI StartMode нерозпізнаний: '$([string]$startModeProperty.Value)'")
+            }
+        } catch {
+            [void]$reasons.Add("WMI-запит завершився помилкою: $($_.Exception.Message)")
+        }
+    }
+
+    return (& $makeResult 'Unknown' 'None')
+}
+
 function Set-BRAVOBootRestoreServiceStartType {
     # Канонічне (єдине в комплекті) місце, де BRAVO змінює start type
     # служб Windows. Використовується ЛИШЕ інсталятором Планувальника для
@@ -563,11 +799,25 @@ function Set-BRAVOBootRestoreServiceStartType {
             })
             continue
         }
-        $startType = [string]$service.StartType
+        # StartType (.NET < 4.6.1) може бути відсутній: тип запуску читає
+        # канонічний Get-BRAVOServiceStartMode (WMI-fallback). Невідомий тип
+        # запуску НЕ змінюємо (жодних припущень про стан служби).
+        $startModeResult = Get-BRAVOServiceStartMode -Service $service
+        $startType = [string]$startModeResult.StartMode
         $delayed = Get-BRAVOServiceDelayedAutoStart -ServiceName $serviceName
         $action = 'None'
         $targetArgument = $null
-        if ($startType -eq 'Automatic') {
+        $success = $true
+        $details = $null
+        if ($startType -eq 'Unknown') {
+            # Ні StartType, ні WMI не дали типу запуску: службу не чіпаємо.
+            # У HoldServices це ламає гарантію «клієнти не зайдуть до
+            # реставрації», тому там — збій (рішення за викликачем); у None
+            # власного delayed-стану відкотити нема чого.
+            $action = 'SkippedUnknownStartType'
+            $details = "тип запуску невідомий: $($startModeResult.FailureReason)"
+            if ($HoldServices) { $success = $false }
+        } elseif ($startType -eq 'Automatic') {
             if ($HoldServices -and -not $delayed) {
                 $action = 'SetDelayedAuto'; $targetArgument = 'delayed-auto'
             } elseif (-not $HoldServices -and $delayed) {
@@ -576,8 +826,6 @@ function Set-BRAVOBootRestoreServiceStartType {
         } elseif ($HoldServices) {
             $action = 'SkippedNotAutomatic'
         }
-        $success = $true
-        $details = $null
         if ($null -ne $targetArgument -and -not $ValidateOnly) {
             # sc.exe вимагає пробіл ПІСЛЯ 'start=' — це синтаксис утиліти.
             & "$env:SystemRoot\System32\sc.exe" config $serviceName start= $targetArgument | Out-Null
@@ -593,6 +841,323 @@ function Set-BRAVOBootRestoreServiceStartType {
         })
     }
     return ,$results.ToArray()
+}
+
+# ---------------------------------------------------------------------------
+# Тимчасове утримання служб від автостарту на час restore (#297).
+#
+# Проблема: boot-recovery профіль (HoldServices) ставить служби в Automatic
+# (Delayed Start); SCM запускає їх ~2 хв після завантаження, тобто посеред
+# багатохвилинного before-archive/bravocmd. Так само «restart on failure» чи
+# сторонній Start-Service/залежна служба можуть підняти BRAVO/exchangAPI/Web
+# усередині вікна реставрації. Зупинка служб сама по собі цього не
+# запобігає — вона лише стан у момент знімка (TOCTOU).
+#
+# Рішення (транзакція зі write-ahead у ТОМУ Ж ownership-маркері, а не
+# паралельний механізм):
+#   1. знімок ТОЧНОГО початкового start type (Automatic / AutomaticDelayed /
+#      Manual) кожної керованої служби, яка НЕ Disabled — Disabled служби
+#      у знімок не потрапляють і НІКОЛИ не змінюються/не стартуються;
+#   2. знімок записується в маркер (startTypeSnapshot) ДО будь-якої зміни;
+#   3. служби переводяться в Disabled (на відміну від Manual, Disabled
+#      блокує ВСІ запуски: SCM autostart, recovery actions, Start-Service,
+#      автостарт залежностей);
+#   4. finally власника повертає типи зі знімка ПЕРЕД стартом служб;
+#   5. аварійний вихід (kill/reboot): наступний Maintenance/Recovery
+#      (Repair-BRAVOOrphanedServiceStartTypes) та Health-watchdog
+#      відновлюють типи з маркера мертвого власника.
+# Відновлення торкається ЛИШЕ служби, що зараз Disabled (наша тимчасова
+# зміна); якщо оператор уже сам змінив тип — його рішення не перезаписується.
+# Виняток: маркер із restartSuppressed (модель у невизначеному стані) —
+# служби свідомо ЛИШАЮТЬСЯ Disabled до ручного відновлення (код 43), інакше
+# SCM підняв би їх на напіввідновленій моделі при наступному boot.
+# ---------------------------------------------------------------------------
+
+function Get-BRAVOServiceRegistryStartMode {
+    # Точний SCM start type (вкл. AutomaticDelayed) з реєстру — для знімка
+    # утримання #297. Для загальної класифікації start type див.
+    # Get-BRAVOServiceStartMode (інший контракт).
+    # Канонічне значення start type: Automatic | AutomaticDelayed | Manual |
+    # Disabled | Other (boot/system/невідоме) | $null (службу не знайдено).
+    # Читається з реєстру (Start + DelayedAutostart), а не з
+    # ServiceController.StartType: не залежить від версії .NET і чесно
+    # розрізняє Delayed Start. Єдине місце читання (тестовий шов).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+
+    $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if (-not (Test-Path -LiteralPath $registryPath)) { return $null }
+    $properties = Get-ItemProperty -LiteralPath $registryPath -ErrorAction SilentlyContinue
+    if ($null -eq $properties -or $null -eq $properties.PSObject.Properties['Start']) { return $null }
+    switch ([int]$properties.Start) {
+        2 {
+            if ((Get-BRAVOServiceDelayedAutoStart -ServiceName $ServiceName) -eq $true) { return 'AutomaticDelayed' }
+            return 'Automatic'
+        }
+        3 { return 'Manual' }
+        4 { return 'Disabled' }
+        default { return 'Other' }
+    }
+}
+
+function Set-BRAVOServiceStartMode {
+    # Єдиний шов запису start type (sc.exe; тестовий шов). $true = успіх.
+    # sc.exe вимагає пробіл ПІСЛЯ 'start=' — це синтаксис утиліти.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][ValidateSet('Automatic', 'AutomaticDelayed', 'Manual', 'Disabled')][string]$StartMode
+    )
+
+    $scArgument = switch ($StartMode) {
+        'Automatic'        { 'auto' }
+        'AutomaticDelayed' { 'delayed-auto' }
+        'Manual'           { 'demand' }
+        'Disabled'         { 'disabled' }
+    }
+    & "$env:SystemRoot\System32\sc.exe" config $ServiceName start= $scArgument | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function New-BRAVOServiceStartTypeSnapshot {
+    # Знімок точних початкових start type для служб, які МОЖНА тимчасово
+    # утримувати: існують і є Automatic/AutomaticDelayed/Manual. Disabled
+    # (рішення оператора), Other та відсутні служби — поза знімком, тобто
+    # ніколи не змінюються й не відновлюються.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ServiceNames)
+
+    $snapshot = New-Object System.Collections.Generic.List[object]
+    foreach ($serviceName in @($ServiceNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        $startMode = Get-BRAVOServiceRegistryStartMode -ServiceName $serviceName
+        if ($startMode -in @('Automatic', 'AutomaticDelayed', 'Manual')) {
+            [void]$snapshot.Add(@{ Name = [string]$serviceName; StartMode = [string]$startMode })
+        }
+    }
+    return $snapshot.ToArray()
+}
+
+function Suspend-BRAVOServiceAutostart {
+    # Застосовує Disabled до служб зі знімка (знімок УЖЕ записано в маркер).
+    # Не кидає виняток: повертає Applied/Failed — рішення про фатальність
+    # (restore fail-closed) ухвалює викликач. Служба, що вже не в
+    # початковому стані зі знімка (напр. оператор її вимкнув), не чіпається.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Snapshot)
+
+    $applied = @()
+    $failed = @()
+    foreach ($entry in @($Snapshot)) {
+        $name = [string]$entry.Name
+        try {
+            $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $name
+            if ($currentMode -eq 'Disabled') { $applied += $name; continue }
+            if ($currentMode -ne [string]$entry.StartMode) {
+                $failed += "${name}: тип запуску змінився після знімка ($currentMode замість $($entry.StartMode))"
+                continue
+            }
+            if (Set-BRAVOServiceStartMode -ServiceName $name -StartMode 'Disabled') {
+                $applied += $name
+            } else {
+                $failed += "${name}: sc config start= disabled не вдався"
+            }
+        } catch {
+            $failed += "${name}: $($_.Exception.Message)"
+        }
+    }
+    return [pscustomobject]@{ Applied = @($applied); Failed = @($failed) }
+}
+
+function Restore-BRAVOServiceStartTypeSnapshot {
+    # Повертає start type зі знімка. Ідемпотентна й безпечна до чужих змін:
+    #   - поточний тип Disabled  -> наша тимчасова зміна -> повертаємо;
+    #   - поточний == початковий -> нічого (напр. збій між записом знімка й
+    #                               застосуванням Disabled);
+    #   - будь-який інший        -> оператор змінив сам -> НЕ чіпаємо.
+    # -AllowedServiceNames: службу поза канонічним набором (стороннє
+    # редагування маркера) не чіпаємо — Failed із поясненням.
+    # Не кидає виняток; Failed != порожній => викликач лишає маркер.
+    #
+    # ОБМЕЖЕННЯ (свідоме, не виправляється тут): функція не відрізняє
+    # тимчасовий Disabled від Disabled, який оператор виставив САМ уже ПІСЛЯ
+    # аварії — обидва виглядають як «зараз Disabled». Тож якщо оператор
+    # вимкнув службу між аварією й самовідновленням, початковий тип буде
+    # повернено. Це свідомий компроміс: служба, що лишилась би Disabled через
+    # аварію, гірша за повернення її початкового типу; про відновлення
+    # гучно повідомляється (WARNING/Slack), оператор бачить, що саме змінено.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Snapshot,
+        [string[]]$AllowedServiceNames
+    )
+
+    $restored = @()
+    $unchanged = @()
+    $foreign = @()
+    $failed = @()
+    foreach ($entry in @($Snapshot)) {
+        $name = [string]$entry.Name
+        $originalMode = [string]$entry.StartMode
+        try {
+            if ($PSBoundParameters.ContainsKey('AllowedServiceNames') -and
+                @($AllowedServiceNames | Where-Object { $_ -ieq $name }).Count -eq 0) {
+                $failed += "${name}: поза керованим набором служб — зміну start type заборонено (можливе стороннє редагування маркера)"
+                continue
+            }
+            $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $name
+            if ($null -eq $currentMode) { $unchanged += $name; continue }
+            if ($currentMode -eq $originalMode) { $unchanged += $name; continue }
+            if ($currentMode -ne 'Disabled') {
+                $foreign += "${name}: $currentMode (початковий $originalMode)"
+                continue
+            }
+            if (-not (Set-BRAVOServiceStartMode -ServiceName $name -StartMode $originalMode)) {
+                $failed += "${name}: не вдалося повернути $originalMode"
+                continue
+            }
+            $verifiedMode = Get-BRAVOServiceRegistryStartMode -ServiceName $name
+            if ($verifiedMode -ne $originalMode) {
+                $failed += "${name}: після відновлення тип $verifiedMode замість $originalMode"
+                continue
+            }
+            $restored += "${name}=$originalMode"
+        } catch {
+            $failed += "${name}: $($_.Exception.Message)"
+        }
+    }
+    return [pscustomobject]@{
+        Restored = @($restored); Unchanged = @($unchanged); Foreign = @($foreign); Failed = @($failed)
+    }
+}
+
+function Repair-BRAVOOrphanedServiceStartTypes {
+    # Крок самовідновлення на старті Maintenance/Recovery (до читання
+    # start type керованих служб!). Маркер мертвого власника з непорожнім
+    # startTypeSnapshot => попередній прогін загинув у вікні утримання:
+    #   Status = 'NoMarker'/'NoSnapshot'/'OwnerAlive' — нічого не робимо;
+    #   'HeldSuppressed' — маркер restartSuppressed (модель невизначена):
+    #       служби свідомо лишаються Disabled, потрібне ручне відновлення;
+    #   'Repaired' — типи повернуто, знімок у маркері очищено (маркер, pid,
+    #       createdAt збережено: Health-watchdog і далі стартує служби);
+    #   'RepairFailed' — частина типів не повернута, маркер лишається.
+    # Не кидає виняток (стартовий крок не має валити Maintenance).
+    [CmdletBinding()]
+    param([string[]]$AllowedServiceNames)
+
+    $result = [pscustomobject]@{
+        Status = 'NoMarker'; Owner = $null; Snapshot = @(); Restored = @(); Failed = @(); Foreign = @()
+    }
+    try {
+        $state = Read-BRAVOServiceQuiescenceState
+        if ($null -eq $state) { return $result }
+        $result.Owner = [string]$state.owner
+        $snapshot = @($state.startTypeSnapshot)
+        if ($snapshot.Count -eq 0) { $result.Status = 'NoSnapshot'; return $result }
+        $result.Snapshot = @($snapshot)
+        if (Test-BRAVOProcessAlive -ProcessId ([int]$state.pid) -ProcessStartTime ([string]$state.processStartTime)) {
+            $result.Status = 'OwnerAlive'; return $result
+        }
+        if ([bool]$state.restartSuppressed) { $result.Status = 'HeldSuppressed'; return $result }
+
+        $restoreArguments = @{ Snapshot = $snapshot }
+        if ($null -ne $AllowedServiceNames) { $restoreArguments['AllowedServiceNames'] = $AllowedServiceNames }
+        $restoreResult = Restore-BRAVOServiceStartTypeSnapshot @restoreArguments
+        $result.Restored = @($restoreResult.Restored)
+        $result.Foreign = @($restoreResult.Foreign)
+        $result.Failed = @($restoreResult.Failed)
+        if ($result.Failed.Count -gt 0) { $result.Status = 'RepairFailed'; return $result }
+
+        # Очищаємо знімок, зберігаючи решту маркера дослівно (owner/pid/
+        # createdAt — за ними Health-watchdog і TOCTOU-guard).
+        $statePath = Get-BRAVOServiceQuiescenceStatePath
+        $raw = [IO.File]::ReadAllText($statePath, (New-Object Text.UTF8Encoding($false)))
+        # Точкова заміна тексту знімка (а не ConvertFrom/To-Json круговорот):
+        # решта маркера лишається байт-у-байт, зокрема формат createdAt.
+        $clearedRaw = [regex]::Replace($raw, '(?s)("startTypeSnapshot"\s*:\s*)\[.*?\]', '$1[]', 1)
+        if ($clearedRaw -eq $raw) {
+            $rawState = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($null -ne $rawState.PSObject.Properties['startTypeSnapshot']) {
+                $rawState.startTypeSnapshot = @()
+            }
+            $clearedRaw = $rawState | ConvertTo-Json -Depth 5
+        }
+        Write-BRAVOStateFileAtomic -Path $statePath -Text $clearedRaw
+        $result.Status = 'Repaired'
+    } catch {
+        $result.Status = 'RepairFailed'
+        $result.Failed = @($result.Failed) + @("виняток самовідновлення: $($_.Exception.Message)")
+    }
+    return $result
+}
+
+function Confirm-BRAVOServicesQuiesced {
+    # Жорстка повторна перевірка безпосередньо ПЕРЕД деструктивним кроком
+    # (before-archive, bravocmd): служби з ServiceNames мають бути Stopped.
+    # Утримання Disabled закриває вікно, а це — детектор/страховка на
+    # випадок, коли утримання не спрацювало (збій sc, зміна типу іншим
+    # актором) чи служба піднялась ДО його застосування.
+    #   -StopRunning: служба, що біжить, зупиняється знову (ДО архівації
+    #       це безпечно). Без прапорця біжуча служба = Offenders (fail-
+    #       closed): під час/після before-архіву її запуск означає, що
+    #       архів міг бути неконсистентним, тож bravocmd НЕ запускається.
+    #   -Snapshot: служби зі знімка мають зараз бути Disabled; при
+    #       -StopRunning утримання перезастосовується, інакше розбіжність
+    #       = Offenders.
+    # Не кидає виняток. Ok = $true лише коли Offenders порожній.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ServiceNames,
+        [object[]]$Snapshot = @(),
+        [switch]$StopRunning,
+        [int]$StopTimeoutSeconds = 60,
+        [int]$PollIntervalSeconds = 2
+    )
+
+    $offenders = @()
+    $stoppedAgain = @()
+    foreach ($serviceName in @($ServiceNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        try {
+            $service = Get-Service -Name $serviceName -ErrorAction Stop
+            $service.Refresh()
+            $status = [string]$service.Status
+            if ($status -eq 'Stopped') { continue }
+            if (-not $StopRunning) {
+                $offenders += "${serviceName}: стан $status (запущена під час вікна реставрації)"
+                continue
+            }
+            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+            $deadline = (Get-Date).AddSeconds([math]::Max(1, $StopTimeoutSeconds))
+            do {
+                $service = Get-Service -Name $serviceName -ErrorAction Stop
+                $service.Refresh()
+                if ([string]$service.Status -eq 'Stopped') { break }
+                if ((Get-Date) -ge $deadline) { break }
+                Start-Sleep -Seconds ([math]::Max(1, $PollIntervalSeconds))
+            } while ($true)
+            if ([string]$service.Status -eq 'Stopped') {
+                $stoppedAgain += $serviceName
+            } else {
+                $offenders += "${serviceName}: не вдалося зупинити повторно (стан $($service.Status))"
+            }
+        } catch {
+            $offenders += "${serviceName}: $($_.Exception.Message)"
+        }
+    }
+    foreach ($entry in @($Snapshot)) {
+        $name = [string]$entry.Name
+        try {
+            $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $name
+            if ($currentMode -eq 'Disabled') { continue }
+            if ($StopRunning -and $currentMode -eq [string]$entry.StartMode -and
+                (Set-BRAVOServiceStartMode -ServiceName $name -StartMode 'Disabled')) { continue }
+            $offenders += "${name}: утримання від автостарту не діє (тип запуску $currentMode замість Disabled)"
+        } catch {
+            $offenders += "${name}: $($_.Exception.Message)"
+        }
+    }
+    return [pscustomobject]@{
+        Ok = ($offenders.Count -eq 0); Offenders = @($offenders); StoppedAgain = @($stoppedAgain)
+    }
 }
 
 function Get-BRAVOTaskRootReadinessResults {
