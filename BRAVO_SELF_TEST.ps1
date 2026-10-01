@@ -760,7 +760,10 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
     )
     for ($ownedIndex = $StartIndex; $ownedIndex -lt $script:BRAVOSelfTestOwnedRuntimeModules.Count; $ownedIndex++) {
         $ownedEntry = $script:BRAVOSelfTestOwnedRuntimeModules[$ownedIndex]
-        if ($ownedEntry.Cleaned) { continue }
+        # Strict-safe: записи реєстру з інших джерел (проби) можуть не мати
+        # прапорця Cleaned.
+        $cleanedProperty = $ownedEntry.PSObject.Properties['Cleaned']
+        if ($null -ne $cleanedProperty -and $cleanedProperty.Value) { continue }
         $ownerModuleName = $ownedEntry.Module.Name
         foreach ($functionName in @($ownedEntry.FunctionNames)) {
             $currentCommand = Get-Command -Name $functionName -ErrorAction SilentlyContinue
@@ -774,7 +777,11 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
             }
         }
         Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
-        $ownedEntry.Cleaned = $true
+        if ($null -ne $cleanedProperty) {
+            $cleanedProperty.Value = $true
+        } else {
+            Add-Member -InputObject $ownedEntry -MemberType NoteProperty -Name 'Cleaned' -Value $true -Force
+        }
     }
 }
 
