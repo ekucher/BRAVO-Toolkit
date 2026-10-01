@@ -253,6 +253,153 @@ function Test-BRAVOConfigLoaderCallerCompleteness {
     }
 }
 
+function Get-BRAVOConfigLoaderSanctionedGeneratedTextRelativePath {
+    <#
+        Issue #320: файли, яким дозволено містити в рядкових літералах текст
+        виклику Import-BravoConfiguration БЕЗ -DisallowLegacyPrimaryAutoDetect.
+        Це НЕ production-runtime:
+          - BRAVO_SELF_TEST.ps1 - тестовий harness; контрольні дочірні прогони
+            навмисно виконують legacy-файл, щоб довести, що без прапорця він
+            справді читається;
+          - BRAVO_CONFIG_INTEGRATE.ps1 - інструмент міграції 5.2, що ГЕНЕРУЄ
+            виклик loader-а в старих entrypoint-ах (явна міграційна операція
+            оператора, не шлях запуску Configurator чи runtime).
+        Решта (зокрема дочірні скрипти Configurator-а) мусить нести прапорець
+        у тому самому логічному рядку команди.
+    #>
+    return @(
+        'BRAVO_SELF_TEST.ps1',
+        'BRAVO_CONFIG_INTEGRATE.ps1'
+    )
+}
+
+function Test-BRAVOGeneratedLoaderCallText {
+    <#
+        Issue #320: цільовий регресійний guard для ТЕКСТУ дочірніх скриптів.
+        Configurator.Effective генерує скрипт із рядком
+        "Import-BravoConfiguration -ConfigRoot ... -PassThru" і виконує його
+        в окремому powershell.exe. Для AST це лише рядковий літерал, а не
+        CommandAst, тому гейти AUTOEXEC і CALLER_COMPLETENESS (CommandAst-
+        орієнтовані) такий виклик не бачать - саме так legacy BRAVO.config
+        виконувався поза гейтом B7.
+
+        Перевірка: у кореневих *.ps1 і modules\*.ps1|psm1 кожен рядковий
+        літерал (StringConstant/ExpandableString, включно з here-string),
+        що містить "Import-BravoConfiguration" з наступним параметром
+        (пробіл + '-' або backtick-продовження), мусить прив'язувати
+        -DisallowLegacyPrimaryAutoDetect (не :$false/:0) у ТОМУ САМОМУ
+        логічному рядку команди (до першого нового рядка без
+        backtick-продовження). Винятки - лише
+        Get-BRAVOConfigLoaderSanctionedGeneratedTextRelativePath.
+
+        МЕЖІ (свідомо, #239: не будувати крихкий regex-гейт на все): бачить
+        лише текст, написаний ЛІТЕРАЛЬНО в одному рядковому літералі. Не бачить
+        виклик, склеєний із фрагментів ('Import-' + 'BravoConfiguration'),
+        прочитаний із файлу чи побудований поза обсягом (ci\, deploy\,
+        selftest\). Це доказ "відомий патерн не повернувся", а не доказ
+        відсутності будь-якого generated-виклику; поведінкову гарантію дає
+        self-test Configurator/LegacyConfig/*, який реально виконує дочірній
+        процес проти підкладеного BRAVO.config.
+
+        Повертає [pscustomobject]@{ Passed; Failures; FlaglessText;
+        ParseFailures } - НЕ кидає виняток; файл, що не розібрався, не
+        пропускається мовчки (ParseFailures -> Failures).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string[]]$SanctionedGeneratedTextRelativePath = (Get-BRAVOConfigLoaderSanctionedGeneratedTextRelativePath)
+    )
+
+    $resolvedRoot = (Get-Item -LiteralPath $Root).FullName
+    $candidateFiles = New-Object System.Collections.Generic.List[object]
+    foreach ($rootScript in @(Get-ChildItem -LiteralPath $resolvedRoot -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -eq '.ps1' })) {
+        [void]$candidateFiles.Add($rootScript)
+    }
+    $modulesPath = Join-Path $resolvedRoot 'modules'
+    if (Test-Path -LiteralPath $modulesPath -PathType Container) {
+        foreach ($moduleScript in @(Get-ChildItem -LiteralPath $modulesPath -Recurse -File |
+                Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.psm1' })) {
+            [void]$candidateFiles.Add($moduleScript)
+        }
+    }
+
+    $sanctioned = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($sanctionedPath in @($SanctionedGeneratedTextRelativePath)) {
+        if (-not [string]::IsNullOrWhiteSpace($sanctionedPath)) {
+            [void]$sanctioned.Add($sanctionedPath.Replace('/', '\'))
+        }
+    }
+
+    $flaglessText = New-Object System.Collections.Generic.List[string]
+    $parseFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($candidateFile in $candidateFiles) {
+        $relativePath = $candidateFile.FullName.Substring($resolvedRoot.Length).TrimStart('\', '/').Replace('/', '\')
+        if ($sanctioned.Contains($relativePath)) { continue }
+        $candidateText = [IO.File]::ReadAllText($candidateFile.FullName, [Text.Encoding]::UTF8)
+        $candidateParseErrors = $null
+        $candidateAst = [System.Management.Automation.Language.Parser]::ParseInput(
+            $candidateText, [ref]$null, [ref]$candidateParseErrors
+        )
+        if ($candidateParseErrors -and $candidateParseErrors.Count -gt 0) {
+            [void]$parseFailures.Add("$relativePath ($($candidateParseErrors[0].Message))")
+            continue
+        }
+        $stringLiterals = @($candidateAst.FindAll({
+                    param($astNode)
+                    ($astNode -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or
+                    ($astNode -is [System.Management.Automation.Language.ExpandableStringExpressionAst])
+                }, $true))
+        foreach ($stringLiteral in $stringLiterals) {
+            $literalText = [string]$stringLiteral.Value
+            foreach ($loaderTextMatch in [regex]::Matches($literalText, '(?i)Import-BravoConfiguration[ \t]+[-`]')) {
+                # Логічний рядок команди: до першого \n, перед яким немає backtick.
+                $logicalLineEnd = $loaderTextMatch.Index
+                while ($logicalLineEnd -lt $literalText.Length) {
+                    $newlineIndex = $literalText.IndexOf("`n", $logicalLineEnd)
+                    if ($newlineIndex -lt 0) { $logicalLineEnd = $literalText.Length; break }
+                    $beforeNewline = $literalText.Substring($loaderTextMatch.Index, $newlineIndex - $loaderTextMatch.Index).TrimEnd("`r")
+                    if ($beforeNewline.EndsWith('`')) { $logicalLineEnd = $newlineIndex + 1; continue }
+                    $logicalLineEnd = $newlineIndex
+                    break
+                }
+                $commandText = $literalText.Substring($loaderTextMatch.Index, $logicalLineEnd - $loaderTextMatch.Index)
+                $flagMatch = [regex]::Match($commandText, '(?i)-DisallowLegacyPrimaryAutoDetect(?<arg>:\s*\S+)?')
+                $flagBound = $flagMatch.Success -and -not (
+                    $flagMatch.Groups['arg'].Success -and $flagMatch.Groups['arg'].Value -match '^:\s*\$?(false|0)\s*$')
+                if (-not $flagBound) {
+                    [void]$flaglessText.Add($relativePath + ':' + $stringLiteral.Extent.StartLineNumber)
+                }
+            }
+        }
+    }
+
+    $failures = New-Object System.Collections.Generic.List[string]
+    if ($parseFailures.Count -gt 0) {
+        [void]$failures.Add(
+            'Гейт GENERATED_LOADER_CALL_TEXT (issue #320): не вдалося розібрати AST ' + $parseFailures.Count +
+            ' файл(ів) - довести відсутність generated-виклику loader-а без прапорця неможливо: ' +
+            ([string]::Join(', ', $parseFailures))
+        )
+    }
+    if ($flaglessText.Count -gt 0) {
+        [void]$failures.Add(
+            'Гейт GENERATED_LOADER_CALL_TEXT (issue #320): ' + $flaglessText.Count +
+            ' рядковий(і) літерал(и) містять виклик Import-BravoConfiguration без -DisallowLegacyPrimaryAutoDetect у тому самому ' +
+            'логічному рядку команди (це текст дочірнього скрипта, який виконає інший процес: auto-derived legacy BRAVO.config поруч ' +
+            'виконався б поза гейтом B7; AST-гейти AUTOEXEC і CALLER_COMPLETENESS такий текст не бачать): ' +
+            ([string]::Join(', ', $flaglessText))
+        )
+    }
+
+    return [pscustomobject]@{
+        Passed        = ($failures.Count -eq 0)
+        Failures      = @($failures.ToArray())
+        FlaglessText  = @($flaglessText.ToArray())
+        ParseFailures = @($parseFailures.ToArray())
+    }
+}
+
 function Test-BRAVOConfigV2CutoverGates {
     <#
         -Root: staging-каталог (release-build) або checked-out repo tree
@@ -698,6 +845,14 @@ function Test-BRAVOConfigV2CutoverGates {
         -ProductionEntryPointRelativePath $ProductionEntryPointRelativePath
     foreach ($callerCompletenessFailure in $callerCompleteness.Failures) {
         [void]$failures.Add($callerCompletenessFailure)
+    }
+
+    # --- Гейт 5: GENERATED_LOADER_CALL_TEXT (issue #320) ---
+    # Текст дочірніх скриптів (Configurator.Effective), який AST-гейти вище
+    # не бачать; межі - у Test-BRAVOGeneratedLoaderCallText.
+    $generatedLoaderCallText = Test-BRAVOGeneratedLoaderCallText -Root $Root
+    foreach ($generatedLoaderCallTextFailure in $generatedLoaderCallText.Failures) {
+        [void]$failures.Add($generatedLoaderCallTextFailure)
     }
 
     return [pscustomobject]@{

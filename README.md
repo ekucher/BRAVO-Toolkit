@@ -1228,7 +1228,9 @@ UAC — можливий подальший крок, якщо той самий
 і для них.
 
 Додатковий параметр архівації `-SyncBAZA` примусово запитує синхронізацію BAZA,
-якщо її дозволяє конфігурація. Для maintenance доступні службові перемикачі
+якщо її дозволяє конфігурація. Він використовує той самий канонічний двигун, що й основний прогін
+(`Invoke-BRAVOBazaCanonicalSync`: IncrementalAppendOnly, MutationPolicy, remote conflict);
+legacy `synchronize -mirror` застосовується лише за явного `backupMonitoring.SFTP.BAZA.Mode = "Legacy"`. Для maintenance доступні службові перемикачі
 `-ForceRestore`, `-DisableSizeCheck`, `-EnableAllSlack`, `-DisableAllSlack`,
 `-AutoShutdown on|off` і `-ArchiveAfterMaintenance on|off`; змінювати їх слід
 лише з розумінням впливу на production.

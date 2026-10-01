@@ -2,6 +2,208 @@
 
 ## Не випущено (developer)
 
+- **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
+  `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
+  ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
+  без `-DisallowLegacyPrimaryAutoDetect`, тож файл, що лишився після `Update-BRAVOServer`,
+  виконувався при кожному запуску Configurator (UI/Persistence/Model) і показував значення,
+  які runtime 5.3 уже ігнорує. Тепер ізольований корінь не отримує копії `BRAVO.config`, а
+  дочірній виклик передає `-DisallowLegacyPrimaryAutoDetect` (захист у глибину). Додатковий
+  guard `GENERATED_LOADER_CALL_TEXT` у `ci\BRAVOConfigV2CutoverGates.ps1`
+  (`Test-BRAVOGeneratedLoaderCallText`, підключений до `Test-BRAVOConfigV2CutoverGates`):
+  AST-пошук рядкових літералів із текстом виклику loader-а без прапорця; межі описано в
+  коментарі функції (склеєний/зчитаний із файлу текст не бачить). Self-test fixture
+  Configurator більше не спирається на legacy `BRAVO.config`: built-in `LIMSRoot`/`BackupRoot`
+  підміняються у копії модуля `BRAVO.Configuration`. Нові self-test перевірки:
+  `Configurator/LegacyConfig/BaselineWithoutLegacyFile`,
+  `Configurator/LegacyConfig/PoisonedLegacyDoesNotBreakEffective`,
+  `Configurator/LegacyConfig/PoisonedLegacyMarkerNotWritten`,
+  `Configurator/LegacyConfig/LocalCandidateStillApplied`,
+  `Configurator/LegacyConfig/DiscoveryAndCredentialSettingsUnchanged`,
+  `Configurator/LegacyConfig/LegacyValueDoesNotAffectEffective`,
+  `Configurator/LegacyConfig/ChildPassesDisallowFlagAndDoesNotCopyLegacy`,
+  `ReleaseGate/GeneratedLoaderCallTextFlagsFlaglessChildScript`,
+  `ReleaseGate/GeneratedLoaderCallTextAcceptsFlaggedAndRejectsFalseBinding`,
+  `ReleaseGate/GeneratedLoaderCallTextIgnoresCommentsAndSanctioned`,
+  `ReleaseGate/GeneratedLoaderCallTextHoldsOnRepositoryTree`,
+  `ReleaseGate/CutoverGatesEnforceGeneratedLoaderCallText`.
+
+- **Fix: безпечне читання типу запуску служби без `ServiceController.StartType` (#319).**
+  `StartType` існує лише з .NET Framework 4.6.1, а Windows PowerShell 5.1 може
+  працювати на .NET 4.5.2+; під `Set-StrictMode -Version 2.0` пряме звернення
+  до відсутньої властивості кидає `PropertyNotFoundStrict` (PR #310 виправив
+  лише Health). Додано єдиний helper `Get-BRAVOServiceStartMode` (BRAVO.System):
+  читає `StartType` через `PSObject.Properties`, потім WMI `Win32_Service.StartMode`
+  (через `Get-BRAVOWmiInstance`), нормалізує до `Automatic`/`Manual`/`Disabled`
+  і замість винятку повертає `Unknown` із `FailureReason`. Переведено місця з
+  прямим читанням: Maintenance (верхній рівень BravoWeb та
+  `Get-ConfiguredServiceState`), `Get-BRAVODataRestoreServiceSnapshot`,
+  `Get-BRAVODryRunConfiguredServiceState` і `Set-BRAVOBootRestoreServiceStartType`
+  (джерело типу запуску — WMI; невідомий тип у `HoldServices` — збій
+  `SkippedUnknownStartType`, у `None` — без змін). Поведінка Health (#310) не
+  змінена. Нові self-test перевірки:
+  `ServiceStartMode/HelperNormalizationPrecedenceAndUnknown`,
+  `Maintenance/ServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `DataRestore/ServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `DryRun/ServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `BootRestore/ServiceStartTypeMissingUsesWmiAndFailsClosed`.
+
+- **Fix: Maintenance/Recovery утримує BRAVO, exchangAPI і Web від автостарту на час restore (#297).**
+  Boot-recovery профіль (`HoldServices`) ставить служби в Automatic (Delayed
+  Start): SCM піднімав їх ~через 2 хв після завантаження посеред багатохвилинного
+  before-архіву або `bravocmd`, а сторонній `Start-Service`, залежна служба чи
+  SCM recovery «restart on failure» могли зробити те саме й у звичайному нічному
+  вікні, тож BRAVO працював над моделлю, яку саме відновлюють (ризик пошкодження
+  даних). Єдиною мірою був restart-intent в ownership-маркері. Тепер на все
+  вікно «служби зупинені» керовані служби тимчасово переводяться в `Disabled`
+  (блокує SCM autostart, recovery actions, `Start-Service` і автостарт
+  залежностей; `Manual` цього не гарантує). Це транзакція, що перевикористовує
+  наявний ownership-маркер `BRAVO_SERVICE_QUIESCENCE.json` (необов'язкове поле
+  `startTypeSnapshot`, `schemaVersion` лишається 1; старі маркери читаються):
+  знімок точних початкових типів (Automatic, Automatic Delayed Start, Manual)
+  пишеться в маркер ДО зміни; у `finally` типи повертаються ПЕРЕД стартом служб;
+  збій повернення лишає маркер і вважається збоєм відновлення служб. Аварійний
+  вихід (kill, перезавантаження) самовідновлюється: наступний Maintenance/Recovery
+  (до читання start type) і Health-watchdog повертають типи зі знімка маркера
+  мертвого власника, гучно логуючи подію. Безпека: Disabled-служби (рішення
+  оператора) не потрапляють у знімок і ніколи не змінюються й не стартують;
+  відновлення чіпає лише службу, що зараз `Disabled`, тож зміна оператора не
+  перезаписується; служби поза керованим набором ігноруються; маркер
+  `restartSuppressed` (перервана посеред `bravocmd` реставрація) тримає служби
+  `Disabled` до ручного відновлення (код 43) разом із CRITICAL-повідомленням, що
+  містить початкові типи. Додатково hard-recheck: перед before-архівом
+  (`Confirm-BRAVOServicesQuiesced -StopRunning`) служба, яку встигли підняти,
+  зупиняється знову; безпосередньо перед `bravocmd` будь-яка запущена служба або
+  втрачене утримання скасовує реставрацію fail-closed (модель не торкнута, архів
+  збережено). Сам recheck без утримання недостатній (TOCTOU: служба може
+  піднятися одразу після перевірки), тож він доповнює утримання, а не замінює його.
+  Запис маркера не губить знімок: якщо на диску чужий маркер (мертвий власник,
+  `restartSuppressed` або невдале відновлення) має непорожній `startTypeSnapshot`,
+  запис Maintenance відхиляється fail-closed (гучна критична помилка, маркер
+  недоторканий), а запис DataRestore переносить чужий знімок у свій маркер
+  (`-PreserveForeignStartTypeSnapshot`; для тієї самої служби чинний старий
+  запис). Класифікація Disabled, обчислена до очікування lock, перевіряється
+  після його отримання: якщо вона змінилась (живий прогін тимчасово утримував
+  служби), Maintenance завершується з кодом 20 без дій, а не пропускає BRAVO
+  мовчки. Відновлення типів не відрізняє тимчасовий Disabled від Disabled,
+  виставленого оператором після аварії (свідомий компроміс).
+  Нові self-test перевірки: `ServiceQuiescence/StartTypeSuppressedDuringWindowAndExactlyRestored`,
+  `ServiceQuiescence/StartTypeDisabledByOperatorNeverTouched`,
+  `ServiceQuiescence/StartTypeRestoredAfterRestoreFailure`,
+  `ServiceQuiescence/StartTypePartialRestoreFailureReported`,
+  `ServiceQuiescence/StartTypeSnapshotSurvivesMarkerRewriteAndIsSanitized`,
+  `ServiceQuiescence/CrashLeavesMarkerNextRunRepairsExactStartTypes`,
+  `ServiceQuiescence/StartTypeRepairHandlesStaleForeignAndSuppressedMarkers`,
+  `ServiceQuiescence/RecheckDetectsServiceStartedMidWindow`,
+  `ServiceQuiescence/WatchdogRestoresStartTypesBeforeStartingServices`,
+  `ServiceQuiescence/MaintenanceOrdersRepairSuppressRecheckRestore`,
+  `ServiceQuiescence/MarkerWriteNeverDropsForeignStartTypeSnapshot`,
+  `ServiceQuiescence/MaintenanceRechecksClassificationAfterLock`,
+  `ServiceQuiescence/StartModeSleepStubDoesNotLeakIntoSession`.
+
+- **Fix: Maintenance `-ForceRestore` більше не пропускається мовчки, коли служба BRAVO має тип запуску Disabled (#321).**
+  `$BravoMaintenanceEnabled` дорівнює `false` при `StartMode=Disabled`, тож `$shouldRestore`
+  теж ставав `false`: реставрація пропускалась, заголовок не мав рядка «Реставрація моделі»,
+  крок рендерився SKIPPED «не заплановано на цей запуск», а статус був УСПІШНО. Тепер рішення
+  винесене в чисту функцію `Get-BRAVOMaintenanceRestoreDecision`: `-ForceRestore` + Disabled
+  -> реставрація ВИКОНУЄТЬСЯ. Служба вже зупинена, тому її не зупиняємо й не запускаємо після
+  реставрації, тип запуску не змінюємо (Disabled лишається); не-Disabled-випадки та звичайний
+  (не примусовий) Maintenance + Disabled поводяться як раніше (без реставрації). Заголовок
+  завжди показує «Реставрація моделі: АКТИВОВАНА (Примусово)». Окремого WARNING немає: після
+  успішної реставрації INFO у лозі й у Details кроку — «Реставрацію виконано; служба BRAVO має
+  тип Disabled — не запускалась»; статус прогону визначає сама реставрація (збій реставрації
+  провалює прогін як і раніше). Каталог архівів моделі створюється й за Disabled. Якщо
+  Disabled-служба фактично працює, реставрація не стартує (fail-closed, критична помилка).
+  Решта BRAVO-операцій при Disabled лишається пропущеною (trace, перевірка розмірів `.md`,
+  RangeId, retention) — рішення: примусова реставрація не розширює вимкнений компонент.
+  Поза обсягом: відновлення служб після зупинки вручну (#314), #316.
+  Супутнє: очікування операційного lock (`Enter-BRAVOMaintenanceOperationLock`) тепер пише
+  рівно два INFO — на початку очікування (operation/pid/hostname/startedAt власника, якщо JSON
+  читається; нечитабельний не заважає) і після отримання lock із тривалістю очікування;
+  покрокові рядки кожні 30 с прибрано, лічильник попереджень не змінюється.
+  Нові self-test перевірки: `Maintenance/RestoreDecision[...]` (10 сценаріїв),
+  `Maintenance/ForceRestoreDisabledDecisionIsWired`,
+  `Maintenance/ForceRestoreDisabledHeaderShowsActivated`,
+  `Maintenance/ForceRestoreDisabledEntersRestoreSequence`,
+  `Maintenance/ForceRestoreDisabledKeepsServiceStoppedAndInfoOnly`,
+  `Maintenance/OperationLockWaitLogsOnceWithHolderAndDuration`,
+  `Maintenance/OperationLockWaitLogToleratesUnreadableHolder`,
+  `Maintenance/ForceRestoreDisabledKillsStrayBis` (сторонній `Bis` завершується й за
+  `-ForceRestore` + Disabled, спільним хелпером `Stop-BRAVOMaintenanceStrayProcess`).
+
+- **Fix: `BRAVO_ARCHIV -SyncBAZA` більше не обходить IncrementalAppendOnly і MutationPolicy (#292).**
+  Задача BAZASync (кожні 4 год) запускала `-SyncBAZA`, який завжди викликав
+  legacy `Sync-FolderToSFTP` (`synchronize remote -mirror`): локально зіпсований
+  чи зашифрований файл BAZA перезаписував перевірену remote-копію, а
+  incremental-стан не оновлювався. Тепер Main і `-SyncBAZA` викликають ОДНУ
+  функцію `Invoke-BRAVOBazaCanonicalSync`: при `Mode = "IncrementalAppendOnly"`
+  (типовий) діють append-only контракт, MutationPolicy, remote conflict, audit
+  drift, несумісні імена, mutation archive та оновлення стану; legacy mirror
+  лишається лише за явного `Mode = "Legacy"`, а невідомий `Mode` завершується
+  помилкою замість тихого переходу на legacy. Будь-який не-`COMPLETE` статус
+  (`MUTATION_VIOLATION`, `REMOTE_CONFLICT`, `AUDIT_DRIFT`, `INCOMPATIBLE_NAME`,
+  `MUTATION_AUTO_ARCHIVED`) у `-SyncBAZA` дає exit 50, а
+  фінальна Operations-подія `-SyncBAZA` тепер несе режим і статус двигуна по
+  компонентах. Lock компонента спільний з Main/Health (той самий
+  `Invoke-BRAVOBazaComponentSyncSession`). Побічно: у legacy-режимі Main тепер
+  завжди ініціалізує `$script:bazaAppSyncResult`/`$script:bazaWWWSyncResult`.
+  `SKIPPED_CONCURRENT` у `-SyncBAZA` (lock компонента тримає Health) — INFO без збою,
+  як і в Health, але підсумок запуску й Operations-подія (`runOutcome`) кажуть
+  «ПРОПУЩЕНО (інший процес синхронізує компонент)», а не «УСПІШНО»
+  (`BazaSync/SyncBazaSkippedConcurrentRunOutcomeIsSkippedNotSuccess`); порожній/пробільний `BAZA.Mode` = типовий `IncrementalAppendOnly`.
+  `docs/BAZA_SFTP_ACCEPTANCE.md` і README оновлено. Нові self-test перевірки:
+  `BazaSync/SyncBazaSkippedConcurrentIsInfoNotFailure`, `BazaSync/SyncBazaEmptyModeTreatedAsDefaultIncremental`,
+  `BazaSync/SyncBazaAndMainResolveToSameCanonicalDispatcher`,
+  `BazaSync/NoProductionBazaSyncPathBypassesCanonicalDispatcher`,
+  `BazaSync/CanonicalDispatcherLegacyOnlyOnExplicitModeAndFailsClosed`,
+  `BazaSync/SyncBazaFailureMapsToSftpFailedExitAndOperationsEvent`,
+  `BazaSync/SyncBazaNewRemoteFileUploadedViaIncrementalEngineAndStateUpdated`,
+  `BazaSync/SyncBazaUnchangedFileMakesNoTransfer`,
+  `BazaSync/SyncBazaMutationViolationFailsAndRemoteGoodCopyNotOverwritten`,
+  `BazaSync/SyncBazaRemoteChangedFileIsNeverBlindlyMirrored`,
+  `BazaSync/SyncBazaRemoteConflictFailsWithoutOverwrite`,
+  `BazaSync/SyncBazaIncompatibleNameFailsButCompatibleFilesTransferred`,
+  `BazaSync/SyncBazaAuditDriftFailsWithoutOverwrite`,
+  `BazaSync/SyncBazaMutationAutoArchivedPreservesOldRemoteThenUploadsNewVersion`,
+  `BazaSync/SyncBazaLegacyMirrorOnlyWhenModeExplicitlyLegacy`,
+  `BazaSync/SyncBazaDefaultModeKeepsGoodRemoteCopyUnlikeLegacyMirror`,
+  `BazaSync/SyncBazaUnknownModeFailsClosedInsteadOfLegacyMirror`,
+  `BazaSync/SyncBazaRespectsSharedComponentSyncLock`; замінено застарілі текстові
+  перевірки call sites на `BazaSync/ArchiveBAZA_APPUsesCanonicalSyncDispatcher`,
+  `BazaSync/ArchiveBAZA_WWWUsesCanonicalSyncDispatcher`,
+  `BazaSync/CanonicalDispatcherPreservesIncrementalAndLegacyBranches`.
+
+- **Fix: автоматичний відкат `Update-BRAVOServer.ps1` точний, а не «старе поверх нового» (#289).**
+  Відкат копіював backup поверх runtime без видалення: файли, додані новим релізом, лишалися,
+  відновлений старий `RUNTIME_MANIFEST.json` їх не знав, і `BRAVO_RUNTIME_GUARD` блокував
+  Archive/Maintenance/Health/DataRestore кодом `33`, хоча robocopy звітував про успіх. Крім того,
+  задачі Планувальника лишалися такими, як їх зареєстрував новий реліз. Тепер
+  `deploy\BRAVO.Deploy.Rollback.ps1` (PowerShell без robocopy) відновлює owned-набір дзеркально:
+  staged-файли ∪ ключі нового й старого manifest мінус виключення розгортання (`BRAVO.config`,
+  `BRAVO.local.config`, `LOGS`, `MODEL` тощо); додані новим релізом файли видаляються, змінені й
+  видалені повертаються з backup. Відкат успішний (exit `1`) лише коли хеші runtime == старий
+  manifest, `VERSION.json` стара, guard `0`, `BRAVO_SETUP -Action Scheduler` повторно виконано зі
+  старого комплекту і `-ValidateOnly` пройшов; інакше exit `2` «ВІДКАТ НЕ ВДАВСЯ». Нові self-test
+  перевірки: `Rollback/PremiseNewReleaseBreaksOldManifest`, `Rollback/ChangedFilesRestoredToOldContent`,
+  `Rollback/FilesAddedByNewReleaseRemoved`, `Rollback/FileDeletedByNewReleaseIsRestored`,
+  `Rollback/RuntimeEqualsOldManifestAfterRollback`, `Rollback/OperatorOwnedStateSurvivesUntouched`,
+  `Rollback/VerificationDetectsStrayScriptAndHashDrift`,
+  `Rollback/UpdaterUsesExactRestoreNotRobocopyOverlay`,
+  `Rollback/UpdaterReRegistersSchedulerAndFailsLoudly`.
+  Той самий відкат (з тими самими критеріями успіху й контрактом exit `1`/`2`) тепер запускається і
+  при винятку чи збої robocopy розгортання після backup (раніше catch завершував exit `1` з
+  напіврозгорнутим комплектом): `Rollback/UpdaterRollsBackOnFailureAfterDeployStarted`.
+  Ключі manifest з `..`, кореневою, дисковою чи UNC формою відхиляються гучно (відкат не вдався, exit `2`), а
+  повний шлях цілі мусить лишатися під RuntimeRoot до будь-якого видалення/копіювання; верифікація відкату
+  не обходить виключені каталоги (LOGS/MODEL/BAZA...): `Rollback/UnsafeManifestKeysRejectedLoudlyAndNothingOutsideRootTouched`,
+  `Rollback/ResolvedTargetMustStayUnderRoot`, `Rollback/VerificationSkipsExcludedDirsButStillCatchesStrayScripts`,
+  `Rollback/TreeWalkDoesNotEnterExcludedDirs`.
+  Оркестратор відкату `Invoke-BRAVODeployUpdaterRollback` тепер виконується в self-test
+  реально (фейкові guard/BRAVO_SETUP у старому комплекті): порядок guard → Scheduler →
+  ValidateOnly зі старого комплекту, exit 10 не є збоєм відкату, а збій кожного кроку
+  стає проблемою відкату (exit 2): `Rollback/UpdaterOrchestrationReRegistersSchedulerFromRestoredKit`,
+  `Rollback/UpdaterOrchestrationAcceptsSetupWarningExit10`, `Rollback/UpdaterOrchestrationReportsEveryFailedStep`.
+
 - **Нове: пропущена нічна копія робиться після старту сервера (#322).**
   Якщо сервер був вимкнений о `Backup.DailyAt`, нічна копія раніше
   пропускалася до наступної ночі, а Health о `00:30` показував «Generation
