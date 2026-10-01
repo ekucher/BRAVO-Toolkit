@@ -803,6 +803,7 @@ function Get-BRAVOWmiInstance {
         -Name "ServiceQuiescence/HealthRunsWatchdogBeforeManagedServiceChecks" `
         -Failure "Health має запускати watchdog ДО оцінки керованих служб і вливати його issues у результат"
 
+    & {
     # --- #319: ServiceController.StartType існує лише з .NET Framework 4.6.1.
     # Під Set-StrictMode -Version 2.0 пряме звернення до відсутньої властивості
     # кидає PropertyNotFoundStrict. Усі місця читання типу запуску мають іти
@@ -1065,6 +1066,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
         -Condition ($startModeBootRestoreDiffs.Count -eq 0) `
         -Name "BootRestore/ServiceStartTypeMissingUsesWmiAndFailsClosed" `
         -Failure "Set-BRAVOBootRestoreServiceStartType: служба без StartType (.NET < 4.6.1) не має кидати виняток під StrictMode 2.0; тип запуску береться з WMI; якщо невідомий і HoldServices — Success=False (SkippedUnknownStartType), у None — не збій; наявний StartType має пріоритет над WMI. Розбіжності: $($startModeBootRestoreDiffs -join ' | ')"
+    }
 
     # Review F4: SETUP має зміцнювати ACL State-кореня (apply з адмін-правами,
     # CheckOnly для ValidateOnly/неелевованого прогону), а watchdog —
