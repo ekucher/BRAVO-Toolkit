@@ -213,6 +213,32 @@
   стає проблемою відкату (exit 2): `Rollback/UpdaterOrchestrationReRegistersSchedulerFromRestoredKit`,
   `Rollback/UpdaterOrchestrationAcceptsSetupWarningExit10`, `Rollback/UpdaterOrchestrationReportsEveryFailedStep`.
 
+- **Нове: пропущена нічна копія робиться після старту сервера (#322).**
+  Якщо сервер був вимкнений о `Backup.DailyAt`, нічна копія раніше
+  пропускалася до наступної ночі, а Health о `00:30` показував «Generation
+  старша за 24 год.». Тепер інсталятор реєструє boot-завдання
+  `BRAVO_ARCHIV_CATCHUP` (затримка 7 хв. після старту ОС), яке запускає `BRAVO_ARCHIV.ps1 -CatchUpMissedBackup`.
+  Після отримання спільного lock скрипт перевіряє `BRAVO_TASK_EXECUTION_STATE.json`:
+  копія робиться, лише якщо після останнього слоту немає COMPLETE-копії і до
+  наступного слоту більше 60 хв. (`Get-BRAVOBackupCatchUpDecision`, BRAVO.System).
+  Інакше exit `0` без сповіщення, Operations-події й вивантаження журналу.
+  На профілі `HoldServices` завдання вимкнене, бо пропущений backup уже
+  виконує `BRAVO_RESTORE_RECOVERY`. Вузол `schedulerSettings.BackupCatchUp`
+  повністю похідний (Derivation, для legacy-конфігурації — завантажувач),
+  нових канонічних листів конфігурації немає. Щоб завдання з'явилося, переінсталюйте задачі
+  (`BRAVO_TASKS_INSTALL.ps1`). Нові self-test перевірки:
+  `Scheduler/BackupCatchUpDecision`, `Scheduler/BackupCatchUpNextRunIsBoot`,
+  `Config/BackupCatchUpDerived`, `Scheduler/BackupCatchUpBootTaskWiring`.
+  Межові випадки закріплено: у перші 2 хв. після слоту (включно з
+  `Now == DailyAt`) підхоплення поступається звичайному запуску, щоб при
+  одночасному старті не вийшло двох копій; рівно 60 хв. до наступного слоту
+  = пропуск; відсутній, пошкоджений, без поля `Backup` чи з нерозбірливою
+  датою стан = копія робиться (з INFO у журнал), без винятку; стан пишеться
+  лише при COMPLETE generation. Нові self-test перевірки:
+  `Scheduler/BackupCatchUpStateReadCategories`,
+  `Scheduler/BackupExecutionStateWrittenOnlyOnComplete`,
+  `Scheduler/BackupCatchUpSharesArchiveLock`.
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях
