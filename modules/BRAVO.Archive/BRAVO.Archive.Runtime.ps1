@@ -3695,7 +3695,10 @@ function New-BRAVOTransferOperationResult {
 function Test-SFTPConfig {
     param(
         [switch]$BAZAOnly,
-        [switch]$SynchronizationOnly
+        [switch]$SynchronizationOnly,
+        # Не встановлені на цьому сервері компоненти (склад backup set):
+        # для них SFTP-каталоги не вимагаються, бо їх не копіюють.
+        [string[]]$NotInstalledComponents = @()
     )
 
     $configurationErrors = @()
@@ -3717,19 +3720,23 @@ function Test-SFTPConfig {
     }
 
     if (-not $BAZAOnly -and -not $SynchronizationOnly -and $componentSettings.SFTP.ArchiveUpload) {
-        foreach ($archive in ($archiveDefinitions | Where-Object { $_.Enabled })) {
+        foreach ($archive in ($archiveDefinitions | Where-Object {
+            $_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type
+        })) {
             if (-not $sftpDirectories.ContainsKey($archive.Type) -or [string]::IsNullOrWhiteSpace($sftpDirectories[$archive.Type])) {
                 $configurationErrors += "не встановлено SFTP каталог для архiву $($archive.Type)"
             }
         }
     }
 
-    if ($BAZAOnly -or $componentSettings.Synchronization.BAZA_APP_SFTP) {
+    if (@($NotInstalledComponents) -notcontains 'BAZA_APP' -and
+        ($BAZAOnly -or $componentSettings.Synchronization.BAZA_APP_SFTP)) {
         if (-not $sftpDirectories.ContainsKey("BAZA") -or [string]::IsNullOrWhiteSpace($sftpDirectories.BAZA)) {
             $configurationErrors += "не встановлено SFTP каталог для BAZA"
         }
     }
-    if ($componentSettings.Synchronization.BAZA_WWW_SFTP) {
+    if (@($NotInstalledComponents) -notcontains 'BAZA_WWW' -and
+        $componentSettings.Synchronization.BAZA_WWW_SFTP) {
         if (-not $sftpDirectories.ContainsKey("BAZAWWW") -or
             [string]::IsNullOrWhiteSpace($sftpDirectories.BAZAWWW)) {
             $configurationErrors += "не встановлено SFTP каталог для BAZA WWW"
@@ -5572,7 +5579,13 @@ function Invoke-ManualBAZASFTPSynchronization {
         return [pscustomobject]@{ Success = $false; Results = $manualResults }
     }
 
-    if (-not (Test-SFTPConfig -SynchronizationOnly)) {
+    # Напрямок без прапорця (вимкнений або компонент не встановлений) не
+    # потребує SFTP-каталогу.
+    $manualNotInstalled = @(
+        if (-not $BazaAppEnabled) { 'BAZA_APP' }
+        if (-not $BazaWWWEnabled) { 'BAZA_WWW' }
+    )
+    if (-not (Test-SFTPConfig -SynchronizationOnly -NotInstalledComponents $manualNotInstalled)) {
         Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю BAZA_APP / BAZA_WWW зупинено через помилки конфiгурацiї SFTP" -Level "ERROR"
         $manualResults.SFTPConnection.Success = $false
         $manualResults.SFTPConnection.Error = 'SFTP configuration invalid'
@@ -6485,7 +6498,8 @@ function Main {
             -DiscoveryResult $bravoDiscoveryResult `
             -Baseline $discoveryBaselineImport.Baseline `
             -BaselineSourceKind ([string]$discoveryBaselineImport.Source) `
-            -EnabledComponents $discoveryEnabledComponents
+            -EnabledComponents $discoveryEnabledComponents `
+            -PreviousCompleteComponents @(Get-BRAVOLastCompleteBackupComponents -BackupRoot $backupRootPath)
     } catch {
         $backupScopeError = $_.Exception.Message
     }
@@ -7044,7 +7058,7 @@ function Main {
         Show-ScriptProgress -Status "Перевiрка конфiгурацiї SFTP" -PercentComplete 10
         Write-Log "==="
         Write-Log "=== ПЕРЕВIРКА КОНФIГУРАЦIЇ SFTP ==="
-        $sftpConfigurationValid = Test-SFTPConfig
+        $sftpConfigurationValid = Test-SFTPConfig -NotInstalledComponents $notInstalledComponents
         if (-not $sftpConfigurationValid) {
             Write-Log "SFTP-компоненти буде пропущено; локальна архiвацiя продовжиться" -Level "WARNING"
             $operationFailed = $true

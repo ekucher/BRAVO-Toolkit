@@ -2,6 +2,31 @@
 
 ## Не випущено (developer)
 
+- **Feat: резервне копіювання лише встановлених компонентів (#282).**
+  Прапорець компонента в `componentSettings` тепер означає «копіювати, якщо компонент є на
+  сервері». `Resolve-BRAVOBackupComponentScope` (BRAVO.Discovery) поверх матриці
+  `Test-BRAVODiscoveryComponentDrift` класифікує склад: `Planned` / `NotInstalled` /
+  `DisabledByConfig` / `Missing` / `Unknown`. Увімкнений, але не встановлений компонент без
+  запису в baseline пропускається (Info) без архіву, BAZA-синхронізації й каталогів
+  призначення; `MODEL` обов'язковий, порожній склад і зниклий підтверджений компонент лишаються
+  помилкою. Discovery baseline створюється й доповнюється автоматично після COMPLETE generation
+  (лише Planned-компоненти, наявні значення не змінюються; перше створення не бере
+  DisabledByConfig). Для серверів без baseline другий доказ присутності — останній COMPLETE
+  generation manifest (`Get-BRAVOLastCompleteBackupComponents`): компонент, що мав у ньому
+  архів, а тепер Absent, стає `Missing` (помилка), а не `NotInstalled`. `BRAVO_ARCHIV`,
+  Health, Dry Run і `BRAVO_SETUP -ValidateOnly` користуються цим самим складом (ValidateOnly і
+  Test-BRAVODiscoveryResult більше не створюють каталогів); `Test-SFTPConfig` не вимагає
+  SFTP-каталогів для NotInstalled-компонентів; Health показує один INFO-рядок «Не встановлено
+  на цьому сервері: …» без WARNING. Свідоме відхилення від
+  `designs/backup-scope-by-environment.md` (розділ 5): Health бере склад із живого discovery +
+  baseline (read-only) і останнього COMPLETE manifest як другого доказу, а не зі `scope`
+  manifest, бо manifest застаріває між прогонами; поле manifest `componentScope` пишеться як
+  аудит-доказ свідомого пропуску й Health його не читає. Нові self-test перевірки: набір
+  `BackupScope` (зокрема `BackupScope/PreviouslyBackedUpComponentVanishedWithoutBaselineIsError`,
+  `BackupScope/FirstBaselineExcludesDisabledByConfig`,
+  `BackupScope/LastCompleteManifestComponentsReader`,
+  `BackupScope/SftpConfigSkipsNotInstalledAndPreviousProofWired`).
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`

@@ -564,12 +564,21 @@ function Get-BRAVOHealthExpectedArchiveDefinitions {
 
 # Той самий канонічний склад, що й у BRAVO_ARCHIV, у read-only варіанті:
 # Health лише читає baseline. Невизначеність = очікуємо всі увімкнені.
+# Свідоме відхилення від designs/backup-scope-by-environment.md (розділ 5):
+# дизайн велів брати склад зі `scope` останнього COMPLETE manifest. Тут
+# склад береться з живого discovery + baseline (+ останній COMPLETE
+# manifest як другий доказ присутності, див. -BackupRoot), бо manifest
+# застаріває між прогонами: компонент, що зник після останньої копії,
+# Health побачив би «Planned» лише до наступного прогону, а що з'явився,
+# не побачив би взагалі. Поле manifest `componentScope` пишеться для аудиту
+# (доказ, що пропуск свідомий) і Health його не читає.
 # Журнал Health тут ще не ініціалізовано: причини записуються пізніше.
 $healthComponentScope = Get-BRAVOBackupNotInstalledComponents `
     -DiscoveryResult $bravoDiscoveryResult `
     -EnabledComponents $discoveryEnabledComponents `
     -StateRoot $stateRoot `
-    -RuntimeRoot $runtimeRoot
+    -RuntimeRoot $runtimeRoot `
+    -BackupRoot $backupRootPath
 $script:healthComponentScopeError = [string]$healthComponentScope.Error
 $script:healthNotInstalledComponents = @($healthComponentScope.NotInstalled)
 $bazaAppHealthInstalled = @($script:healthNotInstalledComponents) -notcontains 'BAZA_APP'

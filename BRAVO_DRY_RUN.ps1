@@ -1271,7 +1271,8 @@ try {
             -DiscoveryResult $bravoDiscoveryResult `
             -EnabledComponents $global:discoveryEnabledComponents `
             -StateRoot $dryRunStateRoot `
-            -RuntimeRoot $dryRunRuntimeRoot
+            -RuntimeRoot $dryRunRuntimeRoot `
+            -BackupRoot ([string]$global:backupRootPath)
         $dryRunComponentScopeError = [string]$dryRunComponentScope.Error
         $dryRunNotInstalledComponents = @($dryRunComponentScope.NotInstalled)
     } catch {

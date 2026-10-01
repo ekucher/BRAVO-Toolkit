@@ -85,6 +85,64 @@ Test-BRAVOCondition -Condition (
 ) -Name 'BackupScope/BaselineConfirmedComponentVanishedIsError' `
     -Failure 'компонент, підтверджений у baseline, який зник, має лишатись помилкою (Missing), а не тихим NotInstalled'
 
+# (2b) Сервер без baseline, але BLOG мав архів в останній COMPLETE generation
+# і тепер Absent: другий доказ присутності -> Missing (Error), а не
+# NotInstalled. Без цього доказу той самий стан лишається NotInstalled.
+$scopeBlogAbsentPresence = @{ MODEL = 'Present'; BLOG = 'Absent'; BRAVOEXCH = 'Absent'; BAZA_APP = 'Absent'; BAZA_WWW = 'Present' }
+$scopePreviousBlog = Resolve-BRAVOBackupComponentScope `
+    -DiscoveryResult (New-BRAVOSelfTestScopeDiscovery -Presence $scopeBlogAbsentPresence) `
+    -EnabledComponents $scopeAllEnabled `
+    -PreviousCompleteComponents @('MODEL', 'BLOG')
+$scopeNoPreviousBlog = Resolve-BRAVOBackupComponentScope `
+    -DiscoveryResult (New-BRAVOSelfTestScopeDiscovery -Presence $scopeBlogAbsentPresence) `
+    -EnabledComponents $scopeAllEnabled `
+    -PreviousCompleteComponents @('MODEL')
+Test-BRAVOCondition -Condition (
+    [string]$scopePreviousBlog.Components['BLOG'] -eq 'Missing' -and
+    @($scopePreviousBlog.Findings | Where-Object { [string]$_.Severity -eq 'Error' -and [string]$_.Component -eq 'BLOG' }).Count -eq 1 -and
+    @($scopePreviousBlog.NotInstalled) -notcontains 'BLOG' -and
+    [bool]$scopePreviousBlog.EffectiveEnabledComponents['BLOG'] -and
+    [string]$scopePreviousBlog.Components['BRAVOEXCH'] -eq 'NotInstalled' -and
+    [string]$scopeNoPreviousBlog.Components['BLOG'] -eq 'NotInstalled'
+) -Name 'BackupScope/PreviouslyBackedUpComponentVanishedWithoutBaselineIsError' `
+    -Failure 'без baseline компонент, що мав архів в останній COMPLETE generation і зник, має бути Missing (Error), а не NotInstalled'
+
+# Той самий читач, що годує Resolve: останній COMPLETE manifest у MANIFESTS\.
+$scopeManifestRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_SCOPE_BACKUP_' + [guid]::NewGuid().ToString('N'))
+try {
+    $scopeManifestDir = Join-Path $scopeManifestRoot 'MANIFESTS'
+    [void](New-Item -ItemType Directory -Path $scopeManifestDir -Force)
+    $scopeUtf8 = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText((Join-Path $scopeManifestDir 'BRAVO_BACKUP_20260101_020000.json'), (@{
+        generationId = '20260101_020000'; status = 'COMPLETE'; createdAt = '2026-01-01T02:00:00Z'
+        components = @{ MODEL = @{ CreateSuccess = $true; ArchivePath = 'C:\ExampleLims\ARCHIV\MODEL\m.7z' } }
+    } | ConvertTo-Json -Depth 5), $scopeUtf8)
+    [IO.File]::WriteAllText((Join-Path $scopeManifestDir 'BRAVO_BACKUP_20260102_020000.json'), (@{
+        generationId = '20260102_020000'; status = 'COMPLETE'; createdAt = '2026-01-02T02:00:00Z'
+        components = @{
+            MODEL = @{ CreateSuccess = $true; ArchivePath = 'C:\ExampleLims\ARCHIV\MODEL\m2.7z' }
+            BLOG = @{ CreateSuccess = $true; ArchivePath = 'C:\ExampleLims\ARCHIV\BLOG\b2.7z' }
+            BRAVOEXCH = @{ CreateSuccess = $false; ArchivePath = '' }
+        }
+    } | ConvertTo-Json -Depth 5), $scopeUtf8)
+    [IO.File]::WriteAllText((Join-Path $scopeManifestDir 'BRAVO_BACKUP_20260103_020000.json'), (@{
+        generationId = '20260103_020000'; status = 'INCOMPLETE'; createdAt = '2026-01-03T02:00:00Z'
+        components = @{ BAZA_APP = @{ CreateSuccess = $true; ArchivePath = 'C:\x.7z' } }
+    } | ConvertTo-Json -Depth 5), $scopeUtf8)
+    $scopeLastNames = @(Get-BRAVOLastCompleteBackupComponents -BackupRoot $scopeManifestRoot)
+    Test-BRAVOCondition -Condition (
+        $scopeLastNames.Count -eq 2 -and
+        $scopeLastNames -contains 'MODEL' -and
+        $scopeLastNames -contains 'BLOG' -and
+        @(Get-BRAVOLastCompleteBackupComponents -BackupRoot (Join-Path $scopeManifestRoot 'немає')).Count -eq 0
+    ) -Name 'BackupScope/LastCompleteManifestComponentsReader' `
+        -Failure 'Get-BRAVOLastCompleteBackupComponents має брати найновіший COMPLETE manifest (не INCOMPLETE) і лише компоненти з архівом'
+} finally {
+    if (Test-Path -LiteralPath $scopeManifestRoot) {
+        Remove-Item -LiteralPath $scopeManifestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # (3) MODEL обов'язковий: його відсутність — помилка навіть без baseline.
 $scopeModelAbsent = Resolve-BRAVOBackupComponentScope `
     -DiscoveryResult (New-BRAVOSelfTestScopeDiscovery -Presence @{ MODEL = 'Absent'; BLOG = 'Present'; BRAVOEXCH = 'Absent'; BAZA_APP = 'Absent'; BAZA_WWW = 'Absent' }) `
@@ -186,6 +244,26 @@ try {
     ) -Name 'BackupScope/BaselineExtendedOnlyForEmptyFields' `
         -Failure 'автоматичне доповнення має дописувати лише порожні поля Planned-компонентів і ніколи не змінювати наявні значення'
 
+    # Перше створення baseline: DisabledByConfig-компонент (тут BAZA_WWW
+    # вимкнено, хоч він є на сервері) не потрапляє в baseline.
+    Remove-Item -LiteralPath $scopeBaselinePath -Force
+    $scopeWwwDisabled = Resolve-BRAVOBackupComponentScope `
+        -DiscoveryResult $scopeVetOfficeDiscovery `
+        -EnabledComponents @{ MODEL = $true; BLOG = $true; BRAVOEXCH = $true; BAZA_APP = $true; BAZA_WWW = $false }
+    $scopeCreatedPlannedOnly = Update-BRAVODiscoveryBaselineFromScope `
+        -DiscoveryResult $scopeVetOfficeDiscovery -ScopeResult $scopeWwwDisabled `
+        -StateRoot $scopeStateRoot -RuntimeRoot $scopeRuntimeRoot
+    $scopePlannedOnlyBaseline = (Get-Content -LiteralPath $scopeBaselinePath -Raw -Encoding UTF8) | ConvertFrom-Json
+    Test-BRAVOCondition -Condition (
+        [string]$scopeWwwDisabled.Components['BAZA_WWW'] -eq 'DisabledByConfig' -and
+        [string]$scopeCreatedPlannedOnly.Action -eq 'Created' -and
+        @($scopeCreatedPlannedOnly.AddedComponents) -notcontains 'BAZA_WWW' -and
+        [string]$scopePlannedOnlyBaseline.MODEL_SOURCE -eq 'C:\ExampleLims\Model' -and
+        [string]$scopePlannedOnlyBaseline.BLOG_SOURCE -eq 'C:\ExampleLims\BLOG' -and
+        [string]::IsNullOrWhiteSpace([string]$scopePlannedOnlyBaseline.BAZA_WWW)
+    ) -Name 'BackupScope/FirstBaselineExcludesDisabledByConfig' `
+        -Failure 'перший baseline має містити лише Planned-компоненти: вимкнений у конфігурації компонент не береться під захист'
+
     [IO.File]::WriteAllText($scopeBaselinePath, '{ не JSON', (New-Object Text.UTF8Encoding($false)))
     $scopeUnreadable = Update-BRAVODiscoveryBaselineFromScope `
         -DiscoveryResult $scopeVetOfficeDiscovery -ScopeResult $scopeVetOffice `
@@ -259,6 +337,14 @@ Test-BRAVOCondition -Condition (
     -not $scopeHealthText.Contains('@($archiveDefinitions | Where-Object { $_.Enabled })')
 ) -Name 'BackupScope/HealthExpectsOnlyInstalledComponents' `
     -Failure 'Health має очікувати лише встановлені компоненти через Get-BRAVOHealthExpectedArchiveDefinitions і read-only Get-BRAVOBackupNotInstalledComponents'
+Test-BRAVOCondition -Condition (
+    $scopeArchiveText.Contains('Test-SFTPConfig -NotInstalledComponents $notInstalledComponents') -and
+    $scopeArchiveText.Contains('Test-SFTPConfig -SynchronizationOnly -NotInstalledComponents $manualNotInstalled') -and
+    $scopeArchiveText.Contains('$_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type') -and
+    $scopeArchiveText.Contains('-PreviousCompleteComponents @(Get-BRAVOLastCompleteBackupComponents -BackupRoot $backupRootPath)') -and
+    $scopeHealthText.Contains('-BackupRoot $backupRootPath')
+) -Name 'BackupScope/SftpConfigSkipsNotInstalledAndPreviousProofWired' `
+    -Failure 'Test-SFTPConfig не має вимагати SFTP-каталоги NotInstalled-компонентів; Archive і Health мають передавати останній COMPLETE manifest як другий доказ'
 $scopeDryRunText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)
 Test-BRAVOCondition -Condition (
     $scopeDryRunText.Contains('$dryRunComponentScope = Get-BRAVOBackupNotInstalledComponents') -and
