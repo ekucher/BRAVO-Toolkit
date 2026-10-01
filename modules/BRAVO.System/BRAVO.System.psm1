@@ -654,7 +654,10 @@ function Set-BRAVOBootRestoreServiceStartType {
 # SCM підняв би їх на напіввідновленій моделі при наступному boot.
 # ---------------------------------------------------------------------------
 
-function Get-BRAVOServiceStartMode {
+function Get-BRAVOServiceRegistryStartMode {
+    # Точний SCM start type (вкл. AutomaticDelayed) з реєстру — для знімка
+    # утримання #297. Для загальної класифікації start type див.
+    # Get-BRAVOServiceStartMode (інший контракт).
     # Канонічне значення start type: Automatic | AutomaticDelayed | Manual |
     # Disabled | Other (boot/system/невідоме) | $null (службу не знайдено).
     # Читається з реєстру (Start + DelayedAutostart), а не з
@@ -707,7 +710,7 @@ function New-BRAVOServiceStartTypeSnapshot {
 
     $snapshot = New-Object System.Collections.Generic.List[object]
     foreach ($serviceName in @($ServiceNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        $startMode = Get-BRAVOServiceStartMode -ServiceName $serviceName
+        $startMode = Get-BRAVOServiceRegistryStartMode -ServiceName $serviceName
         if ($startMode -in @('Automatic', 'AutomaticDelayed', 'Manual')) {
             [void]$snapshot.Add(@{ Name = [string]$serviceName; StartMode = [string]$startMode })
         }
@@ -728,7 +731,7 @@ function Suspend-BRAVOServiceAutostart {
     foreach ($entry in @($Snapshot)) {
         $name = [string]$entry.Name
         try {
-            $currentMode = Get-BRAVOServiceStartMode -ServiceName $name
+            $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $name
             if ($currentMode -eq 'Disabled') { $applied += $name; continue }
             if ($currentMode -ne [string]$entry.StartMode) {
                 $failed += "${name}: тип запуску змінився після знімка ($currentMode замість $($entry.StartMode))"
@@ -774,7 +777,7 @@ function Restore-BRAVOServiceStartTypeSnapshot {
                 $failed += "${name}: поза керованим набором служб — зміну start type заборонено (можливе стороннє редагування маркера)"
                 continue
             }
-            $currentMode = Get-BRAVOServiceStartMode -ServiceName $name
+            $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $name
             if ($null -eq $currentMode) { $unchanged += $name; continue }
             if ($currentMode -eq $originalMode) { $unchanged += $name; continue }
             if ($currentMode -ne 'Disabled') {
@@ -785,7 +788,7 @@ function Restore-BRAVOServiceStartTypeSnapshot {
                 $failed += "${name}: не вдалося повернути $originalMode"
                 continue
             }
-            $verifiedMode = Get-BRAVOServiceStartMode -ServiceName $name
+            $verifiedMode = Get-BRAVOServiceRegistryStartMode -ServiceName $name
             if ($verifiedMode -ne $originalMode) {
                 $failed += "${name}: після відновлення тип $verifiedMode замість $originalMode"
                 continue
@@ -916,7 +919,7 @@ function Confirm-BRAVOServicesQuiesced {
     foreach ($entry in @($Snapshot)) {
         $name = [string]$entry.Name
         try {
-            $currentMode = Get-BRAVOServiceStartMode -ServiceName $name
+            $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $name
             if ($currentMode -eq 'Disabled') { continue }
             if ($StopRunning -and $currentMode -eq [string]$entry.StartMode -and
                 (Set-BRAVOServiceStartMode -ServiceName $name -StartMode 'Disabled')) { continue }

@@ -843,7 +843,7 @@ function Reset-BRAVOSelfTestStartModes {
     $script:Q297SetLog = @()
     $script:Q297OwnerAlive = $false
 }
-function Get-BRAVOServiceStartMode {
+function Get-BRAVOServiceRegistryStartMode {
     param([string]$ServiceName)
     if ($script:Q297Modes.ContainsKey($ServiceName)) { return [string]$script:Q297Modes[$ServiceName] }
     return $null
@@ -878,7 +878,7 @@ function Start-Sleep { param($Seconds) }
             'Get-BRAVOServiceQuiescenceStatePath',
             'Set-BRAVOSelfTestQuiescenceStatePath',
             'Reset-BRAVOSelfTestStartModes',
-            'Get-BRAVOServiceStartMode',
+            'Get-BRAVOServiceRegistryStartMode',
             'Set-BRAVOServiceStartMode',
             'Test-BRAVOProcessAlive',
             'Get-Service',
