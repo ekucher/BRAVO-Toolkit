@@ -343,10 +343,41 @@ function Write-BRAVOServiceQuiescenceState {
         # #297: точні початкові start type служб, які власник тимчасово
         # переводить у Disabled на час restore (@{ Name; StartMode }).
         # Пишеться ДО зміни (write-ahead) — див. Suspend-BRAVOServiceAutostart.
-        [object[]]$StartTypeSnapshot = @()
+        [object[]]$StartTypeSnapshot = @(),
+        # #297: поведінка, коли на диску вже є ЧУЖИЙ маркер з непорожнім
+        # startTypeSnapshot (попередній прогін загинув/його служби свідомо
+        # утримано Disabled): його знімок — єдиний запис справжніх початкових
+        # типів. Без цього прапорця запис ВІДХИЛЯЄТЬСЯ (throw, fail-closed:
+        # власник-Maintenance абортує зупинку служб гучною критичною
+        # помилкою, а маркер лишається недоторканим — перезапис загубив би
+        # типи, і служби лишились би Disabled назавжди, а наступні прогони
+        # прийняли б їх за вимкнені оператором). З прапорцем (DataRestore:
+        # його робота — саме ручне відновлення й блокувати її не можна)
+        # записи чужого знімка переносяться в новий маркер; для тієї самої
+        # служби чинний старий запис (він містить справжній оригінал).
+        [switch]$PreserveForeignStartTypeSnapshot
     )
 
     $statePath = Get-BRAVOServiceQuiescenceStatePath
+    $existingState = $null
+    try { $existingState = Read-BRAVOServiceQuiescenceState } catch { $existingState = $null }
+    if ($null -ne $existingState -and
+        @($existingState.startTypeSnapshot).Count -gt 0 -and
+        -not (Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess -State $existingState)) {
+        if (-not $PreserveForeignStartTypeSnapshot) {
+            throw "Існуючий ownership-маркер ($($existingState.owner), PID $($existingState.pid)) містить знімок початкових типів запуску служб (#297) — він не перезаписується, щоб не втратити типи (потрібне відновлення: Health-watchdog або ручне, код 43)"
+        }
+        $mergedSnapshot = @()
+        foreach ($oldEntry in @($existingState.startTypeSnapshot)) {
+            $mergedSnapshot += [pscustomobject]@{ Name = [string]$oldEntry.Name; StartMode = [string]$oldEntry.StartMode }
+        }
+        foreach ($newEntry in @($StartTypeSnapshot)) {
+            if (@($mergedSnapshot | Where-Object { $_.Name -ieq [string]$newEntry.Name }).Count -eq 0) {
+                $mergedSnapshot += [pscustomobject]@{ Name = [string]$newEntry.Name; StartMode = [string]$newEntry.StartMode }
+            }
+        }
+        $StartTypeSnapshot = @($mergedSnapshot)
+    }
     $stateDirectory = Split-Path -Path $statePath -Parent
     if (-not [IO.Directory]::Exists($stateDirectory)) {
         [void][IO.Directory]::CreateDirectory($stateDirectory)
@@ -758,6 +789,14 @@ function Restore-BRAVOServiceStartTypeSnapshot {
     # -AllowedServiceNames: службу поза канонічним набором (стороннє
     # редагування маркера) не чіпаємо — Failed із поясненням.
     # Не кидає виняток; Failed != порожній => викликач лишає маркер.
+    #
+    # ОБМЕЖЕННЯ (свідоме, не виправляється тут): функція не відрізняє
+    # тимчасовий Disabled від Disabled, який оператор виставив САМ уже ПІСЛЯ
+    # аварії — обидва виглядають як «зараз Disabled». Тож якщо оператор
+    # вимкнув службу між аварією й самовідновленням, початковий тип буде
+    # повернено. Це свідомий компроміс: служба, що лишилась би Disabled через
+    # аварію, гірша за повернення її початкового типу; про відновлення
+    # гучно повідомляється (WARNING/Slack), оператор бачить, що саме змінено.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Snapshot,

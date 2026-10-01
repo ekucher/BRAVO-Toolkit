@@ -1236,6 +1236,72 @@ function Restore-BRAVOServiceStartTypeSnapshot {
             ) `
             -Name "ServiceQuiescence/MaintenanceOrdersRepairSuppressRecheckRestore" `
             -Failure "Maintenance: Repair до читання start type; знімок у маркері до Suspend; Confirm перед before-archive і перед bravocmd; Restore start type у finally ПЕРЕД стартом служб"
+
+        # (10) P2: запис маркера не губить чужий знімок типів. Чужий маркер
+        # (pid іншого процесу) із непорожнім знімком: Maintenance-запис
+        # відхиляється (маркер недоторканий); DataRestore-запис переносить
+        # знімок (старий запис чинний для тієї ж служби); порожній знімок
+        # чужого маркера не блокує запис.
+        $foreignWrite = & $startModeModule {
+            $out = @{}
+            Reset-BRAVOSelfTestStartModes -Modes @{}
+            $path = Get-BRAVOServiceQuiescenceStatePath
+            $makeForeign = {
+                param($Snapshot)
+                [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'x' -StartTypeSnapshot $Snapshot)
+                $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+                $raw.pid = 1
+                [IO.File]::WriteAllText($path, ($raw | ConvertTo-Json -Depth 5))
+            }
+            & $makeForeign @(@{ Name = 'BRAVO'; StartMode = 'AutomaticDelayed' })
+            $out.Refused = $false
+            try {
+                [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'exchangAPI'; RestartIntent = $true }) -LogFile 'y' -StartTypeSnapshot @(@{ Name = 'exchangAPI'; StartMode = 'Automatic' }))
+            } catch { $out.Refused = $true }
+            $out.AfterRefuse = Read-BRAVOServiceQuiescenceState
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_DATA_RESTORE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'z' -RestartSuppressed -PreserveForeignStartTypeSnapshot `
+                -StartTypeSnapshot @(@{ Name = 'BRAVO'; StartMode = 'Manual' }, @{ Name = 'BravoWeb'; StartMode = 'Automatic' }))
+            $out.Merged = Read-BRAVOServiceQuiescenceState
+            & $makeForeign @()
+            $out.EmptyAllowed = $true
+            try {
+                [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'w' -StartTypeSnapshot @())
+            } catch { $out.EmptyAllowed = $false }
+            [pscustomobject]$out
+        }
+        $mergedByName = @{}
+        foreach ($mergedEntry in @($foreignWrite.Merged.startTypeSnapshot)) { $mergedByName[[string]$mergedEntry.Name] = [string]$mergedEntry.StartMode }
+        Test-BRAVOCondition `
+            -Condition (
+                $foreignWrite.Refused -and
+                @($foreignWrite.AfterRefuse.startTypeSnapshot).Count -eq 1 -and
+                [string]$foreignWrite.AfterRefuse.startTypeSnapshot[0].StartMode -eq 'AutomaticDelayed' -and
+                $mergedByName.Count -eq 2 -and $mergedByName['BRAVO'] -eq 'AutomaticDelayed' -and $mergedByName['BravoWeb'] -eq 'Automatic' -and
+                $foreignWrite.EmptyAllowed
+            ) `
+            -Name "ServiceQuiescence/MarkerWriteNeverDropsForeignStartTypeSnapshot" `
+            -Failure "запис маркера: чужий знімок типів не перезаписується (Maintenance throw, маркер недоторканий); DataRestore переносить його (старий запис виграє); порожній знімок не блокує"
+
+        # (11) P2: класифікація Disabled перевіряється ПІСЛЯ отримання lock,
+        # до будь-яких дій (зупинка служб), а DataRestore зберігає знімок.
+        $lockIndex = $maintenanceTextForStartMode.IndexOf('$script:maintenanceOperationLockPath = $maintenanceLockResult.Path')
+        $postLockRepairIndex = $maintenanceTextForStartMode.IndexOf('$postLockRepair = Repair-BRAVOOrphanedServiceStartTypes')
+        $reclassifyIndex = $maintenanceTextForStartMode.IndexOf('$reBravoEnabled = ')
+        $reclassifyExitIndex = $maintenanceTextForStartMode.IndexOf('Resolve-BRAVOExitCode -LockBusy', $reclassifyIndex)
+        $logRotationIndex = $maintenanceTextForStartMode.IndexOf('$bravoLogRotationLogger = ')
+        $dataRestoreTextForStartMode = [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $lockIndex -ge 0 -and $postLockRepairIndex -gt $lockIndex -and
+                $reclassifyIndex -gt $postLockRepairIndex -and $reclassifyExitIndex -gt $reclassifyIndex -and
+                $logRotationIndex -gt $reclassifyExitIndex -and
+                $dataRestoreTextForStartMode.Contains('-PreserveForeignStartTypeSnapshot')
+            ) `
+            -Name "ServiceQuiescence/MaintenanceRechecksClassificationAfterLock" `
+            -Failure "після lock Maintenance має повторити Repair і перевірити класифікацію служб (зміна -> fail-closed exit 20) до будь-яких дій; DataRestore пише маркер з -PreserveForeignStartTypeSnapshot"
     } finally {
         Remove-Item -LiteralPath $startModeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

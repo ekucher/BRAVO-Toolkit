@@ -714,6 +714,7 @@ if ($script:SlackMode -ne "none") {
 # Крок не кидає виняток; результат логується пізніше (Write-Log ще не
 # визначено), а тут — одразу в консоль.
 $script:startModeRepairResult = $null
+$startModeRepairAllowedNames = @()
 try {
     $startModeRepairAllowedNames = @($BravoServiceName, $ExchangAPIServiceName)
     foreach ($startModeRepairWebCandidate in $BravoWebServiceCandidates) {
@@ -8310,6 +8311,43 @@ if (-not $maintenanceLockResult.Success) {
 }
 $script:maintenanceOperationLock = $maintenanceLockResult.Stream
 $script:maintenanceOperationLockPath = $maintenanceLockResult.Path
+
+# #297 (клас гонитви): класифікація Disabled/Enabled (~рядки 830/1010) і
+# $shouldRestore обчислені ДО очікування lock. Якщо тоді живий інший прогін
+# тримав служби в тимчасовому Disabled (Repair -> 'OwnerAlive'), служба
+# хибно класифікована як «вимкнена оператором», а до моменту отримання lock
+# той прогін уже повернув типи. Тут (lock отримано, власник завершився)
+# повторюємо самовідновлення й ПЕРЕВІРЯЄМО класифікацію. Якщо вона змінилась,
+# похідні рішення (restore, кроки, підсумок) обчислені зі застарілих
+# прапорців, а їх перерахунок інвазивний — тож прогін завершується
+# fail-closed (код 20, нічого не зроблено) і наступний запуск рахує все
+# заново. Незмінна класифікація — продовжуємо.
+if ([string]$script:startModeRepairResult.Status -eq 'OwnerAlive') {
+    $postLockRepair = Repair-BRAVOOrphanedServiceStartTypes `
+        -AllowedServiceNames @($startModeRepairAllowedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    Write-Log -Message "Повторне самовідновлення типів запуску після отримання lock (#297): $($postLockRepair.Status)" -Level "INFO"
+    $reBravoEnabled = [bool](Get-ConfiguredServiceState -Name $BravoServiceName).Enabled
+    $reExchangeState = Get-ConfiguredServiceState -Name $ExchangAPIServiceName
+    $reExchangeEnabled = [bool](Get-BRAVOOptionalServiceComponentPlan `
+        -ServiceExists $reExchangeState.Exists -ServiceDisabled $reExchangeState.Disabled).ManageService
+    $reWebEnabled = [bool]$BravoWebMaintenanceEnabled
+    if (-not [string]::IsNullOrWhiteSpace([string]$BravoWebServiceName)) {
+        $reWebState = Get-ConfiguredServiceState -Name $BravoWebServiceName
+        $reWebEnabled = [bool](Get-BRAVOBravoWebComponentPlan `
+            -ComponentEnabled $BravoWebComponentEnabled `
+            -ServiceExists $reWebState.Exists `
+            -ServiceDisabled $reWebState.Disabled `
+            -ServiceMatchCount $BravoWebServiceMatchCount).ManageService
+    }
+    if ($reBravoEnabled -ne [bool]$BravoMaintenanceEnabled -or
+        $reExchangeEnabled -ne [bool]$exchangAPIServiceEnabled -or
+        $reWebEnabled -ne [bool]$BravoWebMaintenanceEnabled) {
+        Write-Log -Message "Класифікація служб змінилась, поки очікувався lock (інший прогін тимчасово утримував служби Disabled, #297): Bravo $BravoMaintenanceEnabled->$reBravoEnabled, exchangAPI $exchangAPIServiceEnabled->$reExchangeEnabled, Web $BravoWebMaintenanceEnabled->$reWebEnabled. Рішення цього прогону обчислені зі застарілих даних — прогін завершено без дій, наступний запуск повторить" -Level "WARNING"
+        try { $script:maintenanceOperationLock.Dispose() } catch { }
+        Complete-BRAVOProgress
+        exit (Resolve-BRAVOExitCode -LockBusy)
+    }
+}
 
 $bravoLogRotationLogger = { param($Message, $Level) Write-Log -Message $Message -Level $Level }
 

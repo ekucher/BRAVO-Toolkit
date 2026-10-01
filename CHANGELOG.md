@@ -31,6 +31,16 @@
   втрачене утримання скасовує реставрацію fail-closed (модель не торкнута, архів
   збережено). Сам recheck без утримання недостатній (TOCTOU: служба може
   піднятися одразу після перевірки), тож він доповнює утримання, а не замінює його.
+  Запис маркера не губить знімок: якщо на диску чужий маркер (мертвий власник,
+  `restartSuppressed` або невдале відновлення) має непорожній `startTypeSnapshot`,
+  запис Maintenance відхиляється fail-closed (гучна критична помилка, маркер
+  недоторканий), а запис DataRestore переносить чужий знімок у свій маркер
+  (`-PreserveForeignStartTypeSnapshot`; для тієї самої служби чинний старий
+  запис). Класифікація Disabled, обчислена до очікування lock, перевіряється
+  після його отримання: якщо вона змінилась (живий прогін тимчасово утримував
+  служби), Maintenance завершується з кодом 20 без дій, а не пропускає BRAVO
+  мовчки. Відновлення типів не відрізняє тимчасовий Disabled від Disabled,
+  виставленого оператором після аварії (свідомий компроміс).
   Нові self-test перевірки: `ServiceQuiescence/StartTypeSuppressedDuringWindowAndExactlyRestored`,
   `ServiceQuiescence/StartTypeDisabledByOperatorNeverTouched`,
   `ServiceQuiescence/StartTypeRestoredAfterRestoreFailure`,
@@ -40,7 +50,9 @@
   `ServiceQuiescence/StartTypeRepairHandlesStaleForeignAndSuppressedMarkers`,
   `ServiceQuiescence/RecheckDetectsServiceStartedMidWindow`,
   `ServiceQuiescence/WatchdogRestoresStartTypesBeforeStartingServices`,
-  `ServiceQuiescence/MaintenanceOrdersRepairSuppressRecheckRestore`.
+  `ServiceQuiescence/MaintenanceOrdersRepairSuppressRecheckRestore`,
+  `ServiceQuiescence/MarkerWriteNeverDropsForeignStartTypeSnapshot`,
+  `ServiceQuiescence/MaintenanceRechecksClassificationAfterLock`.
 
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
