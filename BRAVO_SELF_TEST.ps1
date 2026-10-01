@@ -11754,13 +11754,16 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     try {
         [void][IO.Directory]::CreateDirectory($staleFixtureRoot)
         $staleNowUtc = (Get-Date).ToUniversalTime()
-        $badComponent = @{ MODEL = @{ ArchivePath = 'x'; HashPath = 'y'; Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $false } }
+        $badComponent = @{ MODEL = @{ ArchivePath = 'x'; HashPath = 'y'; Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $false; ErrorStage = 'PUBLISH' } }
         foreach ($fixture in @(
-            @{ Id = 'G-OLD'; Status = 'COMPLETE'; Age = 72 },
-            @{ Id = 'G-NEW'; Status = 'INCOMPLETE'; Age = 3 }
+            @{ Id = '20260101_000100'; Status = 'COMPLETE'; Age = 72 },
+            @{ Id = '20260101_000200'; Status = 'INCOMPLETE'; Age = 3 },
+            @{ Id = '20260101_000300'; Status = 'INCOMPLETE'; Age = 2; JsonId = '20260101_000999' },
+            @{ Id = '20260101_000400'; Status = 'WEIRD'; Age = 1 }
         )) {
+            $jsonId = if ($fixture.ContainsKey('JsonId')) { $fixture.JsonId } else { $fixture.Id }
             @{
-                generationId = $fixture.Id
+                generationId = $jsonId
                 status = $fixture.Status
                 createdAt = $staleNowUtc.AddHours(-$fixture.Age).ToString('o')
                 components = $badComponent
@@ -11775,23 +11778,29 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $healthCheckStartedUtc = (Get-Date).ToUniversalTime()
             $script:healthLatestArchives = @{}
             function Get-BRAVOFiles { param([string]$Path, [string]$Filter) return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue) }
-            function Write-HealthLog { param($Message, $Level) }
+            $script:staleWarnings = New-Object System.Collections.Generic.List[string]
+            function Write-HealthLog { param($Message, $Level) if ($Level -eq 'WARNING') { [void]$script:staleWarnings.Add([string]$Message) } }
             # Читання планувальника/статусу недоступне (детерміновано, незалежно від хоста):
             # діагностика мусить пропустити ці перевірки й дійти до INCOMPLETE manifest.
             $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
             $stateRoot = $BackupRoot
             function Get-BRAVOScheduledTaskState { param($TaskPath, $TaskName) throw 'self-test: планувальник недоступний' }
             function Get-BRAVOOperationStatus { param($Path) throw 'self-test: status недоступний' }
-            return @(Get-BackupHealthIssues)
+            $fixtureIssues = @(Get-BackupHealthIssues)
+            return [pscustomobject]@{ Issues = $fixtureIssues; Warnings = @($script:staleWarnings | Where-Object { $_ -match 'Діагностика generation: manifest' }) }
         } $staleFixtureRoot
-        $staleGenerationIssue = @($staleFixtureIssues | Where-Object { $_.Component -eq 'Generation' })[0]
+        $staleFixtureWarnings = @($staleFixtureIssues.Warnings)
+        $staleGenerationIssue = @($staleFixtureIssues.Issues | Where-Object { $_.Component -eq 'Generation' })[0]
         Test-BRAVOCondition `
             -Condition (
                 $null -ne $staleGenerationIssue -and
                 $staleGenerationIssue.Kind -eq 'LocalBackupGeneration' -and
                 $staleGenerationIssue.Reason -match '^остання COMPLETE generation старша за 24 год\.$' -and
-                $staleGenerationIssue.Diagnosis -match 'G-NEW' -and $staleGenerationIssue.Diagnosis -match 'INCOMPLETE' -and
-                $staleGenerationIssue.Diagnosis -match 'MODEL/SHA512'
+                $staleGenerationIssue.Diagnosis -match '20260101_000200' -and $staleGenerationIssue.Diagnosis -match 'INCOMPLETE' -and
+                $staleGenerationIssue.Diagnosis -match 'MODEL/PUBLISH' -and $staleGenerationIssue.Diagnosis -notmatch 'SHA512' -and
+                $staleFixtureWarnings.Count -eq 2 -and
+                @($staleFixtureWarnings | Where-Object { $_ -match 'ідентичності' -and $_ -match '20260101_000999' }).Count -eq 1 -and
+                @($staleFixtureWarnings | Where-Object { $_ -match "невідомий статус 'WEIRD'" }).Count -eq 1
             ) `
             -Name 'Health/StaleGenerationDiagnosisFromIncompleteManifest' `
             -Failure "INCOMPLETE manifest новіший за COMPLETE має потрапити в Diagnosis, а Kind/Component/Reason лишитись незмінними; отримано: $($staleGenerationIssue | ConvertTo-Json -Compress)"

@@ -1375,6 +1375,12 @@ function Get-BRAVOHealthManifestFailedStage {
         return ''
     }
     foreach ($component in @($componentsProperty.Value.PSObject.Properties)) {
+        # Записаний Archive-ом ErrorStage (CREATE/INTEGRITY/HASH/PUBLISH/VSS/…) має
+        # пріоритет; прапорці CreateSuccess/… — лише fallback для старіших manifest.
+        $errorStageProperty = $component.Value.PSObject.Properties['ErrorStage']
+        if ($null -ne $errorStageProperty -and -not [string]::IsNullOrWhiteSpace([string]$errorStageProperty.Value)) {
+            return "$($component.Name)/$([string]$errorStageProperty.Value)"
+        }
         $stageNames = @{ CreateSuccess = 'archive'; IntegritySuccess = 'integrity'; HashSuccess = 'SHA512' }
         foreach ($stageKey in @('CreateSuccess', 'IntegritySuccess', 'HashSuccess')) {
             $stageProperty = $component.Value.PSObject.Properties[$stageKey]
@@ -1425,6 +1431,22 @@ function Get-BackupHealthIssues {
             }
             if ([string]$manifest.status -ne 'COMPLETE') {
                 # #322: не-COMPLETE спроба не є generation, але потрібна для діагностики.
+                # Кандидат лише зі статусом, який справді пише Archive (FAILED/INCOMPLETE),
+                # і з generationId, що точно збігається з іменем файлу (як у
+                # Get-BRAVORestoreGenerationManifest); інакше WARNING і пропуск.
+                $manifestStatus = [string]$manifest.status
+                if ($manifestStatus -cnotin @('FAILED', 'INCOMPLETE')) {
+                    Write-HealthLog "Діагностика generation: manifest $($manifestFile.Name) має невідомий статус '$manifestStatus' — пропущено" -Level 'WARNING'
+                    continue
+                }
+                $filenameGenerationId = [IO.Path]::GetFileNameWithoutExtension($manifestFile.Name) -replace '^BRAVO_BACKUP_', ''
+                $jsonGenerationId = [string]$manifest.generationId
+                if ([string]::IsNullOrWhiteSpace($jsonGenerationId) -or
+                    $jsonGenerationId -notmatch '^\d{8}_\d{6}(?:_\d+)?$' -or
+                    -not [string]::Equals($filenameGenerationId, $jsonGenerationId, [StringComparison]::Ordinal)) {
+                    Write-HealthLog "Діагностика generation: manifest $($manifestFile.Name) не пройшов перевірку ідентичності (ім'я: '$filenameGenerationId', JSON: '$jsonGenerationId') — пропущено" -Level 'WARNING'
+                    continue
+                }
                 $incompleteCandidates += [pscustomobject]@{ Manifest = $manifest; CreatedAtUtc = $createdAtUtc }
                 continue
             }
