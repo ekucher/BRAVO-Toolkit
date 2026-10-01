@@ -446,12 +446,18 @@ try { [void](New-Item -ItemType SymbolicLink -Path $runtimeLogLinkDir -Target $r
 if (-not (Test-Path -LiteralPath $runtimeLogLinkDir)) {
     try { [void](New-Item -ItemType Junction -Path $runtimeLogLinkDir -Target $runtimeLogLinkOutside -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
 }
+if (-not (Test-Path -LiteralPath $runtimeLogLinkDir) -and $env:OS -eq 'Windows_NT') {
+    # Directory junction не потребує прав адміністратора.
+    $runtimeLogLinkFixtureNote = (& cmd.exe /c mklink /J "`"$runtimeLogLinkDir`"" "`"$runtimeLogLinkOutside`"" 2>&1 | Out-String)
+}
 $runtimeLogLinkDirCreated = (Test-Path -LiteralPath $runtimeLogLinkDir)
 try { [void](New-Item -ItemType SymbolicLink -Path $runtimeLogLinkFile -Target (Join-Path $runtimeLogLinkOutside 'outside_secret_1.log') -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
 $runtimeLogLinkFileCreated = (Test-Path -LiteralPath $runtimeLogLinkFile)
 if (-not $runtimeLogLinkDirCreated) {
-    Test-BRAVOCondition $true -Name 'Maintenance/RuntimeLogSyncSkipsReparsePoints' `
-        -Failure "SKIPPED: не вдалося створити symlink/junction у цьому середовищі: $runtimeLogLinkFixtureNote"
+    # На Windows junction створюється завжди — тоді відсутність посилання
+    # є ПОМИЛКОЮ тесту, а не пропуском; пропуск лише на не-Windows хості.
+    Test-BRAVOCondition ($env:OS -ne 'Windows_NT') -Name 'Maintenance/RuntimeLogSyncSkipsReparsePoints' `
+        -Failure "SKIPPED/FAIL: не вдалося створити symlink/junction у цьому середовищі: $runtimeLogLinkFixtureNote"
 } else {
     $runtimeLogLinkState = New-BRAVORuntimeLogSyncTestState
     $runtimeLogLinkSummary = & $runtimeLogSyncModule $runtimeLogSyncRun $runtimeLogLinkRoot 'logs/runtime' $runtimeLogLinkState
@@ -468,6 +474,37 @@ if (-not $runtimeLogLinkDirCreated) {
     # на PS 5.1 міг би зайти у junction.
     if ($runtimeLogLinkFileCreated) { try { [IO.File]::Delete($runtimeLogLinkFile) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message } }
     try { [IO.Directory]::Delete($runtimeLogLinkDir) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+
+    # Сам корінь LOGS — посилання (легітимне налаштування): вивантаження
+    # триває, а вкладені посилання все одно пропускаються.
+    $runtimeLogRootLink = Join-Path $maintenanceOwnLogTestRoot 'ROOTLINK'
+    $runtimeLogRootLinkNested = Join-Path $runtimeLogLinkRoot 'NESTED'
+    try { [void](New-Item -ItemType SymbolicLink -Path $runtimeLogRootLink -Target $runtimeLogLinkRoot -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+    if (-not (Test-Path -LiteralPath $runtimeLogRootLink)) {
+        try { [void](New-Item -ItemType Junction -Path $runtimeLogRootLink -Target $runtimeLogLinkRoot -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+    }
+    if (-not (Test-Path -LiteralPath $runtimeLogRootLink) -and $env:OS -eq 'Windows_NT') {
+        $runtimeLogLinkFixtureNote = (& cmd.exe /c mklink /J "`"$runtimeLogRootLink`"" "`"$runtimeLogLinkRoot`"" 2>&1 | Out-String)
+    }
+    $runtimeLogRootLinkCreated = (Test-Path -LiteralPath $runtimeLogRootLink)
+    try { [void](New-Item -ItemType SymbolicLink -Path $runtimeLogRootLinkNested -Target $runtimeLogLinkOutside -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+    if (-not (Test-Path -LiteralPath $runtimeLogRootLinkNested)) {
+        try { [void](New-Item -ItemType Junction -Path $runtimeLogRootLinkNested -Target $runtimeLogLinkOutside -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+    }
+    $runtimeLogRootLinkState = New-BRAVORuntimeLogSyncTestState
+    $runtimeLogRootLinkSummary = $null
+    if ($runtimeLogRootLinkCreated) {
+        $runtimeLogRootLinkSummary = & $runtimeLogSyncModule $runtimeLogSyncRun $runtimeLogRootLink 'logs/runtime' $runtimeLogRootLinkState
+    }
+    Test-BRAVOCondition (
+        $runtimeLogRootLinkCreated -and $null -ne $runtimeLogRootLinkSummary -and -not $runtimeLogRootLinkSummary.Rejected -and
+        @($runtimeLogRootLinkState.SentRemotePaths) -contains '/logs/runtime/real_1.log' -and
+        (@($runtimeLogRootLinkState.SentContents) -join '|') -notmatch 'OUTSIDE-SECRET' -and
+        @($runtimeLogRootLinkState.SentRemotePaths | Where-Object { $_ -like '*NESTED*' -or $_ -like '*outside*' }).Count -eq 0
+    ) -Name 'Maintenance/RuntimeLogSyncAllowsReparsePointAsLogsRoot' `
+        -Failure "корінь LOGS-посилання дозволений (вивантаження триває), вкладене посилання пропущено; факт: created=$runtimeLogRootLinkCreated sent=$(@($runtimeLogRootLinkState.SentRemotePaths) -join ',') note=$runtimeLogLinkFixtureNote"
+    try { [IO.Directory]::Delete($runtimeLogRootLinkNested) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+    try { [IO.Directory]::Delete($runtimeLogRootLink) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
 }
 
 # 3) Небезпечний remote-корінь відхиляється без вивантаження: WARNING, жодного Send.

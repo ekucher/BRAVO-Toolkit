@@ -4607,7 +4607,7 @@ function Sync-BRAVORuntimeLogsToSftp {
     # порівняння розміру з SFTP іде з розміром ЗАМАСКОВАНОГО знімка;
     # файл, що не читається як текст, пропускається з WARNING;
     # (2) reparse point (junction/symlink: каталог чи файл) ніколи не
-    # відкривається і не обходиться; кожен файл мусить лежати всередині
+    # відкривається і не обходиться (сам корінь LOGS може бути посиланням); кожен файл мусить лежати всередині
     # кореня журналів; (3) RemoteDirectory з сегментом `..`/`.`, порожній
     # або такий, що дорівнює кореню SFTP, відхиляється з WARNING без
     # жодного вивантаження. Усе це fail-soft: лише WARNING, без винятків.
@@ -4636,11 +4636,9 @@ function Sync-BRAVORuntimeLogsToSftp {
     }
     $remoteRoot = "/$($remoteSegments -join '/')"
     $localRootItem = Get-Item -LiteralPath $LocalLogRoot -Force -ErrorAction Stop
-    if (([int]$localRootItem.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        $result.Rejected = $true
-        Write-Log "Журнали toolkit: каталог журналів '$($localRootItem.FullName)' є reparse point (junction/symlink) — вивантаження пропущено." -Level "WARNING"
-        return $result
-    }
+    # Сам корінь журналів МОЖЕ бути junction/symlink (штатне налаштування
+    # адміна, напр. LOGS на іншому диску): обходимо його за НЕрозв'язаним
+    # шляхом, а reparse points усередині кореня пропускаємо.
     $localRootFullPath = $localRootItem.FullName.TrimEnd('\', '/')
     $localRootPrefix = $localRootFullPath + [System.IO.Path]::DirectorySeparatorChar
     $ensuredRemoteDirectories = @{}
