@@ -2,6 +2,12 @@
 
 ## Не випущено (developer)
 
+- **Fix: на Windows Server 2012/2012 R2 заплановані завдання завершувались з кодом 1 без логу.**
+  Runtime перемикав кодову сторінку консолі на UTF-8 (65001); у консолі SYSTEM (сесія 0) на
+  Windows до 10 після цього перший `Write-Host` з кирилицею падав з Win32 `0x1F`, тож
+  ARCHIV/HEALTH/MAINTENANCE гинули до відкриття журналу. `Test-BRAVOConsoleCodePageChangeSafe`
+  (BRAVO.Compatibility) на Windows < 10 у неінтерактивній сесії кодову сторінку консолі не
+  змінює; Windows 10+ та інтерактивні запуски — без змін. Перенесено з `5.2.5-rc.3`.
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
