@@ -11638,7 +11638,12 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             Incomplete = & $reason (& $task) $null $incomplete $now.AddHours(-30)
             IncompleteOlder = & $reason (& $task) $null $incomplete $now.AddHours(-1)
             BadResult = & $reason (& $task -Result (-2147024891)) (& $status 0 1) $null $null
-            RunningCodes = @(0, 267009, 267011 | ForEach-Object { & $reason (& $task -Result $_) $null $null $null })
+            CodeZero = & $reason (& $task -Result 0) $null $null $null
+            Running = & $reason (& $task -Result 267009 -RunAgeHours 1) (& $status 0 30) $null $null
+            NeverRunCode = & $reason (& $task -Result 267011) $null $null $null
+            NeverRunYear = & $reason ([pscustomobject]@{ Exists = $true; Enabled = $true; LastTaskResult = 0; LastRunTime = [datetime]'1999-11-30' }) $null $null $null
+            NotFoundWithStatus = & $reason (& $task -Exists $false) (& $status 20 1) $null $null
+            HashtableInfo = & $reason @{ Exists = $true; Enabled = $false } $null $null $null
             NotRun = & $reason (& $task -RunAgeHours 72) (& $status 0 71) $null $null
             Early = & $reason (& $task -RunAgeHours 2) (& $status 0 30) $null $null
             StatusCode = & $reason (& $task) (& $status 20 1) $null $null
@@ -11649,12 +11654,17 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     }
     Test-BRAVOCondition `
         -Condition (
-            $staleReasons.NotRegistered -eq 'завдання BRAVO_ARCHIV не встановлене' -and
+            $staleReasons.NotRegistered -eq 'завдання BRAVO_ARCHIV не знайдене або недоступне для читання' -and
+            $staleReasons.NotFoundWithStatus -match 'код 20' -and
+            $staleReasons.Running -eq 'завдання BRAVO_ARCHIV виконується зараз' -and
+            $staleReasons.NeverRunCode -eq 'завдання BRAVO_ARCHIV ще не запускалося' -and
+            $staleReasons.NeverRunYear -eq 'завдання BRAVO_ARCHIV ще не запускалося' -and
+            $staleReasons.HashtableInfo -eq 'завдання BRAVO_ARCHIV вимкнене' -and
             $staleReasons.Disabled -eq 'завдання BRAVO_ARCHIV вимкнене' -and
             $staleReasons.Incomplete -match 'G-NEW' -and $staleReasons.Incomplete -match 'INCOMPLETE' -and $staleReasons.Incomplete -match 'MODEL/SHA512' -and
             $null -eq $staleReasons.IncompleteOlder -and
             $staleReasons.BadResult -match '0x80070005' -and $staleReasons.BadResult -match 'TEST_NAME' -and
-            @($staleReasons.RunningCodes | Where-Object { $null -ne $_ }).Count -eq 0 -and
+            $null -eq $staleReasons.CodeZero -and
             $staleReasons.NotRun -match '^завдання не запускалося з \d\d\.\d\d\.\d{4} \d\d:\d\d$' -and
             $staleReasons.Early -match 'завершився достроково' -and
             $staleReasons.StatusCode -match 'код 20 \(TEST_NAME\)' -and

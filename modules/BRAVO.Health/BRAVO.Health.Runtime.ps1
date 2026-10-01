@@ -1194,6 +1194,10 @@ function Get-BRAVOHealthBackupStaleReason {
     $read = {
         param($Object, [string]$Name)
         if ($null -eq $Object) { return $null }
+        if ($Object -is [System.Collections.IDictionary]) {
+            if ($Object.Contains($Name)) { return $Object[$Name] }
+            return $null
+        }
         $property = $Object.PSObject.Properties[$Name]
         if ($null -eq $property) { return $null }
         return $property.Value
@@ -1206,10 +1210,11 @@ function Get-BRAVOHealthBackupStaleReason {
     }
 
     $lastRun = $null
+    $taskMissing = $false
     if ($null -ne $TaskInfo) {
-        if (-not [bool](& $read $TaskInfo 'Exists')) {
-            return "завдання $TaskName не встановлене"
-        }
+        # Exists=$false не відрізняє «немає завдання» від збою читання (COM/ACL),
+        # тому це правило перевіряється останнім, коли інші нічого не знайшли.
+        $taskMissing = -not [bool](& $read $TaskInfo 'Exists')
         $enabled = & $read $TaskInfo 'Enabled'
         if ($null -ne $enabled -and -not [bool]$enabled) {
             return "завдання $TaskName вимкнене"
@@ -1230,7 +1235,7 @@ function Get-BRAVOHealthBackupStaleReason {
     $statusExitCode = & $read $ArchiveStatus 'ExitCode'
     $statusName = [string](& $read $ArchiveStatus 'ExitCodeName')
     $statusFinished = & $read $ArchiveStatus 'FinishedAt'
-    $hasLastRun = $null -ne $lastRun -and ([datetime]$lastRun).Year -gt 1900
+    $hasLastRun = $null -ne $lastRun -and ([datetime]$lastRun).Year -ge 2000
 
     $taskResult = & $read $TaskInfo 'LastTaskResult'
     if ($null -ne $taskResult) {
@@ -1240,6 +1245,12 @@ function Get-BRAVOHealthBackupStaleReason {
             $runText = if ($hasLastRun) { " $(& $format ([datetime]$lastRun))" } else { '' }
             $nameText = if ([string]::IsNullOrWhiteSpace($statusName)) { '' } else { " ($statusName)" }
             return ("останній запуск $TaskName{0} завершився з кодом 0x{1:X8}{2}" -f $runText, $resultCode, $nameText)
+        }
+        if ($resultCode -eq [uint32]267009) {
+            return "завдання $TaskName виконується зараз"
+        }
+        if ($resultCode -eq [uint32]267011) {
+            return "завдання $TaskName ще не запускалося"
         }
     }
 
@@ -1259,6 +1270,10 @@ function Get-BRAVOHealthBackupStaleReason {
         $nameText = if ([string]::IsNullOrWhiteSpace($statusName)) { '' } else { " ($statusName)" }
         $atText = if ($null -ne $statusFinished) { " о $(& $format ([datetime]$statusFinished))" } else { '' }
         return "останній статус Archive: код $([int]$statusExitCode)$nameText$atText"
+    }
+
+    if ($taskMissing) {
+        return "завдання $TaskName не знайдене або недоступне для читання"
     }
 
     return $null
