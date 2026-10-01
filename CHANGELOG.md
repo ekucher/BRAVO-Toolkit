@@ -13,7 +13,7 @@
   лишається лише за явного `Mode = "Legacy"`, а невідомий `Mode` завершується
   помилкою замість тихого переходу на legacy. Будь-який не-`COMPLETE` статус
   (`MUTATION_VIOLATION`, `REMOTE_CONFLICT`, `AUDIT_DRIFT`, `INCOMPATIBLE_NAME`,
-  `MUTATION_AUTO_ARCHIVED`, `SKIPPED_CONCURRENT`) у `-SyncBAZA` дає exit 50, а
+  `MUTATION_AUTO_ARCHIVED`) у `-SyncBAZA` дає exit 50, а
   фінальна Operations-подія `-SyncBAZA` тепер несе режим і статус двигуна по
   компонентах. Lock компонента спільний з Main/Health (той самий
   `Invoke-BRAVOBazaComponentSyncSession`). Побічно: у legacy-режимі Main тепер
@@ -21,8 +21,7 @@
   `SKIPPED_CONCURRENT` у `-SyncBAZA` (lock компонента тримає Health) — INFO без збою,
   як і в Health; порожній/пробільний `BAZA.Mode` = типовий `IncrementalAppendOnly`.
   `docs/BAZA_SFTP_ACCEPTANCE.md` і README оновлено. Нові self-test перевірки:
-  Додатково: `BazaSync/SyncBazaSkippedConcurrentIsInfoNotFailure`, `BazaSync/SyncBazaEmptyModeTreatedAsDefaultIncremental`.
-  Основні:
+  `BazaSync/SyncBazaSkippedConcurrentIsInfoNotFailure`, `BazaSync/SyncBazaEmptyModeTreatedAsDefaultIncremental`,
   `BazaSync/SyncBazaAndMainResolveToSameCanonicalDispatcher`,
   `BazaSync/NoProductionBazaSyncPathBypassesCanonicalDispatcher`,
   `BazaSync/CanonicalDispatcherLegacyOnlyOnExplicitModeAndFailsClosed`,
