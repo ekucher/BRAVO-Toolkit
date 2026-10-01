@@ -529,6 +529,13 @@ function Assert-BravoLoadedConfiguration {
             [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.ArchivLog)) {
             $global:sftpDirectories.ArchivLog = 'logs/archiv'
         }
+        # Каталог для всього <RuntimeRoot>\LOGS (вивантаження журналів
+        # toolkit, рішення власника 2026-10-01): legacy-конфіги без ключа
+        # отримують канонічний дефолт.
+        if (-not $global:sftpDirectories.Contains('RuntimeLogs') -or
+            [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.RuntimeLogs)) {
+            $global:sftpDirectories.RuntimeLogs = 'logs/runtime'
+        }
     }
 
     # RestoreVerify (P1.1, 5.3.0): щотижневий restore drill. Старі

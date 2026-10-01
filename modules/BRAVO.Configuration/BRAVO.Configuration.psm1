@@ -367,6 +367,7 @@ function Get-BRAVODefaultConfiguration {
             ExchangeApiLogs = "logs/exchangapi"
             MaintenanceLog = "logs/maintenance"
             ArchivLog = "logs/archiv"
+            RuntimeLogs = "logs/runtime"
         }
 
         backupMonitoring = @{

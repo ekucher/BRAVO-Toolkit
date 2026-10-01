@@ -186,6 +186,7 @@
         # ArchiveLogUploadEnabled (Components/SFTP вище).
         @{ Path = 'sftpDirectories.MaintenanceLog'; Group = 'Storage'; Section = 'SFTP'; Label = 'SFTP каталог: MaintenanceLog'; Description = 'Власні логи BRAVO_MAINTENANCE (+ знімки range_id_log) — opt-in, діє лише при componentSettings.SFTP.MaintenanceLogUploadEnabled=true.'; Type = 'String'; Phase = 2; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 110 }
         @{ Path = 'sftpDirectories.ArchivLog'; Group = 'Storage'; Section = 'SFTP'; Label = 'SFTP каталог: ArchivLog'; Description = 'Власні логи BRAVO_ARCHIV — opt-in, діє лише при componentSettings.SFTP.ArchiveLogUploadEnabled=true.'; Type = 'String'; Phase = 2; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 120 }
+        @{ Path = 'sftpDirectories.RuntimeLogs'; Group = 'Storage'; Section = 'SFTP'; Label = 'SFTP каталог: RuntimeLogs'; Description = 'Увесь каталог журналів toolkit (<RuntimeRoot>\LOGS разом із HELPERS) — вивантажується наприкінці BRAVO_MAINTENANCE, коли увімкнено componentSettings.SFTP.Enabled і в Credential Manager є SFTP-креденшли.'; Type = 'String'; Phase = 2; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 130 }
 
         # ===== Storage / SMB (smbSettings) — фаза 1 =====
         @{ Path = 'smbSettings.RootPath'; Group = 'Storage'; Section = 'SMB'; Label = 'Кореневий шлях SMB'; Description = 'UNC-шлях, напр. \\host\share\BRAVO.'; Type = 'UNCPath'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 10 }

@@ -2,6 +2,57 @@
 
 ## Не випущено (developer)
 
+- **Feature: усі журнали toolkit вивантажуються на SFTP за увімкненого хмарного бекапу.**
+  Раніше на SFTP потрапляли лише логи BRAVO_MAINTENANCE і BRAVO_ARCHIV і лише за
+  окремими opt-in тумблерами `componentSettings.SFTP.MaintenanceLogUploadEnabled` /
+  `ArchiveLogUploadEnabled` (обидва за замовчуванням `$false`); журнали Health,
+  DataRestore та допоміжних скриптів (`LOGS\HELPERS`) не вивантажувались зовсім.
+  Тепер наприкінці кожного прогону BRAVO_MAINTENANCE, коли
+  `componentSettings.SFTP.Enabled = $true` і в Credential Manager є SFTP-креденшли,
+  увесь каталог `<RuntimeRoot>\LOGS` разом із підкаталогами інкрементально
+  вивантажується в новий каталог `sftpDirectories.RuntimeLogs` (за замовчуванням
+  `logs/runtime`) зі збереженням відносних шляхів. Файл, що вже є на SFTP з тим самим
+  розміром, вдруге не передається; на SFTP нічого не видаляється. Без креденшлів
+  вивантаження пропускається з `INFO`; помилки передачі дають один `WARNING` і не
+  змінюють код завершення. Тумблери окремих копій логів прогону лишаються без змін.
+  **Вплив оновлення:** `componentSettings.SFTP.Enabled` за замовчуванням `$true` (і для
+  старих конфігурацій без цього ключа), тож на кожному сервері з SFTP-креденшлами після
+  оновлення з'являється новий вихідний потік: весь `LOGS` (зокрема `HELPERS`) після кожного
+  прогону Maintenance. Окремого тумблера немає; вимкнути можна лише разом з усім SFTP
+  (`SFTP.Enabled = $false`, що вимикає й хмарний бекап та BAZA sync).
+  Канонічних листів конфігурації стало 278 (+1 `ALLOW_SITE`). Нові self-test перевірки:
+  `Maintenance/OwnLogToggleOffStillSyncsRuntimeLogs`,
+  `Maintenance/RuntimeLogUploadSkippedWhenSftpDisabled`,
+  `Maintenance/RuntimeLogUploadSkippedWithoutCredentials`,
+  `Maintenance/RuntimeLogSyncFailureCaughtNotPropagated`,
+  `Maintenance/RuntimeLogSyncUploadsNewAndGrownFilesRecursively`,
+  `Maintenance/RuntimeLogSyncUsesSnapshotsAndCleansUp`,
+  `Maintenance/RuntimeLogSyncMissingLocalRootIsNoOp`.
+  Безпека вивантаження: знімок кожного журналу (зокрема сирих транскриптів
+  `LOGS\HELPERS`) маскується через `Protect-BRAVOLogSecret` зі збереженням кодування
+  (UTF-8/UTF-16 з BOM), а розмір на SFTP порівнюється із замаскованим знімком; файл, що
+  не читається як текст, не вантажиться (`WARNING`). Обхід `LOGS` не заходить у reparse
+  points (junction/symlink: каталоги й файли пропускаються з `WARNING`; сам корінь `LOGS`
+  може бути посиланням), кожен файл мусить лежати всередині `LOGS`. `sftpDirectories.RuntimeLogs`
+  з порожнім значенням, `.`, `..`-сегментом або коренем SFTP відхиляється з `WARNING` без
+  вивантаження. Усе fail-soft: код завершення не змінюється. Нові перевірки:
+  `Maintenance/RuntimeLogSyncMasksSecretsInHelperTranscripts`,
+  `Maintenance/RuntimeLogSyncSkipsReparsePoints`,
+  `Maintenance/RuntimeLogSyncAllowsReparsePointAsLogsRoot`,
+  `Maintenance/RuntimeLogSyncRejectsUnsafeRemoteRoot`.
+  Маскування `Protect-BRAVOLogSecret` розширено: `Pwd=`, `Passphrase=`, `api_key`/`apikey`/`X-Api-Key`,
+  JSON `"password": "x"` / `"token":"x"` (будь-яке лапкування й пробіли), значення в лапках із
+  пробілами, `Bearer <токен>`, `Authorization: Basic ...`, CLI-форми `-p значення` / `-pw значення`;
+  правила ідемпотентні й лінійні (без катастрофічного відкату на великих файлах). Додатково
+  налаштовані SFTP/SMB-облікові дані (логін/пароль із Credential Manager, довжина від 4) замінюються
+  дослівно у кожному знімку (`-KnownSecrets`). Копія логу прогону (`Send-BRAVOOwnLogFile`) тепер
+  також іде замаскованим знімком, а не сирим живим файлом; `sftpDirectories.RuntimeLogs`
+  перевіряється ДО SFTP-логіну (небезпечне значення без копії логу прогону — без з'єднання).
+  Нові перевірки: `Logging/MaskSecret_*` (по одній на формат), `Logging/MaskKnownSecretLiterals`,
+  `Logging/MaskSecretLargeInputNoCatastrophicBacktracking`,
+  `Maintenance/OwnLogFileUploadsMaskedSnapshotNotLiveLog`, `Maintenance/OwnLogFileSkipsNonTextAndCleansSnapshot`,
+  `Maintenance/OwnLogBadRuntimeRootDoesNotConnect`, `Maintenance/OwnLogPassesKnownSecretsToUploads`.
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
