@@ -20,7 +20,9 @@ param(
 # і modules\BRAVO.Update\ буде реалізовано — цей скрипт слід видалити.
 #
 # ЩО ВІН НІКОЛИ НЕ РОБИТЬ:
-#   * не видаляє з runtime жодного файлу (перевірено: між 5.2.3 і 5.2.4
+#   * не видаляє з runtime жодного файлу при розгортанні (єдиний виняток —
+#     автоматичний відкат, #289: він видаляє ЛИШЕ файли, додані цим розгортанням,
+#     див. BRAVO.Deploy.Rollback.ps1) (перевірено: між 5.2.3 і 5.2.4
 #     не видалено жодного файлу, додано лише один документ — тож копіювання
 #     поверх достатнє; для переходу, де файли зникають, потрібен P3.2a);
 #   * не чіпає BRAVO.config, BRAVO.local.config, Tools\TOOLS_INTEGRITY.json,
@@ -95,6 +97,67 @@ function Write-Bad  { param([string]$T) Write-Host ('  [FAIL]  ' + $T) -Foregrou
 function Write-Note { param([string]$T) Write-Host ('  [..]    ' + $T) }
 function Write-Warn2{ param([string]$T) Write-Host ('  [УВАГА] ' + $T) -ForegroundColor Yellow }
 
+function Invoke-BRAVODeployUpdaterRollback {
+    # Єдиний шлях відкату (#289): і для провалу гейта, і для винятку/збою
+    # robocopy ПІСЛЯ початку розгортання. Повертає список проблем; порожній =
+    # відкат успішний. Користується змінними скрипта ($RuntimeRoot, $BackupRoot,
+    # $staged, $excludeFiles, $excludeDirs, $currentVersion).
+    Write-Note ('точне відновлення з ' + $BackupRoot)
+
+    # Відкат вважається успішним ЛИШЕ коли виконано все: дзеркальне
+    # відновлення owned-набору (файли нового релізу видалено, старі повернено),
+    # хеші runtime == старий RUNTIME_MANIFEST, VERSION.json == стара, guard 0,
+    # Scheduler перереєстровано зі старого комплекту, ValidateOnly пройшов.
+    # Будь-який збій = exit 2 ("ВІДКАТ НЕ ВДАВСЯ"), а не exit 1 — інакше
+    # частково відкочений комплект виглядав би як успішний відкат.
+    $rollbackProblems = New-Object System.Collections.Generic.List[string]
+    try {
+        $restore = Invoke-BRAVODeployExactRestore -RuntimeRoot $RuntimeRoot -BackupRoot $BackupRoot `
+            -StagedRoot $staged -ExcludeFiles $excludeFiles -ExcludeDirs $excludeDirs
+        Write-Note ('відновлено файлів: ' + @($restore.Restored).Count +
+            ', видалено доданих новим релізом: ' + @($restore.Removed).Count)
+        foreach ($r in @($restore.Removed)) { Write-Note ('видалено: ' + $r) }
+        foreach ($e in @($restore.Errors)) { [void]$rollbackProblems.Add('відновлення: ' + $e) }
+
+        $match = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $RuntimeRoot `
+            -ManifestPath (Join-Path $BackupRoot 'RUNTIME_MANIFEST.json') -ExcludeDirs $excludeDirs
+        foreach ($m in @($match.Problems)) { [void]$rollbackProblems.Add('runtime != старий manifest, ' + $m) }
+
+        $restoredVersion = (Get-Content -LiteralPath (Join-Path $RuntimeRoot 'VERSION.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+        if ([string]$restoredVersion.packageVersion -ne [string]$currentVersion.packageVersion) {
+            [void]$rollbackProblems.Add('VERSION.json після відкату = ' + $restoredVersion.packageVersion +
+                ', очікувалось ' + $currentVersion.packageVersion)
+        }
+
+        Push-Location $RuntimeRoot
+        try {
+            & .\BRAVO_RUNTIME_GUARD.ps1
+            $g2 = $LASTEXITCODE
+            if ($g2 -ne 0) { [void]$rollbackProblems.Add('guard після відкату exit ' + $g2) }
+
+            # Задачі Планувальника перереєстровуються з ВІДНОВЛЕНОГО комплекту:
+            # крок 6 уже міг зареєструвати їх за визначенням нового релізу.
+            & .\BRAVO_SETUP.ps1 -Action Scheduler -NoPause
+            $s2 = $LASTEXITCODE
+            if (@(0, 10) -notcontains $s2) { [void]$rollbackProblems.Add('BRAVO_SETUP -Action Scheduler після відкату exit ' + $s2) }
+
+            & .\BRAVO_SETUP.ps1 -ValidateOnly -NoPause
+            $v2 = $LASTEXITCODE
+            if (@(0, 10) -notcontains $v2) { [void]$rollbackProblems.Add('BRAVO_SETUP -ValidateOnly після відкату exit ' + $v2) }
+        } finally {
+            Pop-Location
+        }
+    } catch {
+        [void]$rollbackProblems.Add('виняток під час відкату: ' + $_.Exception.Message)
+    }
+    # Через змінну скрипта, а не return: вивід дочірніх скриптів гейтів потрапляє
+    # у конвеєр функції і зіпсував би повернуте значення.
+    $script:RollbackProblems = @($rollbackProblems.ToArray())
+}
+
+$script:DeployStarted = $false
+$script:RollbackProblems = @()
+$script:RollbackFailed = $false
 $script:Blockers = New-Object System.Collections.Generic.List[string]
 function Add-Blocker { param([string]$T) Write-Bad $T; [void]$script:Blockers.Add($T) }
 
@@ -108,6 +171,15 @@ if (-not (Test-Path -LiteralPath $script:ReleaseGatePath -PathType Leaf)) {
         '). Це файл політики гейта релізу — скопіюйте весь каталог deploy\, а не один скрипт.')
 }
 . $script:ReleaseGatePath
+
+# Логіка точного відкату (#289) — окремий файл без robocopy, щоб набір файлів
+# виконувався й перевірявся self-test на будь-якій ОС. Fail-closed, як і гейт.
+$script:RollbackHelperPath = Join-Path $PSScriptRoot 'BRAVO.Deploy.Rollback.ps1'
+if (-not (Test-Path -LiteralPath $script:RollbackHelperPath -PathType Leaf)) {
+    throw ('Поруч зі скриптом немає BRAVO.Deploy.Rollback.ps1 (' + $script:RollbackHelperPath +
+        '). Без нього автоматичний відкат неможливий — скопіюйте весь каталог deploy\, а не один скрипт.')
+}
+. $script:RollbackHelperPath
 
 # --- 0. Права й цілісність цілі --------------------------------------------
 
@@ -473,6 +545,9 @@ $excludeFiles = @('BRAVO.config', 'BRAVO.local.config', 'TOOLS_INTEGRITY.json',
                   'WinSCP.ini', 'BRAVO_OPERATION.lock')
 $excludeDirs  = @('LOGS', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA', 'BAZA_WWW', 'artifacts')
 
+# З цього моменту runtime може бути змінено: будь-який збій далі = відкат.
+$script:DeployStarted = $true
+
 $rcArgs = @($staged, $RuntimeRoot, '/E', '/R:2', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS',
             '/XF') + $excludeFiles + @('/XD') + $excludeDirs
 $rcDeploy = robocopy @rcArgs
@@ -520,17 +595,15 @@ try {
 if ($gateFailures.Count -gt 0) {
     Write-Step 'ПРОВАЛ ГЕЙТА — автоматичний відкат'
     foreach ($f in $gateFailures) { Write-Bad $f }
-    Write-Note ('відновлення з ' + $BackupRoot)
-    $rcBack = robocopy $BackupRoot $RuntimeRoot /E /R:2 /W:2 /NFL /NDL /NJH /NJS /XD LOGS
-    if ($LASTEXITCODE -ge 8) {
-        Write-Bad ('ВІДКАТ НЕ ВДАВСЯ (robocopy код ' + $LASTEXITCODE + '). Комплект у невизначеному стані.')
+    Invoke-BRAVODeployUpdaterRollback | Out-Null
+    $rollbackProblems = @($script:RollbackProblems)
+    if ($rollbackProblems.Count -gt 0) {
+        Write-Bad 'ВІДКАТ НЕ ВДАВСЯ. Комплект у невизначеному стані, потрібне ручне втручання.'
+        foreach ($p in $rollbackProblems) { Write-Bad $p }
         Write-Bad ('Backup лишається тут: ' + $BackupRoot)
         exit 2
     }
-    Push-Location $RuntimeRoot
-    try { & .\BRAVO_RUNTIME_GUARD.ps1; $g2 = $LASTEXITCODE } finally { Pop-Location }
-    if ($g2 -eq 0) { Write-Ok 'відкат виконано, guard на відновленому комплекті: exit 0' }
-    else { Write-Bad ('після відкату guard дає exit ' + $g2 + ' — потрібне ручне втручання') }
+    Write-Ok 'відкат виконано: runtime == попередній реліз, guard 0, Scheduler перереєстровано, ValidateOnly пройдено'
     exit 1
 }
 
@@ -548,9 +621,26 @@ exit 0
     Write-Host ''
     Write-Host ('ЗУПИНЕНО: ' + $_.Exception.Message) -ForegroundColor Red
     $script:Failed = $true
+    if ($script:DeployStarted) {
+        # Виняток або збій robocopy після початку розгортання: без відкату
+        # лишився б напіврозгорнутий комплект (guard exit 33, #289).
+        Write-Step 'ЗБІЙ ПІСЛЯ ПОЧАТКУ РОЗГОРТАННЯ — автоматичний відкат'
+        $script:DeployStarted = $false
+        Invoke-BRAVODeployUpdaterRollback | Out-Null
+        $catchProblems = @($script:RollbackProblems)
+        if ($catchProblems.Count -gt 0) {
+            Write-Bad 'ВІДКАТ НЕ ВДАВСЯ. Комплект у невизначеному стані, потрібне ручне втручання.'
+            foreach ($p in $catchProblems) { Write-Bad $p }
+            Write-Bad ('Backup лишається тут: ' + $BackupRoot)
+            $script:RollbackFailed = $true
+        } else {
+            Write-Ok 'відкат виконано: runtime == попередній реліз, guard 0, Scheduler перереєстровано, ValidateOnly пройдено'
+        }
+    }
 } finally {
     Wait-BRAVODeployCompletion
     Restore-BRAVOConsoleEncoding
 }
 
+if ($script:RollbackFailed) { exit 2 }
 if ($script:Failed) { exit 1 }
