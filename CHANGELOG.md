@@ -2,6 +2,43 @@
 
 ## Не випущено (developer)
 
+- **Fix: `BRAVO_ARCHIV -SyncBAZA` більше не обходить IncrementalAppendOnly і MutationPolicy (#292).**
+  Задача BAZASync (кожні 4 год) запускала `-SyncBAZA`, який завжди викликав
+  legacy `Sync-FolderToSFTP` (`synchronize remote -mirror`): локально зіпсований
+  чи зашифрований файл BAZA перезаписував перевірену remote-копію, а
+  incremental-стан не оновлювався. Тепер Main і `-SyncBAZA` викликають ОДНУ
+  функцію `Invoke-BRAVOBazaCanonicalSync`: при `Mode = "IncrementalAppendOnly"`
+  (типовий) діють append-only контракт, MutationPolicy, remote conflict, audit
+  drift, несумісні імена, mutation archive та оновлення стану; legacy mirror
+  лишається лише за явного `Mode = "Legacy"`, а невідомий `Mode` завершується
+  помилкою замість тихого переходу на legacy. Будь-який не-`COMPLETE` статус
+  (`MUTATION_VIOLATION`, `REMOTE_CONFLICT`, `AUDIT_DRIFT`, `INCOMPATIBLE_NAME`,
+  `MUTATION_AUTO_ARCHIVED`, `SKIPPED_CONCURRENT`) у `-SyncBAZA` дає exit 50, а
+  фінальна Operations-подія `-SyncBAZA` тепер несе режим і статус двигуна по
+  компонентах. Lock компонента спільний з Main/Health (той самий
+  `Invoke-BRAVOBazaComponentSyncSession`). Побічно: у legacy-режимі Main тепер
+  завжди ініціалізує `$script:bazaAppSyncResult`/`$script:bazaWWWSyncResult`.
+  `docs/BAZA_SFTP_ACCEPTANCE.md` і README оновлено. Нові self-test перевірки:
+  `BazaSync/SyncBazaAndMainResolveToSameCanonicalDispatcher`,
+  `BazaSync/NoProductionBazaSyncPathBypassesCanonicalDispatcher`,
+  `BazaSync/CanonicalDispatcherLegacyOnlyOnExplicitModeAndFailsClosed`,
+  `BazaSync/SyncBazaFailureMapsToSftpFailedExitAndOperationsEvent`,
+  `BazaSync/SyncBazaNewRemoteFileUploadedViaIncrementalEngineAndStateUpdated`,
+  `BazaSync/SyncBazaUnchangedFileMakesNoTransfer`,
+  `BazaSync/SyncBazaMutationViolationFailsAndRemoteGoodCopyNotOverwritten`,
+  `BazaSync/SyncBazaRemoteChangedFileIsNeverBlindlyMirrored`,
+  `BazaSync/SyncBazaRemoteConflictFailsWithoutOverwrite`,
+  `BazaSync/SyncBazaIncompatibleNameFailsButCompatibleFilesTransferred`,
+  `BazaSync/SyncBazaAuditDriftFailsWithoutOverwrite`,
+  `BazaSync/SyncBazaMutationAutoArchivedPreservesOldRemoteThenUploadsNewVersion`,
+  `BazaSync/SyncBazaLegacyMirrorOnlyWhenModeExplicitlyLegacy`,
+  `BazaSync/SyncBazaDefaultModeKeepsGoodRemoteCopyUnlikeLegacyMirror`,
+  `BazaSync/SyncBazaUnknownModeFailsClosedInsteadOfLegacyMirror`,
+  `BazaSync/SyncBazaRespectsSharedComponentSyncLock`; замінено застарілі текстові
+  перевірки call sites на `BazaSync/ArchiveBAZA_APPUsesCanonicalSyncDispatcher`,
+  `BazaSync/ArchiveBAZA_WWWUsesCanonicalSyncDispatcher`,
+  `BazaSync/CanonicalDispatcherPreservesIncrementalAndLegacyBranches`.
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях

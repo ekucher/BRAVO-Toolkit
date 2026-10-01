@@ -8714,11 +8714,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Failure 'Scenario 2 (BAZA_WWW_SFTP=enabled, джерело/Apache недоступні): має лишатись ERROR + $operationFailed=$true (fail closed, SftpFailed) — джерело не повинно мовчки вимикатись/маскуватись'
     Test-BRAVOCondition `
         -Condition (
-            $archiveScriptText.Contains('$script:bazaWWWSyncResult = Invoke-BRAVOBazaIncrementalSync -Component ''BAZA_WWW''') -or
-            $archiveScriptText.Contains('$bazaWWWSFTPSync = Sync-FolderToSFTP')
+            $archiveScriptText.Contains('$bazaWWWOutcome = Invoke-BRAVOBazaCanonicalSync -Component ''BAZA_WWW''') -and
+            $archiveScriptText.Contains('$legacySuccess = Sync-FolderToSFTP')
         ) `
         -Name "Archive/BazaWWWEnabledSourceAvailableUsesExistingUploadPath" `
-        -Failure "Scenario 3 (enabled + джерело доступне): має лишатись існуючий upload-шлях (incremental sync / Sync-FolderToSFTP) без змін"
+        -Failure "Scenario 3 (enabled + джерело доступне): має лишатись існуючий upload-шлях (канонічний диспетчер: incremental sync / legacy Sync-FolderToSFTP) без змін"
 
     Test-BRAVOCondition `
         -Condition (
