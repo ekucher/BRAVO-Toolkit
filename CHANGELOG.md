@@ -48,6 +48,59 @@
   `DryRun/ServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
   `BootRestore/ServiceStartTypeMissingUsesWmiAndFailsClosed`.
 
+- **Fix: Maintenance/Recovery утримує BRAVO, exchangAPI і Web від автостарту на час restore (#297).**
+  Boot-recovery профіль (`HoldServices`) ставить служби в Automatic (Delayed
+  Start): SCM піднімав їх ~через 2 хв після завантаження посеред багатохвилинного
+  before-архіву або `bravocmd`, а сторонній `Start-Service`, залежна служба чи
+  SCM recovery «restart on failure» могли зробити те саме й у звичайному нічному
+  вікні, тож BRAVO працював над моделлю, яку саме відновлюють (ризик пошкодження
+  даних). Єдиною мірою був restart-intent в ownership-маркері. Тепер на все
+  вікно «служби зупинені» керовані служби тимчасово переводяться в `Disabled`
+  (блокує SCM autostart, recovery actions, `Start-Service` і автостарт
+  залежностей; `Manual` цього не гарантує). Це транзакція, що перевикористовує
+  наявний ownership-маркер `BRAVO_SERVICE_QUIESCENCE.json` (необов'язкове поле
+  `startTypeSnapshot`, `schemaVersion` лишається 1; старі маркери читаються):
+  знімок точних початкових типів (Automatic, Automatic Delayed Start, Manual)
+  пишеться в маркер ДО зміни; у `finally` типи повертаються ПЕРЕД стартом служб;
+  збій повернення лишає маркер і вважається збоєм відновлення служб. Аварійний
+  вихід (kill, перезавантаження) самовідновлюється: наступний Maintenance/Recovery
+  (до читання start type) і Health-watchdog повертають типи зі знімка маркера
+  мертвого власника, гучно логуючи подію. Безпека: Disabled-служби (рішення
+  оператора) не потрапляють у знімок і ніколи не змінюються й не стартують;
+  відновлення чіпає лише службу, що зараз `Disabled`, тож зміна оператора не
+  перезаписується; служби поза керованим набором ігноруються; маркер
+  `restartSuppressed` (перервана посеред `bravocmd` реставрація) тримає служби
+  `Disabled` до ручного відновлення (код 43) разом із CRITICAL-повідомленням, що
+  містить початкові типи. Додатково hard-recheck: перед before-архівом
+  (`Confirm-BRAVOServicesQuiesced -StopRunning`) служба, яку встигли підняти,
+  зупиняється знову; безпосередньо перед `bravocmd` будь-яка запущена служба або
+  втрачене утримання скасовує реставрацію fail-closed (модель не торкнута, архів
+  збережено). Сам recheck без утримання недостатній (TOCTOU: служба може
+  піднятися одразу після перевірки), тож він доповнює утримання, а не замінює його.
+  Запис маркера не губить знімок: якщо на диску чужий маркер (мертвий власник,
+  `restartSuppressed` або невдале відновлення) має непорожній `startTypeSnapshot`,
+  запис Maintenance відхиляється fail-closed (гучна критична помилка, маркер
+  недоторканий), а запис DataRestore переносить чужий знімок у свій маркер
+  (`-PreserveForeignStartTypeSnapshot`; для тієї самої служби чинний старий
+  запис). Класифікація Disabled, обчислена до очікування lock, перевіряється
+  після його отримання: якщо вона змінилась (живий прогін тимчасово утримував
+  служби), Maintenance завершується з кодом 20 без дій, а не пропускає BRAVO
+  мовчки. Відновлення типів не відрізняє тимчасовий Disabled від Disabled,
+  виставленого оператором після аварії (свідомий компроміс).
+  Нові self-test перевірки: `ServiceQuiescence/StartTypeSuppressedDuringWindowAndExactlyRestored`,
+  `ServiceQuiescence/StartTypeDisabledByOperatorNeverTouched`,
+  `ServiceQuiescence/StartTypeRestoredAfterRestoreFailure`,
+  `ServiceQuiescence/StartTypePartialRestoreFailureReported`,
+  `ServiceQuiescence/StartTypeSnapshotSurvivesMarkerRewriteAndIsSanitized`,
+  `ServiceQuiescence/CrashLeavesMarkerNextRunRepairsExactStartTypes`,
+  `ServiceQuiescence/StartTypeRepairHandlesStaleForeignAndSuppressedMarkers`,
+  `ServiceQuiescence/RecheckDetectsServiceStartedMidWindow`,
+  `ServiceQuiescence/WatchdogRestoresStartTypesBeforeStartingServices`,
+  `ServiceQuiescence/MaintenanceOrdersRepairSuppressRecheckRestore`,
+  `ServiceQuiescence/MarkerWriteNeverDropsForeignStartTypeSnapshot`,
+  `ServiceQuiescence/MaintenanceRechecksClassificationAfterLock`,
+  `ServiceQuiescence/StartModeSleepStubDoesNotLeakIntoSession`.
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях

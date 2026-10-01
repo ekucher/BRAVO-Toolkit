@@ -4330,7 +4330,9 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # Провал реставрації, що потребував відкату, мапиться на
             # RestoreFailed (43) — окремо від збою СТВОРЕННЯ архіву (40).
             $maintenanceRuntimeTextForExitCodes.Contains('-RestoreFailed:$script:restoreFailed') -and
-            # 11 точок restoreArchiveFailed; 10 точок restoreIntegrityFailed.
+            # 13 точок restoreArchiveFailed (11 + 2 від #297: скасування
+            # реставрації перед before-архівом і перед bravocmd, коли служби
+            # не гарантовано зупинені); 10 точок restoreIntegrityFailed.
             # +1 integrity проти fix/repair-rollback-false-positive:
             # Invoke-BRAVOModelRestoreRecovery після успішного відкату повторно
             # валідує модель і, якщо вона ВСЕ ОДНО не консистентна, позначає
@@ -4339,7 +4341,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # 7z t» / «не вдалося створити SHA512») злито в одну гілку
             # Verify-Backup (7z t + SHA512); збій 7z t і далі виставляє
             # restoreIntegrityFailed у Test-BRAVOMaintenanceSevenZipArchiveIntegrity.
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 11) -and
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 13) -and
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 10)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
@@ -13093,9 +13095,16 @@ function Write-BRAVOStepResult {
     Add-ProbeEvent ("STEP {0}/{1} {2} {3}" -f $Current, $Total, $Name, $Status)
 }
 function Write-BRAVOServiceQuiescenceState {
-    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed)
+    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
     Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
 }
+# #297: утримання від автостарту. Стаби повертають порожній знімок (жодних
+# змін start type, жодних подій у журналі проби) — оркестрація кроків і
+# порядок подій лишаються рівно тими, що були до #297.
+function New-BRAVOServiceStartTypeSnapshot { param([string[]]$ServiceNames) return @() }
+function Suspend-BRAVOServiceAutostart { param([object[]]$Snapshot) return [pscustomobject]@{ Applied = @(); Failed = @() } }
+function Restore-BRAVOServiceStartTypeSnapshot { param([object[]]$Snapshot, [string[]]$AllowedServiceNames) return [pscustomobject]@{ Restored = @(); Unchanged = @(); Foreign = @(); Failed = @() } }
+function Confirm-BRAVOServicesQuiesced { param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds) return [pscustomobject]@{ Ok = $true; Offenders = @(); StoppedAgain = @() } }
 function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
 function Set-BRAVOServiceQuiescenceRestartSuppressed { param([bool]$Suppressed) }
 function Enter-BRAVOMaintenanceOperationLock {
@@ -13321,7 +13330,10 @@ try {
         ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
         ('$script:ProbeServices = {0}' -f $probeServiceTable),
         ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' })),
-        ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' }))
+        ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' })),
+        # #297: результат раннього самовідновлення типів запуску (у production
+        # його виставляє преамбула, яку seed замінює).
+        '$script:startModeRepairResult = [pscustomobject]@{ Status = ''NoMarker''; Owner = $null; Snapshot = @(); Restored = @(); Failed = @(); Foreign = @() }'
     ) -join "`n"
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,

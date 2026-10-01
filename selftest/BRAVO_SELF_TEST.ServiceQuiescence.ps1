@@ -1088,3 +1088,503 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
         -Condition ($watchdogFunctionBlock.Contains('Get-BRAVOQuiescenceWatchdogAllowedServiceNames')) `
         -Name "ServiceQuiescence/WatchdogConsultsManagedServiceWhitelist" `
         -Failure "watchdog має фільтрувати служби маркера через Get-BRAVOQuiescenceWatchdogAllowedServiceNames перед Start-Service"
+
+    # ============================================================
+    # #297: тимчасове утримання служб від автостарту на час restore
+    # (start type -> Disabled, write-ahead знімок у ownership-маркері,
+    # повернення у finally, самовідновлення після аварії, hard-recheck
+    # перед before-archive/bravocmd). Реальні служби/sc.exe/реєстр НІКОЛИ
+    # не чіпаються: Get/Set-BRAVOServiceStartMode (шви читання/запису) і
+    # Get/Stop-Service затінені in-memory стабами (стаб ПЕРШИМ).
+    # ============================================================
+    #region #297-start-type-suppression
+    & {
+    $startModeStubs = @'
+function Reset-BRAVOSelfTestStartModes {
+    param([hashtable]$Modes, [hashtable]$Status = @{}, [string[]]$SetFailures = @(), [string[]]$StopFailures = @())
+    $script:Q297Modes = $Modes.Clone()
+    $script:Q297Status = $Status.Clone()
+    $script:Q297SetFailures = @($SetFailures)
+    $script:Q297StopFailures = @($StopFailures)
+    $script:Q297SetLog = @()
+    $script:Q297OwnerAlive = $false
+}
+function Get-BRAVOServiceRegistryStartMode {
+    param([string]$ServiceName)
+    if ($script:Q297Modes.ContainsKey($ServiceName)) { return [string]$script:Q297Modes[$ServiceName] }
+    return $null
+}
+function Set-BRAVOServiceStartMode {
+    param([string]$ServiceName, [string]$StartMode)
+    $script:Q297SetLog += @("$ServiceName=$StartMode")
+    if (@($script:Q297SetFailures) -contains $ServiceName) { return $false }
+    $script:Q297Modes[$ServiceName] = $StartMode
+    return $true
+}
+function Test-BRAVOProcessAlive {
+    param([int]$ProcessId, [string]$ProcessStartTime)
+    return [bool]$script:Q297OwnerAlive
+}
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    $status = if ($script:Q297Status.ContainsKey($Name)) { [string]$script:Q297Status[$Name] } else { 'Stopped' }
+    $object = [pscustomobject]@{ Name = $Name; Status = $status }
+    Add-Member -InputObject $object -MemberType ScriptMethod -Name Refresh -Value { } -Force
+    return $object
+}
+function Stop-Service {
+    param([string]$Name, [switch]$Force, $ErrorAction, $WarningAction)
+    if (@($script:Q297StopFailures) -notcontains $Name) { $script:Q297Status[$Name] = 'Stopped' }
+}
+function Start-Sleep { param($Seconds) }
+'@
+    $startModeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($quiescenceStateStubs + "`n" + $startModeStubs + "`n" + $systemModuleTextForQuiescence) `
+        -FunctionNames @(
+            'Get-BRAVOServiceQuiescenceStatePath',
+            'Set-BRAVOSelfTestQuiescenceStatePath',
+            'Reset-BRAVOSelfTestStartModes',
+            'Get-BRAVOServiceRegistryStartMode',
+            'Set-BRAVOServiceStartMode',
+            'Test-BRAVOProcessAlive',
+            'Get-Service',
+            'Stop-Service',
+            'Start-Sleep',
+            'Protect-BRAVOMachineStateRoot',
+            'Get-BRAVOCurrentProcessStartTimeText',
+            'Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess',
+            'Write-BRAVOStateTemporaryText',
+            'Write-BRAVOStateFileAtomic',
+            'Write-BRAVOServiceQuiescenceState',
+            'Read-BRAVOServiceQuiescenceState',
+            'Clear-BRAVOServiceQuiescenceState',
+            'Set-BRAVOServiceQuiescenceRestartSuppressed',
+            'New-BRAVOServiceStartTypeSnapshot',
+            'Suspend-BRAVOServiceAutostart',
+            'Restore-BRAVOServiceStartTypeSnapshot',
+            'Repair-BRAVOOrphanedServiceStartTypes',
+            'Confirm-BRAVOServicesQuiesced'
+        )
+    # New-Module імпортує заглушки в глобальну область. Заглушка Start-Sleep
+    # потрібна лише всередині модуля (виклики в ньому резолвляться в модулі й
+    # без глобальної копії); глобальна копія гасила справжні паузи наступних
+    # suite (TraceArchive/GraceCompletionExpiry...), тож прибираємо її одразу.
+    $startModeLeakedSleep = Get-Command -Name 'Start-Sleep' -CommandType Function -ErrorAction SilentlyContinue
+    if ($null -ne $startModeLeakedSleep -and $startModeLeakedSleep.ModuleName -eq $startModeModule.Name) {
+        Remove-Item -Path 'function:Start-Sleep' -Force -ErrorAction Stop
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [string](Get-Command -Name 'Start-Sleep').ModuleName -ne $startModeModule.Name -and
+            [string](& $startModeModule { (Get-Command -Name 'Start-Sleep').CommandType }) -eq 'Function'
+        ) `
+        -Name "ServiceQuiescence/StartModeSleepStubDoesNotLeakIntoSession" `
+        -Failure "заглушка Start-Sleep тестів #297 має діяти лише всередині тестового модуля, а не в сесії self-test"
+    $startModeTestRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "bravo_selftest_startmode_{0}" -f ([guid]::NewGuid().ToString("N"))
+    )
+    [void][IO.Directory]::CreateDirectory($startModeTestRoot)
+    try {
+        $startModeStatePath = Join-Path $startModeTestRoot 'BRAVO_SERVICE_QUIESCENCE.json'
+        & $startModeModule { param($Path) Set-BRAVOSelfTestQuiescenceStatePath -Path $Path } $startModeStatePath
+        $startModeManaged = @('BRAVO', 'exchangAPI', 'BravoWeb')
+
+        # (1) Утримання застосовується ДО restore, точні початкові типи
+        # (Delayed/Auto/Manual) повертаються після успіху; Disabled лишається
+        # Disabled і ніколи не змінюється (жодного Set для нього).
+        $suppressScenario = & $startModeModule {
+            Reset-BRAVOSelfTestStartModes -Modes @{
+                BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic'; BravoWeb = 'Manual'; OperatorOff = 'Disabled'
+            }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames @('BRAVO', 'exchangAPI', 'BravoWeb', 'OperatorOff', 'Missing'))
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' `
+                -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'C:\LOGS\m.log' -StartTypeSnapshot $snapshot)
+            $suspend = Suspend-BRAVOServiceAutostart -Snapshot $snapshot
+            $duringWindow = @{ BRAVO = $script:Q297Modes['BRAVO']; exchangAPI = $script:Q297Modes['exchangAPI']; BravoWeb = $script:Q297Modes['BravoWeb']; OperatorOff = $script:Q297Modes['OperatorOff'] }
+            $marker = Read-BRAVOServiceQuiescenceState
+            $restore = Restore-BRAVOServiceStartTypeSnapshot -Snapshot $snapshot
+            [pscustomobject]@{
+                SnapshotCount = $snapshot.Count; Suspend = $suspend; During = $duringWindow; Marker = $marker
+                Restore = $restore; After = $script:Q297Modes.Clone(); SetLog = @($script:Q297SetLog)
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $suppressScenario.SnapshotCount -eq 3 -and
+                @($suppressScenario.Suspend.Failed).Count -eq 0 -and
+                $suppressScenario.During.BRAVO -eq 'Disabled' -and
+                $suppressScenario.During.exchangAPI -eq 'Disabled' -and
+                $suppressScenario.During.BravoWeb -eq 'Disabled' -and
+                $suppressScenario.During.OperatorOff -eq 'Disabled' -and
+                @($suppressScenario.Marker.startTypeSnapshot).Count -eq 3 -and
+                [string]$suppressScenario.Marker.startTypeSnapshot[0].StartMode -eq 'AutomaticDelayed' -and
+                $suppressScenario.After.BRAVO -eq 'AutomaticDelayed' -and
+                $suppressScenario.After.exchangAPI -eq 'Automatic' -and
+                $suppressScenario.After.BravoWeb -eq 'Manual' -and
+                $suppressScenario.After.OperatorOff -eq 'Disabled' -and
+                @($suppressScenario.Restore.Failed).Count -eq 0
+            ) `
+            -Name "ServiceQuiescence/StartTypeSuppressedDuringWindowAndExactlyRestored" `
+            -Failure "утримання: на час вікна керовані служби Disabled (знімок у маркері), після успіху точні типи (AutomaticDelayed/Automatic/Manual) повернуто"
+        Test-BRAVOCondition `
+            -Condition (
+                @($suppressScenario.SetLog) -notcontains 'OperatorOff=Disabled' -and
+                @($suppressScenario.SetLog | Where-Object { $_ -like 'OperatorOff=*' }).Count -eq 0 -and
+                @($suppressScenario.SetLog | Where-Object { $_ -like 'Missing=*' }).Count -eq 0
+            ) `
+            -Name "ServiceQuiescence/StartTypeDisabledByOperatorNeverTouched" `
+            -Failure "служба, вимкнена оператором (Disabled), і відсутня служба не потрапляють у знімок і НІКОЛИ не змінюються/не стартують"
+
+        # (2) Збій у середині restore (виняток): finally власника повертає
+        # типи. Моделюємо try/catch/finally тим самим викликом, що й
+        # Maintenance (порядок «Restore перед стартом служб» — окремий
+        # статичний чек нижче).
+        $failureScenario = & $startModeModule {
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic' }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames @('BRAVO', 'exchangAPI'))
+            [void](Suspend-BRAVOServiceAutostart -Snapshot $snapshot)
+            $thrown = $false
+            try {
+                try { throw 'self-test: bravocmd впав' } finally {
+                    $script:Q297FinallyResult = Restore-BRAVOServiceStartTypeSnapshot -Snapshot $snapshot
+                }
+            } catch { $thrown = $true }
+            [pscustomobject]@{ Thrown = $thrown; After = $script:Q297Modes.Clone(); Result = $script:Q297FinallyResult }
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $failureScenario.Thrown -and
+                $failureScenario.After.BRAVO -eq 'AutomaticDelayed' -and
+                $failureScenario.After.exchangAPI -eq 'Automatic' -and
+                @($failureScenario.Result.Failed).Count -eq 0
+            ) `
+            -Name "ServiceQuiescence/StartTypeRestoredAfterRestoreFailure" `
+            -Failure "після винятку посеред restore finally має повернути точні початкові типи запуску"
+
+        # (3) Збій відновлення окремої служби не губиться: Failed непорожній
+        # (викликач лишає маркер), решта служб відновлена.
+        $partialRestore = & $startModeModule {
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Manual' }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames @('BRAVO', 'exchangAPI'))
+            [void](Suspend-BRAVOServiceAutostart -Snapshot $snapshot)
+            $script:Q297SetFailures = @('BRAVO')
+            $result = Restore-BRAVOServiceStartTypeSnapshot -Snapshot $snapshot
+            [pscustomobject]@{ Result = $result; After = $script:Q297Modes.Clone() }
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                @($partialRestore.Result.Failed).Count -eq 1 -and
+                [string]$partialRestore.Result.Failed[0] -match '^BRAVO:' -and
+                $partialRestore.After.exchangAPI -eq 'Manual' -and
+                $partialRestore.After.BRAVO -eq 'Disabled'
+            ) `
+            -Name "ServiceQuiescence/StartTypePartialRestoreFailureReported" `
+            -Failure "збій повернення типу однієї служби має потрапити в Failed (маркер лишається), інші служби відновлюються"
+
+        # (4) Маркер зберігає знімок через Suppress; Read відкидає зіпсовані
+        # записи й нормалізує відсутнє поле (старі маркери).
+        $markerScenario = & $startModeModule {
+            Reset-BRAVOSelfTestStartModes -Modes @{}
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' `
+                -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'x' `
+                -StartTypeSnapshot @(@{ Name = 'BRAVO'; StartMode = 'AutomaticDelayed' }))
+            [void](Set-BRAVOServiceQuiescenceRestartSuppressed)
+            $suppressed = Read-BRAVOServiceQuiescenceState
+            $path = Get-BRAVOServiceQuiescenceStatePath
+            $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $raw.startTypeSnapshot = @(
+                [pscustomobject]@{ Name = 'BRAVO'; StartMode = 'Bogus' },
+                [pscustomobject]@{ Name = 'exchangAPI'; StartMode = 'Disabled' },
+                [pscustomobject]@{ Name = 'BravoWeb'; StartMode = 'Manual' }
+            )
+            [IO.File]::WriteAllText($path, ($raw | ConvertTo-Json -Depth 5))
+            $sanitized = Read-BRAVOServiceQuiescenceState
+            $raw.PSObject.Properties.Remove('startTypeSnapshot')
+            [IO.File]::WriteAllText($path, ($raw | ConvertTo-Json -Depth 5))
+            $legacy = Read-BRAVOServiceQuiescenceState
+            [pscustomobject]@{ Suppressed = $suppressed; Sanitized = $sanitized; Legacy = $legacy }
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                [bool]$markerScenario.Suppressed.restartSuppressed -and
+                @($markerScenario.Suppressed.startTypeSnapshot).Count -eq 1 -and
+                [string]$markerScenario.Suppressed.startTypeSnapshot[0].StartMode -eq 'AutomaticDelayed' -and
+                @($markerScenario.Sanitized.startTypeSnapshot).Count -eq 1 -and
+                [string]$markerScenario.Sanitized.startTypeSnapshot[0].Name -eq 'BravoWeb' -and
+                $null -ne $markerScenario.Legacy -and
+                @($markerScenario.Legacy.startTypeSnapshot).Count -eq 0
+            ) `
+            -Name "ServiceQuiescence/StartTypeSnapshotSurvivesMarkerRewriteAndIsSanitized" `
+            -Failure "Suppress має зберігати знімок типів; Read відкидає невалідні записи (Bogus/Disabled) і нормалізує маркер без поля (старі версії)"
+
+        # (5) Аварія: маркер лишився, служби Disabled, власник мертвий ->
+        # наступний прогін повертає точні типи й чистить знімок (маркер,
+        # pid, createdAt збережено — Health-watchdog і далі стартує служби).
+        $crashScenario = & $startModeModule {
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic'; BravoWeb = 'Manual' }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames @('BRAVO', 'exchangAPI', 'BravoWeb'))
+            $written = Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' `
+                -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'x' -StartTypeSnapshot $snapshot
+            [void](Suspend-BRAVOServiceAutostart -Snapshot $snapshot)
+            $duringCrash = $script:Q297Modes.Clone()
+            # процес «загинув» — finally не виконався; власник мертвий
+            $script:Q297OwnerAlive = $false
+            $repair = Repair-BRAVOOrphanedServiceStartTypes -AllowedServiceNames @('BRAVO', 'exchangAPI', 'BravoWeb')
+            $afterRepair = $script:Q297Modes.Clone()
+            $markerAfter = Read-BRAVOServiceQuiescenceState
+            $secondRepair = Repair-BRAVOOrphanedServiceStartTypes -AllowedServiceNames @('BRAVO', 'exchangAPI', 'BravoWeb')
+            [pscustomobject]@{
+                During = $duringCrash; Repair = $repair; After = $afterRepair; Marker = $markerAfter
+                Second = $secondRepair; CreatedAt = $written.createdAt
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $crashScenario.During.BRAVO -eq 'Disabled' -and
+                [string]$crashScenario.Repair.Status -eq 'Repaired' -and
+                $crashScenario.After.BRAVO -eq 'AutomaticDelayed' -and
+                $crashScenario.After.exchangAPI -eq 'Automatic' -and
+                $crashScenario.After.BravoWeb -eq 'Manual' -and
+                $null -ne $crashScenario.Marker -and
+                ([datetime]$crashScenario.Marker.createdAt).ToUniversalTime().Ticks -eq ([datetime]$crashScenario.CreatedAt).ToUniversalTime().Ticks -and
+                @($crashScenario.Marker.startTypeSnapshot).Count -eq 0 -and
+                [string]$crashScenario.Second.Status -eq 'NoSnapshot'
+            ) `
+            -Name "ServiceQuiescence/CrashLeavesMarkerNextRunRepairsExactStartTypes" `
+            -Failure "аварійний вихід у вікні утримання: наступний прогін має повернути точні типи з маркера мертвого власника, зберегти маркер (watchdog стартує служби) і очистити знімок (повтор = NoSnapshot)"
+
+        # (6) Stale/foreign/неочікувані маркери — безпечні відмови.
+        $staleScenario = & $startModeModule {
+            $allowed = @('BRAVO', 'exchangAPI', 'BravoWeb')
+            $out = @{}
+            # 6a: власник ЖИВИЙ -> не втручатись
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic' }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames @('BRAVO'))
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'x' -StartTypeSnapshot $snapshot)
+            [void](Suspend-BRAVOServiceAutostart -Snapshot $snapshot)
+            $script:Q297OwnerAlive = $true
+            $out.Alive = Repair-BRAVOOrphanedServiceStartTypes -AllowedServiceNames $allowed
+            $out.AliveMode = $script:Q297Modes['BRAVO']
+            # 6b: маркер restartSuppressed (перервана реставрація) -> лишається Disabled
+            $script:Q297OwnerAlive = $false
+            [void](Set-BRAVOServiceQuiescenceRestartSuppressed)
+            $out.Held = Repair-BRAVOOrphanedServiceStartTypes -AllowedServiceNames $allowed
+            $out.HeldMode = $script:Q297Modes['BRAVO']
+            # 6c: оператор уже сам змінив тип (Manual) -> не перезаписувати
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic' }
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'x' -StartTypeSnapshot $snapshot)
+            $script:Q297Modes['BRAVO'] = 'Manual'
+            $out.Foreign = Repair-BRAVOOrphanedServiceStartTypes -AllowedServiceNames $allowed
+            $out.ForeignMode = $script:Q297Modes['BRAVO']
+            # 6d: служба поза керованим набором (підроблений маркер) -> відмова
+            Reset-BRAVOSelfTestStartModes -Modes @{ SomeOtherSvc = 'Disabled' }
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'x' `
+                -StartTypeSnapshot @(@{ Name = 'SomeOtherSvc'; StartMode = 'Automatic' }))
+            $out.Outside = Repair-BRAVOOrphanedServiceStartTypes -AllowedServiceNames $allowed
+            $out.OutsideMode = $script:Q297Modes['SomeOtherSvc']
+            # 6e: маркер чужого hostname -> Read = $null -> NoMarker
+            $path = Get-BRAVOServiceQuiescenceStatePath
+            $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $raw.hostname = 'SRV-OTHER-HOST'
+            [IO.File]::WriteAllText($path, ($raw | ConvertTo-Json -Depth 5))
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Disabled' }
+            $out.Foreigner = Repair-BRAVOOrphanedServiceStartTypes -AllowedServiceNames $allowed
+            $out.ForeignerMode = $script:Q297Modes['BRAVO']
+            [pscustomobject]$out
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$staleScenario.Alive.Status -eq 'OwnerAlive' -and $staleScenario.AliveMode -eq 'Disabled' -and
+                [string]$staleScenario.Held.Status -eq 'HeldSuppressed' -and $staleScenario.HeldMode -eq 'Disabled' -and
+                [string]$staleScenario.Foreign.Status -eq 'Repaired' -and @($staleScenario.Foreign.Foreign).Count -eq 1 -and $staleScenario.ForeignMode -eq 'Manual' -and
+                [string]$staleScenario.Outside.Status -eq 'RepairFailed' -and $staleScenario.OutsideMode -eq 'Disabled' -and
+                [string]$staleScenario.Foreigner.Status -eq 'NoMarker' -and $staleScenario.ForeignerMode -eq 'Disabled'
+            ) `
+            -Name "ServiceQuiescence/StartTypeRepairHandlesStaleForeignAndSuppressedMarkers" `
+            -Failure "живий власник/suppressed/зміна оператора/служба поза набором/чужий hostname: жодних небезпечних змін типу запуску (Disabled лишається Disabled)"
+
+        # (7) Hard-recheck: служба, запущена «SCM» посеред вікна, виявляється.
+        $recheckScenario = & $startModeModule {
+            $names = @('BRAVO', 'exchangAPI')
+            $snap = @(@{ Name = 'BRAVO'; StartMode = 'Automatic' }, @{ Name = 'exchangAPI'; StartMode = 'Manual' })
+            $out = @{}
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Disabled'; exchangAPI = 'Disabled' } -Status @{}
+            $out.Clean = Confirm-BRAVOServicesQuiesced -ServiceNames $names -Snapshot $snap
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Disabled'; exchangAPI = 'Disabled' } -Status @{ BRAVO = 'Running' }
+            $out.StartedMidWindow = Confirm-BRAVOServicesQuiesced -ServiceNames $names -Snapshot $snap
+            $out.StartedStatusUntouched = $script:Q297Status['BRAVO']
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Disabled'; exchangAPI = 'Disabled' } -Status @{ BRAVO = 'Running' }
+            $out.Restopped = Confirm-BRAVOServicesQuiesced -ServiceNames $names -Snapshot $snap -StopRunning
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Disabled'; exchangAPI = 'Disabled' } -Status @{ BRAVO = 'Running' } -StopFailures @('BRAVO')
+            $out.CannotStop = Confirm-BRAVOServicesQuiesced -ServiceNames $names -Snapshot $snap -StopRunning -StopTimeoutSeconds 1 -PollIntervalSeconds 1
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Disabled' }
+            $out.SuppressionLost = Confirm-BRAVOServicesQuiesced -ServiceNames $names -Snapshot $snap
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Disabled' }
+            $out.Reapplied = Confirm-BRAVOServicesQuiesced -ServiceNames $names -Snapshot $snap -StopRunning
+            $out.ReappliedMode = $script:Q297Modes['BRAVO']
+            [pscustomobject]$out
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $recheckScenario.Clean.Ok -and
+                -not $recheckScenario.StartedMidWindow.Ok -and
+                @($recheckScenario.StartedMidWindow.Offenders).Count -eq 1 -and
+                $recheckScenario.StartedStatusUntouched -eq 'Running' -and
+                $recheckScenario.Restopped.Ok -and @($recheckScenario.Restopped.StoppedAgain) -contains 'BRAVO' -and
+                -not $recheckScenario.CannotStop.Ok -and
+                -not $recheckScenario.SuppressionLost.Ok -and
+                $recheckScenario.Reapplied.Ok -and $recheckScenario.ReappliedMode -eq 'Disabled'
+            ) `
+            -Name "ServiceQuiescence/RecheckDetectsServiceStartedMidWindow" `
+            -Failure "Confirm-BRAVOServicesQuiesced: запущена посеред вікна служба = Offender (fail-closed перед bravocmd); перед архівом -StopRunning зупиняє знову; втрачене утримання виявляється/перезастосовується"
+
+        # (8) Watchdog (Health): типи запуску повертаються ПЕРЕД Start-Service
+        # (Disabled блокує старт); збій повернення -> маркер лишається.
+        $watchdogStartModeStubs = @'
+function Restore-BRAVOServiceStartTypeSnapshot {
+    param($Snapshot, $AllowedServiceNames)
+    $script:BRAVOSelfTestRestoreBeforeStart = (@($script:BRAVOSelfTestQuiescenceStartedServices).Count -eq 0)
+    $script:BRAVOSelfTestRestoreSnapshot = @($Snapshot)
+    if ($script:BRAVOSelfTestRestoreFail) {
+        return [pscustomobject]@{ Restored = @(); Unchanged = @(); Foreign = @(); Failed = @('BRAVO: self-test збій') }
+    }
+    return [pscustomobject]@{ Restored = @('BRAVO=Automatic'); Unchanged = @(); Foreign = @(); Failed = @() }
+}
+'@
+        $watchdogStartModeModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($quiescenceWatchdogStubs + "`n" + $watchdogStartModeStubs + "`n" + $healthRuntimeTextForQuiescence) `
+            -FunctionNames @(
+                'Write-HealthLog', 'Read-BRAVOServiceQuiescenceState', 'Test-BRAVOProcessAlive',
+                'Get-BRAVOQuiescenceWatchdogAllowedServiceNames', 'Get-Service', 'Start-Service',
+                'Clear-BRAVOServiceQuiescenceState', 'Invoke-BRAVOSelfTestQuiescenceScenario',
+                'Restore-BRAVOServiceStartTypeSnapshot', 'Invoke-BRAVOServiceQuiescenceWatchdog'
+            )
+        $snapshotMarker = [pscustomobject]@{
+            schemaVersion = 1; owner = 'BRAVO_MAINTENANCE'; hostname = [Environment]::MachineName
+            pid = 12345; processStartTime = '2026-08-20T23:55:00.0000000+03:00'
+            createdAt = '2026-08-20T23:55:01.0000000+03:00'; logFile = 'C:\LOGS\maintenance.log'
+            restartSuppressed = $false
+            services = @([pscustomobject]@{ Name = 'BRAVO'; RestartIntent = $true })
+            startTypeSnapshot = @([pscustomobject]@{ Name = 'BRAVO'; StartMode = 'Automatic' })
+        }
+        $watchdogOk = & $watchdogStartModeModule {
+            param($State)
+            $script:BRAVOSelfTestRestoreFail = $false; $script:BRAVOSelfTestRestoreBeforeStart = $null
+            $scenario = Invoke-BRAVOSelfTestQuiescenceScenario -State $State -OwnerAlive $false -StartFailures @()
+            [pscustomobject]@{ Scenario = $scenario; RestoreBeforeStart = $script:BRAVOSelfTestRestoreBeforeStart; Snapshot = $script:BRAVOSelfTestRestoreSnapshot }
+        } $snapshotMarker
+        $watchdogFail = & $watchdogStartModeModule {
+            param($State)
+            $script:BRAVOSelfTestRestoreFail = $true
+            Invoke-BRAVOSelfTestQuiescenceScenario -State $State -OwnerAlive $false -StartFailures @()
+        } $snapshotMarker
+        Test-BRAVOCondition `
+            -Condition (
+                $watchdogOk.RestoreBeforeStart -eq $true -and
+                @($watchdogOk.Snapshot).Count -eq 1 -and
+                @($watchdogOk.Scenario.StartedServices) -contains 'BRAVO' -and
+                $watchdogOk.Scenario.MarkerCleared -eq $true -and
+                $watchdogFail.MarkerCleared -eq $false
+            ) `
+            -Name "ServiceQuiescence/WatchdogRestoresStartTypesBeforeStartingServices" `
+            -Failure "Health-watchdog мертвого власника: спочатку повернути start type зі знімка (Disabled блокує старт), потім Start-Service; збій повернення типу лишає маркер"
+
+        # (9) Статичний порядок у Maintenance: самовідновлення ДО читання
+        # start type; recheck ПЕРЕД before-archive і ПЕРЕД bravocmd; повернення
+        # типів у finally ПЕРЕД стартом служб; write-ahead знімок у маркері.
+        $maintenanceTextForStartMode = [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        )
+        $repairCallIndex = $maintenanceTextForStartMode.IndexOf('Repair-BRAVOOrphanedServiceStartTypes')
+        $firstStartModeReadIndex = $maintenanceTextForStartMode.IndexOf('$bravoServiceState = Get-ConfiguredServiceState')
+        $markerWriteIndex = $maintenanceTextForStartMode.IndexOf('-StartTypeSnapshot $script:startTypeSnapshot)')
+        $suspendIndex = $maintenanceTextForStartMode.IndexOf('Suspend-BRAVOServiceAutostart -Snapshot')
+        $archiveRecheckIndex = $maintenanceTextForStartMode.IndexOf('$preArchiveQuiescence = Confirm-BRAVOServicesQuiesced')
+        $archiveRunIndex = $maintenanceTextForStartMode.IndexOf('-Description "Архівація моделі перед реставрацією"')
+        $bravocmdRecheckIndex = $maintenanceTextForStartMode.IndexOf('$preRestoreQuiescence = Confirm-BRAVOServicesQuiesced')
+        $bravocmdRunIndex = $maintenanceTextForStartMode.IndexOf('-Description "Виконання реставрації моделі')
+        $finallyIndex = $maintenanceTextForStartMode.IndexOf("Write-BRAVOProgressPhase -Phase 'Відновлення стану служб'")
+        $finallyRestoreIndex = $maintenanceTextForStartMode.IndexOf('Restore-BRAVOServiceStartTypeSnapshot -Snapshot $script:startTypeSnapshot')
+        $firstServiceStartIndex = $maintenanceTextForStartMode.IndexOf('# 1. Запуск служби BRAVO')
+        Test-BRAVOCondition `
+            -Condition (
+                $repairCallIndex -ge 0 -and $repairCallIndex -lt $firstStartModeReadIndex -and
+                $markerWriteIndex -ge 0 -and $suspendIndex -gt $markerWriteIndex -and
+                $archiveRecheckIndex -ge 0 -and $archiveRecheckIndex -lt $archiveRunIndex -and
+                $bravocmdRecheckIndex -gt $archiveRunIndex -and $bravocmdRecheckIndex -lt $bravocmdRunIndex -and
+                $finallyIndex -ge 0 -and $finallyRestoreIndex -gt $finallyIndex -and $finallyRestoreIndex -lt $firstServiceStartIndex
+            ) `
+            -Name "ServiceQuiescence/MaintenanceOrdersRepairSuppressRecheckRestore" `
+            -Failure "Maintenance: Repair до читання start type; знімок у маркері до Suspend; Confirm перед before-archive і перед bravocmd; Restore start type у finally ПЕРЕД стартом служб"
+
+        # (10) P2: запис маркера не губить чужий знімок типів. Чужий маркер
+        # (pid іншого процесу) із непорожнім знімком: Maintenance-запис
+        # відхиляється (маркер недоторканий); DataRestore-запис переносить
+        # знімок (старий запис чинний для тієї ж служби); порожній знімок
+        # чужого маркера не блокує запис.
+        $foreignWrite = & $startModeModule {
+            $out = @{}
+            Reset-BRAVOSelfTestStartModes -Modes @{}
+            $path = Get-BRAVOServiceQuiescenceStatePath
+            $makeForeign = {
+                param($Snapshot)
+                [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'x' -StartTypeSnapshot $Snapshot)
+                $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+                $raw.pid = 1
+                [IO.File]::WriteAllText($path, ($raw | ConvertTo-Json -Depth 5))
+            }
+            & $makeForeign @(@{ Name = 'BRAVO'; StartMode = 'AutomaticDelayed' })
+            $out.Refused = $false
+            try {
+                [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'exchangAPI'; RestartIntent = $true }) -LogFile 'y' -StartTypeSnapshot @(@{ Name = 'exchangAPI'; StartMode = 'Automatic' }))
+            } catch { $out.Refused = $true }
+            $out.AfterRefuse = Read-BRAVOServiceQuiescenceState
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_DATA_RESTORE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'z' -RestartSuppressed -PreserveForeignStartTypeSnapshot `
+                -StartTypeSnapshot @(@{ Name = 'BRAVO'; StartMode = 'Manual' }, @{ Name = 'BravoWeb'; StartMode = 'Automatic' }))
+            $out.Merged = Read-BRAVOServiceQuiescenceState
+            & $makeForeign @()
+            $out.EmptyAllowed = $true
+            try {
+                [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'w' -StartTypeSnapshot @())
+            } catch { $out.EmptyAllowed = $false }
+            [pscustomobject]$out
+        }
+        $mergedByName = @{}
+        foreach ($mergedEntry in @($foreignWrite.Merged.startTypeSnapshot)) { $mergedByName[[string]$mergedEntry.Name] = [string]$mergedEntry.StartMode }
+        Test-BRAVOCondition `
+            -Condition (
+                $foreignWrite.Refused -and
+                @($foreignWrite.AfterRefuse.startTypeSnapshot).Count -eq 1 -and
+                [string]$foreignWrite.AfterRefuse.startTypeSnapshot[0].StartMode -eq 'AutomaticDelayed' -and
+                $mergedByName.Count -eq 2 -and $mergedByName['BRAVO'] -eq 'AutomaticDelayed' -and $mergedByName['BravoWeb'] -eq 'Automatic' -and
+                $foreignWrite.EmptyAllowed
+            ) `
+            -Name "ServiceQuiescence/MarkerWriteNeverDropsForeignStartTypeSnapshot" `
+            -Failure "запис маркера: чужий знімок типів не перезаписується (Maintenance throw, маркер недоторканий); DataRestore переносить його (старий запис виграє); порожній знімок не блокує"
+
+        # (11) P2: класифікація Disabled перевіряється ПІСЛЯ отримання lock,
+        # до будь-яких дій (зупинка служб), а DataRestore зберігає знімок.
+        $lockIndex = $maintenanceTextForStartMode.IndexOf('$script:maintenanceOperationLockPath = $maintenanceLockResult.Path')
+        $postLockRepairIndex = $maintenanceTextForStartMode.IndexOf('$postLockRepair = Repair-BRAVOOrphanedServiceStartTypes')
+        $reclassifyIndex = $maintenanceTextForStartMode.IndexOf('$reBravoEnabled = ')
+        $reclassifyExitIndex = $maintenanceTextForStartMode.IndexOf('Resolve-BRAVOExitCode -LockBusy', $reclassifyIndex)
+        $logRotationIndex = $maintenanceTextForStartMode.IndexOf('$bravoLogRotationLogger = ')
+        $dataRestoreTextForStartMode = [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $lockIndex -ge 0 -and $postLockRepairIndex -gt $lockIndex -and
+                $reclassifyIndex -gt $postLockRepairIndex -and $reclassifyExitIndex -gt $reclassifyIndex -and
+                $logRotationIndex -gt $reclassifyExitIndex -and
+                $dataRestoreTextForStartMode.Contains('-PreserveForeignStartTypeSnapshot')
+            ) `
+            -Name "ServiceQuiescence/MaintenanceRechecksClassificationAfterLock" `
+            -Failure "після lock Maintenance має повторити Repair і перевірити класифікацію служб (зміна -> fail-closed exit 20) до будь-яких дій; DataRestore пише маркер з -PreserveForeignStartTypeSnapshot"
+    } finally {
+        Remove-Item -LiteralPath $startModeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    }
+    #endregion #297-start-type-suppression

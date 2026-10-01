@@ -5242,7 +5242,7 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
             # Компактно (запит оператора): одна причина + одна дія + лог.
             # Повний технічний контекст (restartSuppressed, варіанти
             # переривання) лишається в ERROR-рядку Health-логу вище.
-            Reason = "перерване відновлення — потрібне РУЧНЕ втручання за кодом 43 (автостарт заборонено); лог: $($quiescenceState.logFile)"
+            Reason = "перерване відновлення — потрібне РУЧНЕ втручання за кодом 43 (автостарт заборонено)$(if (@($quiescenceState.startTypeSnapshot).Count -gt 0) { '; служби утримано Disabled, початкові типи запуску: ' + ((@($quiescenceState.startTypeSnapshot) | ForEach-Object { '{0}={1}' -f $_.Name, $_.StartMode }) -join ', ') }); лог: $($quiescenceState.logFile)"
             # Власний ActionText: Component тут — опис події, тому загальний
             # шаблон «запустити або перевірити службу <Component>» непридатний.
             ActionText = "виконати ручне відновлення служб (OPERATIONS.md, код 43)"
@@ -5275,6 +5275,27 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
     $startFailures = @()
     $startedServices = @()
     $alreadyRunningServices = @()
+    # #297: власник міг загинути у вікні тимчасового утримання служб від
+    # автостарту (start type = Disabled). Disabled блокує Start-Service, тож
+    # СПОЧАТКУ повертаємо початкові типи з маркера (лише службам, що зараз
+    # Disabled і входять до керованого набору; чужу зміну оператора не
+    # перезаписуємо). Збій повернення — у startFailures: маркер лишається.
+    $markerStartTypeSnapshot = @()
+    if ($null -ne $quiescenceState.PSObject.Properties['startTypeSnapshot']) {
+        $markerStartTypeSnapshot = @($quiescenceState.startTypeSnapshot)
+    }
+    if ($markerStartTypeSnapshot.Count -gt 0) {
+        $startTypeRestore = Restore-BRAVOServiceStartTypeSnapshot `
+            -Snapshot $markerStartTypeSnapshot `
+            -AllowedServiceNames $allowedServiceNames
+        foreach ($startTypeFailure in @($startTypeRestore.Failed)) {
+            $startFailures += "тип запуску: $startTypeFailure"
+            Write-HealthLog "Не вдалося повернути початковий тип запуску після аварійного переривання: $startTypeFailure" -Level "ERROR"
+        }
+        if (@($startTypeRestore.Restored).Count -gt 0) {
+            Write-HealthLog "Початкові типи запуску служб повернуто після аварійного переривання $($quiescenceState.owner): $(@($startTypeRestore.Restored) -join ', ')" -Level "WARNING"
+        }
+    }
     foreach ($markedService in @($quiescenceState.services | Where-Object { [bool]$_.RestartIntent })) {
         $markedName = [string]$markedService.Name
         if (@($allowedServiceNames | Where-Object { $_ -ieq $markedName }).Count -eq 0) {
