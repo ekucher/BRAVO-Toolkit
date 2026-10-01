@@ -276,7 +276,7 @@ function New-BRAVOTaskDefinition {
     param(
         $TaskService,
         [hashtable]$TaskSettings,
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")]
         [string]$TaskType,
         [string]$ResolvedConfigPath,
 
@@ -343,7 +343,7 @@ function New-BRAVOTaskDefinition {
         ConvertTo-ScheduleTime `
             -Value $TaskSettings.StartAt `
             -SettingName "$TaskType.StartAt"
-    } elseif ($TaskType -eq "Recovery") {
+    } elseif ($TaskType -eq "Recovery" -or $TaskType -eq "BackupCatchUp") {
         $null
     } elseif ($TaskType -eq "RestoreVerify") {
         ConvertTo-ScheduleTime -Value $TaskSettings.At -SettingName "$TaskType.At"
@@ -360,7 +360,11 @@ function New-BRAVOTaskDefinition {
     # Раніший дизайн (daily-trigger о WindowStart + boot-Repetition
     # 15 хв/8 год) прибрано: на production-сервері BRAVO 2026-08-20 repetition-хвіст будив
     # завдання кожні 15 хв ще довго після успішної реставрації.
-    if ($TaskType -eq "Recovery") {
+    # BackupCatchUp — той самий єдиний boot-trigger із затримкою: пропущену
+    # нічну копію робимо через StartupDelayMinutes після старту ОС (рішення
+    # власника 2026-09-30: 5-10 хв). Чи слот справді пропущено, вирішує сам
+    # BRAVO_ARCHIV -CatchUpMissedBackup.
+    if ($TaskType -eq "Recovery" -or $TaskType -eq "BackupCatchUp") {
         $trigger = $definition.Triggers.Create(8) # TASK_TRIGGER_BOOT
         $delayMinutes = [math]::Max(0, [int]$TaskSettings.StartupDelayMinutes)
         if ($delayMinutes -gt 0) {
@@ -423,6 +427,9 @@ function New-BRAVOTaskDefinition {
     if ($TaskType -eq "Recovery") {
         $actionArguments += " -RunMissedRestoreOnly"
     }
+    if ($TaskType -eq "BackupCatchUp") {
+        $actionArguments += " -CatchUpMissedBackup"
+    }
     if ($TaskType -eq "BAZASync") {
         $actionArguments += " -SyncBAZA"
     }
@@ -450,7 +457,7 @@ function New-BRAVOTaskDefinition {
 
 function Format-BRAVOInstalledTaskSummaryNextRun {
     param(
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")]
         [string]$TaskType,
         $TaskSettings,
         $NextRunTime
@@ -460,11 +467,22 @@ function Format-BRAVOInstalledTaskSummaryNextRun {
         TaskType = $TaskType
         NextRunTime = $NextRunTime
     }
-    if ($TaskType -eq "Recovery") {
+    if ($TaskType -eq "Recovery" -or $TaskType -eq "BackupCatchUp") {
         $nextRunArguments.StartupDelayMinutes = [int]$TaskSettings.StartupDelayMinutes
     }
 
     return Format-BRAVOSchedulerNextRun @nextRunArguments
+}
+
+function Get-BRAVOBackupCatchUpTaskSettings {
+    # Вузол schedulerSettings.BackupCatchUp або $null для legacy-конфігурації,
+    # у якій його ще немає.
+    if ($schedulerSettings -is [System.Collections.IDictionary] -and
+        $schedulerSettings.Contains('BackupCatchUp') -and
+        $schedulerSettings.BackupCatchUp -is [System.Collections.IDictionary]) {
+        return $schedulerSettings.BackupCatchUp
+    }
+    return $null
 }
 
 function Test-SchedulerConfiguration {
@@ -562,6 +580,12 @@ function Test-SchedulerConfiguration {
     Test-TaskName -TaskName $schedulerSettings.Recovery.TaskName -SettingName "Recovery.TaskName"
     Test-TaskName -TaskName $schedulerSettings.BAZASync.TaskName -SettingName "BAZASync.TaskName"
     Test-TaskName -TaskName $schedulerSettings.RestoreVerify.TaskName -SettingName "RestoreVerify.TaskName"
+    # BackupCatchUp може бути відсутнім у legacy-конфігурації — тоді
+    # завдання просто не реєструється.
+    $backupCatchUpSettings = Get-BRAVOBackupCatchUpTaskSettings
+    if ($null -ne $backupCatchUpSettings) {
+        Test-TaskName -TaskName $backupCatchUpSettings.TaskName -SettingName "BackupCatchUp.TaskName"
+    }
     $taskNames = @(
         [string]$schedulerSettings.Backup.TaskName,
         [string]$schedulerSettings.Maintenance.TaskName,
@@ -570,8 +594,11 @@ function Test-SchedulerConfiguration {
         [string]$schedulerSettings.BAZASync.TaskName,
         [string]$schedulerSettings.RestoreVerify.TaskName
     )
+    if ($null -ne $backupCatchUpSettings) {
+        $taskNames += [string]$backupCatchUpSettings.TaskName
+    }
     if (@($taskNames | Select-Object -Unique).Count -ne $taskNames.Count) {
-        throw "Імена Backup, Maintenance, Health, Recovery, BAZASync і RestoreVerify завдань повинні відрізнятися"
+        throw "Імена Backup, Maintenance, Health, Recovery, BAZASync, RestoreVerify і BackupCatchUp завдань повинні відрізнятися"
     }
 
     foreach ($taskSettings in @(
@@ -580,8 +607,10 @@ function Test-SchedulerConfiguration {
         $schedulerSettings.Health,
         $schedulerSettings.Recovery,
         $schedulerSettings.BAZASync,
-        $schedulerSettings.RestoreVerify
+        $schedulerSettings.RestoreVerify,
+        $backupCatchUpSettings
     )) {
+        if ($null -eq $taskSettings) { continue }
         if ($taskSettings.Enabled -and -not (Test-Path -Path $taskSettings.ScriptPath -PathType Leaf)) {
             throw "Скрипт завдання не знайдено: $($taskSettings.ScriptPath)"
         }
@@ -614,6 +643,11 @@ function Test-SchedulerConfiguration {
     if ($schedulerSettings.Recovery.Enabled -and
         [int]$schedulerSettings.Recovery.StartupDelayMinutes -lt 0) {
         throw "Recovery.StartupDelayMinutes не може бути від'ємним"
+    }
+    if ($null -ne $backupCatchUpSettings -and $backupCatchUpSettings.Enabled -and
+        ([int]$backupCatchUpSettings.StartupDelayMinutes -lt 0 -or
+         [int]$backupCatchUpSettings.StartupDelayMinutes -gt 120)) {
+        throw "BackupCatchUp.StartupDelayMinutes повинен бути в межах від 0 до 120"
     }
     if ($schedulerSettings.RestoreVerify.Enabled) {
         [void](ConvertTo-ScheduleTime `
@@ -792,6 +826,10 @@ try {
         [pscustomobject]@{ Type = "BAZASync"; Settings = $schedulerSettings.BAZASync },
         [pscustomobject]@{ Type = "RestoreVerify"; Settings = $schedulerSettings.RestoreVerify }
     )
+    $backupCatchUpSettings = Get-BRAVOBackupCatchUpTaskSettings
+    if ($null -ne $backupCatchUpSettings) {
+        $taskPlans += [pscustomobject]@{ Type = "BackupCatchUp"; Settings = $backupCatchUpSettings }
+    }
 
     $requireProtectedRuntime = (
         $schedulerSettings.Contains("RequireProtectedRuntime") -and
@@ -940,6 +978,8 @@ try {
                 "щодня о $($taskSettings.DailyAt)"
             } elseif ($taskPlan.Type -eq "Recovery") {
                 "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.; профіль робочого часу)"
+            } elseif ($taskPlan.Type -eq "BackupCatchUp") {
+                "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.), лише якщо нічну копію пропущено"
             } elseif ($taskPlan.Type -eq "BAZASync") {
                 "кожні $($taskSettings.RepeatEveryHours) год., починаючи з $($taskSettings.StartAt)"
             } elseif ($taskPlan.Type -eq "RestoreVerify") {
