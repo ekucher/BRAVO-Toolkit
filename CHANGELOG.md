@@ -82,6 +82,14 @@
   і `ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget` (гейт на фактичному
   вмісті кожної цілі). `RUNTIME_MANIFEST.json` оновлено для змінених файлів.
 
+- **Документація і коментарі: реальні назви установ, хостів і коди замінено
+  вигаданими.** У `CHANGELOG.md`, `RELEASE_POLICY.md`, `OPERATIONS.md`,
+  `docs/*` та коментарях runtime- і self-test-коду реальні назви лабораторій,
+  імена серверів і коди установ замінено на `ЛАБОРАТОРІЯ-N` / `SRV-LABN`;
+  тестовий код установи в self-test — на `00000000`. Поведінка не змінюється:
+  змінено лише коментарі, тексти документації та рядки повідомлень self-test;
+  `RUNTIME_MANIFEST.json` перераховано для змінених `.ps1`/`.psm1`.
+
 - **Документація: операторські розділи про сповіщення перекладено
   українською, виправлено латинські літери в українських словах (A10).**
   Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
@@ -3126,7 +3134,7 @@ Scope real-server acceptance rc.1 (уся нова поверхня циклу):
      переписане в 5.2.0 тіло): пряма
      `[IO.DirectoryInfo]::EnumerateFiles`-enumeration з Hidden/System-
      фільтром замість ненадійного `Get-ChildItem -Recurse`
-     (детермінований інцидент ДНДІЛДВСЕ ~364 «зниклих» файлів) +
+     (детермінований інцидент ЛАБОРАТОРІЯ-6 ~364 «зниклих» файлів) +
      settle-retry 12×15с ЛИШЕ при знайдених критичних розбіжностях
      (AV-race видимості; канонічний фікс — AV-виняток, runbook у
      OPERATIONS.md код 43); tripwire розсинхрону шляхів виконується
@@ -3309,7 +3317,7 @@ acceptance handoff). Незакритих блокуючих знахідок н
 ## 5.2.1-rc.9 — 2026-08-27 (hotfix candidate, pending acceptance)
 
 Кандидат = rc.8 + фікс систематичного пропуску денних health-прогонів
-(доведено логами ДНДІЛДВСЕ 25-27.08.2026) + повний каталог
+(доведено логами ЛАБОРАТОРІЯ-6 25-27.08.2026) + повний каталог
 `BRAVO.local.config.example`:
 
 - **FIX (health/scheduler): денний слот health-прогону систематично
@@ -3341,7 +3349,7 @@ Acceptance rc.9 додатково включає: re-run `BRAVO_TASKS_INSTALL`
 ## 5.2.1-rc.8 — 2026-08-27 (hotfix candidate, pending acceptance)
 
 Кандидат = rc.7 + фікс хибного ERROR у сповіщенні про несумісні імена
-(знайдено аналізом acceptance-логів ХРДЛ 27.08: rc.5/rc.6 -SyncBAZA):
+(знайдено аналізом acceptance-логів ЛАБОРАТОРІЯ-7 27.08: rc.5/rc.6 -SyncBAZA):
 
 - **FIX (notifications): одно-chunk результат
   `ConvertTo-BRAVONotificationPayloadText` втрачав масивність.**
@@ -3376,7 +3384,7 @@ Acceptance rc.9 додатково включає: re-run `BRAVO_TASKS_INSTALL`
   валідаційному інструментарії; runtime-поведінка rc.7 коректна.
 
 Acceptance rc.8 (додатково до rc.7): на інсталяції з несумісними
-іменами BAZA (напр., ХРДЛ) прогнати `-SyncBAZA` → у лозі SUCCESS
+іменами BAZA (напр., ЛАБОРАТОРІЯ-7) прогнати `-SyncBAZA` → у лозі SUCCESS
 «Сповіщення про N несумісних імен … відправлено», без ERROR
 «Не вдалося відправити…: Не удается найти свойство "Count"».
 
@@ -3414,7 +3422,7 @@ Acceptance rc.7 (додатково до rc.6): на нетиповій інст
 ## 5.2.1-rc.6 — 2026-08-27 (hotfix candidate, NOT accepted — superseded by rc.7)
 
 Кандидат = rc.5 + свідома зміна дефолту порогу авто-архівування BAZA
-(реальний алерт ДНДІЛДВСЕ 23:00: 18 легітимних мутацій PDF-звітів →
+(реальний алерт ЛАБОРАТОРІЯ-6 23:00: 18 легітимних мутацій PDF-звітів →
 CRITICAL «ПОТРІБНА ДІЯ», хоча механізм auto-archive існує з 5.2.0, але
 був вимкнений дефолтом 0):
 
@@ -3430,7 +3438,7 @@ CRITICAL «ПОТРІБНА ДІЯ», хоча механізм auto-archive і�
   (OPERATIONS/THREAT_MODEL/README/конфіг-коментар) синхронізовано;
   залишковий ризик per-cycle порогу зафіксовано там само.
 
-Acceptance rc.6 (додатково до rc.5): на ДНДІЛДВСЕ після оновлення
+Acceptance rc.6 (додатково до rc.5): на ЛАБОРАТОРІЯ-6 після оновлення
 конфіга — наступний цикл авто-архівує ≤25 мутацій (INFO, без
 «ПОТРІБНА ДІЯ»), старі remote-версії з суфіксом `.replaced_*`.
 
@@ -3439,7 +3447,7 @@ Acceptance rc.6 (додатково до rc.5): на ДНДІЛДВСЕ післ
 ## 5.2.1-rc.5 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.6)
 
 Кандидат = rc.4 + фікс хибного CRITICAL при зайнятому WinSCP (реальний
-алерт SERV_HRDL_1/ХЕРСОНСЬКА РДЛ 23:03: «Запуск WinSCP для SFTP
+алерт SRV-LAB7/ЛАБОРАТОРІЯ-7 23:03: «Запуск WinSCP для SFTP
 health-check заблоковано: виявлено активний WinSCP.com»):
 
 - **FIX (health, операторський UX): зайнятий WinSCP = відкладення, а не
@@ -3459,7 +3467,7 @@ SKIPPED; без конкуренції — звичайна повна пере�
 ## 5.2.1-rc.4 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.5)
 
 Кандидат = rc.3 + фікс накопичення diskshadow metadata-.cab (реальний
-звіт SERVER-01/Тернопіль: файли `NN-DD.MM.YYYY-HH_--_SERVER-01.cab` у
+звіт SERVER-01/Лабораторія-12: файли `NN-DD.MM.YYYY-HH_--_SERVER-01.cab` у
 `C:\Program Files\BRAVO-Toolkit` після кожної багатотомної архівації):
 
 - **FIX (archive/VSS): metadata-.cab diskshadow — у TEMP і прибирається.**
@@ -3501,7 +3509,7 @@ Acceptance rc.3 (додатково до сценаріїв rc.2): на legacy-�
 ## 5.2.1-rc.2 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.3)
 
 Hotfix-кандидат лінії 5.2.x = rc.1 + другий операторський фікс,
-відтворений власником на тому самому сервері (Тернопіль):
+відтворений власником на тому самому сервері (Лабораторія-12):
 
 - **FIX (dry-run, операторський UX):** тестове повідомлення
   `-SendTestNotification` надходило в ALERTS замість GENERAL —
@@ -3527,7 +3535,7 @@ Hotfix-кандидат лінії 5.2.x (гілка `hotfix/5.2.1` від stabl
 
 - **FIX (maintenance, операторський UX):** «Реставрацію пропущено: ...
   поза дозволеним вікном» — рівень WARNING → INFO (реальний денний
-  ручний прогін ТЕРНОПІЛЬСЬКА РДЛ 2026-08-26: хибний алерт
+  ручний прогін ЛАБОРАТОРІЯ-12 2026-08-26: хибний алерт
   «ПОТРІБНА ДІЯ» з exit 10 при повністю зеленому прогоні; рішення
   власника — це штатна поведінка, слот не втрачається: підхоплюється
   нічним Maintenance у вікні або boot-Recovery). Текст у лозі доповнено
@@ -3552,7 +3560,7 @@ Acceptance: ручний денний прогін `BRAVO_MAINTENANCE.ps1` по�
 `12e6370`), артефакт BRAVO-Toolkit-5.2.0-rc.13.zip sha256
 `6eac9695ed6053e7156ff843d8b4aed8522b4627d65c95bace1bc3de5a42af22`.
 
-Real-server acceptance rc.13: PASS 2026-08-26 (`LIMS`/ДНДІЛДВСЕ —
+Real-server acceptance rc.13: PASS 2026-08-26 (`SRV-LAB6`/ЛАБОРАТОРІЯ-6 —
 повний maintenance-цикл з реставрацією, logs pipeline v2, компактні
 алерти, негативний сценарій forced+normal без повторної реставрації)
 плюс A2-encoding протокол (RELEASE_CHECKLIST §1.1) PASS в обох
@@ -3811,7 +3819,7 @@ acceptance: нові SFTP-каталоги `logs/*`, WinSCP MoveFile-мігра�
 ## 5.2.0-rc.8 — 2026-08-25 (candidate, acceptance passed)
 
 **UPD (2026-08-25 22:03-22:24): real-server acceptance реставрації
-ПРОЙДЕНО на сервері інциденту** (`LIMS`/ДНДІЛДВСЕ, `BRAVO_MAINTENANCE
+ПРОЙДЕНО на сервері інциденту** (`SRV-LAB6`/ЛАБОРАТОРІЯ-6, `BRAVO_MAINTENANCE
 -ForceRestore`): `[5/8] Реставрація моделі OK 19:22 — bravocmd exit=0 |
 RemovedByRepair=0 | Critical=0 | Rollback=NONE | MainModel=OK`; фінал
 УСПІШНО/exit 0, служби відновлено автоматично, Trace-pipeline (добовий
@@ -3820,7 +3828,7 @@ RemovedByRepair=0 | Critical=0 | Rollback=NONE | MainModel=OK`; фінал
 
 Кандидат = зміст прийнятого `v5.2.0-rc.7` (`5.2.0-rc.5` + розрахункова
 перевірка вільного місця з floor-override; повний end-to-end acceptance
-2026-08-25 на `WIN-42Q5558LQC9`) + `fix(maintenance)` нижче (PR #86).
+2026-08-25 на `SRV-LAB11`) + `fix(maintenance)` нижче (PR #86).
 Перший формальний build із гілки `developer` після злиття PR #83/#84:
 rc.6/rc.7 збирались з інтеграційної гілки `rc6-merge`, функціональний
 runtime-diff `developer` проти `v5.2.0-rc.7` до PR #86 був порожній.
@@ -3829,7 +3837,7 @@ acceptance у складі rc.7; новий у цьому кандидаті —
 
 - **FIX (data-integrity, restore/maintenance): хибний тотальний провал
   перевірки цілісності моделі після repair через регістр шляху MODEL.**
-  Реальний інцидент (ДНДІЛДВСЕ, 2026-08-25, exit 43): `bravocmd r`
+  Реальний інцидент (ЛАБОРАТОРІЯ-6, 2026-08-25, exit 43): `bravocmd r`
   завершується успішно, але `Compare-FileSizes` оголошував УСІ файли
   before-CSV відсутніми (364 CRITICAL + 182 RemovedByRepair) і після
   успішного відкату повторна перевірка знову провалювалась —
@@ -3923,8 +3931,8 @@ acceptance у складі rc.7; новий у цьому кандидаті —
 Кандидат = `5.2.0-rc.4` (нижче) + три cherry-picked фікси з локальної гілки
 `developer`, перевірені на відсутність дублювання з уже прийнятими
 origin-змінами. Acceptance пройдено на двох реальних серверах:
-`SERV_HRDL_1` (ХЕРСОНСЬКА РДЛ, rc.4) і `WIN-44OBNQ3R3OB` (МИКОЛАЇВСЬКА
-РДЛ, rc.5) — повний `BRAVO_SELF_TEST.ps1` PASSED, `BRAVO_DRY_RUN.ps1
+`SRV-LAB7` (ЛАБОРАТОРІЯ-7, rc.4) і `SRV-LAB1` (ЛАБОРАТОРІЯ-1,
+rc.5) — повний `BRAVO_SELF_TEST.ps1` PASSED, `BRAVO_DRY_RUN.ps1
 -TestAccess` без жодного FAIL, `BRAVO_TASKS_INSTALL.ps1 -ValidateOnly`
 успішний.
 
@@ -4061,7 +4069,7 @@ origin-змінами. Acceptance пройдено на двох реальни�
 ## 5.2.0-rc.3 — 2026-08-24 (candidate, pending acceptance)
 
 Кандидат зі стабілізаційними виправленнями за логами реального сервера
-(`SERV_HRDL_1`, 2026-08-24) і двома змінами поведінки на запит власника.
+(`SRV-LAB7`, 2026-08-24) і двома змінами поведінки на запит власника.
 Нових функцій немає — усе нижче або виправляє дефект, або змінює рівень/
 видимість уже наявної поведінки (розділ 3.2 `RELEASE_POLICY.md`).
 

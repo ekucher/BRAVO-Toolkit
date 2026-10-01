@@ -91,7 +91,7 @@ function Invoke-BRAVOCompareFileSizesScenario {
         [Parameter(Mandatory = $true)][hashtable]$BeforeFiles,
         [Parameter(Mandatory = $true)][hashtable]$AfterFiles,
         [string]$MainModelRelativePath,
-        # Реальний інцидент (ДНДІЛДВСЕ, 2026-08-25): bravo.ini MODEL= містить
+        # Реальний інцидент (ЛАБОРАТОРІЯ-6, 2026-08-25): bravo.ini MODEL= містить
         # шлях з іншим регістром (мала літера диска), ніж нормалізований
         # FullName від Get-ChildItem. Перемикач передає Compare-FileSizes
         # той самий каталог, але з повністю зміненим регістром рядка шляху —
@@ -390,7 +390,7 @@ Test-BRAVOCondition `
     -Name "Maintenance/CompareFileSizesTempDollarPlusMdMixed" `
     -Failure "змішаний: DEPART.md = CRITICAL, KZPpat.`$`$`$ = RemovedByRepair(1); отримано HasCriticalChanges=$($resultTempAndMd.HasCriticalChanges), RemovedByRepairCount=$($resultTempAndMd.RemovedByRepairCount)"
 
-# --- Регресія реального інциденту (ДНДІЛДВСЕ, 2026-08-25, exit 43):
+# --- Регресія реального інциденту (ЛАБОРАТОРІЯ-6, 2026-08-25, exit 43):
 # bravo.ini MODEL= з малою літерою диска ("d:\LIMS\Model"), Get-ChildItem
 # нормалізує FullName до "D:\...", ordinal Replace НЕ зрізав корінь, ключі
 # lookup ставали абсолютними шляхами і ВСІ 546 файлів before-CSV оголошувались
@@ -563,7 +563,7 @@ Test-BRAVOCondition `
 # --- Викликач деривує hint від MAIN_MODEL_FILE тим самим канонічним правилом
 # Get-BRAVOModelRelativePath, що й writer before-CSV та lookup у
 # Compare-FileSizes, а не здогадом "$MODEL_NAME.md" і не ordinal Replace
-# (регістрочутливий Replace — корінь інциденту ДНДІЛДВСЕ 2026-08-25).
+# (регістрочутливий Replace — корінь інциденту ЛАБОРАТОРІЯ-6 2026-08-25).
 Test-BRAVOCondition `
     -Condition (
         $maintenanceRepairScriptText.Contains(
