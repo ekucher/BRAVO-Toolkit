@@ -2670,10 +2670,15 @@ function Test-RangeIdUsage {
         }
 
     $sourceFileName = [System.IO.Path]::GetFileName($Path)
+    # `time` необов'язкове: під StrictMode 2.0 пряме $rangeData.time для
+    # відсутньої властивості кидає виняток (обрив нічного прогону), тому
+    # читаємо через PSObject.Properties, як і решту полів.
+    $rangeTimeProperty = $rangeData.PSObject.Properties['time']
+    $rangeTime = if ($rangeTimeProperty) { $rangeTimeProperty.Value } else { $null }
     $message = "Перевищено поріг використання діапазонів ID (${thresholdText}%):`n$($alertLines -join "`n")"
     $message += "`nФайл: $sourceFileName"
-    if ($rangeData.time) {
-        $message += "`nЧас оновлення даних: $($rangeData.time)"
+    if ($rangeTime) {
+        $message += "`nЧас оновлення даних: $rangeTime"
     }
 
     # Повний перелік діапазонів — у журналі; операторський alert —
@@ -2688,8 +2693,8 @@ function Test-RangeIdUsage {
         ''
         "Файл: $sourceFileName"
     )
-    if ($rangeData.time) {
-        $rangeAlertCompactLines += "Час оновлення даних: $($rangeData.time)"
+    if ($rangeTime) {
+        $rangeAlertCompactLines += "Час оновлення даних: $rangeTime"
     }
 
     Write-Log $message -Level "WARNING" -NoConsole
@@ -5765,7 +5770,7 @@ function Resolve-BRAVOExchangeApiRuntimeDirectory {
 # Ordinal String.Replace на такому розсинхроні мовчки НЕ зрізав корінь,
 # ключі порівняння ставали абсолютними шляхами і ВСІ файли before-CSV
 # оголошувались відсутніми — хибний CRITICAL + rollback (реальний інцидент
-# ДНДІЛДВСЕ 2026-08-25, exit 43). Windows-шляхи регістронезалежні, тому
+# ЛАБОРАТОРІЯ-6 2026-08-25, exit 43). Windows-шляхи регістронезалежні, тому
 # OrdinalIgnoreCase тут коректний і не залежить від локалі ОС.
 function Get-BRAVOModelRelativePath {
     param(
@@ -5890,7 +5895,7 @@ function Compare-FileSizes {
         # Пряма .NET enumeration замість Get-BRAVOFiles/Get-ChildItem -Recurse
         # (порт f7f6628): PowerShell-провайдер на великих/глибоких деревах з
         # -ErrorAction SilentlyContinue мовчки повертав НЕПОВНИЙ список —
-        # реальний детермінований інцидент ДНДІЛДВСЕ 2026-08-24 (~364 «зниклі»
+        # реальний детермінований інцидент ЛАБОРАТОРІЯ-6 2026-08-24 (~364 «зниклі»
         # файли 4/4 рази, незалежно від settle-вікна, дані фізично цілі).
         # Той самий канонічний механізм, що вже використовують дві інші
         # enumeration-точки цього flow (Check-MdFileSizes і before-CSV
@@ -7980,7 +7985,7 @@ if ($BravoMaintenanceEnabled) {
     # би лише "ВИМКНЕНА" й не мав би причини.
     #
     # INFO, не WARNING (5.2.1; рішення власника після реального прогону
-    # ТЕРНОПІЛЬСЬКА РДЛ 2026-08-26 16:42): ручний денний прогін Maintenance
+    # ЛАБОРАТОРІЯ-12 2026-08-26 16:42): ручний денний прогін Maintenance
     # поза вікном 21:00-03:00 — штатна ситуація, а не аномалія: пропущений
     # слот НЕ втрачається (його підхоплює нічний Maintenance у вікні на
     # 24/7-профілі або boot-Recovery на профілі робочого часу). WARNING тут
@@ -8008,7 +8013,7 @@ if ($BravoMaintenanceEnabled) {
         #
         # (5.2.1) Сусідня гілка $restoreSkippedByWindow тепер теж INFO — той
         # самий клас хибного «ПОТРІБНА ДІЯ», підтверджений реальним денним
-        # прогоном ТЕРНОПІЛЬСЬКА РДЛ; обґрунтування в коментарі тієї гілки.
+        # прогоном ЛАБОРАТОРІЯ-12; обґрунтування в коментарі тієї гілки.
         Write-Log -Message (
             "Примусова реставрація поза дозволеним вікном $RestoreWindowStart-$RestoreWindowEnd " +
             "(поточний час $($currentDate.ToString('HH:mm'))): служби BRAVO будуть зупинені."

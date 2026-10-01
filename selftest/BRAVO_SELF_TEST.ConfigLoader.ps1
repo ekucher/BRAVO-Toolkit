@@ -14,6 +14,7 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 — НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/OriginalExceptionMessageNotLost') { try {
 $configLoaderPath = Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'
 $configLoaderScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_CONFIG_LOADER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -569,6 +570,8 @@ try {
 } finally {
     Remove-Item -LiteralPath $busyWaitScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/OriginalExceptionMessageNotLost' } }
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic') { try {
 
 # ============================================================
 # backupMonitoring.SuccessDedupMinutes (5.2.1): loader-нормалізація вікна
@@ -1472,6 +1475,8 @@ try {
 } finally {
     Remove-Item -LiteralPath $reqAdminBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic' } }
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/RequireAdministratorMissingBlocks' -DependsOn 'ConfigLoader/OriginalExceptionMessageNotLost', 'ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic') { try {
 
 # --- ConfigLoader/RequireAdministratorMissingBlocks: викликає
 # Test-BRAVOEffectiveSecurityInvariants НАПРЯМУ у чистому процесі (без
@@ -2369,6 +2374,8 @@ Test-BRAVOCondition `
         Remove-Item -LiteralPath $strictnessBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/RequireAdministratorMissingBlocks' } }
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/Authorization' -DependsOn 'ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic') { try {
 
 # =====================================================================
 # Wave 2 (#216): атомарність авторизаційного шару BRAVO.local.config
@@ -2578,6 +2585,134 @@ try {
 }
 
 # ============================================================
+# Спільний захоплювач ПОВНОГО канонічного знімка в дочірньому процесі
+# (Proof B нижче + B7-матриця, issue #154). Один дочірній шаблон на
+# фрагмент: довільний виклик Import-BravoConfiguration ($InvocationText,
+# у scope якого доступні $RuntimeRoot/$ConfigRoot) -> ПОВНИЙ знімок
+# Get-BRAVOEffectiveConfigurationSnapshot -> CliXml. Рекурсивне
+# сплощення [pscustomobject] і вибір CliXml замість JSON — обґрунтування
+# у коментарі Proof B нижче. На помилці дитина пише повідомлення винятку
+# і (опційно) значення перелічених $global:-змінних ПІСЛЯ throw —
+# для доказу атомарності "жоден сусідній override не потрапив у стан".
+# Окремий процес на кожне захоплення: Import-BravoConfiguration
+# встановлює десятки $global:, які небезпечно змішувати між прогонами.
+# ============================================================
+function Invoke-BRAVOSelfTestEffectiveSnapshotCapture {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkRoot,
+        [Parameter(Mandatory = $true)][string]$ConfigRoot,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$InvocationText,
+        [string[]]$ProbeVariableName = @()
+    )
+
+    $childScriptPath = Join-Path $WorkRoot 'EffectiveSnapshotCaptureChild.ps1'
+    if (-not (Test-Path -LiteralPath $childScriptPath -PathType Leaf)) {
+        $childTemplate = @'
+param(
+    [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+    [Parameter(Mandatory = $true)][string]$ConfigRoot,
+    [Parameter(Mandatory = $true)][string]$InvocationPath,
+    [Parameter(Mandatory = $true)][string]$OutputPath,
+    [Parameter(Mandatory = $true)][string]$ErrorPath,
+    [string]$ProbeVariableNames = ''
+)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$WarningPreference = 'SilentlyContinue'
+try {
+    . (Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1')
+    . $InvocationPath
+    Import-Module -Name (Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Snapshot.psd1') -Force
+    function ConvertTo-ProofBComparableValue {
+        param($Value)
+        if ($null -eq $Value) { return $null }
+        if ($Value -is [System.Management.Automation.PSCustomObject]) {
+            $result = @{}
+            foreach ($property in $Value.PSObject.Properties) {
+                $result[$property.Name] = ConvertTo-ProofBComparableValue -Value $property.Value
+            }
+            return $result
+        }
+        if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string]) -and -not ($Value -is [System.Collections.IDictionary])) {
+            return ,@(@($Value) | ForEach-Object { ConvertTo-ProofBComparableValue -Value $_ })
+        }
+        return $Value
+    }
+
+    $names = @(Get-BRAVOEffectiveConfigurationVariableName)
+    $snapshot = Get-BRAVOEffectiveConfigurationSnapshot -VariableName $names
+    $captured = @{}
+    foreach ($name in $names) {
+        $captured[$name] = ConvertTo-ProofBComparableValue -Value $snapshot[$name]
+    }
+    $captured | Export-Clixml -LiteralPath $OutputPath -Depth 20
+    # Той самий канонічний перелік імен, але значення читаються напряму,
+    # без `$x = if (...) { $v.Value }` усередині
+    # Get-BRAVOEffectiveConfigurationSnapshot: вивід if-оператора йде
+    # конвеєром і для ВЕРХНЬОРІВНЕВИХ змінних-масивів розгортає @() у $null,
+    # а @('x') — у скаляр 'x' (issue #154, B7: виявлено під час
+    # характеризації, винесено окремо — не змінено тут). Для доказів, де
+    # важить саме тип масиву, B7 порівнює цей неспотворений знімок.
+    $rawCaptured = @{}
+    foreach ($name in $names) {
+        $rawVariable = Get-Variable -Name $name -Scope Global -ErrorAction SilentlyContinue
+        if ($null -eq $rawVariable) {
+            $rawCaptured[$name] = '<<ABSENT>>'
+        } else {
+            $rawCaptured[$name] = ConvertTo-ProofBComparableValue -Value $rawVariable.Value
+        }
+    }
+    $rawCaptured | Export-Clixml -LiteralPath ($OutputPath + '.raw') -Depth 20
+} catch {
+    $probeValues = @{}
+    foreach ($probeName in @($ProbeVariableNames -split ',' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        $probeVariable = Get-Variable -Name $probeName -Scope Global -ErrorAction SilentlyContinue
+        $probeValues[$probeName] = if ($null -eq $probeVariable) { '<unset>' } else { [string]$probeVariable.Value }
+    }
+    [pscustomobject]@{ Message = $_.Exception.Message; ScriptStackTrace = $_.ScriptStackTrace; ProbeValues = $probeValues } |
+        Export-Clixml -LiteralPath $ErrorPath -Depth 5
+    exit 1
+}
+'@
+        [IO.File]::WriteAllText($childScriptPath, $childTemplate, (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    $workDir = Join-Path $WorkRoot $Label
+    [void][IO.Directory]::CreateDirectory($workDir)
+    $invocationPath = Join-Path $workDir 'invocation.ps1'
+    [IO.File]::WriteAllText($invocationPath, $InvocationText, (New-Object System.Text.UTF8Encoding($false)))
+    $outputPath = Join-Path $workDir 'snapshot.clixml'
+    $errorPath = Join-Path $workDir 'error.clixml'
+    $stdoutPath = Join-Path $workDir 'stdout.log'
+    $stderrPath = Join-Path $workDir 'stderr.log'
+    $processArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $childScriptPath,
+        '-RuntimeRoot', $root, '-ConfigRoot', $ConfigRoot, '-InvocationPath', $invocationPath,
+        '-OutputPath', $outputPath, '-ErrorPath', $errorPath)
+    if (@($ProbeVariableName).Count -gt 0) {
+        $processArgs += @('-ProbeVariableNames', ([string]::Join(',', @($ProbeVariableName))))
+    }
+    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $processArgs -NoNewWindow -PassThru -Wait `
+        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+
+    $errorRecord = $null
+    if (Test-Path -LiteralPath $errorPath -PathType Leaf) {
+        $errorRecord = Import-Clixml -LiteralPath $errorPath
+    }
+    $stderrText = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { [string](Get-Content -LiteralPath $stderrPath -Raw) } else { '' }
+    $succeeded = ($process.ExitCode -eq 0) -and ($null -eq $errorRecord) -and (Test-Path -LiteralPath $outputPath -PathType Leaf)
+    return [pscustomobject]@{
+        Succeeded    = $succeeded
+        Snapshot     = $(if ($succeeded) { Import-Clixml -LiteralPath $outputPath } else { $null })
+        RawSnapshot  = $(if ($succeeded) { Import-Clixml -LiteralPath ($outputPath + '.raw') } else { $null })
+        ErrorMessage = $(if ($null -ne $errorRecord) { [string]$errorRecord.Message } else { '' })
+        ProbeValues  = $(if ($null -ne $errorRecord) { $errorRecord.ProbeValues } else { @{} })
+        ExitCode     = $process.ExitCode
+        StdErr       = $stderrText
+    }
+}
+
+# ============================================================
 # Issue #216 (Proof B, Lead-звіт 2026-09-26, §9 п.1 HIGH): permanent
 # regression-покриття емпіричного інваріанта Config V2 cutover.
 #
@@ -2654,92 +2789,22 @@ try {
         )
         [IO.File]::WriteAllText((Join-Path $proofBConfigRoot 'BRAVO.local.config'), $proofBLocalConfigLiteral, (New-Object System.Text.UTF8Encoding($false)))
 
-        $proofBChildTemplate = @'
-param(
-    [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-    [Parameter(Mandatory = $true)][string]$ConfigRoot,
-    [Parameter(Mandatory = $true)][string]$OutputPath,
-    [Parameter(Mandatory = $true)][string]$ErrorPath
-)
-Set-StrictMode -Version 2.0
-$ErrorActionPreference = 'Stop'
-$WarningPreference = 'SilentlyContinue'
-try {
-    . (Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1')
-    Import-BravoConfiguration -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot -DisallowLegacyPrimaryAutoDetect
-    Import-Module -Name (Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Snapshot.psd1') -Force
-    # Compare-BRAVOConfigurationGraph розкриває рекурсивно лише
-    # [hashtable]-вузли ("-is [hashtable]" у Add-BRAVOConfigurationGraphDifference/
-    # BRAVO.Configuration.Delta) — PSCustomObject він порівняв би одним
-    # непрозорим `-eq` на весь об'єкт (завжди "Changed" для двох різних
-    # інстансів із двох дочірніх процесів, незалежно від фактичних
-    # значень полів). У канонічному знімку [pscustomobject] зустрічається
-    # НЕ лише на верхньому рівні (BravoConfigurationMetadata/
-    # BravoLocalConfigOverrideState), а й вкладено (storageEffective.SFTP/
-    # .SMB, bazaSyncEffective.Components — Get-BRAVOEffectiveStorageConfiguration/
-    # Get-BRAVOEffectiveSynchronizationConfiguration у BRAVO.Discovery
-    # повертають [pscustomobject] на кожному рівні) — реально відтворено
-    # при розробці цього тесту: одноразове (не рекурсивне) сплощення
-    # лишало саме ці вузли непорівнюваними й давало 3 хибних "Changed".
-    # Тому конвертація — рекурсивна на будь-яку глибину, а не спеціальний
-    # випадок для двох конкретних імен.
-    function ConvertTo-ProofBComparableValue {
-        param($Value)
-        if ($null -eq $Value) { return $null }
-        if ($Value -is [System.Management.Automation.PSCustomObject]) {
-            $result = @{}
-            foreach ($property in $Value.PSObject.Properties) {
-                $result[$property.Name] = ConvertTo-ProofBComparableValue -Value $property.Value
-            }
-            return $result
-        }
-        if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string]) -and -not ($Value -is [System.Collections.IDictionary])) {
-            return ,@(@($Value) | ForEach-Object { ConvertTo-ProofBComparableValue -Value $_ })
-        }
-        return $Value
-    }
-
-    $names = @(Get-BRAVOEffectiveConfigurationVariableName)
-    $snapshot = Get-BRAVOEffectiveConfigurationSnapshot -VariableName $names
-    $captured = @{}
-    foreach ($name in $names) {
-        $captured[$name] = ConvertTo-ProofBComparableValue -Value $snapshot[$name]
-    }
-    $captured | Export-Clixml -LiteralPath $OutputPath -Depth 20
-} catch {
-    [pscustomobject]@{ Message = $_.Exception.Message; ScriptStackTrace = $_.ScriptStackTrace } |
-        Export-Clixml -LiteralPath $ErrorPath -Depth 5
-    exit 1
-}
-'@
-        $proofBChildScriptPath = Join-Path $proofBRoot 'ProofBCaptureChild.ps1'
-        [IO.File]::WriteAllText($proofBChildScriptPath, $proofBChildTemplate, (New-Object System.Text.UTF8Encoding($false)))
-
         function Invoke-BRAVOProofBCapture {
             # Окремий дочірній процес per side (той самий підхід, що й у
             # Invoke-ParityCapture ci\Test-BRAVOConfigFoundationParity.ps1):
             # Import-BravoConfiguration встановлює десятки $global:, які
             # небезпечно змішувати між CLEAN і POISONED прогонами в
-            # одному процесі.
+            # одному процесі. Сам дочірній шаблон — спільний
+            # Invoke-BRAVOSelfTestEffectiveSnapshotCapture (вище).
             param([Parameter(Mandatory = $true)][string]$ConfigRoot, [Parameter(Mandatory = $true)][string]$Label)
 
-            $workDir = Join-Path $proofBRoot $Label
-            [void][IO.Directory]::CreateDirectory($workDir)
-            $outputPath = Join-Path $workDir 'snapshot.clixml'
-            $errorPath = Join-Path $workDir 'error.clixml'
-            $stdoutPath = Join-Path $workDir 'stdout.log'
-            $stderrPath = Join-Path $workDir 'stderr.log'
-            $processArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $proofBChildScriptPath,
-                '-RuntimeRoot', $root, '-ConfigRoot', $ConfigRoot, '-OutputPath', $outputPath, '-ErrorPath', $errorPath)
-            $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $processArgs -NoNewWindow -PassThru -Wait `
-                -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-
-            if ($process.ExitCode -ne 0 -or (Test-Path -LiteralPath $errorPath -PathType Leaf)) {
-                $errorDetail = if (Test-Path -LiteralPath $errorPath -PathType Leaf) { (Import-Clixml -LiteralPath $errorPath).Message } else { '' }
-                $stderrText = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
-                throw "Invoke-BRAVOProofBCapture($Label): дочірній процес завершився з помилкою (ExitCode=$($process.ExitCode)). $errorDetail $stderrText"
+            $capture = Invoke-BRAVOSelfTestEffectiveSnapshotCapture `
+                -WorkRoot $proofBRoot -ConfigRoot $ConfigRoot -Label $Label `
+                -InvocationText 'Import-BravoConfiguration -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot -DisallowLegacyPrimaryAutoDetect'
+            if (-not $capture.Succeeded) {
+                throw "Invoke-BRAVOProofBCapture($Label): дочірній процес завершився з помилкою (ExitCode=$($capture.ExitCode)). $($capture.ErrorMessage) $($capture.StdErr)"
             }
-            return (Import-Clixml -LiteralPath $outputPath)
+            return $capture.Snapshot
         }
 
         # CLEAN-знімок ЗНІМАЄТЬСЯ ПЕРШИМ, до появи отруєного BRAVO.config —
@@ -3062,3 +3127,664 @@ try {
         -Name "ConfigLoader/MalformedLocalConfigEmptyKeyFailsClosed" `
         -Failure "BRAVO.local.config з порожнім ключем поруч із валідним override мусить fail closed ЦІЛИМ шаром (атомарно) — сусідній archiveRetentionDays=999 НЕ повинен потрапити в ефективний `$global:-стан; отримано: $malformedEmptyKeyResult"
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/Authorization' } }
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' -DependsOn 'ConfigLoader/RequireAdministratorMissingBlocks', 'ConfigLoader/Authorization') { try {
+
+# ============================================================
+# Issue #154 (B7): регресійна матриця Config V2 на 5.3-шляху.
+#
+# Усі сценарії нижче йдуть через ТОЙ САМИЙ канонічний ланцюжок, що й
+# production: Import-BravoConfiguration -DisallowLegacyPrimaryAutoDetect
+# без BRAVO.config (або з підкладеним, але заблокованим), повний знімок
+# за канонічним переліком Get-BRAVOEffectiveConfigurationVariableName
+# (спільний захоплювач Invoke-BRAVOSelfTestEffectiveSnapshotCapture вище;
+# B7 бере його RawSnapshot — без розгортання верхньорівневих масивів, див.
+# коментар у дочірньому шаблоні), порівняння —
+# Compare-BRAVOConfigurationGraph (BRAVO.Configuration.Delta), міграція —
+# реальний deploy\Get-BRAVOConfigSiteDelta.ps1. Другої моделі
+# конфігурації тут немає: жодного власного парсера чи власного переліку
+# ключів — лише канонічні Get-BRAVODefaultConfiguration,
+# Get-BRAVOConfigurationSchemaAuthorizationClass і
+# ConvertTo-BRAVOConfiguratorPowerShellLiteral.
+#
+# Категорії (нумерація — зі звіту про прогалини B7):
+#   (a) виклик Import-BravoConfiguration у кожному з чотирьох runtime-ів
+#       (і в heartbeat) дає той самий канонічний знімок, що й еталонний
+#       виклик, і не виконує підкладений BRAVO.config;
+#   (c) дозволені локальні перевизначення на 5.3-шляху: масив, явний @(),
+#       скаляри, вкладений вузол зі збереженням сусідів;
+#   (d) security-/execution-чутливі та похідні ключі через
+#       BRAVO.local.config відхиляються fail closed, без часткового
+#       застосування;
+#   (e) зіпсований/невідомий local-config — fail closed із діагностикою,
+#       що називає файл (або ConfigRoot) і ключ;
+#   (f)(g) міграція 5.2 -> 5.3 реальним інструментом: повний ефективний
+#       знімок до == після, дельта детермінована, повторна міграція вже
+#       мігрованого сервера нічого не додає.
+# Категорії (b) і (h) покриті Proof B / PostUpdateStaleConfig вище та
+# ReleaseGate/* у BRAVO_SELF_TEST.Governance.ps1.
+#
+# Окремий child scope (& { ... }): фрагменти self-test дот-сорсяться в
+# ОДИН scope і ділять ліміт $MaximumVariableCount.
+# ============================================================
+& {
+    if (-not (Get-Command -Name 'Get-BRAVODefaultConfiguration' -ErrorAction SilentlyContinue)) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
+    }
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Delta.psd1') -Force
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configurator\BRAVO.Configurator.Effective.psd1') -Force
+
+    $b7Root = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_B7_MATRIX_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($b7Root)
+    $b7Utf8 = New-Object System.Text.UTF8Encoding($false)
+    $b7Defaults = Get-BRAVODefaultConfiguration
+    $b7CanonicalInvocation = 'Import-BravoConfiguration -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot -DisallowLegacyPrimaryAutoDetect'
+    # Дочірні процеси успадковують середовище: наявний у сесії
+    # BRAVO_ALLOW_WEAKENED_SECURITY=1 відкрив би escape hatch для
+    # requireAdministrator і зробив би (d) недетермінованим.
+    $b7PreviousWeakenedSecurity = $env:BRAVO_ALLOW_WEAKENED_SECURITY
+    Remove-Item -Path 'Env:BRAVO_ALLOW_WEAKENED_SECURITY' -ErrorAction SilentlyContinue
+
+    function New-BRAVOB7ConfigRoot {
+        # Ізольований ConfigRoot з BRAVO.local.config: явний BackupRoot
+        # (герметичність на машині без LIMS — той самий прийом, що й Proof B)
+        # плюс рядки override-ів "'шлях' = літерал".
+        param(
+            [Parameter(Mandatory = $true)][string]$Name,
+            [string[]]$OverrideLine = @(),
+            [switch]$NoLocalConfig
+        )
+        $configRoot = Join-Path $b7Root $Name
+        [void][IO.Directory]::CreateDirectory($configRoot)
+        $backupDir = Join-Path $configRoot 'SITE_BACKUP'
+        [void][IO.Directory]::CreateDirectory($backupDir)
+        if (-not $NoLocalConfig) {
+            $body = "@{`r`n    'pathSettings.BackupRoot' = '$($backupDir.Replace("'", "''"))'`r`n"
+            foreach ($line in @($OverrideLine)) {
+                $body += "    $line`r`n"
+            }
+            $body += "}`r`n"
+            [IO.File]::WriteAllText((Join-Path $configRoot 'BRAVO.local.config'), $body, $b7Utf8)
+        }
+        return $configRoot
+    }
+
+    function Get-BRAVOB7DefaultLeafValue {
+        # Значення канонічного дефолту за dot-шляхом реєстру авторизації.
+        param([Parameter(Mandatory = $true)][string]$Path)
+        $node = $b7Defaults
+        foreach ($segment in $Path.Split('.')) {
+            if (-not ($node -is [System.Collections.IDictionary]) -or -not $node.Contains($segment)) {
+                throw "B7: канонічний дефолт не містить шляху '$Path' (сегмент '$segment')"
+            }
+            $node = $node[$segment]
+        }
+        return ,$node
+    }
+
+    function Get-BRAVOB7UnexpectedDifference {
+        # Відмінності повного знімка поза явним allowlist-ом dot-шляхів
+        # (точні шляхи, не префікси вузлів).
+        param($Reference, $Candidate, [string[]]$AllowedPath = @())
+        return @(Compare-BRAVOConfigurationGraph `
+                -ReferenceConfiguration $Reference `
+                -CandidateConfiguration $Candidate `
+                -IncludeMissingInCandidate |
+            Where-Object { $null -ne $_ -and $AllowedPath -notcontains $_.Path })
+    }
+
+    function Get-BRAVOB7CallSiteInvocationText {
+        # (a) Точний виклик Import-BravoConfiguration з файлу entrypoint-а
+        # (AST, Extent.Text — жодного переписування параметрів чи
+        # switch-прив'язок, зокрема -DisallowLegacyPrimaryAutoDetect[:x]).
+        # Змінні в аргументах зв'язуються за РОЛЛЮ — параметром, якому
+        # змінна передана напряму: ConfigRoot/ConfigPath/RuntimeRoot/
+        # ConfigPathWasExplicit. Змінна без ролі чи з двома ролями —
+        # явна відмова (fail closed), а не здогад.
+        param([Parameter(Mandatory = $true)][string]$RelativePath)
+
+        $sourcePath = Join-Path $root $RelativePath
+        $parseErrors = $null
+        $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$null, [ref]$parseErrors)
+        if ($parseErrors -and $parseErrors.Count -gt 0) {
+            throw "B7: не вдалося розібрати $RelativePath : $($parseErrors[0].Message)"
+        }
+        $calls = @($fileAst.FindAll({
+                    param($astNode)
+                    ($astNode -is [System.Management.Automation.Language.CommandAst]) -and
+                    [string]::Equals([string]$astNode.GetCommandName(), 'Import-BravoConfiguration', [StringComparison]::OrdinalIgnoreCase)
+                }, $true))
+        if ($calls.Count -ne 1) {
+            throw "B7: у $RelativePath очікувався рівно один виклик Import-BravoConfiguration, знайдено $($calls.Count)"
+        }
+        $call = $calls[0]
+        $literalVariableNames = @('true', 'false', 'null')
+        $switchParameterNames = @('ConfigPathWasExplicit', 'DisallowLegacyPrimaryAutoDetect', 'PassThru')
+        $bindableRoles = @('ConfigRoot', 'ConfigPath', 'RuntimeRoot', 'ConfigPathWasExplicit')
+        $roleByVariable = @{}
+        $elements = @($call.CommandElements)
+        for ($elementIndex = 1; $elementIndex -lt $elements.Count; $elementIndex++) {
+            $element = $elements[$elementIndex]
+            if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+            $argumentAst = $element.Argument
+            if ($null -eq $argumentAst -and
+                ($elementIndex + 1) -lt $elements.Count -and
+                $elements[$elementIndex + 1] -isnot [System.Management.Automation.Language.CommandParameterAst] -and
+                $switchParameterNames -notcontains $element.ParameterName) {
+                $argumentAst = $elements[$elementIndex + 1]
+            }
+            if ($argumentAst -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            $argumentVariableName = $argumentAst.VariablePath.UserPath
+            if ($literalVariableNames -contains $argumentVariableName) { continue }
+            if ($roleByVariable.ContainsKey($argumentVariableName) -and $roleByVariable[$argumentVariableName] -ne $element.ParameterName) {
+                throw "B7: у $RelativePath змінна `$$argumentVariableName передана двом параметрам ($($roleByVariable[$argumentVariableName]), $($element.ParameterName)) — роль неоднозначна"
+            }
+            $roleByVariable[$argumentVariableName] = $element.ParameterName
+        }
+        $callStartOffset = $call.Extent.StartOffset
+        $invocationText = $call.Extent.Text
+        $variableAsts = @($call.FindAll({ param($astNode) $astNode -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
+            Where-Object { $literalVariableNames -notcontains $_.VariablePath.UserPath } |
+            Sort-Object -Property { $_.Extent.StartOffset } -Descending)
+        foreach ($variableAst in $variableAsts) {
+            $variableName = $variableAst.VariablePath.UserPath
+            if (-not $roleByVariable.ContainsKey($variableName) -or $bindableRoles -notcontains $roleByVariable[$variableName]) {
+                throw "B7: у $RelativePath змінна `$$variableName не має однозначної ролі серед $($bindableRoles -join '/') — виклик не можна відтворити поведінково"
+            }
+            $relativeStart = $variableAst.Extent.StartOffset - $callStartOffset
+            $invocationText = $invocationText.Substring(0, $relativeStart) + '$b7Bind' + $roleByVariable[$variableName] +
+                $invocationText.Substring($relativeStart + $variableAst.Extent.Text.Length)
+        }
+        # Контекст AUTO-наміру: оператор -ConfigPath не задавав, entrypoint
+        # сам вивів <ConfigRoot>\BRAVO.config — рівно той випадок, коли
+        # підкладений файл міг би виконатись без наміру оператора.
+        return (
+            "`$b7BindConfigRoot = `$ConfigRoot`r`n" +
+            "`$b7BindConfigPath = Join-Path `$ConfigRoot 'BRAVO.config'`r`n" +
+            "`$b7BindRuntimeRoot = `$RuntimeRoot`r`n" +
+            "`$b7BindConfigPathWasExplicit = `$false`r`n" +
+            $invocationText + "`r`n"
+        )
+    }
+
+    try {
+        # ==========================================================
+        # (a) Виклик кожного runtime-а -> канонічний знімок + Proof B.
+        # ==========================================================
+        $b7CallSiteRoot = New-BRAVOB7ConfigRoot -Name 'CALLSITE'
+        $b7CallSiteReference = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7CallSiteRoot `
+            -Label 'CALLSITE_REFERENCE' -InvocationText $b7CanonicalInvocation
+        if (-not $b7CallSiteReference.Succeeded) {
+            throw "B7(a): еталонний знімок не знято: $($b7CallSiteReference.ErrorMessage) $($b7CallSiteReference.StdErr)"
+        }
+        $b7PoisonBackupDir = Join-Path $b7CallSiteRoot 'POISON_BACKUP'
+        [void][IO.Directory]::CreateDirectory($b7PoisonBackupDir)
+        $b7BackupRootLiteralLine = '    BackupRoot    = ""'
+        $b7LegacyText = Get-BRAVOSelfTestLegacyConfigText
+        if (-not $b7LegacyText.Contains($b7BackupRootLiteralLine)) {
+            throw "B7: у legacy-фікстурі не знайдено рядок '$b7BackupRootLiteralLine' — оновіть підготовку B7-сценаріїв"
+        }
+        [IO.File]::WriteAllText(
+            (Join-Path $b7CallSiteRoot 'BRAVO.config'),
+            ($b7LegacyText.Replace($b7BackupRootLiteralLine, "    BackupRoot    = '$($b7PoisonBackupDir.Replace("'", "''"))'") +
+                "`r`n`$global:logRetentionDays = 999`r`n`$global:bravoSettings['InstitutionName'] = 'B7_POISONED_INSTITUTION'`r`n"),
+            $b7Utf8)
+
+        # Контроль (не тавтологія): БЕЗ прапорця той самий файл реально
+        # читається й змінює ефективні значення.
+        $b7PoisonControl = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7CallSiteRoot `
+            -Label 'CALLSITE_POISON_CONTROL' -InvocationText 'Import-BravoConfiguration -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot'
+        Test-BRAVOCondition `
+            -Condition (
+                $b7PoisonControl.Succeeded -and
+                [string]$b7PoisonControl.RawSnapshot['logRetentionDays'] -eq '999' -and
+                [string]$b7PoisonControl.RawSnapshot['bravoSettings']['InstitutionName'] -eq 'B7_POISONED_INSTITUTION'
+            ) `
+            -Name 'ConfigLoader/B7CallSitePoisonControlIsLiveWithoutFlag' `
+            -Failure "контроль (a): без -DisallowLegacyPrimaryAutoDetect підкладений BRAVO.config мусить реально діяти (logRetentionDays=999), інакше перевірки call-site нижче нічого не доводять; Succeeded=$($b7PoisonControl.Succeeded) $($b7PoisonControl.ErrorMessage)"
+
+        $b7CallSiteTargets = [ordered]@{
+            'ArchiveRuntime'      = 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'
+            'MaintenanceRuntime'  = 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'
+            'HealthRuntime'       = 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'
+            'DataRestoreRuntime'  = 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1'
+            'OperationsHeartbeat' = 'BRAVO_OPERATIONS_HEARTBEAT.ps1'
+        }
+        $b7ProofBProvenancePaths = @(
+            'BravoConfigurationMetadata.LoadedAt',
+            'BravoConfigurationMetadata.PrimaryConfigPresentOnDisk',
+            'BravoConfigurationMetadata.PrimaryConfigAutoDetectBlocked'
+        )
+        foreach ($b7CallSiteName in @($b7CallSiteTargets.Keys)) {
+            $b7CallSiteRelativePath = $b7CallSiteTargets[$b7CallSiteName]
+            $b7CallSiteError = ''
+            $b7CallSiteUnexpected = @()
+            $b7CallSiteBlocked = $false
+            try {
+                $b7CallSiteInvocation = Get-BRAVOB7CallSiteInvocationText -RelativePath $b7CallSiteRelativePath
+                $b7CallSiteCapture = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7CallSiteRoot `
+                    -Label "CALLSITE_$b7CallSiteName" -InvocationText $b7CallSiteInvocation
+                if ($b7CallSiteCapture.Succeeded) {
+                    $b7CallSiteBlocked = ($b7CallSiteCapture.RawSnapshot['BravoConfigurationMetadata']['PrimaryConfigAutoDetectBlocked'] -eq $true)
+                    $b7CallSiteUnexpected = @(Get-BRAVOB7UnexpectedDifference `
+                            -Reference $b7CallSiteReference.RawSnapshot -Candidate $b7CallSiteCapture.RawSnapshot -AllowedPath $b7ProofBProvenancePaths)
+                } else {
+                    $b7CallSiteError = "$($b7CallSiteCapture.ErrorMessage) $($b7CallSiteCapture.StdErr)"
+                }
+            } catch {
+                $b7CallSiteError = $_.Exception.Message
+            }
+            Test-BRAVOCondition `
+                -Condition ([string]::IsNullOrEmpty($b7CallSiteError) -and $b7CallSiteBlocked -and $b7CallSiteUnexpected.Count -eq 0) `
+                -Name "ConfigLoader/B7CallSiteCanonicalSnapshot$b7CallSiteName" `
+                -Failure (
+                    "точний виклик Import-BravoConfiguration з $b7CallSiteRelativePath (AUTO-намір, підкладений BRAVO.config поруч) мусить " +
+                    "дати ТОЙ САМИЙ повний знімок, що й еталон -DisallowLegacyPrimaryAutoDetect, з заблокованим auto-detect; " +
+                    "помилка='$b7CallSiteError' Blocked=$b7CallSiteBlocked, неочікуваних відмінностей $($b7CallSiteUnexpected.Count): " +
+                    (($b7CallSiteUnexpected | ForEach-Object { "$($_.Path) [$($_.Kind)]" }) -join '; ')
+                )
+        }
+
+        # ==========================================================
+        # (c) Дозволені перевизначення на 5.3-шляху.
+        # ==========================================================
+        $b7OverrideRoot = New-BRAVOB7ConfigRoot -Name 'OVERRIDES' -OverrideLine @(
+            "'maintenanceSettings.Limits.ExcludedDrives' = @('X:\', 'Y:\')",
+            "'maintenanceSettings.Limits.MdFileSizeExclusions' = @('B7ONLY.md')",
+            "'lunchArchiveCleanupDirectories' = @()",
+            "'archiveRetentionDays' = 200",
+            "'enableOrphanTempCleanup' = `$false",
+            "'sftpHostTemplate' = '{0}.b7-selftest.test'",
+            "'bravoSettings.NotificationRouting' = @{ 'SUCCESS' = 'alerts' }"
+        )
+        $b7Override = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7OverrideRoot `
+            -Label 'OVERRIDES' -InvocationText $b7CanonicalInvocation
+        $b7OverrideSnapshot = if ($b7Override.Succeeded) { $b7Override.RawSnapshot } else { @{} }
+        $b7OverrideFailureContext = "Succeeded=$($b7Override.Succeeded) $($b7Override.ErrorMessage)"
+
+        $b7OverrideMetadataOk = $false
+        if ($b7Override.Succeeded) {
+            $b7OverrideMetadata = $b7OverrideSnapshot['BravoConfigurationMetadata']
+            $b7ExpectedOverrideKeys = @(
+                'archiveRetentionDays', 'bravoSettings.NotificationRouting', 'enableOrphanTempCleanup',
+                'lunchArchiveCleanupDirectories', 'maintenanceSettings.Limits.ExcludedDrives',
+                'maintenanceSettings.Limits.MdFileSizeExclusions', 'pathSettings.BackupRoot', 'sftpHostTemplate'
+            )
+            $b7ActualOverrideKeys = @(@($b7OverrideMetadata['LocalConfigOverrides']) | Sort-Object)
+            $b7OverrideMetadataOk = (
+                [string]$b7OverrideMetadata['Format'] -eq 'synthetic-no-config' -and
+                $b7OverrideMetadata['PrimaryConfigPresent'] -eq $false -and
+                $b7OverrideMetadata['PrimaryConfigPresentOnDisk'] -eq $false -and
+                (($b7ActualOverrideKeys -join '|') -eq (($b7ExpectedOverrideKeys | Sort-Object) -join '|'))
+            )
+        }
+        Test-BRAVOCondition `
+            -Condition $b7OverrideMetadataOk `
+            -Name 'ConfigLoader/B7LocalOverridesLoadOnPure53Path' `
+            -Failure "BRAVO.local.config без BRAVO.config на диску мусить завантажуватись як synthetic-no-config і обліковувати рівно 8 перевизначених шляхів; $b7OverrideFailureContext"
+
+        $b7OverrideLimits = if ($b7Override.Succeeded) { $b7OverrideSnapshot['maintenanceSettings']['Limits'] } else { @{} }
+        $b7DefaultLimits = $b7Defaults['maintenanceSettings']['Limits']
+        Test-BRAVOCondition `
+            -Condition (
+                $b7Override.Succeeded -and
+                (@($b7OverrideLimits['ExcludedDrives']) -join '|') -eq 'X:\|Y:\' -and
+                (@($b7OverrideLimits['MdFileSizeExclusions']) -join '|') -eq 'B7ONLY.md' -and
+                (@($b7DefaultLimits['MdFileSizeExclusions']) -join '|') -ne 'B7ONLY.md'
+            ) `
+            -Name 'ConfigLoader/B7LocalOverrideArrayReplacesDefaultOn53Path' `
+            -Failure "масив із BRAVO.local.config мусить ЗАМІНЮВАТИ дефолт (не доповнювати): ExcludedDrives='$(@($b7OverrideLimits['ExcludedDrives']) -join '|')' MdFileSizeExclusions='$(@($b7OverrideLimits['MdFileSizeExclusions']) -join '|')'; $b7OverrideFailureContext"
+
+        # Пряме присвоєння, а не `$x = if (...) { ... }`: вивід if-оператора
+        # іде конвеєром і розгорнув би порожній масив у $null.
+        $b7EmptyArrayValue = $null
+        if ($b7Override.Succeeded) { $b7EmptyArrayValue = $b7OverrideSnapshot['lunchArchiveCleanupDirectories'] }
+        Test-BRAVOCondition `
+            -Condition (
+                $b7Override.Succeeded -and
+                $null -ne $b7EmptyArrayValue -and
+                $b7EmptyArrayValue -isnot [string] -and
+                @($b7EmptyArrayValue).Count -eq 0 -and
+                @($b7Defaults['lunchArchiveCleanupDirectories']).Count -gt 0
+            ) `
+            -Name 'ConfigLoader/B7LocalOverrideExplicitEmptyArrayOn53Path' `
+            -Failure "явний @() у BRAVO.local.config мусить давати порожній масив, а не успадкований дефолт ($(@($b7Defaults['lunchArchiveCleanupDirectories']) -join ',')); отримано '$(@($b7EmptyArrayValue) -join ',')' (null=$($null -eq $b7EmptyArrayValue)); $b7OverrideFailureContext"
+
+        Test-BRAVOCondition `
+            -Condition (
+                $b7Override.Succeeded -and
+                (Get-BRAVOParityValueKind -Value $b7OverrideSnapshot['archiveRetentionDays']) -eq 'Number' -and
+                [int]$b7OverrideSnapshot['archiveRetentionDays'] -eq 200 -and
+                [int]$b7Defaults['archiveRetentionDays'] -ne 200 -and
+                $b7OverrideSnapshot['enableOrphanTempCleanup'] -is [bool] -and
+                $b7OverrideSnapshot['enableOrphanTempCleanup'] -eq $false -and
+                $b7Defaults['enableOrphanTempCleanup'] -eq $true -and
+                $b7OverrideSnapshot['sftpHostTemplate'] -is [string] -and
+                $b7OverrideSnapshot['sftpHostTemplate'] -eq '{0}.b7-selftest.test'
+            ) `
+            -Name 'ConfigLoader/B7LocalOverrideScalarsOn53Path' `
+            -Failure "скаляри з BRAVO.local.config (int/bool/string) мусять потрапити в ефективний стан зі збереженням типу; archiveRetentionDays='$($b7OverrideSnapshot['archiveRetentionDays'])' enableOrphanTempCleanup='$($b7OverrideSnapshot['enableOrphanTempCleanup'])' sftpHostTemplate='$($b7OverrideSnapshot['sftpHostTemplate'])'; $b7OverrideFailureContext"
+
+        $b7NestedSiblingDiffs = New-Object System.Collections.Generic.List[string]
+        if ($b7Override.Succeeded) {
+            $b7OverrideRouting = $b7OverrideSnapshot['bravoSettings']['NotificationRouting']
+            $b7DefaultRouting = $b7Defaults['bravoSettings']['NotificationRouting']
+            if ([string]$b7OverrideRouting['SUCCESS'] -ne 'alerts' -or [string]$b7DefaultRouting['SUCCESS'] -eq 'alerts') {
+                [void]$b7NestedSiblingDiffs.Add("NotificationRouting.SUCCESS='$($b7OverrideRouting['SUCCESS'])' (дефолт '$($b7DefaultRouting['SUCCESS'])')")
+            }
+            foreach ($b7RoutingKey in @($b7DefaultRouting.Keys)) {
+                if ($b7RoutingKey -eq 'SUCCESS') { continue }
+                if ([string]$b7OverrideRouting[$b7RoutingKey] -ne [string]$b7DefaultRouting[$b7RoutingKey]) {
+                    [void]$b7NestedSiblingDiffs.Add("NotificationRouting.$b7RoutingKey")
+                }
+            }
+            foreach ($b7LimitsKey in @($b7DefaultLimits.Keys)) {
+                if (@('ExcludedDrives', 'MdFileSizeExclusions') -contains $b7LimitsKey) { continue }
+                if ([string]$b7OverrideLimits[$b7LimitsKey] -ne [string]$b7DefaultLimits[$b7LimitsKey]) {
+                    [void]$b7NestedSiblingDiffs.Add("maintenanceSettings.Limits.$b7LimitsKey")
+                }
+            }
+        } else {
+            [void]$b7NestedSiblingDiffs.Add('capture failed')
+        }
+        Test-BRAVOCondition `
+            -Condition ($b7NestedSiblingDiffs.Count -eq 0) `
+            -Name 'ConfigLoader/B7LocalOverrideNestedNodePreservesSiblingsOn53Path' `
+            -Failure "вкладений вузол із BRAVO.local.config мусить змінювати лише перевизначені листи, а сусідні листи того самого вузла — лишати канонічними; розбіжності: $($b7NestedSiblingDiffs -join ', '); $b7OverrideFailureContext"
+
+        # (d), позитивний бік: похідні security-значення на чистому
+        # 5.3-графі обчислюються канонічно від RuntimeRoot — їх не можна
+        # задати конфігурацією (див. негативні сценарії нижче).
+        $b7ToolIntegrity = if ($b7Override.Succeeded) { $b7OverrideSnapshot['toolIntegritySettings'] } else { @{} }
+        Test-BRAVOCondition `
+            -Condition (
+                $b7Override.Succeeded -and
+                [string]$b7ToolIntegrity['Mode'] -eq 'Enforce' -and
+                [string]$b7ToolIntegrity['ManifestPath'] -eq (Join-Path (Join-Path $root 'Tools') 'TOOLS_MANIFEST.json')
+            ) `
+            -Name 'ConfigLoader/B7ToolIntegrityDerivedCanonicallyOn53Path' `
+            -Failure "toolIntegritySettings на 5.3-шляху мусить бути канонічною деривацією (Mode=Enforce, ManifestPath=<RuntimeRoot>\Tools\TOOLS_MANIFEST.json); отримано Mode='$($b7ToolIntegrity['Mode'])' ManifestPath='$($b7ToolIntegrity['ManifestPath'])'; $b7OverrideFailureContext"
+
+        # ==========================================================
+        # (d) Security-/execution-чутливі та похідні ключі.
+        # ==========================================================
+        # Кожен DENY_*-лист канонічного реєстру авторизації, заданий РІВНО
+        # своїм дефолтним значенням (не послабленням): відмова мусить
+        # залежати від класу листа, а не від запропонованого значення.
+        # Перелік береться з реєстру, тож новий DENY-лист покривається
+        # автоматично. Сусідній дозволений override (archiveRetentionDays)
+        # доводить атомарність: жоден лист зі шару не застосовано.
+        $b7AuthorizationClass = Get-BRAVOConfigurationSchemaAuthorizationClass
+        $b7DenyLeaves = @(@($b7AuthorizationClass.Keys) | Where-Object { ([string]$b7AuthorizationClass[$_].Class).StartsWith('DENY_') } | Sort-Object)
+        $b7DenyLines = New-Object System.Collections.Generic.List[string]
+        foreach ($b7DenyLeaf in $b7DenyLeaves) {
+            $b7DenyLiteral = ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value (Get-BRAVOB7DefaultLeafValue -Path $b7DenyLeaf)
+            [void]$b7DenyLines.Add("'$b7DenyLeaf' = $b7DenyLiteral")
+        }
+        [void]$b7DenyLines.Add("'archiveRetentionDays' = 999")
+        $b7DenyRoot = New-BRAVOB7ConfigRoot -Name 'DENY_LEAVES' -OverrideLine $b7DenyLines.ToArray()
+        $b7Deny = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7DenyRoot `
+            -Label 'DENY_LEAVES' -InvocationText $b7CanonicalInvocation -ProbeVariableName @('archiveRetentionDays')
+        $b7DenyUnnamed = @($b7DenyLeaves | Where-Object {
+                -not ($b7Deny.ErrorMessage -match ('(^|[\s\u2014.])' + [regex]::Escape($_) + ': '))
+            })
+        Test-BRAVOCondition `
+            -Condition (
+                $b7DenyLeaves.Count -gt 0 -and
+                @($b7DenyLeaves | Where-Object { $b7AuthorizationClass[$_].Class -eq 'DENY_SECURITY_CONTROL' }).Count -gt 0 -and
+                -not $b7Deny.Succeeded -and
+                $b7DenyUnnamed.Count -eq 0 -and
+                [string]$b7Deny.ProbeValues['archiveRetentionDays'] -ne '999'
+            ) `
+            -Name 'ConfigLoader/B7LocalConfigDenyClassLeavesRejectedEvenAtDefault' `
+            -Failure "кожен із $($b7DenyLeaves.Count) DENY_*-листів реєстру авторизації, заданий через BRAVO.local.config навіть власним дефолтним значенням, мусить відхилятись fail closed і бути названим у діагностиці, без часткового застосування сусіднього archiveRetentionDays; Succeeded=$($b7Deny.Succeeded), не названо: $($b7DenyUnnamed -join ', '), archiveRetentionDays після відмови='$($b7Deny.ProbeValues['archiveRetentionDays'])', повідомлення: $($b7Deny.ErrorMessage)"
+
+        # Похідні ключі, яких немає в канонічній схемі (їх обчислює
+        # Resolve-BRAVOConfigurationDerivation від RuntimeRoot/%ProgramData%):
+        # цілісність інструментів (T001/PR #272 — ManifestPath сьогодні
+        # конфігурацією не перевизначається), шляхи виконуваних файлів,
+        # стан і lock. Очікувана канонічна поведінка — unknown key, fail closed.
+        $b7DerivedKeys = @(
+            'toolIntegritySettings.ManifestPath',
+            'toolIntegritySettings.Mode',
+            'toolsPath',
+            'arcPath',
+            'winSCPPath',
+            'winSCPAssemblyPath',
+            'stateRoot',
+            'operationLockSettings.Path',
+            'runtimeLogRoot'
+        )
+        $b7DerivedLines = New-Object System.Collections.Generic.List[string]
+        $b7DerivedValue = (Join-Path $b7Root 'B7_REDIRECTED').Replace("'", "''")
+        foreach ($b7DerivedKey in $b7DerivedKeys) {
+            $b7DerivedLiteral = if ($b7DerivedKey -eq 'toolIntegritySettings.Mode') { "'Warn'" } else { "'$b7DerivedValue'" }
+            [void]$b7DerivedLines.Add("'$b7DerivedKey' = $b7DerivedLiteral")
+        }
+        [void]$b7DerivedLines.Add("'archiveRetentionDays' = 999")
+        $b7DerivedRoot = New-BRAVOB7ConfigRoot -Name 'DERIVED_KEYS' -OverrideLine $b7DerivedLines.ToArray()
+        $b7Derived = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7DerivedRoot `
+            -Label 'DERIVED_KEYS' -InvocationText $b7CanonicalInvocation -ProbeVariableName @('archiveRetentionDays')
+        $b7DerivedUnnamed = @($b7DerivedKeys | Where-Object { -not $b7Derived.ErrorMessage.Contains($_) })
+        Test-BRAVOCondition `
+            -Condition (
+                -not $b7Derived.Succeeded -and
+                $b7Derived.ErrorMessage.Contains('Невідомий(і) ключ(і) конфігурації') -and
+                $b7DerivedUnnamed.Count -eq 0 -and
+                [string]$b7Derived.ProbeValues['archiveRetentionDays'] -ne '999'
+            ) `
+            -Name 'ConfigLoader/B7LocalConfigDerivedSecurityKeysRejected' `
+            -Failure "похідні security-/execution-ключі (toolIntegritySettings.ManifestPath/Mode, toolsPath, шляхи виконуваних файлів, stateRoot, operationLockSettings.Path, runtimeLogRoot) через BRAVO.local.config мусять відхилятись як не-raw-configurable, без часткового застосування; Succeeded=$($b7Derived.Succeeded), не названо: $($b7DerivedUnnamed -join ', '), archiveRetentionDays після відмови='$($b7Derived.ProbeValues['archiveRetentionDays'])', повідомлення: $($b7Derived.ErrorMessage)"
+
+        # Вузлова форма того самого (перезапис цілого похідного вузла).
+        $b7NodeRoot = New-BRAVOB7ConfigRoot -Name 'DERIVED_NODE' -OverrideLine @("'toolIntegritySettings' = @{ 'Mode' = 'Warn' }")
+        $b7Node = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7NodeRoot `
+            -Label 'DERIVED_NODE' -InvocationText $b7CanonicalInvocation
+        Test-BRAVOCondition `
+            -Condition (-not $b7Node.Succeeded -and $b7Node.ErrorMessage.Contains('toolIntegritySettings')) `
+            -Name 'ConfigLoader/B7LocalConfigToolIntegrityNodeRejected' `
+            -Failure "вузол toolIntegritySettings цілком через BRAVO.local.config мусить відхилятись fail closed; Succeeded=$($b7Node.Succeeded), повідомлення: $($b7Node.ErrorMessage)"
+
+        # ==========================================================
+        # (e) Зіпсований / невідомий local-config — діагностика.
+        # ==========================================================
+        $b7MalformedCases = [ordered]@{
+            'Syntax'       = @{ Body = "@{`r`n    'archiveRetentionDays' = 999`r`n"; Phrase = 'мусить бути data-only hashtable' }
+            'NonHashtable' = @{ Body = "@('archiveRetentionDays', 999)`r`n"; Phrase = 'мусить бути data-only hashtable' }
+            'EmptyKey'     = @{ Body = "@{`r`n    'archiveRetentionDays' = 999`r`n    '' = 'orphaned-value'`r`n}`r`n"; Phrase = 'порожній ключ неприпустимий' }
+        }
+        foreach ($b7MalformedName in @($b7MalformedCases.Keys)) {
+            $b7MalformedRoot = New-BRAVOB7ConfigRoot -Name "MALFORMED_$b7MalformedName" -NoLocalConfig
+            $b7MalformedPath = Join-Path $b7MalformedRoot 'BRAVO.local.config'
+            [IO.File]::WriteAllText($b7MalformedPath, [string]$b7MalformedCases[$b7MalformedName].Body, $b7Utf8)
+            $b7Malformed = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7MalformedRoot `
+                -Label "MALFORMED_$b7MalformedName" -InvocationText $b7CanonicalInvocation -ProbeVariableName @('archiveRetentionDays')
+            Test-BRAVOCondition `
+                -Condition (
+                    -not $b7Malformed.Succeeded -and
+                    $b7Malformed.ErrorMessage.Contains([string]$b7MalformedCases[$b7MalformedName].Phrase) -and
+                    $b7Malformed.ErrorMessage.Contains($b7MalformedPath) -and
+                    [string]$b7Malformed.ProbeValues['archiveRetentionDays'] -ne '999'
+                ) `
+                -Name "ConfigLoader/B7MalformedLocalConfig${b7MalformedName}NamesFileOn53Path" `
+                -Failure "зіпсований BRAVO.local.config ($b7MalformedName) на 5.3-шляху мусить fail closed з діагностикою, що називає ПОВНИЙ шлях файлу ('$b7MalformedPath') і причину, без часткового застосування; Succeeded=$($b7Malformed.Succeeded), archiveRetentionDays='$($b7Malformed.ProbeValues['archiveRetentionDays'])', повідомлення: $($b7Malformed.ErrorMessage)"
+        }
+
+        # Невідомий ключ: діагностика мусить назвати сам ключ і ConfigRoot
+        # (повідомлення схеми не містить імені файлу — див. звіт B7; тут
+        # закріплено наявний мінімум, без зміни runtime-тексту).
+        $b7UnknownRoot = New-BRAVOB7ConfigRoot -Name 'UNKNOWN_KEY' -OverrideLine @("'archiveRetentionDays' = 999", "'b7NoSuchSetting' = 1")
+        $b7Unknown = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7UnknownRoot `
+            -Label 'UNKNOWN_KEY' -InvocationText $b7CanonicalInvocation -ProbeVariableName @('archiveRetentionDays')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $b7Unknown.Succeeded -and
+                $b7Unknown.ErrorMessage.Contains('b7NoSuchSetting') -and
+                $b7Unknown.ErrorMessage.Contains($b7UnknownRoot) -and
+                [string]$b7Unknown.ProbeValues['archiveRetentionDays'] -ne '999'
+            ) `
+            -Name 'ConfigLoader/B7UnknownLocalKeyNamesKeyAndConfigRootOn53Path' `
+            -Failure "невідомий ключ у BRAVO.local.config на 5.3-шляху мусить fail closed з діагностикою, що називає ключ і ConfigRoot ('$b7UnknownRoot'), без часткового застосування; Succeeded=$($b7Unknown.Succeeded), повідомлення: $($b7Unknown.ErrorMessage)"
+
+        # ==========================================================
+        # (f)(g) Міграція 5.2 -> 5.3 реальним інструментом.
+        # ==========================================================
+        # Репрезентативний 5.2-сервер: заморожений legacy-текст + типові
+        # site-перевизначення (той самий клас, що на пілотному сервері).
+        $b7MigrationRoot = New-BRAVOB7ConfigRoot -Name 'MIGRATION' -NoLocalConfig
+        $b7MigrationBackupDir = Join-Path $b7MigrationRoot 'SITE_BACKUP'
+        $b7MigrationLunchDir = Join-Path $b7MigrationRoot 'LUNCH'
+        [void][IO.Directory]::CreateDirectory($b7MigrationLunchDir)
+        $b7MigrationLegacyText = $b7LegacyText.Replace(
+            $b7BackupRootLiteralLine,
+            "    BackupRoot    = '$($b7MigrationBackupDir.Replace("'", "''"))'"
+        ) + "`r`n" +
+            "`$global:hostInformationSettings['PublicIPLookupEnabled'] = `$false`r`n" +
+            "`$global:lunchArchiveCleanupPath = '$($b7MigrationLunchDir.Replace("'", "''"))'`r`n" +
+            "`$global:maintenanceSettings['Limits']['ExcludedDrives'] = @('X:\', 'Y:\')`r`n" +
+            "`$global:maintenanceSettings['Restore']['Time'] = '22:30'`r`n" +
+            "`$global:smbSettings['RootPath'] = '\\server\bravo-b7'`r`n" +
+            "`$global:archiveRetentionDays = 365`r`n" +
+            "`$global:lunchArchiveCleanupDirectories = @('MODEL')`r`n"
+        $b7MigrationLegacyPath = Join-Path $b7MigrationRoot 'BRAVO.config'
+        [IO.File]::WriteAllText($b7MigrationLegacyPath, $b7MigrationLegacyText, $b7Utf8)
+
+        # BEFORE: так, як сервер 5.2 бачить себе сьогодні (legacy-primary,
+        # auto-detect — санкціонований шлях migration-інструментів).
+        $b7Before = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7MigrationRoot `
+            -Label 'MIGRATION_BEFORE' -InvocationText 'Import-BravoConfiguration -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot'
+        if (-not $b7Before.Succeeded) {
+            throw "B7(f): знімок BEFORE не знято: $($b7Before.ErrorMessage) $($b7Before.StdErr)"
+        }
+
+        $b7DeltaToolPath = Join-Path $root 'deploy\Get-BRAVOConfigSiteDelta.ps1'
+        $b7PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        function Invoke-BRAVOB7SiteDelta {
+            param([Parameter(Mandatory = $true)][string]$OutputPath)
+            # Локально (scope функції): у Windows PowerShell 5.1 рядок stderr
+            # нативного процесу під 2>&1 і 'Stop' став би термінуючим
+            # NativeCommandError — справжній gate тут ExitCode нижче.
+            $ErrorActionPreference = 'Continue'
+            $deltaOutput = [string](& $b7PowerShellExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                    -File $b7DeltaToolPath -RuntimeRoot $root -ConfigRoot $b7MigrationRoot -OutputPath $OutputPath 2>&1 | Out-String)
+            return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $deltaOutput }
+        }
+
+        # (g1) Детермінованість: два прогони на тому самому 5.2-вході дають
+        # той самий текст (окрім рядка з часом генерації в заголовку).
+        $b7Delta1Path = Join-Path $b7Root 'delta1.local.config'
+        $b7Delta2Path = Join-Path $b7Root 'delta2.local.config'
+        $b7Delta1 = Invoke-BRAVOB7SiteDelta -OutputPath $b7Delta1Path
+        $b7Delta2 = Invoke-BRAVOB7SiteDelta -OutputPath $b7Delta2Path
+        $b7Delta1Lines = if (Test-Path -LiteralPath $b7Delta1Path -PathType Leaf) { @([IO.File]::ReadAllText($b7Delta1Path, [Text.Encoding]::UTF8) -split "`r?`n") } else { @() }
+        $b7Delta2Lines = if (Test-Path -LiteralPath $b7Delta2Path -PathType Leaf) { @([IO.File]::ReadAllText($b7Delta2Path, [Text.Encoding]::UTF8) -split "`r?`n") } else { @() }
+        Test-BRAVOCondition `
+            -Condition (
+                $b7Delta1.ExitCode -eq 0 -and $b7Delta2.ExitCode -eq 0 -and
+                $b7Delta1Lines.Count -gt 2 -and
+                (@($b7Delta1Lines | Select-Object -Skip 1) -join "`n") -eq (@($b7Delta2Lines | Select-Object -Skip 1) -join "`n")
+            ) `
+            -Name 'ConfigLoader/B7MigrationDeltaIsDeterministic' `
+            -Failure "deploy\Get-BRAVOConfigSiteDelta.ps1 на тому самому 5.2-вході мусить давати ідентичний BRAVO.local.config (окрім часу генерації); ExitCode=$($b7Delta1.ExitCode)/$($b7Delta2.ExitCode); вивід: $($b7Delta1.Output) | $($b7Delta2.Output)"
+
+        # Міграція: згенерований текст стає BRAVO.local.config, BRAVO.config
+        # ретирується (прибирається з ConfigRoot).
+        $b7RetiredLegacyPath = Join-Path $b7Root 'BRAVO.config.retired'
+        if (Test-Path -LiteralPath $b7Delta1Path -PathType Leaf) {
+            Copy-Item -LiteralPath $b7Delta1Path -Destination (Join-Path $b7MigrationRoot 'BRAVO.local.config')
+        }
+        Move-Item -LiteralPath $b7MigrationLegacyPath -Destination $b7RetiredLegacyPath
+
+        # AFTER: чистий 5.3-шлях.
+        $b7After = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7MigrationRoot `
+            -Label 'MIGRATION_AFTER' -InvocationText $b7CanonicalInvocation
+        # Точковий allowlist — лише поля, що описують СПОСІБ композиції
+        # (legacy-primary -> built-in + local) і час прогону; жодного
+        # ефективного значення конфігурації. Той самий принцип, що
+        # $knownAbsentIntentionalDiffPrefixes у
+        # ci\Test-BRAVOConfigFoundationParity.ps1, але для іншого
+        # порівняння (legacy-сервер до/після міграції).
+        $b7MigrationProvenancePaths = @(
+            'BravoConfigurationMetadata.LoadedAt',
+            'BravoConfigurationMetadata.Format',
+            'BravoConfigurationMetadata.Mode',
+            'BravoConfigurationMetadata.PrimaryConfigPresent',
+            'BravoConfigurationMetadata.PrimaryConfigPresentOnDisk',
+            'BravoConfigurationMetadata.PrimaryConfigOverridesCanonicalDefaults',
+            'BravoConfigurationMetadata.LocalConfigPresent',
+            'BravoConfigurationMetadata.LocalConfigPath',
+            'BravoConfigurationMetadata.LocalConfigOverrides',
+            'BravoConfigurationMetadata.AppliedLocalOverrideKeys',
+            'BravoConfigurationMetadata.LocalConfigEffectiveSchemaVersion'
+        )
+        $b7MigrationUnexpected = @()
+        if ($b7After.Succeeded) {
+            $b7MigrationUnexpected = @(Get-BRAVOB7UnexpectedDifference -Reference $b7Before.RawSnapshot -Candidate $b7After.RawSnapshot -AllowedPath $b7MigrationProvenancePaths)
+        }
+        # Не тавтологія: site-значення справді відрізняються від дефолтів
+        # і справді присутні в обох знімках.
+        $b7MigrationNonVacuous = $b7After.Succeeded -and
+            [int]$b7Before.RawSnapshot['archiveRetentionDays'] -eq 365 -and
+            [int]$b7After.RawSnapshot['archiveRetentionDays'] -eq 365 -and
+            [string]$b7After.RawSnapshot['maintenanceSettings']['Restore']['Time'] -eq '22:30' -and
+            [string]$b7After.RawSnapshot['smbSettings']['RootPath'] -eq '\\server\bravo-b7' -and
+            $b7After.RawSnapshot['hostInformationSettings']['PublicIPLookupEnabled'] -eq $false -and
+            (@($b7After.RawSnapshot['maintenanceSettings']['Limits']['ExcludedDrives']) -join '|') -eq 'X:\|Y:\' -and
+            $b7After.RawSnapshot['lunchArchiveCleanupDirectories'] -isnot [string] -and
+            (@($b7After.RawSnapshot['lunchArchiveCleanupDirectories']) -join '|') -eq 'MODEL'
+        Test-BRAVOCondition `
+            -Condition ($b7After.Succeeded -and $b7MigrationNonVacuous -and $b7MigrationUnexpected.Count -eq 0) `
+            -Name 'ConfigLoader/B7MigrationParityFullEffectiveSnapshot' `
+            -Failure (
+                "5.2 BRAVO.config -> реальний Get-BRAVOConfigSiteDelta.ps1 -> BRAVO.local.config -> 5.3-шлях мусить дати ТОЙ САМИЙ повний " +
+                "ефективний знімок, що й до міграції (відмінності лише в provenance-полях); Succeeded=$($b7After.Succeeded) $($b7After.ErrorMessage), " +
+                "NonVacuous=$b7MigrationNonVacuous, неочікуваних відмінностей $($b7MigrationUnexpected.Count): " +
+                (($b7MigrationUnexpected | ForEach-Object { "$($_.Path) [$($_.Kind)]" }) -join '; ')
+            )
+
+        $b7PrimaryOverrideSet = @(@($b7Before.RawSnapshot['BravoConfigurationMetadata']['PrimaryConfigOverridesCanonicalDefaults']) | Sort-Object)
+        $b7AppliedLocalSet = if ($b7After.Succeeded) { @(@($b7After.RawSnapshot['BravoConfigurationMetadata']['AppliedLocalOverrideKeys']) | Sort-Object) } else { @() }
+        Test-BRAVOCondition `
+            -Condition ($b7PrimaryOverrideSet.Count -gt 0 -and ($b7PrimaryOverrideSet -join '|') -eq ($b7AppliedLocalSet -join '|')) `
+            -Name 'ConfigLoader/B7MigrationCarriesEveryPrimaryOverride' `
+            -Failure "кожен шлях, який 5.2 BRAVO.config перевизначав відносно канонічних дефолтів, мусить стати застосованим override-ом BRAVO.local.config (і жодного зайвого); до='$($b7PrimaryOverrideSet -join ', ')' після='$($b7AppliedLocalSet -join ', ')'"
+
+        # (g2) Повторна міграція вже мігрованого сервера: legacy-файл знову
+        # поруч (Update-BRAVOServer.ps1 його не видаляє), BRAVO.local.config
+        # уже згенеровано. Інструмент не пропонує жодного нового
+        # перенесення, а ефективна конфігурація 5.3-entrypoint-а не змінюється.
+        Copy-Item -LiteralPath $b7RetiredLegacyPath -Destination $b7MigrationLegacyPath
+        $b7Delta3Path = Join-Path $b7Root 'delta3.local.config'
+        $b7Delta3 = Invoke-BRAVOB7SiteDelta -OutputPath $b7Delta3Path
+        $b7Delta3Text = if (Test-Path -LiteralPath $b7Delta3Path -PathType Leaf) { [IO.File]::ReadAllText($b7Delta3Path, [Text.Encoding]::UTF8) } else { '' }
+        $b7Delta3Active = @(@($b7Delta3Text -split "`r?`n") | Where-Object { $_ -match "^\s+'[^']+'\s*=" })
+        $b7Delta3AlreadyPresent = @(@($b7Delta3Text -split "`r?`n") | Where-Object { $_.Contains('[уже є в BRAVO.local.config]') })
+        Test-BRAVOCondition `
+            -Condition (
+                $b7Delta3.ExitCode -eq 0 -and
+                $b7Delta3Active.Count -eq 0 -and
+                $b7Delta3AlreadyPresent.Count -eq $b7PrimaryOverrideSet.Count -and
+                $b7Delta3.Output.Contains('Відмінностей до перенесення: 0')
+            ) `
+            -Name 'ConfigLoader/B7MigrationRerunOnMigratedServerIsNoOp' `
+            -Failure "повторний прогін міграції на вже мігрованому сервері не повинен пропонувати жодного нового override-а (усі $($b7PrimaryOverrideSet.Count) — '[уже є в BRAVO.local.config]'); активних рядків $($b7Delta3Active.Count), позначених $($b7Delta3AlreadyPresent.Count), ExitCode=$($b7Delta3.ExitCode), вивід: $($b7Delta3.Output)"
+
+        $b7Rerun = Invoke-BRAVOSelfTestEffectiveSnapshotCapture -WorkRoot $b7Root -ConfigRoot $b7MigrationRoot `
+            -Label 'MIGRATION_RERUN' -InvocationText $b7CanonicalInvocation
+        $b7RerunUnexpected = @()
+        if ($b7Rerun.Succeeded -and $b7After.Succeeded) {
+            $b7RerunUnexpected = @(Get-BRAVOB7UnexpectedDifference -Reference $b7After.RawSnapshot -Candidate $b7Rerun.RawSnapshot -AllowedPath $b7ProofBProvenancePaths)
+        }
+        Test-BRAVOCondition `
+            -Condition ($b7Rerun.Succeeded -and $b7After.Succeeded -and $b7RerunUnexpected.Count -eq 0) `
+            -Name 'ConfigLoader/B7MigratedServerRetainedLegacyConfigHasNoEffect' `
+            -Failure "мігрований сервер із залишеним поруч 5.2 BRAVO.config мусить мати той самий ефективний знімок на 5.3-шляху (відмінності лише LoadedAt/PrimaryConfigPresentOnDisk/PrimaryConfigAutoDetectBlocked); Succeeded=$($b7Rerun.Succeeded) $($b7Rerun.ErrorMessage), неочікуваних $($b7RerunUnexpected.Count): $(($b7RerunUnexpected | ForEach-Object { "$($_.Path) [$($_.Kind)]" }) -join '; ')"
+    } finally {
+        if ($null -ne $b7PreviousWeakenedSecurity) {
+            $env:BRAVO_ALLOW_WEAKENED_SECURITY = $b7PreviousWeakenedSecurity
+        }
+        Remove-Item -LiteralPath $b7Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' } }

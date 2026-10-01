@@ -6,6 +6,7 @@
 # baseline 93 тести DataRestore/*, рядки 7979-11279 оригінального файлу на
 # момент витягнення).
 
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/PathGuardsFailClosed') { try {
     # ============================================================
     # BRAVO_DATA_RESTORE (rc.2): поведінкові тести чистих функцій
     # відновлення даних. Функції витягуються з runtime за AST в
@@ -284,6 +285,53 @@ function Stop-Process {
             ) `
             -Name "DataRestore/PlanRejectsUnsafeOutOfPlaceTargets" `
             -Failure "Get-BRAVODataRestorePlan має відхиляти -TargetPath, що перетинається із захищеним розташуванням у БУДЬ-ЯКУ сторону вкладеності (BackupRoot/RuntimeRoot/staging/live-джерело), відносний шлях і непорожню ціль компонента"
+
+        # Диск-відносне ('C:restore') і корінь-відносне ('\restore') значення
+        # IsPathRooted вважає rooted, але вони резолвяться відносно
+        # поточного каталогу/диска процесу (елевований — System32).
+        $planDriveRelative = & $planInvoke $dataRestoreModule 'OutOfPlace' 'C:restore' $planBackupRoot $planRuntimeRoot $planStagingRoot $planDefinitions
+        $planRootRelative = & $planInvoke $dataRestoreModule 'OutOfPlace' '\restore' $planBackupRoot $planRuntimeRoot $planStagingRoot $planDefinitions
+        Test-BRAVOCondition `
+            -Condition (
+                -not $planDriveRelative.Success -and
+                -not $planRootRelative.Success -and
+                ([string]$planDriveRelative.Error).Contains('повністю кваліфікованим') -and
+                ([string]$planRootRelative.Error).Contains('повністю кваліфікованим')
+            ) `
+            -Name "DataRestore/PlanRejectsDriveAndRootRelativeTargetPath" `
+            -Failure "Get-BRAVODataRestorePlan (OutOfPlace) має відхиляти диск-відносне 'C:restore' і корінь-відносне '\restore' -TargetPath (IsPathRooted їх пропускає)"
+
+        # Повна матриця #304: прийнятні форми -TargetPath і всі відносні /
+        # device-namespace форми, які мають відхилятися (і валідатором, і
+        # Get-BRAVODataRestorePlan).
+        $targetPathAcceptCases = @('C:\restore', 'D:\x\restore', '\\server\share\x')
+        $targetPathRejectCases = @('C:restore', '\restore', '.\restore', '..\restore', '\\?\C:\restore', '\\.\C:\restore')
+        $targetPathMatrixMismatches = New-Object System.Collections.Generic.List[string]
+        foreach ($acceptCase in $targetPathAcceptCases) {
+            $acceptResult = & $dataRestoreModule { param($v) Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $v } $acceptCase
+            if ($acceptResult -ne $true) { $targetPathMatrixMismatches.Add("ACCEPT очікувалось: $acceptCase") }
+        }
+        foreach ($rejectCase in $targetPathRejectCases) {
+            $rejectResult = & $dataRestoreModule { param($v) Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $v } $rejectCase
+            if ($rejectResult -ne $false) { $targetPathMatrixMismatches.Add("REJECT очікувалось (валідатор): $rejectCase") }
+            $rejectPlan = & $planInvoke $dataRestoreModule 'OutOfPlace' $rejectCase $planBackupRoot $planRuntimeRoot $planStagingRoot $planDefinitions
+            if ($rejectPlan.Success -or -not ([string]$rejectPlan.Error).Contains('повністю кваліфікованим')) {
+                $targetPathMatrixMismatches.Add("REJECT очікувалось (план): $rejectCase")
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition ($targetPathMatrixMismatches.Count -eq 0) `
+            -Name "DataRestore/TargetPathQualificationMatrix" `
+            -Failure ("Матриця -TargetPath (#304) не збігається: " + ($targetPathMatrixMismatches.ToArray() -join '; '))
+
+        # -TargetPath перевіряється ще ДО UAC-релаунчу, де робочий каталог —
+        # C:\Windows\System32.
+        $targetGuardIndex = $dataRestoreRuntimeTextForTests.IndexOf('Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value ([Environment]::ExpandEnvironmentVariables($TargetPath))')
+        $relaunchIndex = $dataRestoreRuntimeTextForTests.IndexOf('Start-Process powershell.exe -ArgumentList $elevatedArguments')
+        Test-BRAVOCondition `
+            -Condition ($targetGuardIndex -gt 0 -and $relaunchIndex -gt $targetGuardIndex) `
+            -Name "DataRestore/TargetPathValidatedBeforeElevation" `
+            -Failure "-TargetPath має проходити Test-BRAVODataRestoreFullyQualifiedWindowsPath ДО Start-Process -Verb RunAs, інакше диск-/корінь-відносне значення резолвиться в System32 елевованого процесу"
 
         # Fourth restore safety review (PR #40): наперед існуюча, але
         # ПОРОЖНЯ ціль компонента теж має відхилятись (не лише непорожня) —
@@ -869,6 +917,8 @@ function Stop-Process {
             Remove-Item -LiteralPath $moveAsideFailureRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/PathGuardsFailClosed' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/CurrentComponentRollbackFailurePreservesPrerestoreCopy' -DependsOn 'DataRestore/PathGuardsFailClosed') { try {
 
     # --- 6.3. Restore safety review (PR #40): відкат САМОГО поточного
     # компонента, що провалився, теж може не завершитись — статус має
@@ -1498,6 +1548,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Remove-Item -LiteralPath $probeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/CurrentComponentRollbackFailurePreservesPrerestoreCopy' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/SftpStagingFreeSpaceRequirementDeclaresProbeDirectory' -DependsOn 'Root/Version', 'DataRestore/CurrentComponentRollbackFailurePreservesPrerestoreCopy') { try {
 
     # --- 6.10.1. B4 acceptance defect (9257157/PHASE 3): SFTP staging
     # free-space requirement (stagingRequirements) МАЄ оголошувати
@@ -2011,6 +2063,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/OutOfPlaceAclFailureCleansUpBeforeAbortingBeforeExtraction" `
         -Failure "при провалі захисного ACL: спершу спроба прибрати ЩОЙНО СТВОРЕНИЙ (цим прогоном) порожній корінь, потім Stop-BRAVODataRestoreRun — усе це СТРОГО до циклу відновлення компонентів (extraction не повинна викликатись)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/SftpStagingFreeSpaceRequirementDeclaresProbeDirectory' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/InPlacePlanUsesCanonicalRestoreTargetWhenBackupSourceMissing' -DependsOn 'DataRestore/PathGuardsFailClosed') { try {
 
     # --- 6.18. Third restore safety review (PR #40): InPlace restore-target
     # має братись із canonical discovery (RestoreTargetDirectories), а не
@@ -2803,6 +2857,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/ManagedServiceQueryFailureFailsClosed" `
         -Failure "Stop-BRAVODataRestoreServices/Test-BRAVODataRestoreServicesAllStopped мають трактувати null АБО виняток від Get-Service для Managed-запису як провал тиші (unsafe/failure), а не мовчазний 'continue'; unmanaged-записи лишаються повністю ігнорованими, а нормальна Running-служба й далі зупиняється без помилок"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/InPlacePlanUsesCanonicalRestoreTargetWhenBackupSourceMissing' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/RestoreServicesUsesRestartIntentNotLiteralWasRunning' -DependsOn 'DataRestore/PathGuardsFailClosed') { try {
 
     # --- 7.2a. P2: Restore-BRAVODataRestoreServices відновлює службу за
     # ShouldRestartAfterRestore (намір "працювати": Running АБО StartPending
@@ -3608,6 +3664,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/NotificationDeliveryFailureCountsWarning" `
         -Failure "збій доставки (endpoint налаштовано, транспорт кидає) має збільшити лічильник WARNING рівно на 1, записати причину й не виходити за межі функції — і не плутатися з ненастроєним webhook; отримано: $($dataRestoreNotificationProbe.DeliveryFailure | ConvertTo-Json -Compress -Depth 3)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/RestoreServicesUsesRestartIntentNotLiteralWasRunning' } }
+    if (Enter-BRAVOSelfTestSection -Name 'DataRestore/NotificationCriticalRoutesToAlerts' -DependsOn 'DataRestore/RestoreServicesUsesRestartIntentNotLiteralWasRunning') { try {
 
     Test-BRAVOCondition `
         -Condition (
@@ -4384,3 +4442,4 @@ try {
             }
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'DataRestore/NotificationCriticalRoutesToAlerts' } }

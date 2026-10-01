@@ -3084,7 +3084,7 @@ function Get-SFTPHealthIssues {
         return @()
     }
 
-    # 5.2.1 (реальний алерт SERV_HRDL_1 23:03): активний WinSCP.com іншої
+    # 5.2.1 (реальний алерт SRV-LAB7 23:03): активний WinSCP.com іншої
     # BRAVO-операції (паралельна передача/затяжна синхронізація) робив
     # SFTP-перевірку CRITICAL «ПОТРІБНА ДІЯ», хоча це transient-конкуренція,
     # а не збій SFTP. Тепер зайнятий WinSCP = ВІДКЛАДЕННЯ: WARNING у лозі
@@ -3737,7 +3737,11 @@ function Get-ManagedServiceHealthIssues {
 
     $issues = @()
     foreach ($service in @($services)) {
-        $startMode = [string]$service.StartType
+        # StartType з'явилась лише в .NET 4.6.1; під StrictMode 2.0 пряме
+        # звернення до відсутньої властивості кидає виняток замість $null, і
+        # WMI-fallback нижче ніколи не виконувався б.
+        $startTypeProperty = $service.PSObject.Properties['StartType']
+        $startMode = if ($startTypeProperty) { [string]$startTypeProperty.Value } else { '' }
         if ([string]::IsNullOrWhiteSpace($startMode) -and
             $startModeByName.ContainsKey([string]$service.Name)) {
             $startMode = [string]$startModeByName[[string]$service.Name]
@@ -4825,7 +4829,7 @@ if ($SkipIfBackupTaskRunning) {
     # 5.2.1: BAZASync (BRAVO_ARCHIV -SyncBAZA, кожні 4 год о :00) на
     # реальних серверах тримає lock архівації ~16-17 хв і систематично
     # накривав слот Health :15 — КОЖЕН денний health-прогін відкладався без
-    # повтору (доведено логами ДНДІЛДВСЕ 25-27.08.2026). Замість негайного
+    # повтору (доведено логами ЛАБОРАТОРІЯ-6 25-27.08.2026). Замість негайного
     # відкладення Health обмежено чекає звільнення архівації
     # (schedulerSettings.Health.BusyWaitMinutes, loader-дефолт 60 хв;
     # 0 = стара поведінка) і лише після вичерпання ліміту відкладається

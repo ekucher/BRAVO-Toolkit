@@ -1676,16 +1676,16 @@ live-перевірка 2026-09-30 захисту `developer` не знайшл�
 Хронологія RC-циклу 5.2.0 (2026-08-24/25):
 
 - `v5.2.0-rc.4`/`v5.2.0-rc.5` (лінія PR #83) — повний real-server
-  acceptance PASS (`SERV_HRDL_1`, `WIN-44OBNQ3R3OB`).
+  acceptance PASS (`SRV-LAB7`, `SRV-LAB1`).
 - `v5.2.0-rc.6` — acceptance FAIL (фіксований поріг місця блокував
   backup); `v5.2.0-rc.7` (rc.5 + PR #84: розрахункова перевірка
   вільного місця з floor-override) — повний end-to-end acceptance PASS
-  2026-08-25 (`WIN-42Q5558LQC9`: backup MODEL/BLOG/BRAVOEXCH,
+  2026-08-25 (`SRV-LAB11`: backup MODEL/BLOG/BRAVOEXCH,
   SFTP 7/7, Health OK).
 - `v5.2.0-rc.8` (rc.7 + PR #86: регістронезалежна деривація відносних
   шляхів MODEL у Compare-FileSizes; закриває інцидент exit 43) —
   **acceptance реставрації PASS** 2026-08-25 22:03-22:24 на сервері
-  інциденту (`LIMS`/ДНДІЛДВСЕ, `-ForceRestore`: bravocmd exit 0,
+  інциденту (`SRV-LAB6`/ЛАБОРАТОРІЯ-6, `-ForceRestore`: bravocmd exit 0,
   Critical=0, Rollback=NONE, служби відновлено, Trace-pipeline OK).
 - `v5.2.0-rc.9` (rc.8 + PR #88: живий підстатус консолі Maintenance +
   PR #89: logs pipeline v2 — усі `*.out` з кореня інсталяції,
@@ -1712,7 +1712,7 @@ live-перевірка 2026-09-30 захисту `developer` не знайшл�
   опис bravocmd-фази без прив'язки до продукту, з фактичним ім'ям
   проєкту моделі) — **фінальний кандидат циклу; acceptance PASS
   2026-08-26**: повний maintenance-цикл нової поверхні rc.9-rc.13 на
-  двох реальних серверах (ДНДІЛДВСЕ Server 2022 / Львівська РДЛ,
+  двох реальних серверах (ЛАБОРАТОРІЯ-6 Server 2022 / Лабораторія-11,
   включно з хостом Server 2016 LegacyBestEffort) — перша бойова WinSCP
   MoveFile-міграція `trace/`→`logs/trace` 4/4, автостворення `logs/*`,
   скан реальних `*.out`-варіантів, компактні алерти, forced+normal
@@ -1796,7 +1796,7 @@ required checks гілки master, merge PR #61 виконано admin-обхо�
 ### Функціональна зміна дефолту під час DEV-LIMS acceptance `5.2.0-rc.1`
 
 - **`RepeatAlertAfterHours` (health-alert дедуп): дефолт `6` → `0`.**
-  Виявлено під час реального DEV-LIMS acceptance (ДНДІЛДВСЕ,
+  Виявлено під час реального DEV-LIMS acceptance (ЛАБОРАТОРІЯ-6,
   2026-08-23): при увімкненому `AutoArchiveMutationThreshold` оператор
   спостерігав лише перше сповіщення про `MUTATION_VIOLATION`, повторний
   ідентичний alert протягом наступних до 6 год. мовчав
