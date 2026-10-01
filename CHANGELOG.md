@@ -27,6 +27,9 @@
   (без `Get-Command` для відсутніх імен — дорогий пошук модулів), підмітання функцій
   зареєстрованих модулів виконується й у фінальному `Clear-...`, збій відновлення
   реєструється як збій секції, а не виходить із `finally`.
+  Побічно: RestoreSynthetic раніше покладався на витік no-op `Start-Sleep` з попередніх suite
+  (settle-повтори recovery 15 с x спроб, +~660 с на Windows CI); тепер власна заглушка
+  `Start-Sleep` є у модулі фікстури RestoreSynthetic.
 
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
