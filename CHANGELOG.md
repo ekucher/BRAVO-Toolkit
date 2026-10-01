@@ -101,6 +101,36 @@
   `ServiceQuiescence/MaintenanceRechecksClassificationAfterLock`,
   `ServiceQuiescence/StartModeSleepStubDoesNotLeakIntoSession`.
 
+- **Fix: Maintenance `-ForceRestore` більше не пропускається мовчки, коли служба BRAVO має тип запуску Disabled (#321).**
+  `$BravoMaintenanceEnabled` дорівнює `false` при `StartMode=Disabled`, тож `$shouldRestore`
+  теж ставав `false`: реставрація пропускалась, заголовок не мав рядка «Реставрація моделі»,
+  крок рендерився SKIPPED «не заплановано на цей запуск», а статус був УСПІШНО. Тепер рішення
+  винесене в чисту функцію `Get-BRAVOMaintenanceRestoreDecision`: `-ForceRestore` + Disabled
+  -> реставрація ВИКОНУЄТЬСЯ. Служба вже зупинена, тому її не зупиняємо й не запускаємо після
+  реставрації, тип запуску не змінюємо (Disabled лишається); не-Disabled-випадки та звичайний
+  (не примусовий) Maintenance + Disabled поводяться як раніше (без реставрації). Заголовок
+  завжди показує «Реставрація моделі: АКТИВОВАНА (Примусово)». Окремого WARNING немає: після
+  успішної реставрації INFO у лозі й у Details кроку — «Реставрацію виконано; служба BRAVO має
+  тип Disabled — не запускалась»; статус прогону визначає сама реставрація (збій реставрації
+  провалює прогін як і раніше). Каталог архівів моделі створюється й за Disabled. Якщо
+  Disabled-служба фактично працює, реставрація не стартує (fail-closed, критична помилка).
+  Решта BRAVO-операцій при Disabled лишається пропущеною (trace, перевірка розмірів `.md`,
+  RangeId, retention) — рішення: примусова реставрація не розширює вимкнений компонент.
+  Поза обсягом: відновлення служб після зупинки вручну (#314), #316.
+  Супутнє: очікування операційного lock (`Enter-BRAVOMaintenanceOperationLock`) тепер пише
+  рівно два INFO — на початку очікування (operation/pid/hostname/startedAt власника, якщо JSON
+  читається; нечитабельний не заважає) і після отримання lock із тривалістю очікування;
+  покрокові рядки кожні 30 с прибрано, лічильник попереджень не змінюється.
+  Нові self-test перевірки: `Maintenance/RestoreDecision[...]` (10 сценаріїв),
+  `Maintenance/ForceRestoreDisabledDecisionIsWired`,
+  `Maintenance/ForceRestoreDisabledHeaderShowsActivated`,
+  `Maintenance/ForceRestoreDisabledEntersRestoreSequence`,
+  `Maintenance/ForceRestoreDisabledKeepsServiceStoppedAndInfoOnly`,
+  `Maintenance/OperationLockWaitLogsOnceWithHolderAndDuration`,
+  `Maintenance/OperationLockWaitLogToleratesUnreadableHolder`,
+  `Maintenance/ForceRestoreDisabledKillsStrayBis` (сторонній `Bis` завершується й за
+  `-ForceRestore` + Disabled, спільним хелпером `Stop-BRAVOMaintenanceStrayProcess`).
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях
