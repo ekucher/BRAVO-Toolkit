@@ -2245,6 +2245,7 @@
         # перезаписував перевірену remote-копію.
         # BEGIN SYNCBAZA-CANONICAL
         # =======================================================================
+        & {
         $sbArchiveText = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
         $sbAst = [System.Management.Automation.Language.Parser]::ParseInput($sbArchiveText, [ref]$null, [ref]$null)
         $sbFunctionAsts = @{}
@@ -2633,6 +2634,7 @@
             Remove-Module -ModuleInfo $sbModule -ErrorAction SilentlyContinue
             if ($sbHadBackupMonitoring) { $global:backupMonitoring = $sbSavedBackupMonitoring } else { Remove-Variable -Name backupMonitoring -Scope Global -ErrorAction SilentlyContinue }
             if ($sbHadStateRoot) { $global:stateRoot = $sbSavedStateRoot } else { Remove-Variable -Name stateRoot -Scope Global -ErrorAction SilentlyContinue }
+        }
         }
         # END SYNCBAZA-CANONICAL
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/SyncBazaUsesCanonicalEngine' } }
