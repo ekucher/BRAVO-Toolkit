@@ -918,6 +918,20 @@ function Get-ConfiguredServiceState {
     }
 }
 
+# Завершення додаткових процесів, що можуть тримати файли моделі (Bis).
+# Спільне для зупинки працюючої служби BRAVO і для -ForceRestore при Disabled (#321).
+function Stop-BRAVOMaintenanceStrayProcess {
+    $processNames = @("Bis")
+    foreach ($procName in $processNames) {
+        $process = Get-Process -Name $procName -ErrorAction SilentlyContinue
+        if ($process) {
+            Write-Log -Message "Завершення процесу $procName..." -Level "INFO"
+            $process | Stop-Process -Force
+            Start-Sleep -Seconds 1
+        }
+    }
+}
+
 function Invoke-ServiceStateChange {
     param(
         [Parameter(Mandatory = $true)]
@@ -8698,16 +8712,7 @@ if ($BravoMaintenanceEnabled) {
         if ($serviceStatus -eq 'Running') {
             Write-Log -Message "Зупинка служби $BravoServiceName..." -Level "INFO"
             
-            # Завершення додаткових процесів
-            $processNames = @("Bis")
-            foreach ($procName in $processNames) {
-                $process = Get-Process -Name $procName -ErrorAction SilentlyContinue
-                if ($process) {
-                    Write-Log -Message "Завершення процесу $procName..." -Level "INFO"
-                    $process | Stop-Process -Force
-                    Start-Sleep -Seconds 1
-                }
-            }
+            Stop-BRAVOMaintenanceStrayProcess
             
             $serviceResult = Invoke-ServiceStateChange `
                 -Name $BravoServiceName `
@@ -8735,6 +8740,11 @@ if ($BravoMaintenanceEnabled) {
     }
 } elseif ($BravoServiceDisabledBySystem) {
     Write-Log -Message "Служба $BravoServiceName має тип запуску Disabled - компонент BRAVO пропущено" -Level "INFO"
+    if ($restoreOnDisabledBravo) {
+        # #321: службу не чіпаємо (уже зупинена, Disabled), але сторонній Bis
+        # може тримати файли моделі під час bravocmd — та сама логіка завершення.
+        Stop-BRAVOMaintenanceStrayProcess
+    }
 } else {
     Write-Log -Message "Службу $BravoServiceName не встановлено - компонент BRAVO пропущено" -Level "INFO"
 }

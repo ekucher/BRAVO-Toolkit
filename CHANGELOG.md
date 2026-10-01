@@ -28,7 +28,9 @@
   `Maintenance/ForceRestoreDisabledEntersRestoreSequence`,
   `Maintenance/ForceRestoreDisabledKeepsServiceStoppedAndInfoOnly`,
   `Maintenance/OperationLockWaitLogsOnceWithHolderAndDuration`,
-  `Maintenance/OperationLockWaitLogToleratesUnreadableHolder`.
+  `Maintenance/OperationLockWaitLogToleratesUnreadableHolder`,
+  `Maintenance/ForceRestoreDisabledKillsStrayBis` (сторонній `Bis` завершується й за
+  `-ForceRestore` + Disabled, спільним хелпером `Stop-BRAVOMaintenanceStrayProcess`).
 
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який

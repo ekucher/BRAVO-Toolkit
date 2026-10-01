@@ -10867,6 +10867,22 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 ) `
                 -Name 'Maintenance/ForceRestoreDisabledKeepsServiceStoppedAndInfoOnly' `
                 -Failure 'Disabled-служба не має ні зупинятись/стартувати, ні змінювати StartupType (serviceWasRunning.Bravo лише від $BravoMaintenanceEnabled); INFO «Реставрацію виконано; служба BRAVO має тип Disabled — не запускалась» — лише в гілці успішної реставрації, рівнем INFO, і в Details кроку'
+
+            # Stray Bis може тримати файли моделі під bravocmd: при Disabled+Force
+            # той самий спільний хелпер викликається в Disabled-гілці зупинки.
+            $strayDisabledIndex = $RuntimeText.IndexOf('} elseif ($BravoServiceDisabledBySystem) {')
+            $strayDisabledWindow = if ($strayDisabledIndex -ge 0) {
+                $RuntimeText.Substring($strayDisabledIndex, [Math]::Min(700, $RuntimeText.Length - $strayDisabledIndex))
+            } else { '' }
+            Test-BRAVOCondition `
+                -Condition (
+                    $RuntimeText.Contains('function Stop-BRAVOMaintenanceStrayProcess {') -and
+                    $RuntimeText.Contains('$processNames = @("Bis")') -and
+                    $strayDisabledWindow -match '(?s)if \(\$restoreOnDisabledBravo\) \{.{0,400}?Stop-BRAVOMaintenanceStrayProcess' -and
+                    ([regex]::Matches($RuntimeText, 'Stop-BRAVOMaintenanceStrayProcess')).Count -ge 3
+                ) `
+                -Name 'Maintenance/ForceRestoreDisabledKillsStrayBis' `
+                -Failure 'при -ForceRestore + Disabled має завершуватись сторонній Bis тим самим хелпером Stop-BRAVOMaintenanceStrayProcess'
         } $maintenanceRestoreWindowText
 
         # Structural: обидва бар'єри реально СТОЯТЬ там, де мають — перед
