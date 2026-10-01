@@ -304,6 +304,13 @@ $script:environmentLimitations = New-Object System.Collections.ArrayList
 # змінній, і виглядало б це як дефект обраного фрагмента, а не як обмеження
 # режиму — рівно той клас плутанини, який закриває #188.
 #
+# ЗВОРОТНИЙ НАПРЯМ ЗАБОРОНЕНО (#219). Корінь та інші фрагменти не читають
+# змінних і не викликають функцій, які визначає лише gated-фрагмент: у
+# -Suite без цього фрагмента таке читання падає під Set-StrictMode ще до
+# обраного suite. Спільне для кількох фрагментів визначається тут, у
+# bootstrap-і, або в тілі кореня до першого споживача. Інваріант стереже
+# Framework/SelectiveSuitesHaveNoCrossSuiteDependency.
+#
 # Тому економія часу обмежена зверху: корінь — це 961 з 2107 перевірок і
 # 188.6 с із 477.5 с sum-of-suites. Вибірковий прогін не може бути швидшим
 # за цю частину, і обіцяти більше було б неправдою.
@@ -755,6 +762,164 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
         Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
     }
     $script:BRAVOSelfTestOwnedRuntimeModules.Clear()
+}
+
+# ============================================================
+# Спільна фікстура фрагментів BazaSync і TraceArchive (#219): фейкова
+# WinSCP-сесія. Визначена тут, у bootstrap-і, що виконується завжди, а
+# не в gated-фрагменті BazaSync: TraceArchive викликає її так само, і
+# -Suite TraceArchive без BazaSync падав на CommandNotFound. Функція
+# використовує лише BCL-типи й Add-Member (жодного WinSCP-типу чи
+# BRAVO.*-модуля), тож її визначення не потребує імпортів.
+# ============================================================
+function New-BRAVOSelfTestFakeBazaSession {
+    param(
+        [string[]]$FailOnRelativePaths = @(),
+        [switch]$AllTransfersFail,
+        [switch]$MoveFileShouldFail,
+        [switch]$RemoveFilesShouldFail,
+        # R4-3 (PR #136, четверте коло review): опційне повторне
+        # використання "серверного" стану (RemoteSizes/
+        # KnownRemoteDirs) від ПОПЕРЕДНЬОЇ фейкової сесії — реальний
+        # SFTP-сервер переживає між окремими нічними прогонами
+        # Maintenance, кожен з яких відкриває СВОЮ WinSCP.Session;
+        # без цього кожна нова тестова сесія моделювала б "порожній"
+        # сервер, що не знає про файли, завантажені попередньою
+        # сесією, і жива remote-перевірка (Test-BRAVOTraceRemote-
+        # ArchivePublicationCurrent) завжди хибно провалювалась би.
+        # Не передано (усі наявні виклик-площини) -> точно стара
+        # поведінка, нуль різниці: свіжий порожній Hashtable/HashSet.
+        [AllowNull()]$SeedRemoteState
+    )
+    # ПРИМІТКА (PS 5.1): `if(){}else{}` як значення прямо всередині
+    # @{} hashtable-літералу для HashSet[string] розгортає
+    # односимвольний HashSet у скалярний рядок (той самий клас
+    # pipeline-unwrap багу, що @(List[object]) — HashSet, на
+    # відміну від Hashtable, не отримує спеціального PowerShell-
+    # захисту від enumerate-розгортання). Явні проміжні змінні
+    # (простий присвоєння властивості, без capture через
+    # statement-результат) зберігають референс без розгортання.
+    if ($null -ne $SeedRemoteState) {
+        $seededKnownRemoteDirs = $SeedRemoteState.KnownRemoteDirs
+        $seededRemoteSizes = $SeedRemoteState.RemoteSizes
+    } else {
+        $seededKnownRemoteDirs = New-Object System.Collections.Generic.HashSet[string]
+        $seededRemoteSizes = @{}
+    }
+    $state = [pscustomobject]@{
+        PutFilesCallCount = 0
+        PutFilesCalledFor = New-Object System.Collections.Generic.List[string]
+        KnownRemoteDirs = $seededKnownRemoteDirs
+        RemoteSizes = $seededRemoteSizes
+        MoveFileCalls = New-Object System.Collections.Generic.List[string]
+        RemoveFilesCalls = New-Object System.Collections.Generic.List[string]
+        FileExistsCalledFor = New-Object System.Collections.Generic.List[string]
+        GetFileInfoCalledFor = New-Object System.Collections.Generic.List[string]
+        MoveFileShouldFail = [bool]$MoveFileShouldFail
+        RemoveFilesShouldFail = [bool]$RemoveFilesShouldFail
+        LastResumeSupportState = $null
+    }
+    $session = New-Object psobject
+    $session | Add-Member -MemberType NoteProperty -Name State -Value $state
+    $session | Add-Member -MemberType ScriptMethod -Name FileExists -Value {
+        param($path)
+        # Як і реальний WinSCP Session.FileExists — і каталоги, і файли.
+        [void]$this.State.FileExistsCalledFor.Add([string]$path)
+        return ($this.State.KnownRemoteDirs.Contains($path) -or $this.State.RemoteSizes.ContainsKey($path))
+    }
+    $session | Add-Member -MemberType ScriptMethod -Name CreateDirectory -Value {
+        param($path)
+        [void]$this.State.KnownRemoteDirs.Add($path)
+    }
+    $failSet = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($p in $FailOnRelativePaths) { [void]$failSet.Add($p.Replace('\','/')) }
+    $allFail = [bool]$AllTransfersFail
+    $putFilesScript = {
+        param($localPath, $remotePath, $remove, $options)
+        $this.State.PutFilesCallCount++
+        [void]$this.State.PutFilesCalledFor.Add($remotePath)
+        if ($null -ne $options -and $null -ne $options.ResumeSupport) {
+            $this.State.LastResumeSupportState = [string]$options.ResumeSupport.State
+        }
+        $localSize = (Get-Item -LiteralPath $localPath).Length
+        $normalizedRemote = [string]$remotePath
+        $shouldFail = $allFail
+        foreach ($f in $failSet) {
+            if ($normalizedRemote.EndsWith($f)) { $shouldFail = $true }
+        }
+        if ($shouldFail) {
+            $errObj = [pscustomobject]@{ Error = [pscustomobject]@{ Message = "simulated transfer failure" } }
+            return [pscustomobject]@{ IsSuccess = $false; Transfers = @($errObj) }
+        }
+        $this.State.RemoteSizes[$normalizedRemote] = $localSize
+        return [pscustomobject]@{ IsSuccess = $true; Transfers = @() }
+    }.GetNewClosure()
+    $session | Add-Member -MemberType ScriptMethod -Name PutFiles -Value $putFilesScript
+    $session | Add-Member -MemberType ScriptMethod -Name GetFileInfo -Value {
+        param($remotePath)
+        [void]$this.State.GetFileInfoCalledFor.Add([string]$remotePath)
+        $size = $this.State.RemoteSizes[[string]$remotePath]
+        if ($null -eq $size) { $size = 0 }
+        return [pscustomobject]@{ Length = $size }
+    }
+    # P2 (deep review): checkpoint publish/replace і no-delete
+    # structural coverage. MoveFile навмисно моделює SFTP-семантику
+    # "rename НЕ перезаписує наявну ціль" (hardening round 2) — щоб
+    # production-код, який покладався б на rename-overwrite, падав
+    # у тестах, а не на реальному сервері на другому циклі.
+    $session | Add-Member -MemberType ScriptMethod -Name MoveFile -Value {
+        param($sourcePath, $targetPath)
+        [void]$this.State.MoveFileCalls.Add("$sourcePath -> $targetPath")
+        if ($this.State.MoveFileShouldFail) { throw "simulated MoveFile failure" }
+        if ($this.State.RemoteSizes.ContainsKey($targetPath)) {
+            throw "simulated rename failure: target already exists: $targetPath"
+        }
+        if ($this.State.RemoteSizes.ContainsKey($sourcePath)) {
+            $this.State.RemoteSizes[$targetPath] = $this.State.RemoteSizes[$sourcePath]
+            $this.State.RemoteSizes.Remove($sourcePath)
+        }
+    }
+    $session | Add-Member -MemberType ScriptMethod -Name ListDirectory -Value {
+        param($path)
+        # Спрощена модель WinSCP Session.ListDirectory: безпосередні
+        # діти каталогу з RemoteSizes/KnownRemoteDirs. Використовується
+        # міграцією журнальних архівів (TraceArchive-фрагмент).
+        $normalized = ([string]$path).TrimEnd('/')
+        $files = New-Object System.Collections.Generic.List[object]
+        foreach ($remotePath in @($this.State.RemoteSizes.Keys)) {
+            if ($remotePath -notlike "$normalized/*") { continue }
+            $childRelative = $remotePath.Substring($normalized.Length + 1)
+            if ($childRelative.Contains('/')) { continue }
+            [void]$files.Add([pscustomobject]@{
+                Name = $childRelative
+                IsDirectory = $false
+                Length = [int64]$this.State.RemoteSizes[$remotePath]
+            })
+        }
+        foreach ($knownDir in @($this.State.KnownRemoteDirs)) {
+            if ($knownDir -notlike "$normalized/*") { continue }
+            $childRelative = $knownDir.Substring($normalized.Length + 1)
+            if ($childRelative.Contains('/')) { continue }
+            [void]$files.Add([pscustomobject]@{
+                Name = $childRelative
+                IsDirectory = $true
+                Length = [int64]0
+            })
+        }
+        return [pscustomobject]@{ Files = @($files.ToArray()) }
+    }
+    $session | Add-Member -MemberType ScriptMethod -Name RemoveFiles -Value {
+        param($path)
+        [void]$this.State.RemoveFilesCalls.Add($path)
+        if ($this.State.RemoveFilesShouldFail) {
+            # Реальний WinSCP репортує per-file збій у RemovalOperationResult
+            # (IsSuccess=false) без винятку -- моделюємо саме це.
+            return [pscustomobject]@{ IsSuccess = $false }
+        }
+        $this.State.RemoteSizes.Remove($path)
+        return [pscustomobject]@{ IsSuccess = $true }
+    }
+    return $session
 }
 
 # P0 fail-fast/telemetry: друкує суто ДОДАТКОВУ (assertion-level і
@@ -17118,11 +17283,11 @@ try {
     Import-Module -Name (Join-Path $root "modules\BRAVO.Console\BRAVO.Console.psd1") -Force -ErrorAction Stop
     Initialize-BRAVOConsole -StepWidth 58
 
-    $maintenanceHeaderCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOHeader `')
-    $maintenanceHeaderCallEnd = $maintenanceScriptTextForManifestStorage.IndexOf(
+    $maintenanceHeaderCallIndex = $maintenanceScriptText.IndexOf('Write-BRAVOHeader `')
+    $maintenanceHeaderCallEnd = $maintenanceScriptText.IndexOf(
         '-StartedAt $script:ScriptStartTime', $maintenanceHeaderCallIndex)
     $maintenanceHeaderCallText = if ($maintenanceHeaderCallIndex -ge 0 -and $maintenanceHeaderCallEnd -gt $maintenanceHeaderCallIndex) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             $maintenanceHeaderCallIndex, $maintenanceHeaderCallEnd - $maintenanceHeaderCallIndex + 40)
     } else { '' }
 
@@ -17170,7 +17335,7 @@ try {
     # UserSid на вході, жодного власного WindowsIdentity), тому тестується
     # напряму на детермінованих SID без реальної системної ідентичності.
     $maintenanceExecutionModeModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @('Get-BRAVOMaintenanceExecutionMode')
     $manualAdminMode = & $maintenanceExecutionModeModule {
         Get-BRAVOMaintenanceExecutionMode -UserSid 'S-1-5-21-111-222-333-1001'
@@ -17194,7 +17359,7 @@ try {
     Test-BRAVOCondition `
         -Condition (
             $manualAdminMode -eq $manualAdminModeWithNoPauseIntent -and
-            -not $maintenanceScriptTextForManifestStorage.Contains("function Get-BRAVOMaintenanceExecutionMode {`n    param([Parameter(Mandatory = `$true)][string]`$UserSid, [switch]`$NoPause)")
+            -not $maintenanceScriptText.Contains("function Get-BRAVOMaintenanceExecutionMode {`n    param([Parameter(Mandatory = `$true)][string]`$UserSid, [switch]`$NoPause)")
         ) `
         -Name "Maintenance/ModeDoesNotDependOnNoPause" `
         -Failure "Get-BRAVOMaintenanceExecutionMode має приймати лише UserSid — жодного параметра -NoPause, який міг би вплинути на результат"
@@ -17206,16 +17371,16 @@ try {
     # розійтися" вимагає.
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("'ТАК' } else { 'НІ' }") -and
-            $maintenanceScriptTextForManifestStorage.Contains('$maintenancePlanEntries = [ordered]@{')
+            $maintenanceScriptText.Contains("'ТАК' } else { 'НІ' }") -and
+            $maintenanceScriptText.Contains('$maintenancePlanEntries = [ordered]@{')
         ) `
         -Name "Maintenance/PlanUsesTakNi" `
         -Failure "План операцій має друкувати рівно ТАК/НІ, без True/False/внутрішніх назв змінних"
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled") -and
-            $maintenanceScriptTextForManifestStorage.Contains('$script:BRAVOMaintenanceRestoreStepEnabled = $shouldRestore') -and
-            $maintenanceScriptTextForManifestStorage.Contains('$ForceRestore -or')
+            $maintenanceScriptText.Contains("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled") -and
+            $maintenanceScriptText.Contains('$script:BRAVOMaintenanceRestoreStepEnabled = $shouldRestore') -and
+            $maintenanceScriptText.Contains('$ForceRestore -or')
         ) `
         -Name "Maintenance/PlanReflectsForceRestore" `
         -Failure "рядок плану 'Реставрація моделі' має відображати -ForceRestore через `$shouldRestore/BRAVOMaintenanceRestoreStepEnabled"
@@ -17227,31 +17392,31 @@ try {
     # ширший критерій: ForceRestore АБО ця сама умова АБО плановий день/час).
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("'Відновлення пропущених операцій' = [bool](`$RunMissedRestoreOnly -and `$missedDailyWork)") -and
-            $maintenanceScriptTextForManifestStorage.Contains("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled") -and
-            -not $maintenanceScriptTextForManifestStorage.Contains("'Контроль діапазонів ID'          = [bool]")
+            $maintenanceScriptText.Contains("'Відновлення пропущених операцій' = [bool](`$RunMissedRestoreOnly -and `$missedDailyWork)") -and
+            $maintenanceScriptText.Contains("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled") -and
+            -not $maintenanceScriptText.Contains("'Контроль діапазонів ID'          = [bool]")
         ) `
         -Name "Maintenance/PlanShowsBothRestoreLinesWithDistinctSemantics" `
         -Failure "'Відновлення пропущених операцій' (RunMissedRestoreOnly+missedDailyWork) і 'Реставрація моделі' (shouldRestore) мають бути ДВОМА окремими рядками плану з різними значеннями; Range ID у плані не показується (лише крок)"
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("'Перевірка розмірів'              = [bool]`$script:BRAVOMaintenanceCheckSizeStepEnabled") -and
-            $maintenanceScriptTextForManifestStorage.Contains('$script:BRAVOMaintenanceCheckSizeStepEnabled = $BravoMaintenanceEnabled -and $CheckSize') -and
-            $maintenanceScriptTextForManifestStorage.Contains('$CheckSize = -not $DisableSizeCheck')
+            $maintenanceScriptText.Contains("'Перевірка розмірів'              = [bool]`$script:BRAVOMaintenanceCheckSizeStepEnabled") -and
+            $maintenanceScriptText.Contains('$script:BRAVOMaintenanceCheckSizeStepEnabled = $BravoMaintenanceEnabled -and $CheckSize') -and
+            $maintenanceScriptText.Contains('$CheckSize = -not $DisableSizeCheck')
         ) `
         -Name "Maintenance/PlanReflectsDisableSizeCheck" `
         -Failure "рядок плану 'Перевірка розмірів' має відображати -DisableSizeCheck через `$CheckSize"
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("'Автоматичне вимкнення сервера'   = [bool]`$script:EnableAutoShutdown") -and
-            $maintenanceScriptTextForManifestStorage.Contains('$script:EnableAutoShutdown = ($AutoShutdown -eq "on")')
+            $maintenanceScriptText.Contains("'Автоматичне вимкнення сервера'   = [bool]`$script:EnableAutoShutdown") -and
+            $maintenanceScriptText.Contains('$script:EnableAutoShutdown = ($AutoShutdown -eq "on")')
         ) `
         -Name "Maintenance/PlanReflectsAutoShutdown" `
         -Failure "рядок плану 'Автоматичне вимкнення сервера' має відображати -AutoShutdown"
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("'Архівація після maintenance'     = [bool]`$script:BRAVOMaintenanceArchiveStepEnabled") -and
-            $maintenanceScriptTextForManifestStorage.Contains('$script:BRAVOMaintenanceArchiveStepEnabled = [bool]$script:EnableArchiveAfterMaintenance')
+            $maintenanceScriptText.Contains("'Архівація після maintenance'     = [bool]`$script:BRAVOMaintenanceArchiveStepEnabled") -and
+            $maintenanceScriptText.Contains('$script:BRAVOMaintenanceArchiveStepEnabled = [bool]$script:EnableArchiveAfterMaintenance')
         ) `
         -Name "Maintenance/PlanReflectsArchiveAfterMaintenance" `
         -Failure "рядок плану 'Архівація після maintenance' має відображати -ArchiveAfterMaintenance"
@@ -17261,7 +17426,7 @@ try {
     # реальні функції, реальний BRAVO.Console (Write-BRAVOStepResult тощо,
     # вже імпортований вище), синтетичні кроки замість реального Main().
     $maintenanceStepModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @(
             'Initialize-BRAVOMaintenanceSteps',
             'Get-BRAVOMaintenanceStepStatus',
@@ -17331,9 +17496,9 @@ try {
     # існують' лишились на місці після об'єднання з MANIFESTS init/migration.
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("if (`$directoryStepStatus -eq 'SKIPPED')") -and
-            $maintenanceScriptTextForManifestStorage.Contains("-Status 'SKIPPED'") -and
-            $maintenanceScriptTextForManifestStorage.Contains("-Details 'усі вже існують'")
+            $maintenanceScriptText.Contains("if (`$directoryStepStatus -eq 'SKIPPED')") -and
+            $maintenanceScriptText.Contains("-Status 'SKIPPED'") -and
+            $maintenanceScriptText.Contains("-Details 'усі вже існують'")
         ) `
         -Name "Maintenance/SkippedDirectories" `
         -Failure "'Створення необхідних директорій' має лишатися SKIPPED/'усі вже існують', коли і директорії, і MANIFESTS init/migration нічого не зробили"
@@ -17348,17 +17513,17 @@ try {
     # Details, лише сама змінна, що йде у -Details, перейменована.
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("-Name 'Реставрація моделі' ``") -and
-            $maintenanceScriptTextForManifestStorage.Contains('-Details $restoreStepDetails') -and
-            $maintenanceScriptTextForManifestStorage.Contains('$restoreStepDetails = $restoreReason') -and
-            $maintenanceScriptTextForManifestStorage.Contains('$restoreReason = if ($ForceRestore) { "Примусово" }')
+            $maintenanceScriptText.Contains("-Name 'Реставрація моделі' ``") -and
+            $maintenanceScriptText.Contains('-Details $restoreStepDetails') -and
+            $maintenanceScriptText.Contains('$restoreStepDetails = $restoreReason') -and
+            $maintenanceScriptText.Contains('$restoreReason = if ($ForceRestore) { "Примусово" }')
         ) `
         -Name "Maintenance/ForceRestoreDetail" `
         -Failure "крок 'Реставрація моделі' має показувати причину реставрації ('Примусово' для -ForceRestore) як Details"
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains("-Name 'Обробка trace і логів' ``") -and
-            $maintenanceScriptTextForManifestStorage.Contains('"оброблено файлів: $processedLogCounts"')
+            $maintenanceScriptText.Contains("-Name 'Обробка trace і логів' ``") -and
+            $maintenanceScriptText.Contains('"оброблено файлів: $processedLogCounts"')
         ) `
         -Name "Maintenance/TraceProcessedDetail" `
         -Failure "крок 'Обробка trace і логів' має показувати кількість оброблених файлів як Details"
@@ -17369,9 +17534,17 @@ try {
     # статусу цього конкретного кроку (інакше WARN на екрані розійшовся б
     # із FAIL).
     $rangeIdTestModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @('Test-RangeIdUsage')
-    $rangeIdMissingPath = Join-Path $manifestStorageTestRoot 'does-not-exist-range-id.json'
+    # Власний тимчасовий корінь Range ID-тестів (#219). Раніше корінь
+    # позичав $manifestStorageTestRoot фрагмента ManifestStorage, тому
+    # -Suite без ManifestStorage падав під Set-StrictMode на невизначеній
+    # змінній. Каталог створюється нижче, перед тестами на реальних файлах;
+    # до того $rangeIdMissingPath навмисно вказує на неіснуючий файл.
+    $rangeIdTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_RANGE_ID_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    $rangeIdMissingPath = Join-Path $rangeIdTestRoot 'does-not-exist-range-id.json'
     $rangeIdMissingResultCapture = & $rangeIdTestModule {
         param($Path)
         # Стаб дзеркалить реальну сигнатуру Write-Log (Message/Level/
@@ -17398,9 +17571,9 @@ try {
         -Name "Maintenance/RangeIdMissingRemainsWarning" `
         -Failure "Test-RangeIdUsage на відсутньому файлі має повертати HasIssue=true з причиною, яку крок консолі показує як WARN"
 
-    $rangeIdCallSiteStart = $maintenanceScriptTextForManifestStorage.IndexOf("-Name 'Контроль діапазонів ID' ``")
+    $rangeIdCallSiteStart = $maintenanceScriptText.IndexOf("-Name 'Контроль діапазонів ID' ``")
     $rangeIdCallSiteWindow = if ($rangeIdCallSiteStart -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             [Math]::Max(0, $rangeIdCallSiteStart - 1100), 1100)
     } else { '' }
     Test-BRAVOCondition `
@@ -17464,8 +17637,8 @@ try {
     Test-BRAVOCondition `
         -Condition (
             -not $rangeIdCriticalRestoreCapture.CriticalAfterRestore -and
-            $maintenanceScriptTextForManifestStorage.Contains('Resolve-BRAVOExitCode -HasWarnings') -and
-            $maintenanceScriptTextForManifestStorage.Contains('-MaintenanceFailed')
+            $maintenanceScriptText.Contains('Resolve-BRAVOExitCode -HasWarnings') -and
+            $maintenanceScriptText.Contains('-MaintenanceFailed')
         ) `
         -Name "Maintenance/RangeIdMissingDoesNotProduceFailureExit" `
         -Failure "з criticalErrorOccurred=false і WARN-лічильником > 0 підсумковий exit code має бути Resolve-BRAVOExitCode -HasWarnings (10), а не -MaintenanceFailed (60) — сама формула exit code (нижче) не змінена, лише вхідний прапорець"
@@ -17485,211 +17658,210 @@ try {
     # реальній екстракції функції; Start-Sleep підмінюється в module scope,
     # щоб тести були детермінованими і не спали по-справжньому.
     $rangeIdWaitModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @('Wait-BRAVORangeIdLogFile')
-    # Корінь уже прибраний finally-блоком manifest-storage тестів вище —
-    # створюємо заново для реальних файлів цих тестів і прибираємо в кінці.
-    [void][IO.Directory]::CreateDirectory($manifestStorageTestRoot)
+    # Каталог існує лише на час тестів на реальних файлах нижче і
+    # прибирається у finally навіть тоді, коли якийсь із них кине виняток.
+    [void][IO.Directory]::CreateDirectory($rangeIdTestRoot)
+    try {
+        # 1) Файл уже існує (звичайний maintenance) — повернення одразу,
+        # Start-Sleep не викликається взагалі: жодної доданої затримки.
+        $rangeIdExistingFilePath = Join-Path $rangeIdTestRoot 'existing-range-id.json'
+        Set-Content -LiteralPath $rangeIdExistingFilePath -Value '{}' -Encoding Ascii
+        $rangeIdWaitExistingCapture = & $rangeIdWaitModule {
+            param($Path)
+            $script:RangeIdWaitSleepCalls = 0
+            function Write-Log {
+                param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+                $null = $Message; $null = $Level; $null = $NoTimestamp; $null = $NoConsole
+            }
+            function Start-Sleep { param($Seconds) $null = $Seconds; $script:RangeIdWaitSleepCalls++ }
+            $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 30 -IntervalSeconds 5
+            [pscustomobject]@{ Appeared = $appeared; SleepCalls = $script:RangeIdWaitSleepCalls }
+        } $rangeIdExistingFilePath
+        Test-BRAVOCondition `
+            -Condition ($rangeIdWaitExistingCapture.Appeared -and $rangeIdWaitExistingCapture.SleepCalls -eq 0) `
+            -Name "Maintenance/RangeIdWaitSkipsDelayWhenFileExists" `
+            -Failure "з наявним range_id_log.json Wait-BRAVORangeIdLogFile має повертати true одразу, без жодного Start-Sleep — звичайний maintenance не отримує доданої затримки"
 
-    # 1) Файл уже існує (звичайний maintenance) — повернення одразу,
-    # Start-Sleep не викликається взагалі: жодної доданої затримки.
-    $rangeIdExistingFilePath = Join-Path $manifestStorageTestRoot 'existing-range-id.json'
-    Set-Content -LiteralPath $rangeIdExistingFilePath -Value '{}' -Encoding Ascii
-    $rangeIdWaitExistingCapture = & $rangeIdWaitModule {
-        param($Path)
-        $script:RangeIdWaitSleepCalls = 0
-        function Write-Log {
-            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
-            $null = $Message; $null = $Level; $null = $NoTimestamp; $null = $NoConsole
-        }
-        function Start-Sleep { param($Seconds) $null = $Seconds; $script:RangeIdWaitSleepCalls++ }
-        $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 30 -IntervalSeconds 5
-        [pscustomobject]@{ Appeared = $appeared; SleepCalls = $script:RangeIdWaitSleepCalls }
-    } $rangeIdExistingFilePath
-    Test-BRAVOCondition `
-        -Condition ($rangeIdWaitExistingCapture.Appeared -and $rangeIdWaitExistingCapture.SleepCalls -eq 0) `
-        -Name "Maintenance/RangeIdWaitSkipsDelayWhenFileExists" `
-        -Failure "з наявним range_id_log.json Wait-BRAVORangeIdLogFile має повертати true одразу, без жодного Start-Sleep — звичайний maintenance не отримує доданої затримки"
+        # 2) Файл з'являється ПІД ЧАС очікування (BRAVO створив його асинхронно
+        # після старту): фейковий Start-Sleep створює файл — детермінована
+        # модель "файл з'явився через 5-20 сек.". Результат true, без WARNING.
+        $rangeIdLateFilePath = Join-Path $rangeIdTestRoot 'late-range-id.json'
+        if (Test-Path -LiteralPath $rangeIdLateFilePath) { Remove-Item -LiteralPath $rangeIdLateFilePath -Force }
+        $rangeIdWaitLateCapture = & $rangeIdWaitModule {
+            param($Path)
+            $script:RangeIdWaitLogLevels = @()
+            function Write-Log {
+                param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+                $null = $Message; $null = $NoTimestamp; $null = $NoConsole
+                $script:RangeIdWaitLogLevels += $Level
+            }
+            function Start-Sleep {
+                param($Seconds)
+                $null = $Seconds
+                Set-Content -LiteralPath $Path -Value '{}' -Encoding Ascii
+            }
+            $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 30 -IntervalSeconds 5
+            [pscustomobject]@{ Appeared = $appeared; Levels = $script:RangeIdWaitLogLevels }
+        } $rangeIdLateFilePath
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdWaitLateCapture.Appeared -and
+                @($rangeIdWaitLateCapture.Levels | Where-Object { $_ -eq 'WARNING' }).Count -eq 0 -and
+                @($rangeIdWaitLateCapture.Levels | Where-Object { $_ -eq 'INFO' }).Count -eq 2
+            ) `
+            -Name "Maintenance/RangeIdWaitDetectsLateFile" `
+            -Failure "якщо файл з'явився під час bounded-очікування, Wait-BRAVORangeIdLogFile має повернути true з двома INFO (початок очікування + поява файла) і жодного WARNING — штатна перевірка далі йде без false WARNING"
 
-    # 2) Файл з'являється ПІД ЧАС очікування (BRAVO створив його асинхронно
-    # після старту): фейковий Start-Sleep створює файл — детермінована
-    # модель "файл з'явився через 5-20 сек.". Результат true, без WARNING.
-    $rangeIdLateFilePath = Join-Path $manifestStorageTestRoot 'late-range-id.json'
-    if (Test-Path -LiteralPath $rangeIdLateFilePath) { Remove-Item -LiteralPath $rangeIdLateFilePath -Force }
-    $rangeIdWaitLateCapture = & $rangeIdWaitModule {
-        param($Path)
-        $script:RangeIdWaitLogLevels = @()
-        function Write-Log {
-            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
-            $null = $Message; $null = $NoTimestamp; $null = $NoConsole
-            $script:RangeIdWaitLogLevels += $Level
-        }
-        function Start-Sleep {
-            param($Seconds)
-            $null = $Seconds
-            Set-Content -LiteralPath $Path -Value '{}' -Encoding Ascii
-        }
-        $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 30 -IntervalSeconds 5
-        [pscustomobject]@{ Appeared = $appeared; Levels = $script:RangeIdWaitLogLevels }
-    } $rangeIdLateFilePath
-    Test-BRAVOCondition `
-        -Condition (
-            $rangeIdWaitLateCapture.Appeared -and
-            @($rangeIdWaitLateCapture.Levels | Where-Object { $_ -eq 'WARNING' }).Count -eq 0 -and
-            @($rangeIdWaitLateCapture.Levels | Where-Object { $_ -eq 'INFO' }).Count -eq 2
-        ) `
-        -Name "Maintenance/RangeIdWaitDetectsLateFile" `
-        -Failure "якщо файл з'явився під час bounded-очікування, Wait-BRAVORangeIdLogFile має повернути true з двома INFO (початок очікування + поява файла) і жодного WARNING — штатна перевірка далі йде без false WARNING"
+        # 3) Файл так і не з'явився: цикл обмежений дедлайном (реальний таймаут
+        # 1 сек. — тест швидкий), повертає false; сам helper WARNING не пише
+        # (рівно один фінальний WARNING формує Test-RangeIdUsage за таймаутом).
+        $rangeIdNeverFilePath = Join-Path $rangeIdTestRoot 'never-range-id.json'
+        if (Test-Path -LiteralPath $rangeIdNeverFilePath) { Remove-Item -LiteralPath $rangeIdNeverFilePath -Force }
+        $rangeIdWaitTimeoutCapture = & $rangeIdWaitModule {
+            param($Path)
+            $script:RangeIdWaitLogLevels = @()
+            function Write-Log {
+                param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+                $null = $Message; $null = $NoTimestamp; $null = $NoConsole
+                $script:RangeIdWaitLogLevels += $Level
+            }
+            function Start-Sleep { param($Seconds) $null = $Seconds }
+            $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 1 -IntervalSeconds 1
+            [pscustomobject]@{ Appeared = $appeared; Levels = $script:RangeIdWaitLogLevels }
+        } $rangeIdNeverFilePath
+        Test-BRAVOCondition `
+            -Condition (
+                -not $rangeIdWaitTimeoutCapture.Appeared -and
+                @($rangeIdWaitTimeoutCapture.Levels | Where-Object { $_ -eq 'WARNING' }).Count -eq 0
+            ) `
+            -Name "Maintenance/RangeIdWaitTimesOutBounded" `
+            -Failure "якщо файл не з'явився до дедлайну, Wait-BRAVORangeIdLogFile має повернути false за скінченний час і не писати WARNING сам — інакше було б два WARNING за один цикл"
 
-    # 3) Файл так і не з'явився: цикл обмежений дедлайном (реальний таймаут
-    # 1 сек. — тест швидкий), повертає false; сам helper WARNING не пише
-    # (рівно один фінальний WARNING формує Test-RangeIdUsage за таймаутом).
-    $rangeIdNeverFilePath = Join-Path $manifestStorageTestRoot 'never-range-id.json'
-    if (Test-Path -LiteralPath $rangeIdNeverFilePath) { Remove-Item -LiteralPath $rangeIdNeverFilePath -Force }
-    $rangeIdWaitTimeoutCapture = & $rangeIdWaitModule {
-        param($Path)
-        $script:RangeIdWaitLogLevels = @()
-        function Write-Log {
-            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
-            $null = $Message; $null = $NoTimestamp; $null = $NoConsole
-            $script:RangeIdWaitLogLevels += $Level
-        }
-        function Start-Sleep { param($Seconds) $null = $Seconds }
-        $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 1 -IntervalSeconds 1
-        [pscustomobject]@{ Appeared = $appeared; Levels = $script:RangeIdWaitLogLevels }
-    } $rangeIdNeverFilePath
-    Test-BRAVOCondition `
-        -Condition (
-            -not $rangeIdWaitTimeoutCapture.Appeared -and
-            @($rangeIdWaitTimeoutCapture.Levels | Where-Object { $_ -eq 'WARNING' }).Count -eq 0
-        ) `
-        -Name "Maintenance/RangeIdWaitTimesOutBounded" `
-        -Failure "якщо файл не з'явився до дедлайну, Wait-BRAVORangeIdLogFile має повернути false за скінченний час і не писати WARNING сам — інакше було б два WARNING за один цикл"
+        # 4) Після невдалого очікування Test-RangeIdUsage -WaitedForFileSeconds
+        # формує саме таймаут-текст (лог/Slack — один рядок, Reason кроку — два).
+        $rangeIdTimeoutMessageCapture = & $rangeIdTestModule {
+            param($Path)
+            $script:RangeIdWarningMessages = @()
+            function Write-Log {
+                param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+                $null = $NoTimestamp; $null = $NoConsole
+                if ($Level -eq 'WARNING') { $script:RangeIdWarningMessages += [string]$Message }
+            }
+            function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+            $result = Test-RangeIdUsage -Path $Path -ThresholdPercent 90 -WaitedForFileSeconds 30
+            [pscustomobject]@{
+                HasIssue = $result.HasIssue
+                Reason = $result.Reason
+                WarningMessages = $script:RangeIdWarningMessages
+            }
+        } $rangeIdMissingPath
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdTimeoutMessageCapture.HasIssue -and
+                [string]$rangeIdTimeoutMessageCapture.Reason -eq "Файл контролю діапазонів ID не з'явився протягом 30 сек. після запуску BRAVO:`n$rangeIdMissingPath" -and
+                @($rangeIdTimeoutMessageCapture.WarningMessages).Count -eq 1 -and
+                [string]@($rangeIdTimeoutMessageCapture.WarningMessages)[0] -eq "Файл контролю діапазонів ID не з'явився протягом 30 сек. після запуску BRAVO: $rangeIdMissingPath"
+            ) `
+            -Name "Maintenance/RangeIdTimeoutWarningNamesStartupWait" `
+            -Failure "після марного bounded-очікування WARNING має пояснювати таймаут появи файла після запуску BRAVO (рівно один WARNING), а Reason кроку — та сама мітка + шлях окремим рядком"
 
-    # 4) Після невдалого очікування Test-RangeIdUsage -WaitedForFileSeconds
-    # формує саме таймаут-текст (лог/Slack — один рядок, Reason кроку — два).
-    $rangeIdTimeoutMessageCapture = & $rangeIdTestModule {
-        param($Path)
-        $script:RangeIdWarningMessages = @()
-        function Write-Log {
-            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
-            $null = $NoTimestamp; $null = $NoConsole
-            if ($Level -eq 'WARNING') { $script:RangeIdWarningMessages += [string]$Message }
-        }
-        function Send-SlackAlert { param($Message, [switch]$IsCritical) }
-        $result = Test-RangeIdUsage -Path $Path -ThresholdPercent 90 -WaitedForFileSeconds 30
-        [pscustomobject]@{
-            HasIssue = $result.HasIssue
-            Reason = $result.Reason
-            WarningMessages = $script:RangeIdWarningMessages
-        }
-    } $rangeIdMissingPath
-    Test-BRAVOCondition `
-        -Condition (
-            $rangeIdTimeoutMessageCapture.HasIssue -and
-            [string]$rangeIdTimeoutMessageCapture.Reason -eq "Файл контролю діапазонів ID не з'явився протягом 30 сек. після запуску BRAVO:`n$rangeIdMissingPath" -and
-            @($rangeIdTimeoutMessageCapture.WarningMessages).Count -eq 1 -and
-            [string]@($rangeIdTimeoutMessageCapture.WarningMessages)[0] -eq "Файл контролю діапазонів ID не з'явився протягом 30 сек. після запуску BRAVO: $rangeIdMissingPath"
-        ) `
-        -Name "Maintenance/RangeIdTimeoutWarningNamesStartupWait" `
-        -Failure "після марного bounded-очікування WARNING має пояснювати таймаут появи файла після запуску BRAVO (рівно один WARNING), а Reason кроку — та сама мітка + шлях окремим рядком"
+        # 5) Структурно: очікування підключене саме в гейті [8/8] і застосовує
+        # 30-сек. таймаут ЛИШЕ коли службу BRAVO запустив цей прогін; прапорець
+        # ставиться рівно один раз — у success-гілці запуску служби BRAVO.
+        $rangeIdWaitTryIndex = $maintenanceScriptText.IndexOf('усе від Range ID до Send-FinalReport')
+        $rangeIdWaitGateIndex = if ($rangeIdWaitTryIndex -ge 0) {
+            $maintenanceScriptText.IndexOf(
+                'if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {',
+                $rangeIdWaitTryIndex)
+        } else { -1 }
+        $rangeIdWaitGateWindow = if ($rangeIdWaitGateIndex -ge 0) {
+            $maintenanceScriptText.Substring(
+                $rangeIdWaitGateIndex,
+                [Math]::Min(3600, $maintenanceScriptText.Length - $rangeIdWaitGateIndex))
+        } else { '' }
+        $rangeIdStartFlagAssignments = [regex]::Matches(
+            $maintenanceScriptText,
+            [regex]::Escape('$script:bravoServiceStartedThisRun = $true'))
+        $rangeIdStartSuccessIndex = $maintenanceScriptText.IndexOf(
+            'Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"')
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdWaitGateIndex -ge 0 -and
+                $rangeIdWaitGateWindow.Contains('$rangeIdWaitTimeoutSeconds = if ($script:bravoServiceStartedThisRun) { 30 } else { 0 }') -and
+                $rangeIdWaitGateWindow.Contains('Wait-BRAVORangeIdLogFile') -and
+                $rangeIdWaitGateWindow.Contains('-WaitedForFileSeconds $rangeIdWaitedForFileSeconds') -and
+                $rangeIdStartFlagAssignments.Count -eq 1 -and
+                $rangeIdStartSuccessIndex -ge 0 -and
+                $rangeIdStartFlagAssignments[0].Index -gt $rangeIdStartSuccessIndex -and
+                $rangeIdStartFlagAssignments[0].Index - $rangeIdStartSuccessIndex -lt 300 -and
+                $maintenanceScriptText.Contains('$script:bravoServiceStartedThisRun = $false')
+            ) `
+            -Name "Maintenance/RangeIdWaitOnlyAfterBravoServiceStart" `
+            -Failure "30-сек. bounded-очікування має вмикатися лише коли `$script:bravoServiceStartedThisRun=true, а сам прапорець — ставитися рівно один раз у success-гілці запуску служби BRAVO і скидатися у false на старті прогону"
 
-    # 5) Структурно: очікування підключене саме в гейті [8/8] і застосовує
-    # 30-сек. таймаут ЛИШЕ коли службу BRAVO запустив цей прогін; прапорець
-    # ставиться рівно один раз — у success-гілці запуску служби BRAVO.
-    $rangeIdWaitTryIndex = $maintenanceScriptTextForManifestStorage.IndexOf('усе від Range ID до Send-FinalReport')
-    $rangeIdWaitGateIndex = if ($rangeIdWaitTryIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.IndexOf(
-            'if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {',
-            $rangeIdWaitTryIndex)
-    } else { -1 }
-    $rangeIdWaitGateWindow = if ($rangeIdWaitGateIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring(
-            $rangeIdWaitGateIndex,
-            [Math]::Min(3600, $maintenanceScriptTextForManifestStorage.Length - $rangeIdWaitGateIndex))
-    } else { '' }
-    $rangeIdStartFlagAssignments = [regex]::Matches(
-        $maintenanceScriptTextForManifestStorage,
-        [regex]::Escape('$script:bravoServiceStartedThisRun = $true'))
-    $rangeIdStartSuccessIndex = $maintenanceScriptTextForManifestStorage.IndexOf(
-        'Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"')
-    Test-BRAVOCondition `
-        -Condition (
-            $rangeIdWaitGateIndex -ge 0 -and
-            $rangeIdWaitGateWindow.Contains('$rangeIdWaitTimeoutSeconds = if ($script:bravoServiceStartedThisRun) { 30 } else { 0 }') -and
-            $rangeIdWaitGateWindow.Contains('Wait-BRAVORangeIdLogFile') -and
-            $rangeIdWaitGateWindow.Contains('-WaitedForFileSeconds $rangeIdWaitedForFileSeconds') -and
-            $rangeIdStartFlagAssignments.Count -eq 1 -and
-            $rangeIdStartSuccessIndex -ge 0 -and
-            $rangeIdStartFlagAssignments[0].Index -gt $rangeIdStartSuccessIndex -and
-            $rangeIdStartFlagAssignments[0].Index - $rangeIdStartSuccessIndex -lt 300 -and
-            $maintenanceScriptTextForManifestStorage.Contains('$script:bravoServiceStartedThisRun = $false')
-        ) `
-        -Name "Maintenance/RangeIdWaitOnlyAfterBravoServiceStart" `
-        -Failure "30-сек. bounded-очікування має вмикатися лише коли `$script:bravoServiceStartedThisRun=true, а сам прапорець — ставитися рівно один раз у success-гілці запуску служби BRAVO і скидатися у false на старті прогону"
+        # 6) Guard тексту helper-а: без WARNING/Slack усередині (гарантія рівно
+        # одного WARNING за цикл), цикл жорстко обмежений дедлайном, обидва
+        # Test-Path — на тому самому -LiteralPath $Path (без fallback-пошуку).
+        $rangeIdWaitFunctionStart = $maintenanceScriptText.IndexOf('function Wait-BRAVORangeIdLogFile')
+        $rangeIdWaitFunctionEnd = $maintenanceScriptText.IndexOf('function Test-RangeIdUsage', [Math]::Max(0, $rangeIdWaitFunctionStart))
+        $rangeIdWaitFunctionText = if ($rangeIdWaitFunctionStart -ge 0 -and $rangeIdWaitFunctionEnd -gt $rangeIdWaitFunctionStart) {
+            $maintenanceScriptText.Substring(
+                $rangeIdWaitFunctionStart, $rangeIdWaitFunctionEnd - $rangeIdWaitFunctionStart)
+        } else { '' }
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdWaitFunctionText.Length -gt 0 -and
+                -not $rangeIdWaitFunctionText.Contains('-Level "WARNING"') -and
+                -not $rangeIdWaitFunctionText.Contains('Send-SlackAlert') -and
+                $rangeIdWaitFunctionText.Contains('while ((Get-Date) -lt $deadline)') -and
+                ([regex]::Matches($rangeIdWaitFunctionText, [regex]::Escape('Test-Path -LiteralPath $Path -PathType Leaf')).Count -eq 2) -and
+                ([regex]::Matches($rangeIdWaitFunctionText, 'Test-Path').Count -eq 2)
+            ) `
+            -Name "Maintenance/RangeIdWaitHelperIsBoundedAndSilent" `
+            -Failure "Wait-BRAVORangeIdLogFile не має писати WARNING/Slack (фінальний WARNING — лише з Test-RangeIdUsage), цикл має бути обмежений дедлайном (без нескінченних циклів), а обидва Test-Path — перевіряти один і той самий -LiteralPath `$Path без fallback-шляхів"
 
-    # 6) Guard тексту helper-а: без WARNING/Slack усередині (гарантія рівно
-    # одного WARNING за цикл), цикл жорстко обмежений дедлайном, обидва
-    # Test-Path — на тому самому -LiteralPath $Path (без fallback-пошуку).
-    $rangeIdWaitFunctionStart = $maintenanceScriptTextForManifestStorage.IndexOf('function Wait-BRAVORangeIdLogFile')
-    $rangeIdWaitFunctionEnd = $maintenanceScriptTextForManifestStorage.IndexOf('function Test-RangeIdUsage', [Math]::Max(0, $rangeIdWaitFunctionStart))
-    $rangeIdWaitFunctionText = if ($rangeIdWaitFunctionStart -ge 0 -and $rangeIdWaitFunctionEnd -gt $rangeIdWaitFunctionStart) {
-        $maintenanceScriptTextForManifestStorage.Substring(
-            $rangeIdWaitFunctionStart, $rangeIdWaitFunctionEnd - $rangeIdWaitFunctionStart)
-    } else { '' }
-    Test-BRAVOCondition `
-        -Condition (
-            $rangeIdWaitFunctionText.Length -gt 0 -and
-            -not $rangeIdWaitFunctionText.Contains('-Level "WARNING"') -and
-            -not $rangeIdWaitFunctionText.Contains('Send-SlackAlert') -and
-            $rangeIdWaitFunctionText.Contains('while ((Get-Date) -lt $deadline)') -and
-            ([regex]::Matches($rangeIdWaitFunctionText, [regex]::Escape('Test-Path -LiteralPath $Path -PathType Leaf')).Count -eq 2) -and
-            ([regex]::Matches($rangeIdWaitFunctionText, 'Test-Path').Count -eq 2)
-        ) `
-        -Name "Maintenance/RangeIdWaitHelperIsBoundedAndSilent" `
-        -Failure "Wait-BRAVORangeIdLogFile не має писати WARNING/Slack (фінальний WARNING — лише з Test-RangeIdUsage), цикл має бути обмежений дедлайном (без нескінченних циклів), а обидва Test-Path — перевіряти один і той самий -LiteralPath `$Path без fallback-шляхів"
-
-    # 7) Deadline-семантика: TimeoutSeconds — справжня верхня межа, а не
-    # "дедлайн + ще один повний інтервал". Фейковий годинник (Get-Date і
-    # Start-Sleep підмінені в module scope; fake-sleep просуває годинник на
-    # запитану кількість секунд) робить перевірку детермінованою: з
-    # Timeout=13/Interval=5 послідовність sleep-ів має бути 5,5,3 — останній
-    # sleep обрізаний до залишку бюджету (3, а не повний інтервал 5), сума
-    # рівно 13 і жодної секунди понад Timeout.
-    $rangeIdWaitClampCapture = & $rangeIdWaitModule {
-        param($Path)
-        $script:RangeIdFakeNow = [datetime]'2026-01-01T00:00:00'
-        $script:RangeIdSleepLog = @()
-        function Get-Date { return $script:RangeIdFakeNow }
-        function Write-Log {
-            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
-            $null = $Message; $null = $Level; $null = $NoTimestamp; $null = $NoConsole
+        # 7) Deadline-семантика: TimeoutSeconds — справжня верхня межа, а не
+        # "дедлайн + ще один повний інтервал". Фейковий годинник (Get-Date і
+        # Start-Sleep підмінені в module scope; fake-sleep просуває годинник на
+        # запитану кількість секунд) робить перевірку детермінованою: з
+        # Timeout=13/Interval=5 послідовність sleep-ів має бути 5,5,3 — останній
+        # sleep обрізаний до залишку бюджету (3, а не повний інтервал 5), сума
+        # рівно 13 і жодної секунди понад Timeout.
+        $rangeIdWaitClampCapture = & $rangeIdWaitModule {
+            param($Path)
+            $script:RangeIdFakeNow = [datetime]'2026-01-01T00:00:00'
+            $script:RangeIdSleepLog = @()
+            function Get-Date { return $script:RangeIdFakeNow }
+            function Write-Log {
+                param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+                $null = $Message; $null = $Level; $null = $NoTimestamp; $null = $NoConsole
+            }
+            function Start-Sleep {
+                param($Seconds)
+                $script:RangeIdSleepLog += [int]$Seconds
+                $script:RangeIdFakeNow = $script:RangeIdFakeNow.AddSeconds([int]$Seconds)
+            }
+            $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 13 -IntervalSeconds 5
+            [pscustomobject]@{
+                Appeared = $appeared
+                Sleeps = @($script:RangeIdSleepLog)
+                TotalSleptSeconds = [int](@($script:RangeIdSleepLog) | Measure-Object -Sum).Sum
+            }
+        } $rangeIdNeverFilePath
+        Test-BRAVOCondition `
+            -Condition (
+                -not $rangeIdWaitClampCapture.Appeared -and
+                (@($rangeIdWaitClampCapture.Sleeps) -join ',') -eq '5,5,3' -and
+                $rangeIdWaitClampCapture.TotalSleptSeconds -eq 13
+            ) `
+            -Name "Maintenance/RangeIdWaitLastSleepClampedToDeadline" `
+            -Failure "з Timeout=13/Interval=5 сума sleep-ів має бути рівно 13 (5,5,3): останній sleep обрізається до залишку бюджету, а не спить повний інтервал понад дедлайн"
+    } finally {
+        if (Test-Path -LiteralPath $rangeIdTestRoot) {
+            Remove-Item -LiteralPath $rangeIdTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
-        function Start-Sleep {
-            param($Seconds)
-            $script:RangeIdSleepLog += [int]$Seconds
-            $script:RangeIdFakeNow = $script:RangeIdFakeNow.AddSeconds([int]$Seconds)
-        }
-        $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 13 -IntervalSeconds 5
-        [pscustomobject]@{
-            Appeared = $appeared
-            Sleeps = @($script:RangeIdSleepLog)
-            TotalSleptSeconds = [int](@($script:RangeIdSleepLog) | Measure-Object -Sum).Sum
-        }
-    } $rangeIdNeverFilePath
-    Test-BRAVOCondition `
-        -Condition (
-            -not $rangeIdWaitClampCapture.Appeared -and
-            (@($rangeIdWaitClampCapture.Sleeps) -join ',') -eq '5,5,3' -and
-            $rangeIdWaitClampCapture.TotalSleptSeconds -eq 13
-        ) `
-        -Name "Maintenance/RangeIdWaitLastSleepClampedToDeadline" `
-        -Failure "з Timeout=13/Interval=5 сума sleep-ів має бути рівно 13 (5,5,3): останній sleep обрізається до залишку бюджету, а не спить повний інтервал понад дедлайн"
-
-    # Прибирання файлів bounded-очікування — повертаємо стан "корінь
-    # відсутній", як його лишив finally manifest-storage тестів вище.
-    if (Test-Path -LiteralPath $manifestStorageTestRoot) {
-        Remove-Item -LiteralPath $manifestStorageTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     # --- Фінальний підсумок: та сама триланкова логіка (ПОМИЛКА/УСПІШНО З
@@ -17724,17 +17896,17 @@ function Get-BRAVOMaintenanceSummaryResult {
     Test-BRAVOCondition `
         -Condition (
             $maintenanceSuccessResult -eq 'УСПІШНО' -and
-            $maintenanceScriptTextForManifestStorage.Contains('function Get-BRAVOMaintenanceFinalStatus') -and
-            $maintenanceScriptTextForManifestStorage.Contains('$maintenanceFinalStatus = Get-BRAVOMaintenanceFinalStatus') -and
-            $maintenanceScriptTextForManifestStorage.Contains('$maintenanceSummaryResult = $maintenanceFinalStatus.Text') -and
-            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOFinalSummaryHeader ``") -and
-            $maintenanceScriptTextForManifestStorage.Contains("-Title 'BRAVO MAINTENANCE'") -and
-            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Статус'") -and
-            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Початок'") -and
-            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Завершення'") -and
-            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Кроків'") -and
+            $maintenanceScriptText.Contains('function Get-BRAVOMaintenanceFinalStatus') -and
+            $maintenanceScriptText.Contains('$maintenanceFinalStatus = Get-BRAVOMaintenanceFinalStatus') -and
+            $maintenanceScriptText.Contains('$maintenanceSummaryResult = $maintenanceFinalStatus.Text') -and
+            $maintenanceScriptText.Contains("Write-BRAVOFinalSummaryHeader ``") -and
+            $maintenanceScriptText.Contains("-Title 'BRAVO MAINTENANCE'") -and
+            $maintenanceScriptText.Contains("Write-BRAVOResultField -Label 'Статус'") -and
+            $maintenanceScriptText.Contains("Write-BRAVOResultField -Label 'Початок'") -and
+            $maintenanceScriptText.Contains("Write-BRAVOResultField -Label 'Завершення'") -and
+            $maintenanceScriptText.Contains("Write-BRAVOResultField -Label 'Кроків'") -and
             (
-                [regex]::Matches($maintenanceScriptTextForManifestStorage, "Write-BRAVOResultField -Label 'Попереджень'").Count -eq 1
+                [regex]::Matches($maintenanceScriptText, "Write-BRAVOResultField -Label 'Попереджень'").Count -eq 1
             )
         ) `
         -Name "Maintenance/FinalSummarySuccess" `
@@ -17742,9 +17914,9 @@ function Get-BRAVOMaintenanceSummaryResult {
     Test-BRAVOCondition `
         -Condition (
             $maintenanceFailureResult -eq 'ПОМИЛКА' -and
-            $maintenanceScriptTextForManifestStorage.Contains('$maintenanceExitCodeText = "{0} — {1}" -f $script:maintenanceRuntimeExitCode, (Get-BRAVOExitCodeName -Code $script:maintenanceRuntimeExitCode)') -and
-            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Код завершення' -Value `$maintenanceExitCodeText") -and
-            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Помилок' -Value ([string]`$script:BRAVOMaintenanceStepFailCount)")
+            $maintenanceScriptText.Contains('$maintenanceExitCodeText = "{0} — {1}" -f $script:maintenanceRuntimeExitCode, (Get-BRAVOExitCodeName -Code $script:maintenanceRuntimeExitCode)') -and
+            $maintenanceScriptText.Contains("Write-BRAVOResultField -Label 'Код завершення' -Value `$maintenanceExitCodeText") -and
+            $maintenanceScriptText.Contains("Write-BRAVOResultField -Label 'Помилок' -Value ([string]`$script:BRAVOMaintenanceStepFailCount)")
         ) `
         -Name "Maintenance/FinalSummaryFailure" `
         -Failure "ПОМИЛКА (критична помилка) має показувати той самий, а не вигаданий, exit code/назву через BRAVO.ExitCodes"
@@ -17941,12 +18113,12 @@ function Get-BRAVOMaintenanceSummaryResult {
     # Пошук стартує ПІСЛЯ 'усе від Range ID до Send-FinalReport' (унікальний
     # якір десь між ними), щоб знайти саме основний 10-field summary, а не
     # ранній compact recovery-варіант.
-    $maintenanceMainSummarySearchStart = $maintenanceScriptTextForManifestStorage.IndexOf('усе від Range ID до Send-FinalReport')
-    $maintenanceSummaryBlockStart = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryHeader `', $maintenanceMainSummarySearchStart)
-    $maintenanceSummaryBlockEnd = $maintenanceScriptTextForManifestStorage.IndexOf(
+    $maintenanceMainSummarySearchStart = $maintenanceScriptText.IndexOf('усе від Range ID до Send-FinalReport')
+    $maintenanceSummaryBlockStart = $maintenanceScriptText.IndexOf('Write-BRAVOFinalSummaryHeader `', $maintenanceMainSummarySearchStart)
+    $maintenanceSummaryBlockEnd = $maintenanceScriptText.IndexOf(
         'Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE', $maintenanceSummaryBlockStart)
     $maintenanceSummaryBlockText = if ($maintenanceSummaryBlockStart -ge 0 -and $maintenanceSummaryBlockEnd -gt $maintenanceSummaryBlockStart) {
-        $maintenanceSummaryBlockText = $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceSummaryBlockText = $maintenanceScriptText.Substring(
             $maintenanceSummaryBlockStart,
             $maintenanceSummaryBlockEnd - $maintenanceSummaryBlockStart + "Write-BRAVOFinalSummaryFooter -LogFile `$LOG_FILE".Length)
         $maintenanceSummaryBlockText
@@ -17998,7 +18170,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         'Контроль діапазонів ID'
     )
     $maintenanceStepCallNamePattern = "Write-BRAVOMaintenanceStep[\s``]*-Name\s+'([^']+)'"
-    $maintenanceStepCallMatches = [regex]::Matches($maintenanceScriptTextForManifestStorage, $maintenanceStepCallNamePattern)
+    $maintenanceStepCallMatches = [regex]::Matches($maintenanceScriptText, $maintenanceStepCallNamePattern)
     $maintenanceStepCallOrderedNames = @($maintenanceStepCallMatches | ForEach-Object { $_.Groups[1].Value })
     # Унікальні назви в порядку ПЕРШОЇ появи в джерелі — гілки (OK/WARN/
     # FAIL/SKIPPED) того самого логічного кроку повторюють ту саму назву.
@@ -18027,7 +18199,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     $maintenanceStepTotalTokens = $null
     $maintenanceStepTotalErrors = $null
     $maintenanceStepTotalAst = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceScriptTextForManifestStorage,
+        $maintenanceScriptText,
         [ref]$maintenanceStepTotalTokens,
         [ref]$maintenanceStepTotalErrors
     )
@@ -18077,11 +18249,11 @@ function Get-BRAVOMaintenanceSummaryResult {
     # конкретного кроку (унікальний якір у джерелі), тоді перевіряє, що
     # SKIPPED/'вимкнено' (чи специфічний Details) прив'язані САМЕ до неї,
     # не просто десь є у файлі.
-    $maintenanceRestoreGateIndex = $maintenanceScriptTextForManifestStorage.IndexOf('if (-not $restoreStepReported) {')
+    $maintenanceRestoreGateIndex = $maintenanceScriptText.IndexOf('if (-not $restoreStepReported) {')
     $maintenanceRestoreGateWindow = if ($maintenanceRestoreGateIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             $maintenanceRestoreGateIndex,
-            [Math]::Min(700, $maintenanceScriptTextForManifestStorage.Length - $maintenanceRestoreGateIndex))
+            [Math]::Min(700, $maintenanceScriptText.Length - $maintenanceRestoreGateIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -18096,11 +18268,11 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/RestoreDisabledRendersSkipped" `
         -Failure "коли реставрація не запланована цього прогону (`$shouldRestore=false), крок 'Реставрація моделі' має рендеритись SKIPPED 'не заплановано на цей запуск', зі своїм номером [5/8]"
 
-    $maintenanceSizeCheckGateIndex = $maintenanceScriptTextForManifestStorage.IndexOf('if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {')
+    $maintenanceSizeCheckGateIndex = $maintenanceScriptText.IndexOf('if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {')
     $maintenanceSizeCheckGateWindow = if ($maintenanceSizeCheckGateIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             $maintenanceSizeCheckGateIndex,
-            [Math]::Min(700, $maintenanceScriptTextForManifestStorage.Length - $maintenanceSizeCheckGateIndex))
+            [Math]::Min(700, $maintenanceScriptText.Length - $maintenanceSizeCheckGateIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -18113,11 +18285,11 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/SizeCheckDisabledRendersSkipped" `
         -Failure "коли перевірку розмірів .md вимкнено, крок 'Перевірка розмірів .md' має рендеритись SKIPPED 'вимкнено', зі своїм номером [4/8]"
 
-    $maintenanceLogsGateIndex = $maintenanceScriptTextForManifestStorage.IndexOf('if (-not $script:BRAVOMaintenanceLogsStepEnabled) {')
+    $maintenanceLogsGateIndex = $maintenanceScriptText.IndexOf('if (-not $script:BRAVOMaintenanceLogsStepEnabled) {')
     $maintenanceLogsGateWindow = if ($maintenanceLogsGateIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             $maintenanceLogsGateIndex,
-            [Math]::Min(300, $maintenanceScriptTextForManifestStorage.Length - $maintenanceLogsGateIndex))
+            [Math]::Min(300, $maintenanceScriptText.Length - $maintenanceLogsGateIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -18129,9 +18301,9 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/LogsDisabledRendersSkipped" `
         -Failure "коли компонент BRAVO вимкнено, крок 'Обробка trace і логів' має рендеритись SKIPPED 'вимкнено', зі своїм номером [6/8]"
 
-    $maintenanceOuterRangeTryIndex = $maintenanceScriptTextForManifestStorage.IndexOf('усе від Range ID до Send-FinalReport')
+    $maintenanceOuterRangeTryIndex = $maintenanceScriptText.IndexOf('усе від Range ID до Send-FinalReport')
     $maintenanceRangeIdGateIndex = if ($maintenanceOuterRangeTryIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.IndexOf(
+        $maintenanceScriptText.IndexOf(
             'if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {',
             $maintenanceOuterRangeTryIndex)
     } else { -1 }
@@ -18139,9 +18311,9 @@ function Get-BRAVOMaintenanceSummaryResult {
     # Wait-BRAVORangeIdLogFile перед Test-RangeIdUsage — else-гілка SKIPPED
     # змістилась далі від початку гейта, але лишається в цьому ж блоці.
     $maintenanceRangeIdGateWindow = if ($maintenanceRangeIdGateIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             $maintenanceRangeIdGateIndex,
-            [Math]::Min(3600, $maintenanceScriptTextForManifestStorage.Length - $maintenanceRangeIdGateIndex))
+            [Math]::Min(3600, $maintenanceScriptText.Length - $maintenanceRangeIdGateIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -18161,25 +18333,25 @@ function Get-BRAVOMaintenanceSummaryResult {
     # джерелі (той самий IndexOf-підхід, що Console/MaintenancePausesOnEveryExitPath
     # вище), без запуску production Main().
     # ================================================================
-    $maintenanceOuterRangeCatchIndex = $maintenanceScriptTextForManifestStorage.IndexOf('див. коментар біля відкриття try вище')
-    $maintenanceEndOfScriptMarkerIndex = $maintenanceScriptTextForManifestStorage.IndexOf('# ===== ЗАВЕРШЕННЯ СКРИПТУ =====')
+    $maintenanceOuterRangeCatchIndex = $maintenanceScriptText.IndexOf('див. коментар біля відкриття try вище')
+    $maintenanceEndOfScriptMarkerIndex = $maintenanceScriptText.IndexOf('# ===== ЗАВЕРШЕННЯ СКРИПТУ =====')
     # dev.19 (виправлено): inline if/elseif/else замінено на виклик
     # Get-BRAVOMaintenanceResolvedExitCode (та сама формула, лише
     # винесена в канонічну функцію й піднята ще вище — тепер ДО друку
     # ЛОГ "=== СТАТУС ===", не лише ДО РЕЗУЛЬТАТ) — новий буквальний
     # маркер точки присвоєння.
-    $maintenanceExitCodeCalcIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode')
+    $maintenanceExitCodeCalcIndex = $maintenanceScriptText.IndexOf('$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode')
     # dev.16: обидва пошуки стартують ПІСЛЯ $maintenanceEndOfScriptMarkerIndex,
     # бо Write-BRAVOFinalSummaryHeader/Footer тепер зустрічаються й раніше
     # в файлі — у compact no-op summary (Recovery/RunMissedRestoreOnly) —
     # і незв'язаний неунковий IndexOf знайшов би ЙОГО, а не основний
     # 10-field summary, чий порядок відносно exit code/Wait-BRAVOManualExit
     # тут перевіряється.
-    $maintenanceSummaryHeaderOrderIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryHeader `', $maintenanceEndOfScriptMarkerIndex)
-    $maintenanceSummaryFooterOrderIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE', $maintenanceEndOfScriptMarkerIndex)
-    $maintenanceManualExitOrderIndex = $maintenanceScriptTextForManifestStorage.LastIndexOf('Wait-BRAVOManualExit -NoPause:$NoPause')
+    $maintenanceSummaryHeaderOrderIndex = $maintenanceScriptText.IndexOf('Write-BRAVOFinalSummaryHeader `', $maintenanceEndOfScriptMarkerIndex)
+    $maintenanceSummaryFooterOrderIndex = $maintenanceScriptText.IndexOf('Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE', $maintenanceEndOfScriptMarkerIndex)
+    $maintenanceManualExitOrderIndex = $maintenanceScriptText.LastIndexOf('Wait-BRAVOManualExit -NoPause:$NoPause')
     $maintenanceCatchBodyText = if ($maintenanceOuterRangeCatchIndex -ge 0 -and $maintenanceEndOfScriptMarkerIndex -gt $maintenanceOuterRangeCatchIndex) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             $maintenanceOuterRangeCatchIndex,
             $maintenanceEndOfScriptMarkerIndex - $maintenanceOuterRangeCatchIndex)
     } else { '' }
@@ -18245,10 +18417,10 @@ function Get-BRAVOMaintenanceSummaryResult {
     # dev.15: Range ID — WARN не дублюється в консолі (Write-Log -NoConsole
     # всередині Test-RangeIdUsage), відсутній файл дає multiline Reason.
     # ================================================================
-    $maintenanceRangeIdFunctionStart = $maintenanceScriptTextForManifestStorage.IndexOf('function Test-RangeIdUsage')
-    $maintenanceRangeIdFunctionEnd = $maintenanceScriptTextForManifestStorage.IndexOf('function Format-CommandOutput', $maintenanceRangeIdFunctionStart)
+    $maintenanceRangeIdFunctionStart = $maintenanceScriptText.IndexOf('function Test-RangeIdUsage')
+    $maintenanceRangeIdFunctionEnd = $maintenanceScriptText.IndexOf('function Format-CommandOutput', $maintenanceRangeIdFunctionStart)
     $maintenanceRangeIdFunctionText = if ($maintenanceRangeIdFunctionStart -ge 0 -and $maintenanceRangeIdFunctionEnd -gt $maintenanceRangeIdFunctionStart) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             $maintenanceRangeIdFunctionStart, $maintenanceRangeIdFunctionEnd - $maintenanceRangeIdFunctionStart)
     } else { '' }
     # Лише виклики, чиє повідомлення повертається як .Reason (і тому й так
@@ -18294,8 +18466,8 @@ function Get-BRAVOMaintenanceSummaryResult {
     # `.Contains()` на всьому файлі ловив би й коментар.
     Test-BRAVOCondition `
         -Condition (
-            [regex]::IsMatch($maintenanceScriptTextForManifestStorage, '(?m)^Write-BRAVOHeaderSeparator\s*$') -and
-            -not [regex]::IsMatch($maintenanceScriptTextForManifestStorage, '(?m)^Write-BRAVOSeparator\s*$') -and
+            [regex]::IsMatch($maintenanceScriptText, '(?m)^Write-BRAVOHeaderSeparator\s*$') -and
+            -not [regex]::IsMatch($maintenanceScriptText, '(?m)^Write-BRAVOSeparator\s*$') -and
             $maintenanceHeaderSeparatorText -eq $maintenanceSeparatorLine
         ) `
         -Name "Maintenance/PlanUsesEqualsSeparator" `
@@ -18316,7 +18488,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # усередині виклику — відтворення точної причини, не симуляція.
     # ================================================================
     $restoreCleanupModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @('Remove-OldRestoreArchives')
     $restoreCleanupPrefix = 'RESTORECLEANUP'
 
@@ -18792,9 +18964,9 @@ function Get-BRAVOMaintenanceSummaryResult {
 
     # --- Plan: Очистка старих даних/логів присутня й на правильній позиції
     # (Реставрація моделі -> Очистка -> Архівація після maintenance).
-    $planCleanupIndex = $maintenanceScriptTextForManifestStorage.IndexOf("'Очистка старих даних/логів'      = `$true")
-    $planRestoreIndex = $maintenanceScriptTextForManifestStorage.IndexOf("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled")
-    $planArchiveIndex = $maintenanceScriptTextForManifestStorage.IndexOf("'Архівація після maintenance'     = [bool]`$script:BRAVOMaintenanceArchiveStepEnabled")
+    $planCleanupIndex = $maintenanceScriptText.IndexOf("'Очистка старих даних/логів'      = `$true")
+    $planRestoreIndex = $maintenanceScriptText.IndexOf("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled")
+    $planArchiveIndex = $maintenanceScriptText.IndexOf("'Архівація після maintenance'     = [bool]`$script:BRAVOMaintenanceArchiveStepEnabled")
     Test-BRAVOCondition `
         -Condition (
             $planCleanupIndex -ge 0 -and
@@ -18819,7 +18991,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     )) {
         $unnumberedOpPattern = "Write-BRAVOMaintenanceOperation[\s``]*-Name\s+'$([regex]::Escape($unnumberedOp.Name))'"
         Test-BRAVOCondition `
-            -Condition ([regex]::IsMatch($maintenanceScriptTextForManifestStorage, $unnumberedOpPattern)) `
+            -Condition ([regex]::IsMatch($maintenanceScriptText, $unnumberedOpPattern)) `
             -Name $unnumberedOp.TestName `
             -Failure "'$($unnumberedOp.Name)' має рендеритись через Write-BRAVOMaintenanceOperation (без [N/8]), не Write-BRAVOMaintenanceStep"
     }
@@ -18926,15 +19098,15 @@ function Get-BRAVOMaintenanceSummaryResult {
     # підхоплюється нічним Maintenance у вікні / boot-Recovery) — теж INFO;
     # справжній розсинхрон конфігурації покриває окреме попередження
     # $maintenanceDailyAtInsideRestoreWindow.
-    $forceRestoreOutsideWindowIndex = $maintenanceScriptTextForManifestStorage.IndexOf(
+    $forceRestoreOutsideWindowIndex = $maintenanceScriptText.IndexOf(
         '"Примусова реставрація поза дозволеним вікном')
     $forceRestoreOutsideWindowWindow = if ($forceRestoreOutsideWindowIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring($forceRestoreOutsideWindowIndex, 300)
+        $maintenanceScriptText.Substring($forceRestoreOutsideWindowIndex, 300)
     } else { '' }
-    $restoreSkippedByWindowIndex = $maintenanceScriptTextForManifestStorage.IndexOf(
+    $restoreSkippedByWindowIndex = $maintenanceScriptText.IndexOf(
         '"Реставрацію пропущено: поточний час')
     $restoreSkippedByWindowWindow = if ($restoreSkippedByWindowIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring($restoreSkippedByWindowIndex, 300)
+        $maintenanceScriptText.Substring($restoreSkippedByWindowIndex, 300)
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -18965,7 +19137,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     Test-BRAVOCondition `
         -Condition (
             [int]$maintenanceSummaryTotals.LogCount -eq [int]$maintenanceSummaryTotals.Sum -and
-            $maintenanceScriptTextForManifestStorage.Contains(
+            $maintenanceScriptText.Contains(
                 "Write-BRAVOResultField -Label 'Кроків' -Value ([string]`$script:BRAVOMaintenanceStepLog.Count)")
         ) `
         -Name "Maintenance/SummaryStepCountMatchesStatusCounters" `
@@ -18978,11 +19150,11 @@ function Get-BRAVOMaintenanceSummaryResult {
     # хоча етап відпрацював ("оброблено файлів: 2"). Зріз мусить братися
     # безпосередньо перед фазою обробки логів.
     $maintenanceLogsBaselineAssignments = [regex]::Matches(
-        $maintenanceScriptTextForManifestStorage,
+        $maintenanceScriptText,
         '\$logsCriticalBefore\s*=\s*\$script:criticalErrorOccurred')
-    $maintenanceLogsPhaseIndex = $maintenanceScriptTextForManifestStorage.IndexOf(
+    $maintenanceLogsPhaseIndex = $maintenanceScriptText.IndexOf(
         "Write-BRAVOProgressPhase -Phase 'Обробка trace і логів'")
-    $maintenanceRestoreStepIndex = $maintenanceScriptTextForManifestStorage.IndexOf(
+    $maintenanceRestoreStepIndex = $maintenanceScriptText.IndexOf(
         "-Name 'Реставрація моделі' ``")
     $maintenanceLogsBaselineNearPhase = @(
         $maintenanceLogsBaselineAssignments |
@@ -19006,9 +19178,9 @@ function Get-BRAVOMaintenanceSummaryResult {
     # ПЕРЕД цим call site, тож фіксований 1400-символьний lookback
     # більше не дотягувався до SKIPPED/Get-BRAVOMaintenanceStepStatus
     # вище.
-    $cleanupResultCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("-Name 'Очистка старих даних/логів' ``", $planCleanupIndex)
+    $cleanupResultCallIndex = $maintenanceScriptText.IndexOf("-Name 'Очистка старих даних/логів' ``", $planCleanupIndex)
     $cleanupResultCallWindow = if ($cleanupResultCallIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring([Math]::Max(0, $cleanupResultCallIndex - 2000), 2000)
+        $maintenanceScriptText.Substring([Math]::Max(0, $cleanupResultCallIndex - 2000), 2000)
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -19038,12 +19210,12 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure "WARN/FAIL 'Очистка старих даних/логів' має показувати Details 'перевірте LOG для деталей'"
 
     # --- Archive after maintenance: SKIPPED/OK/FAIL wiring.
-    $archiveResultCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("`$script:currentMaintenanceOperation = 'Архівація після maintenance'")
+    $archiveResultCallIndex = $maintenanceScriptText.IndexOf("`$script:currentMaintenanceOperation = 'Архівація після maintenance'")
     # Вікно 3600 -> 4300: гейт AUTO-наміру для дочірнього BRAVO_ARCHIV
     # (review PR #134, $archiveConfigArgumentText) легітимно додав ~600
     # символів між маркером операції та SKIPPED/OK/FAIL-wiring.
     $archiveResultCallWindow = if ($archiveResultCallIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring($archiveResultCallIndex, [Math]::Min(4300, $maintenanceScriptTextForManifestStorage.Length - $archiveResultCallIndex))
+        $maintenanceScriptText.Substring($archiveResultCallIndex, [Math]::Min(4300, $maintenanceScriptText.Length - $archiveResultCallIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -19079,7 +19251,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # Get-BRAVOMaintenanceResolvedExitCode; коди — з BRAVO.ExitCodes.
     $archiveChildExitTempFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_MAINT_ARCHIVE_CHILD_SELF_TEST_{0}.log" -f [guid]::NewGuid().ToString("N"))
     $archiveChildExitModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @(
             'Write-Log',
             'Write-BRAVOMaintenanceLogFile',
@@ -19161,9 +19333,9 @@ function Get-BRAVOMaintenanceSummaryResult {
     # reachability (той самий рядок 'Автоматичне вимкнення сервера' тепер
     # зустрічається двічі: маркер + відкладений виклик — беремо ОСТАННЄ
     # входження).
-    $autoShutdownResultCallIndex = $maintenanceScriptTextForManifestStorage.LastIndexOf('ВИКЛИК ФУНКЦІЇ АВТОМАТИЧНОГО ВИМКНЕННЯ (P2-6')
+    $autoShutdownResultCallIndex = $maintenanceScriptText.LastIndexOf('ВИКЛИК ФУНКЦІЇ АВТОМАТИЧНОГО ВИМКНЕННЯ (P2-6')
     $autoShutdownResultCallWindow = if ($autoShutdownResultCallIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring($autoShutdownResultCallIndex, [Math]::Min(2600, $maintenanceScriptTextForManifestStorage.Length - $autoShutdownResultCallIndex))
+        $maintenanceScriptText.Substring($autoShutdownResultCallIndex, [Math]::Min(2600, $maintenanceScriptText.Length - $autoShutdownResultCallIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -19185,8 +19357,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition (
             $autoShutdownResultCallWindow.Contains("default     { 'FAIL' }") -and
             $autoShutdownResultCallWindow.Contains("'не вдалося ініціювати вимкнення") -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "Помилка ініціювання вимкнення системи. Код помилки: $($process.ExitCode)" -Level "ERROR"') -and
-            [regex]::Matches($maintenanceScriptTextForManifestStorage, "(?m)^\s*return 'Failed'\s*`$").Count -ge 2
+            $maintenanceScriptText.Contains('Write-Log -Message "Помилка ініціювання вимкнення системи. Код помилки: $($process.ExitCode)" -Level "ERROR"') -and
+            [regex]::Matches($maintenanceScriptText, "(?m)^\s*return 'Failed'\s*`$").Count -ge 2
         ) `
         -Name "Maintenance/AutoShutdownFailureRendersFail" `
         -Failure "невдале планування/виняток (Invoke-AutoShutdown повертає 'Failed') має рендерити FAIL з коротким поясненням; Invoke-AutoShutdown має явно return 'Failed' і на гілці помилки коду виходу, і в catch"
@@ -19194,8 +19366,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition (
             $autoShutdownResultCallWindow.Contains("'Cancelled' { 'SKIPPED' }") -and
             $autoShutdownResultCallWindow.Contains("'скасовано користувачем'") -and
-            $maintenanceScriptTextForManifestStorage.Contains("Вимкнення успішно скасовано") -and
-            $maintenanceScriptTextForManifestStorage.Contains("return 'Cancelled'")
+            $maintenanceScriptText.Contains("Вимкнення успішно скасовано") -and
+            $maintenanceScriptText.Contains("return 'Cancelled'")
         ) `
         -Name "Maintenance/AutoShutdownCancelledRendersSkipped" `
         -Failure "коли оператор інтерактивно скасував заплановане вимкнення (Invoke-AutoShutdown повертає 'Cancelled'), результат має рендеритись SKIPPED 'скасовано користувачем'"
@@ -19207,7 +19379,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     $autoShutdownCallSiteTokens = $null
     $autoShutdownCallSiteErrors = $null
     $autoShutdownCallSiteAst = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceScriptTextForManifestStorage,
+        $maintenanceScriptText,
         [ref]$autoShutdownCallSiteTokens,
         [ref]$autoShutdownCallSiteErrors
     )
@@ -19263,7 +19435,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # ДО обчислення exit code/фінального summary (доповнює
     # Maintenance/FinalSummaryOccursBeforeManualPause вище тими самими
     # якорями).
-    $rangeIdStepCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("-Name 'Контроль діапазонів ID' ``")
+    $rangeIdStepCallIndex = $maintenanceScriptText.IndexOf("-Name 'Контроль діапазонів ID' ``")
     Test-BRAVOCondition `
         -Condition (
             $rangeIdStepCallIndex -ge 0 -and
@@ -19314,9 +19486,9 @@ function Get-BRAVOMaintenanceSummaryResult {
     # --- Recovery no-op: compact success summary ДО exit 0, у межах
     # того самого зовнішнього try/finally (Wait-BRAVOManualExit — той
     # самий шлях, що й звичайний прогін).
-    $recoveryNoWorkIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$RunMissedRestoreOnly -and -not $missedDailyWork')
+    $recoveryNoWorkIndex = $maintenanceScriptText.IndexOf('$RunMissedRestoreOnly -and -not $missedDailyWork')
     $recoveryNoWorkWindow = if ($recoveryNoWorkIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring($recoveryNoWorkIndex, [Math]::Min(1600, $maintenanceScriptTextForManifestStorage.Length - $recoveryNoWorkIndex))
+        $maintenanceScriptText.Substring($recoveryNoWorkIndex, [Math]::Min(1600, $maintenanceScriptText.Length - $recoveryNoWorkIndex))
     } else { '' }
     $recoveryHeaderIndexInWindow = $recoveryNoWorkWindow.IndexOf('Write-BRAVOFinalSummaryHeader')
     $recoveryFooterIndexInWindow = $recoveryNoWorkWindow.IndexOf('Write-BRAVOFinalSummaryFooter')
@@ -21337,6 +21509,14 @@ function Write-BRAVOLog {
     # жодної підказки, кого зупиняти. Перевіряємо на СПРАВЖНЬОМУ блокуванні:
     # відкриваємо файл ексклюзивно й вимагаємо, щоб діагностика назвала
     # поточний процес (його PID).
+    # Власна мінімальна фікстура кореня (#219): раніше тут використовувався
+    # $logRotationModule фрагмента LogRotation, і -Suite без LogRotation
+    # падав під Set-StrictMode. Get-BRAVOFileLockingProcess самодостатня
+    # (лише Add-Type Restart Manager), тож екстракції однієї функції з того
+    # самого джерела достатньо.
+    $lockProbeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptText `
+        -FunctionNames @('Get-BRAVOFileLockingProcess')
     $lockProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_LOCKPROBE_" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $lockProbeRoot -Force | Out-Null
     $lockProbeFile = Join-Path $lockProbeRoot 'TraceSRV.out'
@@ -21351,7 +21531,7 @@ function Write-BRAVOLog {
             [IO.FileAccess]::ReadWrite,
             [IO.FileShare]::None
         )
-        $lockProbeHolders = @(& $logRotationModule {
+        $lockProbeHolders = @(& $lockProbeModule {
             param($Path)
             Get-BRAVOFileLockingProcess -Path $Path
         } $lockProbeFile)
@@ -21360,7 +21540,7 @@ function Write-BRAVOLog {
     }
     # Після звільнення тримачів бути не повинно — інакше тест підтверджував би
     # будь-який непорожній результат, а не саме виявлення блокування.
-    $lockProbeUnlockedHolders = @(& $logRotationModule {
+    $lockProbeUnlockedHolders = @(& $lockProbeModule {
         param($Path)
         Get-BRAVOFileLockingProcess -Path $Path
     } $lockProbeFile)
@@ -21944,26 +22124,6 @@ function Write-BRAVOLog {
         -Name 'Console/ManualExitPauseOnExitFalseBypasses' `
         -Failure "PauseOnExit=`$false (явне налаштування в BRAVO.config) має лишатись bypass-сигналом і повертатись миттєво; зайняло $($manualExitPauseOnExitFalseElapsed.TotalSeconds) с"
 
-    # --- Structural: [Console]::IsInputRedirected більше НЕ окрема
-    # самостійна pre-check причина відхилити операторську консоль ДО
-    # спроби RawUI.ReadKey (реальний DEV-LIMS баг); UserInteractive
-    # лишається єдиною такою причиною.
-    Test-BRAVOCondition `
-        -Condition (
-            -not $waitManualExitText.Contains('[Console]::IsInputRedirected') -and
-            $waitManualExitText.Contains('[Environment]::UserInteractive')
-        ) `
-        -Name 'Console/ManualExitDoesNotPreSkipSolelyForInputRedirected' `
-        -Failure 'Wait-BRAVOManualExit НЕ повинна містити самостійну перевірку [Console]::IsInputRedirected — реальний DEV-LIMS MANUAL-запуск довів, що вона помилково відхиляла справжню операторську консоль до спроби RawUI.ReadKey'
-
-    Test-BRAVOCondition `
-        -Condition (
-            $waitManualExitText.Contains('$Host.UI.RawUI.ReadKey(') -and
-            $waitManualExitText.Contains('[void](Read-Host)')
-        ) `
-        -Name 'Console/ManualExitUsesRawUIWithReadHostFallback' `
-        -Failure 'Wait-BRAVOManualExit має спершу пробувати $Host.UI.RawUI.ReadKey(...), з фолбеком на Read-Host — той самий контракт, що й раніше'
-
     # --- Archive: власна тонка обгортка Wait-ForManualExit делегує в той
     # самий спільний Wait-BRAVOManualExit -NoPause:$NoPause (не власна
     # реалізація); Health/Maintenance також викликають його напряму —
@@ -21976,8 +22136,8 @@ function Write-BRAVOLog {
             -not $archiveScriptText.Contains('RawUI.ReadKey(') -and
             $healthScriptText.Contains('Wait-BRAVOManualExit -NoPause:$NoPause') -and
             -not $healthScriptText.Contains('RawUI.ReadKey(') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Wait-BRAVOManualExit -NoPause:$NoPause') -and
-            -not $maintenanceScriptTextForManifestStorage.Contains('RawUI.ReadKey(')
+            $maintenanceScriptText.Contains('Wait-BRAVOManualExit -NoPause:$NoPause') -and
+            -not $maintenanceScriptText.Contains('RawUI.ReadKey(')
         ) `
         -Name 'Archive/ManualModeAndPauseUseSameNoPauseContract' `
         -Failure 'Archive/Health/Maintenance мають викликати ТІЛЬКИ спільний Wait-BRAVOManualExit -NoPause:$NoPause (BRAVO.Console); жоден із трьох runtime не повинен мати власного RawUI.ReadKey'
@@ -22210,7 +22370,7 @@ function Write-BRAVOLog {
     # резолвлять Protect-BRAVOLogSecret/Write-BRAVOConsoleMessage з
     # реально імпортованих BRAVO.Logging/BRAVO.Console.
     $maintenanceFinalStatusModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @('Get-BRAVOMaintenanceFinalStatus')
     Test-BRAVOCondition `
         -Condition (
@@ -22254,22 +22414,22 @@ function Write-BRAVOLog {
 
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains(
+            $maintenanceScriptText.Contains(
                 "`$maintenanceLogRunId = `"{0}_PID{1}`" -f `$currentDate.ToString(`"yyyyMMdd_HHmmss`"), `$PID") -and
-            $maintenanceScriptTextForManifestStorage.Contains(
+            $maintenanceScriptText.Contains(
                 "`$script:LOG_FILE = `"`$LOG_DIR\BRAVO_MAINTENANCE_`$maintenanceLogRunId.log`"") -and
-            -not $maintenanceScriptTextForManifestStorage.Contains(
+            -not $maintenanceScriptText.Contains(
                 "`$LOG_FILE = `"`$LOG_DIR\BRAVO_MAINTENANCE_`$NOW.log`"")
         ) `
         -Name 'Maintenance/ExecutionLogsAreUniquePerSecondAndProcess' `
         -Failure 'Maintenance log має містити yyyyMMdd_HHmmss і PID; хвилинна назва змішує два окремі запуски в одному audit log'
 
-    $maintenanceDiskFailureStart = $maintenanceScriptTextForManifestStorage.IndexOf('if (-not $spaceCheckResult) {')
+    $maintenanceDiskFailureStart = $maintenanceScriptText.IndexOf('if (-not $spaceCheckResult) {')
     $maintenanceDiskFailureEnd = if ($maintenanceDiskFailureStart -ge 0) {
-        $maintenanceScriptTextForManifestStorage.IndexOf("`n}", $maintenanceDiskFailureStart)
+        $maintenanceScriptText.IndexOf("`n}", $maintenanceDiskFailureStart)
     } else { -1 }
     $maintenanceDiskFailureBlock = if ($maintenanceDiskFailureEnd -gt $maintenanceDiskFailureStart) {
-        $maintenanceScriptTextForManifestStorage.Substring(
+        $maintenanceScriptText.Substring(
             $maintenanceDiskFailureStart,
             $maintenanceDiskFailureEnd - $maintenanceDiskFailureStart
         )
@@ -22284,7 +22444,7 @@ function Write-BRAVOLog {
             $maintenanceDiskFailureBlock.Contains("Wait-BRAVOManualExit -NoPause:`$NoPause") -and
             $maintenanceDiskFailureBlock.Contains("exit `$diskPreflightExitCode") -and
             -not $maintenanceDiskFailureBlock.Contains('exit 60') -and
-            $maintenanceScriptTextForManifestStorage.Contains(
+            $maintenanceScriptText.Contains(
                 'Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE')
         ) `
         -Name 'Maintenance/DiskPreflightFailureRendersFinalSummary' `
@@ -22305,7 +22465,7 @@ function Write-BRAVOLog {
     $maintenanceFinalStatusFlowTokens = $null
     $maintenanceFinalStatusFlowErrors = $null
     $maintenanceFinalStatusFlowAst = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceScriptTextForManifestStorage, [ref]$maintenanceFinalStatusFlowTokens, [ref]$maintenanceFinalStatusFlowErrors
+        $maintenanceScriptText, [ref]$maintenanceFinalStatusFlowTokens, [ref]$maintenanceFinalStatusFlowErrors
     )
     $maintenanceFinalStatusFunctionAst = $null
     $maintenanceResolvedExitCodeFunctionAst = $null
@@ -22345,11 +22505,11 @@ function Write-BRAVOLog {
             $true
         )
     })
-    $maintenanceExitCodeAssignIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode')
-    $maintenanceLogStatusIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-Log -Message "=== СТАТУС: $((Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode).Text) ==="')
-    $maintenanceConsoleStatusIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$maintenanceFinalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode')
-    $maintenanceNotificationSnapshotIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$maintenanceNotificationExitCodeSnapshot = Get-BRAVOMaintenanceResolvedExitCode')
-    $maintenanceNotificationStatusIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$maintenanceNotificationStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $maintenanceNotificationExitCodeSnapshot')
+    $maintenanceExitCodeAssignIndex = $maintenanceScriptText.IndexOf('$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode')
+    $maintenanceLogStatusIndex = $maintenanceScriptText.IndexOf('Write-Log -Message "=== СТАТУС: $((Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode).Text) ==="')
+    $maintenanceConsoleStatusIndex = $maintenanceScriptText.IndexOf('$maintenanceFinalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode')
+    $maintenanceNotificationSnapshotIndex = $maintenanceScriptText.IndexOf('$maintenanceNotificationExitCodeSnapshot = Get-BRAVOMaintenanceResolvedExitCode')
+    $maintenanceNotificationStatusIndex = $maintenanceScriptText.IndexOf('$maintenanceNotificationStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $maintenanceNotificationExitCodeSnapshot')
     Test-BRAVOCondition `
         -Condition (
             $maintenanceFinalStatusReferencesFlags.Count -eq 0 -and
@@ -22377,7 +22537,7 @@ function Write-BRAVOLog {
     # ✅/"Дій не потрібно" — перевірено тим самим викликом, щоб довести, що
     # правка severity-порядку не зачепила звичайний success-шлях.
     $maintenanceNotificationModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @('New-MaintenanceNotificationMessage')
     $maintenanceWarningsNotificationText = & $maintenanceNotificationModule {
         New-MaintenanceNotificationMessage `
@@ -22420,7 +22580,7 @@ function Write-BRAVOLog {
     # ✅, і оператор не бачив причини попередження. Реальна AST-екстракція
     # New-BRAVOMaintenanceCompletedLines + Get-BRAVOMaintenanceStepOutcome.
     $maintenanceCompletedLinesModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $maintenanceScriptTextForManifestStorage `
+        -SourceText $maintenanceScriptText `
         -FunctionNames @('Get-BRAVOMaintenanceStepOutcome', 'New-BRAVOMaintenanceCompletedLines')
     $maintenanceCompletedAllOk = & $maintenanceCompletedLinesModule {
         $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
@@ -22594,7 +22754,7 @@ function Write-BRAVOLog {
     $maintenanceTotalTokens = $null
     $maintenanceTotalErrors = $null
     $maintenanceTotalAst = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceScriptTextForManifestStorage, [ref]$maintenanceTotalTokens, [ref]$maintenanceTotalErrors
+        $maintenanceScriptText, [ref]$maintenanceTotalTokens, [ref]$maintenanceTotalErrors
     )
     $maintenanceSuccessWithWarningsLiteralAsts = @($maintenanceTotalAst.FindAll(
         {
@@ -22680,7 +22840,7 @@ function Write-BRAVOLog {
     # звичайними секціями).
     # ================================================================
     $maintenanceBareLogSeparatorBranchMatch = [regex]::Match(
-        $maintenanceScriptTextForManifestStorage,
+        $maintenanceScriptText,
         '(?s)if \(\$Message -eq "=" -or \$Message -eq "==="\) \{(.*?)\}'
     )
     $maintenanceBareLogSeparatorBranchText = if ($maintenanceBareLogSeparatorBranchMatch.Success) { $maintenanceBareLogSeparatorBranchMatch.Groups[1].Value } else { 'MISSING' }
@@ -22694,18 +22854,18 @@ function Write-BRAVOLog {
 
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptTextForManifestStorage.Contains('if ($Message -match "^=== .* ===$") {') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-BRAVOMaintenanceLogFile -Entry $Message') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ДЖЕРЕЛА ЖУРНАЛІВ ==="') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==="') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ЗУПИНКА СЛУЖБ ==="') -and
-            $maintenanceScriptTextForManifestStorage.Contains('=== ПЕРЕВІРКА РОЗМІРІВ .MD ФАЙЛІВ ===') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== РЕСТАВРАЦІЯ МОДЕЛІ ==="') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ==="') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ОЧИСТКА СТАРИХ ДАНИХ ==="') -and
-            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ ==="')
+            $maintenanceScriptText.Contains('if ($Message -match "^=== .* ===$") {') -and
+            $maintenanceScriptText.Contains('Write-BRAVOMaintenanceLogFile -Entry $Message') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== ДЖЕРЕЛА ЖУРНАЛІВ ==="') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==="') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== ЗУПИНКА СЛУЖБ ==="') -and
+            $maintenanceScriptText.Contains('=== ПЕРЕВІРКА РОЗМІРІВ .MD ФАЙЛІВ ===') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== РЕСТАВРАЦІЯ МОДЕЛІ ==="') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ==="') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== ОЧИСТКА СТАРИХ ДАНИХ ==="') -and
+            $maintenanceScriptText.Contains('Write-Log -Message "=== ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ ==="')
         ) `
         -Name 'Maintenance/SectionHeadingsRemainLogged' `
         -Failure '"=== ЗАГОЛОВОК ===" записи (ДЖЕРЕЛА ЖУРНАЛІВ/ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ/ЗУПИНКА СЛУЖБ/ПЕРЕВІРКА РОЗМІРІВ .MD ФАЙЛІВ/РЕСТАВРАЦІЯ МОДЕЛІ/ОБРОБКА TRACE-ФАЙЛІВ/ОБРОБКА ЛОГІВ EXCHANGAPI/ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ/ОЧИСТКА СТАРИХ ДАНИХ/ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ) мають і надалі писатись у журнал повним текстом — незмінено'
@@ -22720,7 +22880,7 @@ function Write-BRAVOLog {
     $maintenanceLogRoundTripTempFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_MAINT_LOG_SELF_TEST_{0}.log" -f [guid]::NewGuid().ToString("N"))
     try {
         $maintenanceWriteLogRoundTripModule = New-BRAVOSelfTestRuntimeModule `
-            -SourceText $maintenanceScriptTextForManifestStorage `
+            -SourceText $maintenanceScriptText `
             -FunctionNames @('Write-Log', 'Write-BRAVOMaintenanceLogFile')
         $global:consoleSettings = @{ ConsoleLevel = 'ERROR'; ShowTimestampsInConsole = $false }
         try {
@@ -22990,8 +23150,9 @@ function Write-BRAVOLog {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Operations.ps1')
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
-    # TraceArchive ПІСЛЯ BazaSync: SFTP-сценарії добового Trace-архіву
-    # використовують New-BRAVOSelfTestFakeBazaSession, визначену там.
+    # SFTP-сценарії добового Trace-архіву використовують
+    # New-BRAVOSelfTestFakeBazaSession зі спільного bootstrap-у (#219), а не
+    # з фрагмента BazaSync, тож TraceArchive не залежить від його вибору.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'TraceArchive') {
         Enter-BRAVOSelfTestSuite -Name 'TraceArchive'
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.TraceArchive.ps1')
@@ -23631,7 +23792,12 @@ function Remove-BRAVOSelfTestFixtureDirectory {
         $syntheticFilePath = Join-Path $tempRoot "Phase0Only.json"
         $syntheticFileContent = '{ "phase0": true,'
         [IO.File]::WriteAllText($syntheticFilePath, $syntheticFileContent, (New-Object Text.UTF8Encoding($false)))
-        $syntheticFileHash = (Get-BRAVOFileHash -Path $syntheticFilePath -Algorithm SHA256).Hash.ToUpperInvariant()
+        # Module-qualified (#219): Clear-BRAVOSelfTestOwnedRuntimeModules
+        # прибирає глобальний Function:Get-BRAVOFileHash, який експортують
+        # runtime-модулі фрагментів TraceArchive/MaintenanceOwnLog, і з ним
+        # зникає експорт Compatibility; у вибірковому -Suite його ніхто не
+        # повертає.
+        $syntheticFileHash = (BRAVO.Compatibility\Get-BRAVOFileHash -Path $syntheticFilePath -Algorithm SHA256).Hash.ToUpperInvariant()
 
         # Дописати новий запис у TEMP-копію RUNTIME_MANIFEST.json (НЕ у
         # repository-файл) — реальний SHA256 щойно записаних байтів,
@@ -24703,6 +24869,429 @@ Test-BRAVOCondition `
         -Name "Framework/ChangedPathHintNeverGuesses" `
         -Failure ("для шляху без точної відповідності підказка мусить повертати порожньо (= повний прогін), " +
             "а не вгадувати suite; повернуто: " + [string]::Join(', ', @($suiteHintUnknown)))
+}
+
+# ============================================================
+# #219: вибірковий прогін без прихованих міжsuite-залежностей.
+#
+# Кореневе тіло виконується завжди, а gated-фрагмент — лише коли його
+# обрано. Тому змінна чи функція, яку визначає ЛИШЕ фрагмент, не може
+# читатися ні коренем, ні іншим фрагментом: у повному прогоні читання
+# працює (фрагмент уже виконався), а в -Suite без цього фрагмента падає під
+# Set-StrictMode ще до обраного suite. Так було з п'ятьма залежностями
+# #219, і жодна перевірка цього не бачила, бо CI вибірковий режим не
+# запускає (Framework/CiWorkflowNeverNarrowsSelfTest).
+#
+# Guard статичний (AST), без Windows і без запуску фрагментів:
+#   - визначення фрагмента: присвоєння змінних і функції у scope файлу
+#     (усередині try/if теж), а також $script:/$global:-присвоєння;
+#   - споживачі: корінь (включно з хвостом) та інші фрагменти;
+#   - читання не є залежністю, якщо ім'я визначає сам споживач, корінь
+#     РАНІШЕ за місце читання (для фрагмента — раніше за його гейт), або
+#     воно локальне в дочірньому scriptblock/функції;
+#   - scriptblock, виконаний у scope динамічного модуля (& $module { }),
+#     змінних self-test не бачить, тож не аналізується.
+# ============================================================
+& {
+    function Get-BRAVOSelfTestCrossSuiteDependency {
+        param(
+            [Parameter(Mandatory = $true)]$RootAst,
+            [Parameter(Mandatory = $true)][hashtable]$FragmentAst
+        )
+
+        $automaticNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($automaticName in @(
+                'null', 'true', 'false', '_', 'PSItem', 'this', 'args', 'input', 'Matches',
+                'LASTEXITCODE', 'Error', 'PSScriptRoot', 'PSCommandPath', 'MyInvocation',
+                'PSBoundParameters', 'PSCmdlet', 'ExecutionContext', 'Host', 'PID', 'HOME', 'PWD',
+                'PSVersionTable', 'PSEdition', 'PSHOME', 'ShellId', 'StackTrace', 'OFS',
+                'ErrorActionPreference', 'WarningPreference', 'VerbosePreference',
+                'DebugPreference', 'InformationPreference', 'ProgressPreference',
+                'ConfirmPreference', 'WhatIfPreference', 'MaximumVariableCount',
+                'PSDefaultParameterValues', 'OutputEncoding', 'foreach', 'switch', 'sender',
+                'EventArgs', 'Event', '?', '^', '$')) {
+            [void]$automaticNames.Add($automaticName)
+        }
+        $sameScopeCommands = @('ForEach-Object', '%', 'foreach', 'Where-Object', '?', 'where', 'Measure-Command')
+        $problems = New-Object System.Collections.ArrayList
+
+        # --- 1. Одиниці: корінь і gated-фрагменти (з вкладеними) ----------
+        # Підключення фрагмента має єдину форму . (Join-Path $root
+        # 'selftest\BRAVO_SELF_TEST.<Ім'я>.ps1') — її ж вимагає
+        # Framework/EverySuiteFragmentIsGated; вкладене підключення
+        # (ManualLaunchers у LogRotation) належить тому самому suite.
+        $getDotSourcedFragments = {
+            param($Ast)
+            return @([regex]::Matches([string]$Ast.Extent.Text,
+                    "(?m)^\s*\.\s*\(\s*Join-Path\s+\`$root\s+'selftest[\\/]BRAVO_SELF_TEST\.([A-Za-z0-9]+)\.ps1'\s*\)") |
+                    ForEach-Object { $_.Groups[1].Value })
+        }
+
+        $units = New-Object System.Collections.ArrayList
+        [void]$units.Add([pscustomobject]@{ Suite = $null; Fragment = 'BRAVO_SELF_TEST'; Ast = $RootAst; GateOffset = [int]::MaxValue })
+        $gateStatements = @(
+            @($RootAst.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] }, $true)) |
+                Where-Object {
+                    $_.Clauses.Count -ge 1 -and
+                    $_.Clauses[0].Item1.Extent.Text -match "^\s*Test-BRAVOSelfTestSuiteEnabled\s+-Name\s+'[^']+'\s*$"
+                })
+        $gatedSuites = New-Object System.Collections.ArrayList
+        foreach ($gate in $gateStatements) {
+            $suiteName = [regex]::Match($gate.Clauses[0].Item1.Extent.Text, "'([^']+)'").Groups[1].Value
+            [void]$gatedSuites.Add($suiteName)
+            $pending = New-Object System.Collections.Queue
+            foreach ($fragmentName in (& $getDotSourcedFragments $gate.Clauses[0].Item2)) { $pending.Enqueue($fragmentName) }
+            $seenFragments = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            while ($pending.Count -gt 0) {
+                $fragmentName = [string]$pending.Dequeue()
+                if (-not $seenFragments.Add($fragmentName)) { continue }
+                if (-not $FragmentAst.ContainsKey($fragmentName)) {
+                    [void]$problems.Add("фрагмент $fragmentName (suite $suiteName) не розібрано")
+                    continue
+                }
+                $fragmentUnitAst = $FragmentAst[$fragmentName]
+                [void]$units.Add([pscustomobject]@{ Suite = $suiteName; Fragment = $fragmentName; Ast = $fragmentUnitAst; GateOffset = $gate.Extent.StartOffset })
+                foreach ($nestedName in (& $getDotSourcedFragments $fragmentUnitAst)) { $pending.Enqueue($nestedName) }
+            }
+            if ($seenFragments.Count -eq 0) { [void]$problems.Add("гейт suite $suiteName не підключає жодного фрагмента") }
+        }
+
+        # --- 2. Визначення і використання в кожній одиниці ---------------
+        $scopeKindOf = {
+            param($Block)
+            if ($Block -is [Management.Automation.Language.FunctionDefinitionAst]) { return 'Function' }
+            $command = $Block.Parent
+            if ($command -is [Management.Automation.Language.CommandAst]) {
+                $commandName = $command.GetCommandName()
+                $isFirst = [object]::ReferenceEquals($command.CommandElements[0], $Block)
+                if ($command.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot -and $isFirst) { return 'Same' }
+                if ($null -ne $commandName -and $sameScopeCommands -contains $commandName) { return 'Same' }
+                if ($commandName -eq 'New-Module') { return 'Foreign' }
+                if (-not $isFirst -and (
+                        $command.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Ampersand -or
+                        $command.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot)) {
+                    return 'Foreign'
+                }
+            }
+            return 'Child'
+        }
+        # Контекст вузла: ланцюг дочірніх scope (найглибший перший) і чи він
+        # усередині функції; $null — вузол у scope динамічного модуля.
+        # Контекст кожного scope-блока обчислюється раз і кешується: вузли
+        # одного блока мають спільний ланцюг предків.
+        $fileScopeContext = [pscustomobject]@{ Scopes = @(); InFunction = $false }
+        $blockContextCache = @{}
+        $getContext = {
+            param($Node, $UnitAst)
+            $parent = $Node.Parent
+            while ($null -ne $parent -and -not [object]::ReferenceEquals($parent, $UnitAst) -and
+                -not ($parent -is [Management.Automation.Language.FunctionDefinitionAst] -or
+                    $parent -is [Management.Automation.Language.ScriptBlockExpressionAst])) {
+                $parent = $parent.Parent
+            }
+            if ($null -eq $parent -or [object]::ReferenceEquals($parent, $UnitAst)) { return $fileScopeContext }
+            if ($blockContextCache.ContainsKey($parent)) { return $blockContextCache[$parent] }
+            $outerContext = & $getContext $parent $UnitAst
+            $kind = & $scopeKindOf $parent
+            $blockContext = $null
+            if ($null -ne $outerContext -and $kind -ne 'Foreign') {
+                $blockScopes = New-Object System.Collections.ArrayList
+                if ($kind -ne 'Same') { [void]$blockScopes.Add($parent) }
+                foreach ($outerScope in $outerContext.Scopes) { [void]$blockScopes.Add($outerScope) }
+                $blockContext = [pscustomobject]@{
+                    Scopes     = $blockScopes
+                    InFunction = ($outerContext.InFunction -or $kind -eq 'Function')
+                }
+            }
+            $blockContextCache[$parent] = $blockContext
+            return $blockContext
+        }
+
+        # Спершу дешево класифікуємо кожен вузол (визначення чи читання).
+        # Дорогий підйом до меж scope — лише для визначень і для тих читань,
+        # чиє ім'я взагалі визначає якийсь фрагмент.
+        $unitFacts = @()
+        foreach ($unit in $units) {
+            $definitionNodes = New-Object System.Collections.ArrayList
+            $useKeys = New-Object System.Collections.ArrayList
+            $useNodes = New-Object System.Collections.ArrayList
+            foreach ($node in @($unit.Ast.FindAll({
+                            param($candidate)
+                            $candidate -is [Management.Automation.Language.VariableExpressionAst] -or
+                            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -or
+                            $candidate -is [Management.Automation.Language.CommandAst]
+                        }, $true))) {
+                if ($node -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                    [void]$definitionNodes.Add([pscustomobject]@{ Key = 'function:' + $node.Name; Node = $node; Qualified = $false })
+                    continue
+                }
+                if ($node -is [Management.Automation.Language.CommandAst]) {
+                    $commandName = $node.GetCommandName()
+                    if ([string]::IsNullOrEmpty($commandName) -or
+                        $node.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot) { continue }
+                    [void]$useKeys.Add('function:' + $commandName)
+                    [void]$useNodes.Add($node)
+                    continue
+                }
+                $variablePath = $node.VariablePath
+                # Кваліфікатор scope ($script:, $global:, ...) не змінює ім'я;
+                # провайдерні диски ($env:, $function:, ...) — не змінні self-test.
+                $variableName = $variablePath.UserPath
+                $qualifierEnd = $variableName.IndexOf(':')
+                if ($qualifierEnd -ge 0) {
+                    if (@('script', 'global', 'local', 'private', 'variable', 'using') -notcontains $variableName.Substring(0, $qualifierEnd)) { continue }
+                    $variableName = $variableName.Substring($qualifierEnd + 1)
+                }
+                if ($automaticNames.Contains($variableName)) { continue }
+                $key = 'variable:' + $variableName
+                $parentNode = $node.Parent
+                $isDefinition = $false
+                $isAlsoRead = $false
+                if ($parentNode -is [Management.Automation.Language.AssignmentStatementAst] -and [object]::ReferenceEquals($parentNode.Left, $node)) {
+                    $isDefinition = $true
+                    $isAlsoRead = $parentNode.Operator -ne [Management.Automation.Language.TokenKind]::Equals
+                } elseif (($parentNode -is [Management.Automation.Language.ConvertExpressionAst] -or
+                        $parentNode -is [Management.Automation.Language.ArrayLiteralAst]) -and
+                    $parentNode.Parent -is [Management.Automation.Language.AssignmentStatementAst] -and
+                    [object]::ReferenceEquals($parentNode.Parent.Left, $parentNode)) {
+                    $isDefinition = $true
+                } elseif ($parentNode -is [Management.Automation.Language.ForEachStatementAst] -and
+                    [object]::ReferenceEquals($parentNode.Variable, $node)) {
+                    $isDefinition = $true
+                } elseif ($parentNode -is [Management.Automation.Language.ParameterAst]) {
+                    $isDefinition = $true
+                }
+                if ($isDefinition) {
+                    [void]$definitionNodes.Add([pscustomobject]@{ Key = $key; Node = $node; Qualified = ($variablePath.IsScript -or $variablePath.IsGlobal) })
+                }
+                if (-not $isDefinition -or $isAlsoRead) {
+                    [void]$useKeys.Add($key)
+                    [void]$useNodes.Add($node)
+                }
+            }
+            $unitFacts += , ([pscustomobject]@{
+                    Unit            = $unit
+                    DefinitionNodes = $definitionNodes
+                    Definitions     = New-Object System.Collections.ArrayList
+                    UseKeys         = $useKeys
+                    UseNodes        = $useNodes
+                    LocalNames      = @{}
+                })
+        }
+
+        # Визначення: у scope файлу (разом із $script:/$global:) чи локальне
+        # в дочірньому scriptblock/функції. Спершу фрагменти; для кореня
+        # потрібні лише імена, які визначає хоч один фрагмент.
+        $fragmentDefinedKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($pass in @('Fragments', 'Root')) {
+            foreach ($facts in $unitFacts) {
+                $isRootUnit = $null -eq $facts.Unit.Suite
+                if (($pass -eq 'Root') -ne $isRootUnit) { continue }
+                foreach ($definitionNode in $facts.DefinitionNodes) {
+                    if ($isRootUnit -and -not $fragmentDefinedKeys.Contains($definitionNode.Key)) { continue }
+                    $context = & $getContext $definitionNode.Node $facts.Unit.Ast
+                    if ($null -eq $context) { continue }
+                    if ($context.Scopes.Count -eq 0 -or $definitionNode.Qualified) {
+                        [void]$facts.Definitions.Add([pscustomobject]@{
+                                Key        = $definitionNode.Key
+                                Offset     = $definitionNode.Node.Extent.StartOffset
+                                InFunction = $context.InFunction
+                            })
+                        if (-not $isRootUnit) { [void]$fragmentDefinedKeys.Add($definitionNode.Key) }
+                    } else {
+                        $innermost = $context.Scopes[0]
+                        if (-not $facts.LocalNames.ContainsKey($innermost)) {
+                            $facts.LocalNames[$innermost] = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+                        }
+                        [void]$facts.LocalNames[$innermost].Add($definitionNode.Key)
+                    }
+                }
+            }
+        }
+
+        # --- 3. Хто що визначає ------------------------------------------
+        # Порядок виконання повного прогону = порядок у кореневому файлі, а
+        # фрагмент виконується в точці свого гейта. Для кореня досить
+        # найранішого визначення у scope файлу; визначення всередині функції
+        # може виконатися будь-коли, тож вважається задовільним.
+        $rootEarliest = @{}
+        $rootInFunction = @{}
+        $fragmentOwners = @{}
+        $suiteDefinitions = @{}
+        foreach ($facts in $unitFacts) {
+            foreach ($definition in $facts.Definitions) {
+                if ($null -eq $facts.Unit.Suite) {
+                    if ($definition.InFunction) {
+                        $rootInFunction[$definition.Key] = $true
+                    } elseif (-not $rootEarliest.ContainsKey($definition.Key) -or $definition.Offset -lt $rootEarliest[$definition.Key]) {
+                        $rootEarliest[$definition.Key] = $definition.Offset
+                    }
+                } else {
+                    if (-not $fragmentOwners.ContainsKey($definition.Key)) { $fragmentOwners[$definition.Key] = @{} }
+                    $fragmentOwners[$definition.Key][$facts.Unit.Suite] = $facts.Unit.GateOffset
+                    $suiteDefinitions[$facts.Unit.Suite + '|' + $definition.Key] = $true
+                }
+            }
+        }
+
+        # --- 4. Читання чужого визначення ---------------------------------
+        # Залежність є лише тоді, коли у повному прогоні значення справді
+        # приходить із чужого фрагмента: фрагмент-власник виконується РАНІШЕ
+        # за місце читання (для читання всередині функції — будь-коли), а
+        # корінь до того моменту не визначив це ім'я сам. Читання, що в
+        # повному прогоні відбувається до будь-якого визначення, тут не
+        # предмет: воно або зовнішнє (наприклад, глобальна змінна з
+        # Import-BravoConfiguration), або вже ламає й повний прогін.
+        $findings = New-Object 'System.Collections.Generic.List[string]'
+        $seenFindings = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($facts in $unitFacts) {
+            $consumerSuite = $facts.Unit.Suite
+            for ($useIndex = 0; $useIndex -lt $facts.UseKeys.Count; $useIndex++) {
+                if (-not $fragmentOwners.ContainsKey($facts.UseKeys[$useIndex])) { continue }
+                $use = [pscustomobject]@{ Key = [string]$facts.UseKeys[$useIndex]; Node = $facts.UseNodes[$useIndex] }
+                if ($rootInFunction.ContainsKey($use.Key)) { continue }
+                if ($null -ne $consumerSuite -and $suiteDefinitions.ContainsKey($consumerSuite + '|' + $use.Key)) { continue }
+                $readOffset = if ($null -eq $consumerSuite) { $use.Node.Extent.StartOffset } else { $facts.Unit.GateOffset }
+                if ($rootEarliest.ContainsKey($use.Key) -and $rootEarliest[$use.Key] -lt $readOffset) { continue }
+                $context = & $getContext $use.Node $facts.Unit.Ast
+                if ($null -eq $context) { continue }
+                if ($context.InFunction -and $rootEarliest.ContainsKey($use.Key)) { continue }
+                $owners = New-Object System.Collections.ArrayList
+                foreach ($ownerEntry in $fragmentOwners[$use.Key].GetEnumerator()) {
+                    if ($ownerEntry.Key -eq $consumerSuite) { continue }
+                    if ($context.InFunction -or $ownerEntry.Value -lt $readOffset) { [void]$owners.Add([string]$ownerEntry.Key) }
+                }
+                if ($owners.Count -eq 0) { continue }
+                $isLocal = $false
+                foreach ($scope in $context.Scopes) {
+                    if ($facts.LocalNames.ContainsKey($scope) -and $facts.LocalNames[$scope].Contains($use.Key)) { $isLocal = $true; break }
+                }
+                if ($isLocal) { continue }
+                $consumerLabel = if ($null -eq $consumerSuite) { 'корінь' } else { "suite $consumerSuite" }
+                if (-not $seenFindings.Add($use.Key + '|' + $consumerLabel)) { continue }
+                $findings.Add(("{0} визначає лише suite {1}, а читає {2} ({3}:{4})" -f
+                        $use.Key, ([string]::Join('/', @($owners | Sort-Object))), $consumerLabel,
+                        $facts.Unit.Fragment, $use.Node.Extent.StartLineNumber))
+            }
+        }
+
+        return [pscustomobject]@{
+            GatedSuites = @($gatedSuites | Sort-Object -Unique)
+            Problems    = @($problems)
+            Findings    = @($findings)
+        }
+    }
+
+    # --- Реальне джерело ---------------------------------------------------
+    $crossSuiteResult = $null
+    $crossSuiteError = $null
+    try {
+        $crossSuiteFragmentAst = @{}
+        foreach ($crossSuiteFile in @(Get-ChildItem -LiteralPath (Join-Path $root 'selftest') -Filter 'BRAVO_SELF_TEST.*.ps1' -File)) {
+            $crossSuiteTokens = $null
+            $crossSuiteErrors = $null
+            $crossSuiteParsed = [Management.Automation.Language.Parser]::ParseFile(
+                $crossSuiteFile.FullName, [ref]$crossSuiteTokens, [ref]$crossSuiteErrors)
+            if (@($crossSuiteErrors).Count -gt 0) { throw "синтаксичні помилки у $($crossSuiteFile.Name)" }
+            $crossSuiteName = $crossSuiteFile.Name -replace '^BRAVO_SELF_TEST\.', '' -replace '\.ps1$', ''
+            $crossSuiteFragmentAst[$crossSuiteName] = $crossSuiteParsed
+        }
+        $crossSuiteResult = Get-BRAVOSelfTestCrossSuiteDependency `
+            -RootAst (Get-BRAVOSelfTestOwnSourceAst) -FragmentAst $crossSuiteFragmentAst
+    } catch {
+        $crossSuiteError = $_.Exception.Message
+    }
+    $crossSuiteCatalogSorted = @($script:BRAVOSelfTestSuiteCatalog | Sort-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $crossSuiteError -and
+            $null -ne $crossSuiteResult -and
+            @($crossSuiteResult.Problems).Count -eq 0 -and
+            @($crossSuiteResult.GatedSuites).Count -eq @($crossSuiteCatalogSorted).Count -and
+            @(Compare-Object -ReferenceObject $crossSuiteCatalogSorted -DifferenceObject @($crossSuiteResult.GatedSuites)).Count -eq 0 -and
+            @($crossSuiteResult.Findings).Count -eq 0
+        ) `
+        -Name "Framework/SelectiveSuitesHaveNoCrossSuiteDependency" `
+        -Failure ("корінь та інші фрагменти не повинні читати змінні чи викликати функції, які визначає лише " +
+            "gated-фрагмент: -Suite без нього падає під Set-StrictMode. Спільне визначайте в bootstrap-і " +
+            "кореня або в самому споживачі. Помилка аналізу: [$crossSuiteError]; " +
+            $(if ($null -ne $crossSuiteResult) {
+                    "проблеми: [$([string]::Join('; ', @($crossSuiteResult.Problems)))]; " +
+                    "suite під гейтом: $(@($crossSuiteResult.GatedSuites).Count) з $(@($crossSuiteCatalogSorted).Count); " +
+                    "залежності: [$([string]::Join('; ', @($crossSuiteResult.Findings)))]"
+                } else { 'результату немає' }))
+
+    # --- Негативний контроль: guard бачить синтетичну залежність ----------
+    # Та сама форма підключення, що й у корені. Фрагмент Alpha визначає
+    # змінну й функцію; корінь читає змінну, фрагмент Beta викликає функцію.
+    # Чистий варіант тих самих джерел (корінь визначає своє, функція — у
+    # bootstrap-і) мусить дати нуль знахідок: guard не має спрацьовувати на
+    # будь-що.
+    $crossSuiteFixtureError = $null
+    $crossSuiteDirty = $null
+    $crossSuiteClean = $null
+    try {
+        $crossSuiteParse = {
+            param([string]$Text)
+            $fixtureTokens = $null
+            $fixtureErrors = $null
+            $fixtureAst = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$fixtureTokens, [ref]$fixtureErrors)
+            if (@($fixtureErrors).Count -gt 0) { throw 'синтаксична помилка у фікстурі guard-а' }
+            return $fixtureAst
+        }
+        # Рядки гейта складаються з формату, а не лежать у here-string
+        # дослівно: інакше regex-guard-и #187 (SuiteCatalogMatchesGatedFragments,
+        # EverySuiteFragmentIsGated), що читають сирий текст цього файлу,
+        # побачили б синтетичні suite Alpha/Beta як справжні.
+        $crossSuiteGateText = [string]::Join("`n", @(
+                @('Alpha', 'Beta') | ForEach-Object {
+                    ("    if (Test-BRAVOSelfTestSuiteEnabled -Name '{0}') {{" -f $_)
+                    ("        Enter-BRAVOSelfTestSuite -Name '{0}'" -f $_)
+                    ("        . (Join-Path `$root 'selftest\BRAVO_SELF_TEST.{0}.ps1')" -f $_)
+                    '    }'
+                }))
+        $crossSuiteAlphaText = @'
+$alphaOwnedText = 'alpha'
+try {
+    function New-AlphaOwnedFixture { return 1 }
+} finally { }
+& { param($alphaLocalOnly) $null = $alphaLocalOnly }
+'@
+        $crossSuiteBetaText = @'
+$null = New-AlphaOwnedFixture
+& { $alphaLocalOnly = 2; $null = $alphaLocalOnly }
+'@
+        $crossSuiteDirtyRoot = "try {`n" + $crossSuiteGateText + "`n    `$null = `$alphaOwnedText.Length`n} catch { }"
+        $crossSuiteCleanRoot = "function New-AlphaOwnedFixture { return 1 }`n`$alphaOwnedText = 'root'`ntry {`n" +
+            $crossSuiteGateText + "`n    `$null = `$alphaOwnedText.Length`n} catch { }"
+        $crossSuiteFixtureFragments = @{
+            Alpha = & $crossSuiteParse $crossSuiteAlphaText
+            Beta  = & $crossSuiteParse $crossSuiteBetaText
+        }
+        $crossSuiteDirty = Get-BRAVOSelfTestCrossSuiteDependency `
+            -RootAst (& $crossSuiteParse $crossSuiteDirtyRoot) -FragmentAst $crossSuiteFixtureFragments
+        $crossSuiteClean = Get-BRAVOSelfTestCrossSuiteDependency `
+            -RootAst (& $crossSuiteParse $crossSuiteCleanRoot) -FragmentAst $crossSuiteFixtureFragments
+    } catch {
+        $crossSuiteFixtureError = $_.Exception.Message
+    }
+    $crossSuiteDirtyText = if ($null -ne $crossSuiteDirty) { [string]::Join('; ', @($crossSuiteDirty.Findings)) } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $crossSuiteFixtureError -and
+            $null -ne $crossSuiteDirty -and $null -ne $crossSuiteClean -and
+            @($crossSuiteDirty.Findings).Count -eq 2 -and
+            $crossSuiteDirtyText.Contains('variable:alphaOwnedText визначає лише suite Alpha, а читає корінь') -and
+            $crossSuiteDirtyText.Contains('function:New-AlphaOwnedFixture визначає лише suite Alpha, а читає suite Beta') -and
+            @($crossSuiteClean.Findings).Count -eq 0 -and
+            @($crossSuiteDirty.Problems).Count -eq 0 -and
+            @($crossSuiteDirty.GatedSuites).Count -eq 2
+        ) `
+        -Name "Framework/SelectiveSuitesHaveNoCrossSuiteDependencyIsMeaningful" `
+        -Failure ("guard міжsuite-залежностей мусить знаходити рівно дві синтетичні залежності (змінну, " +
+            "прочитану коренем, і функцію, викликану іншим фрагментом) і нуль у чистому варіанті. " +
+            "Помилка: [$crossSuiteFixtureError]; знайдено: [$crossSuiteDirtyText]; у чистому варіанті: " +
+            $(if ($null -ne $crossSuiteClean) { [string]::Join('; ', @($crossSuiteClean.Findings)) } else { 'н/д' }))
 }
 
 # ============================================================
