@@ -6369,6 +6369,51 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
             ) `
             -Name "Rollback/UpdaterOrchestrationReportsEveryFailedStep" `
             -Failure "кожен збій після відновлення (guard, Scheduler, ValidateOnly, VERSION.json) мусить ставати проблемою відкату (=> exit 2); guard=$(@($guardRun.Problems) -join ' | ') sched=$(@($schedRun.Problems) -join ' | ') valid=$(@($validRun.Problems) -join ' | ') ver=$(@($verRun.Problems) -join ' | ')"
+
+        # --- #330: гейт після розгортання приймає exit 10 BRAVO_SETUP ---
+        # Блок гейта (if ($gateFailures.Count -eq 0) { Scheduler; ValidateOnly })
+        # витягується з Update-BRAVOServer.ps1 і виконується реально з фейковим
+        # BRAVO_SETUP.ps1: 0 => PASS, 10 => PASS WITH WARNING (без провалу гейта),
+        # інший код => провал гейта (а отже відкат).
+        $gateAst = $orchAst.Find({ param($n)
+            $n -is [System.Management.Automation.Language.IfStatementAst] -and
+            $n.Clauses.Count -ge 1 -and
+            $n.Clauses[0].Item1.Extent.Text -eq '$gateFailures.Count -eq 0' -and
+            $n.Extent.Text.Contains('BRAVO_SETUP.ps1 -Action Scheduler')
+        }, $true)
+        $gateVerdicts = @(
+            foreach ($code in @(0, 10, 1, 2, 11)) { Get-BRAVODeploySetupExitVerdict -ExitCode $code }
+        )
+        $gateRun = {
+            param([int]$Scheduler, [int]$Validate)
+            if (Test-Path -LiteralPath $sb3) { Remove-Item -LiteralPath $sb3 -Recurse -Force }
+            [void][IO.Directory]::CreateDirectory($sb3)
+            Write-RbFile $sb3 'codes.json' ((@{ Guard = 0; Scheduler = $Scheduler; ValidateOnly = $Validate } | ConvertTo-Json))
+            Write-RbFile $sb3 'VERSION.json' '{"packageVersion":"5.3.0"}'
+            Write-RbFile $sb3 'BRAVO_SETUP.ps1' $orchSetup
+            $gateFailures = New-Object System.Collections.Generic.List[string]
+            $script:GateWarnings = 0
+            function Write-Ok { param([string]$T) }
+            function Write-Warn2 { param([string]$T) $script:GateWarnings++ }
+            Push-Location $sb3
+            try { . ([scriptblock]::Create($gateAst.Extent.Text)) } finally { Pop-Location }
+            return [pscustomobject]@{ Failures = @($gateFailures.ToArray()); Warnings = $script:GateWarnings }
+        }
+        $gateOk = & $gateRun 0 0
+        $gateWarn = & $gateRun 10 10
+        $gateFailSched = & $gateRun 1 0
+        $gateFailVal = & $gateRun 0 2
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $gateAst -and
+                ($gateVerdicts -join ',') -eq 'PASS,PASS_WITH_WARNING,FAIL,FAIL,FAIL' -and
+                @($gateOk.Failures).Count -eq 0 -and $gateOk.Warnings -eq 0 -and
+                @($gateWarn.Failures).Count -eq 0 -and $gateWarn.Warnings -eq 2 -and
+                @($gateFailSched.Failures | Where-Object { $_ -like '*Scheduler exit 1' }).Count -eq 1 -and
+                @($gateFailVal.Failures | Where-Object { $_ -like '*ValidateOnly exit 2' }).Count -eq 1
+            ) `
+            -Name "Rollback/PostDeployGateTreatsSetupExit10AsPassWithWarning" `
+            -Failure "гейт після розгортання: BRAVO_SETUP exit 0 => PASS, 10 => PASS WITH WARNING без провалу гейта (інакше справне оновлення відкочується), інший код => провал (#330); verdicts=$($gateVerdicts -join ',') ok=$(@($gateOk.Failures) -join ' | ') warn=$(@($gateWarn.Failures) -join ' | ')/$($gateWarn.Warnings) sched=$(@($gateFailSched.Failures) -join ' | ') val=$(@($gateFailVal.Failures) -join ' | ')"
     } finally {
         $script:RollbackProblems = @()
         if (Test-Path -LiteralPath $sb3) { Remove-Item -LiteralPath $sb3 -Recurse -Force -ErrorAction SilentlyContinue }

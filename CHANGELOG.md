@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Fix: `Update-BRAVOServer` більше не відкочує оновлення, коли `BRAVO_SETUP` повертає exit 10 (#330).**
+  Гейт після розгортання приймав від `BRAVO_SETUP -Action Scheduler` і `-ValidateOnly`
+  лише `0`, тож SuccessWithWarnings (`10`) за контрактом BRAVO.ExitCodes вважався провалом
+  і справне оновлення відкочувалось (після #289 — дзеркальним відкатом). Тепер гейт і
+  перевірка після відкату користуються одним вердиктом `Get-BRAVODeploySetupExitVerdict`
+  (`deploy\BRAVO.Deploy.Rollback.ps1`): `0` = PASS, `10` = PASS WITH WARNING (рядок
+  `[УВАГА]`), інше = FAIL. Self-test `Rollback/PostDeployGateTreatsSetupExit10AsPassWithWarning`
+  виконує блок гейта з `Update-BRAVOServer.ps1` із фейковим `BRAVO_SETUP` і падає без виправлення.
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
