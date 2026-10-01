@@ -24187,12 +24187,12 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $archiveNewSha512HashCallAsts.Count -eq 1 -and
-            $archiveGetFileHashCallAsts.Count -eq 4 -and
+            $archiveGetFileHashCallAsts.Count -eq 3 -and
             $null -ne $archiveHashWorkCallAst -and
             $archiveHashWorkCallAst.Extent.StartOffset -eq $archiveNewSha512HashCallAsts[0].Extent.StartOffset
         ) `
         -Name 'Archive/HashBusinessCallsRemainUnchanged' `
-        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
+        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 3 рази (четвертий виклик був у мертвій Remove-OldBackupSets, видаленій у #335); знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' } }
 
     # Archive (P2-1/P2-5, PR #136 review): рекурсивне впорядкування SFTP-
