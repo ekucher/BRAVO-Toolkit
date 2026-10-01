@@ -127,7 +127,15 @@ try {
         [string]$schedulerSettings.BAZASync.TaskName,
         [string]$schedulerSettings.RestoreVerify.TaskName
     )
-    if ($taskNames.Count -ne 6 -or
+    $expectedTaskNameCount = 6
+    # BackupCatchUp (boot-підхоплення пропущеної нічної копії) відсутній у
+    # legacy-конфігурації — тоді нема чого видаляти.
+    if ($schedulerSettings.Contains('BackupCatchUp') -and
+        $schedulerSettings.BackupCatchUp -is [System.Collections.IDictionary]) {
+        $taskNames += [string]$schedulerSettings.BackupCatchUp.TaskName
+        $expectedTaskNameCount++
+    }
+    if ($taskNames.Count -ne $expectedTaskNameCount -or
         @($taskNames | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -match '[\\/]' }).Count -gt 0) {
         throw "У конфігурації вказано некоректні імена завдань"
     }
