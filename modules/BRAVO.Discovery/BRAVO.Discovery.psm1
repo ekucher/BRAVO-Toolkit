@@ -2144,6 +2144,8 @@ function Get-BRAVOLastCompleteBackupEvidence {
     if ($null -eq $componentsProperty -or $null -eq $componentsProperty.Value) { return $noEvidence }
     foreach ($componentProperty in $componentsProperty.Value.PSObject.Properties) {
         $component = $componentProperty.Value
+        # null-компонент (пошкоджений або частковий manifest) - не доказ.
+        if ($null -eq $component) { continue }
         $createProperty = $component.PSObject.Properties['CreateSuccess']
         $archiveProperty = $component.PSObject.Properties['ArchivePath']
         if ($null -ne $createProperty -and [bool]$createProperty.Value -and

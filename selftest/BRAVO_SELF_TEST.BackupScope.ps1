@@ -247,6 +247,24 @@ try {
         $null -eq (Get-BRAVOLastCompleteBackupEvidence -BackupRoot (Join-Path $scopeManifestRoot 'немає')).CreatedAtUtc
     ) -Name 'BackupScope/LastCompleteEvidenceCarriesManifestTime' `
         -Failure 'Get-BRAVOLastCompleteBackupEvidence має повертати час найновішого COMPLETE manifest разом з компонентами'
+    # null-компонент у COMPLETE manifest (StrictMode, BRAVO_SETUP -ValidateOnly кличе без try/catch).
+    $scopeNullRoot = Join-Path $scopeManifestRoot 'NULLCOMP'
+    $scopeNullDir = Join-Path $scopeNullRoot 'MANIFESTS'
+    [void](New-Item -ItemType Directory -Path $scopeNullDir -Force)
+    [IO.File]::WriteAllText((Join-Path $scopeNullDir 'BRAVO_BACKUP_20260104_020000.json'),
+        '{"generationId":"20260104_020000","status":"COMPLETE","createdAt":"2026-01-04T02:00:00Z","components":{"MODEL":null,"BLOG":{"CreateSuccess":true,"ArchivePath":"C:\\ExampleLims\\ARCHIV\\BLOG\\b4.7z"}}}', $scopeUtf8)
+    $scopeNullEvidence = $null
+    $scopeNullError = $null
+    try {
+        $scopeNullEvidence = & { Set-StrictMode -Version 2.0; Get-BRAVOLastCompleteBackupEvidence -BackupRoot $scopeNullRoot }
+    } catch {
+        $scopeNullError = $_.Exception.Message
+    }
+    Test-BRAVOCondition -Condition (
+        $null -eq $scopeNullError -and $null -ne $scopeNullEvidence -and
+        @($scopeNullEvidence.Components).Count -eq 1 -and @($scopeNullEvidence.Components)[0] -eq 'BLOG'
+    ) -Name 'BackupScope/LastCompleteEvidenceSkipsNullComponent' `
+        -Failure "null-компонент у COMPLETE manifest пропускається без винятку, решта компонентів зберігається: $scopeNullError"
     Test-BRAVOCondition -Condition (
         $scopeLastNames.Count -eq 2 -and
         $scopeLastNames -contains 'MODEL' -and
