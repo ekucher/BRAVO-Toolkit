@@ -890,46 +890,81 @@ function Get-BRAVODirectories {
         # identity джерела => недовіру до кешованого state => повну
         # повторну обробку (реальний upload). У продакшн-роботі
         # LastWriteTime джерела НІКОЛИ не змінюється — спливає лише
-        # Get-Date. Тому тут grace-межу перетинаємо СПРАВЖНІМ плином
-        # часу (Start-Sleep) при grace=1 день і початковому LastWriteTime,
-        # виставленому щільно ПІД межею (день мінус 2с) — без жодної
-        # подальшої мутації LastWriteTime.
+        # Get-Date. Тому grace-межу перетинаємо ЗСУВОМ КЕРОВАНОГО ГОДИННИКА
+        # (#338), а не реальним очікуванням і не мутацією LastWriteTime:
+        # у модулі на час кроку тимчасово підміняється Get-Date (без
+        # параметрів = реальний час + зсув; з параметрами — штатний), а
+        # LastWriteTime джерела виставляється з запасом 1 година ПІД межею.
+        # Крок 1: зсув 0 (вік ~23 год < 1 доби — лишається за будь-якої
+        # швидкості runner-а до години). Крок 2: зсув +2 год (вік >= 25 год
+        # > 1 доби — детерміновано за межею). Production-код не змінено.
         $taP7ExpireDir = Join-Path $traceArchiveTestRoot "grace-completion-expire\Trace"
         [void](New-Item -ItemType Directory -Path $taP7ExpireDir -Force)
         $taP7ExpireFile = Join-Path $taP7ExpireDir 'TraceSRV_20260904_090000.out'
         [IO.File]::WriteAllText($taP7ExpireFile, 'grace completion expire')
-        (Get-Item -LiteralPath $taP7ExpireFile).LastWriteTime = (Get-Date).AddDays(-1).AddSeconds(2)
+        (Get-Item -LiteralPath $taP7ExpireFile).LastWriteTime = (Get-Date).AddDays(-1).AddHours(1)
         $taP7ExpireStatePath = Join-Path $traceArchiveTestRoot 'grace-completion-expire\state.json'
         $taP7ExpireSession1 = New-BRAVOSelfTestFakeBazaSession
         $taP7ExpireResult1 = & $traceArchiveModule {
-            param($d, $z, $ap, $p, $s, $rd, $grace, $statePath)
-            Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap `
-                -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 `
-                -Session $s -RemoteDirectory $rd -RawSourceRetentionDays $grace -GraceCompletionStatePath $statePath
-        } $taP7ExpireDir $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taP7ExpireSession1 'trace' 1 $taP7ExpireStatePath
+            param($d, $z, $ap, $p, $s, $rd, $grace, $statePath, $offsetHours)
+            # Керований годинник: Get-Date без параметрів = реальний час + зсув.
+            $script:BRAVOSelfTestClockOffsetHours = $offsetHours
+            function script:Get-Date {
+                if ($args.Count -gt 0) { return Microsoft.PowerShell.Utility\Get-Date @args }
+                return (Microsoft.PowerShell.Utility\Get-Date).AddHours([double]$script:BRAVOSelfTestClockOffsetHours)
+            }
+            try {
+                Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap `
+                    -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 `
+                    -Session $s -RemoteDirectory $rd -RawSourceRetentionDays $grace -GraceCompletionStatePath $statePath
+            } finally {
+                Remove-Item -LiteralPath 'Function:\script:Get-Date' -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath 'Function:\Get-Date' -ErrorAction SilentlyContinue
+            }
+        } $taP7ExpireDir $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taP7ExpireSession1 'trace' 1 $taP7ExpireStatePath 0
         Test-BRAVOCondition -Condition (
             [int]$taP7ExpireResult1.SourcesRetainedForGrace -eq 1 -and
             (Test-Path -LiteralPath $taP7ExpireFile)
         ) -Name 'TraceArchive/GraceCompletionExpirySetupRetainsWithinWindow' `
             -Failure "передумова тесту: джерело щільно під grace-межею має лишитись на цьому кроці; факт: retained=$($taP7ExpireResult1.SourcesRetainedForGrace) exists=$(Test-Path -LiteralPath $taP7ExpireFile)"
-        # Реальний плин часу (не мутація LastWriteTime) переносить те саме
-        # немодифіковане джерело за grace-межу (1 день).
-        Start-Sleep -Seconds 3
+        # Керований годинник (+2 год) переносить те саме немодифіковане
+        # джерело за grace-межу (1 доба) без реального очікування.
         $taP7ExpireSession2 = New-BRAVOSelfTestFakeBazaSession -SeedRemoteState $taP7ExpireSession1.State
         $taP7ExpireResult2 = & $traceArchiveModule {
-            param($d, $z, $ap, $p, $s, $rd, $grace, $statePath)
-            Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap `
-                -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 `
-                -Session $s -RemoteDirectory $rd -RawSourceRetentionDays $grace -GraceCompletionStatePath $statePath
-        } $taP7ExpireDir $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taP7ExpireSession2 'trace' 1 $taP7ExpireStatePath
-        $taP7ExpireJsonAfter = Get-Content -LiteralPath $taP7ExpireStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            param($d, $z, $ap, $p, $s, $rd, $grace, $statePath, $offsetHours)
+            $script:BRAVOSelfTestClockOffsetHours = $offsetHours
+            function script:Get-Date {
+                if ($args.Count -gt 0) { return Microsoft.PowerShell.Utility\Get-Date @args }
+                return (Microsoft.PowerShell.Utility\Get-Date).AddHours([double]$script:BRAVOSelfTestClockOffsetHours)
+            }
+            try {
+                Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap `
+                    -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 `
+                    -Session $s -RemoteDirectory $rd -RawSourceRetentionDays $grace -GraceCompletionStatePath $statePath
+            } finally {
+                Remove-Item -LiteralPath 'Function:\script:Get-Date' -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath 'Function:\Get-Date' -ErrorAction SilentlyContinue
+            }
+        } $taP7ExpireDir $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taP7ExpireSession2 'trace' 1 $taP7ExpireStatePath 2
+        # Незалежна від годинника перевірка: Get-Date знову штатний.
+        $taP7ExpireStateExists = Test-Path -LiteralPath $taP7ExpireStatePath
+        $taP7ExpireStateHasEntry = $true
+        if ($taP7ExpireStateExists) {
+            try {
+                $taP7ExpireJsonAfter = Get-Content -LiteralPath $taP7ExpireStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $taP7ExpireStateHasEntry = ($null -ne $taP7ExpireJsonAfter.entries.PSObject.Properties['20260904'])
+            } catch {
+                $taP7ExpireStateHasEntry = $true
+            }
+        }
         Test-BRAVOCondition -Condition (
             [int]$taP7ExpireResult2.SourcesDeleted -eq 1 -and
             [int]$taP7ExpireResult2.SourcesRetainedForGrace -eq 0 -and
             @($taP7ExpireSession2.State.PutFilesCalledFor).Count -eq 0 -and
             (-not (Test-Path -LiteralPath $taP7ExpireFile)) -and
-            ($null -eq $taP7ExpireJsonAfter.entries.PSObject.Properties['20260904'])
-        ) -Name 'TraceArchive/GraceCompletionExpiryDeletesWithoutReuploadAndClearsState' -Failure "завершення grace має видалити джерело БЕЗ повторного PutFiles і прибрати запис зі state; факт: deleted=$($taP7ExpireResult2.SourcesDeleted) putCalls=$(@($taP7ExpireSession2.State.PutFilesCalledFor).Count) stateHasEntry=$($null -ne $taP7ExpireJsonAfter.entries.PSObject.Properties['20260904'])"
+            $taP7ExpireStateExists -and
+            (-not $taP7ExpireStateHasEntry)
+        ) -Name 'TraceArchive/GraceCompletionExpiryDeletesWithoutReuploadAndClearsState' -Failure "завершення grace має видалити джерело БЕЗ повторного PutFiles і прибрати запис зі state; факт: deleted=$($taP7ExpireResult2.SourcesDeleted) retained=$($taP7ExpireResult2.SourcesRetainedForGrace) putCalls=$(@($taP7ExpireSession2.State.PutFilesCalledFor).Count) stateExists=$taP7ExpireStateExists stateHasEntry=$taP7ExpireStateHasEntry"
 
         # --- E: RawSourceGraceDays=0 -> completion state НІКОЛИ не створюється (попередня поведінка).
         $taP7ZeroDir = Join-Path $traceArchiveTestRoot "grace-completion-zero\Trace"
