@@ -972,6 +972,8 @@ function Write-BRAVOSelfTestTimingSummary {
 # при Phase-0-FAIL вони були б вакуумно-істинними (жодних fixture ще не
 # створено) і лише засмічували б short-circuit шлях.
 function Complete-BRAVOSelfTestReport {
+    # #219 (частина B): із цієї миті аварійний шлях не запускає звіт повторно.
+    $script:BRAVOSelfTestReportStarted = $true
     Complete-BRAVOSelfTestActiveSuiteSpan
 
     # P2 fix (review comment 3962649933): стабільний end-boundary для
@@ -1023,6 +1025,15 @@ function Complete-BRAVOSelfTestReport {
             -Value ('вибірковий: ' + [string]::Join(', ', $script:BRAVOSelfTestSelectedSuite)) `
             -Color ([ConsoleColor]::Yellow)
     }
+    # #219 (частина B): перервані й пропущені секції — окремими полями, щоб
+    # частковий прогін не виглядав як повний навіть за побіжного перегляду.
+    $reportAbortedSectionCount = @($script:BRAVOSelfTestSections | Where-Object { $_.Status -eq 'Aborted' }).Count
+    $reportSkippedSectionCount = @($script:BRAVOSelfTestSections | Where-Object { $_.Status -eq 'Skipped' }).Count
+    if ($reportAbortedSectionCount -gt 0 -or $reportSkippedSectionCount -gt 0) {
+        Write-BRAVOResultField -Label 'Перервані секції' -Value ([string]$reportAbortedSectionCount) -Color ([ConsoleColor]::Red)
+        Write-BRAVOResultField -Label 'Пропущені секції' -Value ([string]$reportSkippedSectionCount) -Color ([ConsoleColor]::Red)
+    }
+    Write-BRAVOSelfTestSectionReport
     Write-BRAVOResultBlankLine
     if ($script:selfTestExitCode -eq 0 -and $null -ne $script:BRAVOSelfTestSelectedSuite) {
         # #187: вибірковий прогін не має права виглядати як успішне
@@ -1084,12 +1095,512 @@ function Complete-BRAVOSelfTestReport {
     # шляху завершення (P18). SYSTEM/non-interactive/-NoPause не чекають —
     # рішення повністю всередині самої Wait-BRAVOManualExit (той самий
     # контракт, що й Archive/Health/Maintenance, жодної паралельної реалізації).
+    $script:BRAVOSelfTestReportIssued = $true
     try {
         Complete-BRAVOHelperLog -ExitCode $script:selfTestExitCode
     } finally {
         Wait-BRAVOManualExit -NoPause:$NoPause
     }
 }
+
+# ============================================================
+# #219 (частина B): секційна ізоляція фатальних помилок.
+#
+# Раніше будь-який непередбачений виняток у корені чи фрагменті летів у
+# ЄДИНИЙ зовнішній catch: решта прогону (сотні перевірок) мовчки не
+# виконувалась, а в підсумку лишався один рядок "Fatal: <повідомлення>"
+# без файлу, рядка й стеку. Тепер тіло прогону поділено на ІМЕНОВАНІ
+# секції з явною межею:
+#
+#     if (Enter-BRAVOSelfTestSection -Name 'X' [-DependsOn ...] [-Policy ...]) { try {
+#         ...тіло секції без змін...
+#     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'X' } }
+#
+# ЧОМУ INLINE, А НЕ ФУНКЦІЯ-ОБГОРТКА. try/if не створюють scope, тож
+# змінні секції лишаються у scope файлу, як і до поділу. Функція чи
+# & { } створили б дочірній scope і зламали б потік фікстур між
+# перевірками.
+#
+# КОНТРАКТ МЕЖІ (fail-closed):
+#   - ім'я: стабільне, без номерів рядків; повтор імені = пошкоджені межі;
+#   - старт: фіксуються час і кількість уже виконаних перевірок;
+#   - виняток: тип, повідомлення, ErrorId, файл:рядок, позиція, скорочений
+#     стек — і в момент збою, і в підсумковому звіті;
+#   - cleanup: фікстурні try/finally усередині секції виконуються як і
+#     раніше (unwind іде крізь них до catch секції); owned runtime modules
+#     і config root прибирає Invoke-BRAVOSelfTestFinalCleanup на КОЖНОМУ
+#     шляху завершення, а її збій реєструється окремо й не маскує
+#     першопричину;
+#   - реєстрація: кожна перервана або пропущена секція потрапляє в
+#     $script:failures, тобто код завершення 1 і "SELF-TEST FAILED";
+#     перетворити виняток на інформаційний рядок неможливо;
+#   - продовження: Continue — наступні незалежні секції виконуються;
+#     GlobalFatal — решта основного тіла не виконується (явні глобальні
+#     межі нижче).
+#
+# КАСКАДИ. Секція, що читає фікстуру іншої секції, оголошує це через
+# -DependsOn. Якщо передумову перервано або пропущено, залежну секцію
+# не виконують і позначають [ПРОПУЩЕНО]: одна першопричина дає один
+# рядок збою й короткий список пропусків, а не десятки
+# VariableIsUndefined. Пропуск теж рахується як помилка прогону.
+#
+# ГЛОБАЛЬНО-ФАТАЛЬНІ МЕЖІ (свідомо лишаються такими):
+#   1. цілісність комплекту до Import-Module (bootstrap, exit 1 без модулів);
+#   2. невідомий -Suite і імпорт HelperLogging/Console (до початку прогону);
+#   3. секція Bootstrap/RuntimeGuard (guard і StrictMode для решти файлу);
+#   4. секція Phase0 (структурний gate; провал перевірок — short-circuit);
+#   5. пошкоджений фреймворк: Test-BRAVOCondition, функції suite/секцій
+#      чи звіту підмінені або затінені модулем, лічильники підмінено,
+#      межі секцій порушено — прогін зупиняється (Kind = Framework);
+#   6. збій самої машинерії звіту — мінімальний dependency-free шлях
+#      "SELF-TEST FAILED" і exit 1.
+# ============================================================
+$script:BRAVOSelfTestGlobalFatalDataKey = 'BRAVOSelfTestGlobalFatal'
+
+function Initialize-BRAVOSelfTestSectionState {
+    # Єдине місце ініціалізації стану секцій: той самий виклик робить і
+    # bootstrap, і ізольовані регресійні проби (дочірній процес), щоб
+    # проби не тримали власної копії стану.
+    $script:BRAVOSelfTestSections = New-Object System.Collections.Generic.List[object]
+    $script:BRAVOSelfTestSectionIndex = @{}
+    $script:BRAVOSelfTestSectionStack = New-Object System.Collections.Generic.List[object]
+    $script:BRAVOSelfTestGlobalFaults = New-Object System.Collections.Generic.List[object]
+    $script:BRAVOSelfTestCleanupFaults = New-Object System.Collections.Generic.List[object]
+    $script:BRAVOSelfTestRunStopReason = ''
+    $script:BRAVOSelfTestReportStarted = $false
+    $script:BRAVOSelfTestReportIssued = $false
+    $script:BRAVOSelfTestAbnormalExitStarted = $false
+    $script:BRAVOSelfTestFrameworkSnapshot = @{}
+}
+
+function New-BRAVOSelfTestGlobalFatalException {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('Boundary', 'Framework')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+    $globalFatalException = New-Object System.InvalidOperationException ($Message)
+    $globalFatalException.Data[$script:BRAVOSelfTestGlobalFatalDataKey] = $Kind
+    return $globalFatalException
+}
+
+function Get-BRAVOSelfTestGlobalFatalKind {
+    # '' — звичайний виняток; 'Boundary'/'Framework' — маркер глобальної
+    # зупинки, який секції не поглинають, а передають назовні.
+    param($ErrorRecord)
+    try {
+        $markedException = $ErrorRecord.Exception
+        if ($null -ne $markedException -and $null -ne $markedException.Data -and
+            $markedException.Data.Contains($script:BRAVOSelfTestGlobalFatalDataKey)) {
+            return [string]$markedException.Data[$script:BRAVOSelfTestGlobalFatalDataKey]
+        }
+    } catch {
+        return ''
+    }
+    return ''
+}
+
+function ConvertTo-BRAVOSelfTestFaultRecord {
+    # Діагностика винятку для звіту. Нічого не приховує: за будь-якого
+    # збою самого розбору повертає хоча б текст, отриманий через ToString.
+    param($ErrorRecord)
+    $faultType = ''
+    $faultMessage = ''
+    $faultErrorId = ''
+    $faultLocation = ''
+    $faultPosition = ''
+    $faultStack = ''
+    try {
+        $faultException = $ErrorRecord.Exception
+        if ($null -ne $faultException) {
+            $faultType = $faultException.GetType().FullName
+            $faultMessage = [string]$faultException.Message
+        }
+        $faultErrorId = [string]$ErrorRecord.FullyQualifiedErrorId
+        $faultInvocation = $ErrorRecord.InvocationInfo
+        if ($null -ne $faultInvocation) {
+            $faultScriptName = [string]$faultInvocation.ScriptName
+            if (-not [string]::IsNullOrEmpty($faultScriptName)) {
+                $faultScriptName = [IO.Path]::GetFileName($faultScriptName)
+            }
+            $faultLocation = '{0}:{1}' -f $faultScriptName, $faultInvocation.ScriptLineNumber
+            $faultPositionLines = @(([string]$faultInvocation.PositionMessage -split "`r?`n") |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 3)
+            $faultPosition = [string]::Join(' | ', @($faultPositionLines | ForEach-Object { $_.Trim() }))
+        }
+        $faultStackLines = @(([string]$ErrorRecord.ScriptStackTrace -split "`r?`n") |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $faultStack = [string]::Join(' | ', @($faultStackLines | Select-Object -First 6))
+        if ($faultStackLines.Count -gt 6) { $faultStack += (' | … ще {0}' -f ($faultStackLines.Count - 6)) }
+    } catch {
+        if ([string]::IsNullOrEmpty($faultMessage)) { $faultMessage = [string]$ErrorRecord }
+    }
+    if ($faultPosition.Length -gt 400) { $faultPosition = $faultPosition.Substring(0, 400) + '…' }
+    return [pscustomobject]@{
+        Type     = $faultType
+        Message  = $faultMessage
+        ErrorId  = $faultErrorId
+        Location = $faultLocation
+        Position = $faultPosition
+        Stack    = $faultStack
+    }
+}
+
+function Write-BRAVOSelfTestSectionFault {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Verdict,
+        [Parameter(Mandatory = $true)]$Fault
+    )
+    Write-Host ("[FAIL] {0}: {1} [{2}] {3}" -f $Label, $Verdict, $Fault.Type, $Fault.Message) -ForegroundColor Red
+    Write-Host ("       місце: {0}; ErrorId: {1}" -f $Fault.Location, $Fault.ErrorId) -ForegroundColor Red
+    if (-not [string]::IsNullOrEmpty($Fault.Position)) { Write-Host ("       позиція: {0}" -f $Fault.Position) -ForegroundColor Red }
+    if (-not [string]::IsNullOrEmpty($Fault.Stack)) { Write-Host ("       стек: {0}" -f $Fault.Stack) -ForegroundColor Red }
+}
+
+function Get-BRAVOSelfTestFrameworkIntegrityProblem {
+    # Порожній рядок — фреймворк цілий. Інакше — перелік порушень.
+    $integrityProblems = New-Object System.Collections.Generic.List[string]
+    if ($script:BRAVOSelfTestFrameworkSnapshot.Count -eq 0) {
+        [void]$integrityProblems.Add('знімок функцій фреймворку відсутній')
+    }
+    foreach ($frameworkFunctionName in @($script:BRAVOSelfTestFrameworkSnapshot.Keys)) {
+        $frameworkFunction = Get-Item -LiteralPath ('function:' + $frameworkFunctionName) -ErrorAction SilentlyContinue
+        if ($null -eq $frameworkFunction) {
+            [void]$integrityProblems.Add("$frameworkFunctionName відсутня")
+        } elseif (-not [string]::IsNullOrEmpty([string]$frameworkFunction.ModuleName)) {
+            [void]$integrityProblems.Add("$frameworkFunctionName затінена модулем $($frameworkFunction.ModuleName)")
+        } elseif ($frameworkFunction.ScriptBlock.ToString() -cne $script:BRAVOSelfTestFrameworkSnapshot[$frameworkFunctionName].ToString()) {
+            [void]$integrityProblems.Add("$frameworkFunctionName перевизначена")
+        }
+    }
+    if (-not ($script:failures -is [System.Collections.ArrayList])) { [void]$integrityProblems.Add('$script:failures підмінено') }
+    if (-not ($script:testTimings -is [System.Collections.Generic.List[object]])) { [void]$integrityProblems.Add('$script:testTimings підмінено') }
+    return [string]::Join('; ', $integrityProblems.ToArray())
+}
+
+function Assert-BRAVOSelfTestFrameworkIntact {
+    param([Parameter(Mandatory = $true)][string]$Context)
+    $integrityProblem = Get-BRAVOSelfTestFrameworkIntegrityProblem
+    if (-not [string]::IsNullOrEmpty($integrityProblem)) {
+        throw (New-BRAVOSelfTestGlobalFatalException -Kind Framework `
+                -Message ("фреймворк self-test пошкоджено ({0}): {1}" -f $Context, $integrityProblem))
+    }
+}
+
+function Restore-BRAVOSelfTestFrameworkFunctions {
+    # Лише для шляху зупинки: звіт мусить виконуватися справжнім кодом,
+    # а не підміною, що й спричинила зупинку. Повертає перелік відновлених.
+    $restoredFunctions = New-Object System.Collections.Generic.List[string]
+    foreach ($frameworkFunctionName in @($script:BRAVOSelfTestFrameworkSnapshot.Keys)) {
+        $frameworkFunction = Get-Item -LiteralPath ('function:' + $frameworkFunctionName) -ErrorAction SilentlyContinue
+        $originalScriptBlock = $script:BRAVOSelfTestFrameworkSnapshot[$frameworkFunctionName]
+        if ($null -eq $frameworkFunction -or
+            -not [string]::IsNullOrEmpty([string]$frameworkFunction.ModuleName) -or
+            $frameworkFunction.ScriptBlock.ToString() -cne $originalScriptBlock.ToString()) {
+            # script: — явна область визначення фреймворку, незалежно від того,
+            # з якої області викликано відновлення.
+            Set-Item -LiteralPath ('function:script:' + $frameworkFunctionName) -Value $originalScriptBlock -Force
+            [void]$restoredFunctions.Add($frameworkFunctionName)
+        }
+    }
+    return @($restoredFunctions.ToArray())
+}
+
+function Save-BRAVOSelfTestFrameworkSnapshot {
+    param([Parameter(Mandatory = $true)][string[]]$FunctionName)
+    foreach ($frameworkFunctionName in $FunctionName) {
+        $script:BRAVOSelfTestFrameworkSnapshot[$frameworkFunctionName] =
+            (Get-Item -LiteralPath ('function:' + $frameworkFunctionName) -ErrorAction Stop).ScriptBlock
+    }
+}
+
+function Enter-BRAVOSelfTestSection {
+    # $true — виконувати тіло секції; $false — секцію пропущено (причину
+    # уже зареєстровано як помилку прогону).
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string[]]$DependsOn = @(),
+        [ValidateSet('Continue', 'GlobalFatal')][string]$Policy = 'Continue'
+    )
+    Assert-BRAVOSelfTestFrameworkIntact -Context "вхід у секцію $Name"
+    if ($script:BRAVOSelfTestSectionIndex.ContainsKey($Name)) {
+        throw (New-BRAVOSelfTestGlobalFatalException -Kind Framework `
+                -Message "секцію '$Name' оголошено вдруге — межі секцій порушено")
+    }
+    $sectionStackDepth = $script:BRAVOSelfTestSectionStack.Count
+    $sectionRecord = [pscustomobject]@{
+        Name           = $Name
+        Policy         = $Policy
+        DependsOn      = @($DependsOn)
+        Parent         = $(if ($sectionStackDepth -gt 0) { $script:BRAVOSelfTestSectionStack[$sectionStackDepth - 1].Name } else { '' })
+        Suite          = $script:currentSuiteName
+        Status         = 'Running'
+        StartedAtMs    = $script:selfTestTotalStopwatch.Elapsed.TotalMilliseconds
+        DurationMs     = 0.0
+        ChecksAtStart  = $script:testTimings.Count
+        ChecksExecuted = 0
+        Fault          = $null
+        FaultSuite     = ''
+        SkipReason     = ''
+    }
+    [void]$script:BRAVOSelfTestSections.Add($sectionRecord)
+    $script:BRAVOSelfTestSectionIndex[$Name] = $sectionRecord
+
+    $sectionSkipReason = ''
+    if (-not [string]::IsNullOrEmpty($script:BRAVOSelfTestRunStopReason)) {
+        $sectionSkipReason = 'прогін зупинено через пошкоджений фреймворк'
+    } else {
+        foreach ($sectionDependencyName in @($DependsOn)) {
+            if (-not $script:BRAVOSelfTestSectionIndex.ContainsKey($sectionDependencyName)) {
+                $sectionSkipReason = "передумову '$sectionDependencyName' не виконано"
+                break
+            }
+            $sectionDependency = $script:BRAVOSelfTestSectionIndex[$sectionDependencyName]
+            if ($sectionDependency.Status -eq 'Running') {
+                throw (New-BRAVOSelfTestGlobalFatalException -Kind Framework `
+                        -Message "секція '$Name' залежить від ще відкритої секції '$sectionDependencyName' — межі секцій порушено")
+            }
+            if ($sectionDependency.Status -eq 'Aborted') {
+                $sectionSkipReason = "передумову '$sectionDependencyName' перервано винятком"
+                break
+            }
+            if ($sectionDependency.Status -eq 'Skipped') {
+                $sectionSkipReason = "передумову '$sectionDependencyName' пропущено"
+                break
+            }
+        }
+    }
+    if (-not [string]::IsNullOrEmpty($sectionSkipReason)) {
+        $sectionRecord.Status = 'Skipped'
+        $sectionRecord.SkipReason = $sectionSkipReason
+        [void]$script:failures.Add("Section/$Name — пропущено: $sectionSkipReason")
+        Write-Host "[ПРОПУЩЕНО] Section/${Name}: $sectionSkipReason" -ForegroundColor Red
+        return $false
+    }
+    [void]$script:BRAVOSelfTestSectionStack.Add($sectionRecord)
+    return $true
+}
+
+function Register-BRAVOSelfTestSectionFault {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+    # Маркер глобальної зупинки секція не поглинає: він іде назовні аж до
+    # головного catch.
+    if (-not [string]::IsNullOrEmpty((Get-BRAVOSelfTestGlobalFatalKind -ErrorRecord $ErrorRecord))) {
+        throw $ErrorRecord
+    }
+    $sectionStackDepth = $script:BRAVOSelfTestSectionStack.Count
+    if ($sectionStackDepth -eq 0) {
+        throw (New-BRAVOSelfTestGlobalFatalException -Kind Framework `
+                -Message ("виняток зареєстровано поза відкритою секцією — межі секцій порушено: " + $ErrorRecord.Exception.Message))
+    }
+    $faultedSection = $script:BRAVOSelfTestSectionStack[$sectionStackDepth - 1]
+    $sectionFault = ConvertTo-BRAVOSelfTestFaultRecord -ErrorRecord $ErrorRecord
+    $faultedSection.Status = 'Aborted'
+    $faultedSection.Fault = $sectionFault
+    $faultedSection.FaultSuite = $script:currentSuiteName
+    [void]$script:failures.Add(("Section/{0} — перервано: [{1}] {2} ({3})" -f
+            $faultedSection.Name, $sectionFault.Type, $sectionFault.Message, $sectionFault.Location))
+    Write-BRAVOSelfTestSectionFault -Label ("Section/" + $faultedSection.Name) -Verdict 'перервано винятком' -Fault $sectionFault
+    Assert-BRAVOSelfTestFrameworkIntact -Context ("після винятку в секції " + $faultedSection.Name)
+    if ($faultedSection.Policy -eq 'GlobalFatal') {
+        throw (New-BRAVOSelfTestGlobalFatalException -Kind Boundary `
+                -Message ("глобальну межу '{0}' перервано — решту основного тіла не виконано" -f $faultedSection.Name))
+    }
+}
+
+function Complete-BRAVOSelfTestSection {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $sectionStackDepth = $script:BRAVOSelfTestSectionStack.Count
+    $closingSection = if ($sectionStackDepth -gt 0) { $script:BRAVOSelfTestSectionStack[$sectionStackDepth - 1] } else { $null }
+    if ($null -eq $closingSection -or $closingSection.Name -ne $Name) {
+        throw (New-BRAVOSelfTestGlobalFatalException -Kind Framework `
+                -Message ("межі секцій порушено: закривається '{0}', відкрита '{1}'" -f $Name,
+                    $(if ($null -ne $closingSection) { $closingSection.Name } else { '' })))
+    }
+    $script:BRAVOSelfTestSectionStack.RemoveAt($sectionStackDepth - 1)
+    if ($closingSection.Status -eq 'Running') { $closingSection.Status = 'Completed' }
+    # Enter-BRAVOSelfTestSuite лишається єдиним власником suite-span:
+    # перервана секція фрагмента не повинна лишити атрибуцію "мертвому" suite.
+    if ($closingSection.Status -eq 'Aborted' -and $script:currentSuiteName -ne $closingSection.Suite) {
+        Enter-BRAVOSelfTestSuite -Name $closingSection.Suite
+    }
+    $closingSection.DurationMs = $script:selfTestTotalStopwatch.Elapsed.TotalMilliseconds - $closingSection.StartedAtMs
+    $closingSection.ChecksExecuted = $script:testTimings.Count - $closingSection.ChecksAtStart
+    Assert-BRAVOSelfTestFrameworkIntact -Context "завершення секції $Name"
+}
+
+function Register-BRAVOSelfTestGlobalFatal {
+    # Головний catch: виняток дійшов сюди лише як маркер глобальної межі
+    # або з коду МІЖ секціями (перемикання suite, гейти).
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+    $globalFatalKind = Get-BRAVOSelfTestGlobalFatalKind -ErrorRecord $ErrorRecord
+    $globalFault = ConvertTo-BRAVOSelfTestFaultRecord -ErrorRecord $ErrorRecord
+    [void]$script:BRAVOSelfTestGlobalFaults.Add([pscustomobject]@{ Kind = $globalFatalKind; Fault = $globalFault })
+    [void]$script:failures.Add($globalFault.Message)
+    if ($globalFatalKind -eq 'Boundary') {
+        Write-Host "[FAIL] Fatal: $($globalFault.Message)" -ForegroundColor Red
+    } else {
+        Write-BRAVOSelfTestSectionFault -Label 'Fatal' -Verdict 'основне тіло зупинено' -Fault $globalFault
+    }
+    # Межі, що лишились відкритими, закриваються як перервані.
+    for ($openIndex = $script:BRAVOSelfTestSectionStack.Count - 1; $openIndex -ge 0; $openIndex--) {
+        $script:BRAVOSelfTestSectionStack[$openIndex].Status = 'Aborted'
+    }
+    $script:BRAVOSelfTestSectionStack.Clear()
+    $integrityProblem = Get-BRAVOSelfTestFrameworkIntegrityProblem
+    if ($globalFatalKind -eq 'Framework' -or -not [string]::IsNullOrEmpty($integrityProblem)) {
+        $script:BRAVOSelfTestRunStopReason = $(if ($globalFatalKind -eq 'Framework') { $globalFault.Message } else { $integrityProblem })
+        $restoredFrameworkFunctions = @(Restore-BRAVOSelfTestFrameworkFunctions)
+        Write-Host ("[FAIL] Framework/RunStopped: прогін зупинено, решту секцій не виконано; відновлено функції: {0}" -f
+            $(if ($restoredFrameworkFunctions.Count -gt 0) { [string]::Join(', ', $restoredFrameworkFunctions) } else { 'немає' })) -ForegroundColor Red
+        [void]$script:failures.Add("Framework/RunStopped — прогін зупинено: $($script:BRAVOSelfTestRunStopReason)")
+    }
+    # P0 fail-fast/telemetry (PR #138 review, P2-B): після винятку атрибуція
+    # повертається до 'Root (inline)', а не лишається "мертвому" suite.
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+}
+
+function Remove-BRAVOSelfTestConfigRoot {
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:selfTestConfigRoot) -and
+        [IO.Directory]::Exists($script:selfTestConfigRoot)) {
+        [IO.Directory]::Delete($script:selfTestConfigRoot, $true)
+    }
+}
+
+function Invoke-BRAVOSelfTestFinalCleanup {
+    # Гарантоване прибирання перед звітом на КОЖНОМУ шляху завершення, крім
+    # Phase-0 short-circuit (там фікстур ще немає). Ідемпотентне: штатний
+    # хвіст уже прибрав те саме, тоді це no-op. Ніколи не кидає — збій
+    # кроку реєструється як помилка прогону.
+    foreach ($finalCleanupStep in @('OwnedRuntimeModules', 'ConfigRoot')) {
+        try {
+            if ($finalCleanupStep -eq 'OwnedRuntimeModules') {
+                Clear-BRAVOSelfTestOwnedRuntimeModules
+            } else {
+                Remove-BRAVOSelfTestConfigRoot
+            }
+        } catch {
+            # Реєструється поряд із першопричиною, а не замість неї: звіт
+            # показує і перервану секцію, і збій прибирання.
+            $finalCleanupFault = ConvertTo-BRAVOSelfTestFaultRecord -ErrorRecord $_
+            [void]$script:BRAVOSelfTestCleanupFaults.Add([pscustomobject]@{ Step = $finalCleanupStep; Fault = $finalCleanupFault })
+            [void]$script:failures.Add(("Framework/FinalCleanup.{0} — [{1}] {2}" -f
+                    $finalCleanupStep, $finalCleanupFault.Type, $finalCleanupFault.Message))
+            Write-BRAVOSelfTestSectionFault -Label ("Framework/FinalCleanup." + $finalCleanupStep) -Verdict 'прибирання не вдалося' -Fault $finalCleanupFault
+        }
+    }
+}
+
+function Write-BRAVOSelfTestSectionReport {
+    # Підсумок секцій у фінальному звіті: першопричина — першою.
+    $abortedSections = @($script:BRAVOSelfTestSections | Where-Object { $_.Status -eq 'Aborted' -and $null -ne $_.Fault })
+    $skippedSections = @($script:BRAVOSelfTestSections | Where-Object { $_.Status -eq 'Skipped' })
+    if ($abortedSections.Count -eq 0 -and $skippedSections.Count -eq 0 -and
+        $script:BRAVOSelfTestCleanupFaults.Count -eq 0 -and $script:BRAVOSelfTestGlobalFaults.Count -eq 0) {
+        return
+    }
+    Write-BRAVOResultBlankLine
+    Write-Host 'Збої секцій і меж (у порядку виникнення, перший — першопричина):' -ForegroundColor Red
+    foreach ($abortedSection in $abortedSections) {
+        Write-Host ("  - {0} [suite {1}; перевірок до збою: {2}]: [{3}] {4}" -f $abortedSection.Name, $abortedSection.FaultSuite,
+            $abortedSection.ChecksExecuted, $abortedSection.Fault.Type, $abortedSection.Fault.Message) -ForegroundColor Red
+        Write-Host ("      місце: {0}; ErrorId: {1}" -f $abortedSection.Fault.Location, $abortedSection.Fault.ErrorId)
+        if (-not [string]::IsNullOrEmpty($abortedSection.Fault.Position)) { Write-Host ("      позиція: {0}" -f $abortedSection.Fault.Position) }
+        if (-not [string]::IsNullOrEmpty($abortedSection.Fault.Stack)) { Write-Host ("      стек: {0}" -f $abortedSection.Fault.Stack) }
+    }
+    foreach ($cleanupFaultEntry in $script:BRAVOSelfTestCleanupFaults) {
+        Write-Host ("  - прибирання {0}: [{1}] {2} ({3})" -f $cleanupFaultEntry.Step, $cleanupFaultEntry.Fault.Type,
+            $cleanupFaultEntry.Fault.Message, $cleanupFaultEntry.Fault.Location) -ForegroundColor Red
+    }
+    foreach ($globalFaultEntry in $script:BRAVOSelfTestGlobalFaults) {
+        Write-Host ("  - глобальна зупинка ({0}): [{1}] {2} ({3})" -f
+            $(if ([string]::IsNullOrEmpty($globalFaultEntry.Kind)) { 'поза секцією' } else { $globalFaultEntry.Kind }),
+            $globalFaultEntry.Fault.Type, $globalFaultEntry.Fault.Message, $globalFaultEntry.Fault.Location) -ForegroundColor Red
+    }
+    if ($skippedSections.Count -gt 0) {
+        Write-Host ("Пропущені секції: {0}" -f $skippedSections.Count) -ForegroundColor Red
+        foreach ($skippedSection in @($skippedSections | Select-Object -First 25)) {
+            Write-Host ("  - {0}: {1}" -f $skippedSection.Name, $skippedSection.SkipReason)
+        }
+        if ($skippedSections.Count -gt 25) { Write-Host ("  … ще {0}" -f ($skippedSections.Count - 25)) }
+    }
+}
+
+function Complete-BRAVOSelfTestAbnormalExit {
+    # Гарантований термінальний шлях, коли штатний Complete-BRAVOSelfTestReport
+    # не відпрацював (незахищений виняток поза секціями або збій самого
+    # звіту). Ніколи не повертається і ніколи не дає коду 0.
+    param($ErrorRecord)
+    $script:BRAVOSelfTestAbnormalExitStarted = $true
+    try {
+        $abnormalMessage = 'прогін завершився поза штатним шляхом звіту'
+        if ($null -ne $ErrorRecord) {
+            $abnormalFault = ConvertTo-BRAVOSelfTestFaultRecord -ErrorRecord $ErrorRecord
+            Write-BRAVOSelfTestSectionFault -Label 'Framework/UnprotectedFatal' -Verdict 'виняток поза секціями' -Fault $abnormalFault
+            $abnormalMessage = ("[{0}] {1} ({2})" -f $abnormalFault.Type, $abnormalFault.Message, $abnormalFault.Location)
+        } else {
+            Write-Host "[FAIL] Framework/UnprotectedFatal: $abnormalMessage" -ForegroundColor Red
+        }
+        [void]$script:failures.Add("Framework/UnprotectedFatal — $abnormalMessage")
+    } catch {
+        Write-Host '[FAIL] Framework/UnprotectedFatal: діагностику зібрати не вдалося' -ForegroundColor Red
+    }
+    try {
+        # Сюди доходить і маркер пошкодженого фреймворку з хвоста: звіт має
+        # виконуватись справжнім кодом, а не підміною.
+        $abnormalRestored = @(Restore-BRAVOSelfTestFrameworkFunctions)
+        if ($abnormalRestored.Count -gt 0) {
+            Write-Host ("[FAIL] Framework/RunStopped: прогін зупинено; відновлено функції: " + [string]::Join(', ', $abnormalRestored)) -ForegroundColor Red
+            [void]$script:failures.Add("Framework/RunStopped — відновлено функції: " + [string]::Join(', ', $abnormalRestored))
+        }
+    } catch {
+        Write-Host '[FAIL] Framework/RunStopped: функції фреймворку відновити не вдалося' -ForegroundColor Red
+    }
+    try {
+        Invoke-BRAVOSelfTestFinalCleanup
+    } catch {
+        # Invoke-BRAVOSelfTestFinalCleanup сама реєструє збої кроків; сюди
+        # доходить лише її власна поломка, і термінальний шлях не має права
+        # зупинитись на ній, не видавши FAILED і код 1.
+    }
+    if (-not $script:BRAVOSelfTestReportStarted) {
+        try {
+            Complete-BRAVOSelfTestReport
+        } catch {
+            Write-Host ("[FAIL] Framework/ReportMachinery: {0}" -f $_.Exception.Message) -ForegroundColor Red
+        }
+    }
+    # Сюди доходить лише тоді, коли не відпрацювала сама машинерія звіту.
+    # Мінімальний dependency-free шлях: той самий машинний маркер і exit 1.
+    $abnormalFailureCount = 1
+    try {
+        if ($script:failures.Count -gt 0) { $abnormalFailureCount = $script:failures.Count }
+    } catch {
+        # Лічильник підмінено чи зіпсовано — лишається мінімальне 1: маркер
+        # FAILED і код 1 важливіші за точну кількість.
+    }
+    Write-Host ("SELF-TEST FAILED: {0}" -f $abnormalFailureCount) -ForegroundColor Red
+    try {
+        Complete-BRAVOHelperLog -ExitCode 1
+    } catch {
+        # Журнал недоступний: код 1 усе одно гарантує exit нижче.
+    }
+    exit 1
+}
+
+Initialize-BRAVOSelfTestSectionState
+Save-BRAVOSelfTestFrameworkSnapshot -FunctionName @(
+    'Initialize-BRAVOSelfTestSectionState', 'Test-BRAVOCondition', 'Get-BRAVOSelfTestAssertionResult', 'Test-BRAVOSelfTestSuiteEnabled',
+    'Enter-BRAVOSelfTestSuite', 'Complete-BRAVOSelfTestActiveSuiteSpan',
+    'Write-BRAVOSelfTestTimingSummary', 'Complete-BRAVOSelfTestReport',
+    'Clear-BRAVOSelfTestOwnedRuntimeModules', 'New-BRAVOSelfTestGlobalFatalException',
+    'Get-BRAVOSelfTestGlobalFatalKind', 'ConvertTo-BRAVOSelfTestFaultRecord',
+    'Write-BRAVOSelfTestSectionFault', 'Get-BRAVOSelfTestFrameworkIntegrityProblem',
+    'Assert-BRAVOSelfTestFrameworkIntact', 'Restore-BRAVOSelfTestFrameworkFunctions',
+    'Enter-BRAVOSelfTestSection', 'Register-BRAVOSelfTestSectionFault',
+    'Complete-BRAVOSelfTestSection', 'Register-BRAVOSelfTestGlobalFatal',
+    'Remove-BRAVOSelfTestConfigRoot', 'Invoke-BRAVOSelfTestFinalCleanup',
+    'Write-BRAVOSelfTestSectionReport', 'Complete-BRAVOSelfTestAbnormalExit')
 
 # ============================================================
 # #157 (фаза 1): memo власного джерела self-test.
@@ -1146,8 +1657,15 @@ function Get-BRAVOSelfTestOwnSourceAst {
     return $script:BRAVOSelfTestOwnSourceAst
 }
 
+# #219 (частина B): ЗОВНІШНІЙ try охоплює і основне тіло, і хвіст. Його
+# catch/finally — гарантований термінальний шлях: будь-який виняток поза
+# секціями або збій самого звіту закінчується звітом (чи мінімальним
+# "SELF-TEST FAILED") і ненульовим кодом, а не необробленим винятком.
+# Відступи тіла навмисно не змінено, щоб diff лишився оглядовим.
+try {
 try {
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Parser') { try {
     Write-Host "BRAVO SELF-TEST (STATIC + RUNTIME)" -ForegroundColor Cyan
     $powerShellFiles = @(
         @(Get-ChildItem -LiteralPath $root -File -Filter '*.ps1')
@@ -1742,6 +2260,8 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "DryRun/ModeLabelReflectsWriteProbes" `
         -Failure "з -TestAccess прогін робить локальні проби запису і створює каталоги на SFTP, тому заголовок не має безумовно повідомляти оператору READ-ONLY"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Parser' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/DryRun' -DependsOn 'Root/Parser') { try {
 
     # P2-знахідка acceptance 5.2.0: тестове повідомлення -SendTestNotification
     # завжди йшло в ALERTS, бо Test-DryRunWebhookCredential ітерував маршрути
@@ -2033,12 +2553,16 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             [IO.Directory]::Delete($toolManifestRoot, $true)
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/DryRun' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Bootstrap/RuntimeGuard' -Policy GlobalFatal) { try {
 
     # Аудит P2: цілісність усього PowerShell-комплекту. Guard навмисно
     # самодостатній (лише .NET, без модулів BRAVO), бо виконується ДО
     # Import-Module — інакше довелося б завантажити модуль, щоб
     # перевірити модулі.
     . (Join-Path $root "BRAVO_RUNTIME_GUARD.ps1")
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Bootstrap/RuntimeGuard' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/RuntimeManifest') { try {
 
     $runtimeGuardRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
@@ -2158,6 +2682,8 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             [IO.Directory]::Delete($runtimeGuardRoot, $true)
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/RuntimeManifest' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Phase0' -Policy GlobalFatal) { try {
 
     # PHASE 0 — STRUCTURAL PREFLIGHT (BRAVO SELF_TEST P0 DESIGN — FINAL).
     # Baseline фіксується ДО існуючої RuntimeManifest-перевірки нижче:
@@ -2269,7 +2795,9 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     if ($script:failures.Count -gt $phase0FailureBaseline) {
         Complete-BRAVOSelfTestReport
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Phase0' } }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/RuntimeManifest.GuardRunsBeforeImport') { try {
 
     # Усі entrypoint мають перевіряти цілісність ДО Import-Module.
     foreach ($entryPointName in @('BRAVO_ARCHIV.ps1', 'BRAVO_HEALTH.ps1', 'BRAVO_MAINTENANCE.ps1', 'BRAVO_DATA_RESTORE.ps1')) {
@@ -2582,6 +3110,8 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "VersionState/HugeNumericPrereleaseComparesNumerically" `
         -Failure "числові prerelease-ідентифікатори довільної довжини (понад Int64) мають порівнюватися як числа: rc.99…9(19) < rc.10…0(20), незалежно від розрядності"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/RuntimeManifest.GuardRunsBeforeImport' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/VersionState' -DependsOn 'Root/Parser', 'Root/RuntimeManifest.GuardRunsBeforeImport') { try {
 
     # Знахідка B: сувора SemVer-валідація суфіксів ДО порівняння і ДО
     # запису стану. Malformed суфікс (лапки, '_', порожній сегмент,
@@ -3377,6 +3907,8 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Condition ($filesWithWrongManifestLocation.Count -eq 0) `
         -Name "ToolManifest/ManifestPathIsInsideToolsDirectory" `
         -Failure "TOOLS_MANIFEST.json має шукатись через Join-Path `$toolsPath 'TOOLS_MANIFEST.json' (той самий каталог, що й утиліти), а не поруч зі скриптом; не узгоджені: $($filesWithWrongManifestLocation -join ', ')"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/VersionState' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/ToolManifest') { try {
 
     Test-BRAVOCondition `
         -Condition (
@@ -3749,6 +4281,8 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "Health/EnvironmentNotificationOmitsUnavailableLog" `
         -Failure "environment-notification і Complete-BRAVOHealthResult Result.LogPath мають передавати шлях логу лише коли script:BRAVOHealthLogWritable=true — інакше сповіщення/консоль заявляють журнал, якого немає"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/ToolManifest' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health' -DependsOn 'Root/ToolManifest') { try {
 
     # correctness pass, 3rd iteration (заміна ACL-тестів): статичний guard
     # підтверджує САМ МЕХАНІЗМ preservation, а не лише його наслідок —
@@ -4256,6 +4790,8 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     $legacyHealthyCopyText = "Остання справна " + "копія"
     Test-BRAVOCondition -Condition (-not ($notifySuccess + $notifyWarning).Contains($legacyHealthyCopyText)) -Name "Notifications/HealthDoesNotUseLastHealthyCopyWording" -Failure "operator notification не має використовувати legacy health wording"
     Test-BRAVOCondition -Condition ($notifySuccess -notmatch "\.mdz") -Name "Notifications/HealthSuccessDoesNotExposeArchiveFilename" -Failure "Health SUCCESS не має показувати archive filename"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Notifications' -DependsOn 'Root/Health') { try {
 
     # dev.12: status-first component rows. Discord/Slack рендерять
     # пропорційним шрифтом, тому padding пробілами (стара :package: NAME
@@ -4448,6 +4984,8 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "Notifications/ListSummaryHandlesUnicodeAndPaths" `
         -Failure "helper має без спотворень нести #\, кирилицю, пробіли, вкладені шляхи"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Notifications' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Notifications.PayloadGuardTruncatesSlackToSingleMessage' -DependsOn 'Root/Notifications') { try {
 
     # Guard: аномально великий payload -> ОДНЕ повідомлення на обох
     # транспортах, обрізане по межі рядка, з явним suffix і збереженим
@@ -4894,6 +5432,8 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name 'DryRun/SlackTopologyMirrorsDiscordContract' `
         -Failure 'Slack мусить мати той самий контракт, що Discord: legacy-only інсталяція (лише BRAVO_SLACK_URL) -> FAIL з міграційною діагностикою; errors_only з лише ALERTS -> PASS'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Notifications.PayloadGuardTruncatesSlackToSingleMessage' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/RestoreDrill') { try {
     # --- 5.2.1: source-контракти міграції з legacy provider-wide webhook-ів.
     # (1) Restore Drill мусить іти канонічним конвеєром BRAVO.Notifications і
     # не знати про legacy targets чи прямий HTTP-виклик.
@@ -5394,6 +5934,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Maintenance/NotificationOnlyCritical_ContentSeverityStaysCritical" `
         -Failure "notification-only CRITICAL не повинен downgrade-итись до -Severity WARNING у фінальному контенті лише через спільний TitleEmoji ':warning:' (review, повторна знахідка після 95c05d7)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/RestoreDrill' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Maintenance' -DependsOn 'Root/Health', 'Root/RestoreDrill') { try {
 
     # legacy -IsCritical: content SEVERITY=CRITICAL, route alerts, execution
     # critical=true, CriticalErrorsList використовується (не змінено).
@@ -5839,6 +6381,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Health/EnvironmentPreflightOperationsEventNotGatedByNotificationSwitch" `
         -Failure "environment-preflight CRITICAL Operations-подія (BRAVO.Health.Runtime.ps1) має викликатись ЗА МЕЖАМИ гейту (-not `$NoSlack) -and (`$NotificationMode -ne 'none') -- інакше dashboard не бачить CRITICAL-подію лише тому, що Slack/Discord вимкнено на цьому сервері (review finding, PR #225 раунд 3)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Version') { try {
 
     # Аудит P4: короткий buildId не дає однозначної відповіді, який саме
     # код розгорнуто (короткі hash збігаються й погано шукаються).
@@ -6266,6 +6810,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Health/ExplicitNonInteractiveDoesNotDependOnWmi" `
         -Failure "Test-BRAVOHealthExplicitNonInteractive -Argv ([Environment]::GetCommandLineArgs()) має працювати без жодного CIM/WMI виклику й повертати стабільний bool"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Version' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.ElevationDetectionStates' -DependsOn 'Root/Version') { try {
 
     # A: elevated Administrator -> true; SYSTEM -> privileged; звичайний -> false.
     $elevationStateAdmin = & $healthElevationModule {
@@ -7095,6 +7641,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     } finally {
         Remove-Item -LiteralPath $estimatedSpaceTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.ElevationDetectionStates' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Runtime' -DependsOn 'Root/Health.ElevationDetectionStates') { try {
 
     # Merge-BRAVOArchiveSpaceCheckResults (5.2.1) видалено в 5.2.3 разом з
     # переходом на спільний BRAVO.DiskSpace-класифікатор
@@ -7931,6 +8479,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Runtime/BomFreeStdinStartRestoresConsoleEncoding" `
         -Failure ("після Start-BRAVOProcessWithBomFreeInput (успіх і виняток) кодування вводу консолі має бути відновлене: до={0}, після успіху={1}, після винятку={2}, виняток='{3}'" -f
             $bomFreeActivePreambleLength, $bomFreePreambleAfterReturn, $bomFreePreambleAfterThrow, $bomFreeMissingProbe.Error)
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Runtime' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Compatibility' -DependsOn 'Root/Runtime') { try {
     # (кінець блоку T005b)
 
     # Реальний випадок: власний прогрес-бокс Test-NetConnection
@@ -8249,6 +8799,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Console/MaintenanceOwnLogUploadRunsAfterExitCodeResolution" `
         -Failure "вивантаження власного логу Maintenance мусить стояти після резолву exit code і фінального футера — інакше провал телеметрії може змінити результат прогону"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Compatibility' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Console' -DependsOn 'Root/Runtime') { try {
 
     # $difference.Local з WinSCP CompareDirectories — це RemoteFileInfo
     # навіть для локальної сторони порівняння, а не System.IO.FileInfo:
@@ -8685,6 +9237,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Condition ($successFingerprintVolatileProbe -eq $true) `
         -Name "Health/SuccessDedupFingerprintIgnoresVolatileTimestamps" `
         -Failure "та сама генерація копії (GenerationId) у різні моменти читання мусить давати той самий fingerprint — старіння копії в межах healthy-порогу не є зміною semantic-стану"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Console' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.SuccessDedupDoesNotTouchAlertPath' -DependsOn 'Root/Console') { try {
     # Test F: alert-шлях (WARNING/ERROR/CRITICAL) не бере участі в
     # SUCCESS-дедупі — жодне звернення до success-стану/fingerprint/decision
     # не зустрічається після alert-циклу; alert-механізм (Test-AlertSuppressed/
@@ -9454,6 +10008,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             'Get-BRAVODryRunOptionalComponentPlan',
             'Get-BRAVODryRunRangeIdPlan'
         )
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.SuccessDedupDoesNotTouchAlertPath' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/DryRun.RangeIdUsesCanonicalSystemPath' -DependsOn 'Root/Health.SuccessDedupDoesNotTouchAlertPath') { try {
     # Get-BRAVOTaskRootReadinessResults більше НЕ живе в BRAVO_DRY_RUN.ps1 —
     # спільна з BRAVO_TASKS_INSTALL.ps1 canonical точка інтерпретації
     # (BRAVO.System, P1 safety-review: Installer теж має блокувати
@@ -9725,6 +10281,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'DryRun/ResolvedRootsAreAlwaysPass' `
         -Failure 'визначені LIMSRoot/SystemLogRoot/BackupRoot мають бути PASS незалежно від Maintenance/Recovery'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/DryRun.RangeIdUsesCanonicalSystemPath' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Scheduler' -DependsOn 'Root/Health.ElevationDetectionStates') { try {
 
     # P1 (safety-review): BRAVO_TASKS_INSTALL.ps1 сам має блокувати
     # реєстрацію Maintenance/Recovery з нерозв'язаними LIMSRoot/SystemLogRoot
@@ -10920,6 +11478,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             Remove-Item -LiteralPath $archiveGenerationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Scheduler' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.MissingCompleteGenerationHasNoFictitiousFileName' -DependsOn 'Root/Runtime') { try {
     $healthGenerationModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $healthScriptText `
         -FunctionNames @(
@@ -11285,6 +11845,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Scheduler/ProtectedRuntimeAclDoesNotMutateExistingDacl" `
         -Failure "ACL hardening має будуватися з чистого security-descriptor (New-Object DirectorySecurity/FileSecurity), а не Get-Acl+RemoveAccessRuleAll на існуючому DACL — інакше падає на неканонічному DACL/orphaned SID реального сервера"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.MissingCompleteGenerationHasNoFictitiousFileName' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Scheduler.AclRuleAppliesToFilesAndFolders' -DependsOn 'Root/Health.MissingCompleteGenerationHasNoFictitiousFileName') { try {
 
     # Функціональна регресія (code-review 2026-08-31): попередня версія цього
     # тесту була суто in-memory (Get-Acl + AddAccessRule, ніколи не викликала
@@ -11415,12 +11977,16 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Condition (-not $credentialsSetupText.Contains('function Import-BRAVOConfiguration')) `
         -Name "ConfigurationLoader/CredentialsSetupNoNameCollision" `
         -Failure "локальний wrapper credentials-утиліти не повинен збігатися за ім'ям із Import-BravoConfiguration"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Scheduler.AclRuleAppliesToFilesAndFolders' } }
 
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Governance') {
         Enter-BRAVOSelfTestSuite -Name 'Governance'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Governance') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Governance.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Governance' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/DryRun.VerifiesRuntimeIntegrity') { try {
 
     # ===== DRY-RUN МУСИТЬ ПЕРЕВІРЯТИ ЦІЛІСНІСТЬ =====
     # Знайдено тестовим розгортанням: dry-run звітував «0 помилок» на
@@ -12126,6 +12692,8 @@ try {
         ) `
         -Name "Console/MaintenancePausesOnEveryExitPath" `
         -Failure "Maintenance.Runtime.ps1 має один зовнішній try/finally з Wait-BRAVOManualExit, що охоплює геть усі exit-и файлу — від елевації до фінального exit 0"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/DryRun.VerifiesRuntimeIntegrity' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Console.MaintenanceRuntimeWrappedInFunction' -DependsOn 'Root/DryRun.VerifiesRuntimeIntegrity') { try {
 
     # Maintenance.Runtime.ps1: тіло runtime загорнуте в
     # Invoke-BRAVOMaintenance за зразком Invoke-BRAVOHealth. Структура (AST):
@@ -13370,6 +13938,8 @@ try {
         ) `
         -Name "Health/EmbeddedCallSuppressesOwnSummary" `
         -Failure "Complete-BRAVOHealthResult має придушувати власний Write-BRAVOResultHeader при -SuppressHeader (вбудований виклик з Archive), не чіпаючи Complete-BRAVOProgress"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Console.MaintenanceRuntimeWrappedInFunction' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.ServerSideHashFallbackIsInfoNotWarning' -DependsOn 'Root/Console.MaintenanceRuntimeWrappedInFunction') { try {
 
     # Реальний випадок: "SFTP MODEL: серверний SHA архіву недоступний;
     # використано повний збіг віддаленого hash-файлу" — перевірка все одно
@@ -14027,7 +14597,10 @@ try {
     $discoveryTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_DISCOVERY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.ServerSideHashFallbackIsInfoNotWarning' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Discovery' -DependsOn 'Root/Health.ServerSideHashFallbackIsInfoNotWarning') { try {
     try {
+        if (Enter-BRAVOSelfTestSection -Name 'Root/Discovery.ResolvesFromServiceAndIniWithoutOverride' -DependsOn 'Root/Health.ServerSideHashFallbackIsInfoNotWarning') { try {
         [void][IO.Directory]::CreateDirectory($discoveryTestRoot)
         $fakeBravoExePath = Join-Path $discoveryTestRoot "bravo.exe"
         [IO.File]::WriteAllText($fakeBravoExePath, "stub")
@@ -14699,6 +15272,8 @@ try {
                 Remove-Item -LiteralPath $presenceRoot -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Discovery.ResolvesFromServiceAndIniWithoutOverride' } }
+        if (Enter-BRAVOSelfTestSection -Name 'Root/Discovery.PresenceContractShownBySetupValidateOnly' -DependsOn 'Root/Discovery.ResolvesFromServiceAndIniWithoutOverride') { try {
 
         # Оператор мусить бачити presence-стан у BRAVO_SETUP.ps1
         # -Action Test -ValidateOnly, інакше Ambiguous/Error виглядають
@@ -15602,6 +16177,8 @@ try {
                 Remove-Item -LiteralPath $canonicalIniTestRoot -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Discovery.PresenceContractShownBySetupValidateOnly' } }
+        if (Enter-BRAVOSelfTestSection -Name 'Root/ProductionConfig' -DependsOn 'Root/Scheduler', 'Root/Discovery.PresenceContractShownBySetupValidateOnly') { try {
 
         # Maintenance safety NOT weakened: власна явна перевірка
         # BRAVO_MAINTENANCE.ps1 (effectiveLimsRoot/systemLogRoot/backupRootPath
@@ -16415,11 +16992,14 @@ try {
                 -Name 'DiscoveryBaseline/SetupUsesCanonicalStatePath' `
                 -Failure 'BRAVO_SETUP.ps1 мусить читати baseline через Import-BRAVODiscoveryBaseline зі $global:stateRoot, а не збирати шлях від $PSScriptRoot\LOGS (#158 етап 1)'
         }
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/ProductionConfig' } }
     } finally {
         if (Test-Path -LiteralPath $discoveryTestRoot) {
             Remove-Item -LiteralPath $discoveryTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Discovery' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Discovery.WiredIntoConfigLoaderAndSetup') { try {
 
     # P0 Configuration Foundation (PR B): discovery/derivation-виклики
     # (Resolve-BRAVOInstallationDiscovery, $global:discoverySettings/
@@ -17054,6 +17634,8 @@ try {
         Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
         Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Discovery.WiredIntoConfigLoaderAndSetup' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/LegacyBomFallback') { try {
 
     # Прокидання сигналу в кожен entrypoint, чий головний потік не можна
     # виконати в self-test (inline Main): додатковий текстовий guard проти
@@ -17121,18 +17703,24 @@ try {
         ) `
         -Name "RestoreDrill/ScriptImplementsFullDrillCycle" `
         -Failure "BRAVO_RESTORE_TEST.ps1 має вибирати один COMPLETE GenerationId для всіх компонентів через спільні функції BRAVO.ArchiveHelpers (не локальні копії), перевіряти SHA512/7za, розпаковувати в ізольований каталог, повертати контрактний exit code і прибирати за собою"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/LegacyBomFallback' } }
 
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'DataRestore') {
         Enter-BRAVOSelfTestSuite -Name 'DataRestore'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/DataRestore') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.DataRestore.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/DataRestore' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'ServiceQuiescence') {
         Enter-BRAVOSelfTestSuite -Name 'ServiceQuiescence'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ServiceQuiescence') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceQuiescence.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceQuiescence' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/SizeSanity') { try {
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
     # архів (7za test + SHA512 збігається) все одно може бути підозріло
@@ -17265,11 +17853,15 @@ try {
         ) `
         -Name "SizeSanity/WiredIntoArchiveRuntime" `
         -Failure "BRAVO.Archive.Runtime.ps1 має викликати Test-BRAVOBackupSizeAnomaly з налаштувань backupMonitoring.SizeSanity"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/SizeSanity' } }
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'ManifestStorage') {
         Enter-BRAVOSelfTestSuite -Name 'ManifestStorage'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ManifestStorage') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ManifestStorage.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ManifestStorage' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Maintenance.HeaderContainsVersion' -DependsOn 'Root/Runtime') { try {
 
     # ================================================================
     # dev.14 (round 2, частина B): operator console UX BRAVO_MAINTENANCE.
@@ -17527,6 +18119,8 @@ try {
         ) `
         -Name "Maintenance/TraceProcessedDetail" `
         -Failure "крок 'Обробка trace і логів' має показувати кількість оброблених файлів як Details"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance.HeaderContainsVersion' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Maintenance.RangeIdMissingRemainsWarning' -DependsOn 'Root/DryRun.VerifiesRuntimeIntegrity', 'Root/Maintenance.HeaderContainsVersion') { try {
 
     # --- Range ID: реальна Test-RangeIdUsage (ізольована екстракція) на
     # відсутньому файлі має сигналізувати HasIssue=true (WARN на консолі),
@@ -18022,6 +18616,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/RangeIdWarningRender" `
         -Failure "[8/8] Контроль діапазонів ID має рендеритись як WARN з 6-пробільним canonical-шляхом, без 'Причина:'"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance.RangeIdMissingRemainsWarning' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Maintenance.DirectoryDetailsRenderAsSeparateLines' -DependsOn 'Root/Maintenance.RangeIdMissingRemainsWarning') { try {
 
     # --- E/F/G. Summary render: clean/warning-only/failure ---
     # dev.14 (round 4): повний підсумок разом із footer (Write-BRAVOFinalSummaryFooter) —
@@ -18583,6 +19179,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition (-not $restoreCleanupSingleThrew) `
         -Name "Maintenance/RestoreCleanupStrictModeSingleItemSafe" `
         -Failure ("Remove-OldRestoreArchives не повинен кидати виняток під Set-StrictMode -Version Latest, коли Where-Object повертає рівно один результат; кинуто: {0}" -f $restoreCleanupSingleErrorMessage)
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance.DirectoryDetailsRenderAsSeparateLines' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Maintenance.RestoreCleanupSingleRemainingFileDoesNotThrow' -DependsOn 'Root/Maintenance.DirectoryDetailsRenderAsSeparateLines') { try {
 
     # --- Test 3: після видалення залишається РІВНО один файл із префіксом
     # (Get-ChildItem -Filter повертає скалярний FileInfo, не масив) ->
@@ -19241,6 +19839,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/ArchiveFailureRendersFail" `
         -Failure "FAIL 'Архівація після maintenance' (exit!=0/не знайдено/exception) має показувати конкретну коротку причину в Details"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance.RestoreCleanupSingleRemainingFileDoesNotThrow' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Maintenance.ArchiveChildExitSuccessIsOk' -DependsOn 'Root/Maintenance.RestoreCleanupSingleRemainingFileDoesNotThrow') { try {
 
     # --- Archive after maintenance: exit-код дочірнього BRAVO_ARCHIV.
     # Раніше будь-який ненульовий код, включно з 10 (SuccessWithWarnings),
@@ -19603,6 +20203,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Runtime/SharedToolIntegrityRecommendation" `
         -Failure "Archive/Health/Maintenance мають перевіряти цілісність Tools (7za.exe/WinSCP) через спільну функцію"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance.ArchiveChildExitSuccessIsOk' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Runtime.ToolManifestBlocksArchiveAndMaintenance' -DependsOn 'Root/Health', 'Root/Maintenance.ArchiveChildExitSuccessIsOk') { try {
 
     # Аудит P1: Archive і Maintenance мають саме БЛОКУВАТИ запуск при
     # порушенні еталонного маніфесту (обидва викликають 7za/WinSCP від
@@ -20041,6 +20643,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name 'Scheduler/BazaSyncTaskPlannedWhenSftpEnabled' `
         -Failure "componentSettings.SFTP.Enabled=true (комплектний дефолт, BAZA_APP_SFTP=true) має планувати завдання 'BRAVO BAZA Synchronization' з розкладом 00:00; отримано згадок назви: $schedBaselineBazaSyncOccurrences, маркерів розкладу '00:00': $schedBaselineBazaSyncScheduleMarkers, ExitCode=$($schedResultSftpBaseline.ExitCode)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Runtime.ToolManifestBlocksArchiveAndMaintenance' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Scheduler.BazaSyncTaskSkippedWhenSftpGloballyDisabled' -DependsOn 'Root/Runtime.ToolManifestBlocksArchiveAndMaintenance') { try {
 
     $schedFixtureSftpDisabled = New-BRAVOSelfTestSchedulerFixtureConfig `
         -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false `
@@ -20512,12 +21116,16 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Runtime/10-PreflightCoversAllRequiredRoots" `
         -Failure "SYSTEM preflight має перевіряти читання RuntimeRoot/ConfigPath/modules/Tools/LIMSRoot/bravo.ini і запис ArchiveRoot/BackupRoot/LOGS та всіх каталогів призначення ротації"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Scheduler.BazaSyncTaskSkippedWhenSftpGloballyDisabled' } }
 
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Paths') {
         Enter-BRAVOSelfTestSuite -Name 'Paths'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Paths') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Paths.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Paths' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Sync' -DependsOn 'Root/Scheduler.BazaSyncTaskSkippedWhenSftpGloballyDisabled') { try {
 
     # ===== ВИПРАВЛЕННЯ ПІСЛЯ ТЕСТОВОГО РОЗГОРТАННЯ 5.0.0-dev.1
     # (SID-акаунти, RuntimeRoot!=ConfigRoot, effective BAZASync, BAZA source
@@ -21024,6 +21632,8 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
         ) `
         -Name "Scheduler/RecoveryNextRunIsBootOnly" `
         -Failure "Recovery (5.2.0) — лише boot-trigger: Format-BRAVOSchedulerNextRun не повинен мати параметрів DailyWindowStart/HasBootTrigger і не повинен згадувати щоденний розклад"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Sync' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Deploy' -DependsOn 'Root/Sync') { try {
 
     # --- Deploy/RuntimeRootConfigRootSeparation: runtime-ресурси з RuntimeRoot ---
     $separateConfigRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CFGROOT_" + [guid]::NewGuid().ToString('N'))
@@ -21331,17 +21941,23 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
         ) `
         -Name "Version/StampConsistency" `
         -Failure "VERSION.json.buildId має бути префіксом 40-символьного sourceCommit; інакше артефакт pre-stamp/неузгоджений"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Deploy' } }
 
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'LogRotation') {
         Enter-BRAVOSelfTestSuite -Name 'LogRotation'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/LogRotation') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.LogRotation.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/LogRotation' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'ConsoleUX') {
         Enter-BRAVOSelfTestSuite -Name 'ConsoleUX'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ConsoleUX') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConsoleUX.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ConsoleUX' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Console.ManifestExportsWriteBRAVOPlan' -DependsOn 'Root/Scheduler.BazaSyncTaskSkippedWhenSftpGloballyDisabled') { try {
 
     #####################################################################
     # dev.16 (review round 3): Archive/Health operator-visibility pass —
@@ -21816,6 +22432,8 @@ function Write-BRAVOLog {
                 -Failure $archiveHealthNoSlackFailure
         }
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Console.ManifestExportsWriteBRAVOPlan' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.PlanRendersStandaloneOnly' -DependsOn 'Root/Runtime') { try {
 
     # --- Health: "План перевірок" рендериться ЛИШЕ у самостійному запуску
     # (не при SuppressHeader — вбудований виклик з Archive) і через
@@ -22224,6 +22842,8 @@ function Write-BRAVOLog {
         ) `
         -Name 'Archive/DynamicTotalIncludesOrphanCleanup' `
         -Failure 'той самий +1 доданок generation cleanup у Total має враховувати й enableOrphanTempCleanup — інакше orphan-only сценарій (усе інше вимкнено) рендерить крок без місця в нумерації'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.PlanRendersStandaloneOnly' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Archive' -DependsOn 'Root/Health.PlanRendersStandaloneOnly') { try {
 
     # --- Archive: План/Total/фактичний гейт кроку читають ОДИН і той
     # самий буквальний вираз для generation cleanup — не три незалежні
@@ -22667,6 +23287,8 @@ function Write-BRAVOLog {
         ) `
         -Name 'Maintenance/CompletedLinesSkipSkippedAndFlagWarn' `
         -Failure "SKIPPED-реставрація друкується ⏭️ з причиною, WARN-етап показується ⚠️ з причиною; отримано:`n$maintenanceCompletedSkippedText"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Archive' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Maintenance.CompletedLinesShowSkippedRestoreWithReason' -DependsOn 'Root/Maintenance.DirectoryDetailsRenderAsSeparateLines', 'Root/Archive') { try {
 
     # Пропуск за тижневою квотою — з конкретною причиною, а не мовчки.
     $maintenanceCompletedQuotaSkip = & $maintenanceCompletedLinesModule {
@@ -23070,6 +23692,8 @@ function Write-BRAVOLog {
         ) `
         -Name 'Archive/HashHeadingPrecedesHashWork' `
         -Failure '"=== СТВОРЕННЯ ХЕШУ ... ===" має друкуватись ДО першого виклику New-SHA512Hash всередині Invoke-BRAVOComponentBackup — реальний DEV-LIMS лог показував заголовок ПІСЛЯ вже виконаної роботи (заголовок друкувався в Main, після повного завершення виклику)'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance.CompletedLinesShowSkippedRestoreWithReason' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' -DependsOn 'Root/Maintenance.CompletedLinesShowSkippedRestoreWithReason') { try {
 
     Test-BRAVOCondition `
         -Condition (
@@ -23122,32 +23746,43 @@ function Write-BRAVOLog {
         ) `
         -Name 'Archive/HashBusinessCallsRemainUnchanged' `
         -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' } }
 
     # Archive (P2-1/P2-5, PR #136 review): рекурсивне впорядкування SFTP-
     # каталогів перед mkdir і єдиний call site вивантаження власного логу.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Archive') {
         Enter-BRAVOSelfTestSuite -Name 'Archive'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Archive') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Archive.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Archive' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'SftpCredentialsRequired') {
         Enter-BRAVOSelfTestSuite -Name 'SftpCredentialsRequired'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/SftpCredentialsRequired') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.SftpCredentialsRequired.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/SftpCredentialsRequired' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'MaintenanceOwnLog') {
         Enter-BRAVOSelfTestSuite -Name 'MaintenanceOwnLog'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/MaintenanceOwnLog') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceOwnLog.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/MaintenanceOwnLog' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'BazaSync') {
         Enter-BRAVOSelfTestSuite -Name 'BazaSync'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/BazaSync') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaSync.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BazaSync' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Operations') {
         Enter-BRAVOSelfTestSuite -Name 'Operations'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Operations') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Operations.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Operations' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # SFTP-сценарії добового Trace-архіву використовують
@@ -23155,14 +23790,18 @@ function Write-BRAVOLog {
     # з фрагмента BazaSync, тож TraceArchive не залежить від його вибору.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'TraceArchive') {
         Enter-BRAVOSelfTestSuite -Name 'TraceArchive'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/TraceArchive') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.TraceArchive.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/TraceArchive' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # MaintenanceRepair: false-positive rollback після bravocmd repair +
     # Discord HTTP 429 retry (fix/repair-rollback-false-positive-and-discord-429).
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'MaintenanceRepair') {
         Enter-BRAVOSelfTestSuite -Name 'MaintenanceRepair'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/MaintenanceRepair') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceRepair.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/MaintenanceRepair' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # RestoreSynthetic: наскрізний синтетичний тест відкату — справжній
@@ -23171,7 +23810,9 @@ function Write-BRAVOLog {
     # архіві. Приймальну перевірку на DEV-LIMS не замінює.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'RestoreSynthetic') {
         Enter-BRAVOSelfTestSuite -Name 'RestoreSynthetic'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/RestoreSynthetic') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreSynthetic.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/RestoreSynthetic' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # RestoreVerify (P1.1): state-API верифікації відновлюваності, health-
@@ -23179,7 +23820,9 @@ function Write-BRAVOLog {
     # loader-нормалізація legacy-конфігів без RestoreVerify-вузлів.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'RestoreVerify') {
         Enter-BRAVOSelfTestSuite -Name 'RestoreVerify'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/RestoreVerify' -DependsOn 'Root/Runtime.ToolManifestBlocksArchiveAndMaintenance') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreVerify.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/RestoreVerify' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Status (P2.1): machine-readable status contract v1 — атомарний
@@ -23187,7 +23830,9 @@ function Write-BRAVOLog {
     # відсутність секретів і fail-soft контракти чотирьох call-site'ів.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Status') {
         Enter-BRAVOSelfTestSuite -Name 'Status'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Status') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Status.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Status' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # ConfigLoader: діагностичне збагачення помилки виконання BRAVO.config
@@ -23195,7 +23840,9 @@ function Write-BRAVOLog {
     # замість голої NullReferenceException).
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'ConfigLoader') {
         Enter-BRAVOSelfTestSuite -Name 'ConfigLoader'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ConfigLoader') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigLoader.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ConfigLoader' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Configuration Foundation (P0, PR A): canonical built-in raw defaults +
@@ -23205,7 +23852,9 @@ function Write-BRAVOLog {
     # (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Configuration') {
         Enter-BRAVOSelfTestSuite -Name 'Configuration'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Configuration') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configuration.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Configuration' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Configuration Foundation: AUTO/EXPLICIT намір -ConfigPath на межі
@@ -23213,14 +23862,18 @@ function Write-BRAVOLog {
     # та AUTO-intent класу дефектів root-entrypoint splat-ів).
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'ConfigIntent') {
         Enter-BRAVOSelfTestSuite -Name 'ConfigIntent'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ConfigIntent') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigIntent.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ConfigIntent' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Configurator backend: Schema/Model/Effective/Validation/Persistence/
     # Credentials/Presets/Preview (docs/design/BRAVO_CONFIGURATOR_DESIGN.md).
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Configurator') {
         Enter-BRAVOSelfTestSuite -Name 'Configurator'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Configurator') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configurator.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Configurator' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Configurator UI: лише headless-тестовані pure-функції (coverage,
@@ -23229,32 +23882,44 @@ function Write-BRAVOLog {
     # викликається.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'ConfiguratorUI') {
         Enter-BRAVOSelfTestSuite -Name 'ConfiguratorUI'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ConfiguratorUI') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfiguratorUI.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ConfiguratorUI' } }
     }
     # DiskSpace: спільний operation-aware класифікатор вільного місця/доступу
     # (fix/5.2.3-operation-aware-disk-space) — S1-S20, ізольовано від
     # Archive/Maintenance інтеграції.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'DiskSpace') {
         Enter-BRAVOSelfTestSuite -Name 'DiskSpace'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/DiskSpace') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.DiskSpace.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/DiskSpace' } }
     }
     # ArchiveDiskSpace: A1-A25, реальний виклик-сайт BRAVO_ARCHIV
     # (Resolve-BRAVOArchiveSpaceDecision) — на відміну від DiskSpace.ps1
     # вище, що тестує сам shared classifier ізольовано.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'ArchiveDiskSpace') {
         Enter-BRAVOSelfTestSuite -Name 'ArchiveDiskSpace'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ArchiveDiskSpace' -DependsOn 'Root/Version') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ArchiveDiskSpace.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ArchiveDiskSpace' } }
     }
     # MaintenanceDiskSpace: M1-M11, реальний виклик-сайт BRAVO_MAINTENANCE
     # (Invoke-BRAVOMaintenanceDiskSpaceCheck).
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'MaintenanceDiskSpace') {
         Enter-BRAVOSelfTestSuite -Name 'MaintenanceDiskSpace'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/MaintenanceDiskSpace') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/MaintenanceDiskSpace' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 } catch {
-    [void]$script:failures.Add($_.Exception.Message)
-    Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
+    # #219 (частина B): сюди доходять лише маркери глобальних меж і винятки
+    # з коду МІЖ секціями. Register-BRAVOSelfTestGlobalFatal реєструє
+    # помилку прогону з повною діагностикою (тип, місце, позиція, стек) і
+    # поводиться як попередній inline-catch: той самий рядок "[FAIL] Fatal:"
+    # і той самий Enter-BRAVOSelfTestSuite 'Root (inline)' наприкінці.
+    Register-BRAVOSelfTestGlobalFatal -ErrorRecord $_
     # P0 fail-fast/telemetry: якщо виняток стався ПОСЕРЕД відкритого suite-
     # інтервалу (Enter-BRAVOSelfTestSuite викликана, парний виклик, що мав
     # би закрити інтервал, — пропущено через unwind до цього catch),
@@ -23265,9 +23930,10 @@ function Write-BRAVOLog {
     # реалізації), і додатково повертає $script:currentSuiteName у
     # 'Root (inline)'. Без цього подальший framework-код нижче (Isolation/*,
     # Framework/*) хибно атрибутувався б до "мертвого" suite останнього
-    # доменного фрагмента замість 'Root (inline)'.
-    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    # доменного фрагмента замість 'Root (inline)'. Цей виклик тепер —
+    # останній крок Register-BRAVOSelfTestGlobalFatal.
 }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/OwnedModuleCleanup') { try {
 
 # ============================================================
 # P0 hotfix: session-contamination gate. Знімок УСІХ імен функцій, які
@@ -23285,6 +23951,8 @@ $selfTestOwnedModuleNamesBeforeCleanup = @(
 )
 
 Clear-BRAVOSelfTestOwnedRuntimeModules
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/OwnedModuleCleanup' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Isolation' -DependsOn 'Tail/OwnedModuleCleanup') { try {
 
 # Fail-loud production-command contract: якщо будь-який self-test fixture
 # (New-BRAVOSelfTestRuntimeModule) лишив caller-сесію отруєною, SELF-TEST
@@ -23762,6 +24430,8 @@ function Remove-BRAVOSelfTestFixtureDirectory {
             -Failure "не вдалося видалити TEMP fixture-каталог '$tempRoot': $($cleanupResult.ErrorMessage)"
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Isolation' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework' -DependsOn 'Tail/Isolation') { try {
 
 # Framework/Phase0FailStopsDomains (P2 fix, review comment 3960370672):
 # ЦЕЙ fixture тепер реально тестує сам Phase 0 gate (5.2-5.4), а не
@@ -24177,6 +24847,8 @@ function Remove-BRAVOSelfTestFixtureDirectory {
             -Failure "не вдалося видалити TEMP fixture-каталог '$tempRoot': $($cleanupResult.ErrorMessage)"
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.Phase0PassPreservesFullBehavior' -DependsOn 'Phase0') { try {
 
 # Framework/Phase0PassPreservesFullBehavior: без вкладеного FULL self-test
 # (дорого й рекурсивно, п.7 завдання). Дві частини: (а) структурна
@@ -24198,10 +24870,11 @@ Test-BRAVOCondition `
 # Framework/FatalCatchBaselineAndSuiteRegression (P2-A + P2-B regression):
 # ІЗОЛЬОВАНИЙ harness (та сама New-BRAVOSelfTestRuntimeModule-модель, що
 # timing-probe нижче) відтворює РІВНО ту саму послідовність, що виконує
-# головний зовнішній catch — Enter suite X -> throw -> catch -> ФІКС
-# (Enter-BRAVOSelfTestSuite 'Root (inline)') -> подальший assertion —
-# тестуючи РЕАЛЬНІ функції з цього файлу (AST-екстракція), не ручну
-# копію-дублікат. Доводить одночасно: (P2-B) suite-контекст після catch
+# головний зовнішній catch — Enter suite X -> throw -> catch ->
+# Register-BRAVOSelfTestGlobalFatal (#219, частина B: реальна функція
+# головного catch, яка наприкінці робить Enter-BRAVOSelfTestSuite
+# 'Root (inline)') -> подальший assertion — тестуючи РЕАЛЬНІ функції з
+# цього файлу (AST-екстракція), не ручну копію-дублікат. Доводить одночасно: (P2-B) suite-контекст після catch
 # повертається на 'Root (inline)', а НЕ лишається на мертвому 'FatalDomainX'
 # (тому наступний assertion коректно атрибутується); (P2-A) сам факт, що
 # $phase0FailureBaseline-style змінна, визначена ДО throw, лишається
@@ -24223,21 +24896,20 @@ Test-BRAVOCondition `
     # викликає Complete-BRAVOSelfTestActiveSuiteSpan за іменем, не за
     # прямим посиланням) писала б у $script:-простір ЦЬОГО фантомного
     # модуля замість реальних лічильників головного self-test.
-    $realTestBRAVOConditionScriptBlock = (Get-Item -Path function:Test-BRAVOCondition).ScriptBlock
-    # #188: Test-BRAVOCondition делегує категорію результату цій функції, тому
-    # вона мусить і екстрагуватись у модуль, і відновлюватись у finally — за
-    # тією самою причиною, що описана вище (New-Module заміщує однойменні
-    # функції в Function:-drive головного процесу).
-    $realGetBRAVOSelfTestAssertionResultScriptBlock = (Get-Item -Path function:Get-BRAVOSelfTestAssertionResult).ScriptBlock
-    $realEnterBRAVOSelfTestSuiteScriptBlock = (Get-Item -Path function:Enter-BRAVOSelfTestSuite).ScriptBlock
-    $realCompleteBRAVOSelfTestActiveSuiteSpanScriptBlock = (Get-Item -Path function:Complete-BRAVOSelfTestActiveSuiteSpan).ScriptBlock
+    # #219 (частина B): до модуля потрапляє і реальний обробник головного
+    # catch з його залежностями. Усі екстраговані функції входять у знімок
+    # фреймворку, тож у finally їх відновлює канонічна
+    # Restore-BRAVOSelfTestFrameworkFunctions (сама вона не екстрагується,
+    # тому не затінена) — замість ручного переліку Set-Item.
     $result = $null
     $fixtureExceptionMessage = $null
     try {
         $sourceText = Get-BRAVOSelfTestOwnSourceText
         $module = New-BRAVOSelfTestRuntimeModule -SourceText $sourceText `
             -FunctionNames @('Enter-BRAVOSelfTestSuite', 'Complete-BRAVOSelfTestActiveSuiteSpan',
-                'Test-BRAVOCondition', 'Get-BRAVOSelfTestAssertionResult')
+                'Test-BRAVOCondition', 'Get-BRAVOSelfTestAssertionResult', 'Register-BRAVOSelfTestGlobalFatal',
+                'Get-BRAVOSelfTestGlobalFatalKind', 'ConvertTo-BRAVOSelfTestFaultRecord',
+                'Write-BRAVOSelfTestSectionFault', 'Initialize-BRAVOSelfTestSectionState')
         $result = & $module {
             function Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$IgnoredArgs) }
             Set-StrictMode -Version 2.0
@@ -24250,6 +24922,11 @@ Test-BRAVOCondition `
             $script:currentSuiteSpanStopwatch = $null
             $script:selfTestTotalStopwatch = [Diagnostics.Stopwatch]::StartNew()
             $script:lastAssertionCompletedAtMs = 0.0
+            Initialize-BRAVOSelfTestSectionState
+            # Цілісність фреймворку в цій пробі не предмет перевірки (її
+            # доводять Framework/SectionIsolation.*): функції модуля за
+            # визначенням мають ModuleName.
+            function Get-BRAVOSelfTestFrameworkIntegrityProblem { return '' }
 
             # P2-A: baseline, визначений ДО throw — той самий структурний
             # патерн, що реальний $phase0FailureBaseline у головному файлі.
@@ -24259,9 +24936,8 @@ Test-BRAVOCondition `
             try {
                 throw "synthetic P2-A/P2-B regression exception"
             } catch {
-                [void]$script:failures.Add($_.Exception.Message)
-                # РІВНО той самий фікс, що в реальному зовнішньому catch файлу.
-                Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+                # РІВНО той самий виклик, що в реальному головному catch файлу.
+                Register-BRAVOSelfTestGlobalFatal -ErrorRecord $_
             }
 
             # P2-A: якщо б $regressionFailureBaseline був невизначений під
@@ -24275,16 +24951,15 @@ Test-BRAVOCondition `
                 PostFatalCurrentSuite   = $script:currentSuiteName
                 PostFatalAssertionSuite = ($script:testTimings | Select-Object -Last 1).Suite
                 BaselineNoException     = $true
+                FailureRegistered       = @($script:failures | Where-Object { [string]$_ -eq 'synthetic P2-A/P2-B regression exception' }).Count -eq 1
+                GlobalFaultLocated      = ($script:BRAVOSelfTestGlobalFaults.Count -eq 1 -and
+                    -not [string]::IsNullOrEmpty($script:BRAVOSelfTestGlobalFaults[0].Fault.Location))
             }
         }
     } catch {
         $fixtureExceptionMessage = $_.Exception.Message
     } finally {
-        Set-Item -Path function:Test-BRAVOCondition -Value $realTestBRAVOConditionScriptBlock -Force
-        Set-Item -Path function:Get-BRAVOSelfTestAssertionResult `
-            -Value $realGetBRAVOSelfTestAssertionResultScriptBlock -Force
-        Set-Item -Path function:Enter-BRAVOSelfTestSuite -Value $realEnterBRAVOSelfTestSuiteScriptBlock -Force
-        Set-Item -Path function:Complete-BRAVOSelfTestActiveSuiteSpan -Value $realCompleteBRAVOSelfTestActiveSuiteSpanScriptBlock -Force
+        $null = Restore-BRAVOSelfTestFrameworkFunctions
         Clear-BRAVOSelfTestOwnedRuntimeModules
     }
 
@@ -24299,11 +24974,14 @@ Test-BRAVOCondition `
                 $result.BaselineNoException -and
                 $result.FatalDomainXSpanClosed -and
                 $result.PostFatalCurrentSuite -eq 'Root (inline)' -and
-                $result.PostFatalAssertionSuite -eq 'Root (inline)'
+                $result.PostFatalAssertionSuite -eq 'Root (inline)' -and
+                $result.FailureRegistered -and
+                $result.GlobalFaultLocated
             ) `
             -Name "Framework/FatalCatchBaselineAndSuiteRegression" `
             -Failure ("fatal-catch-фікс не поводиться як очікувано в ізоляції: SpanClosed=$($result.FatalDomainXSpanClosed) " +
-                "CurrentSuite='$($result.PostFatalCurrentSuite)' AssertionSuite='$($result.PostFatalAssertionSuite)'")
+                "CurrentSuite='$($result.PostFatalCurrentSuite)' AssertionSuite='$($result.PostFatalAssertionSuite)' " +
+                "FailureRegistered=$($result.FailureRegistered) GlobalFaultLocated=$($result.GlobalFaultLocated)")
     }
 }
 
@@ -24541,11 +25219,12 @@ Test-BRAVOCondition `
     -Name "Framework/TimingProbeFinallyRestoresOnFixtureException" `
     -Failure ("try/finally-патерн навколо timing-probe module-invoke не відновив оригінальну function-точку після " +
         "forced-винятку всередині probe; ExceptionMessage='$timingProbeRegressionExceptionMessage' RestoredValue='$timingProbeRegressionRestoredValue'")
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.Phase0PassPreservesFullBehavior' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/ConfigRootCleanup') { try {
 
-if (-not [string]::IsNullOrWhiteSpace([string]$script:selfTestConfigRoot) -and
-    [IO.Directory]::Exists($script:selfTestConfigRoot)) {
-    [IO.Directory]::Delete($script:selfTestConfigRoot, $true)
-}
+Remove-BRAVOSelfTestConfigRoot
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/ConfigRootCleanup' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.VariableScopeHeadroom') { try {
 
 # #163: перевірка запасу змінних області. Стеля $MaximumVariableCount
 # піднята на початку файлу; тут — доказ, що запас реальний. Без цієї
@@ -24753,13 +25432,19 @@ Test-BRAVOCondition `
             "під гейтом $(@($suiteGatedNames).Count)")
 
     # Фрагмент, підключений повз гейт, ігнорував би -Suite — і прогін мовчки
-    # робив би більше, ніж просили.
+    # робив би більше, ніж просили. #219 (частина B): гейт, suite, секція
+    # Suite/<Ім'я> і підключення мусять називати ОДИН і той самий фрагмент, а
+    # секція — охоплювати рівно це підключення: фрагмент поза своєю секцією
+    # при винятку зупинив би основне тіло замість однієї секції.
     $suiteFragmentDotSources = @(
         [regex]::Matches($suiteOwnSource, "(?m)^\s*\. \(Join-Path \`$root 'selftest\\BRAVO_SELF_TEST\.([A-Za-z]+)\.ps1'\)") |
             ForEach-Object { $_.Value })
     $suiteGuardedDotSources = @(
         [regex]::Matches($suiteOwnSource,
-            "(?m)^\s*if \(Test-BRAVOSelfTestSuiteEnabled -Name '[^']+'\) \{\r?\n\s*Enter-BRAVOSelfTestSuite -Name '[^']+'\r?\n\s*\. \(Join-Path \`$root 'selftest\\BRAVO_SELF_TEST\.[A-Za-z]+\.ps1'\)") |
+            ("(?m)^\s*if \(Test-BRAVOSelfTestSuiteEnabled -Name '([^']+)'\) \{\r?\n\s*Enter-BRAVOSelfTestSuite -Name '\1'\r?\n" +
+                "\s*if \(Enter-BRAVOSelfTestSection -Name 'Suite/\1'(?: -DependsOn '[^']+'(?:, '[^']+')*)?\) \{ try \{\r?\n" +
+                "\s*\. \(Join-Path \`$root 'selftest\\BRAVO_SELF_TEST\.\1\.ps1'\)\r?\n" +
+                "\s*\} catch \{ Register-BRAVOSelfTestSectionFault -ErrorRecord \`$_ \} finally \{ Complete-BRAVOSelfTestSection -Name 'Suite/\1' \} \}")) |
             ForEach-Object { $_.Value })
     Test-BRAVOCondition `
         -Condition (
@@ -24767,8 +25452,9 @@ Test-BRAVOCondition `
             @($suiteFragmentDotSources).Count -eq @($suiteGuardedDotSources).Count
         ) `
         -Name "Framework/EverySuiteFragmentIsGated" `
-        -Failure ("кожне підключення suite-фрагмента мусить стояти під Test-BRAVOSelfTestSuiteEnabled; " +
-            "підключень $(@($suiteFragmentDotSources).Count), під гейтом $(@($suiteGuardedDotSources).Count)")
+        -Failure ("кожне підключення suite-фрагмента мусить стояти під Test-BRAVOSelfTestSuiteEnabled і всередині " +
+            "власної секції Suite/<Ім'я>; підключень $(@($suiteFragmentDotSources).Count), під гейтом і в секції " +
+            "$(@($suiteGuardedDotSources).Count)")
 
     # Повний прогін — режим за замовчуванням. Саме цей прогін його і доводить:
     # якби -Suite якось активувався без параметра, тут був би не $null.
@@ -24870,6 +25556,8 @@ Test-BRAVOCondition `
         -Failure ("для шляху без точної відповідності підказка мусить повертати порожньо (= повний прогін), " +
             "а не вгадувати suite; повернуто: " + [string]::Join(', ', @($suiteHintUnknown)))
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.VariableScopeHeadroom' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossSuiteDependency') { try {
 
 # ============================================================
 # #219: вибірковий прогін без прихованих міжsuite-залежностей.
@@ -25382,10 +26070,897 @@ $null = New-AlphaOwnedFixture
             "проходів: $($perfAnalysisLoops.Count); обходів дерева в ньому: $perfTreeWalkCount; " +
             "не живляться з нього: $($perfMissingCollections -join ', ')")
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossSuiteDependency' } }
+
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionIsolation') { try {
+
+# ============================================================
+# #219 (частина B): регресійні проби секційної ізоляції.
+#
+# Кожен сценарій — ОКРЕМИЙ дочірній процес: сценарії навмисно ламають
+# фреймворк (підміна Test-BRAVOCondition модулем, зламана реєстрація
+# винятку, зламаний звіт) і завершуються через exit, тож у процесі
+# головного прогону їх виконувати не можна. Дочірній скрипт збирається
+# з РЕАЛЬНОГО коду цього файлу (AST-екстракція функцій фреймворку, його
+# ініціалізації та обробників зовнішнього try/catch/finally), а не з
+# ручної копії: зміна межі тут одразу перевіряється пробою.
+#
+# Заглушки лише дві, обидві — зовнішні для фреймворку ефекти:
+# Complete-BRAVOHelperLog (друкує маркер і робить exit із тим самим кодом,
+# як справжня) і Wait-BRAVOManualExit (без паузи). Маркери перевірок —
+# ASCII, щоб результат не залежав від кодової сторінки консолі хоста.
+# ============================================================
+& {
+    $isolationProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SECTION_ISOLATION_' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($isolationProbeRoot)
+    $isolationResults = @{}
+    $isolationProbeError = $null
+    try {
+        $isolationOwnAst = Get-BRAVOSelfTestOwnSourceAst
+        $isolationTopStatements = @($isolationOwnAst.EndBlock.Statements)
+        $isolationSnapshotCall = @($isolationTopStatements | Where-Object {
+                $_ -is [Management.Automation.Language.PipelineAst] -and
+                $_.PipelineElements.Count -eq 1 -and
+                $_.PipelineElements[0] -is [Management.Automation.Language.CommandAst] -and
+                $_.PipelineElements[0].GetCommandName() -eq 'Save-BRAVOSelfTestFrameworkSnapshot' })
+        $isolationDataKeyAssignment = @($isolationTopStatements | Where-Object {
+                $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $_.Left.Extent.Text -eq '$script:BRAVOSelfTestGlobalFatalDataKey' })
+        $isolationOuterTry = @($isolationTopStatements | Where-Object {
+                $_ -is [Management.Automation.Language.TryStatementAst] -and
+                $_.Body.Extent.Text.Contains('BRAVO SELF-TEST (STATIC + RUNTIME)') }) | Select-Object -First 1
+        if ($isolationSnapshotCall.Count -ne 1 -or $isolationDataKeyAssignment.Count -ne 1 -or $null -eq $isolationOuterTry) {
+            throw 'не знайдено знімок фреймворку, ключ маркера або зовнішній try — межі фреймворку змінено'
+        }
+        $isolationMainTry = @($isolationOuterTry.Body.Statements |
+                Where-Object { $_ -is [Management.Automation.Language.TryStatementAst] }) | Select-Object -First 1
+        $isolationOuterStatements = @($isolationOuterTry.Body.Statements)
+        $isolationFrameworkNames = @(@($isolationSnapshotCall[0].PipelineElements[0].CommandElements |
+                    ForEach-Object { $_.FindAll({ param($node) $node -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) } |
+                    ForEach-Object { $_.Value } |
+                    Where-Object { $_ -like '*-BRAVO*' }) + @('Initialize-BRAVOSelfTestSectionState', 'Save-BRAVOSelfTestFrameworkSnapshot'))
+        $isolationFunctionText = New-Object System.Text.StringBuilder
+        foreach ($isolationFunctionName in $isolationFrameworkNames) {
+            $isolationDefinition = @($isolationTopStatements | Where-Object {
+                    $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq $isolationFunctionName }) |
+                Select-Object -First 1
+            if ($null -eq $isolationDefinition) { throw "функцію фреймворку '$isolationFunctionName' не знайдено" }
+            [void]$isolationFunctionText.AppendLine($isolationDefinition.Extent.Text)
+        }
+        $isolationPrologue = @'
+param([string]$RepoRoot, [string]$ProbeRoot)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$NoPause = $true
+Import-Module -Name (Join-Path $RepoRoot 'modules\BRAVO.Console\BRAVO.Console.psd1') -Force -ErrorAction Stop
+function Complete-BRAVOHelperLog { param([int]$ExitCode) Write-Host ('PROBE-HELPERLOG-EXIT=' + $ExitCode); exit $ExitCode }
+function Wait-BRAVOManualExit { param([switch]$NoPause) }
+$script:failures = New-Object System.Collections.ArrayList
+$script:passCount = 0
+$script:environmentLimitations = New-Object System.Collections.ArrayList
+$script:BRAVOSelfTestSelectedSuite = $null
+$script:suiteDurationTotals = [ordered]@{}
+$script:currentSuiteName = 'Root (inline)'
+$script:currentSuiteSpanStopwatch = $null
+$script:testTimings = New-Object System.Collections.Generic.List[object]
+$script:lastAssertionCompletedAtMs = 0.0
+$script:selfTestTotalStopwatch = [Diagnostics.Stopwatch]::StartNew()
+$script:BRAVOSelfTestOwnedRuntimeModules = New-Object System.Collections.Generic.List[object]
+$script:selfTestHelperLogPath = Join-Path $ProbeRoot 'probe.log'
+$script:selfTestConfigRoot = Join-Path $ProbeRoot 'config-root'
+[void][IO.Directory]::CreateDirectory($script:selfTestConfigRoot)
+'@
+        $isolationFramework = $isolationDataKeyAssignment[0].Extent.Text + "`r`n" + $isolationFunctionText.ToString() +
+            "Initialize-BRAVOSelfTestSectionState`r`n" + $isolationSnapshotCall[0].Extent.Text + "`r`n"
+        # Обробники — дослівно з реального файлу: головний catch, зовнішні
+        # catch/finally і два фінальні оператори зовнішнього try.
+        $isolationMainCatch = $isolationMainTry.CatchClauses[0].Extent.Text
+        $isolationOuterCatch = $isolationOuterTry.CatchClauses[0].Extent.Text
+        $isolationOuterFinally = 'finally ' + $isolationOuterTry.Finally.Extent.Text
+        $isolationFinalStatements = $isolationOuterStatements[$isolationOuterStatements.Count - 2].Extent.Text + "`r`n" +
+            $isolationOuterStatements[$isolationOuterStatements.Count - 1].Extent.Text
+
+        $isolationScenarios = [ordered]@{
+            Pass      = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Alpha') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/PassAlpha' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Alpha' } }
+'@
+                Tail = @'
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Omega') { try {
+Test-BRAVOCondition -Condition $true -Name 'Probe/PassOmega' -Failure 'n/a'
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Omega' } }
+'@
+            }
+            MultiFault = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Alpha') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/AlphaBefore' -Failure 'n/a'
+    $alphaFixture = Join-Path $ProbeRoot 'alpha-fixture'
+    [void][IO.Directory]::CreateDirectory($alphaFixture)
+    try {
+        throw (New-Object System.IO.InvalidDataException 'probe-alpha-fault')
+    } finally {
+        [IO.Directory]::Delete($alphaFixture, $true)
+    }
+    Test-BRAVOCondition -Condition $true -Name 'Probe/AlphaUnreachable' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Alpha' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AlphaConsumer' -DependsOn 'Root/Alpha') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/AlphaConsumerUnreachable' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AlphaConsumer' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Beta') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/BetaBefore' -Failure 'n/a'
+    $betaNothing = $null
+    $betaNothing.ProbeMissingMethod()
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Beta' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Suite/Gamma') { try {
+    Enter-BRAVOSelfTestSuite -Name 'Gamma'
+    Test-BRAVOCondition -Condition $true -Name 'Probe/GammaBefore' -Failure 'n/a'
+    $gammaValue = $script:probeGammaUndefinedVariable
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Gamma' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Delta') { try {
+    Write-Host ('PROBE-SUITE-AFTER-GAMMA=' + $script:currentSuiteName)
+    Test-BRAVOCondition -Condition $false -Name 'Probe/DeltaOrdinaryFail' -Failure 'probe-ordinary-fail'
+    Test-BRAVOCondition -Condition $true -Name 'Probe/DeltaRuns' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Delta' } }
+'@
+                Tail = @'
+[void]$script:BRAVOSelfTestOwnedRuntimeModules.Add([pscustomobject]@{ Module = [pscustomobject]@{ ProbeMarker = 'broken' }; FunctionNames = @('Probe-NoSuchFunction') })
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Omega') { try {
+Test-BRAVOCondition -Condition $true -Name 'Probe/TailOmegaRuns' -Failure 'n/a'
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Omega' } }
+'@
+            }
+            # Імена suite в подвійних лапках: regex-guard-и #187 читають сирий
+            # текст цього файлу й інакше побачили б синтетичні Gamma/Other як справжні.
+            Selective  = @{
+                Pre  = "`$script:BRAVOSelfTestSelectedSuite = @('Gamma')"
+                Main = @'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name "Gamma") {
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Gamma') { try {
+        Enter-BRAVOSelfTestSuite -Name 'Gamma'
+        Test-BRAVOCondition -Condition $true -Name 'Probe/SelectiveGammaBefore' -Failure 'n/a'
+        throw (New-Object System.FormatException 'probe-selective-fault')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Gamma' } }
+    }
+    if (Test-BRAVOSelfTestSuiteEnabled -Name "Other") {
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Other') { try {
+        Test-BRAVOCondition -Condition $true -Name 'Probe/OtherMustNotRun' -Failure 'n/a'
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Other' } }
+    }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AfterSelective') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/AfterSelectiveRuns' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterSelective' } }
+'@
+                Tail = ''
+            }
+            Shadowed   = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Outer') { try {
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Corrupt') { try {
+    $null = New-Module -Name 'BRAVOProbeShadow' -ScriptBlock { function Test-BRAVOCondition { param($Condition, $Name, $Failure) } }
+    Test-BRAVOCondition -Condition $false -Name 'Probe/ShadowSwallowedFail' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Corrupt' } }
+    Write-Host 'PROBE-OUTER-CONTINUED-AFTER-CORRUPT'
+    Test-BRAVOCondition -Condition $true -Name 'Probe/OuterAfterCorruptMustNotRun' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Outer' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AfterCorrupt') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/AfterCorruptMustNotRun' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterCorrupt' } }
+'@
+                Tail = @'
+if (Enter-BRAVOSelfTestSection -Name 'Tail/AfterCorrupt') { try {
+Test-BRAVOCondition -Condition $true -Name 'Probe/TailAfterCorruptMustNotRun' -Failure 'n/a'
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/AfterCorrupt' } }
+'@
+            }
+            ShadowedTail = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Alpha') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/ShadowedTailAlpha' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Alpha' } }
+'@
+                # Найгірший випадок: підміна самого звіту, що друкує PASSED і
+                # виходить із кодом 0.
+                Tail = @'
+if (Enter-BRAVOSelfTestSection -Name 'Tail/CorruptReport') { try {
+$null = New-Module -Name 'BRAVOProbeReportShadow' -ScriptBlock { function Complete-BRAVOSelfTestReport { Write-Host 'SELF-TEST PASSED'; exit 0 } }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/CorruptReport' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/AfterCorruptReport') { try {
+Test-BRAVOCondition -Condition $true -Name 'Probe/TailAfterCorruptReportMustNotRun' -Failure 'n/a'
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/AfterCorruptReport' } }
+'@
+            }
+            BrokenRegistration = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/BreakRegistration') { try {
+    Set-Item -LiteralPath 'function:Register-BRAVOSelfTestSectionFault' -Value { param($ErrorRecord) }
+    throw 'probe-swallowed-fault'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/BreakRegistration' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AfterBreak') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/AfterBreakMustNotRun' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterBreak' } }
+'@
+                Tail = ''
+            }
+            GlobalBoundary = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/BoundaryOuter') { try {
+    if (Enter-BRAVOSelfTestSection -Name 'ProbeBoundary' -Policy GlobalFatal) { try {
+    throw (New-Object System.IO.FileNotFoundException 'probe-boundary-fault')
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ProbeBoundary' } }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/BoundaryOuter' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AfterBoundary') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/AfterBoundaryMustNotRun' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterBoundary' } }
+'@
+                Tail = @'
+if (Enter-BRAVOSelfTestSection -Name 'Tail/AfterBoundary') { try {
+Test-BRAVOCondition -Condition $true -Name 'Probe/TailAfterBoundaryRuns' -Failure 'n/a'
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/AfterBoundary' } }
+'@
+            }
+            UnprotectedTail = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Alpha') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/UnprotectedAlpha' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Alpha' } }
+'@
+                Tail = "throw (New-Object System.ArgumentException 'probe-unprotected-tail')"
+            }
+            BrokenReport = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Alpha') { try {
+    Test-BRAVOCondition -Condition $true -Name 'Probe/BrokenReportAlpha' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Alpha' } }
+'@
+                # Зламано і звіт, і журнал: єдиним, що лишається, є мінімальний
+                # шлях із власним exit 1.
+                Tail = "Set-Item -LiteralPath 'function:Write-BRAVOSelfTestSectionReport' -Value { throw 'probe-report-broken' }`r`n" +
+                    "Set-Item -LiteralPath 'function:Complete-BRAVOHelperLog' -Value { throw 'probe-helperlog-broken' }"
+            }
+        }
+
+        $isolationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $isolationResults = @{}
+        foreach ($isolationScenarioName in @($isolationScenarios.Keys)) {
+            $isolationScenario = $isolationScenarios[$isolationScenarioName]
+            $isolationScenarioRoot = Join-Path $isolationProbeRoot $isolationScenarioName
+            [void][IO.Directory]::CreateDirectory($isolationScenarioRoot)
+            $isolationScript = $isolationPrologue + "`r`n" + $isolationFramework + $isolationScenario.Pre + "`r`n" +
+                "try {`r`ntry {`r`n    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'`r`n" + $isolationScenario.Main + "`r`n" +
+                "    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'`r`n} " + $isolationMainCatch + "`r`n" +
+                $isolationScenario.Tail + "`r`n" + $isolationFinalStatements + "`r`n} " + $isolationOuterCatch + ' ' +
+                $isolationOuterFinally + "`r`n"
+            $isolationScriptPath = Join-Path $isolationScenarioRoot ('probe-' + $isolationScenarioName + '.ps1')
+            # BOM обов'язковий: Windows PowerShell 5.1 без нього читає
+            # кириличні рядки екстрагованих функцій у кодовій сторінці ANSI.
+            [IO.File]::WriteAllText($isolationScriptPath, $isolationScript, (New-Object Text.UTF8Encoding($true)))
+            # Без 2>&1: у Windows PowerShell 5.1 рядок stderr нативного процесу
+            # під ErrorActionPreference = Stop став би термінальною помилкою батька.
+            $isolationOutput = @(& $isolationHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                    -File $isolationScriptPath $root $isolationScenarioRoot | ForEach-Object { [string]$_ })
+            $isolationResults[$isolationScenarioName] = [pscustomobject]@{
+                ExitCode = $LASTEXITCODE
+                Text     = [string]::Join("`n", $isolationOutput)
+                Root     = $isolationScenarioRoot
+            }
+        }
+    } catch {
+        $isolationProbeError = $_.Exception.Message
+    } finally {
+        if ([IO.Directory]::Exists($isolationProbeRoot)) {
+            [IO.Directory]::Delete($isolationProbeRoot, $true)
+        }
+    }
+
+    # Повертає перелік розбіжностей сценарію з очікуванням; порожній — збіг.
+    $isolationMismatch = {
+        param([string]$ScenarioName, [int]$ExpectedExitCode, [string[]]$Present = @(), [string[]]$Absent = @())
+        $scenarioResult = $isolationResults[$ScenarioName]
+        if ($null -eq $scenarioResult) { return @("сценарій $ScenarioName не виконано") }
+        $scenarioProblems = New-Object System.Collections.Generic.List[string]
+        if ($scenarioResult.ExitCode -ne $ExpectedExitCode) {
+            [void]$scenarioProblems.Add(("код виходу {0} замість {1}" -f $scenarioResult.ExitCode, $ExpectedExitCode))
+        }
+        foreach ($presentMarker in $Present) {
+            if (-not $scenarioResult.Text.Contains($presentMarker)) { [void]$scenarioProblems.Add("немає '$presentMarker'") }
+        }
+        foreach ($absentMarker in $Absent) {
+            if ($scenarioResult.Text.Contains($absentMarker)) { [void]$scenarioProblems.Add("є зайве '$absentMarker'") }
+        }
+        return @($scenarioProblems.ToArray())
+    }
+    # [НЕДОСТУПНО] — лише коли дочірній процес не дав результату ВЗАГАЛІ і
+    # хост доведено обмежений; проба, що відпрацювала неправильно, — [FAIL].
+    $isolationRestriction = {
+        param([string]$ScenarioName)
+        $scenarioResult = $isolationResults[$ScenarioName]
+        if ($null -ne $scenarioResult -and ($scenarioResult.Text.Contains('PROBE-HELPERLOG-EXIT=') -or
+                $scenarioResult.Text.Contains('SELF-TEST '))) { return '' }
+        $restrictionReason = Get-BRAVOSelfTestHostRestriction
+        if ([string]::IsNullOrWhiteSpace($restrictionReason)) { return '' }
+        return $restrictionReason
+    }
+    if ($null -ne $isolationProbeError) {
+        Test-BRAVOCondition `
+            -Condition $false `
+            -Name 'Framework/SectionIsolation.ProbeExecution' `
+            -EnvironmentLimitation (& $isolationRestriction '') `
+            -Failure "проби секційної ізоляції не вдалося підготувати чи запустити: $isolationProbeError"
+    } else {
+        # Негативний контроль: без збоїв той самий зібраний каркас дає 0 і
+        # PASSED — інакше решта проб нічого б не доводила.
+        $isolationProblems = @(& $isolationMismatch 'Pass' 0 @('[PASS] Probe/PassAlpha', '[PASS] Probe/PassOmega',
+                'SELF-TEST PASSED', 'PROBE-HELPERLOG-EXIT=0') @('SELF-TEST FAILED'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.CleanRunPasses' `
+            -EnvironmentLimitation (& $isolationRestriction 'Pass') `
+            -Failure ('каркас без збоїв має дати код 0 і SELF-TEST PASSED: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'MultiFault' 1 @('[PASS] Probe/AlphaBefore', '[PASS] Probe/BetaBefore',
+                '[PASS] Probe/GammaBefore', '[PASS] Probe/DeltaRuns', '[PASS] Probe/TailOmegaRuns', 'SELF-TEST FAILED',
+                'PROBE-HELPERLOG-EXIT=1', 'Total wall-clock') @('Probe/AlphaUnreachable', 'SELF-TEST PASSED'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.FatalSectionFailsAndOthersContinue' `
+            -EnvironmentLimitation (& $isolationRestriction 'MultiFault') `
+            -Failure ('виняток у секції має провалити прогін, а незалежні секції й хвіст — виконатися: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'MultiFault' 1 @('System.IO.InvalidDataException', 'probe-alpha-fault',
+                'probe-MultiFault.ps1:', 'probe-MultiFault.ps1: line', 'VariableIsUndefined', 'probeGammaUndefinedVariable',
+                'Section/Root/Beta', 'Probe/DeltaOrdinaryFail: probe-ordinary-fail'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.MultipleFaultsAllReportedWithDiagnostics' `
+            -EnvironmentLimitation (& $isolationRestriction 'MultiFault') `
+            -Failure ('кожна перервана секція має потрапити у звіт із типом, повідомленням, file:line і стеком: ' +
+                [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'MultiFault' 1 @('Section/Root/AlphaConsumer', 'PROBE-SUITE-AFTER-GAMMA=Root (inline)') @('Probe/AlphaConsumerUnreachable'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.DependentOfAbortedSectionIsSkippedAsFailure' `
+            -EnvironmentLimitation (& $isolationRestriction 'MultiFault') `
+            -Failure ('залежна від перерваної секція має бути пропущена як помилка, а suite-атрибуція — повернутися до Root: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationMultiFault = $isolationResults['MultiFault']
+        $isolationProblems = @(& $isolationMismatch 'MultiFault' 1 @('Framework/FinalCleanup.OwnedRuntimeModules', 'probe-alpha-fault'))
+        if ($null -ne $isolationMultiFault) {
+            # Фікстура перерваної секції і config root прибрані, попри збій
+            # іншого кроку прибирання; першопричина лишилась у звіті ПІСЛЯ нього.
+            if ([IO.Directory]::Exists((Join-Path $isolationMultiFault.Root 'alpha-fixture'))) { $isolationProblems += 'фікстуру перерваної секції не прибрано' }
+            if ([IO.Directory]::Exists((Join-Path $isolationMultiFault.Root 'config-root'))) { $isolationProblems += 'config root не прибрано' }
+            if ($isolationMultiFault.Text.LastIndexOf('probe-alpha-fault') -lt $isolationMultiFault.Text.IndexOf('Framework/FinalCleanup.OwnedRuntimeModules')) {
+                $isolationProblems += 'першопричина не повторена у звіті після збою прибирання'
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.CleanupFaultDoesNotMaskCause' `
+            -EnvironmentLimitation (& $isolationRestriction 'MultiFault') `
+            -Failure ('збій прибирання має бути зареєстрований окремо й не маскувати першопричину: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'Selective' 1 @('[PASS] Probe/SelectiveGammaBefore', '[PASS] Probe/AfterSelectiveRuns',
+                'System.FormatException', 'probe-selective-fault', 'SELF-TEST FAILED') @('Probe/OtherMustNotRun', 'SELF-TEST PARTIAL', 'SELF-TEST PASSED'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.SelectiveRunWithFatalSectionFails' `
+            -EnvironmentLimitation (& $isolationRestriction 'Selective') `
+            -Failure ('вибірковий прогін із перерваною секцією має дати FAILED, а не PARTIAL: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'Shadowed' 1 @('Framework/RunStopped', 'BRAVOProbeShadow', 'Section/Tail/AfterCorrupt',
+                'SELF-TEST FAILED', 'PROBE-HELPERLOG-EXIT=1') @('Probe/OuterAfterCorruptMustNotRun', 'Probe/AfterCorruptMustNotRun',
+                'Probe/TailAfterCorruptMustNotRun', 'PROBE-OUTER-CONTINUED-AFTER-CORRUPT', 'SELF-TEST PASSED'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.ShadowedAssertionStopsRun' `
+            -EnvironmentLimitation (& $isolationRestriction 'Shadowed') `
+            -Failure ('затінена модулем Test-BRAVOCondition має зупинити прогін (глобальна межа), а звіт — виконатись справжнім кодом: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'ShadowedTail' 1 @('Framework/RunStopped', 'BRAVOProbeReportShadow',
+                'Complete-BRAVOSelfTestReport', 'SELF-TEST FAILED', 'PROBE-HELPERLOG-EXIT=1') @('Probe/TailAfterCorruptReportMustNotRun', 'SELF-TEST PASSED'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.ShadowedReportInTailStillFails' `
+            -EnvironmentLimitation (& $isolationRestriction 'ShadowedTail') `
+            -Failure ('підмінений у хвості звіт має бути відновлений зі знімка, а прогін — завершитись FAILED із кодом 1: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'BrokenRegistration' 1 @('Framework/RunStopped', 'Register-BRAVOSelfTestSectionFault',
+                'SELF-TEST FAILED', 'PROBE-HELPERLOG-EXIT=1') @('Probe/AfterBreakMustNotRun', 'SELF-TEST PASSED'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.BrokenFaultRegistrationStopsRun' `
+            -EnvironmentLimitation (& $isolationRestriction 'BrokenRegistration') `
+            -Failure ('підмінена реєстрація винятку, що поглинає збої, має зупинити прогін: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'GlobalBoundary' 1 @('System.IO.FileNotFoundException', 'probe-boundary-fault',
+                '[PASS] Probe/TailAfterBoundaryRuns', 'SELF-TEST FAILED') @('Probe/AfterBoundaryMustNotRun', 'SELF-TEST PASSED'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.GlobalFatalBoundaryStopsMainBody' `
+            -EnvironmentLimitation (& $isolationRestriction 'GlobalBoundary') `
+            -Failure ('виняток у GlobalFatal-секції має зупинити основне тіло, але не хвіст і не звіт: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'UnprotectedTail' 1 @('Framework/UnprotectedFatal', 'System.ArgumentException',
+                'probe-unprotected-tail', 'SELF-TEST FAILED', 'Total wall-clock', 'PROBE-HELPERLOG-EXIT=1') @('SELF-TEST PASSED'))
+        $isolationUnprotected = $isolationResults['UnprotectedTail']
+        if ($null -ne $isolationUnprotected -and [IO.Directory]::Exists((Join-Path $isolationUnprotected.Root 'config-root'))) {
+            $isolationProblems += 'config root не прибрано'
+        }
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.UnprotectedFaultStillReportsAndCleans' `
+            -EnvironmentLimitation (& $isolationRestriction 'UnprotectedTail') `
+            -Failure ('виняток поза секціями має завершитись повним звітом, прибиранням і кодом 1: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'BrokenReport' 1 @('Framework/UnprotectedFatal', 'probe-report-broken',
+                'SELF-TEST FAILED: ') @('SELF-TEST PASSED', 'PROBE-HELPERLOG-EXIT'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.BrokenReportFallsBackToMinimalFailure' `
+            -EnvironmentLimitation (& $isolationRestriction 'BrokenReport') `
+            -Failure ('збій машинерії звіту має дати мінімальний SELF-TEST FAILED і код 1: ' + [string]::Join('; ', $isolationProblems))
+    }
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SectionIsolation' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
+
+# ============================================================
+# #219 (частина B): структурні guard-и секційної ізоляції.
+#
+# Ізоляція працює лише доти, доки межі мають ОДНУ форму і покривають усе
+# виконуване тіло. Код, доданий МІЖ секціями, знову летів би в головний
+# catch і зупиняв решту прогону; break/continue/exit/return на рівні
+# файлу у фрагменті чи секції обійшли б і секцію, і звіт. Аналізатор —
+# один scriptblock, що працює і на реальному джерелі, і на синтетичних
+# фікстурах (IsMeaningful): guard, який нічого не знаходить на навмисно
+# зламаному тексті, нічого й не доводить.
+# ============================================================
+& {
+    $boundaryAnalyze = {
+        param(
+            [Parameter(Mandatory = $true)]$RootAst,
+            [Parameter(Mandatory = $true)][hashtable]$FragmentAst,
+            [string[]]$GlobalFatalAllowList = @()
+        )
+        $boundaryProblems = [ordered]@{
+            WellFormed = New-Object System.Collections.Generic.List[string]
+            Coverage   = New-Object System.Collections.Generic.List[string]
+            Jumps      = New-Object System.Collections.Generic.List[string]
+            Skeleton   = New-Object System.Collections.Generic.List[string]
+        }
+        $commandNameOf = {
+            param($Statement)
+            if ($Statement -is [Management.Automation.Language.PipelineAst] -and $Statement.PipelineElements.Count -eq 1 -and
+                $Statement.PipelineElements[0] -is [Management.Automation.Language.CommandAst]) {
+                return [string]$Statement.PipelineElements[0].GetCommandName()
+            }
+            return ''
+        }
+        # Значення -Name/-DependsOn/-Policy як літерали; $null — не літерал.
+        $literalParameters = {
+            param($CommandAst)
+            $parameterValues = @{}
+            $elements = @($CommandAst.CommandElements)
+            for ($elementIndex = 1; $elementIndex -lt $elements.Count; $elementIndex++) {
+                $element = $elements[$elementIndex]
+                if (-not ($element -is [Management.Automation.Language.CommandParameterAst]) -or $elementIndex + 1 -ge $elements.Count) { return $null }
+                $valueAst = $elements[$elementIndex + 1]
+                $values = @()
+                if ($valueAst -is [Management.Automation.Language.StringConstantExpressionAst]) {
+                    $values = @($valueAst.Value)
+                } elseif ($valueAst -is [Management.Automation.Language.ArrayLiteralAst] -and
+                    @($valueAst.Elements | Where-Object { -not ($_ -is [Management.Automation.Language.StringConstantExpressionAst]) }).Count -eq 0) {
+                    $values = @($valueAst.Elements | ForEach-Object { $_.Value })
+                } else {
+                    return $null
+                }
+                $parameterValues[$element.ParameterName] = $values
+                $elementIndex++
+            }
+            return $parameterValues
+        }
+        $isSectionIf = {
+            param($Node)
+            if (-not ($Node -is [Management.Automation.Language.IfStatementAst]) -or $Node.Clauses.Count -lt 1) { return $false }
+            $conditionCommand = $Node.Clauses[0].Item1.Find({ param($inner) $inner -is [Management.Automation.Language.CommandAst] }, $true)
+            return ($null -ne $conditionCommand -and $conditionCommand.GetCommandName() -eq 'Enter-BRAVOSelfTestSection')
+        }
+        $analyzeUnit = {
+            param($UnitAst, [string]$Domain, [string]$Label)
+            $unitSections = New-Object System.Collections.Generic.List[object]
+            # ОДИН обхід дерева на одиницю: FindAll викликає предикат на КОЖЕН
+            # вузол, тож предикат — лише дешеві перевірки типу, а класифікація
+            # — уже по відібраних вузлах (див. Perf/SingleAstPassOverRepositoryFiles).
+            $unitNodes = @($UnitAst.FindAll({ param($node)
+                        $node -is [Management.Automation.Language.IfStatementAst] -or
+                        $node -is [Management.Automation.Language.CommandAst] -or
+                        $node -is [Management.Automation.Language.BreakStatementAst] -or
+                        $node -is [Management.Automation.Language.ContinueStatementAst] -or
+                        $node -is [Management.Automation.Language.ExitStatementAst] -or
+                        $node -is [Management.Automation.Language.ReturnStatementAst] }, $true))
+            $unitSectionIfs = @($unitNodes | Where-Object { $_ -is [Management.Automation.Language.IfStatementAst] -and (& $isSectionIf $_) })
+            $unitBoundaryCalls = @($unitNodes | Where-Object { $_ -is [Management.Automation.Language.CommandAst] -and
+                    @('Enter-BRAVOSelfTestSection', 'Register-BRAVOSelfTestSectionFault', 'Complete-BRAVOSelfTestSection') -contains $_.GetCommandName() })
+            $unitJumps = @($unitNodes | Where-Object { -not ($_ -is [Management.Automation.Language.IfStatementAst]) -and
+                    -not ($_ -is [Management.Automation.Language.CommandAst]) })
+            foreach ($sectionIf in $unitSectionIfs) {
+                $sectionProblem = ''
+                $sectionName = ''
+                $sectionDependsOn = @()
+                $sectionPolicy = 'Continue'
+                $conditionPipeline = $sectionIf.Clauses[0].Item1
+                $enterCommand = $null
+                if ($sectionIf.Clauses.Count -ne 1 -or $null -ne $sectionIf.ElseClause) {
+                    $sectionProblem = 'межа має рівно одну гілку без else'
+                } elseif (-not ($conditionPipeline -is [Management.Automation.Language.PipelineAst]) -or $conditionPipeline.PipelineElements.Count -ne 1) {
+                    $sectionProblem = 'умова межі — лише виклик Enter-BRAVOSelfTestSection'
+                } else {
+                    $enterCommand = $conditionPipeline.PipelineElements[0]
+                    $enterParameters = & $literalParameters $enterCommand
+                    if ($null -eq $enterParameters -or -not $enterParameters.ContainsKey('Name') -or @($enterParameters['Name']).Count -ne 1) {
+                        $sectionProblem = 'Enter-BRAVOSelfTestSection приймає лише літеральні -Name/-DependsOn/-Policy'
+                    } else {
+                        $sectionName = [string]$enterParameters['Name'][0]
+                        if ($enterParameters.ContainsKey('DependsOn')) { $sectionDependsOn = @($enterParameters['DependsOn']) }
+                        if ($enterParameters.ContainsKey('Policy')) { $sectionPolicy = [string]$enterParameters['Policy'][0] }
+                        $unknownParameters = @($enterParameters.Keys | Where-Object { @('Name', 'DependsOn', 'Policy') -notcontains $_ })
+                        if ($unknownParameters.Count -gt 0) { $sectionProblem = 'невідомий параметр межі: ' + [string]::Join(', ', $unknownParameters) }
+                    }
+                }
+                $sectionBody = $sectionIf.Clauses[0].Item2
+                if ([string]::IsNullOrEmpty($sectionProblem)) {
+                    $sectionTry = if ($sectionBody.Statements.Count -eq 1) { $sectionBody.Statements[0] } else { $null }
+                    if (-not ($sectionTry -is [Management.Automation.Language.TryStatementAst])) {
+                        $sectionProblem = 'тіло межі — рівно один try'
+                    } elseif ($sectionTry.CatchClauses.Count -ne 1 -or -not $sectionTry.CatchClauses[0].IsCatchAll -or
+                        $sectionTry.CatchClauses[0].Body.Statements.Count -ne 1 -or
+                        $sectionTry.CatchClauses[0].Body.Statements[0].Extent.Text -cne 'Register-BRAVOSelfTestSectionFault -ErrorRecord $_') {
+                        $sectionProblem = 'catch межі — лише Register-BRAVOSelfTestSectionFault -ErrorRecord $_'
+                    } elseif ($null -eq $sectionTry.Finally -or $sectionTry.Finally.Statements.Count -ne 1 -or
+                        $sectionTry.Finally.Statements[0].Extent.Text -cne ("Complete-BRAVOSelfTestSection -Name '" + $sectionName + "'")) {
+                        $sectionProblem = "finally межі — лише Complete-BRAVOSelfTestSection -Name '$sectionName'"
+                    }
+                }
+                if (-not [string]::IsNullOrEmpty($sectionProblem)) {
+                    [void]$boundaryProblems.WellFormed.Add(("{0}:{1} {2}: {3}" -f $Label, $sectionIf.Extent.StartLineNumber, $sectionName, $sectionProblem))
+                }
+                if ($sectionPolicy -ne 'Continue' -and $GlobalFatalAllowList -notcontains $sectionName) {
+                    [void]$boundaryProblems.WellFormed.Add(("{0}:{1} {2}: -Policy {3} дозволено лише межам {4}" -f
+                            $Label, $sectionIf.Extent.StartLineNumber, $sectionName, $sectionPolicy, [string]::Join(', ', $GlobalFatalAllowList)))
+                }
+                $parentSection = $sectionIf.Parent
+                while ($null -ne $parentSection -and -not (& $isSectionIf $parentSection)) { $parentSection = $parentSection.Parent }
+                [void]$unitSections.Add([pscustomobject]@{
+                        Name      = $sectionName
+                        DependsOn = $sectionDependsOn
+                        Domain    = $Domain
+                        Label     = $Label
+                        Line      = $sectionIf.Extent.StartLineNumber
+                        Ast       = $sectionIf
+                        ParentAst = $parentSection
+                        Parent    = ''
+                    })
+            }
+            # Кожен виклик межевих функцій — лише всередині канонічної форми.
+            foreach ($boundaryCall in $unitBoundaryCalls) {
+                $owningFunction = $boundaryCall.Parent
+                while ($null -ne $owningFunction -and -not ($owningFunction -is [Management.Automation.Language.FunctionDefinitionAst])) { $owningFunction = $owningFunction.Parent }
+                if ($null -ne $owningFunction) { continue }
+                $owningSection = $boundaryCall.Parent
+                while ($null -ne $owningSection -and -not (& $isSectionIf $owningSection)) { $owningSection = $owningSection.Parent }
+                $isCanonicalCall = $false
+                if ($null -ne $owningSection) {
+                    $owningTry = $owningSection.Clauses[0].Item2.Statements | Select-Object -First 1
+                    $isCanonicalCall = ($boundaryCall.Parent -eq $owningSection.Clauses[0].Item1) -or
+                        ($owningTry -is [Management.Automation.Language.TryStatementAst] -and
+                        (($owningTry.CatchClauses.Count -gt 0 -and $boundaryCall.Parent.Parent -eq $owningTry.CatchClauses[0].Body) -or
+                         ($null -ne $owningTry.Finally -and $boundaryCall.Parent.Parent -eq $owningTry.Finally)))
+                }
+                if (-not $isCanonicalCall) {
+                    [void]$boundaryProblems.WellFormed.Add(("{0}:{1}: {2} поза канонічною формою межі" -f $Label, $boundaryCall.Extent.StartLineNumber, $boundaryCall.GetCommandName()))
+                }
+            }
+            # Стрибки на рівні файлу: break/continue поза циклом чи switch,
+            # exit/return поза функцією чи scriptblock-ом.
+            # У корені — лише всередині секцій: bootstrap до головного try
+            # законно завершується exit 1 (глобальна межа 1).
+            foreach ($jumpNode in $unitJumps) {
+                    $isLoopJump = $jumpNode -is [Management.Automation.Language.BreakStatementAst] -or $jumpNode -is [Management.Automation.Language.ContinueStatementAst]
+                    $jumpAncestor = $jumpNode.Parent
+                    $jumpContained = $false
+                    $jumpInSection = ($Domain -ne 'root')
+                    while ($null -ne $jumpAncestor) {
+                        if (-not $jumpInSection -and $jumpAncestor -is [Management.Automation.Language.IfStatementAst] -and (& $isSectionIf $jumpAncestor)) {
+                            $jumpInSection = $true
+                        }
+                        if ($jumpAncestor -is [Management.Automation.Language.FunctionDefinitionAst] -or
+                            $jumpAncestor -is [Management.Automation.Language.ScriptBlockExpressionAst] -or
+                            ($isLoopJump -and $jumpAncestor -is [Management.Automation.Language.LabeledStatementAst])) {
+                            $jumpContained = $true
+                            break
+                        }
+                        $jumpAncestor = $jumpAncestor.Parent
+                    }
+                    if ($jumpContained -or -not $jumpInSection) { continue }
+                    [void]$boundaryProblems.Jumps.Add(("{0}:{1}: {2}" -f $Label, $jumpNode.Extent.StartLineNumber, $jumpNode.Extent.Text))
+            }
+            return @($unitSections.ToArray())
+        }
+
+        # --- Корінь: секції, покриття основного тіла й хвоста, каркас ----
+        $orderedSections = New-Object System.Collections.Generic.List[object]
+        $rootSections = @(& $analyzeUnit $RootAst 'root' 'BRAVO_SELF_TEST.ps1')
+        $rootTop = @($RootAst.EndBlock.Statements)
+        $outerTry = @($rootTop | Where-Object {
+                $_ -is [Management.Automation.Language.TryStatementAst] -and
+                @($_.Body.Statements).Count -gt 0 -and $_.Body.Statements[0] -is [Management.Automation.Language.TryStatementAst] })
+        if ($outerTry.Count -ne 1 -or -not [object]::ReferenceEquals($outerTry[0], $rootTop[$rootTop.Count - 1])) {
+            [void]$boundaryProblems.Skeleton.Add('зовнішній try з головним try першим оператором мусить бути один і останнім оператором файлу')
+        } else {
+            $outer = $outerTry[0]
+            $mainTry = $outer.Body.Statements[0]
+            $outerStatements = @($outer.Body.Statements)
+            if ($mainTry.CatchClauses.Count -ne 1 -or $mainTry.CatchClauses[0].Body.Statements.Count -ne 1 -or
+                $mainTry.CatchClauses[0].Body.Statements[0].Extent.Text -cne 'Register-BRAVOSelfTestGlobalFatal -ErrorRecord $_' -or
+                $null -ne $mainTry.Finally) {
+                [void]$boundaryProblems.Skeleton.Add('головний catch — лише Register-BRAVOSelfTestGlobalFatal -ErrorRecord $_, без finally')
+            }
+            if ($outer.CatchClauses.Count -ne 1 -or -not $outer.CatchClauses[0].IsCatchAll -or
+                $outer.CatchClauses[0].Body.Statements.Count -ne 1 -or
+                $outer.CatchClauses[0].Body.Statements[0].Extent.Text -cne 'Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $_') {
+                [void]$boundaryProblems.Skeleton.Add('зовнішній catch — лише Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $_')
+            }
+            $outerFinallyText = if ($null -ne $outer.Finally) { [string]$outer.Finally.Extent.Text } else { '' }
+            if (-not ($outerFinallyText.Contains('$script:BRAVOSelfTestReportIssued') -and
+                    $outerFinallyText.Contains('$script:BRAVOSelfTestAbnormalExitStarted') -and
+                    $outerFinallyText.Contains('Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $null'))) {
+                [void]$boundaryProblems.Skeleton.Add('зовнішній finally мусить гарантувати Complete-BRAVOSelfTestAbnormalExit, якщо звіт не видано')
+            }
+            if ($outerStatements.Count -lt 3 -or
+                (& $commandNameOf $outerStatements[$outerStatements.Count - 2]) -ne 'Invoke-BRAVOSelfTestFinalCleanup' -or
+                (& $commandNameOf $outerStatements[$outerStatements.Count - 1]) -ne 'Complete-BRAVOSelfTestReport') {
+                [void]$boundaryProblems.Skeleton.Add('зовнішній try завершується Invoke-BRAVOSelfTestFinalCleanup і Complete-BRAVOSelfTestReport')
+            }
+            $sectionAstSet = @{}
+            foreach ($rootSection in $rootSections) { $sectionAstSet[$rootSection.Ast.Extent.StartOffset] = $rootSection }
+            $checkCovered = {
+                param($Statement, [bool]$AllowGate)
+                if ($sectionAstSet.ContainsKey($Statement.Extent.StartOffset) -and [object]::ReferenceEquals($sectionAstSet[$Statement.Extent.StartOffset].Ast, $Statement)) { return $true }
+                if ((& $commandNameOf $Statement) -eq 'Enter-BRAVOSelfTestSuite') { return $true }
+                if ($AllowGate -and $Statement -is [Management.Automation.Language.IfStatementAst] -and $Statement.Clauses.Count -eq 1 -and
+                    $null -eq $Statement.ElseClause -and
+                    $Statement.Clauses[0].Item1.Extent.Text -match "^Test-BRAVOSelfTestSuiteEnabled -Name '([^']+)'$") {
+                    $gateSuite = $Matches[1]
+                    $gateBody = @($Statement.Clauses[0].Item2.Statements)
+                    return ($gateBody.Count -eq 2 -and
+                        $gateBody[0].Extent.Text -ceq ("Enter-BRAVOSelfTestSuite -Name '" + $gateSuite + "'") -and
+                        $sectionAstSet.ContainsKey($gateBody[1].Extent.StartOffset) -and
+                        $sectionAstSet[$gateBody[1].Extent.StartOffset].Name -eq ('Suite/' + $gateSuite))
+                }
+                return $false
+            }
+            foreach ($mainStatement in @($mainTry.Body.Statements)) {
+                if (-not (& $checkCovered $mainStatement $true)) {
+                    [void]$boundaryProblems.Coverage.Add(("BRAVO_SELF_TEST.ps1:{0}: оператор основного тіла поза секцією" -f $mainStatement.Extent.StartLineNumber))
+                }
+            }
+            for ($outerIndex = 1; $outerIndex -lt $outerStatements.Count - 2; $outerIndex++) {
+                if (-not (& $checkCovered $outerStatements[$outerIndex] $false)) {
+                    [void]$boundaryProblems.Coverage.Add(("BRAVO_SELF_TEST.ps1:{0}: оператор хвоста поза секцією" -f $outerStatements[$outerIndex].Extent.StartLineNumber))
+                }
+            }
+        }
+
+        # --- Порядок виконання: фрагмент — усередині своєї Suite/<Ім'я> ---
+        foreach ($rootSection in $rootSections) {
+            [void]$orderedSections.Add($rootSection)
+            if ($rootSection.Name -like 'Suite/*') {
+                $fragmentName = $rootSection.Name.Substring(6)
+                $rootSection.Domain = $fragmentName
+                if (-not $FragmentAst.ContainsKey($fragmentName)) {
+                    [void]$boundaryProblems.WellFormed.Add("секція $($rootSection.Name) без фрагмента $fragmentName")
+                    continue
+                }
+                foreach ($fragmentSection in @(& $analyzeUnit $FragmentAst[$fragmentName] $fragmentName ("BRAVO_SELF_TEST.$fragmentName.ps1"))) {
+                    if ($null -eq $fragmentSection.ParentAst) { $fragmentSection.Parent = $rootSection.Name }
+                    [void]$orderedSections.Add($fragmentSection)
+                }
+            }
+        }
+        $sectionPosition = @{}
+        $sectionByAst = New-Object 'System.Collections.Generic.Dictionary[object,object]'
+        foreach ($orderedSection in $orderedSections) { $sectionByAst[$orderedSection.Ast] = $orderedSection }
+        for ($orderIndex = 0; $orderIndex -lt $orderedSections.Count; $orderIndex++) {
+            $orderedSection = $orderedSections[$orderIndex]
+            if ($null -ne $orderedSection.ParentAst -and $sectionByAst.ContainsKey($orderedSection.ParentAst)) {
+                $orderedSection.Parent = $sectionByAst[$orderedSection.ParentAst].Name
+            }
+            if ([string]::IsNullOrEmpty($orderedSection.Name)) { continue }
+            if ($sectionPosition.ContainsKey($orderedSection.Name)) {
+                [void]$boundaryProblems.WellFormed.Add(("{0}:{1}: ім'я секції {2} повторюється" -f $orderedSection.Label, $orderedSection.Line, $orderedSection.Name))
+                continue
+            }
+            $sectionPosition[$orderedSection.Name] = $orderIndex
+        }
+        foreach ($orderedSection in $orderedSections) {
+            $ancestorNames = New-Object System.Collections.Generic.List[string]
+            $ancestorName = $orderedSection.Parent
+            while (-not [string]::IsNullOrEmpty($ancestorName) -and $ancestorNames.Count -lt 64) {
+                [void]$ancestorNames.Add($ancestorName)
+                $ancestorRecord = if ($sectionPosition.ContainsKey($ancestorName)) { $orderedSections[$sectionPosition[$ancestorName]] } else { $null }
+                $ancestorName = if ($null -ne $ancestorRecord) { $ancestorRecord.Parent } else { '' }
+            }
+            foreach ($dependencyName in @($orderedSection.DependsOn)) {
+                $dependencyProblem = ''
+                if (-not $sectionPosition.ContainsKey($dependencyName)) {
+                    $dependencyProblem = 'невідома секція'
+                } elseif ($sectionPosition[$dependencyName] -ge $sectionPosition[$orderedSection.Name]) {
+                    $dependencyProblem = 'виконується не раніше залежної'
+                } elseif ($ancestorNames.Contains($dependencyName)) {
+                    $dependencyProblem = 'є її власною зовнішньою секцією'
+                } else {
+                    $dependencyDomain = $orderedSections[$sectionPosition[$dependencyName]].Domain
+                    if ($dependencyDomain -ne 'root' -and $dependencyDomain -ne $orderedSection.Domain) {
+                        $dependencyProblem = "належить gated suite $dependencyDomain — у вибірковому прогоні її може не бути"
+                    }
+                }
+                if (-not [string]::IsNullOrEmpty($dependencyProblem)) {
+                    [void]$boundaryProblems.WellFormed.Add(("{0}:{1}: {2} -DependsOn '{3}' {4}" -f
+                            $orderedSection.Label, $orderedSection.Line, $orderedSection.Name, $dependencyName, $dependencyProblem))
+                }
+            }
+        }
+        return [pscustomobject]@{
+            Problems     = $boundaryProblems
+            SectionCount = $orderedSections.Count
+        }
+    }
+
+    $boundaryParse = {
+        param([string]$Text)
+        $fixtureTokens = $null
+        $fixtureErrors = $null
+        $fixtureAst = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$fixtureTokens, [ref]$fixtureErrors)
+        if (@($fixtureErrors).Count -gt 0) { throw 'синтаксична помилка у фікстурі guard-а меж' }
+        return $fixtureAst
+    }
+    $boundaryAllowList = @('Bootstrap/RuntimeGuard', 'Phase0')
+
+    # --- Реальне джерело ---------------------------------------------------
+    $boundaryResult = $null
+    $boundaryError = $null
+    try {
+        $boundaryFragmentAst = @{}
+        foreach ($boundaryFragmentFile in @(Get-ChildItem -LiteralPath (Join-Path $root 'selftest') -Filter 'BRAVO_SELF_TEST.*.ps1' -File)) {
+            $boundaryTokens = $null
+            $boundaryErrors = $null
+            $boundaryParsed = [Management.Automation.Language.Parser]::ParseFile(
+                $boundaryFragmentFile.FullName, [ref]$boundaryTokens, [ref]$boundaryErrors)
+            if (@($boundaryErrors).Count -gt 0) { throw "синтаксичні помилки у $($boundaryFragmentFile.Name)" }
+            $boundaryFragmentAst[($boundaryFragmentFile.Name -replace '^BRAVO_SELF_TEST\.', '' -replace '\.ps1$', '')] = $boundaryParsed
+        }
+        $boundaryResult = & $boundaryAnalyze -RootAst (Get-BRAVOSelfTestOwnSourceAst) -FragmentAst $boundaryFragmentAst `
+            -GlobalFatalAllowList $boundaryAllowList
+    } catch {
+        $boundaryError = $_.Exception.Message
+    }
+    $boundaryReport = {
+        param($Result, [string]$Category)
+        if ($null -eq $Result) { return 'н/д' }
+        $categoryProblems = @($Result.Problems[$Category])
+        if ($categoryProblems.Count -eq 0) { return 'немає' }
+        return ([string]::Join('; ', @($categoryProblems | Select-Object -First 5)) +
+            $(if ($categoryProblems.Count -gt 5) { " … ще $($categoryProblems.Count - 5)" } else { '' }))
+    }
+    foreach ($boundaryCheck in @(
+            @{ Category = 'WellFormed'; Name = 'Framework/SectionBoundariesAreWellFormed'
+                Failure = 'кожна межа — канонічна форма з літеральним унікальним іменем; -DependsOn — на раніше виконану секцію кореня чи того самого suite; GlobalFatal — лише для дозволених меж' },
+            @{ Category = 'Coverage'; Name = 'Framework/SectionsCoverMainBodyAndTail'
+                Failure = 'кожен оператор основного тіла й хвоста — секція, гейт фрагмента з Suite/<Ім''я> або Enter-BRAVOSelfTestSuite' },
+            @{ Category = 'Jumps'; Name = 'Framework/NoFileLevelJumpInSectionsOrFragments'
+                Failure = 'break/continue поза циклом і exit/return поза функцією в секції чи фрагменті обходять межу й звіт' },
+            @{ Category = 'Skeleton'; Name = 'Framework/GuaranteedTerminalPathSkeleton'
+                Failure = 'зовнішній try/catch/finally мусить гарантувати звіт або мінімальний SELF-TEST FAILED із кодом 1' })) {
+        Test-BRAVOCondition `
+            -Condition ($null -eq $boundaryError -and $null -ne $boundaryResult -and
+                $boundaryResult.SectionCount -gt 0 -and @($boundaryResult.Problems[$boundaryCheck.Category]).Count -eq 0) `
+            -Name $boundaryCheck.Name `
+            -Failure ($boundaryCheck.Failure + '. Помилка: [' + [string]$boundaryError + ']; знайдено: ' + (& $boundaryReport $boundaryResult $boundaryCheck.Category))
+    }
+
+    # --- IsMeaningful: зламаний і чистий синтетичні варіанти ----------------
+    $boundaryFixtureError = $null
+    $boundaryDirty = $null
+    $boundaryClean = $null
+    try {
+        # Рядки меж складаються форматом, а не лежать дослівно: інакше
+        # guard-и, що читають сирий текст цього файлу, бачили б їх як справжні.
+        $boundaryOpen = "if (Enter-BRAVOSelfTestSection -Name '{0}'{1}) {{ try {{"
+        $boundaryClose = "}} catch {{ Register-BRAVOSelfTestSectionFault -ErrorRecord `$_ }} finally {{ Complete-BRAVOSelfTestSection -Name '{0}' }} }}"
+        $boundaryGate = "if (Test-BRAVOSelfTestSuiteEnabled -Name 'Alpha') {`n    Enter-BRAVOSelfTestSuite -Name 'Alpha'`n    " +
+            ($boundaryOpen -f 'Suite/Alpha', '') + "`n    . (Join-Path `$root 'x.ps1')`n    " + ($boundaryClose -f 'Suite/Alpha') + "`n}"
+        $boundarySkeleton = "try {{`ntry {{`n{0}`n}} catch {{ Register-BRAVOSelfTestGlobalFatal -ErrorRecord `$_ }}`n{1}`n" +
+            "Invoke-BRAVOSelfTestFinalCleanup`nComplete-BRAVOSelfTestReport`n}} catch {{ Complete-BRAVOSelfTestAbnormalExit -ErrorRecord `$_ }} " +
+            "finally {{ if (-not `$script:BRAVOSelfTestReportIssued -and -not `$script:BRAVOSelfTestAbnormalExitStarted) {{ Complete-BRAVOSelfTestAbnormalExit -ErrorRecord `$null }} }}"
+        $boundaryCleanRoot = $boundarySkeleton -f (
+            ($boundaryOpen -f 'Root/A', '') + "`n`$a = 1`n" + ($boundaryClose -f 'Root/A') + "`n" +
+            $boundaryGate + "`nEnter-BRAVOSelfTestSuite -Name 'Root (inline)'`n" +
+            ($boundaryOpen -f 'Root/B', " -DependsOn 'Root/A'") + "`nforeach (`$i in 1) { break }`n" + ($boundaryClose -f 'Root/B')),
+            (($boundaryOpen -f 'Tail/C', '') + "`n`$c = 1`n" + ($boundaryClose -f 'Tail/C'))
+        $boundaryCleanFragment = ($boundaryOpen -f 'Alpha/X', '') + "`n& { return }`n" + ($boundaryClose -f 'Alpha/X') + "`nfunction F { exit 1 }"
+        # Зламаний: оператор поза секцією, неканонічний catch, повтор імені,
+        # залежність від пізнішої секції і від іншого gated suite, заборонена
+        # GlobalFatal, break і return на рівні файлу, голий хвіст без каркаса.
+        $boundaryDirtyRoot = ($boundarySkeleton -f (
+                ($boundaryOpen -f 'Root/A', " -DependsOn 'Root/B'") + "`n`$a = 1`n} catch { } finally { Complete-BRAVOSelfTestSection -Name 'Root/A' } }`n" +
+                "`$outside = 1`n" + $boundaryGate + "`n" +
+                ($boundaryOpen -f 'Root/B', " -DependsOn 'Alpha/X' -Policy GlobalFatal") + "`nbreak`n" + ($boundaryClose -f 'Root/B') + "`n" +
+                ($boundaryOpen -f 'Root/B', '') + "`n`$b = 2`n" + ($boundaryClose -f 'Root/B')),
+            "`$tailOutside = 1").Replace('catch { Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $_ }', 'catch { }')
+        $boundaryDirtyFragment = ($boundaryOpen -f 'Alpha/X', '') + "`n`$x = 1`n" + ($boundaryClose -f 'Alpha/X') + "`nreturn"
+        $boundaryDirty = & $boundaryAnalyze -RootAst (& $boundaryParse $boundaryDirtyRoot) `
+            -FragmentAst @{ Alpha = (& $boundaryParse $boundaryDirtyFragment) } -GlobalFatalAllowList $boundaryAllowList
+        $boundaryClean = & $boundaryAnalyze -RootAst (& $boundaryParse $boundaryCleanRoot) `
+            -FragmentAst @{ Alpha = (& $boundaryParse $boundaryCleanFragment) } -GlobalFatalAllowList $boundaryAllowList
+    } catch {
+        $boundaryFixtureError = $_.Exception.Message
+    }
+    $boundaryDirtyWellFormed = if ($null -ne $boundaryDirty) { [string]::Join('; ', @($boundaryDirty.Problems.WellFormed)) } else { '' }
+    $boundaryCleanTotal = if ($null -ne $boundaryClean) {
+        @($boundaryClean.Problems.Values | ForEach-Object { @($_) }).Count
+    } else { -1 }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $boundaryFixtureError -and $null -ne $boundaryDirty -and
+            $boundaryDirtyWellFormed.Contains('catch межі') -and
+            $boundaryDirtyWellFormed.Contains('Root/B повторюється') -and
+            $boundaryDirtyWellFormed.Contains("-DependsOn 'Root/B' виконується не раніше залежної") -and
+            $boundaryDirtyWellFormed.Contains("-DependsOn 'Alpha/X' належить gated suite Alpha") -and
+            $boundaryDirtyWellFormed.Contains('-Policy GlobalFatal') -and
+            @($boundaryDirty.Problems.Coverage).Count -gt 0 -and
+            @($boundaryDirty.Problems.Jumps | Where-Object { $_ -like '*: break' }).Count -eq 1 -and
+            @($boundaryDirty.Problems.Jumps | Where-Object { $_ -like '*: return' }).Count -eq 1 -and
+            @($boundaryDirty.Problems.Skeleton).Count -gt 0 -and
+            $boundaryCleanTotal -eq 0
+        ) `
+        -Name 'Framework/SectionBoundaryGuardsAreMeaningful' `
+        -Failure ("guard-и меж мусять знаходити кожен клас синтетичного порушення і нуль у чистому варіанті. Помилка: [" +
+            [string]$boundaryFixtureError + "]; WellFormed: [" + $boundaryDirtyWellFormed + "]; Coverage: [" + (& $boundaryReport $boundaryDirty 'Coverage') +
+            "]; Jumps: [" + (& $boundaryReport $boundaryDirty 'Jumps') + "]; Skeleton: [" + (& $boundaryReport $boundaryDirty 'Skeleton') +
+            "]; у чистому варіанті: $boundaryCleanTotal (" + $(if ($null -ne $boundaryClean) {
+                    [string]::Join('; ', @($boundaryClean.Problems.Values | ForEach-Object { @($_) })) } else { 'н/д' }) + ')')
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries' } }
 
 # P0 fail-fast/telemetry: увесь попередній inline reporting/exit-хвіст
 # (exit-code formula, operator summary, SELF-TEST PASSED/FAILED, Complete-
 # BRAVOHelperLog/Wait-BRAVOManualExit) екстрагований 1:1 у
 # Complete-BRAVOSelfTestReport (визначена вище, перед головним try) —
 # та сама функція, що й Phase-0-FAIL short-circuit вище викликає.
+# #219 (частина B): перед звітом — ідемпотентне гарантоване прибирання
+# (owned runtime modules, config root) навіть якщо його секції хвоста було
+# перервано чи пропущено.
+Invoke-BRAVOSelfTestFinalCleanup
 Complete-BRAVOSelfTestReport
+} catch {
+    Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $_
+} finally {
+    # Штатний шлях завершується exit усередині Complete-BRAVOHelperLog
+    # (ReportIssued уже $true). Сюди без звіту потрапляє лише прогін,
+    # що вийшов із тіла в обхід catch — він теж не може дати код 0.
+    if (-not $script:BRAVOSelfTestReportIssued -and -not $script:BRAVOSelfTestAbnormalExitStarted) {
+        Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $null
+    }
+}

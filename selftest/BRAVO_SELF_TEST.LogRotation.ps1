@@ -75,6 +75,7 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_LOG_ROTATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
     try {
+        if (Enter-BRAVOSelfTestSection -Name 'LogRotation/01-BravoIniPathOnX64') { try {
         [void][IO.Directory]::CreateDirectory($rotationTestRoot)
         $rotationLogMessages = New-Object System.Collections.Generic.List[string]
         $rotationLogger = {
@@ -338,6 +339,8 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             ) `
             -Name "RangeId/06-MissingSystemFileProducesWarning" `
             -Failure "відсутній authoritative системний range_id_log.json має давати WARNING з фактичним шляхом без пошуку копій"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'LogRotation/01-BravoIniPathOnX64' } }
+        if (Enter-BRAVOSelfTestSection -Name 'LogRotation/03-NoFallbackToBravoExeDirectory' -DependsOn 'LogRotation/01-BravoIniPathOnX64') { try {
 
         # StrictMode 2.0: JSON із перевищеним порогом, але без верхньорівневого
         # `time`, не має обривати Test-RangeIdUsage винятком (обрив нічного
@@ -941,6 +944,8 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             ) `
             -Name "LogRotation/17-EmptyApplicationLogSkipped" `
             -Failure "порожній application log лишається в джерелі, не отримує номера й не є помилкою"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'LogRotation/03-NoFallbackToBravoExeDirectory' } }
+        if (Enter-BRAVOSelfTestSection -Name 'LogRotation/18-NoOverwriteOfExistingLog' -DependsOn 'Root/Health', 'LogRotation/01-BravoIniPathOnX64') { try {
 
         # --- Test 18: жодного перезапису наявного журналу ---
         $test18Source = Join-Path $rotationTestRoot "test18\src"
@@ -1529,6 +1534,7 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             ) `
             -Name "LogRotation/27-ServiceRestorationIsIndependentOfRotation" `
             -Failure "ротація має виконуватись усередині try, а відновлення служб — у finally за збереженим початковим станом: помилка ротації не може залишити служби зупиненими"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'LogRotation/18-NoOverwriteOfExistingLog' } }
     } finally {
         if (Test-Path -LiteralPath $rotationTestRoot) {
             Remove-Item -LiteralPath $rotationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
