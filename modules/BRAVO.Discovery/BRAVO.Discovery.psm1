@@ -1381,15 +1381,38 @@ function Test-BRAVODiscoveryResult {
     }
 
     foreach ($componentName in $DestinationPaths.Keys) {
+        # #282: вимкнений (або не встановлений на сервері) компонент не має
+        # каталогу призначення, тому його й не перевіряємо.
+        if ($sourceFieldsByComponent.Contains($componentName) -and
+            (-not $EnabledComponents.Contains($componentName) -or
+                -not [bool]$EnabledComponents[$componentName])) {
+            continue
+        }
         $destinationValue = [string]$DestinationPaths[$componentName]
         if ([string]::IsNullOrWhiteSpace($destinationValue)) {
             continue
         }
         if (-not (Test-Path -LiteralPath $destinationValue -PathType Container)) {
+            # #282: перевірка нічого не створює (контракт -ValidateOnly).
+            # Каталог створить перший справжній прогін; тут достатньо, щоб
+            # існував найближчий батьківський каталог (диск або корінь).
+            $existingAncestor = $null
             try {
-                [void](New-Item -ItemType Directory -Path $destinationValue -Force -ErrorAction Stop)
+                $ancestorCandidate = Split-Path -Path $destinationValue -Parent
+                while (-not [string]::IsNullOrWhiteSpace($ancestorCandidate)) {
+                    if (Test-Path -LiteralPath $ancestorCandidate -PathType Container) {
+                        $existingAncestor = $ancestorCandidate
+                        break
+                    }
+                    $nextCandidate = Split-Path -Path $ancestorCandidate -Parent
+                    if ([string]::Equals($nextCandidate, $ancestorCandidate, [StringComparison]::OrdinalIgnoreCase)) { break }
+                    $ancestorCandidate = $nextCandidate
+                }
             } catch {
-                $errors.Add("Каталог призначення '$componentName' не існує і не вдалося створити: $destinationValue ($($_.Exception.Message))")
+                $existingAncestor = $null
+            }
+            if ($null -eq $existingAncestor) {
+                $errors.Add("Каталог призначення '$componentName' не існує, і жоден його батьківський каталог недоступний: $destinationValue")
                 continue
             }
         }
@@ -1587,6 +1610,123 @@ function Test-BRAVODiscoveryComponentDrift {
     # Той самий контракт повернення, що й у Test-BRAVODiscoveryResult:
     # звичайний масив, викликач обгортає @(...) сам.
     return $findings.ToArray()
+}
+
+# Компоненти, без яких інсталяція не є легітимною: їхня відсутність на
+# сервері — завжди помилка, навіть без baseline, а не «не встановлено».
+$script:BRAVOBackupMandatoryComponents = @('MODEL')
+
+function Resolve-BRAVOBackupComponentScope {
+    # Склад backup set за наявністю компонентів на сервері (рішення
+    # власника 2026-10-01, designs/backup-scope-by-environment.md).
+    #
+    # Прапорець компонента в componentSettings означає «копіювати, ЯКЩО
+    # компонент є на сервері». Фактичний склад визначають presence-контракт
+    # discovery і підтверджений baseline. Матриця дрейфу лишається
+    # канонічною в Test-BRAVODiscoveryComponentDrift — тут вона лише
+    # перекладається в рішення «копіювати / пропустити / зупинити»:
+    #
+    #   вимкнено в конфігурації             -> DisabledByConfig (Info)
+    #   Present                             -> Planned
+    #   Absent  + у baseline немає          -> NotInstalled     (Info, пропуск без помилки)
+    #   Absent  + у baseline є              -> Missing          (Error, як і раніше)
+    #   Absent  обов'язкового компонента    -> Missing          (Error, навіть без baseline)
+    #   Ambiguous / Error                   -> Unknown          (Error, як і раніше)
+    #
+    # Інваріант #158 не послаблено: раніше підтверджений компонент не має
+    # права тихо зникнути, а «не вдалося визначити» не дорівнює «немає».
+    # Послаблено лише одне: увімкнений за замовчуванням компонент, якого на
+    # цьому сервері ніколи не було, більше не валить нічний прогін.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$DiscoveryResult,
+        [object]$Baseline,
+        [string]$BaselineSourceKind = 'None',
+        [hashtable]$EnabledComponents = @{}
+    )
+
+    $driftFindings = @(Test-BRAVODiscoveryComponentDrift `
+        -DiscoveryResult $DiscoveryResult `
+        -Baseline $Baseline `
+        -BaselineSourceKind $BaselineSourceKind `
+        -EnabledComponents $EnabledComponents)
+
+    $findings = New-Object System.Collections.Generic.List[object]
+    foreach ($finding in $driftFindings) {
+        if ([string]$finding.Component -eq 'BASELINE') {
+            $findings.Add($finding)
+        }
+    }
+
+    $scopes = [ordered]@{}
+    $planned = New-Object System.Collections.Generic.List[string]
+    $notInstalled = New-Object System.Collections.Generic.List[string]
+    $effectiveEnabled = @{}
+    $confirmHint = "Якщо зміна легітимна — підтвердіть новий baseline: $script:BRAVODiscoveryConfirmBaselineCommand"
+
+    foreach ($componentName in $script:BRAVODiscoveryComponentSourceFields.Keys) {
+        $componentFinding = @($driftFindings | Where-Object {
+            [string]$_.Component -eq $componentName
+        } | Select-Object -First 1)
+        $isEnabled = ($EnabledComponents.Contains($componentName) -and
+            [bool]$EnabledComponents[$componentName])
+
+        $scope = 'Planned'
+        if (-not $isEnabled) {
+            $scope = 'DisabledByConfig'
+        } elseif ($componentFinding.Count -gt 0) {
+            $finding = $componentFinding[0]
+            if ([string]$finding.Severity -eq 'Error') {
+                $scope = $(if ([string]$finding.Presence -eq 'Absent') { 'Missing' } else { 'Unknown' })
+            } elseif ([string]$finding.Presence -eq 'Absent') {
+                $scope = 'NotInstalled'
+            }
+        }
+
+        if ($scope -eq 'NotInstalled' -and $script:BRAVOBackupMandatoryComponents -contains $componentName) {
+            $scope = 'Missing'
+            $entry = $DiscoveryResult.Components[$componentName]
+            $reason = $(if ($null -ne $entry) { [string]$entry.Reason } else { 'запису presence для компонента немає' })
+            $findings.Add((New-BRAVODiscoveryDriftFinding `
+                -Component $componentName -Severity 'Error' -Presence 'Absent' `
+                -Message ("Обов'язковий компонент '$componentName' увімкнено, але на сервері його не знайдено " +
+                    "($reason). Без нього інсталяція не є легітимною, тому це помилка, а не 'не встановлено'. " +
+                    "Перевірте discovery (bravo.ini / discoverySettings.Sources.$componentName). $confirmHint")))
+        } elseif ($scope -eq 'NotInstalled') {
+            $findings.Add((New-BRAVODiscoveryDriftFinding `
+                -Component $componentName -Severity 'Info' -Presence 'Absent' `
+                -Message ("Компонент '$componentName' на цьому сервері не встановлено: пропущено без помилки, " +
+                    "каталоги для нього не створюються.")))
+        } elseif ($componentFinding.Count -gt 0) {
+            $findings.Add($componentFinding[0])
+        }
+
+        $scopes[$componentName] = $scope
+        if ($scope -eq 'Planned') { $planned.Add($componentName) }
+        if ($scope -eq 'NotInstalled') { $notInstalled.Add($componentName) }
+        $effectiveEnabled[$componentName] = ($isEnabled -and $scope -ne 'NotInstalled')
+    }
+
+    # Порожній склад: усе, що увімкнено, на сервері не встановлено. «Успіх
+    # без жодного архіву» гірший за керовану помилку.
+    $anyEnabled = @($EnabledComponents.Keys | Where-Object { [bool]$EnabledComponents[$_] }).Count -gt 0
+    $hasError = @($findings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -gt 0
+    $emptyComposition = ($anyEnabled -and $planned.Count -eq 0 -and -not $hasError)
+    if ($emptyComposition) {
+        $findings.Add((New-BRAVODiscoveryDriftFinding `
+            -Component 'BASELINE' -Severity 'Error' -Presence 'Absent' `
+            -Message ("Жоден увімкнений компонент не встановлено на цьому сервері (" +
+                ($notInstalled.ToArray() -join ', ') + '). Резервної копії не буде, прогін зупинено.')))
+    }
+
+    return [pscustomobject]@{
+        Components = $scopes
+        Planned = $planned.ToArray()
+        NotInstalled = $notInstalled.ToArray()
+        EffectiveEnabledComponents = $effectiveEnabled
+        EmptyComposition = $emptyComposition
+        Findings = $findings.ToArray()
+    }
 }
 
 function Get-BRAVODiscoveryBaselinePath {
@@ -1839,7 +1979,112 @@ function Save-BRAVODiscoveryBaseline {
     Write-BRAVODiscoveryBaselineTextAtomic -Path $BaselinePath -Text $json
 }
 
+function Get-BRAVOBackupNotInstalledComponents {
+    # Read-only варіант складу backup set для споживачів, які лише
+    # звітують (Health, Dry Run): baseline читається з -ReadOnly, нічого
+    # не записується. Будь-яка невизначеність дає порожній список, тобто
+    # споживач очікує всі увімкнені компоненти, як і до цієї зміни: зайва
+    # тривога краща за пропущену. Зокрема непридатний baseline не дає
+    # записати раніше підтверджений компонент у «не встановлені».
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$DiscoveryResult,
+        [hashtable]$EnabledComponents = @{},
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot
+    )
+
+    try {
+        $baselineImport = Import-BRAVODiscoveryBaseline `
+            -StateRoot $StateRoot `
+            -RuntimeRoot $RuntimeRoot `
+            -ReadOnly
+        if ([string]$baselineImport.Source -eq 'Unreadable') {
+            return [pscustomobject]@{ NotInstalled = @(); Error = $null }
+        }
+        $scope = Resolve-BRAVOBackupComponentScope `
+            -DiscoveryResult $DiscoveryResult `
+            -Baseline $baselineImport.Baseline `
+            -BaselineSourceKind ([string]$baselineImport.Source) `
+            -EnabledComponents $EnabledComponents
+        return [pscustomobject]@{ NotInstalled = @($scope.NotInstalled); Error = $null }
+    } catch {
+        return [pscustomobject]@{ NotInstalled = @(); Error = $_.Exception.Message }
+    }
+}
+
+function Update-BRAVODiscoveryBaselineFromScope {
+    # Автоматичне створення й доповнення baseline після COMPLETE generation
+    # (рішення власника 2026-10-01, designs/backup-scope-by-environment.md).
+    #
+    #   baseline немає (None)          -> створюється з поточного discovery
+    #                                     (Save-BRAVODiscoveryBaseline);
+    #   Canonical / MigratedFromLegacy -> дописуються ЛИШЕ порожні поля
+    #                                     компонентів зі станом Planned;
+    #   Unreadable                     -> нічого не пишеться (fail-closed:
+    #                                     пошкоджений baseline лишається
+    #                                     видимою проблемою, а не
+    #                                     перезаписується «першим запуском»).
+    #
+    # Наявні значення baseline ніколи не змінюються й не видаляються: зняти
+    # компонент із захисту може лише оператор через
+    # -ConfirmDiscoveryBaseline. Тому автоматичне доповнення лише розширює
+    # захист від тихого зникнення і ніколи його не послаблює.
+    #
+    # Baseline читається заново тут, а не береться з початку прогону: між
+    # ними могли минути години, і оператор міг підтвердити новий baseline.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$DiscoveryResult,
+        [Parameter(Mandatory = $true)][object]$ScopeResult,
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot
+    )
+
+    $import = Import-BRAVODiscoveryBaseline -StateRoot $StateRoot -RuntimeRoot $RuntimeRoot
+    $baselinePath = Get-BRAVODiscoveryBaselinePath -StateRoot $StateRoot
+    $plannedComponents = @($ScopeResult.Planned)
+
+    if ([string]$import.Source -eq 'None') {
+        if ($plannedComponents.Count -eq 0) {
+            return [pscustomobject]@{ Action = 'Skipped'; AddedComponents = @(); Path = $baselinePath }
+        }
+        Save-BRAVODiscoveryBaseline -DiscoveryResult $DiscoveryResult -BaselinePath $baselinePath
+        return [pscustomobject]@{ Action = 'Created'; AddedComponents = $plannedComponents; Path = $baselinePath }
+    }
+
+    if (@('Canonical', 'MigratedFromLegacy') -notcontains [string]$import.Source -or
+        $null -eq $import.Baseline) {
+        return [pscustomobject]@{ Action = 'Skipped'; AddedComponents = @(); Path = $baselinePath }
+    }
+
+    $snapshot = [ordered]@{}
+    foreach ($property in $import.Baseline.PSObject.Properties) {
+        $snapshot[$property.Name] = $property.Value
+    }
+    $added = New-Object System.Collections.Generic.List[string]
+    foreach ($componentName in $plannedComponents) {
+        if (-not $script:BRAVODiscoveryComponentSourceFields.Contains($componentName)) { continue }
+        $fieldName = [string]$script:BRAVODiscoveryComponentSourceFields[$componentName]
+        $currentValue = [string]$DiscoveryResult.$fieldName
+        if ([string]::IsNullOrWhiteSpace($currentValue)) { continue }
+        $baselineValue = $(if ($snapshot.Contains($fieldName)) { [string]$snapshot[$fieldName] } else { '' })
+        if (-not [string]::IsNullOrWhiteSpace($baselineValue)) { continue }
+        $snapshot[$fieldName] = $currentValue
+        $added.Add($componentName)
+    }
+
+    if ($added.Count -eq 0) {
+        return [pscustomobject]@{ Action = 'Unchanged'; AddedComponents = @(); Path = $baselinePath }
+    }
+
+    $snapshot['UpdatedAt'] = (Get-Date).ToString('o')
+    Write-BRAVODiscoveryBaselineTextAtomic -Path $baselinePath -Text ([pscustomobject]$snapshot | ConvertTo-Json)
+    return [pscustomobject]@{ Action = 'Extended'; AddedComponents = $added.ToArray(); Path = $baselinePath }
+}
+
 function Compare-BRAVODiscoveryBaseline {
+
     # Повертає масив рядків-попереджень про дрейф джерел відносно
     # останнього збереженого baseline (порожній масив == дрейфу немає або
     # baseline ще не існує — перший запуск не є дрейфом). -Baseline
@@ -2216,6 +2461,9 @@ Export-ModuleMember -Function @(
     'Get-BRAVOEffectiveSynchronizationConfiguration',
     'Test-BRAVODiscoveryResult',
     'Test-BRAVODiscoveryComponentDrift',
+    'Resolve-BRAVOBackupComponentScope',
+    'Get-BRAVOBackupNotInstalledComponents',
+    'Update-BRAVODiscoveryBaselineFromScope',
     'Write-BRAVODiscoveryPresenceReport',
     'Save-BRAVODiscoveryBaseline',
     'Compare-BRAVODiscoveryBaseline',

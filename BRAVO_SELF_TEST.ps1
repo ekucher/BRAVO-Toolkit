@@ -315,7 +315,7 @@ $script:environmentLimitations = New-Object System.Collections.ArrayList
 # 188.6 с із 477.5 с sum-of-suites. Вибірковий прогін не може бути швидшим
 # за цю частину, і обіцяти більше було б неправдою.
 $script:BRAVOSelfTestSuiteCatalog = @(
-    'Archive', 'ArchiveDiskSpace', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
+    'Archive', 'ArchiveDiskSpace', 'BackupScope', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
     'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
     'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
     'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
@@ -15673,15 +15673,15 @@ try {
         $derivationTextForDrift = Get-Content -LiteralPath (Join-Path $root "modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1") -Raw -Encoding UTF8
         Test-BRAVOCondition `
             -Condition (
-                $setupTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
-                $archiveRuntimeTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
+                $setupTextForDrift.Contains('Resolve-BRAVOBackupComponentScope') -and
+                $archiveRuntimeTextForDrift.Contains('Resolve-BRAVOBackupComponentScope') -and
                 $archiveRuntimeTextForDrift.Contains('-not $discoveryBaselineValid') -and
                 $derivationTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $setupTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $archiveRuntimeTextForDrift.Contains('-EnabledComponents $discoveryEnabledComponents')
             ) `
             -Name "Presence/DriftGateIsWiredIntoArchiveRuntimeAndSetup" `
-            -Failure "Test-BRAVODiscoveryComponentDrift має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
+            -Failure "Рішення про дрейф (Test-BRAVODiscoveryComponentDrift через канонічний Resolve-BRAVOBackupComponentScope) має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
 
         # 06: explicit override має АБСОЛЮТНИЙ пріоритет над Apache
         # discovery, навіть коли Apache-служба ОДНОЗНАЧНА і її DocumentRoot
@@ -24021,6 +24021,14 @@ function Write-BRAVOLog {
         if (Enter-BRAVOSelfTestSection -Name 'Suite/Archive') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Archive.ps1')
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Archive' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    # BackupScope: бекап лише наявних компонентів (рішення власника 2026-10-01).
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'BackupScope') {
+        Enter-BRAVOSelfTestSuite -Name 'BackupScope'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/BackupScope') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BackupScope.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BackupScope' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'SftpCredentialsRequired') {

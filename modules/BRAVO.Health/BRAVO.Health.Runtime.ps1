@@ -389,7 +389,9 @@ function Complete-BRAVOHealthResult {
             # повертає $null замість кидати виняток під Set-StrictMode.
             $archiveDefinitionsVariable = Get-Variable -Name archiveDefinitions -Scope Global -ErrorAction SilentlyContinue
             if ($null -ne $archiveDefinitionsVariable -and $script:healthLatestArchives.Count -gt 0) {
-                $enabledArchiveDefinitionsForSummary = @($archiveDefinitionsVariable.Value | Where-Object { $_.Enabled })
+                $enabledArchiveDefinitionsForSummary = @($archiveDefinitionsVariable.Value | Where-Object {
+                    $_.Enabled -and @($script:healthNotInstalledComponents) -notcontains [string]$_.Type
+                })
                 if ($enabledArchiveDefinitionsForSummary.Count -gt 0) {
                     Write-BRAVOResultSection -Title 'Резервні копії'
                     foreach ($definition in $enabledArchiveDefinitionsForSummary) {
@@ -478,6 +480,11 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $healthCheckStarted = Get-Date
 $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime()
 $script:healthLatestArchives = @{}
+# Компоненти, увімкнені в конфігурації, але не встановлені на цьому
+# сервері (Resolve-BRAVOBackupComponentScope). Health їх не очікує й не
+# тривожить через них. Ініціалізується тут, до будь-якого раннього виходу,
+# бо підсумок результату читає її під Set-StrictMode.
+$script:healthNotInstalledComponents = @()
 
 # P0 Configuration Foundation: BRAVO.config став опційним основним
 # override-шаром — попередня жорстка "файл мусить існувати" перевірка
@@ -540,17 +547,38 @@ function Test-BRAVOSettingEnabled {
     return ([string]$Value).Trim() -match '^(?i:true|1|yes|on)$'
 }
 
-$bazaAppLocalHealthEnabled = Test-BRAVOSettingEnabled `
-    -Value $componentSettings.Synchronization.BAZA_APP_LOCAL
+function Get-BRAVOHealthExpectedArchiveDefinitions {
+    # Архіви, які Health очікує: увімкнені в конфігурації й встановлені на
+    # цьому сервері. Єдине місце цього фільтра для всіх перевірок Health.
+    return @($archiveDefinitions | Where-Object {
+        [bool]$_.Enabled -and @($script:healthNotInstalledComponents) -notcontains [string]$_.Type
+    })
+}
+
+# Той самий канонічний склад, що й у BRAVO_ARCHIV, у read-only варіанті:
+# Health лише читає baseline. Невизначеність = очікуємо всі увімкнені.
+# Журнал Health тут ще не ініціалізовано: причини записуються пізніше.
+$healthComponentScope = Get-BRAVOBackupNotInstalledComponents `
+    -DiscoveryResult $bravoDiscoveryResult `
+    -EnabledComponents $discoveryEnabledComponents `
+    -StateRoot $stateRoot `
+    -RuntimeRoot $runtimeRoot
+$script:healthComponentScopeError = [string]$healthComponentScope.Error
+$script:healthNotInstalledComponents = @($healthComponentScope.NotInstalled)
+$bazaAppHealthInstalled = @($script:healthNotInstalledComponents) -notcontains 'BAZA_APP'
+$bazaWWWHealthInstalled = @($script:healthNotInstalledComponents) -notcontains 'BAZA_WWW'
+
+$bazaAppLocalHealthEnabled = (Test-BRAVOSettingEnabled `
+    -Value $componentSettings.Synchronization.BAZA_APP_LOCAL) -and $bazaAppHealthInstalled
 # SFTP-напрямки BAZA (5.2.2): через canonical $bazaSyncEffective.Components
 # (Get-BRAVOEffectiveSynchronizationConfiguration), той самий вираз, що і
 # в Archive/Дry Run — componentSettings.SFTP.Enabled уже "запечений" в
 # SftpEnabled, Health не дублює AND самостійно. LOCAL-напрямки від
 # глобального SFTP-вимикача не залежать і лишаються прямим читанням.
-$bazaAppSFTPHealthEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_APP' } | Select-Object -First 1 -ExpandProperty SftpEnabled)
-$bazaWWWSFTPHealthEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_WWW' } | Select-Object -First 1 -ExpandProperty SftpEnabled)
-$bazaWWWLocalHealthEnabled = Test-BRAVOSettingEnabled `
-    -Value $componentSettings.Synchronization.BAZA_WWW_LOCAL
+$bazaAppSFTPHealthEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_APP' } | Select-Object -First 1 -ExpandProperty SftpEnabled) -and $bazaAppHealthInstalled
+$bazaWWWSFTPHealthEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_WWW' } | Select-Object -First 1 -ExpandProperty SftpEnabled) -and $bazaWWWHealthInstalled
+$bazaWWWLocalHealthEnabled = (Test-BRAVOSettingEnabled `
+    -Value $componentSettings.Synchronization.BAZA_WWW_LOCAL) -and $bazaWWWHealthInstalled
 
 $healthLogTimestamp = $healthCheckStarted.ToString($logFileDateFormat)
 $healthLogName = $backupMonitoring.LogFileNameTemplate -f $healthLogTimestamp
@@ -1178,7 +1206,7 @@ function Get-LocalBackupState {
 
 function Get-BackupHealthIssues {
     $issues = @()
-    $enabledArchiveDefinitions = @($archiveDefinitions | Where-Object { $_.Enabled })
+    $enabledArchiveDefinitions = @(Get-BRAVOHealthExpectedArchiveDefinitions)
     $maximumAge = [timespan]::FromHours([double]$backupMonitoring.MaxBackupAgeHours)
 
     if ($enabledArchiveDefinitions.Count -eq 0) {
@@ -1802,7 +1830,7 @@ function Test-SFTPHealthConfiguration {
         if ([double]$backupMonitoring.SFTP.RemoteBackupMaxAgeHours -le 0) {
             $errors += "максимальний вік віддаленого бекапу повинен бути більшим за 0"
         }
-        foreach ($archiveDefinition in @($archiveDefinitions | Where-Object { $_.Enabled })) {
+        foreach ($archiveDefinition in @(Get-BRAVOHealthExpectedArchiveDefinitions)) {
             if (-not $sftpDirectories.ContainsKey($archiveDefinition.Type) -or
                 [string]::IsNullOrWhiteSpace($sftpDirectories[$archiveDefinition.Type])) {
                 $errors += "не встановлено SFTP каталог для $($archiveDefinition.Type)"
@@ -3123,7 +3151,7 @@ function Get-SFTPHealthIssues {
     if ($checkArchives) {
         $archiveChecks = @()
         $healthTemporaryRoot = Get-BRAVOHealthTemporaryRoot
-        foreach ($archiveDefinition in @($archiveDefinitions | Where-Object { $_.Enabled })) {
+        foreach ($archiveDefinition in @(Get-BRAVOHealthExpectedArchiveDefinitions)) {
             $generationArchive = $script:healthLatestArchives[[string]$archiveDefinition.Type]
             if ($null -eq $generationArchive -or
                 -not (Test-Path -LiteralPath ([string]$generationArchive.FullName) -PathType Leaf)) {
@@ -3460,7 +3488,7 @@ function Test-SMBHealthConfiguration {
         $errors += "максимальний вік NAS/SMB-копії повинен бути більшим за 0"
     }
 
-    foreach ($archiveDefinition in @($archiveDefinitions | Where-Object { $_.Enabled })) {
+    foreach ($archiveDefinition in @(Get-BRAVOHealthExpectedArchiveDefinitions)) {
         if ($null -eq $smbSettings.Directories -or
             -not $smbSettings.Directories.ContainsKey($archiveDefinition.Type) -or
             [string]::IsNullOrWhiteSpace([string]$smbSettings.Directories[$archiveDefinition.Type])) {
@@ -3527,7 +3555,7 @@ function Get-SMBHealthIssues {
     $drive = $null
     try {
         $drive = New-BRAVOSMBHealthDrive
-        foreach ($archiveDefinition in @($archiveDefinitions | Where-Object { $_.Enabled })) {
+        foreach ($archiveDefinition in @(Get-BRAVOHealthExpectedArchiveDefinitions)) {
             $generationArchive = $script:healthLatestArchives[[string]$archiveDefinition.Type]
             if ($null -eq $generationArchive -or
                 -not (Test-Path -LiteralPath ([string]$generationArchive.FullName) -PathType Leaf)) {
@@ -3666,8 +3694,7 @@ function Get-EnabledBackupComponentNames {
         $componentNames += "BAZA_WWW"
     }
     $componentNames += @(
-        $archiveDefinitions |
-            Where-Object { $_.Enabled } |
+        Get-BRAVOHealthExpectedArchiveDefinitions |
             ForEach-Object { $_.Type }
     )
 
@@ -4048,8 +4075,7 @@ function Get-BRAVOHealthConsoleIssueLine {
 
 function Get-BRAVOHealthLatestBackupSummary {
     $archives = @(
-        $archiveDefinitions |
-            Where-Object { $_.Enabled } |
+        Get-BRAVOHealthExpectedArchiveDefinitions |
             ForEach-Object {
                 $archiveInfo = $script:healthLatestArchives[$_.Type]
                 if ($null -ne $archiveInfo -and $null -ne $archiveInfo.LastWriteTime) {
@@ -4379,6 +4405,9 @@ function New-SlackSuccessMessage {
     if ($enabledComponentCount -gt 0) {
         $resultLines.Add("")
         $resultLines.Add("Компоненти: $enabledComponentCount/$enabledComponentCount")
+    }
+    if (@($script:healthNotInstalledComponents).Count -gt 0) {
+        $resultLines.Add(":information_source: Не встановлено на цьому сервері: $(@($script:healthNotInstalledComponents) -join ', ')")
     }
 
     return New-BRAVOOperatorNotificationMessage `
@@ -4901,6 +4930,12 @@ if ($SkipIfBackupTaskRunning) {
 Write-HealthLog "Конфігурація: $ConfigPath"
 Write-HealthLog "Сумісність: Windows $($BRAVOCompatibility.WindowsVersion); PowerShell $($BRAVOCompatibility.PowerShellVersion); WMI=$($BRAVOCompatibility.WmiProvider); JSON=$($BRAVOCompatibility.JsonProvider); завдання=$($BRAVOCompatibility.TaskSchedulerProvider)"
 Write-HealthLog "Каталог резервних копій: $backupRootPath"
+if ($script:healthNotInstalledComponents.Count -gt 0) {
+    Write-HealthLog "Не встановлено на цьому сервері (не перевіряється): $($script:healthNotInstalledComponents -join ', ')"
+}
+if (-not [string]::IsNullOrWhiteSpace([string]$script:healthComponentScopeError)) {
+    Write-HealthLog "Склад компонентів за наявністю не визначено, очікуються всі увімкнені: $($script:healthComponentScopeError)"
+}
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
     Write-HealthLog $BRAVOPowerShellUpdate.Message -Level "WARNING" -Environmental
 }
@@ -5592,7 +5627,7 @@ if ($healthIssues.Count -eq 0) {
         if ($script:BRAVOHealthSmbStepEnabled) { 'smb' }
     )
     $successArchiveIdentities = @(
-        $archiveDefinitions | Where-Object { [bool]$_.Enabled } | ForEach-Object {
+        Get-BRAVOHealthExpectedArchiveDefinitions | ForEach-Object {
             $successArchiveInfo = $script:healthLatestArchives[[string]$_.Type]
             if ($null -ne $successArchiveInfo -and $null -ne $successArchiveInfo.LastWriteTime) {
                 [pscustomobject]@{
