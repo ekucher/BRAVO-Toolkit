@@ -11726,6 +11726,42 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Health/AlertFingerprintIncludesGenerationDiagnosis' `
         -Failure "fingerprint LocalBackupGeneration залежить від Diagnosis (змінена причина не придушується), стабільний за незмінної причини; інші Kind не змінюються: $($fingerprints | ConvertTo-Json -Compress)"
 
+    $staleCatchUp = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        function Write-HealthLog { param($Message, $Level) }
+        $script:mode = 'catchup-newer'
+        $stateRoot = 'x'
+        $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'SELFTEST_MAIN' }; BackupCatchUp = [pscustomobject]@{ Enabled = $true; TaskName = 'SELFTEST_CATCHUP' } }
+        function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+        function Get-BRAVOOperationStatus { param($Path) throw 'self-test: status недоступний' }
+        function Get-BRAVOScheduledTaskState {
+            param($TaskPath, $TaskName)
+            $run = if ($TaskName -eq 'SELFTEST_MAIN') { (Get-Date).AddHours(-30) } else { (Get-Date).AddHours(-1) }
+            $result = if ($TaskName -eq 'SELFTEST_MAIN') { 0 } else { -2147024891 }
+            if ($TaskName -eq 'SELFTEST_CATCHUP' -and $script:mode -eq 'catchup-missing') { throw 'self-test: catch-up недоступне' }
+            if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'catchup-missing') { $run = (Get-Date).AddHours(-3); $result = 20 }
+            if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'main-newer') { $run = (Get-Date).AddMinutes(-20); $result = 20 }
+            return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = $run; LastTaskResult = $result } }
+        }
+        $diag = { Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $null -LatestCompleteUtc $null -NowUtc (Get-Date).ToUniversalTime() -MaxAge ([timespan]::FromHours(24)) }
+        $newer = & $diag
+        $script:mode = 'catchup-missing'
+        $missing = & $diag
+        $script:mode = 'main-newer'
+        $mainNewer = & $diag
+        $nullStage = Get-BRAVOHealthManifestFailedStage -Manifest ([pscustomobject]@{ components = [pscustomobject]@{ MODEL = $null; BLOG = [pscustomobject]@{ ErrorStage = 'CREATE' } } })
+        [pscustomobject]@{ CatchUpNewer = $newer; CatchUpMissing = $missing; MainNewer = $mainNewer; NullStage = $nullStage }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $staleCatchUp.CatchUpNewer -match 'SELFTEST_CATCHUP' -and $staleCatchUp.CatchUpNewer -match '0x80070005' -and
+            $staleCatchUp.CatchUpMissing -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpMissing -match '0x00000014' -and
+            $staleCatchUp.MainNewer -match 'SELFTEST_MAIN' -and $staleCatchUp.MainNewer -match '0x00000014' -and
+            $staleCatchUp.NullStage -eq 'BLOG/CREATE'
+        ) `
+        -Name 'Health/StaleGenerationCatchUpTaskAndNullComponent' `
+        -Failure "діагностика бере новіше з основного/catch-up завдань (відсутнє catch-up → основне), null-компонент manifest пропускається без винятку: $($staleCatchUp | ConvertTo-Json -Compress)"
+
     $staleCorrupt = & $staleReasonModule {
         Set-StrictMode -Version Latest
         $script:corruptLog = New-Object System.Collections.Generic.List[string]

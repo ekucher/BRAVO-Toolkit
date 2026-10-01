@@ -1306,33 +1306,61 @@ function Get-BRAVOHealthBackupStaleDiagnosis {
         [timespan]$MaxAge
     )
 
-    $taskName = 'BRAVO_ARCHIV'
-    $taskInfo = $null
-    try {
-        $taskName = [string]$schedulerSettings.Backup.TaskName
-        $taskState = Get-BRAVOScheduledTaskState -TaskPath ([string]$schedulerSettings.TaskPath) -TaskName $taskName
-        $taskInfo = [pscustomobject]@{
-            Exists = [bool]$taskState.Exists
-            Enabled = ([string]$taskState.State -ne 'Disabled')
+    $readTask = {
+        param([string]$Name)
+        $info = [pscustomobject]@{
+            Exists = $false
+            Enabled = $true
             LastRunTime = $null
             LastTaskResult = $null
         }
-        if ($taskInfo.Exists) {
+        $taskState = Get-BRAVOScheduledTaskState -TaskPath ([string]$schedulerSettings.TaskPath) -TaskName $Name
+        $info.Exists = [bool]$taskState.Exists
+        $info.Enabled = ([string]$taskState.State -ne 'Disabled')
+        if ($info.Exists) {
             try {
                 $runInfo = if ([string]$taskState.Provider -eq 'ScheduledTasks') {
                     Get-ScheduledTaskInfo -InputObject $taskState.Task -ErrorAction Stop
                 } else {
                     $taskState.Task
                 }
-                $taskInfo.LastRunTime = [datetime]$runInfo.LastRunTime
-                $taskInfo.LastTaskResult = [int64]$runInfo.LastTaskResult
+                $info.LastRunTime = [datetime]$runInfo.LastRunTime
+                $info.LastTaskResult = [int64]$runInfo.LastTaskResult
             } catch {
-                Write-HealthLog "Діагностика generation: результат останнього запуску не прочитано: $($_.Exception.Message)" -Level 'WARNING'
+                Write-HealthLog "Діагностика generation: результат останнього запуску $Name не прочитано: $($_.Exception.Message)" -Level 'WARNING'
             }
         }
+        return $info
+    }
+
+    $taskName = 'BRAVO_ARCHIV'
+    $taskInfo = $null
+    try {
+        $taskName = [string]$schedulerSettings.Backup.TaskName
+        $taskInfo = & $readTask $taskName
     } catch {
         $taskInfo = $null
         Write-HealthLog "Діагностика generation: стан завдання не прочитано: $($_.Exception.Message)" -Level 'WARNING'
+    }
+
+    # Catch-up завдання (BackupCatchUp) може тримати останню спробу: класифікуємо
+    # те завдання, чий валідний LastRunTime новіший; відсутнє/нечитабельне — основне.
+    try {
+        $catchUp = $schedulerSettings.BackupCatchUp
+        if ($null -ne $catchUp -and [bool]$catchUp.Enabled -and -not [string]::IsNullOrWhiteSpace([string]$catchUp.TaskName)) {
+            $catchUpInfo = & $readTask ([string]$catchUp.TaskName)
+            $catchUpRun = $catchUpInfo.LastRunTime
+            if ($catchUpInfo.Exists -and $null -ne $catchUpRun -and ([datetime]$catchUpRun).Year -ge 2000) {
+                $mainRun = if ($null -ne $taskInfo) { $taskInfo.LastRunTime } else { $null }
+                if ($null -eq $mainRun -or ([datetime]$mainRun).Year -lt 2000 -or
+                    ([datetime]$catchUpRun).ToUniversalTime() -gt ([datetime]$mainRun).ToUniversalTime()) {
+                    $taskInfo = $catchUpInfo
+                    $taskName = [string]$catchUp.TaskName
+                }
+            }
+        }
+    } catch {
+        Write-HealthLog "Діагностика generation: catch-up завдання не прочитано: $($_.Exception.Message)" -Level 'WARNING'
     }
 
     $archiveStatus = $null
@@ -1376,6 +1404,7 @@ function Get-BRAVOHealthManifestFailedStage {
         return ''
     }
     foreach ($component in @($componentsProperty.Value.PSObject.Properties)) {
+        if ($null -eq $component.Value -or $component.Value -isnot [System.Management.Automation.PSCustomObject]) { continue }
         # Записаний Archive-ом ErrorStage (CREATE/INTEGRITY/HASH/PUBLISH/VSS/…) має
         # пріоритет; прапорці CreateSuccess/… — лише fallback для старіших manifest.
         $errorStageProperty = $component.Value.PSObject.Properties['ErrorStage']
@@ -1466,11 +1495,17 @@ function Get-BackupHealthIssues {
     $incompleteCandidate = $incompleteCandidates | Sort-Object CreatedAtUtc -Descending | Select-Object -First 1
     if ($null -ne $incompleteCandidate) {
         $incompleteManifest = $incompleteCandidate.Manifest
+        $failedStage = ''
+        try {
+            $failedStage = Get-BRAVOHealthManifestFailedStage -Manifest $incompleteManifest
+        } catch {
+            Write-HealthLog "Діагностика generation: етап збою manifest не визначено: $($_.Exception.Message)" -Level 'WARNING'
+        }
         $latestIncomplete = [pscustomobject]@{
             GenerationId = [string]$incompleteManifest.generationId
             Status = [string]$incompleteManifest.status
             CreatedAtUtc = $incompleteCandidate.CreatedAtUtc
-            Stage = Get-BRAVOHealthManifestFailedStage -Manifest $incompleteManifest
+            Stage = $failedStage
         }
     }
     if ($null -eq $generation) {
