@@ -718,7 +718,7 @@ function Write-BRAVOBackupGenerationManifest {
     return (Join-Path $BackupRoot 'self-test-manifest.json')
 }
 function Remove-BRAVOExpiredBackupGenerations {
-    param($BackupRoot, $CurrentGenerationId, $RetentionDays, [ref]$CleanupSectionShown, [ref]$RemovedGenerationCount)
+    param($BackupRoot, $CurrentGenerationId, $RetentionDays, [ref]$CleanupSectionShown, [ref]$RemovedGenerationCount, $ArchiveDefinitions)
     Add-ProbeEvent 'RETENTION-CLEANUP'
     return $true
 }

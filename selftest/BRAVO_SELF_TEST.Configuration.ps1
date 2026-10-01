@@ -1697,10 +1697,24 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     #   operationsReportingSettings.RequestTimeoutSeconds      ALLOW_WITH_VALIDATOR (IntegerRange:1,600)
     # Жоден НАЯВНИЙ лист не змінив класу — саме тому дельта класів нижче
     # рівно +3 ALLOW_SITE і +3 ALLOW_WITH_VALIDATOR, а не перерозподіл.
+    #
+    # 277 -> 279 (#335, проріджування кількох копій за день, рішення
+    # власника 2026-10-01): два НОВІ листи, обидва ALLOW_SITE з явним
+    # записом у реєстрі:
+    #   retentionAllCopiesDays        ALLOW_SITE
+    #   retentionDailyCopySelection   ALLOW_SITE (некоректне значення
+    #                                 рантайм замінює на Latest з WARNING)
+    # 279 -> 284 (#335, схема Д/Т/М/Р, рішення власника 2026-10-01):
+    #   retentionScheme               ALLOW_WITH_VALIDATOR (Enum:Age,Calendar)
+    #   retentionDailyCopies          ALLOW_SITE
+    #   retentionWeeklyCopies         ALLOW_SITE
+    #   retentionMonthlyCopies        ALLOW_SITE
+    #   retentionYearlyCopies         ALLOW_SITE
+    # Назва перевірки лишається історичною, щоб не ламати порівняння звітів.
     Test-BRAVOCondition `
-        -Condition ($authLeaves.Count -eq 277) `
+        -Condition ($authLeaves.Count -eq 284) `
         -Name "Authorization/Exactly277CanonicalLeaves" `
-        -Failure "контракт фіксує рівно 277 канонічних листів (271 Wave 2 + 6 BSYSTEM Operations 5.3.0); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
+        -Failure "контракт фіксує рівно 284 канонічних листи (271 Wave 2 + 6 BSYSTEM Operations 5.3.0 + 7 retention #335); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
 
     # --- Authorization/AllClassesRecognized ---
     $authUnrecognizedClasses = @(@($authRegistry.Values) | ForEach-Object { [string]$_.Class } | Where-Object { $authKnownClasses -notcontains $_ } | Select-Object -Unique)
@@ -1741,15 +1755,18 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     # +3 ALLOW_WITH_VALIDATOR (25->28), TOTAL 271->277. Перелік цих шести
     # листів і клас кожного — у коментарі до Exactly277CanonicalLeaves
     # вище; жоден наявний лист класу не змінив.
+    #
+    # Retention #335: +6 ALLOW_SITE (205->211) і +1 ALLOW_WITH_VALIDATOR
+    # (28->29), TOTAL 277->284.
     Test-BRAVOCondition `
         -Condition (
-            $authAllowSiteCount -eq 205 -and $authAllowValidatorCount -eq 28 -and
+            $authAllowSiteCount -eq 211 -and $authAllowValidatorCount -eq 29 -and
             $authDenyDerivedCount -eq 0 -and $authDenyCredentialCount -eq 0 -and
             $authDenySecurityCount -eq 6 -and $authDenyExecutionCount -eq 21 -and
             $authDenyInternalCount -eq 17
         ) `
         -Name "Authorization/ClassCountsMatchContract" `
-        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW): ALLOW_SITE=$authAllowSiteCount(205) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(28) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
+        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW): ALLOW_SITE=$authAllowSiteCount(211) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(29) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
 
     # --- Authorization/EveryValidatorIdentifierResolves ---
     # Кожен ALLOW_WITH_VALIDATOR-запис мусить посилатись на валідатор,
