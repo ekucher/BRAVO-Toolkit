@@ -793,19 +793,23 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
 # 'Suite/*' знімає знімок резолюції спостережуваних команд, Complete-
 # BRAVOSelfTestSection у finally відновлює її й перевіряє. Спільний
 # механізм для кожного suite — без латок у конкретних фрагментах.
-$script:BRAVOSelfTestWatchedBuiltinCommands = @(
-    'Get-Service', 'Start-Service', 'Stop-Service', 'Restart-Service',
-    'Get-Process', 'Stop-Process', 'Start-Process', 'Wait-Process',
-    'Invoke-WebRequest', 'Invoke-RestMethod', 'Start-Sleep',
-    'Get-CimInstance', 'Get-WmiObject', 'Get-Date', 'Test-Connection',
-    'Test-Path', 'Get-Content', 'Set-Content', 'Add-Content', 'Out-File',
-    'Remove-Item', 'Copy-Item', 'Move-Item', 'New-Item', 'Get-Item',
-    'Get-ChildItem', 'Get-ItemProperty', 'Set-ItemProperty',
-    'Write-Host', 'Write-Output', 'Write-Warning', 'Write-Error',
-    'Join-Path', 'Split-Path', 'Resolve-Path', 'ConvertTo-Json',
-    'ConvertFrom-Json', 'Get-FileHash', 'New-Object', 'Get-Command',
-    'Get-Module', 'Import-Module', 'Remove-Module', 'Send-MailMessage'
-)
+function Get-BRAVOSelfTestWatchedBuiltinCommandNames {
+    # Функція, а не $script:-змінна: ізоляційні проби збирають дочірній скрипт
+    # лише з функцій фреймворку.
+    return @(
+        'Get-Service', 'Start-Service', 'Stop-Service', 'Restart-Service',
+        'Get-Process', 'Stop-Process', 'Start-Process', 'Wait-Process',
+        'Invoke-WebRequest', 'Invoke-RestMethod', 'Start-Sleep',
+        'Get-CimInstance', 'Get-WmiObject', 'Get-Date', 'Test-Connection',
+        'Test-Path', 'Get-Content', 'Set-Content', 'Add-Content', 'Out-File',
+        'Remove-Item', 'Copy-Item', 'Move-Item', 'New-Item', 'Get-Item',
+        'Get-ChildItem', 'Get-ItemProperty', 'Set-ItemProperty',
+        'Write-Host', 'Write-Output', 'Write-Warning', 'Write-Error',
+        'Join-Path', 'Split-Path', 'Resolve-Path', 'ConvertTo-Json',
+        'ConvertFrom-Json', 'Get-FileHash', 'New-Object', 'Get-Command',
+        'Get-Module', 'Import-Module', 'Remove-Module', 'Send-MailMessage'
+    )
+}
 
 function Get-BRAVOSelfTestBuiltinCommandState {
     # Фактична резолюція імені: CommandType + модуль/джерело, а для функції
@@ -836,7 +840,7 @@ function Test-BRAVOSelfTestBuiltinCommandStateEqual {
 
 function New-BRAVOSelfTestSuiteIsolationSnapshot {
     $commandStates = @{}
-    foreach ($watchedName in $script:BRAVOSelfTestWatchedBuiltinCommands) {
+    foreach ($watchedName in @(Get-BRAVOSelfTestWatchedBuiltinCommandNames)) {
         $commandStates[$watchedName] = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
     }
     $functionBaseline = @{}
@@ -866,7 +870,7 @@ function Restore-BRAVOSelfTestSuiteIsolation {
     } catch {
         [void]$residualProblems.Add("прибирання runtime-модулів: $($_.Exception.Message)")
     }
-    foreach ($watchedName in $script:BRAVOSelfTestWatchedBuiltinCommands) {
+    foreach ($watchedName in @(Get-BRAVOSelfTestWatchedBuiltinCommandNames)) {
         $baselineState = $Snapshot.CommandStates[$watchedName]
         $currentState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
         if (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $currentState) { continue }
@@ -1761,7 +1765,8 @@ Save-BRAVOSelfTestFrameworkSnapshot -FunctionName @(
     'Enter-BRAVOSelfTestSection', 'Register-BRAVOSelfTestSectionFault',
     'Complete-BRAVOSelfTestSection', 'Register-BRAVOSelfTestGlobalFatal',
     'Remove-BRAVOSelfTestConfigRoot', 'Invoke-BRAVOSelfTestFinalCleanup',
-    'Get-BRAVOSelfTestBuiltinCommandState', 'Test-BRAVOSelfTestBuiltinCommandStateEqual',
+    'Get-BRAVOSelfTestWatchedBuiltinCommandNames', 'Get-BRAVOSelfTestBuiltinCommandState',
+    'Test-BRAVOSelfTestBuiltinCommandStateEqual',
     'New-BRAVOSelfTestSuiteIsolationSnapshot', 'Restore-BRAVOSelfTestSuiteIsolation',
     'Write-BRAVOSelfTestSectionReport', 'Complete-BRAVOSelfTestAbnormalExit')
 
@@ -27071,7 +27076,6 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/TailAfterBoundaryRuns' -Failur
         $isolationProbeError = $_.Exception.Message
     } finally {
         if ([IO.Directory]::Exists($isolationProbeRoot)) {
-            Copy-Item -LiteralPath $isolationProbeRoot -Destination '/tmp/claude-0/sp/b337/probe' -Recurse -Force
             [IO.Directory]::Delete($isolationProbeRoot, $true)
         }
     }
