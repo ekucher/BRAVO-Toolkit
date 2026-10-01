@@ -1,5 +1,24 @@
 # Changelog
 
+## 5.2.5-rc.2 — 2026-10-01
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.1` (нижче).
+
+- **Fix: на хостах з .NET Framework < 4.6.1 `BRAVO_SETUP -Action Scheduler` зупинявся на
+  dry-run (#319).** `ServiceController.StartType` з'явилась лише в .NET 4.6.1; на Windows
+  PowerShell 5.1 поверх .NET 4.5.x пряме `$service.StartType` під `Set-StrictMode -Version 2.0`
+  кидає `PropertyNotFoundStrict`, тож `BRAVO_DRY_RUN.ps1` завершувався
+  `[FAIL] Dry-run: The property 'StartType' cannot be found` і Setup зупиняв усі етапи
+  (fail-closed). Дефект присутній і в `5.2.4`. Перенесено з `developer` канонічний
+  `Get-BRAVOServiceStartMode` (BRAVO.System): `StartType` читається через
+  `PSObject.Properties`, далі — вже отриманий `Win32_Service.StartMode` або WMI через
+  `Get-BRAVOWmiInstance`; невідомий тип запуску -> `Unknown`, а не виняток. На нього
+  переведено dry-run, Maintenance (Apache і керовані служби), DataRestore і
+  `Set-BRAVOBootRestoreServiceStartType` (невідомий тип запуску службу не змінює; у режимі
+  утримання служб — класифікований збій).
+- **Fix: Health на тих самих хостах завершувався з exit 90 (#295).** `Get-ManagedServiceHealthIssues`
+  читає `StartType` через `PSObject.Properties`, тож WMI-fallback знову виконується.
+
 ## 5.2.5-rc.1 — 2026-10-01
 
 Hotfix від stable `5.2.4` (RELEASE_POLICY §12).

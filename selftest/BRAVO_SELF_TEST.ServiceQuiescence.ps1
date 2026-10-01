@@ -723,6 +723,50 @@ function Get-Service {
         -Name "ServiceQuiescence/DataRestoreMarkerIsSuppressedFromCreation" `
         -Failure "маркер DataRestore має писатися одразу з -RestartSuppressed: автостарт поверх невизначеної live filesystem заборонено навіть після жорсткого kill"
 
+    # Get-ManagedServiceHealthIssues під StrictMode 2.0: ServiceController без
+    # StartType (.NET < 4.6.1) не має обривати Health винятком, а тип запуску
+    # має братись із WMI-fallback (Disabled -> службу пропущено).
+    $startTypeStubs = @'
+function Write-HealthLog { param($Message, $Level) }
+function Get-Service {
+    param($Name, $DisplayName, $ErrorAction)
+    $svc = [pscustomobject]@{ Name = [string]$Name; Status = [System.ServiceProcess.ServiceControllerStatus]::Stopped }
+    Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { } -Force
+    return $svc
+}
+function Get-BRAVOWmiInstance {
+    param($ClassName)
+    return @(
+        [pscustomobject]@{ Name = 'BravoDisabled'; StartMode = 'Disabled' },
+        [pscustomobject]@{ Name = 'BravoAuto'; StartMode = 'Auto' }
+    )
+}
+'@
+    $startTypeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($startTypeStubs + "`n" + $healthRuntimeTextForQuiescence) `
+        -FunctionNames @('Write-HealthLog', 'Get-Service', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled', 'Get-ManagedServiceHealthIssues')
+    $startTypeProbe = {
+        param($ServiceName)
+        Set-StrictMode -Version 2.0
+        $script:backupMonitoring = @{ CheckManagedServices = $true }
+        $script:maintenanceSettings = [pscustomobject]@{
+            Services = [pscustomobject]@{ BravoName = $ServiceName; ExchangeApiName = ''; BravoWebEnabled = $false; BravoWebCandidates = @() }
+        }
+        $thrown = $null
+        $issues = @()
+        try { $issues = @(Get-ManagedServiceHealthIssues) } catch { $thrown = $_.Exception.Message }
+        [pscustomobject]@{ Thrown = $thrown; IssueCount = @($issues).Count }
+    }
+    $startTypeDisabled = & $startTypeModule $startTypeProbe 'BravoDisabled'
+    $startTypeAuto = & $startTypeModule $startTypeProbe 'BravoAuto'
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $startTypeDisabled.Thrown -and $startTypeDisabled.IssueCount -eq 0 -and
+            $null -eq $startTypeAuto.Thrown -and $startTypeAuto.IssueCount -eq 1
+        ) `
+        -Name "Health/ManagedServiceStartTypeMissingDoesNotThrowUnderStrictMode" `
+        -Failure "Get-ManagedServiceHealthIssues має читати StartType через PSObject.Properties: ServiceController без StartType (.NET < 4.6.1) не повинен кидати виняток під StrictMode 2.0, а тип запуску має братись із WMI (Disabled -> пропуск, Auto -> проблема). Отримано: Disabled(Thrown='$($startTypeDisabled.Thrown)', Issues=$($startTypeDisabled.IssueCount)), Auto(Thrown='$($startTypeAuto.Thrown)', Issues=$($startTypeAuto.IssueCount))"
+
     $healthWatchdogInvokeIndex = $healthRuntimeTextForQuiescence.IndexOf('$quiescenceWatchdogIssues = @(Invoke-BRAVOServiceQuiescenceWatchdog)')
     $healthManagedServicesIndex = $healthRuntimeTextForQuiescence.IndexOf('$serviceHealthIssues = @($quiescenceWatchdogIssues) + @(Get-ManagedServiceHealthIssues)')
     Test-BRAVOCondition `
@@ -733,6 +777,269 @@ function Get-Service {
         ) `
         -Name "ServiceQuiescence/HealthRunsWatchdogBeforeManagedServiceChecks" `
         -Failure "Health має запускати watchdog ДО оцінки керованих служб і вливати його issues у результат"
+
+    # --- #319: ServiceController.StartType існує лише з .NET Framework 4.6.1.
+    # Під Set-StrictMode -Version 2.0 пряме звернення до відсутньої властивості
+    # кидає PropertyNotFoundStrict. Усі місця читання типу запуску мають іти
+    # через канонічний Get-BRAVOServiceStartMode (BRAVO.System). Службовий
+    # об'єкт у stub-ах — PSCustomObject БЕЗ StartType (як ServiceController на
+    # .NET < 4.6.1); WMI керується прапорцями $script:svcWmi*.
+    $startModeIssueSystemText = $systemModuleTextForQuiescence
+    $startModeIssueMaintenanceText = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $startModeIssueDataRestoreText = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $startModeIssueDryRunText = [IO.File]::ReadAllText((Join-Path $root "BRAVO_DRY_RUN.ps1"), [Text.Encoding]::UTF8)
+    # Порядок у -SourceText: спершу текст runtime (його param() має бути першим
+    # оператором), потім stub-и й BRAVO.System.
+    $startModeIssueStubs = @'
+function Get-Service {
+    param($Name, $ErrorAction)
+    $svc = [pscustomobject]@{ Name = [string]$Name; DisplayName = [string]$Name; Status = 'Running' }
+    if ($script:svcStartType) { Add-Member -InputObject $svc -MemberType NoteProperty -Name StartType -Value $script:svcStartType }
+    return $svc
+}
+function Get-BRAVOWmiInstance {
+    param($ClassName, $Filter)
+    $script:svcWmiCalls = 1 + [int]$script:svcWmiCalls
+    if ($script:svcWmiFails) { throw 'WMI недоступний (stub)' }
+    if ([string]::IsNullOrEmpty($script:svcWmiMode)) { return @() }
+    return @([pscustomobject]@{ Name = 'SvcProbe'; StartMode = $script:svcWmiMode })
+}
+function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
+'@
+    # Сценарії: StartType службового об'єкта ($null = властивості немає),
+    # WMI StartMode, чи падає WMI.
+    $startModeScenarios = [ordered]@{
+        NoST_WmiDisabled   = @{ ST = $null;        Wmi = 'Disabled'; Fail = $false }
+        NoST_WmiAuto       = @{ ST = $null;        Wmi = 'Auto';     Fail = $false }
+        NoST_WmiManual     = @{ ST = $null;        Wmi = 'Manual';   Fail = $false }
+        NoST_WmiFails      = @{ ST = $null;        Wmi = $null;      Fail = $true }
+        STDisabled_WmiAuto = @{ ST = 'Disabled';   Wmi = 'Auto';     Fail = $false }
+        STAuto_WmiDisabled = @{ ST = 'Automatic';  Wmi = 'Disabled'; Fail = $false }
+        STDisabled_WmiFail = @{ ST = 'Disabled';   Wmi = $null;      Fail = $true }
+        STAuto_WmiFails    = @{ ST = 'Automatic';  Wmi = $null;      Fail = $true }
+    }
+
+    # 1) Юніт-тести канонічного helper-а (нормалізація, пріоритет джерел, Unknown).
+    $startModeHelperModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($startModeIssueStubs + "`n" + $startModeIssueSystemText) `
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode')
+    $startModeHelperProbe = & $startModeHelperModule {
+        Set-StrictMode -Version 2.0
+        $out = [ordered]@{}
+        $run = {
+            param($Key, $Service, $WmiMode, [bool]$WmiFails, $Fallback, [bool]$NoWmi)
+            $script:svcWmiMode = $WmiMode; $script:svcWmiFails = $WmiFails; $script:svcWmiCalls = 0
+            $thrown = $null; $r = $null
+            try {
+                if ($NoWmi) { $r = Get-BRAVOServiceStartMode -Service $Service -FallbackStartMode $Fallback -NoWmiQuery }
+                else { $r = Get-BRAVOServiceStartMode -Service $Service -FallbackStartMode $Fallback }
+            } catch { $thrown = $_.Exception.Message }
+            $out[$Key] = if ($null -ne $thrown) { "THROW:$thrown" } else { '{0}/{1}/{2}/calls={3}' -f $r.StartMode, $r.Source, [bool]$r.FailureReason, $script:svcWmiCalls }
+        }
+        $withST = { param($v) [pscustomobject]@{ Name = 'SvcProbe'; StartType = $v } }
+        $noST = [pscustomobject]@{ Name = 'SvcProbe' }
+        & $run 'ST_Automatic' (& $withST 'Automatic') 'Disabled' $false $null $false
+        & $run 'ST_Manual' (& $withST 'Manual') 'Auto' $false $null $false
+        & $run 'ST_Disabled_beats_WMI' (& $withST 'Disabled') 'Auto' $false $null $false
+        & $run 'ST_Auto_alias' (& $withST 'Auto') $null $false $null $false
+        & $run 'NoST_WmiAuto' $noST 'Auto' $false $null $false
+        & $run 'NoST_WmiManual' $noST 'Manual' $false $null $false
+        & $run 'NoST_WmiDisabled' $noST 'Disabled' $false $null $false
+        & $run 'NoST_WmiFails' $noST $null $true $null $false
+        & $run 'NoST_WmiEmpty' $noST $null $false $null $false
+        & $run 'NoST_WmiUnrecognized' $noST 'Boot' $false $null $false
+        & $run 'NoST_Fallback_noQuery' $noST 'Disabled' $false 'Manual' $false
+        & $run 'NoST_NoWmiQuery' $noST 'Disabled' $false $null $true
+        & $run 'ST_Blank_WmiAuto' (& $withST '') 'Auto' $false $null $false
+        & $run 'ST_Unrecognized_WmiManual' (& $withST 'Boot') 'Manual' $false $null $false
+        & $run 'NullService' $null 'Auto' $false $null $false
+        $out
+    }
+    $startModeHelperExpected = [ordered]@{
+        ST_Automatic = 'Automatic/StartType/False/calls=0'
+        ST_Manual = 'Manual/StartType/False/calls=0'
+        ST_Disabled_beats_WMI = 'Disabled/StartType/False/calls=0'
+        ST_Auto_alias = 'Automatic/StartType/False/calls=0'
+        NoST_WmiAuto = 'Automatic/WMI/False/calls=1'
+        NoST_WmiManual = 'Manual/WMI/False/calls=1'
+        NoST_WmiDisabled = 'Disabled/WMI/False/calls=1'
+        NoST_WmiFails = 'Unknown/None/True/calls=1'
+        NoST_WmiEmpty = 'Unknown/None/True/calls=1'
+        NoST_WmiUnrecognized = 'Unknown/None/True/calls=1'
+        NoST_Fallback_noQuery = 'Manual/FallbackStartMode/False/calls=0'
+        NoST_NoWmiQuery = 'Unknown/None/True/calls=0'
+        ST_Blank_WmiAuto = 'Automatic/WMI/False/calls=1'
+        ST_Unrecognized_WmiManual = 'Manual/WMI/False/calls=1'
+        NullService = 'Unknown/None/True/calls=0'
+    }
+    $startModeHelperDiffs = @($startModeHelperExpected.Keys | Where-Object { [string]$startModeHelperProbe[$_] -ne [string]$startModeHelperExpected[$_] } |
+        ForEach-Object { "$_ => '$($startModeHelperProbe[$_])' (очікувалось '$($startModeHelperExpected[$_])')" })
+    Test-BRAVOCondition `
+        -Condition ($startModeHelperDiffs.Count -eq 0) `
+        -Name "ServiceStartMode/HelperNormalizationPrecedenceAndUnknown" `
+        -Failure "Get-BRAVOServiceStartMode під StrictMode 2.0: нормалізація (Auto->Automatic), пріоритет StartType над WMI, WMI/Fallback без StartType, Unknown + FailureReason замість винятку. Розбіжності: $($startModeHelperDiffs -join ' | ')"
+
+    # 2) Maintenance: Get-ConfiguredServiceState (fallback після збою WMI) і
+    # Test-BRAVOServiceDisabledBySystem (верхній рівень, безумовне читання).
+    $startModeMaintenanceModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($startModeIssueMaintenanceText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-ConfiguredServiceState', 'Test-BRAVOServiceDisabledBySystem')
+    $startModeMaintenanceProbe = & $startModeMaintenanceModule {
+        param($Scenarios)
+        Set-StrictMode -Version 2.0
+        $out = [ordered]@{}
+        foreach ($key in $Scenarios.Keys) {
+            $s = $Scenarios[$key]
+            $script:svcStartType = $s.ST; $script:svcWmiMode = $s.Wmi; $script:svcWmiFails = $s.Fail; $script:svcWmiCalls = 0
+            $thrown = $null; $state = $null
+            try { $state = Get-ConfiguredServiceState -Name 'SvcProbe' } catch { $thrown = $_.Exception.Message }
+            $out["State_$key"] = if ($null -ne $thrown) { "THROW:$thrown" } else { 'Exists={0},Disabled={1},Enabled={2}' -f $state.Exists, $state.Disabled, $state.Enabled }
+        }
+        foreach ($case in @(
+            @{ K = 'Top_NoST_CimEmpty'; ST = $null; Cim = '' },
+            @{ K = 'Top_NoST_CimDisabled'; ST = $null; Cim = 'Disabled' },
+            @{ K = 'Top_NoST_CimAuto'; ST = $null; Cim = 'Auto' },
+            @{ K = 'Top_STDisabled_CimEmpty'; ST = 'Disabled'; Cim = '' },
+            @{ K = 'Top_STAuto_CimEmpty'; ST = 'Automatic'; Cim = '' }
+        )) {
+            $script:svcStartType = $case.ST; $script:svcWmiCalls = 0
+            $svc = Get-Service -Name 'SvcProbe'
+            $thrown = $null; $disabled = $null
+            try { $disabled = Test-BRAVOServiceDisabledBySystem -Service $svc -CimStartMode $case.Cim } catch { $thrown = $_.Exception.Message }
+            $out[$case.K] = if ($null -ne $thrown) { "THROW:$thrown" } else { "Disabled=$disabled,calls=$($script:svcWmiCalls)" }
+        }
+        $out
+    } $startModeScenarios
+    $startModeMaintenanceExpected = [ordered]@{
+        State_NoST_WmiDisabled = 'Exists=True,Disabled=True,Enabled=False'
+        State_NoST_WmiAuto = 'Exists=True,Disabled=False,Enabled=True'
+        State_NoST_WmiManual = 'Exists=True,Disabled=False,Enabled=True'
+        State_NoST_WmiFails = 'Exists=True,Disabled=False,Enabled=True'
+        State_STDisabled_WmiAuto = 'Exists=True,Disabled=False,Enabled=True'
+        State_STAuto_WmiDisabled = 'Exists=True,Disabled=True,Enabled=False'
+        State_STDisabled_WmiFail = 'Exists=True,Disabled=True,Enabled=False'
+        State_STAuto_WmiFails = 'Exists=True,Disabled=False,Enabled=True'
+        Top_NoST_CimEmpty = 'Disabled=False,calls=0'
+        Top_NoST_CimDisabled = 'Disabled=True,calls=0'
+        Top_NoST_CimAuto = 'Disabled=False,calls=0'
+        Top_STDisabled_CimEmpty = 'Disabled=True,calls=0'
+        Top_STAuto_CimEmpty = 'Disabled=False,calls=0'
+    }
+    $startModeMaintenanceDiffs = @($startModeMaintenanceExpected.Keys | Where-Object { [string]$startModeMaintenanceProbe[$_] -ne [string]$startModeMaintenanceExpected[$_] } |
+        ForEach-Object { "$_ => '$($startModeMaintenanceProbe[$_])' (очікувалось '$($startModeMaintenanceExpected[$_])')" })
+    Test-BRAVOCondition `
+        -Condition ($startModeMaintenanceDiffs.Count -eq 0) `
+        -Name "Maintenance/ServiceStartTypeMissingDoesNotThrowUnderStrictMode" `
+        -Failure "Maintenance (Get-ConfiguredServiceState і визначення BravoWeb Disabled): служба без StartType (.NET < 4.6.1) не має кидати виняток під StrictMode 2.0; WMI-збій без StartType не обриває прогін (служба вважається не-Disabled), наявний StartType читається. Розбіжності: $($startModeMaintenanceDiffs -join ' | ')"
+
+    # 3) DataRestore: Get-BRAVODataRestoreServiceSnapshot (fallback після збою WMI).
+    $startModeDataRestoreModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($startModeIssueDataRestoreText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-BRAVODataRestoreServiceSnapshot')
+    $startModeDataRestoreProbe = & $startModeDataRestoreModule {
+        param($Scenarios)
+        Set-StrictMode -Version 2.0
+        $out = [ordered]@{}
+        foreach ($key in $Scenarios.Keys) {
+            $s = $Scenarios[$key]
+            $script:svcStartType = $s.ST; $script:svcWmiMode = $s.Wmi; $script:svcWmiFails = $s.Fail; $script:svcWmiCalls = 0
+            $thrown = $null; $entries = @()
+            try {
+                $entries = @(Get-BRAVODataRestoreServiceSnapshot -ServicesSettings @{ BravoName = 'SvcProbe'; ExchangeApiName = ''; BravoWebEnabled = $false; BravoWebCandidates = @() })
+            } catch { $thrown = $_.Exception.Message }
+            $bravoEntry = @($entries | Where-Object { $_.Key -eq 'Bravo' }) | Select-Object -First 1
+            $out[$key] = if ($null -ne $thrown) { "THROW:$thrown" } elseif ($null -eq $bravoEntry) { 'NOENTRY' } else { "Managed=$($bravoEntry.Managed)" }
+        }
+        $out
+    } $startModeScenarios
+    $startModeDataRestoreExpected = [ordered]@{
+        NoST_WmiDisabled = 'Managed=False'
+        NoST_WmiAuto = 'Managed=True'
+        NoST_WmiManual = 'Managed=True'
+        NoST_WmiFails = 'Managed=True'
+        STDisabled_WmiAuto = 'Managed=True'
+        STAuto_WmiDisabled = 'Managed=False'
+        STDisabled_WmiFail = 'Managed=False'
+        STAuto_WmiFails = 'Managed=True'
+    }
+    $startModeDataRestoreDiffs = @($startModeDataRestoreExpected.Keys | Where-Object { [string]$startModeDataRestoreProbe[$_] -ne [string]$startModeDataRestoreExpected[$_] } |
+        ForEach-Object { "$_ => '$($startModeDataRestoreProbe[$_])' (очікувалось '$($startModeDataRestoreExpected[$_])')" })
+    Test-BRAVOCondition `
+        -Condition ($startModeDataRestoreDiffs.Count -eq 0) `
+        -Name "DataRestore/ServiceStartTypeMissingDoesNotThrowUnderStrictMode" `
+        -Failure "Get-BRAVODataRestoreServiceSnapshot: служба без StartType (.NET < 4.6.1) не має кидати виняток під StrictMode 2.0; WMI-збій без StartType не обриває знімок (служба керована), StartType=Disabled при збої WMI -> не керована. Розбіжності: $($startModeDataRestoreDiffs -join ' | ')"
+
+    # 4) BRAVO_DRY_RUN.ps1: Get-BRAVODryRunConfiguredServiceState (StartType -> WMI).
+    $startModeDryRunModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($startModeIssueDryRunText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-BRAVODryRunConfiguredServiceState')
+    $startModeDryRunProbe = & $startModeDryRunModule {
+        param($Scenarios)
+        Set-StrictMode -Version 2.0
+        $out = [ordered]@{}
+        foreach ($key in $Scenarios.Keys) {
+            $s = $Scenarios[$key]
+            $script:svcStartType = $s.ST; $script:svcWmiMode = $s.Wmi; $script:svcWmiFails = $s.Fail; $script:svcWmiCalls = 0
+            $thrown = $null; $state = $null
+            try { $state = Get-BRAVODryRunConfiguredServiceState -ServiceCandidates @('SvcProbe') } catch { $thrown = $_.Exception.Message }
+            $out[$key] = if ($null -ne $thrown) { "THROW:$thrown" } else { "Exists=$($state.Exists),Disabled=$($state.Disabled)" }
+        }
+        $out
+    } $startModeScenarios
+    $startModeDryRunExpected = [ordered]@{
+        NoST_WmiDisabled = 'Exists=True,Disabled=True'
+        NoST_WmiAuto = 'Exists=True,Disabled=False'
+        NoST_WmiManual = 'Exists=True,Disabled=False'
+        NoST_WmiFails = 'Exists=True,Disabled=False'
+        STDisabled_WmiAuto = 'Exists=True,Disabled=True'
+        STAuto_WmiDisabled = 'Exists=True,Disabled=False'
+        STDisabled_WmiFail = 'Exists=True,Disabled=True'
+        STAuto_WmiFails = 'Exists=True,Disabled=False'
+    }
+    $startModeDryRunDiffs = @($startModeDryRunExpected.Keys | Where-Object { [string]$startModeDryRunProbe[$_] -ne [string]$startModeDryRunExpected[$_] } |
+        ForEach-Object { "$_ => '$($startModeDryRunProbe[$_])' (очікувалось '$($startModeDryRunExpected[$_])')" })
+    Test-BRAVOCondition `
+        -Condition ($startModeDryRunDiffs.Count -eq 0) `
+        -Name "DryRun/ServiceStartTypeMissingDoesNotThrowUnderStrictMode" `
+        -Failure "Get-BRAVODryRunConfiguredServiceState: служба без StartType (.NET < 4.6.1) не має кидати виняток під StrictMode 2.0, тип запуску береться з WMI, наявний StartType має пріоритет над WMI, збій WMI не обриває Dry Run. Розбіжності: $($startModeDryRunDiffs -join ' | ')"
+
+    # 5) BRAVO.System: Set-BRAVOBootRestoreServiceStartType без StartType.
+    $startModeBootRestoreModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($startModeIssueStubs + "`n" + $startModeIssueSystemText) `
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceDelayedAutoStart', 'Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
+    $startModeBootRestoreProbe = & $startModeBootRestoreModule {
+        param($Scenarios)
+        Set-StrictMode -Version 2.0
+        $out = [ordered]@{}
+        foreach ($key in $Scenarios.Keys) {
+            $s = $Scenarios[$key]
+            foreach ($hold in @($true, $false)) {
+                $script:svcStartType = $s.ST; $script:svcWmiMode = $s.Wmi; $script:svcWmiFails = $s.Fail; $script:svcWmiCalls = 0
+                $thrown = $null; $r = @()
+                try { $r = @(Set-BRAVOBootRestoreServiceStartType -ServiceNames @('SvcProbe') -HoldServices $hold -ValidateOnly) } catch { $thrown = $_.Exception.Message }
+                $out["${key}_Hold$hold"] = if ($null -ne $thrown) { "THROW:$thrown" } else { "$($r[0].StartType)/$($r[0].Action)/Success=$($r[0].Success)" }
+            }
+        }
+        $out
+    } $startModeScenarios
+    $startModeBootRestoreExpected = [ordered]@{
+        NoST_WmiDisabled_HoldTrue = 'Disabled/SkippedNotAutomatic/Success=True'
+        NoST_WmiAuto_HoldTrue = 'Automatic/SetDelayedAuto/Success=True'
+        NoST_WmiAuto_HoldFalse = 'Automatic/None/Success=True'
+        NoST_WmiManual_HoldTrue = 'Manual/SkippedNotAutomatic/Success=True'
+        NoST_WmiFails_HoldTrue = 'Unknown/SkippedUnknownStartType/Success=False'
+        NoST_WmiFails_HoldFalse = 'Unknown/SkippedUnknownStartType/Success=True'
+        STDisabled_WmiAuto_HoldTrue = 'Disabled/SkippedNotAutomatic/Success=True'
+        STAuto_WmiDisabled_HoldTrue = 'Automatic/SetDelayedAuto/Success=True'
+        STAuto_WmiFails_HoldTrue = 'Automatic/SetDelayedAuto/Success=True'
+    }
+    $startModeBootRestoreDiffs = @($startModeBootRestoreExpected.Keys | Where-Object {
+        [string]$startModeBootRestoreProbe[$_] -ne [string]$startModeBootRestoreExpected[$_]
+    } | ForEach-Object { "$_ => '$($startModeBootRestoreProbe[$_])' (очікувалось '$($startModeBootRestoreExpected[$_])')" })
+    Test-BRAVOCondition `
+        -Condition ($startModeBootRestoreDiffs.Count -eq 0) `
+        -Name "BootRestore/ServiceStartTypeMissingUsesWmiAndFailsClosed" `
+        -Failure "Set-BRAVOBootRestoreServiceStartType: служба без StartType (.NET < 4.6.1) не має кидати виняток під StrictMode 2.0; тип запуску береться з WMI; якщо невідомий і HoldServices — Success=False (SkippedUnknownStartType), у None — не збій; наявний StartType має пріоритет над WMI. Розбіжності: $($startModeBootRestoreDiffs -join ' | ')"
 
     # Review F4: SETUP має зміцнювати ACL State-кореня (apply з адмін-правами,
     # CheckOnly для ValidateOnly/неелевованого прогону), а watchdog —

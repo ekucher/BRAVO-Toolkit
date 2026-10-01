@@ -3641,7 +3641,11 @@ function Get-ManagedServiceHealthIssues {
 
     $issues = @()
     foreach ($service in @($services)) {
-        $startMode = [string]$service.StartType
+        # StartType з'явилась лише в .NET 4.6.1; під StrictMode 2.0 пряме
+        # звернення до відсутньої властивості кидає виняток замість $null, і
+        # WMI-fallback нижче ніколи не виконувався б.
+        $startTypeProperty = $service.PSObject.Properties['StartType']
+        $startMode = if ($startTypeProperty) { [string]$startTypeProperty.Value } else { '' }
         if ([string]::IsNullOrWhiteSpace($startMode) -and
             $startModeByName.ContainsKey([string]$service.Name)) {
             $startMode = [string]$startModeByName[[string]$service.Name]

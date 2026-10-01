@@ -256,18 +256,16 @@ function Get-BRAVODryRunConfiguredServiceState {
         } | Select-Object -First 1
     }
 
-    $startType = if ($null -ne $service) { [string]$service.StartType } else { '' }
-    if ($null -ne $service -and [string]::IsNullOrWhiteSpace($startType)) {
-        try {
-            $escapedName = ([string]$service.Name).Replace("'", "''")
-            $serviceInfo = Get-WmiObject -Class Win32_Service `
-                -Filter "Name = '$escapedName'" `
-                -ErrorAction Stop | Select-Object -First 1
-            $startType = [string]$serviceInfo.StartMode
-        } catch {
-            # A denied WMI query must not turn an optional component into a
-            # Dry Run failure; Get-Service still establishes its existence.
-        }
+    # StartType відсутній у ServiceController на .NET < 4.6.1 (#319), а під
+    # StrictMode 2.0 пряме звернення кидає виняток: канонічний
+    # Get-BRAVOServiceStartMode читає його безпечно й падає назад на WMI.
+    # A denied WMI query must not turn an optional component into a Dry Run
+    # failure: helper повертає Unknown (не Disabled), а Get-Service лишається
+    # доказом існування служби.
+    $startType = if ($null -ne $service) {
+        [string](Get-BRAVOServiceStartMode -Service $service).StartMode
+    } else {
+        ''
     }
 
     return [pscustomobject]@{
@@ -1192,6 +1190,16 @@ try {
     $dryRunSystemLogRoot = [string]$global:systemLogRoot
     $dryRunBackupRoot = [string]$global:backupRootPath
     $dryRunStateRoot = [string]$global:stateRoot
+    # Get-BRAVOServiceStartMode (BRAVO.System) використовує WMI-обгортку
+    # Get-BRAVOWmiInstance з BRAVO.Compatibility; без неї helper дає Unknown
+    # (не кидає), тож імпорт best-effort.
+    if ($null -eq (Get-Command -Name 'Get-BRAVOWmiInstance' -ErrorAction SilentlyContinue)) {
+        try {
+            Import-Module -Name (Join-Path $dryRunRuntimeRoot 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1') -ErrorAction Stop
+        } catch {
+            # Compatibility перевіряється нижче окремим FAIL-записом.
+        }
+    }
     $bravoWebEnabled = Test-SettingEnabled $maintenanceSettings.Services.BravoWebEnabled
     $bravoWebServiceState = if ($bravoWebEnabled) {
         Get-BRAVODryRunConfiguredServiceState `
