@@ -8,7 +8,7 @@
   `ArchiveLogUploadEnabled` (обидва за замовчуванням `$false`); журнали Health,
   DataRestore та допоміжних скриптів (`LOGS\HELPERS`) не вивантажувались зовсім.
   Тепер наприкінці кожного прогону BRAVO_MAINTENANCE, коли
-  `storageSettings.SFTP.Enabled = $true` і в Credential Manager є SFTP-креденшли,
+  `componentSettings.SFTP.Enabled = $true` і в Credential Manager є SFTP-креденшли,
   увесь каталог `<RuntimeRoot>\LOGS` разом із підкаталогами інкрементально
   вивантажується в новий каталог `sftpDirectories.RuntimeLogs` (за замовчуванням
   `logs/runtime`) зі збереженням відносних шляхів. Файл, що вже є на SFTP з тим самим

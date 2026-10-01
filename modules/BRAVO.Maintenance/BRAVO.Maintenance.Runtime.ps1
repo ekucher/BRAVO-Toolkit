@@ -4643,7 +4643,7 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
             return
         }
         # Рішення власника (2026-10-01): за увімкненого хмарного бекапу
-        # (storageSettings.SFTP.Enabled) і наявних SFTP-креденшлів у
+        # (componentSettings.SFTP.Enabled) і наявних SFTP-креденшлів у
         # Credential Manager на SFTP іде ВЕСЬ каталог журналів toolkit
         # (Sync-BRAVORuntimeLogsToSftp нижче). Тумблер
         # MaintenanceLogUploadEnabled лишається і керує лише окремою
@@ -11235,7 +11235,7 @@ Write-BRAVOResultField -Label 'Помилок' -Value ([string]$script:BRAVOMain
 Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
 
 # Вивантаження журналів toolkit на SFTP: весь <RuntimeRoot>\LOGS у
-# sftpDirectories.RuntimeLogs, коли storageSettings.SFTP.Enabled і є
+# sftpDirectories.RuntimeLogs, коли componentSettings.SFTP.Enabled і є
 # SFTP-креденшли; окрема копія логу прогону (+ знімок range_id_log.json) —
 # opt-in (componentSettings.SFTP.MaintenanceLogUploadEnabled, дефолт
 # $false). Розміщено ПІСЛЯ резолву $script:maintenanceRuntimeExitCode

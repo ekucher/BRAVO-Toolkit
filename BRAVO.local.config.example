@@ -360,7 +360,7 @@
     # 'sftpDirectories.MaintenanceLog' = 'logs/maintenance'
     # 'sftpDirectories.ArchivLog' = 'logs/archiv'
     # Увесь каталог журналів toolkit (<RuntimeRoot>\LOGS) — вивантажується
-    # наприкінці BRAVO_MAINTENANCE, коли увімкнено storageSettings.SFTP.Enabled
+    # наприкінці BRAVO_MAINTENANCE, коли увімкнено componentSettings.SFTP.Enabled
     # і в Credential Manager є SFTP-креденшли:
     # 'sftpDirectories.RuntimeLogs' = 'logs/runtime'
 

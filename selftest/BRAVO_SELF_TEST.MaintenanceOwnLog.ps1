@@ -200,7 +200,7 @@ $maintOwnLogSftpOff = Invoke-BRAVOSelfTestMaintenanceOwnLogUploadScenario -Modul
 Test-BRAVOCondition (
     $maintOwnLogSftpOff.ConnectCalls -eq 0 -and $maintOwnLogSftpOff.SendCalls -eq 0 -and $maintOwnLogSftpOff.SyncCalls -eq 0
 ) -Name 'Maintenance/RuntimeLogUploadSkippedWhenSftpDisabled' `
-    -Failure "storageSettings.SFTP.Enabled=`$false має пропускати будь-яке вивантаження; факт: connect=$($maintOwnLogSftpOff.ConnectCalls) send=$($maintOwnLogSftpOff.SendCalls) sync=$($maintOwnLogSftpOff.SyncCalls)"
+    -Failure "componentSettings.SFTP.Enabled=`$false має пропускати будь-яке вивантаження; факт: connect=$($maintOwnLogSftpOff.ConnectCalls) send=$($maintOwnLogSftpOff.SendCalls) sync=$($maintOwnLogSftpOff.SyncCalls)"
 
 # (a3) SFTP увімкнено, але креденшлів у Credential Manager немає ->
 # вивантаження пропускається без спроби з'єднання.
