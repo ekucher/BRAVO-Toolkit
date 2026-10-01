@@ -6169,6 +6169,9 @@ function Read-BRAVOBackupLastSuccess {
     # Час останньої COMPLETE-копії з BRAVO_TASK_EXECUTION_STATE.json (його
     # пише Write-BRAVOBackupExecutionState вище). $null = запису немає або
     # файл пошкоджений; для -CatchUpMissedBackup це «копії не було».
+    # Категорії (усі -> $null, без винятку; рішення «робити копію» безпечне):
+    #  відсутній файл (тихо) / нечитабельний або не-JSON-об'єкт / немає
+    #  поля Backup / порожнє чи нерозбірливе значення (кожна — INFO у журнал).
     $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         return $null
@@ -6182,12 +6185,23 @@ function Read-BRAVOBackupLastSuccess {
             -Level "INFO"
         return $null
     }
-    $property = $state.PSObject.Properties['Backup']
+    $property = $null
+    if ($null -ne $state -and $state -is [psobject] -and $state -isnot [System.Array]) {
+        $property = $state.PSObject.Properties['Backup']
+    }
     if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+        Write-BRAVOLog `
+            -Component 'STATE' `
+            -Message "У стані завдань ($path) немає запису про останню успішну копію (Backup)." `
+            -Level "INFO"
         return $null
     }
     [datetime]$lastSuccess = [datetime]::MinValue
     if (-not [datetime]::TryParse([string]$property.Value, [ref]$lastSuccess)) {
+        Write-BRAVOLog `
+            -Component 'STATE' `
+            -Message "У стані завдань ($path) поле Backup не є датою: '$([string]$property.Value)'." `
+            -Level "INFO"
         return $null
     }
     return $lastSuccess

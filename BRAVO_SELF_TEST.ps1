@@ -21646,6 +21646,15 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
         @{ Name = 'next-slot-soon'; Now = [datetime]'2026-09-30T22:30:00'; Last = [datetime]'2026-09-28T23:05:00'; Run = $false; Slot = [datetime]'2026-09-29T23:00:00' }
         @{ Name = 'boot-after-slot'; Now = [datetime]'2026-09-30T23:10:00'; Last = [datetime]'2026-09-29T23:05:00'; Run = $true; Slot = [datetime]'2026-09-30T23:00:00' }
         @{ Name = 'boundary-equal'; Now = [datetime]'2026-10-01T08:00:00'; Last = [datetime]'2026-09-30T23:00:00'; Run = $false; Slot = [datetime]'2026-09-30T23:00:00' }
+        # Матриця #322: ранок до першого слоту дня (вчорашній слот виконано, ручна копія після півночі).
+        @{ Name = 'morning-before-todays-slot-done'; Now = [datetime]'2026-10-01T08:00:00'; Last = [datetime]'2026-10-01T00:10:00'; Run = $false; Slot = [datetime]'2026-09-30T23:00:00' }
+        # Межі: Last на секунду раніше слоту = слот не виконано; Now == слот і перші 2 хв. = запускає звичайний прогін.
+        @{ Name = 'last-one-second-before-slot'; Now = [datetime]'2026-10-01T08:00:00'; Last = [datetime]'2026-09-30T22:59:59'; Run = $true; Slot = [datetime]'2026-09-30T23:00:00' }
+        @{ Name = 'now-equals-slot'; Now = [datetime]'2026-09-30T23:00:00'; Last = [datetime]'2026-09-29T23:05:00'; Run = $false; Slot = [datetime]'2026-09-30T23:00:00' }
+        @{ Name = 'inside-slot-start-grace'; Now = [datetime]'2026-09-30T23:01:59'; Last = $null; Run = $false; Slot = [datetime]'2026-09-30T23:00:00' }
+        @{ Name = 'after-slot-start-grace'; Now = [datetime]'2026-09-30T23:02:00'; Last = [datetime]'2026-09-29T23:05:00'; Run = $true; Slot = [datetime]'2026-09-30T23:00:00' }
+        @{ Name = 'next-slot-exactly-60-min'; Now = [datetime]'2026-09-30T22:00:00'; Last = [datetime]'2026-09-28T23:05:00'; Run = $false; Slot = [datetime]'2026-09-29T23:00:00' }
+        @{ Name = 'next-slot-61-min'; Now = [datetime]'2026-09-30T21:59:00'; Last = [datetime]'2026-09-28T23:05:00'; Run = $true; Slot = [datetime]'2026-09-29T23:00:00' }
     )
     $catchUpFailures = @()
     foreach ($catchUpCase in $catchUpCases) {
@@ -21679,6 +21688,124 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
         -Condition ($catchUpNextRun -like '*старту Windows*' -and $catchUpNextRun -like '*затримка 7 хв.*' -and $catchUpNextRun -notmatch '1899') `
         -Name "Scheduler/BackupCatchUpNextRunIsBoot" `
         -Failure "BackupCatchUp — boot-trigger: next-run має показувати старт Windows і затримку, а не 30.12.1899"
+
+    # --- Scheduler/BackupCatchUpState*: читання стану й узгодженість із записом (#322) ---
+    # Реальні Read-BRAVOBackupLastSuccess / Write-BRAVOBackupExecutionState
+    # (AST-екстракція) + реальне рішення. DailyAt = «зараз мінус 30 хв.», щоб
+    # результат не залежав від годинника: попередній слот завжди 30 хв. тому,
+    # до наступного 23,5 год.
+    $catchUpStateText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $catchUpStateModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $catchUpStateText `
+        -FunctionNames @('Read-BRAVOBackupLastSuccess', 'Write-BRAVOBackupExecutionState')
+    $catchUpStateRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CATCHUP_STATE_{0}" -f [guid]::NewGuid().ToString('N'))
+    $catchUpStateFailures = @()
+    try {
+        [void](New-Item -ItemType Directory -Path $catchUpStateRoot -Force)
+        $catchUpUtf8NoBom = New-Object Text.UTF8Encoding($false)
+        $catchUpStateNow = Get-Date
+        $catchUpStateDailyAt = $catchUpStateNow.AddMinutes(-30).ToString('HH:mm')
+        $catchUpStateScenarios = @(
+            @{ Name = 'missing-file'; Content = $null; ExpectLog = 0 }
+            @{ Name = 'bad-json'; Content = '{"Maintenance":'; ExpectLog = 1 }
+            @{ Name = 'empty-file'; Content = ''; ExpectLog = 1 }
+            @{ Name = 'json-null'; Content = 'null'; ExpectLog = 1 }
+            @{ Name = 'json-array'; Content = '[]'; ExpectLog = 1 }
+            @{ Name = 'json-scalar'; Content = '42'; ExpectLog = 1 }
+            @{ Name = 'no-backup-property'; Content = '{"Maintenance":"2026-09-30T23:55:00+03:00"}'; ExpectLog = 1 }
+            @{ Name = 'empty-backup'; Content = '{"Backup":""}'; ExpectLog = 1 }
+            @{ Name = 'unparsable-date'; Content = '{"Backup":"не дата"}'; ExpectLog = 1 }
+        )
+        foreach ($catchUpStateScenario in $catchUpStateScenarios) {
+            $scenarioDir = Join-Path $catchUpStateRoot $catchUpStateScenario.Name
+            [void](New-Item -ItemType Directory -Path $scenarioDir -Force)
+            if ($null -ne $catchUpStateScenario.Content) {
+                [IO.File]::WriteAllText((Join-Path $scenarioDir 'BRAVO_TASK_EXECUTION_STATE.json'), [string]$catchUpStateScenario.Content, $catchUpUtf8NoBom)
+            }
+            try {
+                $readOutcome = & $catchUpStateModule {
+                    param($stateDir)
+                    $script:stateRoot = $stateDir
+                    $script:catchUpStateLogCount = 0
+                    function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level) $script:catchUpStateLogCount++ }
+                    $value = Read-BRAVOBackupLastSuccess
+                    [pscustomobject]@{ Value = $value; Logs = $script:catchUpStateLogCount }
+                } $scenarioDir
+                $scenarioDecision = Get-BRAVOBackupCatchUpDecision -Now $catchUpStateNow -DailyAt $catchUpStateDailyAt -LastSuccess $readOutcome.Value
+                if ($null -ne $readOutcome.Value -or $readOutcome.Logs -ne $catchUpStateScenario.ExpectLog -or -not $scenarioDecision.Run) {
+                    $catchUpStateFailures += "$($catchUpStateScenario.Name): Value=$($readOutcome.Value) Logs=$($readOutcome.Logs) Run=$($scenarioDecision.Run)"
+                }
+            } catch {
+                $catchUpStateFailures += "$($catchUpStateScenario.Name): виняток $($_.Exception.Message)"
+            }
+        }
+
+        # Коректний запис: ISO-значення зі зсувом читається назад як момент часу.
+        $validDir = Join-Path $catchUpStateRoot 'valid'
+        [void](New-Item -ItemType Directory -Path $validDir -Force)
+        $validStamp = $catchUpStateNow.AddMinutes(-5)
+        [IO.File]::WriteAllText((Join-Path $validDir 'BRAVO_TASK_EXECUTION_STATE.json'), ('{"Backup":"' + $validStamp.ToString('o') + '"}'), $catchUpUtf8NoBom)
+        $validRead = & $catchUpStateModule {
+            param($stateDir)
+            $script:stateRoot = $stateDir
+            function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level) }
+            Read-BRAVOBackupLastSuccess
+        } $validDir
+        if ($null -eq $validRead -or [math]::Abs(($validRead - $validStamp).TotalSeconds) -gt 1) {
+            $catchUpStateFailures += "valid: прочитано '$validRead' замість '$validStamp'"
+        }
+
+        # Кейс 9: звичайна нічна копія завершилась COMPLETE, поки підхоплення
+        # чекало lock; рішення ПІСЛЯ lock бачить свіжий запис -> другої копії немає.
+        $roundTripDir = Join-Path $catchUpStateRoot 'roundtrip'
+        [void](New-Item -ItemType Directory -Path $roundTripDir -Force)
+        $beforeNightly = & $catchUpStateModule {
+            param($stateDir)
+            $script:stateRoot = $stateDir
+            function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level) }
+            Read-BRAVOBackupLastSuccess
+        } $roundTripDir
+        $decisionBeforeNightly = Get-BRAVOBackupCatchUpDecision -Now $catchUpStateNow -DailyAt $catchUpStateDailyAt -LastSuccess $beforeNightly
+        $afterNightly = & $catchUpStateModule {
+            param($stateDir)
+            $script:stateRoot = $stateDir
+            function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level) }
+            Write-BRAVOBackupExecutionState
+            Read-BRAVOBackupLastSuccess
+        } $roundTripDir
+        $decisionAfterNightly = Get-BRAVOBackupCatchUpDecision -Now ((Get-Date).AddSeconds(1)) -DailyAt $catchUpStateDailyAt -LastSuccess $afterNightly
+        if (-not $decisionBeforeNightly.Run -or $decisionAfterNightly.Run) {
+            $catchUpStateFailures += "roundtrip: до нічної копії Run=$($decisionBeforeNightly.Run), після Run=$($decisionAfterNightly.Run)"
+        }
+    } finally {
+        if (Test-Path -LiteralPath $catchUpStateRoot) {
+            Remove-Item -LiteralPath $catchUpStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($catchUpStateFailures.Count -eq 0) `
+        -Name "Scheduler/BackupCatchUpStateReadCategories" `
+        -Failure ("Read-BRAVOBackupLastSuccess: відсутній/пошкоджений/без Backup/нерозбірливий стан -> `$null без винятку (з INFO у журнал, окрім відсутнього файлу) і копія робиться; запис COMPLETE-копії зчитується й гасить підхоплення. Збої: " + ($catchUpStateFailures -join '; '))
+
+    # Кейс 8: BRAVO_TASK_EXECUTION_STATE.Backup пишеться ЛИШЕ при COMPLETE
+    # generation (INCOMPLETE/FAILED його не оновлюють), а COMPLETE ставиться лише
+    # коли опубліковано всі увімкнені компоненти.
+    $catchUpWriteMatches = [regex]::Matches($catchUpStateText, '(?m)^\s*Write-BRAVOBackupExecutionState\s*$')
+    $catchUpGuardedWrite = [regex]::Matches($catchUpStateText, '(?m)if \(\$script:backupGenerationStatus -eq ''COMPLETE''\) \{\s*\r?\n\s*Write-BRAVOBackupExecutionState\s*\r?\n')
+    $catchUpCompleteAssign = [regex]::Matches($catchUpStateText, '\$script:backupGenerationStatus = if \(\$null -eq \$generationSnapshotSet -or \$publishedComponentCount -eq 0\) \{\s*\r?\n\s*''FAILED''\s*\r?\n\s*\} elseif \(\$publishedComponentCount -eq \$enabledArchives\.Count\) \{\s*\r?\n\s*''COMPLETE''')
+    Test-BRAVOCondition `
+        -Condition ($catchUpWriteMatches.Count -eq 1 -and $catchUpGuardedWrite.Count -eq 1 -and $catchUpCompleteAssign.Count -eq 1) `
+        -Name "Scheduler/BackupExecutionStateWrittenOnlyOnComplete" `
+        -Failure "Write-BRAVOBackupExecutionState має викликатися один раз і лише під if (backupGenerationStatus -eq 'COMPLETE'); COMPLETE — лише коли опубліковано всі увімкнені компоненти (інакше підхоплення сприйме INCOMPLETE як успішну копію). Знайдено викликів: $($catchUpWriteMatches.Count), під guard: $($catchUpGuardedWrite.Count), присвоєнь COMPLETE: $($catchUpCompleteAssign.Count)"
+
+    # Кейс 10: підхоплення бере той самий спільний lock і той самий бюджет
+    # очікування (TaskType Backup), що й звичайний BRAVO_ARCHIV: один виклик
+    # Enter-BRAVOArchiveProcessLock у Main, без окремого шляху захоплення.
+    $catchUpLockCalls = [regex]::Matches($catchUpStateText, 'Enter-BRAVOArchiveProcessLock\s*`\s*\r?\n\s*-TaskType \$\(if \(\$SyncBAZA\) \{ ''BAZASync'' \} else \{ ''Backup'' \}\)')
+    Test-BRAVOCondition `
+        -Condition ($catchUpLockCalls.Count -eq 1) `
+        -Name "Scheduler/BackupCatchUpSharesArchiveLock" `
+        -Failure "-CatchUpMissedBackup має захоплювати lock тим самим єдиним викликом Enter-BRAVOArchiveProcessLock (TaskType Backup), що й звичайна нічна копія: той самий бюджет очікування Maintenance і той самий код 20 при вичерпанні; знайдено викликів: $($catchUpLockCalls.Count)"
 
     $catchUpInstallerText = Get-Content -LiteralPath (Join-Path $root 'BRAVO_TASKS_INSTALL.ps1') -Raw -Encoding UTF8
     $catchUpDiagnoseText = Get-Content -LiteralPath (Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1') -Raw -Encoding UTF8

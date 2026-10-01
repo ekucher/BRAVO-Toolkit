@@ -18,6 +18,15 @@
   (`BRAVO_TASKS_INSTALL.ps1`). Нові self-test перевірки:
   `Scheduler/BackupCatchUpDecision`, `Scheduler/BackupCatchUpNextRunIsBoot`,
   `Config/BackupCatchUpDerived`, `Scheduler/BackupCatchUpBootTaskWiring`.
+  Межові випадки закріплено: у перші 2 хв. після слоту (включно з
+  `Now == DailyAt`) підхоплення поступається звичайному запуску, щоб при
+  одночасному старті не вийшло двох копій; рівно 60 хв. до наступного слоту
+  = пропуск; відсутній, пошкоджений, без поля `Backup` чи з нерозбірливою
+  датою стан = копія робиться (з INFO у журнал), без винятку; стан пишеться
+  лише при COMPLETE generation. Нові self-test перевірки:
+  `Scheduler/BackupCatchUpStateReadCategories`,
+  `Scheduler/BackupExecutionStateWrittenOnlyOnComplete`,
+  `Scheduler/BackupCatchUpSharesArchiveLock`.
 
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який

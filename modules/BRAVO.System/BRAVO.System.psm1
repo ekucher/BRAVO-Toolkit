@@ -90,12 +90,26 @@ function Get-BRAVOBackupCatchUpDecision {
     # Відсутній запис = копії не було, тож копія робиться. Якщо до
     # наступного планового слоту лишилось не більше NextSlotGuardMinutes,
     # підхоплення не потрібне: копію зробить звичайний запуск.
+    #
+    # Межові випадки (детерміновані, закріплені self-test):
+    #  - LastSuccess == початок слоту вважається виконаним слотом (-ge);
+    #  - Now у перші SlotStartGraceMinutes хв. після слоту (включно з
+    #    Now == DailyAt): Планувальник саме зараз запускає звичайний
+    #    BRAVO_ARCHIV, тож підхоплення поступається йому (інакше, виграв
+    #    би підхоплення lock, звичайний прогін після нього зробив би другу
+    #    копію); якщо звичайний прогін завершиться без COMPLETE, наступний
+    #    boot-запуск або наступний слот це покриє;
+    #  - до наступного слоту рівно NextSlotGuardMinutes хв. = пропуск (-le);
+    #  - LastSuccess відсутній ($null; стану немає або він пошкоджений) =
+    #    копії не було, отже копія робиться: хост без жодної COMPLETE-копії
+    #    не повинен лишатися без неї.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][datetime]$Now,
         [Parameter(Mandatory = $true)][string]$DailyAt,
         [AllowNull()]$LastSuccess,
-        [int]$NextSlotGuardMinutes = 60
+        [int]$NextSlotGuardMinutes = 60,
+        [int]$SlotStartGraceMinutes = 2
     )
 
     $slotTime = [TimeSpan]::Zero
@@ -121,6 +135,8 @@ function Get-BRAVOBackupCatchUpDecision {
     $run = $false
     if ($null -ne $lastSuccessTime -and $lastSuccessTime -ge $previousSlot) {
         $reason = "копія за слот $($previousSlot.ToString('dd.MM.yyyy HH:mm')) уже є (остання успішна $lastSuccessText)"
+    } elseif (($Now - $previousSlot).TotalMinutes -lt $SlotStartGraceMinutes) {
+        $reason = "плановий запуск $($previousSlot.ToString('dd.MM.yyyy HH:mm')) саме стартує, копію зробить він"
     } elseif (($nextSlot - $Now).TotalMinutes -le $NextSlotGuardMinutes) {
         $reason = "до планового запуску $($nextSlot.ToString('dd.MM.yyyy HH:mm')) не більше $NextSlotGuardMinutes хв, копію зробить він"
     } else {
