@@ -12,6 +12,7 @@
 # Успадковує з викликача: $root, Test-BRAVOCondition,
 # New-BRAVOSelfTestRuntimeModule, $script:failures.
 
+if (Enter-BRAVOSelfTestSection -Name 'MaintenanceRepair/Maintenance') { try {
 $maintenanceRepairScriptText = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
     [Text.Encoding]::UTF8
@@ -352,6 +353,8 @@ Test-BRAVOCondition `
     -Condition ($resultHierMissing.HasCriticalChanges -and $resultHierMissing.RemovedByRepairCount -eq 0) `
     -Name "Maintenance/CompareFileSizesHierarchyFileMissingCritical" `
     -Failure "зниклий файл ієрархії (.h1) має бути CRITICAL, не RemovedByRepair"
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'MaintenanceRepair/Maintenance' } }
+if (Enter-BRAVOSelfTestSection -Name 'MaintenanceRepair/Maintenance.CompareFileSizesMixedMissingSegmentAndMd' -DependsOn 'MaintenanceRepair/Maintenance') { try {
 
 # --- Змішаний кейс: зник сегмент .000 (штатно) І зник DEPART.md (втрата
 # даних) -> CRITICAL, при цьому сегмент коректно лишається у RemovedByRepair.
@@ -735,6 +738,8 @@ Test-BRAVOCondition `
     -Condition $compatibilityScriptText.Contains('[Globalization.CultureInfo]::InvariantCulture') `
     -Name "Notifications/DiscordRetryAfterParseUsesInvariantCulture" `
     -Failure "парсинг Retry-After має використовувати InvariantCulture-перевантаження TryParse (culture-залежне на uk-UA не парсить '1.5')"
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'MaintenanceRepair/Maintenance.CompareFileSizesMixedMissingSegmentAndMd' } }
+if (Enter-BRAVOSelfTestSection -Name 'MaintenanceRepair/Notifications' -DependsOn 'MaintenanceRepair/Maintenance.CompareFileSizesMixedMissingSegmentAndMd') { try {
 
 # --- Non-429 помилка НЕ ретраїться (rethrow одразу, без затримки).
 $webhookNon429Result = & $webhookModule {
@@ -1161,3 +1166,4 @@ try {
         Remove-Item -LiteralPath $legacySweepRootScopeRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'MaintenanceRepair/Notifications' } }

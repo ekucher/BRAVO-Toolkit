@@ -12,6 +12,7 @@
     # regression. Categories A-G per safety-review specification.
     # =====================================================================
     try {
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ConfigDefinesBazaBlock') { try {
         Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
         Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1") -Force -ErrorAction Stop
         Import-Module -Name (Join-Path $root "modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1") -Force -ErrorAction Stop
@@ -19,158 +20,10 @@
             Add-Type -Path (Join-Path $root "Tools\WinSCPnet.dll") -ErrorAction Stop
         }
 
-        # ---------------------------------------------------------------------
-        # Fake WinSCP session factory
-        # ---------------------------------------------------------------------
-        function New-BRAVOSelfTestFakeBazaSession {
-            param(
-                [string[]]$FailOnRelativePaths = @(),
-                [switch]$AllTransfersFail,
-                [switch]$MoveFileShouldFail,
-                [switch]$RemoveFilesShouldFail,
-                # R4-3 (PR #136, четверте коло review): опційне повторне
-                # використання "серверного" стану (RemoteSizes/
-                # KnownRemoteDirs) від ПОПЕРЕДНЬОЇ фейкової сесії — реальний
-                # SFTP-сервер переживає між окремими нічними прогонами
-                # Maintenance, кожен з яких відкриває СВОЮ WinSCP.Session;
-                # без цього кожна нова тестова сесія моделювала б "порожній"
-                # сервер, що не знає про файли, завантажені попередньою
-                # сесією, і жива remote-перевірка (Test-BRAVOTraceRemote-
-                # ArchivePublicationCurrent) завжди хибно провалювалась би.
-                # Не передано (усі наявні виклик-площини) -> точно стара
-                # поведінка, нуль різниці: свіжий порожній Hashtable/HashSet.
-                [AllowNull()]$SeedRemoteState
-            )
-            # ПРИМІТКА (PS 5.1): `if(){}else{}` як значення прямо всередині
-            # @{} hashtable-літералу для HashSet[string] розгортає
-            # односимвольний HashSet у скалярний рядок (той самий клас
-            # pipeline-unwrap багу, що @(List[object]) — HashSet, на
-            # відміну від Hashtable, не отримує спеціального PowerShell-
-            # захисту від enumerate-розгортання). Явні проміжні змінні
-            # (простий присвоєння властивості, без capture через
-            # statement-результат) зберігають референс без розгортання.
-            if ($null -ne $SeedRemoteState) {
-                $seededKnownRemoteDirs = $SeedRemoteState.KnownRemoteDirs
-                $seededRemoteSizes = $SeedRemoteState.RemoteSizes
-            } else {
-                $seededKnownRemoteDirs = New-Object System.Collections.Generic.HashSet[string]
-                $seededRemoteSizes = @{}
-            }
-            $state = [pscustomobject]@{
-                PutFilesCallCount = 0
-                PutFilesCalledFor = New-Object System.Collections.Generic.List[string]
-                KnownRemoteDirs = $seededKnownRemoteDirs
-                RemoteSizes = $seededRemoteSizes
-                MoveFileCalls = New-Object System.Collections.Generic.List[string]
-                RemoveFilesCalls = New-Object System.Collections.Generic.List[string]
-                FileExistsCalledFor = New-Object System.Collections.Generic.List[string]
-                GetFileInfoCalledFor = New-Object System.Collections.Generic.List[string]
-                MoveFileShouldFail = [bool]$MoveFileShouldFail
-                RemoveFilesShouldFail = [bool]$RemoveFilesShouldFail
-                LastResumeSupportState = $null
-            }
-            $session = New-Object psobject
-            $session | Add-Member -MemberType NoteProperty -Name State -Value $state
-            $session | Add-Member -MemberType ScriptMethod -Name FileExists -Value {
-                param($path)
-                # Як і реальний WinSCP Session.FileExists — і каталоги, і файли.
-                [void]$this.State.FileExistsCalledFor.Add([string]$path)
-                return ($this.State.KnownRemoteDirs.Contains($path) -or $this.State.RemoteSizes.ContainsKey($path))
-            }
-            $session | Add-Member -MemberType ScriptMethod -Name CreateDirectory -Value {
-                param($path)
-                [void]$this.State.KnownRemoteDirs.Add($path)
-            }
-            $failSet = New-Object System.Collections.Generic.HashSet[string]
-            foreach ($p in $FailOnRelativePaths) { [void]$failSet.Add($p.Replace('\','/')) }
-            $allFail = [bool]$AllTransfersFail
-            $putFilesScript = {
-                param($localPath, $remotePath, $remove, $options)
-                $this.State.PutFilesCallCount++
-                [void]$this.State.PutFilesCalledFor.Add($remotePath)
-                if ($null -ne $options -and $null -ne $options.ResumeSupport) {
-                    $this.State.LastResumeSupportState = [string]$options.ResumeSupport.State
-                }
-                $localSize = (Get-Item -LiteralPath $localPath).Length
-                $normalizedRemote = [string]$remotePath
-                $shouldFail = $allFail
-                foreach ($f in $failSet) {
-                    if ($normalizedRemote.EndsWith($f)) { $shouldFail = $true }
-                }
-                if ($shouldFail) {
-                    $errObj = [pscustomobject]@{ Error = [pscustomobject]@{ Message = "simulated transfer failure" } }
-                    return [pscustomobject]@{ IsSuccess = $false; Transfers = @($errObj) }
-                }
-                $this.State.RemoteSizes[$normalizedRemote] = $localSize
-                return [pscustomobject]@{ IsSuccess = $true; Transfers = @() }
-            }.GetNewClosure()
-            $session | Add-Member -MemberType ScriptMethod -Name PutFiles -Value $putFilesScript
-            $session | Add-Member -MemberType ScriptMethod -Name GetFileInfo -Value {
-                param($remotePath)
-                [void]$this.State.GetFileInfoCalledFor.Add([string]$remotePath)
-                $size = $this.State.RemoteSizes[[string]$remotePath]
-                if ($null -eq $size) { $size = 0 }
-                return [pscustomobject]@{ Length = $size }
-            }
-            # P2 (deep review): checkpoint publish/replace і no-delete
-            # structural coverage. MoveFile навмисно моделює SFTP-семантику
-            # "rename НЕ перезаписує наявну ціль" (hardening round 2) — щоб
-            # production-код, який покладався б на rename-overwrite, падав
-            # у тестах, а не на реальному сервері на другому циклі.
-            $session | Add-Member -MemberType ScriptMethod -Name MoveFile -Value {
-                param($sourcePath, $targetPath)
-                [void]$this.State.MoveFileCalls.Add("$sourcePath -> $targetPath")
-                if ($this.State.MoveFileShouldFail) { throw "simulated MoveFile failure" }
-                if ($this.State.RemoteSizes.ContainsKey($targetPath)) {
-                    throw "simulated rename failure: target already exists: $targetPath"
-                }
-                if ($this.State.RemoteSizes.ContainsKey($sourcePath)) {
-                    $this.State.RemoteSizes[$targetPath] = $this.State.RemoteSizes[$sourcePath]
-                    $this.State.RemoteSizes.Remove($sourcePath)
-                }
-            }
-            $session | Add-Member -MemberType ScriptMethod -Name ListDirectory -Value {
-                param($path)
-                # Спрощена модель WinSCP Session.ListDirectory: безпосередні
-                # діти каталогу з RemoteSizes/KnownRemoteDirs. Використовується
-                # міграцією журнальних архівів (TraceArchive-фрагмент).
-                $normalized = ([string]$path).TrimEnd('/')
-                $files = New-Object System.Collections.Generic.List[object]
-                foreach ($remotePath in @($this.State.RemoteSizes.Keys)) {
-                    if ($remotePath -notlike "$normalized/*") { continue }
-                    $childRelative = $remotePath.Substring($normalized.Length + 1)
-                    if ($childRelative.Contains('/')) { continue }
-                    [void]$files.Add([pscustomobject]@{
-                        Name = $childRelative
-                        IsDirectory = $false
-                        Length = [int64]$this.State.RemoteSizes[$remotePath]
-                    })
-                }
-                foreach ($knownDir in @($this.State.KnownRemoteDirs)) {
-                    if ($knownDir -notlike "$normalized/*") { continue }
-                    $childRelative = $knownDir.Substring($normalized.Length + 1)
-                    if ($childRelative.Contains('/')) { continue }
-                    [void]$files.Add([pscustomobject]@{
-                        Name = $childRelative
-                        IsDirectory = $true
-                        Length = [int64]0
-                    })
-                }
-                return [pscustomobject]@{ Files = @($files.ToArray()) }
-            }
-            $session | Add-Member -MemberType ScriptMethod -Name RemoveFiles -Value {
-                param($path)
-                [void]$this.State.RemoveFilesCalls.Add($path)
-                if ($this.State.RemoveFilesShouldFail) {
-                    # Реальний WinSCP репортує per-file збій у RemovalOperationResult
-                    # (IsSuccess=false) без винятку -- моделюємо саме це.
-                    return [pscustomobject]@{ IsSuccess = $false }
-                }
-                $this.State.RemoteSizes.Remove($path)
-                return [pscustomobject]@{ IsSuccess = $true }
-            }
-            return $session
-        }
+        # New-BRAVOSelfTestFakeBazaSession (фейкова WinSCP-сесія) визначена
+        # у bootstrap-і кореневого BRAVO_SELF_TEST.ps1 (#219): її так само
+        # викликає фрагмент TraceArchive, а -Suite TraceArchive без BazaSync
+        # падав на CommandNotFound.
 
         function New-BRAVOSelfTestBazaFile {
             param([string]$Directory, [string]$RelativePath, [int]$SizeBytes = 100, [datetime]$LastWriteTimeUtc)
@@ -436,6 +289,8 @@
             $mutTypoResult3.MutationViolations[0].RelativePath -eq 'verified.txt' -and
             $mutTypoSession3.State.PutFilesCallCount -eq 0
         ) -Name 'BazaSync/ExplicitValidFailPolicyMutationBehaviorUnchanged' -Failure "явне MutationPolicy='Fail' на тій самій мутації має лишатись MUTATION_VIOLATION без upload (regression); Status=$($mutTypoResult3.Status),Violations=$($mutTypoResult3.MutationViolations.Count),PutFiles=$($mutTypoSession3.State.PutFilesCallCount)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ConfigDefinesBazaBlock' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ConfigContractInvalidMutationPolicyRejected' -DependsOn 'BazaSync/ConfigDefinesBazaBlock') { try {
 
         # D. Config-рівень (Get-BRAVOBazaSettingsEffective): невалідне
         # значення відхиляється fail-closed з точним іменем ключа й
@@ -677,6 +532,8 @@
         $skippedHealth = Get-BRAVOBazaFastHealthResult -SyncResult $skippedResult
         Test-BRAVOCondition -Condition ($skippedHealth.Healthy -eq $true -and $skippedHealth.Level -eq 'INFO') `
             -Name 'BazaSync/SkippedConcurrentIsHealthyInfoNotAlert' -Failure 'SKIPPED_CONCURRENT не повинен бути alert -- це ознака активної роботи іншого процесу'
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ConfigContractInvalidMutationPolicyRejected' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/PerformancePlanScalesWithNewFilesNotTotalFiles' -DependsOn 'BazaSync/ConfigDefinesBazaBlock') { try {
 
         # =======================================================================
         # PERFORMANCE REGRESSION (section 22)
@@ -838,6 +695,8 @@
             -Name 'BazaSync/IncompleteStateSaveFailureIsNotHealthy' -Failure "INCOMPLETE з Failed=0/Pending=0 (збій Save-BRAVOBazaState ПІСЛЯ успішних upload-ів) має бути Healthy=false; отримано Healthy=$($drP12FastHealth.Healthy)"
         Test-BRAVOCondition -Condition ($drP12FastHealth.Message -notmatch 'актуальна') `
             -Name 'BazaSync/IncompleteWithZeroFailedNeverSaysCloudCurrent' -Failure "повідомлення НЕ має стверджувати актуальність хмарної копії; отримано: $($drP12FastHealth.Message)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/PerformancePlanScalesWithNewFilesNotTotalFiles' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/UnknownStatusFailsVisible' -DependsOn 'BazaSync/ConfigDefinesBazaBlock') { try {
 
         $drP12UnknownResult = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId 'x' -StartedUtc (Get-Date) -CutoffUtc (Get-Date)
         $drP12UnknownResult.Status = 'SOME_FUTURE_STATUS_NOBODY_HANDLES'
@@ -1020,6 +879,8 @@
             (@($drP2NameResult.IncompatibleFiles).Count -eq 1) -and
             ($drP2NameResult.IncompatibleFiles[0].RelativePath -match [regex]::Escape($drUtf8Name.Substring(0, 20)))
         ) -Name 'BazaSync/FilenameCompatCompatibleCandidateStillUploads' -Failure "очікувався рівно 1 upload (normal.txt) і 1 явний incompatible-результат; Uploaded=$($drP2NameResult.Uploaded) PutFiles=$($drP2NameSession.State.PutFilesCallCount) Incompatible=$(@($drP2NameResult.IncompatibleFiles).Count)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/UnknownStatusFailsVisible' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/FilenameCompatIncompatibleProducesExplicitResult' -DependsOn 'BazaSync/UnknownStatusFailsVisible') { try {
 
         $drP2NameHealth = Get-BRAVOBazaFastHealthResult -SyncResult $drP2NameResult
         Test-BRAVOCondition -Condition ($drP2NameHealth.Healthy -eq $false -and $drP2NameHealth.Message -match [regex]::Escape($drUtf8Name.Substring(0, 20))) `
@@ -1164,6 +1025,8 @@
             $drCfgDefaults.SynchronizeBeforeHealth -eq $true -and $drCfgDefaults.FastHealthEnabled -eq $true
         ) -Name 'BazaSync/ConfigContractDefaultsDoNotThrow' -Failure "відсутність BAZA-ключів має давати типові true/true без помилки; Error=$drCfgError4"
         $global:backupMonitoring = $null
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/FilenameCompatIncompatibleProducesExplicitResult' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/NoDeleteAnywhereInIncrementalEngine' -DependsOn 'BazaSync/FilenameCompatIncompatibleProducesExplicitResult') { try {
 
         # =======================================================================
         # DEEP REVIEW acceptance 10: жодного -delete / remote-видалення даних
@@ -1400,6 +1263,8 @@
         ) -Name 'BazaSync/ExistingRemoteSameSizeMarksVerifiedWithoutUpload' -Failure "кандидат із уже наявним remote-файлом того самого розміру має стати Verified=true БЕЗ передачі; Status=$($hr3RecResult.Status) Recovered=$($hr3RecResult.RecoveredRemote) Uploaded=$($hr3RecResult.Uploaded)"
         Test-BRAVOCondition -Condition ($hr3RecSession.State.PutFilesCallCount -eq 0) `
             -Name 'BazaSync/ExistingRemoteSameSizeMakesZeroPutFilesCalls' -Failure "нуль PutFiles для recovered кандидата; отримано $($hr3RecSession.State.PutFilesCallCount)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/NoDeleteAnywhereInIncrementalEngine' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ExistingRemoteMismatchReturnsRemoteConflict' -DependsOn 'BazaSync/PerformancePlanScalesWithNewFilesNotTotalFiles', 'BazaSync/UnknownStatusFailsVisible') { try {
 
         # remote-файл існує з ІНШИМ розміром -> REMOTE_CONFLICT, без перезапису
         $hr3ConfRoot = Join-Path $bazaSyncTestRoot "HR3_Conflict"
@@ -1687,6 +1552,8 @@
             $hr4PerStateAfter.State.Files.ContainsKey('drifted2.txt') -and
             [bool]$hr4PerStateAfter.State.Files['drifted2.txt'].Verified -eq $false
         ) -Name 'BazaSync/PeriodicFullAuditSameSizeDriftIsNotRecovered' -Failure "періодичний audit-pending drift (same size) НЕ recovery-иться: AUDIT_DRIFT, 0 PutFiles, Verified лишається false; Status=$($hr4PerResult2.Status) PutFiles=$($hr4PerSession2.State.PutFilesCallCount)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ExistingRemoteMismatchReturnsRemoteConflict' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/AuditPendingDoesNotAdvanceLastSuccessfulSyncUtc' -DependsOn 'BazaSync/ExistingRemoteMismatchReturnsRemoteConflict') { try {
 
         Test-BRAVOCondition -Condition (
             -not [string]::IsNullOrWhiteSpace($hr4PerProvenanceUtc) -and
@@ -1985,6 +1852,8 @@
             $hr6MisHealth.Healthy -eq $false -and $hr6MisHealth.Level -eq 'CRITICAL' -and
             $hr6MisHealth.Message -match 'gone\.txt'
         ) -Name 'BazaSync/PersistedAuditDriftMissingLocalRemainsUnhealthy' -Failure "Health для missing-local блокера: CRITICAL з точним шляхом; Healthy=$($hr6MisHealth.Healthy) Message=$($hr6MisHealth.Message)"
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/AuditPendingDoesNotAdvanceLastSuccessfulSyncUtc' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/PersistedAuditDriftMissingLocalDoesNotAdvanceProvenance' -DependsOn 'BazaSync/AuditPendingDoesNotAdvanceLastSuccessfulSyncUtc') { try {
 
         $hr6MisStateAfter2 = Read-BRAVOBazaState -Path $hr6MisStatePath
         Test-BRAVOCondition -Condition (
@@ -2303,6 +2172,8 @@
             @($mrFailResult.StateRemoved).Count -eq 0 -and
             $null -ne $mrStateAfterFail.State.Files['doc1.pdf']
         ) -Name 'BazaSync/ReconcileMoveFailureKeepsStateEntry' -Failure 'збій MoveFile має лишати state-запис неторкнутим (fail-closed: довіра знімається лише після успішного rename)'
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/PersistedAuditDriftMissingLocalDoesNotAdvanceProvenance' } }
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ReconcileRenamesRemoteAndRemovesStateEntry' -DependsOn 'BazaSync/PersistedAuditDriftMissingLocalDoesNotAdvanceProvenance') { try {
 
         # Успішний reconcile обох мутацій: старі remote-версії перейменовано
         # у *.replaced_*, ключі прибрано, keep.txt неторкнутий, ЖОДНОГО
@@ -2358,6 +2229,7 @@
         Test-BRAVOCondition -Condition (
             $mrReconcileEntrypointText -match '\$acceptList\s*=\s*@\(if\s'
         ) -Name 'BazaSync/ReconcileAcceptListAssignmentStaysArrayWrapped' -Failure 'BRAVO_BAZA_RECONCILE: $acceptList має присвоюватися як @(if ...) — if-вираз без обгортки розгортає одноелементний масив у скаляр і .Count падає під StrictMode 2.0'
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ReconcileRenamesRemoteAndRemovesStateEntry' } }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

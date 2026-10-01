@@ -11,18 +11,19 @@
 # New-BRAVOSelfTestRuntimeModule, $script:failures.
 #
 # Свідомо відсутні тут ID з §63 (перевірено 2026-08-31, не оверсайт):
-#   A3  — below-floor relaxation при достатній оцінці. Сценарій прибраний
-#         разом із PeakSafeEstimate=false для Archive (§24.1); замінений на
-#         A24 (BLOCK BelowFloorEstimateNotPeakSafe) і A25 (той самий вхід під
-#         ArchivePeakSafe-політикою, яка в 5.2.3 не використовується
-#         production-виклик-сайтом — лише доводить наявність коду).
+#   A3  — below-floor relaxation при достатній оцінці. Сценарій покриває
+#         A24: у 5.2.3 він перевіряв BLOCK BelowFloorEstimateNotPeakSafe, з
+#         5.2.4 (production-виклик-сайт на ArchivePeakSafe) — ALLOW + WARNING
+#         BelowHealthFloorButRequirementSatisfied; A25 доводить, що
+#         невиконана вимога блокує й далі.
 #   A12 — SyncBAZA-потік. Invoke-ManualBAZASFTPSynchronization НЕ підключений
 #         до Invoke-BRAVODiskSpaceClassifier у цьому релізі (CHANGELOG,
 #         "Відомі обмеження") — тестувати нема що, поведінка незмінна
 #         відносно 5.2.2.
-#   A13 — peak-estimator characterization. Результат Phase 0 зафіксований як
-#         рішення коду (PeakSafeEstimate=false, коментар на початку
-#         BRAVO.DiskSpace.psm1), а не як окремий регресійний тест.
+#   A13 — peak-estimator characterization. Не окремий регресійний тест:
+#         рішення 5.2.3 (PeakSafeEstimate=false) скасоване в 5.2.4 —
+#         обґрунтування в коментарі над RequirementPolicy='ArchivePeakSafe'
+#         у Resolve-BRAVOArchiveSpaceDecision та в CHANGELOG 5.2.4-rc.1.
 #   A18, A21, A22 — remote/SFTP capacity-unknown і access-unavailable
 #         сценарії. StorageKind SFTP проходить ті самі гілки класифікатора,
 #         що й UNC/AccessUnavailable — реальне branch-покриття вже дають

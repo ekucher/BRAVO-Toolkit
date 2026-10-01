@@ -7,6 +7,7 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 -- НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 
+    if (Enter-BRAVOSelfTestSection -Name 'Configuration/DefaultExcludedDrivesEmpty') { try {
     Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
 
     # --- Built-in default: ExcludedDrives = @() (розділ 5 ТЗ) ---
@@ -407,6 +408,8 @@
         if ($null -ne $discoveryOverrideBeforePath) { $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $discoveryOverrideBeforePath }
         Remove-Item -LiteralPath $discoveryOverrideTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/DefaultExcludedDrivesEmpty' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Configuration/Delta') { try {
 
     # =====================================================================
     # BRAVO.Configuration.Delta — порівняння графів (#154, задача B0)
@@ -1023,6 +1026,8 @@
         -Name "DataFile/LoaderNoLongerInvokesSiteFile" `
         -Failure "Read-BRAVOLocalConfigurationOverrides мусить вилучати дані через ConvertFrom-BRAVOConfigurationDataFileText і не створювати/не викликати scriptblock site-файлу"
 }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/Delta' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configuration/DiscoveryOverride') { try {
 
 # =============================================================
 # #158 (етап 4): discovery overrides застосовуються ДО discovery
@@ -1649,6 +1654,8 @@
         -Name "Schema/LoaderValidatesLocalLayerBeforeMerge" `
         -Failure "BRAVO_CONFIG_LOADER мусить валідувати типи site-шару ДО Resolve-BRAVORawConfiguration (validation=$schemaValidationIndex merge=$schemaMergeIndex)"
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/DiscoveryOverride' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
 
 # =====================================================================
 # Wave 2 (#216): авторизація local-override шляхів BRAVO.local.config
@@ -1656,6 +1663,7 @@
 # Окремий child scope (& { ... }) — з тієї самої причини, що й решта
 # фрагментів вище: усі фрагменти self-test дот-сорсяться в ОДИН scope.
 & {
+    if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization.RegistryCoversEveryCanonicalLeaf') { try {
     Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
     Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
 
@@ -1977,6 +1985,8 @@
         -Condition (-not [bool]$irHighPrecisionDecimalResult.IsValid) `
         -Name "Configuration/IntegerRangeHighPrecisionDecimalFractionRejected" `
         -Failure "високоточний дробовий decimal (6.9999999999999999999999999999, [double]-звуження округлює рівно до 7.0) мусить лишитись відхиленим як дробове значення, не проходити через double-precision-loss; отримано IsValid=$($irHighPrecisionDecimalResult.IsValid)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/Authorization.RegistryCoversEveryCanonicalLeaf' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Configuration/IntegerRangeExactDecimalIntegerAccepted' -DependsOn 'Configuration/Authorization.RegistryCoversEveryCanonicalLeaf') { try {
 
     # --- Configuration/IntegerRangeExactDecimalIntegerAccepted ---
     # Негативний контроль: справжнє ціле decimal (без дробової частини)
@@ -2342,6 +2352,8 @@
         -Condition ([bool]$logLevelTrimmedResult.IsValid) `
         -Name "Authorization/LogLevelWhitespaceTrimmedValueAccepted" `
         -Failure "LogLevel=' ERROR ' (whitespace навколо валідного значення) мусить бути прийнятий, як і defaultLogLevel; отримано IsValid=$($logLevelTrimmedResult.IsValid)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/IntegerRangeExactDecimalIntegerAccepted' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization.LogLevelInvalidTrimmedValueRejected' -DependsOn 'Configuration/Authorization.RegistryCoversEveryCanonicalLeaf') { try {
 
     # --- Authorization/LogLevelInvalidTrimmedValueRejected ---
     $logLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
@@ -2588,6 +2600,8 @@
         -Condition ([bool]$r35ConsoleLevelWhitespaceResult.IsValid) `
         -Name "Preview/ConsoleLevelWhitespaceAccepted" `
         -Failure "consoleSettings.ConsoleLevel=' ERROR ' мусить бути прийнятий (доведена trim-tolerance runtime-споживача); отримано IsValid=$($r35ConsoleLevelWhitespaceResult.IsValid)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/Authorization.LogLevelInvalidTrimmedValueRejected' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Configuration/Preview' -DependsOn 'Configuration/Authorization.RegistryCoversEveryCanonicalLeaf') { try {
 
     # --- Preview/FileLevelWhitespaceAccepted ---
     $r35FileLevelWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
@@ -2869,6 +2883,8 @@
         -Condition (-not [bool]$authBazaIncrementalResult.IsValid) `
         -Name "Authorization/OwnerDecisionBazaModeIncrementalAppendOnlyAlsoDenied" `
         -Failure "backupMonitoring.SFTP.BAZA.Mode='IncrementalAppendOnly' МУСИТЬ теж бути відхилений — авторизація про володіння листом, не про безпечність значення"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/Preview' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization.UnknownTerminalLeafUnderKnownNodeStillD3Accepted' -DependsOn 'Configuration/Authorization.RegistryCoversEveryCanonicalLeaf') { try {
 
     # --- Authorization/UnknownTerminalLeafUnderKnownNodeStillD3Accepted ---
     # D3 (рішення власника 2026-09-14) не повинен зламатись Wave 2:
@@ -3167,7 +3183,10 @@
         -Condition (-not $authRegistry.Contains('bravoSettings.NotificationRouting')) `
         -Name "Authorization/NestedRegistryStaysLeafOnly" `
         -Failure "реєстр авторизації мусить лишатись leaf-only — bravoSettings.NotificationRouting (Node) не повинен мати власного запису в реєстрі"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/Authorization.UnknownTerminalLeafUnderKnownNodeStillD3Accepted' } }
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/Authorization' } }
+if (Enter-BRAVOSelfTestSection -Name 'Configuration/ConfigVersion') { try {
 
 # =====================================================================
 # Версійний диспетч site-файлу (#154, B3)
@@ -3622,3 +3641,4 @@
         -Name "PilotSafety/CredentialReferenceNeverResolved" `
         -Failure "credentialSettings.SFTPPassword після повного конвеєра має лишатись ТОЧНО тим самим рядком-посиланням, що прийшов із legacy-фікстури ('BRAVO_SFTP_PASSWORD_PILOT_SITE'), не резолвнутим значенням; отримано '$($pilotAfter.credentialSettings.SFTPPassword)'"
 }
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configuration/ConfigVersion' } }

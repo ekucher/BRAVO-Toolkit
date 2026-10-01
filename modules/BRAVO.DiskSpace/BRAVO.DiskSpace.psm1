@@ -24,14 +24,22 @@
 # запуску — модуль підключається через Import-Module так само, як
 # BRAVO.ExitCodes/BRAVO.Logging.
 #
-# Минуле рішення (5.2.1): Archive мав власний Merge-BRAVOArchiveSpaceCheckResults,
-# який послаблював фіксований поріг per-drive, коли Get-BRAVOArchiveEstimatedSpaceRequirement
-# показував достатність. Ця функція видалена в 5.2.3 разом з переходом на
-# спільний класифікатор: PeakSafeEstimate=false для Archive (estimator НЕ
-# доведений peak-safe — не враховує retained generations і .work тимчасові
-# файли), тому below-floor relaxation свідомо вимкнено — див. політику
-# 'ArchiveNotPeakSafe' нижче. Це навмисне посилення проти 5.2.1, задокументоване
-# окремо (CHANGELOG/upgrade notes), а не регресія.
+# Історія рішення про below-floor для Archive:
+# - 5.2.1/5.2.2: Archive мав власний Merge-BRAVOArchiveSpaceCheckResults,
+#   який послаблював фіксований поріг per-drive, коли
+#   Get-BRAVOArchiveEstimatedSpaceRequirement показував достатність.
+# - 5.2.3: функцію видалено разом з переходом на спільний класифікатор;
+#   Archive викликав його з RequirementPolicy='ArchiveNotPeakSafe', тож
+#   below-floor при достатній оцінці БЛОКУВАВ (BelowFloorEstimateNotPeakSafe).
+# - 5.2.4 і далі (чинне): Resolve-BRAVOArchiveSpaceDecision у
+#   BRAVO.Archive.Runtime.ps1 передає RequirementPolicy='ArchivePeakSafe'.
+#   Below-floor при виконаній Known-вимозі дає Status=Warning, Blocks=false,
+#   Reason=BelowHealthFloorButRequirementSatisfied; за нестачею місця блокує
+#   лише EstimatedRequirementNotMet (або BelowFallbackFloorNoEstimate, коли вимога
+#   Unknown). Обґрунтування — коментар над цим викликом і CHANGELOG 5.2.4-rc.1.
+# Гілка 'ArchiveNotPeakSafe' у Resolve-BRAVODiskSpaceGroupDecision лишається
+# в контракті класифікатора (self-test DiskSpace/S* викликає його саме з нею),
+# але production-викликачі її не використовують.
 
 Set-StrictMode -Version Latest
 

@@ -28,6 +28,7 @@
 # бо виклики між функціями одного psm1 резолвляться в межах module
 # session state, а не глобальної сесії.
 
+    if (Enter-BRAVOSelfTestSection -Name 'Operations/UrlNormalizationTrailingSlashInvariant') { try {
     Import-Module -Name (Join-Path $root "modules\BRAVO.Logging\BRAVO.Logging.psd1") -Force -ErrorAction Stop
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
     Import-Module -Name (Join-Path $root "modules\BRAVO.Credentials\BRAVO.Credentials.psd1") -Force -ErrorAction Stop
@@ -549,6 +550,8 @@
         $legacyStateReadClaim -eq $legacyStateClaim -and $legacyStateMintedClaim -eq $legacyStateClaim
     ) -Name 'Operations/StateFileMissingNewerOptionalFieldKeepsClaim' `
       -Failure "State-файл без новішого optional-поля мусить зберегти персистований claim ($legacyStateClaim); прочитано [$legacyStateReadClaim], Get-BRAVOOperationsEnrollmentClaim повернув [$legacyStateMintedClaim] (якщо він інший — наступний POST /enroll дав би постійний 409 claim_mismatch)"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Operations/UrlNormalizationTrailingSlashInvariant' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Operations/ApprovedWithoutApiKeyMeansTtlExpiredReturnsNullNoThrow' -DependsOn 'Operations/UrlNormalizationTrailingSlashInvariant') { try {
 
     # =====================================================================
     # ENROLLMENT (A1-A7 протокол — агент сам генерує claim, сервер його
@@ -1027,6 +1030,8 @@
     Test-BRAVOCondition -Condition (-not $noPathGoodRemainsInOutbox -and $noPathDrainOutcome -eq 'ok') `
         -Name 'Operations/OutboxItemWithoutApiPathDoesNotBlockRemainingQueueDrain' `
         -Failure "справний item після item-а без ApiPath МАВ БУТИ доставлений у тому самому дренажі, а результат дренажу -- 'ok', а не 'transient'; outcome=$noPathDrainOutcome goodRemainsInOutbox=$noPathGoodRemainsInOutbox"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Operations/ApprovedWithoutApiKeyMeansTtlExpiredReturnsNullNoThrow' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Operations/EnabledWithEmptyApiBaseUrlFailsClosedReturnsNull' -DependsOn 'Operations/UrlNormalizationTrailingSlashInvariant') { try {
 
     # ---------------------------------------------------------------------
     # Thread 6/P2 (review): Enabled=true + порожній ApiBaseUrl -- НЕ
@@ -1362,3 +1367,4 @@
     [Environment]::SetEnvironmentVariable('BRAVO_OPERATIONS_TEST_STATE_DIR', $null)
     Remove-Module -Name 'BRAVO.Operations' -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $opsSelfTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Operations/EnabledWithEmptyApiBaseUrlFailsClosedReturnsNull' } }
