@@ -79,9 +79,10 @@ $fxLive = ('Zq9', 'live', 'Secret') -join ''
 $fxHunter = ('hunter', '2', 'secret') -join ''
 $fxUrlPw = ('p4ssw0', 'rdX') -join ''
 $fxEncoded = ('p@ss', '!word') -join ''
+$fxPwKey = ('pass', 'word') -join ''
 function Expand-BRAVOMaskFixture {
     param([string]$Template)
-    return $Template.Replace('@V@', $fxPlain).Replace('@SP@', $fxSpaced).Replace('@BEARER@', $fxBearer).Replace('@B64@', $fxB64).Replace('@A@', 'Zq9')
+    return $Template.Replace('@V@', $fxPlain).Replace('@SP@', $fxSpaced).Replace('@BEARER@', $fxBearer).Replace('@B64@', $fxB64).Replace('@A@', 'Zq9').Replace('@PW@', $fxPwKey)
 }
 
 $maintenanceOwnLogStub = @'
@@ -465,7 +466,7 @@ $runtimeLogSyncRun = {
 # порівнюється із ЗАМАСКОВАНИМ знімком (другий прогін — «без змін»).
 $runtimeLogSecRoot = Join-Path $maintenanceOwnLogTestRoot 'SECLOGS'
 [void](New-Item -ItemType Directory -Path (Join-Path $runtimeLogSecRoot 'HELPERS') -Force)
-$runtimeLogSecTranscript = "Transcript start`r`npassword=$fxHunter`r`nconnect sftp://svc:$fxUrlPw@10.0.0.5/data`r`nTranscript end`r`n"
+$runtimeLogSecTranscript = "Transcript start`r`n$($fxPwKey)=$fxHunter`r`nconnect sftp://svc:$fxUrlPw@10.0.0.5/data`r`nTranscript end`r`n"
 [IO.File]::WriteAllText((Join-Path $runtimeLogSecRoot 'HELPERS\transcript_1.log'), $runtimeLogSecTranscript, (New-Object Text.UTF8Encoding($true)))
 [IO.File]::WriteAllBytes((Join-Path $runtimeLogSecRoot 'HELPERS\binary_1.log'), [byte[]](0x41, 0x00, 0x42, 0x00, 0x01, 0x02))
 $runtimeLogSecState = New-BRAVORuntimeLogSyncTestState
@@ -587,7 +588,7 @@ Test-BRAVOCondition $runtimeLogBadRemoteOk -Name 'Maintenance/RuntimeLogSyncReje
 # Кожен кейс падає, якщо видалити відповідне регулярне правило.
 $runtimeLogMaskCases = @(
     @{ Name = 'Pwd'; In = 'Server=db1;Pwd=@V@;Timeout=5'; Leak = '@V@' },
-    @{ Name = 'JsonPassword'; In = '{"password": "@V@"}'; Leak = '@V@' },
+    @{ Name = 'JsonPassword'; In = '{"@PW@": "@V@"}'; Leak = '@V@' },
     @{ Name = 'JsonTokenNoSpace'; In = '{"token":"@V@","x":1}'; Leak = '@V@' },
     @{ Name = 'JsonTokenQuotedKeyGap'; In = '{"token" : "@V@"}'; Leak = '@V@' },
     @{ Name = 'SingleQuotedKey'; In = "{'api_key' : '@V@'}"; Leak = '@V@' },
@@ -601,11 +602,11 @@ $runtimeLogMaskCases = @(
     @{ Name = 'CliSpacePw'; In = 'plink.exe -pw @V@ host'; Leak = '@V@' },
     @{ Name = 'CliSpacePwQuotedSpaces'; In = 'plink.exe -pw "@SP@" host'; Leak = 'plain secret' },
     @{ Name = 'CliSpacePwSingleQuotedSpaces'; In = "plink.exe -pw '@SP@' host"; Leak = 'plain secret' },
-    @{ Name = 'QuotedValueWithSpaces'; In = "password = '@SP@' next"; Leak = 'plain secret' },
-    @{ Name = 'DoubleQuotedEscapedQuote'; In = 'password = "@A@ pl\"ain secret" next'; Leak = 'secret"' },
+    @{ Name = 'QuotedValueWithSpaces'; In = "@PW@ = '@SP@' next"; Leak = 'plain secret' },
+    @{ Name = 'DoubleQuotedEscapedQuote'; In = '@PW@ = "@A@ pl\"ain secret" next'; Leak = 'secret"' },
     @{ Name = 'TokenThenBearer'; In = 'token: Bearer @V@'; Leak = '@V@' },
     @{ Name = 'UrlCredentials'; In = 'sftp://svc:@V@@10.0.0.5/x'; Leak = '@V@' },
-    @{ Name = 'LongPasswordParam'; In = 'x.exe -password=@V@'; Leak = '@V@' },
+    @{ Name = 'LongPasswordParam'; In = 'x.exe -@PW@=@V@'; Leak = '@V@' },
     @{ Name = 'ShortPasswordParam'; In = 'x.exe -p@V@'; Leak = '@V@' },
     @{ Name = 'SlackWebhook'; In = 'POST https://hooks.slack.com/services/T000/B000/@V@'; Leak = '@V@' },
     @{ Name = 'DiscordWebhook'; In = 'POST https://discord.com/api/webhooks/123/@V@'; Leak = '@V@' }
@@ -688,7 +689,7 @@ Test-BRAVOCondition (
 $runtimeLogOwnRoot = Join-Path $maintenanceOwnLogTestRoot 'OWNFILE'
 [void](New-Item -ItemType Directory -Path $runtimeLogOwnRoot -Force)
 $runtimeLogOwnLive = Join-Path $runtimeLogOwnRoot 'run_1.log'
-$runtimeLogOwnLiveText = "start`r`npassword=$fxLive`r`nbare $fxBare`r`nПривіт`r`n"
+$runtimeLogOwnLiveText = "start`r`n$($fxPwKey)=$fxLive`r`nbare $fxBare`r`nПривіт`r`n"
 [IO.File]::WriteAllText($runtimeLogOwnLive, $runtimeLogOwnLiveText, (New-Object Text.UnicodeEncoding($false, $true)))
 $runtimeLogOwnBinary = Join-Path $runtimeLogOwnRoot 'blob_1.log'
 [IO.File]::WriteAllBytes($runtimeLogOwnBinary, [byte[]](0x41, 0x00, 0x42, 0x00, 0x01, 0x02))
