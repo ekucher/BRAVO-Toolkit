@@ -11638,6 +11638,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             Incomplete = & $reason (& $task) $null $incomplete $now.AddHours(-30)
             IncompleteOlder = & $reason (& $task) $null $incomplete $now.AddHours(-1)
             BadResult = & $reason (& $task -Result (-2147024891)) (& $status 0 1) $null $null
+            SameCodeNamed = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 1) $null $null
+            SameCodeOldStatus = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 30) $null $null
+            NewerFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            OlderFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 5) $null $incomplete $now.AddHours(-30)
             CodeZero = & $reason (& $task -Result 0) $null $null $null
             Running = & $reason (& $task -Result 267009 -RunAgeHours 1) (& $status 0 30) $null $null
             NeverRunCode = & $reason (& $task -Result 267011) $null $null $null
@@ -11667,7 +11671,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $staleReasons.Disabled -eq 'завдання BRAVO_ARCHIV вимкнене' -and
             $staleReasons.Incomplete -match 'G-NEW' -and $staleReasons.Incomplete -match 'INCOMPLETE' -and $staleReasons.Incomplete -match 'MODEL/SHA512' -and
             $null -eq $staleReasons.IncompleteOlder -and
-            $staleReasons.BadResult -match '0x80070005' -and $staleReasons.BadResult -match 'TEST_NAME' -and
+            $staleReasons.BadResult -match '0x80070005' -and $staleReasons.BadResult -notmatch 'TEST_NAME' -and
+            $staleReasons.SameCodeNamed -match '0x00000014 \(TEST_NAME\)' -and
+            $staleReasons.SameCodeOldStatus -match '0x00000014' -and $staleReasons.SameCodeOldStatus -notmatch 'TEST_NAME' -and
+            $staleReasons.NewerFailedRun -match '0x80070005' -and $staleReasons.NewerFailedRun -notmatch 'G-NEW' -and
+            $staleReasons.OlderFailedRun -match 'G-NEW' -and
             $null -eq $staleReasons.CodeZero -and
             $staleReasons.NotRun -match '^завдання не запускалося з \d\d\.\d\d\.\d{4} \d\d:\d\d$' -and
             $staleReasons.Early -match 'завершився достроково' -and
@@ -11683,6 +11691,36 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/StaleGenerationReasonClassifier' `
         -Failure "класифікатор причин (завдання відсутнє/вимкнене/INCOMPLETE/код/не запускалося/достроково/статус/нічого; помилка читання пропускає перевірку): $($staleReasons | ConvertTo-Json -Compress)"
+
+    $fingerprintModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @('Get-BRAVOHealthIssueField', 'Get-AlertFingerprint')
+    $fingerprints = & $fingerprintModule {
+        Set-StrictMode -Version Latest
+        $issue = {
+            param($Diagnosis)
+            [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; Diagnosis = $Diagnosis }
+        }
+        $other = [pscustomobject]@{ Kind = 'LocalBackup'; Component = 'MODEL'; Reason = 'x'; FileName = 'a.7z'; LastWriteTime = $null; Diagnosis = 'a' }
+        $other2 = [pscustomobject]@{ Kind = 'LocalBackup'; Component = 'MODEL'; Reason = 'x'; FileName = 'a.7z'; LastWriteTime = $null; Diagnosis = 'b' }
+        [pscustomobject]@{
+            Running = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV виконується зараз')
+            RunningAgain = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV виконується зараз')
+            Disabled = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV вимкнене')
+            NoDiagnosis = Get-AlertFingerprint -Issues @(& $issue $null)
+            OtherA = Get-AlertFingerprint -Issues @($other)
+            OtherB = Get-AlertFingerprint -Issues @($other2)
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $fingerprints.Running -eq $fingerprints.RunningAgain -and
+            $fingerprints.Running -ne $fingerprints.Disabled -and
+            $fingerprints.Disabled -ne $fingerprints.NoDiagnosis -and
+            $fingerprints.OtherA -eq $fingerprints.OtherB
+        ) `
+        -Name 'Health/AlertFingerprintIncludesGenerationDiagnosis' `
+        -Failure "fingerprint LocalBackupGeneration залежить від Diagnosis (змінена причина не придушується), стабільний за незмінної причини; інші Kind не змінюються: $($fingerprints | ConvertTo-Json -Compress)"
 
     $staleCorrupt = & $staleReasonModule {
         Set-StrictMode -Version Latest

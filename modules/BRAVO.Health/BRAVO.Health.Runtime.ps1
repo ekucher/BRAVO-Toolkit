@@ -1222,9 +1222,27 @@ function Get-BRAVOHealthBackupStaleReason {
         $lastRun = & $read $TaskInfo 'LastRunTime'
     }
 
+    $statusExitCode = & $read $ArchiveStatus 'ExitCode'
+    $statusName = [string](& $read $ArchiveStatus 'ExitCodeName')
+    $statusFinished = & $read $ArchiveStatus 'FinishedAt'
+    $hasLastRun = $null -ne $lastRun -and ([datetime]$lastRun).Year -ge 2000
+
+    $resultCode = $null
+    $taskResult = & $read $TaskInfo 'LastTaskResult'
+    if ($null -ne $taskResult) {
+        $resultCode = [uint32]([int64]$taskResult -band [int64]4294967295)
+    }
+    # 0 = успіх, 0x41301 = виконується, 0x41303 = ще не запускалося
+    $taskRunFailed = $null -ne $resultCode -and
+        $resultCode -notin @([uint32]0, [uint32]267009, [uint32]267011)
+
     if ($null -ne $LatestIncomplete) {
         $incompleteUtc = & $read $LatestIncomplete 'CreatedAtUtc'
-        if ($null -ne $incompleteUtc -and
+        # Новіший за manifest невдалий запуск завдання (збій до створення manifest)
+        # не ховаємо за старою INCOMPLETE-спробою — його покаже правило коду нижче.
+        $taskRunNewerAndFailed = $taskRunFailed -and $hasLastRun -and $null -ne $incompleteUtc -and
+            ([datetime]$lastRun).ToUniversalTime() -gt ([datetime]$incompleteUtc).ToUniversalTime()
+        if ($null -ne $incompleteUtc -and -not $taskRunNewerAndFailed -and
             ($null -eq $LatestCompleteUtc -or [datetime]$incompleteUtc -gt [datetime]$LatestCompleteUtc)) {
             $stage = [string](& $read $LatestIncomplete 'Stage')
             $stageText = if ([string]::IsNullOrWhiteSpace($stage)) { '' } else { " (етап: $stage)" }
@@ -1232,18 +1250,15 @@ function Get-BRAVOHealthBackupStaleReason {
         }
     }
 
-    $statusExitCode = & $read $ArchiveStatus 'ExitCode'
-    $statusName = [string](& $read $ArchiveStatus 'ExitCodeName')
-    $statusFinished = & $read $ArchiveStatus 'FinishedAt'
-    $hasLastRun = $null -ne $lastRun -and ([datetime]$lastRun).Year -ge 2000
-
-    $taskResult = & $read $TaskInfo 'LastTaskResult'
-    if ($null -ne $taskResult) {
-        $resultCode = [uint32]([int64]$taskResult -band [int64]4294967295)
-        # 0 = успіх, 0x41301 = виконується, 0x41303 = ще не запускалося
-        if ($resultCode -notin @([uint32]0, [uint32]267009, [uint32]267011)) {
+    if ($null -ne $resultCode) {
+        if ($taskRunFailed) {
             $runText = if ($hasLastRun) { " $(& $format ([datetime]$lastRun))" } else { '' }
-            $nameText = if ([string]::IsNullOrWhiteSpace($statusName)) { '' } else { " ($statusName)" }
+            # Ім'я з status-файла лише для того самого запуску й того самого коду
+            # (HRESULT планувальника, напр. 0x80070005, не є кодом BRAVO).
+            $sameRun = $null -ne $statusExitCode -and $null -ne $statusFinished -and
+                [uint32]([int64]$statusExitCode -band [int64]4294967295) -eq $resultCode -and
+                (-not $hasLastRun -or ([datetime]$statusFinished) -ge ([datetime]$lastRun))
+            $nameText = if (-not $sameRun -or [string]::IsNullOrWhiteSpace($statusName)) { '' } else { " ($statusName)" }
             return ("останній запуск $TaskName{0} завершився з кодом 0x{1:X8}{2}" -f $runText, $resultCode, $nameText)
         }
         if ($resultCode -eq [uint32]267009) {
@@ -4726,6 +4741,11 @@ function Get-AlertFingerprint {
                 (Get-BRAVOHealthIssueField -Issue $issue -Name 'ExpectedSizeBytes'),
                 (Get-BRAVOHealthIssueField -Issue $issue -Name 'ActualSizeBytes')
             ) + $actionValues
+            if ((Get-BRAVOHealthIssueField -Issue $issue -Name 'Kind') -eq 'LocalBackupGeneration') {
+                # Змінена першопричина (виконується → збій планувальника → вимкнено)
+                # має давати новий fingerprint; для інших Kind набір полів незмінний.
+                $fields += (Get-BRAVOHealthIssueField -Issue $issue -Name 'Diagnosis')
+            }
             $fields -join '|'
         }
     }) -join "`n")
