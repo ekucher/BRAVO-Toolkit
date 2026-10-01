@@ -1200,7 +1200,9 @@ function Get-BRAVOHealthBackupStaleReason {
     }
     $format = {
         param([datetime]$Value)
-        return $Value.ToUniversalTime().ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+        # TimeZoneInfo замість прямого перетворення в локальний час: контракт
+        # Health/SuccessAndProblemNotificationsReuseLatestBackupTimestamp тримає його в одній точці джерела.
+        return [TimeZoneInfo]::ConvertTimeFromUtc($Value.ToUniversalTime(), [TimeZoneInfo]::Local).ToString('dd.MM.yyyy HH:mm')
     }
 
     $lastRun = $null

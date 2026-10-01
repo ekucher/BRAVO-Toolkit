@@ -11691,7 +11691,12 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $script:healthLatestArchives = @{}
             function Get-BRAVOFiles { param([string]$Path, [string]$Filter) return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue) }
             function Write-HealthLog { param($Message, $Level) }
-            # Читання планувальника/статусу недоступне: діагностика мусить пропустити ці перевірки.
+            # Читання планувальника/статусу недоступне (детерміновано, незалежно від хоста):
+            # діагностика мусить пропустити ці перевірки й дійти до INCOMPLETE manifest.
+            $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+            $stateRoot = $BackupRoot
+            function Get-BRAVOScheduledTaskState { param($TaskPath, $TaskName) throw 'self-test: планувальник недоступний' }
+            function Get-BRAVOOperationStatus { param($Path) throw 'self-test: status недоступний' }
             return @(Get-BackupHealthIssues)
         } $staleFixtureRoot
         $staleGenerationIssue = @($staleFixtureIssues | Where-Object { $_.Component -eq 'Generation' })[0]
