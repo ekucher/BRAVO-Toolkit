@@ -48,10 +48,13 @@
       гілки — не інструмент, який це вимагає автоматично; дотримуйтесь
       вручну.)
 - [ ] GitHub Actions CI (`.github/workflows/ci.yml`) зелений на коміті
-      релізу — перевірте вкладку Actions перед тегуванням. Branch
-      protection на `master` і `developer` увімкнено (перевірено
-      2026-08-26): merge технічно заблоковано, доки required checks не
-      зелені; цей пункт лишається як свідома фінальна звірка.
+      релізу — перевірте вкладку Actions перед тегуванням. Цей пункт —
+      обов'язкова ручна звірка, а не формальність: за live-перевіркою
+      через GitHub REST API 2026-09-30 `master` захищено шістьма
+      required checks, а `developer` **не захищено взагалі** — merge у
+      `developer` з червоним CI технічно нічим не заблоковано. Перед
+      рішенням стан перечитати заново; бажана політика, live-стан і
+      дія власника — `RELEASE_POLICY.md`, розділи 13.3 і 13.4.
 - [ ] `RUNTIME_MANIFEST.json` перегенеровано **після останньої зміни
       коду**: `ci\Update-BRAVORuntimeManifest.ps1 -Apply`. Без цього
       свіжо розгорнутий комплект заблокує сам себе на першому ж запуску
@@ -119,11 +122,13 @@ stdin, чи будь-яку іншу поведінку, що впливає н�
 - CI (аудит AUD-001) — тепер існує: `.github/workflows/ci.yml`
   (`windows-latest`, парсинг, BOM, JSON, `PSScriptAnalyzer`, повний
   `BRAVO_SELF_TEST.ps1`, `gitleaks`), запускається на кожен push/PR.
-  Branch protection **увімкнено** (2026-08-26; репозиторій публічний,
-  обмеження GitHub Pro для приватних більше не діє): `master` і
-  `developer` приймають зміни лише через PR із зеленими required
-  checks, force push/видалення заборонені, `enforce_admins` увімкнено.
-  Фактичний стан описано в `RELEASE_POLICY.md`, розділ 13.
+  Branch protection (перевірено через GitHub REST API 2026-09-30,
+  мусить бути перечитано перед рішенням): `master` — protected, шість
+  required checks з канону `RELEASE_POLICY.md` §13.3; його `strict`,
+  `enforce_admins`, вимогу PR і заборону force push/видалення з
+  автоматичної сесії не перевірено (HTTP 403). `developer` — **не
+  protected** (ні правила, ні ruleset); бажана політика і процедура
+  власника — `RELEASE_POLICY.md` §13.4 (OWNER ACTION REQUIRED).
 - Tools hashes (`TOOLS_INTEGRITY.json`) — TOFU, не еталонний release
   manifest; оновлюються самі при першому запуску на кожному сервері, а
   не публікуються разом з релізом (аудит P0.2).

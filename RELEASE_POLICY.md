@@ -1001,41 +1001,70 @@ branch protection зіставляє required checks за ІМЕНЕМ, і пі�
 був причиною issue #149 — перелік вівся вручну, `ci.yml` пішов уперед,
 і провалений матричний тест лишався технічно немерджблокуючим.
 
-Технічний стан (перевірено 2026-08-26, репозиторій публічний —
-branch protection доступний без платного плану): protection
-**увімкнено** для обох гілок.
+**Бажана політика й перевірений стан — різні речі.** Перелік вище і
+§13.1/§13.2 фіксують **бажану політику** — те, що мусить бути
+налаштовано. Нижче — **перевірений live-стан**: це знімок, а не
+гарантія. Налаштування змінюються поза репозиторієм, тому перед
+будь-яким рішенням, що спирається на захист гілки, стан перечитують
+заново. Запис «застосовано» з'являється тут лише після live-перевірки
+через GitHub API або UI — з датою й методом.
 
-- `master`: зміни лише через Pull Request; required checks
-  «Parser / BOM / JSON», «PSScriptAnalyzer», «BRAVO_SELF_TEST.ps1»,
-  «Secret scanning (gitleaks)», «GitGuardian Security Checks»
-  (strict — гілка мусить бути актуальною); force push і видалення
-  гілки заборонені; `enforce_admins` увімкнено (обхід адміністратором
-  заблоковано — прецедент merge PR #61 у вікні промоції 5.1.0 більше
-  технічно неможливий).
-- `developer`: зміни лише через Pull Request; ті самі required
-  checks (без strict-вимоги актуальності гілки); force push і
-  видалення заборонені; `enforce_admins` увімкнено.
+Перевірений live-стан (перевірено через GitHub REST API 2026-10-01,
+`developer` = `610e93f`, `master` = `f8fa5aa`; мусить бути перечитано
+перед рішенням):
 
-> **`Config parity (BRAVO_CONFIG_LOADER)` у налаштуваннях ЩЕ НЕ
-> ввімкнено.** Перевірку навмисно НЕ додано до переліку вище: перелік
-> фіксує те, що **мусить бути налаштоване**, і запис про невімкнену
-> перевірку відтворив би рівно дефект #149. Workflow
-> `.github/workflows/config-parity.yml` уже придатний до промоції —
-> він запускається на кожному PR і завершується успіхом як
-> `NOT APPLICABLE` для PR поза конфігураційним пайплайном (чому це
-> обов'язкова умова для required check — §14.4). Після фактичного
-> ввімкнення ім'я додається до переліку вище, а цей абзац замінюється
-> на запис у технічному стані з датою перевірки.
+| Налаштування | `master` | `developer` |
+| --- | --- | --- |
+| protection (`GET /branches/{b}` → `protected`) | **так** | **ні** (`protected: false`, `enforcement_level: off`) |
+| rulesets гілки (`GET /rules/branches/{b}`) | немає (`[]`) | немає (`[]`) |
+| required status checks | 6, перелік нижче | немає (`contexts: []`) |
+| `Config parity (BRAVO_CONFIG_LOADER)` серед required | ні | ні |
+| `strict`, `enforce_admins`, вимога PR, заборона force push і видалення | **не перевірено**: `GET /branches/master/protection` → HTTP 403 (токен сесії не має `administration=read`) | відсутні — protection немає |
 
-> **`BRAVO_DATA_RESTORE_MATRIX_TEST.ps1` у налаштуваннях ЩЕ НЕ
-> ввімкнено** (issue #149). Задача виконується на кожному PR і має
-> стабільне ім'я (перевірено за `ci.yml`: тригер `pull_request: {}` без
-> умов, креденціал генерується в самій задачі, тож зовнішніх секретів
-> вона не потребує й не пропускається), але доки її не додано в
-> required checks обох гілок, **провалений E2E-тест відновлення мердж
-> не блокує**. Документування адміністративного контролю не є його
-> впровадженням: цей абзац оновлюється лише після фактичного
-> ввімкнення, з новою датою перевірки.
+Required checks `master` за live-відповіддю
+(`protection.required_status_checks`, `enforcement_level: everyone`) —
+рівно шість, і вони збігаються з каноном вище: `Parser / BOM / JSON`,
+`PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`, `Secret scanning (gitleaks)`,
+`GitGuardian Security Checks`, `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`.
+П'ять прив'язані до GitHub Actions (`app_id` 15368),
+`GitGuardian Security Checks` — до GitGuardian (`app_id` 46505). Це
+`pull_request`-імена (`.github/workflows/ci.yml`, коментар над `jobs:`):
+push-прогони несуть суфікс ` (push)` і required checks не задовольняють —
+так задумано.
+
+Попередня редакція цього абзацу (перевірка 2026-08-26) стверджувала,
+що protection увімкнено для **обох** гілок, з PR-only і
+`enforce_admins`. Для `developer` це не відповідає live-стану:
+перевірки 2026-09-27 і 2026-09-30 не знайшли ні класичного правила, ні
+ruleset (чи існував захист 2026-08-26 і був згодом знятий, з репозиторію
+встановити не можна — важливий поточний стан). Отже зараз
+**ніщо технічно не блокує merge у `developer` з червоним CI** — зелений
+CI там тримається лише дисципліною. Для `master` ті самі `strict` і
+`enforce_admins` з цієї сесії не перевірювані (HTTP 403), тож їх не
+записано ані як увімкнені, ані як вимкнені. Створення захисту
+`developer` — дія власника, §13.4.
+
+> **`Config parity (BRAVO_CONFIG_LOADER)` ще НЕ required** — ні на
+> `master`, ні на `developer` (live 2026-09-30). Перевірку навмисно НЕ
+> додано до канонічного переліку вище: перелік фіксує те, що **мусить
+> бути налаштоване вже зараз**, і запис про невімкнену перевірку
+> відтворив би рівно дефект #149. Передумову промоції виконано: check
+> створюється на кожному `pull_request` до будь-якої base-гілки
+> (`.github/workflows/config-parity.yml`: тригер `pull_request:` без
+> `paths`/`branches`, job без `if:`, крок `Not applicable for this pull
+> request` завершується `exit 0`); live-підтверджено зеленим check run
+> на docs-only PR #263 і на PR #310 (2026-09-30). На push check не
+> створюється (push-тригера немає) — для required check це нормально,
+> бо protection зіставляє саме PR-прогін. Required він стає лише після
+> фактичного застосування налаштування (§13.4) і повторної
+> live-перевірки; тоді ім'я додається до переліку вище, а цей абзац
+> замінюється записом у live-стані з датою.
+
+> **`BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`** (issue #149): на `master`
+> required (live 2026-09-30); на `developer` не required, бо там немає
+> protection узагалі. Задача виконується на кожному PR і має стабільне
+> ім'я (тригер `pull_request: {}` без умов, креденціал генерується в
+> самій задачі, тож зовнішніх секретів вона не потребує).
 
 Дозволене джерело промоції в `master` (`developer`/`hotfix/*` з
 ЦЬОГО репозиторію, а не fork з однойменною гілкою) і семантичне
@@ -1043,6 +1072,129 @@ branch protection доступний без платного плану): protec
 `ci\Test-BRAVOMasterMergePolicy.ps1` (крок у required check
 «Parser / BOM / JSON»), тож порушення політики блокує merge
 технічно, а не лише процедурно.
+
+### 13.4. OWNER ACTION REQUIRED: захист `developer`
+
+Статус: **не застосовано** (live 2026-09-30, §13.3). Автоматична сесія
+цього зробити не може: токен інтеграції не має дозволу Administration
+(`GET`/`PUT .../branches/{b}/protection` → HTTP 403), тож дію виконує
+власник — у GitHub UI або через `gh` під власним обліковим записом.
+
+Цільові налаштування `developer` (бажана політика):
+
+| Параметр | Значення | Підстава |
+| --- | --- | --- |
+| Вимога Pull Request | так, без обов'язкових схвалень (`required_approving_review_count: 0`) | §13.2 вимагає CI для PR; кількості схвалень ця політика не встановлює, а автор PR і власник репозиторію — один обліковий запис (GitHub не дозволяє схвалити власний PR). Інше число — окреме рішення власника |
+| Required checks | 6 канонічних (§13.3) + `Config parity (BRAVO_CONFIG_LOADER)` | §13.3, §14.4; передумову «check створюється на кожному PR» перевірено live |
+| `strict` (гілка мусить бути актуальною) | `false` | §13.2 — на відміну від `master` (§13.1) |
+| `enforce_admins` | `true` | прецедент PR #61 (§13.3): обхід адміністратором не повинен бути можливим |
+| force push | заборонено | §13.2 |
+| видалення гілки | заборонено | §13.2 |
+
+Кроки в GitHub UI (класичне правило):
+
+1. Settings → Branches → Branch protection rules → Add rule
+   (або Add classic branch protection rule).
+2. Branch name pattern: `developer`.
+3. Увімкнути Require a pull request before merging; Require approvals
+   лишити вимкненим.
+4. Увімкнути Require status checks to pass before merging;
+   Require branches to be up to date before merging лишити
+   **вимкненим**; у пошуку додати рівно сім перевірок:
+   `Parser / BOM / JSON`, `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`,
+   `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`, `Secret scanning (gitleaks)`,
+   `GitGuardian Security Checks`, `Config parity (BRAVO_CONFIG_LOADER)`
+   — без суфікса ` (push)`; джерело — GitHub Actions, для
+   `GitGuardian Security Checks` — GitGuardian.
+5. Увімкнути Do not allow bypassing the above settings (`enforce_admins`).
+6. Allow force pushes і Allow deletions лишити вимкненими.
+7. Create / Save changes.
+
+Еквівалент через `gh` (`PUT` **замінює** protection повністю — перед
+застосуванням перечитати live-стан, бо хтось міг уже створити правило):
+
+```text
+gh api -X PUT repos/<owner>/BRAVO-Toolkit/branches/developer/protection \
+  -H "Accept: application/vnd.github+json" --input developer.json
+```
+
+Payload для `developer` (файл developer.json у каталозі payload-ів):
+
+```json
+{
+  "required_status_checks": {
+    "strict": false,
+    "checks": [
+      { "context": "Parser / BOM / JSON", "app_id": 15368 },
+      { "context": "PSScriptAnalyzer", "app_id": 15368 },
+      { "context": "BRAVO_SELF_TEST.ps1", "app_id": 15368 },
+      { "context": "BRAVO_DATA_RESTORE_MATRIX_TEST.ps1", "app_id": 15368 },
+      { "context": "Secret scanning (gitleaks)", "app_id": 15368 },
+      { "context": "GitGuardian Security Checks", "app_id": 46505 },
+      { "context": "Config parity (BRAVO_CONFIG_LOADER)", "app_id": 15368 }
+    ]
+  },
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "dismiss_stale_reviews": false,
+    "require_code_owner_reviews": false,
+    "required_approving_review_count": 0
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+```
+
+Форма `checks` з `app_id` (а не голий перелік `contexts`) повторює
+live-прив'язку `master`: статус із тим самим ім'ям від іншого джерела
+перевірку не задовольнить. Значення `app_id` взято з live-відповіді
+`master` і check run-ів PR (2026-09-30).
+
+Після застосування — перевірка, без якої запис «застосовано» не
+робиться:
+
+```text
+curl -sS https://api.github.com/repos/<owner>/BRAVO-Toolkit/branches/developer
+```
+
+Очікувано `protected: true` і рівно сім імен у
+`protection.required_status_checks.contexts`. Лише тоді оновлюються
+таблиця live-стану в §13.3 (з датою), абзац про `Config parity` і
+`.claude/PROJECT_STATE.md`.
+
+**Необов'язкове рішення власника: `Config parity` на `master`.** Не
+застосовано й не є частиною обов'язкової дії вище. Якщо власник вирішить
+додати перевірку й на `master`, змінювати треба **лише** перелік
+required checks, не чіпаючи налаштувань, яких сесія не бачить (`strict`,
+`enforce_admins`, вимога PR). Спершу зберегти поточний стан
+(`gh api repos/<owner>/BRAVO-Toolkit/branches/master/protection`), потім:
+
+```text
+gh api -X PATCH repos/<owner>/BRAVO-Toolkit/branches/master/protection/required_status_checks \
+  -H "Accept: application/vnd.github+json" --input master-add-config-parity.json
+```
+
+Payload для додавання Config parity на `master` (файл master-add-config-parity.json):
+
+```json
+{
+  "checks": [
+    { "context": "Parser / BOM / JSON", "app_id": 15368 },
+    { "context": "PSScriptAnalyzer", "app_id": 15368 },
+    { "context": "BRAVO_SELF_TEST.ps1", "app_id": 15368 },
+    { "context": "Secret scanning (gitleaks)", "app_id": 15368 },
+    { "context": "GitGuardian Security Checks", "app_id": 46505 },
+    { "context": "BRAVO_DATA_RESTORE_MATRIX_TEST.ps1", "app_id": 15368 },
+    { "context": "Config parity (BRAVO_CONFIG_LOADER)", "app_id": 15368 }
+  ]
+}
+```
+
+`PATCH` без поля `strict` його не змінює, але перелік `checks`
+**замінює** наявний, тому в payload стоять усі шість live-перевірок
+`master` плюс `Config parity`. Прибрати з нього будь-яку з шести
+означало б послабити захист `master`.
 
 ---
 
@@ -1170,14 +1322,16 @@ workflow, що запускається безумовно.
 `ConfigParity/RelevantPathDecision*` перевіряють саме логіку рішення на
 синтетичних наборах.
 
-**Це ще не required check.** Наявність задачі в CI не робить її
-блокуючою — перелік required checks задається в налаштуваннях GitHub
-(див. §13.3). Workflow тепер **придатний** до промоції; саму промоцію
-виконує власник, і перед нею потрібні два докази на реальних PR:
-(1) docs-only PR — check з'явився і зелений як `NOT APPLICABLE`;
-(2) PR, що торкається пайплайна, — harness реально виконався і зелений.
-Цей абзац оновлюється лише після фактичного ввімкнення, з новою датою
-перевірки.
+**Це ще не required check** (live 2026-09-30: ні на `master`, ні на
+`developer`, §13.3). Наявність задачі в CI не робить її блокуючою —
+перелік required checks задається в налаштуваннях GitHub. Workflow
+**придатний** до промоції, і обидва потрібні докази на реальних PR уже
+є: (1) PR поза пайплайном — check з'явився і зелений як
+`NOT APPLICABLE` (PR #221/#231, повторно docs-only PR #263,
+2026-09-30); (2) PR, що торкається пайплайна, — harness реально
+виконався і зелений (PR #214). Саму промоцію виконує власник (§13.4).
+Цей абзац оновлюється лише після фактичного ввімкнення й повторної
+live-перевірки, з новою датою.
 
 Результат (паритет або повний перелік відмінностей із обґрунтуванням
 кожної) лишається частиною доказової бази PR. Ручний запуск потребує
@@ -1332,9 +1486,16 @@ Settings → Rules → Rulesets → New ruleset → New tag ruleset:
 Код своєї половини контракту вже виконує: заміна опублікованого ассета
 іншими байтами провалює workflow (§16.1), а форму виклику
 `gh release upload` стереже регресія в `BRAVO_SELF_TEST.ps1`
-(рівно один `--clobber`, і лише в draft-гілці). Незакритим лишається
-саме ruleset — без нього тег можна пересунути, і тоді незмінність
+(рівно один `--clobber`, і лише в draft-гілці). Другу половину контракту
+закриває саме ruleset — без нього тег можна пересунути, і тоді незмінність
 ассетів захищає вже не той корінь довіри.
+
+Перевірений live-стан (перевірено через GitHub REST API 2026-09-30,
+мусить бути перечитано перед рішенням): ruleset `protected-release-tags`
+існує й діє — `target: tag`, `enforcement: active`, include
+`refs/tags/v*`, правила `deletion`, `non_fast_forward`, `update`,
+`bypass_actors` порожній; створено 2026-09-16 (issue #151 закрито того
+ж дня). Тобто пункт закрито налаштуванням, а не лише описом.
 
 ---
 
@@ -1509,7 +1670,8 @@ sourceCommit `12e6370`) + non-runtime доповнення: acceptance-evidence
 документ (PR #100) і governance-hardening PR #101 (repository identity
 у гейті промоції master, регресії, branch protection `developer`,
 синхронізація release-документації) — runtime functional diff проти
-прийнятого rc.13 порожній.
+прийнятого rc.13 порожній. Запис історичний і поточного стану не описує:
+live-перевірка 2026-09-30 захисту `developer` не знайшла (§13.3).
 
 Хронологія RC-циклу 5.2.0 (2026-08-24/25):
 
