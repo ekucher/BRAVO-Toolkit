@@ -55,6 +55,13 @@ $script:BRAVOHealthLastStepTime = $null
 # $script:BRAVOArchiveStepHistory в Archive) — Operations-подія SUCCESS/
 # CRITICAL нижче читає це для per-stage деталізації.
 $script:BRAVOHealthStepHistory = New-Object System.Collections.Generic.List[object]
+# Компоненти, увімкнені в конфігурації, але не встановлені на цьому
+# сервері (Get-BRAVOBackupNotInstalledComponents). Health їх не очікує й
+# не тривожить через них. Ініціалізується тут, разом з іншим станом
+# прогону, бо підсумок результату й журнал читають її під Set-StrictMode
+# на кожному виході, зокрема ранньому.
+$script:healthNotInstalledComponents = @()
+$script:healthComponentScopeError = $null
 # Перевірка цілісності інструментів виконується значно нижче, але
 # Complete-BRAVOHealthResult читає її результат — а через цю функцію
 # проходить КОЖЕН вихід Health, зокрема ранні (моніторинг вимкнено,
@@ -480,11 +487,6 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $healthCheckStarted = Get-Date
 $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime()
 $script:healthLatestArchives = @{}
-# Компоненти, увімкнені в конфігурації, але не встановлені на цьому
-# сервері (Resolve-BRAVOBackupComponentScope). Health їх не очікує й не
-# тривожить через них. Ініціалізується тут, до будь-якого раннього виходу,
-# бо підсумок результату читає її під Set-StrictMode.
-$script:healthNotInstalledComponents = @()
 
 # P0 Configuration Foundation: BRAVO.config став опційним основним
 # override-шаром — попередня жорстка "файл мусить існувати" перевірка
@@ -550,8 +552,13 @@ function Test-BRAVOSettingEnabled {
 function Get-BRAVOHealthExpectedArchiveDefinitions {
     # Архіви, які Health очікує: увімкнені в конфігурації й встановлені на
     # цьому сервері. Єдине місце цього фільтра для всіх перевірок Health.
+    # Склад читається через Get-Variable: функцію викликають і поза повним
+    # прогоном (ізольовані перевірки), де стан прогону не ініціалізовано;
+    # тоді очікуються всі увімкнені, як і до обліку складу.
+    $notInstalledVariable = Get-Variable -Name healthNotInstalledComponents -Scope Script -ErrorAction SilentlyContinue
+    $notInstalled = @(if ($null -ne $notInstalledVariable) { $notInstalledVariable.Value })
     return @($archiveDefinitions | Where-Object {
-        [bool]$_.Enabled -and @($script:healthNotInstalledComponents) -notcontains [string]$_.Type
+        [bool]$_.Enabled -and $notInstalled -notcontains [string]$_.Type
     })
 }
 

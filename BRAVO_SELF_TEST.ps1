@@ -11611,6 +11611,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -FunctionNames @(
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
             'Get-BackupHealthIssues'
         )
     $healthNoGenerationRoot = Join-Path ([IO.Path]::GetTempPath()) (
@@ -22891,6 +22892,7 @@ function Write-BRAVOLog {
         -SourceText ($healthScriptText + [Environment]::NewLine + $notificationScriptText) `
         -FunctionNames @(
             'Get-BRAVOHealthLatestBackupSummary',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
             'Format-BackupAge',
             'Get-BRAVOUtcAge',
             'ConvertTo-BRAVOUtcDateTime',
