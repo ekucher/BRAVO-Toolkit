@@ -2,6 +2,27 @@
 
 ## Не випущено (developer)
 
+- **Fix: заглушки вбудованих команд self-test не витікають між suite (#337).**
+  `New-BRAVOSelfTestRuntimeModule` (голий `New-Module`) матеріалізує функції-заглушки
+  (`Get-Service`, `Start-Service`, `Stop-Service`, `Get-Process`, `Stop-Process`,
+  `Invoke-WebRequest`, `Start-Sleep`, `Get-CimInstance` тощо) у глобальній сесії, а
+  прибиралися вони лише наприкінці прогону, тож змінювали семантику наступних suite
+  (витік `Start-Sleep` уже ламав TraceArchive). Тепер єдиний життєвий цикл: на вході в
+  кожну секцію `Suite/*` `Enter-BRAVOSelfTestSection` знімає знімок резолюції
+  спостережуваних вбудованих команд і межу реєстру runtime-модулів, а
+  `Complete-BRAVOSelfTestSection` (у `finally`, тобто й після перерваного suite) через
+  `Restore-BRAVOSelfTestSuiteIsolation` прибирає модулі цього suite, знімає затінюючі
+  global function/alias (у т.ч. від голого `New-Module`), повертає початкові функції та
+  перевіряє результат; залишкове відхилення — `[FAIL] Framework/SuiteIsolation[...]`.
+  `Clear-BRAVOSelfTestOwnedRuntimeModules` отримав `-StartIndex`/`-FunctionBaseline` і
+  лишається ідемпотентною страховкою наприкінці прогону. Нові перевірки:
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites` (фактична резолюція `Get-Command`
+  після закриття проба-suite для Get-Service, Start-Service, Stop-Service, Get-Process,
+  Stop-Process, Invoke-WebRequest, Start-Sleep, Get-CimInstance, Get-WmiObject,
+  Start-Process, а також Invoke-RestMethod і global-аліаса Get-Date),
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ProbeStubsActiveInsideSuite`,
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation`.
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
