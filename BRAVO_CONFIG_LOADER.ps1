@@ -577,6 +577,33 @@ function Assert-BravoLoadedConfiguration {
             Write-Warning "schedulerSettings.RestoreVerify.WeeklyOn = '$weeklyOnValue' не розпізнано (очікується англійська назва дня тижня, напр. 'Saturday') — застосовується дефолт 'Saturday'."
             $restoreVerifyScheduleForValidation.WeeklyOn = 'Saturday'
         }
+
+        # BackupCatchUp (boot-підхоплення пропущеної нічної копії, #322):
+        # legacy site-config без вузла отримує його тут, щоб після
+        # переінсталяції задач пропущена копія підхоплювалась на всьому
+        # флоті. Похідний Enabled — те саме правило, що в Derivation:
+        # лише коли Backup увімкнений, а Recovery (профіль робочого часу,
+        # який сам підхоплює пропущений Backup) — ні.
+        if (-not $global:schedulerSettings.Contains('BackupCatchUp') -or
+            -not ($global:schedulerSettings.BackupCatchUp -is [hashtable])) {
+            $catchUpBackupEnabled = $global:schedulerSettings.Contains('Backup') -and
+                $global:schedulerSettings.Backup -is [hashtable] -and
+                [bool]$global:schedulerSettings.Backup.Enabled
+            $catchUpRecoveryEnabled = $global:schedulerSettings.Contains('Recovery') -and
+                $global:schedulerSettings.Recovery -is [hashtable] -and
+                $global:schedulerSettings.Recovery.Contains('Enabled') -and
+                [bool]$global:schedulerSettings.Recovery.Enabled
+            $global:schedulerSettings.BackupCatchUp = @{
+                Enabled = ($catchUpBackupEnabled -and -not $catchUpRecoveryEnabled)
+                TaskName = 'BRAVO_ARCHIV_CATCHUP'
+                Description = 'Пропущена нічна архівація BRAVO після старту сервера'
+                StartupDelayMinutes = 7
+                ExecutionTimeLimitHours = 30
+            }
+            if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+                $global:schedulerSettings.BackupCatchUp.ScriptPath = Join-Path $RuntimeRoot 'BRAVO_ARCHIV.ps1'
+            }
+        }
     }
     $restoreVerifyVariable = Get-Variable -Name 'restoreVerifySettings' -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $restoreVerifyVariable -or -not ($global:restoreVerifySettings -is [hashtable])) {

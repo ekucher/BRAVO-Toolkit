@@ -138,7 +138,7 @@
     $taskUninstallerTextForVerify = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_UNINSTALL.ps1'), [Text.Encoding]::UTF8)
     Test-BRAVOCondition `
         -Condition (
-            $taskInstallerTextForVerify.Contains('"BAZASync", "RestoreVerify")') -and
+            $taskInstallerTextForVerify.Contains('"BAZASync", "RestoreVerify", "BackupCatchUp")') -and
             $taskInstallerTextForVerify.Contains('$definition.Triggers.Create(3) # TASK_TRIGGER_WEEKLY') -and
             $taskInstallerTextForVerify.Contains('ConvertTo-BRAVODaysOfWeekMask -DayOfWeek ([string]$TaskSettings.WeeklyOn)') -and
             $taskInstallerTextForVerify.Contains('Type = "RestoreVerify"; Settings = $schedulerSettings.RestoreVerify') -and

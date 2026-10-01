@@ -58,7 +58,9 @@ function Format-BRAVOSchedulerNextRun {
     # Restore.BootRestoreMode="HoldServices"); daily-trigger о WindowStart
     # прибрано — на 24/7-профілі пропущений слот підхоплює щонічне
     # Maintenance, а саме Recovery-завдання вимкнене.
-    if ($TaskType -eq 'Recovery') {
+    # BackupCatchUp — так само лише boot-trigger (підхоплення пропущеної
+    # нічної архівації).
+    if ($TaskType -eq 'Recovery' -or $TaskType -eq 'BackupCatchUp') {
         if ($StartupDelayMinutes -gt 0) {
             return "після наступного старту Windows; затримка $StartupDelayMinutes хв."
         }
@@ -76,6 +78,79 @@ function Format-BRAVOSchedulerNextRun {
         # помилка діагностики — трактуємо як 'невідомо' (значення нижче).
     }
     return 'невідомо'
+}
+
+function Get-BRAVOBackupCatchUpDecision {
+    # Рішення boot-завдання BackupCatchUp (BRAVO_ARCHIV -CatchUpMissedBackup):
+    # чи був пропущений останній щоденний слот Backup.DailyAt. Чиста функція
+    # без I/O, щоб self-test перевіряв саме правило.
+    #
+    # Слот вважається виконаним, якщо остання COMPLETE-копія
+    # (BRAVO_TASK_EXECUTION_STATE.json -> Backup) не старша за цей слот.
+    # Відсутній запис = копії не було, тож копія робиться. Якщо до
+    # наступного планового слоту лишилось не більше NextSlotGuardMinutes,
+    # підхоплення не потрібне: копію зробить звичайний запуск.
+    #
+    # Межові випадки (детерміновані, закріплені self-test):
+    #  - LastSuccess == початок слоту вважається виконаним слотом (-ge);
+    #  - Now у перші SlotStartGraceMinutes хв. після слоту (включно з
+    #    Now == DailyAt): Планувальник саме зараз запускає звичайний
+    #    BRAVO_ARCHIV, тож підхоплення поступається йому (інакше, виграв
+    #    би підхоплення lock, звичайний прогін після нього зробив би другу
+    #    копію); якщо звичайний прогін завершиться без COMPLETE, наступний
+    #    boot-запуск або наступний слот це покриє;
+    #  - до наступного слоту рівно NextSlotGuardMinutes хв. = пропуск (-le);
+    #  - LastSuccess відсутній ($null; стану немає або він пошкоджений) =
+    #    копії не було, отже копія робиться: хост без жодної COMPLETE-копії
+    #    не повинен лишатися без неї.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Now,
+        [Parameter(Mandatory = $true)][string]$DailyAt,
+        [AllowNull()]$LastSuccess,
+        [int]$NextSlotGuardMinutes = 60,
+        [int]$SlotStartGraceMinutes = 2
+    )
+
+    $slotTime = [TimeSpan]::Zero
+    if (-not [TimeSpan]::TryParse($DailyAt, [ref]$slotTime) -or
+        $slotTime -lt [TimeSpan]::Zero -or $slotTime.TotalHours -ge 24) {
+        throw "Backup.DailyAt повинен мати формат HH:mm: '$DailyAt'"
+    }
+    $previousSlot = $Now.Date.Add($slotTime)
+    if ($previousSlot -gt $Now) {
+        $previousSlot = $previousSlot.AddDays(-1)
+    }
+    $nextSlot = $previousSlot.AddDays(1)
+    $lastSuccessTime = $null
+    if ($LastSuccess -is [datetime]) {
+        $lastSuccessTime = [datetime]$LastSuccess
+    }
+    $lastSuccessText = if ($null -ne $lastSuccessTime) {
+        $lastSuccessTime.ToString('dd.MM.yyyy HH:mm')
+    } else {
+        'немає даних'
+    }
+
+    $run = $false
+    if ($null -ne $lastSuccessTime -and $lastSuccessTime -ge $previousSlot) {
+        $reason = "копія за слот $($previousSlot.ToString('dd.MM.yyyy HH:mm')) уже є (остання успішна $lastSuccessText)"
+    } elseif (($Now - $previousSlot).TotalMinutes -lt $SlotStartGraceMinutes) {
+        $reason = "плановий запуск $($previousSlot.ToString('dd.MM.yyyy HH:mm')) саме стартує, копію зробить він"
+    } elseif (($nextSlot - $Now).TotalMinutes -le $NextSlotGuardMinutes) {
+        $reason = "до планового запуску $($nextSlot.ToString('dd.MM.yyyy HH:mm')) не більше $NextSlotGuardMinutes хв, копію зробить він"
+    } else {
+        $run = $true
+        $reason = "пропущено слот $($previousSlot.ToString('dd.MM.yyyy HH:mm')) (остання успішна копія: $lastSuccessText)"
+    }
+
+    return [pscustomobject]@{
+        Run = $run
+        PreviousSlot = $previousSlot
+        NextSlot = $nextSlot
+        LastSuccess = $lastSuccessTime
+        Reason = $reason
+    }
 }
 
 # ---------------------------------------------------------------------------
