@@ -23792,7 +23792,12 @@ function Remove-BRAVOSelfTestFixtureDirectory {
         $syntheticFilePath = Join-Path $tempRoot "Phase0Only.json"
         $syntheticFileContent = '{ "phase0": true,'
         [IO.File]::WriteAllText($syntheticFilePath, $syntheticFileContent, (New-Object Text.UTF8Encoding($false)))
-        $syntheticFileHash = (Get-BRAVOFileHash -Path $syntheticFilePath -Algorithm SHA256).Hash.ToUpperInvariant()
+        # Module-qualified (#219): Clear-BRAVOSelfTestOwnedRuntimeModules
+        # прибирає глобальний Function:Get-BRAVOFileHash, який експортують
+        # runtime-модулі фрагментів TraceArchive/MaintenanceOwnLog, і з ним
+        # зникає експорт Compatibility; у вибірковому -Suite його ніхто не
+        # повертає.
+        $syntheticFileHash = (BRAVO.Compatibility\Get-BRAVOFileHash -Path $syntheticFilePath -Algorithm SHA256).Hash.ToUpperInvariant()
 
         # Дописати новий запис у TEMP-копію RUNTIME_MANIFEST.json (НЕ у
         # repository-файл) — реальний SHA256 щойно записаних байтів,

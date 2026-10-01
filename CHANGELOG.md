@@ -143,6 +143,12 @@
   `New-BRAVOSelfTestFakeBazaSession` визначено в bootstrap-і кореня, спільному для
   `BazaSync` і `TraceArchive`, а `TraceArchive` сам завантажує `Tools\WinSCPnet.dll`
   (тим самим ідемпотентним гардом, що й `BazaSync`) для `WinSCP.TransferOptions`.
+  Динамічна перевірка вибіркових прогонів знайшла ще дві залежності від стану
+  модулів, яких статичний guard не бачить: `TraceArchive` тепер сам імпортує модуль
+  `BRAVO.BazaSync` (`New-BRAVOBazaRemoteDirectoryRecursive`), а хвостова перевірка
+  `Framework/Phase0FailStopsDomains` викликає `BRAVO.Compatibility\Get-BRAVOFileHash`
+  module-qualified, бо очищення runtime-модулів фрагментів `TraceArchive` і
+  `MaintenanceOwnLog` прибирає глобальний експорт цієї функції.
   Повний прогін виконує ті самі перевірки з тими самими іменами; дві перевірки `Console/ManualExit*` тепер зараховуються до suite `ConsoleUX`.
   Нові перевірки `Framework/SelectiveSuitesHaveNoCrossSuiteDependency` (статичний
   AST-аналіз: змінна чи функція, яку визначає лише gated-фрагмент, не читається ні

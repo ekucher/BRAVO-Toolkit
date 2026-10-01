@@ -14,6 +14,11 @@ $traceArchiveScriptText = [IO.File]::ReadAllText(
 
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
     Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+    # New-BRAVOBazaRemoteDirectoryRecursive у SFTP-сценаріях нижче (#219):
+    # модуль BazaSync імпортує сам фрагмент, а не покладається на імпорт
+    # фрагмента BazaSync, інакше -Suite TraceArchive без BazaSync падав на
+    # CommandNotFound.
+    Import-Module -Name (Join-Path $root "modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1") -Force -ErrorAction Stop
     # WinSCP.TransferOptions у SFTP-сценаріях нижче (#219): збірку завантажує
     # сам фрагмент, а не покладається на Add-Type фрагмента BazaSync, інакше
     # -Suite TraceArchive без BazaSync падав на TypeNotFound. Add-Type
