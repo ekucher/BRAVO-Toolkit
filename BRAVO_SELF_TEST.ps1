@@ -11635,7 +11635,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         [pscustomobject]@{
             NotRegistered = & $reason (& $task -Exists $false) $null $null $null
             Disabled = & $reason (& $task -Enabled $false) $null $null $null
-            Incomplete = & $reason (& $task) $null $incomplete $now.AddHours(-30)
+            # Запуск, що створив INCOMPLETE manifest, стартував РАНІШЕ за нього (-4 год проти -3 год).
+            Incomplete = & $reason (& $task -RunAgeHours 4) $null $incomplete $now.AddHours(-30)
             IncompleteOlder = & $reason (& $task) $null $incomplete $now.AddHours(-1)
             BadResult = & $reason (& $task -Result (-2147024891)) (& $status 0 1) $null $null
             SameCodeNamed = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 1) $null $null
