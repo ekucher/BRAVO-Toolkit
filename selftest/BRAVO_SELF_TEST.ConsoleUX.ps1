@@ -564,7 +564,7 @@ function Test-BRAVOSelfTestDuplicateDefinition {
         -Failure "під BRAVO_SELFTEST_SIMULATED_OUTPUT=1 Red/Yellow деталі мають ставати DarkGray (інші кольори без змін), без змінної — лишатися Red/Yellow; отримано: self-test Red=$detailColorSelfTestRed, Yellow=$detailColorSelfTestYellow, Green=$detailColorSelfTestGreen; production Red=$detailColorProductionRed, Yellow=$detailColorProductionYellow"
 
     $selfTestSimulatedSetIndex = $selfTestScriptText.IndexOf("[Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', '1')")
-    $selfTestSimulatedRestoreIndex = $selfTestScriptText.IndexOf("[Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', `$script:selfTestSimulatedOutputPrevious)")
+    $selfTestSimulatedRestoreIndex = $selfTestScriptText.IndexOf("(Get-Variable -Name 'selfTestSimulatedOutputPrevious' -Scope Script -ValueOnly -ErrorAction SilentlyContinue)")
     Test-BRAVOCondition `
         -Condition ($selfTestSimulatedSetIndex -ge 0 -and $selfTestSimulatedRestoreIndex -gt $selfTestSimulatedSetIndex) `
         -Name "ConsoleUX/32-SelfTestSetsAndRestoresSimulatedOutputFlag" `

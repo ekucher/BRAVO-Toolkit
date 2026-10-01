@@ -27446,7 +27446,11 @@ Complete-BRAVOSelfTestReport
 } catch {
     Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $_
 } finally {
-    [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', $script:selfTestSimulatedOutputPrevious)
+    # Get-Variable, а не пряме читання: Framework/SectionIsolation-проби
+    # копіюють цей finally у дочірній скрипт під Set-StrictMode, де змінна
+    # не оголошена.
+    [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT',
+        (Get-Variable -Name 'selfTestSimulatedOutputPrevious' -Scope Script -ValueOnly -ErrorAction SilentlyContinue))
     # Штатний шлях завершується exit усередині Complete-BRAVOHelperLog
     # (ReportIssued уже $true). Сюди без звіту потрапляє лише прогін,
     # що вийшов із тіла в обхід catch — він теж не може дати код 0.
