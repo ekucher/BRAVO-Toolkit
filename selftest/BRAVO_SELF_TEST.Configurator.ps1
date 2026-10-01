@@ -83,6 +83,7 @@ $configuratorExpectedLogLifecyclePaths = @{
     'componentSettings.SFTP.ArchiveLogUploadEnabled'     = 'Boolean'
     'sftpDirectories.MaintenanceLog'                     = 'String'
     'sftpDirectories.ArchivLog'                          = 'String'
+    'sftpDirectories.RuntimeLogs'                        = 'String'
 }
 $configuratorLogLifecycleMismatches = New-Object System.Collections.Generic.List[string]
 foreach ($expectedPath in $configuratorExpectedLogLifecyclePaths.Keys) {
@@ -95,7 +96,7 @@ foreach ($expectedPath in $configuratorExpectedLogLifecyclePaths.Keys) {
 }
 Test-BRAVOCondition ($configuratorLogLifecycleMismatches.Count -eq 0) `
     'Configurator/LogLifecycleSettingsHaveDescriptors' `
-    "5 нових log-lifecycle ключів мають мати дескриптор коректного типу; розбіжності: $($configuratorLogLifecycleMismatches -join ' | ')"
+    "6 log-lifecycle ключів мають мати дескриптор коректного типу; розбіжності: $($configuratorLogLifecycleMismatches -join ' | ')"
 
 # ===== Model: Default/Override/Effective/Dirty (§22.4-6 задачі) =====
 $configuratorSchemaCatalog = Get-BRAVOConfiguratorSchemaCatalog

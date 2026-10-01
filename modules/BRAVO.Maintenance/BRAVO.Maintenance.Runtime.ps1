@@ -4406,6 +4406,104 @@ function Send-BRAVOOwnLogFile {
     }
 }
 
+function Test-BRAVOOwnLogSftpCredentialAvailable {
+    # Чи є в Credential Manager обидва SFTP-записи (логін і пароль) для
+    # поточного облікового запису. Відсутність креденшлів — штатна
+    # ситуація для вивантаження журналів (тоді воно просто не
+    # відбувається), тому тут лише $true/$false без WARNING.
+    [CmdletBinding()]
+    param()
+
+    try {
+        $loginTarget = [string]$credentialSettings.Targets.SFTPLogin
+        $passwordTarget = [string]$credentialSettings.Targets.SFTPPassword
+        if ([string]::IsNullOrWhiteSpace($loginTarget)) { $loginTarget = 'BRAVO_SFTP_LOGIN' }
+        if ([string]::IsNullOrWhiteSpace($passwordTarget)) { $passwordTarget = 'BRAVO_SFTP_PASSWORD' }
+        $available = -not [string]::IsNullOrWhiteSpace((Get-BRAVOCredentialSecret -Target $loginTarget)) -and
+            -not [string]::IsNullOrWhiteSpace((Get-BRAVOCredentialSecret -Target $passwordTarget))
+        return [bool]$available
+    } catch {
+        return $false
+    }
+}
+
+function Sync-BRAVORuntimeLogsToSftp {
+    # Вивантажує ВЕСЬ каталог журналів toolkit (<RuntimeRoot>\LOGS разом
+    # із підкаталогами, зокрема HELPERS) у RemoteDirectory зі збереженням
+    # відносних шляхів. Інкрементально: файл, який уже є на SFTP з тим
+    # самим розміром, не передається вдруге (журнали лише дописуються,
+    # тому зміна вмісту завжди змінює розмір). На SFTP нічого не
+    # видаляється: локальна ротація журналів не прибирає їхніх копій.
+    # Кожен файл передається через локальний знімок — живий журнал (лог
+    # поточного прогону, лог Health, що саме пише) інакше міг би вирости
+    # між передачею і перевіркою розміру в Send-BRAVOTraceArchiveFile.
+    # Помилка окремого файла не зупиняє решту; підсумок повертається
+    # викликачу. Duck-typed $Session — той самий контракт, що
+    # Send-BRAVOTraceArchiveFile.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$LocalLogRoot,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RemoteDirectory
+    )
+
+    $result = [pscustomobject]@{ Uploaded = 0; Unchanged = 0; Failed = 0; FirstError = $null }
+    if ([string]::IsNullOrWhiteSpace($LocalLogRoot) -or
+        -not (Test-Path -LiteralPath $LocalLogRoot -PathType Container)) {
+        return $result
+    }
+    $normalizedRemoteDirectory = ([string]$RemoteDirectory).Trim().Trim('/').Replace('\', '/')
+    $remoteRoot = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { '' } else { "/$normalizedRemoteDirectory" }
+    $localRootFullPath = (Get-Item -LiteralPath $LocalLogRoot -ErrorAction Stop).FullName.TrimEnd('\', '/')
+    $ensuredRemoteDirectories = @{}
+
+    $localFiles = @(Get-ChildItem -LiteralPath $localRootFullPath -File -Recurse -Force -ErrorAction SilentlyContinue |
+        Sort-Object -Property FullName)
+    foreach ($localFile in $localFiles) {
+        $relativePath = $localFile.FullName.Substring($localRootFullPath.Length).TrimStart('\', '/').Replace('\', '/')
+        $remoteFinalPath = "$remoteRoot/$relativePath"
+        $snapshotPath = $null
+        try {
+            $remoteUpToDate = $false
+            if ($Session.FileExists($remoteFinalPath)) {
+                $remoteInfo = $Session.GetFileInfo($remoteFinalPath)
+                $remoteUpToDate = ($null -ne $remoteInfo -and [int64]$remoteInfo.Length -eq [int64]$localFile.Length)
+            }
+            if ($remoteUpToDate) {
+                $result.Unchanged++
+            } else {
+                $remoteParent = $remoteFinalPath.Substring(0, $remoteFinalPath.LastIndexOf('/'))
+                if (-not [string]::IsNullOrWhiteSpace($remoteParent) -and -not $ensuredRemoteDirectories.ContainsKey($remoteParent)) {
+                    New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $remoteParent
+                    $ensuredRemoteDirectories[$remoteParent] = $true
+                }
+                $snapshotPath = Join-Path ([System.IO.Path]::GetTempPath()) `
+                    ("BRAVO_log_snapshot_{0}.tmp" -f [guid]::NewGuid().ToString('N'))
+                [System.IO.File]::Copy($localFile.FullName, $snapshotPath, $true)
+                $sendResult = Send-BRAVOTraceArchiveFile `
+                    -Session $Session `
+                    -LocalPath $snapshotPath `
+                    -RemoteFinalPath $remoteFinalPath `
+                    -Logger $null
+                if ($sendResult.Success) {
+                    $result.Uploaded++
+                } else {
+                    $result.Failed++
+                    if ($null -eq $result.FirstError) { $result.FirstError = "$relativePath — $($sendResult.Error)" }
+                }
+            }
+        } catch {
+            $result.Failed++
+            if ($null -eq $result.FirstError) { $result.FirstError = "$relativePath — $($_.Exception.Message)" }
+        } finally {
+            if ($null -ne $snapshotPath -and (Test-Path -LiteralPath $snapshotPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $snapshotPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    return $result
+}
+
 # ===== R3-1/R3-3 (PR #136, третє коло review): гарантований, ідемпотентний
 # epilogue вивантаження власного логу Maintenance =====
 function Invoke-BRAVOMaintenanceOwnLogUpload {
@@ -4439,13 +4537,24 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
             -not (Get-Variable -Name storageEffective -Scope Global -ErrorAction SilentlyContinue)) {
             return
         }
-        if (-not ([bool]$componentSettings.SFTP.MaintenanceLogUploadEnabled -and
-                [bool]$storageEffective.SFTP.Enabled)) {
+        # Рішення власника (2026-10-01): за увімкненого хмарного бекапу
+        # (storageSettings.SFTP.Enabled) і наявних SFTP-креденшлів у
+        # Credential Manager на SFTP іде ВЕСЬ каталог журналів toolkit
+        # (Sync-BRAVORuntimeLogsToSftp нижче). Тумблер
+        # MaintenanceLogUploadEnabled лишається і керує лише окремою
+        # копією логу прогону + знімка range_id_log.json у
+        # sftpDirectories.MaintenanceLog.
+        if (-not [bool]$storageEffective.SFTP.Enabled) {
             return
         }
-        if (-not (Get-Variable -Name LOG_FILE -Scope Script -ErrorAction SilentlyContinue) -or
-            [string]::IsNullOrWhiteSpace([string]$LOG_FILE) -or
-            -not (Test-Path -LiteralPath $LOG_FILE -PathType Leaf)) {
+        $ownLogFileUploadEnabled = [bool]$componentSettings.SFTP.MaintenanceLogUploadEnabled -and
+            [bool](Get-Variable -Name LOG_FILE -Scope Script -ErrorAction SilentlyContinue) -and
+            -not [string]::IsNullOrWhiteSpace([string]$LOG_FILE) -and
+            (Test-Path -LiteralPath $LOG_FILE -PathType Leaf)
+        if (-not (Test-BRAVOOwnLogSftpCredentialAvailable)) {
+            # Без креденшлів вивантаження просто не відбувається: це не
+            # збій прогону, тому INFO, а не WARNING.
+            Write-Log "Журнали toolkit: SFTP-креденшли в Credential Manager недоступні — вивантаження пропущено" -Level "INFO"
             return
         }
 
@@ -4453,44 +4562,66 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
         $ownRangeIdLogSnapshotPath = $null
         try {
             $ownLogUploadSession = Connect-BRAVOOwnLogSftpSession
-            if ($null -ne $ownLogUploadSession) {
-                $ownLogRemoteDirectory = [string]$sftpDirectories.MaintenanceLog
-                Send-BRAVOOwnLogFile `
-                    -Session $ownLogUploadSession `
-                    -LocalLogPath $LOG_FILE `
-                    -RemoteDirectory $ownLogRemoteDirectory `
-                    -Logger $null
+            # Окрема копія логу прогону — у власному try: її провал не
+            # повинен скасовувати вивантаження решти журналів нижче.
+            try {
+                if ($null -ne $ownLogUploadSession -and $ownLogFileUploadEnabled) {
+                    $ownLogRemoteDirectory = [string]$sftpDirectories.MaintenanceLog
+                    Send-BRAVOOwnLogFile `
+                        -Session $ownLogUploadSession `
+                        -LocalLogPath $LOG_FILE `
+                        -RemoteDirectory $ownLogRemoteDirectory `
+                        -Logger $null
 
-                # R3-3 (round-3 review): range_id_log.json пише служба
-                # BRAVO КОНКУРЕНТНО з цим прогоном (toolkit його лише
-                # читає). Пряме читання живого шляху ДВІЧІ (розмір у
-                # Get-Item всередині Send-BRAVOTraceArchiveFile, потім
-                # вміст під час PutFiles) створювало TOCTOU-вікно: append
-                # між ними ламав перевірку розміру, а перезапис тієї самої
-                # довжини проходив перевірку, вивантаживши неузгоджений
-                # проміжний стан. Один локальний snapshot СТВОРЮЄТЬСЯ ПЕРШИМ,
-                # і розмір/hash/upload/verification відбуваються ЛИШЕ на
-                # ньому — живий шлях після цього моменту більше не
-                # читається. Знімок прибирається у внутрішньому finally
-                # незалежно від успіху/провалу.
-                $ownRangeIdLogPath = Get-BRAVOSystemRangeIdLogPath
-                if (-not [string]::IsNullOrWhiteSpace([string]$ownRangeIdLogPath) -and
-                    (Test-Path -LiteralPath $ownRangeIdLogPath -PathType Leaf)) {
-                    $ownRangeIdLogSnapshotPath = Join-Path ([System.IO.Path]::GetTempPath()) `
-                        ("BRAVO_range_id_log_snapshot_{0}.json" -f [guid]::NewGuid().ToString('N'))
-                    try {
-                        [System.IO.File]::Copy($ownRangeIdLogPath, $ownRangeIdLogSnapshotPath, $true)
-                        $ownRangeIdLogSnapshotHash = (Get-BRAVOFileHash -Path $ownRangeIdLogSnapshotPath -Algorithm SHA256).Hash
-                        Write-Log "Власний лог: знімок range_id_log.json створено ($ownRangeIdLogSnapshotPath, SHA256=$ownRangeIdLogSnapshotHash)" -Level "DEBUG"
-                        Send-BRAVOOwnLogFile `
-                            -Session $ownLogUploadSession `
-                            -LocalLogPath $ownRangeIdLogSnapshotPath `
-                            -RemoteDirectory $ownLogRemoteDirectory `
-                            -RemoteFileName ("range_id_log_{0}.json" -f $maintenanceLogRunId) `
-                            -Logger $null
-                    } catch {
-                        Write-Log "Власний лог: не вдалося створити знімок range_id_log.json: $($_.Exception.Message)" -Level "WARNING"
+                    # R3-3 (round-3 review): range_id_log.json пише служба
+                    # BRAVO КОНКУРЕНТНО з цим прогоном (toolkit його лише
+                    # читає). Пряме читання живого шляху ДВІЧІ (розмір у
+                    # Get-Item всередині Send-BRAVOTraceArchiveFile, потім
+                    # вміст під час PutFiles) створювало TOCTOU-вікно: append
+                    # між ними ламав перевірку розміру, а перезапис тієї самої
+                    # довжини проходив перевірку, вивантаживши неузгоджений
+                    # проміжний стан. Один локальний snapshot СТВОРЮЄТЬСЯ ПЕРШИМ,
+                    # і розмір/hash/upload/verification відбуваються ЛИШЕ на
+                    # ньому — живий шлях після цього моменту більше не
+                    # читається. Знімок прибирається у внутрішньому finally
+                    # незалежно від успіху/провалу.
+                    $ownRangeIdLogPath = Get-BRAVOSystemRangeIdLogPath
+                    if (-not [string]::IsNullOrWhiteSpace([string]$ownRangeIdLogPath) -and
+                        (Test-Path -LiteralPath $ownRangeIdLogPath -PathType Leaf)) {
+                        $ownRangeIdLogSnapshotPath = Join-Path ([System.IO.Path]::GetTempPath()) `
+                            ("BRAVO_range_id_log_snapshot_{0}.json" -f [guid]::NewGuid().ToString('N'))
+                        try {
+                            [System.IO.File]::Copy($ownRangeIdLogPath, $ownRangeIdLogSnapshotPath, $true)
+                            $ownRangeIdLogSnapshotHash = (Get-BRAVOFileHash -Path $ownRangeIdLogSnapshotPath -Algorithm SHA256).Hash
+                            Write-Log "Власний лог: знімок range_id_log.json створено ($ownRangeIdLogSnapshotPath, SHA256=$ownRangeIdLogSnapshotHash)" -Level "DEBUG"
+                            Send-BRAVOOwnLogFile `
+                                -Session $ownLogUploadSession `
+                                -LocalLogPath $ownRangeIdLogSnapshotPath `
+                                -RemoteDirectory $ownLogRemoteDirectory `
+                                -RemoteFileName ("range_id_log_{0}.json" -f $maintenanceLogRunId) `
+                                -Logger $null
+                        } catch {
+                            Write-Log "Власний лог: не вдалося створити знімок range_id_log.json: $($_.Exception.Message)" -Level "WARNING"
+                        }
                     }
+                }
+            } catch {
+                Write-Log "Власний лог: вивантаження на SFTP не вдалося: $($_.Exception.Message)" -Level "WARNING"
+            }
+            if ($null -ne $ownLogUploadSession) {
+                try {
+                    $runtimeLogSyncResult = Sync-BRAVORuntimeLogsToSftp `
+                        -Session $ownLogUploadSession `
+                        -LocalLogRoot ([string]$global:runtimeLogRoot) `
+                        -RemoteDirectory ([string]$sftpDirectories.RuntimeLogs)
+                    $runtimeLogSyncMessage = "Журнали toolkit на SFTP: вивантажено $($runtimeLogSyncResult.Uploaded), без змін $($runtimeLogSyncResult.Unchanged), помилок $($runtimeLogSyncResult.Failed)"
+                    if ($runtimeLogSyncResult.Failed -gt 0) {
+                        Write-Log "$runtimeLogSyncMessage; перша помилка: $($runtimeLogSyncResult.FirstError)" -Level "WARNING"
+                    } else {
+                        Write-Log $runtimeLogSyncMessage -Level "INFO"
+                    }
+                } catch {
+                    Write-Log "Журнали toolkit: вивантаження на SFTP не вдалося: $($_.Exception.Message)" -Level "WARNING"
                 }
             }
         } catch {
@@ -10796,9 +10927,11 @@ Write-BRAVOResultField -Label 'Помилок' -Value ([string]$script:BRAVOMain
 # Archive/Health/інших — тут навмисно окрема функція, не той самий виклик.
 Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
 
-# Вивантаження ВЛАСНОГО повного логу прогону (+ знімок range_id_log.json)
-# на SFTP — opt-in (componentSettings.SFTP.MaintenanceLogUploadEnabled,
-# дефолт $false). Розміщено ПІСЛЯ резолву $script:maintenanceRuntimeExitCode
+# Вивантаження журналів toolkit на SFTP: весь <RuntimeRoot>\LOGS у
+# sftpDirectories.RuntimeLogs, коли storageSettings.SFTP.Enabled і є
+# SFTP-креденшли; окрема копія логу прогону (+ знімок range_id_log.json) —
+# opt-in (componentSettings.SFTP.MaintenanceLogUploadEnabled, дефолт
+# $false). Розміщено ПІСЛЯ резолву $script:maintenanceRuntimeExitCode
 # і фінального підсумку: провал передачі структурно не може змінити
 # результат прогону (другорядний/телеметричний ефект). Виклик тут —
 # call site №1 (щасливий шлях, ПЕРЕД AutoShutdown — P2-6 ordering);

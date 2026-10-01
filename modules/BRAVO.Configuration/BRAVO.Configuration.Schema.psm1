@@ -513,12 +513,12 @@ function Test-BRAVOConfigurationOverrideSchema {
 # узагалі й проходить повз цей шар так само, як повз type-перевірку.
 # Це свідоме узгодження з D3, не недогляд (WAVE2-CONTRACT.md, розділ 5/11.3).
 #
-# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 277 канонічних листів (а не
+# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 278 канонічних листів (а не
 # лише на DENY/VALIDATOR-підмножину) — навмисно: WAVE2-CONTRACT.md
 # (розділ 8/11.3) вимагає, щоб кожен НОВИЙ канонічний лист отримував
 # явне класифікаційне рішення (навіть якщо це явний ALLOW_SITE), а не
 # мовчазний allow-by-omission. Повнота реєстру перевіряється в
-# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "277/277
+# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "278/278
 # coverage" — фейлить, якщо реєстр і канонічна схема розійшлися в
 # обидва боки: зайвий запис АБО відсутній запис); у цьому модулі немає
 # окремої функції з такою назвою.
@@ -938,6 +938,7 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'sftpDirectories.MaintenanceLog' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.Manifest' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.MODEL' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.RuntimeLogs' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.Trace' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.TraceLogs' = @{ Class = 'ALLOW_SITE' }
     'sftpHostKey' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'NonEmptyString' }

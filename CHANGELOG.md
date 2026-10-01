@@ -2,6 +2,28 @@
 
 ## Не випущено (developer)
 
+- **Feature: усі журнали toolkit вивантажуються на SFTP за увімкненого хмарного бекапу.**
+  Раніше на SFTP потрапляли лише логи BRAVO_MAINTENANCE і BRAVO_ARCHIV і лише за
+  окремими opt-in тумблерами `componentSettings.SFTP.MaintenanceLogUploadEnabled` /
+  `ArchiveLogUploadEnabled` (обидва за замовчуванням `$false`); журнали Health,
+  DataRestore та допоміжних скриптів (`LOGS\HELPERS`) не вивантажувались зовсім.
+  Тепер наприкінці кожного прогону BRAVO_MAINTENANCE, коли
+  `storageSettings.SFTP.Enabled = $true` і в Credential Manager є SFTP-креденшли,
+  увесь каталог `<RuntimeRoot>\LOGS` разом із підкаталогами інкрементально
+  вивантажується в новий каталог `sftpDirectories.RuntimeLogs` (за замовчуванням
+  `logs/runtime`) зі збереженням відносних шляхів. Файл, що вже є на SFTP з тим самим
+  розміром, вдруге не передається; на SFTP нічого не видаляється. Без креденшлів
+  вивантаження пропускається з `INFO`; помилки передачі дають один `WARNING` і не
+  змінюють код завершення. Тумблери окремих копій логів прогону лишаються без змін.
+  Канонічних листів конфігурації стало 278 (+1 `ALLOW_SITE`). Нові self-test перевірки:
+  `Maintenance/OwnLogToggleOffStillSyncsRuntimeLogs`,
+  `Maintenance/RuntimeLogUploadSkippedWhenSftpDisabled`,
+  `Maintenance/RuntimeLogUploadSkippedWithoutCredentials`,
+  `Maintenance/RuntimeLogSyncFailureCaughtNotPropagated`,
+  `Maintenance/RuntimeLogSyncUploadsNewAndGrownFilesRecursively`,
+  `Maintenance/RuntimeLogSyncUsesSnapshotsAndCleansUp`,
+  `Maintenance/RuntimeLogSyncMissingLocalRootIsNoOp`.
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях

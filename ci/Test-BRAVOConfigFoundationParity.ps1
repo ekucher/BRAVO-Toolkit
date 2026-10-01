@@ -496,6 +496,9 @@ $knownIntentionalDiffPrefixes = @(
     'maintenanceSettings.Retention.RawSourceGraceDays',
     'sftpDirectories.ArchivLog',
     'sftpDirectories.MaintenanceLog',
+    # Вивантаження всього каталогу журналів toolkit (рішення власника
+    # 2026-10-01) — адитивний ключ, у BEFORE його немає.
+    'sftpDirectories.RuntimeLogs',
     # BSYSTEM Operations (5.3.0), коміт 021fdbf — нові credential-target
     # ключі bootstrap-секрету self-enrollment і виданого API-ключа.
     # У BEFORE (42cf9ad) секції credentialSettings.Targets / legacy
