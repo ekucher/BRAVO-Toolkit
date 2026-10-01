@@ -604,17 +604,16 @@ try {
 
             # #282: каталог призначення перевіряється лише для компонента,
             # який справді його отримає; для BAZA_* це тільки *_LOCAL.
-            $discoveryDestinationPaths = @{
-                MODEL = $archiveDirs.Model
-                BLOG = $archiveDirs.Blog
-                BRAVOEXCH = $archiveDirs.BravoExch
-            }
-            if ([bool]$global:componentSettings.Synchronization.BAZA_APP_LOCAL) {
-                $discoveryDestinationPaths['BAZA_APP'] = $bazaAppPaths.Destination
-            }
-            if ([bool]$global:componentSettings.Synchronization.BAZA_WWW_LOCAL) {
-                $discoveryDestinationPaths['BAZA_WWW'] = $bazaWWWPaths.Destination
-            }
+            $discoveryDestinationPaths = Get-BRAVODiscoveryDestinationPaths `
+                -ArchiveDirectories @{
+                    Model = $archiveDirs.Model
+                    Blog = $archiveDirs.Blog
+                    BravoExch = $archiveDirs.BravoExch
+                } `
+                -BazaAppDestination $bazaAppPaths.Destination `
+                -BazaWwwDestination $bazaWWWPaths.Destination `
+                -BazaAppLocal $global:componentSettings.Synchronization.BAZA_APP_LOCAL `
+                -BazaWwwLocal $global:componentSettings.Synchronization.BAZA_WWW_LOCAL
             $discoveryValidationErrors = @(Test-BRAVODiscoveryResult `
                 -DiscoveryResult $bravoDiscoveryResult `
                 -EnabledComponents $discoveryScope.EffectiveEnabledComponents `

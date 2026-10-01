@@ -1278,9 +1278,9 @@ try {
     } catch {
         $dryRunComponentScopeError = [string]$_.Exception.Message
     }
-    $dryRunArchiveDefinitions = @($archiveDefinitions | Where-Object {
-        (Test-SettingEnabled $_.Enabled) -and $dryRunNotInstalledComponents -notcontains [string]$_.Type
-    })
+    $dryRunArchiveDefinitions = @(Select-BRAVOExpectedArchiveDefinition `
+        -ArchiveDefinitions $archiveDefinitions `
+        -NotInstalledComponents $dryRunNotInstalledComponents)
 
     Add-DryRunResult PASS "Корені" "RuntimeRoot" $dryRunRuntimeRoot
     Add-DryRunResult PASS "Корені" "RuntimeLogRoot (script logs)" $dryRunRuntimeLogRoot

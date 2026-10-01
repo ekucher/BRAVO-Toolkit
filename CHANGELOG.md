@@ -23,12 +23,21 @@
   `Missing` (backup пробує компонент і падає гучно, baseline не пишеться). Доказ з попереднього
   COMPLETE manifest діє й коли baseline старіший за цей manifest; `BRAVO_SETUP` передає той самий
   доказ, що й ARCHIV. Підсумок ARCHIV (status JSON, секція «Архіви», план, лог) враховує лише реальний
-  склад. Свідоме відхилення від
-  `designs/backup-scope-by-environment.md` (розділ 5): Health бере склад із живого discovery +
-  baseline (read-only) і останнього COMPLETE manifest як другого доказу, а не зі `scope`
-  manifest, бо manifest застаріває між прогонами; поле manifest `componentScope` пишеться як
-  аудит-доказ свідомого пропуску й Health його не читає. Нові self-test перевірки: набір
-  `BackupScope` (зокрема `BackupScope/PreviouslyBackedUpComponentVanishedWithoutBaselineIsError`,
+  склад.
+  Дизайн складу: Health і Dry Run не читають склад зі `scope` останнього manifest, а беруть його
+  з живого discovery + baseline (лише читання, `Get-BRAVOBackupNotInstalledComponents`) і
+  останнього COMPLETE manifest як другого доказу присутності, бо manifest застаріває між
+  прогонами: компонент, що зник після останньої копії, Health побачив би як `Planned` лише до
+  наступного прогону, а новий не побачив би взагалі. Поле manifest `componentScope`
+  (компонент -> `Planned` / `NotInstalled` / `DisabledByConfig` / `Missing` / `Unknown`) пишеться
+  для аудиту як доказ свідомого пропуску; Health його не читає. Невизначеність (непридатний
+  baseline) у read-only варіанті дає порожній список NotInstalled: очікуються всі увімкнені
+  компоненти, зайва тривога краща за пропущену. Фільтри «увімкнений і встановлений» винесено в
+  `Select-BRAVOExpectedArchiveDefinition`, охоронець оновлення baseline в
+  `Test-BRAVOBackupBaselineUpdateAllowed`, перелік призначень SETUP у
+  `Get-BRAVODiscoveryDestinationPaths`, а перевірку BAZA-синхронізації в
+  `Test-BRAVOBackupComponentInstalled`, щоб їх поведінку перевіряли self-test-и, а не пошук
+  тексту в коді. Нові self-test перевірки: набір `BackupScope` (зокрема `BackupScope/PreviouslyBackedUpComponentVanishedWithoutBaselineIsError`,
   `BackupScope/FirstBaselineExcludesDisabledByConfig`,
   `BackupScope/LastCompleteManifestComponentsReader`,
   `BackupScope/SftpConfigSkipsNotInstalledAndPreviousProofWired`).

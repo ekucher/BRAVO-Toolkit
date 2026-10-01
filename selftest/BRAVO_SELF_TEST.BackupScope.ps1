@@ -1,7 +1,8 @@
 ﻿# ============================================================
 # BackupScope: резервне копіювання лише наявних компонентів
 # ============================================================
-# Рішення власника 2026-10-01 (designs/backup-scope-by-environment.md):
+# Рішення власника 2026-10-01 (опис дизайну - у CHANGELOG, запис про
+# бекап лише наявних компонентів):
 # прапорець компонента означає «копіювати, якщо компонент є на сервері».
 # Канонічна класифікація — Resolve-BRAVOBackupComponentScope
 # (modules\BRAVO.Discovery) поверх матриці Test-BRAVODiscoveryComponentDrift.
@@ -321,6 +322,54 @@ try {
         -not (Test-Path -LiteralPath (Get-BRAVODiscoveryBaselinePath -StateRoot $scopeStateRoot))
     ) -Name 'BackupScope/ReadOnlyScopeWritesNothing' `
         -Failure 'Get-BRAVOBackupNotInstalledComponents має повертати той самий склад без жодного запису baseline'
+
+    # Другий доказ присутності: останній COMPLETE manifest, де BLOG був у
+    # складі. Тепер BLOG відсутній на сервері й baseline немає, але
+    # компонент уже потрапляв у резервну копію, тож він не NotInstalled
+    # (Health і Dry Run мають очікувати його й підняти тривогу).
+    $scopeEvidenceBackupRoot = Join-Path $scopeStateRoot 'EvidenceBackupRoot'
+    $scopeEvidenceManifestDir = Join-Path $scopeEvidenceBackupRoot 'MANIFESTS'
+    [void](New-Item -ItemType Directory -Path $scopeEvidenceManifestDir -Force)
+    [IO.File]::WriteAllText(
+        (Join-Path $scopeEvidenceManifestDir 'BRAVO_BACKUP_20260102_020000.json'),
+        (@{
+            generationId = '20260102_020000'; status = 'COMPLETE'; createdAt = '2026-01-02T02:00:00Z'
+            components = @{
+                MODEL = @{ CreateSuccess = $true; ArchivePath = 'C:\ExampleLims\ARCHIV\MODEL\m.7z' }
+                BLOG = @{ CreateSuccess = $true; ArchivePath = 'C:\ExampleLims\ARCHIV\BLOG\b.7z' }
+            }
+        } | ConvertTo-Json -Depth 5),
+        (New-Object Text.UTF8Encoding($false)))
+    $scopeBlogGoneDiscovery = New-BRAVOSelfTestScopeDiscovery -Presence @{ MODEL = 'Present'; BLOG = 'Absent'; BRAVOEXCH = 'Absent'; BAZA_APP = 'Absent'; BAZA_WWW = 'Present' }
+    $scopeNoEvidence = Get-BRAVOBackupNotInstalledComponents `
+        -DiscoveryResult $scopeBlogGoneDiscovery -EnabledComponents $scopeAllEnabled `
+        -StateRoot $scopeStateRoot -RuntimeRoot $scopeRuntimeRoot
+    $scopeWithEvidence = Get-BRAVOBackupNotInstalledComponents `
+        -DiscoveryResult $scopeBlogGoneDiscovery -EnabledComponents $scopeAllEnabled `
+        -StateRoot $scopeStateRoot -RuntimeRoot $scopeRuntimeRoot `
+        -BackupRoot $scopeEvidenceBackupRoot
+    Test-BRAVOCondition -Condition (
+        @($scopeNoEvidence.NotInstalled) -contains 'BLOG' -and
+        @($scopeWithEvidence.NotInstalled) -notcontains 'BLOG' -and
+        @($scopeWithEvidence.NotInstalled) -contains 'BRAVOEXCH'
+    ) -Name 'BackupScope/ReadOnlyScopeUsesPreviousCompleteManifestEvidence' `
+        -Failure 'Get-BRAVOBackupNotInstalledComponents має брати останній COMPLETE manifest другим доказом: компонент, що вже був у копії, не стає NotInstalled'
+
+    # Непридатний baseline: невизначеність дає порожній список (очікуємо всі
+    # увімкнені), а не тихе «не встановлено».
+    $scopeUnreadableStateRoot = Join-Path $scopeStateRoot 'UnreadableState'
+    [void](New-Item -ItemType Directory -Path $scopeUnreadableStateRoot -Force)
+    $scopeUnreadableBaselinePath = Get-BRAVODiscoveryBaselinePath -StateRoot $scopeUnreadableStateRoot
+    [void](New-Item -ItemType Directory -Path (Split-Path -Parent $scopeUnreadableBaselinePath) -Force)
+    [IO.File]::WriteAllText($scopeUnreadableBaselinePath, '{ не JSON', (New-Object Text.UTF8Encoding($false)))
+    $scopeUnreadableReadOnly = Get-BRAVOBackupNotInstalledComponents `
+        -DiscoveryResult $scopeVetOfficeDiscovery -EnabledComponents $scopeAllEnabled `
+        -StateRoot $scopeUnreadableStateRoot -RuntimeRoot $scopeRuntimeRoot
+    Test-BRAVOCondition -Condition (
+        @($scopeUnreadableReadOnly.NotInstalled).Count -eq 0 -and
+        [IO.File]::ReadAllText($scopeUnreadableBaselinePath) -eq '{ не JSON'
+    ) -Name 'BackupScope/ReadOnlyScopeUnreadableBaselineFailsSafe' `
+        -Failure 'за непридатного baseline Get-BRAVOBackupNotInstalledComponents має повертати порожній список (очікуються всі увімкнені) і нічого не перезаписувати'
     $scopeCreated = Update-BRAVODiscoveryBaselineFromScope `
         -DiscoveryResult $scopeVetOfficeDiscovery -ScopeResult $scopeVetOffice `
         -StateRoot $scopeStateRoot -RuntimeRoot $scopeRuntimeRoot
@@ -440,18 +489,21 @@ $scopeArchiveSyncBazaIndex = $scopeArchiveText.IndexOf('if ($SyncBAZA) {', [Math
 Test-BRAVOCondition -Condition (
     $scopeArchiveResolveIndex -ge 0 -and
     $scopeArchiveSyncBazaIndex -gt $scopeArchiveResolveIndex -and
-    $scopeArchiveText.Contains('$_.Enabled -and $notInstalledComponents -notcontains [string]$_.Type') -and
+    $scopeArchiveText.Contains('$enabledArchives = @(Select-BRAVOExpectedArchiveDefinition') -and
+    $scopeArchiveText.Contains("Test-BRAVOBackupComponentInstalled -Component 'BAZA_APP'") -and
+    $scopeArchiveText.Contains('if (Test-BRAVOBackupBaselineUpdateAllowed') -and
     $scopeArchiveText.Contains('$discoveryDriftFindings = @($backupScope.Findings)') -and
     $scopeArchiveText.Contains('-ComponentScope $(if ($null -ne $backupScope) { $backupScope.Components } else { $null })') -and
     $scopeArchiveText.Contains("`$manifest['componentScope'] = `$componentScopeProperty.Value") -and
     $scopeArchiveText.Contains('$baselineUpdate = Update-BRAVODiscoveryBaselineFromScope')
-) -Name 'BackupScope/ArchiveUsesCanonicalScope' `
+) -Name 'BackupScope/ArchiveUsesCanonicalScopeWired' `
     -Failure 'BRAVO_ARCHIV має обчислювати склад до гілки -SyncBAZA, фільтрувати NotInstalled, писати componentScope у manifest і доповнювати baseline лише через канонічні функції'
 Test-BRAVOCondition -Condition (
     $scopeHealthText.Contains('function Get-BRAVOHealthExpectedArchiveDefinitions') -and
     $scopeHealthText.Contains('$healthComponentScope = Get-BRAVOBackupNotInstalledComponents') -and
+    $scopeHealthText.Contains('Select-BRAVOExpectedArchiveDefinition') -and
     -not $scopeHealthText.Contains('@($archiveDefinitions | Where-Object { $_.Enabled })')
-) -Name 'BackupScope/HealthExpectsOnlyInstalledComponents' `
+) -Name 'BackupScope/HealthExpectsOnlyInstalledComponentsWired' `
     -Failure 'Health має очікувати лише встановлені компоненти через Get-BRAVOHealthExpectedArchiveDefinitions і read-only Get-BRAVOBackupNotInstalledComponents'
 Test-BRAVOCondition -Condition (
     $scopeArchiveText.Contains('Test-SFTPConfig -NotInstalledComponents $notInstalledComponents') -and
@@ -465,14 +517,17 @@ Test-BRAVOCondition -Condition (
 $scopeDryRunText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)
 Test-BRAVOCondition -Condition (
     $scopeDryRunText.Contains('$dryRunComponentScope = Get-BRAVOBackupNotInstalledComponents') -and
+    $scopeDryRunText.Contains('$dryRunArchiveDefinitions = @(Select-BRAVOExpectedArchiveDefinition') -and
+    $scopeDryRunText.Contains('-NotInstalledComponents $dryRunNotInstalledComponents)') -and
     $scopeDryRunText.Contains('foreach ($definition in $dryRunArchiveDefinitions)') -and
     -not $scopeDryRunText.Contains('@($archiveDefinitions | Where-Object { Test-SettingEnabled $_.Enabled })')
-) -Name 'BackupScope/DryRunChecksOnlyInstalledComponents' `
+) -Name 'BackupScope/DryRunChecksOnlyInstalledComponentsWired' `
     -Failure 'Dry Run має перевіряти джерела й призначення лише встановлених компонентів через Get-BRAVOBackupNotInstalledComponents'
 Test-BRAVOCondition -Condition (
     $scopeSetupText.Contains('$discoveryScope = Resolve-BRAVOBackupComponentScope') -and
+    $scopeSetupText.Contains('$discoveryDestinationPaths = Get-BRAVODiscoveryDestinationPaths') -and
     $scopeSetupText.Contains('-EnabledComponents $discoveryScope.EffectiveEnabledComponents')
-) -Name 'BackupScope/SetupValidatesEffectiveComposition' `
+) -Name 'BackupScope/SetupValidatesEffectiveCompositionWired' `
     -Failure 'BRAVO_SETUP -ValidateOnly має перевіряти склад через Resolve-BRAVOBackupComponentScope'
 Test-BRAVOCondition -Condition (
     $scopeSetupText.Contains('Get-BRAVOLastCompleteBackupEvidence') -and
@@ -494,5 +549,126 @@ Test-BRAVOCondition -Condition (
     -not $scopeArchiveText.Contains('$statusComponentsTotal = @($archiveDefinitions') -and
     $scopeArchiveText.Contains('$notInstalledComponents -notcontains [string]$archiveDefinition.Type') -and
     $scopeArchiveText.Contains("'НЕ ВСТАНОВЛЕНО (пропущено)'")
-) -Name 'BackupScope/ArchiveSummaryCountsOnlyInstalledComponents' `
+) -Name 'BackupScope/ArchiveSummaryCountsOnlyInstalledComponentsWired' `
     -Failure 'status JSON componentsTotal, секція "Архіви", план і лог мають використовувати $enabledArchives: NotInstalled не рахується і не друкується як "Архів не створено"'
+
+# (11) Поведінкові перевірки фільтрів і охоронців (замість пошуку тексту).
+$scopeDefinitions = @(
+    [pscustomobject]@{ Type = 'MODEL'; Enabled = $true },
+    [pscustomobject]@{ Type = 'BLOG'; Enabled = $true },
+    [pscustomobject]@{ Type = 'BRAVOEXCH'; Enabled = $true },
+    [pscustomobject]@{ Type = 'BAZA_APP'; Enabled = 'false' }
+)
+$scopeSelected = @(Select-BRAVOExpectedArchiveDefinition -ArchiveDefinitions $scopeDefinitions -NotInstalledComponents @('BRAVOEXCH'))
+$scopeSelectedAll = @(Select-BRAVOExpectedArchiveDefinition -ArchiveDefinitions $scopeDefinitions)
+Test-BRAVOCondition -Condition (
+    $scopeSelected.Count -eq 2 -and
+    @($scopeSelected.Type) -contains 'MODEL' -and
+    @($scopeSelected.Type) -contains 'BLOG' -and
+    @($scopeSelected.Type) -notcontains 'BRAVOEXCH' -and
+    @($scopeSelected.Type) -notcontains 'BAZA_APP' -and
+    $scopeSelectedAll.Count -eq 3 -and
+    @($scopeSelectedAll.Type) -contains 'BRAVOEXCH'
+) -Name 'BackupScope/ExpectedArchiveDefinitionsExcludeNotInstalled' `
+    -Failure 'Select-BRAVOExpectedArchiveDefinition (фільтр Archive/Health/Dry Run) має виключати NotInstalled і вимкнені (зокрема рядок "false"), а без NotInstalled повертати всі увімкнені'
+
+# Health: реальна функція з Health runtime на фікстурі.
+$scopeHealthModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText $scopeHealthText `
+    -FunctionNames @('Get-BRAVOHealthExpectedArchiveDefinitions')
+$scopeHealthExpected = & $scopeHealthModule {
+    param($Definitions)
+    Set-StrictMode -Version Latest
+    $archiveDefinitions = $Definitions
+    $unset = @(Get-BRAVOHealthExpectedArchiveDefinitions | ForEach-Object { [string]$_.Type })
+    $script:healthNotInstalledComponents = @('BRAVOEXCH')
+    $filtered = @(Get-BRAVOHealthExpectedArchiveDefinitions | ForEach-Object { [string]$_.Type })
+    $script:healthNotInstalledComponents = @()
+    $empty = @(Get-BRAVOHealthExpectedArchiveDefinitions | ForEach-Object { [string]$_.Type })
+    return [pscustomobject]@{ Unset = $unset; Filtered = $filtered; Empty = $empty }
+} $scopeDefinitions
+Test-BRAVOCondition -Condition (
+    @($scopeHealthExpected.Filtered).Count -eq 2 -and
+    @($scopeHealthExpected.Filtered) -notcontains 'BRAVOEXCH' -and
+    @($scopeHealthExpected.Filtered) -contains 'MODEL' -and
+    @($scopeHealthExpected.Unset).Count -eq 3 -and
+    @($scopeHealthExpected.Empty).Count -eq 3
+) -Name 'BackupScope/HealthExpectedArchivesExcludeNotInstalled' `
+    -Failure 'Get-BRAVOHealthExpectedArchiveDefinitions має виключати NotInstalled-компонент; без стану прогону або з порожнім списком очікуються всі увімкнені'
+
+# Dry Run: той самий канонічний фільтр з рядковими прапорцями Enabled.
+$scopeDryRunSelected = @(Select-BRAVOExpectedArchiveDefinition `
+    -ArchiveDefinitions @(
+        [pscustomobject]@{ Type = 'MODEL'; Enabled = 'true' },
+        [pscustomobject]@{ Type = 'BLOG'; Enabled = '1' },
+        [pscustomobject]@{ Type = 'BRAVOEXCH'; Enabled = $true }
+    ) `
+    -NotInstalledComponents @('BLOG'))
+Test-BRAVOCondition -Condition (
+    $scopeDryRunSelected.Count -eq 2 -and
+    @($scopeDryRunSelected.Type) -notcontains 'BLOG' -and
+    @($scopeDryRunSelected.Type) -contains 'BRAVOEXCH'
+) -Name 'BackupScope/DryRunFilterExcludesNotInstalled' `
+    -Failure 'фільтр Dry Run має виключати NotInstalled і розуміти рядкові прапорці Enabled'
+
+# Archive: охоронець автоматичного оновлення baseline.
+$scopeGuardScope = [pscustomobject]@{ NotInstalled = @() }
+Test-BRAVOCondition -Condition (
+    (Test-BRAVOBackupBaselineUpdateAllowed -GenerationStatus 'COMPLETE' -BaselineValid $true -BackupScope $scopeGuardScope -GenerationManifestPath 'C:\ExampleLims\ARCHIV\GEN\manifest.json') -and
+    -not (Test-BRAVOBackupBaselineUpdateAllowed -GenerationStatus 'FAILED' -BaselineValid $true -BackupScope $scopeGuardScope -GenerationManifestPath 'C:\ExampleLims\ARCHIV\GEN\manifest.json') -and
+    -not (Test-BRAVOBackupBaselineUpdateAllowed -GenerationStatus 'INCOMPLETE' -BaselineValid $true -BackupScope $scopeGuardScope -GenerationManifestPath 'C:\ExampleLims\ARCHIV\GEN\manifest.json') -and
+    -not (Test-BRAVOBackupBaselineUpdateAllowed -GenerationStatus 'COMPLETE' -BaselineValid $false -BackupScope $scopeGuardScope -GenerationManifestPath 'C:\ExampleLims\ARCHIV\GEN\manifest.json') -and
+    -not (Test-BRAVOBackupBaselineUpdateAllowed -GenerationStatus 'COMPLETE' -BaselineValid $true -BackupScope $null -GenerationManifestPath 'C:\ExampleLims\ARCHIV\GEN\manifest.json') -and
+    -not (Test-BRAVOBackupBaselineUpdateAllowed -GenerationStatus 'COMPLETE' -BaselineValid $true -BackupScope $scopeGuardScope -GenerationManifestPath '')
+) -Name 'BackupScope/ArchiveBaselineUpdateGuard' `
+    -Failure 'baseline має оновлюватись лише після COMPLETE generation з придатним baseline, визначеним складом і записаним manifest'
+
+# Archive: NotInstalled BAZA-компонент не синхронізується.
+Test-BRAVOCondition -Condition (
+    -not (Test-BRAVOBackupComponentInstalled -Component 'BAZA_APP' -NotInstalledComponents @('BAZA_APP', 'BRAVOEXCH')) -and
+    (Test-BRAVOBackupComponentInstalled -Component 'BAZA_WWW' -NotInstalledComponents @('BAZA_APP')) -and
+    (Test-BRAVOBackupComponentInstalled -Component 'BAZA_APP' -NotInstalledComponents @())
+) -Name 'BackupScope/NotInstalledBazaComponentNotSynced' `
+    -Failure 'Test-BRAVOBackupComponentInstalled має давати $false для NotInstalled BAZA_*, інакше ARCHIV синхронізував би відсутній компонент'
+
+# SETUP: призначення BAZA_* перевіряються лише за увімкненої *_LOCAL
+# синхронізації, а NotInstalled-компонент не перевіряється зовсім.
+$scopeSetupArchiveDirs = @{ Model = 'C:\ExampleLims\ARCHIV\MODEL'; Blog = 'C:\ExampleLims\ARCHIV\BLOG'; BravoExch = 'C:\ExampleLims\ARCHIV\BRAVOEXCH' }
+$scopeSetupPathsOff = Get-BRAVODiscoveryDestinationPaths -ArchiveDirectories $scopeSetupArchiveDirs `
+    -BazaAppDestination 'C:\ExampleLims\BAZA_COPY' -BazaWwwDestination 'C:\ExampleWeb\BAZA_WWW_COPY' -BazaAppLocal $false -BazaWwwLocal 'false'
+$scopeSetupPathsOn = Get-BRAVODiscoveryDestinationPaths -ArchiveDirectories $scopeSetupArchiveDirs `
+    -BazaAppDestination 'C:\ExampleLims\BAZA_COPY' -BazaWwwDestination 'C:\ExampleWeb\BAZA_WWW_COPY' -BazaAppLocal $true -BazaWwwLocal 'true'
+$scopeSetupSource = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_SCOPE_SETUPSRC_' + [guid]::NewGuid().ToString('N'))
+try {
+    [void](New-Item -ItemType Directory -Path $scopeSetupSource -Force)
+    $scopeSetupDiscovery = [pscustomobject]@{
+        MODEL_SOURCE = $null; BLOG_SOURCE = $null; BRAVOEXCH_SOURCE = $null
+        BAZA_APP = $scopeSetupSource; BAZA_WWW = $null
+    }
+    # Призначення BAZA_APP збігається з джерелом: для встановленого
+    # компонента це помилка, для NotInstalled - ні.
+    $scopeSetupBadDestination = @{ BAZA_APP = $scopeSetupSource }
+    $scopeSetupErrorsInstalled = @(Test-BRAVODiscoveryResult -DiscoveryResult $scopeSetupDiscovery `
+        -EnabledComponents @{ BAZA_APP = $true } -DestinationPaths $scopeSetupBadDestination)
+    $scopeSetupScopeNotInstalled = Resolve-BRAVOBackupComponentScope `
+        -DiscoveryResult (New-BRAVOSelfTestScopeDiscovery -Presence @{ MODEL = 'Present'; BLOG = 'Present'; BRAVOEXCH = 'Present'; BAZA_APP = 'Absent'; BAZA_WWW = 'Present' }) `
+        -EnabledComponents @{ BAZA_APP = $true }
+    $scopeSetupErrorsNotInstalled = @(Test-BRAVODiscoveryResult -DiscoveryResult $scopeSetupDiscovery `
+        -EnabledComponents $scopeSetupScopeNotInstalled.EffectiveEnabledComponents -DestinationPaths $scopeSetupBadDestination)
+} finally {
+    foreach ($scopeSetupTemp in @($scopeSetupSource)) {
+        if (Test-Path -LiteralPath $scopeSetupTemp) { Remove-Item -LiteralPath $scopeSetupTemp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+Test-BRAVOCondition -Condition (
+    -not $scopeSetupPathsOff.ContainsKey('BAZA_APP') -and
+    -not $scopeSetupPathsOff.ContainsKey('BAZA_WWW') -and
+    $scopeSetupPathsOff.ContainsKey('MODEL') -and
+    $scopeSetupPathsOn.ContainsKey('BAZA_APP') -and
+    $scopeSetupPathsOn.ContainsKey('BAZA_WWW') -and
+    [string]$scopeSetupScopeNotInstalled.Components['BAZA_APP'] -eq 'NotInstalled' -and
+    -not [bool]$scopeSetupScopeNotInstalled.EffectiveEnabledComponents['BAZA_APP'] -and
+    $scopeSetupErrorsInstalled.Count -gt 0 -and
+    $scopeSetupErrorsNotInstalled.Count -eq 0
+) -Name 'BackupScope/SetupDestinationCheckHonoursNotInstalled' `
+    -Failure 'SETUP має перевіряти призначення BAZA_* лише за увімкненої *_LOCAL синхронізації (рядок "false" = вимкнено) і не вимагати призначення для NotInstalled-компонента'

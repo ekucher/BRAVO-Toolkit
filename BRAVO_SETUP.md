@@ -232,6 +232,14 @@ retention нового запуску шукають уже новий преф�
 
 У режимі `-ValidateOnly` тестове повідомлення не надсилається.
 
+Перевірка складу джерел враховує наявність компонентів: увімкнений, але не
+встановлений на сервері компонент (`NotInstalled`) пропускається без помилки,
+і каталог його призначення не вимагається. `-ValidateOnly` нічого не створює.
+Discovery baseline (`%ProgramData%\BRAVO\State\DISCOVERY_BASELINE.json`)
+створюється й доповнюється автоматично після першого COMPLETE backup
+(`BRAVO_ARCHIV.ps1`), а generation manifest містить поле `componentScope`.
+Деталі: `OPERATIONS.md`, розділ про `NotInstalled`.
+
 Якщо зовнішня мережа під час інсталяції недоступна:
 
 ```powershell

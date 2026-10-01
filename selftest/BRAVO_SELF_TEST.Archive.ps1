@@ -674,6 +674,9 @@ function Get-BRAVOFiles { param($Path, $Filter) return @() }
 function Import-BRAVODiscoveryBaseline { param($StateRoot, $RuntimeRoot) return [pscustomobject]@{ Problems = @(); Baseline = $null; Source = 'self-test' } }
 function Test-BRAVODiscoveryComponentDrift { param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents) return @() }
 function Get-BRAVOLastCompleteBackupComponents { param($BackupRoot) return @() }
+function Select-BRAVOExpectedArchiveDefinition { param($ArchiveDefinitions, [string[]]$NotInstalledComponents) return @(@($ArchiveDefinitions) | Where-Object { $_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type }) }
+function Test-BRAVOBackupComponentInstalled { param([string]$Component, [string[]]$NotInstalledComponents) return (@($NotInstalledComponents) -notcontains $Component) }
+function Test-BRAVOBackupBaselineUpdateAllowed { param($GenerationStatus, $BaselineValid, $BackupScope, $GenerationManifestPath) return ($GenerationStatus -eq 'COMPLETE' -and $BaselineValid -and $null -ne $BackupScope -and -not [string]::IsNullOrWhiteSpace($GenerationManifestPath)) }
 function Get-BRAVOLastCompleteBackupEvidence { param($BackupRoot) return [pscustomobject]@{ Components = @(); CreatedAtUtc = $null } }
 function Resolve-BRAVOBackupComponentScope {
     param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents, $PreviousCompleteComponents, $PreviousCompleteAt)

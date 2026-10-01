@@ -6507,13 +6507,13 @@ function Main {
     }
     $notInstalledComponents = @(if ($null -ne $backupScope) { $backupScope.NotInstalled })
 
-    $enabledArchives = @($archiveDefinitions | Where-Object {
-        $_.Enabled -and $notInstalledComponents -notcontains [string]$_.Type
-    })
+    $enabledArchives = @(Select-BRAVOExpectedArchiveDefinition `
+        -ArchiveDefinitions $archiveDefinitions `
+        -NotInstalledComponents $notInstalledComponents)
     $readyArchives = @()
     $results = @{}
-    $bazaAppInstalled = $notInstalledComponents -notcontains 'BAZA_APP'
-    $bazaWWWInstalled = $notInstalledComponents -notcontains 'BAZA_WWW'
+    $bazaAppInstalled = Test-BRAVOBackupComponentInstalled -Component 'BAZA_APP' -NotInstalledComponents $notInstalledComponents
+    $bazaWWWInstalled = Test-BRAVOBackupComponentInstalled -Component 'BAZA_WWW' -NotInstalledComponents $notInstalledComponents
     $bazaAppLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_LOCAL -and $bazaAppInstalled
     # BAZA_*_SFTP тут беруться вже effective (Get-BRAVOEffectiveSynchronizationConfiguration
     # ANDить componentSettings.SFTP.Enabled у SftpEnabled кожного компонента,
@@ -8007,10 +8007,11 @@ function Main {
     # перевіркою складу. Тоді компонент, що вже реально потрапив у
     # резервну копію, береться під захист від тихого зникнення без ручного
     # -ConfirmDiscoveryBaseline. Наявні записи baseline не змінюються.
-    if ([string]$script:backupGenerationStatus -eq 'COMPLETE' -and
-        $discoveryBaselineValid -and
-        $null -ne $backupScope -and
-        -not [string]::IsNullOrWhiteSpace([string]$generationManifestPath)) {
+    if (Test-BRAVOBackupBaselineUpdateAllowed `
+            -GenerationStatus ([string]$script:backupGenerationStatus) `
+            -BaselineValid ([bool]$discoveryBaselineValid) `
+            -BackupScope $backupScope `
+            -GenerationManifestPath ([string]$generationManifestPath)) {
         try {
             $baselineUpdate = Update-BRAVODiscoveryBaselineFromScope `
                 -DiscoveryResult $bravoDiscoveryResult `

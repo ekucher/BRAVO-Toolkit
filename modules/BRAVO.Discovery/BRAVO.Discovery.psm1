@@ -1654,7 +1654,7 @@ $script:BRAVOBackupMandatoryComponents = @('MODEL')
 
 function Resolve-BRAVOBackupComponentScope {
     # Склад backup set за наявністю компонентів на сервері (рішення
-    # власника 2026-10-01, designs/backup-scope-by-environment.md).
+    # власника 2026-10-01, опис дизайну у CHANGELOG).
     #
     # Прапорець компонента в componentSettings означає «копіювати, ЯКЩО
     # компонент є на сервері». Фактичний склад визначають presence-контракт
@@ -2202,9 +2202,91 @@ function Get-BRAVOBackupNotInstalledComponents {
     }
 }
 
+function ConvertTo-BRAVOScopeFlag {
+    # Прапорець із конфігурації (bool або рядок). Пряме [bool]"false" дає
+    # $true, тому рядки розбираються явно.
+    param([object]$Value)
+
+    if ($Value -is [bool]) { return [bool]$Value }
+    if ($null -eq $Value) { return $false }
+    return ([string]$Value).Trim() -match '^(?i:true|1|yes|on|enabled)$'
+}
+
+function Select-BRAVOExpectedArchiveDefinition {
+    # Єдиний фільтр архівів, які очікуються на цьому сервері: увімкнені в
+    # конфігурації й не NotInstalled. Використовують Archive, Health і
+    # Dry Run, щоб не мати трьох копій фільтра.
+    [CmdletBinding()]
+    param(
+        [object[]]$ArchiveDefinitions = @(),
+        [string[]]$NotInstalledComponents = @()
+    )
+
+    return @(@($ArchiveDefinitions) | Where-Object {
+        (ConvertTo-BRAVOScopeFlag -Value $_.Enabled) -and
+        @($NotInstalledComponents) -notcontains [string]$_.Type
+    })
+}
+
+function Test-BRAVOBackupComponentInstalled {
+    # $true, якщо компонент не позначено NotInstalled (BAZA_APP/BAZA_WWW
+    # синхронізуються лише за цієї умови).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [string[]]$NotInstalledComponents = @()
+    )
+
+    return (@($NotInstalledComponents) -notcontains $Component)
+}
+
+function Test-BRAVOBackupBaselineUpdateAllowed {
+    # Охоронець автоматичного оновлення discovery baseline: лише після
+    # COMPLETE generation, коли поточний baseline придатний, склад
+    # визначено й manifest generation записано.
+    [CmdletBinding()]
+    param(
+        [string]$GenerationStatus,
+        [bool]$BaselineValid,
+        [object]$BackupScope,
+        [string]$GenerationManifestPath
+    )
+
+    return (
+        $GenerationStatus -eq 'COMPLETE' -and
+        $BaselineValid -and
+        $null -ne $BackupScope -and
+        -not [string]::IsNullOrWhiteSpace($GenerationManifestPath)
+    )
+}
+
+function Get-BRAVODiscoveryDestinationPaths {
+    # Призначення, які перевіряє Test-BRAVODiscoveryResult у SETUP:
+    # каталоги архівів завжди, а BAZA_* лише коли відповідна локальна
+    # синхронізація увімкнена (інакше каталог не буде створено й не
+    # потрібно вимагати).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$ArchiveDirectories,
+        [string]$BazaAppDestination,
+        [string]$BazaWwwDestination,
+        [object]$BazaAppLocal,
+        [object]$BazaWwwLocal
+    )
+
+    $paths = @{
+        MODEL = $ArchiveDirectories['Model']
+        BLOG = $ArchiveDirectories['Blog']
+        BRAVOEXCH = $ArchiveDirectories['BravoExch']
+    }
+    if (ConvertTo-BRAVOScopeFlag -Value $BazaAppLocal) { $paths['BAZA_APP'] = $BazaAppDestination }
+    if (ConvertTo-BRAVOScopeFlag -Value $BazaWwwLocal) { $paths['BAZA_WWW'] = $BazaWwwDestination }
+    return $paths
+}
+
 function Update-BRAVODiscoveryBaselineFromScope {
     # Автоматичне створення й доповнення baseline після COMPLETE generation
-    # (рішення власника 2026-10-01, designs/backup-scope-by-environment.md).
+    # (рішення власника 2026-10-01, опис дизайну у CHANGELOG).
     #
     #   baseline немає (None)          -> створюється з поточного discovery
     #                                     (Save-BRAVODiscoveryBaseline);
@@ -2658,6 +2740,10 @@ Export-ModuleMember -Function @(
     'Get-BRAVOBackupNotInstalledComponents',
     'Get-BRAVOLastCompleteBackupEvidence',
     'Get-BRAVOLastCompleteBackupComponents',
+    'Select-BRAVOExpectedArchiveDefinition',
+    'Test-BRAVOBackupComponentInstalled',
+    'Test-BRAVOBackupBaselineUpdateAllowed',
+    'Get-BRAVODiscoveryDestinationPaths',
     'Update-BRAVODiscoveryBaselineFromScope',
     'Write-BRAVODiscoveryPresenceReport',
     'Save-BRAVODiscoveryBaseline',

@@ -14148,6 +14148,7 @@ try {
             [void][IO.Directory]::CreateDirectory($healthOrchestrationRoot)
             $healthOrchestrationStubs = @'
 function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
+function Select-BRAVOExpectedArchiveDefinition { param($ArchiveDefinitions, [string[]]$NotInstalledComponents) return @(@($ArchiveDefinitions) | Where-Object { $_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type }) }
 function New-ProbeIssue {
     param([string]$Kind, [string]$Component, [string]$Reason, [string]$Location)
     return [pscustomobject]@{ Kind = $Kind; Component = $Component; Reason = $Reason; FileName = 'немає даних'; LastWriteTime = $null; SizeBytes = $null; ActualSizeBytes = $null; Location = $Location; Details = @() }

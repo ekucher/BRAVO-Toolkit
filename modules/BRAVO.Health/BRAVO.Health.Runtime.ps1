@@ -557,15 +557,15 @@ function Get-BRAVOHealthExpectedArchiveDefinitions {
     # тоді очікуються всі увімкнені, як і до обліку складу.
     $notInstalledVariable = Get-Variable -Name healthNotInstalledComponents -Scope Script -ErrorAction SilentlyContinue
     $notInstalled = @(if ($null -ne $notInstalledVariable) { $notInstalledVariable.Value })
-    return @($archiveDefinitions | Where-Object {
-        [bool]$_.Enabled -and $notInstalled -notcontains [string]$_.Type
-    })
+    return @(Select-BRAVOExpectedArchiveDefinition `
+        -ArchiveDefinitions $archiveDefinitions `
+        -NotInstalledComponents $notInstalled)
 }
 
 # Той самий канонічний склад, що й у BRAVO_ARCHIV, у read-only варіанті:
 # Health лише читає baseline. Невизначеність = очікуємо всі увімкнені.
-# Свідоме відхилення від designs/backup-scope-by-environment.md (розділ 5):
-# дизайн велів брати склад зі `scope` останнього COMPLETE manifest. Тут
+# Свідоме рішення (опис дизайну у CHANGELOG): склад не береться зі `scope`
+# останнього COMPLETE manifest. Тут
 # склад береться з живого discovery + baseline (+ останній COMPLETE
 # manifest як другий доказ присутності, див. -BackupRoot), бо manifest
 # застаріває між прогонами: компонент, що зник після останньої копії,
