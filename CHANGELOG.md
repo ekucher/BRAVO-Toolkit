@@ -2,6 +2,22 @@
 
 ## Не випущено (developer)
 
+- **Fix: Health показує ймовірну причину застарілої generation і не дублює її в хмарних рядках (#322).**
+  Не-COMPLETE manifest більше не пропускається мовчки: `Get-BackupHealthIssues` запам'ятовує
+  останню INCOMPLETE/FAILED спробу, а issue «остання COMPLETE generation старша за N год.»
+  отримує поле `Diagnosis` з чистого класифікатора `Get-BRAVOHealthBackupStaleReason`
+  (завдання не встановлене/вимкнене → новіша не-COMPLETE спроба зі статусом і етапом → код
+  останнього запуску → не запускалося → завершився достроково → код status-файла Archive).
+  Кожне читання (планувальник, status-файл) у власному try/catch: збій пропускає перевірку
+  з WARNING, діагностика не змінює Kind/Component/Reason, exit code та Operations. У Slack
+  `LocalBackupGeneration` тепер у секції «ЛОКАЛЬНІ БЕКАПИ» (раніше «ІНШІ ПОМИЛКИ») з рядком
+  «:mag: Причина: …»; age-only хмарні рядки SFTP/SMB для того самого застарілого локального
+  архіву згортаються в один, помилки розміру/відсутності/з'єднання не згортаються,
+  лічильник компонентів не дублюється. Self-test: `Health/StaleGenerationReasonClassifier`,
+  `Health/StaleGenerationDiagnosisFromIncompleteManifest`,
+  `Health/StaleGenerationInLocalSectionWithReason`,
+  `Health/StaleGenerationCollapsesOnlyAgeOnlyCloudRows`,
+  `Health/StaleGenerationDiagnosisKeepsKindAndComponent`.
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`

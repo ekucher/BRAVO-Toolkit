@@ -1176,6 +1176,182 @@ function Get-LocalBackupState {
     }
 }
 
+function Get-BRAVOHealthBackupStaleReason {
+    # Чиста класифікація ймовірної причини, чому свіжої COMPLETE generation
+    # немає (#322). Перший збіг зверху вниз; $null = причину не визначено
+    # (рядок у повідомлення не додається). Вхід, якого не вдалося прочитати,
+    # передається як $null — відповідна перевірка пропускається.
+    param(
+        [AllowNull()][object]$TaskInfo,
+        [AllowNull()][object]$ArchiveStatus,
+        [AllowNull()][object]$LatestIncomplete,
+        [AllowNull()][object]$LatestCompleteUtc,
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime(),
+        [timespan]$MaxAge = [timespan]::FromHours(24),
+        [string]$TaskName = 'BRAVO_ARCHIV'
+    )
+
+    $read = {
+        param($Object, [string]$Name)
+        if ($null -eq $Object) { return $null }
+        $property = $Object.PSObject.Properties[$Name]
+        if ($null -eq $property) { return $null }
+        return $property.Value
+    }
+    $format = {
+        param([datetime]$Value)
+        return $Value.ToUniversalTime().ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+    }
+
+    $lastRun = $null
+    if ($null -ne $TaskInfo) {
+        if (-not [bool](& $read $TaskInfo 'Exists')) {
+            return "завдання $TaskName не встановлене"
+        }
+        $enabled = & $read $TaskInfo 'Enabled'
+        if ($null -ne $enabled -and -not [bool]$enabled) {
+            return "завдання $TaskName вимкнене"
+        }
+        $lastRun = & $read $TaskInfo 'LastRunTime'
+    }
+
+    if ($null -ne $LatestIncomplete) {
+        $incompleteUtc = & $read $LatestIncomplete 'CreatedAtUtc'
+        if ($null -ne $incompleteUtc -and
+            ($null -eq $LatestCompleteUtc -or [datetime]$incompleteUtc -gt [datetime]$LatestCompleteUtc)) {
+            $stage = [string](& $read $LatestIncomplete 'Stage')
+            $stageText = if ([string]::IsNullOrWhiteSpace($stage)) { '' } else { " (етап: $stage)" }
+            return "остання спроба $(& $read $LatestIncomplete 'GenerationId') $(& $format ([datetime]$incompleteUtc)) має статус $(& $read $LatestIncomplete 'Status')$stageText"
+        }
+    }
+
+    $statusExitCode = & $read $ArchiveStatus 'ExitCode'
+    $statusName = [string](& $read $ArchiveStatus 'ExitCodeName')
+    $statusFinished = & $read $ArchiveStatus 'FinishedAt'
+    $hasLastRun = $null -ne $lastRun -and ([datetime]$lastRun).Year -gt 1900
+
+    $taskResult = & $read $TaskInfo 'LastTaskResult'
+    if ($null -ne $taskResult) {
+        $resultCode = [uint32]([int64]$taskResult -band [int64]4294967295)
+        # 0 = успіх, 0x41301 = виконується, 0x41303 = ще не запускалося
+        if ($resultCode -notin @([uint32]0, [uint32]267009, [uint32]267011)) {
+            $runText = if ($hasLastRun) { " $(& $format ([datetime]$lastRun))" } else { '' }
+            $nameText = if ([string]::IsNullOrWhiteSpace($statusName)) { '' } else { " ($statusName)" }
+            return ("останній запуск $TaskName{0} завершився з кодом 0x{1:X8}{2}" -f $runText, $resultCode, $nameText)
+        }
+    }
+
+    if ($null -ne $TaskInfo -and $null -ne $lastRun) {
+        if (-not $hasLastRun) {
+            return "завдання $TaskName ще не запускалося"
+        }
+        if (($NowUtc - ([datetime]$lastRun).ToUniversalTime()) -ge $MaxAge) {
+            return "завдання не запускалося з $(& $format ([datetime]$lastRun))"
+        }
+        if ($null -ne $statusFinished -and ([datetime]$statusFinished) -lt ([datetime]$lastRun)) {
+            return "запуск $(& $format ([datetime]$lastRun)) завершився достроково (немає завершеного статусу; код у журналі)"
+        }
+    }
+
+    if ($null -ne $statusExitCode -and [int]$statusExitCode -ne 0) {
+        $nameText = if ([string]::IsNullOrWhiteSpace($statusName)) { '' } else { " ($statusName)" }
+        $atText = if ($null -ne $statusFinished) { " о $(& $format ([datetime]$statusFinished))" } else { '' }
+        return "останній статус Archive: код $([int]$statusExitCode)$nameText$atText"
+    }
+
+    return $null
+}
+
+function Get-BRAVOHealthBackupStaleDiagnosis {
+    # Best-effort обгортка: кожне читання (планувальник COM/ScheduledTasks,
+    # status-файл) у власному try/catch — збій пропускає відповідну перевірку
+    # з WARNING. Діагностика не змінює результат Health і не кидає виняток.
+    param(
+        [AllowNull()][object]$LatestIncomplete,
+        [AllowNull()][object]$LatestCompleteUtc,
+        [datetime]$NowUtc,
+        [timespan]$MaxAge
+    )
+
+    $taskName = 'BRAVO_ARCHIV'
+    $taskInfo = $null
+    try {
+        $taskName = [string]$schedulerSettings.Backup.TaskName
+        $taskState = Get-BRAVOScheduledTaskState -TaskPath ([string]$schedulerSettings.TaskPath) -TaskName $taskName
+        $taskInfo = [pscustomobject]@{
+            Exists = [bool]$taskState.Exists
+            Enabled = ([string]$taskState.State -ne 'Disabled')
+            LastRunTime = $null
+            LastTaskResult = $null
+        }
+        if ($taskInfo.Exists) {
+            try {
+                $runInfo = if ([string]$taskState.Provider -eq 'ScheduledTasks') {
+                    Get-ScheduledTaskInfo -InputObject $taskState.Task -ErrorAction Stop
+                } else {
+                    $taskState.Task
+                }
+                $taskInfo.LastRunTime = [datetime]$runInfo.LastRunTime
+                $taskInfo.LastTaskResult = [int64]$runInfo.LastTaskResult
+            } catch {
+                Write-HealthLog "Діагностика generation: результат останнього запуску не прочитано: $($_.Exception.Message)" -Level 'WARNING'
+            }
+        }
+    } catch {
+        $taskInfo = $null
+        Write-HealthLog "Діагностика generation: стан завдання не прочитано: $($_.Exception.Message)" -Level 'WARNING'
+    }
+
+    $archiveStatus = $null
+    try {
+        $statusResult = Get-BRAVOOperationStatus -Path (Get-BRAVOOperationStatusPath -StateRoot $stateRoot -Operation Archive)
+        if ($statusResult.Exists -and -not $statusResult.Corrupt) {
+            $statusState = $statusResult.State
+            $archiveStatus = [pscustomobject]@{
+                ExitCode = [int]$statusState.exitCode
+                ExitCodeName = [string]$statusState.exitCodeName
+                FinishedAt = [datetime]$statusState.finishedAt
+            }
+        }
+    } catch {
+        $archiveStatus = $null
+        Write-HealthLog "Діагностика generation: status-файл Archive не прочитано: $($_.Exception.Message)" -Level 'WARNING'
+    }
+
+    try {
+        return Get-BRAVOHealthBackupStaleReason `
+            -TaskInfo $taskInfo `
+            -ArchiveStatus $archiveStatus `
+            -LatestIncomplete $LatestIncomplete `
+            -LatestCompleteUtc $LatestCompleteUtc `
+            -NowUtc $NowUtc `
+            -MaxAge $MaxAge `
+            -TaskName $taskName
+    } catch {
+        Write-HealthLog "Діагностика generation не сформована: $($_.Exception.Message)" -Level 'WARNING'
+        return $null
+    }
+}
+
+function Get-BRAVOHealthManifestFailedStage {
+    param([object]$Manifest)
+
+    $componentsProperty = $Manifest.PSObject.Properties['components']
+    if ($null -eq $componentsProperty -or $null -eq $componentsProperty.Value) {
+        return ''
+    }
+    foreach ($component in @($componentsProperty.Value.PSObject.Properties)) {
+        $stageNames = @{ CreateSuccess = 'archive'; IntegritySuccess = 'integrity'; HashSuccess = 'SHA512' }
+        foreach ($stageKey in @('CreateSuccess', 'IntegritySuccess', 'HashSuccess')) {
+            $stageProperty = $component.Value.PSObject.Properties[$stageKey]
+            if ($null -ne $stageProperty -and -not [bool]$stageProperty.Value) {
+                return "$($component.Name)/$($stageNames[$stageKey])"
+            }
+        }
+    }
+    return ''
+}
+
 function Get-BackupHealthIssues {
     $issues = @()
     $enabledArchiveDefinitions = @($archiveDefinitions | Where-Object { $_.Enabled })
@@ -1197,6 +1373,7 @@ function Get-BackupHealthIssues {
     }
 
     $manifestCandidates = @()
+    $incompleteCandidates = @()
     # dev.14: MANIFESTS-first reader з fallback на legacy корінь BackupRoot.
     # Health лишається read-only — жодної міграції/запису тут не відбувається;
     # відсутність MANIFESTS на ще не мігрованій інсталяції не є помилкою, поки
@@ -1204,9 +1381,6 @@ function Get-BackupHealthIssues {
     foreach ($manifestFile in @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $backupRootPath)) {
         try {
             $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
-            if ([string]$manifest.status -ne 'COMPLETE') {
-                continue
-            }
             $createdAtUtc = $manifestFile.LastWriteTimeUtc
             foreach ($dateProperty in @('createdAt', 'startedAt')) {
                 $property = $manifest.PSObject.Properties[$dateProperty]
@@ -1214,6 +1388,11 @@ function Get-BackupHealthIssues {
                     $createdAtUtc = ConvertTo-BRAVOUtcDateTime -Timestamp ([datetime]$property.Value)
                     break
                 }
+            }
+            if ([string]$manifest.status -ne 'COMPLETE') {
+                # #322: не-COMPLETE спроба не є generation, але потрібна для діагностики.
+                $incompleteCandidates += [pscustomobject]@{ Manifest = $manifest; CreatedAtUtc = $createdAtUtc }
+                continue
             }
             $manifestCandidates += [pscustomobject]@{
                 File = $manifestFile
@@ -1226,6 +1405,17 @@ function Get-BackupHealthIssues {
     }
 
     $generation = $manifestCandidates | Sort-Object CreatedAtUtc -Descending | Select-Object -First 1
+    $latestIncomplete = $null
+    $incompleteCandidate = $incompleteCandidates | Sort-Object CreatedAtUtc -Descending | Select-Object -First 1
+    if ($null -ne $incompleteCandidate) {
+        $incompleteManifest = $incompleteCandidate.Manifest
+        $latestIncomplete = [pscustomobject]@{
+            GenerationId = [string]$incompleteManifest.generationId
+            Status = [string]$incompleteManifest.status
+            CreatedAtUtc = $incompleteCandidate.CreatedAtUtc
+            Stage = Get-BRAVOHealthManifestFailedStage -Manifest $incompleteManifest
+        }
+    }
     if ($null -eq $generation) {
         return @([pscustomobject]@{
             Kind = 'LocalBackupGeneration'
@@ -1234,6 +1424,7 @@ function Get-BackupHealthIssues {
             FileName = 'немає даних'
             LastWriteTime = $null
             SizeBytes = $null
+            Diagnosis = Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $latestIncomplete -LatestCompleteUtc $null -NowUtc $healthCheckStartedUtc -MaxAge $maximumAge
         })
     }
 
@@ -1331,6 +1522,7 @@ function Get-BackupHealthIssues {
             FileName = $generation.File.Name
             LastWriteTime = $generation.CreatedAtUtc
             SizeBytes = $generation.File.Length
+            Diagnosis = Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $latestIncomplete -LatestCompleteUtc $generation.CreatedAtUtc -NowUtc $healthCheckStartedUtc -MaxAge $maximumAge
         }
     } elseif ($issues.Count -eq 0) {
         Write-HealthLog "Остання COMPLETE generation $manifestGenerationId справна; one generation = one point-in-time" -Level 'SUCCESS'
@@ -3907,7 +4099,42 @@ function Format-CompactLocalIssue {
     }
 
     $fileText = Format-HealthIssueFileName -Issue $Issue
-    return ":x: $componentName — $($Issue.Reason)$fileText"
+    $issueText = ":x: $componentName — $($Issue.Reason)$fileText"
+    if ($Issue.Kind -eq "LocalBackupGeneration") {
+        $diagnosisProperty = $Issue.PSObject.Properties['Diagnosis']
+        if ($null -ne $diagnosisProperty -and -not [string]::IsNullOrWhiteSpace([string]$diagnosisProperty.Value)) {
+            $issueText += "`n:mag: Причина: $(ConvertTo-NotificationLiteralText -Text ([string]$diagnosisProperty.Value))"
+        }
+    }
+    return $issueText
+}
+
+function Get-BRAVOHealthCollapsedCloudIssues {
+    # Хмарні рядки, що лише повторюють ту саму застарілу локальну generation:
+    # age-only «віддалена копія старша за N год.» для файлу, який і є
+    # застарілим локальним архівом. Розмір/відсутність/з'єднання не згортаються.
+    param([array]$Issues, [hashtable]$LatestArchives)
+
+    $hasStaleGeneration = @($Issues | Where-Object {
+        $_.Kind -eq "LocalBackupGeneration" -and $_.Component -eq "Generation" -and
+        $_.Reason -match '^остання COMPLETE generation старша за '
+    }).Count -gt 0
+    if (-not $hasStaleGeneration -or $null -eq $LatestArchives) {
+        return @()
+    }
+    $collapsed = @()
+    foreach ($issue in $Issues) {
+        if ($issue.Kind -notin @("SFTPArchive", "SMBArchive") -or
+            $issue.Reason -notmatch '^віддалена копія старша за [\d.,]+ год\.$') {
+            continue
+        }
+        $archive = $LatestArchives[(Get-HealthIssueComponentName -Issue $issue)]
+        if ($null -ne $archive -and $null -ne $archive.PSObject.Properties['Name'] -and
+            [string]$issue.FileName -ceq [string]$archive.Name) {
+            $collapsed += $issue
+        }
+    }
+    return @($collapsed)
 }
 
 function Format-CompactSFTPIssue {
@@ -4138,25 +4365,29 @@ function New-SlackAlertMessage {
     } else {
         [string]$global:ScriptBuildId
     }
+    $collapsedCloudIssues = @(Get-BRAVOHealthCollapsedCloudIssues -Issues $Issues -LatestArchives $script:healthLatestArchives)
     $problemComponentNames = @()
-    foreach ($issue in $Issues) {
+    foreach ($issue in @($Issues | Where-Object { $collapsedCloudIssues -notcontains $_ })) {
         $componentName = Get-HealthIssueComponentName -Issue $issue
         if ($problemComponentNames -notcontains $componentName) {
             $problemComponentNames += $componentName
         }
     }
     $localIssues = @($Issues | Where-Object {
-        $_.Kind -in @("LocalBackup", "LocalSynchronization")
+        $_.Kind -in @("LocalBackup", "LocalBackupGeneration", "LocalSynchronization")
     })
     $serviceIssues = @($Issues | Where-Object { $_.Kind -eq "Service" })
     $sftpIssues = @($Issues | Where-Object {
-        $_.Kind -in @("SFTPArchive", "SFTPSynchronization", "SFTPConnection")
+        $_.Kind -in @("SFTPArchive", "SFTPSynchronization", "SFTPConnection") -and
+        $collapsedCloudIssues -notcontains $_
     })
     $smbIssues = @($Issues | Where-Object {
-        $_.Kind -in @("SMBArchive", "SMBConnection")
+        $_.Kind -in @("SMBArchive", "SMBConnection") -and
+        $collapsedCloudIssues -notcontains $_
     })
     $knownKinds = @(
         "LocalBackup",
+        "LocalBackupGeneration",
         "LocalSynchronization",
         "Service",
         "SFTPArchive",
@@ -4216,9 +4447,13 @@ function New-SlackAlertMessage {
         }
     }
 
-    if ($sftpIssues.Count -gt 0) {
+    if ($sftpIssues.Count -gt 0 -or $collapsedCloudIssues.Count -gt 0) {
         $resultLines.Add("")
         $resultLines.Add(":cloud: БЕКАПИ У ХМАРІ")
+        if ($collapsedCloudIssues.Count -gt 0) {
+            $collapsedCloudNames = @($collapsedCloudIssues | ForEach-Object { Get-HealthIssueComponentName -Issue $_ } | Select-Object -Unique)
+            $resultLines.Add(":cloud: Хмара ($($collapsedCloudNames -join ' · ')): та сама застаріла generation")
+        }
         foreach ($issue in $sftpIssues) {
             $resultLines.Add((Format-CompactSFTPIssue -Issue $issue))
         }
