@@ -24,8 +24,38 @@
 Set-StrictMode -Version 2.0
 
 function ConvertTo-BRAVODeployRelativeKey {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    return (($Path -replace '\\', '/').TrimStart('/'))
+    # Ключ манифесту = ДАНІ (staged/backup), а на його основі виконується
+    # видалення й копіювання. Тому небезпечні форми відхиляються ГУЧНО (виняток,
+    # а не мовчазний пропуск): кореневі (\x, /x), диск (C:\x), UNC (\\srv\share\x),
+    # сегменти '..' і '.', порожній ключ.
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw 'Небезпечний шлях у manifest: порожній ключ' }
+    if ($Path -match '^[\\/]' -or $Path -match '^[A-Za-z]:' -or $Path.Contains(':')) {
+        throw ('Небезпечний шлях у manifest (кореневий, диск або UNC): ' + $Path)
+    }
+    $key = ($Path -replace '\\', '/')
+    foreach ($segment in @($key -split '/')) {
+        if ($segment -eq '..' -or $segment -eq '.' -or $segment.Length -eq 0) {
+            throw ('Небезпечний шлях у manifest (сегмент ''' + $segment + '''): ' + $Path)
+        }
+    }
+    return $key
+}
+
+function Resolve-BRAVODeployTargetPath {
+    # Друга лінія захисту: повний шлях мусить лишатися під коренем
+    # (Windows-семантика: без урахування регістру).
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $rootFull = [System.IO.Path]::GetFullPath($Root.TrimEnd('\', '/'))
+    $full = [System.IO.Path]::GetFullPath($rootFull + $sep + ($Key -replace '/', $sep))
+    if (-not $full.StartsWith($rootFull + $sep, [StringComparison]::OrdinalIgnoreCase)) {
+        throw ('Шлях виходить за межі ' + $rootFull + ': ' + $Key)
+    }
+    return $full
 }
 
 function Test-BRAVODeployPathExcluded {
@@ -50,6 +80,8 @@ function Test-BRAVODeployPathExcluded {
 }
 
 function Get-BRAVODeployTreeKeys {
+    # Обхід пропускає виключені каталоги ЦІЛКОМ (не заходить у LOGS/MODEL/BAZA...):
+    # величезне або недоступне дерево даних не має ні гальмувати, ні валити відкат.
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [string[]]$ExcludeFiles = @(),
@@ -58,10 +90,23 @@ function Get-BRAVODeployTreeKeys {
     $keys = New-Object System.Collections.Generic.List[string]
     if (-not [System.IO.Directory]::Exists($Root)) { return @() }
     $prefix = $Root.TrimEnd('\', '/').Length + 1
-    foreach ($full in [System.IO.Directory]::GetFiles($Root, '*', [System.IO.SearchOption]::AllDirectories)) {
-        $key = ConvertTo-BRAVODeployRelativeKey -Path $full.Substring($prefix)
-        if (Test-BRAVODeployPathExcluded -RelativeKey $key -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs) { continue }
-        [void]$keys.Add($key)
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($Root.TrimEnd('\', '/'))
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        foreach ($sub in [System.IO.Directory]::GetDirectories($dir)) {
+            $name = [System.IO.Path]::GetFileName($sub)
+            $skip = $false
+            foreach ($ex in @($ExcludeDirs)) {
+                if ([string]::Equals($name, $ex, [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break }
+            }
+            if (-not $skip) { $stack.Push($sub) }
+        }
+        foreach ($full in [System.IO.Directory]::GetFiles($dir)) {
+            $key = ($full.Substring($prefix) -replace '\\', '/')
+            if (Test-BRAVODeployPathExcluded -RelativeKey $key -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs) { continue }
+            [void]$keys.Add($key)
+        }
     }
     return @($keys.ToArray())
 }
@@ -141,10 +186,9 @@ function Invoke-BRAVODeployExactRestore {
         -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs)
 
     foreach ($key in $owned) {
-        $native = $key -replace '/', [System.IO.Path]::DirectorySeparatorChar
-        $runtimeFile = $runtimeBase + [System.IO.Path]::DirectorySeparatorChar + $native
-        $backupFile = $backupBase + [System.IO.Path]::DirectorySeparatorChar + $native
         try {
+            $runtimeFile = Resolve-BRAVODeployTargetPath -Root $runtimeBase -Key $key
+            $backupFile = Resolve-BRAVODeployTargetPath -Root $backupBase -Key $key
             if ([System.IO.File]::Exists($backupFile)) {
                 $needCopy = $true
                 if ([System.IO.File]::Exists($runtimeFile)) {
@@ -187,19 +231,20 @@ function Test-BRAVODeployRuntimeMatchesManifest {
     # коду виходу guard.
     param(
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-        [Parameter(Mandatory = $true)][string]$ManifestPath
+        [Parameter(Mandatory = $true)][string]$ManifestPath,
+        [string[]]$ExcludeDirs = @()
     )
     $expected = Get-BRAVODeployManifestHashes -ManifestPath $ManifestPath
     $problems = New-Object System.Collections.Generic.List[string]
     $base = $RuntimeRoot.TrimEnd('\', '/')
     foreach ($key in @($expected.Keys)) {
-        $full = $base + [System.IO.Path]::DirectorySeparatorChar + ($key -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+        $full = Resolve-BRAVODeployTargetPath -Root $base -Key $key
         if (-not [System.IO.File]::Exists($full)) { [void]$problems.Add('відсутній: ' + $key); continue }
         if ((Get-BRAVODeployFileSha256 -Path $full) -ne $expected[$key]) { [void]$problems.Add('змінено: ' + $key) }
     }
     $lookup = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($key in @($expected.Keys)) { [void]$lookup.Add($key) }
-    foreach ($key in (Get-BRAVODeployTreeKeys -Root $RuntimeRoot)) {
+    foreach ($key in (Get-BRAVODeployTreeKeys -Root $RuntimeRoot -ExcludeDirs $ExcludeDirs)) {
         $ext = [System.IO.Path]::GetExtension($key).ToLowerInvariant()
         if (@('.ps1', '.psm1', '.psd1') -notcontains $ext) { continue }
         if ($key -match '^(LOGS|\.git|\.vscode|\.claude|local-backups)/') { continue }

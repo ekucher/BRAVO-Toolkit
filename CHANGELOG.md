@@ -22,6 +22,11 @@
   Той самий відкат (з тими самими критеріями успіху й контрактом exit `1`/`2`) тепер запускається і
   при винятку чи збої robocopy розгортання після backup (раніше catch завершував exit `1` з
   напіврозгорнутим комплектом): `Rollback/UpdaterRollsBackOnFailureAfterDeployStarted`.
+  Ключі manifest з `..`, кореневою, дисковою чи UNC формою відхиляються гучно (відкат не вдався, exit `2`), а
+  повний шлях цілі мусить лишатися під RuntimeRoot до будь-якого видалення/копіювання; верифікація відкату
+  не обходить виключені каталоги (LOGS/MODEL/BAZA...): `Rollback/UnsafeManifestKeysRejectedLoudlyAndNothingOutsideRootTouched`,
+  `Rollback/ResolvedTargetMustStayUnderRoot`, `Rollback/VerificationSkipsExcludedDirsButStillCatchesStrayScripts`,
+  `Rollback/TreeWalkDoesNotEnterExcludedDirs`.
 
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який

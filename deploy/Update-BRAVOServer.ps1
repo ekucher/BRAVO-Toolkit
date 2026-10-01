@@ -120,7 +120,7 @@ function Invoke-BRAVODeployUpdaterRollback {
         foreach ($e in @($restore.Errors)) { [void]$rollbackProblems.Add('відновлення: ' + $e) }
 
         $match = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $RuntimeRoot `
-            -ManifestPath (Join-Path $BackupRoot 'RUNTIME_MANIFEST.json')
+            -ManifestPath (Join-Path $BackupRoot 'RUNTIME_MANIFEST.json') -ExcludeDirs $excludeDirs
         foreach ($m in @($match.Problems)) { [void]$rollbackProblems.Add('runtime != старий manifest, ' + $m) }
 
         $restoredVersion = (Get-Content -LiteralPath (Join-Path $RuntimeRoot 'VERSION.json') -Raw -Encoding UTF8 | ConvertFrom-Json)

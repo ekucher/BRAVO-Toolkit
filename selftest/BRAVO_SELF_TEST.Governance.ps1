@@ -6129,6 +6129,65 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
         if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
+    # --- небезпечні ключі manifest: відкат падає ГУЧНО й нічого не чіпає поза коренем ---
+    $sb2 = Join-Path ([IO.Path]::GetTempPath()) ('bravo_rb289b_' + [guid]::NewGuid().ToString('N'))
+    try {
+        $rt2 = Join-Path (Join-Path $sb2 'a\b') 'runtime'; $st2 = Join-Path $sb2 'staged'; $bk2 = Join-Path $sb2 'backup'
+        Write-RbFile $rt2 'A.ps1' 'A'
+        Write-RbFile $bk2 'A.ps1' 'A'
+        Write-RbManifest -Root $bk2 -Rels @('A.ps1')
+        $canary = Join-Path $sb2 'X'
+        [IO.File]::WriteAllText($canary, 'canary')
+        $badKeys = @('..\..\X', '..\..\..\X', 'C:\x', '\\srv\share\x', '/etc/x', 'a\..\..\X')
+        $allRejected = $true; $reasons = @()
+        foreach ($bad in $badKeys) {
+            Write-RbFile $st2 'A.ps1' 'A'
+            $json = (@{ schemaVersion = 1; files = @{ 'A.ps1' = 'X'; $bad = 'X' } } | ConvertTo-Json -Depth 4)
+            [IO.File]::WriteAllText((Join-Path $st2 'RUNTIME_MANIFEST.json'), $json)
+            $threw = $false
+            try {
+                [void](Invoke-BRAVODeployExactRestore -RuntimeRoot $rt2 -BackupRoot $bk2 -StagedRoot $st2 `
+                    -ExcludeFiles $script:RbExF -ExcludeDirs $script:RbExD)
+            } catch { $threw = $true }
+            if (-not $threw) { $allRejected = $false; $reasons += $bad }
+        }
+        Test-BRAVOCondition `
+            -Condition ($allRejected -and (Read-RbFile $sb2 'X') -eq 'canary') `
+            -Name "Rollback/UnsafeManifestKeysRejectedLoudlyAndNothingOutsideRootTouched" `
+            -Failure ("ключі manifest з '..', диском, UNC чи коренем мусять давати виняток (відкат не вдався), а файли поза RuntimeRoot — лишатись; не відхилено: " + ($reasons -join ', '))
+        $resolverThrew = $false
+        try { [void](Resolve-BRAVODeployTargetPath -Root $rt2 -Key 'sub/../../../X') } catch { $resolverThrew = $true }
+        $resolverOk = ((Resolve-BRAVODeployTargetPath -Root $rt2 -Key 'sub/f.ps1').Length -gt $rt2.Length)
+        Test-BRAVOCondition `
+            -Condition ($resolverThrew -and $resolverOk) `
+            -Name "Rollback/ResolvedTargetMustStayUnderRoot" `
+            -Failure "Resolve-BRAVODeployTargetPath мусить відхиляти шлях, що виходить за корінь, і приймати вкладений"
+
+        # P3: виключені каталоги не обходяться при верифікації.
+        $rt3 = Join-Path $sb2 'rt3'
+        Write-RbFile $rt3 'A.ps1' 'A'
+        Write-RbManifest -Root $rt3 -Rels @('A.ps1')
+        Write-RbFile $rt3 'LOGS\deep\stray.ps1' 'x'
+        Write-RbFile $rt3 'MODEL\stray2.ps1' 'x'
+        $okExcl = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $rt3 -ManifestPath (Join-Path $rt3 'RUNTIME_MANIFEST.json') -ExcludeDirs $script:RbExD
+        $walked = @(Get-BRAVODeployTreeKeys -Root $rt3 -ExcludeDirs $script:RbExD)
+        Write-RbFile $rt3 'other\stray3.ps1' 'x'
+        $badOther = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $rt3 -ManifestPath (Join-Path $rt3 'RUNTIME_MANIFEST.json') -ExcludeDirs $script:RbExD
+        Test-BRAVOCondition `
+            -Condition ($okExcl.IsMatch -and -not ($walked -match '^(LOGS|MODEL)/') -and -not $badOther.IsMatch) `
+            -Name "Rollback/VerificationSkipsExcludedDirsButStillCatchesStrayScripts" `
+            -Failure "верифікація мусить не заходити у виключені каталоги (LOGS/MODEL...), але ловити сторонні скрипти в решті дерева"
+        # Поведінково «не зайшли» на Windows/root не довести (недоступний каталог
+        # не відтворюється без ACL), тому структурно: рекурсія пропускає виключені каталоги.
+        $rollbackSrc = [IO.File]::ReadAllText($rollbackPath, [Text.Encoding]::UTF8)
+        Test-BRAVOCondition `
+            -Condition ($rollbackSrc.Contains('if (-not $skip) { $stack.Push($sub) }') -and -not $rollbackSrc.Contains('SearchOption]::AllDirectories')) `
+            -Name "Rollback/TreeWalkDoesNotEnterExcludedDirs" `
+            -Failure "обхід дерева в BRAVO.Deploy.Rollback.ps1 мусить пропускати виключені каталоги цілком (не GetFiles AllDirectories): величезний/недоступний LOGS/MODEL/BAZA не має валити відкат"
+    } finally {
+        if (Test-Path -LiteralPath $sb2) { Remove-Item -LiteralPath $sb2 -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
     # --- структурні перевірки оркестратора ---
     $fnStart = $updaterText.IndexOf('function Invoke-BRAVODeployUpdaterRollback')
     $fnEnd = $updaterText.IndexOf('$script:DeployStarted = $false', [Math]::Max($fnStart, 0))
