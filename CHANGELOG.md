@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Fix: self-test `TraceArchive/GraceCompletionExpiry*` не залежить від швидкості runner-а (#338).**
+  Fixture виставляв `LastWriteTime` джерела за 2 с до grace-межі й перетинав межу реальним
+  `Start-Sleep`; на повільному runner-і джерело вже було за межею на кроці-передумові, видалялось,
+  `state.json` не створювався, а вторинний `Get-Content` обривав секцію TraceArchive. Тепер
+  fixture лежить за 1 годину ПІД межею, а межа перетинається зсувом керованого годинника
+  (тимчасова підміна `Get-Date` у модулі на час кроку: без параметрів — реальний час + зсув 0/+2 год,
+  з параметрами — штатний), без очікування. Читання `state.json` захищене `Test-Path`, тож збій
+  перевірки дає чисте `[FAIL]`, а не виняток секції. Production-код і маніфест не змінено.
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
