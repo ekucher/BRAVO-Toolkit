@@ -1100,6 +1100,9 @@ Maintenance, окреме Recovery-завдання не реєструєтьс�
 | `BRAVO_ARCHIV` | щодня `23:00` | архівація та передача копій |
 | `BRAVO_MAINTENANCE` | щодня `23:55` | обслуговування BRAVO |
 | `BRAVO_ARCHIV_HEALTH` | кожні 240 хв. від `00:30` | контроль служб і локальних/SFTP/SMB копій |
+| `BRAVO_RESTORE_VERIFY` | щотижня, субота `04:00` | restore drill (розділ 6.1) |
+| `BRAVO_RESTORE_RECOVERY` | при старті сервера | підхоплення пропущеної реставрації моделі; лише профіль робочого часу (`Restore.BootRestoreMode = "HoldServices"`) |
+| `BRAVO BAZA Synchronization` | кожні 4 год. від `00:00` | синхронізація `BAZA_APP`/`BAZA_WWW` із SFTP; лише коли ввімкнено BAZA SFTP |
 
 Архівація, maintenance і health-check використовують спільний
 `C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock`. Якщо інша операція вже працює, наступна не накладається
