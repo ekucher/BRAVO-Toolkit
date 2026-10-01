@@ -21839,7 +21839,7 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
     # не чіпаються).
     $bootRestoreStartTypeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $systemSourceTextForScheduler `
-        -FunctionNames @('Set-BRAVOBootRestoreServiceStartType')
+        -FunctionNames @('Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
     $bootRestoreStartTypeProbe = & $bootRestoreStartTypeModule {
         $script:BRAVOSelfTestStartTypeStates = @{
             SVC_AUTO_PLAIN   = @{ StartType = 'Automatic'; Delayed = $false }
