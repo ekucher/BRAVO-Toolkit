@@ -283,6 +283,10 @@ Test-BRAVOCondition (
 # ============================================================
 
 $runtimeLogSyncStub = @'
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    [void]$script:runtimeLogSyncState.Warnings.Add("${Level}: $Message")
+}
 function New-BRAVOBazaRemoteDirectoryRecursive {
     param($Session, [string]$RemoteDirectoryPath)
     [void]$script:runtimeLogSyncState.EnsuredDirectories.Add($RemoteDirectoryPath)
@@ -292,6 +296,7 @@ function Send-BRAVOTraceArchiveFile {
     [void]$script:runtimeLogSyncState.SentRemotePaths.Add($RemoteFinalPath)
     [void]$script:runtimeLogSyncState.SentLocalPaths.Add($LocalPath)
     [void]$script:runtimeLogSyncState.SentContents.Add([IO.File]::ReadAllText($LocalPath))
+    [void]$script:runtimeLogSyncState.SentHeads.Add((([IO.File]::ReadAllBytes($LocalPath) | Select-Object -First 3 | ForEach-Object { $_.ToString('X2') }) -join ''))
     if ($RemoteFinalPath -like '*fail*') {
         return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = 'simulated transfer failure' }
     }
@@ -300,8 +305,8 @@ function Send-BRAVOTraceArchiveFile {
 }
 '@
 $runtimeLogSyncModule = New-BRAVOSelfTestRuntimeModule `
-    -SourceText ($runtimeLogSyncStub + "`n" + $maintenanceOwnLogScriptText) `
-    -FunctionNames @('New-BRAVOBazaRemoteDirectoryRecursive', 'Send-BRAVOTraceArchiveFile', 'Sync-BRAVORuntimeLogsToSftp')
+    -SourceText ($runtimeLogSyncStub + "`n" + $maintenanceOwnLogScriptText + "`n" + [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Logging\BRAVO.Logging.psm1'), [Text.Encoding]::UTF8)) `
+    -FunctionNames @('Write-Log', 'Protect-BRAVOLogSecret', 'New-BRAVOMaskedLogSnapshot', 'New-BRAVOBazaRemoteDirectoryRecursive', 'Send-BRAVOTraceArchiveFile', 'Sync-BRAVORuntimeLogsToSftp')
 
 $runtimeLogSyncRoot = Join-Path $maintenanceOwnLogTestRoot 'LOGS'
 [void](New-Item -ItemType Directory -Path (Join-Path $runtimeLogSyncRoot 'HELPERS') -Force)
@@ -320,6 +325,8 @@ $runtimeLogSyncResult = & $runtimeLogSyncModule {
         SentRemotePaths    = (New-Object System.Collections.Generic.List[string])
         SentLocalPaths     = (New-Object System.Collections.Generic.List[string])
         SentContents       = (New-Object System.Collections.Generic.List[string])
+        SentHeads          = (New-Object System.Collections.Generic.List[string])
+        Warnings           = (New-Object System.Collections.Generic.List[string])
     }
     $fakeSession = New-Object PSObject
     $fakeSession | Add-Member -MemberType ScriptMethod -Name FileExists -Value {
@@ -368,5 +375,117 @@ Test-BRAVOCondition (
     $runtimeLogSyncMissingRoot.Uploaded -eq 0 -and $runtimeLogSyncMissingRoot.Failed -eq 0
 ) -Name 'Maintenance/RuntimeLogSyncMissingLocalRootIsNoOp' `
     -Failure "відсутній локальний каталог журналів — тихий no-op; факт: uploaded=$($runtimeLogSyncMissingRoot.Uploaded) failed=$($runtimeLogSyncMissingRoot.Failed)"
+
+# ---- Безпека вивантаження (приймальний список власника PR #332) ----
+function New-BRAVORuntimeLogSyncTestState {
+    param([hashtable]$Remote = @{})
+    [pscustomobject]@{
+        Remote             = $Remote
+        EnsuredDirectories = (New-Object System.Collections.Generic.List[string])
+        SentRemotePaths    = (New-Object System.Collections.Generic.List[string])
+        SentLocalPaths     = (New-Object System.Collections.Generic.List[string])
+        SentContents       = (New-Object System.Collections.Generic.List[string])
+        SentHeads          = (New-Object System.Collections.Generic.List[string])
+        Warnings           = (New-Object System.Collections.Generic.List[string])
+    }
+}
+$runtimeLogSyncRun = {
+    param($localRoot, $remoteDirectory, $state)
+    $script:runtimeLogSyncState = $state
+    $fakeSession = New-Object PSObject
+    $fakeSession | Add-Member -MemberType ScriptMethod -Name FileExists -Value {
+        param($path) return $script:runtimeLogSyncState.Remote.ContainsKey($path)
+    }
+    $fakeSession | Add-Member -MemberType ScriptMethod -Name GetFileInfo -Value {
+        param($path) return [pscustomobject]@{ Length = $script:runtimeLogSyncState.Remote[$path] }
+    }
+    Sync-BRAVORuntimeLogsToSftp -Session $fakeSession -LocalLogRoot $localRoot -RemoteDirectory $remoteDirectory
+}
+
+# 1) Секрет у сирому транскрипті HELPERS маскується у знімку; BOM/CRLF
+# зберігаються; нетекстовий файл пропускається з WARNING; розмір на SFTP
+# порівнюється із ЗАМАСКОВАНИМ знімком (другий прогін — «без змін»).
+$runtimeLogSecRoot = Join-Path $maintenanceOwnLogTestRoot 'SECLOGS'
+[void](New-Item -ItemType Directory -Path (Join-Path $runtimeLogSecRoot 'HELPERS') -Force)
+$runtimeLogSecTranscript = "Transcript start`r`npassword=hunter2secret`r`nconnect sftp://svc:p4ssw0rdX@10.0.0.5/data`r`nTranscript end`r`n"
+[IO.File]::WriteAllText((Join-Path $runtimeLogSecRoot 'HELPERS\transcript_1.log'), $runtimeLogSecTranscript, (New-Object Text.UTF8Encoding($true)))
+[IO.File]::WriteAllBytes((Join-Path $runtimeLogSecRoot 'HELPERS\binary_1.log'), [byte[]](0x41, 0x00, 0x42, 0x00, 0x01, 0x02))
+$runtimeLogSecState = New-BRAVORuntimeLogSyncTestState
+$runtimeLogSecFirst = & $runtimeLogSyncModule $runtimeLogSyncRun $runtimeLogSecRoot 'logs/runtime' $runtimeLogSecState
+$runtimeLogSecSentText = (@($runtimeLogSecState.SentContents) -join "`n")
+$runtimeLogSecBinaryWarnings = @($runtimeLogSecState.Warnings | Where-Object { $_ -like 'WARNING:*binary_1.log*' }).Count
+$runtimeLogSecSecond = & $runtimeLogSyncModule $runtimeLogSyncRun $runtimeLogSecRoot 'logs/runtime' $runtimeLogSecState
+Test-BRAVOCondition (
+    $runtimeLogSecFirst.Uploaded -eq 1 -and $runtimeLogSecFirst.Skipped -eq 1 -and
+    $runtimeLogSecSentText -notmatch 'hunter2secret' -and $runtimeLogSecSentText -notmatch 'p4ssw0rdX' -and
+    $runtimeLogSecSentText -match 'password=\*\*\*' -and $runtimeLogSecSentText -match 'svc:\*\*\*@10\.0\.0\.5' -and
+    $runtimeLogSecSentText -match "Transcript end`r`n" -and
+    @($runtimeLogSecState.SentHeads)[0] -eq 'EFBBBF' -and
+    @($runtimeLogSecState.SentRemotePaths) -notcontains '/logs/runtime/HELPERS/binary_1.log' -and
+    $runtimeLogSecBinaryWarnings -eq 1 -and
+    $runtimeLogSecSecond.Uploaded -eq 0 -and $runtimeLogSecSecond.Unchanged -eq 1
+) -Name 'Maintenance/RuntimeLogSyncMasksSecretsInHelperTranscripts' `
+    -Failure "секрети в сирому транскрипті мають маскуватись у знімку (BOM/CRLF збережено), нетекстовий файл — пропуск із WARNING, повторний прогін — без змін за розміром замаскованого знімка; факт: uploaded=$($runtimeLogSecFirst.Uploaded) skipped=$($runtimeLogSecFirst.Skipped) second=$($runtimeLogSecSecond.Uploaded)/$($runtimeLogSecSecond.Unchanged) head=$(@($runtimeLogSecState.SentHeads) -join ',') sent='$runtimeLogSecSentText' warnings=$(@($runtimeLogSecState.Warnings) -join ' | ')"
+
+# 2) Reparse point (junction/symlink: каталог і файл) не відкривається;
+# вміст поза LOGS не вивантажується. Фікстура потребує створення посилань
+# (Linux: symlink; Windows: symlink або junction) — якщо це неможливо,
+# тест явно позначається як пропущений.
+$runtimeLogLinkRoot = Join-Path $maintenanceOwnLogTestRoot 'LINKLOGS'
+$runtimeLogLinkOutside = Join-Path $maintenanceOwnLogTestRoot 'OUTSIDE'
+[void](New-Item -ItemType Directory -Path $runtimeLogLinkRoot -Force)
+[void](New-Item -ItemType Directory -Path $runtimeLogLinkOutside -Force)
+[IO.File]::WriteAllText((Join-Path $runtimeLogLinkRoot 'real_1.log'), 'real-log')
+[IO.File]::WriteAllText((Join-Path $runtimeLogLinkOutside 'outside_secret_1.log'), 'OUTSIDE-SECRET-CONTENT')
+$runtimeLogLinkDir = Join-Path $runtimeLogLinkRoot 'LINKDIR'
+$runtimeLogLinkFile = Join-Path $runtimeLogLinkRoot 'linkfile_1.log'
+$runtimeLogLinkFixtureNote = ''
+$runtimeLogLinkDirCreated = $false
+$runtimeLogLinkFileCreated = $false
+try { [void](New-Item -ItemType SymbolicLink -Path $runtimeLogLinkDir -Target $runtimeLogLinkOutside -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+if (-not (Test-Path -LiteralPath $runtimeLogLinkDir)) {
+    try { [void](New-Item -ItemType Junction -Path $runtimeLogLinkDir -Target $runtimeLogLinkOutside -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+}
+$runtimeLogLinkDirCreated = (Test-Path -LiteralPath $runtimeLogLinkDir)
+try { [void](New-Item -ItemType SymbolicLink -Path $runtimeLogLinkFile -Target (Join-Path $runtimeLogLinkOutside 'outside_secret_1.log') -ErrorAction Stop) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+$runtimeLogLinkFileCreated = (Test-Path -LiteralPath $runtimeLogLinkFile)
+if (-not $runtimeLogLinkDirCreated) {
+    Test-BRAVOCondition $true -Name 'Maintenance/RuntimeLogSyncSkipsReparsePoints' `
+        -Failure "SKIPPED: не вдалося створити symlink/junction у цьому середовищі: $runtimeLogLinkFixtureNote"
+} else {
+    $runtimeLogLinkState = New-BRAVORuntimeLogSyncTestState
+    $runtimeLogLinkSummary = & $runtimeLogSyncModule $runtimeLogSyncRun $runtimeLogLinkRoot 'logs/runtime' $runtimeLogLinkState
+    $runtimeLogLinkExpectedSkipped = 1 + [int]$runtimeLogLinkFileCreated
+    Test-BRAVOCondition (
+        $runtimeLogLinkSummary.Uploaded -eq 1 -and $runtimeLogLinkSummary.Skipped -eq $runtimeLogLinkExpectedSkipped -and
+        @($runtimeLogLinkState.SentRemotePaths).Count -eq 1 -and
+        @($runtimeLogLinkState.SentRemotePaths)[0] -eq '/logs/runtime/real_1.log' -and
+        (@($runtimeLogLinkState.SentContents) -join '|') -notmatch 'OUTSIDE-SECRET' -and
+        @($runtimeLogLinkState.Warnings | Where-Object { $_ -like 'WARNING:*reparse point*' }).Count -eq $runtimeLogLinkExpectedSkipped
+    ) -Name 'Maintenance/RuntimeLogSyncSkipsReparsePoints' `
+        -Failure "посилання (каталог$(if ($runtimeLogLinkFileCreated) { ' і файл' })) не відкриваються й не обходяться, вміст поза LOGS не вивантажується, кожен пропуск — WARNING; факт: uploaded=$($runtimeLogLinkSummary.Uploaded) skipped=$($runtimeLogLinkSummary.Skipped) sent=$(@($runtimeLogLinkState.SentRemotePaths) -join ',') warnings=$(@($runtimeLogLinkState.Warnings).Count)"
+    # Посилання видаляються ДО рекурсивного прибирання — інакше Remove-Item
+    # на PS 5.1 міг би зайти у junction.
+    if ($runtimeLogLinkFileCreated) { try { [IO.File]::Delete($runtimeLogLinkFile) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message } }
+    try { [IO.Directory]::Delete($runtimeLogLinkDir) } catch { $runtimeLogLinkFixtureNote = $_.Exception.Message }
+}
+
+# 3) Небезпечний remote-корінь відхиляється без вивантаження: WARNING, жодного Send.
+$runtimeLogBadRemoteOk = $true
+$runtimeLogBadRemoteFacts = @()
+foreach ($runtimeLogBadRemote in @('', '   ', '.', '/', '\', '..', '../x', 'a/../../b', '..\x', 'logs/./x', 'logs//x')) {
+    $runtimeLogBadState = New-BRAVORuntimeLogSyncTestState
+    $runtimeLogBadSummary = & $runtimeLogSyncModule $runtimeLogSyncRun $runtimeLogSecRoot $runtimeLogBadRemote $runtimeLogBadState
+    $runtimeLogBadWarnings = @($runtimeLogBadState.Warnings | Where-Object { $_ -like 'WARNING:*RuntimeLogs*' }).Count
+    if (-not ($runtimeLogBadSummary.Rejected -and $runtimeLogBadSummary.Uploaded -eq 0 -and
+            @($runtimeLogBadState.SentRemotePaths).Count -eq 0 -and @($runtimeLogBadState.EnsuredDirectories).Count -eq 0 -and
+            $runtimeLogBadWarnings -eq 1)) {
+        $runtimeLogBadRemoteOk = $false
+        $runtimeLogBadRemoteFacts += "'$runtimeLogBadRemote'=>rejected:$($runtimeLogBadSummary.Rejected) sent:$(@($runtimeLogBadState.SentRemotePaths).Count) warn:$runtimeLogBadWarnings"
+    }
+}
+Test-BRAVOCondition $runtimeLogBadRemoteOk -Name 'Maintenance/RuntimeLogSyncRejectsUnsafeRemoteRoot' `
+    -Failure "порожній/'.'/'/'/'..'-сегмент remote-кореня мають відхилятись із одним WARNING і без вивантаження; факт: $($runtimeLogBadRemoteFacts -join '; ')"
+
 
 Remove-Item -LiteralPath $maintenanceOwnLogTestRoot -Recurse -Force -ErrorAction SilentlyContinue

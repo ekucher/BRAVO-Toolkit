@@ -4532,6 +4532,64 @@ function Test-BRAVOOwnLogSftpCredentialAvailable {
     }
 }
 
+function New-BRAVOMaskedLogSnapshot {
+    # Знімає ЗАМАСКОВАНУ копію текстового журналу (Protect-BRAVOLogSecret):
+    # журнали з Write-Log уже замасковані, але сирий Start-Transcript
+    # (LOGS\HELPERS) — ні, а на SFTP нічого незамаскованого йти не має.
+    # Кодування зберігається (UTF-8 з/без BOM, UTF-16 LE/BE з BOM). Файл,
+    # який не вдається прочитати як текст (нульові байти без BOM, невалідний
+    # UTF-8, помилка читання), НЕ вантажиться: Success = $false.
+    # Читання з FileShare.ReadWrite — живий журнал може бути відкритий
+    # на запис іншим процесом.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$SnapshotPath
+    )
+
+    try {
+        $stream = New-Object System.IO.FileStream($SourcePath, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            $buffer = New-Object System.IO.MemoryStream
+            $stream.CopyTo($buffer)
+            $bytes = $buffer.ToArray()
+        } finally {
+            $stream.Dispose()
+        }
+
+        $preamble = @()
+        $encoding = $null
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            $preamble = @($bytes[0], $bytes[1], $bytes[2])
+            $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+        } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+            $preamble = @($bytes[0], $bytes[1])
+            $encoding = New-Object System.Text.UnicodeEncoding($false, $false, $true)
+        } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+            $preamble = @($bytes[0], $bytes[1])
+            $encoding = New-Object System.Text.UnicodeEncoding($true, $false, $true)
+        } else {
+            if ([Array]::IndexOf($bytes, [byte]0) -ge 0) {
+                return [pscustomobject]@{ Success = $false; Error = 'файл не є текстовим (містить нульові байти без BOM)' }
+            }
+            $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+        }
+
+        $text = $encoding.GetString($bytes, $preamble.Count, $bytes.Length - $preamble.Count)
+        $masked = Protect-BRAVOLogSecret -Text $text
+        if ($null -eq $masked) { $masked = '' }
+        $maskedBytes = $encoding.GetBytes($masked)
+        $outputBytes = New-Object byte[] ($preamble.Count + $maskedBytes.Length)
+        for ($i = 0; $i -lt $preamble.Count; $i++) { $outputBytes[$i] = [byte]$preamble[$i] }
+        [Array]::Copy($maskedBytes, 0, $outputBytes, $preamble.Count, $maskedBytes.Length)
+        [System.IO.File]::WriteAllBytes($SnapshotPath, $outputBytes)
+        return [pscustomobject]@{ Success = $true; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
+    }
+}
+
 function Sync-BRAVORuntimeLogsToSftp {
     # Вивантажує ВЕСЬ каталог журналів toolkit (<RuntimeRoot>\LOGS разом
     # із підкаталогами, зокрема HELPERS) у RemoteDirectory зі збереженням
@@ -4545,6 +4603,14 @@ function Sync-BRAVORuntimeLogsToSftp {
     # Помилка окремого файла не зупиняє решту; підсумок повертається
     # викликачу. Duck-typed $Session — той самий контракт, що
     # Send-BRAVOTraceArchiveFile.
+    # Безпека: (1) знімок маскується через Protect-BRAVOLogSecret, тож
+    # порівняння розміру з SFTP іде з розміром ЗАМАСКОВАНОГО знімка;
+    # файл, що не читається як текст, пропускається з WARNING;
+    # (2) reparse point (junction/symlink: каталог чи файл) ніколи не
+    # відкривається і не обходиться; кожен файл мусить лежати всередині
+    # кореня журналів; (3) RemoteDirectory з сегментом `..`/`.`, порожній
+    # або такий, що дорівнює кореню SFTP, відхиляється з WARNING без
+    # жодного вивантаження. Усе це fail-soft: лише WARNING, без винятків.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Session,
@@ -4552,27 +4618,80 @@ function Sync-BRAVORuntimeLogsToSftp {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RemoteDirectory
     )
 
-    $result = [pscustomobject]@{ Uploaded = 0; Unchanged = 0; Failed = 0; FirstError = $null }
+    $result = [pscustomobject]@{ Uploaded = 0; Unchanged = 0; Failed = 0; Skipped = 0; Rejected = $false; FirstError = $null }
     if ([string]::IsNullOrWhiteSpace($LocalLogRoot) -or
         -not (Test-Path -LiteralPath $LocalLogRoot -PathType Container)) {
         return $result
     }
-    $normalizedRemoteDirectory = ([string]$RemoteDirectory).Trim().Trim('/').Replace('\', '/')
-    $remoteRoot = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { '' } else { "/$normalizedRemoteDirectory" }
-    $localRootFullPath = (Get-Item -LiteralPath $LocalLogRoot -ErrorAction Stop).FullName.TrimEnd('\', '/')
+    $normalizedRemoteDirectory = ([string]$RemoteDirectory).Trim().Replace('\', '/').Trim('/')
+    $remoteSegments = @($normalizedRemoteDirectory.Split('/') | ForEach-Object { $_.Trim() })
+    $remoteRootRejected = ($normalizedRemoteDirectory.Length -eq 0)
+    foreach ($remoteSegment in $remoteSegments) {
+        if ($remoteSegment -eq '..' -or $remoteSegment -eq '.' -or $remoteSegment.Length -eq 0) { $remoteRootRejected = $true }
+    }
+    if ($remoteRootRejected) {
+        $result.Rejected = $true
+        Write-Log "Журнали toolkit: sftpDirectories.RuntimeLogs='$RemoteDirectory' відхилено (порожнє значення, '.', '..' або корінь SFTP недопустимі) — вивантаження пропущено." -Level "WARNING"
+        return $result
+    }
+    $remoteRoot = "/$($remoteSegments -join '/')"
+    $localRootItem = Get-Item -LiteralPath $LocalLogRoot -Force -ErrorAction Stop
+    if (([int]$localRootItem.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        $result.Rejected = $true
+        Write-Log "Журнали toolkit: каталог журналів '$($localRootItem.FullName)' є reparse point (junction/symlink) — вивантаження пропущено." -Level "WARNING"
+        return $result
+    }
+    $localRootFullPath = $localRootItem.FullName.TrimEnd('\', '/')
+    $localRootPrefix = $localRootFullPath + [System.IO.Path]::DirectorySeparatorChar
     $ensuredRemoteDirectories = @{}
 
-    $localFiles = @(Get-ChildItem -LiteralPath $localRootFullPath -File -Recurse -Force -ErrorAction SilentlyContinue |
-        Sort-Object -Property FullName)
+    # Власний обхід замість Get-ChildItem -Recurse: на PS 5.1 -Recurse
+    # заходить у junction/symlink-каталоги й вивів би файли поза LOGS.
+    $localFiles = New-Object System.Collections.Generic.List[object]
+    $pendingDirectories = New-Object System.Collections.Generic.Stack[string]
+    $pendingDirectories.Push($localRootFullPath)
+    while ($pendingDirectories.Count -gt 0) {
+        $currentDirectory = $pendingDirectories.Pop()
+        foreach ($childItem in @(Get-ChildItem -LiteralPath $currentDirectory -Force -ErrorAction SilentlyContinue)) {
+            if (([int]$childItem.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $result.Skipped++
+                Write-Log "Журнали toolkit: '$($childItem.FullName)' є reparse point (junction/symlink) — пропущено, за посиланням не йдемо." -Level "WARNING"
+                continue
+            }
+            if (-not $childItem.FullName.StartsWith($localRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $result.Skipped++
+                Write-Log "Журнали toolkit: '$($childItem.FullName)' поза каталогом журналів — пропущено." -Level "WARNING"
+                continue
+            }
+            if ($childItem.PSIsContainer) {
+                $pendingDirectories.Push($childItem.FullName)
+            } else {
+                $localFiles.Add($childItem)
+            }
+        }
+    }
+    $localFiles = @($localFiles.ToArray() | Sort-Object -Property FullName)
     foreach ($localFile in $localFiles) {
         $relativePath = $localFile.FullName.Substring($localRootFullPath.Length).TrimStart('\', '/').Replace('\', '/')
         $remoteFinalPath = "$remoteRoot/$relativePath"
         $snapshotPath = $null
         try {
+            # Знімок (замаскований) робиться ДО порівняння з SFTP: маскування
+            # змінює розмір, тож «той самий розмір» означає той самий
+            # замаскований вміст.
+            $snapshotPath = Join-Path ([System.IO.Path]::GetTempPath()) `
+                ("BRAVO_log_snapshot_{0}.tmp" -f [guid]::NewGuid().ToString('N'))
+            $snapshotResult = New-BRAVOMaskedLogSnapshot -SourcePath $localFile.FullName -SnapshotPath $snapshotPath
+            if (-not $snapshotResult.Success) {
+                $result.Skipped++
+                Write-Log "Журнали toolkit: '$relativePath' не вивантажено (не вдалося зняти замаскований знімок: $($snapshotResult.Error))." -Level "WARNING"
+                continue
+            }
+            $snapshotLength = (Get-Item -LiteralPath $snapshotPath -Force).Length
             $remoteUpToDate = $false
             if ($Session.FileExists($remoteFinalPath)) {
                 $remoteInfo = $Session.GetFileInfo($remoteFinalPath)
-                $remoteUpToDate = ($null -ne $remoteInfo -and [int64]$remoteInfo.Length -eq [int64]$localFile.Length)
+                $remoteUpToDate = ($null -ne $remoteInfo -and [int64]$remoteInfo.Length -eq [int64]$snapshotLength)
             }
             if ($remoteUpToDate) {
                 $result.Unchanged++
@@ -4582,9 +4701,6 @@ function Sync-BRAVORuntimeLogsToSftp {
                     New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $remoteParent
                     $ensuredRemoteDirectories[$remoteParent] = $true
                 }
-                $snapshotPath = Join-Path ([System.IO.Path]::GetTempPath()) `
-                    ("BRAVO_log_snapshot_{0}.tmp" -f [guid]::NewGuid().ToString('N'))
-                [System.IO.File]::Copy($localFile.FullName, $snapshotPath, $true)
                 $sendResult = Send-BRAVOTraceArchiveFile `
                     -Session $Session `
                     -LocalPath $snapshotPath `
@@ -4719,11 +4835,13 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                         -Session $ownLogUploadSession `
                         -LocalLogRoot ([string]$runtimeLogRoot) `
                         -RemoteDirectory ([string]$sftpDirectories.RuntimeLogs)
-                    $runtimeLogSyncMessage = "Журнали toolkit на SFTP: вивантажено $($runtimeLogSyncResult.Uploaded), без змін $($runtimeLogSyncResult.Unchanged), помилок $($runtimeLogSyncResult.Failed)"
-                    if ($runtimeLogSyncResult.Failed -gt 0) {
-                        Write-Log "$runtimeLogSyncMessage; перша помилка: $($runtimeLogSyncResult.FirstError)" -Level "WARNING"
-                    } else {
-                        Write-Log $runtimeLogSyncMessage -Level "INFO"
+                    if (-not $runtimeLogSyncResult.Rejected) {
+                        $runtimeLogSyncMessage = "Журнали toolkit на SFTP: вивантажено $($runtimeLogSyncResult.Uploaded), без змін $($runtimeLogSyncResult.Unchanged), пропущено $($runtimeLogSyncResult.Skipped), помилок $($runtimeLogSyncResult.Failed)"
+                        if ($runtimeLogSyncResult.Failed -gt 0) {
+                            Write-Log "$runtimeLogSyncMessage; перша помилка: $($runtimeLogSyncResult.FirstError)" -Level "WARNING"
+                        } else {
+                            Write-Log $runtimeLogSyncMessage -Level "INFO"
+                        }
                     }
                 } catch {
                     Write-Log "Журнали toolkit: вивантаження на SFTP не вдалося: $($_.Exception.Message)" -Level "WARNING"

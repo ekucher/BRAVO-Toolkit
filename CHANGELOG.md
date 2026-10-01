@@ -23,6 +23,17 @@
   `Maintenance/RuntimeLogSyncUploadsNewAndGrownFilesRecursively`,
   `Maintenance/RuntimeLogSyncUsesSnapshotsAndCleansUp`,
   `Maintenance/RuntimeLogSyncMissingLocalRootIsNoOp`.
+  Безпека вивантаження: знімок кожного журналу (зокрема сирих транскриптів
+  `LOGS\HELPERS`) маскується через `Protect-BRAVOLogSecret` зі збереженням кодування
+  (UTF-8/UTF-16 з BOM), а розмір на SFTP порівнюється із замаскованим знімком; файл, що
+  не читається як текст, не вантажиться (`WARNING`). Обхід `LOGS` не заходить у reparse
+  points (junction/symlink: каталоги й файли пропускаються з `WARNING`; сам `LOGS`-reparse
+  відхиляється), кожен файл мусить лежати всередині `LOGS`. `sftpDirectories.RuntimeLogs`
+  з порожнім значенням, `.`, `..`-сегментом або коренем SFTP відхиляється з `WARNING` без
+  вивантаження. Усе fail-soft: код завершення не змінюється. Нові перевірки:
+  `Maintenance/RuntimeLogSyncMasksSecretsInHelperTranscripts`,
+  `Maintenance/RuntimeLogSyncSkipsReparsePoints`,
+  `Maintenance/RuntimeLogSyncRejectsUnsafeRemoteRoot`.
 
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
