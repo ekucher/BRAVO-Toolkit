@@ -674,8 +674,9 @@ function Get-BRAVOFiles { param($Path, $Filter) return @() }
 function Import-BRAVODiscoveryBaseline { param($StateRoot, $RuntimeRoot) return [pscustomobject]@{ Problems = @(); Baseline = $null; Source = 'self-test' } }
 function Test-BRAVODiscoveryComponentDrift { param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents) return @() }
 function Get-BRAVOLastCompleteBackupComponents { param($BackupRoot) return @() }
+function Get-BRAVOLastCompleteBackupEvidence { param($BackupRoot) return [pscustomobject]@{ Components = @(); CreatedAtUtc = $null } }
 function Resolve-BRAVOBackupComponentScope {
-    param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents, $PreviousCompleteComponents)
+    param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents, $PreviousCompleteComponents, $PreviousCompleteAt)
     return [pscustomobject]@{ Components = [ordered]@{}; Planned = @(); NotInstalled = @(); EffectiveEnabledComponents = $EnabledComponents; EmptyComposition = $false; Findings = @() }
 }
 function Update-BRAVODiscoveryBaselineFromScope {
