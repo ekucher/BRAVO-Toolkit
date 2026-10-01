@@ -147,6 +147,7 @@ function Stop-Process {
             'Stop-Process',
             'Test-BRAVODataRestorePathWithin',
             'Test-BRAVODataRestorePathEquals',
+            'Get-BRAVODataRestorePathProbe',
             'Test-BRAVODataRestorePathHasReparseAncestor',
             'Test-BRAVODataRestoreGenerationIdFormat',
             'Test-BRAVODataRestoreMinimumFreeSpaceGB',
@@ -242,6 +243,33 @@ function Stop-Process {
             [void][IO.Directory]::CreateDirectory($planDirectory)
         }
         $planDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Source = (Join-Path $planLiveModel 'model.gdb') })
+
+        # Детермінована імітація недосяжного UNC-хоста. На доменному сервері
+        # Test-Path по такому шляху (Windows PowerShell 5.1) піднімає
+        # термінальне "The network path was not found", а CI-раннер просто
+        # не резолвить ім'я і тихо отримує $false — тому без імітації CI
+        # дефекту не бачить, а self-test на реальному хості обривався
+        # ("Fatal: The network path was not found"). Заглушка живе лише в
+        # script-scope self-test-модуля і прибирається у finally; реальний
+        # мережевий запит не робиться взагалі.
+        $unreachableUncInvoke = {
+            param($Module, [scriptblock]$Body, [object[]]$Arguments)
+            & $Module {
+                function script:Test-Path {
+                    [CmdletBinding()]
+                    param([string]$LiteralPath, [string]$PathType = 'Any')
+                    if ($LiteralPath.Contains('nas-host')) {
+                        throw (New-Object System.IO.IOException('The network path was not found.'))
+                    }
+                    Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType
+                }
+            }
+            try {
+                & $Module $Body @Arguments
+            } finally {
+                & $Module { Remove-Item -Path 'Function:\Test-Path' -ErrorAction SilentlyContinue }
+            }
+        }
 
         $planInvoke = {
             param($Module, $Mode, $TargetPath, $BackupRoot, $RuntimeRoot, $StagingRoot, $Definitions)
@@ -357,6 +385,36 @@ function Stop-Process {
             ) `
             -Name "DataRestore/PlanInPlaceUsesDiscoveryAndPrerestoreName" `
             -Failure "InPlace-план має забороняти -TargetPath, відхиляти невизначене live-джерело і давати ціль discovery разом із prerestore-іменем <live>.prerestore_<stamp>"
+
+        # OutOfPlace на недосяжний UNC -TargetPath: класифікована відмова
+        # плану (InvalidConfiguration), а не виняток Test-Path.
+        $planUncThrew = $false
+        $planUncResult = $null
+        try {
+            $planUncResult = & $unreachableUncInvoke $dataRestoreModule {
+                param($b, $r, $s, $d)
+                Get-BRAVODataRestorePlan `
+                    -ComponentTypes @('MODEL') `
+                    -RestoreMode 'OutOfPlace' `
+                    -RequestedTargetPath '\\nas-host\share\restore' `
+                    -BackupRoot $b `
+                    -RuntimeRootPath $r `
+                    -StagingRoot $s `
+                    -ArchiveDefinitions $d `
+                    -RunStamp '20260814_120000'
+            } @($planBackupRoot, $planRuntimeRoot, $planStagingRoot, $planDefinitions)
+        } catch {
+            $planUncThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                -not $planUncThrew -and
+                $null -ne $planUncResult -and
+                -not $planUncResult.Success -and
+                ([string]$planUncResult.Error).Contains('недоступн')
+            ) `
+            -Name "DataRestore/PlanClassifiesUnreachableUncTarget" `
+            -Failure "Get-BRAVODataRestorePlan (OutOfPlace) на недосяжний UNC -TargetPath має повертати Success=false з поясненням недоступності, а не кидати виняток Test-Path"
     } finally {
         if (Test-Path -LiteralPath $planTestRoot) {
             Remove-Item -LiteralPath $planTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -379,56 +437,59 @@ function Stop-Process {
                 -Requirements @([pscustomobject]@{ TargetDirectory = $dir; RequiredBytes = [long]900000000000000 }) `
                 -MinimumFreeGigabytes 1
         } $freeSpaceTestRoot
-        $freeSpaceUnc = & $dataRestoreModule {
-            Test-BRAVODataRestoreFreeSpace `
-                -Requirements @([pscustomobject]@{ TargetDirectory = '\\\\nas-host\\share\\restore'; RequiredBytes = [long]1024 }) `
-                -MinimumFreeGigabytes 1
-        }
-        Test-BRAVOCondition `
-            -Condition (
-                $freeSpaceOk.Success -and
-                -not $freeSpaceImpossible.Success -and
-                @($freeSpaceUnc.Notes).Count -gt 0
-            ) `
-            -Name "DataRestore/FreeSpacePreflightBlocksAndProbes" `
-            -Failure "Test-BRAVODataRestoreFreeSpace має пропускати реалістичну вимогу, блокувати завідомо неможливу (з урахуванням резерву MinimumFreeSpaceGB) і для UNC-цілі лишати нотатку замість перевірки обсягу"
-
-        # Регресія (реальний сервер, 2026-09-14): на доменному хості
-        # Test-Path по недосяжному UNC не повертає $false, а піднімає
-        # "The network path was not found" — після успішного резолву імені
-        # йде спроба SMB. Під $ErrorActionPreference = 'Stop' це вбивало
-        # весь self-test ("Fatal: The network path was not found") і, що
-        # важливіше, зробило б відновлення на тимчасово недоступний UNC
-        # некатегоризованою фатальною помилкою замість класифікованої
-        # проблеми. CI-раннер дефекту не бачив: там ім'я просто не
-        # резолвиться, і Test-Path тихо повертає $false.
+        # UNC-виклики — лише через $unreachableUncInvoke і в try/catch:
+        # регресія тут має дати [FAIL] конкретної перевірки, а не обірвати
+        # решту DataRestore-сюїти як "Fatal".
         $uncProbeThrew = $false
-        $uncProbeResult = $null
+        $freeSpaceUnc = $null
         try {
-            $uncProbeResult = & $dataRestoreModule {
+            $freeSpaceUnc = & $unreachableUncInvoke $dataRestoreModule {
                 Test-BRAVODataRestoreFreeSpace `
-                    -Requirements @([pscustomobject]@{ TargetDirectory = '\\\\nas-host\\share\\restore'; RequiredBytes = [long]1024 }) `
+                    -Requirements @([pscustomobject]@{ TargetDirectory = '\\nas-host\share\restore'; RequiredBytes = [long]1024 }) `
                     -MinimumFreeGigabytes 1
-            }
+            } @()
         } catch {
             $uncProbeThrew = $true
         }
         Test-BRAVOCondition `
             -Condition (
-                -not $uncProbeThrew -and
-                $null -ne $uncProbeResult -and
-                -not $uncProbeResult.Success -and
-                @($uncProbeResult.Problems).Count -gt 0
+                $freeSpaceOk.Success -and
+                -not $freeSpaceImpossible.Success -and
+                $null -ne $freeSpaceUnc -and
+                @($freeSpaceUnc.Notes).Count -gt 0
             ) `
-            -Name "DataRestore/UnreachableUncTargetIsClassifiedNotFatal" `
-            -Failure "недосяжна UNC-ціль має давати класифіковану проблему (Success=false + Problems), а не термінальну помилку"
+            -Name "DataRestore/FreeSpacePreflightBlocksAndProbes" `
+            -Failure "Test-BRAVODataRestoreFreeSpace має пропускати реалістичну вимогу, блокувати завідомо неможливу (з урахуванням резерву MinimumFreeSpaceGB) і для UNC-цілі лишати нотатку замість перевірки обсягу"
+
+        # Регресія (реальні сервери, 2026-09-14 і 2026-10-01): на доменному
+        # хості Test-Path по недосяжному UNC піднімає "The network path was
+        # not found" замість $false. Під $ErrorActionPreference = 'Stop' це
+        # вбивало весь self-test ("Fatal: The network path was not found"),
+        # а в production зробило б відновлення на тимчасово недоступний UNC
+        # некатегоризованою фатальною помилкою замість класифікованої.
         Test-BRAVOCondition `
             -Condition (
-                $dataRestoreRuntimeTextForTests -match 
-                    '(?m)^\s*-not \(Test-Path -LiteralPath \$probeDirectory -PathType Container -ErrorAction SilentlyContinue\)\)'
+                -not $uncProbeThrew -and
+                $null -ne $freeSpaceUnc -and
+                -not $freeSpaceUnc.Success -and
+                @($freeSpaceUnc.Problems).Count -gt 0 -and
+                -not (& $dataRestoreModule { [bool](Get-Command Test-Path -CommandType Function -ErrorAction SilentlyContinue) })
+            ) `
+            -Name "DataRestore/UnreachableUncTargetIsClassifiedNotFatal" `
+            -Failure "недосяжна UNC-ціль має давати класифіковану проблему (Success=false + Problems), а не термінальну помилку; заглушка Test-Path не має лишатися в self-test-модулі"
+        # Структурна гарантія: у DataRestore runtime жодна перевірка шляху,
+        # що може бути UNC-ціллю, не йде повз Get-BRAVODataRestorePathProbe
+        # (-ErrorAction SilentlyContinue термінальну помилку провайдера
+        # не гарантовано гасить).
+        $rawUncTestPathPattern = '(?m)Test-Path -LiteralPath \$(probeDirectory|probeFile|targetRoot|componentTarget|restorePlan\.TargetRoot) -PathType'
+        Test-BRAVOCondition `
+            -Condition (
+                $dataRestoreRuntimeTextForTests -match '(?m)^function Get-BRAVODataRestorePathProbe \{' -and
+                $dataRestoreRuntimeTextForTests -notmatch $rawUncTestPathPattern -and
+                $dataRestoreRuntimeTextForTests -notmatch '(?m)^\s*if \(Test-Path -LiteralPath \$componentTarget\)'
             ) `
             -Name "DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors" `
-            -Failure "пошук наявного батьківського каталогу у write-probe мусить придушувати помилки провайдера (-ErrorAction SilentlyContinue), інакше недосяжний UNC валить весь виклик"
+            -Failure "перевірки існування UNC-можливих цілей (write-probe, -TargetPath, ціль компонента, out-of-place корінь) мусять іти через Get-BRAVODataRestorePathProbe, інакше недосяжний UNC валить весь виклик"
     } finally {
         if (Test-Path -LiteralPath $freeSpaceTestRoot) {
             Remove-Item -LiteralPath $freeSpaceTestRoot -Recurse -Force -ErrorAction SilentlyContinue

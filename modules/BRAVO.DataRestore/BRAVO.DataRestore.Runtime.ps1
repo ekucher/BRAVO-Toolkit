@@ -616,6 +616,30 @@ function Test-BRAVODataRestorePathEquals {
     }
 }
 
+function Get-BRAVODataRestorePathProbe {
+    # Єдина точка перевірки існування шляху, що може бути UNC. Test-Path
+    # по недосяжному UNC-хосту на Windows PowerShell 5.1 не повертає
+    # $false: після успішного резолву імені йде спроба SMB, і провайдер
+    # піднімає "The network path was not found" — у транскрипті це
+    # TerminatingError(Test-Path), і -ErrorAction SilentlyContinue його
+    # НЕ гарантовано гасить. Тому тут -ErrorAction Stop + try/catch: будь-яка
+    # помилка провайдера (термінальна чи ні) стає полем Error, а викликач
+    # сам вирішує, як класифікувати недоступність (fail-closed).
+    # CI-раннер цього не бачить: там неіснуюче ім'я не резолвиться, і
+    # Test-Path тихо повертає $false.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateSet('Any', 'Container', 'Leaf')][string]$PathType = 'Any'
+    )
+
+    try {
+        $exists = [bool](Test-Path -LiteralPath $Path -PathType $PathType -ErrorAction Stop)
+        return [pscustomobject]@{ Exists = $exists; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Exists = $false; Error = [string]$_.Exception.Message }
+    }
+}
+
 function Test-BRAVODataRestorePathHasReparseAncestor {
     # Test-BRAVODataRestorePathWithin/-PathEquals — лише лексична
     # нормалізація (GetFullPath): вони НЕ бачать, що каталог фізично є
@@ -1177,7 +1201,13 @@ function Get-BRAVODataRestorePlan {
         } catch {
             return [pscustomobject]@{ Success = $false; Error = "-TargetPath некоректний: $($_.Exception.Message)"; TargetRoot = $null; Components = @() }
         }
-        if (Test-Path -LiteralPath $targetRoot -PathType Leaf) {
+        # Недосяжний UNC -TargetPath -> класифікована відмова плану
+        # (InvalidConfiguration), а не некатегоризований виняток.
+        $targetRootProbe = Get-BRAVODataRestorePathProbe -Path $targetRoot -PathType Leaf
+        if ($null -ne $targetRootProbe.Error) {
+            return [pscustomobject]@{ Success = $false; Error = "-TargetPath недоступний: $targetRoot ($($targetRootProbe.Error))"; TargetRoot = $null; Components = @() }
+        }
+        if ($targetRootProbe.Exists) {
             return [pscustomobject]@{ Success = $false; Error = "-TargetPath вказує на файл, а не каталог: $targetRoot"; TargetRoot = $null; Components = @() }
         }
         # Лексична нормалізація (GetFullPath) вище не бачить, що
@@ -1221,7 +1251,14 @@ function Get-BRAVODataRestorePlan {
             # створює компонентний каталог сам і явно володіє ним — інакше
             # відмова компонента могла б знищити чужий, не створений цим
             # прогоном каталог.
-            if (Test-Path -LiteralPath $componentTarget) {
+            # Fail-closed: якщо існування не вдалося перевірити, НЕ вважаємо
+            # ціль відсутньою — інакше runtime міг би "створити" (no-op) і
+            # потім при відмові видалити чужий каталог.
+            $componentTargetProbe = Get-BRAVODataRestorePathProbe -Path $componentTarget
+            if ($null -ne $componentTargetProbe.Error) {
+                return [pscustomobject]@{ Success = $false; Error = "ціль компонента недоступна для перевірки: $componentTarget ($($componentTargetProbe.Error))"; TargetRoot = $null; Components = @() }
+            }
+            if ($componentTargetProbe.Exists) {
                 return [pscustomobject]@{ Success = $false; Error = "ціль компонента вже існує (має бути відсутньою — runtime створює її сам): $componentTarget"; TargetRoot = $null; Components = @() }
             }
             $planComponents += [pscustomobject]@{
@@ -1472,19 +1509,14 @@ function Test-BRAVODataRestoreFreeSpace {
         } catch {
             continue
         }
-        # -ErrorAction SilentlyContinue тут обов'язковий. На недоступному
-        # UNC-хості Test-Path не просто повертає $false: після успішного
-        # резолву імені йде спроба SMB, і провайдер піднімає
-        # "The network path was not found". Під $ErrorActionPreference =
-        # 'Stop' у викликача це ставало ТЕРМІНАЛЬНОЮ помилкою — замість
-        # класифікованої проблеми відновлення падало некатегоризовано.
-        # Спіймано self-test-ом на доменному сервері; CI-раннер помилки не
-        # бачив, бо там неіснуюче ім'я просто не резолвиться.
-        #
-        # Fail-closed збережено: недосяжний шлях = "немає наявного
+        # Обхід угору через Get-BRAVODataRestorePathProbe: на недоступному
+        # UNC-хості Test-Path піднімає "The network path was not found"
+        # (термінально на Windows PowerShell 5.1), що раніше обривало і
+        # відновлення, і весь self-test ("Fatal: The network path was not
+        # found"). Fail-closed збережено: недосяжний шлях = "немає наявного
         # батьківського каталогу" -> запис у $problems -> Success = $false.
         while (-not [string]::IsNullOrWhiteSpace($probeDirectory) -and
-            -not (Test-Path -LiteralPath $probeDirectory -PathType Container -ErrorAction SilentlyContinue)) {
+            -not (Get-BRAVODataRestorePathProbe -Path $probeDirectory -PathType Container).Exists) {
             $parentDirectory = $null
             try {
                 $parentDirectory = [string](Split-Path -Path $probeDirectory -Parent)
@@ -1513,7 +1545,7 @@ function Test-BRAVODataRestoreFreeSpace {
             # провалився частково (файл міг бути створений і залишений
             # порожнім) — інакше скасоване відновлення лишає слід у
             # (потенційно production) probe-каталозі.
-            if (Test-Path -LiteralPath $probeFile -PathType Leaf -ErrorAction SilentlyContinue) {
+            if ((Get-BRAVODataRestorePathProbe -Path $probeFile -PathType Leaf).Exists) {
                 try {
                     Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
                 } catch {
@@ -3699,7 +3731,18 @@ try {
         # стану (крос-компонентний rollback), а не лишити суміш generation.
         $completedInPlaceComponents = New-Object System.Collections.ArrayList
         $createdTargetRoot = $false
-        if ($Mode -eq 'OutOfPlace' -and -not (Test-Path -LiteralPath $restorePlan.TargetRoot -PathType Container)) {
+        $targetRootExists = $false
+        if ($Mode -eq 'OutOfPlace') {
+            # UNC-корінь міг стати недосяжним між preflight і цим кроком
+            # (служби вже зупинені): класифікована відмова, а не
+            # некатегоризований виняток Test-Path.
+            $targetRootProbe = Get-BRAVODataRestorePathProbe -Path $restorePlan.TargetRoot -PathType Container
+            if ($null -ne $targetRootProbe.Error) {
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "ціль out-of-place недоступна: $($restorePlan.TargetRoot) ($($targetRootProbe.Error))"
+            }
+            $targetRootExists = $targetRootProbe.Exists
+        }
+        if ($Mode -eq 'OutOfPlace' -and -not $targetRootExists) {
             # БЕЗ -Force: якщо TargetRoot з'явився паралельно (інший
             # процес/оператор) у вузькому вікні між Test-Path вище і цим
             # викликом, New-Item провалюється замість мовчазного прийняття

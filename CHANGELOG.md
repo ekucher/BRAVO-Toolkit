@@ -2,6 +2,23 @@
 
 ## Не випущено (developer)
 
+- **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
+  На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
+  піднімає помилку провайдера замість `$false`; під `$ErrorActionPreference = 'Stop'`
+  self-test DataRestore обривався з `[FAIL] Fatal`, а решта DataRestore-перевірок не
+  виконувалась. Попередній фікс (`-ErrorAction SilentlyContinue` у write-probe) термінальну
+  помилку не гарантовано гасить і покривав лише один виклик. Додано helper
+  `Get-BRAVODataRestorePathProbe` (`-ErrorAction Stop` + try/catch -> `Exists`/`Error`); через
+  нього йдуть write-probe free-space preflight, перевірка `-TargetPath` і цілі компонента в
+  `Get-BRAVODataRestorePlan` (недоступність -> класифікована відмова плану, fail-closed) та
+  перевірка out-of-place кореня перед створенням (`RestoreFailed` замість некатегоризованого
+  винятку). Self-test імітує недосяжний хост заглушкою `Test-Path` у script-scope
+  self-test-модуля, тож CI тепер бачить той самий шлях, що й доменний сервер, а UNC-виклики
+  загорнуто в try/catch (регресія дає `[FAIL]` конкретної перевірки, а не `Fatal`). Нова
+  перевірка: `DataRestore/PlanClassifiesUnreachableUncTarget`; посилено
+  `DataRestore/UnreachableUncTargetIsClassifiedNotFatal` і
+  `DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors`.
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
