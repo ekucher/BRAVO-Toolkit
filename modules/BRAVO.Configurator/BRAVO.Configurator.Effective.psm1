@@ -77,29 +77,23 @@ function New-BRAVOConfiguratorIsolatedConfigRoot {
         [Parameter(Mandatory = $true)][hashtable]$CandidateOverrides
     )
 
-    # P0 Configuration Foundation (PR C, Секція 8): BRAVO.config — опційний
-    # legacy-primary шар (Секції 2-5), не обов'язкова умова роботи
-    # Configurator-а. AUTO-семантика тут дзеркалить canonical loader:
-    # присутній -> копіюємо (та сама поведінка, що раніше); відсутній ->
-    # ізольований root свідомо БЕЗ BRAVO.config, і canonical
-    # Import-BravoConfiguration -PassThru (дочірній процес нижче) сам іде
-    # built-in-only/local-only synthetic шляхом (той самий контракт, що
-    # Get-SetupConfiguration AUTO і BRAVO_TASKS_INSTALL.ps1 AUTO) — не
-    # окрема, друга політика "config відсутній".
-    $sourceConfigPath = Join-Path $RuntimeRoot 'BRAVO.config'
-    $sourceConfigPresent = Test-Path -LiteralPath $sourceConfigPath -PathType Leaf
-
+    # Issue #320 (Config V2 B7): legacy BRAVO.config поруч із RuntimeRoot НЕ
+    # потрапляє в ізольований root. 5.3-runtime (усі production-entrypoint-и)
+    # викликає Import-BravoConfiguration -DisallowLegacyPrimaryAutoDetect і
+    # ігнорує цей файл; Configurator мусить показувати РІВНО ті effective-
+    # значення, які побачить runtime, а не виконувати чужий код з файлу,
+    # що лишився після Update-BRAVOServer (той не видаляє BRAVO.config).
+    # Ізольований root містить лише кандидатний BRAVO.local.config (нижче) —
+    # той самий built-in-only/built-in+local синтетичний шлях canonical
+    # loader-а, що й на свіжому сервері без BRAVO.config. Другий захист —
+    # прапорець -DisallowLegacyPrimaryAutoDetect у дочірньому скрипті
+    # (Invoke-BRAVOConfiguratorEffectiveComputation): навіть якщо хтось
+    # знову покладе BRAVO.config в ізольований root, loader його не виконає.
+    # Явного migration-шляху тут немає свідомо: міграцію виконують
+    # BRAVO_CONFIG_INTEGRATE.ps1 / deploy\Get-BRAVOConfigSiteDelta.ps1 з
+    # явним -ConfigPath, а не Configurator.
     $isolatedRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('BRAVO_CONFIGURATOR_EFFECTIVE_' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $isolatedRoot -Force -ErrorAction Stop | Out-Null
-    if ($sourceConfigPresent) {
-        # P2-A (той самий root-cause клас, що BRAVO.Configurator.Persistence
-        # AtomicReplace/PostApplyVerification hermetic-тести реально виявили):
-        # без -ErrorAction Stop файлова IOException тут успадковує
-        # $ErrorActionPreference викликача й може НЕ termінувати виконання під
-        # дефолтним 'Continue' — isolated root лишився б без BRAVO.config
-        # мовчки замість явного throw.
-        Copy-Item -LiteralPath $sourceConfigPath -Destination (Join-Path $isolatedRoot 'BRAVO.config') -Force -ErrorAction Stop
-    }
 
     if ($CandidateOverrides.Count -gt 0) {
         # #154 (B3): кандидат мусить нести ТУ САМУ версію формату, що й
@@ -198,7 +192,7 @@ function Invoke-BRAVOConfiguratorEffectiveComputation {
             '$ErrorActionPreference = ''Stop''',
             'try {',
             "    . (Join-Path '$escapedRuntimeRoot' 'BRAVO_CONFIG_LOADER.ps1')",
-            "    `$null = Import-BravoConfiguration -ConfigRoot '$isolatedRoot' -RuntimeRoot '$escapedRuntimeRoot' -PassThru",
+            "    `$null = Import-BravoConfiguration -ConfigRoot '$isolatedRoot' -RuntimeRoot '$escapedRuntimeRoot' -DisallowLegacyPrimaryAutoDetect -PassThru",
             "    `$capturedNames = $capturedNamesLiteral",
             '    $snapshot = [ordered]@{}',
             '    foreach ($name in $capturedNames) {',

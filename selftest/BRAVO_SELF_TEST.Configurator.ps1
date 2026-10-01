@@ -12,19 +12,21 @@
 #
 # Герметичність RuntimeRoot (CI-регресія, той самий клас, що
 # selftest\BRAVO_SELF_TEST.ConfigLoader.ps1 вже документує для
-# BackupRoot=""): Configurator.Effective копіює $RuntimeRoot\BRAVO.config
-# У isolated ConfigRoot ВЕРБАТИМ, без жодного патчингу. Канонічний
-# комплектний default LIMSRoot=""/BackupRoot="" (AUTO) на реальному
-# production-сервері резолвиться через встановлену службу BRAVO; на
-# GitHub runner (і будь-якій dev-машині без LIMS) AUTO-виявлення падає з
-# "Не вдалося визначити BackupRoot" — жоден Configurator-виклик з
-# порожнім/без-override candidate (у т.ч. ВСЕРЕДИНІ production
-# Test-BRAVOConfiguratorCandidateOverrides, яка завжди рахує ВЛАСНИЙ
-# DefaultConfig з -CandidateOverrides @{}) не може обійти цю залежність
-# лише через overrides, передані САМИМ self-test-ом. Тому весь фрагмент
-# передає RuntimeRoot = ІЗОЛЬОВАНА копія реального комплекту з ЄДИНОЮ
-# зміною — явний LIMSRoot/BackupRoot замість AUTO (той самий text-replace
-# прийом, що ConfigLoader.ps1), а не реальний $root.
+# BackupRoot=""): канонічний комплектний default LIMSRoot=""/BackupRoot=""
+# (AUTO) на реальному production-сервері резолвиться через встановлену
+# службу BRAVO; на GitHub runner (і будь-якій dev-машині без LIMS)
+# AUTO-виявлення падає з "Не вдалося визначити BackupRoot" — жоден
+# Configurator-виклик з порожнім/без-override candidate (у т.ч. ВСЕРЕДИНІ
+# production Test-BRAVOConfiguratorCandidateOverrides, яка завжди рахує
+# ВЛАСНИЙ DefaultConfig з -CandidateOverrides @{}) не може обійти цю
+# залежність лише через overrides, передані САМИМ self-test-ом. Тому
+# весь фрагмент передає RuntimeRoot = ІЗОЛЬОВАНА копія комплекту, де
+# built-in default pathSettings.LIMSRoot/BackupRoot у КОПІЇ модуля
+# BRAVO.Configuration замінено на явні fixture-шляхи (інші модулі — junction-и
+# на реальні). Issue #320: раніше цю підміну несла копія legacy BRAVO.config
+# у RuntimeRoot, яку Configurator.Effective копіював в isolated root і
+# ВИКОНУВАВ; тепер Configurator legacy BRAVO.config не читає взагалі, тож
+# fixture не може на нього спиратись (див. блок Configurator/LegacyConfig*).
 
 if (Enter-BRAVOSelfTestSection -Name 'Configurator/Schema1') { try {
 $configuratorModuleRoot = Join-Path $root 'modules\BRAVO.Configurator'
@@ -46,21 +48,31 @@ $configuratorFixtureBackupRoot = Join-Path $configuratorFixtureRuntimeRoot 'FIXT
 [void][IO.Directory]::CreateDirectory($configuratorFixtureBackupRoot)
 Copy-Item -LiteralPath (Join-Path $root 'BRAVO_CONFIG_LOADER.ps1') -Destination (Join-Path $configuratorFixtureRuntimeRoot 'BRAVO_CONFIG_LOADER.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $root 'VERSION.json') -Destination (Join-Path $configuratorFixtureRuntimeRoot 'VERSION.json') -Force
-# Junction, не copy: modules\ — великий, реальні збірки викликів
-# (Discovery/Compatibility) мають лишатися canonical-кодом репозиторію,
-# не копією, що могла б непомітно розійтись.
-$null = cmd.exe /c mklink /J "$configuratorFixtureRuntimeRoot\modules" "$root\modules" 2>&1
-$configuratorKitConfigText = (Get-BRAVOSelfTestLegacyConfigText)
-$configuratorLimsRootLiteralLine = '    LIMSRoot      = ""'
-$configuratorBackupRootLiteralLine = '    BackupRoot    = ""'
-if (-not $configuratorKitConfigText.Contains($configuratorLimsRootLiteralLine) -or
-    -not $configuratorKitConfigText.Contains($configuratorBackupRootLiteralLine)) {
-    throw "BRAVO_SELF_TEST.Configurator: у BRAVO.config не знайдено очікувані рядки LIMSRoot/BackupRoot — оновіть fixture під нову форму конфігурації"
+# Issue #320: hermetic fixture БЕЗ legacy BRAVO.config. modules\ — реальний
+# каталог, де кожен модуль крім BRAVO.Configuration — junction на реальний
+# (canonical-код не дублюється й не розходиться); BRAVO.Configuration —
+# копія з ЄДИНОЮ зміною: built-in default LIMSRoot/BackupRoot = fixture-шляхи.
+& {
+    $configuratorFixtureModulesRoot = Join-Path $configuratorFixtureRuntimeRoot 'modules'
+    [void][IO.Directory]::CreateDirectory($configuratorFixtureModulesRoot)
+    foreach ($configuratorRealModuleDir in @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Directory)) {
+        if ($configuratorRealModuleDir.Name -eq 'BRAVO.Configuration') { continue }
+        $null = cmd.exe /c mklink /J "$configuratorFixtureModulesRoot\$($configuratorRealModuleDir.Name)" "$($configuratorRealModuleDir.FullName)" 2>&1
+    }
+    Copy-Item -LiteralPath (Join-Path $root 'modules\BRAVO.Configuration') -Destination (Join-Path $configuratorFixtureModulesRoot 'BRAVO.Configuration') -Recurse -Force
+    $configuratorFixtureDefaultsPath = Join-Path $configuratorFixtureModulesRoot 'BRAVO.Configuration\BRAVO.Configuration.psm1'
+    $configuratorFixtureDefaultsText = [IO.File]::ReadAllText($configuratorFixtureDefaultsPath, [Text.Encoding]::UTF8)
+    $configuratorLimsRootLiteralLine = 'LIMSRoot      = ""'
+    $configuratorBackupRootLiteralLine = 'BackupRoot    = ""'
+    if (-not $configuratorFixtureDefaultsText.Contains($configuratorLimsRootLiteralLine) -or
+        -not $configuratorFixtureDefaultsText.Contains($configuratorBackupRootLiteralLine)) {
+        throw "BRAVO_SELF_TEST.Configurator: у built-in defaults BRAVO.Configuration не знайдено очікувані рядки LIMSRoot/BackupRoot — оновіть fixture під нову форму конфігурації"
+    }
+    $configuratorFixtureDefaultsText = $configuratorFixtureDefaultsText.
+        Replace($configuratorLimsRootLiteralLine, "LIMSRoot      = '$($configuratorFixtureLimsRoot.Replace("'", "''"))'").
+        Replace($configuratorBackupRootLiteralLine, "BackupRoot    = '$($configuratorFixtureBackupRoot.Replace("'", "''"))'")
+    [IO.File]::WriteAllText($configuratorFixtureDefaultsPath, $configuratorFixtureDefaultsText, (New-Object System.Text.UTF8Encoding($true)))
 }
-$configuratorPatchedConfigText = $configuratorKitConfigText.
-    Replace($configuratorLimsRootLiteralLine, "    LIMSRoot      = '$($configuratorFixtureLimsRoot.Replace("'", "''"))'").
-    Replace($configuratorBackupRootLiteralLine, "    BackupRoot    = '$($configuratorFixtureBackupRoot.Replace("'", "''"))'")
-[IO.File]::WriteAllText((Join-Path $configuratorFixtureRuntimeRoot 'BRAVO.config'), $configuratorPatchedConfigText, (New-Object System.Text.UTF8Encoding($false)))
 
 # ===== Schema completeness (§3.4 задачі Configurator-а) =====
 $configuratorSchemaResult = Test-BRAVOConfiguratorSchemaCompleteness -ExamplePath (Join-Path $root 'BRAVO.local.config.example')
@@ -1202,6 +1214,117 @@ try {
     }
 } finally {
     Remove-Item -LiteralPath $configuratorNoConfigRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ===== Issue #320 (Config V2 B7): legacy BRAVO.config поруч із RuntimeRoot НЕ
+# виконується й НЕ впливає на effective-значення Configurator-а. Сценарій:
+# сервер оновлено до 5.3, старий BRAVO.config лишився (Update-BRAVOServer його
+# не видаляє) — раніше Configurator.Effective копіював його в isolated root, а
+# дочірній Import-BravoConfiguration (без -DisallowLegacyPrimaryAutoDetect)
+# виконував. Два підкладені файли: (1) "poison" — пише marker-файл і кидає
+# виняток (виконання = marker існує АБО computation падає); (2) валідний
+# frozen-legacy текст зі зміненим ConsoleLevel (виконання = Effective != default).
+# Той самий герметичний fixture, що no-config блок вище (LIMSRoot/BackupRoot —
+# через CandidateOverrides). Credential Manager/discovery семантика не
+# змінюється: порівнюються Effective-структури, похідні від discovery
+# (effectiveLimsRoot/backupRootPath/storageEffective/bazaSyncEffective/
+# credentialSettings), з прогоном БЕЗ legacy-файлу. =====
+& {
+    $configuratorLegacyRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_SELFTEST_LEGACY320_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($configuratorLegacyRuntimeRoot)
+    try {
+        $configuratorLegacyLimsRoot = Join-Path $configuratorLegacyRuntimeRoot 'FIXTURE_LIMS'
+        $configuratorLegacyBackupRoot = Join-Path $configuratorLegacyRuntimeRoot 'FIXTURE_BACKUP'
+        [void][IO.Directory]::CreateDirectory($configuratorLegacyLimsRoot)
+        [void][IO.Directory]::CreateDirectory($configuratorLegacyBackupRoot)
+        Copy-Item -LiteralPath (Join-Path $root 'BRAVO_CONFIG_LOADER.ps1') -Destination (Join-Path $configuratorLegacyRuntimeRoot 'BRAVO_CONFIG_LOADER.ps1') -Force
+        Copy-Item -LiteralPath (Join-Path $root 'VERSION.json') -Destination (Join-Path $configuratorLegacyRuntimeRoot 'VERSION.json') -Force
+        $null = cmd.exe /c mklink /J "$configuratorLegacyRuntimeRoot\modules" "$root\modules" 2>&1
+        $configuratorLegacyOverrides = @{
+            'pathSettings.LIMSRoot' = $configuratorLegacyLimsRoot
+            'pathSettings.BackupRoot' = $configuratorLegacyBackupRoot
+        }
+        $configuratorLegacyConfigPath = Join-Path $configuratorLegacyRuntimeRoot 'BRAVO.config'
+        $configuratorLegacyMarkerPath = Join-Path $configuratorLegacyRuntimeRoot 'LEGACY_EXECUTED.marker'
+        $configuratorLegacyMarkerLiteral = $configuratorLegacyMarkerPath.Replace("'", "''")
+
+        # Контроль (без legacy-файлу): еталонний Effective.
+        $configuratorLegacyBaseline = $null
+        $configuratorLegacyBaselineError = ''
+        try {
+            $configuratorLegacyBaseline = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorLegacyRuntimeRoot -CandidateOverrides $configuratorLegacyOverrides
+        } catch { $configuratorLegacyBaselineError = $_.Exception.Message }
+        Test-BRAVOCondition ($null -ne $configuratorLegacyBaseline) `
+            'Configurator/LegacyConfig/BaselineWithoutLegacyFile' `
+            "Контрольний прогін без BRAVO.config мусить пройти; помилка: $configuratorLegacyBaselineError"
+
+        # Сценарій 1: poison (marker + throw).
+        [IO.File]::WriteAllText($configuratorLegacyConfigPath, ("Set-Content -LiteralPath '$configuratorLegacyMarkerLiteral' -Value 'executed'`r`nthrow 'LEGACY EXECUTED'`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+        $configuratorLegacyPoisonResult = $null
+        $configuratorLegacyPoisonError = ''
+        try {
+            $configuratorLegacyPoisonResult = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorLegacyRuntimeRoot -CandidateOverrides $configuratorLegacyOverrides
+        } catch { $configuratorLegacyPoisonError = $_.Exception.Message }
+        Test-BRAVOCondition (
+            $null -ne $configuratorLegacyPoisonResult -and
+            [string]::IsNullOrEmpty($configuratorLegacyPoisonError)
+        ) `
+            'Configurator/LegacyConfig/PoisonedLegacyDoesNotBreakEffective' `
+            "BRAVO.config з throw 'LEGACY EXECUTED' поруч із RuntimeRoot НЕ мусить ламати розрахунок Effective (legacy не виконується); помилка: $configuratorLegacyPoisonError"
+        Test-BRAVOCondition (-not (Test-Path -LiteralPath $configuratorLegacyMarkerPath)) `
+            'Configurator/LegacyConfig/PoisonedLegacyMarkerNotWritten' `
+            'legacy BRAVO.config виконався в дочірньому процесі Configurator (marker-файл створено) — обхід гейта B7'
+        if ($null -ne $configuratorLegacyPoisonResult -and $null -ne $configuratorLegacyBaseline) {
+            Test-BRAVOCondition (
+                [string]$configuratorLegacyPoisonResult.pathSettings.LIMSRoot -eq $configuratorLegacyLimsRoot -and
+                [string]$configuratorLegacyPoisonResult.pathSettings.BackupRoot -eq $configuratorLegacyBackupRoot -and
+                [string]$configuratorLegacyPoisonResult.effectiveLimsRoot -eq [string]$configuratorLegacyBaseline.effectiveLimsRoot
+            ) `
+                'Configurator/LegacyConfig/LocalCandidateStillApplied' `
+                "кандидатний BRAVO.local.config (CandidateOverrides) мусить діяти як і раніше; LIMSRoot=$($configuratorLegacyPoisonResult.pathSettings.LIMSRoot) BackupRoot=$($configuratorLegacyPoisonResult.pathSettings.BackupRoot)"
+            $configuratorLegacyUnchangedNames = @('effectiveLimsRoot', 'systemLogRoot', 'backupRootPath', 'storageEffective', 'bazaSyncEffective', 'credentialSettings')
+            $configuratorLegacyDriftedNames = @($configuratorLegacyUnchangedNames | Where-Object {
+                    ((ConvertTo-Json -InputObject $configuratorLegacyPoisonResult.$_ -Depth 12 -Compress) -ne
+                    (ConvertTo-Json -InputObject $configuratorLegacyBaseline.$_ -Depth 12 -Compress))
+                })
+            Test-BRAVOCondition ($configuratorLegacyDriftedNames.Count -eq 0) `
+                'Configurator/LegacyConfig/DiscoveryAndCredentialSettingsUnchanged' `
+                "discovery-похідні й credentialSettings мусять збігатися з прогоном без legacy-файлу; розбіжність: $($configuratorLegacyDriftedNames -join ', ')"
+        }
+
+        # Сценарій 2: валідний legacy-текст, що ЗМІНЮЄ значення (ConsoleLevel).
+        $configuratorLegacyValueText = (Get-BRAVOSelfTestLegacyConfigText)
+        $configuratorLegacyConsoleLine = 'ConsoleLevel = "WARNING"'
+        if (-not $configuratorLegacyValueText.Contains($configuratorLegacyConsoleLine)) {
+            throw 'BRAVO_SELF_TEST.Configurator: у frozen-legacy тексті не знайдено ConsoleLevel = "WARNING" — оновіть fixture Configurator/LegacyConfig'
+        }
+        [IO.File]::WriteAllText($configuratorLegacyConfigPath, $configuratorLegacyValueText.Replace($configuratorLegacyConsoleLine, 'ConsoleLevel = "ERROR"'), (New-Object System.Text.UTF8Encoding($false)))
+        $configuratorLegacyValueResult = $null
+        $configuratorLegacyValueError = ''
+        try {
+            $configuratorLegacyValueResult = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorLegacyRuntimeRoot -CandidateOverrides $configuratorLegacyOverrides
+        } catch { $configuratorLegacyValueError = $_.Exception.Message }
+        Test-BRAVOCondition (
+            $null -ne $configuratorLegacyValueResult -and $null -ne $configuratorLegacyBaseline -and
+            [string]$configuratorLegacyValueResult.consoleSettings.ConsoleLevel -eq [string]$configuratorLegacyBaseline.consoleSettings.ConsoleLevel -and
+            [string]$configuratorLegacyValueResult.consoleSettings.ConsoleLevel -ne 'ERROR'
+        ) `
+            'Configurator/LegacyConfig/LegacyValueDoesNotAffectEffective' `
+            "legacy ConsoleLevel=ERROR не мусить впливати на Effective; отримано $($(if ($null -ne $configuratorLegacyValueResult) { $configuratorLegacyValueResult.consoleSettings.ConsoleLevel } else { "помилка: $configuratorLegacyValueError" })), без legacy: $($(if ($null -ne $configuratorLegacyBaseline) { $configuratorLegacyBaseline.consoleSettings.ConsoleLevel } else { 'N/A' }))"
+
+        # Структурний захист у глибину: дочірній скрипт передає прапорець, а
+        # isolated root не отримує копії BRAVO.config.
+        $configuratorLegacyEffectiveText = [IO.File]::ReadAllText((Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Effective.psm1'), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition (
+            $configuratorLegacyEffectiveText -match 'Import-BravoConfiguration\s+-ConfigRoot[^"\r\n]*-DisallowLegacyPrimaryAutoDetect' -and
+            $configuratorLegacyEffectiveText -notmatch "Copy-Item[^\r\n]*'BRAVO\.config'"
+        ) `
+            'Configurator/LegacyConfig/ChildPassesDisallowFlagAndDoesNotCopyLegacy' `
+            'Invoke-BRAVOConfiguratorEffectiveComputation мусить передавати -DisallowLegacyPrimaryAutoDetect у дочірній Import-BravoConfiguration, а New-BRAVOConfiguratorIsolatedConfigRoot не мусить копіювати BRAVO.config'
+    } finally {
+        Remove-Item -LiteralPath $configuratorLegacyRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/ConfiguratorNestedBaselineChangedIsDirty' } }
 if (Enter-BRAVOSelfTestSection -Name 'Configurator/Authorization' -DependsOn 'Configurator/Schema1') { try {

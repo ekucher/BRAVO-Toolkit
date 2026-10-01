@@ -632,6 +632,38 @@ function Test-BRAVORestoreExecutionStillAllowed {
     return Test-BRAVORestoreTimeWindow -Now $now -WindowStart $WindowStart -WindowEnd $WindowEnd
 }
 
+# Рішення про реставрацію моделі цього прогону (#321). Чиста функція — щоб
+# self-test перевіряв рішення на значеннях, а не regex-ом по тексту.
+#
+# Нормальна гілка: реставрація можлива лише при ввімкненому компоненті BRAVO
+# (служба встановлена й не Disabled); -ForceRestore вікном і квотою не
+# обмежується, автоматична — лише у вікні (або boot-recovery профілю
+# робочого часу).
+#
+# Виняток (#321): -ForceRestore + служба BRAVO має тип запуску Disabled
+# (ручна дія на хості; toolkit сам службу в Disabled не переводить) —
+# оператор свідомо просить реставрацію, а служба вже зупинена, тож
+# реставрація ВИКОНУЄТЬСЯ (RestoreOnDisabledBravo). Тип запуску не
+# змінюється, службу після реставрації не стартуємо. Звичайний
+# (не примусовий) Maintenance + Disabled поводиться як раніше — без
+# реставрації. Не встановлена служба (не Disabled) винятком не є.
+function Get-BRAVOMaintenanceRestoreDecision {
+    param(
+        [bool]$BravoMaintenanceEnabled,
+        [bool]$BravoServiceDisabled,
+        [bool]$ForceRestore,
+        [bool]$automaticRestoreDue,
+        [bool]$restoreWindowOpen,
+        [bool]$bootRestoreIgnoresWindow
+    )
+    $shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)))
+    $restoreOnDisabledBravo = [bool]($ForceRestore -and $BravoServiceDisabled -and -not $BravoMaintenanceEnabled)
+    return [pscustomobject]@{
+        ShouldRestore = [bool]($shouldRestore -or $restoreOnDisabledBravo)
+        RestoreOnDisabledBravo = $restoreOnDisabledBravo
+    }
+}
+
 $parsedRestoreTime = [TimeSpan]::Zero
 $parsedRestoreWindowStart = [TimeSpan]::Zero
 $parsedRestoreWindowEnd = [TimeSpan]::Zero
@@ -703,6 +735,36 @@ if ($script:SlackMode -ne "none") {
         Write-Host "ПОМИЛКА: Для каналу $NotificationProviderDisplayName не знайдено коректний HTTPS webhook у Credential Manager$credentialDetails" -ForegroundColor Red
         exit 31
     }
+}
+
+# #297: самовідновлення після аварійного виходу попереднього прогону.
+# Якщо попередній Maintenance/Recovery загинув у вікні тимчасового
+# утримання служб (start type = Disabled, див. Suspend-BRAVOServiceAutostart),
+# початкові типи запуску лежать у ownership-маркері. Це МУСИТЬ статися ДО
+# будь-якого читання start type нижче: інакше тимчасово Disabled служба
+# була б прийнята за «вимкнену оператором» і лишилась би вимкненою назавжди.
+# Крок не кидає виняток; результат логується пізніше (Write-Log ще не
+# визначено), а тут — одразу в консоль.
+$script:startModeRepairResult = $null
+$startModeRepairAllowedNames = @()
+try {
+    $startModeRepairAllowedNames = @($BravoServiceName, $ExchangAPIServiceName)
+    foreach ($startModeRepairWebCandidate in $BravoWebServiceCandidates) {
+        $startModeRepairAllowedNames += [string]$startModeRepairWebCandidate
+        $startModeRepairWebService = Get-Service -DisplayName ([string]$startModeRepairWebCandidate) -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $startModeRepairWebService) { $startModeRepairAllowedNames += [string]$startModeRepairWebService.Name }
+    }
+    $script:startModeRepairResult = Repair-BRAVOOrphanedServiceStartTypes `
+        -AllowedServiceNames @($startModeRepairAllowedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+} catch {
+    $script:startModeRepairResult = [pscustomobject]@{
+        Status = 'RepairFailed'; Owner = $null; Snapshot = @(); Restored = @(); Foreign = @()
+        Failed = @("виняток: $($_.Exception.Message)")
+    }
+}
+if ($script:startModeRepairResult.Status -in @('Repaired', 'RepairFailed', 'HeldSuppressed')) {
+    Write-Host " УВАГА (#297): виявлено слід аварійно перерваного утримання служб — стан: $($script:startModeRepairResult.Status); відновлено: $(@($script:startModeRepairResult.Restored) -join ', '); помилки: $(@($script:startModeRepairResult.Failed) -join '; ')" -ForegroundColor Yellow
 }
 
 # Автоматичне визначення служби Apache для BRAVO Web.
@@ -795,15 +857,25 @@ if ($BravoWebComponentEnabled -and -not $ApacheService) {
     }
 }
 
+function Test-BRAVOServiceDisabledBySystem {
+    # StartType відсутній у ServiceController на .NET < 4.6.1 (#319), тож
+    # читається лише через Get-BRAVOServiceStartMode (під StrictMode 2.0
+    # пряме звернення кинуло б виняток ще до рішення про керування службою).
+    # CIM StartMode уже отриманий викликачем — другий WMI-запит не потрібен.
+    param($Service, [string]$CimStartMode)
+
+    if ($CimStartMode -ieq "Disabled") { return $true }
+    $startModeResult = Get-BRAVOServiceStartMode -Service $Service -NoWmiQuery
+    return ($startModeResult.StartMode -eq "Disabled")
+}
+
 $ApacheServiceExists = ($null -ne $ApacheService)
 $BravoWebServiceDisabledBySystem = $false
 if ($ApacheServiceExists) {
     $cimStartMode = if ($ApacheServiceInfo) { [string]$ApacheServiceInfo.StartMode } else { "" }
-    $serviceStartType = [string]$ApacheService.StartType
-    $BravoWebServiceDisabledBySystem = (
-        $cimStartMode -ieq "Disabled" -or
-        $serviceStartType -ieq "Disabled"
-    )
+    $BravoWebServiceDisabledBySystem = Test-BRAVOServiceDisabledBySystem `
+        -Service $ApacheService `
+        -CimStartMode $cimStartMode
 }
 function Get-BRAVOBravoWebComponentPlan {
     [CmdletBinding()]
@@ -874,7 +946,8 @@ function Get-ConfiguredServiceState {
         $startMode = if ($serviceInfo) {
             [string]$serviceInfo.StartMode
         } else {
-            [string]$service.StartType
+            # StartType відсутній на .NET < 4.6.1 (#319): безпечне читання.
+            [string](Get-BRAVOServiceStartMode -Service $service -NoWmiQuery).StartMode
         }
     }
 
@@ -883,6 +956,20 @@ function Get-ConfiguredServiceState {
         Exists   = ($null -ne $service)
         Disabled = ($startMode -ieq "Disabled")
         Enabled  = ($null -ne $service -and $startMode -ine "Disabled")
+    }
+}
+
+# Завершення додаткових процесів, що можуть тримати файли моделі (Bis).
+# Спільне для зупинки працюючої служби BRAVO і для -ForceRestore при Disabled (#321).
+function Stop-BRAVOMaintenanceStrayProcess {
+    $processNames = @("Bis")
+    foreach ($procName in $processNames) {
+        $process = Get-Process -Name $procName -ErrorAction SilentlyContinue
+        if ($process) {
+            Write-Log -Message "Завершення процесу $procName..." -Level "INFO"
+            $process | Stop-Process -Force
+            Start-Sleep -Seconds 1
+        }
     }
 }
 
@@ -1050,6 +1137,13 @@ function Enter-BRAVOMaintenanceOperationLock {
         $deadline = (Get-Date).AddMinutes($waitMinutes)
         $stream = $null
         $lastLockError = $null
+        # #321: очікування lock було мовчазним (у проді 30 хв без жодного
+        # рядка), а пізніша версія писала INFO кожні 30 с. Тепер рівно ДВА
+        # INFO за весь прогін: один на початку очікування (з метаданими
+        # власника, якщо JSON читається) і один після отримання lock із
+        # тривалістю очікування. INFO, не WARNING — штатне очікування не
+        # має змінювати лічильник попереджень.
+        $lockWaitStartedAt = $null
         do {
             try {
                 # FileShare.Read (не .None): дозволяє чужому read-only peek
@@ -1068,45 +1162,56 @@ function Enter-BRAVOMaintenanceOperationLock {
             } catch {
                 $lastLockError = $_.Exception.Message
                 if ((Get-Date) -lt $deadline) {
-                    # Оператор бачив лише мовчазний Start-Sleep до
-                    # OperationLockWaitMinutes і жодного натяку, хто саме
-                    # тримає lock, хоча holder уже пише в цей файл JSON із
-                    # operation/pid/hostname/generationId (DEV-LIMS
-                    # acceptance 2026-08-23). Читання — best-effort: holder
-                    # тримає файл із FileShare.Read, тому в звичайному разі
-                    # peek вдається; вузьке вікно між OpenOrCreate і Write
-                    # лишається, і тоді просто немає що показати — це не
-                    # привід перетворити діагностичний peek на ще одну
-                    # причину провалити захоплення lock.
-                    $holderDescription = "невідомо (lock ще не опубліковано або читання наразі неможливе)"
-                    try {
-                        $peekStream = [System.IO.File]::Open(
-                            $lockPath,
-                            [System.IO.FileMode]::Open,
-                            [System.IO.FileAccess]::Read,
-                            [System.IO.FileShare]::ReadWrite
-                        )
+                    if ($null -eq $lockWaitStartedAt) {
+                        $lockWaitStartedAt = Get-Date
+                        # Оператор бачив лише мовчазний Start-Sleep до
+                        # OperationLockWaitMinutes і жодного натяку, хто саме
+                        # тримає lock, хоча holder уже пише в цей файл JSON із
+                        # operation/pid/hostname/generationId (DEV-LIMS
+                        # acceptance 2026-08-23). Читання — best-effort: holder
+                        # тримає файл із FileShare.Read, тому в звичайному разі
+                        # peek вдається; вузьке вікно між OpenOrCreate і Write
+                        # лишається, і тоді просто немає що показати — це не
+                        # привід перетворити діагностичний peek на ще одну
+                        # причину провалити захоплення lock.
+                        $holderDescription = "невідомо (lock ще не опубліковано або читання наразі неможливе)"
                         try {
-                            $peekReader = New-Object System.IO.StreamReader($peekStream, [System.Text.Encoding]::UTF8)
-                            $peekText = $peekReader.ReadToEnd()
-                        } finally {
-                            $peekStream.Dispose()
+                            $peekStream = [System.IO.File]::Open(
+                                $lockPath,
+                                [System.IO.FileMode]::Open,
+                                [System.IO.FileAccess]::Read,
+                                [System.IO.FileShare]::ReadWrite
+                            )
+                            try {
+                                $peekReader = New-Object System.IO.StreamReader($peekStream, [System.Text.Encoding]::UTF8)
+                                $peekText = $peekReader.ReadToEnd()
+                            } finally {
+                                $peekStream.Dispose()
+                            }
+                            if (-not [string]::IsNullOrWhiteSpace($peekText)) {
+                                $holderInfo = $peekText | ConvertFrom-Json
+                                $holderFields = foreach ($holderField in @('operation', 'pid', 'hostname', 'startedAt', 'generationId')) {
+                                    $holderProperty = $holderInfo.PSObject.Properties[$holderField]
+                                    "$holderField=$(if ($null -ne $holderProperty) { $holderProperty.Value } else { '?' })"
+                                }
+                                $holderDescription = @($holderFields) -join '; '
+                            }
+                        } catch {
+                            # Peek не вдався (гонка з holder-ом, тимчасова
+                            # недоступність) — лишаємо дефолтний опис вище.
                         }
-                        if (-not [string]::IsNullOrWhiteSpace($peekText)) {
-                            $holderInfo = $peekText | ConvertFrom-Json
-                            $holderDescription = "operation=$($holderInfo.operation); pid=$($holderInfo.pid); hostname=$($holderInfo.hostname); startedAt=$($holderInfo.startedAt); generationId=$($holderInfo.generationId)"
-                        }
-                    } catch {
-                        # Peek не вдався (гонка з holder-ом, тимчасова
-                        # недоступність) — лишаємо дефолтний опис вище.
+                        Write-Log "Очікую звільнення операційного lock ($lockPath); тримає: $holderDescription; максимум очікування $waitMinutes хв.$waitLimitDescription" -Level "INFO"
                     }
-                    Write-Log "Очікую звільнення операційного lock ($lockPath); тримає: $holderDescription; залишилось $([math]::Max(0, [int]($deadline - (Get-Date)).TotalMinutes)) хв." -Level "INFO"
                     Start-Sleep -Seconds 30
                 }
             }
         } while ($null -eq $stream -and (Get-Date) -lt $deadline)
         if ($null -eq $stream) {
             throw "lock не звільнився за $waitMinutes хв.$($waitLimitDescription): $lastLockError"
+        }
+        if ($null -ne $lockWaitStartedAt) {
+            $lockWaited = (Get-Date) - $lockWaitStartedAt
+            Write-Log "Операційний lock отримано після очікування $([int][math]::Floor($lockWaited.TotalMinutes)) хв $($lockWaited.Seconds) с" -Level "INFO"
         }
         # JSON замість "Operation=...; PID=...; Started=..." (аудит P1.8):
         # той самий формат, що й у спільному lock з Archive.Runtime.ps1.
@@ -7801,7 +7906,18 @@ $automaticRestoreDue = ($scheduledRestoreDue -or $missedRestoreDue) -and -not $w
 $bootRestoreIgnoresWindow = $RunMissedRestoreOnly -and
     ([string]$maintenanceSettings.Restore.BootRestoreMode -eq 'HoldServices')
 $restoreSkippedByWindow = $automaticRestoreDue -and -not $restoreWindowOpen -and -not $ForceRestore -and -not $bootRestoreIgnoresWindow
-$shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)))
+$restoreDecision = Get-BRAVOMaintenanceRestoreDecision `
+    -BravoMaintenanceEnabled ([bool]$BravoMaintenanceEnabled) `
+    -BravoServiceDisabled ([bool]$BravoServiceDisabledBySystem) `
+    -ForceRestore ([bool]$ForceRestore) `
+    -automaticRestoreDue ([bool]$automaticRestoreDue) `
+    -restoreWindowOpen ([bool]$restoreWindowOpen) `
+    -bootRestoreIgnoresWindow ([bool]$bootRestoreIgnoresWindow)
+$shouldRestore = [bool]$restoreDecision.ShouldRestore
+# true = -ForceRestore при службі BRAVO з типом запуску Disabled (#321).
+# Компонент BRAVO лишається вимкненим для решти операцій (trace, .md,
+# RangeId, retention, RangeId) — виконується лише реставрація моделі.
+$restoreOnDisabledBravo = [bool]$restoreDecision.RestoreOnDisabledBravo
 $restoreReason = if ($ForceRestore) { "Примусово" } elseif ($missedRestoreDue) { "Пропущений плановий слот $($scheduledOccurrence.ToString('yyyy-MM-dd HH:mm'))$(if ($bootRestoreIgnoresWindow -and -not $restoreWindowOpen) { ' (boot-recovery поза вікном, профіль робочого часу)' })" } else { "$RestoreDayName, після $RestoreTime" }
 $CheckSize = -not $DisableSizeCheck
 if ($RunMissedRestoreOnly -and $missedDailyWork) {
@@ -8093,6 +8209,14 @@ if (-not $BravoWebComponentEnabled) {
     Write-Log -Message "Обробка веб-логів: $(if ($ApacheEnabled) {'Увімкнена'} else {'Вимкнена'})" -NoTimestamp
 }
 
+if (-not $BravoMaintenanceEnabled -and $restoreOnDisabledBravo) {
+    # #321: компонент BRAVO вимкнено (Disabled), але оператор передав
+    # -ForceRestore — заголовок усе одно показує, що реставрація буде
+    # виконана. Решта рядків блоку (розміри, умови вікна) стосується
+    # звичайного плану й тут не потрібна.
+    Write-Log -Message "Реставрація моделі: АКТИВОВАНА ($restoreReason)" -NoTimestamp
+    Write-Log -Message "Служба $BravoServiceName має тип запуску Disabled: реставрацію буде виконано без керування службою (тип запуску не змінюється, службу не запускаємо)" -Level "INFO"
+}
 if ($BravoMaintenanceEnabled) {
     if ($isRestoreDay -and $isAfterRestoreTime -and (Test-Path $MARKER_FILE)) {
         Write-Log -Message "РЕСТАВРАЦІЯ СЬОГОДНІ ВЖЕ ВИКОНУВАЛАСЬ (знайдено маркер $([System.IO.Path]::GetFileName($MARKER_FILE)))" -Level "INFO"
@@ -8323,6 +8447,10 @@ if ($BravoMaintenanceEnabled) {
     if ($null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
         $dirsToCreate += $TRACE_DIR, $TRACE_ARCHIV_DIR
     }
+} elseif ($restoreOnDisabledBravo) {
+    # #321: реставрація при Disabled пише before/after-архіви в $ARC_DIR —
+    # каталог має існувати, хоча решта BRAVO-каталогів (Trace) не потрібна.
+    $dirsToCreate += $ARC_DIR
 }
 if ($exchangAPIServiceEnabled) {
     # Нова модель — плоский EXCHANGE_LOG_DIR (оригінальні імена + добовий
@@ -8373,6 +8501,29 @@ if ($missingDirs.Count -gt 0 -or $script:criticalErrorOccurred) {
 }
 $directoryCreationFailed = $script:criticalErrorOccurred
 
+# #297: підсумок самовідновлення типів запуску (див. початок скрипта) — тепер
+# Write-Log доступний. Лише WARNING (лічильник попереджень), без фатальності.
+switch ([string]$script:startModeRepairResult.Status) {
+    'Repaired' {
+        $startModeRepairMessage = "Попередній прогін $($script:startModeRepairResult.Owner) завершився аварійно під час утримання служб від автостарту (#297): початкові типи запуску відновлено автоматично ($(@($script:startModeRepairResult.Restored) -join ', ')); перевірте причину переривання"
+        Write-Log -Message $startModeRepairMessage -Level 'WARNING'
+        Send-SlackAlert -Message $startModeRepairMessage -Severity WARNING
+    }
+    'RepairFailed' {
+        $startModeRepairMessage = "Не вдалося повністю відновити типи запуску служб після аварійного переривання попереднього прогону (#297): $(@($script:startModeRepairResult.Failed) -join '; '). Службу з типом Disabled, яку не вимикав оператор, слід повернути вручну; маркер залишено — Health-watchdog повторить спробу"
+        Write-Log -Message $startModeRepairMessage -Level 'WARNING'
+        Send-SlackAlert -Message $startModeRepairMessage -Severity WARNING
+    }
+    'HeldSuppressed' {
+        $startModeRepairMessage = "Попередній прогін $($script:startModeRepairResult.Owner) перервано посеред реставрації (restartSuppressed): служби свідомо лишаються Disabled до ручного відновлення (OPERATIONS.md, код 43). Початкові типи запуску: $(@($script:startModeRepairResult.Snapshot | ForEach-Object { '{0}={1}' -f $_.Name, $_.StartMode }) -join ', ')"
+        Write-Log -Message $startModeRepairMessage -Level 'WARNING'
+        Send-SlackAlert -Message $startModeRepairMessage -Severity WARNING
+    }
+}
+if (@($script:startModeRepairResult.Foreign).Count -gt 0) {
+    Write-Log -Message "Типи запуску не повернуто, бо їх змінив оператор після аварії (#297): $(@($script:startModeRepairResult.Foreign) -join '; ')" -Level 'WARNING'
+}
+
 Write-BRAVOProgressPhase -Phase 'Зупинка служб' -PercentComplete 20
 $maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock `
     -TaskType $(if ($RunMissedRestoreOnly) { 'Recovery' } else { 'Maintenance' })
@@ -8389,6 +8540,43 @@ if (-not $maintenanceLockResult.Success) {
 }
 $script:maintenanceOperationLock = $maintenanceLockResult.Stream
 $script:maintenanceOperationLockPath = $maintenanceLockResult.Path
+
+# #297 (клас гонитви): класифікація Disabled/Enabled (~рядки 830/1010) і
+# $shouldRestore обчислені ДО очікування lock. Якщо тоді живий інший прогін
+# тримав служби в тимчасовому Disabled (Repair -> 'OwnerAlive'), служба
+# хибно класифікована як «вимкнена оператором», а до моменту отримання lock
+# той прогін уже повернув типи. Тут (lock отримано, власник завершився)
+# повторюємо самовідновлення й ПЕРЕВІРЯЄМО класифікацію. Якщо вона змінилась,
+# похідні рішення (restore, кроки, підсумок) обчислені зі застарілих
+# прапорців, а їх перерахунок інвазивний — тож прогін завершується
+# fail-closed (код 20, нічого не зроблено) і наступний запуск рахує все
+# заново. Незмінна класифікація — продовжуємо.
+if ([string]$script:startModeRepairResult.Status -eq 'OwnerAlive') {
+    $postLockRepair = Repair-BRAVOOrphanedServiceStartTypes `
+        -AllowedServiceNames @($startModeRepairAllowedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    Write-Log -Message "Повторне самовідновлення типів запуску після отримання lock (#297): $($postLockRepair.Status)" -Level "INFO"
+    $reBravoEnabled = [bool](Get-ConfiguredServiceState -Name $BravoServiceName).Enabled
+    $reExchangeState = Get-ConfiguredServiceState -Name $ExchangAPIServiceName
+    $reExchangeEnabled = [bool](Get-BRAVOOptionalServiceComponentPlan `
+        -ServiceExists $reExchangeState.Exists -ServiceDisabled $reExchangeState.Disabled).ManageService
+    $reWebEnabled = [bool]$BravoWebMaintenanceEnabled
+    if (-not [string]::IsNullOrWhiteSpace([string]$BravoWebServiceName)) {
+        $reWebState = Get-ConfiguredServiceState -Name $BravoWebServiceName
+        $reWebEnabled = [bool](Get-BRAVOBravoWebComponentPlan `
+            -ComponentEnabled $BravoWebComponentEnabled `
+            -ServiceExists $reWebState.Exists `
+            -ServiceDisabled $reWebState.Disabled `
+            -ServiceMatchCount $BravoWebServiceMatchCount).ManageService
+    }
+    if ($reBravoEnabled -ne [bool]$BravoMaintenanceEnabled -or
+        $reExchangeEnabled -ne [bool]$exchangAPIServiceEnabled -or
+        $reWebEnabled -ne [bool]$BravoWebMaintenanceEnabled) {
+        Write-Log -Message "Класифікація служб змінилась, поки очікувався lock (інший прогін тимчасово утримував служби Disabled, #297): Bravo $BravoMaintenanceEnabled->$reBravoEnabled, exchangAPI $exchangAPIServiceEnabled->$reExchangeEnabled, Web $BravoWebMaintenanceEnabled->$reWebEnabled. Рішення цього прогону обчислені зі застарілих даних — прогін завершено без дій, наступний запуск повторить" -Level "WARNING"
+        Exit-BRAVOMaintenanceOperationLock
+        Complete-BRAVOProgress
+        exit (Resolve-BRAVOExitCode -LockBusy)
+    }
+}
 
 $bravoLogRotationLogger = { param($Message, $Level) Write-Log -Message $Message -Level $Level }
 
@@ -8653,22 +8841,50 @@ $script:quiescenceMarkerWrittenThisRun = $false
 # true = маркер зараз suppressed на час деструктивної фази реставрації
 # (bravocmd) — див. Restore-BRAVOMaintenanceQuiescenceAutostart нижче.
 $script:quiescenceMarkerSuppressedForRestore = $false
+# #297: тимчасове утримання від автостарту (start type -> Disabled) на ВСЕ
+# вікно «служби зупинені». Знімок точних початкових типів іде в маркер ДО
+# зміни (write-ahead); Disabled служби у знімок не потрапляють (вони й так
+# не стартують і ніколи не змінюються). Збій зняття знімка/застосування не
+# фатальний для обслуговування, але робить реставрацію fail-closed (див.
+# Confirm-BRAVOServicesQuiesced перед before-archive і bravocmd).
+$script:quiescedServiceNames = @()
+$script:startTypeSnapshot = @()
+$script:startModeSuppressionFailures = @()
+$script:startModeRestoreIncomplete = $false
 if ($stopServicesRequired) {
     $quiescenceServices = @()
     if ($serviceWasRunning.Bravo) { $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = $true } }
     if ($serviceWasRunning.ExchangeApi) { $quiescenceServices += @{ Name = $ExchangAPIServiceName; RestartIntent = $true } }
     if ($serviceWasRunning.BravoWeb) { $quiescenceServices += @{ Name = $BravoWebServiceName; RestartIntent = $true } }
+    $script:quiescedServiceNames = @($quiescenceServices | ForEach-Object { [string]$_.Name })
+    try {
+        $script:startTypeSnapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $script:quiescedServiceNames)
+    } catch {
+        $script:startTypeSnapshot = @()
+        $script:startModeSuppressionFailures += "знімок типів запуску не знято: $($_.Exception.Message)"
+    }
     try {
         [void](Write-BRAVOServiceQuiescenceState `
             -Owner 'BRAVO_MAINTENANCE' `
             -Services $quiescenceServices `
-            -LogFile ([string]$LOG_FILE))
+            -LogFile ([string]$LOG_FILE) `
+            -StartTypeSnapshot $script:startTypeSnapshot)
         $script:quiescenceMarkerWrittenThisRun = $true
     } catch {
         $quiescenceMarkerError = "Не вдалося записати ownership-маркер зупинки служб — зупинку служб і обслуговування перервано (без маркера аварійне переривання лишило б служби зупиненими без автоматичного відновлення): $($_.Exception.Message)"
         Write-Log -Message $quiescenceMarkerError -Level 'ERROR'
         Send-SlackAlert -Message $quiescenceMarkerError -IsCritical
         throw $quiescenceMarkerError
+    }
+    if ($script:startTypeSnapshot.Count -gt 0) {
+        $startModeSuppression = Suspend-BRAVOServiceAutostart -Snapshot $script:startTypeSnapshot
+        $script:startModeSuppressionFailures += @($startModeSuppression.Failed)
+        if (@($startModeSuppression.Applied).Count -gt 0) {
+            Write-Log -Message "Служби утримано від автостарту на час реставрації (start type -> Disabled; початкові типи збережено в маркері): $(@($script:startTypeSnapshot | ForEach-Object { '{0}={1}' -f $_.Name, $_.StartMode }) -join ', ')" -Level "INFO"
+        }
+    }
+    if ($script:startModeSuppressionFailures.Count -gt 0) {
+        Write-Log -Message "Не вдалося утримати служби від автостарту (#297): $($script:startModeSuppressionFailures -join '; ') — реставрація моделі (before-archive/bravocmd) буде скасована fail-closed, решта обслуговування триває" -Level "WARNING"
     }
 }
 
@@ -8685,7 +8901,8 @@ function Restore-BRAVOMaintenanceQuiescenceAutostart {
         [void](Write-BRAVOServiceQuiescenceState `
             -Owner 'BRAVO_MAINTENANCE' `
             -Services $quiescenceServices `
-            -LogFile ([string]$LOG_FILE))
+            -LogFile ([string]$LOG_FILE) `
+            -StartTypeSnapshot $script:startTypeSnapshot)
         $script:quiescenceMarkerSuppressedForRestore = $false
         Write-Log -Message "Ownership-маркер повернуто в режим автостарту: модель консистентна після фази реставрації" -Level "INFO"
     } catch {
@@ -8756,16 +8973,7 @@ if ($BravoMaintenanceEnabled) {
         if ($serviceStatus -eq 'Running') {
             Write-Log -Message "Зупинка служби $BravoServiceName..." -Level "INFO"
             
-            # Завершення додаткових процесів
-            $processNames = @("Bis")
-            foreach ($procName in $processNames) {
-                $process = Get-Process -Name $procName -ErrorAction SilentlyContinue
-                if ($process) {
-                    Write-Log -Message "Завершення процесу $procName..." -Level "INFO"
-                    $process | Stop-Process -Force
-                    Start-Sleep -Seconds 1
-                }
-            }
+            Stop-BRAVOMaintenanceStrayProcess
             
             $serviceResult = Invoke-ServiceStateChange `
                 -Name $BravoServiceName `
@@ -8793,6 +9001,11 @@ if ($BravoMaintenanceEnabled) {
     }
 } elseif ($BravoServiceDisabledBySystem) {
     Write-Log -Message "Служба $BravoServiceName має тип запуску Disabled - компонент BRAVO пропущено" -Level "INFO"
+    if ($restoreOnDisabledBravo) {
+        # #321: службу не чіпаємо (уже зупинена, Disabled), але сторонній Bis
+        # може тримати файли моделі під час bravocmd — та сама логіка завершення.
+        Stop-BRAVOMaintenanceStrayProcess
+    }
 } else {
     Write-Log -Message "Службу $BravoServiceName не встановлено - компонент BRAVO пропущено" -Level "INFO"
 }
@@ -8853,6 +9066,9 @@ $restoreMainModelValid = $true
 # ownership-маркера в suppressed (fail-closed, критична помилка вже
 # зарапортована в місці скасування).
 $restoreAbortedBeforeDestructivePhase = $false
+# Текст INFO про реставрацію при Disabled (#321); заповнюється лише після
+# УСПІШНОЇ реставрації — збій реставрації визначає статус сам по собі.
+$restoreDisabledBravoInfo = $null
 # Базові лічильники етапу «Обробка trace і логів» — до розгалуження за
 # станом служби: підсумок етапу друкується в усіх гілках, зокрема й тоді,
 # коли BRAVO зупинити не вдалося. Тут лише ІНІЦІАЛІЗАЦІЯ (щоб під
@@ -8860,8 +9076,8 @@ $restoreAbortedBeforeDestructivePhase = $false
 # знімається безпосередньо перед фазою обробки логів — див. нижче.
 $logsCriticalBefore = $script:criticalErrorOccurred
 $logsWarningsBefore = $script:BRAVOWarningCount
-$bravoStatus = if ($BravoMaintenanceEnabled) { (Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
-if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
+$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { (Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
+if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -ne "Running") {
     # P0 TOCTOU barrier 1 (перед входом у restore sequence): $shouldRestore
     # обчислений задовго до цього місця (до Enter-BRAVOMaintenanceOperationLock,
     # тобто до OperationLockWaitMinutes очікування, і до зупинки служб вище)
@@ -8923,14 +9139,39 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 Remove-Item -LiteralPath $beforeHashPath -Force -ErrorAction Stop
                 Write-Log "Видалено попередній hash-файл перед повторним створенням архіву: $beforeHashPath" -Level "WARNING"
             }
+            # #297: жорстка перевірка ДО before-архіву. Служба, яку SCM
+            # (Delayed Start) чи recovery action підняв після зупинки, до
+            # утримання або попри його збій, зупиняється знову — архів іще
+            # не почато, тож це безпечно. Не вдалося утримати/зупинити —
+            # реставрація скасовується fail-closed (модель не торкнута).
+            $preArchiveQuiescence = Confirm-BRAVOServicesQuiesced `
+                -ServiceNames $script:quiescedServiceNames `
+                -Snapshot $script:startTypeSnapshot `
+                -StopRunning `
+                -StopTimeoutSeconds $ServiceStopTimeoutSeconds `
+                -PollIntervalSeconds $ServicePollIntervalSeconds
+            $preArchiveQuiescenceOk = $preArchiveQuiescence.Ok -and ($script:startModeSuppressionFailures.Count -eq 0)
+            if ($preArchiveQuiescence.StoppedAgain.Count -gt 0) {
+                Write-Log -Message "Перед архівацією повторно зупинено служби, запущені після зупинки Maintenance (SCM autostart/recovery/інший актор): $($preArchiveQuiescence.StoppedAgain -join ', ')" -Level "WARNING"
+            }
             $arcArgs = $arcCommonParams + @($beforeArchivePath, "$MODEL_PATH\*")
-            $exitCode = Invoke-CommandWithLog `
-                -Command $ARC_PATH `
-                -Arguments $arcArgs `
-                -Description "Архівація моделі перед реставрацією" `
-                -StandardInputText $script:ArchivePassword
-            
-            if ($exitCode -ne 0) {
+            if ($preArchiveQuiescenceOk) {
+                $exitCode = Invoke-CommandWithLog `
+                    -Command $ARC_PATH `
+                    -Arguments $arcArgs `
+                    -Description "Архівація моделі перед реставрацією" `
+                    -StandardInputText $script:ArchivePassword
+            } else {
+                $exitCode = $null
+            }
+
+            if (-not $preArchiveQuiescenceOk) {
+                $errorMsg = "Реставрацію скасовано ДО архівації: не гарантовано, що служби не працюють під час реставрації (#297): $(@($preArchiveQuiescence.Offenders + $script:startModeSuppressionFailures) -join '; '). Модель не торкнута."
+                Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+                Send-SlackAlert -Message $errorMsg -IsCritical
+                $script:criticalErrorOccurred = $true
+                $script:restoreArchiveFailed = $true
+            } elseif ($exitCode -ne 0) {
                 $exitDescription = Get-BRAVOSevenZipExitCodeDescription -ExitCode $exitCode
                 $errorMsg = "Архівація моделі перед реставрацією не вдалася! Код 7-Zip: $exitCode — $exitDescription. Реставрація скасована."
                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
@@ -8976,7 +9217,30 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     # реставрація НЕ починається (fail-closed: модель ще не
                     # торкнута, збереження поточного стану безпечне).
                     $quiescenceSuppressionReady = $true
-                    if ($script:quiescenceMarkerWrittenThisRun) {
+                    # #297: ОСТАННЯ перевірка безпосередньо перед bravocmd.
+                    # Утримання Disabled закриває вікно (запуск неможливий),
+                    # а тут перевіряємо, що воно ще діє й жодна служба не
+                    # піднялась за час багатохвилинного before-архіву. Служба
+                    # запущена => before-архів міг бути неконсистентним, а
+                    # bravocmd працював би під живою службою: НЕ повторюємо
+                    # зупинку мовчки, а скасовуємо fail-closed (модель
+                    # ще не торкнута). Залишкове вікно: від цієї перевірки
+                    # до старту bravocmd — лише для актора, що спершу змінить
+                    # start type (потрібні права адміністратора).
+                    $preRestoreQuiescence = Confirm-BRAVOServicesQuiesced `
+                        -ServiceNames $script:quiescedServiceNames `
+                        -Snapshot $script:startTypeSnapshot
+                    if (-not $preRestoreQuiescence.Ok) {
+                        $quiescenceSuppressionReady = $false
+                        $restoreAbortedBeforeDestructivePhase = $true
+                        $exitCode = $null
+                        $errorMsg = "Реставрацію скасовано перед bravocmd.exe (#297): під час before-архіву службу запущено або утримання від автостарту перестало діяти: $($preRestoreQuiescence.Offenders -join '; '). bravocmd.exe НЕ викликано; модель не торкнута; архів перед реставрацією збережено: $beforeArchivePath"
+                        Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+                        Send-SlackAlert -Message $errorMsg -IsCritical
+                        $script:criticalErrorOccurred = $true
+                        $script:restoreArchiveFailed = $true
+                    }
+                    if ($quiescenceSuppressionReady -and $script:quiescenceMarkerWrittenThisRun) {
                         try {
                             [void](Set-BRAVOServiceQuiescenceRestartSuppressed)
                             $script:quiescenceMarkerSuppressedForRestore = $true
@@ -9075,6 +9339,15 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             ""
                         }
                         Write-Log -Message "Модель успішно відреставрована$removedByRepairSuffix" -Level "SUCCESS"
+                        if ($restoreOnDisabledBravo) {
+                            # #321: INFO, не WARNING — оператор сам передав
+                            # -ForceRestore і знає, що службу вимкнено; служба
+                            # лишається зупиненою й Disabled (її не стартуємо:
+                            # serviceWasRunning.Bravo=false, finally нічого не
+                            # запускає й не змінює StartupType).
+                            $restoreDisabledBravoInfo = "Реставрацію виконано; служба $BravoServiceName має тип Disabled — не запускалась"
+                            Write-Log -Message $restoreDisabledBravoInfo -Level "INFO"
+                        }
 
                         # Реставрація успішна, критичних змін немає — модель
                         # консистентна; повертаємо watchdog право автостарту
@@ -9213,6 +9486,9 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 "| Critical=$restoreCriticalCount | Rollback=$restoreRollbackStatus | MainModel=$mainModelStatusText"
             )
         }
+        if ($null -ne $restoreDisabledBravoInfo) {
+            $restoreStepDetails += " | $restoreDisabledBravoInfo"
+        }
         Write-BRAVOMaintenanceStep `
             -Name 'Реставрація моделі' `
             -Status (Get-BRAVOMaintenanceStepStatus `
@@ -9265,7 +9541,10 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
         $script:criticalErrorOccurred = $true
     }
 }
-elseif ($BravoMaintenanceEnabled) {
+elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {
+    # #321: Disabled-служба, що фактично працює (тип запуску змінили, не
+    # зупинивши її), реставрацію не отримує — модель під живим процесом
+    # не торкаємо; fail-closed, як і для ввімкненої служби.
     $errorMsg = "Сервіс $($BravoServiceName) все ще працює. Операції з файлами пропущено."
     Write-Log -Message $errorMsg -Level "ERROR"
     Send-SlackAlert -Message $errorMsg -IsCritical
@@ -9444,6 +9723,34 @@ if (-not $script:modelIntegrityEstablished) {
     Send-SlackAlert -Message $errorMsg -IsCritical
     $script:criticalErrorOccurred = $true
     $serviceRestartFailed = $true
+}
+
+# #297: повернути ТОЧНІ початкові типи запуску (включно з Delayed Start) —
+# ПЕРЕД стартом служб (Disabled блокує Start-Service). Лише коли цілісність
+# моделі встановлена: інакше служби свідомо лишаються Disabled разом із
+# suppressed-маркером (інакше SCM підняв би їх на пошкодженій моделі при
+# наступному boot) — початкові типи лишаються в маркері для ручного
+# відновлення. Збій відновлення = $serviceRestartFailed (маркер лишається,
+# Health-watchdog / наступний прогін повторить).
+if ($script:modelIntegrityEstablished -and $script:startTypeSnapshot.Count -gt 0) {
+    $startModeRestore = Restore-BRAVOServiceStartTypeSnapshot -Snapshot $script:startTypeSnapshot
+    if (@($startModeRestore.Failed).Count -gt 0) {
+        $errorMsg = "Не вдалося повернути початкові типи запуску служб після реставрації (#297): $(@($startModeRestore.Failed) -join '; '). Службу, яку не вимикав оператор, поверніть вручну: sc config <служба> start= auto|delayed-auto|demand"
+        Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+        Send-SlackAlert -Message $errorMsg -IsCritical
+        $script:criticalErrorOccurred = $true
+        $serviceRestartFailed = $true
+        $script:startModeRestoreIncomplete = $true
+    } else {
+        Write-Log -Message "Початкові типи запуску служб повернуто (#297): $(@($startModeRestore.Restored) -join ', ')" -Level "INFO"
+    }
+    if (@($startModeRestore.Foreign).Count -gt 0) {
+        Write-Log -Message "Тип запуску не повернуто — його змінив оператор під час прогону: $(@($startModeRestore.Foreign) -join '; ')" -Level "WARNING"
+    }
+} elseif ($script:startTypeSnapshot.Count -gt 0) {
+    $startModeHeldMessage = "Служби лишаються Disabled (утримання від автостарту, #297) до ручного відновлення моделі. Початкові типи запуску: $(@($script:startTypeSnapshot | ForEach-Object { '{0}={1}' -f $_.Name, $_.StartMode }) -join ', ') — після відновлення: sc config <служба> start= auto|delayed-auto|demand"
+    Write-Log -Message $startModeHeldMessage -Level "WARNING"
+    Send-SlackAlert -Message $startModeHeldMessage -IsCritical
 }
 
 # 1. Запуск служби BRAVO
