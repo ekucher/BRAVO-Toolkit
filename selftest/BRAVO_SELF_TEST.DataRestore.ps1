@@ -3918,6 +3918,9 @@ function Get-Service {
 function Start-Service {
     param([string]$Name, $WarningAction, $ErrorAction, $ErrorVariable)
     Add-ProbeEvent "START $Name"
+    # #333: SCM не стартує службу з типом Disabled і службу з інжектованою відмовою.
+    if ($script:ProbeStartModes.ContainsKey($Name) -and [string]$script:ProbeStartModes[$Name] -eq 'Disabled') { Add-ProbeEvent "START-BLOCKED-DISABLED $Name"; return }
+    if (@($script:ProbeStartFailures) -contains $Name) { return }
     $script:ProbeServices[$Name] = 'Running'
 }
 function Stop-Service {
@@ -3925,6 +3928,29 @@ function Stop-Service {
     Add-ProbeEvent "STOP $Name"
     $script:ProbeServices[$Name] = 'Stopped'
 }
+# #333: шви типу запуску (реєстр/sc.exe) і живості власника — in-memory; реальні
+# служби, реєстр і маркер ProgramData НІКОЛИ не чіпаються.
+function Get-BRAVOServiceRegistryStartMode {
+    param([string]$ServiceName)
+    if ($script:ProbeStartModes.ContainsKey($ServiceName)) { return [string]$script:ProbeStartModes[$ServiceName] }
+    return $null
+}
+function Set-BRAVOServiceStartMode {
+    param([string]$ServiceName, [string]$StartMode)
+    Add-ProbeEvent "SETMODE $ServiceName=$StartMode"
+    $script:ProbeStartModes[$ServiceName] = $StartMode
+    return $true
+}
+function Test-BRAVOProcessAlive { param([int]$ProcessId, [string]$ProcessStartTime) return $false }
+function Get-BRAVOServiceQuiescenceStatePath { return $script:ProbeStatePath }
+function Get-ProbeModesText {
+    return ((@($script:ProbeStartModes.Keys) | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $script:ProbeStartModes[$_] }) -join ';')
+}
+# Типові (не-SM) сценарії: утримання не активне. SM-сценарії підміняють ці стаби
+# дослівними функціями BRAVO.System (див. probe).
+function Repair-BRAVOOrphanedServiceStartTypes { param([string[]]$AllowedServiceNames) return [pscustomobject]@{ Status = 'NoMarker'; Owner = $null; Snapshot = @(); Restored = @(); Failed = @(); Foreign = @() } }
+function Get-BRAVOForeignServiceQuiescenceContext { return [pscustomobject]@{ Present = $false; OwnerAlive = $false; Owner = $null; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() } }
+function New-BRAVOServiceStartTypeSnapshot { param([string[]]$ServiceNames) return @() }
 function Get-BRAVOWmiInstance { param($ClassName, $Filter) return [pscustomobject]@{ StartMode = 'Auto' } }
 function Get-Process { param($Name, $Id, $ErrorAction) }
 function Stop-Process { param([switch]$Force) Add-ProbeEvent 'STOP-PROCESS' }
@@ -4002,6 +4028,7 @@ function Set-BRAVOServiceQuiescenceRestartSuppressed { param([bool]$Suppressed) 
 function Invoke-BRAVODataRestoreMoveAside {
     param($LiveDirectory, $PrerestoreDirectory)
     Add-ProbeEvent 'MOVE-ASIDE'
+    Add-ProbeEvent ('MODES-AT-MOVE-ASIDE ' + (Get-ProbeModesText))
     if ($script:ProbeScenario -eq 'InPlaceMoveAsideFails') {
         return [pscustomobject]@{ Success = $false; Performed = $false; Error = 'self-test: імітована відмова move-aside' }
     }
@@ -4016,13 +4043,24 @@ function Copy-BRAVODataRestoreDirectoryAcl { param($SourceDirectory, $Destinatio
 function Set-BRAVODataRestoreCreatedDirectoryAcl { param($Path) }
 function Invoke-BRAVOSevenZipExtraction {
     Add-ProbeEvent 'EXTRACT'
-    if ($script:ProbeScenario -eq 'InPlaceThrowInExtraction') { throw 'self-test: імітований збій розпакування' }
+    if ($script:ProbeScenario -eq 'InPlaceThrowInExtraction' -or $script:ProbeThrowInExtraction) { throw 'self-test: імітований збій розпакування' }
     return [pscustomobject]@{ Success = $true; Description = '' }
 }
 function Test-BRAVODataRestoreExtractionResult { param($TargetDirectory, $Inventory) return [pscustomobject]@{ Success = $true; FileCount = 1; ByteCount = 1; Problems = @() } }
 function Invoke-BRAVODataRestorePostHealth { Add-ProbeEvent 'HEALTH'; return 0 }
 function Get-HostInformation { return [pscustomobject]@{ MachineName = 'self-test-host'; LocalIP = '192.0.2.10'; PublicIP = 'вимкнено' } }
-function Wait-BRAVOManualExit { param([switch]$NoPause) Add-ProbeEvent 'MANUAL-EXIT' }
+function Wait-BRAVOManualExit {
+    param([switch]$NoPause)
+    Add-ProbeEvent ('FINAL-MODES ' + (Get-ProbeModesText))
+    if (Test-Path -LiteralPath $script:ProbeStatePath -PathType Leaf) {
+        $probeFinalMarker = $null
+        try { $probeFinalMarker = [IO.File]::ReadAllText($script:ProbeStatePath) | ConvertFrom-Json } catch { }
+        if ($null -eq $probeFinalMarker) { Add-ProbeEvent 'FINAL-MARKER invalid' } else {
+            Add-ProbeEvent ('FINAL-MARKER present suppressed={0} snapshot={1}' -f $probeFinalMarker.restartSuppressed, @($probeFinalMarker.startTypeSnapshot).Count)
+        }
+    } else { Add-ProbeEvent 'FINAL-MARKER absent' }
+    Add-ProbeEvent 'MANUAL-EXIT'
+}
 '@
             # Тіло транспортного стабу; param-блок (разом з атрибутами) проба
             # бере ДОСЛІВНО з канонічної Send-BRAVONotification.
@@ -4164,11 +4202,84 @@ try {
     } else {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
     }
+    # #333: сценарії типів запуску (SM*). Services/Modes — початковий стан;
+    # Marker — попередньо записаний ЧУЖИЙ маркер (немає ключа = маркера немає;
+    # 'garbage' = зіпсований файл); Intent/Snapshot/Suppressed — його вміст.
+    $probeAllRunning = @{ BRAVO = 'Running'; exchangAPI = 'Running'; BravoWeb = 'Running' }
+    $probeOriginalModes = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic'; BravoWeb = 'Manual' }
+    $probeAllStopped = @{ BRAVO = 'Stopped'; exchangAPI = 'Stopped'; BravoWeb = 'Stopped' }
+    $probeAllDisabled = @{ BRAVO = 'Disabled'; exchangAPI = 'Disabled'; BravoWeb = 'Disabled' }
+    $probeStartModeScenarios = @{
+        SMNormal = @{ Services = $probeAllRunning; Modes = $probeOriginalModes }
+        SMManualStopped = @{ Services = @{ BRAVO = 'Running'; exchangAPI = 'Stopped'; BravoWeb = 'Running' }; Modes = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Manual'; BravoWeb = 'Automatic' } }
+        SMDelayedAutomaticStopped = @{ Services = @{ BRAVO = 'Stopped'; exchangAPI = 'Running'; BravoWeb = 'Running' }; Modes = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic'; BravoWeb = 'Manual' } }
+        SMOperatorDisabled = @{ Services = @{ BRAVO = 'Running'; exchangAPI = 'Stopped'; BravoWeb = 'Running' }; Modes = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Disabled'; BravoWeb = 'Manual' } }
+        SMForeignSnapshotHeld = @{ Services = $probeAllStopped; Modes = $probeAllDisabled
+            Marker = 'foreign'; Suppressed = $true; Intent = @('BRAVO', 'exchangAPI'); Snapshot = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic' } }
+        SMForeignSnapshotRepairable = @{ Services = $probeAllStopped; Modes = $probeAllDisabled
+            Marker = 'foreign'; Suppressed = $false; Intent = @('BRAVO', 'exchangAPI'); Snapshot = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic' } }
+        SMMissingSnapshot = @{ Services = @{ BRAVO = 'Stopped'; exchangAPI = 'Running'; BravoWeb = 'Running' }; Modes = @{ BRAVO = 'Automatic'; exchangAPI = 'Automatic'; BravoWeb = 'Manual' }
+            Marker = 'foreign'; Suppressed = $false; Intent = @('BRAVO'); Snapshot = @{} }
+        SMMalformedMarker = @{ Services = $probeAllRunning; Modes = $probeOriginalModes; Marker = 'garbage' }
+        SMFailureDuringRestore = @{ Services = $probeAllRunning; Modes = $probeOriginalModes; Throw = $true }
+        SMFailureDuringServiceRestart = @{ Services = $probeAllRunning; Modes = $probeOriginalModes; StartFailures = @('BRAVO') }
+    }
+    $probeStartModeScenario = $probeStartModeScenarios[$Scenario]
+    $probeStatePath = Join-Path (Join-Path $ProbeRoot 'state') 'BRAVO_SERVICE_QUIESCENCE.json'
+    $probeRealSystem = ''
+    $probeStartModesLiteral = '@{}'
+    $probeStartFailuresLiteral = '@()'
+    $probeThrowLiteral = '$false'
+    if ($null -ne $probeStartModeScenario) {
+        $probeServiceTable = '@{ ' + ((@($probeStartModeScenario.Services.Keys) | ForEach-Object { "'{0}' = '{1}'" -f $_, $probeStartModeScenario.Services[$_] }) -join '; ') + ' }'
+        $probeStartModesLiteral = '@{ ' + ((@($probeStartModeScenario.Modes.Keys) | ForEach-Object { "'{0}' = '{1}'" -f $_, $probeStartModeScenario.Modes[$_] }) -join '; ') + ' }'
+        if ($probeStartModeScenario.ContainsKey('StartFailures')) {
+            $probeStartFailuresLiteral = '@(' + ((@($probeStartModeScenario.StartFailures) | ForEach-Object { "'$_'" }) -join ',') + ')'
+        }
+        if ($probeStartModeScenario.ContainsKey('Throw')) { $probeThrowLiteral = '$true' }
+        # Дослівні функції BRAVO.System (канонічний контракт утримання) замість
+        # стабів: тест виконує РЕАЛЬНІ Write/Read/Clear маркера, знімок,
+        # Suspend/Restore/Repair/Confirm — затінені лише шви реєстру/sc/pid.
+        $probeSystemAst = [Management.Automation.Language.Parser]::ParseInput(
+            [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8), [ref]$null, [ref]$null)
+        $probeSystemWanted = @(
+            'Write-BRAVOStateTemporaryText', 'Write-BRAVOStateFileAtomic', 'Get-BRAVOCurrentProcessStartTimeText',
+            'Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess', 'Write-BRAVOServiceQuiescenceState',
+            'Read-BRAVOServiceQuiescenceState', 'Clear-BRAVOServiceQuiescenceState', 'Set-BRAVOServiceQuiescenceRestartSuppressed',
+            'New-BRAVOServiceStartTypeSnapshot', 'Suspend-BRAVOServiceAutostart', 'Restore-BRAVOServiceStartTypeSnapshot',
+            'Repair-BRAVOOrphanedServiceStartTypes', 'Confirm-BRAVOServicesQuiesced', 'Get-BRAVOForeignServiceQuiescenceContext')
+        $probeSystemFunctions = @($probeSystemAst.EndBlock.Statements | Where-Object {
+                $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $probeSystemWanted -contains $_.Name })
+        if ($probeSystemFunctions.Count -ne $probeSystemWanted.Count) { throw "BRAVO.System: знайдено $($probeSystemFunctions.Count) із $($probeSystemWanted.Count) потрібних функцій" }
+        $probeRealSystem = ($probeSystemFunctions | ForEach-Object { $_.Extent.Text }) -join "`n`n"
+        if ($probeStartModeScenario.ContainsKey('Marker')) {
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $probeStatePath))
+            if ($probeStartModeScenario.Marker -eq 'garbage') {
+                [IO.File]::WriteAllText($probeStatePath, '{ not json', (New-Object Text.UTF8Encoding($false)))
+            } else {
+                $probeMarker = [ordered]@{
+                    schemaVersion = 1; owner = 'BRAVO_MAINTENANCE'; hostname = [Environment]::MachineName; pid = 999999
+                    processStartTime = 'self-test'; createdAt = (Get-Date).ToString('o'); logFile = 'self-test.log'
+                    restartSuppressed = [bool]$probeStartModeScenario.Suppressed
+                    services = @($probeStartModeScenario.Intent | ForEach-Object { [ordered]@{ Name = $_; RestartIntent = $true } })
+                }
+                # Маркер старішої версії (сценарій MissingSnapshot) не має поля знімка взагалі.
+                if ($probeStartModeScenario.Snapshot.Count -gt 0) {
+                    $probeMarker['startTypeSnapshot'] = @($probeStartModeScenario.Snapshot.Keys | ForEach-Object { [ordered]@{ Name = $_; StartMode = $probeStartModeScenario.Snapshot[$_] } })
+                }
+                [IO.File]::WriteAllText($probeStatePath, ($probeMarker | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
+            }
+        }
+    }
     $probeScenarioSeed = @(
         ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
         ('$script:ProbeScenario = ''{0}''' -f $Scenario.Replace("'", "''")),
         ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
-        ('$script:ProbeServices = {0}' -f $probeServiceTable)
+        ('$script:ProbeServices = {0}' -f $probeServiceTable),
+        ('$script:ProbeStartModes = {0}' -f $probeStartModesLiteral),
+        ('$script:ProbeStartFailures = {0}' -f $probeStartFailuresLiteral),
+        ('$script:ProbeThrowInExtraction = {0}' -f $probeThrowLiteral),
+        ('$script:ProbeStatePath = ''{0}''' -f $probeStatePath.Replace("'", "''"))
     ) -join "`n"
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
@@ -4176,6 +4287,7 @@ try {
         'Set-StrictMode -Version 2.0',
         ($probeFunctionTexts -join "`n`n"),
         $probeStubs,
+        $probeRealSystem,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
         ($probeStateTexts -join "`n"),
@@ -4233,7 +4345,7 @@ try {
             [IO.File]::WriteAllText($dataRestoreOrchestrationProbePath, $dataRestoreOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $dataRestoreOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $dataRestoreOrchestrationResults = @{}
-            foreach ($dataRestoreOrchestrationScenario in @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace')) {
+            foreach ($dataRestoreOrchestrationScenario in @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace', 'SMNormal', 'SMManualStopped', 'SMDelayedAutomaticStopped', 'SMOperatorDisabled', 'SMForeignSnapshotHeld', 'SMForeignSnapshotRepairable', 'SMMissingSnapshot', 'SMMalformedMarker', 'SMFailureDuringRestore', 'SMFailureDuringServiceRestart')) {
                 $dataRestoreOrchestrationScenarioRoot = Join-Path $dataRestoreOrchestrationRoot $dataRestoreOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($dataRestoreOrchestrationScenarioRoot)
                 # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
@@ -4436,6 +4548,156 @@ try {
                 ) `
                 -Name "DataRestore/OrchestrationOutOfPlaceLeavesServicesUntouched" `
                 -Failure "OutOfPlace не повинен знімати стан, зупиняти чи запускати служби або писати маркер quiescence — лише розпакувати компонент і завершитися кодом 0 без SUCCESS-сповіщення за errors_only; проба: $($dataRestoreOutOfPlace | ConvertTo-Json -Compress -Depth 4)"
+
+            # ----------------------------------------------------------------
+            # #333: тимчасове утримання типу запуску служб на час restore — той
+            # самий контракт, що Maintenance (#297/#329): знімок -> тимчасовий
+            # Disabled -> restore -> типи повертаються у finally ПЕРЕД стартом
+            # служб. Реальні Write/Read/Clear маркера, знімок і Suspend/Restore/
+            # Repair — дослівні функції BRAVO.System; затінені лише шви реєстру/
+            # sc.exe/живості pid (стани й маркер — у каталозі проби).
+            # ----------------------------------------------------------------
+            $smEvents = {
+                param($Result)
+                if ($null -ne $Result.PSObject.Properties['ProbeError']) { return @() }
+                return @($Result.Events | ForEach-Object { [string]$_ })
+            }
+            $smModes = {
+                param([object[]]$Events, [string]$Prefix)
+                $table = @{}
+                $line = @($Events | Where-Object { $_ -like "$Prefix *" }) | Select-Object -First 1
+                if ($null -eq $line) { return $table }
+                foreach ($pair in (([string]$line).Substring($Prefix.Length + 1) -split ';')) {
+                    if ($pair -match '^(?<n>[^=]+)=(?<m>.+)$') { $table[$Matches['n']] = $Matches['m'] }
+                }
+                return $table
+            }
+            $smModesEqual = {
+                param($Actual, [hashtable]$Expected)
+                if (@($Actual.Keys).Count -ne $Expected.Count) { return $false }
+                foreach ($key in $Expected.Keys) { if (-not $Actual.ContainsKey($key) -or [string]$Actual[$key] -ne [string]$Expected[$key]) { return $false } }
+                return $true
+            }
+            $smIndex = {
+                param([object[]]$Events, [string]$Pattern, [switch]$Last)
+                $found = -1
+                for ($i = 0; $i -lt $Events.Count; $i++) { if ([string]$Events[$i] -match $Pattern) { $found = $i; if (-not $Last) { break } } }
+                return $found
+            }
+            $smOriginal = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic'; BravoWeb = 'Manual' }
+            $smAllDisabled = @{ BRAVO = 'Disabled'; exchangAPI = 'Disabled'; BravoWeb = 'Disabled' }
+            # Спільна перевірка успішного прогону: вікно утримання (Disabled у момент move-aside),
+            # точні типи після, повернення типів ПЕРЕД першим стартом, маркер прибрано, код 0.
+            $smSuccessCheck = {
+                param($Result, [hashtable]$ExpectedFinal, [hashtable]$ExpectedDuring, [string[]]$ExpectedStarts, [string[]]$ForbiddenStarts, [int]$ExpectedExitCode = 0)
+                $ev = @(& $smEvents $Result)
+                $lastSet = & $smIndex $ev '^SETMODE ' -Last
+                $firstStart = & $smIndex $ev '^START '
+                $starts = @($ev | Where-Object { $_ -like 'START *' -and $_ -notlike 'START-*' } | ForEach-Object { ([string]$_).Substring(6) })
+                return (
+                    $null -eq $Result.PSObject.Properties['ProbeError'] -and
+                    $Result.ExitCode -eq $ExpectedExitCode -and
+                    (& $smModesEqual (& $smModes $ev 'MODES-AT-MOVE-ASIDE') $ExpectedDuring) -and
+                    (& $smModesEqual (& $smModes $ev 'FINAL-MODES') $ExpectedFinal) -and
+                    @($ev | Where-Object { $_ -like 'START-BLOCKED-DISABLED *' }).Count -eq 0 -and
+                    (($starts | Sort-Object) -join ',') -ceq (($ExpectedStarts | Sort-Object) -join ',') -and
+                    @($ForbiddenStarts | Where-Object { $starts -contains $_ }).Count -eq 0 -and
+                    ($firstStart -lt 0 -or $lastSet -lt $firstStart) -and
+                    @($ev | Where-Object { $_ -ceq 'FINAL-MARKER absent' }).Count -eq 1
+                )
+            }
+
+            # (SM1) Звичайний прогін: у вікні всі Disabled, після — точні типи
+            # (Delayed/Automatic/Manual), старт усіх, маркер прибрано, код 0.
+            Test-BRAVOCondition `
+                -Condition (& $smSuccessCheck $dataRestoreOrchestrationResults['SMNormal'] $smOriginal $smAllDisabled @('BRAVO', 'exchangAPI', 'BravoWeb') @()) `
+                -Name "DataRestore/StartModeHeldAndRestoredNormalService" `
+                -Failure "DataRestore InPlace має тимчасово переводити керовані служби в Disabled, у finally повертати точні типи (AutomaticDelayed/Automatic/Manual) ПЕРЕД стартом і прибирати маркер; проба: $($dataRestoreOrchestrationResults['SMNormal'] | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM2) Ручна служба, що була зупинена: утримується, тип Manual повертається, службу не стартує.
+            Test-BRAVOCondition `
+                -Condition (& $smSuccessCheck $dataRestoreOrchestrationResults['SMManualStopped'] @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Manual'; BravoWeb = 'Automatic' } $smAllDisabled @('BRAVO', 'BravoWeb') @('exchangAPI')) `
+                -Name "DataRestore/StartModeManualStoppedStaysManualAndStopped" `
+                -Failure "зупинена служба з типом Manual має пережити restore з типом Manual і не стартувати; проба: $($dataRestoreOrchestrationResults['SMManualStopped'] | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM3) Delayed automatic, але зупинена (SCM міг її підняти посеред restore): утримується, тип повертається, не стартує.
+            Test-BRAVOCondition `
+                -Condition (& $smSuccessCheck $dataRestoreOrchestrationResults['SMDelayedAutomaticStopped'] $smOriginal $smAllDisabled @('exchangAPI', 'BravoWeb') @('BRAVO')) `
+                -Name "DataRestore/StartModeDelayedAutomaticStoppedHeldAndRestored" `
+                -Failure "зупинена служба з AutomaticDelayed має бути утримана Disabled на час restore й повернена в AutomaticDelayed без старту; проба: $($dataRestoreOrchestrationResults['SMDelayedAutomaticStopped'] | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM4) Оператор вимкнув службу ДО прогону: лишається Disabled і зупиненою,
+            # жодного sc config для неї, не в маркері, не стартується.
+            $smOperator = $dataRestoreOrchestrationResults['SMOperatorDisabled']
+            $smOperatorEvents = @(& $smEvents $smOperator)
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $smSuccessCheck $smOperator @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Disabled'; BravoWeb = 'Manual' } @{ BRAVO = 'Disabled'; exchangAPI = 'Disabled'; BravoWeb = 'Disabled' } @('BRAVO', 'BravoWeb') @('exchangAPI')) -and
+                    @($smOperatorEvents | Where-Object { $_ -like 'SETMODE exchangAPI=*' }).Count -eq 0 -and
+                    @($smOperatorEvents | Where-Object { $_ -match '^(START|STOP) exchangAPI$' }).Count -eq 0
+                ) `
+                -Name "DataRestore/StartModeOperatorDisabledStaysDisabled" `
+                -Failure "служба, вимкнена оператором ДО прогону, лишається Disabled і зупиненою (ніколи не Automatic, жодного sc config і старту); проба: $($smOperator | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM5) Аварійний Maintenance: служби тимчасово Disabled, чужий знімок у маркері
+            # (а) restartSuppressed (загинув у bravocmd) і (б) без suppression. В обох випадках
+            # DataRestore повертає ОРИГІНАЛЬНІ типи (не Disabled), запускає служби з наміром
+            # маркера, а маркер не лишається назавжди.
+            $smForeignExpected = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic'; BravoWeb = 'Disabled' }
+            $smHeld = $dataRestoreOrchestrationResults['SMForeignSnapshotHeld']
+            Test-BRAVOCondition `
+                -Condition (& $smSuccessCheck $smHeld $smForeignExpected $smAllDisabled @('BRAVO', 'exchangAPI') @('BravoWeb') 10) `
+                -Name "DataRestore/StartModeForeignSuppressedSnapshotMergedAndRestored" `
+                -Failure "чужий знімок restartSuppressed-маркера має бути злитий і повернути ОРИГІНАЛЬНІ типи BRAVO/exchangAPI (служби запущено, маркер прибрано, код 0); проба: $($smHeld | ConvertTo-Json -Compress -Depth 4)"
+            $smRepairable = $dataRestoreOrchestrationResults['SMForeignSnapshotRepairable']
+            Test-BRAVOCondition `
+                -Condition (& $smSuccessCheck $smRepairable $smForeignExpected $smAllDisabled @('BRAVO', 'exchangAPI') @('BravoWeb') 10) `
+                -Name "DataRestore/StartModeForeignRepairableSnapshotRecoveredBeforeRestore" `
+                -Failure "знімок осиротілого (не suppressed) маркера має бути відновлений самовідновленням ДО знімка служб; служби з наміром запущено, маркер прибрано, код 10; проба: $($smRepairable | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM6) Маркер без знімка (старша версія): типи не чіпаються, служба з наміром стартує, маркер прибрано.
+            Test-BRAVOCondition `
+                -Condition (& $smSuccessCheck $dataRestoreOrchestrationResults['SMMissingSnapshot'] @{ BRAVO = 'Automatic'; exchangAPI = 'Automatic'; BravoWeb = 'Manual' } $smAllDisabled @('BRAVO', 'exchangAPI', 'BravoWeb') @()) `
+                -Name "DataRestore/StartModeMissingSnapshotKeepsModesAndHonoursIntent" `
+                -Failure "чужий маркер без знімка: типи без змін, службу з RestartIntent запущено, маркер прибрано; проба: $($dataRestoreOrchestrationResults['SMMissingSnapshot'] | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM7) Зіпсований маркер: ігнорується, перезаписується власним і прибирається.
+            Test-BRAVOCondition `
+                -Condition (& $smSuccessCheck $dataRestoreOrchestrationResults['SMMalformedMarker'] $smOriginal $smAllDisabled @('BRAVO', 'exchangAPI', 'BravoWeb') @()) `
+                -Name "DataRestore/StartModeMalformedMarkerReplacedAndCleared" `
+                -Failure "зіпсований маркер не має блокувати утримання: його замінює власний маркер, який прибирається; типи повертаються; проба: $($dataRestoreOrchestrationResults['SMMalformedMarker'] | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM8) Збій під час restore: rollback завершено, типи повернуто, служби
+            # запущено, маркер прибрано; код 43.
+            $smRestoreFail = $dataRestoreOrchestrationResults['SMFailureDuringRestore']
+            $smRestoreFailEvents = @(& $smEvents $smRestoreFail)
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $smRestoreFail.PSObject.Properties['ProbeError'] -and
+                    $smRestoreFail.ExitCode -eq 43 -and
+                    (& $smModesEqual (& $smModes $smRestoreFailEvents 'MODES-AT-MOVE-ASIDE') $smAllDisabled) -and
+                    (& $smModesEqual (& $smModes $smRestoreFailEvents 'FINAL-MODES') $smOriginal) -and
+                    @($smRestoreFailEvents | Where-Object { $_ -like 'START-BLOCKED-DISABLED *' }).Count -eq 0 -and
+                    @($smRestoreFailEvents | Where-Object { $_ -match '^START (BRAVO|exchangAPI|BravoWeb)$' }).Count -eq 3 -and
+                    @($smRestoreFailEvents | Where-Object { $_ -ceq 'FINAL-MARKER absent' }).Count -eq 1
+                ) `
+                -Name "DataRestore/StartModeRestoredWhenRestoreFails" `
+                -Failure "збій restore (виняток у розпакуванні, rollback завершено): finally має повернути точні типи й запустити служби, маркер прибрано, код 43; проба: $($smRestoreFail | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM9) Збій старту служби: типи повернуто ДО спроби старту, код 43,
+            # маркер лишається suppressed (Health алертить), а не зникає й не стартує сам.
+            $smStartFail = $dataRestoreOrchestrationResults['SMFailureDuringServiceRestart']
+            $smStartFailEvents = @(& $smEvents $smStartFail)
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $smStartFail.PSObject.Properties['ProbeError'] -and
+                    $smStartFail.ExitCode -eq 43 -and
+                    (& $smModesEqual (& $smModes $smStartFailEvents 'FINAL-MODES') $smOriginal) -and
+                    (& $smIndex $smStartFailEvents '^SETMODE ' -Last) -lt (& $smIndex $smStartFailEvents '^START ') -and
+                    @($smStartFailEvents | Where-Object { $_ -ceq 'FINAL-MARKER present suppressed=True snapshot=3' }).Count -eq 1
+                ) `
+                -Name "DataRestore/StartModeRestoredWhenServiceStartFails" `
+                -Failure "збій старту служби: типи запуску вже повернуто (до старту), код 43, маркер лишається suppressed зі знімком; проба: $($smStartFail | ConvertTo-Json -Compress -Depth 4)"
         } finally {
             if (Test-Path -LiteralPath $dataRestoreOrchestrationRoot -PathType Container) {
                 Remove-Item -LiteralPath $dataRestoreOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -331,6 +331,12 @@ $script:dataRestoreServicesStopped = $false
 # (BRAVO_SERVICE_QUIESCENCE.json): чистити/позначати suppressed можна лише
 # ВЛАСНИЙ маркер — чужий осиротілий опрацьовує Health-watchdog.
 $script:dataRestoreQuiescenceMarkerWritten = $false
+# #333: тимчасове утримання типу запуску керованих служб на час restore
+# (той самий контракт, що Maintenance після #329/#297, — примітиви
+# BRAVO.System). Знімок ТОЧНИХ початкових типів (разом із чужим знімком
+# осиротілого маркера), набір дозволених імен і ознака «утримання діє».
+$script:dataRestoreStartTypeSnapshot = @()
+$script:dataRestoreAllowedServiceNames = @()
 # true, якщо відкат (поточного компонента АБО раніше завершених) не
 # гарантовано довершився — тоді live filesystem у невизначеному стані, і
 # служби НЕ можна запускати поверх нього (див. фінальний finally нижче).
@@ -1580,7 +1586,16 @@ function Get-BRAVODataRestoreServiceSnapshot {
     # або системно відключена (Disabled) служба не керується взагалі.
     # BravoWeb резолвиться за списком кандидатів (Name або DisplayName) —
     # документований fallback-шлях самого Maintenance.
-    param([Parameter(Mandatory = $true)][hashtable]$ServicesSettings)
+    # #333: -TemporarilyDisabledServiceNames — служби, чий Disabled є наслідком
+    # аварійного прогону, що загинув у вікні утримання (чужий знімок типів
+    # запуску): вони НЕ «вимкнені оператором», тож керуються (Managed).
+    # -RestartIntentServiceNames — служби, які аварійний власник зупинив із
+    # наміром запустити (RestartIntent маркера): ShouldRestartAfterRestore.
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$ServicesSettings,
+        [string[]]$TemporarilyDisabledServiceNames = @(),
+        [string[]]$RestartIntentServiceNames = @()
+    )
 
     $resolveServiceState = {
         param([string]$ServiceName)
@@ -1601,7 +1616,7 @@ function Get-BRAVODataRestoreServiceSnapshot {
         }
         [pscustomobject]@{
             Exists = ($null -ne $service)
-            Disabled = ($startMode -ieq 'Disabled')
+            Disabled = ($startMode -ieq 'Disabled' -and @($TemporarilyDisabledServiceNames | Where-Object { $_ -ieq $ServiceName }).Count -eq 0)
             Running = ($null -ne $service -and [string]$service.Status -eq 'Running')
             Status = if ($null -ne $service) { [string]$service.Status } else { $null }
         }
@@ -1656,6 +1671,12 @@ function Get-BRAVODataRestoreServiceSnapshot {
         #   замовчуванням стан лишається Stopped, а не вгадування).
         # StartupType служби ця політика НІКОЛИ не змінює.
         $shouldRestartAfterRestore = ($stateStatus -eq 'Running' -or $stateStatus -eq 'StartPending')
+        # #333: намір аварійного власника (RestartIntent чужого маркера) —
+        # служба була зупинена ним, а не оператором; після restore її запускаємо.
+        if (-not $shouldRestartAfterRestore -and -not [string]::IsNullOrWhiteSpace([string]$definition.Name) -and
+            @($RestartIntentServiceNames | Where-Object { $_ -ieq [string]$definition.Name }).Count -gt 0) {
+            $shouldRestartAfterRestore = $true
+        }
         $entries += [pscustomobject]@{
             Key = [string]$definition.Key
             Name = [string]$definition.Name
@@ -1667,6 +1688,28 @@ function Get-BRAVODataRestoreServiceSnapshot {
         }
     }
     return @($entries)
+}
+
+function Get-BRAVODataRestoreAllowedServiceNames {
+    # #333: канонічний набір імен керованих служб (BRAVO, exchangAPI, BravoWeb
+    # — кандидати за Name/DisplayName і resolved ім'я) для
+    # Repair-/Restore-BRAVOServiceStartType*: службу поза набором, записану
+    # у знімку маркера (стороннє редагування), start type не змінюється.
+    param([Parameter(Mandatory = $true)][hashtable]$ServicesSettings)
+
+    $names = @([string]$ServicesSettings.BravoName, [string]$ServicesSettings.ExchangeApiName)
+    $bravoWebEnabled = $true
+    if ($ServicesSettings -is [System.Collections.IDictionary] -and $ServicesSettings.Contains('BravoWebEnabled')) {
+        $bravoWebEnabled = [System.Convert]::ToBoolean($ServicesSettings.BravoWebEnabled)
+    }
+    if ($bravoWebEnabled) {
+        foreach ($candidate in @($ServicesSettings.BravoWebCandidates | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })) {
+            $names += $candidate
+            $resolved = Get-Service -DisplayName $candidate -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $resolved) { $names += [string]$resolved.Name }
+        }
+    }
+    return @($names | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
 }
 
 function Invoke-BRAVODataRestoreServiceStateChange {
@@ -3598,8 +3641,37 @@ try {
             }
             # Знімок стану служб.
             $stageStartedAt = Get-Date
+            # #333: самовідновлення після аварійного прогону (Maintenance/
+            # DataRestore загинув у вікні утримання: служби тимчасово
+            # Disabled, початкові типи лежать у чужому маркері) — ДО читання
+            # start type: інакше тимчасово Disabled служба була б прийнята за
+            # «вимкнену оператором» і лишилась би Disabled назавжди. Той самий
+            # канонічний крок, що на старті Maintenance.
+            $script:dataRestoreAllowedServiceNames = @(Get-BRAVODataRestoreAllowedServiceNames -ServicesSettings $maintenanceSettings.Services)
+            $orphanContext = Get-BRAVOForeignServiceQuiescenceContext
+            $orphanRepair = Repair-BRAVOOrphanedServiceStartTypes -AllowedServiceNames $script:dataRestoreAllowedServiceNames
+            switch ([string]$orphanRepair.Status) {
+                'Repaired' {
+                    Write-DataRestoreLog -Message ("Попередній прогін {0} завершився аварійно під час утримання служб (#333): початкові типи запуску відновлено перед restore ({1})" -f $orphanRepair.Owner, (@($orphanRepair.Restored) -join ', ')) -Level 'WARNING'
+                    $script:dataRestoreWarningCount++
+                }
+                'RepairFailed' {
+                    Write-DataRestoreLog -Message ("Не вдалося повністю відновити типи запуску після аварійного прогону (#333): {0}; відновлення продовжується, залишок повернеться зі знімка маркера у finally" -f (@($orphanRepair.Failed) -join '; ')) -Level 'WARNING'
+                    $script:dataRestoreWarningCount++
+                }
+                'HeldSuppressed' {
+                    Write-DataRestoreLog -Message ("Попередній прогін {0} перервано посеред реставрації (restartSuppressed): служби лишаються Disabled; цей прогін об'єднає знімок типів запуску й поверне їх лише після успішного restore (#333)" -f $orphanRepair.Owner) -Level 'WARNING'
+                    $script:dataRestoreWarningCount++
+                }
+            }
+            $heldDisabledNames = @()
+            if ([string]$orphanRepair.Status -eq 'HeldSuppressed' -or [string]$orphanRepair.Status -eq 'RepairFailed') {
+                $heldDisabledNames = @(@($orphanContext.HeldSnapshot) | ForEach-Object { [string]$_.Name })
+            }
             $script:dataRestoreServiceSnapshot = Get-BRAVODataRestoreServiceSnapshot `
-                -ServicesSettings $maintenanceSettings.Services
+                -ServicesSettings $maintenanceSettings.Services `
+                -TemporarilyDisabledServiceNames $heldDisabledNames `
+                -RestartIntentServiceNames @($orphanContext.RestartIntentNames)
             # Два РІЗНІ набори (round-7 follow-up P2 — не плутати їх):
             #   $managedServicesForQuiescence — ВСІ Managed-служби: саме на
             #     них діє примусова Stopped-квієсценція нижче, і вона
@@ -3664,20 +3736,60 @@ try {
             # служба не працювала на момент знімка — типово для тестових/
             # ізольованих прогонів), маркер не потрібен: без нього watchdog
             # і так ніколи не діє.
-            if ($servicesWithRestartIntent.Count -gt 0) {
+            #
+            # #333: тимчасове утримання від автостарту (start type -> Disabled)
+            # на ВСЕ вікно «служби зупинені» — той самий контракт, що в
+            # Maintenance (#297/#329): знімок точних початкових типів кожної
+            # керованої служби (Disabled-оператором у знімок не потрапляють
+            # і не змінюються) іде в ТОЙ САМИЙ маркер ДО будь-якої зміни
+            # (write-ahead; чужий знімок осиротілого маркера зливається, а не
+            # губиться), далі служби переводяться в Disabled, а у finally
+            # типи повертаються ПЕРЕД стартом служб. Збій знімка/утримання
+            # = аборт ДО деструктивної фази (fail-closed).
+            $script:dataRestoreStartTypeSnapshot = @()
+            $startModeHoldFailures = @()
+            try {
+                $script:dataRestoreStartTypeSnapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames @($managedServicesForQuiescence | ForEach-Object { [string]$_.Name }))
+            } catch {
+                $startModeHoldFailures += "знімок типів запуску не знято: $($_.Exception.Message)"
+            }
+            $orphanHeldSnapshot = @($orphanContext.HeldSnapshot)
+            if ($servicesWithRestartIntent.Count -gt 0 -or $script:dataRestoreStartTypeSnapshot.Count -gt 0 -or $orphanHeldSnapshot.Count -gt 0) {
                 try {
-                    [void](Write-BRAVOServiceQuiescenceState `
+                    $markerServices = @($servicesWithRestartIntent)
+                    if ($markerServices.Count -eq 0) { $markerServices = @($managedServicesForQuiescence) }
+                    if ($markerServices.Count -eq 0) { $markerServices = @($script:dataRestoreServiceSnapshot | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Name) }) }
+                    $writtenMarkerState = Write-BRAVOServiceQuiescenceState `
                         -Owner 'BRAVO_DATA_RESTORE' `
-                        -Services @($servicesWithRestartIntent | ForEach-Object {
-                            @{ Name = [string]$_.Name; RestartIntent = $true }
+                        -Services @($markerServices | ForEach-Object {
+                            @{ Name = [string]$_.Name; RestartIntent = [bool]$_.ShouldRestartAfterRestore }
                         }) `
                         -LogFile ([string]$script:dataRestoreLogFile) `
                         -RestartSuppressed `
-                        -PreserveForeignStartTypeSnapshot)
+                        -StartTypeSnapshot $script:dataRestoreStartTypeSnapshot `
+                        -PreserveForeignStartTypeSnapshot
                     $script:dataRestoreQuiescenceMarkerWritten = $true
+                    # Об'єднаний знімок (власний + чужий) — те, що повертається у finally.
+                    # (Write повертає впорядкований словник стану, а не PSObject.)
+                    if ($writtenMarkerState -is [System.Collections.IDictionary] -and $writtenMarkerState.Contains('startTypeSnapshot')) {
+                        $script:dataRestoreStartTypeSnapshot = @(@($writtenMarkerState['startTypeSnapshot']) | ForEach-Object {
+                            [pscustomobject]@{ Name = [string]$_.Name; StartMode = [string]$_.StartMode }
+                        })
+                    }
                 } catch {
                     Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "не вдалося записати ownership-маркер зупинки служб (без нього аварійне переривання лишило б служби зупиненими «мовчазно», без сліду власника і CRITICAL-алерту Health): $($_.Exception.Message)"
                 }
+            }
+            if ($script:dataRestoreStartTypeSnapshot.Count -gt 0) {
+                $startModeSuppression = Suspend-BRAVOServiceAutostart -Snapshot $script:dataRestoreStartTypeSnapshot
+                $startModeHoldFailures += @($startModeSuppression.Failed)
+                if (@($startModeSuppression.Applied).Count -gt 0) {
+                    Write-DataRestoreLog -Message ("Служби утримано від автостарту на час restore (start type -> Disabled; початкові типи збережено в маркері): {0}" -f (@($script:dataRestoreStartTypeSnapshot | ForEach-Object { '{0}={1}' -f $_.Name, $_.StartMode }) -join ', ')) -Level 'INFO'
+                }
+            }
+            if ($startModeHoldFailures.Count -gt 0) {
+                Write-BRAVOOperationResult -Name 'Утримання служб від автостарту' -Status 'FAIL' -Duration ((Get-Date) - $stageStartedAt)
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ("не вдалося утримати служби від автостарту (#333) — restore скасовано ДО змін даних: {0}" -f ($startModeHoldFailures -join '; '))
             }
             $quiescenceFailures = Invoke-BRAVODataRestoreQuiescence `
                 -Snapshot $script:dataRestoreServiceSnapshot `
@@ -3686,6 +3798,16 @@ try {
             if (@($quiescenceFailures).Count -gt 0) {
                 Write-BRAVOOperationResult -Name 'Зупинка служб' -Status 'FAIL' -Duration ((Get-Date) - $stageStartedAt)
                 Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ($quiescenceFailures -join '; ')
+            }
+            if ($script:dataRestoreStartTypeSnapshot.Count -gt 0) {
+                # Hard-recheck (як перед bravocmd у Maintenance): тиша + дієве утримання.
+                $holdCheck = Confirm-BRAVOServicesQuiesced `
+                    -ServiceNames @($managedServicesForQuiescence | ForEach-Object { [string]$_.Name }) `
+                    -Snapshot $script:dataRestoreStartTypeSnapshot
+                if (-not $holdCheck.Ok) {
+                    Write-BRAVOOperationResult -Name 'Зупинка служб' -Status 'FAIL' -Duration ((Get-Date) - $stageStartedAt)
+                    Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ("утримання служб від автостарту не підтверджено (#333): {0}" -f (@($holdCheck.Offenders) -join '; '))
+                }
             }
             Write-BRAVOOperationResult `
                 -Name 'Зупинка служб' `
@@ -4048,6 +4170,11 @@ try {
                 $script:dataRestoreAbortReason = 'відкат не гарантовано довершився — служби навмисно залишено зупиненими, потрібне ручне відновлення (OPERATIONS.md, код 43)'
             }
             Write-DataRestoreLog -Message 'Служби НАВМИСНО залишено зупиненими: відкат не гарантовано довершився, live filesystem у невизначеному стані. Потрібне ручне відновлення перед запуском служб.' -Level 'ERROR' -Console
+            if (@($script:dataRestoreStartTypeSnapshot).Count -gt 0) {
+                # #333: службам свідомо ЛИШАЄТЬСЯ тимчасовий Disabled (інакше SCM
+                # підняв би їх на невизначеній live filesystem при наступному boot).
+                Write-DataRestoreLog -Message ("Служби лишаються Disabled (утримання від автостарту, #333) до ручного відновлення. Початкові типи запуску: {0} — після відновлення: sc config <служба> start= auto|delayed-auto|demand" -f (@($script:dataRestoreStartTypeSnapshot | ForEach-Object { '{0}={1}' -f $_.Name, $_.StartMode }) -join ', ')) -Level 'ERROR' -Console
+            }
             Write-BRAVOOperationResult -Name 'Відновлення стану служб' -Status 'SKIPPED' -Details 'служби навмисно залишено зупиненими через незавершений rollback — ручне відновлення обов''язкове'
             # Ownership-маркер НЕ видаляється: Health-watchdog побачить його,
             # НЕ стартуватиме служби (маркер suppressed від самого створення —
@@ -4064,10 +4191,36 @@ try {
             }
         } elseif ($script:dataRestoreServicesStopped -and $null -ne $script:dataRestoreServiceSnapshot) {
             $restoreServicesStartedAt = Get-Date
-            $startFailures = Restore-BRAVODataRestoreServices `
+            # #333: ТОЧНІ початкові типи запуску (разом із Delayed Start) —
+            # ПЕРЕД стартом служб (Disabled блокує Start-Service). Службу, яку
+            # оператор вимкнув сам (Disabled до прогону), у знімку немає — вона
+            # лишається Disabled і зупиненою. Збій повернення = невдале
+            # відновлення (43), маркер лишається (Health-watchdog алертить).
+            $startModeRestoreFailures = @()
+            if (@($script:dataRestoreStartTypeSnapshot).Count -gt 0) {
+                try {
+                    $startModeRestore = Restore-BRAVOServiceStartTypeSnapshot `
+                        -Snapshot $script:dataRestoreStartTypeSnapshot `
+                        -AllowedServiceNames $script:dataRestoreAllowedServiceNames
+                    $startModeRestoreFailures = @($startModeRestore.Failed)
+                    if ($startModeRestoreFailures.Count -eq 0) {
+                        Write-DataRestoreLog -Message ("Початкові типи запуску служб повернуто (#333): {0}" -f (@($startModeRestore.Restored) -join ', ')) -Level 'INFO'
+                    }
+                    if (@($startModeRestore.Foreign).Count -gt 0) {
+                        Write-DataRestoreLog -Message ("Тип запуску не повернуто — його змінив оператор під час прогону: {0}" -f (@($startModeRestore.Foreign) -join '; ')) -Level 'WARNING'
+                    }
+                } catch {
+                    $startModeRestoreFailures = @("виняток повернення типів запуску: $($_.Exception.Message)")
+                }
+                if ($startModeRestoreFailures.Count -gt 0) {
+                    Write-DataRestoreLog -Message ("Не вдалося повернути початкові типи запуску служб (#333): {0}. Службу, яку не вимикав оператор, поверніть вручну: sc config <служба> start= auto|delayed-auto|demand" -f ($startModeRestoreFailures -join '; ')) -Level 'ERROR' -Console
+                }
+            }
+            $startFailures = @(Restore-BRAVODataRestoreServices `
                 -Snapshot $script:dataRestoreServiceSnapshot `
                 -StartTimeoutSeconds $serviceStartTimeoutSeconds `
-                -PollIntervalSeconds $servicePollIntervalSeconds
+                -PollIntervalSeconds $servicePollIntervalSeconds)
+            $startFailures = @($startModeRestoreFailures | ForEach-Object { "не вдалося повернути тип запуску: $_" }) + $startFailures
             if (@($startFailures).Count -gt 0) {
                 # Дані могли бути відновлені, але production не працює —
                 # операційно це невдале відновлення (43), не warning.

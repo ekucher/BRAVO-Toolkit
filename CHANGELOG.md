@@ -2,6 +2,26 @@
 
 ## Не випущено (developer)
 
+- **Fix: DataRestore тимчасово утримує тип запуску служб на час restore (#333, продовження #297/#329).**
+  Раніше InPlace-DataRestore лише писав ownership-маркер і не знімав знімок типів запуску: SCM
+  міг підняти службу з delayed/automatic start посеред restore, а після аварійного Maintenance
+  (служби тимчасово `Disabled`, початкові типи в чужому знімку) `Start-Service` падав і прогін
+  завершувався кодом `43` з маркером `restartSuppressed`, який ніхто не знімав. Тепер DataRestore
+  користується тим самим канонічним контрактом BRAVO.System, що й Maintenance (нових копій
+  логіки немає): самовідновлення `Repair-BRAVOOrphanedServiceStartTypes` до читання start type;
+  знімок точних початкових типів (`New-BRAVOServiceStartTypeSnapshot`, Disabled-оператором у
+  знімок не потрапляє) пишеться в той самий маркер до зміни (чужий знімок зливається);
+  `Suspend-BRAVOServiceAutostart` → тимчасовий `Disabled`; `Confirm-BRAVOServicesQuiesced` перед
+  деструктивною фазою; у `finally` `Restore-BRAVOServiceStartTypeSnapshot` повертає типи ПЕРЕД
+  стартом служб (стартують лише служби з наміром). Служба, вимкнена оператором до прогону,
+  лишається `Disabled` і зупиненою. Маркер аварійного прогону з `restartSuppressed` більше не
+  блокує: його знімок зливається, служби з `RestartIntent` запускаються після успішного restore.
+  При незавершеному rollback служби свідомо лишаються `Disabled` (код 43). Збій знімка/утримання
+  скасовує restore до змін даних. Новий експорт `Get-BRAVOForeignServiceQuiescenceContext`
+  (BRAVO.System). Self-test: `DataRestore/StartMode*` (звичайна служба, Manual-зупинена,
+  delayed automatic, вимкнена оператором, чужий знімок suppressed/repairable, відсутній знімок,
+  зіпсований маркер, збій restore, збій старту служби).
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`

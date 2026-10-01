@@ -1163,6 +1163,7 @@ function Start-Sleep { param($Seconds) }
             'Suspend-BRAVOServiceAutostart',
             'Restore-BRAVOServiceStartTypeSnapshot',
             'Repair-BRAVOOrphanedServiceStartTypes',
+            'Get-BRAVOForeignServiceQuiescenceContext',
             'Confirm-BRAVOServicesQuiesced'
         )
     # New-Module імпортує заглушки в глобальну область. Заглушка Start-Sleep
@@ -1352,6 +1353,43 @@ function Start-Sleep { param($Seconds) }
             ) `
             -Name "ServiceQuiescence/CrashLeavesMarkerNextRunRepairsExactStartTypes" `
             -Failure "аварійний вихід у вікні утримання: наступний прогін має повернути точні типи з маркера мертвого власника, зберегти маркер (watchdog стартує служби) і очистити знімок (повтор = NoSnapshot)"
+
+        # (5b) #333: контекст ЧУЖОГО маркера для DataRestore (єдине місце читання):
+        # власний маркер — не чужий; мертвий чужий власник віддає RestartIntent-
+        # служби та знімок; живий — нічого; зіпсований/відсутній — Present=$false.
+        $foreignContext = & $startModeModule {
+            $out = @{}
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic' }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames @('BRAVO', 'exchangAPI'))
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' `
+                -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }, @{ Name = 'exchangAPI'; RestartIntent = $false }) -LogFile 'x' -RestartSuppressed -StartTypeSnapshot $snapshot)
+            $out.Own = Get-BRAVOForeignServiceQuiescenceContext
+            $statePath = Get-BRAVOServiceQuiescenceStatePath
+            $raw = [IO.File]::ReadAllText($statePath)
+            [IO.File]::WriteAllText($statePath, ($raw -replace '"pid":\s*\d+', '"pid": 999999'))
+            $script:Q297OwnerAlive = $false
+            $out.Dead = Get-BRAVOForeignServiceQuiescenceContext
+            $script:Q297OwnerAlive = $true
+            $out.Alive = Get-BRAVOForeignServiceQuiescenceContext
+            [IO.File]::WriteAllText($statePath, '{ not json')
+            $out.Garbage = Get-BRAVOForeignServiceQuiescenceContext
+            Remove-Item -LiteralPath $statePath -Force
+            $out.Missing = Get-BRAVOForeignServiceQuiescenceContext
+            $out
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                -not $foreignContext.Own.Present -and
+                $foreignContext.Dead.Present -and -not $foreignContext.Dead.OwnerAlive -and $foreignContext.Dead.RestartSuppressed -and
+                (@($foreignContext.Dead.RestartIntentNames) -join ',') -ceq 'BRAVO' -and
+                @($foreignContext.Dead.HeldSnapshot).Count -eq 2 -and
+                [string]$foreignContext.Dead.HeldSnapshot[0].StartMode -eq 'AutomaticDelayed' -and
+                $foreignContext.Alive.Present -and $foreignContext.Alive.OwnerAlive -and
+                @($foreignContext.Alive.RestartIntentNames).Count -eq 0 -and @($foreignContext.Alive.HeldSnapshot).Count -eq 0 -and
+                -not $foreignContext.Garbage.Present -and -not $foreignContext.Missing.Present
+            ) `
+            -Name "ServiceQuiescence/ForeignContextForDataRestoreOwnership" `
+            -Failure "Get-BRAVOForeignServiceQuiescenceContext: власний маркер не чужий; мертвий чужий власник віддає RestartIntent і знімок; живий — нічого; зіпсований/відсутній — Present=false"
 
         # (6) Stale/foreign/неочікувані маркери — безпечні відмови.
         $staleScenario = & $startModeModule {
@@ -1583,6 +1621,37 @@ function Restore-BRAVOServiceStartTypeSnapshot {
             ) `
             -Name "ServiceQuiescence/MaintenanceRechecksClassificationAfterLock" `
             -Failure "після lock Maintenance має повторити Repair і перевірити класифікацію служб (зміна -> fail-closed exit 20) до будь-яких дій; DataRestore пише маркер з -PreserveForeignStartTypeSnapshot"
+
+        # (12) #333: DataRestore користується ТИМИ САМИМИ канонічними функціями
+        # BRAVO.System, що й Maintenance (без копій логіки), у контрактному
+        # порядку: Repair до знімка служб; знімок -> маркер зі знімком -> Suspend;
+        # у finally Restore типів ПЕРЕД стартом служб. Поведінку перевіряють
+        # DataRestore/StartMode* (Orchestration-проба).
+        $dataRestoreContractNames = @(
+            'Repair-BRAVOOrphanedServiceStartTypes', 'New-BRAVOServiceStartTypeSnapshot', 'Suspend-BRAVOServiceAutostart',
+            'Confirm-BRAVOServicesQuiesced', 'Restore-BRAVOServiceStartTypeSnapshot', 'Get-BRAVOForeignServiceQuiescenceContext')
+        $dataRestoreContractMissing = @($dataRestoreContractNames | Where-Object { $dataRestoreTextForStartMode.IndexOf($_) -lt 0 })
+        $dataRestoreRepairIndex = $dataRestoreTextForStartMode.IndexOf('$orphanRepair = Repair-BRAVOOrphanedServiceStartTypes')
+        $dataRestoreSnapshotIndex = $dataRestoreTextForStartMode.IndexOf('$script:dataRestoreServiceSnapshot = Get-BRAVODataRestoreServiceSnapshot')
+        $dataRestoreHoldSnapshotIndex = $dataRestoreTextForStartMode.IndexOf('New-BRAVOServiceStartTypeSnapshot -ServiceNames')
+        $dataRestoreMarkerIndex = $dataRestoreTextForStartMode.IndexOf('$writtenMarkerState = Write-BRAVOServiceQuiescenceState')
+        $dataRestoreSuspendIndex = $dataRestoreTextForStartMode.IndexOf('Suspend-BRAVOServiceAutostart -Snapshot')
+        $dataRestoreRestoreModesIndex = $dataRestoreTextForStartMode.IndexOf('$startModeRestore = Restore-BRAVOServiceStartTypeSnapshot')
+        $dataRestoreStartServicesIndex = $dataRestoreTextForStartMode.IndexOf('$startFailures = @(Restore-BRAVODataRestoreServices')
+        Test-BRAVOCondition `
+            -Condition (
+                $dataRestoreContractMissing.Count -eq 0 -and
+                $dataRestoreRepairIndex -ge 0 -and $dataRestoreSnapshotIndex -gt $dataRestoreRepairIndex -and
+                $dataRestoreHoldSnapshotIndex -gt $dataRestoreSnapshotIndex -and
+                $dataRestoreMarkerIndex -gt $dataRestoreHoldSnapshotIndex -and
+                $dataRestoreSuspendIndex -gt $dataRestoreMarkerIndex -and
+                $dataRestoreRestoreModesIndex -gt $dataRestoreSuspendIndex -and
+                $dataRestoreStartServicesIndex -gt $dataRestoreRestoreModesIndex -and
+                $dataRestoreTextForStartMode -notmatch 'sc\.exe' -and
+                $dataRestoreTextForStartMode -notmatch 'HKLM:'
+            ) `
+            -Name "ServiceQuiescence/DataRestoreUsesCanonicalStartTypeHoldContract" `
+            -Failure "DataRestore має викликати канонічні функції BRAVO.System (відсутні: $($dataRestoreContractMissing -join ', ')) у порядку Repair -> знімок служб -> знімок типів -> маркер -> Suspend -> Restore типів -> старт служб, без власних sc.exe/реєстру"
     } finally {
         Remove-Item -LiteralPath $startModeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
