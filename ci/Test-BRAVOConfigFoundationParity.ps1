@@ -519,6 +519,18 @@ $knownIntentionalDiffPrefixes = @(
     'operationsReportingSettings.Enabled',
     'operationsReportingSettings.ProductType',
     'operationsReportingSettings.RequestTimeoutSeconds',
+    # BackupCatchUp (#322) — новий ПОХІДНИЙ вузол планувальника
+    # (Resolve-BRAVOConfigurationDerivation; для legacy-конфігурації —
+    # backfill у BRAVO_CONFIG_LOADER.ps1): boot-завдання
+    # BRAVO_ARCHIV_CATCHUP для пропущеної нічної копії. У BEFORE (42cf9ad)
+    # вузла не існує (BEFORE=<null>); наявні поля не змінено. Перелічено
+    # ПОІМЕННО за тим самим правилом, що й адитивні ключі вище.
+    'schedulerSettings.BackupCatchUp.Description',
+    'schedulerSettings.BackupCatchUp.Enabled',
+    'schedulerSettings.BackupCatchUp.ExecutionTimeLimitHours',
+    'schedulerSettings.BackupCatchUp.ScriptPath',
+    'schedulerSettings.BackupCatchUp.StartupDelayMinutes',
+    'schedulerSettings.BackupCatchUp.TaskName',
     # Секція 5, задокументований canonical-default фікс (перевірено
     # окремим self-test ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults):
     # "E:\Archiv" (застарілий placeholder BRAVO.config) -> "" (canonical).
