@@ -2,6 +2,41 @@
 
 ## Не випущено (developer)
 
+- **Fix: retention не видаляє COMPLETE резервні копії як «невдалі» (#335, безпечна частина).**
+  `Remove-BRAVOExpiredBackupGenerations` відносила generation до гілки `failedArchiveRetentionDays`
+  за результатом сьогоднішньої повторної перевірки, а не за записаним статусом: COMPLETE копія з
+  одним пошкодженим архівом через 30 днів видалялась разом із цілими архівами інших компонентів
+  навіть при `enableArchiveDeletion = $false`, без попередження. Тепер гілку визначає записаний
+  статус: COMPLETE видаляється лише за `archiveRetentionDays` і лише при `enableArchiveDeletion`;
+  пошкодження COMPLETE (також старшої за `minimumRetainedVerifiedBackups` захищених) дає WARNING
+  «Пошкоджена резервна копія» і не веде до видалення. Для WARNING кожної COMPLETE generation
+  використовується дешева перевірка без читання вмісту (архів і `.sha512` на місці, розмір проти
+  `ArchiveSize`, формат `.sha512`); повний SHA512 рахується лише для вибору N захищених, коли
+  `enableArchiveDeletion = $true` і є прострочені COMPLETE generation, тобто не щоночі по всій
+  історії. Шляхи архівів перебудовуються як у відновленні (`ConvertTo-BRAVORebasedLocalGenerationManifest`):
+  після перенесення сховища manifest-и більше не стираються, а архіви не лишаються сиротами.
+  Manifest видаляється останнім і лише після своїх архівів; помилка на одній generation (напр.
+  заблокований файл) не зупиняє решту, а прогін повертає невдачу. Generation із типом компонента,
+  якого немає в поточних `ArchiveDefinitions`, не видаляється (WARNING). Архіви без manifest-а
+  лише рахуються в рядку «Аудит retention» (обідні `_HHMM` копії не рахуються) і не видаляються.
+  Видалено мертву `Remove-OldBackupSets` разом із симуляційним self-test. README: захист
+  `minimumRetainedVerifiedBackups` типово `2` і рахується по generation. Нових ключів
+  конфігурації немає. Нові self-test перевірки:
+  `BackupConsistency/CompleteGenerationIsNeverDeletedAsFailedAndCorruptionWarns`,
+  `BackupConsistency/CompleteGenerationNeverDeletedWhenArchiveDeletionDisabled`,
+  `BackupConsistency/FailedGenerationStillExpiresByFailedRetention`,
+  `BackupConsistency/OldCorruptCompleteBeyondProtectedWarnsAndIsKept`,
+  `BackupConsistency/Sha512MismatchWarnsAndOlderVerifiedIsProtected`,
+  `BackupConsistency/NoSha512WhenArchiveDeletionDisabled`,
+  `BackupConsistency/NoSha512WhenNothingIsExpired`,
+  `BackupConsistency/RelocatedRepositoryKeepsCompleteManifests`,
+  `BackupConsistency/RelocatedRepositoryExpiryDeletesArchivesWithManifest`,
+  `BackupConsistency/RetentionFailureOnOneGenerationDoesNotStopOthers`,
+  `BackupConsistency/ManifestIsDeletedOnlyAfterItsArtifacts`,
+  `BackupConsistency/RetentionRetryFinishesGenerationAfterLockReleased`,
+  `BackupConsistency/UnreferencedArchivesAreReportedNotDeleted`,
+  `BackupConsistency/UnknownComponentTypeKeepsGenerationAndWarns`.
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
