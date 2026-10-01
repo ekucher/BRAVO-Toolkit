@@ -2,6 +2,32 @@
 
 ## Не випущено (developer)
 
+- **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
+  `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
+  ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
+  без `-DisallowLegacyPrimaryAutoDetect`, тож файл, що лишився після `Update-BRAVOServer`,
+  виконувався при кожному запуску Configurator (UI/Persistence/Model) і показував значення,
+  які runtime 5.3 уже ігнорує. Тепер ізольований корінь не отримує копії `BRAVO.config`, а
+  дочірній виклик передає `-DisallowLegacyPrimaryAutoDetect` (захист у глибину). Додатковий
+  guard `GENERATED_LOADER_CALL_TEXT` у `ci\BRAVOConfigV2CutoverGates.ps1`
+  (`Test-BRAVOGeneratedLoaderCallText`, підключений до `Test-BRAVOConfigV2CutoverGates`):
+  AST-пошук рядкових літералів із текстом виклику loader-а без прапорця; межі описано в
+  коментарі функції (склеєний/зчитаний із файлу текст не бачить). Self-test fixture
+  Configurator більше не спирається на legacy `BRAVO.config`: built-in `LIMSRoot`/`BackupRoot`
+  підміняються у копії модуля `BRAVO.Configuration`. Нові self-test перевірки:
+  `Configurator/LegacyConfig/BaselineWithoutLegacyFile`,
+  `Configurator/LegacyConfig/PoisonedLegacyDoesNotBreakEffective`,
+  `Configurator/LegacyConfig/PoisonedLegacyMarkerNotWritten`,
+  `Configurator/LegacyConfig/LocalCandidateStillApplied`,
+  `Configurator/LegacyConfig/DiscoveryAndCredentialSettingsUnchanged`,
+  `Configurator/LegacyConfig/LegacyValueDoesNotAffectEffective`,
+  `Configurator/LegacyConfig/ChildPassesDisallowFlagAndDoesNotCopyLegacy`,
+  `ReleaseGate/GeneratedLoaderCallTextFlagsFlaglessChildScript`,
+  `ReleaseGate/GeneratedLoaderCallTextAcceptsFlaggedAndRejectsFalseBinding`,
+  `ReleaseGate/GeneratedLoaderCallTextIgnoresCommentsAndSanctioned`,
+  `ReleaseGate/GeneratedLoaderCallTextHoldsOnRepositoryTree`,
+  `ReleaseGate/CutoverGatesEnforceGeneratedLoaderCallText`.
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях
