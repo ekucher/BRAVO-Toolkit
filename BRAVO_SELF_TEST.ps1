@@ -11641,6 +11641,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             SameCodeNamed = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 1) $null $null
             SameCodeOldStatus = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 30) $null $null
             NewerFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            NewerRunning = & $reason (& $task -Result 267009 -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            NewerSuccess = & $reason (& $task -Result 0 -RunAgeHours 1) (& $status 0 0.5) $incomplete $now.AddHours(-30)
             OlderFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 5) $null $incomplete $now.AddHours(-30)
             CodeZero = & $reason (& $task -Result 0) $null $null $null
             Running = & $reason (& $task -Result 267009 -RunAgeHours 1) (& $status 0 30) $null $null
@@ -11675,6 +11677,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $staleReasons.SameCodeNamed -match '0x00000014 \(TEST_NAME\)' -and
             $staleReasons.SameCodeOldStatus -match '0x00000014' -and $staleReasons.SameCodeOldStatus -notmatch 'TEST_NAME' -and
             $staleReasons.NewerFailedRun -match '0x80070005' -and $staleReasons.NewerFailedRun -notmatch 'G-NEW' -and
+            $staleReasons.NewerRunning -eq 'завдання BRAVO_ARCHIV виконується зараз' -and
+            $null -eq $staleReasons.NewerSuccess -and
             $staleReasons.OlderFailedRun -match 'G-NEW' -and
             $null -eq $staleReasons.CodeZero -and
             $staleReasons.NotRun -match '^завдання не запускалося з \d\d\.\d\d\.\d{4} \d\d:\d\d$' -and

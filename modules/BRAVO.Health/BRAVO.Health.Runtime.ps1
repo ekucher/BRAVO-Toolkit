@@ -1238,9 +1238,10 @@ function Get-BRAVOHealthBackupStaleReason {
 
     if ($null -ne $LatestIncomplete) {
         $incompleteUtc = & $read $LatestIncomplete 'CreatedAtUtc'
-        # Новіший за manifest невдалий запуск завдання (збій до створення manifest)
-        # не ховаємо за старою INCOMPLETE-спробою — його покаже правило коду нижче.
-        $taskRunNewerAndFailed = $taskRunFailed -and $hasLastRun -and $null -ne $incompleteUtc -and
+        # Новіший за manifest запуск завдання (виконується, успішний або збій до
+        # створення manifest) не ховаємо за старою INCOMPLETE-спробою — його
+        # опишуть правила за результатом запуску нижче.
+        $taskRunNewerAndFailed = $hasLastRun -and $null -ne $incompleteUtc -and
             ([datetime]$lastRun).ToUniversalTime() -gt ([datetime]$incompleteUtc).ToUniversalTime()
         if ($null -ne $incompleteUtc -and -not $taskRunNewerAndFailed -and
             ($null -eq $LatestCompleteUtc -or [datetime]$incompleteUtc -gt [datetime]$LatestCompleteUtc)) {
