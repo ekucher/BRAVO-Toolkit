@@ -795,15 +795,25 @@ if ($BravoWebComponentEnabled -and -not $ApacheService) {
     }
 }
 
+function Test-BRAVOServiceDisabledBySystem {
+    # StartType відсутній у ServiceController на .NET < 4.6.1 (#319), тож
+    # читається лише через Get-BRAVOServiceStartMode (під StrictMode 2.0
+    # пряме звернення кинуло б виняток ще до рішення про керування службою).
+    # CIM StartMode уже отриманий викликачем — другий WMI-запит не потрібен.
+    param($Service, [string]$CimStartMode)
+
+    if ($CimStartMode -ieq "Disabled") { return $true }
+    $startModeResult = Get-BRAVOServiceStartMode -Service $Service -NoWmiQuery
+    return ($startModeResult.StartMode -eq "Disabled")
+}
+
 $ApacheServiceExists = ($null -ne $ApacheService)
 $BravoWebServiceDisabledBySystem = $false
 if ($ApacheServiceExists) {
     $cimStartMode = if ($ApacheServiceInfo) { [string]$ApacheServiceInfo.StartMode } else { "" }
-    $serviceStartType = [string]$ApacheService.StartType
-    $BravoWebServiceDisabledBySystem = (
-        $cimStartMode -ieq "Disabled" -or
-        $serviceStartType -ieq "Disabled"
-    )
+    $BravoWebServiceDisabledBySystem = Test-BRAVOServiceDisabledBySystem `
+        -Service $ApacheService `
+        -CimStartMode $cimStartMode
 }
 function Get-BRAVOBravoWebComponentPlan {
     [CmdletBinding()]
@@ -874,7 +884,8 @@ function Get-ConfiguredServiceState {
         $startMode = if ($serviceInfo) {
             [string]$serviceInfo.StartMode
         } else {
-            [string]$service.StartType
+            # StartType відсутній на .NET < 4.6.1 (#319): безпечне читання.
+            [string](Get-BRAVOServiceStartMode -Service $service -NoWmiQuery).StartMode
         }
     }
 

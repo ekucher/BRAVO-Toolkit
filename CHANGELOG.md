@@ -2,6 +2,26 @@
 
 ## Не випущено (developer)
 
+- **Fix: безпечне читання типу запуску служби без `ServiceController.StartType` (#319).**
+  `StartType` існує лише з .NET Framework 4.6.1, а Windows PowerShell 5.1 може
+  працювати на .NET 4.5.2+; під `Set-StrictMode -Version 2.0` пряме звернення
+  до відсутньої властивості кидає `PropertyNotFoundStrict` (PR #310 виправив
+  лише Health). Додано єдиний helper `Get-BRAVOServiceStartMode` (BRAVO.System):
+  читає `StartType` через `PSObject.Properties`, потім WMI `Win32_Service.StartMode`
+  (через `Get-BRAVOWmiInstance`), нормалізує до `Automatic`/`Manual`/`Disabled`
+  і замість винятку повертає `Unknown` із `FailureReason`. Переведено місця з
+  прямим читанням: Maintenance (верхній рівень BravoWeb та
+  `Get-ConfiguredServiceState`), `Get-BRAVODataRestoreServiceSnapshot`,
+  `Get-BRAVODryRunConfiguredServiceState` і `Set-BRAVOBootRestoreServiceStartType`
+  (джерело типу запуску — WMI; невідомий тип у `HoldServices` — збій
+  `SkippedUnknownStartType`, у `None` — без змін). Поведінка Health (#310) не
+  змінена. Нові self-test перевірки:
+  `ServiceStartMode/HelperNormalizationPrecedenceAndUnknown`,
+  `Maintenance/ServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `DataRestore/ServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `DryRun/ServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `BootRestore/ServiceStartTypeMissingUsesWmiAndFailsClosed`.
+
 - **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
   Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
   вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях

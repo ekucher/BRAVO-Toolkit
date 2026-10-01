@@ -526,6 +526,107 @@ function Get-BRAVOServiceDelayedAutoStart {
     return ([int]$properties.DelayedAutostart -eq 1)
 }
 
+function Get-BRAVOServiceStartMode {
+    # Єдиний канонічний читач типу запуску служби Windows (#319).
+    # ServiceController.StartType існує лише з .NET Framework 4.6.1, а
+    # Windows PowerShell 5.1 може працювати на .NET 4.5.2+: під
+    # Set-StrictMode -Version 2.0 пряме звернення до відсутньої властивості
+    # кидає PropertyNotFoundStrict. Порядок джерел:
+    #   1) StartType службового об'єкта (через PSObject.Properties) — має
+    #      пріоритет, коли присутній і розпізнаний;
+    #   2) -FallbackStartMode — значення Win32_Service.StartMode, яке
+    #      викликач уже отримав (щоб не робити другий WMI-запит);
+    #   3) WMI/CIM Win32_Service через Get-BRAVOWmiInstance (BRAVO.Compatibility),
+    #      якщо не вказано -NoWmiQuery.
+    # Значення нормалізується до Automatic/Manual/Disabled; WMI 'Auto' ->
+    # Automatic. Delayed Start тут НЕ розрізняється (його читає окремо
+    # Get-BRAVOServiceDelayedAutoStart з реєстру). Функція не кидає виняток:
+    # якщо джерел немає або значення нерозпізнане, StartMode = 'Unknown', а
+    # FailureReason пояснює чому.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Service,
+        [string]$FallbackStartMode,
+        [switch]$NoWmiQuery
+    )
+
+    $normalize = {
+        param($Value)
+        if ($null -eq $Value) { return $null }
+        switch (([string]$Value).Trim().ToLowerInvariant()) {
+            'automatic' { return 'Automatic' }
+            'auto' { return 'Automatic' }
+            'manual' { return 'Manual' }
+            'disabled' { return 'Disabled' }
+            default { return $null }
+        }
+    }
+
+    $serviceName = ''
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $Service) {
+        $nameProperty = $Service.PSObject.Properties['Name']
+        if ($null -ne $nameProperty -and $null -ne $nameProperty.Value) {
+            $serviceName = [string]$nameProperty.Value
+        }
+    }
+    $makeResult = {
+        param([string]$Mode, [string]$Source)
+        [pscustomobject]@{
+            Name = $serviceName
+            StartMode = $Mode
+            Source = $Source
+            FailureReason = if ($Mode -eq 'Unknown') { ($reasons -join '; ') } else { $null }
+        }
+    }
+
+    if ($null -eq $Service) {
+        [void]$reasons.Add('службовий об''єкт не передано')
+        return (& $makeResult 'Unknown' 'None')
+    }
+
+    $startTypeProperty = $Service.PSObject.Properties['StartType']
+    if ($null -eq $startTypeProperty) {
+        [void]$reasons.Add('властивість StartType відсутня (.NET Framework < 4.6.1)')
+    } else {
+        $mode = & $normalize $startTypeProperty.Value
+        if ($null -ne $mode) { return (& $makeResult $mode 'StartType') }
+        [void]$reasons.Add("StartType порожній або нерозпізнаний: '$([string]$startTypeProperty.Value)'")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($FallbackStartMode)) {
+        $mode = & $normalize $FallbackStartMode
+        if ($null -ne $mode) { return (& $makeResult $mode 'FallbackStartMode') }
+        [void]$reasons.Add("FallbackStartMode нерозпізнаний: '$FallbackStartMode'")
+    }
+
+    if ($NoWmiQuery) {
+        [void]$reasons.Add('WMI-запит вимкнено (-NoWmiQuery)')
+    } elseif ([string]::IsNullOrWhiteSpace($serviceName)) {
+        [void]$reasons.Add('ім''я служби невідоме — WMI-запит неможливий')
+    } elseif ($null -eq (Get-Command -Name 'Get-BRAVOWmiInstance' -ErrorAction SilentlyContinue)) {
+        [void]$reasons.Add('Get-BRAVOWmiInstance (BRAVO.Compatibility) недоступна')
+    } else {
+        try {
+            $escapedName = $serviceName.Replace("'", "''")
+            $serviceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
+                Select-Object -First 1
+            $startModeProperty = if ($null -ne $serviceInfo) { $serviceInfo.PSObject.Properties['StartMode'] } else { $null }
+            if ($null -eq $startModeProperty) {
+                [void]$reasons.Add('WMI не повернув Win32_Service.StartMode')
+            } else {
+                $mode = & $normalize $startModeProperty.Value
+                if ($null -ne $mode) { return (& $makeResult $mode 'WMI') }
+                [void]$reasons.Add("WMI StartMode нерозпізнаний: '$([string]$startModeProperty.Value)'")
+            }
+        } catch {
+            [void]$reasons.Add("WMI-запит завершився помилкою: $($_.Exception.Message)")
+        }
+    }
+
+    return (& $makeResult 'Unknown' 'None')
+}
+
 function Set-BRAVOBootRestoreServiceStartType {
     # Канонічне (єдине в комплекті) місце, де BRAVO змінює start type
     # служб Windows. Використовується ЛИШЕ інсталятором Планувальника для
@@ -563,11 +664,25 @@ function Set-BRAVOBootRestoreServiceStartType {
             })
             continue
         }
-        $startType = [string]$service.StartType
+        # StartType (.NET < 4.6.1) може бути відсутній: тип запуску читає
+        # канонічний Get-BRAVOServiceStartMode (WMI-fallback). Невідомий тип
+        # запуску НЕ змінюємо (жодних припущень про стан служби).
+        $startModeResult = Get-BRAVOServiceStartMode -Service $service
+        $startType = [string]$startModeResult.StartMode
         $delayed = Get-BRAVOServiceDelayedAutoStart -ServiceName $serviceName
         $action = 'None'
         $targetArgument = $null
-        if ($startType -eq 'Automatic') {
+        $success = $true
+        $details = $null
+        if ($startType -eq 'Unknown') {
+            # Ні StartType, ні WMI не дали типу запуску: службу не чіпаємо.
+            # У HoldServices це ламає гарантію «клієнти не зайдуть до
+            # реставрації», тому там — збій (рішення за викликачем); у None
+            # власного delayed-стану відкотити нема чого.
+            $action = 'SkippedUnknownStartType'
+            $details = "тип запуску невідомий: $($startModeResult.FailureReason)"
+            if ($HoldServices) { $success = $false }
+        } elseif ($startType -eq 'Automatic') {
             if ($HoldServices -and -not $delayed) {
                 $action = 'SetDelayedAuto'; $targetArgument = 'delayed-auto'
             } elseif (-not $HoldServices -and $delayed) {
@@ -576,8 +691,6 @@ function Set-BRAVOBootRestoreServiceStartType {
         } elseif ($HoldServices) {
             $action = 'SkippedNotAutomatic'
         }
-        $success = $true
-        $details = $null
         if ($null -ne $targetArgument -and -not $ValidateOnly) {
             # sc.exe вимагає пробіл ПІСЛЯ 'start=' — це синтаксис утиліти.
             & "$env:SystemRoot\System32\sc.exe" config $serviceName start= $targetArgument | Out-Null
