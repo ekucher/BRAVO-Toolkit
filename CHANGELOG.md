@@ -17,7 +17,13 @@
   Health, Dry Run і `BRAVO_SETUP -ValidateOnly` користуються цим самим складом (ValidateOnly і
   Test-BRAVODiscoveryResult більше не створюють каталогів); `Test-SFTPConfig` не вимагає
   SFTP-каталогів для NotInstalled-компонентів; Health показує один INFO-рядок «Не встановлено
-  на цьому сервері: …» без WARNING. Свідоме відхилення від
+  на цьому сервері: …» без WARNING. Оголошене (bravo.ini/служба/override), але недоступне джерело
+  ніколи не стає `NotInstalled`: `Test-BRAVODiscoverySourceDirectory` розрізняє «не існує» і «не
+  вдалося прочитати» (Kind), нечитабельне дає Error, а Absent з оголошеним джерелом у scope лишається
+  `Missing` (backup пробує компонент і падає гучно, baseline не пишеться). Доказ з попереднього
+  COMPLETE manifest діє й коли baseline старіший за цей manifest; `BRAVO_SETUP` передає той самий
+  доказ, що й ARCHIV. Підсумок ARCHIV (status JSON, секція «Архіви», план, лог) враховує лише реальний
+  склад. Свідоме відхилення від
   `designs/backup-scope-by-environment.md` (розділ 5): Health бере склад із живого discovery +
   baseline (read-only) і останнього COMPLETE manifest як другого доказу, а не зі `scope`
   manifest, бо manifest застаріває між прогонами; поле manifest `componentScope` пишеться як

@@ -6494,12 +6494,14 @@ function Main {
         $discoveryBaselineImport = Import-BRAVODiscoveryBaseline `
             -StateRoot $stateRoot `
             -RuntimeRoot $runtimeRoot
+        $previousCompleteEvidence = Get-BRAVOLastCompleteBackupEvidence -BackupRoot $backupRootPath
         $backupScope = Resolve-BRAVOBackupComponentScope `
             -DiscoveryResult $bravoDiscoveryResult `
             -Baseline $discoveryBaselineImport.Baseline `
             -BaselineSourceKind ([string]$discoveryBaselineImport.Source) `
             -EnabledComponents $discoveryEnabledComponents `
-            -PreviousCompleteComponents @(Get-BRAVOLastCompleteBackupComponents -BackupRoot $backupRootPath)
+            -PreviousCompleteComponents @($previousCompleteEvidence.Components) `
+            -PreviousCompleteAt $previousCompleteEvidence.CreatedAtUtc
     } catch {
         $backupScopeError = $_.Exception.Message
     }
@@ -6769,7 +6771,8 @@ function Main {
     $archivePlanEntries['Локальна синхронізація BAZA_APP'] = [bool]$bazaAppLocalSyncEnabled
     $archivePlanEntries['Локальна синхронізація BAZA_WWW'] = [bool]$bazaWWWLocalSyncEnabled
     foreach ($archiveDefinition in $archiveDefinitions) {
-        $archivePlanEntries["Архівація $($archiveDefinition.Type)"] = [bool]$archiveDefinition.Enabled
+        $archivePlanEntries["Архівація $($archiveDefinition.Type)"] = ([bool]$archiveDefinition.Enabled -and
+            $notInstalledComponents -notcontains [string]$archiveDefinition.Type)
     }
     $archivePlanEntries['Завантаження архівів на SFTP'] = [bool]$sftpArchiveUploadEnabled
     $archivePlanEntries['Синхронізація BAZA_APP на SFTP'] = [bool]$bazaAppSFTPSyncEnabled
@@ -6804,7 +6807,8 @@ function Main {
     Write-Log "Очищення обідніх архівів (_1300.): $(if ($enableLunchArchiveCleanup) {'УВIМКНЕНО'} else {'ВИМКНЕНО'})" -NoTimestamp
     Write-Log "Узгодженість щоденних архівів: $([string]$backupConsistency.Mode)" -NoTimestamp
     foreach ($archive in $archiveDefinitions) {
-        Write-Log "Архiвацiя $($archive.Type): $(if ($archive.Enabled) {'УВIМКНЕНО'} else {'ВИМКНЕНО'})" -NoTimestamp
+        $archiveLogState = $(if (-not $archive.Enabled) { 'ВИМКНЕНО' } elseif ($notInstalledComponents -contains [string]$archive.Type) { 'НЕ ВСТАНОВЛЕНО (пропущено)' } else { 'УВIМКНЕНО' })
+        Write-Log "Архiвацiя $($archive.Type): $archiveLogState" -NoTimestamp
     }
     # Джерело показуємо для кожного увiмкненого компонента — інакше з
     # самого лише "УВIМКНЕНО" не видно, який саме каталог реально обрано
@@ -8779,7 +8783,7 @@ function Main {
     # логується і ніколи не змінює результат Archive (інваріант
     # «telemetry не змінює exit code»).
     try {
-        $statusComponentsTotal = @($archiveDefinitions | Where-Object { [bool]$_.Enabled }).Count
+        $statusComponentsTotal = @($enabledArchives).Count
         $statusComponentsSucceeded = @($results.Values | Where-Object { [bool]$_.ArchiveSuccess }).Count
         $statusTotalCreatedBytes = [long]0
         foreach ($statusComponentResult in $results.Values) {
@@ -8912,12 +8916,11 @@ function Main {
     # Архіви: усі заплановані компоненти в стабільному порядку
     # archiveDefinitions — успішний component показує розмір і повний
     # шлях окремим рядком, невдалий — ERROR без вигаданого шляху.
-    if ($archiveDefinitions.Count -gt 0) {
+    # Лише компоненти реального складу ($enabledArchives): NotInstalled
+    # пропущено без помилки і не має друкуватись як «Архів не створено».
+    if ($enabledArchives.Count -gt 0) {
         Write-BRAVOResultSection -Title 'Архіви'
-        foreach ($definition in $archiveDefinitions) {
-            if (-not [bool]$definition.Enabled) {
-                continue
-            }
+        foreach ($definition in $enabledArchives) {
             $componentResult = $results[$definition.Type]
             if ($null -ne $componentResult -and [bool]$componentResult.ArchiveSuccess) {
                 Write-Host ("  {0,-12}{1}" -f $definition.Type, (Format-BRAVOFileSize -Bytes $componentResult.Bytes))

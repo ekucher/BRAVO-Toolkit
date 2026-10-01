@@ -589,11 +589,17 @@ try {
             # Склад за наявністю (рішення власника 2026-10-01): той самий
             # Resolve-BRAVOBackupComponentScope, що й у BRAVO_ARCHIV. Не
             # встановлений на сервері компонент не є помилкою перевірки.
+            # Другий доказ присутності - останній COMPLETE manifest, як і в
+            # BRAVO_ARCHIV: SETUP і нічний прогін мають погоджуватись.
+            $discoveryPreviousEvidence = Get-BRAVOLastCompleteBackupEvidence `
+                -BackupRoot ([string]$global:backupRootPath)
             $discoveryScope = Resolve-BRAVOBackupComponentScope `
                 -DiscoveryResult $bravoDiscoveryResult `
                 -Baseline $discoveryDriftBaseline `
                 -BaselineSourceKind $discoveryDriftBaselineKind `
-                -EnabledComponents $global:discoveryEnabledComponents
+                -EnabledComponents $global:discoveryEnabledComponents `
+                -PreviousCompleteComponents @($discoveryPreviousEvidence.Components) `
+                -PreviousCompleteAt $discoveryPreviousEvidence.CreatedAtUtc
             $discoveryDriftFindings = @($discoveryScope.Findings)
 
             # #282: каталог призначення перевіряється лише для компонента,

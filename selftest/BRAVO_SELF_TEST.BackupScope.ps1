@@ -107,6 +107,114 @@ Test-BRAVOCondition -Condition (
 ) -Name 'BackupScope/PreviouslyBackedUpComponentVanishedWithoutBaselineIsError' `
     -Failure 'без baseline компонент, що мав архів в останній COMPLETE generation і зник, має бути Missing (Error), а не NotInstalled'
 
+# (2c) P2-1 (безпека даних): оголошене, але недоступне джерело ніколи не
+# стає NotInstalled. Структурна перевірка відрізняє «не існує/порожньо» від
+# «не вдалося прочитати», а presence оголошеного шляху без підтвердження —
+# Error (не Absent), тому компонент лишається в складі й падає гучно.
+$scopeDirRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_SCOPE_DIR_' + [guid]::NewGuid().ToString('N'))
+try {
+    $scopeDirFull = Join-Path $scopeDirRoot 'full'
+    $scopeDirEmpty = Join-Path $scopeDirRoot 'empty'
+    $scopeDirMissing = Join-Path $scopeDirRoot 'missing'
+    [void](New-Item -ItemType Directory -Path $scopeDirFull -Force)
+    [void](New-Item -ItemType Directory -Path $scopeDirEmpty -Force)
+    [IO.File]::WriteAllText((Join-Path $scopeDirFull 'data.txt'), 'x')
+    $scopeKindFull = Test-BRAVODiscoverySourceDirectory -Path $scopeDirFull
+    $scopeKindEmpty = Test-BRAVODiscoverySourceDirectory -Path $scopeDirEmpty
+    $scopeKindMissing = Test-BRAVODiscoverySourceDirectory -Path $scopeDirMissing
+    Test-BRAVOCondition -Condition (
+        $scopeKindFull.Valid -and [string]$scopeKindFull.Kind -eq 'Ok' -and
+        -not $scopeKindEmpty.Valid -and [string]$scopeKindEmpty.Kind -eq 'Empty' -and
+        -not $scopeKindMissing.Valid -and [string]$scopeKindMissing.Kind -eq 'NotFound'
+    ) -Name 'BackupScope/SourceDirectoryDistinguishesMissingFromUnreadable' `
+        -Failure 'Test-BRAVODiscoverySourceDirectory має повертати Kind: Ok / Empty / NotFound (а Unreadable/Reparse - для нечитабельного)'
+
+    $scopeDiscoveryModule = Get-Module -Name 'BRAVO.Discovery'
+    # Нечитабельний каталог (відмова в доступі) імітується підміною
+    # Get-Item/Get-ChildItem у scope модуля: від root Linux справжню
+    # відмову не відтворити. Це той самий код-шлях catch у production.
+    $scopeUnreadableGetItem = & $scopeDiscoveryModule {
+        param($p)
+        function Get-Item { throw (New-Object System.UnauthorizedAccessException 'Access denied (synthetic)') }
+        Test-BRAVODiscoverySourceDirectory -Path $p
+    } $scopeDirFull
+    $scopeUnreadableList = & $scopeDiscoveryModule {
+        param($p)
+        function Get-ChildItem { throw (New-Object System.UnauthorizedAccessException 'Access denied (synthetic)') }
+        Test-BRAVODiscoverySourceDirectory -Path $p
+    } $scopeDirFull
+    $scopeDeclaredUnreadable = & $scopeDiscoveryModule {
+        param($p)
+        function Get-Item { throw (New-Object System.UnauthorizedAccessException 'Access denied (synthetic)') }
+        Resolve-BRAVODiscoveryPathComponentPresence -Component 'BLOG' -Path $p -Source 'BravoIni' -Reason 'bravo.ini'
+    } $scopeDirFull
+    $scopeDeclaredMissing = & $scopeDiscoveryModule {
+        param($p)
+        Resolve-BRAVODiscoveryPathComponentPresence -Component 'BLOG' -Path $p -Source 'BravoIni' -Reason 'bravo.ini'
+    } $scopeDirMissing
+    $scopeDeclaredPresent = & $scopeDiscoveryModule {
+        param($p)
+        Resolve-BRAVODiscoveryPathComponentPresence -Component 'BLOG' -Path $p -Source 'BravoIni' -Reason 'bravo.ini'
+    } $scopeDirFull
+    Test-BRAVOCondition -Condition (
+        -not $scopeUnreadableGetItem.Valid -and [string]$scopeUnreadableGetItem.Kind -eq 'Unreadable' -and
+        -not $scopeUnreadableList.Valid -and [string]$scopeUnreadableList.Kind -eq 'Unreadable' -and
+        [string]$scopeDeclaredUnreadable.Presence -eq 'Error' -and
+        [string]$scopeDeclaredMissing.Presence -eq 'Absent' -and
+        [string]$scopeDeclaredPresent.Presence -eq 'Present'
+    ) -Name 'BackupScope/DeclaredButUnreadableSourceIsErrorNotAbsent' `
+        -Failure 'оголошений шлях, який не вдалося прочитати (доступ/помилка), має давати Kind Unreadable і presence Error; лише достовірно відсутній - Absent'
+} finally {
+    if (Test-Path -LiteralPath $scopeDirRoot) {
+        Remove-Item -LiteralPath $scopeDirRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$scopeDeclaredDiscovery = New-BRAVOSelfTestScopeDiscovery -Presence $scopeBlogAbsentPresence
+$scopeDeclaredDiscovery.Components['BLOG'] = [pscustomobject]@{
+    Component = 'BLOG'; Presence = 'Absent'; Source = 'BravoIni'; Path = $null
+    Reason = 'шлях з bravo.ini недоступний (синтетично)'
+}
+$scopeDeclaredAbsent = Resolve-BRAVOBackupComponentScope `
+    -DiscoveryResult $scopeDeclaredDiscovery `
+    -EnabledComponents $scopeAllEnabled
+Test-BRAVOCondition -Condition (
+    [string]$scopeDeclaredAbsent.Components['BLOG'] -eq 'Missing' -and
+    @($scopeDeclaredAbsent.NotInstalled) -notcontains 'BLOG' -and
+    [bool]$scopeDeclaredAbsent.EffectiveEnabledComponents['BLOG'] -and
+    @($scopeDeclaredAbsent.Findings | Where-Object { [string]$_.Severity -eq 'Error' -and [string]$_.Component -eq 'BLOG' }).Count -eq 1 -and
+    [string]$scopeDeclaredAbsent.Components['BRAVOEXCH'] -eq 'NotInstalled'
+) -Name 'BackupScope/DeclaredSourceAbsentWithoutBaselineIsNeverNotInstalled' `
+    -Failure 'Absent з оголошеним джерелом (BravoIni/ServiceDiscovery/ExplicitOverride) без baseline не може стати NotInstalled: компонент має лишитись у складі як Missing (Error)'
+
+# (2d) P3: доказ з попереднього COMPLETE manifest діє й коли baseline є, але
+# старіший за цей manifest і не містить компонента. Новіший baseline
+# (оператор підтвердив зникнення) доказ скасовує, тож deadlock немає.
+$scopeOldBaseline = [pscustomobject]@{ SavedAt = '2026-01-01T00:00:00.0000000Z'; MODEL_SOURCE = 'C:\ExampleLims\Model' }
+$scopeNewBaseline = [pscustomobject]@{ SavedAt = '2026-03-01T00:00:00.0000000Z'; MODEL_SOURCE = 'C:\ExampleLims\Model' }
+$scopeManifestAt = [datetime]::Parse('2026-02-01T00:00:00Z').ToUniversalTime()
+$scopeStaleBaselineRun = Resolve-BRAVOBackupComponentScope `
+    -DiscoveryResult (New-BRAVOSelfTestScopeDiscovery -Presence $scopeBlogAbsentPresence) `
+    -Baseline $scopeOldBaseline -BaselineSourceKind 'Canonical' `
+    -EnabledComponents $scopeAllEnabled `
+    -PreviousCompleteComponents @('MODEL', 'BLOG') -PreviousCompleteAt $scopeManifestAt
+$scopeFreshBaselineRun = Resolve-BRAVOBackupComponentScope `
+    -DiscoveryResult (New-BRAVOSelfTestScopeDiscovery -Presence $scopeBlogAbsentPresence) `
+    -Baseline $scopeNewBaseline -BaselineSourceKind 'Canonical' `
+    -EnabledComponents $scopeAllEnabled `
+    -PreviousCompleteComponents @('MODEL', 'BLOG') -PreviousCompleteAt $scopeManifestAt
+$scopeNoTimeRun = Resolve-BRAVOBackupComponentScope `
+    -DiscoveryResult (New-BRAVOSelfTestScopeDiscovery -Presence $scopeBlogAbsentPresence) `
+    -Baseline $scopeOldBaseline -BaselineSourceKind 'Canonical' `
+    -EnabledComponents $scopeAllEnabled `
+    -PreviousCompleteComponents @('MODEL', 'BLOG')
+Test-BRAVOCondition -Condition (
+    [string]$scopeStaleBaselineRun.Components['BLOG'] -eq 'Missing' -and
+    [string]$scopeFreshBaselineRun.Components['BLOG'] -eq 'NotInstalled' -and
+    [string]$scopeNoTimeRun.Components['BLOG'] -eq 'NotInstalled'
+) -Name 'BackupScope/PreviousManifestEvidenceCoversBaselineThatPredatesComponent' `
+    -Failure 'компонент з архівом у COMPLETE manifest, який новіший за baseline без цього компонента, має бути Missing; новіший baseline або відсутність часу manifest - NotInstalled'
+
 # Той самий читач, що годує Resolve: останній COMPLETE manifest у MANIFESTS\.
 $scopeManifestRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_SCOPE_BACKUP_' + [guid]::NewGuid().ToString('N'))
 try {
@@ -130,6 +238,14 @@ try {
         components = @{ BAZA_APP = @{ CreateSuccess = $true; ArchivePath = 'C:\x.7z' } }
     } | ConvertTo-Json -Depth 5), $scopeUtf8)
     $scopeLastNames = @(Get-BRAVOLastCompleteBackupComponents -BackupRoot $scopeManifestRoot)
+    $scopeLastEvidence = Get-BRAVOLastCompleteBackupEvidence -BackupRoot $scopeManifestRoot
+    Test-BRAVOCondition -Condition (
+        $null -ne $scopeLastEvidence.CreatedAtUtc -and
+        ([datetime]$scopeLastEvidence.CreatedAtUtc).ToUniversalTime().Date -eq [datetime]::Parse('2026-01-02').Date -and
+        @($scopeLastEvidence.Components).Count -eq 2 -and
+        $null -eq (Get-BRAVOLastCompleteBackupEvidence -BackupRoot (Join-Path $scopeManifestRoot 'немає')).CreatedAtUtc
+    ) -Name 'BackupScope/LastCompleteEvidenceCarriesManifestTime' `
+        -Failure 'Get-BRAVOLastCompleteBackupEvidence має повертати час найновішого COMPLETE manifest разом з компонентами'
     Test-BRAVOCondition -Condition (
         $scopeLastNames.Count -eq 2 -and
         $scopeLastNames -contains 'MODEL' -and
@@ -341,7 +457,8 @@ Test-BRAVOCondition -Condition (
     $scopeArchiveText.Contains('Test-SFTPConfig -NotInstalledComponents $notInstalledComponents') -and
     $scopeArchiveText.Contains('Test-SFTPConfig -SynchronizationOnly -NotInstalledComponents $manualNotInstalled') -and
     $scopeArchiveText.Contains('$_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type') -and
-    $scopeArchiveText.Contains('-PreviousCompleteComponents @(Get-BRAVOLastCompleteBackupComponents -BackupRoot $backupRootPath)') -and
+    $scopeArchiveText.Contains('Get-BRAVOLastCompleteBackupEvidence -BackupRoot $backupRootPath') -and
+    $scopeArchiveText.Contains('-PreviousCompleteAt $previousCompleteEvidence.CreatedAtUtc') -and
     $scopeHealthText.Contains('-BackupRoot $backupRootPath')
 ) -Name 'BackupScope/SftpConfigSkipsNotInstalledAndPreviousProofWired' `
     -Failure 'Test-SFTPConfig не має вимагати SFTP-каталоги NotInstalled-компонентів; Archive і Health мають передавати останній COMPLETE manifest як другий доказ'
@@ -357,3 +474,25 @@ Test-BRAVOCondition -Condition (
     $scopeSetupText.Contains('-EnabledComponents $discoveryScope.EffectiveEnabledComponents')
 ) -Name 'BackupScope/SetupValidatesEffectiveComposition' `
     -Failure 'BRAVO_SETUP -ValidateOnly має перевіряти склад через Resolve-BRAVOBackupComponentScope'
+Test-BRAVOCondition -Condition (
+    $scopeSetupText.Contains('Get-BRAVOLastCompleteBackupEvidence') -and
+    $scopeSetupText.Contains('-PreviousCompleteComponents @($discoveryPreviousEvidence.Components)') -and
+    $scopeSetupText.Contains('-PreviousCompleteAt $discoveryPreviousEvidence.CreatedAtUtc')
+) -Name 'BackupScope/SetupPassesPreviousCompleteEvidenceLikeArchive' `
+    -Failure 'BRAVO_SETUP має передавати той самий другий доказ (останній COMPLETE manifest), що й BRAVO_ARCHIV, щоб SETUP і нічний прогін погоджувались'
+
+# (10) P2-2: підсумок ARCHIV (status JSON, секція "Архіви", план, лог) рахує
+# і друкує лише реальний склад $enabledArchives, а не NotInstalled-компоненти.
+$scopeResultStart = $scopeArchiveText.IndexOf("Write-BRAVOResultSection -Title 'Архіви'")
+$scopeResultBlock = $(if ($scopeResultStart -ge 0) { $scopeArchiveText.Substring([Math]::Max(0, $scopeResultStart - 120), 700) } else { '' })
+Test-BRAVOCondition -Condition (
+    $scopeResultStart -ge 0 -and
+    $scopeResultBlock.Contains('if ($enabledArchives.Count -gt 0)') -and
+    $scopeResultBlock.Contains('foreach ($definition in $enabledArchives)') -and
+    -not $scopeResultBlock.Contains('foreach ($definition in $archiveDefinitions)') -and
+    $scopeArchiveText.Contains('$statusComponentsTotal = @($enabledArchives).Count') -and
+    -not $scopeArchiveText.Contains('$statusComponentsTotal = @($archiveDefinitions') -and
+    $scopeArchiveText.Contains('$notInstalledComponents -notcontains [string]$archiveDefinition.Type') -and
+    $scopeArchiveText.Contains("'НЕ ВСТАНОВЛЕНО (пропущено)'")
+) -Name 'BackupScope/ArchiveSummaryCountsOnlyInstalledComponents' `
+    -Failure 'status JSON componentsTotal, секція "Архіви", план і лог мають використовувати $enabledArchives: NotInstalled не рахується і не друкується як "Архів не створено"'
