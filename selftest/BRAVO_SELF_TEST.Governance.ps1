@@ -6414,6 +6414,35 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
             ) `
             -Name "Rollback/PostDeployGateTreatsSetupExit10AsPassWithWarning" `
             -Failure "гейт після розгортання: BRAVO_SETUP exit 0 => PASS, 10 => PASS WITH WARNING без провалу гейта (інакше справне оновлення відкочується), інший код => провал (#330); verdicts=$($gateVerdicts -join ',') ok=$(@($gateOk.Failures) -join ' | ') warn=$(@($gateWarn.Failures) -join ' | ')/$($gateWarn.Warnings) sched=$(@($gateFailSched.Failures) -join ' | ') val=$(@($gateFailVal.Failures) -join ' | ')"
+
+        # --- #330: матриця вердиктів (Scheduler x ValidateOnly) і відкату ---
+        # Реально виконується витягнутий блок гейта; вердикт: є провал гейта =>
+        # FAIL, інакше є попередження => PASS WITH WARNING, інакше PASS.
+        $matrix = @(
+            @{ S = 0; V = 0; E = 'PASS' }, @{ S = 10; V = 0; E = 'PASS WITH WARNING' },
+            @{ S = 0; V = 10; E = 'PASS WITH WARNING' }, @{ S = 10; V = 10; E = 'PASS WITH WARNING' },
+            @{ S = 1; V = 0; E = 'FAIL' }, @{ S = 0; V = 2; E = 'FAIL' }, @{ S = 10; V = 2; E = 'FAIL' }
+        )
+        $matrixBad = New-Object System.Collections.Generic.List[string]
+        foreach ($case in $matrix) {
+            $r = & $gateRun $case.S $case.V
+            $got = if (@($r.Failures).Count -gt 0) { 'FAIL' } elseif ($r.Warnings -gt 0) { 'PASS WITH WARNING' } else { 'PASS' }
+            if ($got -ne $case.E) { [void]$matrixBad.Add(('{0}/{1}: очікувано {2}, отримано {3}' -f $case.S, $case.V, $case.E, $got)) }
+        }
+        $rbMatrix = @(
+            @{ C = 0; E = 'PASS' }, @{ C = 10; E = 'PASS WITH WARNING' }, @{ C = 3; E = 'FAIL' }
+        )
+        foreach ($case in $rbMatrix) {
+            $r = & $orchRun 0 $case.C 0 ''
+            $got = if (@($r.Problems).Count -gt 0) { 'FAIL' }
+                   elseif ((Get-BRAVODeploySetupExitVerdict -ExitCode $case.C) -eq 'PASS_WITH_WARNING') { 'PASS WITH WARNING' }
+                   else { 'PASS' }
+            if ($got -ne $case.E) { [void]$matrixBad.Add(('rollback {0}: очікувано {1}, отримано {2}' -f $case.C, $case.E, $got)) }
+        }
+        Test-BRAVOCondition `
+            -Condition ($null -ne $gateAst -and $matrixBad.Count -eq 0) `
+            -Name "Rollback/SetupExitVerdictMatrixGateAndRollback" `
+            -Failure "матриця вердиктів BRAVO_SETUP (#330): Scheduler/Validate 0/0 PASS; 10/0, 0/10, 10/10 PASS WITH WARNING; 1/0, 0/2, 10/2 FAIL; після відкату 0 PASS, 10 PASS WITH WARNING, 3 FAIL; розбіжності: $($matrixBad -join '; ')"
     } finally {
         $script:RollbackProblems = @()
         if (Test-Path -LiteralPath $sb3) { Remove-Item -LiteralPath $sb3 -Recurse -Force -ErrorAction SilentlyContinue }
