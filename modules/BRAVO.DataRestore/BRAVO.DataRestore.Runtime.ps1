@@ -1596,7 +1596,8 @@ function Get-BRAVODataRestoreServiceSnapshot {
             } catch {
                 $serviceInfo = $null
             }
-            $startMode = if ($serviceInfo) { [string]$serviceInfo.StartMode } else { [string]$service.StartType }
+            # StartType відсутній на .NET < 4.6.1 (#319): безпечне читання.
+            $startMode = if ($serviceInfo) { [string]$serviceInfo.StartMode } else { [string](Get-BRAVOServiceStartMode -Service $service -NoWmiQuery).StartMode }
         }
         [pscustomobject]@{
             Exists = ($null -ne $service)
