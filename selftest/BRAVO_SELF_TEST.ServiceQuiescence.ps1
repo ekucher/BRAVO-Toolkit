@@ -833,6 +833,7 @@ function Get-BRAVOWmiInstance {
     # Get/Stop-Service затінені in-memory стабами (стаб ПЕРШИМ).
     # ============================================================
     #region #297-start-type-suppression
+    & {
     $startModeStubs = @'
 function Reset-BRAVOSelfTestStartModes {
     param([hashtable]$Modes, [hashtable]$Status = @{}, [string[]]$SetFailures = @(), [string[]]$StopFailures = @())
@@ -1304,5 +1305,6 @@ function Restore-BRAVOServiceStartTypeSnapshot {
             -Failure "після lock Maintenance має повторити Repair і перевірити класифікацію служб (зміна -> fail-closed exit 20) до будь-яких дій; DataRestore пише маркер з -PreserveForeignStartTypeSnapshot"
     } finally {
         Remove-Item -LiteralPath $startModeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
     }
     #endregion #297-start-type-suppression
