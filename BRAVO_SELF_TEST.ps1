@@ -11650,6 +11650,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             Nothing = & $reason (& $task) (& $status 0 1) $null $null
             ReadFailedTask = & $reason $null (& $status 20 1) $null $null
             ReadFailedAll = & $reason $null $null $null $null
+            ExpIncomplete = $now.AddHours(-3).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpRun2 = $now.AddHours(-2).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpRun72 = $now.AddHours(-72).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpFinished1 = $now.AddHours(-1).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
         }
     }
     Test-BRAVOCondition `
@@ -11670,7 +11674,12 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $staleReasons.StatusCode -match 'код 20 \(TEST_NAME\)' -and
             $null -eq $staleReasons.Nothing -and
             $staleReasons.ReadFailedTask -match 'код 20' -and
-            $null -eq $staleReasons.ReadFailedAll
+            $null -eq $staleReasons.ReadFailedAll -and
+            $staleReasons.Incomplete.Contains($staleReasons.ExpIncomplete) -and
+            $staleReasons.BadResult.Contains($staleReasons.ExpRun2) -and
+            $staleReasons.NotRun.Contains($staleReasons.ExpRun72) -and
+            $staleReasons.Early.Contains($staleReasons.ExpRun2) -and
+            $staleReasons.StatusCode.Contains($staleReasons.ExpFinished1)
         ) `
         -Name 'Health/StaleGenerationReasonClassifier' `
         -Failure "класифікатор причин (завдання відсутнє/вимкнене/INCOMPLETE/код/не запускалося/достроково/статус/нічого; помилка читання пропускає перевірку): $($staleReasons | ConvertTo-Json -Compress)"
@@ -11761,10 +11770,25 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         [pscustomobject]@{
             Mixed = New-SlackAlertMessage -Issues $issues -Duration ([timespan]::FromSeconds(1))
             AgeOnly = New-SlackAlertMessage -Issues @($issues[0], $issues[1], $issues[2]) -Duration ([timespan]::FromSeconds(1))
+            NoGeneration = New-SlackAlertMessage -Issues @($issues[1], $issues[2]) -Duration ([timespan]::FromSeconds(1))
+            OtherFiles = New-SlackAlertMessage -Issues @($issues[0], (& $cloud 'SFTP MODEL' $ageOnly 'MODEL_other.7z'), (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_other.7z')) -Duration ([timespan]::FromSeconds(1))
+            Smb = New-SlackAlertMessage -Issues @($issues[0], [pscustomobject]@{ Kind = 'SMBArchive'; Component = 'NAS/SMB MODEL'; Reason = $ageOnly; FileName = 'MODEL_old.7z'; LastWriteTime = $null; SizeBytes = 10; ExpectedSizeBytes = 10; ActualSizeBytes = 10; Location = '/x' }) -Duration ([timespan]::FromSeconds(1))
         }
     }
     $staleAgeOnlyText = [string]$staleSlackText.AgeOnly
     $staleMixedText = [string]$staleSlackText.Mixed
+    Test-BRAVOCondition `
+        -Condition (
+            $staleSlackText.NoGeneration -notmatch 'та сама застаріла' -and
+            ([regex]::Matches([string]$staleSlackText.NoGeneration, 'файл є, розмір збігається')).Count -eq 2 -and
+            $staleSlackText.OtherFiles -notmatch 'та сама застаріла' -and
+            ([regex]::Matches([string]$staleSlackText.OtherFiles, 'файл є, розмір збігається')).Count -eq 2 -and
+            $staleSlackText.Smb -match 'Проблемних компонентів: 1 ·' -and
+            $staleSlackText.Smb -match 'та сама застаріла generation' -and
+            $staleSlackText.Smb -notmatch 'віддалена копія старша'
+        ) `
+        -Name 'Health/StaleGenerationCollapseNegativeAndSmbCases' `
+        -Failure "без застарілої generation або з іншим файлом хмарні рядки лишаються; SMB age-only згортається: $($staleSlackText | ConvertTo-Json -Compress)"
     Test-BRAVOCondition `
         -Condition (
             $staleAgeOnlyText -match '(?s)ЛОКАЛЬНІ БЕКАПИ\s+:x: Generation — остання COMPLETE generation старша за 24 год\..*\n:mag: Причина: завдання BRAVO_ARCHIV вимкнене' -and
@@ -11824,13 +11848,26 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue)
             }
             function Write-HealthLog { param($Message, $Level) }
+            # Позитивний шлях обгортки діагностики: завдання є й свіже, status-файл має код 20.
+            $stateRoot = $BackupRoot
+            $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+            function Get-BRAVOScheduledTaskState {
+                param($TaskPath, $TaskName)
+                return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = (Get-Date).AddHours(-1); LastTaskResult = 0 } }
+            }
+            function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+            function Get-BRAVOOperationStatus {
+                param($Path)
+                return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = [pscustomobject]@{ exitCode = 20; exitCodeName = 'TEST_NAME'; finishedAt = (Get-Date).AddMinutes(-30) } }
+            }
             return @(Get-BackupHealthIssues)[0]
         } $healthNoGenerationRoot
         Test-BRAVOCondition `
             -Condition (
                 $healthNoGenerationIssue.Reason -eq 'не знайдено жодного COMPLETE generation manifest' -and
                 $healthNoGenerationIssue.FileName -eq 'немає даних' -and
-                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json'
+                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json' -and
+                $healthNoGenerationIssue.Diagnosis -match 'код 20 \(TEST_NAME\)'
             ) `
             -Name 'Health/MissingCompleteGenerationHasNoFictitiousFileName' `
             -Failure 'за відсутності COMPLETE generation Health має показувати причину, але не вигаданий BRAVO_BACKUP_.json'
