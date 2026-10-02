@@ -210,10 +210,9 @@ function Test-SevenZipArchiveIntegrity {
 function Get-BRAVOValidArchiveSizeHistory {
     # AUD-008 (аудит P1.6): для sanity-check обсягу backup потрібна історія
     # РОЗМІРІВ попередніх валідних (hash-підтверджених) архівів того самого
-    # компонента. Той самий алгоритм валідації, що Remove-OldBackupSets
-    # (BRAVO.Archive.Runtime.ps1) використовує для retention — сюди
-    # свідомо не винесений як спільна функція, щоб не чіпати вже
-    # перевірений retention-код; тут лише збирається .Length, видалення
+    # компонента. Валідація — та сама пара архів + .sha512 з SHA512,
+    # що й у retention (Test-BRAVOGenerationManifestVerified,
+    # BRAVO.Archive.Runtime.ps1); тут лише збирається .Length, видалення
     # не відбувається.
     [CmdletBinding()]
     param(

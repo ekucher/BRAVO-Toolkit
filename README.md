@@ -1709,9 +1709,27 @@ checks, acceptance) — у `RELEASE_POLICY.md` у корені репозито�
 - перед production-змінами завжди виконуйте self-test, `-ValidateOnly` і
   dry-run;
 - `enableArchiveDeletion` ніколи не видаляє останні `minimumRetainedVerifiedBackups`
-  (за замовчуванням `1`) перевірених (SHA512 збігається) комплектів кожного
-  компонента, навіть якщо вони старші за `archiveRetentionDays` — серія
-  невдалих backup не повинна лишити компонент без жодної придатної копії;
+  (за замовчуванням `2`) COMPLETE generation, що проходять повну перевірку
+  (архів і hash-файл кожного компонента на місці, SHA512 збігається), навіть
+  якщо вони старші за `archiveRetentionDays`. Захист рахується по generation
+  цілком, а не окремо по компонентах — серія невдалих backup не повинна
+  лишити сервер без жодної придатної копії;
+- гілку видалення визначає записаний статус прогону: COMPLETE generation
+  видаляється лише за `archiveRetentionDays` і лише при
+  `enableArchiveDeletion = $true`; generation, що не завершилась COMPLETE, —
+  за `failedArchiveRetentionDays` при `enableFailedArchiveDeletion`.
+  COMPLETE generation, що не проходить перевірку, лише дає WARNING про
+  пошкоджену копію і ніколи не видаляється як невдала. Повне читання архівів
+  (SHA512) відбувається лише коли `enableArchiveDeletion = $true` і є
+  прострочені COMPLETE generation; для WARNING про відсутні чи змінені за
+  розміром файли використовується дешева перевірка без читання вмісту;
+- шляхи до архівів retention шукає так само, як відновлення: за записаним
+  шляхом, а якщо його немає — у канонічному каталозі компонента (сховище,
+  перенесене на інший диск). Manifest видаляється лише після всіх знайдених
+  архівів своєї generation; помилка на одній generation не зупиняє решту.
+  Generation з типом компонента, якого немає в поточних налаштуваннях,
+  не видаляється (WARNING). Архіви без generation manifest-а лише рахуються
+  в рядку «Аудит retention» і автоматично не видаляються;
 - помилки завантаження `BRAVO.config` і читання Credential Manager
   (SFTP/SMB/архів/webhook) маскуються `Protect-BRAVOLogSecret` одразу при
   захопленні винятку, а не лише при подальшому записі в лог — ці
