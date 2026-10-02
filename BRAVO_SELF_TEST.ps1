@@ -869,7 +869,7 @@ function ConvertTo-BRAVOSelfTestCommandEntry {
         return [pscustomobject]@{ Kind = 'Alias'; Definition = [string]$Item.Definition; Options = [string]$Item.Options
             Description = [string]$Item.Description; ScriptBlock = $null; Item = $Item }
     }
-    return [pscustomobject]@{ Kind = 'Function'; Definition = [string]$Item.ModuleName; Options = ''
+    return [pscustomobject]@{ Kind = 'Function'; Definition = [string]$Item.ModuleName; Options = [string]$Item.Options
         Description = ''; ScriptBlock = $Item.ScriptBlock; Item = $Item }
 }
 
@@ -952,6 +952,17 @@ function Set-BRAVOSelfTestBuiltinCommandEntry {
     if ($null -eq $Entry) { return }
     if ($Entry.Kind -eq 'Function') {
         Microsoft.PowerShell.Management\Set-Item -Path ('function:' + $Scope.ToLowerInvariant() + ':' + $Name) -Value $Entry.ScriptBlock -Force
+        # Options (ReadOnly/AllScope/Private) Set-Item не переносить —
+        # повернути їх на щойно відновленій функції.
+        $restoredOptions = [Management.Automation.ScopedItemOptions]$Entry.Options
+        if ($restoredOptions -ne [Management.Automation.ScopedItemOptions]::None) {
+            $restoredFunction = if ($Scope -eq 'Global') {
+                Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $Name)
+            } else {
+                Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue
+            }
+            if ($null -ne $restoredFunction) { $restoredFunction.Options = $restoredOptions }
+        }
     } else {
         Microsoft.PowerShell.Utility\Set-Alias -Name $Name -Value $Entry.Definition -Scope $Scope `
             -Option ([Management.Automation.ScopedItemOptions]$Entry.Options) -Description $Entry.Description -Force
@@ -26210,6 +26221,39 @@ Test-BRAVOCondition -Condition (
     -Failure ("аліас має повернутися з початковими Options/Description: {0}; залишки: {1}" -f
         $(if ($null -ne $aliasMetaProbeRestored) { '{0} [{1}] "{2}"' -f $aliasMetaProbeRestored.Definition, $aliasMetaProbeRestored.Options, $aliasMetaProbeRestored.Description } else { 'аліаса немає' }),
         [string]::Join('; ', [string[]]$aliasMetaProbeResidualProblems))
+
+# Codex P2 на #340 (5): глобальна функція повертається з початковими Options.
+$functionOptionsProbeName = 'Restart-Service'
+$functionOptionsProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $functionOptionsProbeName) -ErrorAction SilentlyContinue)
+$functionOptionsProbeRestored = $null
+$functionOptionsProbeResidualProblems = @()
+if (-not $functionOptionsProbePreexisting) {
+    try {
+        Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $functionOptionsProbeName) -Value { 'baseline-readonly' } -Force
+        (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $functionOptionsProbeName)).Options = [Management.Automation.ScopedItemOptions]::ReadOnly
+        $functionOptionsProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        try {
+            Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $functionOptionsProbeName)
+            [void](New-Module -ScriptBlock { function Restart-Service { 'stub' } })
+        } finally {
+            $functionOptionsProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $functionOptionsProbeSnapshot -Label 'Framework.FunctionOptionsProbe')
+        }
+        $functionOptionsProbeRestored = Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $functionOptionsProbeName)
+    } finally {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $functionOptionsProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $functionOptionsProbePreexisting -or (
+        $null -ne $functionOptionsProbeRestored -and
+        (& $functionOptionsProbeRestored.ScriptBlock) -eq 'baseline-readonly' -and
+        (($functionOptionsProbeRestored.Options -band [Management.Automation.ScopedItemOptions]::ReadOnly) -ne 0) -and
+        $functionOptionsProbeResidualProblems.Count -eq 0)
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FunctionOptionsRestored' `
+    -Failure ("функція має повернутися з початковими Options: {0}; залишки: {1}" -f
+        $(if ($null -ne $functionOptionsProbeRestored) { [string]$functionOptionsProbeRestored.Options } else { 'функції немає' }),
+        [string]::Join('; ', [string[]]$functionOptionsProbeResidualProblems))
 
 # Codex P2 на #340 (4): global-заглушка (голий New-Module) під уже наявною
 # script-функцією з тим самим ім'ям знімається; script-функція лишається.
