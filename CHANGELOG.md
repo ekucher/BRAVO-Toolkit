@@ -89,6 +89,37 @@
   `Health/StaleGenerationInLocalSectionWithReason`,
   `Health/StaleGenerationCollapsesOnlyAgeOnlyCloudRows`,
   `Health/StaleGenerationDiagnosisKeepsKindAndComponent`.
+
+- **Fix: DataRestore тимчасово утримує тип запуску служб на час restore (#333, продовження #297/#329).**
+  Раніше InPlace-DataRestore лише писав ownership-маркер і не знімав знімок типів запуску: SCM
+  міг підняти службу з delayed/automatic start посеред restore, а після аварійного Maintenance
+  (служби тимчасово `Disabled`, початкові типи в чужому знімку) `Start-Service` падав і прогін
+  завершувався кодом `43` з маркером `restartSuppressed`, який ніхто не знімав. Тепер DataRestore
+  користується тим самим канонічним контрактом BRAVO.System, що й Maintenance (нових копій
+  логіки немає): самовідновлення `Repair-BRAVOOrphanedServiceStartTypes` до читання start type;
+  знімок точних початкових типів (`New-BRAVOServiceStartTypeSnapshot`, Disabled-оператором у
+  знімок не потрапляє) пишеться в той самий маркер до зміни (чужий знімок зливається);
+  `Suspend-BRAVOServiceAutostart` → тимчасовий `Disabled`; `Confirm-BRAVOServicesQuiesced` перед
+  деструктивною фазою; у `finally` `Restore-BRAVOServiceStartTypeSnapshot` повертає типи ПЕРЕД
+  стартом служб (стартують лише служби з наміром). Служба, вимкнена оператором до прогону,
+  лишається `Disabled` і зупиненою. Маркер аварійного прогону з `restartSuppressed` більше не
+  блокує: його знімок зливається, служби з `RestartIntent` запускаються після успішного restore.
+  При незавершеному rollback служби свідомо лишаються `Disabled` (код 43). Збій знімка/утримання
+  скасовує restore до змін даних. Новий експорт `Get-BRAVOForeignServiceQuiescenceContext`
+  (BRAVO.System). Відновлення після аварійного прогону дає попередження, тож успішний restore
+  завершується кодом `10` (SuccessWithWarnings); маркер живого власника блокує прогін (`43`) до
+  будь-яких змін; записи знімка поза керованим набором служб ігноруються. Self-test: `DataRestore/StartMode*` (звичайна служба, Manual-зупинена,
+  delayed automatic, вимкнена оператором, чужий знімок suppressed/repairable, відсутній знімок,
+  зіпсований маркер, збій restore, збій старту служби).
+  Правки рев'ю #345: керована служба зі start type `Other`/нечитаним (не потрапила б у знімок)
+  скасовує restore (`43`) до змін даних, з її іменем у журналі; записи чужого знімка поза
+  керованим набором відкидаються з маркера ДО запису власного (WARNING). Maintenance не змінено.
+  Правки рев'ю #345 (2): очищення чужого маркера більше не викликає приватну
+  `Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess` (не експортована з BRAVO.System, у проді
+  давала `43`); успадковане `restartSuppressed` знімається лише успішним restore — збій цього
+  прогону лишає служби зупиненими й `Disabled`, маркер suppressed (`43`); утримання від автостарту
+  перевіряється (`Confirm-BRAVOServicesQuiesced`) перед КОЖНИМ компонентом, втрата утримання
+  скасовує restore до торкання компонента (`43`).
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
