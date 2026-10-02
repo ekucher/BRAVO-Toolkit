@@ -11887,6 +11887,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -FunctionNames @(
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
             'Get-BRAVOHealthBackupStaleReason',
             'Test-BRAVOHealthCatchUpRunIsAttempt',
             'Get-BRAVOHealthBackupStaleDiagnosis',
