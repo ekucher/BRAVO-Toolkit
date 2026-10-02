@@ -11912,12 +11912,355 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         }
     }
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Scheduler' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' -DependsOn 'Root/Runtime') { try {
+    # #322: діагностика причини застарілої generation (чистий класифікатор,
+    # fixture з INCOMPLETE новішим за COMPLETE, секція Slack і дедуп хмари).
+    $staleReasonModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'ConvertTo-BRAVOUtcDateTime',
+            'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthBackupStaleReason',
+            'Test-BRAVOHealthCatchUpRunIsAttempt',
+            'Get-BRAVOHealthBackupStaleDiagnosis',
+            'Get-BRAVOHealthManifestFailedStage',
+            'Get-BackupHealthIssues'
+        )
+    $staleReasons = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        $now = [datetime]::SpecifyKind([datetime]'2026-09-30T12:00:00', [DateTimeKind]::Utc)
+        $max = [timespan]::FromHours(24)
+        $task = {
+            param($Exists = $true, $Enabled = $true, $Result = 0, $RunAgeHours = 2)
+            [pscustomobject]@{ Exists = $Exists; Enabled = $Enabled; LastTaskResult = $Result; LastRunTime = $now.AddHours(-$RunAgeHours).ToLocalTime() }
+        }
+        $status = {
+            param($Code = 0, $FinishedAgeHours = 1)
+            [pscustomobject]@{ ExitCode = $Code; ExitCodeName = 'TEST_NAME'; FinishedAt = $now.AddHours(-$FinishedAgeHours).ToLocalTime() }
+        }
+        $incomplete = [pscustomobject]@{ GenerationId = 'G-NEW'; Status = 'INCOMPLETE'; CreatedAtUtc = $now.AddHours(-3); Stage = 'MODEL/SHA512' }
+        $reason = { param($t, $s, $i, $c) Get-BRAVOHealthBackupStaleReason -TaskInfo $t -ArchiveStatus $s -LatestIncomplete $i -LatestCompleteUtc $c -NowUtc $now -MaxAge $max }
+        [pscustomobject]@{
+            NotRegistered = & $reason (& $task -Exists $false) $null $null $null
+            Disabled = & $reason (& $task -Enabled $false) $null $null $null
+            # Запуск, що створив INCOMPLETE manifest, стартував РАНІШЕ за нього (-4 год проти -3 год).
+            Incomplete = & $reason (& $task -RunAgeHours 4) $null $incomplete $now.AddHours(-30)
+            IncompleteOlder = & $reason (& $task) $null $incomplete $now.AddHours(-1)
+            BadResult = & $reason (& $task -Result (-2147024891)) (& $status 0 1) $null $null
+            SameCodeNamed = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 1) $null $null
+            SameCodeOldStatus = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 30) $null $null
+            NewerFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            NewerRunning = & $reason (& $task -Result 267009 -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            NewerSuccess = & $reason (& $task -Result 0 -RunAgeHours 1) (& $status 0 0.5) $incomplete $now.AddHours(-30)
+            OlderFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 5) $null $incomplete $now.AddHours(-30)
+            CodeZero = & $reason (& $task -Result 0) $null $null $null
+            Running = & $reason (& $task -Result 267009 -RunAgeHours 1) (& $status 0 30) $null $null
+            NeverRunCode = & $reason (& $task -Result 267011) $null $null $null
+            NeverRunYear = & $reason ([pscustomobject]@{ Exists = $true; Enabled = $true; LastTaskResult = 0; LastRunTime = [datetime]'1999-11-30' }) $null $null $null
+            NotFoundWithStatus = & $reason (& $task -Exists $false) (& $status 20 1) $null $null
+            HashtableInfo = & $reason @{ Exists = $true; Enabled = $false } $null $null $null
+            NotRun = & $reason (& $task -RunAgeHours 72) (& $status 0 71) $null $null
+            Early = & $reason (& $task -RunAgeHours 2) (& $status 0 30) $null $null
+            StatusCode = & $reason (& $task) (& $status 20 1) $null $null
+            Nothing = & $reason (& $task) (& $status 0 1) $null $null
+            ReadFailedTask = & $reason $null (& $status 20 1) $null $null
+            ReadFailedAll = & $reason $null $null $null $null
+            ExpIncomplete = $now.AddHours(-3).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpRun2 = $now.AddHours(-2).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpRun72 = $now.AddHours(-72).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpFinished1 = $now.AddHours(-1).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $staleReasons.NotRegistered -eq 'завдання BRAVO_ARCHIV не знайдене або недоступне для читання' -and
+            $staleReasons.NotFoundWithStatus -match 'код 20' -and
+            $staleReasons.Running -eq 'завдання BRAVO_ARCHIV виконується зараз' -and
+            $staleReasons.NeverRunCode -eq 'завдання BRAVO_ARCHIV ще не запускалося' -and
+            $staleReasons.NeverRunYear -eq 'завдання BRAVO_ARCHIV ще не запускалося' -and
+            $staleReasons.HashtableInfo -eq 'завдання BRAVO_ARCHIV вимкнене' -and
+            $staleReasons.Disabled -eq 'завдання BRAVO_ARCHIV вимкнене' -and
+            $staleReasons.Incomplete -match 'G-NEW' -and $staleReasons.Incomplete -match 'INCOMPLETE' -and $staleReasons.Incomplete -match 'MODEL/SHA512' -and
+            $null -eq $staleReasons.IncompleteOlder -and
+            $staleReasons.BadResult -match '0x80070005' -and $staleReasons.BadResult -notmatch 'TEST_NAME' -and
+            $staleReasons.SameCodeNamed -match '0x00000014 \(TEST_NAME\)' -and
+            $staleReasons.SameCodeOldStatus -match '0x00000014' -and $staleReasons.SameCodeOldStatus -notmatch 'TEST_NAME' -and
+            $staleReasons.NewerFailedRun -match '0x80070005' -and $staleReasons.NewerFailedRun -notmatch 'G-NEW' -and
+            $staleReasons.NewerRunning -eq 'завдання BRAVO_ARCHIV виконується зараз' -and
+            $null -eq $staleReasons.NewerSuccess -and
+            $staleReasons.OlderFailedRun -match 'G-NEW' -and
+            $null -eq $staleReasons.CodeZero -and
+            $staleReasons.NotRun -match '^завдання не запускалося з \d\d\.\d\d\.\d{4} \d\d:\d\d$' -and
+            $staleReasons.Early -match 'завершився достроково' -and
+            $staleReasons.StatusCode -match 'код 20 \(TEST_NAME\)' -and
+            $null -eq $staleReasons.Nothing -and
+            $staleReasons.ReadFailedTask -match 'код 20' -and
+            $null -eq $staleReasons.ReadFailedAll -and
+            $staleReasons.Incomplete.Contains($staleReasons.ExpIncomplete) -and
+            $staleReasons.BadResult.Contains($staleReasons.ExpRun2) -and
+            $staleReasons.NotRun.Contains($staleReasons.ExpRun72) -and
+            $staleReasons.Early.Contains($staleReasons.ExpRun2) -and
+            $staleReasons.StatusCode.Contains($staleReasons.ExpFinished1)
+        ) `
+        -Name 'Health/StaleGenerationReasonClassifier' `
+        -Failure "класифікатор причин (завдання відсутнє/вимкнене/INCOMPLETE/код/не запускалося/достроково/статус/нічого; помилка читання пропускає перевірку): $($staleReasons | ConvertTo-Json -Compress)"
+
+    $fingerprintModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @('Get-BRAVOHealthIssueField', 'Get-AlertFingerprint')
+    $fingerprints = & $fingerprintModule {
+        Set-StrictMode -Version Latest
+        $issue = {
+            param($Diagnosis)
+            [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; Diagnosis = $Diagnosis }
+        }
+        $other = [pscustomobject]@{ Kind = 'LocalBackup'; Component = 'MODEL'; Reason = 'x'; FileName = 'a.7z'; LastWriteTime = $null; Diagnosis = 'a' }
+        $other2 = [pscustomobject]@{ Kind = 'LocalBackup'; Component = 'MODEL'; Reason = 'x'; FileName = 'a.7z'; LastWriteTime = $null; Diagnosis = 'b' }
+        [pscustomobject]@{
+            Running = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV виконується зараз')
+            RunningAgain = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV виконується зараз')
+            Disabled = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV вимкнене')
+            NoDiagnosis = Get-AlertFingerprint -Issues @(& $issue $null)
+            OtherA = Get-AlertFingerprint -Issues @($other)
+            OtherB = Get-AlertFingerprint -Issues @($other2)
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $fingerprints.Running -eq $fingerprints.RunningAgain -and
+            $fingerprints.Running -ne $fingerprints.Disabled -and
+            $fingerprints.Disabled -ne $fingerprints.NoDiagnosis -and
+            $fingerprints.OtherA -eq $fingerprints.OtherB
+        ) `
+        -Name 'Health/AlertFingerprintIncludesGenerationDiagnosis' `
+        -Failure "fingerprint LocalBackupGeneration залежить від Diagnosis (змінена причина не придушується), стабільний за незмінної причини; інші Kind не змінюються: $($fingerprints | ConvertTo-Json -Compress)"
+
+    $staleCatchUp = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        function Write-HealthLog { param($Message, $Level) }
+        $script:mode = 'catchup-newer'
+        $stateRoot = 'x'
+        $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'SELFTEST_MAIN' }; BackupCatchUp = [pscustomobject]@{ Enabled = $true; TaskName = 'SELFTEST_CATCHUP' } }
+        function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+        function Get-BRAVOOperationStatus {
+            param($Path)
+            # catchup-noop: status-файл від справжнього прогону ДО старту catch-up (#323: no-op catch-up його не оновлює).
+            if ($script:mode -eq 'catchup-noop') { return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = [pscustomobject]@{ exitCode = 0; exitCodeName = 'OK'; finishedAt = (Get-Date).AddHours(-29) } } }
+            throw 'self-test: status недоступний'
+        }
+        function Get-BRAVOScheduledTaskState {
+            param($TaskPath, $TaskName)
+            $run = if ($TaskName -eq 'SELFTEST_MAIN') { (Get-Date).AddHours(-30) } else { (Get-Date).AddHours(-1) }
+            $result = if ($TaskName -eq 'SELFTEST_MAIN') { 0 } else { -2147024891 }
+            if ($script:mode -eq 'catchup-noop') { $result = if ($TaskName -eq 'SELFTEST_MAIN') { 20 } else { 0 } }
+            if ($TaskName -eq 'SELFTEST_CATCHUP' -and $script:mode -eq 'catchup-missing') { throw 'self-test: catch-up недоступне' }
+            if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'catchup-missing') { $run = (Get-Date).AddHours(-3); $result = 20 }
+            if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'main-newer') { $run = (Get-Date).AddMinutes(-20); $result = 20 }
+            return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = $run; LastTaskResult = $result } }
+        }
+        $diag = { Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $null -LatestCompleteUtc $null -NowUtc (Get-Date).ToUniversalTime() -MaxAge ([timespan]::FromHours(24)) }
+        $newer = & $diag
+        $script:mode = 'catchup-missing'
+        $missing = & $diag
+        $script:mode = 'main-newer'
+        $mainNewer = & $diag
+        $script:mode = 'catchup-noop'
+        $catchUpNoOp = & $diag
+        $nullStage = Get-BRAVOHealthManifestFailedStage -Manifest ([pscustomobject]@{ components = [pscustomobject]@{ MODEL = $null; BLOG = [pscustomobject]@{ ErrorStage = 'CREATE' } } })
+        [pscustomobject]@{ CatchUpNewer = $newer; CatchUpMissing = $missing; MainNewer = $mainNewer; CatchUpNoOp = $catchUpNoOp; NullStage = $nullStage }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $staleCatchUp.CatchUpNewer -match 'SELFTEST_CATCHUP' -and $staleCatchUp.CatchUpNewer -match '0x80070005' -and
+            $staleCatchUp.CatchUpMissing -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpMissing -match '0x00000014' -and
+            $staleCatchUp.MainNewer -match 'SELFTEST_MAIN' -and $staleCatchUp.MainNewer -match '0x00000014' -and
+            $staleCatchUp.CatchUpNoOp -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpNoOp -match '0x00000014' -and
+            $staleCatchUp.NullStage -eq 'BLOG/CREATE'
+        ) `
+        -Name 'Health/StaleGenerationCatchUpTaskAndNullComponent' `
+        -Failure "діагностика бере новіше з основного/catch-up завдань (відсутнє catch-up або no-op catch-up без нового status → основне), null-компонент manifest пропускається без винятку: $($staleCatchUp | ConvertTo-Json -Compress)"
+
+    $staleCorrupt = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        $script:corruptLog = New-Object System.Collections.Generic.List[string]
+        function Write-HealthLog { param($Message, $Level) [void]$script:corruptLog.Add("$Level|$Message") }
+        $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+        $stateRoot = 'x'
+        function Get-BRAVOScheduledTaskState {
+            param($TaskPath, $TaskName)
+            return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = (Get-Date).AddHours(-1); LastTaskResult = (-2147024891) } }
+        }
+        function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+        function Get-BRAVOOperationStatus { param($Path) return [pscustomobject]@{ Exists = $true; Corrupt = $true; State = $null; Reason = 'self-test: зіпсований JSON' } }
+        $thrown = $false
+        $diagnosis = $null
+        try {
+            $diagnosis = Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $null -LatestCompleteUtc $null -NowUtc (Get-Date).ToUniversalTime() -MaxAge ([timespan]::FromHours(24))
+        } catch { $thrown = $true }
+        [pscustomobject]@{ Thrown = $thrown; Diagnosis = $diagnosis; Log = @($script:corruptLog) }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $staleCorrupt.Thrown -and
+            $staleCorrupt.Diagnosis -match '0x80070005' -and
+            @($staleCorrupt.Log | Where-Object { $_ -match '^WARNING\|Діагностика generation: status-файл Archive пошкоджений: self-test: зіпсований JSON$' }).Count -eq 1
+        ) `
+        -Name 'Health/StaleGenerationCorruptStatusLogsWarning' `
+        -Failure "пошкоджений status-файл Archive: WARNING у лог, інші правила працюють, без винятку: $($staleCorrupt | ConvertTo-Json -Compress)"
+
+    $staleFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_HEALTH_STALE_REASON_{0}' -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($staleFixtureRoot)
+        $staleNowUtc = (Get-Date).ToUniversalTime()
+        $badComponent = @{ MODEL = @{ ArchivePath = 'x'; HashPath = 'y'; Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $false; ErrorStage = 'PUBLISH' } }
+        foreach ($fixture in @(
+            @{ Id = '20260101_000100'; Status = 'COMPLETE'; Age = 72 },
+            @{ Id = '20260101_000200'; Status = 'INCOMPLETE'; Age = 3 },
+            @{ Id = '20260101_000300'; Status = 'INCOMPLETE'; Age = 2; JsonId = '20260101_000999' },
+            @{ Id = '20260101_000400'; Status = 'WEIRD'; Age = 1 }
+        )) {
+            $jsonId = if ($fixture.ContainsKey('JsonId')) { $fixture.JsonId } else { $fixture.Id }
+            @{
+                generationId = $jsonId
+                status = $fixture.Status
+                createdAt = $staleNowUtc.AddHours(-$fixture.Age).ToString('o')
+                components = $badComponent
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $staleFixtureRoot "BRAVO_BACKUP_$($fixture.Id).json") -Encoding UTF8
+        }
+        $staleFixtureIssues = & $staleReasonModule {
+            param($BackupRoot)
+            Set-StrictMode -Version Latest
+            $archiveDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Enabled = $true })
+            $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24 }
+            $backupRootPath = $BackupRoot
+            $healthCheckStartedUtc = (Get-Date).ToUniversalTime()
+            $script:healthLatestArchives = @{}
+            function Get-BRAVOFiles { param([string]$Path, [string]$Filter) return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue) }
+            $script:staleWarnings = New-Object System.Collections.Generic.List[string]
+            function Write-HealthLog { param($Message, $Level) if ($Level -eq 'WARNING') { [void]$script:staleWarnings.Add([string]$Message) } }
+            # Читання планувальника/статусу недоступне (детерміновано, незалежно від хоста):
+            # діагностика мусить пропустити ці перевірки й дійти до INCOMPLETE manifest.
+            $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+            $stateRoot = $BackupRoot
+            function Get-BRAVOScheduledTaskState { param($TaskPath, $TaskName) throw 'self-test: планувальник недоступний' }
+            function Get-BRAVOOperationStatus { param($Path) throw 'self-test: status недоступний' }
+            $fixtureIssues = @(Get-BackupHealthIssues)
+            return [pscustomobject]@{ Issues = $fixtureIssues; Warnings = @($script:staleWarnings | Where-Object { $_ -match 'Діагностика generation: manifest' }) }
+        } $staleFixtureRoot
+        $staleFixtureWarnings = @($staleFixtureIssues.Warnings)
+        $staleGenerationIssue = @($staleFixtureIssues.Issues | Where-Object { $_.Component -eq 'Generation' })[0]
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $staleGenerationIssue -and
+                $staleGenerationIssue.Kind -eq 'LocalBackupGeneration' -and
+                $staleGenerationIssue.Reason -match '^остання COMPLETE generation старша за 24 год\.$' -and
+                $staleGenerationIssue.Diagnosis -match '20260101_000200' -and $staleGenerationIssue.Diagnosis -match 'INCOMPLETE' -and
+                $staleGenerationIssue.Diagnosis -match 'MODEL/PUBLISH' -and $staleGenerationIssue.Diagnosis -notmatch 'SHA512' -and
+                $staleFixtureWarnings.Count -eq 2 -and
+                @($staleFixtureWarnings | Where-Object { $_ -match 'ідентичності' -and $_ -match '20260101_000999' }).Count -eq 1 -and
+                @($staleFixtureWarnings | Where-Object { $_ -match "невідомий статус 'WEIRD'" }).Count -eq 1
+            ) `
+            -Name 'Health/StaleGenerationDiagnosisFromIncompleteManifest' `
+            -Failure "INCOMPLETE manifest новіший за COMPLETE має потрапити в Diagnosis, а Kind/Component/Reason лишитись незмінними; отримано: $($staleGenerationIssue | ConvertTo-Json -Compress)"
+    } finally {
+        if (Test-Path -LiteralPath $staleFixtureRoot -PathType Container) {
+            Remove-Item -LiteralPath $staleFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $staleSlackModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Format-FileSize', 'Format-BackupAge', 'ConvertTo-BRAVOUtcDateTime', 'Get-BRAVOUtcAge',
+            'Get-HealthIssueComponentName', 'ConvertTo-NotificationLiteralText', 'Format-HealthIssueFileName',
+            'Format-CompactLocalIssue', 'Format-CompactSFTPIssue', 'Format-CompactSMBIssue',
+            'Get-BRAVOHealthCollapsedCloudIssues', 'Get-BRAVOHealthIssueActionText', 'New-SlackAlertMessage'
+        )
+    $staleSlackText = & $staleSlackModule {
+        Set-StrictMode -Version Latest
+        $script:NotificationProvider = 'slack'
+        $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+        $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'; SFTP = [pscustomobject]@{ Enabled = $false; CheckBAZASynchronization = $false } }
+        $bazaAppLocalHealthEnabled = $false; $bazaWWWLocalHealthEnabled = $false; $bazaAppSFTPHealthEnabled = $false; $bazaWWWSFTPHealthEnabled = $false
+        $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+        $script:healthLatestArchives = @{ MODEL = [pscustomobject]@{ Name = 'MODEL_old.7z' }; BLOG = [pscustomobject]@{ Name = 'BLOG_old.7z' } }
+        function Get-HostInformation { return $null }
+        function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+        function New-BRAVOOperatorNotificationMessage { param($ResultLines, $ReasonLines) return (@($ReasonLines) + @($ResultLines)) -join "`n" }
+        $cloud = {
+            param($Component, $Reason, $File, $Expected = 10, $Actual = 10)
+            [pscustomobject]@{ Kind = 'SFTPArchive'; Component = $Component; Reason = $Reason; FileName = $File; LastWriteTime = $null; SizeBytes = $Actual; ExpectedSizeBytes = $Expected; ActualSizeBytes = $Actual; Location = '/x' }
+        }
+        $ageOnly = 'віддалена копія старша за 26 год.'
+        $generation = [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; SizeBytes = 1; Diagnosis = 'завдання BRAVO_ARCHIV вимкнене' }
+        $issues = @(
+            $generation,
+            (& $cloud 'SFTP MODEL' $ageOnly 'MODEL_old.7z'),
+            (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_old.7z'),
+            (& $cloud 'SFTP MODEL' 'розмір віддаленого архіву не збігається' 'MODEL_old.7z' 10 9),
+            (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_other.7z')
+        )
+        [pscustomobject]@{
+            Mixed = New-SlackAlertMessage -Issues $issues -Duration ([timespan]::FromSeconds(1))
+            AgeOnly = New-SlackAlertMessage -Issues @($issues[0], $issues[1], $issues[2]) -Duration ([timespan]::FromSeconds(1))
+            NoGeneration = New-SlackAlertMessage -Issues @($issues[1], $issues[2]) -Duration ([timespan]::FromSeconds(1))
+            OtherFiles = New-SlackAlertMessage -Issues @($issues[0], (& $cloud 'SFTP MODEL' $ageOnly 'MODEL_other.7z'), (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_other.7z')) -Duration ([timespan]::FromSeconds(1))
+            Smb = New-SlackAlertMessage -Issues @($issues[0], [pscustomobject]@{ Kind = 'SMBArchive'; Component = 'NAS/SMB MODEL'; Reason = $ageOnly; FileName = 'MODEL_old.7z'; LastWriteTime = $null; SizeBytes = 10; ExpectedSizeBytes = 10; ActualSizeBytes = 10; Location = '/x' }) -Duration ([timespan]::FromSeconds(1))
+        }
+    }
+    $staleAgeOnlyText = [string]$staleSlackText.AgeOnly
+    $staleMixedText = [string]$staleSlackText.Mixed
+    Test-BRAVOCondition `
+        -Condition (
+            $staleSlackText.NoGeneration -notmatch 'та сама застаріла' -and
+            ([regex]::Matches([string]$staleSlackText.NoGeneration, 'файл є, розмір збігається')).Count -eq 2 -and
+            $staleSlackText.OtherFiles -notmatch 'та сама застаріла' -and
+            ([regex]::Matches([string]$staleSlackText.OtherFiles, 'файл є, розмір збігається')).Count -eq 2 -and
+            $staleSlackText.Smb -match 'Проблемних компонентів: 1 ·' -and
+            $staleSlackText.Smb -match 'та сама застаріла generation' -and
+            $staleSlackText.Smb -notmatch 'віддалена копія старша'
+        ) `
+        -Name 'Health/StaleGenerationCollapseNegativeAndSmbCases' `
+        -Failure "без застарілої generation або з іншим файлом хмарні рядки лишаються; SMB age-only згортається: $($staleSlackText | ConvertTo-Json -Compress)"
+    Test-BRAVOCondition `
+        -Condition (
+            $staleAgeOnlyText -match '(?s)ЛОКАЛЬНІ БЕКАПИ\s+:x: Generation — остання COMPLETE generation старша за 24 год\..*\n:mag: Причина: завдання BRAVO_ARCHIV вимкнене' -and
+            $staleAgeOnlyText -notmatch 'ІНШІ ПОМИЛКИ'
+        ) `
+        -Name 'Health/StaleGenerationInLocalSectionWithReason' `
+        -Failure "LocalBackupGeneration має бути в секції ЛОКАЛЬНІ БЕКАПИ з рядком «Причина», а не в ІНШІ ПОМИЛКИ: $staleAgeOnlyText"
+    Test-BRAVOCondition `
+        -Condition (
+            $staleAgeOnlyText -match 'Проблемних компонентів: 1 ·' -and
+            $staleAgeOnlyText -match 'Хмара \(MODEL · BLOG\): та сама застаріла generation' -and
+            $staleAgeOnlyText -notmatch 'файл є, розмір збігається' -and
+            $staleMixedText -match 'Проблемних компонентів: 3 ·' -and
+            $staleMixedText -match 'BLOG_other\.7z' -and
+            $staleMixedText -match 'розмір віддаленого архіву не збігається' -and
+            $staleMixedText -match 'Хмара \(MODEL · BLOG\): та сама застаріла generation'
+        ) `
+        -Name 'Health/StaleGenerationCollapsesOnlyAgeOnlyCloudRows' `
+        -Failure "age-only хмарні рядки для того самого локального архіву мають згортатись в один, розбіжність розміру — ні: $staleAgeOnlyText ||| $staleMixedText"
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('Kind = ''LocalBackupGeneration''') -and
+            $healthScriptText.Contains('Component = ''Generation''') -and
+            $healthScriptText.Contains('Diagnosis = Get-BRAVOHealthBackupStaleDiagnosis') -and
+            $healthScriptText.Contains('Reason = "остання COMPLETE generation старша за $($backupMonitoring.MaxBackupAgeHours) год."')
+        ) `
+        -Name 'Health/StaleGenerationDiagnosisKeepsKindAndComponent' `
+        -Failure 'Diagnosis — додаткове поле: Kind=LocalBackupGeneration, Component=Generation і Reason stale-issue не змінюються (action text, Operations, exit code)'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.MissingCompleteGenerationHasNoFictitiousFileName' -DependsOn 'Root/Runtime') { try {
     $healthGenerationModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $healthScriptText `
         -FunctionNames @(
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthBackupStaleReason',
+            'Test-BRAVOHealthCatchUpRunIsAttempt',
+            'Get-BRAVOHealthBackupStaleDiagnosis',
+            'Get-BRAVOHealthManifestFailedStage',
             'Get-BackupHealthIssues'
         )
     $healthNoGenerationRoot = Join-Path ([IO.Path]::GetTempPath()) (
@@ -11939,13 +12282,26 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue)
             }
             function Write-HealthLog { param($Message, $Level) }
+            # Позитивний шлях обгортки діагностики: завдання є й свіже, status-файл має код 20.
+            $stateRoot = $BackupRoot
+            $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+            function Get-BRAVOScheduledTaskState {
+                param($TaskPath, $TaskName)
+                return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = (Get-Date).AddHours(-1); LastTaskResult = 0 } }
+            }
+            function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+            function Get-BRAVOOperationStatus {
+                param($Path)
+                return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = [pscustomobject]@{ exitCode = 20; exitCodeName = 'TEST_NAME'; finishedAt = (Get-Date).AddMinutes(-30) } }
+            }
             return @(Get-BackupHealthIssues)[0]
         } $healthNoGenerationRoot
         Test-BRAVOCondition `
             -Condition (
                 $healthNoGenerationIssue.Reason -eq 'не знайдено жодного COMPLETE generation manifest' -and
                 $healthNoGenerationIssue.FileName -eq 'немає даних' -and
-                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json'
+                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json' -and
+                $healthNoGenerationIssue.Diagnosis -match 'код 20 \(TEST_NAME\)'
             ) `
             -Name 'Health/MissingCompleteGenerationHasNoFictitiousFileName' `
             -Failure 'за відсутності COMPLETE generation Health має показувати причину, але не вигаданий BRAVO_BACKUP_.json'

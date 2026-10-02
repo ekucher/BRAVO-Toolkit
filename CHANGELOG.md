@@ -67,6 +67,28 @@
   і перевірку після відкату (0 PASS, 10 PASS WITH WARNING, 3 FAIL); падає і при поверненні гейта
   до `-eq 0`, і при зміні класифікатора (10 => FAIL).
 
+- **Fix: Health показує ймовірну причину застарілої generation і не дублює її в хмарних рядках (#322).**
+  Не-COMPLETE manifest більше не пропускається мовчки: `Get-BackupHealthIssues` запам'ятовує
+  останню INCOMPLETE/FAILED спробу, а issue «остання COMPLETE generation старша за N год.»
+  отримує поле `Diagnosis` з чистого класифікатора `Get-BRAVOHealthBackupStaleReason`
+  (завдання вимкнене → новіша не-COMPLETE спроба зі статусом і етапом → код
+  останнього запуску → не запускалося → завершився достроково → код status-файла Archive).
+  «Завдання не знайдене або недоступне» перевіряється останнім (збій читання планувальника не
+  видається за «не встановлене»); виконується зараз (0x41301) і ще не запускалося (0x41303 або
+  рік < 2000) не вважаються «завершилось достроково»; hashtable-вхід читається як PSCustomObject.
+  Boot catch-up (`BackupCatchUp`) береться як остання спроба лише коли він справді архівував
+  (ненульовий результат або status-файл, записаний після його старту); no-op catch-up не
+  видається за «завершився достроково».
+  Кожне читання (планувальник, status-файл) у власному try/catch: збій пропускає перевірку
+  з WARNING, діагностика не змінює Kind/Component/Reason, exit code та Operations. У Slack
+  `LocalBackupGeneration` тепер у секції «ЛОКАЛЬНІ БЕКАПИ» (раніше «ІНШІ ПОМИЛКИ») з рядком
+  «:mag: Причина: …»; age-only хмарні рядки SFTP/SMB для того самого застарілого локального
+  архіву згортаються в один, помилки розміру/відсутності/з'єднання не згортаються,
+  лічильник компонентів не дублюється. Self-test: `Health/StaleGenerationReasonClassifier`,
+  `Health/StaleGenerationDiagnosisFromIncompleteManifest`,
+  `Health/StaleGenerationInLocalSectionWithReason`,
+  `Health/StaleGenerationCollapsesOnlyAgeOnlyCloudRows`,
+  `Health/StaleGenerationDiagnosisKeepsKindAndComponent`.
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
