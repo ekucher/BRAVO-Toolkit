@@ -6443,6 +6443,17 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
             -Condition ($null -ne $gateAst -and $matrixBad.Count -eq 0) `
             -Name "Rollback/SetupExitVerdictMatrixGateAndRollback" `
             -Failure "матриця вердиктів BRAVO_SETUP (#330): Scheduler/Validate 0/0 PASS; 10/0, 0/10, 10/10 PASS WITH WARNING; 1/0, 0/2, 10/2 FAIL; після відкату 0 PASS, 10 PASS WITH WARNING, 3 FAIL; розбіжності: $($matrixBad -join '; ')"
+
+        # Діагностичний крок 7 Install-BRAVOServer.ps1 (-ValidateOnly) теж бере
+        # вердикт з канонічного помічника, без окремого `-eq 0` (#330).
+        $installVerdictText = [IO.File]::ReadAllText((Join-Path $root 'deploy\Install-BRAVOServer.ps1'), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition `
+            -Condition (
+                $installVerdictText.Contains('Get-BRAVODeploySetupExitVerdict -ExitCode $validateCode') -and
+                -not [regex]::IsMatch($installVerdictText, '\$validateCode\s+-(eq|ne)\s+\d')
+            ) `
+            -Name "Rollback/InstallValidateOnlyUsesCanonicalSetupVerdict" `
+            -Failure "deploy\Install-BRAVOServer.ps1: вердикт -ValidateOnly має йти через Get-BRAVODeploySetupExitVerdict (0 PASS, 10 PASS WITH WARNING), без окремого порівняння коду з числом (#330)"
     } finally {
         $script:RollbackProblems = @()
         if (Test-Path -LiteralPath $sb3) { Remove-Item -LiteralPath $sb3 -Recurse -Force -ErrorAction SilentlyContinue }

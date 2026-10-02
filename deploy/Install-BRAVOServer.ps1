@@ -498,8 +498,20 @@ try {
     Pop-Location
 }
 
-if ($validateCode -eq 0) {
+# Вердикт — той самий канонічний помічник, що й у гейтах оновлювача (#330):
+# 0 = PASS, 10 = PASS WITH WARNING, інше = FAIL. Помічник читається в
+# дочірній області (його Set-StrictMode не змінює режим цього скрипта);
+# без файлу крок лише діагностичний, тож вердикт = FAIL з кодом у журналі.
+$validateVerdict = 'FAIL'
+$rollbackHelperPath = Join-Path $PSScriptRoot 'BRAVO.Deploy.Rollback.ps1'
+if ($null -ne $validateCode -and (Test-Path -LiteralPath $rollbackHelperPath -PathType Leaf)) {
+    $validateVerdict = & { . $rollbackHelperPath; Get-BRAVODeploySetupExitVerdict -ExitCode $validateCode }
+}
+
+if ($validateVerdict -eq 'PASS') {
     Write-Ok 'BRAVO_SETUP.ps1 -ValidateOnly -> exit 0'
+} elseif ($validateVerdict -eq 'PASS_WITH_WARNING') {
+    Write-Ok 'BRAVO_SETUP.ps1 -ValidateOnly -> exit 10 (PASS WITH WARNING: успіх із попередженнями)'
 } else {
     Write-Warn2 ('BRAVO_SETUP.ps1 -ValidateOnly -> exit ' + $validateCode)
     Write-Host '  На ЧИСТОМУ сервері це очікувано: 30 — не задані site-шляхи,' -ForegroundColor Yellow
