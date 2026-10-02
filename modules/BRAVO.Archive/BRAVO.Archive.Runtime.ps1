@@ -1365,38 +1365,103 @@ function Resolve-BRAVORetentionGenerationManifest {
     # пріоритеті, якщо файл за ним існує і лежить у BackupRoot: так
     # generation, створена до зміни каталогу компонента, не губить свої
     # файли. Без ArchiveDefinitions manifest повертається без змін.
+    #
+    # Retention ВИДАЛЯЄ файли за перебудованими шляхами, тому перебудова тут
+    # fail-closed. Компонент потрапляє в UnresolvedReasons (generation не
+    # видаляється, WARNING), якщо:
+    #  - файл за записаним шляхом існує, але поза BackupRoot (видалення
+    #    manifest-а осиротило б його);
+    #  - leaf-ім'я не належить ЦІЙ generation за NameTemplate
+    #    (той самий identity gate, що в Get-BRAVOVerifiedGenerationArchive):
+    #    інакше manifest із чужим іменем видалив би архів іншої generation
+    #    в обхід захищених і поточної;
+    #  - канонічний каталог компонента недоступний: відсутній файл там не
+    #    доводить, що його вже видалено.
     param(
         [Parameter(Mandatory = $true)][object]$Manifest,
         [Parameter(Mandatory = $true)][string]$BackupRoot,
         [object[]]$ArchiveDefinitions
     )
 
+    $unresolvedReasons = @()
     $componentNames = @()
     if ($null -ne $Manifest.PSObject.Properties['components'] -and $null -ne $Manifest.components) {
         $componentNames = @($Manifest.components.PSObject.Properties | ForEach-Object { $_.Name })
     }
     if ($componentNames.Count -eq 0 -or $null -eq $ArchiveDefinitions -or $ArchiveDefinitions.Count -eq 0) {
-        return $Manifest
+        return [pscustomobject]@{ Manifest = $Manifest; UnresolvedReasons = $unresolvedReasons }
     }
 
+    $generationId = [string]$Manifest.generationId
+    $hashExtension = [string](Get-Variable -Name 'hashFileExtension' -ValueOnly -ErrorAction SilentlyContinue)
+    if ([string]::IsNullOrWhiteSpace($hashExtension)) { $hashExtension = '.sha512' }
     $resolvedManifest = ConvertTo-BRAVORebasedLocalGenerationManifest `
         -Manifest $Manifest `
         -ComponentTypes $componentNames `
         -ArchiveDefinitions @($ArchiveDefinitions)
     foreach ($componentProperty in @($Manifest.components.PSObject.Properties)) {
-        $resolvedComponent = $resolvedManifest.components.PSObject.Properties[$componentProperty.Name].Value
+        $componentName = [string]$componentProperty.Name
+        $resolvedComponent = $resolvedManifest.components.PSObject.Properties[$componentName].Value
+        $definition = @($ArchiveDefinitions | Where-Object {
+            [string]::Equals([string]$_.Type, $componentName, [StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)
+        # Невідомий тип / порожній Destination звітує
+        # Get-BRAVORetentionUnresolvedComponentTypes.
+        if ($definition.Count -eq 0 -or [string]::IsNullOrWhiteSpace([string]$definition[0].Destination)) { continue }
+        $destination = [string]$definition[0].Destination
+        $nameTemplate = ''
+        if ($definition[0] -is [System.Collections.IDictionary]) {
+            if ($definition[0].Contains('NameTemplate')) { $nameTemplate = [string]$definition[0]['NameTemplate'] }
+        } elseif ($null -ne $definition[0].PSObject.Properties['NameTemplate']) {
+            $nameTemplate = [string]$definition[0].NameTemplate
+        }
         foreach ($fieldName in @('ArchivePath', 'HashPath')) {
             $recordedProperty = $componentProperty.Value.PSObject.Properties[$fieldName]
             if ($null -eq $recordedProperty) { continue }
             $recordedPath = [string]$recordedProperty.Value
-            if (-not [string]::IsNullOrWhiteSpace($recordedPath) -and
-                (Test-Path -LiteralPath $recordedPath -PathType Leaf) -and
-                (Test-BRAVOBackupArtifactPathSafe -Path $recordedPath -BackupRoot $BackupRoot)) {
-                $resolvedComponent.$fieldName = $recordedPath
+            if ([string]::IsNullOrWhiteSpace($recordedPath)) { continue }
+            if (Test-Path -LiteralPath $recordedPath -PathType Leaf) {
+                if (Test-BRAVOBackupArtifactPathSafe -Path $recordedPath -BackupRoot $BackupRoot) {
+                    $resolvedComponent.$fieldName = $recordedPath
+                } else {
+                    $unresolvedReasons += "${componentName}: файл за записаним шляхом лежить поза BackupRoot ($recordedPath)"
+                }
+                continue
             }
+            $leaf = Get-BRAVOVerifiedArtifactLeafName -Value $recordedPath
+            if ($null -eq $leaf) {
+                $unresolvedReasons += "${componentName}: некоректне ім'я файлу в manifest-і ($fieldName)"
+                continue
+            }
+            $canonicalPath = Join-Path $destination $leaf
+            $recordedFull = try { [IO.Path]::GetFullPath($recordedPath) } catch { $recordedPath }
+            $canonicalFull = try { [IO.Path]::GetFullPath($canonicalPath) } catch { $canonicalPath }
+            if ([string]::Equals($recordedFull, $canonicalFull, [StringComparison]::OrdinalIgnoreCase)) {
+                # Перебудови немає: файла просто вже немає (як до #335).
+                $resolvedComponent.$fieldName = $recordedPath
+                continue
+            }
+            $expectedSuffix = ''
+            if (-not [string]::IsNullOrWhiteSpace($nameTemplate)) {
+                try { $expectedSuffix = $nameTemplate -f '', $generationId } catch { $expectedSuffix = '' }
+            }
+            if ($fieldName -eq 'HashPath' -and -not [string]::IsNullOrEmpty($expectedSuffix)) {
+                $expectedSuffix += $hashExtension
+            }
+            if ([string]::IsNullOrEmpty($expectedSuffix) -or
+                $leaf.Length -le $expectedSuffix.Length -or
+                -not $leaf.EndsWith($expectedSuffix, [StringComparison]::Ordinal)) {
+                $unresolvedReasons += "${componentName}: ім'я '$leaf' не належить generation $generationId за NameTemplate"
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+                $unresolvedReasons += "${componentName}: каталог компонента недоступний ($destination)"
+                continue
+            }
+            $resolvedComponent.$fieldName = $canonicalPath
         }
     }
-    return $resolvedManifest
+    return [pscustomobject]@{ Manifest = $resolvedManifest; UnresolvedReasons = @($unresolvedReasons | Select-Object -Unique) }
 }
 
 function Get-BRAVORetentionUnresolvedComponentTypes {
@@ -1461,7 +1526,15 @@ function Get-BRAVOGenerationManifestArtifactProblems {
             $problems += "${name}: архів відсутній"
             continue
         }
-        $archiveLength = (New-Object System.IO.FileInfo -ArgumentList $archivePath).Length
+        # Файл міг зникнути після Test-Path або не читатися (ACL, збій
+        # сховища): це проблема ЦІЄЇ generation, а не всього прогону.
+        $archiveLength = $null
+        try {
+            $archiveLength = (New-Object System.IO.FileInfo -ArgumentList $archivePath).Length
+        } catch {
+            $problems += "${name}: метадані архіву не прочитано ($($_.Exception.Message))"
+            continue
+        }
         if ($archiveLength -le 0) { $problems += "${name}: архів порожній" }
         $sizeProperty = $component.PSObject.Properties['ArchiveSize']
         if ($null -ne $sizeProperty -and $null -ne $sizeProperty.Value) {
@@ -1629,17 +1702,18 @@ function Remove-BRAVOExpiredBackupGenerations {
                         if ($null -ne $recordedLeaf) { $referencedArchiveNames[$recordedLeaf] = $true }
                     }
                 }
+                $resolution = Resolve-BRAVORetentionGenerationManifest `
+                    -Manifest $manifest `
+                    -BackupRoot $BackupRoot `
+                    -ArchiveDefinitions $ArchiveDefinitions
                 $records += [pscustomobject]@{
                     GenerationId = $generationId
                     Status = [string]$manifest.status
                     IsComplete = ([string]$manifest.status -eq 'COMPLETE')
                     StartedAt = $startedAt
-                    Manifest = Resolve-BRAVORetentionGenerationManifest `
-                        -Manifest $manifest `
-                        -BackupRoot $BackupRoot `
-                        -ArchiveDefinitions $ArchiveDefinitions
-                    UnresolvedTypes = @(Get-BRAVORetentionUnresolvedComponentTypes `
-                        -Manifest $manifest -ArchiveDefinitions $ArchiveDefinitions)
+                    Manifest = $resolution.Manifest
+                    UnresolvedTypes = @(@(Get-BRAVORetentionUnresolvedComponentTypes `
+                        -Manifest $manifest -ArchiveDefinitions $ArchiveDefinitions) + @($resolution.UnresolvedReasons))
                     ArtifactProblems = @()
                     ManifestPath = $manifestFile.FullName
                 }
@@ -1649,14 +1723,15 @@ function Remove-BRAVOExpiredBackupGenerations {
         }
 
         # Generation з типом компонента, якого немає в ArchiveDefinitions,
-        # лишається в сховищі (WARNING): правильний каталог її архівів
-        # невідомий, а видалення "відсутніх" файлів губило б manifest.
+        # або з файлами, які не вдалося безпечно перебудувати
+        # (Resolve-BRAVORetentionGenerationManifest), лишається в сховищі
+        # (WARNING): видалення "відсутніх" файлів губило б manifest.
         foreach ($record in $records) {
             if ($record.UnresolvedTypes.Count -eq 0) { continue }
             $unresolvedGenerationIds += $record.GenerationId
             Write-BRAVOLog -Component 'CLEANUP' -Message (
-                "Резервна копія $($record.GenerationId) містить компоненти ($($record.UnresolvedTypes -join ', ')), " +
-                "яких немає в поточних ArchiveDefinitions. Retention її не чіпає: каталог архівів невідомий"
+                "Резервна копія $($record.GenerationId): retention не може однозначно визначити її файли " +
+                "($($record.UnresolvedTypes -join '; ')). Retention її не чіпає"
             ) -Level 'WARNING'
         }
 

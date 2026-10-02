@@ -653,8 +653,8 @@ function Get-BRAVOFileHash {
     function Get-BRAVORetentionFixtureDefinitions {
         param([string]$Root)
         return @(
-            @{ Type = 'MODEL'; Destination = (Join-Path $Root 'MODEL') },
-            @{ Type = 'BLOG'; Destination = (Join-Path $Root 'BLOG') }
+            @{ Type = 'MODEL'; Destination = (Join-Path $Root 'MODEL'); NameTemplate = '{0}_{1}.mdz' },
+            @{ Type = 'BLOG'; Destination = (Join-Path $Root 'BLOG'); NameTemplate = '{0}_{1}.mdz' }
         )
     }
 
@@ -932,7 +932,7 @@ function Get-BRAVOFileHash {
             -Components @('MODEL', 'BRAVOEXCH') -RecordedRoot $unknownOldRoot
         [void](New-BRAVORetentionComponentFixture -Root $unknownRoot -GenerationId '20261001_230000' -StartedAt (Get-Date) -Components @('MODEL'))
         $unknownOk = Invoke-BRAVORetentionFixtureCleanup -Root $unknownRoot `
-            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions @(@{ Type = 'MODEL'; Destination = (Join-Path $unknownRoot 'MODEL') })
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions @(@{ Type = 'MODEL'; Destination = (Join-Path $unknownRoot 'MODEL'); NameTemplate = '{0}_{1}.mdz' })
         Test-BRAVOCondition `
             -Condition (
                 $unknownOk -eq $true -and
@@ -944,6 +944,120 @@ function Get-BRAVOFileHash {
             ) `
             -Name "BackupConsistency/UnknownComponentTypeKeepsGenerationAndWarns" `
             -Failure "generation з типом компонента, відсутнім в ArchiveDefinitions, не повинна ні видалятися, ні мовчки випадати з retention: manifest і архіви мають лишитися, а WARNING називати тип"
+
+        # Сценарій 7 (Codex на #344): перебудова шляхів fail-closed.
+        # 7a: прострочений FAILED manifest у перенесеному сховищі посилається
+        # на ім'я ІНШОЇ (поточної) generation. Перебудова дала б канонічний
+        # шлях чужого архіву, і retention видалив би його в обхід поточної
+        # та захищених. Identity gate за NameTemplate має це зупинити.
+        $global:enableArchiveDeletion = $false
+        $identityRoot = Join-Path $retentionStatusTestRoot 'identity'
+        $identityOldRoot = Join-Path $retentionStatusTestRoot 'identity-old-disk'
+        [void](New-BRAVORetentionComponentFixture -Root $identityRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $foreignNameManifest = New-BRAVORetentionComponentFixture -Root $identityRoot `
+            -GenerationId '20250301_230000' -StartedAt (Get-Date).AddDays(-580) -Status 'FAILED' -RecordedRoot $identityOldRoot
+        [IO.File]::WriteAllText($foreignNameManifest, (
+            [IO.File]::ReadAllText($foreignNameManifest).Replace('MODEL_20250301_230000.mdz', 'MODEL_20261001_230000.mdz')
+        ))
+        $identityOk = Invoke-BRAVORetentionFixtureCleanup -Root $identityRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $identityRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $identityOk -eq $true -and
+                (Test-Path -LiteralPath $foreignNameManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $identityRoot 'MODEL') 'MODEL_20261001_230000.mdz')) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $identityRoot 'MODEL') 'MODEL_20261001_230000.mdz.sha512')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'не належить generation 20250301_230000')
+            ) `
+            -Name "BackupConsistency/RelocatedForeignGenerationNameIsNotDeleted" `
+            -Failure "manifest, що після перенесення сховища посилається на ім'я архіву іншої generation, не повинен призводити до видалення чужого архіву: generation лишається з WARNING"
+
+        # 7b: файл ще лежить лише за старим записаним шляхом (поза новим
+        # BackupRoot). Видалення manifest-а осиротило б його.
+        $staleRoot = Join-Path $retentionStatusTestRoot 'stale-path'
+        $staleOldRoot = Join-Path $retentionStatusTestRoot 'stale-old-disk'
+        [void](New-BRAVORetentionComponentFixture -Root $staleRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $staleManifest = New-BRAVORetentionComponentFixture -Root $staleRoot `
+            -GenerationId '20250401_230000' -StartedAt (Get-Date).AddDays(-550) -Status 'FAILED' -RecordedRoot $staleOldRoot
+        $staleOldModelDirectory = Join-Path $staleOldRoot 'MODEL'
+        [void][IO.Directory]::CreateDirectory($staleOldModelDirectory)
+        $staleCanonicalArchive = Join-Path (Join-Path $staleRoot 'MODEL') 'MODEL_20250401_230000.mdz'
+        $staleOldArchive = Join-Path $staleOldModelDirectory 'MODEL_20250401_230000.mdz'
+        Microsoft.PowerShell.Management\Move-Item -LiteralPath $staleCanonicalArchive -Destination $staleOldArchive
+        $staleOk = Invoke-BRAVORetentionFixtureCleanup -Root $staleRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $staleRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $staleOk -eq $true -and
+                (Test-Path -LiteralPath $staleManifest) -and
+                (Test-Path -LiteralPath $staleOldArchive) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'поза BackupRoot')
+            ) `
+            -Name "BackupConsistency/RelocatedArtifactOnlyAtOldPathKeepsManifest" `
+            -Failure "якщо файл generation лежить лише за старим записаним шляхом поза BackupRoot, manifest не повинен видалятися: generation лишається з WARNING"
+
+        # 7c: канонічний каталог компонента недоступний (перенесення ще
+        # триває). Відсутній там файл не доводить, що його вже видалено.
+        $offlineRoot = Join-Path $retentionStatusTestRoot 'offline-destination'
+        $offlineOldRoot = Join-Path $retentionStatusTestRoot 'offline-old-disk'
+        [void](New-BRAVORetentionComponentFixture -Root $offlineRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $offlineManifest = New-BRAVORetentionComponentFixture -Root $offlineRoot `
+            -GenerationId '20250501_230000' -StartedAt (Get-Date).AddDays(-520) -Status 'FAILED' -RecordedRoot $offlineOldRoot
+        $offlineDefinitions = @(
+            @{ Type = 'MODEL'; Destination = (Join-Path $offlineRoot 'MODEL'); NameTemplate = '{0}_{1}.mdz' },
+            @{ Type = 'BLOG'; Destination = (Join-Path $offlineRoot 'BLOG-NOT-MOUNTED'); NameTemplate = '{0}_{1}.mdz' }
+        )
+        $offlineOk = Invoke-BRAVORetentionFixtureCleanup -Root $offlineRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions $offlineDefinitions
+        Test-BRAVOCondition `
+            -Condition (
+                $offlineOk -eq $true -and
+                (Test-Path -LiteralPath $offlineManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $offlineRoot 'MODEL') 'MODEL_20250501_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'каталог компонента недоступний')
+            ) `
+            -Name "BackupConsistency/RelocatedUnavailableDestinationKeepsGeneration" `
+            -Failure "якщо канонічний каталог компонента недоступний, generation не повинна видалятися (ні архіви, ні manifest): лише WARNING"
+
+        # 7d: метадані архіву не читаються (файл зник після Test-Path, ACL).
+        # Це проблема однієї generation: WARNING для неї, решта обробляється.
+        $metadataRoot = Join-Path $retentionStatusTestRoot 'metadata'
+        [void](New-BRAVORetentionComponentFixture -Root $metadataRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $unreadableManifest = New-BRAVORetentionComponentFixture -Root $metadataRoot `
+            -GenerationId '20260815_230000' -StartedAt (Get-Date).AddDays(-47)
+        $metadataFailedManifest = New-BRAVORetentionComponentFixture -Root $metadataRoot `
+            -GenerationId '20250601_230000' -StartedAt (Get-Date).AddDays(-480) -Status 'FAILED'
+        $global:BRAVORetentionUnreadablePath = Join-Path (Join-Path $metadataRoot 'MODEL') 'MODEL_20260815_230000.mdz'
+        function global:New-Object {
+            param(
+                [Parameter(Position = 0)][string]$TypeName,
+                [Parameter(Position = 1)][object[]]$ArgumentList,
+                [System.Collections.IDictionary]$Property,
+                [switch]$Strict
+            )
+            if ($TypeName -eq 'System.IO.FileInfo' -and @($ArgumentList).Count -gt 0 -and
+                [string]$ArgumentList[0] -eq $global:BRAVORetentionUnreadablePath) {
+                throw 'Access to the path is denied.'
+            }
+            Microsoft.PowerShell.Utility\New-Object @PSBoundParameters
+        }
+        $metadataOk = $null
+        try {
+            $metadataOk = Invoke-BRAVORetentionFixtureCleanup -Root $metadataRoot `
+                -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $metadataRoot)
+        } finally {
+            $global:BRAVORetentionUnreadablePath = $null
+            Microsoft.PowerShell.Management\Remove-Item -Path Function:\New-Object -ErrorAction SilentlyContinue
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $metadataOk -eq $true -and
+                (Test-Path -LiteralPath $unreadableManifest) -and
+                -not (Test-Path -LiteralPath $metadataFailedManifest) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'метадані архіву не прочитано')
+            ) `
+            -Name "BackupConsistency/UnreadableArchiveMetadataIsIsolatedPerGeneration" `
+            -Failure "збій читання метаданих архіву однієї generation має давати WARNING лише для неї; прострочена невдала generation має видалятися в тому ж прогоні"
     } finally {
         Remove-Item -Path Variable:\global:enableArchiveDeletion, `
             Variable:\global:enableFailedArchiveDeletion, `
@@ -952,7 +1066,8 @@ function Get-BRAVOFileHash {
             Variable:\global:progressSettings, `
             Variable:\global:BRAVORetentionTestLog, `
             Variable:\global:BRAVORetentionHashCalls, `
-            Variable:\global:BRAVORetentionLockedPath `
+            Variable:\global:BRAVORetentionLockedPath, `
+            Variable:\global:BRAVORetentionUnreadablePath `
             -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $retentionStatusTestRoot) {
             Remove-Item -LiteralPath $retentionStatusTestRoot -Recurse -Force -ErrorAction SilentlyContinue
