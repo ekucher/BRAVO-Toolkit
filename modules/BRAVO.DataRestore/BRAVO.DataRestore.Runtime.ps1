@@ -341,6 +341,11 @@ $script:dataRestoreAllowedServiceNames = @()
 # гарантовано довершився — тоді live filesystem у невизначеному стані, і
 # служби НЕ можна запускати поверх нього (див. фінальний finally нижче).
 $script:dataRestoreRollbackIncomplete = $false
+# #333 (review #345): true, якщо цей прогін успадкував restartSuppressed-маркер
+# мертвого власника (попередній restore перервано у невизначеному стані даних).
+# Успадковане утримання знімається ЛИШЕ успішним завершенням цього restore.
+$script:dataRestoreInheritedSuppression = $false
+$script:dataRestoreRestoreCompleted = $false
 $script:dataRestoreHealthExitCode = $null
 $script:dataRestoreSelectedGenerationId = $null
 $script:dataRestoreStagingGenerationRoot = $null
@@ -1746,9 +1751,12 @@ function Remove-BRAVODataRestoreDisallowedMarkerSnapshotEntries {
 
     $existingState = $null
     try { $existingState = Read-BRAVOServiceQuiescenceState } catch { $existingState = $null }
-    if ($null -eq $existingState -or
-        @($existingState.startTypeSnapshot).Count -eq 0 -or
-        (Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess -State $existingState)) {
+    # Перевірку «чий маркер» навмисно НЕ робимо: Test-BRAVOServiceQuiescenceState-
+    # OwnedByCurrentProcess приватна для BRAVO.System (не експортована) і з цього
+    # модуля не резолвиться. Функція викликається ДО першого запису власного
+    # маркера цим прогоном, тож будь-який маркер на диску тут чужий (власний
+    # знімок і так складається лише з дозволених імен).
+    if ($null -eq $existingState -or @($existingState.startTypeSnapshot).Count -eq 0) {
         return @()
     }
     $rejected = @($existingState.startTypeSnapshot | Where-Object {
@@ -3725,6 +3733,9 @@ try {
             if ($orphanContext.OwnerAlive -or [string]$orphanRepair.Status -eq 'OwnerAlive') {
                 Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ("ownership-маркер служб належить живому процесу ({0}) — одночасний restore заборонено (#333); дочекайтеся його завершення" -f $orphanContext.Owner)
             }
+            if ([bool]$orphanContext.RestartSuppressed -or [string]$orphanRepair.Status -eq 'HeldSuppressed') {
+                $script:dataRestoreInheritedSuppression = $true
+            }
             $heldDisabledNames = @()
             if ([string]$orphanRepair.Status -eq 'HeldSuppressed' -or [string]$orphanRepair.Status -eq 'RepairFailed') {
                 $heldDisabledNames = @(@($orphanContext.HeldSnapshot) | ForEach-Object { [string]$_.Name })
@@ -4003,6 +4014,19 @@ try {
                     if (@($componentQuiescenceFailures).Count -gt 0) {
                         throw ("тиша служб/процесів не підтверджена перед компонентом ${componentType}: " + ($componentQuiescenceFailures -join '; '))
                     }
+                    # #333 (review #345): утримання від автостарту (Disabled) також
+                    # перевіряється ПЕРЕД деструктивною фазою КОЖНОГО компонента —
+                    # довге розпакування попереднього могло дати оператору/SCM
+                    # змогу змінити тип запуску. Fail-closed: аборт ДО торкання
+                    # цього компонента (без тихого перезастосування).
+                    if (@($script:dataRestoreStartTypeSnapshot).Count -gt 0) {
+                        $componentHoldCheck = Confirm-BRAVOServicesQuiesced `
+                            -ServiceNames @($managedServicesForQuiescence | ForEach-Object { [string]$_.Name }) `
+                            -Snapshot $script:dataRestoreStartTypeSnapshot
+                        if (-not $componentHoldCheck.Ok) {
+                            throw ("утримання служб від автостарту втрачено перед компонентом ${componentType} (#333): " + (@($componentHoldCheck.Offenders) -join '; '))
+                        }
+                    }
                     $moveAsideResult = Invoke-BRAVODataRestoreMoveAside `
                         -LiveDirectory $planComponent.LiveSourceDirectory `
                         -PrerestoreDirectory $planComponent.PrerestoreDirectory
@@ -4226,6 +4250,10 @@ try {
             }
         }
 
+        # Усі компоненти відновлено — успадковане (restartSuppressed) утримання
+        # попереднього перерваного прогону цим restore знімається (#333).
+        $script:dataRestoreRestoreCompleted = $true
+
         # --- 10. SFTP staging: успіх -> прибрати ---
         if ($Source -eq 'SFTP' -and -not [string]::IsNullOrWhiteSpace([string]$script:dataRestoreStagingGenerationRoot)) {
             try {
@@ -4264,12 +4292,27 @@ try {
         # Наразі немає надійного відображення компонент->служба, тому
         # безпечніше лишити ВСІ служби зі знімка зупиненими, а не запускати
         # частину.
-        if ($script:dataRestoreRollbackIncomplete) {
+        #
+        # #333 (review #345): те саме правило діє, коли цей прогін успадкував
+        # restartSuppressed-маркер мертвого власника (попередній restore лишив
+        # дані у невизначеному стані) і НЕ завершився успішно — навіть при
+        # чистому відкаті власних змін: утримання знімає лише успішний restore.
+        $inheritedSuppressionHeld = ($script:dataRestoreInheritedSuppression -and
+            $script:dataRestoreServicesStopped -and -not $script:dataRestoreRestoreCompleted)
+        if ($script:dataRestoreRollbackIncomplete -or $inheritedSuppressionHeld) {
             $script:flagRestoreFailed = $true
             if ([string]::IsNullOrWhiteSpace([string]$script:dataRestoreAbortReason)) {
-                $script:dataRestoreAbortReason = 'відкат не гарантовано довершився — служби навмисно залишено зупиненими, потрібне ручне відновлення (OPERATIONS.md, код 43)'
+                $script:dataRestoreAbortReason = if ($script:dataRestoreRollbackIncomplete) {
+                    'відкат не гарантовано довершився — служби навмисно залишено зупиненими, потрібне ручне відновлення (OPERATIONS.md, код 43)'
+                } else {
+                    'restore не завершено, а попередній перерваний прогін залишив дані у невизначеному стані (restartSuppressed) — служби навмисно залишено зупиненими й Disabled, потрібне ручне відновлення (OPERATIONS.md, код 43)'
+                }
             }
-            Write-DataRestoreLog -Message 'Служби НАВМИСНО залишено зупиненими: відкат не гарантовано довершився, live filesystem у невизначеному стані. Потрібне ручне відновлення перед запуском служб.' -Level 'ERROR' -Console
+            if ($script:dataRestoreRollbackIncomplete) {
+                Write-DataRestoreLog -Message 'Служби НАВМИСНО залишено зупиненими: відкат не гарантовано довершився, live filesystem у невизначеному стані. Потрібне ручне відновлення перед запуском служб.' -Level 'ERROR' -Console
+            } else {
+                Write-DataRestoreLog -Message 'Служби НАВМИСНО залишено зупиненими: цей restore не завершився успішно, а успадкований маркер попереднього перерваного прогону (restartSuppressed) означає невизначений стан даних — тимчасове утримання не знімається до успішного restore або ручного відновлення.' -Level 'ERROR' -Console
+            }
             if (@($script:dataRestoreStartTypeSnapshot).Count -gt 0) {
                 # #333: службам свідомо ЛИШАЄТЬСЯ тимчасовий Disabled (інакше SCM
                 # підняв би їх на невизначеній live filesystem при наступному boot).

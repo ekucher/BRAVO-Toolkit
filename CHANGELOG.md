@@ -26,6 +26,12 @@
   Правки рев'ю #345: керована служба зі start type `Other`/нечитаним (не потрапила б у знімок)
   скасовує restore (`43`) до змін даних, з її іменем у журналі; записи чужого знімка поза
   керованим набором відкидаються з маркера ДО запису власного (WARNING). Maintenance не змінено.
+  Правки рев'ю #345 (2): очищення чужого маркера більше не викликає приватну
+  `Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess` (не експортована з BRAVO.System, у проді
+  давала `43`); успадковане `restartSuppressed` знімається лише успішним restore — збій цього
+  прогону лишає служби зупиненими й `Disabled`, маркер suppressed (`43`); утримання від автостарту
+  перевіряється (`Confirm-BRAVOServicesQuiesced`) перед КОЖНИМ компонентом, втрата утримання
+  скасовує restore до торкання компонента (`43`).
 
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в

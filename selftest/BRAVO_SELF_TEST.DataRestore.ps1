@@ -4020,9 +4020,16 @@ function ConvertTo-BRAVORebasedLocalGenerationManifest { param($Manifest, $Compo
 function Get-BRAVODataRestorePlan {
     param($ComponentTypes, $RestoreMode, $RequestedTargetPath, $BackupRoot, $RuntimeRootPath, $StagingRoot, $ArchiveDefinitions, $RestoreTargetDirectories, $RunStamp)
     if ($RestoreMode -eq 'InPlace') {
-        return [pscustomobject]@{ Success = $true; Error = $null; TargetRoot = $null; Components = @([pscustomobject]@{
-                    Type = 'MODEL'; TargetDirectory = $script:ProbeLiveDirectory; LiveSourceDirectory = $script:ProbeLiveDirectory
-                    PrerestoreDirectory = ($script:ProbeLiveDirectory + '.prerestore_selftest') }) }
+        $probePlanComponents = @([pscustomobject]@{
+                Type = 'MODEL'; TargetDirectory = $script:ProbeLiveDirectory; LiveSourceDirectory = $script:ProbeLiveDirectory
+                PrerestoreDirectory = ($script:ProbeLiveDirectory + '.prerestore_selftest') })
+        if ($script:ProbeScenario -eq 'SMHoldLostBetweenComponents') {
+            $probeBlogDirectory = Join-Path (Split-Path -Parent $script:ProbeLiveDirectory) 'Blog'
+            $probePlanComponents += [pscustomobject]@{
+                Type = 'BLOG'; TargetDirectory = $probeBlogDirectory; LiveSourceDirectory = $probeBlogDirectory
+                PrerestoreDirectory = ($probeBlogDirectory + '.prerestore_selftest') }
+        }
+        return [pscustomobject]@{ Success = $true; Error = $null; TargetRoot = $null; Components = $probePlanComponents }
     }
     return [pscustomobject]@{ Success = $true; Error = $null; TargetRoot = $RequestedTargetPath; Components = @([pscustomobject]@{
                 Type = 'MODEL'; TargetDirectory = (Join-Path $RequestedTargetPath 'MODEL'); LiveSourceDirectory = $script:ProbeLiveDirectory
@@ -4053,6 +4060,13 @@ function Invoke-BRAVODataRestoreMoveAside {
     }
     Add-ProbeEvent ('AT-MOVE-ASIDE-MARKER-SNAPSHOT ' + $probeMoveMarkerNames)
     Add-ProbeEvent ('MODES-AT-MOVE-ASIDE ' + (Get-ProbeModesText))
+    # #345 (F3): утримання втрачено під час розпакування ПЕРШОГО компонента
+    # (сторонній актор повернув Automatic) — другий компонент має бути заблоковано.
+    if ($script:ProbeScenario -eq 'SMHoldLostBetweenComponents' -and -not $script:ProbeHoldLost) {
+        $script:ProbeHoldLost = $true
+        $script:ProbeStartModes['exchangAPI'] = 'Automatic'
+        Add-ProbeEvent 'HOLD-LOST exchangAPI'
+    }
     if ($script:ProbeScenario -eq 'InPlaceMoveAsideFails') {
         return [pscustomobject]@{ Success = $false; Performed = $false; Error = 'self-test: імітована відмова move-aside' }
     }
@@ -4125,6 +4139,18 @@ $script:ProbeManifest = [pscustomobject]@{
     components = [pscustomobject]@{
         MODEL = [pscustomobject]@{ Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true; ArchivePath = $script:ProbeArchivePath; HashPath = $probeHashPath; SHA512 = ''; ArchiveSize = 1 }
     }
+}
+if ($script:ProbeScenario -eq 'SMHoldLostBetweenComponents') {
+    # Два компоненти (MODEL + BLOG): утримання втрачається між ними.
+    $probeBlogBackupDirectory = Join-Path $backupRootPath 'BLOG'
+    [void][IO.Directory]::CreateDirectory($probeBlogBackupDirectory)
+    $probeBlogArchivePath = Join-Path $probeBlogBackupDirectory 'BLOG_20260101_000000.7z'
+    [IO.File]::WriteAllText($probeBlogArchivePath, 'self-test')
+    [IO.File]::WriteAllText($probeBlogArchivePath + '.sha512', 'self-test')
+    $probeBlogLiveDirectory = Join-Path (Split-Path -Parent $script:ProbeLiveDirectory) 'Blog'
+    $global:archiveDefinitions = @($global:archiveDefinitions) + @([pscustomobject]@{ Type = 'BLOG'; Source = (Join-Path $probeBlogLiveDirectory '*'); Destination = $probeBlogBackupDirectory; NameTemplate = 'BLOG_{0}.7z' })
+    $global:bravoDiscoveryResult = [pscustomobject]@{ MODEL_SOURCE = $script:ProbeLiveDirectory; BLOG_SOURCE = $probeBlogLiveDirectory; BRAVOEXCH_SOURCE = '' }
+    $script:ProbeManifest.components | Add-Member -NotePropertyName BLOG -NotePropertyValue ([pscustomobject]@{ Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true; ArchivePath = $probeBlogArchivePath; HashPath = ($probeBlogArchivePath + '.sha512'); SHA512 = ''; ArchiveSize = 1 })
 }
 '@
             $dataRestoreOrchestrationProbeScript = @'
@@ -4255,6 +4281,9 @@ try {
         SMUnreadableModeAborts = @{ Services = $probeAllRunning; Modes = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Other'; BravoWeb = 'Manual' } }
         SMForeignDisallowedEntry = @{ Services = $probeAllStopped; Modes = $probeAllDisabled
             Marker = 'foreign'; Suppressed = $true; Intent = @('BRAVO', 'exchangAPI'); Snapshot = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic'; EvilSvc = 'Manual' } }
+        SMInheritedSuppressedFailureKeepsHold = @{ Services = $probeAllStopped; Modes = $probeAllDisabled; Throw = $true
+            Marker = 'foreign'; Suppressed = $true; Intent = @('BRAVO', 'exchangAPI'); Snapshot = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic' } }
+        SMHoldLostBetweenComponents = @{ Services = $probeAllRunning; Modes = $probeOriginalModes }
         SMConfirmFailureAborts = @{ Services = $probeAllRunning; Modes = $probeOriginalModes; SetNoop = @('BRAVO=Disabled') }
         SMTypeRestoreFailureKeepsMarker = @{ Services = @{ BRAVO = 'Running'; exchangAPI = 'Stopped'; BravoWeb = 'Running' }; Modes = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Manual'; BravoWeb = 'Automatic' }; SetFailures = @('exchangAPI=Manual') }
         SMRollbackIncomplete = @{ Services = $probeAllRunning; Modes = $probeOriginalModes; Throw = $true; UndoFails = $true }
@@ -4328,6 +4357,7 @@ try {
         ('$script:ProbeThrowInExtraction = {0}' -f $probeThrowLiteral),
         ('$script:ProbeOwnerAlive = {0}' -f $probeOwnerAliveLiteral),
         ('$script:ProbeUndoFails = {0}' -f $probeUndoFailsLiteral),
+        '$script:ProbeHoldLost = $false',
         ('$script:ProbeSetNoop = {0}' -f $probeListLiterals['SetNoop']),
         ('$script:ProbeSetFailApply = {0}' -f $probeListLiterals['SetFailApply']),
         ('$script:ProbeSetFailures = {0}' -f $probeListLiterals['SetFailures']),
@@ -4399,7 +4429,7 @@ try {
             [IO.File]::WriteAllText($dataRestoreOrchestrationProbePath, $dataRestoreOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $dataRestoreOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $dataRestoreOrchestrationResults = @{}
-            foreach ($dataRestoreOrchestrationScenario in @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace', 'SMNormal', 'SMManualStopped', 'SMDelayedAutomaticStopped', 'SMOperatorDisabled', 'SMForeignSnapshotHeld', 'SMForeignSnapshotRepairable', 'SMMissingSnapshot', 'SMMalformedMarker', 'SMFailureDuringRestore', 'SMFailureDuringServiceRestart', 'SMLiveForeignOwner', 'SMHoldFailureAborts', 'SMSnapshotFailureAborts', 'SMUnreadableModeAborts', 'SMForeignDisallowedEntry', 'SMConfirmFailureAborts', 'SMTypeRestoreFailureKeepsMarker', 'SMRollbackIncomplete', 'SMRepairFailedRecovers')) {
+            foreach ($dataRestoreOrchestrationScenario in @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace', 'SMNormal', 'SMManualStopped', 'SMDelayedAutomaticStopped', 'SMOperatorDisabled', 'SMForeignSnapshotHeld', 'SMForeignSnapshotRepairable', 'SMMissingSnapshot', 'SMMalformedMarker', 'SMFailureDuringRestore', 'SMFailureDuringServiceRestart', 'SMLiveForeignOwner', 'SMHoldFailureAborts', 'SMSnapshotFailureAborts', 'SMUnreadableModeAborts', 'SMForeignDisallowedEntry', 'SMInheritedSuppressedFailureKeepsHold', 'SMHoldLostBetweenComponents', 'SMConfirmFailureAborts', 'SMTypeRestoreFailureKeepsMarker', 'SMRollbackIncomplete', 'SMRepairFailedRecovers')) {
                 $dataRestoreOrchestrationScenarioRoot = Join-Path $dataRestoreOrchestrationRoot $dataRestoreOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($dataRestoreOrchestrationScenarioRoot)
                 # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
@@ -4829,6 +4859,62 @@ try {
                 ) `
                 -Name "DataRestore/StartModeForeignDisallowedSnapshotEntryNotPersisted" `
                 -Failure "запис чужого знімка поза керованим набором має бути відкинутий ДО запису маркера (WARNING), збережений маркер його не містить; проба: $($smDisallowed | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM12d) #345 P1 (F2): успадкований restartSuppressed-маркер мертвого власника +
+            # збій ПІЗНІШЕ в цьому прогоні (розпакування кидає, rollback чистий) — утримання
+            # не знімається: служби не стартують, типи лишаються Disabled, маркер лишається
+            # suppressed (зі знімком), код 43.
+            $smInherit = $dataRestoreOrchestrationResults['SMInheritedSuppressedFailureKeepsHold']
+            $smInheritEvents = @(& $smEvents $smInherit)
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $smInherit.PSObject.Properties['ProbeError'] -and $smInherit.ExitCode -eq 43 -and
+                    @($smInheritEvents | Where-Object { $_ -ceq 'EXTRACT' }).Count -eq 1 -and
+                    @($smInheritEvents | Where-Object { $_ -ceq 'ROLLBACK' }).Count -ge 1 -and
+                    @($smInheritEvents | Where-Object { $_ -like 'START *' }).Count -eq 0 -and
+                    @($smInheritEvents | Where-Object { $_ -match '^SETMODE .*=(Automatic|AutomaticDelayed|Manual)$' }).Count -eq 0 -and
+                    (& $smModesEqual (& $smModes $smInheritEvents 'FINAL-MODES') $smAllDisabled) -and
+                    @($smInheritEvents | Where-Object { $_ -ceq 'FINAL-MARKER present suppressed=True snapshot=2' }).Count -eq 1
+                ) `
+                -Name "DataRestore/StartModeInheritedSuppressionPersistsWhenThisRunFails" `
+                -Failure "успадкований restartSuppressed-маркер: збій цього прогону (навіть із чистим rollback) не має знімати утримання — служби не стартують, типи Disabled, маркер suppressed лишається, код 43; проба: $($smInherit | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM12e) #345 P1 (F3): утримання втрачено між компонентами (під час розпакування
+            # першого) — другий компонент не торкається (жодного move-aside/extraction для нього), код 43.
+            $smLost = $dataRestoreOrchestrationResults['SMHoldLostBetweenComponents']
+            $smLostEvents = @(& $smEvents $smLost)
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $smLost.PSObject.Properties['ProbeError'] -and $smLost.ExitCode -eq 43 -and
+                    @($smLostEvents | Where-Object { $_ -ceq 'HOLD-LOST exchangAPI' }).Count -eq 1 -and
+                    @($smLostEvents | Where-Object { $_ -ceq 'MOVE-ASIDE' }).Count -eq 1 -and
+                    @($smLostEvents | Where-Object { $_ -ceq 'EXTRACT' }).Count -eq 1 -and
+                    @($smLostEvents | Where-Object { $_ -like 'LOG-ERROR*утримання служб від автостарту втрачено перед компонентом BLOG*' }).Count -ge 1
+                ) `
+                -Name "DataRestore/StartModeHoldLostBetweenComponentsAbortsBeforeNextComponent" `
+                -Failure "утримання від автостарту втрачено між компонентами: наступний компонент (BLOG) не має торкатися — fail-closed (43) ДО його move-aside/extraction; проба: $($smLost | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM12f) #345 P1 (F1): прод імпортує BRAVO.System як модуль — приватні (неекспортовані)
+            # функції звідти не резолвляться. Проба вставляє дослівні функції в один scope, тож
+            # приватний виклик вона не ловить; цей статичний тест ловить: runtime DataRestore
+            # не викликає жодної функції BRAVO.System, якої немає у FunctionsToExport.
+            $smSystemPsm1Ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [ref]$null, [ref]$null)
+            $smSystemAllFunctions = @($smSystemPsm1Ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { [string]$_.Name })
+            $smSystemPsd1Text = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psd1'), [Text.Encoding]::UTF8)
+            $smSystemExported = @()
+            if ($smSystemPsd1Text -match '(?s)FunctionsToExport\s*=\s*@\((?<List>[^)]*)\)') {
+                $smSystemExported = @([regex]::Matches($Matches['List'], "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+            }
+            $smSystemPrivate = @($smSystemAllFunctions | Where-Object { $smSystemExported -notcontains $_ })
+            $smRuntimeAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1'), [ref]$null, [ref]$null)
+            $smRuntimeLocalFunctions = @($smRuntimeAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { [string]$_.Name })
+            $smPrivateCalls = @($smRuntimeAst.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true) |
+                    ForEach-Object { [string]$_.GetCommandName() } |
+                    Where-Object { $smSystemPrivate -contains $_ -and $smRuntimeLocalFunctions -notcontains $_ } | Select-Object -Unique)
+            Test-BRAVOCondition `
+                -Condition ($smSystemExported.Count -gt 10 -and $smSystemPrivate.Count -gt 0 -and $smPrivateCalls.Count -eq 0) `
+                -Name "DataRestore/RuntimeCallsOnlyExportedBravoSystemFunctions" `
+                -Failure "runtime DataRestore викликає приватні (неекспортовані з BRAVO.System) функції — у проді вони не резолвляться (CommandNotFound, код 43): $($smPrivateCalls -join ', ') (експортовано: $($smSystemExported.Count), приватних: $($smSystemPrivate.Count))"
 
             # (SM13) Утримання не діє (sc «успішний», але тип не змінився): Confirm виявляє — аборт 43 ДО змін.
             $smConf = $dataRestoreOrchestrationResults['SMConfirmFailureAborts']
