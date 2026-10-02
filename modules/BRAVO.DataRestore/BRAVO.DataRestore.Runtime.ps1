@@ -1712,6 +1712,62 @@ function Get-BRAVODataRestoreAllowedServiceNames {
     return @($names | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
 }
 
+function Get-BRAVODataRestoreUnrestorableServiceNames {
+    # #333 (review #345): керована служба, яку буде зупинено, але яка НЕ
+    # потрапила у знімок типів запуску й не Disabled (нечитаний/Other/
+    # відсутній start type), не може бути утримана від автостарту й
+    # повернена — restore не має стартувати з нею (fail-closed). Служба, що
+    # вже Disabled (рішення оператора), легітимно лишається поза знімком.
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ManagedNames,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Snapshot
+    )
+
+    $unrestorable = @()
+    foreach ($managedName in @($ManagedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        if (@($Snapshot | Where-Object { [string]$_.Name -ieq $managedName }).Count -gt 0) { continue }
+        $currentMode = $null
+        try { $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $managedName } catch { $currentMode = $null }
+        if ($null -ne $currentMode -and [string]$currentMode -eq 'Disabled') { continue }
+        $modeText = if ($null -eq $currentMode) { 'не прочитано' } else { [string]$currentMode }
+        $unrestorable += ('{0} (тип запуску: {1})' -f $managedName, $modeText)
+    }
+    return @($unrestorable)
+}
+
+function Remove-BRAVODataRestoreDisallowedMarkerSnapshotEntries {
+    # #333 (review #345): чужий маркер (інший процес) зі знімком типів запуску
+    # може містити записи поза канонічним набором служб (стороннє редагування).
+    # Write-BRAVOServiceQuiescenceState переносить чужі записи у новий маркер
+    # без фільтрації, тому відкидаємо їх у чужому маркері ДО запису власного —
+    # збережений маркер ніколи не містить відхилених записів. Повертає імена
+    # відкинутих записів; кидає виняток, якщо маркер не вдалося переписати.
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$AllowedServiceNames)
+
+    $existingState = $null
+    try { $existingState = Read-BRAVOServiceQuiescenceState } catch { $existingState = $null }
+    if ($null -eq $existingState -or
+        @($existingState.startTypeSnapshot).Count -eq 0 -or
+        (Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess -State $existingState)) {
+        return @()
+    }
+    $rejected = @($existingState.startTypeSnapshot | Where-Object {
+            $entryName = [string]$_.Name
+            @($AllowedServiceNames | Where-Object { $_ -ieq $entryName }).Count -eq 0
+        })
+    if ($rejected.Count -eq 0) { return @() }
+
+    $statePath = Get-BRAVOServiceQuiescenceStatePath
+    $rawState = [IO.File]::ReadAllText($statePath, (New-Object Text.UTF8Encoding($false))) | ConvertFrom-Json -ErrorAction Stop
+    $keptEntries = @(@($rawState.startTypeSnapshot) | Where-Object {
+            $entryName = [string]$_.Name
+            @($AllowedServiceNames | Where-Object { $_ -ieq $entryName }).Count -gt 0
+        })
+    $rawState.startTypeSnapshot = @($keptEntries)
+    Write-BRAVOStateFileAtomic -Path $statePath -Text ($rawState | ConvertTo-Json -Depth 5)
+    return @($rejected | ForEach-Object { [string]$_.Name })
+}
+
 function Invoke-BRAVODataRestoreServiceStateChange {
     # Дзеркало Invoke-ServiceStateChange (Maintenance): команда + очікування
     # фактичного стану з таймаутом, без довіри до проміжних помилок cmdlet.
@@ -3759,6 +3815,29 @@ try {
                 $script:dataRestoreStartTypeSnapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames @($managedServicesForQuiescence | ForEach-Object { [string]$_.Name }))
             } catch {
                 $startModeHoldFailures += "знімок типів запуску не знято: $($_.Exception.Message)"
+            }
+            # Служба, яку буде зупинено, але яку неможливо утримати/повернути
+            # (start type не прочитано або Other), — аборт ДО змін даних (#345).
+            if ($startModeHoldFailures.Count -eq 0) {
+                $unrestorableManaged = @(Get-BRAVODataRestoreUnrestorableServiceNames `
+                        -ManagedNames @($managedServicesForQuiescence | ForEach-Object { [string]$_.Name }) `
+                        -Snapshot $script:dataRestoreStartTypeSnapshot)
+                if ($unrestorableManaged.Count -gt 0) {
+                    $unrestorableText = $unrestorableManaged -join ', '
+                    Write-DataRestoreLog -Message ("Службу(и) не можна утримати від автостарту — тип запуску не прочитано або не підтримується: {0}; restore скасовано ДО змін даних (#333)" -f $unrestorableText) -Level 'ERROR'
+                    $startModeHoldFailures += "службу(и) неможливо утримати від автостарту та повернути її тип запуску: $unrestorableText"
+                }
+            }
+            # Чужий знімок: відкидаємо записи поза керованим набором ДО запису
+            # власного маркера — Write переносить їх без фільтрації (#345).
+            try {
+                $rejectedForeignEntries = @(Remove-BRAVODataRestoreDisallowedMarkerSnapshotEntries -AllowedServiceNames @($script:dataRestoreAllowedServiceNames))
+                if ($rejectedForeignEntries.Count -gt 0) {
+                    Write-DataRestoreLog -Message ("Записи знімка типів запуску поза керованим набором служб відкинуто з маркера (можливе стороннє редагування): {0}" -f ($rejectedForeignEntries -join ', ')) -Level 'WARNING'
+                    $script:dataRestoreWarningCount++
+                }
+            } catch {
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "не вдалося очистити чужий маркер служб від записів поза керованим набором (#333): $($_.Exception.Message)"
             }
             $orphanHeldSnapshot = @($orphanContext.HeldSnapshot)
             if ($servicesWithRestartIntent.Count -gt 0 -or $script:dataRestoreStartTypeSnapshot.Count -gt 0 -or $orphanHeldSnapshot.Count -gt 0) {

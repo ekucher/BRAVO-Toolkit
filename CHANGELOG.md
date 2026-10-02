@@ -23,6 +23,9 @@
   будь-яких змін; записи знімка поза керованим набором служб ігноруються. Self-test: `DataRestore/StartMode*` (звичайна служба, Manual-зупинена,
   delayed automatic, вимкнена оператором, чужий знімок suppressed/repairable, відсутній знімок,
   зіпсований маркер, збій restore, збій старту служби).
+  Правки рев'ю #345: керована служба зі start type `Other`/нечитаним (не потрапила б у знімок)
+  скасовує restore (`43`) до змін даних, з її іменем у журналі; записи чужого знімка поза
+  керованим набором відкидаються з маркера ДО запису власного (WARNING). Maintenance не змінено.
 
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
