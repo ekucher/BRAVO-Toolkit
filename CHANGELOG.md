@@ -2,6 +2,71 @@
 
 ## Не випущено (developer)
 
+- **Fix: self-test `TraceArchive/GraceCompletionExpiry*` не залежить від швидкості runner-а (#338).**
+  Fixture виставляв `LastWriteTime` джерела за 2 с до grace-межі й перетинав межу реальним
+  `Start-Sleep`; на повільному runner-і джерело вже було за межею на кроці-передумові, видалялось,
+  `state.json` не створювався, а вторинний `Get-Content` обривав секцію TraceArchive. Тепер
+  fixture лежить за 1 годину ПІД межею, а межа перетинається зсувом керованого годинника
+  (тимчасова підміна `Get-Date` у модулі на час кроку: без параметрів — реальний час + зсув 0/+2 год,
+  з параметрами — штатний), без очікування. Читання `state.json` захищене `Test-Path`, тож збій
+  перевірки дає чисте `[FAIL]`, а не виняток секції. Production-код і маніфест не змінено.
+
+- **Fix: заглушки вбудованих команд self-test не витікають між suite (#337).**
+  `New-BRAVOSelfTestRuntimeModule` (голий `New-Module`) матеріалізує функції-заглушки
+  (`Get-Service`, `Start-Service`, `Stop-Service`, `Get-Process`, `Stop-Process`,
+  `Invoke-WebRequest`, `Start-Sleep`, `Get-CimInstance` тощо) у глобальній сесії, а
+  прибиралися вони лише наприкінці прогону, тож змінювали семантику наступних suite
+  (витік `Start-Sleep` уже ламав TraceArchive). Тепер єдиний життєвий цикл: на вході в
+  кожну секцію `Suite/*` `Enter-BRAVOSelfTestSection` знімає знімок резолюції
+  спостережуваних вбудованих команд і межу реєстру runtime-модулів, а
+  `Complete-BRAVOSelfTestSection` (у `finally`, тобто й після перерваного suite) через
+  `Restore-BRAVOSelfTestSuiteIsolation` прибирає модулі цього suite, знімає затінюючі
+  global function/alias (у т.ч. від голого `New-Module`), повертає початкові функції та
+  перевіряє результат; залишкове відхилення — `[FAIL] Framework/SuiteIsolation[...]`.
+  `Clear-BRAVOSelfTestOwnedRuntimeModules` отримав `-StartIndex`/`-FunctionBaseline` і
+  лишається ідемпотентною страховкою наприкінці прогону. Нові перевірки:
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites` (фактична резолюція `Get-Command`
+  після закриття проба-suite для Get-Service, Start-Service, Stop-Service, Get-Process,
+  Stop-Process, Invoke-WebRequest, Start-Sleep, Get-CimInstance, Get-WmiObject,
+  Start-Process, а також Invoke-RestMethod і global-аліаса Get-Date),
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ProbeStubsActiveInsideSuite`,
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation`,
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.RestorerPrimitivesShadowed` (саме
+  відновлення викликає cmdlet-и з модульною кваліфікацією, тож затінені suite-ом `Get-Item`,
+  `Remove-Item`, `Set-Item`, `Get-ChildItem`, `Remove-Module`, `New-Object`, `Write-Host`
+  теж знімаються; `Set-Item` додано до спостережуваних),
+  `…FunctionHiddenBehindAliasRemoved` (alias і function під тим самим ім'ям відстежуються
+  окремо), `…FailedCleanupNotMarkedCleaned` (невдале прибирання модуля повторюється фінальним
+  проходом), `Framework/SectionIsolation.AbortedSuiteCleanupFaultKeepsPrimaryFault` (збій
+  відновлення після перерваного suite не перезаписує первинний виняток),
+  `…AliasMetadataRestored` (аліас повертається з Options/Description),
+  `…FunctionOptionsRestored` (функція повертається з Options),
+  `…ModuleOwnedFunctionRestored` (функція модуля лишається прив'язаною до модуля),
+  `…AllScopeAliasNotSilentlyLeaked` (заміна AllScope-аліаса відновлюється або дає видимий залишок),
+  `…GlobalStubBehindScriptFunctionRemoved` (global-заглушка під script-функцією знімається; глобальну
+  область читає й чистить порожній динамічний модуль, бо `Remove-Item function:global:X` нічого не видаляє),
+  `Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs` (реальний Enter/Complete
+  для `Suite/*` у дочірньому процесі). Стан затінення читається прямо з Function:/Alias:
+  (без `Get-Command` для відсутніх імен — дорогий пошук модулів), підмітання функцій
+  зареєстрованих модулів виконується й у фінальному `Clear-...`, збій відновлення
+  реєструється як збій секції, а не виходить із `finally`.
+  Побічно: RestoreSynthetic раніше покладався на витік no-op `Start-Sleep` з попередніх suite
+  (settle-повтори recovery 15 с x спроб, +~660 с на Windows CI); тепер власна заглушка
+  `Start-Sleep` є у модулі фікстури RestoreSynthetic.
+
+- **Fix: `Update-BRAVOServer` більше не відкочує оновлення, коли `BRAVO_SETUP` повертає exit 10 (#330).**
+  Гейт після розгортання приймав від `BRAVO_SETUP -Action Scheduler` і `-ValidateOnly`
+  лише `0`, тож SuccessWithWarnings (`10`) за контрактом BRAVO.ExitCodes вважався провалом
+  і справне оновлення відкочувалось (після #289 — дзеркальним відкатом). Тепер гейт і
+  перевірка після відкату користуються одним вердиктом `Get-BRAVODeploySetupExitVerdict`
+  (`deploy\BRAVO.Deploy.Rollback.ps1`): `0` = PASS, `10` = PASS WITH WARNING (рядок
+  `[УВАГА]`), інше = FAIL. Self-test `Rollback/PostDeployGateTreatsSetupExit10AsPassWithWarning`
+  виконує блок гейта з `Update-BRAVOServer.ps1` із фейковим `BRAVO_SETUP` і падає без виправлення.
+  Регресійна матриця `Rollback/SetupExitVerdictMatrixGateAndRollback` виконує той самий блок
+  для пар Scheduler/ValidateOnly (0/0 PASS; 10/0, 0/10, 10/10 PASS WITH WARNING; 1/0, 0/2, 10/2 FAIL)
+  і перевірку після відкату (0 PASS, 10 PASS WITH WARNING, 3 FAIL); падає і при поверненні гейта
+  до `-eq 0`, і при зміні класифікатора (10 => FAIL).
+
 - **Fix: Health показує ймовірну причину застарілої generation і не дублює її в хмарних рядках (#322).**
   Не-COMPLETE manifest більше не пропускається мовчки: `Get-BackupHealthIssues` запам'ятовує
   останню INCOMPLETE/FAILED спробу, а issue «остання COMPLETE generation старша за N год.»
