@@ -2,6 +2,24 @@
 
 ## Не випущено (developer)
 
+- **Fix: ізоляція suite self-test бачить Private-записи й тримає незмінний знімок функцій (#350).**
+  Знімок і відновлення читали alias/function script- і global-області з області функції
+  фреймворку, звідки записи з опцією `Private` у батьківських областях невидимі: такий запис
+  фіксувався як відсутній, і його заміна чи видалення suite-ом не відновлювались. Тепер стан
+  читається, знімається й відновлюється прямо в таблиці потрібної області
+  (`Get-BRAVOSelfTestSessionScopeAccess`, `Get-/Remove-BRAVOSelfTestScopedCommandItem`;
+  відсутній член рушія — виняток, а не тихе неповне читання), Options (`Private`,
+  `ReadOnly` тощо) повертаються на відновлений запис. Знімок функцій більше не зберігає живі
+  `FunctionInfo` (перевизначення наявної функції змінює той самий об'єкт на місці, і
+  «знімок» віддавав би заглушку): на вході в suite матеріалізуються ім'я -> `ScriptBlock` та
+  ім'я -> `Options` глобальних функцій. Нові перевірки `Framework/SuiteIsolation.*`:
+  Private-функція й Private-аліас (заміна, видалення; script- і global-область), матриця
+  наявна/видалена/нова функція та аліас, голий `New-Module`, dot-source suite-фрагмента,
+  runtime-модуль над Private-функцією, відновлення після винятку suite, незмінність знімка
+  функцій і поведінкова перевірка резолюції `Get-Service`, `Start-Service`, `Stop-Service`,
+  `Get-Process`, `Stop-Process`, `Start-Sleep`, `Invoke-WebRequest`, `Get-CimInstance`,
+  `Get-WmiObject`, `Start-Process` після Private-заглушок. Production-код не змінено.
+
 - **Fix: self-test `TraceArchive/GraceCompletionExpiry*` не залежить від швидкості runner-а (#338).**
   Fixture виставляв `LastWriteTime` джерела за 2 с до grace-межі й перетинав межу реальним
   `Start-Sleep`; на повільному runner-і джерело вже було за межею на кроці-передумові, видалялось,
