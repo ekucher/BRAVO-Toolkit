@@ -842,44 +842,120 @@ function Get-BRAVOSelfTestWatchedBuiltinCommandNames {
     )
 }
 
-function Get-BRAVOSelfTestBuiltinCommandState {
-    # Стан затінення імені: alias і function фіксуються НЕЗАЛЕЖНО (прямий
-    # хеш-пошук у Alias:/Function:, без Get-Command: той для відсутнього
-    # імені запускає дорогий пошук модулів — на Windows це давало десятки
-    # секунд на suite). Функція, що з'явилась під уже наявним аліасом, теж
-    # змінює стан: інакше вона лишилась би прихованою і проявилась би після
-    # зняття аліаса. Cmdlet/зовнішня команда без затінення = '<none>'. Для
-    # функції ще й посилання на ScriptBlock (заміна функції функцією з тим
-    # самим ModuleName теж видима).
-    param([Parameter(Mandatory = $true)][string]$Name)
-    $aliasItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $Name) -ErrorAction SilentlyContinue
-    $functionItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue
-    $keyParts = @()
-    $aliasDefinition = $null
-    $functionScriptBlock = $null
-    if ($null -ne $aliasItem) {
-        $aliasDefinition = [string]$aliasItem.Definition
-        $keyParts += ('Alias|' + $aliasDefinition)
+function Invoke-BRAVOSelfTestGlobalScopeItem {
+    # Операція з Alias:/Function: у ГЛОБАЛЬНІЙ області. Scope-кваліфікатор у
+    # шляху (function:global:X) Get-Item/Remove-Item не розуміють, тож
+    # виконуємо в порожньому динамічному модулі: його ланцюг областей —
+    # модуль -> global, тому найближчий запис і є глобальний.
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('Get', 'Remove')][string]$Operation,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    if ($null -eq (Microsoft.PowerShell.Utility\Get-Variable -Name 'BRAVOSelfTestGlobalScopeReader' -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:BRAVOSelfTestGlobalScopeReader = Microsoft.PowerShell.Core\New-Module -ScriptBlock { }
     }
-    if ($null -ne $functionItem) {
-        $functionScriptBlock = $functionItem.ScriptBlock
-        $keyParts += ('Function|' + $functionItem.ModuleName)
+    if ($Operation -eq 'Get') {
+        return (& $script:BRAVOSelfTestGlobalScopeReader {
+                param($ItemPath) Microsoft.PowerShell.Management\Get-Item -LiteralPath $ItemPath -ErrorAction SilentlyContinue } $Path)
+    }
+    & $script:BRAVOSelfTestGlobalScopeReader {
+        param($ItemPath) Microsoft.PowerShell.Management\Remove-Item -LiteralPath $ItemPath -Force -ErrorAction SilentlyContinue } $Path
+}
+
+function ConvertTo-BRAVOSelfTestCommandEntry {
+    param($Item, [string]$Kind)
+    if ($null -eq $Item) { return $null }
+    if ($Kind -eq 'Alias') {
+        return [pscustomobject]@{ Kind = 'Alias'; Definition = [string]$Item.Definition; Options = [string]$Item.Options
+            Description = [string]$Item.Description; ScriptBlock = $null; Item = $Item }
+    }
+    return [pscustomobject]@{ Kind = 'Function'; Definition = [string]$Item.ModuleName; Options = ''
+        Description = ''; ScriptBlock = $Item.ScriptBlock; Item = $Item }
+}
+
+function Get-BRAVOSelfTestBuiltinCommandState {
+    # Стан затінення імені: alias і function, кожен у ГЛОБАЛЬНІЙ області і
+    # як НАЙБЛИЖЧИЙ запис (script-область self-test, куди dot-source пише
+    # suite-фрагменти), фіксуються незалежно — прямий хеш-пошук у
+    # Alias:/Function:, без Get-Command (той для відсутнього імені запускає
+    # дорогий пошук модулів — на Windows це давало десятки секунд на suite).
+    # Заглушка не ховається за наявним записом: функція під аліасом,
+    # global-заглушка голого New-Module під script-функцією. Для аліаса — ще
+    # Options і Description, для функції — посилання на ScriptBlock (заміна
+    # функції функцією з тим самим ModuleName теж видима). Нічого = '<none>'.
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $entries = [ordered]@{
+        GlobalAlias     = ConvertTo-BRAVOSelfTestCommandEntry -Kind Alias -Item (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('alias:' + $Name))
+        NearestAlias    = ConvertTo-BRAVOSelfTestCommandEntry -Kind Alias -Item (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $Name) -ErrorAction SilentlyContinue)
+        GlobalFunction  = ConvertTo-BRAVOSelfTestCommandEntry -Kind Function -Item (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $Name))
+        NearestFunction = ConvertTo-BRAVOSelfTestCommandEntry -Kind Function -Item (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue)
+    }
+    $keyParts = @()
+    foreach ($entryName in @($entries.Keys)) {
+        $entry = $entries[$entryName]
+        if ($null -eq $entry) { continue }
+        # Найближчий, що збігається з глобальним, окремо не показуємо.
+        $globalTwin = $entries[$entryName.Replace('Nearest', 'Global')]
+        if ($entryName.StartsWith('Nearest') -and $null -ne $globalTwin -and [object]::ReferenceEquals($entry.Item, $globalTwin.Item)) { continue }
+        $keyParts += ('{0}|{1}|{2}|{3}' -f $entryName.Replace('Global', ''), $entry.Definition, $entry.Options, $entry.Description)
     }
     $stateKey = if ($keyParts.Count -gt 0) { [string]::Join(' + ', [string[]]$keyParts) } else { '<none>' }
-    return [pscustomobject]@{
-        Name            = $Name
-        Key             = $stateKey
-        HasAlias        = ($null -ne $aliasItem)
-        AliasDefinition = $aliasDefinition
-        HasFunction     = ($null -ne $functionItem)
-        ScriptBlock     = $functionScriptBlock
-    }
+    return [pscustomobject]@{ Name = $Name; Key = $stateKey; Entries = $entries }
+}
+
+function Test-BRAVOSelfTestBuiltinCommandEntryEqual {
+    param($Left, $Right)
+    if ($null -eq $Left -or $null -eq $Right) { return ($null -eq $Left -and $null -eq $Right) }
+    if ($Left.Kind -ne $Right.Kind -or $Left.Definition -ne $Right.Definition -or
+        $Left.Options -ne $Right.Options -or $Left.Description -ne $Right.Description) { return $false }
+    return [object]::ReferenceEquals($Left.ScriptBlock, $Right.ScriptBlock)
 }
 
 function Test-BRAVOSelfTestBuiltinCommandStateEqual {
     param($Left, $Right)
     if ($Left.Key -ne $Right.Key) { return $false }
-    return [object]::ReferenceEquals($Left.ScriptBlock, $Right.ScriptBlock)
+    foreach ($entryName in @($Left.Entries.Keys)) {
+        if (-not (Test-BRAVOSelfTestBuiltinCommandEntryEqual -Left $Left.Entries[$entryName] -Right $Right.Entries[$entryName])) { return $false }
+    }
+    return $true
+}
+
+function Restore-BRAVOSelfTestBuiltinCommandEntry {
+    # Повертає один вид запису (Alias/Function) імені до знімка: спершу
+    # глобальний, потім найближчий (script-область), якщо він був окремим.
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Kind, $Baseline)
+    $drive = $Kind.ToLowerInvariant() + ':'
+    $current = Get-BRAVOSelfTestBuiltinCommandState -Name $Name
+    if (-not (Test-BRAVOSelfTestBuiltinCommandEntryEqual -Left $Baseline.Entries['Global' + $Kind] -Right $current.Entries['Global' + $Kind])) {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ($drive + $Name)
+        Set-BRAVOSelfTestBuiltinCommandEntry -Name $Name -Scope Global -Entry $Baseline.Entries['Global' + $Kind]
+        $current = Get-BRAVOSelfTestBuiltinCommandState -Name $Name
+    }
+    if (-not (Test-BRAVOSelfTestBuiltinCommandEntryEqual -Left $Baseline.Entries['Nearest' + $Kind] -Right $current.Entries['Nearest' + $Kind])) {
+        # Окремий найближчий запис (не глобальний) — зняти: без кваліфікатора
+        # Remove-Item прибирає найближчий у ланцюгу (тут — script-область).
+        $currentNearest = $current.Entries['Nearest' + $Kind]
+        $currentGlobal = $current.Entries['Global' + $Kind]
+        if ($null -ne $currentNearest -and -not ($null -ne $currentGlobal -and [object]::ReferenceEquals($currentNearest.Item, $currentGlobal.Item))) {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath ($drive + $Name) -Force -ErrorAction SilentlyContinue
+        }
+        $baselineNearest = $Baseline.Entries['Nearest' + $Kind]
+        $baselineGlobal = $Baseline.Entries['Global' + $Kind]
+        if ($null -ne $baselineNearest -and -not ($null -ne $baselineGlobal -and [object]::ReferenceEquals($baselineNearest.Item, $baselineGlobal.Item))) {
+            Set-BRAVOSelfTestBuiltinCommandEntry -Name $Name -Scope Script -Entry $baselineNearest
+        }
+    }
+}
+
+function Set-BRAVOSelfTestBuiltinCommandEntry {
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Scope, $Entry)
+    if ($null -eq $Entry) { return }
+    if ($Entry.Kind -eq 'Function') {
+        Microsoft.PowerShell.Management\Set-Item -Path ('function:' + $Scope.ToLowerInvariant() + ':' + $Name) -Value $Entry.ScriptBlock -Force
+    } else {
+        Microsoft.PowerShell.Utility\Set-Alias -Name $Name -Value $Entry.Definition -Scope $Scope `
+            -Option ([Management.Automation.ScopedItemOptions]$Entry.Options) -Description $Entry.Description -Force
+    }
 }
 
 function New-BRAVOSelfTestSuiteIsolationSnapshot {
@@ -924,18 +1000,8 @@ function Restore-BRAVOSelfTestSuiteIsolation {
         $currentState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
         if (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $currentState) { continue }
         try {
-            # Зняти затінюючі alias/function (можуть бути в кількох областях).
-            foreach ($shadowScope in @('global:', 'script:', '')) {
-                Microsoft.PowerShell.Management\Remove-Item -Path ('alias:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
-                Microsoft.PowerShell.Management\Remove-Item -Path ('function:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
-            }
-            # Початкові функція та/або аліас — повернути кожен.
-            if ($baselineState.HasFunction) {
-                Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $watchedName) -Value $baselineState.ScriptBlock -Force
-            }
-            if ($baselineState.HasAlias) {
-                Microsoft.PowerShell.Utility\Set-Alias -Name $watchedName -Value $baselineState.AliasDefinition -Scope Global -Force
-            }
+            Restore-BRAVOSelfTestBuiltinCommandEntry -Name $watchedName -Kind Alias -Baseline $baselineState
+            Restore-BRAVOSelfTestBuiltinCommandEntry -Name $watchedName -Kind Function -Baseline $baselineState
         } catch {
             [void]$residualProblems.Add("${watchedName}: не вдалося зняти затінення — $($_.Exception.Message)")
         }
@@ -1818,7 +1884,9 @@ Save-BRAVOSelfTestFrameworkSnapshot -FunctionName @(
     'Complete-BRAVOSelfTestSection', 'Register-BRAVOSelfTestGlobalFatal',
     'Remove-BRAVOSelfTestConfigRoot', 'Invoke-BRAVOSelfTestFinalCleanup',
     'Get-BRAVOSelfTestWatchedBuiltinCommandNames', 'Get-BRAVOSelfTestBuiltinCommandState',
-    'Test-BRAVOSelfTestBuiltinCommandStateEqual',
+    'Test-BRAVOSelfTestBuiltinCommandStateEqual', 'Test-BRAVOSelfTestBuiltinCommandEntryEqual',
+    'Invoke-BRAVOSelfTestGlobalScopeItem', 'ConvertTo-BRAVOSelfTestCommandEntry',
+    'Restore-BRAVOSelfTestBuiltinCommandEntry', 'Set-BRAVOSelfTestBuiltinCommandEntry',
     'New-BRAVOSelfTestSuiteIsolationSnapshot', 'Restore-BRAVOSelfTestSuiteIsolation',
     'Write-BRAVOSelfTestSectionReport', 'Complete-BRAVOSelfTestAbnormalExit')
 
@@ -26007,6 +26075,15 @@ $primitiveProbeShadowCount = {
     }).Count
 }
 $primitiveProbeBeforeCount = & $primitiveProbeShadowCount $primitiveProbeNames
+# Незалежне від перевірюваного Restore прибирання: лише записи global, яких не
+# було до проби, і лише модуль-кваліфікованими cmdlet-ами.
+$primitiveProbePreexisting = @{}
+foreach ($primitiveProbeName in $primitiveProbeNames) {
+    foreach ($primitiveProbeDrive in @('function', 'alias')) {
+        $primitiveProbePreexisting[$primitiveProbeDrive + ':' + $primitiveProbeName] =
+            $null -ne (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ($primitiveProbeDrive + ':' + $primitiveProbeName))
+    }
+}
 $primitiveProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
 $primitiveProbeDuringCount = -1
 $primitiveProbeResidualProblems = @()
@@ -26022,7 +26099,15 @@ try {
     Set-Alias -Name 'Write-Host' -Value 'Out-Null' -Scope Global
     $primitiveProbeDuringCount = & $primitiveProbeShadowCount $primitiveProbeNames
 } finally {
-    $primitiveProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $primitiveProbeSnapshot -Label 'Framework.PrimitiveShadowProbe')
+    try {
+        $primitiveProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $primitiveProbeSnapshot -Label 'Framework.PrimitiveShadowProbe')
+    } finally {
+        foreach ($primitiveProbeKey in @($primitiveProbePreexisting.Keys)) {
+            if (-not $primitiveProbePreexisting[$primitiveProbeKey]) {
+                Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path $primitiveProbeKey
+            }
+        }
+    }
 }
 $primitiveProbeAfterCount = & $primitiveProbeShadowCount $primitiveProbeNames
 Test-BRAVOCondition -Condition (
@@ -26041,6 +26126,7 @@ Test-BRAVOCondition -Condition (
 $hiddenProbeName = 'Get-Date'
 $hiddenProbeHadAlias = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $hiddenProbeName) -ErrorAction SilentlyContinue)
 $hiddenProbeAliasAdded = $false
+$hiddenProbeFunctionPreexisting = $null -ne (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $hiddenProbeName))
 $hiddenProbeResidualProblems = @()
 $hiddenProbeFunctionDuring = $false
 try {
@@ -26058,8 +26144,11 @@ try {
     $hiddenProbeFunctionAfter = Test-Path -LiteralPath ('function:' + $hiddenProbeName)
     $hiddenProbeAliasAfter = Test-Path -LiteralPath ('alias:' + $hiddenProbeName)
 } finally {
+    if (-not $hiddenProbeFunctionPreexisting) {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $hiddenProbeName)
+    }
     if ($hiddenProbeAliasAdded) {
-        Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('alias:' + $hiddenProbeName) -Force -ErrorAction SilentlyContinue
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('alias:' + $hiddenProbeName)
     }
 }
 Test-BRAVOCondition -Condition (
@@ -26087,6 +26176,79 @@ $failedCleanupMarked = $null -ne $failedCleanupEntry.PSObject.Properties['Cleane
 Test-BRAVOCondition -Condition ($failedCleanupThrew -and -not $failedCleanupMarked) `
     -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FailedCleanupNotMarkedCleaned' `
     -Failure "невдале прибирання runtime-модуля має повідомити про збій і лишити запис для повтору (кинуло=$failedCleanupThrew, Cleaned=$failedCleanupMarked)"
+
+# Codex P2 на #340 (3): аліас повертається з початковими Options і
+# Description, а не як стандартний записуваний аліас.
+$aliasMetaProbeName = 'Send-MailMessage'
+$aliasMetaProbeRestored = $null
+$aliasMetaProbeResidualProblems = @()
+$aliasMetaProbePreexisting = $null -ne (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('alias:' + $aliasMetaProbeName))
+if (-not $aliasMetaProbePreexisting) {
+    try {
+        Microsoft.PowerShell.Utility\Set-Alias -Name $aliasMetaProbeName -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Global `
+            -Option ReadOnly -Description 'probe-alias-meta' -Force
+        $aliasMetaProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        try {
+            Microsoft.PowerShell.Utility\Set-Alias -Name $aliasMetaProbeName -Value 'Out-Null' -Scope Global -Option None -Description '' -Force
+        } finally {
+            $aliasMetaProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $aliasMetaProbeSnapshot -Label 'Framework.AliasMetadataProbe')
+        }
+        $aliasMetaProbeRestored = Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('alias:' + $aliasMetaProbeName)
+    } finally {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('alias:' + $aliasMetaProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $aliasMetaProbePreexisting -or (
+        $null -ne $aliasMetaProbeRestored -and
+        [string]$aliasMetaProbeRestored.Definition -eq 'Microsoft.PowerShell.Utility\Write-Output' -and
+        (($aliasMetaProbeRestored.Options -band [Management.Automation.ScopedItemOptions]::ReadOnly) -ne 0) -and
+        [string]$aliasMetaProbeRestored.Description -eq 'probe-alias-meta' -and
+        $aliasMetaProbeResidualProblems.Count -eq 0)
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.AliasMetadataRestored' `
+    -Failure ("аліас має повернутися з початковими Options/Description: {0}; залишки: {1}" -f
+        $(if ($null -ne $aliasMetaProbeRestored) { '{0} [{1}] "{2}"' -f $aliasMetaProbeRestored.Definition, $aliasMetaProbeRestored.Options, $aliasMetaProbeRestored.Description } else { 'аліаса немає' }),
+        [string]::Join('; ', [string[]]$aliasMetaProbeResidualProblems))
+
+# Codex P2 на #340 (4): global-заглушка (голий New-Module) під уже наявною
+# script-функцією з тим самим ім'ям знімається; script-функція лишається.
+$scopeProbeName = 'Wait-Process'
+$scopeProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $scopeProbeName) -ErrorAction SilentlyContinue)
+$scopeProbeGlobalDuring = $false
+$scopeProbeGlobalAfter = $true
+$scopeProbeScriptAfter = $false
+$scopeProbeResidualProblems = @()
+if (-not $scopeProbePreexisting) {
+    try {
+        Microsoft.PowerShell.Management\Set-Item -LiteralPath ('function:script:' + $scopeProbeName) -Value { 'script-baseline' } -Force
+        $scopeProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        try {
+            [void](New-Module -ScriptBlock { function Wait-Process { 'global-stub' } })
+            $scopeProbeGlobalDuring = $null -ne (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $scopeProbeName))
+        } finally {
+            $scopeProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $scopeProbeSnapshot -Label 'Framework.ScopedFunctionProbe')
+        }
+        # Якщо self-test запущено через -File, script-область і є global:
+        # тоді «global після» — це та сама відновлена script-функція.
+        $scopeProbeNearestAfter = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $scopeProbeName) -ErrorAction SilentlyContinue
+        $scopeProbeGlobalAfterItem = Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $scopeProbeName)
+        $scopeProbeGlobalAfter = $null -ne $scopeProbeGlobalAfterItem -and -not (
+            $null -ne $scopeProbeNearestAfter -and [object]::ReferenceEquals($scopeProbeGlobalAfterItem.ScriptBlock, $scopeProbeNearestAfter.ScriptBlock))
+        $scopeProbeScriptAfter = $null -ne $scopeProbeNearestAfter -and (& $scopeProbeNearestAfter.ScriptBlock) -eq 'script-baseline'
+    } finally {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('function:' + $scopeProbeName) -Force -ErrorAction SilentlyContinue
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $scopeProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $scopeProbePreexisting -or (
+        $scopeProbeGlobalDuring -and -not $scopeProbeGlobalAfter -and $scopeProbeScriptAfter -and
+        $scopeProbeResidualProblems.Count -eq 0)
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.GlobalStubBehindScriptFunctionRemoved' `
+    -Failure ("global-заглушка під script-функцією має бути знята: під час={0}, global після={1}, script після={2}; залишки: {3}" -f
+        $scopeProbeGlobalDuring, $scopeProbeGlobalAfter, $scopeProbeScriptAfter, [string]::Join('; ', [string[]]$scopeProbeResidualProblems))
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.BuiltinCommandStubsDoNotLeakAcrossSuites' } }
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.VariableScopeHeadroom') { try {
 

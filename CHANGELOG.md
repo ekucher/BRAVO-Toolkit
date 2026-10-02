@@ -39,6 +39,9 @@
   окремо), `…FailedCleanupNotMarkedCleaned` (невдале прибирання модуля повторюється фінальним
   проходом), `Framework/SectionIsolation.AbortedSuiteCleanupFaultKeepsPrimaryFault` (збій
   відновлення після перерваного suite не перезаписує первинний виняток),
+  `…AliasMetadataRestored` (аліас повертається з Options/Description),
+  `…GlobalStubBehindScriptFunctionRemoved` (global-заглушка під script-функцією знімається; глобальну
+  область читає й чистить порожній динамічний модуль, бо `Remove-Item function:global:X` нічого не видаляє),
   `Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs` (реальний Enter/Complete
   для `Suite/*` у дочірньому процесі). Стан затінення читається прямо з Function:/Alias:
   (без `Get-Command` для відсутніх імен — дорогий пошук модулів), підмітання функцій
