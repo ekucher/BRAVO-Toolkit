@@ -13889,6 +13889,9 @@ function Write-BRAVOServiceQuiescenceState {
 # змін start type, жодних подій у журналі проби) — оркестрація кроків і
 # порядок подій лишаються рівно тими, що були до #297.
 function New-BRAVOServiceStartTypeSnapshot { param([string[]]$ServiceNames) return @() }
+# #349: реєстровий тип запуску — Disabled, щоб порожній стаб-знімок не вважався
+# «неутримуваною» службою (перевірка Get-BRAVOMaintenanceUnrestorableServiceNames).
+function Get-BRAVOServiceRegistryStartMode { param([string]$ServiceName) return 'Disabled' }
 function Suspend-BRAVOServiceAutostart { param([object[]]$Snapshot) return [pscustomobject]@{ Applied = @(); Failed = @() } }
 function Restore-BRAVOServiceStartTypeSnapshot { param([object[]]$Snapshot, [string[]]$AllowedServiceNames) return [pscustomobject]@{ Restored = @(); Unchanged = @(); Foreign = @(); Failed = @() } }
 function Confirm-BRAVOServicesQuiesced { param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds) return [pscustomobject]@{ Ok = $true; Offenders = @(); StoppedAgain = @() } }

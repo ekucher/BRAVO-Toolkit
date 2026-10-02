@@ -857,6 +857,29 @@ if ($BravoWebComponentEnabled -and -not $ApacheService) {
     }
 }
 
+function Get-BRAVOMaintenanceUnrestorableServiceNames {
+    # #349: служба, яку буде зупинено, але яка НЕ потрапила у знімок типів
+    # запуску й не Disabled (нечитаний/Other/відсутній start type), не може
+    # бути утримана від автостарту й повернена — вона могла б перезапуститись
+    # посеред реставрації. Служба, що вже Disabled (рішення оператора),
+    # легітимно лишається поза знімком. Той самий інваріант, що в DataRestore (#345).
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ManagedNames,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Snapshot
+    )
+
+    $unrestorable = @()
+    foreach ($managedName in @($ManagedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        if (@($Snapshot | Where-Object { [string]$_.Name -ieq $managedName }).Count -gt 0) { continue }
+        $currentMode = $null
+        try { $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $managedName } catch { $currentMode = $null }
+        if ($null -ne $currentMode -and [string]$currentMode -eq 'Disabled') { continue }
+        $modeText = if ($null -eq $currentMode) { 'не прочитано' } else { [string]$currentMode }
+        $unrestorable += ('{0} (тип запуску: {1})' -f $managedName, $modeText)
+    }
+    return @($unrestorable)
+}
+
 function Test-BRAVOServiceDisabledBySystem {
     # StartType відсутній у ServiceController на .NET < 4.6.1 (#319), тож
     # читається лише через Get-BRAVOServiceStartMode (під StrictMode 2.0
@@ -8731,6 +8754,18 @@ if ($stopServicesRequired) {
     } catch {
         $script:startTypeSnapshot = @()
         $script:startModeSuppressionFailures += "знімок типів запуску не знято: $($_.Exception.Message)"
+    }
+    # #349: служба, яку буде зупинено, але неможливо утримати/повернути
+    # (start type не прочитано або Other), — fail-closed як і збій утримання.
+    if ($script:startModeSuppressionFailures.Count -eq 0) {
+        $unrestorableQuiesced = @(Get-BRAVOMaintenanceUnrestorableServiceNames `
+                -ManagedNames @($script:quiescedServiceNames) `
+                -Snapshot @($script:startTypeSnapshot))
+        if ($unrestorableQuiesced.Count -gt 0) {
+            $unrestorableQuiescedText = $unrestorableQuiesced -join ', '
+            Write-Log -Message "Службу(и) не можна утримати від автостарту — тип запуску не прочитано або не підтримується: $unrestorableQuiescedText (#349)" -Level "ERROR"
+            $script:startModeSuppressionFailures += "службу(и) неможливо утримати від автостарту та повернути її тип запуску: $unrestorableQuiescedText"
+        }
     }
     try {
         [void](Write-BRAVOServiceQuiescenceState `

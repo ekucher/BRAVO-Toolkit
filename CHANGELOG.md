@@ -2,6 +2,17 @@
 
 ## Не випущено (developer)
 
+- **Fix: Maintenance не зупиняє службу без утримання від автостарту, коли її тип запуску неможливо зняти (#349).**
+  `New-BRAVOServiceStartTypeSnapshot` мовчки пропускає службу з нечитаним ($null) або `Other` типом
+  запуску (а `Disabled` пропускає свідомо), а Maintenance не порівнював знімок зі службами, які
+  зупиняє, — така служба зупинялась без утримання й могла перезапуститись посеред
+  обслуговування/реставрації. Тепер нова `Get-BRAVOMaintenanceUnrestorableServiceNames` (той самий
+  інваріант, що в DataRestore, #345) після знімка шукає зупинювані служби поза знімком, чий реєстровий
+  тип не `Disabled`; кожна така служба логується як ERROR і додається в `startModeSuppressionFailures`
+  (та сама fail-closed політика: реставрація моделі before-archive/bravocmd скасовується через
+  `Confirm-BRAVOServicesQuiesced`, решта обслуговування триває). Службу, вимкнену оператором
+  (`Disabled`), не чіпаємо. Додано self-test `ServiceQuiescence/Maintenance*`.
+
 - **Fix: self-test `TraceArchive/GraceCompletionExpiry*` не залежить від швидкості runner-а (#338).**
   Fixture виставляв `LastWriteTime` джерела за 2 с до grace-межі й перетинав межу реальним
   `Start-Sleep`; на повільному runner-і джерело вже було за межею на кроці-передумові, видалялось,
