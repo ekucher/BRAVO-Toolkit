@@ -616,7 +616,7 @@ function Test-BRAVOSelfTestDuplicateDefinition {
                     $consoleCodePageRelative -like 'tests/*' -or $consoleCodePageRelative -like 'BRAVO_SELF_TEST*' -or
                     $consoleCodePageRelative -like 'BRAVO_DATA_RESTORE_MATRIX_TEST*' -or
                     $consoleCodePageAllowed -contains $consoleCodePageRelative) -and
-                ([IO.File]::ReadAllText($_.FullName) -match '\[Console\]::OutputEncoding\s*=[^=]')
+                ([IO.File]::ReadAllText($_.FullName) -match '\[(System\.)?Console\]::(OutputEncoding\s*=[^=]|set_OutputEncoding\s*\()')
             } |
             ForEach-Object { $_.FullName.Substring($root.TrimEnd('\', '/').Length + 1) }
     )

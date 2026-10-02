@@ -8,7 +8,7 @@
   ARCHIV/HEALTH/MAINTENANCE гинули до відкриття журналу. `Test-BRAVOConsoleCodePageChangeSafe`
   (BRAVO.Compatibility) на Windows < 10 у неінтерактивній сесії кодову сторінку консолі не
   змінює; Windows 10+ та інтерактивні запуски — без змін. `$OutputEncoding` (кодування для
-  зовнішніх процесів) і UTF-8-логи не змінюються. Перенесено з `5.2.5-rc.3`. Нові перевірки:
+  зовнішніх процесів) і UTF-8-логи не змінюються; лише в цьому випадку консоль лишається на OEM-сторінці, тож нативний вивід, захоплений без явного `StandardOutputEncoding`, декодується за OEM. Перенесено з `5.2.5-rc.3`. Нові перевірки:
   `ConsoleUX/31-LegacySystemConsoleKeepsCodePage` (поведінкова матриця Server 2012 / 2012 R2 /
   Windows 10 / 11 x інтерактивна чи неінтерактивна сесія x кодова сторінка через
   `Initialize-BRAVOConsoleEncoding` з тестовими параметрами `-OSVersion`, `-UserInteractive`,
