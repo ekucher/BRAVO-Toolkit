@@ -26832,7 +26832,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteIsolationPrivateAndImm
 # в finally навіть після винятку. Опис дії та перевірки виконуються dot-source
 # на рівні script-області: лише звідти видно її Private-записи, і саме туди
 # dot-source пише suite-фрагменти. Ім'я, зайняте до проби, — FAIL, а не
-# тихий пропуск: інакше проба нічого не доводила б.
+# тихий пропуск: інакше проба нічого не доводила б. Імена — лише справжні
+# cmdlet-и в Windows PowerShell 5.1 і 7 (Get-FileHash, наприклад, у 5.1 —
+# функція модуля Microsoft.PowerShell.Utility, тож ім'я вже зайняте).
 $suiteIsolationCaseCleanup = {
     param([string[]]$SuiteIsolationCleanupNames)
     $suiteIsolationCleanupAccess = Get-BRAVOSelfTestSessionScopeAccess
@@ -26957,7 +26959,7 @@ $suiteIsolationAbsent = {
     & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
     if ($suiteIsolationScriptTable -eq 'Script') { & $suiteIsolationHiddenFromChild ('function:' + $suiteIsolationCaseCommand) }
 }
-. $suiteIsolationCaseRun 'PrivateScriptFunctionRemoved' @('Get-FileHash') $suiteIsolationArrangeScriptFunction {
+. $suiteIsolationCaseRun 'PrivateScriptFunctionRemoved' @('Move-Item') $suiteIsolationArrangeScriptFunction {
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('function:' + $suiteIsolationCaseCommand) -Force
 } {
     & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
@@ -26998,11 +27000,11 @@ $suiteIsolationAbsent = {
 } {
     & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'None'
 }
-. $suiteIsolationCaseRun 'NewFunctionRemoved' @('Test-Connection', 'Get-FileHash') { } {
+. $suiteIsolationCaseRun 'NewFunctionRemoved' @('Test-Connection', 'Move-Item') { } {
     Microsoft.PowerShell.Management\Set-Item -Path 'function:global:Test-Connection' -Value { 'STUB' } -Force
-    Microsoft.PowerShell.Management\Set-Item -Path 'function:script:Get-FileHash' -Value { 'STUB' } -Force
+    Microsoft.PowerShell.Management\Set-Item -Path 'function:script:Move-Item' -Value { 'STUB' } -Force
 } $suiteIsolationAbsent
-. $suiteIsolationCaseRun 'ExistingAliasModified' @('Get-FileHash') $suiteIsolationArrangeGlobalAlias {
+. $suiteIsolationCaseRun 'ExistingAliasModified' @('Move-Item') $suiteIsolationArrangeGlobalAlias {
     Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Out-Null' -Scope Global -Force
 } {
     & $suiteIsolationCheckAlias 'Global' $suiteIsolationCaseCommand 'None'
@@ -27026,8 +27028,8 @@ $suiteIsolationAbsent = {
 . $suiteIsolationCaseRun 'DotSourcedSuiteFragmentRemoved' @('Send-MailMessage', 'Set-ItemProperty') { } {
     . ([scriptblock]::Create("function Send-MailMessage { 'STUB' }`nSet-Alias -Name Set-ItemProperty -Value Out-Null -Option Private"))
 } $suiteIsolationAbsent
-. $suiteIsolationCaseRun 'RuntimeModuleOverPrivateScriptFunction' @('Get-FileHash') $suiteIsolationArrangeScriptFunction {
-    [void](New-BRAVOSelfTestRuntimeModule -SourceText "function Get-FileHash { 'STUB' }" -FunctionNames @('Get-FileHash'))
+. $suiteIsolationCaseRun 'RuntimeModuleOverPrivateScriptFunction' @('Move-Item') $suiteIsolationArrangeScriptFunction {
+    [void](New-BRAVOSelfTestRuntimeModule -SourceText "function Move-Item { 'STUB' }" -FunctionNames @('Move-Item'))
 } {
     & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
     if ($suiteIsolationScriptTable -eq 'Script' -and $null -ne (Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
@@ -27056,6 +27058,11 @@ $suiteIsolationAbsent = {
     $suiteIsolationLiveInfo.Options = [Management.Automation.ScopedItemOptions]::Private
 } {
     Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+    # Suite прибирає перевизначену функцію, і runtime-модуль ставить власну
+    # заглушку: без цього в Windows PowerShell 5.1 експорт модуля не
+    # витісняє наявну Private-функцію, і відновлення через модуль не
+    # запускалося б.
+    Remove-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) -Scope Global -Kind Function -Name $suiteIsolationCaseCommand
     [void](New-BRAVOSelfTestRuntimeModule -SourceText "function Test-BRAVOSelfTestIsolation350Original { 'STUB' }" `
             -FunctionNames @('Test-BRAVOSelfTestIsolation350Original'))
 } {
