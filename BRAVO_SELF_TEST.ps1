@@ -315,7 +315,7 @@ $script:environmentLimitations = New-Object System.Collections.ArrayList
 # 188.6 с із 477.5 с sum-of-suites. Вибірковий прогін не може бути швидшим
 # за цю частину, і обіцяти більше було б неправдою.
 $script:BRAVOSelfTestSuiteCatalog = @(
-    'Archive', 'ArchiveDiskSpace', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
+    'Archive', 'ArchiveDiskSpace', 'BackupScope', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
     'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
     'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
     'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
@@ -8192,44 +8192,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $archiveScriptText.Contains('$record.GenerationId -eq $CurrentGenerationId') -and
             $archiveScriptText.Contains('$record.GenerationId -notin $protectedGenerationIds') -and
             $archiveScriptText.Contains('minimumRetainedVerifiedBackups') -and
-            $archiveScriptText.Contains('Select-Object -First $minimumRetainedCount') -and
+            $archiveScriptText.Contains('$protectedGenerationIds.Count -ge $minimumRetainedCount') -and
             $bravoConfigTextForRetention.Contains('$global:minimumRetainedVerifiedBackups')
         ) `
         -Name "BackupConsistency/RetentionNeverDeletesLastVerified" `
         -Failure "generation-aware retention має захищати current і N найновіших verified COMPLETE generations незалежно від archiveRetentionDays"
-
-    # Archive.Runtime.ps1 безумовно запускає Main при dot-source, тому саму
-    # функцію Remove-OldBackupSets тут викликати небезпечно. Натомість
-    # відтворюємо той самий алгоритм відбору (Select-Object -First/-Skip на
-    # відсортованому за спаданням часу списку) на синтетичних даних — це
-    # функціональна, а не текстова перевірка інваріанту "останню перевірену
-    # копію не видаляти", яку одна лише текстова перевірка вище довести не може.
-    # Навмисно всі три "покоління" старші за cutoff — саме такий сценарій
-    # (серія невдалих backup, лише старі перевірені копії) і був не захищений
-    # до цього виправлення: без Select-Object -First найновіший теж потрапляв
-    # у $setsToDelete.
-    $retentionSimulationSets = @(
-        [pscustomobject]@{ Name = "gen1_newest"; LastWriteTime = (Get-Date).AddDays(-190) },
-        [pscustomobject]@{ Name = "gen2_old"; LastWriteTime = (Get-Date).AddDays(-200) },
-        [pscustomobject]@{ Name = "gen3_oldest"; LastWriteTime = (Get-Date).AddDays(-400) }
-    ) | Sort-Object LastWriteTime -Descending
-    $retentionSimulationCutoff = (Get-Date).AddDays(-183)
-    $retentionSimulationProtected = @($retentionSimulationSets | Select-Object -First 1)
-    $retentionSimulationCandidates = @($retentionSimulationSets | Select-Object -Skip 1)
-    $retentionSimulationToDelete = @($retentionSimulationCandidates | Where-Object {
-        $_.LastWriteTime -lt $retentionSimulationCutoff
-    })
-    Test-BRAVOCondition `
-        -Condition (
-            $retentionSimulationProtected.Count -eq 1 -and
-            $retentionSimulationProtected[0].Name -eq "gen1_newest" -and
-            $retentionSimulationToDelete.Count -eq 2 -and
-            ($retentionSimulationToDelete.Name -contains "gen2_old") -and
-            ($retentionSimulationToDelete.Name -contains "gen3_oldest") -and
-            -not ($retentionSimulationToDelete.Name -contains "gen1_newest")
-        ) `
-        -Name "BackupConsistency/RetentionSelectionAlgorithm" `
-        -Failure "алгоритм відбору на видалення (Select-Object -First/-Skip найновіших перевірених комплектів) має завжди виключати найновіший комплект, навіть коли він старший за retention cutoff"
 
     $generationVerifierModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $archiveScriptText `
@@ -11920,6 +11887,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -FunctionNames @(
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
             'Get-BRAVOHealthBackupStaleReason',
             'Test-BRAVOHealthCatchUpRunIsAttempt',
             'Get-BRAVOHealthBackupStaleDiagnosis',
@@ -12257,6 +12225,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -FunctionNames @(
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
             'Get-BRAVOHealthBackupStaleReason',
             'Test-BRAVOHealthCatchUpRunIsAttempt',
             'Get-BRAVOHealthBackupStaleDiagnosis',
@@ -14813,6 +14782,7 @@ try {
             [void][IO.Directory]::CreateDirectory($healthOrchestrationRoot)
             $healthOrchestrationStubs = @'
 function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
+function Select-BRAVOExpectedArchiveDefinition { param($ArchiveDefinitions, [string[]]$NotInstalledComponents) return @(@($ArchiveDefinitions) | Where-Object { $_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type }) }
 function New-ProbeIssue {
     param([string]$Kind, [string]$Component, [string]$Reason, [string]$Location)
     return [pscustomobject]@{ Kind = $Kind; Component = $Component; Reason = $Reason; FileName = 'немає даних'; LastWriteTime = $null; SizeBytes = $null; ActualSizeBytes = $null; Location = $Location; Details = @() }
@@ -16339,15 +16309,15 @@ try {
         $derivationTextForDrift = Get-Content -LiteralPath (Join-Path $root "modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1") -Raw -Encoding UTF8
         Test-BRAVOCondition `
             -Condition (
-                $setupTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
-                $archiveRuntimeTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
+                $setupTextForDrift.Contains('Resolve-BRAVOBackupComponentScope') -and
+                $archiveRuntimeTextForDrift.Contains('Resolve-BRAVOBackupComponentScope') -and
                 $archiveRuntimeTextForDrift.Contains('-not $discoveryBaselineValid') -and
                 $derivationTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $setupTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $archiveRuntimeTextForDrift.Contains('-EnabledComponents $discoveryEnabledComponents')
             ) `
             -Name "Presence/DriftGateIsWiredIntoArchiveRuntimeAndSetup" `
-            -Failure "Test-BRAVODiscoveryComponentDrift має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
+            -Failure "Рішення про дрейф (Test-BRAVODiscoveryComponentDrift через канонічний Resolve-BRAVOBackupComponentScope) має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
 
         # 06: explicit override має АБСОЛЮТНИЙ пріоритет над Apache
         # discovery, навіть коли Apache-служба ОДНОЗНАЧНА і її DocumentRoot
@@ -23771,6 +23741,7 @@ function Write-BRAVOLog {
         -SourceText ($healthScriptText + [Environment]::NewLine + $notificationScriptText) `
         -FunctionNames @(
             'Get-BRAVOHealthLatestBackupSummary',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
             'Format-BackupAge',
             'Get-BRAVOUtcAge',
             'ConvertTo-BRAVOUtcDateTime',
@@ -24886,12 +24857,12 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $archiveNewSha512HashCallAsts.Count -eq 1 -and
-            $archiveGetFileHashCallAsts.Count -eq 4 -and
+            $archiveGetFileHashCallAsts.Count -eq 3 -and
             $null -ne $archiveHashWorkCallAst -and
             $archiveHashWorkCallAst.Extent.StartOffset -eq $archiveNewSha512HashCallAsts[0].Extent.StartOffset
         ) `
         -Name 'Archive/HashBusinessCallsRemainUnchanged' `
-        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
+        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 3 рази (четвертий виклик був у мертвій Remove-OldBackupSets, видаленій у #335); знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' } }
 
     # Archive (P2-1/P2-5, PR #136 review): рекурсивне впорядкування SFTP-
@@ -24901,6 +24872,14 @@ function Write-BRAVOLog {
         if (Enter-BRAVOSelfTestSection -Name 'Suite/Archive') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Archive.ps1')
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Archive' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    # BackupScope: бекап лише наявних компонентів (рішення власника 2026-10-01).
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'BackupScope') {
+        Enter-BRAVOSelfTestSuite -Name 'BackupScope'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/BackupScope') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BackupScope.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BackupScope' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'SftpCredentialsRequired') {
