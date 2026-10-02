@@ -24,6 +24,49 @@
   з параметрами — штатний), без очікування. Читання `state.json` захищене `Test-Path`, тож збій
   перевірки дає чисте `[FAIL]`, а не виняток секції. Production-код і маніфест не змінено.
 
+- **Fix: заглушки вбудованих команд self-test не витікають між suite (#337).**
+  `New-BRAVOSelfTestRuntimeModule` (голий `New-Module`) матеріалізує функції-заглушки
+  (`Get-Service`, `Start-Service`, `Stop-Service`, `Get-Process`, `Stop-Process`,
+  `Invoke-WebRequest`, `Start-Sleep`, `Get-CimInstance` тощо) у глобальній сесії, а
+  прибиралися вони лише наприкінці прогону, тож змінювали семантику наступних suite
+  (витік `Start-Sleep` уже ламав TraceArchive). Тепер єдиний життєвий цикл: на вході в
+  кожну секцію `Suite/*` `Enter-BRAVOSelfTestSection` знімає знімок резолюції
+  спостережуваних вбудованих команд і межу реєстру runtime-модулів, а
+  `Complete-BRAVOSelfTestSection` (у `finally`, тобто й після перерваного suite) через
+  `Restore-BRAVOSelfTestSuiteIsolation` прибирає модулі цього suite, знімає затінюючі
+  global function/alias (у т.ч. від голого `New-Module`), повертає початкові функції та
+  перевіряє результат; залишкове відхилення — `[FAIL] Framework/SuiteIsolation[...]`.
+  `Clear-BRAVOSelfTestOwnedRuntimeModules` отримав `-StartIndex`/`-FunctionBaseline` і
+  лишається ідемпотентною страховкою наприкінці прогону. Нові перевірки:
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites` (фактична резолюція `Get-Command`
+  після закриття проба-suite для Get-Service, Start-Service, Stop-Service, Get-Process,
+  Stop-Process, Invoke-WebRequest, Start-Sleep, Get-CimInstance, Get-WmiObject,
+  Start-Process, а також Invoke-RestMethod і global-аліаса Get-Date),
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ProbeStubsActiveInsideSuite`,
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation`,
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.RestorerPrimitivesShadowed` (саме
+  відновлення викликає cmdlet-и з модульною кваліфікацією, тож затінені suite-ом `Get-Item`,
+  `Remove-Item`, `Set-Item`, `Get-ChildItem`, `Remove-Module`, `New-Object`, `Write-Host`
+  теж знімаються; `Set-Item` додано до спостережуваних),
+  `…FunctionHiddenBehindAliasRemoved` (alias і function під тим самим ім'ям відстежуються
+  окремо), `…FailedCleanupNotMarkedCleaned` (невдале прибирання модуля повторюється фінальним
+  проходом), `Framework/SectionIsolation.AbortedSuiteCleanupFaultKeepsPrimaryFault` (збій
+  відновлення після перерваного suite не перезаписує первинний виняток),
+  `…AliasMetadataRestored` (аліас повертається з Options/Description),
+  `…FunctionOptionsRestored` (функція повертається з Options),
+  `…ModuleOwnedFunctionRestored` (функція модуля лишається прив'язаною до модуля),
+  `…AllScopeAliasNotSilentlyLeaked` (заміна AllScope-аліаса відновлюється або дає видимий залишок),
+  `…GlobalStubBehindScriptFunctionRemoved` (global-заглушка під script-функцією знімається; глобальну
+  область читає й чистить порожній динамічний модуль, бо `Remove-Item function:global:X` нічого не видаляє),
+  `Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs` (реальний Enter/Complete
+  для `Suite/*` у дочірньому процесі). Стан затінення читається прямо з Function:/Alias:
+  (без `Get-Command` для відсутніх імен — дорогий пошук модулів), підмітання функцій
+  зареєстрованих модулів виконується й у фінальному `Clear-...`, збій відновлення
+  реєструється як збій секції, а не виходить із `finally`.
+  Побічно: RestoreSynthetic раніше покладався на витік no-op `Start-Sleep` з попередніх suite
+  (settle-повтори recovery 15 с x спроб, +~660 с на Windows CI); тепер власна заглушка
+  `Start-Sleep` є у модулі фікстури RestoreSynthetic.
+
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
