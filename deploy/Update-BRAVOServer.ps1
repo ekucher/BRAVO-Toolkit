@@ -139,11 +139,11 @@ function Invoke-BRAVODeployUpdaterRollback {
             # крок 6 уже міг зареєструвати їх за визначенням нового релізу.
             & .\BRAVO_SETUP.ps1 -Action Scheduler -NoPause
             $s2 = $LASTEXITCODE
-            if (@(0, 10) -notcontains $s2) { [void]$rollbackProblems.Add('BRAVO_SETUP -Action Scheduler після відкату exit ' + $s2) }
+            if ((Get-BRAVODeploySetupExitVerdict -ExitCode $s2) -eq 'FAIL') { [void]$rollbackProblems.Add('BRAVO_SETUP -Action Scheduler після відкату exit ' + $s2) }
 
             & .\BRAVO_SETUP.ps1 -ValidateOnly -NoPause
             $v2 = $LASTEXITCODE
-            if (@(0, 10) -notcontains $v2) { [void]$rollbackProblems.Add('BRAVO_SETUP -ValidateOnly після відкату exit ' + $v2) }
+            if ((Get-BRAVODeploySetupExitVerdict -ExitCode $v2) -eq 'FAIL') { [void]$rollbackProblems.Add('BRAVO_SETUP -ValidateOnly після відкату exit ' + $v2) }
         } finally {
             Pop-Location
         }
@@ -576,15 +576,23 @@ try {
     else { [void]$gateFailures.Add('BRAVO_RUNTIME_GUARD.ps1 exit ' + $guard) }
 
     if ($gateFailures.Count -eq 0) {
+        # #330: exit 10 (SuccessWithWarnings) — успіх із попередженням, не
+        # провал гейта; відкат лише за FAIL (будь-який інший код).
         & .\BRAVO_SETUP.ps1 -Action Scheduler -NoPause
         $sched = $LASTEXITCODE
-        if ($sched -eq 0) { Write-Ok 'BRAVO_SETUP -Action Scheduler: exit 0' }
-        else { [void]$gateFailures.Add('BRAVO_SETUP -Action Scheduler exit ' + $sched) }
+        switch (Get-BRAVODeploySetupExitVerdict -ExitCode $sched) {
+            'PASS' { Write-Ok 'BRAVO_SETUP -Action Scheduler: exit 0' }
+            'PASS_WITH_WARNING' { Write-Warn2 'BRAVO_SETUP -Action Scheduler: exit 10 (успіх із попередженнями, див. журнал BRAVO_SETUP)' }
+            default { [void]$gateFailures.Add('BRAVO_SETUP -Action Scheduler exit ' + $sched) }
+        }
 
         & .\BRAVO_SETUP.ps1 -ValidateOnly -NoPause
         $val = $LASTEXITCODE
-        if ($val -eq 0) { Write-Ok 'BRAVO_SETUP -ValidateOnly: exit 0' }
-        else { [void]$gateFailures.Add('BRAVO_SETUP -ValidateOnly exit ' + $val) }
+        switch (Get-BRAVODeploySetupExitVerdict -ExitCode $val) {
+            'PASS' { Write-Ok 'BRAVO_SETUP -ValidateOnly: exit 0' }
+            'PASS_WITH_WARNING' { Write-Warn2 'BRAVO_SETUP -ValidateOnly: exit 10 (успіх із попередженнями, див. журнал BRAVO_SETUP)' }
+            default { [void]$gateFailures.Add('BRAVO_SETUP -ValidateOnly exit ' + $val) }
+        }
     }
 } finally {
     Pop-Location
