@@ -783,6 +783,9 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
             Microsoft.PowerShell.Core\Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
         } catch {
             [void]$clearProblems.Add($_.Exception.Message)
+            # Невдале прибирання не позначається Cleaned: фінальний прохід
+            # без параметрів має повторити його, а не пропустити запис.
+            continue
         }
         if ($null -ne $cleanedProperty) {
             $cleanedProperty.Value = $true
@@ -840,22 +843,37 @@ function Get-BRAVOSelfTestWatchedBuiltinCommandNames {
 }
 
 function Get-BRAVOSelfTestBuiltinCommandState {
-    # Стан затінення імені: чи є за ним function/alias у відповідних drive
-    # (прямий хеш-пошук, без Get-Command: той для відсутнього імені запускає
-    # дорогий пошук модулів — на Windows це давало десятки секунд на suite).
-    # Cmdlet/зовнішня команда без затінення = '<none>'; заміна cmdlet на
-    # function чи alias завжди змінює цей стан. Для функції ще й посилання на
-    # ScriptBlock (заміна функції функцією з тим самим ModuleName теж видима).
+    # Стан затінення імені: alias і function фіксуються НЕЗАЛЕЖНО (прямий
+    # хеш-пошук у Alias:/Function:, без Get-Command: той для відсутнього
+    # імені запускає дорогий пошук модулів — на Windows це давало десятки
+    # секунд на suite). Функція, що з'явилась під уже наявним аліасом, теж
+    # змінює стан: інакше вона лишилась би прихованою і проявилась би після
+    # зняття аліаса. Cmdlet/зовнішня команда без затінення = '<none>'. Для
+    # функції ще й посилання на ScriptBlock (заміна функції функцією з тим
+    # самим ModuleName теж видима).
     param([Parameter(Mandatory = $true)][string]$Name)
     $aliasItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $Name) -ErrorAction SilentlyContinue
-    if ($null -ne $aliasItem) {
-        return [pscustomobject]@{ Name = $Name; Key = ('Alias|' + $aliasItem.Definition); Kind = 'Alias'; Definition = [string]$aliasItem.Definition; ScriptBlock = $null }
-    }
     $functionItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue
-    if ($null -ne $functionItem) {
-        return [pscustomobject]@{ Name = $Name; Key = ('Function|' + $functionItem.ModuleName); Kind = 'Function'; Definition = ''; ScriptBlock = $functionItem.ScriptBlock }
+    $keyParts = @()
+    $aliasDefinition = $null
+    $functionScriptBlock = $null
+    if ($null -ne $aliasItem) {
+        $aliasDefinition = [string]$aliasItem.Definition
+        $keyParts += ('Alias|' + $aliasDefinition)
     }
-    return [pscustomobject]@{ Name = $Name; Key = '<none>'; Kind = 'None'; Definition = ''; ScriptBlock = $null }
+    if ($null -ne $functionItem) {
+        $functionScriptBlock = $functionItem.ScriptBlock
+        $keyParts += ('Function|' + $functionItem.ModuleName)
+    }
+    $stateKey = if ($keyParts.Count -gt 0) { [string]::Join(' + ', [string[]]$keyParts) } else { '<none>' }
+    return [pscustomobject]@{
+        Name            = $Name
+        Key             = $stateKey
+        HasAlias        = ($null -ne $aliasItem)
+        AliasDefinition = $aliasDefinition
+        HasFunction     = ($null -ne $functionItem)
+        ScriptBlock     = $functionScriptBlock
+    }
 }
 
 function Test-BRAVOSelfTestBuiltinCommandStateEqual {
@@ -911,11 +929,12 @@ function Restore-BRAVOSelfTestSuiteIsolation {
                 Microsoft.PowerShell.Management\Remove-Item -Path ('alias:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
                 Microsoft.PowerShell.Management\Remove-Item -Path ('function:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
             }
-            # Початкова команда була функцією/аліасом — повернути її.
-            if ($baselineState.Kind -eq 'Function') {
+            # Початкові функція та/або аліас — повернути кожен.
+            if ($baselineState.HasFunction) {
                 Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $watchedName) -Value $baselineState.ScriptBlock -Force
-            } elseif ($baselineState.Kind -eq 'Alias') {
-                Microsoft.PowerShell.Utility\Set-Alias -Name $watchedName -Value $baselineState.Definition -Scope Global -Force
+            }
+            if ($baselineState.HasAlias) {
+                Microsoft.PowerShell.Utility\Set-Alias -Name $watchedName -Value $baselineState.AliasDefinition -Scope Global -Force
             }
         } catch {
             [void]$residualProblems.Add("${watchedName}: не вдалося зняти затінення — $($_.Exception.Message)")
@@ -1596,11 +1615,21 @@ function Complete-BRAVOSelfTestSection {
     if ($null -ne $closingSection.SuiteIsolation) {
         # finally-шлях: ізоляція відновлюється і після перерваного suite.
         # Виняток не має вийти з finally до Status/DurationMs/Assert...Intact:
-        # реєструється як збій секції (вона ще на стеку).
+        # реєструється як збій секції (вона ще на стеку). Якщо suite уже
+        # перервано, первинний Fault/FaultSuite не перезаписується: збій
+        # відновлення додається окремим FAIL.
         try {
             [void](Restore-BRAVOSelfTestSuiteIsolation -Snapshot $closingSection.SuiteIsolation -Label $Name)
         } catch {
-            Register-BRAVOSelfTestSectionFault -ErrorRecord $_
+            if ($closingSection.Status -ne 'Aborted' -or
+                -not [string]::IsNullOrEmpty((Get-BRAVOSelfTestGlobalFatalKind -ErrorRecord $_))) {
+                Register-BRAVOSelfTestSectionFault -ErrorRecord $_
+            } else {
+                $isolationCleanupMessage = ("Section/{0} — відновлення ізоляції після перерваного suite: {1}" -f
+                    $Name, $_.Exception.Message)
+                [void]$script:failures.Add($isolationCleanupMessage)
+                Microsoft.PowerShell.Utility\Write-Host "[FAIL] $isolationCleanupMessage" -ForegroundColor Red
+            }
         } finally {
             $closingSection.SuiteIsolation = $null
         }
@@ -26005,6 +26034,59 @@ Test-BRAVOCondition -Condition (
     -Failure ("затінені cmdlet-и самого відновлення мають бути зняті: до {0}, під час {1} (очікувано +{2}), після {3}; залишки: {4}" -f
         $primitiveProbeBeforeCount, $primitiveProbeDuringCount, $primitiveProbeNames.Count, $primitiveProbeAfterCount,
         [string]::Join('; ', [string[]]$primitiveProbeResidualProblems))
+
+# Codex P2 на #340 (1): функція, що з'явилась під уже наявним аліасом, теж
+# змінює стан і знімається; аліас лишається. Раніше стан фіксував лише
+# «переможний» аліас, і прихована функція витікала.
+$hiddenProbeName = 'Get-Date'
+$hiddenProbeHadAlias = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $hiddenProbeName) -ErrorAction SilentlyContinue)
+$hiddenProbeAliasAdded = $false
+$hiddenProbeResidualProblems = @()
+$hiddenProbeFunctionDuring = $false
+try {
+    if (-not $hiddenProbeHadAlias) {
+        Set-Alias -Name $hiddenProbeName -Value 'Microsoft.PowerShell.Utility\Get-Date' -Scope Global
+        $hiddenProbeAliasAdded = $true
+    }
+    $hiddenProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+    try {
+        [void](New-Module -ScriptBlock { function Get-Date { 'hidden-stub' } })
+        $hiddenProbeFunctionDuring = Test-Path -LiteralPath ('function:' + $hiddenProbeName)
+    } finally {
+        $hiddenProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $hiddenProbeSnapshot -Label 'Framework.HiddenFunctionProbe')
+    }
+    $hiddenProbeFunctionAfter = Test-Path -LiteralPath ('function:' + $hiddenProbeName)
+    $hiddenProbeAliasAfter = Test-Path -LiteralPath ('alias:' + $hiddenProbeName)
+} finally {
+    if ($hiddenProbeAliasAdded) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('alias:' + $hiddenProbeName) -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-BRAVOCondition -Condition (
+    $hiddenProbeFunctionDuring -and -not $hiddenProbeFunctionAfter -and $hiddenProbeAliasAfter -and
+    $hiddenProbeResidualProblems.Count -eq 0
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FunctionHiddenBehindAliasRemoved' `
+    -Failure ("функція під наявним аліасом має бути знята, аліас — лишитись: під час={0}, функція після={1}, аліас після={2}, залишки: {3}" -f
+        $hiddenProbeFunctionDuring, $hiddenProbeFunctionAfter, $hiddenProbeAliasAfter, [string]::Join('; ', [string[]]$hiddenProbeResidualProblems))
+
+# Codex P2 на #340 (2): запис реєстру, прибирання якого кинуло, не
+# позначається Cleaned, тож фінальний прохід повторить його.
+$failedCleanupEntry = [pscustomobject]@{ Module = [pscustomobject]@{ Name = ('probe-' + [guid]::NewGuid().ToString('N')) }; FunctionNames = @() }
+$failedCleanupIndex = $script:BRAVOSelfTestOwnedRuntimeModules.Count
+[void]$script:BRAVOSelfTestOwnedRuntimeModules.Add($failedCleanupEntry)
+$failedCleanupThrew = $false
+try {
+    Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $failedCleanupIndex
+} catch {
+    $failedCleanupThrew = $true
+} finally {
+    $script:BRAVOSelfTestOwnedRuntimeModules.RemoveAt($failedCleanupIndex)
+}
+$failedCleanupMarked = $null -ne $failedCleanupEntry.PSObject.Properties['Cleaned'] -and [bool]$failedCleanupEntry.Cleaned
+Test-BRAVOCondition -Condition ($failedCleanupThrew -and -not $failedCleanupMarked) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FailedCleanupNotMarkedCleaned' `
+    -Failure "невдале прибирання runtime-модуля має повідомити про збій і лишити запис для повтору (кинуло=$failedCleanupThrew, Cleaned=$failedCleanupMarked)"
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.BuiltinCommandStubsDoNotLeakAcrossSuites' } }
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.VariableScopeHeadroom') { try {
 
@@ -26975,6 +27057,24 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/StubOmega' -Failure 'n/a'
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Omega' } }
 '@
             }
+            # Перерваний suite, у якого ще й відновлення ізоляції кидає (знімок
+            # без CommandStates): первинний Fault має лишитися, збій
+            # відновлення — окремим FAIL, а не повторною реєстрацією секції.
+            AbortedSuiteCleanupFault = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Suite/Delta') { try {
+    Enter-BRAVOSelfTestSuite -Name 'Delta'
+    $script:BRAVOSelfTestSectionStack[$script:BRAVOSelfTestSectionStack.Count - 1].SuiteIsolation = [pscustomobject]@{ OwnedStartIndex = 0 }
+    throw (New-Object System.IO.InvalidDataException 'probe-primary-fault')
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Delta' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AfterDelta') { try {
+    $deltaRecord = $script:BRAVOSelfTestSectionIndex['Suite/Delta']
+    Test-BRAVOCondition -Condition ($deltaRecord.Status -eq 'Aborted' -and $deltaRecord.Fault.Message -eq 'probe-primary-fault') -Name 'Probe/PrimaryFaultKept' -Failure ('Fault: ' + $deltaRecord.Fault.Message)
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterDelta' } }
+'@
+                Tail = ''
+            }
             MultiFault = @{
                 Pre  = ''
                 Main = @'
@@ -27216,6 +27316,15 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/TailAfterBoundaryRuns' -Failur
             -Name 'Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs' `
             -EnvironmentLimitation (& $isolationRestriction 'StubIsolation') `
             -Failure ('реальний Enter/Complete для Suite/* має прибрати заглушки вбудованих команд (Start-Sleep, Get-Service, alias Get-Date): ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'AbortedSuiteCleanupFault' 1 @('[PASS] Probe/PrimaryFaultKept',
+                'probe-primary-fault', 'Section/Suite/Delta — відновлення ізоляції після перерваного suite', 'SELF-TEST FAILED') @(
+                'Section/Suite/Delta: перервано винятком [System.Management.Automation.PropertyNotFoundException]'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.AbortedSuiteCleanupFaultKeepsPrimaryFault' `
+            -EnvironmentLimitation (& $isolationRestriction 'AbortedSuiteCleanupFault') `
+            -Failure ('збій відновлення ізоляції після перерваного suite не має перезаписувати первинний виняток: ' + [string]::Join('; ', $isolationProblems))
 
         $isolationProblems = @(& $isolationMismatch 'MultiFault' 1 @('[PASS] Probe/AlphaBefore', '[PASS] Probe/BetaBefore',
                 '[PASS] Probe/GammaBefore', '[PASS] Probe/DeltaRuns', '[PASS] Probe/TailOmegaRuns', 'SELF-TEST FAILED',
