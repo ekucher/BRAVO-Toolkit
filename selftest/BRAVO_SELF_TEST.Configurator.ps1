@@ -410,21 +410,65 @@ Test-BRAVOCondition ($defaultCacheApplyComputations -eq 1) `
     "обчислень DefaultConfig за шість Apply на тому самому RuntimeRoot: $defaultCacheApplyComputations (очікується 1)"
 
 # Кешований DefaultConfig збігається з прямим canonical-обчисленням, а
-# викликач отримує окрему глибоку копію.
-$defaultCacheDirect = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorFixtureRuntimeRoot -CandidateOverrides @{}
+# викликач отримує окрему глибоку копію. Кілька листів результату
+# змінюються від прогону до прогону самі по собі (напр. шлях тимчасового
+# ізольованого root); їх видно як розбіжність ДВОХ прямих обчислень, і
+# лише вони не порівнюються з кешем.
+$flattenDefaultConfig = {
+    param($Value, [string]$Path, [hashtable]$Into)
+    if ($null -eq $Value) {
+        $Into[$Path] = '<null>'
+    } elseif ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $Into[$Path + '{}'] = @($Value.PSObject.Properties).Count
+        foreach ($flattenProperty in $Value.PSObject.Properties) {
+            & $flattenDefaultConfig $flattenProperty.Value ($Path + '.' + $flattenProperty.Name) $Into
+        }
+    } elseif ($Value -is [array]) {
+        $Into[$Path + '[]'] = $Value.Count
+        for ($flattenIndex = 0; $flattenIndex -lt $Value.Count; $flattenIndex++) {
+            & $flattenDefaultConfig $Value[$flattenIndex] ($Path + '[' + $flattenIndex + ']') $Into
+        }
+    } else {
+        $Into[$Path] = $Value.GetType().Name + ':' + [string]$Value
+    }
+}
+$defaultCacheDirectFirst = @{}
+$defaultCacheDirectSecond = @{}
+& $flattenDefaultConfig (Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorFixtureRuntimeRoot -CandidateOverrides @{}) '' $defaultCacheDirectFirst
+& $flattenDefaultConfig (Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorFixtureRuntimeRoot -CandidateOverrides @{}) '' $defaultCacheDirectSecond
 $defaultCacheFirst = & $configuratorPersistenceModule { param($RuntimeRoot) Get-BRAVOConfiguratorDefaultConfig -RuntimeRoot $RuntimeRoot } $configuratorFixtureRuntimeRoot
 $defaultCacheFirst.pathSettings | Add-Member -MemberType NoteProperty -Name 'SelfTestCacheMutation' -Value 'x' -Force
 $defaultCacheSecond = & $configuratorPersistenceModule { param($RuntimeRoot) Get-BRAVOConfiguratorDefaultConfig -RuntimeRoot $RuntimeRoot } $configuratorFixtureRuntimeRoot
-$defaultCacheDirectJson = $defaultCacheDirect | ConvertTo-Json -Depth 12 -Compress
-$defaultCacheSecondJson = $defaultCacheSecond | ConvertTo-Json -Depth 12 -Compress
+$defaultCacheStored = @{}
+$defaultCacheReturned = @{}
+& $flattenDefaultConfig (& $configuratorPersistenceModule { $script:DefaultConfigCache.Value }) '' $defaultCacheStored
+& $flattenDefaultConfig $defaultCacheSecond '' $defaultCacheReturned
+$defaultCacheVolatilePaths = @($defaultCacheDirectFirst.Keys | Where-Object {
+    -not $defaultCacheDirectSecond.ContainsKey($_) -or $defaultCacheDirectSecond[$_] -ne $defaultCacheDirectFirst[$_]
+} | Sort-Object)
+$defaultCacheMismatchPaths = @(@(@($defaultCacheDirectFirst.Keys) + @($defaultCacheReturned.Keys)) | Sort-Object -Unique | Where-Object {
+    $defaultCacheVolatilePaths -notcontains $_ -and (
+        -not $defaultCacheDirectFirst.ContainsKey($_) -or
+        -not $defaultCacheReturned.ContainsKey($_) -or
+        $defaultCacheDirectFirst[$_] -ne $defaultCacheReturned[$_])
+})
+$defaultCacheCopyMismatchPaths = @(@(@($defaultCacheStored.Keys) + @($defaultCacheReturned.Keys)) | Sort-Object -Unique | Where-Object {
+    -not $defaultCacheStored.ContainsKey($_) -or
+    -not $defaultCacheReturned.ContainsKey($_) -or
+    $defaultCacheStored[$_] -ne $defaultCacheReturned[$_]
+})
 Test-BRAVOCondition (
-    $defaultCacheDirectJson -eq $defaultCacheSecondJson -and
+    $defaultCacheDirectFirst.Count -gt 50 -and
+    $defaultCacheMismatchPaths.Count -eq 0 -and
+    $defaultCacheCopyMismatchPaths.Count -eq 0 -and
     -not [object]::ReferenceEquals($defaultCacheFirst, $defaultCacheSecond) -and
     @($defaultCacheSecond.pathSettings.PSObject.Properties | Where-Object { $_.Name -eq 'SelfTestCacheMutation' }).Count -eq 0 -and
     (& $configuratorPersistenceModule { $script:DefaultConfigComputationCount }) -eq 1
 ) `
     'Configurator Persistence: кешований DefaultConfig дорівнює canonical-обчисленню і віддається глибокою копією' `
-    ("збіг з прямим обчисленням=$($defaultCacheDirectJson -eq $defaultCacheSecondJson); " +
+    ("листів=$($defaultCacheDirectFirst.Count); розбіжності з прямим обчисленням: $($defaultCacheMismatchPaths -join ', '); " +
+     "розбіжності копії з кешем: $($defaultCacheCopyMismatchPaths -join ', '); " +
+     "мінливі між прямими прогонами: $($defaultCacheVolatilePaths -join ', '); " +
      "окремий екземпляр=$(-not [object]::ReferenceEquals($defaultCacheFirst, $defaultCacheSecond)); " +
      "обчислень=$(& $configuratorPersistenceModule { $script:DefaultConfigComputationCount })")
 
