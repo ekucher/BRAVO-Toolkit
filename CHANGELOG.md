@@ -8,6 +8,221 @@
   ARCHIV/HEALTH/MAINTENANCE гинули до відкриття журналу. `Test-BRAVOConsoleCodePageChangeSafe`
   (BRAVO.Compatibility) на Windows < 10 у неінтерактивній сесії кодову сторінку консолі не
   змінює; Windows 10+ та інтерактивні запуски — без змін. Перенесено з `5.2.5-rc.3`.
+
+- **Fix: ізоляція suite self-test бачить Private-записи й тримає незмінний знімок функцій (#350).**
+  Знімок і відновлення читали alias/function script- і global-області з області функції
+  фреймворку, звідки записи з опцією `Private` у батьківських областях невидимі: такий запис
+  фіксувався як відсутній, і його заміна чи видалення suite-ом не відновлювались. Тепер стан
+  читається, знімається й відновлюється прямо в таблиці потрібної області
+  (`Get-BRAVOSelfTestSessionScopeAccess`, `Get-/Remove-BRAVOSelfTestScopedCommandItem`;
+  відсутній член рушія — виняток, а не тихе неповне читання), Options (`Private`,
+  `ReadOnly` тощо) повертаються на відновлений запис. Знімок функцій більше не зберігає живі
+  `FunctionInfo` (перевизначення наявної функції змінює той самий об'єкт на місці, і
+  «знімок» віддавав би заглушку): на вході в suite матеріалізуються ім'я -> `ScriptBlock` та
+  ім'я -> `Options` глобальних функцій. Нові перевірки `Framework/SuiteIsolation.*`:
+  Private-функція й Private-аліас (заміна, видалення; script- і global-область), матриця
+  наявна/видалена/нова функція та аліас, голий `New-Module`, dot-source suite-фрагмента,
+  runtime-модуль над Private-функцією, відновлення після винятку suite, незмінність знімка
+  функцій і поведінкова перевірка резолюції `Get-Service`, `Start-Service`, `Stop-Service`,
+  `Get-Process`, `Stop-Process`, `Start-Sleep`, `Invoke-WebRequest`, `Get-CimInstance`,
+  `Get-WmiObject`, `Start-Process` після Private-заглушок. Production-код не змінено.
+
+- **Fix: self-test `TraceArchive/GraceCompletionExpiry*` не залежить від швидкості runner-а (#338).**
+  Fixture виставляв `LastWriteTime` джерела за 2 с до grace-межі й перетинав межу реальним
+  `Start-Sleep`; на повільному runner-і джерело вже було за межею на кроці-передумові, видалялось,
+  `state.json` не створювався, а вторинний `Get-Content` обривав секцію TraceArchive. Тепер
+  fixture лежить за 1 годину ПІД межею, а межа перетинається зсувом керованого годинника
+  (тимчасова підміна `Get-Date` у модулі на час кроку: без параметрів — реальний час + зсув 0/+2 год,
+  з параметрами — штатний), без очікування. Читання `state.json` захищене `Test-Path`, тож збій
+  перевірки дає чисте `[FAIL]`, а не виняток секції. Production-код і маніфест не змінено.
+
+- **Fix: заглушки вбудованих команд self-test не витікають між suite (#337).**
+  `New-BRAVOSelfTestRuntimeModule` (голий `New-Module`) матеріалізує функції-заглушки
+  (`Get-Service`, `Start-Service`, `Stop-Service`, `Get-Process`, `Stop-Process`,
+  `Invoke-WebRequest`, `Start-Sleep`, `Get-CimInstance` тощо) у глобальній сесії, а
+  прибиралися вони лише наприкінці прогону, тож змінювали семантику наступних suite
+  (витік `Start-Sleep` уже ламав TraceArchive). Тепер єдиний життєвий цикл: на вході в
+  кожну секцію `Suite/*` `Enter-BRAVOSelfTestSection` знімає знімок резолюції
+  спостережуваних вбудованих команд і межу реєстру runtime-модулів, а
+  `Complete-BRAVOSelfTestSection` (у `finally`, тобто й після перерваного suite) через
+  `Restore-BRAVOSelfTestSuiteIsolation` прибирає модулі цього suite, знімає затінюючі
+  global function/alias (у т.ч. від голого `New-Module`), повертає початкові функції та
+  перевіряє результат; залишкове відхилення — `[FAIL] Framework/SuiteIsolation[...]`.
+  `Clear-BRAVOSelfTestOwnedRuntimeModules` отримав `-StartIndex`/`-FunctionBaseline` і
+  лишається ідемпотентною страховкою наприкінці прогону. Нові перевірки:
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites` (фактична резолюція `Get-Command`
+  після закриття проба-suite для Get-Service, Start-Service, Stop-Service, Get-Process,
+  Stop-Process, Invoke-WebRequest, Start-Sleep, Get-CimInstance, Get-WmiObject,
+  Start-Process, а також Invoke-RestMethod і global-аліаса Get-Date),
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ProbeStubsActiveInsideSuite`,
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation`,
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.RestorerPrimitivesShadowed` (саме
+  відновлення викликає cmdlet-и з модульною кваліфікацією, тож затінені suite-ом `Get-Item`,
+  `Remove-Item`, `Set-Item`, `Get-ChildItem`, `Remove-Module`, `New-Object`, `Write-Host`
+  теж знімаються; `Set-Item` додано до спостережуваних),
+  `…FunctionHiddenBehindAliasRemoved` (alias і function під тим самим ім'ям відстежуються
+  окремо), `…FailedCleanupNotMarkedCleaned` (невдале прибирання модуля повторюється фінальним
+  проходом), `Framework/SectionIsolation.AbortedSuiteCleanupFaultKeepsPrimaryFault` (збій
+  відновлення після перерваного suite не перезаписує первинний виняток),
+  `…AliasMetadataRestored` (аліас повертається з Options/Description),
+  `…FunctionOptionsRestored` (функція повертається з Options),
+  `…ModuleOwnedFunctionRestored` (функція модуля лишається прив'язаною до модуля),
+  `…AllScopeAliasNotSilentlyLeaked` (заміна AllScope-аліаса відновлюється або дає видимий залишок),
+  `…GlobalStubBehindScriptFunctionRemoved` (global-заглушка під script-функцією знімається; глобальну
+  область читає й чистить порожній динамічний модуль, бо `Remove-Item function:global:X` нічого не видаляє),
+  `Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs` (реальний Enter/Complete
+  для `Suite/*` у дочірньому процесі). Стан затінення читається прямо з Function:/Alias:
+  (без `Get-Command` для відсутніх імен — дорогий пошук модулів), підмітання функцій
+  зареєстрованих модулів виконується й у фінальному `Clear-...`, збій відновлення
+  реєструється як збій секції, а не виходить із `finally`.
+  Побічно: RestoreSynthetic раніше покладався на витік no-op `Start-Sleep` з попередніх suite
+  (settle-повтори recovery 15 с x спроб, +~660 с на Windows CI); тепер власна заглушка
+  `Start-Sleep` є у модулі фікстури RestoreSynthetic.
+
+- **Fix: `Update-BRAVOServer` більше не відкочує оновлення, коли `BRAVO_SETUP` повертає exit 10 (#330).**
+  Гейт після розгортання приймав від `BRAVO_SETUP -Action Scheduler` і `-ValidateOnly`
+  лише `0`, тож SuccessWithWarnings (`10`) за контрактом BRAVO.ExitCodes вважався провалом
+  і справне оновлення відкочувалось (після #289 — дзеркальним відкатом). Тепер гейт і
+  перевірка після відкату користуються одним вердиктом `Get-BRAVODeploySetupExitVerdict`
+  (`deploy\BRAVO.Deploy.Rollback.ps1`): `0` = PASS, `10` = PASS WITH WARNING (рядок
+  `[УВАГА]`), інше = FAIL. Self-test `Rollback/PostDeployGateTreatsSetupExit10AsPassWithWarning`
+  виконує блок гейта з `Update-BRAVOServer.ps1` із фейковим `BRAVO_SETUP` і падає без виправлення.
+  Регресійна матриця `Rollback/SetupExitVerdictMatrixGateAndRollback` виконує той самий блок
+  для пар Scheduler/ValidateOnly (0/0 PASS; 10/0, 0/10, 10/10 PASS WITH WARNING; 1/0, 0/2, 10/2 FAIL)
+  і перевірку після відкату (0 PASS, 10 PASS WITH WARNING, 3 FAIL); падає і при поверненні гейта
+  до `-eq 0`, і при зміні класифікатора (10 => FAIL).
+
+- **Fix: Health показує ймовірну причину застарілої generation і не дублює її в хмарних рядках (#322).**
+  Не-COMPLETE manifest більше не пропускається мовчки: `Get-BackupHealthIssues` запам'ятовує
+  останню INCOMPLETE/FAILED спробу, а issue «остання COMPLETE generation старша за N год.»
+  отримує поле `Diagnosis` з чистого класифікатора `Get-BRAVOHealthBackupStaleReason`
+  (завдання вимкнене → новіша не-COMPLETE спроба зі статусом і етапом → код
+  останнього запуску → не запускалося → завершився достроково → код status-файла Archive).
+  «Завдання не знайдене або недоступне» перевіряється останнім (збій читання планувальника не
+  видається за «не встановлене»); виконується зараз (0x41301) і ще не запускалося (0x41303 або
+  рік < 2000) не вважаються «завершилось достроково»; hashtable-вхід читається як PSCustomObject.
+  Boot catch-up (`BackupCatchUp`) береться як остання спроба лише коли він справді архівував
+  (ненульовий результат або status-файл, записаний після його старту); no-op catch-up не
+  видається за «завершився достроково».
+  Кожне читання (планувальник, status-файл) у власному try/catch: збій пропускає перевірку
+  з WARNING, діагностика не змінює Kind/Component/Reason, exit code та Operations. У Slack
+  `LocalBackupGeneration` тепер у секції «ЛОКАЛЬНІ БЕКАПИ» (раніше «ІНШІ ПОМИЛКИ») з рядком
+  «:mag: Причина: …»; age-only хмарні рядки SFTP/SMB для того самого застарілого локального
+  архіву згортаються в один, помилки розміру/відсутності/з'єднання не згортаються,
+  лічильник компонентів не дублюється. Self-test: `Health/StaleGenerationReasonClassifier`,
+  `Health/StaleGenerationDiagnosisFromIncompleteManifest`,
+  `Health/StaleGenerationInLocalSectionWithReason`,
+  `Health/StaleGenerationCollapsesOnlyAgeOnlyCloudRows`,
+  `Health/StaleGenerationDiagnosisKeepsKindAndComponent`.
+
+- **Fix: DataRestore тимчасово утримує тип запуску служб на час restore (#333, продовження #297/#329).**
+  Раніше InPlace-DataRestore лише писав ownership-маркер і не знімав знімок типів запуску: SCM
+  міг підняти службу з delayed/automatic start посеред restore, а після аварійного Maintenance
+  (служби тимчасово `Disabled`, початкові типи в чужому знімку) `Start-Service` падав і прогін
+  завершувався кодом `43` з маркером `restartSuppressed`, який ніхто не знімав. Тепер DataRestore
+  користується тим самим канонічним контрактом BRAVO.System, що й Maintenance (нових копій
+  логіки немає): самовідновлення `Repair-BRAVOOrphanedServiceStartTypes` до читання start type;
+  знімок точних початкових типів (`New-BRAVOServiceStartTypeSnapshot`, Disabled-оператором у
+  знімок не потрапляє) пишеться в той самий маркер до зміни (чужий знімок зливається);
+  `Suspend-BRAVOServiceAutostart` → тимчасовий `Disabled`; `Confirm-BRAVOServicesQuiesced` перед
+  деструктивною фазою; у `finally` `Restore-BRAVOServiceStartTypeSnapshot` повертає типи ПЕРЕД
+  стартом служб (стартують лише служби з наміром). Служба, вимкнена оператором до прогону,
+  лишається `Disabled` і зупиненою. Маркер аварійного прогону з `restartSuppressed` більше не
+  блокує: його знімок зливається, служби з `RestartIntent` запускаються після успішного restore.
+  При незавершеному rollback служби свідомо лишаються `Disabled` (код 43). Збій знімка/утримання
+  скасовує restore до змін даних. Новий експорт `Get-BRAVOForeignServiceQuiescenceContext`
+  (BRAVO.System). Відновлення після аварійного прогону дає попередження, тож успішний restore
+  завершується кодом `10` (SuccessWithWarnings); маркер живого власника блокує прогін (`43`) до
+  будь-яких змін; записи знімка поза керованим набором служб ігноруються. Self-test: `DataRestore/StartMode*` (звичайна служба, Manual-зупинена,
+  delayed automatic, вимкнена оператором, чужий знімок suppressed/repairable, відсутній знімок,
+  зіпсований маркер, збій restore, збій старту служби).
+  Правки рев'ю #345: керована служба зі start type `Other`/нечитаним (не потрапила б у знімок)
+  скасовує restore (`43`) до змін даних, з її іменем у журналі; записи чужого знімка поза
+  керованим набором відкидаються з маркера ДО запису власного (WARNING). Maintenance не змінено.
+  Правки рев'ю #345 (2): очищення чужого маркера більше не викликає приватну
+  `Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess` (не експортована з BRAVO.System, у проді
+  давала `43`); успадковане `restartSuppressed` знімається лише успішним restore — збій цього
+  прогону лишає служби зупиненими й `Disabled`, маркер suppressed (`43`); утримання від автостарту
+  перевіряється (`Confirm-BRAVOServicesQuiesced`) перед КОЖНИМ компонентом, втрата утримання
+  скасовує restore до торкання компонента (`43`).
+
+- **Fix: retention не видаляє COMPLETE резервні копії як «невдалі» (#335, безпечна частина).**
+  `Remove-BRAVOExpiredBackupGenerations` відносила generation до гілки `failedArchiveRetentionDays`
+  за результатом сьогоднішньої повторної перевірки, а не за записаним статусом: COMPLETE копія з
+  одним пошкодженим архівом через 30 днів видалялась разом із цілими архівами інших компонентів
+  навіть при `enableArchiveDeletion = $false`, без попередження. Тепер гілку визначає записаний
+  статус: COMPLETE видаляється лише за `archiveRetentionDays` і лише при `enableArchiveDeletion`;
+  пошкодження COMPLETE (також старшої за `minimumRetainedVerifiedBackups` захищених) дає WARNING
+  «Пошкоджена резервна копія» і не веде до видалення. Для WARNING кожної COMPLETE generation
+  використовується дешева перевірка без читання вмісту (архів і `.sha512` на місці, розмір проти
+  `ArchiveSize`, формат `.sha512`); повний SHA512 рахується лише для вибору N захищених, коли
+  `enableArchiveDeletion = $true` і є прострочені COMPLETE generation, тобто не щоночі по всій
+  історії. Шляхи архівів перебудовуються як у відновленні (`ConvertTo-BRAVORebasedLocalGenerationManifest`):
+  після перенесення сховища manifest-и більше не стираються, а архіви не лишаються сиротами.
+  Manifest видаляється останнім і лише після своїх архівів; помилка на одній generation (напр.
+  заблокований файл) не зупиняє решту, а прогін повертає невдачу. Generation із типом компонента,
+  якого немає в поточних `ArchiveDefinitions`, не видаляється (WARNING). Перебудова шляхів
+  fail-closed: generation лишається з WARNING, якщо перебудоване ім'я не належить цій generation
+  за `NameTemplate`, файл ще лежить за старим шляхом поза `BackupRoot` або канонічний каталог
+  компонента недоступний; збій читання метаданих архіву стосується лише своєї generation. Архіви без manifest-а
+  лише рахуються в рядку «Аудит retention» (обідні `_HHMM` копії не рахуються) і не видаляються.
+  Видалено мертву `Remove-OldBackupSets` разом із симуляційним self-test. README: захист
+  `minimumRetainedVerifiedBackups` типово `2` і рахується по generation. Нових ключів
+  конфігурації немає. Нові self-test перевірки:
+  `BackupConsistency/CompleteGenerationIsNeverDeletedAsFailedAndCorruptionWarns`,
+  `BackupConsistency/CompleteGenerationNeverDeletedWhenArchiveDeletionDisabled`,
+  `BackupConsistency/FailedGenerationStillExpiresByFailedRetention`,
+  `BackupConsistency/OldCorruptCompleteBeyondProtectedWarnsAndIsKept`,
+  `BackupConsistency/Sha512MismatchWarnsAndOlderVerifiedIsProtected`,
+  `BackupConsistency/NoSha512WhenArchiveDeletionDisabled`,
+  `BackupConsistency/NoSha512WhenNothingIsExpired`,
+  `BackupConsistency/RelocatedRepositoryKeepsCompleteManifests`,
+  `BackupConsistency/RelocatedRepositoryExpiryDeletesArchivesWithManifest`,
+  `BackupConsistency/RetentionFailureOnOneGenerationDoesNotStopOthers`,
+  `BackupConsistency/ManifestIsDeletedOnlyAfterItsArtifacts`,
+  `BackupConsistency/RetentionRetryFinishesGenerationAfterLockReleased`,
+  `BackupConsistency/UnreferencedArchivesAreReportedNotDeleted`,
+  `BackupConsistency/UnknownComponentTypeKeepsGenerationAndWarns`.
+
+- **Feat: резервне копіювання лише встановлених компонентів (#282).**
+  Прапорець компонента в `componentSettings` тепер означає «копіювати, якщо компонент є на
+  сервері». `Resolve-BRAVOBackupComponentScope` (BRAVO.Discovery) поверх матриці
+  `Test-BRAVODiscoveryComponentDrift` класифікує склад: `Planned` / `NotInstalled` /
+  `DisabledByConfig` / `Missing` / `Unknown`. Увімкнений, але не встановлений компонент без
+  запису в baseline пропускається (Info) без архіву, BAZA-синхронізації й каталогів
+  призначення; `MODEL` обов'язковий, порожній склад і зниклий підтверджений компонент лишаються
+  помилкою. Discovery baseline створюється й доповнюється автоматично після COMPLETE generation
+  (лише Planned-компоненти, наявні значення не змінюються; перше створення не бере
+  DisabledByConfig). Для серверів без baseline другий доказ присутності — останній COMPLETE
+  generation manifest (`Get-BRAVOLastCompleteBackupComponents`): компонент, що мав у ньому
+  архів, а тепер Absent, стає `Missing` (помилка), а не `NotInstalled`. `BRAVO_ARCHIV`,
+  Health, Dry Run і `BRAVO_SETUP -ValidateOnly` користуються цим самим складом (ValidateOnly і
+  Test-BRAVODiscoveryResult більше не створюють каталогів); `Test-SFTPConfig` не вимагає
+  SFTP-каталогів для NotInstalled-компонентів; Health показує один INFO-рядок «Не встановлено
+  на цьому сервері: …» без WARNING. Оголошене (bravo.ini/служба/override), але недоступне джерело
+  ніколи не стає `NotInstalled`: `Test-BRAVODiscoverySourceDirectory` розрізняє «не існує» і «не
+  вдалося прочитати» (Kind), нечитабельне дає Error, а Absent з оголошеним джерелом у scope лишається
+  `Missing` (backup пробує компонент і падає гучно, baseline не пишеться). Доказ з попереднього
+  COMPLETE manifest діє й коли baseline старіший за цей manifest; `BRAVO_SETUP` передає той самий
+  доказ, що й ARCHIV. Підсумок ARCHIV (status JSON, секція «Архіви», план, лог) враховує лише реальний
+  склад.
+  Дизайн складу: Health і Dry Run не читають склад зі `scope` останнього manifest, а беруть його
+  з живого discovery + baseline (лише читання, `Get-BRAVOBackupNotInstalledComponents`) і
+  останнього COMPLETE manifest як другого доказу присутності, бо manifest застаріває між
+  прогонами: компонент, що зник після останньої копії, Health побачив би як `Planned` лише до
+  наступного прогону, а новий не побачив би взагалі. Поле manifest `componentScope`
+  (компонент -> `Planned` / `NotInstalled` / `DisabledByConfig` / `Missing` / `Unknown`) пишеться
+  для аудиту як доказ свідомого пропуску; Health його не читає. Невизначеність (непридатний
+  baseline) у read-only варіанті дає порожній список NotInstalled: очікуються всі увімкнені
+  компоненти, зайва тривога краща за пропущену. Фільтри «увімкнений і встановлений» винесено в
+  `Select-BRAVOExpectedArchiveDefinition`, охоронець оновлення baseline в
+  `Test-BRAVOBackupBaselineUpdateAllowed`, перелік призначень SETUP у
+  `Get-BRAVODiscoveryDestinationPaths`, а перевірку BAZA-синхронізації в
+  `Test-BRAVOBackupComponentInstalled`, щоб їх поведінку перевіряли self-test-и, а не пошук
+  тексту в коді. Нові self-test перевірки: набір `BackupScope` (зокрема `BackupScope/PreviouslyBackedUpComponentVanishedWithoutBaselineIsError`,
+  `BackupScope/FirstBaselineExcludesDisabledByConfig`,
+  `BackupScope/LastCompleteManifestComponentsReader`,
+  `BackupScope/SftpConfigSkipsNotInstalledAndPreviousProofWired`).
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`

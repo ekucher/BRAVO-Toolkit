@@ -1260,6 +1260,27 @@ try {
         -ExchangeApiServiceDisabled $exchangeApiServiceState.Disabled `
         -SystemLogRoot $dryRunSystemLogRoot `
         -ExchangeApiServiceName $exchangeApiServiceName
+    # Склад backup set (бекап лише наявних компонентів): та сама канонічна
+    # класифікація BRAVO.Discovery, що в ARCHIV і Health; baseline лише
+    # читається. Невстановлений компонент не перевіряється як джерело чи
+    # призначення, бо ARCHIV його не копіює.
+    $dryRunNotInstalledComponents = @()
+    $dryRunComponentScopeError = $null
+    try {
+        $dryRunComponentScope = Get-BRAVOBackupNotInstalledComponents `
+            -DiscoveryResult $bravoDiscoveryResult `
+            -EnabledComponents $global:discoveryEnabledComponents `
+            -StateRoot $dryRunStateRoot `
+            -RuntimeRoot $dryRunRuntimeRoot `
+            -BackupRoot ([string]$global:backupRootPath)
+        $dryRunComponentScopeError = [string]$dryRunComponentScope.Error
+        $dryRunNotInstalledComponents = @($dryRunComponentScope.NotInstalled)
+    } catch {
+        $dryRunComponentScopeError = [string]$_.Exception.Message
+    }
+    $dryRunArchiveDefinitions = @(Select-BRAVOExpectedArchiveDefinition `
+        -ArchiveDefinitions $archiveDefinitions `
+        -NotInstalledComponents $dryRunNotInstalledComponents)
 
     Add-DryRunResult PASS "Корені" "RuntimeRoot" $dryRunRuntimeRoot
     Add-DryRunResult PASS "Корені" "RuntimeLogRoot (script logs)" $dryRunRuntimeLogRoot
@@ -1348,18 +1369,30 @@ try {
     foreach ($optionalTarget in $optionalComponentPlan.WriteAccessTargets.GetEnumerator()) {
         $writeAccessTargets[[string]$optionalTarget.Key] = [string]$optionalTarget.Value
     }
-    foreach ($definition in @($archiveDefinitions | Where-Object { Test-SettingEnabled $_.Enabled })) {
+    foreach ($definition in $dryRunArchiveDefinitions) {
         $writeAccessTargets["$($definition.Type) destination"] = [string]$definition.Destination
         # [IO.Path]::Combine: диск призначення може ще не існувати — список
         # шляхів для probe будується без DriveNotFoundException, а недоступність
         # рапортує сам probe.
         $writeAccessTargets["$($definition.Type) work"] = [System.IO.Path]::Combine([string]$definition.Destination, '.work')
     }
-    if (Test-SettingEnabled $componentSettings.Synchronization.BAZA_APP_LOCAL) {
+    if ((Test-SettingEnabled $componentSettings.Synchronization.BAZA_APP_LOCAL) -and
+        $dryRunNotInstalledComponents -notcontains 'BAZA_APP') {
         $writeAccessTargets['BAZA_APP destination'] = [string]$bazaAppPaths.Destination
     }
-    if (Test-SettingEnabled $componentSettings.Synchronization.BAZA_WWW_LOCAL) {
+    if ((Test-SettingEnabled $componentSettings.Synchronization.BAZA_WWW_LOCAL) -and
+        $dryRunNotInstalledComponents -notcontains 'BAZA_WWW') {
         $writeAccessTargets['BAZA_WWW destination'] = [string]$bazaWWWPaths.Destination
+    }
+    if ($dryRunNotInstalledComponents.Count -gt 0) {
+        Add-DryRunResult PASS "Склад" "Не встановлено на цьому сервері" (
+            "$($dryRunNotInstalledComponents -join ', '): не копіюється й не перевіряється"
+        )
+    }
+    if (-not [string]::IsNullOrWhiteSpace($dryRunComponentScopeError)) {
+        Add-DryRunResult WARN "Склад" "Визначення складу" (
+            "не вдалося визначити невстановлені компоненти, перевіряються всі увімкнені: $dryRunComponentScopeError"
+        )
     }
     foreach ($writeTarget in $writeAccessTargets.GetEnumerator()) {
         if ([string]::IsNullOrWhiteSpace([string]$writeTarget.Value)) {
@@ -1452,10 +1485,7 @@ try {
     }
 
     $enabledArchiveCount = 0
-    foreach ($definition in @($archiveDefinitions)) {
-        if (-not (Test-SettingEnabled $definition.Enabled)) {
-            continue
-        }
+    foreach ($definition in $dryRunArchiveDefinitions) {
         $enabledArchiveCount++
         $sourceDirectory = Get-SourceDirectory ([string]$definition.Source)
         $sourceReadResult = Test-BRAVOFileSystemReadAccess -Path $sourceDirectory
@@ -1472,8 +1502,7 @@ try {
 
     if ($enabledArchiveCount -gt 0) {
         $sourceVolumes = @(
-            $archiveDefinitions |
-                Where-Object { Test-SettingEnabled $_.Enabled } |
+            $dryRunArchiveDefinitions |
                 ForEach-Object { Get-BRAVODryRunVolumeRoot -Path ([string]$_.Source) } |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
                 Select-Object -Unique
@@ -1521,6 +1550,7 @@ try {
     # $bazaSyncEffective (Config Loader), а не обчислюються тут повторно.
     foreach ($syncComponent in $bazaSyncEffective.Components) {
         if (-not $syncComponent.AnyEnabled) { continue }
+        if ($dryRunNotInstalledComponents -contains [string]$syncComponent.Name) { continue }
 
         $componentSource = [string]$syncComponent.Source
         if ([string]::IsNullOrWhiteSpace($componentSource)) {
@@ -1562,7 +1592,9 @@ try {
     # persisted state (Read-BRAVOBazaState) — жодного SFTP-з'єднання,
     # жодного sync не виконується. Одна canonical точка інтерпретації
     # (Get-BRAVOBazaSettingsEffective) — та сама, що Archive і Health.
-    $bazaSftpComponents = @($bazaSyncEffective.Components | Where-Object { $_.AnyEnabled -and $_.SftpEnabled })
+    $bazaSftpComponents = @($bazaSyncEffective.Components | Where-Object {
+        $_.AnyEnabled -and $_.SftpEnabled -and $dryRunNotInstalledComponents -notcontains [string]$_.Name
+    })
     if ($bazaSftpComponents.Count -gt 0) {
         $bazaArchiveRuntimeModulePath = Join-Path $dryRunRuntimeRoot 'modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1'
         $bazaSyncModulePath = Join-Path $dryRunRuntimeRoot 'modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1'

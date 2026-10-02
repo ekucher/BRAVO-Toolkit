@@ -315,7 +315,7 @@ $script:environmentLimitations = New-Object System.Collections.ArrayList
 # 188.6 с із 477.5 с sum-of-suites. Вибірковий прогін не може бути швидшим
 # за цю частину, і обіцяти більше було б неправдою.
 $script:BRAVOSelfTestSuiteCatalog = @(
-    'Archive', 'ArchiveDiskSpace', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
+    'Archive', 'ArchiveDiskSpace', 'BackupScope', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
     'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
     'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
     'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
@@ -726,6 +726,7 @@ function New-BRAVOSelfTestRuntimeModule {
         [pscustomobject]@{
             Module        = $runtimeModule
             FunctionNames = @($FunctionNames)
+            Cleaned       = $false
         }
     )
 
@@ -733,12 +734,12 @@ function New-BRAVOSelfTestRuntimeModule {
 }
 
 function Clear-BRAVOSelfTestOwnedRuntimeModules {
-    # Централізований, ownership-aware cleanup усіх динамічних модулів,
-    # створених New-BRAVOSelfTestRuntimeModule протягом усього прогону
-    # self-test. Викликається РІВНО ОДИН РАЗ, наприкінці — після того, як
-    # усі доменні фрагменти відпрацювали (& $module {...} лишається
-    # робочим до самого кінця незалежно від цього витоку, бо це окремий
-    # механізм виклику через сам PSModuleInfo).
+    # Централізований, ownership-aware cleanup динамічних модулів, створених
+    # New-BRAVOSelfTestRuntimeModule. Викликається (а) наприкінці КОЖНОГО
+    # suite через Restore-BRAVOSelfTestSuiteIsolation (#337: -StartIndex =
+    # довжина реєстру на вході в suite, тож чіпає лише модулі цього suite) і
+    # (б) наприкінці прогону без параметрів як страховка (ідемпотентно:
+    # уже прибрані записи пропускаються).
     #
     # Ownership-перевірка: функцію видаляємо з Function:-drive ЛИШЕ якщо
     # її поточний ModuleName станом на момент cleanup дійсно збігається з
@@ -749,19 +750,398 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
     # у будь-який момент може резолвитися лише ОСТАННЄ визначення, тому
     # ownership-mismatch для більш ранніх реєстрацій — очікуваний, не
     # помилка.
-    foreach ($ownedEntry in $script:BRAVOSelfTestOwnedRuntimeModules) {
-        $ownerModuleName = $ownedEntry.Module.Name
-        foreach ($functionName in @($ownedEntry.FunctionNames)) {
-            $currentCommand = Get-Command -Name $functionName -ErrorAction SilentlyContinue
-            if ($null -ne $currentCommand -and
-                $currentCommand.CommandType -eq [Management.Automation.CommandTypes]::Function -and
-                $currentCommand.ModuleName -eq $ownerModuleName) {
-                Remove-Item -Path "function:$functionName" -Force -ErrorAction Stop
+    #
+    # -FunctionBaseline (ім'я -> ScriptBlock, знято на вході в suite): якщо
+    # прибрана заглушка затіняла ПЕРЕДІСНУЮЧУ функцію (напр. Write-Log), її
+    # початкове визначення повертається, а не губиться; -FunctionOptionsBaseline
+    # (ім'я -> Options, лише не None) повертає й її Options (#350).
+    param(
+        [int]$StartIndex = 0,
+        [hashtable]$FunctionBaseline = $null,
+        [hashtable]$FunctionOptionsBaseline = $null
+    )
+    $clearProblems = Microsoft.PowerShell.Utility\New-Object System.Collections.Generic.List[string]
+    for ($ownedIndex = $StartIndex; $ownedIndex -lt $script:BRAVOSelfTestOwnedRuntimeModules.Count; $ownedIndex++) {
+        $ownedEntry = $script:BRAVOSelfTestOwnedRuntimeModules[$ownedIndex]
+        # Strict-safe: записи реєстру з інших джерел (проби) можуть не мати
+        # прапорця Cleaned.
+        $cleanedProperty = $ownedEntry.PSObject.Properties['Cleaned']
+        if ($null -ne $cleanedProperty -and $cleanedProperty.Value) { continue }
+        # Збій на одному записі не має пропускати решту записів і підмітання
+        # нижче: збираємо проблеми й кидаємо один виняток наприкінці.
+        try {
+            $ownerModuleName = $ownedEntry.Module.Name
+            foreach ($functionName in @($ownedEntry.FunctionNames)) {
+                # Пряме читання Function:-drive (хеш-пошук) замість Get-Command:
+                # Get-Command для відсутнього імені запускає дорогий пошук модулів.
+                $currentFunction = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $functionName) -ErrorAction SilentlyContinue
+                if ($null -ne $currentFunction -and $currentFunction.ModuleName -eq $ownerModuleName) {
+                    Microsoft.PowerShell.Management\Remove-Item -Path "function:$functionName" -Force -ErrorAction Stop
+                    if ($null -ne $FunctionBaseline -and $FunctionBaseline.ContainsKey($functionName)) {
+                        $baselineFunctionOptions = 'None'
+                        if ($null -ne $FunctionOptionsBaseline -and $FunctionOptionsBaseline.ContainsKey($functionName)) {
+                            $baselineFunctionOptions = $FunctionOptionsBaseline[$functionName]
+                        }
+                        Set-BRAVOSelfTestBuiltinCommandEntry -Name $functionName -Scope Global -Entry ([pscustomobject]@{
+                                Kind = 'Function'; ScriptBlock = $FunctionBaseline[$functionName]; Options = $baselineFunctionOptions })
+                    }
+                }
+            }
+            Microsoft.PowerShell.Core\Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
+        } catch {
+            [void]$clearProblems.Add($_.Exception.Message)
+            # Невдале прибирання не позначається Cleaned: фінальний прохід
+            # без параметрів має повторити його, а не пропустити запис.
+            continue
+        }
+        if ($null -ne $cleanedProperty) {
+            $cleanedProperty.Value = $true
+        } else {
+            Microsoft.PowerShell.Utility\Add-Member -InputObject $ownedEntry -MemberType NoteProperty -Name 'Cleaned' -Value $true -Force
+        }
+    }
+    # Підмітання: жодна функція, прив'язана до модуля з діапазону (для
+    # фінального виклику — до БУДЬ-ЯКОГО зареєстрованого модуля, включно з
+    # уже прибраними й помилково відновленими з -FunctionBaseline чи самим
+    # suite), не лишається у Function:-drive. Ім'я модуля — унікальний GUID,
+    # тож чужу функцію це не зачепить.
+    $sweepModuleNames = @{}
+    for ($sweepIndex = $StartIndex; $sweepIndex -lt $script:BRAVOSelfTestOwnedRuntimeModules.Count; $sweepIndex++) {
+        $sweepModuleNames[[string]$script:BRAVOSelfTestOwnedRuntimeModules[$sweepIndex].Module.Name] = $true
+    }
+    if ($sweepModuleNames.Count -gt 0) {
+        foreach ($sweepFunction in @(Microsoft.PowerShell.Management\Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)) {
+            if (-not [string]::IsNullOrEmpty([string]$sweepFunction.ModuleName) -and $sweepModuleNames.ContainsKey([string]$sweepFunction.ModuleName)) {
+                foreach ($sweepScope in @('global:', 'script:', '')) {
+                    Microsoft.PowerShell.Management\Remove-Item -Path ('function:' + $sweepScope + $sweepFunction.Name) -Force -ErrorAction SilentlyContinue
+                }
             }
         }
-        Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
     }
-    $script:BRAVOSelfTestOwnedRuntimeModules.Clear()
+    if ($clearProblems.Count -gt 0) {
+        throw ('прибирання runtime-модулів: ' + [string]::Join(' | ', $clearProblems.ToArray()))
+    }
+}
+
+# #337: канонічний життєвий цикл ізоляції suite. Заглушки вбудованих команд
+# (Get-Service, Start-Sleep, Invoke-WebRequest ...), створені bare
+# New-Module у dot-source suite-фрагменті, потрапляють у GLOBAL-сесію і
+# раніше жили до кінця прогону, змінюючи семантику наступних suite (витік
+# Start-Sleep уже ламав TraceArchive). Тепер Enter-BRAVOSelfTestSection для
+# 'Suite/*' знімає знімок резолюції спостережуваних команд, Complete-
+# BRAVOSelfTestSection у finally відновлює її й перевіряє. Спільний
+# механізм для кожного suite — без латок у конкретних фрагментах.
+function Get-BRAVOSelfTestWatchedBuiltinCommandNames {
+    # Функція, а не $script:-змінна: ізоляційні проби збирають дочірній скрипт
+    # лише з функцій фреймворку.
+    return @(
+        'Get-Service', 'Start-Service', 'Stop-Service', 'Restart-Service',
+        'Get-Process', 'Stop-Process', 'Start-Process', 'Wait-Process',
+        'Invoke-WebRequest', 'Invoke-RestMethod', 'Start-Sleep',
+        'Get-CimInstance', 'Get-WmiObject', 'Get-Date', 'Test-Connection',
+        'Test-Path', 'Get-Content', 'Set-Content', 'Add-Content', 'Out-File',
+        'Remove-Item', 'Copy-Item', 'Move-Item', 'New-Item', 'Get-Item', 'Set-Item',
+        'Get-ChildItem', 'Get-ItemProperty', 'Set-ItemProperty',
+        'Write-Host', 'Write-Output', 'Write-Warning', 'Write-Error',
+        'Join-Path', 'Split-Path', 'Resolve-Path', 'ConvertTo-Json',
+        'ConvertFrom-Json', 'Get-FileHash', 'New-Object', 'Get-Command',
+        'Get-Module', 'Import-Module', 'Remove-Module', 'Send-MailMessage'
+    )
+}
+
+function Invoke-BRAVOSelfTestGlobalScopeItem {
+    # Операція з Alias:/Function: у ГЛОБАЛЬНІЙ області. Scope-кваліфікатор у
+    # шляху (function:global:X) Get-Item/Remove-Item не розуміють, тож
+    # виконуємо в порожньому динамічному модулі: його ланцюг областей —
+    # модуль -> global, тому найближчий запис і є глобальний. Модуль щоразу
+    # новий: AllScope-запис копіюється в нову область у момент її створення,
+    # тож закешований модуль бачив би застарілу копію. Видалити AllScope-запис
+    # з global звідси не вийде (зніметься лише копія) — фінальна перевірка
+    # Restore тоді дає видимий FAIL, а не тихий успіх.
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('Get', 'Remove')][string]$Operation,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $globalScopeReader = Microsoft.PowerShell.Core\New-Module -ScriptBlock { }
+    if ($Operation -eq 'Get') {
+        return (& $globalScopeReader {
+                param($ItemPath) Microsoft.PowerShell.Management\Get-Item -LiteralPath $ItemPath -ErrorAction SilentlyContinue } $Path)
+    }
+    & $globalScopeReader {
+        param($ItemPath) Microsoft.PowerShell.Management\Remove-Item -LiteralPath $ItemPath -Force -ErrorAction SilentlyContinue } $Path
+}
+
+function Get-BRAVOSelfTestSessionScopeAccess {
+    # #350: прямий доступ до таблиць Alias:/Function: ГЛОБАЛЬНОЇ області і
+    # SCRIPT-області self-test. Публічні шляхи (Get-Item alias:X /
+    # function:X, Get-Alias -Scope, Get-ChildItem alias:) з області функції
+    # фреймворку не бачать записів з опцією Private у батьківських
+    # областях: знімок фіксував такий запис як відсутній, і заміна чи
+    # видалення його suite-ом не відновлювались. Таблиця самої області
+    # (внутрішній SessionStateScope рушія, наявний і в Windows PowerShell
+    # 5.1) повертає запис незалежно від Private. Відсутній член рушія —
+    # виняток (fail closed), а не тихе повернення до неповного читання.
+    # Script = $null, коли script-область і є глобальною (запуск через -File).
+    $bindingFlags = [Reflection.BindingFlags]'Instance, Public, NonPublic'
+    $sessionState = $ExecutionContext.SessionState
+    $internalProperty = $sessionState.GetType().GetProperty('Internal', $bindingFlags)
+    $sessionInternal = $null
+    if ($null -ne $internalProperty) { $sessionInternal = $internalProperty.GetValue($sessionState, $null) }
+    if ($null -eq $sessionInternal) { throw 'ізоляція suite: рушій PowerShell не надає SessionState.Internal' }
+    $internalType = $sessionInternal.GetType()
+    $globalScopeProperty = $internalType.GetProperty('GlobalScope', $bindingFlags)
+    $scopeByIdMethod = $internalType.GetMethod('GetScopeByID', $bindingFlags, $null, [type[]]@([string]), $null)
+    if ($null -eq $globalScopeProperty -or $null -eq $scopeByIdMethod) {
+        throw 'ізоляція suite: рушій PowerShell не надає GlobalScope/GetScopeByID'
+    }
+    $globalScope = $globalScopeProperty.GetValue($sessionInternal, $null)
+    $scriptScope = $scopeByIdMethod.Invoke($sessionInternal, [object[]]@('script'))
+    if ($null -eq $globalScope -or $null -eq $scriptScope) { throw 'ізоляція suite: не вдалося визначити global/script-область' }
+    if ([object]::ReferenceEquals($scriptScope, $globalScope)) { $scriptScope = $null }
+    $scopeType = $globalScope.GetType()
+    $scopeAccess = [pscustomobject]@{
+        Global         = $globalScope
+        Script         = $scriptScope
+        GetFunction    = $scopeType.GetMethod('GetFunction', $bindingFlags, $null, [type[]]@([string]), $null)
+        GetAlias       = $scopeType.GetMethod('GetAlias', $bindingFlags, $null, [type[]]@([string]), $null)
+        RemoveFunction = $scopeType.GetMethod('RemoveFunction', $bindingFlags, $null, [type[]]@([string], [bool]), $null)
+        RemoveAlias    = $scopeType.GetMethod('RemoveAlias', $bindingFlags, $null, [type[]]@([string], [bool]), $null)
+        FunctionTable  = $scopeType.GetProperty('FunctionTable', $bindingFlags)
+    }
+    foreach ($scopeMember in @('GetFunction', 'GetAlias', 'RemoveFunction', 'RemoveAlias', 'FunctionTable')) {
+        if ($null -eq $scopeAccess.$scopeMember) { throw ("ізоляція suite: рушій PowerShell не надає SessionStateScope.{0}" -f $scopeMember) }
+    }
+    return $scopeAccess
+}
+
+function Get-BRAVOSelfTestScopedCommandItem {
+    # Запис саме цієї області (включно з Private) або $null.
+    param(
+        [Parameter(Mandatory = $true)]$Access,
+        [Parameter(Mandatory = $true)][ValidateSet('Global', 'Script')][string]$Scope,
+        [Parameter(Mandatory = $true)][ValidateSet('Alias', 'Function')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    $targetScope = $Access.$Scope
+    if ($null -eq $targetScope) { return $null }
+    return $Access.('Get' + $Kind).Invoke($targetScope, [object[]]@($Name))
+}
+
+function Remove-BRAVOSelfTestScopedCommandItem {
+    # Знімає запис саме з цієї області (включно з Private/ReadOnly). Копії
+    # AllScope-запису в інших областях не чіпає — фінальна перевірка
+    # Restore тоді дає видимий залишок, а не тихий успіх.
+    param(
+        [Parameter(Mandatory = $true)]$Access,
+        [Parameter(Mandatory = $true)][ValidateSet('Global', 'Script')][string]$Scope,
+        [Parameter(Mandatory = $true)][ValidateSet('Alias', 'Function')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    $targetScope = $Access.$Scope
+    if ($null -eq $targetScope) { return }
+    [void]$Access.('Remove' + $Kind).Invoke($targetScope, [object[]]@($Name, $true))
+}
+
+function ConvertTo-BRAVOSelfTestCommandEntry {
+    param($Item, [string]$Kind)
+    if ($null -eq $Item) { return $null }
+    if ($Kind -eq 'Alias') {
+        return [pscustomobject]@{ Kind = 'Alias'; Definition = [string]$Item.Definition; Options = [string]$Item.Options
+            Description = [string]$Item.Description; ScriptBlock = $null; Item = $Item }
+    }
+    return [pscustomobject]@{ Kind = 'Function'; Definition = [string]$Item.ModuleName; Options = [string]$Item.Options
+        Description = ''; ScriptBlock = $Item.ScriptBlock; Item = $Item }
+}
+
+function Get-BRAVOSelfTestBuiltinCommandState {
+    # Стан затінення імені: alias і function, кожен у ГЛОБАЛЬНІЙ області і в
+    # SCRIPT-області self-test (куди dot-source пише suite-фрагменти),
+    # фіксуються незалежно — прямим читанням таблиці кожної області (#350:
+    # включно з Private-записами, яких не видно з області функції), без
+    # Get-Command (той для відсутнього імені запускає дорогий пошук модулів
+    # — на Windows це давало десятки секунд на suite). Заглушка не ховається
+    # за наявним записом: функція під аліасом, global-заглушка голого
+    # New-Module під script-функцією. Для аліаса — ще Options і Description,
+    # для функції — посилання на ScriptBlock, взяте в момент читання (заміна
+    # функції функцією з тим самим ModuleName теж видима). Script-копія
+    # AllScope-запису з global (той самий об'єкт) окремо не фіксується.
+    # Нічого = '<none>'. -Access — результат Get-BRAVOSelfTestSessionScopeAccess
+    # (знімок і відновлення визначають області один раз на всі імена).
+    param([Parameter(Mandatory = $true)][string]$Name, $Access = $null)
+    if ($null -eq $Access) { $Access = Get-BRAVOSelfTestSessionScopeAccess }
+    $globalAliasItem = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope Global -Kind Alias -Name $Name
+    $scriptAliasItem = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope Script -Kind Alias -Name $Name
+    $globalFunctionItem = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope Global -Kind Function -Name $Name
+    $scriptFunctionItem = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope Script -Kind Function -Name $Name
+    if ($null -ne $scriptAliasItem -and [object]::ReferenceEquals($scriptAliasItem, $globalAliasItem)) { $scriptAliasItem = $null }
+    if ($null -ne $scriptFunctionItem -and [object]::ReferenceEquals($scriptFunctionItem, $globalFunctionItem)) { $scriptFunctionItem = $null }
+    $entries = [ordered]@{
+        GlobalAlias    = ConvertTo-BRAVOSelfTestCommandEntry -Kind Alias -Item $globalAliasItem
+        ScriptAlias    = ConvertTo-BRAVOSelfTestCommandEntry -Kind Alias -Item $scriptAliasItem
+        GlobalFunction = ConvertTo-BRAVOSelfTestCommandEntry -Kind Function -Item $globalFunctionItem
+        ScriptFunction = ConvertTo-BRAVOSelfTestCommandEntry -Kind Function -Item $scriptFunctionItem
+    }
+    $keyParts = @()
+    foreach ($entryName in @($entries.Keys)) {
+        $entry = $entries[$entryName]
+        if ($null -eq $entry) { continue }
+        $keyParts += ('{0}|{1}|{2}|{3}' -f $entryName.Replace('Global', ''), $entry.Definition, $entry.Options, $entry.Description)
+    }
+    $stateKey = if ($keyParts.Count -gt 0) { [string]::Join(' + ', [string[]]$keyParts) } else { '<none>' }
+    return [pscustomobject]@{ Name = $Name; Key = $stateKey; Entries = $entries }
+}
+
+function Test-BRAVOSelfTestBuiltinCommandEntryEqual {
+    param($Left, $Right)
+    if ($null -eq $Left -or $null -eq $Right) { return ($null -eq $Left -and $null -eq $Right) }
+    if ($Left.Kind -ne $Right.Kind -or $Left.Definition -ne $Right.Definition -or
+        $Left.Options -ne $Right.Options -or $Left.Description -ne $Right.Description) { return $false }
+    return [object]::ReferenceEquals($Left.ScriptBlock, $Right.ScriptBlock)
+}
+
+function Test-BRAVOSelfTestBuiltinCommandStateEqual {
+    param($Left, $Right)
+    if ($Left.Key -ne $Right.Key) { return $false }
+    foreach ($entryName in @($Left.Entries.Keys)) {
+        if (-not (Test-BRAVOSelfTestBuiltinCommandEntryEqual -Left $Left.Entries[$entryName] -Right $Right.Entries[$entryName])) { return $false }
+    }
+    return $true
+}
+
+function Restore-BRAVOSelfTestBuiltinCommandEntry {
+    # Повертає один вид запису (Alias/Function) імені до знімка: спершу
+    # глобальний, потім script-область — кожну окремо, знімаючи й
+    # відновлюючи запис прямо в її таблиці (#350: і Private теж).
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        $Baseline,
+        $Access = $null
+    )
+    if ($null -eq $Access) { $Access = Get-BRAVOSelfTestSessionScopeAccess }
+    foreach ($scopeName in @('Global', 'Script')) {
+        $entryName = $scopeName + $Kind
+        $baselineEntry = $Baseline.Entries[$entryName]
+        $currentEntry = (Get-BRAVOSelfTestBuiltinCommandState -Name $Name -Access $Access).Entries[$entryName]
+        if (Test-BRAVOSelfTestBuiltinCommandEntryEqual -Left $baselineEntry -Right $currentEntry) { continue }
+        if ($null -ne $currentEntry) {
+            Remove-BRAVOSelfTestScopedCommandItem -Access $Access -Scope $scopeName -Kind $Kind -Name $Name
+        }
+        Set-BRAVOSelfTestBuiltinCommandEntry -Name $Name -Scope $scopeName -Entry $baselineEntry -Access $Access
+    }
+}
+
+function Set-BRAVOSelfTestBuiltinCommandEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][ValidateSet('Global', 'Script')][string]$Scope,
+        $Entry,
+        $Access = $null
+    )
+    if ($null -eq $Entry) { return }
+    if ($Entry.Kind -eq 'Function') {
+        # ScriptBlock несе свій модуль: відновлена функція модуля лишається
+        # прив'язаною до нього (ModuleName/Module ті самі, див.
+        # ModuleOwnedFunctionRestored).
+        Microsoft.PowerShell.Management\Set-Item -Path ('function:' + $Scope.ToLowerInvariant() + ':' + $Name) -Value $Entry.ScriptBlock -Force
+        # Options (ReadOnly/AllScope/Private) Set-Item не переносить —
+        # повернути їх на щойно відновленій функції саме цієї області.
+        $restoredOptions = [Management.Automation.ScopedItemOptions]$Entry.Options
+        if ($restoredOptions -ne [Management.Automation.ScopedItemOptions]::None) {
+            if ($null -eq $Access) { $Access = Get-BRAVOSelfTestSessionScopeAccess }
+            $restoredFunction = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope $Scope -Kind Function -Name $Name
+            if ($null -eq $restoredFunction) { throw ("функцію {0} не відновлено в області {1}" -f $Name, $Scope) }
+            $restoredFunction.Options = $restoredOptions
+        }
+    } else {
+        Microsoft.PowerShell.Utility\Set-Alias -Name $Name -Value $Entry.Definition -Scope $Scope `
+            -Option ([Management.Automation.ScopedItemOptions]$Entry.Options) -Description $Entry.Description -Force
+    }
+}
+
+function New-BRAVOSelfTestSuiteIsolationSnapshot {
+    $scopeAccess = Get-BRAVOSelfTestSessionScopeAccess
+    $commandStates = @{}
+    foreach ($watchedName in @(Get-BRAVOSelfTestWatchedBuiltinCommandNames)) {
+        $commandStates[$watchedName] = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName -Access $scopeAccess
+    }
+    # #350: початкові ГЛОБАЛЬНІ функції (туди потрапляють функції runtime-
+    # модулів; прибрана заглушка повертає саме глобальний оригінал)
+    # матеріалізуються тут же: ім'я -> ScriptBlock і ім'я -> Options
+    # (лише не None). Живі FunctionInfo зберігати не можна: перевизначення
+    # наявної функції (Set-Item, function global:X) змінює той самий об'єкт
+    # на місці, і «знімок» віддав би вже заглушку.
+    $functionBaseline = @{}
+    $functionOptionsBaseline = @{}
+    foreach ($globalFunctionPair in $scopeAccess.FunctionTable.GetValue($scopeAccess.Global, $null).GetEnumerator()) {
+        $functionBaseline[[string]$globalFunctionPair.Key] = $globalFunctionPair.Value.ScriptBlock
+        if ($globalFunctionPair.Value.Options -ne [Management.Automation.ScopedItemOptions]::None) {
+            $functionOptionsBaseline[[string]$globalFunctionPair.Key] = [string]$globalFunctionPair.Value.Options
+        }
+    }
+    return [pscustomobject]@{
+        CommandStates           = $commandStates
+        FunctionBaseline        = $functionBaseline
+        FunctionOptionsBaseline = $functionOptionsBaseline
+        OwnedStartIndex         = $script:BRAVOSelfTestOwnedRuntimeModules.Count
+    }
+}
+
+function Restore-BRAVOSelfTestSuiteIsolation {
+    # 1) прибирає runtime-модулі, створені протягом suite, 2) повертає
+    # резолюцію спостережуваних вбудованих команд до знімка (зняття
+    # затінюючих global function/alias, відновлення початкової функції чи
+    # аліаса), 3) перевіряє результат. Повертає перелік залишкових відхилень
+    # (порожній = ізоляцію відновлено); невдача також реєструється як FAIL.
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [string]$Label = 'suite',
+        # Лише для проб, що свідомо перевіряють видимий залишок: повертає
+        # його, не реєструючи FAIL прогону.
+        [switch]$NoFailureRegistration
+    )
+    $residualProblems = Microsoft.PowerShell.Utility\New-Object System.Collections.Generic.List[string]
+    try {
+        # Знімок незмінний (#350): матеріалізовані на вході в suite
+        # ім'я -> ScriptBlock/Options, а не живі FunctionInfo.
+        if ($script:BRAVOSelfTestOwnedRuntimeModules.Count -gt $Snapshot.OwnedStartIndex) {
+            Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $Snapshot.OwnedStartIndex -FunctionBaseline $Snapshot.FunctionBaseline `
+                -FunctionOptionsBaseline $Snapshot.FunctionOptionsBaseline
+        } else {
+            Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $Snapshot.OwnedStartIndex
+        }
+    } catch {
+        [void]$residualProblems.Add("прибирання runtime-модулів: $($_.Exception.Message)")
+    }
+    $scopeAccess = $null
+    try {
+        $scopeAccess = Get-BRAVOSelfTestSessionScopeAccess
+    } catch {
+        [void]$residualProblems.Add("області сесії: $($_.Exception.Message)")
+    }
+    foreach ($watchedName in @(Get-BRAVOSelfTestWatchedBuiltinCommandNames)) {
+        if ($null -eq $scopeAccess) { break }
+        $baselineState = $Snapshot.CommandStates[$watchedName]
+        $currentState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName -Access $scopeAccess
+        if (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $currentState) { continue }
+        try {
+            Restore-BRAVOSelfTestBuiltinCommandEntry -Name $watchedName -Kind Alias -Baseline $baselineState -Access $scopeAccess
+            Restore-BRAVOSelfTestBuiltinCommandEntry -Name $watchedName -Kind Function -Baseline $baselineState -Access $scopeAccess
+        } catch {
+            [void]$residualProblems.Add("${watchedName}: не вдалося зняти затінення — $($_.Exception.Message)")
+        }
+        $finalState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName -Access $scopeAccess
+        if (-not (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $finalState)) {
+            [void]$residualProblems.Add(("{0}: було {1}, стало {2}" -f $watchedName, $baselineState.Key, $finalState.Key))
+        }
+    }
+    if ($residualProblems.Count -gt 0 -and -not $NoFailureRegistration) {
+        $isolationMessage = ("Framework/SuiteIsolation[{0}] — вбудовані команди не повернуто до стану до suite: {1}" -f
+            $Label, [string]::Join('; ', $residualProblems.ToArray()))
+        [void]$script:failures.Add($isolationMessage)
+        Microsoft.PowerShell.Utility\Write-Host "[FAIL] $isolationMessage" -ForegroundColor Red
+    }
+    return @($residualProblems.ToArray())
 }
 
 # ============================================================
@@ -1342,6 +1722,7 @@ function Enter-BRAVOSelfTestSection {
         Fault          = $null
         FaultSuite     = ''
         SkipReason     = ''
+        SuiteIsolation = $null
     }
     [void]$script:BRAVOSelfTestSections.Add($sectionRecord)
     $script:BRAVOSelfTestSectionIndex[$Name] = $sectionRecord
@@ -1376,6 +1757,11 @@ function Enter-BRAVOSelfTestSection {
         [void]$script:failures.Add("Section/$Name — пропущено: $sectionSkipReason")
         Write-Host "[ПРОПУЩЕНО] Section/${Name}: $sectionSkipReason" -ForegroundColor Red
         return $false
+    }
+    # #337: межа suite = межа ізоляції вбудованих команд (див.
+    # Restore-BRAVOSelfTestSuiteIsolation у Complete-BRAVOSelfTestSection).
+    if ($Name -like 'Suite/*') {
+        $sectionRecord.SuiteIsolation = New-BRAVOSelfTestSuiteIsolationSnapshot
     }
     [void]$script:BRAVOSelfTestSectionStack.Add($sectionRecord)
     return $true
@@ -1416,6 +1802,28 @@ function Complete-BRAVOSelfTestSection {
         throw (New-BRAVOSelfTestGlobalFatalException -Kind Framework `
                 -Message ("межі секцій порушено: закривається '{0}', відкрита '{1}'" -f $Name,
                     $(if ($null -ne $closingSection) { $closingSection.Name } else { '' })))
+    }
+    if ($null -ne $closingSection.SuiteIsolation) {
+        # finally-шлях: ізоляція відновлюється і після перерваного suite.
+        # Виняток не має вийти з finally до Status/DurationMs/Assert...Intact:
+        # реєструється як збій секції (вона ще на стеку). Якщо suite уже
+        # перервано, первинний Fault/FaultSuite не перезаписується: збій
+        # відновлення додається окремим FAIL.
+        try {
+            [void](Restore-BRAVOSelfTestSuiteIsolation -Snapshot $closingSection.SuiteIsolation -Label $Name)
+        } catch {
+            if ($closingSection.Status -ne 'Aborted' -or
+                -not [string]::IsNullOrEmpty((Get-BRAVOSelfTestGlobalFatalKind -ErrorRecord $_))) {
+                Register-BRAVOSelfTestSectionFault -ErrorRecord $_
+            } else {
+                $isolationCleanupMessage = ("Section/{0} — відновлення ізоляції після перерваного suite: {1}" -f
+                    $Name, $_.Exception.Message)
+                [void]$script:failures.Add($isolationCleanupMessage)
+                Microsoft.PowerShell.Utility\Write-Host "[FAIL] $isolationCleanupMessage" -ForegroundColor Red
+            }
+        } finally {
+            $closingSection.SuiteIsolation = $null
+        }
     }
     $script:BRAVOSelfTestSectionStack.RemoveAt($sectionStackDepth - 1)
     if ($closingSection.Status -eq 'Running') { $closingSection.Status = 'Completed' }
@@ -1600,6 +2008,12 @@ Save-BRAVOSelfTestFrameworkSnapshot -FunctionName @(
     'Enter-BRAVOSelfTestSection', 'Register-BRAVOSelfTestSectionFault',
     'Complete-BRAVOSelfTestSection', 'Register-BRAVOSelfTestGlobalFatal',
     'Remove-BRAVOSelfTestConfigRoot', 'Invoke-BRAVOSelfTestFinalCleanup',
+    'Get-BRAVOSelfTestWatchedBuiltinCommandNames', 'Get-BRAVOSelfTestBuiltinCommandState',
+    'Test-BRAVOSelfTestBuiltinCommandStateEqual', 'Test-BRAVOSelfTestBuiltinCommandEntryEqual',
+    'Invoke-BRAVOSelfTestGlobalScopeItem', 'ConvertTo-BRAVOSelfTestCommandEntry',
+    'Get-BRAVOSelfTestSessionScopeAccess', 'Get-BRAVOSelfTestScopedCommandItem', 'Remove-BRAVOSelfTestScopedCommandItem',
+    'Restore-BRAVOSelfTestBuiltinCommandEntry', 'Set-BRAVOSelfTestBuiltinCommandEntry',
+    'New-BRAVOSelfTestSuiteIsolationSnapshot', 'Restore-BRAVOSelfTestSuiteIsolation',
     'Write-BRAVOSelfTestSectionReport', 'Complete-BRAVOSelfTestAbnormalExit')
 
 # ============================================================
@@ -7885,44 +8299,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $archiveScriptText.Contains('$record.GenerationId -eq $CurrentGenerationId') -and
             $archiveScriptText.Contains('$record.GenerationId -notin $protectedGenerationIds') -and
             $archiveScriptText.Contains('minimumRetainedVerifiedBackups') -and
-            $archiveScriptText.Contains('Select-Object -First $minimumRetainedCount') -and
+            $archiveScriptText.Contains('$protectedGenerationIds.Count -ge $minimumRetainedCount') -and
             $bravoConfigTextForRetention.Contains('$global:minimumRetainedVerifiedBackups')
         ) `
         -Name "BackupConsistency/RetentionNeverDeletesLastVerified" `
         -Failure "generation-aware retention має захищати current і N найновіших verified COMPLETE generations незалежно від archiveRetentionDays"
-
-    # Archive.Runtime.ps1 безумовно запускає Main при dot-source, тому саму
-    # функцію Remove-OldBackupSets тут викликати небезпечно. Натомість
-    # відтворюємо той самий алгоритм відбору (Select-Object -First/-Skip на
-    # відсортованому за спаданням часу списку) на синтетичних даних — це
-    # функціональна, а не текстова перевірка інваріанту "останню перевірену
-    # копію не видаляти", яку одна лише текстова перевірка вище довести не може.
-    # Навмисно всі три "покоління" старші за cutoff — саме такий сценарій
-    # (серія невдалих backup, лише старі перевірені копії) і був не захищений
-    # до цього виправлення: без Select-Object -First найновіший теж потрапляв
-    # у $setsToDelete.
-    $retentionSimulationSets = @(
-        [pscustomobject]@{ Name = "gen1_newest"; LastWriteTime = (Get-Date).AddDays(-190) },
-        [pscustomobject]@{ Name = "gen2_old"; LastWriteTime = (Get-Date).AddDays(-200) },
-        [pscustomobject]@{ Name = "gen3_oldest"; LastWriteTime = (Get-Date).AddDays(-400) }
-    ) | Sort-Object LastWriteTime -Descending
-    $retentionSimulationCutoff = (Get-Date).AddDays(-183)
-    $retentionSimulationProtected = @($retentionSimulationSets | Select-Object -First 1)
-    $retentionSimulationCandidates = @($retentionSimulationSets | Select-Object -Skip 1)
-    $retentionSimulationToDelete = @($retentionSimulationCandidates | Where-Object {
-        $_.LastWriteTime -lt $retentionSimulationCutoff
-    })
-    Test-BRAVOCondition `
-        -Condition (
-            $retentionSimulationProtected.Count -eq 1 -and
-            $retentionSimulationProtected[0].Name -eq "gen1_newest" -and
-            $retentionSimulationToDelete.Count -eq 2 -and
-            ($retentionSimulationToDelete.Name -contains "gen2_old") -and
-            ($retentionSimulationToDelete.Name -contains "gen3_oldest") -and
-            -not ($retentionSimulationToDelete.Name -contains "gen1_newest")
-        ) `
-        -Name "BackupConsistency/RetentionSelectionAlgorithm" `
-        -Failure "алгоритм відбору на видалення (Select-Object -First/-Skip найновіших перевірених комплектів) має завжди виключати найновіший комплект, навіть коли він старший за retention cutoff"
 
     $generationVerifierModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $archiveScriptText `
@@ -11605,12 +11986,357 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         }
     }
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Scheduler' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' -DependsOn 'Root/Runtime') { try {
+    # #322: діагностика причини застарілої generation (чистий класифікатор,
+    # fixture з INCOMPLETE новішим за COMPLETE, секція Slack і дедуп хмари).
+    $staleReasonModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'ConvertTo-BRAVOUtcDateTime',
+            'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
+            'Get-BRAVOHealthBackupStaleReason',
+            'Test-BRAVOHealthCatchUpRunIsAttempt',
+            'Get-BRAVOHealthBackupStaleDiagnosis',
+            'Get-BRAVOHealthManifestFailedStage',
+            'Get-BackupHealthIssues'
+        )
+    $staleReasons = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        $now = [datetime]::SpecifyKind([datetime]'2026-09-30T12:00:00', [DateTimeKind]::Utc)
+        $max = [timespan]::FromHours(24)
+        $task = {
+            param($Exists = $true, $Enabled = $true, $Result = 0, $RunAgeHours = 2)
+            [pscustomobject]@{ Exists = $Exists; Enabled = $Enabled; LastTaskResult = $Result; LastRunTime = $now.AddHours(-$RunAgeHours).ToLocalTime() }
+        }
+        $status = {
+            param($Code = 0, $FinishedAgeHours = 1)
+            [pscustomobject]@{ ExitCode = $Code; ExitCodeName = 'TEST_NAME'; FinishedAt = $now.AddHours(-$FinishedAgeHours).ToLocalTime() }
+        }
+        $incomplete = [pscustomobject]@{ GenerationId = 'G-NEW'; Status = 'INCOMPLETE'; CreatedAtUtc = $now.AddHours(-3); Stage = 'MODEL/SHA512' }
+        $reason = { param($t, $s, $i, $c) Get-BRAVOHealthBackupStaleReason -TaskInfo $t -ArchiveStatus $s -LatestIncomplete $i -LatestCompleteUtc $c -NowUtc $now -MaxAge $max }
+        [pscustomobject]@{
+            NotRegistered = & $reason (& $task -Exists $false) $null $null $null
+            Disabled = & $reason (& $task -Enabled $false) $null $null $null
+            # Запуск, що створив INCOMPLETE manifest, стартував РАНІШЕ за нього (-4 год проти -3 год).
+            Incomplete = & $reason (& $task -RunAgeHours 4) $null $incomplete $now.AddHours(-30)
+            IncompleteOlder = & $reason (& $task) $null $incomplete $now.AddHours(-1)
+            BadResult = & $reason (& $task -Result (-2147024891)) (& $status 0 1) $null $null
+            SameCodeNamed = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 1) $null $null
+            SameCodeOldStatus = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 30) $null $null
+            NewerFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            NewerRunning = & $reason (& $task -Result 267009 -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            NewerSuccess = & $reason (& $task -Result 0 -RunAgeHours 1) (& $status 0 0.5) $incomplete $now.AddHours(-30)
+            OlderFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 5) $null $incomplete $now.AddHours(-30)
+            CodeZero = & $reason (& $task -Result 0) $null $null $null
+            Running = & $reason (& $task -Result 267009 -RunAgeHours 1) (& $status 0 30) $null $null
+            NeverRunCode = & $reason (& $task -Result 267011) $null $null $null
+            NeverRunYear = & $reason ([pscustomobject]@{ Exists = $true; Enabled = $true; LastTaskResult = 0; LastRunTime = [datetime]'1999-11-30' }) $null $null $null
+            NotFoundWithStatus = & $reason (& $task -Exists $false) (& $status 20 1) $null $null
+            HashtableInfo = & $reason @{ Exists = $true; Enabled = $false } $null $null $null
+            NotRun = & $reason (& $task -RunAgeHours 72) (& $status 0 71) $null $null
+            Early = & $reason (& $task -RunAgeHours 2) (& $status 0 30) $null $null
+            StatusCode = & $reason (& $task) (& $status 20 1) $null $null
+            Nothing = & $reason (& $task) (& $status 0 1) $null $null
+            ReadFailedTask = & $reason $null (& $status 20 1) $null $null
+            ReadFailedAll = & $reason $null $null $null $null
+            ExpIncomplete = $now.AddHours(-3).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpRun2 = $now.AddHours(-2).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpRun72 = $now.AddHours(-72).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpFinished1 = $now.AddHours(-1).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $staleReasons.NotRegistered -eq 'завдання BRAVO_ARCHIV не знайдене або недоступне для читання' -and
+            $staleReasons.NotFoundWithStatus -match 'код 20' -and
+            $staleReasons.Running -eq 'завдання BRAVO_ARCHIV виконується зараз' -and
+            $staleReasons.NeverRunCode -eq 'завдання BRAVO_ARCHIV ще не запускалося' -and
+            $staleReasons.NeverRunYear -eq 'завдання BRAVO_ARCHIV ще не запускалося' -and
+            $staleReasons.HashtableInfo -eq 'завдання BRAVO_ARCHIV вимкнене' -and
+            $staleReasons.Disabled -eq 'завдання BRAVO_ARCHIV вимкнене' -and
+            $staleReasons.Incomplete -match 'G-NEW' -and $staleReasons.Incomplete -match 'INCOMPLETE' -and $staleReasons.Incomplete -match 'MODEL/SHA512' -and
+            $null -eq $staleReasons.IncompleteOlder -and
+            $staleReasons.BadResult -match '0x80070005' -and $staleReasons.BadResult -notmatch 'TEST_NAME' -and
+            $staleReasons.SameCodeNamed -match '0x00000014 \(TEST_NAME\)' -and
+            $staleReasons.SameCodeOldStatus -match '0x00000014' -and $staleReasons.SameCodeOldStatus -notmatch 'TEST_NAME' -and
+            $staleReasons.NewerFailedRun -match '0x80070005' -and $staleReasons.NewerFailedRun -notmatch 'G-NEW' -and
+            $staleReasons.NewerRunning -eq 'завдання BRAVO_ARCHIV виконується зараз' -and
+            $null -eq $staleReasons.NewerSuccess -and
+            $staleReasons.OlderFailedRun -match 'G-NEW' -and
+            $null -eq $staleReasons.CodeZero -and
+            $staleReasons.NotRun -match '^завдання не запускалося з \d\d\.\d\d\.\d{4} \d\d:\d\d$' -and
+            $staleReasons.Early -match 'завершився достроково' -and
+            $staleReasons.StatusCode -match 'код 20 \(TEST_NAME\)' -and
+            $null -eq $staleReasons.Nothing -and
+            $staleReasons.ReadFailedTask -match 'код 20' -and
+            $null -eq $staleReasons.ReadFailedAll -and
+            $staleReasons.Incomplete.Contains($staleReasons.ExpIncomplete) -and
+            $staleReasons.BadResult.Contains($staleReasons.ExpRun2) -and
+            $staleReasons.NotRun.Contains($staleReasons.ExpRun72) -and
+            $staleReasons.Early.Contains($staleReasons.ExpRun2) -and
+            $staleReasons.StatusCode.Contains($staleReasons.ExpFinished1)
+        ) `
+        -Name 'Health/StaleGenerationReasonClassifier' `
+        -Failure "класифікатор причин (завдання відсутнє/вимкнене/INCOMPLETE/код/не запускалося/достроково/статус/нічого; помилка читання пропускає перевірку): $($staleReasons | ConvertTo-Json -Compress)"
+
+    $fingerprintModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @('Get-BRAVOHealthIssueField', 'Get-AlertFingerprint')
+    $fingerprints = & $fingerprintModule {
+        Set-StrictMode -Version Latest
+        $issue = {
+            param($Diagnosis)
+            [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; Diagnosis = $Diagnosis }
+        }
+        $other = [pscustomobject]@{ Kind = 'LocalBackup'; Component = 'MODEL'; Reason = 'x'; FileName = 'a.7z'; LastWriteTime = $null; Diagnosis = 'a' }
+        $other2 = [pscustomobject]@{ Kind = 'LocalBackup'; Component = 'MODEL'; Reason = 'x'; FileName = 'a.7z'; LastWriteTime = $null; Diagnosis = 'b' }
+        [pscustomobject]@{
+            Running = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV виконується зараз')
+            RunningAgain = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV виконується зараз')
+            Disabled = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV вимкнене')
+            NoDiagnosis = Get-AlertFingerprint -Issues @(& $issue $null)
+            OtherA = Get-AlertFingerprint -Issues @($other)
+            OtherB = Get-AlertFingerprint -Issues @($other2)
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $fingerprints.Running -eq $fingerprints.RunningAgain -and
+            $fingerprints.Running -ne $fingerprints.Disabled -and
+            $fingerprints.Disabled -ne $fingerprints.NoDiagnosis -and
+            $fingerprints.OtherA -eq $fingerprints.OtherB
+        ) `
+        -Name 'Health/AlertFingerprintIncludesGenerationDiagnosis' `
+        -Failure "fingerprint LocalBackupGeneration залежить від Diagnosis (змінена причина не придушується), стабільний за незмінної причини; інші Kind не змінюються: $($fingerprints | ConvertTo-Json -Compress)"
+
+    $staleCatchUp = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        function Write-HealthLog { param($Message, $Level) }
+        $script:mode = 'catchup-newer'
+        $stateRoot = 'x'
+        $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'SELFTEST_MAIN' }; BackupCatchUp = [pscustomobject]@{ Enabled = $true; TaskName = 'SELFTEST_CATCHUP' } }
+        function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+        function Get-BRAVOOperationStatus {
+            param($Path)
+            # catchup-noop: status-файл від справжнього прогону ДО старту catch-up (#323: no-op catch-up його не оновлює).
+            if ($script:mode -eq 'catchup-noop') { return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = [pscustomobject]@{ exitCode = 0; exitCodeName = 'OK'; finishedAt = (Get-Date).AddHours(-29) } } }
+            throw 'self-test: status недоступний'
+        }
+        function Get-BRAVOScheduledTaskState {
+            param($TaskPath, $TaskName)
+            $run = if ($TaskName -eq 'SELFTEST_MAIN') { (Get-Date).AddHours(-30) } else { (Get-Date).AddHours(-1) }
+            $result = if ($TaskName -eq 'SELFTEST_MAIN') { 0 } else { -2147024891 }
+            if ($script:mode -eq 'catchup-noop') { $result = if ($TaskName -eq 'SELFTEST_MAIN') { 20 } else { 0 } }
+            if ($TaskName -eq 'SELFTEST_CATCHUP' -and $script:mode -eq 'catchup-missing') { throw 'self-test: catch-up недоступне' }
+            if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'catchup-missing') { $run = (Get-Date).AddHours(-3); $result = 20 }
+            if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'main-newer') { $run = (Get-Date).AddMinutes(-20); $result = 20 }
+            return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = $run; LastTaskResult = $result } }
+        }
+        $diag = { Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $null -LatestCompleteUtc $null -NowUtc (Get-Date).ToUniversalTime() -MaxAge ([timespan]::FromHours(24)) }
+        $newer = & $diag
+        $script:mode = 'catchup-missing'
+        $missing = & $diag
+        $script:mode = 'main-newer'
+        $mainNewer = & $diag
+        $script:mode = 'catchup-noop'
+        $catchUpNoOp = & $diag
+        $nullStage = Get-BRAVOHealthManifestFailedStage -Manifest ([pscustomobject]@{ components = [pscustomobject]@{ MODEL = $null; BLOG = [pscustomobject]@{ ErrorStage = 'CREATE' } } })
+        [pscustomobject]@{ CatchUpNewer = $newer; CatchUpMissing = $missing; MainNewer = $mainNewer; CatchUpNoOp = $catchUpNoOp; NullStage = $nullStage }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $staleCatchUp.CatchUpNewer -match 'SELFTEST_CATCHUP' -and $staleCatchUp.CatchUpNewer -match '0x80070005' -and
+            $staleCatchUp.CatchUpMissing -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpMissing -match '0x00000014' -and
+            $staleCatchUp.MainNewer -match 'SELFTEST_MAIN' -and $staleCatchUp.MainNewer -match '0x00000014' -and
+            $staleCatchUp.CatchUpNoOp -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpNoOp -match '0x00000014' -and
+            $staleCatchUp.NullStage -eq 'BLOG/CREATE'
+        ) `
+        -Name 'Health/StaleGenerationCatchUpTaskAndNullComponent' `
+        -Failure "діагностика бере новіше з основного/catch-up завдань (відсутнє catch-up або no-op catch-up без нового status → основне), null-компонент manifest пропускається без винятку: $($staleCatchUp | ConvertTo-Json -Compress)"
+
+    $staleCorrupt = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        $script:corruptLog = New-Object System.Collections.Generic.List[string]
+        function Write-HealthLog { param($Message, $Level) [void]$script:corruptLog.Add("$Level|$Message") }
+        $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+        $stateRoot = 'x'
+        function Get-BRAVOScheduledTaskState {
+            param($TaskPath, $TaskName)
+            return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = (Get-Date).AddHours(-1); LastTaskResult = (-2147024891) } }
+        }
+        function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+        function Get-BRAVOOperationStatus { param($Path) return [pscustomobject]@{ Exists = $true; Corrupt = $true; State = $null; Reason = 'self-test: зіпсований JSON' } }
+        $thrown = $false
+        $diagnosis = $null
+        try {
+            $diagnosis = Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $null -LatestCompleteUtc $null -NowUtc (Get-Date).ToUniversalTime() -MaxAge ([timespan]::FromHours(24))
+        } catch { $thrown = $true }
+        [pscustomobject]@{ Thrown = $thrown; Diagnosis = $diagnosis; Log = @($script:corruptLog) }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $staleCorrupt.Thrown -and
+            $staleCorrupt.Diagnosis -match '0x80070005' -and
+            @($staleCorrupt.Log | Where-Object { $_ -match '^WARNING\|Діагностика generation: status-файл Archive пошкоджений: self-test: зіпсований JSON$' }).Count -eq 1
+        ) `
+        -Name 'Health/StaleGenerationCorruptStatusLogsWarning' `
+        -Failure "пошкоджений status-файл Archive: WARNING у лог, інші правила працюють, без винятку: $($staleCorrupt | ConvertTo-Json -Compress)"
+
+    $staleFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_HEALTH_STALE_REASON_{0}' -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($staleFixtureRoot)
+        $staleNowUtc = (Get-Date).ToUniversalTime()
+        $badComponent = @{ MODEL = @{ ArchivePath = 'x'; HashPath = 'y'; Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $false; ErrorStage = 'PUBLISH' } }
+        foreach ($fixture in @(
+            @{ Id = '20260101_000100'; Status = 'COMPLETE'; Age = 72 },
+            @{ Id = '20260101_000200'; Status = 'INCOMPLETE'; Age = 3 },
+            @{ Id = '20260101_000300'; Status = 'INCOMPLETE'; Age = 2; JsonId = '20260101_000999' },
+            @{ Id = '20260101_000400'; Status = 'WEIRD'; Age = 1 }
+        )) {
+            $jsonId = if ($fixture.ContainsKey('JsonId')) { $fixture.JsonId } else { $fixture.Id }
+            @{
+                generationId = $jsonId
+                status = $fixture.Status
+                createdAt = $staleNowUtc.AddHours(-$fixture.Age).ToString('o')
+                components = $badComponent
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $staleFixtureRoot "BRAVO_BACKUP_$($fixture.Id).json") -Encoding UTF8
+        }
+        $staleFixtureIssues = & $staleReasonModule {
+            param($BackupRoot)
+            Set-StrictMode -Version Latest
+            $archiveDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Enabled = $true })
+            $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24 }
+            $backupRootPath = $BackupRoot
+            $healthCheckStartedUtc = (Get-Date).ToUniversalTime()
+            $script:healthLatestArchives = @{}
+            function Get-BRAVOFiles { param([string]$Path, [string]$Filter) return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue) }
+            $script:staleWarnings = New-Object System.Collections.Generic.List[string]
+            function Write-HealthLog { param($Message, $Level) if ($Level -eq 'WARNING') { [void]$script:staleWarnings.Add([string]$Message) } }
+            # Читання планувальника/статусу недоступне (детерміновано, незалежно від хоста):
+            # діагностика мусить пропустити ці перевірки й дійти до INCOMPLETE manifest.
+            $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+            $stateRoot = $BackupRoot
+            function Get-BRAVOScheduledTaskState { param($TaskPath, $TaskName) throw 'self-test: планувальник недоступний' }
+            function Get-BRAVOOperationStatus { param($Path) throw 'self-test: status недоступний' }
+            $fixtureIssues = @(Get-BackupHealthIssues)
+            return [pscustomobject]@{ Issues = $fixtureIssues; Warnings = @($script:staleWarnings | Where-Object { $_ -match 'Діагностика generation: manifest' }) }
+        } $staleFixtureRoot
+        $staleFixtureWarnings = @($staleFixtureIssues.Warnings)
+        $staleGenerationIssue = @($staleFixtureIssues.Issues | Where-Object { $_.Component -eq 'Generation' })[0]
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $staleGenerationIssue -and
+                $staleGenerationIssue.Kind -eq 'LocalBackupGeneration' -and
+                $staleGenerationIssue.Reason -match '^остання COMPLETE generation старша за 24 год\.$' -and
+                $staleGenerationIssue.Diagnosis -match '20260101_000200' -and $staleGenerationIssue.Diagnosis -match 'INCOMPLETE' -and
+                $staleGenerationIssue.Diagnosis -match 'MODEL/PUBLISH' -and $staleGenerationIssue.Diagnosis -notmatch 'SHA512' -and
+                $staleFixtureWarnings.Count -eq 2 -and
+                @($staleFixtureWarnings | Where-Object { $_ -match 'ідентичності' -and $_ -match '20260101_000999' }).Count -eq 1 -and
+                @($staleFixtureWarnings | Where-Object { $_ -match "невідомий статус 'WEIRD'" }).Count -eq 1
+            ) `
+            -Name 'Health/StaleGenerationDiagnosisFromIncompleteManifest' `
+            -Failure "INCOMPLETE manifest новіший за COMPLETE має потрапити в Diagnosis, а Kind/Component/Reason лишитись незмінними; отримано: $($staleGenerationIssue | ConvertTo-Json -Compress)"
+    } finally {
+        if (Test-Path -LiteralPath $staleFixtureRoot -PathType Container) {
+            Remove-Item -LiteralPath $staleFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $staleSlackModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Format-FileSize', 'Format-BackupAge', 'ConvertTo-BRAVOUtcDateTime', 'Get-BRAVOUtcAge',
+            'Get-HealthIssueComponentName', 'ConvertTo-NotificationLiteralText', 'Format-HealthIssueFileName',
+            'Format-CompactLocalIssue', 'Format-CompactSFTPIssue', 'Format-CompactSMBIssue',
+            'Get-BRAVOHealthCollapsedCloudIssues', 'Get-BRAVOHealthIssueActionText', 'New-SlackAlertMessage'
+        )
+    $staleSlackText = & $staleSlackModule {
+        Set-StrictMode -Version Latest
+        $script:NotificationProvider = 'slack'
+        $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+        $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'; SFTP = [pscustomobject]@{ Enabled = $false; CheckBAZASynchronization = $false } }
+        $bazaAppLocalHealthEnabled = $false; $bazaWWWLocalHealthEnabled = $false; $bazaAppSFTPHealthEnabled = $false; $bazaWWWSFTPHealthEnabled = $false
+        $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+        $script:healthLatestArchives = @{ MODEL = [pscustomobject]@{ Name = 'MODEL_old.7z' }; BLOG = [pscustomobject]@{ Name = 'BLOG_old.7z' } }
+        function Get-HostInformation { return $null }
+        function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+        function New-BRAVOOperatorNotificationMessage { param($ResultLines, $ReasonLines) return (@($ReasonLines) + @($ResultLines)) -join "`n" }
+        $cloud = {
+            param($Component, $Reason, $File, $Expected = 10, $Actual = 10)
+            [pscustomobject]@{ Kind = 'SFTPArchive'; Component = $Component; Reason = $Reason; FileName = $File; LastWriteTime = $null; SizeBytes = $Actual; ExpectedSizeBytes = $Expected; ActualSizeBytes = $Actual; Location = '/x' }
+        }
+        $ageOnly = 'віддалена копія старша за 26 год.'
+        $generation = [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; SizeBytes = 1; Diagnosis = 'завдання BRAVO_ARCHIV вимкнене' }
+        $issues = @(
+            $generation,
+            (& $cloud 'SFTP MODEL' $ageOnly 'MODEL_old.7z'),
+            (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_old.7z'),
+            (& $cloud 'SFTP MODEL' 'розмір віддаленого архіву не збігається' 'MODEL_old.7z' 10 9),
+            (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_other.7z')
+        )
+        [pscustomobject]@{
+            Mixed = New-SlackAlertMessage -Issues $issues -Duration ([timespan]::FromSeconds(1))
+            AgeOnly = New-SlackAlertMessage -Issues @($issues[0], $issues[1], $issues[2]) -Duration ([timespan]::FromSeconds(1))
+            NoGeneration = New-SlackAlertMessage -Issues @($issues[1], $issues[2]) -Duration ([timespan]::FromSeconds(1))
+            OtherFiles = New-SlackAlertMessage -Issues @($issues[0], (& $cloud 'SFTP MODEL' $ageOnly 'MODEL_other.7z'), (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_other.7z')) -Duration ([timespan]::FromSeconds(1))
+            Smb = New-SlackAlertMessage -Issues @($issues[0], [pscustomobject]@{ Kind = 'SMBArchive'; Component = 'NAS/SMB MODEL'; Reason = $ageOnly; FileName = 'MODEL_old.7z'; LastWriteTime = $null; SizeBytes = 10; ExpectedSizeBytes = 10; ActualSizeBytes = 10; Location = '/x' }) -Duration ([timespan]::FromSeconds(1))
+        }
+    }
+    $staleAgeOnlyText = [string]$staleSlackText.AgeOnly
+    $staleMixedText = [string]$staleSlackText.Mixed
+    Test-BRAVOCondition `
+        -Condition (
+            $staleSlackText.NoGeneration -notmatch 'та сама застаріла' -and
+            ([regex]::Matches([string]$staleSlackText.NoGeneration, 'файл є, розмір збігається')).Count -eq 2 -and
+            $staleSlackText.OtherFiles -notmatch 'та сама застаріла' -and
+            ([regex]::Matches([string]$staleSlackText.OtherFiles, 'файл є, розмір збігається')).Count -eq 2 -and
+            $staleSlackText.Smb -match 'Проблемних компонентів: 1 ·' -and
+            $staleSlackText.Smb -match 'та сама застаріла generation' -and
+            $staleSlackText.Smb -notmatch 'віддалена копія старша'
+        ) `
+        -Name 'Health/StaleGenerationCollapseNegativeAndSmbCases' `
+        -Failure "без застарілої generation або з іншим файлом хмарні рядки лишаються; SMB age-only згортається: $($staleSlackText | ConvertTo-Json -Compress)"
+    Test-BRAVOCondition `
+        -Condition (
+            $staleAgeOnlyText -match '(?s)ЛОКАЛЬНІ БЕКАПИ\s+:x: Generation — остання COMPLETE generation старша за 24 год\..*\n:mag: Причина: завдання BRAVO_ARCHIV вимкнене' -and
+            $staleAgeOnlyText -notmatch 'ІНШІ ПОМИЛКИ'
+        ) `
+        -Name 'Health/StaleGenerationInLocalSectionWithReason' `
+        -Failure "LocalBackupGeneration має бути в секції ЛОКАЛЬНІ БЕКАПИ з рядком «Причина», а не в ІНШІ ПОМИЛКИ: $staleAgeOnlyText"
+    Test-BRAVOCondition `
+        -Condition (
+            $staleAgeOnlyText -match 'Проблемних компонентів: 1 ·' -and
+            $staleAgeOnlyText -match 'Хмара \(MODEL · BLOG\): та сама застаріла generation' -and
+            $staleAgeOnlyText -notmatch 'файл є, розмір збігається' -and
+            $staleMixedText -match 'Проблемних компонентів: 3 ·' -and
+            $staleMixedText -match 'BLOG_other\.7z' -and
+            $staleMixedText -match 'розмір віддаленого архіву не збігається' -and
+            $staleMixedText -match 'Хмара \(MODEL · BLOG\): та сама застаріла generation'
+        ) `
+        -Name 'Health/StaleGenerationCollapsesOnlyAgeOnlyCloudRows' `
+        -Failure "age-only хмарні рядки для того самого локального архіву мають згортатись в один, розбіжність розміру — ні: $staleAgeOnlyText ||| $staleMixedText"
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('Kind = ''LocalBackupGeneration''') -and
+            $healthScriptText.Contains('Component = ''Generation''') -and
+            $healthScriptText.Contains('Diagnosis = Get-BRAVOHealthBackupStaleDiagnosis') -and
+            $healthScriptText.Contains('Reason = "остання COMPLETE generation старша за $($backupMonitoring.MaxBackupAgeHours) год."')
+        ) `
+        -Name 'Health/StaleGenerationDiagnosisKeepsKindAndComponent' `
+        -Failure 'Diagnosis — додаткове поле: Kind=LocalBackupGeneration, Component=Generation і Reason stale-issue не змінюються (action text, Operations, exit code)'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.MissingCompleteGenerationHasNoFictitiousFileName' -DependsOn 'Root/Runtime') { try {
     $healthGenerationModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $healthScriptText `
         -FunctionNames @(
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
+            'Get-BRAVOHealthBackupStaleReason',
+            'Test-BRAVOHealthCatchUpRunIsAttempt',
+            'Get-BRAVOHealthBackupStaleDiagnosis',
+            'Get-BRAVOHealthManifestFailedStage',
             'Get-BackupHealthIssues'
         )
     $healthNoGenerationRoot = Join-Path ([IO.Path]::GetTempPath()) (
@@ -11632,13 +12358,26 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue)
             }
             function Write-HealthLog { param($Message, $Level) }
+            # Позитивний шлях обгортки діагностики: завдання є й свіже, status-файл має код 20.
+            $stateRoot = $BackupRoot
+            $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+            function Get-BRAVOScheduledTaskState {
+                param($TaskPath, $TaskName)
+                return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = (Get-Date).AddHours(-1); LastTaskResult = 0 } }
+            }
+            function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+            function Get-BRAVOOperationStatus {
+                param($Path)
+                return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = [pscustomobject]@{ exitCode = 20; exitCodeName = 'TEST_NAME'; finishedAt = (Get-Date).AddMinutes(-30) } }
+            }
             return @(Get-BackupHealthIssues)[0]
         } $healthNoGenerationRoot
         Test-BRAVOCondition `
             -Condition (
                 $healthNoGenerationIssue.Reason -eq 'не знайдено жодного COMPLETE generation manifest' -and
                 $healthNoGenerationIssue.FileName -eq 'немає даних' -and
-                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json'
+                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json' -and
+                $healthNoGenerationIssue.Diagnosis -match 'код 20 \(TEST_NAME\)'
             ) `
             -Name 'Health/MissingCompleteGenerationHasNoFictitiousFileName' `
             -Failure 'за відсутності COMPLETE generation Health має показувати причину, але не вигаданий BRAVO_BACKUP_.json'
@@ -14147,6 +14886,7 @@ try {
             [void][IO.Directory]::CreateDirectory($healthOrchestrationRoot)
             $healthOrchestrationStubs = @'
 function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
+function Select-BRAVOExpectedArchiveDefinition { param($ArchiveDefinitions, [string[]]$NotInstalledComponents) return @(@($ArchiveDefinitions) | Where-Object { $_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type }) }
 function New-ProbeIssue {
     param([string]$Kind, [string]$Component, [string]$Reason, [string]$Location)
     return [pscustomobject]@{ Kind = $Kind; Component = $Component; Reason = $Reason; FileName = 'немає даних'; LastWriteTime = $null; SizeBytes = $null; ActualSizeBytes = $null; Location = $Location; Details = @() }
@@ -15673,15 +16413,15 @@ try {
         $derivationTextForDrift = Get-Content -LiteralPath (Join-Path $root "modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1") -Raw -Encoding UTF8
         Test-BRAVOCondition `
             -Condition (
-                $setupTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
-                $archiveRuntimeTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
+                $setupTextForDrift.Contains('Resolve-BRAVOBackupComponentScope') -and
+                $archiveRuntimeTextForDrift.Contains('Resolve-BRAVOBackupComponentScope') -and
                 $archiveRuntimeTextForDrift.Contains('-not $discoveryBaselineValid') -and
                 $derivationTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $setupTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $archiveRuntimeTextForDrift.Contains('-EnabledComponents $discoveryEnabledComponents')
             ) `
             -Name "Presence/DriftGateIsWiredIntoArchiveRuntimeAndSetup" `
-            -Failure "Test-BRAVODiscoveryComponentDrift має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
+            -Failure "Рішення про дрейф (Test-BRAVODiscoveryComponentDrift через канонічний Resolve-BRAVOBackupComponentScope) має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
 
         # 06: explicit override має АБСОЛЮТНИЙ пріоритет над Apache
         # discovery, навіть коли Apache-служба ОДНОЗНАЧНА і її DocumentRoot
@@ -23105,6 +23845,7 @@ function Write-BRAVOLog {
         -SourceText ($healthScriptText + [Environment]::NewLine + $notificationScriptText) `
         -FunctionNames @(
             'Get-BRAVOHealthLatestBackupSummary',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
             'Format-BackupAge',
             'Get-BRAVOUtcAge',
             'ConvertTo-BRAVOUtcDateTime',
@@ -24220,12 +24961,12 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $archiveNewSha512HashCallAsts.Count -eq 1 -and
-            $archiveGetFileHashCallAsts.Count -eq 4 -and
+            $archiveGetFileHashCallAsts.Count -eq 3 -and
             $null -ne $archiveHashWorkCallAst -and
             $archiveHashWorkCallAst.Extent.StartOffset -eq $archiveNewSha512HashCallAsts[0].Extent.StartOffset
         ) `
         -Name 'Archive/HashBusinessCallsRemainUnchanged' `
-        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
+        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 3 рази (четвертий виклик був у мертвій Remove-OldBackupSets, видаленій у #335); знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' } }
 
     # Archive (P2-1/P2-5, PR #136 review): рекурсивне впорядкування SFTP-
@@ -24235,6 +24976,14 @@ function Write-BRAVOLog {
         if (Enter-BRAVOSelfTestSection -Name 'Suite/Archive') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Archive.ps1')
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Archive' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    # BackupScope: бекап лише наявних компонентів (рішення власника 2026-10-01).
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'BackupScope') {
+        Enter-BRAVOSelfTestSuite -Name 'BackupScope'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/BackupScope') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BackupScope.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BackupScope' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'SftpCredentialsRequired') {
@@ -25704,6 +26453,654 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/ConfigRootCleanup') { try {
 
 Remove-BRAVOSelfTestConfigRoot
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/ConfigRootCleanup' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.BuiltinCommandStubsDoNotLeakAcrossSuites') { try {
+
+# #337: guard канонічної ізоляції suite. Перевіряється ФАКТИЧНА резолюція
+# команд (Get-Command: CommandType + модуль + ScriptBlock) до і після
+# справжнього проходу знімок -> Restore-BRAVOSelfTestSuiteIsolation (той
+# самий, що Enter/Complete-BRAVOSelfTestSection викликають для кожного
+# 'Suite/*'; проба не може бути справжньою секцією 'Suite/*' — такі секції
+# мусять мати фрагмент каталогу), а не текст коду. Проба-suite створює заглушки вбудованих команд трьома
+# шляхами, що колись витікали: New-BRAVOSelfTestRuntimeModule, голий
+# New-Module і global-аліас. Усередині suite заглушки МАЮТЬ діяти (інакше
+# проба нічого не доводить), після закриття suite — жодної.
+$leakProbeBuiltinNames = @(
+    'Get-Service', 'Start-Service', 'Stop-Service', 'Get-Process', 'Stop-Process',
+    'Invoke-WebRequest', 'Start-Sleep', 'Get-CimInstance', 'Get-WmiObject', 'Start-Process'
+)
+$leakProbeBeforeStates = @{}
+foreach ($leakProbeName in ($leakProbeBuiltinNames + @('Invoke-RestMethod', 'Get-Date'))) {
+    $leakProbeBeforeStates[$leakProbeName] = Get-BRAVOSelfTestBuiltinCommandState -Name $leakProbeName
+}
+$leakProbeSourceText = [string]::Join("`n", @($leakProbeBuiltinNames | ForEach-Object { "function $_ { 'leaked-stub' }" }))
+$leakProbeActiveDuringSuite = @()
+$leakProbeBuiltinInSuiteStillCallable = $false
+$leakProbeIsolationSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+$leakProbeResidualProblems = @()
+try {
+    $leakProbeModule = New-BRAVOSelfTestRuntimeModule -SourceText $leakProbeSourceText -FunctionNames $leakProbeBuiltinNames
+    [void](New-Module -ScriptBlock { function Invoke-RestMethod { 'leaked-stub' } })
+    Set-Alias -Name 'Get-Date' -Value 'Get-Process' -Scope Global
+    $leakProbeActiveDuringSuite = @(
+        $leakProbeBuiltinNames + @('Invoke-RestMethod', 'Get-Date') | Where-Object {
+            $leakProbeNowCommand = Get-Command -Name $_ -ErrorAction SilentlyContinue | Select-Object -First 1
+            $null -ne $leakProbeNowCommand -and
+            $leakProbeNowCommand.CommandType -in @([Management.Automation.CommandTypes]::Function, [Management.Automation.CommandTypes]::Alias)
+        }
+    )
+    # заглушка suite-модуля лишається робочою ВЕСЬ suite (кілька секцій
+    # одного suite можуть ділити модуль)
+    $leakProbeBuiltinInSuiteStillCallable = ((& $leakProbeModule { Start-Sleep }) -eq 'leaked-stub')
+} finally {
+    $leakProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $leakProbeIsolationSnapshot -Label 'Framework.StubLeakProbe')
+}
+
+$leakProbeLeakedNames = @(
+    foreach ($leakProbeName in $leakProbeBeforeStates.Keys) {
+        $leakProbeAfterState = Get-BRAVOSelfTestBuiltinCommandState -Name $leakProbeName
+        if (-not (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $leakProbeBeforeStates[$leakProbeName] -Right $leakProbeAfterState)) {
+            '{0} ({1} -> {2})' -f $leakProbeName, $leakProbeBeforeStates[$leakProbeName].Key, $leakProbeAfterState.Key
+        }
+    }
+)
+Test-BRAVOCondition -Condition (
+    $leakProbeActiveDuringSuite.Count -eq ($leakProbeBuiltinNames.Count + 2) -and
+    $leakProbeBuiltinInSuiteStillCallable
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ProbeStubsActiveInsideSuite' `
+    -Failure "проба-suite має реально затінити вбудовані команди (активні: $($leakProbeActiveDuringSuite -join ', ')); інакше guard нічого не доводить"
+# Проводка: dispatcher справді викликає знімок/відновлення на межах suite.
+$leakProbeEnterText = (Get-Command -Name 'Enter-BRAVOSelfTestSection' -CommandType Function).ScriptBlock.ToString()
+$leakProbeCompleteText = (Get-Command -Name 'Complete-BRAVOSelfTestSection' -CommandType Function).ScriptBlock.ToString()
+Test-BRAVOCondition -Condition (
+    $leakProbeEnterText.Contains('New-BRAVOSelfTestSuiteIsolationSnapshot') -and
+    $leakProbeCompleteText.Contains('Restore-BRAVOSelfTestSuiteIsolation')
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation' `
+    -Failure "Enter/Complete-BRAVOSelfTestSection мають знімати і відновлювати ізоляцію на межах 'Suite/*'"
+Test-BRAVOCondition -Condition ($leakProbeLeakedNames.Count -eq 0 -and $leakProbeResidualProblems.Count -eq 0) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites' `
+    -Failure "після закриття suite вбудовані команди мають резолвитися як до нього; витекло: $($leakProbeLeakedNames -join '; ')"
+
+# Codex P1 на #340: suite може затінити й ті cmdlet-и, якими реалізоване саме
+# відновлення (Get-Item, Remove-Item, Set-Item, Get-ChildItem, Remove-Module,
+# New-Object, Write-Host). Restore має їх зняти, а не працювати через
+# заглушки: Get-Item-заглушка, що повертає $null, раніше давала хибне
+# «нічого не затінено», і заглушки лишались. Перевірка незалежна від
+# Get-BRAVOSelfTestBuiltinCommandState: модуль-кваліфікований Get-Command.
+$primitiveProbeNames = @('Get-Item', 'Remove-Item', 'Set-Item', 'Get-ChildItem', 'Remove-Module', 'New-Object', 'Write-Host')
+$primitiveProbeShadowCount = {
+    param([string[]]$Names)
+    @($Names | Where-Object {
+        $null -ne (Microsoft.PowerShell.Core\Get-Command -Name $_ -CommandType Function, Alias -ErrorAction SilentlyContinue)
+    }).Count
+}
+$primitiveProbeBeforeCount = & $primitiveProbeShadowCount $primitiveProbeNames
+# Незалежне від перевірюваного Restore прибирання: лише записи global, яких не
+# було до проби, і лише модуль-кваліфікованими cmdlet-ами.
+$primitiveProbePreexisting = @{}
+foreach ($primitiveProbeName in $primitiveProbeNames) {
+    foreach ($primitiveProbeDrive in @('function', 'alias')) {
+        $primitiveProbePreexisting[$primitiveProbeDrive + ':' + $primitiveProbeName] =
+            $null -ne (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ($primitiveProbeDrive + ':' + $primitiveProbeName))
+    }
+}
+$primitiveProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+$primitiveProbeDuringCount = -1
+$primitiveProbeResidualProblems = @()
+try {
+    [void](New-Module -ScriptBlock {
+        function Get-Item { $null }
+        function Remove-Item { }
+        function Set-Item { }
+        function Get-ChildItem { }
+        function Remove-Module { }
+        function New-Object { throw 'stub New-Object' }
+    })
+    Set-Alias -Name 'Write-Host' -Value 'Out-Null' -Scope Global
+    $primitiveProbeDuringCount = & $primitiveProbeShadowCount $primitiveProbeNames
+} finally {
+    try {
+        $primitiveProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $primitiveProbeSnapshot -Label 'Framework.PrimitiveShadowProbe')
+    } finally {
+        foreach ($primitiveProbeKey in @($primitiveProbePreexisting.Keys)) {
+            if (-not $primitiveProbePreexisting[$primitiveProbeKey]) {
+                Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path $primitiveProbeKey
+            }
+        }
+    }
+}
+$primitiveProbeAfterCount = & $primitiveProbeShadowCount $primitiveProbeNames
+# Кожне ім'я під час проби затінене (наявне затінення до проби рахується
+# тим самим одним збігом), після — як до неї.
+Test-BRAVOCondition -Condition (
+    $primitiveProbeDuringCount -eq $primitiveProbeNames.Count -and
+    $primitiveProbeAfterCount -eq $primitiveProbeBeforeCount -and
+    $primitiveProbeResidualProblems.Count -eq 0
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.RestorerPrimitivesShadowed' `
+    -Failure ("затінені cmdlet-и самого відновлення мають бути зняті: до {0}, під час {1} (очікувано {2}), після {3}; залишки: {4}" -f
+        $primitiveProbeBeforeCount, $primitiveProbeDuringCount, $primitiveProbeNames.Count, $primitiveProbeAfterCount,
+        [string]::Join('; ', [string[]]$primitiveProbeResidualProblems))
+
+# Codex P2 на #340 (1): функція, що з'явилась під уже наявним аліасом, теж
+# змінює стан і знімається; аліас лишається. Раніше стан фіксував лише
+# «переможний» аліас, і прихована функція витікала.
+$hiddenProbeName = 'Get-Date'
+$hiddenProbeHadAlias = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $hiddenProbeName) -ErrorAction SilentlyContinue)
+$hiddenProbeAliasAdded = $false
+$hiddenProbeFunctionPreexisting = $null -ne (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $hiddenProbeName))
+$hiddenProbeResidualProblems = @()
+$hiddenProbeFunctionDuring = $false
+try {
+    if (-not $hiddenProbeHadAlias) {
+        Set-Alias -Name $hiddenProbeName -Value 'Microsoft.PowerShell.Utility\Get-Date' -Scope Global
+        $hiddenProbeAliasAdded = $true
+    }
+    $hiddenProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+    try {
+        [void](New-Module -ScriptBlock { function Get-Date { 'hidden-stub' } })
+        $hiddenProbeFunctionDuring = Test-Path -LiteralPath ('function:' + $hiddenProbeName)
+    } finally {
+        $hiddenProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $hiddenProbeSnapshot -Label 'Framework.HiddenFunctionProbe')
+    }
+    $hiddenProbeFunctionAfter = Test-Path -LiteralPath ('function:' + $hiddenProbeName)
+    $hiddenProbeAliasAfter = Test-Path -LiteralPath ('alias:' + $hiddenProbeName)
+} finally {
+    if (-not $hiddenProbeFunctionPreexisting) {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $hiddenProbeName)
+    }
+    if ($hiddenProbeAliasAdded) {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('alias:' + $hiddenProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $hiddenProbeFunctionDuring -and -not $hiddenProbeFunctionAfter -and $hiddenProbeAliasAfter -and
+    $hiddenProbeResidualProblems.Count -eq 0
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FunctionHiddenBehindAliasRemoved' `
+    -Failure ("функція під наявним аліасом має бути знята, аліас — лишитись: під час={0}, функція після={1}, аліас після={2}, залишки: {3}" -f
+        $hiddenProbeFunctionDuring, $hiddenProbeFunctionAfter, $hiddenProbeAliasAfter, [string]::Join('; ', [string[]]$hiddenProbeResidualProblems))
+
+# Codex P2 на #340 (2): запис реєстру, прибирання якого кинуло, не
+# позначається Cleaned, тож фінальний прохід повторить його.
+$failedCleanupEntry = [pscustomobject]@{ Module = [pscustomobject]@{ Name = ('probe-' + [guid]::NewGuid().ToString('N')) }; FunctionNames = @() }
+$failedCleanupIndex = $script:BRAVOSelfTestOwnedRuntimeModules.Count
+[void]$script:BRAVOSelfTestOwnedRuntimeModules.Add($failedCleanupEntry)
+$failedCleanupThrew = $false
+try {
+    Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $failedCleanupIndex
+} catch {
+    $failedCleanupThrew = $true
+} finally {
+    $script:BRAVOSelfTestOwnedRuntimeModules.RemoveAt($failedCleanupIndex)
+}
+$failedCleanupMarked = $null -ne $failedCleanupEntry.PSObject.Properties['Cleaned'] -and [bool]$failedCleanupEntry.Cleaned
+Test-BRAVOCondition -Condition ($failedCleanupThrew -and -not $failedCleanupMarked) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FailedCleanupNotMarkedCleaned' `
+    -Failure "невдале прибирання runtime-модуля має повідомити про збій і лишити запис для повтору (кинуло=$failedCleanupThrew, Cleaned=$failedCleanupMarked)"
+
+# Codex P2 на #340 (3): аліас повертається з початковими Options і
+# Description, а не як стандартний записуваний аліас.
+$aliasMetaProbeName = 'Send-MailMessage'
+$aliasMetaProbeRestored = $null
+$aliasMetaProbeResidualProblems = @()
+$aliasMetaProbePreexisting = $null -ne (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('alias:' + $aliasMetaProbeName))
+if (-not $aliasMetaProbePreexisting) {
+    try {
+        Microsoft.PowerShell.Utility\Set-Alias -Name $aliasMetaProbeName -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Global `
+            -Option ReadOnly -Description 'probe-alias-meta' -Force
+        $aliasMetaProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        try {
+            Microsoft.PowerShell.Utility\Set-Alias -Name $aliasMetaProbeName -Value 'Out-Null' -Scope Global -Option None -Description '' -Force
+        } finally {
+            $aliasMetaProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $aliasMetaProbeSnapshot -Label 'Framework.AliasMetadataProbe')
+        }
+        $aliasMetaProbeRestored = Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('alias:' + $aliasMetaProbeName)
+    } finally {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('alias:' + $aliasMetaProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $aliasMetaProbePreexisting -or (
+        $null -ne $aliasMetaProbeRestored -and
+        [string]$aliasMetaProbeRestored.Definition -eq 'Microsoft.PowerShell.Utility\Write-Output' -and
+        (($aliasMetaProbeRestored.Options -band [Management.Automation.ScopedItemOptions]::ReadOnly) -ne 0) -and
+        [string]$aliasMetaProbeRestored.Description -eq 'probe-alias-meta' -and
+        $aliasMetaProbeResidualProblems.Count -eq 0)
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.AliasMetadataRestored' `
+    -Failure ("аліас має повернутися з початковими Options/Description: {0}; залишки: {1}" -f
+        $(if ($null -ne $aliasMetaProbeRestored) { '{0} [{1}] "{2}"' -f $aliasMetaProbeRestored.Definition, $aliasMetaProbeRestored.Options, $aliasMetaProbeRestored.Description } else { 'аліаса немає' }),
+        [string]::Join('; ', [string[]]$aliasMetaProbeResidualProblems))
+
+# Codex P2 на #340 (5): глобальна функція повертається з початковими Options.
+$functionOptionsProbeName = 'Restart-Service'
+$functionOptionsProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $functionOptionsProbeName) -ErrorAction SilentlyContinue)
+$functionOptionsProbeRestored = $null
+$functionOptionsProbeResidualProblems = @()
+if (-not $functionOptionsProbePreexisting) {
+    try {
+        Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $functionOptionsProbeName) -Value { 'baseline-readonly' } -Force
+        (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $functionOptionsProbeName)).Options = [Management.Automation.ScopedItemOptions]::ReadOnly
+        $functionOptionsProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        try {
+            Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $functionOptionsProbeName)
+            [void](New-Module -ScriptBlock { function Restart-Service { 'stub' } })
+        } finally {
+            $functionOptionsProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $functionOptionsProbeSnapshot -Label 'Framework.FunctionOptionsProbe')
+        }
+        $functionOptionsProbeRestored = Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $functionOptionsProbeName)
+    } finally {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $functionOptionsProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $functionOptionsProbePreexisting -or (
+        $null -ne $functionOptionsProbeRestored -and
+        (& $functionOptionsProbeRestored.ScriptBlock) -eq 'baseline-readonly' -and
+        (($functionOptionsProbeRestored.Options -band [Management.Automation.ScopedItemOptions]::ReadOnly) -ne 0) -and
+        $functionOptionsProbeResidualProblems.Count -eq 0)
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FunctionOptionsRestored' `
+    -Failure ("функція має повернутися з початковими Options: {0}; залишки: {1}" -f
+        $(if ($null -ne $functionOptionsProbeRestored) { [string]$functionOptionsProbeRestored.Options } else { 'функції немає' }),
+        [string]::Join('; ', [string[]]$functionOptionsProbeResidualProblems))
+
+# Codex P2 на #340 (6): функція, експортована модулем, повертається як
+# запис того самого модуля (ModuleName збігається), а не відірвана копія.
+# Set-Item з ScriptBlock модуля зберігає прив'язку — guard фіксує це.
+$moduleOwnedProbeName = 'Restart-Service'
+$moduleOwnedProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $moduleOwnedProbeName) -ErrorAction SilentlyContinue)
+$moduleOwnedProbeModuleName = 'BRAVOSelfTestOwnedProbe' + [guid]::NewGuid().ToString('N')
+$moduleOwnedProbeRestored = $null
+$moduleOwnedProbeResidualProblems = @()
+$moduleOwnedProbeModule = $null
+if (-not $moduleOwnedProbePreexisting) {
+    try {
+        $moduleOwnedProbeModule = Microsoft.PowerShell.Core\New-Module -Name $moduleOwnedProbeModuleName -ScriptBlock {
+            function Restart-Service { 'module-owned-baseline' }
+            Export-ModuleMember -Function Restart-Service
+        }
+        Microsoft.PowerShell.Core\Import-Module -ModuleInfo $moduleOwnedProbeModule -Global
+        $moduleOwnedProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        try {
+            Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $moduleOwnedProbeName)
+            [void](New-Module -ScriptBlock { function Restart-Service { 'stub' } })
+        } finally {
+            $moduleOwnedProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $moduleOwnedProbeSnapshot -Label 'Framework.ModuleOwnedFunctionProbe')
+        }
+        $moduleOwnedProbeRestored = Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $moduleOwnedProbeName)
+    } finally {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $moduleOwnedProbeName)
+        if ($null -ne $moduleOwnedProbeModule) { Microsoft.PowerShell.Core\Remove-Module -ModuleInfo $moduleOwnedProbeModule -Force -ErrorAction SilentlyContinue }
+    }
+}
+Test-BRAVOCondition -Condition (
+    $moduleOwnedProbePreexisting -or (
+        $null -ne $moduleOwnedProbeRestored -and
+        [string]$moduleOwnedProbeRestored.ModuleName -eq $moduleOwnedProbeModuleName -and
+        (& $moduleOwnedProbeRestored.ScriptBlock) -eq 'module-owned-baseline' -and
+        $moduleOwnedProbeResidualProblems.Count -eq 0)
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ModuleOwnedFunctionRestored' `
+    -Failure ("функція модуля має повернутися як запис цього модуля: ModuleName={0}; залишки: {1}" -f
+        $(if ($null -ne $moduleOwnedProbeRestored) { [string]$moduleOwnedProbeRestored.ModuleName } else { 'функції немає' }),
+        [string]::Join('; ', [string[]]$moduleOwnedProbeResidualProblems))
+
+# Codex P2 на #340 (7): AllScope-аліас. Читання global щоразу новим
+# модулем бачить актуальну копію, тож заміну помічено; якщо точне
+# відновлення неможливе, це видимий залишок, а не тихий успіх.
+$allScopeProbeName = 'Stop-Service'
+$allScopeProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $allScopeProbeName) -ErrorAction SilentlyContinue)
+$allScopeProbeDefinitionAfter = ''
+$allScopeProbeResidualProblems = @()
+$allScopeProbeSnapshotKey = ''
+if (-not $allScopeProbePreexisting) {
+    try {
+        Microsoft.PowerShell.Utility\Set-Alias -Name $allScopeProbeName -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Global -Option AllScope -Force
+        $allScopeProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        $allScopeProbeSnapshotKey = $allScopeProbeSnapshot.CommandStates[$allScopeProbeName].Key
+        try {
+            Microsoft.PowerShell.Utility\Set-Alias -Name $allScopeProbeName -Value 'Out-Null' -Scope Global -Option AllScope -Force
+        } finally {
+            # Залишок цієї проби — очікуваний сигнал, не збій прогону.
+            $allScopeProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $allScopeProbeSnapshot -Label 'Framework.AllScopeAliasProbe' -NoFailureRegistration)
+        }
+        $allScopeProbeAfterItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $allScopeProbeName) -ErrorAction SilentlyContinue
+        if ($null -ne $allScopeProbeAfterItem) { $allScopeProbeDefinitionAfter = [string]$allScopeProbeAfterItem.Definition }
+    } finally {
+        Microsoft.PowerShell.Utility\Set-Alias -Name $allScopeProbeName -Value 'Out-Null' -Scope Global -Option None -Force -ErrorAction SilentlyContinue
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('alias:' + $allScopeProbeName) -Force -ErrorAction SilentlyContinue
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('alias:' + $allScopeProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $allScopeProbePreexisting -or (
+        $allScopeProbeSnapshotKey.Contains('Write-Output') -and
+        ($allScopeProbeDefinitionAfter -eq 'Microsoft.PowerShell.Utility\Write-Output' -or $allScopeProbeResidualProblems.Count -gt 0))
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.AllScopeAliasNotSilentlyLeaked' `
+    -Failure ("заміна AllScope-аліаса має бути відновлена або видимо зафіксована: знімок '{0}', після '{1}', залишків {2}" -f
+        $allScopeProbeSnapshotKey, $allScopeProbeDefinitionAfter, $allScopeProbeResidualProblems.Count)
+
+# Codex P2 на #340 (4): global-заглушка (голий New-Module) під уже наявною
+# script-функцією з тим самим ім'ям знімається; script-функція лишається.
+$scopeProbeName = 'Wait-Process'
+$scopeProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $scopeProbeName) -ErrorAction SilentlyContinue)
+$scopeProbeGlobalDuring = $false
+$scopeProbeGlobalAfter = $true
+$scopeProbeScriptAfter = $false
+$scopeProbeResidualProblems = @()
+if (-not $scopeProbePreexisting) {
+    try {
+        Microsoft.PowerShell.Management\Set-Item -LiteralPath ('function:script:' + $scopeProbeName) -Value { 'script-baseline' } -Force
+        $scopeProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        try {
+            [void](New-Module -ScriptBlock { function Wait-Process { 'global-stub' } })
+            $scopeProbeGlobalDuring = $null -ne (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $scopeProbeName))
+        } finally {
+            $scopeProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $scopeProbeSnapshot -Label 'Framework.ScopedFunctionProbe')
+        }
+        # Якщо self-test запущено через -File, script-область і є global:
+        # тоді «global після» — це та сама відновлена script-функція.
+        $scopeProbeNearestAfter = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $scopeProbeName) -ErrorAction SilentlyContinue
+        $scopeProbeGlobalAfterItem = Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $scopeProbeName)
+        $scopeProbeGlobalAfter = $null -ne $scopeProbeGlobalAfterItem -and -not (
+            $null -ne $scopeProbeNearestAfter -and [object]::ReferenceEquals($scopeProbeGlobalAfterItem.ScriptBlock, $scopeProbeNearestAfter.ScriptBlock))
+        $scopeProbeScriptAfter = $null -ne $scopeProbeNearestAfter -and (& $scopeProbeNearestAfter.ScriptBlock) -eq 'script-baseline'
+    } finally {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('function:' + $scopeProbeName) -Force -ErrorAction SilentlyContinue
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $scopeProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $scopeProbePreexisting -or (
+        $scopeProbeGlobalDuring -and -not $scopeProbeGlobalAfter -and $scopeProbeScriptAfter -and
+        $scopeProbeResidualProblems.Count -eq 0)
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.GlobalStubBehindScriptFunctionRemoved' `
+    -Failure ("global-заглушка під script-функцією має бути знята: під час={0}, global після={1}, script після={2}; залишки: {3}" -f
+        $scopeProbeGlobalDuring, $scopeProbeGlobalAfter, $scopeProbeScriptAfter, [string]::Join('; ', [string[]]$scopeProbeResidualProblems))
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.BuiltinCommandStubsDoNotLeakAcrossSuites' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteIsolationPrivateAndImmutableSnapshot') { try {
+
+# #350: поведінкові проби ізоляції suite для записів з опцією Private і для
+# незмінності знімка функцій. Кожен випадок — справжній прохід знімок ->
+# дія suite -> Restore-BRAVOSelfTestSuiteIsolation (той самий, що
+# Enter/Complete-BRAVOSelfTestSection викликають для 'Suite/*'), прибирання
+# в finally навіть після винятку. Опис дії та перевірки виконуються dot-source
+# на рівні script-області: лише звідти видно її Private-записи, і саме туди
+# dot-source пише suite-фрагменти. Ім'я, зайняте до проби, — FAIL, а не
+# тихий пропуск: інакше проба нічого не доводила б. Імена — лише справжні
+# cmdlet-и в Windows PowerShell 5.1 і 7 (Get-FileHash, наприклад, у 5.1 —
+# функція модуля Microsoft.PowerShell.Utility, тож ім'я вже зайняте).
+$suiteIsolationCaseCleanup = {
+    param([string[]]$SuiteIsolationCleanupNames)
+    $suiteIsolationCleanupAccess = Get-BRAVOSelfTestSessionScopeAccess
+    foreach ($suiteIsolationCleanupName in $SuiteIsolationCleanupNames) {
+        foreach ($suiteIsolationCleanupKind in @('Function', 'Alias')) {
+            foreach ($suiteIsolationCleanupScope in @('Script', 'Global')) {
+                Remove-BRAVOSelfTestScopedCommandItem -Access $suiteIsolationCleanupAccess -Scope $suiteIsolationCleanupScope `
+                    -Kind $suiteIsolationCleanupKind -Name $suiteIsolationCleanupName
+            }
+        }
+    }
+}
+$suiteIsolationCaseRun = {
+    param(
+        [string]$SuiteIsolationCaseName,
+        [string[]]$SuiteIsolationCaseCommands,
+        [scriptblock]$SuiteIsolationCaseArrange,
+        [scriptblock]$SuiteIsolationCaseAct,
+        [scriptblock]$SuiteIsolationCaseVerify,
+        [bool]$SuiteIsolationCaseActThrows = $false
+    )
+    $suiteIsolationCaseCommand = $SuiteIsolationCaseCommands[0]
+    $suiteIsolationCaseOccupied = @(
+        foreach ($suiteIsolationOccupiedName in $SuiteIsolationCaseCommands) {
+            $suiteIsolationOccupiedState = Get-BRAVOSelfTestBuiltinCommandState -Name $suiteIsolationOccupiedName
+            if ($suiteIsolationOccupiedState.Key -ne '<none>') { $suiteIsolationOccupiedName + ' (' + $suiteIsolationOccupiedState.Key + ')' }
+        })
+    $suiteIsolationCaseResidual = @()
+    $suiteIsolationCaseProblem = ''
+    $suiteIsolationCaseThrew = $false
+    $suiteIsolationCaseThrowMessage = ''
+    if ($suiteIsolationCaseOccupied.Count -eq 0) {
+        try {
+            . $SuiteIsolationCaseArrange
+            $suiteIsolationCaseSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+            try {
+                . $SuiteIsolationCaseAct
+            } catch {
+                $suiteIsolationCaseThrew = $true
+                $suiteIsolationCaseThrowMessage = $_.Exception.Message
+            } finally {
+                $suiteIsolationCaseResidual = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $suiteIsolationCaseSnapshot `
+                        -Label ('Framework.' + $SuiteIsolationCaseName) -NoFailureRegistration)
+            }
+            $suiteIsolationCaseProblem = [string]::Join('; ', [string[]]@(. $SuiteIsolationCaseVerify | Where-Object { -not [string]::IsNullOrEmpty([string]$_) }))
+        } catch {
+            $suiteIsolationCaseProblem = 'виняток проби: ' + $_.Exception.Message
+        } finally {
+            . $suiteIsolationCaseCleanup $SuiteIsolationCaseCommands
+        }
+    }
+    Test-BRAVOCondition -Condition (
+        $suiteIsolationCaseOccupied.Count -eq 0 -and $suiteIsolationCaseThrew -eq $SuiteIsolationCaseActThrows -and
+        $suiteIsolationCaseResidual.Count -eq 0 -and $suiteIsolationCaseProblem -eq ''
+    ) `
+        -Name ('Framework/SuiteIsolation.' + $SuiteIsolationCaseName) `
+        -Failure ("зайняті до проби: [{0}]; виняток дії: {1} (очікувано {2}) {3}; залишки Restore: [{4}]; перевірка: [{5}]" -f
+            [string]::Join(', ', [string[]]$suiteIsolationCaseOccupied), $suiteIsolationCaseThrew, $SuiteIsolationCaseActThrows,
+            $suiteIsolationCaseThrowMessage, [string]::Join('; ', [string[]]$suiteIsolationCaseResidual), $suiteIsolationCaseProblem)
+}
+# Перевірка запису функції/аліаса прямо в таблиці області (видно і Private);
+# викликаються через &, щоб не засмічувати script-область.
+$suiteIsolationCheckFunction = {
+    param([string]$SuiteIsolationCheckScope, [string]$SuiteIsolationCheckName, $SuiteIsolationExpectedBlock, [string]$SuiteIsolationExpectedOption)
+    $suiteIsolationCheckItem = Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+        -Scope $SuiteIsolationCheckScope -Kind Function -Name $SuiteIsolationCheckName
+    if ($null -eq $suiteIsolationCheckItem) { return "$SuiteIsolationCheckScope-функції $SuiteIsolationCheckName немає" }
+    if ((& $suiteIsolationCheckItem.ScriptBlock) -ne 'ORIGINAL') { return "$SuiteIsolationCheckScope-функція повертає '$(& $suiteIsolationCheckItem.ScriptBlock)'" }
+    if (-not [object]::ReferenceEquals($suiteIsolationCheckItem.ScriptBlock, $SuiteIsolationExpectedBlock)) { return "$SuiteIsolationCheckScope-функція має не початковий ScriptBlock" }
+    if ([string]$suiteIsolationCheckItem.Options -ne $SuiteIsolationExpectedOption) { return "$SuiteIsolationCheckScope-функція має Options '$($suiteIsolationCheckItem.Options)' замість '$SuiteIsolationExpectedOption'" }
+}
+$suiteIsolationCheckAlias = {
+    param([string]$SuiteIsolationCheckScope, [string]$SuiteIsolationCheckName, [string]$SuiteIsolationExpectedOption)
+    $suiteIsolationCheckItem = Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+        -Scope $SuiteIsolationCheckScope -Kind Alias -Name $SuiteIsolationCheckName
+    if ($null -eq $suiteIsolationCheckItem) { return "$SuiteIsolationCheckScope-аліаса $SuiteIsolationCheckName немає" }
+    if ([string]$suiteIsolationCheckItem.Definition -ne 'Microsoft.PowerShell.Utility\Write-Output' -or
+        [string]$suiteIsolationCheckItem.Description -ne 'probe-350' -or
+        [string]$suiteIsolationCheckItem.Options -ne $SuiteIsolationExpectedOption) {
+        return ("$SuiteIsolationCheckScope-аліас: {0} [{1}] '{2}'" -f $suiteIsolationCheckItem.Definition, $suiteIsolationCheckItem.Options, $suiteIsolationCheckItem.Description)
+    }
+}
+# Залежно від запуску (-File чи ні) script-область може бути глобальною:
+# тоді «script»-запис живе в Global-таблиці.
+$suiteIsolationScriptTable = if ($null -eq (Get-BRAVOSelfTestSessionScopeAccess).Script) { 'Global' } else { 'Script' }
+$suiteIsolationArrangeScriptFunction = {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:script:' + $suiteIsolationCaseCommand) -Value { 'ORIGINAL' } -Force
+    $suiteIsolationOriginalItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $suiteIsolationCaseCommand)
+    $suiteIsolationOriginalItem.Options = [Management.Automation.ScopedItemOptions]::Private
+    $suiteIsolationOriginalBlock = $suiteIsolationOriginalItem.ScriptBlock
+}
+$suiteIsolationArrangeScriptAlias = {
+    Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Script `
+        -Option Private -Description 'probe-350' -Force
+}
+$suiteIsolationArrangeGlobalFunction = {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'ORIGINAL' } -Force
+    $suiteIsolationOriginalBlock = (Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+            -Scope Global -Kind Function -Name $suiteIsolationCaseCommand).ScriptBlock
+}
+$suiteIsolationArrangeGlobalAlias = {
+    Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Global `
+        -Description 'probe-350' -Force
+}
+$suiteIsolationHiddenFromChild = {
+    # Private зберігся: з дочірньої області (цей блок викликається через &)
+    # запис не видно.
+    param([string]$SuiteIsolationHiddenPath)
+    if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $SuiteIsolationHiddenPath) { return "$SuiteIsolationHiddenPath видно з дочірньої області — Private втрачено" }
+}
+$suiteIsolationAbsent = {
+    foreach ($suiteIsolationAbsentName in $SuiteIsolationCaseCommands) {
+        $suiteIsolationAbsentState = Get-BRAVOSelfTestBuiltinCommandState -Name $suiteIsolationAbsentName
+        if ($suiteIsolationAbsentState.Key -ne '<none>') { "$suiteIsolationAbsentName лишився: $($suiteIsolationAbsentState.Key)" }
+    }
+}
+
+# --- Private-записи (дефект 1) -------------------------------------------
+. $suiteIsolationCaseRun 'PrivateScriptFunctionOverwritten' @('Test-Connection') $suiteIsolationArrangeScriptFunction {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:script:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+} {
+    & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+    if ($suiteIsolationScriptTable -eq 'Script') { & $suiteIsolationHiddenFromChild ('function:' + $suiteIsolationCaseCommand) }
+}
+. $suiteIsolationCaseRun 'PrivateScriptFunctionRemoved' @('Move-Item') $suiteIsolationArrangeScriptFunction {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('function:' + $suiteIsolationCaseCommand) -Force
+} {
+    & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+}
+. $suiteIsolationCaseRun 'PrivateScriptAliasOverwritten' @('Wait-Process') $suiteIsolationArrangeScriptAlias {
+    Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Out-Null' -Scope Script -Option Private -Force
+} {
+    & $suiteIsolationCheckAlias $suiteIsolationScriptTable $suiteIsolationCaseCommand 'Private'
+    if ($suiteIsolationScriptTable -eq 'Script') { & $suiteIsolationHiddenFromChild ('alias:' + $suiteIsolationCaseCommand) }
+}
+. $suiteIsolationCaseRun 'PrivateScriptAliasRemoved' @('Invoke-RestMethod') $suiteIsolationArrangeScriptAlias {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('alias:' + $suiteIsolationCaseCommand) -Force
+} {
+    & $suiteIsolationCheckAlias $suiteIsolationScriptTable $suiteIsolationCaseCommand 'Private'
+}
+. $suiteIsolationCaseRun 'PrivateGlobalFunctionAndAliasRestored' @('Resolve-Path', 'Get-ItemProperty') {
+    . $suiteIsolationArrangeGlobalFunction
+    (Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) -Scope Global -Kind Function `
+        -Name $suiteIsolationCaseCommand).Options = [Management.Automation.ScopedItemOptions]::Private
+    Microsoft.PowerShell.Utility\Set-Alias -Name 'Get-ItemProperty' -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Global `
+        -Option Private -Description 'probe-350' -Force
+} {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+    Microsoft.PowerShell.Utility\Set-Alias -Name 'Get-ItemProperty' -Value 'Out-Null' -Scope Global -Option Private -Force
+} {
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+    & $suiteIsolationCheckAlias 'Global' 'Get-ItemProperty' 'Private'
+}
+
+# --- Матриця функцій і аліасів -------------------------------------------
+. $suiteIsolationCaseRun 'ExistingFunctionOverwritten' @('Get-ItemProperty') $suiteIsolationArrangeGlobalFunction {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+} {
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'None'
+}
+. $suiteIsolationCaseRun 'ExistingFunctionRemoved' @('Set-ItemProperty') $suiteIsolationArrangeGlobalFunction {
+    Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $suiteIsolationCaseCommand)
+} {
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'None'
+}
+. $suiteIsolationCaseRun 'NewFunctionRemoved' @('Test-Connection', 'Move-Item') { } {
+    Microsoft.PowerShell.Management\Set-Item -Path 'function:global:Test-Connection' -Value { 'STUB' } -Force
+    Microsoft.PowerShell.Management\Set-Item -Path 'function:script:Move-Item' -Value { 'STUB' } -Force
+} $suiteIsolationAbsent
+. $suiteIsolationCaseRun 'ExistingAliasModified' @('Move-Item') $suiteIsolationArrangeGlobalAlias {
+    Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Out-Null' -Scope Global -Force
+} {
+    & $suiteIsolationCheckAlias 'Global' $suiteIsolationCaseCommand 'None'
+}
+. $suiteIsolationCaseRun 'ExistingAliasRemoved' @('Wait-Process') $suiteIsolationArrangeGlobalAlias {
+    Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('alias:' + $suiteIsolationCaseCommand)
+} {
+    & $suiteIsolationCheckAlias 'Global' $suiteIsolationCaseCommand 'None'
+}
+. $suiteIsolationCaseRun 'NewAliasRemoved' @('Invoke-RestMethod', 'Resolve-Path') { } {
+    Microsoft.PowerShell.Utility\Set-Alias -Name 'Invoke-RestMethod' -Value 'Out-Null' -Scope Global -Force
+    Microsoft.PowerShell.Utility\Set-Alias -Name 'Resolve-Path' -Value 'Out-Null' -Scope Script -Option Private -Force
+} $suiteIsolationAbsent
+
+# --- Динамічні модулі та dot-source suite-фрагмента ----------------------
+. $suiteIsolationCaseRun 'BareNewModuleOverExistingFunction' @('Restart-Service') $suiteIsolationArrangeGlobalFunction {
+    [void](Microsoft.PowerShell.Core\New-Module -ScriptBlock { function Restart-Service { 'STUB' } })
+} {
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'None'
+}
+. $suiteIsolationCaseRun 'DotSourcedSuiteFragmentRemoved' @('Send-MailMessage', 'Set-ItemProperty') { } {
+    . ([scriptblock]::Create("function Send-MailMessage { 'STUB' }`nSet-Alias -Name Set-ItemProperty -Value Out-Null -Option Private"))
+} $suiteIsolationAbsent
+. $suiteIsolationCaseRun 'RuntimeModuleOverPrivateScriptFunction' @('Move-Item') $suiteIsolationArrangeScriptFunction {
+    [void](New-BRAVOSelfTestRuntimeModule -SourceText "function Move-Item { 'STUB' }" -FunctionNames @('Move-Item'))
+} {
+    & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+    if ($suiteIsolationScriptTable -eq 'Script' -and $null -ne (Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+                -Scope Global -Kind Function -Name $suiteIsolationCaseCommand)) { 'global-заглушка runtime-модуля лишилась' }
+}
+
+# --- Виняток у suite: відновлення все одно відбувається (finally) ---------
+. $suiteIsolationCaseRun 'CleanupAfterSuiteException' @('Test-Connection', 'Restart-Service') $suiteIsolationArrangeScriptFunction {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:script:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+    [void](Microsoft.PowerShell.Core\New-Module -ScriptBlock { function Restart-Service { 'STUB' } })
+    throw (Microsoft.PowerShell.Utility\New-Object System.IO.InvalidDataException 'probe-350-suite-fault')
+} {
+    & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+    if ((Get-BRAVOSelfTestBuiltinCommandState -Name 'Restart-Service').Key -ne '<none>') { 'заглушка Restart-Service лишилась' }
+} $true
+
+# --- Незмінний знімок функцій (дефект 2) ---------------------------------
+# Перевизначення наявної функції змінює той самий FunctionInfo на місці;
+# знімок із живими FunctionInfo віддав би при відновленні вже 'STUB'. Options
+# = Private: з ReadOnly Set-Item -Force створює новий об'єкт, а не змінює
+# наявний, і проба не відтворювала б дефект.
+. $suiteIsolationCaseRun 'FunctionSnapshotNotLiveFunctionInfo' @('Test-BRAVOSelfTestIsolation350Original') {
+    . $suiteIsolationArrangeGlobalFunction
+    $suiteIsolationLiveInfo = Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+        -Scope Global -Kind Function -Name $suiteIsolationCaseCommand
+    $suiteIsolationLiveInfo.Options = [Management.Automation.ScopedItemOptions]::Private
+} {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+    # Suite прибирає перевизначену функцію, і runtime-модуль ставить власну
+    # заглушку: без цього в Windows PowerShell 5.1 експорт модуля не
+    # витісняє наявну Private-функцію, і відновлення через модуль не
+    # запускалося б.
+    Remove-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) -Scope Global -Kind Function -Name $suiteIsolationCaseCommand
+    [void](New-BRAVOSelfTestRuntimeModule -SourceText "function Test-BRAVOSelfTestIsolation350Original { 'STUB' }" `
+            -FunctionNames @('Test-BRAVOSelfTestIsolation350Original'))
+} {
+    # Непорожність: живий FunctionInfo справді змінився на місці.
+    if ((& $suiteIsolationLiveInfo.ScriptBlock) -ne 'STUB') { 'живий FunctionInfo не змінився — проба нічого не доводить' }
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+}
+
+# --- Поведінковий guard вбудованих команд проти Private-заглушок ----------
+# Резолюція (CommandType + Source) кожного імені після suite така сама, як до.
+$suiteIsolationBuiltinNames = @(
+    'Get-Service', 'Start-Service', 'Stop-Service', 'Get-Process', 'Stop-Process',
+    'Start-Sleep', 'Invoke-WebRequest', 'Get-CimInstance', 'Get-WmiObject', 'Start-Process'
+)
+$suiteIsolationResolution = {
+    @(foreach ($suiteIsolationResolvedName in $suiteIsolationBuiltinNames) {
+            $suiteIsolationResolved = Microsoft.PowerShell.Core\Get-Command -Name $suiteIsolationResolvedName -ErrorAction SilentlyContinue |
+                Microsoft.PowerShell.Utility\Select-Object -First 1
+            if ($null -eq $suiteIsolationResolved) { $suiteIsolationResolvedName + '=<none>' } else {
+                '{0}={1}|{2}' -f $suiteIsolationResolvedName, $suiteIsolationResolved.CommandType, $suiteIsolationResolved.Source }
+        })
+}
+$suiteIsolationResolutionBefore = [string]::Join(', ', [string[]](. $suiteIsolationResolution))
+. $suiteIsolationCaseRun 'PrivateBuiltinStubsDoNotLeak' $suiteIsolationBuiltinNames { } {
+    foreach ($suiteIsolationStubName in $suiteIsolationBuiltinNames) {
+        Microsoft.PowerShell.Management\Set-Item -Path ('function:script:' + $suiteIsolationStubName) -Value { 'leaked-stub' } -Force
+        (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $suiteIsolationStubName)).Options = [Management.Automation.ScopedItemOptions]::Private
+    }
+    $suiteIsolationStubsActive = @($suiteIsolationBuiltinNames | Where-Object {
+            $null -ne (Microsoft.PowerShell.Core\Get-Command -Name $_ -CommandType Function -ErrorAction SilentlyContinue) }).Count
+} {
+    if ($suiteIsolationStubsActive -ne $suiteIsolationBuiltinNames.Count) {
+        "заглушки мали діяти всередині suite: активних $suiteIsolationStubsActive з $($suiteIsolationBuiltinNames.Count)"
+    }
+    $suiteIsolationResolutionAfter = [string]::Join(', ', [string[]](. $suiteIsolationResolution))
+    if ($suiteIsolationResolutionAfter -ne $suiteIsolationResolutionBefore) { "резолюція до: $suiteIsolationResolutionBefore; після: $suiteIsolationResolutionAfter" }
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteIsolationPrivateAndImmutableSnapshot' } }
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.VariableScopeHeadroom') { try {
 
 # #163: перевірка запасу змінних області. Стеля $MaximumVariableCount
@@ -26654,6 +28051,43 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/PassOmega' -Failure 'n/a'
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Omega' } }
 '@
             }
+            StubIsolation = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Suite/Gamma') { try {
+    Enter-BRAVOSelfTestSuite -Name 'Gamma'
+    [void](New-Module -ScriptBlock { function Start-Sleep { 'stub' }; function Get-Service { 'stub' } })
+    Set-Alias -Name Get-Date -Value Get-Process -Scope Global
+    Test-BRAVOCondition -Condition ((Start-Sleep) -eq 'stub') -Name 'Probe/StubActiveInSuite' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Gamma' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AfterStub') { try {
+    Test-BRAVOCondition -Condition (-not (Test-Path 'function:Start-Sleep') -and -not (Test-Path 'function:Get-Service') -and -not (Test-Path 'alias:Get-Date')) -Name 'Probe/StubGoneAfterSuite' -Failure 'n/a'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterStub' } }
+'@
+                Tail = @'
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Omega') { try {
+Test-BRAVOCondition -Condition $true -Name 'Probe/StubOmega' -Failure 'n/a'
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Omega' } }
+'@
+            }
+            # Перерваний suite, у якого ще й відновлення ізоляції кидає (знімок
+            # без CommandStates): первинний Fault має лишитися, збій
+            # відновлення — окремим FAIL, а не повторною реєстрацією секції.
+            AbortedSuiteCleanupFault = @{
+                Pre  = ''
+                Main = @'
+    if (Enter-BRAVOSelfTestSection -Name 'Suite/Delta') { try {
+    Enter-BRAVOSelfTestSuite -Name 'Delta'
+    $script:BRAVOSelfTestSectionStack[$script:BRAVOSelfTestSectionStack.Count - 1].SuiteIsolation = [pscustomobject]@{ OwnedStartIndex = 0 }
+    throw (New-Object System.IO.InvalidDataException 'probe-primary-fault')
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Delta' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/AfterDelta') { try {
+    $deltaRecord = $script:BRAVOSelfTestSectionIndex['Suite/Delta']
+    Test-BRAVOCondition -Condition ($deltaRecord.Status -eq 'Aborted' -and $deltaRecord.Fault.Message -eq 'probe-primary-fault') -Name 'Probe/PrimaryFaultKept' -Failure ('Fault: ' + $deltaRecord.Fault.Message)
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterDelta' } }
+'@
+                Tail = ''
+            }
             MultiFault = @{
                 Pre  = ''
                 Main = @'
@@ -26887,6 +28321,23 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/TailAfterBoundaryRuns' -Failur
             -Name 'Framework/SectionIsolation.CleanRunPasses' `
             -EnvironmentLimitation (& $isolationRestriction 'Pass') `
             -Failure ('каркас без збоїв має дати код 0 і SELF-TEST PASSED: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'StubIsolation' 0 @('[PASS] Probe/StubActiveInSuite', '[PASS] Probe/StubGoneAfterSuite',
+                'SELF-TEST PASSED') @('SELF-TEST FAILED', 'Framework/SuiteIsolation'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs' `
+            -EnvironmentLimitation (& $isolationRestriction 'StubIsolation') `
+            -Failure ('реальний Enter/Complete для Suite/* має прибрати заглушки вбудованих команд (Start-Sleep, Get-Service, alias Get-Date): ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'AbortedSuiteCleanupFault' 1 @('[PASS] Probe/PrimaryFaultKept',
+                'probe-primary-fault', 'Section/Suite/Delta — відновлення ізоляції після перерваного suite', 'SELF-TEST FAILED') @(
+                'Section/Suite/Delta: перервано винятком [System.Management.Automation.PropertyNotFoundException]'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.AbortedSuiteCleanupFaultKeepsPrimaryFault' `
+            -EnvironmentLimitation (& $isolationRestriction 'AbortedSuiteCleanupFault') `
+            -Failure ('збій відновлення ізоляції після перерваного suite не має перезаписувати первинний виняток: ' + [string]::Join('; ', $isolationProblems))
 
         $isolationProblems = @(& $isolationMismatch 'MultiFault' 1 @('[PASS] Probe/AlphaBefore', '[PASS] Probe/BetaBefore',
                 '[PASS] Probe/GammaBefore', '[PASS] Probe/DeltaRuns', '[PASS] Probe/TailOmegaRuns', 'SELF-TEST FAILED',
