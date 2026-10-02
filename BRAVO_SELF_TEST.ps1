@@ -846,19 +846,21 @@ function Invoke-BRAVOSelfTestGlobalScopeItem {
     # Операція з Alias:/Function: у ГЛОБАЛЬНІЙ області. Scope-кваліфікатор у
     # шляху (function:global:X) Get-Item/Remove-Item не розуміють, тож
     # виконуємо в порожньому динамічному модулі: його ланцюг областей —
-    # модуль -> global, тому найближчий запис і є глобальний.
+    # модуль -> global, тому найближчий запис і є глобальний. Модуль щоразу
+    # новий: AllScope-запис копіюється в нову область у момент її створення,
+    # тож закешований модуль бачив би застарілу копію. Видалити AllScope-запис
+    # з global звідси не вийде (зніметься лише копія) — фінальна перевірка
+    # Restore тоді дає видимий FAIL, а не тихий успіх.
     param(
         [Parameter(Mandatory = $true)][ValidateSet('Get', 'Remove')][string]$Operation,
         [Parameter(Mandatory = $true)][string]$Path
     )
-    if ($null -eq (Microsoft.PowerShell.Utility\Get-Variable -Name 'BRAVOSelfTestGlobalScopeReader' -Scope Script -ErrorAction SilentlyContinue)) {
-        $script:BRAVOSelfTestGlobalScopeReader = Microsoft.PowerShell.Core\New-Module -ScriptBlock { }
-    }
+    $globalScopeReader = Microsoft.PowerShell.Core\New-Module -ScriptBlock { }
     if ($Operation -eq 'Get') {
-        return (& $script:BRAVOSelfTestGlobalScopeReader {
+        return (& $globalScopeReader {
                 param($ItemPath) Microsoft.PowerShell.Management\Get-Item -LiteralPath $ItemPath -ErrorAction SilentlyContinue } $Path)
     }
-    & $script:BRAVOSelfTestGlobalScopeReader {
+    & $globalScopeReader {
         param($ItemPath) Microsoft.PowerShell.Management\Remove-Item -LiteralPath $ItemPath -Force -ErrorAction SilentlyContinue } $Path
 }
 
@@ -951,6 +953,9 @@ function Set-BRAVOSelfTestBuiltinCommandEntry {
     param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Scope, $Entry)
     if ($null -eq $Entry) { return }
     if ($Entry.Kind -eq 'Function') {
+        # ScriptBlock несе свій модуль: відновлена функція модуля лишається
+        # прив'язаною до нього (ModuleName/Module ті самі, див.
+        # ModuleOwnedFunctionRestored).
         Microsoft.PowerShell.Management\Set-Item -Path ('function:' + $Scope.ToLowerInvariant() + ':' + $Name) -Value $Entry.ScriptBlock -Force
         # Options (ReadOnly/AllScope/Private) Set-Item не переносить —
         # повернути їх на щойно відновленій функції.
@@ -992,7 +997,10 @@ function Restore-BRAVOSelfTestSuiteIsolation {
     # (порожній = ізоляцію відновлено); невдача також реєструється як FAIL.
     param(
         [Parameter(Mandatory = $true)]$Snapshot,
-        [string]$Label = 'suite'
+        [string]$Label = 'suite',
+        # Лише для проб, що свідомо перевіряють видимий залишок: повертає
+        # його, не реєструючи FAIL прогону.
+        [switch]$NoFailureRegistration
     )
     $residualProblems = Microsoft.PowerShell.Utility\New-Object System.Collections.Generic.List[string]
     try {
@@ -1021,7 +1029,7 @@ function Restore-BRAVOSelfTestSuiteIsolation {
             [void]$residualProblems.Add(("{0}: було {1}, стало {2}" -f $watchedName, $baselineState.Key, $finalState.Key))
         }
     }
-    if ($residualProblems.Count -gt 0) {
+    if ($residualProblems.Count -gt 0 -and -not $NoFailureRegistration) {
         $isolationMessage = ("Framework/SuiteIsolation[{0}] — вбудовані команди не повернуто до стану до suite: {1}" -f
             $Label, [string]::Join('; ', $residualProblems.ToArray()))
         [void]$script:failures.Add($isolationMessage)
@@ -26121,13 +26129,15 @@ try {
     }
 }
 $primitiveProbeAfterCount = & $primitiveProbeShadowCount $primitiveProbeNames
+# Кожне ім'я під час проби затінене (наявне затінення до проби рахується
+# тим самим одним збігом), після — як до неї.
 Test-BRAVOCondition -Condition (
-    $primitiveProbeDuringCount -eq ($primitiveProbeBeforeCount + $primitiveProbeNames.Count) -and
+    $primitiveProbeDuringCount -eq $primitiveProbeNames.Count -and
     $primitiveProbeAfterCount -eq $primitiveProbeBeforeCount -and
     $primitiveProbeResidualProblems.Count -eq 0
 ) `
     -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.RestorerPrimitivesShadowed' `
-    -Failure ("затінені cmdlet-и самого відновлення мають бути зняті: до {0}, під час {1} (очікувано +{2}), після {3}; залишки: {4}" -f
+    -Failure ("затінені cmdlet-и самого відновлення мають бути зняті: до {0}, під час {1} (очікувано {2}), після {3}; залишки: {4}" -f
         $primitiveProbeBeforeCount, $primitiveProbeDuringCount, $primitiveProbeNames.Count, $primitiveProbeAfterCount,
         [string]::Join('; ', [string[]]$primitiveProbeResidualProblems))
 
@@ -26254,6 +26264,83 @@ Test-BRAVOCondition -Condition (
     -Failure ("функція має повернутися з початковими Options: {0}; залишки: {1}" -f
         $(if ($null -ne $functionOptionsProbeRestored) { [string]$functionOptionsProbeRestored.Options } else { 'функції немає' }),
         [string]::Join('; ', [string[]]$functionOptionsProbeResidualProblems))
+
+# Codex P2 на #340 (6): функція, експортована модулем, повертається як
+# запис того самого модуля (ModuleName збігається), а не відірвана копія.
+# Set-Item з ScriptBlock модуля зберігає прив'язку — guard фіксує це.
+$moduleOwnedProbeName = 'Restart-Service'
+$moduleOwnedProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $moduleOwnedProbeName) -ErrorAction SilentlyContinue)
+$moduleOwnedProbeModuleName = 'BRAVOSelfTestOwnedProbe' + [guid]::NewGuid().ToString('N')
+$moduleOwnedProbeRestored = $null
+$moduleOwnedProbeResidualProblems = @()
+$moduleOwnedProbeModule = $null
+if (-not $moduleOwnedProbePreexisting) {
+    try {
+        $moduleOwnedProbeModule = Microsoft.PowerShell.Core\New-Module -Name $moduleOwnedProbeModuleName -ScriptBlock {
+            function Restart-Service { 'module-owned-baseline' }
+            Export-ModuleMember -Function Restart-Service
+        }
+        Microsoft.PowerShell.Core\Import-Module -ModuleInfo $moduleOwnedProbeModule -Global
+        $moduleOwnedProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        try {
+            Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $moduleOwnedProbeName)
+            [void](New-Module -ScriptBlock { function Restart-Service { 'stub' } })
+        } finally {
+            $moduleOwnedProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $moduleOwnedProbeSnapshot -Label 'Framework.ModuleOwnedFunctionProbe')
+        }
+        $moduleOwnedProbeRestored = Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $moduleOwnedProbeName)
+    } finally {
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $moduleOwnedProbeName)
+        if ($null -ne $moduleOwnedProbeModule) { Microsoft.PowerShell.Core\Remove-Module -ModuleInfo $moduleOwnedProbeModule -Force -ErrorAction SilentlyContinue }
+    }
+}
+Test-BRAVOCondition -Condition (
+    $moduleOwnedProbePreexisting -or (
+        $null -ne $moduleOwnedProbeRestored -and
+        [string]$moduleOwnedProbeRestored.ModuleName -eq $moduleOwnedProbeModuleName -and
+        (& $moduleOwnedProbeRestored.ScriptBlock) -eq 'module-owned-baseline' -and
+        $moduleOwnedProbeResidualProblems.Count -eq 0)
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ModuleOwnedFunctionRestored' `
+    -Failure ("функція модуля має повернутися як запис цього модуля: ModuleName={0}; залишки: {1}" -f
+        $(if ($null -ne $moduleOwnedProbeRestored) { [string]$moduleOwnedProbeRestored.ModuleName } else { 'функції немає' }),
+        [string]::Join('; ', [string[]]$moduleOwnedProbeResidualProblems))
+
+# Codex P2 на #340 (7): AllScope-аліас. Читання global щоразу новим
+# модулем бачить актуальну копію, тож заміну помічено; якщо точне
+# відновлення неможливе, це видимий залишок, а не тихий успіх.
+$allScopeProbeName = 'Stop-Service'
+$allScopeProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $allScopeProbeName) -ErrorAction SilentlyContinue)
+$allScopeProbeDefinitionAfter = ''
+$allScopeProbeResidualProblems = @()
+$allScopeProbeSnapshotKey = ''
+if (-not $allScopeProbePreexisting) {
+    try {
+        Microsoft.PowerShell.Utility\Set-Alias -Name $allScopeProbeName -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Global -Option AllScope -Force
+        $allScopeProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+        $allScopeProbeSnapshotKey = $allScopeProbeSnapshot.CommandStates[$allScopeProbeName].Key
+        try {
+            Microsoft.PowerShell.Utility\Set-Alias -Name $allScopeProbeName -Value 'Out-Null' -Scope Global -Option AllScope -Force
+        } finally {
+            # Залишок цієї проби — очікуваний сигнал, не збій прогону.
+            $allScopeProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $allScopeProbeSnapshot -Label 'Framework.AllScopeAliasProbe' -NoFailureRegistration)
+        }
+        $allScopeProbeAfterItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $allScopeProbeName) -ErrorAction SilentlyContinue
+        if ($null -ne $allScopeProbeAfterItem) { $allScopeProbeDefinitionAfter = [string]$allScopeProbeAfterItem.Definition }
+    } finally {
+        Microsoft.PowerShell.Utility\Set-Alias -Name $allScopeProbeName -Value 'Out-Null' -Scope Global -Option None -Force -ErrorAction SilentlyContinue
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('alias:' + $allScopeProbeName) -Force -ErrorAction SilentlyContinue
+        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('alias:' + $allScopeProbeName)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $allScopeProbePreexisting -or (
+        $allScopeProbeSnapshotKey.Contains('Write-Output') -and
+        ($allScopeProbeDefinitionAfter -eq 'Microsoft.PowerShell.Utility\Write-Output' -or $allScopeProbeResidualProblems.Count -gt 0))
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.AllScopeAliasNotSilentlyLeaked' `
+    -Failure ("заміна AllScope-аліаса має бути відновлена або видимо зафіксована: знімок '{0}', після '{1}', залишків {2}" -f
+        $allScopeProbeSnapshotKey, $allScopeProbeDefinitionAfter, $allScopeProbeResidualProblems.Count)
 
 # Codex P2 на #340 (4): global-заглушка (голий New-Module) під уже наявною
 # script-функцією з тим самим ім'ям знімається; script-функція лишається.

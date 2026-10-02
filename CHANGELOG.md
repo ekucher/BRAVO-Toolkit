@@ -41,6 +41,8 @@
   відновлення після перерваного suite не перезаписує первинний виняток),
   `…AliasMetadataRestored` (аліас повертається з Options/Description),
   `…FunctionOptionsRestored` (функція повертається з Options),
+  `…ModuleOwnedFunctionRestored` (функція модуля лишається прив'язаною до модуля),
+  `…AllScopeAliasNotSilentlyLeaked` (заміна AllScope-аліаса відновлюється або дає видимий залишок),
   `…GlobalStubBehindScriptFunctionRemoved` (global-заглушка під script-функцією знімається; глобальну
   область читає й чистить порожній динамічний модуль, бо `Remove-Item function:global:X` нічого не видаляє),
   `Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs` (реальний Enter/Complete
