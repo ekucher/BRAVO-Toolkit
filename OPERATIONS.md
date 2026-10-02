@@ -1176,6 +1176,36 @@ backup Health, notifications. Scheduled завдання
 
 ---
 
+## Не встановлений компонент (`NotInstalled`) і discovery baseline
+
+**Що це.** Компонент, увімкнений у `componentSettings`, але відсутній на
+цьому сервері (наприклад, немає BRAVOEXCH або BAZA_APP), не є помилкою:
+`BRAVO_ARCHIV.ps1` його не архівує й не синхронізує, Health і Dry Run не
+перевіряють його, а Health виводить один INFO-рядок «Не встановлено на
+цьому сервері: …» без WARNING. `MODEL` обов'язковий, а порожній склад (жоден
+увімкнений компонент не встановлено) лишається помилкою.
+
+**Що не вважається `NotInstalled`.** Компонент, який раніше був у
+discovery baseline або в останньому COMPLETE manifest, а тепер зник, -
+це `Missing` (помилка), а не «не встановлено». Так само джерело,
+оголошене в `bravo.ini`, службі чи override, але недоступне. Невизначений
+стан (непридатний baseline) Health і Dry Run трактують обережно: очікують
+усі увімкнені компоненти.
+
+**Baseline.** Після COMPLETE generation `BRAVO_ARCHIV.ps1` сам створює
+`%ProgramData%\BRAVO\State\DISCOVERY_BASELINE.json` або доповнює його
+порожні поля новими компонентами; наявні значення й непридатний файл не
+змінюються. Підтвердити зникнення компонента вручну:
+
+```powershell
+.\BRAVO_SETUP.ps1 -Action Test -ValidateOnly -ConfirmDiscoveryBaseline
+```
+
+**Manifest.** Поле `componentScope` у generation manifest показує статус
+кожного компонента на момент прогону (аудит; Health його не читає).
+
+---
+
 ## Профілі реставрації: 24/7 vs сервер робочого часу
 
 Планова реставрація моделі (`Restore.Day`/`Restore.Time`, типово нд

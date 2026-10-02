@@ -3736,11 +3736,17 @@ function New-BRAVOBackupGenerationState {
         [Parameter(Mandatory = $true)][datetime]$StartedAt,
         [object]$SnapshotSet,
         [object[]]$Components,
-        [Parameter(Mandatory = $true)][string]$Status
+        [Parameter(Mandatory = $true)][string]$Status,
+        # Склад backup set (Resolve-BRAVOBackupComponentScope): компонент ->
+        # Planned / NotInstalled / DisabledByConfig / Missing / Unknown.
+        # Записується в manifest як доказ, що пропущений компонент
+        # пропущено свідомо, а не загублено. $null — склад не обчислено.
+        [System.Collections.IDictionary]$ComponentScope
     )
 
     [pscustomobject]@{
         GenerationId = $GenerationId
+        ComponentScope = $ComponentScope
         StartedAt = $StartedAt
         SnapshotSetId = $(if ($null -ne $SnapshotSet) { [string]$SnapshotSet.SnapshotSetId } else { $null })
         SnapshotCreatedAt = $(if ($null -ne $SnapshotSet) { $SnapshotSet.CreatedAt } else { $null })
@@ -3827,6 +3833,10 @@ function Write-BRAVOBackupGenerationManifest {
         components = $components
         transferResults = $GenerationState.TransferResults
         healthResult = $GenerationState.HealthResult
+    }
+    $componentScopeProperty = $GenerationState.PSObject.Properties['ComponentScope']
+    if ($null -ne $componentScopeProperty -and $null -ne $componentScopeProperty.Value) {
+        $manifest['componentScope'] = $componentScopeProperty.Value
     }
     # dev.14: generation manifest-и живуть у виділеному MANIFESTS\, а не
     # поруч з архівами — lifecycle прив'язаний до generation (retention
@@ -3931,7 +3941,10 @@ function New-BRAVOTransferOperationResult {
 function Test-SFTPConfig {
     param(
         [switch]$BAZAOnly,
-        [switch]$SynchronizationOnly
+        [switch]$SynchronizationOnly,
+        # Не встановлені на цьому сервері компоненти (склад backup set):
+        # для них SFTP-каталоги не вимагаються, бо їх не копіюють.
+        [string[]]$NotInstalledComponents = @()
     )
 
     $configurationErrors = @()
@@ -3953,19 +3966,23 @@ function Test-SFTPConfig {
     }
 
     if (-not $BAZAOnly -and -not $SynchronizationOnly -and $componentSettings.SFTP.ArchiveUpload) {
-        foreach ($archive in ($archiveDefinitions | Where-Object { $_.Enabled })) {
+        foreach ($archive in ($archiveDefinitions | Where-Object {
+            $_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type
+        })) {
             if (-not $sftpDirectories.ContainsKey($archive.Type) -or [string]::IsNullOrWhiteSpace($sftpDirectories[$archive.Type])) {
                 $configurationErrors += "не встановлено SFTP каталог для архiву $($archive.Type)"
             }
         }
     }
 
-    if ($BAZAOnly -or $componentSettings.Synchronization.BAZA_APP_SFTP) {
+    if (@($NotInstalledComponents) -notcontains 'BAZA_APP' -and
+        ($BAZAOnly -or $componentSettings.Synchronization.BAZA_APP_SFTP)) {
         if (-not $sftpDirectories.ContainsKey("BAZA") -or [string]::IsNullOrWhiteSpace($sftpDirectories.BAZA)) {
             $configurationErrors += "не встановлено SFTP каталог для BAZA"
         }
     }
-    if ($componentSettings.Synchronization.BAZA_WWW_SFTP) {
+    if (@($NotInstalledComponents) -notcontains 'BAZA_WWW' -and
+        $componentSettings.Synchronization.BAZA_WWW_SFTP) {
         if (-not $sftpDirectories.ContainsKey("BAZAWWW") -or
             [string]::IsNullOrWhiteSpace($sftpDirectories.BAZAWWW)) {
             $configurationErrors += "не встановлено SFTP каталог для BAZA WWW"
@@ -5749,6 +5766,14 @@ function Get-BRAVOManualSyncRunOutcomeLabel {
 }
 
 function Invoke-ManualBAZASFTPSynchronization {
+    # Які напрямки синхронізувати, вирішує викликач: прапорці конфігурації
+    # з урахуванням складу backup set (NotInstalled компонент не
+    # синхронізується). Дефолти зберігають попередню поведінку прямих
+    # викликів.
+    param(
+        [bool]$BazaAppEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_SFTP,
+        [bool]$BazaWWWEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_SFTP
+    )
     Write-BRAVOLog -Component 'SFTP' -Message "==="
     Write-BRAVOLog -Component 'SFTP' -Message "=== РУЧНА СИНХРОНIЗАЦIЯ BAZA_APP / BAZA_WWW НА SFTP ==="
     Write-BRAVOLog -Component 'SFTP' -Message "Режим -SyncBAZA: синхронізуються всі увімкнені BAZA_APP/BAZA_WWW; архiвацiю, очищення архiвiв, NAS/SMB та health-check пропущено" -Level "INFO"
@@ -5756,15 +5781,15 @@ function Invoke-ManualBAZASFTPSynchronization {
 
     $manualResults = [ordered]@{
         SFTPConnection = New-BRAVOTransferOperationResult -Name 'SFTP connection' -Enabled $true
-        BAZA_APP = New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_APP' -Enabled ([bool]$componentSettings.Synchronization.BAZA_APP_SFTP)
-        BAZA_WWW = New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_WWW' -Enabled ([bool]$componentSettings.Synchronization.BAZA_WWW_SFTP)
+        BAZA_APP = New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_APP' -Enabled $BazaAppEnabled
+        BAZA_WWW = New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_WWW' -Enabled $BazaWWWEnabled
         # Нормалізовані результати канонічного двигуна (Mode/Status/SyncResult)
         # для фінальної Operations-події -SyncBAZA.
         SyncOutcomes = @{}
     }
     $syncTargets = @()
     $sourceConfigurationFailed = $false
-    if ([bool]$componentSettings.Synchronization.BAZA_APP_SFTP) {
+    if ($BazaAppEnabled) {
         if (Test-PathWithLog -Path $bazaAppPaths.Source -Description "Каталог BAZA_APP" -CreateIfMissing $false) {
             $syncTargets += [pscustomobject]@{
                 Name = "BAZA_APP"
@@ -5778,7 +5803,7 @@ function Invoke-ManualBAZASFTPSynchronization {
             Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронізацію BAZA_APP пропущено: локальний каталог недоступний" -Level "ERROR"
         }
     }
-    if ([bool]$componentSettings.Synchronization.BAZA_WWW_SFTP) {
+    if ($BazaWWWEnabled) {
         if ($bazaWWWDetection.Success -and
             -not [string]::IsNullOrWhiteSpace([string]$bazaWWWPaths.Source) -and
             (Test-PathWithLog -Path $bazaWWWPaths.Source -Description "Каталог BAZA_WWW" -CreateIfMissing $false)) {
@@ -5800,7 +5825,13 @@ function Invoke-ManualBAZASFTPSynchronization {
         return [pscustomobject]@{ Success = $false; Results = $manualResults }
     }
 
-    if (-not (Test-SFTPConfig -SynchronizationOnly)) {
+    # Напрямок без прапорця (вимкнений або компонент не встановлений) не
+    # потребує SFTP-каталогу.
+    $manualNotInstalled = @(
+        if (-not $BazaAppEnabled) { 'BAZA_APP' }
+        if (-not $BazaWWWEnabled) { 'BAZA_WWW' }
+    )
+    if (-not (Test-SFTPConfig -SynchronizationOnly -NotInstalledComponents $manualNotInstalled)) {
         Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю BAZA_APP / BAZA_WWW зупинено через помилки конфiгурацiї SFTP" -Level "ERROR"
         $manualResults.SFTPConnection.Success = $false
         $manualResults.SFTPConnection.Error = 'SFTP configuration invalid'
@@ -6694,17 +6725,49 @@ function Main {
         Write-BRAVOLog -Component 'VSS' -Message "Removed $($orphanCleanupResult.Deleted) BRAVO-owned orphan VSS shadow(s) from persisted state" -Level 'SUCCESS'
     }
 
-    $enabledArchives = @($archiveDefinitions | Where-Object { $_.Enabled })
+    # Склад backup set за наявністю компонентів на сервері (рішення
+    # власника 2026-10-01). Прапорець компонента означає «копіювати, якщо
+    # компонент є»: увімкнений, але не встановлений на цьому сервері
+    # компонент (NotInstalled) не потрапляє ні в архівацію, ні в BAZA-
+    # синхронізацію, і для нього не створюються каталоги. Рішення
+    # обчислюється ДО гілки -SyncBAZA, бо обидва прогони мусять бачити
+    # той самий склад. Помилку обчислення не ковтаємо: її fail-closed
+    # обробляє перевірка складу джерел нижче (як і раніше).
+    $backupScope = $null
+    $backupScopeError = $null
+    $discoveryBaselineImport = $null
+    try {
+        $discoveryBaselineImport = Import-BRAVODiscoveryBaseline `
+            -StateRoot $stateRoot `
+            -RuntimeRoot $runtimeRoot
+        $previousCompleteEvidence = Get-BRAVOLastCompleteBackupEvidence -BackupRoot $backupRootPath
+        $backupScope = Resolve-BRAVOBackupComponentScope `
+            -DiscoveryResult $bravoDiscoveryResult `
+            -Baseline $discoveryBaselineImport.Baseline `
+            -BaselineSourceKind ([string]$discoveryBaselineImport.Source) `
+            -EnabledComponents $discoveryEnabledComponents `
+            -PreviousCompleteComponents @($previousCompleteEvidence.Components) `
+            -PreviousCompleteAt $previousCompleteEvidence.CreatedAtUtc
+    } catch {
+        $backupScopeError = $_.Exception.Message
+    }
+    $notInstalledComponents = @(if ($null -ne $backupScope) { $backupScope.NotInstalled })
+
+    $enabledArchives = @(Select-BRAVOExpectedArchiveDefinition `
+        -ArchiveDefinitions $archiveDefinitions `
+        -NotInstalledComponents $notInstalledComponents)
     $readyArchives = @()
     $results = @{}
-    $bazaAppLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_LOCAL
+    $bazaAppInstalled = Test-BRAVOBackupComponentInstalled -Component 'BAZA_APP' -NotInstalledComponents $notInstalledComponents
+    $bazaWWWInstalled = Test-BRAVOBackupComponentInstalled -Component 'BAZA_WWW' -NotInstalledComponents $notInstalledComponents
+    $bazaAppLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_LOCAL -and $bazaAppInstalled
     # BAZA_*_SFTP тут беруться вже effective (Get-BRAVOEffectiveSynchronizationConfiguration
     # ANDить componentSettings.SFTP.Enabled у SftpEnabled кожного компонента,
     # 5.2.2) — один канонічний вираз замінює локальний AND і в цьому файлі,
     # і в Health/Maintenance/Dry Run.
-    $bazaAppSFTPSyncEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_APP' } | Select-Object -First 1 -ExpandProperty SftpEnabled)
-    $bazaWWWSFTPSyncEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_WWW' } | Select-Object -First 1 -ExpandProperty SftpEnabled)
-    $bazaWWWLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_LOCAL
+    $bazaAppSFTPSyncEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_APP' } | Select-Object -First 1 -ExpandProperty SftpEnabled) -and $bazaAppInstalled
+    $bazaWWWSFTPSyncEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_WWW' } | Select-Object -First 1 -ExpandProperty SftpEnabled) -and $bazaWWWInstalled
+    $bazaWWWLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_LOCAL -and $bazaWWWInstalled
     $sftpArchiveUploadEnabled = [bool]$storageEffective.SFTP.ArchiveUpload
     $smbArchiveCopyEnabled = [bool]$storageEffective.SMB.ArchiveCopy
     $sftpTransferEnabled = (
@@ -6768,8 +6831,45 @@ function Main {
                 -LogFile $script:logFile
             return
         }
+        # Склад backup set: увімкнений у конфігурації, але не встановлений
+        # на цьому сервері BAZA-компонент пропускається без помилки. Якщо
+        # після цього синхронізувати нічого, це той самий чистий SKIPPED
+        # exit 0, що й для глобально вимкненого SFTP, а не exit 50 кожні
+        # кілька годин на сервері, де BAZA_APP ніколи не було.
+        foreach ($notInstalledBazaComponent in @($notInstalledComponents | Where-Object { @('BAZA_APP', 'BAZA_WWW') -contains $_ })) {
+            Write-Log "Компонент $notInstalledBazaComponent на цьому сервері не встановлено: синхронізацію пропущено без помилки" -Level "INFO" -NoTimestamp
+        }
+        $manualSyncNotInstalledOnly = (-not $bazaAppSFTPSyncEnabled) -and (-not $bazaWWWSFTPSyncEnabled) -and (
+            ([bool]$componentSettings.Synchronization.BAZA_APP_SFTP -and -not $bazaAppInstalled) -or
+            ([bool]$componentSettings.Synchronization.BAZA_WWW_SFTP -and -not $bazaWWWInstalled)
+        )
+        if ($manualSyncNotInstalledOnly) {
+            $notInstalledSyncReason = 'увімкнені BAZA-компоненти на цьому сервері не встановлено'
+            Write-Log "==="
+            Write-Log "=== РУЧНА СИНХРОНIЗАЦIЯ BAZA_APP / BAZA_WWW НА SFTP: SKIPPED ==="
+            Write-Log $notInstalledSyncReason -Level "INFO" -NoTimestamp
+            $script:processExitCode = 0
+            Show-ScriptProgress -Status "Завершено" -PercentComplete 100
+            Complete-BRAVOProgress
+            Initialize-BRAVOArchiveSteps -Total 1
+            Write-BRAVOArchiveStep `
+                -Name 'SFTP: BAZA_APP/BAZA_WWW' `
+                -Status 'SKIPPED' `
+                -Details $notInstalledSyncReason
+            $notInstalledSyncMetrics = New-Object System.Collections.Specialized.OrderedDictionary
+            $notInstalledSyncMetrics.Add('Операція', 'Ручна синхронізація BAZA_APP / BAZA_WWW')
+            $notInstalledSyncMetrics.Add('Причина', $notInstalledSyncReason)
+            Write-BRAVOSummary `
+                -Result 'УСПІШНО' `
+                -Duration ([timespan]::Zero) `
+                -Metrics $notInstalledSyncMetrics `
+                -LogFile $script:logFile
+            return
+        }
         $manualSyncStarted = Get-Date
-        $manualSyncResult = Invoke-ManualBAZASFTPSynchronization
+        $manualSyncResult = Invoke-ManualBAZASFTPSynchronization `
+            -BazaAppEnabled ([bool]$componentSettings.Synchronization.BAZA_APP_SFTP -and $bazaAppInstalled) `
+            -BazaWWWEnabled ([bool]$componentSettings.Synchronization.BAZA_WWW_SFTP -and $bazaWWWInstalled)
         $manualSyncSuccess = [bool]$manualSyncResult.Success
         $manualSyncOutcomeLabel = Get-BRAVOManualSyncRunOutcomeLabel -ManualSyncResult $manualSyncResult
         $manualSyncFinished = Get-Date
@@ -6917,7 +7017,8 @@ function Main {
     $archivePlanEntries['Локальна синхронізація BAZA_APP'] = [bool]$bazaAppLocalSyncEnabled
     $archivePlanEntries['Локальна синхронізація BAZA_WWW'] = [bool]$bazaWWWLocalSyncEnabled
     foreach ($archiveDefinition in $archiveDefinitions) {
-        $archivePlanEntries["Архівація $($archiveDefinition.Type)"] = [bool]$archiveDefinition.Enabled
+        $archivePlanEntries["Архівація $($archiveDefinition.Type)"] = ([bool]$archiveDefinition.Enabled -and
+            $notInstalledComponents -notcontains [string]$archiveDefinition.Type)
     }
     $archivePlanEntries['Завантаження архівів на SFTP'] = [bool]$sftpArchiveUploadEnabled
     $archivePlanEntries['Синхронізація BAZA_APP на SFTP'] = [bool]$bazaAppSFTPSyncEnabled
@@ -6952,7 +7053,8 @@ function Main {
     Write-Log "Очищення обідніх архівів (_1300.): $(if ($enableLunchArchiveCleanup) {'УВIМКНЕНО'} else {'ВИМКНЕНО'})" -NoTimestamp
     Write-Log "Узгодженість щоденних архівів: $([string]$backupConsistency.Mode)" -NoTimestamp
     foreach ($archive in $archiveDefinitions) {
-        Write-Log "Архiвацiя $($archive.Type): $(if ($archive.Enabled) {'УВIМКНЕНО'} else {'ВИМКНЕНО'})" -NoTimestamp
+        $archiveLogState = $(if (-not $archive.Enabled) { 'ВИМКНЕНО' } elseif ($notInstalledComponents -contains [string]$archive.Type) { 'НЕ ВСТАНОВЛЕНО (пропущено)' } else { 'УВIМКНЕНО' })
+        Write-Log "Архiвацiя $($archive.Type): $archiveLogState" -NoTimestamp
     }
     # Джерело показуємо для кожного увiмкненого компонента — інакше з
     # самого лише "УВIМКНЕНО" не видно, який саме каталог реально обрано
@@ -7206,7 +7308,7 @@ function Main {
         Show-ScriptProgress -Status "Перевiрка конфiгурацiї SFTP" -PercentComplete 10
         Write-Log "==="
         Write-Log "=== ПЕРЕВIРКА КОНФIГУРАЦIЇ SFTP ==="
-        $sftpConfigurationValid = Test-SFTPConfig
+        $sftpConfigurationValid = Test-SFTPConfig -NotInstalledComponents $notInstalledComponents
         if (-not $sftpConfigurationValid) {
             Write-Log "SFTP-компоненти буде пропущено; локальна архiвацiя продовжиться" -Level "WARNING"
             $operationFailed = $true
@@ -7320,17 +7422,18 @@ function Main {
     $driftFailedComponents = @()
     $discoveryDriftFindings = @()
     try {
-        $discoveryBaselineImport = Import-BRAVODiscoveryBaseline `
-            -StateRoot $stateRoot `
-            -RuntimeRoot $runtimeRoot
+        # Baseline і склад уже обчислено на початку прогону
+        # (Resolve-BRAVOBackupComponentScope поверх тієї самої матриці
+        # Test-BRAVODiscoveryComponentDrift); тут лише звітуємо й
+        # застосовуємо рішення. Помилка того обчислення — та сама
+        # fail-closed гілка, що й раніше.
+        if ($null -ne $backupScopeError) {
+            throw $backupScopeError
+        }
         foreach ($baselineProblem in @($discoveryBaselineImport.Problems)) {
             Write-BRAVOLog -Component 'DISCOVERY' -Message ([string]$baselineProblem) -Level 'WARNING'
         }
-        $discoveryDriftFindings = @(Test-BRAVODiscoveryComponentDrift `
-            -DiscoveryResult $bravoDiscoveryResult `
-            -Baseline $discoveryBaselineImport.Baseline `
-            -BaselineSourceKind ([string]$discoveryBaselineImport.Source) `
-            -EnabledComponents $discoveryEnabledComponents)
+        $discoveryDriftFindings = @($backupScope.Findings)
     } catch {
         # Fail-closed: якщо саму перевірку складу виконати не вдалося, ми
         # НЕ знаємо, чи повний backup set. Мовчазне продовження тут
@@ -7363,6 +7466,8 @@ function Main {
         'склад джерел оцінити не вдалося; деталі у журналі.'
     } elseif ($driftFailedComponents.Count -gt 0) {
         "компонентів із дрейфом: $($driftFailedComponents -join ', '); деталі у журналі."
+    } elseif ($notInstalledComponents.Count -gt 0) {
+        "не встановлено на цьому сервері: $($notInstalledComponents -join ', ')"
     } else {
         ''
     })
@@ -8105,7 +8210,8 @@ function Main {
             -StartedAt $scriptStartTime `
             -SnapshotSet $generationSnapshotSet `
             -Components $generationResultsArray `
-            -Status $script:backupGenerationStatus
+            -Status $script:backupGenerationStatus `
+            -ComponentScope $(if ($null -ne $backupScope) { $backupScope.Components } else { $null })
         if ($enabledArchives.Count -gt 0) {
             try {
                 $generationManifestPath = Write-BRAVOBackupGenerationManifest `
@@ -8141,6 +8247,38 @@ function Main {
         $generationFinalizationFailed = $true
         $generationFinalizationFailureReason = $_.Exception.Message
         $operationFailed = $true
+    }
+    # Автоматичне створення й доповнення discovery baseline (рішення
+    # власника 2026-10-01): лише після COMPLETE generation з чистою
+    # перевіркою складу. Тоді компонент, що вже реально потрапив у
+    # резервну копію, береться під захист від тихого зникнення без ручного
+    # -ConfirmDiscoveryBaseline. Наявні записи baseline не змінюються.
+    if (Test-BRAVOBackupBaselineUpdateAllowed `
+            -GenerationStatus ([string]$script:backupGenerationStatus) `
+            -BaselineValid ([bool]$discoveryBaselineValid) `
+            -BackupScope $backupScope `
+            -GenerationManifestPath ([string]$generationManifestPath)) {
+        try {
+            $baselineUpdate = Update-BRAVODiscoveryBaselineFromScope `
+                -DiscoveryResult $bravoDiscoveryResult `
+                -ScopeResult $backupScope `
+                -StateRoot $stateRoot `
+                -RuntimeRoot $runtimeRoot
+            if ([string]$baselineUpdate.Action -eq 'Created') {
+                Write-BRAVOLog -Component 'DISCOVERY' -Message (
+                    "Discovery baseline створено автоматично після COMPLETE generation ${generationId}: " +
+                    "під захистом від зникнення $(@($baselineUpdate.AddedComponents) -join ', ')"
+                ) -Level 'INFO'
+            } elseif ([string]$baselineUpdate.Action -eq 'Extended') {
+                Write-BRAVOLog -Component 'DISCOVERY' -Message (
+                    "Новий компонент узято під захист у discovery baseline: $(@($baselineUpdate.AddedComponents) -join ', ')"
+                ) -Level 'INFO'
+            }
+        } catch {
+            Write-BRAVOLog -Component 'DISCOVERY' -Message (
+                "Не вдалося автоматично оновити discovery baseline: $($_.Exception.Message)"
+            ) -Level 'WARNING'
+        }
     }
     Show-ItemProgress -Id 10 -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" -Completed
 
@@ -8893,7 +9031,7 @@ function Main {
     # логується і ніколи не змінює результат Archive (інваріант
     # «telemetry не змінює exit code»).
     try {
-        $statusComponentsTotal = @($archiveDefinitions | Where-Object { [bool]$_.Enabled }).Count
+        $statusComponentsTotal = @($enabledArchives).Count
         $statusComponentsSucceeded = @($results.Values | Where-Object { [bool]$_.ArchiveSuccess }).Count
         $statusTotalCreatedBytes = [long]0
         foreach ($statusComponentResult in $results.Values) {
@@ -9026,12 +9164,11 @@ function Main {
     # Архіви: усі заплановані компоненти в стабільному порядку
     # archiveDefinitions — успішний component показує розмір і повний
     # шлях окремим рядком, невдалий — ERROR без вигаданого шляху.
-    if ($archiveDefinitions.Count -gt 0) {
+    # Лише компоненти реального складу ($enabledArchives): NotInstalled
+    # пропущено без помилки і не має друкуватись як «Архів не створено».
+    if ($enabledArchives.Count -gt 0) {
         Write-BRAVOResultSection -Title 'Архіви'
-        foreach ($definition in $archiveDefinitions) {
-            if (-not [bool]$definition.Enabled) {
-                continue
-            }
+        foreach ($definition in $enabledArchives) {
             $componentResult = $results[$definition.Type]
             if ($null -ne $componentResult -and [bool]$componentResult.ArchiveSuccess) {
                 Write-Host ("  {0,-12}{1}" -f $definition.Type, (Format-BRAVOFileSize -Bytes $componentResult.Bytes))

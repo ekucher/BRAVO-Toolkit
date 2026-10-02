@@ -158,6 +158,46 @@
   `BackupConsistency/RetentionRetryFinishesGenerationAfterLockReleased`,
   `BackupConsistency/UnreferencedArchivesAreReportedNotDeleted`,
   `BackupConsistency/UnknownComponentTypeKeepsGenerationAndWarns`.
+
+- **Feat: резервне копіювання лише встановлених компонентів (#282).**
+  Прапорець компонента в `componentSettings` тепер означає «копіювати, якщо компонент є на
+  сервері». `Resolve-BRAVOBackupComponentScope` (BRAVO.Discovery) поверх матриці
+  `Test-BRAVODiscoveryComponentDrift` класифікує склад: `Planned` / `NotInstalled` /
+  `DisabledByConfig` / `Missing` / `Unknown`. Увімкнений, але не встановлений компонент без
+  запису в baseline пропускається (Info) без архіву, BAZA-синхронізації й каталогів
+  призначення; `MODEL` обов'язковий, порожній склад і зниклий підтверджений компонент лишаються
+  помилкою. Discovery baseline створюється й доповнюється автоматично після COMPLETE generation
+  (лише Planned-компоненти, наявні значення не змінюються; перше створення не бере
+  DisabledByConfig). Для серверів без baseline другий доказ присутності — останній COMPLETE
+  generation manifest (`Get-BRAVOLastCompleteBackupComponents`): компонент, що мав у ньому
+  архів, а тепер Absent, стає `Missing` (помилка), а не `NotInstalled`. `BRAVO_ARCHIV`,
+  Health, Dry Run і `BRAVO_SETUP -ValidateOnly` користуються цим самим складом (ValidateOnly і
+  Test-BRAVODiscoveryResult більше не створюють каталогів); `Test-SFTPConfig` не вимагає
+  SFTP-каталогів для NotInstalled-компонентів; Health показує один INFO-рядок «Не встановлено
+  на цьому сервері: …» без WARNING. Оголошене (bravo.ini/служба/override), але недоступне джерело
+  ніколи не стає `NotInstalled`: `Test-BRAVODiscoverySourceDirectory` розрізняє «не існує» і «не
+  вдалося прочитати» (Kind), нечитабельне дає Error, а Absent з оголошеним джерелом у scope лишається
+  `Missing` (backup пробує компонент і падає гучно, baseline не пишеться). Доказ з попереднього
+  COMPLETE manifest діє й коли baseline старіший за цей manifest; `BRAVO_SETUP` передає той самий
+  доказ, що й ARCHIV. Підсумок ARCHIV (status JSON, секція «Архіви», план, лог) враховує лише реальний
+  склад.
+  Дизайн складу: Health і Dry Run не читають склад зі `scope` останнього manifest, а беруть його
+  з живого discovery + baseline (лише читання, `Get-BRAVOBackupNotInstalledComponents`) і
+  останнього COMPLETE manifest як другого доказу присутності, бо manifest застаріває між
+  прогонами: компонент, що зник після останньої копії, Health побачив би як `Planned` лише до
+  наступного прогону, а новий не побачив би взагалі. Поле manifest `componentScope`
+  (компонент -> `Planned` / `NotInstalled` / `DisabledByConfig` / `Missing` / `Unknown`) пишеться
+  для аудиту як доказ свідомого пропуску; Health його не читає. Невизначеність (непридатний
+  baseline) у read-only варіанті дає порожній список NotInstalled: очікуються всі увімкнені
+  компоненти, зайва тривога краща за пропущену. Фільтри «увімкнений і встановлений» винесено в
+  `Select-BRAVOExpectedArchiveDefinition`, охоронець оновлення baseline в
+  `Test-BRAVOBackupBaselineUpdateAllowed`, перелік призначень SETUP у
+  `Get-BRAVODiscoveryDestinationPaths`, а перевірку BAZA-синхронізації в
+  `Test-BRAVOBackupComponentInstalled`, щоб їх поведінку перевіряли self-test-и, а не пошук
+  тексту в коді. Нові self-test перевірки: набір `BackupScope` (зокрема `BackupScope/PreviouslyBackedUpComponentVanishedWithoutBaselineIsError`,
+  `BackupScope/FirstBaselineExcludesDisabledByConfig`,
+  `BackupScope/LastCompleteManifestComponentsReader`,
+  `BackupScope/SftpConfigSkipsNotInstalledAndPreviousProofWired`).
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`
