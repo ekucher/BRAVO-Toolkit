@@ -7,7 +7,13 @@
   Windows до 10 після цього перший `Write-Host` з кирилицею падав з Win32 `0x1F`, тож
   ARCHIV/HEALTH/MAINTENANCE гинули до відкриття журналу. `Test-BRAVOConsoleCodePageChangeSafe`
   (BRAVO.Compatibility) на Windows < 10 у неінтерактивній сесії кодову сторінку консолі не
-  змінює; Windows 10+ та інтерактивні запуски — без змін. Перенесено з `5.2.5-rc.3`.
+  змінює; Windows 10+ та інтерактивні запуски — без змін. `$OutputEncoding` (кодування для
+  зовнішніх процесів) і UTF-8-логи не змінюються. Перенесено з `5.2.5-rc.3`. Нові перевірки:
+  `ConsoleUX/31-LegacySystemConsoleKeepsCodePage` (поведінкова матриця Server 2012 / 2012 R2 /
+  Windows 10 / 11 x інтерактивна чи неінтерактивна сесія x кодова сторінка через
+  `Initialize-BRAVOConsoleEncoding` з тестовими параметрами `-OSVersion`, `-UserInteractive`,
+  `-SetConsoleOutputEncoding`) і `ConsoleUX/33-NoUnguardedConsoleCodePageSwitch` (жоден інший
+  production-скрипт не перемикає `[Console]::OutputEncoding` напряму).
 
 - **Fix: ізоляція suite self-test бачить Private-записи й тримає незмінний знімок функцій (#350).**
   Знімок і відновлення читали alias/function script- і global-області з області функції

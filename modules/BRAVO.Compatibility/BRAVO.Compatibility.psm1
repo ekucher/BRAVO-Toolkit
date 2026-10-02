@@ -40,8 +40,16 @@ function Test-BRAVOConsoleCodePageChangeSafe {
 }
 
 function Initialize-BRAVOConsoleEncoding {
+    # -OSVersion/-UserInteractive/-SetConsoleOutputEncoding — лише для
+    # поведінкових тестів (матриця ОС і сесій); production-виклики їх не
+    # передають і отримують фактичні значення процесу.
     [CmdletBinding()]
-    param([int]$CodePage = 65001)
+    param(
+        [int]$CodePage = 65001,
+        [Version]$OSVersion = [Environment]::OSVersion.Version,
+        [bool]$UserInteractive = [Environment]::UserInteractive,
+        [scriptblock]$SetConsoleOutputEncoding = { param($Encoding) [Console]::OutputEncoding = $Encoding }
+    )
 
     try {
         $consoleEncoding = if ($CodePage -eq 65001) {
@@ -55,11 +63,11 @@ function Initialize-BRAVOConsoleEncoding {
         # програмами, а Console.OutputEncoding узгоджує кодову сторінку
         # самого вікна консолі. Помилка в сеансі без консолі не є критичною.
         $global:OutputEncoding = $consoleEncoding
-        if (-not (Test-BRAVOConsoleCodePageChangeSafe -CodePage $CodePage)) {
+        if (-not (Test-BRAVOConsoleCodePageChangeSafe -CodePage $CodePage -OSVersion $OSVersion -UserInteractive $UserInteractive)) {
             return $false
         }
         try {
-            [Console]::OutputEncoding = $consoleEncoding
+            & $SetConsoleOutputEncoding $consoleEncoding
         } catch {
             return $false
         }
