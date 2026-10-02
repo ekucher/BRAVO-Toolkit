@@ -31,6 +31,10 @@
   Start-Process, а також Invoke-RestMethod і global-аліаса Get-Date),
   `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.ProbeStubsActiveInsideSuite`,
   `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.DispatcherWiresIsolation`,
+  `Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.RestorerPrimitivesShadowed` (саме
+  відновлення викликає cmdlet-и з модульною кваліфікацією, тож затінені suite-ом `Get-Item`,
+  `Remove-Item`, `Set-Item`, `Get-ChildItem`, `Remove-Module`, `New-Object`, `Write-Host`
+  теж знімаються; `Set-Item` додано до спостережуваних),
   `Framework/SectionIsolation.SuiteBoundaryRemovesBuiltinStubs` (реальний Enter/Complete
   для `Suite/*` у дочірньому процесі). Стан затінення читається прямо з Function:/Alias:
   (без `Get-Command` для відсутніх імен — дорогий пошук модулів), підмітання функцій

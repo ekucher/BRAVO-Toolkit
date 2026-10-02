@@ -758,7 +758,7 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
         [int]$StartIndex = 0,
         [hashtable]$FunctionBaseline = $null
     )
-    $clearProblems = New-Object System.Collections.Generic.List[string]
+    $clearProblems = Microsoft.PowerShell.Utility\New-Object System.Collections.Generic.List[string]
     for ($ownedIndex = $StartIndex; $ownedIndex -lt $script:BRAVOSelfTestOwnedRuntimeModules.Count; $ownedIndex++) {
         $ownedEntry = $script:BRAVOSelfTestOwnedRuntimeModules[$ownedIndex]
         # Strict-safe: записи реєстру з інших джерел (проби) можуть не мати
@@ -772,22 +772,22 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
             foreach ($functionName in @($ownedEntry.FunctionNames)) {
                 # Пряме читання Function:-drive (хеш-пошук) замість Get-Command:
                 # Get-Command для відсутнього імені запускає дорогий пошук модулів.
-                $currentFunction = Get-Item -LiteralPath ('function:' + $functionName) -ErrorAction SilentlyContinue
+                $currentFunction = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $functionName) -ErrorAction SilentlyContinue
                 if ($null -ne $currentFunction -and $currentFunction.ModuleName -eq $ownerModuleName) {
-                    Remove-Item -Path "function:$functionName" -Force -ErrorAction Stop
+                    Microsoft.PowerShell.Management\Remove-Item -Path "function:$functionName" -Force -ErrorAction Stop
                     if ($null -ne $FunctionBaseline -and $FunctionBaseline.ContainsKey($functionName)) {
-                        Set-Item -Path "function:global:$functionName" -Value $FunctionBaseline[$functionName] -Force
+                        Microsoft.PowerShell.Management\Set-Item -Path "function:global:$functionName" -Value $FunctionBaseline[$functionName] -Force
                     }
                 }
             }
-            Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
+            Microsoft.PowerShell.Core\Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
         } catch {
             [void]$clearProblems.Add($_.Exception.Message)
         }
         if ($null -ne $cleanedProperty) {
             $cleanedProperty.Value = $true
         } else {
-            Add-Member -InputObject $ownedEntry -MemberType NoteProperty -Name 'Cleaned' -Value $true -Force
+            Microsoft.PowerShell.Utility\Add-Member -InputObject $ownedEntry -MemberType NoteProperty -Name 'Cleaned' -Value $true -Force
         }
     }
     # Підмітання: жодна функція, прив'язана до модуля з діапазону (для
@@ -800,10 +800,10 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
         $sweepModuleNames[[string]$script:BRAVOSelfTestOwnedRuntimeModules[$sweepIndex].Module.Name] = $true
     }
     if ($sweepModuleNames.Count -gt 0) {
-        foreach ($sweepFunction in @(Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)) {
+        foreach ($sweepFunction in @(Microsoft.PowerShell.Management\Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)) {
             if (-not [string]::IsNullOrEmpty([string]$sweepFunction.ModuleName) -and $sweepModuleNames.ContainsKey([string]$sweepFunction.ModuleName)) {
                 foreach ($sweepScope in @('global:', 'script:', '')) {
-                    Remove-Item -Path ('function:' + $sweepScope + $sweepFunction.Name) -Force -ErrorAction SilentlyContinue
+                    Microsoft.PowerShell.Management\Remove-Item -Path ('function:' + $sweepScope + $sweepFunction.Name) -Force -ErrorAction SilentlyContinue
                 }
             }
         }
@@ -830,7 +830,7 @@ function Get-BRAVOSelfTestWatchedBuiltinCommandNames {
         'Invoke-WebRequest', 'Invoke-RestMethod', 'Start-Sleep',
         'Get-CimInstance', 'Get-WmiObject', 'Get-Date', 'Test-Connection',
         'Test-Path', 'Get-Content', 'Set-Content', 'Add-Content', 'Out-File',
-        'Remove-Item', 'Copy-Item', 'Move-Item', 'New-Item', 'Get-Item',
+        'Remove-Item', 'Copy-Item', 'Move-Item', 'New-Item', 'Get-Item', 'Set-Item',
         'Get-ChildItem', 'Get-ItemProperty', 'Set-ItemProperty',
         'Write-Host', 'Write-Output', 'Write-Warning', 'Write-Error',
         'Join-Path', 'Split-Path', 'Resolve-Path', 'ConvertTo-Json',
@@ -847,11 +847,11 @@ function Get-BRAVOSelfTestBuiltinCommandState {
     # function чи alias завжди змінює цей стан. Для функції ще й посилання на
     # ScriptBlock (заміна функції функцією з тим самим ModuleName теж видима).
     param([Parameter(Mandatory = $true)][string]$Name)
-    $aliasItem = Get-Item -LiteralPath ('alias:' + $Name) -ErrorAction SilentlyContinue
+    $aliasItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $Name) -ErrorAction SilentlyContinue
     if ($null -ne $aliasItem) {
         return [pscustomobject]@{ Name = $Name; Key = ('Alias|' + $aliasItem.Definition); Kind = 'Alias'; Definition = [string]$aliasItem.Definition; ScriptBlock = $null }
     }
-    $functionItem = Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue
+    $functionItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue
     if ($null -ne $functionItem) {
         return [pscustomobject]@{ Name = $Name; Key = ('Function|' + $functionItem.ModuleName); Kind = 'Function'; Definition = ''; ScriptBlock = $functionItem.ScriptBlock }
     }
@@ -874,7 +874,7 @@ function New-BRAVOSelfTestSuiteIsolationSnapshot {
     # Хеш-таблиця будується ліниво, лише якщо suite зареєстрував модулі.
     return [pscustomobject]@{
         CommandStates    = $commandStates
-        FunctionList     = @(Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)
+        FunctionList     = @(Microsoft.PowerShell.Management\Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)
         OwnedStartIndex  = $script:BRAVOSelfTestOwnedRuntimeModules.Count
     }
 }
@@ -889,7 +889,7 @@ function Restore-BRAVOSelfTestSuiteIsolation {
         [Parameter(Mandatory = $true)]$Snapshot,
         [string]$Label = 'suite'
     )
-    $residualProblems = New-Object System.Collections.Generic.List[string]
+    $residualProblems = Microsoft.PowerShell.Utility\New-Object System.Collections.Generic.List[string]
     try {
         $restoreFunctionBaseline = @{}
         if ($script:BRAVOSelfTestOwnedRuntimeModules.Count -gt $Snapshot.OwnedStartIndex) {
@@ -908,14 +908,14 @@ function Restore-BRAVOSelfTestSuiteIsolation {
         try {
             # Зняти затінюючі alias/function (можуть бути в кількох областях).
             foreach ($shadowScope in @('global:', 'script:', '')) {
-                Remove-Item -Path ('alias:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
-                Remove-Item -Path ('function:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
+                Microsoft.PowerShell.Management\Remove-Item -Path ('alias:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
+                Microsoft.PowerShell.Management\Remove-Item -Path ('function:' + $shadowScope + $watchedName) -Force -ErrorAction SilentlyContinue
             }
             # Початкова команда була функцією/аліасом — повернути її.
             if ($baselineState.Kind -eq 'Function') {
-                Set-Item -Path ('function:global:' + $watchedName) -Value $baselineState.ScriptBlock -Force
+                Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $watchedName) -Value $baselineState.ScriptBlock -Force
             } elseif ($baselineState.Kind -eq 'Alias') {
-                Set-Alias -Name $watchedName -Value $baselineState.Definition -Scope Global -Force
+                Microsoft.PowerShell.Utility\Set-Alias -Name $watchedName -Value $baselineState.Definition -Scope Global -Force
             }
         } catch {
             [void]$residualProblems.Add("${watchedName}: не вдалося зняти затінення — $($_.Exception.Message)")
@@ -929,7 +929,7 @@ function Restore-BRAVOSelfTestSuiteIsolation {
         $isolationMessage = ("Framework/SuiteIsolation[{0}] — вбудовані команди не повернуто до стану до suite: {1}" -f
             $Label, [string]::Join('; ', $residualProblems.ToArray()))
         [void]$script:failures.Add($isolationMessage)
-        Write-Host "[FAIL] $isolationMessage" -ForegroundColor Red
+        Microsoft.PowerShell.Utility\Write-Host "[FAIL] $isolationMessage" -ForegroundColor Red
     }
     return @($residualProblems.ToArray())
 }
@@ -25963,6 +25963,48 @@ Test-BRAVOCondition -Condition (
 Test-BRAVOCondition -Condition ($leakProbeLeakedNames.Count -eq 0 -and $leakProbeResidualProblems.Count -eq 0) `
     -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites' `
     -Failure "після закриття suite вбудовані команди мають резолвитися як до нього; витекло: $($leakProbeLeakedNames -join '; ')"
+
+# Codex P1 на #340: suite може затінити й ті cmdlet-и, якими реалізоване саме
+# відновлення (Get-Item, Remove-Item, Set-Item, Get-ChildItem, Remove-Module,
+# New-Object, Write-Host). Restore має їх зняти, а не працювати через
+# заглушки: Get-Item-заглушка, що повертає $null, раніше давала хибне
+# «нічого не затінено», і заглушки лишались. Перевірка незалежна від
+# Get-BRAVOSelfTestBuiltinCommandState: модуль-кваліфікований Get-Command.
+$primitiveProbeNames = @('Get-Item', 'Remove-Item', 'Set-Item', 'Get-ChildItem', 'Remove-Module', 'New-Object', 'Write-Host')
+$primitiveProbeShadowCount = {
+    param([string[]]$Names)
+    @($Names | Where-Object {
+        $null -ne (Microsoft.PowerShell.Core\Get-Command -Name $_ -CommandType Function, Alias -ErrorAction SilentlyContinue)
+    }).Count
+}
+$primitiveProbeBeforeCount = & $primitiveProbeShadowCount $primitiveProbeNames
+$primitiveProbeSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+$primitiveProbeDuringCount = -1
+$primitiveProbeResidualProblems = @()
+try {
+    [void](New-Module -ScriptBlock {
+        function Get-Item { $null }
+        function Remove-Item { }
+        function Set-Item { }
+        function Get-ChildItem { }
+        function Remove-Module { }
+        function New-Object { throw 'stub New-Object' }
+    })
+    Set-Alias -Name 'Write-Host' -Value 'Out-Null' -Scope Global
+    $primitiveProbeDuringCount = & $primitiveProbeShadowCount $primitiveProbeNames
+} finally {
+    $primitiveProbeResidualProblems = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $primitiveProbeSnapshot -Label 'Framework.PrimitiveShadowProbe')
+}
+$primitiveProbeAfterCount = & $primitiveProbeShadowCount $primitiveProbeNames
+Test-BRAVOCondition -Condition (
+    $primitiveProbeDuringCount -eq ($primitiveProbeBeforeCount + $primitiveProbeNames.Count) -and
+    $primitiveProbeAfterCount -eq $primitiveProbeBeforeCount -and
+    $primitiveProbeResidualProblems.Count -eq 0
+) `
+    -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.RestorerPrimitivesShadowed' `
+    -Failure ("затінені cmdlet-и самого відновлення мають бути зняті: до {0}, під час {1} (очікувано +{2}), після {3}; залишки: {4}" -f
+        $primitiveProbeBeforeCount, $primitiveProbeDuringCount, $primitiveProbeNames.Count, $primitiveProbeAfterCount,
+        [string]::Join('; ', [string[]]$primitiveProbeResidualProblems))
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.BuiltinCommandStubsDoNotLeakAcrossSuites' } }
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.VariableScopeHeadroom') { try {
 
