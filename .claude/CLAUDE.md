@@ -650,3 +650,16 @@ issue і в 65 коментарях (44 issue + 21 review) лишається о
 13. Редагування коду — це ще не завершення; потрібен доказ валідації.
 14. Жодних реальних імен, IP-адрес, імен хостів, облікових записів і назв
     організацій у проекті: лише вигадані назви.
+
+## Agent orchestration policy
+
+Canonical orchestration mechanics for agent roles, HANDOFF,
+reviewer severity, Codex A2A routing, Claude QA fallback,
+and the prohibition on publishing chat/session links are defined in:
+
+BRAVO_AGENT_POLICY.md
+
+Existing BRAVO-specific architecture, security, PowerShell 5.1,
+compatibility, Git/GitHub, CI, release, and mutation rules in this
+.claude/CLAUDE.md remain authoritative and are not weakened or replaced
+by the orchestration policy.
