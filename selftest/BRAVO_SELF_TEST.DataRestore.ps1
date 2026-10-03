@@ -147,6 +147,7 @@ function Stop-Process {
             'Stop-Process',
             'Test-BRAVODataRestorePathWithin',
             'Test-BRAVODataRestorePathEquals',
+            'Get-BRAVODataRestorePathProbe',
             'Test-BRAVODataRestorePathHasReparseAncestor',
             'Test-BRAVODataRestoreGenerationIdFormat',
             'Test-BRAVODataRestoreMinimumFreeSpaceGB',
@@ -242,6 +243,61 @@ function Stop-Process {
             [void][IO.Directory]::CreateDirectory($planDirectory)
         }
         $planDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Source = (Join-Path $planLiveModel 'model.gdb') })
+
+        # Детермінована імітація недосяжного UNC-хоста. На доменному сервері
+        # Test-Path по такому шляху (Windows PowerShell 5.1) піднімає
+        # термінальне "The network path was not found", а CI-раннер просто
+        # не резолвить ім'я і тихо отримує $false — тому без імітації CI
+        # дефекту не бачить, а self-test на реальному хості обривався
+        # ("Fatal: The network path was not found"). Заглушка живе лише в
+        # script-scope self-test-модуля і прибирається у finally; реальний
+        # мережевий запит не робиться взагалі.
+        # $Behaviours: префікс шляху -> поведінка провайдера (IOException,
+        # Unauthorized, ProviderError — виняток; Exists/Missing — результат);
+        # решта шляхів іде в справжній Test-Path.
+        $pathProviderInvoke = {
+            param($Module, [hashtable]$Behaviours, [scriptblock]$Body, [object[]]$Arguments)
+            & $Module {
+                param([hashtable]$SelfTestBehaviours)
+                $script:BRAVOSelfTestPathBehaviours = $SelfTestBehaviours
+                function script:Test-Path {
+                    [CmdletBinding()]
+                    param([string]$LiteralPath, [string]$PathType = 'Any')
+                    foreach ($selfTestPathPrefix in @($script:BRAVOSelfTestPathBehaviours.Keys)) {
+                        if ($LiteralPath.IndexOf([string]$selfTestPathPrefix, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+                        switch ([string]$script:BRAVOSelfTestPathBehaviours[$selfTestPathPrefix]) {
+                            'IOException' { throw (New-Object System.IO.IOException('The network path was not found.')) }
+                            'Unauthorized' { throw (New-Object System.UnauthorizedAccessException('Access to the path is denied.')) }
+                            'ProviderError' { throw (New-Object System.Management.Automation.ProviderInvocationException('self-test: збій провайдера FileSystem', (New-Object System.IO.IOException('The specified network name is no longer available.')))) }
+                            'Exists' { return $true }
+                            'Missing' { return $false }
+                            default { throw "self-test: невідома поведінка заглушки Test-Path: $($script:BRAVOSelfTestPathBehaviours[$selfTestPathPrefix])" }
+                        }
+                    }
+                    Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType
+                }
+            } $Behaviours
+            try {
+                & $Module $Body @Arguments
+            } finally {
+                & $Module {
+                    Remove-Item -Path 'Function:\Test-Path' -ErrorAction SilentlyContinue
+                    Remove-Variable -Name 'BRAVOSelfTestPathBehaviours' -Scope Script -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        $unreachableUncInvoke = {
+            param($Module, [scriptblock]$Body, [object[]]$Arguments)
+            & $pathProviderInvoke $Module @{ '\\nas-host\' = 'IOException' } $Body $Arguments
+        }
+        # Ізоляція: після виклику в модулі немає ні заглушки, ні її стану.
+        $pathProviderStubLeaked = {
+            param($Module)
+            return [bool](& $Module {
+                    [bool](Get-Command -Name 'Test-Path' -CommandType Function -ErrorAction SilentlyContinue) -or
+                    [bool](Get-Variable -Name 'BRAVOSelfTestPathBehaviours' -Scope Script -ErrorAction SilentlyContinue)
+                })
+        }
 
         $planInvoke = {
             param($Module, $Mode, $TargetPath, $BackupRoot, $RuntimeRoot, $StagingRoot, $Definitions)
@@ -357,6 +413,126 @@ function Stop-Process {
             ) `
             -Name "DataRestore/PlanInPlaceUsesDiscoveryAndPrerestoreName" `
             -Failure "InPlace-план має забороняти -TargetPath, відхиляти невизначене live-джерело і давати ціль discovery разом із prerestore-іменем <live>.prerestore_<stamp>"
+
+        # OutOfPlace на недосяжний UNC -TargetPath: класифікована відмова
+        # плану (InvalidConfiguration), а не виняток Test-Path.
+        $planUncThrew = $false
+        $planUncResult = $null
+        try {
+            $planUncResult = & $unreachableUncInvoke $dataRestoreModule {
+                param($b, $r, $s, $d)
+                Get-BRAVODataRestorePlan `
+                    -ComponentTypes @('MODEL') `
+                    -RestoreMode 'OutOfPlace' `
+                    -RequestedTargetPath '\\nas-host\share\restore' `
+                    -BackupRoot $b `
+                    -RuntimeRootPath $r `
+                    -StagingRoot $s `
+                    -ArchiveDefinitions $d `
+                    -RunStamp '20260814_120000'
+            } @($planBackupRoot, $planRuntimeRoot, $planStagingRoot, $planDefinitions)
+        } catch {
+            $planUncThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                -not $planUncThrew -and
+                $null -ne $planUncResult -and
+                -not $planUncResult.Success -and
+                ([string]$planUncResult.Error).Contains('-TargetPath недоступний') -and
+                -not (& $pathProviderStubLeaked $dataRestoreModule)
+            ) `
+            -Name "DataRestore/PlanClassifiesUnreachableUncTarget" `
+            -Failure "Get-BRAVODataRestorePlan (OutOfPlace) на недосяжний UNC -TargetPath має повертати Success=false з поясненням недоступності, а не кидати виняток Test-Path"
+
+        # Контракт Get-BRAVODataRestorePathProbe: "шляху немає" (Exists=$false,
+        # Error=$null) і "існування не вдалося визначити" (Error заповнено) —
+        # різні стани. UNC-поведінку задає заглушка провайдера: мережа й DNS
+        # не чіпаються (CI-раннер резолвить вигадане ім'я інакше, ніж
+        # доменний сервер, тож на нього не покладаємось).
+        $pathProbeCases = $null
+        $pathProbeThrew = $false
+        try {
+            $pathProbeCases = & $pathProviderInvoke $dataRestoreModule @{
+                '\\reachable-host\' = 'Exists'
+                '\\unresolved-host\' = 'Missing'
+                '\\nas-host\' = 'IOException'
+                '\\denied-host\' = 'Unauthorized'
+                '\\provider-host\' = 'ProviderError'
+            } {
+                param($existing, $missing)
+                [pscustomobject]@{
+                    LocalExisting = Get-BRAVODataRestorePathProbe -Path $existing -PathType Container
+                    LocalExistingAsLeaf = Get-BRAVODataRestorePathProbe -Path $existing -PathType Leaf
+                    LocalMissing = Get-BRAVODataRestorePathProbe -Path $missing
+                    ReachableUnc = Get-BRAVODataRestorePathProbe -Path '\\reachable-host\share\data' -PathType Container
+                    UnresolvedUnc = Get-BRAVODataRestorePathProbe -Path '\\unresolved-host\share\data'
+                    UnreachableUnc = Get-BRAVODataRestorePathProbe -Path '\\nas-host\share\data'
+                    AccessDenied = Get-BRAVODataRestorePathProbe -Path '\\denied-host\share\data'
+                    ProviderFailure = Get-BRAVODataRestorePathProbe -Path '\\provider-host\share\data'
+                }
+            } @($planTarget, (Join-Path $planTestRoot 'MISSING'))
+        } catch {
+            $pathProbeThrew = $true
+        }
+        $pathProbeIs = {
+            param($Probe, [bool]$Exists, [bool]$HasError)
+            return ($null -ne $Probe -and [bool]$Probe.Exists -eq $Exists -and (($null -ne $Probe.Error) -eq $HasError))
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                -not $pathProbeThrew -and
+                $null -ne $pathProbeCases -and
+                (& $pathProbeIs $pathProbeCases.LocalExisting $true $false) -and
+                (& $pathProbeIs $pathProbeCases.LocalExistingAsLeaf $false $false) -and
+                (& $pathProbeIs $pathProbeCases.LocalMissing $false $false) -and
+                (& $pathProbeIs $pathProbeCases.ReachableUnc $true $false) -and
+                (& $pathProbeIs $pathProbeCases.UnresolvedUnc $false $false) -and
+                (& $pathProbeIs $pathProbeCases.UnreachableUnc $false $true) -and
+                ([string]$pathProbeCases.UnreachableUnc.Error).Contains('network path was not found') -and
+                (& $pathProbeIs $pathProbeCases.AccessDenied $false $true) -and
+                (& $pathProbeIs $pathProbeCases.ProviderFailure $false $true) -and
+                -not (& $pathProviderStubLeaked $dataRestoreModule)
+            ) `
+            -Name "DataRestore/PathProbeSeparatesMissingFromUndeterminable" `
+            -Failure "Get-BRAVODataRestorePathProbe: наявний/відсутній шлях (локальний чи UNC) -> Exists без Error; IOException, UnauthorizedAccessException і загальна помилка провайдера -> Error заповнено, а не тихе Exists=`$false і не виняток; заглушка не лишається в модулі; результат: $($pathProbeCases | ConvertTo-Json -Compress -Depth 3)"
+
+        # Ціль компонента, існування якої не вдалося перевірити, — відмова
+        # плану, а не "відсутня ціль" (інакше runtime прийняв би чужий
+        # каталог за створений ним). Контроль: той самий корінь без
+        # заглушки дає успішний план.
+        $planComponentProbeRoot = Join-Path $planTestRoot 'TARGET_COMPONENT_PROBE'
+        [void][IO.Directory]::CreateDirectory($planComponentProbeRoot)
+        $planComponentProbeControl = & $planInvoke $dataRestoreModule 'OutOfPlace' $planComponentProbeRoot $planBackupRoot $planRuntimeRoot $planStagingRoot $planDefinitions
+        $planComponentProbeThrew = $false
+        $planComponentProbeResult = $null
+        try {
+            $planComponentProbeResult = & $pathProviderInvoke $dataRestoreModule @{ (Join-Path $planComponentProbeRoot 'MODEL') = 'IOException' } {
+                param($t, $b, $r, $s, $d)
+                Get-BRAVODataRestorePlan `
+                    -ComponentTypes @('MODEL') `
+                    -RestoreMode 'OutOfPlace' `
+                    -RequestedTargetPath $t `
+                    -BackupRoot $b `
+                    -RuntimeRootPath $r `
+                    -StagingRoot $s `
+                    -ArchiveDefinitions $d `
+                    -RunStamp '20260814_120000'
+            } @($planComponentProbeRoot, $planBackupRoot, $planRuntimeRoot, $planStagingRoot, $planDefinitions)
+        } catch {
+            $planComponentProbeThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $planComponentProbeControl.Success -and
+                -not $planComponentProbeThrew -and
+                $null -ne $planComponentProbeResult -and
+                -not $planComponentProbeResult.Success -and
+                ([string]$planComponentProbeResult.Error).Contains('ціль компонента недоступна для перевірки') -and
+                -not (& $pathProviderStubLeaked $dataRestoreModule)
+            ) `
+            -Name "DataRestore/PlanComponentTargetUndeterminableFailsClosed" `
+            -Failure "Get-BRAVODataRestorePlan: ціль компонента, яку не вдалося перевірити (помилка провайдера), має давати Success=false з поясненням недоступності, а не вважатися відсутньою; контроль без заглушки має бути успішним; результат: $($planComponentProbeResult | ConvertTo-Json -Compress -Depth 3)"
     } finally {
         if (Test-Path -LiteralPath $planTestRoot) {
             Remove-Item -LiteralPath $planTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -379,56 +555,85 @@ function Stop-Process {
                 -Requirements @([pscustomobject]@{ TargetDirectory = $dir; RequiredBytes = [long]900000000000000 }) `
                 -MinimumFreeGigabytes 1
         } $freeSpaceTestRoot
-        $freeSpaceUnc = & $dataRestoreModule {
-            Test-BRAVODataRestoreFreeSpace `
-                -Requirements @([pscustomobject]@{ TargetDirectory = '\\\\nas-host\\share\\restore'; RequiredBytes = [long]1024 }) `
-                -MinimumFreeGigabytes 1
-        }
-        Test-BRAVOCondition `
-            -Condition (
-                $freeSpaceOk.Success -and
-                -not $freeSpaceImpossible.Success -and
-                @($freeSpaceUnc.Notes).Count -gt 0
-            ) `
-            -Name "DataRestore/FreeSpacePreflightBlocksAndProbes" `
-            -Failure "Test-BRAVODataRestoreFreeSpace має пропускати реалістичну вимогу, блокувати завідомо неможливу (з урахуванням резерву MinimumFreeSpaceGB) і для UNC-цілі лишати нотатку замість перевірки обсягу"
-
-        # Регресія (реальний сервер, 2026-09-14): на доменному хості
-        # Test-Path по недосяжному UNC не повертає $false, а піднімає
-        # "The network path was not found" — після успішного резолву імені
-        # йде спроба SMB. Під $ErrorActionPreference = 'Stop' це вбивало
-        # весь self-test ("Fatal: The network path was not found") і, що
-        # важливіше, зробило б відновлення на тимчасово недоступний UNC
-        # некатегоризованою фатальною помилкою замість класифікованої
-        # проблеми. CI-раннер дефекту не бачив: там ім'я просто не
-        # резолвиться, і Test-Path тихо повертає $false.
+        # UNC-виклики — лише через $unreachableUncInvoke і в try/catch:
+        # регресія тут має дати [FAIL] конкретної перевірки, а не обірвати
+        # решту DataRestore-сюїти як "Fatal".
         $uncProbeThrew = $false
-        $uncProbeResult = $null
+        $freeSpaceUnc = $null
         try {
-            $uncProbeResult = & $dataRestoreModule {
+            $freeSpaceUnc = & $unreachableUncInvoke $dataRestoreModule {
                 Test-BRAVODataRestoreFreeSpace `
-                    -Requirements @([pscustomobject]@{ TargetDirectory = '\\\\nas-host\\share\\restore'; RequiredBytes = [long]1024 }) `
+                    -Requirements @([pscustomobject]@{ TargetDirectory = '\\nas-host\share\restore'; RequiredBytes = [long]1024 }) `
                     -MinimumFreeGigabytes 1
-            }
+            } @()
         } catch {
             $uncProbeThrew = $true
         }
         Test-BRAVOCondition `
             -Condition (
-                -not $uncProbeThrew -and
-                $null -ne $uncProbeResult -and
-                -not $uncProbeResult.Success -and
-                @($uncProbeResult.Problems).Count -gt 0
+                $freeSpaceOk.Success -and
+                -not $freeSpaceImpossible.Success -and
+                $null -ne $freeSpaceUnc -and
+                @($freeSpaceUnc.Notes).Count -gt 0
             ) `
-            -Name "DataRestore/UnreachableUncTargetIsClassifiedNotFatal" `
-            -Failure "недосяжна UNC-ціль має давати класифіковану проблему (Success=false + Problems), а не термінальну помилку"
+            -Name "DataRestore/FreeSpacePreflightBlocksAndProbes" `
+            -Failure "Test-BRAVODataRestoreFreeSpace має пропускати реалістичну вимогу, блокувати завідомо неможливу (з урахуванням резерву MinimumFreeSpaceGB) і для UNC-цілі лишати нотатку замість перевірки обсягу"
+
+        # Регресія (реальні сервери, 2026-09-14 і 2026-10-01): на доменному
+        # хості Test-Path по недосяжному UNC піднімає "The network path was
+        # not found" замість $false. Під $ErrorActionPreference = 'Stop' це
+        # вбивало весь self-test ("Fatal: The network path was not found"),
+        # а в production зробило б відновлення на тимчасово недоступний UNC
+        # некатегоризованою фатальною помилкою замість класифікованої.
         Test-BRAVOCondition `
             -Condition (
-                $dataRestoreRuntimeTextForTests -match 
-                    '(?m)^\s*-not \(Test-Path -LiteralPath \$probeDirectory -PathType Container -ErrorAction SilentlyContinue\)\)'
+                -not $uncProbeThrew -and
+                $null -ne $freeSpaceUnc -and
+                -not $freeSpaceUnc.Success -and
+                @($freeSpaceUnc.Problems).Count -gt 0 -and
+                (@($freeSpaceUnc.Problems) -join ' | ').Contains('ціль недоступна для перевірки') -and
+                -not (& $pathProviderStubLeaked $dataRestoreModule)
+            ) `
+            -Name "DataRestore/UnreachableUncTargetIsClassifiedNotFatal" `
+            -Failure "недосяжна UNC-ціль має давати класифіковану проблему 'ціль недоступна для перевірки' (Success=false + Problems), а не термінальну помилку чи 'немає батьківського каталогу'; заглушка Test-Path не має лишатися в self-test-модулі; проблеми: $(@($freeSpaceUnc.Problems) -join ' | ')"
+
+        # Помилка провайдера на перевірці write-probe файлу перед прибиранням
+        # — класифікована проблема (fail-closed), а не виняток із finally.
+        $freeSpaceCleanupThrew = $false
+        $freeSpaceCleanupProbe = $null
+        try {
+            $freeSpaceCleanupProbe = & $pathProviderInvoke $dataRestoreModule @{ (Join-Path $freeSpaceTestRoot 'BRAVO_DATA_RESTORE_PROBE_') = 'IOException' } {
+                param($dir)
+                Test-BRAVODataRestoreFreeSpace `
+                    -Requirements @([pscustomobject]@{ TargetDirectory = $dir; RequiredBytes = [long]1024 }) `
+                    -MinimumFreeGigabytes 0.001
+            } @($freeSpaceTestRoot)
+        } catch {
+            $freeSpaceCleanupThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                -not $freeSpaceCleanupThrew -and
+                $null -ne $freeSpaceCleanupProbe -and
+                -not $freeSpaceCleanupProbe.Success -and
+                (@($freeSpaceCleanupProbe.Problems) -join ' | ').Contains('не вдалося перевірити для прибирання') -and
+                -not (& $pathProviderStubLeaked $dataRestoreModule)
+            ) `
+            -Name "DataRestore/FreeSpaceCleanupProbeErrorIsClassified" `
+            -Failure "помилка провайдера при перевірці write-probe файлу перед прибиранням має бути проблемою preflight (Success=false), а не винятком; проблеми: $(@($freeSpaceCleanupProbe.Problems) -join ' | ')"
+        # Структурна гарантія: у DataRestore runtime жодна перевірка шляху,
+        # що може бути UNC-ціллю, не йде повз Get-BRAVODataRestorePathProbe
+        # (-ErrorAction SilentlyContinue термінальну помилку провайдера
+        # не гарантовано гасить).
+        $rawUncTestPathPattern = '(?m)Test-Path -LiteralPath \$(probeDirectory|probeFile|targetRoot|componentTarget|restorePlan\.TargetRoot) -PathType'
+        Test-BRAVOCondition `
+            -Condition (
+                $dataRestoreRuntimeTextForTests -match '(?m)^function Get-BRAVODataRestorePathProbe \{' -and
+                $dataRestoreRuntimeTextForTests -notmatch $rawUncTestPathPattern -and
+                $dataRestoreRuntimeTextForTests -notmatch '(?m)^\s*if \(Test-Path -LiteralPath \$componentTarget\)'
             ) `
             -Name "DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors" `
-            -Failure "пошук наявного батьківського каталогу у write-probe мусить придушувати помилки провайдера (-ErrorAction SilentlyContinue), інакше недосяжний UNC валить весь виклик"
+            -Failure "перевірки існування UNC-можливих цілей (write-probe, -TargetPath, ціль компонента, out-of-place корінь) мусять іти через Get-BRAVODataRestorePathProbe, інакше недосяжний UNC валить весь виклик"
     } finally {
         if (Test-Path -LiteralPath $freeSpaceTestRoot) {
             Remove-Item -LiteralPath $freeSpaceTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -4082,6 +4287,7 @@ function Copy-BRAVODataRestoreDirectoryAcl { param($SourceDirectory, $Destinatio
 function Set-BRAVODataRestoreCreatedDirectoryAcl { param($Path) }
 function Invoke-BRAVOSevenZipExtraction {
     Add-ProbeEvent 'EXTRACT'
+    if ($script:ProbeScenario -eq 'SMProviderErrorAfterQuiescence') { throw (New-Object System.IO.IOException('The network path was not found.')) }
     if ($script:ProbeScenario -eq 'InPlaceThrowInExtraction' -or $script:ProbeThrowInExtraction) { throw 'self-test: імітований збій розпакування' }
     return [pscustomobject]@{ Success = $true; Description = '' }
 }
@@ -4284,6 +4490,7 @@ try {
         SMInheritedSuppressedFailureKeepsHold = @{ Services = $probeAllStopped; Modes = $probeAllDisabled; Throw = $true
             Marker = 'foreign'; Suppressed = $true; Intent = @('BRAVO', 'exchangAPI'); Snapshot = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Automatic' } }
         SMHoldLostBetweenComponents = @{ Services = $probeAllRunning; Modes = $probeOriginalModes }
+        SMProviderErrorAfterQuiescence = @{ Services = $probeAllRunning; Modes = $probeOriginalModes }
         SMConfirmFailureAborts = @{ Services = $probeAllRunning; Modes = $probeOriginalModes; SetNoop = @('BRAVO=Disabled') }
         SMTypeRestoreFailureKeepsMarker = @{ Services = @{ BRAVO = 'Running'; exchangAPI = 'Stopped'; BravoWeb = 'Running' }; Modes = @{ BRAVO = 'AutomaticDelayed'; exchangAPI = 'Manual'; BravoWeb = 'Automatic' }; SetFailures = @('exchangAPI=Manual') }
         SMRollbackIncomplete = @{ Services = $probeAllRunning; Modes = $probeOriginalModes; Throw = $true; UndoFails = $true }
@@ -4365,6 +4572,29 @@ try {
         ('$script:ProbeRegistryThrows = {0}' -f $probeListLiterals['RegistryThrows']),
         ('$script:ProbeStatePath = ''{0}''' -f $probeStatePath.Replace("'", "''"))
     ) -join "`n"
+    # #342: недосяжна (UNC) out-of-place ціль. Заглушка Test-Path живе лише
+    # в цьому дочірньому процесі й кидає помилку провайдера на заданому
+    # префіксі шляху; решта шляхів — справжній Test-Path.
+    $probeUnreachablePrefix = switch ($Scenario) {
+        'OutOfPlaceTargetUnreachable' { Join-Path $ProbeRoot 'target' }
+        'OutOfPlaceComponentTargetUnreachable' { Join-Path (Join-Path $ProbeRoot 'target') 'MODEL' }
+        default { $null }
+    }
+    if ($null -ne $probeUnreachablePrefix) {
+        $probeScenarioSeed = @(
+            $probeScenarioSeed,
+            ('$script:ProbeUnreachablePrefix = ''{0}''' -f $probeUnreachablePrefix.Replace("'", "''")),
+            'function Test-Path {',
+            '    [CmdletBinding()]',
+            '    param([string]$LiteralPath, [string]$PathType = ''Any'')',
+            '    if ($LiteralPath.StartsWith($script:ProbeUnreachablePrefix, [StringComparison]::OrdinalIgnoreCase)) {',
+            '        Add-ProbeEvent (''PROBE-UNREACHABLE '' + (Split-Path -Leaf $LiteralPath))',
+            '        throw (New-Object System.IO.IOException(''The network path was not found.''))',
+            '    }',
+            '    Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType',
+            '}'
+        ) -join "`n"
+    }
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
         'function Invoke-BRAVODataRestoreOrchestrationProbe {',
@@ -4396,7 +4626,7 @@ try {
         Force = $true
         NoPause = $true
     }
-    if ($Scenario -eq 'OutOfPlace') {
+    if ($Scenario -like 'OutOfPlace*') {
         $probeParameters['Mode'] = 'OutOfPlace'
         $probeParameters['TargetPath'] = (Join-Path $ProbeRoot 'target')
     } else {
@@ -4429,7 +4659,7 @@ try {
             [IO.File]::WriteAllText($dataRestoreOrchestrationProbePath, $dataRestoreOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $dataRestoreOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $dataRestoreOrchestrationResults = @{}
-            foreach ($dataRestoreOrchestrationScenario in @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace', 'SMNormal', 'SMManualStopped', 'SMDelayedAutomaticStopped', 'SMOperatorDisabled', 'SMForeignSnapshotHeld', 'SMForeignSnapshotRepairable', 'SMMissingSnapshot', 'SMMalformedMarker', 'SMFailureDuringRestore', 'SMFailureDuringServiceRestart', 'SMLiveForeignOwner', 'SMHoldFailureAborts', 'SMSnapshotFailureAborts', 'SMUnreadableModeAborts', 'SMForeignDisallowedEntry', 'SMInheritedSuppressedFailureKeepsHold', 'SMHoldLostBetweenComponents', 'SMConfirmFailureAborts', 'SMTypeRestoreFailureKeepsMarker', 'SMRollbackIncomplete', 'SMRepairFailedRecovers')) {
+            foreach ($dataRestoreOrchestrationScenario in @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace', 'SMNormal', 'SMManualStopped', 'SMDelayedAutomaticStopped', 'SMOperatorDisabled', 'SMForeignSnapshotHeld', 'SMForeignSnapshotRepairable', 'SMMissingSnapshot', 'SMMalformedMarker', 'SMFailureDuringRestore', 'SMFailureDuringServiceRestart', 'SMLiveForeignOwner', 'SMHoldFailureAborts', 'SMSnapshotFailureAborts', 'SMUnreadableModeAborts', 'SMForeignDisallowedEntry', 'SMInheritedSuppressedFailureKeepsHold', 'SMHoldLostBetweenComponents', 'SMConfirmFailureAborts', 'SMTypeRestoreFailureKeepsMarker', 'SMRollbackIncomplete', 'SMRepairFailedRecovers', 'OutOfPlaceTargetUnreachable', 'OutOfPlaceComponentTargetUnreachable', 'SMProviderErrorAfterQuiescence')) {
                 $dataRestoreOrchestrationScenarioRoot = Join-Path $dataRestoreOrchestrationRoot $dataRestoreOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($dataRestoreOrchestrationScenarioRoot)
                 # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
@@ -4633,6 +4863,37 @@ try {
                 -Name "DataRestore/OrchestrationOutOfPlaceLeavesServicesUntouched" `
                 -Failure "OutOfPlace не повинен знімати стан, зупиняти чи запускати служби або писати маркер quiescence — лише розпакувати компонент і завершитися кодом 0 без SUCCESS-сповіщення за errors_only; проба: $($dataRestoreOutOfPlace | ConvertTo-Json -Compress -Depth 4)"
 
+            # (7a) #342: out-of-place корінь або ціль компонента стали недосяжні
+            # (UNC, помилка провайдера) уже ПІСЛЯ плану: класифікована відмова
+            # RestoreFailed (43), без розпакування, без створення цілі
+            # компонента, без жодної дії зі службами; lock звільнено й
+            # зовнішній finally виконано (не некатегоризований виняток).
+            $dataRestoreUncOutcome = {
+                param([string]$Scenario, [string]$ProbeLeaf, [string]$ReasonText)
+                $uncResult = $dataRestoreOrchestrationResults[$Scenario]
+                $uncEvents = @(& $dataRestoreOrchestrationEvents $uncResult)
+                return ($null -eq $uncResult.PSObject.Properties['ProbeError'] -and
+                    $uncResult.ExitCode -eq 43 -and
+                    [string]$uncResult.ExitCodeName -ceq 'RestoreFailed' -and
+                    @($uncEvents | Where-Object { $_ -ceq ('PROBE-UNREACHABLE ' + $ProbeLeaf) }).Count -ge 1 -and
+                    @($uncEvents | Where-Object { $_ -like ('LOG-ERROR *' + $ReasonText + '*') }).Count -ge 1 -and
+                    @($uncEvents | Where-Object { $_ -match '^(STOP |START |MARKER-|MOVE-ASIDE$|EXTRACT$|SETMODE )' }).Count -eq 0 -and
+                    (& $dataRestoreOrchestrationEventIndex $uncEvents ('^PROBE-UNREACHABLE ' + [regex]::Escape($ProbeLeaf) + '$')) -lt (& $dataRestoreOrchestrationEventIndex $uncEvents '^LOCK-EXIT$') -and
+                    (& $dataRestoreOrchestrationEventIndex $uncEvents '^LOCK-EXIT$') -lt (& $dataRestoreOrchestrationEventIndex $uncEvents '^MANUAL-EXIT$') -and
+                    -not (Test-Path -LiteralPath (Join-Path (Join-Path (Join-Path $dataRestoreOrchestrationRoot $Scenario) 'target') 'MODEL')))
+            }
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $dataRestoreUncOutcome 'OutOfPlaceTargetUnreachable' 'target' 'ціль out-of-place недоступна') -and
+                    -not (Test-Path -LiteralPath (Join-Path (Join-Path $dataRestoreOrchestrationRoot 'OutOfPlaceTargetUnreachable') 'target'))
+                ) `
+                -Name "DataRestore/OrchestrationOutOfPlaceUnreachableTargetIsClassified" `
+                -Failure "недосяжний out-of-place корінь (помилка провайдера після плану) має дати RestoreFailed (43) без створення кореня, розпакування й дій зі службами, зі звільненим lock і виконаним finally; проба: $($dataRestoreOrchestrationResults['OutOfPlaceTargetUnreachable'] | ConvertTo-Json -Compress -Depth 4)"
+            Test-BRAVOCondition `
+                -Condition (& $dataRestoreUncOutcome 'OutOfPlaceComponentTargetUnreachable' 'MODEL' 'ціль компонента недоступна для перевірки') `
+                -Name "DataRestore/OrchestrationOutOfPlaceUnreachableComponentTargetIsClassified" `
+                -Failure "ціль компонента, яку не вдалося перевірити перед створенням, має дати відмову компонента RestoreFailed (43) без створення цілі й розпакування, зі звільненим lock і виконаним finally; проба: $($dataRestoreOrchestrationResults['OutOfPlaceComponentTargetUnreachable'] | ConvertTo-Json -Compress -Depth 4)"
+
             # ----------------------------------------------------------------
             # #333: тимчасове утримання типу запуску служб на час restore — той
             # самий контракт, що Maintenance (#297/#329): знімок -> тимчасовий
@@ -4767,6 +5028,26 @@ try {
                 ) `
                 -Name "DataRestore/StartModeRestoredWhenRestoreFails" `
                 -Failure "збій restore (виняток у розпакуванні, rollback завершено): finally має повернути точні типи й запустити служби, маркер прибрано, код 43; проба: $($smRestoreFail | ConvertTo-Json -Compress -Depth 4)"
+
+            # (SM8a) #342: помилка провайдера ("The network path was not found",
+            # IOException) уже ПІСЛЯ зупинки й утримання служб: класифікована
+            # відмова компонента (43), rollback, finally повертає точні типи
+            # запуску й запускає служби за наміром, маркер прибрано.
+            $smProviderFail = $dataRestoreOrchestrationResults['SMProviderErrorAfterQuiescence']
+            $smProviderFailEvents = @(& $smEvents $smProviderFail)
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $smProviderFail.PSObject.Properties['ProbeError'] -and
+                    $smProviderFail.ExitCode -eq 43 -and
+                    (& $smModesEqual (& $smModes $smProviderFailEvents 'MODES-AT-MOVE-ASIDE') $smAllDisabled) -and
+                    @($smProviderFailEvents | Where-Object { $_ -ceq 'ROLLBACK' }).Count -eq 1 -and
+                    @($smProviderFailEvents | Where-Object { $_ -like 'LOG-ERROR *network path was not found*' }).Count -ge 1 -and
+                    (& $smModesEqual (& $smModes $smProviderFailEvents 'FINAL-MODES') $smOriginal) -and
+                    @($smProviderFailEvents | Where-Object { $_ -match '^START (BRAVO|exchangAPI|BravoWeb)$' }).Count -eq 3 -and
+                    @($smProviderFailEvents | Where-Object { $_ -ceq 'FINAL-MARKER absent' }).Count -eq 1
+                ) `
+                -Name "DataRestore/StartModeRestoredWhenProviderErrorAfterQuiescence" `
+                -Failure "помилка провайдера після утримання служб: відмова компонента з кодом 43 і rollback, finally повертає точні типи запуску й запускає служби, маркер прибрано; проба: $($smProviderFail | ConvertTo-Json -Compress -Depth 4)"
 
             # (SM9) Збій старту служби: типи повернуто ДО спроби старту, код 43,
             # маркер лишається suppressed (Health алертить), а не зникає й не стартує сам.
