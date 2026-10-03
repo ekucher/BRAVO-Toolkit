@@ -1111,7 +1111,11 @@ function Reset-BRAVOSelfTestStartModes {
 }
 function Get-BRAVOServiceRegistryStartMode {
     param([string]$ServiceName)
-    if ($script:Q297Modes.ContainsKey($ServiceName)) { return [string]$script:Q297Modes[$ServiceName] }
+    if ($script:Q297Modes.ContainsKey($ServiceName)) {
+        # #349: 'THROW' — збій читання реєстру (тип запуску не прочитано).
+        if ([string]$script:Q297Modes[$ServiceName] -ceq 'THROW') { throw "self-test: тип запуску $ServiceName не прочитано з реєстру" }
+        return [string]$script:Q297Modes[$ServiceName]
+    }
     return $null
 }
 function Set-BRAVOServiceStartMode {
@@ -1256,6 +1260,9 @@ function Start-Sleep { param($Seconds) }
             $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $managed)
             $out.MixedSnapshotCount = $snapshot.Count
             $out.Mixed = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot $snapshot)
+            # Збій читання реєстру для служби поза знімком — теж неутримувана
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'THROW'; BravoWeb = 'Disabled' }
+            $out.Throws = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot @(@{ Name = 'BRAVO'; StartMode = 'Automatic' }))
             # Disabled оператором: без збою і лишається Disabled
             Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Disabled'; BravoWeb = 'Manual' }
             $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $managed)
@@ -1277,10 +1284,11 @@ function Start-Sleep { param($Seconds) }
                 $unrestorableScenario.MixedSnapshotCount -eq 1 -and
                 @($unrestorableScenario.Mixed).Count -eq 2 -and
                 (@($unrestorableScenario.Mixed) -join '|') -like '*exchangAPI (*Other*' -and
-                (@($unrestorableScenario.Mixed) -join '|') -like '*BravoWeb (*не прочитано*'
+                (@($unrestorableScenario.Mixed) -join '|') -like '*BravoWeb (*не прочитано*' -and
+                (@($unrestorableScenario.Throws) -join '|') -ceq 'exchangAPI (тип запуску: не прочитано)'
             ) `
             -Name "ServiceQuiescence/MaintenanceUnreadableAndOtherStartTypeIsFailure" `
-            -Failure "Maintenance (#349): служба зі start type Other або нечитаним ($null) поза знімком має бути названа як неутримувана (fail-closed), а не тихо пропущена"
+            -Failure "Maintenance (#349): служба зі start type Other, нечитаним ($null) або зі збоєм читання реєстру поза знімком має бути названа як неутримувана (fail-closed), а не тихо пропущена"
         Test-BRAVOCondition `
             -Condition (
                 @($unrestorableScenario.DisabledFailures).Count -eq 0 -and

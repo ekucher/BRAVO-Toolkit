@@ -11,7 +11,11 @@
   тип не `Disabled`; кожна така служба логується як ERROR і додається в `startModeSuppressionFailures`
   (та сама fail-closed політика: реставрація моделі before-archive/bravocmd скасовується через
   `Confirm-BRAVOServicesQuiesced`, решта обслуговування триває). Службу, вимкнену оператором
-  (`Disabled`), не чіпаємо. Додано self-test `ServiceQuiescence/Maintenance*`.
+  (`Disabled`), не чіпаємо. Додано self-test `ServiceQuiescence/Maintenance*` (Other, нечитаний
+  тип і збій читання реєстру) і поведінкові сценарії справжньої оркестрації Maintenance
+  `Maintenance/StartMode*`: Other, нечитаний тип і збій читання реєстру скасовують реставрацію
+  ДО архіву перед реставрацією й bravocmd (ERROR у журналі, служби підняті у finally), а
+  Automatic/AutomaticDelayed/Manual і `Disabled` оператором доходять до архіву.
 
 - **Fix: на Windows Server 2012/2012 R2 заплановані завдання завершувались з кодом 1 без логу.**
   Runtime перемикав кодову сторінку консолі на UTF-8 (65001); у консолі SYSTEM (сесія 0) на

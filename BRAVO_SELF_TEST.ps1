@@ -13961,14 +13961,47 @@ function Write-BRAVOServiceQuiescenceState {
     param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
     Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
 }
-# #297: утримання від автостарту. Стаби повертають порожній знімок (жодних
-# змін start type, жодних подій у журналі проби) — оркестрація кроків і
-# порядок подій лишаються рівно тими, що були до #297.
-function New-BRAVOServiceStartTypeSnapshot { param([string[]]$ServiceNames) return @() }
-# #349: реєстровий тип запуску — Disabled, щоб порожній стаб-знімок не вважався
-# «неутримуваною» службою (перевірка Get-BRAVOMaintenanceUnrestorableServiceNames).
-function Get-BRAVOServiceRegistryStartMode { param([string]$ServiceName) return 'Disabled' }
-function Suspend-BRAVOServiceAutostart { param([object[]]$Snapshot) return [pscustomobject]@{ Applied = @(); Failed = @() } }
+# #297: утримання від автостарту. Без $script:ProbeStartModes стаби повертають
+# порожній знімок і Disabled-тип (жодних змін start type, жодних подій у
+# журналі проби) — оркестрація кроків і порядок подій лишаються рівно тими,
+# що були до #297; Disabled не дає порожньому знімку вважатися
+# «неутримуваною» службою (#349).
+# #349: зі $script:ProbeStartModes (ім'я -> тип запуску; 'THROW' = збій
+# читання реєстру) стаби відтворюють контракт BRAVO.System: знімок бере лише
+# Automatic/AutomaticDelayed/Manual, а збій читання пробиває знімок.
+function Get-BRAVOServiceRegistryStartMode {
+    param([string]$ServiceName)
+    if ($null -eq $script:ProbeStartModes) { return 'Disabled' }
+    if (-not $script:ProbeStartModes.ContainsKey($ServiceName)) { return $null }
+    $probeStartMode = $script:ProbeStartModes[$ServiceName]
+    if ([string]$probeStartMode -ceq 'THROW') { throw "self-test: тип запуску $ServiceName не прочитано з реєстру" }
+    return $probeStartMode
+}
+function New-BRAVOServiceStartTypeSnapshot {
+    param([string[]]$ServiceNames)
+    if ($null -eq $script:ProbeStartModes) { return @() }
+    $probeSnapshot = @()
+    foreach ($probeSnapshotName in @($ServiceNames)) {
+        $probeSnapshotMode = Get-BRAVOServiceRegistryStartMode -ServiceName $probeSnapshotName
+        if (@('Automatic', 'AutomaticDelayed', 'Manual') -contains [string]$probeSnapshotMode) {
+            $probeSnapshot += @{ Name = [string]$probeSnapshotName; StartMode = [string]$probeSnapshotMode }
+        }
+    }
+    return $probeSnapshot
+}
+function Suspend-BRAVOServiceAutostart {
+    param([object[]]$Snapshot)
+    foreach ($probeHeld in @($Snapshot)) { Add-ProbeEvent ("HOLD " + [string]$probeHeld.Name) }
+    return [pscustomobject]@{ Applied = @(@($Snapshot) | ForEach-Object { [string]$_.Name }); Failed = @() }
+}
+function Get-BRAVOSevenZipExitCodeDescription { param([int]$ExitCode) return 'self-test' }
+# #349: native-операція (7-Zip архів перед реставрацією, bravocmd) лише
+# реєструється; код 2 зупиняє реставрацію на першій же операції.
+function Invoke-CommandWithLog {
+    param([string]$Command, [array]$Arguments, [string]$Description, [int]$TimeoutSeconds, [AllowNull()][string]$StandardInputText)
+    Add-ProbeEvent ("NATIVE " + $Description)
+    return 2
+}
 function Restore-BRAVOServiceStartTypeSnapshot { param([object[]]$Snapshot, [string[]]$AllowedServiceNames) return [pscustomobject]@{ Restored = @(); Unchanged = @(); Foreign = @(); Failed = @() } }
 function Confirm-BRAVOServicesQuiesced { param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds) return [pscustomobject]@{ Ok = $true; Offenders = @(); StoppedAgain = @() } }
 function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
@@ -14198,10 +14231,41 @@ try {
         ('$script:ProbeServices = {0}' -f $probeServiceTable),
         ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' })),
         ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' })),
+        # #349: типи запуску служб (лише сценарії утримання; інакше — стаби до #297).
+        ('$script:ProbeStartModes = {0}' -f $(switch ($Scenario) {
+                'StartModeOther' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Other'; 'BravoWeb' = 'Manual' }" }
+                'StartModeUnreadable' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed' }" }
+                'StartModeQueryThrows' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'THROW'; 'BravoWeb' = 'Manual' }" }
+                'StartModeHeld' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeOperatorDisabled' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Disabled'; 'BravoWeb' = 'Manual' }" }
+                default { '$null' }
+            })),
         # #297: результат раннього самовідновлення типів запуску (у production
         # його виставляє преамбула, яку seed замінює).
         '$script:startModeRepairResult = [pscustomobject]@{ Status = ''NoMarker''; Owner = $null; Snapshot = @(); Restored = @(); Failed = @(); Foreign = @() }'
     ) -join "`n"
+    # #349: сценарії утримання вмикають реставрацію (після seed) — щоб довести,
+    # що fail-closed зупиняє її ДО архіву перед реставрацією й bravocmd.
+    $probeRestoreSeed = ''
+    if ($Scenario -like 'StartMode*') {
+        $probeRestoreSeed = @(
+            '$shouldRestore = $true',
+            '$ForceRestore = $true',
+            '$restoreReason = ''self-test''',
+            '$script:BRAVOMaintenanceRestoreStepEnabled = $true',
+            '$ARCH_NAME1 = ''self-test_before.mdz''',
+            '$SIZES_FILE = Join-Path $probeWorkRoot ''logs\file_sizes_before.csv''',
+            '$arcCommonParams = @()',
+            '$MODEL_PROJECT_PATH = $MODEL_PATH',
+            '$MODEL_NAME = ''self-test''',
+            '$MAIN_MODEL_FILE = ''self-test.md''',
+            '$BRAVOCMD_PATH = Join-Path $probeWorkRoot ''lims\bravocmd.exe''',
+            '[void][IO.Directory]::CreateDirectory($MODEL_PATH)',
+            '[IO.File]::WriteAllText((Join-Path $MODEL_PATH ''self-test.md''), ''self-test'')',
+            '[void][IO.Directory]::CreateDirectory($LOG_DIR)',
+            '[void][IO.Directory]::CreateDirectory($ARC_DIR)'
+        ) -join "`n"
+    }
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
         'function Invoke-BRAVOMaintenanceOrchestrationProbe {',
@@ -14210,6 +14274,7 @@ try {
         $probeStubs,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
+        $probeRestoreSeed,
         'try {',
         $probeRegion.ToString(),
         ('} finally ' + $probeOuterTry.Finally.Extent.Text),
@@ -14253,7 +14318,7 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure')) {
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled')) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
                 $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
@@ -14428,6 +14493,106 @@ try {
                 ) `
                 -Name "Maintenance/OrchestrationRestoresServicesAfterControlledStopFailure" `
                 -Failure "контрольований збій зупинки BravoWeb має дати [3/8] FAIL без переривання порядку [1/8]..[8/8], запуск у finally зупинених прогоном BRAVO й exchangAPI, прибраний маркер quiescence, статус-файл і код 60 (MaintenanceFailed), звільнений lock і зовнішній finally; проба: $($maintenanceStopFailure | ConvertTo-Json -Compress -Depth 4)"
+
+            # (4) #349: Maintenance з реставрацією, коли службу неможливо
+            # утримати від автостарту (тип запуску Other, нечитаний або збій
+            # читання реєстру). Справжня оркестрація: збій утримання видно в
+            # журналі (ERROR), реставрацію скасовано fail-closed ДО першої
+            # native-операції (архів перед реставрацією, bravocmd), служба не
+            # «утримана» мовчки, а решта обслуговування триває за контрактом
+            # (кроки [1/8]..[8/8], служби підняті у finally, маркер прибрано).
+            # Контроль (Automatic/AutomaticDelayed/Manual і Disabled
+            # оператором) доходить до архіву перед реставрацією — сценарії
+            # не вакуумні.
+            $maintenanceStartModeOutcome = {
+                param([string]$Scenario)
+                $outcome = $maintenanceOrchestrationResults[$Scenario]
+                $events = @()
+                $labels = @()
+                $probeOk = ($null -ne $outcome -and $null -eq $outcome.PSObject.Properties['ProbeError'])
+                if ($probeOk) {
+                    $events = @($outcome.Events | ForEach-Object { [string]$_ })
+                    $labels = @($events | Where-Object { $_ -match $maintenanceOrchestrationStepPattern } | ForEach-Object {
+                            [void]($_ -match $maintenanceOrchestrationStepPattern)
+                            "[{0}/{1}] {2}" -f $Matches[1], $Matches[2], $Matches[3]
+                        })
+                }
+                return [pscustomobject]@{
+                    ProbeOk = $probeOk
+                    ExitCode = $(if ($probeOk) { [int]$outcome.ExitCode } else { -1 })
+                    Events = $events
+                    StepOrderOk = (($labels -join '|') -ceq ($maintenanceExpectedStepLabels -join '|'))
+                    Native = @($events | Where-Object { $_ -like 'NATIVE *' })
+                    RestoreCancelled = @($events | Where-Object { $_ -like 'LOG-ERROR ПОМИЛКА: Реставрацію скасовано ДО архівації*' }).Count -eq 1
+                    RestoreStepFailed = @($events | Where-Object { $_ -ceq 'STEP 5/8 Реставрація моделі FAIL' }).Count -eq 1
+                    ServicesStarted = (@($events | Where-Object { $_ -ceq 'START BRAVO' -or $_ -ceq 'START exchangAPI' -or $_ -ceq 'START BravoWeb' }).Count -eq 3)
+                    MarkerCleared = @($events | Where-Object { $_ -ceq 'MARKER-CLEAR' }).Count -eq 1
+                    Held = @($events | Where-Object { $_ -like 'HOLD *' } | ForEach-Object { $_.Substring(5) })
+                    UnrestorableErrors = @($events | Where-Object { $_ -like 'LOG-ERROR Службу(и) не можна утримати від автостарту*(#349)' })
+                    FirstStop = (& $maintenanceOrchestrationEventIndex $events '^STOP ')
+                    UnrestorableErrorIndex = (& $maintenanceOrchestrationEventIndex $events '^LOG-ERROR Службу\(и\) не можна утримати від автостарту')
+                }
+            }
+            $maintenanceStartModeFailClosed = {
+                param($Outcome)
+                return ($Outcome.ProbeOk -and
+                    $Outcome.ExitCode -eq 40 -and
+                    $Outcome.StepOrderOk -and
+                    @($Outcome.Native).Count -eq 0 -and
+                    $Outcome.RestoreCancelled -and
+                    $Outcome.RestoreStepFailed -and
+                    $Outcome.ServicesStarted -and
+                    $Outcome.MarkerCleared -and
+                    (& $maintenanceOrchestrationFinallyTail $Outcome.Events))
+            }
+            $maintenanceStartModeOther = & $maintenanceStartModeOutcome 'StartModeOther'
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $maintenanceStartModeFailClosed $maintenanceStartModeOther) -and
+                    @($maintenanceStartModeOther.UnrestorableErrors).Count -eq 1 -and
+                    [string]$maintenanceStartModeOther.UnrestorableErrors[0] -like '*exchangAPI (тип запуску: Other)*' -and
+                    $maintenanceStartModeOther.UnrestorableErrorIndex -ge 0 -and
+                    $maintenanceStartModeOther.UnrestorableErrorIndex -lt $maintenanceStartModeOther.FirstStop -and
+                    ($maintenanceStartModeOther.Held -join ',') -ceq 'BRAVO,BravoWeb'
+                ) `
+                -Name "Maintenance/StartModeOtherCancelsRestoreFailClosed" `
+                -Failure ("Maintenance (#349): служба з типом запуску Other має дати ERROR до зупинки служб і скасувати реставрацію ДО архіву й bravocmd (без native-операцій), а решта обслуговування — тривати; події: " + ($maintenanceStartModeOther.Events -join ' | '))
+            $maintenanceStartModeUnreadable = & $maintenanceStartModeOutcome 'StartModeUnreadable'
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $maintenanceStartModeFailClosed $maintenanceStartModeUnreadable) -and
+                    @($maintenanceStartModeUnreadable.UnrestorableErrors).Count -eq 1 -and
+                    [string]$maintenanceStartModeUnreadable.UnrestorableErrors[0] -like '*BravoWeb (тип запуску: не прочитано)*' -and
+                    ($maintenanceStartModeUnreadable.Held -join ',') -ceq 'BRAVO,exchangAPI'
+                ) `
+                -Name "Maintenance/StartModeUnreadableCancelsRestoreFailClosed" `
+                -Failure ("Maintenance (#349): служба з нечитаним типом запуску має дати ERROR і скасувати реставрацію ДО архіву й bravocmd; події: " + ($maintenanceStartModeUnreadable.Events -join ' | '))
+            $maintenanceStartModeQueryThrows = & $maintenanceStartModeOutcome 'StartModeQueryThrows'
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $maintenanceStartModeFailClosed $maintenanceStartModeQueryThrows) -and
+                    @($maintenanceStartModeQueryThrows.Held).Count -eq 0 -and
+                    @($maintenanceStartModeQueryThrows.Events | Where-Object { $_ -like 'LOG-WARNING Не вдалося утримати служби від автостарту (#297): знімок типів запуску не знято:*' }).Count -eq 1
+                ) `
+                -Name "Maintenance/StartModeQueryFailureCancelsRestoreFailClosed" `
+                -Failure ("Maintenance (#349): збій читання типу запуску з реєстру має бути збоєм утримання і скасувати реставрацію ДО архіву й bravocmd; події: " + ($maintenanceStartModeQueryThrows.Events -join ' | '))
+            $maintenanceStartModeHeld = & $maintenanceStartModeOutcome 'StartModeHeld'
+            $maintenanceStartModeOperatorDisabled = & $maintenanceStartModeOutcome 'StartModeOperatorDisabled'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceStartModeHeld.ProbeOk -and $maintenanceStartModeHeld.StepOrderOk -and
+                    ($maintenanceStartModeHeld.Held -join ',') -ceq 'BRAVO,exchangAPI,BravoWeb' -and
+                    @($maintenanceStartModeHeld.UnrestorableErrors).Count -eq 0 -and
+                    -not $maintenanceStartModeHeld.RestoreCancelled -and
+                    ($maintenanceStartModeHeld.Native -join '|') -ceq 'NATIVE Архівація моделі перед реставрацією' -and
+                    $maintenanceStartModeOperatorDisabled.ProbeOk -and $maintenanceStartModeOperatorDisabled.StepOrderOk -and
+                    ($maintenanceStartModeOperatorDisabled.Held -join ',') -ceq 'BRAVO,BravoWeb' -and
+                    @($maintenanceStartModeOperatorDisabled.UnrestorableErrors).Count -eq 0 -and
+                    -not $maintenanceStartModeOperatorDisabled.RestoreCancelled -and
+                    ($maintenanceStartModeOperatorDisabled.Native -join '|') -ceq 'NATIVE Архівація моделі перед реставрацією'
+                ) `
+                -Name "Maintenance/StartModeHeldOrOperatorDisabledReachesRestore" `
+                -Failure ("Maintenance (#349): Automatic/AutomaticDelayed/Manual утримуються, Disabled оператором не змінюється й не є збоєм — реставрація доходить до архіву перед реставрацією; події: " + ($maintenanceStartModeHeld.Events -join ' | ') + ' || ' + ($maintenanceStartModeOperatorDisabled.Events -join ' | '))
         } finally {
             if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
                 Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
