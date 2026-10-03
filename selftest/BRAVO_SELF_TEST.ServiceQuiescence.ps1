@@ -1111,7 +1111,11 @@ function Reset-BRAVOSelfTestStartModes {
 }
 function Get-BRAVOServiceRegistryStartMode {
     param([string]$ServiceName)
-    if ($script:Q297Modes.ContainsKey($ServiceName)) { return [string]$script:Q297Modes[$ServiceName] }
+    if ($script:Q297Modes.ContainsKey($ServiceName)) {
+        # #349: 'THROW' — збій читання реєстру (тип запуску не прочитано).
+        if ([string]$script:Q297Modes[$ServiceName] -ceq 'THROW') { throw "self-test: тип запуску $ServiceName не прочитано з реєстру" }
+        return [string]$script:Q297Modes[$ServiceName]
+    }
     return $null
 }
 function Set-BRAVOServiceStartMode {
@@ -1235,6 +1239,80 @@ function Start-Sleep { param($Seconds) }
             ) `
             -Name "ServiceQuiescence/StartTypeDisabledByOperatorNeverTouched" `
             -Failure "служба, вимкнена оператором (Disabled), і відсутня служба не потрапляють у знімок і НІКОЛИ не змінюються/не стартують"
+
+        # (1b) #349: служба, яку Maintenance зупиняє, але яку знімок мовчки
+        # пропустив (start type не прочитано / Other), не можна утримати від
+        # автостарту — це збій утримання (fail-closed), а не тиха пропущена
+        # служба. Disabled-оператором — легітимно поза знімком і не змінюється.
+        $unrestorableMaintenanceTextSrc = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+        $unrestorableModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($unrestorableMaintenanceTextSrc + "`n" + $startModeStubs + "`n" + $systemModuleTextForQuiescence) `
+            -FunctionNames @(
+                'Reset-BRAVOSelfTestStartModes', 'Get-BRAVOServiceRegistryStartMode', 'Set-BRAVOServiceStartMode',
+                'New-BRAVOServiceStartTypeSnapshot', 'Suspend-BRAVOServiceAutostart',
+                'Get-BRAVOMaintenanceUnrestorableServiceNames'
+            )
+        $unrestorableScenario = & $unrestorableModule {
+            $out = @{}
+            $managed = @('BRAVO', 'exchangAPI', 'BravoWeb')
+            # Нечитаний ($null: служби немає в реєстрі стабу) і Other
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Other' }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $managed)
+            $out.MixedSnapshotCount = $snapshot.Count
+            $out.Mixed = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot $snapshot)
+            # Збій читання реєстру для служби поза знімком — теж неутримувана
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'THROW'; BravoWeb = 'Disabled' }
+            $out.Throws = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot @(@{ Name = 'BRAVO'; StartMode = 'Automatic' }))
+            # Імена служб Windows нечутливі до регістру: запис знімка в іншому регістрі —
+            # та сама служба, а не неутримувана (тип Other тут не має значення).
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Other'; BravoWeb = 'Disabled' }
+            $out.CaseInsensitive = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot @(@{ Name = 'bravo'; StartMode = 'Automatic' }, @{ Name = 'EXCHANGAPI'; StartMode = 'Automatic' }))
+            # Disabled оператором: без збою і лишається Disabled
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Disabled'; BravoWeb = 'Manual' }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $managed)
+            $out.DisabledFailures = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot $snapshot)
+            [void](Suspend-BRAVOServiceAutostart -Snapshot $snapshot)
+            $out.DisabledMode = $script:Q297Modes['exchangAPI']
+            $out.DisabledSetLog = @($script:Q297SetLog)
+            # Усі Automatic/Manual: утримано як і раніше, збоїв немає
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'AutomaticDelayed'; BravoWeb = 'Manual' }
+            $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $managed)
+            $out.NormalFailures = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot $snapshot)
+            $suspend = Suspend-BRAVOServiceAutostart -Snapshot $snapshot
+            $out.NormalHeld = @($suspend.Applied).Count
+            $out.NormalModes = @($managed | ForEach-Object { [string]$script:Q297Modes[$_] })
+            [pscustomobject]$out
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $unrestorableScenario.MixedSnapshotCount -eq 1 -and
+                @($unrestorableScenario.Mixed).Count -eq 2 -and
+                (@($unrestorableScenario.Mixed) -join '|') -like '*exchangAPI (*Other*' -and
+                (@($unrestorableScenario.Mixed) -join '|') -like '*BravoWeb (*не прочитано*' -and
+                (@($unrestorableScenario.Throws) -join '|') -ceq 'exchangAPI (тип запуску: не прочитано)' -and
+                @($unrestorableScenario.CaseInsensitive).Count -eq 0
+            ) `
+            -Name "ServiceQuiescence/MaintenanceUnreadableAndOtherStartTypeIsFailure" `
+            -Failure "Maintenance (#349): служба зі start type Other, нечитаним ($null) або зі збоєм читання реєстру поза знімком має бути названа як неутримувана (fail-closed), а не тихо пропущена"
+        Test-BRAVOCondition `
+            -Condition (
+                @($unrestorableScenario.DisabledFailures).Count -eq 0 -and
+                $unrestorableScenario.DisabledMode -eq 'Disabled' -and
+                @($unrestorableScenario.DisabledSetLog | Where-Object { $_ -like 'exchangAPI=*' }).Count -eq 0
+            ) `
+            -Name "ServiceQuiescence/MaintenanceOperatorDisabledIsNotFailureAndStaysDisabled" `
+            -Failure "Maintenance (#349): служба Disabled оператором не є збоєм утримання і не змінюється"
+        Test-BRAVOCondition `
+            -Condition (
+                @($unrestorableScenario.NormalFailures).Count -eq 0 -and
+                $unrestorableScenario.NormalHeld -eq 3 -and
+                (@($unrestorableScenario.NormalModes) -join ',') -ceq 'Disabled,Disabled,Disabled'
+            ) `
+            -Name "ServiceQuiescence/MaintenanceNormalStartTypesStillHeld" `
+            -Failure "Maintenance (#349): Automatic/AutomaticDelayed/Manual без збоїв і, як і раніше, утримуються (Disabled на час вікна)"
+        # Проводку перевірки в оркестрацію (ERROR -> startModeSuppressionFailures ->
+        # скасування реставрації ДО архіву й bravocmd) доводять поведінкові сценарії
+        # Maintenance/StartMode* у BRAVO_SELF_TEST.ps1 (справжня оркестрація).
 
         # (2) Збій у середині restore (виняток): finally власника повертає
         # типи. Моделюємо try/catch/finally тим самим викликом, що й

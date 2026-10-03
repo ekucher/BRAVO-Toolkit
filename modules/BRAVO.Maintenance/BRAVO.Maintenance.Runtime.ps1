@@ -857,6 +857,29 @@ if ($BravoWebComponentEnabled -and -not $ApacheService) {
     }
 }
 
+function Get-BRAVOMaintenanceUnrestorableServiceNames {
+    # #349: служба, яку буде зупинено, але яка НЕ потрапила у знімок типів
+    # запуску й не Disabled (нечитаний/Other/відсутній start type), не може
+    # бути утримана від автостарту й повернена — вона могла б перезапуститись
+    # посеред реставрації. Служба, що вже Disabled (рішення оператора),
+    # легітимно лишається поза знімком. Той самий інваріант, що в DataRestore (#345).
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ManagedNames,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Snapshot
+    )
+
+    $unrestorable = @()
+    foreach ($managedName in @($ManagedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        if (@($Snapshot | Where-Object { [string]$_.Name -ieq $managedName }).Count -gt 0) { continue }
+        $currentMode = $null
+        try { $currentMode = Get-BRAVOServiceRegistryStartMode -ServiceName $managedName } catch { $currentMode = $null }
+        if ($null -ne $currentMode -and [string]$currentMode -eq 'Disabled') { continue }
+        $modeText = if ($null -eq $currentMode) { 'не прочитано' } else { [string]$currentMode }
+        $unrestorable += ('{0} (тип запуску: {1})' -f $managedName, $modeText)
+    }
+    return @($unrestorable)
+}
+
 function Test-BRAVOServiceDisabledBySystem {
     # StartType відсутній у ServiceController на .NET < 4.6.1 (#319), тож
     # читається лише через Get-BRAVOServiceStartMode (під StrictMode 2.0
@@ -8685,6 +8708,39 @@ if ($BravoWebMaintenanceEnabled -and -not $serviceWasRunning.BravoWeb) {
 }
 Send-InactiveServiceWarning -ServiceDescriptions $inactiveServicesAtStart
 
+# #349: намір перезапуску служб, які зупинив аварійно перерваний прогін
+# (маркер мертвого власника без restartSuppressed), успадковується: власний
+# маркер цього прогону перезаписує чужий, і без успадкування RestartIntent
+# став би false — finally не підняв би ці служби, а очищений наприкінці
+# маркер не дав би Health-watchdog відновити їх. Та сама модель, що в
+# DataRestore (#333): такі служби трактуються як «працювали на старті».
+# Після перевірки Recovery (вона дивиться на ФАКТИЧНО працюючі служби) і
+# після попередження про неактивні служби (вони справді зупинені).
+$inheritedRestartIntentNames = @()
+$foreignQuiescenceContext = Get-BRAVOForeignServiceQuiescenceContext
+if ($foreignQuiescenceContext.Present -and -not $foreignQuiescenceContext.OwnerAlive -and
+    -not $foreignQuiescenceContext.RestartSuppressed) {
+    $foreignRestartIntentNames = @($foreignQuiescenceContext.RestartIntentNames | ForEach-Object { [string]$_ })
+    if ($BravoMaintenanceEnabled -and -not $serviceWasRunning.Bravo -and
+        @($foreignRestartIntentNames | Where-Object { $_ -ieq $BravoServiceName }).Count -gt 0) {
+        $serviceWasRunning.Bravo = $true
+        $inheritedRestartIntentNames += $BravoServiceName
+    }
+    if ($exchangAPIServiceEnabled -and -not $serviceWasRunning.ExchangeApi -and
+        @($foreignRestartIntentNames | Where-Object { $_ -ieq $ExchangAPIServiceName }).Count -gt 0) {
+        $serviceWasRunning.ExchangeApi = $true
+        $inheritedRestartIntentNames += $ExchangAPIServiceName
+    }
+    if ($BravoWebMaintenanceEnabled -and -not $serviceWasRunning.BravoWeb -and
+        @($foreignRestartIntentNames | Where-Object { $_ -ieq $BravoWebServiceName }).Count -gt 0) {
+        $serviceWasRunning.BravoWeb = $true
+        $inheritedRestartIntentNames += $BravoWebServiceName
+    }
+    if ($inheritedRestartIntentNames.Count -gt 0) {
+        Write-Log -Message "Успадковано намір перезапуску служб від аварійно перерваного прогону $($foreignQuiescenceContext.Owner): $($inheritedRestartIntentNames -join ', ') — їх буде запущено після обслуговування (#349)" -Level "INFO"
+    }
+}
+
 # Усі операції зі зупиненими службами захищені finally. Навіть необроблена
 # помилка повинна повернути до роботи лише ті служби, які працювали на початку.
 try {
@@ -8720,17 +8776,44 @@ $script:quiescedServiceNames = @()
 $script:startTypeSnapshot = @()
 $script:startModeSuppressionFailures = @()
 $script:startModeRestoreIncomplete = $false
-if ($stopServicesRequired) {
-    $quiescenceServices = @()
-    if ($serviceWasRunning.Bravo) { $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = $true } }
-    if ($serviceWasRunning.ExchangeApi) { $quiescenceServices += @{ Name = $ExchangAPIServiceName; RestartIntent = $true } }
-    if ($serviceWasRunning.BravoWeb) { $quiescenceServices += @{ Name = $BravoWebServiceName; RestartIntent = $true } }
+# #349: коли заплановано реставрацію, утримується КОЖНА увімкнена керована
+# служба, а не лише ті, що працювали на старті: зупинка нижче діє за
+# ФАКТИЧНИМ станом, тож служба, що встигла запуститися після знімка
+# $serviceWasRunning, інакше була б зупинена поза знімком типів запуску,
+# утриманням і бар'єрами перед before-archive/bravocmd. Та сама модель, що
+# в DataRestore (#333/#345): квієсценція — усі керовані служби, намір
+# перезапуску (RestartIntent, старт у finally, Health-watchdog) — лише ті,
+# що працювали на старті.
+$quiescenceHoldAllManaged = [bool]$shouldRestore
+$quiescenceServices = @()
+if ($serviceWasRunning.Bravo -or ($quiescenceHoldAllManaged -and $BravoMaintenanceEnabled)) {
+    $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = [bool]$serviceWasRunning.Bravo }
+}
+if ($serviceWasRunning.ExchangeApi -or ($quiescenceHoldAllManaged -and $exchangAPIServiceEnabled)) {
+    $quiescenceServices += @{ Name = $ExchangAPIServiceName; RestartIntent = [bool]$serviceWasRunning.ExchangeApi }
+}
+if ($serviceWasRunning.BravoWeb -or ($quiescenceHoldAllManaged -and $BravoWebMaintenanceEnabled)) {
+    $quiescenceServices += @{ Name = $BravoWebServiceName; RestartIntent = [bool]$serviceWasRunning.BravoWeb }
+}
+if ($quiescenceServices.Count -gt 0) {
     $script:quiescedServiceNames = @($quiescenceServices | ForEach-Object { [string]$_.Name })
     try {
         $script:startTypeSnapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $script:quiescedServiceNames)
     } catch {
         $script:startTypeSnapshot = @()
         $script:startModeSuppressionFailures += "знімок типів запуску не знято: $($_.Exception.Message)"
+    }
+    # #349: служба, яку буде зупинено, але неможливо утримати/повернути
+    # (start type не прочитано або Other), — fail-closed як і збій утримання.
+    if ($script:startModeSuppressionFailures.Count -eq 0) {
+        $unrestorableQuiesced = @(Get-BRAVOMaintenanceUnrestorableServiceNames `
+                -ManagedNames @($script:quiescedServiceNames) `
+                -Snapshot @($script:startTypeSnapshot))
+        if ($unrestorableQuiesced.Count -gt 0) {
+            $unrestorableQuiescedText = $unrestorableQuiesced -join ', '
+            Write-Log -Message "Службу(и) не можна утримати від автостарту — тип запуску не прочитано або не підтримується: $unrestorableQuiescedText (#349)" -Level "ERROR"
+            $script:startModeSuppressionFailures += "службу(и) неможливо утримати від автостарту та повернути її тип запуску: $unrestorableQuiescedText"
+        }
     }
     try {
         [void](Write-BRAVOServiceQuiescenceState `
