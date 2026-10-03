@@ -13,6 +13,37 @@
   `Confirm-BRAVOServicesQuiesced`, решта обслуговування триває). Службу, вимкнену оператором
   (`Disabled`), не чіпаємо. Додано self-test `ServiceQuiescence/Maintenance*`.
 
+- **Fix: на Windows Server 2012/2012 R2 заплановані завдання завершувались з кодом 1 без логу.**
+  Runtime перемикав кодову сторінку консолі на UTF-8 (65001); у консолі SYSTEM (сесія 0) на
+  Windows до 10 після цього перший `Write-Host` з кирилицею падав з Win32 `0x1F`, тож
+  ARCHIV/HEALTH/MAINTENANCE гинули до відкриття журналу. `Test-BRAVOConsoleCodePageChangeSafe`
+  (BRAVO.Compatibility) на Windows < 10 у неінтерактивній сесії кодову сторінку консолі не
+  змінює; Windows 10+ та інтерактивні запуски — без змін. `$OutputEncoding` (кодування для
+  зовнішніх процесів) і UTF-8-логи не змінюються; лише в цьому випадку консоль лишається на OEM-сторінці, тож нативний вивід, захоплений без явного `StandardOutputEncoding`, декодується за OEM. Перенесено з `5.2.5-rc.3`. Нові перевірки:
+  `ConsoleUX/31-LegacySystemConsoleKeepsCodePage` (поведінкова матриця Server 2012 / 2012 R2 /
+  Windows 10 / 11 x інтерактивна чи неінтерактивна сесія x кодова сторінка через
+  `Initialize-BRAVOConsoleEncoding` з тестовими параметрами `-OSVersion`, `-UserInteractive`,
+  `-SetConsoleOutputEncoding`) і `ConsoleUX/33-NoUnguardedConsoleCodePageSwitch` (жоден інший
+  production-скрипт не перемикає `[Console]::OutputEncoding` напряму).
+
+- **Fix: ізоляція suite self-test бачить Private-записи й тримає незмінний знімок функцій (#350).**
+  Знімок і відновлення читали alias/function script- і global-області з області функції
+  фреймворку, звідки записи з опцією `Private` у батьківських областях невидимі: такий запис
+  фіксувався як відсутній, і його заміна чи видалення suite-ом не відновлювались. Тепер стан
+  читається, знімається й відновлюється прямо в таблиці потрібної області
+  (`Get-BRAVOSelfTestSessionScopeAccess`, `Get-/Remove-BRAVOSelfTestScopedCommandItem`;
+  відсутній член рушія — виняток, а не тихе неповне читання), Options (`Private`,
+  `ReadOnly` тощо) повертаються на відновлений запис. Знімок функцій більше не зберігає живі
+  `FunctionInfo` (перевизначення наявної функції змінює той самий об'єкт на місці, і
+  «знімок» віддавав би заглушку): на вході в suite матеріалізуються ім'я -> `ScriptBlock` та
+  ім'я -> `Options` глобальних функцій. Нові перевірки `Framework/SuiteIsolation.*`:
+  Private-функція й Private-аліас (заміна, видалення; script- і global-область), матриця
+  наявна/видалена/нова функція та аліас, голий `New-Module`, dot-source suite-фрагмента,
+  runtime-модуль над Private-функцією, відновлення після винятку suite, незмінність знімка
+  функцій і поведінкова перевірка резолюції `Get-Service`, `Start-Service`, `Stop-Service`,
+  `Get-Process`, `Stop-Process`, `Start-Sleep`, `Invoke-WebRequest`, `Get-CimInstance`,
+  `Get-WmiObject`, `Start-Process` після Private-заглушок. Production-код не змінено.
+
 - **Fix: self-test `TraceArchive/GraceCompletionExpiry*` не залежить від швидкості runner-а (#338).**
   Fixture виставляв `LastWriteTime` джерела за 2 с до grace-межі й перетинав межу реальним
   `Start-Sleep`; на повільному runner-і джерело вже було за межею на кроці-передумові, видалялось,
