@@ -14235,6 +14235,7 @@ try {
         ('$script:ProbeStartModes = {0}' -f $(switch ($Scenario) {
                 'StartModeOther' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Other'; 'BravoWeb' = 'Manual' }" }
                 'StartModeUnreadable' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed' }" }
+                'StartModeOtherAndUnreadable' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Other' }" }
                 'StartModeQueryThrows' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'THROW'; 'BravoWeb' = 'Manual' }" }
                 'StartModeHeld' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 'StartModeOperatorDisabled' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Disabled'; 'BravoWeb' = 'Manual' }" }
@@ -14318,7 +14319,7 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled')) {
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled')) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
                 $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
@@ -14528,9 +14529,10 @@ try {
                     ServicesStarted = (@($events | Where-Object { $_ -ceq 'START BRAVO' -or $_ -ceq 'START exchangAPI' -or $_ -ceq 'START BravoWeb' }).Count -eq 3)
                     MarkerCleared = @($events | Where-Object { $_ -ceq 'MARKER-CLEAR' }).Count -eq 1
                     Held = @($events | Where-Object { $_ -like 'HOLD *' } | ForEach-Object { $_.Substring(5) })
-                    UnrestorableErrors = @($events | Where-Object { $_ -like 'LOG-ERROR Службу(и) не можна утримати від автостарту*(#349)' })
+                    UnrestorableErrors = @($events | Where-Object { $_ -like 'LOG-ERROR *(#349)' })
                     FirstStop = (& $maintenanceOrchestrationEventIndex $events '^STOP ')
-                    UnrestorableErrorIndex = (& $maintenanceOrchestrationEventIndex $events '^LOG-ERROR Службу\(и\) не можна утримати від автостарту')
+                    UnrestorableErrorIndex = (& $maintenanceOrchestrationEventIndex $events '^LOG-ERROR .*\(#349\)$')
+                    MarkerWriteIndex = (& $maintenanceOrchestrationEventIndex $events '^MARKER-WRITE ')
                 }
             }
             $maintenanceStartModeFailClosed = {
@@ -14552,7 +14554,8 @@ try {
                     @($maintenanceStartModeOther.UnrestorableErrors).Count -eq 1 -and
                     [string]$maintenanceStartModeOther.UnrestorableErrors[0] -like '*exchangAPI (тип запуску: Other)*' -and
                     $maintenanceStartModeOther.UnrestorableErrorIndex -ge 0 -and
-                    $maintenanceStartModeOther.UnrestorableErrorIndex -lt $maintenanceStartModeOther.FirstStop -and
+                    $maintenanceStartModeOther.UnrestorableErrorIndex -lt $maintenanceStartModeOther.MarkerWriteIndex -and
+                    $maintenanceStartModeOther.MarkerWriteIndex -lt $maintenanceStartModeOther.FirstStop -and
                     ($maintenanceStartModeOther.Held -join ',') -ceq 'BRAVO,BravoWeb'
                 ) `
                 -Name "Maintenance/StartModeOtherCancelsRestoreFailClosed" `
@@ -14567,6 +14570,17 @@ try {
                 ) `
                 -Name "Maintenance/StartModeUnreadableCancelsRestoreFailClosed" `
                 -Failure ("Maintenance (#349): служба з нечитаним типом запуску має дати ERROR і скасувати реставрацію ДО архіву й bravocmd; події: " + ($maintenanceStartModeUnreadable.Events -join ' | '))
+            $maintenanceStartModeOtherAndUnreadable = & $maintenanceStartModeOutcome 'StartModeOtherAndUnreadable'
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $maintenanceStartModeFailClosed $maintenanceStartModeOtherAndUnreadable) -and
+                    @($maintenanceStartModeOtherAndUnreadable.UnrestorableErrors).Count -eq 1 -and
+                    [string]$maintenanceStartModeOtherAndUnreadable.UnrestorableErrors[0] -like '*exchangAPI (тип запуску: Other)*' -and
+                    [string]$maintenanceStartModeOtherAndUnreadable.UnrestorableErrors[0] -like '*BravoWeb (тип запуску: не прочитано)*' -and
+                    ($maintenanceStartModeOtherAndUnreadable.Held -join ',') -ceq 'BRAVO'
+                ) `
+                -Name "Maintenance/StartModeSeveralUnrestorableAllReported" `
+                -Failure ("Maintenance (#349): кілька неутримуваних служб мають бути названі всі в одному ERROR, реставрацію скасовано ДО архіву й bravocmd; події: " + ($maintenanceStartModeOtherAndUnreadable.Events -join ' | '))
             $maintenanceStartModeQueryThrows = & $maintenanceStartModeOutcome 'StartModeQueryThrows'
             Test-BRAVOCondition `
                 -Condition (

@@ -1263,6 +1263,10 @@ function Start-Sleep { param($Seconds) }
             # Збій читання реєстру для служби поза знімком — теж неутримувана
             Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'THROW'; BravoWeb = 'Disabled' }
             $out.Throws = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot @(@{ Name = 'BRAVO'; StartMode = 'Automatic' }))
+            # Імена служб Windows нечутливі до регістру: запис знімка в іншому регістрі —
+            # та сама служба, а не неутримувана (тип Other тут не має значення).
+            Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Other'; BravoWeb = 'Disabled' }
+            $out.CaseInsensitive = @(Get-BRAVOMaintenanceUnrestorableServiceNames -ManagedNames $managed -Snapshot @(@{ Name = 'bravo'; StartMode = 'Automatic' }, @{ Name = 'EXCHANGAPI'; StartMode = 'Automatic' }))
             # Disabled оператором: без збою і лишається Disabled
             Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Automatic'; exchangAPI = 'Disabled'; BravoWeb = 'Manual' }
             $snapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $managed)
@@ -1285,7 +1289,8 @@ function Start-Sleep { param($Seconds) }
                 @($unrestorableScenario.Mixed).Count -eq 2 -and
                 (@($unrestorableScenario.Mixed) -join '|') -like '*exchangAPI (*Other*' -and
                 (@($unrestorableScenario.Mixed) -join '|') -like '*BravoWeb (*не прочитано*' -and
-                (@($unrestorableScenario.Throws) -join '|') -ceq 'exchangAPI (тип запуску: не прочитано)'
+                (@($unrestorableScenario.Throws) -join '|') -ceq 'exchangAPI (тип запуску: не прочитано)' -and
+                @($unrestorableScenario.CaseInsensitive).Count -eq 0
             ) `
             -Name "ServiceQuiescence/MaintenanceUnreadableAndOtherStartTypeIsFailure" `
             -Failure "Maintenance (#349): служба зі start type Other, нечитаним ($null) або зі збоєм читання реєстру поза знімком має бути названа як неутримувана (fail-closed), а не тихо пропущена"
@@ -1305,19 +1310,9 @@ function Start-Sleep { param($Seconds) }
             ) `
             -Name "ServiceQuiescence/MaintenanceNormalStartTypesStillHeld" `
             -Failure "Maintenance (#349): Automatic/AutomaticDelayed/Manual без збоїв і, як і раніше, утримуються (Disabled на час вікна)"
-        $unrestorableMaintenanceText = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
-        $unrestorableWireIndex = $unrestorableMaintenanceText.IndexOf('Get-BRAVOMaintenanceUnrestorableServiceNames `')
-        $unrestorableSnapshotIndex = $unrestorableMaintenanceText.IndexOf('$script:startTypeSnapshot = @(New-BRAVOServiceStartTypeSnapshot')
-        $unrestorableSuspendIndex = $unrestorableMaintenanceText.IndexOf('Suspend-BRAVOServiceAutostart -Snapshot')
-        $unrestorableAppendIndex = $unrestorableMaintenanceText.IndexOf('$script:startModeSuppressionFailures += "службу(и) неможливо утримати')
-        Test-BRAVOCondition `
-            -Condition (
-                $unrestorableSnapshotIndex -ge 0 -and $unrestorableWireIndex -gt $unrestorableSnapshotIndex -and
-                $unrestorableMaintenanceText -match '\$script:startModeSuppressionFailures\.Count -eq 0\)\s*\{\s*\$unrestorableQuiesced = @\(Get-BRAVOMaintenanceUnrestorableServiceNames' -and
-                $unrestorableAppendIndex -gt $unrestorableWireIndex -and $unrestorableAppendIndex -lt $unrestorableSuspendIndex
-            ) `
-            -Name "ServiceQuiescence/MaintenanceUnrestorableCheckFeedsSuppressionFailures" `
-            -Failure "Maintenance (#349): після знімка перевірка неутримуваних служб має додавати збій у startModeSuppressionFailures (fail-closed через Confirm-BRAVOServicesQuiesced) ДО Suspend"
+        # Проводку перевірки в оркестрацію (ERROR -> startModeSuppressionFailures ->
+        # скасування реставрації ДО архіву й bravocmd) доводять поведінкові сценарії
+        # Maintenance/StartMode* у BRAVO_SELF_TEST.ps1 (справжня оркестрація).
 
         # (2) Збій у середині restore (виняток): finally власника повертає
         # типи. Моделюємо try/catch/finally тим самим викликом, що й
