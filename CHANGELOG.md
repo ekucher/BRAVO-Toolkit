@@ -5,17 +5,27 @@
 - **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
   На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
   піднімає помилку провайдера замість `$false`; під `$ErrorActionPreference = 'Stop'`
-  self-test DataRestore обривався з `[FAIL] Fatal`, а решта DataRestore-перевірок не
-  виконувалась. Попередній фікс (`-ErrorAction SilentlyContinue` у write-probe) термінальну
-  помилку не гарантовано гасить і покривав лише один виклик. Додано helper
-  `Get-BRAVODataRestorePathProbe` (`-ErrorAction Stop` + try/catch -> `Exists`/`Error`); через
-  нього йдуть write-probe free-space preflight, перевірка `-TargetPath` і цілі компонента в
-  `Get-BRAVODataRestorePlan` (недоступність -> класифікована відмова плану, fail-closed) та
-  перевірка out-of-place кореня перед створенням (`RestoreFailed` замість некатегоризованого
-  винятку). Self-test імітує недосяжний хост заглушкою `Test-Path` у script-scope
-  self-test-модуля, тож CI тепер бачить той самий шлях, що й доменний сервер, а UNC-виклики
-  загорнуто в try/catch (регресія дає `[FAIL]` конкретної перевірки, а не `Fatal`). Нова
-  перевірка: `DataRestore/PlanClassifiesUnreachableUncTarget`; посилено
+  self-test DataRestore обривався з `[FAIL] Fatal`, а відновлення на тимчасово недоступну
+  ціль давало некатегоризований виняток. Попередній фікс (`-ErrorAction SilentlyContinue` у
+  write-probe) термінальну помилку не гарантовано гасить і покривав лише один виклик. Додано
+  helper `Get-BRAVODataRestorePathProbe` (`-ErrorAction Stop` + try/catch -> `Exists`/`Error`):
+  "шляху немає" і "існування не вдалося визначити" — різні стани. Через нього йдуть перевірка
+  `-TargetPath` і цілі компонента в `Get-BRAVODataRestorePlan` (недоступність -> класифікована
+  відмова плану, а не "відсутня ціль"), write-probe free-space preflight (недоступна ціль ->
+  проблема "ціль недоступна для перевірки", помилка перевірки probe-файлу перед прибиранням ->
+  проблема preflight), а також повторні перевірки під час відновлення: out-of-place корінь і
+  ціль компонента перед створенням (`RestoreFailed`, код 43, з тим самим формулюванням, що в
+  плані). Out-of-place не зупиняє служб; для InPlace помилка провайдера після утримання служб
+  проходить звичайний шлях відмови компонента, і finally повертає типи запуску та запускає
+  служби за наміром. Self-test імітує поведінку провайдера заглушкою `Test-Path` у script-scope
+  self-test-модуля або в дочірньому процесі проби (без мережі й DNS), заглушка прибирається у
+  finally. Нові перевірки: `DataRestore/PathProbeSeparatesMissingFromUndeterminable`,
+  `DataRestore/PlanClassifiesUnreachableUncTarget`,
+  `DataRestore/PlanComponentTargetUndeterminableFailsClosed`,
+  `DataRestore/FreeSpaceCleanupProbeErrorIsClassified`,
+  `DataRestore/OrchestrationOutOfPlaceUnreachableTargetIsClassified`,
+  `DataRestore/OrchestrationOutOfPlaceUnreachableComponentTargetIsClassified`,
+  `DataRestore/StartModeRestoredWhenProviderErrorAfterQuiescence`; посилено
   `DataRestore/UnreachableUncTargetIsClassifiedNotFatal` і
   `DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors`.
 

@@ -1524,10 +1524,20 @@ function Test-BRAVODataRestoreFreeSpace {
         # UNC-хості Test-Path піднімає "The network path was not found"
         # (термінально на Windows PowerShell 5.1), що раніше обривало і
         # відновлення, і весь self-test ("Fatal: The network path was not
-        # found"). Fail-closed збережено: недосяжний шлях = "немає наявного
-        # батьківського каталогу" -> запис у $problems -> Success = $false.
-        while (-not [string]::IsNullOrWhiteSpace($probeDirectory) -and
-            -not (Get-BRAVODataRestorePathProbe -Path $probeDirectory -PathType Container).Exists) {
+        # found"). "Каталогу немає" і "існування не вдалося визначити" —
+        # різні стани: помилка провайдера зупиняє обхід і стає окремою
+        # проблемою (fail-closed, Success = $false), а не підйомом до
+        # батьківського каталогу.
+        $probeDirectoryError = $null
+        while (-not [string]::IsNullOrWhiteSpace($probeDirectory)) {
+            $probeDirectoryProbe = Get-BRAVODataRestorePathProbe -Path $probeDirectory -PathType Container
+            if ($null -ne $probeDirectoryProbe.Error) {
+                $probeDirectoryError = $probeDirectoryProbe.Error
+                break
+            }
+            if ($probeDirectoryProbe.Exists) {
+                break
+            }
             $parentDirectory = $null
             try {
                 $parentDirectory = [string](Split-Path -Path $probeDirectory -Parent)
@@ -1541,6 +1551,10 @@ function Test-BRAVODataRestoreFreeSpace {
                 break
             }
             $probeDirectory = $parentDirectory
+        }
+        if ($null -ne $probeDirectoryError) {
+            $problems += "ціль недоступна для перевірки: ${probeDirectory} ($probeDirectoryError)"
+            continue
         }
         if ([string]::IsNullOrWhiteSpace($probeDirectory)) {
             $problems += "не знайдено жодного наявного батьківського каталогу для цілі: $($requirement.TargetDirectory)"
@@ -1556,7 +1570,10 @@ function Test-BRAVODataRestoreFreeSpace {
             # провалився частково (файл міг бути створений і залишений
             # порожнім) — інакше скасоване відновлення лишає слід у
             # (потенційно production) probe-каталозі.
-            if ((Get-BRAVODataRestorePathProbe -Path $probeFile -PathType Leaf).Exists) {
+            $probeFileProbe = Get-BRAVODataRestorePathProbe -Path $probeFile -PathType Leaf
+            if ($null -ne $probeFileProbe.Error) {
+                $problems += "write-probe файл не вдалося перевірити для прибирання (${probeFile}): $($probeFileProbe.Error)"
+            } elseif ($probeFileProbe.Exists) {
                 try {
                     Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
                 } catch {
@@ -4094,7 +4111,13 @@ try {
                     # процес/оператор) — тоді ми НЕ можемо претендувати на
                     # володіння ним і мусимо відмовити компонент, а не мовчки
                     # extract-ити в чужий каталог чи пізніше видалити його.
-                    if (Test-Path -LiteralPath $planComponent.TargetDirectory) {
+                    # Та сама класифікація, що в плані: недосяжна ціль -> відмова
+                    # компонента (RestoreFailed), а не "відсутня" ціль.
+                    $componentTargetProbe = Get-BRAVODataRestorePathProbe -Path $planComponent.TargetDirectory
+                    if ($null -ne $componentTargetProbe.Error) {
+                        throw "ціль компонента недоступна для перевірки: $($planComponent.TargetDirectory) ($($componentTargetProbe.Error))"
+                    }
+                    if ($componentTargetProbe.Exists) {
                         throw "ціль компонента з'явилася між плануванням і відновленням (не створено цим прогоном): $($planComponent.TargetDirectory)"
                     }
                     [void](New-Item -ItemType Directory -Path $planComponent.TargetDirectory -ErrorAction Stop)
