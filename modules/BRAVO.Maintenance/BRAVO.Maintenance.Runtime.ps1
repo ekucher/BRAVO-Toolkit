@@ -8708,6 +8708,39 @@ if ($BravoWebMaintenanceEnabled -and -not $serviceWasRunning.BravoWeb) {
 }
 Send-InactiveServiceWarning -ServiceDescriptions $inactiveServicesAtStart
 
+# #349: намір перезапуску служб, які зупинив аварійно перерваний прогін
+# (маркер мертвого власника без restartSuppressed), успадковується: власний
+# маркер цього прогону перезаписує чужий, і без успадкування RestartIntent
+# став би false — finally не підняв би ці служби, а очищений наприкінці
+# маркер не дав би Health-watchdog відновити їх. Та сама модель, що в
+# DataRestore (#333): такі служби трактуються як «працювали на старті».
+# Після перевірки Recovery (вона дивиться на ФАКТИЧНО працюючі служби) і
+# після попередження про неактивні служби (вони справді зупинені).
+$inheritedRestartIntentNames = @()
+$foreignQuiescenceContext = Get-BRAVOForeignServiceQuiescenceContext
+if ($foreignQuiescenceContext.Present -and -not $foreignQuiescenceContext.OwnerAlive -and
+    -not $foreignQuiescenceContext.RestartSuppressed) {
+    $foreignRestartIntentNames = @($foreignQuiescenceContext.RestartIntentNames | ForEach-Object { [string]$_ })
+    if ($BravoMaintenanceEnabled -and -not $serviceWasRunning.Bravo -and
+        @($foreignRestartIntentNames | Where-Object { $_ -ieq $BravoServiceName }).Count -gt 0) {
+        $serviceWasRunning.Bravo = $true
+        $inheritedRestartIntentNames += $BravoServiceName
+    }
+    if ($exchangAPIServiceEnabled -and -not $serviceWasRunning.ExchangeApi -and
+        @($foreignRestartIntentNames | Where-Object { $_ -ieq $ExchangAPIServiceName }).Count -gt 0) {
+        $serviceWasRunning.ExchangeApi = $true
+        $inheritedRestartIntentNames += $ExchangAPIServiceName
+    }
+    if ($BravoWebMaintenanceEnabled -and -not $serviceWasRunning.BravoWeb -and
+        @($foreignRestartIntentNames | Where-Object { $_ -ieq $BravoWebServiceName }).Count -gt 0) {
+        $serviceWasRunning.BravoWeb = $true
+        $inheritedRestartIntentNames += $BravoWebServiceName
+    }
+    if ($inheritedRestartIntentNames.Count -gt 0) {
+        Write-Log -Message "Успадковано намір перезапуску служб від аварійно перерваного прогону $($foreignQuiescenceContext.Owner): $($inheritedRestartIntentNames -join ', ') — їх буде запущено після обслуговування (#349)" -Level "INFO"
+    }
+}
+
 # Усі операції зі зупиненими службами захищені finally. Навіть необроблена
 # помилка повинна повернути до роботи лише ті служби, які працювали на початку.
 try {

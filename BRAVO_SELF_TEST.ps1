@@ -14007,6 +14007,13 @@ function Invoke-CommandWithLog {
 function Restore-BRAVOServiceStartTypeSnapshot { param([object[]]$Snapshot, [string[]]$AllowedServiceNames) return [pscustomobject]@{ Restored = @(); Unchanged = @(); Foreign = @(); Failed = @() } }
 function Confirm-BRAVOServicesQuiesced { param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds) return [pscustomobject]@{ Ok = $true; Offenders = @(); StoppedAgain = @() } }
 function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
+# #349: маркер аварійно перерваного прогону (мертвий власник) з наміром перезапуску
+# служб $script:ProbeForeignRestartIntent; без нього — маркера немає.
+# $script:ProbeForeignRestartSuppressed — маркер із restartSuppressed.
+function Get-BRAVOForeignServiceQuiescenceContext {
+    $probeForeignPresent = @($script:ProbeForeignRestartIntent).Count -gt 0
+    return [pscustomobject]@{ Present = $probeForeignPresent; OwnerAlive = $false; Owner = $(if ($probeForeignPresent) { 'BRAVO_MAINTENANCE' } else { $null }); RestartSuppressed = [bool]$script:ProbeForeignRestartSuppressed; RestartIntentNames = @($script:ProbeForeignRestartIntent); HeldSnapshot = @() }
+}
 function Set-BRAVOServiceQuiescenceRestartSuppressed { param([bool]$Suppressed) }
 function Enter-BRAVOMaintenanceOperationLock {
     Add-ProbeEvent 'LOCK-ENTER'
@@ -14237,6 +14244,8 @@ try {
         ('$script:ProbeServices = {0}' -f $probeServiceTable),
         ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' })),
         ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' })),
+        ('$script:ProbeForeignRestartIntent = {0}' -f $(if ($Scenario -like 'StartMode*IntentInitiallyStopped') { "@('BravoWeb')" } else { '@()' })),
+        ('$script:ProbeForeignRestartSuppressed = {0}' -f $(if ($Scenario -eq 'StartModeSuppressedIntentInitiallyStopped') { '$true' } else { '$false' })),
         # #349: типи запуску служб (лише сценарії утримання; інакше — стаби до #297).
         ('$script:ProbeStartModes = {0}' -f $(switch ($Scenario) {
                 'StartModeOther' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Other'; 'BravoWeb' = 'Manual' }" }
@@ -14247,6 +14256,8 @@ try {
                 'StartModeOperatorDisabled' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Disabled'; 'BravoWeb' = 'Manual' }" }
                 'StartModeOtherInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Other' }" }
                 'StartModeHeldInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeOrphanIntentInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeSuppressedIntentInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 default { '$null' }
             })),
         # #297: результат раннього самовідновлення типів запуску (у production
@@ -14327,7 +14338,7 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped')) {
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped')) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
                 $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
@@ -14640,6 +14651,26 @@ try {
                 ) `
                 -Name "Maintenance/StartModeInitiallyStoppedServiceIsHeldWithoutRestart" `
                 -Failure ("Maintenance (#349): служба, зупинена до прогону, при запланованій реставрації має утримуватись і перевірятись (Other -> fail-closed), але не стартувати у finally; події: " + ($maintenanceStartModeOtherStopped.Events -join ' | ') + ' || ' + ($maintenanceStartModeHeldStopped.Events -join ' | '))
+            # #349 (рев'ю): служба, яку зупинив аварійно перерваний прогін із наміром
+            # перезапуску, не втрачає цей намір, коли маркер перезаписується: вона
+            # утримується з RestartIntent і стартує у finally. Маркер із
+            # restartSuppressed (свідома відмова від перезапуску) не успадковується.
+            $maintenanceStartModeOrphanIntent = & $maintenanceStartModeOutcome 'StartModeOrphanIntentInitiallyStopped'
+            $maintenanceStartModeSuppressedIntent = & $maintenanceStartModeOutcome 'StartModeSuppressedIntentInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceStartModeOrphanIntent.ProbeOk -and $maintenanceStartModeOrphanIntent.StepOrderOk -and
+                    @($maintenanceStartModeOrphanIntent.Events | Where-Object { $_ -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb' }).Count -eq 1 -and
+                    @($maintenanceStartModeOrphanIntent.Events | Where-Object { $_ -like 'MARKER-NO-RESTART *' }).Count -eq 0 -and
+                    ($maintenanceStartModeOrphanIntent.Held -join ',') -ceq 'BRAVO,exchangAPI,BravoWeb' -and
+                    $maintenanceStartModeOrphanIntent.ServicesStarted -and
+                    $maintenanceStartModeOrphanIntent.MarkerCleared -and
+                    $maintenanceStartModeSuppressedIntent.ProbeOk -and $maintenanceStartModeSuppressedIntent.StepOrderOk -and
+                    (@($maintenanceStartModeSuppressedIntent.Events | Where-Object { $_ -like 'MARKER-NO-RESTART *' }) -join ',') -ceq 'MARKER-NO-RESTART BravoWeb' -and
+                    @($maintenanceStartModeSuppressedIntent.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 0
+                ) `
+                -Name "Maintenance/StartModeOrphanRestartIntentSurvivesMarkerRewrite" `
+                -Failure ("Maintenance (#349): намір перезапуску служби, зупиненої аварійно перерваним прогоном, має зберегтися в маркері й служба має стартувати у finally, а restartSuppressed — не успадковуватись; події: " + ($maintenanceStartModeOrphanIntent.Events -join ' | ') + ' || ' + ($maintenanceStartModeSuppressedIntent.Events -join ' | '))
         } finally {
             if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
                 Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
