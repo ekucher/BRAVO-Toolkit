@@ -252,3 +252,15 @@ function Test-BRAVODeployRuntimeMatchesManifest {
     }
     return [pscustomobject]@{ IsMatch = ($problems.Count -eq 0); Problems = @($problems.ToArray()) }
 }
+
+# Вердикт коду завершення BRAVO_SETUP.ps1 для гейтів оновлювача (#330).
+# Контракт BRAVO.ExitCodes: 0 = успіх, 10 = SuccessWithWarnings (успіх із
+# попередженнями), усе інше = збій. Один вердикт і для гейта після
+# розгортання, і для перевірки після відкату: раніше гейт приймав лише 0 і
+# відкочував справне оновлення через попередження, а відкат приймав 0 і 10.
+function Get-BRAVODeploySetupExitVerdict {
+    param([Parameter(Mandatory = $true)][int]$ExitCode)
+    if ($ExitCode -eq 0) { return 'PASS' }
+    if ($ExitCode -eq 10) { return 'PASS_WITH_WARNING' }
+    return 'FAIL'
+}

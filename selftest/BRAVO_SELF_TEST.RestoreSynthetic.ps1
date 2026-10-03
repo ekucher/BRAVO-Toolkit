@@ -42,6 +42,8 @@ $restoreSyntheticRuntimeText = [IO.File]::ReadAllText(
 $restoreSyntheticStubText = @'
 function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp) }
 function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+# #337: заглушки більше не витікають між suite, тож справжній Start-Sleep (settle-повтори recovery, 15 с x спроб) без власного no-op дав би +160 с на сценарій.
+function Start-Sleep { param($Seconds, $Milliseconds) }
 function Write-BRAVOLog { param($Component, $Message, $Level, [switch]$Secondary) }
 function Format-BRAVODuration { param($Duration) return [string]$Duration }
 function Get-BRAVOFiles { BRAVO.Compatibility\Get-BRAVOFiles @args }
@@ -68,7 +70,7 @@ function Format-BRAVORunningDetail {
 $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($restoreSyntheticStubText + "`n" + $restoreSyntheticRuntimeText) `
     -FunctionNames @(
-        'Write-Log', 'Send-SlackAlert', 'Write-BRAVOLog', 'Format-BRAVODuration',
+        'Write-Log', 'Send-SlackAlert', 'Start-Sleep', 'Write-BRAVOLog', 'Format-BRAVODuration',
         'Get-BRAVOFiles', 'ConvertTo-BRAVOWindowsCommandLineArgument',
         'Start-BRAVOProcessOutputCapture', 'Complete-BRAVOProcessOutputCapture',
         'Write-BRAVOProcessInputText', 'Get-BRAVOSevenZipExitCodeDescription',
