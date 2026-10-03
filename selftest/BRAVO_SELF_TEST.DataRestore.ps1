@@ -268,9 +268,10 @@ function Stop-Process {
                         switch ([string]$script:BRAVOSelfTestPathBehaviours[$selfTestPathPrefix]) {
                             'IOException' { throw (New-Object System.IO.IOException('The network path was not found.')) }
                             'Unauthorized' { throw (New-Object System.UnauthorizedAccessException('Access to the path is denied.')) }
-                            'ProviderError' { throw (New-Object System.Management.Automation.ProviderInvocationException('self-test: збій провайдера FileSystem')) }
+                            'ProviderError' { throw (New-Object System.Management.Automation.ProviderInvocationException('self-test: збій провайдера FileSystem', (New-Object System.IO.IOException('The specified network name is no longer available.')))) }
                             'Exists' { return $true }
                             'Missing' { return $false }
+                            default { throw "self-test: невідома поведінка заглушки Test-Path: $($script:BRAVOSelfTestPathBehaviours[$selfTestPathPrefix])" }
                         }
                     }
                     Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType
@@ -438,7 +439,8 @@ function Stop-Process {
                 -not $planUncThrew -and
                 $null -ne $planUncResult -and
                 -not $planUncResult.Success -and
-                ([string]$planUncResult.Error).Contains('недоступн')
+                ([string]$planUncResult.Error).Contains('-TargetPath недоступний') -and
+                -not (& $pathProviderStubLeaked $dataRestoreModule)
             ) `
             -Name "DataRestore/PlanClassifiesUnreachableUncTarget" `
             -Failure "Get-BRAVODataRestorePlan (OutOfPlace) на недосяжний UNC -TargetPath має повертати Success=false з поясненням недоступності, а не кидати виняток Test-Path"

@@ -634,8 +634,10 @@ function Get-BRAVODataRestorePathProbe {
     # піднімає "The network path was not found" — у транскрипті це
     # TerminatingError(Test-Path), і -ErrorAction SilentlyContinue його
     # НЕ гарантовано гасить. Тому тут -ErrorAction Stop + try/catch: будь-яка
-    # помилка провайдера (термінальна чи ні) стає полем Error, а викликач
-    # сам вирішує, як класифікувати недоступність (fail-closed).
+    # помилка, яку провайдер ПІДНІМАЄ (термінальна чи ні), стає полем Error,
+    # а викликач сам вирішує, як класифікувати недоступність (fail-closed).
+    # Якщо провайдер мовчки повертає $false без помилки, проба не може
+    # відрізнити це від відсутнього шляху — тоді Exists=$false, Error=$null.
     # CI-раннер цього не бачить: там неіснуюче ім'я не резолвиться, і
     # Test-Path тихо повертає $false.
     param(
@@ -678,7 +680,10 @@ function Test-BRAVODataRestorePathHasReparseAncestor {
     $current = $fullPath
     while (-not [string]::IsNullOrWhiteSpace($current)) {
         try {
-            if (Test-Path -LiteralPath $current) {
+            # -ErrorAction Stop: помилка провайдера (недосяжний UNC) має
+            # потрапити в catch нижче (відхилити), а не стати "предка немає"
+            # з підйомом угору за ErrorActionPreference=Continue.
+            if (Test-Path -LiteralPath $current -ErrorAction Stop) {
                 $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
                 if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                     return $true
