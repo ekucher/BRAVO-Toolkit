@@ -13960,6 +13960,8 @@ function Write-BRAVOStepResult {
 function Write-BRAVOServiceQuiescenceState {
     param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
     Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
+    # #349: утримувана служба без наміру перезапуску (зупинена до прогону).
+    foreach ($probeNoIntent in @(@($Services) | Where-Object { -not [bool]$_.RestartIntent })) { Add-ProbeEvent ("MARKER-NO-RESTART " + [string]$probeNoIntent.Name) }
 }
 # #297: утримання від автостарту. Без $script:ProbeStartModes стаби повертають
 # порожній знімок і Disabled-тип (жодних змін start type, жодних подій у
@@ -14220,10 +14222,14 @@ try {
     }
 
     $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
-    $probeServiceTable = if ($Scenario -ne 'ThrowInSizeCheck') {
-        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
-    } else {
+    # ThrowInSizeCheck: exchangAPI зупинена до прогону. #349 *InitiallyStopped:
+    # BravoWeb зупинена до прогону (поза restart-intent, але має утримуватись).
+    $probeServiceTable = if ($Scenario -eq 'ThrowInSizeCheck') {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Running' }"
+    } elseif ($Scenario -like '*InitiallyStopped') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Stopped' }"
+    } else {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
     }
     $probeScenarioSeed = @(
         ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
@@ -14239,6 +14245,8 @@ try {
                 'StartModeQueryThrows' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'THROW'; 'BravoWeb' = 'Manual' }" }
                 'StartModeHeld' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 'StartModeOperatorDisabled' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Disabled'; 'BravoWeb' = 'Manual' }" }
+                'StartModeOtherInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Other' }" }
+                'StartModeHeldInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 default { '$null' }
             })),
         # #297: результат раннього самовідновлення типів запуску (у production
@@ -14319,7 +14327,7 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled')) {
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped')) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
                 $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
@@ -14607,6 +14615,31 @@ try {
                 ) `
                 -Name "Maintenance/StartModeHeldOrOperatorDisabledReachesRestore" `
                 -Failure ("Maintenance (#349): Automatic/AutomaticDelayed/Manual утримуються, Disabled оператором не змінюється й не є збоєм — реставрація доходить до архіву перед реставрацією; події: " + ($maintenanceStartModeHeld.Events -join ' | ') + ' || ' + ($maintenanceStartModeOperatorDisabled.Events -join ' | '))
+            # #349 (рев'ю): служба, зупинена ДО прогону, при запланованій реставрації
+            # теж утримується й перевіряється (зупинка діє за фактичним станом, тож
+            # служба, що встигла запуститися, інакше була б поза знімком і бар'єрами),
+            # але без наміру перезапуску: у finally вона не стартує.
+            $maintenanceStartModeOtherStopped = & $maintenanceStartModeOutcome 'StartModeOtherInitiallyStopped'
+            $maintenanceStartModeHeldStopped = & $maintenanceStartModeOutcome 'StartModeHeldInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceStartModeOtherStopped.ProbeOk -and
+                    $maintenanceStartModeOtherStopped.ExitCode -eq 40 -and
+                    $maintenanceStartModeOtherStopped.StepOrderOk -and
+                    @($maintenanceStartModeOtherStopped.Native).Count -eq 0 -and
+                    $maintenanceStartModeOtherStopped.RestoreCancelled -and
+                    @($maintenanceStartModeOtherStopped.UnrestorableErrors).Count -eq 1 -and
+                    [string]$maintenanceStartModeOtherStopped.UnrestorableErrors[0] -like '*BravoWeb (тип запуску: Other)*' -and
+                    (@($maintenanceStartModeOtherStopped.Events | Where-Object { $_ -like 'START *' }) -join ',') -ceq 'START BRAVO,START exchangAPI' -and
+                    $maintenanceStartModeHeldStopped.ProbeOk -and $maintenanceStartModeHeldStopped.StepOrderOk -and
+                    @($maintenanceStartModeHeldStopped.Events | Where-Object { $_ -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb' }).Count -eq 1 -and
+                    (@($maintenanceStartModeHeldStopped.Events | Where-Object { $_ -like 'MARKER-NO-RESTART *' }) -join ',') -ceq 'MARKER-NO-RESTART BravoWeb' -and
+                    ($maintenanceStartModeHeldStopped.Held -join ',') -ceq 'BRAVO,exchangAPI,BravoWeb' -and
+                    ($maintenanceStartModeHeldStopped.Native -join '|') -ceq 'NATIVE Архівація моделі перед реставрацією' -and
+                    @($maintenanceStartModeHeldStopped.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 0
+                ) `
+                -Name "Maintenance/StartModeInitiallyStoppedServiceIsHeldWithoutRestart" `
+                -Failure ("Maintenance (#349): служба, зупинена до прогону, при запланованій реставрації має утримуватись і перевірятись (Other -> fail-closed), але не стартувати у finally; події: " + ($maintenanceStartModeOtherStopped.Events -join ' | ') + ' || ' + ($maintenanceStartModeHeldStopped.Events -join ' | '))
         } finally {
             if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
                 Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue

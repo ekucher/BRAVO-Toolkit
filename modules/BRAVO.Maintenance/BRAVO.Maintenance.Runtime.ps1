@@ -8743,11 +8743,26 @@ $script:quiescedServiceNames = @()
 $script:startTypeSnapshot = @()
 $script:startModeSuppressionFailures = @()
 $script:startModeRestoreIncomplete = $false
-if ($stopServicesRequired) {
-    $quiescenceServices = @()
-    if ($serviceWasRunning.Bravo) { $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = $true } }
-    if ($serviceWasRunning.ExchangeApi) { $quiescenceServices += @{ Name = $ExchangAPIServiceName; RestartIntent = $true } }
-    if ($serviceWasRunning.BravoWeb) { $quiescenceServices += @{ Name = $BravoWebServiceName; RestartIntent = $true } }
+# #349: коли заплановано реставрацію, утримується КОЖНА увімкнена керована
+# служба, а не лише ті, що працювали на старті: зупинка нижче діє за
+# ФАКТИЧНИМ станом, тож служба, що встигла запуститися після знімка
+# $serviceWasRunning, інакше була б зупинена поза знімком типів запуску,
+# утриманням і бар'єрами перед before-archive/bravocmd. Та сама модель, що
+# в DataRestore (#333/#345): квієсценція — усі керовані служби, намір
+# перезапуску (RestartIntent, старт у finally, Health-watchdog) — лише ті,
+# що працювали на старті.
+$quiescenceHoldAllManaged = [bool]$shouldRestore
+$quiescenceServices = @()
+if ($serviceWasRunning.Bravo -or ($quiescenceHoldAllManaged -and $BravoMaintenanceEnabled)) {
+    $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = [bool]$serviceWasRunning.Bravo }
+}
+if ($serviceWasRunning.ExchangeApi -or ($quiescenceHoldAllManaged -and $exchangAPIServiceEnabled)) {
+    $quiescenceServices += @{ Name = $ExchangAPIServiceName; RestartIntent = [bool]$serviceWasRunning.ExchangeApi }
+}
+if ($serviceWasRunning.BravoWeb -or ($quiescenceHoldAllManaged -and $BravoWebMaintenanceEnabled)) {
+    $quiescenceServices += @{ Name = $BravoWebServiceName; RestartIntent = [bool]$serviceWasRunning.BravoWeb }
+}
+if ($quiescenceServices.Count -gt 0) {
     $script:quiescedServiceNames = @($quiescenceServices | ForEach-Object { [string]$_.Name })
     try {
         $script:startTypeSnapshot = @(New-BRAVOServiceStartTypeSnapshot -ServiceNames $script:quiescedServiceNames)
