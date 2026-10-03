@@ -47,8 +47,34 @@ $dotClaudeClaude = Join-Path $RepoRoot '.claude\CLAUDE.md'
 $agents = Join-Path $RepoRoot 'AGENTS.md'
 $orchestrate = Join-Path $RepoRoot '.claude\skills\orchestrate\SKILL.md'
 $reviewer = Join-Path $RepoRoot '.claude\agents\reviewer.md'
+$scout = Join-Path $RepoRoot '.claude\agents\scout.md'
+$tester = Join-Path $RepoRoot '.claude\agents\tester.md'
+$worker = Join-Path $RepoRoot '.claude\agents\worker.md'
 
 @($policy, $dotClaudeClaude, $agents, $orchestrate, $reviewer) | ForEach-Object { Assert-FileExists $_ }
+
+# Referential integrity: a rule-file path referenced anywhere in the portable
+# policy surface (e.g. `.claude/rules/05-architecture.md`) must actually exist
+# as a tracked file. A reference to a path under a sibling root that was never
+# committed (`.agents/rules/...` when only `.claude/rules/...` is tracked) is a
+# silent authority gap: a harness following the reference loads nothing and
+# cannot tell that loading failed.
+function Assert-ReferencedRuleFilesExist {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $text = [System.IO.File]::ReadAllText($Path)
+    $ruleRefs = [System.Text.RegularExpressions.Regex]::Matches($text, '\.(?:agents|claude)/rules/[A-Za-z0-9_.\-]+\.md')
+    foreach ($ref in $ruleRefs) {
+        $relative = $ref.Value -replace '/', '\'
+        $candidate = Join-Path $RepoRoot $relative
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            $failures.Add("Referenced rule file does not exist: $($ref.Value) (referenced in $Path)")
+        }
+    }
+}
+
+@($policy, $dotClaudeClaude, $agents, $orchestrate, $reviewer, $scout, $tester, $worker) |
+    ForEach-Object { Assert-ReferencedRuleFilesExist $_ }
 
 Assert-Contains $dotClaudeClaude 'BRAVO_AGENT_POLICY\.md' '.claude/CLAUDE.md must reference canonical BRAVO_AGENT_POLICY.md.'
 Assert-Contains $agents 'BRAVO_AGENT_POLICY\.md' 'AGENTS.md must reference canonical BRAVO_AGENT_POLICY.md.'
@@ -61,6 +87,7 @@ Assert-Contains $policy '\*\*P3\*\*' 'Canonical policy must define P3.'
 Assert-Contains $orchestrate 'codex_delegate' 'Orchestrator must integrate codex_delegate.'
 Assert-Contains $orchestrate 'quota/usage limit' 'Orchestrator must implement the Codex limit fallback rule.'
 Assert-Contains $reviewer 'claude-qa-fallback' 'Reviewer must support the explicit Claude QA fallback mode.'
+Assert-Contains $reviewer 'P0/P1/P2/P3 only' 'Reviewer policy must mandate P0/P1/P2/P3-only findings.'
 
 # Fallback reason must stay restricted to quota/rate-limit/service-unavailable.
 Assert-Contains $policy 'fallback_reason:\s*quota \| rate-limit \| service-unavailable' 'Canonical policy must restrict fallback_reason to quota|rate-limit|service-unavailable.'
@@ -70,7 +97,7 @@ Assert-Contains $policy 'not\*\* allowed to hide (bridge defects|MCP)' 'Canonica
 Assert-Contains $policy 'configuration errors, protocol errors, parsing failures, test failures, or implementation bugs' 'Canonical policy must enumerate the failure classes the fallback may not hide.'
 
 Assert-NotContains $policy 'Any child process must be started as `powershell\.exe`' 'Old over-broad child-process rule detected.'
-Assert-NotContains $reviewer 'blocker\|should-fix\|nit' 'Legacy reviewer severity labels detected; use P0-P3.'
+Assert-NotContains $reviewer '(?im)^\s*[-*]?\s*(blocker|should-fix|nit)\s*:\s*$' 'Legacy reviewer severity labels detected; use P0-P3.'
 Assert-NotContains $orchestrate 'harnessmachine/codex-orchestrate' 'Legacy standalone codex-orchestrate dependency detected.'
 Assert-NotContains $orchestrate 'standalone codex-orchestrate' 'Standalone codex-orchestrate dependency detected; route Codex only through codex_delegate/claude-codex-a2a.'
 

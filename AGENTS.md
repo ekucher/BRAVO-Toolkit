@@ -62,72 +62,51 @@ chat/session-link prohibition.
 
 Follow it for agent coordination and reporting. It does not override the
 BRAVO-specific engineering, architecture, security, PowerShell 5.1, or release
-rules defined elsewhere in this file and in `.agents/rules/`.
+rules defined elsewhere in this file and in `.claude/rules/`.
 
 ## Rule loading
 
-Additional project rules live in `.agents/rules/`.
+Detailed engineering rules for domains this repository has split into a
+dedicated tracked file live under `.claude/rules/`. Load the relevant ones
+before editing; always apply the principles in this file regardless.
 
-Before editing, load only the rule files relevant to the task.
-
-Always apply the principles in this file.
-
-Load these rules when applicable:
-
-- `.agents/rules/00-workflow.md`
-  - non-trivial implementation, debugging, refactoring, or analysis
-
-- `.agents/rules/01-change-safety.md`
-  - editing existing files or handling uncommitted changes
-
-- `.agents/rules/02-git.md`
-  - Git, commits, branches, staging, history, pull requests, tags, releases
-
-- `.agents/rules/03-security.md`
-  - authentication, authorization, external input, networking, filesystem access,
-    shell execution, secrets, public endpoints, privileged code
-
-- `.agents/rules/04-testing-validation.md`
-  - any code change that can be tested or built
-
-- `.agents/rules/05-architecture.md`
+- `.claude/rules/05-architecture.md`
   - non-trivial code implementation, structural changes, new modules,
     large PowerShell scripts, deduplication, modularization, shared helpers,
     domain ownership, or refactoring
 
-- `.agents/rules/06-release-lifecycle.md`
+- `.claude/rules/06-release-lifecycle.md`
   - VERSION/release metadata, RC acceptance, stable promotion, developer/master
     lifecycle, release preparation, tags, release branches, or refactoring after
     a stable baseline
 
-- `.agents/rules/07-bravo-runtime-invariants.md`
-  - BRAVO runtime safety behavior: Archive, DataRestore, Maintenance, Health,
-    BazaSync, Scheduler, System, Credentials, configuration/state compatibility,
-    SFTP, service ownership, restore safety, or runtime/tool integrity
-
-- `.agents/rules/powershell.md`
+- `.claude/rules/powershell.md`
   - `.ps1`, `.psm1`, `.psd1`
 
-- `.agents/rules/shell.md`
-  - `.sh`, Bash, Linux operational scripts
+For topics this repository has not (yet) split into a dedicated tracked rule
+file, the authoritative guidance lives inline in this document instead:
 
-- `.agents/rules/docker.md`
-  - Dockerfiles, Compose, container runtime changes
+- workflow, non-trivial implementation, debugging, refactoring, or analysis
+  -> "Before changing anything" above
+- change safety, editing existing files, or handling uncommitted changes
+  -> "Change discipline" below
+- Git, commits, branches, staging, history, pull requests, tags, releases
+  -> "Git" below
+- authentication, authorization, external input, networking, filesystem
+  access, shell execution, secrets, public endpoints, privileged code
+  -> "Security" below
+- any code change that can be tested or built -> "Validation" below
+- BRAVO runtime safety behavior (Archive, DataRestore, Maintenance, Health,
+  BazaSync, Scheduler, System, Credentials, configuration/state
+  compatibility, SFTP, service ownership, restore safety, or runtime/tool
+  integrity) -> `BRAVO_AGENT_POLICY.md` and "Non-negotiable repository
+  invariants" below
 
-- `.agents/rules/database.md`
-  - SQL, migrations, schemas, database access
-
-- `.agents/rules/php.md`
-  - PHP or Composer
-
-- `.agents/rules/python.md`
-  - Python or Python project configuration
-
-- `.agents/rules/config-and-yaml.md`
-  - YAML, JSON, TOML, INI, service/application configuration
-
-- `.agents/rules/logging.md`
-  - logs, tracing, diagnostics, incident investigation
+Do not claim a dedicated rule file exists for shell scripting, Docker,
+databases, PHP, Python, or config/YAML handling unless one is actually
+tracked under `.claude/rules/` -- none is today. If work in one of those
+areas needs a durable rule, add it to `.claude/rules/` first, then reference
+it here; do not invent an untracked path.
 
 Do not load every rule file mechanically.
 
@@ -135,20 +114,19 @@ Keep context focused.
 
 For example, a PowerShell refactor will normally require:
 
-    00-workflow.md
-    01-change-safety.md
-    04-testing-validation.md
-    05-architecture.md
-    powershell.md
+    "Before changing anything" (above)
+    "Change discipline" (below)
+    "Validation" (below)
+    .claude/rules/05-architecture.md
+    .claude/rules/powershell.md
 
 A stable promotion will normally require:
 
-    00-workflow.md
-    01-change-safety.md
-    02-git.md
-    04-testing-validation.md
-    06-release-lifecycle.md
-    config-and-yaml.md
+    "Before changing anything" (above)
+    "Change discipline" (below)
+    "Git" (below)
+    "Validation" (below)
+    .claude/rules/06-release-lifecycle.md
 
 plus other rules only when relevant.
 
@@ -165,7 +143,7 @@ Use this compact format:
 
 Example:
 
-`Active project rules: 00-workflow.md, 01-change-safety.md, 04-testing-validation.md, 05-architecture.md, powershell.md`
+`Active project rules: Before changing anything, Change discipline, Validation, .claude/rules/05-architecture.md, .claude/rules/powershell.md`
 
 Requirements:
 
@@ -175,7 +153,7 @@ Requirements:
 - do not repeat the report unless the active rule set changes materially;
 - do not emit the report for trivial questions, read-only lookups, or tasks that
   do not require repository changes;
-- if no additional `.agents/rules/*.md` file is needed, do not invent one.
+- if no additional `.claude/rules/*.md` file is needed, do not invent one.
 
 If a relevant rule should apply but has not yet been read, read it before editing.
 
@@ -261,7 +239,7 @@ Before creating a new helper:
 Do not introduce generic dumping-ground helper modules merely to reduce line
 count.
 
-Use `.agents/rules/05-architecture.md` for detailed architecture policy.
+Use `.claude/rules/05-architecture.md` for detailed architecture policy.
 
 ## Refactoring
 
@@ -332,7 +310,7 @@ baseline for the next development cycle.
 Broad modularization belongs in the subsequent development/prerelease cycle, not
 inside stable promotion.
 
-Use `.agents/rules/06-release-lifecycle.md` for detailed release policy.
+Use `.claude/rules/06-release-lifecycle.md` for detailed release policy.
 
 ## Validation
 
@@ -435,7 +413,7 @@ Unless repository policy explicitly changes:
 - prefer explicit paths and parameters;
 - avoid unnecessary global state.
 
-Load `.agents/rules/powershell.md` for PowerShell changes.
+Load `.claude/rules/powershell.md` for PowerShell changes.
 
 ## Communication
 
