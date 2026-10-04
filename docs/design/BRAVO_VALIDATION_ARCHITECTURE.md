@@ -175,6 +175,156 @@ Affected
 Full
 ```
 
+## 5. Класифікація змін та вимоги до валідації
+
+Вимога запуску Full Self-Test визначається не самим фактом наявності PR і не розширенням зміненого файла, а впливом зміни на executable/runtime behavior, validation contract, packaging, configuration, integrity та release behavior.
+
+Для планування валідації зміни класифікуються за найвищим застосовним класом ризику:
+
+| Клас | Характер зміни | Мінімальна вимога |
+| --- | --- | --- |
+| V0 — Non-runtime | зміна не може вплинути на executable/runtime behavior або validation contract | релевантні documentation/governance/static checks; Full Self-Test не потрібен |
+| V1 — Static / governance | зміна стосується repository mechanics або доказово non-semantic content | релевантні static/governance checks; Full визначається фактичним впливом |
+| V2 — Behavioral scoped | production/test behavior змінюється у відомій області з визначеним ownership | Targeted -> Affected -> Full перед acceptance |
+| V3 — Critical / broad | security, integrity, trust boundary, shared behavior, harness, packaging/release-critical або невідомий широкий вплив | Full + усі релевантні specialized gates + відповідний independent review |
+
+### 5.1 V0 — зміни, для яких Full Self-Test не потрібен
+
+До V0 належить documentation-only change, якщо весь diff складається лише з документації й документація не є executable/generated input для runtime, packaging, CI або release process.
+
+Типові приклади:
+
+- Markdown-документація під `docs/`;
+- `README.md`, операторські інструкції та design-документи;
+- текстові виправлення документації;
+- PR/Issue metadata, якщо вони не змінюють repository tree;
+- інші суто документальні зміни, для яких механічно підтверджено відсутність runtime/validation впливу.
+
+Для V0:
+
+```text
+BRAVO_SELF_TEST.ps1:
+NOT RUN — validation class V0; Full Self-Test not required
+```
+
+Це не `PASS` і не доказ проходження Self-Test. Це явне твердження, що Full не запускався, оскільки за класифікацією зміни він не є необхідним gate.
+
+V0 не скасовує релевантні repository checks, наприклад перевірку Markdown encoding, secret scanning або інші governance checks, якщо вони застосовні.
+
+### 5.2 V1 — static / governance changes
+
+V1 охоплює зміни, які не повинні змінювати product runtime behavior, але можуть впливати на repository mechanics або потребують спеціальної статичної перевірки.
+
+Потенційні приклади, які потребують підтвердження фактичного diff:
+
+- доказово non-semantic formatting/comment-only зміни у коді;
+- repository metadata;
+- окремі governance rules;
+- допоміжні metadata-файли, що не входять до runtime/release/validation contract.
+
+V1 не означає автоматичне звільнення від Full. Якщо зміна governance або metadata впливає на validation, build, packaging, release чи runtime contract, вона переходить до V2 або V3.
+
+### 5.3 V2 — behavioral scoped changes
+
+До V2 належать зміни production або test behavior з відомим domain ownership та достатньо визначеною dependency model.
+
+Нормальна послідовність:
+
+```text
+Targeted
+   |
+Affected
+   |
+Full перед acceptance
+```
+
+Успішні Targeted/Affected дають швидкий feedback, але не замінюють Full acceptance.
+
+### 5.4 V3 — critical / broad changes
+
+До V3 належать щонайменше зміни, що зачіпають:
+
+- security/integrity behavior;
+- pre-trust runtime guard boundary;
+- credentials або authorization;
+- Self-Test harness, discovery, aggregation, counters, logging чи exit-code contract;
+- shared behavior із невизначеним або широким dependency graph;
+- packaging/deployment/update behavior, коли воно впливає на runtime candidate;
+- release-critical generated artifacts;
+- зміни, для яких неможливо надійно визначити affected validation set.
+
+V3 вимагає Full та всіх релевантних specialized gates. Глибина independent review визначається repository review policy.
+
+### 5.5 Файли, які не можна автоматично вважати V0/V1
+
+Класифікація не повинна ґрунтуватися лише на extension або назві каталогу.
+
+Зокрема, такі області не отримують автоматичного Self-Test exemption:
+
+- `VERSION.json`;
+- `RUNTIME_MANIFEST.json`;
+- `.github/workflows/**`;
+- `ci/**`;
+- `selftest/**`;
+- production `*.ps1`, `*.psm1`, `*.psd1`;
+- configuration/schema/defaults;
+- packaging/deploy/update scripts;
+- generated artifacts або їхні canonical inputs;
+- приклади конфігурації, якщо вони є machine-consumed input або частиною acceptance/release contract.
+
+Для них клас визначається фактичним впливом.
+
+### 5.6 Fail-safe правило класифікації
+
+Застосовується найвищий клас серед усіх змінених artifacts.
+
+```text
+тільки V0          -> V0
+V0 + V1            -> V1
+V0 + behavioral    -> V2/V3
+unknown impact     -> V3 або Full як conservative fallback
+```
+
+Якщо неможливо механічно або evidence-based підтвердити, що зміна non-behavioral, Self-Test exemption не застосовується.
+
+Жоден агент не повинен знижувати клас лише для скорочення часу CI або отримання green status.
+
+### 5.7 CI semantics для not-required checks
+
+Required-capable workflow не слід вимикати workflow-level `paths:` лише для optimization, якщо це може призвести до відсутності required status check.
+
+Цільова CI-модель повинна відокремлювати:
+
+1. створення/наявність required check status;
+2. relevance decision;
+3. фактичний запуск дорогого test harness.
+
+Для V0/V1 job може завершитися успішним статусом `N/A / not required`, якщо repository protection потребує check result, але це не можна звітувати як `BRAVO_SELF_TEST.ps1 PASS`.
+
+Поточний CI може продовжувати запускати Full на всіх PR до окремої, reviewed behavioral зміни workflow. Цей design сам по собі не авторизує зміну `ci.yml`.
+
+### 5.8 Початкова Validation Requirement Matrix
+
+| Тип зміни | Targeted | Affected | Full Self-Test | Додаткова валідація |
+| --- | --- | --- | --- | --- |
+| Documentation-only, V0 | не потрібен | не потрібен | NOT REQUIRED | docs/governance/static checks |
+| PR/Issue metadata без repository diff | не потрібен | не потрібен | NOT REQUIRED | за потреби |
+| Доказово non-semantic code change | зазвичай не потрібен | зазвичай не потрібен | визначається evidence; не автоматично | parser/static checks |
+| Repository/governance metadata | за потреби | за потреби | залежить від впливу | governance checks |
+| CI/workflow | релевантні | релевантні | залежить від впливу; validation-contract change може вимагати Full | workflow/governance checks |
+| Test-only | змінений test | affected tests | REQUIRED, якщо змінюється Full contract/harness/coverage; інакше за risk classification | відповідний test contract |
+| Self-Test harness/discovery/aggregation | не є достатнім | не є достатнім | REQUIRED | governance/characterization |
+| Production PowerShell | REQUIRED | REQUIRED | REQUIRED перед acceptance | domain-specific gates |
+| Configuration/schema/defaults | REQUIRED | REQUIRED | REQUIRED | Config parity та інші config gates |
+| Runtime integrity/manifest | REQUIRED | REQUIRED | REQUIRED | integrity/release gates |
+| Packaging/deploy/update | REQUIRED | REQUIRED | REQUIRED, якщо змінюється runtime candidate/behavior | artifact/deployment gates |
+| Security/trust/credentials | REQUIRED | REQUIRED | REQUIRED | security validation/review |
+| Release/version metadata | за потреби | за потреби | згідно release policy та фактичного runtime impact | release gates |
+| Generated runtime artifact/input | REQUIRED | REQUIRED | REQUIRED | generation/idempotency/integrity |
+| Mixed або unknown scope | conservative | conservative | REQUIRED | усі релевантні specialized gates |
+
+Матриця є design baseline. VAL-01/VAL-02 повинні підтвердити або уточнити категорії на основі фактичного ownership та поточного Self-Test contract.
+
 ## 5. Цільова архітектура Self-Test
 
 ```text
