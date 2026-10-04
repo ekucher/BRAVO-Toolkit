@@ -13,18 +13,16 @@
 Перетворити встановлення, оновлення, відновлення та діагностику BRAVO Toolkit з набору окремих операторських сценаріїв на один безпечний lifecycle:
 
 ```text
-BRAVO Installer / Maintenance Center
-                |
-                v
-         BRAVO_UPDATE.ps1
-                |
-                v
-           BRAVO.Update
-      /       |       \
- Install    Update    Repair
-                |
-                v
-     canonical BRAVO domains
+              BRAVO.Update
+             /     |      \
+            /      |       \
+ Installer GUI   CLI entry   Scheduled trigger
+                 |
+          BRAVO_UPDATE.ps1
+
+BRAVO.Update є canonical lifecycle/deployment domain.
+GUI, CLI entrypoint і майбутній Scheduled trigger не створюють
+паралельних implementation deployment policy.
 ```
 
 GUI не є власником deployment policy. Він відображає стан, збирає вибір оператора, показує план, запускає канонічний engine та відображає structured progress/result.
@@ -44,7 +42,7 @@ GUI не є власником deployment policy. Він відображає с
 5. Legacy `BRAVO.config` не видаляється і не мігрує автоматично без доведеної operator-controlled migration.
 6. Після початку mutation failure має завершитися або доведено успішним rollback, або явним `CRITICAL/Manual intervention required`.
 7. Scheduled update використовує той самий engine, що й ручне оновлення.
-8. Auto-update не вводиться до acceptance manual transactional update, rollback та recovery.
+8. Production `Automatic` update не входить у P3.2a та залишається hard-blocked до завершення й acceptance повного P3.2: versioned release directories, deployment pointer, staging/validation, atomic activation, automatic rollback та update journal.
 9. Prerelease deployment залишається fail-closed без explicit authorization.
 10. Merged code не дорівнює real-host acceptance.
 
