@@ -1064,6 +1064,17 @@ function Invoke-ServiceStateChange {
             if ([string]$service.Status -eq 'StartPending') {
                 $service = Wait-BRAVOServiceStartPendingSettled -Name $Name -Deadline $deadline -PollIntervalSeconds $pollSeconds
             }
+            # #360: призупинену оператором службу не зупиняємо (зупинка й
+            # перезапуск перетворили б паузу на Running) — за свіжим станом,
+            # безпосередньо перед Stop-Service.
+            if ([string]$service.Status -in @('Paused', 'PausePending', 'ContinuePending')) {
+                return [pscustomobject]@{
+                    Success = $false
+                    AlreadyInState = $false
+                    FinalStatus = [string]$service.Status
+                    Error = "службу призупинено (стан: $($service.Status)) — не зупинено, пауза зберігається (#360)"
+                }
+            }
             if ([string]$service.Status -ne 'Stopped') {
                 Stop-Service `
                     -Name $Name `
@@ -9017,8 +9028,11 @@ function Get-BRAVOMaintenancePreArchiveBarrierPlan {
             -Force
         if ($serviceResult.Success) {
             $stoppedAgain += $managedService.Name
+        } elseif ([string]$serviceResult.FinalStatus -in @('Paused', 'PausePending', 'ContinuePending')) {
+            # Призупинену службу бар'єр теж не зупиняє — реставрацію скасовано.
+            $contractFailures += "$($managedService.Name): $($serviceResult.Error)"
         }
-        # Не зупинилась — бар'єр нижче зафіксує її як порушника.
+        # Не зупинилась з іншої причини — бар'єр нижче зафіксує її як порушника.
     }
     if ($stoppedAgain.Count -gt 0) {
         Write-Log -Message "Перед архівацією повторно зупинено служби, запущені після зупинки Maintenance (SCM autostart/recovery/інший актор): $($stoppedAgain -join ', ')" -Level "WARNING"
