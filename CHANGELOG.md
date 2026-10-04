@@ -1,5 +1,24 @@
 # Changelog
 
+## 5.2.5-rc.4 — 2026-10-04
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.3` (нижче).
+
+- **Fix: перевищення порогу діапазонів ID більше не ховає решту перевірок Maintenance у сповіщенні.**
+  Коли `Test-RangeIdUsage` фіксував перевищення порогу (`range_id_log.json`), запис потрапляв у
+  `CriticalErrorsList`, і `Send-FinalReport` будував фінальне сповіщення ЛИШЕ з цього списку:
+  статуси реставрації, `.md`, trace, очистки, вільного місця, проблемні етапи ("Також потребує
+  уваги") і попередження з `NotificationAlertQueue` до оператора не доходили, хоча самі перевірки
+  виконувались. Тепер блок "Виконано:" будує окремий helper
+  `Get-BRAVOMaintenanceFinalReportCheckLines`, і він додається в КОЖНУ гілку фінального звіту:
+  критична гілка містить записи `CriticalErrorsList`, попередження з черги і статуси етапів;
+  гілка черги попереджень — попередження і статуси етапів. Збій побудови блоку статусів лише
+  логується (`Get-BRAVOMaintenanceFinalReportCheckLinesSafe`) і не забирає саме сповіщення про
+  проблему. Дефект присутній і в `5.2.4`. Нові перевірки:
+  `Maintenance/RangeIdAlertKeepsOtherChecksInFinalReport`,
+  `Maintenance/AlertQueueFinalReportIncludesCheckStatuses`,
+  `Maintenance/FinalReportCheckLinesFailureKeepsAlert`.
+
 ## 5.2.5-rc.3 — 2026-10-02
 
 Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.2` (нижче).
