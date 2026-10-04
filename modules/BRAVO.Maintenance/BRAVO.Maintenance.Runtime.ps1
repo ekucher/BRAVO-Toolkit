@@ -10027,9 +10027,10 @@ if ($script:modelIntegrityEstablished -and $script:startTypeSnapshot.Count -gt 0
 
 # 1. Запуск служби BRAVO
 try {
-    # Призупинену оператором службу (Paused) не запускаємо: Maintenance її не
-    # зупиняв, пауза зберігається (#360).
-    if ($script:modelIntegrityEstablished -and $serviceWasRunning.Bravo -and [string](Get-Service -Name $BravoServiceName).Status -notin @('Running', 'Paused')) {
+    # Призупинену оператором службу (Paused, а також PausePending /
+    # ContinuePending — той самий набір, що й у фазі зупинки) не запускаємо:
+    # Maintenance її не зупиняв, пауза зберігається (#360).
+    if ($script:modelIntegrityEstablished -and $serviceWasRunning.Bravo -and [string](Get-Service -Name $BravoServiceName).Status -notin @('Running', 'Paused', 'PausePending', 'ContinuePending')) {
         Write-Log -Message "Запуск служби $BravoServiceName..." -Level "INFO"
         $serviceResult = Invoke-ServiceStateChange `
             -Name $BravoServiceName `
@@ -10071,8 +10072,8 @@ if ($BravoMaintenanceEnabled -and $null -ne $traceConfiguration -and $traceConfi
 if ($script:modelIntegrityEstablished -and $serviceWasRunning.ExchangeApi) {
     try {
         $serviceStatus = [string](Get-Service -Name $ExchangAPIServiceName -ErrorAction Stop).Status
-        # Призупинену оператором службу (Paused) не запускаємо (#360).
-        if ($serviceStatus -notin @('Running', 'Paused')) {
+        # Призупинену оператором службу (Paused/PausePending/ContinuePending) не запускаємо (#360).
+        if ($serviceStatus -notin @('Running', 'Paused', 'PausePending', 'ContinuePending')) {
             Write-Log -Message "Запуск служби $ExchangAPIServiceName..." -Level "INFO"
             $serviceResult = Invoke-ServiceStateChange `
                 -Name $ExchangAPIServiceName `
@@ -10100,8 +10101,8 @@ if ($script:modelIntegrityEstablished -and $serviceWasRunning.ExchangeApi) {
 if ($script:modelIntegrityEstablished -and $serviceWasRunning.BravoWeb) {
     try {
         $ApacheService = Get-Service -Name $BravoWebServiceName -ErrorAction Stop
-        # Призупинену оператором службу (Paused) не запускаємо (#360).
-        if ([string]$ApacheService.Status -notin @('Running', 'Paused')) {
+        # Призупинену оператором службу (Paused/PausePending/ContinuePending) не запускаємо (#360).
+        if ([string]$ApacheService.Status -notin @('Running', 'Paused', 'PausePending', 'ContinuePending')) {
             Write-Log -Message "Запуск служби BRAVO Web ($BravoWebServiceName)..." -Level "INFO"
             $serviceResult = Invoke-ServiceStateChange `
                 -Name $BravoWebServiceName `

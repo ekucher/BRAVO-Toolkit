@@ -34,7 +34,7 @@
   архівацією» (консоль, підсумок, фінальне сповіщення) — навіть коли `[3/8]` звітував SKIPPED. Реставрація й
   обробка trace не виконуються над службою в перехідному стані (лише `Stopped` або `Paused`),
   а стан BRAVO перечитується безпосередньо перед ротацією trace. Призупинена (`Paused`) служба
-  не зупиняється й не запускається — і на старті, і коли її призупинили вже після знімка (BRAVO
+  (а також `PausePending`/`ContinuePending`) не зупиняється й не запускається — і на старті, і коли її призупинили вже після знімка (BRAVO
   Web раніше зупинялася й лишалася зупиненою); якщо в неї був намір перезапуску, його знято й з
   маркера, тож Health-watchdog після аварійного переривання її не запустить; у restore-прогоні така утримувана служба
   скасовує реставрацію fail-closed ДО архіву. Служба, зупинена і на старті, і перед зупинкою, як
@@ -56,6 +56,7 @@
   `Maintenance/LifecyclePreArchiveBarrierStopIsReported`,
   `Maintenance/LifecycleFinalBarrierNeverStopsOutsideContract`,
   `Maintenance/LifecycleUnreadableServiceStateIsNotStopped`,
+  `Maintenance/LifecyclePendingPauseIsNotRestarted`,
   `Maintenance/LifecyclePausedServiceStateIsPreserved`,
   `Maintenance/LifecycleTraceRotationRechecksBravoState`.
 
