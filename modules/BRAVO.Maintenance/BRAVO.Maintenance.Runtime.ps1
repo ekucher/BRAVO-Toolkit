@@ -8958,7 +8958,8 @@ function Confirm-BRAVOMaintenanceServiceStopContract {
         Write-Log -Message "Службу $Name (стан: $Status) запущено вже після запису ownership-маркера — вона поза lifecycle-контрактом цього прогону, тому Maintenance її не зупиняє (#360)" -Level "WARNING"
         return $false
     }
-    if ($Status -in @('Running', 'StartPending') -and -not $serviceWasRunning[$Key]) {
+    # Сюди без наміру доходить лише Running/StartPending (див. перевірку вище).
+    if (-not $serviceWasRunning[$Key]) {
         $intentEntries = @($quiescenceServices | Where-Object { [string]$_.Name -ieq $Name })
         foreach ($intentEntry in $intentEntries) { $intentEntry.RestartIntent = $true }
         try {
@@ -8980,6 +8981,50 @@ function Confirm-BRAVOMaintenanceServiceStopContract {
         Write-Log -Message "Службу $Name запущено після початкового знімка (стан: $Status) — намір перезапуску записано в ownership-маркер до її зупинки (#360)" -Level "INFO"
     }
     return $true
+}
+
+function Get-BRAVOMaintenancePreArchiveBarrierPlan {
+    # #360/#287: підготовка бар'єра перед before-архівом. Службу, яку бар'єр
+    # зупинить знову (її запустили вже після зупинки), спершу пропускає
+    # Confirm-BRAVOMaintenanceServiceStopContract; не пропустив — бар'єр її
+    # НЕ зупиняє (інакше вона лишилася б зупиненою без наміру), а
+    # ContractFailures скасовує реставрацію fail-closed. Службу у
+    # StartPending бар'єр зупинив би одразу, а SCM такий stop відхиляє —
+    # тому тут чекаємо завершення її старту.
+    $contractFailures = @()
+    foreach ($managedService in $maintenanceManagedServices) {
+        if (-not $managedService.Enabled -or
+            @($script:quiescedServiceNames | Where-Object { [string]$_ -ieq $managedService.Name }).Count -eq 0) { continue }
+        $serviceStatus = [string](Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue).Status
+        if ([string]::IsNullOrEmpty($serviceStatus) -or $serviceStatus -eq 'Stopped') { continue }
+        if (-not (Confirm-BRAVOMaintenanceServiceStopContract `
+                    -Key $managedService.Key `
+                    -Name $managedService.Name `
+                    -Status $serviceStatus)) {
+            $contractFailures += "$($managedService.Name): стан $serviceStatus, без наміру перезапуску в ownership-маркері її не зупинено (#360)"
+        }
+    }
+    $barrierNames = @($script:quiescedServiceNames | Where-Object {
+            $barrierName = [string]$_
+            @($contractFailures | Where-Object { $_.StartsWith($barrierName + ':', [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0
+        })
+    $pendingDeadline = (Get-Date).AddSeconds([math]::Max(1, $ServiceStopTimeoutSeconds))
+    foreach ($barrierName in $barrierNames) {
+        try {
+            if ([string](Get-Service -Name $barrierName -ErrorAction Stop).Status -eq 'StartPending') {
+                [void](Wait-BRAVOServiceStartPendingSettled `
+                    -Name $barrierName `
+                    -Deadline $pendingDeadline `
+                    -PollIntervalSeconds $ServicePollIntervalSeconds)
+            }
+        } catch {
+            # Стан служби недоступний — бар'єр сам зафіксує її як порушника.
+        }
+    }
+    return [pscustomobject]@{
+        BarrierNames = @($barrierNames)
+        ContractFailures = @($contractFailures)
+    }
 }
 
 # 1. Зупинка BRAVO Web
@@ -9225,43 +9270,11 @@ if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in
             # утримання або попри його збій, зупиняється знову — архів іще
             # не почато, тож це безпечно. Не вдалося утримати/зупинити —
             # реставрація скасовується fail-closed (модель не торкнута).
-            # #360: служба, яку бар'єр нижче зупинить знову, спершу отримує
-            # намір перезапуску в маркері (її запустили вже після зупинки).
-            # Не вдалося записати намір — бар'єр її НЕ зупиняє (інакше вона
-            # лишилася б зупиненою без наміру), а реставрацію скасовано
-            # fail-closed: служба працює.
-            $preArchiveContractFailures = @()
-            foreach ($managedService in $maintenanceManagedServices) {
-                if (-not $managedService.Enabled -or
-                    @($script:quiescedServiceNames | Where-Object { [string]$_ -ieq $managedService.Name }).Count -eq 0) { continue }
-                $preArchiveServiceStatus = [string](Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue).Status
-                if ([string]::IsNullOrEmpty($preArchiveServiceStatus) -or $preArchiveServiceStatus -eq 'Stopped') { continue }
-                if (-not (Confirm-BRAVOMaintenanceServiceStopContract `
-                            -Key $managedService.Key `
-                            -Name $managedService.Name `
-                            -Status $preArchiveServiceStatus)) {
-                    $preArchiveContractFailures += "$($managedService.Name): стан $preArchiveServiceStatus, без наміру перезапуску в ownership-маркері її не зупинено (#360)"
-                }
-            }
-            $preArchiveBarrierNames = @($script:quiescedServiceNames | Where-Object {
-                    $preArchiveBarrierName = [string]$_
-                    @($preArchiveContractFailures | Where-Object { $_.StartsWith($preArchiveBarrierName + ':', [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0
-                })
-            # #287: бар'єр зупиняє службу одразу, а stop службі у StartPending
-            # SCM відхиляє — спершу дочекатися завершення її старту.
-            $preArchivePendingDeadline = (Get-Date).AddSeconds([math]::Max(1, $ServiceStopTimeoutSeconds))
-            foreach ($preArchiveBarrierName in $preArchiveBarrierNames) {
-                try {
-                    if ([string](Get-Service -Name $preArchiveBarrierName -ErrorAction Stop).Status -eq 'StartPending') {
-                        [void](Wait-BRAVOServiceStartPendingSettled `
-                            -Name $preArchiveBarrierName `
-                            -Deadline $preArchivePendingDeadline `
-                            -PollIntervalSeconds $ServicePollIntervalSeconds)
-                    }
-                } catch {
-                    # Стан служби недоступний — бар'єр нижче сам зафіксує її як порушника.
-                }
-            }
+            # #360/#287: наміри перезапуску й очікування StartPending — див.
+            # Get-BRAVOMaintenancePreArchiveBarrierPlan.
+            $preArchivePlan = Get-BRAVOMaintenancePreArchiveBarrierPlan
+            $preArchiveContractFailures = @($preArchivePlan.ContractFailures)
+            $preArchiveBarrierNames = @($preArchivePlan.BarrierNames)
             $preArchiveQuiescence = Confirm-BRAVOServicesQuiesced `
                 -ServiceNames $preArchiveBarrierNames `
                 -Snapshot $script:startTypeSnapshot `

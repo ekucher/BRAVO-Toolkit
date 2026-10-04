@@ -11218,7 +11218,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             # Ворота реставрації й каталог архівів пропускають Disabled-випадок.
             Test-BRAVOCondition `
                 -Condition (
-                    $RuntimeText.Contains('if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -ne "Running") {') -and
+                    $RuntimeText.Contains('if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @(''Stopped'', ''Paused'')) {') -and
                     $RuntimeText.Contains('$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {') -and
                     $RuntimeText -match '(?s)\} elseif \(\$restoreOnDisabledBravo\) \{[^}]{0,400}\$dirsToCreate \+= \$ARC_DIR' -and
                     $RuntimeText.Contains('elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {')
@@ -11275,7 +11275,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # файлу) — не "чи існує рядок десь у файлі", а "чи стоїть він у
         # правильному місці відносно правильних сусідів".
         $barrier1WindowStart = $maintenanceRestoreWindowText.IndexOf(
-            '$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { (Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
+            '$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { [string](Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
         )
         $barrier1EntryIndex = $maintenanceRestoreWindowText.IndexOf(
             "if (`$shouldRestore) {", [Math]::Max(0, $barrier1WindowStart)
