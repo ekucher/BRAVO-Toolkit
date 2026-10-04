@@ -2,6 +2,32 @@
 
 ## Не випущено (developer)
 
+- **Fix: Maintenance не зупиняє службу, запущену після знімка стану, без ownership-маркера й наміру перезапуску (#360, #287).**
+  Знімок `$serviceWasRunning` знімався один раз на початку, а фаза зупинки діє за фактичним
+  станом. Служба, яку SCM autostart, recovery action чи оператор запустив між знімком і
+  зупинкою, зупинялася поза ownership-маркером і утриманням від автостарту. У не-restore прогоні
+  крок `[3/8]` друкувався як SKIPPED, після обслуговування служба лишалася зупиненою, а після
+  аварійного переривання її не піднімав і Health-watchdog. Тепер безпосередньо перед зупинкою
+  Maintenance перечитує фактичний стан увімкнених керованих служб. Канонічний намір
+  перезапуску: служба працювала (Running/StartPending) на старті **або перед зупинкою**, або
+  намір успадковано (#349). Кожну зупинку пропускає `Confirm-BRAVOMaintenanceServiceStopContract`:
+  утримувана служба без наміру, яка зараз активна, отримує намір у маркері ДО зупинки (так само
+  перед повторною зупинкою бар'єром перед before-архівом). Служба поза маркером, запущена вже
+  після його запису в не-restore прогоні, не зупиняється (WARNING). exchangAPI зупиняється за
+  свіжим, а не закешованим на старті станом. #287: BRAVO і exchangAPI зупиняються в будь-якому
+  активному стані (зокрема `StartPending`), `Invoke-ServiceStateChange` спершу чекає завершення
+  старту (SCM відхиляє stop службі у `StartPending`), а реставрація й обробка trace вимагають
+  саме `Stopped`. Служба, зупинена і на старті, і перед зупинкою, як і раніше не запускається;
+  `Disabled` (оператор) не чіпається; boot-recovery без змін. Нові сценарії оркестрації:
+  `Maintenance/LifecycleEveryStopHasRestartContract` (перевіряє всі сценарії),
+  `Maintenance/LifecycleLateStartBeforeStopIsOwnedAndRestarted`,
+  `Maintenance/LifecycleStartPendingIsStoppedAndRestarted`,
+  `Maintenance/LifecycleLateStartRestartedAfterStepThrows`,
+  `Maintenance/LifecycleOperatorDisabledServiceNeverTouched`,
+  `Maintenance/LifecycleServiceStartedAfterContractIsNotStopped`,
+  `Maintenance/LifecycleRestoreLateStartGetsRestartIntentBeforeStop`,
+  `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`.
+
 - **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
   На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
   піднімає помилку провайдера замість `$false`; під `$ErrorActionPreference = 'Stop'`
