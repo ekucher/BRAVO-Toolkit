@@ -1,27 +1,27 @@
-# BRAVO Validation Architecture
+# Архітектура валідації BRAVO
 
-Status: proposed design and implementation plan  
-Scope: repository validation, self-test execution model, installation verification, CI and acceptance boundaries  
-Baseline used for this design: `developer` at `5de8173d5a75d008278be8c2693cbfb242337251`
+Статус: запропонований дизайн і план реалізації  
+Область: репозиторна валідація, модель виконання Self-Test, перевірка встановлення, CI та межі acceptance  
+Базова лінія цього дизайну: `developer` @ `5de8173d5a75d008278be8c2693cbfb242337251`
 
-## 1. Purpose
+## 1. Призначення
 
-BRAVO-Toolkit has grown from a small script set into an operational toolkit with multiple entrypoints, configuration, integrity controls, maintenance, archive, restore, deployment and acceptance workflows.
+BRAVO-Toolkit виріс із набору скриптів у повноцінний операційний toolkit із кількома entrypoint-скриптами, конфігурацією, контролем цілісності, maintenance, archive, restore, deployment та acceptance-процесами.
 
-Validation must therefore serve several different purposes without mixing their trust and safety boundaries:
+Валідація повинна вирішувати різні задачі без змішування їхніх trust/safety boundaries:
 
-1. fast feedback while developing a focused change;
-2. regression validation for all mandatory repository self-tests;
-3. specialized integration and acceptance testing;
-4. production-safe verification after installation;
-5. ongoing operational health and maintenance.
+1. швидкий зворотний зв'язок під час розробки вузької зміни;
+2. регресійна перевірка всіх обов'язкових repository self-tests;
+3. спеціалізовані integration та acceptance перевірки;
+4. production-safe перевірка після встановлення;
+5. постійний operational health та maintenance.
 
-These are different validation layers. A single full self-test run is not the correct tool for every layer.
+Це різні рівні валідації. Повний Self-Test не є правильним інструментом для кожного рівня.
 
-The target model is:
+Цільова модель:
 
 ```text
-Development feedback
+Розробка
     Targeted
        |
     Affected
@@ -34,9 +34,9 @@ Repository acceptance
 Specialized integration / CI
        |
        v
-DEV-LIMS / release acceptance when required
+DEV-LIMS / release acceptance за потреби
 
-Installation
+Встановлення
        |
        v
 Post-Install Verify
@@ -44,66 +44,66 @@ Post-Install Verify
     READY / BLOCKED
        |
        v
-Normal operation
+Нормальна експлуатація
        |
        v
 Health / Maintenance
 ```
 
-## 2. Current verified contract
+## 2. Поточний підтверджений контракт
 
-The following are existing project contracts and must not be weakened by this design.
+Наведені нижче правила вже є контрактами проєкту й не можуть бути послаблені цим дизайном.
 
-### 2.1 Canonical Full Self-Test
+### 2.1 Канонічний Full Self-Test
 
-The canonical full repository self-test remains:
+Канонічний повний repository self-test:
 
 ```powershell
 .\BRAVO_SELF_TEST.ps1 -NoPause
 ```
 
-This command must continue to work unchanged and remain the default Full run.
+Ця команда повинна й надалі працювати без змін і залишатися стандартним Full-прогоном.
 
-A refactor must not:
+Рефакторинг не повинен:
 
-- remove, skip, bypass or weaken an existing mandatory check;
-- downgrade a failure to a warning merely to make validation green;
-- silently exclude a suite from the Full run;
-- migrate the self-test framework to Pester;
-- introduce in-process runspaces, `-Parallel` or background jobs as a self-test acceleration mechanism;
-- make PowerShell 7 evidence substitute for supported Windows PowerShell 5.1 validation.
+- видаляти, пропускати, обходити або послаблювати обов'язкові перевірки;
+- перетворювати FAIL на WARN лише заради green validation;
+- приховано виключати suite з Full-прогону;
+- мігрувати Self-Test framework на Pester;
+- використовувати in-process runspaces, `-Parallel` або background jobs для прискорення Self-Test;
+- використовувати PowerShell 7 як заміну evidence на підтримуваному Windows PowerShell 5.1.
 
-### 2.2 Runtime and test isolation
+### 2.2 Runtime та ізоляція тестів
 
-BRAVO product and test validation uses Windows PowerShell 5.1.
+BRAVO product/tests валідуються у Windows PowerShell 5.1.
 
-Tests and fixtures must not read from or write to real BRAVO production state as part of test setup or mutation.
+Tests і fixtures не повинні читати або змінювати реальний production state BRAVO як частину тестового setup чи mutation.
 
-The production VersionState location:
+Production VersionState:
 
 ```text
 C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json
 ```
 
-must not be used as test state. Tests use sandbox-local state.
+не може використовуватися як test state. Тести повинні працювати із sandbox-local state.
 
-`BRAVO_ALLOW_DOWNGRADE=1` is not an acceptable validation workaround.
+`BRAVO_ALLOW_DOWNGRADE=1` не є допустимим workaround для валідації.
 
-### 2.3 Existing validation layers
+### 2.3 Наявні рівні валідації
 
-The repository already contains:
+У репозиторії вже є:
 
 - root `BRAVO_SELF_TEST.ps1`;
-- thematic scripts under `selftest/`;
-- specialized test entrypoints such as configuration and data-restore validation;
-- normal GitHub Actions validation;
-- a DEV-LIMS full self-test acceptance workflow.
+- тематичні скрипти у `selftest/`;
+- спеціалізовані test entrypoints, зокрема для configuration і data restore;
+- стандартна GitHub Actions validation;
+- DEV-LIMS workflow для Full Self-Test acceptance.
 
-Specialized validation is not automatically part of the Self-Test harness and must not be merged into it merely for consolidation.
+Спеціалізовані перевірки не стають автоматично частиною Self-Test harness і не повинні об'єднуватися з ним лише заради консолідації.
 
-## 3. Architectural decision
+## 3. Архітектурне рішення
 
-BRAVO adopts three repository self-test execution levels:
+BRAVO використовуватиме три рівні виконання repository self-test:
 
 ```text
 Targeted -> Affected -> Full
@@ -111,55 +111,55 @@ Targeted -> Affected -> Full
 
 ### Targeted
 
-Runs explicitly selected thematic suite(s) relevant to the code currently being developed.
+Запускає явно вибрані тематичні suite, пов'язані з кодом, що змінюється.
 
-Purpose:
+Призначення:
 
-- shortest developer feedback loop;
-- repeated execution during implementation;
-- debugging a known area.
+- найкоротший developer feedback loop;
+- повторний запуск під час реалізації;
+- діагностика конкретної області.
 
-Targeted success is not release or merge acceptance evidence.
+Успішний Targeted не є release або merge acceptance evidence.
 
 ### Affected
 
-Runs all suites known to be affected by the changed component, including declared dependent suites.
+Запускає всі suite, відомі як залежні від зміненого компонента, включно з declared dependent suites.
 
-Purpose:
+Призначення:
 
-- catch cross-component regressions before the expensive Full gate;
-- provide deterministic validation based on an explicit dependency map;
-- avoid a manually curated permanent "Fast" suite that can drift away from actual dependencies.
+- виявлення cross-component regressions до дорогого Full gate;
+- deterministic validation на основі explicit dependency map;
+- відмова від постійного вручну підтримуваного набору `Fast`, який може втратити актуальність.
 
-Affected success is not a replacement for Full acceptance.
+Успішний Affected не замінює Full acceptance.
 
 ### Full
 
-Runs every mandatory Self-Test suite/check covered by the canonical Full contract.
+Запускає всі обов'язкові Self-Test suites/checks канонічного Full contract.
 
-Purpose:
+Призначення:
 
-- regression gate on a completed logical change;
-- PR/release acceptance evidence where required;
-- validation after changes to the Self-Test harness itself;
-- validation after meaningful base/integration changes when previous evidence is stale.
+- regression gate для завершеної логічної зміни;
+- PR/release acceptance evidence, коли це вимагається;
+- валідація змін самого Self-Test harness;
+- повторна валідація після суттєвих integration/base змін, якщо попереднє evidence стало неактуальним.
 
-Full is not required after every source edit.
+Full не потрібен після кожного редагування коду.
 
-## 4. When Full is required
+## 4. Коли потрібен Full
 
-A Full run should be treated as a control-point gate rather than the default inner development loop.
+Full слід використовувати як контрольний gate, а не як внутрішній цикл кожної зміни.
 
-Full is required at minimum when:
+Full обов'язковий щонайменше коли:
 
-- a logical implementation package is ready for acceptance;
-- the Self-Test harness, suite discovery, aggregation, counters, logging or exit-code behavior changes;
-- a broad/shared component changes and the dependency model cannot safely bound the affected set;
-- acceptance policy for the PR/release explicitly requires Full;
-- a meaningful integration/base change invalidates previous Full evidence;
-- DEV-LIMS or release acceptance explicitly calls for the canonical Full command.
+- логічний пакет реалізації готовий до acceptance;
+- змінюються Self-Test harness, suite discovery, aggregation, counters, logging або exit-code behavior;
+- змінюється широкий/shared component і dependency model не дозволяє безпечно обмежити affected set;
+- acceptance policy PR/release прямо вимагає Full;
+- суттєва integration/base зміна робить попереднє Full evidence неактуальним;
+- DEV-LIMS або release acceptance прямо вимагає канонічну Full-команду.
 
-During normal implementation the preferred loop is:
+Нормальний development loop:
 
 ```text
 edit
@@ -170,19 +170,17 @@ edit/fix
   |
 Affected
   |
-completed logical change
+завершена логічна зміна
   |
 Full
 ```
 
-## 5. Self-Test target architecture
-
-The desired structural boundary is:
+## 5. Цільова архітектура Self-Test
 
 ```text
 BRAVO_SELF_TEST.ps1
         |
-        | canonical thin entrypoint
+        | канонічний thin entrypoint
         v
 +-----------------------------+
 |       Self-Test Harness     |
@@ -198,85 +196,83 @@ BRAVO_SELF_TEST.ps1
                |
                v
        selftest/*.ps1
-       thematic suites
+       тематичні suites
 ```
 
-The root script remains the stable operator/CI-facing entrypoint. Substantial reusable harness behavior should have one canonical owner rather than being duplicated across root and suites.
+Root script залишається стабільним entrypoint для operator/CI. Значна reusable harness logic повинна мати одного canonical owner, а не дублюватися між root і suites.
 
-This is a target architecture, not evidence that the current root script has already reached this state.
+Це цільова архітектура, а не твердження, що поточний root script уже відповідає цій структурі.
 
-## 6. Suite dependency model
+## 6. Модель залежностей suites
 
-Affected execution requires an explicit mapping from production ownership to validation ownership.
-
-Conceptually:
+Affected execution потребує явної карти production ownership → validation ownership.
 
 ```text
-changed component
+змінений компонент
       |
-      +--> directly owning suite
+      +--> suite прямого власника
       |
       +--> dependent suites
       |
       +--> shared-contract suites
 ```
 
-Example categories, subject to VAL-01 inventory confirmation:
+Приклади категорій, які мають бути підтверджені VAL-01:
 
-- configuration loader changes may affect configuration, config intent and configurator validation;
-- archive changes may affect archive, disk-space, backup-scope and trace/archive validation;
-- maintenance changes may affect maintenance-specific suites;
-- shared harness changes force Full;
-- changes with unknown dependency coverage force Full.
+- зміни configuration loader можуть вимагати configuration, config intent і configurator validation;
+- зміни archive можуть вимагати archive, disk-space, backup-scope і trace/archive validation;
+- зміни maintenance можуть вимагати maintenance-specific suites;
+- зміни shared harness завжди вимагають Full;
+- зміни з невідомим dependency coverage вимагають Full.
 
-The mapping must be repository-owned, reviewable and deterministic. It must fail toward broader validation when ownership is ambiguous.
+Карта повинна зберігатися в репозиторії, бути reviewable та deterministic. За неоднозначного ownership вона повинна обирати ширшу валідацію.
 
-Do not create a static "Fast" list as a substitute for dependency ownership.
+Не створювати статичний список `Fast` як заміну dependency ownership.
 
 ## 7. Post-Install Verification
 
-Installation verification is a separate production concern.
+Installation verification — окрема production-задача.
 
-`BRAVO_SELF_TEST.ps1` answers:
+`BRAVO_SELF_TEST.ps1` відповідає на питання:
 
-> Is the BRAVO codebase behaving according to its repository test contract?
+> Чи відповідає код BRAVO repository test contract?
 
-Post-Install Verify answers:
+Post-Install Verify відповідає на питання:
 
-> Is this specific BRAVO installation complete, internally consistent and safe to enter normal operation?
+> Чи є конкретне встановлення BRAVO повним, внутрішньо узгодженим і готовим до нормальної експлуатації?
 
-Therefore a first production installation should not require the development Full Self-Test harness merely to prove that installation succeeded.
+Тому перша production installation не повинна вимагати development Full Self-Test harness лише для підтвердження успішного встановлення.
 
-### 7.1 Target verification areas
+### 7.1 Цільові області перевірки
 
-The final check set must be confirmed against installer architecture and runtime ownership, but is expected to cover:
+Остаточний набір checks має бути підтверджений Installer architecture і фактичним runtime ownership. Очікувані області:
 
-- installed runtime presence and expected layout;
+- наявність встановленого runtime та очікуваної структури;
 - runtime manifest/integrity verification;
-- preservation of the pre-trust runtime-guard boundary;
-- configuration load and required settings;
-- site/local configuration handling;
-- required path availability and permissions;
-- required credential presence without disclosing secret values;
+- збереження pre-trust runtime-guard boundary;
+- завантаження configuration і required settings;
+- коректна робота site/local configuration;
+- доступність required paths та permissions;
+- наявність required credentials без розкриття secret values;
 - required dependencies;
-- scheduled tasks selected by installation, when applicable;
-- logging/state path readiness;
+- scheduled tasks, вибрані під час installation, якщо застосовно;
+- готовність logging/state paths;
 - production-safe entrypoint/runtime smoke checks.
 
 ### 7.2 Safety contract
 
-Post-Install Verify must:
+Post-Install Verify повинен:
 
-- be safe to run on a production host;
-- avoid synthetic mutations of production data;
-- avoid using production state as a test fixture;
-- fail closed for integrity/security conditions where BRAVO runtime policy requires it;
-- provide actionable diagnostics;
-- never print secrets;
-- return a meaningful process exit code;
-- distinguish successful installation readiness from warnings that do not block operation.
+- бути безпечним для production host;
+- не виконувати synthetic mutations production data;
+- не використовувати production state як test fixture;
+- fail closed для integrity/security conditions, де цього вимагає runtime policy;
+- надавати actionable diagnostics;
+- ніколи не виводити secrets;
+- повертати meaningful process exit code;
+- відрізняти installation readiness від warnings, які не блокують operation.
 
-The intended terminal state is:
+Цільовий результат:
 
 ```text
 Installation
@@ -288,29 +284,25 @@ Post-Install Verify
 READY  BLOCKED
 ```
 
-The exact executable/script/module name is intentionally not fixed by this design document until implementation ownership is decided.
+Точна назва script/module навмисно не фіксується до визначення implementation ownership.
 
-## 8. Validation boundaries
+## 8. Межі валідації
 
-The project must preserve these conceptual boundaries:
-
-| Layer | Question | Typical environment |
+| Рівень | Питання | Типове середовище |
 | --- | --- | --- |
-| Targeted | Did the focused area still work? | development |
-| Affected | Did known dependent behavior still work? | development / pre-review |
-| Full Self-Test | Does the complete repository Self-Test contract pass? | development / CI / acceptance |
-| Specialized tests | Does a specialized integration contract pass? | CI / acceptance |
-| DEV-LIMS acceptance | Does the exact candidate pass required real-host acceptance? | controlled acceptance host |
-| Post-Install Verify | Is this installation READY? | installed host |
-| Health / Maintenance | Is the installed system healthy during operation? | operational host |
+| Targeted | Чи працює вузька змінена область? | development |
+| Affected | Чи працює відома залежна поведінка? | development / pre-review |
+| Full Self-Test | Чи проходить повний repository Self-Test contract? | development / CI / acceptance |
+| Specialized tests | Чи проходить спеціалізований integration contract? | CI / acceptance |
+| DEV-LIMS acceptance | Чи проходить exact candidate необхідний real-host acceptance? | controlled acceptance host |
+| Post-Install Verify | Чи має конкретна installation статус READY? | installed host |
+| Health / Maintenance | Чи є встановлена система здоровою під час operation? | operational host |
 
-Passing one layer must not be reported as evidence that another layer passed unless that other layer was actually executed.
+Проходження одного рівня не можна подавати як evidence проходження іншого, якщо той фактично не запускався.
 
-## 9. Installer dependency
+## 9. Залежність від Installer
 
-The Installer should not be blocked by completion of the entire Self-Test refactor.
-
-The dependency is:
+Installer не повинен блокуватися до завершення повного Self-Test refactor.
 
 ```text
 Self-Test inventory
@@ -331,22 +323,22 @@ Self-Test evolution    Installer MVP
         Verify integration
 ```
 
-Before Installer implementation relies on validation, the project needs:
+До того, як Installer почне залежати від validation contract, потрібні:
 
-1. current Self-Test inventory;
-2. characterization of the canonical Full behavior;
-3. accepted Validation Architecture;
-4. accepted Post-Install Verify contract.
+1. inventory поточного Self-Test;
+2. characterization канонічного Full behavior;
+3. погоджена Validation Architecture;
+4. погоджений Post-Install Verify contract.
 
-Deep Self-Test harness cleanup can continue independently after those foundations exist.
+Глибокий cleanup Self-Test harness може продовжуватися окремо після створення цих foundations.
 
-## 10. Implementation plan
+## 10. План реалізації
 
-### VAL-01 - Self-Test Inventory
+### VAL-01 — Інвентаризація Self-Test
 
-Read-only inventory of:
+Read-only inventory:
 
-- root Self-Test responsibilities;
+- responsibilities root Self-Test;
 - thematic suites;
 - suite/check ownership;
 - global/script state;
@@ -355,74 +347,68 @@ Read-only inventory of:
 - production-path access risks;
 - duplicated harness behavior;
 - ordering dependencies;
-- logging, counters and exit behavior;
-- CI and DEV-LIMS consumers.
+- logging, counters та exit behavior;
+- CI і DEV-LIMS consumers.
 
-Deliverable: ownership/dependency inventory.
+Результат: ownership/dependency inventory.
 
-Estimated effort: 3-5 hours.
+Оцінка: 3–5 годин.
 
-### VAL-02 - Full Characterization Baseline
+### VAL-02 — Characterization baseline Full
 
-Freeze the externally observable canonical Full contract before structural refactoring.
-
-Characterize:
+Зафіксувати externally observable canonical Full contract до structural refactoring:
 
 - command-line behavior;
 - mandatory suite/check execution;
-- ordering dependencies where behaviorally relevant;
+- behaviorally relevant ordering dependencies;
 - PASS/FAIL aggregation;
 - counters;
 - logs;
 - process exit behavior;
 - relevant failure modes.
 
-No check weakening is permitted.
+Послаблення checks заборонене.
 
-Estimated effort: 4-8 hours.
+Оцінка: 4–8 годин.
 
-### VAL-03 - Validation Architecture Specification
+### VAL-03 — Специфікація Validation Architecture
 
-Review and update this document using VAL-01/VAL-02 evidence.
+Переглянути й оновити цей документ на основі evidence VAL-01/VAL-02. Усунути припущення початкового дизайну.
 
-Resolve any assumptions in this initial design.
+Оцінка: 3–5 годин.
 
-Estimated effort: 3-5 hours.
+### VAL-04 — Targeted Suite Execution
 
-### VAL-04 - Targeted Suite Execution
+Реалізувати підтримуваний запуск вибраних thematic suites зі збереженням існуючого Full default без змін.
 
-Implement a supported way to execute selected thematic suites while preserving the existing Full default unchanged.
-
-Requirements:
+Вимоги:
 
 - Windows PowerShell 5.1;
 - deterministic selection;
-- invalid suite selection fails clearly;
-- Full command unchanged;
-- no silent skip behavior;
-- existing logs/result semantics preserved where applicable.
+- invalid suite selection завершується зрозумілою помилкою;
+- Full command незмінна;
+- без silent skip behavior;
+- existing logs/result semantics зберігаються, де застосовно.
 
-Estimated effort: 4-8 hours.
+Оцінка: 4–8 годин.
 
-### VAL-05 - Affected Suite Mapping
+### VAL-05 — Affected Suite Mapping
 
-Introduce repository-owned dependency mapping.
-
-Requirements:
+Додати repository-owned dependency mapping:
 
 - component-to-suite ownership;
 - dependent-suite relationships;
-- conservative fallback to Full for unknown/shared changes;
-- characterization tests for mapping behavior;
-- no manually maintained generic Fast bucket.
+- conservative fallback до Full для unknown/shared changes;
+- characterization tests для mapping behavior;
+- без generic `Fast` bucket.
 
-Estimated effort: 6-10 hours.
+Оцінка: 6–10 годин.
 
-### VAL-06 - Post-Install Verification Contract
+### VAL-06 — Контракт Post-Install Verification
 
-Convert section 7 into an implementation-ready contract based on the Installer architecture and actual runtime ownership.
+Перетворити розділ 7 на implementation-ready contract на основі Installer architecture і actual runtime ownership.
 
-Define:
+Визначити:
 
 - mandatory checks;
 - READY/BLOCKED semantics;
@@ -433,93 +419,93 @@ Define:
 - safe operations;
 - forbidden production mutations.
 
-Estimated effort: 4-6 hours.
+Оцінка: 4–6 годин.
 
-### INS-01 - Installer Technical Architecture
+### INS-01 — Технічна архітектура Installer
 
-Define Installer phases and integration points for Post-Install Verify.
+Визначити Installer phases та integration points для Post-Install Verify.
 
-This task belongs to the Installer track but depends on VAL-06.
+Це задача Installer track, залежна від VAL-06.
 
-Estimated effort: 4-8 hours.
+Оцінка: 4–8 годин.
 
-### INS-02 - Installer MVP
+### INS-02 — Installer MVP
 
-Implement the separately approved Installer MVP according to its design.
+Реалізувати окремо погоджений Installer MVP відповідно до його design.
 
-Estimated effort: 1-2 days.
+Оцінка: 1–2 робочі дні.
 
-### VAL-07 - Post-Install Verifier
+### VAL-07 — Post-Install Verifier
 
-Implement the production-safe verifier defined by VAL-06.
+Реалізувати production-safe verifier за контрактом VAL-06.
 
-Estimated effort: 1-2 days.
+Оцінка: 1–2 робочі дні.
 
-### INS-03 - Installer Verification Integration
+### INS-03 — Інтеграція verification в Installer
 
-Connect Installer completion to Post-Install Verify and present actionable READY/BLOCKED diagnostics.
+Підключити завершення Installer до Post-Install Verify і показувати actionable READY/BLOCKED diagnostics.
 
-Estimated effort: 4-8 hours.
+Оцінка: 4–8 годин.
 
-### VAL-08 - Self-Test Harness Boundary
+### VAL-08 — Межа Self-Test Harness
 
-Reduce root Self-Test responsibilities toward orchestration and establish canonical ownership of reusable harness behavior.
+Зменшити responsibilities root Self-Test до orchestration та встановити canonical ownership reusable harness behavior.
 
-This is structural work and requires characterization-first validation.
+Це structural work і потребує characterization-first validation.
 
-Estimated effort: 1-2 days.
+Оцінка: 1–2 робочі дні.
 
-### VAL-09 - Suite Normalization and Isolation
+### VAL-09 — Нормалізація та ізоляція suites
 
-Normalize suite lifecycle and remove unsafe/duplicated fixture/sandbox patterns without changing test intent.
+Нормалізувати suite lifecycle та усунути unsafe/duplicated fixture/sandbox patterns без зміни test intent.
 
-Explicitly verify absence of production-state fixture contamination.
+Окремо перевірити відсутність production-state fixture contamination.
 
-Estimated effort: 1-2 days.
+Оцінка: 1–2 робочі дні.
 
-### VAL-10 - CI Validation Model
+### VAL-10 — CI Validation Model
 
-Use Targeted/Affected execution for faster feedback where it provides value while retaining mandatory Full coverage at acceptance gates.
+Використовувати Targeted/Affected execution для швидшого feedback там, де це корисно, з обов'язковим збереженням Full coverage на acceptance gates.
 
-Any CI parallelism must use separate supported processes/jobs. Do not introduce prohibited in-process Self-Test parallelism.
+Будь-який CI parallelism має використовувати окремі supported processes/jobs. Заборонений in-process Self-Test parallelism не вводити.
 
-Estimated effort: 4-8 hours.
+Оцінка: 4–8 годин.
 
-### ACC-01 - Full Regression
+### ACC-01 — Full Regression
 
-Execute the required Windows PowerShell 5.1 Full and specialized validation on the exact candidate.
+Виконати required Windows PowerShell 5.1 Full та specialized validation на exact candidate.
 
-Evidence must include actual command, exit code and key result.
+Evidence має містити фактичну команду, exit code та key result.
 
-Estimated effort: approximately 0.5 day.
+Оцінка: приблизно 0,5 робочого дня.
 
-### ACC-02 - Independent Review
+### ACC-02 — Незалежне рев'ю
 
-Fresh reviewer assesses the behavioral/architectural change using P0-P3 findings and normal merge-gate policy.
+Fresh reviewer перевіряє behavioral/architectural change за P0–P3 та звичайною merge-gate policy.
 
-Estimated effort: 2-4 hours.
+Оцінка: 2–4 години.
 
-### ACC-03 - DEV-LIMS Acceptance
+### ACC-03 — DEV-LIMS Acceptance
 
-When required and operational gates permit it, run exact-SHA canonical Full acceptance on the controlled DEV-LIMS environment.
+Коли це потрібно і operational gates дозволяють, виконати exact-SHA canonical Full acceptance у контрольованому DEV-LIMS environment.
 
-This is not automatically authorized by completion of earlier tasks.
+Завершення попередніх задач саме по собі не авторизує цю дію.
 
-Estimated effort: 2-4 hours excluding environment blockers.
+Оцінка: 2–4 години без урахування environment blockers.
 
-## 11. Suggested delivery waves
+## 11. Хвилі реалізації
 
-### Wave 1 - Foundation
+### Wave 1 — Foundation
 
 ```text
 VAL-01 -> VAL-02 -> VAL-03
 ```
 
-No broad implementation refactor should precede this baseline.
+Broad implementation refactor не повинен передувати цій baseline.
 
-Expected duration: about 1-2 working days.
+Орієнтир: 1–2 робочі дні.
 
-### Wave 2 - Fast feedback and installation contract
+### Wave 2 — Швидкий feedback та installation contract
 
 ```text
 VAL-04 -> VAL-05
@@ -527,9 +513,9 @@ VAL-04 -> VAL-05
 VAL-06 -> INS-01
 ```
 
-These tracks can proceed independently after their dependencies are satisfied, subject to the project's one-mutation-lane rules for overlapping files/artifacts.
+Tracks можуть виконуватися незалежно після виконання dependencies, з дотриманням правила про один mutation lane для overlapping files/artifacts.
 
-### Wave 3 - Installer MVP and verifier
+### Wave 3 — Installer MVP та verifier
 
 ```text
 VAL-07 ----+
@@ -537,9 +523,9 @@ VAL-07 ----+
 INS-02 ----+
 ```
 
-Expected duration: about 2-4 working days depending on Installer scope.
+Орієнтир: 2–4 робочі дні залежно від scope Installer.
 
-### Wave 4 - Harness completion
+### Wave 4 — Завершення Harness
 
 ```text
 VAL-08 -> VAL-09 -> VAL-10
@@ -549,53 +535,53 @@ VAL-08 -> VAL-09 -> VAL-10
                     |
                   ACC-02
                     |
-                  ACC-03 when required
+                  ACC-03 за потреби
 ```
 
-## 12. Overall estimate
+## 12. Загальна оцінка
 
-Initial planning estimate:
+Початкова planning estimate:
 
-- foundation before serious Installer implementation: 1-2 working days;
-- Installer MVP plus Post-Install Verify: approximately 2-4 additional working days;
-- complete Validation Architecture cleanup, CI integration and review: approximately 6-10 working days total.
+- foundation перед серйозною реалізацією Installer: 1–2 робочі дні;
+- Installer MVP + Post-Install Verify: приблизно ще 2–4 робочі дні;
+- повна Validation Architecture, cleanup, CI integration та review: приблизно 6–10 робочих днів загалом.
 
-These are planning estimates, not commitments. VAL-01/VAL-02 should replace them with evidence-based estimates after hidden coupling and current harness ownership are known.
+Це planning estimates, а не commitments. Після VAL-01/VAL-02 їх потрібно замінити evidence-based оцінкою з урахуванням фактичного coupling та harness ownership.
 
-## 13. Non-goals
+## 13. Що не входить у цю архітектуру
 
-This architecture does not authorize or require:
+Цей дизайн не дозволяє і не вимагає:
 
-- reducing Full Self-Test coverage;
-- replacing Windows PowerShell 5.1 with PowerShell 7;
-- migrating to Pester;
-- weakening integrity/security gates;
-- executing Full Self-Test on every production installation;
-- treating Post-Install Verify as release acceptance;
-- treating Health/Maintenance as repository testing;
-- merging all specialized tests into one script;
-- parallel writers changing the same test/harness artifacts;
-- deployment, release, merge or production-host changes.
+- скорочувати Full Self-Test coverage;
+- замінювати Windows PowerShell 5.1 на PowerShell 7;
+- мігрувати на Pester;
+- послаблювати integrity/security gates;
+- виконувати Full Self-Test на кожній production installation;
+- вважати Post-Install Verify release acceptance;
+- вважати Health/Maintenance repository testing;
+- об'єднувати всі specialized tests в один script;
+- дозволяти parallel writers змінювати ті самі test/harness artifacts;
+- виконувати deployment, release або merge.
 
 ## 14. Acceptance invariants
 
-Implementation is acceptable only if all applicable invariants remain true:
+Реалізація прийнятна лише якщо всі застосовні invariants залишаються істинними:
 
-1. `.\BRAVO_SELF_TEST.ps1 -NoPause` remains the canonical unchanged Full entrypoint.
-2. Full still covers every mandatory check that it covered before the change.
-3. Targeted/Affected modes are additive developer feedback mechanisms, not weaker acceptance substitutes.
-4. Unknown dependency ownership falls back to broader validation, ultimately Full.
-5. Windows PowerShell 5.1 remains the supported validation runtime.
-6. Test fixtures/state remain isolated from real BRAVO production state.
-7. Runtime integrity and the pre-trust guard boundary are not weakened.
-8. Post-Install Verify is production-safe and separate from repository Self-Test.
-9. Evidence is reported only for commands/checks actually executed.
-10. Behavioral/high-risk changes receive fresh independent review before acceptance.
+1. `.\BRAVO_SELF_TEST.ps1 -NoPause` залишається канонічним незмінним Full entrypoint.
+2. Full охоплює всі mandatory checks, які він охоплював до зміни.
+3. Targeted/Affected є додатковими developer feedback mechanisms, а не слабшими acceptance substitutes.
+4. Unknown dependency ownership переходить до ширшої validation, аж до Full.
+5. Windows PowerShell 5.1 залишається supported validation runtime.
+6. Test fixtures/state ізольовані від real BRAVO production state.
+7. Runtime integrity і pre-trust guard boundary не послаблюються.
+8. Post-Install Verify production-safe та відокремлений від repository Self-Test.
+9. Evidence звітується лише для commands/checks, які фактично виконувалися.
+10. Behavioral/high-risk changes проходять fresh independent review перед acceptance.
 
-## 15. Immediate next action
+## 15. Наступна дія
 
-The next implementation action is not a Self-Test refactor.
+Наступна implementation action — не Self-Test refactor.
 
-Start with VAL-01 and VAL-02 as a read-only evidence-gathering wave. Use their results to revise this design before VAL-04 or VAL-08 changes test behavior or structure.
+Спочатку виконати VAL-01 і VAL-02 як read-only evidence-gathering wave. Їхні результати використати для уточнення цього design до того, як VAL-04 або VAL-08 змінюватимуть test behavior чи structure.
 
-That sequence preserves the existing Full contract while creating a safe path toward faster development validation and a human-oriented Installer.
+Такий порядок зберігає поточний Full contract і створює безпечний шлях до швидшої development validation та зручного для людини Installer.
