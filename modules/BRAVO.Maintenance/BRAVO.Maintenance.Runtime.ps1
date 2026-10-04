@@ -9093,7 +9093,8 @@ function Get-BRAVOMaintenancePreArchiveBarrierPlan {
     # для кожної служби, очікування StartPending). Не пропущена контрактом
     # служба в бар'єр не передається (інакше він зупинив би її без наміру),
     # а ContractFailures скасовує реставрацію fail-closed. Бар'єр
-    # Confirm-BRAVOServicesQuiesced лишається останньою перевіркою.
+    # Confirm-BRAVOServicesQuiesced лишається останньою перевіркою (без
+    # власної зупинки: активна служба для нього — порушник).
     $contractFailures = @()
     $stoppedAgain = @()
     foreach ($managedService in $maintenanceManagedServices) {
@@ -9178,27 +9179,35 @@ if ($BravoWebMaintenanceEnabled) {
 if ($exchangAPIServiceEnabled) {
     # #360: свіжий стан — $exchangAPIService знято на старті прогону, і його
     # закешований Status не бачить служби, запущеної після знімка.
-    $exchangAPICurrentService = Get-Service -Name $ExchangAPIServiceName -ErrorAction SilentlyContinue
-    $serviceStatus = if ($exchangAPICurrentService) { [string]$exchangAPICurrentService.Status } else { 'Stopped' }
-    if (Confirm-BRAVOMaintenanceServiceStopContract -Key 'ExchangeApi' -Name $ExchangAPIServiceName -Status $serviceStatus) {
-        Write-Log -Message "Зупинка служби $ExchangAPIServiceName..." -Level "INFO"
-        $serviceResult = Invoke-ServiceStateChange `
-            -Name $ExchangAPIServiceName `
-            -DesiredStatus Stopped `
-            -TimeoutSeconds $ServiceStopTimeoutSeconds `
-            -PollIntervalSeconds $ServicePollIntervalSeconds `
-            -Force
-        Complete-BRAVOMaintenanceServiceStop -Key 'ExchangeApi' -Name $ExchangAPIServiceName -Result $serviceResult
-        if ($serviceResult.Success) {
-            Write-Log -Message "Служба $ExchangAPIServiceName успішно зупинена" -Level "SUCCESS"
-        } else {
-            $errorMsg = "Не вдалося зупинити службу ${ExchangAPIServiceName}: $($serviceResult.Error)"
-            Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-            Send-SlackAlert -Message $errorMsg -IsCritical
-            $script:criticalErrorOccurred = $true
+    try {
+        # Нечитабельний стан — невідомий, а не «зупинена»: збій читання = критична
+        # помилка, служба не вважається зупиненою (як для BRAVO і BRAVO Web).
+        $serviceStatus = [string](Get-Service -Name $ExchangAPIServiceName -ErrorAction Stop).Status
+        if (Confirm-BRAVOMaintenanceServiceStopContract -Key 'ExchangeApi' -Name $ExchangAPIServiceName -Status $serviceStatus) {
+            Write-Log -Message "Зупинка служби $ExchangAPIServiceName..." -Level "INFO"
+            $serviceResult = Invoke-ServiceStateChange `
+                -Name $ExchangAPIServiceName `
+                -DesiredStatus Stopped `
+                -TimeoutSeconds $ServiceStopTimeoutSeconds `
+                -PollIntervalSeconds $ServicePollIntervalSeconds `
+                -Force
+            Complete-BRAVOMaintenanceServiceStop -Key 'ExchangeApi' -Name $ExchangAPIServiceName -Result $serviceResult
+            if ($serviceResult.Success) {
+                Write-Log -Message "Служба $ExchangAPIServiceName успішно зупинена" -Level "SUCCESS"
+            } else {
+                $errorMsg = "Не вдалося зупинити службу ${ExchangAPIServiceName}: $($serviceResult.Error)"
+                Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+                Send-SlackAlert -Message $errorMsg -IsCritical
+                $script:criticalErrorOccurred = $true
+            }
+        } elseif ($serviceStatus -eq 'Stopped') {
+            Write-Log -Message "Служба $ExchangAPIServiceName вже зупинена" -Level "INFO"
         }
-    } elseif ($serviceStatus -eq 'Stopped') {
-        Write-Log -Message "Служба $ExchangAPIServiceName вже зупинена" -Level "INFO"
+    } catch {
+        $errorMsg = "Помилка при зупинці служби ${ExchangAPIServiceName}: $($_.Exception.Message)"
+        Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+        Send-SlackAlert -Message $errorMsg -IsCritical
+        $script:criticalErrorOccurred = $true
     }
 } elseif ($exchangAPIServiceDisabled) {
     Write-Log -Message "Служба $ExchangAPIServiceName має тип запуску Disabled - керування пропущено" -Level "INFO"
@@ -9391,21 +9400,25 @@ if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in
             # не почато, тож це безпечно. Не вдалося утримати/зупинити —
             # реставрація скасовується fail-closed (модель не торкнута).
             # #360/#287: повторна зупинка під lifecycle-контрактом — див.
-            # Get-BRAVOMaintenancePreArchiveBarrierPlan.
+            # Get-BRAVOMaintenancePreArchiveBarrierPlan. Сам бар'єр служби більше
+            # не зупиняє: його Stop-Service обійшов би контракт маркера (служба
+            # лишилась би зупиненою без наміру перезапуску). Служба, яку
+            # запустили вже після плану, — порушник, реставрацію скасовано
+            # fail-closed. Утримання Disabled, як і раніше, перезастосовується.
             $preArchivePlan = Get-BRAVOMaintenancePreArchiveBarrierPlan
             $preArchiveContractFailures = @($preArchivePlan.ContractFailures)
             $preArchiveBarrierNames = @($preArchivePlan.BarrierNames)
-            $preArchiveQuiescence = Confirm-BRAVOServicesQuiesced `
-                -ServiceNames $preArchiveBarrierNames `
+            $preArchiveHold = Confirm-BRAVOServicesQuiesced `
+                -ServiceNames @() `
                 -Snapshot $script:startTypeSnapshot `
                 -StopRunning `
                 -StopTimeoutSeconds $ServiceStopTimeoutSeconds `
                 -PollIntervalSeconds $ServicePollIntervalSeconds
-            $preArchiveQuiescenceOk = $preArchiveQuiescence.Ok -and ($script:startModeSuppressionFailures.Count -eq 0) -and
+            $preArchiveQuiescence = Confirm-BRAVOServicesQuiesced `
+                -ServiceNames $preArchiveBarrierNames
+            $preArchiveQuiescenceOk = $preArchiveQuiescence.Ok -and $preArchiveHold.Ok -and
+                ($script:startModeSuppressionFailures.Count -eq 0) -and
                 ($preArchiveContractFailures.Count -eq 0)
-            if ($preArchiveQuiescence.StoppedAgain.Count -gt 0) {
-                Write-Log -Message "Перед архівацією повторно зупинено служби, запущені після зупинки Maintenance (SCM autostart/recovery/інший актор): $($preArchiveQuiescence.StoppedAgain -join ', ')" -Level "WARNING"
-            }
             $arcArgs = $arcCommonParams + @($beforeArchivePath, "$MODEL_PATH\*")
             if ($preArchiveQuiescenceOk) {
                 $exitCode = Invoke-CommandWithLog `
@@ -9418,7 +9431,7 @@ if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in
             }
 
             if (-not $preArchiveQuiescenceOk) {
-                $errorMsg = "Реставрацію скасовано ДО архівації: не гарантовано, що служби не працюють під час реставрації (#297): $(@($preArchiveQuiescence.Offenders + $script:startModeSuppressionFailures + $preArchiveContractFailures) -join '; '). Модель не торкнута."
+                $errorMsg = "Реставрацію скасовано ДО архівації: не гарантовано, що служби не працюють під час реставрації (#297): $(@($preArchiveQuiescence.Offenders + $preArchiveHold.Offenders + $script:startModeSuppressionFailures + $preArchiveContractFailures) -join '; '). Модель не торкнута."
                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
                 Send-SlackAlert -Message $errorMsg -IsCritical
                 $script:criticalErrorOccurred = $true

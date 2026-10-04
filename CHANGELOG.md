@@ -21,12 +21,15 @@
   перед повторною зупинкою бар'єром перед before-архівом; якщо намір не вдалося записати, бар'єр
   службу не зупиняє, а реставрацію скасовано fail-closed). Служба поза маркером, запущена вже
   після його запису в не-restore прогоні, не зупиняється (WARNING). exchangAPI зупиняється за
-  свіжим, а не закешованим на старті станом. #287: BRAVO і exchangAPI зупиняються й у стані
+  свіжим, а не закешованим на старті станом; збій читання цього стану — критична помилка кроку
+  `[3/8]`, а не «службу вже зупинено». #287: BRAVO і exchangAPI зупиняються й у стані
   `StartPending`; `Invoke-ServiceStateChange` спершу чекає завершення старту
   (`Wait-BRAVOServiceStartPendingSettled`: SCM відхиляє stop службі у `StartPending`). Перед
   before-архівом утримувану службу, запущену після зупинки, Maintenance зупиняє сама тією самою
   операцією (контракт маркера, потім `Invoke-ServiceStateChange` з окремим таймаутом для кожної
-  служби); бар'єр `Confirm-BRAVOServicesQuiesced` лишається останньою перевіркою. Таку повторну
+  служби); бар'єр `Confirm-BRAVOServicesQuiesced` лишається останньою перевіркою і служби вже
+  не зупиняє (перезастосовує лише утримання `Disabled`): службу, запущену вже після його плану,
+  він не зупиняє поза контрактом маркера, а реставрацію скасовано fail-closed. Таку повторну
   зупинку видно у звіті кроків окремим результатом WARN «Повторна зупинка служб перед
   архівацією» (консоль, підсумок, фінальне сповіщення) — навіть коли `[3/8]` звітував SKIPPED. Реставрація й
   обробка trace не виконуються над службою в перехідному стані (лише `Stopped` або `Paused`),
@@ -51,6 +54,8 @@
   `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`,
   `Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending`,
   `Maintenance/LifecyclePreArchiveBarrierStopIsReported`,
+  `Maintenance/LifecycleFinalBarrierNeverStopsOutsideContract`,
+  `Maintenance/LifecycleUnreadableServiceStateIsNotStopped`,
   `Maintenance/LifecyclePausedServiceStateIsPreserved`,
   `Maintenance/LifecycleTraceRotationRechecksBravoState`.
 
