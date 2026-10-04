@@ -22,7 +22,9 @@
   (`Wait-BRAVOServiceStartPendingSettled`: SCM відхиляє stop службі у `StartPending`). Перед
   before-архівом утримувану службу, запущену після зупинки, Maintenance зупиняє сама тією самою
   операцією (контракт маркера, потім `Invoke-ServiceStateChange` з окремим таймаутом для кожної
-  служби); бар'єр `Confirm-BRAVOServicesQuiesced` лишається останньою перевіркою. Реставрація й
+  служби); бар'єр `Confirm-BRAVOServicesQuiesced` лишається останньою перевіркою. Таку повторну
+  зупинку видно у звіті кроків окремим результатом WARN «Повторна зупинка служб перед
+  архівацією» (консоль, підсумок, фінальне сповіщення) — навіть коли `[3/8]` звітував SKIPPED. Реставрація й
   обробка trace не виконуються над службою в перехідному стані (лише `Stopped` або `Paused`),
   а стан BRAVO перечитується безпосередньо перед ротацією trace. Призупинена (`Paused`) служба
   не зупиняється й не запускається — і на старті, і коли її призупинили вже після знімка (BRAVO
@@ -43,6 +45,7 @@
   `Maintenance/LifecycleStuckStartPendingGetsNoTraceProcessing`,
   `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`,
   `Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending`,
+  `Maintenance/LifecyclePreArchiveBarrierStopIsReported`,
   `Maintenance/LifecyclePausedServiceStateIsPreserved`,
   `Maintenance/LifecycleTraceRotationRechecksBravoState`.
 

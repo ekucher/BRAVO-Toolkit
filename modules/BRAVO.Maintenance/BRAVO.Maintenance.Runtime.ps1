@@ -9069,6 +9069,13 @@ function Get-BRAVOMaintenancePreArchiveBarrierPlan {
     }
     if ($stoppedAgain.Count -gt 0) {
         Write-Log -Message "Перед архівацією повторно зупинено служби, запущені після зупинки Maintenance (SCM autostart/recovery/інший актор): $($stoppedAgain -join ', ')" -Level "WARNING"
+        # Крок [3/8] уже звітував про фазу зупинки (зокрема SKIPPED, коли на
+        # той момент усі служби стояли), тому зупинку бар'єром фіксує окремий
+        # результат: консоль, підсумок і фінальне сповіщення бачать її (#360).
+        Write-BRAVOMaintenanceOperation `
+            -Name 'Повторна зупинка служб перед архівацією' `
+            -Status 'WARN' `
+            -Details "зупинено: $($stoppedAgain -join ', ')"
     }
     $barrierNames = @($script:quiescedServiceNames | Where-Object {
             $barrierName = [string]$_
