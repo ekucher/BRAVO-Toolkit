@@ -11218,7 +11218,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             # Ворота реставрації й каталог архівів пропускають Disabled-випадок.
             Test-BRAVOCondition `
                 -Condition (
-                    $RuntimeText.Contains('if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -ne "Running") {') -and
+                    $RuntimeText.Contains('if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @(''Stopped'', ''Paused'')) {') -and
                     $RuntimeText.Contains('$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {') -and
                     $RuntimeText -match '(?s)\} elseif \(\$restoreOnDisabledBravo\) \{[^}]{0,400}\$dirsToCreate \+= \$ARC_DIR' -and
                     $RuntimeText.Contains('elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {')
@@ -11275,7 +11275,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # файлу) — не "чи існує рядок десь у файлі", а "чи стоїть він у
         # правильному місці відносно правильних сусідів".
         $barrier1WindowStart = $maintenanceRestoreWindowText.IndexOf(
-            '$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { (Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
+            '$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { [string](Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
         )
         $barrier1EntryIndex = $maintenanceRestoreWindowText.IndexOf(
             "if (`$shouldRestore) {", [Math]::Max(0, $barrier1WindowStart)
@@ -13929,7 +13929,24 @@ function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:
 function Get-Service {
     param([string]$Name, $ErrorAction)
     if (-not $script:ProbeServices.ContainsKey($Name)) { throw "self-test: невідома служба $Name" }
-    $probeService = [pscustomobject]@{ Name = $Name; Status = [string]$script:ProbeServices[$Name] }
+    $probeStatus = [string]$script:ProbeServices[$Name]
+    # Збій читання стану: з SilentlyContinue справжній Get-Service повертає
+    # $null, з Stop — кидає виняток. Після першого винятку служба читається як Running.
+    if ($probeStatus -ceq 'UNREADABLE') {
+        if ([string]$ErrorAction -eq 'SilentlyContinue') { return $null }
+        $script:ProbeServices[$Name] = 'Running'
+        throw "self-test: стан служби $Name не прочитано"
+    }
+    # #287: служба у StartPending доходить до Running після кількох читань
+    # стану (старт завершується сам) — до того SCM не приймає від неї stop.
+    if ($probeStatus -eq 'StartPending' -and @($script:ProbeStickyPending) -notcontains $Name) {
+        $script:ProbePendingReads[$Name] = 1 + [int]$script:ProbePendingReads[$Name]
+        # ProbeStartFails: старт завершується невдачею — служба сама стає Stopped.
+        if ([int]$script:ProbePendingReads[$Name] -gt 3) { $script:ProbeServices[$Name] = $(if (@($script:ProbeStartFails) -contains $Name) { 'Stopped' } else { 'Running' }) }
+    }
+    # Зупинка, яку почав інший актор (StopPending), завершується сама.
+    if ($probeStatus -eq 'StopPending' -and @($script:ProbeStickyStopPending) -notcontains $Name) { $script:ProbeServices[$Name] = 'Stopped' }
+    $probeService = [pscustomobject]@{ Name = $Name; Status = $probeStatus }
     $probeService | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
     return $probeService
 }
@@ -13943,6 +13960,17 @@ function Stop-Service {
     # Служба, що «не зупиняється»: стан лишається Running, тож справжній
     # Invoke-ServiceStateChange дочекається таймауту й поверне Success=$false.
     if (@($script:ProbeStopFailures) -contains $Name) { Add-ProbeEvent "STOP-FAIL $Name"; return }
+    # Запит на зупинку відхилено (помилка в -ErrorVariable), але службу тим
+    # часом зупиняє інший актор.
+    if (@($script:ProbeStopRejected) -contains $Name) {
+        Add-ProbeEvent "STOP-REJECTED $Name"
+        $script:ProbeServices[$Name] = 'Stopped'
+        Set-Variable -Name ([string]$ErrorVariable) -Scope 1 -Value @(
+            (New-Object Management.Automation.ErrorRecord (New-Object Exception 'self-test: запит на зупинку відхилено'), 'SelfTest', 'NotSpecified', $null))
+        return
+    }
+    # #287: stop службі, що саме стартує, SCM відхиляє (стан не змінюється).
+    if ([string]$script:ProbeServices[$Name] -eq 'StartPending') { Add-ProbeEvent "STOP-REFUSED-START-PENDING $Name"; return }
     Add-ProbeEvent "STOP $Name"
     $script:ProbeServices[$Name] = 'Stopped'
 }
@@ -13952,16 +13980,46 @@ function Write-Log {
     param([string]$Message, [string]$Level = 'INFO', [int]$SeparatorLength = 100, [switch]$NoTimestamp, [switch]$NoConsole, [switch]$Environmental)
     if ($Level -eq 'WARNING' -and -not $Environmental) { $script:BRAVOWarningCount++ }
     if ($Level -eq 'WARNING' -or $Level -eq 'ERROR') { Add-ProbeEvent "LOG-$Level $Message" }
+    # Lifecycle-race: оператор призупиняє службу між перевіркою контракту і зупинкою.
+    if ($null -ne $script:ProbePauseBeforeStop) {
+        foreach ($probePauseName in @($script:ProbePauseBeforeStop.Keys)) {
+            if ($Message -like "Зупинка служби $probePauseName...") {
+                Invoke-ProbeLateStart -Changes $script:ProbePauseBeforeStop
+                break
+            }
+        }
+    }
 }
 function Write-BRAVOStepResult {
     param([int]$Current, [int]$Total, [string]$Name, [string]$Status, [string]$Details, $Duration)
     Add-ProbeEvent ("STEP {0}/{1} {2} {3}" -f $Current, $Total, $Name, $Status)
 }
+function Write-BRAVOOperationResult {
+    param([string]$Name, [string]$Status, $Duration, [string]$Details)
+    Add-ProbeEvent ("OPERATION {0} {1}" -f $Name, $Status)
+}
 function Write-BRAVOServiceQuiescenceState {
     param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
+    # Збій запису маркера, починаючи з N-го запису ($script:ProbeMarkerWriteFailFrom).
+    $script:ProbeMarkerWrites = 1 + [int]$script:ProbeMarkerWrites
+    if ([int]$script:ProbeMarkerWriteFailFrom -gt 0 -and $script:ProbeMarkerWrites -ge [int]$script:ProbeMarkerWriteFailFrom) {
+        Add-ProbeEvent 'MARKER-WRITE-FAIL'
+        throw 'self-test: імітований збій запису ownership-маркера'
+    }
     Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
     # #349: утримувана служба без наміру перезапуску (зупинена до прогону).
     foreach ($probeNoIntent in @(@($Services) | Where-Object { -not [bool]$_.RestartIntent })) { Add-ProbeEvent ("MARKER-NO-RESTART " + [string]$probeNoIntent.Name) }
+    Invoke-ProbeLateStart -Changes $script:ProbeLateStartAfterMarker
+}
+# Lifecycle-race: інший актор (SCM autostart/recovery, оператор) запускає
+# службу ПІСЛЯ початкового знімка стану. Зміни застосовуються один раз.
+function Invoke-ProbeLateStart {
+    param([hashtable]$Changes)
+    foreach ($probeLateName in @($Changes.Keys | Sort-Object)) {
+        Add-ProbeEvent ("LATE-START {0} {1}" -f $probeLateName, $Changes[$probeLateName])
+        $script:ProbeServices[$probeLateName] = [string]$Changes[$probeLateName]
+    }
+    $Changes.Clear()
 }
 # #297: утримання від автостарту. Без $script:ProbeStartModes стаби повертають
 # порожній знімок і Disabled-тип (жодних змін start type, жодних подій у
@@ -14005,12 +14063,45 @@ function Invoke-CommandWithLog {
     return 2
 }
 function Restore-BRAVOServiceStartTypeSnapshot { param([object[]]$Snapshot, [string[]]$AllowedServiceNames) return [pscustomobject]@{ Restored = @(); Unchanged = @(); Foreign = @(); Failed = @() } }
-function Confirm-BRAVOServicesQuiesced { param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds) return [pscustomobject]@{ Ok = $true; Offenders = @(); StoppedAgain = @() } }
+# Бар'єр: з -StopRunning знову зупиняє служби, що біжать; без нього (як і
+# справжній бар'єр) активна служба = порушник (fail-closed).
+function Confirm-BRAVOServicesQuiesced {
+    param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds)
+    $probeStoppedAgain = @()
+    $probeOffenders = @()
+    # Lifecycle-race: інший актор запускає службу вже після плану бар'єра.
+    if (@($ServiceNames).Count -gt 0) { Invoke-ProbeLateStart -Changes $script:ProbeLateStartBeforeBarrier }
+    if (-not $StopRunning) {
+        foreach ($probeBarrierName in @($ServiceNames)) {
+            if ([string]$script:ProbeServices[$probeBarrierName] -ne 'Stopped') {
+                Add-ProbeEvent "BARRIER-OFFENDER $probeBarrierName"
+                $probeOffenders += "${probeBarrierName}: стан $($script:ProbeServices[$probeBarrierName]) (запущена під час вікна реставрації)"
+            }
+        }
+    }
+    if ($StopRunning) {
+        foreach ($probeBarrierName in @($ServiceNames)) {
+            # #287: як і справжній бар'єр, stop службі у StartPending SCM відхиляє.
+            if ([string]$script:ProbeServices[$probeBarrierName] -eq 'StartPending') {
+                Add-ProbeEvent "STOP-REFUSED-START-PENDING $probeBarrierName"
+                $probeOffenders += "${probeBarrierName}: не вдалося зупинити повторно (стан StartPending)"
+            } elseif ([string]$script:ProbeServices[$probeBarrierName] -ne 'Stopped') {
+                Add-ProbeEvent "STOP $probeBarrierName"
+                $script:ProbeServices[$probeBarrierName] = 'Stopped'
+                $probeStoppedAgain += $probeBarrierName
+            }
+        }
+    }
+    return [pscustomobject]@{ Ok = ($probeOffenders.Count -eq 0); Offenders = @($probeOffenders); StoppedAgain = @($probeStoppedAgain) }
+}
 function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
 # #349: маркер аварійно перерваного прогону (мертвий власник) з наміром перезапуску
 # служб $script:ProbeForeignRestartIntent; без нього — маркера немає.
 # $script:ProbeForeignRestartSuppressed — маркер із restartSuppressed.
 function Get-BRAVOForeignServiceQuiescenceContext {
+    # Lifecycle-race: читання чужого маркера стоїть між початковим знімком
+    # стану служб і фазою зупинки — тут інший актор «встигає» запустити службу.
+    Invoke-ProbeLateStart -Changes $script:ProbeLateStart
     $probeForeignPresent = @($script:ProbeForeignRestartIntent).Count -gt 0
     return [pscustomobject]@{ Present = $probeForeignPresent; OwnerAlive = $false; Owner = $(if ($probeForeignPresent) { 'BRAVO_MAINTENANCE' } else { $null }); RestartSuppressed = [bool]$script:ProbeForeignRestartSuppressed; RestartIntentNames = @($script:ProbeForeignRestartIntent); HeldSnapshot = @() }
 }
@@ -14025,9 +14116,15 @@ function Initialize-BRAVOBackupManifestStorage {
     param($BackupRoot, $Logger)
     return [pscustomobject]@{ Errors = @(); Migrated = @(); Deduplicated = @(); Conflicts = @(); ManifestRootCreated = $false; ManifestRoot = '' }
 }
+# Lifecycle-race: інший актор піднімає службу безпосередньо перед обробкою trace.
+function Write-BRAVOProgressPhase {
+    param([string]$Phase, [int]$PercentComplete)
+    if ($Phase -eq 'Обробка trace і логів') { Invoke-ProbeLateStart -Changes $script:ProbeLateStartBeforeTrace }
+}
 function Check-MdFileSizes {
     param($MODEL_PATH, $MAX_MD_FILE_SIZE, $ExcludePatterns)
     Add-ProbeEvent 'SIZE-CHECK'
+    Invoke-ProbeLateStart -Changes $script:ProbeLateStartAfterStop
     if ($script:ProbeThrowInSizeCheck) { throw 'self-test: імітований збій кроку перевірки розмірів .md' }
 }
 function Get-BRAVOTraceConfiguration {
@@ -14039,7 +14136,7 @@ function Resolve-BRAVOExchangeApiRuntimeDirectory { param($ServiceName, $Fallbac
 function Get-BRAVOOSSupportTier { return [pscustomobject]@{ Tier = 'Supported'; OperatingSystem = 'self-test'; OperatingSystemVersion = '10.0'; Build = 0; PowerShellVersion = '5.1'; DotNetRelease = 0; Message = '' } }
 function Get-BRAVOToolIntegrityRecommendation { param($ToolPaths, $ManifestPath) return [pscustomobject]@{ HasIntegrityIssue = $false; Message = '' } }
 function Test-BRAVOToolManifestIntegrity { param($ToolsDirectory, $ManifestPath, $Mode) return [pscustomobject]@{ IsValid = $true; ShouldBlock = $false; Message = '' } }
-function Invoke-BRAVOTraceRotation { return [pscustomobject]@{ Moved = 0; Errors = 0 } }
+function Invoke-BRAVOTraceRotation { Add-ProbeEvent 'TRACE-ROTATION'; return [pscustomobject]@{ Moved = 0; Errors = 0 } }
 function Invoke-BRAVOExchangeApiLogRotation { return [pscustomobject]@{ Found = 0; Moved = 0; Errors = 0 } }
 function Invoke-BRAVOLegacySweep { }
 function Invoke-BRAVOLegacyModelArchiveLocalMigration { }
@@ -14231,8 +14328,26 @@ try {
     $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
     # ThrowInSizeCheck: exchangAPI зупинена до прогону. #349 *InitiallyStopped:
     # BravoWeb зупинена до прогону (поза restart-intent, але має утримуватись).
+    # Lifecycle-race: LateStart* і BootRecoveryLateStart стартують зі
+    # зупиненими службами, які інший актор запускає вже після знімка.
     $probeServiceTable = if ($Scenario -eq 'ThrowInSizeCheck') {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Running' }"
+    } elseif (@('LateStartAllStopped', 'LateStartPending', 'LateStartThrow', 'BootRecoveryLateStart', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck', 'StartModeAllStoppedLateAfterMarker', 'AllStoppedExchangeApiUnreadable') -contains $Scenario) {
+        "@{ 'BRAVO' = 'Stopped'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Stopped' }"
+    } elseif ($Scenario -eq 'LateStartPartial') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Stopped' }"
+    } elseif ($Scenario -eq 'InitiallyStartPending' -or $Scenario -eq 'StuckStartPending' -or $Scenario -eq 'InitiallyStartPendingFails') {
+        "@{ 'BRAVO' = 'StartPending'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
+    } elseif ($Scenario -eq 'LateStartOperatorDisabled') {
+        "@{ 'BRAVO' = 'Stopped'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Stopped' }"
+    } elseif ($Scenario -eq 'LateStartAfterMarker') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Stopped' }"
+    } elseif ($Scenario -eq 'PausedServicesPreserved') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Paused'; 'BravoWeb' = 'Paused' }"
+    } elseif ($Scenario -eq 'BravoPausedPreserved') {
+        "@{ 'BRAVO' = 'Paused'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
+    } elseif ($Scenario -eq 'StartModePausedHeld') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Paused' }"
     } elseif ($Scenario -like '*InitiallyStopped') {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Stopped' }"
     } else {
@@ -14242,10 +14357,67 @@ try {
         ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
         ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
         ('$script:ProbeServices = {0}' -f $probeServiceTable),
-        ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' })),
+        ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck' -or $Scenario -eq 'LateStartThrow') { '$true' } else { '$false' })),
         ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' })),
-        ('$script:ProbeForeignRestartIntent = {0}' -f $(if ($Scenario -like 'StartMode*IntentInitiallyStopped') { "@('BravoWeb')" } else { '@()' })),
-        ('$script:ProbeForeignRestartSuppressed = {0}' -f $(if ($Scenario -eq 'StartModeSuppressedIntentInitiallyStopped') { '$true' } else { '$false' })),
+        ('$script:ProbeForeignRestartIntent = {0}' -f $(if ($Scenario -like 'StartMode*IntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { "@('BravoWeb')" } else { '@()' })),
+        ('$script:ProbeForeignRestartSuppressed = {0}' -f $(if ($Scenario -eq 'StartModeSuppressedIntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { '$true' } else { '$false' })),
+        '$script:ProbePendingReads = @{}',
+        '$script:ProbeMarkerWrites = 0',
+        ('$script:ProbeMarkerWriteFailFrom = {0}' -f $(if ($Scenario -eq 'StartModeLateAfterStopMarkerFailInitiallyStopped') { '2' } else { '0' })),
+        # StuckStartPending: старт BRAVO не завершується (StartPending назавжди).
+        ('$script:ProbeStickyPending = {0}' -f $(if ($Scenario -eq 'StuckStartPending') { "@('BRAVO')" } else { '@()' })),
+        # LateStartStopPendingStuck: чужа зупинка не завершується до таймауту.
+        ('$script:ProbeStickyStopPending = {0}' -f $(if ($Scenario -eq 'LateStartStopPendingStuck') { "@('BRAVO')" } else { '@()' })),
+        ('$script:ProbeStopRejected = {0}' -f $(if ($Scenario -eq 'LateStartStopRejectedSelfStopped') { "@('BRAVO')" } else { '@()' })),
+        ('$script:ProbeStartFails = {0}' -f $(if ($Scenario -eq 'LateStartPendingFailsBeforeStop' -or $Scenario -eq 'InitiallyStartPendingFails') { "@('BRAVO')" } else { '@()' })),
+        ('$script:ProbeLateStart = {0}' -f $(switch ($Scenario) {
+                'LateStartAllStopped' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartSelfStoppedBeforeStop' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartStopPendingBeforeStop' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartStopRejectedSelfStopped' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartStopPendingStuck' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartThrow' { "@{ 'BRAVO' = 'Running' }" }
+                'BootRecoveryLateStart' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartOperatorDisabled' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartPartial' { "@{ 'exchangAPI' = 'Running'; 'BravoWeb' = 'StartPending' }" }
+                'LateStartPending' { "@{ 'BRAVO' = 'StartPending' }" }
+                'LateStartPendingFailsBeforeStop' { "@{ 'BRAVO' = 'StartPending' }" }
+                'StartModeLateStartInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeSuppressedLateStartInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                'PausedAfterSnapshot' { "@{ 'exchangAPI' = 'Paused' }" }
+                'AllStoppedExchangeApiUnreadable' { "@{ 'exchangAPI' = 'UNREADABLE' }" }
+                default { '@{}' }
+            })),
+        ('$script:ProbeLateStartBeforeBarrier = {0}' -f $(if ($Scenario -eq 'StartModeLateBeforeBarrierInitiallyStopped') { "@{ 'BravoWeb' = 'Running' }" } else { '@{}' })),
+        ('$script:ProbeLateStartBeforeTrace = {0}' -f $(if ($Scenario -eq 'LateStartBeforeTrace') { "@{ 'BRAVO' = 'Running' }" } else { '@{}' })),
+        ('$script:ProbePauseBeforeStop = {0}' -f $(switch ($Scenario) {
+                'PausedBeforeStop' { "@{ 'exchangAPI' = 'Paused' }" }
+                # Інший актор уже зупиняє службу між контрактом і Stop-Service.
+                'LateStartStopPendingBeforeStop' { "@{ 'BRAVO' = 'StopPending' }" }
+                'LateStartStopPendingStuck' { "@{ 'BRAVO' = 'StopPending' }" }
+                default { '@{}' }
+            })),
+        ('$script:ProbeLateStartAfterStop = {0}' -f $(switch ($Scenario) {
+                'StartModeLateAfterStopInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeAllStoppedLateAfterStop' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeLateAfterStopMarkerFailInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeLatePendingAfterStopInitiallyStopped' { "@{ 'BravoWeb' = 'StartPending' }" }
+                # Інший актор піднімає і призупиняє служби вже після фази зупинки.
+                'PausePendingBeforeRestart' { "@{ 'exchangAPI' = 'ContinuePending'; 'BravoWeb' = 'PausePending' }" }
+                'BravoPausePendingBeforeRestart' { "@{ 'BRAVO' = 'PausePending' }" }
+                default { '@{}' }
+            })),
+        ('$script:ProbeLateStartAfterMarker = {0}' -f $(switch ($Scenario) {
+                'LateStartAfterMarker' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeLateAfterMarkerInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                # Служба, запущена після знімка, сама зупиняється до фази зупинки.
+                'LateStartSelfStoppedBeforeStop' { "@{ 'BRAVO' = 'Stopped' }" }
+                # Стан exchangAPI не читається саме у фазі зупинки.
+                'ExchangeApiUnreadableAtStop' { "@{ 'exchangAPI' = 'UNREADABLE' }" }
+                # Усі служби стояли на обох читаннях; BravoWeb стартує вже після маркера.
+                'StartModeAllStoppedLateAfterMarker' { "@{ 'BravoWeb' = 'Running' }" }
+                default { '@{}' }
+            })),
         # #349: типи запуску служб (лише сценарії утримання; інакше — стаби до #297).
         ('$script:ProbeStartModes = {0}' -f $(switch ($Scenario) {
                 'StartModeOther' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Other'; 'BravoWeb' = 'Manual' }" }
@@ -14258,6 +14430,16 @@ try {
                 'StartModeHeldInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 'StartModeOrphanIntentInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 'StartModeSuppressedIntentInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateStartInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateAfterMarkerInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateAfterStopInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeAllStoppedLateAfterStop' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateBeforeBarrierInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeAllStoppedLateAfterMarker' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateAfterStopMarkerFailInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLatePendingAfterStopInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModePausedHeld' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeSuppressedLateStartInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 default { '$null' }
             })),
         # #297: результат раннього самовідновлення типів запуску (у production
@@ -14285,6 +14467,12 @@ try {
             '[void][IO.Directory]::CreateDirectory($LOG_DIR)',
             '[void][IO.Directory]::CreateDirectory($ARC_DIR)'
         ) -join "`n"
+    } elseif ($Scenario -eq 'BootRecoveryLateStart') {
+        # Профіль boot-recovery: «hold» усіх увімкнених керованих служб.
+        $probeRestoreSeed = '$bootRestoreIgnoresWindow = $true'
+    } elseif ($Scenario -eq 'LateStartOperatorDisabled') {
+        # exchangAPI вимкнена оператором (Disabled) — працює, але не керується.
+        $probeRestoreSeed = @('$exchangAPIServiceEnabled = $false', '$exchangAPIServiceDisabled = $true') -join "`n"
     }
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
@@ -14338,7 +14526,7 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped')) {
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped', 'StartModeLatePendingAfterStopInitiallyStopped', 'PausedServicesPreserved', 'BravoPausedPreserved', 'StartModePausedHeld', 'PausedAfterSnapshot', 'LateStartBeforeTrace', 'PausedBeforeStop', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'InitiallyStartPendingFails', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck', 'StartModeLateBeforeBarrierInitiallyStopped', 'ExchangeApiUnreadableAtStop', 'PausePendingBeforeRestart', 'BravoPausePendingBeforeRestart', 'StartModeAllStoppedLateAfterMarker', 'AllStoppedExchangeApiUnreadable')) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
                 $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
@@ -14671,6 +14859,468 @@ try {
                 ) `
                 -Name "Maintenance/StartModeOrphanRestartIntentSurvivesMarkerRewrite" `
                 -Failure ("Maintenance (#349): намір перезапуску служби, зупиненої аварійно перерваним прогоном, має зберегтися в маркері й служба має стартувати у finally, а restartSuppressed — не успадковуватись; події: " + ($maintenanceStartModeOrphanIntent.Events -join ' | ') + ' || ' + ($maintenanceStartModeSuppressedIntent.Events -join ' | '))
+
+            # Lifecycle-інваріант (усі сценарії оркестрації): Maintenance зупиняє
+            # службу ЛИШЕ коли чинний ownership-маркер уже містить її з наміром
+            # перезапуску, і кожну зупинену службу запускає у finally. Служба,
+            # яку інший актор запустив після початкового знімка, інакше
+            # зупинялася б поза маркером/утриманням і лишалася б лежати.
+            $maintenanceLifecycleViolations = @()
+            foreach ($maintenanceLifecycleScenario in @($maintenanceOrchestrationResults.Keys | Sort-Object)) {
+                $maintenanceLifecycleOutcome = $maintenanceOrchestrationResults[$maintenanceLifecycleScenario]
+                if ($null -ne $maintenanceLifecycleOutcome.PSObject.Properties['ProbeError']) {
+                    $maintenanceLifecycleViolations += "${maintenanceLifecycleScenario}: проба не виконалась ($($maintenanceLifecycleOutcome.ProbeError))"
+                    continue
+                }
+                $maintenanceLifecycleIntent = @{}
+                $maintenanceLifecycleStopped = @()
+                $maintenanceLifecycleStarted = @()
+                foreach ($maintenanceLifecycleEvent in @($maintenanceLifecycleOutcome.Events | ForEach-Object { [string]$_ })) {
+                    if ($maintenanceLifecycleEvent -like 'MARKER-WRITE *') {
+                        $maintenanceLifecycleIntent = @{}
+                        foreach ($maintenanceLifecycleName in $maintenanceLifecycleEvent.Substring(13).Split(',')) {
+                            if ($maintenanceLifecycleName) { $maintenanceLifecycleIntent[$maintenanceLifecycleName] = $true }
+                        }
+                    } elseif ($maintenanceLifecycleEvent -like 'MARKER-NO-RESTART *') {
+                        $maintenanceLifecycleIntent[$maintenanceLifecycleEvent.Substring(18)] = $false
+                    } elseif ($maintenanceLifecycleEvent -like 'STOP *') {
+                        $maintenanceLifecycleName = $maintenanceLifecycleEvent.Substring(5)
+                        $maintenanceLifecycleStopped += $maintenanceLifecycleName
+                        if (-not ($maintenanceLifecycleIntent.ContainsKey($maintenanceLifecycleName) -and $maintenanceLifecycleIntent[$maintenanceLifecycleName])) {
+                            $maintenanceLifecycleViolations += "${maintenanceLifecycleScenario}: STOP $maintenanceLifecycleName без маркера з наміром перезапуску"
+                        }
+                    } elseif ($maintenanceLifecycleEvent -like 'START *') {
+                        $maintenanceLifecycleStarted += $maintenanceLifecycleEvent.Substring(6)
+                    } elseif ($maintenanceLifecycleEvent -match '^LATE-START (\S+) (Running|StartPending|Paused|PausePending|ContinuePending)$' -and $maintenanceLifecycleStopped -contains $Matches[1]) {
+                        # Зупинену прогоном службу знову підняв інший актор — зупиненою вона не лишилась.
+                        $maintenanceLifecycleStarted += $Matches[1]
+                    }
+                }
+                foreach ($maintenanceLifecycleName in $maintenanceLifecycleStopped) {
+                    if ($maintenanceLifecycleStarted -notcontains $maintenanceLifecycleName) {
+                        $maintenanceLifecycleViolations += "${maintenanceLifecycleScenario}: $maintenanceLifecycleName зупинено, але не запущено у finally"
+                    }
+                }
+            }
+            Test-BRAVOCondition `
+                -Condition ($maintenanceLifecycleViolations.Count -eq 0) `
+                -Name "Maintenance/LifecycleEveryStopHasRestartContract" `
+                -Failure ("Maintenance: кожна зупинка служби має йти після ownership-маркера з наміром її перезапуску, а зупинена служба — стартувати у finally; порушення: " + ($maintenanceLifecycleViolations -join ' | '))
+
+            # Lifecycle-race (не-restore прогін): служба, зупинена на момент
+            # початкового знімка, яку інший актор запустив до фази зупинки,
+            # потрапляє в маркер із наміром перезапуску, зупиняється (крок
+            # [3/8] не SKIPPED) і запускається у finally. exchangAPI
+            # зупиняється за свіжим, а не закешованим на старті станом. Код 10
+            # (SuccessWithWarnings) — від попередження про неактивні на старті
+            # служби; інших WARNING немає.
+            # Намір перезапуску пізно запущеної служби записується не за знімком
+            # перед фазою зупинки, а за свіжим станом безпосередньо перед її
+            # зупинкою: перший маркер містить службу без наміру, наступний — з
+            # наміром, і лише після нього йде STOP.
+            $maintenanceMarkerTrail = {
+                param([string[]]$Events)
+                @($Events | Where-Object { $_ -like 'MARKER-WRITE *' -or $_ -like 'MARKER-NO-RESTART *' }) -join '|'
+            }
+            # Служби без наміру перезапуску в ОСТАННЬОМУ записаному маркері.
+            $maintenanceFinalMarkerNoRestart = {
+                param([string[]]$Events)
+                $finalMarkerIndex = -1
+                for ($eventIndex = 0; $eventIndex -lt $Events.Count; $eventIndex++) {
+                    if ($Events[$eventIndex] -like 'MARKER-WRITE *') { $finalMarkerIndex = $eventIndex }
+                }
+                $finalNoRestart = @()
+                if ($finalMarkerIndex -ge 0) {
+                    for ($eventIndex = $finalMarkerIndex + 1; $eventIndex -lt $Events.Count -and $Events[$eventIndex] -like 'MARKER-NO-RESTART *'; $eventIndex++) {
+                        $finalNoRestart += $Events[$eventIndex].Substring('MARKER-NO-RESTART '.Length)
+                    }
+                }
+                $finalNoRestart -join ','
+            }
+            $maintenanceLateAll = & $maintenanceStartModeOutcome 'LateStartAllStopped'
+            $maintenanceLatePartial = & $maintenanceStartModeOutcome 'LateStartPartial'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateAll.ProbeOk -and $maintenanceLateAll.ExitCode -eq 10 -and $maintenanceLateAll.StepOrderOk -and
+                    (& $maintenanceMarkerTrail $maintenanceLateAll.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO|MARKER-WRITE BRAVO' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceLateAll.Events '^STOP BRAVO$') -gt ([array]::LastIndexOf([string[]]$maintenanceLateAll.Events, 'MARKER-WRITE BRAVO')) -and
+                    @($maintenanceLateAll.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб OK' }).Count -eq 1 -and
+                    (@($maintenanceLateAll.Events | Where-Object { $_ -like 'STOP *' -or $_ -like 'START *' }) -join '|') -ceq 'STOP BRAVO|START BRAVO' -and
+                    $maintenanceLateAll.MarkerCleared -and
+                    $maintenanceLatePartial.ProbeOk -and $maintenanceLatePartial.ExitCode -eq 10 -and $maintenanceLatePartial.StepOrderOk -and
+                    (& $maintenanceMarkerTrail $maintenanceLatePartial.Events) -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb|MARKER-NO-RESTART exchangAPI|MARKER-NO-RESTART BravoWeb|MARKER-WRITE BRAVO,exchangAPI,BravoWeb|MARKER-NO-RESTART exchangAPI|MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceLatePartial.Events '^STOP exchangAPI$') -gt ([array]::LastIndexOf([string[]]$maintenanceLatePartial.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
+                    (@($maintenanceLatePartial.Events | Where-Object { $_ -like 'STOP *' } | Sort-Object) -join '|') -ceq 'STOP BRAVO|STOP BravoWeb|STOP exchangAPI' -and
+                    (@($maintenanceLatePartial.Events | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb|START exchangAPI' -and
+                    @($maintenanceLatePartial.Events | Where-Object { $_ -like 'LOG-WARNING*' -and $_ -notlike 'LOG-WARNING До початку maintenance не запущені служби:*' }).Count -eq 0 -and
+                    $maintenanceLatePartial.MarkerCleared
+                ) `
+                -Name "Maintenance/LifecycleLateStartBeforeStopIsOwnedAndRestarted" `
+                -Failure ("Maintenance: служба, запущена іншим актором після початкового знімка, має отримати намір перезапуску в маркері безпосередньо перед зупинкою за свіжим станом і бути запущеною у finally; події: " + ($maintenanceLateAll.Events -join ' | ') + ' || ' + ($maintenanceLatePartial.Events -join ' | '))
+
+            # Служба, запущена після знімка, але зупинена іншим актором ще до
+            # фази зупинки, наміру перезапуску не отримує: Maintenance її не
+            # зупиняє й не запускає, а маркер лишає її без наміру.
+            $maintenanceLateSelfStopped = & $maintenanceStartModeOutcome 'LateStartSelfStoppedBeforeStop'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateSelfStopped.ProbeOk -and $maintenanceLateSelfStopped.StepOrderOk -and
+                    @($maintenanceLateSelfStopped.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceMarkerTrail $maintenanceLateSelfStopped.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO' -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateSelfStopped.Events) -ceq 'BRAVO'
+                ) `
+                -Name "Maintenance/LifecycleLateStartIntentRecordedOnlyAtStop" `
+                -Failure ("Maintenance: служба, запущена після знімка й зупинена іншим актором до фази зупинки, не повинна отримати намір перезапуску (Maintenance її не зупиняла й не запускає); події: " + ($maintenanceLateSelfStopped.Events -join ' | '))
+
+            # Служба у StartPending, намір якої записано перед зупинкою, але старт
+            # якої завершився невдачею (сама стала Stopped) ще до Stop-Service:
+            # Maintenance її не зупиняла, тож намір знято й з маркера, а finally
+            # її не запускає.
+            $maintenanceLatePendingFails = & $maintenanceStartModeOutcome 'LateStartPendingFailsBeforeStop'
+            $maintenanceInitialPendingFails = & $maintenanceStartModeOutcome 'InitiallyStartPendingFails'
+            $maintenanceLateStopPending = & $maintenanceStartModeOutcome 'LateStartStopPendingBeforeStop'
+            $maintenanceLateStopRejected = & $maintenanceStartModeOutcome 'LateStartStopRejectedSelfStopped'
+            $maintenanceLateStopPendingStuck = & $maintenanceStartModeOutcome 'LateStartStopPendingStuck'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLatePendingFails.ProbeOk -and $maintenanceLatePendingFails.StepOrderOk -and
+                    @($maintenanceLatePendingFails.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceMarkerTrail $maintenanceLatePendingFails.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO|MARKER-WRITE BRAVO|MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO' -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLatePendingFails.Events) -ceq 'BRAVO' -and
+                    # Характеризація до #360: намір, що був на старті (StartPending
+                    # на початковому знімку), не знімається — finally запускає службу.
+                    $maintenanceInitialPendingFails.ProbeOk -and $maintenanceInitialPendingFails.StepOrderOk -and
+                    @($maintenanceInitialPendingFails.Events | Where-Object { $_ -ceq 'START BRAVO' }).Count -eq 1 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceInitialPendingFails.Events) -ceq '' -and
+                    # Службу вже зупиняє інший актор (StopPending): Stop-Service не
+                    # надсилається, намір знято, finally її не запускає.
+                    $maintenanceLateStopPending.ProbeOk -and $maintenanceLateStopPending.StepOrderOk -and
+                    @($maintenanceLateStopPending.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopPending.Events) -ceq 'BRAVO' -and
+                    # Stop-Service відхилено, а службу зупинив інший актор: зупинку
+                    # Maintenance собі не приписує, намір знято.
+                    $maintenanceLateStopRejected.ProbeOk -and $maintenanceLateStopRejected.StepOrderOk -and
+                    @($maintenanceLateStopRejected.Events | Where-Object { $_ -ceq 'STOP-REJECTED BRAVO' }).Count -eq 1 -and
+                    @($maintenanceLateStopRejected.Events | Where-Object { $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopRejected.Events) -ceq 'BRAVO' -and
+                    # Чужа зупинка (StopPending) не завершилась до таймауту: операція
+                    # невдала, але Stop-Service не надсилався — намір теж знято.
+                    $maintenanceLateStopPendingStuck.ProbeOk -and $maintenanceLateStopPendingStuck.StepOrderOk -and
+                    @($maintenanceLateStopPendingStuck.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopPendingStuck.Events) -ceq 'BRAVO'
+                ) `
+                -Name "Maintenance/LifecycleIntentRevokedWhenServiceStopsByItself" `
+                -Failure ("Maintenance: намір перезапуску, записаний перед зупинкою, має бути знятий (і в маркері), якщо служба зупинилася сама до Stop-Service — finally її не запускає; події: " + ($maintenanceLatePendingFails.Events -join ' | ') + ' || ' + ($maintenanceInitialPendingFails.Events -join ' | ') + ' || ' + ($maintenanceLateStopPending.Events -join ' | ') + ' || ' + ($maintenanceLateStopRejected.Events -join ' | ') + ' || ' + ($maintenanceLateStopPendingStuck.Events -join ' | '))
+
+            # #287: служба у StartPending (на момент знімка або після нього)
+            # зупиняється після завершення старту (stop не надсилається, поки SCM
+            # його відхиляє) і запускається у finally; ротація trace не
+            # починається на службі, що саме піднімається.
+            $maintenanceLatePending = & $maintenanceStartModeOutcome 'LateStartPending'
+            $maintenanceInitialPending = & $maintenanceStartModeOutcome 'InitiallyStartPending'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLatePending.ProbeOk -and $maintenanceLatePending.ExitCode -eq 10 -and $maintenanceLatePending.StepOrderOk -and
+                    (& $maintenanceMarkerTrail $maintenanceLatePending.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO|MARKER-WRITE BRAVO' -and
+                    (@($maintenanceLatePending.Events | Where-Object { $_ -like 'STOP*' -or $_ -like 'START *' }) -join '|') -ceq 'STOP BRAVO|START BRAVO' -and
+                    @($maintenanceLatePending.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб OK' }).Count -eq 1 -and
+                    $maintenanceInitialPending.ProbeOk -and $maintenanceInitialPending.ExitCode -eq 0 -and $maintenanceInitialPending.StepOrderOk -and
+                    @($maintenanceInitialPending.Events | Where-Object { $_ -like 'STOP-REFUSED*' }).Count -eq 0 -and
+                    (@($maintenanceInitialPending.Events | Where-Object { $_ -like 'STOP *' } | Sort-Object) -join '|') -ceq 'STOP BRAVO|STOP BravoWeb|STOP exchangAPI' -and
+                    (@($maintenanceInitialPending.Events | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb|START exchangAPI' -and
+                    @($maintenanceInitialPending.Events | Where-Object { $_ -like 'LOG-ERROR*' }).Count -eq 0
+                ) `
+                -Name "Maintenance/LifecycleStartPendingIsStoppedAndRestarted" `
+                -Failure ("Maintenance (#287): служба у StartPending має бути зупинена після завершення старту (без відхиленого stop) і запущена у finally; події: " + ($maintenanceLatePending.Events -join ' | ') + ' || ' + ($maintenanceInitialPending.Events -join ' | '))
+
+            # #287: служба BRAVO, яка так і не вийшла зі StartPending (stop
+            # неможливий), не отримує обробки trace: бар'єр вимагає Stopped (чи
+            # Paused), а не «не Running»; критична помилка, код 60.
+            $maintenanceStuckPending = & $maintenanceStartModeOutcome 'StuckStartPending'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceStuckPending.ProbeOk -and $maintenanceStuckPending.StepOrderOk -and
+                    $maintenanceStuckPending.ExitCode -eq 60 -and
+                    @($maintenanceStuckPending.Events | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 0 -and
+                    @($maintenanceStuckPending.Events | Where-Object { $_ -like 'LOG-ERROR Сервіс BRAVO все ще працює*' }).Count -eq 1 -and
+                    @($maintenanceStuckPending.Events | Where-Object { $_ -ceq 'STEP 6/8 Обробка trace і логів SKIPPED' }).Count -eq 1 -and
+                    @(& $maintenanceStartModeOutcome 'InitiallyStartPending' | ForEach-Object { $_.Events } | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleStuckStartPendingGetsNoTraceProcessing" `
+                -Failure ("Maintenance (#287): служба BRAVO, що не вийшла зі StartPending, не повинна отримати обробку trace (бар'єр вимагає Stopped), а прогін має завершитися критичною помилкою з кодом 60; події: " + ($maintenanceStuckPending.Events -join ' | '))
+
+            # Виняток після зупинки: служба, запущена після знімка й зупинена
+            # прогоном, стартує у finally навіть коли крок [4/8] кидає виняток.
+            $maintenanceLateThrow = & $maintenanceStartModeOutcome 'LateStartThrow'
+            $maintenanceLateThrowSizeCheck = & $maintenanceOrchestrationEventIndex $maintenanceLateThrow.Events '^SIZE-CHECK$'
+            $maintenanceLateThrowStart = & $maintenanceOrchestrationEventIndex $maintenanceLateThrow.Events '^START BRAVO$'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateThrow.ProbeOk -and $maintenanceLateThrow.ExitCode -eq 90 -and
+                    (& $maintenanceMarkerTrail $maintenanceLateThrow.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO|MARKER-WRITE BRAVO' -and
+                    $maintenanceLateThrowSizeCheck -ge 0 -and $maintenanceLateThrowStart -gt $maintenanceLateThrowSizeCheck -and
+                    $maintenanceLateThrow.MarkerCleared
+                ) `
+                -Name "Maintenance/LifecycleLateStartRestartedAfterStepThrows" `
+                -Failure ("Maintenance: служба, запущена після знімка й зупинена прогоном, має стартувати у finally після винятку в кроці [4/8]; події: " + ($maintenanceLateThrow.Events -join ' | '))
+
+            # Disabled = оператор свідомо вимкнув службу: Maintenance її не
+            # зупиняє, не утримує й не запускає, навіть коли вона працює.
+            $maintenanceLateDisabled = & $maintenanceStartModeOutcome 'LateStartOperatorDisabled'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateDisabled.ProbeOk -and $maintenanceLateDisabled.StepOrderOk -and
+                    @($maintenanceLateDisabled.Events | Where-Object { ($_ -like 'STOP*' -or $_ -like 'START *' -or $_ -like 'MARKER-WRITE *' -or $_ -like 'HOLD *') -and $_ -like '*exchangAPI*' }).Count -eq 0 -and
+                    (@($maintenanceLateDisabled.Events | Where-Object { $_ -like 'STOP *' -or $_ -like 'START *' }) -join '|') -ceq 'STOP BRAVO|START BRAVO'
+                ) `
+                -Name "Maintenance/LifecycleOperatorDisabledServiceNeverTouched" `
+                -Failure ("Maintenance: служба з типом запуску Disabled (вимкнена оператором) не зупиняється, не утримується й не запускається; події: " + ($maintenanceLateDisabled.Events -join ' | '))
+
+            # Служба, запущена вже ПІСЛЯ запису маркера в не-restore прогоні
+            # (поза lifecycle-контрактом прогону), не зупиняється: WARNING, її
+            # стан лишається як є, маркер її не містить.
+            $maintenanceLateAfterMarker = & $maintenanceStartModeOutcome 'LateStartAfterMarker'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateAfterMarker.ProbeOk -and $maintenanceLateAfterMarker.StepOrderOk -and
+                    (@($maintenanceLateAfterMarker.Events | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO,exchangAPI' -and
+                    @($maintenanceLateAfterMarker.Events | Where-Object { ($_ -like 'STOP*' -or $_ -like 'START *') -and $_ -like '*BravoWeb*' }).Count -eq 0 -and
+                    @($maintenanceLateAfterMarker.Events | Where-Object { $_ -like 'LOG-WARNING *BravoWeb*поза lifecycle-контрактом*' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleServiceStartedAfterContractIsNotStopped" `
+                -Failure ("Maintenance: служба, запущена після запису ownership-маркера не-restore прогону, не зупиняється (WARNING), щоб не лишитися зупиненою без контракту; події: " + ($maintenanceLateAfterMarker.Events -join ' | '))
+
+            # Restore-прогін: утримувана служба, зупинена на момент знімка, але
+            # запущена до фази зупинки (до або після запису маркера), отримує
+            # намір перезапуску ДО зупинки й стартує у finally. Чужий маркер із
+            # restartSuppressed не скасовує намір служби, яка фактично працювала.
+            $maintenanceRestoreLate = & $maintenanceStartModeOutcome 'StartModeLateStartInitiallyStopped'
+            $maintenanceRestoreLateAfterMarker = & $maintenanceStartModeOutcome 'StartModeLateAfterMarkerInitiallyStopped'
+            $maintenanceRestoreLateSuppressed = & $maintenanceStartModeOutcome 'StartModeSuppressedLateStartInitiallyStopped'
+            $maintenanceRestoreLateAfterStop = & $maintenanceStartModeOutcome 'StartModeLateAfterStopInitiallyStopped'
+            $maintenanceRestoreLateAfterStopBarrierStop = & $maintenanceOrchestrationEventIndex $maintenanceRestoreLateAfterStop.Events '^STOP BravoWeb$'
+            $maintenanceRestoreLateAfterMarkerWrites = @($maintenanceRestoreLateAfterMarker.Events | Where-Object { $_ -like 'MARKER-WRITE *' -or $_ -like 'MARKER-NO-RESTART *' })
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreLate.ProbeOk -and $maintenanceRestoreLate.StepOrderOk -and
+                    (& $maintenanceMarkerTrail $maintenanceRestoreLate.Events) -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb|MARKER-NO-RESTART BravoWeb|MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLate.Events '^STOP BravoWeb$') -gt ([array]::LastIndexOf([string[]]$maintenanceRestoreLate.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
+                    @($maintenanceRestoreLate.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1 -and
+                    $maintenanceRestoreLateAfterMarker.ProbeOk -and $maintenanceRestoreLateAfterMarker.StepOrderOk -and
+                    ($maintenanceRestoreLateAfterMarkerWrites -join '|') -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb|MARKER-NO-RESTART BravoWeb|MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLateAfterMarker.Events '^STOP BravoWeb$') -gt ([array]::LastIndexOf([string[]]$maintenanceRestoreLateAfterMarker.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
+                    @($maintenanceRestoreLateAfterMarker.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1 -and
+                    $maintenanceRestoreLateSuppressed.ProbeOk -and $maintenanceRestoreLateSuppressed.StepOrderOk -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceRestoreLateSuppressed.Events) -ceq '' -and
+                    @($maintenanceRestoreLateSuppressed.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1 -and
+                    $maintenanceRestoreLateAfterStop.ProbeOk -and $maintenanceRestoreLateAfterStop.StepOrderOk -and
+                    $maintenanceRestoreLateAfterStopBarrierStop -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLateAfterStop.Events '^SIZE-CHECK$') -and
+                    $maintenanceRestoreLateAfterStopBarrierStop -gt ([array]::LastIndexOf([string[]]$maintenanceRestoreLateAfterStop.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
+                    @($maintenanceRestoreLateAfterStop.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleRestoreLateStartGetsRestartIntentBeforeStop" `
+                -Failure ("Maintenance: утримувана служба, запущена після знімка (до чи після фази зупинки), має отримати намір перезапуску в маркері ДО зупинки (і повторної зупинки бар'єром перед before-архівом) й стартувати у finally; події: " + ($maintenanceRestoreLate.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateAfterMarker.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateSuppressed.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateAfterStop.Events -join ' | '))
+
+            # Подвійний збій: службу запущено після фази зупинки, а намір її
+            # перезапуску не вдалося записати в маркер. Бар'єр перед
+            # before-архівом її не зупиняє (вона лишається працювати), а
+            # реставрацію скасовано fail-closed ДО архіву.
+            $maintenanceRestoreMarkerFail = & $maintenanceStartModeOutcome 'StartModeLateAfterStopMarkerFailInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreMarkerFail.ProbeOk -and $maintenanceRestoreMarkerFail.StepOrderOk -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -ceq 'MARKER-WRITE-FAIL' }).Count -eq 1 -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -like 'STOP*BravoWeb' -or $_ -ceq 'START BravoWeb' }).Count -eq 0 -and
+                    @($maintenanceRestoreMarkerFail.Native).Count -eq 0 -and
+                    $maintenanceRestoreMarkerFail.RestoreCancelled -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -like 'LOG-ERROR ПОМИЛКА: Службу BravoWeb (стан: Running) не зупинено*' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleIntentWriteFailureNeverStopsService" `
+                -Failure ("Maintenance: служба, намір перезапуску якої не вдалося записати в маркер, не зупиняється бар'єром перед before-архівом, а реставрацію скасовано fail-closed; події: " + ($maintenanceRestoreMarkerFail.Events -join ' | '))
+
+            # #287 у бар'єрі перед before-архівом: службу, яка після фази
+            # зупинки перейшла у StartPending, бар'єр зупиняє після завершення
+            # старту (без відхиленого stop), тож реставрація не скасовується, а
+            # служба стартує у finally.
+            $maintenanceRestoreLatePending = & $maintenanceStartModeOutcome 'StartModeLatePendingAfterStopInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreLatePending.ProbeOk -and $maintenanceRestoreLatePending.StepOrderOk -and
+                    @($maintenanceRestoreLatePending.Events | Where-Object { $_ -like 'STOP-REFUSED*' }).Count -eq 0 -and
+                    -not $maintenanceRestoreLatePending.RestoreCancelled -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^STOP BravoWeb$') -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^SIZE-CHECK$') -and
+                    @($maintenanceRestoreLatePending.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending" `
+                -Failure ("Maintenance (#287): службу у StartPending бар'єр перед before-архівом має зупинити після завершення старту, не скасовуючи реставрацію, і запустити у finally; події: " + ($maintenanceRestoreLatePending.Events -join ' | '))
+
+            # Restore-прогін, де на старті всі служби стояли: крок [3/8]
+            # звітує SKIPPED, а службу, яку запустили вже після нього, зупиняє
+            # бар'єр перед before-архівом. Ця зупинка не ховається — її фіксує
+            # окремий результат WARN (консоль, підсумок, фінальне сповіщення).
+            $maintenanceRestoreAllStoppedLate = & $maintenanceStartModeOutcome 'StartModeAllStoppedLateAfterStop'
+            $maintenanceRestoreAllStoppedLateStop = & $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^STOP BravoWeb$'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreAllStoppedLate.ProbeOk -and $maintenanceRestoreAllStoppedLate.StepOrderOk -and
+                    -not $maintenanceRestoreAllStoppedLate.RestoreCancelled -and
+                    @($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб SKIPPED' }).Count -eq 1 -and
+                    $maintenanceRestoreAllStoppedLateStop -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^SIZE-CHECK$') -and
+                    @($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -ceq 'OPERATION Повторна зупинка служб перед архівацією WARN' }).Count -eq 1 -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^OPERATION Повторна зупинка служб перед архівацією WARN$') -gt $maintenanceRestoreAllStoppedLateStop -and
+                    (@($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START BravoWeb'
+                ) `
+                -Name "Maintenance/LifecyclePreArchiveBarrierStopIsReported" `
+                -Failure ("Maintenance: зупинка служби бар'єром перед before-архівом має бути видима у звіті кроків окремим результатом WARN, навіть коли [3/8] звітував SKIPPED, а служба має стартувати у finally; події: " + ($maintenanceRestoreAllStoppedLate.Events -join ' | '))
+
+            # Службу запустили вже після плану бар'єра (між контрактною
+            # зупинкою і фінальною перевіркою). Бар'єр не зупиняє її сам — його
+            # Stop-Service обійшов би контракт маркера й лишив службу зупиненою
+            # без наміру перезапуску. Вона — порушник: реставрацію скасовано
+            # fail-closed, модель не торкнута, служба не зупинена й не стартує.
+            $maintenanceRestoreLateBeforeBarrier = & $maintenanceStartModeOutcome 'StartModeLateBeforeBarrierInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreLateBeforeBarrier.ProbeOk -and $maintenanceRestoreLateBeforeBarrier.StepOrderOk -and
+                    @($maintenanceRestoreLateBeforeBarrier.Events | Where-Object { $_ -ceq 'LATE-START BravoWeb Running' }).Count -eq 1 -and
+                    @($maintenanceRestoreLateBeforeBarrier.Events | Where-Object { $_ -ceq 'BARRIER-OFFENDER BravoWeb' }).Count -eq 1 -and
+                    @($maintenanceRestoreLateBeforeBarrier.Events | Where-Object { $_ -like 'STOP*BravoWeb' -or $_ -ceq 'START BravoWeb' }).Count -eq 0 -and
+                    @($maintenanceRestoreLateBeforeBarrier.Native).Count -eq 0 -and
+                    $maintenanceRestoreLateBeforeBarrier.RestoreCancelled
+                ) `
+                -Name "Maintenance/LifecycleFinalBarrierNeverStopsOutsideContract" `
+                -Failure ("Maintenance: службу, запущену після плану бар'єра перед before-архівом, фінальна перевірка не зупиняє поза контрактом маркера, а скасовує реставрацію fail-closed; події: " + ($maintenanceRestoreLateBeforeBarrier.Events -join ' | '))
+
+            # Нечитабельний стан exchangAPI у фазі зупинки — невідомий, а не
+            # «зупинена»: критична помилка кроку [3/8], без Stop-Service і без
+            # тихого «вже зупинена».
+            $maintenanceExchangeUnreadable = & $maintenanceStartModeOutcome 'ExchangeApiUnreadableAtStop'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceExchangeUnreadable.ProbeOk -and $maintenanceExchangeUnreadable.StepOrderOk -and
+                    @($maintenanceExchangeUnreadable.Events | Where-Object { $_ -ceq 'LATE-START exchangAPI UNREADABLE' }).Count -eq 1 -and
+                    @($maintenanceExchangeUnreadable.Events | Where-Object { $_ -ceq 'LOG-ERROR ПОМИЛКА: Помилка при зупинці служби exchangAPI: self-test: стан служби exchangAPI не прочитано' }).Count -eq 1 -and
+                    @($maintenanceExchangeUnreadable.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб FAIL' }).Count -eq 1 -and
+                    @($maintenanceExchangeUnreadable.Events | Where-Object { $_ -like 'STOP*exchangAPI' -or $_ -ceq 'START exchangAPI' }).Count -eq 0
+                ) `
+                -Name "Maintenance/LifecycleUnreadableServiceStateIsNotStopped" `
+                -Failure ("Maintenance: збій читання стану exchangAPI у фазі зупинки має бути критичною помилкою кроку [3/8], а не «службу вже зупинено»; події: " + ($maintenanceExchangeUnreadable.Events -join ' | '))
+
+            # Служба, яку після фази зупинки підняли й призупиняють
+            # (PausePending/ContinuePending), у finally не запускається — той
+            # самий набір станів паузи, що й у фазі зупинки; інакше Start-Service
+            # чекав би до таймауту й позначав прогін критичним.
+            $maintenancePausePendingRestart = & $maintenanceStartModeOutcome 'PausePendingBeforeRestart'
+            $maintenanceBravoPausePendingRestart = & $maintenanceStartModeOutcome 'BravoPausePendingBeforeRestart'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenancePausePendingRestart.ProbeOk -and $maintenancePausePendingRestart.StepOrderOk -and
+                    @($maintenancePausePendingRestart.Events | Where-Object { $_ -ceq 'STOP exchangAPI' -or $_ -ceq 'STOP BravoWeb' }).Count -eq 2 -and
+                    (@($maintenancePausePendingRestart.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START BRAVO' -and
+                    @($maintenancePausePendingRestart.Events | Where-Object { $_ -like 'LOG-ERROR *' }).Count -eq 0 -and
+                    $maintenanceBravoPausePendingRestart.ProbeOk -and $maintenanceBravoPausePendingRestart.StepOrderOk -and
+                    (@($maintenanceBravoPausePendingRestart.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START exchangAPI|START BravoWeb' -and
+                    @($maintenanceBravoPausePendingRestart.Events | Where-Object { $_ -like 'LOG-ERROR *не запустився*' }).Count -eq 0
+                ) `
+                -Name "Maintenance/LifecyclePendingPauseIsNotRestarted" `
+                -Failure ("Maintenance: службу у PausePending/ContinuePending finally не запускає (як і Paused), без критичної помилки; події: " + ($maintenancePausePendingRestart.Events -join ' | ') + ' || ' + ($maintenanceBravoPausePendingRestart.Events -join ' | '))
+
+            # Restore-прогін, де на старті й на повторному читанні всі служби
+            # стояли, а BravoWeb запустили вже після запису маркера: фаза зупинки
+            # зупиняє її під контрактом, тож крок [3/8] не звітує SKIPPED, а
+            # служба стартує у finally.
+            $maintenanceAllStoppedLateAfterMarker = & $maintenanceStartModeOutcome 'StartModeAllStoppedLateAfterMarker'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceAllStoppedLateAfterMarker.ProbeOk -and $maintenanceAllStoppedLateAfterMarker.StepOrderOk -and
+                    @($maintenanceAllStoppedLateAfterMarker.Events | Where-Object { $_ -ceq 'LATE-START BravoWeb Running' }).Count -eq 1 -and
+                    @($maintenanceAllStoppedLateAfterMarker.Events | Where-Object { $_ -like 'STEP 3/8 Зупинка служб *' -and $_ -cne 'STEP 3/8 Зупинка служб SKIPPED' }).Count -eq 1 -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceAllStoppedLateAfterMarker.Events '^STOP BravoWeb$') -lt (& $maintenanceOrchestrationEventIndex $maintenanceAllStoppedLateAfterMarker.Events '^STEP 3/8 ') -and
+                    (@($maintenanceAllStoppedLateAfterMarker.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START BravoWeb'
+                ) `
+                -Name "Maintenance/LifecycleStopStepNotSkippedAfterActualStop" `
+                -Failure ("Maintenance: крок [3/8] не звітує SKIPPED, якщо фаза зупинки фактично зупинила службу, запущену вже після запису маркера, а служба стартує у finally; події: " + ($maintenanceAllStoppedLateAfterMarker.Events -join ' | '))
+
+            # Усі служби стояли, а стан exchangAPI у фазі зупинки не прочитано:
+            # критична помилка кроку [3/8] не ховається за SKIPPED.
+            $maintenanceAllStoppedUnreadable = & $maintenanceStartModeOutcome 'AllStoppedExchangeApiUnreadable'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceAllStoppedUnreadable.ProbeOk -and $maintenanceAllStoppedUnreadable.StepOrderOk -and
+                    @($maintenanceAllStoppedUnreadable.Events | Where-Object { $_ -ceq 'LOG-ERROR ПОМИЛКА: Помилка при зупинці служби exchangAPI: self-test: стан служби exchangAPI не прочитано' }).Count -eq 1 -and
+                    @($maintenanceAllStoppedUnreadable.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб FAIL' }).Count -eq 1 -and
+                    @($maintenanceAllStoppedUnreadable.Events | Where-Object { $_ -like 'STOP *' -or $_ -like 'START *' }).Count -eq 0
+                ) `
+                -Name "Maintenance/LifecycleStopStepFailureNotHiddenBySkipped" `
+                -Failure ("Maintenance: критична помилка у фазі зупинки, коли всі служби стояли, має давати [3/8] FAIL, а не SKIPPED; події: " + ($maintenanceAllStoppedUnreadable.Events -join ' | '))
+
+            # Призупинена оператором служба (Paused) — на старті чи вже після
+            # початкового знімка — Maintenance не зупиняє й не запускає (стан
+            # зберігається; намір її перезапуску знято й з маркера, щоб
+            # Health-watchdog не запустив її за осиротілим маркером), а
+            # призупинена BRAVO, як і до #360, не блокує обробку trace. У
+            # restore-прогоні утримувану призупинену службу без наміру бар'єр
+            # теж не зупиняє: реставрацію скасовано fail-closed ДО архіву.
+            $maintenancePausedOthers = & $maintenanceStartModeOutcome 'PausedServicesPreserved'
+            $maintenancePausedBravo = & $maintenanceStartModeOutcome 'BravoPausedPreserved'
+            $maintenancePausedHeld = & $maintenanceStartModeOutcome 'StartModePausedHeld'
+            $maintenancePausedAfterSnapshot = & $maintenanceStartModeOutcome 'PausedAfterSnapshot'
+            $maintenancePausedBeforeStop = & $maintenanceStartModeOutcome 'PausedBeforeStop'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenancePausedOthers.ProbeOk -and $maintenancePausedOthers.StepOrderOk -and
+                    (@($maintenancePausedOthers.Events | Where-Object { $_ -like 'STOP*' -or $_ -like 'START *' }) -join '|') -ceq 'STOP BRAVO|START BRAVO' -and
+                    (@($maintenancePausedOthers.Events | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO' -and
+                    @($maintenancePausedOthers.Events | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 1 -and
+                    @($maintenancePausedOthers.Events | Where-Object { $_ -like 'LOG-ERROR*' }).Count -eq 0 -and
+                    $maintenancePausedBravo.ProbeOk -and $maintenancePausedBravo.StepOrderOk -and
+                    @($maintenancePausedBravo.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (@($maintenancePausedBravo.Events | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BravoWeb|START exchangAPI' -and
+                    @($maintenancePausedBravo.Events | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 1 -and
+                    @($maintenancePausedBravo.Events | Where-Object { $_ -like 'LOG-ERROR*' }).Count -eq 0 -and
+                    $maintenancePausedHeld.ProbeOk -and $maintenancePausedHeld.StepOrderOk -and
+                    @($maintenancePausedHeld.Events | Where-Object { $_ -like 'STOP*BravoWeb' -or $_ -ceq 'START BravoWeb' }).Count -eq 0 -and
+                    @($maintenancePausedHeld.Native).Count -eq 0 -and
+                    $maintenancePausedHeld.RestoreCancelled -and
+                    $maintenancePausedAfterSnapshot.ProbeOk -and $maintenancePausedAfterSnapshot.StepOrderOk -and
+                    @($maintenancePausedAfterSnapshot.Events | Where-Object { $_ -like 'STOP*exchangAPI' -or $_ -ceq 'START exchangAPI' }).Count -eq 0 -and
+                    (@($maintenancePausedAfterSnapshot.Events | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb' -and
+                    @($maintenancePausedAfterSnapshot.Events | Where-Object { $_ -like 'LOG-ERROR*' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenancePausedAfterSnapshot.Events) -ceq 'exchangAPI' -and
+                    $maintenancePausedBeforeStop.ProbeOk -and $maintenancePausedBeforeStop.StepOrderOk -and
+                    @($maintenancePausedBeforeStop.Events | Where-Object { $_ -like 'STOP*exchangAPI' -or $_ -ceq 'START exchangAPI' }).Count -eq 0 -and
+                    @($maintenancePausedBeforeStop.Events | Where-Object { $_ -like 'LOG-ERROR *exchangAPI*пауза зберігається (#360)' }).Count -eq 1 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenancePausedBeforeStop.Events) -ceq 'exchangAPI'
+                ) `
+                -Name "Maintenance/LifecyclePausedServiceStateIsPreserved" `
+                -Failure ("Maintenance: призупинена (Paused) служба без наміру перезапуску не зупиняється й не запускається, а призупинена BRAVO не блокує обробку trace; події: " + ($maintenancePausedOthers.Events -join ' | ') + ' || ' + ($maintenancePausedBravo.Events -join ' | ') + ' || ' + ($maintenancePausedHeld.Events -join ' | ') + ' || ' + ($maintenancePausedAfterSnapshot.Events -join ' | ') + ' || ' + ($maintenancePausedBeforeStop.Events -join ' | '))
+
+            # Стан BRAVO перечитується безпосередньо перед ротацією trace: службу,
+            # яку інший актор підняв після воріт фази, ротація не чіпає (критична
+            # помилка), а знову піднята служба не лишається зупиненою.
+            $maintenanceLateBeforeTrace = & $maintenanceStartModeOutcome 'LateStartBeforeTrace'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateBeforeTrace.ProbeOk -and $maintenanceLateBeforeTrace.StepOrderOk -and
+                    $maintenanceLateBeforeTrace.ExitCode -eq 60 -and
+                    @($maintenanceLateBeforeTrace.Events | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 0 -and
+                    @($maintenanceLateBeforeTrace.Events | Where-Object { $_ -like 'LOG-ERROR *trace-файли не переміщено (#360)' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleTraceRotationRechecksBravoState" `
+                -Failure ("Maintenance: стан BRAVO має перечитуватися безпосередньо перед ротацією trace — службу, підняту після воріт фази, ротація не чіпає, прогін завершується критичною помилкою (60); події: " + ($maintenanceLateBeforeTrace.Events -join ' | '))
+
+            # Boot-recovery (характеризація): усі увімкнені керовані служби
+            # утримуються з наміром перезапуску незалежно від знімка.
+            $maintenanceBootLate = & $maintenanceStartModeOutcome 'BootRecoveryLateStart'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceBootLate.ProbeOk -and $maintenanceBootLate.StepOrderOk -and
+                    (@($maintenanceBootLate.Events | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
+                    @($maintenanceBootLate.Events | Where-Object { $_ -like 'MARKER-NO-RESTART *' }).Count -eq 0 -and
+                    $maintenanceBootLate.ServicesStarted -and $maintenanceBootLate.MarkerCleared
+                ) `
+                -Name "Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart" `
+                -Failure ("Maintenance (boot-recovery): усі увімкнені керовані служби мають бути в маркері з наміром перезапуску й стартувати у finally; події: " + ($maintenanceBootLate.Events -join ' | '))
         } finally {
             if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
                 Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
