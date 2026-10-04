@@ -1093,6 +1093,9 @@ function Invoke-ServiceStateChange {
                     -WarningAction SilentlyContinue `
                     -ErrorAction SilentlyContinue `
                     -ErrorVariable operationErrors
+                # Відхилений запит (помилка Stop-Service) — не зупинка Maintenance:
+                # якщо служба все ж стане Stopped, її зупинив інший актор (#360).
+                if (@($operationErrors).Count -gt 0) { $stateChangeIssued = $false }
             }
         }
 
