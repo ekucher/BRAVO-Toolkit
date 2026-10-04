@@ -2611,6 +2611,169 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         }
     }
 
+    # --- 6.21c. Regression (#357): провайдерна помилка під час проби
+    # НАЯВНОГО reparse-предка (не сам $Path, а предок, до якого цикл
+    # піднявся) має призводити до fail-closed ($true), а не до "предка
+    # немає" через ErrorActionPreference=Continue. Захищає конкретно
+    # семантику `-ErrorAction Stop` на викликові Test-Path усередині
+    # Test-BRAVODataRestorePathHasReparseAncestor: мутація, що її прибирає,
+    # перетворює термінальну провайдерну помилку в нетермінальну, яку цикл
+    # мовчки проковтує й піднімається вище, як якщо б предка не існувало.
+    # Seam — ізольований модуль з власним стабом Test-Path (не throw: throw
+    # лишився б термінальним і після видалення -ErrorAction Stop, і
+    # мутація хибно пройшла б як GREEN): реальний провайдер НІКОЛИ не
+    # викликається по недосяжному UNC/мережі; помилка симулюється лише для
+    # одного наперед відомого існуючого предка (PARENT) — GetFullPath/
+    # Split-Path/дочірні неіснуючі компоненти/предки вище йдуть крізь
+    # справжній Test-Path без модифікації, а Get-Item лишається
+    # незаторкнутим. Стаб інсталюється як `function script:Test-Path`
+    # УСЕРЕДИНІ самого динамічного модуля (а не через -FunctionNames
+    # New-BRAVOSelfTestRuntimeModule) — підміняє роздільну здатність лише
+    # для коду, dot-sourced у цьому модулі, і ніколи не потрапляє у
+    # глобальний Function:-drive caller-сесії, тож інші DataRestore-секції
+    # в тому ж suite завжди бачать справжній вбудований Test-Path. Стаб
+    # явно перевіряє $PSBoundParameters['ErrorAction'],
+    # а НЕ покладається на ambient $ErrorActionPreference: сам self-test
+    # (BRAVO_SELF_TEST.ps1:238) ставить $ErrorActionPreference='Stop'
+    # глобально для ВСЬОГО прогону, тож $PSCmdlet.WriteError без явного
+    # примусу стає термінальним незалежно від того, чи реальний виклик
+    # у runtime передав -ErrorAction Stop — мутація, що прибирає
+    # -ErrorAction Stop, лишилась би нерозрізненою (вакуумний тест). ------
+    $reparseProviderErrorRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_REPARSE_PROVIDER_ERROR_{0}" -f [guid]::NewGuid().ToString('N'))
+    # Реєстр динамічних модулів ДО створення наших двох (production +
+    # mutated) — дає можливість прибрати ЛИШЕ їхню матеріалізовану
+    # Test-BRAVODataRestorePathHasReparseAncestor одразу після
+    # використання, не чекаючи кінця всього suite DataRestore
+    # (New-BRAVOSelfTestRuntimeModule за замовчуванням експортує функції
+    # з -FunctionNames у ГЛОБАЛЬНИЙ Function:-drive; без негайного
+    # прибирання наступний unqualified виклик цього імені в тому ж suite
+    # міг би отримати mutated-версію замість справжньої production-логіки
+    # — сам стаб Test-Path тут глобально НЕ матеріалізується, див. коментар
+    # нижче). Знято ДО try: має бути завжди визначеним у finally, навіть
+    # якщо наступний крок (CreateDirectory) впаде.
+    $reparseProviderErrorOwnedStartIndex = $script:BRAVOSelfTestOwnedRuntimeModules.Count
+    try {
+        $reparseProviderErrorParent = Join-Path $reparseProviderErrorRoot 'PARENT'
+        [void][IO.Directory]::CreateDirectory($reparseProviderErrorParent)
+        $reparseProviderErrorSentinel = [IO.Path]::GetFullPath($reparseProviderErrorParent).TrimEnd('\', '/')
+        $reparseProviderErrorProbePath = Join-Path $reparseProviderErrorParent 'CHILD\NEW'
+
+        # Стаб інсталюється МОДУЛЬ-ЛОКАЛЬНО (function script:Test-Path у
+        # власному script-scope динамічного модуля), а не через
+        # -FunctionNames New-BRAVOSelfTestRuntimeModule: останній за
+        # замовчуванням матеріалізує ім'я у ГЛОБАЛЬНИЙ Function:-drive
+        # caller-сесії (прийнятно для project-specific
+        # Test-BRAVODataRestorePathHasReparseAncestor, але НЕ для
+        # вбудованого Test-Path — звідси й був latent-дефект: інкомплітний
+        # глобальний стаб без passthrough `-PathType`, що ламав будь-який
+        # інший виклик `Test-Path -PathType ...` у вікні між створенням
+        # модуля і прибиранням). `function script:Test-Path` всередині
+        # `& $Module { ... }` зв'язується з top-level script-scope САМЕ
+        # цього модуля — підміняє роздільну здатність лише для коду,
+        # dot-sourced у цьому ж модулі (production/mutated-функція), і
+        # ніколи не стає видимим за межами модуля.
+        $reparseProviderErrorStubInstaller = {
+            function script:Test-Path {
+                [CmdletBinding()]
+                param(
+                    [Parameter(Position = 0)]
+                    [string]$LiteralPath,
+                    [string]$Path
+                )
+                $probedPath = if ($PSBoundParameters.ContainsKey('LiteralPath')) { $LiteralPath } else { $Path }
+                if ($null -ne $script:BRAVOSelfTestReparseProviderErrorSentinel -and
+                    [string]::Equals($probedPath, $script:BRAVOSelfTestReparseProviderErrorSentinel, [StringComparison]::OrdinalIgnoreCase)) {
+                    if ($null -eq $script:BRAVOSelfTestReparseProviderErrorHitCount) { $script:BRAVOSelfTestReparseProviderErrorHitCount = 0 }
+                    $script:BRAVOSelfTestReparseProviderErrorHitCount++
+                    $exception = New-Object System.UnauthorizedAccessException("BRAVO-SELFTEST-SIMULATED-PROVIDER-ERROR: $probedPath")
+                    $errorRecord = New-Object System.Management.Automation.ErrorRecord(
+                        $exception, 'BRAVOSelfTestSimulatedProviderError',
+                        [System.Management.Automation.ErrorCategory]::PermissionDenied, $probedPath)
+                    $explicitErrorActionStop = $PSBoundParameters.ContainsKey('ErrorAction') -and
+                        $PSBoundParameters['ErrorAction'] -eq [System.Management.Automation.ActionPreference]::Stop
+                    if ($explicitErrorActionStop) {
+                        $PSCmdlet.ThrowTerminatingError($errorRecord)
+                    }
+                    # Явно 'Continue' для ЦЬОГО виклику, незалежно від ambient
+                    # $ErrorActionPreference='Stop' self-test-у — WriteError має бути
+                    # нетермінальним САМЕ тоді, коли викликач НЕ передав -ErrorAction
+                    # Stop явно (симуляція мутації, що прибирає цей аргумент).
+                    $local:ErrorActionPreference = 'Continue'
+                    $PSCmdlet.WriteError($errorRecord)
+                    return $false
+                }
+                return [bool](Microsoft.PowerShell.Management\Test-Path -LiteralPath $probedPath)
+            }
+        }
+
+        $reparseProviderErrorMutatedText = $dataRestoreRuntimeTextForTests.Replace(
+            'Test-Path -LiteralPath $current -ErrorAction Stop',
+            'Test-Path -LiteralPath $current'
+        )
+        Test-BRAVOCondition `
+            -Condition ($reparseProviderErrorMutatedText -ne $dataRestoreRuntimeTextForTests) `
+            -Name "DataRestore/ReparseAncestorProviderErrorMutationTargetFound" `
+            -Failure "Мутаційний seam для #357 не знайшов рядок 'Test-Path -LiteralPath `$current -ErrorAction Stop' у BRAVO.DataRestore.Runtime.ps1 — regression-тест не може довести RED без нього"
+
+        $reparseProviderErrorInvoke = {
+            param($Module, $Sentinel, $ProbePath)
+            & $Module {
+                param($s, $p)
+                $script:BRAVOSelfTestReparseProviderErrorSentinel = $s
+                $script:BRAVOSelfTestReparseProviderErrorHitCount = 0
+                $callError = ''
+                $callResult = $null
+                try {
+                    $callResult = Test-BRAVODataRestorePathHasReparseAncestor -Path $p
+                } catch {
+                    $callError = $_.Exception.Message
+                }
+                return [pscustomobject]@{
+                    Result   = $callResult
+                    HitCount = $script:BRAVOSelfTestReparseProviderErrorHitCount
+                    Error    = $callError
+                }
+            } $Sentinel $ProbePath
+        }
+
+        $reparseProviderErrorProductionModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $dataRestoreRuntimeTextForTests `
+            -FunctionNames @('Test-BRAVODataRestorePathHasReparseAncestor')
+        & $reparseProviderErrorProductionModule $reparseProviderErrorStubInstaller
+        $reparseProviderErrorProductionResult = & $reparseProviderErrorInvoke $reparseProviderErrorProductionModule $reparseProviderErrorSentinel $reparseProviderErrorProbePath
+
+        Test-BRAVOCondition `
+            -Condition (
+                $reparseProviderErrorProductionResult.Result -eq $true -and
+                $reparseProviderErrorProductionResult.HitCount -eq 1
+            ) `
+            -Name "DataRestore/ReparseAncestorProviderErrorFailsClosed" `
+            -Failure "Test-BRAVODataRestorePathHasReparseAncestor має fail-closed повертати `$true, коли Test-Path на НАЯВНОМУ предкові піднімає провайдерну помилку (симульовано non-terminating помилку, що стає термінальною через -ErrorAction Stop); отримано Result=$($reparseProviderErrorProductionResult.Result), HitCount=$($reparseProviderErrorProductionResult.HitCount), Error='$($reparseProviderErrorProductionResult.Error)'"
+
+        $reparseProviderErrorMutatedModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $reparseProviderErrorMutatedText `
+            -FunctionNames @('Test-BRAVODataRestorePathHasReparseAncestor')
+        & $reparseProviderErrorMutatedModule $reparseProviderErrorStubInstaller
+        $reparseProviderErrorMutatedResult = & $reparseProviderErrorInvoke $reparseProviderErrorMutatedModule $reparseProviderErrorSentinel $reparseProviderErrorProbePath
+
+        Test-BRAVOCondition `
+            -Condition (
+                $reparseProviderErrorMutatedResult.Result -eq $false -and
+                $reparseProviderErrorMutatedResult.HitCount -eq 1
+            ) `
+            -Name "DataRestore/ReparseAncestorProviderErrorMutationIsCaught" `
+            -Failure "Мутаційна перевірка (#357): видалення -ErrorAction Stop з Test-Path усередині Test-BRAVODataRestorePathHasReparseAncestor має перетворювати провайдерну помилку на нетермінальну, через що цикл мовчки піднімається вище і небезпечний шлях помилково приймається (Result=`$false); отримано Result=$($reparseProviderErrorMutatedResult.Result), HitCount=$($reparseProviderErrorMutatedResult.HitCount) — якщо це не так, тест вакуумний і не ловить цю мутацію"
+    } finally {
+        # Прибрати нашу матеріалізовану Test-BRAVODataRestorePathHasReparseAncestor
+        # з глобального Function:-drive негайно (ownership-aware — зачіпає
+        # лише наші два модулі), щоб наступні DataRestore-секції в тому ж
+        # suite не отримали mutated-версію замість справжньої.
+        Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $reparseProviderErrorOwnedStartIndex
+        if (Test-Path -LiteralPath $reparseProviderErrorRoot) {
+            Remove-Item -LiteralPath $reparseProviderErrorRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # --- 6.22. Служба, чий знімок мав WasRunning=$false (Stopped/
     # StartPending), але яка встигла перейти у нестабільний стан ДО
     # виклику зупинки (гонитва зі знімком), усе одно має бути зупинена;

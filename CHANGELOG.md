@@ -16,6 +16,68 @@
   `Maintenance/AlertQueueFinalReportIncludesCheckStatuses`,
   `Maintenance/FinalReportCheckLinesFailureKeepsAlert`.
 
+- **Fix: Maintenance не зупиняє службу, запущену після знімка стану, без ownership-маркера й наміру перезапуску (#360, #287).**
+  Знімок `$serviceWasRunning` знімався один раз на початку, а фаза зупинки діє за фактичним
+  станом. Служба, яку SCM autostart, recovery action чи оператор запустив між знімком і
+  зупинкою, зупинялася поза ownership-маркером і утриманням від автостарту. У не-restore прогоні
+  крок `[3/8]` друкувався як SKIPPED, після обслуговування служба лишалася зупиненою, а після
+  аварійного переривання її не піднімав і Health-watchdog. Тепер безпосередньо перед зупинкою
+  Maintenance перечитує фактичний стан увімкнених керованих служб: активна служба потрапляє в
+  ownership-маркер, але намір її перезапуску записується лише тоді, коли свіжий стан у фазі
+  зупинки підтверджує, що Maintenance справді її зупиняє (служба, яка встигла зупинитися сама,
+  після обслуговування не запускається; якщо вона зупинилася вже після запису наміру, але до
+  `Stop-Service` — напр. невдалий старт зі `StartPending` чи зупинка іншим актором, коли служба
+  вже у `StopPending`, — намір знімається й з маркера; службі у `StopPending`
+  `Invoke-ServiceStateChange` не надсилає `Stop-Service`, а лише чекає `Stopped`; відхилений
+  `Stop-Service` теж не вважається зупинкою Maintenance). Канонічний намір перезапуску: служба працювала
+  (Running/StartPending) на старті **або в момент її зупинки**, або намір успадковано (#349). Кожну зупинку пропускає `Confirm-BRAVOMaintenanceServiceStopContract`:
+  утримувана служба без наміру, яка зараз активна, отримує намір у маркері ДО зупинки (так само
+  перед повторною зупинкою бар'єром перед before-архівом; якщо намір не вдалося записати, бар'єр
+  службу не зупиняє, а реставрацію скасовано fail-closed). Служба поза маркером, запущена вже
+  після його запису в не-restore прогоні, не зупиняється (WARNING). exchangAPI зупиняється за
+  свіжим, а не закешованим на старті станом; збій читання цього стану — критична помилка кроку
+  `[3/8]`, а не «службу вже зупинено». Крок `[3/8]` звітує SKIPPED лише тоді, коли
+  жодної зупинки не пробували й нових попереджень чи помилок немає (раніше служба, яку
+  запустили вже після повторного читання стану, зупинялась під SKIPPED). #287: BRAVO і exchangAPI зупиняються й у стані
+  `StartPending`; `Invoke-ServiceStateChange` спершу чекає завершення старту
+  (`Wait-BRAVOServiceStartPendingSettled`: SCM відхиляє stop службі у `StartPending`). Перед
+  before-архівом утримувану службу, запущену після зупинки, Maintenance зупиняє сама тією самою
+  операцією (контракт маркера, потім `Invoke-ServiceStateChange` з окремим таймаутом для кожної
+  служби); бар'єр `Confirm-BRAVOServicesQuiesced` лишається останньою перевіркою і служби вже
+  не зупиняє (перезастосовує лише утримання `Disabled`): службу, запущену вже після його плану,
+  він не зупиняє поза контрактом маркера, а реставрацію скасовано fail-closed. Таку повторну
+  зупинку видно у звіті кроків окремим результатом WARN «Повторна зупинка служб перед
+  архівацією» (консоль, підсумок, фінальне сповіщення) — навіть коли `[3/8]` звітував SKIPPED. Реставрація й
+  обробка trace не виконуються над службою в перехідному стані (лише `Stopped` або `Paused`),
+  а стан BRAVO перечитується безпосередньо перед ротацією trace. Призупинена (`Paused`) служба
+  (а також `PausePending`/`ContinuePending`) не зупиняється й не запускається — і на старті, і коли її призупинили вже після знімка (BRAVO
+  Web раніше зупинялася й лишалася зупиненою); якщо в неї був намір перезапуску, його знято й з
+  маркера, тож Health-watchdog після аварійного переривання її не запустить; у restore-прогоні така утримувана служба
+  скасовує реставрацію fail-closed ДО архіву. Служба, зупинена і на старті, і перед зупинкою, як
+  і раніше не запускається; `Disabled` (оператор) не чіпається; boot-recovery без змін. Нові
+  сценарії оркестрації:
+  `Maintenance/LifecycleEveryStopHasRestartContract` (перевіряє всі сценарії),
+  `Maintenance/LifecycleLateStartBeforeStopIsOwnedAndRestarted`,
+  `Maintenance/LifecycleLateStartIntentRecordedOnlyAtStop`,
+  `Maintenance/LifecycleIntentRevokedWhenServiceStopsByItself`,
+  `Maintenance/LifecycleStartPendingIsStoppedAndRestarted`,
+  `Maintenance/LifecycleLateStartRestartedAfterStepThrows`,
+  `Maintenance/LifecycleOperatorDisabledServiceNeverTouched`,
+  `Maintenance/LifecycleServiceStartedAfterContractIsNotStopped`,
+  `Maintenance/LifecycleRestoreLateStartGetsRestartIntentBeforeStop`,
+  `Maintenance/LifecycleIntentWriteFailureNeverStopsService`,
+  `Maintenance/LifecycleStuckStartPendingGetsNoTraceProcessing`,
+  `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`,
+  `Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending`,
+  `Maintenance/LifecyclePreArchiveBarrierStopIsReported`,
+  `Maintenance/LifecycleFinalBarrierNeverStopsOutsideContract`,
+  `Maintenance/LifecycleUnreadableServiceStateIsNotStopped`,
+  `Maintenance/LifecyclePendingPauseIsNotRestarted`,
+  `Maintenance/LifecycleStopStepNotSkippedAfterActualStop`,
+  `Maintenance/LifecycleStopStepFailureNotHiddenBySkipped`,
+  `Maintenance/LifecyclePausedServiceStateIsPreserved`,
+  `Maintenance/LifecycleTraceRotationRechecksBravoState`.
+
 - **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
   На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
   піднімає помилку провайдера замість `$false`; під `$ErrorActionPreference = 'Stop'`
