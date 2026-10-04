@@ -2,6 +2,19 @@
 
 ## Не випущено (developer)
 
+- **Fix: очікувані помилки змодельованих сценаріїв self-test більше не червоні.**
+  Сценарії на кшталт `Maintenance/M3-MaintenanceTargetInsufficientBlocks` проганяють
+  справжній `Write-Log`, і очікувані в них ERROR/WARNING («ПОМИЛКА: Недостатньо вільного
+  місця…», `BelowHealthFloorNoFreeSpaceRequirement`, `MaintenanceTargetUndetermined`)
+  друкувались червоним/жовтим одразу після `[PASS]`, тож успішний прогін виглядав як збій.
+  `BRAVO_SELF_TEST.ps1` на час прогону виставляє `BRAVO_SELFTEST_SIMULATED_OUTPUT=1` і
+  відновлює попереднє значення у зовнішньому `finally`; під цією змінною
+  `Write-BRAVOConsoleDetail` (BRAVO.Console) друкує Red/Yellow деталі кольором DarkGray.
+  Вердикт self-test (`[FAIL]`, `SELF-TEST FAILED`) друкується напряму і лишається червоним;
+  production-консоль без змінної не змінюється. Нові перевірки:
+  `ConsoleUX/34-SelfTestSimulatedErrorsNotRed`,
+  `ConsoleUX/35-SelfTestSetsAndRestoresSimulatedOutputFlag`.
+
 - **Fix: перевищення порогу діапазонів ID більше не ховає решту перевірок Maintenance у сповіщенні.**
   Коли `Test-RangeIdUsage` фіксував перевищення порогу (`range_id_log.json`), запис потрапляв у
   `CriticalErrorsList`, і `Send-FinalReport` будував фінальне сповіщення ЛИШЕ з цього списку:
