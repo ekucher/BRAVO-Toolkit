@@ -16,11 +16,14 @@
   службу не зупиняє, а реставрацію скасовано fail-closed). Служба поза маркером, запущена вже
   після його запису в не-restore прогоні, не зупиняється (WARNING). exchangAPI зупиняється за
   свіжим, а не закешованим на старті станом. #287: BRAVO і exchangAPI зупиняються й у стані
-  `StartPending`; `Invoke-ServiceStateChange` і бар'єр перед before-архівом спершу чекають
-  завершення старту (`Wait-BRAVOServiceStartPendingSettled`: SCM відхиляє stop службі у
-  `StartPending`), а реставрація й обробка trace не виконуються над службою в перехідному стані
-  (лише `Stopped` або `Paused`). Призупинена (`Paused`) чи інша перехідна служба без наміру
-  перезапуску не зупиняється (стан зберігається, як і до цієї зміни для BRAVO/exchangAPI; BRAVO
+  `StartPending`; `Invoke-ServiceStateChange` спершу чекає завершення старту
+  (`Wait-BRAVOServiceStartPendingSettled`: SCM відхиляє stop службі у `StartPending`). Перед
+  before-архівом утримувану службу, запущену після зупинки, Maintenance зупиняє сама тією самою
+  операцією (контракт маркера, потім `Invoke-ServiceStateChange` з окремим таймаутом для кожної
+  служби); бар'єр `Confirm-BRAVOServicesQuiesced` лишається останньою перевіркою. Реставрація й
+  обробка trace не виконуються над службою в перехідному стані (лише `Stopped` або `Paused`),
+  а стан BRAVO перечитується безпосередньо перед ротацією trace. Призупинена (`Paused`) служба
+  не зупиняється й не запускається — і на старті, і коли її призупинили вже після знімка (BRAVO
   Web раніше зупинялася й лишалася зупиненою); у restore-прогоні така утримувана служба
   скасовує реставрацію fail-closed ДО архіву. Служба, зупинена і на старті, і перед зупинкою, як
   і раніше не запускається; `Disabled` (оператор) не чіпається; boot-recovery без змін. Нові
@@ -36,7 +39,8 @@
   `Maintenance/LifecycleStuckStartPendingGetsNoTraceProcessing`,
   `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`,
   `Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending`,
-  `Maintenance/LifecyclePausedServiceStateIsPreserved`.
+  `Maintenance/LifecyclePausedServiceStateIsPreserved`,
+  `Maintenance/LifecycleTraceRotationRechecksBravoState`.
 
 - **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
   На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
