@@ -8808,13 +8808,15 @@ foreach ($managedService in $maintenanceManagedServices) {
     $managedServiceStatus = [string](Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue).Status
     if ($managedServiceStatus -notin @('Running', 'StartPending')) { continue }
     $serviceActiveBeforeStop[$managedService.Key] = $true
+    # Намір перезапуску тут НЕ записується: служба може зупинитися сама до
+    # фази зупинки. Його записує Confirm-BRAVOMaintenanceServiceStopContract
+    # за свіжим станом безпосередньо перед зупинкою (#360).
     if (-not $serviceWasRunning[$managedService.Key]) {
-        $serviceWasRunning[$managedService.Key] = $true
         $lateStartedServiceNames += "$($managedService.Name) ($managedServiceStatus)"
     }
 }
 if ($lateStartedServiceNames.Count -gt 0) {
-    Write-Log -Message "Службу(и) запущено після початкового знімка стану (SCM autostart/recovery або інший актор): $($lateStartedServiceNames -join ', ') — Maintenance зупинить їх під ownership-маркером і запустить після обслуговування (#360)" -Level "INFO"
+    Write-Log -Message "Службу(и) запущено після початкового знімка стану (SCM autostart/recovery або інший актор): $($lateStartedServiceNames -join ', ') — якщо вони лишаться активними до фази зупинки, Maintenance запише намір їх перезапуску в ownership-маркер, зупинить їх і запустить після обслуговування (#360)" -Level "INFO"
 }
 
 # Усі операції зі зупиненими службами захищені finally. Навіть необроблена
@@ -8865,7 +8867,8 @@ $script:startModeRestoreIncomplete = $false
 # що працювали на старті.
 $quiescenceHoldAllManaged = [bool]$shouldRestore
 # #360: до маркера потрапляє й кожна служба, що працювала (Running/
-# StartPending) перед зупинкою, — з наміром перезапуску.
+# StartPending) перед зупинкою; намір її перезапуску записується лише тоді,
+# коли свіжий стан у фазі зупинки підтвердить, що її справді зупиняють.
 $quiescenceServices = @()
 if ($serviceWasRunning.Bravo -or $serviceActiveBeforeStop.Bravo -or ($quiescenceHoldAllManaged -and $BravoMaintenanceEnabled)) {
     $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = [bool]$serviceWasRunning.Bravo }
@@ -8943,6 +8946,34 @@ function Restore-BRAVOMaintenanceQuiescenceAutostart {
     }
 }
 
+function Clear-BRAVOMaintenancePausedServiceRestartIntent {
+    # #360: призупинену службу Maintenance не зупиняє й не запускає. Якщо в неї
+    # був намір перезапуску (працювала на старті), намір знімається й у
+    # ownership-маркері (RestartIntent=false): інакше Health-watchdog за
+    # осиротілим маркером запустив би призупинену службу. Збій запису не
+    # фатальний (WARNING): graceful finally призупинену службу й так не запускає.
+    param(
+        [string]$Key,
+        [string]$Name,
+        [string]$Status
+    )
+    if ($Status -notin @('Paused', 'PausePending', 'ContinuePending') -or -not $serviceWasRunning[$Key]) { return }
+    $serviceWasRunning[$Key] = $false
+    foreach ($intentEntry in @($quiescenceServices | Where-Object { [string]$_.Name -ieq $Name })) { $intentEntry.RestartIntent = $false }
+    if (-not $script:quiescenceMarkerWrittenThisRun) { return }
+    try {
+        [void](Write-BRAVOServiceQuiescenceState `
+            -Owner 'BRAVO_MAINTENANCE' `
+            -Services $quiescenceServices `
+            -LogFile ([string]$LOG_FILE) `
+            -RestartSuppressed:([bool]$script:quiescenceMarkerSuppressedForRestore) `
+            -StartTypeSnapshot $script:startTypeSnapshot)
+        Write-Log -Message "Службу $Name призупинено (стан: $Status) — намір її перезапуску знято з ownership-маркера (#360)" -Level "INFO"
+    } catch {
+        Write-Log -Message "Не вдалося зняти намір перезапуску призупиненої служби $Name з ownership-маркера (#360): $($_.Exception.Message) — при жорсткому перериванні прогону Health-watchdog може її запустити" -Level "WARNING"
+    }
+}
+
 function Confirm-BRAVOMaintenanceServiceStopContract {
     # #360: lifecycle-інваріант — службу зупиняють лише тоді, коли чинний
     # ownership-маркер уже містить її з наміром перезапуску. $true = можна
@@ -8965,6 +8996,7 @@ function Confirm-BRAVOMaintenanceServiceStopContract {
         # паузу оператора на Running. StopPending без наміру зупиняється сама,
         # без контракту на перезапуск. Стан зберігається, як і до #360.
         Write-Log -Message "Служба $Name у стані $Status — Maintenance її не зупиняє, стан збережено (#360)" -Level "INFO"
+        Clear-BRAVOMaintenancePausedServiceRestartIntent -Key $Key -Name $Name -Status $Status
         return $false
     }
     if (@($script:quiescedServiceNames | Where-Object { [string]$_ -ieq $Name }).Count -eq 0) {
@@ -9030,6 +9062,7 @@ function Get-BRAVOMaintenancePreArchiveBarrierPlan {
             $stoppedAgain += $managedService.Name
         } elseif ([string]$serviceResult.FinalStatus -in @('Paused', 'PausePending', 'ContinuePending')) {
             # Призупинену службу бар'єр теж не зупиняє — реставрацію скасовано.
+            Clear-BRAVOMaintenancePausedServiceRestartIntent -Key $managedService.Key -Name $managedService.Name -Status ([string]$serviceResult.FinalStatus)
             $contractFailures += "$($managedService.Name): $($serviceResult.Error)"
         }
         # Не зупинилась з іншої причини — бар'єр нижче зафіксує її як порушника.
@@ -9062,6 +9095,7 @@ if ($BravoWebMaintenanceEnabled) {
             if ($serviceResult.Success) {
                 Write-Log -Message "Службу BRAVO Web успішно зупинено" -Level "SUCCESS"
             } else {
+                Clear-BRAVOMaintenancePausedServiceRestartIntent -Key 'BravoWeb' -Name $BravoWebServiceName -Status ([string]$serviceResult.FinalStatus)
                 throw $serviceResult.Error
             }
         } elseif ([string]$ApacheService.Status -eq 'Stopped') {
@@ -9093,6 +9127,7 @@ if ($exchangAPIServiceEnabled) {
         if ($serviceResult.Success) {
             Write-Log -Message "Служба $ExchangAPIServiceName успішно зупинена" -Level "SUCCESS"
         } else {
+            Clear-BRAVOMaintenancePausedServiceRestartIntent -Key 'ExchangeApi' -Name $ExchangAPIServiceName -Status ([string]$serviceResult.FinalStatus)
             $errorMsg = "Не вдалося зупинити службу ${ExchangAPIServiceName}: $($serviceResult.Error)"
             Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
             Send-SlackAlert -Message $errorMsg -IsCritical
@@ -9126,6 +9161,7 @@ if ($BravoMaintenanceEnabled) {
             if ($serviceResult.Success) {
                 Write-Log -Message "Служба $BravoServiceName успішно зупинена" -Level "SUCCESS"
             } else {
+                Clear-BRAVOMaintenancePausedServiceRestartIntent -Key 'Bravo' -Name $BravoServiceName -Status ([string]$serviceResult.FinalStatus)
                 $errorMsg = "$BravoServiceName не зупинився автоматично: $($serviceResult.Error)"
                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
                 Send-SlackAlert -Message $errorMsg -IsCritical
