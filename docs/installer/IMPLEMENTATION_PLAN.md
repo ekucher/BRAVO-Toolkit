@@ -154,7 +154,7 @@ GUI не має власної deployment policy.
 
 ## 13. Phase 10 — scheduled update
 
-Scheduled update вводиться після acceptance manual transactional update.
+Scheduled update розділяється за рівнем mutation. `NotifyOnly`/read-only check може проєктуватися окремо після появи стабільного canonical check path. `StageOnly` потребує окремого approved contract для acquire/verify/stage без activation. `Automatic` production mutation **не входить у P3.2a** і залишається hard-blocked до завершення та acceptance повного P3.2 (versioned release directories, deployment pointer, staging/validation, atomic activation, automatic rollback, update journal).
 
 - **INS-110 — Update Check Scheduled Task.** Запускає canonical update/check path.
 - **INS-111 — Update policy.** `NotifyOnly`, `StageOnly`, `Automatic`; default `NotifyOnly`.
@@ -163,7 +163,7 @@ Scheduled update вводиться після acceptance manual transactional u
 - **INS-114 — Stage-only mode**
 - **INS-115 — Maintenance window**
 - **INS-116 — Automatic preflight**
-- **INS-117 — Scheduled automatic deployment**
+- **INS-117 — Scheduled automatic deployment.** Gate: full P3.2 accepted; не реалізовувати як розширення P3.2a
 - **INS-118 — Scheduled rollback**
 - **INS-119 — Result notification**
 - **INS-120 — Update Settings UI**
@@ -182,7 +182,7 @@ Unsafe/ambiguous preflight означає skip, не force.
 - **INS-137 — Interruption/recovery acceptance**
 - **INS-138 — Scheduled `NotifyOnly`**
 - **INS-139 — Scheduled `StageOnly`**
-- **INS-140 — Scheduled `Automatic`**
+- **INS-140 — Scheduled `Automatic`.** Acceptance тільки після full P3.2 gate
 - **INS-141 — Full BRAVO self-test**
 - **INS-142 — Fresh independent review**
 
@@ -197,7 +197,7 @@ BRAVO validation evidence використовує `powershell.exe`; `pwsh` не
 - **INS-154 — Automatic update pilot**
 - **INS-155 — Fleet rollout decision**
 
-Automatic update є останнім pilot mode, а не першим.
+Automatic update є останнім pilot mode, а не першим, і не допускається до pilot до завершення та acceptance full P3.2.
 
 ## 16. Рекомендована перша implementation wave
 
