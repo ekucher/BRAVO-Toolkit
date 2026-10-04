@@ -2054,7 +2054,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
                     $parseTokens = $null
                     $parseErrors = $null
                     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root $candidate), [ref]$parseTokens, [ref]$parseErrors)
-                    foreach ($fd in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                    foreach ($fd in $ast.FindAll((Get-BRAVOSelfTestAstTypePredicate -Type @([Management.Automation.Language.FunctionDefinitionAst])), $true)) {
                         [void]$names.Add(($fd.Name -replace '^(global|script):', ''))
                     }
                     $parsedFunctionSet[$candidate] = $names
@@ -5376,18 +5376,18 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/GenericObjectListBinderGate') {
 
         # Крок 1: розбір, вузли, визначення функцій з метаданими параметрів,
         # локальні присвоєння для затінення.
+        $unitNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
+            [System.Management.Automation.Language.AssignmentStatementAst],
+            [System.Management.Automation.Language.CommandAst],
+            [System.Management.Automation.Language.CommandExpressionAst],
+            [System.Management.Automation.Language.ArrayExpressionAst],
+            [System.Management.Automation.Language.HashtableAst],
+            [System.Management.Automation.Language.FunctionDefinitionAst])
         foreach ($sourceItem in $Source) {
             $unitAst = [System.Management.Automation.Language.Parser]::ParseInput([string]$sourceItem.Text, [ref]$null, [ref]$null)
-            # Предикат через $args[0], а не param(): прив'язка параметрів
-            # скриптблоку на кожному вузлі AST утричі дорожча.
-            $unitNodes = @($unitAst.FindAll({
-                        $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -or
-                        $args[0] -is [System.Management.Automation.Language.CommandAst] -or
-                        $args[0] -is [System.Management.Automation.Language.CommandExpressionAst] -or
-                        $args[0] -is [System.Management.Automation.Language.ArrayExpressionAst] -or
-                        $args[0] -is [System.Management.Automation.Language.HashtableAst] -or
-                        $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
-                    }, $true))
+            # Предикат скомпільовано один раз (Get-BRAVOSelfTestAstTypePredicate):
+            # scriptblock на кожному вузлі AST був основною вартістю обходу.
+            $unitNodes = @($unitAst.FindAll($unitNodePredicate, $true))
             $unit = [pscustomobject]@{
                 Name             = [string]$sourceItem.Name
                 Sources          = @{}
