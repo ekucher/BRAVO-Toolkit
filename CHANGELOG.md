@@ -22,7 +22,9 @@
   службу не зупиняє, а реставрацію скасовано fail-closed). Служба поза маркером, запущена вже
   після його запису в не-restore прогоні, не зупиняється (WARNING). exchangAPI зупиняється за
   свіжим, а не закешованим на старті станом; збій читання цього стану — критична помилка кроку
-  `[3/8]`, а не «службу вже зупинено». #287: BRAVO і exchangAPI зупиняються й у стані
+  `[3/8]`, а не «службу вже зупинено». Крок `[3/8]` звітує SKIPPED лише тоді, коли
+  жодної зупинки не пробували й нових попереджень чи помилок немає (раніше служба, яку
+  запустили вже після повторного читання стану, зупинялась під SKIPPED). #287: BRAVO і exchangAPI зупиняються й у стані
   `StartPending`; `Invoke-ServiceStateChange` спершу чекає завершення старту
   (`Wait-BRAVOServiceStartPendingSettled`: SCM відхиляє stop службі у `StartPending`). Перед
   before-архівом утримувану службу, запущену після зупинки, Maintenance зупиняє сама тією самою
@@ -57,6 +59,8 @@
   `Maintenance/LifecycleFinalBarrierNeverStopsOutsideContract`,
   `Maintenance/LifecycleUnreadableServiceStateIsNotStopped`,
   `Maintenance/LifecyclePendingPauseIsNotRestarted`,
+  `Maintenance/LifecycleStopStepNotSkippedAfterActualStop`,
+  `Maintenance/LifecycleStopStepFailureNotHiddenBySkipped`,
   `Maintenance/LifecyclePausedServiceStateIsPreserved`,
   `Maintenance/LifecycleTraceRotationRechecksBravoState`.
 

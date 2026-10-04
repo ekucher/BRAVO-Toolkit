@@ -8822,10 +8822,17 @@ $serviceActiveBeforeStop = @{ Bravo = $false; ExchangeApi = $false; BravoWeb = $
 # Намір перезапуску, записаний Confirm-BRAVOMaintenanceServiceStopContract у
 # поточній операції зупинки (див. Complete-BRAVOMaintenanceServiceStop).
 $serviceIntentPromotedAtStop = @{ Bravo = $false; ExchangeApi = $false; BravoWeb = $false }
+# Чи пропустив контракт хоча б одну зупинку в цьому прогоні: крок [3/8] не
+# звітує SKIPPED після фактичної спроби зупинки, навіть коли на обох читаннях
+# стану (знімок і повторне читання) служби стояли (#360).
+$script:maintenanceServiceStopAttempted = $false
 $lateStartedServiceNames = @()
 foreach ($managedService in $maintenanceManagedServices) {
     if (-not $managedService.Enabled) { continue }
-    $managedServiceStatus = [string](Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue).Status
+    # Нечитабельний стан тут не вважається активним (і не обриває прогін під
+    # Set-StrictMode): фаза зупинки перечитує стан і обробляє збій як помилку.
+    $managedServiceObject = Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue
+    $managedServiceStatus = if ($managedServiceObject) { [string]$managedServiceObject.Status } else { '' }
     if ($managedServiceStatus -notin @('Running', 'StartPending')) { continue }
     $serviceActiveBeforeStop[$managedService.Key] = $true
     # Намір перезапуску тут НЕ записується: служба може зупинитися сама до
@@ -9081,6 +9088,7 @@ function Confirm-BRAVOMaintenanceServiceStopContract {
         $serviceIntentPromotedAtStop[$Key] = $true
         Write-Log -Message "Службу $Name запущено після початкового знімка (стан: $Status) — намір перезапуску записано в ownership-маркер до її зупинки (#360)" -Level "INFO"
     }
+    $script:maintenanceServiceStopAttempted = $true
     return $true
 }
 
@@ -9100,7 +9108,13 @@ function Get-BRAVOMaintenancePreArchiveBarrierPlan {
     foreach ($managedService in $maintenanceManagedServices) {
         if (-not $managedService.Enabled -or
             @($script:quiescedServiceNames | Where-Object { [string]$_ -ieq $managedService.Name }).Count -eq 0) { continue }
-        $serviceStatus = [string](Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue).Status
+        $barrierService = Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue
+        if (-not $barrierService) {
+            # Стан невідомий — не «зупинена»: реставрацію скасовано fail-closed.
+            $contractFailures += "$($managedService.Name): стан служби не прочитано (#360)"
+            continue
+        }
+        $serviceStatus = [string]$barrierService.Status
         if ([string]::IsNullOrEmpty($serviceStatus) -or $serviceStatus -eq 'Stopped') { continue }
         if (-not (Confirm-BRAVOMaintenanceServiceStopContract `
                     -Key $managedService.Key `
@@ -9266,7 +9280,9 @@ Write-BRAVOMaintenanceStep `
     -Status (Get-BRAVOMaintenanceStepStatus `
         -CriticalBefore $stopServicesCriticalBefore `
         -WarningsBefore $stopServicesWarningsBefore `
-        -Skipped:(-not $stopServicesRequired))
+        -Skipped:(-not $stopServicesRequired -and -not $script:maintenanceServiceStopAttempted -and
+            $script:BRAVOWarningCount -eq $stopServicesWarningsBefore -and
+            $script:criticalErrorOccurred -eq $stopServicesCriticalBefore))
 
 # ===== ПЕРЕВІРКА РОЗМІРІВ ФАЙЛІВ .md =====
 Write-BRAVOProgressPhase -Phase 'Перевірка розмірів .md' -PercentComplete 35
