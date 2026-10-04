@@ -9010,7 +9010,7 @@ function Complete-BRAVOMaintenanceServiceStop {
     # #360: підсумок операції зупинки для lifecycle-контракту. Призупинена
     # служба втрачає намір перезапуску. Намір, записаний Confirm-контрактом
     # саме для цієї зупинки, знімається, якщо Invoke-ServiceStateChange не
-    # надсилав Stop-Service: служба зупинилася сама (напр. невдалий старт зі
+    # надсилав Stop-Service (успішно чи ні): служба зупинилася сама (напр. невдалий старт зі
     # StartPending), Maintenance її не зупиняла й не повинна запускати.
     param(
         [string]$Key,
@@ -9018,8 +9018,11 @@ function Complete-BRAVOMaintenanceServiceStop {
         [object]$Result
     )
     Clear-BRAVOMaintenancePausedServiceRestartIntent -Key $Key -Name $Name -Status ([string]$Result.FinalStatus)
+    # Незалежно від Success: і після таймауту чи помилки операції служба, якій
+    # Maintenance не надсилала Stop-Service, може зупинитися сама — тоді
+    # finally чи watchdog запустили б її без підстав.
     if ($serviceIntentPromotedAtStop[$Key] -and $serviceWasRunning[$Key] -and
-        [bool]$Result.Success -and -not [bool]$Result.StateChangeIssued) {
+        -not [bool]$Result.StateChangeIssued) {
         Revoke-BRAVOMaintenanceServiceRestartIntent -Key $Key -Name $Name -Reason 'служба зупинилася сама до того, як Maintenance її зупинила'
     }
     $serviceIntentPromotedAtStop[$Key] = $false

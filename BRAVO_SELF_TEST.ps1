@@ -13938,7 +13938,7 @@ function Get-Service {
         if ([int]$script:ProbePendingReads[$Name] -gt 3) { $script:ProbeServices[$Name] = $(if (@($script:ProbeStartFails) -contains $Name) { 'Stopped' } else { 'Running' }) }
     }
     # Зупинка, яку почав інший актор (StopPending), завершується сама.
-    if ($probeStatus -eq 'StopPending') { $script:ProbeServices[$Name] = 'Stopped' }
+    if ($probeStatus -eq 'StopPending' -and @($script:ProbeStickyStopPending) -notcontains $Name) { $script:ProbeServices[$Name] = 'Stopped' }
     $probeService = [pscustomobject]@{ Name = $Name; Status = $probeStatus }
     $probeService | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
     return $probeService
@@ -14314,7 +14314,7 @@ try {
     # зупиненими службами, які інший актор запускає вже після знімка.
     $probeServiceTable = if ($Scenario -eq 'ThrowInSizeCheck') {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Running' }"
-    } elseif (@('LateStartAllStopped', 'LateStartPending', 'LateStartThrow', 'BootRecoveryLateStart', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped') -contains $Scenario) {
+    } elseif (@('LateStartAllStopped', 'LateStartPending', 'LateStartThrow', 'BootRecoveryLateStart', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck') -contains $Scenario) {
         "@{ 'BRAVO' = 'Stopped'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Stopped' }"
     } elseif ($Scenario -eq 'LateStartPartial') {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Stopped' }"
@@ -14348,6 +14348,8 @@ try {
         ('$script:ProbeMarkerWriteFailFrom = {0}' -f $(if ($Scenario -eq 'StartModeLateAfterStopMarkerFailInitiallyStopped') { '2' } else { '0' })),
         # StuckStartPending: старт BRAVO не завершується (StartPending назавжди).
         ('$script:ProbeStickyPending = {0}' -f $(if ($Scenario -eq 'StuckStartPending') { "@('BRAVO')" } else { '@()' })),
+        # LateStartStopPendingStuck: чужа зупинка не завершується до таймауту.
+        ('$script:ProbeStickyStopPending = {0}' -f $(if ($Scenario -eq 'LateStartStopPendingStuck') { "@('BRAVO')" } else { '@()' })),
         ('$script:ProbeStopRejected = {0}' -f $(if ($Scenario -eq 'LateStartStopRejectedSelfStopped') { "@('BRAVO')" } else { '@()' })),
         ('$script:ProbeStartFails = {0}' -f $(if ($Scenario -eq 'LateStartPendingFailsBeforeStop' -or $Scenario -eq 'InitiallyStartPendingFails') { "@('BRAVO')" } else { '@()' })),
         ('$script:ProbeLateStart = {0}' -f $(switch ($Scenario) {
@@ -14355,6 +14357,7 @@ try {
                 'LateStartSelfStoppedBeforeStop' { "@{ 'BRAVO' = 'Running' }" }
                 'LateStartStopPendingBeforeStop' { "@{ 'BRAVO' = 'Running' }" }
                 'LateStartStopRejectedSelfStopped' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartStopPendingStuck' { "@{ 'BRAVO' = 'Running' }" }
                 'LateStartThrow' { "@{ 'BRAVO' = 'Running' }" }
                 'BootRecoveryLateStart' { "@{ 'BRAVO' = 'Running' }" }
                 'LateStartOperatorDisabled' { "@{ 'BRAVO' = 'Running' }" }
@@ -14371,6 +14374,7 @@ try {
                 'PausedBeforeStop' { "@{ 'exchangAPI' = 'Paused' }" }
                 # Інший актор уже зупиняє службу між контрактом і Stop-Service.
                 'LateStartStopPendingBeforeStop' { "@{ 'BRAVO' = 'StopPending' }" }
+                'LateStartStopPendingStuck' { "@{ 'BRAVO' = 'StopPending' }" }
                 default { '@{}' }
             })),
         ('$script:ProbeLateStartAfterStop = {0}' -f $(switch ($Scenario) {
@@ -14493,7 +14497,7 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped', 'StartModeLatePendingAfterStopInitiallyStopped', 'PausedServicesPreserved', 'BravoPausedPreserved', 'StartModePausedHeld', 'PausedAfterSnapshot', 'LateStartBeforeTrace', 'PausedBeforeStop', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'InitiallyStartPendingFails', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped')) {
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped', 'StartModeLatePendingAfterStopInitiallyStopped', 'PausedServicesPreserved', 'BravoPausedPreserved', 'StartModePausedHeld', 'PausedAfterSnapshot', 'LateStartBeforeTrace', 'PausedBeforeStop', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'InitiallyStartPendingFails', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck')) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
                 $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
@@ -14947,6 +14951,7 @@ try {
             $maintenanceInitialPendingFails = & $maintenanceStartModeOutcome 'InitiallyStartPendingFails'
             $maintenanceLateStopPending = & $maintenanceStartModeOutcome 'LateStartStopPendingBeforeStop'
             $maintenanceLateStopRejected = & $maintenanceStartModeOutcome 'LateStartStopRejectedSelfStopped'
+            $maintenanceLateStopPendingStuck = & $maintenanceStartModeOutcome 'LateStartStopPendingStuck'
             Test-BRAVOCondition `
                 -Condition (
                     $maintenanceLatePendingFails.ProbeOk -and $maintenanceLatePendingFails.StepOrderOk -and
@@ -14968,10 +14973,15 @@ try {
                     $maintenanceLateStopRejected.ProbeOk -and $maintenanceLateStopRejected.StepOrderOk -and
                     @($maintenanceLateStopRejected.Events | Where-Object { $_ -ceq 'STOP-REJECTED BRAVO' }).Count -eq 1 -and
                     @($maintenanceLateStopRejected.Events | Where-Object { $_ -ceq 'START BRAVO' }).Count -eq 0 -and
-                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopRejected.Events) -ceq 'BRAVO'
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopRejected.Events) -ceq 'BRAVO' -and
+                    # Чужа зупинка (StopPending) не завершилась до таймауту: операція
+                    # невдала, але Stop-Service не надсилався — намір теж знято.
+                    $maintenanceLateStopPendingStuck.ProbeOk -and $maintenanceLateStopPendingStuck.StepOrderOk -and
+                    @($maintenanceLateStopPendingStuck.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopPendingStuck.Events) -ceq 'BRAVO'
                 ) `
                 -Name "Maintenance/LifecycleIntentRevokedWhenServiceStopsByItself" `
-                -Failure ("Maintenance: намір перезапуску, записаний перед зупинкою, має бути знятий (і в маркері), якщо служба зупинилася сама до Stop-Service — finally її не запускає; події: " + ($maintenanceLatePendingFails.Events -join ' | ') + ' || ' + ($maintenanceInitialPendingFails.Events -join ' | ') + ' || ' + ($maintenanceLateStopPending.Events -join ' | ') + ' || ' + ($maintenanceLateStopRejected.Events -join ' | '))
+                -Failure ("Maintenance: намір перезапуску, записаний перед зупинкою, має бути знятий (і в маркері), якщо служба зупинилася сама до Stop-Service — finally її не запускає; події: " + ($maintenanceLatePendingFails.Events -join ' | ') + ' || ' + ($maintenanceInitialPendingFails.Events -join ' | ') + ' || ' + ($maintenanceLateStopPending.Events -join ' | ') + ' || ' + ($maintenanceLateStopRejected.Events -join ' | ') + ' || ' + ($maintenanceLateStopPendingStuck.Events -join ' | '))
 
             # #287: служба у StartPending (на момент знімка або після нього)
             # зупиняється після завершення старту (stop не надсилається, поки SCM
