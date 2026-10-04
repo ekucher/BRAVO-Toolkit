@@ -1082,7 +1082,10 @@ function Invoke-ServiceStateChange {
                     Error = "службу призупинено (стан: $($service.Status)) — не зупинено, пауза зберігається (#360)"
                 }
             }
-            if ([string]$service.Status -ne 'Stopped') {
+            # StopPending: службу вже зупиняє інший актор — Stop-Service не
+            # надсилається, операція лише чекає Stopped і не приписує зупинку
+            # собі (StateChangeIssued=$false, #360).
+            if ([string]$service.Status -notin @('Stopped', 'StopPending')) {
                 $stateChangeIssued = $true
                 Stop-Service `
                     -Name $Name `
