@@ -571,17 +571,6 @@ try {
             # componentSettings -> компоненти discovery (BRAVO.Configuration
             # .Derivation). Раніше він будувався тут inline, і Archive
             # runtime мусив би завести другу копію.
-            $discoveryValidationErrors = @(Test-BRAVODiscoveryResult `
-                -DiscoveryResult $bravoDiscoveryResult `
-                -EnabledComponents $global:discoveryEnabledComponents `
-                -DestinationPaths @{
-                    MODEL = $archiveDirs.Model
-                    BLOG = $archiveDirs.Blog
-                    BRAVOEXCH = $archiveDirs.BravoExch
-                    BAZA_APP = $bazaAppPaths.Destination
-                    BAZA_WWW = $bazaWWWPaths.Destination
-                })
-
             # #158 (етап 3): склад backup set відносно підтвердженого
             # baseline. Після -ConfirmDiscoveryBaseline порівнюємо з щойно
             # збереженим знімком (це і є поточний результат), інакше
@@ -597,11 +586,38 @@ try {
             } else {
                 [string]$discoveryBaselineImport.Source
             })
-            $discoveryDriftFindings = @(Test-BRAVODiscoveryComponentDrift `
+            # Склад за наявністю (рішення власника 2026-10-01): той самий
+            # Resolve-BRAVOBackupComponentScope, що й у BRAVO_ARCHIV. Не
+            # встановлений на сервері компонент не є помилкою перевірки.
+            # Другий доказ присутності - останній COMPLETE manifest, як і в
+            # BRAVO_ARCHIV: SETUP і нічний прогін мають погоджуватись.
+            $discoveryPreviousEvidence = Get-BRAVOLastCompleteBackupEvidence `
+                -BackupRoot ([string]$global:backupRootPath)
+            $discoveryScope = Resolve-BRAVOBackupComponentScope `
                 -DiscoveryResult $bravoDiscoveryResult `
                 -Baseline $discoveryDriftBaseline `
                 -BaselineSourceKind $discoveryDriftBaselineKind `
-                -EnabledComponents $global:discoveryEnabledComponents)
+                -EnabledComponents $global:discoveryEnabledComponents `
+                -PreviousCompleteComponents @($discoveryPreviousEvidence.Components) `
+                -PreviousCompleteAt $discoveryPreviousEvidence.CreatedAtUtc
+            $discoveryDriftFindings = @($discoveryScope.Findings)
+
+            # #282: каталог призначення перевіряється лише для компонента,
+            # який справді його отримає; для BAZA_* це тільки *_LOCAL.
+            $discoveryDestinationPaths = Get-BRAVODiscoveryDestinationPaths `
+                -ArchiveDirectories @{
+                    Model = $archiveDirs.Model
+                    Blog = $archiveDirs.Blog
+                    BravoExch = $archiveDirs.BravoExch
+                } `
+                -BazaAppDestination $bazaAppPaths.Destination `
+                -BazaWwwDestination $bazaWWWPaths.Destination `
+                -BazaAppLocal $global:componentSettings.Synchronization.BAZA_APP_LOCAL `
+                -BazaWwwLocal $global:componentSettings.Synchronization.BAZA_WWW_LOCAL
+            $discoveryValidationErrors = @(Test-BRAVODiscoveryResult `
+                -DiscoveryResult $bravoDiscoveryResult `
+                -EnabledComponents $discoveryScope.EffectiveEnabledComponents `
+                -DestinationPaths $discoveryDestinationPaths)
             $discoveryDriftErrors = @($discoveryDriftFindings | Where-Object { $_.Severity -eq 'Error' })
             if ($discoveryDriftFindings.Count -gt 0) {
                 Write-Host 'Склад джерел відносно підтвердженого baseline:'

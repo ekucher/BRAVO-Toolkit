@@ -315,7 +315,7 @@ $script:environmentLimitations = New-Object System.Collections.ArrayList
 # 188.6 с із 477.5 с sum-of-suites. Вибірковий прогін не може бути швидшим
 # за цю частину, і обіцяти більше було б неправдою.
 $script:BRAVOSelfTestSuiteCatalog = @(
-    'Archive', 'ArchiveDiskSpace', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
+    'Archive', 'ArchiveDiskSpace', 'BackupScope', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
     'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
     'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
     'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
@@ -753,10 +753,12 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
     #
     # -FunctionBaseline (ім'я -> ScriptBlock, знято на вході в suite): якщо
     # прибрана заглушка затіняла ПЕРЕДІСНУЮЧУ функцію (напр. Write-Log), її
-    # початкове визначення повертається, а не губиться.
+    # початкове визначення повертається, а не губиться; -FunctionOptionsBaseline
+    # (ім'я -> Options, лише не None) повертає й її Options (#350).
     param(
         [int]$StartIndex = 0,
-        [hashtable]$FunctionBaseline = $null
+        [hashtable]$FunctionBaseline = $null,
+        [hashtable]$FunctionOptionsBaseline = $null
     )
     $clearProblems = Microsoft.PowerShell.Utility\New-Object System.Collections.Generic.List[string]
     for ($ownedIndex = $StartIndex; $ownedIndex -lt $script:BRAVOSelfTestOwnedRuntimeModules.Count; $ownedIndex++) {
@@ -776,7 +778,12 @@ function Clear-BRAVOSelfTestOwnedRuntimeModules {
                 if ($null -ne $currentFunction -and $currentFunction.ModuleName -eq $ownerModuleName) {
                     Microsoft.PowerShell.Management\Remove-Item -Path "function:$functionName" -Force -ErrorAction Stop
                     if ($null -ne $FunctionBaseline -and $FunctionBaseline.ContainsKey($functionName)) {
-                        Microsoft.PowerShell.Management\Set-Item -Path "function:global:$functionName" -Value $FunctionBaseline[$functionName] -Force
+                        $baselineFunctionOptions = 'None'
+                        if ($null -ne $FunctionOptionsBaseline -and $FunctionOptionsBaseline.ContainsKey($functionName)) {
+                            $baselineFunctionOptions = $FunctionOptionsBaseline[$functionName]
+                        }
+                        Set-BRAVOSelfTestBuiltinCommandEntry -Name $functionName -Scope Global -Entry ([pscustomobject]@{
+                                Kind = 'Function'; ScriptBlock = $FunctionBaseline[$functionName]; Options = $baselineFunctionOptions })
                     }
                 }
             }
@@ -864,6 +871,77 @@ function Invoke-BRAVOSelfTestGlobalScopeItem {
         param($ItemPath) Microsoft.PowerShell.Management\Remove-Item -LiteralPath $ItemPath -Force -ErrorAction SilentlyContinue } $Path
 }
 
+function Get-BRAVOSelfTestSessionScopeAccess {
+    # #350: прямий доступ до таблиць Alias:/Function: ГЛОБАЛЬНОЇ області і
+    # SCRIPT-області self-test. Публічні шляхи (Get-Item alias:X /
+    # function:X, Get-Alias -Scope, Get-ChildItem alias:) з області функції
+    # фреймворку не бачать записів з опцією Private у батьківських
+    # областях: знімок фіксував такий запис як відсутній, і заміна чи
+    # видалення його suite-ом не відновлювались. Таблиця самої області
+    # (внутрішній SessionStateScope рушія, наявний і в Windows PowerShell
+    # 5.1) повертає запис незалежно від Private. Відсутній член рушія —
+    # виняток (fail closed), а не тихе повернення до неповного читання.
+    # Script = $null, коли script-область і є глобальною (запуск через -File).
+    $bindingFlags = [Reflection.BindingFlags]'Instance, Public, NonPublic'
+    $sessionState = $ExecutionContext.SessionState
+    $internalProperty = $sessionState.GetType().GetProperty('Internal', $bindingFlags)
+    $sessionInternal = $null
+    if ($null -ne $internalProperty) { $sessionInternal = $internalProperty.GetValue($sessionState, $null) }
+    if ($null -eq $sessionInternal) { throw 'ізоляція suite: рушій PowerShell не надає SessionState.Internal' }
+    $internalType = $sessionInternal.GetType()
+    $globalScopeProperty = $internalType.GetProperty('GlobalScope', $bindingFlags)
+    $scopeByIdMethod = $internalType.GetMethod('GetScopeByID', $bindingFlags, $null, [type[]]@([string]), $null)
+    if ($null -eq $globalScopeProperty -or $null -eq $scopeByIdMethod) {
+        throw 'ізоляція suite: рушій PowerShell не надає GlobalScope/GetScopeByID'
+    }
+    $globalScope = $globalScopeProperty.GetValue($sessionInternal, $null)
+    $scriptScope = $scopeByIdMethod.Invoke($sessionInternal, [object[]]@('script'))
+    if ($null -eq $globalScope -or $null -eq $scriptScope) { throw 'ізоляція suite: не вдалося визначити global/script-область' }
+    if ([object]::ReferenceEquals($scriptScope, $globalScope)) { $scriptScope = $null }
+    $scopeType = $globalScope.GetType()
+    $scopeAccess = [pscustomobject]@{
+        Global         = $globalScope
+        Script         = $scriptScope
+        GetFunction    = $scopeType.GetMethod('GetFunction', $bindingFlags, $null, [type[]]@([string]), $null)
+        GetAlias       = $scopeType.GetMethod('GetAlias', $bindingFlags, $null, [type[]]@([string]), $null)
+        RemoveFunction = $scopeType.GetMethod('RemoveFunction', $bindingFlags, $null, [type[]]@([string], [bool]), $null)
+        RemoveAlias    = $scopeType.GetMethod('RemoveAlias', $bindingFlags, $null, [type[]]@([string], [bool]), $null)
+        FunctionTable  = $scopeType.GetProperty('FunctionTable', $bindingFlags)
+    }
+    foreach ($scopeMember in @('GetFunction', 'GetAlias', 'RemoveFunction', 'RemoveAlias', 'FunctionTable')) {
+        if ($null -eq $scopeAccess.$scopeMember) { throw ("ізоляція suite: рушій PowerShell не надає SessionStateScope.{0}" -f $scopeMember) }
+    }
+    return $scopeAccess
+}
+
+function Get-BRAVOSelfTestScopedCommandItem {
+    # Запис саме цієї області (включно з Private) або $null.
+    param(
+        [Parameter(Mandatory = $true)]$Access,
+        [Parameter(Mandatory = $true)][ValidateSet('Global', 'Script')][string]$Scope,
+        [Parameter(Mandatory = $true)][ValidateSet('Alias', 'Function')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    $targetScope = $Access.$Scope
+    if ($null -eq $targetScope) { return $null }
+    return $Access.('Get' + $Kind).Invoke($targetScope, [object[]]@($Name))
+}
+
+function Remove-BRAVOSelfTestScopedCommandItem {
+    # Знімає запис саме з цієї області (включно з Private/ReadOnly). Копії
+    # AllScope-запису в інших областях не чіпає — фінальна перевірка
+    # Restore тоді дає видимий залишок, а не тихий успіх.
+    param(
+        [Parameter(Mandatory = $true)]$Access,
+        [Parameter(Mandatory = $true)][ValidateSet('Global', 'Script')][string]$Scope,
+        [Parameter(Mandatory = $true)][ValidateSet('Alias', 'Function')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    $targetScope = $Access.$Scope
+    if ($null -eq $targetScope) { return }
+    [void]$Access.('Remove' + $Kind).Invoke($targetScope, [object[]]@($Name, $true))
+}
+
 function ConvertTo-BRAVOSelfTestCommandEntry {
     param($Item, [string]$Kind)
     if ($null -eq $Item) { return $null }
@@ -876,29 +954,37 @@ function ConvertTo-BRAVOSelfTestCommandEntry {
 }
 
 function Get-BRAVOSelfTestBuiltinCommandState {
-    # Стан затінення імені: alias і function, кожен у ГЛОБАЛЬНІЙ області і
-    # як НАЙБЛИЖЧИЙ запис (script-область self-test, куди dot-source пише
-    # suite-фрагменти), фіксуються незалежно — прямий хеш-пошук у
-    # Alias:/Function:, без Get-Command (той для відсутнього імені запускає
-    # дорогий пошук модулів — на Windows це давало десятки секунд на suite).
-    # Заглушка не ховається за наявним записом: функція під аліасом,
-    # global-заглушка голого New-Module під script-функцією. Для аліаса — ще
-    # Options і Description, для функції — посилання на ScriptBlock (заміна
-    # функції функцією з тим самим ModuleName теж видима). Нічого = '<none>'.
-    param([Parameter(Mandatory = $true)][string]$Name)
+    # Стан затінення імені: alias і function, кожен у ГЛОБАЛЬНІЙ області і в
+    # SCRIPT-області self-test (куди dot-source пише suite-фрагменти),
+    # фіксуються незалежно — прямим читанням таблиці кожної області (#350:
+    # включно з Private-записами, яких не видно з області функції), без
+    # Get-Command (той для відсутнього імені запускає дорогий пошук модулів
+    # — на Windows це давало десятки секунд на suite). Заглушка не ховається
+    # за наявним записом: функція під аліасом, global-заглушка голого
+    # New-Module під script-функцією. Для аліаса — ще Options і Description,
+    # для функції — посилання на ScriptBlock, взяте в момент читання (заміна
+    # функції функцією з тим самим ModuleName теж видима). Script-копія
+    # AllScope-запису з global (той самий об'єкт) окремо не фіксується.
+    # Нічого = '<none>'. -Access — результат Get-BRAVOSelfTestSessionScopeAccess
+    # (знімок і відновлення визначають області один раз на всі імена).
+    param([Parameter(Mandatory = $true)][string]$Name, $Access = $null)
+    if ($null -eq $Access) { $Access = Get-BRAVOSelfTestSessionScopeAccess }
+    $globalAliasItem = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope Global -Kind Alias -Name $Name
+    $scriptAliasItem = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope Script -Kind Alias -Name $Name
+    $globalFunctionItem = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope Global -Kind Function -Name $Name
+    $scriptFunctionItem = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope Script -Kind Function -Name $Name
+    if ($null -ne $scriptAliasItem -and [object]::ReferenceEquals($scriptAliasItem, $globalAliasItem)) { $scriptAliasItem = $null }
+    if ($null -ne $scriptFunctionItem -and [object]::ReferenceEquals($scriptFunctionItem, $globalFunctionItem)) { $scriptFunctionItem = $null }
     $entries = [ordered]@{
-        GlobalAlias     = ConvertTo-BRAVOSelfTestCommandEntry -Kind Alias -Item (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('alias:' + $Name))
-        NearestAlias    = ConvertTo-BRAVOSelfTestCommandEntry -Kind Alias -Item (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('alias:' + $Name) -ErrorAction SilentlyContinue)
-        GlobalFunction  = ConvertTo-BRAVOSelfTestCommandEntry -Kind Function -Item (Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $Name))
-        NearestFunction = ConvertTo-BRAVOSelfTestCommandEntry -Kind Function -Item (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue)
+        GlobalAlias    = ConvertTo-BRAVOSelfTestCommandEntry -Kind Alias -Item $globalAliasItem
+        ScriptAlias    = ConvertTo-BRAVOSelfTestCommandEntry -Kind Alias -Item $scriptAliasItem
+        GlobalFunction = ConvertTo-BRAVOSelfTestCommandEntry -Kind Function -Item $globalFunctionItem
+        ScriptFunction = ConvertTo-BRAVOSelfTestCommandEntry -Kind Function -Item $scriptFunctionItem
     }
     $keyParts = @()
     foreach ($entryName in @($entries.Keys)) {
         $entry = $entries[$entryName]
         if ($null -eq $entry) { continue }
-        # Найближчий, що збігається з глобальним, окремо не показуємо.
-        $globalTwin = $entries[$entryName.Replace('Nearest', 'Global')]
-        if ($entryName.StartsWith('Nearest') -and $null -ne $globalTwin -and [object]::ReferenceEquals($entry.Item, $globalTwin.Item)) { continue }
         $keyParts += ('{0}|{1}|{2}|{3}' -f $entryName.Replace('Global', ''), $entry.Definition, $entry.Options, $entry.Description)
     }
     $stateKey = if ($keyParts.Count -gt 0) { [string]::Join(' + ', [string[]]$keyParts) } else { '<none>' }
@@ -924,33 +1010,34 @@ function Test-BRAVOSelfTestBuiltinCommandStateEqual {
 
 function Restore-BRAVOSelfTestBuiltinCommandEntry {
     # Повертає один вид запису (Alias/Function) імені до знімка: спершу
-    # глобальний, потім найближчий (script-область), якщо він був окремим.
-    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Kind, $Baseline)
-    $drive = $Kind.ToLowerInvariant() + ':'
-    $current = Get-BRAVOSelfTestBuiltinCommandState -Name $Name
-    if (-not (Test-BRAVOSelfTestBuiltinCommandEntryEqual -Left $Baseline.Entries['Global' + $Kind] -Right $current.Entries['Global' + $Kind])) {
-        Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ($drive + $Name)
-        Set-BRAVOSelfTestBuiltinCommandEntry -Name $Name -Scope Global -Entry $Baseline.Entries['Global' + $Kind]
-        $current = Get-BRAVOSelfTestBuiltinCommandState -Name $Name
-    }
-    if (-not (Test-BRAVOSelfTestBuiltinCommandEntryEqual -Left $Baseline.Entries['Nearest' + $Kind] -Right $current.Entries['Nearest' + $Kind])) {
-        # Окремий найближчий запис (не глобальний) — зняти: без кваліфікатора
-        # Remove-Item прибирає найближчий у ланцюгу (тут — script-область).
-        $currentNearest = $current.Entries['Nearest' + $Kind]
-        $currentGlobal = $current.Entries['Global' + $Kind]
-        if ($null -ne $currentNearest -and -not ($null -ne $currentGlobal -and [object]::ReferenceEquals($currentNearest.Item, $currentGlobal.Item))) {
-            Microsoft.PowerShell.Management\Remove-Item -LiteralPath ($drive + $Name) -Force -ErrorAction SilentlyContinue
+    # глобальний, потім script-область — кожну окремо, знімаючи й
+    # відновлюючи запис прямо в її таблиці (#350: і Private теж).
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        $Baseline,
+        $Access = $null
+    )
+    if ($null -eq $Access) { $Access = Get-BRAVOSelfTestSessionScopeAccess }
+    foreach ($scopeName in @('Global', 'Script')) {
+        $entryName = $scopeName + $Kind
+        $baselineEntry = $Baseline.Entries[$entryName]
+        $currentEntry = (Get-BRAVOSelfTestBuiltinCommandState -Name $Name -Access $Access).Entries[$entryName]
+        if (Test-BRAVOSelfTestBuiltinCommandEntryEqual -Left $baselineEntry -Right $currentEntry) { continue }
+        if ($null -ne $currentEntry) {
+            Remove-BRAVOSelfTestScopedCommandItem -Access $Access -Scope $scopeName -Kind $Kind -Name $Name
         }
-        $baselineNearest = $Baseline.Entries['Nearest' + $Kind]
-        $baselineGlobal = $Baseline.Entries['Global' + $Kind]
-        if ($null -ne $baselineNearest -and -not ($null -ne $baselineGlobal -and [object]::ReferenceEquals($baselineNearest.Item, $baselineGlobal.Item))) {
-            Set-BRAVOSelfTestBuiltinCommandEntry -Name $Name -Scope Script -Entry $baselineNearest
-        }
+        Set-BRAVOSelfTestBuiltinCommandEntry -Name $Name -Scope $scopeName -Entry $baselineEntry -Access $Access
     }
 }
 
 function Set-BRAVOSelfTestBuiltinCommandEntry {
-    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Scope, $Entry)
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][ValidateSet('Global', 'Script')][string]$Scope,
+        $Entry,
+        $Access = $null
+    )
     if ($null -eq $Entry) { return }
     if ($Entry.Kind -eq 'Function') {
         # ScriptBlock несе свій модуль: відновлена функція модуля лишається
@@ -958,15 +1045,13 @@ function Set-BRAVOSelfTestBuiltinCommandEntry {
         # ModuleOwnedFunctionRestored).
         Microsoft.PowerShell.Management\Set-Item -Path ('function:' + $Scope.ToLowerInvariant() + ':' + $Name) -Value $Entry.ScriptBlock -Force
         # Options (ReadOnly/AllScope/Private) Set-Item не переносить —
-        # повернути їх на щойно відновленій функції.
+        # повернути їх на щойно відновленій функції саме цієї області.
         $restoredOptions = [Management.Automation.ScopedItemOptions]$Entry.Options
         if ($restoredOptions -ne [Management.Automation.ScopedItemOptions]::None) {
-            $restoredFunction = if ($Scope -eq 'Global') {
-                Invoke-BRAVOSelfTestGlobalScopeItem -Operation Get -Path ('function:' + $Name)
-            } else {
-                Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $Name) -ErrorAction SilentlyContinue
-            }
-            if ($null -ne $restoredFunction) { $restoredFunction.Options = $restoredOptions }
+            if ($null -eq $Access) { $Access = Get-BRAVOSelfTestSessionScopeAccess }
+            $restoredFunction = Get-BRAVOSelfTestScopedCommandItem -Access $Access -Scope $Scope -Kind Function -Name $Name
+            if ($null -eq $restoredFunction) { throw ("функцію {0} не відновлено в області {1}" -f $Name, $Scope) }
+            $restoredFunction.Options = $restoredOptions
         }
     } else {
         Microsoft.PowerShell.Utility\Set-Alias -Name $Name -Value $Entry.Definition -Scope $Scope `
@@ -975,17 +1060,30 @@ function Set-BRAVOSelfTestBuiltinCommandEntry {
 }
 
 function New-BRAVOSelfTestSuiteIsolationSnapshot {
+    $scopeAccess = Get-BRAVOSelfTestSessionScopeAccess
     $commandStates = @{}
     foreach ($watchedName in @(Get-BRAVOSelfTestWatchedBuiltinCommandNames)) {
-        $commandStates[$watchedName] = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
+        $commandStates[$watchedName] = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName -Access $scopeAccess
     }
-    # Єдине перелічення Function: на suite (початкові визначення для
-    # відновлення функції, яку затінила прибрана заглушка).
-    # Хеш-таблиця будується ліниво, лише якщо suite зареєстрував модулі.
+    # #350: початкові ГЛОБАЛЬНІ функції (туди потрапляють функції runtime-
+    # модулів; прибрана заглушка повертає саме глобальний оригінал)
+    # матеріалізуються тут же: ім'я -> ScriptBlock і ім'я -> Options
+    # (лише не None). Живі FunctionInfo зберігати не можна: перевизначення
+    # наявної функції (Set-Item, function global:X) змінює той самий об'єкт
+    # на місці, і «знімок» віддав би вже заглушку.
+    $functionBaseline = @{}
+    $functionOptionsBaseline = @{}
+    foreach ($globalFunctionPair in $scopeAccess.FunctionTable.GetValue($scopeAccess.Global, $null).GetEnumerator()) {
+        $functionBaseline[[string]$globalFunctionPair.Key] = $globalFunctionPair.Value.ScriptBlock
+        if ($globalFunctionPair.Value.Options -ne [Management.Automation.ScopedItemOptions]::None) {
+            $functionOptionsBaseline[[string]$globalFunctionPair.Key] = [string]$globalFunctionPair.Value.Options
+        }
+    }
     return [pscustomobject]@{
-        CommandStates    = $commandStates
-        FunctionList     = @(Microsoft.PowerShell.Management\Get-ChildItem -Path 'function:' -ErrorAction SilentlyContinue)
-        OwnedStartIndex  = $script:BRAVOSelfTestOwnedRuntimeModules.Count
+        CommandStates           = $commandStates
+        FunctionBaseline        = $functionBaseline
+        FunctionOptionsBaseline = $functionOptionsBaseline
+        OwnedStartIndex         = $script:BRAVOSelfTestOwnedRuntimeModules.Count
     }
 }
 
@@ -1004,27 +1102,35 @@ function Restore-BRAVOSelfTestSuiteIsolation {
     )
     $residualProblems = Microsoft.PowerShell.Utility\New-Object System.Collections.Generic.List[string]
     try {
-        $restoreFunctionBaseline = @{}
+        # Знімок незмінний (#350): матеріалізовані на вході в suite
+        # ім'я -> ScriptBlock/Options, а не живі FunctionInfo.
         if ($script:BRAVOSelfTestOwnedRuntimeModules.Count -gt $Snapshot.OwnedStartIndex) {
-            foreach ($baselineFunction in $Snapshot.FunctionList) {
-                $restoreFunctionBaseline[$baselineFunction.Name] = $baselineFunction.ScriptBlock
-            }
+            Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $Snapshot.OwnedStartIndex -FunctionBaseline $Snapshot.FunctionBaseline `
+                -FunctionOptionsBaseline $Snapshot.FunctionOptionsBaseline
+        } else {
+            Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $Snapshot.OwnedStartIndex
         }
-        Clear-BRAVOSelfTestOwnedRuntimeModules -StartIndex $Snapshot.OwnedStartIndex -FunctionBaseline $restoreFunctionBaseline
     } catch {
         [void]$residualProblems.Add("прибирання runtime-модулів: $($_.Exception.Message)")
     }
+    $scopeAccess = $null
+    try {
+        $scopeAccess = Get-BRAVOSelfTestSessionScopeAccess
+    } catch {
+        [void]$residualProblems.Add("області сесії: $($_.Exception.Message)")
+    }
     foreach ($watchedName in @(Get-BRAVOSelfTestWatchedBuiltinCommandNames)) {
+        if ($null -eq $scopeAccess) { break }
         $baselineState = $Snapshot.CommandStates[$watchedName]
-        $currentState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
+        $currentState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName -Access $scopeAccess
         if (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $currentState) { continue }
         try {
-            Restore-BRAVOSelfTestBuiltinCommandEntry -Name $watchedName -Kind Alias -Baseline $baselineState
-            Restore-BRAVOSelfTestBuiltinCommandEntry -Name $watchedName -Kind Function -Baseline $baselineState
+            Restore-BRAVOSelfTestBuiltinCommandEntry -Name $watchedName -Kind Alias -Baseline $baselineState -Access $scopeAccess
+            Restore-BRAVOSelfTestBuiltinCommandEntry -Name $watchedName -Kind Function -Baseline $baselineState -Access $scopeAccess
         } catch {
             [void]$residualProblems.Add("${watchedName}: не вдалося зняти затінення — $($_.Exception.Message)")
         }
-        $finalState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName
+        $finalState = Get-BRAVOSelfTestBuiltinCommandState -Name $watchedName -Access $scopeAccess
         if (-not (Test-BRAVOSelfTestBuiltinCommandStateEqual -Left $baselineState -Right $finalState)) {
             [void]$residualProblems.Add(("{0}: було {1}, стало {2}" -f $watchedName, $baselineState.Key, $finalState.Key))
         }
@@ -1905,6 +2011,7 @@ Save-BRAVOSelfTestFrameworkSnapshot -FunctionName @(
     'Get-BRAVOSelfTestWatchedBuiltinCommandNames', 'Get-BRAVOSelfTestBuiltinCommandState',
     'Test-BRAVOSelfTestBuiltinCommandStateEqual', 'Test-BRAVOSelfTestBuiltinCommandEntryEqual',
     'Invoke-BRAVOSelfTestGlobalScopeItem', 'ConvertTo-BRAVOSelfTestCommandEntry',
+    'Get-BRAVOSelfTestSessionScopeAccess', 'Get-BRAVOSelfTestScopedCommandItem', 'Remove-BRAVOSelfTestScopedCommandItem',
     'Restore-BRAVOSelfTestBuiltinCommandEntry', 'Set-BRAVOSelfTestBuiltinCommandEntry',
     'New-BRAVOSelfTestSuiteIsolationSnapshot', 'Restore-BRAVOSelfTestSuiteIsolation',
     'Write-BRAVOSelfTestSectionReport', 'Complete-BRAVOSelfTestAbnormalExit')
@@ -8201,44 +8308,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $archiveScriptText.Contains('$record.GenerationId -eq $CurrentGenerationId') -and
             $archiveScriptText.Contains('$record.GenerationId -notin $protectedGenerationIds') -and
             $archiveScriptText.Contains('minimumRetainedVerifiedBackups') -and
-            $archiveScriptText.Contains('Select-Object -First $minimumRetainedCount') -and
+            $archiveScriptText.Contains('$protectedGenerationIds.Count -ge $minimumRetainedCount') -and
             $bravoConfigTextForRetention.Contains('$global:minimumRetainedVerifiedBackups')
         ) `
         -Name "BackupConsistency/RetentionNeverDeletesLastVerified" `
         -Failure "generation-aware retention має захищати current і N найновіших verified COMPLETE generations незалежно від archiveRetentionDays"
-
-    # Archive.Runtime.ps1 безумовно запускає Main при dot-source, тому саму
-    # функцію Remove-OldBackupSets тут викликати небезпечно. Натомість
-    # відтворюємо той самий алгоритм відбору (Select-Object -First/-Skip на
-    # відсортованому за спаданням часу списку) на синтетичних даних — це
-    # функціональна, а не текстова перевірка інваріанту "останню перевірену
-    # копію не видаляти", яку одна лише текстова перевірка вище довести не може.
-    # Навмисно всі три "покоління" старші за cutoff — саме такий сценарій
-    # (серія невдалих backup, лише старі перевірені копії) і був не захищений
-    # до цього виправлення: без Select-Object -First найновіший теж потрапляв
-    # у $setsToDelete.
-    $retentionSimulationSets = @(
-        [pscustomobject]@{ Name = "gen1_newest"; LastWriteTime = (Get-Date).AddDays(-190) },
-        [pscustomobject]@{ Name = "gen2_old"; LastWriteTime = (Get-Date).AddDays(-200) },
-        [pscustomobject]@{ Name = "gen3_oldest"; LastWriteTime = (Get-Date).AddDays(-400) }
-    ) | Sort-Object LastWriteTime -Descending
-    $retentionSimulationCutoff = (Get-Date).AddDays(-183)
-    $retentionSimulationProtected = @($retentionSimulationSets | Select-Object -First 1)
-    $retentionSimulationCandidates = @($retentionSimulationSets | Select-Object -Skip 1)
-    $retentionSimulationToDelete = @($retentionSimulationCandidates | Where-Object {
-        $_.LastWriteTime -lt $retentionSimulationCutoff
-    })
-    Test-BRAVOCondition `
-        -Condition (
-            $retentionSimulationProtected.Count -eq 1 -and
-            $retentionSimulationProtected[0].Name -eq "gen1_newest" -and
-            $retentionSimulationToDelete.Count -eq 2 -and
-            ($retentionSimulationToDelete.Name -contains "gen2_old") -and
-            ($retentionSimulationToDelete.Name -contains "gen3_oldest") -and
-            -not ($retentionSimulationToDelete.Name -contains "gen1_newest")
-        ) `
-        -Name "BackupConsistency/RetentionSelectionAlgorithm" `
-        -Failure "алгоритм відбору на видалення (Select-Object -First/-Skip найновіших перевірених комплектів) має завжди виключати найновіший комплект, навіть коли він старший за retention cutoff"
 
     $generationVerifierModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $archiveScriptText `
@@ -11153,7 +11227,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             # Ворота реставрації й каталог архівів пропускають Disabled-випадок.
             Test-BRAVOCondition `
                 -Condition (
-                    $RuntimeText.Contains('if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -ne "Running") {') -and
+                    $RuntimeText.Contains('if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @(''Stopped'', ''Paused'')) {') -and
                     $RuntimeText.Contains('$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {') -and
                     $RuntimeText -match '(?s)\} elseif \(\$restoreOnDisabledBravo\) \{[^}]{0,400}\$dirsToCreate \+= \$ARC_DIR' -and
                     $RuntimeText.Contains('elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {')
@@ -11210,7 +11284,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # файлу) — не "чи існує рядок десь у файлі", а "чи стоїть він у
         # правильному місці відносно правильних сусідів".
         $barrier1WindowStart = $maintenanceRestoreWindowText.IndexOf(
-            '$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { (Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
+            '$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { [string](Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
         )
         $barrier1EntryIndex = $maintenanceRestoreWindowText.IndexOf(
             "if (`$shouldRestore) {", [Math]::Max(0, $barrier1WindowStart)
@@ -11921,12 +11995,357 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         }
     }
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Scheduler' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' -DependsOn 'Root/Runtime') { try {
+    # #322: діагностика причини застарілої generation (чистий класифікатор,
+    # fixture з INCOMPLETE новішим за COMPLETE, секція Slack і дедуп хмари).
+    $staleReasonModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'ConvertTo-BRAVOUtcDateTime',
+            'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
+            'Get-BRAVOHealthBackupStaleReason',
+            'Test-BRAVOHealthCatchUpRunIsAttempt',
+            'Get-BRAVOHealthBackupStaleDiagnosis',
+            'Get-BRAVOHealthManifestFailedStage',
+            'Get-BackupHealthIssues'
+        )
+    $staleReasons = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        $now = [datetime]::SpecifyKind([datetime]'2026-09-30T12:00:00', [DateTimeKind]::Utc)
+        $max = [timespan]::FromHours(24)
+        $task = {
+            param($Exists = $true, $Enabled = $true, $Result = 0, $RunAgeHours = 2)
+            [pscustomobject]@{ Exists = $Exists; Enabled = $Enabled; LastTaskResult = $Result; LastRunTime = $now.AddHours(-$RunAgeHours).ToLocalTime() }
+        }
+        $status = {
+            param($Code = 0, $FinishedAgeHours = 1)
+            [pscustomobject]@{ ExitCode = $Code; ExitCodeName = 'TEST_NAME'; FinishedAt = $now.AddHours(-$FinishedAgeHours).ToLocalTime() }
+        }
+        $incomplete = [pscustomobject]@{ GenerationId = 'G-NEW'; Status = 'INCOMPLETE'; CreatedAtUtc = $now.AddHours(-3); Stage = 'MODEL/SHA512' }
+        $reason = { param($t, $s, $i, $c) Get-BRAVOHealthBackupStaleReason -TaskInfo $t -ArchiveStatus $s -LatestIncomplete $i -LatestCompleteUtc $c -NowUtc $now -MaxAge $max }
+        [pscustomobject]@{
+            NotRegistered = & $reason (& $task -Exists $false) $null $null $null
+            Disabled = & $reason (& $task -Enabled $false) $null $null $null
+            # Запуск, що створив INCOMPLETE manifest, стартував РАНІШЕ за нього (-4 год проти -3 год).
+            Incomplete = & $reason (& $task -RunAgeHours 4) $null $incomplete $now.AddHours(-30)
+            IncompleteOlder = & $reason (& $task) $null $incomplete $now.AddHours(-1)
+            BadResult = & $reason (& $task -Result (-2147024891)) (& $status 0 1) $null $null
+            SameCodeNamed = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 1) $null $null
+            SameCodeOldStatus = & $reason (& $task -Result 20 -RunAgeHours 3) (& $status 20 30) $null $null
+            NewerFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            NewerRunning = & $reason (& $task -Result 267009 -RunAgeHours 1) $null $incomplete $now.AddHours(-30)
+            NewerSuccess = & $reason (& $task -Result 0 -RunAgeHours 1) (& $status 0 0.5) $incomplete $now.AddHours(-30)
+            OlderFailedRun = & $reason (& $task -Result (-2147024891) -RunAgeHours 5) $null $incomplete $now.AddHours(-30)
+            CodeZero = & $reason (& $task -Result 0) $null $null $null
+            Running = & $reason (& $task -Result 267009 -RunAgeHours 1) (& $status 0 30) $null $null
+            NeverRunCode = & $reason (& $task -Result 267011) $null $null $null
+            NeverRunYear = & $reason ([pscustomobject]@{ Exists = $true; Enabled = $true; LastTaskResult = 0; LastRunTime = [datetime]'1999-11-30' }) $null $null $null
+            NotFoundWithStatus = & $reason (& $task -Exists $false) (& $status 20 1) $null $null
+            HashtableInfo = & $reason @{ Exists = $true; Enabled = $false } $null $null $null
+            NotRun = & $reason (& $task -RunAgeHours 72) (& $status 0 71) $null $null
+            Early = & $reason (& $task -RunAgeHours 2) (& $status 0 30) $null $null
+            StatusCode = & $reason (& $task) (& $status 20 1) $null $null
+            Nothing = & $reason (& $task) (& $status 0 1) $null $null
+            ReadFailedTask = & $reason $null (& $status 20 1) $null $null
+            ReadFailedAll = & $reason $null $null $null $null
+            ExpIncomplete = $now.AddHours(-3).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpRun2 = $now.AddHours(-2).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpRun72 = $now.AddHours(-72).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            ExpFinished1 = $now.AddHours(-1).ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $staleReasons.NotRegistered -eq 'завдання BRAVO_ARCHIV не знайдене або недоступне для читання' -and
+            $staleReasons.NotFoundWithStatus -match 'код 20' -and
+            $staleReasons.Running -eq 'завдання BRAVO_ARCHIV виконується зараз' -and
+            $staleReasons.NeverRunCode -eq 'завдання BRAVO_ARCHIV ще не запускалося' -and
+            $staleReasons.NeverRunYear -eq 'завдання BRAVO_ARCHIV ще не запускалося' -and
+            $staleReasons.HashtableInfo -eq 'завдання BRAVO_ARCHIV вимкнене' -and
+            $staleReasons.Disabled -eq 'завдання BRAVO_ARCHIV вимкнене' -and
+            $staleReasons.Incomplete -match 'G-NEW' -and $staleReasons.Incomplete -match 'INCOMPLETE' -and $staleReasons.Incomplete -match 'MODEL/SHA512' -and
+            $null -eq $staleReasons.IncompleteOlder -and
+            $staleReasons.BadResult -match '0x80070005' -and $staleReasons.BadResult -notmatch 'TEST_NAME' -and
+            $staleReasons.SameCodeNamed -match '0x00000014 \(TEST_NAME\)' -and
+            $staleReasons.SameCodeOldStatus -match '0x00000014' -and $staleReasons.SameCodeOldStatus -notmatch 'TEST_NAME' -and
+            $staleReasons.NewerFailedRun -match '0x80070005' -and $staleReasons.NewerFailedRun -notmatch 'G-NEW' -and
+            $staleReasons.NewerRunning -eq 'завдання BRAVO_ARCHIV виконується зараз' -and
+            $null -eq $staleReasons.NewerSuccess -and
+            $staleReasons.OlderFailedRun -match 'G-NEW' -and
+            $null -eq $staleReasons.CodeZero -and
+            $staleReasons.NotRun -match '^завдання не запускалося з \d\d\.\d\d\.\d{4} \d\d:\d\d$' -and
+            $staleReasons.Early -match 'завершився достроково' -and
+            $staleReasons.StatusCode -match 'код 20 \(TEST_NAME\)' -and
+            $null -eq $staleReasons.Nothing -and
+            $staleReasons.ReadFailedTask -match 'код 20' -and
+            $null -eq $staleReasons.ReadFailedAll -and
+            $staleReasons.Incomplete.Contains($staleReasons.ExpIncomplete) -and
+            $staleReasons.BadResult.Contains($staleReasons.ExpRun2) -and
+            $staleReasons.NotRun.Contains($staleReasons.ExpRun72) -and
+            $staleReasons.Early.Contains($staleReasons.ExpRun2) -and
+            $staleReasons.StatusCode.Contains($staleReasons.ExpFinished1)
+        ) `
+        -Name 'Health/StaleGenerationReasonClassifier' `
+        -Failure "класифікатор причин (завдання відсутнє/вимкнене/INCOMPLETE/код/не запускалося/достроково/статус/нічого; помилка читання пропускає перевірку): $($staleReasons | ConvertTo-Json -Compress)"
+
+    $fingerprintModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @('Get-BRAVOHealthIssueField', 'Get-AlertFingerprint')
+    $fingerprints = & $fingerprintModule {
+        Set-StrictMode -Version Latest
+        $issue = {
+            param($Diagnosis)
+            [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; Diagnosis = $Diagnosis }
+        }
+        $other = [pscustomobject]@{ Kind = 'LocalBackup'; Component = 'MODEL'; Reason = 'x'; FileName = 'a.7z'; LastWriteTime = $null; Diagnosis = 'a' }
+        $other2 = [pscustomobject]@{ Kind = 'LocalBackup'; Component = 'MODEL'; Reason = 'x'; FileName = 'a.7z'; LastWriteTime = $null; Diagnosis = 'b' }
+        [pscustomobject]@{
+            Running = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV виконується зараз')
+            RunningAgain = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV виконується зараз')
+            Disabled = Get-AlertFingerprint -Issues @(& $issue 'завдання BRAVO_ARCHIV вимкнене')
+            NoDiagnosis = Get-AlertFingerprint -Issues @(& $issue $null)
+            OtherA = Get-AlertFingerprint -Issues @($other)
+            OtherB = Get-AlertFingerprint -Issues @($other2)
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $fingerprints.Running -eq $fingerprints.RunningAgain -and
+            $fingerprints.Running -ne $fingerprints.Disabled -and
+            $fingerprints.Disabled -ne $fingerprints.NoDiagnosis -and
+            $fingerprints.OtherA -eq $fingerprints.OtherB
+        ) `
+        -Name 'Health/AlertFingerprintIncludesGenerationDiagnosis' `
+        -Failure "fingerprint LocalBackupGeneration залежить від Diagnosis (змінена причина не придушується), стабільний за незмінної причини; інші Kind не змінюються: $($fingerprints | ConvertTo-Json -Compress)"
+
+    $staleCatchUp = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        function Write-HealthLog { param($Message, $Level) }
+        $script:mode = 'catchup-newer'
+        $stateRoot = 'x'
+        $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'SELFTEST_MAIN' }; BackupCatchUp = [pscustomobject]@{ Enabled = $true; TaskName = 'SELFTEST_CATCHUP' } }
+        function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+        function Get-BRAVOOperationStatus {
+            param($Path)
+            # catchup-noop: status-файл від справжнього прогону ДО старту catch-up (#323: no-op catch-up його не оновлює).
+            if ($script:mode -eq 'catchup-noop') { return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = [pscustomobject]@{ exitCode = 0; exitCodeName = 'OK'; finishedAt = (Get-Date).AddHours(-29) } } }
+            throw 'self-test: status недоступний'
+        }
+        function Get-BRAVOScheduledTaskState {
+            param($TaskPath, $TaskName)
+            $run = if ($TaskName -eq 'SELFTEST_MAIN') { (Get-Date).AddHours(-30) } else { (Get-Date).AddHours(-1) }
+            $result = if ($TaskName -eq 'SELFTEST_MAIN') { 0 } else { -2147024891 }
+            if ($script:mode -eq 'catchup-noop') { $result = if ($TaskName -eq 'SELFTEST_MAIN') { 20 } else { 0 } }
+            if ($TaskName -eq 'SELFTEST_CATCHUP' -and $script:mode -eq 'catchup-missing') { throw 'self-test: catch-up недоступне' }
+            if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'catchup-missing') { $run = (Get-Date).AddHours(-3); $result = 20 }
+            if ($TaskName -eq 'SELFTEST_MAIN' -and $script:mode -eq 'main-newer') { $run = (Get-Date).AddMinutes(-20); $result = 20 }
+            return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = $run; LastTaskResult = $result } }
+        }
+        $diag = { Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $null -LatestCompleteUtc $null -NowUtc (Get-Date).ToUniversalTime() -MaxAge ([timespan]::FromHours(24)) }
+        $newer = & $diag
+        $script:mode = 'catchup-missing'
+        $missing = & $diag
+        $script:mode = 'main-newer'
+        $mainNewer = & $diag
+        $script:mode = 'catchup-noop'
+        $catchUpNoOp = & $diag
+        $nullStage = Get-BRAVOHealthManifestFailedStage -Manifest ([pscustomobject]@{ components = [pscustomobject]@{ MODEL = $null; BLOG = [pscustomobject]@{ ErrorStage = 'CREATE' } } })
+        [pscustomobject]@{ CatchUpNewer = $newer; CatchUpMissing = $missing; MainNewer = $mainNewer; CatchUpNoOp = $catchUpNoOp; NullStage = $nullStage }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $staleCatchUp.CatchUpNewer -match 'SELFTEST_CATCHUP' -and $staleCatchUp.CatchUpNewer -match '0x80070005' -and
+            $staleCatchUp.CatchUpMissing -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpMissing -match '0x00000014' -and
+            $staleCatchUp.MainNewer -match 'SELFTEST_MAIN' -and $staleCatchUp.MainNewer -match '0x00000014' -and
+            $staleCatchUp.CatchUpNoOp -match 'SELFTEST_MAIN' -and $staleCatchUp.CatchUpNoOp -match '0x00000014' -and
+            $staleCatchUp.NullStage -eq 'BLOG/CREATE'
+        ) `
+        -Name 'Health/StaleGenerationCatchUpTaskAndNullComponent' `
+        -Failure "діагностика бере новіше з основного/catch-up завдань (відсутнє catch-up або no-op catch-up без нового status → основне), null-компонент manifest пропускається без винятку: $($staleCatchUp | ConvertTo-Json -Compress)"
+
+    $staleCorrupt = & $staleReasonModule {
+        Set-StrictMode -Version Latest
+        $script:corruptLog = New-Object System.Collections.Generic.List[string]
+        function Write-HealthLog { param($Message, $Level) [void]$script:corruptLog.Add("$Level|$Message") }
+        $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+        $stateRoot = 'x'
+        function Get-BRAVOScheduledTaskState {
+            param($TaskPath, $TaskName)
+            return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = (Get-Date).AddHours(-1); LastTaskResult = (-2147024891) } }
+        }
+        function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+        function Get-BRAVOOperationStatus { param($Path) return [pscustomobject]@{ Exists = $true; Corrupt = $true; State = $null; Reason = 'self-test: зіпсований JSON' } }
+        $thrown = $false
+        $diagnosis = $null
+        try {
+            $diagnosis = Get-BRAVOHealthBackupStaleDiagnosis -LatestIncomplete $null -LatestCompleteUtc $null -NowUtc (Get-Date).ToUniversalTime() -MaxAge ([timespan]::FromHours(24))
+        } catch { $thrown = $true }
+        [pscustomobject]@{ Thrown = $thrown; Diagnosis = $diagnosis; Log = @($script:corruptLog) }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $staleCorrupt.Thrown -and
+            $staleCorrupt.Diagnosis -match '0x80070005' -and
+            @($staleCorrupt.Log | Where-Object { $_ -match '^WARNING\|Діагностика generation: status-файл Archive пошкоджений: self-test: зіпсований JSON$' }).Count -eq 1
+        ) `
+        -Name 'Health/StaleGenerationCorruptStatusLogsWarning' `
+        -Failure "пошкоджений status-файл Archive: WARNING у лог, інші правила працюють, без винятку: $($staleCorrupt | ConvertTo-Json -Compress)"
+
+    $staleFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_HEALTH_STALE_REASON_{0}' -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($staleFixtureRoot)
+        $staleNowUtc = (Get-Date).ToUniversalTime()
+        $badComponent = @{ MODEL = @{ ArchivePath = 'x'; HashPath = 'y'; Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $false; ErrorStage = 'PUBLISH' } }
+        foreach ($fixture in @(
+            @{ Id = '20260101_000100'; Status = 'COMPLETE'; Age = 72 },
+            @{ Id = '20260101_000200'; Status = 'INCOMPLETE'; Age = 3 },
+            @{ Id = '20260101_000300'; Status = 'INCOMPLETE'; Age = 2; JsonId = '20260101_000999' },
+            @{ Id = '20260101_000400'; Status = 'WEIRD'; Age = 1 }
+        )) {
+            $jsonId = if ($fixture.ContainsKey('JsonId')) { $fixture.JsonId } else { $fixture.Id }
+            @{
+                generationId = $jsonId
+                status = $fixture.Status
+                createdAt = $staleNowUtc.AddHours(-$fixture.Age).ToString('o')
+                components = $badComponent
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $staleFixtureRoot "BRAVO_BACKUP_$($fixture.Id).json") -Encoding UTF8
+        }
+        $staleFixtureIssues = & $staleReasonModule {
+            param($BackupRoot)
+            Set-StrictMode -Version Latest
+            $archiveDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Enabled = $true })
+            $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24 }
+            $backupRootPath = $BackupRoot
+            $healthCheckStartedUtc = (Get-Date).ToUniversalTime()
+            $script:healthLatestArchives = @{}
+            function Get-BRAVOFiles { param([string]$Path, [string]$Filter) return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue) }
+            $script:staleWarnings = New-Object System.Collections.Generic.List[string]
+            function Write-HealthLog { param($Message, $Level) if ($Level -eq 'WARNING') { [void]$script:staleWarnings.Add([string]$Message) } }
+            # Читання планувальника/статусу недоступне (детерміновано, незалежно від хоста):
+            # діагностика мусить пропустити ці перевірки й дійти до INCOMPLETE manifest.
+            $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+            $stateRoot = $BackupRoot
+            function Get-BRAVOScheduledTaskState { param($TaskPath, $TaskName) throw 'self-test: планувальник недоступний' }
+            function Get-BRAVOOperationStatus { param($Path) throw 'self-test: status недоступний' }
+            $fixtureIssues = @(Get-BackupHealthIssues)
+            return [pscustomobject]@{ Issues = $fixtureIssues; Warnings = @($script:staleWarnings | Where-Object { $_ -match 'Діагностика generation: manifest' }) }
+        } $staleFixtureRoot
+        $staleFixtureWarnings = @($staleFixtureIssues.Warnings)
+        $staleGenerationIssue = @($staleFixtureIssues.Issues | Where-Object { $_.Component -eq 'Generation' })[0]
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $staleGenerationIssue -and
+                $staleGenerationIssue.Kind -eq 'LocalBackupGeneration' -and
+                $staleGenerationIssue.Reason -match '^остання COMPLETE generation старша за 24 год\.$' -and
+                $staleGenerationIssue.Diagnosis -match '20260101_000200' -and $staleGenerationIssue.Diagnosis -match 'INCOMPLETE' -and
+                $staleGenerationIssue.Diagnosis -match 'MODEL/PUBLISH' -and $staleGenerationIssue.Diagnosis -notmatch 'SHA512' -and
+                $staleFixtureWarnings.Count -eq 2 -and
+                @($staleFixtureWarnings | Where-Object { $_ -match 'ідентичності' -and $_ -match '20260101_000999' }).Count -eq 1 -and
+                @($staleFixtureWarnings | Where-Object { $_ -match "невідомий статус 'WEIRD'" }).Count -eq 1
+            ) `
+            -Name 'Health/StaleGenerationDiagnosisFromIncompleteManifest' `
+            -Failure "INCOMPLETE manifest новіший за COMPLETE має потрапити в Diagnosis, а Kind/Component/Reason лишитись незмінними; отримано: $($staleGenerationIssue | ConvertTo-Json -Compress)"
+    } finally {
+        if (Test-Path -LiteralPath $staleFixtureRoot -PathType Container) {
+            Remove-Item -LiteralPath $staleFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $staleSlackModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Format-FileSize', 'Format-BackupAge', 'ConvertTo-BRAVOUtcDateTime', 'Get-BRAVOUtcAge',
+            'Get-HealthIssueComponentName', 'ConvertTo-NotificationLiteralText', 'Format-HealthIssueFileName',
+            'Format-CompactLocalIssue', 'Format-CompactSFTPIssue', 'Format-CompactSMBIssue',
+            'Get-BRAVOHealthCollapsedCloudIssues', 'Get-BRAVOHealthIssueActionText', 'New-SlackAlertMessage'
+        )
+    $staleSlackText = & $staleSlackModule {
+        Set-StrictMode -Version Latest
+        $script:NotificationProvider = 'slack'
+        $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+        $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'; SFTP = [pscustomobject]@{ Enabled = $false; CheckBAZASynchronization = $false } }
+        $bazaAppLocalHealthEnabled = $false; $bazaWWWLocalHealthEnabled = $false; $bazaAppSFTPHealthEnabled = $false; $bazaWWWSFTPHealthEnabled = $false
+        $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+        $script:healthLatestArchives = @{ MODEL = [pscustomobject]@{ Name = 'MODEL_old.7z' }; BLOG = [pscustomobject]@{ Name = 'BLOG_old.7z' } }
+        function Get-HostInformation { return $null }
+        function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+        function New-BRAVOOperatorNotificationMessage { param($ResultLines, $ReasonLines) return (@($ReasonLines) + @($ResultLines)) -join "`n" }
+        $cloud = {
+            param($Component, $Reason, $File, $Expected = 10, $Actual = 10)
+            [pscustomobject]@{ Kind = 'SFTPArchive'; Component = $Component; Reason = $Reason; FileName = $File; LastWriteTime = $null; SizeBytes = $Actual; ExpectedSizeBytes = $Expected; ActualSizeBytes = $Actual; Location = '/x' }
+        }
+        $ageOnly = 'віддалена копія старша за 26 год.'
+        $generation = [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; SizeBytes = 1; Diagnosis = 'завдання BRAVO_ARCHIV вимкнене' }
+        $issues = @(
+            $generation,
+            (& $cloud 'SFTP MODEL' $ageOnly 'MODEL_old.7z'),
+            (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_old.7z'),
+            (& $cloud 'SFTP MODEL' 'розмір віддаленого архіву не збігається' 'MODEL_old.7z' 10 9),
+            (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_other.7z')
+        )
+        [pscustomobject]@{
+            Mixed = New-SlackAlertMessage -Issues $issues -Duration ([timespan]::FromSeconds(1))
+            AgeOnly = New-SlackAlertMessage -Issues @($issues[0], $issues[1], $issues[2]) -Duration ([timespan]::FromSeconds(1))
+            NoGeneration = New-SlackAlertMessage -Issues @($issues[1], $issues[2]) -Duration ([timespan]::FromSeconds(1))
+            OtherFiles = New-SlackAlertMessage -Issues @($issues[0], (& $cloud 'SFTP MODEL' $ageOnly 'MODEL_other.7z'), (& $cloud 'SFTP BLOG' $ageOnly 'BLOG_other.7z')) -Duration ([timespan]::FromSeconds(1))
+            Smb = New-SlackAlertMessage -Issues @($issues[0], [pscustomobject]@{ Kind = 'SMBArchive'; Component = 'NAS/SMB MODEL'; Reason = $ageOnly; FileName = 'MODEL_old.7z'; LastWriteTime = $null; SizeBytes = 10; ExpectedSizeBytes = 10; ActualSizeBytes = 10; Location = '/x' }) -Duration ([timespan]::FromSeconds(1))
+        }
+    }
+    $staleAgeOnlyText = [string]$staleSlackText.AgeOnly
+    $staleMixedText = [string]$staleSlackText.Mixed
+    Test-BRAVOCondition `
+        -Condition (
+            $staleSlackText.NoGeneration -notmatch 'та сама застаріла' -and
+            ([regex]::Matches([string]$staleSlackText.NoGeneration, 'файл є, розмір збігається')).Count -eq 2 -and
+            $staleSlackText.OtherFiles -notmatch 'та сама застаріла' -and
+            ([regex]::Matches([string]$staleSlackText.OtherFiles, 'файл є, розмір збігається')).Count -eq 2 -and
+            $staleSlackText.Smb -match 'Проблемних компонентів: 1 ·' -and
+            $staleSlackText.Smb -match 'та сама застаріла generation' -and
+            $staleSlackText.Smb -notmatch 'віддалена копія старша'
+        ) `
+        -Name 'Health/StaleGenerationCollapseNegativeAndSmbCases' `
+        -Failure "без застарілої generation або з іншим файлом хмарні рядки лишаються; SMB age-only згортається: $($staleSlackText | ConvertTo-Json -Compress)"
+    Test-BRAVOCondition `
+        -Condition (
+            $staleAgeOnlyText -match '(?s)ЛОКАЛЬНІ БЕКАПИ\s+:x: Generation — остання COMPLETE generation старша за 24 год\..*\n:mag: Причина: завдання BRAVO_ARCHIV вимкнене' -and
+            $staleAgeOnlyText -notmatch 'ІНШІ ПОМИЛКИ'
+        ) `
+        -Name 'Health/StaleGenerationInLocalSectionWithReason' `
+        -Failure "LocalBackupGeneration має бути в секції ЛОКАЛЬНІ БЕКАПИ з рядком «Причина», а не в ІНШІ ПОМИЛКИ: $staleAgeOnlyText"
+    Test-BRAVOCondition `
+        -Condition (
+            $staleAgeOnlyText -match 'Проблемних компонентів: 1 ·' -and
+            $staleAgeOnlyText -match 'Хмара \(MODEL · BLOG\): та сама застаріла generation' -and
+            $staleAgeOnlyText -notmatch 'файл є, розмір збігається' -and
+            $staleMixedText -match 'Проблемних компонентів: 3 ·' -and
+            $staleMixedText -match 'BLOG_other\.7z' -and
+            $staleMixedText -match 'розмір віддаленого архіву не збігається' -and
+            $staleMixedText -match 'Хмара \(MODEL · BLOG\): та сама застаріла generation'
+        ) `
+        -Name 'Health/StaleGenerationCollapsesOnlyAgeOnlyCloudRows' `
+        -Failure "age-only хмарні рядки для того самого локального архіву мають згортатись в один, розбіжність розміру — ні: $staleAgeOnlyText ||| $staleMixedText"
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('Kind = ''LocalBackupGeneration''') -and
+            $healthScriptText.Contains('Component = ''Generation''') -and
+            $healthScriptText.Contains('Diagnosis = Get-BRAVOHealthBackupStaleDiagnosis') -and
+            $healthScriptText.Contains('Reason = "остання COMPLETE generation старша за $($backupMonitoring.MaxBackupAgeHours) год."')
+        ) `
+        -Name 'Health/StaleGenerationDiagnosisKeepsKindAndComponent' `
+        -Failure 'Diagnosis — додаткове поле: Kind=LocalBackupGeneration, Component=Generation і Reason stale-issue не змінюються (action text, Operations, exit code)'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.MissingCompleteGenerationHasNoFictitiousFileName' -DependsOn 'Root/Runtime') { try {
     $healthGenerationModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $healthScriptText `
         -FunctionNames @(
             'ConvertTo-BRAVOUtcDateTime',
             'Get-BRAVOUtcAge',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
+            'Get-BRAVOHealthBackupStaleReason',
+            'Test-BRAVOHealthCatchUpRunIsAttempt',
+            'Get-BRAVOHealthBackupStaleDiagnosis',
+            'Get-BRAVOHealthManifestFailedStage',
             'Get-BackupHealthIssues'
         )
     $healthNoGenerationRoot = Join-Path ([IO.Path]::GetTempPath()) (
@@ -11948,13 +12367,26 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue)
             }
             function Write-HealthLog { param($Message, $Level) }
+            # Позитивний шлях обгортки діагностики: завдання є й свіже, status-файл має код 20.
+            $stateRoot = $BackupRoot
+            $schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_ARCHIV' } }
+            function Get-BRAVOScheduledTaskState {
+                param($TaskPath, $TaskName)
+                return [pscustomobject]@{ Exists = $true; State = 'Ready'; Provider = 'COM'; Task = [pscustomobject]@{ LastRunTime = (Get-Date).AddHours(-1); LastTaskResult = 0 } }
+            }
+            function Get-BRAVOOperationStatusPath { param($StateRoot, $Operation) return 'x' }
+            function Get-BRAVOOperationStatus {
+                param($Path)
+                return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = [pscustomobject]@{ exitCode = 20; exitCodeName = 'TEST_NAME'; finishedAt = (Get-Date).AddMinutes(-30) } }
+            }
             return @(Get-BackupHealthIssues)[0]
         } $healthNoGenerationRoot
         Test-BRAVOCondition `
             -Condition (
                 $healthNoGenerationIssue.Reason -eq 'не знайдено жодного COMPLETE generation manifest' -and
                 $healthNoGenerationIssue.FileName -eq 'немає даних' -and
-                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json'
+                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json' -and
+                $healthNoGenerationIssue.Diagnosis -match 'код 20 \(TEST_NAME\)'
             ) `
             -Name 'Health/MissingCompleteGenerationHasNoFictitiousFileName' `
             -Failure 'за відсутності COMPLETE generation Health має показувати причину, але не вигаданий BRAVO_BACKUP_.json'
@@ -13506,7 +13938,24 @@ function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:
 function Get-Service {
     param([string]$Name, $ErrorAction)
     if (-not $script:ProbeServices.ContainsKey($Name)) { throw "self-test: невідома служба $Name" }
-    $probeService = [pscustomobject]@{ Name = $Name; Status = [string]$script:ProbeServices[$Name] }
+    $probeStatus = [string]$script:ProbeServices[$Name]
+    # Збій читання стану: з SilentlyContinue справжній Get-Service повертає
+    # $null, з Stop — кидає виняток. Після першого винятку служба читається як Running.
+    if ($probeStatus -ceq 'UNREADABLE') {
+        if ([string]$ErrorAction -eq 'SilentlyContinue') { return $null }
+        $script:ProbeServices[$Name] = 'Running'
+        throw "self-test: стан служби $Name не прочитано"
+    }
+    # #287: служба у StartPending доходить до Running після кількох читань
+    # стану (старт завершується сам) — до того SCM не приймає від неї stop.
+    if ($probeStatus -eq 'StartPending' -and @($script:ProbeStickyPending) -notcontains $Name) {
+        $script:ProbePendingReads[$Name] = 1 + [int]$script:ProbePendingReads[$Name]
+        # ProbeStartFails: старт завершується невдачею — служба сама стає Stopped.
+        if ([int]$script:ProbePendingReads[$Name] -gt 3) { $script:ProbeServices[$Name] = $(if (@($script:ProbeStartFails) -contains $Name) { 'Stopped' } else { 'Running' }) }
+    }
+    # Зупинка, яку почав інший актор (StopPending), завершується сама.
+    if ($probeStatus -eq 'StopPending' -and @($script:ProbeStickyStopPending) -notcontains $Name) { $script:ProbeServices[$Name] = 'Stopped' }
+    $probeService = [pscustomobject]@{ Name = $Name; Status = $probeStatus }
     $probeService | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
     return $probeService
 }
@@ -13520,6 +13969,17 @@ function Stop-Service {
     # Служба, що «не зупиняється»: стан лишається Running, тож справжній
     # Invoke-ServiceStateChange дочекається таймауту й поверне Success=$false.
     if (@($script:ProbeStopFailures) -contains $Name) { Add-ProbeEvent "STOP-FAIL $Name"; return }
+    # Запит на зупинку відхилено (помилка в -ErrorVariable), але службу тим
+    # часом зупиняє інший актор.
+    if (@($script:ProbeStopRejected) -contains $Name) {
+        Add-ProbeEvent "STOP-REJECTED $Name"
+        $script:ProbeServices[$Name] = 'Stopped'
+        Set-Variable -Name ([string]$ErrorVariable) -Scope 1 -Value @(
+            (New-Object Management.Automation.ErrorRecord (New-Object Exception 'self-test: запит на зупинку відхилено'), 'SelfTest', 'NotSpecified', $null))
+        return
+    }
+    # #287: stop службі, що саме стартує, SCM відхиляє (стан не змінюється).
+    if ([string]$script:ProbeServices[$Name] -eq 'StartPending') { Add-ProbeEvent "STOP-REFUSED-START-PENDING $Name"; return }
     Add-ProbeEvent "STOP $Name"
     $script:ProbeServices[$Name] = 'Stopped'
 }
@@ -13529,23 +13989,131 @@ function Write-Log {
     param([string]$Message, [string]$Level = 'INFO', [int]$SeparatorLength = 100, [switch]$NoTimestamp, [switch]$NoConsole, [switch]$Environmental)
     if ($Level -eq 'WARNING' -and -not $Environmental) { $script:BRAVOWarningCount++ }
     if ($Level -eq 'WARNING' -or $Level -eq 'ERROR') { Add-ProbeEvent "LOG-$Level $Message" }
+    # Lifecycle-race: оператор призупиняє службу між перевіркою контракту і зупинкою.
+    if ($null -ne $script:ProbePauseBeforeStop) {
+        foreach ($probePauseName in @($script:ProbePauseBeforeStop.Keys)) {
+            if ($Message -like "Зупинка служби $probePauseName...") {
+                Invoke-ProbeLateStart -Changes $script:ProbePauseBeforeStop
+                break
+            }
+        }
+    }
 }
 function Write-BRAVOStepResult {
     param([int]$Current, [int]$Total, [string]$Name, [string]$Status, [string]$Details, $Duration)
     Add-ProbeEvent ("STEP {0}/{1} {2} {3}" -f $Current, $Total, $Name, $Status)
 }
+function Write-BRAVOOperationResult {
+    param([string]$Name, [string]$Status, $Duration, [string]$Details)
+    Add-ProbeEvent ("OPERATION {0} {1}" -f $Name, $Status)
+}
 function Write-BRAVOServiceQuiescenceState {
     param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
+    # Збій запису маркера, починаючи з N-го запису ($script:ProbeMarkerWriteFailFrom).
+    $script:ProbeMarkerWrites = 1 + [int]$script:ProbeMarkerWrites
+    if ([int]$script:ProbeMarkerWriteFailFrom -gt 0 -and $script:ProbeMarkerWrites -ge [int]$script:ProbeMarkerWriteFailFrom) {
+        Add-ProbeEvent 'MARKER-WRITE-FAIL'
+        throw 'self-test: імітований збій запису ownership-маркера'
+    }
     Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
+    # #349: утримувана служба без наміру перезапуску (зупинена до прогону).
+    foreach ($probeNoIntent in @(@($Services) | Where-Object { -not [bool]$_.RestartIntent })) { Add-ProbeEvent ("MARKER-NO-RESTART " + [string]$probeNoIntent.Name) }
+    Invoke-ProbeLateStart -Changes $script:ProbeLateStartAfterMarker
 }
-# #297: утримання від автостарту. Стаби повертають порожній знімок (жодних
-# змін start type, жодних подій у журналі проби) — оркестрація кроків і
-# порядок подій лишаються рівно тими, що були до #297.
-function New-BRAVOServiceStartTypeSnapshot { param([string[]]$ServiceNames) return @() }
-function Suspend-BRAVOServiceAutostart { param([object[]]$Snapshot) return [pscustomobject]@{ Applied = @(); Failed = @() } }
+# Lifecycle-race: інший актор (SCM autostart/recovery, оператор) запускає
+# службу ПІСЛЯ початкового знімка стану. Зміни застосовуються один раз.
+function Invoke-ProbeLateStart {
+    param([hashtable]$Changes)
+    foreach ($probeLateName in @($Changes.Keys | Sort-Object)) {
+        Add-ProbeEvent ("LATE-START {0} {1}" -f $probeLateName, $Changes[$probeLateName])
+        $script:ProbeServices[$probeLateName] = [string]$Changes[$probeLateName]
+    }
+    $Changes.Clear()
+}
+# #297: утримання від автостарту. Без $script:ProbeStartModes стаби повертають
+# порожній знімок і Disabled-тип (жодних змін start type, жодних подій у
+# журналі проби) — оркестрація кроків і порядок подій лишаються рівно тими,
+# що були до #297; Disabled не дає порожньому знімку вважатися
+# «неутримуваною» службою (#349).
+# #349: зі $script:ProbeStartModes (ім'я -> тип запуску; 'THROW' = збій
+# читання реєстру) стаби відтворюють контракт BRAVO.System: знімок бере лише
+# Automatic/AutomaticDelayed/Manual, а збій читання пробиває знімок.
+function Get-BRAVOServiceRegistryStartMode {
+    param([string]$ServiceName)
+    if ($null -eq $script:ProbeStartModes) { return 'Disabled' }
+    if (-not $script:ProbeStartModes.ContainsKey($ServiceName)) { return $null }
+    $probeStartMode = $script:ProbeStartModes[$ServiceName]
+    if ([string]$probeStartMode -ceq 'THROW') { throw "self-test: тип запуску $ServiceName не прочитано з реєстру" }
+    return $probeStartMode
+}
+function New-BRAVOServiceStartTypeSnapshot {
+    param([string[]]$ServiceNames)
+    if ($null -eq $script:ProbeStartModes) { return @() }
+    $probeSnapshot = @()
+    foreach ($probeSnapshotName in @($ServiceNames)) {
+        $probeSnapshotMode = Get-BRAVOServiceRegistryStartMode -ServiceName $probeSnapshotName
+        if (@('Automatic', 'AutomaticDelayed', 'Manual') -contains [string]$probeSnapshotMode) {
+            $probeSnapshot += @{ Name = [string]$probeSnapshotName; StartMode = [string]$probeSnapshotMode }
+        }
+    }
+    return $probeSnapshot
+}
+function Suspend-BRAVOServiceAutostart {
+    param([object[]]$Snapshot)
+    foreach ($probeHeld in @($Snapshot)) { Add-ProbeEvent ("HOLD " + [string]$probeHeld.Name) }
+    return [pscustomobject]@{ Applied = @(@($Snapshot) | ForEach-Object { [string]$_.Name }); Failed = @() }
+}
+function Get-BRAVOSevenZipExitCodeDescription { param([int]$ExitCode) return 'self-test' }
+# #349: native-операція (7-Zip архів перед реставрацією, bravocmd) лише
+# реєструється; код 2 зупиняє реставрацію на першій же операції.
+function Invoke-CommandWithLog {
+    param([string]$Command, [array]$Arguments, [string]$Description, [int]$TimeoutSeconds, [AllowNull()][string]$StandardInputText)
+    Add-ProbeEvent ("NATIVE " + $Description)
+    return 2
+}
 function Restore-BRAVOServiceStartTypeSnapshot { param([object[]]$Snapshot, [string[]]$AllowedServiceNames) return [pscustomobject]@{ Restored = @(); Unchanged = @(); Foreign = @(); Failed = @() } }
-function Confirm-BRAVOServicesQuiesced { param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds) return [pscustomobject]@{ Ok = $true; Offenders = @(); StoppedAgain = @() } }
+# Бар'єр: з -StopRunning знову зупиняє служби, що біжать; без нього (як і
+# справжній бар'єр) активна служба = порушник (fail-closed).
+function Confirm-BRAVOServicesQuiesced {
+    param([string[]]$ServiceNames, [object[]]$Snapshot, [switch]$StopRunning, [int]$StopTimeoutSeconds, [int]$PollIntervalSeconds)
+    $probeStoppedAgain = @()
+    $probeOffenders = @()
+    # Lifecycle-race: інший актор запускає службу вже після плану бар'єра.
+    if (@($ServiceNames).Count -gt 0) { Invoke-ProbeLateStart -Changes $script:ProbeLateStartBeforeBarrier }
+    if (-not $StopRunning) {
+        foreach ($probeBarrierName in @($ServiceNames)) {
+            if ([string]$script:ProbeServices[$probeBarrierName] -ne 'Stopped') {
+                Add-ProbeEvent "BARRIER-OFFENDER $probeBarrierName"
+                $probeOffenders += "${probeBarrierName}: стан $($script:ProbeServices[$probeBarrierName]) (запущена під час вікна реставрації)"
+            }
+        }
+    }
+    if ($StopRunning) {
+        foreach ($probeBarrierName in @($ServiceNames)) {
+            # #287: як і справжній бар'єр, stop службі у StartPending SCM відхиляє.
+            if ([string]$script:ProbeServices[$probeBarrierName] -eq 'StartPending') {
+                Add-ProbeEvent "STOP-REFUSED-START-PENDING $probeBarrierName"
+                $probeOffenders += "${probeBarrierName}: не вдалося зупинити повторно (стан StartPending)"
+            } elseif ([string]$script:ProbeServices[$probeBarrierName] -ne 'Stopped') {
+                Add-ProbeEvent "STOP $probeBarrierName"
+                $script:ProbeServices[$probeBarrierName] = 'Stopped'
+                $probeStoppedAgain += $probeBarrierName
+            }
+        }
+    }
+    return [pscustomobject]@{ Ok = ($probeOffenders.Count -eq 0); Offenders = @($probeOffenders); StoppedAgain = @($probeStoppedAgain) }
+}
 function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
+# #349: маркер аварійно перерваного прогону (мертвий власник) з наміром перезапуску
+# служб $script:ProbeForeignRestartIntent; без нього — маркера немає.
+# $script:ProbeForeignRestartSuppressed — маркер із restartSuppressed.
+function Get-BRAVOForeignServiceQuiescenceContext {
+    # Lifecycle-race: читання чужого маркера стоїть між початковим знімком
+    # стану служб і фазою зупинки — тут інший актор «встигає» запустити службу.
+    Invoke-ProbeLateStart -Changes $script:ProbeLateStart
+    $probeForeignPresent = @($script:ProbeForeignRestartIntent).Count -gt 0
+    return [pscustomobject]@{ Present = $probeForeignPresent; OwnerAlive = $false; Owner = $(if ($probeForeignPresent) { 'BRAVO_MAINTENANCE' } else { $null }); RestartSuppressed = [bool]$script:ProbeForeignRestartSuppressed; RestartIntentNames = @($script:ProbeForeignRestartIntent); HeldSnapshot = @() }
+}
 function Set-BRAVOServiceQuiescenceRestartSuppressed { param([bool]$Suppressed) }
 function Enter-BRAVOMaintenanceOperationLock {
     Add-ProbeEvent 'LOCK-ENTER'
@@ -13557,9 +14125,15 @@ function Initialize-BRAVOBackupManifestStorage {
     param($BackupRoot, $Logger)
     return [pscustomobject]@{ Errors = @(); Migrated = @(); Deduplicated = @(); Conflicts = @(); ManifestRootCreated = $false; ManifestRoot = '' }
 }
+# Lifecycle-race: інший актор піднімає службу безпосередньо перед обробкою trace.
+function Write-BRAVOProgressPhase {
+    param([string]$Phase, [int]$PercentComplete)
+    if ($Phase -eq 'Обробка trace і логів') { Invoke-ProbeLateStart -Changes $script:ProbeLateStartBeforeTrace }
+}
 function Check-MdFileSizes {
     param($MODEL_PATH, $MAX_MD_FILE_SIZE, $ExcludePatterns)
     Add-ProbeEvent 'SIZE-CHECK'
+    Invoke-ProbeLateStart -Changes $script:ProbeLateStartAfterStop
     if ($script:ProbeThrowInSizeCheck) { throw 'self-test: імітований збій кроку перевірки розмірів .md' }
 }
 function Get-BRAVOTraceConfiguration {
@@ -13571,7 +14145,7 @@ function Resolve-BRAVOExchangeApiRuntimeDirectory { param($ServiceName, $Fallbac
 function Get-BRAVOOSSupportTier { return [pscustomobject]@{ Tier = 'Supported'; OperatingSystem = 'self-test'; OperatingSystemVersion = '10.0'; Build = 0; PowerShellVersion = '5.1'; DotNetRelease = 0; Message = '' } }
 function Get-BRAVOToolIntegrityRecommendation { param($ToolPaths, $ManifestPath) return [pscustomobject]@{ HasIntegrityIssue = $false; Message = '' } }
 function Test-BRAVOToolManifestIntegrity { param($ToolsDirectory, $ManifestPath, $Mode) return [pscustomobject]@{ IsValid = $true; ShouldBlock = $false; Message = '' } }
-function Invoke-BRAVOTraceRotation { return [pscustomobject]@{ Moved = 0; Errors = 0 } }
+function Invoke-BRAVOTraceRotation { Add-ProbeEvent 'TRACE-ROTATION'; return [pscustomobject]@{ Moved = 0; Errors = 0 } }
 function Invoke-BRAVOExchangeApiLogRotation { return [pscustomobject]@{ Found = 0; Moved = 0; Errors = 0 } }
 function Invoke-BRAVOLegacySweep { }
 function Invoke-BRAVOLegacyModelArchiveLocalMigration { }
@@ -13761,21 +14335,154 @@ try {
     }
 
     $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
-    $probeServiceTable = if ($Scenario -ne 'ThrowInSizeCheck') {
-        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
-    } else {
+    # ThrowInSizeCheck: exchangAPI зупинена до прогону. #349 *InitiallyStopped:
+    # BravoWeb зупинена до прогону (поза restart-intent, але має утримуватись).
+    # Lifecycle-race: LateStart* і BootRecoveryLateStart стартують зі
+    # зупиненими службами, які інший актор запускає вже після знімка.
+    $probeServiceTable = if ($Scenario -eq 'ThrowInSizeCheck') {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Running' }"
+    } elseif (@('LateStartAllStopped', 'LateStartPending', 'LateStartThrow', 'BootRecoveryLateStart', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck', 'StartModeAllStoppedLateAfterMarker', 'AllStoppedExchangeApiUnreadable') -contains $Scenario) {
+        "@{ 'BRAVO' = 'Stopped'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Stopped' }"
+    } elseif ($Scenario -eq 'LateStartPartial') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Stopped' }"
+    } elseif ($Scenario -eq 'InitiallyStartPending' -or $Scenario -eq 'StuckStartPending' -or $Scenario -eq 'InitiallyStartPendingFails') {
+        "@{ 'BRAVO' = 'StartPending'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
+    } elseif ($Scenario -eq 'LateStartOperatorDisabled') {
+        "@{ 'BRAVO' = 'Stopped'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Stopped' }"
+    } elseif ($Scenario -eq 'LateStartAfterMarker') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Stopped' }"
+    } elseif ($Scenario -eq 'PausedServicesPreserved') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Paused'; 'BravoWeb' = 'Paused' }"
+    } elseif ($Scenario -eq 'BravoPausedPreserved') {
+        "@{ 'BRAVO' = 'Paused'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
+    } elseif ($Scenario -eq 'StartModePausedHeld') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Paused' }"
+    } elseif ($Scenario -like '*InitiallyStopped') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Stopped' }"
+    } else {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
     }
     $probeScenarioSeed = @(
         ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
         ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
         ('$script:ProbeServices = {0}' -f $probeServiceTable),
-        ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' })),
+        ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck' -or $Scenario -eq 'LateStartThrow') { '$true' } else { '$false' })),
         ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' })),
+        ('$script:ProbeForeignRestartIntent = {0}' -f $(if ($Scenario -like 'StartMode*IntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { "@('BravoWeb')" } else { '@()' })),
+        ('$script:ProbeForeignRestartSuppressed = {0}' -f $(if ($Scenario -eq 'StartModeSuppressedIntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { '$true' } else { '$false' })),
+        '$script:ProbePendingReads = @{}',
+        '$script:ProbeMarkerWrites = 0',
+        ('$script:ProbeMarkerWriteFailFrom = {0}' -f $(if ($Scenario -eq 'StartModeLateAfterStopMarkerFailInitiallyStopped') { '2' } else { '0' })),
+        # StuckStartPending: старт BRAVO не завершується (StartPending назавжди).
+        ('$script:ProbeStickyPending = {0}' -f $(if ($Scenario -eq 'StuckStartPending') { "@('BRAVO')" } else { '@()' })),
+        # LateStartStopPendingStuck: чужа зупинка не завершується до таймауту.
+        ('$script:ProbeStickyStopPending = {0}' -f $(if ($Scenario -eq 'LateStartStopPendingStuck') { "@('BRAVO')" } else { '@()' })),
+        ('$script:ProbeStopRejected = {0}' -f $(if ($Scenario -eq 'LateStartStopRejectedSelfStopped') { "@('BRAVO')" } else { '@()' })),
+        ('$script:ProbeStartFails = {0}' -f $(if ($Scenario -eq 'LateStartPendingFailsBeforeStop' -or $Scenario -eq 'InitiallyStartPendingFails') { "@('BRAVO')" } else { '@()' })),
+        ('$script:ProbeLateStart = {0}' -f $(switch ($Scenario) {
+                'LateStartAllStopped' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartSelfStoppedBeforeStop' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartStopPendingBeforeStop' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartStopRejectedSelfStopped' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartStopPendingStuck' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartThrow' { "@{ 'BRAVO' = 'Running' }" }
+                'BootRecoveryLateStart' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartOperatorDisabled' { "@{ 'BRAVO' = 'Running' }" }
+                'LateStartPartial' { "@{ 'exchangAPI' = 'Running'; 'BravoWeb' = 'StartPending' }" }
+                'LateStartPending' { "@{ 'BRAVO' = 'StartPending' }" }
+                'LateStartPendingFailsBeforeStop' { "@{ 'BRAVO' = 'StartPending' }" }
+                'StartModeLateStartInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeSuppressedLateStartInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                'PausedAfterSnapshot' { "@{ 'exchangAPI' = 'Paused' }" }
+                'AllStoppedExchangeApiUnreadable' { "@{ 'exchangAPI' = 'UNREADABLE' }" }
+                default { '@{}' }
+            })),
+        ('$script:ProbeLateStartBeforeBarrier = {0}' -f $(if ($Scenario -eq 'StartModeLateBeforeBarrierInitiallyStopped') { "@{ 'BravoWeb' = 'Running' }" } else { '@{}' })),
+        ('$script:ProbeLateStartBeforeTrace = {0}' -f $(if ($Scenario -eq 'LateStartBeforeTrace') { "@{ 'BRAVO' = 'Running' }" } else { '@{}' })),
+        ('$script:ProbePauseBeforeStop = {0}' -f $(switch ($Scenario) {
+                'PausedBeforeStop' { "@{ 'exchangAPI' = 'Paused' }" }
+                # Інший актор уже зупиняє службу між контрактом і Stop-Service.
+                'LateStartStopPendingBeforeStop' { "@{ 'BRAVO' = 'StopPending' }" }
+                'LateStartStopPendingStuck' { "@{ 'BRAVO' = 'StopPending' }" }
+                default { '@{}' }
+            })),
+        ('$script:ProbeLateStartAfterStop = {0}' -f $(switch ($Scenario) {
+                'StartModeLateAfterStopInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeAllStoppedLateAfterStop' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeLateAfterStopMarkerFailInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeLatePendingAfterStopInitiallyStopped' { "@{ 'BravoWeb' = 'StartPending' }" }
+                # Інший актор піднімає і призупиняє служби вже після фази зупинки.
+                'PausePendingBeforeRestart' { "@{ 'exchangAPI' = 'ContinuePending'; 'BravoWeb' = 'PausePending' }" }
+                'BravoPausePendingBeforeRestart' { "@{ 'BRAVO' = 'PausePending' }" }
+                default { '@{}' }
+            })),
+        ('$script:ProbeLateStartAfterMarker = {0}' -f $(switch ($Scenario) {
+                'LateStartAfterMarker' { "@{ 'BravoWeb' = 'Running' }" }
+                'StartModeLateAfterMarkerInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
+                # Служба, запущена після знімка, сама зупиняється до фази зупинки.
+                'LateStartSelfStoppedBeforeStop' { "@{ 'BRAVO' = 'Stopped' }" }
+                # Стан exchangAPI не читається саме у фазі зупинки.
+                'ExchangeApiUnreadableAtStop' { "@{ 'exchangAPI' = 'UNREADABLE' }" }
+                # Усі служби стояли на обох читаннях; BravoWeb стартує вже після маркера.
+                'StartModeAllStoppedLateAfterMarker' { "@{ 'BravoWeb' = 'Running' }" }
+                default { '@{}' }
+            })),
+        # #349: типи запуску служб (лише сценарії утримання; інакше — стаби до #297).
+        ('$script:ProbeStartModes = {0}' -f $(switch ($Scenario) {
+                'StartModeOther' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Other'; 'BravoWeb' = 'Manual' }" }
+                'StartModeUnreadable' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed' }" }
+                'StartModeOtherAndUnreadable' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Other' }" }
+                'StartModeQueryThrows' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'THROW'; 'BravoWeb' = 'Manual' }" }
+                'StartModeHeld' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeOperatorDisabled' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Disabled'; 'BravoWeb' = 'Manual' }" }
+                'StartModeOtherInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Other' }" }
+                'StartModeHeldInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeOrphanIntentInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeSuppressedIntentInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateStartInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateAfterMarkerInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateAfterStopInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeAllStoppedLateAfterStop' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateBeforeBarrierInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeAllStoppedLateAfterMarker' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateAfterStopMarkerFailInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLatePendingAfterStopInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModePausedHeld' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeSuppressedLateStartInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                default { '$null' }
+            })),
         # #297: результат раннього самовідновлення типів запуску (у production
         # його виставляє преамбула, яку seed замінює).
         '$script:startModeRepairResult = [pscustomobject]@{ Status = ''NoMarker''; Owner = $null; Snapshot = @(); Restored = @(); Failed = @(); Foreign = @() }'
     ) -join "`n"
+    # #349: сценарії утримання вмикають реставрацію (після seed) — щоб довести,
+    # що fail-closed зупиняє її ДО архіву перед реставрацією й bravocmd.
+    $probeRestoreSeed = ''
+    if ($Scenario -like 'StartMode*') {
+        $probeRestoreSeed = @(
+            '$shouldRestore = $true',
+            '$ForceRestore = $true',
+            '$restoreReason = ''self-test''',
+            '$script:BRAVOMaintenanceRestoreStepEnabled = $true',
+            '$ARCH_NAME1 = ''self-test_before.mdz''',
+            '$SIZES_FILE = Join-Path $probeWorkRoot ''logs\file_sizes_before.csv''',
+            '$arcCommonParams = @()',
+            '$MODEL_PROJECT_PATH = $MODEL_PATH',
+            '$MODEL_NAME = ''self-test''',
+            '$MAIN_MODEL_FILE = ''self-test.md''',
+            '$BRAVOCMD_PATH = Join-Path $probeWorkRoot ''lims\bravocmd.exe''',
+            '[void][IO.Directory]::CreateDirectory($MODEL_PATH)',
+            '[IO.File]::WriteAllText((Join-Path $MODEL_PATH ''self-test.md''), ''self-test'')',
+            '[void][IO.Directory]::CreateDirectory($LOG_DIR)',
+            '[void][IO.Directory]::CreateDirectory($ARC_DIR)'
+        ) -join "`n"
+    } elseif ($Scenario -eq 'BootRecoveryLateStart') {
+        # Профіль boot-recovery: «hold» усіх увімкнених керованих служб.
+        $probeRestoreSeed = '$bootRestoreIgnoresWindow = $true'
+    } elseif ($Scenario -eq 'LateStartOperatorDisabled') {
+        # exchangAPI вимкнена оператором (Disabled) — працює, але не керується.
+        $probeRestoreSeed = @('$exchangAPIServiceEnabled = $false', '$exchangAPIServiceDisabled = $true') -join "`n"
+    }
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
         'function Invoke-BRAVOMaintenanceOrchestrationProbe {',
@@ -13784,6 +14491,7 @@ try {
         $probeStubs,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
+        $probeRestoreSeed,
         'try {',
         $probeRegion.ToString(),
         ('} finally ' + $probeOuterTry.Finally.Extent.Text),
@@ -13827,7 +14535,7 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure')) {
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped', 'StartModeLatePendingAfterStopInitiallyStopped', 'PausedServicesPreserved', 'BravoPausedPreserved', 'StartModePausedHeld', 'PausedAfterSnapshot', 'LateStartBeforeTrace', 'PausedBeforeStop', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'InitiallyStartPendingFails', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck', 'StartModeLateBeforeBarrierInitiallyStopped', 'ExchangeApiUnreadableAtStop', 'PausePendingBeforeRestart', 'BravoPausePendingBeforeRestart', 'StartModeAllStoppedLateAfterMarker', 'AllStoppedExchangeApiUnreadable')) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
                 $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
@@ -14002,6 +14710,626 @@ try {
                 ) `
                 -Name "Maintenance/OrchestrationRestoresServicesAfterControlledStopFailure" `
                 -Failure "контрольований збій зупинки BravoWeb має дати [3/8] FAIL без переривання порядку [1/8]..[8/8], запуск у finally зупинених прогоном BRAVO й exchangAPI, прибраний маркер quiescence, статус-файл і код 60 (MaintenanceFailed), звільнений lock і зовнішній finally; проба: $($maintenanceStopFailure | ConvertTo-Json -Compress -Depth 4)"
+
+            # (4) #349: Maintenance з реставрацією, коли службу неможливо
+            # утримати від автостарту (тип запуску Other, нечитаний або збій
+            # читання реєстру). Справжня оркестрація: збій утримання видно в
+            # журналі (ERROR), реставрацію скасовано fail-closed ДО першої
+            # native-операції (архів перед реставрацією, bravocmd), служба не
+            # «утримана» мовчки, а решта обслуговування триває за контрактом
+            # (кроки [1/8]..[8/8], служби підняті у finally, маркер прибрано).
+            # Контроль (Automatic/AutomaticDelayed/Manual і Disabled
+            # оператором) доходить до архіву перед реставрацією — сценарії
+            # не вакуумні.
+            $maintenanceStartModeOutcome = {
+                param([string]$Scenario)
+                $outcome = $maintenanceOrchestrationResults[$Scenario]
+                $events = @()
+                $labels = @()
+                $probeOk = ($null -ne $outcome -and $null -eq $outcome.PSObject.Properties['ProbeError'])
+                if ($probeOk) {
+                    $events = @($outcome.Events | ForEach-Object { [string]$_ })
+                    $labels = @($events | Where-Object { $_ -match $maintenanceOrchestrationStepPattern } | ForEach-Object {
+                            [void]($_ -match $maintenanceOrchestrationStepPattern)
+                            "[{0}/{1}] {2}" -f $Matches[1], $Matches[2], $Matches[3]
+                        })
+                }
+                return [pscustomobject]@{
+                    ProbeOk = $probeOk
+                    ExitCode = $(if ($probeOk) { [int]$outcome.ExitCode } else { -1 })
+                    Events = $events
+                    StepOrderOk = (($labels -join '|') -ceq ($maintenanceExpectedStepLabels -join '|'))
+                    Native = @($events | Where-Object { $_ -like 'NATIVE *' })
+                    RestoreCancelled = @($events | Where-Object { $_ -like 'LOG-ERROR ПОМИЛКА: Реставрацію скасовано ДО архівації*' }).Count -eq 1
+                    RestoreStepFailed = @($events | Where-Object { $_ -ceq 'STEP 5/8 Реставрація моделі FAIL' }).Count -eq 1
+                    ServicesStarted = (@($events | Where-Object { $_ -ceq 'START BRAVO' -or $_ -ceq 'START exchangAPI' -or $_ -ceq 'START BravoWeb' }).Count -eq 3)
+                    MarkerCleared = @($events | Where-Object { $_ -ceq 'MARKER-CLEAR' }).Count -eq 1
+                    Held = @($events | Where-Object { $_ -like 'HOLD *' } | ForEach-Object { $_.Substring(5) })
+                    UnrestorableErrors = @($events | Where-Object { $_ -like 'LOG-ERROR *(#349)' })
+                    FirstStop = (& $maintenanceOrchestrationEventIndex $events '^STOP ')
+                    UnrestorableErrorIndex = (& $maintenanceOrchestrationEventIndex $events '^LOG-ERROR .*\(#349\)$')
+                    MarkerWriteIndex = (& $maintenanceOrchestrationEventIndex $events '^MARKER-WRITE ')
+                }
+            }
+            $maintenanceStartModeFailClosed = {
+                param($Outcome)
+                return ($Outcome.ProbeOk -and
+                    $Outcome.ExitCode -eq 40 -and
+                    $Outcome.StepOrderOk -and
+                    @($Outcome.Native).Count -eq 0 -and
+                    $Outcome.RestoreCancelled -and
+                    $Outcome.RestoreStepFailed -and
+                    $Outcome.ServicesStarted -and
+                    $Outcome.MarkerCleared -and
+                    (& $maintenanceOrchestrationFinallyTail $Outcome.Events))
+            }
+            $maintenanceStartModeOther = & $maintenanceStartModeOutcome 'StartModeOther'
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $maintenanceStartModeFailClosed $maintenanceStartModeOther) -and
+                    @($maintenanceStartModeOther.UnrestorableErrors).Count -eq 1 -and
+                    [string]$maintenanceStartModeOther.UnrestorableErrors[0] -like '*exchangAPI (тип запуску: Other)*' -and
+                    $maintenanceStartModeOther.UnrestorableErrorIndex -ge 0 -and
+                    $maintenanceStartModeOther.UnrestorableErrorIndex -lt $maintenanceStartModeOther.MarkerWriteIndex -and
+                    $maintenanceStartModeOther.MarkerWriteIndex -lt $maintenanceStartModeOther.FirstStop -and
+                    ($maintenanceStartModeOther.Held -join ',') -ceq 'BRAVO,BravoWeb'
+                ) `
+                -Name "Maintenance/StartModeOtherCancelsRestoreFailClosed" `
+                -Failure ("Maintenance (#349): служба з типом запуску Other має дати ERROR до зупинки служб і скасувати реставрацію ДО архіву й bravocmd (без native-операцій), а решта обслуговування — тривати; події: " + ($maintenanceStartModeOther.Events -join ' | '))
+            $maintenanceStartModeUnreadable = & $maintenanceStartModeOutcome 'StartModeUnreadable'
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $maintenanceStartModeFailClosed $maintenanceStartModeUnreadable) -and
+                    @($maintenanceStartModeUnreadable.UnrestorableErrors).Count -eq 1 -and
+                    [string]$maintenanceStartModeUnreadable.UnrestorableErrors[0] -like '*BravoWeb (тип запуску: не прочитано)*' -and
+                    ($maintenanceStartModeUnreadable.Held -join ',') -ceq 'BRAVO,exchangAPI'
+                ) `
+                -Name "Maintenance/StartModeUnreadableCancelsRestoreFailClosed" `
+                -Failure ("Maintenance (#349): служба з нечитаним типом запуску має дати ERROR і скасувати реставрацію ДО архіву й bravocmd; події: " + ($maintenanceStartModeUnreadable.Events -join ' | '))
+            $maintenanceStartModeOtherAndUnreadable = & $maintenanceStartModeOutcome 'StartModeOtherAndUnreadable'
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $maintenanceStartModeFailClosed $maintenanceStartModeOtherAndUnreadable) -and
+                    @($maintenanceStartModeOtherAndUnreadable.UnrestorableErrors).Count -eq 1 -and
+                    [string]$maintenanceStartModeOtherAndUnreadable.UnrestorableErrors[0] -like '*exchangAPI (тип запуску: Other)*' -and
+                    [string]$maintenanceStartModeOtherAndUnreadable.UnrestorableErrors[0] -like '*BravoWeb (тип запуску: не прочитано)*' -and
+                    ($maintenanceStartModeOtherAndUnreadable.Held -join ',') -ceq 'BRAVO'
+                ) `
+                -Name "Maintenance/StartModeSeveralUnrestorableAllReported" `
+                -Failure ("Maintenance (#349): кілька неутримуваних служб мають бути названі всі в одному ERROR, реставрацію скасовано ДО архіву й bravocmd; події: " + ($maintenanceStartModeOtherAndUnreadable.Events -join ' | '))
+            $maintenanceStartModeQueryThrows = & $maintenanceStartModeOutcome 'StartModeQueryThrows'
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $maintenanceStartModeFailClosed $maintenanceStartModeQueryThrows) -and
+                    @($maintenanceStartModeQueryThrows.Held).Count -eq 0 -and
+                    @($maintenanceStartModeQueryThrows.Events | Where-Object { $_ -like 'LOG-WARNING Не вдалося утримати служби від автостарту (#297): знімок типів запуску не знято:*' }).Count -eq 1
+                ) `
+                -Name "Maintenance/StartModeQueryFailureCancelsRestoreFailClosed" `
+                -Failure ("Maintenance (#349): збій читання типу запуску з реєстру має бути збоєм утримання і скасувати реставрацію ДО архіву й bravocmd; події: " + ($maintenanceStartModeQueryThrows.Events -join ' | '))
+            $maintenanceStartModeHeld = & $maintenanceStartModeOutcome 'StartModeHeld'
+            $maintenanceStartModeOperatorDisabled = & $maintenanceStartModeOutcome 'StartModeOperatorDisabled'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceStartModeHeld.ProbeOk -and $maintenanceStartModeHeld.StepOrderOk -and
+                    ($maintenanceStartModeHeld.Held -join ',') -ceq 'BRAVO,exchangAPI,BravoWeb' -and
+                    @($maintenanceStartModeHeld.UnrestorableErrors).Count -eq 0 -and
+                    -not $maintenanceStartModeHeld.RestoreCancelled -and
+                    ($maintenanceStartModeHeld.Native -join '|') -ceq 'NATIVE Архівація моделі перед реставрацією' -and
+                    $maintenanceStartModeOperatorDisabled.ProbeOk -and $maintenanceStartModeOperatorDisabled.StepOrderOk -and
+                    ($maintenanceStartModeOperatorDisabled.Held -join ',') -ceq 'BRAVO,BravoWeb' -and
+                    @($maintenanceStartModeOperatorDisabled.UnrestorableErrors).Count -eq 0 -and
+                    -not $maintenanceStartModeOperatorDisabled.RestoreCancelled -and
+                    ($maintenanceStartModeOperatorDisabled.Native -join '|') -ceq 'NATIVE Архівація моделі перед реставрацією'
+                ) `
+                -Name "Maintenance/StartModeHeldOrOperatorDisabledReachesRestore" `
+                -Failure ("Maintenance (#349): Automatic/AutomaticDelayed/Manual утримуються, Disabled оператором не змінюється й не є збоєм — реставрація доходить до архіву перед реставрацією; події: " + ($maintenanceStartModeHeld.Events -join ' | ') + ' || ' + ($maintenanceStartModeOperatorDisabled.Events -join ' | '))
+            # #349 (рев'ю): служба, зупинена ДО прогону, при запланованій реставрації
+            # теж утримується й перевіряється (зупинка діє за фактичним станом, тож
+            # служба, що встигла запуститися, інакше була б поза знімком і бар'єрами),
+            # але без наміру перезапуску: у finally вона не стартує.
+            $maintenanceStartModeOtherStopped = & $maintenanceStartModeOutcome 'StartModeOtherInitiallyStopped'
+            $maintenanceStartModeHeldStopped = & $maintenanceStartModeOutcome 'StartModeHeldInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceStartModeOtherStopped.ProbeOk -and
+                    $maintenanceStartModeOtherStopped.ExitCode -eq 40 -and
+                    $maintenanceStartModeOtherStopped.StepOrderOk -and
+                    @($maintenanceStartModeOtherStopped.Native).Count -eq 0 -and
+                    $maintenanceStartModeOtherStopped.RestoreCancelled -and
+                    @($maintenanceStartModeOtherStopped.UnrestorableErrors).Count -eq 1 -and
+                    [string]$maintenanceStartModeOtherStopped.UnrestorableErrors[0] -like '*BravoWeb (тип запуску: Other)*' -and
+                    (@($maintenanceStartModeOtherStopped.Events | Where-Object { $_ -like 'START *' }) -join ',') -ceq 'START BRAVO,START exchangAPI' -and
+                    $maintenanceStartModeHeldStopped.ProbeOk -and $maintenanceStartModeHeldStopped.StepOrderOk -and
+                    @($maintenanceStartModeHeldStopped.Events | Where-Object { $_ -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb' }).Count -eq 1 -and
+                    (@($maintenanceStartModeHeldStopped.Events | Where-Object { $_ -like 'MARKER-NO-RESTART *' }) -join ',') -ceq 'MARKER-NO-RESTART BravoWeb' -and
+                    ($maintenanceStartModeHeldStopped.Held -join ',') -ceq 'BRAVO,exchangAPI,BravoWeb' -and
+                    ($maintenanceStartModeHeldStopped.Native -join '|') -ceq 'NATIVE Архівація моделі перед реставрацією' -and
+                    @($maintenanceStartModeHeldStopped.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 0
+                ) `
+                -Name "Maintenance/StartModeInitiallyStoppedServiceIsHeldWithoutRestart" `
+                -Failure ("Maintenance (#349): служба, зупинена до прогону, при запланованій реставрації має утримуватись і перевірятись (Other -> fail-closed), але не стартувати у finally; події: " + ($maintenanceStartModeOtherStopped.Events -join ' | ') + ' || ' + ($maintenanceStartModeHeldStopped.Events -join ' | '))
+            # #349 (рев'ю): служба, яку зупинив аварійно перерваний прогін із наміром
+            # перезапуску, не втрачає цей намір, коли маркер перезаписується: вона
+            # утримується з RestartIntent і стартує у finally. Маркер із
+            # restartSuppressed (свідома відмова від перезапуску) не успадковується.
+            $maintenanceStartModeOrphanIntent = & $maintenanceStartModeOutcome 'StartModeOrphanIntentInitiallyStopped'
+            $maintenanceStartModeSuppressedIntent = & $maintenanceStartModeOutcome 'StartModeSuppressedIntentInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceStartModeOrphanIntent.ProbeOk -and $maintenanceStartModeOrphanIntent.StepOrderOk -and
+                    @($maintenanceStartModeOrphanIntent.Events | Where-Object { $_ -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb' }).Count -eq 1 -and
+                    @($maintenanceStartModeOrphanIntent.Events | Where-Object { $_ -like 'MARKER-NO-RESTART *' }).Count -eq 0 -and
+                    ($maintenanceStartModeOrphanIntent.Held -join ',') -ceq 'BRAVO,exchangAPI,BravoWeb' -and
+                    $maintenanceStartModeOrphanIntent.ServicesStarted -and
+                    $maintenanceStartModeOrphanIntent.MarkerCleared -and
+                    $maintenanceStartModeSuppressedIntent.ProbeOk -and $maintenanceStartModeSuppressedIntent.StepOrderOk -and
+                    (@($maintenanceStartModeSuppressedIntent.Events | Where-Object { $_ -like 'MARKER-NO-RESTART *' }) -join ',') -ceq 'MARKER-NO-RESTART BravoWeb' -and
+                    @($maintenanceStartModeSuppressedIntent.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 0
+                ) `
+                -Name "Maintenance/StartModeOrphanRestartIntentSurvivesMarkerRewrite" `
+                -Failure ("Maintenance (#349): намір перезапуску служби, зупиненої аварійно перерваним прогоном, має зберегтися в маркері й служба має стартувати у finally, а restartSuppressed — не успадковуватись; події: " + ($maintenanceStartModeOrphanIntent.Events -join ' | ') + ' || ' + ($maintenanceStartModeSuppressedIntent.Events -join ' | '))
+
+            # Lifecycle-інваріант (усі сценарії оркестрації): Maintenance зупиняє
+            # службу ЛИШЕ коли чинний ownership-маркер уже містить її з наміром
+            # перезапуску, і кожну зупинену службу запускає у finally. Служба,
+            # яку інший актор запустив після початкового знімка, інакше
+            # зупинялася б поза маркером/утриманням і лишалася б лежати.
+            $maintenanceLifecycleViolations = @()
+            foreach ($maintenanceLifecycleScenario in @($maintenanceOrchestrationResults.Keys | Sort-Object)) {
+                $maintenanceLifecycleOutcome = $maintenanceOrchestrationResults[$maintenanceLifecycleScenario]
+                if ($null -ne $maintenanceLifecycleOutcome.PSObject.Properties['ProbeError']) {
+                    $maintenanceLifecycleViolations += "${maintenanceLifecycleScenario}: проба не виконалась ($($maintenanceLifecycleOutcome.ProbeError))"
+                    continue
+                }
+                $maintenanceLifecycleIntent = @{}
+                $maintenanceLifecycleStopped = @()
+                $maintenanceLifecycleStarted = @()
+                foreach ($maintenanceLifecycleEvent in @($maintenanceLifecycleOutcome.Events | ForEach-Object { [string]$_ })) {
+                    if ($maintenanceLifecycleEvent -like 'MARKER-WRITE *') {
+                        $maintenanceLifecycleIntent = @{}
+                        foreach ($maintenanceLifecycleName in $maintenanceLifecycleEvent.Substring(13).Split(',')) {
+                            if ($maintenanceLifecycleName) { $maintenanceLifecycleIntent[$maintenanceLifecycleName] = $true }
+                        }
+                    } elseif ($maintenanceLifecycleEvent -like 'MARKER-NO-RESTART *') {
+                        $maintenanceLifecycleIntent[$maintenanceLifecycleEvent.Substring(18)] = $false
+                    } elseif ($maintenanceLifecycleEvent -like 'STOP *') {
+                        $maintenanceLifecycleName = $maintenanceLifecycleEvent.Substring(5)
+                        $maintenanceLifecycleStopped += $maintenanceLifecycleName
+                        if (-not ($maintenanceLifecycleIntent.ContainsKey($maintenanceLifecycleName) -and $maintenanceLifecycleIntent[$maintenanceLifecycleName])) {
+                            $maintenanceLifecycleViolations += "${maintenanceLifecycleScenario}: STOP $maintenanceLifecycleName без маркера з наміром перезапуску"
+                        }
+                    } elseif ($maintenanceLifecycleEvent -like 'START *') {
+                        $maintenanceLifecycleStarted += $maintenanceLifecycleEvent.Substring(6)
+                    } elseif ($maintenanceLifecycleEvent -match '^LATE-START (\S+) (Running|StartPending|Paused|PausePending|ContinuePending)$' -and $maintenanceLifecycleStopped -contains $Matches[1]) {
+                        # Зупинену прогоном службу знову підняв інший актор — зупиненою вона не лишилась.
+                        $maintenanceLifecycleStarted += $Matches[1]
+                    }
+                }
+                foreach ($maintenanceLifecycleName in $maintenanceLifecycleStopped) {
+                    if ($maintenanceLifecycleStarted -notcontains $maintenanceLifecycleName) {
+                        $maintenanceLifecycleViolations += "${maintenanceLifecycleScenario}: $maintenanceLifecycleName зупинено, але не запущено у finally"
+                    }
+                }
+            }
+            Test-BRAVOCondition `
+                -Condition ($maintenanceLifecycleViolations.Count -eq 0) `
+                -Name "Maintenance/LifecycleEveryStopHasRestartContract" `
+                -Failure ("Maintenance: кожна зупинка служби має йти після ownership-маркера з наміром її перезапуску, а зупинена служба — стартувати у finally; порушення: " + ($maintenanceLifecycleViolations -join ' | '))
+
+            # Lifecycle-race (не-restore прогін): служба, зупинена на момент
+            # початкового знімка, яку інший актор запустив до фази зупинки,
+            # потрапляє в маркер із наміром перезапуску, зупиняється (крок
+            # [3/8] не SKIPPED) і запускається у finally. exchangAPI
+            # зупиняється за свіжим, а не закешованим на старті станом. Код 10
+            # (SuccessWithWarnings) — від попередження про неактивні на старті
+            # служби; інших WARNING немає.
+            # Намір перезапуску пізно запущеної служби записується не за знімком
+            # перед фазою зупинки, а за свіжим станом безпосередньо перед її
+            # зупинкою: перший маркер містить службу без наміру, наступний — з
+            # наміром, і лише після нього йде STOP.
+            $maintenanceMarkerTrail = {
+                param([string[]]$Events)
+                @($Events | Where-Object { $_ -like 'MARKER-WRITE *' -or $_ -like 'MARKER-NO-RESTART *' }) -join '|'
+            }
+            # Служби без наміру перезапуску в ОСТАННЬОМУ записаному маркері.
+            $maintenanceFinalMarkerNoRestart = {
+                param([string[]]$Events)
+                $finalMarkerIndex = -1
+                for ($eventIndex = 0; $eventIndex -lt $Events.Count; $eventIndex++) {
+                    if ($Events[$eventIndex] -like 'MARKER-WRITE *') { $finalMarkerIndex = $eventIndex }
+                }
+                $finalNoRestart = @()
+                if ($finalMarkerIndex -ge 0) {
+                    for ($eventIndex = $finalMarkerIndex + 1; $eventIndex -lt $Events.Count -and $Events[$eventIndex] -like 'MARKER-NO-RESTART *'; $eventIndex++) {
+                        $finalNoRestart += $Events[$eventIndex].Substring('MARKER-NO-RESTART '.Length)
+                    }
+                }
+                $finalNoRestart -join ','
+            }
+            $maintenanceLateAll = & $maintenanceStartModeOutcome 'LateStartAllStopped'
+            $maintenanceLatePartial = & $maintenanceStartModeOutcome 'LateStartPartial'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateAll.ProbeOk -and $maintenanceLateAll.ExitCode -eq 10 -and $maintenanceLateAll.StepOrderOk -and
+                    (& $maintenanceMarkerTrail $maintenanceLateAll.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO|MARKER-WRITE BRAVO' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceLateAll.Events '^STOP BRAVO$') -gt ([array]::LastIndexOf([string[]]$maintenanceLateAll.Events, 'MARKER-WRITE BRAVO')) -and
+                    @($maintenanceLateAll.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб OK' }).Count -eq 1 -and
+                    (@($maintenanceLateAll.Events | Where-Object { $_ -like 'STOP *' -or $_ -like 'START *' }) -join '|') -ceq 'STOP BRAVO|START BRAVO' -and
+                    $maintenanceLateAll.MarkerCleared -and
+                    $maintenanceLatePartial.ProbeOk -and $maintenanceLatePartial.ExitCode -eq 10 -and $maintenanceLatePartial.StepOrderOk -and
+                    (& $maintenanceMarkerTrail $maintenanceLatePartial.Events) -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb|MARKER-NO-RESTART exchangAPI|MARKER-NO-RESTART BravoWeb|MARKER-WRITE BRAVO,exchangAPI,BravoWeb|MARKER-NO-RESTART exchangAPI|MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceLatePartial.Events '^STOP exchangAPI$') -gt ([array]::LastIndexOf([string[]]$maintenanceLatePartial.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
+                    (@($maintenanceLatePartial.Events | Where-Object { $_ -like 'STOP *' } | Sort-Object) -join '|') -ceq 'STOP BRAVO|STOP BravoWeb|STOP exchangAPI' -and
+                    (@($maintenanceLatePartial.Events | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb|START exchangAPI' -and
+                    @($maintenanceLatePartial.Events | Where-Object { $_ -like 'LOG-WARNING*' -and $_ -notlike 'LOG-WARNING До початку maintenance не запущені служби:*' }).Count -eq 0 -and
+                    $maintenanceLatePartial.MarkerCleared
+                ) `
+                -Name "Maintenance/LifecycleLateStartBeforeStopIsOwnedAndRestarted" `
+                -Failure ("Maintenance: служба, запущена іншим актором після початкового знімка, має отримати намір перезапуску в маркері безпосередньо перед зупинкою за свіжим станом і бути запущеною у finally; події: " + ($maintenanceLateAll.Events -join ' | ') + ' || ' + ($maintenanceLatePartial.Events -join ' | '))
+
+            # Служба, запущена після знімка, але зупинена іншим актором ще до
+            # фази зупинки, наміру перезапуску не отримує: Maintenance її не
+            # зупиняє й не запускає, а маркер лишає її без наміру.
+            $maintenanceLateSelfStopped = & $maintenanceStartModeOutcome 'LateStartSelfStoppedBeforeStop'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateSelfStopped.ProbeOk -and $maintenanceLateSelfStopped.StepOrderOk -and
+                    @($maintenanceLateSelfStopped.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceMarkerTrail $maintenanceLateSelfStopped.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO' -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateSelfStopped.Events) -ceq 'BRAVO'
+                ) `
+                -Name "Maintenance/LifecycleLateStartIntentRecordedOnlyAtStop" `
+                -Failure ("Maintenance: служба, запущена після знімка й зупинена іншим актором до фази зупинки, не повинна отримати намір перезапуску (Maintenance її не зупиняла й не запускає); події: " + ($maintenanceLateSelfStopped.Events -join ' | '))
+
+            # Служба у StartPending, намір якої записано перед зупинкою, але старт
+            # якої завершився невдачею (сама стала Stopped) ще до Stop-Service:
+            # Maintenance її не зупиняла, тож намір знято й з маркера, а finally
+            # її не запускає.
+            $maintenanceLatePendingFails = & $maintenanceStartModeOutcome 'LateStartPendingFailsBeforeStop'
+            $maintenanceInitialPendingFails = & $maintenanceStartModeOutcome 'InitiallyStartPendingFails'
+            $maintenanceLateStopPending = & $maintenanceStartModeOutcome 'LateStartStopPendingBeforeStop'
+            $maintenanceLateStopRejected = & $maintenanceStartModeOutcome 'LateStartStopRejectedSelfStopped'
+            $maintenanceLateStopPendingStuck = & $maintenanceStartModeOutcome 'LateStartStopPendingStuck'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLatePendingFails.ProbeOk -and $maintenanceLatePendingFails.StepOrderOk -and
+                    @($maintenanceLatePendingFails.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceMarkerTrail $maintenanceLatePendingFails.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO|MARKER-WRITE BRAVO|MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO' -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLatePendingFails.Events) -ceq 'BRAVO' -and
+                    # Характеризація до #360: намір, що був на старті (StartPending
+                    # на початковому знімку), не знімається — finally запускає службу.
+                    $maintenanceInitialPendingFails.ProbeOk -and $maintenanceInitialPendingFails.StepOrderOk -and
+                    @($maintenanceInitialPendingFails.Events | Where-Object { $_ -ceq 'START BRAVO' }).Count -eq 1 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceInitialPendingFails.Events) -ceq '' -and
+                    # Службу вже зупиняє інший актор (StopPending): Stop-Service не
+                    # надсилається, намір знято, finally її не запускає.
+                    $maintenanceLateStopPending.ProbeOk -and $maintenanceLateStopPending.StepOrderOk -and
+                    @($maintenanceLateStopPending.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopPending.Events) -ceq 'BRAVO' -and
+                    # Stop-Service відхилено, а службу зупинив інший актор: зупинку
+                    # Maintenance собі не приписує, намір знято.
+                    $maintenanceLateStopRejected.ProbeOk -and $maintenanceLateStopRejected.StepOrderOk -and
+                    @($maintenanceLateStopRejected.Events | Where-Object { $_ -ceq 'STOP-REJECTED BRAVO' }).Count -eq 1 -and
+                    @($maintenanceLateStopRejected.Events | Where-Object { $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopRejected.Events) -ceq 'BRAVO' -and
+                    # Чужа зупинка (StopPending) не завершилась до таймауту: операція
+                    # невдала, але Stop-Service не надсилався — намір теж знято.
+                    $maintenanceLateStopPendingStuck.ProbeOk -and $maintenanceLateStopPendingStuck.StepOrderOk -and
+                    @($maintenanceLateStopPendingStuck.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceLateStopPendingStuck.Events) -ceq 'BRAVO'
+                ) `
+                -Name "Maintenance/LifecycleIntentRevokedWhenServiceStopsByItself" `
+                -Failure ("Maintenance: намір перезапуску, записаний перед зупинкою, має бути знятий (і в маркері), якщо служба зупинилася сама до Stop-Service — finally її не запускає; події: " + ($maintenanceLatePendingFails.Events -join ' | ') + ' || ' + ($maintenanceInitialPendingFails.Events -join ' | ') + ' || ' + ($maintenanceLateStopPending.Events -join ' | ') + ' || ' + ($maintenanceLateStopRejected.Events -join ' | ') + ' || ' + ($maintenanceLateStopPendingStuck.Events -join ' | '))
+
+            # #287: служба у StartPending (на момент знімка або після нього)
+            # зупиняється після завершення старту (stop не надсилається, поки SCM
+            # його відхиляє) і запускається у finally; ротація trace не
+            # починається на службі, що саме піднімається.
+            $maintenanceLatePending = & $maintenanceStartModeOutcome 'LateStartPending'
+            $maintenanceInitialPending = & $maintenanceStartModeOutcome 'InitiallyStartPending'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLatePending.ProbeOk -and $maintenanceLatePending.ExitCode -eq 10 -and $maintenanceLatePending.StepOrderOk -and
+                    (& $maintenanceMarkerTrail $maintenanceLatePending.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO|MARKER-WRITE BRAVO' -and
+                    (@($maintenanceLatePending.Events | Where-Object { $_ -like 'STOP*' -or $_ -like 'START *' }) -join '|') -ceq 'STOP BRAVO|START BRAVO' -and
+                    @($maintenanceLatePending.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб OK' }).Count -eq 1 -and
+                    $maintenanceInitialPending.ProbeOk -and $maintenanceInitialPending.ExitCode -eq 0 -and $maintenanceInitialPending.StepOrderOk -and
+                    @($maintenanceInitialPending.Events | Where-Object { $_ -like 'STOP-REFUSED*' }).Count -eq 0 -and
+                    (@($maintenanceInitialPending.Events | Where-Object { $_ -like 'STOP *' } | Sort-Object) -join '|') -ceq 'STOP BRAVO|STOP BravoWeb|STOP exchangAPI' -and
+                    (@($maintenanceInitialPending.Events | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb|START exchangAPI' -and
+                    @($maintenanceInitialPending.Events | Where-Object { $_ -like 'LOG-ERROR*' }).Count -eq 0
+                ) `
+                -Name "Maintenance/LifecycleStartPendingIsStoppedAndRestarted" `
+                -Failure ("Maintenance (#287): служба у StartPending має бути зупинена після завершення старту (без відхиленого stop) і запущена у finally; події: " + ($maintenanceLatePending.Events -join ' | ') + ' || ' + ($maintenanceInitialPending.Events -join ' | '))
+
+            # #287: служба BRAVO, яка так і не вийшла зі StartPending (stop
+            # неможливий), не отримує обробки trace: бар'єр вимагає Stopped (чи
+            # Paused), а не «не Running»; критична помилка, код 60.
+            $maintenanceStuckPending = & $maintenanceStartModeOutcome 'StuckStartPending'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceStuckPending.ProbeOk -and $maintenanceStuckPending.StepOrderOk -and
+                    $maintenanceStuckPending.ExitCode -eq 60 -and
+                    @($maintenanceStuckPending.Events | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 0 -and
+                    @($maintenanceStuckPending.Events | Where-Object { $_ -like 'LOG-ERROR Сервіс BRAVO все ще працює*' }).Count -eq 1 -and
+                    @($maintenanceStuckPending.Events | Where-Object { $_ -ceq 'STEP 6/8 Обробка trace і логів SKIPPED' }).Count -eq 1 -and
+                    @(& $maintenanceStartModeOutcome 'InitiallyStartPending' | ForEach-Object { $_.Events } | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleStuckStartPendingGetsNoTraceProcessing" `
+                -Failure ("Maintenance (#287): служба BRAVO, що не вийшла зі StartPending, не повинна отримати обробку trace (бар'єр вимагає Stopped), а прогін має завершитися критичною помилкою з кодом 60; події: " + ($maintenanceStuckPending.Events -join ' | '))
+
+            # Виняток після зупинки: служба, запущена після знімка й зупинена
+            # прогоном, стартує у finally навіть коли крок [4/8] кидає виняток.
+            $maintenanceLateThrow = & $maintenanceStartModeOutcome 'LateStartThrow'
+            $maintenanceLateThrowSizeCheck = & $maintenanceOrchestrationEventIndex $maintenanceLateThrow.Events '^SIZE-CHECK$'
+            $maintenanceLateThrowStart = & $maintenanceOrchestrationEventIndex $maintenanceLateThrow.Events '^START BRAVO$'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateThrow.ProbeOk -and $maintenanceLateThrow.ExitCode -eq 90 -and
+                    (& $maintenanceMarkerTrail $maintenanceLateThrow.Events) -ceq 'MARKER-WRITE BRAVO|MARKER-NO-RESTART BRAVO|MARKER-WRITE BRAVO' -and
+                    $maintenanceLateThrowSizeCheck -ge 0 -and $maintenanceLateThrowStart -gt $maintenanceLateThrowSizeCheck -and
+                    $maintenanceLateThrow.MarkerCleared
+                ) `
+                -Name "Maintenance/LifecycleLateStartRestartedAfterStepThrows" `
+                -Failure ("Maintenance: служба, запущена після знімка й зупинена прогоном, має стартувати у finally після винятку в кроці [4/8]; події: " + ($maintenanceLateThrow.Events -join ' | '))
+
+            # Disabled = оператор свідомо вимкнув службу: Maintenance її не
+            # зупиняє, не утримує й не запускає, навіть коли вона працює.
+            $maintenanceLateDisabled = & $maintenanceStartModeOutcome 'LateStartOperatorDisabled'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateDisabled.ProbeOk -and $maintenanceLateDisabled.StepOrderOk -and
+                    @($maintenanceLateDisabled.Events | Where-Object { ($_ -like 'STOP*' -or $_ -like 'START *' -or $_ -like 'MARKER-WRITE *' -or $_ -like 'HOLD *') -and $_ -like '*exchangAPI*' }).Count -eq 0 -and
+                    (@($maintenanceLateDisabled.Events | Where-Object { $_ -like 'STOP *' -or $_ -like 'START *' }) -join '|') -ceq 'STOP BRAVO|START BRAVO'
+                ) `
+                -Name "Maintenance/LifecycleOperatorDisabledServiceNeverTouched" `
+                -Failure ("Maintenance: служба з типом запуску Disabled (вимкнена оператором) не зупиняється, не утримується й не запускається; події: " + ($maintenanceLateDisabled.Events -join ' | '))
+
+            # Служба, запущена вже ПІСЛЯ запису маркера в не-restore прогоні
+            # (поза lifecycle-контрактом прогону), не зупиняється: WARNING, її
+            # стан лишається як є, маркер її не містить.
+            $maintenanceLateAfterMarker = & $maintenanceStartModeOutcome 'LateStartAfterMarker'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateAfterMarker.ProbeOk -and $maintenanceLateAfterMarker.StepOrderOk -and
+                    (@($maintenanceLateAfterMarker.Events | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO,exchangAPI' -and
+                    @($maintenanceLateAfterMarker.Events | Where-Object { ($_ -like 'STOP*' -or $_ -like 'START *') -and $_ -like '*BravoWeb*' }).Count -eq 0 -and
+                    @($maintenanceLateAfterMarker.Events | Where-Object { $_ -like 'LOG-WARNING *BravoWeb*поза lifecycle-контрактом*' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleServiceStartedAfterContractIsNotStopped" `
+                -Failure ("Maintenance: служба, запущена після запису ownership-маркера не-restore прогону, не зупиняється (WARNING), щоб не лишитися зупиненою без контракту; події: " + ($maintenanceLateAfterMarker.Events -join ' | '))
+
+            # Restore-прогін: утримувана служба, зупинена на момент знімка, але
+            # запущена до фази зупинки (до або після запису маркера), отримує
+            # намір перезапуску ДО зупинки й стартує у finally. Чужий маркер із
+            # restartSuppressed не скасовує намір служби, яка фактично працювала.
+            $maintenanceRestoreLate = & $maintenanceStartModeOutcome 'StartModeLateStartInitiallyStopped'
+            $maintenanceRestoreLateAfterMarker = & $maintenanceStartModeOutcome 'StartModeLateAfterMarkerInitiallyStopped'
+            $maintenanceRestoreLateSuppressed = & $maintenanceStartModeOutcome 'StartModeSuppressedLateStartInitiallyStopped'
+            $maintenanceRestoreLateAfterStop = & $maintenanceStartModeOutcome 'StartModeLateAfterStopInitiallyStopped'
+            $maintenanceRestoreLateAfterStopBarrierStop = & $maintenanceOrchestrationEventIndex $maintenanceRestoreLateAfterStop.Events '^STOP BravoWeb$'
+            $maintenanceRestoreLateAfterMarkerWrites = @($maintenanceRestoreLateAfterMarker.Events | Where-Object { $_ -like 'MARKER-WRITE *' -or $_ -like 'MARKER-NO-RESTART *' })
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreLate.ProbeOk -and $maintenanceRestoreLate.StepOrderOk -and
+                    (& $maintenanceMarkerTrail $maintenanceRestoreLate.Events) -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb|MARKER-NO-RESTART BravoWeb|MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLate.Events '^STOP BravoWeb$') -gt ([array]::LastIndexOf([string[]]$maintenanceRestoreLate.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
+                    @($maintenanceRestoreLate.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1 -and
+                    $maintenanceRestoreLateAfterMarker.ProbeOk -and $maintenanceRestoreLateAfterMarker.StepOrderOk -and
+                    ($maintenanceRestoreLateAfterMarkerWrites -join '|') -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb|MARKER-NO-RESTART BravoWeb|MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLateAfterMarker.Events '^STOP BravoWeb$') -gt ([array]::LastIndexOf([string[]]$maintenanceRestoreLateAfterMarker.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
+                    @($maintenanceRestoreLateAfterMarker.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1 -and
+                    $maintenanceRestoreLateSuppressed.ProbeOk -and $maintenanceRestoreLateSuppressed.StepOrderOk -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenanceRestoreLateSuppressed.Events) -ceq '' -and
+                    @($maintenanceRestoreLateSuppressed.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1 -and
+                    $maintenanceRestoreLateAfterStop.ProbeOk -and $maintenanceRestoreLateAfterStop.StepOrderOk -and
+                    $maintenanceRestoreLateAfterStopBarrierStop -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLateAfterStop.Events '^SIZE-CHECK$') -and
+                    $maintenanceRestoreLateAfterStopBarrierStop -gt ([array]::LastIndexOf([string[]]$maintenanceRestoreLateAfterStop.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
+                    @($maintenanceRestoreLateAfterStop.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleRestoreLateStartGetsRestartIntentBeforeStop" `
+                -Failure ("Maintenance: утримувана служба, запущена після знімка (до чи після фази зупинки), має отримати намір перезапуску в маркері ДО зупинки (і повторної зупинки бар'єром перед before-архівом) й стартувати у finally; події: " + ($maintenanceRestoreLate.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateAfterMarker.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateSuppressed.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateAfterStop.Events -join ' | '))
+
+            # Подвійний збій: службу запущено після фази зупинки, а намір її
+            # перезапуску не вдалося записати в маркер. Бар'єр перед
+            # before-архівом її не зупиняє (вона лишається працювати), а
+            # реставрацію скасовано fail-closed ДО архіву.
+            $maintenanceRestoreMarkerFail = & $maintenanceStartModeOutcome 'StartModeLateAfterStopMarkerFailInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreMarkerFail.ProbeOk -and $maintenanceRestoreMarkerFail.StepOrderOk -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -ceq 'MARKER-WRITE-FAIL' }).Count -eq 1 -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -like 'STOP*BravoWeb' -or $_ -ceq 'START BravoWeb' }).Count -eq 0 -and
+                    @($maintenanceRestoreMarkerFail.Native).Count -eq 0 -and
+                    $maintenanceRestoreMarkerFail.RestoreCancelled -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -like 'LOG-ERROR ПОМИЛКА: Службу BravoWeb (стан: Running) не зупинено*' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleIntentWriteFailureNeverStopsService" `
+                -Failure ("Maintenance: служба, намір перезапуску якої не вдалося записати в маркер, не зупиняється бар'єром перед before-архівом, а реставрацію скасовано fail-closed; події: " + ($maintenanceRestoreMarkerFail.Events -join ' | '))
+
+            # #287 у бар'єрі перед before-архівом: службу, яка після фази
+            # зупинки перейшла у StartPending, бар'єр зупиняє після завершення
+            # старту (без відхиленого stop), тож реставрація не скасовується, а
+            # служба стартує у finally.
+            $maintenanceRestoreLatePending = & $maintenanceStartModeOutcome 'StartModeLatePendingAfterStopInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreLatePending.ProbeOk -and $maintenanceRestoreLatePending.StepOrderOk -and
+                    @($maintenanceRestoreLatePending.Events | Where-Object { $_ -like 'STOP-REFUSED*' }).Count -eq 0 -and
+                    -not $maintenanceRestoreLatePending.RestoreCancelled -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^STOP BravoWeb$') -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^SIZE-CHECK$') -and
+                    @($maintenanceRestoreLatePending.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending" `
+                -Failure ("Maintenance (#287): службу у StartPending бар'єр перед before-архівом має зупинити після завершення старту, не скасовуючи реставрацію, і запустити у finally; події: " + ($maintenanceRestoreLatePending.Events -join ' | '))
+
+            # Restore-прогін, де на старті всі служби стояли: крок [3/8]
+            # звітує SKIPPED, а службу, яку запустили вже після нього, зупиняє
+            # бар'єр перед before-архівом. Ця зупинка не ховається — її фіксує
+            # окремий результат WARN (консоль, підсумок, фінальне сповіщення).
+            $maintenanceRestoreAllStoppedLate = & $maintenanceStartModeOutcome 'StartModeAllStoppedLateAfterStop'
+            $maintenanceRestoreAllStoppedLateStop = & $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^STOP BravoWeb$'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreAllStoppedLate.ProbeOk -and $maintenanceRestoreAllStoppedLate.StepOrderOk -and
+                    -not $maintenanceRestoreAllStoppedLate.RestoreCancelled -and
+                    @($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб SKIPPED' }).Count -eq 1 -and
+                    $maintenanceRestoreAllStoppedLateStop -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^SIZE-CHECK$') -and
+                    @($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -ceq 'OPERATION Повторна зупинка служб перед архівацією WARN' }).Count -eq 1 -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^OPERATION Повторна зупинка служб перед архівацією WARN$') -gt $maintenanceRestoreAllStoppedLateStop -and
+                    (@($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START BravoWeb'
+                ) `
+                -Name "Maintenance/LifecyclePreArchiveBarrierStopIsReported" `
+                -Failure ("Maintenance: зупинка служби бар'єром перед before-архівом має бути видима у звіті кроків окремим результатом WARN, навіть коли [3/8] звітував SKIPPED, а служба має стартувати у finally; події: " + ($maintenanceRestoreAllStoppedLate.Events -join ' | '))
+
+            # Службу запустили вже після плану бар'єра (між контрактною
+            # зупинкою і фінальною перевіркою). Бар'єр не зупиняє її сам — його
+            # Stop-Service обійшов би контракт маркера й лишив службу зупиненою
+            # без наміру перезапуску. Вона — порушник: реставрацію скасовано
+            # fail-closed, модель не торкнута, служба не зупинена й не стартує.
+            $maintenanceRestoreLateBeforeBarrier = & $maintenanceStartModeOutcome 'StartModeLateBeforeBarrierInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreLateBeforeBarrier.ProbeOk -and $maintenanceRestoreLateBeforeBarrier.StepOrderOk -and
+                    @($maintenanceRestoreLateBeforeBarrier.Events | Where-Object { $_ -ceq 'LATE-START BravoWeb Running' }).Count -eq 1 -and
+                    @($maintenanceRestoreLateBeforeBarrier.Events | Where-Object { $_ -ceq 'BARRIER-OFFENDER BravoWeb' }).Count -eq 1 -and
+                    @($maintenanceRestoreLateBeforeBarrier.Events | Where-Object { $_ -like 'STOP*BravoWeb' -or $_ -ceq 'START BravoWeb' }).Count -eq 0 -and
+                    @($maintenanceRestoreLateBeforeBarrier.Native).Count -eq 0 -and
+                    $maintenanceRestoreLateBeforeBarrier.RestoreCancelled
+                ) `
+                -Name "Maintenance/LifecycleFinalBarrierNeverStopsOutsideContract" `
+                -Failure ("Maintenance: службу, запущену після плану бар'єра перед before-архівом, фінальна перевірка не зупиняє поза контрактом маркера, а скасовує реставрацію fail-closed; події: " + ($maintenanceRestoreLateBeforeBarrier.Events -join ' | '))
+
+            # Нечитабельний стан exchangAPI у фазі зупинки — невідомий, а не
+            # «зупинена»: критична помилка кроку [3/8], без Stop-Service і без
+            # тихого «вже зупинена».
+            $maintenanceExchangeUnreadable = & $maintenanceStartModeOutcome 'ExchangeApiUnreadableAtStop'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceExchangeUnreadable.ProbeOk -and $maintenanceExchangeUnreadable.StepOrderOk -and
+                    @($maintenanceExchangeUnreadable.Events | Where-Object { $_ -ceq 'LATE-START exchangAPI UNREADABLE' }).Count -eq 1 -and
+                    @($maintenanceExchangeUnreadable.Events | Where-Object { $_ -ceq 'LOG-ERROR ПОМИЛКА: Помилка при зупинці служби exchangAPI: self-test: стан служби exchangAPI не прочитано' }).Count -eq 1 -and
+                    @($maintenanceExchangeUnreadable.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб FAIL' }).Count -eq 1 -and
+                    @($maintenanceExchangeUnreadable.Events | Where-Object { $_ -like 'STOP*exchangAPI' -or $_ -ceq 'START exchangAPI' }).Count -eq 0
+                ) `
+                -Name "Maintenance/LifecycleUnreadableServiceStateIsNotStopped" `
+                -Failure ("Maintenance: збій читання стану exchangAPI у фазі зупинки має бути критичною помилкою кроку [3/8], а не «службу вже зупинено»; події: " + ($maintenanceExchangeUnreadable.Events -join ' | '))
+
+            # Служба, яку після фази зупинки підняли й призупиняють
+            # (PausePending/ContinuePending), у finally не запускається — той
+            # самий набір станів паузи, що й у фазі зупинки; інакше Start-Service
+            # чекав би до таймауту й позначав прогін критичним.
+            $maintenancePausePendingRestart = & $maintenanceStartModeOutcome 'PausePendingBeforeRestart'
+            $maintenanceBravoPausePendingRestart = & $maintenanceStartModeOutcome 'BravoPausePendingBeforeRestart'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenancePausePendingRestart.ProbeOk -and $maintenancePausePendingRestart.StepOrderOk -and
+                    @($maintenancePausePendingRestart.Events | Where-Object { $_ -ceq 'STOP exchangAPI' -or $_ -ceq 'STOP BravoWeb' }).Count -eq 2 -and
+                    (@($maintenancePausePendingRestart.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START BRAVO' -and
+                    @($maintenancePausePendingRestart.Events | Where-Object { $_ -like 'LOG-ERROR *' }).Count -eq 0 -and
+                    $maintenanceBravoPausePendingRestart.ProbeOk -and $maintenanceBravoPausePendingRestart.StepOrderOk -and
+                    (@($maintenanceBravoPausePendingRestart.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START exchangAPI|START BravoWeb' -and
+                    @($maintenanceBravoPausePendingRestart.Events | Where-Object { $_ -like 'LOG-ERROR *не запустився*' }).Count -eq 0
+                ) `
+                -Name "Maintenance/LifecyclePendingPauseIsNotRestarted" `
+                -Failure ("Maintenance: службу у PausePending/ContinuePending finally не запускає (як і Paused), без критичної помилки; події: " + ($maintenancePausePendingRestart.Events -join ' | ') + ' || ' + ($maintenanceBravoPausePendingRestart.Events -join ' | '))
+
+            # Restore-прогін, де на старті й на повторному читанні всі служби
+            # стояли, а BravoWeb запустили вже після запису маркера: фаза зупинки
+            # зупиняє її під контрактом, тож крок [3/8] не звітує SKIPPED, а
+            # служба стартує у finally.
+            $maintenanceAllStoppedLateAfterMarker = & $maintenanceStartModeOutcome 'StartModeAllStoppedLateAfterMarker'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceAllStoppedLateAfterMarker.ProbeOk -and $maintenanceAllStoppedLateAfterMarker.StepOrderOk -and
+                    @($maintenanceAllStoppedLateAfterMarker.Events | Where-Object { $_ -ceq 'LATE-START BravoWeb Running' }).Count -eq 1 -and
+                    @($maintenanceAllStoppedLateAfterMarker.Events | Where-Object { $_ -like 'STEP 3/8 Зупинка служб *' -and $_ -cne 'STEP 3/8 Зупинка служб SKIPPED' }).Count -eq 1 -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceAllStoppedLateAfterMarker.Events '^STOP BravoWeb$') -lt (& $maintenanceOrchestrationEventIndex $maintenanceAllStoppedLateAfterMarker.Events '^STEP 3/8 ') -and
+                    (@($maintenanceAllStoppedLateAfterMarker.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START BravoWeb'
+                ) `
+                -Name "Maintenance/LifecycleStopStepNotSkippedAfterActualStop" `
+                -Failure ("Maintenance: крок [3/8] не звітує SKIPPED, якщо фаза зупинки фактично зупинила службу, запущену вже після запису маркера, а служба стартує у finally; події: " + ($maintenanceAllStoppedLateAfterMarker.Events -join ' | '))
+
+            # Усі служби стояли, а стан exchangAPI у фазі зупинки не прочитано:
+            # критична помилка кроку [3/8] не ховається за SKIPPED.
+            $maintenanceAllStoppedUnreadable = & $maintenanceStartModeOutcome 'AllStoppedExchangeApiUnreadable'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceAllStoppedUnreadable.ProbeOk -and $maintenanceAllStoppedUnreadable.StepOrderOk -and
+                    @($maintenanceAllStoppedUnreadable.Events | Where-Object { $_ -ceq 'LOG-ERROR ПОМИЛКА: Помилка при зупинці служби exchangAPI: self-test: стан служби exchangAPI не прочитано' }).Count -eq 1 -and
+                    @($maintenanceAllStoppedUnreadable.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб FAIL' }).Count -eq 1 -and
+                    @($maintenanceAllStoppedUnreadable.Events | Where-Object { $_ -like 'STOP *' -or $_ -like 'START *' }).Count -eq 0
+                ) `
+                -Name "Maintenance/LifecycleStopStepFailureNotHiddenBySkipped" `
+                -Failure ("Maintenance: критична помилка у фазі зупинки, коли всі служби стояли, має давати [3/8] FAIL, а не SKIPPED; події: " + ($maintenanceAllStoppedUnreadable.Events -join ' | '))
+
+            # Призупинена оператором служба (Paused) — на старті чи вже після
+            # початкового знімка — Maintenance не зупиняє й не запускає (стан
+            # зберігається; намір її перезапуску знято й з маркера, щоб
+            # Health-watchdog не запустив її за осиротілим маркером), а
+            # призупинена BRAVO, як і до #360, не блокує обробку trace. У
+            # restore-прогоні утримувану призупинену службу без наміру бар'єр
+            # теж не зупиняє: реставрацію скасовано fail-closed ДО архіву.
+            $maintenancePausedOthers = & $maintenanceStartModeOutcome 'PausedServicesPreserved'
+            $maintenancePausedBravo = & $maintenanceStartModeOutcome 'BravoPausedPreserved'
+            $maintenancePausedHeld = & $maintenanceStartModeOutcome 'StartModePausedHeld'
+            $maintenancePausedAfterSnapshot = & $maintenanceStartModeOutcome 'PausedAfterSnapshot'
+            $maintenancePausedBeforeStop = & $maintenanceStartModeOutcome 'PausedBeforeStop'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenancePausedOthers.ProbeOk -and $maintenancePausedOthers.StepOrderOk -and
+                    (@($maintenancePausedOthers.Events | Where-Object { $_ -like 'STOP*' -or $_ -like 'START *' }) -join '|') -ceq 'STOP BRAVO|START BRAVO' -and
+                    (@($maintenancePausedOthers.Events | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO' -and
+                    @($maintenancePausedOthers.Events | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 1 -and
+                    @($maintenancePausedOthers.Events | Where-Object { $_ -like 'LOG-ERROR*' }).Count -eq 0 -and
+                    $maintenancePausedBravo.ProbeOk -and $maintenancePausedBravo.StepOrderOk -and
+                    @($maintenancePausedBravo.Events | Where-Object { $_ -like 'STOP*BRAVO' -or $_ -ceq 'START BRAVO' }).Count -eq 0 -and
+                    (@($maintenancePausedBravo.Events | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BravoWeb|START exchangAPI' -and
+                    @($maintenancePausedBravo.Events | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 1 -and
+                    @($maintenancePausedBravo.Events | Where-Object { $_ -like 'LOG-ERROR*' }).Count -eq 0 -and
+                    $maintenancePausedHeld.ProbeOk -and $maintenancePausedHeld.StepOrderOk -and
+                    @($maintenancePausedHeld.Events | Where-Object { $_ -like 'STOP*BravoWeb' -or $_ -ceq 'START BravoWeb' }).Count -eq 0 -and
+                    @($maintenancePausedHeld.Native).Count -eq 0 -and
+                    $maintenancePausedHeld.RestoreCancelled -and
+                    $maintenancePausedAfterSnapshot.ProbeOk -and $maintenancePausedAfterSnapshot.StepOrderOk -and
+                    @($maintenancePausedAfterSnapshot.Events | Where-Object { $_ -like 'STOP*exchangAPI' -or $_ -ceq 'START exchangAPI' }).Count -eq 0 -and
+                    (@($maintenancePausedAfterSnapshot.Events | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb' -and
+                    @($maintenancePausedAfterSnapshot.Events | Where-Object { $_ -like 'LOG-ERROR*' }).Count -eq 0 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenancePausedAfterSnapshot.Events) -ceq 'exchangAPI' -and
+                    $maintenancePausedBeforeStop.ProbeOk -and $maintenancePausedBeforeStop.StepOrderOk -and
+                    @($maintenancePausedBeforeStop.Events | Where-Object { $_ -like 'STOP*exchangAPI' -or $_ -ceq 'START exchangAPI' }).Count -eq 0 -and
+                    @($maintenancePausedBeforeStop.Events | Where-Object { $_ -like 'LOG-ERROR *exchangAPI*пауза зберігається (#360)' }).Count -eq 1 -and
+                    (& $maintenanceFinalMarkerNoRestart $maintenancePausedBeforeStop.Events) -ceq 'exchangAPI'
+                ) `
+                -Name "Maintenance/LifecyclePausedServiceStateIsPreserved" `
+                -Failure ("Maintenance: призупинена (Paused) служба без наміру перезапуску не зупиняється й не запускається, а призупинена BRAVO не блокує обробку trace; події: " + ($maintenancePausedOthers.Events -join ' | ') + ' || ' + ($maintenancePausedBravo.Events -join ' | ') + ' || ' + ($maintenancePausedHeld.Events -join ' | ') + ' || ' + ($maintenancePausedAfterSnapshot.Events -join ' | ') + ' || ' + ($maintenancePausedBeforeStop.Events -join ' | '))
+
+            # Стан BRAVO перечитується безпосередньо перед ротацією trace: службу,
+            # яку інший актор підняв після воріт фази, ротація не чіпає (критична
+            # помилка), а знову піднята служба не лишається зупиненою.
+            $maintenanceLateBeforeTrace = & $maintenanceStartModeOutcome 'LateStartBeforeTrace'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceLateBeforeTrace.ProbeOk -and $maintenanceLateBeforeTrace.StepOrderOk -and
+                    $maintenanceLateBeforeTrace.ExitCode -eq 60 -and
+                    @($maintenanceLateBeforeTrace.Events | Where-Object { $_ -ceq 'TRACE-ROTATION' }).Count -eq 0 -and
+                    @($maintenanceLateBeforeTrace.Events | Where-Object { $_ -like 'LOG-ERROR *trace-файли не переміщено (#360)' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleTraceRotationRechecksBravoState" `
+                -Failure ("Maintenance: стан BRAVO має перечитуватися безпосередньо перед ротацією trace — службу, підняту після воріт фази, ротація не чіпає, прогін завершується критичною помилкою (60); події: " + ($maintenanceLateBeforeTrace.Events -join ' | '))
+
+            # Boot-recovery (характеризація): усі увімкнені керовані служби
+            # утримуються з наміром перезапуску незалежно від знімка.
+            $maintenanceBootLate = & $maintenanceStartModeOutcome 'BootRecoveryLateStart'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceBootLate.ProbeOk -and $maintenanceBootLate.StepOrderOk -and
+                    (@($maintenanceBootLate.Events | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
+                    @($maintenanceBootLate.Events | Where-Object { $_ -like 'MARKER-NO-RESTART *' }).Count -eq 0 -and
+                    $maintenanceBootLate.ServicesStarted -and $maintenanceBootLate.MarkerCleared
+                ) `
+                -Name "Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart" `
+                -Failure ("Maintenance (boot-recovery): усі увімкнені керовані служби мають бути в маркері з наміром перезапуску й стартувати у finally; події: " + ($maintenanceBootLate.Events -join ' | '))
         } finally {
             if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
                 Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -14463,6 +15791,7 @@ try {
             [void][IO.Directory]::CreateDirectory($healthOrchestrationRoot)
             $healthOrchestrationStubs = @'
 function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
+function Select-BRAVOExpectedArchiveDefinition { param($ArchiveDefinitions, [string[]]$NotInstalledComponents) return @(@($ArchiveDefinitions) | Where-Object { $_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type }) }
 function New-ProbeIssue {
     param([string]$Kind, [string]$Component, [string]$Reason, [string]$Location)
     return [pscustomobject]@{ Kind = $Kind; Component = $Component; Reason = $Reason; FileName = 'немає даних'; LastWriteTime = $null; SizeBytes = $null; ActualSizeBytes = $null; Location = $Location; Details = @() }
@@ -15989,15 +17318,15 @@ try {
         $derivationTextForDrift = Get-Content -LiteralPath (Join-Path $root "modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1") -Raw -Encoding UTF8
         Test-BRAVOCondition `
             -Condition (
-                $setupTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
-                $archiveRuntimeTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
+                $setupTextForDrift.Contains('Resolve-BRAVOBackupComponentScope') -and
+                $archiveRuntimeTextForDrift.Contains('Resolve-BRAVOBackupComponentScope') -and
                 $archiveRuntimeTextForDrift.Contains('-not $discoveryBaselineValid') -and
                 $derivationTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $setupTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $archiveRuntimeTextForDrift.Contains('-EnabledComponents $discoveryEnabledComponents')
             ) `
             -Name "Presence/DriftGateIsWiredIntoArchiveRuntimeAndSetup" `
-            -Failure "Test-BRAVODiscoveryComponentDrift має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
+            -Failure "Рішення про дрейф (Test-BRAVODiscoveryComponentDrift через канонічний Resolve-BRAVOBackupComponentScope) має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
 
         # 06: explicit override має АБСОЛЮТНИЙ пріоритет над Apache
         # discovery, навіть коли Apache-служба ОДНОЗНАЧНА і її DocumentRoot
@@ -23421,6 +24750,7 @@ function Write-BRAVOLog {
         -SourceText ($healthScriptText + [Environment]::NewLine + $notificationScriptText) `
         -FunctionNames @(
             'Get-BRAVOHealthLatestBackupSummary',
+            'Get-BRAVOHealthExpectedArchiveDefinitions',
             'Format-BackupAge',
             'Get-BRAVOUtcAge',
             'ConvertTo-BRAVOUtcDateTime',
@@ -24536,12 +25866,12 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $archiveNewSha512HashCallAsts.Count -eq 1 -and
-            $archiveGetFileHashCallAsts.Count -eq 4 -and
+            $archiveGetFileHashCallAsts.Count -eq 3 -and
             $null -ne $archiveHashWorkCallAst -and
             $archiveHashWorkCallAst.Extent.StartOffset -eq $archiveNewSha512HashCallAsts[0].Extent.StartOffset
         ) `
         -Name 'Archive/HashBusinessCallsRemainUnchanged' `
-        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
+        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 3 рази (четвертий виклик був у мертвій Remove-OldBackupSets, видаленій у #335); знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' } }
 
     # Archive (P2-1/P2-5, PR #136 review): рекурсивне впорядкування SFTP-
@@ -24551,6 +25881,14 @@ function Write-BRAVOLog {
         if (Enter-BRAVOSelfTestSection -Name 'Suite/Archive') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Archive.ps1')
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Archive' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    # BackupScope: бекап лише наявних компонентів (рішення власника 2026-10-01).
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'BackupScope') {
+        Enter-BRAVOSelfTestSuite -Name 'BackupScope'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/BackupScope') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BackupScope.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BackupScope' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'SftpCredentialsRequired') {
@@ -26390,6 +27728,284 @@ Test-BRAVOCondition -Condition (
     -Failure ("global-заглушка під script-функцією має бути знята: під час={0}, global після={1}, script після={2}; залишки: {3}" -f
         $scopeProbeGlobalDuring, $scopeProbeGlobalAfter, $scopeProbeScriptAfter, [string]::Join('; ', [string[]]$scopeProbeResidualProblems))
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.BuiltinCommandStubsDoNotLeakAcrossSuites' } }
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteIsolationPrivateAndImmutableSnapshot') { try {
+
+# #350: поведінкові проби ізоляції suite для записів з опцією Private і для
+# незмінності знімка функцій. Кожен випадок — справжній прохід знімок ->
+# дія suite -> Restore-BRAVOSelfTestSuiteIsolation (той самий, що
+# Enter/Complete-BRAVOSelfTestSection викликають для 'Suite/*'), прибирання
+# в finally навіть після винятку. Опис дії та перевірки виконуються dot-source
+# на рівні script-області: лише звідти видно її Private-записи, і саме туди
+# dot-source пише suite-фрагменти. Ім'я, зайняте до проби, — FAIL, а не
+# тихий пропуск: інакше проба нічого не доводила б. Імена — лише справжні
+# cmdlet-и в Windows PowerShell 5.1 і 7 (Get-FileHash, наприклад, у 5.1 —
+# функція модуля Microsoft.PowerShell.Utility, тож ім'я вже зайняте).
+$suiteIsolationCaseCleanup = {
+    param([string[]]$SuiteIsolationCleanupNames)
+    $suiteIsolationCleanupAccess = Get-BRAVOSelfTestSessionScopeAccess
+    foreach ($suiteIsolationCleanupName in $SuiteIsolationCleanupNames) {
+        foreach ($suiteIsolationCleanupKind in @('Function', 'Alias')) {
+            foreach ($suiteIsolationCleanupScope in @('Script', 'Global')) {
+                Remove-BRAVOSelfTestScopedCommandItem -Access $suiteIsolationCleanupAccess -Scope $suiteIsolationCleanupScope `
+                    -Kind $suiteIsolationCleanupKind -Name $suiteIsolationCleanupName
+            }
+        }
+    }
+}
+$suiteIsolationCaseRun = {
+    param(
+        [string]$SuiteIsolationCaseName,
+        [string[]]$SuiteIsolationCaseCommands,
+        [scriptblock]$SuiteIsolationCaseArrange,
+        [scriptblock]$SuiteIsolationCaseAct,
+        [scriptblock]$SuiteIsolationCaseVerify,
+        [bool]$SuiteIsolationCaseActThrows = $false
+    )
+    $suiteIsolationCaseCommand = $SuiteIsolationCaseCommands[0]
+    $suiteIsolationCaseOccupied = @(
+        foreach ($suiteIsolationOccupiedName in $SuiteIsolationCaseCommands) {
+            $suiteIsolationOccupiedState = Get-BRAVOSelfTestBuiltinCommandState -Name $suiteIsolationOccupiedName
+            if ($suiteIsolationOccupiedState.Key -ne '<none>') { $suiteIsolationOccupiedName + ' (' + $suiteIsolationOccupiedState.Key + ')' }
+        })
+    $suiteIsolationCaseResidual = @()
+    $suiteIsolationCaseProblem = ''
+    $suiteIsolationCaseThrew = $false
+    $suiteIsolationCaseThrowMessage = ''
+    if ($suiteIsolationCaseOccupied.Count -eq 0) {
+        try {
+            . $SuiteIsolationCaseArrange
+            $suiteIsolationCaseSnapshot = New-BRAVOSelfTestSuiteIsolationSnapshot
+            try {
+                . $SuiteIsolationCaseAct
+            } catch {
+                $suiteIsolationCaseThrew = $true
+                $suiteIsolationCaseThrowMessage = $_.Exception.Message
+            } finally {
+                $suiteIsolationCaseResidual = @(Restore-BRAVOSelfTestSuiteIsolation -Snapshot $suiteIsolationCaseSnapshot `
+                        -Label ('Framework.' + $SuiteIsolationCaseName) -NoFailureRegistration)
+            }
+            $suiteIsolationCaseProblem = [string]::Join('; ', [string[]]@(. $SuiteIsolationCaseVerify | Where-Object { -not [string]::IsNullOrEmpty([string]$_) }))
+        } catch {
+            $suiteIsolationCaseProblem = 'виняток проби: ' + $_.Exception.Message
+        } finally {
+            . $suiteIsolationCaseCleanup $SuiteIsolationCaseCommands
+        }
+    }
+    Test-BRAVOCondition -Condition (
+        $suiteIsolationCaseOccupied.Count -eq 0 -and $suiteIsolationCaseThrew -eq $SuiteIsolationCaseActThrows -and
+        $suiteIsolationCaseResidual.Count -eq 0 -and $suiteIsolationCaseProblem -eq ''
+    ) `
+        -Name ('Framework/SuiteIsolation.' + $SuiteIsolationCaseName) `
+        -Failure ("зайняті до проби: [{0}]; виняток дії: {1} (очікувано {2}) {3}; залишки Restore: [{4}]; перевірка: [{5}]" -f
+            [string]::Join(', ', [string[]]$suiteIsolationCaseOccupied), $suiteIsolationCaseThrew, $SuiteIsolationCaseActThrows,
+            $suiteIsolationCaseThrowMessage, [string]::Join('; ', [string[]]$suiteIsolationCaseResidual), $suiteIsolationCaseProblem)
+}
+# Перевірка запису функції/аліаса прямо в таблиці області (видно і Private);
+# викликаються через &, щоб не засмічувати script-область.
+$suiteIsolationCheckFunction = {
+    param([string]$SuiteIsolationCheckScope, [string]$SuiteIsolationCheckName, $SuiteIsolationExpectedBlock, [string]$SuiteIsolationExpectedOption)
+    $suiteIsolationCheckItem = Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+        -Scope $SuiteIsolationCheckScope -Kind Function -Name $SuiteIsolationCheckName
+    if ($null -eq $suiteIsolationCheckItem) { return "$SuiteIsolationCheckScope-функції $SuiteIsolationCheckName немає" }
+    if ((& $suiteIsolationCheckItem.ScriptBlock) -ne 'ORIGINAL') { return "$SuiteIsolationCheckScope-функція повертає '$(& $suiteIsolationCheckItem.ScriptBlock)'" }
+    if (-not [object]::ReferenceEquals($suiteIsolationCheckItem.ScriptBlock, $SuiteIsolationExpectedBlock)) { return "$SuiteIsolationCheckScope-функція має не початковий ScriptBlock" }
+    if ([string]$suiteIsolationCheckItem.Options -ne $SuiteIsolationExpectedOption) { return "$SuiteIsolationCheckScope-функція має Options '$($suiteIsolationCheckItem.Options)' замість '$SuiteIsolationExpectedOption'" }
+}
+$suiteIsolationCheckAlias = {
+    param([string]$SuiteIsolationCheckScope, [string]$SuiteIsolationCheckName, [string]$SuiteIsolationExpectedOption)
+    $suiteIsolationCheckItem = Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+        -Scope $SuiteIsolationCheckScope -Kind Alias -Name $SuiteIsolationCheckName
+    if ($null -eq $suiteIsolationCheckItem) { return "$SuiteIsolationCheckScope-аліаса $SuiteIsolationCheckName немає" }
+    if ([string]$suiteIsolationCheckItem.Definition -ne 'Microsoft.PowerShell.Utility\Write-Output' -or
+        [string]$suiteIsolationCheckItem.Description -ne 'probe-350' -or
+        [string]$suiteIsolationCheckItem.Options -ne $SuiteIsolationExpectedOption) {
+        return ("$SuiteIsolationCheckScope-аліас: {0} [{1}] '{2}'" -f $suiteIsolationCheckItem.Definition, $suiteIsolationCheckItem.Options, $suiteIsolationCheckItem.Description)
+    }
+}
+# Залежно від запуску (-File чи ні) script-область може бути глобальною:
+# тоді «script»-запис живе в Global-таблиці.
+$suiteIsolationScriptTable = if ($null -eq (Get-BRAVOSelfTestSessionScopeAccess).Script) { 'Global' } else { 'Script' }
+$suiteIsolationArrangeScriptFunction = {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:script:' + $suiteIsolationCaseCommand) -Value { 'ORIGINAL' } -Force
+    $suiteIsolationOriginalItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $suiteIsolationCaseCommand)
+    $suiteIsolationOriginalItem.Options = [Management.Automation.ScopedItemOptions]::Private
+    $suiteIsolationOriginalBlock = $suiteIsolationOriginalItem.ScriptBlock
+}
+$suiteIsolationArrangeScriptAlias = {
+    Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Script `
+        -Option Private -Description 'probe-350' -Force
+}
+$suiteIsolationArrangeGlobalFunction = {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'ORIGINAL' } -Force
+    $suiteIsolationOriginalBlock = (Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+            -Scope Global -Kind Function -Name $suiteIsolationCaseCommand).ScriptBlock
+}
+$suiteIsolationArrangeGlobalAlias = {
+    Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Global `
+        -Description 'probe-350' -Force
+}
+$suiteIsolationHiddenFromChild = {
+    # Private зберігся: з дочірньої області (цей блок викликається через &)
+    # запис не видно.
+    param([string]$SuiteIsolationHiddenPath)
+    if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $SuiteIsolationHiddenPath) { return "$SuiteIsolationHiddenPath видно з дочірньої області — Private втрачено" }
+}
+$suiteIsolationAbsent = {
+    foreach ($suiteIsolationAbsentName in $SuiteIsolationCaseCommands) {
+        $suiteIsolationAbsentState = Get-BRAVOSelfTestBuiltinCommandState -Name $suiteIsolationAbsentName
+        if ($suiteIsolationAbsentState.Key -ne '<none>') { "$suiteIsolationAbsentName лишився: $($suiteIsolationAbsentState.Key)" }
+    }
+}
+
+# --- Private-записи (дефект 1) -------------------------------------------
+. $suiteIsolationCaseRun 'PrivateScriptFunctionOverwritten' @('Test-Connection') $suiteIsolationArrangeScriptFunction {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:script:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+} {
+    & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+    if ($suiteIsolationScriptTable -eq 'Script') { & $suiteIsolationHiddenFromChild ('function:' + $suiteIsolationCaseCommand) }
+}
+. $suiteIsolationCaseRun 'PrivateScriptFunctionRemoved' @('Move-Item') $suiteIsolationArrangeScriptFunction {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('function:' + $suiteIsolationCaseCommand) -Force
+} {
+    & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+}
+. $suiteIsolationCaseRun 'PrivateScriptAliasOverwritten' @('Wait-Process') $suiteIsolationArrangeScriptAlias {
+    Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Out-Null' -Scope Script -Option Private -Force
+} {
+    & $suiteIsolationCheckAlias $suiteIsolationScriptTable $suiteIsolationCaseCommand 'Private'
+    if ($suiteIsolationScriptTable -eq 'Script') { & $suiteIsolationHiddenFromChild ('alias:' + $suiteIsolationCaseCommand) }
+}
+. $suiteIsolationCaseRun 'PrivateScriptAliasRemoved' @('Invoke-RestMethod') $suiteIsolationArrangeScriptAlias {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath ('alias:' + $suiteIsolationCaseCommand) -Force
+} {
+    & $suiteIsolationCheckAlias $suiteIsolationScriptTable $suiteIsolationCaseCommand 'Private'
+}
+. $suiteIsolationCaseRun 'PrivateGlobalFunctionAndAliasRestored' @('Resolve-Path', 'Get-ItemProperty') {
+    . $suiteIsolationArrangeGlobalFunction
+    (Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) -Scope Global -Kind Function `
+        -Name $suiteIsolationCaseCommand).Options = [Management.Automation.ScopedItemOptions]::Private
+    Microsoft.PowerShell.Utility\Set-Alias -Name 'Get-ItemProperty' -Value 'Microsoft.PowerShell.Utility\Write-Output' -Scope Global `
+        -Option Private -Description 'probe-350' -Force
+} {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+    Microsoft.PowerShell.Utility\Set-Alias -Name 'Get-ItemProperty' -Value 'Out-Null' -Scope Global -Option Private -Force
+} {
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+    & $suiteIsolationCheckAlias 'Global' 'Get-ItemProperty' 'Private'
+}
+
+# --- Матриця функцій і аліасів -------------------------------------------
+. $suiteIsolationCaseRun 'ExistingFunctionOverwritten' @('Get-ItemProperty') $suiteIsolationArrangeGlobalFunction {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+} {
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'None'
+}
+. $suiteIsolationCaseRun 'ExistingFunctionRemoved' @('Set-ItemProperty') $suiteIsolationArrangeGlobalFunction {
+    Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('function:' + $suiteIsolationCaseCommand)
+} {
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'None'
+}
+. $suiteIsolationCaseRun 'NewFunctionRemoved' @('Test-Connection', 'Move-Item') { } {
+    Microsoft.PowerShell.Management\Set-Item -Path 'function:global:Test-Connection' -Value { 'STUB' } -Force
+    Microsoft.PowerShell.Management\Set-Item -Path 'function:script:Move-Item' -Value { 'STUB' } -Force
+} $suiteIsolationAbsent
+. $suiteIsolationCaseRun 'ExistingAliasModified' @('Move-Item') $suiteIsolationArrangeGlobalAlias {
+    Microsoft.PowerShell.Utility\Set-Alias -Name $suiteIsolationCaseCommand -Value 'Out-Null' -Scope Global -Force
+} {
+    & $suiteIsolationCheckAlias 'Global' $suiteIsolationCaseCommand 'None'
+}
+. $suiteIsolationCaseRun 'ExistingAliasRemoved' @('Wait-Process') $suiteIsolationArrangeGlobalAlias {
+    Invoke-BRAVOSelfTestGlobalScopeItem -Operation Remove -Path ('alias:' + $suiteIsolationCaseCommand)
+} {
+    & $suiteIsolationCheckAlias 'Global' $suiteIsolationCaseCommand 'None'
+}
+. $suiteIsolationCaseRun 'NewAliasRemoved' @('Invoke-RestMethod', 'Resolve-Path') { } {
+    Microsoft.PowerShell.Utility\Set-Alias -Name 'Invoke-RestMethod' -Value 'Out-Null' -Scope Global -Force
+    Microsoft.PowerShell.Utility\Set-Alias -Name 'Resolve-Path' -Value 'Out-Null' -Scope Script -Option Private -Force
+} $suiteIsolationAbsent
+
+# --- Динамічні модулі та dot-source suite-фрагмента ----------------------
+. $suiteIsolationCaseRun 'BareNewModuleOverExistingFunction' @('Restart-Service') $suiteIsolationArrangeGlobalFunction {
+    [void](Microsoft.PowerShell.Core\New-Module -ScriptBlock { function Restart-Service { 'STUB' } })
+} {
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'None'
+}
+. $suiteIsolationCaseRun 'DotSourcedSuiteFragmentRemoved' @('Send-MailMessage', 'Set-ItemProperty') { } {
+    . ([scriptblock]::Create("function Send-MailMessage { 'STUB' }`nSet-Alias -Name Set-ItemProperty -Value Out-Null -Option Private"))
+} $suiteIsolationAbsent
+. $suiteIsolationCaseRun 'RuntimeModuleOverPrivateScriptFunction' @('Move-Item') $suiteIsolationArrangeScriptFunction {
+    [void](New-BRAVOSelfTestRuntimeModule -SourceText "function Move-Item { 'STUB' }" -FunctionNames @('Move-Item'))
+} {
+    & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+    if ($suiteIsolationScriptTable -eq 'Script' -and $null -ne (Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+                -Scope Global -Kind Function -Name $suiteIsolationCaseCommand)) { 'global-заглушка runtime-модуля лишилась' }
+}
+
+# --- Виняток у suite: відновлення все одно відбувається (finally) ---------
+. $suiteIsolationCaseRun 'CleanupAfterSuiteException' @('Test-Connection', 'Restart-Service') $suiteIsolationArrangeScriptFunction {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:script:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+    [void](Microsoft.PowerShell.Core\New-Module -ScriptBlock { function Restart-Service { 'STUB' } })
+    throw (Microsoft.PowerShell.Utility\New-Object System.IO.InvalidDataException 'probe-350-suite-fault')
+} {
+    & $suiteIsolationCheckFunction $suiteIsolationScriptTable $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+    if ((Get-BRAVOSelfTestBuiltinCommandState -Name 'Restart-Service').Key -ne '<none>') { 'заглушка Restart-Service лишилась' }
+} $true
+
+# --- Незмінний знімок функцій (дефект 2) ---------------------------------
+# Перевизначення наявної функції змінює той самий FunctionInfo на місці;
+# знімок із живими FunctionInfo віддав би при відновленні вже 'STUB'. Options
+# = Private: з ReadOnly Set-Item -Force створює новий об'єкт, а не змінює
+# наявний, і проба не відтворювала б дефект.
+. $suiteIsolationCaseRun 'FunctionSnapshotNotLiveFunctionInfo' @('Test-BRAVOSelfTestIsolation350Original') {
+    . $suiteIsolationArrangeGlobalFunction
+    $suiteIsolationLiveInfo = Get-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) `
+        -Scope Global -Kind Function -Name $suiteIsolationCaseCommand
+    $suiteIsolationLiveInfo.Options = [Management.Automation.ScopedItemOptions]::Private
+} {
+    Microsoft.PowerShell.Management\Set-Item -Path ('function:global:' + $suiteIsolationCaseCommand) -Value { 'STUB' } -Force
+    # Suite прибирає перевизначену функцію, і runtime-модуль ставить власну
+    # заглушку: без цього в Windows PowerShell 5.1 експорт модуля не
+    # витісняє наявну Private-функцію, і відновлення через модуль не
+    # запускалося б.
+    Remove-BRAVOSelfTestScopedCommandItem -Access (Get-BRAVOSelfTestSessionScopeAccess) -Scope Global -Kind Function -Name $suiteIsolationCaseCommand
+    [void](New-BRAVOSelfTestRuntimeModule -SourceText "function Test-BRAVOSelfTestIsolation350Original { 'STUB' }" `
+            -FunctionNames @('Test-BRAVOSelfTestIsolation350Original'))
+} {
+    # Непорожність: живий FunctionInfo справді змінився на місці.
+    if ((& $suiteIsolationLiveInfo.ScriptBlock) -ne 'STUB') { 'живий FunctionInfo не змінився — проба нічого не доводить' }
+    & $suiteIsolationCheckFunction 'Global' $suiteIsolationCaseCommand $suiteIsolationOriginalBlock 'Private'
+}
+
+# --- Поведінковий guard вбудованих команд проти Private-заглушок ----------
+# Резолюція (CommandType + Source) кожного імені після suite така сама, як до.
+$suiteIsolationBuiltinNames = @(
+    'Get-Service', 'Start-Service', 'Stop-Service', 'Get-Process', 'Stop-Process',
+    'Start-Sleep', 'Invoke-WebRequest', 'Get-CimInstance', 'Get-WmiObject', 'Start-Process'
+)
+$suiteIsolationResolution = {
+    @(foreach ($suiteIsolationResolvedName in $suiteIsolationBuiltinNames) {
+            $suiteIsolationResolved = Microsoft.PowerShell.Core\Get-Command -Name $suiteIsolationResolvedName -ErrorAction SilentlyContinue |
+                Microsoft.PowerShell.Utility\Select-Object -First 1
+            if ($null -eq $suiteIsolationResolved) { $suiteIsolationResolvedName + '=<none>' } else {
+                '{0}={1}|{2}' -f $suiteIsolationResolvedName, $suiteIsolationResolved.CommandType, $suiteIsolationResolved.Source }
+        })
+}
+$suiteIsolationResolutionBefore = [string]::Join(', ', [string[]](. $suiteIsolationResolution))
+. $suiteIsolationCaseRun 'PrivateBuiltinStubsDoNotLeak' $suiteIsolationBuiltinNames { } {
+    foreach ($suiteIsolationStubName in $suiteIsolationBuiltinNames) {
+        Microsoft.PowerShell.Management\Set-Item -Path ('function:script:' + $suiteIsolationStubName) -Value { 'leaked-stub' } -Force
+        (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $suiteIsolationStubName)).Options = [Management.Automation.ScopedItemOptions]::Private
+    }
+    $suiteIsolationStubsActive = @($suiteIsolationBuiltinNames | Where-Object {
+            $null -ne (Microsoft.PowerShell.Core\Get-Command -Name $_ -CommandType Function -ErrorAction SilentlyContinue) }).Count
+} {
+    if ($suiteIsolationStubsActive -ne $suiteIsolationBuiltinNames.Count) {
+        "заглушки мали діяти всередині suite: активних $suiteIsolationStubsActive з $($suiteIsolationBuiltinNames.Count)"
+    }
+    $suiteIsolationResolutionAfter = [string]::Join(', ', [string[]](. $suiteIsolationResolution))
+    if ($suiteIsolationResolutionAfter -ne $suiteIsolationResolutionBefore) { "резолюція до: $suiteIsolationResolutionBefore; після: $suiteIsolationResolutionAfter" }
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteIsolationPrivateAndImmutableSnapshot' } }
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.VariableScopeHeadroom') { try {
 
 # #163: перевірка запасу змінних області. Стеля $MaximumVariableCount

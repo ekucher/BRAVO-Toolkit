@@ -997,9 +997,27 @@ Start-Service '<BravoWebName>'
 ```
 
 Служба з `restart-after-recovery=NO` має залишитися зупиненою — її
-стан не є наслідком аварії. Службу зі `StartType = Disabled` не
-намагайтеся піднімати: її відключив адміністратор, і `Start-Service`
-все одно завершиться помилкою.
+стан не є наслідком аварії.
+
+Тип запуску (#333): на час restore DataRestore тимчасово переводить
+керовані служби в `Disabled` (початкові типи лежать у маркері
+`%ProgramData%\BRAVO\State\BRAVO_SERVICE_QUIESCENCE.json`, поле
+`startTypeSnapshot`). Якщо в журналі
+є рядок «Служби лишаються Disabled (утримання від автостарту, #333)»
+(код `43` при незавершеному rollback) — такі служби `Disabled` через
+аварію, а не через адміністратора. ПІСЛЯ ручного відновлення моделі й ПЕРЕД
+`Start-Service` поверніть кожній службі початковий тип зі знімка (з журналу
+або з маркера):
+
+```powershell
+sc.exe config '<ServiceName>' start= auto          # Automatic
+sc.exe config '<ServiceName>' start= delayed-auto  # AutomaticDelayed
+sc.exe config '<ServiceName>' start= demand        # Manual
+```
+
+Після цього запустіть служби за списком вище і видаліть маркер. Службу, якої
+НЕМАЄ у знімку, а тип запуску `Disabled`, відключив адміністратор — не
+піднімайте її (`Start-Service` все одно завершиться помилкою).
 
 Крок 7. Перевірте систему:
 
@@ -1155,6 +1173,36 @@ backup Health, notifications. Scheduled завдання
 збій. `Health`/`Dry Run` рендерять явний PASS/SKIPPED з причиною
 (`componentSettings.SFTP.Enabled = $false` / `SMB.Enabled = $false`),
 не WARNING і не ERROR.
+
+---
+
+## Не встановлений компонент (`NotInstalled`) і discovery baseline
+
+**Що це.** Компонент, увімкнений у `componentSettings`, але відсутній на
+цьому сервері (наприклад, немає BRAVOEXCH або BAZA_APP), не є помилкою:
+`BRAVO_ARCHIV.ps1` його не архівує й не синхронізує, Health і Dry Run не
+перевіряють його, а Health виводить один INFO-рядок «Не встановлено на
+цьому сервері: …» без WARNING. `MODEL` обов'язковий, а порожній склад (жоден
+увімкнений компонент не встановлено) лишається помилкою.
+
+**Що не вважається `NotInstalled`.** Компонент, який раніше був у
+discovery baseline або в останньому COMPLETE manifest, а тепер зник, -
+це `Missing` (помилка), а не «не встановлено». Так само джерело,
+оголошене в `bravo.ini`, службі чи override, але недоступне. Невизначений
+стан (непридатний baseline) Health і Dry Run трактують обережно: очікують
+усі увімкнені компоненти.
+
+**Baseline.** Після COMPLETE generation `BRAVO_ARCHIV.ps1` сам створює
+`%ProgramData%\BRAVO\State\DISCOVERY_BASELINE.json` або доповнює його
+порожні поля новими компонентами; наявні значення й непридатний файл не
+змінюються. Підтвердити зникнення компонента вручну:
+
+```powershell
+.\BRAVO_SETUP.ps1 -Action Test -ValidateOnly -ConfirmDiscoveryBaseline
+```
+
+**Manifest.** Поле `componentScope` у generation manifest показує статус
+кожного компонента на момент прогону (аудит; Health його не читає).
 
 ---
 
@@ -1935,6 +1983,15 @@ Override-и — окремі одне від одного налаштуванн
 Без маркера BRAVO не запустить їх автоматично ніколи. Єдине застереження:
 не плануйте роботи на вікно обслуговування (23:55) — якщо Maintenance
 у цей час зупинив служби і впав, watchdog підніме їх протягом ≤4 год.
+
+Маркер DataRestore (і маркер аварійного Maintenance з утриманням) несе
+`startTypeSnapshot` — початкові типи запуску служб. Повторний запуск
+DataRestore після такого аварійного переривання зливає цей знімок у свій
+маркер, повертає типи після успішного restore й запускає служби з
+`RestartIntent=true`; про відновлення після аварійного прогону він
+завершується кодом `10` (SuccessWithWarnings), а не `0`. Маркер ЖИВОГО
+власника DataRestore не чіпає: прогін завершується кодом `43` до будь-яких
+змін.
 
 **Якщо бачите алерт про suppressed-маркер:** дійте за процедурою коду
 `43` (розділ вище), після ручного відновлення видаліть маркер вручну.

@@ -531,7 +531,101 @@ function Test-BRAVOSelfTestDuplicateDefinition {
         -Name "ConsoleUX/30-SelfTestNoPauseStillReturnsImmediately" `
         -Failure "Wait-BRAVOManualExit -NoPause (та сама функція, яку BRAVO_SELF_TEST.ps1 викликає наприкінці) має повертатися миттєво; зайняло $($selfTestNoPauseElapsed.TotalSeconds) с"
 
-    # 31. Очікувані ERROR/WARNING змодельованих сценаріїв self-test не
+    # 31. Консоль SYSTEM (сесія 0) на Windows до 10 з кодовою сторінкою
+    # 65001 не може вивести кирилицю (Win32 0x1F) — заплановані завдання
+    # падали з кодом 1 до відкриття логу. Кодову сторінку консолі там не
+    # перемикаємо; Windows 10+ та інтерактивні запуски — без змін.
+    # Поведінкова матриця: ОС x сесія x запитана кодова сторінка ->
+    # рішення помічника і фактична дія Initialize-BRAVOConsoleEncoding.
+    if (-not (Get-Command -Name Test-BRAVOConsoleCodePageChangeSafe -ErrorAction SilentlyContinue)) {
+        Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -ErrorAction Stop
+    }
+    $consoleCodePageMatrix = @(
+        @{ Case = 'Server2012-Interactive';   OS = '6.2.9200';   Interactive = $true;  CodePage = 65001; Switch = $true }
+        @{ Case = 'Server2012-Session0';      OS = '6.2.9200';   Interactive = $false; CodePage = 65001; Switch = $false }
+        @{ Case = 'Server2012R2-Interactive'; OS = '6.3.9600';   Interactive = $true;  CodePage = 65001; Switch = $true }
+        @{ Case = 'Server2012R2-Session0';    OS = '6.3.9600';   Interactive = $false; CodePage = 65001; Switch = $false }
+        @{ Case = 'Server2012R2-Session0-866'; OS = '6.3.9600';  Interactive = $false; CodePage = 866;   Switch = $true }
+        @{ Case = 'Win10-Interactive';        OS = '10.0.17763'; Interactive = $true;  CodePage = 65001; Switch = $true }
+        @{ Case = 'Win10-ScheduledTask';      OS = '10.0.17763'; Interactive = $false; CodePage = 65001; Switch = $true }
+        @{ Case = 'Win11-Session0';           OS = '10.0.22631'; Interactive = $false; CodePage = 65001; Switch = $true }
+    )
+    $consoleCodePageMismatches = New-Object System.Collections.Generic.List[string]
+    $consoleCodePageSavedOutputEncoding = $global:OutputEncoding
+    try {
+        foreach ($consoleCodePageRow in $consoleCodePageMatrix) {
+            $consoleCodePageOs = [Version]$consoleCodePageRow.OS
+            $consoleCodePageDecision = Test-BRAVOConsoleCodePageChangeSafe -CodePage $consoleCodePageRow.CodePage `
+                -OSVersion $consoleCodePageOs -UserInteractive $consoleCodePageRow.Interactive
+            # Шпигун замість [Console]::OutputEncoding: фіксує, чи Initialize
+            # справді перемкнув би консоль, не чіпаючи консоль self-test-у.
+            $consoleCodePageSpy = New-Object System.Collections.Generic.List[int]
+            $consoleCodePageSpySetter = { param($Encoding) $consoleCodePageSpy.Add($Encoding.CodePage) }.GetNewClosure()
+            $global:OutputEncoding = [Text.Encoding]::ASCII
+            $consoleCodePageResult = Initialize-BRAVOConsoleEncoding -CodePage $consoleCodePageRow.CodePage `
+                -OSVersion $consoleCodePageOs -UserInteractive $consoleCodePageRow.Interactive `
+                -SetConsoleOutputEncoding $consoleCodePageSpySetter
+            $consoleCodePageSwitched = $consoleCodePageSpy.Count -eq 1 -and $consoleCodePageSpy[0] -eq $consoleCodePageRow.CodePage
+            # Кодування для зовнішніх процесів ($OutputEncoding) — у будь-якому
+            # разі запитане: перемикання консолі його не скасовує.
+            $consoleCodePageExternal = [int]$global:OutputEncoding.CodePage
+            if ($consoleCodePageDecision -ne $consoleCodePageRow.Switch -or
+                $consoleCodePageSwitched -ne $consoleCodePageRow.Switch -or
+                [bool]$consoleCodePageResult -ne $consoleCodePageRow.Switch -or
+                $consoleCodePageExternal -ne $consoleCodePageRow.CodePage -or
+                ($consoleCodePageRow.Switch -eq $false -and $consoleCodePageSpy.Count -ne 0)) {
+                [void]$consoleCodePageMismatches.Add(("{0}: рішення={1}, перемкнуто={2}, результат={3}, `$OutputEncoding={4} (очікувано перемикання={5}, {6})" -f
+                        $consoleCodePageRow.Case, $consoleCodePageDecision, $consoleCodePageSwitched, $consoleCodePageResult,
+                        $consoleCodePageExternal, $consoleCodePageRow.Switch, $consoleCodePageRow.CodePage))
+            }
+        }
+    } finally {
+        $global:OutputEncoding = $consoleCodePageSavedOutputEncoding
+    }
+    Test-BRAVOCondition `
+        -Condition ($consoleCodePageMismatches.Count -eq 0) `
+        -Name "ConsoleUX/31-LegacySystemConsoleKeepsCodePage" `
+        -Failure ("UTF-8 консолі має не вмикатись лише на Windows < 10 у неінтерактивній сесії, решта — без змін: " +
+            [string]::Join('; ', $consoleCodePageMismatches.ToArray()))
+
+    # 32. Archive перемикає консоль окремо від Initialize-BRAVOConsoleEncoding
+    # (кодова сторінка з налаштувань консолі) — той самий помічник.
+    Test-BRAVOCondition `
+        -Condition (
+            $compatibilityScriptText.Contains('if (-not (Test-BRAVOConsoleCodePageChangeSafe -CodePage $CodePage -OSVersion $OSVersion -UserInteractive $UserInteractive)) {') -and
+            $archiveScriptText.Contains('if (Test-BRAVOConsoleCodePageChangeSafe -CodePage $configuredOutputEncoding.CodePage) {')
+        ) `
+        -Name "ConsoleUX/32-ConsoleCodePageSwitchIsGuarded" `
+        -Failure "Initialize-BRAVOConsoleEncoding і налаштування консолі Archive мають перевіряти Test-BRAVOConsoleCodePageChangeSafe перед [Console]::OutputEncoding"
+
+    # 33. Жоден інший production-скрипт чи модуль не перемикає консоль напряму:
+    # entrypoint-и (Archive, Health, Maintenance, DataRestore, Tasks,
+    # Credentials) ідуть через Initialize-BRAVOConsoleEncoding. Виняток —
+    # deploy-скрипти, які оператор запускає вручну ще до встановлення модулів.
+    $consoleCodePageAllowed = @(
+        'modules/BRAVO.Compatibility/BRAVO.Compatibility.psm1',
+        'modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1',
+        'deploy/Install-BRAVOServer.ps1',
+        'deploy/Update-BRAVOServer.ps1'
+    )
+    $consoleCodePageDirect = @(
+        Get-ChildItem -Path $root -Recurse -File -Include '*.ps1', '*.psm1' -ErrorAction SilentlyContinue |
+            Where-Object {
+                $consoleCodePageRelative = $_.FullName.Substring($root.TrimEnd('\', '/').Length + 1).Replace('\', '/')
+                -not ($consoleCodePageRelative -like 'selftest/*' -or $consoleCodePageRelative -like 'ci/*' -or
+                    $consoleCodePageRelative -like 'tests/*' -or $consoleCodePageRelative -like 'BRAVO_SELF_TEST*' -or
+                    $consoleCodePageRelative -like 'BRAVO_DATA_RESTORE_MATRIX_TEST*' -or
+                    $consoleCodePageAllowed -contains $consoleCodePageRelative) -and
+                ([IO.File]::ReadAllText($_.FullName) -match '\[(System\.)?Console\]::(OutputEncoding\s*=[^=]|set_OutputEncoding\s*\()')
+            } |
+            ForEach-Object { $_.FullName.Substring($root.TrimEnd('\', '/').Length + 1) }
+    )
+    Test-BRAVOCondition `
+        -Condition ($consoleCodePageDirect.Count -eq 0) `
+        -Name "ConsoleUX/33-NoUnguardedConsoleCodePageSwitch" `
+        -Failure ("[Console]::OutputEncoding перемикають напряму, без Test-BRAVOConsoleCodePageChangeSafe: " + [string]::Join(', ', [string[]]$consoleCodePageDirect))
+
+    # 34. Очікувані ERROR/WARNING змодельованих сценаріїв self-test не
     # друкуються червоним/жовтим між рядками [PASS]: під
     # BRAVO_SELFTEST_SIMULATED_OUTPUT=1 BRAVO.Console приглушує їх до DarkGray,
     # без змінної (production) кольори Red/Yellow лишаються. BRAVO_SELF_TEST.ps1
@@ -560,12 +654,12 @@ function Test-BRAVOSelfTestDuplicateDefinition {
             $detailColorProductionRed -eq [ConsoleColor]::Red -and
             $detailColorProductionYellow -eq [ConsoleColor]::Yellow
         ) `
-        -Name "ConsoleUX/31-SelfTestSimulatedErrorsNotRed" `
+        -Name "ConsoleUX/34-SelfTestSimulatedErrorsNotRed" `
         -Failure "під BRAVO_SELFTEST_SIMULATED_OUTPUT=1 Red/Yellow деталі мають ставати DarkGray (інші кольори без змін), без змінної — лишатися Red/Yellow; отримано: self-test Red=$detailColorSelfTestRed, Yellow=$detailColorSelfTestYellow, Green=$detailColorSelfTestGreen; production Red=$detailColorProductionRed, Yellow=$detailColorProductionYellow"
 
     $selfTestSimulatedSetIndex = $selfTestScriptText.IndexOf("[Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', '1')")
     $selfTestSimulatedRestoreIndex = $selfTestScriptText.IndexOf("(Get-Variable -Name 'selfTestSimulatedOutputPrevious' -Scope Script -ValueOnly -ErrorAction SilentlyContinue)")
     Test-BRAVOCondition `
         -Condition ($selfTestSimulatedSetIndex -ge 0 -and $selfTestSimulatedRestoreIndex -gt $selfTestSimulatedSetIndex) `
-        -Name "ConsoleUX/32-SelfTestSetsAndRestoresSimulatedOutputFlag" `
+        -Name "ConsoleUX/35-SelfTestSetsAndRestoresSimulatedOutputFlag" `
         -Failure "BRAVO_SELF_TEST.ps1 має виставляти BRAVO_SELFTEST_SIMULATED_OUTPUT=1 перед зовнішнім try і відновлювати попереднє значення у finally"

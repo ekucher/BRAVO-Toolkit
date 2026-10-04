@@ -1090,6 +1090,45 @@ function Repair-BRAVOOrphanedServiceStartTypes {
     return $result
 }
 
+function Get-BRAVOForeignServiceQuiescenceContext {
+    # #333: контекст ЧУЖОГО (не цього процесу) ownership-маркера для власника,
+    # що зараз починає власне вікно утримання (DataRestore). Єдине місце, де
+    # це читається, — щоб споживач не копіював логіку маркера.
+    #   Present            - на диску є валідний чужий маркер;
+    #   OwnerAlive         - його власник ще живий (тоді решта полів порожня:
+    #                        чужу живу роботу не «успадковуємо»);
+    #   RestartSuppressed  - маркер мертвого власника suppressed;
+    #   RestartIntentNames - служби, які мертвий власник зупинив із наміром
+    #                        їх запустити (RestartIntent = $true);
+    #   HeldSnapshot       - непорожній startTypeSnapshot мертвого власника
+    #                        (служби, що можуть бути тимчасово Disabled).
+    # Не кидає виняток; невалідний/відсутній маркер = Present $false.
+    [CmdletBinding()]
+    param()
+
+    $context = [pscustomobject]@{
+        Present = $false; OwnerAlive = $false; Owner = $null; RestartSuppressed = $false
+        RestartIntentNames = @(); HeldSnapshot = @()
+    }
+    try {
+        $state = Read-BRAVOServiceQuiescenceState
+        if ($null -eq $state) { return $context }
+        if (Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess -State $state) { return $context }
+        $context.Present = $true
+        $context.Owner = [string]$state.owner
+        if (Test-BRAVOProcessAlive -ProcessId ([int]$state.pid) -ProcessStartTime ([string]$state.processStartTime)) {
+            $context.OwnerAlive = $true
+            return $context
+        }
+        $context.RestartSuppressed = [bool]$state.restartSuppressed
+        $context.RestartIntentNames = @(@($state.services) | Where-Object { [bool]$_.RestartIntent } | ForEach-Object { [string]$_.Name })
+        $context.HeldSnapshot = @(@($state.startTypeSnapshot) | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; StartMode = [string]$_.StartMode } })
+    } catch {
+        $context.Present = $false
+    }
+    return $context
+}
+
 function Confirm-BRAVOServicesQuiesced {
     # Жорстка повторна перевірка безпосередньо ПЕРЕД деструктивним кроком
     # (before-archive, bravocmd): служби з ServiceNames мають бути Stopped.

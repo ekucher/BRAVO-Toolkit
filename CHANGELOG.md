@@ -12,8 +12,152 @@
   `Write-BRAVOConsoleDetail` (BRAVO.Console) друкує Red/Yellow деталі кольором DarkGray.
   Вердикт self-test (`[FAIL]`, `SELF-TEST FAILED`) друкується напряму і лишається червоним;
   production-консоль без змінної не змінюється. Нові перевірки:
-  `ConsoleUX/31-SelfTestSimulatedErrorsNotRed`,
-  `ConsoleUX/32-SelfTestSetsAndRestoresSimulatedOutputFlag`.
+  `ConsoleUX/34-SelfTestSimulatedErrorsNotRed`,
+  `ConsoleUX/35-SelfTestSetsAndRestoresSimulatedOutputFlag`.
+
+- **Fix: Maintenance не зупиняє службу, запущену після знімка стану, без ownership-маркера й наміру перезапуску (#360, #287).**
+  Знімок `$serviceWasRunning` знімався один раз на початку, а фаза зупинки діє за фактичним
+  станом. Служба, яку SCM autostart, recovery action чи оператор запустив між знімком і
+  зупинкою, зупинялася поза ownership-маркером і утриманням від автостарту. У не-restore прогоні
+  крок `[3/8]` друкувався як SKIPPED, після обслуговування служба лишалася зупиненою, а після
+  аварійного переривання її не піднімав і Health-watchdog. Тепер безпосередньо перед зупинкою
+  Maintenance перечитує фактичний стан увімкнених керованих служб: активна служба потрапляє в
+  ownership-маркер, але намір її перезапуску записується лише тоді, коли свіжий стан у фазі
+  зупинки підтверджує, що Maintenance справді її зупиняє (служба, яка встигла зупинитися сама,
+  після обслуговування не запускається; якщо вона зупинилася вже після запису наміру, але до
+  `Stop-Service` — напр. невдалий старт зі `StartPending` чи зупинка іншим актором, коли служба
+  вже у `StopPending`, — намір знімається й з маркера; службі у `StopPending`
+  `Invoke-ServiceStateChange` не надсилає `Stop-Service`, а лише чекає `Stopped`; відхилений
+  `Stop-Service` теж не вважається зупинкою Maintenance). Канонічний намір перезапуску: служба працювала
+  (Running/StartPending) на старті **або в момент її зупинки**, або намір успадковано (#349). Кожну зупинку пропускає `Confirm-BRAVOMaintenanceServiceStopContract`:
+  утримувана служба без наміру, яка зараз активна, отримує намір у маркері ДО зупинки (так само
+  перед повторною зупинкою бар'єром перед before-архівом; якщо намір не вдалося записати, бар'єр
+  службу не зупиняє, а реставрацію скасовано fail-closed). Служба поза маркером, запущена вже
+  після його запису в не-restore прогоні, не зупиняється (WARNING). exchangAPI зупиняється за
+  свіжим, а не закешованим на старті станом; збій читання цього стану — критична помилка кроку
+  `[3/8]`, а не «службу вже зупинено». Крок `[3/8]` звітує SKIPPED лише тоді, коли
+  жодної зупинки не пробували й нових попереджень чи помилок немає (раніше служба, яку
+  запустили вже після повторного читання стану, зупинялась під SKIPPED). #287: BRAVO і exchangAPI зупиняються й у стані
+  `StartPending`; `Invoke-ServiceStateChange` спершу чекає завершення старту
+  (`Wait-BRAVOServiceStartPendingSettled`: SCM відхиляє stop службі у `StartPending`). Перед
+  before-архівом утримувану службу, запущену після зупинки, Maintenance зупиняє сама тією самою
+  операцією (контракт маркера, потім `Invoke-ServiceStateChange` з окремим таймаутом для кожної
+  служби); бар'єр `Confirm-BRAVOServicesQuiesced` лишається останньою перевіркою і служби вже
+  не зупиняє (перезастосовує лише утримання `Disabled`): службу, запущену вже після його плану,
+  він не зупиняє поза контрактом маркера, а реставрацію скасовано fail-closed. Таку повторну
+  зупинку видно у звіті кроків окремим результатом WARN «Повторна зупинка служб перед
+  архівацією» (консоль, підсумок, фінальне сповіщення) — навіть коли `[3/8]` звітував SKIPPED. Реставрація й
+  обробка trace не виконуються над службою в перехідному стані (лише `Stopped` або `Paused`),
+  а стан BRAVO перечитується безпосередньо перед ротацією trace. Призупинена (`Paused`) служба
+  (а також `PausePending`/`ContinuePending`) не зупиняється й не запускається — і на старті, і коли її призупинили вже після знімка (BRAVO
+  Web раніше зупинялася й лишалася зупиненою); якщо в неї був намір перезапуску, його знято й з
+  маркера, тож Health-watchdog після аварійного переривання її не запустить; у restore-прогоні така утримувана служба
+  скасовує реставрацію fail-closed ДО архіву. Служба, зупинена і на старті, і перед зупинкою, як
+  і раніше не запускається; `Disabled` (оператор) не чіпається; boot-recovery без змін. Нові
+  сценарії оркестрації:
+  `Maintenance/LifecycleEveryStopHasRestartContract` (перевіряє всі сценарії),
+  `Maintenance/LifecycleLateStartBeforeStopIsOwnedAndRestarted`,
+  `Maintenance/LifecycleLateStartIntentRecordedOnlyAtStop`,
+  `Maintenance/LifecycleIntentRevokedWhenServiceStopsByItself`,
+  `Maintenance/LifecycleStartPendingIsStoppedAndRestarted`,
+  `Maintenance/LifecycleLateStartRestartedAfterStepThrows`,
+  `Maintenance/LifecycleOperatorDisabledServiceNeverTouched`,
+  `Maintenance/LifecycleServiceStartedAfterContractIsNotStopped`,
+  `Maintenance/LifecycleRestoreLateStartGetsRestartIntentBeforeStop`,
+  `Maintenance/LifecycleIntentWriteFailureNeverStopsService`,
+  `Maintenance/LifecycleStuckStartPendingGetsNoTraceProcessing`,
+  `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`,
+  `Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending`,
+  `Maintenance/LifecyclePreArchiveBarrierStopIsReported`,
+  `Maintenance/LifecycleFinalBarrierNeverStopsOutsideContract`,
+  `Maintenance/LifecycleUnreadableServiceStateIsNotStopped`,
+  `Maintenance/LifecyclePendingPauseIsNotRestarted`,
+  `Maintenance/LifecycleStopStepNotSkippedAfterActualStop`,
+  `Maintenance/LifecycleStopStepFailureNotHiddenBySkipped`,
+  `Maintenance/LifecyclePausedServiceStateIsPreserved`,
+  `Maintenance/LifecycleTraceRotationRechecksBravoState`.
+
+- **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
+  На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
+  піднімає помилку провайдера замість `$false`; під `$ErrorActionPreference = 'Stop'`
+  self-test DataRestore обривався з `[FAIL] Fatal`, а відновлення на тимчасово недоступну
+  ціль давало некатегоризований виняток. Попередній фікс (`-ErrorAction SilentlyContinue` у
+  write-probe) термінальну помилку не гарантовано гасить і покривав лише один виклик. Додано
+  helper `Get-BRAVODataRestorePathProbe` (`-ErrorAction Stop` + try/catch -> `Exists`/`Error`):
+  "шляху немає" і "існування не вдалося визначити" (провайдер підняв помилку) — різні стани.
+  Перевірка reparse-предків цілі теж іде з `-ErrorAction Stop`, тож помилка провайдера там
+  відхиляє ціль, а не стає "предка немає". Через нього йдуть перевірка
+  `-TargetPath` і цілі компонента в `Get-BRAVODataRestorePlan` (недоступність -> класифікована
+  відмова плану, а не "відсутня ціль"), write-probe free-space preflight (недоступна ціль ->
+  проблема "ціль недоступна для перевірки", помилка перевірки probe-файлу перед прибиранням ->
+  проблема preflight), а також повторні перевірки під час відновлення: out-of-place корінь і
+  ціль компонента перед створенням (`RestoreFailed`, код 43, з тим самим формулюванням, що в
+  плані). Out-of-place не зупиняє служб; для InPlace помилка провайдера після утримання служб
+  проходить звичайний шлях відмови компонента, і finally повертає типи запуску та запускає
+  служби за наміром. Self-test імітує поведінку провайдера заглушкою `Test-Path` у script-scope
+  self-test-модуля або в дочірньому процесі проби (без мережі й DNS), заглушка прибирається у
+  finally. Нові перевірки: `DataRestore/PathProbeSeparatesMissingFromUndeterminable`,
+  `DataRestore/PlanClassifiesUnreachableUncTarget`,
+  `DataRestore/PlanComponentTargetUndeterminableFailsClosed`,
+  `DataRestore/FreeSpaceCleanupProbeErrorIsClassified`,
+  `DataRestore/OrchestrationOutOfPlaceUnreachableTargetIsClassified`,
+  `DataRestore/OrchestrationOutOfPlaceUnreachableComponentTargetIsClassified`,
+  `DataRestore/StartModeRestoredWhenProviderErrorAfterQuiescence`; посилено
+  `DataRestore/UnreachableUncTargetIsClassifiedNotFatal` і
+  `DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors`.
+
+- **Fix: Maintenance не зупиняє службу без утримання від автостарту, коли її тип запуску неможливо зняти (#349).**
+  `New-BRAVOServiceStartTypeSnapshot` мовчки пропускає службу з нечитаним ($null) або `Other` типом
+  запуску (а `Disabled` пропускає свідомо), а Maintenance не порівнював знімок зі службами, які
+  зупиняє, — така служба зупинялась без утримання й могла перезапуститись посеред
+  обслуговування/реставрації. Тепер нова `Get-BRAVOMaintenanceUnrestorableServiceNames` (той самий
+  інваріант, що в DataRestore, #345) після знімка шукає зупинювані служби поза знімком, чий реєстровий
+  тип не `Disabled`; кожна така служба логується як ERROR і додається в `startModeSuppressionFailures`
+  (та сама fail-closed політика: реставрація моделі before-archive/bravocmd скасовується через
+  `Confirm-BRAVOServicesQuiesced`, решта обслуговування триває). Службу, вимкнену оператором
+  (`Disabled`), не чіпаємо. Додано self-test `ServiceQuiescence/Maintenance*` (Other, нечитаний
+  тип і збій читання реєстру) і поведінкові сценарії справжньої оркестрації Maintenance
+  `Maintenance/StartMode*`: Other, нечитаний тип і збій читання реєстру скасовують реставрацію
+  ДО архіву перед реставрацією й bravocmd (ERROR у журналі, служби підняті у finally), а
+  Automatic/AutomaticDelayed/Manual і `Disabled` оператором доходять до архіву. Коли заплановано
+  реставрацію, утримується й перевіряється КОЖНА увімкнена керована служба, а не лише ті, що
+  працювали на старті (зупинка діє за фактичним станом; та сама модель, що в DataRestore), але
+  у finally перезапускаються лише ті, що працювали (`Maintenance/StartModeInitiallyStopped*`).
+  Намір перезапуску з маркера аварійно перерваного прогону (мертвий власник, без
+  `restartSuppressed`) успадковується, як у DataRestore (#333): інакше новий маркер перезаписав би
+  його з `RestartIntent = false`, і зупинені тим прогоном служби лишились би зупиненими
+  (`Maintenance/StartModeOrphanRestartIntentSurvivesMarkerRewrite`).
+
+- **Fix: на Windows Server 2012/2012 R2 заплановані завдання завершувались з кодом 1 без логу.**
+  Runtime перемикав кодову сторінку консолі на UTF-8 (65001); у консолі SYSTEM (сесія 0) на
+  Windows до 10 після цього перший `Write-Host` з кирилицею падав з Win32 `0x1F`, тож
+  ARCHIV/HEALTH/MAINTENANCE гинули до відкриття журналу. `Test-BRAVOConsoleCodePageChangeSafe`
+  (BRAVO.Compatibility) на Windows < 10 у неінтерактивній сесії кодову сторінку консолі не
+  змінює; Windows 10+ та інтерактивні запуски — без змін. `$OutputEncoding` (кодування для
+  зовнішніх процесів) і UTF-8-логи не змінюються; лише в цьому випадку консоль лишається на OEM-сторінці, тож нативний вивід, захоплений без явного `StandardOutputEncoding`, декодується за OEM. Перенесено з `5.2.5-rc.3`. Нові перевірки:
+  `ConsoleUX/31-LegacySystemConsoleKeepsCodePage` (поведінкова матриця Server 2012 / 2012 R2 /
+  Windows 10 / 11 x інтерактивна чи неінтерактивна сесія x кодова сторінка через
+  `Initialize-BRAVOConsoleEncoding` з тестовими параметрами `-OSVersion`, `-UserInteractive`,
+  `-SetConsoleOutputEncoding`) і `ConsoleUX/33-NoUnguardedConsoleCodePageSwitch` (жоден інший
+  production-скрипт не перемикає `[Console]::OutputEncoding` напряму).
+
+- **Fix: ізоляція suite self-test бачить Private-записи й тримає незмінний знімок функцій (#350).**
+  Знімок і відновлення читали alias/function script- і global-області з області функції
+  фреймворку, звідки записи з опцією `Private` у батьківських областях невидимі: такий запис
+  фіксувався як відсутній, і його заміна чи видалення suite-ом не відновлювались. Тепер стан
+  читається, знімається й відновлюється прямо в таблиці потрібної області
+  (`Get-BRAVOSelfTestSessionScopeAccess`, `Get-/Remove-BRAVOSelfTestScopedCommandItem`;
+  відсутній член рушія — виняток, а не тихе неповне читання), Options (`Private`,
+  `ReadOnly` тощо) повертаються на відновлений запис. Знімок функцій більше не зберігає живі
+  `FunctionInfo` (перевизначення наявної функції змінює той самий об'єкт на місці, і
+  «знімок» віддавав би заглушку): на вході в suite матеріалізуються ім'я -> `ScriptBlock` та
+  ім'я -> `Options` глобальних функцій. Нові перевірки `Framework/SuiteIsolation.*`:
+  Private-функція й Private-аліас (заміна, видалення; script- і global-область), матриця
+  наявна/видалена/нова функція та аліас, голий `New-Module`, dot-source suite-фрагмента,
+  runtime-модуль над Private-функцією, відновлення після винятку suite, незмінність знімка
+  функцій і поведінкова перевірка резолюції `Get-Service`, `Start-Service`, `Stop-Service`,
+  `Get-Process`, `Stop-Process`, `Start-Sleep`, `Invoke-WebRequest`, `Get-CimInstance`,
+  `Get-WmiObject`, `Start-Process` після Private-заглушок. Production-код не змінено.
 
 - **Fix: self-test `TraceArchive/GraceCompletionExpiry*` не залежить від швидкості runner-а (#338).**
   Fixture виставляв `LastWriteTime` джерела за 2 с до grace-межі й перетинав межу реальним
@@ -67,6 +211,150 @@
   (settle-повтори recovery 15 с x спроб, +~660 с на Windows CI); тепер власна заглушка
   `Start-Sleep` є у модулі фікстури RestoreSynthetic.
 
+- **Fix: `Update-BRAVOServer` більше не відкочує оновлення, коли `BRAVO_SETUP` повертає exit 10 (#330).**
+  Гейт після розгортання приймав від `BRAVO_SETUP -Action Scheduler` і `-ValidateOnly`
+  лише `0`, тож SuccessWithWarnings (`10`) за контрактом BRAVO.ExitCodes вважався провалом
+  і справне оновлення відкочувалось (після #289 — дзеркальним відкатом). Тепер гейт і
+  перевірка після відкату користуються одним вердиктом `Get-BRAVODeploySetupExitVerdict`
+  (`deploy\BRAVO.Deploy.Rollback.ps1`): `0` = PASS, `10` = PASS WITH WARNING (рядок
+  `[УВАГА]`), інше = FAIL. Self-test `Rollback/PostDeployGateTreatsSetupExit10AsPassWithWarning`
+  виконує блок гейта з `Update-BRAVOServer.ps1` із фейковим `BRAVO_SETUP` і падає без виправлення.
+  Регресійна матриця `Rollback/SetupExitVerdictMatrixGateAndRollback` виконує той самий блок
+  для пар Scheduler/ValidateOnly (0/0 PASS; 10/0, 0/10, 10/10 PASS WITH WARNING; 1/0, 0/2, 10/2 FAIL)
+  і перевірку після відкату (0 PASS, 10 PASS WITH WARNING, 3 FAIL); падає і при поверненні гейта
+  до `-eq 0`, і при зміні класифікатора (10 => FAIL).
+
+- **Fix: Health показує ймовірну причину застарілої generation і не дублює її в хмарних рядках (#322).**
+  Не-COMPLETE manifest більше не пропускається мовчки: `Get-BackupHealthIssues` запам'ятовує
+  останню INCOMPLETE/FAILED спробу, а issue «остання COMPLETE generation старша за N год.»
+  отримує поле `Diagnosis` з чистого класифікатора `Get-BRAVOHealthBackupStaleReason`
+  (завдання вимкнене → новіша не-COMPLETE спроба зі статусом і етапом → код
+  останнього запуску → не запускалося → завершився достроково → код status-файла Archive).
+  «Завдання не знайдене або недоступне» перевіряється останнім (збій читання планувальника не
+  видається за «не встановлене»); виконується зараз (0x41301) і ще не запускалося (0x41303 або
+  рік < 2000) не вважаються «завершилось достроково»; hashtable-вхід читається як PSCustomObject.
+  Boot catch-up (`BackupCatchUp`) береться як остання спроба лише коли він справді архівував
+  (ненульовий результат або status-файл, записаний після його старту); no-op catch-up не
+  видається за «завершився достроково».
+  Кожне читання (планувальник, status-файл) у власному try/catch: збій пропускає перевірку
+  з WARNING, діагностика не змінює Kind/Component/Reason, exit code та Operations. У Slack
+  `LocalBackupGeneration` тепер у секції «ЛОКАЛЬНІ БЕКАПИ» (раніше «ІНШІ ПОМИЛКИ») з рядком
+  «:mag: Причина: …»; age-only хмарні рядки SFTP/SMB для того самого застарілого локального
+  архіву згортаються в один, помилки розміру/відсутності/з'єднання не згортаються,
+  лічильник компонентів не дублюється. Self-test: `Health/StaleGenerationReasonClassifier`,
+  `Health/StaleGenerationDiagnosisFromIncompleteManifest`,
+  `Health/StaleGenerationInLocalSectionWithReason`,
+  `Health/StaleGenerationCollapsesOnlyAgeOnlyCloudRows`,
+  `Health/StaleGenerationDiagnosisKeepsKindAndComponent`.
+
+- **Fix: DataRestore тимчасово утримує тип запуску служб на час restore (#333, продовження #297/#329).**
+  Раніше InPlace-DataRestore лише писав ownership-маркер і не знімав знімок типів запуску: SCM
+  міг підняти службу з delayed/automatic start посеред restore, а після аварійного Maintenance
+  (служби тимчасово `Disabled`, початкові типи в чужому знімку) `Start-Service` падав і прогін
+  завершувався кодом `43` з маркером `restartSuppressed`, який ніхто не знімав. Тепер DataRestore
+  користується тим самим канонічним контрактом BRAVO.System, що й Maintenance (нових копій
+  логіки немає): самовідновлення `Repair-BRAVOOrphanedServiceStartTypes` до читання start type;
+  знімок точних початкових типів (`New-BRAVOServiceStartTypeSnapshot`, Disabled-оператором у
+  знімок не потрапляє) пишеться в той самий маркер до зміни (чужий знімок зливається);
+  `Suspend-BRAVOServiceAutostart` → тимчасовий `Disabled`; `Confirm-BRAVOServicesQuiesced` перед
+  деструктивною фазою; у `finally` `Restore-BRAVOServiceStartTypeSnapshot` повертає типи ПЕРЕД
+  стартом служб (стартують лише служби з наміром). Служба, вимкнена оператором до прогону,
+  лишається `Disabled` і зупиненою. Маркер аварійного прогону з `restartSuppressed` більше не
+  блокує: його знімок зливається, служби з `RestartIntent` запускаються після успішного restore.
+  При незавершеному rollback служби свідомо лишаються `Disabled` (код 43). Збій знімка/утримання
+  скасовує restore до змін даних. Новий експорт `Get-BRAVOForeignServiceQuiescenceContext`
+  (BRAVO.System). Відновлення після аварійного прогону дає попередження, тож успішний restore
+  завершується кодом `10` (SuccessWithWarnings); маркер живого власника блокує прогін (`43`) до
+  будь-яких змін; записи знімка поза керованим набором служб ігноруються. Self-test: `DataRestore/StartMode*` (звичайна служба, Manual-зупинена,
+  delayed automatic, вимкнена оператором, чужий знімок suppressed/repairable, відсутній знімок,
+  зіпсований маркер, збій restore, збій старту служби).
+  Правки рев'ю #345: керована служба зі start type `Other`/нечитаним (не потрапила б у знімок)
+  скасовує restore (`43`) до змін даних, з її іменем у журналі; записи чужого знімка поза
+  керованим набором відкидаються з маркера ДО запису власного (WARNING). Maintenance не змінено.
+  Правки рев'ю #345 (2): очищення чужого маркера більше не викликає приватну
+  `Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess` (не експортована з BRAVO.System, у проді
+  давала `43`); успадковане `restartSuppressed` знімається лише успішним restore — збій цього
+  прогону лишає служби зупиненими й `Disabled`, маркер suppressed (`43`); утримання від автостарту
+  перевіряється (`Confirm-BRAVOServicesQuiesced`) перед КОЖНИМ компонентом, втрата утримання
+  скасовує restore до торкання компонента (`43`).
+
+- **Fix: retention не видаляє COMPLETE резервні копії як «невдалі» (#335, безпечна частина).**
+  `Remove-BRAVOExpiredBackupGenerations` відносила generation до гілки `failedArchiveRetentionDays`
+  за результатом сьогоднішньої повторної перевірки, а не за записаним статусом: COMPLETE копія з
+  одним пошкодженим архівом через 30 днів видалялась разом із цілими архівами інших компонентів
+  навіть при `enableArchiveDeletion = $false`, без попередження. Тепер гілку визначає записаний
+  статус: COMPLETE видаляється лише за `archiveRetentionDays` і лише при `enableArchiveDeletion`;
+  пошкодження COMPLETE (також старшої за `minimumRetainedVerifiedBackups` захищених) дає WARNING
+  «Пошкоджена резервна копія» і не веде до видалення. Для WARNING кожної COMPLETE generation
+  використовується дешева перевірка без читання вмісту (архів і `.sha512` на місці, розмір проти
+  `ArchiveSize`, формат `.sha512`); повний SHA512 рахується лише для вибору N захищених, коли
+  `enableArchiveDeletion = $true` і є прострочені COMPLETE generation, тобто не щоночі по всій
+  історії. Шляхи архівів перебудовуються як у відновленні (`ConvertTo-BRAVORebasedLocalGenerationManifest`):
+  після перенесення сховища manifest-и більше не стираються, а архіви не лишаються сиротами.
+  Manifest видаляється останнім і лише після своїх архівів; помилка на одній generation (напр.
+  заблокований файл) не зупиняє решту, а прогін повертає невдачу. Generation із типом компонента,
+  якого немає в поточних `ArchiveDefinitions`, не видаляється (WARNING). Перебудова шляхів
+  fail-closed: generation лишається з WARNING, якщо перебудоване ім'я не належить цій generation
+  за `NameTemplate`, файл ще лежить за старим шляхом поза `BackupRoot` або канонічний каталог
+  компонента недоступний; збій читання метаданих архіву стосується лише своєї generation. Архіви без manifest-а
+  лише рахуються в рядку «Аудит retention» (обідні `_HHMM` копії не рахуються) і не видаляються.
+  Видалено мертву `Remove-OldBackupSets` разом із симуляційним self-test. README: захист
+  `minimumRetainedVerifiedBackups` типово `2` і рахується по generation. Нових ключів
+  конфігурації немає. Нові self-test перевірки:
+  `BackupConsistency/CompleteGenerationIsNeverDeletedAsFailedAndCorruptionWarns`,
+  `BackupConsistency/CompleteGenerationNeverDeletedWhenArchiveDeletionDisabled`,
+  `BackupConsistency/FailedGenerationStillExpiresByFailedRetention`,
+  `BackupConsistency/OldCorruptCompleteBeyondProtectedWarnsAndIsKept`,
+  `BackupConsistency/Sha512MismatchWarnsAndOlderVerifiedIsProtected`,
+  `BackupConsistency/NoSha512WhenArchiveDeletionDisabled`,
+  `BackupConsistency/NoSha512WhenNothingIsExpired`,
+  `BackupConsistency/RelocatedRepositoryKeepsCompleteManifests`,
+  `BackupConsistency/RelocatedRepositoryExpiryDeletesArchivesWithManifest`,
+  `BackupConsistency/RetentionFailureOnOneGenerationDoesNotStopOthers`,
+  `BackupConsistency/ManifestIsDeletedOnlyAfterItsArtifacts`,
+  `BackupConsistency/RetentionRetryFinishesGenerationAfterLockReleased`,
+  `BackupConsistency/UnreferencedArchivesAreReportedNotDeleted`,
+  `BackupConsistency/UnknownComponentTypeKeepsGenerationAndWarns`.
+
+- **Feat: резервне копіювання лише встановлених компонентів (#282).**
+  Прапорець компонента в `componentSettings` тепер означає «копіювати, якщо компонент є на
+  сервері». `Resolve-BRAVOBackupComponentScope` (BRAVO.Discovery) поверх матриці
+  `Test-BRAVODiscoveryComponentDrift` класифікує склад: `Planned` / `NotInstalled` /
+  `DisabledByConfig` / `Missing` / `Unknown`. Увімкнений, але не встановлений компонент без
+  запису в baseline пропускається (Info) без архіву, BAZA-синхронізації й каталогів
+  призначення; `MODEL` обов'язковий, порожній склад і зниклий підтверджений компонент лишаються
+  помилкою. Discovery baseline створюється й доповнюється автоматично після COMPLETE generation
+  (лише Planned-компоненти, наявні значення не змінюються; перше створення не бере
+  DisabledByConfig). Для серверів без baseline другий доказ присутності — останній COMPLETE
+  generation manifest (`Get-BRAVOLastCompleteBackupComponents`): компонент, що мав у ньому
+  архів, а тепер Absent, стає `Missing` (помилка), а не `NotInstalled`. `BRAVO_ARCHIV`,
+  Health, Dry Run і `BRAVO_SETUP -ValidateOnly` користуються цим самим складом (ValidateOnly і
+  Test-BRAVODiscoveryResult більше не створюють каталогів); `Test-SFTPConfig` не вимагає
+  SFTP-каталогів для NotInstalled-компонентів; Health показує один INFO-рядок «Не встановлено
+  на цьому сервері: …» без WARNING. Оголошене (bravo.ini/служба/override), але недоступне джерело
+  ніколи не стає `NotInstalled`: `Test-BRAVODiscoverySourceDirectory` розрізняє «не існує» і «не
+  вдалося прочитати» (Kind), нечитабельне дає Error, а Absent з оголошеним джерелом у scope лишається
+  `Missing` (backup пробує компонент і падає гучно, baseline не пишеться). Доказ з попереднього
+  COMPLETE manifest діє й коли baseline старіший за цей manifest; `BRAVO_SETUP` передає той самий
+  доказ, що й ARCHIV. Підсумок ARCHIV (status JSON, секція «Архіви», план, лог) враховує лише реальний
+  склад.
+  Дизайн складу: Health і Dry Run не читають склад зі `scope` останнього manifest, а беруть його
+  з живого discovery + baseline (лише читання, `Get-BRAVOBackupNotInstalledComponents`) і
+  останнього COMPLETE manifest як другого доказу присутності, бо manifest застаріває між
+  прогонами: компонент, що зник після останньої копії, Health побачив би як `Planned` лише до
+  наступного прогону, а новий не побачив би взагалі. Поле manifest `componentScope`
+  (компонент -> `Planned` / `NotInstalled` / `DisabledByConfig` / `Missing` / `Unknown`) пишеться
+  для аудиту як доказ свідомого пропуску; Health його не читає. Невизначеність (непридатний
+  baseline) у read-only варіанті дає порожній список NotInstalled: очікуються всі увімкнені
+  компоненти, зайва тривога краща за пропущену. Фільтри «увімкнений і встановлений» винесено в
+  `Select-BRAVOExpectedArchiveDefinition`, охоронець оновлення baseline в
+  `Test-BRAVOBackupBaselineUpdateAllowed`, перелік призначень SETUP у
+  `Get-BRAVODiscoveryDestinationPaths`, а перевірку BAZA-синхронізації в
+  `Test-BRAVOBackupComponentInstalled`, щоб їх поведінку перевіряли self-test-и, а не пошук
+  тексту в коді. Нові self-test перевірки: набір `BackupScope` (зокрема `BackupScope/PreviouslyBackedUpComponentVanishedWithoutBaselineIsError`,
+  `BackupScope/FirstBaselineExcludesDisabledByConfig`,
+  `BackupScope/LastCompleteManifestComponentsReader`,
+  `BackupScope/SftpConfigSkipsNotInstalledAndPreviousProofWired`).
 - **Fix: Configurator не виконує legacy `BRAVO.config` поруч із RuntimeRoot (#320).**
   `Invoke-BRAVOConfiguratorEffectiveComputation` копіював `<RuntimeRoot>\BRAVO.config` в
   ізольований корінь, а згенерований дочірній скрипт викликав `Import-BravoConfiguration`

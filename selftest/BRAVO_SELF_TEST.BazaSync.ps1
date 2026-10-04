@@ -2341,7 +2341,7 @@
                 function Write-BRAVOLog { param($Component, $Message, $Level, [switch]$NoTimestamp) [void]$script:Messages.Add([string]$Message) }
                 function Show-ScriptProgress { param($Status, $PercentComplete, [switch]$Completed) }
                 function Test-PathWithLog { param($Path, $Description, $CreateIfMissing) return (Test-Path -LiteralPath $Path) }
-                function Test-SFTPConfig { param([switch]$SynchronizationOnly, [switch]$BAZAOnly) return $true }
+                function Test-SFTPConfig { param([switch]$SynchronizationOnly, [switch]$BAZAOnly, [string[]]$NotInstalledComponents) return $true }
                 function Test-SFTPConnection { param($WinSCPPath, $RepositorySFTPUrl, $HostKey) return $true }
                 function Initialize-BRAVOSFTPRemoteDirectories { param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $RemoteDirectories) }
                 function Get-BRAVOWinSCPDotNetComponents { param($WinSCPAssemblyPath, $WinSCPPath) return [pscustomobject]@{ AssemblyPath = 'C:\fake\WinSCPnet.dll'; ExecutablePath = 'C:\fake\winscp.exe' } }

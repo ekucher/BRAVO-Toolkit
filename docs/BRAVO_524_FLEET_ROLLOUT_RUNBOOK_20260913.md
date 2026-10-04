@@ -166,7 +166,7 @@ site-overlay, не правлячи `BRAVO.config`:
 1. `VERSION.json` = `5.2.4`;
 2. `BRAVO_RUNTIME_GUARD.ps1` → `exit 0`;
 3. `BRAVO_SETUP -Action Scheduler` → перереєстрація завдань;
-4. `BRAVO_SETUP -ValidateOnly` → `exit 0`.
+4. `BRAVO_SETUP -ValidateOnly` → `exit 0` (PASS) або `exit 10` (PASS WITH WARNING, #330).
 
 Провал будь-якого гейта — **автоматичний відкат** з backup і повторна
 перевірка guard.

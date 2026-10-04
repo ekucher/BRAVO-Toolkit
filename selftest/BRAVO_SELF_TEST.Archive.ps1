@@ -673,6 +673,19 @@ function Write-BRAVODiskSpaceDecisionLog { param($Results, $Logger) }
 function Get-BRAVOFiles { param($Path, $Filter) return @() }
 function Import-BRAVODiscoveryBaseline { param($StateRoot, $RuntimeRoot) return [pscustomobject]@{ Problems = @(); Baseline = $null; Source = 'self-test' } }
 function Test-BRAVODiscoveryComponentDrift { param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents) return @() }
+function Get-BRAVOLastCompleteBackupComponents { param($BackupRoot) return @() }
+function Select-BRAVOExpectedArchiveDefinition { param($ArchiveDefinitions, [string[]]$NotInstalledComponents) return @(@($ArchiveDefinitions) | Where-Object { $_.Enabled -and @($NotInstalledComponents) -notcontains [string]$_.Type }) }
+function Test-BRAVOBackupComponentInstalled { param([string]$Component, [string[]]$NotInstalledComponents) return (@($NotInstalledComponents) -notcontains $Component) }
+function Test-BRAVOBackupBaselineUpdateAllowed { param($GenerationStatus, $BaselineValid, $BackupScope, $GenerationManifestPath) return ($GenerationStatus -eq 'COMPLETE' -and $BaselineValid -and $null -ne $BackupScope -and -not [string]::IsNullOrWhiteSpace($GenerationManifestPath)) }
+function Get-BRAVOLastCompleteBackupEvidence { param($BackupRoot) return [pscustomobject]@{ Components = @(); CreatedAtUtc = $null } }
+function Resolve-BRAVOBackupComponentScope {
+    param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents, $PreviousCompleteComponents, $PreviousCompleteAt)
+    return [pscustomobject]@{ Components = [ordered]@{}; Planned = @(); NotInstalled = @(); EffectiveEnabledComponents = $EnabledComponents; EmptyComposition = $false; Findings = @() }
+}
+function Update-BRAVODiscoveryBaselineFromScope {
+    param($DiscoveryResult, $ScopeResult, $StateRoot, $RuntimeRoot)
+    return [pscustomobject]@{ Action = 'Unchanged'; AddedComponents = @(); Path = $null }
+}
 function Test-PathWithLog { param($Path, $Description, $CreateIfMissing) return $true }
 function Show-PathCheckSummary { param($CheckedPaths, $AllPathsExist) }
 function Test-BRAVOFileSystemWriteProbe { param($Path) return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null } }
@@ -718,7 +731,7 @@ function Write-BRAVOBackupGenerationManifest {
     return (Join-Path $BackupRoot 'self-test-manifest.json')
 }
 function Remove-BRAVOExpiredBackupGenerations {
-    param($BackupRoot, $CurrentGenerationId, $RetentionDays, [ref]$CleanupSectionShown, [ref]$RemovedGenerationCount)
+    param($BackupRoot, $CurrentGenerationId, $RetentionDays, [ref]$CleanupSectionShown, [ref]$RemovedGenerationCount, $ArchiveDefinitions)
     Add-ProbeEvent 'RETENTION-CLEANUP'
     return $true
 }
