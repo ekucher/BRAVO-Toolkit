@@ -15,6 +15,20 @@
   `ConsoleUX/34-SelfTestSimulatedErrorsNotRed`,
   `ConsoleUX/35-SelfTestSetsAndRestoresSimulatedOutputFlag`.
 
+- **Fix: перевищення порогу діапазонів ID більше не ховає решту перевірок Maintenance у сповіщенні.**
+  Коли `Test-RangeIdUsage` фіксував перевищення порогу (`range_id_log.json`), запис потрапляв у
+  `CriticalErrorsList`, і `Send-FinalReport` будував фінальне сповіщення ЛИШЕ з цього списку:
+  статуси реставрації, `.md`, trace, очистки, вільного місця, проблемні етапи ("Також потребує
+  уваги") і попередження з `NotificationAlertQueue` до оператора не доходили, хоча самі перевірки
+  виконувались. Тепер блок "Виконано:" будує окремий helper
+  `Get-BRAVOMaintenanceFinalReportCheckLines`, і він додається в КОЖНУ гілку фінального звіту:
+  критична гілка містить записи `CriticalErrorsList`, попередження з черги і статуси етапів;
+  гілка черги попереджень — попередження і статуси етапів. Збій побудови блоку статусів лише
+  логується (`Get-BRAVOMaintenanceFinalReportCheckLinesSafe`) і не забирає саме сповіщення про
+  проблему. Нові перевірки: `Maintenance/RangeIdAlertKeepsOtherChecksInFinalReport`,
+  `Maintenance/AlertQueueFinalReportIncludesCheckStatuses`,
+  `Maintenance/FinalReportCheckLinesFailureKeepsAlert`.
+
 - **Fix: Maintenance не зупиняє службу, запущену після знімка стану, без ownership-маркера й наміру перезапуску (#360, #287).**
   Знімок `$serviceWasRunning` знімався один раз на початку, а фаза зупинки діє за фактичним
   станом. Служба, яку SCM autostart, recovery action чи оператор запустив між знімком і

@@ -302,6 +302,11 @@ Test-BRAVOCondition (-not $validationClean.HasErrors -and $validationClean.Findi
 $configuratorPersistScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_CONFIGURATOR_PERSIST_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($configuratorPersistScenarioRoot)
+# Пришвидшення 2026-10-02: DefaultConfig для Apply кешується в модулі
+# Persistence. Лічильник обчислень скидається тут, а після сценаріїв
+# 14-20 (шість Apply на тому самому RuntimeRoot) має дорівнювати 1.
+$configuratorPersistenceModule = Get-Module -Name 'BRAVO.Configurator.Persistence'
+& $configuratorPersistenceModule { $script:DefaultConfigCache = $null; $script:DefaultConfigComputationCount = 0 }
 try {
     # 14: candidate valid -> atomic apply (на порожній production-директорії)
     $persistBaselineEmpty = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot
@@ -397,6 +402,134 @@ try {
 } finally {
     Remove-Item -LiteralPath $configuratorPersistScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# --- DefaultConfig-кеш Apply: один дочірній процес на незмінний ключ ---
+$defaultCacheApplyComputations = & $configuratorPersistenceModule { $script:DefaultConfigComputationCount }
+Test-BRAVOCondition ($defaultCacheApplyComputations -eq 1) `
+    'Configurator Persistence: повторні Apply не запускають другий дочірній процес для DefaultConfig' `
+    "обчислень DefaultConfig за шість Apply на тому самому RuntimeRoot: $defaultCacheApplyComputations (очікується 1)"
+
+# Кешований DefaultConfig збігається з прямим canonical-обчисленням, а
+# викликач отримує окрему глибоку копію. Кілька листів результату
+# змінюються від прогону до прогону самі по собі (напр. шлях тимчасового
+# ізольованого root); їх видно як розбіжність ДВОХ прямих обчислень, і
+# лише вони не порівнюються з кешем.
+$flattenDefaultConfig = {
+    param($Value, [string]$Path, [hashtable]$Into)
+    if ($null -eq $Value) {
+        $Into[$Path] = '<null>'
+    } elseif ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $Into[$Path + '{}'] = @($Value.PSObject.Properties).Count
+        foreach ($flattenProperty in $Value.PSObject.Properties) {
+            & $flattenDefaultConfig $flattenProperty.Value ($Path + '.' + $flattenProperty.Name) $Into
+        }
+    } elseif ($Value -is [array]) {
+        $Into[$Path + '[]'] = $Value.Count
+        for ($flattenIndex = 0; $flattenIndex -lt $Value.Count; $flattenIndex++) {
+            & $flattenDefaultConfig $Value[$flattenIndex] ($Path + '[' + $flattenIndex + ']') $Into
+        }
+    } else {
+        $Into[$Path] = $Value.GetType().Name + ':' + [string]$Value
+    }
+}
+$defaultCacheDirectFirst = @{}
+$defaultCacheDirectSecond = @{}
+& $flattenDefaultConfig (Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorFixtureRuntimeRoot -CandidateOverrides @{}) '' $defaultCacheDirectFirst
+& $flattenDefaultConfig (Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorFixtureRuntimeRoot -CandidateOverrides @{}) '' $defaultCacheDirectSecond
+$defaultCacheFirst = & $configuratorPersistenceModule { param($RuntimeRoot) Get-BRAVOConfiguratorDefaultConfig -RuntimeRoot $RuntimeRoot } $configuratorFixtureRuntimeRoot
+$defaultCacheFirst.pathSettings | Add-Member -MemberType NoteProperty -Name 'SelfTestCacheMutation' -Value 'x' -Force
+$defaultCacheSecond = & $configuratorPersistenceModule { param($RuntimeRoot) Get-BRAVOConfiguratorDefaultConfig -RuntimeRoot $RuntimeRoot } $configuratorFixtureRuntimeRoot
+$defaultCacheStored = @{}
+$defaultCacheReturned = @{}
+& $flattenDefaultConfig (& $configuratorPersistenceModule { $script:DefaultConfigCache.Value }) '' $defaultCacheStored
+& $flattenDefaultConfig $defaultCacheSecond '' $defaultCacheReturned
+$defaultCacheVolatilePaths = @($defaultCacheDirectFirst.Keys | Where-Object {
+    -not $defaultCacheDirectSecond.ContainsKey($_) -or $defaultCacheDirectSecond[$_] -ne $defaultCacheDirectFirst[$_]
+} | Sort-Object)
+$defaultCacheMismatchPaths = @(@(@($defaultCacheDirectFirst.Keys) + @($defaultCacheReturned.Keys)) | Sort-Object -Unique | Where-Object {
+    $defaultCacheVolatilePaths -notcontains $_ -and (
+        -not $defaultCacheDirectFirst.ContainsKey($_) -or
+        -not $defaultCacheReturned.ContainsKey($_) -or
+        $defaultCacheDirectFirst[$_] -ne $defaultCacheReturned[$_])
+})
+$defaultCacheCopyMismatchPaths = @(@(@($defaultCacheStored.Keys) + @($defaultCacheReturned.Keys)) | Sort-Object -Unique | Where-Object {
+    -not $defaultCacheStored.ContainsKey($_) -or
+    -not $defaultCacheReturned.ContainsKey($_) -or
+    $defaultCacheStored[$_] -ne $defaultCacheReturned[$_]
+})
+Test-BRAVOCondition (
+    $defaultCacheDirectFirst.Count -gt 50 -and
+    $defaultCacheMismatchPaths.Count -eq 0 -and
+    $defaultCacheCopyMismatchPaths.Count -eq 0 -and
+    -not [object]::ReferenceEquals($defaultCacheFirst, $defaultCacheSecond) -and
+    @($defaultCacheSecond.pathSettings.PSObject.Properties | Where-Object { $_.Name -eq 'SelfTestCacheMutation' }).Count -eq 0 -and
+    (& $configuratorPersistenceModule { $script:DefaultConfigComputationCount }) -eq 1
+) `
+    'Configurator Persistence: кешований DefaultConfig дорівнює canonical-обчисленню і віддається глибокою копією' `
+    ("листів=$($defaultCacheDirectFirst.Count); розбіжності з прямим обчисленням: $($defaultCacheMismatchPaths -join ', '); " +
+     "розбіжності копії з кешем: $($defaultCacheCopyMismatchPaths -join ', '); " +
+     "мінливі між прямими прогонами: $($defaultCacheVolatilePaths -join ', '); " +
+     "окремий екземпляр=$(-not [object]::ReferenceEquals($defaultCacheFirst, $defaultCacheSecond)); " +
+     "обчислень=$(& $configuratorPersistenceModule { $script:DefaultConfigComputationCount })")
+
+# Ключ кешу: RuntimeRoot, вміст файлів loader-а й modules\, env BRAVO_*.
+# Файли конфігурації (BRAVO.local.config) у ключ не входять.
+$defaultCacheKeyRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CONFIGURATOR_CACHEKEY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+$defaultCacheKeyProbeName = 'BRAVO_SELFTEST_DEFAULT_CONFIG_CACHE_PROBE'
+$defaultCacheKeyResults = [ordered]@{}
+try {
+    [void][IO.Directory]::CreateDirectory((Join-Path $defaultCacheKeyRoot 'modules\BRAVO.Configuration'))
+    $defaultCacheKeyLoader = Join-Path $defaultCacheKeyRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $defaultCacheKeyModule = Join-Path $defaultCacheKeyRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psm1'
+    $defaultCacheKeyLocal = Join-Path $defaultCacheKeyRoot 'BRAVO.local.config'
+    [IO.File]::WriteAllText($defaultCacheKeyLoader, '# loader v1')
+    [IO.File]::WriteAllText($defaultCacheKeyModule, '# module v1')
+    [IO.File]::WriteAllText($defaultCacheKeyLocal, '@{}')
+    $getDefaultCacheKey = { & $configuratorPersistenceModule { param($RuntimeRoot) Get-BRAVOConfiguratorDefaultConfigCacheKey -RuntimeRoot $RuntimeRoot } $defaultCacheKeyRoot }
+    $defaultCacheKeyBase = & $getDefaultCacheKey
+    $defaultCacheKeyResults['стабільний'] = ((& $getDefaultCacheKey) -eq $defaultCacheKeyBase)
+    [IO.File]::WriteAllText($defaultCacheKeyLoader, '# loader v2')
+    $defaultCacheKeyResults['loader'] = ((& $getDefaultCacheKey) -ne $defaultCacheKeyBase)
+    [IO.File]::WriteAllText($defaultCacheKeyLoader, '# loader v1')
+    [IO.File]::WriteAllText($defaultCacheKeyModule, '# module v2')
+    $defaultCacheKeyResults['modules'] = ((& $getDefaultCacheKey) -ne $defaultCacheKeyBase)
+    [IO.File]::WriteAllText($defaultCacheKeyModule, '# module v1')
+    [Environment]::SetEnvironmentVariable($defaultCacheKeyProbeName, 'probe', 'Process')
+    $defaultCacheKeyResults['env'] = ((& $getDefaultCacheKey) -ne $defaultCacheKeyBase)
+    [Environment]::SetEnvironmentVariable($defaultCacheKeyProbeName, $null, 'Process')
+    [IO.File]::WriteAllText($defaultCacheKeyLocal, "@{ 'consoleSettings.ConsoleLevel' = 'ERROR' }")
+    $defaultCacheKeyResults['local-config-поза-ключем'] = ((& $getDefaultCacheKey) -eq $defaultCacheKeyBase)
+    $defaultCacheKeyResults['runtime-root'] = ((& $configuratorPersistenceModule { param($RuntimeRoot) Get-BRAVOConfiguratorDefaultConfigCacheKey -RuntimeRoot $RuntimeRoot } $configuratorFixtureRuntimeRoot) -ne $defaultCacheKeyBase)
+} finally {
+    [Environment]::SetEnvironmentVariable($defaultCacheKeyProbeName, $null, 'Process')
+    Remove-Item -LiteralPath $defaultCacheKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+Test-BRAVOCondition (
+    $defaultCacheKeyResults.Count -eq 6 -and
+    @($defaultCacheKeyResults.Values | Where-Object { -not $_ }).Count -eq 0
+) `
+    'Configurator Persistence: ключ DefaultConfig-кешу змінюється з loader-ом, modules\, env BRAVO_* і RuntimeRoot' `
+    ("результати: " + (@($defaultCacheKeyResults.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '))
+
+# Після зміни частини ключа (env BRAVO_*) чи завершення TTL DefaultConfig
+# рахується заново.
+$defaultCacheCountBeforeChange = & $configuratorPersistenceModule { $script:DefaultConfigComputationCount }
+try {
+    [Environment]::SetEnvironmentVariable($defaultCacheKeyProbeName, 'probe', 'Process')
+    $null = & $configuratorPersistenceModule { param($RuntimeRoot) Get-BRAVOConfiguratorDefaultConfig -RuntimeRoot $RuntimeRoot } $configuratorFixtureRuntimeRoot
+} finally {
+    [Environment]::SetEnvironmentVariable($defaultCacheKeyProbeName, $null, 'Process')
+}
+$defaultCacheCountAfterKeyChange = & $configuratorPersistenceModule { $script:DefaultConfigComputationCount }
+& $configuratorPersistenceModule { $script:DefaultConfigCache.CreatedUtc = [DateTime]::UtcNow.AddSeconds(-($script:DefaultConfigCacheTtlSeconds + 1)) }
+$null = & $configuratorPersistenceModule { param($RuntimeRoot) Get-BRAVOConfiguratorDefaultConfig -RuntimeRoot $RuntimeRoot } $configuratorFixtureRuntimeRoot
+$defaultCacheCountAfterTtl = & $configuratorPersistenceModule { $script:DefaultConfigComputationCount }
+Test-BRAVOCondition (
+    $defaultCacheCountAfterKeyChange -eq ($defaultCacheCountBeforeChange + 1) -and
+    $defaultCacheCountAfterTtl -eq ($defaultCacheCountAfterKeyChange + 1)
+) `
+    'Configurator Persistence: DefaultConfig рахується заново після зміни ключа кешу або TTL' `
+    "обчислень: до=$defaultCacheCountBeforeChange, після зміни env=$defaultCacheCountAfterKeyChange, після TTL=$defaultCacheCountAfterTtl"
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/Schema1' } }
 if (Enter-BRAVOSelfTestSection -Name 'Configurator/Persistence' -DependsOn 'Configurator/Schema1') { try {
 

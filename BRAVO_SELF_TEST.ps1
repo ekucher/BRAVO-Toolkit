@@ -6270,6 +6270,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
                 return "TITLE=$Title|EMOJI=$TitleEmoji|SEVERITY=$Severity|DETAILS=$($Details -join ';')"
             }
+            function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
 
             & $SendCallsInner
 
@@ -6520,7 +6521,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # WARNING/ALERTS, а не як SUCCESS/GENERAL (review finding #1) ----------
     $finalStatusModuleForSeverity = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
     $successWithWarningsRouteCapture = & $finalStatusModuleForSeverity {
         $script:SlackMode = "all"
         $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
@@ -6598,7 +6599,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # StaticAnalysis/NoStaticNewConstructorInProductionCode (Governance).
     $completedLinesModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
     $completedLinesScenarios = @(
         @{ Name = 'Zero'; Lines = @() },
         @{ Name = 'One'; Lines = @('Виконано:') },
@@ -6669,6 +6670,158 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             ) `
             -Name "Maintenance/SuccessNotificationCompletedLines_$($completedLinesScenario.Name)" `
             -Failure "успішне сповіщення (mode=all) мало передати в -Details $($expectedCompletedLines.Count) рядк(ів) '$($expectedCompletedLines -join '|')'; отримано: $(if ($null -eq $completedLinesCapture) { '<немає результату>' } else { '{0} доставлено, {1} рядк(ів) ''{2}''' -f $completedLinesCapture.DeliveredCount, $completedLinesCapture.DetailsCount, $completedLinesCapture.DetailsJoined })"
+    }
+
+    # --- Maintenance: перевищення порогу діапазонів ID (запис у
+    # CriticalErrorsList через Test-RangeIdUsage -> Send-SlackAlert
+    # -IsCritical) не повинно ховати решту перевірок. Регресія з продового
+    # сповіщення 5.2.4: фінальне повідомлення містило ЛИШЕ блок діапазонів
+    # ID — без статусів реставрації/.md/trace/очистки/вільного місця, без
+    # проблемних етапів і без попереджень з NotificationAlertQueue. Реальні
+    # Test-RangeIdUsage, Send-SlackAlert, Send-FinalReport і побудова блоку
+    # "Виконано:"; стабами лише транспорт і рендер.
+    $rangeIdFinalReportModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceRuntimeSourceForSeverity `
+        -FunctionNames @(
+            'Test-RangeIdUsage', 'Send-SlackAlert',
+            'Get-BRAVOMaintenanceStepOutcome', 'New-BRAVOMaintenanceCompletedLines',
+            'Get-BRAVOMaintenanceFinalReportCheckLines', 'Get-BRAVOMaintenanceFinalReportCheckLinesSafe',
+            'Send-FinalReport'
+        )
+    $rangeIdFinalReportRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RangeIdFinalReport_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $rangeIdFinalReportRoot -Force)
+    try {
+        $rangeIdFinalReportLogPath = Join-Path $rangeIdFinalReportRoot 'range_id_log.json'
+        [IO.File]::WriteAllText(
+            $rangeIdFinalReportLogPath,
+            '{"time":"2026-01-01T00:00:00","critical":[{"file":"range_test_A","filled":84.22}],"info":[{"file":"range_test_B","filled":12.5}]}',
+            (New-Object System.Text.UTF8Encoding($false)))
+
+        function Invoke-RangeIdFinalReportScenario {
+            param([string]$RangeIdLogPath, [switch]$WithRangeId, [switch]$BreakCheckLines)
+            & $rangeIdFinalReportModule {
+                param($RangeIdLogPathInner, $WithRangeIdInner, $BreakCheckLinesInner)
+                Set-StrictMode -Version 2.0
+                $script:SlackMode = 'errors_only'
+                $script:CriticalErrors = $false
+                $script:criticalErrorOccurred = $false
+                $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+                $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+                $script:NotificationWebhookUrls = @{ alerts = 'STUB-ALERTS-URL'; general = 'STUB-GENERAL-URL' }
+                $script:ScriptStartTime = Get-Date
+                $script:BRAVOWarningCount = 0
+                $bravoSettings = @{ NotificationRouting = @{} }
+                $LOG_FILE = 'STUB-LOG-PATH'
+                $LOG_DIR = 'STUB-LOG-DIR'
+                $NotificationProviderDisplayName = 'STUB'
+                $BravoMaintenanceEnabled = $true
+                $traceOutputProcessed = $true
+                $traceOutputProcessedCount = 3
+                $exchangAPILogsProcessedCount = 0
+                $restoreCompletedAt = Get-Date '2026-01-01T22:30:00'
+                $script:rangeIdFinalReportDelivered = New-Object System.Collections.Generic.List[object]
+                $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
+                foreach ($stepEntry in @(
+                        @('Реставрація моделі', 'OK', $null),
+                        @('Перевірка розмірів .md', 'OK', $null),
+                        @('Контроль діапазонів ID', $(if ($WithRangeIdInner) { 'WARN' } else { 'OK' }), $(if ($WithRangeIdInner) { 'перевищено поріг 80%: 1' } else { $null })),
+                        @('Обробка trace і логів', 'OK', $null),
+                        @('Очистка старих даних/логів', 'OK', $null),
+                        @('Перевірка вільного місця', 'OK', $null),
+                        @('Відновлення стану служб', 'WARN', 'служба HOST-01-TEST не запустилась'))) {
+                    $script:BRAVOMaintenanceStepLog.Add([pscustomobject]@{ Name = $stepEntry[0]; Status = $stepEntry[1]; Details = $stepEntry[2] })
+                }
+
+                function Write-Log {
+                    param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+                    $null = $Message; $null = $NoTimestamp; $null = $NoConsole
+                    if ($Level -eq 'WARNING') { $script:BRAVOWarningCount++ }
+                }
+                function Get-BRAVOFiles { param($Path, $Filter) return @() }
+                function Get-MaintenanceFreeSpaceInlineText { return ':floppy_disk: C: 100 ГБ · поріг: 20 ГБ' }
+                function Resolve-BRAVONotificationRoute {
+                    param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                    if ($NotificationMode -eq 'none') { return 'none' }
+                    if ($Severity -eq 'SUCCESS') { if ($NotificationMode -eq 'errors_only') { return 'none' }; return 'general' }
+                    return 'alerts'
+                }
+                function Invoke-NotificationWebhook {
+                    param([string]$Message, [string]$WebhookUrl)
+                    $script:rangeIdFinalReportDelivered.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+                }
+                function New-MaintenanceNotificationMessage {
+                    param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                    return "SEVERITY=$Severity`n$(@($Details) -join "`n")"
+                }
+                if ($BreakCheckLinesInner) {
+                    function New-BRAVOMaintenanceCompletedLines { throw 'збій побудови блоку статусів' }
+                }
+
+                Send-SlackAlert -Message 'Тестове попередження з черги сповіщень' -Severity 'WARNING'
+                if ($WithRangeIdInner) {
+                    [void](Test-RangeIdUsage -Path $RangeIdLogPathInner -ThresholdPercent 80)
+                }
+                Send-FinalReport -LOG_FILE $LOG_FILE
+
+                [pscustomobject]@{
+                    DeliveredCount = $script:rangeIdFinalReportDelivered.Count
+                    Text = if ($script:rangeIdFinalReportDelivered.Count -gt 0) { [string]$script:rangeIdFinalReportDelivered[0].Message } else { '' }
+                    WebhookUrl = if ($script:rangeIdFinalReportDelivered.Count -gt 0) { [string]$script:rangeIdFinalReportDelivered[0].WebhookUrl } else { '' }
+                }
+            } $RangeIdLogPath ([bool]$WithRangeId) ([bool]$BreakCheckLines)
+        }
+
+        $rangeIdFinalReportExpected = @(
+            'Перевищено поріг використання діапазонів ID (80%): 1 діапазон.',
+            'range_test_A: 84.22%',
+            'Тестове попередження з черги сповіщень',
+            'Виконано:',
+            ':white_check_mark: Реставрація — за планом',
+            ':white_check_mark: .md-файли — перевірено',
+            ':warning: Інтервали ID — перевищено поріг 80%: 1',
+            ':white_check_mark: Trace — оброблено 3',
+            ':white_check_mark: Очистка — виконано',
+            ':white_check_mark: Вільне місце — достатньо',
+            ':mag: Також потребує уваги:',
+            ':warning: Відновлення стану служб — служба HOST-01-TEST не запустилась'
+        )
+        $rangeIdFinalReportCapture = Invoke-RangeIdFinalReportScenario -RangeIdLogPath $rangeIdFinalReportLogPath -WithRangeId
+        $rangeIdFinalReportMissing = @($rangeIdFinalReportExpected | Where-Object { -not $rangeIdFinalReportCapture.Text.Contains([string]$_) })
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdFinalReportCapture.DeliveredCount -eq 1 -and
+                $rangeIdFinalReportCapture.WebhookUrl -eq 'STUB-ALERTS-URL' -and
+                $rangeIdFinalReportCapture.Text.StartsWith('SEVERITY=CRITICAL') -and
+                -not $rangeIdFinalReportCapture.Text.Contains('range_test_B') -and
+                $rangeIdFinalReportMissing.Count -eq 0
+            ) `
+            -Name 'Maintenance/RangeIdAlertKeepsOtherChecksInFinalReport' `
+            -Failure "перевищення порогу діапазонів ID має прийти ОДНИМ сповіщенням разом зі статусами всіх етапів і попередженнями з черги; доставлено: $($rangeIdFinalReportCapture.DeliveredCount), бракує: $($rangeIdFinalReportMissing -join ' | ')"
+
+        $rangeIdFinalReportCapture = Invoke-RangeIdFinalReportScenario -RangeIdLogPath $rangeIdFinalReportLogPath
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdFinalReportCapture.DeliveredCount -eq 1 -and
+                $rangeIdFinalReportCapture.Text.StartsWith('SEVERITY=WARNING') -and
+                $rangeIdFinalReportCapture.Text.Contains('Тестове попередження з черги сповіщень') -and
+                $rangeIdFinalReportCapture.Text.Contains(':white_check_mark: Інтервали ID — у нормі') -and
+                $rangeIdFinalReportCapture.Text.Contains(':warning: Відновлення стану служб — служба HOST-01-TEST не запустилась')
+            ) `
+            -Name 'Maintenance/AlertQueueFinalReportIncludesCheckStatuses' `
+            -Failure "сповіщення з попередженнями черги (errors_only) має містити й блок статусів етапів; отримано: $($rangeIdFinalReportCapture.Text)"
+
+        $rangeIdFinalReportCapture = Invoke-RangeIdFinalReportScenario -RangeIdLogPath $rangeIdFinalReportLogPath -WithRangeId -BreakCheckLines
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdFinalReportCapture.DeliveredCount -eq 1 -and
+                $rangeIdFinalReportCapture.Text.Contains('range_test_A: 84.22%') -and
+                $rangeIdFinalReportCapture.Text.Contains('Тестове попередження з черги сповіщень') -and
+                -not $rangeIdFinalReportCapture.Text.Contains('Виконано:')
+            ) `
+            -Name 'Maintenance/FinalReportCheckLinesFailureKeepsAlert' `
+            -Failure "збій побудови блоку статусів не повинен забирати саме сповіщення про проблему; доставлено: $($rangeIdFinalReportCapture.DeliveredCount), текст: $($rangeIdFinalReportCapture.Text)"
+    } finally {
+        Remove-Item -LiteralPath $rangeIdFinalReportRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     # Модель release channel (P0.6 аудиту): developer -> development,
@@ -19296,6 +19449,7 @@ try {
                     param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
                     return "SEVERITY=$Severity|DETAILS=$($Details -join ';')"
                 }
+                function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
                 foreach ($archiveName in $ArchiveNamesInner) {
                     [void](Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
                         -SevenZipPath 'stub-7za' `
