@@ -14,21 +14,20 @@ BRAVO Installer має стати єдиним operator-facing lifecycle fronten
 | Install | Update | Repair | Configure | Diagnose | Logs     |
 +------------------------------+------------------------------+
                                |
-                               v
-+-------------------------------------------------------------+
-| BRAVO_UPDATE.ps1 — thin orchestration entrypoint            |
-+------------------------------+------------------------------+
                                |
-                               v
-+-------------------------------------------------------------+
-| BRAVO.Update                                                 |
++------------------------------v------------------------------+
+| BRAVO.Update — canonical lifecycle/deployment domain         |
 | State | Preflight | Plan | Acquire | Verify | Stage          |
 | Backup | Deploy | Validate | Rollback | Recovery | Journal   |
-+----------+-------------+---------------+--------------------+
-           |             |               |
-           v             v               v
-    Configuration     Scheduler     Runtime integrity
-    / Configurator    / System      / Runtime Guard
++----------+-------------------+-------------------+-----------+
+           ^                   ^                   ^
+           |                   |                   |
+ Installer GUI        BRAVO_UPDATE.ps1      Scheduled trigger
+   frontend            CLI entrypoint       (коли дозволено)
+                               |
+                               v
+              canonical BRAVO domains
+       Configuration | Scheduler | Runtime integrity
 ```
 
 Назви `BRAVO_UPDATE.ps1`, `modules/BRAVO.Update/` та API нижче є **цільовим design**, доки відповідна реалізація не прийнята.
@@ -183,9 +182,9 @@ Automatic
 
 Default production design: `NotifyOnly`.
 
-`StageOnly` дозволяє acquire + verify + stage без activation. `Automatic` дозволяється лише після acceptance manual transactional update, rollback та recovery.
+`StageOnly` дозволяє acquire + verify + stage без activation. `Automatic` **не входить у P3.2a** і не дозволяється лише на підставі acceptance manual transactional update. Production automatic mutation залишається hard-blocked до завершення та acceptance **повного P3.2**: versioned release directories, deployment pointer, staging/validation, atomic activation, automatic rollback та update journal.
 
-Перед automatic mutation потрібен fail-closed preflight: allowed release channel, valid release, sufficient disk, no conflicting BRAVO task, valid configuration, no unresolved transaction, no migration blocker. Невизначеність означає skip, а не force.
+Після виконання full P3.2 gate перед кожною automatic mutation додатково потрібен fail-closed preflight: allowed release channel, valid release, sufficient disk, no conflicting BRAVO task, valid configuration, no unresolved transaction, no migration blocker. Невизначеність означає skip, а не force.
 
 ## 14. Result та progress contracts
 
