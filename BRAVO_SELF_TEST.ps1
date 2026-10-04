@@ -13968,6 +13968,12 @@ function Write-BRAVOStepResult {
 }
 function Write-BRAVOServiceQuiescenceState {
     param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
+    # Збій запису маркера, починаючи з N-го запису ($script:ProbeMarkerWriteFailFrom).
+    $script:ProbeMarkerWrites = 1 + [int]$script:ProbeMarkerWrites
+    if ([int]$script:ProbeMarkerWriteFailFrom -gt 0 -and $script:ProbeMarkerWrites -ge [int]$script:ProbeMarkerWriteFailFrom) {
+        Add-ProbeEvent 'MARKER-WRITE-FAIL'
+        throw 'self-test: імітований збій запису ownership-маркера'
+    }
     Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
     # #349: утримувана служба без наміру перезапуску (зупинена до прогону).
     foreach ($probeNoIntent in @(@($Services) | Where-Object { -not [bool]$_.RestartIntent })) { Add-ProbeEvent ("MARKER-NO-RESTART " + [string]$probeNoIntent.Name) }
@@ -14297,6 +14303,8 @@ try {
         ('$script:ProbeForeignRestartIntent = {0}' -f $(if ($Scenario -like 'StartMode*IntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { "@('BravoWeb')" } else { '@()' })),
         ('$script:ProbeForeignRestartSuppressed = {0}' -f $(if ($Scenario -eq 'StartModeSuppressedIntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { '$true' } else { '$false' })),
         '$script:ProbePendingReads = @{}',
+        '$script:ProbeMarkerWrites = 0',
+        ('$script:ProbeMarkerWriteFailFrom = {0}' -f $(if ($Scenario -eq 'StartModeLateAfterStopMarkerFailInitiallyStopped') { '2' } else { '0' })),
         # StuckStartPending: старт BRAVO не завершується (StartPending назавжди).
         ('$script:ProbeStickyPending = {0}' -f $(if ($Scenario -eq 'StuckStartPending') { "@('BRAVO')" } else { '@()' })),
         ('$script:ProbeLateStart = {0}' -f $(switch ($Scenario) {
@@ -14310,7 +14318,7 @@ try {
                 'StartModeSuppressedLateStartInitiallyStopped' { "@{ 'BravoWeb' = 'Running' }" }
                 default { '@{}' }
             })),
-        ('$script:ProbeLateStartAfterStop = {0}' -f $(if ($Scenario -eq 'StartModeLateAfterStopInitiallyStopped') { "@{ 'BravoWeb' = 'Running' }" } else { '@{}' })),
+        ('$script:ProbeLateStartAfterStop = {0}' -f $(if ($Scenario -eq 'StartModeLateAfterStopInitiallyStopped' -or $Scenario -eq 'StartModeLateAfterStopMarkerFailInitiallyStopped') { "@{ 'BravoWeb' = 'Running' }" } else { '@{}' })),
         ('$script:ProbeLateStartAfterMarker = {0}' -f $(if ($Scenario -eq 'LateStartAfterMarker' -or $Scenario -eq 'StartModeLateAfterMarkerInitiallyStopped') { "@{ 'BravoWeb' = 'Running' }" } else { '@{}' })),
         # #349: типи запуску служб (лише сценарії утримання; інакше — стаби до #297).
         ('$script:ProbeStartModes = {0}' -f $(switch ($Scenario) {
@@ -14327,6 +14335,7 @@ try {
                 'StartModeLateStartInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 'StartModeLateAfterMarkerInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 'StartModeLateAfterStopInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
+                'StartModeLateAfterStopMarkerFailInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 'StartModeSuppressedLateStartInitiallyStopped' { "@{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'AutomaticDelayed'; 'BravoWeb' = 'Manual' }" }
                 default { '$null' }
             })),
@@ -14414,7 +14423,7 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending')) {
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped')) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
                 $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
@@ -14928,6 +14937,23 @@ try {
                 ) `
                 -Name "Maintenance/LifecycleRestoreLateStartGetsRestartIntentBeforeStop" `
                 -Failure ("Maintenance: утримувана служба, запущена після знімка (до чи після фази зупинки), має отримати намір перезапуску в маркері ДО зупинки (і повторної зупинки бар'єром перед before-архівом) й стартувати у finally; події: " + ($maintenanceRestoreLate.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateAfterMarker.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateSuppressed.Events -join ' | ') + ' || ' + ($maintenanceRestoreLateAfterStop.Events -join ' | '))
+
+            # Подвійний збій: службу запущено після фази зупинки, а намір її
+            # перезапуску не вдалося записати в маркер. Бар'єр перед
+            # before-архівом її не зупиняє (вона лишається працювати), а
+            # реставрацію скасовано fail-closed ДО архіву.
+            $maintenanceRestoreMarkerFail = & $maintenanceStartModeOutcome 'StartModeLateAfterStopMarkerFailInitiallyStopped'
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreMarkerFail.ProbeOk -and $maintenanceRestoreMarkerFail.StepOrderOk -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -ceq 'MARKER-WRITE-FAIL' }).Count -eq 1 -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -like 'STOP*BravoWeb' -or $_ -ceq 'START BravoWeb' }).Count -eq 0 -and
+                    @($maintenanceRestoreMarkerFail.Native).Count -eq 0 -and
+                    $maintenanceRestoreMarkerFail.RestoreCancelled -and
+                    @($maintenanceRestoreMarkerFail.Events | Where-Object { $_ -like 'LOG-ERROR ПОМИЛКА: Службу BravoWeb (стан: Running) не зупинено*' }).Count -eq 1
+                ) `
+                -Name "Maintenance/LifecycleIntentWriteFailureNeverStopsService" `
+                -Failure ("Maintenance: служба, намір перезапуску якої не вдалося записати в маркер, не зупиняється бар'єром перед before-архівом, а реставрацію скасовано fail-closed; події: " + ($maintenanceRestoreMarkerFail.Events -join ' | '))
 
             # Boot-recovery (характеризація): усі увімкнені керовані служби
             # утримуються з наміром перезапуску незалежно від знімка.

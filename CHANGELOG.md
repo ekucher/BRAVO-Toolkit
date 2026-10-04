@@ -12,7 +12,8 @@
   перезапуску: служба працювала (Running/StartPending) на старті **або перед зупинкою**, або
   намір успадковано (#349). Кожну зупинку пропускає `Confirm-BRAVOMaintenanceServiceStopContract`:
   утримувана служба без наміру, яка зараз активна, отримує намір у маркері ДО зупинки (так само
-  перед повторною зупинкою бар'єром перед before-архівом). Служба поза маркером, запущена вже
+  перед повторною зупинкою бар'єром перед before-архівом; якщо намір не вдалося записати, бар'єр
+  службу не зупиняє, а реставрацію скасовано fail-closed). Служба поза маркером, запущена вже
   після його запису в не-restore прогоні, не зупиняється (WARNING). exchangAPI зупиняється за
   свіжим, а не закешованим на старті станом. #287: BRAVO і exchangAPI зупиняються в будь-якому
   активному стані (зокрема `StartPending`), `Invoke-ServiceStateChange` спершу чекає завершення
@@ -26,6 +27,8 @@
   `Maintenance/LifecycleOperatorDisabledServiceNeverTouched`,
   `Maintenance/LifecycleServiceStartedAfterContractIsNotStopped`,
   `Maintenance/LifecycleRestoreLateStartGetsRestartIntentBeforeStop`,
+  `Maintenance/LifecycleIntentWriteFailureNeverStopsService`,
+  `Maintenance/LifecycleStuckStartPendingGetsNoTraceProcessing`,
   `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`.
 
 - **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**

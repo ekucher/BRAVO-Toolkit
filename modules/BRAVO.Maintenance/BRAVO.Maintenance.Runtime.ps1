@@ -9196,21 +9196,34 @@ if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -eq
             # реставрація скасовується fail-closed (модель не торкнута).
             # #360: служба, яку бар'єр нижче зупинить знову, спершу отримує
             # намір перезапуску в маркері (її запустили вже після зупинки).
+            # Не вдалося записати намір — бар'єр її НЕ зупиняє (інакше вона
+            # лишилася б зупиненою без наміру), а реставрацію скасовано
+            # fail-closed: служба працює.
+            $preArchiveContractFailures = @()
             foreach ($managedService in $maintenanceManagedServices) {
                 if (-not $managedService.Enabled -or
                     @($script:quiescedServiceNames | Where-Object { [string]$_ -ieq $managedService.Name }).Count -eq 0) { continue }
-                [void](Confirm-BRAVOMaintenanceServiceStopContract `
-                        -Key $managedService.Key `
-                        -Name $managedService.Name `
-                        -Status ([string](Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue).Status))
+                $preArchiveServiceStatus = [string](Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue).Status
+                if ([string]::IsNullOrEmpty($preArchiveServiceStatus) -or $preArchiveServiceStatus -eq 'Stopped') { continue }
+                if (-not (Confirm-BRAVOMaintenanceServiceStopContract `
+                            -Key $managedService.Key `
+                            -Name $managedService.Name `
+                            -Status $preArchiveServiceStatus)) {
+                    $preArchiveContractFailures += "$($managedService.Name): стан $preArchiveServiceStatus, намір перезапуску не записано в ownership-маркер (#360)"
+                }
             }
+            $preArchiveBarrierNames = @($script:quiescedServiceNames | Where-Object {
+                    $preArchiveBarrierName = [string]$_
+                    @($preArchiveContractFailures | Where-Object { $_.StartsWith($preArchiveBarrierName + ':', [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0
+                })
             $preArchiveQuiescence = Confirm-BRAVOServicesQuiesced `
-                -ServiceNames $script:quiescedServiceNames `
+                -ServiceNames $preArchiveBarrierNames `
                 -Snapshot $script:startTypeSnapshot `
                 -StopRunning `
                 -StopTimeoutSeconds $ServiceStopTimeoutSeconds `
                 -PollIntervalSeconds $ServicePollIntervalSeconds
-            $preArchiveQuiescenceOk = $preArchiveQuiescence.Ok -and ($script:startModeSuppressionFailures.Count -eq 0)
+            $preArchiveQuiescenceOk = $preArchiveQuiescence.Ok -and ($script:startModeSuppressionFailures.Count -eq 0) -and
+                ($preArchiveContractFailures.Count -eq 0)
             if ($preArchiveQuiescence.StoppedAgain.Count -gt 0) {
                 Write-Log -Message "Перед архівацією повторно зупинено служби, запущені після зупинки Maintenance (SCM autostart/recovery/інший актор): $($preArchiveQuiescence.StoppedAgain -join ', ')" -Level "WARNING"
             }
@@ -9226,7 +9239,7 @@ if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -eq
             }
 
             if (-not $preArchiveQuiescenceOk) {
-                $errorMsg = "Реставрацію скасовано ДО архівації: не гарантовано, що служби не працюють під час реставрації (#297): $(@($preArchiveQuiescence.Offenders + $script:startModeSuppressionFailures) -join '; '). Модель не торкнута."
+                $errorMsg = "Реставрацію скасовано ДО архівації: не гарантовано, що служби не працюють під час реставрації (#297): $(@($preArchiveQuiescence.Offenders + $script:startModeSuppressionFailures + $preArchiveContractFailures) -join '; '). Модель не торкнута."
                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
                 Send-SlackAlert -Message $errorMsg -IsCritical
                 $script:criticalErrorOccurred = $true
