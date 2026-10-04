@@ -7244,6 +7244,74 @@ function Check-MdFileSizes {
     }
 }
 
+# Блок "Виконано:" (статуси всіх етапів прогону) для фінального сповіщення.
+# Винесено з Send-FinalReport, щоб той самий блок потрапляв у КОЖНУ гілку
+# звіту, а не лише в успішну: раніше, щойно Test-RangeIdUsage клав запис у
+# CriticalErrorsList (перевищення порогу діапазонів ID), фінальне
+# сповіщення містило ЛИШЕ цей запис — статуси реставрації, .md, trace,
+# очистки, вільного місця і попередження з NotificationAlertQueue
+# оператор не бачив.
+function Get-BRAVOMaintenanceFinalReportCheckLines {
+    $completedCheckLines = New-Object 'System.Collections.Generic.List[string]'
+    $lastRestoreTime = $restoreCompletedAt
+    # Персистована дата — джерело істини для ОБОХ шляхів: маркери
+    # restore_done_*.marker бачать лише автоматичну реставрацію
+    # (примусова їх свідомо не створює), тому реальне повідомлення
+    # показувало "ще не виконувалася" через 20 хвилин після успішної
+    # примусової. Маркери лишаються legacy-fallback для станів,
+    # записаних попередніми версіями.
+    if ($null -eq $lastRestoreTime) {
+        $lastRestoreTime = Get-BRAVORestoreLastSuccessfulAt -State (Read-BRAVORestoreState)
+    }
+    if ($null -eq $lastRestoreTime) {
+        $lastRestoreMarker = @(Get-BRAVOFiles -Path $LOG_DIR -Filter "restore_done_*.marker" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1)
+        if ($lastRestoreMarker.Count -gt 0) {
+            $lastRestoreTime = [datetime]$lastRestoreMarker[0].LastWriteTime
+        }
+    }
+    $lastRestoreText = if ($null -ne $lastRestoreTime) {
+        $lastRestoreTime.ToString("dd.MM.yyyy HH:mm")
+    } elseif (-not $BravoMaintenanceEnabled) {
+        "немає даних (компонент BRAVO вимкнено)"
+    } else {
+        "ще не виконувалася"
+    }
+    # Блок будується з ФАКТИЧНИХ статусів етапів (див.
+    # New-BRAVOMaintenanceCompletedLines): збійний етап отримує ❌/⚠️
+    # і причину, а не ✅ від самої лише наявності компонента.
+    $traceCountText = if ($BravoMaintenanceEnabled -and $traceOutputProcessed) {
+        Format-BRAVOUkrainianCount -Count $traceOutputProcessedCount -One "файл" -Few "файли" -Many "файлів"
+    } else {
+        $null
+    }
+    $exchangeCountText = if ($exchangAPILogsProcessedCount -gt 0) {
+        Format-BRAVOUkrainianCount -Count $exchangAPILogsProcessedCount -One "файл" -Few "файли" -Many "файлів"
+    } else {
+        $null
+    }
+    foreach ($completedLine in @(New-BRAVOMaintenanceCompletedLines `
+            -LastRestoreText $lastRestoreText `
+            -FreeSpaceInlineText (Get-MaintenanceFreeSpaceInlineText) `
+            -TraceCountText $traceCountText `
+            -ExchangeCountText $exchangeCountText)) {
+        $completedCheckLines.Add([string]$completedLine)
+    }
+    return $completedCheckLines.ToArray()
+}
+
+# Для гілок з проблемами: збій побудови блоку статусів не повинен
+# забрати в оператора саме сповіщення про проблему.
+function Get-BRAVOMaintenanceFinalReportCheckLinesSafe {
+    try {
+        return @(Get-BRAVOMaintenanceFinalReportCheckLines)
+    } catch {
+        Write-Log -Message "Не вдалося додати статуси етапів до фінального сповіщення: $($_.Exception.Message)" -Level "WARNING"
+        return @()
+    }
+}
+
 # Функція для відправки фінального звіту
 function Send-FinalReport {
     param(
@@ -7267,7 +7335,9 @@ function Send-FinalReport {
             -TitleEmoji ":rotating_light:" `
             -Severity "CRITICAL" `
             -Duration $elapsedTime `
-            -Details @($script:CriticalErrorsList.ToArray()) `
+            -Details (@($script:CriticalErrorsList.ToArray()) +
+                @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
+                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
             -LogPath $LOG_FILE
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
@@ -7311,59 +7381,15 @@ function Send-FinalReport {
             -TitleEmoji $alertQueueTitleEmoji `
             -Severity $notificationSeverity `
             -Duration $elapsedTime `
-            -Details @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) `
+            -Details (@($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
+                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
             -LogPath $LOG_FILE
         $shouldSend = $true
     }
     else {
         # Немає критичних помилок - відправляємо тільки в режимі "all"
         if ($script:SlackMode -eq "all") {
-            $completedCheckLines = New-Object 'System.Collections.Generic.List[string]'
-            $lastRestoreTime = $restoreCompletedAt
-            # Персистована дата — джерело істини для ОБОХ шляхів: маркери
-            # restore_done_*.marker бачать лише автоматичну реставрацію
-            # (примусова їх свідомо не створює), тому реальне повідомлення
-            # показувало "ще не виконувалася" через 20 хвилин після успішної
-            # примусової. Маркери лишаються legacy-fallback для станів,
-            # записаних попередніми версіями.
-            if ($null -eq $lastRestoreTime) {
-                $lastRestoreTime = Get-BRAVORestoreLastSuccessfulAt -State (Read-BRAVORestoreState)
-            }
-            if ($null -eq $lastRestoreTime) {
-                $lastRestoreMarker = @(Get-BRAVOFiles -Path $LOG_DIR -Filter "restore_done_*.marker" |
-                    Sort-Object LastWriteTime -Descending |
-                    Select-Object -First 1)
-                if ($lastRestoreMarker.Count -gt 0) {
-                    $lastRestoreTime = [datetime]$lastRestoreMarker[0].LastWriteTime
-                }
-            }
-            $lastRestoreText = if ($null -ne $lastRestoreTime) {
-                $lastRestoreTime.ToString("dd.MM.yyyy HH:mm")
-            } elseif (-not $BravoMaintenanceEnabled) {
-                "немає даних (компонент BRAVO вимкнено)"
-            } else {
-                "ще не виконувалася"
-            }
-            # Блок будується з ФАКТИЧНИХ статусів етапів (див.
-            # New-BRAVOMaintenanceCompletedLines): збійний етап отримує ❌/⚠️
-            # і причину, а не ✅ від самої лише наявності компонента.
-            $traceCountText = if ($BravoMaintenanceEnabled -and $traceOutputProcessed) {
-                Format-BRAVOUkrainianCount -Count $traceOutputProcessedCount -One "файл" -Few "файли" -Many "файлів"
-            } else {
-                $null
-            }
-            $exchangeCountText = if ($exchangAPILogsProcessedCount -gt 0) {
-                Format-BRAVOUkrainianCount -Count $exchangAPILogsProcessedCount -One "файл" -Few "файли" -Many "файлів"
-            } else {
-                $null
-            }
-            foreach ($completedLine in @(New-BRAVOMaintenanceCompletedLines `
-                    -LastRestoreText $lastRestoreText `
-                    -FreeSpaceInlineText (Get-MaintenanceFreeSpaceInlineText) `
-                    -TraceCountText $traceCountText `
-                    -ExchangeCountText $exchangeCountText)) {
-                $completedCheckLines.Add([string]$completedLine)
-            }
+            $completedCheckLines = @(Get-BRAVOMaintenanceFinalReportCheckLines)
 
             # dev.19 (виправлено): той самий канонічний
             # Get-BRAVOMaintenanceFinalStatus, що ЛОГ/консоль — раніше
@@ -7412,7 +7438,7 @@ function Send-FinalReport {
                 -Severity $notificationSeverity `
                 -Duration $elapsedTime `
                 -StatusLines @() `
-                -Details @($completedCheckLines.ToArray()) `
+                -Details $completedCheckLines `
                 -LogPath $LOG_FILE
             $shouldSend = $true
         } else {
