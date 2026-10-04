@@ -11,7 +11,8 @@
   Maintenance перечитує фактичний стан увімкнених керованих служб: активна служба потрапляє в
   ownership-маркер, але намір її перезапуску записується лише тоді, коли свіжий стан у фазі
   зупинки підтверджує, що Maintenance справді її зупиняє (служба, яка встигла зупинитися сама,
-  після обслуговування не запускається). Канонічний намір перезапуску: служба працювала
+  після обслуговування не запускається; якщо вона зупинилася вже після запису наміру, але до
+  `Stop-Service` — напр. невдалий старт зі `StartPending`, — намір знімається й з маркера). Канонічний намір перезапуску: служба працювала
   (Running/StartPending) на старті **або в момент її зупинки**, або намір успадковано (#349). Кожну зупинку пропускає `Confirm-BRAVOMaintenanceServiceStopContract`:
   утримувана служба без наміру, яка зараз активна, отримує намір у маркері ДО зупинки (так само
   перед повторною зупинкою бар'єром перед before-архівом; якщо намір не вдалося записати, бар'єр
@@ -36,6 +37,7 @@
   `Maintenance/LifecycleEveryStopHasRestartContract` (перевіряє всі сценарії),
   `Maintenance/LifecycleLateStartBeforeStopIsOwnedAndRestarted`,
   `Maintenance/LifecycleLateStartIntentRecordedOnlyAtStop`,
+  `Maintenance/LifecycleIntentRevokedWhenServiceStopsByItself`,
   `Maintenance/LifecycleStartPendingIsStoppedAndRestarted`,
   `Maintenance/LifecycleLateStartRestartedAfterStepThrows`,
   `Maintenance/LifecycleOperatorDisabledServiceNeverTouched`,
