@@ -996,6 +996,30 @@ function Stop-BRAVOMaintenanceStrayProcess {
     }
 }
 
+function Wait-BRAVOServiceStartPendingSettled {
+    # #287: службі у StartPending SCM не передає stop (служба ще не приймає
+    # керування) — перед зупинкою треба дочекатися завершення старту до
+    # $Deadline, інакше stop відхиляється, а служба доходить до Running і
+    # лишається працювати. Повертає свіжий об'єкт служби.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$Deadline,
+
+        [int]$PollIntervalSeconds = 2
+    )
+    $service = Get-Service -Name $Name -ErrorAction Stop
+    $service.Refresh()
+    while ([string]$service.Status -eq 'StartPending' -and (Get-Date) -lt $Deadline) {
+        Start-Sleep -Seconds ([math]::Max(1, $PollIntervalSeconds))
+        $service = Get-Service -Name $Name -ErrorAction Stop
+        $service.Refresh()
+    }
+    return $service
+}
+
 function Invoke-ServiceStateChange {
     param(
         [Parameter(Mandatory = $true)]
@@ -1035,14 +1059,10 @@ function Invoke-ServiceStateChange {
                 -ErrorAction SilentlyContinue `
                 -ErrorVariable operationErrors
         } else {
-            # #287: службі у StartPending SCM не передає stop (служба ще не
-            # приймає керування) — спершу дочекатися завершення старту в межах
-            # того самого таймауту, інакше stop відхиляється, а служба
-            # доходить до Running і лишається працювати.
-            while ([string]$service.Status -eq 'StartPending' -and (Get-Date) -lt $deadline) {
-                Start-Sleep -Seconds $pollSeconds
-                $service = Get-Service -Name $Name -ErrorAction Stop
-                $service.Refresh()
+            # #287: StartPending — спершу дочекатися завершення старту в межах
+            # того самого таймауту.
+            if ([string]$service.Status -eq 'StartPending') {
+                $service = Wait-BRAVOServiceStartPendingSettled -Name $Name -Deadline $deadline -PollIntervalSeconds $pollSeconds
             }
             if ([string]$service.Status -ne 'Stopped') {
                 Stop-Service `
@@ -8763,6 +8783,8 @@ if ($foreignQuiescenceContext.Present -and -not $foreignQuiescenceContext.OwnerA
 # перезапуску: служба працювала (Running/StartPending) на старті АБО перед
 # зупинкою, або його успадковано від аварійно перерваного прогону (#349).
 # Disabled-служби (вимкнені оператором) не керуються і сюди не потрапляють.
+# Призупинена (Paused) чи інша перехідна служба активною не вважається: без
+# наміру перезапуску Maintenance її не зупиняє, щоб не лишити зупиненою.
 $maintenanceManagedServices = @(
     @{ Key = 'Bravo'; Name = [string]$BravoServiceName; Enabled = [bool]$BravoMaintenanceEnabled },
     @{ Key = 'ExchangeApi'; Name = [string]$ExchangAPIServiceName; Enabled = [bool]$exchangAPIServiceEnabled },
@@ -8773,9 +8795,9 @@ $lateStartedServiceNames = @()
 foreach ($managedService in $maintenanceManagedServices) {
     if (-not $managedService.Enabled) { continue }
     $managedServiceStatus = [string](Get-Service -Name $managedService.Name -ErrorAction SilentlyContinue).Status
-    if ([string]::IsNullOrEmpty($managedServiceStatus) -or $managedServiceStatus -eq 'Stopped') { continue }
+    if ($managedServiceStatus -notin @('Running', 'StartPending')) { continue }
     $serviceActiveBeforeStop[$managedService.Key] = $true
-    if ($managedServiceStatus -in @('Running', 'StartPending') -and -not $serviceWasRunning[$managedService.Key]) {
+    if (-not $serviceWasRunning[$managedService.Key]) {
         $serviceWasRunning[$managedService.Key] = $true
         $lateStartedServiceNames += "$($managedService.Name) ($managedServiceStatus)"
     }
@@ -8831,8 +8853,8 @@ $script:startModeRestoreIncomplete = $false
 # перезапуску (RestartIntent, старт у finally, Health-watchdog) — лише ті,
 # що працювали на старті.
 $quiescenceHoldAllManaged = [bool]$shouldRestore
-# #360: до маркера потрапляє й кожна служба, активна перед зупинкою
-# (StopPending тощо — без наміру перезапуску): її теж буде зупинено.
+# #360: до маркера потрапляє й кожна служба, що працювала (Running/
+# StartPending) перед зупинкою, — з наміром перезапуску.
 $quiescenceServices = @()
 if ($serviceWasRunning.Bravo -or $serviceActiveBeforeStop.Bravo -or ($quiescenceHoldAllManaged -and $BravoMaintenanceEnabled)) {
     $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = [bool]$serviceWasRunning.Bravo }
@@ -8925,6 +8947,13 @@ function Confirm-BRAVOMaintenanceServiceStopContract {
         [string]$Status
     )
     if ([string]::IsNullOrEmpty($Status) -or $Status -eq 'Stopped') { return $false }
+    if ($Status -notin @('Running', 'StartPending') -and -not $serviceWasRunning[$Key]) {
+        # Призупинена (Paused) чи перехідна служба без наміру перезапуску:
+        # зупинка лишила б її зупиненою після обслуговування — стан
+        # зберігається, як і до #360.
+        Write-Log -Message "Служба $Name у стані $Status без наміру перезапуску — Maintenance її не зупиняє, стан збережено (#360)" -Level "INFO"
+        return $false
+    }
     if (@($script:quiescedServiceNames | Where-Object { [string]$_ -ieq $Name }).Count -eq 0) {
         Write-Log -Message "Службу $Name (стан: $Status) запущено вже після запису ownership-маркера — вона поза lifecycle-контрактом цього прогону, тому Maintenance її не зупиняє (#360)" -Level "WARNING"
         return $false
@@ -9126,8 +9155,10 @@ $logsCriticalBefore = $script:criticalErrorOccurred
 $logsWarningsBefore = $script:BRAVOWarningCount
 $bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { [string](Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
 # #287: реставрація й обробка trace — лише над фактично ЗУПИНЕНОЮ службою
-# (StartPending/StopPending — служба ще працює з файлами).
-if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -eq 'Stopped') {
+# (StartPending/StopPending — служба ще працює з файлами). Призупинену
+# оператором (Paused) службу Maintenance не зупиняє (#360), а обробку
+# trace, як і до #360, вона не блокує.
+if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @('Stopped', 'Paused')) {
     # P0 TOCTOU barrier 1 (перед входом у restore sequence): $shouldRestore
     # обчислений задовго до цього місця (до Enter-BRAVOMaintenanceOperationLock,
     # тобто до OperationLockWaitMinutes очікування, і до зупинки служб вище)
@@ -9209,13 +9240,28 @@ if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -eq
                             -Key $managedService.Key `
                             -Name $managedService.Name `
                             -Status $preArchiveServiceStatus)) {
-                    $preArchiveContractFailures += "$($managedService.Name): стан $preArchiveServiceStatus, намір перезапуску не записано в ownership-маркер (#360)"
+                    $preArchiveContractFailures += "$($managedService.Name): стан $preArchiveServiceStatus, без наміру перезапуску в ownership-маркері її не зупинено (#360)"
                 }
             }
             $preArchiveBarrierNames = @($script:quiescedServiceNames | Where-Object {
                     $preArchiveBarrierName = [string]$_
                     @($preArchiveContractFailures | Where-Object { $_.StartsWith($preArchiveBarrierName + ':', [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0
                 })
+            # #287: бар'єр зупиняє службу одразу, а stop службі у StartPending
+            # SCM відхиляє — спершу дочекатися завершення її старту.
+            $preArchivePendingDeadline = (Get-Date).AddSeconds([math]::Max(1, $ServiceStopTimeoutSeconds))
+            foreach ($preArchiveBarrierName in $preArchiveBarrierNames) {
+                try {
+                    if ([string](Get-Service -Name $preArchiveBarrierName -ErrorAction Stop).Status -eq 'StartPending') {
+                        [void](Wait-BRAVOServiceStartPendingSettled `
+                            -Name $preArchiveBarrierName `
+                            -Deadline $preArchivePendingDeadline `
+                            -PollIntervalSeconds $ServicePollIntervalSeconds)
+                    }
+                } catch {
+                    # Стан служби недоступний — бар'єр нижче сам зафіксує її як порушника.
+                }
+            }
             $preArchiveQuiescence = Confirm-BRAVOServicesQuiesced `
                 -ServiceNames $preArchiveBarrierNames `
                 -Snapshot $script:startTypeSnapshot `
@@ -9754,7 +9800,7 @@ if (-not $script:BRAVOMaintenanceLogsStepEnabled) {
         -Name 'Обробка trace і логів' `
         -Status 'SKIPPED' `
         -Details 'вимкнено'
-} elseif (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -ne 'Stopped') {
+} elseif (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -notin @('Stopped', 'Paused')) {
     # Заплановане й невиконане, а не «не настав час»: службу BRAVO не
     # вдалося зупинити, тому жодного журналу не чіпали.
     Write-BRAVOMaintenanceStep `

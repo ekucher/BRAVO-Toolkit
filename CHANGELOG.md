@@ -15,11 +15,16 @@
   перед повторною зупинкою бар'єром перед before-архівом; якщо намір не вдалося записати, бар'єр
   службу не зупиняє, а реставрацію скасовано fail-closed). Служба поза маркером, запущена вже
   після його запису в не-restore прогоні, не зупиняється (WARNING). exchangAPI зупиняється за
-  свіжим, а не закешованим на старті станом. #287: BRAVO і exchangAPI зупиняються в будь-якому
-  активному стані (зокрема `StartPending`), `Invoke-ServiceStateChange` спершу чекає завершення
-  старту (SCM відхиляє stop службі у `StartPending`), а реставрація й обробка trace вимагають
-  саме `Stopped`. Служба, зупинена і на старті, і перед зупинкою, як і раніше не запускається;
-  `Disabled` (оператор) не чіпається; boot-recovery без змін. Нові сценарії оркестрації:
+  свіжим, а не закешованим на старті станом. #287: BRAVO і exchangAPI зупиняються й у стані
+  `StartPending`; `Invoke-ServiceStateChange` і бар'єр перед before-архівом спершу чекають
+  завершення старту (`Wait-BRAVOServiceStartPendingSettled`: SCM відхиляє stop службі у
+  `StartPending`), а реставрація й обробка trace не виконуються над службою в перехідному стані
+  (лише `Stopped` або `Paused`). Призупинена (`Paused`) чи інша перехідна служба без наміру
+  перезапуску не зупиняється (стан зберігається, як і до цієї зміни для BRAVO/exchangAPI; BRAVO
+  Web раніше зупинялася й лишалася зупиненою); у restore-прогоні така утримувана служба
+  скасовує реставрацію fail-closed ДО архіву. Служба, зупинена і на старті, і перед зупинкою, як
+  і раніше не запускається; `Disabled` (оператор) не чіпається; boot-recovery без змін. Нові
+  сценарії оркестрації:
   `Maintenance/LifecycleEveryStopHasRestartContract` (перевіряє всі сценарії),
   `Maintenance/LifecycleLateStartBeforeStopIsOwnedAndRestarted`,
   `Maintenance/LifecycleStartPendingIsStoppedAndRestarted`,
@@ -29,7 +34,9 @@
   `Maintenance/LifecycleRestoreLateStartGetsRestartIntentBeforeStop`,
   `Maintenance/LifecycleIntentWriteFailureNeverStopsService`,
   `Maintenance/LifecycleStuckStartPendingGetsNoTraceProcessing`,
-  `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`.
+  `Maintenance/LifecycleBootRecoveryHoldsAllManagedWithRestart`,
+  `Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending`,
+  `Maintenance/LifecyclePausedServiceStateIsPreserved`.
 
 - **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
   На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
