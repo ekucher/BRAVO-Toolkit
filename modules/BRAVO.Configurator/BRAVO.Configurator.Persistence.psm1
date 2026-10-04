@@ -9,6 +9,129 @@
 
 Set-StrictMode -Version 2.0
 
+# ============================================================
+# Кеш "конфігу без override-ів" (DefaultConfig) для Apply.
+#
+# Кожен Apply рахує DefaultConfig через canonical loader у дочірньому
+# powershell.exe (Invoke-BRAVOConfiguratorEffectiveComputation
+# -CandidateOverrides @{}), хоча без зміни комплекту чи середовища
+# результат той самий. Кеш тримає один результат на модуль.
+#
+# Ключ — усе, від чого залежить дочірній прогін:
+#   - повний RuntimeRoot;
+#   - SHA256 файлів, які завантажує loader: BRAVO_CONFIG_LOADER.ps1,
+#     BRAVO_RUNTIME_GUARD.ps1, VERSION.json, RUNTIME_MANIFEST.json і всі
+#     *.ps1/*.psm1/*.psd1/*.json у modules\ (схема, Discovery тощо);
+#   - імена й значення env-змінних BRAVO_*.
+# BRAVO.local.config/BRAVO.config у ключ не входять: дочірній прогін їх не
+# читає (ізольований root без override-ів).
+#
+# Стан хоста, який читає Discovery (служби, каталоги), у ключ не входить,
+# тому запис живе не довше за DefaultConfigCacheTtlSeconds. Помилка
+# обчислення не кешується. Викликач отримує глибоку копію: зміна
+# повернутого об'єкта не псує кеш.
+# ============================================================
+$script:DefaultConfigCache = $null
+$script:DefaultConfigCacheTtlSeconds = 600
+$script:DefaultConfigComputationCount = 0
+
+function Get-BRAVOConfiguratorDefaultConfigCacheKey {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+
+    $resolvedRoot = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\', '/')
+    $keyFiles = New-Object System.Collections.Generic.List[string]
+    foreach ($rootFileName in @('BRAVO_CONFIG_LOADER.ps1', 'BRAVO_RUNTIME_GUARD.ps1', 'VERSION.json', 'RUNTIME_MANIFEST.json')) {
+        $rootFilePath = Join-Path $resolvedRoot $rootFileName
+        if (Test-Path -LiteralPath $rootFilePath -PathType Leaf) { $keyFiles.Add($rootFilePath) }
+    }
+    $modulesPath = Join-Path $resolvedRoot 'modules'
+    if (Test-Path -LiteralPath $modulesPath -PathType Container) {
+        foreach ($moduleFile in @(Get-ChildItem -LiteralPath $modulesPath -Recurse -File -ErrorAction Stop |
+                Where-Object { @('.ps1', '.psm1', '.psd1', '.json') -contains $_.Extension.ToLowerInvariant() } |
+                Sort-Object -Property FullName)) {
+            $keyFiles.Add($moduleFile.FullName)
+        }
+    }
+
+    $keyBuilder = New-Object System.Text.StringBuilder
+    [void]$keyBuilder.Append('root=').Append($resolvedRoot.ToLowerInvariant()).Append("`n")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($keyFile in $keyFiles) {
+            $fileHash = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($keyFile))).Replace('-', '')
+            [void]$keyBuilder.Append('file=').Append($keyFile.Substring($resolvedRoot.Length).ToLowerInvariant()).Append('|').Append($fileHash).Append("`n")
+        }
+    } finally {
+        $sha256.Dispose()
+    }
+    foreach ($environmentEntry in @(Get-ChildItem -LiteralPath 'Env:' |
+            Where-Object { $_.Name -like 'BRAVO_*' } |
+            Sort-Object -Property Name)) {
+        [void]$keyBuilder.Append('env=').Append($environmentEntry.Name.ToUpperInvariant()).Append('=').Append([string]$environmentEntry.Value).Append("`n")
+    }
+    return $keyBuilder.ToString()
+}
+
+function Copy-BRAVOConfiguratorDefaultConfigValue {
+    # Глибока копія результату ConvertFrom-Json: PSCustomObject і масиви
+    # копіюються рекурсивно, скаляри (рядки, числа, bool, дати) незмінні.
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $properties = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            $properties[$property.Name] = Copy-BRAVOConfiguratorDefaultConfigValue -Value $property.Value
+        }
+        return [pscustomobject]$properties
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $dictionaryCopy = @{}
+        foreach ($dictionaryKey in @($Value.Keys)) {
+            $dictionaryCopy[$dictionaryKey] = Copy-BRAVOConfiguratorDefaultConfigValue -Value $Value[$dictionaryKey]
+        }
+        return $dictionaryCopy
+    }
+    if ($Value -is [array]) {
+        $arrayCopy = New-Object object[] $Value.Count
+        for ($index = 0; $index -lt $Value.Count; $index++) {
+            $arrayCopy[$index] = Copy-BRAVOConfiguratorDefaultConfigValue -Value $Value[$index]
+        }
+        return , $arrayCopy
+    }
+    return $Value
+}
+
+function Get-BRAVOConfiguratorDefaultConfig {
+    <#
+    .SYNOPSIS
+        DefaultConfig (canonical loader без override-ів) для Apply з кешу
+        модуля; дочірній процес запускається лише тоді, коли змінився
+        ключ кешу або минув TTL.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+
+    $cacheKey = Get-BRAVOConfiguratorDefaultConfigCacheKey -RuntimeRoot $RuntimeRoot
+    $nowUtc = [DateTime]::UtcNow
+    $cached = $script:DefaultConfigCache
+    if ($null -eq $cached -or
+        $cached.Key -ne $cacheKey -or
+        ($nowUtc - $cached.CreatedUtc).TotalSeconds -ge $script:DefaultConfigCacheTtlSeconds -or
+        $nowUtc -lt $cached.CreatedUtc) {
+        $script:DefaultConfigComputationCount++
+        $computed = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $RuntimeRoot -CandidateOverrides @{}
+        $cached = [pscustomobject]@{
+            Key        = $cacheKey
+            CreatedUtc = $nowUtc
+            Value      = Copy-BRAVOConfiguratorDefaultConfigValue -Value $computed
+        }
+        $script:DefaultConfigCache = $cached
+    }
+    return (Copy-BRAVOConfiguratorDefaultConfigValue -Value $cached.Value)
+}
+
 function Get-BRAVOConfiguratorProductionOverrideState {
     <#
     .SYNOPSIS
@@ -180,7 +303,10 @@ function Test-BRAVOConfiguratorCandidateOverrides {
         # preserved-ключ міг пройти Apply, не будучи реально прогнаним
         # через canonical Import-BravoConfiguration, і впасти лише пізніше
         # в production entrypoint-і.
-        $defaultConfig = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $RuntimeRoot -CandidateOverrides @{}
+        # DefaultConfig без override-ів береться з кешу модуля (див.
+        # Get-BRAVOConfiguratorDefaultConfig): той самий canonical прогін,
+        # лише без повторного дочірнього процесу на кожен Apply.
+        $defaultConfig = Get-BRAVOConfiguratorDefaultConfig -RuntimeRoot $RuntimeRoot
         $model = Get-BRAVOConfiguratorModel -SchemaCatalog $SchemaCatalog -DefaultConfig $defaultConfig -LocalOverrides $MergedOverrides
         $model = Update-BRAVOConfiguratorEffective -Model $model -RuntimeRoot $RuntimeRoot -CandidateOverridesOverride $MergedOverrides
         $validation = Invoke-BRAVOConfiguratorValidation -Model $model
