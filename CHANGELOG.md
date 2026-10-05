@@ -7,9 +7,11 @@
   Три Framework-перевірки стану ПОВНОГО прогону (`Framework/FullCanonicalRunIsDefault`,
   `Framework/FullRunEnablesEverySuite`, `Framework/SuiteSelectionProbeRestoresState`) були
   безумовними, тож у `-Suite X` давали `[FAIL]`: успішний вибірковий прогін (код 0 і
-  `SELF-TEST PARTIAL`) був недосяжним. Тепер вони стоять у тілі
-  `if ($null -eq $script:BRAVOSelfTestSelectedSuite)`; сама проба предиката лишається
-  безумовною. У повному прогоні набір перевірок не змінився. Формулу коду завершення, маркери
+  `SELF-TEST PARTIAL`) був недосяжним. Тепер перші дві стоять у тілі
+  `if ($null -eq $script:BRAVOSelfTestSelectedSuite)`, а `SuiteSelectionProbeRestoresState`
+  лишається безумовною і порівнює вибір з тим, що був до проби
+  (`[object]::ReferenceEquals`), тож вірна в обох режимах і не стає тавтологією; сама проба
+  предиката теж безумовна. У повному прогоні набір перевірок не змінився. Формулу коду завершення, маркери
   `SELF-TEST PASSED`/`PARTIAL`/`FAILED`, `ci.yml` і саму мапу шляхів не змінено.
   Нова корінна секція `Tail/Framework.SuiteSelectionContract` (між
   `Tail/Framework.SelectiveSuitesHaveNoCrossSuiteDependency` і `Tail/Framework.SectionIsolation`):

@@ -28595,14 +28595,14 @@ Test-BRAVOCondition `
     } finally {
         $script:BRAVOSelfTestSelectedSuite = $suiteSelectionBefore
     }
-    # Проба сама лишається безумовною (вона відновлює стан у finally); gate стоїть
-    # лише на перевірці, що після неї повний прогін знову без вибору.
-    if ($null -eq $script:BRAVOSelfTestSelectedSuite) {
-        Test-BRAVOCondition `
-            -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
-            -Name "Framework/SuiteSelectionProbeRestoresState" `
-            -Failure "проба предиката мусить відновити вибір фрагментів — інакше підсумок повного прогону назве себе вибірковим"
-    }
+    # Ця перевірка БЕЗУМОВНА і порівнює з тим, що було ДО проби ($suiteSelectionBefore):
+    # у повному прогоні це $null/$null, у -Suite — той самий масив. Обгортка
+    # if ($null -eq ...) зробила б її тавтологією: зламане відновлення залишило б вибір
+    # непорожнім, gate пропустив би перевірку, і нічого б не впало.
+    Test-BRAVOCondition `
+        -Condition ([object]::ReferenceEquals($script:BRAVOSelfTestSelectedSuite, $suiteSelectionBefore)) `
+        -Name "Framework/SuiteSelectionProbeRestoresState" `
+        -Failure "проба предиката мусить відновити той вибір фрагментів, що був до проби — інакше підсумок повного прогону назве себе вибірковим"
 
     # --- Підказка "змінений файл -> suite" -----------------------------
     Test-BRAVOCondition `
@@ -29230,6 +29230,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
     # хибні за визначенням. Якщо вони не обгорнуті умовою "вибору немає",
     # кожен реальний -Suite X завершується SELF-TEST FAILED, і успішний
     # вибірковий прогін (exit 0 + SELF-TEST PARTIAL) недосяжний.
+    # Виняток — SuiteSelectionProbeRestoresState: вона порівнює з $suiteSelectionBefore і
+    # ВІРНА в обох режимах, тому gate на ній заборонений (він робить її тавтологією).
     $suiteContractG1Ast = Get-BRAVOSelfTestOwnSourceAst
     $suiteContractG1Names = @(
         'Framework/FullCanonicalRunIsDefault',
@@ -29241,6 +29243,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
                 $node.GetCommandName() -eq 'Test-BRAVOCondition'
             }, $true))
     $suiteContractG1Found = @{}
+    $suiteContractG1RestoreName = 'Framework/SuiteSelectionProbeRestoresState'
+    $suiteContractG1RestoreOk = $false
     $suiteContractG1Ungated = New-Object System.Collections.Generic.List[string]
     foreach ($suiteContractG1Call in $suiteContractG1Calls) {
         $suiteContractG1CallName = ''
@@ -29259,6 +29263,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
         }
         $suiteContractG1Found[$suiteContractG1CallName] = $suiteContractG1Found[$suiteContractG1CallName] + 1
         # Умова gate стоїть у ТІЛІ if (Item2), а не в самій умові чи else.
+        # Для RestoresState вимога протилежна: gate там робить перевірку тавтологією,
+        # тож вона мусить бути БЕЗ gate і порівнювати з $suiteSelectionBefore.
         $suiteContractG1Gated = $false
         $suiteContractG1Parent = $suiteContractG1Call.Parent
         while ($null -ne $suiteContractG1Parent) {
@@ -29273,7 +29279,13 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
             }
             $suiteContractG1Parent = $suiteContractG1Parent.Parent
         }
-        if (-not $suiteContractG1Gated) { [void]$suiteContractG1Ungated.Add($suiteContractG1CallName) }
+        if ($suiteContractG1CallName -ceq $suiteContractG1RestoreName) {
+            $suiteContractG1RestoreOk = (-not $suiteContractG1Gated) -and
+                $suiteContractG1Call.Extent.Text.Contains('$suiteSelectionBefore')
+            if (-not $suiteContractG1RestoreOk) { [void]$suiteContractG1Ungated.Add($suiteContractG1CallName) }
+        } elseif (-not $suiteContractG1Gated) {
+            [void]$suiteContractG1Ungated.Add($suiteContractG1CallName)
+        }
     }
     # Спершу доводиться, що всі три виклики знайдено рівно по одному разу:
     # інакше "нічого не порушено" означало б лише "нічого не знайдено".
@@ -29286,9 +29298,10 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
     Test-BRAVOCondition `
         -Condition ($suiteContractG1AllFound -and $suiteContractG1Ungated.Count -eq 0) `
         -Name "Framework/SuiteSelectionContract.FullOnlyAssertionsAreGatedOnFullRun" `
-        -Failure ("перевірки стану повного прогону мусять стояти в тілі if (`$null -eq `$script:BRAVOSelfTestSelectedSuite), " +
-            "інакше кожен -Suite завершується SELF-TEST FAILED. Усі три знайдено по одному разу: $suiteContractG1AllFound; " +
-            "без gate: [" + [string]::Join(', ', @($suiteContractG1Ungated.ToArray())) + "]")
+        -Failure ("FullCanonicalRunIsDefault і FullRunEnablesEverySuite мусять стояти в тілі if (`$null -eq `$script:BRAVOSelfTestSelectedSuite), " +
+            "інакше кожен -Suite завершується SELF-TEST FAILED; SuiteSelectionProbeRestoresState мусить бути без такого gate " +
+            "і порівнювати з `$suiteSelectionBefore. Усі три знайдено по одному разу: $suiteContractG1AllFound; " +
+            "порушують: [" + [string]::Join(', ', @($suiteContractG1Ungated.ToArray())) + "]")
 }
 & {
     # S1, S2, S3, S11, R2, R3, R4: статичний контракт -Suite. Усе читається з
