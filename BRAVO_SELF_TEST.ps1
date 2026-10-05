@@ -2071,11 +2071,114 @@ function Get-BRAVOSelfTestOwnSourceAst {
     return $script:BRAVOSelfTestOwnSourceAst
 }
 
+# ============================================================
+# Пришвидшення self-test (2026-10-02): один кеш AST на прогін.
+#
+# Статичні guard-и (Parser/*, Diagnostics/*, Secrets/*, Framework/*,
+# Governance/*) розбирали ті самі файли комплекту кожен заново. Кеш тримає
+# рівно один розбір файлу на прогін: Ast, Tokens і Errors, включно з
+# розбором, що дав синтаксичні помилки (їх перевірка Parser/<file> мусить
+# бачити так само, як і без кешу).
+#
+# Ключ — повний шлях, а запис дійсний лише для того самого часу
+# модифікації й розміру: змінений під час прогону файл буде розібрано
+# заново, а не віддано застарілий AST. Кеш призначений для файлів
+# репозиторію; фікстури, що пишуть тимчасові файли, розбирають їх
+# напряму, повз кеш.
+# ============================================================
+$script:BRAVOSelfTestParsedFileCache = @{}
+
+function Get-BRAVOSelfTestParsedFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $stamp = "{0}|{1}" -f $item.LastWriteTimeUtc.Ticks, $item.Length
+    $cacheKey = $item.FullName
+    if ($script:BRAVOSelfTestParsedFileCache.ContainsKey($cacheKey)) {
+        $cached = $script:BRAVOSelfTestParsedFileCache[$cacheKey]
+        if ($cached.Stamp -eq $stamp) { return $cached }
+    }
+    $parseTokens = $null
+    $parseErrors = $null
+    $parsedAst = [Management.Automation.Language.Parser]::ParseFile(
+        $item.FullName,
+        [ref]$parseTokens,
+        [ref]$parseErrors
+    )
+    $entry = [pscustomobject]@{
+        Path   = $item.FullName
+        Stamp  = $stamp
+        Ast    = $parsedAst
+        Tokens = $parseTokens
+        Errors = $parseErrors
+    }
+    $script:BRAVOSelfTestParsedFileCache[$cacheKey] = $entry
+    return $entry
+}
+
+# FindAll викликає предикат на КОЖНОМУ вузлі дерева, і саме виклики
+# PowerShell-scriptblock-а, а не розбір, коштують найбільше. Предикат
+# "вузол належить одному з типів" тому компілюється один раз у .NET-делегат
+# (System.Linq.Expressions, є в .NET 4.0, тобто в PowerShell 3.0). Він
+# перевіряє тип так само, як -is, включно з похідними класами; додаткові
+# умови перевірки застосовують уже до знайдених вузлів. Якщо компіляція
+# недоступна, повертається звичайний scriptblock з тією самою семантикою.
+$script:BRAVOSelfTestAstTypePredicateCache = @{}
+
+function Get-BRAVOSelfTestAstTypePredicate {
+    param([Parameter(Mandatory = $true)][type[]]$Type)
+
+    $cacheKey = (@($Type | ForEach-Object { $_.FullName }) -join '|')
+    if ($script:BRAVOSelfTestAstTypePredicateCache.ContainsKey($cacheKey)) {
+        return $script:BRAVOSelfTestAstTypePredicateCache[$cacheKey]
+    }
+    $predicate = $null
+    try {
+        $nodeParameter = [Linq.Expressions.Expression]::Parameter([Management.Automation.Language.Ast], 'node')
+        $body = $null
+        foreach ($nodeType in $Type) {
+            $typeTest = [Linq.Expressions.Expression]::TypeIs($nodeParameter, $nodeType)
+            if ($null -eq $body) {
+                $body = $typeTest
+            } else {
+                $body = [Linq.Expressions.Expression]::OrElse($body, $typeTest)
+            }
+        }
+        $predicate = [Linq.Expressions.Expression]::Lambda(
+            [Func[Management.Automation.Language.Ast, bool]],
+            $body,
+            [Linq.Expressions.ParameterExpression[]]@($nodeParameter)
+        ).Compile()
+    } catch {
+        # Linq.Expressions недоступні (обмежений хост): повільніший, але
+        # рівнозначний за результатом предикат.
+        $fallbackTypes = $Type
+        $predicate = {
+            param($node)
+            foreach ($fallbackType in $fallbackTypes) {
+                if ($node -is $fallbackType) { return $true }
+            }
+            return $false
+        }.GetNewClosure()
+    }
+    $script:BRAVOSelfTestAstTypePredicateCache[$cacheKey] = $predicate
+    return $predicate
+}
+
 # #219 (частина B): ЗОВНІШНІЙ try охоплює і основне тіло, і хвіст. Його
 # catch/finally — гарантований термінальний шлях: будь-який виняток поза
 # секціями або збій самого звіту закінчується звітом (чи мінімальним
 # "SELF-TEST FAILED") і ненульовим кодом, а не необробленим винятком.
 # Відступи тіла навмисно не змінено, щоб diff лишився оглядовим.
+#
+# Очікувані ERROR/WARNING змодельованих сценаріїв (Write-Log -> BRAVO.Console)
+# на час прогону друкуються DarkGray, а не червоним/жовтим: між рядками [PASS]
+# вони виглядали як справжні помилки. Вердикт ([FAIL], SELF-TEST FAILED)
+# друкується напряму і лишається червоним. Попереднє значення змінної
+# відновлюється першим рядком зовнішнього finally, щоб консоль, з якої
+# запускали self-test, не успадкувала приглушені кольори.
+$script:selfTestSimulatedOutputPrevious = [Environment]::GetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT')
+[Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT', '1')
 try {
 try {
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
@@ -2087,13 +2190,9 @@ try {
             Where-Object { $_.Extension -in @('.ps1', '.psm1', '.psd1') })
     )
     foreach ($file in $powerShellFiles) {
-        $tokens = $null
-        $errors = $null
-        [void][Management.Automation.Language.Parser]::ParseFile(
-            $file.FullName,
-            [ref]$tokens,
-            [ref]$errors
-        )
+        # Розбір через кеш прогону: аналітичний прохід нижче і Secrets-
+        # guard-и беруть той самий AST, а не розбирають файл заново.
+        $errors = @((Get-BRAVOSelfTestParsedFile -Path $file.FullName).Errors)
         Test-BRAVOCondition `
             -Condition ($errors.Count -eq 0) `
             -Name "Parser/$($file.Name)" `
@@ -4001,16 +4100,23 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # Раніше кожна з наступних чотирьох перевірок відкривала й повністю
     # розбирала КОЖЕН файл комплекту заново — 4 повні проходи по ~4.7 МБ
     # коду. Самі перевірки, їхні фільтри, тексти й ПОРЯДОК assert-ів нижче
-    # не змінені: спільним став лише розбір. AST не кешується між
-    # проходами навмисно — він живе рівно один виток циклу, тож пікова
-    # пам'ять лишається такою ж, як була для одного проходу.
+    # не змінені: спільним став лише розбір. Пришвидшення 2026-10-02:
+    # розбір береться з кешу прогону (Get-BRAVOSelfTestParsedFile — той
+    # самий AST, що вже розібрав цикл Parser/<file> вище), а предикат
+    # обходу скомпільовано один раз для тих самих п'яти типів вузлів.
+    $analyzedNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
+        [System.Management.Automation.Language.CatchClauseAst],
+        [System.Management.Automation.Language.CommandAst],
+        [System.Management.Automation.Language.BinaryExpressionAst],
+        [System.Management.Automation.Language.StringConstantExpressionAst],
+        [System.Management.Automation.Language.ExpandableStringExpressionAst]
+    )
     foreach ($analyzedFile in $powerShellFiles) {
         if ($analyzedFile.Extension -notin @('.ps1', '.psm1')) { continue }
 
-        $analyzedTokens = $null
-        $analyzedErrors = $null
-        $analyzedAst = [System.Management.Automation.Language.Parser]::ParseFile(
-            $analyzedFile.FullName, [ref]$analyzedTokens, [ref]$analyzedErrors)
+        $analyzedParsed = Get-BRAVOSelfTestParsedFile -Path $analyzedFile.FullName
+        $analyzedAst = $analyzedParsed.Ast
+        $analyzedTokens = $analyzedParsed.Tokens
         if ($null -eq $analyzedAst) { continue }
 
         # #157 (фаза 1): ОДИН обхід дерева замість чотирьох. FindAll
@@ -4018,14 +4124,10 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         # виклики, а не сам ParseFile, і є домінантною вартістю цих
         # перевірок. Один предикат відбирає вузли всіх потрібних типів,
         # а розбір за типом відбувається нижче, вже без повторних обходів.
-        $analyzedNodes = @($analyzedAst.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.CatchClauseAst] -or
-            $node -is [System.Management.Automation.Language.CommandAst] -or
-            $node -is [System.Management.Automation.Language.BinaryExpressionAst] -or
-            $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
-            $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
-        }, $true))
+        $analyzedNodes = @($analyzedAst.FindAll($analyzedNodePredicate, $true))
+        # Коментарі файлу відбираються один раз і лише за потреби: раніше
+        # кожен порожній catch переглядав УСІ токени файлу заново.
+        $analyzedCommentTokens = $null
 
         foreach ($analyzedNode in $analyzedNodes) {
             # --- порожній catch без пояснення ---
@@ -4033,8 +4135,13 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                 if ($analyzedNode.Body.Statements.Count -ne 0) { continue }
                 $bodyStart = $analyzedNode.Body.Extent.StartOffset
                 $bodyEnd = $analyzedNode.Body.Extent.EndOffset
-                $hasExplanation = @($analyzedTokens | Where-Object {
-                    $_.Kind -eq 'Comment' -and
+                if ($null -eq $analyzedCommentTokens) {
+                    $analyzedCommentTokens = New-Object System.Collections.ArrayList
+                    foreach ($analyzedToken in $analyzedTokens) {
+                        if ($analyzedToken.Kind -eq 'Comment') { [void]$analyzedCommentTokens.Add($analyzedToken) }
+                    }
+                }
+                $hasExplanation = @($analyzedCommentTokens | Where-Object {
                     $_.Extent.StartOffset -ge $bodyStart -and
                     $_.Extent.EndOffset -le $bodyEnd
                 }).Count -gt 0
@@ -6261,6 +6368,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
                 return "TITLE=$Title|EMOJI=$TitleEmoji|SEVERITY=$Severity|DETAILS=$($Details -join ';')"
             }
+            function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
 
             & $SendCallsInner
 
@@ -6511,7 +6619,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # WARNING/ALERTS, а не як SUCCESS/GENERAL (review finding #1) ----------
     $finalStatusModuleForSeverity = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
     $successWithWarningsRouteCapture = & $finalStatusModuleForSeverity {
         $script:SlackMode = "all"
         $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
@@ -6589,7 +6697,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # StaticAnalysis/NoStaticNewConstructorInProductionCode (Governance).
     $completedLinesModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
     $completedLinesScenarios = @(
         @{ Name = 'Zero'; Lines = @() },
         @{ Name = 'One'; Lines = @('Виконано:') },
@@ -6660,6 +6768,158 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             ) `
             -Name "Maintenance/SuccessNotificationCompletedLines_$($completedLinesScenario.Name)" `
             -Failure "успішне сповіщення (mode=all) мало передати в -Details $($expectedCompletedLines.Count) рядк(ів) '$($expectedCompletedLines -join '|')'; отримано: $(if ($null -eq $completedLinesCapture) { '<немає результату>' } else { '{0} доставлено, {1} рядк(ів) ''{2}''' -f $completedLinesCapture.DeliveredCount, $completedLinesCapture.DetailsCount, $completedLinesCapture.DetailsJoined })"
+    }
+
+    # --- Maintenance: перевищення порогу діапазонів ID (запис у
+    # CriticalErrorsList через Test-RangeIdUsage -> Send-SlackAlert
+    # -IsCritical) не повинно ховати решту перевірок. Регресія з продового
+    # сповіщення 5.2.4: фінальне повідомлення містило ЛИШЕ блок діапазонів
+    # ID — без статусів реставрації/.md/trace/очистки/вільного місця, без
+    # проблемних етапів і без попереджень з NotificationAlertQueue. Реальні
+    # Test-RangeIdUsage, Send-SlackAlert, Send-FinalReport і побудова блоку
+    # "Виконано:"; стабами лише транспорт і рендер.
+    $rangeIdFinalReportModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceRuntimeSourceForSeverity `
+        -FunctionNames @(
+            'Test-RangeIdUsage', 'Send-SlackAlert',
+            'Get-BRAVOMaintenanceStepOutcome', 'New-BRAVOMaintenanceCompletedLines',
+            'Get-BRAVOMaintenanceFinalReportCheckLines', 'Get-BRAVOMaintenanceFinalReportCheckLinesSafe',
+            'Send-FinalReport'
+        )
+    $rangeIdFinalReportRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RangeIdFinalReport_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $rangeIdFinalReportRoot -Force)
+    try {
+        $rangeIdFinalReportLogPath = Join-Path $rangeIdFinalReportRoot 'range_id_log.json'
+        [IO.File]::WriteAllText(
+            $rangeIdFinalReportLogPath,
+            '{"time":"2026-01-01T00:00:00","critical":[{"file":"range_test_A","filled":84.22}],"info":[{"file":"range_test_B","filled":12.5}]}',
+            (New-Object System.Text.UTF8Encoding($false)))
+
+        function Invoke-RangeIdFinalReportScenario {
+            param([string]$RangeIdLogPath, [switch]$WithRangeId, [switch]$BreakCheckLines)
+            & $rangeIdFinalReportModule {
+                param($RangeIdLogPathInner, $WithRangeIdInner, $BreakCheckLinesInner)
+                Set-StrictMode -Version 2.0
+                $script:SlackMode = 'errors_only'
+                $script:CriticalErrors = $false
+                $script:criticalErrorOccurred = $false
+                $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+                $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+                $script:NotificationWebhookUrls = @{ alerts = 'STUB-ALERTS-URL'; general = 'STUB-GENERAL-URL' }
+                $script:ScriptStartTime = Get-Date
+                $script:BRAVOWarningCount = 0
+                $bravoSettings = @{ NotificationRouting = @{} }
+                $LOG_FILE = 'STUB-LOG-PATH'
+                $LOG_DIR = 'STUB-LOG-DIR'
+                $NotificationProviderDisplayName = 'STUB'
+                $BravoMaintenanceEnabled = $true
+                $traceOutputProcessed = $true
+                $traceOutputProcessedCount = 3
+                $exchangAPILogsProcessedCount = 0
+                $restoreCompletedAt = Get-Date '2026-01-01T22:30:00'
+                $script:rangeIdFinalReportDelivered = New-Object System.Collections.Generic.List[object]
+                $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
+                foreach ($stepEntry in @(
+                        @('Реставрація моделі', 'OK', $null),
+                        @('Перевірка розмірів .md', 'OK', $null),
+                        @('Контроль діапазонів ID', $(if ($WithRangeIdInner) { 'WARN' } else { 'OK' }), $(if ($WithRangeIdInner) { 'перевищено поріг 80%: 1' } else { $null })),
+                        @('Обробка trace і логів', 'OK', $null),
+                        @('Очистка старих даних/логів', 'OK', $null),
+                        @('Перевірка вільного місця', 'OK', $null),
+                        @('Відновлення стану служб', 'WARN', 'служба HOST-01-TEST не запустилась'))) {
+                    $script:BRAVOMaintenanceStepLog.Add([pscustomobject]@{ Name = $stepEntry[0]; Status = $stepEntry[1]; Details = $stepEntry[2] })
+                }
+
+                function Write-Log {
+                    param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+                    $null = $Message; $null = $NoTimestamp; $null = $NoConsole
+                    if ($Level -eq 'WARNING') { $script:BRAVOWarningCount++ }
+                }
+                function Get-BRAVOFiles { param($Path, $Filter) return @() }
+                function Get-MaintenanceFreeSpaceInlineText { return ':floppy_disk: C: 100 ГБ · поріг: 20 ГБ' }
+                function Resolve-BRAVONotificationRoute {
+                    param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                    if ($NotificationMode -eq 'none') { return 'none' }
+                    if ($Severity -eq 'SUCCESS') { if ($NotificationMode -eq 'errors_only') { return 'none' }; return 'general' }
+                    return 'alerts'
+                }
+                function Invoke-NotificationWebhook {
+                    param([string]$Message, [string]$WebhookUrl)
+                    $script:rangeIdFinalReportDelivered.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+                }
+                function New-MaintenanceNotificationMessage {
+                    param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                    return "SEVERITY=$Severity`n$(@($Details) -join "`n")"
+                }
+                if ($BreakCheckLinesInner) {
+                    function New-BRAVOMaintenanceCompletedLines { throw 'збій побудови блоку статусів' }
+                }
+
+                Send-SlackAlert -Message 'Тестове попередження з черги сповіщень' -Severity 'WARNING'
+                if ($WithRangeIdInner) {
+                    [void](Test-RangeIdUsage -Path $RangeIdLogPathInner -ThresholdPercent 80)
+                }
+                Send-FinalReport -LOG_FILE $LOG_FILE
+
+                [pscustomobject]@{
+                    DeliveredCount = $script:rangeIdFinalReportDelivered.Count
+                    Text = if ($script:rangeIdFinalReportDelivered.Count -gt 0) { [string]$script:rangeIdFinalReportDelivered[0].Message } else { '' }
+                    WebhookUrl = if ($script:rangeIdFinalReportDelivered.Count -gt 0) { [string]$script:rangeIdFinalReportDelivered[0].WebhookUrl } else { '' }
+                }
+            } $RangeIdLogPath ([bool]$WithRangeId) ([bool]$BreakCheckLines)
+        }
+
+        $rangeIdFinalReportExpected = @(
+            'Перевищено поріг використання діапазонів ID (80%): 1 діапазон.',
+            'range_test_A: 84.22%',
+            'Тестове попередження з черги сповіщень',
+            'Виконано:',
+            ':white_check_mark: Реставрація — за планом',
+            ':white_check_mark: .md-файли — перевірено',
+            ':warning: Інтервали ID — перевищено поріг 80%: 1',
+            ':white_check_mark: Trace — оброблено 3',
+            ':white_check_mark: Очистка — виконано',
+            ':white_check_mark: Вільне місце — достатньо',
+            ':mag: Також потребує уваги:',
+            ':warning: Відновлення стану служб — служба HOST-01-TEST не запустилась'
+        )
+        $rangeIdFinalReportCapture = Invoke-RangeIdFinalReportScenario -RangeIdLogPath $rangeIdFinalReportLogPath -WithRangeId
+        $rangeIdFinalReportMissing = @($rangeIdFinalReportExpected | Where-Object { -not $rangeIdFinalReportCapture.Text.Contains([string]$_) })
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdFinalReportCapture.DeliveredCount -eq 1 -and
+                $rangeIdFinalReportCapture.WebhookUrl -eq 'STUB-ALERTS-URL' -and
+                $rangeIdFinalReportCapture.Text.StartsWith('SEVERITY=CRITICAL') -and
+                -not $rangeIdFinalReportCapture.Text.Contains('range_test_B') -and
+                $rangeIdFinalReportMissing.Count -eq 0
+            ) `
+            -Name 'Maintenance/RangeIdAlertKeepsOtherChecksInFinalReport' `
+            -Failure "перевищення порогу діапазонів ID має прийти ОДНИМ сповіщенням разом зі статусами всіх етапів і попередженнями з черги; доставлено: $($rangeIdFinalReportCapture.DeliveredCount), бракує: $($rangeIdFinalReportMissing -join ' | ')"
+
+        $rangeIdFinalReportCapture = Invoke-RangeIdFinalReportScenario -RangeIdLogPath $rangeIdFinalReportLogPath
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdFinalReportCapture.DeliveredCount -eq 1 -and
+                $rangeIdFinalReportCapture.Text.StartsWith('SEVERITY=WARNING') -and
+                $rangeIdFinalReportCapture.Text.Contains('Тестове попередження з черги сповіщень') -and
+                $rangeIdFinalReportCapture.Text.Contains(':white_check_mark: Інтервали ID — у нормі') -and
+                $rangeIdFinalReportCapture.Text.Contains(':warning: Відновлення стану служб — служба HOST-01-TEST не запустилась')
+            ) `
+            -Name 'Maintenance/AlertQueueFinalReportIncludesCheckStatuses' `
+            -Failure "сповіщення з попередженнями черги (errors_only) має містити й блок статусів етапів; отримано: $($rangeIdFinalReportCapture.Text)"
+
+        $rangeIdFinalReportCapture = Invoke-RangeIdFinalReportScenario -RangeIdLogPath $rangeIdFinalReportLogPath -WithRangeId -BreakCheckLines
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdFinalReportCapture.DeliveredCount -eq 1 -and
+                $rangeIdFinalReportCapture.Text.Contains('range_test_A: 84.22%') -and
+                $rangeIdFinalReportCapture.Text.Contains('Тестове попередження з черги сповіщень') -and
+                -not $rangeIdFinalReportCapture.Text.Contains('Виконано:')
+            ) `
+            -Name 'Maintenance/FinalReportCheckLinesFailureKeepsAlert' `
+            -Failure "збій побудови блоку статусів не повинен забирати саме сповіщення про проблему; доставлено: $($rangeIdFinalReportCapture.DeliveredCount), текст: $($rangeIdFinalReportCapture.Text)"
+    } finally {
+        Remove-Item -LiteralPath $rangeIdFinalReportRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     # Модель release channel (P0.6 аудиту): developer -> development,
@@ -8421,18 +8681,19 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             Where-Object { @('.ps1', '.psm1') -contains $_.Extension })
     )
     $directStdinWriteViolations = @()
+    # Файли комплекту беруться з кешу прогону, а скомпільований предикат
+    # відбирає лише виклики методів; решта умов перевіряється вже на них.
+    $directStdinMemberCallPredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
+        [Management.Automation.Language.InvokeMemberExpressionAst])
     foreach ($directStdinWriteFile in $directStdinWriteFiles) {
-        $directStdinFileAst = [Management.Automation.Language.Parser]::ParseFile(
-            $directStdinWriteFile.FullName, [ref]$null, [ref]$null)
-        $directStdinWriteViolations += @($directStdinFileAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
-                $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
-                @('Write', 'WriteLine') -contains $node.Member.Value -and
-                $node.Expression -is [Management.Automation.Language.MemberExpressionAst] -and
-                $node.Expression.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
-                $node.Expression.Member.Value -eq 'StandardInput'
-        }, $true) | ForEach-Object {
+        $directStdinFileAst = (Get-BRAVOSelfTestParsedFile -Path $directStdinWriteFile.FullName).Ast
+        $directStdinWriteViolations += @(@($directStdinFileAst.FindAll($directStdinMemberCallPredicate, $true)) | Where-Object {
+            $_.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                @('Write', 'WriteLine') -contains $_.Member.Value -and
+                $_.Expression -is [Management.Automation.Language.MemberExpressionAst] -and
+                $_.Expression.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                $_.Expression.Member.Value -eq 'StandardInput'
+        } | ForEach-Object {
             "{0}:{1}" -f $directStdinWriteFile.FullName.Substring($root.Length).TrimStart('\', '/'), $_.Extent.StartLineNumber
         })
     }
@@ -8460,24 +8721,37 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         param(
             [Parameter(Mandatory = $true)][string]$RootPath,
             [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files,
-            [string[]]$DirectStdinWriteAllowList = @()
+            [string[]]$DirectStdinWriteAllowList = @(),
+            # Файли репозиторію беруться з кешу прогону; синтетичні
+            # проби (тимчасові файли) розбираються напряму.
+            [switch]$UseParsedFileCache
         )
 
         $violations = New-Object System.Collections.Generic.List[string]
         $usedAllowListEntries = @{}
+        $memberCallPredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
+            [Management.Automation.Language.InvokeMemberExpressionAst])
+        $functionDefinitionPredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
+            [Management.Automation.Language.FunctionDefinitionAst])
         foreach ($file in $Files) {
             $relativePath = ($file.FullName.Substring($RootPath.Length).TrimStart('\', '/')) -replace '/', '\'
-            $parseTokens = $null
-            $parseErrors = $null
-            $fileAst = [Management.Automation.Language.Parser]::ParseFile(
-                $file.FullName,
-                [ref]$parseTokens,
-                [ref]$parseErrors
-            )
-            $memberCalls = @($fileAst.FindAll({
-                param($node)
-                $node -is [Management.Automation.Language.InvokeMemberExpressionAst]
-            }, $true))
+            if ($UseParsedFileCache) {
+                $fileAst = (Get-BRAVOSelfTestParsedFile -Path $file.FullName).Ast
+            } else {
+                $parseTokens = $null
+                $parseErrors = $null
+                $fileAst = [Management.Automation.Language.Parser]::ParseFile(
+                    $file.FullName,
+                    [ref]$parseTokens,
+                    [ref]$parseErrors
+                )
+            }
+            $memberCalls = @($fileAst.FindAll($memberCallPredicate, $true))
+            # Власний текст області (без тіл вкладених функцій) рахується
+            # один раз на область, а не на кожен виклик методу в ній:
+            # повторний FindAll по тілу функції для кожного виклику робив
+            # обхід квадратичним.
+            $scopeOwnTextByNode = New-Object 'System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,string]'
             foreach ($call in $memberCalls) {
                 $memberName = ([string]$call.Member.Extent.Text).Trim("'", '"')
                 $scopeNode = $call
@@ -8511,28 +8785,35 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 # (напр. запуск процесу зі stdin) мають власну область; їхній
                 # RedirectStandardInput не робить статичний ::Start() обгортки
                 # (напр. UAC-перезапуск з -Verb RunAs) порушенням.
-                $scopeOwnText = $scopeNode.Extent.Text
-                if ($scopeNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
-                    $nestedScopes = @($scopeNode.Body.FindAll({
-                        param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
-                    }, $true) | Sort-Object { $_.Extent.StartOffset })
-                    $maskedUntilOffset = -1
-                    $ownTextBuilder = New-Object System.Text.StringBuilder
-                    $ownTextCursor = 0
-                    foreach ($nestedScope in $nestedScopes) {
-                        if ($nestedScope.Extent.StartOffset -lt $maskedUntilOffset) { continue }
-                        $nestedStart = $nestedScope.Extent.StartOffset - $scopeNode.Extent.StartOffset
-                        $nestedLength = $nestedScope.Extent.EndOffset - $nestedScope.Extent.StartOffset
-                        [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor, $nestedStart - $ownTextCursor))
-                        $ownTextCursor = $nestedStart + $nestedLength
-                        $maskedUntilOffset = $nestedScope.Extent.EndOffset
+                if ($call.Static -and $memberName -eq 'Start') {
+                    # Власний текст області потрібен лише статичному ::Start(), тож
+                    # для решти викликів він не рахується зовсім.
+                    if ($scopeOwnTextByNode.ContainsKey($scopeNode)) {
+                        $scopeOwnText = $scopeOwnTextByNode[$scopeNode]
+                    } else {
+                        $scopeOwnText = $scopeNode.Extent.Text
+                        if ($scopeNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                            $nestedScopes = @($scopeNode.Body.FindAll($functionDefinitionPredicate, $true) |
+                                Sort-Object { $_.Extent.StartOffset })
+                            $maskedUntilOffset = -1
+                            $ownTextBuilder = New-Object System.Text.StringBuilder
+                            $ownTextCursor = 0
+                            foreach ($nestedScope in $nestedScopes) {
+                                if ($nestedScope.Extent.StartOffset -lt $maskedUntilOffset) { continue }
+                                $nestedStart = $nestedScope.Extent.StartOffset - $scopeNode.Extent.StartOffset
+                                $nestedLength = $nestedScope.Extent.EndOffset - $nestedScope.Extent.StartOffset
+                                [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor, $nestedStart - $ownTextCursor))
+                                $ownTextCursor = $nestedStart + $nestedLength
+                                $maskedUntilOffset = $nestedScope.Extent.EndOffset
+                            }
+                            [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor))
+                            $scopeOwnText = $ownTextBuilder.ToString()
+                        }
+                        $scopeOwnTextByNode[$scopeNode] = $scopeOwnText
                     }
-                    [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor))
-                    $scopeOwnText = $ownTextBuilder.ToString()
-                }
-                if ($call.Static -and $memberName -eq 'Start' -and
-                    $scopeOwnText.Contains('RedirectStandardInput')) {
-                    $violations.Add("$location — статичний ::Start() в області з RedirectStandardInput")
+                    if ($scopeOwnText.Contains('RedirectStandardInput')) {
+                        $violations.Add("$location — статичний ::Start() в області з RedirectStandardInput")
+                    }
                 }
                 if ($memberName -match '^Write(Line)?$' -and
                     ([string]$call.Expression.Extent.Text) -match '\.StandardInput(\.BaseStream)?$' -and
@@ -8566,7 +8847,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     $bomFreeDirectWriteAllowList = @()
     $bomFreeViolations = @(Get-BRAVOStdinProcessStartViolation `
         -RootPath $root -Files $bomFreeProductionFiles `
-        -DirectStdinWriteAllowList $bomFreeDirectWriteAllowList)
+        -DirectStdinWriteAllowList $bomFreeDirectWriteAllowList -UseParsedFileCache)
 
     # Контроль невакуумності гарда: синтетичний файл з типовим
     # порушенням (сирий .Start() + WriteLine) МАЄ дати порушення.
@@ -19287,6 +19568,7 @@ try {
                     param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
                     return "SEVERITY=$Severity|DETAILS=$($Details -join ';')"
                 }
+                function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
                 foreach ($archiveName in $ArchiveNamesInner) {
                     [void](Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
                         -SevenZipPath 'stub-7za' `
@@ -26099,9 +26381,14 @@ foreach ($criticalCommandName in @('Get-Service', 'Start-Service', 'Stop-Service
             "ModuleName=$($criticalCommand.ModuleName)")
 }
 
+# Пошук іде через Function:-drive, а не Get-Command: для імені, якого вже
+# немає (нормальний випадок після прибирання), Get-Command запускав пошук і
+# автозавантаження модулів по всьому PSModulePath, і на сотнях імен це
+# коштувало десятки секунд. Перевіряється те саме: функція з таким ім'ям,
+# видима з цієї області, і модуль, якому вона належить.
 $leakedFixtureCommands = @(
     $selfTestEverRegisteredFunctionNames | ForEach-Object {
-        $command = Get-Command -Name $_ -ErrorAction SilentlyContinue
+        $command = Get-Item -LiteralPath ('function:' + $_) -ErrorAction SilentlyContinue
         if ($null -ne $command -and
             $command.CommandType -eq [Management.Automation.CommandTypes]::Function -and
             $selfTestOwnedModuleNamesBeforeCleanup -contains $command.ModuleName) {
@@ -26131,7 +26418,7 @@ $leakedHelperCommands = @(
     $selfTestEverRegisteredFunctionNames |
         Where-Object { $_ -notin @('Get-Service', 'Start-Service', 'Stop-Service') } |
         ForEach-Object {
-            $command = Get-Command -Name $_ -ErrorAction SilentlyContinue
+            $command = Get-Item -LiteralPath ('function:' + $_) -ErrorAction SilentlyContinue
             if ($null -ne $command -and
                 $command.CommandType -eq [Management.Automation.CommandTypes]::Function -and
                 $selfTestOwnedModuleNamesBeforeCleanup -contains $command.ModuleName) {
@@ -28391,7 +28678,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
         $units = New-Object System.Collections.ArrayList
         [void]$units.Add([pscustomobject]@{ Suite = $null; Fragment = 'BRAVO_SELF_TEST'; Ast = $RootAst; GateOffset = [int]::MaxValue })
         $gateStatements = @(
-            @($RootAst.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] }, $true)) |
+            @($RootAst.FindAll((Get-BRAVOSelfTestAstTypePredicate -Type @([Management.Automation.Language.IfStatementAst])), $true)) |
                 Where-Object {
                     $_.Clauses.Count -ge 1 -and
                     $_.Clauses[0].Item1.Extent.Text -match "^\s*Test-BRAVOSelfTestSuiteEnabled\s+-Name\s+'[^']+'\s*$"
@@ -28472,16 +28759,15 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
         # Дорогий підйом до меж scope — лише для визначень і для тих читань,
         # чиє ім'я взагалі визначає якийсь фрагмент.
         $unitFacts = @()
+        $unitNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
+            [Management.Automation.Language.VariableExpressionAst],
+            [Management.Automation.Language.FunctionDefinitionAst],
+            [Management.Automation.Language.CommandAst])
         foreach ($unit in $units) {
             $definitionNodes = New-Object System.Collections.ArrayList
             $useKeys = New-Object System.Collections.ArrayList
             $useNodes = New-Object System.Collections.ArrayList
-            foreach ($node in @($unit.Ast.FindAll({
-                            param($candidate)
-                            $candidate -is [Management.Automation.Language.VariableExpressionAst] -or
-                            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -or
-                            $candidate -is [Management.Automation.Language.CommandAst]
-                        }, $true))) {
+            foreach ($node in @($unit.Ast.FindAll($unitNodePredicate, $true))) {
                 if ($node -is [Management.Automation.Language.FunctionDefinitionAst]) {
                     [void]$definitionNodes.Add([pscustomobject]@{ Key = 'function:' + $node.Name; Node = $node; Qualified = $false })
                     continue
@@ -28649,11 +28935,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
     try {
         $crossSuiteFragmentAst = @{}
         foreach ($crossSuiteFile in @(Get-ChildItem -LiteralPath (Join-Path $root 'selftest') -Filter 'BRAVO_SELF_TEST.*.ps1' -File)) {
-            $crossSuiteTokens = $null
-            $crossSuiteErrors = $null
-            $crossSuiteParsed = [Management.Automation.Language.Parser]::ParseFile(
-                $crossSuiteFile.FullName, [ref]$crossSuiteTokens, [ref]$crossSuiteErrors)
-            if (@($crossSuiteErrors).Count -gt 0) { throw "синтаксичні помилки у $($crossSuiteFile.Name)" }
+            $crossSuiteParsedFile = Get-BRAVOSelfTestParsedFile -Path $crossSuiteFile.FullName
+            $crossSuiteParsed = $crossSuiteParsedFile.Ast
+            if (@($crossSuiteParsedFile.Errors).Count -gt 0) { throw "синтаксичні помилки у $($crossSuiteFile.Name)" }
             $crossSuiteName = $crossSuiteFile.Name -replace '^BRAVO_SELF_TEST\.', '' -replace '\.ps1$', ''
             $crossSuiteFragmentAst[$crossSuiteName] = $crossSuiteParsed
         }
@@ -28797,6 +29081,76 @@ $null = New-AlphaOwnedFixture
         -Name "Perf/OwnSourceMemoKeyTracksFileState" `
         -Failure "ключ memo має містити час модифікації й розмір файлу, інакше зміна файлу під час прогону віддала б застарілий розбір; фактично: '$perfOwnStamp'"
 
+    # Пришвидшення 2026-10-02: кеш розбору файлів на прогін. Той самий
+    # екземпляр для незміненого файлу; новий розбір, щойно файл змінився;
+    # синтаксичні помилки кешуються разом із розбором.
+    $perfCacheProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AST_CACHE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    $perfCacheSameInstance = $false
+    $perfCacheTracksChange = $false
+    $perfCacheKeepsErrors = $false
+    try {
+        [void][IO.Directory]::CreateDirectory($perfCacheProbeRoot)
+        $perfCacheProbeFile = Join-Path $perfCacheProbeRoot 'probe.ps1'
+        [IO.File]::WriteAllText($perfCacheProbeFile, "function Get-ProbeA { 1 }`r`n", (New-Object Text.UTF8Encoding($false)))
+        $perfCacheFirst = Get-BRAVOSelfTestParsedFile -Path $perfCacheProbeFile
+        $perfCacheSecond = Get-BRAVOSelfTestParsedFile -Path $perfCacheProbeFile
+        $perfCacheSameInstance = [object]::ReferenceEquals($perfCacheFirst, $perfCacheSecond) -and
+            [object]::ReferenceEquals($perfCacheFirst.Ast, $perfCacheSecond.Ast)
+        [IO.File]::WriteAllText($perfCacheProbeFile, "function Get-ProbeChanged { 2 }`r`n", (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::SetLastWriteTimeUtc($perfCacheProbeFile, [datetime]::UtcNow.AddMinutes(1))
+        $perfCacheChanged = Get-BRAVOSelfTestParsedFile -Path $perfCacheProbeFile
+        $perfCacheTracksChange = -not [object]::ReferenceEquals($perfCacheFirst, $perfCacheChanged) -and
+            $perfCacheChanged.Ast.Extent.Text.Contains('Get-ProbeChanged')
+        $perfCacheBrokenFile = Join-Path $perfCacheProbeRoot 'broken.ps1'
+        [IO.File]::WriteAllText($perfCacheBrokenFile, "if (`$true) {`r`n", (New-Object Text.UTF8Encoding($false)))
+        $perfCacheBrokenFirst = Get-BRAVOSelfTestParsedFile -Path $perfCacheBrokenFile
+        $perfCacheBrokenSecond = Get-BRAVOSelfTestParsedFile -Path $perfCacheBrokenFile
+        $perfCacheKeepsErrors = @($perfCacheBrokenFirst.Errors).Count -gt 0 -and
+            @($perfCacheBrokenSecond.Errors).Count -eq @($perfCacheBrokenFirst.Errors).Count
+    } finally {
+        foreach ($perfCacheKey in @($script:BRAVOSelfTestParsedFileCache.Keys)) {
+            if ($perfCacheKey.StartsWith($perfCacheProbeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $script:BRAVOSelfTestParsedFileCache.Remove($perfCacheKey)
+            }
+        }
+        if (Test-Path -LiteralPath $perfCacheProbeRoot) {
+            Remove-Item -LiteralPath $perfCacheProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($perfCacheSameInstance -and $perfCacheTracksChange -and $perfCacheKeepsErrors) `
+        -Name "Perf/ParsedFileCacheReusesAndTracksFileState" `
+        -Failure ("кеш розбору має віддавати той самий розбір для незміненого файлу, розбирати файл " +
+            "заново після зміни і зберігати синтаксичні помилки; фактично: same=$perfCacheSameInstance, " +
+            "changed=$perfCacheTracksChange, errors=$perfCacheKeepsErrors")
+
+    # Скомпільований предикат типу має знаходити рівно ті самі вузли, що й
+    # -is у scriptblock-у, включно з похідними класами
+    # (InvokeMemberExpressionAst є MemberExpressionAst).
+    $perfPredicateAst = [Management.Automation.Language.Parser]::ParseInput(
+        "`$a.B; `$a.C(); [x]::D(); function F { `$e.G() }; if (`$h) { `$i.J }", [ref]$null, [ref]$null)
+    $perfPredicateTypes = @(
+        [Management.Automation.Language.MemberExpressionAst],
+        [Management.Automation.Language.FunctionDefinitionAst])
+    $perfCompiledPredicate = Get-BRAVOSelfTestAstTypePredicate -Type $perfPredicateTypes
+    $perfCompiledMatches = @($perfPredicateAst.FindAll($perfCompiledPredicate, $true) | ForEach-Object { $_.Extent.StartOffset })
+    $perfScriptBlockMatches = @($perfPredicateAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.MemberExpressionAst] -or
+            $node -is [Management.Automation.Language.FunctionDefinitionAst]
+    }, $true) | ForEach-Object { $_.Extent.StartOffset })
+    Test-BRAVOCondition `
+        -Condition (
+            $perfCompiledPredicate -is [Func[Management.Automation.Language.Ast, bool]] -and
+            [object]::ReferenceEquals($perfCompiledPredicate, (Get-BRAVOSelfTestAstTypePredicate -Type $perfPredicateTypes)) -and
+            $perfCompiledMatches.Count -eq 6 -and
+            ($perfCompiledMatches -join ',') -eq ($perfScriptBlockMatches -join ',')
+        ) `
+        -Name "Perf/AstTypePredicateIsCompiledAndMatchesIsOperator" `
+        -Failure ("предикат типу має бути скомпільованим делегатом, повторно використовуватись і знаходити " +
+            "ті самі вузли, що й -is; фактично: compiled=$($perfCompiledPredicate -is [Func[Management.Automation.Language.Ast, bool]]), " +
+            "скомпільований=$($perfCompiledMatches -join ','), scriptblock=$($perfScriptBlockMatches -join ',')")
+
     # Головний anti-regression guard фази 1: рівно ОДИН АНАЛІТИЧНИЙ
     # AST-прохід по $powerShellFiles, і він годує всі чотири набори
     # знахідок. Цикл синтаксичної перевірки (Parser/<file>) теж розбирає
@@ -28815,7 +29169,9 @@ $null = New-AlphaOwnedFixture
     }, $true))
     $perfAnalysisLoops = @($perfRepoLoops | Where-Object {
         $loopText = [string]$_.Extent.Text
-        $loopText.Contains('Parser]::ParseFile') -and
+        # Розбір іде через кеш прогону (Get-BRAVOSelfTestParsedFile), а не
+        # прямим Parser::ParseFile.
+        $loopText.Contains('Get-BRAVOSelfTestParsedFile') -and
         @($perfRequiredCollections | Where-Object { $loopText.Contains($_) }).Count -gt 0
     })
     $perfMergedLoopText = if ($perfAnalysisLoops.Count -eq 1) {
@@ -29784,6 +30140,11 @@ Complete-BRAVOSelfTestReport
 } catch {
     Complete-BRAVOSelfTestAbnormalExit -ErrorRecord $_
 } finally {
+    # Get-Variable, а не пряме читання: Framework/SectionIsolation-проби
+    # копіюють цей finally у дочірній скрипт під Set-StrictMode, де змінна
+    # не оголошена.
+    [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT',
+        (Get-Variable -Name 'selfTestSimulatedOutputPrevious' -Scope Script -ValueOnly -ErrorAction SilentlyContinue))
     # Штатний шлях завершується exit усередині Complete-BRAVOHelperLog
     # (ReportIssued уже $true). Сюди без звіту потрапляє лише прогін,
     # що вийшов із тіла в обхід catch — він теж не може дати код 0.

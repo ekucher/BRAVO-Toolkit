@@ -560,7 +560,25 @@ function Write-BRAVOConsoleDetail {
         Write-Host ''
         $script:BRAVOConsoleStepOpen = $false
     }
-    Write-Host ("      " + $Message) -ForegroundColor $Color
+    Write-Host ("      " + $Message) -ForegroundColor (Resolve-BRAVOConsoleDetailColor -Color $Color)
+}
+
+# Self-test проганяє справжній бізнес-код на змодельованих сценаріях, і
+# очікувані в цих сценаріях ERROR/WARNING друкувались червоним/жовтим між
+# рядками [PASS], тож оператор бачив "помилку" там, де тест якраз успішний.
+# На час прогону BRAVO_SELF_TEST.ps1 виставляє BRAVO_SELFTEST_SIMULATED_OUTPUT=1
+# (і відновлює попереднє значення у finally), і такі деталі приглушуються до
+# DarkGray. Вердикт self-test ([FAIL], SELF-TEST FAILED) друкується напряму
+# через Write-Host і лишається червоним. Поза self-test змінна не
+# встановлена, тому кольори production-консолі не змінюються.
+function Resolve-BRAVOConsoleDetailColor {
+    param([ConsoleColor]$Color)
+
+    if ([Environment]::GetEnvironmentVariable('BRAVO_SELFTEST_SIMULATED_OUTPUT') -eq '1' -and
+        $Color -in @([ConsoleColor]::Red, [ConsoleColor]::DarkRed, [ConsoleColor]::Yellow, [ConsoleColor]::DarkYellow)) {
+        return [ConsoleColor]::DarkGray
+    }
+    return $Color
 }
 
 # Рівні журналу мають ті самі кольори, що й статуси етапів: оператор не має
