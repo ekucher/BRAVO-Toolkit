@@ -1196,6 +1196,29 @@ function Get-BRAVOFileHash {
             ) `
             -Name "BackupConsistency/NullStartedAtCompleteDoesNotDisplaceProtectedGeneration" `
             -Failure "COMPLETE з невідомим часом не повинна брати участі у виборі N захищених: валідна прострочена generation, що входить у N найновіших, має лишитися, а копія з невідомим часом - не видалятися"
+
+        # 8h: контроль - startedAt у форматі ConvertTo-Json Windows
+        # PowerShell 5.1 ("\/Date(ms)\/") лишається відомим часом:
+        # прострочена незахищена COMPLETE generation видаляється як і раніше.
+        $epochRoot = Join-Path $retentionStatusTestRoot 'epoch-time'
+        [void](New-BRAVORetentionComponentFixture -Root $epochRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        [void](New-BRAVORetentionComponentFixture -Root $epochRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
+        $epochManifest = New-BRAVORetentionComponentFixture -Root $epochRoot `
+            -GenerationId '20250501_230000' -StartedAt (Get-Date).AddDays(-640)
+        $epochStart = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+        $epochMilliseconds = [long]((Get-Date).AddDays(-640).ToUniversalTime() - $epochStart).TotalMilliseconds
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $epochManifest -JsonValue ('"\/Date(' + $epochMilliseconds + ')\/"') -LastWriteTime (Get-Date)
+        $epochOk = Invoke-BRAVORetentionFixtureCleanup -Root $epochRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $epochRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $epochOk -eq $true -and
+                -not (Test-Path -LiteralPath $epochManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path (Join-Path $epochRoot 'MODEL') 'MODEL_20250501_230000.mdz')) -and
+                -not (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250501_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/EpochStartedAtStillExpiresByAge" `
+            -Failure "startedAt у форматі \/Date(ms)\/ (ConvertTo-Json Windows PowerShell 5.1) має розбиратися як відомий час: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $epochManifest)"
     } finally {
         Remove-Item -Path Variable:\global:enableArchiveDeletion, `
             Variable:\global:enableFailedArchiveDeletion, `

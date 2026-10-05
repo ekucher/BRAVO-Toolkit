@@ -1703,7 +1703,16 @@ function Remove-BRAVOExpiredBackupGenerations {
                     } else {
                         $parsedStartedAt = [datetime]::MinValue
                         $startedAtText = [string]$startedAtProperty.Value
-                        if (-not [string]::IsNullOrWhiteSpace($startedAtText) -and
+                        # Формат ConvertTo-Json Windows PowerShell 5.1 для
+                        # [datetime] ("\/Date(ms)\/"), якщо ConvertFrom-Json
+                        # лишив його рядком: мілісекунди від епохи UTC.
+                        $epochMatch = [regex]::Match($startedAtText, '^/Date\((-?\d+)(?:[+-]\d{4})?\)/$')
+                        if ($epochMatch.Success) {
+                            $epochMilliseconds = [long]0
+                            if ([long]::TryParse($epochMatch.Groups[1].Value, [ref]$epochMilliseconds)) {
+                                $parsedStartedAt = (New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).AddMilliseconds($epochMilliseconds).ToLocalTime()
+                            }
+                        } elseif (-not [string]::IsNullOrWhiteSpace($startedAtText) -and
                             -not [datetime]::TryParse(
                                 $startedAtText,
                                 [Globalization.CultureInfo]::InvariantCulture,
