@@ -643,8 +643,16 @@ function Get-BRAVOFileHash {
             param($BackupRoot, $CurrentId, $Definitions, $SectionShownRef, $UseStrictMode)
             # Production виконується під Set-StrictMode -Version 2.0
             # (BRAVO_CONFIG_LOADER.ps1); сценарії, що це моделюють, вмикають
-            # його лише в області цього scriptblock.
-            if ($UseStrictMode) { Set-StrictMode -Version 2.0 }
+            # його лише в області цього scriptblock. Під StrictMode retention
+            # читає змінні конфігурації, які в production завжди задає
+            # BRAVO.Configuration: тут вони задаються з тими ж значеннями за
+            # замовчуванням, інакше невизначена змінна чи властивість $null
+            # кидала б виняток і видалення падало б у catch.
+            if ($UseStrictMode) {
+                Set-StrictMode -Version 2.0
+                $archiveFileFilter = '*.mdz'
+                $progressSettings = @{ Enabled = $false; ShowOverallProgress = $false }
+            }
             Remove-BRAVOExpiredBackupGenerations `
                 -BackupRoot $BackupRoot `
                 -CurrentGenerationId $CurrentId `
@@ -1172,7 +1180,7 @@ function Get-BRAVOFileHash {
                 -not (Test-Path -LiteralPath (Join-Path (Join-Path $knownFailedRoot 'MODEL') 'MODEL_20250302_230000.mdz'))
             ) `
             -Name "BackupConsistency/KnownFailedAndIncompleteStatusesStillExpire" `
-            -Failure "generation зі статусом FAILED або INCOMPLETE (без урахування регістру) з відомим startedAt, старшим за failedArchiveRetentionDays, має видалятися як і раніше"
+            -Failure "generation зі статусом FAILED або INCOMPLETE (без урахування регістру) з відомим startedAt, старшим за failedArchiveRetentionDays, має видалятися як і раніше; ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
 
         # 8g: COMPLETE з невідомим часом не займає місце серед N захищених
         # (сортується останньою, тож це насамперед перевірка, що вона не
@@ -1221,7 +1229,7 @@ function Get-BRAVOFileHash {
                 -not (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250501_230000: час запуску')
             ) `
             -Name "BackupConsistency/EpochStartedAtStillExpiresByAge" `
-            -Failure "startedAt як рядок /Date(ms)/ має розбиратися як відомий час: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $epochManifest)"
+            -Failure "startedAt як рядок /Date(ms)/ має розбиратися як відомий час: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $epochManifest); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
 
         # 8i: наскрізно - startedAt серіалізовано тим самим ConvertTo-Json, що
         # й writer manifest-а (у Windows PowerShell 5.1 це "\/Date(ms)\/", який
@@ -1246,7 +1254,7 @@ function Get-BRAVOFileHash {
                 -not (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250601_230000: час запуску')
             ) `
             -Name "BackupConsistency/ConvertToJsonStartedAtRoundTripStillExpiresByAge" `
-            -Failure "startedAt, серіалізований ConvertTo-Json як у writer manifest-а ($roundTripValue), має лишатися відомим часом: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $roundTripManifest)"
+            -Failure "startedAt, серіалізований ConvertTo-Json як у writer manifest-а ($roundTripValue), має лишатися відомим часом: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $roundTripManifest); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
     } finally {
         Remove-Item -Path Variable:\global:enableArchiveDeletion, `
             Variable:\global:enableFailedArchiveDeletion, `
