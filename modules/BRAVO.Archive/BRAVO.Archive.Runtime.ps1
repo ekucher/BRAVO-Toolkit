@@ -1727,7 +1727,10 @@ function Remove-BRAVOExpiredBackupGenerations {
                     if ($parsedStartedAt.Kind -eq [DateTimeKind]::Utc) {
                         $parsedStartedAt = $parsedStartedAt.ToLocalTime()
                     }
-                    if ($parsedStartedAt -gt [datetime]::MinValue) {
+                    # Будь-який час у перший день (0001-01-01) - це незаданий
+                    # [datetime], а не найстаріша копія: після переходу між
+                    # UTC і локальним часом він може стати MinValue + зсув.
+                    if ($parsedStartedAt.Date -gt [datetime]::MinValue.Date) {
                         $startedAt = $parsedStartedAt
                         $timeKnown = $true
                     }

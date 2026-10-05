@@ -1256,6 +1256,34 @@ function Get-BRAVOFileHash {
             ) `
             -Name "BackupConsistency/ConvertToJsonStartedAtRoundTripStillExpiresByAge" `
             -Failure "startedAt, серіалізований ConvertTo-Json (legacy-формат, $roundTripValue), має лишатися відомим часом: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $roundTripManifest); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
+        # 8j: нульова дата (0001-01-01 - так ConvertTo-Json пише незаданий
+        # [datetime]: "\/Date(-62135596800000)\/", або рядок з Z) - це
+        # невідомий час, а не "найстаріша копія", у будь-якому часовому поясі.
+        # Східніше UTC перехід у локальний час давав би 0001-01-01 + зсув,
+        # що вже більше за MinValue.
+        $zeroTimeRoot = Join-Path $retentionStatusTestRoot 'zero-time'
+        [void](New-BRAVORetentionComponentFixture -Root $zeroTimeRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        [void](New-BRAVORetentionComponentFixture -Root $zeroTimeRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
+        $zeroEpochManifest = New-BRAVORetentionComponentFixture -Root $zeroTimeRoot `
+            -GenerationId '20250701_230000' -StartedAt (Get-Date).AddDays(-640)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $zeroEpochManifest -JsonValue '"\/Date(-62135596800000)\/"' -LastWriteTime (Get-Date).AddDays(-640)
+        $zeroIsoManifest = New-BRAVORetentionComponentFixture -Root $zeroTimeRoot `
+            -GenerationId '20250702_230000' -StartedAt (Get-Date).AddDays(-640)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $zeroIsoManifest -JsonValue '"0001-01-01T00:00:00Z"' -LastWriteTime (Get-Date).AddDays(-640)
+        $zeroTimeOk = Invoke-BRAVORetentionFixtureCleanup -Root $zeroTimeRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $zeroTimeRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $zeroTimeOk -eq $true -and
+                (Test-Path -LiteralPath $zeroEpochManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $zeroTimeRoot 'MODEL') 'MODEL_20250701_230000.mdz')) -and
+                (Test-Path -LiteralPath $zeroIsoManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $zeroTimeRoot 'MODEL') 'MODEL_20250702_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250701_230000: час запуску') -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250702_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/ZeroDateStartedAtIsUnknownInAnyTimeZone" `
+            -Failure "startedAt з датою 0001-01-01 (незаданий [datetime] з ConvertTo-Json чи рядок з Z) має бути невідомим часом: generation не видаляється, WARNING називає її; часовий пояс: $([TimeZoneInfo]::Local.Id); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
     } finally {
         Remove-Item -Path Variable:\global:enableArchiveDeletion, `
             Variable:\global:enableFailedArchiveDeletion, `

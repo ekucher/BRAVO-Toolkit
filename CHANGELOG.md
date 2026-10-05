@@ -23,10 +23,12 @@
   `BackupConsistency/KnownFailedAndIncompleteStatusesStillExpire`,
   `BackupConsistency/NullStartedAtCompleteDoesNotDisplaceProtectedGeneration`,
   `BackupConsistency/EpochStartedAtStillExpiresByAge`,
-  `BackupConsistency/ConvertToJsonStartedAtRoundTripStillExpiresByAge`. Час у форматі
+  `BackupConsistency/ConvertToJsonStartedAtRoundTripStillExpiresByAge`,
+  `BackupConsistency/ZeroDateStartedAtIsUnknownInAnyTimeZone`. Час у форматі
   `\/Date(ms)\/` (як його пише `ConvertTo-Json` Windows PowerShell 5.1) і рядок
   `/Date(ms)/` розбираються як відомий час, тож наявні manifest-и обробляються як раніше.
-  UTC-час переводиться в локальний перед порівнянням з межею зберігання.
+  UTC-час переводиться в локальний перед порівнянням з межею зберігання. Дата 0001-01-01
+  (незаданий `[datetime]`) у будь-якому часовому поясі вважається невідомим часом.
 
 - **Fix: очікувані помилки змодельованих сценаріїв self-test більше не червоні.**
   Сценарії на кшталт `Maintenance/M3-MaintenanceTargetInsufficientBlocks` проганяють
