@@ -30441,7 +30441,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan') { try {
     & $affExpect 'Kelvin module' (& $affPlanPlain @('modules/BRAVO.Dis' + $affKelvin + 'Space/x.psm1')) 'V3|'
     & $affExpect 'Kelvin fragment' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.Dis' + $affKelvin + 'Space.ps1')) 'V3|'
     & $affExpect 'Kelvin leaf module' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @('modules/BRAVO.Lea' + $affKelvin + '/x.psm1') -LeafModuleTable @{ 'Leak' = @{ Owner = 'Paths' } }) 'V3|'
-    & $affExpect 'long s directory' (& $affPlanPlain @(('se' + $affLongS + 'tt').Replace('tt', 'ftest') + '/BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'long s directory' (& $affPlanPlain @($affLongS + 'elftest/BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
     & $affExpect 'Cyrillic fragment name' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.' + $affCyrillicA + 'rchive.ps1')) 'V3|'
     & $affExpect 'Cyrillic document' (& $affPlanPlain @($affCyrillicA + '.md')) 'V3|'
     & $affExpect 'Cyrillic README lookalike' (& $affPlanPlain @('REA' + [string][char]0x0414 + 'ME.md')) 'V3|'
