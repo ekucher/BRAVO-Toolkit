@@ -1175,6 +1175,8 @@ function Get-BRAVOFileHash {
             -Failure "generation зі статусом FAILED або INCOMPLETE (без урахування регістру) з відомим startedAt, старшим за failedArchiveRetentionDays, має видалятися як і раніше"
 
         # 8g: COMPLETE з невідомим часом не займає місце серед N захищених
+        # (сортується останньою, тож це насамперед перевірка, що вона не
+        # видаляється і не витісняє цілу копію)
         # (minimumRetainedVerifiedBackups=2): прострочена, але захищена ціла
         # generation лишається, а сама копія з невідомим часом не видаляється.
         $protectedRoot = Join-Path $retentionStatusTestRoot 'null-time-protected'
@@ -1197,9 +1199,10 @@ function Get-BRAVOFileHash {
             -Name "BackupConsistency/NullStartedAtCompleteDoesNotDisplaceProtectedGeneration" `
             -Failure "COMPLETE з невідомим часом не повинна брати участі у виборі N захищених: валідна прострочена generation, що входить у N найновіших, має лишитися, а копія з невідомим часом - не видалятися"
 
-        # 8h: контроль - startedAt у форматі ConvertTo-Json Windows
-        # PowerShell 5.1 ("\/Date(ms)\/") лишається відомим часом:
-        # прострочена незахищена COMPLETE generation видаляється як і раніше.
+        # 8h: контроль - startedAt як НЕекранований рядок "/Date(ms)/"
+        # (ConvertFrom-Json лишає його рядком, тож працює розбір у retention)
+        # лишається відомим часом: прострочена незахищена COMPLETE generation
+        # видаляється як і раніше.
         $epochRoot = Join-Path $retentionStatusTestRoot 'epoch-time'
         [void](New-BRAVORetentionComponentFixture -Root $epochRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
         [void](New-BRAVORetentionComponentFixture -Root $epochRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
@@ -1207,7 +1210,7 @@ function Get-BRAVOFileHash {
             -GenerationId '20250501_230000' -StartedAt (Get-Date).AddDays(-640)
         $epochStart = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
         $epochMilliseconds = [long]((Get-Date).AddDays(-640).ToUniversalTime() - $epochStart).TotalMilliseconds
-        Set-BRAVORetentionManifestStartedAt -ManifestPath $epochManifest -JsonValue ('"\/Date(' + $epochMilliseconds + ')\/"') -LastWriteTime (Get-Date)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $epochManifest -JsonValue ('"/Date(' + $epochMilliseconds + ')/"') -LastWriteTime (Get-Date)
         $epochOk = Invoke-BRAVORetentionFixtureCleanup -Root $epochRoot -StrictMode `
             -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $epochRoot)
         Test-BRAVOCondition `
@@ -1218,7 +1221,32 @@ function Get-BRAVOFileHash {
                 -not (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250501_230000: час запуску')
             ) `
             -Name "BackupConsistency/EpochStartedAtStillExpiresByAge" `
-            -Failure "startedAt у форматі \/Date(ms)\/ (ConvertTo-Json Windows PowerShell 5.1) має розбиратися як відомий час: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $epochManifest)"
+            -Failure "startedAt як рядок /Date(ms)/ має розбиратися як відомий час: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $epochManifest)"
+
+        # 8i: наскрізно - startedAt серіалізовано тим самим ConvertTo-Json, що
+        # й writer manifest-а (у Windows PowerShell 5.1 це "\/Date(ms)\/", який
+        # ConvertFrom-Json повертає як [datetime]): час відомий, прострочена
+        # незахищена COMPLETE generation видаляється як і раніше.
+        $roundTripRoot = Join-Path $retentionStatusTestRoot 'round-trip-time'
+        [void](New-BRAVORetentionComponentFixture -Root $roundTripRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        [void](New-BRAVORetentionComponentFixture -Root $roundTripRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
+        $roundTripManifest = New-BRAVORetentionComponentFixture -Root $roundTripRoot `
+            -GenerationId '20250601_230000' -StartedAt (Get-Date).AddDays(-640)
+        $roundTripJson = ([ordered]@{ startedAt = [datetime]::Now.AddDays(-640) } | ConvertTo-Json -Compress)
+        $roundTripValue = [regex]::Match($roundTripJson, '^\{"startedAt":(.+)\}$').Groups[1].Value
+        if ([string]::IsNullOrEmpty($roundTripValue)) { throw "ConvertTo-Json дав неочікуваний формат: $roundTripJson" }
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $roundTripManifest -JsonValue $roundTripValue -LastWriteTime (Get-Date)
+        $roundTripOk = Invoke-BRAVORetentionFixtureCleanup -Root $roundTripRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $roundTripRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $roundTripOk -eq $true -and
+                -not (Test-Path -LiteralPath $roundTripManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path (Join-Path $roundTripRoot 'MODEL') 'MODEL_20250601_230000.mdz')) -and
+                -not (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250601_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/ConvertToJsonStartedAtRoundTripStillExpiresByAge" `
+            -Failure "startedAt, серіалізований ConvertTo-Json як у writer manifest-а ($roundTripValue), має лишатися відомим часом: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $roundTripManifest)"
     } finally {
         Remove-Item -Path Variable:\global:enableArchiveDeletion, `
             Variable:\global:enableFailedArchiveDeletion, `

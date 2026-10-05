@@ -21,7 +21,11 @@
   `BackupConsistency/RunningStatusOlderThanFailedRetentionIsKeptAndWarns`,
   `BackupConsistency/EmptyStatusIsKeptAndWarns`,
   `BackupConsistency/KnownFailedAndIncompleteStatusesStillExpire`,
-  `BackupConsistency/NullStartedAtCompleteDoesNotDisplaceProtectedGeneration`.
+  `BackupConsistency/NullStartedAtCompleteDoesNotDisplaceProtectedGeneration`,
+  `BackupConsistency/EpochStartedAtStillExpiresByAge`,
+  `BackupConsistency/ConvertToJsonStartedAtRoundTripStillExpiresByAge`. Час у форматі
+  `\/Date(ms)\/` (як його пише `ConvertTo-Json` Windows PowerShell 5.1) і рядок
+  `/Date(ms)/` розбираються як відомий час, тож наявні manifest-и обробляються як раніше.
 
 - **Fix: очікувані помилки змодельованих сценаріїв self-test більше не червоні.**
   Сценарії на кшталт `Maintenance/M3-MaintenanceTargetInsufficientBlocks` проганяють
