@@ -2,6 +2,39 @@
 
 ## Не випущено (developer)
 
+- **Fix: реальний `-Suite X` більше не завершується `SELF-TEST FAILED`; контракт `-Suite` і мапа
+  «змінений файл -> suite» закріплені тестами (VAL-04a, VAL-02a).**
+  Три Framework-перевірки стану ПОВНОГО прогону (`Framework/FullCanonicalRunIsDefault`,
+  `Framework/FullRunEnablesEverySuite`, `Framework/SuiteSelectionProbeRestoresState`) були
+  безумовними, тож у `-Suite X` давали `[FAIL]`: успішний вибірковий прогін (код 0 і
+  `SELF-TEST PARTIAL`) був недосяжним. Тепер вони стоять у тілі
+  `if ($null -eq $script:BRAVOSelfTestSelectedSuite)`; сама проба предиката лишається
+  безумовною. У повному прогоні набір перевірок не змінився. Формулу коду завершення, маркери
+  `SELF-TEST PASSED`/`PARTIAL`/`FAILED`, `ci.yml` і саму мапу шляхів не змінено.
+  Нова корінна секція `Tail/Framework.SuiteSelectionContract` (між
+  `Tail/Framework.SelectiveSuitesHaveNoCrossSuiteDependency` і `Tail/Framework.SectionIsolation`):
+  `Framework/SuiteSelectionContract.FullOnlyAssertionsAreGatedOnFullRun` (AST),
+  `.ParamDeclaration`, `.CatalogShapeIsDeterministic`, `.CatalogEntriesHaveFragmentFiles`,
+  `.AbsentOrEmptyMeansFull`, `.SingleSuiteSelected`, `.MultiSuiteKeepsRequestOrder`,
+  `.DuplicatesAndCaseCollapse`, `.UnknownSuiteThrowsExactMessage`,
+  `.UnknownSuiteListsOnlyUnknownAndNeverPartiallySelects`, `.NonSelectableNamesAreUnknown`,
+  `.UnknownThrowIsUncaughtTopLevel`, `.UnknownSuiteExitsNonZeroUnderFile`,
+  `.FileInvocationCommaFormNeverSilentlyMisselects`, `.SelectiveSummaryTextIsPinned`,
+  `.ExitCodeIndependentOfSelectionMode`, `.RootGuardsAreNeverSuiteGated`. Розбір `-Suite`
+  перевіряється кодом, витягнутим з реального файлу, у дочірніх процесах (один процес на багато
+  входів і два запуски через `-File`); тимчасові файли прибираються у `finally`.
+  `Framework/SectionIsolation.SelectiveCleanRunPrintsPartialNotPassed` (новий сценарій
+  `SelectivePass`) доводить код 0 і `SELF-TEST PARTIAL`, але не `SELF-TEST PASSED`.
+  Мапу закріплено групою `Framework/ChangedPathMap.*` з точним порівнянням замість
+  `-contains`: `.FragmentsMapExactlyAndOnlyToThemselves`, `.FragmentsOutsideCatalogMapToNothing`,
+  `.ModuleTableIsPinned`, `.ModulePrefixDoesNotLeak`, `.NonCodeAndInfraPathsMapToNothing`,
+  `.EmptyAndNullInputNeverReturnsSuite`, `.ResultShapeNeedsArrayWrapping`,
+  `.NeverReturnsMoreThanOneSuiteOrUnknownName`, `.CurrentLooseMatchingIsRecorded`. Для `-File ...
+  -Suite 'Paths,Archive'` і для `$null` у мапі допустимі два результати, закодовані як «одне з двох».
+  Не перевірено локально: у середовищі немає Windows PowerShell; канонічний повний прогін і
+  ручний `powershell.exe -NoProfile -File .\BRAVO_SELF_TEST.ps1 -NoPause -Suite Paths`
+  (очікується код 0 і `SELF-TEST PARTIAL: Paths`) виконуються в Windows CI.
+
 - **Fix: retention не видаляє резервну копію з невідомим часом запуску чи невідомим статусом (латентні L1/L2).**
   У `Remove-BRAVOExpiredBackupGenerations` явний `"startedAt": null` перетворювався на
   `0001-01-01` (`[datetime]$null`), через що така копія вважалась найстарішою: невдала
