@@ -1231,10 +1231,11 @@ function Get-BRAVOFileHash {
             -Name "BackupConsistency/EpochStartedAtStillExpiresByAge" `
             -Failure "startedAt як рядок /Date(ms)/ має розбиратися як відомий час: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $epochManifest); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
 
-        # 8i: наскрізно - startedAt серіалізовано тим самим ConvertTo-Json, що
-        # й writer manifest-а (у Windows PowerShell 5.1 це "\/Date(ms)\/", який
-        # ConvertFrom-Json повертає як [datetime]): час відомий, прострочена
-        # незахищена COMPLETE generation видаляється як і раніше.
+        # 8i: наскрізно - startedAt як [datetime], серіалізований ConvertTo-Json
+        # (legacy-формат: у Windows PowerShell 5.1 це "\/Date(ms)\/", який
+        # ConvertFrom-Json повертає як [datetime]; поточні writer-и пишуть
+        # ToString('o')): час відомий, прострочена незахищена COMPLETE
+        # generation видаляється як і раніше.
         $roundTripRoot = Join-Path $retentionStatusTestRoot 'round-trip-time'
         [void](New-BRAVORetentionComponentFixture -Root $roundTripRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
         [void](New-BRAVORetentionComponentFixture -Root $roundTripRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
@@ -1254,7 +1255,7 @@ function Get-BRAVOFileHash {
                 -not (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250601_230000: час запуску')
             ) `
             -Name "BackupConsistency/ConvertToJsonStartedAtRoundTripStillExpiresByAge" `
-            -Failure "startedAt, серіалізований ConvertTo-Json як у writer manifest-а ($roundTripValue), має лишатися відомим часом: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $roundTripManifest); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
+            -Failure "startedAt, серіалізований ConvertTo-Json (legacy-формат, $roundTripValue), має лишатися відомим часом: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $roundTripManifest); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
     } finally {
         Remove-Item -Path Variable:\global:enableArchiveDeletion, `
             Variable:\global:enableFailedArchiveDeletion, `

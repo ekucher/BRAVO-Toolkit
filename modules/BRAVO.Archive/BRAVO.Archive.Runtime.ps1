@@ -1705,8 +1705,7 @@ function Remove-BRAVOExpiredBackupGenerations {
                         $startedAtText = [string]$startedAtProperty.Value
                         # Формат ConvertTo-Json Windows PowerShell 5.1 для
                         # [datetime] ("\/Date(ms)\/"), якщо ConvertFrom-Json
-                        # лишив його рядком: мілісекунди від епохи UTC (Kind=Utc,
-                        # як і DateTime, який повертає ConvertFrom-Json).
+                        # лишив його рядком: мілісекунди від епохи UTC.
                         $epochMatch = [regex]::Match($startedAtText, '^/Date\((-?\d+)(?:[+-]\d{4})?\)/$')
                         if ($epochMatch.Success) {
                             $epochMilliseconds = [long]0
@@ -1721,6 +1720,12 @@ function Remove-BRAVOExpiredBackupGenerations {
                                 [ref]$parsedStartedAt)) {
                             $parsedStartedAt = [datetime]::MinValue
                         }
+                    }
+                    # Cutoff рахується від локального (Get-Date), а порівняння
+                    # DateTime ігнорує Kind: UTC-значення (епоха чи DateTime з
+                    # ConvertFrom-Json) переводиться в локальний час.
+                    if ($parsedStartedAt.Kind -eq [DateTimeKind]::Utc) {
+                        $parsedStartedAt = $parsedStartedAt.ToLocalTime()
                     }
                     if ($parsedStartedAt -gt [datetime]::MinValue) {
                         $startedAt = $parsedStartedAt
