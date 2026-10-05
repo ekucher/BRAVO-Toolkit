@@ -365,7 +365,7 @@ Root script залишається стабільним entrypoint для опе
 
 ## 7. Модель залежностей suites
 
-Affected execution потребує явної карти production ownership → validation ownership. Наявний канонічний власник такої карти — `Get-BRAVOSelfTestSuiteForChangedPath` у `BRAVO_SELF_TEST.ps1` (порожній результат означає «невідомо → повний прогін»); друга карта заборонена.
+Affected execution потребує явної карти production ownership → validation ownership. Канонічний власник такої карти — `selftest/BRAVOSelfTestSuiteMap.ps1`: каталог `-Suite`, підказка `Get-BRAVOSelfTestSuiteForChangedPath` (порожній результат означає «невідомо → повний прогін») і план `Get-BRAVOSelfTestAffectedPlan`; `BRAVO_SELF_TEST.ps1` лише dot-source-ить цей файл після перевірки цілісності `RUNTIME_MANIFEST.json` і до розбору `-Suite`. Друга карта заборонена.
 
 ```text
 змінений компонент
@@ -388,6 +388,20 @@ Affected execution потребує явної карти production ownership �
 Карта повинна зберігатися в репозиторії, бути придатною для рев'ю та детермінованою. За неоднозначного ownership вона повинна обирати ширшу валідацію.
 
 Не створювати статичний список `Fast` як заміну dependency ownership.
+
+### 7.1 Правила класів у плані Affected
+
+План (`Get-BRAVOSelfTestAffectedPlan`) — чиста функція; його клас є **мінімальним за картою шляхів**, а не класифікацією PR, і ніколи не є acceptance (`IsAcceptanceEvidence = $false`). Класифікація PR за §5 лишається обов'язковою й може підвищити клас.
+
+- **V0 план не видає ніколи.** Документ поза вхідним набором Governance механічно довести неможливо (`Documentation/RelativeLinksResolve` читає всі tracked `*.md`), а runner не друкує «Full не потрібен».
+- **Невідомий шлях → V3 і `Suite = @()`.** Змішаний набір відомих і невідомих шляхів теж V3: запускати лише відомі suite небезпечно. Некоректний шлях (порожній, змінюваний `Trim`, абсолютний, з сегментами `..`, `.` чи порожніми) → V3; вхід ніколи не обрізається.
+- **Governance** (shared-contract) додається до union завжди, коли клас нижчий за V3; union упорядковано за каталогом.
+- **V2 лише для** каталожних фрагментів `selftest/BRAVO_SELF_TEST.<Ім'я>.ps1` (suite = однойменний) і **leaf-модулів** (owner + dependents). Leaf-модуль — модуль без вхідних ребер від не-фрагментів (інших модулів, `BRAVO_CONFIG_LOADER.ps1`, кореневих `BRAVO_*.ps1`, `deploy/*.ps1`, `ci/*.ps1`); інваріант стереже AST-guard `Framework/AffectedPlan.LeafModulesHaveNoNonFragmentInboundEdge`, який також відмовляє (fail closed) за динамічного складання імені модуля. На базі `18137d9` усі модулі з suite мають такі ребра, тож таблиця leaf-модулів порожня й будь-яка зміна модуля дає V3. Видалений фрагмент → V3.
+- **Супутній `RUNTIME_MANIFEST.json`** (похідний артефакт, регенерується після зміни будь-якого `.ps1/.psm1/.psd1`): якщо обидва тексти — коректний JSON, верхній рівень і поля `schemaVersion`, `description`, `updateProcedure` ідентичні, а кожен доданий, видалений чи змінений запис `files` (без регістру, `\` → `/`) є шляхом змінених файлів, маніфест — супутник, що дає **щонайменше V2** (навіть з порожньою розібраною дельтою) і gate «Integrity manifests are current». Інакше, а також якщо маніфест єдиний у наборі, — V3. `Tools/TOOLS_MANIFEST.json` і `VERSION.json` завжди V3.
+- **Таблиця споживаних документів** (клас V1 із своїми споживачами): `README.md`, `SECURITY.md`, `RELEASE_CHECKLIST.md`, `RELEASE_POLICY.md`, `THREAT_MODEL.md`, `PROJECT.md`, `deploy/README.md` → Governance; `OPERATIONS.md` → Governance, DataRestore; `BRAVO_SETUP.md` → Governance, ConfigLoader; `CHANGELOG.md` → Governance. Для `README.md`, `BRAVO_SETUP.md`, `CHANGELOG.md` додається gate Release policy. Будь-який інший `*.md` (зокрема `docs/**`) → V3.
+- **База порівняння (контракт збирача, PR2):** `merge-base(Base, HEAD)` з робочим деревом, untracked-файли включено; `git diff --no-renames --name-status -z` (rename дає обидва шляхи, видалення включено); шляхи не обрізаються; shallow-репозиторій, збій будь-якої команди git (зокрема `git status`) і порожній diff — помилка, а не порожній прогін.
+
+Деталі реалізації й матриця тестів — у VAL-05 нижче.
 
 ## 8. Post-Install Verification
 
@@ -561,7 +575,7 @@ Self-Test evolution    Installer MVP
 
 ### VAL-05 — Affected: карта та виконуваний інтерфейс
 
-Характеризувати й розширити наявного власника `Get-BRAVOSelfTestSuiteForChangedPath`; друга карта заборонена. Якщо власника переносять, споживачів і характеризаційні перевірки (`Framework/ChangedFragmentMapsToItsOwnSuite`, `ChangedModuleMapsToSuiteOfSameDomain`, `ChangedPathHintNeverGuesses`) мігрувати в тому ж пакеті.
+Характеризувати й розширити наявного власника `Get-BRAVOSelfTestSuiteForChangedPath`; друга карта заборонена. PR1 виносить каталог, підказку й план у `selftest/BRAVOSelfTestSuiteMap.ps1` (правила класів — §7.1) разом з міграцією споживачів і тестів `Framework/ChangedPathMap.*` та проб `-Suite`; git-збирач і runner — окремі PR. Якщо власника переносять, споживачів і характеризаційні перевірки (`Framework/ChangedFragmentMapsToItsOwnSuite`, `ChangedModuleMapsToSuiteOfSameDomain`, `ChangedPathHintNeverGuesses`) мігрувати в тому ж пакеті.
 
 Карта:
 

@@ -2,6 +2,37 @@
 
 ## Не випущено (developer)
 
+- **Feat: мапа «змінений шлях -> suite» і консервативний план Affected винесені у `selftest/BRAVOSelfTestSuiteMap.ps1` (VAL-05, PR1 з трьох).**
+  Каталог `-Suite` (дослівно), `Get-BRAVOSelfTestSuiteForChangedPath` і нові чисті функції
+  `Get-BRAVOSelfTestAffectedPlan`, `Test-BRAVOSelfTestRuntimeManifestCompanion`,
+  `Get-BRAVOSelfTestLeafModuleTable` (порожня на цій базі), `Get-BRAVOSelfTestConsumedDocumentTable`
+  живуть в одному файлі, який `BRAVO_SELF_TEST.ps1` dot-source-ить після перевірки цілісності
+  `RUNTIME_MANIFEST.json` і до розбору `-Suite`; ім'я файлу не збігається з
+  `BRAVO_SELF_TEST.<Ім'я>.ps1`, тож він не є фрагментом. Поведінка `-Suite`, маркери, коди завершення і
+  `ci.yml` не змінені; виконуваного режиму Affected (git-збирач, runner) ще немає — це PR2/PR3.
+  План повертає клас лише V1/V2/V3 (V0 не видається ніколи), мітку «мінімальний клас за картою
+  шляхів» і `IsAcceptanceEvidence = $false`; невідомий чи змішаний набір шляхів дає V3 і порожній
+  `Suite`; Governance входить до union нижче V3; union упорядковано за каталогом. Супутній
+  `RUNTIME_MANIFEST.json` без доведеної дельти `files` не підвищує клас до V3, але дає щонайменше
+  V2. Документи з таблиці споживаних (`README.md`, `CHANGELOG.md`, `OPERATIONS.md` тощо) мають V1,
+  будь-який інший `*.md` — V3.
+  Мапа посилена (поведінка підказки змінилась свідомо): шлях більше не обрізається (`Trim`), абсолютні
+  шляхи, сегменти `..`, `.` чи порожні й двійники префікса (`xselftest\...`) дають порожній результат,
+  модуль береться повним сегментом каталогу з явної таблиці (`BRAVO.Archive.Legacy` більше не Archive),
+  а голий `modules\BRAVO.DiskSpace` без роздільника не відображається. Відповідно оновлено тести
+  `Framework/ChangedPathMap.FragmentsMapExactlyAndOnlyToThemselves`, `.ModuleTableIsPinned`,
+  `.ModulePrefixDoesNotLeak`; `.CurrentLooseMatchingIsRecorded` перейменовано на
+  `.RulesAreAnchoredAtPathStart`; додано `.InvalidPathFormsMapToNothing`. Проби `-Suite` беруть
+  присвоєння каталогу з AST файлу мапи.
+  Нова корінна секція `Tail/Framework.AffectedPlan` (після `Tail/Framework.SuiteSelectionContract`):
+  `Framework/AffectedPlan.*` — рядки матриці B (1-6, 3a-3e, 9a, 11-12, 19-26, 20a-20e, 29-36, 45-47),
+  статичні guard-и (файл мапи чистий і володіє лише каталогом, не містить V0, має BOM і CRLF, підключений
+  коренем у правильному місці; AST-guard вхідних ребер leaf-модулів зі синтетичним негативним
+  контролем, покриття споживачів, залежні suite з каталогу, наявність документів) і перевірка, що
+  підказка gate Config parity покриває канонічні шаблони `ci/Test-BRAVOConfigParityRelevantPath.ps1`.
+  Не перевірено локально: у середовищі немає Windows PowerShell; канонічний повний прогін
+  `.\BRAVO_SELF_TEST.ps1 -NoPause` виконується в Windows CI.
+
 - **Fix: реальний `-Suite X` більше не завершується `SELF-TEST FAILED`; контракт `-Suite` і мапа
   «змінений файл -> suite» закріплені тестами (VAL-04a, VAL-02a).**
   Три Framework-перевірки стану ПОВНОГО прогону (`Framework/FullCanonicalRunIsDefault`,
