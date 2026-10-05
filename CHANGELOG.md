@@ -2,6 +2,27 @@
 
 ## Не випущено (developer)
 
+- **Fix: retention не видаляє резервну копію з невідомим часом запуску чи невідомим статусом (латентні L1/L2).**
+  У `Remove-BRAVOExpiredBackupGenerations` явний `"startedAt": null` перетворювався на
+  `0001-01-01` (`[datetime]$null`), через що така копія вважалась найстарішою: невдала
+  видалялась у першому ж прогоні, а ціла COMPLETE випадала з N захищених і видалялась як
+  прострочена. Нерозбірливий `startedAt` підміняв час `LastWriteTime` файлу manifest-а, який
+  міг дозволити видалення. Крім того, будь-який наявний статус, окрім COMPLETE (порожній,
+  `RUNNING`, значення від майбутньої версії), потрапляв у гілку `failedArchiveRetentionDays`.
+  Тепер запис із відсутнім, `null`, порожнім чи нерозбірливим `startedAt` (`TimeKnown=$false`)
+  не видаляється жодною гілкою, не бере участі у виборі N захищених і дає WARNING з
+  номером generation; `LastWriteTime` видалення не дозволяє. Гілка невдалих застосовується
+  лише до статусів `FAILED` і `INCOMPLETE` (без урахування регістру); інший не-COMPLETE
+  статус зберігається з WARNING. Поведінку COMPLETE, повідомлення наявних логів і
+  підсумковий аудит не змінено. Нові перевірки (під `Set-StrictMode -Version 2.0`):
+  `BackupConsistency/CompleteWithNullStartedAtIsNeverDeletedAndWarns`,
+  `BackupConsistency/FailedWithNullStartedAtIsNeverDeletedAndWarns`,
+  `BackupConsistency/UnparseableStartedAtIsNotDeletedByFileTime`,
+  `BackupConsistency/RunningStatusOlderThanFailedRetentionIsKeptAndWarns`,
+  `BackupConsistency/EmptyStatusIsKeptAndWarns`,
+  `BackupConsistency/KnownFailedAndIncompleteStatusesStillExpire`,
+  `BackupConsistency/NullStartedAtCompleteDoesNotDisplaceProtectedGeneration`.
+
 - **Fix: очікувані помилки змодельованих сценаріїв self-test більше не червоні.**
   Сценарії на кшталт `Maintenance/M3-MaintenanceTargetInsufficientBlocks` проганяють
   справжній `Write-Log`, і очікувані в них ERROR/WARNING («ПОМИЛКА: Недостатньо вільного
