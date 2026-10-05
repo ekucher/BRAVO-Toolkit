@@ -421,7 +421,7 @@ Post-Install Verify відповідає на питання:
 - готовність logging/state paths;
 - безпечні для production smoke-перевірки entrypoint/runtime.
 
-Перевірки шляхів, прав, credentials і smoke-перевірки виконуються під ідентичністю, налаштованою для запланованих завдань (`schedulerSettings.LogonType`; за замовчуванням `NT AUTHORITY\SYSTEM`), повторно використовуючи наявний механізм `BRAVO_SETUP.ps1 -ValidateOnly`, який читає Credential Manager від цієї ідентичності через короткочасне завдання. Перевірки під обліковим записом інсталятора звітуються окремо й не дають READY.
+Ідентичність запланованих завдань визначає `schedulerSettings.RunAsUser` (див. `BRAVO_CREDENTIALS_SETUP.ps1`); `LogonType` лише обирає спосіб автентифікації. Сьогодні `BRAVO_SETUP.ps1 -ValidateOnly` делегує цій ідентичності тільки перевірку credentials (через короткочасне завдання), а безпечний тестовий прогін доступу/smoke виконує під обліковим записом того, хто запустив інсталятор. Тому Post-Install Verify повинен виконувати **кожну** операційну перевірку (шляхи, права, credentials, smoke) у worker-і під ідентичністю `RunAsUser`, розширивши наявний механізм короткочасного завдання, а не створюючи другий. Доки цього немає, перевірки під обліковим записом інсталятора звітуються окремо, а результат — не READY.
 
 ### 8.2 Safety contract
 
@@ -669,7 +669,7 @@ Self-Test evolution    Installer MVP
 
 Evidence має містити фактичну команду, exit code та key result.
 
-Full валідний лише якщо: exit 0, маркер `SELF-TEST PASSED`, 0 рядків `[НЕДОСТУПНО]`, 0 перерваних/пропущених секцій і всі required checks зелені на exact SHA: `Parser / BOM / JSON`, `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`, `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1` (та релевантні `Config parity (BRAVO_CONFIG_LOADER)` тощо). Exit 0 і маркер недостатні: `[НЕДОСТУПНО]` не входить у failures, тож за обмежень хоста Self-Test друкує `SELF-TEST PASSED` з exit 0, але такий прогін не є повним прийманням. Наявність `[НЕДОСТУПНО]` на required checks інвалідує Full acceptance.
+Full валідний лише якщо: exit 0, маркер `SELF-TEST PASSED`, 0 рядків `[НЕДОСТУПНО]`, 0 перерваних/пропущених секцій і всі required checks зелені на exact SHA: увесь канонічний перелік із `RELEASE_POLICY.md` §13.3 (`Parser / BOM / JSON`, `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`, `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`, `Secret scanning (gitleaks)`, `GitGuardian Security Checks`) плюс умовні перевірки, коли вони запускаються (наприклад `Config parity (BRAVO_CONFIG_LOADER)`). Перелік читається з канонічної політики, а не копіюється сюди як окреме джерело; відсутня чи не запущена required-перевірка інвалідує acceptance. Exit 0 і маркер недостатні: `[НЕДОСТУПНО]` не входить у failures, тож за обмежень хоста Self-Test друкує `SELF-TEST PASSED` з exit 0, але такий прогін не є повним прийманням. Наявність `[НЕДОСТУПНО]` на required checks інвалідує Full acceptance.
 
 Оцінка: приблизно 0,5 робочого дня.
 
@@ -713,9 +713,11 @@ Tracks можуть виконуватися незалежно після ви�
 
 ```text
 VAL-07 ----+
-           +--> INS-03
+           +--> INS-03 -> ACC-01 -> ACC-02 -> ACC-03 за потреби
 INS-02 ----+
 ```
+
+INS-02/INS-03 змінюють поведінку розгортання, тому це V3: Installer MVP, доставлений незалежно від Wave 4, проходить власний acceptance-шлях на exact SHA (Full за ACC-01, спеціалізована перевірка Installer/Post-Install Verify, незалежне рев'ю ACC-02, ACC-03 за потреби) і не вважається завершеним без нього. Цей шлях не чекає на VAL-08–VAL-10.
 
 Орієнтир: 2–4 робочі дні залежно від scope Installer.
 
