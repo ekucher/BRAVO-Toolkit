@@ -30902,6 +30902,686 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan') { try {
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan' } }
 
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath') { try {
+
+# ============================================================
+# VAL-05 (Affected), PR2: git-збирач змінених шляхів.
+#
+# Канонічний власник - ci\BRAVOChangedPath.ps1 (Invoke-BRAVOGitCommand,
+# Get-BRAVOChangedPathSet). Секція перевіряє контракт бази порівняння
+# (merge-base -> робоче дерево, untracked включно, rename дає обидва
+# шляхи, видалення окремо) і головний інваріант: збій git НІКОЛИ не
+# стає порожнім набором шляхів (fail closed).
+#
+# Позначення: [I] - ін'єкція -GitInvoker (git не потрібен); [T] -
+# тимчасовий репозиторій під TEMP з вигаданою ідентичністю; [R] -
+# статичний guard файлу. Якщо git недоступний, [T]-перевірки
+# звітують [НЕДОСТУПНО] тим самим механізмом, що й решта комплекту
+# (-EnvironmentLimitation з названою причиною), а не мовчки проходять.
+# Змінні лишаються в межах & { }: нічого нового не читається коренем.
+# ============================================================
+& {
+    $cpPath = Join-Path $root 'ci\BRAVOChangedPath.ps1'
+    $cpText = ''
+    if ([IO.File]::Exists($cpPath)) {
+        . $cpPath
+        $cpText = [IO.File]::ReadAllText($cpPath, [Text.Encoding]::UTF8)
+    }
+    $cpReady = (
+        $null -ne (Get-Command -Name 'Invoke-BRAVOGitCommand' -CommandType Function -ErrorAction SilentlyContinue) -and
+        $null -ne (Get-Command -Name 'Get-BRAVOChangedPathSet' -CommandType Function -ErrorAction SilentlyContinue))
+    Test-BRAVOCondition `
+        -Condition $cpReady `
+        -Name "Framework/AffectedChangedPath.FunctionsExist" `
+        -Failure "ci\BRAVOChangedPath.ps1 мусить існувати й визначати Invoke-BRAVOGitCommand та Get-BRAVOChangedPathSet (канонічний git-збирач Affected); файл знайдено: $([IO.File]::Exists($cpPath))"
+
+    if ($cpReady) {
+        $cpNul = [string][char]0
+        $cpSha1 = 'a' * 40
+        $cpSha2 = 'b' * 40
+        $cpMismatch = New-Object System.Collections.Generic.List[string]
+        $cpCheck = {
+            param([string]$Id, [bool]$Condition)
+            if (-not $Condition) { [void]$cpMismatch.Add($Id) }
+        }
+        $cpTake = {
+            $taken = [string]::Join('; ', @($cpMismatch.ToArray() | Select-Object -First 8))
+            $cpMismatch.Clear()
+            return $taken
+        }
+        $cpHas = {
+            param($Set, [string]$Value)
+            foreach ($member in @($Set)) {
+                if ([string]::Equals([string]$member, $Value, [StringComparison]::Ordinal)) { return $true }
+            }
+            return $false
+        }
+
+        # --- [I]: fake-git за ін'єкцією -GitInvoker ----------------------------
+        $cpFakeRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_CHANGEDPATH_FAKE_' + [guid]::NewGuid().ToString('N'))
+        $cpEmptyRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_CHANGEDPATH_EMPTY_' + [guid]::NewGuid().ToString('N'))
+        $cpManifestCurrent = '{"current":true}'
+        $cpFakeCalls = New-Object System.Collections.Generic.List[string]
+        $cpFakeResponses = @{}
+        $cpFakeKind = {
+            param([string[]]$Argument)
+            if ($Argument -contains 'diff') { return 'diff' }
+            if ($Argument -contains 'ls-files') { return 'untracked' }
+            if ($Argument -contains 'status') { return 'status' }
+            if ($Argument -contains 'merge-base') { return 'mergebase' }
+            if ($Argument -contains 'show') { return 'show' }
+            if ($Argument -contains '--show-toplevel') { return 'toplevel' }
+            if ($Argument -contains '--is-shallow-repository') { return 'shallow' }
+            if ($Argument -contains 'HEAD^{commit}') { return 'head' }
+            return 'base'
+        }
+        $cpFakeDefaults = {
+            return @{
+                toplevel  = @{ ExitCode = 0; StdOut = ($cpFakeRoot + "`n"); StdErr = '' }
+                shallow   = @{ ExitCode = 0; StdOut = "false`n"; StdErr = '' }
+                base      = @{ ExitCode = 0; StdOut = ($cpSha1 + "`n"); StdErr = '' }
+                head      = @{ ExitCode = 0; StdOut = ($cpSha2 + "`n"); StdErr = '' }
+                mergebase = @{ ExitCode = 0; StdOut = ($cpSha1 + "`n"); StdErr = '' }
+                diff      = @{ ExitCode = 0; StdOut = ('M' + $cpNul + 'docs/a.md' + $cpNul); StdErr = '' }
+                untracked = @{ ExitCode = 0; StdOut = ('docs/b.md' + $cpNul); StdErr = '' }
+                show      = @{ ExitCode = 0; StdOut = '{"base":true}'; StdErr = '' }
+                status    = @{ ExitCode = 0; StdOut = (' M docs/a.md' + $cpNul); StdErr = '' }
+            }
+        }
+        # Відповідь-рядок означає виняток запуску (симуляція Process.Start).
+        $cpFakeInvoker = {
+            param([string[]]$Argument)
+            [void]$cpFakeCalls.Add([string]::Join(' ', $Argument))
+            $fakeKind = & $cpFakeKind $Argument
+            $fakeResponse = $cpFakeResponses[$fakeKind]
+            if ($fakeResponse -is [string]) { throw $fakeResponse }
+            return $fakeResponse
+        }
+        $cpRun = {
+            param([hashtable]$Override = @{}, [string]$BaseRef = 'main', [string]$Root = $cpFakeRoot)
+            $cpFakeCalls.Clear()
+            $cpFakeResponses = & $cpFakeDefaults
+            foreach ($overrideKey in @($Override.Keys)) { $cpFakeResponses[$overrideKey] = $Override[$overrideKey] }
+            return (Get-BRAVOChangedPathSet -RepositoryRoot $Root -BaseRef $BaseRef -GitInvoker $cpFakeInvoker)
+        }
+        $cpReply = {
+            param([int]$Code, [string]$Out = '', [string]$Err = '')
+            return @{ ExitCode = $Code; StdOut = $Out; StdErr = $Err }
+        }
+
+        try {
+            [void][IO.Directory]::CreateDirectory($cpFakeRoot)
+            [void][IO.Directory]::CreateDirectory($cpEmptyRoot)
+            [IO.File]::WriteAllText((Join-Path $cpFakeRoot 'RUNTIME_MANIFEST.json'), $cpManifestCurrent, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+
+            # C6: порожня база - жодного виклику git.
+            foreach ($cpMissing in @('', '  ', [string]$null, "`t", "`r`n")) {
+                $cpResult = & $cpRun @{} $cpMissing
+                & $cpCheck ('missing[' + $cpMissing.Length + ']') ($cpResult.Status -ceq 'BASE-MISSING' -and $cpFakeCalls.Count -eq 0)
+            }
+            $cpProblem = & $cpTake
+            Test-BRAVOCondition `
+                -Condition ($cpProblem.Length -eq 0) `
+                -Name "Framework/AffectedChangedPath.MissingBaseNeverCallsGit" `
+                -Failure ("порожній BaseRef (порожній рядок, пробіли, `$null) мусить давати BASE-MISSING без жодного виклику git: " + $cpProblem)
+
+            # C5 [I]: форма BaseRef поза allowlist - BASE-INVALID до будь-якого виклику git.
+            foreach ($cpInvalid in @('-x', '--help', '--output=x', 'a b', 'a;b', ' main', 'main ', "main`n", 'a|b', 'a$b', 'a"b', "a`0b", 'a\b', 'a`b', 'a&b', 'a*b', 'a:b')) {
+                $cpResult = & $cpRun @{} $cpInvalid
+                & $cpCheck ('invalid[' + $cpInvalid.Replace("`n", '\n').Replace("`0", '\0') + ']') ($cpResult.Status -ceq 'BASE-INVALID' -and $cpFakeCalls.Count -eq 0)
+            }
+            foreach ($cpValid in @('main', 'origin/main', 'HEAD~1', 'HEAD^', 'v1.2.3', '@{u}', 'feature/x-y_z.1', 'a1b2c3d')) {
+                $cpResult = & $cpRun @{} $cpValid
+                & $cpCheck ('valid[' + $cpValid + ']') ($cpResult.Status -ceq 'Ok')
+            }
+            $cpResult = & $cpRun @{ base = (& $cpReply 1) } 'no-such-ref'
+            & $cpCheck 'base exit 1' ($cpResult.Status -ceq 'BASE-INVALID')
+            $cpProblem = & $cpTake
+            Test-BRAVOCondition `
+                -Condition ($cpProblem.Length -eq 0) `
+                -Name "Framework/AffectedChangedPath.InvalidBaseRefNeverReachesGit" `
+                -Failure ("BaseRef поза allowlist (початок з '-', пробіли, метасимволи, `\`) мусить давати BASE-INVALID без виклику git, допустимі форми проходять, а код 1 від rev-parse --verify означає BASE-INVALID: " + $cpProblem)
+
+            # Фіксований контракт викликів: порядок, прапорці, відсутність 2>&1 тощо.
+            $cpResult = & $cpRun @{} 'main'
+            $cpExpectedCalls = @(
+                'rev-parse --show-toplevel',
+                'rev-parse --is-shallow-repository',
+                'rev-parse --verify --quiet main^{commit}',
+                'rev-parse --verify --quiet HEAD^{commit}',
+                ('merge-base ' + $cpSha1 + ' ' + $cpSha2),
+                ('-c core.quotepath=off diff --no-renames --name-status -z --no-ext-diff ' + $cpSha1 + ' --'),
+                'ls-files --others --exclude-standard -z',
+                'status --porcelain=v1 -z --untracked-files=all')
+            $cpActualCalls = [string]::Join("`n", $cpFakeCalls.ToArray())
+            Test-BRAVOCondition `
+                -Condition (
+                    $cpResult.Status -ceq 'Ok' -and
+                    $cpActualCalls -ceq [string]::Join("`n", $cpExpectedCalls) -and
+                    $cpResult.BaseSha -ceq $cpSha1 -and $cpResult.HeadSha -ceq $cpSha2 -and $cpResult.MergeBaseSha -ceq $cpSha1 -and
+                    $cpResult.Dirty -eq $true
+                ) `
+                -Name "Framework/AffectedChangedPath.GitCallContractIsPinned" `
+                -Failure ("послідовність і аргументи викликів git мусять збігатися з A5 (show-toplevel, is-shallow, verify base, verify HEAD, merge-base, diff --no-renames --name-status -z --no-ext-diff <mb> --, ls-files --others --exclude-standard -z, status --porcelain=v1 -z --untracked-files=all). Фактично: " +
+                    $cpActualCalls.Replace("`n", ' / ') + "; статус: $($cpResult.Status)")
+
+            # C7: будь-який збій git - GIT-FAILED, ніколи не порожній diff.
+            $cpFailCases = @(
+                @{ Id = 'diff 128'; Key = 'diff'; Response = (& $cpReply 128 '' 'fatal: x') },
+                @{ Id = 'diff odd tokens (1)'; Key = 'diff'; Response = (& $cpReply 0 ('M' + $cpNul)) },
+                @{ Id = 'diff odd tokens (3)'; Key = 'diff'; Response = (& $cpReply 0 ('M' + $cpNul + 'a.md' + $cpNul + 'D' + $cpNul)) },
+                @{ Id = 'diff bad status'; Key = 'diff'; Response = (& $cpReply 0 ('Z' + $cpNul + 'a.md' + $cpNul)) },
+                @{ Id = 'diff rename status'; Key = 'diff'; Response = (& $cpReply 0 ('R100' + $cpNul + 'a.md' + $cpNul)) },
+                @{ Id = 'merge-base 128'; Key = 'mergebase'; Response = (& $cpReply 128 '' 'fatal: y') },
+                @{ Id = 'merge-base not sha'; Key = 'mergebase'; Response = (& $cpReply 0 'zzz') },
+                @{ Id = 'merge-base 1 with output'; Key = 'mergebase'; Response = (& $cpReply 1 $cpSha1) },
+                @{ Id = 'ls-files 128'; Key = 'untracked'; Response = (& $cpReply 128 '' 'fatal: z') },
+                @{ Id = 'status 128'; Key = 'status'; Response = (& $cpReply 128 '' 'fatal: s') },
+                @{ Id = 'shallow 128'; Key = 'shallow'; Response = (& $cpReply 128) },
+                @{ Id = 'shallow garbage'; Key = 'shallow'; Response = (& $cpReply 0 'maybe') },
+                @{ Id = 'shallow empty'; Key = 'shallow'; Response = (& $cpReply 0 '') },
+                @{ Id = 'base 2'; Key = 'base'; Response = (& $cpReply 2) },
+                @{ Id = 'base not sha'; Key = 'base'; Response = (& $cpReply 0 'xyz') },
+                @{ Id = 'base empty'; Key = 'base'; Response = (& $cpReply 0 '') },
+                @{ Id = 'head 128'; Key = 'head'; Response = (& $cpReply 128) },
+                @{ Id = 'head not sha'; Key = 'head'; Response = (& $cpReply 0 'xyz') },
+                @{ Id = 'toplevel empty output'; Key = 'toplevel'; Response = (& $cpReply 0 '') },
+                @{ Id = 'toplevel invalid path'; Key = 'toplevel'; Response = (& $cpReply 0 "a`0b") })
+            foreach ($cpCase in $cpFailCases) {
+                $cpResult = & $cpRun @{ ($cpCase.Key) = $cpCase.Response }
+                & $cpCheck $cpCase.Id (
+                    $cpResult.Status -ceq 'GIT-FAILED' -and $cpResult.Status -cne 'EMPTY-DIFF' -and
+                    -not [string]::IsNullOrEmpty([string]$cpResult.FailedCommand) -and @($cpResult.ChangedPath).Count -eq 0)
+            }
+            $cpProblem = & $cpTake
+            Test-BRAVOCondition `
+                -Condition ($cpProblem.Length -eq 0) `
+                -Name "Framework/AffectedChangedPath.GitFailureNeverBecomesEmptyDiff" `
+                -Failure ("ненульовий код git, непарна кількість NUL-токенів, невірна форма виводу мусять давати GIT-FAILED із заповненим FailedCommand і порожнім ChangedPath, а не EMPTY-DIFF: " + $cpProblem)
+
+            # C8: виняток запуску (Process.Start) - теж GIT-FAILED.
+            foreach ($cpThrowKey in @('toplevel', 'shallow', 'base', 'head', 'mergebase', 'diff', 'untracked', 'status')) {
+                $cpResult = & $cpRun @{ $cpThrowKey = 'simulated start failure' }
+                & $cpCheck ('throw ' + $cpThrowKey) (
+                    $cpResult.Status -ceq 'GIT-FAILED' -and -not [string]::IsNullOrEmpty([string]$cpResult.FailedCommand) -and @($cpResult.ChangedPath).Count -eq 0)
+            }
+            $cpManifestDiff = (& $cpReply 0 ('M' + $cpNul + 'RUNTIME_MANIFEST.json' + $cpNul + 'M' + $cpNul + 'docs/a.md' + $cpNul))
+            $cpResult = & $cpRun @{ diff = $cpManifestDiff; show = 'simulated start failure' }
+            & $cpCheck 'throw show' ($cpResult.Status -ceq 'GIT-FAILED' -and @($cpResult.ChangedPath).Count -eq 0)
+            $cpProblem = & $cpTake
+            Test-BRAVOCondition `
+                -Condition ($cpProblem.Length -eq 0) `
+                -Name "Framework/AffectedChangedPath.ProcessStartFailureIsGitFailed" `
+                -Failure ("виняток запуску git на будь-якому кроці мусить давати GIT-FAILED (invoker, що кидає виняток, симулює Process.Start): " + $cpProblem)
+
+            # C9: stderr з кодом 0 не робить виклик невдалим.
+            $cpWarn = 'warning: in the working copy of x, LF will be replaced by CRLF'
+            $cpResult = & $cpRun @{
+                diff      = (& $cpReply 0 ('M' + $cpNul + 'docs/a.md' + $cpNul) $cpWarn)
+                untracked = (& $cpReply 0 ('docs/b.md' + $cpNul) $cpWarn)
+                status    = (& $cpReply 0 (' M docs/a.md' + $cpNul) $cpWarn)
+                toplevel  = (& $cpReply 0 ($cpFakeRoot + "`n") $cpWarn)
+            }
+            Test-BRAVOCondition `
+                -Condition (
+                    $cpResult.Status -ceq 'Ok' -and
+                    (& $cpHas $cpResult.ChangedPath 'docs/a.md') -and (& $cpHas $cpResult.ChangedPath 'docs/b.md')
+                ) `
+                -Name "Framework/AffectedChangedPath.StderrWarningWithExitZeroIsNotAFailure" `
+                -Failure "код 0 зі stderr 'warning: ...' - успіх: шляхи беруться зі stdout, stderr не розбирається і не змішується зі stdout; статус: $($cpResult.Status)"
+
+            # C10: git не знайдено.
+            $cpBogusGit = 'bravo-no-such-git-' + [guid]::NewGuid().ToString('N')
+            $cpResult = Get-BRAVOChangedPathSet -RepositoryRoot $cpFakeRoot -BaseRef 'main' -GitCommandName $cpBogusGit
+            $cpRunner = Invoke-BRAVOGitCommand -RepositoryRoot $cpFakeRoot -Argument @('--version') -GitCommandName $cpBogusGit
+            $cpUnavailable = Get-BRAVOChangedPathSet -RepositoryRoot $cpFakeRoot -BaseRef 'main' -GitInvoker { param([string[]]$Argument) return @{ Available = $false; ExitCode = $null; StdOut = ''; StdErr = '' } }
+            Test-BRAVOCondition `
+                -Condition (
+                    $cpResult.Status -ceq 'GIT-MISSING' -and @($cpResult.ChangedPath).Count -eq 0 -and
+                    $cpRunner.Available -eq $false -and $null -eq $cpRunner.ExitCode -and
+                    $cpUnavailable.Status -ceq 'GIT-MISSING'
+                ) `
+                -Name "Framework/AffectedChangedPath.MissingGitIsReported" `
+                -Failure "неіснуюча команда git (і invoker з Available=`$false) мусить давати GIT-MISSING, а Invoke-BRAVOGitCommand - Available=`$false без винятку; статус: $($cpResult.Status)/$($cpUnavailable.Status)"
+
+            # C15, C16: shallow і невідповідність кореня.
+            $cpResult = & $cpRun @{ shallow = (& $cpReply 0 "true`n") }
+            & $cpCheck 'shallow true' ($cpResult.Status -ceq 'SHALLOW-REPOSITORY')
+            $cpResult = & $cpRun @{ toplevel = (& $cpReply 0 "C:/other`n") }
+            & $cpCheck 'root mismatch' ($cpResult.Status -ceq 'ROOT-MISMATCH')
+            foreach ($cpRootForm in @(
+                    ($cpFakeRoot + "`r`n"),
+                    ($cpFakeRoot + '/' + "`n"),
+                    ($cpFakeRoot.ToUpperInvariant() + "`n"),
+                    ($cpFakeRoot.Replace('\', '/') + "`n"))) {
+                $cpResult = & $cpRun @{ toplevel = (& $cpReply 0 $cpRootForm) }
+                & $cpCheck ('root form ' + $cpRootForm.Replace("`r", '\r').Replace("`n", '\n')) ($cpResult.Status -ceq 'Ok')
+            }
+            $cpProblem = & $cpTake
+            Test-BRAVOCondition `
+                -Condition ($cpProblem.Length -eq 0) `
+                -Name "Framework/AffectedChangedPath.ShallowAndRootMismatchFailClosed" `
+                -Failure ("is-shallow=true дає SHALLOW-REPOSITORY, корінь, що не збігається після GetFullPath (без урахування регістру), дає ROOT-MISMATCH, а косі риски, завершальний роздільник, CRLF і регістр кореня не є розбіжністю: " + $cpProblem)
+
+            # C17 [I]: NO-MERGE-BASE і NotARepository (+ підказка safe.directory).
+            $cpResult = & $cpRun @{ mergebase = (& $cpReply 1) }
+            & $cpCheck 'no merge-base' ($cpResult.Status -ceq 'NO-MERGE-BASE' -and @($cpResult.ChangedPath).Count -eq 0)
+            $cpResult = & $cpRun @{ mergebase = (& $cpReply 128 '' 'fatal: q') }
+            & $cpCheck 'merge-base 128' ($cpResult.Status -ceq 'GIT-FAILED')
+            $cpResult = & $cpRun @{ toplevel = (& $cpReply 128 '' 'fatal: not a git repository (or any of the parent directories): .git') }
+            & $cpCheck 'not a repository' ($cpResult.Status -ceq 'NOT-A-REPOSITORY' -and ([string]$cpResult.Message).IndexOf('safe.directory', [StringComparison]::Ordinal) -lt 0)
+            $cpDubious = "fatal: detected dubious ownership in repository at 'X'`nTo add an exception for this directory, call:`n`n`tgit config --global --add safe.directory X"
+            $cpResult = & $cpRun @{ toplevel = (& $cpReply 128 '' $cpDubious) }
+            & $cpCheck 'dubious ownership' (
+                $cpResult.Status -ceq 'NOT-A-REPOSITORY' -and @($cpResult.ChangedPath).Count -eq 0 -and
+                ([string]$cpResult.Message).IndexOf('safe.directory', [StringComparison]::Ordinal) -ge 0)
+            $cpProblem = & $cpTake
+            Test-BRAVOCondition `
+                -Condition ($cpProblem.Length -eq 0) `
+                -Name "Framework/AffectedChangedPath.NoMergeBaseAndNotARepositoryStatuses" `
+                -Failure ("merge-base з кодом 1 і порожнім виводом дає NO-MERGE-BASE (код 128 - GIT-FAILED); show-toplevel з кодом != 0 дає NOT-A-REPOSITORY, а за dubious ownership статус лишається тим самим, але Message містить підказку safe.directory: " + $cpProblem)
+
+            # C22, C23 [I]: дедуплікація Ordinal, детермінований порядок, без обрізання.
+            $cpOrderA = & $cpRun @{
+                diff      = (& $cpReply 0 ('M' + $cpNul + 'docs/z.md' + $cpNul + 'M' + $cpNul + 'docs/a.md' + $cpNul))
+                untracked = (& $cpReply 0 ('docs/a.md' + $cpNul + 'Docs/A.md' + $cpNul + 'docs/b.md' + $cpNul))
+            }
+            $cpOrderB = & $cpRun @{
+                diff      = (& $cpReply 0 ('M' + $cpNul + 'docs/a.md' + $cpNul + 'M' + $cpNul + 'docs/z.md' + $cpNul))
+                untracked = (& $cpReply 0 ('docs/b.md' + $cpNul + 'docs/a.md' + $cpNul + 'Docs/A.md' + $cpNul))
+            }
+            $cpExpectedOrder = 'Docs/A.md|docs/a.md|docs/b.md|docs/z.md'
+            $cpSpaces = & $cpRun @{
+                diff      = (& $cpReply 0 ('M' + $cpNul + ' a.txt' + $cpNul))
+                untracked = (& $cpReply 0 ('b.txt ' + $cpNul + ' c d ' + $cpNul))
+            }
+            Test-BRAVOCondition `
+                -Condition (
+                    $cpOrderA.Status -ceq 'Ok' -and
+                    [string]::Join('|', @($cpOrderA.ChangedPath)) -ceq $cpExpectedOrder -and
+                    [string]::Join('|', @($cpOrderB.ChangedPath)) -ceq $cpExpectedOrder -and
+                    $cpSpaces.Status -ceq 'Ok' -and
+                    [string]::Join('|', @($cpSpaces.ChangedPath)) -ceq ' a.txt| c d |b.txt '
+                ) `
+                -Name "Framework/AffectedChangedPath.DuplicatesDedupedOrdinalAndNeverTrimmed" `
+                -Failure ("дубль із tracked і untracked джерел - рівно один раз, порядок Ordinal не залежить від порядку входу, шляхи з пробілами по краях повертаються дослівно. Фактично: '" +
+                    [string]::Join('|', @($cpOrderA.ChangedPath)) + "' / '" + [string]::Join('|', @($cpOrderB.ChangedPath)) + "' / '" + [string]::Join('|', @($cpSpaces.ChangedPath)) + "'")
+
+            # D потрапляє і в ChangedPath, і в DeletedPath.
+            $cpDeleted = & $cpRun @{
+                diff = (& $cpReply 0 ('D' + $cpNul + 'docs/gone.md' + $cpNul + 'M' + $cpNul + 'docs/a.md' + $cpNul + 'D' + $cpNul + 'docs/gone.md' + $cpNul))
+            }
+            Test-BRAVOCondition `
+                -Condition (
+                    $cpDeleted.Status -ceq 'Ok' -and
+                    (& $cpHas $cpDeleted.ChangedPath 'docs/gone.md') -and (& $cpHas $cpDeleted.ChangedPath 'docs/a.md') -and
+                    [string]::Join('|', @($cpDeleted.DeletedPath)) -ceq 'docs/gone.md' -and
+                    @($cpDeleted.ChangedPath).Count -eq 3
+                ) `
+                -Name "Framework/AffectedChangedPath.DeletedPathIsAlsoChangedPath" `
+                -Failure "видалений файл (статус D) мусить бути і в ChangedPath, і в DeletedPath (без дублів), а змінений - лише в ChangedPath; фактично: Changed='$([string]::Join('|', @($cpDeleted.ChangedPath)))' Deleted='$([string]::Join('|', @($cpDeleted.DeletedPath)))'"
+
+            # C21 [I]: тексти супутнього RUNTIME_MANIFEST.json.
+            $cpWithManifest = & $cpRun @{ diff = $cpManifestDiff; show = (& $cpReply 0 ('{"base":true}' + "`r`n")) }
+            $cpShowCalls = @($cpFakeCalls.ToArray() | Where-Object { $_ -ceq ('show ' + $cpSha1 + ':RUNTIME_MANIFEST.json') })
+            $cpShowFailed = & $cpRun @{ diff = $cpManifestDiff; show = (& $cpReply 128 '' 'fatal: path does not exist') }
+            $cpShowOne = & $cpRun @{ diff = $cpManifestDiff; show = (& $cpReply 1) }
+            $cpNoManifest = & $cpRun @{}
+            $cpNoManifestShow = @($cpFakeCalls.ToArray() | Where-Object { $_.StartsWith('show ', [StringComparison]::Ordinal) })
+            $cpManifestUntracked = & $cpRun @{ diff = (& $cpReply 0 ''); untracked = (& $cpReply 0 ('RUNTIME_MANIFEST.json' + $cpNul)); show = (& $cpReply 128) }
+            $cpManifestDeleted = & $cpRun @{ diff = (& $cpReply 0 ('D' + $cpNul + 'RUNTIME_MANIFEST.json' + $cpNul)); toplevel = (& $cpReply 0 ($cpEmptyRoot + "`n")) } 'main' $cpEmptyRoot
+            Test-BRAVOCondition `
+                -Condition (
+                    $cpWithManifest.Status -ceq 'Ok' -and
+                    $cpWithManifest.RuntimeManifestBaseText -ceq ('{"base":true}' + "`r`n") -and
+                    $cpWithManifest.RuntimeManifestCurrentText -ceq $cpManifestCurrent -and
+                    $cpShowCalls.Count -eq 1 -and
+                    $cpShowFailed.Status -ceq 'Ok' -and $null -eq $cpShowFailed.RuntimeManifestBaseText -and $cpShowFailed.RuntimeManifestCurrentText -ceq $cpManifestCurrent -and
+                    $cpShowOne.Status -ceq 'Ok' -and $null -eq $cpShowOne.RuntimeManifestBaseText -and
+                    $cpNoManifest.Status -ceq 'Ok' -and $null -eq $cpNoManifest.RuntimeManifestBaseText -and $null -eq $cpNoManifest.RuntimeManifestCurrentText -and
+                    $cpNoManifestShow.Count -eq 0 -and
+                    $cpManifestUntracked.Status -ceq 'Ok' -and $null -eq $cpManifestUntracked.RuntimeManifestBaseText -and $cpManifestUntracked.RuntimeManifestCurrentText -ceq $cpManifestCurrent -and
+                    $cpManifestDeleted.Status -ceq 'Ok' -and $null -eq $cpManifestDeleted.RuntimeManifestCurrentText
+                ) `
+                -Name "Framework/AffectedChangedPath.ManifestCompanionTextsComeFromMergeBaseAndDisk" `
+                -Failure "RuntimeManifestBaseText береться з 'git show <merge-base>:RUNTIME_MANIFEST.json' дослівно (код != 0 -> `$null), CurrentText - з диска (немає файлу -> `$null); без маніфесту в наборі обидва `$null і git show не викликається"
+
+            # BASE-EQUALS-HEAD / EMPTY-DIFF / Dirty.
+            $cpEmptyAll = @{ diff = (& $cpReply 0 ''); untracked = (& $cpReply 0 ''); status = (& $cpReply 0 '') }
+            $cpSame = & $cpRun (@{ head = (& $cpReply 0 ($cpSha1 + "`n")) } + $cpEmptyAll)
+            $cpDiffer = & $cpRun $cpEmptyAll
+            $cpSameDirty = & $cpRun @{ head = (& $cpReply 0 ($cpSha1 + "`n")); diff = (& $cpReply 0 ''); untracked = (& $cpReply 0 ('x.md' + $cpNul)) }
+            Test-BRAVOCondition `
+                -Condition (
+                    $cpSame.Status -ceq 'BASE-EQUALS-HEAD' -and $cpSame.Dirty -eq $false -and @($cpSame.ChangedPath).Count -eq 0 -and
+                    $cpDiffer.Status -ceq 'EMPTY-DIFF' -and $cpDiffer.Dirty -eq $false -and
+                    $cpSameDirty.Status -ceq 'Ok' -and $cpSameDirty.Dirty -eq $true
+                ) `
+                -Name "Framework/AffectedChangedPath.EmptySetIsClassifiedNotAccepted" `
+                -Failure "порожній набір: однакові BaseSha і HeadSha - BASE-EQUALS-HEAD, різні - EMPTY-DIFF; за наявності untracked-файлів набір не порожній (Ok, Dirty=`$true); фактично: $($cpSame.Status)/$($cpDiffer.Status)/$($cpSameDirty.Status)"
+
+            # Контракт invoker-а: об'єкт, hashtable, зіпсовані відповіді.
+            $cpObjectInvoker = {
+                param([string[]]$Argument)
+                $plain = & $cpFakeInvoker $Argument
+                return [pscustomobject]@{ ExitCode = $plain.ExitCode; StdOut = $plain.StdOut; StdErr = $plain.StdErr }
+            }
+            $cpFakeCalls.Clear()
+            $cpFakeResponses = & $cpFakeDefaults
+            $cpViaObject = Get-BRAVOChangedPathSet -RepositoryRoot $cpFakeRoot -BaseRef 'main' -GitInvoker $cpObjectInvoker
+            $cpBadInvokers = @(
+                @{ Id = 'null'; Invoker = { param([string[]]$Argument) return $null } },
+                @{ Id = 'no ExitCode'; Invoker = { param([string[]]$Argument) return @{ StdOut = ''; StdErr = '' } } },
+                @{ Id = 'text ExitCode'; Invoker = { param([string[]]$Argument) return @{ ExitCode = 'zero'; StdOut = ''; StdErr = '' } } },
+                @{ Id = 'two objects'; Invoker = { param([string[]]$Argument) return @(@{ ExitCode = 0; StdOut = ''; StdErr = '' }, @{ ExitCode = 0; StdOut = ''; StdErr = '' }) } },
+                @{ Id = 'throws'; Invoker = { param([string[]]$Argument) throw 'boom' } })
+            foreach ($cpBad in $cpBadInvokers) {
+                $cpResult = Get-BRAVOChangedPathSet -RepositoryRoot $cpFakeRoot -BaseRef 'main' -GitInvoker $cpBad.Invoker
+                & $cpCheck ('bad invoker ' + $cpBad.Id) ($cpResult.Status -ceq 'GIT-FAILED' -and @($cpResult.ChangedPath).Count -eq 0)
+            }
+            $cpProblem = & $cpTake
+            Test-BRAVOCondition `
+                -Condition ($cpViaObject.Status -ceq 'Ok' -and $cpProblem.Length -eq 0) `
+                -Name "Framework/AffectedChangedPath.InvokerResultShapeIsValidated" `
+                -Failure ("invoker повертає {ExitCode; StdOut; StdErr} (об'єкт чи hashtable) або кидає виняток; відсутній чи нечисловий ExitCode, `$null і кілька об'єктів - GIT-FAILED. Об'єкт: $($cpViaObject.Status); " + $cpProblem)
+
+            # Форма результату.
+            $cpResult = & $cpRun @{}
+            $cpResultNames = @($cpResult.PSObject.Properties | ForEach-Object { $_.Name })
+            $cpMissingNames = @('Status', 'BaseSha', 'HeadSha', 'MergeBaseSha', 'Dirty', 'ChangedPath', 'DeletedPath',
+                'RuntimeManifestBaseText', 'RuntimeManifestCurrentText', 'FailedCommand', 'ExitCode') | Where-Object { $cpResultNames -cnotcontains $_ }
+            $cpFailed = & $cpRun @{ diff = (& $cpReply 128) }
+            Test-BRAVOCondition `
+                -Condition (
+                    @($cpMissingNames).Count -eq 0 -and
+                    $cpResult.ChangedPath -is [string[]] -and $cpResult.DeletedPath -is [string[]] -and
+                    $cpFailed.ChangedPath -is [string[]] -and $cpFailed.DeletedPath -is [string[]] -and
+                    $cpFailed.ExitCode -eq 128 -and $cpFailed.FailedCommand.Contains('diff')
+                ) `
+                -Name "Framework/AffectedChangedPath.ResultShapeIsStable" `
+                -Failure ("результат мусить мати поля Status, BaseSha, HeadSha, MergeBaseSha, Dirty, ChangedPath, DeletedPath, RuntimeManifestBaseText, RuntimeManifestCurrentText, FailedCommand, ExitCode; шляхи - завжди [string[]] (також при збої); бракує: " +
+                    [string]::Join(', ', @($cpMissingNames)))
+        } finally {
+            Remove-Item -LiteralPath $cpFakeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $cpEmptyRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        # --- [T]: тимчасові репозиторії -------------------------------------
+        $cpT = @{}
+        $cpTNote = @{}
+        $cpGitCommand = @(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue)
+        $cpGitLimitation = ''
+        if ($cpGitCommand.Count -eq 0) {
+            $cpGitLimitation = 'git недоступний на цьому хості: сценарії з тимчасовим репозиторієм не виконувались'
+        }
+        $cpTOk = {
+            param([string]$Key)
+            return ($cpT.ContainsKey($Key) -and $cpT[$Key] -eq $true)
+        }
+        $cpTWhy = {
+            param([string]$Key)
+            if ($cpTNote.ContainsKey($Key)) { return [string]$cpTNote[$Key] }
+            return 'сценарій не виконано'
+        }
+        $cpGit = {
+            param([string]$Dir, [string[]]$GitArgument)
+            $fullArgument = @('-c', 'user.name=Test Author', '-c', 'user.email=test@example.invalid', '-c', 'core.autocrlf=false', '-c', 'core.quotepath=true') + $GitArgument
+            return (Invoke-BRAVOGitCommand -RepositoryRoot $Dir -Argument $fullArgument)
+        }
+        $cpGitOk = {
+            param([string]$Dir, [string[]]$GitArgument)
+            $gitRun = & $cpGit $Dir $GitArgument
+            if (-not ($gitRun.Available -and $null -ne $gitRun.ExitCode -and $gitRun.ExitCode -eq 0)) {
+                throw ('git ' + [string]::Join(' ', $GitArgument) + ' завершився з помилкою: ' + [string]$gitRun.StdErr + [string]$gitRun.StartError)
+            }
+            return ($gitRun.StdOut -replace '[\r\n]+\z', '')
+        }
+        $cpWrite = {
+            param([string]$Dir, [string]$Relative, [string]$Text)
+            $target = Join-Path $Dir $Relative
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+            [IO.File]::WriteAllText($target, $Text, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+        }
+        $cpCommit = {
+            param([string]$Dir, [string]$Message)
+            $null = & $cpGitOk $Dir @('add', '-A')
+            $null = & $cpGitOk $Dir @('commit', '--quiet', '-m', $Message)
+        }
+        $cpInit = {
+            param([string]$Dir)
+            $null = & $cpGitOk $Dir @('-c', 'init.defaultBranch=master', 'init', '--quiet')
+        }
+        $cpWithRepo = {
+            param([string]$Key, [scriptblock]$Body)
+            $repoDir = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_CHANGEDPATH_' + [guid]::NewGuid().ToString('N'))
+            try {
+                [void][IO.Directory]::CreateDirectory($repoDir)
+                & $Body $repoDir
+            } catch {
+                $cpTNote[$Key] = 'виняток сценарію: ' + $_.Exception.Message
+            } finally {
+                Remove-Item -LiteralPath $repoDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $cpCyr1 = 'документ'
+        $cpCyr2 = 'мій новий'
+
+        if ($cpGitLimitation.Length -eq 0) {
+            # Рядок запуску: потоки розділені, stderr не стає помилкою під Stop, збій запуску - не виняток.
+            & $cpWithRepo 'Runner' {
+                param([string]$Dir)
+                $previousPreference = $ErrorActionPreference
+                $ErrorActionPreference = 'Stop'
+                try {
+                    $versionRun = Invoke-BRAVOGitCommand -RepositoryRoot $Dir -Argument @('--version')
+                    $stderrRun = Invoke-BRAVOGitCommand -RepositoryRoot $Dir -Argument @('--bravo-no-such-option')
+                    $startRun = Invoke-BRAVOGitCommand -RepositoryRoot (Join-Path $Dir 'no-such-subdirectory') -Argument @('--version')
+                } finally {
+                    $ErrorActionPreference = $previousPreference
+                }
+                $cpT['Runner'] = (
+                    $versionRun.Available -eq $true -and $versionRun.ExitCode -eq 0 -and $versionRun.StdOut.StartsWith('git version', [StringComparison]::Ordinal) -and
+                    $stderrRun.Available -eq $true -and $null -ne $stderrRun.ExitCode -and $stderrRun.ExitCode -ne 0 -and
+                    $stderrRun.StdOut.Length -eq 0 -and $stderrRun.StdErr.Length -gt 0 -and
+                    $startRun.Available -eq $true -and $null -eq $startRun.ExitCode -and -not [string]::IsNullOrEmpty([string]$startRun.StartError))
+                $cpTNote['Runner'] = "version=$($versionRun.ExitCode); stderrRun=$($stderrRun.ExitCode)/out$($stderrRun.StdOut.Length)/err$($stderrRun.StdErr.Length); start=$($startRun.ExitCode)/$($startRun.StartError)"
+            }
+
+            # Основний репозиторій: C1-C4, C13, C14, C19, C20, C23.
+            & $cpWithRepo 'Main' {
+                param([string]$Dir)
+                & $cpInit $Dir
+                & $cpWrite $Dir 'docs/keep.md' 'keep'
+                & $cpWrite $Dir 'docs/mod.md' 'one'
+                & $cpWrite $Dir 'docs/del.md' 'del'
+                & $cpWrite $Dir 'docs/ren-old.md' 'ren'
+                & $cpWrite $Dir 'docs/my doc.md' 'sp1'
+                & $cpWrite $Dir ('docs/' + $cpCyr1 + '.md') 'cy1'
+                & $cpWrite $Dir '.gitignore' ("ignored/`n")
+                & $cpCommit $Dir 'base'
+                $baseSha = & $cpGitOk $Dir @('rev-parse', 'HEAD')
+
+                & $cpWrite $Dir 'docs/added.md' 'added'
+                $null = & $cpGitOk $Dir @('add', 'docs/added.md')
+                & $cpWrite $Dir 'docs/untracked.md' 'u'
+                & $cpWrite $Dir 'docs/mod.md' 'two'
+                $null = & $cpGitOk $Dir @('add', 'docs/mod.md')
+                & $cpWrite $Dir 'docs/mod.md' 'three'
+                $null = & $cpGitOk $Dir @('rm', '--quiet', 'docs/del.md')
+                $null = & $cpGitOk $Dir @('mv', 'docs/ren-old.md', 'docs/ren-new.md')
+                & $cpWrite $Dir 'docs/my doc.md' 'sp2'
+                & $cpWrite $Dir ('docs/' + $cpCyr1 + '.md') 'cy2'
+                & $cpWrite $Dir ('docs/' + $cpCyr2 + '.md') 'cy3'
+                & $cpWrite $Dir ' a.txt' 'lead'
+                & $cpWrite $Dir 'ignored/x.md' 'ig'
+
+                $mainResult = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef $baseSha
+                $mainChanged = @($mainResult.ChangedPath)
+                $mainDeleted = @($mainResult.DeletedPath)
+                $cpTNote['Main'] = 'Status=' + $mainResult.Status + '; Message=' + [string]$mainResult.Message + '; Changed=' + [string]::Join('|', $mainChanged) + '; Deleted=' + [string]::Join('|', $mainDeleted)
+                $cpT['Main'] = ($mainResult.Status -ceq 'Ok')
+                $cpT['Added'] = ((& $cpHas $mainChanged 'docs/added.md') -and (& $cpHas $mainChanged 'docs/untracked.md'))
+                $cpT['Modified'] = (@($mainChanged | Where-Object { $_ -ceq 'docs/mod.md' }).Count -eq 1 -and -not (& $cpHas $mainDeleted 'docs/mod.md'))
+                $cpT['Deleted'] = ((& $cpHas $mainChanged 'docs/del.md') -and (& $cpHas $mainDeleted 'docs/del.md'))
+                $cpT['Renamed'] = (
+                    (& $cpHas $mainChanged 'docs/ren-old.md') -and (& $cpHas $mainChanged 'docs/ren-new.md') -and
+                    (& $cpHas $mainDeleted 'docs/ren-old.md') -and -not (& $cpHas $mainDeleted 'docs/ren-new.md'))
+                $cpT['Spaces'] = ((& $cpHas $mainChanged 'docs/my doc.md') -and @($mainChanged | Where-Object { $_.Contains('"') }).Count -eq 0)
+                $cyrExpected = 'docs/' + $cpCyr1 + '.md'
+                $cyrUntrackedExpected = 'docs/' + $cpCyr2 + '.md'
+                $cyrFound = @($mainChanged | Where-Object { [string]::Equals($_, $cyrExpected, [StringComparison]::Ordinal) })
+                $cpT['Cyrillic'] = (
+                    $cyrFound.Count -eq 1 -and
+                    [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($cyrFound[0])) -ceq [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($cyrExpected)) -and
+                    (& $cpHas $mainChanged $cyrUntrackedExpected) -and
+                    @($mainChanged | Where-Object { $_ -match '\\[0-7]{3}' -or $_.StartsWith('"', [StringComparison]::Ordinal) }).Count -eq 0)
+                $cpT['NoTrim'] = ((& $cpHas $mainChanged ' a.txt') -and -not (& $cpHas $mainChanged 'a.txt'))
+                $cpT['Ignored'] = (@($mainChanged | Where-Object { $_.StartsWith('ignored/', [StringComparison]::Ordinal) }).Count -eq 0 -and -not (& $cpHas $mainChanged '.gitignore'))
+                $cpT['Dirty'] = (
+                    $mainResult.Dirty -eq $true -and $mainResult.BaseSha -ceq $baseSha -and $mainResult.HeadSha -ceq $baseSha -and $mainResult.MergeBaseSha -ceq $baseSha)
+                $expectedList = New-Object System.Collections.Generic.List[string]
+                foreach ($expectedPath in @(' a.txt', 'docs/added.md', 'docs/del.md', 'docs/mod.md', 'docs/my doc.md', 'docs/ren-new.md', 'docs/ren-old.md', 'docs/untracked.md', $cyrExpected, $cyrUntrackedExpected)) {
+                    [void]$expectedList.Add($expectedPath)
+                }
+                $expectedList.Sort([StringComparer]::Ordinal)
+                $cpT['ExactSet'] = ([string]::Join("`n", $mainChanged) -ceq [string]::Join("`n", $expectedList.ToArray()) -and [string]::Join('|', $mainDeleted) -ceq 'docs/del.md|docs/ren-old.md')
+            }
+
+            # Історія: C5 [T], C11, C12, merge-base, C17 [T].
+            & $cpWithRepo 'History' {
+                param([string]$Dir)
+                & $cpInit $Dir
+                & $cpWrite $Dir 'a.md' 'one'
+                & $cpCommit $Dir 'c1'
+                $sha1 = & $cpGitOk $Dir @('rev-parse', 'HEAD')
+                $equalsHead = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef 'HEAD'
+                $equalsSha = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef $sha1
+                $cpT['BaseEqualsHead'] = ($equalsHead.Status -ceq 'BASE-EQUALS-HEAD' -and $equalsSha.Status -ceq 'BASE-EQUALS-HEAD' -and $equalsHead.Dirty -eq $false -and @($equalsHead.ChangedPath).Count -eq 0)
+                $cpTNote['BaseEqualsHead'] = "HEAD=$($equalsHead.Status); sha=$($equalsSha.Status); Dirty=$($equalsHead.Dirty)"
+
+                $noRef = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef ('no-such-ref-' + [guid]::NewGuid().ToString('N'))
+                $cpT['InvalidBase'] = ($noRef.Status -ceq 'BASE-INVALID' -and @($noRef.ChangedPath).Count -eq 0)
+                $cpTNote['InvalidBase'] = "no-such-ref=$($noRef.Status)"
+
+                $null = & $cpGitOk $Dir @('branch', 'side')
+                $null = & $cpGitOk $Dir @('checkout', '--quiet', 'side')
+                & $cpWrite $Dir 'side.md' 'side'
+                & $cpCommit $Dir 'side'
+                $sideSha = & $cpGitOk $Dir @('rev-parse', 'HEAD')
+                $null = & $cpGitOk $Dir @('checkout', '--quiet', 'master')
+                & $cpWrite $Dir 'a.md' 'two'
+                & $cpWrite $Dir 'b.md' 'two'
+                & $cpCommit $Dir 'c2'
+                & $cpWrite $Dir 'a.md' 'one'
+                $null = & $cpGitOk $Dir @('rm', '--quiet', 'b.md')
+                & $cpCommit $Dir 'c3'
+                $emptyDiff = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef $sha1
+                $viaSide = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef 'side'
+                $cpT['EmptyDiff'] = (
+                    $emptyDiff.Status -ceq 'EMPTY-DIFF' -and @($emptyDiff.ChangedPath).Count -eq 0 -and $emptyDiff.Dirty -eq $false -and
+                    $viaSide.Status -ceq 'EMPTY-DIFF' -and $viaSide.BaseSha -ceq $sideSha -and $viaSide.MergeBaseSha -ceq $sha1 -and $viaSide.HeadSha -cne $sha1)
+                $cpTNote['EmptyDiff'] = "sha=$($emptyDiff.Status); side=$($viaSide.Status) base=$($viaSide.BaseSha) mb=$($viaSide.MergeBaseSha) paths=$([string]::Join('|', @($viaSide.ChangedPath)))"
+
+                $null = & $cpGitOk $Dir @('checkout', '--quiet', '--orphan', 'orphan')
+                & $cpWrite $Dir 'o.md' 'orphan'
+                & $cpCommit $Dir 'root2'
+                $orphan = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef $sha1
+                $cpT['NoMergeBase'] = ($orphan.Status -ceq 'NO-MERGE-BASE' -and @($orphan.ChangedPath).Count -eq 0)
+                $cpTNote['NoMergeBase'] = "orphan=$($orphan.Status) $($orphan.FailedCommand)"
+            }
+
+            # Каталог без git init: C18.
+            & $cpWithRepo 'NotARepository' {
+                param([string]$Dir)
+                $notRepo = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef 'main'
+                $cpT['NotARepository'] = ($notRepo.Status -ceq 'NOT-A-REPOSITORY' -and @($notRepo.ChangedPath).Count -eq 0)
+                $cpTNote['NotARepository'] = "status=$($notRepo.Status); $($notRepo.Message)"
+            }
+
+            # Супутній маніфест: C21 [T].
+            & $cpWithRepo 'Manifest' {
+                param([string]$Dir)
+                & $cpInit $Dir
+                & $cpWrite $Dir 'x.md' 'x'
+                & $cpCommit $Dir 'base'
+                $baseSha = & $cpGitOk $Dir @('rev-parse', 'HEAD')
+                & $cpWrite $Dir 'RUNTIME_MANIFEST.json' '{"v":1}'
+                $untrackedManifest = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef $baseSha
+                & $cpCommit $Dir 'manifest'
+                $manifestSha = & $cpGitOk $Dir @('rev-parse', 'HEAD')
+                & $cpWrite $Dir 'RUNTIME_MANIFEST.json' '{"v":2}'
+                $changedManifest = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef $manifestSha
+                $null = & $cpGitOk $Dir @('checkout', '--quiet', '--', 'RUNTIME_MANIFEST.json')
+                & $cpWrite $Dir 'x.md' 'y'
+                $withoutManifest = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef $manifestSha
+                $cpT['Manifest'] = (
+                    $untrackedManifest.Status -ceq 'Ok' -and $null -eq $untrackedManifest.RuntimeManifestBaseText -and $untrackedManifest.RuntimeManifestCurrentText -ceq '{"v":1}' -and
+                    $changedManifest.Status -ceq 'Ok' -and $changedManifest.RuntimeManifestBaseText -ceq '{"v":1}' -and $changedManifest.RuntimeManifestCurrentText -ceq '{"v":2}' -and
+                    $withoutManifest.Status -ceq 'Ok' -and $null -eq $withoutManifest.RuntimeManifestBaseText -and $null -eq $withoutManifest.RuntimeManifestCurrentText)
+                $cpTNote['Manifest'] = "untracked=$($untrackedManifest.Status)/$($untrackedManifest.RuntimeManifestBaseText)/$($untrackedManifest.RuntimeManifestCurrentText); changed=$($changedManifest.Status)/$($changedManifest.RuntimeManifestBaseText)/$($changedManifest.RuntimeManifestCurrentText); without=$($withoutManifest.Status)"
+            }
+        }
+
+        foreach ($cpCase in @(
+                @{ Key = 'Runner'; Name = 'RealGitRunnerSeparatesStreamsAndReportsStartFailure'; Failure = 'Invoke-BRAVOGitCommand мусить повертати {Available; ExitCode; StdOut; StdErr; StartError}: потоки розділені, stderr не стає помилкою під ErrorActionPreference=Stop, збій запуску - Available=$true, ExitCode=$null, StartError заповнено, без винятку' },
+                @{ Key = 'Main'; Name = 'RealRepositoryCollectsStatusOk'; Failure = 'збирач на реальному репозиторії мусить повернути Ok' },
+                @{ Key = 'Added'; Name = 'RealAddedTrackedAndUntrackedFiles'; Failure = 'новий tracked і новий untracked файли мусять бути в ChangedPath' },
+                @{ Key = 'Modified'; Name = 'RealModifiedStagedAndUnstagedOnce'; Failure = 'файл зі staged і unstaged змінами мусить бути в ChangedPath рівно один раз і не бути в DeletedPath' },
+                @{ Key = 'Deleted'; Name = 'RealDeletedIsChangedAndDeleted'; Failure = 'git rm: шлях мусить бути і в ChangedPath, і в DeletedPath' },
+                @{ Key = 'Renamed'; Name = 'RealRenameReportsBothPaths'; Failure = 'git mv a b: обидва шляхи в ChangedPath (--no-renames), старий у DeletedPath, новий - ні' },
+                @{ Key = 'Spaces'; Name = 'RealPathWithSpacesIsVerbatim'; Failure = 'шлях із пробілом повертається дослівно, без лапок' },
+                @{ Key = 'Cyrillic'; Name = 'RealCyrillicPathIsUtf8WithQuotepathOn'; Failure = 'кириличний шлях (tracked і untracked) за core.quotepath=true повертається побайтово в UTF-8, без восьмеричних екранувань' },
+                @{ Key = 'NoTrim'; Name = 'RealLeadingSpaceIsNotTrimmed'; Failure = 'шлях із пробілом на початку повертається дослівно (без обрізання)' },
+                @{ Key = 'Ignored'; Name = 'RealGitignoredFilesAreExcluded'; Failure = 'файли з .gitignore не входять до ChangedPath' },
+                @{ Key = 'Dirty'; Name = 'RealDirtyTreeIsReported'; Failure = 'база = HEAD зі staged + unstaged + untracked змінами: Dirty=$true, BaseSha=HeadSha=MergeBaseSha' },
+                @{ Key = 'ExactSet'; Name = 'RealChangedPathSetIsExactAndOrdinalSorted'; Failure = 'ChangedPath мусить дорівнювати точному набору в порядку Ordinal, DeletedPath - видаленим і перейменованим старим шляхам' },
+                @{ Key = 'InvalidBase'; Name = 'RealUnknownRefIsBaseInvalid'; Failure = 'неіснуюче ім''я ref мусить давати BASE-INVALID' },
+                @{ Key = 'BaseEqualsHead'; Name = 'RealBaseEqualsHeadOnCleanTree'; Failure = 'BaseRef=HEAD (чи SHA HEAD) на чистому дереві мусить давати BASE-EQUALS-HEAD' },
+                @{ Key = 'EmptyDiff'; Name = 'RealLegitimateEmptyDiffUsesMergeBase'; Failure = 'C1 -> C2 -> C3 (повернення), база C1: EMPTY-DIFF; для бази в іншій гілці порівнюється merge-base, а не кінчик гілки' },
+                @{ Key = 'NoMergeBase'; Name = 'RealOrphanBranchHasNoMergeBase'; Failure = 'orphan-гілка мусить давати NO-MERGE-BASE' },
+                @{ Key = 'NotARepository'; Name = 'RealDirectoryWithoutGitIsNotARepository'; Failure = 'каталог без git init мусить давати NOT-A-REPOSITORY' },
+                @{ Key = 'Manifest'; Name = 'RealManifestCompanionTexts'; Failure = 'RuntimeManifestBaseText - з merge-base ($null, якщо там немає файлу), CurrentText - з диска; без маніфесту в наборі обидва $null' }
+            )) {
+            Test-BRAVOCondition `
+                -Condition (& $cpTOk $cpCase.Key) `
+                -Name ("Framework/AffectedChangedPath." + $cpCase.Name) `
+                -EnvironmentLimitation $cpGitLimitation `
+                -Failure ($cpCase.Failure + '. Деталі: ' + (& $cpTWhy $cpCase.Key))
+        }
+
+        # --- [R]: статичний guard файлу -------------------------------------
+        $cpParsed = Get-BRAVOSelfTestParsedFile -Path $cpPath
+        $cpBytes = [IO.File]::ReadAllBytes($cpPath)
+        $cpBareLf = $false
+        for ($cpByteIndex = 0; $cpByteIndex -lt $cpBytes.Length; $cpByteIndex++) {
+            if ($cpBytes[$cpByteIndex] -eq 10 -and ($cpByteIndex -eq 0 -or $cpBytes[$cpByteIndex - 1] -ne 13)) { $cpBareLf = $true; break }
+        }
+        $cpFunctionNames = [string]::Join(',', @($cpParsed.Ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+                    ForEach-Object { $_.Name } | Sort-Object { $_ } ))
+        $cpForbiddenLiterals = @('2>&1', 'Trim(', '??', '?.', '&&', '||', '-Parallel', '::new', 'Invoke-Expression')
+        $cpForbiddenFound = @($cpForbiddenLiterals | Where-Object { $cpText.IndexOf($_, [StringComparison]::Ordinal) -ge 0 })
+        $cpForeignPatterns = @([regex]::Matches($cpText, '(?i)BRAVO\.(?:\$|\{\d+\}|[''"])|BRAVOSelfTest|config_loader|config-parity|configparity|config\.example') | ForEach-Object { $_.Value })
+        $cpPs7Nodes = @($cpParsed.Ast.FindAll({ param($node)
+                    @('TernaryExpressionAst', 'PipelineChainAst', 'NullConditionalMemberAccessAst', 'NullConditionalIndexExpressionAst', 'ChainableAst') -contains $node.GetType().Name }, $true))
+        Test-BRAVOCondition `
+            -Condition (
+                $cpForbiddenFound.Count -eq 0 -and $cpForeignPatterns.Count -eq 0 -and $cpPs7Nodes.Count -eq 0 -and
+                $cpFunctionNames -ceq 'Get-BRAVOChangedPathSet,Invoke-BRAVOGitCommand'
+            ) `
+            -Name "Framework/AffectedChangedPath.StaticSourceHasNoForbiddenConstructs" `
+            -Failure ("ci\BRAVOChangedPath.ps1: без 2>&1, обрізання (Trim), ??, ?., &&, ||, -Parallel, ::new, динамічного складання імені модуля, копії мапи Affected чи шаблонів config-parity; " +
+                "рівно функції Get-BRAVOChangedPathSet та Invoke-BRAVOGitCommand. Знайдено: [" + [string]::Join(', ', $cpForbiddenFound) + "] [" + [string]::Join(', ', $cpForeignPatterns) + "] PS7-вузлів: $($cpPs7Nodes.Count); функції: [$cpFunctionNames]")
+        Test-BRAVOCondition `
+            -Condition (
+                @($cpParsed.Errors).Count -eq 0 -and
+                $cpBytes.Length -gt 3 -and $cpBytes[0] -eq 0xEF -and $cpBytes[1] -eq 0xBB -and $cpBytes[2] -eq 0xBF -and -not $cpBareLf
+            ) `
+            -Name "Framework/AffectedChangedPath.FileParsesAndHasBomCrlf" `
+            -Failure "ci\BRAVOChangedPath.ps1 мусить розбиратись без помилок (Windows PowerShell 5.1), мати UTF-8 BOM і CRLF, як сусідні файли ci\. Помилок розбору: $(@($cpParsed.Errors).Count)"
+    }
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath' } }
+
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionIsolation') { try {
 
 # ============================================================
