@@ -29201,6 +29201,83 @@ $null = New-AlphaOwnedFixture
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossSuiteDependency' } }
 
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { try {
+
+# ============================================================
+# Контракт -Suite і підказки "змінений файл -> suite" (VAL-04a / VAL-02a).
+#
+# Корінь виконується ЗАВЖДИ, у тому числі в -Suite, тому ця секція не читає
+# $script:BRAVOSelfTestSelectedSuite як "має бути $null": уся динаміка йде
+# через код, витягнутий з реального файлу, у дочірніх процесах (розбір -Suite)
+# або через статичний AST. Нові змінні тут не виходять за межі своїх & { }.
+# ============================================================
+& {
+    # G1. Перевірки стану ПОВНОГО прогону (вибір не встановлено) в -Suite
+    # хибні за визначенням. Якщо вони не обгорнуті умовою "вибору немає",
+    # кожен реальний -Suite X завершується SELF-TEST FAILED, і успішний
+    # вибірковий прогін (exit 0 + SELF-TEST PARTIAL) недосяжний.
+    $suiteContractG1Ast = Get-BRAVOSelfTestOwnSourceAst
+    $suiteContractG1Names = @(
+        'Framework/FullCanonicalRunIsDefault',
+        'Framework/FullRunEnablesEverySuite',
+        'Framework/SuiteSelectionProbeRestoresState')
+    $suiteContractG1Calls = @($suiteContractG1Ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -eq 'Test-BRAVOCondition'
+            }, $true))
+    $suiteContractG1Found = @{}
+    $suiteContractG1Ungated = New-Object System.Collections.Generic.List[string]
+    foreach ($suiteContractG1Call in $suiteContractG1Calls) {
+        $suiteContractG1CallName = ''
+        $suiteContractG1Elements = @($suiteContractG1Call.CommandElements)
+        for ($suiteContractG1Index = 0; $suiteContractG1Index -lt ($suiteContractG1Elements.Count - 1); $suiteContractG1Index++) {
+            $suiteContractG1Element = $suiteContractG1Elements[$suiteContractG1Index]
+            if ($suiteContractG1Element -is [Management.Automation.Language.CommandParameterAst] -and
+                $suiteContractG1Element.ParameterName -eq 'Name' -and
+                $suiteContractG1Elements[$suiteContractG1Index + 1] -is [Management.Automation.Language.StringConstantExpressionAst]) {
+                $suiteContractG1CallName = $suiteContractG1Elements[$suiteContractG1Index + 1].Value
+            }
+        }
+        if ($suiteContractG1Names -cnotcontains $suiteContractG1CallName) { continue }
+        if (-not $suiteContractG1Found.ContainsKey($suiteContractG1CallName)) {
+            $suiteContractG1Found[$suiteContractG1CallName] = 0
+        }
+        $suiteContractG1Found[$suiteContractG1CallName] = $suiteContractG1Found[$suiteContractG1CallName] + 1
+        # Умова gate стоїть у ТІЛІ if (Item2), а не в самій умові чи else.
+        $suiteContractG1Gated = $false
+        $suiteContractG1Parent = $suiteContractG1Call.Parent
+        while ($null -ne $suiteContractG1Parent) {
+            if ($suiteContractG1Parent -is [Management.Automation.Language.IfStatementAst]) {
+                foreach ($suiteContractG1Clause in $suiteContractG1Parent.Clauses) {
+                    if ($suiteContractG1Clause.Item1.Extent.Text.Trim() -ceq '$null -eq $script:BRAVOSelfTestSelectedSuite' -and
+                        $suiteContractG1Clause.Item2.Extent.StartOffset -le $suiteContractG1Call.Extent.StartOffset -and
+                        $suiteContractG1Call.Extent.EndOffset -le $suiteContractG1Clause.Item2.Extent.EndOffset) {
+                        $suiteContractG1Gated = $true
+                    }
+                }
+            }
+            $suiteContractG1Parent = $suiteContractG1Parent.Parent
+        }
+        if (-not $suiteContractG1Gated) { [void]$suiteContractG1Ungated.Add($suiteContractG1CallName) }
+    }
+    # Спершу доводиться, що всі три виклики знайдено рівно по одному разу:
+    # інакше "нічого не порушено" означало б лише "нічого не знайдено".
+    $suiteContractG1AllFound = $true
+    foreach ($suiteContractG1Name in $suiteContractG1Names) {
+        if (-not $suiteContractG1Found.ContainsKey($suiteContractG1Name) -or $suiteContractG1Found[$suiteContractG1Name] -ne 1) {
+            $suiteContractG1AllFound = $false
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($suiteContractG1AllFound -and $suiteContractG1Ungated.Count -eq 0) `
+        -Name "Framework/SuiteSelectionContract.FullOnlyAssertionsAreGatedOnFullRun" `
+        -Failure ("перевірки стану повного прогону мусять стояти в тілі if (`$null -eq `$script:BRAVOSelfTestSelectedSuite), " +
+            "інакше кожен -Suite завершується SELF-TEST FAILED. Усі три знайдено по одному разу: $suiteContractG1AllFound; " +
+            "без gate: [" + [string]::Join(', ', @($suiteContractG1Ungated.ToArray())) + "]")
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract' } }
+
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionIsolation') { try {
 
 # ============================================================
