@@ -28473,6 +28473,17 @@ Test-BRAVOCondition `
 & {
     $suiteOwnSource = Get-BRAVOSelfTestOwnSourceText
 
+    # Чи був запитаний НЕпорожній -Suite: незалежний факт із параметра скрипта, а не зі
+    # стану вибору. Фільтр порожніх і пробільних елементів дослівно той самий, що в
+    # нормалізації -Suite на початку файлу (порожній -Suite = повний прогін). Gate на
+    # самому $script:BRAVOSelfTestSelectedSuite зробив би перевірки стану повного прогону
+    # тавтологією і пропускав би їх саме тоді, коли вибір виставлено без -Suite.
+    $suiteRequested = (
+        $null -ne $Suite -and @($Suite).Count -gt 0 -and
+        @(@($Suite) |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0)
+
     # Каталог — єдине джерело істини для -Suite. Якщо він розійдеться з
     # фактичними сайтами підключення, -Suite почне мовчки не робити нічого
     # для реального фрагмента або приймати ім'я, якого не існує.
@@ -28518,19 +28529,31 @@ Test-BRAVOCondition `
 
     # Повний прогін — режим за замовчуванням. Саме цей прогін його і доводить:
     # якби -Suite якось активувався без параметра, тут був би не $null.
-    Test-BRAVOCondition `
-        -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
-        -Name "Framework/FullCanonicalRunIsDefault" `
-        -Failure "без -Suite вибір фрагментів мусить лишатися невстановленим — інакше повний прогін перестав бути дефолтом"
+    #
+    # Це стан САМЕ повного прогону (без запитаного -Suite, див. $suiteRequested вище), тому
+    # в -Suite він хибний за визначенням. Gate — НЕ на самому вибору: інакше умова
+    # $null -eq вибір стала б тавтологією всередині такого gate.
+    # Без gate кожен реальний -Suite X завершувався б SELF-TEST FAILED (exit 1),
+    # і успішний вибірковий прогін (exit 0 + SELF-TEST PARTIAL) був би недосяжним.
+    # Gate не послаблює повний прогін: у ньому всі три перевірки виконуються як і раніше.
+    # Стереже Framework/SuiteSelectionContract.FullOnlyAssertionsAreGatedOnFullRun.
+    if (-not $suiteRequested) {
+        Test-BRAVOCondition `
+            -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
+            -Name "Framework/FullCanonicalRunIsDefault" `
+            -Failure "без -Suite вибір фрагментів мусить лишатися невстановленим — інакше повний прогін перестав бути дефолтом"
+    }
 
     $suiteAlwaysEnabled = @(
         $script:BRAVOSelfTestSuiteCatalog |
             Where-Object { -not (Test-BRAVOSelfTestSuiteEnabled -Name $_) })
-    Test-BRAVOCondition `
-        -Condition (@($suiteAlwaysEnabled).Count -eq 0) `
-        -Name "Framework/FullRunEnablesEverySuite" `
-        -Failure ("у повному прогоні кожен фрагмент каталогу мусить бути увімкнений; вимкнені: " +
-            [string]::Join(', ', @($suiteAlwaysEnabled)))
+    if (-not $suiteRequested) {
+        Test-BRAVOCondition `
+            -Condition (@($suiteAlwaysEnabled).Count -eq 0) `
+            -Name "Framework/FullRunEnablesEverySuite" `
+            -Failure ("у повному прогоні кожен фрагмент каталогу мусить бути увімкнений; вимкнені: " +
+                [string]::Join(', ', @($suiteAlwaysEnabled)))
+    }
 
     # КЛЮЧОВА властивість fail-closed: маркер релізу недосяжний з
     # вибіркового прогону. RELEASE_CHECKLIST.md вимагає дослівний
@@ -28585,10 +28608,14 @@ Test-BRAVOCondition `
     } finally {
         $script:BRAVOSelfTestSelectedSuite = $suiteSelectionBefore
     }
+    # Ця перевірка БЕЗУМОВНА і порівнює з тим, що було ДО проби ($suiteSelectionBefore):
+    # у повному прогоні це $null/$null, у -Suite — той самий масив. Обгортка
+    # if ($null -eq ...) зробила б її тавтологією: зламане відновлення залишило б вибір
+    # непорожнім, gate пропустив би перевірку, і нічого б не впало.
     Test-BRAVOCondition `
-        -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
+        -Condition ([object]::ReferenceEquals($script:BRAVOSelfTestSelectedSuite, $suiteSelectionBefore)) `
         -Name "Framework/SuiteSelectionProbeRestoresState" `
-        -Failure "проба предиката мусить відновити вибір фрагментів — інакше підсумок повного прогону назве себе вибірковим"
+        -Failure "проба предиката мусить відновити той вибір фрагментів, що був до проби — інакше підсумок повного прогону назве себе вибірковим"
 
     # --- Підказка "змінений файл -> suite" -----------------------------
     Test-BRAVOCondition `
@@ -29201,6 +29228,869 @@ $null = New-AlphaOwnedFixture
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossSuiteDependency' } }
 
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { try {
+
+# ============================================================
+# Контракт -Suite і підказки "змінений файл -> suite" (VAL-04a / VAL-02a).
+#
+# Корінь виконується ЗАВЖДИ, у тому числі в -Suite, тому ця секція не читає
+# $script:BRAVOSelfTestSelectedSuite як "має бути $null": уся динаміка йде
+# через код, витягнутий з реального файлу, у дочірніх процесах (розбір -Suite)
+# або через статичний AST. Нові змінні тут не виходять за межі своїх & { }.
+# ============================================================
+& {
+    # G1. Перевірки стану ПОВНОГО прогону (вибір не встановлено) в -Suite
+    # хибні за визначенням. Якщо вони не обгорнуті умовою "-Suite не запитано",
+    # кожен реальний -Suite X завершується SELF-TEST FAILED, і успішний
+    # вибірковий прогін (exit 0 + SELF-TEST PARTIAL) недосяжний.
+    # Виняток — SuiteSelectionProbeRestoresState: вона порівнює з $suiteSelectionBefore і
+    # ВІРНА в обох режимах, тому gate на ній заборонений (він робить її тавтологією).
+    $suiteContractG1Ast = Get-BRAVOSelfTestOwnSourceAst
+    $suiteContractG1Names = @(
+        'Framework/FullCanonicalRunIsDefault',
+        'Framework/FullRunEnablesEverySuite',
+        'Framework/SuiteSelectionProbeRestoresState')
+    $suiteContractG1Calls = @($suiteContractG1Ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -eq 'Test-BRAVOCondition'
+            }, $true))
+    $suiteContractG1Found = @{}
+    $suiteContractG1RestoreName = 'Framework/SuiteSelectionProbeRestoresState'
+    $suiteContractG1RestoreOk = $false
+    # Прапорець gate мусить бути присвоєний рівно один раз, із параметра $Suite, і не з
+    # самого вибору $script:BRAVOSelfTestSelectedSuite.
+    $suiteContractG1FlagAssignments = @($suiteContractG1Ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left.Extent.Text -ceq '$suiteRequested'
+            }, $true))
+    $suiteContractG1FlagOk = (
+        $suiteContractG1FlagAssignments.Count -eq 1 -and
+        $suiteContractG1FlagAssignments[0].Right.Extent.Text.Contains('$Suite') -and
+        -not $suiteContractG1FlagAssignments[0].Right.Extent.Text.Contains('BRAVOSelfTestSelectedSuite'))
+    $suiteContractG1Ungated = New-Object System.Collections.Generic.List[string]
+    foreach ($suiteContractG1Call in $suiteContractG1Calls) {
+        $suiteContractG1CallName = ''
+        $suiteContractG1Elements = @($suiteContractG1Call.CommandElements)
+        for ($suiteContractG1Index = 0; $suiteContractG1Index -lt ($suiteContractG1Elements.Count - 1); $suiteContractG1Index++) {
+            $suiteContractG1Element = $suiteContractG1Elements[$suiteContractG1Index]
+            if ($suiteContractG1Element -is [Management.Automation.Language.CommandParameterAst] -and
+                $suiteContractG1Element.ParameterName -eq 'Name' -and
+                $suiteContractG1Elements[$suiteContractG1Index + 1] -is [Management.Automation.Language.StringConstantExpressionAst]) {
+                $suiteContractG1CallName = $suiteContractG1Elements[$suiteContractG1Index + 1].Value
+            }
+        }
+        if ($suiteContractG1Names -cnotcontains $suiteContractG1CallName) { continue }
+        if (-not $suiteContractG1Found.ContainsKey($suiteContractG1CallName)) {
+            $suiteContractG1Found[$suiteContractG1CallName] = 0
+        }
+        $suiteContractG1Found[$suiteContractG1CallName] = $suiteContractG1Found[$suiteContractG1CallName] + 1
+        # Умова gate стоїть у ТІЛІ if (Item2), а не в самій умові чи else.
+        # Для RestoresState вимога протилежна: gate там робить перевірку тавтологією,
+        # тож вона мусить бути БЕЗ gate і порівнювати з $suiteSelectionBefore.
+        $suiteContractG1Gated = $false
+        $suiteContractG1Parent = $suiteContractG1Call.Parent
+        while ($null -ne $suiteContractG1Parent) {
+            if ($suiteContractG1Parent -is [Management.Automation.Language.IfStatementAst]) {
+                foreach ($suiteContractG1Clause in $suiteContractG1Parent.Clauses) {
+                    if ($suiteContractG1Clause.Item1.Extent.Text.Trim() -ceq '-not $suiteRequested' -and
+                        $suiteContractG1Clause.Item2.Extent.StartOffset -le $suiteContractG1Call.Extent.StartOffset -and
+                        $suiteContractG1Call.Extent.EndOffset -le $suiteContractG1Clause.Item2.Extent.EndOffset) {
+                        $suiteContractG1Gated = $true
+                    }
+                }
+            }
+            $suiteContractG1Parent = $suiteContractG1Parent.Parent
+        }
+        if ($suiteContractG1CallName -ceq $suiteContractG1RestoreName) {
+            $suiteContractG1RestoreOk = (-not $suiteContractG1Gated) -and
+                $suiteContractG1Call.Extent.Text.Contains('$suiteSelectionBefore')
+            if (-not $suiteContractG1RestoreOk) { [void]$suiteContractG1Ungated.Add($suiteContractG1CallName) }
+        } elseif (-not $suiteContractG1Gated) {
+            [void]$suiteContractG1Ungated.Add($suiteContractG1CallName)
+        }
+    }
+    # Спершу доводиться, що всі три виклики знайдено рівно по одному разу:
+    # інакше "нічого не порушено" означало б лише "нічого не знайдено".
+    $suiteContractG1AllFound = $true
+    foreach ($suiteContractG1Name in $suiteContractG1Names) {
+        if (-not $suiteContractG1Found.ContainsKey($suiteContractG1Name) -or $suiteContractG1Found[$suiteContractG1Name] -ne 1) {
+            $suiteContractG1AllFound = $false
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($suiteContractG1AllFound -and $suiteContractG1FlagOk -and $suiteContractG1Ungated.Count -eq 0) `
+        -Name "Framework/SuiteSelectionContract.FullOnlyAssertionsAreGatedOnFullRun" `
+        -Failure ("FullCanonicalRunIsDefault і FullRunEnablesEverySuite мусять стояти в тілі if (-not `$suiteRequested), де прапорець обчислено з параметра `$Suite (а не з вибору), " +
+            "інакше кожен -Suite завершується SELF-TEST FAILED; SuiteSelectionProbeRestoresState мусить бути без такого gate " +
+            "і порівнювати з `$suiteSelectionBefore. Усі три знайдено по одному разу: $suiteContractG1AllFound; прапорець коректний: $suiteContractG1FlagOk; " +
+            "порушують: [" + [string]::Join(', ', @($suiteContractG1Ungated.ToArray())) + "]")
+}
+& {
+    # S1, S2, S3, S11, R2, R3, R4: статичний контракт -Suite. Усе читається з
+    # AST власного файлу (Get-BRAVOSelfTestOwnSourceAst), без жодного запуску.
+    $suiteContractAst = Get-BRAVOSelfTestOwnSourceAst
+    $suiteContractTop = @($suiteContractAst.EndBlock.Statements)
+
+    # S1. Оголошення параметрів: порядок, тип, відсутність прив'язочних обмежень.
+    $suiteContractParams = @($suiteContractAst.ParamBlock.Parameters)
+    $suiteContractParamNames = @($suiteContractParams | ForEach-Object { $_.Name.VariablePath.UserPath })
+    $suiteContractSuiteParam = @($suiteContractParams | Where-Object { $_.Name.VariablePath.UserPath -ceq 'Suite' })
+    $suiteContractNoPauseParam = @($suiteContractParams | Where-Object { $_.Name.VariablePath.UserPath -ceq 'NoPause' })
+    $suiteContractCmdletBinding = @($suiteContractAst.ParamBlock.Attributes |
+            Where-Object { $_.TypeName.Name -eq 'CmdletBinding' })
+    $suiteContractParamsOk = (
+        [string]::Join(',', $suiteContractParamNames) -ceq 'ConfigPath,Suite,NoPause' -and
+        $suiteContractSuiteParam.Count -eq 1 -and
+        $suiteContractNoPauseParam.Count -eq 1 -and
+        $suiteContractCmdletBinding.Count -eq 1
+    )
+    if ($suiteContractParamsOk) {
+        $suiteContractParamsOk = (
+            $suiteContractSuiteParam[0].StaticType -eq [string[]] -and
+            @($suiteContractSuiteParam[0].Attributes | Where-Object { $_ -is [Management.Automation.Language.AttributeAst] }).Count -eq 0 -and
+            $null -eq $suiteContractSuiteParam[0].DefaultValue -and
+            $suiteContractNoPauseParam[0].StaticType -eq [switch] -and
+            @($suiteContractCmdletBinding[0].NamedArguments | Where-Object { $_.ArgumentName -eq 'PositionalBinding' }).Count -eq 0
+        )
+    }
+    Test-BRAVOCondition `
+        -Condition $suiteContractParamsOk `
+        -Name "Framework/SuiteSelectionContract.ParamDeclaration" `
+        -Failure ("param() кореня мусить мати порядок ConfigPath, Suite, NoPause; Suite — [string[]] без атрибутів " +
+            "прив'язки (Mandatory/Position/ValidateSet/Alias) і без значення за замовчуванням; NoPause — [switch] останнім; " +
+            "CmdletBinding без PositionalBinding (тоді Suite — позиція 1). Фактичний порядок: " +
+            [string]::Join(', ', $suiteContractParamNames))
+
+    # S2. Каталог: унікальний (без урахування регістру — -notcontains нечутливий),
+    # лише літери, відсортований ordinal-порядком.
+    $suiteContractCatalog = @($script:BRAVOSelfTestSuiteCatalog)
+    $suiteContractCatalogSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($suiteContractCatalogName in $suiteContractCatalog) { [void]$suiteContractCatalogSet.Add([string]$suiteContractCatalogName) }
+    $suiteContractCatalogSorted = [string[]]@($suiteContractCatalog)
+    [Array]::Sort($suiteContractCatalogSorted, [StringComparer]::Ordinal)
+    $suiteContractCatalogNonLetters = @($suiteContractCatalog | Where-Object { $_ -cnotmatch '^[A-Za-z]+$' })
+    Test-BRAVOCondition `
+        -Condition (
+            $suiteContractCatalog.Count -gt 0 -and
+            $suiteContractCatalogSet.Count -eq $suiteContractCatalog.Count -and
+            $suiteContractCatalogNonLetters.Count -eq 0 -and
+            [string]::Join(',', $suiteContractCatalogSorted) -ceq [string]::Join(',', $suiteContractCatalog)
+        ) `
+        -Name "Framework/SuiteSelectionContract.CatalogShapeIsDeterministic" `
+        -Failure ("каталог -Suite мусить бути непорожнім, без дублів (без урахування регістру), лише з літер A-Z " +
+            "(від цього залежить мапа шляхів) і відсортованим ordinal-порядком; імена не з літер: [" +
+            [string]::Join(', ', $suiteContractCatalogNonLetters) + "]")
+
+    # S3. Кожен елемент каталогу має файл фрагмента; фрагменти поза каталогом —
+    # рівно два відомі винятки. Новий standalone-фрагмент вимагає свідомого рішення.
+    $suiteContractFragmentNames = @(
+        [IO.Directory]::GetFiles((Join-Path $root 'selftest'), 'BRAVO_SELF_TEST.*.ps1') |
+            ForEach-Object { [IO.Path]::GetFileName($_) } |
+            Where-Object { $_.EndsWith('.ps1', [StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { $_.Substring('BRAVO_SELF_TEST.'.Length, $_.Length - 'BRAVO_SELF_TEST.'.Length - '.ps1'.Length) })
+    $suiteContractNoFile = @($suiteContractCatalog | Where-Object { $suiteContractFragmentNames -cnotcontains $_ })
+    $suiteContractNotInCatalog = [string[]]@($suiteContractFragmentNames | Where-Object { $suiteContractCatalog -cnotcontains $_ })
+    [Array]::Sort($suiteContractNotInCatalog, [StringComparer]::Ordinal)
+    Test-BRAVOCondition `
+        -Condition (
+            $suiteContractFragmentNames.Count -gt 0 -and
+            $suiteContractNoFile.Count -eq 0 -and
+            [string]::Join(',', $suiteContractNotInCatalog) -ceq 'ConfigV2PilotArtifact,ManualLaunchers'
+        ) `
+        -Name "Framework/SuiteSelectionContract.CatalogEntriesHaveFragmentFiles" `
+        -Failure ("кожен suite каталогу мусить мати selftest\BRAVO_SELF_TEST.<Ім'я>.ps1, а фрагменти поза каталогом " +
+            "мусять бути рівно ConfigV2PilotArtifact (окремий скрипт) і ManualLaunchers (вкладений у LogRotation) — " +
+            "новий фрагмент потребує свідомого рішення. Без файлу: [" + [string]::Join(', ', $suiteContractNoFile) +
+            "]; поза каталогом: [" + [string]::Join(', ', $suiteContractNotInCatalog) + "]")
+
+    # Спільний обхід: усі CommandAst (один FindAll на секцію).
+    $suiteContractCommands = @($suiteContractAst.FindAll({
+                param($node) $node -is [Management.Automation.Language.CommandAst]
+            }, $true))
+
+    # S11. throw на невідомий suite — на верхньому рівні, поза try/trap/функцією,
+    # після Import-Module HelperLogging і до першої секції.
+    $suiteContractThrows = @($suiteContractAst.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.ThrowStatementAst] -and
+                $node.Extent.Text.Contains('Невідомий suite')
+            }, $true))
+    $suiteContractTraps = @($suiteContractAst.FindAll({
+                param($node) $node -is [Management.Automation.Language.TrapStatementAst]
+            }, $true))
+    $suiteContractThrowWrapped = $true
+    $suiteContractThrowOrdered = $false
+    if ($suiteContractThrows.Count -eq 1) {
+        $suiteContractThrowWrapped = $false
+        $suiteContractThrowParent = $suiteContractThrows[0].Parent
+        while ($null -ne $suiteContractThrowParent) {
+            if ($suiteContractThrowParent -is [Management.Automation.Language.TryStatementAst] -or
+                $suiteContractThrowParent -is [Management.Automation.Language.CatchClauseAst] -or
+                $suiteContractThrowParent -is [Management.Automation.Language.TrapStatementAst] -or
+                $suiteContractThrowParent -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                $suiteContractThrowWrapped = $true
+            }
+            $suiteContractThrowParent = $suiteContractThrowParent.Parent
+        }
+        $suiteContractHelperImports = @($suiteContractCommands | Where-Object {
+                $_.GetCommandName() -eq 'Import-Module' -and $_.Extent.Text.Contains('$helperLoggingPath') })
+        $suiteContractSectionEnters = @($suiteContractCommands | Where-Object {
+                $_.GetCommandName() -eq 'Enter-BRAVOSelfTestSection' })
+        if ($suiteContractHelperImports.Count -ge 1 -and $suiteContractSectionEnters.Count -ge 1) {
+            $suiteContractFirstEnter = ($suiteContractSectionEnters | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+            $suiteContractThrowOrdered = (
+                $suiteContractThrows[0].Extent.StartOffset -gt $suiteContractHelperImports[0].Extent.StartOffset -and
+                $suiteContractThrows[0].Extent.StartOffset -lt $suiteContractFirstEnter)
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $suiteContractThrows.Count -eq 1 -and
+            -not $suiteContractThrowWrapped -and
+            $suiteContractTraps.Count -eq 0 -and
+            $suiteContractThrowOrdered
+        ) `
+        -Name "Framework/SuiteSelectionContract.UnknownThrowIsUncaughtTopLevel" `
+        -Failure ("throw на невідомий suite мусить бути один, на верхньому рівні скрипта (поза try/catch/trap/функцією; " +
+            "trap у файлі: $($suiteContractTraps.Count)), після Import-Module HelperLogging і до першої секції — тоді " +
+            "-File завершується необробленою помилкою (код 1). throw: $($suiteContractThrows.Count); обгорнутий: " +
+            "$suiteContractThrowWrapped; порядок: $suiteContractThrowOrdered")
+
+    $suiteContractReportFns = @($suiteContractAst.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Complete-BRAVOSelfTestReport'
+            }, $true))
+    $suiteContractReportText = ''
+    if ($suiteContractReportFns.Count -eq 1) { $suiteContractReportText = $suiteContractReportFns[0].Extent.Text }
+
+    # R2. Текст selective-підсумку зафіксовано (читається з тіла функції звіту,
+    # а не з усього файлу, тому цей тест не задовольняє сам себе).
+    Test-BRAVOCondition `
+        -Condition (
+            $suiteContractReportFns.Count -eq 1 -and
+            $suiteContractReportText.Contains("'вибірковий: '") -and
+            $suiteContractReportText.Contains('Виявлених помилок немає, але виконано ВИБІРКОВИЙ прогін.') -and
+            $suiteContractReportText.Contains('Для мержу й релізу потрібен повний канонічний прогін без -Suite.') -and
+            [regex]::IsMatch($suiteContractReportText,
+                'SELF-TEST PARTIAL: "\s*\+\s*\[string\]::Join\('','', \$script:BRAVOSelfTestSelectedSuite\)')
+        ) `
+        -Name "Framework/SuiteSelectionContract.SelectiveSummaryTextIsPinned" `
+        -Failure ("Complete-BRAVOSelfTestReport мусить друкувати поле 'вибірковий: ', три рядки попередження про " +
+            "вибірковий прогін і маркер SELF-TEST PARTIAL: <імена через кому>; зміна тексту — свідоме рішення")
+
+    # R3. Код завершення не залежить від режиму вибору.
+    $suiteContractExitAssignments = @()
+    if ($suiteContractReportFns.Count -eq 1) {
+        $suiteContractExitAssignments = @($suiteContractReportFns[0].FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                    $node.Left.Extent.Text -ceq '$script:selfTestExitCode'
+                }, $true))
+    }
+    $suiteContractSelectedRefs = @()
+    if ($suiteContractReportFns.Count -eq 1) {
+        $suiteContractSelectedRefs = @($suiteContractReportFns[0].FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.VariableExpressionAst] -and
+                    $node.VariablePath.UserPath -ceq 'script:BRAVOSelfTestSelectedSuite'
+                }, $true))
+    }
+    $suiteContractRefsMisplaced = New-Object System.Collections.Generic.List[string]
+    foreach ($suiteContractRef in $suiteContractSelectedRefs) {
+        $suiteContractRefOk = $false
+        $suiteContractRefParent = $suiteContractRef.Parent
+        while ($null -ne $suiteContractRefParent) {
+            if ($suiteContractRefParent -is [Management.Automation.Language.IfStatementAst]) {
+                foreach ($suiteContractRefClause in $suiteContractRefParent.Clauses) {
+                    if ($suiteContractRefClause.Item1.Extent.StartOffset -le $suiteContractRef.Extent.StartOffset -and
+                        $suiteContractRef.Extent.EndOffset -le $suiteContractRefClause.Item1.Extent.EndOffset) {
+                        $suiteContractRefOk = $true
+                    }
+                }
+            }
+            if ($suiteContractRefParent -is [Management.Automation.Language.CommandAst] -and
+                [string]$suiteContractRefParent.GetCommandName() -like 'Write-*') {
+                $suiteContractRefOk = $true
+            }
+            $suiteContractRefParent = $suiteContractRefParent.Parent
+        }
+        if (-not $suiteContractRefOk) { [void]$suiteContractRefsMisplaced.Add($suiteContractRef.Extent.Text) }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $suiteContractExitAssignments.Count -eq 1 -and
+            $suiteContractExitAssignments[0].Right.Extent.Text -ceq 'if ($script:failures.Count -gt 0) { 1 } else { 0 }' -and
+            -not $suiteContractExitAssignments[0].Extent.Text.Contains('BRAVOSelfTestSelectedSuite') -and
+            $suiteContractSelectedRefs.Count -gt 0 -and
+            $suiteContractRefsMisplaced.Count -eq 0
+        ) `
+        -Name "Framework/SuiteSelectionContract.ExitCodeIndependentOfSelectionMode" `
+        -Failure ("код завершення мусить обчислюватись лише з кількості збоїв (1, якщо збої є, інакше 0): рівно одне " +
+            "присвоєння змінної коду завершення, без згадки вибору suite; " +
+            "вибір у звіті може стояти лише в умовах if або в Write-*. Присвоєнь: $($suiteContractExitAssignments.Count); " +
+            "згадок поза умовою/Write-*: $($suiteContractRefsMisplaced.Count)")
+
+    # R4. Корінь і Phase0 ніколи не під suite-gate; число gate-if = розмір каталогу.
+    $suiteContractGateIfs = New-Object System.Collections.Generic.List[object]
+    foreach ($suiteContractIf in @($suiteContractAst.FindAll({
+                    param($node) $node -is [Management.Automation.Language.IfStatementAst]
+                }, $true))) {
+        foreach ($suiteContractIfClause in $suiteContractIf.Clauses) {
+            if ($suiteContractIfClause.Item1.Extent.Text -match '^Test-BRAVOSelfTestSuiteEnabled -Name ') {
+                [void]$suiteContractGateIfs.Add([pscustomobject]@{ Clause = $suiteContractIfClause })
+            }
+        }
+    }
+    $suiteContractGuardProblems = New-Object System.Collections.Generic.List[string]
+    foreach ($suiteContractGuardName in @('Bootstrap/RuntimeGuard', 'Phase0')) {
+        # Ім'я секції — значення параметра -Name (а не будь-який рядок виклику: 'Phase0' є ще й у -DependsOn).
+        $suiteContractGuardEnters = New-Object System.Collections.Generic.List[object]
+        foreach ($suiteContractEnter in @($suiteContractCommands | Where-Object { $_.GetCommandName() -eq 'Enter-BRAVOSelfTestSection' })) {
+            $suiteContractEnterElements = @($suiteContractEnter.CommandElements)
+            for ($suiteContractEnterIndex = 0; $suiteContractEnterIndex -lt ($suiteContractEnterElements.Count - 1); $suiteContractEnterIndex++) {
+                if ($suiteContractEnterElements[$suiteContractEnterIndex] -is [Management.Automation.Language.CommandParameterAst] -and
+                    $suiteContractEnterElements[$suiteContractEnterIndex].ParameterName -eq 'Name' -and
+                    $suiteContractEnterElements[$suiteContractEnterIndex + 1] -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                    $suiteContractEnterElements[$suiteContractEnterIndex + 1].Value -ceq $suiteContractGuardName) {
+                    [void]$suiteContractGuardEnters.Add($suiteContractEnter)
+                }
+            }
+        }
+        if ($suiteContractGuardEnters.Count -ne 1) {
+            [void]$suiteContractGuardProblems.Add("${suiteContractGuardName}: входів $($suiteContractGuardEnters.Count)")
+            continue
+        }
+        foreach ($suiteContractGate in $suiteContractGateIfs) {
+            $suiteContractGuardBody = $suiteContractGate.Clause.Item2.Extent
+            if ($suiteContractGuardBody.StartOffset -le $suiteContractGuardEnters[0].Extent.StartOffset -and
+                $suiteContractGuardEnters[0].Extent.EndOffset -le $suiteContractGuardBody.EndOffset) {
+                [void]$suiteContractGuardProblems.Add("$suiteContractGuardName стоїть під suite-gate")
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $suiteContractGuardProblems.Count -eq 0 -and
+            $suiteContractGateIfs.Count -gt 0 -and
+            $suiteContractGateIfs.Count -eq $suiteContractCatalog.Count
+        ) `
+        -Name "Framework/SuiteSelectionContract.RootGuardsAreNeverSuiteGated" `
+        -Failure ("Bootstrap/RuntimeGuard і Phase0 мусять виконуватись у кожному режимі, а число if (Test-BRAVOSelfTestSuiteEnabled ...) " +
+            "мусить дорівнювати розміру каталогу ($($suiteContractCatalog.Count)); gate-if: $($suiteContractGateIfs.Count); " +
+            "проблеми: [" + [string]::Join('; ', @($suiteContractGuardProblems.ToArray())) + "]")
+}
+& {
+    # S4-S10, S12, S13: дочірні процеси. P1 — один процес на багато входів
+    # (розбір -Suite з реального коду кореня); P2 — два запуски через -File
+    # (код завершення невідомого suite і форма виклику з комою).
+    # Патерн той самий, що в Tail/Framework.SectionIsolation: хост = поточний
+    # процес, скрипт проби з BOM, без 2>&1 (stderr нативного процесу під
+    # ErrorActionPreference = Stop став би термінальною помилкою батька),
+    # кирилиця з дочірнього процесу — лише через base64.
+    # Корінь проби резолвиться ВСЕРЕДИНІ try (конвенція Framework/FixtureTempRootSetupIsControlled):
+    # збій визначення тимчасового шляху стає помилкою проби, а не обриває секцію.
+    $suiteProbeRoot = $null
+    $suiteProbeCases = @{}
+    $suiteProbeRuns = @{}
+    $suiteProbeError = $null
+    # Id, текст аргументів виклику Invoke-SuiteSelectionCase. Єдине джерело
+    # випадків: і драйвер дочірнього процесу, і очікування батька беруть id звідси.
+    $suiteProbeCaseTable = @(
+        @('absent', ''),
+        @('null', '-Suite $null'),
+        @('empty-array', '-Suite @()'),
+        @('empty-string', "-Suite ''"),
+        @('space', "-Suite ' '"),
+        @('empty-and-space', "-Suite @('', ' ')"),
+        @('single', "-Suite 'Paths'"),
+        @('single-padded', "-Suite ' Paths '"),
+        @('multi-paths-archive', "-Suite @('Paths', 'Archive')"),
+        @('multi-archive-paths', "-Suite @('Archive', 'Paths')"),
+        @('dup-same', "-Suite @('Paths', 'Paths')"),
+        @('dup-case', "-Suite @('paths', 'PATHS', 'Paths')"),
+        @('lower', "-Suite 'archive'"),
+        @('upper-long', "-Suite 'ARCHIVEDISKSPACE'"),
+        @('unknown', "-Suite 'NoSuch'"),
+        @('unknown-mixed', "-Suite @('Paths', 'Bogus', 'Nope')"),
+        @('unknown-dup', "-Suite @('Bogus', 'Bogus')"),
+        @('nonsel-phase0', "-Suite 'Phase0'"),
+        @('nonsel-root-inline', "-Suite 'Root (inline)'"),
+        @('nonsel-manuallaunchers', "-Suite 'ManualLaunchers'"),
+        @('nonsel-configv2pilot', "-Suite 'ConfigV2PilotArtifact'"),
+        @('nonsel-prefix', "-Suite 'Arch'"),
+        @('nonsel-comma-one-element', "-Suite 'Paths,Archive'")
+    )
+    try {
+        $suiteProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SUITE_CONTRACT_' + [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($suiteProbeRoot)
+        $suiteProbeAst = Get-BRAVOSelfTestOwnSourceAst
+        $suiteProbeTop = @($suiteProbeAst.EndBlock.Statements)
+        $suiteProbeCatalogAssign = @($suiteProbeTop | Where-Object {
+                $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $_.Left.Extent.Text -ceq '$script:BRAVOSelfTestSuiteCatalog' })
+        $suiteProbeResetAssign = @($suiteProbeTop | Where-Object {
+                $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $_.Left.Extent.Text -ceq '$script:BRAVOSelfTestSelectedSuite' -and
+                $_.Right.Extent.Text -ceq '$null' }) | Select-Object -First 1
+        $suiteProbeNormalize = @($suiteProbeTop | Where-Object {
+                $_ -is [Management.Automation.Language.IfStatementAst] -and
+                $_.Clauses[0].Item1.Extent.Text -match '^\$null -ne \$Suite' })
+        $suiteProbeEnabledFn = @($suiteProbeTop | Where-Object {
+                $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $_.Name -ceq 'Test-BRAVOSelfTestSuiteEnabled' })
+        if ($suiteProbeCatalogAssign.Count -ne 1 -or $null -eq $suiteProbeResetAssign -or
+            $suiteProbeNormalize.Count -ne 1 -or $suiteProbeEnabledFn.Count -ne 1) {
+            throw 'не знайдено каталог, скидання вибору, розбір -Suite чи Test-BRAVOSelfTestSuiteEnabled — межі розбору -Suite змінено'
+        }
+
+        # P1: функція повторює param() кореня ([string[]]$Suite) і виконує дослівні
+        # оператори розбору (без Set-StrictMode, як у корені на цей момент).
+        $suiteProbeDriverCases = New-Object System.Text.StringBuilder
+        foreach ($suiteProbeRow in $suiteProbeCaseTable) {
+            [void]$suiteProbeDriverCases.AppendLine(
+                "    @{ Id = '" + $suiteProbeRow[0] + "'; Run = { Invoke-SuiteSelectionCase " + $suiteProbeRow[1] + " } }")
+        }
+        $suiteProbeP1Head = @'
+$ErrorActionPreference = 'Stop'
+function Format-SuiteState {
+    if ($null -eq $script:BRAVOSelfTestSelectedSuite) { return 'NULL' }
+    return [string]::Join(';', @($script:BRAVOSelfTestSelectedSuite))
+}
+'@
+        $suiteProbeP1Driver = @'
+foreach ($case in $cases) {
+    $sel = ''
+    $err = ''
+    try {
+        $sel = [string](& $case.Run)
+    } catch {
+        $sel = 'THROW'
+        $err = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_.Exception.Message))
+    }
+    Write-Host ('CASE|' + $case.Id + '|SEL=' + $sel + '|POST=' + (Format-SuiteState) + '|ERR=' + $err)
+}
+'@
+        $suiteProbeP1 = $suiteProbeP1Head + "`r`n" + $suiteProbeCatalogAssign[0].Extent.Text + "`r`n" +
+            $suiteProbeEnabledFn[0].Extent.Text + "`r`n" +
+            "function Invoke-SuiteSelectionCase {`r`n    param([string[]]`$Suite)`r`n    " +
+            $suiteProbeResetAssign.Extent.Text + "`r`n    " + $suiteProbeNormalize[0].Extent.Text + "`r`n" +
+            "    return (Format-SuiteState)`r`n}`r`n`$cases = @(`r`n" + $suiteProbeDriverCases.ToString() + ")`r`n" +
+            $suiteProbeP1Driver + "`r`n"
+        # P2: те саме на верхньому рівні скрипта з param() — точна копія контексту throw.
+        $suiteProbeP2 = "param([string[]]`$Suite)`r`n`$ErrorActionPreference = 'Stop'`r`n" +
+            $suiteProbeCatalogAssign[0].Extent.Text + "`r`n" + $suiteProbeResetAssign.Extent.Text + "`r`n" +
+            $suiteProbeNormalize[0].Extent.Text + "`r`n" +
+            "Write-Host 'PROBE-REACHED'`r`n" +
+            "Write-Host ('PROBE-SEL=' + [string]::Join(';', @(`$script:BRAVOSelfTestSelectedSuite)))`r`n"
+
+        $suiteProbeP1Path = Join-Path $suiteProbeRoot 'probe-p1.ps1'
+        $suiteProbeP2Path = Join-Path $suiteProbeRoot 'probe-p2.ps1'
+        # BOM обов'язковий: Windows PowerShell 5.1 без нього читає кириличні
+        # рядки екстрагованого коду в кодовій сторінці ANSI.
+        [IO.File]::WriteAllText($suiteProbeP1Path, $suiteProbeP1, (New-Object Text.UTF8Encoding($true)))
+        [IO.File]::WriteAllText($suiteProbeP2Path, $suiteProbeP2, (New-Object Text.UTF8Encoding($true)))
+        $suiteProbeHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+
+        $suiteProbeP1Lines = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File $suiteProbeP1Path | ForEach-Object { [string]$_ })
+        foreach ($suiteProbeLine in $suiteProbeP1Lines) {
+            $suiteProbeMatch = [regex]::Match($suiteProbeLine.TrimEnd("`r"), '^CASE\|([^|]+)\|SEL=([^|]*)\|POST=([^|]*)\|ERR=(.*)$')
+            if (-not $suiteProbeMatch.Success) { continue }
+            $suiteProbeErrText = ''
+            if ($suiteProbeMatch.Groups[4].Value.Length -gt 0) {
+                $suiteProbeErrText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($suiteProbeMatch.Groups[4].Value))
+            }
+            $suiteProbeCases[$suiteProbeMatch.Groups[1].Value] = [pscustomobject]@{
+                Sel  = $suiteProbeMatch.Groups[2].Value
+                Post = $suiteProbeMatch.Groups[3].Value
+                Err  = $suiteProbeErrText
+            }
+        }
+
+        # Без 2>&1: повідомлення про помилку йде в stderr і тут не перевіряється.
+        $suiteProbeRunA = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File $suiteProbeP2Path -Suite NoSuchSuite | ForEach-Object { [string]$_ })
+        $suiteProbeRuns['unknown'] = [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($suiteProbeRunA | ForEach-Object { $_.TrimEnd("`r") }) }
+        $suiteProbeRunB = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File $suiteProbeP2Path -Suite 'Paths,Archive' | ForEach-Object { [string]$_ })
+        $suiteProbeRuns['comma'] = [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($suiteProbeRunB | ForEach-Object { $_.TrimEnd("`r") }) }
+    } catch {
+        $suiteProbeError = $_.Exception.Message
+    } finally {
+        # Remove-BRAVOSelfTestFixtureDirectory тут не застосовано: його визначено всередині
+        # секції Tail/Isolation (з -DependsOn), тож виклик з цієї секції створив би прихований
+        # зв'язок між секціями і при перерваній Tail/Isolation кидав би CommandNotFound у finally.
+        # Секція SectionIsolation прибирає свій корінь так само напряму.
+        if (-not [string]::IsNullOrEmpty($suiteProbeRoot) -and [IO.Directory]::Exists($suiteProbeRoot)) {
+            [IO.Directory]::Delete($suiteProbeRoot, $true)
+        }
+    }
+
+    # [НЕДОСТУПНО] лише коли дочірній процес не дав ЖОДНОГО випадку і хост
+    # доведено обмежений; проба, що відпрацювала неправильно, — [FAIL].
+    $suiteProbeRestriction = ''
+    if ($suiteProbeCases.Count -eq 0) {
+        $suiteProbeRestriction = [string](Get-BRAVOSelfTestHostRestriction)
+    }
+    $suiteProbeCase = {
+        param([string]$Id)
+        if ($suiteProbeCases.ContainsKey($Id)) { return $suiteProbeCases[$Id] }
+        return $null
+    }
+    $suiteProbeDescribe = {
+        param([string[]]$Ids)
+        $described = New-Object System.Collections.Generic.List[string]
+        foreach ($describedId in $Ids) {
+            $describedCase = & $suiteProbeCase $describedId
+            if ($null -eq $describedCase) { [void]$described.Add("${describedId}: випадку немає"); continue }
+            [void]$described.Add("${describedId}: SEL=$($describedCase.Sel) POST=$($describedCase.Post) ERR=[$($describedCase.Err)]")
+        }
+        return [string]::Join('; ', @($described.ToArray()))
+    }
+    # Очікування "вибір = $Selected, без помилки" (NULL = повний прогін).
+    $suiteProbeExpectSelection = {
+        param([string[]]$Ids, [string[]]$Selected)
+        for ($expectIndex = 0; $expectIndex -lt $Ids.Count; $expectIndex++) {
+            $expectCase = & $suiteProbeCase $Ids[$expectIndex]
+            if ($null -eq $expectCase) { return $false }
+            if ($expectCase.Sel -cne $Selected[$expectIndex] -or $expectCase.Post -cne $Selected[$expectIndex] -or
+                $expectCase.Err.Length -ne 0) { return $false }
+        }
+        return $true
+    }
+    $suiteProbeExpectedError = {
+        param([string]$Unknown)
+        return ('Невідомий suite: ' + $Unknown + '. Доступні: ' + [string]::Join(', ', $script:BRAVOSelfTestSuiteCatalog) +
+            '. Без -Suite виконується повний канонічний прогін.')
+    }
+    # Очікування "виняток з точним повідомленням, вибір не встановлено".
+    $suiteProbeExpectThrow = {
+        param([string[]]$Ids, [string[]]$Unknown)
+        for ($expectIndex = 0; $expectIndex -lt $Ids.Count; $expectIndex++) {
+            $expectCase = & $suiteProbeCase $Ids[$expectIndex]
+            if ($null -eq $expectCase) { return $false }
+            if ($expectCase.Sel -cne 'THROW' -or $expectCase.Post -cne 'NULL' -or
+                $expectCase.Err -cne (& $suiteProbeExpectedError $Unknown[$expectIndex])) { return $false }
+        }
+        return $true
+    }
+
+    if ($null -ne $suiteProbeError) {
+        Test-BRAVOCondition `
+            -Condition $false `
+            -Name 'Framework/SuiteSelectionContract.ProbeExecution' `
+            -EnvironmentLimitation $suiteProbeRestriction `
+            -Failure "проби розбору -Suite не вдалося підготувати чи запустити: $suiteProbeError"
+    } else {
+        $suiteProbeFull = @('absent', 'null', 'empty-array', 'empty-string', 'space', 'empty-and-space')
+        Test-BRAVOCondition `
+            -Condition (& $suiteProbeExpectSelection $suiteProbeFull @('NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL')) `
+            -Name "Framework/SuiteSelectionContract.AbsentOrEmptyMeansFull" `
+            -EnvironmentLimitation $suiteProbeRestriction `
+            -Failure ("відсутній, `$null, порожній масив, порожній і пробільний рядок -Suite мусять давати повний прогін " +
+                "(вибір `$null) без помилки: " + (& $suiteProbeDescribe $suiteProbeFull))
+
+        $suiteProbeSingle = @('single', 'single-padded')
+        Test-BRAVOCondition `
+            -Condition (& $suiteProbeExpectSelection $suiteProbeSingle @('Paths', 'Paths')) `
+            -Name "Framework/SuiteSelectionContract.SingleSuiteSelected" `
+            -EnvironmentLimitation $suiteProbeRestriction `
+            -Failure ("один suite (також з пробілами по краях) мусить дати вибір з одного імені: " + (& $suiteProbeDescribe $suiteProbeSingle))
+
+        $suiteProbeMulti = @('multi-paths-archive', 'multi-archive-paths')
+        Test-BRAVOCondition `
+            -Condition (& $suiteProbeExpectSelection $suiteProbeMulti @('Paths;Archive', 'Archive;Paths')) `
+            -Name "Framework/SuiteSelectionContract.MultiSuiteKeepsRequestOrder" `
+            -EnvironmentLimitation $suiteProbeRestriction `
+            -Failure ("кілька suite мусять зберігати порядок запиту, а не порядок каталогу: " + (& $suiteProbeDescribe $suiteProbeMulti))
+
+        $suiteProbeDup = @('dup-same', 'dup-case', 'lower', 'upper-long')
+        Test-BRAVOCondition `
+            -Condition (& $suiteProbeExpectSelection $suiteProbeDup @('Paths', 'Paths', 'Archive', 'ArchiveDiskSpace')) `
+            -Name "Framework/SuiteSelectionContract.DuplicatesAndCaseCollapse" `
+            -EnvironmentLimitation $suiteProbeRestriction `
+            -Failure ("дублі й варіанти регістру мусять згортатись до одного імені в написанні каталогу: " + (& $suiteProbeDescribe $suiteProbeDup))
+
+        Test-BRAVOCondition `
+            -Condition (& $suiteProbeExpectThrow @('unknown') @('NoSuch')) `
+            -Name "Framework/SuiteSelectionContract.UnknownSuiteThrowsExactMessage" `
+            -EnvironmentLimitation $suiteProbeRestriction `
+            -Failure ("невідомий suite мусить кидати точне повідомлення з повним переліком каталогу, а вибір лишатись `$null: " +
+                (& $suiteProbeDescribe @('unknown')))
+
+        $suiteProbeMixed = @('unknown-mixed', 'unknown-dup')
+        Test-BRAVOCondition `
+            -Condition (& $suiteProbeExpectThrow $suiteProbeMixed @('Bogus, Nope', 'Bogus, Bogus')) `
+            -Name "Framework/SuiteSelectionContract.UnknownSuiteListsOnlyUnknownAndNeverPartiallySelects" `
+            -EnvironmentLimitation $suiteProbeRestriction `
+            -Failure ("повідомлення має називати лише невідомі імена (дублі невідомих не згортаються), а відомі імена з того " +
+                "самого запиту не мають потрапляти у вибір: " + (& $suiteProbeDescribe $suiteProbeMixed))
+
+        $suiteProbeNonSelectable = @('nonsel-phase0', 'nonsel-root-inline', 'nonsel-manuallaunchers',
+            'nonsel-configv2pilot', 'nonsel-prefix', 'nonsel-comma-one-element')
+        Test-BRAVOCondition `
+            -Condition (& $suiteProbeExpectThrow $suiteProbeNonSelectable @('Phase0', 'Root (inline)', 'ManualLaunchers',
+                    'ConfigV2PilotArtifact', 'Arch', 'Paths,Archive')) `
+            -Name "Framework/SuiteSelectionContract.NonSelectableNamesAreUnknown" `
+            -EnvironmentLimitation $suiteProbeRestriction `
+            -Failure ("імена поза каталогом (Phase0, Root (inline), фрагменти поза каталогом, префікс імені, два імені в одному " +
+                "рядку) мусять бути невідомими: " + (& $suiteProbeDescribe $suiteProbeNonSelectable))
+    }
+
+    # S12 / S13: -File. Обидва запуски мають сенс лише коли дочірній процес працює взагалі.
+    $suiteProbeUnknownRun = $null
+    if ($suiteProbeRuns.ContainsKey('unknown')) { $suiteProbeUnknownRun = $suiteProbeRuns['unknown'] }
+    $suiteProbeCommaRun = $null
+    if ($suiteProbeRuns.ContainsKey('comma')) { $suiteProbeCommaRun = $suiteProbeRuns['comma'] }
+    $suiteProbeUnknownOk = (
+        $null -ne $suiteProbeUnknownRun -and
+        $suiteProbeUnknownRun.ExitCode -eq 1 -and
+        @($suiteProbeUnknownRun.Lines | Where-Object { $_.Contains('PROBE-REACHED') -or $_.Contains('SELF-TEST PASSED') }).Count -eq 0)
+    $suiteProbeUnknownExit = 'прогін не виконано'
+    if ($null -ne $suiteProbeUnknownRun) { $suiteProbeUnknownExit = [string]$suiteProbeUnknownRun.ExitCode }
+    Test-BRAVOCondition `
+        -Condition $suiteProbeUnknownOk `
+        -Name "Framework/SuiteSelectionContract.UnknownSuiteExitsNonZeroUnderFile" `
+        -EnvironmentLimitation $suiteProbeRestriction `
+        -Failure ("powershell -File ... -Suite NoSuchSuite мусить завершуватись кодом 1 без виконання подальшого коду; " +
+            "код: $suiteProbeUnknownExit")
+
+    # Межа -File: у Windows PowerShell 5.1 аргумент 'Paths,Archive' після -File
+    # не обов'язково розбирається як масив. Допустимі рівно два результати, і
+    # жоден не вибирає тихо не те, що просили: (1) масив з двох елементів —
+    # код 0 і вибір Paths;Archive, або (2) один рядок 'Paths,Archive' — він
+    # невідомий, код 1 і код далі не виконується.
+    # Після першого прогону на Windows CI записати тут, який саме варіант
+    # обрав Windows PowerShell 5.1.
+    $suiteProbeCommaSelected = (
+        $null -ne $suiteProbeCommaRun -and
+        $suiteProbeCommaRun.ExitCode -eq 0 -and
+        $suiteProbeCommaRun.Lines -ccontains 'PROBE-REACHED' -and
+        $suiteProbeCommaRun.Lines -ccontains 'PROBE-SEL=Paths;Archive')
+    $suiteProbeCommaRejected = (
+        $null -ne $suiteProbeCommaRun -and
+        $suiteProbeCommaRun.ExitCode -eq 1 -and
+        $suiteProbeCommaRun.Lines -cnotcontains 'PROBE-REACHED')
+    $suiteProbeCommaExit = 'прогін не виконано'
+    if ($null -ne $suiteProbeCommaRun) { $suiteProbeCommaExit = [string]$suiteProbeCommaRun.ExitCode }
+    Test-BRAVOCondition `
+        -Condition ($suiteProbeCommaSelected -or $suiteProbeCommaRejected) `
+        -Name "Framework/SuiteSelectionContract.FileInvocationCommaFormNeverSilentlyMisselects" `
+        -EnvironmentLimitation $suiteProbeRestriction `
+        -Failure ("-File ... -Suite 'Paths,Archive' мусить дати або вибір Paths;Archive з кодом 0, або відмову з кодом 1 " +
+            "без виконання подальшого коду; код: $suiteProbeCommaExit")
+}
+& {
+    # M1-M9: мапа "змінений файл -> suite" (Get-BRAVOSelfTestSuiteForChangedPath),
+    # in-process. Порівняння точне (-ceq) за приєднаним через '|' результатом, а не
+    # -contains: -contains не помічає зайвих елементів у результаті. Група фіксує
+    # ПОТОЧНУ поведінку мапи; її розширення (Affected) оновлює ці тести свідомо.
+    $suiteMapCatalog = @($script:BRAVOSelfTestSuiteCatalog)
+    $suiteMapped = {
+        param([string]$Path)
+        return [string]::Join('|', @(Get-BRAVOSelfTestSuiteForChangedPath -Path $Path))
+    }
+    # Пари @(шлях, очікуваний результат); повертає опис розбіжностей.
+    $suiteMapMismatch = {
+        param([object[]]$Pairs)
+        $mismatches = New-Object System.Collections.Generic.List[string]
+        foreach ($pair in $Pairs) {
+            $actual = & $suiteMapped ([string]$pair[0])
+            if ($actual -cne [string]$pair[1]) {
+                [void]$mismatches.Add("'" + [string]$pair[0] + "' -> '" + $actual + "' (очікувалось '" + [string]$pair[1] + "')")
+            }
+        }
+        return @($mismatches.ToArray())
+    }
+
+    # M1. Кожен фрагмент каталогу відображається рівно на себе, у всіх формах шляху.
+    $suiteMapFragmentPairs = New-Object System.Collections.Generic.List[object]
+    foreach ($suiteMapName in $suiteMapCatalog) {
+        $suiteMapRel = 'selftest\BRAVO_SELF_TEST.' + $suiteMapName + '.ps1'
+        foreach ($suiteMapForm in @(
+                $suiteMapRel,
+                $suiteMapRel.Replace('\', '/'),
+                ('.\' + $suiteMapRel),
+                ('./' + $suiteMapRel.Replace('\', '/')),
+                ('C:\work\repo\' + $suiteMapRel),
+                ('/home/u/repo/' + $suiteMapRel.Replace('\', '/')),
+                $suiteMapRel.ToUpperInvariant(),
+                ('  ' + $suiteMapRel + '  '))) {
+            [void]$suiteMapFragmentPairs.Add(@($suiteMapForm, $suiteMapName))
+        }
+    }
+    $suiteMapProblems = @(& $suiteMapMismatch $suiteMapFragmentPairs.ToArray())
+    Test-BRAVOCondition `
+        -Condition ($suiteMapCatalog.Count -gt 0 -and $suiteMapProblems.Count -eq 0) `
+        -Name "Framework/ChangedPathMap.FragmentsMapExactlyAndOnlyToThemselves" `
+        -Failure ("фрагмент каталогу мусить відображатись рівно на однойменний suite (без зайвих елементів) у формах " +
+            "'\', '/', '.\', './', абсолютний шлях, верхній регістр, пробіли по краях: " +
+            [string]::Join('; ', @($suiteMapProblems | Select-Object -First 5)))
+
+    # M2. Фрагменти й файли поза каталогом не відображаються ні на що.
+    $suiteMapProblems = @(& $suiteMapMismatch @(
+            @('selftest\BRAVO_SELF_TEST.ManualLaunchers.ps1', ''),
+            @('selftest\BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1', ''),
+            @('selftest\BRAVO_SELF_TEST.NoSuch.ps1', ''),
+            @('selftest\BRAVO_SELF_TEST.Paths.ps1.bak', ''),
+            @('selftest\fixtures\BravoConfigLegacyFrozen.config', '')))
+    Test-BRAVOCondition `
+        -Condition ($suiteMapProblems.Count -eq 0) `
+        -Name "Framework/ChangedPathMap.FragmentsOutsideCatalogMapToNothing" `
+        -Failure ("фрагмент поза каталогом, суфікс після .ps1 і фікстури selftest мусять давати порожній результат: " +
+            [string]::Join('; ', $suiteMapProblems))
+
+    # M3. Таблиця модулів закріплена: ПОВНИЙ перелік каталогів modules\BRAVO.* і
+    # відповідний suite для кожного. Новий модуль ламає тест і вимагає свідомого
+    # рішення про мапу (станом на базу гілки: 23 модулі, 10 з suite).
+    $suiteMapModuleSuites = @{
+        'Archive'                = 'Archive'
+        'BazaSync'               = 'BazaSync'
+        'Configuration'          = 'Configuration'
+        'Configurator'           = 'Configurator'
+        'DataRestore'            = 'DataRestore'
+        'DataRestore.MatrixTest' = 'DataRestore'
+        'DiskSpace'              = 'DiskSpace'
+        'Operations'             = 'Operations'
+        'RestoreVerify'          = 'RestoreVerify'
+        'Status'                 = 'Status'
+    }
+    $suiteMapModulesWithoutSuite = @('ArchiveHelpers', 'ArchiveRuntime', 'Compatibility', 'Console', 'Credentials',
+        'Discovery', 'ExitCodes', 'Health', 'HelperLogging', 'Logging', 'Maintenance', 'Notifications', 'System')
+    $suiteMapActualModules = [string[]]@(
+        [IO.Directory]::GetDirectories((Join-Path $root 'modules')) |
+            ForEach-Object { [IO.Path]::GetFileName($_) } |
+            Where-Object { $_.StartsWith('BRAVO.', [StringComparison]::Ordinal) } |
+            ForEach-Object { $_.Substring('BRAVO.'.Length) })
+    [Array]::Sort($suiteMapActualModules, [StringComparer]::Ordinal)
+    $suiteMapExpectedModules = [string[]]@(@($suiteMapModuleSuites.Keys) + $suiteMapModulesWithoutSuite)
+    [Array]::Sort($suiteMapExpectedModules, [StringComparer]::Ordinal)
+    $suiteMapModulePairs = New-Object System.Collections.Generic.List[object]
+    foreach ($suiteMapModule in $suiteMapActualModules) {
+        $suiteMapExpected = ''
+        if ($suiteMapModuleSuites.ContainsKey($suiteMapModule)) { $suiteMapExpected = $suiteMapModuleSuites[$suiteMapModule] }
+        [void]$suiteMapModulePairs.Add(@(('modules\BRAVO.' + $suiteMapModule + '\x.psm1'), $suiteMapExpected))
+    }
+    $suiteMapProblems = @(& $suiteMapMismatch $suiteMapModulePairs.ToArray())
+    Test-BRAVOCondition `
+        -Condition (
+            $suiteMapActualModules.Count -gt 0 -and
+            [string]::Join(',', $suiteMapActualModules) -ceq [string]::Join(',', $suiteMapExpectedModules) -and
+            $suiteMapProblems.Count -eq 0
+        ) `
+        -Name "Framework/ChangedPathMap.ModuleTableIsPinned" `
+        -Failure ("перелік модулів і мапа 'модуль -> suite' закріплені: новий або перейменований модуль потребує свідомого " +
+            "рішення про мапу. Фактично: [" + [string]::Join(',', $suiteMapActualModules) + "]; розбіжності: [" +
+            [string]::Join('; ', $suiteMapProblems) + "]")
+
+    # M4. Модуль-префікс іншого імені не просочується; суміжні suite не підміняються.
+    $suiteMapProblems = @(& $suiteMapMismatch @(
+            @('modules\BRAVO.ArchiveHelpers\x.psm1', ''),
+            @('modules\BRAVO.ArchiveRuntime\x.psm1', ''),
+            @('modules\BRAVO.DiskSpace', 'DiskSpace'),
+            @('modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psm1', 'DiskSpace'),
+            @('modules\BRAVO.Archive\BRAVO.Archive.psm1', 'Archive')))
+    Test-BRAVOCondition `
+        -Condition ($suiteMapProblems.Count -eq 0) `
+        -Name "Framework/ChangedPathMap.ModulePrefixDoesNotLeak" `
+        -Failure ("ім'я модуля береться повністю: ArchiveHelpers/ArchiveRuntime не відображаються на Archive, а DiskSpace — " +
+            "лише на DiskSpace, без залежних suite: " + [string]::Join('; ', $suiteMapProblems))
+
+    # M5. Не-код і інфраструктура — порожній результат (= повний прогін). Це
+    # поточний консервативний стан; правила для цих класів додає Affected.
+    $suiteMapUnmapped = @('BRAVO_ARCHIV.ps1', 'BRAVO_HEALTH.ps1', 'BRAVO_SELF_TEST.ps1', 'README.md', 'CHANGELOG.md',
+        'docs\design\BRAVO_VALIDATION_ARCHITECTURE.md', '.github\workflows\ci.yml', 'ci\Update-BRAVORuntimeManifest.ps1',
+        'deploy\Install-BRAVOServer.ps1', 'Tools\TOOLS_MANIFEST.json', 'RUNTIME_MANIFEST.json', 'VERSION.json',
+        'BRAVO.local.config.example', 'PSScriptAnalyzerSettings.psd1')
+    $suiteMapProblems = @(& $suiteMapMismatch @($suiteMapUnmapped | ForEach-Object { , @($_, '') }))
+    Test-BRAVOCondition `
+        -Condition ($suiteMapProblems.Count -eq 0) `
+        -Name "Framework/ChangedPathMap.NonCodeAndInfraPathsMapToNothing" `
+        -Failure ("точки входу, документи, workflow, ci/deploy/Tools, маніфести й конфігурація мусять давати порожній " +
+            "результат: " + [string]::Join('; ', $suiteMapProblems))
+
+    # M6. Порожній вхід не повертає suite. Для $null допустимі рівно два
+    # результати (Mandatory + AllowEmptyString + коерція [string], точна поведінка
+    # залежить від runtime): виняток прив'язки або порожній результат.
+    $suiteMapProblems = @(& $suiteMapMismatch @(@('', ''), @('   ', '')))
+    $suiteMapNullThrew = $false
+    $suiteMapNullResult = @()
+    try {
+        $suiteMapNullResult = @(Get-BRAVOSelfTestSuiteForChangedPath -Path $null)
+    } catch {
+        $suiteMapNullThrew = $true
+    }
+    Test-BRAVOCondition `
+        -Condition ($suiteMapProblems.Count -eq 0 -and ($suiteMapNullThrew -or $suiteMapNullResult.Count -eq 0)) `
+        -Name "Framework/ChangedPathMap.EmptyAndNullInputNeverReturnsSuite" `
+        -Failure ("порожній і пробільний шлях мусять давати порожній результат, а `$null — виняток прив'язки або порожній " +
+            "результат, але не suite. Розбіжності: [" + [string]::Join('; ', $suiteMapProblems) + "]; `$null повернув: " +
+            [string]::Join(',', @($suiteMapNullResult)))
+
+    # M7. Форма результату: без @(...) порожній результат — $null, а один збіг —
+    # скалярний [string]. Майбутній union мусить обгортати виклик у @(...).
+    $suiteMapShapeEmpty = Get-BRAVOSelfTestSuiteForChangedPath -Path 'README.md'
+    $suiteMapShapeKnown = Get-BRAVOSelfTestSuiteForChangedPath -Path 'selftest\BRAVO_SELF_TEST.Paths.ps1'
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $suiteMapShapeEmpty -and
+            $suiteMapShapeKnown -is [string] -and
+            $suiteMapShapeKnown -isnot [array] -and
+            @($suiteMapShapeEmpty).Count -eq 0 -and
+            @($suiteMapShapeKnown).Count -eq 1
+        ) `
+        -Name "Framework/ChangedPathMap.ResultShapeNeedsArrayWrapping" `
+        -Failure ("результат мапи розгортається конвеєром: нуль збігів -> `$null, один збіг -> скаляр [string]; викликач мусить " +
+            "обгортати його в @(...). Порожній: " + $(if ($null -eq $suiteMapShapeEmpty) { '$null' } else { $suiteMapShapeEmpty.GetType().Name }) +
+            "; один збіг: " + $(if ($null -eq $suiteMapShapeKnown) { '$null' } else { $suiteMapShapeKnown.GetType().Name }))
+
+    # M8. Для кожного реального файлу під modules\ і selftest\: не більше одного
+    # suite, і це ім'я з каталогу.
+    $suiteMapRootFull = [IO.Path]::GetFullPath($root).TrimEnd('\', '/')
+    $suiteMapFiles = New-Object System.Collections.Generic.List[string]
+    foreach ($suiteMapDirName in @('modules', 'selftest')) {
+        $suiteMapDirFull = [IO.Path]::GetFullPath((Join-Path $root $suiteMapDirName))
+        foreach ($suiteMapFile in [IO.Directory]::GetFiles($suiteMapDirFull, '*', [IO.SearchOption]::AllDirectories)) {
+            [void]$suiteMapFiles.Add($suiteMapFile.Substring($suiteMapRootFull.Length).TrimStart('\', '/').Replace('/', '\'))
+        }
+    }
+    $suiteMapShapeProblems = New-Object System.Collections.Generic.List[string]
+    foreach ($suiteMapRelFile in $suiteMapFiles) {
+        $suiteMapResult = @(Get-BRAVOSelfTestSuiteForChangedPath -Path $suiteMapRelFile)
+        if ($suiteMapResult.Count -gt 1) {
+            [void]$suiteMapShapeProblems.Add("$suiteMapRelFile -> [" + [string]::Join(',', $suiteMapResult) + "]")
+        }
+        foreach ($suiteMapResultItem in $suiteMapResult) {
+            if ($suiteMapCatalog -cnotcontains [string]$suiteMapResultItem) {
+                [void]$suiteMapShapeProblems.Add("$suiteMapRelFile -> '$suiteMapResultItem' не з каталогу")
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($suiteMapFiles.Count -gt 0 -and $suiteMapShapeProblems.Count -eq 0) `
+        -Name "Framework/ChangedPathMap.NeverReturnsMoreThanOneSuiteOrUnknownName" `
+        -Failure ("мапа мусить повертати для файлу не більше одного suite і лише ім'я з каталогу; перевірено файлів: " +
+            "$($suiteMapFiles.Count); проблеми: [" + [string]::Join('; ', @($suiteMapShapeProblems | Select-Object -First 5)) + "]")
+
+    # M9. ЛИШЕ фіксація поточної нестрогості: правило фрагмента без якоря початку
+    # (xselftest\... дає Paths), правило модуля з якорем (./modules\... та абсолютні
+    # шляхи дають порожньо). Звуження чи виправлення — свідома зміна цього тесту,
+    # а не регресія.
+    $suiteMapProblems = @(& $suiteMapMismatch @(
+            @('xselftest\BRAVO_SELF_TEST.Paths.ps1', 'Paths'),
+            @('./modules/BRAVO.Archive/x', ''),
+            @('C:\repo\modules\BRAVO.Archive\x', '')))
+    Test-BRAVOCondition `
+        -Condition ($suiteMapProblems.Count -eq 0) `
+        -Name "Framework/ChangedPathMap.CurrentLooseMatchingIsRecorded" `
+        -Failure ("зафіксована поточна поведінка мапи змінилась (правило фрагмента без якоря, правило модуля з якорем) — " +
+            "якщо зміна навмисна, оновіть цей тест: " + [string]::Join('; ', $suiteMapProblems))
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract' } }
+
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionIsolation') { try {
 
 # ============================================================
@@ -29400,6 +30290,21 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/TailOmegaRuns' -Failure 'n/a'
     if (Enter-BRAVOSelfTestSection -Name 'Root/AfterSelective') { try {
     Test-BRAVOCondition -Condition $true -Name 'Probe/AfterSelectiveRuns' -Failure 'n/a'
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/AfterSelective' } }
+'@
+                Tail = ''
+            }
+            # Успішний вибірковий прогін: код 0 і SELF-TEST PARTIAL (з усіма вибраними
+            # іменами), але ніколи SELF-TEST PASSED. Ті самі правила щодо лапок: імена
+            # suite в подвійних лапках, щоб regex-guard-и #187 не бачили синтетичні suite.
+            SelectivePass = @{
+                Pre  = "`$script:BRAVOSelfTestSelectedSuite = @('Gamma', 'Other')"
+                Main = @'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name "Gamma") {
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/Gamma') { try {
+        Enter-BRAVOSelfTestSuite -Name 'Gamma'
+        Test-BRAVOCondition -Condition $true -Name 'Probe/SelectivePassGamma' -Failure 'n/a'
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/Gamma' } }
+    }
 '@
                 Tail = ''
             }
@@ -29641,6 +30546,14 @@ Test-BRAVOCondition -Condition $true -Name 'Probe/TailAfterBoundaryRuns' -Failur
             -Name 'Framework/SectionIsolation.SelectiveRunWithFatalSectionFails' `
             -EnvironmentLimitation (& $isolationRestriction 'Selective') `
             -Failure ('вибірковий прогін із перерваною секцією має дати FAILED, а не PARTIAL: ' + [string]::Join('; ', $isolationProblems))
+
+        $isolationProblems = @(& $isolationMismatch 'SelectivePass' 0 @('[PASS] Probe/SelectivePassGamma',
+                'SELF-TEST PARTIAL: Gamma,Other', 'PROBE-HELPERLOG-EXIT=0') @('SELF-TEST PASSED', 'SELF-TEST FAILED'))
+        Test-BRAVOCondition `
+            -Condition ($isolationProblems.Count -eq 0) `
+            -Name 'Framework/SectionIsolation.SelectiveCleanRunPrintsPartialNotPassed' `
+            -EnvironmentLimitation (& $isolationRestriction 'SelectivePass') `
+            -Failure ('успішний вибірковий прогін має дати код 0 і SELF-TEST PARTIAL, але не SELF-TEST PASSED: ' + [string]::Join('; ', $isolationProblems))
 
         $isolationProblems = @(& $isolationMismatch 'Shadowed' 1 @('Framework/RunStopped', 'BRAVOProbeShadow', 'Section/Tail/AfterCorrupt',
                 'SELF-TEST FAILED', 'PROBE-HELPERLOG-EXIT=1') @('Probe/OuterAfterCorruptMustNotRun', 'Probe/AfterCorruptMustNotRun',
