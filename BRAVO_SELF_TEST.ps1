@@ -28473,6 +28473,17 @@ Test-BRAVOCondition `
 & {
     $suiteOwnSource = Get-BRAVOSelfTestOwnSourceText
 
+    # Чи був запитаний НЕпорожній -Suite: незалежний факт із параметра скрипта, а не зі
+    # стану вибору. Фільтр порожніх і пробільних елементів дослівно той самий, що в
+    # нормалізації -Suite на початку файлу (порожній -Suite = повний прогін). Gate на
+    # самому $script:BRAVOSelfTestSelectedSuite зробив би перевірки стану повного прогону
+    # тавтологією і пропускав би їх саме тоді, коли вибір виставлено без -Suite.
+    $suiteRequested = (
+        $null -ne $Suite -and @($Suite).Count -gt 0 -and
+        @(@($Suite) |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0)
+
     # Каталог — єдине джерело істини для -Suite. Якщо він розійдеться з
     # фактичними сайтами підключення, -Suite почне мовчки не робити нічого
     # для реального фрагмента або приймати ім'я, якого не існує.
@@ -28519,12 +28530,14 @@ Test-BRAVOCondition `
     # Повний прогін — режим за замовчуванням. Саме цей прогін його і доводить:
     # якби -Suite якось активувався без параметра, тут був би не $null.
     #
-    # Це стан САМЕ повного прогону, тому в -Suite він хибний за визначенням.
+    # Це стан САМЕ повного прогону (без запитаного -Suite, див. $suiteRequested вище), тому
+    # в -Suite він хибний за визначенням. Gate — НЕ на самому вибору: інакше умова
+    # $null -eq вибір стала б тавтологією всередині такого gate.
     # Без gate кожен реальний -Suite X завершувався б SELF-TEST FAILED (exit 1),
     # і успішний вибірковий прогін (exit 0 + SELF-TEST PARTIAL) був би недосяжним.
     # Gate не послаблює повний прогін: у ньому всі три перевірки виконуються як і раніше.
     # Стереже Framework/SuiteSelectionContract.FullOnlyAssertionsAreGatedOnFullRun.
-    if ($null -eq $script:BRAVOSelfTestSelectedSuite) {
+    if (-not $suiteRequested) {
         Test-BRAVOCondition `
             -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
             -Name "Framework/FullCanonicalRunIsDefault" `
@@ -28534,7 +28547,7 @@ Test-BRAVOCondition `
     $suiteAlwaysEnabled = @(
         $script:BRAVOSelfTestSuiteCatalog |
             Where-Object { -not (Test-BRAVOSelfTestSuiteEnabled -Name $_) })
-    if ($null -eq $script:BRAVOSelfTestSelectedSuite) {
+    if (-not $suiteRequested) {
         Test-BRAVOCondition `
             -Condition (@($suiteAlwaysEnabled).Count -eq 0) `
             -Name "Framework/FullRunEnablesEverySuite" `
@@ -29227,7 +29240,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
 # ============================================================
 & {
     # G1. Перевірки стану ПОВНОГО прогону (вибір не встановлено) в -Suite
-    # хибні за визначенням. Якщо вони не обгорнуті умовою "вибору немає",
+    # хибні за визначенням. Якщо вони не обгорнуті умовою "-Suite не запитано",
     # кожен реальний -Suite X завершується SELF-TEST FAILED, і успішний
     # вибірковий прогін (exit 0 + SELF-TEST PARTIAL) недосяжний.
     # Виняток — SuiteSelectionProbeRestoresState: вона порівнює з $suiteSelectionBefore і
@@ -29245,6 +29258,17 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
     $suiteContractG1Found = @{}
     $suiteContractG1RestoreName = 'Framework/SuiteSelectionProbeRestoresState'
     $suiteContractG1RestoreOk = $false
+    # Прапорець gate мусить бути присвоєний рівно один раз, із параметра $Suite, і не з
+    # самого вибору $script:BRAVOSelfTestSelectedSuite.
+    $suiteContractG1FlagAssignments = @($suiteContractG1Ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left.Extent.Text -ceq '$suiteRequested'
+            }, $true))
+    $suiteContractG1FlagOk = (
+        $suiteContractG1FlagAssignments.Count -eq 1 -and
+        $suiteContractG1FlagAssignments[0].Right.Extent.Text.Contains('$Suite') -and
+        -not $suiteContractG1FlagAssignments[0].Right.Extent.Text.Contains('BRAVOSelfTestSelectedSuite'))
     $suiteContractG1Ungated = New-Object System.Collections.Generic.List[string]
     foreach ($suiteContractG1Call in $suiteContractG1Calls) {
         $suiteContractG1CallName = ''
@@ -29270,7 +29294,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
         while ($null -ne $suiteContractG1Parent) {
             if ($suiteContractG1Parent -is [Management.Automation.Language.IfStatementAst]) {
                 foreach ($suiteContractG1Clause in $suiteContractG1Parent.Clauses) {
-                    if ($suiteContractG1Clause.Item1.Extent.Text.Trim() -ceq '$null -eq $script:BRAVOSelfTestSelectedSuite' -and
+                    if ($suiteContractG1Clause.Item1.Extent.Text.Trim() -ceq '-not $suiteRequested' -and
                         $suiteContractG1Clause.Item2.Extent.StartOffset -le $suiteContractG1Call.Extent.StartOffset -and
                         $suiteContractG1Call.Extent.EndOffset -le $suiteContractG1Clause.Item2.Extent.EndOffset) {
                         $suiteContractG1Gated = $true
@@ -29296,11 +29320,11 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
         }
     }
     Test-BRAVOCondition `
-        -Condition ($suiteContractG1AllFound -and $suiteContractG1Ungated.Count -eq 0) `
+        -Condition ($suiteContractG1AllFound -and $suiteContractG1FlagOk -and $suiteContractG1Ungated.Count -eq 0) `
         -Name "Framework/SuiteSelectionContract.FullOnlyAssertionsAreGatedOnFullRun" `
-        -Failure ("FullCanonicalRunIsDefault і FullRunEnablesEverySuite мусять стояти в тілі if (`$null -eq `$script:BRAVOSelfTestSelectedSuite), " +
+        -Failure ("FullCanonicalRunIsDefault і FullRunEnablesEverySuite мусять стояти в тілі if (-not `$suiteRequested), де прапорець обчислено з параметра `$Suite (а не з вибору), " +
             "інакше кожен -Suite завершується SELF-TEST FAILED; SuiteSelectionProbeRestoresState мусить бути без такого gate " +
-            "і порівнювати з `$suiteSelectionBefore. Усі три знайдено по одному разу: $suiteContractG1AllFound; " +
+            "і порівнювати з `$suiteSelectionBefore. Усі три знайдено по одному разу: $suiteContractG1AllFound; прапорець коректний: $suiteContractG1FlagOk; " +
             "порушують: [" + [string]::Join(', ', @($suiteContractG1Ungated.ToArray())) + "]")
 }
 & {
@@ -29504,8 +29528,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
             $suiteContractRefsMisplaced.Count -eq 0
         ) `
         -Name "Framework/SuiteSelectionContract.ExitCodeIndependentOfSelectionMode" `
-        -Failure ("код завершення мусить обчислюватись лише з кількості збоїв: рівно одне присвоєння " +
-            "`$script:selfTestExitCode = if (`$script:failures.Count -gt 0) { 1 } else { 0 } без згадки вибору; " +
+        -Failure ("код завершення мусить обчислюватись лише з кількості збоїв (1, якщо збої є, інакше 0): рівно одне " +
+            "присвоєння змінної коду завершення, без згадки вибору suite; " +
             "вибір у звіті може стояти лише в умовах if або в Write-*. Присвоєнь: $($suiteContractExitAssignments.Count); " +
             "згадок поза умовою/Write-*: $($suiteContractRefsMisplaced.Count)")
 
@@ -29566,7 +29590,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
     # процес, скрипт проби з BOM, без 2>&1 (stderr нативного процесу під
     # ErrorActionPreference = Stop став би термінальною помилкою батька),
     # кирилиця з дочірнього процесу — лише через base64.
-    $suiteProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SUITE_CONTRACT_' + [guid]::NewGuid().ToString('N'))
+    # Корінь проби резолвиться ВСЕРЕДИНІ try (конвенція Framework/FixtureTempRootSetupIsControlled):
+    # збій визначення тимчасового шляху стає помилкою проби, а не обриває секцію.
+    $suiteProbeRoot = $null
     $suiteProbeCases = @{}
     $suiteProbeRuns = @{}
     $suiteProbeError = $null
@@ -29598,6 +29624,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
         @('nonsel-comma-one-element', "-Suite 'Paths,Archive'")
     )
     try {
+        $suiteProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SUITE_CONTRACT_' + [guid]::NewGuid().ToString('N'))
         [void][IO.Directory]::CreateDirectory($suiteProbeRoot)
         $suiteProbeAst = Get-BRAVOSelfTestOwnSourceAst
         $suiteProbeTop = @($suiteProbeAst.EndBlock.Statements)
@@ -29693,7 +29720,11 @@ foreach ($case in $cases) {
     } catch {
         $suiteProbeError = $_.Exception.Message
     } finally {
-        if ([IO.Directory]::Exists($suiteProbeRoot)) {
+        # Remove-BRAVOSelfTestFixtureDirectory тут не застосовано: його визначено всередині
+        # секції Tail/Isolation (з -DependsOn), тож виклик з цієї секції створив би прихований
+        # зв'язок між секціями і при перерваній Tail/Isolation кидав би CommandNotFound у finally.
+        # Секція SectionIsolation прибирає свій корінь так само напряму.
+        if (-not [string]::IsNullOrEmpty($suiteProbeRoot) -and [IO.Directory]::Exists($suiteProbeRoot)) {
             [IO.Directory]::Delete($suiteProbeRoot, $true)
         }
     }

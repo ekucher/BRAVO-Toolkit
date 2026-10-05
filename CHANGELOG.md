@@ -8,7 +8,10 @@
   `Framework/FullRunEnablesEverySuite`, `Framework/SuiteSelectionProbeRestoresState`) були
   безумовними, тож у `-Suite X` давали `[FAIL]`: успішний вибірковий прогін (код 0 і
   `SELF-TEST PARTIAL`) був недосяжним. Тепер перші дві стоять у тілі
-  `if ($null -eq $script:BRAVOSelfTestSelectedSuite)`, а `SuiteSelectionProbeRestoresState`
+  `if (-not $suiteRequested)`, де прапорець обчислено з параметра `$Suite` тим самим
+  фільтром порожніх елементів, що й нормалізація `-Suite` (а не зі стану вибору: gate на
+  самому вибору був би тавтологією і пропускав би перевірки, коли вибір виставлено без
+  `-Suite`), а `SuiteSelectionProbeRestoresState`
   лишається безумовною і порівнює вибір з тим, що був до проби
   (`[object]::ReferenceEquals`), тож вірна в обох режимах і не стає тавтологією; сама проба
   предиката теж безумовна. У повному прогоні набір перевірок не змінився. Формулу коду завершення, маркери
