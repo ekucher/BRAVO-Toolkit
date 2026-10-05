@@ -28518,19 +28518,29 @@ Test-BRAVOCondition `
 
     # Повний прогін — режим за замовчуванням. Саме цей прогін його і доводить:
     # якби -Suite якось активувався без параметра, тут був би не $null.
-    Test-BRAVOCondition `
-        -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
-        -Name "Framework/FullCanonicalRunIsDefault" `
-        -Failure "без -Suite вибір фрагментів мусить лишатися невстановленим — інакше повний прогін перестав бути дефолтом"
+    #
+    # Це стан САМЕ повного прогону, тому в -Suite він хибний за визначенням.
+    # Без gate кожен реальний -Suite X завершувався б SELF-TEST FAILED (exit 1),
+    # і успішний вибірковий прогін (exit 0 + SELF-TEST PARTIAL) був би недосяжним.
+    # Gate не послаблює повний прогін: у ньому всі три перевірки виконуються як і раніше.
+    # Стереже Framework/SuiteSelectionContract.FullOnlyAssertionsAreGatedOnFullRun.
+    if ($null -eq $script:BRAVOSelfTestSelectedSuite) {
+        Test-BRAVOCondition `
+            -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
+            -Name "Framework/FullCanonicalRunIsDefault" `
+            -Failure "без -Suite вибір фрагментів мусить лишатися невстановленим — інакше повний прогін перестав бути дефолтом"
+    }
 
     $suiteAlwaysEnabled = @(
         $script:BRAVOSelfTestSuiteCatalog |
             Where-Object { -not (Test-BRAVOSelfTestSuiteEnabled -Name $_) })
-    Test-BRAVOCondition `
-        -Condition (@($suiteAlwaysEnabled).Count -eq 0) `
-        -Name "Framework/FullRunEnablesEverySuite" `
-        -Failure ("у повному прогоні кожен фрагмент каталогу мусить бути увімкнений; вимкнені: " +
-            [string]::Join(', ', @($suiteAlwaysEnabled)))
+    if ($null -eq $script:BRAVOSelfTestSelectedSuite) {
+        Test-BRAVOCondition `
+            -Condition (@($suiteAlwaysEnabled).Count -eq 0) `
+            -Name "Framework/FullRunEnablesEverySuite" `
+            -Failure ("у повному прогоні кожен фрагмент каталогу мусить бути увімкнений; вимкнені: " +
+                [string]::Join(', ', @($suiteAlwaysEnabled)))
+    }
 
     # КЛЮЧОВА властивість fail-closed: маркер релізу недосяжний з
     # вибіркового прогону. RELEASE_CHECKLIST.md вимагає дослівний
@@ -28585,10 +28595,14 @@ Test-BRAVOCondition `
     } finally {
         $script:BRAVOSelfTestSelectedSuite = $suiteSelectionBefore
     }
-    Test-BRAVOCondition `
-        -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
-        -Name "Framework/SuiteSelectionProbeRestoresState" `
-        -Failure "проба предиката мусить відновити вибір фрагментів — інакше підсумок повного прогону назве себе вибірковим"
+    # Проба сама лишається безумовною (вона відновлює стан у finally); gate стоїть
+    # лише на перевірці, що після неї повний прогін знову без вибору.
+    if ($null -eq $script:BRAVOSelfTestSelectedSuite) {
+        Test-BRAVOCondition `
+            -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
+            -Name "Framework/SuiteSelectionProbeRestoresState" `
+            -Failure "проба предиката мусить відновити вибір фрагментів — інакше підсумок повного прогону назве себе вибірковим"
+    }
 
     # --- Підказка "змінений файл -> suite" -----------------------------
     Test-BRAVOCondition `
