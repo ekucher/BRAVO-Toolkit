@@ -45,7 +45,9 @@ function ConvertTo-BRAVOSelfTestNormalizedChangedPath {
 
     if ([string]::IsNullOrEmpty($Path)) { return $null }
     if ($Path.Trim() -cne $Path) { return $null }
-    if ($Path -match '[\x00-\x1F]') { return $null }
+    # Лише друковний ASCII: керувальні символи й не-ASCII (Kelvin sign U+212A, довге s, кириличні двійники)
+    # не мусять потрапляти в правила з (?i), які згортають регістр за Unicode.
+    if ($Path -cmatch '[^\x20-\x7E]') { return $null }
     $normalized = $Path.Replace('/', '\')
     if ($normalized.StartsWith('\')) { return $null }
     if ($normalized -match '^[A-Za-z]:') { return $null }
@@ -81,8 +83,10 @@ function Get-BRAVOSelfTestSuiteForChangedPath {
     # 1. Сам фрагмент -> однойменний suite. Це механічно точно, без здогадок.
     $changedFragment = [regex]::Match($changedPath, '(?i)^selftest\\BRAVO_SELF_TEST\.([A-Za-z]+)\.ps1$')
     if ($changedFragment.Success) {
+        $fragmentName = $changedFragment.Groups[1].Value
+        if ($fragmentName -cnotmatch '^[A-Za-z][A-Za-z.]*$') { return @() }
         $changedSuite = @($script:BRAVOSelfTestSuiteCatalog |
-            Where-Object { $_ -eq $changedFragment.Groups[1].Value })
+            Where-Object { [string]::Equals([string]$_, $fragmentName, [StringComparison]::OrdinalIgnoreCase) })
         if (@($changedSuite).Count -gt 0) { return @($changedSuite) }
         return @()
     }
@@ -100,10 +104,14 @@ function Get-BRAVOSelfTestSuiteForChangedPath {
         'RestoreVerify'          = 'RestoreVerify'
         'Status'                 = 'Status'
     }
+    $moduleLookup = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($moduleKey in @($moduleSuiteTable.Keys)) { $moduleLookup[[string]$moduleKey] = [string]$moduleSuiteTable[$moduleKey] }
     $changedModule = [regex]::Match($changedPath, '(?i)^modules\\BRAVO\.([^\\]+)\\')
-    if ($changedModule.Success -and $moduleSuiteTable.ContainsKey($changedModule.Groups[1].Value)) {
-        $moduleSuiteName = [string]$moduleSuiteTable[$changedModule.Groups[1].Value]
-        $changedSuite = @($script:BRAVOSelfTestSuiteCatalog | Where-Object { $_ -eq $moduleSuiteName })
+    if ($changedModule.Success -and $changedModule.Groups[1].Value -cmatch '^[A-Za-z][A-Za-z.]*$' -and
+        $moduleLookup.ContainsKey($changedModule.Groups[1].Value)) {
+        $moduleSuiteName = $moduleLookup[$changedModule.Groups[1].Value]
+        $changedSuite = @($script:BRAVOSelfTestSuiteCatalog |
+            Where-Object { [string]::Equals([string]$_, $moduleSuiteName, [StringComparison]::OrdinalIgnoreCase) })
         if (@($changedSuite).Count -gt 0) { return @($changedSuite) }
     }
     return @()
@@ -214,7 +222,10 @@ function Test-BRAVOSelfTestRuntimeManifestCompanion {
         }
     }
     foreach ($fieldName in @('schemaVersion', 'description', 'updateProcedure')) {
-        if ([string]$baseObject.PSObject.Properties[$fieldName].Value -cne [string]$currentObject.PSObject.Properties[$fieldName].Value) {
+        # Порівняння з урахуванням типу: 1 і "1" - різні значення.
+        $baseField = ConvertTo-Json -InputObject $baseObject.PSObject.Properties[$fieldName].Value -Compress -Depth 5
+        $currentField = ConvertTo-Json -InputObject $currentObject.PSObject.Properties[$fieldName].Value -Compress -Depth 5
+        if ($baseField -cne $currentField) {
             return (& $fail ("поле '" + $fieldName + "' змінено") @())
         }
     }
@@ -290,8 +301,10 @@ function Get-BRAVOSelfTestAffectedPlan {
         в порядку каталогу. Якщо поза супутником маніфесту не лишилося жодного
         шляху - V3.
 
-        RequiredGate - підказка метаданих CI-перевірок; runner (PR3) уточнює її
-        канонічним ci\Test-BRAVOConfigParityRelevantPath.ps1.
+        RequiredGate - підказка метаданих CI-перевірок (Integrity, Release policy,
+        матричний тест DataRestore). Gate Config parity тут НЕ обчислюється: її
+        рішення належить канонічному ci\Test-BRAVOConfigParityRelevantPath.ps1, який
+        викликає runner (PR3); копії переліку шляхів у мапі немає.
     #>
     [CmdletBinding()]
     param(
@@ -304,9 +317,14 @@ function Get-BRAVOSelfTestAffectedPlan {
 
     $classLabel = 'мінімальний клас за картою шляхів'
     $catalog = @($script:BRAVOSelfTestSuiteCatalog)
-    $gateOrder = @('Integrity manifests are current', 'Release policy', 'Config parity', 'DataRestore matrix test')
+    $gateOrder = @('Integrity manifests are current', 'Release policy', 'DataRestore matrix test')
     if ($null -eq $LeafModuleTable) { $LeafModuleTable = Get-BRAVOSelfTestLeafModuleTable }
     if ($null -eq $ConsumedDocumentTable) { $ConsumedDocumentTable = Get-BRAVOSelfTestConsumedDocumentTable }
+    # Пошук за ключем - явний OrdinalIgnoreCase, а не залежний від культури хеш-таблиці.
+    $leafLookup = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($tableKey in @($LeafModuleTable.Keys)) { $leafLookup[[string]$tableKey] = $LeafModuleTable[$tableKey] }
+    $documentLookup = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($tableKey in @($ConsumedDocumentTable.Keys)) { $documentLookup[[string]$tableKey] = $ConsumedDocumentTable[$tableKey] }
 
     $getMember = {
         param($Object, [string]$Name)
@@ -324,7 +342,7 @@ function Get-BRAVOSelfTestAffectedPlan {
         param($Names)
         $resolved = New-Object System.Collections.Generic.List[string]
         foreach ($name in @($Names)) {
-            $match = @($catalog | Where-Object { $_ -eq [string]$name })
+            $match = @($catalog | Where-Object { [string]::Equals([string]$_, [string]$name, [StringComparison]::OrdinalIgnoreCase) })
             if ($match.Count -eq 0) { return $null }
             [void]$resolved.Add([string]$match[0])
         }
@@ -367,18 +385,15 @@ function Get-BRAVOSelfTestAffectedPlan {
         }
     }
 
-    $companionOk = ($null -ne $RuntimeManifestCompanion -and
-        $true -eq (& $getMember $RuntimeManifestCompanion 'IsCompanion'))
+    $companionFlag = $null
+    if ($null -ne $RuntimeManifestCompanion) { $companionFlag = & $getMember $RuntimeManifestCompanion 'IsCompanion' }
+    $companionOk = ($companionFlag -is [bool] -and $companionFlag)
     $companionReason = 'супутник маніфесту не підтверджено'
     if ($null -ne $RuntimeManifestCompanion) {
         $reasonValue = & $getMember $RuntimeManifestCompanion 'Reason'
         if ($null -ne $reasonValue) { $companionReason = [string]$reasonValue }
     }
 
-    $configParityExact = @('bravo_config_loader.ps1', 'bravo.local.config.example',
-        'selftest\fixtures\bravoconfiglegacyfrozen.config', 'ci\test-bravoconfigfoundationparity.ps1',
-        'ci\test-bravoconfigparityrelevantpath.ps1', '.github\workflows\config-parity.yml')
-    $configParityPrefix = @('modules\bravo.configuration\', 'modules\bravo.configurator\')
     $matrixPrefix = @('modules\bravo.datarestore\', 'modules\bravo.datarestore.matrixtest\')
 
     $rows = New-Object System.Collections.Generic.List[object]
@@ -394,10 +409,6 @@ function Get-BRAVOSelfTestAffectedPlan {
         } else {
             $pathKey = [string]$entry.Key
             $lowerKey = $pathKey.ToLowerInvariant()
-            if ($configParityExact -contains $lowerKey) { [void]$rowGate.Add('Config parity') }
-            foreach ($prefix in $configParityPrefix) {
-                if ($lowerKey.StartsWith($prefix, [StringComparison]::Ordinal)) { [void]$rowGate.Add('Config parity') }
-            }
             if ($lowerKey -ceq 'bravo_data_restore_matrix_test.ps1') { [void]$rowGate.Add('DataRestore matrix test') }
             foreach ($prefix in $matrixPrefix) {
                 if ($lowerKey.StartsWith($prefix, [StringComparison]::Ordinal)) { [void]$rowGate.Add('DataRestore matrix test') }
@@ -433,8 +444,9 @@ function Get-BRAVOSelfTestAffectedPlan {
                     foreach ($mappedName in $mappedSuite) { [void]$rowSuite.Add([string]$mappedName) }
                     $rowReason = 'фрагмент каталогу'
                 }
-            } elseif ($moduleMatch.Success -and $LeafModuleTable.ContainsKey($moduleMatch.Groups[1].Value)) {
-                $leafEntry = $LeafModuleTable[$moduleMatch.Groups[1].Value]
+            } elseif ($moduleMatch.Success -and $moduleMatch.Groups[1].Value -cmatch '^[A-Za-z][A-Za-z.]*$' -and
+                $leafLookup.ContainsKey($moduleMatch.Groups[1].Value)) {
+                $leafEntry = $leafLookup[$moduleMatch.Groups[1].Value]
                 $leafOwner = & $getMember $leafEntry 'Owner'
                 $leafDependents = & $getMember $leafEntry 'Dependents'
                 $leafNames = @()
@@ -451,8 +463,8 @@ function Get-BRAVOSelfTestAffectedPlan {
                     foreach ($leafName in @($leafResolved)) { [void]$rowSuite.Add([string]$leafName) }
                     $rowReason = 'leaf-модуль: owner + dependents'
                 }
-            } elseif ($ConsumedDocumentTable.ContainsKey($pathKey)) {
-                $documentEntry = $ConsumedDocumentTable[$pathKey]
+            } elseif ($documentLookup.ContainsKey($pathKey)) {
+                $documentEntry = $documentLookup[$pathKey]
                 $documentSuites = & $getMember $documentEntry 'Suite'
                 $documentGates = & $getMember $documentEntry 'Gate'
                 $documentResolved = $null

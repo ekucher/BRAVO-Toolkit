@@ -30405,39 +30405,56 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan') { try {
             "невідомий suite чи запис без Owner дають V3: " + $affProblem)
 
     # --- Gate-підказки ---------------------------------------------------
-    & $affExpectGate 'gate Config parity (module)' (& $affPlanPlain @('modules/BRAVO.Configuration/BRAVO.Configuration.psm1')) 'Config parity'
-    & $affExpectGate 'gate Config parity (example)' (& $affPlanPlain @('BRAVO.local.config.example')) 'Config parity'
-    & $affExpectGate 'gate Config parity (schema)' (& $affPlanPlain @('modules/BRAVO.Configuration/BRAVO.Configuration.Schema.psm1')) 'Config parity'
+    & $affExpectGate 'no Config parity (module)' (& $affPlanPlain @('modules/BRAVO.Configuration/BRAVO.Configuration.psm1')) ''
+    & $affExpectGate 'no Config parity (example)' (& $affPlanPlain @('BRAVO.local.config.example')) ''
     & $affExpectGate 'gate Matrix' (& $affPlanPlain @('modules/BRAVO.DataRestore.MatrixTest/x.psm1')) 'DataRestore matrix test'
     & $affExpectGate 'gate VERSION' (& $affPlanPlain @('VERSION.json')) 'Release policy'
     & $affExpectGate 'gate TOOLS_MANIFEST' (& $affPlanPlain @('Tools/TOOLS_MANIFEST.json')) 'Integrity manifests are current'
     & $affExpectGate 'gate none' (& $affPlanPlain @('BRAVO_ARCHIV.ps1')) ''
-    & $affExpectGate 'gate order' (& $affPlanPlain @('VERSION.json', 'BRAVO.local.config.example', 'Tools/TOOLS_MANIFEST.json')) 'Integrity manifests are current,Release policy,Config parity'
+    & $affExpectGate 'gate order' (& $affPlanPlain @('VERSION.json', 'BRAVO.local.config.example', 'Tools/TOOLS_MANIFEST.json')) 'Integrity manifests are current,Release policy'
     $affProblem = & $affTakeMismatch
     Test-BRAVOCondition `
         -Condition ($affProblem.Length -eq 0) `
         -Name "Framework/AffectedPlan.RequiredGateHintsAreDeterministic" `
-        -Failure ("метадані gate: Integrity для маніфестів, Release policy для VERSION/документів, Config parity для конфігурації, " +
-            "матричний gate для DataRestore.MatrixTest; порядок фіксований: " + $affProblem)
+        -Failure ("метадані gate: Integrity для маніфестів, Release policy для VERSION/документів, матричний gate для DataRestore.MatrixTest; " +
+            "gate Config parity план не обчислює (це робить runner через канонічний ci-перелік); порядок фіксований: " + $affProblem)
 
-    $affGateParityText = ''
-    $affGateParityMissing = New-Object System.Collections.Generic.List[string]
-    try {
-        . (Join-Path $root 'ci\Test-BRAVOConfigParityRelevantPath.ps1')
-        foreach ($affPattern in @(Get-BRAVOConfigParityRelevantPathPattern)) {
-            $affSample = [string]$affPattern
-            if ($affSample.EndsWith('/**')) { $affSample = $affSample.Substring(0, $affSample.Length - 3) + '/sample.psm1' }
-            $affGatePlan = Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affSample)
-            if (@($affGatePlan.RequiredGate) -cnotcontains 'Config parity') { [void]$affGateParityMissing.Add($affSample) }
-        }
-    } catch {
-        $affGateParityText = $_.Exception.Message
-    }
+    # Рішення Config parity належить ci\Test-BRAVOConfigParityRelevantPath.ps1; мапа не має копії його шаблонів.
+    $affMapTextAll = [IO.File]::ReadAllText((Join-Path $root 'selftest\BRAVOSelfTestSuiteMap.ps1'), [Text.Encoding]::UTF8)
+    $affMapParityTokens = @((Get-BRAVOSelfTestParsedFile -Path (Join-Path $root 'selftest\BRAVOSelfTestSuiteMap.ps1')).Tokens |
+            Where-Object { @('StringLiteral', 'StringExpandable', 'HereStringLiteral', 'HereStringExpandable', 'Generic') -contains [string]$_.Kind } |
+            Where-Object { [string]$_.Text -match '(?i)config_loader|config-parity|configparity|config\.example|BRAVO\.Configurat|Config parity' })
     Test-BRAVOCondition `
-        -Condition ($affGateParityText.Length -eq 0 -and $affGateParityMissing.Count -eq 0) `
-        -Name "Framework/AffectedPlan.ConfigParityGateHintCoversCanonicalPatterns" `
-        -Failure ("підказка gate Config parity у плані мусить покривати кожен шаблон канонічного ci\Test-BRAVOConfigParityRelevantPath.ps1 " +
-            "(інакше два переліки розійдуться); без підказки: [" + [string]::Join(', ', @($affGateParityMissing.ToArray())) + "]; помилка: [" + $affGateParityText + "]")
+        -Condition ($affMapTextAll.Length -gt 0 -and $affMapParityTokens.Count -eq 0) `
+        -Name "Framework/AffectedPlan.MapHasNoCopyOfConfigParityPatterns" `
+        -Failure ("файл мапи не мусить містити рядкових літералів зі шаблонами config-parity (BRAVO_CONFIG_LOADER, config-parity, BRAVO.local.config.example, " +
+            "модулі Configuration/Configurator, назва gate): рішення належить ci\Test-BRAVOConfigParityRelevantPath.ps1. Знайдено: " + $affMapParityTokens.Count)
+
+    # --- Суворість: тип IsCompanion, регістр Unicode, тип полів маніфесту ----
+    $affStrictChanged = @($affPaths, 'RUNTIME_MANIFEST.json')
+    $affKelvin = [string][char]0x212A
+    $affLongS = [string][char]0x017F
+    $affCyrillicA = [string][char]0x0410
+    & $affExpect 'strict IsCompanion string' (Get-BRAVOSelfTestAffectedPlan -ChangedPath $affStrictChanged -RuntimeManifestCompanion ([pscustomobject]@{ IsCompanion = 'False'; Reason = 'x' })) 'V3|'
+    & $affExpect 'strict IsCompanion int' (Get-BRAVOSelfTestAffectedPlan -ChangedPath $affStrictChanged -RuntimeManifestCompanion ([pscustomobject]@{ IsCompanion = 1; Reason = 'x' })) 'V3|'
+    & $affExpect 'strict IsCompanion true' (Get-BRAVOSelfTestAffectedPlan -ChangedPath $affStrictChanged -RuntimeManifestCompanion ([pscustomobject]@{ IsCompanion = $true; Reason = 'x' })) 'V2|Governance,Paths'
+    & $affExpect 'Kelvin module' (& $affPlanPlain @('modules/BRAVO.Dis' + $affKelvin + 'Space/x.psm1')) 'V3|'
+    & $affExpect 'Kelvin fragment' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.Dis' + $affKelvin + 'Space.ps1')) 'V3|'
+    & $affExpect 'Kelvin leaf module' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @('modules/BRAVO.Lea' + $affKelvin + '/x.psm1') -LeafModuleTable @{ 'Leak' = @{ Owner = 'Paths' } }) 'V3|'
+    & $affExpect 'long s directory' (& $affPlanPlain @(('se' + $affLongS + 'tt').Replace('tt', 'ftest') + '/BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'Cyrillic fragment name' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.' + $affCyrillicA + 'rchive.ps1')) 'V3|'
+    & $affExpect 'Cyrillic document' (& $affPlanPlain @($affCyrillicA + '.md')) 'V3|'
+    & $affExpect 'Cyrillic README lookalike' (& $affPlanPlain @('REA' + [string][char]0x0414 + 'ME.md')) 'V3|'
+    $affStrictFiles = & $affManifestText $affBaseFiles 'desc' $true
+    $affStringSchema = $affStrictFiles.Replace('"schemaVersion":1', '"schemaVersion":"1"')
+    $affTypeCompanion = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affStrictFiles -CurrentText $affStringSchema -ChangedPath $affStrictChanged
+    & $affExpect 'strict schemaVersion 1 vs "1"' (Get-BRAVOSelfTestAffectedPlan -ChangedPath $affStrictChanged -RuntimeManifestCompanion $affTypeCompanion) 'V3|'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0 -and $affStringSchema -cne $affStrictFiles -and -not $affTypeCompanion.IsCompanion) `
+        -Name "Framework/AffectedPlan.StrictTypesAndAsciiOnlyNames" `
+        -Failure ("IsCompanion лише булевий true; Kelvin sign, довге s та кириличні двійники не відображаються на suite/модуль/документ; " +
+            'schemaVersion 1 -> "1" не є супутником: ' + $affProblem)
 
     # --- B32-B36: некоректні шляхи -> V3 ----------------------------------
     & $affExpect 'B32 AbsoluteWindows' (& $affPlanPlain @('C:\repo\selftest\BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
