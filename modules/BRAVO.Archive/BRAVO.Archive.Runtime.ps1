@@ -1688,13 +1688,52 @@ function Remove-BRAVOExpiredBackupGenerations {
                     continue
                 }
 
-                $startedAt = $manifestFile.LastWriteTime
-                try {
-                    $startedAt = [datetime]$manifest.startedAt
-                } catch {
-                    # Invalid timestamp does not authorize deletion; file time
-                    # is the conservative fallback and the manifest is retained
-                    # unless it independently satisfies the age policy.
+                # Час запуску невідомий (властивості немає, null, порожній чи
+                # нерозбірливий рядок): TimeKnown=$false. Такий запис не
+                # видаляється жодною гілкою і не бере участі у виборі N
+                # захищених; LastWriteTime файлу видалення не дозволяє.
+                # MinValue - лише сортувальна заглушка, її ніхто не порівнює
+                # з cutoff без перевірки TimeKnown.
+                $startedAt = [datetime]::MinValue
+                $timeKnown = $false
+                $startedAtProperty = $manifest.PSObject.Properties['startedAt']
+                if ($null -ne $startedAtProperty -and $null -ne $startedAtProperty.Value) {
+                    if ($startedAtProperty.Value -is [datetime]) {
+                        $parsedStartedAt = [datetime]$startedAtProperty.Value
+                    } else {
+                        $parsedStartedAt = [datetime]::MinValue
+                        $startedAtText = [string]$startedAtProperty.Value
+                        # Формат ConvertTo-Json Windows PowerShell 5.1 для
+                        # [datetime] ("\/Date(ms)\/"), якщо ConvertFrom-Json
+                        # лишив його рядком: мілісекунди від епохи UTC.
+                        $epochMatch = [regex]::Match($startedAtText, '^/Date\((-?\d+)(?:[+-]\d{4})?\)/$')
+                        if ($epochMatch.Success) {
+                            $epochMilliseconds = [long]0
+                            if ([long]::TryParse($epochMatch.Groups[1].Value, [ref]$epochMilliseconds)) {
+                                $parsedStartedAt = (New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).AddMilliseconds($epochMilliseconds)
+                            }
+                        } elseif (-not [string]::IsNullOrWhiteSpace($startedAtText) -and
+                            -not [datetime]::TryParse(
+                                $startedAtText,
+                                [Globalization.CultureInfo]::InvariantCulture,
+                                [Globalization.DateTimeStyles]::None,
+                                [ref]$parsedStartedAt)) {
+                            $parsedStartedAt = [datetime]::MinValue
+                        }
+                    }
+                    # Cutoff рахується від локального (Get-Date), а порівняння
+                    # DateTime ігнорує Kind: UTC-значення (епоха чи DateTime з
+                    # ConvertFrom-Json) переводиться в локальний час.
+                    if ($parsedStartedAt.Kind -eq [DateTimeKind]::Utc) {
+                        $parsedStartedAt = $parsedStartedAt.ToLocalTime()
+                    }
+                    # Будь-який час у перший день (0001-01-01) - це незаданий
+                    # [datetime], а не найстаріша копія: після переходу між
+                    # UTC і локальним часом він може стати MinValue + зсув.
+                    if ($parsedStartedAt.Date -gt [datetime]::MinValue.Date) {
+                        $startedAt = $parsedStartedAt
+                        $timeKnown = $true
+                    }
                 }
                 # Імена архівів з ОРИГІНАЛЬНОГО manifest-а для звіту про
                 # архіви без manifest-а (незалежно від rebasing і типів).
@@ -1715,6 +1754,7 @@ function Remove-BRAVOExpiredBackupGenerations {
                     Status = [string]$manifest.status
                     IsComplete = ([string]$manifest.status -eq 'COMPLETE')
                     StartedAt = $startedAt
+                    TimeKnown = $timeKnown
                     Manifest = $resolution.Manifest
                     UnresolvedTypes = @(@(Get-BRAVORetentionUnresolvedComponentTypes `
                         -Manifest $manifest -ArchiveDefinitions $ArchiveDefinitions) + @($resolution.UnresolvedReasons))
@@ -1761,12 +1801,12 @@ function Remove-BRAVOExpiredBackupGenerations {
         } else { 1 }
         $protectedGenerationIds = @()
         $hashVerificationNeeded = [bool]$enableArchiveDeletion -and (@($records | Where-Object {
-            $_.IsComplete -and $_.UnresolvedTypes.Count -eq 0 -and
+            $_.IsComplete -and $_.TimeKnown -and $_.UnresolvedTypes.Count -eq 0 -and
             $_.GenerationId -ne $CurrentGenerationId -and $_.StartedAt -lt $validCutoff
         }).Count -gt 0)
         if ($hashVerificationNeeded) {
             foreach ($record in @($records | Where-Object {
-                $_.IsComplete -and $_.UnresolvedTypes.Count -eq 0 -and $_.ArtifactProblems.Count -eq 0
+                $_.IsComplete -and $_.TimeKnown -and $_.UnresolvedTypes.Count -eq 0 -and $_.ArtifactProblems.Count -eq 0
             } | Sort-Object StartedAt -Descending)) {
                 if ($protectedGenerationIds.Count -ge $minimumRetainedCount) { break }
                 if (Test-BRAVOGenerationManifestVerified -Manifest $record.Manifest) {
@@ -1785,6 +1825,13 @@ function Remove-BRAVOExpiredBackupGenerations {
         foreach ($record in @($records | Sort-Object StartedAt)) {
             if ($record.GenerationId -eq $CurrentGenerationId) { continue }
             if ($record.UnresolvedTypes.Count -gt 0) { continue }
+            if (-not $record.TimeKnown) {
+                Write-BRAVOLog -Component 'CLEANUP' -Message (
+                    "Резервна копія $($record.GenerationId): час запуску (startedAt) відсутній або " +
+                    "нерозбірливий у manifest-і. Retention її не чіпає"
+                ) -Level 'WARNING'
+                continue
+            }
             # Гілку визначає записаний статус прогону, а не сьогоднішня
             # перевірка (#335).
             $deleteGeneration = $false
@@ -1792,9 +1839,14 @@ function Remove-BRAVOExpiredBackupGenerations {
                 $deleteGeneration = [bool]$enableArchiveDeletion -and
                     $record.StartedAt -lt $validCutoff -and
                     $record.GenerationId -notin $protectedGenerationIds
-            } else {
+            } elseif ($record.Status -eq 'FAILED' -or $record.Status -eq 'INCOMPLETE') {
                 $deleteGeneration = [bool]$enableFailedArchiveDeletion -and
                     $record.StartedAt -lt $invalidCutoff
+            } else {
+                Write-BRAVOLog -Component 'CLEANUP' -Message (
+                    "Резервна копія $($record.GenerationId): невідомий статус '$($record.Status)' " +
+                    "(очікується COMPLETE, FAILED або INCOMPLETE). Retention її не чіпає"
+                ) -Level 'WARNING'
             }
             if (-not $deleteGeneration) { continue }
 

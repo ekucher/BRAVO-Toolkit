@@ -635,19 +635,42 @@ function Get-BRAVOFileHash {
     }
 
     function Invoke-BRAVORetentionFixtureCleanup {
-        param([string]$Root, [string]$CurrentGenerationId, [object[]]$ArchiveDefinitions)
+        param([string]$Root, [string]$CurrentGenerationId, [object[]]$ArchiveDefinitions, [switch]$StrictMode)
         $global:BRAVORetentionTestLog = New-Object System.Collections.ArrayList
         $global:BRAVORetentionHashCalls = 0
         $sectionShown = $false
         return (& $retentionSafetyModule {
-            param($BackupRoot, $CurrentId, $Definitions, $SectionShownRef)
+            param($BackupRoot, $CurrentId, $Definitions, $SectionShownRef, $UseStrictMode)
+            # Production виконується під Set-StrictMode -Version 2.0
+            # (BRAVO_CONFIG_LOADER.ps1); сценарії, що це моделюють, вмикають
+            # його лише в області цього scriptblock. Під StrictMode retention
+            # читає змінні конфігурації, які в production завжди задає
+            # BRAVO.Configuration: тут вони задаються з тими ж значеннями за
+            # замовчуванням, інакше невизначена змінна чи властивість $null
+            # кидала б виняток і видалення падало б у catch.
+            if ($UseStrictMode) {
+                Set-StrictMode -Version 2.0
+                $archiveFileFilter = '*.mdz'
+                $progressSettings = @{ Enabled = $false; ShowOverallProgress = $false }
+            }
             Remove-BRAVOExpiredBackupGenerations `
                 -BackupRoot $BackupRoot `
                 -CurrentGenerationId $CurrentId `
                 -RetentionDays 183 `
                 -CleanupSectionShown $SectionShownRef `
                 -ArchiveDefinitions $Definitions
-        } $Root $CurrentGenerationId $ArchiveDefinitions ([ref]$sectionShown))
+        } $Root $CurrentGenerationId $ArchiveDefinitions ([ref]$sectionShown) ([bool]$StrictMode))
+    }
+
+    # Підміняє значення startedAt у згенерованому manifest-і буквальним
+    # JSON-фрагментом (null, "рядок") і виставляє давній LastWriteTime файлу.
+    function Set-BRAVORetentionManifestStartedAt {
+        param([string]$ManifestPath, [string]$JsonValue, [datetime]$LastWriteTime)
+        $manifestText = [IO.File]::ReadAllText($ManifestPath)
+        $patchedText = [regex]::Replace($manifestText, '"startedAt":"[^"]*"', ('"startedAt":' + $JsonValue))
+        if ($patchedText -ceq $manifestText) { throw "startedAt не знайдено у fixture manifest: $ManifestPath" }
+        [IO.File]::WriteAllText($ManifestPath, $patchedText)
+        (Get-Item -LiteralPath $ManifestPath).LastWriteTime = $LastWriteTime
     }
 
     function Get-BRAVORetentionFixtureDefinitions {
@@ -1058,6 +1081,216 @@ function Get-BRAVOFileHash {
             ) `
             -Name "BackupConsistency/UnreadableArchiveMetadataIsIsolatedPerGeneration" `
             -Failure "збій читання метаданих архіву однієї generation має давати WARNING лише для неї; прострочена невдала generation має видалятися в тому ж прогоні"
+
+        # Сценарій 8 (L1/L2): час запуску невідомий або статус невідомий -
+        # generation не видаляється, а LastWriteTime файлу видалення не
+        # дозволяє. Усі виклики - під Set-StrictMode -Version 2.0, як у
+        # production. 8a-8c: невідомий час (null, відсутній, нерозбірливий).
+        $global:enableArchiveDeletion = $true
+        $unknownTimeRoot = Join-Path $retentionStatusTestRoot 'unknown-time'
+        [void](New-BRAVORetentionComponentFixture -Root $unknownTimeRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        [void](New-BRAVORetentionComponentFixture -Root $unknownTimeRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
+        $nullTimeCompleteManifest = New-BRAVORetentionComponentFixture -Root $unknownTimeRoot `
+            -GenerationId '20250101_230000' -StartedAt (Get-Date).AddDays(-640)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $nullTimeCompleteManifest -JsonValue 'null' -LastWriteTime (Get-Date).AddDays(-640)
+        $nullTimeFailedManifest = New-BRAVORetentionComponentFixture -Root $unknownTimeRoot `
+            -GenerationId '20250102_230000' -StartedAt (Get-Date).AddDays(-639) -Status 'FAILED'
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $nullTimeFailedManifest -JsonValue 'null' -LastWriteTime (Get-Date).AddDays(-639)
+        $badTimeCompleteManifest = New-BRAVORetentionComponentFixture -Root $unknownTimeRoot `
+            -GenerationId '20250103_230000' -StartedAt (Get-Date).AddDays(-638)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $badTimeCompleteManifest -JsonValue '"not-a-date"' -LastWriteTime (Get-Date).AddDays(-638)
+        $badTimeFailedManifest = New-BRAVORetentionComponentFixture -Root $unknownTimeRoot `
+            -GenerationId '20250104_230000' -StartedAt (Get-Date).AddDays(-637) -Status 'INCOMPLETE'
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $badTimeFailedManifest -JsonValue '"not-a-date"' -LastWriteTime (Get-Date).AddDays(-637)
+        $unknownTimeOk = Invoke-BRAVORetentionFixtureCleanup -Root $unknownTimeRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $unknownTimeRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $unknownTimeOk -eq $true -and
+                (Test-Path -LiteralPath $nullTimeCompleteManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $unknownTimeRoot 'MODEL') 'MODEL_20250101_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250101_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/CompleteWithNullStartedAtIsNeverDeletedAndWarns" `
+            -Failure "COMPLETE generation з startedAt=null має невідомий час: вона не повинна видалятися гілкою віку (навіть при давньому LastWriteTime), а WARNING має називати generation; manifest збережено=$(Test-Path -LiteralPath $nullTimeCompleteManifest)"
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath $nullTimeFailedManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $unknownTimeRoot 'MODEL') 'MODEL_20250102_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250102_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/FailedWithNullStartedAtIsNeverDeletedAndWarns" `
+            -Failure "FAILED generation з startedAt=null має невідомий час: гілка failedArchiveRetentionDays не повинна її видаляти ([datetime]`$null = 0001-01-01), WARNING має називати generation"
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath $badTimeCompleteManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $unknownTimeRoot 'MODEL') 'MODEL_20250103_230000.mdz')) -and
+                (Test-Path -LiteralPath $badTimeFailedManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $unknownTimeRoot 'MODEL') 'MODEL_20250104_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250103_230000: час запуску') -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250104_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/UnparseableStartedAtIsNotDeletedByFileTime" `
+            -Failure "нерозбірливий startedAt не повинен підміняться LastWriteTime файлу manifest-а для рішення про видалення (ні COMPLETE, ні невдала generation); WARNING має називати generation"
+
+        # 8d-8e: невідомий статус (RUNNING, порожній) не потрапляє в гілку
+        # невдалих, навіть коли startedAt давно за failedArchiveRetentionDays.
+        $unknownStatusRoot = Join-Path $retentionStatusTestRoot 'unknown-status'
+        [void](New-BRAVORetentionComponentFixture -Root $unknownStatusRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $runningStatusManifest = New-BRAVORetentionComponentFixture -Root $unknownStatusRoot `
+            -GenerationId '20250201_230000' -StartedAt (Get-Date).AddDays(-61) -Status 'RUNNING'
+        $emptyStatusManifest = New-BRAVORetentionComponentFixture -Root $unknownStatusRoot `
+            -GenerationId '20250202_230000' -StartedAt (Get-Date).AddDays(-61) -Status ''
+        $unknownStatusOk = Invoke-BRAVORetentionFixtureCleanup -Root $unknownStatusRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $unknownStatusRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $unknownStatusOk -eq $true -and
+                (Test-Path -LiteralPath $runningStatusManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $unknownStatusRoot 'MODEL') 'MODEL_20250201_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250201_230000: невідомий статус')
+            ) `
+            -Name "BackupConsistency/RunningStatusOlderThanFailedRetentionIsKeptAndWarns" `
+            -Failure "generation зі статусом RUNNING (не FAILED/INCOMPLETE/COMPLETE) не повинна видалятися гілкою failedArchiveRetentionDays, а WARNING має називати generation"
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath $emptyStatusManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $unknownStatusRoot 'MODEL') 'MODEL_20250202_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250202_230000: невідомий статус')
+            ) `
+            -Name "BackupConsistency/EmptyStatusIsKeptAndWarns" `
+            -Failure "generation з порожнім статусом не повинна видалятися гілкою failedArchiveRetentionDays, а WARNING має називати generation"
+
+        # 8f: контроль - FAILED і INCOMPLETE (будь-який регістр), старші за
+        # failedArchiveRetentionDays, видаляються як і раніше.
+        $knownFailedRoot = Join-Path $retentionStatusTestRoot 'known-failed'
+        [void](New-BRAVORetentionComponentFixture -Root $knownFailedRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $knownFailedManifest = New-BRAVORetentionComponentFixture -Root $knownFailedRoot `
+            -GenerationId '20250301_230000' -StartedAt (Get-Date).AddDays(-61) -Status 'FAILED'
+        $knownIncompleteManifest = New-BRAVORetentionComponentFixture -Root $knownFailedRoot `
+            -GenerationId '20250302_230000' -StartedAt (Get-Date).AddDays(-61) -Status 'incomplete'
+        $knownFailedOk = Invoke-BRAVORetentionFixtureCleanup -Root $knownFailedRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $knownFailedRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $knownFailedOk -eq $true -and
+                -not (Test-Path -LiteralPath $knownFailedManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path (Join-Path $knownFailedRoot 'MODEL') 'MODEL_20250301_230000.mdz')) -and
+                -not (Test-Path -LiteralPath $knownIncompleteManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path (Join-Path $knownFailedRoot 'MODEL') 'MODEL_20250302_230000.mdz'))
+            ) `
+            -Name "BackupConsistency/KnownFailedAndIncompleteStatusesStillExpire" `
+            -Failure "generation зі статусом FAILED або INCOMPLETE (без урахування регістру) з відомим startedAt, старшим за failedArchiveRetentionDays, має видалятися як і раніше; ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
+
+        # 8g: COMPLETE з невідомим часом не займає місце серед N захищених
+        # (сортується останньою, тож це насамперед перевірка, що вона не
+        # видаляється і не витісняє цілу копію)
+        # (minimumRetainedVerifiedBackups=2): прострочена, але захищена ціла
+        # generation лишається, а сама копія з невідомим часом не видаляється.
+        $protectedRoot = Join-Path $retentionStatusTestRoot 'null-time-protected'
+        [void](New-BRAVORetentionComponentFixture -Root $protectedRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $protectedValidManifest = New-BRAVORetentionComponentFixture -Root $protectedRoot `
+            -GenerationId '20250401_230000' -StartedAt (Get-Date).AddDays(-640)
+        $protectedNullManifest = New-BRAVORetentionComponentFixture -Root $protectedRoot `
+            -GenerationId '20250402_230000' -StartedAt (Get-Date).AddDays(-639)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $protectedNullManifest -JsonValue 'null' -LastWriteTime (Get-Date).AddDays(-639)
+        $protectedOk = Invoke-BRAVORetentionFixtureCleanup -Root $protectedRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $protectedRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $protectedOk -eq $true -and
+                (Test-Path -LiteralPath $protectedValidManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $protectedRoot 'MODEL') 'MODEL_20250401_230000.mdz')) -and
+                (Test-Path -LiteralPath $protectedNullManifest) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250402_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/NullStartedAtCompleteDoesNotDisplaceProtectedGeneration" `
+            -Failure "COMPLETE з невідомим часом не повинна брати участі у виборі N захищених: валідна прострочена generation, що входить у N найновіших, має лишитися, а копія з невідомим часом - не видалятися"
+
+        # 8h: контроль - startedAt як НЕекранований рядок "/Date(ms)/"
+        # (ConvertFrom-Json лишає його рядком, тож працює розбір у retention)
+        # лишається відомим часом: прострочена незахищена COMPLETE generation
+        # видаляється як і раніше.
+        $epochRoot = Join-Path $retentionStatusTestRoot 'epoch-time'
+        [void](New-BRAVORetentionComponentFixture -Root $epochRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        [void](New-BRAVORetentionComponentFixture -Root $epochRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
+        $epochManifest = New-BRAVORetentionComponentFixture -Root $epochRoot `
+            -GenerationId '20250501_230000' -StartedAt (Get-Date).AddDays(-640)
+        $epochStart = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+        $epochMilliseconds = [long]((Get-Date).AddDays(-640).ToUniversalTime() - $epochStart).TotalMilliseconds
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $epochManifest -JsonValue ('"/Date(' + $epochMilliseconds + ')/"') -LastWriteTime (Get-Date)
+        $epochOk = Invoke-BRAVORetentionFixtureCleanup -Root $epochRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $epochRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $epochOk -eq $true -and
+                -not (Test-Path -LiteralPath $epochManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path (Join-Path $epochRoot 'MODEL') 'MODEL_20250501_230000.mdz')) -and
+                -not (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250501_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/EpochStartedAtStillExpiresByAge" `
+            -Failure "startedAt як рядок /Date(ms)/ має розбиратися як відомий час: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $epochManifest); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
+
+        # 8i: наскрізно - startedAt як [datetime], серіалізований ConvertTo-Json,
+        # як це робить writer generation manifest-а (у Windows PowerShell 5.1 це
+        # "\/Date(ms)\/", який ConvertFrom-Json повертає як [datetime] з
+        # Kind=Utc - основний production-формат): час відомий, прострочена
+        # незахищена COMPLETE generation видаляється як і раніше.
+        $roundTripRoot = Join-Path $retentionStatusTestRoot 'round-trip-time'
+        [void](New-BRAVORetentionComponentFixture -Root $roundTripRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        [void](New-BRAVORetentionComponentFixture -Root $roundTripRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
+        $roundTripManifest = New-BRAVORetentionComponentFixture -Root $roundTripRoot `
+            -GenerationId '20250601_230000' -StartedAt (Get-Date).AddDays(-640)
+        $roundTripJson = ([ordered]@{ startedAt = [datetime]::Now.AddDays(-640) } | ConvertTo-Json -Compress)
+        $roundTripValue = [regex]::Match($roundTripJson, '^\{"startedAt":(.+)\}$').Groups[1].Value
+        if ([string]::IsNullOrEmpty($roundTripValue)) { throw "ConvertTo-Json дав неочікуваний формат: $roundTripJson" }
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $roundTripManifest -JsonValue $roundTripValue -LastWriteTime (Get-Date)
+        $roundTripOk = Invoke-BRAVORetentionFixtureCleanup -Root $roundTripRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $roundTripRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $roundTripOk -eq $true -and
+                -not (Test-Path -LiteralPath $roundTripManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path (Join-Path $roundTripRoot 'MODEL') 'MODEL_20250601_230000.mdz')) -and
+                -not (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250601_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/ConvertToJsonStartedAtRoundTripStillExpiresByAge" `
+            -Failure "startedAt, серіалізований ConvertTo-Json, як у writer manifest-а ($roundTripValue), має лишатися відомим часом: прострочена незахищена COMPLETE generation видаляється; manifest збережено=$(Test-Path -LiteralPath $roundTripManifest); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
+        # 8j: нульова дата (0001-01-01 - так ConvertTo-Json пише незаданий
+        # [datetime]: "\/Date(-62135596800000)\/", або рядок з Z) - це
+        # невідомий час, а не "найстаріша копія", у будь-якому часовому поясі.
+        # Східніше UTC перехід у локальний час давав би 0001-01-01 + зсув,
+        # що вже більше за MinValue.
+        $zeroTimeRoot = Join-Path $retentionStatusTestRoot 'zero-time'
+        [void](New-BRAVORetentionComponentFixture -Root $zeroTimeRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        [void](New-BRAVORetentionComponentFixture -Root $zeroTimeRoot -GenerationId '20260930_230000' -StartedAt (Get-Date).AddDays(-1))
+        $zeroEpochManifest = New-BRAVORetentionComponentFixture -Root $zeroTimeRoot `
+            -GenerationId '20250701_230000' -StartedAt (Get-Date).AddDays(-640)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $zeroEpochManifest -JsonValue '"\/Date(-62135596800000)\/"' -LastWriteTime (Get-Date).AddDays(-640)
+        $zeroIsoManifest = New-BRAVORetentionComponentFixture -Root $zeroTimeRoot `
+            -GenerationId '20250702_230000' -StartedAt (Get-Date).AddDays(-640)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $zeroIsoManifest -JsonValue '"0001-01-01T00:00:00Z"' -LastWriteTime (Get-Date).AddDays(-640)
+        # Без поясу (Kind=Unspecified, не конвертується): ловить регресію і в UTC.
+        $zeroLocalManifest = New-BRAVORetentionComponentFixture -Root $zeroTimeRoot `
+            -GenerationId '20250703_230000' -StartedAt (Get-Date).AddDays(-640)
+        Set-BRAVORetentionManifestStartedAt -ManifestPath $zeroLocalManifest -JsonValue '"0001-01-01T05:00:00"' -LastWriteTime (Get-Date).AddDays(-640)
+        $zeroTimeOk = Invoke-BRAVORetentionFixtureCleanup -Root $zeroTimeRoot -StrictMode `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $zeroTimeRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $zeroTimeOk -eq $true -and
+                (Test-Path -LiteralPath $zeroEpochManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $zeroTimeRoot 'MODEL') 'MODEL_20250701_230000.mdz')) -and
+                (Test-Path -LiteralPath $zeroIsoManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $zeroTimeRoot 'MODEL') 'MODEL_20250702_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250701_230000: час запуску') -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250702_230000: час запуску') -and
+                (Test-Path -LiteralPath $zeroLocalManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $zeroTimeRoot 'MODEL') 'MODEL_20250703_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'Резервна копія 20250703_230000: час запуску')
+            ) `
+            -Name "BackupConsistency/ZeroDateStartedAtIsUnknownInAnyTimeZone" `
+            -Failure "startedAt з датою 0001-01-01 (незаданий [datetime] з ConvertTo-Json, рядок з Z чи без поясу) має бути невідомим часом: generation не видаляється, WARNING називає її; часовий пояс: $([TimeZoneInfo]::Local.Id); ERROR у лозі retention: $(@($global:BRAVORetentionTestLog | Where-Object { $_.StartsWith('ERROR|') }) -join ' / ')"
     } finally {
         Remove-Item -Path Variable:\global:enableArchiveDeletion, `
             Variable:\global:enableFailedArchiveDeletion, `
