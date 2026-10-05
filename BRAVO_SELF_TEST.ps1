@@ -314,14 +314,13 @@ $script:environmentLimitations = New-Object System.Collections.ArrayList
 # Тому економія часу обмежена зверху: корінь — це 961 з 2107 перевірок і
 # 188.6 с із 477.5 с sum-of-suites. Вибірковий прогін не може бути швидшим
 # за цю частину, і обіцяти більше було б неправдою.
-$script:BRAVOSelfTestSuiteCatalog = @(
-    'Archive', 'ArchiveDiskSpace', 'BackupScope', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
-    'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
-    'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
-    'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
-    'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence',
-    'SftpCredentialsRequired', 'Status', 'TraceArchive'
-)
+# Каталог suite, підказка "змінений шлях -> suite" і план Affected живуть в одному
+# файлі мапи (VAL-05, PR1); це єдиний власник. Файл входить до RUNTIME_MANIFEST,
+# тож підміна чи відсутність зупиняє прогін ще перевіркою цілісності вище.
+# Підключення мусить стояти ПІСЛЯ перевірки цілісності й ДО розбору -Suite нижче
+# (стереже Framework/AffectedPlan.MapIsDotSourcedAfterIntegrityBeforeSuiteNormalization).
+# Ім'я файлу не збігається з BRAVO_SELF_TEST.<Ім'я>.ps1, тому він не є фрагментом.
+. (Join-Path $root 'selftest\BRAVOSelfTestSuiteMap.ps1')
 
 # $null = повний прогін. Непорожній масив = вибірковий.
 $script:BRAVOSelfTestSelectedSuite = $null
@@ -360,35 +359,6 @@ function Test-BRAVOSelfTestSuiteEnabled {
     param([Parameter(Mandatory = $true)][string]$Name)
     if ($null -eq $script:BRAVOSelfTestSelectedSuite) { return $true }
     return ($script:BRAVOSelfTestSelectedSuite -contains $Name)
-}
-
-function Get-BRAVOSelfTestSuiteForChangedPath {
-    <#
-        Підказка "змінений файл -> suite" для розробника.
-
-        Порожній результат означає "не знаю", і це НЕ дозвіл звузити прогін:
-        викликач має виконати повний. Мапа свідомо мінімальна й перевірювана —
-        застаріла мапа гірша за її відсутність, бо тихо радить пропустити те,
-        що саме й зламано.
-    #>
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
-    $changedPath = $Path.Replace('/', '\').Trim()
-    # 1. Сам фрагмент -> однойменний suite. Це механічно точно, без здогадок.
-    $changedFragment = [regex]::Match($changedPath, '(?i)selftest\\BRAVO_SELF_TEST\.([A-Za-z]+)\.ps1$')
-    if ($changedFragment.Success) {
-        $changedSuite = @($script:BRAVOSelfTestSuiteCatalog |
-            Where-Object { $_ -eq $changedFragment.Groups[1].Value })
-        if (@($changedSuite).Count -gt 0) { return @($changedSuite) }
-    }
-    # 2. Доменний модуль -> suite з тим самим іменем домену, якщо такий є.
-    $changedModule = [regex]::Match($changedPath, '(?i)^modules\\BRAVO\.([A-Za-z]+)')
-    if ($changedModule.Success) {
-        $changedSuite = @($script:BRAVOSelfTestSuiteCatalog |
-            Where-Object { $_ -eq $changedModule.Groups[1].Value })
-        if (@($changedSuite).Count -gt 0) { return @($changedSuite) }
-    }
-    return @()
 }
 
 # PR #138 review (P2-A): baseline для Phase-0 hard-gate ініціалізується
@@ -30568,7 +30538,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan') { try {
     $affOrderInput = @($affPaths, $affArchive, 'README.md', 'CHANGELOG.md', $affGovernance)
     $affOrderReference = & $affPlanPlain $affOrderInput
     $affOrderProblems = New-Object System.Collections.Generic.List[string]
-    $affReversed = @($affOrderInput)
+    $affReversed = $affOrderInput.Clone()
     [Array]::Reverse($affReversed)
     $affRotated = @($affOrderInput[2..4] + $affOrderInput[0..1])
     foreach ($affPermutation in @($affReversed, $affRotated, @($affOrderInput + $affOrderInput))) {
