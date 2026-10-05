@@ -2,6 +2,35 @@
 
 ## Не випущено (developer)
 
+- **Feat: git-збирач змінених шляхів `ci/BRAVOChangedPath.ps1` для режиму Affected (VAL-05, PR2 з трьох).**
+  Нові функції `Invoke-BRAVOGitCommand` і `Get-BRAVOChangedPathSet` — єдиний власник git-diff для
+  Affected. Збирач порівнює merge-base(`BaseRef`, `HEAD`) з робочим деревом: tracked-зміни (staged і
+  unstaged), untracked-файли без gitignored, видалення окремо (`DeletedPath`, також у `ChangedPath`),
+  rename — обидва шляхи (`--no-renames`). Шляхи повертаються дослівно, без обрізання, без дублів, у
+  порядку Ordinal; супутні тексти `RUNTIME_MANIFEST.json` беруться з merge-base (`git show`) і з диска.
+  Результат: `Status`, `BaseSha`, `HeadSha`, `MergeBaseSha`, `Dirty`, `ChangedPath`, `DeletedPath`,
+  `RuntimeManifestBaseText`, `RuntimeManifestCurrentText`, `FailedCommand`, `ExitCode`, `Message`.
+  Статуси: `Ok`, `BASE-MISSING`, `BASE-INVALID`, `BASE-EQUALS-HEAD`, `EMPTY-DIFF`, `GIT-MISSING`,
+  `GIT-FAILED`, `NOT-A-REPOSITORY`, `ROOT-MISMATCH`, `SHALLOW-REPOSITORY`, `NO-MERGE-BASE`.
+  Головний інваріант fail closed: ненульовий код git, виняток запуску, непарна кількість NUL-токенів чи
+  невірна форма виводу (включно зі збоєм `git status`) дають `GIT-FAILED` і порожній `ChangedPath`, а не
+  `EMPTY-DIFF`. Для помилки dubious ownership статус лишається `NOT-A-REPOSITORY`, а `Message` містить
+  підказку `safe.directory`. `BaseRef` перевіряється за allowlist до першого виклику git; порожній
+  `BaseRef` не викликає git взагалі. Запуск — `System.Diagnostics.Process` (абсолютний шлях git,
+  `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, stdout і stderr розділені, UTF-8 без BOM), сумісний
+  з Windows PowerShell 5.1. Це лише бібліотека: runner і CLI (PR3), мапа, план, `config-parity.yml`,
+  `ci.yml` і коди завершення не змінені.
+  Нова корінна секція `Tail/Framework.AffectedChangedPath` (після `Tail/Framework.AffectedPlan`):
+  `Framework/AffectedChangedPath.*` — контракт викликів git, збої та винятки запуску, stderr із кодом 0,
+  `GIT-MISSING`, shallow, `ROOT-MISMATCH`, `NO-MERGE-BASE`, `NOT-A-REPOSITORY` і підказка `safe.directory`,
+  дедуплікація й порядок Ordinal, `D` у обох наборах, тексти маніфесту, `BASE-EQUALS-HEAD`/`EMPTY-DIFF`,
+  а також сценарії на тимчасових репозиторіях (added/modified/deleted/renamed, пробіли, кирилиця за
+  `core.quotepath=true`, gitignored, merge-base, orphan-гілка, каталог без git) і статичний guard
+  файлу (без `2>&1`, обрізання, PowerShell 7-синтаксису, копії мапи чи шаблонів config-parity; BOM і CRLF).
+  Сценарії з git звітують `[НЕДОСТУПНО]`, якщо git на хості відсутній. Регенеровано `RUNTIME_MANIFEST.json`.
+  Не перевірено локально: у середовищі немає Windows PowerShell; канонічний повний прогін
+  `.\BRAVO_SELF_TEST.ps1 -NoPause` виконується в Windows CI.
+
 - **Feat: мапа «змінений шлях -> suite» і консервативний план Affected винесені у `selftest/BRAVOSelfTestSuiteMap.ps1` (VAL-05, PR1 з трьох).**
   Каталог `-Suite` (дослівно), `Get-BRAVOSelfTestSuiteForChangedPath` і нові чисті функції
   `Get-BRAVOSelfTestAffectedPlan`, `Test-BRAVOSelfTestRuntimeManifestCompanion`,
