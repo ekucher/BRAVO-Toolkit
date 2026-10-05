@@ -27,7 +27,7 @@
   а також сценарії на тимчасових репозиторіях (added/modified/deleted/renamed, пробіли, кирилиця за
   `core.quotepath=true`, gitignored, merge-base, orphan-гілка, каталог без git) і статичний guard
   файлу (без `2>&1`, обрізання, PowerShell 7-синтаксису, копії мапи чи шаблонів config-parity; BOM і CRLF).
-  Сценарії з git звітують `[НЕДОСТУПНО]`, якщо git на хості відсутній. Регенеровано `RUNTIME_MANIFEST.json`.
+  Сценарії на реальному git-репозиторії виконуються лише в git-робочій копії (є `.git` і git); у розгорнутому пакеті без `.git` вони пропускаються з інформаційним рядком, без `[НЕДОСТУПНО]`, а `RealScenariosRunOnCi` не дає покриттю зникнути на GitHub Actions. Регенеровано `RUNTIME_MANIFEST.json`.
   Не перевірено локально: у середовищі немає Windows PowerShell; канонічний повний прогін
   `.\BRAVO_SELF_TEST.ps1 -NoPause` виконується в Windows CI.
 

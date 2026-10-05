@@ -30915,9 +30915,10 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath') { try
 #
 # Позначення: [I] - ін'єкція -GitInvoker (git не потрібен); [T] -
 # тимчасовий репозиторій під TEMP з вигаданою ідентичністю; [R] -
-# статичний guard файлу. Якщо git недоступний, [T]-перевірки
-# звітують [НЕДОСТУПНО] тим самим механізмом, що й решта комплекту
-# (-EnvironmentLimitation з названою причиною), а не мовчки проходять.
+# статичний guard файлу. [T]-перевірки виконуються лише в git-робочій копії
+# (є .git і git): розгорнутий пакет на сервері не має .git, і [НЕДОСТУПНО]
+# там інвалідувало б acceptance. Покриття на CI не може зникнути мовчки:
+# RealScenariosRunOnCi падає, якщо на GitHub Actions сценарії не виконуються.
 # Змінні лишаються в межах & { }: нічого нового не читається коренем.
 # ============================================================
 & {
@@ -31310,10 +31311,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath') { try
         $cpT = @{}
         $cpTNote = @{}
         $cpGitCommand = @(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue)
-        $cpGitLimitation = ''
-        if ($cpGitCommand.Count -eq 0) {
-            $cpGitLimitation = 'git недоступний на цьому хості: сценарії з тимчасовим репозиторієм не виконувались'
-        }
+        $cpRunReal = ((Test-Path -LiteralPath (Join-Path $root '.git')) -and $cpGitCommand.Count -gt 0)
         $cpTOk = {
             param([string]$Key)
             return ($cpT.ContainsKey($Key) -and $cpT[$Key] -eq $true)
@@ -31366,7 +31364,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath') { try
         $cpCyr1 = 'документ'
         $cpCyr2 = 'мій новий'
 
-        if ($cpGitLimitation.Length -eq 0) {
+        if ($cpRunReal) {
             # Рядок запуску: потоки розділені, stderr не стає помилкою під Stop, збій запуску - не виняток.
             & $cpWithRepo 'Runner' {
                 param([string]$Dir)
@@ -31493,9 +31491,14 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath') { try
             # Каталог без git init: C18.
             & $cpWithRepo 'NotARepository' {
                 param([string]$Dir)
+                $parentProbe = Invoke-BRAVOGitCommand -RepositoryRoot ([IO.Path]::GetDirectoryName($Dir)) -Argument @('rev-parse', '--is-inside-work-tree')
+                $parentInsideRepo = ($parentProbe.Available -and $null -ne $parentProbe.ExitCode -and $parentProbe.ExitCode -eq 0 -and $parentProbe.StdOut.StartsWith('true', [StringComparison]::Ordinal))
                 $notRepo = Get-BRAVOChangedPathSet -RepositoryRoot $Dir -BaseRef 'main'
                 $cpT['NotARepository'] = ($notRepo.Status -ceq 'NOT-A-REPOSITORY' -and @($notRepo.ChangedPath).Count -eq 0)
                 $cpTNote['NotARepository'] = "status=$($notRepo.Status); $($notRepo.Message)"
+                if ($parentInsideRepo) {
+                    $cpTNote['NotARepository'] += '; ПЕРЕДУМОВА НЕ ВИКОНАНА: батьківський каталог тимчасового каталогу сам лежить усередині git-робочого дерева (TEMP у репозиторії), тому NOT-A-REPOSITORY недосяжний'
+                }
             }
 
             # Супутній маніфест: C21 [T].
@@ -31522,32 +31525,39 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath') { try
             }
         }
 
-        foreach ($cpCase in @(
-                @{ Key = 'Runner'; Name = 'RealGitRunnerSeparatesStreamsAndReportsStartFailure'; Failure = 'Invoke-BRAVOGitCommand мусить повертати {Available; ExitCode; StdOut; StdErr; StartError}: потоки розділені, stderr не стає помилкою під ErrorActionPreference=Stop, збій запуску - Available=$true, ExitCode=$null, StartError заповнено, без винятку' },
-                @{ Key = 'Main'; Name = 'RealRepositoryCollectsStatusOk'; Failure = 'збирач на реальному репозиторії мусить повернути Ok' },
-                @{ Key = 'Added'; Name = 'RealAddedTrackedAndUntrackedFiles'; Failure = 'новий tracked і новий untracked файли мусять бути в ChangedPath' },
-                @{ Key = 'Modified'; Name = 'RealModifiedStagedAndUnstagedOnce'; Failure = 'файл зі staged і unstaged змінами мусить бути в ChangedPath рівно один раз і не бути в DeletedPath' },
-                @{ Key = 'Deleted'; Name = 'RealDeletedIsChangedAndDeleted'; Failure = 'git rm: шлях мусить бути і в ChangedPath, і в DeletedPath' },
-                @{ Key = 'Renamed'; Name = 'RealRenameReportsBothPaths'; Failure = 'git mv a b: обидва шляхи в ChangedPath (--no-renames), старий у DeletedPath, новий - ні' },
-                @{ Key = 'Spaces'; Name = 'RealPathWithSpacesIsVerbatim'; Failure = 'шлях із пробілом повертається дослівно, без лапок' },
-                @{ Key = 'Cyrillic'; Name = 'RealCyrillicPathIsUtf8WithQuotepathOn'; Failure = 'кириличний шлях (tracked і untracked) за core.quotepath=true повертається побайтово в UTF-8, без восьмеричних екранувань' },
-                @{ Key = 'NoTrim'; Name = 'RealLeadingSpaceIsNotTrimmed'; Failure = 'шлях із пробілом на початку повертається дослівно (без обрізання)' },
-                @{ Key = 'Ignored'; Name = 'RealGitignoredFilesAreExcluded'; Failure = 'файли з .gitignore не входять до ChangedPath' },
-                @{ Key = 'Dirty'; Name = 'RealDirtyTreeIsReported'; Failure = 'база = HEAD зі staged + unstaged + untracked змінами: Dirty=$true, BaseSha=HeadSha=MergeBaseSha' },
-                @{ Key = 'ExactSet'; Name = 'RealChangedPathSetIsExactAndOrdinalSorted'; Failure = 'ChangedPath мусить дорівнювати точному набору в порядку Ordinal, DeletedPath - видаленим і перейменованим старим шляхам' },
-                @{ Key = 'InvalidBase'; Name = 'RealUnknownRefIsBaseInvalid'; Failure = 'неіснуюче ім''я ref мусить давати BASE-INVALID' },
-                @{ Key = 'BaseEqualsHead'; Name = 'RealBaseEqualsHeadOnCleanTree'; Failure = 'BaseRef=HEAD (чи SHA HEAD) на чистому дереві мусить давати BASE-EQUALS-HEAD' },
-                @{ Key = 'EmptyDiff'; Name = 'RealLegitimateEmptyDiffUsesMergeBase'; Failure = 'C1 -> C2 -> C3 (повернення), база C1: EMPTY-DIFF; для бази в іншій гілці порівнюється merge-base, а не кінчик гілки' },
-                @{ Key = 'NoMergeBase'; Name = 'RealOrphanBranchHasNoMergeBase'; Failure = 'orphan-гілка мусить давати NO-MERGE-BASE' },
-                @{ Key = 'NotARepository'; Name = 'RealDirectoryWithoutGitIsNotARepository'; Failure = 'каталог без git init мусить давати NOT-A-REPOSITORY' },
-                @{ Key = 'Manifest'; Name = 'RealManifestCompanionTexts'; Failure = 'RuntimeManifestBaseText - з merge-base ($null, якщо там немає файлу), CurrentText - з диска; без маніфесту в наборі обидва $null' }
-            )) {
-            Test-BRAVOCondition `
-                -Condition (& $cpTOk $cpCase.Key) `
-                -Name ("Framework/AffectedChangedPath." + $cpCase.Name) `
-                -EnvironmentLimitation $cpGitLimitation `
-                -Failure ($cpCase.Failure + '. Деталі: ' + (& $cpTWhy $cpCase.Key))
+        if ($cpRunReal) {
+            foreach ($cpCase in @(
+                    @{ Key = 'Runner'; Name = 'RealGitRunnerSeparatesStreamsAndReportsStartFailure'; Failure = 'Invoke-BRAVOGitCommand мусить повертати {Available; ExitCode; StdOut; StdErr; StartError}: потоки розділені, stderr не стає помилкою під ErrorActionPreference=Stop, збій запуску - Available=$true, ExitCode=$null, StartError заповнено, без винятку' },
+                    @{ Key = 'Main'; Name = 'RealRepositoryCollectsStatusOk'; Failure = 'збирач на реальному репозиторії мусить повернути Ok' },
+                    @{ Key = 'Added'; Name = 'RealAddedTrackedAndUntrackedFiles'; Failure = 'новий tracked і новий untracked файли мусять бути в ChangedPath' },
+                    @{ Key = 'Modified'; Name = 'RealModifiedStagedAndUnstagedOnce'; Failure = 'файл зі staged і unstaged змінами мусить бути в ChangedPath рівно один раз і не бути в DeletedPath' },
+                    @{ Key = 'Deleted'; Name = 'RealDeletedIsChangedAndDeleted'; Failure = 'git rm: шлях мусить бути і в ChangedPath, і в DeletedPath' },
+                    @{ Key = 'Renamed'; Name = 'RealRenameReportsBothPaths'; Failure = 'git mv a b: обидва шляхи в ChangedPath (--no-renames), старий у DeletedPath, новий - ні' },
+                    @{ Key = 'Spaces'; Name = 'RealPathWithSpacesIsVerbatim'; Failure = 'шлях із пробілом повертається дослівно, без лапок' },
+                    @{ Key = 'Cyrillic'; Name = 'RealCyrillicPathIsUtf8WithQuotepathOn'; Failure = 'кириличний шлях (tracked і untracked) за core.quotepath=true повертається побайтово в UTF-8, без восьмеричних екранувань' },
+                    @{ Key = 'NoTrim'; Name = 'RealLeadingSpaceIsNotTrimmed'; Failure = 'шлях із пробілом на початку повертається дослівно (без обрізання)' },
+                    @{ Key = 'Ignored'; Name = 'RealGitignoredFilesAreExcluded'; Failure = 'файли з .gitignore не входять до ChangedPath' },
+                    @{ Key = 'Dirty'; Name = 'RealDirtyTreeIsReported'; Failure = 'база = HEAD зі staged + unstaged + untracked змінами: Dirty=$true, BaseSha=HeadSha=MergeBaseSha' },
+                    @{ Key = 'ExactSet'; Name = 'RealChangedPathSetIsExactAndOrdinalSorted'; Failure = 'ChangedPath мусить дорівнювати точному набору в порядку Ordinal, DeletedPath - видаленим і перейменованим старим шляхам' },
+                    @{ Key = 'InvalidBase'; Name = 'RealUnknownRefIsBaseInvalid'; Failure = 'неіснуюче ім''я ref мусить давати BASE-INVALID' },
+                    @{ Key = 'BaseEqualsHead'; Name = 'RealBaseEqualsHeadOnCleanTree'; Failure = 'BaseRef=HEAD (чи SHA HEAD) на чистому дереві мусить давати BASE-EQUALS-HEAD' },
+                    @{ Key = 'EmptyDiff'; Name = 'RealLegitimateEmptyDiffUsesMergeBase'; Failure = 'C1 -> C2 -> C3 (повернення), база C1: EMPTY-DIFF; для бази в іншій гілці порівнюється merge-base, а не кінчик гілки' },
+                    @{ Key = 'NoMergeBase'; Name = 'RealOrphanBranchHasNoMergeBase'; Failure = 'orphan-гілка мусить давати NO-MERGE-BASE' },
+                    @{ Key = 'NotARepository'; Name = 'RealDirectoryWithoutGitIsNotARepository'; Failure = 'каталог без git init мусить давати NOT-A-REPOSITORY' },
+                    @{ Key = 'Manifest'; Name = 'RealManifestCompanionTexts'; Failure = 'RuntimeManifestBaseText - з merge-base ($null, якщо там немає файлу), CurrentText - з диска; без маніфесту в наборі обидва $null' }
+                )) {
+                Test-BRAVOCondition `
+                    -Condition (& $cpTOk $cpCase.Key) `
+                    -Name ("Framework/AffectedChangedPath." + $cpCase.Name) `
+                    -Failure ($cpCase.Failure + '. Деталі: ' + (& $cpTWhy $cpCase.Key))
+            }
+        } else {
+            Write-Host "  Сценарії AffectedChangedPath на реальному git-репозиторії пропущено: вони виконуються лише в git-робочій копії (потрібні .git і git)."
         }
+        Test-BRAVOCondition `
+            -Condition (($env:GITHUB_ACTIONS -ne 'true') -or $cpRunReal) `
+            -Name "Framework/AffectedChangedPath.RealScenariosRunOnCi" `
+            -Failure "на GitHub Actions сценарії AffectedChangedPath на реальному git-репозиторії мусять виконуватись (потрібні .git у корені та git у PATH); їх відсутність мовчки прибрала б покриття. .git: $(Test-Path -LiteralPath (Join-Path $root '.git')); git знайдено: $($cpGitCommand.Count -gt 0)"
 
         # --- [R]: статичний guard файлу -------------------------------------
         $cpParsed = Get-BRAVOSelfTestParsedFile -Path $cpPath
@@ -31566,7 +31576,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath') { try
         Test-BRAVOCondition `
             -Condition (
                 $cpForbiddenFound.Count -eq 0 -and $cpForeignPatterns.Count -eq 0 -and $cpPs7Nodes.Count -eq 0 -and
-                $cpFunctionNames -ceq 'Get-BRAVOChangedPathSet,Invoke-BRAVOGitCommand'
+                $cpFunctionNames -ceq 'Get-BRAVOChangedPathSet,Invoke-BRAVOGitCommand' -and
+                @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR' |
+                        Where-Object { $cpText.IndexOf("'" + $_ + "'", [StringComparison]::Ordinal) -lt 0 }).Count -eq 0
             ) `
             -Name "Framework/AffectedChangedPath.StaticSourceHasNoForbiddenConstructs" `
             -Failure ("ci\BRAVOChangedPath.ps1: без 2>&1, обрізання (Trim), ??, ?., &&, ||, -Parallel, ::new, динамічного складання імені модуля, копії мапи Affected чи шаблонів config-parity; " +

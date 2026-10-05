@@ -69,6 +69,12 @@
     $startInfo.RedirectStandardError = $true
     $startInfo.StandardOutputEncoding = $utf8
     $startInfo.StandardErrorEncoding = $utf8
+    # Успадковані змінні вибору репозиторію перевизначили б WorkingDirectory і зіпсували б результат.
+    foreach ($inheritedName in @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR')) {
+        if ($startInfo.EnvironmentVariables.ContainsKey($inheritedName)) {
+            $startInfo.EnvironmentVariables.Remove($inheritedName)
+        }
+    }
     $startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
     $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
 
