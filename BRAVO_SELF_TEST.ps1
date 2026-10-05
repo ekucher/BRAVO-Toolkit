@@ -29628,9 +29628,20 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
         [void][IO.Directory]::CreateDirectory($suiteProbeRoot)
         $suiteProbeAst = Get-BRAVOSelfTestOwnSourceAst
         $suiteProbeTop = @($suiteProbeAst.EndBlock.Statements)
-        $suiteProbeCatalogAssign = @($suiteProbeTop | Where-Object {
+        # Каталог живе у файлі мапи (selftest\BRAVOSelfTestSuiteMap.ps1), а корінь його dot-source-ить;
+        # присвоєння береться з AST саме цього файлу, а корінь мусить підключати його рівно один раз.
+        $suiteProbeMapParsed = Get-BRAVOSelfTestParsedFile -Path (Join-Path $root 'selftest\BRAVOSelfTestSuiteMap.ps1')
+        if (@($suiteProbeMapParsed.Errors).Count -gt 0) { throw 'синтаксичні помилки у selftest\BRAVOSelfTestSuiteMap.ps1' }
+        $suiteProbeMapTop = @($suiteProbeMapParsed.Ast.EndBlock.Statements)
+        $suiteProbeCatalogAssign = @($suiteProbeMapTop | Where-Object {
                 $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
                 $_.Left.Extent.Text -ceq '$script:BRAVOSelfTestSuiteCatalog' })
+        $suiteProbeMapDotSource = @($suiteProbeTop | Where-Object {
+                $_ -is [Management.Automation.Language.PipelineAst] -and
+                $_.PipelineElements.Count -eq 1 -and
+                $_.PipelineElements[0] -is [Management.Automation.Language.CommandAst] -and
+                $_.PipelineElements[0].InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot -and
+                $_.Extent.Text -ceq ". (Join-Path `$root 'selftest\BRAVOSelfTestSuiteMap.ps1')" })
         $suiteProbeResetAssign = @($suiteProbeTop | Where-Object {
                 $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
                 $_.Left.Extent.Text -ceq '$script:BRAVOSelfTestSelectedSuite' -and
@@ -29641,9 +29652,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
         $suiteProbeEnabledFn = @($suiteProbeTop | Where-Object {
                 $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and
                 $_.Name -ceq 'Test-BRAVOSelfTestSuiteEnabled' })
-        if ($suiteProbeCatalogAssign.Count -ne 1 -or $null -eq $suiteProbeResetAssign -or
+        if ($suiteProbeCatalogAssign.Count -ne 1 -or $suiteProbeMapDotSource.Count -ne 1 -or $null -eq $suiteProbeResetAssign -or
             $suiteProbeNormalize.Count -ne 1 -or $suiteProbeEnabledFn.Count -ne 1) {
-            throw 'не знайдено каталог, скидання вибору, розбір -Suite чи Test-BRAVOSelfTestSuiteEnabled — межі розбору -Suite змінено'
+            throw 'не знайдено каталог у файлі мапи, його dot-source у корені, скидання вибору, розбір -Suite чи Test-BRAVOSelfTestSuiteEnabled — межі розбору -Suite змінено'
         }
 
         # P1: функція повторює param() кореня ([string[]]$Suite) і виконує дослівні
@@ -29906,7 +29917,10 @@ foreach ($case in $cases) {
         return @($mismatches.ToArray())
     }
 
-    # M1. Кожен фрагмент каталогу відображається рівно на себе, у всіх формах шляху.
+    # M1. Кожен фрагмент каталогу відображається рівно на себе у відносних формах шляху
+    # ('\', '/', '.\', './', верхній регістр). Абсолютні шляхи й шляхи з пробілами по
+    # краях НЕ відображаються (VAL-05, ревізія 2.1): вхід не обрізається, а абсолютний
+    # шлях не є точним шляхом від кореня репозиторію - підказка порожня, план дає V3.
     $suiteMapFragmentPairs = New-Object System.Collections.Generic.List[object]
     foreach ($suiteMapName in $suiteMapCatalog) {
         $suiteMapRel = 'selftest\BRAVO_SELF_TEST.' + $suiteMapName + '.ps1'
@@ -29915,11 +29929,17 @@ foreach ($case in $cases) {
                 $suiteMapRel.Replace('\', '/'),
                 ('.\' + $suiteMapRel),
                 ('./' + $suiteMapRel.Replace('\', '/')),
+                $suiteMapRel.ToUpperInvariant())) {
+            [void]$suiteMapFragmentPairs.Add(@($suiteMapForm, $suiteMapName))
+        }
+        foreach ($suiteMapForm in @(
                 ('C:\work\repo\' + $suiteMapRel),
                 ('/home/u/repo/' + $suiteMapRel.Replace('\', '/')),
-                $suiteMapRel.ToUpperInvariant(),
-                ('  ' + $suiteMapRel + '  '))) {
-            [void]$suiteMapFragmentPairs.Add(@($suiteMapForm, $suiteMapName))
+                ('\\host-a\share\' + $suiteMapRel),
+                ('  ' + $suiteMapRel + '  '),
+                (' ' + $suiteMapRel),
+                ($suiteMapRel + ' '))) {
+            [void]$suiteMapFragmentPairs.Add(@($suiteMapForm, ''))
         }
     }
     $suiteMapProblems = @(& $suiteMapMismatch $suiteMapFragmentPairs.ToArray())
@@ -29927,7 +29947,7 @@ foreach ($case in $cases) {
         -Condition ($suiteMapCatalog.Count -gt 0 -and $suiteMapProblems.Count -eq 0) `
         -Name "Framework/ChangedPathMap.FragmentsMapExactlyAndOnlyToThemselves" `
         -Failure ("фрагмент каталогу мусить відображатись рівно на однойменний suite (без зайвих елементів) у формах " +
-            "'\', '/', '.\', './', абсолютний шлях, верхній регістр, пробіли по краях: " +
+            "'\', '/', '.\', './', верхній регістр; абсолютний шлях і пробіли по краях дають порожній результат: " +
             [string]::Join('; ', @($suiteMapProblems | Select-Object -First 5)))
 
     # M2. Фрагменти й файли поза каталогом не відображаються ні на що.
@@ -29974,6 +29994,11 @@ foreach ($case in $cases) {
         if ($suiteMapModuleSuites.ContainsKey($suiteMapModule)) { $suiteMapExpected = $suiteMapModuleSuites[$suiteMapModule] }
         [void]$suiteMapModulePairs.Add(@(('modules\BRAVO.' + $suiteMapModule + '\x.psm1'), $suiteMapExpected))
     }
+    # Двійники імені модуля (повний сегмент каталогу, а не префікс) не відображаються.
+    foreach ($suiteMapLookalike in @('modules\BRAVO.Archive.Legacy\x.psm1', 'modules\BRAVO.DiskSpace.Legacy\x.psm1',
+            'modules\BRAVO.DataRestore.Legacy\x.psm1', 'modules\BRAVO.Status2\x.psm1')) {
+        [void]$suiteMapModulePairs.Add(@($suiteMapLookalike, ''))
+    }
     $suiteMapProblems = @(& $suiteMapMismatch $suiteMapModulePairs.ToArray())
     Test-BRAVOCondition `
         -Condition (
@@ -29990,14 +30015,16 @@ foreach ($case in $cases) {
     $suiteMapProblems = @(& $suiteMapMismatch @(
             @('modules\BRAVO.ArchiveHelpers\x.psm1', ''),
             @('modules\BRAVO.ArchiveRuntime\x.psm1', ''),
-            @('modules\BRAVO.DiskSpace', 'DiskSpace'),
+            @('modules\BRAVO.DiskSpace', ''),
+            @('modules\BRAVO.DiskSpace\', ''),
             @('modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psm1', 'DiskSpace'),
             @('modules\BRAVO.Archive\BRAVO.Archive.psm1', 'Archive')))
     Test-BRAVOCondition `
         -Condition ($suiteMapProblems.Count -eq 0) `
         -Name "Framework/ChangedPathMap.ModulePrefixDoesNotLeak" `
-        -Failure ("ім'я модуля береться повністю: ArchiveHelpers/ArchiveRuntime не відображаються на Archive, а DiskSpace — " +
-            "лише на DiskSpace, без залежних suite: " + [string]::Join('; ', $suiteMapProblems))
+        -Failure ("ім'я модуля береться повним сегментом: ArchiveHelpers/ArchiveRuntime не відображаються на Archive, DiskSpace — " +
+            "лише на DiskSpace, без залежних suite, а голий каталог модуля без кінцевого роздільника не відображається: " +
+            [string]::Join('; ', $suiteMapProblems))
 
     # M5. Не-код і інфраструктура — порожній результат (= повний прогін). Це
     # поточний консервативний стан; правила для цих класів додає Affected.
@@ -30075,21 +30102,818 @@ foreach ($case in $cases) {
         -Failure ("мапа мусить повертати для файлу не більше одного suite і лише ім'я з каталогу; перевірено файлів: " +
             "$($suiteMapFiles.Count); проблеми: [" + [string]::Join('; ', @($suiteMapShapeProblems | Select-Object -First 5)) + "]")
 
-    # M9. ЛИШЕ фіксація поточної нестрогості: правило фрагмента без якоря початку
-    # (xselftest\... дає Paths), правило модуля з якорем (./modules\... та абсолютні
-    # шляхи дають порожньо). Звуження чи виправлення — свідома зміна цього тесту,
-    # а не регресія.
+    # M9. Обидва правила (фрагмент і модуль) прив'язані до початку шляху: двійники префікса
+    # (xselftest\..., docs\selftest\...) і абсолютні шляхи дають порожньо. Провідний './'
+    # зрізається однаково для обох правил (тому ./modules/BRAVO.Archive/x дає Archive).
     $suiteMapProblems = @(& $suiteMapMismatch @(
-            @('xselftest\BRAVO_SELF_TEST.Paths.ps1', 'Paths'),
-            @('./modules/BRAVO.Archive/x', ''),
+            @('xselftest\BRAVO_SELF_TEST.Paths.ps1', ''),
+            @('docs\selftest\BRAVO_SELF_TEST.Paths.ps1', ''),
+            @('xmodules\BRAVO.Archive\x', ''),
+            @('docs\modules\BRAVO.Archive\x', ''),
+            @('./modules/BRAVO.Archive/x', 'Archive'),
             @('C:\repo\modules\BRAVO.Archive\x', '')))
     Test-BRAVOCondition `
         -Condition ($suiteMapProblems.Count -eq 0) `
-        -Name "Framework/ChangedPathMap.CurrentLooseMatchingIsRecorded" `
-        -Failure ("зафіксована поточна поведінка мапи змінилась (правило фрагмента без якоря, правило модуля з якорем) — " +
-            "якщо зміна навмисна, оновіть цей тест: " + [string]::Join('; ', $suiteMapProblems))
+        -Name "Framework/ChangedPathMap.RulesAreAnchoredAtPathStart" `
+        -Failure ("правила фрагмента й модуля мусять бути прив'язані до початку шляху (двійники префікса й абсолютні шляхи дають " +
+            "порожньо; провідний './' зрізається): " + [string]::Join('; ', $suiteMapProblems))
+
+    # M10. Некоректні форми шляху не відображаються ні на що, навіть якщо після обрізання чи
+    # нормалізації збіглися б з фрагментом або модулем (обхід каталогів, порожні й '.'-сегменти,
+    # пробіли та керувальні символи, UNC, кінцевий роздільник у фрагменті).
+    $suiteMapProblems = @(& $suiteMapMismatch @(
+            @('selftest\..\selftest\BRAVO_SELF_TEST.Paths.ps1', ''),
+            @('docs/../selftest/BRAVO_SELF_TEST.Paths.ps1', ''),
+            @('selftest\.\BRAVO_SELF_TEST.Paths.ps1', ''),
+            @('selftest\\BRAVO_SELF_TEST.Paths.ps1', ''),
+            @('selftest\BRAVO_SELF_TEST.Paths.ps1\', ''),
+            @('modules\..\modules\BRAVO.Archive\x', ''),
+            @('modules\BRAVO.Archive\..\BRAVO.Archive\x', ''),
+            @("selftest\BRAVO_SELF_TEST.Paths.ps1`n", ''),
+            @("`tselftest\BRAVO_SELF_TEST.Paths.ps1", ''),
+            @(('selftest\BRAVO_SELF_TEST.Paths' + [string][char]1 + '.ps1'), ''),
+            @('\selftest\BRAVO_SELF_TEST.Paths.ps1', ''),
+            @('..\selftest\BRAVO_SELF_TEST.Paths.ps1', '')))
+    Test-BRAVOCondition `
+        -Condition ($suiteMapProblems.Count -eq 0) `
+        -Name "Framework/ChangedPathMap.InvalidPathFormsMapToNothing" `
+        -Failure ("шлях з '..', порожнім чи '.'-сегментом, пробілами або керувальними символами по краях/всередині, абсолютний чи " +
+            "UNC мусить давати порожній результат: " + [string]::Join('; ', $suiteMapProblems))
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract' } }
+
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan') { try {
+
+# ============================================================
+# VAL-05 (Affected), PR1: мапа шляхів і консервативний класифікатор.
+#
+# Канонічний власник - selftest\BRAVOSelfTestSuiteMap.ps1 (каталог -Suite,
+# підказка "шлях -> suite", план Affected). Секція перевіряє ЧИСТІ функції
+# in-process, без git і без дочірніх процесів. Інваріанти:
+#   * клас лише V1/V2/V3, V0 не видається ніколи (рішення P1-B);
+#   * невідомий або змішаний вхід -> V3 і Suite = @() (запускати лише відомі
+#     suite небезпечно);
+#   * RUNTIME_MANIFEST.json - похідний супутник, а не підстава для V3, але
+#     лише за доведеної дельти (мінімум V2 завжди);
+#   * leaf-модулі V2 стереже статичний guard вхідних ребер.
+# Змінні лишаються в межах & { }: нічого нового не читається коренем.
+# ============================================================
+& {
+    $affMapPath = Join-Path $root 'selftest\BRAVOSelfTestSuiteMap.ps1'
+    $affCatalog = @($script:BRAVOSelfTestSuiteCatalog)
+    $affMismatch = New-Object System.Collections.Generic.List[string]
+    $affSeenClass = New-Object System.Collections.Generic.List[string]
+
+    # --- Допоміжні конструкції -------------------------------------------
+    $affManifestText = {
+        param([System.Collections.IDictionary]$Files, [string]$Description = 'desc', [bool]$Compress = $false)
+        $manifestDocument = [ordered]@{
+            schemaVersion   = 1
+            description     = $Description
+            updateProcedure = 'proc'
+            files           = $Files
+        }
+        return (ConvertTo-Json -InputObject $manifestDocument -Depth 4 -Compress:$Compress)
+    }
+    $affBaseFiles = [ordered]@{
+        'BRAVO_ARCHIV.ps1'                         = 'A1'
+        'BRAVO_HEALTH.ps1'                         = 'A2'
+        'selftest\BRAVO_SELF_TEST.Archive.ps1'     = 'A3'
+        'selftest\BRAVO_SELF_TEST.Governance.ps1'  = 'A4'
+        'selftest\BRAVO_SELF_TEST.Paths.ps1'       = 'A5'
+    }
+    # План із супутнім маніфестом: Delta - зміни записів files ($null = запис видалено).
+    $affPlanWithManifest = {
+        param([string[]]$Paths, [hashtable]$Delta, [string[]]$Deleted = @(), [string]$Description = 'desc')
+        $baseText = & $affManifestText $affBaseFiles 'desc'
+        $currentFiles = [ordered]@{}
+        foreach ($baseKey in @($affBaseFiles.Keys)) { $currentFiles[$baseKey] = $affBaseFiles[$baseKey] }
+        foreach ($deltaKey in @($Delta.Keys)) {
+            if ($null -eq $Delta[$deltaKey]) { $currentFiles.Remove($deltaKey) } else { $currentFiles[$deltaKey] = $Delta[$deltaKey] }
+        }
+        $currentText = & $affManifestText $currentFiles $Description
+        $changed = @($Paths) + @('RUNTIME_MANIFEST.json')
+        $companion = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $baseText -CurrentText $currentText -ChangedPath $changed
+        return (Get-BRAVOSelfTestAffectedPlan -ChangedPath $changed -DeletedPath $Deleted -RuntimeManifestCompanion $companion)
+    }
+    $affPlanPlain = {
+        param([string[]]$Paths, [string[]]$Deleted = @())
+        return (Get-BRAVOSelfTestAffectedPlan -ChangedPath $Paths -DeletedPath $Deleted)
+    }
+    $affSignature = {
+        param($Plan)
+        return ([string]$Plan.Class + '|' + [string]::Join(',', @($Plan.Suite)))
+    }
+    $affExpect = {
+        param([string]$Id, $Plan, [string]$Expected)
+        [void]$affSeenClass.Add([string]$Plan.Class)
+        $actual = & $affSignature $Plan
+        if ($actual -cne $Expected) { [void]$affMismatch.Add($Id + ": '" + $actual + "' (очікувалось '" + $Expected + "')") }
+    }
+    $affExpectGate = {
+        param([string]$Id, $Plan, [string]$Expected)
+        $actual = [string]::Join(',', @($Plan.RequiredGate))
+        if ($actual -cne $Expected) { [void]$affMismatch.Add($Id + ": gate '" + $actual + "' (очікувалось '" + $Expected + "')") }
+    }
+    $affTakeMismatch = {
+        $taken = [string]::Join('; ', @($affMismatch.ToArray() | Select-Object -First 6))
+        $affMismatch.Clear()
+        return $taken
+    }
+
+    $affPaths = 'selftest\BRAVO_SELF_TEST.Paths.ps1'
+    $affArchive = 'selftest\BRAVO_SELF_TEST.Archive.ps1'
+    $affGovernance = 'selftest\BRAVO_SELF_TEST.Governance.ps1'
+
+    # --- B1-B4, B29-B31: відомі фрагменти + супутній маніфест -> V2 ------
+    & $affExpect 'B1 KnownSingle' (& $affPlanWithManifest @($affPaths) @{ $affPaths = 'N1' }) 'V2|Governance,Paths'
+    & $affExpect 'B2 KnownMultipleSameSuite' (& $affPlanWithManifest @($affGovernance, 'SECURITY.md') @{ $affGovernance = 'N1' }) 'V2|Governance'
+    & $affExpect 'B3 KnownMultipleSuites' (& $affPlanWithManifest @($affPaths, $affArchive) @{ $affPaths = 'N1'; $affArchive = 'N2' }) 'V2|Archive,Governance,Paths'
+    & $affExpect 'B4 DuplicatePaths' (& $affPlanWithManifest @('selftest/BRAVO_SELF_TEST.Paths.ps1', $affPaths, 'selftest/BRAVO_SELF_TEST.Paths.ps1') @{ $affPaths = 'N1' }) 'V2|Governance,Paths'
+    & $affExpect 'B29 CaseVariant' (& $affPlanWithManifest @('SELFTEST/bravo_self_test.PATHS.ps1') @{ $affPaths = 'N1' }) 'V2|Governance,Paths'
+    & $affExpect 'B30 SlashVsBackslash' (& $affPlanWithManifest @('selftest/BRAVO_SELF_TEST.Archive.ps1') @{ $affArchive = 'N1' }) 'V2|Archive,Governance'
+    & $affExpect 'B31 DotPrefix' (& $affPlanWithManifest @('./selftest/BRAVO_SELF_TEST.Paths.ps1', '.\selftest\BRAVO_SELF_TEST.Archive.ps1') @{ $affPaths = 'N1'; $affArchive = 'N2' }) 'V2|Archive,Governance,Paths'
+    & $affExpect 'B3a RealisticCodePR' (& $affPlanWithManifest @($affPaths, 'CHANGELOG.md') @{ $affPaths = 'N1' }) 'V2|Governance,Paths'
+    & $affExpectGate 'B3a gate' (& $affPlanWithManifest @($affPaths, 'CHANGELOG.md') @{ $affPaths = 'N1' }) 'Integrity manifests are current,Release policy'
+    & $affExpect 'B47 MixedDocAndFragment' (& $affPlanWithManifest @('README.md', $affPaths) @{ $affPaths = 'N1' }) 'V2|Governance,Paths'
+    & $affExpectGate 'B47 gate' (& $affPlanWithManifest @('README.md', $affPaths) @{ $affPaths = 'N1' }) 'Integrity manifests are current,Release policy'
+    & $affExpect 'FragmentWithoutManifestIsStillV2' (& $affPlanPlain @($affPaths)) 'V2|Governance,Paths'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0) `
+        -Name "Framework/AffectedPlan.KnownFragmentsPlanV2WithGovernance" `
+        -Failure ("фрагменти каталогу з супутнім маніфестом (з CHANGELOG.md чи документом таблиці також) мусять давати V2 з union за порядком каталогу, Governance і gate-підказками: " + $affProblem)
+
+    # --- B3a, B47 і мінімум V2 для маніфеста (ревізія 2.1) ---------------
+    $affReformatBase = & $affManifestText $affBaseFiles 'desc' $false
+    $affReformatCurrent = & $affManifestText ([ordered]@{
+            'selftest\BRAVO_SELF_TEST.Paths.ps1'      = 'A5'
+            'selftest\BRAVO_SELF_TEST.Governance.ps1' = 'A4'
+            'selftest\BRAVO_SELF_TEST.Archive.ps1'    = 'A3'
+            'BRAVO_HEALTH.ps1'                        = 'A2'
+            'BRAVO_ARCHIV.ps1'                        = 'A1'
+        }) 'desc' $true
+    $affReformatCompanion = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affReformatBase -CurrentText $affReformatCurrent `
+        -ChangedPath @('README.md', 'RUNTIME_MANIFEST.json')
+    $affReformatPlan = Get-BRAVOSelfTestAffectedPlan -ChangedPath @('README.md', 'RUNTIME_MANIFEST.json') -RuntimeManifestCompanion $affReformatCompanion
+    & $affExpect '2.1 README+ReformattedManifest' $affReformatPlan 'V2|Governance'
+    Test-BRAVOCondition `
+        -Condition ($affMismatch.Count -eq 0 -and $affReformatCompanion.IsCompanion -and @($affReformatCompanion.OutsideEntry).Count -eq 0) `
+        -Name "Framework/AffectedPlan.ManifestCompanionGivesAtLeastV2" `
+        -Failure ("супутній маніфест (навіть переформатований, з порожньою дельтою) дає щонайменше V2, а документ із таблиці " +
+            "разом із ним не лишається V1: " + [string]::Join('; ', @($affMismatch.ToArray())) + "; супутник: " + $affReformatCompanion.Reason)
+    $affMismatch.Clear()
+
+    # --- B3b-B3e: маніфест, що НЕ є супутником -> V3 ---------------------
+    & $affExpect 'B3b ManifestExtraEntry' (& $affPlanWithManifest @($affPaths) @{ $affPaths = 'N1'; 'BRAVO_ARCHIV.ps1' = 'N9' }) 'V3|'
+    & $affExpect 'B3b ManifestRemovedEntry' (& $affPlanWithManifest @($affPaths) @{ $affPaths = 'N1'; 'BRAVO_HEALTH.ps1' = $null }) 'V3|'
+    & $affExpect 'B3b ManifestAddedEntry' (& $affPlanWithManifest @($affPaths) @{ $affPaths = 'N1'; 'ci\Extra.ps1' = 'N9' }) 'V3|'
+    & $affExpect 'B3c ManifestNonHashField' (& $affPlanWithManifest @($affPaths) @{ $affPaths = 'N1' } @() 'changed description') 'V3|'
+    & $affExpect 'B3d ManifestOnly' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @('RUNTIME_MANIFEST.json') -RuntimeManifestCompanion (
+            Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affReformatBase -CurrentText $affReformatCurrent -ChangedPath @('RUNTIME_MANIFEST.json'))) 'V3|'
+    & $affExpect 'B3e ManifestBaseMissing' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affPaths, 'RUNTIME_MANIFEST.json') -RuntimeManifestCompanion (
+            Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $null -CurrentText $affReformatCurrent -ChangedPath @($affPaths, 'RUNTIME_MANIFEST.json'))) 'V3|'
+    & $affExpect 'B3e ManifestUnparsable' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affPaths, 'RUNTIME_MANIFEST.json') -RuntimeManifestCompanion (
+            Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affReformatBase -CurrentText '{ not json' -ChangedPath @($affPaths, 'RUNTIME_MANIFEST.json'))) 'V3|'
+    & $affExpect 'B3e NoCompanionObject' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affPaths, 'RUNTIME_MANIFEST.json')) 'V3|'
+    & $affExpect 'ManifestDeleted' (& $affPlanWithManifest @($affPaths) @{ $affPaths = 'N1' } @('RUNTIME_MANIFEST.json')) 'V3|'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0) `
+        -Name "Framework/AffectedPlan.ManifestWithoutProvenCompanionEscalatesToV3" `
+        -Failure ("маніфест із записом поза ChangedPath, зміненим не-хеш полем, без змісту, без бази, з некоректним JSON, без об'єкта супутника чи видалений мусить давати V3 і Suite = @(): " + $affProblem)
+
+    # --- Функція супутника маніфесту: пряма перевірка ---------------------
+    $affCompanionCases = New-Object System.Collections.Generic.List[string]
+    $affBaseJson = & $affManifestText $affBaseFiles 'desc' $false
+    $affChangedOne = @('selftest/bravo_self_test.paths.ps1', 'RUNTIME_MANIFEST.json')
+    $affOneDelta = [ordered]@{}
+    foreach ($affKey in @($affBaseFiles.Keys)) { $affOneDelta[$affKey] = $affBaseFiles[$affKey] }
+    $affOneDelta['selftest\BRAVO_SELF_TEST.Paths.ps1'] = 'N1'
+    $affOneDeltaJson = & $affManifestText $affOneDelta 'desc' $false
+    $affResult = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affBaseJson -CurrentText $affOneDeltaJson -ChangedPath $affChangedOne
+    if (-not $affResult.IsCompanion) { [void]$affCompanionCases.Add('регістр і роздільник ключів мусять нормалізуватись: ' + $affResult.Reason) }
+    $affResult = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affBaseJson -CurrentText $affOneDeltaJson -ChangedPath @('RUNTIME_MANIFEST.json')
+    if ($affResult.IsCompanion -or [string]::Join(',', @($affResult.OutsideEntry)) -cne 'selftest/BRAVO_SELF_TEST.Paths.ps1') {
+        [void]$affCompanionCases.Add('запис поза ChangedPath мусить бути названий у OutsideEntry: ' + [string]::Join(',', @($affResult.OutsideEntry)))
+    }
+    $affRemovedFiles = [ordered]@{}
+    foreach ($affKey in @($affBaseFiles.Keys)) { if ($affKey -cne 'BRAVO_HEALTH.ps1') { $affRemovedFiles[$affKey] = $affBaseFiles[$affKey] } }
+    $affRemovedJson = & $affManifestText $affRemovedFiles 'desc' $false
+    $affResult = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affBaseJson -CurrentText $affRemovedJson -ChangedPath @('BRAVO_HEALTH.ps1')
+    if (-not $affResult.IsCompanion) { [void]$affCompanionCases.Add('видалений запис, названий у ChangedPath, мусить бути супутником: ' + $affResult.Reason) }
+    $affResult = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affBaseJson -CurrentText $affRemovedJson -ChangedPath @('BRAVO_ARCHIV.ps1')
+    if ($affResult.IsCompanion) { [void]$affCompanionCases.Add('видалений запис поза ChangedPath не може бути супутником') }
+    $affFilesJson = ConvertTo-Json -InputObject $affBaseFiles -Compress
+    $affSchemaJson = '{"schemaVersion":2,"description":"desc","updateProcedure":"proc","files":' + $affFilesJson + '}'
+    $affProcedureJson = '{"schemaVersion":1,"description":"desc","updateProcedure":"other","files":' + $affFilesJson + '}'
+    $affExtraFieldJson = '{"schemaVersion":1,"description":"desc","updateProcedure":"proc","files":' + $affFilesJson + ',"extra":1}'
+    foreach ($affVariant in @(
+            @('schemaVersion', $affSchemaJson), @('updateProcedure', $affProcedureJson), @('додаткове поле верхнього рівня', $affExtraFieldJson),
+            @('порожній текст', ''), @('пробіли', '   '), @('масив у корені', '[1,2]'), @('files не об''єкт', '{"schemaVersion":1,"description":"desc","updateProcedure":"proc","files":[1]}'))) {
+        $affResult = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affBaseJson -CurrentText $affVariant[1] -ChangedPath @($affPaths, 'RUNTIME_MANIFEST.json')
+        if ($affResult.IsCompanion) { [void]$affCompanionCases.Add('варіант не може бути супутником: ' + $affVariant[0]) }
+    }
+    $affResult = Test-BRAVOSelfTestRuntimeManifestCompanion -BaseText $affBaseJson -CurrentText $affBaseJson -ChangedPath @('RUNTIME_MANIFEST.json')
+    if (-not $affResult.IsCompanion -or @($affResult.OutsideEntry).Count -ne 0) { [void]$affCompanionCases.Add('ідентичні тексти (порожня дельта) мусять бути супутником') }
+    Test-BRAVOCondition `
+        -Condition ($affCompanionCases.Count -eq 0) `
+        -Name "Framework/AffectedPlan.ManifestCompanionFunctionIsStrict" `
+        -Failure ("Test-BRAVOSelfTestRuntimeManifestCompanion: " + [string]::Join('; ', @($affCompanionCases.ToArray())))
+
+    # --- B5, B6, B19-B26: невідомі й змішані шляхи -> V3 ------------------
+    $affManifestOnlyArchive = @{ 'BRAVO_ARCHIV.ps1' = 'N1' }
+    & $affExpect 'B5 UnknownSingle' (& $affPlanWithManifest @('BRAVO_ARCHIV.ps1') $affManifestOnlyArchive) 'V3|'
+    & $affExpect 'B6 KnownPlusUnknown' (& $affPlanWithManifest @($affPaths, 'ci/Update-BRAVORuntimeManifest.ps1') @{ $affPaths = 'N1'; 'ci\Update-BRAVORuntimeManifest.ps1' = 'N2' }) 'V3|'
+    & $affExpect 'B19 RootEntrypoint' (& $affPlanWithManifest @('BRAVO_HEALTH.ps1') @{ 'BRAVO_HEALTH.ps1' = 'N1' }) 'V3|'
+    & $affExpect 'B19 RuntimeGuard' (& $affPlanWithManifest @('BRAVO_RUNTIME_GUARD.ps1') @{ 'BRAVO_RUNTIME_GUARD.ps1' = 'N1' }) 'V3|'
+    & $affExpect 'B20 ModuleNoSuite' (& $affPlanWithManifest @('modules/BRAVO.Console/BRAVO.Console.psm1') @{ 'modules\BRAVO.Console\BRAVO.Console.psm1' = 'N1' }) 'V3|'
+    & $affExpect 'B20a ConfigurationModule' (& $affPlanWithManifest @('modules/BRAVO.Configuration/BRAVO.Configuration.psm1') @{ 'modules\BRAVO.Configuration\BRAVO.Configuration.psm1' = 'N1' }) 'V3|'
+    & $affExpect 'B20b DiskSpaceModule' (& $affPlanWithManifest @('modules/BRAVO.DiskSpace/BRAVO.DiskSpace.psm1') @{ 'modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psm1' = 'N1' }) 'V3|'
+    & $affExpect 'B20b ArchiveModule' (& $affPlanWithManifest @('modules/BRAVO.Archive/BRAVO.Archive.psm1') @{ 'modules\BRAVO.Archive\BRAVO.Archive.psm1' = 'N1' }) 'V3|'
+    & $affExpect 'B20d MatrixTestModule' (& $affPlanWithManifest @('modules/BRAVO.DataRestore.MatrixTest/x.psm1') @{ 'modules\BRAVO.DataRestore.MatrixTest\x.psm1' = 'N1' }) 'V3|'
+    & $affExpect 'B20e ModuleNameLookalike' (& $affPlanPlain @('modules/BRAVO.Archive.Legacy/x')) 'V3|'
+    & $affExpect 'B20e ModuleDirWithoutFile' (& $affPlanPlain @('modules/BRAVO.Archive')) 'V3|'
+    & $affExpect 'B21 SelfTest' (& $affPlanWithManifest @('BRAVO_SELF_TEST.ps1') @{ 'BRAVO_SELF_TEST.ps1' = 'N1' }) 'V3|'
+    & $affExpect 'B21 MapFile' (& $affPlanWithManifest @('selftest/BRAVOSelfTestSuiteMap.ps1') @{ 'selftest\BRAVOSelfTestSuiteMap.ps1' = 'N1' }) 'V3|'
+    & $affExpect 'B21 ManualLaunchers' (& $affPlanWithManifest @('selftest/BRAVO_SELF_TEST.ManualLaunchers.ps1') @{ 'selftest\BRAVO_SELF_TEST.ManualLaunchers.ps1' = 'N1' }) 'V3|'
+    & $affExpect 'B21 ConfigV2PilotArtifact' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1')) 'V3|'
+    & $affExpect 'B21 Fixture' (& $affPlanPlain @('selftest/fixtures/BravoConfigLegacyFrozen.config')) 'V3|'
+    & $affExpect 'B22 Config' (& $affPlanPlain @('BRAVO.local.config.example')) 'V3|'
+    & $affExpect 'B23 Schema' (& $affPlanWithManifest @('modules/BRAVO.Configuration/BRAVO.Configuration.Schema.psm1') @{ 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psm1' = 'N1' }) 'V3|'
+    & $affExpect 'B24 Workflow' (& $affPlanPlain @('.github/workflows/ci.yml')) 'V3|'
+    & $affExpect 'B25 ToolsManifest' (& $affPlanPlain @('Tools/TOOLS_MANIFEST.json')) 'V3|'
+    & $affExpect 'B26 VERSION' (& $affPlanPlain @('VERSION.json')) 'V3|'
+    & $affExpect 'ToolsDirectory' (& $affPlanPlain @('Tools/WinSCP/WinSCP.com')) 'V3|'
+    & $affExpect 'ClaudeDirectory' (& $affPlanPlain @('.claude/rules/05-architecture.md')) 'V3|'
+    & $affExpect 'DeployScript' (& $affPlanPlain @('deploy/Install-BRAVOServer.ps1')) 'V3|'
+    & $affExpect 'FragmentBackupFile' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.Paths.ps1.bak')) 'V3|'
+    & $affExpect 'UnknownFragmentName' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.NoSuch.ps1')) 'V3|'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0) `
+        -Name "Framework/AffectedPlan.UnknownAndInfrastructurePathsEscalateToV3" `
+        -Failure ("entrypoint-и, модулі без leaf-статусу (зокрема Configuration, DiskSpace, Archive, MatrixTest, двійник імені), harness, " +
+            "фікстури, конфіг, workflow, Tools, VERSION та змішані набори мусять давати V3 і Suite = @(): " + $affProblem)
+
+    # Змішаний набір: Paths не повертається, невідомий шлях названо.
+    $affMixed = & $affPlanWithManifest @($affPaths, 'ci/Update-BRAVORuntimeManifest.ps1') @{ $affPaths = 'N1'; 'ci\Update-BRAVORuntimeManifest.ps1' = 'N2' }
+    Test-BRAVOCondition `
+        -Condition (
+            $affMixed.Class -ceq 'V3' -and @($affMixed.Suite).Count -eq 0 -and
+            [string]::Join(',', @($affMixed.UnknownPath)) -ceq 'ci/Update-BRAVORuntimeManifest.ps1' -and
+            $affMixed.RequiresIndependentReview -eq $true
+        ) `
+        -Name "Framework/AffectedPlan.MixedKnownAndUnknownNeverNarrows" `
+        -Failure ("відомий + невідомий шлях: V3, порожній Suite, невідомий шлях названо, потрібне незалежне рев'ю. Фактично: " +
+            $affMixed.Class + "|" + [string]::Join(',', @($affMixed.Suite)) + "|" + [string]::Join(',', @($affMixed.UnknownPath)))
+
+    # --- B9a: видалення -------------------------------------------------
+    & $affExpect 'B9a DeletedFragment' (& $affPlanWithManifest @($affPaths) @{ $affPaths = $null } @($affPaths)) 'V3|'
+    & $affExpect 'B9a DeletedFragmentOnly' (& $affPlanPlain @($affPaths) @($affPaths)) 'V3|'
+    & $affExpect 'B9a DeletedOtherFragmentAlongsideChange' (& $affPlanWithManifest @($affPaths, $affArchive) @{ $affPaths = 'N1'; $affArchive = $null } @($affArchive)) 'V3|'
+    & $affExpect 'B9a DeletedConsumedDoc' (& $affPlanPlain @('README.md') @('README.md')) 'V3|'
+    & $affExpect 'B9a DeletedOnlyEntryNotInChanged' (& $affPlanPlain @('README.md') @($affPaths)) 'V3|'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0) `
+        -Name "Framework/AffectedPlan.DeletedKnownPathEscalatesToV3" `
+        -Failure ("видалений фрагмент каталогу (і видалений документ із таблиці) мусить давати V3: " + $affProblem)
+
+    # --- B11, B12: документи ---------------------------------------------
+    & $affExpect 'B11 README' (& $affPlanPlain @('README.md')) 'V1|Governance'
+    & $affExpect 'B11 OPERATIONS' (& $affPlanPlain @('OPERATIONS.md')) 'V1|DataRestore,Governance'
+    & $affExpect 'B11 BRAVO_SETUP' (& $affPlanPlain @('BRAVO_SETUP.md')) 'V1|ConfigLoader,Governance'
+    & $affExpect 'B11 CHANGELOG' (& $affPlanPlain @('CHANGELOG.md')) 'V1|Governance'
+    & $affExpect 'B11 deploy README' (& $affPlanPlain @('deploy/README.md')) 'V1|Governance'
+    & $affExpect 'B11 all documents' (& $affPlanPlain @('README.md', 'OPERATIONS.md', 'BRAVO_SETUP.md', 'CHANGELOG.md', 'SECURITY.md', 'RELEASE_CHECKLIST.md', 'RELEASE_POLICY.md', 'THREAT_MODEL.md', 'PROJECT.md')) 'V1|ConfigLoader,DataRestore,Governance'
+    & $affExpectGate 'B11 README gate' (& $affPlanPlain @('README.md')) 'Release policy'
+    & $affExpectGate 'B11 OPERATIONS gate' (& $affPlanPlain @('OPERATIONS.md')) ''
+    & $affExpectGate 'B11 BRAVO_SETUP gate' (& $affPlanPlain @('BRAVO_SETUP.md')) 'Release policy'
+    & $affExpectGate 'B11 CHANGELOG gate' (& $affPlanPlain @('CHANGELOG.md')) 'Release policy'
+    & $affExpect 'B12 docs outside table 1' (& $affPlanPlain @('docs/BRAVO_HEALTH_FUTURE_MONITORING_DESIGN.md')) 'V3|'
+    & $affExpect 'B12 docs outside table 2' (& $affPlanPlain @('docs/design/BRAVO_VALIDATION_ARCHITECTURE.md')) 'V3|'
+    & $affExpect 'B12 docs outside table 3' (& $affPlanPlain @('ROADMAP.md')) 'V3|'
+    & $affExpect 'B12 docs outside table 4' (& $affPlanPlain @('docs/../README.md')) 'V3|'
+    & $affExpect 'B12 doc plus table doc' (& $affPlanPlain @('README.md', 'docs/x.md')) 'V3|'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0) `
+        -Name "Framework/AffectedPlan.ConsumedDocumentsAreV1AndOthersV3" `
+        -Failure ("документи з таблиці споживаних мають клас V1 із своїми споживачами й gate, будь-який інший *.md (зокрема docs\**) - V3: " + $affProblem)
+
+    # --- B20c: leaf-модуль - лише синтетично -----------------------------
+    $affLeafTable = @{ 'Leaf' = @{ Owner = 'Paths'; Dependents = @('Status') } }
+    $affLeafPath = 'modules/BRAVO.Leaf/BRAVO.Leaf.psm1'
+    $affLeafCompanion = Test-BRAVOSelfTestRuntimeManifestCompanion `
+        -BaseText (& $affManifestText ([ordered]@{ 'modules\BRAVO.Leaf\BRAVO.Leaf.psm1' = 'L1' }) 'desc' $false) `
+        -CurrentText (& $affManifestText ([ordered]@{ 'modules\BRAVO.Leaf\BRAVO.Leaf.psm1' = 'L2' }) 'desc' $false) `
+        -ChangedPath @($affLeafPath, 'RUNTIME_MANIFEST.json')
+    & $affExpect 'B20c LeafModuleSynthetic' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affLeafPath, 'RUNTIME_MANIFEST.json') `
+            -RuntimeManifestCompanion $affLeafCompanion -LeafModuleTable $affLeafTable) 'V2|Governance,Paths,Status'
+    & $affExpect 'B20c LeafWithoutTable' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affLeafPath)) 'V3|'
+    & $affExpect 'B20c LeafPlusUnknown' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affLeafPath, 'BRAVO_ARCHIV.ps1') -LeafModuleTable $affLeafTable) 'V3|'
+    & $affExpect 'B20c LeafLookalike' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @('modules/BRAVO.Leaf.Legacy/x.psm1') -LeafModuleTable $affLeafTable) 'V3|'
+    & $affExpect 'B20c LeafDeleted' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affLeafPath) -DeletedPath @($affLeafPath) -LeafModuleTable $affLeafTable) 'V3|'
+    & $affExpect 'B20c LeafOwnerNotInCatalog' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affLeafPath) `
+            -LeafModuleTable @{ 'Leaf' = @{ Owner = 'NoSuch'; Dependents = @() } }) 'V3|'
+    & $affExpect 'B20c LeafDependentNotInCatalog' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affLeafPath) `
+            -LeafModuleTable @{ 'Leaf' = @{ Owner = 'Paths'; Dependents = @('NoSuch') } }) 'V3|'
+    & $affExpect 'B20c LeafWithoutOwner' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affLeafPath) `
+            -LeafModuleTable @{ 'Leaf' = @{ Dependents = @('Status') } }) 'V3|'
+    & $affExpect 'B20c LeafOwnerOnly' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affLeafPath) `
+            -LeafModuleTable @{ 'Leaf' = @{ Owner = 'Paths' } }) 'V2|Governance,Paths'
+    & $affExpect 'B20c SubstitutedDocumentTable' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @('X.md') `
+            -ConsumedDocumentTable @{ 'X.md' = @{ Suite = @('Status'); Gate = @() } }) 'V1|Governance,Status'
+    & $affExpect 'B20c DocumentTableBadSuite' (Get-BRAVOSelfTestAffectedPlan -ChangedPath @('X.md') `
+            -ConsumedDocumentTable @{ 'X.md' = @{ Suite = @('NoSuch'); Gate = @() } }) 'V3|'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0) `
+        -Name "Framework/AffectedPlan.LeafModuleTableGivesV2OnlyForValidEntries" `
+        -Failure ("підмінена таблиця leaf-модуля дає V2 {owner + dependents + Governance}; відсутній запис, двійник імені, видалення, " +
+            "невідомий suite чи запис без Owner дають V3: " + $affProblem)
+
+    # --- Gate-підказки ---------------------------------------------------
+    & $affExpectGate 'gate Config parity (module)' (& $affPlanPlain @('modules/BRAVO.Configuration/BRAVO.Configuration.psm1')) 'Config parity'
+    & $affExpectGate 'gate Config parity (example)' (& $affPlanPlain @('BRAVO.local.config.example')) 'Config parity'
+    & $affExpectGate 'gate Config parity (schema)' (& $affPlanPlain @('modules/BRAVO.Configuration/BRAVO.Configuration.Schema.psm1')) 'Config parity'
+    & $affExpectGate 'gate Matrix' (& $affPlanPlain @('modules/BRAVO.DataRestore.MatrixTest/x.psm1')) 'DataRestore matrix test'
+    & $affExpectGate 'gate VERSION' (& $affPlanPlain @('VERSION.json')) 'Release policy'
+    & $affExpectGate 'gate TOOLS_MANIFEST' (& $affPlanPlain @('Tools/TOOLS_MANIFEST.json')) 'Integrity manifests are current'
+    & $affExpectGate 'gate none' (& $affPlanPlain @('BRAVO_ARCHIV.ps1')) ''
+    & $affExpectGate 'gate order' (& $affPlanPlain @('VERSION.json', 'BRAVO.local.config.example', 'Tools/TOOLS_MANIFEST.json')) 'Integrity manifests are current,Release policy,Config parity'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0) `
+        -Name "Framework/AffectedPlan.RequiredGateHintsAreDeterministic" `
+        -Failure ("метадані gate: Integrity для маніфестів, Release policy для VERSION/документів, Config parity для конфігурації, " +
+            "матричний gate для DataRestore.MatrixTest; порядок фіксований: " + $affProblem)
+
+    $affGateParityText = ''
+    $affGateParityMissing = New-Object System.Collections.Generic.List[string]
+    try {
+        . (Join-Path $root 'ci\Test-BRAVOConfigParityRelevantPath.ps1')
+        foreach ($affPattern in @(Get-BRAVOConfigParityRelevantPathPattern)) {
+            $affSample = [string]$affPattern
+            if ($affSample.EndsWith('/**')) { $affSample = $affSample.Substring(0, $affSample.Length - 3) + '/sample.psm1' }
+            $affGatePlan = Get-BRAVOSelfTestAffectedPlan -ChangedPath @($affSample)
+            if (@($affGatePlan.RequiredGate) -cnotcontains 'Config parity') { [void]$affGateParityMissing.Add($affSample) }
+        }
+    } catch {
+        $affGateParityText = $_.Exception.Message
+    }
+    Test-BRAVOCondition `
+        -Condition ($affGateParityText.Length -eq 0 -and $affGateParityMissing.Count -eq 0) `
+        -Name "Framework/AffectedPlan.ConfigParityGateHintCoversCanonicalPatterns" `
+        -Failure ("підказка gate Config parity у плані мусить покривати кожен шаблон канонічного ci\Test-BRAVOConfigParityRelevantPath.ps1 " +
+            "(інакше два переліки розійдуться); без підказки: [" + [string]::Join(', ', @($affGateParityMissing.ToArray())) + "]; помилка: [" + $affGateParityText + "]")
+
+    # --- B32-B36: некоректні шляхи -> V3 ----------------------------------
+    & $affExpect 'B32 AbsoluteWindows' (& $affPlanPlain @('C:\repo\selftest\BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B32 AbsolutePosix' (& $affPlanPlain @('/home/user/repo/selftest/BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B32 AbsoluteUnc' (& $affPlanPlain @('\\host-a\share\selftest\BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B32 LeadingBackslash' (& $affPlanPlain @('\selftest\BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B33 Traversal 1' (& $affPlanPlain @('selftest/../BRAVO_ARCHIV.ps1')) 'V3|'
+    & $affExpect 'B33 Traversal 2' (& $affPlanPlain @('docs/../X.md')) 'V3|'
+    & $affExpect 'B33 Traversal into fragment' (& $affPlanPlain @('docs/../selftest/BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B33 DotSegment' (& $affPlanPlain @('selftest/./BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B33 EmptySegment' (& $affPlanPlain @('selftest//BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B33 TrailingSeparator' (& $affPlanPlain @('selftest/')) 'V3|'
+    & $affExpect 'B34 PrefixLookalike 1' (& $affPlanPlain @('xselftest/BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B34 PrefixLookalike 2' (& $affPlanPlain @('docs/selftest/BRAVO_SELF_TEST.Paths.ps1')) 'V3|'
+    & $affExpect 'B35 LeadingSpace' (& $affPlanPlain @(' README.md')) 'V3|'
+    & $affExpect 'B35 TrailingSpace' (& $affPlanPlain @('README.md ')) 'V3|'
+    & $affExpect 'B35 OnlySpace' (& $affPlanPlain @(' ')) 'V3|'
+    & $affExpect 'B35 EmptyEntry' (& $affPlanPlain @('')) 'V3|'
+    & $affExpect 'B35 TrailingNewline' (& $affPlanPlain @("README.md`n")) 'V3|'
+    & $affExpect 'B35 PaddedFragment' (& $affPlanPlain @('  selftest\BRAVO_SELF_TEST.Paths.ps1  ')) 'V3|'
+    & $affExpect 'B35 ValidPlusWhitespace' (& $affPlanPlain @('README.md', ' ')) 'V3|'
+    & $affExpect 'ControlCharacter' (& $affPlanPlain @(('selftest\BRAVO_SELF_TEST.Paths' + [string][char]1 + '.ps1'))) 'V3|'
+    $affProblem = & $affTakeMismatch
+    Test-BRAVOCondition `
+        -Condition ($affProblem.Length -eq 0) `
+        -Name "Framework/AffectedPlan.InvalidPathFormsEscalateToV3" `
+        -Failure ("абсолютні шляхи, обхід каталогів, порожні сегменти, двійники префікса й пробіли по краях (без Trim) мусять давати V3: " + $affProblem)
+
+    # --- B36: порожній вхід -----------------------------------------------
+    $affEmpty = Get-BRAVOSelfTestAffectedPlan -ChangedPath @()
+    Test-BRAVOCondition `
+        -Condition (
+            $affEmpty.Status -ceq 'EmptyInput' -and @($affEmpty.Suite).Count -eq 0 -and
+            $affEmpty.Class -ceq 'V3' -and $affEmpty.IsAcceptanceEvidence -eq $false
+        ) `
+        -Name "Framework/AffectedPlan.EmptyInputIsNotAPlan" `
+        -Failure ("порожній набір шляхів - це Status EmptyInput (не порожній прогін); навіть якщо викликач проігнорує Status, клас V3 " +
+            "і Suite = @(). Фактично: " + [string]$affEmpty.Status + "/" + [string]$affEmpty.Class)
+
+    # --- Форма й контракт плану -------------------------------------------
+    $affShapeProblems = New-Object System.Collections.Generic.List[string]
+    $affShapePlans = @(
+        (& $affPlanPlain @('README.md')),
+        (& $affPlanPlain @('BRAVO_ARCHIV.ps1')),
+        (& $affPlanPlain @($affPaths)),
+        (& $affPlanPlain @($affPaths, $affArchive)),
+        (Get-BRAVOSelfTestAffectedPlan -ChangedPath @()))
+    foreach ($affShapePlan in $affShapePlans) {
+        $affShapeNames = [string]::Join(',', @($affShapePlan.PSObject.Properties | ForEach-Object { $_.Name }))
+        if ($affShapeNames -cne 'Status,Class,ClassLabel,Suite,RequiredGate,RequiresIndependentReview,UnknownPath,Decision,IsAcceptanceEvidence') {
+            [void]$affShapeProblems.Add('поля плану: ' + $affShapeNames)
+        }
+        if ($affShapePlan.ClassLabel -cne 'мінімальний клас за картою шляхів') { [void]$affShapeProblems.Add('ClassLabel: ' + $affShapePlan.ClassLabel) }
+        if ($affShapePlan.IsAcceptanceEvidence -ne $false) { [void]$affShapeProblems.Add('IsAcceptanceEvidence не $false') }
+        if (@('V1', 'V2', 'V3') -cnotcontains $affShapePlan.Class) { [void]$affShapeProblems.Add('клас поза V1-V3: ' + $affShapePlan.Class) }
+        foreach ($affShapeProperty in @('Suite', 'RequiredGate', 'UnknownPath', 'Decision')) {
+            if ($affShapePlan.$affShapeProperty -isnot [array]) { [void]$affShapeProblems.Add($affShapeProperty + ' не масив') }
+        }
+        if (@($affShapePlan.Suite | Where-Object { $affCatalog -cnotcontains $_ }).Count -ne 0) { [void]$affShapeProblems.Add('suite поза каталогом') }
+        if ($affShapePlan.Class -cne 'V3' -and @($affShapePlan.Suite) -cnotcontains 'Governance') { [void]$affShapeProblems.Add('Governance відсутній нижче V3') }
+        if ($affShapePlan.Class -ceq 'V3' -and @($affShapePlan.Suite).Count -ne 0) { [void]$affShapeProblems.Add('V3 з непорожнім Suite') }
+        if ($affShapePlan.Class -ceq 'V3' -and $affShapePlan.RequiresIndependentReview -ne $true) { [void]$affShapeProblems.Add('V3 без незалежного рев''ю') }
+    }
+    $affDecision = (& $affPlanPlain @($affPaths, 'README.md')).Decision
+    if (@($affDecision).Count -ne 2) { [void]$affShapeProblems.Add('Decision мусить мати запис на кожен шлях') }
+    Test-BRAVOCondition `
+        -Condition (
+            $affShapeProblems.Count -eq 0 -and
+            @($affSeenClass.ToArray() | Where-Object { @('V1', 'V2', 'V3') -cnotcontains $_ }).Count -eq 0 -and
+            $affSeenClass.Count -gt 50
+        ) `
+        -Name "Framework/AffectedPlan.PlanContractShapeAndNeverV0" `
+        -Failure ("план: фіксований набір полів, ClassLabel, IsAcceptanceEvidence = `$false, масиви під StrictMode для 0/1/N елементів, " +
+            "Governance нижче V3, порожній Suite у V3; жоден з " + $affSeenClass.Count + " прогнаних планів не має класу поза V1-V3: " +
+            [string]::Join('; ', @($affShapeProblems.ToArray() | Select-Object -First 6)))
+
+    # --- B45: чистота ------------------------------------------------------
+    $affSelectionBefore = $script:BRAVOSelfTestSelectedSuite
+    $affCatalogBefore = [string]::Join(',', @($script:BRAVOSelfTestSuiteCatalog))
+    $affTableBefore = Get-BRAVOSelfTestConsumedDocumentTable
+    [void]$affTableBefore.Remove('README.md')
+    $affTableAfter = Get-BRAVOSelfTestConsumedDocumentTable
+    $affLeafBefore = Get-BRAVOSelfTestLeafModuleTable
+    $affLeafBefore['Injected'] = @{ Owner = 'Paths' }
+    $affPurityPlan = & $affPlanPlain @('README.md')
+    Test-BRAVOCondition `
+        -Condition (
+            [object]::ReferenceEquals($script:BRAVOSelfTestSelectedSuite, $affSelectionBefore) -and
+            [string]::Join(',', @($script:BRAVOSelfTestSuiteCatalog)) -ceq $affCatalogBefore -and
+            $affTableAfter.ContainsKey('README.md') -and
+            -not (Get-BRAVOSelfTestLeafModuleTable).ContainsKey('Injected') -and
+            $affPurityPlan.Class -ceq 'V1'
+        ) `
+        -Name "Framework/AffectedPlan.PlanIsPureAndTablesAreFresh" `
+        -Failure "план не змінює вибір suite й каталог, а таблиці повертаються свіжими копіями: зміна повернутої таблиці не впливає на наступні виклики"
+
+    # --- B46: детермінізм --------------------------------------------------
+    $affOrderInput = @($affPaths, $affArchive, 'README.md', 'CHANGELOG.md', $affGovernance)
+    $affOrderReference = & $affPlanPlain $affOrderInput
+    $affOrderProblems = New-Object System.Collections.Generic.List[string]
+    $affReversed = @($affOrderInput)
+    [Array]::Reverse($affReversed)
+    $affRotated = @($affOrderInput[2..4] + $affOrderInput[0..1])
+    foreach ($affPermutation in @($affReversed, $affRotated, @($affOrderInput + $affOrderInput))) {
+        $affOrderPlan = & $affPlanPlain $affPermutation
+        if ((& $affSignature $affOrderPlan) -cne (& $affSignature $affOrderReference) -or
+            [string]::Join(',', @($affOrderPlan.RequiredGate)) -cne [string]::Join(',', @($affOrderReference.RequiredGate))) {
+            [void]$affOrderProblems.Add((& $affSignature $affOrderPlan))
+        }
+    }
+    $affOrderCatalogIndex = @($affOrderReference.Suite | ForEach-Object { [array]::IndexOf($affCatalog, $_) })
+    $affOrderSorted = @($affOrderCatalogIndex | Sort-Object)
+    Test-BRAVOCondition `
+        -Condition (
+            $affOrderProblems.Count -eq 0 -and
+            [string]::Join(',', $affOrderCatalogIndex) -ceq [string]::Join(',', $affOrderSorted) -and
+            (& $affSignature $affOrderReference) -ceq 'V2|Archive,Governance,Paths'
+        ) `
+        -Name "Framework/AffectedPlan.UnionIsDeterministicInCatalogOrder" `
+        -Failure ("перестановка, ротація й дублікати входу мусять давати той самий union у порядку каталогу; розбіжності: [" +
+            [string]::Join('; ', @($affOrderProblems.ToArray())) + "]; еталон: " + (& $affSignature $affOrderReference))
+
+    # --- Статичні guard-и файлу мапи --------------------------------------
+    $affMapParsed = Get-BRAVOSelfTestParsedFile -Path $affMapPath
+    $affMapAst = $affMapParsed.Ast
+    $affMapBytes = [IO.File]::ReadAllBytes($affMapPath)
+    $affMapFunctions = @($affMapAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))
+    $affMapFunctionNames = [string]::Join(',', @($affMapFunctions | ForEach-Object { $_.Name } | Sort-Object))
+    $affMapAssignments = @($affMapAst.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] }, $true))
+    $affMapScopedAssignments = @($affMapAssignments | Where-Object {
+            $_.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+            -not $_.Left.VariablePath.IsUnqualified })
+    $affMapScopedNames = [string]::Join(',', @($affMapScopedAssignments | ForEach-Object { $_.Left.VariablePath.UserPath }))
+    $affMapTopLevelCatalog = @($affMapAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $_.Left.Extent.Text -ceq '$script:BRAVOSelfTestSuiteCatalog' })
+    $affMapForbiddenCommands = @($affMapAst.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true) |
+            Where-Object {
+                @('set-variable', 'new-variable', 'remove-variable', 'set-item', 'set-content', 'add-content', 'out-file', 'get-content',
+                    'get-item', 'get-childitem', 'test-path', 'set-location', 'push-location', 'remove-item', 'invoke-expression',
+                    'start-process', 'import-module', 'git', 'write-host') -contains ([string]$_.GetCommandName()).ToLowerInvariant()
+            })
+    $affMapForbiddenTypes = @($affMapAst.FindAll({ param($node) $node -is [Management.Automation.Language.TypeExpressionAst] }, $true) |
+            Where-Object { $_.TypeName.FullName -match '(?i)^(System\.)?(IO\.|Environment|Diagnostics\.|Net\.|Reflection\.)' })
+    Test-BRAVOCondition `
+        -Condition (
+            @($affMapParsed.Errors).Count -eq 0 -and
+            $affMapFunctionNames -ceq 'ConvertTo-BRAVOSelfTestNormalizedChangedPath,Get-BRAVOSelfTestAffectedPlan,Get-BRAVOSelfTestConsumedDocumentTable,Get-BRAVOSelfTestLeafModuleTable,Get-BRAVOSelfTestSuiteForChangedPath,Test-BRAVOSelfTestRuntimeManifestCompanion' -and
+            $affMapTopLevelCatalog.Count -eq 1 -and
+            $affMapScopedNames -ceq 'script:BRAVOSelfTestSuiteCatalog' -and
+            $affMapForbiddenCommands.Count -eq 0 -and
+            $affMapForbiddenTypes.Count -eq 0
+        ) `
+        -Name "Framework/AffectedPlan.MapFileIsPureAndOwnsOnlyTheCatalog" `
+        -Failure ("selftest\BRAVOSelfTestSuiteMap.ps1 мусить розбиратись без помилок, мати рівно відомі функції, один стан `$script: (каталог) " +
+            "і жодного вводу-виводу, git, середовища чи виводу в консоль. Помилок розбору: $(@($affMapParsed.Errors).Count); функції: [$affMapFunctionNames]; " +
+            "присвоєння поза локальним scope: [$affMapScopedNames]; заборонені команди: $($affMapForbiddenCommands.Count); типи: $($affMapForbiddenTypes.Count)")
+
+    $affMapHasBareLf = $false
+    for ($affByteIndex = 0; $affByteIndex -lt $affMapBytes.Length; $affByteIndex++) {
+        if ($affMapBytes[$affByteIndex] -eq 10 -and ($affByteIndex -eq 0 -or $affMapBytes[$affByteIndex - 1] -ne 13)) { $affMapHasBareLf = $true; break }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $affMapBytes.Length -gt 3 -and $affMapBytes[0] -eq 0xEF -and $affMapBytes[1] -eq 0xBB -and $affMapBytes[2] -eq 0xBF -and
+            -not $affMapHasBareLf -and
+            -not [regex]::IsMatch([IO.Path]::GetFileName($affMapPath), '^BRAVO_SELF_TEST\..+\.ps1$')
+        ) `
+        -Name "Framework/AffectedPlan.MapFileHasBomCrlfAndIsNotAFragment" `
+        -Failure "файл мапи: UTF-8 з BOM, CRLF (як у сусідніх файлів) і ім'я, що не збігається з BRAVO_SELF_TEST.<Ім'я>.ps1 (інакше його вважали б фрагментом suite)"
+
+    $affMapStringTokens = @($affMapParsed.Tokens | Where-Object { @('StringLiteral', 'StringExpandable', 'HereStringLiteral', 'HereStringExpandable') -contains [string]$_.Kind })
+    $affMapV0Tokens = @($affMapStringTokens | Where-Object { [string]$_.Value -match '(?i)\bV0\b' })
+    Test-BRAVOCondition `
+        -Condition ($affMapStringTokens.Count -gt 0 -and $affMapV0Tokens.Count -eq 0) `
+        -Name "Framework/AffectedPlan.MapNeverEmitsV0" `
+        -Failure "жоден рядковий літерал мапи не містить V0: клас V0 (лише документація) визначає класифікація PR, а не автоматичний план; запускача, що друкує 'Full не потрібен', немає"
+
+    $affRootAst = Get-BRAVOSelfTestOwnSourceAst
+    $affRootTop = @($affRootAst.EndBlock.Statements)
+    $affDotSources = @($affRootTop | Where-Object {
+            $_ -is [Management.Automation.Language.PipelineAst] -and $_.PipelineElements.Count -eq 1 -and
+            $_.PipelineElements[0] -is [Management.Automation.Language.CommandAst] -and
+            $_.PipelineElements[0].InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot -and
+            $_.Extent.Text -ceq ". (Join-Path `$root 'selftest\BRAVOSelfTestSuiteMap.ps1')" })
+    $affIntegrityGate = @($affRootTop | Where-Object {
+            $_ -is [Management.Automation.Language.IfStatementAst] -and
+            $_.Clauses[0].Item1.Extent.Text.Contains('$script:selfTestBootstrapRuntimeManifest.IsValid') })
+    $affNormalize = @($affRootTop | Where-Object {
+            $_ -is [Management.Automation.Language.IfStatementAst] -and
+            $_.Clauses[0].Item1.Extent.Text -match '^\$null -ne \$Suite' })
+    $affRootCatalogAssign = @($affRootTop | Where-Object {
+            $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $_.Left.Extent.Text -ceq '$script:BRAVOSelfTestSuiteCatalog' })
+    $affRootMapperDefinition = @($affRootAst.FindAll({ param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                @('Get-BRAVOSelfTestSuiteForChangedPath', 'Get-BRAVOSelfTestAffectedPlan') -contains $node.Name }, $true))
+    Test-BRAVOCondition `
+        -Condition (
+            $affDotSources.Count -eq 1 -and $affIntegrityGate.Count -eq 1 -and $affNormalize.Count -eq 1 -and
+            $affRootCatalogAssign.Count -eq 0 -and $affRootMapperDefinition.Count -eq 0 -and
+            $affDotSources[0].Extent.StartOffset -gt $affIntegrityGate[0].Extent.EndOffset -and
+            $affDotSources[0].Extent.EndOffset -lt $affNormalize[0].Extent.StartOffset
+        ) `
+        -Name "Framework/AffectedPlan.MapIsDotSourcedAfterIntegrityBeforeSuiteNormalization" `
+        -Failure ("корінь мусить dot-source-ити файл мапи один раз на верхньому рівні ПІСЛЯ перевірки цілісності маніфеста (інакше непідтверджений код виконається) " +
+            "і ДО розбору -Suite, а каталог і мапера в корені не дублюються. dot-source: $($affDotSources.Count); перевірка цілісності: $($affIntegrityGate.Count); " +
+            "розбір -Suite: $($affNormalize.Count); присвоєнь каталогу в корені: $($affRootCatalogAssign.Count); визначень мапера в корені: $($affRootMapperDefinition.Count)")
+
+    # --- Guard-и leaf-модулів: сканер вхідних ребер -------------------------
+    # Ребро до модуля M з файлу F є, якщо F не лежить під modules\BRAVO.<M>\ і РЯДКОВИЙ або
+    # generic-токен F (не коментар) містить сегмент modules\BRAVO.<M>\, дорівнює BRAVO.<M> або
+    # закінчується на BRAVO.<M>.psd1|.psm1. Динамічне складання імені ("BRAVO.$x", 'BRAVO.' + $x,
+    # 'BRAVO.{0}') ребра не показує, тому воно фіксується окремо й для непорожньої таблиці
+    # leaf-модулів є відмовою (fail closed).
+    $affEdgeScan = {
+        param([object[]]$Unit, [string[]]$ModuleName)
+        $stringKinds = @('StringLiteral', 'StringExpandable', 'HereStringLiteral', 'HereStringExpandable', 'Generic')
+        $edges = @{}
+        $dynamic = New-Object System.Collections.Generic.List[string]
+        $moduleAlternation = ''
+        if (@($ModuleName).Count -gt 0) {
+            $moduleAlternation = [string]::Join('|', @($ModuleName | Sort-Object { $_.Length } -Descending | ForEach-Object { [regex]::Escape($_) }))
+        }
+        $candidatePattern = '(?i)BRAVO\.(?:\$|\{\d+\}|[''"])'
+        if ($moduleAlternation.Length -gt 0) {
+            $candidatePattern = '(?i)BRAVO\.(?:(?<module>' + $moduleAlternation + ')(?![A-Za-z0-9_])|\$|\{\d+\}|[''"])'
+        }
+        foreach ($affUnit in @($Unit)) {
+            $unitTokens = @($affUnit.Tokens)
+            $unitText = [string]$affUnit.Text
+            $checkedOffsets = @{}
+            foreach ($candidate in [regex]::Matches($unitText, $candidatePattern)) {
+                $low = 0
+                $high = $unitTokens.Count - 1
+                $found = $null
+                while ($low -le $high) {
+                    $middle = [int][Math]::Floor(($low + $high) / 2)
+                    $probe = $unitTokens[$middle]
+                    if ($candidate.Index -lt $probe.Extent.StartOffset) { $high = $middle - 1 }
+                    elseif ($candidate.Index -ge $probe.Extent.EndOffset) { $low = $middle + 1 }
+                    else { $found = $probe; break }
+                }
+                if ($null -eq $found -or $stringKinds -cnotcontains [string]$found.Kind) { continue }
+                $tokenValue = [string]$found.Text
+                if ($found -is [Management.Automation.Language.StringToken]) { $tokenValue = [string]$found.Value }
+                if ($candidate.Groups['module'].Success) {
+                    $moduleHit = [regex]::Escape($candidate.Groups['module'].Value)
+                    $edgeKey = [string]$found.Extent.StartOffset + '|' + $candidate.Groups['module'].Value.ToLowerInvariant()
+                    if ($checkedOffsets.ContainsKey($edgeKey)) { continue }
+                    $checkedOffsets[$edgeKey] = $true
+                    $isEdge = (
+                        [regex]::IsMatch($tokenValue, '(?i)modules[\\/]BRAVO\.' + $moduleHit + '[\\/]') -or
+                        [regex]::IsMatch($tokenValue, '(?i)^BRAVO\.' + $moduleHit + '$') -or
+                        [regex]::IsMatch($tokenValue, '(?i)BRAVO\.' + $moduleHit + '\.(psd1|psm1)$'))
+                    if (-not $isEdge) { continue }
+                    $ownDirectory = 'modules\bravo.' + $candidate.Groups['module'].Value.ToLowerInvariant() + '\'
+                    if (([string]$affUnit.Rel).ToLowerInvariant().StartsWith($ownDirectory, [StringComparison]::Ordinal)) { continue }
+                    $moduleKey = $candidate.Groups['module'].Value
+                    $matchedName = @($ModuleName | Where-Object { $_ -eq $moduleKey }) | Select-Object -First 1
+                    if ($null -eq $matchedName) { $matchedName = $moduleKey }
+                    if (-not $edges.ContainsKey([string]$matchedName)) { $edges[[string]$matchedName] = New-Object System.Collections.Generic.List[string] }
+                    if (-not $edges[[string]$matchedName].Contains([string]$affUnit.Rel)) { [void]$edges[[string]$matchedName].Add([string]$affUnit.Rel) }
+                } else {
+                    $dynamicKey = [string]$found.Extent.StartOffset + '|dynamic'
+                    if ($checkedOffsets.ContainsKey($dynamicKey)) { continue }
+                    $checkedOffsets[$dynamicKey] = $true
+                    if ([regex]::IsMatch($tokenValue, '(?i)BRAVO\.(\$|\{\d+\}|$)')) {
+                        [void]$dynamic.Add([string]$affUnit.Rel + ':' + [string]$found.Extent.StartLineNumber)
+                    }
+                }
+            }
+        }
+        return [pscustomobject]@{ Edge = $edges; Dynamic = [string[]]@($dynamic.ToArray()) }
+    }
+    $affMakeUnit = {
+        param([string]$Rel, [string]$Text)
+        $unitTokens = $null
+        $unitErrors = $null
+        [void][Management.Automation.Language.Parser]::ParseInput($Text, [ref]$unitTokens, [ref]$unitErrors)
+        return [pscustomobject]@{ Rel = $Rel; Text = $Text; Tokens = $unitTokens }
+    }
+    $affLeafCoverage = {
+        param([object[]]$FragmentUnit, [hashtable]$Table)
+        $coverageProblems = New-Object System.Collections.Generic.List[string]
+        if (@($Table.Keys).Count -eq 0) { return , @() }
+        $coverageScan = & $affEdgeScan $FragmentUnit @($Table.Keys | ForEach-Object { [string]$_ })
+        foreach ($coverageModule in @($coverageScan.Edge.Keys)) {
+            $coverageEntry = $Table[$coverageModule]
+            $coverageAllowed = @('Governance')
+            if ($coverageEntry -is [System.Collections.IDictionary]) {
+                if ($coverageEntry.Contains('Owner')) { $coverageAllowed += @([string]$coverageEntry['Owner']) }
+                if ($coverageEntry.Contains('Dependents')) { $coverageAllowed += @($coverageEntry['Dependents'] | ForEach-Object { [string]$_ }) }
+            }
+            foreach ($coverageFile in @($coverageScan.Edge[$coverageModule])) {
+                $coverageSuite = [regex]::Match($coverageFile, '(?i)^selftest\\BRAVO_SELF_TEST\.([A-Za-z]+)\.ps1$').Groups[1].Value
+                if ($coverageAllowed -cnotcontains $coverageSuite) {
+                    [void]$coverageProblems.Add($coverageModule + ' <- ' + $coverageFile)
+                }
+            }
+        }
+        return , @($coverageProblems.ToArray())
+    }
+
+    $affModuleNames = [string[]]@(
+        [IO.Directory]::GetDirectories((Join-Path $root 'modules')) |
+            ForEach-Object { [IO.Path]::GetFileName($_) } |
+            Where-Object { $_.StartsWith('BRAVO.', [StringComparison]::Ordinal) } |
+            ForEach-Object { $_.Substring('BRAVO.'.Length) })
+    $affScanFiles = New-Object System.Collections.Generic.List[string]
+    foreach ($affModuleFile in [IO.Directory]::GetFiles((Join-Path $root 'modules'), '*', [IO.SearchOption]::AllDirectories)) {
+        if (@('.ps1', '.psm1', '.psd1') -contains [IO.Path]::GetExtension($affModuleFile).ToLowerInvariant()) { [void]$affScanFiles.Add($affModuleFile) }
+    }
+    foreach ($affRootFile in [IO.Directory]::GetFiles($root, 'BRAVO_*.ps1')) {
+        if ([IO.Path]::GetFileName($affRootFile) -cne 'BRAVO_SELF_TEST.ps1') { [void]$affScanFiles.Add($affRootFile) }
+    }
+    foreach ($affFolderName in @('deploy', 'ci')) {
+        $affFolderPath = Join-Path $root $affFolderName
+        if ([IO.Directory]::Exists($affFolderPath)) {
+            foreach ($affFolderFile in [IO.Directory]::GetFiles($affFolderPath, '*.ps1')) { [void]$affScanFiles.Add($affFolderFile) }
+        }
+    }
+    $affRootFull = [IO.Path]::GetFullPath($root).TrimEnd('\', '/')
+    $affUnits = New-Object System.Collections.Generic.List[object]
+    foreach ($affScanFile in $affScanFiles) {
+        $affScanParsed = Get-BRAVOSelfTestParsedFile -Path $affScanFile
+        [void]$affUnits.Add([pscustomobject]@{
+                Rel    = ([IO.Path]::GetFullPath($affScanFile).Substring($affRootFull.Length).TrimStart('\', '/').Replace('/', '\'))
+                Text   = [IO.File]::ReadAllText($affScanFile, [Text.Encoding]::UTF8)
+                Tokens = $affScanParsed.Tokens
+            })
+    }
+    $affRealScan = & $affEdgeScan @($affUnits.ToArray()) $affModuleNames
+    $affLeafActual = Get-BRAVOSelfTestLeafModuleTable
+    $affLeafViolations = New-Object System.Collections.Generic.List[string]
+    foreach ($affLeafName in @($affLeafActual.Keys)) {
+        if ($affModuleNames -cnotcontains [string]$affLeafName) {
+            [void]$affLeafViolations.Add([string]$affLeafName + ': каталогу модуля немає')
+            continue
+        }
+        if ($affRealScan.Edge.ContainsKey([string]$affLeafName)) {
+            [void]$affLeafViolations.Add([string]$affLeafName + ' <- ' + [string]::Join(', ', @($affRealScan.Edge[[string]$affLeafName])))
+        }
+    }
+    if (@($affLeafActual.Keys).Count -gt 0 -and @($affRealScan.Dynamic).Count -gt 0) {
+        [void]$affLeafViolations.Add('динамічне складання імені модуля, ребра не визначити: ' + [string]::Join(', ', @($affRealScan.Dynamic)))
+    }
+    Test-BRAVOCondition `
+        -Condition ($affLeafViolations.Count -eq 0) `
+        -Name "Framework/AffectedPlan.LeafModulesHaveNoNonFragmentInboundEdge" `
+        -Failure ("leaf-модуль не має вхідних ребер від модулів, BRAVO_CONFIG_LOADER.ps1, кореневих BRAVO_*.ps1, deploy\*.ps1 і ci\*.ps1; а за динамічного " +
+            "складання імені модуля таблиця leaf-модулів мусить лишатись порожньою. Порушення: " + [string]::Join('; ', @($affLeafViolations.ToArray())))
+
+    $affEdgeModuleCount = @($affRealScan.Edge.Keys).Count
+    $affSyntheticLeaf = @('Leaf')
+    $affSyntheticEdge = & $affEdgeScan @(
+        (& $affMakeUnit 'BRAVO_X.ps1' "Import-Module (Join-Path `$root 'modules\BRAVO.Leaf\BRAVO.Leaf.psd1')`r`n")) $affSyntheticLeaf
+    $affSyntheticGeneric = & $affEdgeScan @((& $affMakeUnit 'BRAVO_Z.ps1' "Import-Module BRAVO.Leaf`r`n")) $affSyntheticLeaf
+    $affSyntheticCommentOnly = & $affEdgeScan @((& $affMakeUnit 'BRAVO_Y.ps1' "# modules\BRAVO.Leaf\x.psm1`r`nWrite-Output 'x'`r`n")) $affSyntheticLeaf
+    $affSyntheticOwn = & $affEdgeScan @((& $affMakeUnit 'modules\BRAVO.Leaf\BRAVO.Leaf.psm1' "Import-Module (Join-Path `$PSScriptRoot 'modules\BRAVO.Leaf\x.psm1')`r`n")) $affSyntheticLeaf
+    $affSyntheticLookalike = & $affEdgeScan @((& $affMakeUnit 'BRAVO_W.ps1' "Import-Module 'modules\BRAVO.Leaf.Legacy\x.psm1'`r`n")) $affSyntheticLeaf
+    $affSyntheticDynamic = & $affEdgeScan @(
+        (& $affMakeUnit 'BRAVO_D1.ps1' "`$n = 'Leaf'`r`nImport-Module `"modules\BRAVO.`$n\BRAVO.`$n.psd1`"`r`n"),
+        (& $affMakeUnit 'BRAVO_D2.ps1' "`$n = 'Leaf'`r`nImport-Module (Join-Path `$root ('modules\BRAVO.' + `$n))`r`n"),
+        (& $affMakeUnit 'ci\x.ps1' "`$n = 'Leaf'`r`nImport-Module ('modules\BRAVO.{0}' -f `$n)`r`n")) $affSyntheticLeaf
+    Test-BRAVOCondition `
+        -Condition (
+            $affSyntheticEdge.Edge.ContainsKey('Leaf') -and [string]::Join(',', @($affSyntheticEdge.Edge['Leaf'])) -ceq 'BRAVO_X.ps1' -and
+            $affSyntheticGeneric.Edge.ContainsKey('Leaf') -and
+            @($affSyntheticCommentOnly.Edge.Keys).Count -eq 0 -and
+            @($affSyntheticOwn.Edge.Keys).Count -eq 0 -and
+            @($affSyntheticLookalike.Edge.Keys).Count -eq 0 -and
+            @($affSyntheticDynamic.Dynamic).Count -eq 3 -and
+            $affEdgeModuleCount -ge 5
+        ) `
+        -Name "Framework/AffectedPlan.LeafModulesHaveNoNonFragmentInboundEdgeIsMeaningful" `
+        -Failure ("сканер ребер мусить бачити ребро з синтетичного BRAVO_X.ps1 (рядковий і generic токен), ігнорувати коментар, власний каталог " +
+            "і двійник імені, фіксувати динамічне складання (3 варіанти) і знаходити ребра реальних модулів (модулів з ребрами: $affEdgeModuleCount, потрібно >= 5)")
+
+    $affCoverageTable = @{ 'Leaf' = @{ Owner = 'Paths'; Dependents = @('Status') } }
+    $affCoverageGood = & $affLeafCoverage @(
+        (& $affMakeUnit 'selftest\BRAVO_SELF_TEST.Paths.ps1' "Import-Module 'modules\BRAVO.Leaf\BRAVO.Leaf.psd1'`r`n"),
+        (& $affMakeUnit 'selftest\BRAVO_SELF_TEST.Status.ps1' "Import-Module 'modules\BRAVO.Leaf\BRAVO.Leaf.psd1'`r`n"),
+        (& $affMakeUnit 'selftest\BRAVO_SELF_TEST.Governance.ps1' "Import-Module 'modules\BRAVO.Leaf\BRAVO.Leaf.psd1'`r`n")) $affCoverageTable
+    $affCoverageBad = & $affLeafCoverage @(
+        (& $affMakeUnit 'selftest\BRAVO_SELF_TEST.Archive.ps1' "Import-Module 'modules\BRAVO.Leaf\BRAVO.Leaf.psd1'`r`n")) $affCoverageTable
+    $affCoverageActual = @()
+    if (@($affLeafActual.Keys).Count -gt 0) {
+        $affCoverageReal = New-Object System.Collections.Generic.List[object]
+        foreach ($affCoverageSuite in $affCatalog) {
+            $affCoverageFile = Join-Path $root ('selftest\BRAVO_SELF_TEST.' + $affCoverageSuite + '.ps1')
+            $affCoverageParsed = Get-BRAVOSelfTestParsedFile -Path $affCoverageFile
+            [void]$affCoverageReal.Add([pscustomobject]@{
+                    Rel    = 'selftest\BRAVO_SELF_TEST.' + $affCoverageSuite + '.ps1'
+                    Text   = [IO.File]::ReadAllText($affCoverageFile, [Text.Encoding]::UTF8)
+                    Tokens = $affCoverageParsed.Tokens
+                })
+        }
+        $affCoverageActual = & $affLeafCoverage @($affCoverageReal.ToArray()) $affLeafActual
+    }
+    Test-BRAVOCondition `
+        -Condition (@($affCoverageActual).Count -eq 0) `
+        -Name "Framework/AffectedPlan.LeafDependentsCoverDirectConsumers" `
+        -Failure ("кожен фрагмент, що посилається на leaf-модуль, мусить входити до owner + dependents (+ Governance): " + [string]::Join('; ', @($affCoverageActual)))
+    Test-BRAVOCondition `
+        -Condition (@($affCoverageGood).Count -eq 0 -and @($affCoverageBad).Count -eq 1 -and @($affCoverageBad)[0] -ceq 'Leaf <- selftest\BRAVO_SELF_TEST.Archive.ps1') `
+        -Name "Framework/AffectedPlan.LeafDependentsCoverDirectConsumersIsMeaningful" `
+        -Failure "перевірка покриття споживачів мусить пропустити owner, dependents і Governance та назвати фрагмент поза ними (синтетичний Archive)"
+
+    # --- Таблиці посилаються лише на каталог і наявні документи -------------
+    $affTableProblems = New-Object System.Collections.Generic.List[string]
+    foreach ($affLeafKey in @($affLeafActual.Keys)) {
+        $affLeafEntry = $affLeafActual[$affLeafKey]
+        $affLeafNames = @()
+        if ($affLeafEntry -is [System.Collections.IDictionary]) {
+            if ($affLeafEntry.Contains('Owner')) { $affLeafNames += @([string]$affLeafEntry['Owner']) } else { [void]$affTableProblems.Add("$affLeafKey без Owner") }
+            if ($affLeafEntry.Contains('Dependents')) { $affLeafNames += @($affLeafEntry['Dependents'] | ForEach-Object { [string]$_ }) }
+        } else {
+            [void]$affTableProblems.Add("$affLeafKey не є таблицею")
+        }
+        foreach ($affLeafSuiteName in $affLeafNames) {
+            if ($affCatalog -cnotcontains $affLeafSuiteName) { [void]$affTableProblems.Add("$affLeafKey -> $affLeafSuiteName поза каталогом") }
+        }
+    }
+    $affDocumentTable = Get-BRAVOSelfTestConsumedDocumentTable
+    foreach ($affDocumentKey in @($affDocumentTable.Keys)) {
+        foreach ($affDocumentSuite in @($affDocumentTable[$affDocumentKey].Suite)) {
+            if ($affCatalog -cnotcontains [string]$affDocumentSuite) { [void]$affTableProblems.Add("$affDocumentKey -> $affDocumentSuite поза каталогом") }
+        }
+        if (@($affDocumentTable[$affDocumentKey].Suite) -cnotcontains 'Governance') { [void]$affTableProblems.Add("$affDocumentKey без Governance") }
+    }
+    Test-BRAVOCondition `
+        -Condition ($affTableProblems.Count -eq 0 -and @($affDocumentTable.Keys).Count -gt 0) `
+        -Name "Framework/AffectedPlan.DependentsAreCatalogSuites" `
+        -Failure ("owner і dependents leaf-модулів та споживачі документів мусять бути suite з каталогу, а кожен документ - споживатись Governance: " +
+            [string]::Join('; ', @($affTableProblems.ToArray())))
+
+    $affMissingDocuments = @($affDocumentTable.Keys | Where-Object {
+            -not [IO.File]::Exists((Join-Path $root ([string]$_)))
+        } | Sort-Object)
+    Test-BRAVOCondition `
+        -Condition ($affMissingDocuments.Count -eq 0) `
+        -Name "Framework/AffectedPlan.ConsumedDocumentsExist" `
+        -Failure ("кожен документ таблиці споживаних мусить існувати в дереві (застарілий запис давав би V1 для неіснуючого файлу): " + [string]::Join(', ', $affMissingDocuments))
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan' } }
 
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionIsolation') { try {
 
