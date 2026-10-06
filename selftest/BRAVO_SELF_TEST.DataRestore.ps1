@@ -1555,6 +1555,51 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             -Name "DataRestore/SftpManifestAutomaticSelectionSkipsIdentityMismatch" `
             -Failure "автоматичний вибір (без explicit GenerationId) має пропускати manifest із розбіжністю ім'я/JSON generationId fail-closed і обирати наступний дійсно узгоджений COMPLETE"
 
+        # #294: fail-closed пропуск при автоматичному виборі правильний, але
+        # мовчазним бути не може: результат SFTP-вибору повертає перелік
+        # пропущених аномалій у тій самій формі, що й canonical
+        # Get-BRAVORestoreGenerationManifest (SkippedManifests), щоб
+        # викликач урахував їх у попередженнях, коді завершення і сповіщенні.
+        # if-вираз розгортає одноелементний масив у скаляр (без .Count під
+        # StrictMode), тому присвоєння всередині гілки.
+        $skipped7 = $null
+        if (@($result7.PSObject.Properties.Match('SkippedManifests')).Count -gt 0) { $skipped7 = @($result7.SkippedManifests) }
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $skipped7 -and
+                $skipped7.Count -eq 1 -and
+                ([string]$skipped7[0].ManifestPath).EndsWith('BRAVO_BACKUP_20260815_120000.json') -and
+                ([string]$skipped7[0].Reason).Contains('identity mismatch')
+            ) `
+            -Name "DataRestore/SftpManifestAutomaticSelectionReportsSkippedIdentityMismatch" `
+            -Failure "#294: SFTP-вибір має повернути SkippedManifests з одним записом про identity mismatch найновішого manifest-а; факт: $(if ($null -eq $skipped7) { 'властивості SkippedManifests немає' } else { ($skipped7 | ForEach-Object { $_.Reason }) -join '; ' })"
+
+        $stagingDir7b = Join-Path $sftpFetchTestRoot2 'case7b'
+        $names7b = @('BRAVO_BACKUP_20260815_120000.json', 'BRAVO_BACKUP_20260814_090000.json')
+        $content7b = @{
+            'BRAVO_BACKUP_20260815_120000.json' = '{"generationId": "20260815_120000", "status": "COMP'
+            'BRAVO_BACKUP_20260814_090000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260814_090000' 'COMPLETE')
+        }
+        $result7b = & $sftpFetchModule {
+            param($dir, $names, $content)
+            $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+            $script:BRAVOSelfTestSftpListingNames = $names
+            $script:BRAVOSelfTestSftpManifestContent = $content
+            Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId $null
+        } $stagingDir7b $names7b $content7b
+        $skipped7b = $null
+        if (@($result7b.PSObject.Properties.Match('SkippedManifests')).Count -gt 0) { $skipped7b = @($result7b.SkippedManifests) }
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$result7b.Manifest.generationId -eq '20260814_090000' -and
+                $null -ne $skipped7b -and
+                $skipped7b.Count -eq 1 -and
+                ([string]$skipped7b[0].ManifestPath).EndsWith('BRAVO_BACKUP_20260815_120000.json') -and
+                ([string]$skipped7b[0].Reason).Contains('не прочитано')
+            ) `
+            -Name "DataRestore/SftpManifestAutomaticSelectionReportsSkippedCorruptManifest" `
+            -Failure "#294: обрізаний найновіший SFTP-manifest пропускається, обирається старіший COMPLETE, а пропуск повертається в SkippedManifests; факт: generation=$($result7b.Manifest.generationId), skipped=$(if ($null -eq $skipped7b) { 'властивості немає' } else { ($skipped7b | ForEach-Object { $_.Reason }) -join '; ' })"
+
         # #8: newest manifest download FAILS in WinSCP per-download XML
         # (Success=true overall, per-file result failed) while an OLDER
         # manifest in the SAME batch downloads fine and is COMPLETE ->
