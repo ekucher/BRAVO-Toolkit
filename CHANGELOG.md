@@ -10,6 +10,15 @@
   виняток, тож шлях завершення і коди виходу не змінилися. Збій самого відкоту виводиться як Warning і не
   маскує оригінал. Блок винесено у `Invoke-CredentialOperationsViaSystemWorker` без зміни поведінки; порожній
   масив знімків для `Test` більше не розгортається в `$null`. Тести: `Credentials/SystemWorkerException*`.
+  Після review відкіт виконується лише тоді, коли доведено, що SYSTEM worker не запускався (виняток до
+  `$registeredTask.Run`, позначений `Add-SystemWorkerNotStartedMarker`). Таймаут, `FatalError` чи збій
+  `result.json` після запуску означають невизначений стан SYSTEM-сховища: поточне сховище НЕ відкочується
+  (інакше розбіжність виникла б навпаки), виводиться Warning з переліком Target і порадою повторити ту саму
+  команду (або `-Action Test`), а оригінальний виняток пропагується. Warning-и обробника мають
+  `-WarningAction Continue` і не маскують оригінал за `$WarningPreference='Stop'`. Тести:
+  `Credentials/SystemWorkerIndeterminateFailureDoesNotRollBack`,
+  `Credentials/SystemWorkerRollbackWarningsSurviveWarningPreferenceStop`,
+  `Credentials/SystemWorkerNotStartedMarkerOnlyBeforeTaskLaunch`.
 - **Fix: Archive: status-файл оновлюється і при ранніх виходах (#291).**
   `BRAVO_STATUS_Archive.json` писався лише у хвості `Main` і у fatal catch. Провал preflight вільного
   місця (exit 40), провал очищення orphan VSS (exit 40) і `exit` усередині `Test-Compatibility`
