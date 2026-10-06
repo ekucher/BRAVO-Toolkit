@@ -5977,17 +5977,30 @@ Write-BRAVOProgressPhase -Phase 'Сповіщення' -PercentComplete 95
 # SFTP-гілка вже повідомила про гейт цілісності (ToolIntegrityBlocked на її
 # SFTPConnection-issue), окремий issue не додається — порушення в алерті
 # рівно один раз. Issue стоїть першим: ActionText алерту — про інструменти.
+# Коли порушення вже несе SFTP-issue, саме він іде першим і отримує той самий
+# ActionText про інструменти — інакше алерт радив би «перевірити SFTP-з'єднання»
+# при можливій підміні 7za/WinSCP.
+$toolIntegrityActionText = "перевірити каталог Tools і TOOLS_MANIFEST.json: можлива підміна 7za.exe/WinSCP.com"
 $toolIntegrityHealthIssues = @()
+$sftpAlertIssues = @($sftpHealthIssues)
 if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
-    $sftpReportedToolIntegrity = @($sftpHealthIssues | Where-Object {
+    $sftpToolIntegrityIssues = @($sftpHealthIssues | Where-Object {
             $null -ne $_.PSObject.Properties['ToolIntegrityBlocked'] -and [bool]$_.ToolIntegrityBlocked
-        }).Count -gt 0
-    if (-not $sftpReportedToolIntegrity) {
+        })
+    if ($sftpToolIntegrityIssues.Count -gt 0) {
+        foreach ($sftpToolIntegrityIssue in $sftpToolIntegrityIssues) {
+            Add-Member -InputObject $sftpToolIntegrityIssue -MemberType NoteProperty -Name 'ActionText' -Value $toolIntegrityActionText -Force
+        }
+        $toolIntegrityHealthIssues = $sftpToolIntegrityIssues
+        $sftpAlertIssues = @($sftpHealthIssues | Where-Object {
+                -not ($null -ne $_.PSObject.Properties['ToolIntegrityBlocked'] -and [bool]$_.ToolIntegrityBlocked)
+            })
+    } else {
         $toolIntegrityHealthIssues = @([pscustomobject]@{
                 Kind = "ToolIntegrity"
                 Component = "Цілісність інструментів"
                 Reason = "не підтверджено цілісність інструментів (запуск 7za/WinSCP заборонено). $($script:BRAVOToolManifest.Message)"
-                ActionText = "перевірити каталог Tools і TOOLS_MANIFEST.json: можлива підміна 7za.exe/WinSCP.com"
+                ActionText = $toolIntegrityActionText
                 FileName = ""
                 LastWriteTime = $null
                 Location = [string]$toolsPath
@@ -5996,7 +6009,7 @@ if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlo
             })
     }
 }
-$healthIssues = @($toolIntegrityHealthIssues) + @($serviceHealthIssues) + @($localHealthIssues) + @($restoreVerifyHealthIssues) + @($bazaLocalHealthIssues) + @($sftpHealthIssues) + @($smbHealthIssues)
+$healthIssues = @($toolIntegrityHealthIssues) + @($serviceHealthIssues) + @($localHealthIssues) + @($restoreVerifyHealthIssues) + @($bazaLocalHealthIssues) + @($sftpAlertIssues) + @($smbHealthIssues)
 $destinationSummary = Get-BRAVOHealthDestinationSummary `
     -LocalIssues $localHealthIssues `
     -BazaLocalIssues $bazaLocalHealthIssues `

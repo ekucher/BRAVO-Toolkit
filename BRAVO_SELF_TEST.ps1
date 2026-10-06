@@ -16383,6 +16383,7 @@ function Test-SFTPArchiveCopy { param($ArchiveDefinition, $LocalArchive, $Remote
 function New-SlackAlertMessage {
     param($Issues, $Duration)
     foreach ($probeIssue in @($Issues)) { Add-ProbeEvent ("ALERT-ISSUE {0} | {1}" -f $probeIssue.Component, $probeIssue.Reason) }
+    Add-ProbeEvent ("ALERT-ACTION {0}" -f (Get-BRAVOHealthIssueActionText -Issues @($Issues)))
     return 'self-test alert'
 }
 function New-SlackSuccessMessage { param($Duration) return 'self-test success' }
@@ -16860,6 +16861,9 @@ try {
                     (& $healthOrchestrationProbeOk 'ToolIntegrity') -and
                     @($healthToolIntegrityAlerts | Where-Object { $_.Contains('TOOLS_MANIFEST.json') }).Count -eq 1 -and
                     @($healthToolIntegrityAlerts | Where-Object { $_.StartsWith('ALERT-ISSUE Цілісність інструментів | ') }).Count -eq 0 -and
+                    $healthToolIntegrityAlerts[0].StartsWith('ALERT-ISSUE SFTP | ') -and
+                    # Codex P2: дія алерту — про інструменти, не «перевірити SFTP-з'єднання».
+                    (& $healthOrchestrationSelect $healthToolIntegrityEvents '^ALERT-ACTION ') -ceq 'ALERT-ACTION перевірити каталог Tools і TOOLS_MANIFEST.json: можлива підміна 7za.exe/WinSCP.com' -and
                     (& $healthOrchestrationSelect $healthToolIntegrityEvents '^(NOTIFY-|ALERT-STATE-|SUCCESS-STATE-SAVE$|STATUS )') -ceq 'NOTIFY-ROUTE CRITICAL|NOTIFY-SEND https://self-test.invalid/alerts self-test alert|ALERT-STATE-SAVE|STATUS 32'
                 ) `
                 -Name "Health/OrchestrationToolIntegrityReportedOnceWithSftp" `
