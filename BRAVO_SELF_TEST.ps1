@@ -32211,7 +32211,10 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
         # яких в OEM-сторінці немає (і, ґ; на англомовному CI - уся
         # кирилиця), дочірній процес уже замінив на '?', тому для stderr
         # перевіряється лише розкодування: текст 'werr ', жодного U+FFFD і
-        # жодного CLIXML.
+        # жодного CLIXML. 'werr ' шукається в склеєному stderr: ConsoleHost
+        # переносить рядок помилки ('<шлях stub-а> : werr ...') на ширині
+        # прихованої консолі, і за довгого %TEMP% перенос розрізає саме
+        # 'werr' (B-4 D1c).
         # Текст stub-а збирається з кодів символів, щоб сам файл був ASCII.
         $arChildHost = ''
         if (-not [string]::IsNullOrEmpty([string]$env:SystemRoot)) {
@@ -32222,6 +32225,12 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
             $arChildOk = $false
             $arChildNote = 'сценарій не виконано'
             $arChildRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_AFFECTEDRUNNER_CHILD_' + [guid]::NewGuid().ToString('N'))
+            # Шлях stub-а доповнюється до 114 символів: тоді за звичайної
+            # ширини прихованої консолі (120) перенос рядка помилки припадає
+            # всередину 'werr', і перевірка склеєного stderr (D1c) працює
+            # однаково на будь-якій машині, а не лише за довгого %TEMP%.
+            $arChildPad = 114 - (Join-Path $arChildRoot 'BRAVO_SELF_TEST.ps1').Length
+            if ($arChildPad -gt 0) { $arChildRoot = $arChildRoot + ('_' * $arChildPad) }
             try {
                 [void][IO.Directory]::CreateDirectory($arChildRoot)
                 $arStub = @(
@@ -32246,7 +32255,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
                     @($arChildLines | Where-Object { $_ -ceq ('host ' + $arChildText) }).Count -eq 1 -and
                     @($arChildLines | Where-Object { $_ -ceq ('bom' + [char]0xFEFF + 'sep' + [char]0x2028 + 'end') }).Count -eq 1 -and
                     @($arChildLines | Where-Object { $_ -ceq 'suite=Paths' }).Count -eq 1 -and
-                    @($arChildErrors | Where-Object { ([string]$_).Contains('werr ') }).Count -ge 1 -and
+                    ([string]::Join('', $arChildErrors)).Contains('werr ') -and
                     @($arChildErrors | Where-Object { ([string]$_).IndexOf([char]0xFFFD) -ge 0 }).Count -eq 0 -and
                     @($arChildErrors | Where-Object { ([string]$_).Contains('CLIXML') }).Count -eq 0)
                 $arChildCodes = [string]::Join(' ', @(([string]::Join('|', $arChildLines) + '#' + [string]::Join('|', $arChildErrors)).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }))
