@@ -623,6 +623,9 @@ function Test-Compatibility {
             # Main після lock і конфігурації ($stateRoot), тож це статус
             # саме цього прогону.
             $unsupportedOsExitCode = Resolve-BRAVOExitCode -InvalidConfiguration
+            # Фінальна Operations-подія у finally читає $script:processExitCode —
+            # без цього вона звітувала б 0 (Success) при exit 30.
+            $script:processExitCode = $unsupportedOsExitCode
             Write-BRAVOArchiveOperationStatus `
                 -ExitCode $unsupportedOsExitCode `
                 -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
@@ -683,6 +686,7 @@ function Test-Compatibility {
             Send-ToolIntegrityAlert -Result $script:BRAVOToolManifest
             # #291: як і для непідтримуваної ОС — статус перед exit.
             $toolIntegrityExitCode = Resolve-BRAVOExitCode -ToolIntegrityViolation
+            $script:processExitCode = $toolIntegrityExitCode
             Write-BRAVOArchiveOperationStatus `
                 -ExitCode $toolIntegrityExitCode `
                 -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
@@ -6483,6 +6487,11 @@ function Write-BRAVOArchiveOperationStatus {
     )
 
     try {
+        # BRAVO_STATUS_Archive.json — статус НІЧНОЇ копії: денна BAZA-
+        # синхронізація (-SyncBAZA) його не перезаписує, інакше вона
+        # приховала б провал нічної копії або зсунула FinishedAt, на який
+        # спирається діагностика Health.
+        if ((Test-Path variable:SyncBAZA) -and $SyncBAZA) { return }
         $statusDetails = $Details
         if (-not [string]::IsNullOrWhiteSpace($EarlyExitReason)) {
             $statusDetails = @{
@@ -6500,7 +6509,13 @@ function Write-BRAVOArchiveOperationStatus {
             -StartedAt $StartedAt `
             -Details $statusDetails
     } catch {
-        Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)"
+        # Ранні виходи не мають зовнішнього try: збій самого логування не
+        # повинен перетворити 40/30/32 на 90.
+        try {
+            Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)"
+        } catch {
+            # Телеметрія не змінює exit code.
+        }
     }
 }
 

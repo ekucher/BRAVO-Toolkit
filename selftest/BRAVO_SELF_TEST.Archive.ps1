@@ -1227,11 +1227,15 @@ try {
     foreach ($compatExit in $compatExits) {
         $compatExitCodeText = if ($null -ne $compatExit.Pipeline) { [string]$compatExit.Pipeline.Extent.Text } else { '' }
         $compatPreviousText = ''
+        $compatExitCodeAssignText = ''
         if ($compatExit.Parent -is [Management.Automation.Language.StatementBlockAst]) {
             $compatSiblings = @($compatExit.Parent.Statements)
             for ($compatIndex = 1; $compatIndex -lt $compatSiblings.Count; $compatIndex++) {
                 if ([object]::ReferenceEquals($compatSiblings[$compatIndex], $compatExit)) {
                     $compatPreviousText = [string]$compatSiblings[$compatIndex - 1].Extent.Text
+                    if ($compatIndex -ge 2) {
+                        $compatExitCodeAssignText = [string]$compatSiblings[$compatIndex - 2].Extent.Text
+                    }
                     break
                 }
             }
@@ -1239,7 +1243,9 @@ try {
         $compatCovered = (
             $compatExitCodeText -match '^\$[A-Za-z]\w*$' -and
             $compatPreviousText -match '^Write-BRAVOArchiveOperationStatus\b' -and
-            $compatPreviousText -match ('-ExitCode\s+' + [regex]::Escape($compatExitCodeText) + '(?!\w)')
+            $compatPreviousText -match ('-ExitCode\s+' + [regex]::Escape($compatExitCodeText) + '(?!\w)') -and
+            # Фінальна Operations-подія у finally читає $script:processExitCode.
+            $compatExitCodeAssignText -match ('^\$script:processExitCode\s*=\s*' + [regex]::Escape($compatExitCodeText) + '\s*$')
         )
         if (-not $compatCovered) {
             $compatUncoveredExits += [string]$compatExit.Extent.Text
@@ -1253,5 +1259,5 @@ try {
             $compatUncoveredExits.Count -eq 0
         ) `
         -Name 'Archive/CompatibilityExitsWriteStatusBeforeExit' `
-        -Failure "кожен exit у Test-Compatibility має безпосередньо після запису статусу (Write-BRAVOArchiveOperationStatus -ExitCode <той самий код>) завершувати процес, інакше моніторинг бачить застарілий статус; без статусу: $($compatUncoveredExits -join ' | ')"
+        -Failure "кожен exit у Test-Compatibility має безпосередньо після запису статусу (Write-BRAVOArchiveOperationStatus -ExitCode <той самий код>, перед ним $script:processExitCode = <той самий код>) завершувати процес, інакше моніторинг бачить застарілий статус; без статусу: $($compatUncoveredExits -join ' | ')"
 }
