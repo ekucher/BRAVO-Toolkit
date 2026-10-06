@@ -353,6 +353,45 @@
             $fastHealthAutoArchive.Message -match 'eqv_11-116\.pdf' -and $fastHealthAutoArchive.Message -notmatch 'ПОТРІБНА ДІЯ'
         ) -Name 'BazaSync/MutationAutoArchivedIsHealthInfoNotCritical' -Failure "MUTATION_AUTO_ARCHIVED має бути INFO/healthy (не блокує): Level=$($fastHealthAutoArchive.Level),Healthy=$($fastHealthAutoArchive.Healthy)"
 
+        # #293: MUTATION_AUTO_ARCHIVED не має ховати remote-конфлікт/audit-drift/
+        # несумісні імена ТОГО САМОГО циклу. (a) Fast Health напряму: статус
+        # AUTO_ARCHIVED + непорожній RemoteConflicts -> CRITICAL/не healthy, як для
+        # REMOTE_CONFLICT; (b) продакшн-драбина статусів: авто-архівування + remote-
+        # конфлікт в одному циклі -> Status НЕ MUTATION_AUTO_ARCHIVED.
+        $aa293Now = (Get-Date).ToUniversalTime()
+        $aa293Synthetic = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId (New-BRAVOBazaCycleId) -StartedUtc $aa293Now -CutoffUtc $aa293Now
+        $aa293Synthetic.Status = 'MUTATION_AUTO_ARCHIVED'
+        $aa293Synthetic.MutationViolations = @([pscustomobject]@{ RelativePath = 'eqv_11-116.pdf' })
+        $aa293Synthetic.RemoteConflicts = @([pscustomobject]@{ RelativePath = 'c_conflict.txt'; LocalSize = [int64]100; RemoteSize = [int64]55 })
+        $aa293Health = Get-BRAVOBazaFastHealthResult -SyncResult $aa293Synthetic
+        $aa293Reference = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId (New-BRAVOBazaCycleId) -StartedUtc $aa293Now -CutoffUtc $aa293Now
+        $aa293Reference.Status = 'REMOTE_CONFLICT'
+        $aa293Reference.RemoteConflicts = $aa293Synthetic.RemoteConflicts
+        $aa293ReferenceHealth = Get-BRAVOBazaFastHealthResult -SyncResult $aa293Reference
+        Test-BRAVOCondition -Condition (
+            $aa293Health.Healthy -eq $false -and $aa293Health.Level -eq $aa293ReferenceHealth.Level -and
+            $aa293Health.Level -eq 'CRITICAL' -and $aa293Health.Message -match 'c_conflict\.txt'
+        ) -Name 'BazaSync/AutoArchivedDoesNotMaskRemoteConflictInFastHealth' -Failure "MUTATION_AUTO_ARCHIVED + RemoteConflicts має бути CRITICAL/не healthy (як REMOTE_CONFLICT), а не INFO: Level=$($aa293Health.Level),Healthy=$($aa293Health.Healthy)"
+
+        $aa293Root = Join-Path $bazaSyncTestRoot "A_AutoArchiveWithConflict"
+        $aa293Local = Join-Path $aa293Root "local"
+        $aa293State = Join-Path $aa293Root "state"
+        New-Item -ItemType Directory -Path $aa293Local -Force | Out-Null
+        $aa293File = New-BRAVOSelfTestBazaFile -Directory $aa293Local -RelativePath "eqv_11-116.pdf" -SizeBytes 500
+        $aa293Session = New-BRAVOSelfTestFakeBazaSession
+        $aa293Cycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aa293Local -RemoteRootPath '/baza_app' -Session $aa293Session -StateRoot $aa293State -BootstrapIfNeeded -FullAuditProvider $baza
+        [IO.File]::WriteAllBytes($aa293File, (New-Object byte[] 999))
+        [void](New-BRAVOSelfTestBazaFile -Directory $aa293Local -RelativePath "b.txt" -SizeBytes 100)
+        $aa293Session.State.RemoteSizes['/baza_app/b.txt'] = [int64]55
+        $aa293Result = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aa293Local -RemoteRootPath '/baza_app' -Session $aa293Session -StateRoot $aa293State -AutoArchiveMutationThreshold 5
+        Test-BRAVOCondition -Condition (
+            $aa293Cycle1.Status -eq 'COMPLETE' -and
+            $aa293Result.Status -ne 'MUTATION_AUTO_ARCHIVED' -and $aa293Result.Status -eq 'REMOTE_CONFLICT' -and
+            @($aa293Result.RemoteConflicts).Count -eq 1 -and
+            $aa293Session.State.MoveFileCalls.Count -eq 1 -and
+            (Get-BRAVOBazaFastHealthResult -SyncResult $aa293Result).Healthy -eq $false
+        ) -Name 'BazaSync/AutoArchiveWithSameCycleRemoteConflictIsNotAutoArchivedStatus' -Failure "авто-архівування + remote-конфлікт в одному циклі: Status має бути REMOTE_CONFLICT (не MUTATION_AUTO_ARCHIVED), авто-архівування все одно виконано; Status=$($aa293Result.Status),Moves=$($aa293Session.State.MoveFileCalls.Count)"
+
         # AutoArchiveMutationThreshold: N > поріг -> як і без опції (жорсткий блок)
         $aaOverRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveOverThreshold"
         $aaOverLocal = Join-Path $aaOverRoot "local"
@@ -2305,6 +2344,41 @@
             $sbArchiveText.Contains('syncBaza = $true')
         ) -Name 'BazaSync/SyncBazaFailureMapsToSftpFailedExitAndOperationsEvent' `
           -Failure '-SyncBAZA: не-COMPLETE результат двигуна має давати exit SftpFailed (50) через $manualSyncResult.Success і нести статус двигуна у фінальній Operations-події'
+
+        # #285: Invoke-BRAVOBazaCanonicalSync (справжня функція з Archive.Runtime,
+        # AST) мусить вважати MUTATION_AUTO_ARCHIVED успіхом (INFO за контрактом,
+        # OPERATIONS.md); COMPLETE -> успіх; реальні збої -> не успіх. Стаб лише
+        # інкрементального двигуна (зовнішня межа) та логування/режиму.
+        $sb285Module = New-Module -ScriptBlock {}
+        try {
+            $sb285Script = [scriptblock]::Create(@'
+                $script:StubStatus = 'COMPLETE'
+                function Write-BRAVOLog { param($Component, $Message, $Level, [switch]$NoTimestamp) }
+                function Get-BRAVOBazaSyncModeEffective { return 'IncrementalAppendOnly' }
+                function Invoke-BRAVOBazaIncrementalSync {
+                    param($Component, $LocalDirectory, $RemoteDirectory, [switch]$ForceFullAudit)
+                    return [pscustomobject]@{
+                        Status = $script:StubStatus; Error = $null; Uploaded = 0; AlreadyVerified = 0; Failed = 0
+                        IncompatibleFiles = @(); MutationViolations = @(); RemoteConflicts = @(); AuditDriftFiles = @()
+                    }
+                }
+'@ + "`n" + $sbFunctionAsts['Invoke-BRAVOBazaCanonicalSync'].Extent.Text)
+            . $sb285Module.NewBoundScriptBlock($sb285Script)
+            $sb285Outcomes = @{}
+            foreach ($sb285Status in @('COMPLETE', 'MUTATION_AUTO_ARCHIVED', 'MUTATION_VIOLATION', 'REMOTE_CONFLICT', 'INCOMPLETE')) {
+                & $sb285Module { param($s) $script:StubStatus = $s } $sb285Status
+                $sb285Outcomes[$sb285Status] = & $sb285Module { Invoke-BRAVOBazaCanonicalSync -Component 'BAZA_APP' -LocalDirectory 'C:\fake\local' -RemoteDirectory 'baza_app' }
+            }
+            Test-BRAVOCondition -Condition ($sb285Outcomes['COMPLETE'].Success -eq $true) `
+                -Name 'BazaSync/CanonicalSyncCompleteIsSuccess' -Failure "Invoke-BRAVOBazaCanonicalSync: COMPLETE має бути Success=true; Success=$($sb285Outcomes['COMPLETE'].Success)"
+            Test-BRAVOCondition -Condition (
+                $sb285Outcomes['MUTATION_AUTO_ARCHIVED'].Success -eq $true -and $null -eq $sb285Outcomes['MUTATION_AUTO_ARCHIVED'].Error
+            ) -Name 'BazaSync/CanonicalSyncMutationAutoArchivedIsSuccess' -Failure "Invoke-BRAVOBazaCanonicalSync: MUTATION_AUTO_ARCHIVED (INFO за контрактом) має бути Success=true, інакше exit 50 на кожен цикл; Success=$($sb285Outcomes['MUTATION_AUTO_ARCHIVED'].Success)"
+            Test-BRAVOCondition -Condition (
+                $sb285Outcomes['MUTATION_VIOLATION'].Success -eq $false -and $sb285Outcomes['REMOTE_CONFLICT'].Success -eq $false -and
+                $sb285Outcomes['INCOMPLETE'].Success -eq $false
+            ) -Name 'BazaSync/CanonicalSyncFailureStatusesAreNotSuccess' -Failure 'Invoke-BRAVOBazaCanonicalSync: MUTATION_VIOLATION/REMOTE_CONFLICT/INCOMPLETE мають лишатись Success=false'
+        } finally { Remove-Module -ModuleInfo $sb285Module -Force -ErrorAction SilentlyContinue }
 
         # --- Поведінкова матриця ЧЕРЕЗ вхідну функцію -SyncBAZA ---------------
         $sbNeededFunctions = @(
