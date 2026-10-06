@@ -4244,8 +4244,11 @@ function Format-CompactLocalIssue {
 
     $componentName = Get-HealthIssueComponentName -Issue $Issue
     if ($Issue.Kind -eq "LocalSynchronization") {
-        $exitCodeText = if ($null -ne $Issue.ExitCode) {
-            " • robocopy: $($Issue.ExitCode)"
+        # ExitCode є лише в robocopy-гілках Get-BAZALocalSyncHealthIssues;
+        # пряме читання поля під StrictMode валило Health (#286).
+        $exitCodeValue = Get-BRAVOHealthIssueField -Issue $Issue -Name 'ExitCode'
+        $exitCodeText = if ($exitCodeValue -ne '') {
+            " • robocopy: $exitCodeValue"
         } else {
             ""
         }
@@ -6238,7 +6241,7 @@ foreach ($healthIssue in $healthIssues) {
             }
         }
         "LocalSynchronization" {
-            Write-HealthLog "Проблема $($healthIssue.Component): $($healthIssue.Reason); джерело: $($healthIssue.Source); локальна копія: $($healthIssue.Location); код robocopy: $($healthIssue.ExitCode)" -Level "ERROR"
+            Write-HealthLog "Проблема $($healthIssue.Component): $($healthIssue.Reason); джерело: $($healthIssue.Source); локальна копія: $($healthIssue.Location); код robocopy: $(Get-BRAVOHealthIssueField -Issue $healthIssue -Name 'ExitCode')" -Level "ERROR"
         }
         "SFTPConnection" {
             Write-HealthLog "Проблема $($healthIssue.Component): $($healthIssue.Reason)" -Level "ERROR"
