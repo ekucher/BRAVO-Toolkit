@@ -12575,6 +12575,133 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Health/StaleGenerationDiagnosisKeepsKindAndComponent' `
         -Failure 'Diagnosis — додаткове поле: Kind=LocalBackupGeneration, Component=Generation і Reason stale-issue не змінюються (action text, Operations, exit code)'
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.LocalSyncIssueWithoutExitCode' -DependsOn 'Root/Runtime') { try {
+    # #286: проблема LocalSynchronization без поля ExitCode (7 з 9 гілок
+    # Get-BAZALocalSyncHealthIssues) валила Health із кодом 90 під StrictMode:
+    # Format-CompactLocalIssue і журнальний рядок читали .ExitCode напряму.
+    $localSyncExitCodeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Get-BAZALocalSyncHealthIssues', 'Get-BRAVOHealthIssueField',
+            'Format-FileSize', 'Format-BackupAge', 'ConvertTo-BRAVOUtcDateTime', 'Get-BRAVOUtcAge',
+            'Get-HealthIssueComponentName', 'ConvertTo-NotificationLiteralText', 'Format-HealthIssueFileName',
+            'Format-CompactLocalIssue', 'Format-CompactSFTPIssue', 'Format-CompactSMBIssue',
+            'Get-BRAVOHealthCollapsedCloudIssues', 'Get-BRAVOHealthIssueActionText', 'New-SlackAlertMessage'
+        )
+    # Клаузу "LocalSynchronization" журнального switch-а в Invoke-BRAVOHealth
+    # виконуємо як є (AST), бо це інлайн-код, а не функція.
+    $localSyncLogAst = [Management.Automation.Language.Parser]::ParseInput($healthScriptText, [ref]$null, [ref]$null)
+    $localSyncLogClauseText = ''
+    foreach ($localSyncSwitch in @($localSyncLogAst.FindAll({ param($node) $node -is [Management.Automation.Language.SwitchStatementAst] }, $true))) {
+        foreach ($localSyncClause in $localSyncSwitch.Clauses) {
+            if ($localSyncClause.Item1.Extent.Text -eq '"LocalSynchronization"' -and $localSyncClause.Item2.Extent.Text -match 'код robocopy') {
+                $localSyncLogClauseText = (@($localSyncClause.Item2.Statements | ForEach-Object { $_.Extent.Text }) -join "`n")
+            }
+        }
+    }
+    $localSyncFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('bravo-j1-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $localSyncSource = Join-Path $localSyncFixtureRoot 'src'
+        $localSyncEmptySource = Join-Path $localSyncFixtureRoot 'empty-src'
+        $localSyncDestination = Join-Path $localSyncFixtureRoot 'dst'
+        New-Item -ItemType Directory -Path $localSyncSource, $localSyncEmptySource, $localSyncDestination -Force | Out-Null
+        $localSyncResults = & $localSyncExitCodeModule {
+            param($LogClauseText, $Source, $EmptySource, $Destination, $Missing)
+            Set-StrictMode -Version 2.0
+            $script:NotificationProvider = 'slack'
+            $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+            $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'; SFTP = [pscustomobject]@{ Enabled = $false; CheckBAZASynchronization = $false } }
+            $bazaAppLocalHealthEnabled = $true; $bazaWWWLocalHealthEnabled = $false; $bazaAppSFTPHealthEnabled = $false; $bazaWWWSFTPHealthEnabled = $false
+            $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+            $script:healthLatestArchives = @{}
+            $synchronizationSafety = [pscustomobject]@{ RequireNonEmptyBAZASource = $true }
+            $robocopyPath = 'bravo-no-such-robocopy-j1.exe'
+            function Get-HostInformation { return $null }
+            function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+            function New-BRAVOOperatorNotificationMessage { param($ResultLines, $ReasonLines) return (@($ReasonLines) + @($ResultLines)) -join "`n" }
+            function Get-BRAVOFiles {
+                param($LiteralPath, [switch]$Recurse, [switch]$Force)
+                if ($LiteralPath -ne $EmptySource) { return [pscustomobject]@{ Name = 'a.dat' } }
+            }
+            $logLines = New-Object System.Collections.Generic.List[string]
+            function Write-HealthLog { param([string]$Message, [string]$Level) $logLines.Add($Message) }
+            $render = {
+                param($Issue)
+                $row = [ordered]@{ Reason = [string]$Issue.Reason; HasExitCode = [bool]$Issue.PSObject.Properties['ExitCode'] }
+                try { $row.Compact = Format-CompactLocalIssue -Issue $Issue } catch { $row.Compact = $null; $row.CompactError = $_.Exception.Message }
+                try { $row.Slack = [string](New-SlackAlertMessage -Issues @($Issue) -Duration ([timespan]::FromSeconds(1))) } catch { $row.Slack = $null; $row.SlackError = $_.Exception.Message }
+                try {
+                    $logLines.Clear()
+                    $healthIssue = $Issue
+                    & ([scriptblock]::Create($LogClauseText))
+                    $row.Log = [string]$logLines[0]
+                } catch { $row.Log = $null; $row.LogError = $_.Exception.Message }
+                [pscustomobject]$row
+            }
+            $producerIssues = @(
+                (Get-BAZALocalSyncHealthIssues -Enabled $true -SourcePath '' -DestinationPath $Destination -Label 'BAZA APP'),
+                (Get-BAZALocalSyncHealthIssues -Enabled $true -SourcePath $Missing -DestinationPath $Destination -Label 'BAZA APP'),
+                (Get-BAZALocalSyncHealthIssues -Enabled $true -SourcePath $EmptySource -DestinationPath $Destination -Label 'BAZA APP'),
+                (Get-BAZALocalSyncHealthIssues -Enabled $true -SourcePath $Source -DestinationPath $Missing -Label 'BAZA APP'),
+                (Get-BAZALocalSyncHealthIssues -Enabled $true -SourcePath $Source -DestinationPath $Destination -Label 'BAZA APP')
+            )
+            $withCode = [pscustomobject]@{ Kind = 'LocalSynchronization'; Component = 'Локальна BAZA APP'; FileName = 'каталог BAZA APP'; LastWriteTime = $null; SizeBytes = $null; DifferenceCount = $null; Details = @(); Source = 'src'; Location = 'dst'; Reason = 'robocopy не зміг порівняти каталоги (код: 16)'; ExitCode = 16 }
+            [pscustomobject]@{
+                Without = @($producerIssues | ForEach-Object { & $render $_ })
+                With = & $render $withCode
+            }
+        } $localSyncLogClauseText $localSyncSource $localSyncEmptySource $localSyncDestination (Join-Path $localSyncFixtureRoot 'absent')
+    } finally {
+        if (Test-Path -LiteralPath $localSyncFixtureRoot -PathType Container) {
+            Remove-Item -LiteralPath $localSyncFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $localSyncWithout = @($localSyncResults.Without)
+    $localSyncWith = $localSyncResults.With
+    Test-BRAVOCondition `
+        -Condition (
+            $localSyncLogClauseText.Length -gt 0 -and
+            $localSyncWithout.Count -eq 5 -and
+            @($localSyncWithout | Where-Object { $_.HasExitCode }).Count -eq 0 -and
+            @($localSyncWithout | Where-Object { $null -eq $_.Compact -or $null -ne ($_.PSObject.Properties['CompactError']) }).Count -eq 0 -and
+            @($localSyncWithout | Where-Object { $_.Compact -ne ":warning: BAZA — $($_.Reason)" }).Count -eq 0
+        ) `
+        -Name 'Health/LocalSyncIssueWithoutExitCodeDoesNotThrowInFormatter' `
+        -Failure "Format-CompactLocalIssue не має падати на проблемі без ExitCode і не має додавати суфікс robocopy: $($localSyncWithout | ConvertTo-Json -Compress -Depth 4)"
+    Test-BRAVOCondition `
+        -Condition (
+            $localSyncWithout.Count -eq 5 -and
+            @($localSyncWithout | Where-Object { $null -eq $_.Log -or $null -ne ($_.PSObject.Properties['LogError']) }).Count -eq 0 -and
+            @($localSyncWithout | Where-Object { -not $_.Log.StartsWith('Проблема Локальна BAZA APP: ' + $_.Reason + '; джерело: ') -or -not $_.Log.EndsWith('; код robocopy: ') }).Count -eq 0
+        ) `
+        -Name 'Health/LocalSyncIssueWithoutExitCodeDoesNotThrowInLogLine' `
+        -Failure "журнальний рядок LocalSynchronization не має падати без ExitCode; хвіст «код robocopy: » лишається порожнім: $($localSyncWithout | ConvertTo-Json -Compress -Depth 4)"
+    Test-BRAVOCondition `
+        -Condition (
+            $localSyncWithout.Count -eq 5 -and
+            @($localSyncWithout | Where-Object { $null -eq $_.Slack -or $null -ne ($_.PSObject.Properties['SlackError']) -or $_.Slack -notmatch 'ЛОКАЛЬНІ БЕКАПИ' -or -not $_.Slack.Contains($_.Reason) }).Count -eq 0
+        ) `
+        -Name 'Health/LocalSyncIssueWithoutExitCodeReachesSlackAlert' `
+        -Failure "Slack-алерт має будуватись для проблеми LocalSynchronization без ExitCode: $($localSyncWithout | ConvertTo-Json -Compress -Depth 4)"
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $localSyncWith -and
+            $localSyncWith.Compact -eq ':warning: BAZA — robocopy не зміг порівняти каталоги (код: 16) • robocopy: 16' -and
+            $localSyncWith.Log.EndsWith('; код robocopy: 16') -and
+            $localSyncWith.Slack -match 'robocopy: 16'
+        ) `
+        -Name 'Health/LocalSyncRobocopyCodeBranchesKeepExitCode' `
+        -Failure "проблема з ExitCode має зберегти старий текст (• robocopy: N, код robocopy: N): $($localSyncWith | ConvertTo-Json -Compress -Depth 4)"
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText -notmatch '\$healthIssue\.ExitCode\b' -and
+            $healthScriptText -notmatch '\$Issue\.ExitCode\b' -and
+            $healthScriptText.Contains('Get-BRAVOHealthIssueField -Issue $healthIssue -Name ''ExitCode''') -and
+            $healthScriptText.Contains('Get-BRAVOHealthIssueField -Issue $Issue -Name ''ExitCode''')
+        ) `
+        -Name 'Health/LocalSyncHealthIssuesNoDirectExitCodeRead' `
+        -Failure 'ExitCode проблем LocalSynchronization читається лише через Get-BRAVOHealthIssueField (поле є не в усіх гілках Get-BAZALocalSyncHealthIssues)'
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.LocalSyncIssueWithoutExitCode' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.MissingCompleteGenerationHasNoFictitiousFileName' -DependsOn 'Root/Runtime') { try {
     $healthGenerationModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $healthScriptText `
