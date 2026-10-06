@@ -690,3 +690,92 @@ Test-BRAVOCondition -Condition (
     $scopeSetupErrorsNotInstalled.Count -eq 0
 ) -Name 'BackupScope/SetupDestinationCheckHonoursNotInstalled' `
     -Failure 'SETUP має перевіряти призначення BAZA_* лише за увімкненої *_LOCAL синхронізації (рядок "false" = вимкнено) і не вимагати призначення для NotInstalled-компонента'
+
+# (#301) Baseline не має фіксувати шлях компонента, який НЕ Present. Сирі
+# поля discovery (BLOG_SOURCE тощо) лишаються заповненими шляхом з bravo.ini,
+# навіть коли каталог порожній (presence Absent). Раніше Save-BRAVODiscoveryBaseline
+# переносив цей шлях у baseline, і Test-BRAVODiscoveryComponentDrift трактував
+# «Absent + непорожнє поле baseline» як зниклий компонент (Error) - хибна
+# тривога на кожному запуску. Тести проходять реальний ланцюг
+# Save -> Import -> Drift на справжніх каталогах.
+$scope301Root = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_BASELINE301_' + [guid]::NewGuid().ToString('N'))
+try {
+    $scope301Full = Join-Path $scope301Root 'full'
+    $scope301Empty = Join-Path $scope301Root 'empty'
+    $scope301State = Join-Path $scope301Root 'state'
+    $scope301Runtime = Join-Path $scope301Root 'runtime'
+    foreach ($scope301Dir in @($scope301Full, $scope301Empty, $scope301State, $scope301Runtime)) {
+        [void](New-Item -ItemType Directory -Path $scope301Dir -Force)
+    }
+    [IO.File]::WriteAllText((Join-Path $scope301Full 'data.txt'), 'x')
+
+    function New-BRAVOSelfTestScope301Discovery {
+        # Discovery, де BLOG береться з реального каталогу: presence дає
+        # production-функція, а сире поле лишається шляхом (як у discovery).
+        param([string]$BlogPath)
+        $discovery = New-BRAVOSelfTestScopeDiscovery -Presence @{ MODEL = 'Present'; BLOG = 'Present'; BRAVOEXCH = 'Present'; BAZA_APP = 'Present'; BAZA_WWW = 'Present' }
+        $discovery.BLOG_SOURCE = $BlogPath
+        $discovery.Components['BLOG'] = Resolve-BRAVODiscoveryPathComponentPresenceForSelfTest -Path $BlogPath
+        return $discovery
+    }
+    function Resolve-BRAVODiscoveryPathComponentPresenceForSelfTest {
+        param([string]$Path)
+        $moduleScope = Get-Module -Name 'BRAVO.Discovery'
+        return (& $moduleScope {
+            param($p)
+            Resolve-BRAVODiscoveryPathComponentPresence -Component 'BLOG' -Path $p -Source 'BravoIni' -Reason 'bravo.ini'
+        } $Path)
+    }
+    function Save-BRAVOSelfTestScope301Baseline {
+        param([object]$Discovery)
+        $baselinePath = Get-BRAVODiscoveryBaselinePath -StateRoot $scope301State
+        Save-BRAVODiscoveryBaseline -DiscoveryResult $Discovery -BaselinePath $baselinePath
+        return $baselinePath
+    }
+
+    # (a) BLOG порожній на момент baseline і лишається порожнім -> без Error.
+    $scope301AbsentDiscovery = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Empty
+    $scope301AbsentPath = Save-BRAVOSelfTestScope301Baseline -Discovery $scope301AbsentDiscovery
+    $scope301AbsentImport = Import-BRAVODiscoveryBaseline -StateRoot $scope301State -RuntimeRoot $scope301Runtime -ReadOnly
+    $scope301AbsentFindings = @(Test-BRAVODiscoveryComponentDrift `
+        -DiscoveryResult $scope301AbsentDiscovery `
+        -Baseline $scope301AbsentImport.Baseline -BaselineSourceKind ([string]$scope301AbsentImport.Source) `
+        -EnabledComponents $scopeAllEnabled)
+    Test-BRAVOCondition -Condition (
+        [string]$scope301AbsentDiscovery.Components['BLOG'].Presence -eq 'Absent' -and
+        [string]$scope301AbsentImport.Source -eq 'Canonical' -and
+        @($scope301AbsentFindings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
+        @($scope301AbsentFindings | Where-Object { [string]$_.Component -eq 'BLOG' -and [string]$_.Severity -eq 'Info' }).Count -eq 1
+    ) -Name 'BackupScope/BaselineAbsentComponentStillAbsentIsNotDrift' `
+        -Failure 'компонент, якого не було на момент baseline (порожній каталог, Absent) і який лишається Absent, не має давати Error-дрейф'
+
+    # (c) Baseline-файл зберігає '' для не-Present компонента, а Present - шлях.
+    $scope301AbsentJson = Get-Content -LiteralPath $scope301AbsentPath -Raw | ConvertFrom-Json
+    Test-BRAVOCondition -Condition (
+        [string]$scope301AbsentJson.BLOG_SOURCE -eq '' -and
+        [string]$scope301AbsentJson.MODEL_SOURCE -eq 'C:\ExampleLims\Model'
+    ) -Name 'BackupScope/BaselineStoresEmptySourceForNonPresentComponent' `
+        -Failure 'Save-BRAVODiscoveryBaseline має писати порожнє джерело для компонента не в стані Present (а Present лишає зі шляхом)'
+
+    # (b) Guard: BLOG був Present (непорожній каталог) у baseline, потім
+    # каталог став порожнім -> Error лишається.
+    $scope301PresentDiscovery = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Full
+    [void](Save-BRAVOSelfTestScope301Baseline -Discovery $scope301PresentDiscovery)
+    $scope301PresentImport = Import-BRAVODiscoveryBaseline -StateRoot $scope301State -RuntimeRoot $scope301Runtime -ReadOnly
+    $scope301LaterEmpty = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Empty
+    $scope301VanishedFindings = @(Test-BRAVODiscoveryComponentDrift `
+        -DiscoveryResult $scope301LaterEmpty `
+        -Baseline $scope301PresentImport.Baseline -BaselineSourceKind ([string]$scope301PresentImport.Source) `
+        -EnabledComponents $scopeAllEnabled)
+    Test-BRAVOCondition -Condition (
+        [string]$scope301PresentDiscovery.Components['BLOG'].Presence -eq 'Present' -and
+        [string]$scope301PresentImport.Baseline.BLOG_SOURCE -eq $scope301Full -and
+        [string]$scope301LaterEmpty.Components['BLOG'].Presence -eq 'Absent' -and
+        @($scope301VanishedFindings | Where-Object { [string]$_.Severity -eq 'Error' -and [string]$_.Component -eq 'BLOG' }).Count -eq 1
+    ) -Name 'BackupScope/BaselinePresentComponentLaterEmptyStillRaisesError' `
+        -Failure 'компонент, що був Present у baseline і згодом став порожнім (Absent), має й надалі давати Error-дрейф'
+} finally {
+    if (Test-Path -LiteralPath $scope301Root) {
+        Remove-Item -LiteralPath $scope301Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
