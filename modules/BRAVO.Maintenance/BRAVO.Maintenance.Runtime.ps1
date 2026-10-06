@@ -7400,6 +7400,24 @@ function Send-FinalReport {
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
     }
+    elseif ($script:criticalErrorOccurred -eq $true) {
+        # #298: багато місць лише ставлять criticalErrorOccurred (-> exit 60)
+        # і не додають запис у CriticalErrorsList. Без цієї гілки errors_only
+        # мовчки повертався б. Окрема причина алерту: узагальнене CRITICAL
+        # без деталей; записи NotificationAlertQueue (якщо є) додаються, щоб
+        # не загубитись. Коди завершення не змінюються.
+        $notificationMessage = New-MaintenanceNotificationMessage `
+            -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
+            -TitleEmoji ":rotating_light:" `
+            -Severity "CRITICAL" `
+            -Duration $elapsedTime `
+            -Details (@("Maintenance завершився з критичною помилкою без детальної причини. Подробиці дивіться в журналі.") +
+                @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
+                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
+            -LogPath $LOG_FILE
+        $notificationSeverity = "CRITICAL"
+        $shouldSend = $true
+    }
     elseif ($script:NotificationAlertQueue.Count -gt 0) {
         # Notification-only WARNING/ERROR/CRITICAL (Send-SlackAlert
         # -Severity, без -IsCritical) — окрема гілка від справжніх
