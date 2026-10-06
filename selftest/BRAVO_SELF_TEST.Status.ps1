@@ -77,9 +77,14 @@
     # стоїть ПІСЛЯ обчислення exit code (телеметрія не змінює результат) ---
     $statusCallSiteContracts = @(
         @{
+            # #291: перший (і для контрольованих виходів єдиний) виклик в
+            # Archive — у fail-soft helper'і Write-BRAVOArchiveOperationStatus,
+            # який пишуть хвіст Main і ранні виходи; exit code він отримує
+            # параметром. Порядок «хвостовий виклик ПІСЛЯ обчислення exit
+            # code» перевіряється окремо нижче (CallSiteAfterExitCode).
             Label = 'Archive'
             Path = 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'
-            RequiredAfter = '$script:processExitCode = Resolve-BRAVOExitCode -HasWarnings'
+            RequiredAfter = 'function Write-BRAVOArchiveOperationStatus'
         }
         @{
             Label = 'Health'
@@ -120,3 +125,55 @@
             -Name "Status/CallSiteIsFailSoft[$($statusCallSite.Label)]" `
             -Failure "$($statusCallSite.Path): Write-BRAVOOperationStatus має стояти ПІСЛЯ обчислення exit code і всередині try/catch (fail-soft; телеметрія не змінює результат операції)"
     }
+
+    # #291: Archive пише статус через helper — хвостовий виклик helper'а
+    # (останній у файлі; ранні виходи стоять вище) мусить іти ПІСЛЯ
+    # остаточного обчислення exit code і передавати саме його, а сам helper
+    # — бути першим сирим викликом (контракт [Archive] вище) у try/catch.
+    $archiveStatusText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $archiveStatusExitCodeIndex = $archiveStatusText.IndexOf('$script:processExitCode = Resolve-BRAVOExitCode -HasWarnings')
+    # Останній ВИКЛИК (рядок, що починається з імені команди), а не згадка
+    # в коментарі чи визначенні функції.
+    $archiveStatusCallMatches = [regex]::Matches($archiveStatusText, '(?m)^[ \t]*Write-BRAVOArchiveOperationStatus[ \t]+`')
+    $archiveStatusTailCallIndex = if ($archiveStatusCallMatches.Count -gt 0) {
+        $archiveStatusLastCall = $archiveStatusCallMatches[$archiveStatusCallMatches.Count - 1]
+        $archiveStatusLastCall.Index + $archiveStatusLastCall.Value.IndexOf('Write-BRAVOArchiveOperationStatus')
+    } else { -1 }
+    $archiveStatusHelperIndex = $archiveStatusText.IndexOf('function Write-BRAVOArchiveOperationStatus')
+    $archiveStatusTailCallText = if ($archiveStatusTailCallIndex -ge 0) {
+        $archiveStatusText.Substring($archiveStatusTailCallIndex, [Math]::Min(300, $archiveStatusText.Length - $archiveStatusTailCallIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveStatusExitCodeIndex -ge 0 -and
+            $archiveStatusHelperIndex -ge 0 -and
+            $archiveStatusTailCallIndex -gt $archiveStatusExitCodeIndex -and
+            $archiveStatusTailCallText -match '^Write-BRAVOArchiveOperationStatus\s+`?\s*-ExitCode\s+\$script:processExitCode(?!\w)'
+        ) `
+        -Name 'Status/CallSiteAfterExitCode[ArchiveTail]' `
+        -Failure 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1: хвостовий виклик Write-BRAVOArchiveOperationStatus має стояти ПІСЛЯ остаточного обчислення exit code і передавати -ExitCode $script:processExitCode'
+
+    # #291: BRAVO_STATUS_Archive.json — статус нічної копії. Кожен сирий
+    # Write-BRAVOOperationStatus в Archive (helper і фатальний catch навколо
+    # Main) мусить бути під guard'ом -SyncBAZA, інакше денна синхронізація
+    # (зокрема її крах з exit 90) перезапише статус нічної копії.
+    $archiveSyncBazaGuardText = '(Test-Path variable:SyncBAZA) -and $SyncBAZA'
+    $archiveRawStatusIndexes = New-Object 'System.Collections.Generic.List[int]'
+    $archiveRawStatusSearchFrom = 0
+    while ($true) {
+        $archiveRawStatusIndex = $archiveStatusText.IndexOf('Write-BRAVOOperationStatus `', $archiveRawStatusSearchFrom)
+        if ($archiveRawStatusIndex -lt 0) { break }
+        $archiveRawStatusIndexes.Add($archiveRawStatusIndex)
+        $archiveRawStatusSearchFrom = $archiveRawStatusIndex + 1
+    }
+    $archiveUnguardedStatusCount = 0
+    foreach ($archiveRawStatusIndex in $archiveRawStatusIndexes) {
+        $archiveGuardIndex = $archiveStatusText.LastIndexOf($archiveSyncBazaGuardText, $archiveRawStatusIndex)
+        if ($archiveGuardIndex -lt 0 -or ($archiveRawStatusIndex - $archiveGuardIndex) -gt 800) {
+            $archiveUnguardedStatusCount++
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($archiveRawStatusIndexes.Count -ge 2 -and $archiveUnguardedStatusCount -eq 0) `
+        -Name 'Status/ArchiveStatusWritesSkipSyncBaza' `
+        -Failure "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1: кожен Write-BRAVOOperationStatus (helper і фатальний catch) має бути під guard'ом -SyncBAZA; викликів=$($archiveRawStatusIndexes.Count), без guard'а=$archiveUnguardedStatusCount"
