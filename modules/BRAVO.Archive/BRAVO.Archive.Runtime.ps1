@@ -5768,7 +5768,8 @@ function Invoke-BRAVOBazaCanonicalSync {
         $syncResult = Invoke-BRAVOBazaIncrementalSync -Component $Component -LocalDirectory $LocalDirectory -RemoteDirectory $RemoteDirectory
         $outcome.SyncResult = $syncResult
         $outcome.Status = [string]$syncResult.Status
-        $outcome.Success = ($outcome.Status -eq 'COMPLETE')
+        # #285: MUTATION_AUTO_ARCHIVED — успіх (INFO за контрактом), єдиний helper BazaSync/Health.
+        $outcome.Success = [bool](Test-BRAVOBazaSyncStatusSuccess -Status $outcome.Status)
         $outcome.Skipped = ($outcome.Status -eq 'SKIPPED_CONCURRENT')
         $outcome.Completed = [int]($syncResult.Uploaded + $syncResult.AlreadyVerified)
         $outcome.Remaining = [int]$syncResult.Failed

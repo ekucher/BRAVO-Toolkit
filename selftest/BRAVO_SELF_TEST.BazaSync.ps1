@@ -2333,7 +2333,7 @@
             $sbCanonicalText.Contains("`$mode -eq 'IncrementalAppendOnly'") -and
             $sbCanonicalText.Contains("`$mode -eq 'Legacy'") -and
             $sbCanonicalText.Contains('невідомий backupMonitoring.SFTP.BAZA.Mode') -and
-            $sbCanonicalText.Contains("-eq 'COMPLETE'")
+            $sbCanonicalText.Contains('Test-BRAVOBazaSyncStatusSuccess')
         ) -Name 'BazaSync/CanonicalDispatcherLegacyOnlyOnExplicitModeAndFailsClosed' `
           -Failure 'Invoke-BRAVOBazaCanonicalSync: legacy mirror лише за явного Mode=Legacy, невідомий Mode — fail-closed (не legacy), успіх incremental лише COMPLETE'
 
@@ -2379,6 +2379,11 @@
                 $sb285Outcomes['INCOMPLETE'].Success -eq $false
             ) -Name 'BazaSync/CanonicalSyncFailureStatusesAreNotSuccess' -Failure 'Invoke-BRAVOBazaCanonicalSync: MUTATION_VIOLATION/REMOTE_CONFLICT/INCOMPLETE мають лишатись Success=false'
         } finally { Remove-Module -ModuleInfo $sb285Module -Force -ErrorAction SilentlyContinue }
+        Test-BRAVOCondition -Condition (
+            (Test-BRAVOBazaSyncStatusSuccess -Status 'COMPLETE') -and (Test-BRAVOBazaSyncStatusSuccess -Status 'MUTATION_AUTO_ARCHIVED') -and
+            -not (Test-BRAVOBazaSyncStatusSuccess -Status 'REMOTE_CONFLICT') -and -not (Test-BRAVOBazaSyncStatusSuccess -Status 'ERROR') -and
+            -not (Test-BRAVOBazaSyncStatusSuccess -Status '') -and -not (Test-BRAVOBazaSyncStatusSuccess -Status 'SOMETHING_NEW')
+        ) -Name 'BazaSync/StatusSuccessHelperWhitelistsCompleteAndAutoArchivedOnly' -Failure 'Test-BRAVOBazaSyncStatusSuccess: успіх лише COMPLETE і MUTATION_AUTO_ARCHIVED; решта/порожнє/незнайоме — ні'
 
         # --- Поведінкова матриця ЧЕРЕЗ вхідну функцію -SyncBAZA ---------------
         $sbNeededFunctions = @(

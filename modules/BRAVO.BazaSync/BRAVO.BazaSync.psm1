@@ -1372,9 +1372,13 @@ function Invoke-BRAVOBazaSynchronization {
     $completedUtc = (Get-Date).ToUniversalTime()
     $result.CompletedUtc = $completedUtc
 
-    if ($failedFiles.Count -gt 0) {
-        $result.Status = 'INCOMPLETE'
-    } elseif ($plan.MutationViolations.Count -gt 0 -and $MutationPolicy -eq 'Fail' -and
+    # #293: авто-архівування — побічний ефект, а не статус. Воно виконується за
+    # тих самих умов, що й раніше (поріг не змінено), але підсумковий Status
+    # визначає драбина нижче: AUDIT_DRIFT/REMOTE_CONFLICT/INCOMPATIBLE_NAME того
+    # самого циклу мають пріоритет над MUTATION_AUTO_ARCHIVED і не маскуються.
+    $autoArchiveAttempted = $false
+    $autoArchiveClean = $false
+    if ($failedFiles.Count -eq 0 -and $plan.MutationViolations.Count -gt 0 -and $MutationPolicy -eq 'Fail' -and
         $AutoArchiveMutationThreshold -gt 0 -and $plan.MutationViolations.Count -le $AutoArchiveMutationThreshold) {
         # Поріг-based авто-архівування (опційне, default вимкнено —
         # AutoArchiveMutationThreshold=0). Той самий rename-preserve
@@ -1392,14 +1396,19 @@ function Invoke-BRAVOBazaSynchronization {
             -MutationPathLookup $autoArchiveMutationPaths `
             -AcceptRelativePaths $autoArchiveAcceptPaths
         $result.AutoArchivedMutations = $autoArchiveResult
-        if ($autoArchiveResult.Failures.Count -gt 0) {
-            # Fail-closed: часткова/повна невдача rename — нерозв'язані
-            # шляхи лишаються заблокованими рівно як і без порогу.
-            $result.Status = 'MUTATION_VIOLATION'
-        } else {
-            $result.Status = 'MUTATION_AUTO_ARCHIVED'
-        }
-    } elseif ($plan.MutationViolations.Count -gt 0 -and $MutationPolicy -eq 'Fail') {
+        $autoArchiveAttempted = $true
+        $autoArchiveClean = ($autoArchiveResult.Failures.Count -eq 0)
+    }
+
+    if ($failedFiles.Count -gt 0) {
+        $result.Status = 'INCOMPLETE'
+    } elseif ($autoArchiveAttempted -and -not $autoArchiveClean) {
+        # Fail-closed: часткова/повна невдача rename — нерозв'язані
+        # шляхи лишаються заблокованими рівно як і без порогу.
+        $result.Status = 'MUTATION_VIOLATION'
+    } elseif ($autoArchiveClean -and $auditDriftFiles.Count -eq 0 -and $remoteConflicts.Count -eq 0 -and $incompatibleFiles.Count -eq 0) {
+        $result.Status = 'MUTATION_AUTO_ARCHIVED'
+    } elseif (-not $autoArchiveClean -and $plan.MutationViolations.Count -gt 0 -and $MutationPolicy -eq 'Fail') {
         $result.Status = 'MUTATION_VIOLATION'
     } elseif ($auditDriftFiles.Count -gt 0) {
         # P1 (round 4): audit-вердикт не скасовано, але й не виконано —
@@ -1693,6 +1702,17 @@ function Test-BRAVOBazaSyncResultFresh {
     return ($ageMinutes -ge 0 -and $ageMinutes -le $MaxAgeMinutes)
 }
 
+function Test-BRAVOBazaSyncStatusSuccess {
+    # Єдине джерело правди "цикл BAZA-синхронізації успішний" для Archive
+    # (-SyncBAZA/Main, exit code) і Health (OPERATIONS.md): COMPLETE та
+    # MUTATION_AUTO_ARCHIVED (INFO за контрактом: стару remote-версію збережено
+    # rename-ом, нову заллє наступний цикл). Усе інше, включно з незнайомим
+    # значенням, — не успіх (fail visible).
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Status)
+    return ($Status -in @('COMPLETE', 'MUTATION_AUTO_ARCHIVED'))
+}
+
 function Get-BRAVOBazaFastHealthResult {
     # Оцінює здоров'я ВИКЛЮЧНО з уже обчисленого SyncResult — жодного
     # нового SFTP-порівняння (ТЗ п.2, "SYNC -> VERIFY -> HEALTH RESULT").
@@ -1827,7 +1847,11 @@ function Get-BRAVOBazaFastHealthResult {
         "нерозв'язані audit-drift шляхи: $(@($SyncResult.AuditDriftFiles).Count) файл(ів) — $names"
     } else { $null }
 
-    if ($SyncResult.Status -eq 'MUTATION_AUTO_ARCHIVED') {
+    # #293: MUTATION_AUTO_ARCHIVED — INFO лише коли того самого циклу немає
+    # audit-drift/remote-конфлікту/несумісних імен; інакше вони йдуть далі по
+    # драбині як CRITICAL (авто-архівування — у Info через $mutationSummary).
+    if ($SyncResult.Status -eq 'MUTATION_AUTO_ARCHIVED' -and
+        @($SyncResult.AuditDriftFiles).Count -eq 0 -and @($SyncResult.RemoteConflicts).Count -eq 0 -and @($SyncResult.IncompatibleFiles).Count -eq 0) {
         # Опційне поріг-based авто-архівування (AutoArchiveMutationThreshold
         # > 0, default вимкнено) — НЕ CRITICAL, НЕ "ПОТРІБНА ДІЯ": стара
         # remote-версія перейменована (нічого не втрачено), нову заллє
@@ -2322,6 +2346,7 @@ Export-ModuleMember -Function @(
     'Write-BRAVOBazaRemoteCheckpoint',
     'Update-BRAVOBazaSyncResultNewAfterCutoff',
     'Test-BRAVOBazaSyncResultFresh',
+    'Test-BRAVOBazaSyncStatusSuccess',
     'Get-BRAVOBazaFastHealthResult',
     'Invoke-BRAVOBazaComponentSyncSession',
     'Get-BRAVOBazaMutationReport',
