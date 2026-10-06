@@ -104,14 +104,7 @@ $bypassAllowlist = @(
     # ArgumentsTemplate, що сьогодні буквально в BRAVO.config вище —
     # canonical built-in default того самого self-elevation-опису, а не
     # нове виконуване Bypass-місце.
-    'BRAVO.Configuration.psm1',
-    # VAL-05 (Affected), PR3: локальний runner розробника запускає ДОЧІРНІЙ
-    # вибірковий прогін BRAVO_SELF_TEST.ps1 тим самим ізольованим
-    # powershell.exe з Bypass, що й self-test-фрагменти вище (запит будується
-    # в New-BRAVOAffectedChildRequest і перевіряється Framework/AffectedRunner.*).
-    # Це не точка входу оператора, не елевація і не завдання Планувальника.
-    # Єдине ВИКОНУВАНЕ Bypass-місце, додане цим файлом.
-    'BRAVOAffectedSelfTest.ps1'
+    'BRAVO.Configuration.psm1'
 )
 
 $forbiddenRules = @(

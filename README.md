@@ -894,11 +894,17 @@ Self-test перевіряє синтаксис усіх PowerShell-файлів
 Код завершення — лише `0` або `1` (нової таблиці exit-кодів немає). `0` лише
 коли водночас: клас V1/V2, дочірній процес завершився з кодом 0, надруковано
 рівно один рядок `SELF-TEST PARTIAL: <очікуваний перелік>` і жодного іншого
-рядка з маркером Self-Test. Усе інше — `1`. Останній рядок виводу завжди
+рядка з маркером Self-Test. Маркером вважається будь-який рядок дочірнього
+процесу, що після пробілів починається з `SELF-TEST` у будь-якому регістрі.
+Усе інше — `1`. Останній рядок виводу завжди
 `AFFECTED RESULT: <КОД>`, де код — `PARTIAL-OK`, `ESCALATED-V3`, `CHILD-FAILED`,
 `MARKER-MISMATCH` або статус збирача без змін (`BASE-MISSING`, `BASE-INVALID`,
 `BASE-EQUALS-HEAD`, `EMPTY-DIFF`, `GIT-MISSING`, `GIT-FAILED`,
 `NOT-A-REPOSITORY`, `ROOT-MISMATCH`, `SHALLOW-REPOSITORY`, `NO-MERGE-BASE`).
+Непередбачений виняток у CLI дає `AFFECTED ERROR` і `AFFECTED RESULT: RUNNER-FAILED`.
+Доказом прогону є лише маркер на початку рядка: шлях чи інший текст може
+містити `SELF-TEST PASSED` усередині рядка runner-а, і такий рядок нічого не
+підтверджує.
 Порожня база, збій git і порожній diff — це помилка, а не «нічого запускати».
 
 Вивід runner-а завжди починається з `AFFECTED BASE`, `AFFECTED MERGE-BASE`,

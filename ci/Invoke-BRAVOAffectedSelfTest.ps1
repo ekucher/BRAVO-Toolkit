@@ -27,7 +27,11 @@ try {
     . (Join-Path (Join-Path $PSScriptRoot '..') 'selftest\BRAVOSelfTestSuiteMap.ps1')
     $result = Invoke-BRAVOAffectedSelfTest -RepositoryRoot $repositoryPath -BaseRef $BaseRef
 } catch {
-    Write-Host ('AFFECTED ERROR: ' + $_.Exception.Message)
+    # Повідомлення винятку може містити переводи рядка; друкуємо його одним
+    # рядком, щоб жоден рядок stdout не почався з маркера Self-Test.
+    $errorText = [regex]::Replace([string]$_.Exception.Message, '[\x00-\x1F\x7F-\x9F\u2028\u2029]', ' ')
+    Write-Host ('AFFECTED ERROR: ' + $errorText)
+    Write-Host 'AFFECTED RESULT: RUNNER-FAILED'
     exit 1
 }
 

@@ -41,7 +41,7 @@ function New-BRAVOAffectedChildRequest {
         Будує запит на дочірній вибірковий прогін. Нічого не запускає.
 
         Команда: powershell.exe -NoLogo -NoProfile -NonInteractive
-        -ExecutionPolicy Bypass -EncodedCommand <base64 UTF-16LE>, а тіло -
+        -ExecutionPolicy <Bypass> -EncodedCommand <base64 UTF-16LE>, а тіло -
         & '<корінь>\BRAVO_SELF_TEST.ps1' -NoPause -Suite @('A','B'); exit $LASTEXITCODE
 
         Чому EncodedCommand, а не -File: у -File кома в списку suite
@@ -382,7 +382,7 @@ function Invoke-BRAVOAffectedSelfTest {
     & $emit $classLine
     $suiteText = '(немає)'
     if ($effectiveSuite.Count -gt 0) { $suiteText = [string]::Join(',', $effectiveSuite) }
-    & $emit ('AFFECTED SUITES: ' + $suiteText)
+    & $emit ('AFFECTED SUITES: ' + (& $safe $suiteText))
     & $emit ('AFFECTED PATHS: ' + $changed.Count + ' (видалено: ' + $deleted.Count + ')')
     if ($planError.Length -gt 0) {
         & $emit ('AFFECTED ERROR: план не є придатним для запуску: ' + (& $safe $planError))
@@ -486,15 +486,18 @@ function Invoke-BRAVOAffectedSelfTest {
         foreach ($physical in [regex]::Split([string]$element, '\r\n|\n|\r')) {
             $text = [string]$physical
             if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
-            if ([regex]::IsMatch($text, '^SELF-TEST')) {
+            # Маркером вважається будь-який рядок, що після пробілів починається з
+            # SELF-TEST у будь-якому регістрі: інакше "  self-test passed" пройшов би
+            # як шум. PARTIAL зараховується лише в точній канонічній формі.
+            if ([regex]::IsMatch($text, '(?i)^\s*SELF-TEST')) {
                 $partial = [regex]::Match($text, '^SELF-TEST PARTIAL: ([A-Za-z]+(,[A-Za-z]+)*)\z')
                 if ($partial.Success) {
                     [void]$partialList.Add($partial.Groups[1].Value)
                     & $emit ('AFFECTED CHILD MARKER: PARTIAL ' + $partial.Groups[1].Value)
                 } else {
-                    $kind = [regex]::Match($text, '^SELF-TEST ([A-Z]{1,16})\b')
+                    $kind = [regex]::Match($text, '(?i)^\s*SELF-TEST ([A-Z]{1,16})\b')
                     $kindText = 'OTHER'
-                    if ($kind.Success) { $kindText = $kind.Groups[1].Value }
+                    if ($kind.Success) { $kindText = $kind.Groups[1].Value.ToUpperInvariant() }
                     $otherMarkers++
                     & $emit ('AFFECTED CHILD MARKER: UNEXPECTED (' + $kindText + ')')
                 }

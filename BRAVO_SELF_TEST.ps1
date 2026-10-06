@@ -31854,6 +31854,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
             $arTwoPartial = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('SELF-TEST PARTIAL: Governance,Paths', 'SELF-TEST PARTIAL: Governance,Paths') } }
             $arNoMarker = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('nothing useful') } }
             $arPartialAndPassed = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('SELF-TEST PARTIAL: Governance,Paths', 'SELF-TEST PASSED') } }
+            $arLoosePassed = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('SELF-TEST PARTIAL: Governance,Paths', '  self-test passed') } }
             $arFailedWithMarker = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 2; Lines = @('SELF-TEST PARTIAL: Governance,Paths') } }
             Test-BRAVOCondition `
                 -Condition (
@@ -31866,10 +31867,11 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
                 -Condition (
                     $arPassed.ExitCode -eq 1 -and $arPassed.ResultCode -ceq 'MARKER-MISMATCH' -and @(& $arSelfTestLine $arPassed).Count -eq 0 -and
                     (& $arAny $arPassed 'AFFECTED CHILD MARKER: UNEXPECTED (PASSED)') -and
-                    $arPartialAndPassed.ExitCode -eq 1 -and $arPartialAndPassed.ResultCode -ceq 'MARKER-MISMATCH' -and @(& $arSelfTestLine $arPartialAndPassed).Count -eq 0
+                    $arPartialAndPassed.ExitCode -eq 1 -and $arPartialAndPassed.ResultCode -ceq 'MARKER-MISMATCH' -and @(& $arSelfTestLine $arPartialAndPassed).Count -eq 0 -and
+                    $arLoosePassed.ExitCode -eq 1 -and $arLoosePassed.ResultCode -ceq 'MARKER-MISMATCH' -and (& $arAny $arLoosePassed 'AFFECTED CHILD MARKER: UNEXPECTED (PASSED)')
                 ) `
                 -Name "Framework/AffectedRunner.ChildPassedMarkerIsMismatch" `
-                -Failure "R7: код 0, але дочірній прогін надрукував маркер повного прогону (окремо або поряд із PARTIAL) -> код 1 і MARKER-MISMATCH; сирого маркера у stdout runner-а немає"
+                -Failure "R7: код 0, але дочірній прогін надрукував маркер повного прогону (окремо, поряд із PARTIAL або з пробілами й в іншому регістрі) -> код 1 і MARKER-MISMATCH; сирого маркера у stdout runner-а немає"
             Test-BRAVOCondition `
                 -Condition (
                     $arWrongList.ExitCode -eq 1 -and $arWrongList.ResultCode -ceq 'MARKER-MISMATCH' -and

@@ -12,7 +12,8 @@
   §13.3, умовні gate-и, зокрема Config parity за рішенням `Test-BRAVOConfigParityRelevantPath`, незалежне
   рев'ю, невідомі шляхи з причинами) і завершується з `ESCALATED-V3` та кодом 1. Код 0 лише за коду 0
   дочірнього прогону, рівно одного рядка `SELF-TEST PARTIAL: <очікуваний перелік>` і жодного іншого рядка з
-  маркером Self-Test; інакше `CHILD-FAILED` чи `MARKER-MISMATCH`. Будь-який статус збирача (`BASE-MISSING`,
+  маркером Self-Test (маркер — рядок, що після пробілів починається з `SELF-TEST` у будь-якому регістрі);
+  інакше `CHILD-FAILED` чи `MARKER-MISMATCH`; непередбачений виняток CLI — `RUNNER-FAILED`. Будь-який статус збирача (`BASE-MISSING`,
   `BASE-INVALID`, `BASE-EQUALS-HEAD`, `EMPTY-DIFF`, `GIT-MISSING`, `GIT-FAILED`, `NOT-A-REPOSITORY`,
   `ROOT-MISMATCH`, `SHALLOW-REPOSITORY`, `NO-MERGE-BASE`) проходить без змін, план не обчислюється, дочірній
   процес не запускається. Рядки дочірнього процесу друкуються з префіксом `child| `, маркери Self-Test -
