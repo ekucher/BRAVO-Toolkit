@@ -2,6 +2,18 @@
 
 ## Не випущено (developer)
 
+- **Fix: Credentials: FatalError SYSTEM-worker-а до запису у сховище теж відкочує поточне сховище (#302).**
+  Детермінований тригер з #302 (worker під SYSTEM падає ще на завантаженні конфігурації, напр. через
+  `BRAVO_ALLOW_WEAKENED_SECURITY` лише в сесії оператора) повертав `FatalError` після `Run` і йшов шляхом
+  «невизначено» без відкоту. Тепер worker пише в `result.json` поле `OperationsStarted`: `$false`, якщо збій стався
+  до першої операції зі сховищем (конфігурація, модулі, читання чи дешифрування payload), і `$true`, щойно почалась
+  транзакція сховища. `New-SystemWorkerFatalError` позначає виняток «не розпочато» лише за булевим `$false`;
+  відсутнє поле (старий worker) чи інше значення лишається невизначеним станом, як і раніше. Коди завершення не
+  змінено. Тести: `Credentials/SystemWorkerFatalBeforeOperationsIsNotStarted`,
+  `Credentials/SystemWorkerFatalAfterOperationsStaysIndeterminate`, `Credentials/ProtectedPayloadWorkerReportsOperationsStarted`,
+  `Credentials/WorkerModeFailureReportsOperationsStartedFromEntryFlag`; guard
+  `Credentials/SystemWorkerNotStartedMarkerOnlyBeforeTaskLaunch` допускає один маркер у `New-SystemWorkerFatalError`
+  лише під умовою булевого `OperationsStarted`.
 - **Fix: Credentials: виняток SYSTEM-кроку відкочує сховище поточного користувача (#302).**
   `Restore-CredentialOperationSnapshots` запускався лише за рядками результату зі `Status=Error`. Якщо
   `Invoke-AsSystem` кидав виняток (таймаут worker-а, `FatalError`, збій Task Scheduler), блок мав лише `finally`

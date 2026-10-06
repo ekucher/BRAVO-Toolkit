@@ -1296,6 +1296,25 @@ function Test-SystemWorkerNotStartedError {
     return $false
 }
 
+# #302 (follow-up): FatalError worker-а після Run. Worker повідомляє
+# OperationsStarted = $false лише тоді, коли впав ДО першої операції зі
+# сховищем (конфігурація, модулі, читання payload): SYSTEM-сховище не
+# змінено, тож виняток позначається «не розпочато» і поточне сховище
+# відкочується. Відсутнє поле (старий worker) або будь-що, крім булевого
+# $false, = невизначений стан (fail-safe). Self-test перевіряє цю умову.
+function New-SystemWorkerFatalError {
+    param([object]$WorkerResponse)
+
+    $fatalError = New-Object System.Management.Automation.RuntimeException ([string]$WorkerResponse.FatalError)
+    $operationsStartedProperty = $WorkerResponse.PSObject.Properties['OperationsStarted']
+    if ($null -ne $operationsStartedProperty -and
+        $operationsStartedProperty.Value -is [bool] -and
+        -not $operationsStartedProperty.Value) {
+        Add-SystemWorkerNotStartedMarker -Exception $fatalError
+    }
+    return $fatalError
+}
+
 function Invoke-AsSystem {
     param(
         [string]$ResolvedConfigPath,
@@ -1411,7 +1430,7 @@ function Invoke-AsSystem {
         $workerResponse = Read-BRAVOTextFile -Path $workerResultPath |
             ConvertFrom-BRAVOJson
         if ($workerResponse.FatalError) {
-            throw [string]$workerResponse.FatalError
+            throw (New-SystemWorkerFatalError -WorkerResponse $workerResponse)
         }
         return @($workerResponse.Results)
     } finally {
@@ -1437,10 +1456,13 @@ function Invoke-ProtectedPayloadWorker {
         [string]$WorkerResultPath
     )
 
+    $script:BRAVOCredentialWorkerEntered = $true
     $response = @{
         Identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         Results = @()
         FatalError = $null
+        # #302: $true з моменту, коли може початись запис у сховище.
+        OperationsStarted = $false
     }
     try {
         $payload = Read-BRAVOTextFile -Path $PayloadPath |
@@ -1458,6 +1480,7 @@ function Invoke-ProtectedPayloadWorker {
                 SecureSecret = $secureSecret
             }
         })
+        $response.OperationsStarted = $true
         $response.Results = @(
             Invoke-CredentialOperationsTransactional `
                 -Operation ([string]$payload.Action) `
@@ -1815,6 +1838,9 @@ try {
                 Identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
                 Results = @()
                 FatalError = $_.Exception.Message
+                # #302: до входу в Invoke-ProtectedPayloadWorker операцій зі
+                # сховищем не було; після входу — невизначено ($true).
+                OperationsStarted = [bool](Get-Variable -Name BRAVOCredentialWorkerEntered -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
             } | ConvertTo-BRAVOJson -Depth 4
             $temporaryFailurePath = "$ResultPath.tmp"
             [IO.File]::WriteAllText($temporaryFailurePath, $failureResponse, [Text.Encoding]::UTF8)
