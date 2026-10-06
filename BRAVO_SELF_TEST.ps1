@@ -19726,7 +19726,15 @@ try {
                 # Ordinal-перевірка першого символу: культурна StartsWith
                 # ігнорує U+FEFF (ignorable) і дала б true для будь-якого рядка.
                 $hasBomPrefix = $Secret.Length -gt 0 -and $Secret[0] -eq [char]0xFEFF
-                $opened = if ($leaf -like 'legacy*') { $hasBomPrefix } else { -not $hasBomPrefix }
+                # #300: legacy-архів, на якому друга (BOM) спроба не завершує
+                # перевірку (таймаут) — перша дає password-failure з кодом 2.
+                if ($leaf -like 'fallbacktimeout*' -and $hasBomPrefix) {
+                    return New-Object PSObject -Property @{
+                        Success = $false; ExitCode = $null; Description = 'перевищено час очікування'; TimedOut = $true
+                        StandardOutput = ''; StandardError = ''; Error = $null
+                    }
+                }
+                $opened = if ($leaf -like 'legacy*') { $hasBomPrefix } elseif ($leaf -like 'fallbacktimeout*') { $false } else { -not $hasBomPrefix }
                 if ($opened) {
                     return New-Object PSObject -Property @{
                         Success = $true; ExitCode = 0; Description = 'OK'; TimedOut = $false
@@ -19786,6 +19794,42 @@ try {
             -Condition ($t006FallbackWarnings.Count -gt 0 -and -not ($t006FallbackWarnings[0].Message -match '5\.2\.0 під UTF-8|до 5\.2\.0')) `
             -Name "LegacyBomFallback/WarningDoesNotClaimPre520Only" `
             -Failure "Текст попередження має існувати й не стверджувати, що такі архіви створені лише версіями до 5.2.0 (BOM-префікс давали й 5.2.x): $(@($t006FallbackWarnings | ForEach-Object { $_.Message }) -join ' | ')"
+
+        # #300: друга (legacy BOM) спроба не завершила перевірку (таймаут) —
+        # повертається перша спроба з кодом 2, але результат позначено як
+        # незавершену перевірку, і retention-класифікація НЕ вважає його
+        # доведеним пошкодженням архіву (fail-closed).
+        $t006FallbackTimeoutPath = Join-Path ([IO.Path]::GetTempPath()) 'fallbacktimeout_MODEL.7z'
+        $t006FallbackTimeoutResult = Invoke-BRAVOSevenZipIntegrityTest `
+            -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackTimeoutPath -Password $t006Secret -TimeoutSeconds 5
+        $t006WrongLegacyResult = Invoke-BRAVOSevenZipIntegrityTest `
+            -SevenZipPath 'stub-7za' -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'normal_WRONG.7z') -Password ([char]0xFEFF + $t006Secret) -TimeoutSeconds 5
+        $t006FallbackTimeoutInfo = @{}
+        $t006FallbackTimeoutEntries = New-Object System.Collections.Generic.List[object]
+        $t006FallbackTimeoutLogger = & { param($t006FallbackTimeoutEntries) { param($Message, $Level) $t006FallbackTimeoutEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006FallbackTimeoutEntries
+        $t006FallbackTimeoutHelper = Test-SevenZipArchiveIntegrity `
+            -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackTimeoutPath -Password $t006Secret `
+            -Logger $t006FallbackTimeoutLogger -ArchiveFailureLevel 'WARNING' -FailureInfo $t006FallbackTimeoutInfo
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$t006FallbackTimeoutResult.Success -and
+                $null -ne $t006FallbackTimeoutResult.PSObject.Properties['FallbackAttemptOperationalFailure'] -and
+                [bool]$t006FallbackTimeoutResult.FallbackAttemptOperationalFailure -and
+                -not [bool]$t006FallbackTimeoutHelper -and
+                $t006FallbackTimeoutInfo.ContainsKey('ArchiveSpecific') -and
+                -not [bool]$t006FallbackTimeoutInfo['ArchiveSpecific'] -and
+                @($t006FallbackTimeoutEntries | Where-Object { $_.Level -eq 'ERROR' }).Count -ge 1
+            ) `
+            -Name "LegacyBomFallback/FallbackAttemptTimeoutIsNotArchiveSpecific" `
+            -Failure "таймаут другої (legacy BOM) спроби має позначати результат FallbackAttemptOperationalFailure і не класифікуватись як archive-specific (рядок лишається ERROR); success=$($t006FallbackTimeoutResult.Success), marker=$($t006FallbackTimeoutResult.PSObject.Properties['FallbackAttemptOperationalFailure']), archiveSpecific=$($t006FallbackTimeoutInfo['ArchiveSpecific'])"
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$t006WrongLegacyResult.Success -and
+                (($null -eq $t006WrongLegacyResult.PSObject.Properties['FallbackAttemptOperationalFailure']) -or
+                 -not [bool]$t006WrongLegacyResult.FallbackAttemptOperationalFailure)
+            ) `
+            -Name "LegacyBomFallback/CompletedFallbackFailureIsNotOperational" `
+            -Failure "якщо обидві спроби завершили перевірку з кодом 2, результат не має позначатися як незавершена перевірка; marker=$($t006WrongLegacyResult.PSObject.Properties['FallbackAttemptOperationalFailure'])"
 
         $t006NormalEntries = New-Object System.Collections.Generic.List[object]
         $t006NormalLogger = & { param($t006NormalEntries) { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006NormalEntries
@@ -21836,6 +21880,15 @@ function Get-BRAVOMaintenanceSummaryResult {
                     StandardOutput = ''; StandardError = ''
                 }
             }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-LOCALIZED-ACCESS-DENIED') {
+                # #300: код 2 з локалізованим системним текстом (не англійська
+                # Windows) і без власних повідомлень 7-Zip про вміст архіву.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = ('ERROR: ' + [char]0x0412 + [char]0x0456 + [char]0x0434 + [char]0x043C + [char]0x043E + [char]0x0432 + [char]0x043B + [char]0x0435 + [char]0x043D + [char]0x043E + ' ' + [char]0x0432 + ' ' + [char]0x0434 + [char]0x043E + [char]0x0441 + [char]0x0442 + [char]0x0443 + [char]0x043F + [char]0x0456 + '.')
+                }
+            }
             if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT') {
                 return New-Object PSObject -Property @{
                     Success = $false; ExitCode = $null
@@ -22035,6 +22088,44 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags" `
         -Failure ("збій виконання 7z t (не archive-specific: таймаут) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorTimeout.Critical, $retentionFollowupValidatorTimeout.RestoreFailed, $retentionFollowupValidatorTimeout.Threw, $retentionFollowupValidatorTimeout.Log)
+
+    # (e) #300 (Codex 386-C4): код 2 з локалізованим текстом відмови доступу
+    # без власних повідомлень 7-Zip про вміст — збій виконання, не доказ
+    # пошкодження: навіть на старій сесії це ERROR і прапорці.
+    $retentionFollowupLocalizedDenied = & $retentionFollowupRunScenario 'LocalizedAccessDenied' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-LOCALIZED-ACCESS-DENIED'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2')
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupLocalizedDenied -and
+            $null -eq $retentionFollowupLocalizedDenied.Threw -and
+            $retentionFollowupLocalizedDenied.Critical -and
+            $retentionFollowupLocalizedDenied.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupLocalizedDenied.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100')
+        ) `
+        -Name "Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags" `
+        -Failure ("код 2 без власних повідомлень 7-Zip про вміст (локалізована відмова доступу) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupLocalizedDenied.Critical, $retentionFollowupLocalizedDenied.RestoreFailed, $retentionFollowupLocalizedDenied.Threw, $retentionFollowupLocalizedDenied.Log)
+
+    # (f) #300 (data-integrity F2): найновіша сесія непридатна лише через
+    # відсутній .sha512, друга — зламана (7z t). Друга новіша за БУДЬ-ЯКУ
+    # підтверджену точку відновлення, тож її збій критичний, а не WARNING.
+    $retentionFollowupNewestUnhashed = & $retentionFollowupRunScenario 'NewestUnhashed' @(
+        (& $retentionFollowupSession '20260101_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260102_0100' $retentionFollowupBroken),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-unhashed' $false $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupNewestUnhashed -and
+            $null -eq $retentionFollowupNewestUnhashed.Threw -and
+            $retentionFollowupNewestUnhashed.Critical -and
+            $retentionFollowupNewestUnhashed.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupNewestUnhashed.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260102_0100')
+        ) `
+        -Name "Maintenance/RetentionBrokenNewerThanAnyValidPointSetsFailureFlags" `
+        -Failure ("збій 7z t сесії, новішої за всі підтверджені точки відновлення (найновіша непридатна лише через hash), має бути критичним; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupNewestUnhashed.Critical, $retentionFollowupNewestUnhashed.RestoreFailed, $retentionFollowupNewestUnhashed.Threw, $retentionFollowupNewestUnhashed.Log)
 
     # ================================================================
     # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)

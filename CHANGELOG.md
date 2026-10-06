@@ -21,6 +21,15 @@
   `Maintenance/RetentionOldBrokenArchiveLogsWarningNotError`, `Maintenance/RetentionNewestBrokenRestorePointSetsFailureFlags`,
   `Maintenance/RetentionAllRestorePointsBrokenSetsFailureFlags`, `Maintenance/RetentionNoValidRestorePointLeftSetsFailureFlags`,
   `Maintenance/RetentionOldArchiveValidatorMissingSetsFailureFlags`, `Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags`.
+  Уточнення межі: warning-only отримує лише сесія, старша за вже підтверджену придатну точку відновлення (обхід від
+  найновішої), тож збій сесії, новішої за всі придатні (зокрема коли найновіша непридатна лише через `.sha512`), критичний.
+  Код 1/2 вважається archive-specific лише за власними (нелокалізованими) повідомленнями 7-Zip про вміст архіву
+  (`Data Error`, `CRC Failed`, `Wrong password`, `Can not open the file as archive` тощо); локалізована відмова доступу
+  чи зайнятий файл без них — збій виконання (код 41). Якщо в legacy BOM-fallback друга спроба не завершила перевірку
+  (таймаут, помилка запуску, інший код), `Invoke-BRAVOSevenZipIntegrityTest` позначає це `FallbackAttemptOperationalFailure`,
+  і збій не вважається archive-specific. Регресія: `Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags`,
+  `Maintenance/RetentionBrokenNewerThanAnyValidPointSetsFailureFlags`, `LegacyBomFallback/FallbackAttemptTimeoutIsNotArchiveSpecific`,
+  `LegacyBomFallback/CompletedFallbackFailureIsNotOperational`.
 - **Fix: Archive: status-файл оновлюється і при ранніх виходах (#291).**
   `BRAVO_STATUS_Archive.json` писався лише у хвості `Main` і у fatal catch. Провал preflight вільного
   місця (exit 40), провал очищення orphan VSS (exit 40) і `exit` усередині `Test-Compatibility`

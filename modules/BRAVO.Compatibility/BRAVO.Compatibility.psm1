@@ -1954,6 +1954,19 @@ function Invoke-BRAVOSevenZipIntegrityTest {
     }
     # Обидві спроби невдалі — повертаємо ПЕРШУ (нормальний пароль) як
     # основну причину відмови, не приховуючи її fallback-спробою.
+    # #300: але якщо друга спроба не ЗАВЕРШИЛА перевірку (таймаут, помилка
+    # запуску, код поза 1/2), це позначається, щоб споживачі не вважали
+    # результат доведеним пошкодженням архіву.
+    $secondProperties = $secondAttempt.PSObject.Properties
+    $secondTimedOut = ($null -ne $secondProperties['TimedOut'] -and [bool]$secondAttempt.TimedOut)
+    $secondErrorText = if ($null -ne $secondProperties['Error']) { [string]$secondAttempt.Error } else { '' }
+    $secondOperationalFailure = (
+        $secondTimedOut -or
+        -not [string]::IsNullOrWhiteSpace($secondErrorText) -or
+        $null -eq $secondAttempt.ExitCode -or
+        -not (@(1, 2) -contains [int]$secondAttempt.ExitCode)
+    )
+    $firstAttempt | Add-Member -MemberType NoteProperty -Name FallbackAttemptOperationalFailure -Value ([bool]$secondOperationalFailure) -Force
     return $firstAttempt
 }
 

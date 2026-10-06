@@ -6877,17 +6877,19 @@ function Remove-OldRestoreArchives {
     # До ліміту версій зараховуються лише сесії, що мають хоча б один
     # повністю перевірений архів. Неповна нова сесія не повинна витіснити
     # стару придатну точку відновлення.
-    # #300: найновіша сесія — за тим самим порядком, що й retention нижче
-    # (Name = мітка часу yyyyMMdd_HHmm, за спаданням). Лише СТАРІШІ сесії
-    # перевіряються з -NoFailureFlags; збій 7z t найновішої точки
-    # відновлення лишається критичним (exit 41), як до #300.
-    $newestGroupName = [string](@($archiveGroups | Sort-Object Name -Descending | Select-Object -First 1)[0].Name)
+    # #300: сесії обходяться від найновішої (Name = мітка часу
+    # yyyyMMdd_HHmm, той самий порядок, що й retention нижче). -NoFailureFlags
+    # отримує лише сесія, СТАРША за вже підтверджену придатну точку
+    # відновлення: збій 7z t найновішої сесії або будь-якої сесії, новішої
+    # за всі придатні (зокрема коли найновіша непридатна лише через hash),
+    # лишається критичним (exit 41), як до #300.
     $sevenZipIntegrityFailureSeen = $false
+    $validRestorePointNewerSeen = $false
     $validGroups = @()
     $invalidGroups = @()
-    foreach ($group in $archiveGroups) {
+    foreach ($group in @($archiveGroups | Sort-Object Name -Descending)) {
         $validArchiveCount = 0
-        $isOlderGroup = ([string]$group.Name -cne $newestGroupName)
+        $isOlderGroup = $validRestorePointNewerSeen
         foreach ($archive in @($group.Group)) {
             $hashPath = "$($archive.FullName).sha512"
             $archiveValid = $false
@@ -6923,6 +6925,7 @@ function Remove-OldRestoreArchives {
 
         if ($validArchiveCount -gt 0) {
             $validGroups += $group
+            $validRestorePointNewerSeen = $true
         } else {
             $invalidGroups += $group
         }

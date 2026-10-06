@@ -213,8 +213,27 @@ function Test-SevenZipArchiveIntegrity {
         $null -ne $testResult.ExitCode -and
         (@(1, 2) -contains [int]$testResult.ExitCode)
     )
+    # Код 1/2 сам по собі неоднозначний: 7-Zip повертає 2 і для пошкодженого
+    # архіву, і для відмови доступу/зайнятого файлу, а текст системних помилок
+    # Windows локалізований. Тому archive-specific лише за ПОЗИТИВНОЇ ознаки —
+    # власних (нелокалізованих) повідомлень 7-Zip про вміст архіву; без неї
+    # збій вважається збоєм виконання (fail-closed).
+    # Власні повідомлення 7-Zip (англійською незалежно від мови Windows) про
+    # пошкоджений/нечитабельний вміст архіву. Локальна змінна, не script
+    # scope: функцію виконують і поза модулем (AST-витяг у self-test).
+    $archiveContentFailurePattern = '(?i)Data Error|CRC Failed|Headers Error|Unexpected end of (archive|data)|Can ?not open (the )?file as|is not archive|Wrong password|Unsupported (Method|feature)|Unconfirmed start of archive|There are data after the end of archive'
+    $failureOutputText = "$($testResult.StandardError)`n$($testResult.StandardOutput)"
     if ($archiveSpecificFailure -and
-        ("$($testResult.StandardError)`n$($testResult.StandardOutput)" -match 'Access is denied|being used by another process')) {
+        ($failureOutputText -notmatch $archiveContentFailurePattern -or
+         $failureOutputText -match 'Access is denied|being used by another process')) {
+        $archiveSpecificFailure = $false
+    }
+    # Legacy BOM-fallback: якщо друга спроба (правильний legacy-пароль)
+    # завершилась збоєм ВИКОНАННЯ (таймаут, помилка запуску), повертається
+    # перша спроба з кодом 2, хоча перевірку фактично не завершено.
+    if ($archiveSpecificFailure -and
+        $null -ne $resultProperties['FallbackAttemptOperationalFailure'] -and
+        [bool]$testResult.FallbackAttemptOperationalFailure) {
         $archiveSpecificFailure = $false
     }
     if ($null -ne $FailureInfo) {
