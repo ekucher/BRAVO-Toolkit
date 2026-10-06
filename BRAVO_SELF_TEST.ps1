@@ -11467,7 +11467,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             # Ворота реставрації й каталог архівів пропускають Disabled-випадок.
             Test-BRAVOCondition `
                 -Condition (
-                    $RuntimeText.Contains('if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @(''Stopped'', ''Paused'')) {') -and
+                    $RuntimeText.Contains('$bravoFilePhaseAllowed = (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @(''Stopped'', ''Paused''))') -and
+                    $RuntimeText.Contains('if ($bravoFilePhaseAllowed) {') -and
                     $RuntimeText.Contains('$bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {') -and
                     $RuntimeText -match '(?s)\} elseif \(\$restoreOnDisabledBravo\) \{[^}]{0,400}\$dirsToCreate \+= \$ARC_DIR' -and
                     $RuntimeText.Contains('elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {')
