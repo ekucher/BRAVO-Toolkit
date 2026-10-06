@@ -2,6 +2,22 @@
 
 ## Не випущено (developer)
 
+- **Fix: Archive: оцінка місця за розміром джерела враховує метадані кожного файлу (#279).**
+  Для компонента без валідної історії `Get-BRAVOArchiveEstimatedSpaceRequirement` рахував лише
+  `sourceBytes * 1.02`, і коментарі називали це доведеною верхньою межею. Але 7-Zip зберігає для кожного
+  запису заголовок, ім'я та метадані, які не обмежені 2%: багато дрібних файлів або довгі шляхи давали
+  архів більший за оцінку, і політика `ArchivePeakSafe` могла дозволити backup нижче
+  `MinimumFreeSpaceGB`. Тепер до оцінки додається `fileCount * PerFileOverheadBytes` (256 B на файл,
+  свідомо консервативно) та сума `2 * довжина відносного імені + 2` по файлах; кількість файлів і довжини
+  імен беруться з того самого проходу, що міряє `sourceBytes`. Та сама оцінка слугує стелею для
+  history-оцінки; сама history-оцінка (за розміром реальних попередніх архівів) не змінена. Коментарі
+  тепер називають її консервативною оцінкою з урахуванням per-file метаданих, а не доведеною межею.
+  Додано поля `SourceFileCount` і `SourceMetadataBytes`, наявні поля не змінено; `MinimumFreeSpaceGB`,
+  коди завершення і логіка `ArchivePeakSafe` не змінені. Тести:
+  `Archive/EstimatedSpaceCountsPerFileMetadataForManySmallFiles`,
+  `Archive/EstimatedSpaceSingleLargeFileNotPenalised`; очікувані значення наявних bootstrap/cap-тестів
+  оновлено (+280 B за один файл `payload.bin`).
+
 - **Fix: Archive: status-файл оновлюється і при ранніх виходах (#291).**
   `BRAVO_STATUS_Archive.json` писався лише у хвості `Main` і у fatal catch. Провал preflight вільного
   місця (exit 40), провал очищення orphan VSS (exit 40) і `exit` усередині `Test-Compatibility`
