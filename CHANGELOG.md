@@ -30,6 +30,17 @@
   і збій не вважається archive-specific. Регресія: `Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags`,
   `Maintenance/RetentionBrokenNewerThanAnyValidPointSetsFailureFlags`, `LegacyBomFallback/FallbackAttemptTimeoutIsNotArchiveSpecific`,
   `LegacyBomFallback/CompletedFallbackFailureIsNotOperational`.
+- **Fix: Archive: таймаут перевірки SFTP повертає `$false` і звільняє lock WinSCP (#290).**
+  `Test-SFTPConnection` після таймауту вбивала WinSCP і кидала виняток раніше, ніж `Complete-BRAVOProcessOutputCapture`
+  звільняла lock `BRAVO_WINSCP`. Викликачі (ручний `-SyncBAZA` і `Main`) не мають `try`, тому прогін завершувався
+  кодом 90 замість шляху «SFTP недоступний», а lock лишався захопленим. Тепер при таймауті ресурси звільняються
+  (збій звільнення логується WARNING), в журнал пишеться ERROR з описом таймауту, функція повертає `$false`,
+  і діє наявна обробка збою SFTP з кодом 50. Значення кодів завершення не змінено. Регресія:
+  `Archive/SftpConnectionTimeoutReturnsFalse`, `Archive/SftpConnectionTimeoutReleasesWinSCPLock`,
+  `Archive/SftpConnectionTimeoutLogsError`. Lock звільняється лише після підтвердженого завершення WinSCP; якщо
+  процес не завершився, lock лишається (capture з lock-потоком зберігається в script scope до завершення процесу BRAVO,
+  щоб GC не звільнив lock), а прогін іде фатальним шляхом, щоб не запустити другий WinSCP паралельно
+  (`Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive`).
 - **Fix: Credentials: виняток SYSTEM-кроку відкочує сховище поточного користувача (#302).**
   `Restore-CredentialOperationSnapshots` запускався лише за рядками результату зі `Status=Error`. Якщо
   `Invoke-AsSystem` кидав виняток (таймаут worker-а, `FatalError`, збій Task Scheduler), блок мав лише `finally`
