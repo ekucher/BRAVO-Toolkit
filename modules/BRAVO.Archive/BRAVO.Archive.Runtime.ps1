@@ -6147,6 +6147,17 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
             } elseif ($archive.PSObject.Properties.Match('Source').Count -gt 0) {
                 $sourcePath = [string]$archive.Source
             }
+            # #284: production-джерело має форму "<SRC>\*"
+            # (BRAVO.Configuration.Derivation: Join-Path <SOURCE> "*") — так
+            # 7-Zip бере ВМІСТ каталогу. -LiteralPath шукав би файл з іменем
+            # "*" і ніколи не виміряв би джерело, тож межу рахуємо по самому
+            # каталогу. Знімається лише завершальний "*" після роздільника;
+            # роздільник лишається, щоб корінь тому ("D:\*" -> "D:\") не
+            # перетворився на відносний "D:".
+            if (-not [string]::IsNullOrWhiteSpace($sourcePath) -and
+                ($sourcePath.EndsWith('\*') -or $sourcePath.EndsWith('/*'))) {
+                $sourcePath = $sourcePath.Substring(0, $sourcePath.Length - 1)
+            }
             if (-not [string]::IsNullOrWhiteSpace($sourcePath)) {
                 try {
                     if (Test-Path -LiteralPath $sourcePath) {
