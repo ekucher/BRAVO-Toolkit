@@ -19,6 +19,30 @@
   авто-архівування лишається в Info. Fast Health повертає INFO лише коли цих списків немає. Регресія:
   `BazaSync/AutoArchivedDoesNotMaskRemoteConflictInFastHealth`,
   `BazaSync/AutoArchiveWithSameCycleRemoteConflictIsNotAutoArchivedStatus`.
+- **Fix: Archive: status-файл оновлюється і при ранніх виходах (#291).**
+  `BRAVO_STATUS_Archive.json` писався лише у хвості `Main` і у fatal catch. Провал preflight вільного
+  місця (exit 40), провал очищення orphan VSS (exit 40) і `exit` усередині `Test-Compatibility`
+  (непідтримувана ОС — 30, заблокована цілісність інструментів — 32) лишали статус попереднього
+  прогону: після вчорашнього успіху моніторинг далі бачив OK з exit 0, хоча кожна ніч завершувалась
+  помилкою. Тепер запис іде через один fail-soft helper `Write-BRAVOArchiveOperationStatus` (хвіст
+  `Main` і всі ці виходи); у деталях раннього виходу — `earlyTermination` і `earlyExitReason`. Збій
+  запису, як і раніше, лише логується і не змінює код завершення. Lock busy (exit 20) статус навмисно
+  не пише: lock тримає інший екземпляр, і запис перезаписав би статус прогону, що ще триває;
+  catch-up skip, як і раніше, лишає статус останнього справжнього прогону. Регресія:
+  `Archive/OrchestrationFreeSpacePreflightFailureWritesStatus`,
+  `Archive/OrchestrationOrphanVssCleanupFailureWritesStatus`, `Archive/OrchestrationLockBusyDoesNotWriteStatus`
+  в orchestration-пробі, `Archive/CompatibilityExitsWriteStatusBeforeExit` (AST) і
+  `Status/CallSiteAfterExitCode[ArchiveTail]`; контракт `Status/CallSiteIsFailSoft[Archive]` тепер
+  перевіряє helper.
+- **Fix: DataRestore: пропущені під час автовибору generation manifest-и тепер дають WARNING (#294).**
+  Будь-який manifest, пропущений fail-closed під час автовибору (нечитабельний або не проходить перевірку
+  ідентичності), як і раніше не використовується, але тепер кожен такий пропуск рахується як попередження: код
+  завершення 10 замість 0, короткий рядок у фінальному сповіщенні WARNING (повний текст у журналі). Це
+  стосується й старих пошкоджених manifest-ів, як і в контракті BRAVO_RESTORE_TEST. Для Source=SFTP
+  `Invoke-BRAVODataRestoreSftpManifestFetch` повертає `SkippedManifests` у тому ж форматі, що canonical
+  `Get-BRAVORestoreGenerationManifest`. Явний `-GenerationId` не змінено. Тести:
+  `DataRestore/SftpManifestAutomaticSelectionReportsSkipped*`, matrix combo
+  `OutOfPlace-MODEL-CorruptNewestManifestSkippedWithWarning`.
 - **Fix: Health: порушення цілісності інструментів дає алерт і при вимкненому SFTP (#296).**
   Блокуючий результат перевірки `TOOLS_MANIFEST.json` (`ShouldBlock`, режим Enforce) раніше ставав Health
   issue лише всередині SFTP-перевірки. На сервері з вимкненим SFTP або при зайнятому WinSCP (перевірку
