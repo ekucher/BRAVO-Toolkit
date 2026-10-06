@@ -2,6 +2,17 @@
 
 ## Не випущено (developer)
 
+- **Fix: Health: проблема локальної копії BAZA без поля `ExitCode` більше не валить Health з кодом 90 (#286).**
+  Поле `ExitCode` є лише в двох robocopy-гілках `Get-BAZALocalSyncHealthIssues`; у решти семи (джерело
+  не визначене/відсутнє/порожнє, локальну копію не знайдено, robocopy не знайдено, таймаут, виняток)
+  його немає, а `Format-CompactLocalIssue` і журнальний рядок у `Invoke-BRAVOHealth` читали
+  `.ExitCode` напряму: під `Set-StrictMode` це виняток ще до Operations-події та Slack/Discord-алерту,
+  Health завершувався з кодом 90 замість 70. Обидва читачі тепер беруть поле через
+  `Get-BRAVOHealthIssueField`. Текст для проблем з `ExitCode` не змінився; без нього компактний рядок
+  не має суфікса `• robocopy:`, а журнал закінчується порожнім `код robocopy: `. Форма об'єктів
+  проблем не змінена. Регресія: секція `Root/Health.LocalSyncIssueWithoutExitCode` у
+  `BRAVO_SELF_TEST.ps1` (реальний producer і споживачі під StrictMode 2.0).
+
 - **Fix: self-test з дефолтним `-ConfigPath` більше не читає `BRAVO.config` хоста як версійну фікстуру (D-1).**
   У `BRAVO_SELF_TEST.ps1` ознака дефолтного шляху тепер перевіряється раніше за наявність файлу: site-конфіг
   у install root мігрованого хосту не підміняє заморожену фікстуру (раніше це давало хибний FAIL
