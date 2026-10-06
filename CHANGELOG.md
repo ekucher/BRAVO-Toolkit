@@ -11,6 +11,16 @@
   не змінились. Перевірку стану служби BRAVO для реставрації й обробки trace тепер обчислено один раз
   (`$bravoFilePhaseAllowed`). Регресія: `Maintenance/MdSizeCheckRunsAfterRestore` в orchestration-пробі.
 
+- **Perf: сценарії оркестрації Maintenance і DataRestore у self-test виконуються в одному дочірньому процесі.**
+  `Maintenance/OrchestrationRunsStepsInContractOrder` (47 сценаріїв) і
+  `DataRestore/OrchestrationInPlaceRunsPhasesInContractOrder` (30 сценаріїв) раніше запускали окремий
+  `powershell.exe` на кожен сценарій. Тепер `probe.ps1` отримує весь список і виконує кожен сценарій у
+  власному дочірньому scope зі свіжим `Import-Module -Force`, власними `runtime.ps1` і `result.json`;
+  глобальні змінні, створені сценарієм, прибираються перед наступним. Сценарій без `result.json`,
+  як і раніше, дає `ProbeError` (fail-closed). Перевірки сценаріїв не змінились. Нові перевірки
+  `Maintenance/OrchestrationScenariosShareOneChildProcess` і
+  `DataRestore/OrchestrationScenariosShareOneChildProcess` підтверджують один PID на всі сценарії та
+  відсутність витоку канарок (локальної й глобальної) між сценаріями. Production-код не змінено.
 - **Fix: self-test: closure-и більше не гублять пізні змінні у великій області self-test (P2-selftest-scope).**
   `BRAVO_SELF_TEST.ps1` піднімає `$MaximumVariableCount` своєї області до 8192 (#163), а динамічний модуль,
   який створює `.GetNewClosure()`, лишається з глобальним лімітом (типово 4096) і мовчки обрізає копію
