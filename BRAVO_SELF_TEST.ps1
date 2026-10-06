@@ -21630,6 +21630,156 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure ("коли після видалення лишається рівно один файл із префіксом, `$remainingFiles.Count не повинен кидати виняток під Set-StrictMode; кинуто: {0}" -f $restoreCleanupRemainingErrorMessage)
 
     # ================================================================
+    # #300: retention (Remove-OldRestoreArchives) лише ОЦІНЮЄ старі архіви.
+    # Зламаний старий архів дає WARNING "не зараховано як точку
+    # відновлення", але НЕ має виставляти critical/restoreIntegrity-
+    # прапорці (інакше кожен нічний прогін завершується кодом 41 через
+    # архів, який ніхто не відновлює). Реальні функції (AST):
+    # Remove-OldRestoreArchives, Test-BRAVOMaintenanceSevenZipArchiveIntegrity,
+    # канонічний Test-SevenZipArchiveIntegrity; застабовано лише процесний
+    # шар 7-Zip (Invoke-BRAVOSevenZipIntegrityTest) — як у Verify-Backup-пробах.
+    # Контроль області дії: ПРЯМИЙ (не retention) виклик обгортки на тому
+    # самому зламаному архіві мусить, як і раніше, виставляти обидва прапорці.
+    # ================================================================
+    $retentionIntegritySourceText = (
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        ) + "`n" +
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1"),
+            [Text.Encoding]::UTF8
+        )
+    )
+    $retentionIntegrityModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $retentionIntegritySourceText `
+        -FunctionNames @(
+            'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
+            'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
+            'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            'Register-BRAVOLegacyBomPasswordFallback'
+        )
+    $retentionIntegrityStubScriptText = {
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO')
+            [void]$script:retentionIntegrityLogLines.Add("[$Level] $Message")
+        }
+        function Get-BRAVOFileHash {
+            param([string]$Path, [string]$Algorithm)
+            return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
+        }
+        function Invoke-BRAVOSevenZipIntegrityTest {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSAvoidUsingPlainTextForPassword', 'Password',
+                Justification = 'Self-test stub: сигнатура справжнього Invoke-BRAVOSevenZipIntegrityTest.')]
+            param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+            $null = $SevenZipPath
+            $null = $Password
+            $null = $TimeoutSeconds
+            if ([IO.File]::ReadAllText($ArchivePath) -ceq 'BRAVO-SELFTEST-BROKEN-ARCHIVE') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'
+                    StandardOutput = ''; StandardError = 'ERROR: Data Error'
+                }
+            }
+            return New-Object PSObject -Property @{
+                Success = $true; ExitCode = 0; Description = 'No error'
+                StandardOutput = 'Everything is Ok'; StandardError = ''
+            }
+        }
+    }.ToString()
+    $retentionIntegrityPrefix = 'RETINTEG'
+    $retentionIntegrityBrokenName = "${retentionIntegrityPrefix}_before_20260101_0100.mdz"
+    $retentionIntegrityRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_RETENTION_INTEGRITY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($retentionIntegrityRoot)
+    $retentionIntegrityOutcome = $null
+    try {
+        # Три сесії; найстаріша (20260101) зламана для 7z t, але SHA512
+        # збігається — тож retention дійде саме до 7z-перевірки.
+        foreach ($sessionTime in @('20260101_0100', '20260102_0100', '20260103_0100')) {
+            $fileName = "${retentionIntegrityPrefix}_before_$sessionTime.mdz"
+            $archivePath = Join-Path $retentionIntegrityRoot $fileName
+            $content = if ($sessionTime -eq '20260101_0100') { 'BRAVO-SELFTEST-BROKEN-ARCHIVE' } else { "synthetic-ok-$sessionTime" }
+            [IO.File]::WriteAllText($archivePath, $content)
+            $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash
+            "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+        }
+        $retentionIntegrityBrokenPath = Join-Path $retentionIntegrityRoot $retentionIntegrityBrokenName
+
+        $retentionIntegrityOutcome = & $retentionIntegrityModule {
+            param($Path, $Prefix, $BrokenPath, $StubScriptText)
+            Set-StrictMode -Version Latest
+            . ([scriptblock]::Create($StubScriptText))
+            $script:retentionIntegrityLogLines = New-Object System.Collections.ArrayList
+            $script:ArchivePrefixRegex = [regex]::Escape($Prefix)
+            $script:ARC_PATH = 'unused-stub-path'
+            $script:ArchivePassword = 'selftest-fixture'
+            $script:SevenZipIntegrityTestTimeoutSeconds = 60
+            $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
+
+            # 1) retention
+            $script:criticalErrorOccurred = $false
+            $script:restoreIntegrityFailed = $false
+            $retentionThrew = $null
+            try {
+                Remove-OldRestoreArchives -Path $Path -ArchivePrefix $Prefix -KeepCount 2 -InvalidRetentionDays 30
+            } catch {
+                $retentionThrew = $_.Exception.Message
+            }
+            $retentionCritical = [bool]$script:criticalErrorOccurred
+            $retentionRestoreFailed = [bool]$script:restoreIntegrityFailed
+            $retentionLog = (@($script:retentionIntegrityLogLines) -join "`n")
+
+            # 2) прямий виклик обгортки (не retention) на зламаному архіві
+            $script:criticalErrorOccurred = $false
+            $script:restoreIntegrityFailed = $false
+            $directResult = Test-BRAVOMaintenanceSevenZipArchiveIntegrity -SevenZipPath 'unused-stub-path' -ArchivePath $BrokenPath
+            [pscustomobject]@{
+                RetentionThrew = $retentionThrew
+                RetentionCritical = $retentionCritical
+                RetentionRestoreFailed = $retentionRestoreFailed
+                RetentionLog = $retentionLog
+                DirectResult = $directResult
+                DirectCritical = [bool]$script:criticalErrorOccurred
+                DirectRestoreFailed = [bool]$script:restoreIntegrityFailed
+            }
+        } $retentionIntegrityRoot $retentionIntegrityPrefix $retentionIntegrityBrokenPath $retentionIntegrityStubScriptText
+    } finally {
+        if (Test-Path -LiteralPath $retentionIntegrityRoot) {
+            Remove-Item -LiteralPath $retentionIntegrityRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $retentionIntegrityWarningPattern = '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ' +
+        [regex]::Escape($retentionIntegrityBrokenName)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionIntegrityOutcome -and
+            $null -eq $retentionIntegrityOutcome.RetentionThrew -and
+            -not $retentionIntegrityOutcome.RetentionCritical -and
+            -not $retentionIntegrityOutcome.RetentionRestoreFailed
+        ) `
+        -Name "Maintenance/RetentionBrokenOldArchiveDoesNotSetFailureFlags" `
+        -Failure ("retention, що лише оцінює зламаний старий архів, не повинен виставляти `$script:criticalErrorOccurred / `$script:restoreIntegrityFailed (інакше кожен прогін = exit 41); critical={0}, restoreIntegrityFailed={1}, threw={2}" -f $retentionIntegrityOutcome.RetentionCritical, $retentionIntegrityOutcome.RetentionRestoreFailed, $retentionIntegrityOutcome.RetentionThrew)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionIntegrityOutcome -and
+            [regex]::IsMatch([string]$retentionIntegrityOutcome.RetentionLog, $retentionIntegrityWarningPattern)
+        ) `
+        -Name "Maintenance/RetentionBrokenOldArchiveStillLogsWarning" `
+        -Failure ("retention має і далі писати WARNING про зламаний архів {0}; журнал: {1}" -f $retentionIntegrityBrokenName, $retentionIntegrityOutcome.RetentionLog)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionIntegrityOutcome -and
+            $retentionIntegrityOutcome.DirectResult -eq $false -and
+            $retentionIntegrityOutcome.DirectCritical -and
+            $retentionIntegrityOutcome.DirectRestoreFailed
+        ) `
+        -Name "Maintenance/DirectIntegrityCheckStillSetsFailureFlags" `
+        -Failure "прямий (не retention) виклик Test-BRAVOMaintenanceSevenZipArchiveIntegrity на зламаному архіві має, як і раніше, повертати `$false і виставляти обидва прапорці"
+
+    # ================================================================
     # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)
     # мусить РЕАЛЬНО перевіряти архів, а не лише писати .sha512 і
     # повертати $true для будь-якого наявного файлу. Реальні функції
