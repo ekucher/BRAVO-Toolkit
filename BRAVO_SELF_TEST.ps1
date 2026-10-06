@@ -21948,6 +21948,10 @@ function Get-BRAVOMaintenanceSummaryResult {
                     StandardOutput = ''; StandardError = 'ERROR: Data Error'
                 }
             }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-THROWS') {
+                # #300: сам валідатор кидає виняток (а не повертає результат).
+                throw 'BRAVO self-test: валідатор 7-Zip кинув виняток'
+            }
             if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-MISSING') {
                 # Форма Invoke-BRAVOSevenZipIntegrityTestCore, коли 7-Zip
                 # не знайдено: виняток до запуску процесу, ExitCode $null.
@@ -22185,6 +22189,24 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags" `
         -Failure ("код 2 без власних повідомлень 7-Zip про вміст (локалізована відмова доступу) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupLocalizedDenied.Critical, $retentionFollowupLocalizedDenied.RestoreFailed, $retentionFollowupLocalizedDenied.Threw, $retentionFollowupLocalizedDenied.Log)
+
+    # (e2) #300 (Claude QA 386-Q2): перевірка 7z t старої сесії кинула
+    # виняток замість результату — перевірку не виконано, це збій виконання:
+    # прапорці виставляються навіть на старій сесії (fail-closed).
+    $retentionFollowupValidatorThrows = & $retentionFollowupRunScenario 'ValidatorThrows' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-VALIDATOR-THROWS'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2')
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupValidatorThrows -and
+            $null -eq $retentionFollowupValidatorThrows.Threw -and
+            $retentionFollowupValidatorThrows.Critical -and
+            $retentionFollowupValidatorThrows.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionValidatorExceptionSetsFailureFlags" `
+        -Failure ("виняток самої перевірки 7z t (а не результат) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorThrows.Critical, $retentionFollowupValidatorThrows.RestoreFailed, $retentionFollowupValidatorThrows.Threw, $retentionFollowupValidatorThrows.Log)
 
     # (f) #300 (data-integrity F2): найновіша сесія непридатна лише через
     # відсутній .sha512, друга — зламана (7z t). Друга новіша за БУДЬ-ЯКУ
