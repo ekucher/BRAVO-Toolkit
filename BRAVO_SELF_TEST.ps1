@@ -11813,8 +11813,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         'Перевірка вільного місця',
         'Створення необхідних директорій',
         'Зупинка служб',
-        'Перевірка розмірів .md',
         'Реставрація моделі',
+        'Перевірка розмірів .md',
         'Обробка trace і логів',
         'Відновлення стану служб',
         'Контроль діапазонів ID'
@@ -11916,7 +11916,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             $maintenanceRestoreGateWindow.Contains("elseif (`$weeklyRestoreQuotaConsumed) { 'цього тижня вже виконано примусову' }")
         ) `
         -Name "Maintenance/RestoreDisabledRendersSkipped" `
-        -Failure "коли реставрація не запланована цього прогону (`$shouldRestore=false), крок 'Реставрація моделі' має рендеритись SKIPPED 'не заплановано на цей запуск', зі своїм номером [5/8]"
+        -Failure "коли реставрація не запланована цього прогону (`$shouldRestore=false), крок 'Реставрація моделі' має рендеритись SKIPPED 'не заплановано на цей запуск', зі своїм номером [4/8]"
 
     $maintenanceSizeCheckGateIndex = $maintenanceScriptTextForManifestStorage.IndexOf('if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {')
     $maintenanceSizeCheckGateWindow = if ($maintenanceSizeCheckGateIndex -ge 0) {
@@ -11933,7 +11933,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             $maintenanceSizeCheckGateWindow.Contains("-Details 'вимкнено'")
         ) `
         -Name "Maintenance/SizeCheckDisabledRendersSkipped" `
-        -Failure "коли перевірку розмірів .md вимкнено, крок 'Перевірка розмірів .md' має рендеритись SKIPPED 'вимкнено', зі своїм номером [4/8]"
+        -Failure "коли перевірку розмірів .md вимкнено, крок 'Перевірка розмірів .md' має рендеритись SKIPPED 'вимкнено', зі своїм номером [5/8]"
 
     $maintenanceLogsGateIndex = $maintenanceScriptTextForManifestStorage.IndexOf('if (-not $script:BRAVOMaintenanceLogsStepEnabled) {')
     $maintenanceLogsGateWindow = if ($maintenanceLogsGateIndex -ge 0) {
