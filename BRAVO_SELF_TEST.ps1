@@ -14328,7 +14328,7 @@ try {
     # Write-BRAVOMaintenanceStep). Зібраний runtime запускається через
     # справжній Invoke-BRAVOMaintenanceEntrypoint (& runtime, $LASTEXITCODE,
     # catch -> 90). Сценарії: щасливий шлях, необроблений виняток у кроці
-    # [4/8] і контрольований збій зупинки служби (код 60). Стаби живуть лише
+    # [5/8] і контрольований збій зупинки служби (код 60). Стаби живуть лише
     # в дочірньому процесі й не можуть просочитися в сесію самотесту;
     # реальні служби не чіпаються. Увесь блок — у ДОЧІРНЬОМУ scope
     # (`& { ... }`): жодна з його змінних не лишається у script-scope цього
@@ -14534,12 +14534,17 @@ function Initialize-BRAVOBackupManifestStorage {
 # Lifecycle-race: інший актор піднімає службу безпосередньо перед обробкою trace.
 function Write-BRAVOProgressPhase {
     param([string]$Phase, [int]$PercentComplete)
+    # Перша фаза після зупинки служб — реставрація (перевірка розмірів .md
+    # тепер іде ПІСЛЯ неї), тож «пізній старт після зупинки» імітується тут.
+    if ($Phase -eq 'Реставрація моделі') {
+        Add-ProbeEvent 'RESTORE-PHASE'
+        Invoke-ProbeLateStart -Changes $script:ProbeLateStartAfterStop
+    }
     if ($Phase -eq 'Обробка trace і логів') { Invoke-ProbeLateStart -Changes $script:ProbeLateStartBeforeTrace }
 }
 function Check-MdFileSizes {
     param($MODEL_PATH, $MAX_MD_FILE_SIZE, $ExcludePatterns)
     Add-ProbeEvent 'SIZE-CHECK'
-    Invoke-ProbeLateStart -Changes $script:ProbeLateStartAfterStop
     if ($script:ProbeThrowInSizeCheck) { throw 'self-test: імітований збій кроку перевірки розмірів .md' }
 }
 function Get-BRAVOTraceConfiguration {
@@ -14996,8 +15001,8 @@ try {
                 '[1/8] Перевірка вільного місця',
                 '[2/8] Створення необхідних директорій',
                 '[3/8] Зупинка служб',
-                '[4/8] Перевірка розмірів .md',
-                '[5/8] Реставрація моделі',
+                '[4/8] Реставрація моделі',
+                '[5/8] Перевірка розмірів .md',
                 '[6/8] Обробка trace і логів',
                 '[7/8] Відновлення стану служб',
                 '[8/8] Контроль діапазонів ID'
@@ -15027,18 +15032,21 @@ try {
                 -Name "Maintenance/OrchestrationRunsStepsInContractOrder" `
                 -Failure "Maintenance на щасливому шляху має виконати рівно [1/8]..[8/8] у затвердженому порядку (зупинка служб між 2 і 3, старт між 6 і 7, маркер до першої зупинки й прибраний до [7/8], статус-файл з кодом 0, потім звільнення lock і зовнішній finally) і завершитися кодом 0; проба: $($maintenanceHappy | ConvertTo-Json -Compress -Depth 4)"
 
-            # (2) Виняток у кроці [4/8]: finally служб усе одно відновлює служби
-            # (крок 'Відновлення стану служб'), маркер прибрано, lock звільнено;
-            # кроки 4–6 і 8 не рендеряться, а виняток доходить до catch
+            # (2) Виняток у кроці [5/8] (перевірка розмірів .md, що йде ПІСЛЯ
+            # реставрації): finally служб усе одно відновлює служби (крок
+            # 'Відновлення стану служб'), маркер прибрано, lock звільнено;
+            # крок [4/8] Реставрація моделі встигає відрендеритись ДО перевірки
+            # розмірів, кроки 5–6 і 8 не рендеряться, а виняток доходить до catch
             # Invoke-BRAVOMaintenanceEntrypoint -> 90 (InternalError). Номер кроку
             # відновлення тут не фіксується: лічильник кроків послідовний, тому
-            # після пропущених 4–6 він показує не 7.
+            # після пропущених 5–6 він показує не 7.
             $maintenanceThrow = $maintenanceOrchestrationResults['ThrowInSizeCheck']
             $maintenanceThrowEvents = @()
             if ($null -eq $maintenanceThrow.PSObject.Properties['ProbeError']) {
                 $maintenanceThrowEvents = @($maintenanceThrow.Events | ForEach-Object { [string]$_ })
             }
             $maintenanceOrchestrationThrowSizeCheck = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^SIZE-CHECK$'
+            $maintenanceOrchestrationThrowModelRestoreStep = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^STEP 4/8 Реставрація моделі '
             $maintenanceOrchestrationThrowRestoreStep = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^STEP \d+/8 Відновлення стану служб (OK|WARN)$'
             $maintenanceOrchestrationThrowStarts = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents ('^START {0}$' -f $maintenanceOrchestrationServiceName) })
             $maintenanceOrchestrationThrowMarkerClear = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^MARKER-CLEAR$'
@@ -15050,6 +15058,8 @@ try {
                     $maintenanceThrow.ExitCodeName -eq 'InternalError' -and
                     @($maintenanceThrow.Errors | Where-Object { ([string]$_).Contains('self-test: імітований збій кроку перевірки розмірів .md') }).Count -gt 0 -and
                     $maintenanceOrchestrationThrowSizeCheck -ge 0 -and
+                    $maintenanceOrchestrationThrowModelRestoreStep -ge 0 -and
+                    $maintenanceOrchestrationThrowModelRestoreStep -lt $maintenanceOrchestrationThrowSizeCheck -and
                     $maintenanceOrchestrationThrowRestoreStep -gt $maintenanceOrchestrationThrowSizeCheck -and
                     @($maintenanceOrchestrationThrowStarts | Where-Object { $_ -le $maintenanceOrchestrationThrowSizeCheck -or $_ -ge $maintenanceOrchestrationThrowRestoreStep }).Count -eq 0 -and
                     $maintenanceOrchestrationThrowMarkerClear -gt ($maintenanceOrchestrationThrowStarts | Measure-Object -Maximum).Maximum -and
@@ -15057,12 +15067,12 @@ try {
                     $maintenanceOrchestrationThrowLockExit -gt $maintenanceOrchestrationThrowRestoreStep -and
                     (& $maintenanceOrchestrationFinallyTail $maintenanceThrowEvents) -and
                     @($maintenanceThrowEvents | Where-Object {
-                            $_ -match '^STEP \d+/8 (Перевірка розмірів \.md|Реставрація моделі|Обробка trace і логів|Контроль діапазонів ID) ' -or
+                            $_ -match '^STEP \d+/8 (Перевірка розмірів \.md|Обробка trace і логів|Контроль діапазонів ID) ' -or
                             $_ -eq 'FINAL-REPORT' -or $_ -like 'STATUS *'
                         }).Count -eq 0
                 ) `
                 -Name "Maintenance/OrchestrationRestoresServicesWhenStepThrows" `
-                -Failure "виняток у кроці [4/8] має пройти крізь finally служб: служби, зупинені прогоном, запущено, маркер прибрано, lock звільнено, зовнішній finally виконано, а Invoke-BRAVOMaintenanceEntrypoint повертає 90 (InternalError); проба: $($maintenanceThrow | ConvertTo-Json -Compress -Depth 4)"
+                -Failure "виняток у кроці [5/8] має пройти крізь finally служб: служби, зупинені прогоном, запущено, маркер прибрано, lock звільнено, зовнішній finally виконано, а Invoke-BRAVOMaintenanceEntrypoint повертає 90 (InternalError); проба: $($maintenanceThrow | ConvertTo-Json -Compress -Depth 4)"
 
             # (3) Служба, що була зупинена ДО прогону (exchangAPI), не потрапляє
             # в маркер, не зупиняється й не запускається відновленням; решта
@@ -15147,7 +15157,7 @@ try {
                     StepOrderOk = (($labels -join '|') -ceq ($maintenanceExpectedStepLabels -join '|'))
                     Native = @($events | Where-Object { $_ -like 'NATIVE *' })
                     RestoreCancelled = @($events | Where-Object { $_ -like 'LOG-ERROR ПОМИЛКА: Реставрацію скасовано ДО архівації*' }).Count -eq 1
-                    RestoreStepFailed = @($events | Where-Object { $_ -ceq 'STEP 5/8 Реставрація моделі FAIL' }).Count -eq 1
+                    RestoreStepFailed = @($events | Where-Object { $_ -ceq 'STEP 4/8 Реставрація моделі FAIL' }).Count -eq 1
                     ServicesStarted = (@($events | Where-Object { $_ -ceq 'START BRAVO' -or $_ -ceq 'START exchangAPI' -or $_ -ceq 'START BravoWeb' }).Count -eq 3)
                     MarkerCleared = @($events | Where-Object { $_ -ceq 'MARKER-CLEAR' }).Count -eq 1
                     Held = @($events | Where-Object { $_ -like 'HOLD *' } | ForEach-Object { $_.Substring(5) })
@@ -15465,7 +15475,7 @@ try {
                 -Failure ("Maintenance (#287): служба BRAVO, що не вийшла зі StartPending, не повинна отримати обробку trace (бар'єр вимагає Stopped), а прогін має завершитися критичною помилкою з кодом 60; події: " + ($maintenanceStuckPending.Events -join ' | '))
 
             # Виняток після зупинки: служба, запущена після знімка й зупинена
-            # прогоном, стартує у finally навіть коли крок [4/8] кидає виняток.
+            # прогоном, стартує у finally навіть коли крок [5/8] кидає виняток.
             $maintenanceLateThrow = & $maintenanceStartModeOutcome 'LateStartThrow'
             $maintenanceLateThrowSizeCheck = & $maintenanceOrchestrationEventIndex $maintenanceLateThrow.Events '^SIZE-CHECK$'
             $maintenanceLateThrowStart = & $maintenanceOrchestrationEventIndex $maintenanceLateThrow.Events '^START BRAVO$'
@@ -15477,7 +15487,7 @@ try {
                     $maintenanceLateThrow.MarkerCleared
                 ) `
                 -Name "Maintenance/LifecycleLateStartRestartedAfterStepThrows" `
-                -Failure ("Maintenance: служба, запущена після знімка й зупинена прогоном, має стартувати у finally після винятку в кроці [4/8]; події: " + ($maintenanceLateThrow.Events -join ' | '))
+                -Failure ("Maintenance: служба, запущена після знімка й зупинена прогоном, має стартувати у finally після винятку в кроці [5/8]; події: " + ($maintenanceLateThrow.Events -join ' | '))
 
             # Disabled = оператор свідомо вимкнув службу: Maintenance її не
             # зупиняє, не утримує й не запускає, навіть коли вона працює.
@@ -15529,7 +15539,7 @@ try {
                     (& $maintenanceFinalMarkerNoRestart $maintenanceRestoreLateSuppressed.Events) -ceq '' -and
                     @($maintenanceRestoreLateSuppressed.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1 -and
                     $maintenanceRestoreLateAfterStop.ProbeOk -and $maintenanceRestoreLateAfterStop.StepOrderOk -and
-                    $maintenanceRestoreLateAfterStopBarrierStop -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLateAfterStop.Events '^SIZE-CHECK$') -and
+                    $maintenanceRestoreLateAfterStopBarrierStop -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLateAfterStop.Events '^RESTORE-PHASE$') -and
                     $maintenanceRestoreLateAfterStopBarrierStop -gt ([array]::LastIndexOf([string[]]$maintenanceRestoreLateAfterStop.Events, 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb')) -and
                     @($maintenanceRestoreLateAfterStop.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1
                 ) `
@@ -15563,11 +15573,32 @@ try {
                     $maintenanceRestoreLatePending.ProbeOk -and $maintenanceRestoreLatePending.StepOrderOk -and
                     @($maintenanceRestoreLatePending.Events | Where-Object { $_ -like 'STOP-REFUSED*' }).Count -eq 0 -and
                     -not $maintenanceRestoreLatePending.RestoreCancelled -and
-                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^STOP BravoWeb$') -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^SIZE-CHECK$') -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^STOP BravoWeb$') -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^RESTORE-PHASE$') -and
                     @($maintenanceRestoreLatePending.Events | Where-Object { $_ -ceq 'START BravoWeb' }).Count -eq 1
                 ) `
                 -Name "Maintenance/LifecyclePreArchiveBarrierWaitsOutStartPending" `
                 -Failure ("Maintenance (#287): службу у StartPending бар'єр перед before-архівом має зупинити після завершення старту, не скасовуючи реставрацію, і запустити у finally; події: " + ($maintenanceRestoreLatePending.Events -join ' | '))
+
+            # Перевірка розмірів .md іде ПІСЛЯ реставрації: bravocmd repair
+            # штатно стискає .md, тож знімок до неї давав хибне сповіщення
+            # «.md > ліміт» про файл, який реставрація щойно зменшила. У прогоні
+            # з реальною реставрацією SIZE-CHECK стоїть після останньої
+            # native-команди реставрації і після кроку [4/8], але до trace.
+            $maintenanceSizeAfterRestoreSize = & $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^SIZE-CHECK$'
+            $maintenanceSizeAfterRestoreStep = & $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^STEP 4/8 Реставрація моделі '
+            $maintenanceSizeAfterRestoreLastNative = [array]::LastIndexOf([string[]]$maintenanceRestoreLatePending.Events, [string](@($maintenanceRestoreLatePending.Native) | Select-Object -Last 1))
+            $maintenanceSizeAfterRestoreTrace = & $maintenanceOrchestrationEventIndex $maintenanceRestoreLatePending.Events '^STEP 6/8 Обробка trace і логів '
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRestoreLatePending.ProbeOk -and
+                    @($maintenanceRestoreLatePending.Native).Count -gt 0 -and
+                    $maintenanceSizeAfterRestoreStep -ge 0 -and
+                    $maintenanceSizeAfterRestoreSize -gt $maintenanceSizeAfterRestoreStep -and
+                    $maintenanceSizeAfterRestoreSize -gt $maintenanceSizeAfterRestoreLastNative -and
+                    $maintenanceSizeAfterRestoreTrace -gt $maintenanceSizeAfterRestoreSize
+                ) `
+                -Name "Maintenance/MdSizeCheckRunsAfterRestore" `
+                -Failure ("Maintenance: перевірка розмірів .md має виконуватися після реставрації (після native-команд і кроку [4/8]) і до обробки trace; події: " + ($maintenanceRestoreLatePending.Events -join ' | '))
 
             # Restore-прогін, де на старті всі служби стояли: крок [3/8]
             # звітує SKIPPED, а службу, яку запустили вже після нього, зупиняє
@@ -15580,7 +15611,7 @@ try {
                     $maintenanceRestoreAllStoppedLate.ProbeOk -and $maintenanceRestoreAllStoppedLate.StepOrderOk -and
                     -not $maintenanceRestoreAllStoppedLate.RestoreCancelled -and
                     @($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -ceq 'STEP 3/8 Зупинка служб SKIPPED' }).Count -eq 1 -and
-                    $maintenanceRestoreAllStoppedLateStop -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^SIZE-CHECK$') -and
+                    $maintenanceRestoreAllStoppedLateStop -gt (& $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^RESTORE-PHASE$') -and
                     @($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -ceq 'OPERATION Повторна зупинка служб перед архівацією WARN' }).Count -eq 1 -and
                     (& $maintenanceOrchestrationEventIndex $maintenanceRestoreAllStoppedLate.Events '^OPERATION Повторна зупинка служб перед архівацією WARN$') -gt $maintenanceRestoreAllStoppedLateStop -and
                     (@($maintenanceRestoreAllStoppedLate.Events | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START BravoWeb'
@@ -20948,8 +20979,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         'Перевірка вільного місця',
         'Створення необхідних директорій',
         'Зупинка служб',
-        'Перевірка розмірів .md',
         'Реставрація моделі',
+        'Перевірка розмірів .md',
         'Обробка trace і логів',
         'Відновлення стану служб',
         'Контроль діапазонів ID'
@@ -21051,7 +21082,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             $maintenanceRestoreGateWindow.Contains("elseif (`$weeklyRestoreQuotaConsumed) { 'цього тижня вже виконано примусову' }")
         ) `
         -Name "Maintenance/RestoreDisabledRendersSkipped" `
-        -Failure "коли реставрація не запланована цього прогону (`$shouldRestore=false), крок 'Реставрація моделі' має рендеритись SKIPPED 'не заплановано на цей запуск', зі своїм номером [5/8]"
+        -Failure "коли реставрація не запланована цього прогону (`$shouldRestore=false), крок 'Реставрація моделі' має рендеритись SKIPPED 'не заплановано на цей запуск', зі своїм номером [4/8]"
 
     $maintenanceSizeCheckGateIndex = $maintenanceScriptText.IndexOf('if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {')
     $maintenanceSizeCheckGateWindow = if ($maintenanceSizeCheckGateIndex -ge 0) {
@@ -21068,7 +21099,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             $maintenanceSizeCheckGateWindow.Contains("-Details 'вимкнено'")
         ) `
         -Name "Maintenance/SizeCheckDisabledRendersSkipped" `
-        -Failure "коли перевірку розмірів .md вимкнено, крок 'Перевірка розмірів .md' має рендеритись SKIPPED 'вимкнено', зі своїм номером [4/8]"
+        -Failure "коли перевірку розмірів .md вимкнено, крок 'Перевірка розмірів .md' має рендеритись SKIPPED 'вимкнено', зі своїм номером [5/8]"
 
     $maintenanceLogsGateIndex = $maintenanceScriptText.IndexOf('if (-not $script:BRAVOMaintenanceLogsStepEnabled) {')
     $maintenanceLogsGateWindow = if ($maintenanceLogsGateIndex -ge 0) {
