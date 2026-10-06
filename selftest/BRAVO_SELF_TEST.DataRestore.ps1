@@ -1560,7 +1560,10 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         # пропущених аномалій у тій самій формі, що й canonical
         # Get-BRAVORestoreGenerationManifest (SkippedManifests), щоб
         # викликач урахував їх у попередженнях, коді завершення і сповіщенні.
-        $skipped7 = if (@($result7.PSObject.Properties.Match('SkippedManifests')).Count -gt 0) { @($result7.SkippedManifests) } else { $null }
+        # if-вираз розгортає одноелементний масив у скаляр (без .Count під
+        # StrictMode), тому присвоєння всередині гілки.
+        $skipped7 = $null
+        if (@($result7.PSObject.Properties.Match('SkippedManifests')).Count -gt 0) { $skipped7 = @($result7.SkippedManifests) }
         Test-BRAVOCondition `
             -Condition (
                 $null -ne $skipped7 -and
@@ -1584,7 +1587,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             $script:BRAVOSelfTestSftpManifestContent = $content
             Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId $null
         } $stagingDir7b $names7b $content7b
-        $skipped7b = if (@($result7b.PSObject.Properties.Match('SkippedManifests')).Count -gt 0) { @($result7b.SkippedManifests) } else { $null }
+        $skipped7b = $null
+        if (@($result7b.PSObject.Properties.Match('SkippedManifests')).Count -gt 0) { $skipped7b = @($result7b.SkippedManifests) }
         Test-BRAVOCondition `
             -Condition (
                 [string]$result7b.Manifest.generationId -eq '20260814_090000' -and
