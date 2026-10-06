@@ -16383,6 +16383,7 @@ function Test-SFTPArchiveCopy { param($ArchiveDefinition, $LocalArchive, $Remote
 function New-SlackAlertMessage {
     param($Issues, $Duration)
     foreach ($probeIssue in @($Issues)) { Add-ProbeEvent ("ALERT-ISSUE {0} | {1}" -f $probeIssue.Component, $probeIssue.Reason) }
+    Add-ProbeEvent ("ALERT-ACTION {0}" -f (Get-BRAVOHealthIssueActionText -Issues @($Issues)))
     return 'self-test alert'
 }
 function New-SlackSuccessMessage { param($Duration) return 'self-test success' }
@@ -16423,12 +16424,12 @@ $backupMonitoring = [pscustomobject]@{
     InstitutionCode = 'SELFTEST'
     SuccessDedupMinutes = 0
     LogFileNameTemplate = 'BRAVO_ARCHIV_HEALTH_{0}.log'
-    SFTP = [pscustomobject]@{ Enabled = $true; CheckArchiveUploads = $true; CheckBAZASynchronization = $false; OperationTimeoutSeconds = 60; RemoteBackupMaxAgeHours = 26; VerifyRemoteArchiveHash = $false; BAZAPreviewOptions = '-preview'; DifferenceDetailLimit = 10 }
+    SFTP = [pscustomobject]@{ Enabled = $probeSftpEnabled; CheckArchiveUploads = $true; CheckBAZASynchronization = $false; OperationTimeoutSeconds = 60; RemoteBackupMaxAgeHours = 26; VerifyRemoteArchiveHash = $false; BAZAPreviewOptions = '-preview'; DifferenceDetailLimit = 10 }
     SMB = [pscustomobject]@{ Enabled = $true }
 }
 $componentSettings = [pscustomobject]@{ SFTP = [pscustomobject]@{ ArchiveUpload = $true } }
 $storageEffective = [pscustomobject]@{
-    SFTP = [pscustomobject]@{ Enabled = $true; DisabledReason = '' }
+    SFTP = [pscustomobject]@{ Enabled = $probeSftpEnabled; DisabledReason = $(if ($probeSftpEnabled) { '' } else { 'self-test: SFTP вимкнено в конфігурації' }) }
     SMB = [pscustomobject]@{ Enabled = $true; DisabledReason = '' }
 }
 $bazaAppLocalHealthEnabled = $true
@@ -16458,10 +16459,10 @@ $script:Login = 'self-test'
 $script:resolvedSftpHost = 'self-test.invalid'
 $script:sftpUrl = 'sftp://self-test.invalid/'
 $sftpHostKey = 'ssh-ed25519 255 self-test'
-$sftpArchivesHealthEnabled = $true
+$sftpArchivesHealthEnabled = $probeSftpEnabled
 $sftpBazaAppHealthEnabled = $false
 $sftpBazaWWWHealthEnabled = $false
-$sftpCredentialRequired = $true
+$sftpCredentialRequired = $probeSftpEnabled
 $smbCredentialRequired = $true
 $NotificationRequestTimeoutSeconds = 5
 $NotificationProviderDisplayName = 'Slack'
@@ -16576,8 +16577,9 @@ try {
         ('$script:ProbeFailSmb = {0}' -f (& $probeFlag ($Scenario -like 'Failures*'))),
         ('$script:ProbeNotificationThrows = {0}' -f (& $probeFlag ($Scenario -eq 'NotificationFailure'))),
         ('$script:ProbePreflightPrivilegeFailure = {0}' -f (& $probeFlag ($Scenario -eq 'EnvironmentPrivilege'))),
-        ('$script:ProbeToolIntegrityViolation = {0}' -f (& $probeFlag ($Scenario -eq 'ToolIntegrity'))),
-        ('$script:ProbeWinScpBusy = {0}' -f (& $probeFlag ($Scenario -eq 'WinScpBusy')))
+        ('$script:ProbeToolIntegrityViolation = {0}' -f (& $probeFlag ($Scenario -like 'ToolIntegrity*'))),
+        ('$script:ProbeWinScpBusy = {0}' -f (& $probeFlag ($Scenario -in @('WinScpBusy', 'ToolIntegrityWinScpBusy')))),
+        ('$probeSftpEnabled = {0}' -f (& $probeFlag ($Scenario -ne 'ToolIntegritySftpDisabled')))
     ) -join "`n"
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
@@ -16607,6 +16609,9 @@ try {
     }
     if ($Scenario -like '*NoSlack') { $probeParameters['NoSlack'] = $true }
     if ($Scenario -like 'Happy*') { $probeParameters['NotifyOnSuccess'] = $true }
+    # #296: з -NotifyOnSuccess зелене «все справно» реально відправилося б,
+    # якби порушення цілісності інструментів не стало Health issue.
+    if ($Scenario -in @('ToolIntegritySftpDisabled', 'ToolIntegrityWinScpBusy')) { $probeParameters['NotifyOnSuccess'] = $true }
     $global:LASTEXITCODE = 77
     $probeErrors = $null
     $ErrorActionPreference = 'Continue'
@@ -16641,6 +16646,7 @@ try {
             $healthOrchestrationResults = @{}
             foreach ($healthOrchestrationScenario in @(
                     'Happy', 'HappyNoSlack', 'Failures', 'FailuresNoSlack', 'ToolIntegrity',
+                    'ToolIntegritySftpDisabled', 'ToolIntegrityWinScpBusy',
                     'WinScpBusy', 'NotificationFailure', 'EnvironmentPrivilege', 'MonitoringDisabled', 'InsecureWebhook'
                 )) {
                 $healthOrchestrationScenarioRoot = Join-Path $healthOrchestrationRoot $healthOrchestrationScenario
@@ -16778,6 +16784,90 @@ try {
                 ) `
                 -Name "Health/OrchestrationToolIntegritySkipsOnlySftp" `
                 -Failure "порушення цілісності інструментів має пропустити лише SFTP-гілку (без жодного виклику WinSCP), залишивши локальні перевірки виконаними, і завершити Health кодом 32 (ToolIntegrityViolation); проба: $($healthToolIntegrity | ConvertTo-Json -Compress -Depth 4)"
+
+            # (3a) #296: порушення цілісності інструментів — окремий Health
+            # issue, незалежний від SFTP. Раніше єдиний шлях ShouldBlock -> issue
+            # жив у Test-SFTPHealthConfiguration: при вимкненому SFTP
+            # (Get-SFTPHealthIssues повертає @() до будь-якої перевірки) або
+            # зайнятому WinSCP (перевірку відкладено) $healthIssues лишався
+            # порожнім — Health скидав стан алертів (ALERT-STATE-CLEAR) і з
+            # -NotifyOnSuccess слав зелене «все справно», а підміну видно було
+            # лише в коді 32. Тепер у обох випадках — рівно один CRITICAL-алерт
+            # «Цілісність інструментів» (у каналі alerts, зі збереженням стану
+            # алерту й RecoveryPending), без success-звіту й без скидання стану;
+            # код 32 лишається. Жодного виклику WinSCP (навіть перевірки
+            # зайнятості при вимкненому SFTP).
+            $healthToolIntegritySftpDisabled = $healthOrchestrationResults['ToolIntegritySftpDisabled']
+            $healthToolIntegritySftpDisabledEvents = @(& $healthOrchestrationEvents 'ToolIntegritySftpDisabled')
+            $healthToolIntegritySftpDisabledAlerts = @($healthToolIntegritySftpDisabledEvents | Where-Object { $_ -like 'ALERT-ISSUE *' })
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'ToolIntegritySftpDisabled') -and
+                    $healthToolIntegritySftpDisabled.ExitCode -eq 32 -and
+                    $healthToolIntegritySftpDisabled.ExitCodeName -eq 'ToolIntegrityViolation' -and
+                    (& $healthOrchestrationSelect $healthToolIntegritySftpDisabledEvents $healthOrchestrationChecksPattern) -ceq (@(
+                            'PREFLIGHT',
+                            'STEP 1/8 Середовище й цілісність інструментів ERROR',
+                            'CHECK watchdog',
+                            'CHECK services',
+                            'STEP 2/8 Керовані служби OK',
+                            'CHECK local',
+                            'STEP 3/8 Локальні резервні копії OK',
+                            'CHECK restore-verify',
+                            'STEP 4/8 Відновлюваність (restore drill) OK',
+                            'CHECK baza-local BAZA APP',
+                            'STEP 5/8 BAZA_APP (локальна копія) OK',
+                            'CHECK baza-local BAZA WWW',
+                            'STEP 6/8 BAZA_WWW (локальна копія) OK',
+                            'CHECK smb',
+                            'STEP 7/8 NAS/SMB OK',
+                            # Total 8: крок 'Сповіщення' теж потрапляє під STEP [1-8]/.
+                            'STEP 8/8 Сповіщення OK'
+                        ) -join '|') -and
+                    @($healthToolIntegritySftpDisabledEvents | Where-Object { $_ -like 'WINSCP-*' }).Count -eq 0 -and
+                    $healthToolIntegritySftpDisabledAlerts.Count -eq 1 -and
+                    $healthToolIntegritySftpDisabledAlerts[0].StartsWith('ALERT-ISSUE Цілісність інструментів | ') -and
+                    $healthToolIntegritySftpDisabledAlerts[0].Contains('self-test: хеш WinSCP.com не збігається з TOOLS_MANIFEST.json') -and
+                    (& $healthOrchestrationSelect $healthToolIntegritySftpDisabledEvents '^(NOTIFY-|ALERT-STATE-|SUCCESS-STATE-SAVE$|RECOVERY-PENDING |STATUS |STEP 8/)') -ceq 'RECOVERY-PENDING True|NOTIFY-ROUTE CRITICAL|NOTIFY-SEND https://self-test.invalid/alerts self-test alert|ALERT-STATE-SAVE|STATUS 32|STEP 8/8 Сповіщення OK' -and
+                    @($healthToolIntegritySftpDisabled.Log | Where-Object { ([string]$_).Contains('Проблема Цілісність інструментів: ') }).Count -eq 1
+                ) `
+                -Name "Health/OrchestrationToolIntegrityAlertsWhenSftpDisabled" `
+                -Failure "#296: при вимкненому SFTP порушення цілісності інструментів має давати рівно один CRITICAL-алерт 'Цілісність інструментів' (без зеленого success-звіту, без скидання стану алертів, без жодного виклику WinSCP) і код 32; проба: $($healthToolIntegritySftpDisabled | ConvertTo-Json -Compress -Depth 4)"
+
+            $healthToolIntegrityWinScpBusy = $healthOrchestrationResults['ToolIntegrityWinScpBusy']
+            $healthToolIntegrityWinScpBusyEvents = @(& $healthOrchestrationEvents 'ToolIntegrityWinScpBusy')
+            $healthToolIntegrityWinScpBusyAlerts = @($healthToolIntegrityWinScpBusyEvents | Where-Object { $_ -like 'ALERT-ISSUE *' })
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'ToolIntegrityWinScpBusy') -and
+                    $healthToolIntegrityWinScpBusy.ExitCode -eq 32 -and
+                    $healthToolIntegrityWinScpBusy.ExitCodeName -eq 'ToolIntegrityViolation' -and
+                    (& $healthOrchestrationSelect $healthToolIntegrityWinScpBusyEvents $healthOrchestrationChecksPattern) -ceq (& $healthOrchestrationExpectedChecks 9 @('ERROR', 'OK', 'OK', 'OK', 'OK', 'OK', 'SKIPPED', 'OK') $false) -and
+                    @($healthToolIntegrityWinScpBusyEvents | Where-Object { $_ -match '^WINSCP-(SESSION|CHECKSUM|COPY)' }).Count -eq 0 -and
+                    $healthToolIntegrityWinScpBusyAlerts.Count -eq 1 -and
+                    $healthToolIntegrityWinScpBusyAlerts[0].StartsWith('ALERT-ISSUE Цілісність інструментів | ') -and
+                    $healthToolIntegrityWinScpBusyAlerts[0].Contains('self-test: хеш WinSCP.com не збігається з TOOLS_MANIFEST.json') -and
+                    (& $healthOrchestrationSelect $healthToolIntegrityWinScpBusyEvents '^(NOTIFY-|ALERT-STATE-|SUCCESS-STATE-SAVE$|RECOVERY-PENDING |STATUS |STEP 9/)') -ceq 'RECOVERY-PENDING True|NOTIFY-ROUTE CRITICAL|NOTIFY-SEND https://self-test.invalid/alerts self-test alert|ALERT-STATE-SAVE|STATUS 32|STEP 9/9 Сповіщення OK'
+                ) `
+                -Name "Health/OrchestrationToolIntegrityAlertsWhenWinScpBusy" `
+                -Failure "#296: при зайнятому WinSCP (SFTP-перевірку відкладено) порушення цілісності інструментів має давати рівно один CRITICAL-алерт 'Цілісність інструментів' (без зеленого success-звіту й без скидання стану алертів) і код 32; проба: $($healthToolIntegrityWinScpBusy | ConvertTo-Json -Compress -Depth 4)"
+
+            # Дедуплікація: коли SFTP-гілка сама повідомила про гейт цілісності
+            # (сценарій (3)), окремого issue «Цілісність інструментів» немає —
+            # порушення в алерті рівно один раз, і алерт справді доставлено
+            # (CRITICAL, стан збережено, не скинуто).
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'ToolIntegrity') -and
+                    @($healthToolIntegrityAlerts | Where-Object { $_.Contains('TOOLS_MANIFEST.json') }).Count -eq 1 -and
+                    @($healthToolIntegrityAlerts | Where-Object { $_.StartsWith('ALERT-ISSUE Цілісність інструментів | ') }).Count -eq 0 -and
+                    $healthToolIntegrityAlerts[0].StartsWith('ALERT-ISSUE SFTP | ') -and
+                    # Codex P2: дія алерту — про інструменти, не «перевірити SFTP-з'єднання».
+                    (& $healthOrchestrationSelect $healthToolIntegrityEvents '^ALERT-ACTION ') -ceq 'ALERT-ACTION перевірити каталог Tools і TOOLS_MANIFEST.json: можлива підміна 7za.exe/WinSCP.com' -and
+                    (& $healthOrchestrationSelect $healthToolIntegrityEvents '^(NOTIFY-|ALERT-STATE-|SUCCESS-STATE-SAVE$|STATUS )') -ceq 'NOTIFY-ROUTE CRITICAL|NOTIFY-SEND https://self-test.invalid/alerts self-test alert|ALERT-STATE-SAVE|STATUS 32'
+                ) `
+                -Name "Health/OrchestrationToolIntegrityReportedOnceWithSftp" `
+                -Failure "#296: при ввімкненому SFTP порушення цілісності інструментів має з'являтися в алерті рівно один раз (через SFTP-issue, без дубля 'Цілісність інструментів'); проба: $($healthToolIntegrity | ConvertTo-Json -Compress -Depth 4)"
 
             # (4) -NoSlack придушує лише доставку: ті самі перевірки з тими
             # самими статусами й тим самим кодом (0 / 70), але без маршрутизації
