@@ -6523,7 +6523,7 @@ function Write-BRAVOArchiveOperationStatus {
         # Ранні виходи не мають зовнішнього try: збій самого логування не
         # повинен перетворити 40/30/32 на 90.
         try {
-            Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)"
+            Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)" -Level "WARNING"
         } catch {
             # Телеметрія не змінює exit code.
         }
@@ -9202,7 +9202,7 @@ function Main {
                 totalCreatedBytes = $statusTotalCreatedBytes
             }
     } catch {
-        Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)"
+        Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)" -Level "WARNING"
     }
 
     # Причина/Інструмент/Код інструменту показуються лише коли головний
@@ -9506,8 +9506,8 @@ try {
     # прогону. Мовчазний catch — крах може статися до завантаження
     # конфігурації ($stateRoot) чи модуля статусу.
     # BRAVO_STATUS_Archive.json — статус НІЧНОЇ копії: крах денної BAZA-
-    # синхронізації (-SyncBAZA) його теж не перезаписує (#291, як і
-    # Write-BRAVOArchiveOperationStatus).
+    # синхронізації (-SyncBAZA) його теж не перезаписує (#291, той самий
+    # guard, що й у helper'і статусу Archive).
     if (-not ((Test-Path variable:SyncBAZA) -and $SyncBAZA)) {
         try {
             Write-BRAVOOperationStatus `

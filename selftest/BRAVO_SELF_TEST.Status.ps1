@@ -132,7 +132,13 @@
     # — бути першим сирим викликом (контракт [Archive] вище) у try/catch.
     $archiveStatusText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'), [Text.Encoding]::UTF8)
     $archiveStatusExitCodeIndex = $archiveStatusText.IndexOf('$script:processExitCode = Resolve-BRAVOExitCode -HasWarnings')
-    $archiveStatusTailCallIndex = $archiveStatusText.LastIndexOf('Write-BRAVOArchiveOperationStatus')
+    # Останній ВИКЛИК (рядок, що починається з імені команди), а не згадка
+    # в коментарі чи визначенні функції.
+    $archiveStatusCallMatches = [regex]::Matches($archiveStatusText, '(?m)^[ \t]*Write-BRAVOArchiveOperationStatus[ \t]+`')
+    $archiveStatusTailCallIndex = if ($archiveStatusCallMatches.Count -gt 0) {
+        $archiveStatusLastCall = $archiveStatusCallMatches[$archiveStatusCallMatches.Count - 1]
+        $archiveStatusLastCall.Index + $archiveStatusLastCall.Value.IndexOf('Write-BRAVOArchiveOperationStatus')
+    } else { -1 }
     $archiveStatusHelperIndex = $archiveStatusText.IndexOf('function Write-BRAVOArchiveOperationStatus')
     $archiveStatusTailCallText = if ($archiveStatusTailCallIndex -ge 0) {
         $archiveStatusText.Substring($archiveStatusTailCallIndex, [Math]::Min(300, $archiveStatusText.Length - $archiveStatusTailCallIndex))
