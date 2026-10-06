@@ -1126,3 +1126,96 @@ try {
         }
     }
 }
+
+# ============================================================
+# #290: таймаут Test-SFTPConnection має повертати $false (шлях "SFTP
+# failed", exit 50), а не кидати виняток повз Complete-BRAVOProcessOutputCapture.
+# Раніше `throw` після Kill() оминав Complete-BRAVOProcessOutputCapture, який
+# звільняє BRAVO_WINSCP lock: викликачі без try завершувались exit 90, а
+# lock лишався захопленим до кінця процесу.
+#
+# Справжній Test-SFTPConnection (AST) запускає справжній Start-BRAVOProcessOutputCapture
+# зі стабом WinSCP.com: крихітний консольний exe, що висне (скомпільований
+# Add-Type, бо lock береться лише для файлу з іменем WinSCP.com, а .cmd/.ps1
+# під UseShellExecute=$false не запускається).
+# ============================================================
+
+$sftpTimeoutStub = @'
+function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO", [switch]$Secondary)
+    [void]$script:sftpTimeoutLogEntries.Add([pscustomobject]@{ Level = $Level; Message = $Message }) }
+'@
+$sftpTimeoutModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText ($sftpTimeoutStub + "`n" + $archiveScriptText) `
+    -FunctionNames @('Write-BRAVOLog', 'Test-SFTPConnection')
+Import-Module -Name (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1') -Force -ErrorAction Stop
+Import-Module -Name (Join-Path $root 'modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1') -Force -ErrorAction Stop
+
+$sftpTimeoutRoot = Join-Path $env:TEMP "BRAVOSelfTest_SftpTimeout_$([Guid]::NewGuid().ToString('N'))"
+$sftpTimeoutHadGlobalLogPath = Test-Path -LiteralPath 'Variable:global:logPath'
+$sftpTimeoutPreviousGlobalLogPath = if ($sftpTimeoutHadGlobalLogPath) { $global:logPath } else { $null }
+$sftpTimeoutProbe = $null
+$sftpTimeoutStubPath = $null
+try {
+    [void](New-Item -ItemType Directory -Path $sftpTimeoutRoot -Force)
+    $sftpTimeoutLogDir = Join-Path $sftpTimeoutRoot 'logs'
+    [void](New-Item -ItemType Directory -Path $sftpTimeoutLogDir -Force)
+    $sftpTimeoutStubPath = Join-Path $sftpTimeoutRoot 'WinSCP.com'
+    Add-Type -TypeDefinition 'public static class BRAVOSftpHangStub { public static void Main() { System.Threading.Thread.Sleep(120000); } }' `
+        -OutputAssembly $sftpTimeoutStubPath -OutputType ConsoleApplication -ErrorAction Stop
+    $global:logPath = $sftpTimeoutLogDir
+
+    $sftpTimeoutProbe = & $sftpTimeoutModule {
+        param($StubPath)
+        $script:sftpTimeoutLogEntries = New-Object System.Collections.ArrayList
+        $script:resolvedSftpHost = '127.0.0.1'
+        $script:sftpPort = 22
+        $script:winSCPScriptEncoding = 'ASCII'
+        $script:winSCPIniPath = 'nul'
+        # Таймаут очікування = max(1, N + 30) с; N = -29 дає 1 с (self-test швидкий).
+        $script:sftpConnectionTimeoutSeconds = -29
+        $thrown = $null
+        $result = $null
+        try {
+            $result = @(Test-SFTPConnection -WinSCPPath $StubPath -RepositorySFTPUrl 'sftp://selftest@127.0.0.1/' -HostKey 'ssh-rsa 2048 aa:bb:cc')
+        } catch {
+            $thrown = $_.Exception.Message
+        }
+        [pscustomobject]@{
+            Thrown  = $thrown
+            Results = $result
+            Logs    = @($script:sftpTimeoutLogEntries.ToArray())
+        }
+    } $sftpTimeoutStubPath
+
+    $sftpTimeoutLockAfter = Enter-BRAVOWinSCPProcessLock -LogPath $sftpTimeoutLogDir
+    if ($sftpTimeoutLockAfter.Success -and $sftpTimeoutLockAfter.Stream) {
+        $sftpTimeoutLockAfter.Stream.Dispose()
+    }
+
+    Test-BRAVOCondition -Condition (
+        $null -eq $sftpTimeoutProbe.Thrown -and
+        @($sftpTimeoutProbe.Results).Count -eq 1 -and
+        $sftpTimeoutProbe.Results[0] -is [bool] -and
+        $sftpTimeoutProbe.Results[0] -eq $false
+    ) -Name 'Archive/SftpConnectionTimeoutReturnsFalse' `
+        -Failure "таймаут перевірки SFTP має повертати `$false (викликачі ведуть у шлях SFTP failed, exit 50), а не кидати виняток; Thrown='$($sftpTimeoutProbe.Thrown)' Results=$(@($sftpTimeoutProbe.Results) -join ',')"
+
+    Test-BRAVOCondition -Condition (
+        $sftpTimeoutLockAfter.Success -eq $true
+    ) -Name 'Archive/SftpConnectionTimeoutReleasesWinSCPLock' `
+        -Failure "після таймауту BRAVO_WINSCP lock має бути звільнений (Complete-BRAVOProcessOutputCapture), інакше наступний WinSCP-запуск блокується; Error=$($sftpTimeoutLockAfter.Error)"
+
+    Test-BRAVOCondition -Condition (
+        @($sftpTimeoutProbe.Logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -like '*таймаут*' }).Count -ge 1
+    ) -Name 'Archive/SftpConnectionTimeoutLogsError' `
+        -Failure "таймаут перевірки SFTP має логуватись рівнем ERROR з описом таймауту; журнал: $(@($sftpTimeoutProbe.Logs | ForEach-Object { $_.Level + ':' + $_.Message }) -join ' | ')"
+} finally {
+    foreach ($sftpTimeoutLeftover in @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -eq $sftpTimeoutStubPath } catch { $false }
+        })) {
+        try { $sftpTimeoutLeftover.Kill() } catch { Write-Host "self-test cleanup: не вдалося завершити стаб WinSCP: $($_.Exception.Message)" }
+    }
+    if ($sftpTimeoutHadGlobalLogPath) { $global:logPath = $sftpTimeoutPreviousGlobalLogPath }
+    else { Remove-Variable -Name logPath -Scope Global -ErrorAction SilentlyContinue }
+    Remove-Item -LiteralPath $sftpTimeoutRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
