@@ -13063,6 +13063,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             # WRITE_DAC, тому спершу повертаємо поточному SID FullControl на
             # каталог і файли, а вже потім видаляємо. Перевірку ACL-патерну
             # вище це не послаблює: вона завершилась до finally.
+            # B-4 D2b: саме .SetAccessControl(), а не Set-Acl: Set-Acl у 5.1
+            # без прав адміністратора падав з PrivilegeNotHeldException
+            # (SeSecurityPrivilege), а .SetAccessControl() з новим об'єктом
+            # записує лише DACL, для чого власнику досить WRITE_DAC.
             $aclCleanupSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
             $aclCleanupDirectory = New-Object Security.AccessControl.DirectorySecurity
             $aclCleanupDirectory.SetAccessRuleProtection($true, $false)
@@ -13073,7 +13077,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 [Security.AccessControl.PropagationFlags]::None,
                 [Security.AccessControl.AccessControlType]::Allow
             )))
-            Set-Acl -LiteralPath $aclProbeRoot -AclObject $aclCleanupDirectory -ErrorAction Stop
+            (New-Object IO.DirectoryInfo -ArgumentList $aclProbeRoot).SetAccessControl($aclCleanupDirectory)
             foreach ($aclCleanupFile in @([IO.Directory]::GetFiles($aclProbeRoot))) {
                 $aclCleanupFileSecurity = New-Object Security.AccessControl.FileSecurity
                 $aclCleanupFileSecurity.SetAccessRuleProtection($true, $false)
@@ -13084,7 +13088,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     [Security.AccessControl.PropagationFlags]::None,
                     [Security.AccessControl.AccessControlType]::Allow
                 )))
-                Set-Acl -LiteralPath $aclCleanupFile -AclObject $aclCleanupFileSecurity -ErrorAction Stop
+                (New-Object IO.FileInfo -ArgumentList $aclCleanupFile).SetAccessControl($aclCleanupFileSecurity)
             }
             [IO.Directory]::Delete($aclProbeRoot, $true)
         }
@@ -32202,6 +32206,12 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
         # PowerShell 5.1 на stub-скрипті BRAVO_SELF_TEST.ps1 у тимчасовому
         # корені. Дочірня консоль (CreateNoWindow) має OEM-сторінку, тож без
         # явного UTF-8 з обох боків кирилиця, BOM і U+2028 губилися б.
+        # stderr (CLIXML) Windows PowerShell 5.1 пише в OEM-сторінці навіть
+        # після префікса, тож runner декодує його як OEM (B-4 D1b). Літер,
+        # яких в OEM-сторінці немає (і, ґ; на англомовному CI - уся
+        # кирилиця), дочірній процес уже замінив на '?', тому для stderr
+        # перевіряється лише розкодування: текст 'werr ', жодного U+FFFD і
+        # жодного CLIXML.
         # Текст stub-а збирається з кодів символів, щоб сам файл був ASCII.
         $arChildHost = ''
         if (-not [string]::IsNullOrEmpty([string]$env:SystemRoot)) {
@@ -32236,7 +32246,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
                     @($arChildLines | Where-Object { $_ -ceq ('host ' + $arChildText) }).Count -eq 1 -and
                     @($arChildLines | Where-Object { $_ -ceq ('bom' + [char]0xFEFF + 'sep' + [char]0x2028 + 'end') }).Count -eq 1 -and
                     @($arChildLines | Where-Object { $_ -ceq 'suite=Paths' }).Count -eq 1 -and
-                    @($arChildErrors | Where-Object { ([string]$_).Contains('werr ' + $arChildText) }).Count -ge 1 -and
+                    @($arChildErrors | Where-Object { ([string]$_).Contains('werr ') }).Count -ge 1 -and
+                    @($arChildErrors | Where-Object { ([string]$_).IndexOf([char]0xFFFD) -ge 0 }).Count -eq 0 -and
                     @($arChildErrors | Where-Object { ([string]$_).Contains('CLIXML') }).Count -eq 0)
                 $arChildCodes = [string]::Join(' ', @(([string]::Join('|', $arChildLines) + '#' + [string]::Join('|', $arChildErrors)).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }))
                 $arChildNote = "exit=$($arChildRun.ExitCode); startError=$($arChildRun.StartError); коди символів: $arChildCodes"
@@ -32248,7 +32259,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
             Test-BRAVOCondition `
                 -Condition $arChildOk `
                 -Name "Framework/AffectedRunner.RealChildProcessPreservesText" `
-                -Failure ("B-4 D1: справжній дочірній powershell.exe: код завершення (7) доходить до runner-а; stdout і Write-Host з кирилицею (іїєґ ІЇЄҐ), BOM і U+2028 приходять без втрат; Write-Error розкодовано з CLIXML у текст; -Suite передано. Деталі: " + $arChildNote)
+                -Failure ("B-4 D1: справжній дочірній powershell.exe: код завершення (7) доходить до runner-а; stdout і Write-Host з кирилицею (іїєґ ІЇЄҐ), BOM і U+2028 приходять без втрат; Write-Error розкодовано з CLIXML у текст в OEM-сторінці без U+FFFD; -Suite передано. Деталі: " + $arChildNote)
         } else {
             Write-Host "  Сценарій AffectedRunner зі справжнім дочірнім powershell.exe пропущено: Windows PowerShell 5.1 не знайдено (потрібні SystemRoot і powershell.exe)."
         }
