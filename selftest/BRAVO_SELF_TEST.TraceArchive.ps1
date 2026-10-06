@@ -173,7 +173,12 @@ function Get-BRAVODirectories {
         $taGroup20b = @($taBacklog2 | Where-Object { $_.DateKey -eq '20260820' })[0]
         $taPlan2 = & $traceArchiveModule { param($g, $z, $p) Get-BRAVOTraceArchiveUpdatePlan -BacklogGroup $g -SevenZipPath $z -ArchivePassword $p } $taGroup20b $traceArchive7za $traceArchivePassword
         $taDiagLog = New-Object System.Collections.Generic.List[string]
-        $taDiagLogger = { param($Message, $Level) [void]$taDiagLog.Add("[$Level] $Message") }.GetNewClosure()
+        # Closure будується в дочірньому scope: GetNewClosure() копіює змінні
+        # поточного scope, а в script scope self-test їх уже понад 4000, і на
+        # Windows PowerShell 5.1 пізні змінні (як $taDiagLog) до closure не
+        # потрапляли — логер падав на $null (CI PR #374). Дочірній scope
+        # передає лише потрібний список.
+        $taDiagLogger = & { param($DiagLog) { param($Message, $Level) [void]$DiagLog.Add("[$Level] $Message") }.GetNewClosure() } $taDiagLog
         $taUpdate2 = & $traceArchiveModule { param($g, $pl, $z, $ap, $p, $lg) Update-BRAVOTraceDailyArchive -BacklogGroup $g -Plan $pl -SevenZipPath $z -AddParameters $ap -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 -Logger $lg } $taGroup20b $taPlan2 $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taDiagLogger
         $taInventoryAfter = BRAVO.Compatibility\Get-BRAVOSevenZipArchiveEntries -SevenZipPath $traceArchive7za -ArchivePath $taGroup20.ArchivePath -Password $traceArchivePassword
         $taOldPreserved = $true
