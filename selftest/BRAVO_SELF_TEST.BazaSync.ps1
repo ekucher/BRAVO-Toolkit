@@ -347,6 +347,39 @@
             $aaOkSession2.State.PutFilesCallCount -eq 1
         ) -Name 'BazaSync/AutoArchiveBelowThresholdRenamesAndClearsState' -Failure "мутація <= порогу має автоматично rename-archive: Status=$($aaOkResult2.Status),Accepted=$($aaOkResult2.AutoArchivedMutations.Accepted.Count),MoveFile=$($aaOkSession2.State.MoveFileCalls.Count),PutFiles=$($aaOkSession2.State.PutFilesCallCount)"
 
+        # #285 (Codex 388-C1): збій фінального Save-BRAVOBazaState після
+        # авто-архівування. Remote уже перейменовано, а зміну стану не
+        # збережено — цикл не може лишатися MUTATION_AUTO_ARCHIVED (успіх
+        # для -SyncBAZA/Archive); той самий downgrade, що й для COMPLETE.
+        $aaSaveRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveStateSaveFails"
+        $aaSaveLocal = Join-Path $aaSaveRoot "local"
+        $aaSaveState = Join-Path $aaSaveRoot "state"
+        New-Item -ItemType Directory -Path $aaSaveLocal -Force | Out-Null
+        $aaSaveFile = New-BRAVOSelfTestBazaFile -Directory $aaSaveLocal -RelativePath "eqv_12-001.pdf" -SizeBytes 500
+        $aaSaveSession = New-BRAVOSelfTestFakeBazaSession
+        $aaSaveResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaSaveLocal -RemoteRootPath '/baza_app' -Session $aaSaveSession -StateRoot $aaSaveState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        [IO.File]::WriteAllBytes($aaSaveFile, (New-Object byte[] 999))
+        $aaSaveStatePath = Get-BRAVOBazaStatePath -StateRoot $aaSaveState -Component 'BAZA_APP'
+        $aaSaveResult2 = $null
+        $aaSaveThrew = $null
+        [IO.File]::SetAttributes($aaSaveStatePath, [IO.FileAttributes]::ReadOnly)
+        try {
+            $aaSaveResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaSaveLocal -RemoteRootPath '/baza_app' -Session $aaSaveSession -StateRoot $aaSaveState -AutoArchiveMutationThreshold 5
+        } catch {
+            $aaSaveThrew = $_.Exception.Message
+        } finally {
+            [IO.File]::SetAttributes($aaSaveStatePath, [IO.FileAttributes]::Normal)
+        }
+        Test-BRAVOCondition -Condition (
+            $aaSaveResult1.Status -eq 'COMPLETE' -and
+            $null -eq $aaSaveThrew -and
+            $null -ne $aaSaveResult2 -and
+            $aaSaveSession.State.MoveFileCalls.Count -eq 1 -and
+            $aaSaveResult2.Status -eq 'INCOMPLETE' -and
+            [string]$aaSaveResult2.Error -match 'не вдалося зберегти стан' -and
+            -not (Test-BRAVOBazaSyncStatusSuccess -Status $aaSaveResult2.Status)
+        ) -Name 'BazaSync/AutoArchiveStateSaveFailureIsNotSuccess' -Failure "збій збереження стану після авто-архівування має давати не-успішний INCOMPLETE з Error, а не MUTATION_AUTO_ARCHIVED; setup=$($aaSaveResult1.Status) threw='$aaSaveThrew' Status=$(if ($null -ne $aaSaveResult2) { $aaSaveResult2.Status }) Error='$(if ($null -ne $aaSaveResult2) { $aaSaveResult2.Error })' MoveFile=$($aaSaveSession.State.MoveFileCalls.Count)"
+
         $fastHealthAutoArchive = Get-BRAVOBazaFastHealthResult -SyncResult $aaOkResult2
         Test-BRAVOCondition -Condition (
             $fastHealthAutoArchive.Healthy -eq $true -and $fastHealthAutoArchive.Level -eq 'INFO' -and
