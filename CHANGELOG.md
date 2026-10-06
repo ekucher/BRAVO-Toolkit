@@ -9,9 +9,18 @@
   кодом 41 (збій цілісності реставрації). Тепер обгортка має перемикач `-NoFailureFlags`, і лише retention його
   використовує: збій лишається WARNING у журналі (щоразу, без одноразової позначки) і архів не зараховується як
   точка відновлення, але прапорці не виставляються. Решта викликів (Verify-Backup, перевірка після реставрації)
-  поводяться як раніше. Коди завершення не змінено. Регресія:
+  поводяться як раніше. Коди завершення не змінено. Межі послаблення: `-NoFailureFlags` діє лише для старіших
+  сесій (не найновішої за тим самим порядком, що й retention) і лише для archive-specific збою (7-Zip відпрацював
+  і повернув код 1/2). Зламана найновіша точка відновлення, відсутність жодної придатної точки після збою `7z t`
+  і збій виконання самої перевірки (немає 7-Zip, помилка запуску, таймаут, інші коди) й надалі дають обидва
+  прапорці (код 41). На warning-only шляху рядок «Перевірка цілісності 7-Zip не пройдена» пишеться рівнем
+  WARNING, а не ERROR (`Test-SevenZipArchiveIntegrity` отримав необов'язкові `-ArchiveFailureLevel` і `-FailureInfo`;
+  без них поведінка інших викликачів незмінна). Регресія:
   `Maintenance/RetentionBrokenOldArchiveDoesNotSetFailureFlags`, `Maintenance/RetentionBrokenOldArchiveStillLogsWarning`,
-  `Maintenance/DirectIntegrityCheckStillSetsFailureFlags`.
+  `Maintenance/DirectIntegrityCheckStillSetsFailureFlags`, `Maintenance/RetentionOldBrokenArchiveNoFlagsSameKeepDeleteSet`,
+  `Maintenance/RetentionOldBrokenArchiveLogsWarningNotError`, `Maintenance/RetentionNewestBrokenRestorePointSetsFailureFlags`,
+  `Maintenance/RetentionAllRestorePointsBrokenSetsFailureFlags`, `Maintenance/RetentionNoValidRestorePointLeftSetsFailureFlags`,
+  `Maintenance/RetentionOldArchiveValidatorMissingSetsFailureFlags`, `Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags`.
 - **Fix: DataRestore: пропущені під час автовибору generation manifest-и тепер дають WARNING (#294).**
   Будь-який manifest, пропущений fail-closed під час автовибору (нечитабельний або не проходить перевірку
   ідентичності), як і раніше не використовується, але тепер кожен такий пропуск рахується як попередження: код

@@ -6617,26 +6617,48 @@ function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
     param(
         [string]$SevenZipPath,
         [string]$ArchivePath,
-        # #300: лише для retention (Remove-OldRestoreArchives), який ОЦІНЮЄ
-        # старі архіви: збій дає WARNING у викликача, але не виставляє
-        # criticalErrorOccurred/restoreIntegrityFailed (інакше зламаний
-        # старий архів робить кожен нічний прогін exit 41).
+        # #300: лише для retention (Remove-OldRestoreArchives) і лише для
+        # СТАРІШИХ (не найновішої) сесій, які він ОЦІНЮЄ: archive-specific
+        # збій (7-Zip відпрацював і забракував архів) дає WARNING, але не
+        # виставляє criticalErrorOccurred/restoreIntegrityFailed (інакше
+        # зламаний старий архів робить кожен нічний прогін exit 41).
+        # Збій ВИКОНАННЯ перевірки (немає 7-Zip, помилка запуску, таймаут)
+        # прапорці виставляє і з цим перемикачем — це не доказ проти
+        # архіву, а непрацююча перевірка (fail-safe).
         [switch]$NoFailureFlags
     )
 
     # T006: fallback-успіх пише WARNING через цей самий Logger (Write-Log
     # -> BRAVOWarningCount -> код 10) і реєструє ім'я архіву в колекторі
     # прогону для одного сповіщення (Add-BRAVOMaintenanceLegacyBomFallbackAlert).
-    $integrityValid = Test-SevenZipArchiveIntegrity `
-        -SevenZipPath $SevenZipPath `
-        -ArchivePath $ArchivePath `
-        -Password $script:ArchivePassword `
-        -TimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
-        -Logger { param($Message, $Level) Write-Log $Message -Level $Level } `
-        -LegacyBomFallbackCollector $script:MaintenanceLegacyBomFallbackArchives
-    if (-not $integrityValid -and -not $NoFailureFlags) {
-        $script:criticalErrorOccurred = $true
-        $script:restoreIntegrityFailed = $true
+    $integrityArguments = @{
+        SevenZipPath = $SevenZipPath
+        ArchivePath = $ArchivePath
+        Password = $script:ArchivePassword
+        TimeoutSeconds = $SevenZipIntegrityTestTimeoutSeconds
+        Logger = { param($Message, $Level) Write-Log $Message -Level $Level }
+        LegacyBomFallbackCollector = $script:MaintenanceLegacyBomFallbackArchives
+    }
+    # Без -NoFailureFlags виклик ідентичний попередньому (без нових
+    # параметрів); з ним — рядок archive-specific збою пишеться WARNING,
+    # а класифікація збою повертається через FailureInfo.
+    $integrityFailureInfo = $null
+    if ($NoFailureFlags) {
+        $integrityFailureInfo = @{}
+        $integrityArguments['ArchiveFailureLevel'] = 'WARNING'
+        $integrityArguments['FailureInfo'] = $integrityFailureInfo
+    }
+    $integrityValid = Test-SevenZipArchiveIntegrity @integrityArguments
+    if (-not $integrityValid) {
+        $archiveSpecificFailure = (
+            $null -ne $integrityFailureInfo -and
+            $integrityFailureInfo.ContainsKey('ArchiveSpecific') -and
+            [bool]$integrityFailureInfo['ArchiveSpecific']
+        )
+        if (-not $NoFailureFlags -or -not $archiveSpecificFailure) {
+            $script:criticalErrorOccurred = $true
+            $script:restoreIntegrityFailed = $true
+        }
     }
     return $integrityValid
 }
@@ -6855,10 +6877,17 @@ function Remove-OldRestoreArchives {
     # До ліміту версій зараховуються лише сесії, що мають хоча б один
     # повністю перевірений архів. Неповна нова сесія не повинна витіснити
     # стару придатну точку відновлення.
+    # #300: найновіша сесія — за тим самим порядком, що й retention нижче
+    # (Name = мітка часу yyyyMMdd_HHmm, за спаданням). Лише СТАРІШІ сесії
+    # перевіряються з -NoFailureFlags; збій 7z t найновішої точки
+    # відновлення лишається критичним (exit 41), як до #300.
+    $newestGroupName = [string](@($archiveGroups | Sort-Object Name -Descending | Select-Object -First 1)[0].Name)
+    $sevenZipIntegrityFailureSeen = $false
     $validGroups = @()
     $invalidGroups = @()
     foreach ($group in $archiveGroups) {
         $validArchiveCount = 0
+        $isOlderGroup = ([string]$group.Name -cne $newestGroupName)
         foreach ($archive in @($group.Group)) {
             $hashPath = "$($archive.FullName).sha512"
             $archiveValid = $false
@@ -6881,7 +6910,8 @@ function Remove-OldRestoreArchives {
                 if (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
                         -SevenZipPath $ARC_PATH `
                         -ArchivePath $archive.FullName `
-                        -NoFailureFlags)) {
+                        -NoFailureFlags:$isOlderGroup)) {
+                    $sevenZipIntegrityFailureSeen = $true
                     throw "перевірка 7z t не пройдена"
                 }
                 $archiveValid = $true
@@ -6896,6 +6926,15 @@ function Remove-OldRestoreArchives {
         } else {
             $invalidGroups += $group
         }
+    }
+
+    # #300: жодної придатної точки відновлення не лишилось, а причиною
+    # (хоча б частково) був збій 7z t — критично, як до #300, навіть якщо
+    # окремі збої старіших сесій були лише WARNING.
+    if (@($validGroups).Count -eq 0 -and $sevenZipIntegrityFailureSeen) {
+        Write-Log "Не лишилось жодної придатної точки відновлення у $Path (перевірка 7z t не пройдена)" -Level "ERROR"
+        $script:criticalErrorOccurred = $true
+        $script:restoreIntegrityFailed = $true
     }
 
     $sortedGroups = @($validGroups | Sort-Object Name -Descending)
