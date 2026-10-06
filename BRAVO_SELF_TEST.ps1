@@ -51,6 +51,13 @@ $script:selfTestTotalStopwatch = [Diagnostics.Stopwatch]::StartNew()
 # ДОЧІРНІЙ області — & { ... }. Тоді його змінні не залишаються тут
 # узагалі. Функції self-test (Test-BRAVOCondition) і $script:-лічильники
 # з дочірньої області доступні без змін.
+#
+# Те саме стосується .GetNewClosure(): динамічний модуль closure НЕ
+# успадковує піднятий тут ліміт (лишається глобальний, типово 4096) і мовчки
+# обрізає копію змінних області, тож пізні змінні в closure стають $null.
+# Closure, що захоплює змінні, будуйте в дочірній області:
+#   & { param($Dep) { ... }.GetNewClosure() } $Dep
+# (guard Governance/SelfTestClosuresCreatedInNarrowScope).
 $script:selfTestVariableCountLimit = 8192
 $MaximumVariableCount = $script:selfTestVariableCountLimit
 
@@ -19582,7 +19589,7 @@ try {
 
         # --- ArchiveHelpers: канонічна реєстрація fallback-у.
         $t006LogEntries = New-Object System.Collections.Generic.List[object]
-        $t006Logger = { param($Message, $Level) $t006LogEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006Logger = & { param($t006LogEntries) { param($Message, $Level) $t006LogEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006LogEntries
         $t006Collector = New-Object 'System.Collections.Generic.List[string]'
         $t006HelperResults = @()
         foreach ($t006ArchiveName in @('legacy_MODEL.7z', 'legacy_BLOG.7z', 'legacy_MODEL.7z')) {
@@ -19612,7 +19619,7 @@ try {
             -Failure "Текст попередження має існувати й не стверджувати, що такі архіви створені лише версіями до 5.2.0 (BOM-префікс давали й 5.2.x): $(@($t006FallbackWarnings | ForEach-Object { $_.Message }) -join ' | ')"
 
         $t006NormalEntries = New-Object System.Collections.Generic.List[object]
-        $t006NormalLogger = { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006NormalLogger = & { param($t006NormalEntries) { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006NormalEntries
         $t006NormalCollector = New-Object 'System.Collections.Generic.List[string]'
         $t006NormalResult = Test-SevenZipArchiveIntegrity `
             -SevenZipPath 'stub-7za' `
@@ -19633,7 +19640,7 @@ try {
         # реєстратор над результатом Invoke-BRAVOSevenZipExtraction.
         $t006ExtractionCollector = New-Object 'System.Collections.Generic.List[string]'
         $t006ExtractionEntries = New-Object System.Collections.Generic.List[object]
-        $t006ExtractionLogger = { param($Message, $Level) $t006ExtractionEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006ExtractionLogger = & { param($t006ExtractionEntries) { param($Message, $Level) $t006ExtractionEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006ExtractionEntries
         $t006LegacyExtraction = Invoke-BRAVOSevenZipExtraction `
             -SevenZipPath 'stub-7za' `
             -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'legacy_BAZA.7z') `
