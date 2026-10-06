@@ -174,6 +174,12 @@ function Get-BRAVODirectories {
         $taPlan2 = & $traceArchiveModule { param($g, $z, $p) Get-BRAVOTraceArchiveUpdatePlan -BacklogGroup $g -SevenZipPath $z -ArchivePassword $p } $taGroup20b $traceArchive7za $traceArchivePassword
         $taDiagLog = New-Object System.Collections.Generic.List[string]
         $taDiagLogger = { param($Message, $Level) [void]$taDiagLog.Add("[$Level] $Message") }.GetNewClosure()
+        try { Write-Host ("DIAG374 localVars=" + @(Get-Variable -Scope 0).Count + " diagNull=" + ($null -eq $taDiagLog) + " planNull=" + ($null -eq $taPlan2) + " groupNull=" + ($null -eq $taGroup20b) + " EAP=" + $ErrorActionPreference) } catch { Write-Host "DIAG374 a-fail $($_.Exception.Message)" }
+        try { $diagModVar = $taDiagLogger.Module.SessionState.PSVariable.Get('taDiagLog'); Write-Host ("DIAG374 modVarExists=" + ($null -ne $diagModVar) + " modVarValueNull=" + ($null -ne $diagModVar -and $null -eq $diagModVar.Value)) } catch { Write-Host "DIAG374 b-fail $($_.Exception.Message)" }
+        try { $diagModCount = & $taDiagLogger.Module { @(Get-Variable).Count }; Write-Host "DIAG374 modVarCount=$diagModCount max=$MaximumVariableCount" } catch { Write-Host "DIAG374 c-fail $($_.Exception.Message)" }
+        try { $diagNo = Get-Command New-Object; Write-Host ("DIAG374 newObject=" + $diagNo.CommandType + "/" + $diagNo.Source) } catch { Write-Host "DIAG374 d-fail $($_.Exception.Message)" }
+        try { & $taDiagLogger 'probe' 'INFO'; Write-Host "DIAG374 probe-ok count=$($taDiagLog.Count)" } catch { Write-Host "DIAG374 probe-fail $($_.Exception.Message)" }
+        try { Write-Host ("DIAG374 plan new=" + @($taPlan2.NewFiles).Count + " dup=" + @($taPlan2.DuplicateFiles).Count) } catch { Write-Host "DIAG374 e-fail $($_.Exception.Message)" }
         $taUpdate2 = & $traceArchiveModule { param($g, $pl, $z, $ap, $p, $lg) Update-BRAVOTraceDailyArchive -BacklogGroup $g -Plan $pl -SevenZipPath $z -AddParameters $ap -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 -Logger $lg } $taGroup20b $taPlan2 $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taDiagLogger
         $taInventoryAfter = BRAVO.Compatibility\Get-BRAVOSevenZipArchiveEntries -SevenZipPath $traceArchive7za -ArchivePath $taGroup20.ArchivePath -Password $traceArchivePassword
         $taOldPreserved = $true
