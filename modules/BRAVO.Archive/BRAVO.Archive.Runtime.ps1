@@ -619,7 +619,15 @@ function Test-Compatibility {
             Write-BRAVOLog -Component 'STARTUP' -Message "$($osSupportTier.Message) Продовжено через BRAVO_ALLOW_UNSUPPORTED_OS=1." -Level "WARNING"
         } else {
             Write-BRAVOLog -Component 'STARTUP' -Message $osSupportTier.Message -Level "ERROR"
-            exit (Resolve-BRAVOExitCode -InvalidConfiguration)
+            # #291: exit оминає хвіст Main — статус пишемо тут. Виклик іде з
+            # Main після lock і конфігурації ($stateRoot), тож це статус
+            # саме цього прогону.
+            $unsupportedOsExitCode = Resolve-BRAVOExitCode -InvalidConfiguration
+            Write-BRAVOArchiveOperationStatus `
+                -ExitCode $unsupportedOsExitCode `
+                -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
+                -EarlyExitReason 'UnsupportedOperatingSystem'
+            exit $unsupportedOsExitCode
         }
     }
 
@@ -673,7 +681,13 @@ function Test-Compatibility {
 
         if ($script:BRAVOToolManifest.ShouldBlock) {
             Send-ToolIntegrityAlert -Result $script:BRAVOToolManifest
-            exit (Resolve-BRAVOExitCode -ToolIntegrityViolation)
+            # #291: як і для непідтримуваної ОС — статус перед exit.
+            $toolIntegrityExitCode = Resolve-BRAVOExitCode -ToolIntegrityViolation
+            Write-BRAVOArchiveOperationStatus `
+                -ExitCode $toolIntegrityExitCode `
+                -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
+                -EarlyExitReason 'ToolIntegrityViolation'
+            exit $toolIntegrityExitCode
         }
     } elseif (-not [string]::IsNullOrWhiteSpace([string]$script:BRAVOToolManifest.Message)) {
         Write-BRAVOLog -Component 'STARTUP' -Message $script:BRAVOToolManifest.Message -Level "WARNING"
@@ -6449,6 +6463,47 @@ function Write-BRAVOArchivePreflightFailureSummary {
     Complete-BRAVOProgress
 }
 
+function Write-BRAVOArchiveOperationStatus {
+    # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status) для
+    # Archive: ЄДИНИЙ запис статусу для хвоста Main і контрольованих ранніх
+    # виходів під lock (#291: preflight вільного місця, orphan VSS,
+    # Test-Compatibility). Без нього ранній вихід лишав статус попереднього
+    # прогону, і моніторинг бачив "OK" при щоночному exit 40. Lock busy і
+    # catch-up skip його НЕ викликають навмисно (див. там). Fail-soft:
+    # помилка запису лише логується і ніколи не змінює результат Archive
+    # (інваріант «telemetry не змінює exit code»); exit code — параметром,
+    # уже обчислений викликачем.
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][datetime]$StartedAt,
+        [hashtable]$Details = @{},
+        # Ранній вихід: деталі — ідентифікатор generation і причина
+        # (без сирих повідомлень, шляхів чи секретів).
+        [string]$EarlyExitReason
+    )
+
+    try {
+        $statusDetails = $Details
+        if (-not [string]::IsNullOrWhiteSpace($EarlyExitReason)) {
+            $statusDetails = @{
+                generationId = [string]$script:backupGenerationId
+                generationStatus = [string]$script:backupGenerationStatus
+                earlyTermination = $true
+                earlyExitReason = $EarlyExitReason
+            }
+        }
+        Write-BRAVOOperationStatus `
+            -StateRoot $stateRoot `
+            -Operation Archive `
+            -ExitCode $ExitCode `
+            -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
+            -StartedAt $StartedAt `
+            -Details $statusDetails
+    } catch {
+        Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)"
+    }
+}
+
 function Enter-BRAVOArchiveProcessLock {
     # Спільний lock для BRAVO_ARCHIV і BRAVO_MAINTENANCE. Він не дозволяє
     # maintenance зупиняти служби або змінювати джерела під час backup.
@@ -6729,6 +6784,8 @@ function Main {
             "або файл блокування недоступний: $($processLockResult.Error)"
         ) -Level "ERROR"
         $script:processExitCode = Resolve-BRAVOExitCode -LockBusy
+        # Статус-файл тут навмисно НЕ пишемо (#291): lock тримає інший
+        # екземпляр, і запис перезаписав би статус прогону, що ще триває.
         return
     }
     $script:archiveProcessLock = $processLockResult.Stream
@@ -6775,6 +6832,10 @@ function Main {
             $orphanCleanupResult.Error
         ) -Level 'ERROR'
         $script:processExitCode = Resolve-BRAVOExitCode -LocalArchiveFailed
+        Write-BRAVOArchiveOperationStatus `
+            -ExitCode $script:processExitCode `
+            -StartedAt $scriptStartTime `
+            -EarlyExitReason 'OrphanVssCleanup'
         return
     }
     if ($orphanCleanupResult.Found) {
@@ -7313,6 +7374,11 @@ function Main {
         Write-BRAVOArchivePreflightFailureSummary `
             -StartedAt $scriptStartTime `
             -Reason $archiveFreeSpaceReason
+        # Код 40 обчислено в summary вище.
+        Write-BRAVOArchiveOperationStatus `
+            -ExitCode $script:processExitCode `
+            -StartedAt $scriptStartTime `
+            -EarlyExitReason 'FreeSpacePreflight'
         return
     }
 
@@ -9085,7 +9151,8 @@ function Main {
     # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status):
     # ПІСЛЯ обчислення exit code, fail-soft — помилка запису лише
     # логується і ніколи не змінює результат Archive (інваріант
-    # «telemetry не змінює exit code»).
+    # «telemetry не змінює exit code»). Сам запис — у helper'і, спільному
+    # з ранніми виходами (#291); try тут лишається для збору агрегатів.
     try {
         $statusComponentsTotal = @($enabledArchives).Count
         $statusComponentsSucceeded = @($results.Values | Where-Object { [bool]$_.ArchiveSuccess }).Count
@@ -9098,11 +9165,8 @@ function Main {
                 $statusTotalCreatedBytes += [long]$statusComponentResult['Bytes']
             }
         }
-        Write-BRAVOOperationStatus `
-            -StateRoot $stateRoot `
-            -Operation Archive `
+        Write-BRAVOArchiveOperationStatus `
             -ExitCode $script:processExitCode `
-            -ExitCodeName (Get-BRAVOExitCodeName -Code $script:processExitCode) `
             -StartedAt $scriptStartTime `
             -Details @{
                 generationId = [string]$script:backupGenerationId

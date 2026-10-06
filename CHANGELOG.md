@@ -2,6 +2,22 @@
 
 ## Не випущено (developer)
 
+- **Fix: Archive: status-файл оновлюється і при ранніх виходах (#291).**
+  `BRAVO_STATUS_Archive.json` писався лише у хвості `Main` і у fatal catch. Провал preflight вільного
+  місця (exit 40), провал очищення orphan VSS (exit 40) і `exit` усередині `Test-Compatibility`
+  (непідтримувана ОС — 30, заблокована цілісність інструментів — 32) лишали статус попереднього
+  прогону: після вчорашнього успіху моніторинг далі бачив OK з exit 0, хоча кожна ніч завершувалась
+  помилкою. Тепер запис іде через один fail-soft helper `Write-BRAVOArchiveOperationStatus` (хвіст
+  `Main` і всі ці виходи); у деталях раннього виходу — `earlyTermination` і `earlyExitReason`. Збій
+  запису, як і раніше, лише логується і не змінює код завершення. Lock busy (exit 20) статус навмисно
+  не пише: lock тримає інший екземпляр, і запис перезаписав би статус прогону, що ще триває;
+  catch-up skip, як і раніше, лишає статус останнього справжнього прогону. Регресія:
+  `Archive/OrchestrationFreeSpacePreflightFailureWritesStatus`,
+  `Archive/OrchestrationOrphanVssCleanupFailureWritesStatus`, `Archive/OrchestrationLockBusyDoesNotWriteStatus`
+  в orchestration-пробі, `Archive/CompatibilityExitsWriteStatusBeforeExit` (AST) і
+  `Status/CallSiteAfterExitCode[ArchiveTail]`; контракт `Status/CallSiteIsFailSoft[Archive]` тепер
+  перевіряє helper.
+
 - **Fix: Maintenance: перевірка розмірів `.md` виконується після реставрації моделі, а не до неї.**
   bravocmd repair штатно стискає `.md`: у реальному прогоні файл 1,64 ГБ (понад ліміт 1536 МБ) після
   реставрації став 1,21 ГБ, але сповіщення «.md перевищує ліміт» уже пішло, бо перевірка стояла перед
