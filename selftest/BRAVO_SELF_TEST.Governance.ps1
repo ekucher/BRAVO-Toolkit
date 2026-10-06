@@ -6574,3 +6574,144 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
         -Failure "виняток/збій robocopy після backup і до проходження гейтів мусить запускати той самий точний відкат (прапорець DeployStarted між backup і розгортанням, відкат у catch, exit 2 при невдачі) — інакше лишається напіврозгорнутий комплект із exit 33 (#289)"
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/GenericObjectListBinderGate' } }
+if (Enter-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope') { try {
+
+# =====================================================================
+# P2-selftest-scope: .GetNewClosure() у великій області self-test
+# =====================================================================
+# BRAVO_SELF_TEST.ps1 піднімає $MaximumVariableCount своєї області до
+# 8192 (#163), а динамічний модуль, який створює .GetNewClosure(),
+# лишається з глобальним лімітом (типово 4096). Копіювання змінних у
+# модуль ковтає переповнення без помилки, тож найпізніші змінні області
+# у closure тихо стають $null (PR #374: логер TraceArchive на CI).
+# Безпечна ідіома: будувати closure у вузькому дочірньому scope, який
+# отримує лише свої залежності:
+#   $callback = & { param($Dependency) { ...$Dependency... }.GetNewClosure() } $dependency
+& {
+    # --- Структурний guard: closure, що захоплює зовнішні змінні, ---
+    # --- створюється лише у функції або в дочірньому scope & { }. ---
+    # Не залежить від версії PowerShell і від кількості змінних: ловить
+    # сам шаблон до того, як він дасть тиху втрату на якомусь хості.
+    function Test-BRAVOSelfTestClosureNarrowScope {
+        param([Parameter(Mandatory = $true)]$CallAst)
+        $parentAst = $CallAst.Parent
+        while ($null -ne $parentAst) {
+            if ($parentAst -is [Management.Automation.Language.FunctionDefinitionAst]) { return $true }
+            if ($parentAst -is [Management.Automation.Language.ScriptBlockExpressionAst]) {
+                $ownerAst = $parentAst.Parent
+                if ($ownerAst -is [Management.Automation.Language.CommandAst] -and
+                    $ownerAst.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Ampersand) {
+                    return $true
+                }
+            }
+            $parentAst = $parentAst.Parent
+        }
+        return $false
+    }
+
+    function Get-BRAVOSelfTestClosureCapturedNames {
+        param([Parameter(Mandatory = $true)]$CallAst)
+        $bodyAst = $null
+        if ($CallAst.Expression -is [Management.Automation.Language.ScriptBlockExpressionAst]) {
+            $bodyAst = $CallAst.Expression.ScriptBlock
+        }
+        if ($null -eq $bodyAst) { return @('<не literal scriptblock>') }
+        $localNames = @{}
+        foreach ($parameterAst in @($bodyAst.FindAll({ param($node) $node -is [Management.Automation.Language.ParameterAst] }, $true))) {
+            $localNames[$parameterAst.Name.VariablePath.UserPath] = $true
+        }
+        foreach ($assignmentAst in @($bodyAst.FindAll({ param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] }, $true))) {
+            $leftAst = $assignmentAst.Left
+            if ($leftAst -is [Management.Automation.Language.ConvertExpressionAst]) { $leftAst = $leftAst.Child }
+            if ($leftAst -is [Management.Automation.Language.VariableExpressionAst]) {
+                $localNames[$leftAst.VariablePath.UserPath] = $true
+            }
+        }
+        foreach ($loopAst in @($bodyAst.FindAll({ param($node) $node -is [Management.Automation.Language.ForEachStatementAst] }, $true))) {
+            $localNames[$loopAst.Variable.VariablePath.UserPath] = $true
+        }
+        $automaticNames = @('_', 'PSItem', 'args', 'input', 'this', 'true', 'false', 'null',
+            'Error', 'LASTEXITCODE', 'PSBoundParameters', 'MyInvocation', 'PSCmdlet',
+            'ErrorActionPreference', 'PSScriptRoot', 'PSCommandPath', 'Matches', 'PSVersionTable')
+        $capturedNames = @{}
+        foreach ($variableAst in @($bodyAst.FindAll({ param($node) $node -is [Management.Automation.Language.VariableExpressionAst] }, $true))) {
+            $variablePath = $variableAst.VariablePath
+            if ($variablePath.IsDriveQualified -or $variablePath.IsGlobal -or $variablePath.IsScript) { continue }
+            $variableName = $variablePath.UserPath
+            if ($localNames.ContainsKey($variableName) -or ($automaticNames -contains $variableName)) { continue }
+            $capturedNames[$variableName] = $true
+        }
+        return @($capturedNames.Keys | Sort-Object)
+    }
+
+    $closureScanFiles = New-Object System.Collections.Generic.List[string]
+    $closureScanFiles.Add((Join-Path $root 'BRAVO_SELF_TEST.ps1'))
+    foreach ($closureFragment in @(Get-ChildItem -LiteralPath (Join-Path $root 'selftest') -Filter '*.ps1' | Sort-Object Name)) {
+        $closureScanFiles.Add($closureFragment.FullName)
+    }
+    $closureOffenders = New-Object System.Collections.Generic.List[string]
+    $closureParseFailures = New-Object System.Collections.Generic.List[string]
+    $closureSiteCount = 0
+    foreach ($closureFile in $closureScanFiles) {
+        $closureParsed = Get-BRAVOSelfTestParsedFile -Path $closureFile
+        $closureRelative = $closureFile.Substring($root.Length).TrimStart('\', '/')
+        if (@($closureParsed.Errors).Count -gt 0) { $closureParseFailures.Add($closureRelative); continue }
+        $closureCalls = @($closureParsed.Ast.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                    $node.Member.Value -eq 'GetNewClosure'
+                }, $true))
+        foreach ($closureCall in $closureCalls) {
+            $closureSiteCount++
+            if (Test-BRAVOSelfTestClosureNarrowScope -CallAst $closureCall) { continue }
+            $closureCaptured = @(Get-BRAVOSelfTestClosureCapturedNames -CallAst $closureCall)
+            if ($closureCaptured.Count -eq 0) { continue }
+            $closureOffenders.Add(("{0}:{1} [{2}]" -f $closureRelative, $closureCall.Extent.StartLineNumber, ($closureCaptured -join ',')))
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($closureSiteCount -gt 0 -and $closureParseFailures.Count -eq 0 -and $closureOffenders.Count -eq 0) `
+        -Name 'Governance/SelfTestClosuresCreatedInNarrowScope' `
+        -Failure ("closure, що захоплює зовнішні змінні, у self-test створюється лише у функції або в дочірньому scope (& { param(`$Dep) { ... }.GetNewClosure() } `$dep): у великій області self-test модуль closure обрізається на глобальному ліміті змінних, і пізні змінні тихо стають `$null. Сайтів знайдено: $closureSiteCount; помилки розбору: [$([string]::Join(', ', $closureParseFailures.ToArray()))]; порушники ($($closureOffenders.Count)): $([string]::Join('; ', $closureOffenders.ToArray()))")
+
+    # --- Поведінкова характеризація (лише Windows PowerShell) ---
+    # Відтворює умови self-test у дочірньому scope: локальний ліміт
+    # піднято, змінних більше за глобальний ліміт, залежність створена
+    # останньою. Поріг не зашитий числом: він береться з глобального
+    # $MaximumVariableCount хоста. У PowerShell 7 цього ліміту немає,
+    # тож там характеризація не має що відтворювати.
+    $closureGlobalLimitVariable = Get-Variable -Name MaximumVariableCount -Scope Global -ErrorAction SilentlyContinue
+    if ($PSVersionTable.PSVersion.Major -le 5 -and $null -ne $closureGlobalLimitVariable) {
+        $closureProbe = & {
+            param([int]$GlobalLimit)
+            $MaximumVariableCount = $GlobalLimit * 4
+            for ($padIndex = 0; $padIndex -lt ($GlobalLimit + 256); $padIndex++) {
+                Set-Variable -Name ("closurePad$padIndex") -Value $padIndex
+            }
+            $closureDependency = New-Object System.Collections.Generic.List[string]
+            $directCallback = { param($Message) if ($null -ne $closureDependency) { [void]$closureDependency.Add($Message) } }.GetNewClosure()
+            $narrowCallback = & { param($closureDependency) { param($Message) if ($null -ne $closureDependency) { [void]$closureDependency.Add($Message) } }.GetNewClosure() } $closureDependency
+            try { & $directCallback 'direct' } catch { $null = $_ }
+            & $narrowCallback 'narrow'
+            [pscustomobject]@{
+                Direct = $closureDependency.Contains('direct')
+                Narrow = $closureDependency.Contains('narrow')
+            }
+        } ([int]$closureGlobalLimitVariable.Value)
+        Test-BRAVOCondition `
+            -Condition ($closureProbe.Narrow -eq $true) `
+            -Name 'Governance/SelfTestClosureNarrowScopeSurvivesLargeCreatorScope' `
+            -Failure "closure, побудований у дочірньому scope, мусить бачити залежність навіть тоді, коли область-творець має більше змінних, ніж глобальний ліміт: Narrow=$($closureProbe.Narrow)"
+        # Чутливість: без цієї перевірки попередня могла б проходити на
+        # хості, де небезпеку взагалі не відтворено (тавтологія). Якщо
+        # майбутнє оновлення PowerShell прибере обрізання, тут буде
+        # чесний [FAIL] з поясненням, а не тихий PASS.
+        Test-BRAVOCondition `
+            -Condition ($closureProbe.Direct -eq $false) `
+            -Name 'Governance/SelfTestClosureHazardReproducedOnHost' `
+            -Failure "характеризація очікує, що closure, побудований прямо у великій області, губить пізню залежність (обрізання на глобальному ліміті змінних). Direct=$($closureProbe.Direct): небезпеку на цьому хості не відтворено; перегляньте P2-selftest-scope і цю пробу"
+    }
+}
+
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope' } }
