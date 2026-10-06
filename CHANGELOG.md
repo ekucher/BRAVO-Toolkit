@@ -11,6 +11,15 @@
   `Get-BRAVORestoreGenerationManifest`. Явний `-GenerationId` не змінено. Тести:
   `DataRestore/SftpManifestAutomaticSelectionReportsSkipped*`, matrix combo
   `OutOfPlace-MODEL-CorruptNewestManifestSkippedWithWarning`.
+- **Fix: Archive: оцінка потрібного місця вимірює production-джерело `<SRC>\*` (#284).**
+  Джерела MODEL/BLOG/BRAVOEXCH у конфігурації мають форму `<SRC>\*` (так 7-Zip бере вміст каталогу), а
+  `Get-BRAVOArchiveEstimatedSpaceRequirement` перевіряла цей шлях як літеральний і не вимірювала каталог. Через це
+  компонент без валідної історії (перший запуск або всі попередні архіви невалідні) отримував `EstimateBasis=Unknown`
+  і випадав з оцінки по тому, а стеля `HistoryCappedBySource` не діяла: перед запуском лишався тільки фіксований поріг.
+  Тепер завершальний `\*` знімається перед виміром, роздільник лишається (корінь тому `D:\*` -> `D:\`). Інші
+  шаблони не змінюються. Наслідок: на сервері, де вільного місця менше за розмір джерела компонента без історії,
+  preflight тепер зупиняє прогін з кодом 40 до 7-Zip/VSS. Регресія: `Archive/EstimatedSpaceBootstrapMeasuresProductionStarSource`,
+  `Archive/EstimatedSpaceHistoryCappedByProductionStarSource`.
 
 - **Fix: Maintenance: перевірка розмірів `.md` виконується після реставрації моделі, а не до неї.**
   bravocmd repair штатно стискає `.md`: у реальному прогоні файл 1,64 ГБ (понад ліміт 1536 МБ) після
