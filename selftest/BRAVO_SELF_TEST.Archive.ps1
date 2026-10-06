@@ -1286,7 +1286,7 @@ $sftpTimeoutModule = New-BRAVOSelfTestRuntimeModule `
 Import-Module -Name (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1') -Force -ErrorAction Stop
 Import-Module -Name (Join-Path $root 'modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1') -Force -ErrorAction Stop
 
-$sftpTimeoutRoot = Join-Path $env:TEMP "BRAVOSelfTest_SftpTimeout_$([Guid]::NewGuid().ToString('N'))"
+$sftpTimeoutRoot = Join-Path ([IO.Path]::GetTempPath()) "BRAVOSelfTest_SftpTimeout_$([Guid]::NewGuid().ToString('N'))"
 $sftpTimeoutHadGlobalLogPath = Test-Path -LiteralPath 'Variable:global:logPath'
 $sftpTimeoutPreviousGlobalLogPath = if ($sftpTimeoutHadGlobalLogPath) { $global:logPath } else { $null }
 $sftpTimeoutProbe = $null
