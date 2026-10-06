@@ -4395,6 +4395,12 @@ exit
                 $winSCPExited = $false
             }
             if (-not $winSCPExited) {
+                # Lock-потік має жити до завершення ПРОЦЕСУ BRAVO: без
+                # довгоживучого посилання FileStream після виходу з функції
+                # міг би бути фіналізований GC і звільнити lock, поки WinSCP
+                # ще працює (а finally Archive далі запускає WinSCP для
+                # вивантаження власного журналу). Тримаємо його в script scope.
+                $script:BRAVOWinSCPLockHeldForLiveProcess = $outputCapture
                 Write-BRAVOLog `
                     -Component 'SFTP' `
                     -Message "Перевищено таймаут перевірки SFTP-з'єднання, але WinSCP не завершився; BRAVO_WINSCP lock не звільняється" `

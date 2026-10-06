@@ -1402,9 +1402,10 @@ Test-BRAVOCondition `
         $sftpTimeoutBranchMatch.Success -and
         $sftpNotExitedBlockMatch.Success -and
         -not $sftpNotExitedBlockMatch.Value.Contains('Complete-BRAVOProcessOutputCapture') -and
+        $sftpNotExitedBlockMatch.Value -match '\$script:\w+\s*=\s*\$outputCapture\b' -and
         $sftpHasExitedIndex -ge 0 -and
         $sftpCompleteIndex -gt $sftpHasExitedIndex -and
         $sftpNotExitedBlockMatch.Index -lt $sftpCompleteIndex
     ) `
     -Name 'Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive' `
-    -Failure 'гілка таймауту Test-SFTPConnection має перевірити $process.HasExited ДО Complete-BRAVOProcessOutputCapture і, якщо WinSCP не завершився, кинути виняток без звільнення BRAVO_WINSCP lock'
+    -Failure 'гілка таймауту Test-SFTPConnection має перевірити $process.HasExited ДО Complete-BRAVOProcessOutputCapture і, якщо WinSCP не завершився, кинути виняток без звільнення BRAVO_WINSCP lock, зберігши capture (з lock-потоком) у script scope, щоб GC не звільнив lock'
