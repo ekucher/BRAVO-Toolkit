@@ -21780,6 +21780,263 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure "прямий (не retention) виклик Test-BRAVOMaintenanceSevenZipArchiveIntegrity на зламаному архіві має, як і раніше, повертати `$false і виставляти обидва прапорці"
 
     # ================================================================
+    # #300 (follow-up review): -NoFailureFlags у retention дозволено лише
+    # для СТАРІШИХ сесій і лише для archive-specific збою (7-Zip
+    # відпрацював і забракував архів). Критичними (critical +
+    # restoreIntegrityFailed, exit 41) лишаються: зламана НАЙНОВІША
+    # точка відновлення; відсутність жодної придатної точки; збій
+    # ВИКОНАННЯ перевірки (немає 7-Zip / таймаут) навіть для старої
+    # сесії. На warning-only шляху рядок "не пройдена" — WARNING, не
+    # ERROR; набори збережених/видалених файлів — як до зміни.
+    # Реальні функції (AST): Remove-OldRestoreArchives,
+    # Test-BRAVOMaintenanceSevenZipArchiveIntegrity, канонічний
+    # Test-SevenZipArchiveIntegrity; застабовано лише процесний шар
+    # 7-Zip (Invoke-BRAVOSevenZipIntegrityTest), повертаючи ту саму
+    # форму результату, що Invoke-BRAVOSevenZipIntegrityTestCore.
+    # ================================================================
+    $retentionFollowupModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $retentionIntegritySourceText `
+        -FunctionNames @(
+            'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
+            'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
+            'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            'Register-BRAVOLegacyBomPasswordFallback'
+        )
+    $retentionFollowupStubScriptText = {
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO')
+            [void]$script:retentionFollowupLogLines.Add("[$Level] $Message")
+        }
+        function Get-BRAVOFileHash {
+            param([string]$Path, [string]$Algorithm)
+            return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
+        }
+        function Invoke-BRAVOSevenZipIntegrityTest {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSAvoidUsingPlainTextForPassword', 'Password',
+                Justification = 'Self-test stub: сигнатура справжнього Invoke-BRAVOSevenZipIntegrityTest.')]
+            param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+            $null = $Password
+            $null = $TimeoutSeconds
+            $stubArchiveText = [IO.File]::ReadAllText($ArchivePath)
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-BROKEN-ARCHIVE') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = 'ERROR: Data Error'
+                }
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-MISSING') {
+                # Форма Invoke-BRAVOSevenZipIntegrityTestCore, коли 7-Zip
+                # не знайдено: виняток до запуску процесу, ExitCode $null.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = $null
+                    Description = "7-Zip не знайдено: $SevenZipPath"; TimedOut = $false
+                    Error = "7-Zip не знайдено: $SevenZipPath"
+                    StandardOutput = ''; StandardError = ''
+                }
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = $null
+                    Description = 'перевищено час очікування'; TimedOut = $true; Error = $null
+                    StandardOutput = ''; StandardError = ''
+                }
+            }
+            return New-Object PSObject -Property @{
+                Success = $true; ExitCode = 0; Description = 'No error'
+                TimedOut = $false; Error = $null
+                StandardOutput = 'Everything is Ok'; StandardError = ''
+            }
+        }
+    }.ToString()
+    $retentionFollowupPrefix = 'RETFUP'
+    $retentionFollowupSession = {
+        param([string]$Session, [string]$Content, [bool]$Stale = $false, [bool]$NoHash = $false)
+        return @{ Session = $Session; Content = $Content; Stale = $Stale; NoHash = $NoHash }
+    }
+    $retentionFollowupRunScenario = {
+        param([string]$ScenarioName, [object[]]$Sessions, [int]$KeepCount)
+        $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+            ("BRAVO_RETENTION_FOLLOWUP_{0}_{1}" -f $ScenarioName, [guid]::NewGuid().ToString("N"))
+        [void][IO.Directory]::CreateDirectory($scenarioRoot)
+        try {
+            foreach ($scenarioSession in $Sessions) {
+                $fileName = "{0}_before_{1}.mdz" -f $retentionFollowupPrefix, $scenarioSession['Session']
+                $archivePath = Join-Path $scenarioRoot $fileName
+                [IO.File]::WriteAllText($archivePath, [string]$scenarioSession['Content'])
+                if (-not $scenarioSession['NoHash']) {
+                    $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash
+                    "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+                }
+                if ($scenarioSession['Stale']) {
+                    [IO.File]::SetLastWriteTime($archivePath, (Get-Date).AddDays(-90))
+                }
+            }
+            $scenarioOutcome = & $retentionFollowupModule {
+                param($Path, $Prefix, $StubScriptText, $Keep)
+                Set-StrictMode -Version Latest
+                . ([scriptblock]::Create($StubScriptText))
+                $script:retentionFollowupLogLines = New-Object System.Collections.ArrayList
+                $script:ArchivePrefixRegex = [regex]::Escape($Prefix)
+                $script:ARC_PATH = 'unused-stub-path'
+                $script:ArchivePassword = 'selftest-fixture'
+                $script:SevenZipIntegrityTestTimeoutSeconds = 60
+                $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
+                $script:criticalErrorOccurred = $false
+                $script:restoreIntegrityFailed = $false
+                $retentionThrew = $null
+                try {
+                    Remove-OldRestoreArchives -Path $Path -ArchivePrefix $Prefix -KeepCount $Keep -InvalidRetentionDays 30
+                } catch {
+                    $retentionThrew = $_.Exception.Message
+                }
+                [pscustomobject]@{
+                    Threw = $retentionThrew
+                    Critical = [bool]$script:criticalErrorOccurred
+                    RestoreFailed = [bool]$script:restoreIntegrityFailed
+                    Log = (@($script:retentionFollowupLogLines) -join "`n")
+                }
+            } $scenarioRoot $retentionFollowupPrefix $retentionFollowupStubScriptText $KeepCount
+            $remainingNames = @(
+                Get-ChildItem -LiteralPath $scenarioRoot -File -ErrorAction SilentlyContinue |
+                    ForEach-Object { $_.Name } | Sort-Object
+            )
+            $scenarioOutcome | Add-Member -NotePropertyName Remaining -NotePropertyValue ($remainingNames -join '|') -Force
+            return $scenarioOutcome
+        } finally {
+            if (Test-Path -LiteralPath $scenarioRoot) {
+                Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    $retentionFollowupExpectedFiles = {
+        param([string[]]$SessionNames)
+        $expectedNames = foreach ($expectedSession in $SessionNames) {
+            "{0}_before_{1}.mdz" -f $retentionFollowupPrefix, $expectedSession
+            "{0}_before_{1}.mdz.sha512" -f $retentionFollowupPrefix, $expectedSession
+        }
+        return (@($expectedNames | Sort-Object) -join '|')
+    }
+    $retentionFollowupFailedLinePattern = 'Перев[iі]рка ц[iі]л[iі]сност[iі] 7-Zip не пройдена'
+    $retentionFollowupBroken = 'BRAVO-SELFTEST-BROKEN-ARCHIVE'
+
+    # (a) Зламані СТАРІ сесії (одна свіжа за mtime, одна застаріла) при
+    # трьох валідних новіших, KeepCount=2. Як і до зміни: свіжа зламана
+    # лишається (непридатна, але не старша за 30 днів), застаріла зламана
+    # видаляється, найстаріша валідна понад ліміт видаляється.
+    $retentionFollowupOld = & $retentionFollowupRunScenario 'OldBroken' @(
+        (& $retentionFollowupSession '20260101_0100' $retentionFollowupBroken),
+        (& $retentionFollowupSession '20260101_0200' $retentionFollowupBroken $true),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2'),
+        (& $retentionFollowupSession '20260104_0100' 'synthetic-ok-3')
+    ) 2
+    $retentionFollowupOldExpected = & $retentionFollowupExpectedFiles @('20260101_0100', '20260103_0100', '20260104_0100')
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupOld -and
+            $null -eq $retentionFollowupOld.Threw -and
+            -not $retentionFollowupOld.Critical -and
+            -not $retentionFollowupOld.RestoreFailed -and
+            $retentionFollowupOld.Remaining -ceq $retentionFollowupOldExpected
+        ) `
+        -Name "Maintenance/RetentionOldBrokenArchiveNoFlagsSameKeepDeleteSet" `
+        -Failure ("зламані старі сесії: без прапорців і з тим самим набором збережених/видалених файлів; critical={0}, restoreIntegrityFailed={1}, threw={2}, лишилось=[{3}], очікувано=[{4}]" -f $retentionFollowupOld.Critical, $retentionFollowupOld.RestoreFailed, $retentionFollowupOld.Threw, $retentionFollowupOld.Remaining, $retentionFollowupOldExpected)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupOld -and
+            [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[WARNING\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100') -and
+            [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ' + [regex]::Escape("${retentionFollowupPrefix}_before_20260101_0100.mdz")) -and
+            -not [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[ERROR\]')
+        ) `
+        -Name "Maintenance/RetentionOldBrokenArchiveLogsWarningNotError" `
+        -Failure ("warning-only шлях (стара сесія, archive-specific збій) має писати рядок 'не пройдена' і 'не зараховано' рівнем WARNING і жодного ERROR; журнал: {0}" -f $retentionFollowupOld.Log)
+
+    # (b) Зламана НАЙНОВІША точка відновлення — критично, як до #300.
+    $retentionFollowupNewest = & $retentionFollowupRunScenario 'NewestBroken' @(
+        (& $retentionFollowupSession '20260101_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-2'),
+        (& $retentionFollowupSession '20260103_0100' $retentionFollowupBroken)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupNewest -and
+            $null -eq $retentionFollowupNewest.Threw -and
+            $retentionFollowupNewest.Critical -and
+            $retentionFollowupNewest.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupNewest.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260103_0100') -and
+            $retentionFollowupNewest.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260101_0100', '20260102_0100', '20260103_0100'))
+        ) `
+        -Name "Maintenance/RetentionNewestBrokenRestorePointSetsFailureFlags" `
+        -Failure ("збій 7z t НАЙНОВІШОЇ сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed (exit 41) і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupNewest.Critical, $retentionFollowupNewest.RestoreFailed, $retentionFollowupNewest.Threw, $retentionFollowupNewest.Log)
+
+    # (c) Усі сесії зламані — жодної придатної точки відновлення.
+    $retentionFollowupAll = & $retentionFollowupRunScenario 'AllBroken' @(
+        (& $retentionFollowupSession '20260101_0100' $retentionFollowupBroken),
+        (& $retentionFollowupSession '20260102_0100' $retentionFollowupBroken)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupAll -and
+            $null -eq $retentionFollowupAll.Threw -and
+            $retentionFollowupAll.Critical -and
+            $retentionFollowupAll.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionAllRestorePointsBrokenSetsFailureFlags" `
+        -Failure ("коли зламані всі сесії, `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed мають бути виставлені; critical={0}, restoreIntegrityFailed={1}, threw={2}" -f $retentionFollowupAll.Critical, $retentionFollowupAll.RestoreFailed, $retentionFollowupAll.Threw)
+
+    # (c2) Найновіша сесія непридатна без 7z (немає .sha512), старіша
+    # зламана для 7z t — придатних точок 0; критично, як до #300.
+    $retentionFollowupNone = & $retentionFollowupRunScenario 'NoValidLeft' @(
+        (& $retentionFollowupSession '20260101_0100' $retentionFollowupBroken),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-unhashed' $false $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupNone -and
+            $null -eq $retentionFollowupNone.Threw -and
+            $retentionFollowupNone.Critical -and
+            $retentionFollowupNone.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionNoValidRestorePointLeftSetsFailureFlags" `
+        -Failure ("якщо після оцінки не лишилось жодної придатної точки відновлення через збій 7z t, прапорці мають бути виставлені; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupNone.Critical, $retentionFollowupNone.RestoreFailed, $retentionFollowupNone.Threw, $retentionFollowupNone.Log)
+
+    # (d) Стара сесія, але перевірка НЕ ВИКОНАЛАСЬ (немає 7-Zip / таймаут)
+    # — це не доказ проти архіву, а непрацюючий валідатор: fail-safe.
+    $retentionFollowupValidatorMissing = & $retentionFollowupRunScenario 'ValidatorMissing' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-VALIDATOR-MISSING'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2')
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupValidatorMissing -and
+            $null -eq $retentionFollowupValidatorMissing.Threw -and
+            $retentionFollowupValidatorMissing.Critical -and
+            $retentionFollowupValidatorMissing.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupValidatorMissing.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100')
+        ) `
+        -Name "Maintenance/RetentionOldArchiveValidatorMissingSetsFailureFlags" `
+        -Failure ("збій виконання 7z t (не archive-specific: 7-Zip не знайдено) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorMissing.Critical, $retentionFollowupValidatorMissing.RestoreFailed, $retentionFollowupValidatorMissing.Threw, $retentionFollowupValidatorMissing.Log)
+
+    $retentionFollowupValidatorTimeout = & $retentionFollowupRunScenario 'ValidatorTimeout' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2')
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupValidatorTimeout -and
+            $null -eq $retentionFollowupValidatorTimeout.Threw -and
+            $retentionFollowupValidatorTimeout.Critical -and
+            $retentionFollowupValidatorTimeout.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupValidatorTimeout.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100')
+        ) `
+        -Name "Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags" `
+        -Failure ("збій виконання 7z t (не archive-specific: таймаут) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorTimeout.Critical, $retentionFollowupValidatorTimeout.RestoreFailed, $retentionFollowupValidatorTimeout.Threw, $retentionFollowupValidatorTimeout.Log)
+
+    # ================================================================
     # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)
     # мусить РЕАЛЬНО перевіряти архів, а не лише писати .sha512 і
     # повертати $true для будь-якого наявного файлу. Реальні функції
