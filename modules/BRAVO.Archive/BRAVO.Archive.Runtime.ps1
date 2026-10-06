@@ -4365,7 +4365,20 @@ exit
                     -Message "Не вдалося завершити процес WinSCP після таймауту: $($_.Exception.Message)" `
                     -Level "DEBUG"
             }
-            throw "перевищено таймаут перевірки SFTP-з'єднання"
+            # Звільняємо ресурси (зокрема BRAVO_WINSCP lock) ДО виходу:
+            # раніше throw оминав Complete-BRAVOProcessOutputCapture, lock
+            # лишався захопленим, а викликачі (без try) завершувались
+            # exit 90 замість шляху "SFTP недоступний".
+            try {
+                [void](Complete-BRAVOProcessOutputCapture -Capture $outputCapture)
+            } catch {
+                Write-BRAVOLog `
+                    -Component 'SFTP' `
+                    -Message "Не вдалося завершити збір виводу WinSCP після таймауту: $($_.Exception.Message)" `
+                    -Level "WARNING"
+            }
+            Write-BRAVOLog -Component 'SFTP' -Message "Перевищено таймаут перевірки SFTP-з'єднання ($([math]::Max(1, [int]$sftpConnectionTimeoutSeconds + 30)) с); WinSCP завершено" -Level "ERROR"
+            return $false
         }
         $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $outputCapture
         $output = $capturedOutput.StandardOutput

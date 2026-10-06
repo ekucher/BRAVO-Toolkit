@@ -2,6 +2,14 @@
 
 ## Не випущено (developer)
 
+- **Fix: Archive: таймаут перевірки SFTP повертає `$false` і звільняє lock WinSCP (#290).**
+  `Test-SFTPConnection` після таймауту вбивала WinSCP і кидала виняток раніше, ніж `Complete-BRAVOProcessOutputCapture`
+  звільняла lock `BRAVO_WINSCP`. Викликачі (ручний `-SyncBAZA` і `Main`) не мають `try`, тому прогін завершувався
+  кодом 90 замість шляху «SFTP недоступний», а lock лишався захопленим. Тепер при таймауті ресурси звільняються
+  (збій звільнення логується WARNING), в журнал пишеться ERROR з описом таймауту, функція повертає `$false`,
+  і діє наявна обробка збою SFTP з кодом 50. Значення кодів завершення не змінено. Регресія:
+  `Archive/SftpConnectionTimeoutReturnsFalse`, `Archive/SftpConnectionTimeoutReleasesWinSCPLock`,
+  `Archive/SftpConnectionTimeoutLogsError`.
 - **Fix: Health: порушення цілісності інструментів дає алерт і при вимкненому SFTP (#296).**
   Блокуючий результат перевірки `TOOLS_MANIFEST.json` (`ShouldBlock`, режим Enforce) раніше ставав Health
   issue лише всередині SFTP-перевірки. На сервері з вимкненим SFTP або при зайнятому WinSCP (перевірку
