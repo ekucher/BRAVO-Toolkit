@@ -8287,6 +8287,71 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 -Failure 'порожнє джерело не дає стелі: вимога має лишитись history-оцінкою 125000 B, інакше нульовий вимір обнулив би захист'
         }
 
+        # #279: оцінка за розміром джерела мусить враховувати per-file
+        # метадані 7-Zip (заголовок запису, ім'я у UTF-16, атрибути, часи,
+        # CRC), які НЕ обмежені 2% від нестиснутого розміру: багато дрібних
+        # файлів з довгими іменами дають архів більший за sourceBytes*1.02.
+        # Дочірній scope — ліміт 4096 змінних script-scope (див. вище).
+        & {
+            $manyFilesSource = Join-Path $estimatedSpaceTestRoot 'MANYFILES_SRC'
+            $manyFilesDest = Join-Path $estimatedSpaceTestRoot 'MANYFILES_DEST'
+            [void][IO.Directory]::CreateDirectory($manyFilesSource)
+            [void][IO.Directory]::CreateDirectory($manyFilesDest)
+            for ($manyIndex = 0; $manyIndex -lt 2000; $manyIndex++) {
+                [IO.File]::WriteAllBytes(
+                    (Join-Path $manyFilesSource ('long_file_name_for_estimate_{0:D5}.dat' -f $manyIndex)),
+                    [byte[]]@(1))
+            }
+            $manyFilesRootLength = $manyFilesSource.TrimEnd('\', '/').Length
+            $manyFilesFloor = [int64]0
+            $manyFilesCount = 0
+            foreach ($manyFile in (Get-ChildItem -LiteralPath $manyFilesSource -Recurse -File -Force)) {
+                $manyRelative = $manyFile.FullName.Substring($manyFilesRootLength).TrimStart('\', '/')
+                $manyFilesFloor += [int64]$manyFile.Length + (2 * $manyRelative.Length) + 128
+                $manyFilesCount++
+            }
+            $estimateManyFiles = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BRAVOEXCH'; Source = (Join-Path $manyFilesSource '*'); Destination = $manyFilesDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $manyFilesCount -eq 2000 -and
+                    $estimateManyFiles.ComponentEstimates[0].SourceBytes -eq 2000 -and
+                    $estimateManyFiles.ComponentEstimates[0].EstimatedBytes -ge $manyFilesFloor
+                ) `
+                -Name 'Archive/EstimatedSpaceCountsPerFileMetadataForManySmallFiles' `
+                -Failure "#279: 2000 файлів по 1 B з довгими іменами мають давати оцінку не менше суми розмірів + 2*довжина імені + 128 B на файл (нижня межа $manyFilesFloor B); факт: EstimatedBytes=$($estimateManyFiles.ComponentEstimates[0].EstimatedBytes) (стара формула 2000*1.02 = 2040 B ігнорує метадані)"
+
+            $bigFileSource = Join-Path $estimatedSpaceTestRoot 'BIGFILE_SRC'
+            [void][IO.Directory]::CreateDirectory($bigFileSource)
+            [IO.File]::WriteAllBytes((Join-Path $bigFileSource 'big.bin'), (New-Object byte[] 1000000))
+            $estimateBigFile = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BRAVOEXCH'; Source = $bigFileSource; Destination = $manyFilesDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateBigFile.ComponentEstimates[0].SourceBytes -eq 1000000 -and
+                    $estimateBigFile.ComponentEstimates[0].EstimatedBytes -ge 1020000 -and
+                    $estimateBigFile.ComponentEstimates[0].EstimatedBytes -le (1020000 + 1024)
+                ) `
+                -Name 'Archive/EstimatedSpaceSingleLargeFileNotPenalised' `
+                -Failure "#279: один великий файл (1000000 B) має давати оцінку 1020000 B + не більше 1 KB метаданих; факт: EstimatedBytes=$($estimateBigFile.ComponentEstimates[0].EstimatedBytes)"
+        }
+
         # D: два компоненти на одному диску — потреби сумуються на цей диск,
         # а не перевіряються незалежно (інакше можна двічі "витратити" те саме
         # вільне місце в розрахунку).
