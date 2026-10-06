@@ -125,3 +125,20 @@ b8a3b6d0a2ccc1417b6c151395827225206159b8:.claude/hooks/tests/Test-Redact.ps1:gen
 # запис ігнорує лише історичну знахідку в уже опублікованому коміті
 # 21d44020, без rebase/force-push.
 21d44020da56800c60e752229aab4b291f10316f:selftest/BRAVO_SELF_TEST.Operations.ps1:generic-api-key:407
+
+# Закритий PR #332 (гілка claude/project-thread-qcsy2d), коміт 0098dee:
+# таблиця кейсів self-test маскування секретів у журналах
+# (selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1, $runtimeLogMaskCases).
+# Значення — синтетичний літерал 'Zq9plainsecret', який тест подає на вхід
+# Protect-BRAVOLogSecret і перевіряє, що в результаті його немає; це не
+# credential і в Credential Manager чи мережевий виклик не потрапляє. Коміт
+# не входить ні в developer, ні в hotfix/5.2.5, але ручний (workflow_dispatch)
+# прогін gitleaks сканує історію всіх гілок. Записи ігнорують лише ці
+# історичні знахідки, без послаблення правила і без видалення гілки.
+0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:567
+0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:568
+0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:569
+0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:570
+0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:574
+0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:575
+0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:585
