@@ -2,6 +2,12 @@
 
 ## Не випущено (developer)
 
+- **Fix: self-test з дефолтним `-ConfigPath` більше не читає `BRAVO.config` хоста як версійну фікстуру (D-1).**
+  У `BRAVO_SELF_TEST.ps1` ознака дефолтного шляху тепер перевіряється раніше за наявність файлу: site-конфіг
+  у install root мігрованого хосту не підміняє заморожену фікстуру (раніше це давало хибний FAIL
+  `Notifications/PublicIPLookupEnabledByDefault`). Явний `-ConfigPath` працює як і раніше. Додано перевірки
+  `Governance/SelfTestVersionFixtureIgnoresHostConfigWhenPathDefaulted` і
+  `Governance/SelfTestVersionFixtureHonorsExplicitConfigPath`.
 - **Fix: дефекти, знайдені ручною перевіркою runner-а Affected на Windows PowerShell 5.1 (B-4).**
   (1) Дочірня консоль `powershell.exe` (CreateNoWindow) пише в OEM-сторінці, а runner декодував вивід
   кодуванням консолі батька: кирилиця в рядках `child| ` губилась (і, ґ ставали `?`, за UTF-8 консолі

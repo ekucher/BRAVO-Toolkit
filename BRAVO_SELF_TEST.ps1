@@ -5101,18 +5101,16 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     [void][IO.Directory]::CreateDirectory($versionConfigRoot)
     $script:selfTestConfigRoot = $versionConfigRoot
     try {
-        # Issue #216 (B4-2): $sourceConfigPath за замовчуванням вказує на
-        # кореневий BRAVO.config, якого з 5.3 фізично немає (файл
-        # прибрано з пакета/git tree). Якщо викликач self-test передав
-        # СПРАВЖНІЙ явний -ConfigPath — читаємо саме його (як і раніше:
-        # відсутність такого файлу лишається реальною помилкою). Якщо ж
-        # це default-шлях і файлу немає — це legacy-текст для
-        # синтетичної version-фікстури нижче, тож джерело — той самий
-        # заморожений актив, що й для інших фікстур self-test.
-        $versionConfigText = if (Test-Path -LiteralPath $sourceConfigPath -PathType Leaf) {
-            [IO.File]::ReadAllText($sourceConfigPath, [Text.Encoding]::UTF8)
-        } elseif ($script:selfTestConfigPathWasDefaulted) {
+        # D-1 (Issue #216, B4-2): за дефолтного -ConfigPath джерелом
+        # версійної фікстури завжди є заморожений тестовий актив, навіть
+        # якщо на диску за дефолтним шляхом лежить site-конфіг мігрованого
+        # хосту (його значення не мають впливати на перевірки дефолтів).
+        # Якщо викликач передав СПРАВЖНІЙ явний -ConfigPath — читаємо саме
+        # його (відсутність такого файлу лишається реальною помилкою).
+        $versionConfigText = if ($script:selfTestConfigPathWasDefaulted) {
             Get-BRAVOSelfTestLegacyConfigText
+        } elseif (Test-Path -LiteralPath $sourceConfigPath -PathType Leaf) {
+            [IO.File]::ReadAllText($sourceConfigPath, [Text.Encoding]::UTF8)
         } else {
             throw "Не знайдено конфігураційний файл: $sourceConfigPath"
         }
