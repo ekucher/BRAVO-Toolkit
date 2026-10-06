@@ -9505,16 +9505,21 @@ try {
     # без нього моніторинг бачив би застарілий "OK" від попереднього
     # прогону. Мовчазний catch — крах може статися до завантаження
     # конфігурації ($stateRoot) чи модуля статусу.
-    try {
-        Write-BRAVOOperationStatus `
-            -StateRoot $stateRoot `
-            -Operation Archive `
-            -ExitCode 90 `
-            -ExitCodeName 'InternalError' `
-            -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
-            -Details @{ fatal = $true }
-    } catch {
-        # Первинний exception важливіший — не маскуємо його телеметрією.
+    # BRAVO_STATUS_Archive.json — статус НІЧНОЇ копії: крах денної BAZA-
+    # синхронізації (-SyncBAZA) його теж не перезаписує (#291, як і
+    # Write-BRAVOArchiveOperationStatus).
+    if (-not ((Test-Path variable:SyncBAZA) -and $SyncBAZA)) {
+        try {
+            Write-BRAVOOperationStatus `
+                -StateRoot $stateRoot `
+                -Operation Archive `
+                -ExitCode 90 `
+                -ExitCodeName 'InternalError' `
+                -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
+                -Details @{ fatal = $true }
+        } catch {
+            # Первинний exception важливіший — не маскуємо його телеметрією.
+        }
     }
     try {
         Write-BRAVOArchiveFatalDiagnostics `
