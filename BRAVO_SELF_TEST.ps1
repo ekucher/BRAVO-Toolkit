@@ -13057,9 +13057,48 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Failure "новий from-scratch ACL-патерн (DirectorySecurity/FileSecurity + Set-Acl) не застосувався коректно на диску: $aclProbeFailure"
     } finally {
         if (Test-Path -LiteralPath $aclProbeRoot -PathType Container) {
+            # B-4 D2: DACL probe-а не дає поточному користувачеві права DELETE,
+            # тож у неелевованому прогоні видалення падало ("Access ... denied")
+            # і лишало BRAVO_ACL_PROBE_* у %TEMP%. Власник об'єкта завжди має
+            # WRITE_DAC, тому спершу повертаємо поточному SID FullControl на
+            # каталог і файли, а вже потім видаляємо. Перевірку ACL-патерну
+            # вище це не послаблює: вона завершилась до finally.
+            # B-4 D2b: саме .SetAccessControl(), а не Set-Acl: Set-Acl у 5.1
+            # без прав адміністратора падав з PrivilegeNotHeldException
+            # (SeSecurityPrivilege), а .SetAccessControl() з новим об'єктом
+            # записує лише DACL, для чого власнику досить WRITE_DAC.
+            $aclCleanupSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $aclCleanupDirectory = New-Object Security.AccessControl.DirectorySecurity
+            $aclCleanupDirectory.SetAccessRuleProtection($true, $false)
+            $aclCleanupDirectory.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                $aclCleanupSid,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                ([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow
+            )))
+            (New-Object IO.DirectoryInfo -ArgumentList $aclProbeRoot).SetAccessControl($aclCleanupDirectory)
+            foreach ($aclCleanupFile in @([IO.Directory]::GetFiles($aclProbeRoot))) {
+                $aclCleanupFileSecurity = New-Object Security.AccessControl.FileSecurity
+                $aclCleanupFileSecurity.SetAccessRuleProtection($true, $false)
+                $aclCleanupFileSecurity.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                    $aclCleanupSid,
+                    [Security.AccessControl.FileSystemRights]::FullControl,
+                    [Security.AccessControl.InheritanceFlags]::None,
+                    [Security.AccessControl.PropagationFlags]::None,
+                    [Security.AccessControl.AccessControlType]::Allow
+                )))
+                (New-Object IO.FileInfo -ArgumentList $aclCleanupFile).SetAccessControl($aclCleanupFileSecurity)
+            }
             [IO.Directory]::Delete($aclProbeRoot, $true)
         }
     }
+    # B-4 D2: probe-дерево не повинно лишатися в %TEMP% і в неелевованому
+    # прогоні, де DACL вище не дає поточному користувачеві права DELETE.
+    Test-BRAVOCondition `
+        -Condition (-not (Test-Path -LiteralPath $aclProbeRoot)) `
+        -Name "Scheduler/AclProbeCleanupRemovesProtectedTree" `
+        -Failure "тимчасовий каталог ACL-probe лишився після перевірки: $aclProbeRoot"
 
     Test-BRAVOCondition `
         -Condition ($taskInstallScriptText -match '(?s)\$installationCommitted\s*=\s*\$false.*?\$taskFolder\s*=\s*\$null') `
@@ -32075,7 +32114,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
             $arRequest = New-BRAVOAffectedChildRequest -RepositoryRoot $arQuirkRoot -Suite @('Governance', 'Paths')
             $arExpectedScript = Join-Path ([IO.Path]::GetFullPath($arQuirkRoot)) 'BRAVO_SELF_TEST.ps1'
             $arExpectedQuoted = "'" + $arExpectedScript.Replace("'", "''").Replace([string][char]0x2019, ([string][char]0x2019 + [char]0x2019)) + "'"
-            $arExpectedBody = '& ' + $arExpectedQuoted + " -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE"
+            $arExpectedBody = 'try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding -ArgumentList $false } catch { $null = $_ }; & ' + $arExpectedQuoted + " -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE"
             $arDecoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([string]$arRequest.EncodedCommand))
             $arArgumentOk = (
                 [string]::Join(' ', @($arRequest.Argument)) -ceq ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [string]$arRequest.EncodedCommand) -and
@@ -32096,7 +32135,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
                         (-not [string]::IsNullOrEmpty($arSystemRoot) -and [string]$arRequest.FilePath -ceq (Join-Path $arSystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')))
                 ) `
                 -Name "Framework/AffectedRunner.EncodedCommandRoundTrip" `
-                -Failure ("R12: EncodedCommand (base64 UTF-16LE) декодується в `"& '<шлях>' -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE`" (апостроф і типографський апостроф у шляху подвоєно); аргументи -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand без -File; порожній чи небезпечний Suite і керувальні символи в шляху відхиляються. Декодовано: [$arDecoded]; очікувано: [$arExpectedBody]")
+                -Failure ("R12: EncodedCommand (base64 UTF-16LE) декодується в `"try { [Console]::OutputEncoding = UTF-8 без BOM } catch { ... }; & '<шлях>' -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE`" (апостроф і типографський апостроф у шляху подвоєно); аргументи -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand без -File; порожній чи небезпечний Suite і керувальні символи в шляху відхиляються. Декодовано: [$arDecoded]; очікувано: [$arExpectedBody]")
         } finally {
             Remove-Item -LiteralPath $arRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -32160,6 +32199,83 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
             -Condition (($env:GITHUB_ACTIONS -ne 'true') -or $arRunReal) `
             -Name "Framework/AffectedRunner.RealScenariosRunOnCi" `
             -Failure "на GitHub Actions сценарії AffectedRunner на реальному git-репозиторії мусять виконуватись (потрібні .git у корені та git у PATH); їх відсутність мовчки прибрала б покриття. .git: $(Test-Path -LiteralPath (Join-Path $root '.git')); git знайдено: $($arGitCommand.Count -gt 0)"
+
+        # --- [T]: справжній дочірній powershell.exe (B-4, D1) ------------------
+        # Межа процесу без -SelfTestInvoker: New-BRAVOAffectedChildRequest +
+        # Invoke-BRAVOAffectedChildProcess запускають справжній Windows
+        # PowerShell 5.1 на stub-скрипті BRAVO_SELF_TEST.ps1 у тимчасовому
+        # корені. Дочірня консоль (CreateNoWindow) має OEM-сторінку, тож без
+        # явного UTF-8 з обох боків кирилиця, BOM і U+2028 губилися б.
+        # stderr (CLIXML) Windows PowerShell 5.1 пише в OEM-сторінці навіть
+        # після префікса, тож runner декодує його як OEM (B-4 D1b). Літер,
+        # яких в OEM-сторінці немає (і, ґ; на англомовному CI - уся
+        # кирилиця), дочірній процес уже замінив на '?', тому для stderr
+        # перевіряється лише розкодування: текст 'werr ', жодного U+FFFD і
+        # жодного CLIXML. 'werr ' шукається в склеєному stderr: ConsoleHost
+        # переносить рядок помилки ('<шлях stub-а> : werr ...') на ширині
+        # прихованої консолі, і за довгого %TEMP% перенос розрізає саме
+        # 'werr' (B-4 D1c).
+        # Текст stub-а збирається з кодів символів, щоб сам файл був ASCII.
+        $arChildHost = ''
+        if (-not [string]::IsNullOrEmpty([string]$env:SystemRoot)) {
+            $arChildHost = Join-Path ([string]$env:SystemRoot) 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        }
+        $arRunChild = ($arChildHost.Length -gt 0 -and [IO.File]::Exists($arChildHost))
+        if ($arRunChild) {
+            $arChildOk = $false
+            $arChildNote = 'сценарій не виконано'
+            $arChildRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_AFFECTEDRUNNER_CHILD_' + [guid]::NewGuid().ToString('N'))
+            # Шлях stub-а доповнюється до 114 символів: тоді за звичайної
+            # ширини прихованої консолі (120) перенос рядка помилки припадає
+            # всередину 'werr', і перевірка склеєного stderr (D1c) працює
+            # однаково на будь-якій машині, а не лише за довгого %TEMP%.
+            $arChildPad = 114 - (Join-Path $arChildRoot 'BRAVO_SELF_TEST.ps1').Length
+            if ($arChildPad -gt 0) { $arChildRoot = $arChildRoot + ('_' * $arChildPad) }
+            try {
+                [void][IO.Directory]::CreateDirectory($arChildRoot)
+                $arStub = @(
+                    'param([switch]$NoPause, [string[]]$Suite)',
+                    '$text = [string]::Join('''', [char[]]@(0x0456, 0x0457, 0x0454, 0x0491, 0x0020, 0x0406, 0x0407, 0x0404, 0x0490))',
+                    'Write-Output $text',
+                    'Write-Host (''host '' + $text)',
+                    'Write-Output (''bom'' + [char]0xFEFF + ''sep'' + [char]0x2028 + ''end'')',
+                    'Write-Output (''suite='' + [string]::Join('','', @($Suite)))',
+                    'Write-Error (''werr '' + $text)',
+                    'exit 7'
+                )
+                [IO.File]::WriteAllText((Join-Path $arChildRoot 'BRAVO_SELF_TEST.ps1'), ([string]::Join("`r`n", $arStub) + "`r`n"), (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+                $arChildText = [string]::Join('', [char[]]@(0x0456, 0x0457, 0x0454, 0x0491, 0x0020, 0x0406, 0x0407, 0x0404, 0x0490))
+                $arChildRequest = New-BRAVOAffectedChildRequest -RepositoryRoot $arChildRoot -Suite @('Paths')
+                $arChildRun = Invoke-BRAVOAffectedChildProcess -Request $arChildRequest
+                $arChildLines = [string[]]@($arChildRun.Lines)
+                $arChildErrors = [string[]]@($arChildRun.ErrorLines)
+                $arChildOk = (
+                    $null -eq $arChildRun.StartError -and $arChildRun.ExitCode -eq 7 -and
+                    @($arChildLines | Where-Object { $_ -ceq $arChildText }).Count -eq 1 -and
+                    @($arChildLines | Where-Object { $_ -ceq ('host ' + $arChildText) }).Count -eq 1 -and
+                    @($arChildLines | Where-Object { $_ -ceq ('bom' + [char]0xFEFF + 'sep' + [char]0x2028 + 'end') }).Count -eq 1 -and
+                    @($arChildLines | Where-Object { $_ -ceq 'suite=Paths' }).Count -eq 1 -and
+                    ([string]::Join('', $arChildErrors)).Contains('werr ') -and
+                    @($arChildErrors | Where-Object { ([string]$_).IndexOf([char]0xFFFD) -ge 0 }).Count -eq 0 -and
+                    @($arChildErrors | Where-Object { ([string]$_).Contains('CLIXML') }).Count -eq 0)
+                $arChildCodes = [string]::Join(' ', @(([string]::Join('|', $arChildLines) + '#' + [string]::Join('|', $arChildErrors)).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }))
+                $arChildNote = "exit=$($arChildRun.ExitCode); startError=$($arChildRun.StartError); коди символів: $arChildCodes"
+            } catch {
+                $arChildNote = 'виняток сценарію: ' + $_.Exception.Message
+            } finally {
+                Remove-Item -LiteralPath $arChildRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Test-BRAVOCondition `
+                -Condition $arChildOk `
+                -Name "Framework/AffectedRunner.RealChildProcessPreservesText" `
+                -Failure ("B-4 D1: справжній дочірній powershell.exe: код завершення (7) доходить до runner-а; stdout і Write-Host з кирилицею (іїєґ ІЇЄҐ), BOM і U+2028 приходять без втрат; Write-Error розкодовано з CLIXML у текст в OEM-сторінці без U+FFFD; -Suite передано. Деталі: " + $arChildNote)
+        } else {
+            Write-Host "  Сценарій AffectedRunner зі справжнім дочірнім powershell.exe пропущено: Windows PowerShell 5.1 не знайдено (потрібні SystemRoot і powershell.exe)."
+        }
+        Test-BRAVOCondition `
+            -Condition (($env:GITHUB_ACTIONS -ne 'true') -or $arRunChild) `
+            -Name "Framework/AffectedRunner.RealChildScenarioRunsOnCi" `
+            -Failure "на GitHub Actions сценарій зі справжнім дочірнім powershell.exe мусить виконуватись; його відсутність мовчки прибрала б покриття межі процесу. powershell.exe: $arChildHost"
 
         # --- [R]: статичні guard-и файлів ------------------------------------
         $arForbiddenLiterals = @('2>&1', '??', '?.', '&&', '||', '-Parallel', '::new', 'Invoke-Expression', 'SELF-TEST PASSED', '"SELF-TEST', 'Suite @()', "'-File'")

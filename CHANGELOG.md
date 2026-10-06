@@ -2,6 +2,23 @@
 
 ## Не випущено (developer)
 
+- **Fix: дефекти, знайдені ручною перевіркою runner-а Affected на Windows PowerShell 5.1 (B-4).**
+  (1) Дочірня консоль `powershell.exe` (CreateNoWindow) пише в OEM-сторінці, а runner декодував вивід
+  кодуванням консолі батька: кирилиця в рядках `child| ` губилась (і, ґ ставали `?`, за UTF-8 консолі
+  батька - U+FFFD), разом із BOM і U+2028. Тепер тіло `-EncodedCommand` перемикає вивід дочірнього
+  процесу на UTF-8 без BOM, а `Invoke-BRAVOAffectedChildProcess` читає stdout як UTF-8. stderr
+  (CLIXML) Windows PowerShell 5.1 пише в OEM-сторінці і після перемикання, тому runner декодує його
+  як OEM: без U+FFFD, але літери, яких в OEM-сторінці немає, у stderr лишаються `?`.
+  Вердикт runner-а від дефекту не залежав: маркер - ASCII. (2) Перевірка
+  `Scheduler/AclRuleAppliesToFilesAndFolders` ставить на тимчасовий каталог DACL без прав поточного
+  користувача і в неелевованому прогоні не могла його видалити: секція падала, будь-який неелевований
+  self-test (зокрема `-Suite`) завершувався з кодом 1, а в `%TEMP%` лишались `BRAVO_ACL_PROBE_*`. Тепер
+  перед видаленням поточному користувачеві повертається FullControl через `.SetAccessControl()`
+  (власник завжди має WRITE_DAC; `Set-Acl` у неелевованій сесії вимагав SeSecurityPrivilege);
+  сама перевірка ACL-патерну не змінилась. Нові перевірки:
+  `Framework/AffectedRunner.RealChildProcessPreservesText` (справжній дочірній `powershell.exe` на
+  stub-скрипті), `Framework/AffectedRunner.RealChildScenarioRunsOnCi`,
+  `Scheduler/AclProbeCleanupRemovesProtectedTree`.
 - **Feat: runner Affected `ci/Invoke-BRAVOAffectedSelfTest.ps1` (VAL-05, PR3 з трьох).**
   Нова бібліотека `ci/BRAVOAffectedSelfTest.ps1` (`Invoke-BRAVOAffectedSelfTest` з ін'єкціями
   `-GitInvoker` і `-SelfTestInvoker`) і тонкий CLI `ci/Invoke-BRAVOAffectedSelfTest.ps1 -BaseRef <ref>`.
