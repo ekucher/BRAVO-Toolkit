@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Fix: DataRestore: пропущені під час автовибору generation manifest-и тепер дають WARNING (#294).**
+  Якщо найновіший manifest нечитабельний або не проходить перевірку ідентичності, відновлення, як і раніше,
+  fail-closed бере старішу COMPLETE generation, але тепер кожен пропуск рахується як попередження: код
+  завершення 10 замість 0, рядок у фінальному сповіщенні WARNING. Для Source=SFTP
+  `Invoke-BRAVODataRestoreSftpManifestFetch` повертає `SkippedManifests` у тому ж форматі, що canonical
+  `Get-BRAVORestoreGenerationManifest`. Явний `-GenerationId` не змінено. Тести:
+  `DataRestore/SftpManifestAutomaticSelectionReportsSkipped*`, matrix combo
+  `OutOfPlace-MODEL-CorruptNewestManifestSkippedWithWarning`.
+
 - **Fix: Maintenance: перевірка розмірів `.md` виконується після реставрації моделі, а не до неї.**
   bravocmd repair штатно стискає `.md`: у реальному прогоні файл 1,64 ГБ (понад ліміт 1536 МБ) після
   реставрації став 1,21 ГБ, але сповіщення «.md перевищує ліміт» уже пішло, бо перевірка стояла перед

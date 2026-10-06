@@ -317,6 +317,10 @@ $script:flagRestoreFailed = $false
 $script:flagSftpFailed = $false
 $script:flagInternalError = $false
 $script:dataRestoreWarningCount = 0
+# #294: manifest-и, пропущені fail-closed'ом під час АВТОМАТИЧНОГО вибору
+# generation (нечитабельний / identity mismatch). Кожен — попередження
+# (код щонайменше 10) і рядок у ЄДИНОМУ фінальному сповіщенні прогону.
+$script:dataRestoreSkippedManifestLines = New-Object 'System.Collections.Generic.List[string]'
 # T006: імена архівів, відкритих (7z t / 7z x) лише через legacy
 # BOM-у-паролі fallback (колектор Register-BRAVOLegacyBomPasswordFallback,
 # BRAVO.ArchiveHelpers). Непорожній -> код щонайменше 10 і перелік у
@@ -2807,6 +2811,10 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
         }
     }
 
+    # #294: той самий контракт, що canonical Get-BRAVORestoreGenerationManifest —
+    # аномалії fail-closed-пропуску повертаються викликачу як SkippedManifests,
+    # щоб тихий перехід на старішу generation став попередженням.
+    $skippedAnomalies = @()
     $selected = $null
     foreach ($manifestNameBatch in $candidateBatches) {
         $getCommands = @()
@@ -2856,6 +2864,10 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
                 # бути не може — інакше авто-вибір тихо падає на старішу
                 # generation без сліду в лозі.
                 Write-DataRestoreLog -Message "УВАГА: завантажений SFTP-manifest пропущено (не прочитано): $localManifestPath — $($_.Exception.Message)" -Level 'WARNING' -Console
+                $skippedAnomalies += [pscustomobject]@{
+                    ManifestPath = $localManifestPath
+                    Reason       = "manifest не прочитано: $($_.Exception.Message)"
+                }
                 continue
             }
             if ([string]$manifest.status -ne 'COMPLETE') { continue }
@@ -2873,6 +2885,10 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
                     throw "manifest '$manifestName' не пройшов перевірку ідентичності: ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'"
                 }
                 Write-DataRestoreLog -Message "УВАГА: завантажений SFTP-manifest пропущено (identity mismatch): $localManifestPath — ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'" -Level 'WARNING' -Console
+                $skippedAnomalies += [pscustomobject]@{
+                    ManifestPath = $localManifestPath
+                    Reason       = "identity mismatch: ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'"
+                }
                 continue
             }
             $candidates += [pscustomobject]@{
@@ -2892,8 +2908,12 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
         if ($isExplicitRequest) {
             throw "COMPLETE generation '$RequestedGenerationId' не знайдено на SFTP"
         }
+        if (@($skippedAnomalies).Count -gt 0) {
+            throw "серед завантажених manifest-ів немає жодного COMPLETE (пропущено з аномаліями: $(@($skippedAnomalies).Count) — $((@($skippedAnomalies) | ForEach-Object { $_.Reason }) -join '; '))"
+        }
         throw 'серед завантажених manifest-ів немає жодного COMPLETE'
     }
+    Add-Member -InputObject $selected -MemberType NoteProperty -Name 'SkippedManifests' -Value @($skippedAnomalies) -Force
     return $selected
 }
 
@@ -3450,8 +3470,11 @@ try {
             # (нечитабельний manifest / identity mismatch) мають бути видимі
             # оператору: тихий пропуск означав би непомічене відновлення
             # старішої generation.
-            foreach ($skippedManifest in @($selectedGeneration.SkippedManifests)) {
+            # #294: кожен пропуск — попередження (код 10) і рядок сповіщення.
+            foreach ($skippedManifest in @($selectedGeneration.SkippedManifests | Where-Object { $null -ne $_ })) {
                 Write-DataRestoreLog -Message "УВАГА: manifest пропущено під час вибору generation: $($skippedManifest.ManifestPath) — $($skippedManifest.Reason)" -Level 'WARNING' -Console
+                $script:dataRestoreWarningCount++
+                $script:dataRestoreSkippedManifestLines.Add(("Пропущено manifest під час вибору generation: {0} — {1}" -f [IO.Path]::GetFileName([string]$skippedManifest.ManifestPath), $skippedManifest.Reason))
             }
             $selectedManifest = $selectedGeneration.Manifest
         } else {
@@ -3464,6 +3487,12 @@ try {
                     -RequestedGenerationId $GenerationId
             } catch {
                 Stop-BRAVODataRestoreRun -Category SftpFailed -Reason $_.Exception.Message
+            }
+            # #294: Invoke-BRAVODataRestoreSftpManifestFetch уже залогувала
+            # кожен пропуск; тут — лише лічильник попереджень і рядок сповіщення.
+            foreach ($skippedManifest in @($sftpSelected.SkippedManifests | Where-Object { $null -ne $_ })) {
+                $script:dataRestoreWarningCount++
+                $script:dataRestoreSkippedManifestLines.Add(("Пропущено manifest під час вибору generation: {0} — {1}" -f [IO.Path]::GetFileName([string]$skippedManifest.ManifestPath), $skippedManifest.Reason))
             }
             $selectedManifest = $sftpSelected.Manifest
         }
@@ -4596,6 +4625,8 @@ if ($notificationMode -ne 'none') {
     if (-not [string]::IsNullOrWhiteSpace([string]$script:dataRestoreAbortReason)) {
         $notificationLines += "Причина: $script:dataRestoreAbortReason"
     }
+    # #294: пропущені під час вибору generation manifest-и — у те саме сповіщення.
+    $notificationLines += @($script:dataRestoreSkippedManifestLines)
     # T006: перелік legacy BOM-архівів іде в ТЕ САМЕ одне сповіщення прогону.
     $notificationLines += @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames @($script:dataRestoreLegacyBomFallbackArchives))
     if ($dataRestoreExitCode -ge 20) {
