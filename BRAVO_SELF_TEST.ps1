@@ -13060,6 +13060,12 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             [IO.Directory]::Delete($aclProbeRoot, $true)
         }
     }
+    # B-4 D2: probe-дерево не повинно лишатися в %TEMP% і в неелевованому
+    # прогоні, де DACL вище не дає поточному користувачеві права DELETE.
+    Test-BRAVOCondition `
+        -Condition (-not (Test-Path -LiteralPath $aclProbeRoot)) `
+        -Name "Scheduler/AclProbeCleanupRemovesProtectedTree" `
+        -Failure "тимчасовий каталог ACL-probe лишився після перевірки: $aclProbeRoot"
 
     Test-BRAVOCondition `
         -Condition ($taskInstallScriptText -match '(?s)\$installationCommitted\s*=\s*\$false.*?\$taskFolder\s*=\s*\$null') `
@@ -32160,6 +32166,67 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
             -Condition (($env:GITHUB_ACTIONS -ne 'true') -or $arRunReal) `
             -Name "Framework/AffectedRunner.RealScenariosRunOnCi" `
             -Failure "на GitHub Actions сценарії AffectedRunner на реальному git-репозиторії мусять виконуватись (потрібні .git у корені та git у PATH); їх відсутність мовчки прибрала б покриття. .git: $(Test-Path -LiteralPath (Join-Path $root '.git')); git знайдено: $($arGitCommand.Count -gt 0)"
+
+        # --- [T]: справжній дочірній powershell.exe (B-4, D1) ------------------
+        # Межа процесу без -SelfTestInvoker: New-BRAVOAffectedChildRequest +
+        # Invoke-BRAVOAffectedChildProcess запускають справжній Windows
+        # PowerShell 5.1 на stub-скрипті BRAVO_SELF_TEST.ps1 у тимчасовому
+        # корені. Дочірня консоль (CreateNoWindow) має OEM-сторінку, тож без
+        # явного UTF-8 з обох боків кирилиця, BOM і U+2028 губилися б.
+        # Текст stub-а збирається з кодів символів, щоб сам файл був ASCII.
+        $arChildHost = ''
+        if (-not [string]::IsNullOrEmpty([string]$env:SystemRoot)) {
+            $arChildHost = Join-Path ([string]$env:SystemRoot) 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        }
+        $arRunChild = ($arChildHost.Length -gt 0 -and [IO.File]::Exists($arChildHost))
+        if ($arRunChild) {
+            $arChildOk = $false
+            $arChildNote = 'сценарій не виконано'
+            $arChildRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_AFFECTEDRUNNER_CHILD_' + [guid]::NewGuid().ToString('N'))
+            try {
+                [void][IO.Directory]::CreateDirectory($arChildRoot)
+                $arStub = @(
+                    'param([switch]$NoPause, [string[]]$Suite)',
+                    '$text = [string]::Join('''', [char[]]@(0x0456, 0x0457, 0x0454, 0x0491, 0x0020, 0x0406, 0x0407, 0x0404, 0x0490))',
+                    'Write-Output $text',
+                    'Write-Host (''host '' + $text)',
+                    'Write-Output (''bom'' + [char]0xFEFF + ''sep'' + [char]0x2028 + ''end'')',
+                    'Write-Output (''suite='' + [string]::Join('','', @($Suite)))',
+                    'Write-Error (''werr '' + $text)',
+                    'exit 7'
+                )
+                [IO.File]::WriteAllText((Join-Path $arChildRoot 'BRAVO_SELF_TEST.ps1'), ([string]::Join("`r`n", $arStub) + "`r`n"), (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+                $arChildText = [string]::Join('', [char[]]@(0x0456, 0x0457, 0x0454, 0x0491, 0x0020, 0x0406, 0x0407, 0x0404, 0x0490))
+                $arChildRequest = New-BRAVOAffectedChildRequest -RepositoryRoot $arChildRoot -Suite @('Paths')
+                $arChildRun = Invoke-BRAVOAffectedChildProcess -Request $arChildRequest
+                $arChildLines = [string[]]@($arChildRun.Lines)
+                $arChildErrors = [string[]]@($arChildRun.ErrorLines)
+                $arChildOk = (
+                    $null -eq $arChildRun.StartError -and $arChildRun.ExitCode -eq 7 -and
+                    @($arChildLines | Where-Object { $_ -ceq $arChildText }).Count -eq 1 -and
+                    @($arChildLines | Where-Object { $_ -ceq ('host ' + $arChildText) }).Count -eq 1 -and
+                    @($arChildLines | Where-Object { $_ -ceq ('bom' + [char]0xFEFF + 'sep' + [char]0x2028 + 'end') }).Count -eq 1 -and
+                    @($arChildLines | Where-Object { $_ -ceq 'suite=Paths' }).Count -eq 1 -and
+                    @($arChildErrors | Where-Object { ([string]$_).Contains('werr ' + $arChildText) }).Count -ge 1 -and
+                    @($arChildErrors | Where-Object { ([string]$_).Contains('CLIXML') }).Count -eq 0)
+                $arChildCodes = [string]::Join(' ', @(([string]::Join('|', $arChildLines) + '#' + [string]::Join('|', $arChildErrors)).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }))
+                $arChildNote = "exit=$($arChildRun.ExitCode); startError=$($arChildRun.StartError); коди символів: $arChildCodes"
+            } catch {
+                $arChildNote = 'виняток сценарію: ' + $_.Exception.Message
+            } finally {
+                Remove-Item -LiteralPath $arChildRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Test-BRAVOCondition `
+                -Condition $arChildOk `
+                -Name "Framework/AffectedRunner.RealChildProcessPreservesText" `
+                -Failure ("B-4 D1: справжній дочірній powershell.exe: код завершення (7) доходить до runner-а; stdout і Write-Host з кирилицею (іїєґ ІЇЄҐ), BOM і U+2028 приходять без втрат; Write-Error розкодовано з CLIXML у текст; -Suite передано. Деталі: " + $arChildNote)
+        } else {
+            Write-Host "  Сценарій AffectedRunner зі справжнім дочірнім powershell.exe пропущено: Windows PowerShell 5.1 не знайдено (потрібні SystemRoot і powershell.exe)."
+        }
+        Test-BRAVOCondition `
+            -Condition (($env:GITHUB_ACTIONS -ne 'true') -or $arRunChild) `
+            -Name "Framework/AffectedRunner.RealChildScenarioRunsOnCi" `
+            -Failure "на GitHub Actions сценарій зі справжнім дочірнім powershell.exe мусить виконуватись; його відсутність мовчки прибрала б покриття межі процесу. powershell.exe: $arChildHost"
 
         # --- [R]: статичні guard-и файлів ------------------------------------
         $arForbiddenLiterals = @('2>&1', '??', '?.', '&&', '||', '-Parallel', '::new', 'Invoke-Expression', 'SELF-TEST PASSED', '"SELF-TEST', 'Suite @()', "'-File'")
