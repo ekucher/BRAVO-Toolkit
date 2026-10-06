@@ -1407,6 +1407,77 @@ function Invoke-ProtectedPayloadWorker {
     Move-Item -LiteralPath $temporaryResultPath -Destination $WorkerResultPath -Force
 }
 
+function Invoke-CredentialOperationsViaSystemWorker {
+    param(
+        [string]$Action,
+        [object[]]$OperationEntries,
+        [string]$resolvedConfigPath,
+        [bool]$configPathWasExplicit,
+        [string]$currentIdentity
+    )
+
+    Write-Host "Сховища для облікових записів: $currentIdentity та NT AUTHORITY\SYSTEM"
+    $currentUserEntries = @(Copy-OperationEntries -Entries $OperationEntries)
+    $systemEntries = @(Copy-OperationEntries -Entries $OperationEntries)
+    Clear-OperationEntries -Entries $OperationEntries
+
+    $currentUserSnapshots = if ($Action -eq "Test") {
+        @()
+    } else {
+        @(Get-CredentialOperationSnapshots -Entries $currentUserEntries)
+    }
+    try {
+        $currentUserResults = @(
+            Invoke-CredentialOperationsTransactional `
+                -Operation $Action `
+                -Entries $currentUserEntries
+        )
+        $currentUserResults = @(Set-OperationResultScope -Results $currentUserResults -Scope $currentIdentity)
+        if (@($currentUserResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
+            Clear-OperationEntries -Entries $systemEntries
+            $systemResults = @([pscustomobject]@{
+                Component = "SYSTEM"
+                Target = ""
+                Status = "Error"
+                Error = "операцію не розпочато через помилку поточного сховища"
+                Scope = "SYSTEM"
+            })
+        } else {
+            $systemResults = @(
+                Invoke-AsSystem `
+                    -ResolvedConfigPath $resolvedConfigPath `
+                    -ConfigPathWasExplicit $configPathWasExplicit `
+                    -Operation $Action `
+                    -Entries $systemEntries
+            )
+            $systemResults = @(Set-OperationResultScope -Results $systemResults -Scope "SYSTEM")
+            if ($Action -ne "Test" -and
+                @($systemResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
+                $rollbackResults = @(
+                    Restore-CredentialOperationSnapshots `
+                        -Snapshots $currentUserSnapshots
+                )
+                if ($rollbackResults.Count -gt 0) {
+                    $currentUserResults += @(
+                        Set-OperationResultScope `
+                            -Results $rollbackResults `
+                            -Scope $currentIdentity
+                    )
+                } else {
+                    Write-Host "Поточне сховище повернуто до стану перед операцією." -ForegroundColor Yellow
+                }
+            }
+        }
+    } finally {
+        # currentUserSnapshots повинні звільнятися, навіть якщо
+        # Invoke-AsSystem кине виняток (worker timeout, FatalError,
+        # збій Task Scheduler тощо) — інакше SecureString.Copy() з
+        # моменту знімку лишиться недиспоузнутим.
+        Clear-CredentialOperationSnapshots -Snapshots $currentUserSnapshots
+    }
+    return (@($currentUserResults) + @($systemResults))
+}
+
 try {
     $resolvedConfigPath = Get-BRAVOCredentialSetupConfiguration -Path $ConfigPath -PathWasExplicit:$configPathWasExplicit
     Import-Module -Name $credentialSettings.HelperPath -ErrorAction Stop
@@ -1575,66 +1646,14 @@ try {
     }
 
     if ($useSystemWorker -and $currentUserStoreRequested) {
-        Write-Host "Сховища для облікових записів: $currentIdentity та NT AUTHORITY\SYSTEM"
-        $currentUserEntries = @(Copy-OperationEntries -Entries $operationEntries)
-        $systemEntries = @(Copy-OperationEntries -Entries $operationEntries)
-        Clear-OperationEntries -Entries $operationEntries
-
-        $currentUserSnapshots = if ($Action -eq "Test") {
-            @()
-        } else {
-            @(Get-CredentialOperationSnapshots -Entries $currentUserEntries)
-        }
-        try {
-            $currentUserResults = @(
-                Invoke-CredentialOperationsTransactional `
-                    -Operation $Action `
-                    -Entries $currentUserEntries
-            )
-            $currentUserResults = @(Set-OperationResultScope -Results $currentUserResults -Scope $currentIdentity)
-            if (@($currentUserResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
-                Clear-OperationEntries -Entries $systemEntries
-                $systemResults = @([pscustomobject]@{
-                    Component = "SYSTEM"
-                    Target = ""
-                    Status = "Error"
-                    Error = "операцію не розпочато через помилку поточного сховища"
-                    Scope = "SYSTEM"
-                })
-            } else {
-                $systemResults = @(
-                    Invoke-AsSystem `
-                        -ResolvedConfigPath $resolvedConfigPath `
-                        -ConfigPathWasExplicit $configPathWasExplicit `
-                        -Operation $Action `
-                        -Entries $systemEntries
-                )
-                $systemResults = @(Set-OperationResultScope -Results $systemResults -Scope "SYSTEM")
-                if ($Action -ne "Test" -and
-                    @($systemResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
-                    $rollbackResults = @(
-                        Restore-CredentialOperationSnapshots `
-                            -Snapshots $currentUserSnapshots
-                    )
-                    if ($rollbackResults.Count -gt 0) {
-                        $currentUserResults += @(
-                            Set-OperationResultScope `
-                                -Results $rollbackResults `
-                                -Scope $currentIdentity
-                        )
-                    } else {
-                        Write-Host "Поточне сховище повернуто до стану перед операцією." -ForegroundColor Yellow
-                    }
-                }
-            }
-        } finally {
-            # currentUserSnapshots повинні звільнятися, навіть якщо
-            # Invoke-AsSystem кине виняток (worker timeout, FatalError,
-            # збій Task Scheduler тощо) — інакше SecureString.Copy() з
-            # моменту знімку лишиться недиспоузнутим.
-            Clear-CredentialOperationSnapshots -Snapshots $currentUserSnapshots
-        }
-        $operationResults = @($currentUserResults) + @($systemResults)
+        $operationResults = @(
+            Invoke-CredentialOperationsViaSystemWorker `
+                -Action $Action `
+                -OperationEntries $operationEntries `
+                -resolvedConfigPath $resolvedConfigPath `
+                -configPathWasExplicit $configPathWasExplicit `
+                -currentIdentity $currentIdentity
+        )
     } elseif ($useSystemWorker) {
         Write-Host "Сховище для облікового запису: NT AUTHORITY\SYSTEM"
         $operationResults = @(Invoke-AsSystem -ResolvedConfigPath $resolvedConfigPath -ConfigPathWasExplicit $configPathWasExplicit -Operation $Action -Entries $operationEntries)

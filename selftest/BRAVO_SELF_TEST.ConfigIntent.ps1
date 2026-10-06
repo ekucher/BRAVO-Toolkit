@@ -912,3 +912,162 @@ Test-BRAVOCondition `
         'команду -File BRAVO_CREDENTIALS_SETUP.ps1 зі збереженими ' +
         '-ConfigPath (за наміром) / -ProtectedPayloadPath / -ResultPath'
     )
+
+# ===== Regression #302: виняток SYSTEM-кроку мусить відкотити поточне сховище =====
+# Restore-CredentialOperationSnapshots раніше викликався лише коли рядки
+# результату SYSTEM мали Status=Error. Якщо Invoke-AsSystem КИДАВ виняток
+# (worker timeout, FatalError, збій Task Scheduler), блок мав лише finally,
+# що звільняє знімки, — сховище поточного користувача лишалося зміненим, а
+# SYSTEM — ні (розбіжність 7z/SFTP секретів). Реальні production-функції
+# екстрагуються по AST; заглушені лише межі: Windows Credential Manager
+# (Get/Set/Remove-BRAVOCredential, in-memory) та сам виклик SYSTEM-worker-а
+# (Invoke-AsSystem кидає виняток). Справжніх сховищ тест не торкається.
+$credRollbackText = [IO.File]::ReadAllText(
+    (Join-Path $root 'BRAVO_CREDENTIALS_SETUP.ps1'), [Text.Encoding]::UTF8
+)
+# Заглушки йдуть ПІСЛЯ production-тексту з -PreferLastDefinitionOnDuplicate:
+# production Invoke-AsSystem не мусить підміняти заглушку SYSTEM-межі.
+$credRollbackStubText = @'
+$script:credStore = @{}
+$script:credSetCalls = New-Object System.Collections.ArrayList
+$script:credRemoveCalls = New-Object System.Collections.ArrayList
+$script:credFailSetDuringRestore = $false
+$script:credSystemCalls = 0
+function Get-BRAVOCredential {
+    param([string]$Target)
+    if (-not $script:credStore.ContainsKey($Target)) { return $null }
+    $item = $script:credStore[$Target]
+    return [pscustomobject]@{ UserName = $item.UserName; Secret = $item.Secret.Copy() }
+}
+function Set-BRAVOCredential {
+    param([string]$Target, [string]$UserName, $Secret)
+    if ($script:credFailSetDuringRestore -and $script:credSystemCalls -gt 0) {
+        throw 'stub: credential store write failed'
+    }
+    [void]$script:credSetCalls.Add($Target)
+    $script:credStore[$Target] = @{ UserName = $UserName; Secret = $Secret.Copy() }
+}
+function Remove-BRAVOCredential {
+    param([string]$Target)
+    [void]$script:credRemoveCalls.Add($Target)
+    $existed = $script:credStore.ContainsKey($Target)
+    $script:credStore.Remove($Target)
+    return $existed
+}
+function Invoke-AsSystem {
+    param($ResolvedConfigPath, $ConfigPathWasExplicit, $Operation, $Entries)
+    $script:credSystemCalls++
+    foreach ($entry in @($Entries)) {
+        if ($null -ne $entry.SecureSecret) { $entry.SecureSecret.Dispose() }
+    }
+    throw 'stub: SYSTEM worker timeout'
+}
+'@
+$credRollbackModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText ($credRollbackText + "`r`n" + $credRollbackStubText) `
+    -PreferLastDefinitionOnDuplicate `
+    -FunctionNames @(
+        'Invoke-CredentialOperationsViaSystemWorker',
+        'Copy-OperationEntries', 'Clear-OperationEntries', 'Set-OperationResultScope',
+        'Invoke-CredentialOperations', 'Invoke-CredentialOperationsTransactional',
+        'Get-CredentialOperationSnapshots', 'Restore-CredentialOperationSnapshots',
+        'Clear-CredentialOperationSnapshots',
+        'Get-BRAVOCredential', 'Set-BRAVOCredential', 'Remove-BRAVOCredential', 'Invoke-AsSystem'
+    )
+
+function Invoke-BRAVOSelfTestCredentialsRollbackScenario {
+    param(
+        [Parameter(Mandatory = $true)][object]$Module,
+        [string]$Action = 'Set',
+        [bool]$FailRestore = $false
+    )
+    & $Module {
+        param($ScenarioAction, $ScenarioFailRestore)
+        $script:credStore = @{}
+        $script:credSetCalls = New-Object System.Collections.ArrayList
+        $script:credRemoveCalls = New-Object System.Collections.ArrayList
+        $script:credSystemCalls = 0
+        $script:credFailSetDuringRestore = $ScenarioFailRestore
+        $oldSecret = New-Object System.Security.SecureString
+        foreach ($c in 'old-value'.ToCharArray()) { $oldSecret.AppendChar($c) }
+        $script:credStore['TARGET_EXISTING'] = @{ UserName = 'user-old'; Secret = $oldSecret }
+        $newSecretA = New-Object System.Security.SecureString
+        foreach ($c in 'new-a'.ToCharArray()) { $newSecretA.AppendChar($c) }
+        $newSecretB = New-Object System.Security.SecureString
+        foreach ($c in 'new-b'.ToCharArray()) { $newSecretB.AppendChar($c) }
+        $entries = @(
+            [pscustomobject]@{ Component = 'COMP_EXISTING'; Target = 'TARGET_EXISTING'; UserName = 'user-new'; SecureSecret = $newSecretA },
+            [pscustomobject]@{ Component = 'COMP_NEW'; Target = 'TARGET_NEW'; UserName = 'user-new'; SecureSecret = $newSecretB }
+        )
+        $script:credSetCalls.Clear()
+        $script:credCaught = $null
+        # Warning-потік збираємо, навіть коли функція кидає виняток.
+        $warnings = @(& {
+            try {
+                [void](Invoke-CredentialOperationsViaSystemWorker `
+                    -Action $ScenarioAction `
+                    -OperationEntries $entries `
+                    -resolvedConfigPath 'C:\stub\BRAVO.config' `
+                    -configPathWasExplicit $false `
+                    -currentIdentity 'STUB\user')
+            } catch {
+                $script:credCaught = $_
+            }
+        } 3>&1)
+        $caught = $script:credCaught
+        $existing = $script:credStore['TARGET_EXISTING']
+        $existingPlain = $null
+        if ($null -ne $existing) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($existing.Secret)
+            try { $existingPlain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        }
+        [pscustomobject]@{
+            Caught = $caught
+            Output = $warnings
+            SystemCalls = $script:credSystemCalls
+            SetCalls = @($script:credSetCalls).Count
+            RemoveCalls = @($script:credRemoveCalls)
+            ExistingPlain = $existingPlain
+            ExistingUser = if ($null -ne $existing) { [string]$existing.UserName } else { $null }
+            NewTargetPresent = $script:credStore.ContainsKey('TARGET_NEW')
+        }
+    } $Action $FailRestore
+}
+
+$credRollbackMain = Invoke-BRAVOSelfTestCredentialsRollbackScenario -Module $credRollbackModule -Action 'Set'
+Test-BRAVOCondition `
+    -Condition (
+        $credRollbackMain.SystemCalls -eq 1 -and
+        $null -ne $credRollbackMain.Caught -and
+        [string]$credRollbackMain.Caught.Exception.Message -eq 'stub: SYSTEM worker timeout' -and
+        $credRollbackMain.ExistingPlain -eq 'old-value' -and
+        $credRollbackMain.ExistingUser -eq 'user-old' -and
+        -not $credRollbackMain.NewTargetPresent -and
+        @($credRollbackMain.RemoveCalls) -contains 'TARGET_NEW'
+    ) `
+    -Name 'Credentials/SystemWorkerExceptionRollsBackSnapshots' `
+    -Failure "виняток Invoke-AsSystem мусить відкотити сховище поточного користувача до знімку (старий запис відновлено, новий видалено) і пропагувати оригінальний виняток; факт: systemCalls=$($credRollbackMain.SystemCalls) caught=$($null -ne $credRollbackMain.Caught) existing='$($credRollbackMain.ExistingPlain)' newTargetPresent=$($credRollbackMain.NewTargetPresent)"
+
+$credRollbackFail = Invoke-BRAVOSelfTestCredentialsRollbackScenario -Module $credRollbackModule -Action 'Set' -FailRestore $true
+$credRollbackFailText = (@($credRollbackFail.Output) | ForEach-Object { [string]$_ }) -join ' | '
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $credRollbackFail.Caught -and
+        [string]$credRollbackFail.Caught.Exception.Message -eq 'stub: SYSTEM worker timeout' -and
+        $credRollbackFailText.Contains('TARGET_EXISTING') -and
+        $credRollbackFailText.Contains('stub: credential store write failed')
+    ) `
+    -Name 'Credentials/SystemWorkerExceptionRollbackFailureReportedNotMasked' `
+    -Failure "збій відкоту при винятку SYSTEM-кроку мусить бути виведений (Warning з Target і причиною), але не маскувати оригінальний виняток; факт: caught='$(if ($null -ne $credRollbackFail.Caught) { $credRollbackFail.Caught.Exception.Message })' output='$credRollbackFailText'"
+
+$credRollbackTest = Invoke-BRAVOSelfTestCredentialsRollbackScenario -Module $credRollbackModule -Action 'Test'
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $credRollbackTest.Caught -and
+        [string]$credRollbackTest.Caught.Exception.Message -eq 'stub: SYSTEM worker timeout' -and
+        $credRollbackTest.SetCalls -eq 0 -and
+        @($credRollbackTest.RemoveCalls).Count -eq 0
+    ) `
+    -Name 'Credentials/SystemWorkerExceptionTestActionDoesNotRestore' `
+    -Failure 'Action=Test не мутує сховище й не робить знімків: при винятку SYSTEM-кроку відкіт не виконується, виняток пропагується'
