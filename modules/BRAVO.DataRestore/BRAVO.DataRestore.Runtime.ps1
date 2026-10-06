@@ -2756,6 +2756,20 @@ function Get-BRAVODataRestoreSftpTransferTimeoutSeconds {
     return $transferTimeout
 }
 
+function Format-BRAVODataRestoreSkippedManifestLine {
+    # #294: рядок фінального сповіщення про пропущений manifest. Reason може
+    # містити повідомлення ConvertFrom-Json, яке у Windows PowerShell 5.1
+    # вбудовує весь вміст JSON, тому в сповіщення йде одним рядком і
+    # обрізаним; повний текст лишається в журналі.
+    param([Parameter(Mandatory = $true)]$SkippedManifest)
+
+    $reasonText = ([string]$SkippedManifest.Reason) -replace '\s+', ' '
+    if ($reasonText.Length -gt 150) {
+        $reasonText = $reasonText.Substring(0, 150) + '…'
+    }
+    return ("Пропущено manifest під час вибору generation: {0} — {1}" -f [IO.Path]::GetFileName([string]$SkippedManifest.ManifestPath), $reasonText)
+}
+
 function Invoke-BRAVODataRestoreSftpManifestFetch {
     # Вибір і завантаження generation manifest-а з SFTP у staging. Manifest
     # НІКОЛИ не потрапляє в <BackupRoot>\MANIFESTS — локальні listing/retention
@@ -3474,7 +3488,7 @@ try {
             foreach ($skippedManifest in @($selectedGeneration.SkippedManifests | Where-Object { $null -ne $_ })) {
                 Write-DataRestoreLog -Message "УВАГА: manifest пропущено під час вибору generation: $($skippedManifest.ManifestPath) — $($skippedManifest.Reason)" -Level 'WARNING' -Console
                 $script:dataRestoreWarningCount++
-                $script:dataRestoreSkippedManifestLines.Add(("Пропущено manifest під час вибору generation: {0} — {1}" -f [IO.Path]::GetFileName([string]$skippedManifest.ManifestPath), $skippedManifest.Reason))
+                $script:dataRestoreSkippedManifestLines.Add((Format-BRAVODataRestoreSkippedManifestLine -SkippedManifest $skippedManifest))
             }
             $selectedManifest = $selectedGeneration.Manifest
         } else {
@@ -3492,7 +3506,7 @@ try {
             # кожен пропуск; тут — лише лічильник попереджень і рядок сповіщення.
             foreach ($skippedManifest in @($sftpSelected.SkippedManifests | Where-Object { $null -ne $_ })) {
                 $script:dataRestoreWarningCount++
-                $script:dataRestoreSkippedManifestLines.Add(("Пропущено manifest під час вибору generation: {0} — {1}" -f [IO.Path]::GetFileName([string]$skippedManifest.ManifestPath), $skippedManifest.Reason))
+                $script:dataRestoreSkippedManifestLines.Add((Format-BRAVODataRestoreSkippedManifestLine -SkippedManifest $skippedManifest))
             }
             $selectedManifest = $sftpSelected.Manifest
         }

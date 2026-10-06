@@ -3,9 +3,10 @@
 ## Не випущено (developer)
 
 - **Fix: DataRestore: пропущені під час автовибору generation manifest-и тепер дають WARNING (#294).**
-  Якщо найновіший manifest нечитабельний або не проходить перевірку ідентичності, відновлення, як і раніше,
-  fail-closed бере старішу COMPLETE generation, але тепер кожен пропуск рахується як попередження: код
-  завершення 10 замість 0, рядок у фінальному сповіщенні WARNING. Для Source=SFTP
+  Будь-який manifest, пропущений fail-closed під час автовибору (нечитабельний або не проходить перевірку
+  ідентичності), як і раніше не використовується, але тепер кожен такий пропуск рахується як попередження: код
+  завершення 10 замість 0, короткий рядок у фінальному сповіщенні WARNING (повний текст у журналі). Це
+  стосується й старих пошкоджених manifest-ів, як і в контракті BRAVO_RESTORE_TEST. Для Source=SFTP
   `Invoke-BRAVODataRestoreSftpManifestFetch` повертає `SkippedManifests` у тому ж форматі, що canonical
   `Get-BRAVORestoreGenerationManifest`. Явний `-GenerationId` не змінено. Тести:
   `DataRestore/SftpManifestAutomaticSelectionReportsSkipped*`, matrix combo
