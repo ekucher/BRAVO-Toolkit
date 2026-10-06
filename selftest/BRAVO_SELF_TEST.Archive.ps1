@@ -1378,3 +1378,33 @@ try {
     else { Remove-Variable -Name logPath -Scope Global -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $sftpTimeoutRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# ============================================================
+# #290 (Codex P1): BRAVO_WINSCP lock звільняється лише після підтвердженого
+# завершення WinSCP. Якщо Kill()/WaitForExit не завершили процес, гілка
+# таймауту НЕ викликає Complete-BRAVOProcessOutputCapture (він звільняє lock)
+# і йде фатальним шляхом (throw), інакше наступна операція запустила б другий
+# WinSCP паралельно. Невбивний процес у self-test не відтворити, тому це
+# перевірка тексту справжньої гілки таймауту Test-SFTPConnection.
+$sftpTimeoutBranchMatch = [regex]::Match(
+    $archiveScriptText,
+    'if\s*\(-not \$completed\)\s*\{[\s\S]*?Перевищено таймаут перевірки SFTP-з''єднання \('
+)
+$sftpTimeoutBranchText = if ($sftpTimeoutBranchMatch.Success) { $sftpTimeoutBranchMatch.Value } else { '' }
+$sftpNotExitedBlockMatch = [regex]::Match(
+    $sftpTimeoutBranchText,
+    'if\s*\(-not \$winSCPExited\)\s*\{[\s\S]*?\bthrow\b[^\r\n]*\r?\n\s*\}'
+)
+$sftpHasExitedIndex = $sftpTimeoutBranchText.IndexOf('$process.HasExited')
+$sftpCompleteIndex = $sftpTimeoutBranchText.IndexOf('Complete-BRAVOProcessOutputCapture')
+Test-BRAVOCondition `
+    -Condition (
+        $sftpTimeoutBranchMatch.Success -and
+        $sftpNotExitedBlockMatch.Success -and
+        -not $sftpNotExitedBlockMatch.Value.Contains('Complete-BRAVOProcessOutputCapture') -and
+        $sftpHasExitedIndex -ge 0 -and
+        $sftpCompleteIndex -gt $sftpHasExitedIndex -and
+        $sftpNotExitedBlockMatch.Index -lt $sftpCompleteIndex
+    ) `
+    -Name 'Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive' `
+    -Failure 'гілка таймауту Test-SFTPConnection має перевірити $process.HasExited ДО Complete-BRAVOProcessOutputCapture і, якщо WinSCP не завершився, кинути виняток без звільнення BRAVO_WINSCP lock'

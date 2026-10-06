@@ -4383,6 +4383,24 @@ exit
                     -Message "Не вдалося завершити процес WinSCP після таймауту: $($_.Exception.Message)" `
                     -Level "DEBUG"
             }
+            # Lock звільняється лише після ПІДТВЕРДЖЕНОГО завершення WinSCP:
+            # якщо процес досі живий, наступна операція могла б захопити
+            # звільнений lock і запустити другий WinSCP паралельно з першим.
+            # Тоді lock лишається за цим процесом (звільниться з його
+            # завершенням), а прогін іде фатальним шляхом, як до #290.
+            $winSCPExited = $false
+            try {
+                $winSCPExited = [bool]$process.HasExited
+            } catch {
+                $winSCPExited = $false
+            }
+            if (-not $winSCPExited) {
+                Write-BRAVOLog `
+                    -Component 'SFTP' `
+                    -Message "Перевищено таймаут перевірки SFTP-з'єднання, але WinSCP не завершився; BRAVO_WINSCP lock не звільняється" `
+                    -Level "ERROR"
+                throw "перевищено таймаут перевірки SFTP-з'єднання; WinSCP не завершився"
+            }
             # Звільняємо ресурси (зокрема BRAVO_WINSCP lock) ДО виходу:
             # раніше throw оминав Complete-BRAVOProcessOutputCapture, lock
             # лишався захопленим, а викликачі (без try) завершувались

@@ -9,7 +9,9 @@
   (збій звільнення логується WARNING), в журнал пишеться ERROR з описом таймауту, функція повертає `$false`,
   і діє наявна обробка збою SFTP з кодом 50. Значення кодів завершення не змінено. Регресія:
   `Archive/SftpConnectionTimeoutReturnsFalse`, `Archive/SftpConnectionTimeoutReleasesWinSCPLock`,
-  `Archive/SftpConnectionTimeoutLogsError`.
+  `Archive/SftpConnectionTimeoutLogsError`. Lock звільняється лише після підтвердженого завершення WinSCP; якщо
+  процес не завершився, lock лишається, а прогін іде фатальним шляхом, щоб не запустити другий WinSCP паралельно
+  (`Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive`).
 - **Fix: Archive: status-файл оновлюється і при ранніх виходах (#291).**
   `BRAVO_STATUS_Archive.json` писався лише у хвості `Main` і у fatal catch. Провал preflight вільного
   місця (exit 40), провал очищення orphan VSS (exit 40) і `exit` усередині `Test-Compatibility`
