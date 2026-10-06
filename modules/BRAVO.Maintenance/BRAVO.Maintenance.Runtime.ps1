@@ -6616,7 +6616,12 @@ function Invoke-CommandWithLog {
 function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
     param(
         [string]$SevenZipPath,
-        [string]$ArchivePath
+        [string]$ArchivePath,
+        # #300: лише для retention (Remove-OldRestoreArchives), який ОЦІНЮЄ
+        # старі архіви: збій дає WARNING у викликача, але не виставляє
+        # criticalErrorOccurred/restoreIntegrityFailed (інакше зламаний
+        # старий архів робить кожен нічний прогін exit 41).
+        [switch]$NoFailureFlags
     )
 
     # T006: fallback-успіх пише WARNING через цей самий Logger (Write-Log
@@ -6629,7 +6634,7 @@ function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
         -TimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
         -Logger { param($Message, $Level) Write-Log $Message -Level $Level } `
         -LegacyBomFallbackCollector $script:MaintenanceLegacyBomFallbackArchives
-    if (-not $integrityValid) {
+    if (-not $integrityValid -and -not $NoFailureFlags) {
         $script:criticalErrorOccurred = $true
         $script:restoreIntegrityFailed = $true
     }
@@ -6875,7 +6880,8 @@ function Remove-OldRestoreArchives {
                 }
                 if (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
                         -SevenZipPath $ARC_PATH `
-                        -ArchivePath $archive.FullName)) {
+                        -ArchivePath $archive.FullName `
+                        -NoFailureFlags)) {
                     throw "перевірка 7z t не пройдена"
                 }
                 $archiveValid = $true

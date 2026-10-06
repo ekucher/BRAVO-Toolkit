@@ -2,6 +2,16 @@
 
 ## Не випущено (developer)
 
+- **Fix: Maintenance: зламаний старий архів у retention більше не дає код 41 щоночі (#300).**
+  `Remove-OldRestoreArchives` лише оцінює старі архіви реставрації, але його перевірка `7z t` через
+  `Test-BRAVOMaintenanceSevenZipArchiveIntegrity` виставляла `criticalErrorOccurred` і `restoreIntegrityFailed`.
+  Через один давній пошкоджений архів, який ніхто не відновлює, кожен нічний прогін Maintenance завершувався
+  кодом 41 (збій цілісності реставрації). Тепер обгортка має перемикач `-NoFailureFlags`, і лише retention його
+  використовує: збій лишається WARNING у журналі (щоразу, без одноразової позначки) і архів не зараховується як
+  точка відновлення, але прапорці не виставляються. Решта викликів (Verify-Backup, перевірка після реставрації)
+  поводяться як раніше. Коди завершення не змінено. Регресія:
+  `Maintenance/RetentionBrokenOldArchiveDoesNotSetFailureFlags`, `Maintenance/RetentionBrokenOldArchiveStillLogsWarning`,
+  `Maintenance/DirectIntegrityCheckStillSetsFailureFlags`.
 - **Fix: Health: порушення цілісності інструментів дає алерт і при вимкненому SFTP (#296).**
   Блокуючий результат перевірки `TOOLS_MANIFEST.json` (`ShouldBlock`, режим Enforce) раніше ставав Health
   issue лише всередині SFTP-перевірки. На сервері з вимкненим SFTP або при зайнятому WinSCP (перевірку
