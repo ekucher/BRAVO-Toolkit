@@ -7972,8 +7972,8 @@ $script:BRAVOMaintenanceMigrationStepEnabled = ($script:BRAVOMaintenanceLegacyMi
 #   [1/8] Перевірка вільного місця
 #   [2/8] Створення необхідних директорій
 #   [3/8] Зупинка служб
-#   [4/8] Перевірка розмірів .md
-#   [5/8] Реставрація моделі
+#   [4/8] Реставрація моделі
+#   [5/8] Перевірка розмірів .md
 #   [6/8] Обробка trace і логів
 #   [7/8] Відновлення стану служб
 #   [8/8] Контроль діапазонів ID
@@ -8021,9 +8021,9 @@ $maintenancePlanEntries = [ordered]@{
     # -ForceRestore АБО ця сама missed-recovery умова, АБО плановий
     # день/час) — саме те, що показує крок [N/TOTAL] нижче.
     'Відновлення пропущених операцій' = [bool]($RunMissedRestoreOnly -and $missedDailyWork)
-    'Перевірка розмірів'              = [bool]$script:BRAVOMaintenanceCheckSizeStepEnabled
     'Maintenance BRAVO'               = [bool]$BravoMaintenanceEnabled
     'Реставрація моделі'              = [bool]$script:BRAVOMaintenanceRestoreStepEnabled
+    'Перевірка розмірів'              = [bool]$script:BRAVOMaintenanceCheckSizeStepEnabled
     # dev.16: очистка не має власного on/off прапорця — політика
     # оцінюється КОЖЕН прогін (немає гілки, яка пропускає весь блок
     # "===== ОЧИСТКА СТАРИХ ДАНИХ ====="), тому це не UI-only "ТАК", а
@@ -9309,28 +9309,8 @@ Write-BRAVOMaintenanceStep `
             $script:BRAVOWarningCount -eq $stopServicesWarningsBefore -and
             $script:criticalErrorOccurred -eq $stopServicesCriticalBefore))
 
-# ===== ПЕРЕВІРКА РОЗМІРІВ ФАЙЛІВ .md =====
-Write-BRAVOProgressPhase -Phase 'Перевірка розмірів .md' -PercentComplete 35
-$checkSizeCriticalBefore = $script:criticalErrorOccurred
-$checkSizeWarningsBefore = $script:BRAVOWarningCount
-# dev.15: крок завжди рендериться (стабільна нумерація [N/8]) — SKIPPED
-# 'вимкнено', коли перевірку розмірів вимкнено, а не пропуск номера кроку.
-if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
-    Check-MdFileSizes -MODEL_PATH $MODEL_PATH -MAX_MD_FILE_SIZE $MAX_MD_FILE_SIZE -ExcludePatterns $MD_FILE_SIZE_EXCLUSIONS
-    Write-BRAVOMaintenanceStep `
-        -Name 'Перевірка розмірів .md' `
-        -Status (Get-BRAVOMaintenanceStepStatus `
-            -CriticalBefore $checkSizeCriticalBefore `
-            -WarningsBefore $checkSizeWarningsBefore)
-} else {
-    Write-BRAVOMaintenanceStep `
-        -Name 'Перевірка розмірів .md' `
-        -Status 'SKIPPED' `
-        -Details 'вимкнено'
-}
-
 # ===== ОПЕРАЦІЇ ПІСЛЯ ЗУПИНКИ СЕРВІСІВ =====
-Write-BRAVOProgressPhase -Phase 'Реставрація моделі' -PercentComplete 45
+Write-BRAVOProgressPhase -Phase 'Реставрація моделі' -PercentComplete 35
 $restoreCriticalBefore = $script:criticalErrorOccurred
 $restoreWarningsBefore = $script:BRAVOWarningCount
 $restoreStepReported = $false
@@ -9373,7 +9353,11 @@ $bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { [stri
 # (StartPending/StopPending — служба ще працює з файлами). Призупинену
 # оператором (Paused) службу Maintenance не зупиняє (#360), а обробку
 # trace, як і до #360, вона не блокує.
-if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @('Stopped', 'Paused')) {
+# Один знімок дозволу на файлові операції BRAVO для обох фаз нижче
+# (реставрація, потім trace): між ними тепер стоїть перевірка розмірів .md,
+# і обидві гілки мусять бачити той самий стан служби.
+$bravoFilePhaseAllowed = (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @('Stopped', 'Paused'))
+if ($bravoFilePhaseAllowed) {
     # P0 TOCTOU barrier 1 (перед входом у restore sequence): $shouldRestore
     # обчислений задовго до цього місця (до Enter-BRAVOMaintenanceOperationLock,
     # тобто до OperationLockWaitMinutes очікування, і до зупинки служб вище)
@@ -9804,17 +9788,86 @@ if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in
         $restoreStepReported = $true
     }
 
-    # Обробка Trace належить лише до компонента основної служби BRAVO.
-    #
-    # Зріз лічильників пересвіжується САМЕ ТУТ, після завершення
-    # реставрації: початкова ініціалізація вище знімається ДО неї, тому
-    # критична помилка реставрації опинялася "новою" для цього етапу і
-    # фарбувала його в FAIL. Реальний DEV-LIMS негативний прогін 19:48
-    # (bravocmd вбито -> exit 43) показав [6/8] FAIL з деталями
-    # "оброблено файлів: 2" — тобто етап відпрацював, а червоним був через
-    # чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.
-    $logsCriticalBefore = $script:criticalErrorOccurred
-    $logsWarningsBefore = $script:BRAVOWarningCount
+}
+elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {
+    # #321: Disabled-служба, що фактично працює (тип запуску змінили, не
+    # зупинивши її), реставрацію не отримує — модель під живим процесом
+    # не торкаємо; fail-closed, як і для ввімкненої служби.
+    $errorMsg = "Сервіс $($BravoServiceName) все ще працює. Операції з файлами пропущено."
+    Write-Log -Message $errorMsg -Level "ERROR"
+    Send-SlackAlert -Message $errorMsg -IsCritical
+    $script:criticalErrorOccurred = $true
+}
+
+# Реставрація моделі — стабільний крок [4/8], завжди рендериться, і має
+# рендеритись ДО «Перевірка розмірів .md» [5/8] і «Обробка trace і логів»
+# [6/8] — той самий порядок, що в затвердженому operator contract,
+# незалежно від того, чи справді
+# виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
+# гілка ($shouldRestore, вище) її не надрукувала — з трьох причин,
+# які варто розрізняти в Details:
+# - вікно закрилося під час очікування lock/підготовки (Barrier 1) — було
+#   заплановано, безпечно відкладено, наступний daily Recovery повторить;
+# - $shouldRestore було true, але службу BRAVO не вдалося зупинити —
+#   заплановане й невиконане, а не «не настав час»;
+# - $shouldRestore було false від самого початку — реставрація цього
+#   прогону не планувалась взагалі (dev.15: раніше цей випадок не
+#   рендерив крок взагалі, номер кроку "з'їдався").
+# dev.15 (виправлення порядку): цей fallback раніше стояв ПІСЛЯ рендеру
+# «Обробка trace і логів» нижче — коли $shouldRestore=false (типовий
+# щоденний прогін без запланованої реставрації), Logs встигав зайняти
+# номер [5/8], а Restore-SKIPPED зсувався на [6/8], міняючи затверджений
+# порядок місцями. Переміщено вище рендеру Logs, щоб порядок номерів
+# лишався стабільним у БУДЬ-якому сценарії.
+if (-not $restoreStepReported) {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Реставрація моделі' `
+        -Status 'SKIPPED' `
+        -Details $(
+            if ($restorePostponedByWindowClosing) { 'вікно закрилося під час очікування lock/підготовки' }
+            elseif ($shouldRestore) { 'службу BRAVO не було зупинено' }
+            elseif ($weeklyRestoreQuotaConsumed) { 'цього тижня вже виконано примусову' }
+            else { 'не заплановано на цей запуск' }
+        )
+}
+
+# ===== ПЕРЕВІРКА РОЗМІРІВ ФАЙЛІВ .md =====
+# Виконується ПІСЛЯ реставрації: bravocmd repair штатно стискає .md
+# (реальний прогін: 1,64 ГБ до реставрації -> 1,21 ГБ після), тож знімок
+# до неї давав хибну тривогу «.md > ліміт» про файл, який реставрація
+# щойно зменшила. Зменшення файлу тут не тривога; зниклий чи обнулений
+# після repair файл ловить самоперевірка реставрації (Compare-FileSizes).
+Write-BRAVOProgressPhase -Phase 'Перевірка розмірів .md' -PercentComplete 55
+$checkSizeCriticalBefore = $script:criticalErrorOccurred
+$checkSizeWarningsBefore = $script:BRAVOWarningCount
+# dev.15: крок завжди рендериться (стабільна нумерація [N/8]) — SKIPPED
+# 'вимкнено', коли перевірку розмірів вимкнено, а не пропуск номера кроку.
+if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
+    Check-MdFileSizes -MODEL_PATH $MODEL_PATH -MAX_MD_FILE_SIZE $MAX_MD_FILE_SIZE -ExcludePatterns $MD_FILE_SIZE_EXCLUSIONS
+    Write-BRAVOMaintenanceStep `
+        -Name 'Перевірка розмірів .md' `
+        -Status (Get-BRAVOMaintenanceStepStatus `
+            -CriticalBefore $checkSizeCriticalBefore `
+            -WarningsBefore $checkSizeWarningsBefore)
+} else {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Перевірка розмірів .md' `
+        -Status 'SKIPPED' `
+        -Details 'вимкнено'
+}
+
+# Обробка Trace належить лише до компонента основної служби BRAVO.
+#
+# Зріз лічильників пересвіжується САМЕ ТУТ, після реставрації і перевірки
+# розмірів .md: початкова ініціалізація вище знімається ДО них, тому
+# критична помилка реставрації опинялася "новою" для цього етапу і
+# фарбувала його в FAIL. Реальний DEV-LIMS негативний прогін 19:48
+# (bravocmd вбито -> exit 43) показав [6/8] FAIL з деталями
+# "оброблено файлів: 2" — тобто етап відпрацював, а червоним був через
+# чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.
+$logsCriticalBefore = $script:criticalErrorOccurred
+$logsWarningsBefore = $script:BRAVOWarningCount
+if ($bravoFilePhaseAllowed) {
     Write-BRAVOProgressPhase -Phase 'Обробка trace і логів' -PercentComplete 60
     try {
         if ($BravoMaintenanceEnabled) {
@@ -9853,15 +9906,6 @@ if (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in
         Send-SlackAlert -Message $errorMsg -IsCritical
         $script:criticalErrorOccurred = $true
     }
-}
-elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {
-    # #321: Disabled-служба, що фактично працює (тип запуску змінили, не
-    # зупинивши її), реставрацію не отримує — модель під живим процесом
-    # не торкаємо; fail-closed, як і для ввімкненої служби.
-    $errorMsg = "Сервіс $($BravoServiceName) все ще працює. Операції з файлами пропущено."
-    Write-Log -Message $errorMsg -Level "ERROR"
-    Send-SlackAlert -Message $errorMsg -IsCritical
-    $script:criticalErrorOccurred = $true
 }
 
 # Компонент exchangAPI обробляється незалежно, але лише за наявності
@@ -9950,37 +9994,6 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
     } else {
         Write-Log -Message "Ротацію логів BRAVO Web пропущено: службу $BravoWebServiceName не зупинено (стан: $bravoWebStatus)" -Level "WARNING"
     }
-}
-
-# Реставрація моделі — стабільний крок [5/8], завжди рендериться, і має
-# рендеритись ДО «Обробка trace і логів» [6/8] — той самий порядок, що в
-# затвердженому operator contract, незалежно від того, чи справді
-# виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
-# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з трьох причин,
-# які варто розрізняти в Details:
-# - вікно закрилося під час очікування lock/підготовки (Barrier 1) — було
-#   заплановано, безпечно відкладено, наступний daily Recovery повторить;
-# - $shouldRestore було true, але службу BRAVO не вдалося зупинити —
-#   заплановане й невиконане, а не «не настав час»;
-# - $shouldRestore було false від самого початку — реставрація цього
-#   прогону не планувалась взагалі (dev.15: раніше цей випадок не
-#   рендерив крок взагалі, номер кроку "з'їдався").
-# dev.15 (виправлення порядку): цей fallback раніше стояв ПІСЛЯ рендеру
-# «Обробка trace і логів» нижче — коли $shouldRestore=false (типовий
-# щоденний прогін без запланованої реставрації), Logs встигав зайняти
-# номер [5/8], а Restore-SKIPPED зсувався на [6/8], міняючи затверджений
-# порядок місцями. Переміщено вище рендеру Logs, щоб порядок номерів
-# лишався стабільним у БУДЬ-якому сценарії.
-if (-not $restoreStepReported) {
-    Write-BRAVOMaintenanceStep `
-        -Name 'Реставрація моделі' `
-        -Status 'SKIPPED' `
-        -Details $(
-            if ($restorePostponedByWindowClosing) { 'вікно закрилося під час очікування lock/підготовки' }
-            elseif ($shouldRestore) { 'службу BRAVO не було зупинено' }
-            elseif ($weeklyRestoreQuotaConsumed) { 'цього тижня вже виконано примусову' }
-            else { 'не заплановано на цей запуск' }
-        )
 }
 
 # Підсумковий рядок етапу — поза блоком BRAVO Web. Раніше він стояв

@@ -353,6 +353,91 @@ Test-BRAVOCondition `
     -Condition ($resultHierMissing.HasCriticalChanges -and $resultHierMissing.RemovedByRepairCount -eq 0) `
     -Name "Maintenance/CompareFileSizesHierarchyFileMissingCritical" `
     -Failure "зниклий файл ієрархії (.h1) має бути CRITICAL, не RemovedByRepair"
+# ============================================================
+# Check-MdFileSizes: реальна runtime-функція на реальних файлах.
+# Перевірка розмірів .md іде ПІСЛЯ реставрації (bravocmd repair штатно
+# стискає .md), тож вона бачить розмір, який лишився після repair:
+# (a) файл був понад ліміт, repair його стиснув -> жодного WARNING/alert;
+# (b) файл лишився понад ліміт після repair -> WARNING і одне critical-сповіщення;
+# (c) виключення з конфігурації далі діють. Блок — у дочірньому scope,
+# щоб не додавати змінних у script-scope цього flat-файлу (#163).
+# ============================================================
+& {
+    $mdSizeStubText = @'
+function Write-Log {
+    param($Message, [string]$Level = 'INFO')
+    if ($null -eq (Get-Variable -Name BRAVOCapturedLogMessages -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:BRAVOCapturedLogMessages = New-Object System.Collections.ArrayList
+    }
+    [void]$script:BRAVOCapturedLogMessages.Add(('{0}|{1}' -f $Level, [string]$Message))
+}
+function Send-SlackAlert {
+    param($Message, [switch]$IsCritical)
+    if ($null -eq (Get-Variable -Name BRAVOCapturedAlerts -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:BRAVOCapturedAlerts = New-Object System.Collections.ArrayList
+    }
+    [void]$script:BRAVOCapturedAlerts.Add(('{0}|{1}' -f [bool]$IsCritical, [string]$Message))
+}
+function Format-BRAVOUkrainianCount { BRAVO.Notifications\Format-BRAVOUkrainianCount @args }
+function Format-BRAVONotificationListSummary { BRAVO.Notifications\Format-BRAVONotificationListSummary @args }
+'@
+    $mdSizeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($mdSizeStubText + "`n" + $maintenanceRepairScriptText) `
+        -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Format-FileSize', 'Get-BRAVOModelRelativePath', 'Format-BRAVOUkrainianCount', 'Format-BRAVONotificationListSummary', 'Check-MdFileSizes')
+    $mdSizeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_MDSIZE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $mdSizeScenario = {
+            param([int64]$SizeBeforeRepair, [int64]$SizeAfterRepair, [string[]]$ExcludePatterns)
+            if (Test-Path -LiteralPath $mdSizeRoot) { Remove-Item -LiteralPath $mdSizeRoot -Recurse -Force }
+            [void][IO.Directory]::CreateDirectory((Join-Path $mdSizeRoot 'TestProject'))
+            $mdSizeFile = Join-Path $mdSizeRoot 'TestProject\TestProject.md'
+            # Модель до реставрації, потім «repair» переписує файл новим розміром.
+            [IO.File]::WriteAllBytes($mdSizeFile, (New-Object byte[] $SizeBeforeRepair))
+            [IO.File]::WriteAllBytes($mdSizeFile, (New-Object byte[] $SizeAfterRepair))
+            [IO.File]::WriteAllBytes((Join-Path $mdSizeRoot 'TestProject\Small.md'), (New-Object byte[] 512))
+            return (& $mdSizeModule {
+                param($ModelPath, $Excludes)
+                Set-StrictMode -Version Latest
+                $script:BRAVOCapturedAlerts = New-Object System.Collections.ArrayList
+                $script:BRAVOCapturedLogMessages = New-Object System.Collections.ArrayList
+                Check-MdFileSizes -MODEL_PATH $ModelPath -MAX_MD_FILE_SIZE 4096 -ExcludePatterns $Excludes
+                [pscustomobject]@{
+                    Alerts = @($script:BRAVOCapturedAlerts)
+                    Warnings = @($script:BRAVOCapturedLogMessages | Where-Object { ([string]$_).StartsWith('WARNING|') })
+                }
+            } $mdSizeRoot $ExcludePatterns)
+        }
+
+        $mdShrunk = & $mdSizeScenario 8192 2048 @()
+        Test-BRAVOCondition `
+            -Condition ($mdShrunk.Alerts.Count -eq 0 -and $mdShrunk.Warnings.Count -eq 0) `
+            -Name "Maintenance/MdSizeCheckNoAlertWhenRepairShrankFile" `
+            -Failure "файл .md, що був понад ліміт до repair і став меншим за ліміт після нього, не повинен давати WARNING чи сповіщення; alerts=$($mdShrunk.Alerts.Count), warnings=$($mdShrunk.Warnings.Count)"
+
+        $mdStillLarge = & $mdSizeScenario 8192 6144 @()
+        Test-BRAVOCondition `
+            -Condition (
+                $mdStillLarge.Alerts.Count -eq 1 -and
+                ([string]$mdStillLarge.Alerts[0]).StartsWith('True|') -and
+                ([string]$mdStillLarge.Alerts[0]).Contains('TestProject.md') -and
+                -not ([string]$mdStillLarge.Alerts[0]).Contains('Small.md') -and
+                $mdStillLarge.Warnings.Count -eq 1 -and
+                ([string]$mdStillLarge.Warnings[0]).Contains('TestProject.md')
+            ) `
+            -Name "Maintenance/MdSizeCheckAlertsWhenFileStaysOversizedAfterRepair" `
+            -Failure "файл .md, що лишився понад ліміт після repair, має дати рівно один WARNING і одне critical-сповіщення з його назвою; alerts=$($mdStillLarge.Alerts -join ' // '); warnings=$($mdStillLarge.Warnings -join ' // ')"
+
+        $mdExcluded = & $mdSizeScenario 8192 6144 @('TestProject.md')
+        Test-BRAVOCondition `
+            -Condition ($mdExcluded.Alerts.Count -eq 0 -and $mdExcluded.Warnings.Count -eq 0) `
+            -Name "Maintenance/MdSizeCheckHonoursExclusionsAfterRepair" `
+            -Failure "файл .md із виключень конфігурації не повинен давати WARNING чи сповіщення навіть понад ліміт; alerts=$($mdExcluded.Alerts.Count), warnings=$($mdExcluded.Warnings.Count)"
+    } finally {
+        if (Test-Path -LiteralPath $mdSizeRoot) {
+            Remove-Item -LiteralPath $mdSizeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'MaintenanceRepair/Maintenance' } }
 if (Enter-BRAVOSelfTestSection -Name 'MaintenanceRepair/Maintenance.CompareFileSizesMixedMissingSegmentAndMd' -DependsOn 'MaintenanceRepair/Maintenance') { try {
 
