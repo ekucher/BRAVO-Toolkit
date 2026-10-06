@@ -738,9 +738,14 @@ function Get-Service {
     if ([string]$Name -eq 'BravoStartTypeDisabled') { Add-Member -InputObject $svc -MemberType NoteProperty -Name StartType -Value 'Disabled' }
     if ([string]$Name -eq 'BravoStartTypeAutomatic') { Add-Member -InputObject $svc -MemberType NoteProperty -Name StartType -Value 'Automatic' }
     Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { } -Force
+    # Службу видалено з SCM між Get-Service і Refresh().
+    if ([string]$Name -eq 'BravoVanished') { Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { throw 'служба вже не існує (stub)' } -Force }
     return $svc
 }
-function Read-BRAVOServiceQuiescenceState { return $script:startTypeMarker }
+function Read-BRAVOServiceQuiescenceState {
+    if ($script:startTypeMarkerThrows) { throw 'маркер не прочитано (stub)' }
+    return $script:startTypeMarker
+}
 function Get-BRAVOWmiInstance {
     param($ClassName)
     if ($script:startTypeWmiFails) { throw 'WMI недоступний (stub)' }
@@ -757,10 +762,11 @@ function Get-BRAVOWmiInstance {
         -FunctionNames @('Write-HealthLog', 'Get-Service', 'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled',
             'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition', 'Get-ManagedServiceHealthIssues')
     $startTypeProbe = {
-        param($ServiceName, [bool]$WmiFails = $false, $Marker = $null)
+        param($ServiceName, [bool]$WmiFails = $false, $Marker = $null, [bool]$MarkerThrows = $false)
         Set-StrictMode -Version 2.0
         $script:startTypeWmiFails = $WmiFails
         $script:startTypeMarker = $Marker
+        $script:startTypeMarkerThrows = $MarkerThrows
         $script:backupMonitoring = @{ CheckManagedServices = $true }
         $script:maintenanceSettings = [pscustomobject]@{
             Services = [pscustomobject]@{ BravoName = $ServiceName; ExchangeApiName = ''; BravoWebEnabled = $false; BravoWebCandidates = @() }
@@ -768,7 +774,7 @@ function Get-BRAVOWmiInstance {
         $thrown = $null
         $issues = @()
         try { $issues = @(Get-ManagedServiceHealthIssues) } catch { $thrown = $_.Exception.Message }
-        [pscustomobject]@{ Thrown = $thrown; IssueCount = @($issues).Count }
+        [pscustomobject]@{ Thrown = $thrown; IssueCount = @($issues).Count; Reasons = @($issues | ForEach-Object { [string]$_.Reason }) }
     }
     $startTypeDisabled = & $startTypeModule $startTypeProbe 'BravoDisabled'
     $startTypeAuto = & $startTypeModule $startTypeProbe 'BravoAuto'
@@ -818,6 +824,21 @@ function Get-BRAVOWmiInstance {
         ) `
         -Name "Health/ManagedServiceIssuesUnchangedUnderQuiescenceMarker" `
         -Failure "Get-ManagedServiceHealthIssues після переходу на Get-BRAVOManagedServiceCondition: утримана BRAVO служба (Disabled зі знімком у маркері) не дає issue, зупинена служба з маркера дає issue, як і раніше. Отримано: утримана(Thrown='$($startTypeHeld.Thrown)', Issues=$($startTypeHeld.IssueCount)), у маркері(Thrown='$($startTypeMarked.Thrown)', Issues=$($startTypeMarked.IssueCount))"
+
+    # Службу видалено між Get-Service і Refresh(): одна issue з явною
+    # причиною (не «стан: » з порожнім станом), без винятку; збій читання
+    # маркера не обриває Health, служба перевіряється без маркера.
+    $startTypeVanished = & $startTypeModule $startTypeProbe 'BravoVanished'
+    $startTypeMarkerFails = & $startTypeModule $startTypeProbe 'BravoAuto' $false $null $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $startTypeVanished.Thrown -and $startTypeVanished.IssueCount -eq 1 -and
+            ([string]$startTypeVanished.Reasons[0]).Contains('видалено під час перевірки') -and
+            $null -eq $startTypeMarkerFails.Thrown -and $startTypeMarkerFails.IssueCount -eq 1 -and
+            ([string]$startTypeMarkerFails.Reasons[0]).Contains('стан: Stopped')
+        ) `
+        -Name "Health/ManagedServiceVanishedOrMarkerUnreadableIsHandled" `
+        -Failure "Get-ManagedServiceHealthIssues: служба, видалена між Get-Service і Refresh(), дає одну issue з причиною 'видалено під час перевірки'; збій читання маркера не кидає виняток. Отримано: видалена(Thrown='$($startTypeVanished.Thrown)', Reasons='$($startTypeVanished.Reasons -join ' | ')'), маркер(Thrown='$($startTypeMarkerFails.Thrown)', Reasons='$($startTypeMarkerFails.Reasons -join ' | ')')"
 
     $healthManagedServiceFunctionText = $healthRuntimeTextForQuiescence.Substring(
         $healthRuntimeTextForQuiescence.IndexOf('function Get-ManagedServiceHealthIssues'))
@@ -871,6 +892,10 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
         @{ Case = 'ManualStopped'; StartType = 'Manual'; Status = 'Stopped'; Marker = $false; Expected = 'Failed' },
         @{ Case = 'AutoStartPending'; StartType = 'Automatic'; Status = 'StartPending'; Marker = $false; Expected = 'Pending' },
         @{ Case = 'ManualStopPending'; StartType = 'Manual'; Status = 'StopPending'; Marker = $false; Expected = 'Pending' },
+        @{ Case = 'AutoContinuePending'; StartType = 'Automatic'; Status = 'ContinuePending'; Marker = $false; Expected = 'Pending' },
+        @{ Case = 'AutoPausePending'; StartType = 'Automatic'; Status = 'PausePending'; Marker = $false; Expected = 'Pending' },
+        @{ Case = 'AutoPaused'; StartType = 'Automatic'; Status = 'Paused'; Marker = $false; Expected = 'Failed' },
+        @{ Case = 'UnknownStartModeStopped'; StartType = 'Boot'; Status = 'Stopped'; Marker = $false; Expected = 'Failed' },
         @{ Case = 'DisabledStopped'; StartType = 'Disabled'; Status = 'Stopped'; Marker = $false; Expected = 'Disabled' },
         @{ Case = 'DisabledRunning'; StartType = 'Disabled'; Status = 'Running'; Marker = $false; Expected = 'Disabled' },
         @{ Case = 'AutoStoppedInMarker'; Name = 'bravo'; StartType = 'Automatic'; Status = 'Stopped'; Marker = $true; Expected = 'OwnedByBravo' },
@@ -879,7 +904,8 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
         @{ Case = 'AutoPendingInMarker'; Name = 'BRAVO'; StartType = 'Automatic'; Status = 'StartPending'; Marker = $true; Expected = 'Pending' },
         @{ Case = 'DisabledHeldBySnapshot'; Name = 'BravoWeb'; StartType = 'Disabled'; Status = 'Stopped'; Marker = $true; Expected = 'OwnedByBravo' },
         @{ Case = 'DisabledByOperatorInMarker'; Name = 'BravoOperatorDisabled'; StartType = 'Disabled'; Status = 'Stopped'; Marker = $true; Expected = 'Disabled' },
-        @{ Case = 'AutoStoppedOtherMarker'; Name = 'BravoOther'; StartType = 'Automatic'; Status = 'Stopped'; Marker = $true; Expected = 'Failed' }
+        @{ Case = 'AutoStoppedOtherMarker'; Name = 'BravoOther'; StartType = 'Automatic'; Status = 'Stopped'; Marker = $true; Expected = 'Failed' },
+        @{ Case = 'SnapshotOnlyNotDisabledStopped'; Name = 'BravoWeb'; StartType = 'Manual'; Status = 'Stopped'; Marker = $true; Expected = 'Failed' }
     )
     $conditionProbe = {
         param($Cases, $Marker)

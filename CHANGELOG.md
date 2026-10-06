@@ -21,10 +21,13 @@
   Automatic і Manual класифікуються однаково. `Disabled`, виставлений самим BRAVO на час реставрації
   (знімок типу в ownership-маркері, #297/#329), — це `OwnedByBravo` з `HeldByBravo`, а не «навмисно
   вимкнено». Health (`Get-ManagedServiceHealthIssues`) перейшов на неї без зміни набору й текстів
-  проблем; змінився лише INFO-рядок журналу для служби, яку BRAVO тимчасово утримує в `Disabled`.
+  проблем; змінився лише INFO-рядок журналу для служби, яку BRAVO тимчасово утримує в `Disabled`, і
+  причина для служби, яку видалили між `Get-Service` і `Refresh()`: «не знайдена (службу видалено під час
+  перевірки)» (раніше цей випадок обривав перевірку служб винятком).
   Служби поки нічого не запускає: автоматичне відновлення — наступні хвилі #314. Тести:
   `ServiceRecovery/Condition*` і `Health/ManagedServiceIssuesUnchangedUnderQuiescenceMarker`,
-  `Health/ManagedServiceUsesCanonicalCondition` у suite `ServiceQuiescence`.
+  `Health/ManagedServiceUsesCanonicalCondition`, `Health/ManagedServiceVanishedOrMarkerUnreadableIsHandled` у suite
+  `ServiceQuiescence`.
 
 - **Change: прибрано нагадування про застарілі оновлення Windows.**
   BRAVO_HEALTH у кожному прогоні писав WARNING «Останнє оновлення Windows встановлено … дн. тому»

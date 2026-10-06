@@ -4116,10 +4116,17 @@ function Get-ManagedServiceHealthIssues {
             Write-HealthLog "Служба $($service.Name) працює" -Level "SUCCESS"
             continue
         }
+        # NotInstalled тут можливий лише тоді, коли службу видалили між
+        # Get-Service і Refresh(): стану вже немає, тож причина явна.
+        $serviceIssueReason = if ($serviceCondition.Condition -eq 'NotInstalled') {
+            "не знайдена (службу видалено під час перевірки)"
+        } else {
+            "не запущена (стан: $($serviceCondition.Status))"
+        }
         $issues += [pscustomobject]@{
             Kind = "Service"
             Component = "Служба $($service.Name)"
-            Reason = "не запущена (стан: $($serviceCondition.Status))"
+            Reason = $serviceIssueReason
             FileName = ""
             LastWriteTime = $null
             Location = [string]$service.Name
