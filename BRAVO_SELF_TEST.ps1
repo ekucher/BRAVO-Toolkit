@@ -2511,31 +2511,6 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "Compatibility/Tls12EnablementPreservesExistingProtocols" `
         -Failure ("кожна production-точка ввімкнення TLS 1.2 (Enable-BRAVOTls12, старт Maintenance/DataRestore runtime, dry-run webhook) мусить ДОДАВАТИ Tls12 (-bor), не затираючи вже ввімкнені протоколи; порушено: " +
             (@($tls12FailedSites | ForEach-Object { "$($_.Label) (знайдено=$($_.Found), до=$($_.Before), після=$($_.After))" }) -join '; '))
-    $staleHotfix = [pscustomobject]@{ InstalledOn = (Get-Date).AddDays(-400) }
-    $stalePatchLevel = Get-BRAVOWindowsPatchLevelRecommendation `
-        -InstalledHotfixes @($staleHotfix) `
-        -Now (Get-Date) `
-        -StaleAfterDays 120
-    $freshHotfix = [pscustomobject]@{ InstalledOn = (Get-Date).AddDays(-10) }
-    $freshPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation `
-        -InstalledHotfixes @($freshHotfix) `
-        -Now (Get-Date) `
-        -StaleAfterDays 120
-    $noDataPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation `
-        -InstalledHotfixes @() `
-        -StaleAfterDays 120
-    Test-BRAVOCondition `
-        -Condition (
-            $stalePatchLevel.IsUpdateRecommended -and
-            $stalePatchLevel.DaysSinceLastUpdate -eq 400 -and
-            -not [string]::IsNullOrWhiteSpace([string]$stalePatchLevel.Message) -and
-            -not $freshPatchLevel.IsUpdateRecommended -and
-            $null -eq $freshPatchLevel.Message -and
-            $noDataPatchLevel.IsUpdateRecommended -and
-            -not [string]::IsNullOrWhiteSpace([string]$noDataPatchLevel.Message)
-        ) `
-        -Name "Compatibility/WindowsPatchLevelRecommendation" `
-        -Failure "рекомендація оновити Windows має спрацьовувати лише для застарілого рівня патчів і не хибити на свіжій системі"
 
     # P0.4 з ARCHIV_LIMS_MONOLITH_AUDIT_FIXES.md: Supported (Server 2019+,
     # Windows 10/11, PS 5.1) / LegacyBestEffort (Server 2012 R2, 2016) /
@@ -2682,13 +2657,12 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Failure "-Environmental має лишати рівень WARNING, але не інкрементувати лічильник попереджень; звичайний WARNING і будь-який ERROR мають рахуватись як раніше"
     Test-BRAVOCondition `
         -Condition (
-            $healthRuntimeTextForEnvironmental -match '\$BRAVOWindowsPatchLevel\.Message -Level "WARNING" -Environmental' -and
             $healthRuntimeTextForEnvironmental -match '\$BRAVOPowerShellUpdate\.Message -Level "WARNING" -Environmental' -and
             $archiveRuntimeTextForEnvironmental -match '\$powerShellUpdate\.Message -Level "WARNING" -Environmental' -and
             $maintenanceRuntimeTextForEnvironmental -match '\$BRAVOPowerShellUpdate\.Message -Level "WARNING" -Environmental'
         ) `
         -Name "Runtime/StaleUpdateRemindersAreEnvironmental" `
-        -Failure "нагадування про застарілі оновлення Windows/PowerShell мають логуватись з -Environmental, інакше невідновлений сервер назавжди дає exit 10 і статус ЧАСТКОВО на успішному прогоні"
+        -Failure "нагадування про застарілий PowerShell мають логуватись з -Environmental, інакше невідновлений сервер назавжди дає exit 10 і статус ЧАСТКОВО на успішному прогоні"
 
     # --- Dry-run створює відсутній SFTP-каталог призначення замість того,
     # щоб падати fail-closed на тому, що BRAVO_ARCHIV робить сам
@@ -16449,7 +16423,6 @@ $restoreVerifySettings = [pscustomobject]@{ MaxVerificationAgeHours = 200 }
 $bravoSettings = [pscustomobject]@{ InstitutionName = 'self-test'; InstitutionCode = 'SELFTEST' }
 $script:BRAVOCompatibility = [pscustomobject]@{ WindowsVersion = 'self-test'; PowerShellVersion = 'self-test'; WmiProvider = 'self-test'; JsonProvider = 'self-test'; TaskSchedulerProvider = 'self-test' }
 $script:BRAVOPowerShellUpdate = [pscustomobject]@{ IsUpdateRecommended = $false; Message = '' }
-$script:BRAVOWindowsPatchLevel = [pscustomobject]@{ IsUpdateRecommended = $false; Message = '' }
 $toolsPath = Join-Path $probeWorkRoot 'Tools'
 $arcPath = Join-Path $toolsPath '7za.exe'
 $winSCPPath = Join-Path $toolsPath 'WinSCP.com'
@@ -22464,22 +22437,28 @@ function Get-BRAVOMaintenanceSummaryResult {
         (Join-Path $root "BRAVO_TASKS_UNINSTALL.ps1"),
         [Text.Encoding]::UTF8
     )
-    # Свіжість накопичувальних оновлень Windows — health-метрика, а не
-    # умова виконання. В операційних скриптах вона лише додавала WARNING (а
-    # з ним і ненульовий код завершення 10) до дії, на результат якої вік
-    # патчів не впливає. Тому діагностика лишається рівно в одному місці —
-    # BRAVO_HEALTH, який для цього й існує.
+    # Свіжість накопичувальних оновлень Windows Toolkit не перевіряє ніде:
+    # в операційних скриптах вона додавала WARNING (а з ним і код
+    # завершення 10) до дії, на результат якої вік патчів не впливає, а в
+    # BRAVO_HEALTH була постійним нагадуванням у кожному прогоні. Тому
+    # функцію прибрано з BRAVO.Compatibility, а виклики — з усіх runtime.
+    $compatibilityModuleTextForPatchLevel = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"),
+        [Text.Encoding]::UTF8
+    )
     Test-BRAVOCondition `
         -Condition (
-            $healthScriptTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
+            -not $compatibilityModuleTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
+            -not $healthScriptTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
+            -not $healthScriptTextForPatchLevel.Contains('$BRAVOWindowsPatchLevel') -and
             -not $archiveScriptText.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
             -not $maintenanceScriptText.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
             -not $credentialsSetupTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
             -not $tasksInstallTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
             -not $tasksUninstallTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation")
         ) `
-        -Name "Runtime/WindowsPatchLevelOnlyInHealth" `
-        -Failure "діагностика свіжості оновлень Windows має виконуватись лише в BRAVO_HEALTH і не впливати на код завершення Archive/Maintenance/Recovery/Tasks"
+        -Name "Runtime/NoWindowsPatchLevelReminder" `
+        -Failure "нагадування про застарілі оновлення Windows прибрано: функції Get-BRAVOWindowsPatchLevelRecommendation не має бути ні в BRAVO.Compatibility, ні у викликах Health/Archive/Maintenance/Tasks"
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains("Get-BRAVOToolIntegrityRecommendation") -and
