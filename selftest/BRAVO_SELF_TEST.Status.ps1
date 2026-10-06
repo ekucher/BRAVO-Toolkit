@@ -77,9 +77,14 @@
     # стоїть ПІСЛЯ обчислення exit code (телеметрія не змінює результат) ---
     $statusCallSiteContracts = @(
         @{
+            # #291: перший (і для контрольованих виходів єдиний) виклик в
+            # Archive — у fail-soft helper'і Write-BRAVOArchiveOperationStatus,
+            # який пишуть хвіст Main і ранні виходи; exit code він отримує
+            # параметром. Порядок «хвостовий виклик ПІСЛЯ обчислення exit
+            # code» перевіряється окремо нижче (CallSiteAfterExitCode).
             Label = 'Archive'
             Path = 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'
-            RequiredAfter = '$script:processExitCode = Resolve-BRAVOExitCode -HasWarnings'
+            RequiredAfter = 'function Write-BRAVOArchiveOperationStatus'
         }
         @{
             Label = 'Health'
@@ -120,3 +125,24 @@
             -Name "Status/CallSiteIsFailSoft[$($statusCallSite.Label)]" `
             -Failure "$($statusCallSite.Path): Write-BRAVOOperationStatus має стояти ПІСЛЯ обчислення exit code і всередині try/catch (fail-soft; телеметрія не змінює результат операції)"
     }
+
+    # #291: Archive пише статус через helper — хвостовий виклик helper'а
+    # (останній у файлі; ранні виходи стоять вище) мусить іти ПІСЛЯ
+    # остаточного обчислення exit code і передавати саме його, а сам helper
+    # — бути першим сирим викликом (контракт [Archive] вище) у try/catch.
+    $archiveStatusText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $archiveStatusExitCodeIndex = $archiveStatusText.IndexOf('$script:processExitCode = Resolve-BRAVOExitCode -HasWarnings')
+    $archiveStatusTailCallIndex = $archiveStatusText.LastIndexOf('Write-BRAVOArchiveOperationStatus')
+    $archiveStatusHelperIndex = $archiveStatusText.IndexOf('function Write-BRAVOArchiveOperationStatus')
+    $archiveStatusTailCallText = if ($archiveStatusTailCallIndex -ge 0) {
+        $archiveStatusText.Substring($archiveStatusTailCallIndex, [Math]::Min(300, $archiveStatusText.Length - $archiveStatusTailCallIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveStatusExitCodeIndex -ge 0 -and
+            $archiveStatusHelperIndex -ge 0 -and
+            $archiveStatusTailCallIndex -gt $archiveStatusExitCodeIndex -and
+            $archiveStatusTailCallText -match '^Write-BRAVOArchiveOperationStatus\s+`?\s*-ExitCode\s+\$script:processExitCode(?!\w)'
+        ) `
+        -Name 'Status/CallSiteAfterExitCode[ArchiveTail]' `
+        -Failure 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1: хвостовий виклик Write-BRAVOArchiveOperationStatus має стояти ПІСЛЯ остаточного обчислення exit code і передавати -ExitCode $script:processExitCode'
