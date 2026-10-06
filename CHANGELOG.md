@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Fix: Operations: outbox-елемент без EventId більше не блокує доставку подій (#305).**
+  Під StrictMode 2.0 прямий `$item.EventId` кидав виняток для outbox-файлу без цього поля (ручна правка, часткове
+  відновлення) — у логуванні, у самому dead-letter і в логу успіху. Виняток минав поелементну ізоляцію дренажу:
+  дренаж зупинявся на цьому елементі на кожному прогоні Archive/Health/Maintenance/heartbeat, події за ним не
+  доставлялися, а з валідними ApiPath/RequestBody подія ще й надсилалась повторно на кожному циклі backoff. Тепер
+  EventId читається через `Get-BRAVOOperationsOutboxItemEventId`; елемент без EventId до транспорту переміщується в
+  DeadLetter з окремою причиною (ім'я файлу береться з імені файлу outbox), решта черги обробляється далі. Коди
+  завершення не змінено. Тести: `Operations/OutboxItemWithoutEventIdIsDeadLetteredWithOwnReason`,
+  `Operations/OutboxItemWithoutEventIdDoesNotBlockOrResendQueue`.
 - **Fix: Credentials: виняток SYSTEM-кроку відкочує сховище поточного користувача (#302).**
   `Restore-CredentialOperationSnapshots` запускався лише за рядками результату зі `Status=Error`. Якщо
   `Invoke-AsSystem` кидав виняток (таймаут worker-а, `FatalError`, збій Task Scheduler), блок мав лише `finally`
