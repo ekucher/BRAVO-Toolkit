@@ -4523,8 +4523,28 @@ if ($script:ProbeScenario -eq 'SMHoldLostBetweenComponents') {
 }
 '@
             $dataRestoreOrchestrationProbeScript = @'
+param([string]$Scenarios, [string]$RepositoryRoot, [string]$ProbeParent)
+# Усі сценарії в ОДНОМУ дочірньому процесі (раніше: процес на сценарій).
+# Ізоляція сценарію: власний дочірній scope (& { }), власні ProbeRoot,
+# runtime.ps1 і result.json, свіжий Import-Module -Force; глобальні змінні,
+# створені сценарієм, прибираються перед наступним. Згенерований runtime
+# виконується як окремий скрипт (exit завершує лише його, не процес), а
+# do/while($false) не дає випадковому break/continue обірвати решту.
+# Сценарій без result.json батьківська частина вважає ProbeError (fail-closed).
+$probeBaselineGlobals = @{}
+foreach ($probeGlobal in @(Get-Variable -Scope Global)) { $probeBaselineGlobals[$probeGlobal.Name] = $true }
+foreach ($probeScenarioName in @($Scenarios -split ',')) {
+    do {
+        try {
+            & {
 param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
 $ErrorActionPreference = 'Stop'
+# Канарки ізоляції: жодна не має бути видна з попереднього сценарію.
+$probeLeaks = @()
+if ($null -ne (Get-Variable -Name 'probeIsolationCanary' -ErrorAction SilentlyContinue)) { $probeLeaks += 'probeIsolationCanary' }
+if ($null -ne (Get-Variable -Name 'BRAVOOrchestrationProbeCanary' -Scope Global -ErrorAction SilentlyContinue)) { $probeLeaks += 'global:BRAVOOrchestrationProbeCanary' }
+$probeIsolationCanary = $Scenario
+$global:BRAVOOrchestrationProbeCanary = $Scenario
 $probeResultPath = Join-Path $ProbeRoot 'result.json'
 $probeUtf8 = New-Object Text.UTF8Encoding($false)
 try {
@@ -4812,7 +4832,21 @@ try {
 } catch {
     $probeResult = [pscustomobject]@{ ProbeError = [string]$_.Exception.Message }
 }
+$probeResult | Add-Member -NotePropertyName ProbeProcessId -NotePropertyValue $PID -Force
+$probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($probeLeaks) -Force
 [IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
+            } -Scenario $probeScenarioName -RepositoryRoot $RepositoryRoot -ProbeRoot (Join-Path $ProbeParent $probeScenarioName)
+        } catch {
+            # result.json не записано: батьківська частина дасть ProbeError.
+            $null = $_
+        }
+    } while ($false)
+    foreach ($probeGlobal in @(Get-Variable -Scope Global)) {
+        if (-not $probeBaselineGlobals.ContainsKey($probeGlobal.Name)) {
+            Remove-Variable -Name $probeGlobal.Name -Scope Global -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 '@
             $dataRestoreOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
             [IO.File]::WriteAllText((Join-Path $dataRestoreOrchestrationRoot 'stubs.ps1'), $dataRestoreOrchestrationStubs, $dataRestoreOrchestrationUtf8)
@@ -4822,16 +4856,20 @@ try {
             [IO.File]::WriteAllText($dataRestoreOrchestrationProbePath, $dataRestoreOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $dataRestoreOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $dataRestoreOrchestrationResults = @{}
-            foreach ($dataRestoreOrchestrationScenario in @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace', 'SMNormal', 'SMManualStopped', 'SMDelayedAutomaticStopped', 'SMOperatorDisabled', 'SMForeignSnapshotHeld', 'SMForeignSnapshotRepairable', 'SMMissingSnapshot', 'SMMalformedMarker', 'SMFailureDuringRestore', 'SMFailureDuringServiceRestart', 'SMLiveForeignOwner', 'SMHoldFailureAborts', 'SMSnapshotFailureAborts', 'SMUnreadableModeAborts', 'SMForeignDisallowedEntry', 'SMInheritedSuppressedFailureKeepsHold', 'SMHoldLostBetweenComponents', 'SMConfirmFailureAborts', 'SMTypeRestoreFailureKeepsMarker', 'SMRollbackIncomplete', 'SMRepairFailedRecovers', 'OutOfPlaceTargetUnreachable', 'OutOfPlaceComponentTargetUnreachable', 'SMProviderErrorAfterQuiescence')) {
+            $dataRestoreOrchestrationScenarios = @('InPlaceHappy', 'InPlaceIntegrityFails', 'InPlaceMoveAsideFails', 'InPlaceThrowInExtraction', 'InPlaceNotificationThrows', 'OutOfPlace', 'SMNormal', 'SMManualStopped', 'SMDelayedAutomaticStopped', 'SMOperatorDisabled', 'SMForeignSnapshotHeld', 'SMForeignSnapshotRepairable', 'SMMissingSnapshot', 'SMMalformedMarker', 'SMFailureDuringRestore', 'SMFailureDuringServiceRestart', 'SMLiveForeignOwner', 'SMHoldFailureAborts', 'SMSnapshotFailureAborts', 'SMUnreadableModeAborts', 'SMForeignDisallowedEntry', 'SMInheritedSuppressedFailureKeepsHold', 'SMHoldLostBetweenComponents', 'SMConfirmFailureAborts', 'SMTypeRestoreFailureKeepsMarker', 'SMRollbackIncomplete', 'SMRepairFailedRecovers', 'OutOfPlaceTargetUnreachable', 'OutOfPlaceComponentTargetUnreachable', 'SMProviderErrorAfterQuiescence')
+            foreach ($dataRestoreOrchestrationScenario in $dataRestoreOrchestrationScenarios) {
+                [void][IO.Directory]::CreateDirectory((Join-Path $dataRestoreOrchestrationRoot $dataRestoreOrchestrationScenario))
+            }
+            # Один дочірній процес на всі сценарії (ізоляція сценаріїв — у probe.ps1).
+            # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
+            # не дозволяє нових Bypass-місць; той самий підхід, що в T011
+            # Archive): дочірній процес успадковує політику батьківського
+            # прогону self-test.
+            $null = & $dataRestoreOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                -File $dataRestoreOrchestrationProbePath `
+                -Scenarios ($dataRestoreOrchestrationScenarios -join ',') -RepositoryRoot $root -ProbeParent $dataRestoreOrchestrationRoot
+            foreach ($dataRestoreOrchestrationScenario in $dataRestoreOrchestrationScenarios) {
                 $dataRestoreOrchestrationScenarioRoot = Join-Path $dataRestoreOrchestrationRoot $dataRestoreOrchestrationScenario
-                [void][IO.Directory]::CreateDirectory($dataRestoreOrchestrationScenarioRoot)
-                # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
-                # не дозволяє нових Bypass-місць; той самий підхід, що в T011
-                # Archive): дочірній процес успадковує політику батьківського
-                # прогону self-test.
-                $null = & $dataRestoreOrchestrationHost -NoLogo -NoProfile -NonInteractive `
-                    -File $dataRestoreOrchestrationProbePath `
-                    -Scenario $dataRestoreOrchestrationScenario -RepositoryRoot $root -ProbeRoot $dataRestoreOrchestrationScenarioRoot
                 $dataRestoreOrchestrationResultPath = Join-Path $dataRestoreOrchestrationScenarioRoot 'result.json'
                 $dataRestoreOrchestrationResults[$dataRestoreOrchestrationScenario] = if (Test-Path -LiteralPath $dataRestoreOrchestrationResultPath -PathType Leaf) {
                     [IO.File]::ReadAllText($dataRestoreOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -4839,6 +4877,25 @@ try {
                     [pscustomobject]@{ ProbeError = "проба не записала result.json (код виходу $LASTEXITCODE)" }
                 }
             }
+            # Усі сценарії пройшли в одному дочірньому процесі й ізольовано: кожен
+            # записав result.json з тим самим PID, і жоден не бачив канарок
+            # (локальної чи глобальної) попереднього сценарію.
+            $dataRestoreOrchestrationProcessIds = @($dataRestoreOrchestrationScenarios | ForEach-Object {
+                    $orchestrationProcessIdProperty = $dataRestoreOrchestrationResults[$_].PSObject.Properties['ProbeProcessId']
+                    if ($null -ne $orchestrationProcessIdProperty) { [string]$orchestrationProcessIdProperty.Value }
+                } | Sort-Object -Unique)
+            $dataRestoreOrchestrationLeaks = @($dataRestoreOrchestrationScenarios | Where-Object {
+                    $orchestrationLeaksProperty = $dataRestoreOrchestrationResults[$_].PSObject.Properties['ProbeLeaks']
+                    $null -eq $orchestrationLeaksProperty -or @($orchestrationLeaksProperty.Value).Count -gt 0
+                })
+            Test-BRAVOCondition `
+                -Condition (
+                    $dataRestoreOrchestrationResults.Count -eq $dataRestoreOrchestrationScenarios.Count -and
+                    $dataRestoreOrchestrationProcessIds.Count -eq 1 -and
+                    $dataRestoreOrchestrationLeaks.Count -eq 0
+                ) `
+                -Name "DataRestore/OrchestrationScenariosShareOneChildProcess" `
+                -Failure "Сценарії оркестрації мають виконатися в одному дочірньому процесі, кожен ізольовано й із власним result.json; PID: $($dataRestoreOrchestrationProcessIds -join ', '); без результату або з витоком: $($dataRestoreOrchestrationLeaks -join ', ')"
             $dataRestoreOrchestrationEvents = {
                 param($Result)
                 if ($null -ne $Result.PSObject.Properties['ProbeError']) { return @() }
