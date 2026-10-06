@@ -560,7 +560,7 @@ function Test-BRAVOSelfTestDuplicateDefinition {
             # Шпигун замість [Console]::OutputEncoding: фіксує, чи Initialize
             # справді перемкнув би консоль, не чіпаючи консоль self-test-у.
             $consoleCodePageSpy = New-Object System.Collections.Generic.List[int]
-            $consoleCodePageSpySetter = { param($Encoding) $consoleCodePageSpy.Add($Encoding.CodePage) }.GetNewClosure()
+            $consoleCodePageSpySetter = & { param($consoleCodePageSpy) { param($Encoding) $consoleCodePageSpy.Add($Encoding.CodePage) }.GetNewClosure() } $consoleCodePageSpy
             $global:OutputEncoding = [Text.Encoding]::ASCII
             $consoleCodePageResult = Initialize-BRAVOConsoleEncoding -CodePage $consoleCodePageRow.CodePage `
                 -OSVersion $consoleCodePageOs -UserInteractive $consoleCodePageRow.Interactive `

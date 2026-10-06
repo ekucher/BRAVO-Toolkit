@@ -461,13 +461,13 @@
         New-BRAVOSelfTestBazaFile -Directory $bootstrapLocal -RelativePath "existing2.txt" -SizeBytes 222 | Out-Null
         New-BRAVOSelfTestBazaFile -Directory $bootstrapLocal -RelativePath "existing3.txt" -SizeBytes 333 | Out-Null
 
-        $bootstrapAuditProvider = {
+        $bootstrapAuditProvider = & { param($bootstrapLocal) {
             param($Snapshot)
             # Simulate: remote already has ALL of these files (fixture already
             # matches production reality) -- PendingFiles empty means everything
             # already matches, nothing needs (re)upload.
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $bootstrapLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $bootstrapLocal
 
         $bootstrapSession = New-BRAVOSelfTestFakeBazaSession
         $bootstrapResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $bootstrapLocal -RemoteRootPath '/baza_app' -Session $bootstrapSession -StateRoot $bootstrapState -BootstrapIfNeeded -FullAuditProvider $bootstrapAuditProvider
@@ -495,13 +495,13 @@
         Test-BRAVOCondition -Condition ($driftResult1.Status -eq 'COMPLETE' -and $driftResult1.Uploaded -eq 2) `
             -Name 'BazaSync/DriftSetupInitialUploadSucceeds' -Failure 'setup: обидва файли мають спершу успішно завантажитись'
 
-        $driftAuditProvider = {
+        $driftAuditProvider = & { param($driftLocal) {
             param($Snapshot)
             # Simulate WinSCP full compare now reporting driftedaway.txt as PENDING
             # (i.e. it no longer matches remote -- someone deleted/changed it there).
             $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $driftLocal "driftedaway.txt") }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $driftLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $driftLocal
         $driftSession2 = New-BRAVOSelfTestFakeBazaSession
         $driftResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $driftLocal -RemoteRootPath '/baza_app' -Session $driftSession2 -StateRoot $driftState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $driftAuditProvider
         Test-BRAVOCondition -Condition (
@@ -677,10 +677,10 @@
 
         # Archive: -BootstrapIfNeeded + FullAuditProvider -> штатний bootstrap збережено
         $drP11ArchiveSession = New-BRAVOSelfTestFakeBazaSession
-        $drP11ArchiveProvider = {
+        $drP11ArchiveProvider = & { param($drP11Local) {
             param($Snapshot)
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $drP11Local -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $drP11Local
         $drP11ArchiveResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $drP11Local -RemoteRootPath '/baza_app' -Session $drP11ArchiveSession -StateRoot $drP11State -BootstrapIfNeeded -FullAuditProvider $drP11ArchiveProvider
         Test-BRAVOCondition -Condition (
             $drP11ArchiveResult.Status -eq 'COMPLETE' -and $drP11ArchiveResult.Bootstrap -eq $true -and $drP11ArchiveResult.Uploaded -eq 0
@@ -788,12 +788,12 @@
 
         # Archive (BootstrapIfNeeded + FullAuditProvider): реконсиляція через Full Audit
         $drP14ArchiveSession = New-BRAVOSelfTestFakeBazaSession
-        $drP14ArchiveProvider = {
+        $drP14ArchiveProvider = & { param($drP14Local) {
             param($Snapshot)
             # existing1/existing2 вже на remote; missingremote.txt -- ні (pending)
             $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $drP14Local "missingremote.txt") }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $drP14Local -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $drP14Local
         $drP14ArchiveResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $drP14Local -RemoteRootPath '/baza_app' -Session $drP14ArchiveSession -StateRoot $drP14State -BootstrapIfNeeded -FullAuditProvider $drP14ArchiveProvider
         Test-BRAVOCondition -Condition (
             $drP14ArchiveResult.Status -eq 'COMPLETE' -and
@@ -839,10 +839,10 @@
         New-Item -ItemType Directory -Path (Split-Path $drP14SchemaStatePath -Parent) -Force | Out-Null
         [IO.File]::WriteAllText($drP14SchemaStatePath, '{"SchemaVersion":99,"Component":"BAZA_APP","Files":{}}', (New-Object Text.UTF8Encoding($false)))
         $drP14SchemaSession = New-BRAVOSelfTestFakeBazaSession
-        $drP14SchemaProvider = {
+        $drP14SchemaProvider = & { param($drP14SchemaLocal) {
             param($Snapshot)
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $drP14SchemaLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $drP14SchemaLocal
         $drP14SchemaResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $drP14SchemaLocal -RemoteRootPath '/baza_app' -Session $drP14SchemaSession -StateRoot $drP14SchemaState -BootstrapIfNeeded -FullAuditProvider $drP14SchemaProvider
         Test-BRAVOCondition -Condition ($drP14SchemaResult.Status -eq 'COMPLETE' -and $drP14SchemaSession.State.PutFilesCallCount -eq 0) `
             -Name 'BazaSync/UnsupportedSchemaCanBeReconciledExplicitly' -Failure "state з непідтримуваною SchemaVersion має реконсилюватись явним Full Audit; Status=$($drP14SchemaResult.Status) PutFiles=$($drP14SchemaSession.State.PutFilesCallCount)"
@@ -1475,7 +1475,7 @@
         New-Item -ItemType Directory -Path $hr4BootLocal -Force | Out-Null
         New-BRAVOSelfTestBazaFile -Directory $hr4BootLocal -RelativePath "drifted.txt" -SizeBytes 100 | Out-Null
         New-BRAVOSelfTestBazaFile -Directory $hr4BootLocal -RelativePath "other.txt" -SizeBytes 60 | Out-Null
-        $hr4BootProvider = {
+        $hr4BootProvider = & { param($hr4BootLocal) {
             param($Snapshot)
             $pendingFile = [pscustomobject]@{
                 IsDirectory = $false
@@ -1484,7 +1484,7 @@
                 Reason = 'розбіжність часу (той самий розмір)'
             }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr4BootLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr4BootLocal
         $hr4BootSession = New-BRAVOSelfTestFakeBazaSession
         $hr4BootSession.State.RemoteSizes['/baza_app/drifted.txt'] = [int64]100
         $hr4BootResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4BootLocal -RemoteRootPath '/baza_app' -Session $hr4BootSession -StateRoot $hr4BootState -BootstrapIfNeeded -FullAuditProvider $hr4BootProvider
@@ -1537,7 +1537,7 @@
         $hr4PerStateBefore = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr4PerState -Component 'BAZA_APP')
         $hr4PerProvenanceUtc = [string]$hr4PerStateBefore.State.LastSuccessfulSyncUtc
         $hr4PerAuditUtcBefore = [string]$hr4PerStateBefore.State.LastFullAuditUtc
-        $hr4PerProvider = {
+        $hr4PerProvider = & { param($hr4PerLocal) {
             param($Snapshot)
             $pendingFile = [pscustomobject]@{
                 IsDirectory = $false
@@ -1546,7 +1546,7 @@
                 Reason = 'remote mtime відрізняється'
             }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr4PerLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr4PerLocal
         $hr4PerSession2 = New-BRAVOSelfTestFakeBazaSession
         $hr4PerSession2.State.RemoteSizes['/baza_app/drifted2.txt'] = [int64]80
         $hr4PerResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4PerLocal -RemoteRootPath '/baza_app' -Session $hr4PerSession2 -StateRoot $hr4PerState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr4PerProvider
@@ -1572,10 +1572,10 @@
         $hr4SeedLocal = Join-Path $hr4SeedRoot "local"
         New-Item -ItemType Directory -Path $hr4SeedLocal -Force | Out-Null
         New-BRAVOSelfTestBazaFile -Directory $hr4SeedLocal -RelativePath "match.txt" -SizeBytes 70 | Out-Null
-        $hr4SeedProvider = {
+        $hr4SeedProvider = & { param($hr4SeedLocal) {
             param($Snapshot)
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr4SeedLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr4SeedLocal
         $hr4SeedSession = New-BRAVOSelfTestFakeBazaSession
         $hr4SeedResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4SeedLocal -RemoteRootPath '/baza_app' -Session $hr4SeedSession -StateRoot (Join-Path $hr4SeedRoot "state") -BootstrapIfNeeded -FullAuditProvider $hr4SeedProvider
         $hr4SeedStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot (Join-Path $hr4SeedRoot "state") -Component 'BAZA_APP')
@@ -1642,7 +1642,7 @@
         $hr5ProvenanceCycleId = [string]$hr5StateAfter0.State.LastCycleId
 
         New-BRAVOSelfTestBazaFile -Directory $hr5Local -RelativePath "sticky.txt" -SizeBytes 90 | Out-Null
-        $hr5StickyProvider = {
+        $hr5StickyProvider = & { param($hr5Local) {
             param($Snapshot)
             $pendingFile = [pscustomobject]@{
                 IsDirectory = $false
@@ -1651,7 +1651,7 @@
                 Reason = 'remote mtime відрізняється (той самий розмір)'
             }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr5Local -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr5Local
         # ОДНА сесія на всі наступні цикли = персистентний remote
         $hr5Session = New-BRAVOSelfTestFakeBazaSession
         $hr5Session.State.RemoteSizes['/baza_app/sticky.txt'] = [int64]90
@@ -1700,10 +1700,10 @@
         ) -Name 'BazaSync/AuditDriftDoesNotPublishCheckpointOnLaterNormalCycle' -Failure "заблокований пізніший цикл не публікує checkpoint; Attempted=$($hr5CheckpointOutcome.Attempted)"
 
         # розв'язка A: пізніший Full Audit підтверджує збіг -> блокер знято
-        $hr5MatchProvider = {
+        $hr5MatchProvider = & { param($hr5Local) {
             param($Snapshot)
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr5Local -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr5Local
         $hr5Cycle4 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5Local -RemoteRootPath '/baza_app' -Session $hr5Session -StateRoot $hr5State -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr5MatchProvider
         $hr5StateAfter4 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr5State -Component 'BAZA_APP')
         Test-BRAVOCondition -Condition (
@@ -1719,11 +1719,11 @@
         $hr5ResBState = Join-Path $hr5ResBRoot "state"
         New-Item -ItemType Directory -Path $hr5ResBLocal -Force | Out-Null
         New-BRAVOSelfTestBazaFile -Directory $hr5ResBLocal -RelativePath "stickyB.txt" -SizeBytes 70 | Out-Null
-        $hr5ResBProvider = {
+        $hr5ResBProvider = & { param($hr5ResBLocal) {
             param($Snapshot)
             $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr5ResBLocal "stickyB.txt"); Action = 'UploadUpdate'; Reason = 'drift' }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr5ResBLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr5ResBLocal
         $hr5ResBSession = New-BRAVOSelfTestFakeBazaSession
         $hr5ResBSession.State.RemoteSizes['/baza_app/stickyB.txt'] = [int64]70
         $hr5ResBCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5ResBLocal -RemoteRootPath '/baza_app' -Session $hr5ResBSession -StateRoot $hr5ResBState -BootstrapIfNeeded -FullAuditProvider $hr5ResBProvider
@@ -1744,11 +1744,11 @@
         $hr5BootState = Join-Path $hr5BootRoot "state"
         New-Item -ItemType Directory -Path $hr5BootLocal -Force | Out-Null
         New-BRAVOSelfTestBazaFile -Directory $hr5BootLocal -RelativePath "bdrift.txt" -SizeBytes 40 | Out-Null
-        $hr5BootProvider = {
+        $hr5BootProvider = & { param($hr5BootLocal) {
             param($Snapshot)
             $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr5BootLocal "bdrift.txt"); Action = 'UploadUpdate'; Reason = 'drift при bootstrap' }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr5BootLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr5BootLocal
         $hr5BootSession = New-BRAVOSelfTestFakeBazaSession
         $hr5BootSession.State.RemoteSizes['/baza_app/bdrift.txt'] = [int64]40
         $hr5BootCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5BootLocal -RemoteRootPath '/baza_app' -Session $hr5BootSession -StateRoot $hr5BootState -BootstrapIfNeeded -FullAuditProvider $hr5BootProvider
@@ -1769,11 +1769,11 @@
         $hr5CorStatePath = Get-BRAVOBazaStatePath -StateRoot $hr5CorState -Component 'BAZA_APP'
         New-Item -ItemType Directory -Path (Split-Path $hr5CorStatePath -Parent) -Force | Out-Null
         [IO.File]::WriteAllText($hr5CorStatePath, "{ corrupt for hr5", (New-Object Text.UTF8Encoding($false)))
-        $hr5CorProvider = {
+        $hr5CorProvider = & { param($hr5CorLocal) {
             param($Snapshot)
             $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr5CorLocal "stickyC.txt"); Action = 'UploadUpdate'; Reason = 'drift при реконсиляції' }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr5CorLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr5CorLocal
         $hr5CorSession = New-BRAVOSelfTestFakeBazaSession
         $hr5CorSession.State.RemoteSizes['/baza_app/stickyC.txt'] = [int64]50
         $hr5CorCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5CorLocal -RemoteRootPath '/baza_app' -Session $hr5CorSession -StateRoot $hr5CorState -BootstrapIfNeeded -FullAuditProvider $hr5CorProvider
@@ -1834,11 +1834,11 @@
         $hr6MisProvenance = [string](Read-BRAVOBazaState -Path $hr6MisStatePath).State.LastSuccessfulSyncUtc
 
         $hr6MisGone = New-BRAVOSelfTestBazaFile -Directory $hr6MisLocal -RelativePath "gone.txt" -SizeBytes 90
-        $hr6MisProvider = {
+        $hr6MisProvider = & { param($hr6MisLocal) {
             param($Snapshot)
             $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr6MisLocal "gone.txt"); Action = 'UploadUpdate'; Reason = 'drift' }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr6MisLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr6MisLocal
         $hr6MisSession = New-BRAVOSelfTestFakeBazaSession
         $hr6MisSession.State.RemoteSizes['/baza_app/gone.txt'] = [int64]90
         $hr6MisCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MisLocal -RemoteRootPath '/baza_app' -Session $hr6MisSession -StateRoot $hr6MisState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MisProvider
@@ -1872,10 +1872,10 @@
         Test-BRAVOCondition -Condition ($hr6MisCpOutcome.Attempted -eq $false -and $hr6MisCpSession.State.PutFilesCallCount -eq 0) `
             -Name 'BazaSync/PersistedAuditDriftMissingLocalDoesNotPublishCheckpoint' -Failure "missing-local блокер не публікує checkpoint; Attempted=$($hr6MisCpOutcome.Attempted)"
 
-        $hr6MisMatchProvider = {
+        $hr6MisMatchProvider = & { param($hr6MisLocal) {
             param($Snapshot)
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr6MisLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr6MisLocal
         $hr6MisCycle3 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MisLocal -RemoteRootPath '/baza_app' -Session $hr6MisSession -StateRoot $hr6MisState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MisMatchProvider
         $hr6MisStateAfter3 = Read-BRAVOBazaState -Path $hr6MisStatePath
         Test-BRAVOCondition -Condition (
@@ -1903,11 +1903,11 @@
 
         # маркер неможливо зберегти -> audit НЕ запускається взагалі
         $hr6MkProbe = @{ Invoked = 0 }
-        $hr6MkProbeProvider = {
+        $hr6MkProbeProvider = & { param($hr6MkProbe) {
             param($Snapshot)
             $hr6MkProbe.Invoked++
             return [pscustomobject]@{ Success = $true; Error = $null; AlreadyMatchingRelativePaths = @(); LocalSizes = @{}; LastWriteTimesUtc = @{}; PendingItems = @() }
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr6MkProbe
         [IO.File]::SetAttributes($hr6MkStatePath, [IO.FileAttributes]::ReadOnly)
         $hr6MkCycleA = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr6MkState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MkProbeProvider
         [IO.File]::SetAttributes($hr6MkStatePath, [IO.FileAttributes]::Normal)
@@ -1920,12 +1920,12 @@
 
         # маркер на диску = true САМЕ на момент виконання audit
         $hr6MkCapture = @{ PendingAtAudit = $null }
-        $hr6MkCaptureProvider = {
+        $hr6MkCaptureProvider = & { param($hr6MkCapture, $hr6MkLocal, $hr6MkStatePath) {
             param($Snapshot)
             $diskState = Read-BRAVOBazaState -Path $hr6MkStatePath
             $hr6MkCapture.PendingAtAudit = [bool]$diskState.State.AuditReconciliationPending
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr6MkLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr6MkCapture $hr6MkLocal $hr6MkStatePath
         $hr6MkCycleB = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr6MkState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MkCaptureProvider
         $hr6MkStateAfterB = Read-BRAVOBazaState -Path $hr6MkStatePath
         Test-BRAVOCondition -Condition (
@@ -1938,14 +1938,14 @@
         New-BRAVOSelfTestBazaFile -Directory $hr6MkLocal -RelativePath "m2.txt" -SizeBytes 35 | Out-Null
         $hr6MkSession = New-BRAVOSelfTestFakeBazaSession
         $hr6MkSession.State.RemoteSizes['/baza_app/m2.txt'] = [int64]35
-        $hr6MkDriftProvider = {
+        $hr6MkDriftProvider = & { param($hr6MkLocal, $hr6MkStatePath) {
             param($Snapshot)
             # ReadOnly ставиться ПІД ЧАС audit (маркер уже збережено) --
             # модель: audit пройшов, фінальне збереження впаде
             [IO.File]::SetAttributes($hr6MkStatePath, [IO.FileAttributes]::ReadOnly)
             $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr6MkLocal "m2.txt"); Action = 'UploadUpdate'; Reason = 'drift' }
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr6MkLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr6MkLocal $hr6MkStatePath
         $hr6MkCycleC = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session $hr6MkSession -StateRoot $hr6MkState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MkDriftProvider
         $hr6MkStateAfterC = Read-BRAVOBazaState -Path $hr6MkStatePath
         Test-BRAVOCondition -Condition (
@@ -1976,11 +1976,11 @@
         # Archive на pending-стані: реконсиляція примусова (без -ForceFullAudit),
         # маркер знімається лише після успішного фінального збереження
         $hr6MkMatchProbe = @{ Invoked = 0 }
-        $hr6MkMatchProvider = {
+        $hr6MkMatchProvider = & { param($hr6MkLocal, $hr6MkMatchProbe) {
             param($Snapshot)
             $hr6MkMatchProbe.Invoked++
             return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr6MkLocal -LocalSnapshot $Snapshot
-        }.GetNewClosure()
+        }.GetNewClosure() } $hr6MkLocal $hr6MkMatchProbe
         $hr6MkCycleE = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session $hr6MkSession -StateRoot $hr6MkState -BootstrapIfNeeded -FullAuditProvider $hr6MkMatchProvider
         $hr6MkStateAfterE = Read-BRAVOBazaState -Path $hr6MkStatePath
         Test-BRAVOCondition -Condition (

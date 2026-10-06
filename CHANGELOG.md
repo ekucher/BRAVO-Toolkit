@@ -12,6 +12,16 @@
   `Maintenance/OrchestrationScenariosShareOneChildProcess` і
   `DataRestore/OrchestrationScenariosShareOneChildProcess` підтверджують один PID на всі сценарії та
   відсутність витоку канарок (локальної й глобальної) між сценаріями. Production-код не змінено.
+- **Fix: self-test: closure-и більше не гублять пізні змінні у великій області self-test (P2-selftest-scope).**
+  `BRAVO_SELF_TEST.ps1` піднімає `$MaximumVariableCount` своєї області до 8192 (#163), а динамічний модуль,
+  який створює `.GetNewClosure()`, лишається з глобальним лімітом (типово 4096) і мовчки обрізає копію
+  змінних: найпізніші змінні області в closure ставали `$null` (так упав логер TraceArchive на CI у PR #374).
+  23 тестові сайти (BazaSync 19, ConsoleUX 1, логери t006 у `BRAVO_SELF_TEST.ps1`) тепер будують closure
+  у дочірньому scope, що отримує лише свої залежності: `& { param($Dep) { ... }.GetNewClosure() } $Dep`.
+  Нова секція `Governance/SelfTestClosureScope`: структурний guard
+  `Governance/SelfTestClosuresCreatedInNarrowScope` і характеризація на Windows PowerShell
+  (`Governance/SelfTestClosureNarrowScopeSurvivesLargeCreatorScope`,
+  `Governance/SelfTestClosureHazardReproducedOnHost`). Production-код не змінено.
 
 - **Fix: Health: проблема локальної копії BAZA без поля `ExitCode` більше не валить Health з кодом 90 (#286).**
   Поле `ExitCode` є лише в двох robocopy-гілках `Get-BAZALocalSyncHealthIssues`; у решти семи (джерело
