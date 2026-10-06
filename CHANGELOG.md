@@ -17,6 +17,16 @@
   в orchestration-пробі, `Archive/CompatibilityExitsWriteStatusBeforeExit` (AST) і
   `Status/CallSiteAfterExitCode[ArchiveTail]`; контракт `Status/CallSiteIsFailSoft[Archive]` тепер
   перевіряє helper.
+- **Fix: Health: порушення цілісності інструментів дає алерт і при вимкненому SFTP (#296).**
+  Блокуючий результат перевірки `TOOLS_MANIFEST.json` (`ShouldBlock`, режим Enforce) раніше ставав Health
+  issue лише всередині SFTP-перевірки. На сервері з вимкненим SFTP або при зайнятому WinSCP (перевірку
+  відкладено) Health не бачив жодної проблеми: скидав стан алертів, а з `-NotifyOnSuccess` міг надіслати
+  зелене «ВСЕ СПРАВНО». Підміну `7za.exe`/`WinSCP.com` видно було лише в коді 32 і в події Operations.
+  Тепер порушення — окремий CRITICAL issue «Цілісність інструментів» незалежно від SFTP, з дією «перевірити
+  каталог Tools і TOOLS_MANIFEST.json». Якщо SFTP-перевірка вже повідомила про гейт цілісності, окремий
+  issue не додається, тож в алерті порушення рівно один раз. Код завершення 32 (ToolIntegrityViolation) не
+  змінився. Регресія в orchestration-пробі: `Health/OrchestrationToolIntegrityAlertsWhenSftpDisabled`,
+  `Health/OrchestrationToolIntegrityAlertsWhenWinScpBusy`, `Health/OrchestrationToolIntegrityReportedOnceWithSftp`.
 - **Fix: Archive: оцінка потрібного місця вимірює production-джерело `<SRC>\*` (#284).**
   Джерела MODEL/BLOG/BRAVOEXCH у конфігурації мають форму `<SRC>\*` (так 7-Zip бере вміст каталогу), а
   `Get-BRAVOArchiveEstimatedSpaceRequirement` перевіряла цей шлях як літеральний і не вимірювала каталог. Через це

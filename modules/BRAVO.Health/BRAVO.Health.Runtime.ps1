@@ -2111,6 +2111,7 @@ function Test-SFTPHealthConfiguration {
     )
 
     $errors = @()
+    $toolIntegrityBlocked = $false
 
     # Найважливіша умова: не запускати інструменти, цілісність яких не
     # підтверджена. Небезпека не в тому, що Health кудись пише (він
@@ -2123,6 +2124,7 @@ function Test-SFTPHealthConfiguration {
     # запускають і виконуються далі — саме вони й лишаються корисними,
     # коли SFTP-гілку заблоковано.
     if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
+        $toolIntegrityBlocked = $true
         $errors += (
             "SFTP-перевірки пропущено: не підтверджено цілісність інструментів " +
             "(запуск WinSCP заборонено). $($script:BRAVOToolManifest.Message)"
@@ -2190,6 +2192,10 @@ function Test-SFTPHealthConfiguration {
     return [pscustomobject]@{
         Valid = $errors.Count -eq 0
         Errors = @($errors)
+        # #296: ознака, що це SFTP-issue уже несе порушення цілісності
+        # інструментів, — за нею оркестрація не додає окремий issue
+        # «Цілісність інструментів» (без дубля в алерті).
+        ToolIntegrityBlocked = $toolIntegrityBlocked
     }
 }
 
@@ -3467,6 +3473,7 @@ function Get-SFTPHealthIssues {
             LastWriteTime = $null
             SizeBytes = $null
             Location = "/"
+            ToolIntegrityBlocked = [bool]$configurationResult.ToolIntegrityBlocked
         })
     }
 
@@ -5959,7 +5966,50 @@ if ($script:BRAVOHealthSmbStepEnabled) {
 }
 
 Write-BRAVOProgressPhase -Phase 'Сповіщення' -PercentComplete 95
-$healthIssues = @($serviceHealthIssues) + @($localHealthIssues) + @($restoreVerifyHealthIssues) + @($bazaLocalHealthIssues) + @($sftpHealthIssues) + @($smbHealthIssues)
+# #296: блокуюче порушення цілісності інструментів (ShouldBlock — той самий
+# стан, що дає код 32 у Complete-BRAVOHealthResult) — окремий Health issue,
+# незалежний від SFTP. Раніше issue з'являвся лише всередині
+# Test-SFTPHealthConfiguration, тож при вимкненому SFTP (Get-SFTPHealthIssues
+# повертає @() до будь-якої перевірки) чи зайнятому WinSCP (перевірку
+# відкладено) $healthIssues лишався порожнім: Health скидав стан алертів і
+# міг надіслати зелене «все справно», а підміну 7za/WinSCP видно було лише
+# в коді завершення. Health має першим сигналізувати про підміну. Якщо ж
+# SFTP-гілка вже повідомила про гейт цілісності (ToolIntegrityBlocked на її
+# SFTPConnection-issue), окремий issue не додається — порушення в алерті
+# рівно один раз. Issue стоїть першим: ActionText алерту — про інструменти.
+# Коли порушення вже несе SFTP-issue, саме він іде першим і отримує той самий
+# ActionText про інструменти — інакше алерт радив би «перевірити SFTP-з'єднання»
+# при можливій підміні 7za/WinSCP.
+$toolIntegrityActionText = "перевірити каталог Tools і TOOLS_MANIFEST.json: можлива підміна 7za.exe/WinSCP.com"
+$toolIntegrityHealthIssues = @()
+$sftpAlertIssues = @($sftpHealthIssues)
+if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
+    $sftpToolIntegrityIssues = @($sftpHealthIssues | Where-Object {
+            $null -ne $_.PSObject.Properties['ToolIntegrityBlocked'] -and [bool]$_.ToolIntegrityBlocked
+        })
+    if ($sftpToolIntegrityIssues.Count -gt 0) {
+        foreach ($sftpToolIntegrityIssue in $sftpToolIntegrityIssues) {
+            Add-Member -InputObject $sftpToolIntegrityIssue -MemberType NoteProperty -Name 'ActionText' -Value $toolIntegrityActionText -Force
+        }
+        $toolIntegrityHealthIssues = $sftpToolIntegrityIssues
+        $sftpAlertIssues = @($sftpHealthIssues | Where-Object {
+                -not ($null -ne $_.PSObject.Properties['ToolIntegrityBlocked'] -and [bool]$_.ToolIntegrityBlocked)
+            })
+    } else {
+        $toolIntegrityHealthIssues = @([pscustomobject]@{
+                Kind = "ToolIntegrity"
+                Component = "Цілісність інструментів"
+                Reason = "не підтверджено цілісність інструментів (запуск 7za/WinSCP заборонено). $($script:BRAVOToolManifest.Message)"
+                ActionText = $toolIntegrityActionText
+                FileName = ""
+                LastWriteTime = $null
+                Location = [string]$toolsPath
+                SizeBytes = $null
+                Details = @()
+            })
+    }
+}
+$healthIssues = @($toolIntegrityHealthIssues) + @($serviceHealthIssues) + @($localHealthIssues) + @($restoreVerifyHealthIssues) + @($bazaLocalHealthIssues) + @($sftpAlertIssues) + @($smbHealthIssues)
 $destinationSummary = Get-BRAVOHealthDestinationSummary `
     -LocalIssues $localHealthIssues `
     -BazaLocalIssues $bazaLocalHealthIssues `
@@ -6053,6 +6103,9 @@ if ($healthIssues.Count -eq 0) {
             # порушенням цілісності. $script:BRAVOToolManifest уже
             # обчислений вище (Test-BRAVOToolManifestIntegrity), тож тут це
             # відомо без жодного перенесення логіки.
+            # #296: ShouldBlock тепер завжди дає issue «Цілісність
+            # інструментів» (див. збирання $healthIssues), тож ця гілка при
+            # ShouldBlock недосяжна; перевірку лишено як захисну.
             $operationsHealthSeverity = 'SUCCESS'
             $operationsHealthMessage = 'Health-перевірка успішна'
             if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
@@ -6260,6 +6313,9 @@ foreach ($healthIssue in $healthIssues) {
         "SFTPConnection" {
             Write-HealthLog "Проблема $($healthIssue.Component): $($healthIssue.Reason)" -Level "ERROR"
         }
+        "ToolIntegrity" {
+            Write-HealthLog "Проблема $($healthIssue.Component): $($healthIssue.Reason)" -Level "ERROR"
+        }
         "SMBArchive" {
             Write-HealthLog "Проблема $($healthIssue.Component): $($healthIssue.Reason); каталог: $($healthIssue.Location); файл: $($healthIssue.FileName); фактичний розмір: $(Format-FileSize $healthIssue.ActualSizeBytes)" -Level "ERROR"
         }
@@ -6304,6 +6360,9 @@ if ($null -ne $operationsReportingSettings) {
                 warnCount = $script:BRAVOHealthStepWarningCount
                 errorCount = $script:BRAVOHealthStepErrorCount
                 durationMs = [Math]::Round($healthDuration.TotalMilliseconds)
+                # #296: блок цілісності інструментів тепер іде через гілку
+                # issues — ознака лишається в деталях, як і в гілці без issue.
+                toolIntegrityShouldBlock = [bool]($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock)
             }
     } catch {
         Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
