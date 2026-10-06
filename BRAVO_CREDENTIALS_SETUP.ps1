@@ -1421,11 +1421,13 @@ function Invoke-CredentialOperationsViaSystemWorker {
     $systemEntries = @(Copy-OperationEntries -Entries $OperationEntries)
     Clear-OperationEntries -Entries $OperationEntries
 
-    $currentUserSnapshots = if ($Action -eq "Test") {
+    # @(...) навколо if-виразу: порожній масив з if розгортається в $null, а
+    # Clear-CredentialOperationSnapshots тоді ітерував би один $null.
+    $currentUserSnapshots = @(if ($Action -eq "Test") {
         @()
     } else {
         @(Get-CredentialOperationSnapshots -Entries $currentUserEntries)
-    }
+    })
     try {
         $currentUserResults = @(
             Invoke-CredentialOperationsTransactional `
@@ -1468,6 +1470,35 @@ function Invoke-CredentialOperationsViaSystemWorker {
                 }
             }
         }
+    } catch {
+        # Виняток SYSTEM-кроку (worker timeout, FatalError, збій Task
+        # Scheduler) раніше оминав rollback, бо Restore-... запускався лише за
+        # рядками Status=Error: сховище поточного користувача лишалося зміненим,
+        # а SYSTEM — ні. Для мутуючих дій (Action != Test; лише для них є
+        # знімки) повертаємо знімок і перекидаємо ОРИГІНАЛЬНИЙ виняток, тож
+        # шлях завершення з помилкою не змінюється. Збій самого rollback
+        # виводиться як Warning і не маскує оригінал.
+        $systemStepError = $_
+        if ($Action -ne "Test") {
+            try {
+                $rollbackResults = @(
+                    Restore-CredentialOperationSnapshots `
+                        -Snapshots $currentUserSnapshots
+                )
+                foreach ($rollbackResult in $rollbackResults) {
+                    Write-Warning (
+                        "Rollback після винятку SYSTEM-кроку не виконано для " +
+                        "'$($rollbackResult.Target)': $($rollbackResult.Error)"
+                    )
+                }
+                if ($rollbackResults.Count -eq 0) {
+                    Write-Host "Поточне сховище повернуто до стану перед операцією (виняток SYSTEM-кроку)." -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Warning "Rollback після винятку SYSTEM-кроку завершився винятком: $($_.Exception.Message)"
+            }
+        }
+        throw $systemStepError
     } finally {
         # currentUserSnapshots повинні звільнятися, навіть якщо
         # Invoke-AsSystem кине виняток (worker timeout, FatalError,
