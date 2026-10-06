@@ -6239,15 +6239,19 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # Clear-CredentialOperationSnapshots для $currentUserSnapshots
         # захищено try/finally — переживає виняток з Invoke-AsSystem
         # (worker timeout, FatalError, збій Task Scheduler тощо).
+        # #302: гілку винесено в Invoke-CredentialOperationsViaSystemWorker;
+        # якір кінця блоку — її return, а виклик з StoreFor Both
+        # перевіряється окремо, тож жодну з умов не послаблено.
         $bothStoreBlockMatch = [regex]::Match(
             $credentialsSetupScriptText,
-            '\$currentUserSnapshots\s*=\s*if\s*\(\$Action[\s\S]*?\$operationResults\s*=\s*@\(\$currentUserResults\)\s*\+\s*@\(\$systemResults\)'
+            '\$currentUserSnapshots\s*=\s*@\(if\s*\(\$Action[\s\S]*?return\s*\(@\(\$currentUserResults\)\s*\+\s*@\(\$systemResults\)\)'
         )
         $bothStoreBlockText = if ($bothStoreBlockMatch.Success) { $bothStoreBlockMatch.Value } else { '' }
 
         Test-BRAVOCondition `
             -Condition (
                 $bothStoreBlockMatch.Success -and
+                $credentialsSetupScriptText -match 'if\s*\(\$useSystemWorker\s+-and\s+\$currentUserStoreRequested\)\s*\{\s*\$operationResults\s*=\s*@\(\s*Invoke-CredentialOperationsViaSystemWorker' -and
                 $bothStoreBlockText -match 'try\s*\{' -and
                 $bothStoreBlockText -match '\}\s*finally\s*\{[\s\S]*Clear-CredentialOperationSnapshots -Snapshots \$currentUserSnapshots' -and
                 $bothStoreBlockText.Contains('Restore-CredentialOperationSnapshots') -and
