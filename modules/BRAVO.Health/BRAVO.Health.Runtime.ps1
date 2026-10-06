@@ -6347,6 +6347,9 @@ if ($null -ne $operationsReportingSettings) {
                 warnCount = $script:BRAVOHealthStepWarningCount
                 errorCount = $script:BRAVOHealthStepErrorCount
                 durationMs = [Math]::Round($healthDuration.TotalMilliseconds)
+                # #296: блок цілісності інструментів тепер іде через гілку
+                # issues — ознака лишається в деталях, як і в гілці без issue.
+                toolIntegrityShouldBlock = [bool]($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock)
             }
     } catch {
         Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
