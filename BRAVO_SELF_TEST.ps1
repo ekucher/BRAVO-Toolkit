@@ -19742,7 +19742,15 @@ try {
                         StandardOutput = ''; StandardError = ''; Error = $null
                     }
                 }
-                $opened = if ($leaf -like 'legacy*') { $hasBomPrefix } elseif ($leaf -like 'fallbacktimeout*') { $false } else { -not $hasBomPrefix }
+                # #300: друга (BOM) спроба завершується кодом 2 з локалізованим
+                # системним текстом (відмова доступу), без повідомлень 7-Zip про вміст.
+                if ($leaf -like 'fallbackaccess*' -and $hasBomPrefix) {
+                    return New-Object PSObject -Property @{
+                        Success = $false; ExitCode = 2; Description = 'Fatal error'; TimedOut = $false; Error = $null
+                        StandardOutput = ''; StandardError = ('ERROR: ' + [char]0x0412 + [char]0x0456 + [char]0x0434 + [char]0x043C + [char]0x043E + [char]0x0432 + [char]0x043B + [char]0x0435 + [char]0x043D + [char]0x043E + ' ' + [char]0x0432 + ' ' + [char]0x0434 + [char]0x043E + [char]0x0441 + [char]0x0442 + [char]0x0443 + [char]0x043F + [char]0x0456 + '.')
+                    }
+                }
+                $opened = if ($leaf -like 'legacy*') { $hasBomPrefix } elseif ($leaf -like 'fallbacktimeout*' -or $leaf -like 'fallbackaccess*') { $false } else { -not $hasBomPrefix }
                 if ($opened) {
                     return New-Object PSObject -Property @{
                         Success = $true; ExitCode = 0; Description = 'OK'; TimedOut = $false
@@ -19838,6 +19846,68 @@ try {
             ) `
             -Name "LegacyBomFallback/CompletedFallbackFailureIsNotOperational" `
             -Failure "якщо обидві спроби завершили перевірку з кодом 2, результат не має позначатися як незавершена перевірка; marker=$($t006WrongLegacyResult.PSObject.Properties['FallbackAttemptOperationalFailure'])"
+
+        # #300: друга (legacy BOM) спроба повернула код 2 з локалізованою
+        # відмовою доступу (без повідомлень 7-Zip про вміст) — перевірку не
+        # завершено; перша спроба з "Wrong password" не стає доказом
+        # пошкодження архіву.
+        $t006FallbackAccessPath = Join-Path ([IO.Path]::GetTempPath()) 'fallbackaccess_MODEL.7z'
+        $t006FallbackAccessResult = Invoke-BRAVOSevenZipIntegrityTest `
+            -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackAccessPath -Password $t006Secret -TimeoutSeconds 5
+        $t006FallbackAccessInfo = @{}
+        $t006FallbackAccessHelper = Test-SevenZipArchiveIntegrity `
+            -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackAccessPath -Password $t006Secret `
+            -Logger $t006FallbackTimeoutLogger -ArchiveFailureLevel 'WARNING' -FailureInfo $t006FallbackAccessInfo
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$t006FallbackAccessResult.Success -and
+                $null -ne $t006FallbackAccessResult.PSObject.Properties['FallbackAttemptOperationalFailure'] -and
+                [bool]$t006FallbackAccessResult.FallbackAttemptOperationalFailure -and
+                -not [bool]$t006FallbackAccessHelper -and
+                $t006FallbackAccessInfo.ContainsKey('ArchiveSpecific') -and
+                -not [bool]$t006FallbackAccessInfo['ArchiveSpecific']
+            ) `
+            -Name "LegacyBomFallback/FallbackAttemptLocalizedAccessFailureIsNotArchiveSpecific" `
+            -Failure "код 2 другої (legacy BOM) спроби з локалізованою відмовою доступу має позначати FallbackAttemptOperationalFailure і не класифікуватись як archive-specific; marker=$($t006FallbackAccessResult.PSObject.Properties['FallbackAttemptOperationalFailure']), archiveSpecific=$($t006FallbackAccessInfo['ArchiveSpecific'])"
+
+        # #300: валідатор нічого не повернув — Test-SevenZipArchiveIntegrity
+        # повертає структурований збій виконання (false, не archive-specific),
+        # а не кидає виняток StrictMode до встановлення FailureInfo.
+        $t006NullInfo = @{}
+        $t006NullThrew = ''
+        $t006NullHelper = $null
+        try {
+            # Dot-source у верхню область модуля: StrictMode діє на самий
+            # Test-SevenZipArchiveIntegrity (виклик з StrictMode-області
+            # конфігураційного завантажувача), стаб перекриває імпорт.
+            . (Get-Module -Name 'BRAVO.ArchiveHelpers') {
+                Set-StrictMode -Version Latest
+                function script:Invoke-BRAVOSevenZipIntegrityTest {
+                    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                        'PSAvoidUsingPlainTextForPassword', 'Password',
+                        Justification = 'Self-test стаб валідатора: той самий контракт параметрів; значення фікстурне.')]
+                    param([string]$SevenZipPath, [string]$ArchivePath, [string]$Password, [int]$TimeoutSeconds)
+                }
+            }
+            $t006NullHelper = Test-SevenZipArchiveIntegrity `
+                -SevenZipPath 'stub-7za' -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'nullresult_MODEL.7z') -Password $t006Secret `
+                -Logger $t006FallbackTimeoutLogger -ArchiveFailureLevel 'WARNING' -FailureInfo $t006NullInfo
+        } catch {
+            $t006NullThrew = $_.Exception.Message
+        } finally {
+            # Стаб і StrictMode змінили область модуля — повторний імпорт
+            # (-Force, нова область) повертає справжній ланцюг для наступних перевірок.
+            Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrEmpty($t006NullThrew) -and
+                $false -eq $t006NullHelper -and
+                $t006NullInfo.ContainsKey('ArchiveSpecific') -and
+                -not [bool]$t006NullInfo['ArchiveSpecific']
+            ) `
+            -Name "ArchiveHelpers/IntegrityNullValidatorResultIsOperationalFailure" `
+            -Failure "порожній результат валідатора має давати false і ArchiveSpecific=false без винятку; threw='$t006NullThrew', result=$t006NullHelper, archiveSpecific=$($t006NullInfo['ArchiveSpecific'])"
 
         $t006NormalEntries = New-Object System.Collections.Generic.List[object]
         $t006NormalLogger = & { param($t006NormalEntries) { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006NormalEntries
