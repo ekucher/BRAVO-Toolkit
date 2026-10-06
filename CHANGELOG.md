@@ -33,7 +33,9 @@
   повідомлень 7-Zip про вміст архіву (наприклад, локалізована відмова доступу) теж позначається як незавершена
   перевірка, а порожній результат валідатора нормалізується до збою виконання до першого читання властивостей.
   Регресія: `LegacyBomFallback/FallbackAttemptLocalizedAccessFailureIsNotArchiveSpecific`,
-  `ArchiveHelpers/IntegrityNullValidatorResultIsOperationalFailure`.
+  `ArchiveHelpers/IntegrityNullValidatorResultIsOperationalFailure`. Виняток самої перевірки 7z t у retention (а не
+  результат) теж виставляє прапорці цілісності навіть для старшої сесії (перевірку не виконано). Регресія:
+  `Maintenance/RetentionValidatorExceptionSetsFailureFlags`.
 - **Fix: Archive: таймаут перевірки SFTP повертає `$false` і звільняє lock WinSCP (#290).**
   `Test-SFTPConnection` після таймауту вбивала WinSCP і кидала виняток раніше, ніж `Complete-BRAVOProcessOutputCapture`
   звільняла lock `BRAVO_WINSCP`. Викликачі (ручний `-SyncBAZA` і `Main`) не мають `try`, тому прогін завершувався

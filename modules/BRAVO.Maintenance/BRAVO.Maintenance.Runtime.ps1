@@ -6909,10 +6909,23 @@ function Remove-OldRestoreArchives {
                 if ($actualHash -cne $expectedHash) {
                     throw "SHA512 не збігається"
                 }
-                if (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
+                # #300: виняток самої перевірки (а не результат) — перевірку не
+                # виконано, це збій виконання, не доказ пошкодження архіву:
+                # fail-closed, прапорці навіть для старшої сесії.
+                $integrityPassed = $false
+                try {
+                    $integrityPassed = Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
                         -SevenZipPath $ARC_PATH `
                         -ArchivePath $archive.FullName `
-                        -NoFailureFlags:$isOlderGroup)) {
+                        -NoFailureFlags:$isOlderGroup
+                } catch {
+                    $sevenZipIntegrityFailureSeen = $true
+                    Write-Log "Перевірку 7z t не виконано: $($archive.Name) — $($_.Exception.Message)" -Level "ERROR"
+                    $script:criticalErrorOccurred = $true
+                    $script:restoreIntegrityFailed = $true
+                    throw "перевірку 7z t не виконано"
+                }
+                if (-not $integrityPassed) {
                     $sevenZipIntegrityFailureSeen = $true
                     throw "перевірка 7z t не пройдена"
                 }
