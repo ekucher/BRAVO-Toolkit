@@ -6718,6 +6718,76 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Name "Maintenance/SuccessNotificationCompletedLines_$($completedLinesScenario.Name)" `
             -Failure "успішне сповіщення (mode=all) мало передати в -Details $($expectedCompletedLines.Count) рядк(ів) '$($expectedCompletedLines -join '|')'; отримано: $(if ($null -eq $completedLinesCapture) { '<немає результату>' } else { '{0} доставлено, {1} рядк(ів) ''{2}''' -f $completedLinesCapture.DeliveredCount, $completedLinesCapture.DetailsCount, $completedLinesCapture.DetailsJoined })"
     }
+    # --- Maintenance (#298): criticalErrorOccurred без записів у
+    # CriticalErrorsList/NotificationAlertQueue (багато місць ставлять лише
+    # прапорець -> exit 60) за errors_only мав мовчки повертатись. Реальна
+    # Send-FinalReport; стабляться лише webhook і конструктор тексту.
+    $criticalFlagReportModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceRuntimeSourceForSeverity `
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
+    function Invoke-MaintenanceCriticalFlagReportScenario {
+        param([bool]$CriticalFlag, [string[]]$CriticalEntries = @())
+        & $criticalFlagReportModule {
+            param([bool]$FlagInner, [string[]]$EntriesInner)
+            Set-StrictMode -Version 2.0
+            $script:SlackMode = "errors_only"
+            $script:criticalErrorOccurred = $FlagInner
+            $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+            foreach ($entryInner in $EntriesInner) { $script:CriticalErrorsList.Add($entryInner) }
+            $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
+            $script:ScriptStartTime = Get-Date
+            $bravoSettings = @{ NotificationRouting = @{} }
+            $NotificationProviderDisplayName = "STUB"
+            $script:deliveredMessages = New-Object System.Collections.Generic.List[object]
+
+            function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+            function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
+            function Resolve-BRAVONotificationRoute {
+                param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                if ($Severity -eq "SUCCESS" -and $NotificationMode -eq "errors_only") { return "none" }
+                return "alerts"
+            }
+            function Invoke-NotificationWebhook {
+                param([string]$Message, [string]$WebhookUrl)
+                $script:deliveredMessages.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+            }
+            function New-MaintenanceNotificationMessage {
+                param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                return "TITLE=$Title|SEVERITY=$Severity|DETAILS=$($Details -join ';')|LOG=$LogPath"
+            }
+
+            Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+
+            [pscustomobject]@{
+                DeliveredCount = $script:deliveredMessages.Count
+                DeliveredMessage = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].Message } else { $null }
+            }
+        } $CriticalFlag $CriticalEntries
+    }
+    $criticalFlagOnly = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalFlagOnly.DeliveredCount -eq 1 -and
+            $criticalFlagOnly.DeliveredMessage.Contains("SEVERITY=CRITICAL") -and
+            $criticalFlagOnly.DeliveredMessage.Contains("без детальної причини") -and
+            $criticalFlagOnly.DeliveredMessage.Contains("LOG=STUB-LOG-PATH")
+        ) `
+        -Name "Maintenance/CriticalFlagWithoutEntriesAlertsInErrorsOnly" `
+        -Failure "errors_only + `$script:criticalErrorOccurred без записів у чергах мав надіслати рівно один CRITICAL-алерт із узагальненою причиною та шляхом до журналу; доставлено: $($criticalFlagOnly.DeliveredCount)"
+    $noCriticalNoAlert = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $false
+    Test-BRAVOCondition `
+        -Condition ($noCriticalNoAlert.DeliveredCount -eq 0) `
+        -Name "Maintenance/NoCriticalFlagSendsNothingInErrorsOnly" `
+        -Failure "errors_only без критичної помилки не повинен нічого надсилати; доставлено: $($noCriticalNoAlert.DeliveredCount)"
+    $criticalFlagWithEntry = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true -CriticalEntries @("конкретна критична помилка")
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalFlagWithEntry.DeliveredCount -eq 1 -and
+            $criticalFlagWithEntry.DeliveredMessage -eq "TITLE=КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ|SEVERITY=CRITICAL|DETAILS=конкретна критична помилка|LOG=STUB-LOG-PATH"
+        ) `
+        -Name "Maintenance/CriticalFlagWithEntryKeepsExistingMessage" `
+        -Failure "за наявності запису в CriticalErrorsList повідомлення має лишитись незмінним (без узагальненого рядка); отримано: $($criticalFlagWithEntry.DeliveredMessage)"
 
     # --- Maintenance: перевищення порогу діапазонів ID (запис у
     # CriticalErrorsList через Test-RangeIdUsage -> Send-SlackAlert
