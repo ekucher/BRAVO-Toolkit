@@ -1160,8 +1160,31 @@ try {
     $sftpTimeoutLogDir = Join-Path $sftpTimeoutRoot 'logs'
     [void](New-Item -ItemType Directory -Path $sftpTimeoutLogDir -Force)
     $sftpTimeoutStubPath = Join-Path $sftpTimeoutRoot 'WinSCP.com'
-    Add-Type -TypeDefinition 'public static class BRAVOSftpHangStub { public static void Main() { System.Threading.Thread.Sleep(120000); } }' `
-        -OutputAssembly $sftpTimeoutStubPath -OutputType ConsoleApplication -ErrorAction Stop
+    # Справжній PE: компілюємо exe через CodeDom (GenerateExecutable), потім
+    # копіюємо під іменем WinSCP.com (CreateProcess вантажить PE незалежно від
+    # розширення, як і справжній WinSCP.com).
+    $sftpTimeoutStubExe = Join-Path $sftpTimeoutRoot 'stub.exe'
+    $sftpTimeoutCompiler = New-Object Microsoft.CSharp.CSharpCodeProvider
+    $sftpTimeoutCompilerParameters = New-Object System.CodeDom.Compiler.CompilerParameters
+    $sftpTimeoutCompilerParameters.GenerateExecutable = $true
+    $sftpTimeoutCompilerParameters.GenerateInMemory = $false
+    $sftpTimeoutCompilerParameters.OutputAssembly = $sftpTimeoutStubExe
+    $sftpTimeoutCompileResult = $sftpTimeoutCompiler.CompileAssemblyFromSource(
+        $sftpTimeoutCompilerParameters,
+        'public static class BRAVOSftpHangStub { public static void Main() { System.Threading.Thread.Sleep(120000); } }')
+    if (Test-Path -LiteralPath $sftpTimeoutStubExe -PathType Leaf) {
+        Copy-Item -LiteralPath $sftpTimeoutStubExe -Destination $sftpTimeoutStubPath -Force
+    }
+    $sftpTimeoutStubIsPe = $false
+    if (Test-Path -LiteralPath $sftpTimeoutStubPath -PathType Leaf) {
+        $sftpTimeoutStubHead = New-Object byte[] 2
+        $sftpTimeoutStubStream = [IO.File]::OpenRead($sftpTimeoutStubPath)
+        try { [void]$sftpTimeoutStubStream.Read($sftpTimeoutStubHead, 0, 2) } finally { $sftpTimeoutStubStream.Dispose() }
+        $sftpTimeoutStubIsPe = ($sftpTimeoutStubHead[0] -eq 0x4D -and $sftpTimeoutStubHead[1] -eq 0x5A)
+    }
+    Test-BRAVOCondition -Condition $sftpTimeoutStubIsPe `
+        -Name 'Archive/SftpConnectionTimeoutStubIsRunnable' `
+        -Failure "стаб WinSCP.com має бути справжнім PE (MZ), інакше Process.Start не запуститься і таймаут не перевіряється; помилки компіляції: $(@($sftpTimeoutCompileResult.Errors | ForEach-Object { $_.ToString() }) -join ' | ')"
     $global:logPath = $sftpTimeoutLogDir
 
     $sftpTimeoutProbe = & $sftpTimeoutModule {
