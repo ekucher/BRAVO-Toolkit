@@ -9,7 +9,10 @@
   `[4/8] Реставрація моделі`, `[5/8] Перевірка розмірів .md` (раніше навпаки); решта нумерації та
   самоперевірка реставрації (`Compare-FileSizes`: зниклий або обнулений після repair файл критичний)
   не змінились. Перевірку стану служби BRAVO для реставрації й обробки trace тепер обчислено один раз
-  (`$bravoFilePhaseAllowed`). Регресія: `Maintenance/MdSizeCheckRunsAfterRestore` в orchestration-пробі.
+  (`$bravoFilePhaseAllowed`); «План операцій» показує перевірку розмірів після реставрації. Регресія:
+  `Maintenance/MdSizeCheckRunsAfterRestore` в orchestration-пробі і три перевірки справжньої `Check-MdFileSizes`
+  на файлах: стиснутий repair-ом файл не дає сповіщення, файл понад ліміт після repair дає одне critical-сповіщення,
+  виключення діють.
 
 - **Change: прибрано нагадування про застарілі оновлення Windows.**
   BRAVO_HEALTH у кожному прогоні писав WARNING «Останнє оновлення Windows встановлено … дн. тому»

@@ -7972,8 +7972,8 @@ $script:BRAVOMaintenanceMigrationStepEnabled = ($script:BRAVOMaintenanceLegacyMi
 #   [1/8] Перевірка вільного місця
 #   [2/8] Створення необхідних директорій
 #   [3/8] Зупинка служб
-#   [4/8] Перевірка розмірів .md
-#   [5/8] Реставрація моделі
+#   [4/8] Реставрація моделі
+#   [5/8] Перевірка розмірів .md
 #   [6/8] Обробка trace і логів
 #   [7/8] Відновлення стану служб
 #   [8/8] Контроль діапазонів ID
@@ -8021,9 +8021,9 @@ $maintenancePlanEntries = [ordered]@{
     # -ForceRestore АБО ця сама missed-recovery умова, АБО плановий
     # день/час) — саме те, що показує крок [N/TOTAL] нижче.
     'Відновлення пропущених операцій' = [bool]($RunMissedRestoreOnly -and $missedDailyWork)
-    'Перевірка розмірів'              = [bool]$script:BRAVOMaintenanceCheckSizeStepEnabled
     'Maintenance BRAVO'               = [bool]$BravoMaintenanceEnabled
     'Реставрація моделі'              = [bool]$script:BRAVOMaintenanceRestoreStepEnabled
+    'Перевірка розмірів'              = [bool]$script:BRAVOMaintenanceCheckSizeStepEnabled
     # dev.16: очистка не має власного on/off прапорця — політика
     # оцінюється КОЖЕН прогін (немає гілки, яка пропускає весь блок
     # "===== ОЧИСТКА СТАРИХ ДАНИХ ====="), тому це не UI-only "ТАК", а
@@ -9804,7 +9804,7 @@ elseif ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) {
 # [6/8] — той самий порядок, що в затвердженому operator contract,
 # незалежно від того, чи справді
 # виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
-# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з трьох причин,
+# гілка ($shouldRestore, вище) її не надрукувала — з трьох причин,
 # які варто розрізняти в Details:
 # - вікно закрилося під час очікування lock/підготовки (Barrier 1) — було
 #   заплановано, безпечно відкладено, наступний daily Recovery повторить;
