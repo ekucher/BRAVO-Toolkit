@@ -178,6 +178,17 @@ function Test-SevenZipArchiveIntegrity {
         -ArchivePath $ArchivePath `
         -Password $Password `
         -TimeoutSeconds $TimeoutSeconds
+    # #300: порожній результат (валідатор нічого не повернув) — збій виконання,
+    # не виняток: нормалізується до структурованого результату ДО першого
+    # звернення до властивостей (StrictMode кидає на $null.ExitCode).
+    if ($null -eq $testResult) {
+        $testResult = New-Object PSObject -Property @{
+            Success = $false; ExitCode = $null; TimedOut = $false
+            Description = 'валідатор 7-Zip не повернув результат'
+            StandardOutput = ''; StandardError = ''
+            Error = 'Invoke-BRAVOSevenZipIntegrityTest не повернув результат'
+        }
+    }
 
     $exitCodeText = if ($null -eq $testResult.ExitCode) {
         "немає"
@@ -204,15 +215,11 @@ function Test-SevenZipArchiveIntegrity {
     # інструмента, НЕ доказ проти архіву: fail-safe, класифікується як
     # не-archive-specific. Поля TimedOut/Error читаються через
     # PSObject.Properties (StrictMode: не всі джерела результату їх мають).
-    # Порожній результат (не має траплятися) — збій виконання, не виняток.
     # Пряме присвоєння, не if-вираз: if-вираз розгортає колекцію властивостей
     # у масив, і індексація за іменем ламається.
-    $resultProperties = $null
-    if ($null -ne $testResult) {
-        $resultProperties = $testResult.PSObject.Properties
-    }
-    $failureTimedOut = ($null -ne $resultProperties -and $null -ne $resultProperties['TimedOut'] -and [bool]$testResult.TimedOut)
-    $failureErrorText = if ($null -ne $resultProperties -and $null -ne $resultProperties['Error']) { [string]$testResult.Error } else { '' }
+    $resultProperties = $testResult.PSObject.Properties
+    $failureTimedOut = ($null -ne $resultProperties['TimedOut'] -and [bool]$testResult.TimedOut)
+    $failureErrorText = if ($null -ne $resultProperties['Error']) { [string]$testResult.Error } else { '' }
     $archiveSpecificFailure = (
         -not $failureTimedOut -and
         [string]::IsNullOrWhiteSpace($failureErrorText) -and

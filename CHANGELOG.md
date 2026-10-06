@@ -29,7 +29,11 @@
   (таймаут, помилка запуску, інший код), `Invoke-BRAVOSevenZipIntegrityTest` позначає це `FallbackAttemptOperationalFailure`,
   і збій не вважається archive-specific. Регресія: `Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags`,
   `Maintenance/RetentionBrokenNewerThanAnyValidPointSetsFailureFlags`, `LegacyBomFallback/FallbackAttemptTimeoutIsNotArchiveSpecific`,
-  `LegacyBomFallback/CompletedFallbackFailureIsNotOperational`.
+  `LegacyBomFallback/CompletedFallbackFailureIsNotOperational`. Друга (legacy BOM) спроба з кодом 1/2 без власних
+  повідомлень 7-Zip про вміст архіву (наприклад, локалізована відмова доступу) теж позначається як незавершена
+  перевірка, а порожній результат валідатора нормалізується до збою виконання до першого читання властивостей.
+  Регресія: `LegacyBomFallback/FallbackAttemptLocalizedAccessFailureIsNotArchiveSpecific`,
+  `ArchiveHelpers/IntegrityNullValidatorResultIsOperationalFailure`.
 - **Fix: Archive: таймаут перевірки SFTP повертає `$false` і звільняє lock WinSCP (#290).**
   `Test-SFTPConnection` після таймауту вбивала WinSCP і кидала виняток раніше, ніж `Complete-BRAVOProcessOutputCapture`
   звільняла lock `BRAVO_WINSCP`. Викликачі (ручний `-SyncBAZA` і `Main`) не мають `try`, тому прогін завершувався
