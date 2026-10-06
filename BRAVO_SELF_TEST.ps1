@@ -4813,8 +4813,12 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # 7z t» / «не вдалося створити SHA512») злито в одну гілку
             # Verify-Backup (7z t + SHA512); збій 7z t і далі виставляє
             # restoreIntegrityFailed у Test-BRAVOMaintenanceSevenZipArchiveIntegrity.
+            # +1 integrity (#300): retention (Remove-OldRestoreArchives) виставляє
+            # restoreIntegrityFailed, коли після збою 7z t не лишилось жодної
+            # придатної точки відновлення (старіші сесії перевіряються з
+            # -NoFailureFlags, тож цей backstop — окрема точка).
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 13) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 10)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 11)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
         -Failure "Maintenance має розрізняти локальну архівацію (40), перевірку цілісності (41) і провал реставрації з відкатом (43), а не зводити все до 60"
