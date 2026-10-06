@@ -1483,7 +1483,9 @@ function Invoke-BRAVOBazaSynchronization {
         # маркер AuditReconciliationPending (round 6) у такому випадку
         # лишається true на диску, і наступний цикл реконсилюється
         # fail-closed замість довіри застарілим Verified-записам.
-        if ($result.Status -eq 'COMPLETE') {
+        # #285: MUTATION_AUTO_ARCHIVED теж успіх (Test-BRAVOBazaSyncStatusSuccess):
+        # remote уже перейменовано, а зміну стану не збережено — не успіх.
+        if ($result.Status -in @('COMPLETE', 'MUTATION_AUTO_ARCHIVED')) {
             $result.Status = 'INCOMPLETE'
         }
         $result.Error = "передачу завершено, але не вдалося зберегти стан: $($_.Exception.Message)"

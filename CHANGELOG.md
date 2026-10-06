@@ -10,6 +10,8 @@
   `MUTATION_VIOLATION`, `REMOTE_CONFLICT`, `AUDIT_DRIFT`, `INCOMPATIBLE_NAME`, `INCOMPLETE` лишаються збоєм, як і
   раніше. Регресія: `BazaSync/CanonicalSyncMutationAutoArchivedIsSuccess`, `BazaSync/CanonicalSyncCompleteIsSuccess`,
   `BazaSync/CanonicalSyncFailureStatusesAreNotSuccess`, `BazaSync/StatusSuccessHelperWhitelistsCompleteAndAutoArchivedOnly`.
+  Якщо після авто-архівування не вдалося зберегти стан BazaSync, `MUTATION_AUTO_ARCHIVED` знижується до `INCOMPLETE`
+  з Error (як і `COMPLETE`), тож такий цикл не рахується успіхом. Регресія: `BazaSync/AutoArchiveStateSaveFailureIsNotSuccess`.
 - **Fix: BazaSync: `MUTATION_AUTO_ARCHIVED` не ховає `AUDIT_DRIFT`, `REMOTE_CONFLICT` і `INCOMPATIBLE_NAME` того самого циклу (#293).**
   Статус `MUTATION_AUTO_ARCHIVED` обирався раніше за drift/конфлікт/несумісні імена, а Fast Health одразу
   повертав INFO/healthy, тож на сайті з регулярними мутаціями ці проблеми ставали рядками INFO назавжди
