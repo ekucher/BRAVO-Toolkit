@@ -738,7 +738,13 @@ function Get-Service {
     if ([string]$Name -eq 'BravoStartTypeDisabled') { Add-Member -InputObject $svc -MemberType NoteProperty -Name StartType -Value 'Disabled' }
     if ([string]$Name -eq 'BravoStartTypeAutomatic') { Add-Member -InputObject $svc -MemberType NoteProperty -Name StartType -Value 'Automatic' }
     Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { } -Force
+    # Службу видалено з SCM між Get-Service і Refresh().
+    if ([string]$Name -eq 'BravoVanished') { Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { throw 'служба вже не існує (stub)' } -Force }
     return $svc
+}
+function Read-BRAVOServiceQuiescenceState {
+    if ($script:startTypeMarkerThrows) { throw 'маркер не прочитано (stub)' }
+    return $script:startTypeMarker
 }
 function Get-BRAVOWmiInstance {
     param($ClassName)
@@ -752,12 +758,15 @@ function Get-BRAVOWmiInstance {
 }
 '@
     $startTypeModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText ($startTypeStubs + "`n" + $healthRuntimeTextForQuiescence) `
-        -FunctionNames @('Write-HealthLog', 'Get-Service', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled', 'Get-ManagedServiceHealthIssues')
+        -SourceText ($startTypeStubs + "`n" + $healthRuntimeTextForQuiescence + "`n" + $systemModuleTextForQuiescence) `
+        -FunctionNames @('Write-HealthLog', 'Get-Service', 'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled',
+            'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition', 'Get-ManagedServiceHealthIssues')
     $startTypeProbe = {
-        param($ServiceName, [bool]$WmiFails = $false)
+        param($ServiceName, [bool]$WmiFails = $false, $Marker = $null, [bool]$MarkerThrows = $false)
         Set-StrictMode -Version 2.0
         $script:startTypeWmiFails = $WmiFails
+        $script:startTypeMarker = $Marker
+        $script:startTypeMarkerThrows = $MarkerThrows
         $script:backupMonitoring = @{ CheckManagedServices = $true }
         $script:maintenanceSettings = [pscustomobject]@{
             Services = [pscustomobject]@{ BravoName = $ServiceName; ExchangeApiName = ''; BravoWebEnabled = $false; BravoWebCandidates = @() }
@@ -765,7 +774,7 @@ function Get-BRAVOWmiInstance {
         $thrown = $null
         $issues = @()
         try { $issues = @(Get-ManagedServiceHealthIssues) } catch { $thrown = $_.Exception.Message }
-        [pscustomobject]@{ Thrown = $thrown; IssueCount = @($issues).Count }
+        [pscustomobject]@{ Thrown = $thrown; IssueCount = @($issues).Count; Reasons = @($issues | ForEach-Object { [string]$_.Reason }) }
     }
     $startTypeDisabled = & $startTypeModule $startTypeProbe 'BravoDisabled'
     $startTypeAuto = & $startTypeModule $startTypeProbe 'BravoAuto'
@@ -791,6 +800,229 @@ function Get-BRAVOWmiInstance {
         ) `
         -Name "Health/ManagedServiceStartTypePresentAndWmiFailureUnderStrictMode" `
         -Failure "Get-ManagedServiceHealthIssues під StrictMode 2.0: наявний StartType має пріоритет над WMI (Disabled -> пропуск, Automatic -> проблема), а збій WMI без StartType не кидає виняток. Отримано: StartType=Disabled(Thrown='$($startTypePresentDisabled.Thrown)', Issues=$($startTypePresentDisabled.IssueCount)), StartType=Automatic(Thrown='$($startTypePresentAutomatic.Thrown)', Issues=$($startTypePresentAutomatic.IssueCount)), WMI-збій(Thrown='$($startTypeWmiFailure.Thrown)', Issues=$($startTypeWmiFailure.IssueCount))"
+
+    # #314 FR-1: тимчасовий Disabled від BRAVO (#297, знімок типу в маркері)
+    # Health і далі не рапортує як issue (осиротілий маркер відпрацьовує
+    # watchdog), а зупинена служба під маркером без утримання — issue, як і
+    # до переходу на Get-BRAVOManagedServiceCondition.
+    $heldMarker = [pscustomobject]@{
+        owner = 'BRAVO_DATA_RESTORE'
+        services = @([pscustomobject]@{ Name = 'BravoDisabled'; RestartIntent = $true })
+        startTypeSnapshot = @([pscustomobject]@{ Name = 'BravoDisabled'; StartMode = 'Automatic' })
+    }
+    $markedMarker = [pscustomobject]@{
+        owner = 'BRAVO_MAINTENANCE'
+        services = @([pscustomobject]@{ Name = 'bravoauto'; RestartIntent = $true })
+        startTypeSnapshot = @()
+    }
+    $startTypeHeld = & $startTypeModule $startTypeProbe 'BravoDisabled' $false $heldMarker
+    $startTypeMarked = & $startTypeModule $startTypeProbe 'BravoAuto' $false $markedMarker
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $startTypeHeld.Thrown -and $startTypeHeld.IssueCount -eq 0 -and
+            $null -eq $startTypeMarked.Thrown -and $startTypeMarked.IssueCount -eq 1
+        ) `
+        -Name "Health/ManagedServiceIssuesUnchangedUnderQuiescenceMarker" `
+        -Failure "Get-ManagedServiceHealthIssues після переходу на Get-BRAVOManagedServiceCondition: утримана BRAVO служба (Disabled зі знімком у маркері) не дає issue, зупинена служба з маркера дає issue, як і раніше. Отримано: утримана(Thrown='$($startTypeHeld.Thrown)', Issues=$($startTypeHeld.IssueCount)), у маркері(Thrown='$($startTypeMarked.Thrown)', Issues=$($startTypeMarked.IssueCount))"
+
+    # Службу видалено між Get-Service і Refresh(): одна issue з явною
+    # причиною (не «стан: » з порожнім станом), без винятку; збій читання
+    # маркера не обриває Health, служба перевіряється без маркера.
+    $startTypeVanished = & $startTypeModule $startTypeProbe 'BravoVanished'
+    $startTypeMarkerFails = & $startTypeModule $startTypeProbe 'BravoAuto' $false $null $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $startTypeVanished.Thrown -and $startTypeVanished.IssueCount -eq 1 -and
+            ([string]$startTypeVanished.Reasons[0]).Contains('видалено під час перевірки') -and
+            $null -eq $startTypeMarkerFails.Thrown -and $startTypeMarkerFails.IssueCount -eq 1 -and
+            ([string]$startTypeMarkerFails.Reasons[0]).Contains('стан: Stopped')
+        ) `
+        -Name "Health/ManagedServiceVanishedOrMarkerUnreadableIsHandled" `
+        -Failure "Get-ManagedServiceHealthIssues: служба, видалена між Get-Service і Refresh(), дає одну issue з причиною 'видалено під час перевірки'; збій читання маркера не кидає виняток. Отримано: видалена(Thrown='$($startTypeVanished.Thrown)', Reasons='$($startTypeVanished.Reasons -join ' | ')'), маркер(Thrown='$($startTypeMarkerFails.Thrown)', Reasons='$($startTypeMarkerFails.Reasons -join ' | ')')"
+
+    $healthManagedServiceFunctionText = $healthRuntimeTextForQuiescence.Substring(
+        $healthRuntimeTextForQuiescence.IndexOf('function Get-ManagedServiceHealthIssues'))
+    $healthManagedServiceFunctionText = $healthManagedServiceFunctionText.Substring(0,
+        $healthManagedServiceFunctionText.IndexOf('function Get-BRAVOManagedServiceStatusSnapshot'))
+    Test-BRAVOCondition `
+        -Condition (
+            $healthManagedServiceFunctionText.Contains('Get-BRAVOManagedServiceCondition') -and
+            -not $healthManagedServiceFunctionText.Contains("PSObject.Properties['StartType']") -and
+            -not $healthManagedServiceFunctionText.Contains('-ieq "Disabled"')
+        ) `
+        -Name "Health/ManagedServiceUsesCanonicalCondition" `
+        -Failure "Get-ManagedServiceHealthIssues має класифікувати служби лише через Get-BRAVOManagedServiceCondition (BRAVO.System, #314 FR-1), без власного читання StartType/Disabled"
+
+    # ============================================================
+    # #314 FR-1: Get-BRAVOManagedServiceCondition — єдина класифікація
+    # стану керованої служби. Таблиця Auto/Manual/Disabled ×
+    # Running/Stopped/Pending × маркер з підміненими Get-Service/WMI,
+    # під StrictMode 2.0. Функція лише читає.
+    # ============================================================
+    $conditionStubs = @'
+function Get-Service {
+    param($Name, $ErrorAction)
+    if ([string]$Name -eq 'BravoMissing') { return $null }
+    return [pscustomobject]@{ Name = [string]$Name; Status = 'Stopped' }
+}
+function Get-BRAVOWmiInstance {
+    param($ClassName, $Filter)
+    $script:conditionWmiFilters += @([string]$Filter)
+    return [pscustomobject]@{ Name = 'BravoQueried'; StartMode = 'Manual'; ExitCode = 1067; ServiceSpecificExitCode = 0 }
+}
+function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
+'@
+    $conditionModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($conditionStubs + "`n" + $systemModuleTextForQuiescence) `
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Read-BRAVOServiceQuiescenceState',
+            'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition')
+    $conditionMarker = [pscustomobject]@{
+        owner = 'BRAVO_MAINTENANCE'
+        services = @(
+            [pscustomobject]@{ Name = 'BRAVO'; RestartIntent = $true },
+            [pscustomobject]@{ Name = 'exchangAPI'; RestartIntent = $true },
+            [pscustomobject]@{ Name = 'BravoOperatorDisabled'; RestartIntent = $true }
+        )
+        startTypeSnapshot = @([pscustomobject]@{ Name = 'BRAVOWEB'; StartMode = 'Manual' })
+    }
+    $conditionCases = @(
+        @{ Case = 'AutoRunning'; StartType = 'Automatic'; Status = 'Running'; Marker = $false; Expected = 'Running' },
+        @{ Case = 'ManualRunning'; StartType = 'Manual'; Status = 'Running'; Marker = $false; Expected = 'Running' },
+        @{ Case = 'AutoStopped'; StartType = 'Automatic'; Status = 'Stopped'; Marker = $false; Expected = 'Failed' },
+        @{ Case = 'ManualStopped'; StartType = 'Manual'; Status = 'Stopped'; Marker = $false; Expected = 'Failed' },
+        @{ Case = 'AutoStartPending'; StartType = 'Automatic'; Status = 'StartPending'; Marker = $false; Expected = 'Pending' },
+        @{ Case = 'ManualStopPending'; StartType = 'Manual'; Status = 'StopPending'; Marker = $false; Expected = 'Pending' },
+        @{ Case = 'AutoContinuePending'; StartType = 'Automatic'; Status = 'ContinuePending'; Marker = $false; Expected = 'Pending' },
+        @{ Case = 'AutoPausePending'; StartType = 'Automatic'; Status = 'PausePending'; Marker = $false; Expected = 'Pending' },
+        @{ Case = 'AutoPaused'; StartType = 'Automatic'; Status = 'Paused'; Marker = $false; Expected = 'Failed' },
+        @{ Case = 'UnknownStartModeStopped'; StartType = 'Boot'; Status = 'Stopped'; Marker = $false; Expected = 'Failed' },
+        @{ Case = 'DisabledStopped'; StartType = 'Disabled'; Status = 'Stopped'; Marker = $false; Expected = 'Disabled' },
+        @{ Case = 'DisabledRunning'; StartType = 'Disabled'; Status = 'Running'; Marker = $false; Expected = 'Disabled' },
+        @{ Case = 'AutoStoppedInMarker'; Name = 'bravo'; StartType = 'Automatic'; Status = 'Stopped'; Marker = $true; Expected = 'OwnedByBravo' },
+        @{ Case = 'ManualStoppedInMarker'; Name = 'exchangAPI'; StartType = 'Manual'; Status = 'Stopped'; Marker = $true; Expected = 'OwnedByBravo' },
+        @{ Case = 'AutoRunningInMarker'; Name = 'BRAVO'; StartType = 'Automatic'; Status = 'Running'; Marker = $true; Expected = 'Running' },
+        @{ Case = 'AutoPendingInMarker'; Name = 'BRAVO'; StartType = 'Automatic'; Status = 'StartPending'; Marker = $true; Expected = 'Pending' },
+        @{ Case = 'DisabledHeldBySnapshot'; Name = 'BravoWeb'; StartType = 'Disabled'; Status = 'Stopped'; Marker = $true; Expected = 'OwnedByBravo' },
+        @{ Case = 'DisabledByOperatorInMarker'; Name = 'BravoOperatorDisabled'; StartType = 'Disabled'; Status = 'Stopped'; Marker = $true; Expected = 'Disabled' },
+        @{ Case = 'AutoStoppedOtherMarker'; Name = 'BravoOther'; StartType = 'Automatic'; Status = 'Stopped'; Marker = $true; Expected = 'Failed' },
+        @{ Case = 'SnapshotOnlyNotDisabledStopped'; Name = 'BravoWeb'; StartType = 'Manual'; Status = 'Stopped'; Marker = $true; Expected = 'Failed' }
+    )
+    $conditionProbe = {
+        param($Cases, $Marker)
+        Set-StrictMode -Version 2.0
+        $rows = @()
+        foreach ($case in @($Cases)) {
+            $serviceName = if ($case.ContainsKey('Name')) { [string]$case.Name } else { 'Bravo' + [string]$case.Case }
+            $service = [pscustomobject]@{ Name = $serviceName; Status = [string]$case.Status; StartType = [string]$case.StartType }
+            $caseMarker = if ($case.Marker) { $Marker } else { $null }
+            $thrown = $null
+            $condition = $null
+            try {
+                $condition = Get-BRAVOManagedServiceCondition -Name $serviceName -Service $service -ServiceInfo $null -QuiescenceState $caseMarker -NoWmiQuery
+            } catch { $thrown = $_.Exception.Message }
+            $rows += [pscustomobject]@{
+                Case = [string]$case.Case
+                Expected = [string]$case.Expected
+                Actual = if ($null -ne $condition) { [string]$condition.Condition } else { "виняток: $thrown" }
+                Held = if ($null -ne $condition) { [bool]$condition.HeldByBravo } else { $false }
+                Original = if ($null -ne $condition) { [string]$condition.OriginalStartMode } else { '' }
+                Owner = if ($null -ne $condition) { [string]$condition.MarkerOwner } else { '' }
+            }
+        }
+        return @($rows)
+    }
+    $conditionRows = @(& $conditionModule $conditionProbe $conditionCases $conditionMarker)
+    $conditionMismatches = @($conditionRows | Where-Object { $_.Actual -ne $_.Expected } |
+        ForEach-Object { '{0}: очікувано {1}, отримано {2}' -f $_.Case, $_.Expected, $_.Actual })
+    Test-BRAVOCondition `
+        -Condition ($conditionRows.Count -eq $conditionCases.Count -and $conditionMismatches.Count -eq 0) `
+        -Name "ServiceRecovery/ConditionMatrix" `
+        -Failure "Get-BRAVOManagedServiceCondition: таблиця FR-1 #314 (Automatic і Manual однаково; Disabled має пріоритет над станом; служба з маркера — OwnedByBravo; Pending окремо). Розбіжності: $($conditionMismatches -join '; ')"
+
+    $heldRow = @($conditionRows | Where-Object { $_.Case -eq 'DisabledHeldBySnapshot' }) | Select-Object -First 1
+    $operatorRow = @($conditionRows | Where-Object { $_.Case -eq 'DisabledByOperatorInMarker' }) | Select-Object -First 1
+    $markedRow = @($conditionRows | Where-Object { $_.Case -eq 'AutoStoppedInMarker' }) | Select-Object -First 1
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $heldRow -and $heldRow.Held -and $heldRow.Original -eq 'Manual' -and $heldRow.Owner -eq 'BRAVO_MAINTENANCE' -and
+            $null -ne $operatorRow -and -not $operatorRow.Held -and
+            $null -ne $markedRow -and -not $markedRow.Held -and $markedRow.Owner -eq 'BRAVO_MAINTENANCE'
+        ) `
+        -Name "ServiceRecovery/ConditionHeldDisabledIsOwnedByBravo" `
+        -Failure "Disabled зі знімком типу в маркері (#297/#329) — це OwnedByBravo з HeldByBravo і початковим типом, а не «навмисно вимкнено»; Disabled без знімка лишається рішенням оператора"
+
+    $conditionDetailProbe = {
+        Set-StrictMode -Version 2.0
+        $script:conditionWmiFilters = @()
+        $script:conditionMarker = [pscustomobject]@{
+            owner = 'BRAVO_DATA_RESTORE'
+            services = @([pscustomobject]@{ Name = 'BravoQueried'; RestartIntent = $true })
+            startTypeSnapshot = @()
+        }
+        $missing = Get-BRAVOManagedServiceCondition -Name 'BravoMissing'
+        # Без -ServiceInfo/-QuiescenceState: власний WMI-запит за іменем і
+        # читання маркера; StartType відсутній (.NET < 4.6.1) -> WMI StartMode.
+        $queried = Get-BRAVOManagedServiceCondition -Name 'BravoQueried'
+        $wmiFiltersAfterQuery = @($script:conditionWmiFilters).Count
+        $noWmi = Get-BRAVOManagedServiceCondition -Name 'BravoNoWmi' -NoWmiQuery -QuiescenceState $null
+        $fallback = Get-BRAVOManagedServiceCondition -Name 'BravoFallback' -NoWmiQuery -QuiescenceState $null `
+            -ServiceInfo ([pscustomobject]@{ Name = 'BravoFallback'; StartMode = 'Disabled'; ExitCode = 0; ServiceSpecificExitCode = 0 })
+        [pscustomobject]@{
+            MissingCondition = [string]$missing.Condition
+            MissingExists = [bool]$missing.Exists
+            QueriedCondition = [string]$queried.Condition
+            QueriedStartMode = [string]$queried.StartMode
+            QueriedSource = [string]$queried.StartModeSource
+            QueriedExitCode = $queried.ExitCode
+            QueriedFilter = (@($script:conditionWmiFilters) -join '|')
+            WmiFiltersAfterQuery = $wmiFiltersAfterQuery
+            WmiFiltersTotal = @($script:conditionWmiFilters).Count
+            NoWmiCondition = [string]$noWmi.Condition
+            NoWmiStartMode = [string]$noWmi.StartMode
+            NoWmiExitCode = $noWmi.ExitCode
+            FallbackCondition = [string]$fallback.Condition
+        }
+    }
+    $conditionDetail = $null
+    $conditionDetailThrown = $null
+    try { $conditionDetail = & $conditionModule $conditionDetailProbe } catch { $conditionDetailThrown = $_.Exception.Message }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $conditionDetailThrown -and $null -ne $conditionDetail -and
+            $conditionDetail.MissingCondition -eq 'NotInstalled' -and -not $conditionDetail.MissingExists -and
+            $conditionDetail.QueriedCondition -eq 'OwnedByBravo' -and
+            $conditionDetail.QueriedStartMode -eq 'Manual' -and $conditionDetail.QueriedSource -eq 'FallbackStartMode' -and
+            $conditionDetail.QueriedExitCode -eq 1067 -and
+            $conditionDetail.QueriedFilter -eq "Name = 'BravoQueried'" -and
+            $conditionDetail.WmiFiltersAfterQuery -eq 1 -and $conditionDetail.WmiFiltersTotal -eq 1 -and
+            $conditionDetail.NoWmiCondition -eq 'Failed' -and $conditionDetail.NoWmiStartMode -eq 'Unknown' -and
+            $null -eq $conditionDetail.NoWmiExitCode -and
+            $conditionDetail.FallbackCondition -eq 'Disabled'
+        ) `
+        -Name "ServiceRecovery/ConditionSourcesAndExitCode" `
+        -Failure "Get-BRAVOManagedServiceCondition: відсутня служба -> NotInstalled; без StartType тип береться з одного WMI-запиту за іменем (разом з ExitCode), маркер читається сам; -NoWmiQuery не робить запиту (тип Unknown -> Failed). Виняток: '$conditionDetailThrown'; отримано: $(if ($null -ne $conditionDetail) { ($conditionDetail | Out-String).Trim() })"
+
+    # Функція лише читає: у тілі немає жодної команди, що змінює службу,
+    # тип запуску, маркер чи файли.
+    $conditionParseTokens = $null
+    $conditionParseErrors = $null
+    $conditionFunctionAst = [Management.Automation.Language.Parser]::ParseInput($systemModuleTextForQuiescence, [ref]$conditionParseTokens, [ref]$conditionParseErrors).FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOManagedServiceCondition'
+        }, $true) | Select-Object -First 1
+    $conditionCommandNames = @()
+    if ($null -ne $conditionFunctionAst) {
+        $conditionCommandNames = @($conditionFunctionAst.Body.FindAll({
+                    param($node) $node -is [Management.Automation.Language.CommandAst]
+                }, $true) | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)
+    }
+    $conditionAllowedCommands = @('Get-Service', 'Get-Command', 'Get-BRAVOWmiInstance', 'Select-Object', 'Where-Object',
+        'Get-BRAVOServiceStartMode', 'Read-BRAVOServiceQuiescenceState')
+    $conditionUnexpectedCommands = @($conditionCommandNames | Where-Object { $conditionAllowedCommands -notcontains $_ })
+    Test-BRAVOCondition `
+        -Condition ($null -ne $conditionFunctionAst -and $conditionCommandNames.Count -gt 0 -and $conditionUnexpectedCommands.Count -eq 0) `
+        -Name "ServiceRecovery/ConditionIsReadOnly" `
+        -Failure "Get-BRAVOManagedServiceCondition має лише читати (FR-1 #314); неочікувані команди: $($conditionUnexpectedCommands -join ', ')"
 
     $healthWatchdogInvokeIndex = $healthRuntimeTextForQuiescence.IndexOf('$quiescenceWatchdogIssues = @(Invoke-BRAVOServiceQuiescenceWatchdog)')
     $healthManagedServicesIndex = $healthRuntimeTextForQuiescence.IndexOf('$serviceHealthIssues = @($quiescenceWatchdogIssues) + @(Get-ManagedServiceHealthIssues)')
