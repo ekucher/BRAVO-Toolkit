@@ -16770,7 +16770,9 @@ try {
                             'CHECK baza-local BAZA WWW',
                             'STEP 6/8 BAZA_WWW (локальна копія) OK',
                             'CHECK smb',
-                            'STEP 7/8 NAS/SMB OK'
+                            'STEP 7/8 NAS/SMB OK',
+                            # Total 8: крок 'Сповіщення' теж потрапляє під STEP [1-8]/.
+                            'STEP 8/8 Сповіщення OK'
                         ) -join '|') -and
                     @($healthToolIntegritySftpDisabledEvents | Where-Object { $_ -like 'WINSCP-*' }).Count -eq 0 -and
                     $healthToolIntegritySftpDisabledAlerts.Count -eq 1 -and
