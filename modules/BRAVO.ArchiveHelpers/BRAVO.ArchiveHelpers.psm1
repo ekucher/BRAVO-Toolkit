@@ -204,9 +204,10 @@ function Test-SevenZipArchiveIntegrity {
     # інструмента, НЕ доказ проти архіву: fail-safe, класифікується як
     # не-archive-specific. Поля TimedOut/Error читаються через
     # PSObject.Properties (StrictMode: не всі джерела результату їх мають).
-    $resultProperties = $testResult.PSObject.Properties
-    $failureTimedOut = ($null -ne $resultProperties['TimedOut'] -and [bool]$testResult.TimedOut)
-    $failureErrorText = if ($null -ne $resultProperties['Error']) { [string]$testResult.Error } else { '' }
+    # Порожній результат (не має траплятися) — збій виконання, не виняток.
+    $resultProperties = if ($null -ne $testResult) { $testResult.PSObject.Properties } else { $null }
+    $failureTimedOut = ($null -ne $resultProperties -and $null -ne $resultProperties['TimedOut'] -and [bool]$testResult.TimedOut)
+    $failureErrorText = if ($null -ne $resultProperties -and $null -ne $resultProperties['Error']) { [string]$testResult.Error } else { '' }
     $archiveSpecificFailure = (
         -not $failureTimedOut -and
         [string]::IsNullOrWhiteSpace($failureErrorText) -and
