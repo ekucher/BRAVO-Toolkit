@@ -897,6 +897,76 @@
         -Name "Governance/LegacyConfigPathHasSingleOwner" `
         -Failure "у BRAVO_SELF_TEST.ps1 дозволене рівно одне посилання на кореневий BRAVO.config (дефолт -ConfigPath; B4-2 прибрав файл з пакета, тож accessor-и фікстур більше не читають кореневий шлях), у фрагментах — жодного. Знайдено: $legacyConfigOwnerHits у корені, $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray()))). Рядки збігів: [$legacyConfigOwnerLinesText]; очікувані: [$legacyConfigExpectedLinesText]"
 
+    # --- D-1: версійна фікстура self-test не читає BRAVO.config хоста ---
+    # За дефолтного -ConfigPath файл у install root може бути site-конфігом
+    # мігрованого хосту; він не повинен ставати фікстурою. Проба бере
+    # РЕАЛЬНИЙ оператор `$versionConfigText = if ...` з AST кореня і
+    # виконує його в дочірньому scope із заглушкою замороженого аксесора.
+    & {
+        $d1Sandbox = $null
+        $d1SavedFlag = $script:selfTestConfigPathWasDefaulted
+        $d1DefaultedOk = $false
+        $d1DefaultedFailure = ''
+        $d1ExplicitOk = $false
+        $d1ExplicitFailure = ''
+        try {
+            $d1Sandbox = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_D1_' + [guid]::NewGuid().ToString('N'))
+            [void][IO.Directory]::CreateDirectory($d1Sandbox)
+            $d1HostLike = Join-Path $d1Sandbox 'BRAVO.config'
+            [IO.File]::WriteAllText($d1HostLike, 'D1_HOST_SENTINEL PublicIPLookupEnabled = $false', (New-Object Text.UTF8Encoding($false)))
+
+            $d1Ast = Get-BRAVOSelfTestOwnSourceAst
+            $d1Stmts = @($d1Ast.FindAll({
+                param($d1Node)
+                ($d1Node -is [Management.Automation.Language.AssignmentStatementAst]) -and
+                ($d1Node.Left.Extent.Text -ceq '$versionConfigText') -and
+                ($null -ne $d1Node.Right.Find({ param($d1Inner) $d1Inner -is [Management.Automation.Language.IfStatementAst] }, $true))
+            }, $true))
+            if ($d1Stmts.Count -ne 1) {
+                throw ("не знайдено рівно один оператор versionConfigText = if ...; знайдено: " + $d1Stmts.Count)
+            }
+            $d1Runner = [scriptblock]::Create($d1Stmts[0].Extent.Text + "`r`n" + 'return $versionConfigText')
+
+            $d1Run = {
+                param([scriptblock]$Body, [string]$SourceConfigPath, [bool]$Defaulted)
+                function Get-BRAVOSelfTestLegacyConfigText { return 'D1_FROZEN' }
+                $script:selfTestConfigPathWasDefaulted = $Defaulted
+                $sourceConfigPath = $SourceConfigPath
+                return (& $Body)
+            }
+
+            $d1DefaultedText = [string](& $d1Run $d1Runner $d1HostLike $true)
+            $d1DefaultedOk = ($d1DefaultedText -ceq 'D1_FROZEN')
+            $d1DefaultedFailure = "за дефолтного -ConfigPath існуючий BRAVO.config хоста не повинен ставати версійною фікстурою; очікувано заморожений текст, отримано: [$d1DefaultedText]"
+
+            $d1ExplicitText = [string](& $d1Run $d1Runner $d1HostLike $false)
+            $d1MissingThrew = $false
+            try {
+                [void](& $d1Run $d1Runner (Join-Path $d1Sandbox 'missing.config') $false)
+            } catch {
+                $d1MissingThrew = $true
+            }
+            $d1ExplicitOk = ($d1ExplicitText.Contains('D1_HOST_SENTINEL') -and $d1MissingThrew)
+            $d1ExplicitFailure = "явний -ConfigPath має читатися з файлу, а відсутній файл — завершуватися помилкою (файл прочитано: $($d1ExplicitText.Contains('D1_HOST_SENTINEL')); виняток для відсутнього: $d1MissingThrew)"
+        } catch {
+            $d1DefaultedFailure = 'не вдалося виконати пробу D-1: ' + $_.Exception.Message
+            $d1ExplicitFailure = $d1DefaultedFailure
+        } finally {
+            $script:selfTestConfigPathWasDefaulted = $d1SavedFlag
+            if ($null -ne $d1Sandbox -and [IO.Directory]::Exists($d1Sandbox)) {
+                [IO.Directory]::Delete($d1Sandbox, $true)
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition $d1DefaultedOk `
+            -Name 'Governance/SelfTestVersionFixtureIgnoresHostConfigWhenPathDefaulted' `
+            -Failure $d1DefaultedFailure
+        Test-BRAVOCondition `
+            -Condition $d1ExplicitOk `
+            -Name 'Governance/SelfTestVersionFixtureHonorsExplicitConfigPath' `
+            -Failure $d1ExplicitFailure
+    }
+
     # --- Провенанс артефакту: sourceCommit описує САМЕ спаковане дерево ---
     # #199. Форма sourceCommit і рівність packageVersion нічого не кажуть
     # про вміст: перештампування однієї версії штатне, тому залишений
