@@ -51,6 +51,13 @@ $script:selfTestTotalStopwatch = [Diagnostics.Stopwatch]::StartNew()
 # ДОЧІРНІЙ області — & { ... }. Тоді його змінні не залишаються тут
 # узагалі. Функції self-test (Test-BRAVOCondition) і $script:-лічильники
 # з дочірньої області доступні без змін.
+#
+# Те саме стосується .GetNewClosure(): динамічний модуль closure НЕ
+# успадковує піднятий тут ліміт (лишається глобальний, типово 4096) і мовчки
+# обрізає копію змінних області, тож пізні змінні в closure стають $null.
+# Closure, що захоплює змінні, будуйте в дочірній області:
+#   & { param($Dep) { ... }.GetNewClosure() } $Dep
+# (guard Governance/SelfTestClosuresCreatedInNarrowScope).
 $script:selfTestVariableCountLimit = 8192
 $MaximumVariableCount = $script:selfTestVariableCountLimit
 
@@ -14656,8 +14663,28 @@ $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Ge
 $RAW_SOURCE_GRACE_DAYS = 1
 '@
             $maintenanceOrchestrationProbeScript = @'
+param([string]$Scenarios, [string]$RepositoryRoot, [string]$ProbeParent)
+# Усі сценарії в ОДНОМУ дочірньому процесі (раніше: процес на сценарій).
+# Ізоляція сценарію: власний дочірній scope (& { }), власні ProbeRoot,
+# runtime.ps1 і result.json, свіжий Import-Module -Force; глобальні змінні,
+# створені сценарієм, прибираються перед наступним. Згенерований runtime
+# виконується як окремий скрипт (exit завершує лише його, не процес), а
+# do/while($false) не дає випадковому break/continue обірвати решту.
+# Сценарій без result.json батьківська частина вважає ProbeError (fail-closed).
+$probeBaselineGlobals = @{}
+foreach ($probeGlobal in @(Get-Variable -Scope Global)) { $probeBaselineGlobals[$probeGlobal.Name] = $true }
+foreach ($probeScenarioName in @($Scenarios -split ',')) {
+    do {
+        try {
+            & {
 param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
 $ErrorActionPreference = 'Stop'
+# Канарки ізоляції: жодна не має бути видна з попереднього сценарію.
+$probeLeaks = @()
+if ($null -ne (Get-Variable -Name 'probeIsolationCanary' -ErrorAction SilentlyContinue)) { $probeLeaks += 'probeIsolationCanary' }
+if ($null -ne (Get-Variable -Name 'BRAVOOrchestrationProbeCanary' -Scope Global -ErrorAction SilentlyContinue)) { $probeLeaks += 'global:BRAVOOrchestrationProbeCanary' }
+$probeIsolationCanary = $Scenario
+$global:BRAVOOrchestrationProbeCanary = $Scenario
 $probeResultPath = Join-Path $ProbeRoot 'result.json'
 $probeUtf8 = New-Object Text.UTF8Encoding($false)
 try {
@@ -14906,7 +14933,21 @@ try {
 } catch {
     $probeResult = [pscustomobject]@{ ProbeError = [string]$_.Exception.Message }
 }
+$probeResult | Add-Member -NotePropertyName ProbeProcessId -NotePropertyValue $PID -Force
+$probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($probeLeaks) -Force
 [IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
+            } -Scenario $probeScenarioName -RepositoryRoot $RepositoryRoot -ProbeRoot (Join-Path $ProbeParent $probeScenarioName)
+        } catch {
+            # result.json не записано: батьківська частина дасть ProbeError.
+            $null = $_
+        }
+    } while ($false)
+    foreach ($probeGlobal in @(Get-Variable -Scope Global)) {
+        if (-not $probeBaselineGlobals.ContainsKey($probeGlobal.Name)) {
+            Remove-Variable -Name $probeGlobal.Name -Scope Global -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 '@
             $maintenanceOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
             [IO.File]::WriteAllText((Join-Path $maintenanceOrchestrationRoot 'stubs.ps1'), $maintenanceOrchestrationStubs, $maintenanceOrchestrationUtf8)
@@ -14915,12 +14956,16 @@ try {
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped', 'StartModeLatePendingAfterStopInitiallyStopped', 'PausedServicesPreserved', 'BravoPausedPreserved', 'StartModePausedHeld', 'PausedAfterSnapshot', 'LateStartBeforeTrace', 'PausedBeforeStop', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'InitiallyStartPendingFails', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck', 'StartModeLateBeforeBarrierInitiallyStopped', 'ExchangeApiUnreadableAtStop', 'PausePendingBeforeRestart', 'BravoPausePendingBeforeRestart', 'StartModeAllStoppedLateAfterMarker', 'AllStoppedExchangeApiUnreadable')) {
+            $maintenanceOrchestrationScenarios = @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped', 'StartModeLatePendingAfterStopInitiallyStopped', 'PausedServicesPreserved', 'BravoPausedPreserved', 'StartModePausedHeld', 'PausedAfterSnapshot', 'LateStartBeforeTrace', 'PausedBeforeStop', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'InitiallyStartPendingFails', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck', 'StartModeLateBeforeBarrierInitiallyStopped', 'ExchangeApiUnreadableAtStop', 'PausePendingBeforeRestart', 'BravoPausePendingBeforeRestart', 'StartModeAllStoppedLateAfterMarker', 'AllStoppedExchangeApiUnreadable')
+            foreach ($maintenanceOrchestrationScenario in $maintenanceOrchestrationScenarios) {
+                [void][IO.Directory]::CreateDirectory((Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario))
+            }
+            # Один дочірній процес на всі сценарії (ізоляція сценаріїв — у probe.ps1).
+            $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $maintenanceOrchestrationProbePath `
+                -Scenarios ($maintenanceOrchestrationScenarios -join ',') -RepositoryRoot $root -ProbeParent $maintenanceOrchestrationRoot
+            foreach ($maintenanceOrchestrationScenario in $maintenanceOrchestrationScenarios) {
                 $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
-                [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
-                $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
-                    -ExecutionPolicy Bypass -File $maintenanceOrchestrationProbePath `
-                    -Scenario $maintenanceOrchestrationScenario -RepositoryRoot $root -ProbeRoot $maintenanceOrchestrationScenarioRoot
                 $maintenanceOrchestrationResultPath = Join-Path $maintenanceOrchestrationScenarioRoot 'result.json'
                 $maintenanceOrchestrationResults[$maintenanceOrchestrationScenario] = if (Test-Path -LiteralPath $maintenanceOrchestrationResultPath -PathType Leaf) {
                     [IO.File]::ReadAllText($maintenanceOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -14928,6 +14973,25 @@ try {
                     [pscustomobject]@{ ProbeError = "проба не записала result.json (код виходу $LASTEXITCODE)" }
                 }
             }
+            # Усі сценарії пройшли в одному дочірньому процесі й ізольовано: кожен
+            # записав result.json з тим самим PID, і жоден не бачив канарок
+            # (локальної чи глобальної) попереднього сценарію.
+            $maintenanceOrchestrationProcessIds = @($maintenanceOrchestrationScenarios | ForEach-Object {
+                    $orchestrationProcessIdProperty = $maintenanceOrchestrationResults[$_].PSObject.Properties['ProbeProcessId']
+                    if ($null -ne $orchestrationProcessIdProperty) { [string]$orchestrationProcessIdProperty.Value }
+                } | Sort-Object -Unique)
+            $maintenanceOrchestrationLeaks = @($maintenanceOrchestrationScenarios | Where-Object {
+                    $orchestrationLeaksProperty = $maintenanceOrchestrationResults[$_].PSObject.Properties['ProbeLeaks']
+                    $null -eq $orchestrationLeaksProperty -or @($orchestrationLeaksProperty.Value).Count -gt 0
+                })
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceOrchestrationResults.Count -eq $maintenanceOrchestrationScenarios.Count -and
+                    $maintenanceOrchestrationProcessIds.Count -eq 1 -and
+                    $maintenanceOrchestrationLeaks.Count -eq 0
+                ) `
+                -Name "Maintenance/OrchestrationScenariosShareOneChildProcess" `
+                -Failure "Сценарії оркестрації мають виконатися в одному дочірньому процесі, кожен ізольовано й із власним result.json; PID: $($maintenanceOrchestrationProcessIds -join ', '); без результату або з витоком: $($maintenanceOrchestrationLeaks -join ', ')"
             $maintenanceOrchestrationStepPattern = '^STEP (\d+)/(\d+) (.+) (OK|SKIPPED|WARN|FAIL)$'
             $maintenanceOrchestrationEventIndex = {
                 param([object[]]$Events, [string]$Pattern)
@@ -19523,7 +19587,7 @@ try {
 
         # --- ArchiveHelpers: канонічна реєстрація fallback-у.
         $t006LogEntries = New-Object System.Collections.Generic.List[object]
-        $t006Logger = { param($Message, $Level) $t006LogEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006Logger = & { param($t006LogEntries) { param($Message, $Level) $t006LogEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006LogEntries
         $t006Collector = New-Object 'System.Collections.Generic.List[string]'
         $t006HelperResults = @()
         foreach ($t006ArchiveName in @('legacy_MODEL.7z', 'legacy_BLOG.7z', 'legacy_MODEL.7z')) {
@@ -19553,7 +19617,7 @@ try {
             -Failure "Текст попередження має існувати й не стверджувати, що такі архіви створені лише версіями до 5.2.0 (BOM-префікс давали й 5.2.x): $(@($t006FallbackWarnings | ForEach-Object { $_.Message }) -join ' | ')"
 
         $t006NormalEntries = New-Object System.Collections.Generic.List[object]
-        $t006NormalLogger = { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006NormalLogger = & { param($t006NormalEntries) { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006NormalEntries
         $t006NormalCollector = New-Object 'System.Collections.Generic.List[string]'
         $t006NormalResult = Test-SevenZipArchiveIntegrity `
             -SevenZipPath 'stub-7za' `
@@ -19574,7 +19638,7 @@ try {
         # реєстратор над результатом Invoke-BRAVOSevenZipExtraction.
         $t006ExtractionCollector = New-Object 'System.Collections.Generic.List[string]'
         $t006ExtractionEntries = New-Object System.Collections.Generic.List[object]
-        $t006ExtractionLogger = { param($Message, $Level) $t006ExtractionEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006ExtractionLogger = & { param($t006ExtractionEntries) { param($Message, $Level) $t006ExtractionEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006ExtractionEntries
         $t006LegacyExtraction = Invoke-BRAVOSevenZipExtraction `
             -SevenZipPath 'stub-7za' `
             -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'legacy_BAZA.7z') `
