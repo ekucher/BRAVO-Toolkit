@@ -4076,40 +4076,51 @@ function Get-ManagedServiceHealthIssues {
         }
     }
 
-    $startModeByName = @{}
+    # Один WMI-запит на всі служби: рядок Win32_Service передається в
+    # класифікацію як fallback типу запуску (і ExitCode), власних запитів
+    # Get-BRAVOManagedServiceCondition тут не робить.
+    $serviceInfoByName = @{}
     try {
         foreach ($serviceInfo in @(Get-BRAVOWmiInstance -ClassName Win32_Service)) {
-            $startModeByName[[string]$serviceInfo.Name] = [string]$serviceInfo.StartMode
+            $serviceInfoByName[[string]$serviceInfo.Name] = $serviceInfo
         }
     } catch {
         Write-HealthLog "Не вдалося прочитати типи запуску служб: $($_.Exception.Message)" -Level "WARNING"
     }
+    $quiescenceState = $null
+    try { $quiescenceState = Read-BRAVOServiceQuiescenceState } catch { $quiescenceState = $null }
 
     $issues = @()
     foreach ($service in @($services)) {
-        # StartType з'явилась лише в .NET 4.6.1; під StrictMode 2.0 пряме
-        # звернення до відсутньої властивості кидає виняток замість $null, і
-        # WMI-fallback нижче ніколи не виконувався б.
-        $startTypeProperty = $service.PSObject.Properties['StartType']
-        $startMode = if ($startTypeProperty) { [string]$startTypeProperty.Value } else { '' }
-        if ([string]::IsNullOrWhiteSpace($startMode) -and
-            $startModeByName.ContainsKey([string]$service.Name)) {
-            $startMode = [string]$startModeByName[[string]$service.Name]
-        }
-        if ($startMode -ieq "Disabled") {
+        # Класифікація — єдина реалізація FR-1 #314 (BRAVO.System). StartType
+        # читається через PSObject.Properties (.NET < 4.6.1 його не має),
+        # WMI StartMode — fallback.
+        $serviceInfo = if ($serviceInfoByName.ContainsKey([string]$service.Name)) { $serviceInfoByName[[string]$service.Name] } else { $null }
+        $serviceCondition = Get-BRAVOManagedServiceCondition `
+            -Name ([string]$service.Name) `
+            -Service $service `
+            -ServiceInfo $serviceInfo `
+            -QuiescenceState $quiescenceState `
+            -NoWmiQuery
+        if ($serviceCondition.Condition -eq 'Disabled') {
             Write-HealthLog "Перевірку служби $($service.Name) пропущено: тип запуску Disabled" -Level "INFO"
             continue
         }
-
-        $service.Refresh()
-        if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) {
+        if ($serviceCondition.HeldByBravo) {
+            # #297: Disabled тимчасовий (знімок типу в маркері), не рішення
+            # оператора. Issue не додається, як і раніше: осиротілий маркер
+            # відпрацьовує watchdog вище.
+            Write-HealthLog "Перевірку служби $($service.Name) пропущено: тип запуску тимчасово Disabled на час відновлення $($serviceCondition.MarkerOwner) (початковий $($serviceCondition.OriginalStartMode))" -Level "INFO"
+            continue
+        }
+        if ($serviceCondition.Condition -eq 'Running') {
             Write-HealthLog "Служба $($service.Name) працює" -Level "SUCCESS"
             continue
         }
         $issues += [pscustomobject]@{
             Kind = "Service"
             Component = "Служба $($service.Name)"
-            Reason = "не запущена (стан: $($service.Status))"
+            Reason = "не запущена (стан: $($serviceCondition.Status))"
             FileName = ""
             LastWriteTime = $null
             Location = [string]$service.Name

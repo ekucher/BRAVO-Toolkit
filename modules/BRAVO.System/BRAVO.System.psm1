@@ -762,6 +762,148 @@ function Get-BRAVOServiceStartMode {
     return (& $makeResult 'Unknown' 'None')
 }
 
+function Get-BRAVOManagedServiceCondition {
+    # Єдина класифікація стану керованої служби BRAVO (#314, FR-1). Лише
+    # читає, нічого не змінює. Condition:
+    #   NotInstalled - службу не знайдено;
+    #   Disabled     - тип запуску Disabled, виставлений НЕ BRAVO (рішення
+    #                  оператора: «навмисно вимкнено»); має пріоритет над
+    #                  станом служби;
+    #   OwnedByBravo - службою зараз розпоряджається BRAVO: вона в чинному
+    #                  ownership-маркері (зупинена Maintenance/DataRestore)
+    #                  або тимчасово переведена в Disabled зі знімком типу в
+    #                  маркері (#297/#329, HeldByBravo = $true). Такий
+    #                  Disabled НЕ є рішенням оператора: інакше осиротілий
+    #                  знімок після аварії назавжди «вимкнув» би службу;
+    #   Running      - працює;
+    #   Pending      - StartPending/StopPending/ContinuePending/PausePending;
+    #   Failed       - не працює, не Disabled і не під маркером. Automatic чи
+    #                  Manual на рішення не впливає (рішення власника #314).
+    # Маркер мертвого власника теж дає OwnedByBravo: його відпрацьовує
+    # Health-watchdog, а не загальна логіка «впалої» служби.
+    #
+    # Тестові шви / економія запитів для викликача, що перевіряє кілька служб:
+    #   -Service         - уже знайдений службовий об'єкт (BravoWeb
+    #                      резолвиться і за DisplayName);
+    #   -ServiceInfo     - рядок Win32_Service, уже прочитаний викликачем
+    #                      (StartMode як fallback, ExitCode);
+    #   -QuiescenceState - уже прочитаний маркер (явний $null = маркера
+    #                      немає);
+    #   -NoWmiQuery      - не робити власного WMI-запиту.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()][object]$Service,
+        [AllowNull()][object]$ServiceInfo,
+        [AllowNull()][object]$QuiescenceState,
+        [switch]$NoWmiQuery
+    )
+
+    $result = [pscustomobject]@{
+        Name = $Name
+        Exists = $false
+        StartMode = $null
+        StartModeSource = $null
+        Status = $null
+        ExitCode = $null
+        ServiceSpecificExitCode = $null
+        Condition = 'NotInstalled'
+        HeldByBravo = $false
+        OriginalStartMode = $null
+        MarkerOwner = $null
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('Service')) {
+        $Service = @(Get-Service -Name $Name -ErrorAction SilentlyContinue) | Select-Object -First 1
+    }
+    if ($null -eq $Service) { return $result }
+
+    $nameProperty = $Service.PSObject.Properties['Name']
+    if ($null -ne $nameProperty -and -not [string]::IsNullOrWhiteSpace([string]$nameProperty.Value)) {
+        $result.Name = [string]$nameProperty.Value
+    }
+    if ($null -ne $Service.PSObject.Methods['Refresh']) {
+        # Refresh кидає виняток, коли службу вже видалено з SCM.
+        try { $Service.Refresh() } catch { return $result }
+    }
+    $result.Exists = $true
+    $result.Status = [string]$Service.Status
+
+    if (-not $PSBoundParameters.ContainsKey('ServiceInfo')) {
+        $ServiceInfo = $null
+        if (-not $NoWmiQuery -and $null -ne (Get-Command -Name 'Get-BRAVOWmiInstance' -ErrorAction SilentlyContinue)) {
+            try {
+                $escapedName = $result.Name.Replace("'", "''")
+                $ServiceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
+                    Select-Object -First 1
+            } catch {
+                $ServiceInfo = $null
+            }
+        }
+    }
+    $fallbackStartMode = $null
+    if ($null -ne $ServiceInfo) {
+        foreach ($infoPropertyName in @('StartMode', 'ExitCode', 'ServiceSpecificExitCode')) {
+            $infoProperty = $ServiceInfo.PSObject.Properties[$infoPropertyName]
+            if ($null -eq $infoProperty -or $null -eq $infoProperty.Value) { continue }
+            switch ($infoPropertyName) {
+                'StartMode' { $fallbackStartMode = [string]$infoProperty.Value }
+                'ExitCode' { $result.ExitCode = $infoProperty.Value -as [long] }
+                'ServiceSpecificExitCode' { $result.ServiceSpecificExitCode = $infoProperty.Value -as [long] }
+            }
+        }
+    }
+    # WMI тут уже прочитано (або свідомо пропущено) — другого запиту немає.
+    $startModeResult = Get-BRAVOServiceStartMode -Service $Service -FallbackStartMode $fallbackStartMode -NoWmiQuery
+    $result.StartMode = [string]$startModeResult.StartMode
+    $result.StartModeSource = [string]$startModeResult.Source
+
+    if (-not $PSBoundParameters.ContainsKey('QuiescenceState')) {
+        try { $QuiescenceState = Read-BRAVOServiceQuiescenceState } catch { $QuiescenceState = $null }
+    }
+    $markedForRestart = $false
+    $heldSnapshotEntry = $null
+    if ($null -ne $QuiescenceState) {
+        $markerServicesProperty = $QuiescenceState.PSObject.Properties['services']
+        if ($null -ne $markerServicesProperty) {
+            $markedForRestart = @(@($markerServicesProperty.Value) | Where-Object {
+                    $null -ne $_ -and [string]$_.Name -ieq $result.Name
+                }).Count -gt 0
+        }
+        $markerSnapshotProperty = $QuiescenceState.PSObject.Properties['startTypeSnapshot']
+        if ($null -ne $markerSnapshotProperty) {
+            $heldSnapshotEntry = @(@($markerSnapshotProperty.Value) | Where-Object {
+                    $null -ne $_ -and [string]$_.Name -ieq $result.Name
+                }) | Select-Object -First 1
+        }
+        if ($markedForRestart -or $null -ne $heldSnapshotEntry) {
+            $ownerProperty = $QuiescenceState.PSObject.Properties['owner']
+            if ($null -ne $ownerProperty) { $result.MarkerOwner = [string]$ownerProperty.Value }
+        }
+    }
+
+    if ($result.StartMode -eq 'Disabled') {
+        if ($null -ne $heldSnapshotEntry) {
+            $result.Condition = 'OwnedByBravo'
+            $result.HeldByBravo = $true
+            $result.OriginalStartMode = [string]$heldSnapshotEntry.StartMode
+        } else {
+            $result.Condition = 'Disabled'
+        }
+        return $result
+    }
+    if ($result.Status -eq 'Running') {
+        $result.Condition = 'Running'
+    } elseif ($result.Status -in @('StartPending', 'StopPending', 'ContinuePending', 'PausePending')) {
+        $result.Condition = 'Pending'
+    } elseif ($markedForRestart) {
+        $result.Condition = 'OwnedByBravo'
+    } else {
+        $result.Condition = 'Failed'
+    }
+    return $result
+}
+
 function Set-BRAVOBootRestoreServiceStartType {
     # Канонічне (єдине в комплекті) місце, де BRAVO змінює start type
     # служб Windows. Використовується ЛИШЕ інсталятором Планувальника для

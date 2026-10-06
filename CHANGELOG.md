@@ -2,6 +2,18 @@
 
 ## Не випущено (developer)
 
+- **Нове: єдина класифікація стану керованих служб `Get-BRAVOManagedServiceCondition` (#314, хвиля 1).**
+  Функція в `BRAVO.System` лише читає стан служби й повертає `Condition`: `Running`, `NotInstalled`,
+  `Disabled`, `OwnedByBravo`, `Failed` або `Pending`, а також тип запуску, `ExitCode` і
+  `ServiceSpecificExitCode`. Тип запуску береться з канонічного `Get-BRAVOServiceStartMode` (#319),
+  Automatic і Manual класифікуються однаково. `Disabled`, виставлений самим BRAVO на час реставрації
+  (знімок типу в ownership-маркері, #297/#329), — це `OwnedByBravo` з `HeldByBravo`, а не «навмисно
+  вимкнено». Health (`Get-ManagedServiceHealthIssues`) перейшов на неї без зміни набору й текстів
+  проблем; змінився лише INFO-рядок журналу для служби, яку BRAVO тимчасово утримує в `Disabled`.
+  Служби поки нічого не запускає: автоматичне відновлення — наступні хвилі #314. Тести:
+  `ServiceRecovery/Condition*` і `Health/ManagedServiceIssuesUnchangedUnderQuiescenceMarker`,
+  `Health/ManagedServiceUsesCanonicalCondition` у suite `ServiceQuiescence`.
+
 - **Fix: self-test: closure-и більше не гублять пізні змінні у великій області self-test (P2-selftest-scope).**
   `BRAVO_SELF_TEST.ps1` піднімає `$MaximumVariableCount` своєї області до 8192 (#163), а динамічний модуль,
   який створює `.GetNewClosure()`, лишається з глобальним лімітом (типово 4096) і мовчки обрізає копію
