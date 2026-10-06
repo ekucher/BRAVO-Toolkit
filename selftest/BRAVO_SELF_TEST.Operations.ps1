@@ -1085,16 +1085,15 @@
     }
 
     $noIdDeadLetterDir = & $deadLetterDirFn
-    $noIdDeadLetterReasons = @(
-        Get-ChildItem -LiteralPath $noIdDeadLetterDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                $deadLetterItem = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json
-                if ($null -ne $deadLetterItem.PSObject.Properties['DeadLetterReason']) { [string]$deadLetterItem.DeadLetterReason }
-            }
-    )
+    $noIdDeadLetterReasons = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($deadLetterFile in @(Get-ChildItem -LiteralPath $noIdDeadLetterDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        $deadLetterItem = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($deadLetterFile.FullName))
+        if ($null -ne $deadLetterItem.PSObject.Properties['DeadLetterReason']) { $noIdDeadLetterReasons.Add([string]$deadLetterItem.DeadLetterReason) }
+    }
     $noIdRemainsInOutbox = Test-Path -LiteralPath $noIdItemPath -PathType Leaf
     $noIdGoodRemainsInOutbox = Test-Path -LiteralPath (Join-Path $noIdOutboxDir "$noIdGoodEventId.json") -PathType Leaf
-    $noIdHttpCallCount = @($global:BRAVOOpsSelfTestHttpCalls).Count
+    # List[object]: лише .Count напряму; обгортка масивом кидає ArgumentException у PS 5.1.
+    $noIdHttpCallCount = $global:BRAVOOpsSelfTestHttpCalls.Count
 
     Test-BRAVOCondition -Condition (
         $null -eq $noIdDrainThrew -and
