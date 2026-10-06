@@ -14,6 +14,16 @@
   `ServiceRecovery/Condition*` і `Health/ManagedServiceIssuesUnchangedUnderQuiescenceMarker`,
   `Health/ManagedServiceUsesCanonicalCondition` у suite `ServiceQuiescence`.
 
+- **Change: прибрано нагадування про застарілі оновлення Windows.**
+  BRAVO_HEALTH у кожному прогоні писав WARNING «Останнє оновлення Windows встановлено … дн. тому»
+  (або «Не вдалося визначити дату останнього оновлення Windows»), якщо останній hotfix старший за
+  120 днів. Нагадування не впливало на результат і код завершення, але повторювалось щоразу в консолі
+  та журналі Health. Виклик прибрано з Health, а функцію `Get-BRAVOWindowsPatchLevelRecommendation` —
+  з модуля `BRAVO.Compatibility`. Перевірки платформи (ОС, build, рівень підтримки ОС, PowerShell,
+  .NET) і нагадування про застарілий PowerShell лишились без змін. Перевірку
+  `Compatibility/WindowsPatchLevelRecommendation` видалено, `Runtime/WindowsPatchLevelOnlyInHealth`
+  замінено на `Runtime/NoWindowsPatchLevelReminder`.
+
 - **Perf: сценарії оркестрації Maintenance і DataRestore у self-test виконуються в одному дочірньому процесі.**
   `Maintenance/OrchestrationRunsStepsInContractOrder` (47 сценаріїв) і
   `DataRestore/OrchestrationInPlaceRunsPhasesInContractOrder` (30 сценаріїв) раніше запускали окремий

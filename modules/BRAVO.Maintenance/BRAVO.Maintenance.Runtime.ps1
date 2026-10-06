@@ -90,9 +90,8 @@ Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
 $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-# Свіжість накопичувальних оновлень Windows тут навмисно НЕ перевіряється:
-# це health-метрика, а не умова виконання обслуговування. Її місце в
-# BRAVO_HEALTH, який для цього й існує. Тут вона лише додавала WARNING (а
+# Свіжість накопичувальних оновлень Windows Toolkit не перевіряє ніде
+# (ні тут, ні в BRAVO_HEALTH). Тут вона лише додавала WARNING (а
 # отже, ненульовий код завершення 10) до операції, на результат якої вік
 # патчів не впливає. Перевірки платформи (ОС, build, PowerShell, .NET,
 # архітектура, API) лишаються вище й на місці.

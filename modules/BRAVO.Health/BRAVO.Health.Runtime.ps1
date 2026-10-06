@@ -457,7 +457,6 @@ Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
 $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-$script:BRAVOWindowsPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation
 $notificationHelpersPath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Notifications\BRAVO.Notifications.psd1'
 if (-not (Test-Path -LiteralPath $notificationHelpersPath -PathType Leaf)) {
     throw "Не знайдено PowerShell-модуль notifications: $notificationHelpersPath"
@@ -5323,9 +5322,6 @@ if (-not [string]::IsNullOrWhiteSpace([string]$script:healthComponentScopeError)
 }
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
     Write-HealthLog $BRAVOPowerShellUpdate.Message -Level "WARNING" -Environmental
-}
-if ($BRAVOWindowsPatchLevel.IsUpdateRecommended) {
-    Write-HealthLog $BRAVOWindowsPatchLevel.Message -Level "WARNING" -Environmental
 }
 $script:BRAVOOSSupportTier = Get-BRAVOOSSupportTier
 Write-HealthLog "Підтримка ОС: $($script:BRAVOOSSupportTier.Tier) — Windows $($script:BRAVOOSSupportTier.OperatingSystem) ($($script:BRAVOOSSupportTier.OperatingSystemVersion), build $($script:BRAVOOSSupportTier.Build)); PowerShell $($script:BRAVOOSSupportTier.PowerShellVersion); .NET release $($script:BRAVOOSSupportTier.DotNetRelease)"
