@@ -13057,6 +13057,35 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Failure "новий from-scratch ACL-патерн (DirectorySecurity/FileSecurity + Set-Acl) не застосувався коректно на диску: $aclProbeFailure"
     } finally {
         if (Test-Path -LiteralPath $aclProbeRoot -PathType Container) {
+            # B-4 D2: DACL probe-а не дає поточному користувачеві права DELETE,
+            # тож у неелевованому прогоні видалення падало ("Access ... denied")
+            # і лишало BRAVO_ACL_PROBE_* у %TEMP%. Власник об'єкта завжди має
+            # WRITE_DAC, тому спершу повертаємо поточному SID FullControl на
+            # каталог і файли, а вже потім видаляємо. Перевірку ACL-патерну
+            # вище це не послаблює: вона завершилась до finally.
+            $aclCleanupSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $aclCleanupDirectory = New-Object Security.AccessControl.DirectorySecurity
+            $aclCleanupDirectory.SetAccessRuleProtection($true, $false)
+            $aclCleanupDirectory.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                $aclCleanupSid,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                ([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow
+            )))
+            Set-Acl -LiteralPath $aclProbeRoot -AclObject $aclCleanupDirectory -ErrorAction Stop
+            foreach ($aclCleanupFile in @([IO.Directory]::GetFiles($aclProbeRoot))) {
+                $aclCleanupFileSecurity = New-Object Security.AccessControl.FileSecurity
+                $aclCleanupFileSecurity.SetAccessRuleProtection($true, $false)
+                $aclCleanupFileSecurity.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                    $aclCleanupSid,
+                    [Security.AccessControl.FileSystemRights]::FullControl,
+                    [Security.AccessControl.InheritanceFlags]::None,
+                    [Security.AccessControl.PropagationFlags]::None,
+                    [Security.AccessControl.AccessControlType]::Allow
+                )))
+                Set-Acl -LiteralPath $aclCleanupFile -AclObject $aclCleanupFileSecurity -ErrorAction Stop
+            }
             [IO.Directory]::Delete($aclProbeRoot, $true)
         }
     }
@@ -32081,7 +32110,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
             $arRequest = New-BRAVOAffectedChildRequest -RepositoryRoot $arQuirkRoot -Suite @('Governance', 'Paths')
             $arExpectedScript = Join-Path ([IO.Path]::GetFullPath($arQuirkRoot)) 'BRAVO_SELF_TEST.ps1'
             $arExpectedQuoted = "'" + $arExpectedScript.Replace("'", "''").Replace([string][char]0x2019, ([string][char]0x2019 + [char]0x2019)) + "'"
-            $arExpectedBody = '& ' + $arExpectedQuoted + " -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE"
+            $arExpectedBody = 'try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding -ArgumentList $false } catch { $null = $_ }; & ' + $arExpectedQuoted + " -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE"
             $arDecoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([string]$arRequest.EncodedCommand))
             $arArgumentOk = (
                 [string]::Join(' ', @($arRequest.Argument)) -ceq ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [string]$arRequest.EncodedCommand) -and
@@ -32102,7 +32131,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
                         (-not [string]::IsNullOrEmpty($arSystemRoot) -and [string]$arRequest.FilePath -ceq (Join-Path $arSystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')))
                 ) `
                 -Name "Framework/AffectedRunner.EncodedCommandRoundTrip" `
-                -Failure ("R12: EncodedCommand (base64 UTF-16LE) декодується в `"& '<шлях>' -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE`" (апостроф і типографський апостроф у шляху подвоєно); аргументи -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand без -File; порожній чи небезпечний Suite і керувальні символи в шляху відхиляються. Декодовано: [$arDecoded]; очікувано: [$arExpectedBody]")
+                -Failure ("R12: EncodedCommand (base64 UTF-16LE) декодується в `"try { [Console]::OutputEncoding = UTF-8 без BOM } catch { ... }; & '<шлях>' -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE`" (апостроф і типографський апостроф у шляху подвоєно); аргументи -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand без -File; порожній чи небезпечний Suite і керувальні символи в шляху відхиляються. Декодовано: [$arDecoded]; очікувано: [$arExpectedBody]")
         } finally {
             Remove-Item -LiteralPath $arRoot -Recurse -Force -ErrorAction SilentlyContinue
         }

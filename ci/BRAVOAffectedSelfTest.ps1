@@ -42,6 +42,7 @@ function New-BRAVOAffectedChildRequest {
 
         Команда: powershell.exe -NoLogo -NoProfile -NonInteractive
         -ExecutionPolicy <Bypass> -EncodedCommand <base64 UTF-16LE>, а тіло -
+        try { [Console]::OutputEncoding = UTF-8 без BOM } catch { ... };
         & '<корінь>\BRAVO_SELF_TEST.ps1' -NoPause -Suite @('A','B'); exit $LASTEXITCODE
 
         Чому EncodedCommand, а не -File: у -File кома в списку suite
@@ -81,7 +82,15 @@ function New-BRAVOAffectedChildRequest {
         $quotedPath = $quotedPath.Replace($quoteText, $quoteText + $quoteText)
     }
     $suiteList = [string]::Join(',', @($suiteName | ForEach-Object { "'" + $_ + "'" }))
-    $commandBody = "& '" + $quotedPath + "' -NoPause -Suite @(" + $suiteList + "); exit `$LASTEXITCODE"
+    # Дочірня консоль (CreateNoWindow) отримує OEM-сторінку, у якій немає
+    # частини кирилиці (і, ґ), BOM і U+2028; тому дочірній процес перемикає
+    # свій вивід на UTF-8 без BOM, а батько декодує потоки як UTF-8
+    # (Invoke-BRAVOAffectedChildProcess). Обидва потоки перенаправлено,
+    # тож WriteConsole не використовується і обмеження cp65001 на консолях
+    # Windows до 10 (див. Test-BRAVOConsoleCodePageChangeSafe) тут не діє.
+    # Якщо перемкнути не вдалося, вердикт не змінюється: маркер - ASCII.
+    $encodingPrefix = 'try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding -ArgumentList $false } catch { $null = $_ }; '
+    $commandBody = $encodingPrefix + "& '" + $quotedPath + "' -NoPause -Suite @(" + $suiteList + "); exit `$LASTEXITCODE"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($commandBody))
 
     $systemRoot = [string]$env:SystemRoot
@@ -133,15 +142,9 @@ function Invoke-BRAVOAffectedChildProcess {
         return $outcome
     }
 
-    $encoding = $null
-    try {
-        $encoding = [Console]::OutputEncoding
-    } catch {
-        $encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
-    }
-    if ($null -eq $encoding) {
-        $encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
-    }
+    # Дочірній процес пише UTF-8 без BOM (див. New-BRAVOAffectedChildRequest);
+    # кодування консолі батька тут не має значення.
+    $encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $filePath
     $startInfo.Arguments = [string]::Join(' ', [string[]]@($Request.Argument))
