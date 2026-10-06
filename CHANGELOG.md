@@ -17,6 +17,15 @@
   в orchestration-пробі, `Archive/CompatibilityExitsWriteStatusBeforeExit` (AST) і
   `Status/CallSiteAfterExitCode[ArchiveTail]`; контракт `Status/CallSiteIsFailSoft[Archive]` тепер
   перевіряє helper.
+- **Fix: DataRestore: пропущені під час автовибору generation manifest-и тепер дають WARNING (#294).**
+  Будь-який manifest, пропущений fail-closed під час автовибору (нечитабельний або не проходить перевірку
+  ідентичності), як і раніше не використовується, але тепер кожен такий пропуск рахується як попередження: код
+  завершення 10 замість 0, короткий рядок у фінальному сповіщенні WARNING (повний текст у журналі). Це
+  стосується й старих пошкоджених manifest-ів, як і в контракті BRAVO_RESTORE_TEST. Для Source=SFTP
+  `Invoke-BRAVODataRestoreSftpManifestFetch` повертає `SkippedManifests` у тому ж форматі, що canonical
+  `Get-BRAVORestoreGenerationManifest`. Явний `-GenerationId` не змінено. Тести:
+  `DataRestore/SftpManifestAutomaticSelectionReportsSkipped*`, matrix combo
+  `OutOfPlace-MODEL-CorruptNewestManifestSkippedWithWarning`.
 - **Fix: Health: порушення цілісності інструментів дає алерт і при вимкненому SFTP (#296).**
   Блокуючий результат перевірки `TOOLS_MANIFEST.json` (`ShouldBlock`, режим Enforce) раніше ставав Health
   issue лише всередині SFTP-перевірки. На сервері з вимкненим SFTP або при зайнятому WinSCP (перевірку

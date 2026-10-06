@@ -526,6 +526,24 @@ function Get-BRAVODataRestoreMatrixComboDefinitions {
         SentinelPath = (Join-Path $OutOfPlaceRoot 'OOP_FreeSpace\MODEL\CANARY.txt')
     })
 
+    # #294: найновіший manifest пошкоджений (обрізаний JSON), а старіша
+    # COMPLETE generation ціла. Автоматичний вибір має fail-closed пропустити
+    # пошкоджений manifest і відновити найновішу цілу generation, але
+    # пропуск не може бути мовчазним: код 10 (успіх з попередженнями), а
+    # не 0. Пошкоджений manifest кладе драйвер перед прогоном цієї
+    # комбінації і прибирає після неї (CorruptNewestManifestPath).
+    $combos.Add([pscustomobject]@{
+        Name = 'OutOfPlace-MODEL-CorruptNewestManifestSkippedWithWarning'
+        ConfigPath = $FixtureConfig.ConfigPath
+        Arguments = @{ Component = 'MODEL'; Mode = 'OutOfPlace'; TargetPath = (Join-Path $OutOfPlaceRoot 'OOP_CorruptNewest'); Source = 'Local'; Force = $true; NoPause = $true }
+        FailpointComponent = $null
+        ExpectedExitCode = 10
+        AssertionKind = 'OutOfPlaceSuccess'
+        AssertionComponent = 'MODEL'
+        ExpectedCanary = $NewerGenerationId
+        CorruptNewestManifestPath = (Join-Path (Get-BRAVOBackupManifestRoot -BackupRoot ([string]$FixtureConfig.BackupRoot)) 'BRAVO_BACKUP_29991231_235959.json')
+    })
+
     return $combos.ToArray()
 }
 

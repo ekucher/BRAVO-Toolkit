@@ -138,6 +138,15 @@ try {
                     Select-Object -ExpandProperty Name
             )
         }
+        # #294: комбінація з пошкодженим найновішим manifest-ом. Файл
+        # створюється лише на час цієї комбінації, щоб не змінити вибір
+        # generation для решти матриці.
+        $corruptManifestPath = $null
+        if (@($combo.PSObject.Properties.Match('CorruptNewestManifestPath')).Count -gt 0 -and
+            -not [string]::IsNullOrWhiteSpace([string]$combo.CorruptNewestManifestPath)) {
+            $corruptManifestPath = [string]$combo.CorruptNewestManifestPath
+            [IO.File]::WriteAllText($corruptManifestPath, '{"generationId": "29991231_235959", "status": "COMP')
+        }
         $comboResult = Invoke-BRAVODataRestoreMatrixCombo `
             -RepoRoot $PSScriptRoot `
             -ConfigPath ([string]$combo.ConfigPath) `
@@ -148,6 +157,9 @@ try {
             -ComboName $combo.Name `
             -ProgramDataRoot $fixtureConfig.ProgramDataRoot `
             -DiscoverySettingsOverridePath $fixtureConfig.DiscoverySettingsOverridePath
+        if ($null -ne $corruptManifestPath) {
+            Remove-Item -LiteralPath $corruptManifestPath -Force -ErrorAction Stop
+        }
         $assertion = Assert-BRAVODataRestoreMatrixComboResult `
             -Combo $combo `
             -Result $comboResult `
