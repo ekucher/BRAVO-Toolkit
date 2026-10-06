@@ -7400,7 +7400,10 @@ function Send-FinalReport {
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
     }
-    elseif ($script:criticalErrorOccurred -eq $true) {
+    # Get-Variable замість прямого читання: під StrictMode Send-FinalReport
+    # може викликатися там, де criticalErrorOccurred ще не ініціалізовано
+    # (ізольований виклик у self-test); тоді гілка просто не спрацьовує.
+    elseif ((Get-Variable -Name criticalErrorOccurred -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq $true) {
         # #298: багато місць лише ставлять criticalErrorOccurred (-> exit 60)
         # і не додають запис у CriticalErrorsList. Без цієї гілки errors_only
         # мовчки повертався б. Окрема причина алерту: узагальнене CRITICAL
