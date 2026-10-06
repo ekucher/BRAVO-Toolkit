@@ -31670,7 +31670,12 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
         }
         $arSelfTestLine = {
             param($Result)
-            return @(@($Result.Line) | Where-Object { [regex]::IsMatch([string]$_, '(?i)^\s*SELF-TEST') })
+            # Фізичні рядки: елемент Line із вбудованим переводом рядка теж може сховати маркер на початку рядка.
+            $physicalLines = New-Object System.Collections.Generic.List[string]
+            foreach ($resultLine in @($Result.Line)) {
+                foreach ($physicalLine in [regex]::Split([string]$resultLine, '\r\n|\n|\r')) { [void]$physicalLines.Add($physicalLine) }
+            }
+            return @($physicalLines.ToArray() | Where-Object { [regex]::IsMatch($_, '(?i)^\s*SELF-TEST') })
         }
 
         $arRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_AFFECTEDRUNNER_' + [guid]::NewGuid().ToString('N'))
@@ -32035,14 +32040,15 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
             $arPassedWords = 0
             foreach ($arEach in $arAll) {
                 $arSelfTestLines += @(& $arSelfTestLine $arEach).Count
-                $arPassedWords += @(@($arEach.Line) | Where-Object { ([string]$_).Contains('SELF-TEST PASSED') }).Count
+                $arSelfTestLines += @(@($arEach.Line) | Where-Object { [regex]::IsMatch([string]$_, '[\r\n]') }).Count
+                $arPassedWords += @(@($arEach.Line) | Where-Object { ([string]$_).Contains('SELF-TEST PASSED') -and -not ([string]$_).StartsWith('AFFECTED UNKNOWN PATH: ', [StringComparison]::Ordinal) }).Count
                 & $arCheck ('acceptance ' + $arEach.ResultCode) ($arEach.IsAcceptanceEvidence -eq $false -and ($arEach.ExitCode -eq 0 -or $arEach.ExitCode -eq 1))
             }
             $arAcceptanceProblem = & $arTake
             Test-BRAVOCondition `
                 -Condition ($arAll.Count -ge 30 -and $arSelfTestLines -eq 0 -and $arPassedWords -eq 0 -and $arAcceptanceProblem.Length -eq 0) `
                 -Name "Framework/AffectedRunner.NeverPrintsSelfTestLinesDynamic" `
-                -Failure "R10: у жодному зі сценаріїв (всього $($arAll.Count)) рядок stdout runner-а не починається з маркера Self-Test і не містить маркера повного прогону; IsAcceptanceEvidence завжди `$false, код лише 0 або 1; рядків із маркером: $arSelfTestLines; $arAcceptanceProblem"
+                -Failure "R10: у жодному зі сценаріїв (всього $($arAll.Count)) рядок stdout runner-а не починається з маркера Self-Test і не містить маркера повного прогону (крім екранованого шляху в AFFECTED UNKNOWN PATH); IsAcceptanceEvidence завжди `$false, код лише 0 або 1; рядків із маркером: $arSelfTestLines; $arAcceptanceProblem"
 
             # R11 [C]: порожній -Suite не будується; кодована команда містить лише непорожній -Suite @('..').
             $arBodyOk = $true
