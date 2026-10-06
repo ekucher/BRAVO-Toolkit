@@ -655,6 +655,11 @@ function Get-BRAVOVSSOwnershipStatePath { return $script:ProbeVssStatePath }
 function Remove-BRAVOOwnedOrphanVSSResources {
     param([string]$StatePath)
     Add-ProbeEvent 'VSS-ORPHAN-CHECK'
+    if ($script:ProbeScenario -eq 'OrphanVssFails') {
+        # #291: штатна відмова справжньої функції — орфанний знімок BRAVO не
+        # вдалося видалити, тому архівацію заблоковано (exit 40).
+        return [pscustomobject]@{ Success = $false; Found = $true; Deleted = 0; Error = 'self-test: не вдалося видалити orphan VSS' }
+    }
     return [pscustomobject]@{ Success = $true; Found = $false; Deleted = 0; Error = $null }
 }
 function Get-BRAVOArchiveFreeSpaceResult {
@@ -667,7 +672,15 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
 }
 function Resolve-BRAVOArchiveSpaceDecision {
     param($EnabledArchives, $EstimatedResult, $MinimumFreeSpaceGB, $ExcludedDrives)
+    if ($script:ProbeScenario -eq 'FreeSpaceFails') {
+        # #291: preflight вільного місця провалено (exit 40).
+        return [pscustomobject]@{ Success = $false; Results = @(); Warnings = @(); Problems = @('self-test: недостатньо вільного місця') }
+    }
     return [pscustomobject]@{ Success = $true; Results = @(); Warnings = @(); Problems = @() }
+}
+function Send-BRAVOArchiveFreeSpaceAlert {
+    param($Result, $MinimumFreeSpaceGB)
+    Add-ProbeEvent 'FREE-SPACE-ALERT'
 }
 function Write-BRAVODiskSpaceDecisionLog { param($Results, $Logger) }
 function Get-BRAVOFiles { param($Path, $Filter) return @() }
@@ -945,7 +958,7 @@ try {
         [IO.File]::WriteAllText($archiveOrchestrationProbePath, $archiveOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
         $archiveOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         $archiveOrchestrationResults = @{}
-        foreach ($archiveOrchestrationScenario in @('Happy', 'ComponentThrows', 'UnhandledThrow', 'LockBusy')) {
+        foreach ($archiveOrchestrationScenario in @('Happy', 'ComponentThrows', 'UnhandledThrow', 'LockBusy', 'FreeSpaceFails', 'OrphanVssFails')) {
             $archiveOrchestrationScenarioRoot = Join-Path $archiveOrchestrationRoot $archiveOrchestrationScenario
             [void][IO.Directory]::CreateDirectory($archiveOrchestrationScenarioRoot)
             # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
@@ -1120,9 +1133,131 @@ try {
             ) `
             -Name 'Archive/OrchestrationLockWaitTimeoutEndsWithSkippedLockBusy' `
             -Failure "вичерпане очікування операційного lock має завершити Main штатно кодом 20 (SkippedLockBusy) у процесі й Operations-події (WARNING), з ERROR у журналі, без жодної фази під lock і без звільнення незахопленого lock; задача звичайного запуску — Backup; проба: $($archiveLockBusy | ConvertTo-Json -Compress -Depth 4)"
+
+        # (5) #291: lock busy НЕ пише machine-readable статус. Інший екземпляр
+        # BRAVO_ARCHIV (чи Maintenance) тримає lock і сам запише свій
+        # результат; запис тут перезаписав би статус прогону, що ще йде.
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveLockBusy.PSObject.Properties['ProbeError'] -and
+                @($archiveLockBusyEvents | Where-Object { $_ -like 'STATUS*' }).Count -eq 0
+            ) `
+            -Name 'Archive/OrchestrationLockBusyDoesNotWriteStatus' `
+            -Failure "lock busy (exit 20) не повинен записувати status-файл Archive: lock тримає інший екземпляр, і його статус не можна перезаписувати; проба: $($archiveLockBusy | ConvertTo-Json -Compress -Depth 4)"
+
+        # (6) #291: провал preflight вільного місця — ранній вихід 40 до
+        # будь-якої мутації (VSS, архівація). Без запису статусу моніторинг
+        # бачив би "OK" учорашнього прогону, хоча кожна ніч завершується 40.
+        # Статус пишеться рівно раз, з кодом 40, ПІСЛЯ рішення preflight і
+        # ДО вивантаження власного логу; lock звільнено останнім.
+        $archiveFreeSpace = $archiveOrchestrationResults['FreeSpaceFails']
+        $archiveFreeSpaceEvents = @(& $archiveOrchestrationEvents $archiveFreeSpace)
+        $archiveFreeSpaceStep = & $archiveOrchestrationIndex $archiveFreeSpaceEvents '^STEP 1/8 Перевірка вільного місця ERROR$'
+        $archiveFreeSpaceStatus = & $archiveOrchestrationIndex $archiveFreeSpaceEvents '^STATUS 40$'
+        $archiveFreeSpaceUpload = & $archiveOrchestrationIndex $archiveFreeSpaceEvents '^OWN-LOG-UPLOAD$'
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveFreeSpace.PSObject.Properties['ProbeError'] -and
+                $archiveFreeSpace.ExitCode -eq 40 -and
+                $archiveFreeSpace.ExitCodeName -eq 'LocalArchiveFailed' -and
+                $archiveFreeSpaceStep -ge 0 -and
+                $archiveFreeSpaceStatus -gt $archiveFreeSpaceStep -and
+                $archiveFreeSpaceUpload -gt $archiveFreeSpaceStatus -and
+                @($archiveFreeSpaceEvents | Where-Object { $_ -like 'STATUS*' }).Count -eq 1 -and
+                @($archiveFreeSpaceEvents | Where-Object { $_ -eq 'VSS-CREATE' -or $_ -like 'COMPONENT-BACKUP*' -or $_ -like 'MANIFEST-WRITE*' }).Count -eq 0 -and
+                $archiveFreeSpaceEvents.Count -gt 1 -and
+                $archiveFreeSpaceEvents[$archiveFreeSpaceEvents.Count - 1] -eq 'LOCK-RELEASE'
+            ) `
+            -Name 'Archive/OrchestrationFreeSpacePreflightFailureWritesStatus' `
+            -Failure "провал preflight вільного місця (exit 40) має записати status-файл Archive рівно раз із кодом 40 після рішення preflight і до вивантаження логу, без VSS/архівації; проба: $($archiveFreeSpace | ConvertTo-Json -Compress -Depth 4)"
+
+        # (7) #291: провал очищення orphan VSS — ранній вихід 40 одразу після
+        # lock, до будь-якого етапу. Статус пишеться рівно раз, з кодом 40,
+        # ПІСЛЯ перевірки orphan VSS; жоден етап не стартує; lock звільнено
+        # останнім.
+        $archiveOrphan = $archiveOrchestrationResults['OrphanVssFails']
+        $archiveOrphanEvents = @(& $archiveOrchestrationEvents $archiveOrphan)
+        $archiveOrphanCheck = & $archiveOrchestrationIndex $archiveOrphanEvents '^VSS-ORPHAN-CHECK$'
+        $archiveOrphanStatus = & $archiveOrchestrationIndex $archiveOrphanEvents '^STATUS 40$'
+        $archiveOrphanUpload = & $archiveOrchestrationIndex $archiveOrphanEvents '^OWN-LOG-UPLOAD$'
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveOrphan.PSObject.Properties['ProbeError'] -and
+                $archiveOrphan.ExitCode -eq 40 -and
+                $archiveOrphan.ExitCodeName -eq 'LocalArchiveFailed' -and
+                $archiveOrphanCheck -ge 0 -and
+                $archiveOrphanStatus -gt $archiveOrphanCheck -and
+                $archiveOrphanUpload -gt $archiveOrphanStatus -and
+                @($archiveOrphanEvents | Where-Object { $_ -like 'STATUS*' }).Count -eq 1 -and
+                @($archiveOrphanEvents | Where-Object { $_ -like 'STEP *' -or $_ -eq 'VSS-CREATE' -or $_ -like 'COMPONENT-BACKUP*' }).Count -eq 0 -and
+                $archiveOrphanEvents.Count -gt 1 -and
+                $archiveOrphanEvents[$archiveOrphanEvents.Count - 1] -eq 'LOCK-RELEASE'
+            ) `
+            -Name 'Archive/OrchestrationOrphanVssCleanupFailureWritesStatus' `
+            -Failure "провал очищення orphan VSS (exit 40) має записати status-файл Archive рівно раз із кодом 40 після перевірки orphan VSS і до вивантаження логу, без жодного етапу; проба: $($archiveOrphan | ConvertTo-Json -Compress -Depth 4)"
     } finally {
         if (Test-Path -LiteralPath $archiveOrchestrationRoot -PathType Container) {
             Remove-Item -LiteralPath $archiveOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+# ============================================================
+# #291: exit усередині Test-Compatibility (непідтримувана ОС ->
+# InvalidConfiguration; заблокована цілісність інструментів ->
+# ToolIntegrityViolation) оминає хвіст Main, тож status-файл Archive
+# лишався від попереднього прогону. Test-Compatibility викликається з Main
+# ПІСЛЯ захоплення lock і після конфігурації ($stateRoot), тому статус
+# можна писати безпечно. У пробі оркестрації вона затінена стабом, отже
+# тут — структурна перевірка AST: кожен exit у Test-Compatibility має
+# безпосередньо перед собою виклик fail-soft helper'а статусу з тим самим
+# кодом завершення.
+# ============================================================
+& {
+    $compatParseErrors = $null
+    $compatAst = [Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$compatParseErrors)
+    $compatFunction = @($compatAst.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-Compatibility'
+            }, $true)) | Select-Object -First 1
+    $compatExits = @(if ($null -ne $compatFunction) {
+            $compatFunction.Body.FindAll({ param($node) $node -is [Management.Automation.Language.ExitStatementAst] }, $true)
+        })
+    $compatUncoveredExits = @()
+    foreach ($compatExit in $compatExits) {
+        $compatExitCodeText = if ($null -ne $compatExit.Pipeline) { [string]$compatExit.Pipeline.Extent.Text } else { '' }
+        $compatPreviousText = ''
+        $compatExitCodeAssignText = ''
+        if ($compatExit.Parent -is [Management.Automation.Language.StatementBlockAst]) {
+            $compatSiblings = @($compatExit.Parent.Statements)
+            for ($compatIndex = 1; $compatIndex -lt $compatSiblings.Count; $compatIndex++) {
+                if ([object]::ReferenceEquals($compatSiblings[$compatIndex], $compatExit)) {
+                    $compatPreviousText = [string]$compatSiblings[$compatIndex - 1].Extent.Text
+                    if ($compatIndex -ge 2) {
+                        $compatExitCodeAssignText = [string]$compatSiblings[$compatIndex - 2].Extent.Text
+                    }
+                    break
+                }
+            }
+        }
+        $compatCovered = (
+            $compatExitCodeText -match '^\$[A-Za-z]\w*$' -and
+            $compatPreviousText -match '^Write-BRAVOArchiveOperationStatus\b' -and
+            $compatPreviousText -match ('-ExitCode\s+' + [regex]::Escape($compatExitCodeText) + '(?!\w)') -and
+            # Фінальна Operations-подія у finally читає $script:processExitCode.
+            $compatExitCodeAssignText -match ('^\$script:processExitCode\s*=\s*' + [regex]::Escape($compatExitCodeText) + '\s*$')
+        )
+        if (-not $compatCovered) {
+            $compatUncoveredExits += [string]$compatExit.Extent.Text
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            @($compatParseErrors).Count -eq 0 -and
+            $null -ne $compatFunction -and
+            $compatExits.Count -ge 2 -and
+            $compatUncoveredExits.Count -eq 0
+        ) `
+        -Name 'Archive/CompatibilityExitsWriteStatusBeforeExit' `
+        -Failure "кожен exit у Test-Compatibility має безпосередньо після запису статусу (Write-BRAVOArchiveOperationStatus -ExitCode <той самий код>, перед ним `$script:processExitCode = <той самий код>) завершувати процес, інакше моніторинг бачить застарілий статус; без статусу: $($compatUncoveredExits -join ' | ')"
 }
