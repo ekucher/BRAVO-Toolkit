@@ -2,6 +2,45 @@
 
 ## Не випущено (developer)
 
+- **Feat: runner Affected `ci/Invoke-BRAVOAffectedSelfTest.ps1` (VAL-05, PR3 з трьох).**
+  Нова бібліотека `ci/BRAVOAffectedSelfTest.ps1` (`Invoke-BRAVOAffectedSelfTest` з ін'єкціями
+  `-GitInvoker` і `-SelfTestInvoker`) і тонкий CLI `ci/Invoke-BRAVOAffectedSelfTest.ps1 -BaseRef <ref>`.
+  Ланцюг: збирач шляхів (`Get-BRAVOChangedPathSet`) -> супутник маніфесту -> план за картою шляхів ->
+  для класів V1/V2 дочірній `powershell.exe` з вибірковим `-Suite` -> розбір маркера -> машинний рядок
+  `AFFECTED RESULT: <КОД>`. Клас V3 (зокрема будь-який невідомий шлях і змішаний набір відомих та невідомих)
+  **нічого не запускає**: runner друкує вимоги (Full канонічною командою, посилання на `RELEASE_POLICY.md`
+  §13.3, умовні gate-и, зокрема Config parity за рішенням `Test-BRAVOConfigParityRelevantPath`, незалежне
+  рев'ю, невідомі шляхи з причинами) і завершується з `ESCALATED-V3` та кодом 1. Код 0 лише за коду 0
+  дочірнього прогону, рівно одного рядка `SELF-TEST PARTIAL: <очікуваний перелік>` і жодного іншого рядка з
+  маркером Self-Test (маркер — рядок, що після пробілів починається з `SELF-TEST` у будь-якому регістрі);
+  інакше `CHILD-FAILED` чи `MARKER-MISMATCH`; непередбачений виняток CLI — `RUNNER-FAILED`. Будь-який статус збирача (`BASE-MISSING`,
+  `BASE-INVALID`, `BASE-EQUALS-HEAD`, `EMPTY-DIFF`, `GIT-MISSING`, `GIT-FAILED`, `NOT-A-REPOSITORY`,
+  `ROOT-MISMATCH`, `SHALLOW-REPOSITORY`, `NO-MERGE-BASE`) проходить без змін, план не обчислюється, дочірній
+  процес не запускається. Рядки дочірнього процесу друкуються з префіксом `child| `, маркери Self-Test -
+  лише розібраними (`AFFECTED CHILD MARKER: ...`), керувальні символи в шляхах і рядках екранувалися
+  (`\uXXXX`), тож жоден рядок runner-а не починається з `SELF-TEST`; мітка класу - «мінімальний клас за картою
+  шляхів», нагадування про класифікацію PR друкується для кожного класу, фрази «Full not required» немає;
+  план ніколи не є acceptance. Команда дочірнього процесу: `-NoLogo -NoProfile -NonInteractive
+  -ExecutionPolicy Bypass -EncodedCommand` з тілом `& '<шлях>' -NoPause -Suite @('A','B'); exit
+  $LASTEXITCODE` (не `-File`: кома в списку suite; порожній `-Suite` не будується). Нової таблиці
+  exit-кодів немає: лише `0` або `1`, `modules/BRAVO.ExitCodes` не змінено. Це локальний інструмент
+  розробника: `ci.yml` не змінено, required check `BRAVO_SELF_TEST.ps1` лишається повним (підключення -
+  окреме рішення VAL-10).
+  Нова корінна секція `Tail/Framework.AffectedRunner` (після `Tail/Framework.AffectedChangedPath`):
+  `Framework/AffectedRunner.*` - V2 із дочірнім прогоном, V3 без дочірнього процесу, документи V1,
+  `CHILD-FAILED` і `MARKER-MISMATCH`, префікс `child| `, екранування керувальних символів, `HEAD`/`DIRTY`,
+  мітка класу, наскрізна передача статусів збирача, gate Config parity від канонічної функції, вимоги V3,
+  fail-closed контракт `-SelfTestInvoker`, незмінність `$script:BRAVOSelfTestSelectedSuite`, round-trip
+  `EncodedCommand`, статичні guard-и (без `2>&1`, `-File`, порожнього `-Suite`, літералів маркера повного
+  прогону, PowerShell 7-вузлів; BOM і CRLF; CLI лише з `exit 0`/`exit 1`). Сценарії на справжньому
+  git-репозиторії виконуються лише в git-робочій копії (є `.git` і git); у розгорнутому пакеті без `.git`
+  вони пропускаються з інформаційним рядком, без `[НЕДОСТУПНО]`, а `RealScenariosRunOnCi` не дає покриттю
+  зникнути на GitHub Actions. У `ci/Test-BRAVOForbiddenPattern.ps1` додано обґрунтований виняток
+  `ExecutionPolicy Bypass` для нового runner-а (дочірній self-test, як і для фрагментів self-test).
+  README доповнено підрозділом про Affected (Affected не є acceptance), у
+  `docs/design/BRAVO_VALIDATION_ARCHITECTURE.md` (VAL-05) оновлено формулювання про виконуваний інтерфейс.
+  Збирач, мапа, план, `config-parity.yml` і `ci.yml` не змінені. Справжній прогін на Windows PowerShell 5.1
+  - окрема ручна evidence (передумова acceptance PR3). Регенеровано `RUNTIME_MANIFEST.json`.
 - **Feat: git-збирач змінених шляхів `ci/BRAVOChangedPath.ps1` для режиму Affected (VAL-05, PR2 з трьох).**
   Нові функції `Invoke-BRAVOGitCommand` і `Get-BRAVOChangedPathSet` — єдиний власник git-diff для
   Affected. Збирач порівнює merge-base(`BaseRef`, `HEAD`) з робочим деревом: tracked-зміни (staged і

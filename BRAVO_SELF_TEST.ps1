@@ -31594,6 +31594,639 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath') { try
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedChangedPath' } }
 
+if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner') { try {
+
+# ============================================================
+# VAL-05 (Affected), PR3: runner Affected (бібліотека + тонкий CLI).
+#
+# Канонічний власник - ci\BRAVOAffectedSelfTest.ps1
+# (Invoke-BRAVOAffectedSelfTest) і тонкий CLI
+# ci\Invoke-BRAVOAffectedSelfTest.ps1. Ланцюг: збирач шляхів ->
+# супутник маніфесту -> план -> (лише V1/V2) дочірній прогін -Suite ->
+# розбір маркера -> рядок "AFFECTED RESULT: <CODE>".
+#
+# Інваріанти, які тут доводяться: V3 НІКОЛИ не запускає дочірній
+# процес і не стає Full або вибірковим прогоном; будь-який збій збирача
+# проходить без змін і не обчислює план; код 0 лише за повного збігу
+# маркера дочірнього прогону; жоден рядок stdout runner-а не починається
+# з маркера Self-Test (вивід дочірнього процесу має префікс "child| ");
+# план ніколи не є acceptance. Нової таблиці exit-кодів немає: 0 або 1.
+#
+# Позначення: [I] - ін'єкція -GitInvoker; [C] - ін'єкція
+# -SelfTestInvoker (справжній дочірній корінь у Full не запускається);
+# [R] - статичний guard файлів; [T] - справжній git-репозиторій. [T]
+# виконується лише в git-робочій копії (є .git і git): розгорнутий пакет
+# на сервері не має .git, і [НЕДОСТУПНО] там інвалідувало б acceptance.
+# Покриття на CI не може зникнути мовчки: RealScenariosRunOnCi.
+# Змінні лишаються в межах & { }: нічого нового не читається коренем.
+# ============================================================
+& {
+    $arPath = Join-Path $root 'ci\BRAVOAffectedSelfTest.ps1'
+    $arCliPath = Join-Path $root 'ci\Invoke-BRAVOAffectedSelfTest.ps1'
+    $arCollectorPath = Join-Path $root 'ci\BRAVOChangedPath.ps1'
+    $arParityPath = Join-Path $root 'ci\Test-BRAVOConfigParityRelevantPath.ps1'
+    $arText = ''
+    $arCliText = ''
+    if ([IO.File]::Exists($arCollectorPath)) { . $arCollectorPath }
+    if ([IO.File]::Exists($arParityPath)) { . $arParityPath }
+    if ([IO.File]::Exists($arPath)) {
+        . $arPath
+        $arText = [IO.File]::ReadAllText($arPath, [Text.Encoding]::UTF8)
+    }
+    if ([IO.File]::Exists($arCliPath)) { $arCliText = [IO.File]::ReadAllText($arCliPath, [Text.Encoding]::UTF8) }
+    $arReady = $true
+    foreach ($arFunctionName in @('Invoke-BRAVOAffectedSelfTest', 'New-BRAVOAffectedChildRequest', 'Invoke-BRAVOAffectedChildProcess', 'ConvertTo-BRAVOAffectedPrintableText', 'Get-BRAVOChangedPathSet', 'Test-BRAVOConfigParityRelevantPath')) {
+        if ($null -eq (Get-Command -Name $arFunctionName -CommandType Function -ErrorAction SilentlyContinue)) { $arReady = $false }
+    }
+    Test-BRAVOCondition `
+        -Condition $arReady `
+        -Name "Framework/AffectedRunner.FunctionsExist" `
+        -Failure "ci\BRAVOAffectedSelfTest.ps1 мусить існувати й визначати Invoke-BRAVOAffectedSelfTest, New-BRAVOAffectedChildRequest, Invoke-BRAVOAffectedChildProcess, ConvertTo-BRAVOAffectedPrintableText (runner Affected), а ci\Invoke-BRAVOAffectedSelfTest.ps1 - тонкий CLI; файли знайдено: $([IO.File]::Exists($arPath)) / $([IO.File]::Exists($arCliPath))"
+
+    if ($arReady) {
+        $arNul = [string][char]0
+        $arSha1 = 'a' * 40
+        $arSha2 = 'b' * 40
+        $arMismatch = New-Object System.Collections.Generic.List[string]
+        $arCheck = {
+            param([string]$Id, [bool]$Condition)
+            if (-not $Condition) { [void]$arMismatch.Add($Id) }
+        }
+        $arTake = {
+            $taken = [string]::Join('; ', @($arMismatch.ToArray() | Select-Object -First 8))
+            $arMismatch.Clear()
+            return $taken
+        }
+        $arAny = {
+            param($Result, [string]$Fragment)
+            foreach ($resultLine in @($Result.Line)) {
+                if (([string]$resultLine).Contains($Fragment)) { return $true }
+            }
+            return $false
+        }
+        $arStarting = {
+            param($Result, [string]$Prefix)
+            return @(@($Result.Line) | Where-Object { ([string]$_).StartsWith($Prefix, [StringComparison]::Ordinal) })
+        }
+        $arSelfTestLine = {
+            param($Result)
+            # Фізичні рядки: елемент Line із вбудованим переводом рядка теж може сховати маркер на початку рядка.
+            $physicalLines = New-Object System.Collections.Generic.List[string]
+            foreach ($resultLine in @($Result.Line)) {
+                foreach ($physicalLine in [regex]::Split([string]$resultLine, '\r\n|\n|\r')) { [void]$physicalLines.Add($physicalLine) }
+            }
+            return @($physicalLines.ToArray() | Where-Object { [regex]::IsMatch($_, '(?i)^\s*SELF-TEST') })
+        }
+
+        $arRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_AFFECTEDRUNNER_' + [guid]::NewGuid().ToString('N'))
+        $arOtherRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_AFFECTEDRUNNER_OTHER_' + [guid]::NewGuid().ToString('N'))
+        $arManifestKeys = @(
+            'selftest/BRAVO_SELF_TEST.Paths.ps1', 'selftest/BRAVO_SELF_TEST.Archive.ps1', 'BRAVO_ARCHIV.ps1',
+            'ci/Update-BRAVORuntimeManifest.ps1', 'modules/BRAVO.Configuration/x.psm1', 'BRAVO_HEALTH.ps1')
+        $arManifestText = {
+            param([string[]]$DeltaKey)
+            $entries = New-Object System.Collections.Generic.List[string]
+            foreach ($manifestKey in $arManifestKeys) {
+                $hashValue = 'h0'
+                if (@($DeltaKey) -contains $manifestKey) { $hashValue = 'h1' }
+                [void]$entries.Add('"' + $manifestKey + '":"' + $hashValue + '"')
+            }
+            return ('{"schemaVersion":1,"description":"d","updateProcedure":"u","files":{' + [string]::Join(',', $entries.ToArray()) + '}}')
+        }
+        $arReply = {
+            param([int]$Code, [string]$Out = '', [string]$Err = '')
+            return @{ ExitCode = $Code; StdOut = $Out; StdErr = $Err }
+        }
+        $arKind = {
+            param([string[]]$Argument)
+            if ($Argument -contains 'diff') { return 'diff' }
+            if ($Argument -contains 'ls-files') { return 'untracked' }
+            if ($Argument -contains 'status') { return 'status' }
+            if ($Argument -contains 'merge-base') { return 'mergebase' }
+            if ($Argument -contains 'show') { return 'show' }
+            if ($Argument -contains '--show-toplevel') { return 'toplevel' }
+            if ($Argument -contains '--is-shallow-repository') { return 'shallow' }
+            if ($Argument -contains 'HEAD^{commit}') { return 'head' }
+            return 'base'
+        }
+        $arChildCalls = New-Object System.Collections.Generic.List[object]
+        $arAll = New-Object System.Collections.Generic.List[object]
+        $arGitResponses = @{}
+        $arChildBehavior = $null
+        # Відповідь-рядок означає виняток запуску git (симуляція Process.Start).
+        $arGitInvoker = {
+            param([string[]]$Argument)
+            $fakeResponse = $arGitResponses[(& $arKind $Argument)]
+            if ($fakeResponse -is [string]) { throw $fakeResponse }
+            return $fakeResponse
+        }
+        $arChildInvoker = {
+            param($Request)
+            [void]$arChildCalls.Add($Request)
+            return (& $arChildBehavior $Request)
+        }
+        $arDefaultChild = {
+            param($Request)
+            return @{ ExitCode = 0; Lines = @('child noise one', 'second line [PASS] ok', ('SELF-TEST PARTIAL: ' + [string]::Join(',', @($Request.Suite)))) }
+        }
+        # Tracked: 'шлях' (M) або 'D|шлях'. Повертає результат runner-а; Write-Host runner-а приглушено.
+        $arRun = {
+            param(
+                [string[]]$Tracked,
+                [string[]]$Untracked = @(),
+                [string[]]$DeltaKey = @(),
+                [scriptblock]$Behavior = $null,
+                [hashtable]$Override = @{},
+                [string]$BaseRef = 'main'
+            )
+            $arChildCalls.Clear()
+            [IO.File]::WriteAllText((Join-Path $arRoot 'RUNTIME_MANIFEST.json'), (& $arManifestText $DeltaKey), (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+            $diffText = ''
+            foreach ($trackedEntry in @($Tracked)) {
+                if ($trackedEntry.StartsWith('D|', [StringComparison]::Ordinal)) { $diffText += 'D' + $arNul + $trackedEntry.Substring(2) + $arNul }
+                else { $diffText += 'M' + $arNul + $trackedEntry + $arNul }
+            }
+            $untrackedText = ''
+            foreach ($untrackedEntry in @($Untracked)) { $untrackedText += $untrackedEntry + $arNul }
+            $arGitResponses = @{
+                toplevel  = (& $arReply 0 ($arRoot + "`n"))
+                shallow   = (& $arReply 0 "false`n")
+                base      = (& $arReply 0 ($arSha1 + "`n"))
+                head      = (& $arReply 0 ($arSha2 + "`n"))
+                mergebase = (& $arReply 0 ($arSha1 + "`n"))
+                diff      = (& $arReply 0 $diffText)
+                untracked = (& $arReply 0 $untrackedText)
+                show      = (& $arReply 0 (& $arManifestText @()))
+                status    = (& $arReply 0 (' M x' + $arNul))
+            }
+            foreach ($overrideKey in @($Override.Keys)) { $arGitResponses[$overrideKey] = $Override[$overrideKey] }
+            $arChildBehavior = $arDefaultChild
+            if ($null -ne $Behavior) { $arChildBehavior = $Behavior }
+            $runResult = Invoke-BRAVOAffectedSelfTest -RepositoryRoot $arRoot -BaseRef $BaseRef -GitInvoker $arGitInvoker -SelfTestInvoker $arChildInvoker 6>$null
+            [void]$arAll.Add($runResult)
+            return , $runResult
+        }
+        $arSuiteText = {
+            param($Result)
+            return [string]::Join(',', @($Result.Suite))
+        }
+        $arPaths = 'selftest/BRAVO_SELF_TEST.Paths.ps1'
+
+        try {
+            [void][IO.Directory]::CreateDirectory($arRoot)
+
+            # R1 [C+I]: відомий фрагмент + супутній маніфест -> V2, дочірній прогін, код 0.
+            $arOne = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths)
+            $arOneRequest = $null
+            if ($arChildCalls.Count -eq 1) { $arOneRequest = $arChildCalls[0] }
+            Test-BRAVOCondition `
+                -Condition (
+                    @($arOne).Count -eq 1 -and $arOne.ExitCode -eq 0 -and $arOne.ResultCode -ceq 'PARTIAL-OK' -and $arOne.Class -ceq 'V2' -and
+                    $arChildCalls.Count -eq 1 -and $null -ne $arOneRequest -and [string]::Join(',', @($arOneRequest.Suite)) -ceq 'Governance,Paths' -and
+                    (& $arAny $arOne 'Full Self-Test REQUIRED before acceptance') -and
+                    (& $arAny $arOne 'AFFECTED CHILD MARKER: PARTIAL Governance,Paths') -and
+                    @(& $arStarting $arOne 'AFFECTED RESULT: PARTIAL-OK').Count -eq 1 -and
+                    $arOne.Line[$arOne.Line.Count - 1] -ceq 'AFFECTED RESULT: PARTIAL-OK' -and
+                    $arOne.IsAcceptanceEvidence -eq $false
+                ) `
+                -Name "Framework/AffectedRunner.KnownSingleV2RunsChildAndPasses" `
+                -Failure ("R1: фрагмент Paths + супутній маніфест -> клас V2, дочірній прогін із Governance,Paths, код 0, AFFECTED RESULT: PARTIAL-OK останнім рядком і рядок про обов'язковий Full; отримано код=$($arOne.ExitCode) результат=$($arOne.ResultCode) клас=$($arOne.Class) викликів дочірнього=$($arChildCalls.Count)")
+
+            # R20 [I]: лише untracked (фрагмент + маніфест) - теж зміна.
+            $arUntracked = & $arRun @() @($arPaths, 'RUNTIME_MANIFEST.json') @($arPaths)
+            Test-BRAVOCondition `
+                -Condition ($arUntracked.ExitCode -eq 0 -and $arUntracked.Class -ceq 'V2' -and (& $arSuiteText $arUntracked) -ceq 'Governance,Paths' -and $arChildCalls.Count -eq 1) `
+                -Name "Framework/AffectedRunner.UntrackedOnlyChangeIsAChange" `
+                -Failure "R20: збирач повернув лише untracked фрагмент і маніфест - це зміна класу V2 із Governance,Paths, а не порожній прогін"
+
+            # R2, R3 [C+I]: невідомий шлях -> V3; дочірній процес ніколи не запускається.
+            $arUnknown = & $arRun @('BRAVO_ARCHIV.ps1', 'RUNTIME_MANIFEST.json') @() @('BRAVO_ARCHIV.ps1')
+            $arUnknownCalls = $arChildCalls.Count
+            $arMixed = & $arRun @($arPaths, 'ci/Update-BRAVORuntimeManifest.ps1', 'RUNTIME_MANIFEST.json') @() @($arPaths, 'ci/Update-BRAVORuntimeManifest.ps1')
+            $arMixedCalls = $arChildCalls.Count
+            Test-BRAVOCondition `
+                -Condition (
+                    $arUnknown.ExitCode -eq 1 -and $arUnknown.ResultCode -ceq 'ESCALATED-V3' -and $arUnknown.Class -ceq 'V3' -and $arUnknownCalls -eq 0 -and
+                    (& $arAny $arUnknown 'AFFECTED RESULT: ESCALATED-V3') -and
+                    $arMixed.ExitCode -eq 1 -and $arMixed.ResultCode -ceq 'ESCALATED-V3' -and $arMixedCalls -eq 0 -and
+                    @($arMixed.Suite).Count -eq 0 -and (& $arAny $arMixed 'AFFECTED SUITES: (немає)')
+                ) `
+                -Name "Framework/AffectedRunner.UnknownPathEscalatesV3WithoutChild" `
+                -Failure ("R2/R3: невідомий шлях (BRAVO_ARCHIV.ps1) і змішаний набір відомого фрагмента з ci\Update-BRAVORuntimeManifest.ps1 мусять давати клас V3, код 1, ESCALATED-V3, порожній Suite (Paths не запускається окремо) і жодного виклику дочірнього; отримано: [$($arUnknown.ResultCode)/$($arUnknown.ExitCode)/викликів $arUnknownCalls] [$($arMixed.ResultCode)/$($arMixed.ExitCode)/викликів $arMixedCalls/suite $(& $arSuiteText $arMixed)]")
+
+            # R4 [C+I]: споживані документи -> V1, код 0.
+            foreach ($arDoc in @(
+                    @{ Path = 'README.md'; Suite = 'Governance' },
+                    @{ Path = 'OPERATIONS.md'; Suite = 'DataRestore,Governance' },
+                    @{ Path = 'BRAVO_SETUP.md'; Suite = 'ConfigLoader,Governance' },
+                    @{ Path = 'CHANGELOG.md'; Suite = 'Governance' })) {
+                $arDocResult = & $arRun @($arDoc.Path)
+                $arDocRequest = $null
+                if ($arChildCalls.Count -eq 1) { $arDocRequest = $arChildCalls[0] }
+                & $arCheck ('doc ' + $arDoc.Path) (
+                    $arDocResult.ExitCode -eq 0 -and $arDocResult.Class -ceq 'V1' -and $arDocResult.ResultCode -ceq 'PARTIAL-OK' -and
+                    (& $arSuiteText $arDocResult) -ceq $arDoc.Suite -and $null -ne $arDocRequest -and [string]::Join(',', @($arDocRequest.Suite)) -ceq $arDoc.Suite -and
+                    (& $arAny $arDocResult 'Full Self-Test не звільняється'))
+            }
+            $arProblem = & $arTake
+            Test-BRAVOCondition `
+                -Condition ($arProblem.Length -eq 0) `
+                -Name "Framework/AffectedRunner.ConsumedDocumentsAreV1" `
+                -Failure ("R4: README.md, OPERATIONS.md, BRAVO_SETUP.md, CHANGELOG.md -> клас V1, свої suite, код 0 і рядок 'Full Self-Test не звільняється': " + $arProblem)
+
+            # R5 [C+I]: документ поза таблицею -> V3; фрази про непотрібний Full немає.
+            foreach ($arOutside in @('docs/design/BRAVO_VALIDATION_ARCHITECTURE.md', 'ROADMAP.md')) {
+                $arOutsideResult = & $arRun @($arOutside)
+                & $arCheck ('outside ' + $arOutside) (
+                    $arOutsideResult.ExitCode -eq 1 -and $arOutsideResult.Class -ceq 'V3' -and $arOutsideResult.ResultCode -ceq 'ESCALATED-V3' -and $arChildCalls.Count -eq 0 -and
+                    -not [regex]::IsMatch([string]::Join("`n", @($arOutsideResult.Line)), '(?i)full\s+not\s+required'))
+            }
+            $arProblem = & $arTake
+            Test-BRAVOCondition `
+                -Condition ($arProblem.Length -eq 0) `
+                -Name "Framework/AffectedRunner.DocOutsideTableIsV3WithoutFullNotRequired" `
+                -Failure ("R5: документ поза таблицею споживаних -> V3, код 1, без дочірнього процесу і без фрази 'Full not required': " + $arProblem)
+
+            # R6, R7, R8 [C]: збій дочірнього процесу й невідповідність маркера.
+            $arFailed = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 1; Lines = @('boom', 'SELF-TEST FAILED: 2') } }
+            $arPassed = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('SELF-TEST PASSED') } }
+            $arWrongList = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('SELF-TEST PARTIAL: Governance') } }
+            $arTwoPartial = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('SELF-TEST PARTIAL: Governance,Paths', 'SELF-TEST PARTIAL: Governance,Paths') } }
+            $arNoMarker = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('nothing useful') } }
+            $arPartialAndPassed = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('SELF-TEST PARTIAL: Governance,Paths', 'SELF-TEST PASSED') } }
+            $arLoosePassed = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @('SELF-TEST PARTIAL: Governance,Paths', '  self-test passed') } }
+            $arFailedWithMarker = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 2; Lines = @('SELF-TEST PARTIAL: Governance,Paths') } }
+            Test-BRAVOCondition `
+                -Condition (
+                    $arFailed.ExitCode -eq 1 -and $arFailed.ResultCode -ceq 'CHILD-FAILED' -and (& $arAny $arFailed 'AFFECTED RESULT: CHILD-FAILED') -and
+                    $arFailedWithMarker.ExitCode -eq 1 -and $arFailedWithMarker.ResultCode -ceq 'CHILD-FAILED'
+                ) `
+                -Name "Framework/AffectedRunner.ChildFailureIsChildFailed" `
+                -Failure "R6: ненульовий код дочірнього прогону (навіть із маркером PARTIAL) -> код 1 і AFFECTED RESULT: CHILD-FAILED"
+            Test-BRAVOCondition `
+                -Condition (
+                    $arPassed.ExitCode -eq 1 -and $arPassed.ResultCode -ceq 'MARKER-MISMATCH' -and @(& $arSelfTestLine $arPassed).Count -eq 0 -and
+                    (& $arAny $arPassed 'AFFECTED CHILD MARKER: UNEXPECTED (PASSED)') -and
+                    $arPartialAndPassed.ExitCode -eq 1 -and $arPartialAndPassed.ResultCode -ceq 'MARKER-MISMATCH' -and @(& $arSelfTestLine $arPartialAndPassed).Count -eq 0 -and
+                    $arLoosePassed.ExitCode -eq 1 -and $arLoosePassed.ResultCode -ceq 'MARKER-MISMATCH' -and (& $arAny $arLoosePassed 'AFFECTED CHILD MARKER: UNEXPECTED (PASSED)')
+                ) `
+                -Name "Framework/AffectedRunner.ChildPassedMarkerIsMismatch" `
+                -Failure "R7: код 0, але дочірній прогін надрукував маркер повного прогону (окремо, поряд із PARTIAL або з пробілами й в іншому регістрі) -> код 1 і MARKER-MISMATCH; сирого маркера у stdout runner-а немає"
+            Test-BRAVOCondition `
+                -Condition (
+                    $arWrongList.ExitCode -eq 1 -and $arWrongList.ResultCode -ceq 'MARKER-MISMATCH' -and
+                    $arTwoPartial.ExitCode -eq 1 -and $arTwoPartial.ResultCode -ceq 'MARKER-MISMATCH' -and
+                    $arNoMarker.ExitCode -eq 1 -and $arNoMarker.ResultCode -ceq 'MARKER-MISMATCH'
+                ) `
+                -Name "Framework/AffectedRunner.ChildMarkerListMismatch" `
+                -Failure "R8: інший перелік у PARTIAL, два рядки PARTIAL або жодного маркера при коді 0 -> код 1 і MARKER-MISMATCH"
+
+            # R9 [C]: шум дочірнього процесу має префікс child| ; маркер розібрано.
+            $arNoiseLines = @($arOne.Line | Where-Object { ([string]$_).StartsWith('child| ', [StringComparison]::Ordinal) })
+            Test-BRAVOCondition `
+                -Condition (
+                    $arNoiseLines.Count -eq 2 -and $arNoiseLines[0] -ceq 'child| child noise one' -and $arNoiseLines[1] -ceq 'child| second line [PASS] ok' -and
+                    @(& $arSelfTestLine $arOne).Count -eq 0 -and (& $arAny $arOne 'AFFECTED CHILD MARKER: PARTIAL Governance,Paths')
+                ) `
+                -Name "Framework/AffectedRunner.ChildNoiseIsPrefixed" `
+                -Failure "R9: звичайні рядки дочірнього процесу відлунюються як 'child| <рядок>', сирого маркера Self-Test немає, є AFFECTED CHILD MARKER: PARTIAL Governance,Paths"
+
+            # Ін'єкція через шлях і керувальні символи: нові рядки не створюють рядка з маркером.
+            $arInjected = & $arRun @("docs/x`nSELF-TEST PASSED.md", "docs/y`r`n  self-test partial.md") @()
+            $arInjectedChild = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) { param($Request) return @{ ExitCode = 0; Lines = @("a`nSELF-TEST PASSED", "b`rSELF-TEST FAILED: 1", 'SELF-TEST PARTIAL: Governance,Paths') } }
+            Test-BRAVOCondition `
+                -Condition (
+                    $arInjected.ExitCode -eq 1 -and @(& $arSelfTestLine $arInjected).Count -eq 0 -and
+                    $arInjectedChild.ExitCode -eq 1 -and @(& $arSelfTestLine $arInjectedChild).Count -eq 0
+                ) `
+                -Name "Framework/AffectedRunner.ControlCharactersCannotForgeMarkerLines" `
+                -Failure "шлях з переводом рядка та рядок дочірнього процесу з вбудованим переводом рядка не можуть створити рядок stdout runner-а, що починається з маркера Self-Test (керувальні символи екрануються)"
+
+            # R13 [C+I]: BASE, MERGE-BASE, HEAD, DIRTY - для V1, V2 і V3.
+            $arV1 = & $arRun @('README.md')
+            $arHeadOk = $true
+            foreach ($arClassResult in @($arV1, $arOne, $arUnknown)) {
+                $arHeadLine = @(& $arStarting $arClassResult 'AFFECTED HEAD: ')
+                $arHeadOk = $arHeadOk -and (& $arAny $arClassResult ('AFFECTED BASE: ' + $arSha1)) -and (& $arAny $arClassResult ('AFFECTED MERGE-BASE: ' + $arSha1)) -and
+                    (& $arAny $arClassResult ('AFFECTED HEAD: ' + $arSha2)) -and (& $arAny $arClassResult 'AFFECTED DIRTY: true') -and
+                    $arHeadLine.Count -eq 1 -and [regex]::IsMatch([string]$arHeadLine[0], '^AFFECTED HEAD: [0-9a-f]{40}$')
+            }
+            Test-BRAVOCondition `
+                -Condition $arHeadOk `
+                -Name "Framework/AffectedRunner.HeadAndDirtyArePrinted" `
+                -Failure "R13: для V1, V2 і V3 runner друкує AFFECTED BASE, AFFECTED MERGE-BASE, AFFECTED HEAD (40-hex) і AFFECTED DIRTY"
+
+            # R14 [C]: мітка класу й нагадування про PR-класифікацію; без 'Full not required'.
+            $arLabelOk = $true
+            foreach ($arClassResult in @($arV1, $arOne, $arUnknown)) {
+                $arClassLine = @(& $arStarting $arClassResult 'AFFECTED CLASS: ')
+                $arLabelOk = $arLabelOk -and $arClassLine.Count -eq 1 -and ([string]$arClassLine[0]).Contains('(мінімальний клас за картою шляхів)') -and
+                    (& $arAny $arClassResult "Класифікація PR на рівні рев'ю все одно обов'язкова") -and
+                    -not [regex]::IsMatch([string]::Join("`n", @($arClassResult.Line)), '(?i)full\s+not\s+required')
+            }
+            $arLabelOk = $arLabelOk -and $arV1.Class -ceq 'V1' -and $arOne.Class -ceq 'V2' -and $arUnknown.Class -ceq 'V3' -and
+                (& $arAny $arOne 'Full Self-Test REQUIRED before acceptance: .\BRAVO_SELF_TEST.ps1 -NoPause') -and
+                -not (& $arAny $arV1 'Full Self-Test REQUIRED') -and (& $arAny $arV1 'Full Self-Test не звільняється')
+            Test-BRAVOCondition `
+                -Condition $arLabelOk `
+                -Name "Framework/AffectedRunner.ClassLabelAndPrNoticeAreAlwaysPrinted" `
+                -Failure "R14: V1, V2, V3 друкують 'мінімальний клас за картою шляхів' і нагадування про класифікацію PR на рівні рев'ю; для V2 - 'Full Self-Test REQUIRED before acceptance', для V1 - 'Full Self-Test не звільняється'; фрази 'Full not required' немає ніколи"
+
+            # R15 [I]: збої збирача проходять без змін; план не обчислюється; дочірній не запускається.
+            $arCollectorCases = @(
+                @{ Code = 'BASE-MISSING'; Ref = ''; Override = @{} },
+                @{ Code = 'BASE-INVALID'; Ref = 'a b'; Override = @{} },
+                @{ Code = 'BASE-EQUALS-HEAD'; Ref = 'main'; Override = @{ base = (& $arReply 0 ($arSha2 + "`n")); mergebase = (& $arReply 0 ($arSha2 + "`n")); diff = (& $arReply 0 ''); untracked = (& $arReply 0 '') } },
+                @{ Code = 'EMPTY-DIFF'; Ref = 'main'; Override = @{ diff = (& $arReply 0 ''); untracked = (& $arReply 0 '') } },
+                @{ Code = 'GIT-MISSING'; Ref = 'main'; Override = @{ toplevel = @{ Available = $false; ExitCode = $null; StdOut = ''; StdErr = '' } } },
+                @{ Code = 'GIT-FAILED'; Ref = 'main'; Override = @{ diff = (& $arReply 128 '' 'fatal: x') } },
+                @{ Code = 'NOT-A-REPOSITORY'; Ref = 'main'; Override = @{ toplevel = (& $arReply 128 '' 'fatal: not a git repository') } },
+                @{ Code = 'ROOT-MISMATCH'; Ref = 'main'; Override = @{ toplevel = (& $arReply 0 ($arOtherRoot + "`n")) } },
+                @{ Code = 'SHALLOW-REPOSITORY'; Ref = 'main'; Override = @{ shallow = (& $arReply 0 "true`n") } },
+                @{ Code = 'NO-MERGE-BASE'; Ref = 'main'; Override = @{ mergebase = (& $arReply 1) } })
+            foreach ($arCase in $arCollectorCases) {
+                $arCaseResult = & $arRun @($arPaths) @() @() $null $arCase.Override $arCase.Ref
+                & $arCheck $arCase.Code (
+                    $arCaseResult.ExitCode -eq 1 -and $arCaseResult.ResultCode -ceq $arCase.Code -and $arChildCalls.Count -eq 0 -and
+                    (& $arAny $arCaseResult ('AFFECTED RESULT: ' + $arCase.Code)) -and @(& $arStarting $arCaseResult 'AFFECTED CLASS: ').Count -eq 0 -and
+                    $null -eq $arCaseResult.Class -and @(& $arSelfTestLine $arCaseResult).Count -eq 0 -and
+                    $arCaseResult.Line[$arCaseResult.Line.Count - 1] -ceq ('AFFECTED RESULT: ' + $arCase.Code))
+            }
+            $arProblem = & $arTake
+            Test-BRAVOCondition `
+                -Condition ($arProblem.Length -eq 0) `
+                -Name "Framework/AffectedRunner.CollectorFailuresPassThrough" `
+                -Failure ("R15: кожен статус збирача (BASE-MISSING, BASE-INVALID, BASE-EQUALS-HEAD, EMPTY-DIFF, GIT-MISSING, GIT-FAILED, NOT-A-REPOSITORY, ROOT-MISMATCH, SHALLOW-REPOSITORY, NO-MERGE-BASE) мусить давати код 1 і AFFECTED RESULT: <той самий код> останнім рядком без обчислення плану й без дочірнього процесу: " + $arProblem)
+
+            # R16 [I+C]: gate Config parity - за рішенням канонічної функції, включно з видаленням.
+            $arParityModule = & $arRun @('modules/BRAVO.Configuration/x.psm1', 'RUNTIME_MANIFEST.json') @() @('modules/BRAVO.Configuration/x.psm1')
+            $arParityLoader = & $arRun @('BRAVO_CONFIG_LOADER.ps1')
+            $arParityDeleted = & $arRun @('D|modules/BRAVO.Configuration/x.psm1')
+            $arParityNone = & $arRun @('README.md')
+            Test-BRAVOCondition `
+                -Condition (
+                    $arParityModule.ResultCode -ceq 'ESCALATED-V3' -and (& $arAny $arParityModule 'Config parity') -and
+                    $arParityLoader.ResultCode -ceq 'ESCALATED-V3' -and (& $arAny $arParityLoader 'Config parity') -and
+                    $arParityDeleted.ResultCode -ceq 'ESCALATED-V3' -and (& $arAny $arParityDeleted 'Config parity') -and
+                    -not (& $arAny $arParityNone 'Config parity')
+                ) `
+                -Name "Framework/AffectedRunner.ConfigParityGateComesFromCanonicalFunction" `
+                -Failure "R16: V3 зі зміною модуля конфігурації, завантажувача чи видаленого файла модуля містить gate Config parity за рішенням ci\Test-BRAVOConfigParityRelevantPath.ps1; для README.md такого gate немає"
+            Test-BRAVOCondition `
+                -Condition (
+                    $arText.Contains('Test-BRAVOConfigParityRelevantPath') -and -not $arText.Contains('Get-BRAVOConfigParityRelevantPathPattern') -and
+                    -not [regex]::IsMatch($arText, '(?i)modules[\\/]BRAVO\.Configur|BRAVO_CONFIG_LOADER|config\.example|selftest[\\/]fixtures|config-parity')
+                ) `
+                -Name "Framework/AffectedRunner.NoCopyOfConfigParityPathList" `
+                -Failure "ci\BRAVOAffectedSelfTest.ps1 мусить викликати канонічну Test-BRAVOConfigParityRelevantPath і не містити копії переліку шляхів паритету конфігурації"
+
+            # R17 [C]: вимоги V3.
+            $arRequirements = & $arRun @('BRAVO_ARCHIV.ps1', 'RUNTIME_MANIFEST.json') @() @('BRAVO_ARCHIV.ps1')
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $arAny $arRequirements '.\BRAVO_SELF_TEST.ps1 -NoPause') -and (& $arAny $arRequirements 'RELEASE_POLICY.md') -and (& $arAny $arRequirements '13.3') -and
+                    (& $arAny $arRequirements "Незалежне рев'ю") -and (& $arAny $arRequirements 'AFFECTED UNKNOWN PATH: BRAVO_ARCHIV.ps1 - ') -and
+                    (& $arAny $arRequirements 'Integrity manifests are current') -and
+                    (& $arAny $arRequirements 'НЕ запускає') -and $arChildCalls.Count -eq 0
+                ) `
+                -Name "Framework/AffectedRunner.V3RequirementsAreListed" `
+                -Failure "R17: V3 друкує канонічну команду Full, посилання на RELEASE_POLICY.md §13.3, незалежне рев'ю, умовні gate-и й невідомі шляхи з причинами і нічого не запускає"
+
+            # Контракт SelfTestInvoker: невірна форма відповіді - fail closed.
+            $arBadInvokers = @(
+                @{ Id = 'throws'; Behavior = { param($Request) throw 'simulated child start failure' } },
+                @{ Id = 'null'; Behavior = { param($Request) return $null } },
+                @{ Id = 'no exit code'; Behavior = { param($Request) return @{ Lines = @('SELF-TEST PARTIAL: Governance,Paths') } } },
+                @{ Id = 'string exit code'; Behavior = { param($Request) return @{ ExitCode = '0'; Lines = @('SELF-TEST PARTIAL: Governance,Paths') } } },
+                @{ Id = 'start error'; Behavior = { param($Request) return @{ ExitCode = $null; Lines = @(); StartError = 'не стартував' } } },
+                @{ Id = 'two objects'; Behavior = { param($Request) return @(@{ ExitCode = 0; Lines = @('SELF-TEST PARTIAL: Governance,Paths') }, @{ ExitCode = 0; Lines = @() }) } })
+            foreach ($arBad in $arBadInvokers) {
+                $arBadResult = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths) $arBad.Behavior
+                & $arCheck $arBad.Id ($arBadResult.ExitCode -eq 1 -and $arBadResult.ResultCode -ceq 'CHILD-FAILED' -and @(& $arSelfTestLine $arBadResult).Count -eq 0)
+            }
+            $arProblem = & $arTake
+            Test-BRAVOCondition `
+                -Condition ($arProblem.Length -eq 0) `
+                -Name "Framework/AffectedRunner.ChildInvokerContractFailsClosed" `
+                -Failure ("виняток invoker-а, порожня чи двозначна відповідь, відсутній чи нечисловий ExitCode, StartError -> код 1 і CHILD-FAILED, ніколи не успіх: " + $arProblem)
+
+            # R18 [R]: runner не змінює вибір suite кореня.
+            $arSelectionBefore = $script:BRAVOSelfTestSelectedSuite
+            $null = & $arRun @($arPaths, 'RUNTIME_MANIFEST.json') @() @($arPaths)
+            Test-BRAVOCondition `
+                -Condition ([object]::ReferenceEquals($arSelectionBefore, $script:BRAVOSelfTestSelectedSuite)) `
+                -Name "Framework/AffectedRunner.RunnerDoesNotMutateSelection" `
+                -Failure "R18: виклик runner-а не змінює `$script:BRAVOSelfTestSelectedSuite кореня"
+
+            # Write-Host runner-а збігається з Line результату (те, що бачить оператор).
+            [IO.File]::WriteAllText((Join-Path $arRoot 'RUNTIME_MANIFEST.json'), (& $arManifestText @()), (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+            $arGitResponses = @{
+                toplevel = (& $arReply 0 ($arRoot + "`n")); shallow = (& $arReply 0 "false`n"); base = (& $arReply 0 ($arSha1 + "`n")); head = (& $arReply 0 ($arSha2 + "`n"))
+                mergebase = (& $arReply 0 ($arSha1 + "`n")); diff = (& $arReply 0 ('M' + $arNul + 'README.md' + $arNul)); untracked = (& $arReply 0 ''); show = (& $arReply 0 ''); status = (& $arReply 0 (' M x' + $arNul))
+            }
+            $arChildBehavior = $arDefaultChild
+            $arStream = @(Invoke-BRAVOAffectedSelfTest -RepositoryRoot $arRoot -BaseRef 'main' -GitInvoker $arGitInvoker -SelfTestInvoker $arChildInvoker 6>&1)
+            $arStreamResult = @($arStream | Where-Object { $_ -isnot [Management.Automation.InformationRecord] })
+            $arStreamText = @($arStream | Where-Object { $_ -is [Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
+            Test-BRAVOCondition `
+                -Condition (
+                    $arStreamResult.Count -eq 1 -and $arStreamText.Count -gt 5 -and $arStreamText.Count -eq @($arStreamResult[0].Line).Count -and
+                    [string]::Join("`n", $arStreamText) -ceq [string]::Join("`n", @($arStreamResult[0].Line)) -and
+                    @($arStreamText | Where-Object { [regex]::IsMatch($_, '(?i)^\s*SELF-TEST') }).Count -eq 0
+                ) `
+                -Name "Framework/AffectedRunner.ConsoleOutputEqualsResultLines" `
+                -Failure "функція повертає рівно один об'єкт результату, а все, що бачить оператор (Write-Host), збігається з Line і не містить рядків, що починаються з маркера Self-Test; рядків у потоці: $($arStreamText.Count)"
+
+            # R10 динамічно: жоден сценарій не дав рядка з маркером Self-Test на початку і маркера повного прогону.
+            $arSelfTestLines = 0
+            $arPassedWords = 0
+            foreach ($arEach in $arAll) {
+                $arSelfTestLines += @(& $arSelfTestLine $arEach).Count
+                $arSelfTestLines += @(@($arEach.Line) | Where-Object { [regex]::IsMatch([string]$_, '[\r\n]') }).Count
+                $arPassedWords += @(@($arEach.Line) | Where-Object { ([string]$_).Contains('SELF-TEST PASSED') -and -not ([string]$_).StartsWith('AFFECTED UNKNOWN PATH: ', [StringComparison]::Ordinal) }).Count
+                & $arCheck ('acceptance ' + $arEach.ResultCode) ($arEach.IsAcceptanceEvidence -eq $false -and ($arEach.ExitCode -eq 0 -or $arEach.ExitCode -eq 1))
+            }
+            $arAcceptanceProblem = & $arTake
+            Test-BRAVOCondition `
+                -Condition ($arAll.Count -ge 30 -and $arSelfTestLines -eq 0 -and $arPassedWords -eq 0 -and $arAcceptanceProblem.Length -eq 0) `
+                -Name "Framework/AffectedRunner.NeverPrintsSelfTestLinesDynamic" `
+                -Failure "R10: у жодному зі сценаріїв (всього $($arAll.Count)) рядок stdout runner-а не починається з маркера Self-Test і не містить маркера повного прогону (крім екранованого шляху в AFFECTED UNKNOWN PATH); IsAcceptanceEvidence завжди `$false, код лише 0 або 1; рядків із маркером: $arSelfTestLines; $arAcceptanceProblem"
+
+            # R11 [C]: порожній -Suite не будується; кодована команда містить лише непорожній -Suite @('..').
+            $arBodyOk = $true
+            $arBodyCount = 0
+            $arChildRuns = 0
+            foreach ($arEach in $arAll) {
+                if ($arEach.ChildInvoked -eq $true) {
+                    $arChildRuns++
+                    $arBodyCount++
+                    $arBody = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([string]$arEach.ChildRequest.EncodedCommand))
+                    $arBodyOk = $arBodyOk -and [regex]::IsMatch($arBody, "-Suite @\('[A-Za-z]+'(,'[A-Za-z]+')*\); exit ") -and
+                        -not [regex]::IsMatch($arBody, '-Suite\s*(@\(\s*\))?\s*(;|$)') -and $arBody -ceq [string]$arEach.ChildRequest.CommandBody
+                }
+            }
+            Test-BRAVOCondition `
+                -Condition ($arBodyOk -and $arBodyCount -ge 5 -and $arBodyCount -eq $arChildRuns) `
+                -Name "Framework/AffectedRunner.EmptySuiteArgumentIsNeverBuilt" `
+                -Failure "R11: у кожному запуску дочірнього прогону (перевірено $arBodyCount) тіло EncodedCommand містить непорожній -Suite @('A','B'); '-Suite @()' чи '-Suite' без значення не будується"
+
+            # R12 [R]: побудова дочірньої команди.
+            $arQuirkRoot = Join-Path ([IO.Path]::GetTempPath()) ("o'brien " + [char]0x2019 + 'x')
+            $arRequest = New-BRAVOAffectedChildRequest -RepositoryRoot $arQuirkRoot -Suite @('Governance', 'Paths')
+            $arExpectedScript = Join-Path ([IO.Path]::GetFullPath($arQuirkRoot)) 'BRAVO_SELF_TEST.ps1'
+            $arExpectedQuoted = "'" + $arExpectedScript.Replace("'", "''").Replace([string][char]0x2019, ([string][char]0x2019 + [char]0x2019)) + "'"
+            $arExpectedBody = '& ' + $arExpectedQuoted + " -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE"
+            $arDecoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([string]$arRequest.EncodedCommand))
+            $arArgumentOk = (
+                [string]::Join(' ', @($arRequest.Argument)) -ceq ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [string]$arRequest.EncodedCommand) -and
+                @($arRequest.Argument | Where-Object { $_ -ceq '-File' -or $_ -ceq '-Command' }).Count -eq 0)
+            $arEmptyThrows = $false
+            try { [void](New-BRAVOAffectedChildRequest -RepositoryRoot $arRoot -Suite @()) } catch { $arEmptyThrows = $true }
+            $arBadNameThrows = $false
+            try { [void](New-BRAVOAffectedChildRequest -RepositoryRoot $arRoot -Suite @("Gov'; calc")) } catch { $arBadNameThrows = $true }
+            $arControlThrows = $false
+            try { [void](New-BRAVOAffectedChildRequest -RepositoryRoot ($arRoot + "`nx") -Suite @('Governance')) } catch { $arControlThrows = $true }
+            $arSystemRoot = $env:SystemRoot
+            Test-BRAVOCondition `
+                -Condition (
+                    $arDecoded -ceq $arExpectedBody -and [string]$arRequest.CommandBody -ceq $arExpectedBody -and $arArgumentOk -and
+                    [string]::Join(',', @($arRequest.Suite)) -ceq 'Governance,Paths' -and [string]$arRequest.ScriptPath -ceq $arExpectedScript -and
+                    $arEmptyThrows -and $arBadNameThrows -and $arControlThrows -and
+                    (([string]::IsNullOrEmpty($arSystemRoot) -and [string]$arRequest.FilePath -ceq '') -or
+                        (-not [string]::IsNullOrEmpty($arSystemRoot) -and [string]$arRequest.FilePath -ceq (Join-Path $arSystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')))
+                ) `
+                -Name "Framework/AffectedRunner.EncodedCommandRoundTrip" `
+                -Failure ("R12: EncodedCommand (base64 UTF-16LE) декодується в `"& '<шлях>' -NoPause -Suite @('Governance','Paths'); exit `$LASTEXITCODE`" (апостроф і типографський апостроф у шляху подвоєно); аргументи -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand без -File; порожній чи небезпечний Suite і керувальні символи в шляху відхиляються. Декодовано: [$arDecoded]; очікувано: [$arExpectedBody]")
+        } finally {
+            Remove-Item -LiteralPath $arRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        # --- [T]: справжній git-репозиторій (лише в git-робочій копії) -----------
+        $arGitCommand = @(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue)
+        $arRunReal = ((Test-Path -LiteralPath (Join-Path $root '.git')) -and $arGitCommand.Count -gt 0)
+        if ($arRunReal) {
+            $arTReal = $false
+            $arTNote = 'сценарій не виконано'
+            $arRealDir = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_AFFECTEDRUNNER_REAL_' + [guid]::NewGuid().ToString('N'))
+            try {
+                [void][IO.Directory]::CreateDirectory($arRealDir)
+                $arRealGit = {
+                    param([string[]]$GitArgument)
+                    $fullArgument = @('-c', 'user.name=Test Author', '-c', 'user.email=test@example.invalid', '-c', 'core.autocrlf=false', '-c', 'core.quotepath=true') + $GitArgument
+                    $gitRun = Invoke-BRAVOGitCommand -RepositoryRoot $arRealDir -Argument $fullArgument
+                    if (-not ($gitRun.Available -and $null -ne $gitRun.ExitCode -and $gitRun.ExitCode -eq 0)) {
+                        throw ('git ' + [string]::Join(' ', $GitArgument) + ' завершився з помилкою: ' + [string]$gitRun.StdErr + [string]$gitRun.StartError)
+                    }
+                    return ($gitRun.StdOut -replace '[\r\n]+\z', '')
+                }
+                $arRealWrite = {
+                    param([string]$Relative, [string]$Content)
+                    $target = Join-Path $arRealDir $Relative
+                    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+                    [IO.File]::WriteAllText($target, $Content, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+                }
+                $null = & $arRealGit @('-c', 'init.defaultBranch=master', 'init', '--quiet')
+                & $arRealWrite 'README.md' 'one'
+                & $arRealWrite 'docs/keep.md' 'keep'
+                $null = & $arRealGit @('add', '-A')
+                $null = & $arRealGit @('commit', '--quiet', '-m', 'base')
+                $arRealBase = & $arRealGit @('rev-parse', 'HEAD')
+                & $arRealWrite 'README.md' 'two'
+                $arRealChild = { param($Request) return @{ ExitCode = 0; Lines = @('stub', ('SELF-TEST PARTIAL: ' + [string]::Join(',', @($Request.Suite)))) } }
+                $arRealOne = Invoke-BRAVOAffectedSelfTest -RepositoryRoot $arRealDir -BaseRef $arRealBase -SelfTestInvoker $arRealChild 6>$null
+                $arRealHead = & $arRealGit @('rev-parse', 'HEAD')
+                & $arRealWrite 'docs/new-unknown.md' 'u'
+                $arRealTwo = Invoke-BRAVOAffectedSelfTest -RepositoryRoot $arRealDir -BaseRef $arRealBase -SelfTestInvoker { param($Request) throw 'дочірній процес не повинен запускатись для V3' } 6>$null
+                $arRealThree = Invoke-BRAVOAffectedSelfTest -RepositoryRoot $arRealDir -BaseRef ('no-such-ref-' + [guid]::NewGuid().ToString('N')) -SelfTestInvoker $arRealChild 6>$null
+                $arTReal = (
+                    $arRealOne.ExitCode -eq 0 -and $arRealOne.ResultCode -ceq 'PARTIAL-OK' -and $arRealOne.Class -ceq 'V1' -and (& $arSuiteText $arRealOne) -ceq 'Governance' -and
+                    (& $arAny $arRealOne ('AFFECTED HEAD: ' + $arRealHead)) -and (& $arAny $arRealOne ('AFFECTED BASE: ' + $arRealBase)) -and (& $arAny $arRealOne 'AFFECTED DIRTY: true') -and
+                    $arRealTwo.ExitCode -eq 1 -and $arRealTwo.ResultCode -ceq 'ESCALATED-V3' -and $arRealTwo.ChildInvoked -eq $false -and
+                    $arRealThree.ExitCode -eq 1 -and $arRealThree.ResultCode -ceq 'BASE-INVALID')
+                $arTNote = "one=$($arRealOne.ResultCode)/$($arRealOne.Class); two=$($arRealTwo.ResultCode); three=$($arRealThree.ResultCode); head=$arRealHead"
+            } catch {
+                $arTNote = 'виняток сценарію: ' + $_.Exception.Message
+            } finally {
+                Remove-Item -LiteralPath $arRealDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Test-BRAVOCondition `
+                -Condition $arTReal `
+                -Name "Framework/AffectedRunner.RealRepositoryEndToEnd" `
+                -Failure ("B48: runner без -GitInvoker на справжньому репозиторії: V1 зі справжнім HEAD, BASE і DIRTY у виводі; untracked невідомий файл -> ESCALATED-V3 без дочірнього процесу; невідомий ref -> BASE-INVALID. Деталі: " + $arTNote)
+        } else {
+            Write-Host "  Сценарії AffectedRunner на реальному git-репозиторії пропущено: вони виконуються лише в git-робочій копії (потрібні .git і git)."
+        }
+        Test-BRAVOCondition `
+            -Condition (($env:GITHUB_ACTIONS -ne 'true') -or $arRunReal) `
+            -Name "Framework/AffectedRunner.RealScenariosRunOnCi" `
+            -Failure "на GitHub Actions сценарії AffectedRunner на реальному git-репозиторії мусять виконуватись (потрібні .git у корені та git у PATH); їх відсутність мовчки прибрала б покриття. .git: $(Test-Path -LiteralPath (Join-Path $root '.git')); git знайдено: $($arGitCommand.Count -gt 0)"
+
+        # --- [R]: статичні guard-и файлів ------------------------------------
+        $arForbiddenLiterals = @('2>&1', '??', '?.', '&&', '||', '-Parallel', '::new', 'Invoke-Expression', 'SELF-TEST PASSED', '"SELF-TEST', 'Suite @()', "'-File'")
+        $arLibraryTexts = @{}
+        foreach ($arLibraryPath in @($arPath, $arCliPath, $arCollectorPath, (Join-Path $root 'selftest\BRAVOSelfTestSuiteMap.ps1'))) {
+            $arLibraryTexts[$arLibraryPath] = [IO.File]::ReadAllText($arLibraryPath, [Text.Encoding]::UTF8)
+        }
+        $arForbiddenFound = New-Object System.Collections.Generic.List[string]
+        foreach ($arLibraryPath in @($arLibraryTexts.Keys)) {
+            foreach ($arLiteral in @('SELF-TEST PASSED', '"SELF-TEST')) {
+                if ($arLibraryTexts[$arLibraryPath].IndexOf($arLiteral, [StringComparison]::Ordinal) -ge 0) { [void]$arForbiddenFound.Add([IO.Path]::GetFileName($arLibraryPath) + ':' + $arLiteral) }
+            }
+        }
+        foreach ($arOwnPath in @($arPath, $arCliPath)) {
+            foreach ($arLiteral in $arForbiddenLiterals) {
+                if ($arLibraryTexts[$arOwnPath].IndexOf($arLiteral, [StringComparison]::Ordinal) -ge 0) { [void]$arForbiddenFound.Add([IO.Path]::GetFileName($arOwnPath) + ':' + $arLiteral) }
+            }
+        }
+        $arParsedLibrary = Get-BRAVOSelfTestParsedFile -Path $arPath
+        $arParsedCli = Get-BRAVOSelfTestParsedFile -Path $arCliPath
+        $arFunctionNames = [string]::Join(',', @($arParsedLibrary.Ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+                    ForEach-Object { $_.Name } | Sort-Object { $_ }))
+        $arCliFunctions = @($arParsedCli.Ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))
+        $arPs7Nodes = @($arParsedLibrary.Ast.FindAll({ param($node) @('TernaryExpressionAst', 'PipelineChainAst', 'NullConditionalMemberAccessAst', 'NullConditionalIndexExpressionAst', 'ChainableAst') -contains $node.GetType().Name }, $true)) +
+            @($arParsedCli.Ast.FindAll({ param($node) @('TernaryExpressionAst', 'PipelineChainAst', 'NullConditionalMemberAccessAst', 'NullConditionalIndexExpressionAst', 'ChainableAst') -contains $node.GetType().Name }, $true))
+        Test-BRAVOCondition `
+            -Condition (
+                $arForbiddenFound.Count -eq 0 -and $arPs7Nodes.Count -eq 0 -and
+                $arFunctionNames -ceq 'ConvertTo-BRAVOAffectedPrintableText,Invoke-BRAVOAffectedChildProcess,Invoke-BRAVOAffectedSelfTest,New-BRAVOAffectedChildRequest' -and
+                $arCliFunctions.Count -eq 0 -and
+                $arText.Contains('-EncodedCommand') -and $arText.Contains('-ExecutionPolicy') -and $arText.Contains('child| ')
+            ) `
+            -Name "Framework/AffectedRunner.StaticSourceHasNoForbiddenConstructs" `
+            -Failure ("ci\BRAVOAffectedSelfTest.ps1 і ci\Invoke-BRAVOAffectedSelfTest.ps1: без 2>&1, ??, ?., &&, ||, -Parallel, ::new, Invoke-Expression, -File, порожнього '-Suite @()', літералів маркера повного прогону чи рядка з лапкою перед маркером (так само у збирача й мапи); без PowerShell 7-вузлів; рівно чотири функції в бібліотеці й жодної в CLI. Знайдено: [" +
+                [string]::Join(', ', $arForbiddenFound.ToArray()) + "] PS7-вузлів: $($arPs7Nodes.Count); функції: [$arFunctionNames]; функцій у CLI: $($arCliFunctions.Count)")
+
+        # R19 [R]: CLI - тонка обгортка; лише exit 0/1; нової таблиці exit-кодів немає.
+        $arExitTexts = @([regex]::Matches($arCliText, '(?m)^\s*exit\s+(\S+)') | ForEach-Object { $_.Groups[1].Value })
+        $arCliLineCount = @($arCliText -split "`n").Count
+        Test-BRAVOCondition `
+            -Condition (
+                $arCliText.Contains('Set-StrictMode -Version 2.0') -and [regex]::IsMatch($arCliText, "\`$ErrorActionPreference\s*=\s*'Stop'") -and
+                $arExitTexts.Count -ge 2 -and @($arExitTexts | Where-Object { $_ -cne '0' -and $_ -cne '1' }).Count -eq 0 -and
+                -not [regex]::IsMatch($arCliText, '(?i)BRAVO\.ExitCodes|ExitCode\s*=') -and
+                $arCliText.Contains('Invoke-BRAVOAffectedSelfTest') -and $arCliLineCount -le 120 -and
+                -not [regex]::IsMatch($arText, '(?i)BRAVO\.ExitCodes|\bexit\s+\d')
+            ) `
+            -Name "Framework/AffectedRunner.CliIsThinAndExitsOnlyZeroOrOne" `
+            -Failure "R19: ci\Invoke-BRAVOAffectedSelfTest.ps1 - тонкий CLI (до 120 рядків) зі Set-StrictMode -Version 2.0, `$ErrorActionPreference = 'Stop' і лише exit 0 або exit 1; нових exit-кодів і BRAVO.ExitCodes немає; бібліотека не викликає exit. Знайдено exit: [$([string]::Join(', ', $arExitTexts))]; рядків CLI: $arCliLineCount"
+
+        $arBytesOk = $true
+        foreach ($arFilePath in @($arPath, $arCliPath)) {
+            $arBytes = [IO.File]::ReadAllBytes($arFilePath)
+            $arBareLf = $false
+            for ($arByteIndex = 0; $arByteIndex -lt $arBytes.Length; $arByteIndex++) {
+                if ($arBytes[$arByteIndex] -eq 10 -and ($arByteIndex -eq 0 -or $arBytes[$arByteIndex - 1] -ne 13)) { $arBareLf = $true; break }
+            }
+            $arBytesOk = $arBytesOk -and $arBytes.Length -gt 3 -and $arBytes[0] -eq 0xEF -and $arBytes[1] -eq 0xBB -and $arBytes[2] -eq 0xBF -and -not $arBareLf
+        }
+        Test-BRAVOCondition `
+            -Condition (@($arParsedLibrary.Errors).Count -eq 0 -and @($arParsedCli.Errors).Count -eq 0 -and $arBytesOk) `
+            -Name "Framework/AffectedRunner.FilesParseAndHaveBomCrlf" `
+            -Failure "ci\BRAVOAffectedSelfTest.ps1 і ci\Invoke-BRAVOAffectedSelfTest.ps1 мусять розбиратись без помилок (Windows PowerShell 5.1), мати UTF-8 BOM і CRLF, як сусідні файли ci\. Помилок розбору: $(@($arParsedLibrary.Errors).Count)/$(@($arParsedCli.Errors).Count)"
+    }
+}
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedRunner' } }
+
 if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionIsolation') { try {
 
 # ============================================================
