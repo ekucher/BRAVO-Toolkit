@@ -35,9 +35,9 @@ Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
 $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-# Свіжість накопичувальних оновлень Windows тут навмисно НЕ перевіряється:
-# це health-метрика, а не умова виконання backup. Її місце в BRAVO_HEALTH,
-# який для цього й існує. Перевірки платформи (ОС, build, PowerShell, .NET,
+# Свіжість накопичувальних оновлень Windows Toolkit не перевіряє ніде
+# (ні тут, ні в BRAVO_HEALTH): на результат backup вік патчів не впливає,
+# а постійне нагадування було лише шумом. Перевірки платформи (ОС, build, PowerShell, .NET,
 # архітектура, API) лишаються вище й на місці.
 $archiveHelpersPath = Join-Path $bravoScriptDirectory 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1'
 if (-not (Test-Path -LiteralPath $archiveHelpersPath -PathType Leaf)) {
