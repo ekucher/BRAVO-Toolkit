@@ -379,7 +379,7 @@
         New-Item -ItemType Directory -Path $aa293Local -Force | Out-Null
         $aa293File = New-BRAVOSelfTestBazaFile -Directory $aa293Local -RelativePath "eqv_11-116.pdf" -SizeBytes 500
         $aa293Session = New-BRAVOSelfTestFakeBazaSession
-        $aa293Cycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aa293Local -RemoteRootPath '/baza_app' -Session $aa293Session -StateRoot $aa293State -BootstrapIfNeeded -FullAuditProvider $baza
+        $aa293Cycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aa293Local -RemoteRootPath '/baza_app' -Session $aa293Session -StateRoot $aa293State -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
         [IO.File]::WriteAllBytes($aa293File, (New-Object byte[] 999))
         [void](New-BRAVOSelfTestBazaFile -Directory $aa293Local -RelativePath "b.txt" -SizeBytes 100)
         $aa293Session.State.RemoteSizes['/baza_app/b.txt'] = [int64]55
