@@ -8213,6 +8213,55 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 -Failure '5.2.4: history-прогноз 125000 B має обмежуватись доведеною межею джерела 50000*1.02 = 51000 B; стеля робить вимогу тіснішою і ніколи не більшою' `
                 -Name 'Archive/EstimatedSpaceHistoryCappedBySmallerSource'
 
+            # #284: production-джерела задаються у формі "<SRC>\*"
+            # (BRAVO.Configuration.Derivation: Join-Path <SOURCE> "*"), бо саме
+            # так 7-Zip бере ВМІСТ каталогу. Оцінка мусить вимірювати цей
+            # каталог, а не шукати літеральний файл "*": інакше компонент без
+            # історії мовчки отримує EstimateBasis=Unknown і випадає з суми по
+            # тому, а стеля HistoryCappedBySource ніколи не спрацьовує.
+            $estimateBootstrapStarSource = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BRAVOEXCH'; Source = (Join-Path $estimatedSpaceBootstrapSource '*'); Destination = $estimatedSpaceBootstrapDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateBootstrapStarSource.Success -and
+                    -not $estimateBootstrapStarSource.ComponentEstimates[0].HasHistory -and
+                    $estimateBootstrapStarSource.ComponentEstimates[0].SourceBytes -eq 40000 -and
+                    $estimateBootstrapStarSource.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
+                    $estimateBootstrapStarSource.ComponentEstimates[0].EstimatedBytes -eq 40800 -and
+                    @($estimateBootstrapStarSource.VolumeStatus).Count -eq 1
+                ) `
+                -Name 'Archive/EstimatedSpaceBootstrapMeasuresProductionStarSource' `
+                -Failure "#284: джерело у production-формі '<SRC>\*' без історії має виміряти вміст каталогу (40000 B) і дати вимогу 40800 B; факт: SourceBytes=$($estimateBootstrapStarSource.ComponentEstimates[0].SourceBytes), basis=$($estimateBootstrapStarSource.ComponentEstimates[0].EstimateBasis)"
+
+            $estimateCappedStar = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'MODEL'; Source = (Join-Path $estimatedSpaceShrunkSource '*'); Destination = $estimatedSpaceModelDir }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 200000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateCappedStar.Success -and
+                    $estimateCappedStar.ComponentEstimates[0].HasHistory -and
+                    $estimateCappedStar.ComponentEstimates[0].SourceBytes -eq 50000 -and
+                    $estimateCappedStar.ComponentEstimates[0].EstimateBasis -eq 'HistoryCappedBySource' -and
+                    $estimateCappedStar.ComponentEstimates[0].EstimatedBytes -eq 51000
+                ) `
+                -Name 'Archive/EstimatedSpaceHistoryCappedByProductionStarSource' `
+                -Failure "#284: стеля джерела має діяти і для production-форми '<SRC>\*' (50000*1.02 = 51000 B); факт: SourceBytes=$($estimateCappedStar.ComponentEstimates[0].SourceBytes), basis=$($estimateCappedStar.ComponentEstimates[0].EstimateBasis)"
+
             # C4 (5.2.4): межа НЕ застосовується, коли джерело порожнє —
             # інакше нульове/недоступне джерело обнулило б вимогу компонента,
             # який насправді має що архівувати.
