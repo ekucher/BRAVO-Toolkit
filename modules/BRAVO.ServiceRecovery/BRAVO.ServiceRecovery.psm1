@@ -1,9 +1,13 @@
 ﻿# ============================================================
-# BRAVO.ServiceRecovery — облік відновлення впалих служб (#314, хвиля 3).
+# BRAVO.ServiceRecovery — облік відновлення впалих служб (#314, хвилі 3–4).
 #
 # Чиста логіка без звернень до SCM/WMI: політика пауз, state-файл спроб
 # (FR-5), рішення «чи можна запускати зараз», облік CRITICAL «циклічно
-# падає» і тексти сповіщень (FR-6). Запускає служби лише Maintenance —
+# падає», тексти сповіщень (FR-6) і план ланцюжка профілю -RecoverServices
+# (FR-3, Get-BRAVOServiceRecoveryChainPlan). Лише ЧИТАЮТЬ стан системи дві
+# функції профілю: класифікація керованих служб
+# (Get-BRAVOServiceRecoveryConditions) і події SCM із журналу System
+# (Get-BRAVOServiceRecoveryScmEvents). Запускає служби лише Maintenance —
 # цей модуль нічого не запускає і нічого не надсилає.
 #
 # State: %ProgramData%\BRAVO\State\BRAVO_SERVICE_RECOVERY_STATE.json
@@ -615,4 +619,340 @@ function New-BRAVOServiceRecoveryNotificationText {
                 $ServiceName, $AttemptNumber, $sinceTime.ToString('dd.MM HH:mm', $invariant), $logText)
         }
     }
+}
+
+# ============================================================
+# #314 хвиля 4 (FR-3): профіль BRAVO_MAINTENANCE.ps1 -RecoverServices.
+# ============================================================
+
+function Get-BRAVOServiceRecoveryItemValue {
+    # Приватний: значення поля опису служби (hashtable або об'єкт) — під
+    # Set-StrictMode відсутня властивість об'єкта напряму не читається.
+    param(
+        [AllowNull()][object]$Item,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($null -eq $Item) { return $null }
+    if ($Item -is [Collections.IDictionary]) { return $Item[$Name] }
+    $property = $Item.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-BRAVOServiceRecoveryConditions {
+    # Класифікація керованих служб для профілю -RecoverServices (FR-3, крок 1;
+    # повторно — під lock-ом). Лише ЧИТАЄ стан. -Services — опис керованих
+    # служб (Key: Bravo | ExchangeApi | BravoWeb, Name, Enabled); некерована
+    # служба (компонент вимкнено, службу не встановлено, Disabled від
+    # оператора) або служба без імені не класифікується. Ownership-маркер
+    # читається ОДИН раз на виклик. Результат — об'єкти
+    # Get-BRAVOManagedServiceCondition (BRAVO.System) з доданим Key у
+    # канонічному порядку BRAVO -> exchangAPI -> BRAVO Web.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Services
+    )
+
+    $quiescenceState = $null
+    try { $quiescenceState = Read-BRAVOServiceQuiescenceState } catch { $quiescenceState = $null }
+    $conditions = @()
+    foreach ($serviceKey in @(Get-BRAVOManagedServiceOrder -Direction Start)) {
+        foreach ($service in @($Services)) {
+            if ([string](Get-BRAVOServiceRecoveryItemValue -Item $service -Name 'Key') -ne $serviceKey) { continue }
+            $serviceName = [string](Get-BRAVOServiceRecoveryItemValue -Item $service -Name 'Name')
+            if (-not [bool](Get-BRAVOServiceRecoveryItemValue -Item $service -Name 'Enabled') -or
+                [string]::IsNullOrWhiteSpace($serviceName)) { continue }
+            $condition = Get-BRAVOManagedServiceCondition -Name $serviceName -QuiescenceState $quiescenceState
+            Add-Member -InputObject $condition -NotePropertyName 'Key' -NotePropertyValue $serviceKey -Force
+            $conditions += $condition
+        }
+    }
+    return @($conditions)
+}
+
+function Get-BRAVOServiceRecoveryChainPlan {
+    # План ланцюжка профілю -RecoverServices (FR-3, крок 5). ЧИСТА функція:
+    # рішення лише з переданих станів. -Conditions — класифіковані керовані
+    # служби (Key, Name, Condition, Status; hashtable або об'єкт, порядок
+    # довільний). -EligibleNames — впалі служби, чия пауза минула
+    # (Get-BRAVOServiceRecoveryAttemptDecision); без параметра — усі впалі.
+    # Правила (рішення власника #314, порядок BRAVO -> exchangAPI -> BRAVO Web):
+    #   - впала BRAVO: працюючі залежні (exchangAPI, BRAVO Web) зупиняються
+    #     перед її запуском і запускаються після неї; впала залежна теж
+    #     запускається (і обліковується); залежна в Pending -> Deferred;
+    #   - впала exchangAPI / BRAVO Web без впалої BRAVO: запускається лише
+    #     вона; BRAVO в Pending -> Deferred;
+    #   - Disabled, NotInstalled, OwnedByBravo, призупинена (Failed, але не
+    #     Stopped — §0.3) — поза планом.
+    # Deferred непорожній = план цього тику НЕ виконується (служба саме
+    # змінює стан; наступна перевірка через <= 15 хв).
+    # Результат: FailedKeys/FailedNames (обліковуються як спроба;
+    # AccountedNames — те саме), StopKeys/StopOrder (порядок зупинки BRAVO
+    # Web -> exchangAPI), StartKeys/StartOrder (канонічний порядок запуску),
+    # Deferred (імена).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Conditions,
+        [AllowNull()][AllowEmptyCollection()][string[]]$EligibleNames
+    )
+
+    $byKey = @{}
+    foreach ($item in @($Conditions)) {
+        if ($null -eq $item) { continue }
+        $itemKey = [string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'Key')
+        if ([string]::IsNullOrWhiteSpace($itemKey) -or $byKey.ContainsKey($itemKey)) { continue }
+        $byKey[$itemKey] = [pscustomobject]@{
+            Key       = $itemKey
+            Name      = [string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'Name')
+            Condition = [string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'Condition')
+            Status    = [string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'Status')
+        }
+    }
+    $filterEligible = $PSBoundParameters.ContainsKey('EligibleNames') -and $null -ne $EligibleNames
+    $isEligible = {
+        param($Entry)
+        if (-not (Test-BRAVOServiceRecoveryFailed -Condition $Entry)) { return $false }
+        if (-not $filterEligible) { return $true }
+        return (@($EligibleNames | Where-Object { [string]$_ -ieq $Entry.Name }).Count -gt 0)
+    }
+
+    $failed = @{}
+    $stop = @{}
+    $start = @{}
+    $deferred = @{}
+    $bravo = $byKey['Bravo']
+    $bravoFailed = ($null -ne $bravo -and (& $isEligible $bravo))
+    if ($bravoFailed) {
+        $failed['Bravo'] = $true
+        $start['Bravo'] = $true
+    }
+    foreach ($dependentKey in @('ExchangeApi', 'BravoWeb')) {
+        $dependent = $byKey[$dependentKey]
+        if ($null -eq $dependent) { continue }
+        if ($bravoFailed) {
+            if (Test-BRAVOServiceRecoveryFailed -Condition $dependent) {
+                $failed[$dependentKey] = $true
+                $start[$dependentKey] = $true
+            } elseif ($dependent.Condition -eq 'Running') {
+                $stop[$dependentKey] = $true
+                $start[$dependentKey] = $true
+            } elseif ($dependent.Condition -eq 'Pending') {
+                $deferred[$dependentKey] = $true
+            }
+        } elseif (& $isEligible $dependent) {
+            $failed[$dependentKey] = $true
+            $start[$dependentKey] = $true
+            if ($null -ne $bravo -and $bravo.Condition -eq 'Pending') {
+                $deferred['Bravo'] = $true
+            }
+        }
+    }
+
+    $startKeyOrder = @(Get-BRAVOManagedServiceOrder -Direction Start)
+    $failedKeys = @($startKeyOrder | Where-Object { $failed.ContainsKey($_) })
+    $stopKeys = @(Get-BRAVOManagedServiceOrder -Direction Stop | Where-Object { $stop.ContainsKey($_) })
+    $startKeys = @($startKeyOrder | Where-Object { $start.ContainsKey($_) })
+    $deferredKeys = @($startKeyOrder | Where-Object { $deferred.ContainsKey($_) })
+    $failedNames = @($failedKeys | ForEach-Object { $byKey[$_].Name })
+    return [pscustomobject]@{
+        FailedKeys     = $failedKeys
+        FailedNames    = $failedNames
+        StopKeys       = $stopKeys
+        StopOrder      = @($stopKeys | ForEach-Object { $byKey[$_].Name })
+        StartKeys      = $startKeys
+        StartOrder     = @($startKeys | ForEach-Object { $byKey[$_].Name })
+        Deferred       = @($deferredKeys | ForEach-Object { $byKey[$_].Name })
+        AccountedNames = $failedNames
+    }
+}
+
+function Get-BRAVOServiceRecoveryScmEventOwner {
+    # Приватний: якій службі належить подія SCM. Перший параметр події SCM —
+    # ім'я служби (7034/7031 — відображуване ім'я, тому -Aliases: псевдонім ->
+    # ім'я служби); коли параметрів немає — пошук імені окремим словом у
+    # тексті. $null — подія не стосується жодної з -ServiceNames.
+    param(
+        [Parameter(Mandatory = $true)][object]$ScmEvent,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ServiceNames,
+        [hashtable]$Aliases = @{}
+    )
+
+    $candidates = @()
+    foreach ($serviceName in @($ServiceNames)) {
+        if (-not [string]::IsNullOrWhiteSpace($serviceName)) { $candidates += , @([string]$serviceName, [string]$serviceName) }
+    }
+    foreach ($alias in @($Aliases.Keys)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$alias)) { $candidates += , @([string]$alias, [string]$Aliases[$alias]) }
+    }
+    $firstValue = $null
+    $propertiesProperty = $ScmEvent.PSObject.Properties['Properties']
+    if ($null -ne $propertiesProperty -and $null -ne $propertiesProperty.Value) {
+        $firstProperty = @($propertiesProperty.Value) | Select-Object -First 1
+        if ($null -ne $firstProperty) {
+            $valueProperty = $firstProperty.PSObject.Properties['Value']
+            $firstValue = if ($null -ne $valueProperty) { [string]$valueProperty.Value } else { [string]$firstProperty }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($firstValue)) {
+        foreach ($candidate in $candidates) {
+            if ($firstValue.Trim() -ieq $candidate[0]) { return $candidate[1] }
+        }
+        return $null
+    }
+    $messageProperty = $ScmEvent.PSObject.Properties['Message']
+    $message = if ($null -ne $messageProperty) { [string]$messageProperty.Value } else { '' }
+    foreach ($candidate in $candidates) {
+        $pattern = '(?<![\w.-])' + [regex]::Escape($candidate[0]) + '(?![\w.-])'
+        if ([regex]::IsMatch($message, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)) { return $candidate[1] }
+    }
+    return $null
+}
+
+function Select-BRAVOServiceRecoveryScmEvents {
+    # ЧИСТИЙ селектор подій SCM для журналу RECOVER (FR-3, крок 7): лише події
+    # служб -ServiceNames (див. Get-BRAVOServiceRecoveryScmEventOwner),
+    # хронологічно, не більше -MaxEvents найновіших. Результат — об'єкти
+    # ServiceName, Id, TimeCreated, Message.
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]]$Events,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ServiceNames,
+        [hashtable]$Aliases = @{},
+        [int]$MaxEvents = 50
+    )
+
+    $selected = @()
+    foreach ($scmEvent in @($Events)) {
+        if ($null -eq $scmEvent) { continue }
+        $owner = Get-BRAVOServiceRecoveryScmEventOwner -ScmEvent $scmEvent -ServiceNames $ServiceNames -Aliases $Aliases
+        if ($null -eq $owner) { continue }
+        $timeCreated = $null
+        $timeProperty = $scmEvent.PSObject.Properties['TimeCreated']
+        if ($null -ne $timeProperty) {
+            try { $timeCreated = ConvertTo-BRAVOServiceRecoveryDateTime -Value $timeProperty.Value } catch { $timeCreated = $null }
+        }
+        $idProperty = $scmEvent.PSObject.Properties['Id']
+        $messageProperty = $scmEvent.PSObject.Properties['Message']
+        $selected += [pscustomobject]@{
+            ServiceName = $owner
+            Id          = $(if ($null -ne $idProperty) { $idProperty.Value -as [int] } else { $null })
+            TimeCreated = $timeCreated
+            Message     = $(if ($null -ne $messageProperty) { [string]$messageProperty.Value } else { '' })
+        }
+    }
+    $sorted = @($selected | Sort-Object -Property {
+            if ($null -ne $_.TimeCreated) { $_.TimeCreated.ToUniversalTime() } else { [datetime]::MinValue }
+        })
+    if ($MaxEvents -gt 0 -and $sorted.Count -gt $MaxEvents) {
+        $sorted = @($sorted | Select-Object -Last $MaxEvents)
+    }
+    return @($sorted)
+}
+
+function Get-BRAVOServiceRecoveryScmEvents {
+    # Події SCM служб -ServiceNames із журналу System з моменту завантаження
+    # ОС (LastBootUpTime; недоступний — останні WindowHours годин): Id із
+    # політики (ScmEventIds), не більше -MaxEvents найновіших. Лише ЧИТАЄ і
+    # ніколи не кидає винятку: поза Windows або без доступу до журналу —
+    # Available = $false і причина («події SCM недоступні»).
+    # Результат: Available, Events (Select-BRAVOServiceRecoveryScmEvents),
+    # Since, Reason.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ServiceNames,
+        [int]$MaxEvents = 0
+    )
+
+    $policy = Get-BRAVOServiceRecoveryPolicy
+    if ($MaxEvents -le 0) { $MaxEvents = [int]$policy.MaxScmEvents }
+    $result = [pscustomobject]@{ Available = $false; Events = @(); Since = $null; Reason = $null }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+        $null -eq (Get-Command -Name 'Get-WinEvent' -ErrorAction SilentlyContinue)) {
+        $result.Reason = 'події SCM недоступні: журналу подій Windows (Get-WinEvent) на цьому хості немає'
+        return $result
+    }
+
+    $since = $null
+    try {
+        if ($null -ne (Get-Command -Name 'Get-BRAVOWmiInstance' -ErrorAction SilentlyContinue)) {
+            $operatingSystem = @(Get-BRAVOWmiInstance -ClassName 'Win32_OperatingSystem') | Select-Object -First 1
+            if ($null -ne $operatingSystem) {
+                $bootProperty = $operatingSystem.PSObject.Properties['LastBootUpTime']
+                if ($null -ne $bootProperty -and $null -ne $bootProperty.Value) {
+                    $since = if ($bootProperty.Value -is [datetime]) {
+                        [datetime]$bootProperty.Value
+                    } else {
+                        [Management.ManagementDateTimeConverter]::ToDateTime([string]$bootProperty.Value)
+                    }
+                }
+            }
+        }
+    } catch {
+        $since = $null
+    }
+    if ($null -eq $since) { $since = (Get-Date).AddHours(-[int]$policy.WindowHours) }
+    $result.Since = $since
+
+    # 7034/7031 несуть відображуване ім'я служби: псевдоніми для селектора.
+    $aliases = @{}
+    foreach ($serviceName in @($ServiceNames)) {
+        if ([string]::IsNullOrWhiteSpace($serviceName)) { continue }
+        try {
+            $service = @(Get-Service -Name $serviceName -ErrorAction Stop) | Select-Object -First 1
+            if ($null -ne $service -and -not [string]::IsNullOrWhiteSpace([string]$service.DisplayName) -and
+                [string]$service.DisplayName -ine $serviceName) {
+                $aliases[[string]$service.DisplayName] = [string]$serviceName
+            }
+        } catch {
+            # Служби немає — шукаємо лише за іменем.
+        }
+    }
+
+    try {
+        $rawEvents = @(Get-WinEvent -FilterHashtable @{
+                LogName      = 'System'
+                ProviderName = 'Service Control Manager'
+                Id           = @($policy.ScmEventIds)
+                StartTime    = $since
+            } -ErrorAction Stop)
+    } catch {
+        # «No events were found» — штатна відсутність подій, не збій доступу.
+        if ([string]$_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
+            $result.Available = $true
+            return $result
+        }
+        $result.Reason = "події SCM недоступні: $($_.Exception.Message)"
+        return $result
+    }
+    $result.Available = $true
+    $result.Events = @(Select-BRAVOServiceRecoveryScmEvents -Events $rawEvents -ServiceNames $ServiceNames -Aliases $aliases -MaxEvents $MaxEvents)
+    return $result
+}
+
+function Add-BRAVOServiceRecoverySummaryLine {
+    # Зведений журнал профілю -RecoverServices (LOGS\
+    # BRAVO_SERVICE_RECOVERY_SUMMARY.log, UTF-8 без BOM) — рядок про впалу
+    # службу в паузі, коли профіль нічого не робить. Перевірка йде кожні
+    # 15 хв, тому рядок дописується, лише якщо він не збігається з останнім.
+    # Повертає $true, якщо рядок дописано.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Text
+    )
+
+    $line = $Text.Trim()
+    if ([IO.File]::Exists($Path)) {
+        $lastLine = @([IO.File]::ReadAllLines($Path, [Text.Encoding]::UTF8) |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -Last 1
+        if ([string]$lastLine -ceq $line) { return $false }
+    } else {
+        $directory = Split-Path -Path $Path -Parent
+        if (-not [string]::IsNullOrWhiteSpace($directory) -and -not [IO.Directory]::Exists($directory)) {
+            [void][IO.Directory]::CreateDirectory($directory)
+        }
+    }
+    [IO.File]::AppendAllText($Path, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+    return $true
 }

@@ -873,7 +873,7 @@ function Write-BRAVOStateTemporaryText {
         $w4Scm = & $w4ChainModule {
             Set-StrictMode -Version 2.0
             $base = New-Object DateTime(2026, 10, 7, 10, 0, 0, [DateTimeKind]::Local)
-            $event = {
+            $newScmEvent = {
                 param([int]$Id, [int]$MinutesAgo, [string]$Message, [object[]]$Values)
                 [pscustomobject]@{
                     Id = $Id; TimeCreated = $base.AddMinutes(-$MinutesAgo); Message = $Message
@@ -881,11 +881,11 @@ function Write-BRAVOStateTemporaryText {
                 }
             }
             $events = @(
-                (& $event 7034 5 'other text' @('Apache2.4')),
-                (& $event 7034 30 'Служба "exchangAPI" неочікувано завершила роботу.' @('exchangAPI', 1)),
-                (& $event 7031 20 'The BRAVO Web service terminated unexpectedly.' @('BRAVO Web', 2)),
-                (& $event 7034 10 'Служба "Spooler" неочікувано завершила роботу.' @('Spooler', 1)),
-                (& $event 7000 15 'Служба BRAVO не запустилася.' @())
+                (& $newScmEvent 7034 5 'other text' @('Apache2.4')),
+                (& $newScmEvent 7034 30 'Служба "exchangAPI" неочікувано завершила роботу.' @('exchangAPI', 1)),
+                (& $newScmEvent 7031 20 'The BRAVO Web service terminated unexpectedly.' @('BRAVO Web', 2)),
+                (& $newScmEvent 7034 10 'Служба "Spooler" неочікувано завершила роботу.' @('Spooler', 1)),
+                (& $newScmEvent 7000 15 'Служба BRAVO не запустилася.' @())
             )
             $all = @(Select-BRAVOServiceRecoveryScmEvents -Events $events -ServiceNames @('exchangAPI', 'Apache2.4', 'BRAVO') -MaxEvents 50)
             $limited = @(Select-BRAVOServiceRecoveryScmEvents -Events $events -ServiceNames @('exchangAPI', 'Apache2.4', 'BRAVO') -MaxEvents 1)
@@ -1341,7 +1341,7 @@ function Get-BRAVOServiceRecoveryConditions {
             [string](@($w4Exchange.LogCalls) | Select-Object -First 1) -ceq 'INFO|=== ВІДНОВЛЕННЯ СЛУЖБ (-RecoverServices) ===' -and
             @($w4Exchange.LogCalls | Where-Object { $_ -match 'exchangAPI' -and $_ -match 'ExitCode=1067' -and $_ -match 'StartMode=Automatic' -and $_ -match 'ServiceSpecificExitCode=0' }).Count -ge 1 -and
             @($w4Exchange.LogCalls | Where-Object { $_ -match 'події SCM недоступні' }).Count -ge 1 -and
-            (& $w4ForbiddenEvents $w4Exchange).Count -eq 0 -and
+            @(& $w4ForbiddenEvents $w4Exchange).Count -eq 0 -and
             [int]$w4Exchange.LockExits -eq 1
         ) `
         -Name 'ServiceRecovery/ProfileStartsFailedExchangeApiUnderMarker' `
@@ -1357,7 +1357,7 @@ function Get-BRAVOServiceRecoveryConditions {
             $null -eq $w4Bravo.Error -and [int]$w4Bravo.ExitCode -eq 0 -and
             ($w4BravoActions -join '; ') -ceq ('MARKER BRAVO_MAINTENANCE_RECOVER BRAVO=True,exchangAPI=True,Apache2.4=True; STATE Apache2.4 Stopped; STATE exchangAPI Stopped; LOGS Bravo; ' +
                 'START BRAVO recovery=True; START exchangAPI recovery=False; START Apache2.4 recovery=False; CLEAR; REPORT') -and
-            (& $w4ForbiddenEvents $w4Bravo).Count -eq 0
+            @(& $w4ForbiddenEvents $w4Bravo).Count -eq 0
         ) `
         -Name 'ServiceRecovery/ProfileBravoFailedRestartsDependentsInCanonicalOrder' `
         -Failure "впала BRAVO: маркер на всі три служби, зупинка BRAVO Web і exchangAPI, журнали BRAVO, запуск BRAVO -> exchangAPI -> BRAVO Web, без Stop-BRAVOMaintenanceStrayProcess: $(& $w4Describe $w4Bravo)"

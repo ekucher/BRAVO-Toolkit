@@ -2,6 +2,35 @@
 
 ## Не випущено (developer)
 
+- **Feature: профіль відновлення впалих служб `BRAVO_MAINTENANCE.ps1 -RecoverServices` (#314, хвиля 4, FR-3).**
+  Новий перемикач запускає не обслуговування, а легкий профіль: класифікація керованих служб без lock-а
+  (`Get-BRAVOServiceRecoveryConditions`, «впала» = `Failed` і `Stopped`). Немає впалих → вихід 0 без журналу й записів
+  на диск (єдиний виняток — `stableSince` у `BRAVO_SERVICE_RECOVERY_STATE.json`, коли служба з обліком спроб
+  стабільно працює). Паузи між спробами 0/5/15/60 хв: служба в паузі не запускається (рядок
+  «X впала, пауза до HH:mm (спроба K)» у `LOGS\BRAVO_SERVICE_RECOVERY_SUMMARY.log`, без дублів). Далі — операційний
+  lock без очікування (`Enter-BRAVOMaintenanceOperationLock -NoWait -OperationName ServiceRecovery`; у JSON lock-а
+  `operation = ServiceRecovery`): зайнятий (нічний Maintenance, архівація, DataRestore) → вихід 20 без журналу, змін і
+  сповіщень. Під lock-ом: ownership-маркер живого чужого власника → 20; маркер із `restartSuppressed` → нічого не
+  запускати (INFO, код 43); осиротілий маркер без suppression відпрацьовує Health-watchdog. План ланцюжка — чиста
+  `Get-BRAVOServiceRecoveryChainPlan`: порядок BRAVO → exchangAPI → BRAVO Web; впала BRAVO → зупинка працюючих
+  залежних і запуск усіх; служба в Pending — план відкладено до наступної перевірки. Маркер owner
+  `BRAVO_MAINTENANCE_RECOVER` (дозволено в `Write-/Read-BRAVOServiceQuiescenceState`) пишеться до першої дії; збій
+  запису → CRITICAL, вихід 60. Докази — у власному журналі `BRAVO_MAINTENANCE_<ts>_RECOVER_PID<pid>.log`:
+  StartMode/Status/ExitCode/ServiceSpecificExitCode і події SCM (7000/7009/7011/7022/7023/7024/7031/7034) з моменту
+  завантаження ОС (`Get-BRAVOServiceRecoveryScmEvents`, поза Windows — «події SCM недоступні»). Журнали впалих служб
+  обробляються тими самими функціями, що вночі; запуск — `Start-BRAVOMaintenanceManagedService` з обліком спроби і
+  сповіщеннями FR-6 (Recovered WARNING з останньою подією SCM, «циклічно падає» CRITICAL, StartFailed → 60). Маркер
+  знімається лише коли всі служби запущено. Профіль не пише стан задачі Maintenance і статус операції, не змінює типи
+  запуску, не завершує Bis (`Stop-BRAVOMaintenanceStrayProcess`) і не вивантажує власний журнал на SFTP.
+  `-RecoverServices` разом з `-ForceRestore`/`-RunMissedRestoreOnly` → вихід 30. Задачу Планувальника
+  `BRAVO_SERVICE_RECOVERY` додасть хвиля 5 — до того профіль запускається лише вручну. Тести:
+  `ServiceRecovery/ChainPlan*` (7), `ServiceRecovery/Profile*` (10), `ServiceRecovery/LockEnterNoWaitDoesNotSleep`,
+  `ServiceRecovery/ScmEventSelectorFiltersByServiceAndLimits`, `ServiceRecovery/ScmEventsUnavailableOffWindows`,
+  `ServiceRecovery/ConditionsClassifyManagedServicesWithOneMarkerRead`, `ServiceRecovery/RecoverServicesParameterWiring`,
+  `ServiceRecovery/RecoverServicesConflictExits30`, `ServiceRecovery/RecoverProfileBranchesBeforeFirstLogWrite`,
+  `ServiceRecovery/RecoverProfileForbiddenCalls`, `ServiceQuiescence/StateRoundTripAcceptsRecoverOwner`,
+  `Health/WatchdogRecognizesRecoverOwner`.
+
 - **Зміна поведінки: нічний Maintenance запускає впалі служби після обслуговування (#314, хвиля 3, частина 2).**
   Керована служба, яка на старті прогону зупинена і не є `Disabled` від оператора, `OwnedByBravo` (чинний маркер чи
   утримання BRAVO) або `NotInstalled` (класифікація `Get-BRAVOManagedServiceCondition`, «впала» = `Failed` і `Stopped`),
