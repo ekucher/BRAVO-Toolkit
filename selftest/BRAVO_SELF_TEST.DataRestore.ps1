@@ -4728,6 +4728,17 @@ try {
     $probeStartModeScenario = $probeStartModeScenarios[$Scenario]
     $probeStatePath = Join-Path (Join-Path $ProbeRoot 'state') 'BRAVO_SERVICE_QUIESCENCE.json'
     $probeRealSystem = ''
+    # R379-3/R379-4 (#314): знімок служб DataRestore читає тип запуску через
+    # Get-BRAVOWin32ServiceInfo (поверх стабу Get-BRAVOWmiInstance нижче) і
+    # класифікує Disabled через Test-BRAVOServiceDisabledByOperator — у
+    # кожному сценарії це дослівні функції BRAVO.System, не стаби.
+    $probeSnapshotSystemWanted = @('Get-BRAVOWin32ServiceInfo', 'Test-BRAVOServiceDisabledByOperator')
+    $probeSnapshotSystemAst = [Management.Automation.Language.Parser]::ParseInput(
+        [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8), [ref]$null, [ref]$null)
+    $probeSnapshotSystemFunctions = @($probeSnapshotSystemAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $probeSnapshotSystemWanted -contains $_.Name })
+    if ($probeSnapshotSystemFunctions.Count -ne $probeSnapshotSystemWanted.Count) { throw "BRAVO.System: знайдено $($probeSnapshotSystemFunctions.Count) із $($probeSnapshotSystemWanted.Count) потрібних функцій знімка служб" }
+    $probeSnapshotSystem = ($probeSnapshotSystemFunctions | ForEach-Object { $_.Extent.Text }) -join "`n`n"
     $probeStartModesLiteral = '@{}'
     $probeStartFailuresLiteral = '@()'
     $probeThrowLiteral = '$false'
@@ -4829,6 +4840,7 @@ try {
         'Set-StrictMode -Version 2.0',
         ($probeFunctionTexts -join "`n`n"),
         $probeStubs,
+        $probeSnapshotSystem,
         $probeRealSystem,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
