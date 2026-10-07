@@ -225,16 +225,27 @@ function Test-SevenZipArchiveIntegrity {
         $FailureInfo['ArchiveSpecific'] = [bool]$archiveSpecificFailure
         $FailureInfo['ExitCode'] = $testResult.ExitCode
         $FailureInfo['TimedOut'] = [bool]$failureTimedOut
-        # #422: 7-Zip відхилив пароль. Класифікацію (рівень рядка, коди) це
-        # не змінює; викликач, що вирішує про видалення, не має вважати
-        # такий збій доказом пошкодження вмісту (пароль міг змінитися).
+        # #422: ознаки для викликача, що вирішує про видалення. Класифікацію
+        # (рівень рядка, коди) вони не змінюють. PasswordRejected — 7-Zip
+        # відхилив пароль (пароль міг змінитися). ContentCorruption — лише
+        # власні повідомлення 7-Zip про пошкоджені дані (CRC, Data Error,
+        # заголовки, обрив) без відхиленого пароля і без непідтримуваного
+        # методу/можливості: решта archive-specific збоїв (формат, метод,
+        # "не архів") може означати несумісність інструмента, а не вмісту.
         $failureOutputText = ''
         foreach ($failureOutputName in @('StandardError', 'StandardOutput')) {
             if ($null -ne $resultProperties[$failureOutputName]) {
                 $failureOutputText += "$([string]$resultProperties[$failureOutputName].Value)`n"
             }
         }
-        $FailureInfo['PasswordRejected'] = [bool]($failureOutputText -match '(?i)Wrong password')
+        $failurePasswordRejected = [bool]($failureOutputText -match '(?i)Wrong password')
+        $FailureInfo['PasswordRejected'] = $failurePasswordRejected
+        $FailureInfo['ContentCorruption'] = [bool](
+            $archiveSpecificFailure -and
+            -not $failurePasswordRejected -and
+            $failureOutputText -match '(?i)CRC Failed|Data Error|Headers Error|Unexpected end of (archive|data)' -and
+            $failureOutputText -notmatch '(?i)Unsupported (Method|feature)'
+        )
     }
     $failureLevel = if ($archiveSpecificFailure) { $ArchiveFailureLevel } else { 'ERROR' }
 

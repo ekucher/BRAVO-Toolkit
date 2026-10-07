@@ -7097,10 +7097,17 @@ function Remove-OldRestoreArchives {
                         [bool]$integrityFailureInfo['PasswordRejected']) {
                         throw "перевірка 7z t не пройдена (7-Zip відхилив пароль — це не доказ пошкодження архіву: SHA512 збігається з перевіреним)"
                     }
+                    # Доказ — лише власні повідомлення 7-Zip про пошкоджені
+                    # дані (ContentCorruption); непідтримуваний метод чи
+                    # формат — несумісність інструмента, не вмісту.
                     if ($integrityFailureInfo.ContainsKey('ArchiveSpecific') -and
                         [bool]$integrityFailureInfo['ArchiveSpecific']) {
-                        $archiveState = 'PROVEN_CORRUPT'
-                        throw "перевірка 7z t не пройдена (7-Zip забракував вміст архіву)"
+                        if ($integrityFailureInfo.ContainsKey('ContentCorruption') -and
+                            [bool]$integrityFailureInfo['ContentCorruption']) {
+                            $archiveState = 'PROVEN_CORRUPT'
+                            throw "перевірка 7z t не пройдена (7-Zip забракував вміст архіву)"
+                        }
+                        throw "перевірка 7z t не пройдена (7-Zip не зміг перевірити архів: метод стиснення, формат чи версія 7-Zip — це не доказ пошкодження архіву: SHA512 збігається з перевіреним)"
                     }
                     throw "перевірка 7z t не пройдена (збій виконання перевірки, не доказ пошкодження архіву)"
                 }
