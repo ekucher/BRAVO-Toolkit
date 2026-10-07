@@ -243,9 +243,13 @@ BLOCKED.
   CI на 9790a50 зелений (workflow_dispatch run 37528388423)
   git diff --stat 3f181ba 9790a50          # лише VERSION.json і RUNTIME_MANIFEST.json
   git ls-remote --tags origin 'v5.2.5-rc.5*' і список release — порожні
-Під час перевірки RC на сервері (RELEASE_POLICY.md §8) записати в
-issue/звіт результати BRAVO_SETUP.ps1 -ValidateOnly і BRAVO_DRY_RUN.ps1
-(код завершення, рядки ERROR/WARNING); без них RC не вважати перевіреним.
+  ДО публікації тегу (RELEASE_POLICY.md §8; тег незмінний, а перевірка
+  provenance у Release-workflow іде вже після тегу): на тестовому сервері
+  з пакета hotfix/5.2.5 @ 9790a50 запустити BRAVO_SETUP.ps1 -ValidateOnly
+  і BRAVO_DRY_RUN.ps1, записати код завершення та рядки ERROR/WARNING
+  в issue або звіт. Без цих результатів тег v5.2.5-rc.5 не створювати.
+  Сесія цього зробити не може (реальний хост); попереднього запуску на
+  9790a50 у записах немає.
 Перед кроками 2–5 перечитати: git rev-parse origin/developer, GET /pulls?state=open.
 ```
 
