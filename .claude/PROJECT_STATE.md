@@ -40,7 +40,7 @@ git rev-parse HEAD origin/developer origin/master
 | `origin/developer` | `2e3a5da` | `git rev-parse origin/developer` |
 | `origin/master` | `f8fa5aa` (stable `5.2.4`), не змінювався | `git rev-parse origin/master` |
 | `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (далеко позаду `2e3a5da`) | файл у дереві |
-| CI push-прогін `developer` `2e3a5da` | run 37596365619 — на момент запису в процесі; перечитати | `GET /commits/2e3a5da/check-runs` |
+| CI push-прогін `developer` `2e3a5da` | success (run 37596365619, усі jobs ` (push)`) | `GET /commits/2e3a5da/check-runs` |
 | Теги | `v5.3.0-rc.1`; `v5.2.5-rc.1`…`rc.4` (hotfix); `v5.2.5-rc.5` ще не опубліковано | `git ls-remote --tags` |
 | Відкриті PR | лише цей файл | `GET /pulls?state=open` |
 | Відкриті issue | 17 (без PR) | `GET /issues?state=open` |
@@ -194,7 +194,7 @@ BLOCKED.
 | --- | --- | --- |
 | ENGINEERING READY | Runtime-cutover Config V2 (#216) у всіх production-entrypoint-ах | ТАК для прямих викликів і Configurator (#317, #328); непрямі виклики — #239 |
 | ENGINEERING READY | B7: матриця регресій 5.3-шляху в required-наборі | ЧАСТКОВО — матриця в `BRAVO_SELF_TEST.ps1` (required на `master`), але `developer` без захисту |
-| ENGINEERING READY | CI зелений на HEAD `developer` | ПЕРЕВІРИТИ — push-прогін `2e3a5da` (run 37596365619) на момент запису в процесі; попередній `24f7318` — success |
+| ENGINEERING READY | CI зелений на HEAD `developer` | ТАК (push-прогін `2e3a5da`, run 37596365619 — success) |
 | ENGINEERING READY | Немає відкритих bug-issue щодо коректності runtime без рішення | ТАК — #301 і #302 закрито; лишився follow-up борг #394/#396–#398/#408/#413 (не acceptance) |
 | OPERATIONAL ACCEPTANCE | B5: pilot `PILOT ACCEPTED` + мігровані хости парку з доказами | НІ — `PILOT NOT ACCEPTED`, парк не мігровано |
 | OPERATIONAL ACCEPTANCE | Acceptance-issue на реальних хостах (#152/#155/#158) | НІ — open |
