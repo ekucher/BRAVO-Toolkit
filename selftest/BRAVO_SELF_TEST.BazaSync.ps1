@@ -425,6 +425,106 @@
             (Get-BRAVOBazaFastHealthResult -SyncResult $aa293Result).Healthy -eq $false
         ) -Name 'BazaSync/AutoArchiveWithSameCycleRemoteConflictIsNotAutoArchivedStatus' -Failure "авто-архівування + remote-конфлікт в одному циклі: Status має бути REMOTE_CONFLICT (не MUTATION_AUTO_ARCHIVED), авто-архівування все одно виконано; Status=$($aa293Result.Status),Moves=$($aa293Session.State.MoveFileCalls.Count)"
 
+        # #398 (п.5a): решта двох третин контракту #293. Тести вище доводять
+        # лише REMOTE_CONFLICT; тут — AUDIT_DRIFT і INCOMPATIBLE_NAME того
+        # самого циклу, для обох кон'юнкцій: Fast Health (синтетичний
+        # MUTATION_AUTO_ARCHIVED + непорожній AuditDriftFiles/IncompatibleFiles
+        # -> CRITICAL, як для еталонного статусу) і драбини статусів через
+        # справжній Invoke-BRAVOBazaSynchronization (авто-архівування виконано,
+        # MoveFile = 1, але Status — AUDIT_DRIFT/INCOMPATIBLE_NAME). Блок у
+        # дочірній області (#163), closure — у вузькій області.
+        & {
+            $aa398Now = (Get-Date).ToUniversalTime()
+            $aa398DriftSynthetic = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId (New-BRAVOBazaCycleId) -StartedUtc $aa398Now -CutoffUtc $aa398Now
+            $aa398DriftSynthetic.Status = 'MUTATION_AUTO_ARCHIVED'
+            $aa398DriftSynthetic.MutationViolations = @([pscustomobject]@{ RelativePath = 'eqv_11-116.pdf' })
+            $aa398DriftSynthetic.AuditDriftFiles = @([pscustomobject]@{ RelativePath = 'd_drift.txt'; Action = 'UploadUpdate'; LocalSize = [int64]100; RemoteSize = [int64]100; LocalMissing = $false })
+            $aa398DriftHealth = Get-BRAVOBazaFastHealthResult -SyncResult $aa398DriftSynthetic
+            $aa398DriftReference = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId (New-BRAVOBazaCycleId) -StartedUtc $aa398Now -CutoffUtc $aa398Now
+            $aa398DriftReference.Status = 'AUDIT_DRIFT'
+            $aa398DriftReference.AuditDriftFiles = $aa398DriftSynthetic.AuditDriftFiles
+            $aa398DriftReferenceHealth = Get-BRAVOBazaFastHealthResult -SyncResult $aa398DriftReference
+            Test-BRAVOCondition -Condition (
+                $aa398DriftHealth.Healthy -eq $false -and $aa398DriftHealth.Level -eq $aa398DriftReferenceHealth.Level -and
+                $aa398DriftHealth.Level -eq 'CRITICAL' -and $aa398DriftHealth.Message -match 'd_drift\.txt'
+            ) -Name 'BazaSync/AutoArchivedDoesNotMaskAuditDriftInFastHealth' -Failure "MUTATION_AUTO_ARCHIVED + AuditDriftFiles має бути CRITICAL/не healthy (як AUDIT_DRIFT), а не INFO: Level=$($aa398DriftHealth.Level),Healthy=$($aa398DriftHealth.Healthy)"
+
+            $aa398NameSynthetic = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId (New-BRAVOBazaCycleId) -StartedUtc $aa398Now -CutoffUtc $aa398Now
+            $aa398NameSynthetic.Status = 'MUTATION_AUTO_ARCHIVED'
+            $aa398NameSynthetic.MutationViolations = @([pscustomobject]@{ RelativePath = 'eqv_11-116.pdf' })
+            $aa398NameSynthetic.IncompatibleFiles = @([pscustomobject]@{ RelativePath = 'n_badname.txt'; Reason = 'задовге' })
+            $aa398NameHealth = Get-BRAVOBazaFastHealthResult -SyncResult $aa398NameSynthetic
+            $aa398NameReference = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId (New-BRAVOBazaCycleId) -StartedUtc $aa398Now -CutoffUtc $aa398Now
+            $aa398NameReference.Status = 'INCOMPATIBLE_NAME'
+            $aa398NameReference.IncompatibleFiles = $aa398NameSynthetic.IncompatibleFiles
+            $aa398NameReferenceHealth = Get-BRAVOBazaFastHealthResult -SyncResult $aa398NameReference
+            Test-BRAVOCondition -Condition (
+                $aa398NameHealth.Healthy -eq $false -and $aa398NameHealth.Level -eq $aa398NameReferenceHealth.Level -and
+                $aa398NameHealth.Level -eq 'CRITICAL' -and $aa398NameHealth.Message -match 'n_badname\.txt'
+            ) -Name 'BazaSync/AutoArchivedDoesNotMaskIncompatibleNameInFastHealth' -Failure "MUTATION_AUTO_ARCHIVED + IncompatibleFiles має бути CRITICAL/не healthy (як INCOMPATIBLE_NAME), а не INFO: Level=$($aa398NameHealth.Level),Healthy=$($aa398NameHealth.Healthy)"
+
+            # Драбина: мутація в межах порогу + несумісне ім'я того самого
+            # циклу (123 кириличні + 1 ASCII = 247 UTF-8 байтів > 246, лише
+            # 124 символи — безпечно для Windows MAX_PATH).
+            $aa398NameRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveWithIncompatibleName"
+            $aa398NameLocal = Join-Path $aa398NameRoot "local"
+            $aa398NameState = Join-Path $aa398NameRoot "state"
+            New-Item -ItemType Directory -Path $aa398NameLocal -Force | Out-Null
+            $aa398NameFile = New-BRAVOSelfTestBazaFile -Directory $aa398NameLocal -RelativePath "eqv_11-116.pdf" -SizeBytes 500
+            $aa398NameSession = New-BRAVOSelfTestFakeBazaSession
+            $aa398NameCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aa398NameLocal -RemoteRootPath '/baza_app' -Session $aa398NameSession -StateRoot $aa398NameState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+            [IO.File]::WriteAllBytes($aa398NameFile, (New-Object byte[] 999))
+            $aa398LongName = (([string]([char]0x0410)) * 123) + 'a'
+            [void](New-BRAVOSelfTestBazaFile -Directory $aa398NameLocal -RelativePath $aa398LongName -SizeBytes 10)
+            $aa398NameResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aa398NameLocal -RemoteRootPath '/baza_app' -Session $aa398NameSession -StateRoot $aa398NameState -AutoArchiveMutationThreshold 5
+            Test-BRAVOCondition -Condition (
+                $aa398NameCycle1.Status -eq 'COMPLETE' -and
+                $aa398NameResult.Status -ne 'MUTATION_AUTO_ARCHIVED' -and $aa398NameResult.Status -eq 'INCOMPATIBLE_NAME' -and
+                @($aa398NameResult.IncompatibleFiles).Count -eq 1 -and
+                $aa398NameSession.State.MoveFileCalls.Count -eq 1 -and
+                -not (Test-BRAVOBazaSyncStatusSuccess -Status $aa398NameResult.Status) -and
+                (Get-BRAVOBazaFastHealthResult -SyncResult $aa398NameResult).Healthy -eq $false
+            ) -Name 'BazaSync/AutoArchiveWithSameCycleIncompatibleNameIsNotAutoArchivedStatus' -Failure "авто-архівування + несумісне ім'я в одному циклі: Status має бути INCOMPATIBLE_NAME (не MUTATION_AUTO_ARCHIVED), авто-архівування все одно виконано; Cycle1=$($aa398NameCycle1.Status),Status=$($aa398NameResult.Status),Incompatible=$(@($aa398NameResult.IncompatibleFiles).Count),Moves=$($aa398NameSession.State.MoveFileCalls.Count)"
+
+            # Драбина: мутація в межах порогу + audit drift того самого циклу.
+            # Drift дає FullAuditProvider bootstrap-циклу (same-size remote для
+            # audit-pending d_drift.txt -> персистований блокер AuditDrift);
+            # наступний звичайний цикл несе його в AuditDriftFiles разом із
+            # мутацією eqv-файла.
+            $aa398DriftRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveWithAuditDrift"
+            $aa398DriftLocal = Join-Path $aa398DriftRoot "local"
+            $aa398DriftState = Join-Path $aa398DriftRoot "state"
+            New-Item -ItemType Directory -Path $aa398DriftLocal -Force | Out-Null
+            $aa398DriftFile = New-BRAVOSelfTestBazaFile -Directory $aa398DriftLocal -RelativePath "eqv_11-116.pdf" -SizeBytes 500
+            [void](New-BRAVOSelfTestBazaFile -Directory $aa398DriftLocal -RelativePath "d_drift.txt" -SizeBytes 100)
+            $aa398DriftProvider = & { param($aa398DriftLocal) {
+                param($Snapshot)
+                $pendingFile = [pscustomobject]@{
+                    IsDirectory = $false
+                    Path = (Join-Path $aa398DriftLocal "d_drift.txt")
+                    Action = 'UploadUpdate'
+                    Reason = 'розбіжність часу (той самий розмір)'
+                }
+                return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $aa398DriftLocal -LocalSnapshot $Snapshot
+            }.GetNewClosure() } $aa398DriftLocal
+            $aa398DriftSession = New-BRAVOSelfTestFakeBazaSession
+            $aa398DriftSession.State.RemoteSizes['/baza_app/d_drift.txt'] = [int64]100
+            $aa398DriftSession.State.RemoteSizes['/baza_app/eqv_11-116.pdf'] = [int64]500
+            $aa398DriftCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aa398DriftLocal -RemoteRootPath '/baza_app' -Session $aa398DriftSession -StateRoot $aa398DriftState -BootstrapIfNeeded -FullAuditProvider $aa398DriftProvider
+            [IO.File]::WriteAllBytes($aa398DriftFile, (New-Object byte[] 999))
+            $aa398DriftResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aa398DriftLocal -RemoteRootPath '/baza_app' -Session $aa398DriftSession -StateRoot $aa398DriftState -AutoArchiveMutationThreshold 5
+            Test-BRAVOCondition -Condition (
+                $aa398DriftCycle1.Status -eq 'AUDIT_DRIFT' -and
+                $aa398DriftResult.Status -ne 'MUTATION_AUTO_ARCHIVED' -and $aa398DriftResult.Status -eq 'AUDIT_DRIFT' -and
+                @($aa398DriftResult.AuditDriftFiles).Count -eq 1 -and
+                $aa398DriftResult.AuditDriftFiles[0].RelativePath -eq 'd_drift.txt' -and
+                $aa398DriftSession.State.MoveFileCalls.Count -eq 1 -and
+                $aa398DriftSession.State.PutFilesCallCount -eq 0 -and
+                -not (Test-BRAVOBazaSyncStatusSuccess -Status $aa398DriftResult.Status) -and
+                (Get-BRAVOBazaFastHealthResult -SyncResult $aa398DriftResult).Healthy -eq $false
+            ) -Name 'BazaSync/AutoArchiveWithSameCycleAuditDriftIsNotAutoArchivedStatus' -Failure "авто-архівування + audit drift в одному циклі: Status має бути AUDIT_DRIFT (не MUTATION_AUTO_ARCHIVED), авто-архівування все одно виконано; Cycle1=$($aa398DriftCycle1.Status),Status=$($aa398DriftResult.Status),Drift=$(@($aa398DriftResult.AuditDriftFiles).Count),Moves=$($aa398DriftSession.State.MoveFileCalls.Count),PutFiles=$($aa398DriftSession.State.PutFilesCallCount)"
+        }
+
         # AutoArchiveMutationThreshold: N > поріг -> як і без опції (жорсткий блок)
         $aaOverRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveOverThreshold"
         $aaOverLocal = Join-Path $aaOverRoot "local"
