@@ -4663,9 +4663,16 @@ function New-SlackAlertMessage {
         @($Issues | Where-Object {
             $_.Component -eq "Локальна BAZA APP"
         }).Count -eq 0
-    $bazaAppSFTPHealthy = [bool]$backupMonitoring.SFTP.Enabled -and
+    # #303: відкладена через зайнятий WinSCP SFTP-перевірка не дає issues,
+    # але й нічого не підтверджує — такий рядок показується як відкладений.
+    # Безпечне читання: функцію викликають і поза основним потоком, де
+    # прапорець не ініціалізовано (StrictMode).
+    $sftpCheckDeferred = [bool](Get-Variable -Scope Script -Name BRAVOHealthSftpCheckDeferredByBusyWinSCP -ValueOnly -ErrorAction SilentlyContinue)
+    $bazaSftpDeferredLine = "SFTP: перевірку відкладено, WinSCP зайнятий іншою операцією"
+    $bazaAppSFTPChecked = [bool]$backupMonitoring.SFTP.Enabled -and
         [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
-        $bazaAppSFTPHealthEnabled -and
+        $bazaAppSFTPHealthEnabled
+    $bazaAppSFTPHealthy = $bazaAppSFTPChecked -and -not $sftpCheckDeferred -and
         @($Issues | Where-Object {
             $_.Component -eq "SFTP BAZA APP" -or $_.Kind -eq "SFTPConnection"
         }).Count -eq 0
@@ -4679,13 +4686,18 @@ function New-SlackAlertMessage {
             $resultLines.Add(":white_check_mark: BAZA_APP — SFTP актуальна")
         }
     }
+    if ($bazaAppSFTPChecked -and $sftpCheckDeferred) {
+        if (-not $bazaAppLocalHealthy) { $resultLines.Add("") }
+        $resultLines.Add(":warning: BAZA_APP — $bazaSftpDeferredLine")
+    }
     $bazaWWWLocalHealthy = $bazaWWWLocalHealthEnabled -and
         @($Issues | Where-Object {
             $_.Component -eq "Локальна BAZA WWW"
         }).Count -eq 0
-    $bazaWWWSFTPHealthy = [bool]$backupMonitoring.SFTP.Enabled -and
+    $bazaWWWSFTPChecked = [bool]$backupMonitoring.SFTP.Enabled -and
         [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
-        $bazaWWWSFTPHealthEnabled -and
+        $bazaWWWSFTPHealthEnabled
+    $bazaWWWSFTPHealthy = $bazaWWWSFTPChecked -and -not $sftpCheckDeferred -and
         @($Issues | Where-Object {
             $_.Component -eq "SFTP BAZA WWW" -or
             $_.Kind -eq "SFTPConnection"
@@ -4699,6 +4711,10 @@ function New-SlackAlertMessage {
         } else {
             $resultLines.Add(":white_check_mark: BAZA_WWW — SFTP актуальна")
         }
+    }
+    if ($bazaWWWSFTPChecked -and $sftpCheckDeferred) {
+        if (-not $bazaWWWLocalHealthy) { $resultLines.Add("") }
+        $resultLines.Add(":warning: BAZA_WWW — $bazaSftpDeferredLine")
     }
 
     return New-BRAVOOperatorNotificationMessage `
@@ -4767,20 +4783,39 @@ function New-SlackSuccessMessage {
     $resultLines.Add("")
     $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":floppy_disk:" -Name "Local"))
 
+    # #303: відкладена SFTP-перевірка (WinSCP зайнятий) нічого не
+    # підтвердила — її рядки WARNING «перевірку відкладено», а не SUCCESS.
+    # Безпечне читання: функцію викликають і поза основним потоком, де
+    # прапорець не ініціалізовано (StrictMode).
+    $sftpCheckDeferred = [bool](Get-Variable -Scope Script -Name BRAVOHealthSftpCheckDeferredByBusyWinSCP -ValueOnly -ErrorAction SilentlyContinue)
+    $sftpDeferredDetail = 'перевірку відкладено, WinSCP зайнятий іншою операцією'
+
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckArchiveUploads -and
         [bool]$storageEffective.SFTP.ArchiveUpload) {
-        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":cloud:" -Name "SFTP"))
+        if ($sftpCheckDeferred) {
+            $resultLines.Add((Format-BRAVOOperatorStatusLine -Status WARNING -Icon ":cloud:" -Name "SFTP" -Detail $sftpDeferredDetail))
+        } else {
+            $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":cloud:" -Name "SFTP"))
+        }
     }
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckBAZASynchronization -and
         $bazaAppSFTPHealthEnabled) {
-        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_APP" -Detail "синхронізовано"))
+        if ($sftpCheckDeferred) {
+            $resultLines.Add((Format-BRAVOOperatorStatusLine -Status WARNING -Icon ":arrows_counterclockwise:" -Name "BAZA_APP" -Detail $sftpDeferredDetail))
+        } else {
+            $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_APP" -Detail "синхронізовано"))
+        }
     }
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckBAZASynchronization -and
         $bazaWWWSFTPHealthEnabled) {
-        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_WWW" -Detail "синхронізовано"))
+        if ($sftpCheckDeferred) {
+            $resultLines.Add((Format-BRAVOOperatorStatusLine -Status WARNING -Icon ":arrows_counterclockwise:" -Name "BAZA_WWW" -Detail $sftpDeferredDetail))
+        } else {
+            $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_WWW" -Detail "синхронізовано"))
+        }
     }
     if ($bazaAppLocalHealthEnabled) {
         $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_APP local"))
