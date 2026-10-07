@@ -112,9 +112,24 @@ function Send-FileViaWinSCP {
         throw "simulated SFTP transport failure"
     }
     return $script:archiveOwnLogTestState.SendReturnValue
+}function Get-BRAVOLogMaskSecretSet { param($CredentialSettings) return [pscustomobject]@{ Secrets = [string[]]@(); Skipped = @() } }
+function New-BRAVOMaskedLogCopy {
+    # #365: стаб маскованої копії для тестів тумблера/ідемпотентності —
+    # саме маскування перевіряють окремі тести на справжніх функціях.
+    param([string]$Path, [string[]]$KnownSecret)
+    $copyDirectory = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_masked_log_" + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($copyDirectory)
+    $copyPath = Join-Path $copyDirectory ([IO.Path]::GetFileName($Path))
+    [IO.File]::Copy($Path, $copyPath)
+    return $copyPath
+}
+function Remove-BRAVOMaskedLogCopy {
+    param([string]$Path)
+    if (-not [string]::IsNullOrWhiteSpace($Path)) { Remove-Item -LiteralPath (Split-Path -Parent $Path) -Recurse -Force -ErrorAction SilentlyContinue }
 }
 '@
-$archiveOwnLogFunctionNames = @("Write-BRAVOLog", "Initialize-BRAVOSFTPRemoteDirectories", "Send-FileViaWinSCP", "Invoke-BRAVOArchiveOwnLogUpload")
+$archiveOwnLogFunctionNames = @("Write-BRAVOLog", "Initialize-BRAVOSFTPRemoteDirectories", "Send-FileViaWinSCP",
+    "Get-BRAVOLogMaskSecretSet", "New-BRAVOMaskedLogCopy", "Remove-BRAVOMaskedLogCopy", "Invoke-BRAVOArchiveOwnLogUpload")
 $archiveOwnLogCombinedSource = $archiveOwnLogStub + "`n" + $archiveScriptText
 $archiveOwnLogModule = New-BRAVOSelfTestRuntimeModule -SourceText $archiveOwnLogCombinedSource -FunctionNames $archiveOwnLogFunctionNames
 
@@ -205,6 +220,246 @@ Test-BRAVOCondition -Condition (
     -Failure "збій transport під час вивантаження власного логу не повинен змінювати `$script:processExitCode (первинний результат прогону); факт: exitCode=$($archiveOwnLogSendFails.ProcessExitCode)"
 
 Remove-Item -LiteralPath $archiveOwnLogTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+# ============================================================
+# #365 (SECURITY): Invoke-BRAVOArchiveOwnLogUpload вивантажує на SFTP
+# масковану КОПІЮ власного логу — точні значення секретів Credential
+# Manager (SFTP/SMB/7-Zip/Operations/webhook) замінено на ***, навіть без
+# ключового слова поруч. Справжні production-функції (AST) з
+# BRAVO.Archive.Runtime.ps1, BRAVO.Credentials і BRAVO.Logging; стаби лише
+# на межах: Credential Manager (Get-BRAVOCredential — сам CredRead), WinSCP-
+# транспорт (Send-FileViaWinSCP, Initialize-BRAVOSFTPRemoteDirectories) і
+# лог-синк (Write-BRAVOLog). Секрети — синтетичні плейсхолдери.
+# ============================================================
+
+$archiveSecretMaskLoggingText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Logging\BRAVO.Logging.psm1'), [Text.Encoding]::UTF8)
+$archiveSecretMaskCredentialsText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Credentials\BRAVO.Credentials.psm1'), [Text.Encoding]::UTF8)
+# Значення будуються під час запуску з коротких низькоентропійних частин
+# (конвенція репозиторію: жодного суцільного секрето-подібного літерала).
+$archiveSecretMaskNewValue = { param([string]$Prefix) $Prefix + [guid]::NewGuid().ToString('N').Substring(0, 12) }
+$archiveSecretMaskWebhookFormat = 'https://{0}/synthetic/ar-{1}-{2}'
+$archiveSecretMaskByKey = [ordered]@{
+    SFTPPassword              = (& $archiveSecretMaskNewValue 'ArSftp')
+    SMBPassword               = (& $archiveSecretMaskNewValue 'ArSmb-')
+    ArchivePassword           = (& $archiveSecretMaskNewValue 'Ar7z!')
+    OperationsBootstrapSecret = (& $archiveSecretMaskNewValue 'ArBoot')
+    OperationsApiKey          = (& $archiveSecretMaskNewValue 'ar-ops-')
+    SlackWebhookGeneral       = ($archiveSecretMaskWebhookFormat -f 'hooks.example.invalid', 'slack-general', (& $archiveSecretMaskNewValue 'W'))
+    SlackWebhookAlerts        = ($archiveSecretMaskWebhookFormat -f 'hooks.example.invalid', 'slack-alerts', (& $archiveSecretMaskNewValue 'W'))
+    DiscordWebhookGeneral     = ($archiveSecretMaskWebhookFormat -f 'chat.example.invalid', 'discord-general', (& $archiveSecretMaskNewValue 'W'))
+    DiscordWebhookAlerts      = ($archiveSecretMaskWebhookFormat -f 'chat.example.invalid', 'discord-alerts', (& $archiveSecretMaskNewValue 'W'))
+}
+# Конфігурація без Targets -> усі target-и резолвляться в канонічні дефолти.
+$archiveSecretMaskByTarget = @{
+    'BRAVO_SFTP_PASSWORD'               = $archiveSecretMaskByKey['SFTPPassword']
+    'BRAVO_SMB_PASSWORD'                = $archiveSecretMaskByKey['SMBPassword']
+    'BRAVO_7Z_PASSWORD'                 = $archiveSecretMaskByKey['ArchivePassword']
+    'BRAVO_OPERATIONS_BOOTSTRAP_SECRET' = $archiveSecretMaskByKey['OperationsBootstrapSecret']
+    'BRAVO_OPERATIONS_API_KEY'          = $archiveSecretMaskByKey['OperationsApiKey']
+    'BRAVO_SLACK_GENERAL_URL'           = $archiveSecretMaskByKey['SlackWebhookGeneral']
+    'BRAVO_SLACK_ALERTS_URL'            = $archiveSecretMaskByKey['SlackWebhookAlerts']
+    'BRAVO_DISCORD_GENERAL_URL'         = $archiveSecretMaskByKey['DiscordWebhookGeneral']
+    'BRAVO_DISCORD_ALERTS_URL'          = $archiveSecretMaskByKey['DiscordWebhookAlerts']
+}
+
+$archiveSecretMaskStub = @'
+function Write-BRAVOLog {
+    param([string]$Component, [string]$Message, [string]$Level = "INFO", [switch]$Secondary)
+    [void]$script:archiveSecretMaskState.LogLines.Add("[$Level] $Message")
+}
+function Initialize-BRAVOSFTPRemoteDirectories { param([string]$WinSCPPath, [string]$RepositorySFTPUrl, [string]$HostKey, [string[]]$RemoteDirectories) }
+function Send-FileViaWinSCP {
+    param([string]$WinSCPPath, [string]$RepositorySFTPUrl, [string]$HostKey, [string]$LocalFilePath, [string]$RemoteDirectory)
+    $script:archiveSecretMaskState.SentPath = $LocalFilePath
+    $script:archiveSecretMaskState.SentText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($LocalFilePath))
+    return $true
+}
+function Get-BRAVOCredential {
+    param([string]$Target)
+    if (@($script:archiveSecretMaskState.ThrowTargets) -contains $Target) {
+        throw (New-Object System.ComponentModel.Win32Exception(1312, ("synthetic CredRead failure for '" + $Target + "' " + $script:archiveSecretMaskState.ExceptionPayload)))
+    }
+    if ($script:archiveSecretMaskState.SecretByTarget.ContainsKey($Target)) {
+        $selfTestSecure = New-Object System.Security.SecureString
+        foreach ($selfTestChar in ([string]$script:archiveSecretMaskState.SecretByTarget[$Target]).ToCharArray()) { $selfTestSecure.AppendChar($selfTestChar) }
+        $selfTestSecure.MakeReadOnly()
+        return [pscustomobject]@{ TargetName = $Target; UserName = ''; Secret = $selfTestSecure }
+    }
+    return $null
+}
+'@
+
+$archiveSecretMaskSourceText = $archiveSecretMaskStub + "`n" + $archiveScriptText + "`n" + $archiveSecretMaskCredentialsText + "`n" + $archiveSecretMaskLoggingText
+$archiveSecretMaskUploadFunctions = @('Write-BRAVOLog', 'Initialize-BRAVOSFTPRemoteDirectories', 'Send-FileViaWinSCP',
+    'Get-BRAVOCredential', 'Get-BRAVOCredentialSecureSecret', 'ConvertFrom-BRAVOSecureSecret', 'Get-BRAVOCredentialSecret',
+    'Invoke-BRAVOArchiveOwnLogUpload')
+$archiveSecretMaskModule = $null
+$archiveSecretMaskSetupError = ''
+try {
+    $archiveSecretMaskModule = New-BRAVOSelfTestRuntimeModule -SourceText $archiveSecretMaskSourceText `
+        -FunctionNames ($archiveSecretMaskUploadFunctions + @(
+            'Get-BRAVOCredentialTargetName', 'Get-BRAVOLogMaskSecretSet',
+            'Protect-BRAVOLogSecret', 'New-BRAVOMaskedLogCopy', 'Remove-BRAVOMaskedLogCopy'
+        ))
+} catch {
+    $archiveSecretMaskSetupError = "production-функції #365 недоступні: $($_.Exception.Message)"
+    # Код до #365: сценарій усе одно виконується на наявному шляху
+    # вивантаження — і падає на фактичному витоку, а не лише на setup.
+    try {
+        $archiveSecretMaskModule = New-BRAVOSelfTestRuntimeModule -SourceText $archiveSecretMaskSourceText -FunctionNames $archiveSecretMaskUploadFunctions
+    } catch {
+        $archiveSecretMaskModule = $null
+        $archiveSecretMaskSetupError = "$archiveSecretMaskSetupError; шлях вивантаження недоступний: $($_.Exception.Message)"
+    }
+}
+
+$archiveSecretMaskRoot = Join-Path $env:TEMP "BRAVOSelfTest_ArchiveSecretMask365_$([Guid]::NewGuid().ToString('N'))"
+[void](New-Item -ItemType Directory -Path $archiveSecretMaskRoot -Force)
+$archiveSecretMaskLogName = 'BRAVO_ARCHIV_20260101_020304.log'
+$archiveSecretMaskLogFile = Join-Path $archiveSecretMaskRoot $archiveSecretMaskLogName
+$archiveSecretMaskLines = New-Object System.Collections.Generic.List[string]
+foreach ($archiveSecretMaskKey in @($archiveSecretMaskByKey.Keys)) {
+    $archiveSecretMaskLines.Add("2026-01-01 02:03:04.000 [DEBUG  ] [SFTP] raw $($archiveSecretMaskByKey[$archiveSecretMaskKey]) for $archiveSecretMaskKey")
+}
+[IO.File]::WriteAllText($archiveSecretMaskLogFile, (($archiveSecretMaskLines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($true)))
+$archiveSecretMaskOriginalBytes = [IO.File]::ReadAllBytes($archiveSecretMaskLogFile)
+
+$archiveSecretMaskResult = $null
+if ($null -ne $archiveSecretMaskModule) {
+    $archiveSecretMaskResult = & $archiveSecretMaskModule {
+        param($logFilePath, $secretByTarget, $payload)
+        $script:archiveSecretMaskState = [pscustomobject]@{
+            LogLines         = (New-Object System.Collections.Generic.List[string])
+            SecretByTarget   = $secretByTarget
+            ThrowTargets     = @('BRAVO_SMB_PASSWORD')
+            ExceptionPayload = $payload
+            SentPath         = $null
+            SentText         = $null
+        }
+        $script:archiveCatchUpSkipped = $false
+        $global:componentSettings = [pscustomobject]@{ SFTP = [pscustomobject]@{ ArchiveLogUploadEnabled = $true } }
+        $global:storageEffective = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $true } }
+        $script:credentialSettings = @{}
+        $script:sftpUrl = 'sftp://selftest@127.0.0.1/'
+        $script:sftpHostKey = 'ssh-rsa 2048 aa:bb:cc'
+        $script:winSCPPath = 'C:\Windows\System32\cmd.exe'
+        $script:sftpDirectories = [pscustomobject]@{ ArchivLog = 'logs/archiv' }
+        $script:logFile = $logFilePath
+        $script:processExitCode = 42
+        $invokeError = ''
+        try { Invoke-BRAVOArchiveOwnLogUpload } catch { $invokeError = [string]$_.Exception.Message }
+        [pscustomobject]@{
+            SentPath        = $script:archiveSecretMaskState.SentPath
+            SentText        = $script:archiveSecretMaskState.SentText
+            SentCopyRemains = ($null -ne $script:archiveSecretMaskState.SentPath -and (Test-Path -LiteralPath $script:archiveSecretMaskState.SentPath))
+            LogLines        = $script:archiveSecretMaskState.LogLines.ToArray()
+            ProcessExitCode = $script:processExitCode
+            InvokeError     = $invokeError
+        }
+    } $archiveSecretMaskLogFile $archiveSecretMaskByTarget ("carrying " + $archiveSecretMaskByKey['ArchivePassword'])
+}
+
+$archiveSecretMaskLeaks = New-Object System.Collections.Generic.List[string]
+$archiveSecretMaskDiagLeaks = New-Object System.Collections.Generic.List[string]
+if ($null -ne $archiveSecretMaskResult) {
+    $archiveSecretMaskDiagText = (@($archiveSecretMaskResult.LogLines) -join "`n") + "`n" + [string]$archiveSecretMaskResult.InvokeError
+    foreach ($archiveSecretMaskKey in @($archiveSecretMaskByKey.Keys)) {
+        $archiveSecretMaskValue = [string]$archiveSecretMaskByKey[$archiveSecretMaskKey]
+        if ($archiveSecretMaskKey -ne 'SMBPassword' -and ([string]$archiveSecretMaskResult.SentText).Contains($archiveSecretMaskValue)) { $archiveSecretMaskLeaks.Add($archiveSecretMaskKey) }
+        if ($archiveSecretMaskDiagText.Contains($archiveSecretMaskValue)) { $archiveSecretMaskDiagLeaks.Add($archiveSecretMaskKey) }
+    }
+}
+Test-BRAVOCondition -Condition (
+    $null -ne $archiveSecretMaskResult -and
+    -not [string]::IsNullOrEmpty([string]$archiveSecretMaskResult.SentText) -and
+    $archiveSecretMaskLeaks.Count -eq 0 -and
+    ([string]$archiveSecretMaskResult.SentText).Contains('raw *** for ArchivePassword') -and
+    [string]$archiveSecretMaskResult.SentPath -ne $archiveSecretMaskLogFile -and
+    [IO.Path]::GetFileName([string]$archiveSecretMaskResult.SentPath) -ceq $archiveSecretMaskLogName -and
+    -not $archiveSecretMaskResult.SentCopyRemains -and
+    [Convert]::ToBase64String([IO.File]::ReadAllBytes($archiveSecretMaskLogFile)) -ceq [Convert]::ToBase64String($archiveSecretMaskOriginalBytes)
+) -Name 'Archive/OwnLogUploadMasksCredentialSecretsInUploadedBytes' `
+    -Failure "Archive має вивантажувати масковану копію власного логу (те саме remote-ім'я, копію прибрано, локальний лог незмінний) без жодного точного значення секрету Credential Manager; витекли ключі: $($archiveSecretMaskLeaks -join ', '); помилка: $archiveSecretMaskSetupError"
+
+$archiveSecretMaskInfo = @()
+$archiveSecretMaskWarn = @()
+if ($null -ne $archiveSecretMaskResult) {
+    $archiveSecretMaskInfo = @($archiveSecretMaskResult.LogLines | Where-Object { $_.StartsWith('[INFO]') -and $_.Contains('BRAVO_SMB_PASSWORD') })
+    $archiveSecretMaskWarn = @($archiveSecretMaskResult.LogLines | Where-Object { $_.StartsWith('[WARNING]') -or $_.StartsWith('[ERROR]') })
+}
+Test-BRAVOCondition -Condition (
+    $null -ne $archiveSecretMaskResult -and
+    $archiveSecretMaskInfo.Count -ge 1 -and
+    $archiveSecretMaskWarn.Count -eq 0 -and
+    $archiveSecretMaskDiagLeaks.Count -eq 0 -and
+    (@($archiveSecretMaskResult.LogLines) -join "`n") -notmatch 'synthetic CredRead failure' -and
+    [int]$archiveSecretMaskResult.ProcessExitCode -eq 42 -and
+    [string]::IsNullOrEmpty([string]$archiveSecretMaskResult.InvokeError)
+) -Name 'Archive/OwnLogUploadInaccessibleTargetSkippedWithInfoNoLeak' `
+    -Failure "недоступний target (CredRead кидає) — INFO з іменем target-а, без WARNING/ERROR, без тексту винятку і жодного секрету в діагностиці, exit code незмінний; INFO=$($archiveSecretMaskInfo.Count) WARNING/ERROR=$($archiveSecretMaskWarn.Count) витекли ключі: $($archiveSecretMaskDiagLeaks -join ', '); помилка: $archiveSecretMaskSetupError"
+
+# --- #365 review: fail-closed і для Archive (дзеркало
+# Maintenance/OwnLogUploadFailsClosedWhenMaskedCopyUnavailable). Лог
+# заблоковано (FileShare.None) -> масковану копію створити неможливо ->
+# Send-FileViaWinSCP НЕ викликається взагалі (немаскований лог назовні не
+# йде), WARNING без секретів, виняток назовні не йде, exit code незмінний.
+$archiveSecretMaskLockedResult = $null
+if ($null -ne $archiveSecretMaskModule) {
+    $archiveSecretMaskLockHandle = [IO.File]::Open($archiveSecretMaskLogFile, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $archiveSecretMaskLockedResult = & $archiveSecretMaskModule {
+            param($logFilePath, $secretByTarget)
+            $script:archiveSecretMaskState = [pscustomobject]@{
+                LogLines         = (New-Object System.Collections.Generic.List[string])
+                SecretByTarget   = $secretByTarget
+                ThrowTargets     = @()
+                ExceptionPayload = ''
+                SentPath         = $null
+                SentText         = $null
+            }
+            $script:archiveCatchUpSkipped = $false
+            $global:componentSettings = [pscustomobject]@{ SFTP = [pscustomobject]@{ ArchiveLogUploadEnabled = $true } }
+            $global:storageEffective = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $true } }
+            $script:credentialSettings = @{}
+            $script:sftpUrl = 'sftp://selftest@127.0.0.1/'
+            $script:sftpHostKey = 'ssh-rsa 2048 aa:bb:cc'
+            $script:winSCPPath = 'C:\Windows\System32\cmd.exe'
+            $script:sftpDirectories = [pscustomobject]@{ ArchivLog = 'logs/archiv' }
+            $script:logFile = $logFilePath
+            $script:processExitCode = 42
+            $invokeError = ''
+            try { Invoke-BRAVOArchiveOwnLogUpload } catch { $invokeError = [string]$_.Exception.Message }
+            [pscustomobject]@{
+                SentPath        = $script:archiveSecretMaskState.SentPath
+                LogLines        = $script:archiveSecretMaskState.LogLines.ToArray()
+                ProcessExitCode = $script:processExitCode
+                InvokeError     = $invokeError
+            }
+        } $archiveSecretMaskLogFile $archiveSecretMaskByTarget
+    } finally {
+        $archiveSecretMaskLockHandle.Dispose()
+    }
+}
+$archiveSecretMaskLockedWarn = @()
+$archiveSecretMaskLockedLeaks = New-Object System.Collections.Generic.List[string]
+if ($null -ne $archiveSecretMaskLockedResult) {
+    $archiveSecretMaskLockedWarn = @($archiveSecretMaskLockedResult.LogLines | Where-Object { $_.StartsWith('[WARNING]') })
+    $archiveSecretMaskLockedDiag = (@($archiveSecretMaskLockedResult.LogLines) -join "`n") + "`n" + [string]$archiveSecretMaskLockedResult.InvokeError
+    foreach ($archiveSecretMaskKey in @($archiveSecretMaskByKey.Keys)) {
+        if ($archiveSecretMaskLockedDiag.Contains([string]$archiveSecretMaskByKey[$archiveSecretMaskKey])) { $archiveSecretMaskLockedLeaks.Add($archiveSecretMaskKey) }
+    }
+}
+Test-BRAVOCondition -Condition (
+    $null -ne $archiveSecretMaskLockedResult -and
+    $null -eq $archiveSecretMaskLockedResult.SentPath -and
+    $archiveSecretMaskLockedWarn.Count -ge 1 -and
+    $archiveSecretMaskLockedLeaks.Count -eq 0 -and
+    [int]$archiveSecretMaskLockedResult.ProcessExitCode -eq 42 -and
+    [string]::IsNullOrEmpty([string]$archiveSecretMaskLockedResult.InvokeError)
+) -Name 'Archive/OwnLogUploadFailsClosedWhenMaskedCopyUnavailable' `
+    -Failure "збій маскування (копію не створено) — fail-closed: жодної передачі немаскованого логу, WARNING без секретів, exit code незмінний, виняток назовні не йде; передано: $(if ($null -ne $archiveSecretMaskLockedResult) { $null -ne $archiveSecretMaskLockedResult.SentPath } else { 'n/a' }); WARNING=$($archiveSecretMaskLockedWarn.Count); витекли ключі: $($archiveSecretMaskLockedLeaks -join ', '); помилка: $archiveSecretMaskSetupError"
+
+Remove-Item -LiteralPath $archiveSecretMaskRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # ============================================================
 # P2-5 (структурні): РІВНО ОДИН call site — у зовнішньому `finally`, а

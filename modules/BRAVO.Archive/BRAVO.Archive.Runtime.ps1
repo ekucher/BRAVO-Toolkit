@@ -9510,19 +9510,36 @@ function Invoke-BRAVOArchiveOwnLogUpload {
             return
         }
         $ownLogRemoteDirectory = [string]$sftpDirectories.ArchivLog
-        Initialize-BRAVOSFTPRemoteDirectories `
-            -WinSCPPath $winSCPPath `
-            -RepositorySFTPUrl $sftpUrl `
-            -HostKey $sftpHostKey `
-            -RemoteDirectories @($ownLogRemoteDirectory)
-        $ownLogUploaded = Send-FileViaWinSCP `
-            -WinSCPPath $winSCPPath `
-            -RepositorySFTPUrl $sftpUrl `
-            -HostKey $sftpHostKey `
-            -LocalFilePath $script:logFile `
-            -RemoteDirectory $ownLogRemoteDirectory
-        if (-not $ownLogUploaded) {
-            Write-BRAVOLog -Component 'SFTP' -Message "Власний лог: передачу не завершено (деталі вище) — результат прогону не змінюється" -Level "WARNING"
+        # #365: на SFTP іде лише МАСКОВАНА копія — точні значення секретів
+        # Credential Manager замінено на *** незалежно від ключових слів.
+        # Недоступний/відсутній target пропускається з INFO; збій самого
+        # маскування — виняток -> зовнішній catch -> WARNING, і НІЧОГО не
+        # вивантажено (fail-closed). Копія має те саме ім'я файлу, тож
+        # remote-ім'я (WinSCP put бере leaf-ім'я) не змінюється.
+        $ownLogMaskSet = Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)
+        if (@($ownLogMaskSet.Skipped).Count -gt 0) {
+            Write-BRAVOLog -Component 'SFTP' -Message ("Власний лог: маскування — target-и Credential Manager пропущено: " +
+                ((@($ownLogMaskSet.Skipped) | ForEach-Object { "$($_.Target) ($($_.Reason))" }) -join ', ')) -Level "INFO"
+        }
+        $ownLogMaskedCopyPath = $null
+        try {
+            $ownLogMaskedCopyPath = New-BRAVOMaskedLogCopy -Path $script:logFile -KnownSecret $ownLogMaskSet.Secrets
+            Initialize-BRAVOSFTPRemoteDirectories `
+                -WinSCPPath $winSCPPath `
+                -RepositorySFTPUrl $sftpUrl `
+                -HostKey $sftpHostKey `
+                -RemoteDirectories @($ownLogRemoteDirectory)
+            $ownLogUploaded = Send-FileViaWinSCP `
+                -WinSCPPath $winSCPPath `
+                -RepositorySFTPUrl $sftpUrl `
+                -HostKey $sftpHostKey `
+                -LocalFilePath $ownLogMaskedCopyPath `
+                -RemoteDirectory $ownLogRemoteDirectory
+            if (-not $ownLogUploaded) {
+                Write-BRAVOLog -Component 'SFTP' -Message "Власний лог: передачу не завершено (деталі вище) — результат прогону не змінюється" -Level "WARNING"
+            }
+        } finally {
+            Remove-BRAVOMaskedLogCopy -Path $ownLogMaskedCopyPath
         }
     } catch {
         try {

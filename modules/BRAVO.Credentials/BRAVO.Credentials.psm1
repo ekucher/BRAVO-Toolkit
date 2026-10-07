@@ -207,7 +207,62 @@ function Get-BRAVOCredentialSecureSecret {
     if ($null -eq $credential) {
         return $null
     }
-    return $credential.Secret
+    $secureSecret = $credential.Secret
+
+    # #365: реєстр значень, які цей процес УЖЕ отримав із Credential
+    # Manager (target -> SecureString-копії), щоб Get-BRAVOLogMaskSecretSet
+    # маскував і їх: запис, ротований/видалений/нечитабельний до моменту
+    # вивантаження журналу, міг потрапити в журнал раніше. Через цю функцію
+    # проходить і Get-BRAVOCredentialSecret, тож покрито обидва шляхи.
+    # Зберігаються SecureString-копії (не рядки): SecureString-шлях (SMB)
+    # не отримує плейнтексту й тут. Реєстр — приватна змінна модуля на час
+    # життя процесу: не експортується, не логується. Дублікати
+    # порівнюються через BSTR (занулюється) без керованого рядка.
+    if ($secureSecret -is [Security.SecureString] -and $secureSecret.Length -gt 0) {
+        $readSecretRegistry = $null
+        $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
+        if ($null -ne $readSecretRegistryVariable) { $readSecretRegistry = $readSecretRegistryVariable.Value }
+        if ($null -eq $readSecretRegistry) {
+            $readSecretRegistry = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[System.Security.SecureString]]' ([StringComparer]::OrdinalIgnoreCase)
+            $script:BRAVOCredentialReadSecretRegistry = $readSecretRegistry
+        }
+        $targetReadSecrets = $null
+        if (-not $readSecretRegistry.TryGetValue($Target, [ref]$targetReadSecrets)) {
+            $targetReadSecrets = New-Object 'System.Collections.Generic.List[System.Security.SecureString]'
+            $readSecretRegistry[$Target] = $targetReadSecrets
+        }
+        $alreadyRecorded = $false
+        foreach ($recordedSecret in $targetReadSecrets) {
+            if ($recordedSecret.Length -ne $secureSecret.Length) { continue }
+            $recordedPointer = [IntPtr]::Zero
+            $currentPointer = [IntPtr]::Zero
+            $sameValue = $true
+            try {
+                $recordedPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($recordedSecret)
+                $currentPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSecret)
+                for ($charIndex = 0; $charIndex -lt $secureSecret.Length; $charIndex++) {
+                    if ([Runtime.InteropServices.Marshal]::ReadInt16($recordedPointer, $charIndex * 2) -ne
+                        [Runtime.InteropServices.Marshal]::ReadInt16($currentPointer, $charIndex * 2)) {
+                        $sameValue = $false
+                        break
+                    }
+                }
+            } finally {
+                if ($recordedPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($recordedPointer) }
+                if ($currentPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($currentPointer) }
+            }
+            if ($sameValue) {
+                $alreadyRecorded = $true
+                break
+            }
+        }
+        if (-not $alreadyRecorded) {
+            $recordedCopy = $secureSecret.Copy()
+            $recordedCopy.MakeReadOnly()
+            $targetReadSecrets.Add($recordedCopy)
+        }
+    }
+    return $secureSecret
 }
 
 function ConvertFrom-BRAVOSecureSecret {
@@ -297,6 +352,74 @@ function Get-BRAVOCredentialIdentity {
     return [Security.Principal.WindowsIdentity]::GetCurrent().Name
 }
 
+function Get-BRAVOCredentialTargetName {
+    <#
+        #365: ЄДИНИЙ resolver імені запису Credential Manager для ключа
+        credentialSettings.Targets.<Key>: значення з конфігурації, а якщо
+        воно відсутнє/порожнє — канонічний дефолт. Таблиця дефолтів
+        дзеркалить credentialSettings.Targets у Get-BRAVODefaultConfiguration
+        (BRAVO.Configuration) — розбіжність ловить self-test
+        Credentials/TargetNameResolverIsCanonicalAndMatchesDefaults.
+        Невідомий ключ — виняток (опечатка в імені ключа не має мовчки
+        давати порожній target).
+
+        Приймає hashtable або PSCustomObject (обидві форми конфігурації
+        трапляються в runtime) і безпечний під Set-StrictMode.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'CredentialSettings',
+        Justification = 'Хибне спрацювання: $CredentialSettings — це налаштування (назви записів Credential Manager), не секрет.')]
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $CredentialSettings,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Key
+    )
+
+    $defaultTargets = @{
+        SFTPLogin                 = 'BRAVO_SFTP_LOGIN'
+        SFTPPassword              = 'BRAVO_SFTP_PASSWORD'
+        SMBLogin                  = 'BRAVO_SMB_LOGIN'
+        SMBPassword               = 'BRAVO_SMB_PASSWORD'
+        SlackWebhookGeneral       = 'BRAVO_SLACK_GENERAL_URL'
+        SlackWebhookAlerts        = 'BRAVO_SLACK_ALERTS_URL'
+        DiscordWebhookGeneral     = 'BRAVO_DISCORD_GENERAL_URL'
+        DiscordWebhookAlerts      = 'BRAVO_DISCORD_ALERTS_URL'
+        ArchivePassword           = 'BRAVO_7Z_PASSWORD'
+        InstitutionName           = 'BRAVO_INSTITUTION_NAME'
+        InstitutionCode           = 'BRAVO_INSTITUTION_CODE'
+        ArchivePrefix             = 'BRAVO_ARCHIVE_PREFIX'
+        OperationsBootstrapSecret = 'BRAVO_OPERATIONS_BOOTSTRAP_SECRET'
+        OperationsApiKey          = 'BRAVO_OPERATIONS_API_KEY'
+    }
+    if (-not $defaultTargets.ContainsKey($Key)) {
+        throw "Невідомий ключ credentialSettings.Targets: '$Key'"
+    }
+
+    $targets = $null
+    if ($null -ne $CredentialSettings) {
+        if ($CredentialSettings -is [System.Collections.IDictionary]) {
+            if ($CredentialSettings.Contains('Targets')) { $targets = $CredentialSettings['Targets'] }
+        } elseif ($null -ne $CredentialSettings.PSObject.Properties['Targets']) {
+            $targets = $CredentialSettings.Targets
+        }
+    }
+    $configuredTarget = $null
+    if ($null -ne $targets) {
+        if ($targets -is [System.Collections.IDictionary]) {
+            if ($targets.Contains($Key)) { $configuredTarget = [string]$targets[$Key] }
+        } elseif ($null -ne $targets.PSObject.Properties[$Key]) {
+            $configuredTarget = [string]$targets.$Key
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($configuredTarget)) {
+        return $configuredTarget
+    }
+    return [string]$defaultTargets[$Key]
+}
+
 function Get-BRAVOArchivePasswordTarget {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'CredentialSettings',
@@ -309,12 +432,108 @@ function Get-BRAVOArchivePasswordTarget {
         [string]$InstitutionCode
     )
 
-    $configuredTarget = [string]$CredentialSettings.Targets.ArchivePassword
-    if (-not [string]::IsNullOrWhiteSpace($configuredTarget)) {
-        return $configuredTarget
+    # #365: делегує канонічному resolver-у — без власної копії дефолту.
+    return (Get-BRAVOCredentialTargetName -CredentialSettings $CredentialSettings -Key 'ArchivePassword')
+}
+
+function Get-BRAVOLogMaskSecretSet {
+    <#
+        #365: точні значення секретів Credential Manager, які маскуються в
+        журналах перед вивантаженням на SFTP (Protect-BRAVOLogSecret
+        -KnownSecret). Target-и — через Get-BRAVOCredentialTargetName.
+
+        Набір: паролі SFTP/SMB, пароль архівів 7-Zip, bootstrap-секрет і
+        API-ключ Operations, чотири webhook-URL (Slack/Discord, general/
+        alerts). Логіни SFTP/SMB і параметри установи (назва/код/префікс)
+        свідомо НЕ входять: це ідентифікатори, а не облікові секрети, і
+        вони потрібні в журналі для діагностики (SFTP-хост резолвиться з
+        логіна).
+
+        До поточного значення додаються ВСІ значення, які getter-и
+        (Get-BRAVOCredentialSecret / Get-BRAVOCredentialSecureSecret) уже
+        повернули цьому процесу для того самого target-а (реєстр модуля):
+        запис, ротований, видалений чи нечитабельний до вивантаження, міг
+        потрапити в журнал раніше — старе значення маскується теж.
+        Дублікати прибираються.
+
+        Недоступний target (CredRead кидає — під SYSTEM без доступу до
+        запису/профілю, або Credential Manager недоступний узагалі) і
+        відсутній target пропускаються: Skipped з причиною, у якій НЕМАЄ
+        тексту винятку (лише тип) — текст може нести що завгодно; значення,
+        прочитані раніше, при цьому однаково маскуються. Логіка безпеки:
+        процес, що жодного разу не прочитав секрет, не міг і записати його
+        у свій журнал. Ловиться ЛИШЕ збій самого читання; будь-яка інша
+        помилка (невідомий ключ, збій перетворення вже прочитаного
+        значення) виходить назовні — викликач тоді нічого не вивантажує
+        (fail-closed).
+
+        Повертає [pscustomobject]@{ Secrets = [string[]]; Skipped = [object[]] }
+        де Skipped — @{ Key; Target; Reason }.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'CredentialSettings',
+        Justification = 'Хибне спрацювання: $CredentialSettings — це налаштування (назви записів Credential Manager), не секрет.')]
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $CredentialSettings
+    )
+
+    $secretTargetKeys = @(
+        'SFTPPassword', 'SMBPassword', 'ArchivePassword',
+        'OperationsBootstrapSecret', 'OperationsApiKey',
+        'SlackWebhookGeneral', 'SlackWebhookAlerts',
+        'DiscordWebhookGeneral', 'DiscordWebhookAlerts'
+    )
+    $secrets = New-Object 'System.Collections.Generic.List[string]'
+    $skipped = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($secretTargetKey in $secretTargetKeys) {
+        $targetName = Get-BRAVOCredentialTargetName -CredentialSettings $CredentialSettings -Key $secretTargetKey
+        $currentSecret = $null
+        $readFailed = $false
+        try {
+            # Лише читання Credential Manager (успішне читання заодно
+            # потрапляє в реєстр модуля).
+            $currentSecret = Get-BRAVOCredentialSecureSecret -Target $targetName
+        } catch {
+            $readFailed = $true
+            $skipped.Add([pscustomobject]@{
+                Key    = $secretTargetKey
+                Target = $targetName
+                Reason = "недоступний ($($_.Exception.GetType().FullName))"
+            })
+        }
+
+        # Поза try: збій перетворення — не "недоступний target", а помилка,
+        # що має зупинити вивантаження.
+        $currentValue = $null
+        if ($null -ne $currentSecret) {
+            $currentValue = ConvertFrom-BRAVOSecureSecret -Secret $currentSecret
+        }
+        if (-not $readFailed -and [string]::IsNullOrWhiteSpace($currentValue)) {
+            $skipped.Add([pscustomobject]@{ Key = $secretTargetKey; Target = $targetName; Reason = 'відсутній' })
+        }
+        $candidateValues = New-Object 'System.Collections.Generic.List[string]'
+        if (-not [string]::IsNullOrWhiteSpace($currentValue)) { $candidateValues.Add([string]$currentValue) }
+
+        $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
+        $recordedSecrets = $null
+        if ($null -ne $readSecretRegistryVariable -and $null -ne $readSecretRegistryVariable.Value -and
+            $readSecretRegistryVariable.Value.TryGetValue($targetName, [ref]$recordedSecrets)) {
+            foreach ($recordedSecret in $recordedSecrets) {
+                $recordedValue = ConvertFrom-BRAVOSecureSecret -Secret $recordedSecret
+                if (-not [string]::IsNullOrWhiteSpace($recordedValue)) { $candidateValues.Add([string]$recordedValue) }
+            }
+        }
+        foreach ($candidateValue in $candidateValues) {
+            if (-not $secrets.Contains($candidateValue)) { $secrets.Add($candidateValue) }
+        }
     }
 
-    return "BRAVO_7Z_PASSWORD"
+    return [pscustomobject]@{
+        Secrets = [string[]]$secrets.ToArray()
+        Skipped = [object[]]$skipped.ToArray()
+    }
 }
 
 function Test-BRAVOInstitutionSettingValue {
