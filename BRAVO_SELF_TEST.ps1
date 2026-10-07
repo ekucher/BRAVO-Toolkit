@@ -22969,6 +22969,12 @@ function Get-BRAVOMaintenanceSummaryResult {
         [IO.File]::ReadAllText(
             (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1"),
             [Text.Encoding]::UTF8
+        ) + "`n" +
+        # #394: канонічний класифікатор archive-specific збою 7-Zip, який
+        # викликає Test-SevenZipArchiveIntegrity (без стабу — справжній текст).
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"),
+            [Text.Encoding]::UTF8
         )
     )
     $retentionIntegrityModule = New-BRAVOSelfTestRuntimeModule `
@@ -22977,7 +22983,8 @@ function Get-BRAVOMaintenanceSummaryResult {
             'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
             'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
-            'Register-BRAVOLegacyBomPasswordFallback'
+            'Register-BRAVOLegacyBomPasswordFallback',
+            'Test-BRAVOSevenZipArchiveSpecificFailure'
         )
     $retentionIntegrityStubScriptText = {
         function Write-Log {
@@ -23120,7 +23127,8 @@ function Get-BRAVOMaintenanceSummaryResult {
             'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
             'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
-            'Register-BRAVOLegacyBomPasswordFallback'
+            'Register-BRAVOLegacyBomPasswordFallback',
+            'Test-BRAVOSevenZipArchiveSpecificFailure'
         )
     $retentionFollowupStubScriptText = {
         function Write-Log {
@@ -23458,6 +23466,12 @@ function Get-BRAVOMaintenanceSummaryResult {
         [IO.File]::ReadAllText(
             (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1"),
             [Text.Encoding]::UTF8
+        ) + "`n" +
+        # #394: канонічний класифікатор archive-specific збою 7-Zip, який
+        # викликає Test-SevenZipArchiveIntegrity (без стабу — справжній текст).
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"),
+            [Text.Encoding]::UTF8
         )
     )
     $verifyBackupModule = New-BRAVOSelfTestRuntimeModule `
@@ -23466,7 +23480,8 @@ function Get-BRAVOMaintenanceSummaryResult {
             'Verify-Backup', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
             'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
-            'Register-BRAVOLegacyBomPasswordFallback'
+            'Register-BRAVOLegacyBomPasswordFallback',
+            'Test-BRAVOSevenZipArchiveSpecificFailure'
         )
     $verifyBackupStubScriptText = {
         function Write-Log {

@@ -2,6 +2,24 @@
 
 ## Не випущено (developer)
 
+- **Fix: retention / 7z t: один класифікатор власних повідомлень 7-Zip замість двох копій; відмова доступу і зайнятий файл розпізнаються незалежно від мови Windows (#394).**
+  Шаблон «7-Zip сам забракував архів» (archive-specific) жив двома однаковими копіями: у `Test-SevenZipArchiveIntegrity`
+  (BRAVO.ArchiveHelpers) і в `Invoke-BRAVOSevenZipIntegrityTest` (друга, legacy BOM-спроба, BRAVO.Compatibility).
+  Характеризація: копії не розійшлися, але виняток «відмова доступу / зайнятий файл» знав лише англійський текст
+  Windows. Якщо поруч із повідомленням 7-Zip про вміст (`Can not open the file as archive`, `Data Error` тощо) стояла
+  українська чи російська системна помилка, збій вважався archive-specific: у retention стара сесія давала лише WARNING
+  без `criticalErrorOccurred`/`restoreIntegrityFailed` (код 10 замість 41), тоді як на англійській Windows та сама
+  подія — ERROR і код 41. Тепер обидва шляхи викликають єдиний `Test-BRAVOSevenZipArchiveSpecificFailure`
+  (BRAVO.Compatibility; ArchiveHelpers імпортує Compatibility, зворотної залежності немає). Він fail-closed: таймаут,
+  виняток запуску, коди поза 1/2 (7, 8, 255), незавершена legacy BOM-спроба, відсутність власних повідомлень 7-Zip
+  про вміст, відмова доступу чи зайнятий файл англійською, українською або російською, а також маркер 7-Zip
+  `System ERROR` — збій виконання (ERROR, прапорці). Пошкоджений вміст (`CRC Failed`, `Data Error`, `Headers Error`,
+  `Can not open the file as archive`) класифікується як і раніше. Контракти викликачів (bool, `FailureInfo`,
+  `FallbackAttemptOperationalFailure`, рівні журналу) і коди завершення не змінено. Тести: матриця
+  `SevenZipClassifier/*` (обидва шляхи, рівень рядка «не пройдена»), `SevenZipClassifier/RetentionLegacyBomFallbackLocalizedAccessDeniedIsCritical`,
+  `SevenZipClassifier/RetentionLegacyBomFallbackLocalizedAccessDeniedWithContentTextIsCritical`,
+  `SevenZipClassifier/SingleCanonicalClassifierUsedByBothCallers`, `ArchiveHelpers/IntegrityNullValidatorResultLogsFailureAtError`,
+  `Maintenance/RetentionValidatorExceptionLogsError`.
 - **Fix: Operations: карантин пошкодженої події більше не перезаписує попередній dead-letter (#397).**
   Ім'я dead-letter-файлу було детермінованим (`<EventId>` або `missing-eventid-<ім'я outbox-файлу>` після
   санітизації `[^A-Za-z0-9-_]` → `_`), а запис ішов через `File.Replace`: повернений вручну той самий файл, імена,
