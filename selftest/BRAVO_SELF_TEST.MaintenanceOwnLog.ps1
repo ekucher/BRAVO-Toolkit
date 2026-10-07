@@ -785,7 +785,7 @@ if ($null -ne $secretMaskUploadModule) {
 $secretMaskLockedUploads = @()
 $secretMaskLockedLines = @()
 if ($null -ne $secretMaskLockedResult) {
-    $secretMaskLockedUploads = @($secretMaskLockedResult.Uploads)
+    $secretMaskLockedUploads = @($secretMaskLockedResult.Uploads | ForEach-Object { $_ })
     $secretMaskLockedLines = @($secretMaskLockedResult.LogLines)
 }
 $secretMaskLockedLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text ($secretMaskLockedLines -join "`n") -SecretByKey $secretMaskSyntheticByKey)
@@ -910,7 +910,7 @@ if ($null -ne $secretMaskUploadModule) {
 $secretMaskSetFailUploads = @()
 $secretMaskSetFailLines = @()
 if ($null -ne $secretMaskSetFailResult) {
-    $secretMaskSetFailUploads = @($secretMaskSetFailResult.Uploads)
+    $secretMaskSetFailUploads = @($secretMaskSetFailResult.Uploads | ForEach-Object { $_ })
     $secretMaskSetFailLines = @($secretMaskSetFailResult.LogLines)
 }
 $secretMaskSetFailLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text ($secretMaskSetFailLines -join "`n") -SecretByKey $secretMaskSyntheticByKey)
