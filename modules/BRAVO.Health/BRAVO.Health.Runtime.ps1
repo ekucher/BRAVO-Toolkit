@@ -751,14 +751,8 @@ $sftpCredentialRequired = [bool]$backupMonitoring.SFTP.Enabled -and
     ($bazaAppSFTPHealthEnabled -or $bazaWWWSFTPHealthEnabled)))
 if ($sftpCredentialRequired -and $credentialHelperLoaded) {
     try {
-        $sftpLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
-        $sftpPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
-        if ([string]::IsNullOrWhiteSpace($sftpLoginTarget)) {
-            $sftpLoginTarget = "BRAVO_SFTP_LOGIN"
-        }
-        if ([string]::IsNullOrWhiteSpace($sftpPasswordTarget)) {
-            $sftpPasswordTarget = "BRAVO_SFTP_PASSWORD"
-        }
+        $sftpLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPLogin'
+        $sftpPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
         $storedSftpLogin = Get-BRAVOCredentialSecret -Target $sftpLoginTarget
         $storedSftpPassword = Get-BRAVOCredentialSecret -Target $sftpPasswordTarget
         if ([string]::IsNullOrWhiteSpace($storedSftpLogin)) {
@@ -793,14 +787,8 @@ $smbCredentialRequired = [bool]$backupMonitoring.SMB.Enabled -and
     [bool]$storageEffective.SMB.ArchiveCopy
 if ($smbCredentialRequired -and $credentialHelperLoaded) {
     try {
-        $smbLoginTarget = [string]$credentialSettings.Targets.SMBLogin
-        $smbPasswordTarget = [string]$credentialSettings.Targets.SMBPassword
-        if ([string]::IsNullOrWhiteSpace($smbLoginTarget)) {
-            $smbLoginTarget = "BRAVO_SMB_LOGIN"
-        }
-        if ([string]::IsNullOrWhiteSpace($smbPasswordTarget)) {
-            $smbPasswordTarget = "BRAVO_SMB_PASSWORD"
-        }
+        $smbLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SMBLogin'
+        $smbPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SMBPassword'
         $storedSmbLogin = Get-BRAVOCredentialSecret -Target $smbLoginTarget
         # SecureString, не рядок: далі потрібен лише PSCredential, тому
         # плейнтекст пароля SMB не створюється взагалі (аудит #5).

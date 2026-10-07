@@ -2498,10 +2498,8 @@ function Get-BRAVODataRestoreTemporaryRoot {
 function Initialize-BRAVODataRestoreSftpCredentials {
     # Той самий шлях, що Health: Credential Manager -> Resolve-BRAVOSftpHostName
     # -> New-BRAVOSftpUrl. Секрети не потрапляють ні в аргументи, ні в журнал.
-    $sftpLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
-    $sftpPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
-    if ([string]::IsNullOrWhiteSpace($sftpLoginTarget)) { $sftpLoginTarget = 'BRAVO_SFTP_LOGIN' }
-    if ([string]::IsNullOrWhiteSpace($sftpPasswordTarget)) { $sftpPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
+    $sftpLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPLogin'
+    $sftpPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
     $storedSftpLogin = Get-BRAVOCredentialSecret -Target $sftpLoginTarget
     $storedSftpPassword = Get-BRAVOCredentialSecret -Target $sftpPasswordTarget
     if ([string]::IsNullOrWhiteSpace($storedSftpLogin)) {
@@ -3402,10 +3400,7 @@ if ($ListGenerations) {
 # ===== CREDENTIALS =====
 try {
     Initialize-BRAVOCredentialManager
-    $archiveCredentialTarget = [string]$credentialSettings.Targets.ArchivePassword
-    if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
-        $archiveCredentialTarget = 'BRAVO_7Z_PASSWORD'
-    }
+    $archiveCredentialTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
     $script:archivePassword = Get-BRAVOCredentialSecret -Target $archiveCredentialTarget
     if ([string]::IsNullOrWhiteSpace($script:archivePassword)) {
         throw "пароль архіву не знайдено в Credential Manager (target '$archiveCredentialTarget') для $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"

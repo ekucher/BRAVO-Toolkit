@@ -328,10 +328,7 @@ try {
         throw "7za.exe не знайдено: $arcPath"
     }
 
-    $archiveCredentialTarget = [string]$credentialSettings.Targets.ArchivePassword
-    if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
-        $archiveCredentialTarget = "BRAVO_7Z_PASSWORD"
-    }
+    $archiveCredentialTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
     Initialize-BRAVOCredentialManager
     $archivePassword = Get-BRAVOCredentialSecret -Target $archiveCredentialTarget
     if ([string]::IsNullOrWhiteSpace($archivePassword)) {

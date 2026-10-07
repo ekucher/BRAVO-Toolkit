@@ -290,24 +290,34 @@ function Resolve-RequestedComponents {
 }
 
 function Get-CredentialTarget {
+    # #417: тонка проекція імен компонентів setup на канонічний resolver
+    # Get-BRAVOCredentialTargetName (BRAVO.Credentials) — та сама політика,
+    # що в кожному runtime-читанні: значення з конфігурації, а якщо воно
+    # відсутнє, порожнє чи лише з пробілів — канонічний дефолт. Раніше тут
+    # була власна копія з truthy-перевіркою, і target лише з пробілів
+    # використовувався дослівно. OperationsApiKey навмисно не компонент
+    # setup: цей запис створює enrollment BRAVO.Operations, а не оператор.
     param([string]$Name)
 
-    switch ($Name) {
-        "SFTPLogin" { return $(if ($credentialSettings.Targets.SFTPLogin) { [string]$credentialSettings.Targets.SFTPLogin } else { "BRAVO_SFTP_LOGIN" }) }
-        "SFTPPassword" { return $(if ($credentialSettings.Targets.SFTPPassword) { [string]$credentialSettings.Targets.SFTPPassword } else { "BRAVO_SFTP_PASSWORD" }) }
-        "SMBLogin" { return $(if ($credentialSettings.Targets.SMBLogin) { [string]$credentialSettings.Targets.SMBLogin } else { "BRAVO_SMB_LOGIN" }) }
-        "SMBPassword" { return $(if ($credentialSettings.Targets.SMBPassword) { [string]$credentialSettings.Targets.SMBPassword } else { "BRAVO_SMB_PASSWORD" }) }
-        "Slack.General" { return $(if ($credentialSettings.Targets.SlackWebhookGeneral) { [string]$credentialSettings.Targets.SlackWebhookGeneral } else { "BRAVO_SLACK_GENERAL_URL" }) }
-        "Slack.Alerts" { return $(if ($credentialSettings.Targets.SlackWebhookAlerts) { [string]$credentialSettings.Targets.SlackWebhookAlerts } else { "BRAVO_SLACK_ALERTS_URL" }) }
-        "Discord.General" { return $(if ($credentialSettings.Targets.DiscordWebhookGeneral) { [string]$credentialSettings.Targets.DiscordWebhookGeneral } else { "BRAVO_DISCORD_GENERAL_URL" }) }
-        "Discord.Alerts" { return $(if ($credentialSettings.Targets.DiscordWebhookAlerts) { [string]$credentialSettings.Targets.DiscordWebhookAlerts } else { "BRAVO_DISCORD_ALERTS_URL" }) }
-        "Archive" { return $(if ($credentialSettings.Targets.ArchivePassword) { [string]$credentialSettings.Targets.ArchivePassword } else { "BRAVO_7Z_PASSWORD" }) }
-        "InstitutionName" { return $(if ($credentialSettings.Targets.InstitutionName) { [string]$credentialSettings.Targets.InstitutionName } else { "BRAVO_INSTITUTION_NAME" }) }
-        "InstitutionCode" { return $(if ($credentialSettings.Targets.InstitutionCode) { [string]$credentialSettings.Targets.InstitutionCode } else { "BRAVO_INSTITUTION_CODE" }) }
-        "ArchivePrefix" { return $(if ($credentialSettings.Targets.ArchivePrefix) { [string]$credentialSettings.Targets.ArchivePrefix } else { "BRAVO_ARCHIVE_PREFIX" }) }
-        "OperationsBootstrapSecret" { return $(if ($credentialSettings.Targets.OperationsBootstrapSecret) { [string]$credentialSettings.Targets.OperationsBootstrapSecret } else { "BRAVO_OPERATIONS_BOOTSTRAP_SECRET" }) }
-        default { throw "Невідомий компонент секрету: $Name" }
+    $componentTargetKeys = @{
+        "SFTPLogin" = "SFTPLogin"
+        "SFTPPassword" = "SFTPPassword"
+        "SMBLogin" = "SMBLogin"
+        "SMBPassword" = "SMBPassword"
+        "Slack.General" = "SlackWebhookGeneral"
+        "Slack.Alerts" = "SlackWebhookAlerts"
+        "Discord.General" = "DiscordWebhookGeneral"
+        "Discord.Alerts" = "DiscordWebhookAlerts"
+        "Archive" = "ArchivePassword"
+        "InstitutionName" = "InstitutionName"
+        "InstitutionCode" = "InstitutionCode"
+        "ArchivePrefix" = "ArchivePrefix"
+        "OperationsBootstrapSecret" = "OperationsBootstrapSecret"
     }
+    if ([string]::IsNullOrEmpty($Name) -or -not $componentTargetKeys.ContainsKey($Name)) {
+        throw "Невідомий компонент секрету: $Name"
+    }
+    return (Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key $componentTargetKeys[$Name])
 }
 
 function Get-CredentialDescriptors {
