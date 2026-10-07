@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — поточний стан проекту
 
-Останню перевірку виконано: 2026-10-07 (після Autonomous Correctness Green Wave) (Git + GitHub REST API, лише читання).
+Останню перевірку виконано: 2026-10-07 (після Autonomous Correctness Green Wave, #412 і #391) (Git + GitHub REST API, лише читання).
 
 Кожне змінне твердження нижче має дату й метод перевірки. Це знімок, а не
 гарантія: **перечитати перед дією**. Порядок джерел істини — розділ
@@ -13,13 +13,13 @@
 
 ## State baseline SHA
 
-`c27a3e6b3eb43c838214e7e7ba993353f0d925bf` — `developer`, Merge PR #410
+`2e3a5da27a7edd99868e2dfd164d16851fed2425` — `developer`, Merge PR #391
 (перевірено `git rev-parse origin/developer`, 2026-10-07).
 
 Це останній runtime-merge Autonomous Correctness Green Wave 2026-10-06/07;
 PR із цим файлом змінює лише документацію й зливається після нього.
 Попередній baseline — `b0f3b2e` (Merge PR #323, 2026-10-01). Між ними в
-`developer` злито 54 PR (`git rev-list --count --first-parent b0f3b2e..c27a3e6` = 54, усі — merge PR; деталі нижче).
+`developer` злито 56 PR (`git rev-list --count --first-parent b0f3b2e..2e3a5da` = 56, усі — merge PR; деталі нижче).
 
 Це commit `developer`, відносно якого перевірено handoff; він не мусить
 дорівнювати commit-у, що містить сам файл. Якщо `origin/developer` пішов
@@ -37,12 +37,12 @@ git rev-parse HEAD origin/developer origin/master
 
 | Об'єкт | Значення | Метод |
 | --- | --- | --- |
-| `origin/developer` | `c27a3e6` | `git rev-parse origin/developer` |
+| `origin/developer` | `2e3a5da` | `git rev-parse origin/developer` |
 | `origin/master` | `f8fa5aa` (stable `5.2.4`), не змінювався | `git rev-parse origin/master` |
-| `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (далеко позаду `c27a3e6`) | файл у дереві |
-| CI push-прогін `developer` `c27a3e6` | 5 перевірок ` (push)` + `Telegram CI summary` — усі success (self-test job 112642383559) | `GET /commits/c27a3e6/check-runs` |
+| `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (далеко позаду `2e3a5da`) | файл у дереві |
+| CI push-прогін `developer` `2e3a5da` | run 37596365619 — на момент запису в процесі; перечитати | `GET /commits/2e3a5da/check-runs` |
 | Теги | `v5.3.0-rc.1`; `v5.2.5-rc.1`…`rc.4` (hotfix); `v5.2.5-rc.5` ще не опубліковано | `git ls-remote --tags` |
-| Відкриті PR | 1 + цей файл: #391 (draft, #301, рішення власника) | `GET /pulls?state=open` |
+| Відкриті PR | лише цей файл | `GET /pulls?state=open` |
 | Відкриті issue | 17 (без PR) | `GET /issues?state=open` |
 
 ## Branch protection — бажане проти перевіреного
@@ -79,7 +79,7 @@ live-перевірки `GET /branches/{b}`.
 
 ## Злите з попереднього baseline (перевірено `git log --first-parent`, 2026-10-07)
 
-Між `b0f3b2e` і `c27a3e6` злито 54 PR; усі звичайними merge-комітами,
+Між `b0f3b2e` і `2e3a5da` злито 56 PR; усі звичайними merge-комітами,
 кожен на окремій авторизації власника (merge train-и й Lead-треди
 2026-10-01…10-07). Подробиці кожного — у тілі PR і коментарі закриття
 issue.
@@ -93,7 +93,10 @@ TREE_EQUAL → закриття issue з відповідністю критер
   (дефект тестового каркаса або неоновлений `RUNTIME_MANIFEST.json`);
   доказом для них є повторний RED на незміненому runtime. У #406 одна
   з двох нових перевірок проходить і на старому коді (лише регресійний
-  guard). Деталі й номери прогонів — у тілі кожного PR.
+  guard). У #391 self-test на проміжному head bf46716 впав (дефект
+  нового тесту і застаріла текстова перевірка); виправлено в 9fdbf6f, і
+  8/8 отримано на 9fdbf6f без повторного запуску. Деталі й номери
+  прогонів — у тілі кожного PR.
 * 8 перевірок exact-head (за check-runs PR): на Windows —
   `Parser / BOM / JSON`, `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`,
   `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`, `Config parity
@@ -126,6 +129,8 @@ TREE_EQUAL → закриття issue з відповідністю критер
 | #405 | `fe4afa5` | Configurator екранує типографські апострофи | #307 |
 | #409 | `b146a09` | порожній FatalError SYSTEM-worker-а — збій, не успіх | #395 |
 | #410 | `c27a3e6` | оцінка місця: дерева з нульовими файлами і записи каталогів | #400 |
+| #412 | `24f7318` | Credentials: доказ round-trip позначки «worker не стартував» | #302 |
+| #391 | `2e3a5da` | порожній каталог компонента — Warning, не блокує (рішення власника) | #301 |
 
 Рев'ю: на початку хвилі (до ~23:22 UTC 2026-10-06) PR переглядав Codex,
 і його зауваження виправлено до merge: #384 (P1 і P2: 13592a2, a6baff9),
@@ -133,7 +138,9 @@ TREE_EQUAL → закриття issue з відповідністю критер
 lock), #388 (388-C1). Далі ліміт Codex вичерпався, і рев'ю виконував
 Claude QA fallback (`review_source: claude-qa-fallback`, `independence:
 degraded`). З 2026-10-07 Codex знову доступний і переглянув #405, #409,
-#410 без зауважень.
+#410, #412 без зауважень. #391 пройшов чотири раунди Codex (усі P1/P2
+виправлено з RED-тестами; четвертий раунд — за рішенням власника «Ще один
+раунд»), після вичерпання ліміту Codex — Claude QA fallback = CLEAR.
 
 Раніше в тому ж проміжку (окремі хвилі, git-історія й звіти поза
 репозиторієм у `/mnt/project-files/bravo-backlog/`): Production Safety
@@ -147,14 +154,12 @@ self-test (#367, #368, #370, #371), validation docs (#362), retention
 
 ## Відкриті PR (перевірено `GET /pulls?state=open`, 2026-10-07)
 
-| PR | Стан | Зміст | Що потрібно |
-| --- | --- | --- | --- |
-| #391 | draft | Discovery: baseline не зберігає джерело відсутнього компонента (#301) | рішення власника щодо поведінки |
+Відкритий лише PR із цим файлом.
 
 ## Issue (перевірено `GET /issues?state=open`, 2026-10-07)
 
 Відкритих issue — 17. Відкритих `bug`-issue щодо коректності runtime
-без рішення — лише **#301** (фікс у draft #391, чекає власника).
+без рішення немає: #301 закрито (#391), #302 закрито (#412).
 
 * **Рішення власника:** #381 (календарна схема retention Д/Т/М/Р),
   #314 (хвилі 2+ автовідновлення служб; кожна хвиля — окремий дозвіл на
@@ -165,7 +170,8 @@ self-test (#367, #368, #370, #371), validation docs (#362), retention
 * **Follow-up з correctness wave (тестовий борг, P2/P3):** #394
   (retention після #300), #396 (Credentials після #302), #397 (DeadLetter
   після #305), #398 (Maintenance/BazaSync після #298, #285/#293), #408
-  (write-probe Archive preflight, аналог #283).
+  (write-probe Archive preflight, аналог #283), #413 (Discovery після
+  #301: HARDENING, TEST_DEBT, CLEANUP з deferred-debt proof).
 
 ## Пілотний сервер: невирішене після pilot (стан 2026-09-29; з цієї сесії не перевірялось)
 
@@ -180,7 +186,7 @@ self-test (#367, #368, #370, #371), validation docs (#362), retention
 
 ## Класифікація 5.3 (лише класифікація; без promote/tag/release)
 
-Стан на `developer` `c27a3e6`, 2026-10-07. Рівні послідовні: ENGINEERING
+Стан на `developer` `2e3a5da`, 2026-10-07. Рівні послідовні: ENGINEERING
 READY → OPERATIONAL ACCEPTANCE (PENDING → ACCEPTED) → зняття RELEASE
 BLOCKED.
 
@@ -188,16 +194,16 @@ BLOCKED.
 | --- | --- | --- |
 | ENGINEERING READY | Runtime-cutover Config V2 (#216) у всіх production-entrypoint-ах | ТАК для прямих викликів і Configurator (#317, #328); непрямі виклики — #239 |
 | ENGINEERING READY | B7: матриця регресій 5.3-шляху в required-наборі | ЧАСТКОВО — матриця в `BRAVO_SELF_TEST.ps1` (required на `master`), але `developer` без захисту |
-| ENGINEERING READY | CI зелений на HEAD `developer` | ТАК (push-прогін `c27a3e6`, 6/6) |
-| ENGINEERING READY | Немає відкритих bug-issue щодо коректності runtime без рішення | МАЙЖЕ — лишився #301 (draft #391, рішення власника); follow-up тестового боргу #394/#396–#398/#408 |
+| ENGINEERING READY | CI зелений на HEAD `developer` | ПЕРЕВІРИТИ — push-прогін `2e3a5da` (run 37596365619) на момент запису в процесі; попередній `24f7318` — success |
+| ENGINEERING READY | Немає відкритих bug-issue щодо коректності runtime без рішення | ТАК — #301 і #302 закрито; лишився follow-up борг #394/#396–#398/#408/#413 (не acceptance) |
 | OPERATIONAL ACCEPTANCE | B5: pilot `PILOT ACCEPTED` + мігровані хости парку з доказами | НІ — `PILOT NOT ACCEPTED`, парк не мігровано |
 | OPERATIONAL ACCEPTANCE | Acceptance-issue на реальних хостах (#152/#155/#158) | НІ — open |
-| RELEASE | `VERSION.json` provenance відповідає HEAD | НІ — `sourceCommit` `d77f3b4` ≠ `c27a3e6` → `PROVENANCE_STALE` |
+| RELEASE | `VERSION.json` provenance відповідає HEAD | НІ — `sourceCommit` `d77f3b4` ≠ `2e3a5da` → `PROVENANCE_STALE` |
 | RELEASE | Прийнятий RC | НІ — `v5.3.0-rc.1` immutable, приймання не проходив; `rc.2` не створено |
 | RELEASE | Захист `developer` застосовано й перевірено live | НІ — OWNER ACTION REQUIRED (§13.4) |
 | RELEASE | Питання #281 вирішено | НІ — open |
 
-**Підсумок:** ENGINEERING READY — не досягнуто (#301, захист `developer`,
+**Підсумок:** ENGINEERING READY — не досягнуто (захист `developer`,
 #239); OPERATIONAL ACCEPTANCE — PENDING; **RELEASE BLOCKED**.
 
 ## Жорсткі зупинки (hard stops)
@@ -225,9 +231,9 @@ BLOCKED.
 2. Власник застосовує захист developer за RELEASE_POLICY.md §13.4
    (6 канонічних + Config parity); сесія після цього перечитує
    GET /branches/developer і лише тоді оновлює §13.3 та цей файл.
-3. Власник вирішує щодо #301/#391, #381, #364/#365.
+3. Власник вирішує щодо #381, #364/#365.
 4. #314 хвиля 2 (окремий дозвіл), потім #316.
-5. Follow-up тестового боргу #394, #396, #397, #398, #408 — окремими
+5. Follow-up борг #394, #396, #397, #398, #408, #413 — окремими
    PR у developer (потрібна нова авторизація на merge).
 6. B5: довести pilot до PILOT ACCEPTED (PublicIPLookupEnabled),
    рішення про модель міграції парку. До доказів B5 — hard stop нижче.
@@ -235,7 +241,11 @@ BLOCKED.
   git rev-parse origin/hotfix/5.2.5        # очікується 9790a50
   git show origin/hotfix/5.2.5:VERSION.json # 5.2.5-rc.5, sourceCommit 3f181ba
   CI на 9790a50 зелений (workflow_dispatch run 37528388423)
+  git diff --stat 3f181ba 9790a50          # лише VERSION.json і RUNTIME_MANIFEST.json
   git ls-remote --tags origin 'v5.2.5-rc.5*' і список release — порожні
+Під час перевірки RC на сервері (RELEASE_POLICY.md §8) записати в
+issue/звіт результати BRAVO_SETUP.ps1 -ValidateOnly і BRAVO_DRY_RUN.ps1
+(код завершення, рядки ERROR/WARNING); без них RC не вважати перевіреним.
 Перед кроками 2–5 перечитати: git rev-parse origin/developer, GET /pulls?state=open.
 ```
 
