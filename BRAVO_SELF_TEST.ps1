@@ -23623,6 +23623,23 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/RetentionStaleProvenCorruptSessionStillDeleted" `
         -Failure ("стара сесія з доведеним пошкодженням вмісту (7-Zip: CRC Failed, код 2) за наявних підтверджених точок відновлення має видалятися, як і раніше, без прапорців; critical={0}, restoreIntegrityFailed={1}, threw={2}, лишилось=[{3}]" -f $retention422Proven.Critical, $retention422Proven.RestoreFailed, $retention422Proven.Threw, $retention422Proven.Remaining)
 
+    # (a') ArchivesKeepCount = 0: після прогону не лишається жодної
+    # підтвердженої точки відновлення (придатні сесії теж видаляються),
+    # тож навіть доведено пошкоджену стару сесію НЕ видаляємо — WARNING
+    # називає сесію і причину.
+    $retention422KeepZero = & $retentionFollowupRunScenario 'I422KeepZero' (
+        @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-CRC-FAILED' $true)
+    ) 0
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422KeepZero -and
+            $null -eq $retention422KeepZero.Threw -and
+            (& $retention422HasArchive $retention422KeepZero $retention422Subject) -and
+            (& $retention422KeptLine $retention422KeepZero $retention422Subject 'не лишається жодної підтвердженої')
+        ) `
+        -Name "Maintenance/RetentionStaleProvenCorruptSessionKeptWhenNothingRemains" `
+        -Failure ("за ArchivesKeepCount = 0 після прогону не лишається підтвердженої точки відновлення, тож доведено пошкоджена стара сесія НЕ повинна видалятися, а WARNING має назвати сесію і причину; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422KeepZero.Threw, $retention422KeepZero.Remaining, $retention422KeepZero.Log)
+
     # (c)+(d) Перевірка не виконалась або 7-Zip не завершив її (виняток
     # валідатора, таймаут, немає 7-Zip, коди 7/8/255, відмова доступу з
     # маркером System ERROR чи локалізована) — це не доказ проти архіву:
@@ -23662,7 +23679,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             @{ Name = 'MissingHash'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-unhashed'; Stale = $true; NoHash = $true }; Reason = 'відсутній hash-файл' },
             @{ Name = 'MalformedHash'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-malformed'; Stale = $true; NoHash = $false; HashMode = 'Malformed' }; Reason = 'некоректний формат hash-файлу' },
             @{ Name = 'HashMismatch'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-mismatch'; Stale = $true; NoHash = $false; HashMode = 'Mismatch' }; Reason = 'SHA512 не збігається' },
-            @{ Name = 'UnreadableHash'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-locked'; Stale = $true; NoHash = $false; HashMode = 'Locked' }; Reason = '' })) {
+            @{ Name = 'UnreadableHash'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-locked'; Stale = $true; NoHash = $false; HashMode = 'Locked' }; Reason = ''; ReasonPattern = '\S+ — \S' })) {
         $retention422Outcome = & $retentionFollowupRunScenario ('I422' + $retention422Case['Name']) (
             @(& $retention422Base) + @($retention422Case['Session'])
         ) 2
@@ -23672,7 +23689,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                 $null -eq $retention422Outcome.Threw -and
                 (& $retention422HasArchive $retention422Outcome $retention422Subject) -and
                 (& $retention422ControlOk $retention422Outcome) -and
-                (& $retention422KeptLine $retention422Outcome $retention422Subject ([regex]::Escape([string]$retention422Case['Reason'])))
+                (& $retention422KeptLine $retention422Outcome $retention422Subject $(if ($retention422Case.ContainsKey('ReasonPattern')) { [string]$retention422Case['ReasonPattern'] } else { [regex]::Escape([string]$retention422Case['Reason']) }))
             ) `
             -Name ("Maintenance/RetentionStaleSessionKeptOnHashFileProblem/{0}" -f $retention422Case['Name']) `
             -Failure ("сценарій {0}: стара сесія з проблемою hash-файлу (не доведене пошкодження вмісту) НЕ повинна видалятися; WARNING має назвати сесію і причину; лишилось=[{1}], threw={2}, журнал: {3}" -f $retention422Case['Name'], $retention422Outcome.Remaining, $retention422Outcome.Threw, $retention422Outcome.Log)

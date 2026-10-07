@@ -7148,7 +7148,9 @@ function Remove-OldRestoreArchives {
         }
     )
     # #422: стару непридатну сесію видаляємо лише за доказом (PROVEN_DELETABLE)
-    # і лише поки є хоча б одна підтверджена точка відновлення: коли
+    # і лише поки після цього прогону лишається хоча б одна підтверджена
+    # точка відновлення ($groupsToKeep, а не всі $validGroups: за
+    # ArchivesKeepCount = 0 придатні сесії теж видаляються): коли
     # непридатне все, причина швидше системна (пароль, 7-Zip, доступ), ніж
     # пошкодження кожного архіву. Решта лишається з WARNING, що називає
     # сесію і причину.
@@ -7156,10 +7158,10 @@ function Remove-OldRestoreArchives {
     foreach ($staleGroup in $staleInvalidGroups) {
         $staleGroupState = $invalidGroupStates[[string]$staleGroup.Name]
         $staleGroupProven = ($null -ne $staleGroupState -and $staleGroupState['State'] -ceq 'PROVEN_DELETABLE')
-        if ($staleGroupProven -and @($validGroups).Count -gt 0) {
+        if ($staleGroupProven -and @($groupsToKeep).Count -gt 0) {
             $staleDeletableGroups += $staleGroup
         } elseif ($staleGroupProven) {
-            Write-Log "Непридатну сесію $($staleGroup.Name) (старшу за $InvalidRetentionDays днів) НЕ видалено: немає жодної підтвердженої точки відновлення — непридатність усіх сесій може бути системною (пароль, 7-Zip, доступ), а не пошкодженням архівів. Перевірте архіви сесії вручну." -Level "WARNING"
+            Write-Log "Непридатну сесію $($staleGroup.Name) (старшу за $InvalidRetentionDays днів) НЕ видалено: після прогону не лишається жодної підтвердженої точки відновлення — непридатність усіх сесій може бути системною (пароль, 7-Zip, доступ), а не пошкодженням архівів. Перевірте архіви сесії вручну." -Level "WARNING"
         } else {
             $staleGroupReason = 'причину не визначено'
             if ($null -ne $staleGroupState -and $null -ne $staleGroupState['Reason']) {
