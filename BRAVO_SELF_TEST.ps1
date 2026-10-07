@@ -15592,6 +15592,21 @@ try {
             $probeFunctionTexts.Add($probeStatement.Extent.Text)
         }
     }
+    # #314 хвиля 2: рішення циклу служб ухвалюють ЧИСТІ функції BRAVO.System
+    # (без SCM/WMI/маркера). Проба не імпортує BRAVO.System (його побічні
+    # функції затінені стабами), тож ці функції беруться дослівно з модуля.
+    $probeSystemWanted = @(
+        'Get-BRAVOManagedServiceOrder', 'Test-BRAVOManagedServiceActiveStatus', 'Test-BRAVOServiceStartRequired',
+        'Get-BRAVOServiceStopDecision', 'Get-BRAVOManagedServiceRestartIntent', 'Get-BRAVOInheritedServiceRestartIntent',
+        'Get-BRAVOServiceQuiescenceScope')
+    $probeSystemAst = [Management.Automation.Language.Parser]::ParseInput(
+        [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8), [ref]$null, [ref]$null)
+    $probeSystemFunctions = @($probeSystemAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $probeSystemWanted -contains $_.Name })
+    if ($probeSystemFunctions.Count -ne $probeSystemWanted.Count) { throw "BRAVO.System: знайдено $($probeSystemFunctions.Count) із $($probeSystemWanted.Count) потрібних функцій" }
+    foreach ($probeSystemFunction in $probeSystemFunctions) {
+        if (-not $probeStubNames.ContainsKey($probeSystemFunction.Name)) { $probeFunctionTexts.Add($probeSystemFunction.Extent.Text) }
+    }
     # Дослівна оркестрація до кінця зовнішнього try (включно з exit).
     # Затінені стабами визначення функцій усередині неї замінюються
     # пробілами, інакше вони перевизначили б стаб під час виконання.
