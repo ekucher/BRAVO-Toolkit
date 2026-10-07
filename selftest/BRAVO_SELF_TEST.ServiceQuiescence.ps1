@@ -2023,6 +2023,10 @@ function Restore-BRAVOServiceStartTypeSnapshot {
         (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8).Replace("`r`n", "`n")
     $lifecycleSystemText = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.System\BRAVO.System.psm1"), [Text.Encoding]::UTF8).Replace("`r`n", "`n")
+    # #314 хвиля 3: облік спроб і тексти сповіщень (BRAVO.ServiceRecovery) —
+    # справжні функції модуля; читання/запис state-файлу затінені стабами.
+    $lifecycleRecoveryText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.ServiceRecovery\BRAVO.ServiceRecovery.psm1"), [Text.Encoding]::UTF8).Replace("`r`n", "`n")
     $lifecycleSliceProblems = New-Object System.Collections.Generic.List[string]
     $getLifecycleSlice = {
         param([string]$Text, [string]$StartAnchor, [string]$EndPattern, [bool]$IncludeStart, [bool]$IncludeEnd, [bool]$LastStart = $false)
@@ -2099,8 +2103,34 @@ function Send-SlackAlert {
     if ($IsCritical) { $script:criticalErrorOccurred = $true }
     Add-LifecycleTrace ("ALERT|{0}|{1}|{2}" -f [bool]$IsCritical, $Severity, $Message)
 }
-function Send-BRAVOMaintenanceEarlyExitAlerts { param([string]$Reason) Add-LifecycleTrace "EARLYEXIT|$Reason" }
+# Ранній вихід (exit 20 guard-а -RunMissedRestoreOnly) завершив би процес
+# self-test: стаб фіксує його і перериває сценарій винятком.
+function Send-BRAVOMaintenanceEarlyExitAlerts { param([string]$Reason) Add-LifecycleTrace "EARLYEXIT|$Reason"; throw "LIFECYCLE-EARLY-EXIT|$Reason" }
 function Send-InactiveServiceWarning { param([string[]]$ServiceDescriptions) Add-LifecycleTrace ("INACTIVE|{0}" -f (@($ServiceDescriptions) -join ', ')) }
+function Read-BRAVOServiceQuiescenceState { return $script:fx.Marker }
+function Get-BRAVOManagedServiceCondition {
+    # Класифікація за правилами Get-BRAVOManagedServiceCondition (FR-1) з
+    # фікстури: Running/Pending за станом, інакше Failed (зокрема Paused);
+    # Conditions перекриває (OwnedByBravo/Disabled), ExitCodes — ExitCode.
+    [CmdletBinding()]
+    param([string]$Name, [AllowNull()][object]$Service, [AllowNull()][object]$ServiceInfo, [AllowNull()][object]$QuiescenceState, [switch]$NoWmiQuery)
+    $status = if ($script:fx.Services.ContainsKey($Name)) { [string]$script:fx.Services[$Name] } else { $null }
+    $condition = if ($script:fx.Conditions.ContainsKey($Name)) { [string]$script:fx.Conditions[$Name] } elseif ($null -eq $status) { 'NotInstalled' } elseif ($status -eq 'Running') { 'Running' } elseif ($status -like '*Pending') { 'Pending' } else { 'Failed' }
+    $exitCode = if ($script:fx.ExitCodes.ContainsKey($Name)) { $script:fx.ExitCodes[$Name] } else { $null }
+    return [pscustomobject]@{ Name = $Name; Exists = ($null -ne $status); StartMode = 'Auto'; StartModeSource = 'fake'; Status = $status; ExitCode = $exitCode; ServiceSpecificExitCode = $null; Condition = $condition; HeldByBravo = $false; OriginalStartMode = $null; MarkerOwner = $null }
+}
+function Read-BRAVOServiceRecoveryState {
+    Add-LifecycleTrace 'RSTATE-READ'
+    $state = $script:fx.RecoveryState
+    if ($null -eq $state) { $state = New-BRAVOServiceRecoveryEmptyState }
+    return [pscustomobject]@{ State = $state; Status = 'Ok'; Warning = $script:fx.RecoveryReadWarning; QuarantinedPath = $null }
+}
+function Write-BRAVOServiceRecoveryState {
+    param([AllowNull()][object]$State, [datetime]$Now = (Get-Date))
+    if ($script:fx.RecoveryWriteFails) { throw 'fake: state відновлення не записано' }
+    $script:fx.RecoveryState = $State
+    Add-LifecycleTrace ("RSTATE-WRITE|{0}" -f (@(@($State.services.Keys) | Sort-Object | ForEach-Object { '{0}=attempts:{1},critical:{2}' -f $_, @($State.services[$_].attempts).Count, ($null -ne $State.services[$_].lastCriticalAt) }) -join ';'))
+}
 function Get-BRAVOForeignServiceQuiescenceContext {
     if ($null -ne $script:fx.Foreign) { return $script:fx.Foreign }
     return [pscustomobject]@{ Present = $false; OwnerAlive = $false; RestartSuppressed = $false; RestartIntentNames = @(); Owner = $null; HeldSnapshot = @() }
@@ -2149,7 +2179,7 @@ function Invoke-BRAVOWebApplicationLogRotation { param([string]$SourceDirectory,
             Set-StrictMode -Version 2.0
             . ([scriptblock]::Create($DefinitionsText))
             . ([scriptblock]::Create($StubsText))
-        } -ArgumentList @(((& $getLifecycleDefinitions $lifecycleSystemText) + "`n`n" + (& $getLifecycleDefinitions $lifecycleRuntimeText)), $lifecycleStubs)
+        } -ArgumentList @(((& $getLifecycleDefinitions $lifecycleSystemText) + "`n`n" + (& $getLifecycleDefinitions $lifecycleRecoveryText) + "`n`n" + (& $getLifecycleDefinitions $lifecycleRuntimeText)), $lifecycleStubs)
     }
     $runLifecycleScenario = {
         param([hashtable]$Scenario)
@@ -2161,6 +2191,12 @@ function Invoke-BRAVOWebApplicationLogRotation { param([string]$SourceDirectory,
                 Processes = @(& $flag 'Processes' @('Bis'))
                 Failures = @(& $flag 'Failures' @())
                 Foreign = (& $flag 'Foreign' $null)
+                Marker = (& $flag 'Marker' $null)
+                Conditions = (& $flag 'Conditions' @{})
+                ExitCodes = (& $flag 'ExitCodes' @{})
+                RecoveryState = (& $flag 'RecoveryState' $null)
+                RecoveryReadWarning = (& $flag 'RecoveryReadWarning' $null)
+                RecoveryWriteFails = [bool](& $flag 'RecoveryWriteFails' $false)
                 Trace = New-Object System.Collections.Generic.List[string]
             }
             $script:criticalErrorOccurred = $false
@@ -2177,7 +2213,7 @@ function Invoke-BRAVOWebApplicationLogRotation { param([string]$SourceDirectory,
             $restoreOnDisabledBravo = [bool](& $flag 'RestoreOnDisabledBravo' $false)
             $bootRestoreIgnoresWindow = [bool](& $flag 'BootHold' $false)
             $shouldRestore = [bool](& $flag 'ShouldRestore' $false)
-            $RunMissedRestoreOnly = $false; $missedDailyWork = $false; $missedRestoreDue = $false; $scheduledOccurrence = $null
+            $RunMissedRestoreOnly = [bool](& $flag 'RunMissedRestoreOnly' $false); $missedDailyWork = [bool](& $flag 'RunMissedRestoreOnly' $false); $missedRestoreDue = $false; $scheduledOccurrence = $null
             $LOG_FILE = 'C:\BRAVO\LOGS\BRAVO_MAINTENANCE_selftest.log'
             $ARC_DIR = 'D:\ARC'; $ARCH_NAME1 = 'before.mdz'
             $ServiceStopTimeoutSeconds = 120; $ServiceStartTimeoutSeconds = 180; $ServicePollIntervalSeconds = 2
@@ -2273,6 +2309,112 @@ function Invoke-BRAVOWebApplicationLogRotation { param([string]$SourceDirectory,
         -Condition ($lifecycleSliceProblems.Count -eq 0 -and $lifecycleDiffs.Count -eq 0) `
         -Name "ServiceRecovery/MaintenanceLifecycleCharacterization" `
         -Failure "цикл служб нічного Maintenance (знімок -> маркер -> зупинка Web/exchangAPI/BRAVO -> журнали -> запуск BRAVO/exchangAPI/Web) має поводитися як до винесення у функції: $(@($lifecycleSliceProblems) + @($lifecycleDiffs) -join ' || ')"
+    # ============================================================
+    # #314 хвиля 3 (тест 7, FR-2/FR-6): нічний Maintenance вважає впалою
+    # службу, що Stopped і не Disabled/OwnedByBravo/NotInstalled (план §0.3):
+    # вона входить у маркер із RestartIntent, запускається після
+    # обслуговування в канонічному порядку, спроба рахується в state-файлі
+    # (нічний прогін паузу ігнорує), успіх -> INFO + WARNING «Recovered»
+    # (+ CRITICAL «циклічно падає» за CyclicAlertDue), невдача -> наявна
+    # CRITICAL-гілка з текстом StartFailed. Guard -RunMissedRestoreOnly
+    # дивиться на фактично активні служби. Та сама пісочниця, що й
+    # характеризація вище (справжні фрагменти runtime).
+    # ============================================================
+    $nightlyProblems = New-Object System.Collections.Generic.List[string]
+    $nightlyLog = 'C:\BRAVO\LOGS\BRAVO_MAINTENANCE_selftest.log'
+    $runNightlyScenario = {
+        param([string]$Label, [hashtable]$Spec)
+        $nightlyEarlyExit = $null
+        $nightlyTrace = @()
+        try {
+            $nightlyTrace = @(& $runLifecycleScenario $Spec)
+        } catch {
+            if ($_.Exception.Message -like 'LIFECYCLE-EARLY-EXIT|*') {
+                $nightlyEarlyExit = $_.Exception.Message
+                $nightlyTrace = @(& $lifecycleModule { $script:fx.Trace.ToArray() })
+            } else {
+                [void]$nightlyProblems.Add("${Label}: виняток $($_.Exception.Message)")
+            }
+        }
+        return [pscustomobject]@{ Trace = $nightlyTrace; EarlyExit = $nightlyEarlyExit; Text = ($nightlyTrace -join ' ¶ ') }
+    }
+    $nightlyExpect = {
+        param([string]$Label, $Run, [bool]$Condition, [string]$What)
+        if (-not $Condition) { [void]$nightlyProblems.Add("${Label}: $What; траса: $($Run.Text)") }
+    }
+    $nightlyStarts = { param($Run) (@($Run.Trace | Where-Object { $_ -match '^SVC\|.+>Running' } | ForEach-Object { $_.Split('|')[1].Split('>')[0] }) -join ' ') }
+    $nightlyHas = { param($Run, [string]$Prefix) @($Run.Trace | Where-Object { $_.StartsWith($Prefix, [StringComparison]::Ordinal) }).Count -gt 0 }
+    $nightlyLast = { param($Run, [string]$Prefix) @($Run.Trace | Where-Object { $_.StartsWith($Prefix, [StringComparison]::Ordinal) }) | Select-Object -Last 1 }
+
+    if ($null -ne $lifecycleModule) {
+        # (1) exchangAPI впала (ExitCode 1067), BRAVO і BRAVO Web працюють.
+        $run = & $runNightlyScenario 'ExchangeFailed' @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ExitCodes = @{ exchangAPI = 1067 } }
+        & $nightlyExpect 'ExchangeFailed' $run (& $nightlyHas $run 'MARKER|BRAVO_MAINTENANCE|BRAVO=True,exchangAPI=True,Apache2.4=True|') 'маркер має містити exchangAPI з RestartIntent=True'
+        & $nightlyExpect 'ExchangeFailed' $run ((& $nightlyStarts $run) -ceq 'BRAVO exchangAPI Apache2.4') "запуск має бути BRAVO -> exchangAPI -> Apache2.4, отримано '$(& $nightlyStarts $run)'"
+        & $nightlyExpect 'ExchangeFailed' $run (& $nightlyHas $run 'LOG|INFO|Служба exchangAPI була зупинена до обслуговування (ExitCode 1067) — буде запущена після обслуговування (#314)') 'INFO на старті про впалу службу'
+        & $nightlyExpect 'ExchangeFailed' $run (& $nightlyHas $run 'LOG|INFO|Служба exchangAPI була зупинена до обслуговування (ExitCode 1067), запущена') 'INFO про запуск впалої служби'
+        & $nightlyExpect 'ExchangeFailed' $run (& $nightlyHas $run "ALERT|False|WARNING|Служба exchangAPI впала (ExitCode 1067), журнали збережено, запущена. Спроба 1 за добу. Журнал: $nightlyLog") 'WARNING Recovered без -IsCritical'
+        & $nightlyExpect 'ExchangeFailed' $run ((& $nightlyLast $run 'RSTATE-WRITE|') -ceq 'RSTATE-WRITE|exchangAPI=attempts:1,critical:False') "облік спроби в state: '$(& $nightlyLast $run 'RSTATE-WRITE|')'"
+        & $nightlyExpect 'ExchangeFailed' $run (-not ($run.Text -match 'циклічно падає')) 'на першій спробі CRITICAL «циклічно падає» не надсилається'
+        & $nightlyExpect 'ExchangeFailed' $run (-not ($run.Text -match 'До початку maintenance не запущені служби|INACTIVE\|')) 'попередження про неактивні служби прибрано'
+        & $nightlyExpect 'ExchangeFailed' $run (& $nightlyHas $run 'END|critical=False|warnings=0|restartFailed=False|') 'прогін без критичних помилок і попереджень'
+
+        # (2) Третя спроба за добу -> CRITICAL «циклічно падає» (без -IsCritical) і lastCriticalAt.
+        $nightlyNow = Get-Date
+        $nightlyPriorState = [pscustomobject]@{
+            schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+            services = @{ exchangAPI = [pscustomobject]@{ attempts = @($nightlyNow.AddHours(-3).ToString('o'), $nightlyNow.AddHours(-2).ToString('o')); lastCriticalAt = $null; stableSince = $null } }
+        }
+        $run = & $runNightlyScenario 'ExchangeCyclic' @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ExitCodes = @{ exchangAPI = 1067 }; RecoveryState = $nightlyPriorState }
+        & $nightlyExpect 'ExchangeCyclic' $run (& $nightlyHas $run 'ALERT|False|WARNING|Служба exchangAPI впала (ExitCode 1067), журнали збережено, запущена. Спроба 3 за добу.') 'Recovered зі спробою 3'
+        & $nightlyExpect 'ExchangeCyclic' $run (& $nightlyHas $run ('ALERT|False|CRITICAL|Служба exchangAPI циклічно падає: 3 падінь з {0}, потрібне втручання. Журнал: {1}' -f $nightlyNow.AddHours(-3).ToString('dd.MM HH:mm', [Globalization.CultureInfo]::InvariantCulture), $nightlyLog)) 'CRITICAL «циклічно падає» без -IsCritical'
+        & $nightlyExpect 'ExchangeCyclic' $run ((& $nightlyLast $run 'RSTATE-WRITE|') -ceq 'RSTATE-WRITE|exchangAPI=attempts:3,critical:True') "lastCriticalAt у state: '$(& $nightlyLast $run 'RSTATE-WRITE|')'"
+        & $nightlyExpect 'ExchangeCyclic' $run (& $nightlyHas $run 'END|critical=False|') 'Cyclic не провалює прогін'
+
+        # (3) Запуск впалої служби не вдався -> CRITICAL StartFailed (-IsCritical), без Recovered.
+        $run = & $runNightlyScenario 'ExchangeFailedStartFails' @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ExitCodes = @{ exchangAPI = 1067 }; Failures = @('exchangAPI>Running') }
+        & $nightlyExpect 'ExchangeFailedStartFails' $run (& $nightlyHas $run "ALERT|True||Не вдалося запустити службу exchangAPI після падіння (ExitCode 1067): fake: exchangAPI не перейшла в Running. Спроба 1 за добу. Журнал: $nightlyLog") 'CRITICAL StartFailed'
+        & $nightlyExpect 'ExchangeFailedStartFails' $run (-not ($run.Text -match 'ALERT\|False\|WARNING\|Служба exchangAPI впала')) 'без Recovered'
+        & $nightlyExpect 'ExchangeFailedStartFails' $run ((& $nightlyLast $run 'RSTATE-WRITE|') -ceq 'RSTATE-WRITE|exchangAPI=attempts:1,critical:False') 'невдала спроба теж рахується'
+        & $nightlyExpect 'ExchangeFailedStartFails' $run (& $nightlyHas $run 'END|critical=True|warnings=0|restartFailed=True|') 'критична помилка, маркер лишається'
+        & $nightlyExpect 'ExchangeFailedStartFails' $run ((& $nightlyStarts $run) -ceq 'BRAVO exchangAPI Apache2.4') 'Apache2.4 запускається після невдачі exchangAPI'
+
+        # (4) Зупинена служба під маркером BRAVO (OwnedByBravo) — не впала, не запускається.
+        $run = & $runNightlyScenario 'ExchangeOwnedByBravo' @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; Conditions = @{ exchangAPI = 'OwnedByBravo' } }
+        & $nightlyExpect 'ExchangeOwnedByBravo' $run ((& $nightlyStarts $run) -ceq 'BRAVO Apache2.4') "OwnedByBravo не запускається, отримано '$(& $nightlyStarts $run)'"
+        & $nightlyExpect 'ExchangeOwnedByBravo' $run (-not (& $nightlyHas $run 'RSTATE-')) 'state відновлення не чіпається'
+
+        # (5) Усі служби працюють — state відновлення не читається і не пишеться.
+        $run = & $runNightlyScenario 'AllRunning' @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running' }
+        & $nightlyExpect 'AllRunning' $run (-not (& $nightlyHas $run 'RSTATE-') -and -not ($run.Text -match 'ALERT\|')) 'без впалих служб — ні state, ні сповіщень'
+
+        # (6) #321: -ForceRestore при Disabled BRAVO — BRAVO не запускається, впалі exchangAPI/BRAVO Web — запускаються.
+        $run = & $runNightlyScenario 'DisabledBravoForceRestoreFailedOthers' @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped'; BravoEnabled = $false; BravoDisabled = $true; RestoreOnDisabledBravo = $true }
+        & $nightlyExpect 'DisabledBravoForceRestoreFailedOthers' $run ((& $nightlyStarts $run) -ceq 'exchangAPI Apache2.4') "очікувався запуск exchangAPI Apache2.4, отримано '$(& $nightlyStarts $run)'"
+        & $nightlyExpect 'DisabledBravoForceRestoreFailedOthers' $run (-not ($run.Text -match 'Служба BRAVO впала')) 'Disabled BRAVO не є впалою'
+        & $nightlyExpect 'DisabledBravoForceRestoreFailedOthers' $run (& $nightlyHas $run 'KILL|Bis|') 'точка розширення #316 для Disabled BRAVO лишається'
+
+        # (7) Guard -RunMissedRestoreOnly: впалі служби не є «уже працюючими».
+        $run = & $runNightlyScenario 'RecoveryTickAllFailed' @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped'; RunMissedRestoreOnly = $true }
+        & $nightlyExpect 'RecoveryTickAllFailed' $run ($null -eq $run.EarlyExit) "впалі служби не мають давати exit 20 ($($run.EarlyExit))"
+        & $nightlyExpect 'RecoveryTickAllFailed' $run ((& $nightlyStarts $run) -ceq 'BRAVO exchangAPI Apache2.4') "впалі служби запускаються, отримано '$(& $nightlyStarts $run)'"
+        $run = & $runNightlyScenario 'RecoveryTickBravoRunning' @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Stopped'; RunMissedRestoreOnly = $true }
+        & $nightlyExpect 'RecoveryTickBravoRunning' $run ($null -ne $run.EarlyExit -and $run.Text.Contains('уже працюють служби BRAVO. Recovery не зупиняє служби.')) 'працююча BRAVO лишає guard (exit 20) з переліком лише фактично працюючих служб'
+
+        # (8) Boot-hold профілю робочого часу: зупинені на boot служби — утримання, а не падіння.
+        $run = & $runNightlyScenario 'BootHoldNoRecoveryAccounting' @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped'; BootHold = $true; ShouldRestore = $true }
+        & $nightlyExpect 'BootHoldNoRecoveryAccounting' $run ((& $nightlyStarts $run) -ceq 'BRAVO exchangAPI Apache2.4' -and -not (& $nightlyHas $run 'RSTATE-') -and -not ($run.Text -match 'впала')) 'boot-hold піднімає служби без обліку спроб і Recovered'
+
+        # (9) Збій запису state — лише WARNING, служба все одно запускається.
+        $run = & $runNightlyScenario 'RecoveryStateWriteFails' @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; RecoveryWriteFails = $true }
+        & $nightlyExpect 'RecoveryStateWriteFails' $run ((& $nightlyStarts $run) -ceq 'BRAVO exchangAPI Apache2.4' -and (& $nightlyHas $run 'LOG|WARNING|') -and (& $nightlyHas $run 'END|critical=False|')) 'збій state не блокує запуск і не є критичним'
+    } else {
+        [void]$nightlyProblems.Add('пісочниця runtime не зібрана')
+    }
+    Test-BRAVOCondition `
+        -Condition ($lifecycleSliceProblems.Count -eq 0 -and $nightlyProblems.Count -eq 0) `
+        -Name "ServiceRecovery/NightlyMaintenanceStartsFailedServices" `
+        -Failure "нічний Maintenance має піднімати впалу службу (маркер RestartIntent, порядок BRAVO -> exchangAPI -> BRAVO Web, облік спроби, WARNING Recovered / CRITICAL Cyclic / CRITICAL StartFailed, guard за фактично активними): $(@($lifecycleSliceProblems) + @($nightlyProblems) -join ' || ')"
     }
     #endregion #314-wave2-lifecycle-characterization
 

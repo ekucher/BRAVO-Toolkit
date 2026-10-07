@@ -10103,15 +10103,19 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Maintenance/TraceSftpBlockGloballyDisabledSkipsCredentialsAndSession' `
         -Failure 'componentSettings.SFTP.Enabled=false має пропускати credential-читання ($traceSftpLogin = Get-BRAVOCredentialSecret) і відкриття WinSCP-сесії ПОВНІСТЮ — обидва мусять залишатись у "else"-гілці (SFTP увімкнено), не досяжній при глобально вимкненому SFTP'
 
+    # #314 хвиля 3 (FR-2): попередження «СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД
+    # MAINTENANCE» прибрано — зупинену (не Disabled) службу Maintenance тепер
+    # запускає після обслуговування і сповіщає про відновлення (WARNING
+    # Recovered, ServiceRecovery/NightlyMaintenanceStartsFailedServices).
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
-            $maintenanceScriptText.Contains("СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE") -and
+            -not $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
+            -not $maintenanceScriptText.Contains("СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE") -and
             $maintenanceScriptText.Contains("BRAVO.Notifications") -and
             $notificationScriptText.Contains('$newlineLength = if ($currentChunk.Length -gt 0) {')
         ) `
         -Name "Notifications/MaintenanceInactiveServices" `
-        -Failure "maintenance має негайно сповіщати про початково зупинені служби"
+        -Failure "maintenance більше не надсилає попередження про початково зупинені служби (#314): впалу службу він запускає після обслуговування"
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains("RunMissedRestoreOnly") -and

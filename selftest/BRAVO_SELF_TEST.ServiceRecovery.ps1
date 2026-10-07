@@ -522,3 +522,140 @@ function Write-BRAVOStateTemporaryText {
         -Failure ("CRITICAL «циклічно падає» — на 3-й спробі за 24 год, далі не частіше разу на добу; FirstAttemptAt — перша спроба у вікні; " +
             "очікувались хвилини [$cyclicExpectedDueAt], отримано [$($cyclic.DueAt)] second=$($cyclic.SecondDue) third=$($cyclic.ThirdDue)/$($cyclic.ThirdNumber) first=$($cyclic.ThirdFirstAt)")
 }
+
+# ============================================================
+# #314 хвиля 3 (частина 2): нічний Maintenance піднімає впалу службу (FR-2)
+# і сповіщає про це (FR-6). Статична частина тестів 7 і 10 + чистий план
+# життєвого циклу з «впалою» службою (BRAVO.System, без Windows).
+# Поведінку циклу служб (маркер, порядок запуску, облік спроб, сповіщення,
+# guard -RunMissedRestoreOnly) перевіряє ServiceRecovery/NightlyMaintenance*
+# на справжніх фрагментах runtime (ServiceQuiescence, пісочниця
+# характеризації циклу служб).
+# ============================================================
+& {
+    $nightlyRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $nightlyRuntimeAst = [Management.Automation.Language.Parser]::ParseInput($nightlyRuntimeText, [ref]$null, [ref]$null)
+    $nightlyFindFunction = {
+        param([string]$FunctionName)
+        @($nightlyRuntimeAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $FunctionName
+                }, $true)) | Select-Object -First 1
+    }
+    $nightlyCommandCalls = {
+        param($ScopeAst, [string]$CommandName)
+        if ($null -eq $ScopeAst) { return @() }
+        return @($ScopeAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq $CommandName
+                }, $true))
+    }
+    $nightlyParameterValue = {
+        # Значення іменованого параметра CommandAst (текст наступного елемента).
+        param($CommandAst, [string]$ParameterName)
+        $elements = @($CommandAst.CommandElements)
+        for ($elementIndex = 0; $elementIndex -lt $elements.Count; $elementIndex++) {
+            $element = $elements[$elementIndex]
+            if ($element -is [Management.Automation.Language.CommandParameterAst] -and $element.ParameterName -ieq $ParameterName) {
+                if ($null -ne $element.Argument) { return $element.Argument.Extent.Text.Trim("'", '"') }
+                if ($elementIndex + 1 -lt $elements.Count) { return $elements[$elementIndex + 1].Extent.Text.Trim("'", '"') }
+                return ''
+            }
+        }
+        return $null
+    }
+
+    # (тест 7а) Попередження «СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE» прибрано:
+    # зупинену (не Disabled) службу Maintenance тепер запускає, а не лише
+    # повідомляє про неї. Runtime імпортує BRAVO.ServiceRecovery.
+    $nightlyModuleImportLine = @($nightlyRuntimeText -split "`r?`n" | Where-Object { $_ -match "^foreach \(\`$moduleName in @\(" }) | Select-Object -First 1
+    Test-BRAVOCondition `
+        -Condition (
+            -not $nightlyRuntimeText.Contains('Send-InactiveServiceWarning') -and
+            -not $nightlyRuntimeText.Contains('СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE') -and
+            $null -ne $nightlyModuleImportLine -and
+            $nightlyModuleImportLine.Contains("'BRAVO.ServiceRecovery'")
+        ) `
+        -Name 'ServiceRecovery/NightlyMaintenanceDropsInactiveServiceWarning' `
+        -Failure "runtime Maintenance не має містити Send-InactiveServiceWarning і заголовка «СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE» (#314 FR-2) і має імпортувати BRAVO.ServiceRecovery у списку спільних модулів; рядок імпорту: '$nightlyModuleImportLine'"
+
+    # (тест 10, статична частина) Recovered — WARNING через Send-SlackAlert без
+    # -IsCritical (служба піднята, прогін не провалений); Cyclic — CRITICAL без
+    # -IsCritical; невдалий запуск впалої служби — текст StartFailed у
+    # наявній CRITICAL-гілці (-IsCritical -> exit 60).
+    $nightlyRecoveredFunction = & $nightlyFindFunction 'Send-BRAVOMaintenanceServiceRecoveredAlert'
+    $nightlyRecoveredAlerts = @(& $nightlyCommandCalls $nightlyRecoveredFunction 'Send-SlackAlert')
+    $nightlyRecoveredKinds = @(& $nightlyCommandCalls $nightlyRecoveredFunction 'New-BRAVOServiceRecoveryNotificationText' |
+            ForEach-Object { & $nightlyParameterValue $_ 'Kind' })
+    $nightlyRecoveredSeverities = @($nightlyRecoveredAlerts | ForEach-Object { & $nightlyParameterValue $_ 'Severity' })
+    $nightlyRecoveredCriticalFlags = @($nightlyRecoveredAlerts | Where-Object { $null -ne (& $nightlyParameterValue $_ 'IsCritical') })
+    $nightlyStartFunction = & $nightlyFindFunction 'Start-BRAVOMaintenanceManagedService'
+    $nightlyStartFailedKinds = @(& $nightlyCommandCalls $nightlyStartFunction 'New-BRAVOServiceRecoveryNotificationText' |
+            ForEach-Object { & $nightlyParameterValue $_ 'Kind' })
+    $nightlyRecoveredCallers = @(& $nightlyCommandCalls $nightlyStartFunction 'Send-BRAVOMaintenanceServiceRecoveredAlert')
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $nightlyRecoveredFunction -and
+            $nightlyRecoveredAlerts.Count -eq 2 -and
+            (@($nightlyRecoveredSeverities | Sort-Object) -join ',') -eq 'CRITICAL,WARNING' -and
+            $nightlyRecoveredCriticalFlags.Count -eq 0 -and
+            (@($nightlyRecoveredKinds | Sort-Object) -join ',') -eq 'Cyclic,Recovered' -and
+            $nightlyRecoveredFunction.Extent.Text.Contains('Register-BRAVOServiceRecoveryCriticalSent') -and
+            $nightlyStartFailedKinds -contains 'StartFailed' -and
+            $nightlyRecoveredCallers.Count -ge 1
+        ) `
+        -Name 'ServiceRecovery/NightlyRecoveredAlertIsWarningCyclicIsCritical' `
+        -Failure ("Send-BRAVOMaintenanceServiceRecoveredAlert (виклик зі Start-BRAVOMaintenanceManagedService) має надсилати Recovered через Send-SlackAlert -Severity WARNING і Cyclic -Severity CRITICAL, обидва без -IsCritical, і фіксувати Register-BRAVOServiceRecoveryCriticalSent; невдалий запуск — текст StartFailed. " +
+            "функція=$($null -ne $nightlyRecoveredFunction) алертів=$($nightlyRecoveredAlerts.Count) severity=[$($nightlyRecoveredSeverities -join ',')] -IsCritical=$($nightlyRecoveredCriticalFlags.Count) kinds=[$($nightlyRecoveredKinds -join ',')] startKinds=[$($nightlyStartFailedKinds -join ',')] викликів=$($nightlyRecoveredCallers.Count)")
+
+    # Чистий план життєвого циклу (BRAVO.System): «впала» служба (Failed,
+    # Stopped, керована) має намір перезапуску — входить у маркер із
+    # RestartIntent, не зупиняється (вона вже зупинена) і запускається в
+    # канонічному порядку. Некерована (Disabled оператором) — ні.
+    $nightlyPlanModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ([IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8)) `
+        -FunctionNames @('Get-BRAVOManagedServiceOrder', 'Test-BRAVOManagedServiceActiveStatus', 'Test-BRAVOServiceStartRequired',
+            'Get-BRAVOServiceStopDecision', 'Get-BRAVOManagedServiceRestartIntent', 'Get-BRAVOInheritedServiceRestartIntent',
+            'Get-BRAVOServiceQuiescenceScope', 'Get-BRAVOManagedServiceLifecyclePlan')
+    $nightlyPlanProbe = & $nightlyPlanModule {
+        Set-StrictMode -Version 2.0
+        $describe = {
+            param($Plan)
+            '{0} | stop: {1} | start: {2}' -f (@($Plan.QuiescenceServices | ForEach-Object { '{0}={1}' -f $_.Name, [bool]$_.RestartIntent }) -join ','),
+                (@($Plan.StopOrder) -join ' '), (@($Plan.StartOrder) -join ' ')
+        }
+        $exchangeFailed = Get-BRAVOManagedServiceLifecyclePlan -Services @(
+            @{ Key = 'Bravo'; Name = 'BRAVO'; Enabled = $true; Status = 'Running' },
+            @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $true; Status = 'Stopped'; Failed = $true },
+            @{ Key = 'BravoWeb'; Name = 'Apache2.4'; Enabled = $true; Status = 'Running'; Failed = $false })
+        $allFailedObjects = Get-BRAVOManagedServiceLifecyclePlan -Services @(
+            [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Enabled = $true; Status = 'Stopped'; Failed = $true },
+            [pscustomobject]@{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $true; Status = 'Stopped'; Failed = $true },
+            [pscustomobject]@{ Key = 'BravoWeb'; Name = 'Apache2.4'; Enabled = $true; Status = 'Stopped'; Failed = $true })
+        $failedButUnmanaged = Get-BRAVOManagedServiceLifecyclePlan -Services @(
+            [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Enabled = $false; Status = 'Stopped'; Failed = $true },
+            [pscustomobject]@{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $true; Status = 'Stopped'; Failed = $false },
+            [pscustomobject]@{ Key = 'BravoWeb'; Name = 'Apache2.4'; Enabled = $true; Status = 'Running' })
+        $legacyNoFailed = Get-BRAVOManagedServiceLifecyclePlan -Services @(
+            [pscustomobject]@{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $true; Status = 'Stopped' })
+        return [pscustomobject]@{
+            ExchangeFailed = (& $describe $exchangeFailed)
+            AllFailed = (& $describe $allFailedObjects)
+            Unmanaged = (& $describe $failedButUnmanaged)
+            Legacy = (& $describe $legacyNoFailed)
+        }
+    }
+    $nightlyPlanExpected = [ordered]@{
+        ExchangeFailed = 'BRAVO=True,exchangAPI=True,Apache2.4=True | stop: Apache2.4 BRAVO | start: BRAVO exchangAPI Apache2.4'
+        AllFailed = 'BRAVO=True,exchangAPI=True,Apache2.4=True | stop:  | start: BRAVO exchangAPI Apache2.4'
+        Unmanaged = 'Apache2.4=True | stop: Apache2.4 | start: Apache2.4'
+        Legacy = ' | stop:  | start: '
+    }
+    $nightlyPlanDiffs = @($nightlyPlanExpected.Keys | Where-Object { [string]$nightlyPlanProbe.$_ -cne [string]$nightlyPlanExpected[$_] } |
+            ForEach-Object { "${_}: '$($nightlyPlanProbe.$_)' (очікувалось '$($nightlyPlanExpected[$_])')" })
+    Test-BRAVOCondition `
+        -Condition ($nightlyPlanDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/LifecyclePlanStartsFailedService' `
+        -Failure "керована «впала» служба (Failed=`$true) має входити в маркер із RestartIntent і запускатися в порядку BRAVO -> exchangAPI -> BRAVO Web без зупинки; некерована чи без Failed — ні: $($nightlyPlanDiffs -join ' || ')"
+}
