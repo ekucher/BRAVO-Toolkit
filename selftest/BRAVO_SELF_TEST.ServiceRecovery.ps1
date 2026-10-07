@@ -208,8 +208,12 @@ $BRAVOWEB_APP_LOG_FILTER = '*.log'
                     (@($serviceRecoveryScenarios[$serviceRecoveryScenario]) -join "`n"), $serviceRecoveryUtf8)
             }
             $serviceRecoveryHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
+            # не дозволяє нових Bypass-місць): дочірній процес успадковує
+            # політику батьківського прогону self-test (той самий підхід, що
+            # orchestration-проба Archive).
             $null = & $serviceRecoveryHost -NoLogo -NoProfile -NonInteractive `
-                -ExecutionPolicy Bypass -File $serviceRecoveryProbePath `
+                -File $serviceRecoveryProbePath `
                 -Scenarios (@($serviceRecoveryScenarios.Keys) -join ',') -RepositoryRoot $root -ProbeParent $serviceRecoveryRoot
             foreach ($serviceRecoveryScenario in @($serviceRecoveryScenarios.Keys)) {
                 $serviceRecoveryResultPath = Join-Path (Join-Path $serviceRecoveryRoot $serviceRecoveryScenario) 'result.json'
