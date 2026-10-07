@@ -2,6 +2,17 @@
 
 ## Не випущено (developer)
 
+- **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
+  Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
+  `Get-BRAVOCredentialSecureSecret` у приватний `Add-BRAVOCredentialReadSecretRecord` із власним try/catch: збій обліку
+  (BSTR, пам'ять) більше не ламає звичайне читання секрету, але позначає реєстр неповним, і `Get-BRAVOLogMaskSecretSet`
+  тоді кидає виняток без значень і без тексту первинного винятку — власний лог Maintenance/Archive не вивантажується
+  (WARNING, як для будь-якого збою маскування; результат основної операції не змінюється). `Set-BRAVOCredential` після
+  успішного запису теж додає значення в облік, тож записаний цим процесом секрет (напр. API-ключ Operations) маскується,
+  навіть якщо пізніший CredRead упаде. Тести: `Credentials/LogMaskSecretSetIncludesSecretsWrittenInProcess`,
+  `Credentials/RegistryBookkeepingFailureDoesNotBreakReadButFailsMaskSet`,
+  `Maintenance/OwnLogUploadFailsClosedWithoutLeakWhenSecretRegistryIncomplete`.
+
 - **Fix: retention архівів реставрації більше не видаляє стару непридатну сесію без доказу пошкодження (#422).**
   `Remove-OldRestoreArchives` видаляв кожну непридатну сесію, старшу за `Retention.FailedArchiveDays` (типово 30 днів),
   незалежно від причини непридатності: виняток валідатора, таймаут `7z t`, відсутній чи непрацюючий 7-Zip, коди 7/8/255,

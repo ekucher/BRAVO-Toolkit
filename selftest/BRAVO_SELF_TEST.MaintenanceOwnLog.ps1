@@ -373,13 +373,9 @@ function Get-BRAVOSystemRangeIdLogPath { return $script:secretMaskTestState.Rang
 '@
 
 $secretMaskSourceText = $secretMaskStub + "`n" + $maintenanceOwnLogScriptText + "`n" + $secretMaskCredentialsText + "`n" + $secretMaskLoggingText + "`n" + $secretMaskConfigurationText
-$secretMaskCredentialReadChain = @('Get-BRAVOCredential', 'Get-BRAVOCredentialSecureSecret', 'ConvertFrom-BRAVOSecureSecret', 'Get-BRAVOCredentialSecret')
-# #417: облік прочитаних/записаних секретів винесено в приватний helper
-# BRAVO.Credentials; до його появи ланцюг лишається попереднім (тести #417
-# тоді падають на поведінці, а не на відсутності функції).
-if ($secretMaskCredentialsText.Contains('function Add-BRAVOCredentialReadSecretRecord')) {
-    $secretMaskCredentialReadChain += @('Add-BRAVOCredentialReadSecretRecord')
-}
+# #417: Add-BRAVOCredentialReadSecretRecord — приватний helper обліку
+# прочитаних/записаних секретів, який викликають getter і Set-BRAVOCredential.
+$secretMaskCredentialReadChain = @('Get-BRAVOCredential', 'Get-BRAVOCredentialSecureSecret', 'ConvertFrom-BRAVOSecureSecret', 'Get-BRAVOCredentialSecret', 'Add-BRAVOCredentialReadSecretRecord')
 $secretMaskBoundaryAndUploadFunctions = $secretMaskCredentialReadChain + @(
     'Write-Log', 'Connect-BRAVOOwnLogSftpSession',
     'New-BRAVOBazaRemoteDirectoryRecursive', 'Send-BRAVOTraceArchiveFile', 'Get-BRAVOFileHash',

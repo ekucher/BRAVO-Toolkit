@@ -291,7 +291,7 @@ function Get-BRAVOCredential {
 
 $archiveSecretMaskSourceText = $archiveSecretMaskStub + "`n" + $archiveScriptText + "`n" + $archiveSecretMaskCredentialsText + "`n" + $archiveSecretMaskLoggingText
 $archiveSecretMaskUploadFunctions = @('Write-BRAVOLog', 'Initialize-BRAVOSFTPRemoteDirectories', 'Send-FileViaWinSCP',
-    'Get-BRAVOCredential', 'Get-BRAVOCredentialSecureSecret', 'ConvertFrom-BRAVOSecureSecret', 'Get-BRAVOCredentialSecret',
+    'Get-BRAVOCredential', 'Get-BRAVOCredentialSecureSecret', 'ConvertFrom-BRAVOSecureSecret', 'Get-BRAVOCredentialSecret', 'Add-BRAVOCredentialReadSecretRecord',
     'Invoke-BRAVOArchiveOwnLogUpload')
 $archiveSecretMaskModule = $null
 $archiveSecretMaskSetupError = ''
