@@ -192,6 +192,14 @@
     # ОБСЛУГОВУВАННЯ (maintenanceSettings) — фаза 1
     # =========================================================
     # --- Служби ---
+    # Контракт (#314): керована служба (BRAVO, exchangAPI, BRAVO Web), тип
+    # запуску якої не Disabled, має працювати — впалу службу автоматично
+    # запускає BRAVO_MAINTENANCE (нічний прогін і профіль -RecoverServices,
+    # задача BRAVO_SERVICE_RECOVERY). Запускати/зупиняти служби дозволено лише
+    # BRAVO_MAINTENANCE; Health лише запускає задачу відновлення. Службу, яка
+    # на майданчику не використовується, переведіть у Disabled (Manual від
+    # автозапуску не захищає). Див. OPERATIONS.md, «Служби BRAVO:
+    # автоматичне відновлення».
     # Додатковий DisplayName служби BRAVO (див. коментар у BRAVO.config —
     # ДОДАВАЙТЕ до списку, не замінюйте його двома дефолтними):
     # 'maintenanceSettings.Services.BravoDisplayName' = @('BRAVO Service', 'BRAVO Server', 'BRAVO LIMS')

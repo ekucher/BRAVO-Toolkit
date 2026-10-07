@@ -1183,6 +1183,11 @@ Maintenance, окреме Recovery-завдання не реєструєтьс�
 | `BRAVO_RESTORE_RECOVERY` | при старті сервера | підхоплення пропущеної реставрації моделі; лише профіль робочого часу (`Restore.BootRestoreMode = "HoldServices"`) |
 | `BRAVO BAZA Synchronization` | кожні 4 год. від `00:00` | синхронізація `BAZA_APP`/`BAZA_WWW` із SFTP; лише коли ввімкнено BAZA SFTP |
 | `BRAVO_ARCHIV_CATCHUP` | після старту Windows, затримка 7 хв. | пропущена нічна копія (сервер був вимкнений о `23:00`) |
+| `BRAVO_SERVICE_RECOVERY` | за подією SCM (~1 хв), після старту Windows (~10 хв), кожні 15 хв | запуск впалих служб BRAVO (`BRAVO_MAINTENANCE.ps1 -RecoverServices`); увімкнена разом із `BRAVO_MAINTENANCE` |
+
+Задачу `BRAVO_SERVICE_RECOVERY` і контракт «служба не `Disabled` має
+працювати» описано в OPERATIONS.md, розділ «Служби BRAVO: автоматичне
+відновлення».
 
 `BRAVO_ARCHIV_CATCHUP` запускає `BRAVO_ARCHIV.ps1 -CatchUpMissedBackup`.
 Копія робиться, лише якщо після останнього слоту `Backup.DailyAt` немає

@@ -2,6 +2,36 @@
 
 ## Не випущено (developer)
 
+- **Feature: задача Планувальника `BRAVO_SERVICE_RECOVERY` і Health запускає її замість служби (#314, хвиля 5,
+  FR-4/FR-7/FR-8).** Нова задача запускає `BRAVO_MAINTENANCE.ps1 -NoPause -RecoverServices` за трьома тригерами:
+  подія SCM (журнал System, Service Control Manager, EventID 7000/7009/7011/7022/7023/7024/7031/7034, затримка 1 хв),
+  старт Windows (затримка 10 хв) і щодня з 00:00 з повтором кожні 15 хв; `MultipleInstances = IgnoreNew` незалежно від
+  глобального налаштування, ліміт виконання 1 год. Тригери будує `Add-BRAVOServiceRecoveryTaskTriggers`, Diagnose
+  перевіряє фактичне визначення чистою `Test-BRAVOServiceRecoveryTaskDefinition` (ловить відсутній тригер, неповний
+  фільтр EventID, інші затримки/повтор, MultipleInstances, ліміт); Uninstall видаляє задачу. Вузол
+  `schedulerSettings.ServiceRecovery` — похідний (Derivation і legacy-гілка завантажувача, як `BackupCatchUp`):
+  нових ключів конфігурації немає, задача увімкнена разом із `BRAVO_MAINTENANCE`. Інсталятор пише в журнал типи
+  запуску трьох керованих служб. `BRAVO_HEALTH` для впалої (`Failed` і `Stopped`) служби більше не обмежується
+  алертом: один раз за прогін запускає задачу відновлення (`Start-ScheduledTask` або COM `Run`), службу сам не
+  запускає; Reason issue незмінний (fingerprint алертів той самий), дія в алерті — «запущено автоматичне
+  відновлення, перевірте журнал RECOVER»; відсутня або вимкнена задача — окремий issue «Задача відновлення служб»
+  (виконайте `BRAVO_TASKS_INSTALL.ps1`); `Disabled` — без issue, як і раніше. Профіль `-RecoverServices`: впала BRAVO,
+  спроба якої ще в паузі, більше не тягне запуск і облік залежних exchangAPI/BRAVO Web (рядок «чекає на BRAVO» у
+  зведенні). OPERATIONS.md: новий розділ «Служби BRAVO: автоматичне відновлення» (контракт `Disabled`, порядок,
+  тригери, паузи, CRITICAL «циклічно падає», журнали RECOVER і SUMMARY, state-файл і `.corrupt-*`, ручний запуск,
+  коди 0/10/20/30/60, поведінка під час нічного Maintenance, owner `BRAVO_MAINTENANCE_RECOVER`, пам'ятка
+  техпідтримки). **Після оновлення обов'язково перевстановіть задачі (`BRAVO_TASKS_INSTALL.ps1`)**, інакше
+  `BRAVO_SERVICE_RECOVERY` не буде. **Служби, які на майданчику не використовуються, переведіть у `Disabled`** —
+  `Manual` від автозапуску не захищає. Також виправлено анкер тесту
+  `ServiceQuiescence/MaintenanceRechecksClassificationAfterLock` (логер профілю `-RecoverServices` не є кроком
+  нічного прогону). Тести: `ServiceRecovery/TaskTriggersBuiltOnFakeDefinition`,
+  `ServiceRecovery/DiagnoseDetectsMissingTrigger`, `ServiceRecovery/TaskXmlViaComContainsThreeTriggers` (COM — лише
+  Windows), `ServiceRecovery/InstallBuildsRecoveryTaskOnFakeScheduler`,
+  `ServiceRecovery/TaskTypeWiredIntoInstallDiagnoseUninstall`, `ServiceRecovery/TaskNextRunDescribesAllTriggers`,
+  `ServiceRecovery/SchedulerNodeDerivedIdenticallyInDerivationAndLoader`, `ServiceRecovery/Health*` (6),
+  `ServiceRecovery/ChainPlanBravoInPauseHoldsDependents`, `ServiceRecovery/ProfileBravoInPauseHoldsDependentsWithoutLock`,
+  `Config/ServiceRecoveryDerived` (Windows).
+
 - **Feature: профіль відновлення впалих служб `BRAVO_MAINTENANCE.ps1 -RecoverServices` (#314, хвиля 4, FR-3).**
   Новий перемикач запускає не обслуговування, а легкий профіль: класифікація керованих служб без lock-а
   (`Get-BRAVOServiceRecoveryConditions`, «впала» = `Failed` і `Stopped`). Немає впалих → вихід 0 без журналу й записів
@@ -23,7 +53,7 @@
   знімається лише коли всі служби запущено. Профіль не пише стан задачі Maintenance і статус операції, не змінює типи
   запуску, не завершує Bis (`Stop-BRAVOMaintenanceStrayProcess`) і не вивантажує власний журнал на SFTP.
   `-RecoverServices` разом з `-ForceRestore`/`-RunMissedRestoreOnly` → вихід 30. Задачу Планувальника
-  `BRAVO_SERVICE_RECOVERY` додасть хвиля 5 — до того профіль запускається лише вручну. Тести:
+  `BRAVO_SERVICE_RECOVERY` додано в хвилі 5 (запис вище). Тести:
   `ServiceRecovery/ChainPlan*` (7), `ServiceRecovery/Profile*` (10), `ServiceRecovery/LockEnterNoWaitDoesNotSleep`,
   `ServiceRecovery/ScmEventSelectorFiltersByServiceAndLimits`, `ServiceRecovery/ScmEventsUnavailableOffWindows`,
   `ServiceRecovery/ConditionsClassifyManagedServicesWithOneMarkerRead`, `ServiceRecovery/RecoverServicesParameterWiring`,
