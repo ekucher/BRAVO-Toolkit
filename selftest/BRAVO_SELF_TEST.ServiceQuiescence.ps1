@@ -2010,7 +2010,28 @@ function Restore-BRAVOServiceStartTypeSnapshot {
         $postLockRepairIndex = $maintenanceTextForStartMode.IndexOf('$postLockRepair = Repair-BRAVOOrphanedServiceStartTypes')
         $reclassifyIndex = $maintenanceTextForStartMode.IndexOf('$reBravoEnabled = ')
         $reclassifyExitIndex = $maintenanceTextForStartMode.IndexOf('Resolve-BRAVOExitCode -LockBusy', $reclassifyIndex)
-        $logRotationIndex = $maintenanceTextForStartMode.IndexOf('$bravoLogRotationLogger = ')
+        # Перша обробка журналів ОСНОВНОГО потоку нічного прогону. Профіль
+        # -RecoverServices (#314 хвиля 4) має власне присвоєння логера всередині
+        # Invoke-BRAVOMaintenanceServiceRecoveryProfile, визначеної раніше в
+        # тексті runtime; воно виконується лише в профілі (під власним lock-ом)
+        # і не є кроком нічного прогону, тож вилучається лише воно — будь-яке
+        # інше присвоєння до перекласифікації і далі валить перевірку.
+        $recoveryProfileAst = @([Management.Automation.Language.Parser]::ParseInput($maintenanceTextForStartMode, [ref]$null, [ref]$null).FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-BRAVOMaintenanceServiceRecoveryProfile'
+                }, $true)) | Select-Object -First 1
+        $logRotationIndex = -1
+        $logRotationSearchFrom = 0
+        while ($true) {
+            $logRotationCandidate = $maintenanceTextForStartMode.IndexOf('$bravoLogRotationLogger = ', $logRotationSearchFrom)
+            if ($logRotationCandidate -lt 0) { break }
+            $logRotationSearchFrom = $logRotationCandidate + 1
+            if ($null -ne $recoveryProfileAst -and
+                $logRotationCandidate -ge $recoveryProfileAst.Extent.StartOffset -and
+                $logRotationCandidate -lt $recoveryProfileAst.Extent.EndOffset) { continue }
+            $logRotationIndex = $logRotationCandidate
+            break
+        }
         $dataRestoreTextForStartMode = [IO.File]::ReadAllText(
             (Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"),
             [Text.Encoding]::UTF8
