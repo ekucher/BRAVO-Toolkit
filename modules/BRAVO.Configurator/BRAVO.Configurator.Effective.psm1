@@ -106,8 +106,8 @@ function New-BRAVOConfiguratorIsolatedConfigRoot {
         $localConfigLines.Add((Get-BRAVOConfigurationSchemaVersionDeclarationLine))
         foreach ($key in $CandidateOverrides.Keys) {
             $literalValue = ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value $CandidateOverrides[$key]
-            $literalKey = [string]$key
-            $localConfigLines.Add("    '$literalKey' = $literalValue")
+            $literalKey = ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value ([string]$key)
+            $localConfigLines.Add("    $literalKey = $literalValue")
         }
         $localConfigLines.Add('}')
         $localConfigText = [string]::Join([Environment]::NewLine, $localConfigLines)
@@ -115,6 +115,15 @@ function New-BRAVOConfiguratorIsolatedConfigRoot {
     }
 
     return [pscustomobject]@{ IsolatedRoot = $isolatedRoot }
+}
+
+function ConvertTo-BRAVOConfiguratorSingleQuotedContent {
+    # #307: токенізатор PowerShell вважає одинарною лапкою не лише ASCII
+    # `'`, а й U+2018–U+201B (‘ ’ ‚ ‛); кожна з них закриває літерал.
+    # Подвоєння тієї самої лапки — її екранування (як і
+    # CodeGeneration.EscapeSingleQuotedStringContent).
+    param([AllowEmptyString()][string]$Value)
+    return ($Value -replace "['\u2018\u2019\u201A\u201B]", '$0$0')
 }
 
 function ConvertTo-BRAVOConfiguratorPowerShellLiteral {
@@ -147,7 +156,7 @@ function ConvertTo-BRAVOConfiguratorPowerShellLiteral {
         $items = @($Value | ForEach-Object { ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value $_ })
         return '@(' + [string]::Join(', ', $items) + ')'
     }
-    $escaped = ([string]$Value) -replace "'", "''"
+    $escaped = ConvertTo-BRAVOConfiguratorSingleQuotedContent -Value ([string]$Value)
     return "'$escaped'"
 }
 
@@ -185,7 +194,7 @@ function Invoke-BRAVOConfiguratorEffectiveComputation {
         # escaping, що ConvertTo-BRAVOConfiguratorPowerShellLiteral уже
         # застосовує для значень (P2-фікс за результатами незалежного
         # review).
-        $escapedRuntimeRoot = $RuntimeRoot -replace "'", "''"
+        $escapedRuntimeRoot = ConvertTo-BRAVOConfiguratorSingleQuotedContent -Value $RuntimeRoot
 
         $childScriptLines = @(
             'Set-StrictMode -Version 2.0',
