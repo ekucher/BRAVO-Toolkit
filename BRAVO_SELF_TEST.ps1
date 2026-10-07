@@ -23308,7 +23308,10 @@ function Get-BRAVOMaintenanceSummaryResult {
         # FailAfterEnumeration — перелік *_after_*.mdz завершується
         # помилкою доступу (Get-ChildItem пише non-terminating error).
         param([string]$ScenarioName, [object[]]$Sessions, [int]$KeepCount, [bool]$ReportOnly = $false,
-            [string]$CleanupStatusText = '', [bool]$FailAfterEnumeration = $false)
+            [string]$CleanupStatusText = '', [bool]$FailAfterEnumeration = $false,
+            # FailPathLookup — Test-Path каталогу архівів (-Path без -PathType)
+            # пише non-terminating error (ACL / збій провайдера) і нічого не повертає.
+            [bool]$FailPathLookup = $false)
         $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
             ("BRAVO_RETENTION_FOLLOWUP_{0}_{1}" -f $ScenarioName, [guid]::NewGuid().ToString("N"))
         [void][IO.Directory]::CreateDirectory($scenarioRoot)
@@ -23354,7 +23357,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                 }
             }
             $scenarioOutcome = & $retentionFollowupModule {
-                param($Path, $Prefix, $StubScriptText, $Keep, $RetentionReportOnly, $CleanupStatusSource, $AfterEnumerationFails)
+                param($Path, $Prefix, $StubScriptText, $Keep, $RetentionReportOnly, $CleanupStatusSource, $AfterEnumerationFails, $PathLookupFails)
                 Set-StrictMode -Version Latest
                 . ([scriptblock]::Create($StubScriptText))
                 $script:retentionFollowupLogLines = New-Object System.Collections.ArrayList
@@ -23375,6 +23378,17 @@ function Get-BRAVOMaintenanceSummaryResult {
                             return
                         }
                         Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
+                    }
+                }
+                if ($PathLookupFails) {
+                    function Test-Path {
+                        [CmdletBinding()]
+                        param([Parameter(Position = 0)][string]$Path, [string]$LiteralPath, [string]$PathType)
+                        if (-not [string]::IsNullOrEmpty($Path) -and [string]::IsNullOrEmpty($PathType)) {
+                            Write-Error -Message 'BRAVO self-test: збій ACL під час перевірки каталогу архівів' -Category PermissionDenied
+                            return
+                        }
+                        Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
                     }
                 }
                 $script:ArchivePrefixRegex = [regex]::Escape($Prefix)
@@ -23421,7 +23435,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                     CleanupStatus = $cleanupStatusResult
                     StepsError = [int]$script:BRAVOMaintenanceStepFailCount
                 }
-            } $scenarioRoot $retentionFollowupPrefix $retentionFollowupStubScriptText $KeepCount $ReportOnly $CleanupStatusText $FailAfterEnumeration
+            } $scenarioRoot $retentionFollowupPrefix $retentionFollowupStubScriptText $KeepCount $ReportOnly $CleanupStatusText $FailAfterEnumeration $FailPathLookup
             $remainingNames = @(
                 Get-ChildItem -LiteralPath $scenarioRoot -File -ErrorAction SilentlyContinue |
                     ForEach-Object { $_.Name } | Sort-Object
@@ -24138,14 +24152,33 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Maintenance/RestoreArchiveEnumerationFailureNoDeletion" `
         -Failure ("збій переліку архівів реставрації має дати ERROR і прапорці critical/restoreIntegrityFailed (exit 41) без жодного видалення, крок очистки — FAIL; контроль без збою видаляє сесії понад KeepCount, як і раніше; збій: threw={0}, лишилось=[{1}], critical={2}, restoreIntegrityFailed={3}, статус=[{4}], журнал: {5}; контроль: threw={6}, лишилось=[{7}]" -f $retention424EnumFailed.Threw, $retention424EnumFailed.Remaining, $retention424EnumFailed.Critical, $retention424EnumFailed.RestoreFailed, $retention424EnumFailed.CleanupStatus, $retention424EnumFailed.Log, $retention424EnumControl.Threw, $retention424EnumControl.Remaining)
 
+    # (e2) Codex P2 (раунд 2): каталог існує, але сам Test-Path пише
+    # non-terminating error (ACL / збій провайдера) і нічого не повертає.
+    # Раніше це вважалось відсутнім каталогом: ні ERROR, ні exit 41, і
+    # перевірка мовчки пропускалась. Тепер — той самий fail-closed шлях.
+    $retention424LookupFailed = & $retentionFollowupRunScenario 'I424LookupFailed' $retention424EnumSessions 1 $false $retention424CleanupStatusText $false $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424LookupFailed -and
+            $null -eq $retention424LookupFailed.Threw -and
+            [string]$retention424LookupFailed.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260109_0100', '20260110_0100', '20260111_0100')) -and
+            -not [regex]::IsMatch([string]$retention424LookupFailed.Log, '(?m)Видал') -and
+            [regex]::IsMatch([string]$retention424LookupFailed.Log, '(?m)^\[ERROR\] Не вдалося отримати перелік архівів реставрації') -and
+            $retention424LookupFailed.Critical -and
+            $retention424LookupFailed.RestoreFailed -and
+            [string]$retention424LookupFailed.CleanupStatus -ceq 'FAIL'
+        ) `
+        -Name "Maintenance/RestoreArchivePathLookupFailureNoDeletion" `
+        -Failure ("збій Test-Path каталогу архівів реставрації (ACL / провайдер) має дати ERROR і прапорці critical/restoreIntegrityFailed (exit 41) без жодного видалення, крок очистки — FAIL, а не вважатися відсутнім каталогом; threw={0}, лишилось=[{1}], critical={2}, restoreIntegrityFailed={3}, статус=[{4}], журнал: {5}" -f $retention424LookupFailed.Threw, $retention424LookupFailed.Remaining, $retention424LookupFailed.Critical, $retention424LookupFailed.RestoreFailed, $retention424LookupFailed.CleanupStatus, $retention424LookupFailed.Log)
+
     # (f) Канонічний перелік (Get-BRAVORestoreArchiveMainFiles) напряму:
     # відсутній каталог і порожній каталог — успішний порожній перелік без
     # ERROR і прапорців (як і раніше); збій переліку — Failed, ERROR, прапорці.
     $retention424EnumDirect = {
-        param([string]$Path, [bool]$FailAfter)
+        param([string]$Path, [bool]$FailAfter, [bool]$FailLookup = $false)
         try {
             return (& $retentionFollowupModule {
-                param($StubScriptText, $EnumPath, $AfterEnumerationFails)
+                param($StubScriptText, $EnumPath, $AfterEnumerationFails, $PathLookupFails)
                 Set-StrictMode -Version Latest
                 . ([scriptblock]::Create($StubScriptText))
                 $script:retentionFollowupLogLines = New-Object System.Collections.ArrayList
@@ -24163,6 +24196,17 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
                         Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
                     }
                 }
+                if ($PathLookupFails) {
+                    function Test-Path {
+                        [CmdletBinding()]
+                        param([Parameter(Position = 0)][string]$Path, [string]$LiteralPath, [string]$PathType)
+                        if (-not [string]::IsNullOrEmpty($Path) -and [string]::IsNullOrEmpty($PathType)) {
+                            Write-Error -Message 'BRAVO self-test: збій ACL під час перевірки каталогу архівів' -Category PermissionDenied
+                            return
+                        }
+                        Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
+                    }
+                }
                 $enumResult = Get-BRAVORestoreArchiveMainFiles -Path $EnumPath -ArchivePrefix 'RETFUP'
                 [pscustomobject]@{
                     Failed = [bool]$enumResult.Failed
@@ -24171,7 +24215,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
                     RestoreFailed = [bool]$script:restoreIntegrityFailed
                     Log = (@($script:retentionFollowupLogLines) -join "`n")
                 }
-            } $retentionFollowupStubScriptText $Path $FailAfter)
+            } $retentionFollowupStubScriptText $Path $FailAfter $FailLookup)
         } catch {
             return [pscustomobject]@{ Failed = $null; Count = -1; Critical = $null; RestoreFailed = $null; Log = ('THREW: ' + $_.Exception.Message) }
         }
@@ -24184,6 +24228,8 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         [IO.File]::WriteAllText((Join-Path $retention424EnumRoot 'RETFUP_before_20260111_0100.mdz'), 'synthetic-ok')
         $retention424EnumOk = & $retention424EnumDirect $retention424EnumRoot $false
         $retention424EnumDenied = & $retention424EnumDirect $retention424EnumRoot $true
+        # Codex P2 (раунд 2): збій самого Test-Path каталогу (ACL / провайдер).
+        $retention424EnumLookup = & $retention424EnumDirect $retention424EnumRoot $false $true
     } finally {
         if (Test-Path -LiteralPath $retention424EnumRoot) {
             Remove-Item -LiteralPath $retention424EnumRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -24201,10 +24247,13 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
             -not $retention424EnumOk.Critical -and
             $retention424EnumDenied.Failed -eq $true -and $retention424EnumDenied.Count -eq 0 -and
             $retention424EnumDenied.Critical -and $retention424EnumDenied.RestoreFailed -and
-            [regex]::IsMatch([string]$retention424EnumDenied.Log, '(?m)^\[ERROR\] Не вдалося отримати перелік архівів реставрації')
+            [regex]::IsMatch([string]$retention424EnumDenied.Log, '(?m)^\[ERROR\] Не вдалося отримати перелік архівів реставрації') -and
+            $retention424EnumLookup.Failed -eq $true -and $retention424EnumLookup.Count -eq 0 -and
+            $retention424EnumLookup.Critical -and $retention424EnumLookup.RestoreFailed -and
+            [regex]::IsMatch([string]$retention424EnumLookup.Log, '(?m)^\[ERROR\] Не вдалося отримати перелік архівів реставрації')
         ) `
         -Name "Maintenance/RestoreArchiveEnumerationDistinguishesFailureFromEmpty" `
-        -Failure ("Get-BRAVORestoreArchiveMainFiles: відсутній і порожній каталог — успішний порожній перелік без ERROR і прапорців; збій переліку — Failed, порожній перелік, ERROR і прапорці exit 41; відсутній: failed={0}, count={1}, журнал: {2}; порожній: failed={3}, count={4}; один архів: failed={5}, count={6}; збій: failed={7}, count={8}, critical={9}, журнал: {10}" -f $retention424EnumMissing.Failed, $retention424EnumMissing.Count, $retention424EnumMissing.Log, $retention424EnumEmpty.Failed, $retention424EnumEmpty.Count, $retention424EnumOk.Failed, $retention424EnumOk.Count, $retention424EnumDenied.Failed, $retention424EnumDenied.Count, $retention424EnumDenied.Critical, $retention424EnumDenied.Log)
+        -Failure ("Get-BRAVORestoreArchiveMainFiles: відсутній і порожній каталог — успішний порожній перелік без ERROR і прапорців; збій переліку — Failed, порожній перелік, ERROR і прапорці exit 41; відсутній: failed={0}, count={1}, журнал: {2}; порожній: failed={3}, count={4}; один архів: failed={5}, count={6}; збій: failed={7}, count={8}, critical={9}, журнал: {10}; збій Test-Path: failed={11}, count={12}, critical={13}, журнал: {14}" -f $retention424EnumMissing.Failed, $retention424EnumMissing.Count, $retention424EnumMissing.Log, $retention424EnumEmpty.Failed, $retention424EnumEmpty.Count, $retention424EnumOk.Failed, $retention424EnumOk.Count, $retention424EnumDenied.Failed, $retention424EnumDenied.Count, $retention424EnumDenied.Critical, $retention424EnumDenied.Log, $retention424EnumLookup.Failed, $retention424EnumLookup.Count, $retention424EnumLookup.Critical, $retention424EnumLookup.Log)
 
     # (g) Main (тіло Invoke-BRAVOMaintenance поза вкладеними функціями):
     # перелік ARC_DIR, що живить і звичайний

@@ -24,13 +24,16 @@
   0 архівів (нічна перевірка мовчки пропускалась) або лише частину, і частковий перелік ішов у retention. Тепер за збою
   переліку пишеться ERROR «Не вдалося отримати перелік архівів реставрації», виставляються
   `criticalErrorOccurred`/`restoreIntegrityFailed` (exit 41), а в цьому циклі не виконується ні перевірка, ні retention:
-  не видаляється нічого. Відсутній каталог, як і раніше, дає порожній перелік без помилки. Тести:
+  не видаляється нічого. Так само обробляється збій самої перевірки наявності каталогу (`Test-Path` за ACL чи збою
+  провайдера): це не вважається відсутнім каталогом. Справді відсутній каталог, як і раніше, дає порожній перелік без
+  помилки. Тести:
   `Maintenance/RetentionReportOnlyStaleSessionWarnsWithinKeepCount`,
   `Maintenance/RetentionReportOnlyNeverDeletesProvenCorrupt`,
   `Maintenance/RetentionReportOnlySingleBrokenSessionSetsFailureFlags`,
   `Maintenance/RetentionReportOnlyMainBranchWithinKeepCount`,
   `Maintenance/RetentionReportOnlyCleanupStepReportsFailure`,
   `Maintenance/RestoreArchiveEnumerationFailureNoDeletion`,
+  `Maintenance/RestoreArchivePathLookupFailureNoDeletion`,
   `Maintenance/RestoreArchiveEnumerationDistinguishesFailureFromEmpty`,
   `Maintenance/RestoreArchiveMainEnumerationUsesCanonicalHelper`.
 

@@ -6986,8 +6986,10 @@ function Process-OldData {
 
 # #424 (review): канонічний перелік основних архівів реставрації
 # (before/after .mdz, без .sha512) для Main і для Remove-OldRestoreArchives.
-# Відсутній каталог — успішний порожній перелік, як і раніше. Збій самого
-# переліку (відмова доступу тощо) НЕ плутається з порожнім каталогом:
+# Відсутній каталог — успішний порожній перелік (Missing = $true), як і
+# раніше. Збій самого переліку чи перевірки наявності каталогу (відмова
+# доступу, ACL, збій провайдера) НЕ плутається з порожнім чи відсутнім
+# каталогом:
 # ERROR, прапорці critical/restoreIntegrityFailed (exit 41) і Failed =
 # $true, а частковий перелік не повертається. Викликач за Failed не
 # перевіряє й не видаляє жодної сесії в цьому циклі (#422: невідомий стан
@@ -6998,11 +7000,15 @@ function Get-BRAVORestoreArchiveMainFiles {
         [string]$ArchivePrefix
     )
 
-    if (-not (Test-Path $Path)) {
-        return @{ Files = @(); Failed = $false }
-    }
     $enumeratedFiles = @()
     try {
+        # Codex P2 (раунд 2): Test-Path за ACL / збою провайдера може
+        # записати non-terminating error і нічого не повернути — це не
+        # доказ відсутності каталогу, тож -ErrorAction Stop веде в той
+        # самий fail-closed catch, що й збій Get-ChildItem.
+        if (-not (Test-Path $Path -ErrorAction Stop)) {
+            return @{ Files = @(); Failed = $false; Missing = $true }
+        }
         foreach ($archivePattern in @("${ArchivePrefix}_before_*.mdz", "${ArchivePrefix}_after_*.mdz")) {
             $enumeratedFiles += @(Get-ChildItem -Path $Path -Filter $archivePattern -ErrorAction Stop)
         }
@@ -7010,9 +7016,9 @@ function Get-BRAVORestoreArchiveMainFiles {
         Write-Log "Не вдалося отримати перелік архівів реставрації у ${Path}: $($_.Exception.Message). Перевірку придатності й retention сесій реставрації в цьому циклі пропущено, жодну сесію не видалено." -Level "ERROR"
         $script:criticalErrorOccurred = $true
         $script:restoreIntegrityFailed = $true
-        return @{ Files = @(); Failed = $true }
+        return @{ Files = @(); Failed = $true; Missing = $false }
     }
-    return @{ Files = $enumeratedFiles; Failed = $false }
+    return @{ Files = $enumeratedFiles; Failed = $false; Missing = $false }
 }
 
 # Функція видалення старих архівів реставрації (за кількістю версій)
@@ -7028,16 +7034,18 @@ function Remove-OldRestoreArchives {
         [switch]$ReportOnly
     )
 
-    if (-not (Test-Path $Path)) {
-        Write-Log "Директорія архівів $Path не знайдена. Видалення пропущено." -Level "DEBUG"
-        return
-    }
-
     # Збираємо основні архіви (без контрольних сум). #424 (review): збій
-    # переліку — ERROR і прапорці exit 41 уже записано; жодної перевірки
-    # чи видалення за неповним переліком.
+    # переліку чи перевірки наявності каталогу — ERROR і прапорці exit 41
+    # уже записано; жодної перевірки чи видалення за неповним переліком.
+    # Наявність каталогу перевіряє лише канонічний перелік: окремий
+    # незахищений Test-Path тут мовчки сприйняв би збій ACL / провайдера
+    # як відсутній каталог.
     $mainArchiveEnumeration = Get-BRAVORestoreArchiveMainFiles -Path $Path -ArchivePrefix $ArchivePrefix
     if ($mainArchiveEnumeration.Failed) {
+        return
+    }
+    if ($mainArchiveEnumeration.Missing) {
+        Write-Log "Директорія архівів $Path не знайдена. Видалення пропущено." -Level "DEBUG"
         return
     }
     $mainArchiveFiles = @($mainArchiveEnumeration.Files)
