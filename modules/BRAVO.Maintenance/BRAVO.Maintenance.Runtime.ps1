@@ -4619,10 +4619,10 @@ function Connect-BRAVOOwnLogSftpSession {
 
     $ownLogSession = $null
     try {
-        $ownLogLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
-        $ownLogPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
-        if ([string]::IsNullOrWhiteSpace($ownLogLoginTarget)) { $ownLogLoginTarget = 'BRAVO_SFTP_LOGIN' }
-        if ([string]::IsNullOrWhiteSpace($ownLogPasswordTarget)) { $ownLogPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
+        # #365: імена target-ів — канонічний resolver BRAVO.Credentials (той
+        # самий, що збирає секрети для маскування вивантажуваного логу).
+        $ownLogLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPLogin'
+        $ownLogPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
         $ownLogLogin = Get-BRAVOCredentialSecret -Target $ownLogLoginTarget
         $ownLogPassword = Get-BRAVOCredentialSecret -Target $ownLogPasswordTarget
         if ([string]::IsNullOrWhiteSpace($ownLogLogin) -or [string]::IsNullOrWhiteSpace($ownLogPassword)) {
@@ -4751,13 +4751,30 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
 
         $ownLogUploadSession = $null
         $ownRangeIdLogSnapshotPath = $null
+        $ownLogMaskedCopyPath = $null
+        $ownRangeIdLogMaskedCopyPath = $null
         try {
+            # #365: на SFTP іде лише МАСКОВАНА копія — точні значення секретів
+            # Credential Manager замінено на *** незалежно від ключових слів.
+            # Недоступний/відсутній target пропускається з INFO (вивантаження
+            # триває, решта секретів маскується); збій самого маскування —
+            # виняток -> catch нижче -> WARNING і НІЧОГО не вивантажено
+            # (fail-closed: немаскований лог ніколи не йде назовні). Секрети
+            # збираються ДО копії, тож INFO-рядок потрапляє у вивантажену копію.
+            $ownLogMaskSet = Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)
+            if (@($ownLogMaskSet.Skipped).Count -gt 0) {
+                Write-Log ("Власний лог: маскування — target-и Credential Manager пропущено: " +
+                    ((@($ownLogMaskSet.Skipped) | ForEach-Object { "$($_.Target) ($($_.Reason))" }) -join ', ')) -Level "INFO"
+            }
+            $ownLogMaskedCopyPath = New-BRAVOMaskedLogCopy -Path $LOG_FILE -KnownSecret $ownLogMaskSet.Secrets
             $ownLogUploadSession = Connect-BRAVOOwnLogSftpSession
             if ($null -ne $ownLogUploadSession) {
                 $ownLogRemoteDirectory = [string]$sftpDirectories.MaintenanceLog
+                # Копія має те саме ім'я файлу, що й живий лог, тому
+                # remote-ім'я не змінюється.
                 Send-BRAVOOwnLogFile `
                     -Session $ownLogUploadSession `
-                    -LocalLogPath $LOG_FILE `
+                    -LocalLogPath $ownLogMaskedCopyPath `
                     -RemoteDirectory $ownLogRemoteDirectory `
                     -Logger $null
 
@@ -4782,9 +4799,12 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                         [System.IO.File]::Copy($ownRangeIdLogPath, $ownRangeIdLogSnapshotPath, $true)
                         $ownRangeIdLogSnapshotHash = (Get-BRAVOFileHash -Path $ownRangeIdLogSnapshotPath -Algorithm SHA256).Hash
                         Write-Log "Власний лог: знімок range_id_log.json створено ($ownRangeIdLogSnapshotPath, SHA256=$ownRangeIdLogSnapshotHash)" -Level "DEBUG"
+                        # #365: маскована копія знімка; збій -> catch нижче,
+                        # знімок НЕ вивантажується (fail-closed).
+                        $ownRangeIdLogMaskedCopyPath = New-BRAVOMaskedLogCopy -Path $ownRangeIdLogSnapshotPath -KnownSecret $ownLogMaskSet.Secrets
                         Send-BRAVOOwnLogFile `
                             -Session $ownLogUploadSession `
-                            -LocalLogPath $ownRangeIdLogSnapshotPath `
+                            -LocalLogPath $ownRangeIdLogMaskedCopyPath `
                             -RemoteDirectory $ownLogRemoteDirectory `
                             -RemoteFileName ("range_id_log_{0}.json" -f $maintenanceLogRunId) `
                             -Logger $null
@@ -4806,6 +4826,8 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                 (Test-Path -LiteralPath $ownRangeIdLogSnapshotPath -PathType Leaf)) {
                 Remove-Item -LiteralPath $ownRangeIdLogSnapshotPath -Force -ErrorAction SilentlyContinue
             }
+            Remove-BRAVOMaskedLogCopy -Path $ownLogMaskedCopyPath
+            Remove-BRAVOMaskedLogCopy -Path $ownRangeIdLogMaskedCopyPath
         }
     } catch {
         try {
