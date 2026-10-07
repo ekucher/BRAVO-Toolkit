@@ -991,6 +991,48 @@ try {
         @(Get-BRAVOSelfTestScope301Findings -Scope $scope301ModelConfirmed -Component 'MODEL' -Severity 'Error').Count -ge 1
     ) -Name 'BackupScope/ConfirmedModelEmptySourceStaysError' `
         -Failure "підтверджений у baseline MODEL з порожнім каталогом має бути Missing (Error); scope='$($scope301ModelConfirmed.Components['MODEL'])'"
+    # (o) Рев'ю #391 (Codex 510e35e): оператор підтвердив baseline, поки
+    # архівація ще йшла. Перенесення доказу з manifest не має повертати сирий
+    # шлях у свідомо порожнє поле нового baseline. Два варіанти: на початку
+    # прогону baseline не було, і baseline був, але старший за manifest.
+    $scope301ConfirmNoneState = Join-Path $scope301Root 'state-confirm-none'
+    $scope301ConfirmNoneScope = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301EmptyDiscovery -Previous @('MODEL', 'BLOG')
+    Save-BRAVODiscoveryBaseline -DiscoveryResult $scope301EmptyDiscovery `
+        -BaselinePath (Get-BRAVODiscoveryBaselinePath -StateRoot $scope301ConfirmNoneState)
+    $scope301ConfirmNoneError = ''
+    try {
+        [void](Update-BRAVODiscoveryBaselineFromScope -DiscoveryResult $scope301EmptyDiscovery `
+            -ScopeResult $scope301ConfirmNoneScope -StateRoot $scope301ConfirmNoneState -RuntimeRoot $scope301Runtime)
+    } catch { $scope301ConfirmNoneError = $_.Exception.Message }
+    $scope301ConfirmNoneBlog = Get-BRAVOSelfTestScope301BaselineValue -Field 'BLOG_SOURCE' `
+        -Import (Import-BRAVODiscoveryBaseline -StateRoot $scope301ConfirmNoneState -RuntimeRoot $scope301Runtime -ReadOnly)
+
+    $scope301ConfirmStaleState = Join-Path $scope301Root 'state-confirm-stale'
+    $scope301ConfirmStalePath = Get-BRAVODiscoveryBaselinePath -StateRoot $scope301ConfirmStaleState
+    Save-BRAVODiscoveryBaseline -DiscoveryResult $scope301EmptyDiscovery -BaselinePath $scope301ConfirmStalePath -Components @('MODEL')
+    $scope301StaleBaseline = Get-Content -LiteralPath $scope301ConfirmStalePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $scope301StaleBaseline.SavedAt = (Get-Date).AddHours(-2).ToString('o')
+    [IO.File]::WriteAllText($scope301ConfirmStalePath, ($scope301StaleBaseline | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    $scope301ConfirmStaleImport = Import-BRAVODiscoveryBaseline -StateRoot $scope301ConfirmStaleState -RuntimeRoot $scope301Runtime -ReadOnly
+    $scope301ConfirmStaleScope = Resolve-BRAVOBackupComponentScope -DiscoveryResult $scope301EmptyDiscovery `
+        -Baseline $scope301ConfirmStaleImport.Baseline -BaselineSourceKind ([string]$scope301ConfirmStaleImport.Source) `
+        -EnabledComponents $scopeAllEnabled -PreviousCompleteComponents @('MODEL', 'BLOG') `
+        -PreviousCompleteAt ((Get-Date).ToUniversalTime().AddHours(-1))
+    Save-BRAVODiscoveryBaseline -DiscoveryResult $scope301EmptyDiscovery -BaselinePath $scope301ConfirmStalePath
+    $scope301ConfirmStaleError = ''
+    try {
+        [void](Update-BRAVODiscoveryBaselineFromScope -DiscoveryResult $scope301EmptyDiscovery `
+            -ScopeResult $scope301ConfirmStaleScope -StateRoot $scope301ConfirmStaleState -RuntimeRoot $scope301Runtime)
+    } catch { $scope301ConfirmStaleError = $_.Exception.Message }
+    $scope301ConfirmStaleBlog = Get-BRAVOSelfTestScope301BaselineValue -Field 'BLOG_SOURCE' `
+        -Import (Import-BRAVODiscoveryBaseline -StateRoot $scope301ConfirmStaleState -RuntimeRoot $scope301Runtime -ReadOnly)
+    Test-BRAVOCondition -Condition (
+        @(Get-BRAVOSelfTestScope301List -Object $scope301ConfirmNoneScope -Name 'EmptySourceRetained') -contains 'BLOG' -and
+        @(Get-BRAVOSelfTestScope301List -Object $scope301ConfirmStaleScope -Name 'EmptySourceRetained') -contains 'BLOG' -and
+        $scope301ConfirmNoneError -eq '' -and $scope301ConfirmStaleError -eq '' -and
+        $scope301ConfirmNoneBlog -eq '' -and $scope301ConfirmStaleBlog -eq ''
+    ) -Name 'BackupScope/ConcurrentBaselineConfirmationKeepsEmptyField' `
+        -Failure "baseline, підтверджений під час прогону, не має отримати сирий шлях порожнього каталогу: без baseline BLOG='$scope301ConfirmNoneBlog' ($scope301ConfirmNoneError); старий baseline BLOG='$scope301ConfirmStaleBlog' ($scope301ConfirmStaleError)"
 } finally {
     if (Test-Path -LiteralPath $scope301Root) {
         Remove-Item -LiteralPath $scope301Root -Recurse -Force -ErrorAction SilentlyContinue

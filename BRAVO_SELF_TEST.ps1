@@ -13273,6 +13273,35 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/EmptySourceReportedSeparatelyFromNotInstalled' `
         -Failure "Health має показувати порожній каталог джерела окремо від «не встановлено», з :warning: для компонента, що мав дані: $emptySourceSuccess"
+    # #301 (рев'ю #391, Codex 510e35e): прогін без issue, але з WARNING у
+    # журналі (порожній каталог, що мав дані) завершується кодом 10, тож
+    # Operations-подія не може рапортувати SUCCESS. Severity береться з того
+    # самого лічильника, що й код завершення.
+    $cleanRunVerdicts = @{}
+    $cleanRunVerdictError = ''
+    try {
+        $cleanRunVerdictModule = New-BRAVOSelfTestRuntimeModule -SourceText $healthScriptText `
+            -FunctionNames @('Get-BRAVOHealthCleanRunOperationsVerdict')
+        foreach ($cleanRunCase in @('Clean', 'Warned', 'Blocked')) {
+            $cleanRunVerdicts[$cleanRunCase] = [string](& $cleanRunVerdictModule {
+                param($Case)
+                Set-StrictMode -Version Latest
+                (Get-BRAVOHealthCleanRunOperationsVerdict `
+                    -ToolIntegrityShouldBlock ($Case -eq 'Blocked') `
+                    -LogWarningCount $(if ($Case -eq 'Clean') { 0 } else { 2 })).Severity
+            } $cleanRunCase)
+        }
+    } catch { $cleanRunVerdictError = $_.Exception.Message }
+    Test-BRAVOCondition `
+        -Condition (
+            $cleanRunVerdictError -eq '' -and
+            $cleanRunVerdicts['Clean'] -eq 'SUCCESS' -and
+            $cleanRunVerdicts['Warned'] -eq 'WARNING' -and
+            $cleanRunVerdicts['Blocked'] -eq 'CRITICAL' -and
+            $healthScriptText.Contains('-LogWarningCount $script:BRAVOWarningCount')
+        ) `
+        -Name 'Health/CleanRunOperationsEventFollowsWarningExitCode' `
+        -Failure "Operations-подія Health без issue має бути WARNING, коли журнал має WARNING (код 10), і CRITICAL при ShouldBlock: clean='$($cleanRunVerdicts['Clean'])' warned='$($cleanRunVerdicts['Warned'])' blocked='$($cleanRunVerdicts['Blocked'])' error='$cleanRunVerdictError'"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.SftpDeferredMessage' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.LocalSyncIssueWithoutExitCode' -DependsOn 'Root/Runtime') { try {
     # #286: проблема LocalSynchronization без поля ExitCode (7 з 9 гілок
