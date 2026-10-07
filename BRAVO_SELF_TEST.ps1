@@ -21485,6 +21485,14 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceQuiescence' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ServiceRecovery') {
+        Enter-BRAVOSelfTestSuite -Name 'ServiceRecovery'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ServiceRecovery') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceRecovery.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceRecovery' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Enter-BRAVOSelfTestSection -Name 'Root/SizeSanity') { try {
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
