@@ -1579,3 +1579,471 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
         }
     }
 }
+
+# ============================================================
+# #314 хвиля 5 (FR-4, ТЗ §6 п. 8): задача Планувальника BRAVO_SERVICE_RECOVERY.
+# Три тригери (подія Service Control Manager / старт ОС / кожні 15 хв) і
+# власні налаштування задачі будує канонічний
+# Initialize-BRAVOServiceRecoveryTaskDefinition (BRAVO.System), перевіряє
+# Test-BRAVOServiceRecoveryTaskDefinition — той самий модуль, його викликає
+# Test-BRAVOScheduledTaskDefinition у BRAVO_TASKS_DIAGNOSE.ps1. Визначення тут —
+# підроблений COM ITaskDefinition (однаково на Linux і Windows); справжній COM
+# Schedule.Service перевіряє TaskDefinition/ServiceRecoveryComDefinitionHasThreeTriggers
+# у кореневому BRAVO_SELF_TEST.ps1 (лише Windows).
+& {
+    $taskSystemText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8)
+    $taskModule = $null
+    $taskModuleError = ''
+    try {
+        $taskModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $taskSystemText `
+            -FunctionNames @('Get-BRAVOServiceRecoveryTaskTriggerSpec', 'Initialize-BRAVOServiceRecoveryTaskDefinition', 'Test-BRAVOServiceRecoveryTaskDefinition')
+    } catch {
+        $taskModuleError = $_.Exception.Message
+    }
+    # Підроблений ITaskDefinition: Triggers — колекція з методом Create(type),
+    # кожен тригер має властивості всіх трьох COM-типів.
+    $newFakeDefinition = {
+        $fakeTriggers = New-Object System.Collections.ArrayList
+        Add-Member -InputObject $fakeTriggers -MemberType ScriptMethod -Name Create -Value {
+            param($Type)
+            $fakeTrigger = [pscustomobject]@{
+                Type = [int]$Type; Enabled = $false; Delay = ''; Subscription = ''; StartBoundary = ''; DaysInterval = 0
+                Repetition = [pscustomobject]@{ Interval = ''; Duration = ''; StopAtDurationEnd = $true }
+            }
+            [void]$this.Add($fakeTrigger)
+            return $fakeTrigger
+        }
+        [pscustomobject]@{
+            Settings = [pscustomobject]@{ MultipleInstances = 0; StartWhenAvailable = $true; ExecutionTimeLimit = 'PT72H' }
+            Triggers = $fakeTriggers
+        }
+    }
+    $taskProbe = {
+        param($Definition, [string]$Mutation)
+        Initialize-BRAVOServiceRecoveryTaskDefinition -Definition $Definition -Now ([datetime]'2026-10-07T10:20:30')
+        $triggerList = $Definition.Triggers
+        switch ($Mutation) {
+            'NoEvent' { $triggerList.Remove(@($triggerList | Where-Object { $_.Type -eq 0 })[0]) }
+            'NoBoot' { $triggerList.Remove(@($triggerList | Where-Object { $_.Type -eq 8 })[0]) }
+            'NoDaily' { $triggerList.Remove(@($triggerList | Where-Object { $_.Type -eq 2 })[0]) }
+            'DailyHourly' { @($triggerList | Where-Object { $_.Type -eq 2 })[0].Repetition.Interval = 'PT1H' }
+            'BootNoDelay' { @($triggerList | Where-Object { $_.Type -eq 8 })[0].Delay = '' }
+            'EventMissingId' { $eventTriggerToEdit = @($triggerList | Where-Object { $_.Type -eq 0 })[0]; $eventTriggerToEdit.Subscription = $eventTriggerToEdit.Subscription.Replace(' or EventID=7034', '') }
+            'Parallel' { $Definition.Settings.MultipleInstances = 0 }
+        }
+        $spec = Get-BRAVOServiceRecoveryTaskTriggerSpec
+        $subscriptionXml = $null
+        try { $subscriptionXml = [xml]$spec.EventSubscription } catch { $subscriptionXml = $null }
+        [pscustomobject]@{
+            Triggers = @($triggerList | ForEach-Object {
+                    [pscustomobject]@{
+                        Type = $_.Type; Enabled = $_.Enabled; Delay = $_.Delay; Subscription = $_.Subscription
+                        StartBoundary = $_.StartBoundary; DaysInterval = $_.DaysInterval
+                        Interval = $_.Repetition.Interval; Duration = $_.Repetition.Duration; StopAtDurationEnd = $_.Repetition.StopAtDurationEnd
+                    }
+                })
+            Settings = $Definition.Settings
+            Problems = @(Test-BRAVOServiceRecoveryTaskDefinition -Definition $Definition)
+            SubscriptionIsXml = ($null -ne $subscriptionXml -and [string]$subscriptionXml.QueryList.Query.Select.Path -eq 'System')
+        }
+    }
+    $runTaskProbe = {
+        param([string]$Mutation)
+        if ($null -eq $taskModule) { return $null }
+        try { return (& $taskModule $taskProbe (& $newFakeDefinition) $Mutation) } catch { return [pscustomobject]@{ Error = $_.Exception.Message } }
+    }
+
+    $taskBuilt = & $runTaskProbe ''
+    $taskBuiltOk = $false
+    $taskBuiltDetail = $taskModuleError
+    if ($null -ne $taskBuilt -and $null -ne $taskBuilt.PSObject.Properties['Triggers']) {
+        $eventBuilt = @($taskBuilt.Triggers | Where-Object { $_.Type -eq 0 })
+        $bootBuilt = @($taskBuilt.Triggers | Where-Object { $_.Type -eq 8 })
+        $dailyBuilt = @($taskBuilt.Triggers | Where-Object { $_.Type -eq 2 })
+        $eventIdsCovered = $eventBuilt.Count -eq 1 -and @(7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034 | Where-Object { ([string]$eventBuilt[0].Subscription) -notmatch ('EventID={0}\b' -f $_) }).Count -eq 0
+        $taskBuiltOk = (
+            @($taskBuilt.Triggers).Count -eq 3 -and
+            $eventBuilt.Count -eq 1 -and [bool]$eventBuilt[0].Enabled -and $eventBuilt[0].Delay -eq 'PT1M' -and
+            ([string]$eventBuilt[0].Subscription).Contains("Provider[@Name='Service Control Manager']") -and
+            ([string]$eventBuilt[0].Subscription).Contains('<Select Path="System">') -and $eventIdsCovered -and
+            $taskBuilt.SubscriptionIsXml -and
+            $bootBuilt.Count -eq 1 -and [bool]$bootBuilt[0].Enabled -and $bootBuilt[0].Delay -eq 'PT10M' -and
+            $dailyBuilt.Count -eq 1 -and [bool]$dailyBuilt[0].Enabled -and $dailyBuilt[0].DaysInterval -eq 1 -and
+            $dailyBuilt[0].StartBoundary -eq '2026-10-07T00:00:00' -and
+            $dailyBuilt[0].Interval -eq 'PT15M' -and $dailyBuilt[0].Duration -eq 'P1D' -and -not [bool]$dailyBuilt[0].StopAtDurationEnd -and
+            [int]$taskBuilt.Settings.MultipleInstances -eq 2 -and -not [bool]$taskBuilt.Settings.StartWhenAvailable -and
+            [string]$taskBuilt.Settings.ExecutionTimeLimit -eq 'PT1H' -and
+            @($taskBuilt.Problems).Count -eq 0
+        )
+        $taskBuiltDetail = "тригери: $(@($taskBuilt.Triggers | ForEach-Object { '{0}/{1}/{2}/{3}' -f $_.Type, $_.Delay, $_.Interval, $_.Duration }) -join '; '); проблеми: $(@($taskBuilt.Problems) -join ' | ')"
+    } elseif ($null -ne $taskBuilt) {
+        $taskBuiltDetail = [string]$taskBuilt.Error
+    }
+    Test-BRAVOCondition `
+        -Condition $taskBuiltOk `
+        -Name 'ServiceRecovery/TaskDefinitionHasThreeTriggers' `
+        -Failure "#314 FR-4: визначення задачі BRAVO_SERVICE_RECOVERY — рівно три тригери: event (System / Service Control Manager, Id 7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034; Delay PT1M), boot (Delay PT10M), daily з Repetition PT15M / P1D; MultipleInstances=IgnoreNew, StartWhenAvailable=false, ExecutionTimeLimit=PT1H; перевірка того самого визначення — без проблем. Отримано: $taskBuiltDetail"
+
+    $taskMutations = [ordered]@{
+        NoEvent = 'немає event-тригера'
+        NoBoot = 'немає boot-тригера'
+        NoDaily = 'немає daily-тригера'
+        DailyHourly = 'daily-тригер: Repetition'
+        BootNoDelay = 'boot-тригер: Delay'
+        EventMissingId = 'бракує 7034'
+        Parallel = 'MultipleInstances'
+    }
+    $taskMutationMisses = @()
+    foreach ($taskMutation in $taskMutations.Keys) {
+        $taskMutated = & $runTaskProbe $taskMutation
+        $taskMutationProblems = if ($null -ne $taskMutated -and $null -ne $taskMutated.PSObject.Properties['Problems']) { @($taskMutated.Problems) } else { @() }
+        if (@($taskMutationProblems | Where-Object { ([string]$_).Contains([string]$taskMutations[$taskMutation]) }).Count -ne 1) {
+            $taskMutationMisses += "${taskMutation}: $($taskMutationProblems -join ' | ')"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $taskModule -and $taskMutationMisses.Count -eq 0) `
+        -Name 'ServiceRecovery/TaskDefinitionCheckCatchesMissingTrigger' `
+        -Failure "#314 FR-4: перевірка визначення ловить відсутній тригер і неправильні параметри (event / boot / daily, затримка, повтор, ідентифікатори подій, MultipleInstances). Пропущено: $($taskMutationMisses -join '; ') $taskModuleError"
+
+    # Diagnose: Test-BRAVOScheduledTaskDefinition для ServiceRecovery додає
+    # проблеми тригерів (відсутній boot-тригер — FAIL), для інших типів — ні.
+    $diagnoseTextForTask = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1'), [Text.Encoding]::UTF8)
+    $compatibilityTextForTask = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1'), [Text.Encoding]::UTF8)
+    $diagnoseTaskModule = $null
+    $diagnoseTaskError = ''
+    try {
+        $diagnoseTaskModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($diagnoseTextForTask + "`n" + $compatibilityTextForTask + "`n" + $taskSystemText) `
+            -FunctionNames @('Test-BRAVOMappedNetworkDrive', 'ConvertTo-BRAVOAccountSidValue', 'Test-BRAVOAccountIdentityEquivalent',
+                'Get-BRAVOServiceRecoveryTaskTriggerSpec', 'Initialize-BRAVOServiceRecoveryTaskDefinition', 'Test-BRAVOServiceRecoveryTaskDefinition',
+                'Test-BRAVOScheduledTaskDefinition')
+    } catch {
+        $diagnoseTaskError = $_.Exception.Message
+    }
+    $diagnoseTaskProblems = @{}
+    if ($null -ne $diagnoseTaskModule) {
+        foreach ($diagnoseCase in @('ServiceRecovery|', 'ServiceRecovery|NoBoot', 'Maintenance|NoBoot')) {
+            $diagnoseCaseParts = $diagnoseCase.Split('|')
+            $diagnoseDefinition = & $newFakeDefinition
+            Add-Member -InputObject $diagnoseDefinition -MemberType NoteProperty -Name Principal -Value ([pscustomobject]@{ UserId = 'S-1-5-18'; LogonType = 5; RunLevel = 1 })
+            Add-Member -InputObject $diagnoseDefinition -MemberType NoteProperty -Name Actions -Value @()
+            try {
+                $diagnoseTaskProblems[$diagnoseCase] = @(& $diagnoseTaskModule {
+                        param($Definition, $TaskType, $Mutation)
+                        Initialize-BRAVOServiceRecoveryTaskDefinition -Definition $Definition
+                        if ($Mutation -eq 'NoBoot') { $Definition.Triggers.Remove(@($Definition.Triggers | Where-Object { $_.Type -eq 8 })[0]) }
+                        Test-BRAVOScheduledTaskDefinition `
+                            -TaskType $TaskType -RegisteredTask ([pscustomobject]@{ Enabled = $true; Definition = $Definition }) -TaskSettings @{} `
+                            -ExpectedConfigPath '' -ExpectedExecutable '' -RequiredArgumentTokens @() `
+                            -ExpectedAccount 'SYSTEM' -ExpectedLogonType 5 -ExpectedRunLevel 1
+                    } $diagnoseDefinition $diagnoseCaseParts[0] $diagnoseCaseParts[1])
+            } catch {
+                $diagnoseTaskProblems[$diagnoseCase] = @("виняток: $($_.Exception.Message)")
+            }
+        }
+    }
+    $diagnoseTriggerProblems = {
+        param([string]$Case)
+        if (-not $diagnoseTaskProblems.ContainsKey($Case)) { return @('немає результату') }
+        return @($diagnoseTaskProblems[$Case] | Where-Object { ([string]$_) -match 'тригер|MultipleInstances|StartWhenAvailable|ExecutionTimeLimit|виняток' })
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $diagnoseTaskModule -and
+            @(& $diagnoseTriggerProblems 'ServiceRecovery|').Count -eq 0 -and
+            @(& $diagnoseTriggerProblems 'ServiceRecovery|NoBoot' | Where-Object { ([string]$_).Contains('немає boot-тригера') }).Count -eq 1 -and
+            @(& $diagnoseTriggerProblems 'Maintenance|NoBoot').Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/DiagnoseChecksServiceRecoveryTriggers' `
+        -Failure "#314 FR-4: BRAVO_TASKS_DIAGNOSE (Test-BRAVOScheduledTaskDefinition) перевіряє три тригери задачі ServiceRecovery через Test-BRAVOServiceRecoveryTaskDefinition: правильне визначення — без проблем тригерів, без boot-тригера — FAIL; інших типів задач перевірка не стосується. Отримано: правильне=[$(@(& $diagnoseTriggerProblems 'ServiceRecovery|') -join ' | ')]; без boot=[$(@(& $diagnoseTriggerProblems 'ServiceRecovery|NoBoot') -join ' | ')]; Maintenance=[$(@(& $diagnoseTriggerProblems 'Maintenance|NoBoot') -join ' | ')] $diagnoseTaskError"
+
+    # Підключення: тип ServiceRecovery у трьох скриптах задач, похідний вузол
+    # конфігурації (Enabled = Maintenance.Enabled), дія -RecoverServices.
+    $installTextForTask = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_INSTALL.ps1'), [Text.Encoding]::UTF8)
+    $uninstallTextForTask = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_UNINSTALL.ps1'), [Text.Encoding]::UTF8)
+    $derivationTextForTask = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'), [Text.Encoding]::UTF8)
+    $loaderTextForTask = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)
+    $taskTypeSet = '"Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery"'
+    $taskWiringChecks = [ordered]@{
+        'Install: ValidateSet' = ([regex]::Matches($installTextForTask, [regex]::Escape("[ValidateSet($taskTypeSet)]")).Count -eq 2)
+        'Install: план задачі' = $installTextForTask.Contains('[pscustomobject]@{ Type = "ServiceRecovery"; Settings = $serviceRecoverySettings }')
+        'Install: Test-TaskName' = $installTextForTask.Contains('Test-TaskName -TaskName $serviceRecoverySettings.TaskName -SettingName "ServiceRecovery.TaskName"')
+        'Install: тригери' = $installTextForTask.Contains('Initialize-BRAVOServiceRecoveryTaskDefinition -Definition $definition')
+        'Install: дія -RecoverServices' = $installTextForTask.Contains('$actionArguments += " -RecoverServices"')
+        'Install: тип запуску трьох служб' = $installTextForTask.Contains('Get-BRAVOManagedServiceStartModeSummary')
+        'Diagnose: ValidateSet' = $diagnoseTextForTask.Contains("[ValidateSet($taskTypeSet)]")
+        'Diagnose: перелік задач' = $diagnoseTextForTask.Contains("foreach (`$taskType in @($taskTypeSet))")
+        'Diagnose: аргументи' = $diagnoseTextForTask.Contains("ServiceRecovery = @('-NoPause', '-RecoverServices')")
+        'Diagnose: тригери' = $diagnoseTextForTask.Contains('Test-BRAVOServiceRecoveryTaskDefinition -Definition $definition')
+        'Uninstall: ім''я задачі' = $uninstallTextForTask.Contains('$schedulerSettings.ServiceRecovery.TaskName')
+        'Derivation: вузол' = ($derivationTextForTask.Contains('$global:schedulerSettings.ServiceRecovery = @{') -and $derivationTextForTask.Contains('TaskName = "BRAVO_SERVICE_RECOVERY"') -and $derivationTextForTask.Contains('ScriptPath = Join-Path $runtimeRoot "BRAVO_MAINTENANCE.ps1"'))
+        'Loader: legacy-вузол' = ($loaderTextForTask.Contains('$global:schedulerSettings.ServiceRecovery = @{') -and $loaderTextForTask.Contains("TaskName = 'BRAVO_SERVICE_RECOVERY'"))
+    }
+    $taskWiringMissing = @($taskWiringChecks.Keys | Where-Object { -not [bool]$taskWiringChecks[$_] })
+    Test-BRAVOCondition `
+        -Condition ($taskWiringMissing.Count -eq 0) `
+        -Name 'ServiceRecovery/TaskWiredThroughInstallDiagnoseUninstall' `
+        -Failure "#314 FR-4: тип задачі ServiceRecovery (BRAVO_SERVICE_RECOVERY, дія BRAVO_MAINTENANCE.ps1 -RecoverServices -NoPause) має бути в BRAVO_TASKS_INSTALL / DIAGNOSE / UNINSTALL і в похідній конфігурації; бракує: $($taskWiringMissing -join ', ')"
+}
+
+# ============================================================
+# #314 хвиля 5 (FR-7, ТЗ §6 п. 9): Health для впалої служби (Failed) НЕ
+# запускає службу сам, а просить Планувальник запустити задачу
+# BRAVO_SERVICE_RECOVERY (Start-BRAVOScheduledTask, BRAVO.Compatibility).
+# Issue лишається, ActionText — «запущено автоматичне відновлення». Задачі
+# немає або вона вимкнена — окремий issue «виконайте BRAVO_TASKS_INSTALL».
+# Disabled — без issue і без запуску задачі. Стаби: Get-Service, WMI, маркер,
+# Start-Service (фіксує заборонений виклик) і Start-BRAVOScheduledTask.
+& {
+    Add-Type -AssemblyName System.ServiceProcess
+    $healthTextForRecovery = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $systemTextForRecovery = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8)
+    $healthRecoveryStubs = @'
+function Write-HealthLog { param($Message, $Level) [void]$script:healthRecoveryEvents.Add(('LOG-{0} {1}' -f $Level, $Message)) }
+function Get-Service {
+    param($Name, $DisplayName, $ErrorAction)
+    $status = if (@($script:healthRecoveryRunning) -contains [string]$Name) { [System.ServiceProcess.ServiceControllerStatus]::Running } else { [System.ServiceProcess.ServiceControllerStatus]::Stopped }
+    $svc = [pscustomobject]@{ Name = [string]$Name; Status = $status }
+    Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { } -Force
+    return $svc
+}
+function Start-Service { param($Name, $ErrorAction) [void]$script:healthRecoveryEvents.Add(('START-SERVICE {0}' -f $Name)) }
+function Read-BRAVOServiceQuiescenceState { return $null }
+function Get-BRAVOWmiInstance { param($ClassName) return @($script:healthRecoveryWmi) }
+function Start-BRAVOScheduledTask {
+    param($TaskPath, $TaskName)
+    [void]$script:healthRecoveryEvents.Add(('RUN-TASK {0}{1}' -f $TaskPath, $TaskName))
+    if ($null -ne $script:healthRecoveryTaskThrows) { throw $script:healthRecoveryTaskThrows }
+    return $script:healthRecoveryTask
+}
+'@
+    $healthRecoveryModule = $null
+    $healthRecoveryError = ''
+    try {
+        $healthRecoveryModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($healthRecoveryStubs + "`n" + $healthTextForRecovery + "`n" + $systemTextForRecovery) `
+            -FunctionNames @('Write-HealthLog', 'Get-Service', 'Start-Service', 'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOWmiInstance',
+                'Start-BRAVOScheduledTask', 'Test-BRAVOSettingEnabled', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode',
+                'Get-BRAVOManagedServiceCondition', 'Invoke-BRAVOHealthServiceRecoveryTask', 'Get-ManagedServiceHealthIssues')
+    } catch {
+        $healthRecoveryError = $_.Exception.Message
+    }
+    $healthRecoveryProbe = {
+        param([string[]]$Running, $Wmi, $Task, $TaskThrows = $null, [bool]$RecoveryConfigured = $true)
+        Set-StrictMode -Version 2.0
+        $script:healthRecoveryEvents = New-Object System.Collections.ArrayList
+        $script:healthRecoveryRunning = $Running
+        $script:healthRecoveryWmi = $Wmi
+        $script:healthRecoveryTask = $Task
+        $script:healthRecoveryTaskThrows = $TaskThrows
+        $script:backupMonitoring = @{ CheckManagedServices = $true }
+        $script:maintenanceSettings = [pscustomobject]@{
+            Services = [pscustomobject]@{ BravoName = 'BRAVO'; ExchangeApiName = 'exchangAPI'; BravoWebEnabled = $false; BravoWebCandidates = @() }
+        }
+        # Set-Variable, а не присвоєння: змінна живе лише в scope тестового
+        # модуля, а присвоєння $script:schedulerSettings аналізатор
+        # Framework/SelectiveSuitesHaveNoCrossSuiteDependency прийняв би за
+        # визначення змінної конфігурації, яку читає корінь самотесту.
+        Set-Variable -Name 'schedulerSettings' -Scope Script -Value @{
+            TaskPath = '\BRAVO\'
+            ServiceRecovery = @{ Enabled = $RecoveryConfigured; TaskName = 'BRAVO_SERVICE_RECOVERY' }
+        }
+        $thrown = $null
+        $issues = @()
+        try { $issues = @(Get-ManagedServiceHealthIssues) } catch { $thrown = $_.Exception.Message }
+        [pscustomobject]@{
+            Thrown = $thrown
+            Issues = @($issues | ForEach-Object {
+                    [pscustomobject]@{
+                        Location = [string]$_.Location
+                        Reason = [string]$_.Reason
+                        ActionText = $(if ($null -ne $_.PSObject.Properties['ActionText']) { [string]$_.ActionText } else { '' })
+                    }
+                })
+            Events = @($script:healthRecoveryEvents)
+        }
+    }
+    $taskReady = [pscustomobject]@{ Exists = $true; Enabled = $true; AlreadyRunning = $false; Started = $true; Error = $null }
+    $taskMissing = [pscustomobject]@{ Exists = $false; Enabled = $false; AlreadyRunning = $false; Started = $false; Error = $null }
+    $taskDisabled = [pscustomobject]@{ Exists = $true; Enabled = $false; AlreadyRunning = $false; Started = $false; Error = $null }
+    $wmiAuto = @(
+        [pscustomobject]@{ Name = 'BRAVO'; StartMode = 'Auto'; ExitCode = 0 },
+        [pscustomobject]@{ Name = 'exchangAPI'; StartMode = 'Auto'; ExitCode = 1067 }
+    )
+    $wmiExchangeDisabled = @(
+        [pscustomobject]@{ Name = 'BRAVO'; StartMode = 'Auto'; ExitCode = 0 },
+        [pscustomobject]@{ Name = 'exchangAPI'; StartMode = 'Disabled'; ExitCode = 0 }
+    )
+    $runHealthRecovery = {
+        param([string[]]$Running, $Wmi, $Task, $TaskThrows = $null, [bool]$RecoveryConfigured = $true)
+        if ($null -eq $healthRecoveryModule) { return [pscustomobject]@{ Thrown = $healthRecoveryError; Issues = @(); Events = @() } }
+        return (& $healthRecoveryModule $healthRecoveryProbe $Running $Wmi $Task $TaskThrows $RecoveryConfigured)
+    }
+    $describeHealthRecovery = {
+        param($Result)
+        "thrown='$($Result.Thrown)'; issues=[$(@($Result.Issues | ForEach-Object { '{0}: {1} => {2}' -f $_.Location, $_.Reason, $_.ActionText }) -join ' | ')]; events=[$(@($Result.Events | Where-Object { $_ -notlike 'LOG-*' }) -join ', ')]"
+    }
+
+    # Впала exchangAPI, задача на місці: задачу запущено рівно раз, службу — ні.
+    $healthFailed = & $runHealthRecovery @('BRAVO') $wmiAuto $taskReady
+    $healthFailedIssue = @($healthFailed.Issues | Where-Object { $_.Location -eq 'exchangAPI' })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $healthFailed.Thrown -and
+            @($healthFailed.Issues).Count -eq 1 -and $healthFailedIssue.Count -eq 1 -and
+            $healthFailedIssue[0].ActionText.Contains('служба exchangAPI не працює') -and
+            $healthFailedIssue[0].ActionText.Contains('запущено автоматичне відновлення') -and
+            $healthFailedIssue[0].ActionText.Contains('_RECOVER_') -and
+            @($healthFailed.Events | Where-Object { $_ -eq 'RUN-TASK \BRAVO\BRAVO_SERVICE_RECOVERY' }).Count -eq 1 -and
+            @($healthFailed.Events | Where-Object { $_ -like 'START-SERVICE*' }).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/HealthFailedServiceStartsRecoveryTaskNotService' `
+        -Failure "#314 FR-7: Health для Failed-служби запускає задачу BRAVO_SERVICE_RECOVERY (а не службу), issue лишається з ActionText «служба X не працює; запущено автоматичне відновлення, перевірте журнал …_RECOVER_….log». Отримано: $(& $describeHealthRecovery $healthFailed)"
+
+    # Дві впалі служби — одна задача на прогін Health.
+    $healthTwoFailed = & $runHealthRecovery @() $wmiAuto $taskReady
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $healthTwoFailed.Thrown -and @($healthTwoFailed.Issues).Count -eq 2 -and
+            @($healthTwoFailed.Issues | Where-Object { $_.ActionText.Contains('запущено автоматичне відновлення') }).Count -eq 2 -and
+            @($healthTwoFailed.Events | Where-Object { $_ -like 'RUN-TASK *' }).Count -eq 1 -and
+            @($healthTwoFailed.Events | Where-Object { $_ -like 'START-SERVICE*' }).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/HealthRunsRecoveryTaskOncePerCheck' `
+        -Failure "#314 FR-7: кілька впалих служб — задача запускається один раз (профіль сам об'єднує ланцюжки), кожен issue має ActionText про відновлення. Отримано: $(& $describeHealthRecovery $healthTwoFailed)"
+
+    # Задачі немає / вимкнена — окремий issue з дією «виконайте BRAVO_TASKS_INSTALL».
+    $healthNoTask = & $runHealthRecovery @('BRAVO') $wmiAuto $taskMissing
+    $healthDisabledTask = & $runHealthRecovery @('BRAVO') $wmiAuto $taskDisabled
+    $healthTaskIssueOk = {
+        param($Result)
+        $taskIssues = @($Result.Issues | Where-Object { $_.Location -eq 'BRAVO_SERVICE_RECOVERY' })
+        $serviceIssues = @($Result.Issues | Where-Object { $_.Location -eq 'exchangAPI' })
+        return (
+            $null -eq $Result.Thrown -and @($Result.Issues).Count -eq 2 -and
+            $taskIssues.Count -eq 1 -and $taskIssues[0].ActionText.Contains('задача відновлення служб відсутня — виконайте BRAVO_TASKS_INSTALL') -and
+            [string]$Result.Issues[0].Location -eq 'BRAVO_SERVICE_RECOVERY' -and
+            $serviceIssues.Count -eq 1 -and -not $serviceIssues[0].ActionText.Contains('запущено автоматичне відновлення') -and
+            @($Result.Events | Where-Object { $_ -like 'START-SERVICE*' }).Count -eq 0
+        )
+    }
+    Test-BRAVOCondition `
+        -Condition ((& $healthTaskIssueOk $healthNoTask) -and (& $healthTaskIssueOk $healthDisabledTask)) `
+        -Name 'ServiceRecovery/HealthMissingOrDisabledRecoveryTaskIsSeparateIssue' `
+        -Failure "#314 FR-7: задачі BRAVO_SERVICE_RECOVERY немає або вона вимкнена — окремий (перший) issue «задача відновлення служб відсутня — виконайте BRAVO_TASKS_INSTALL», issue служби лишається, службу Health не запускає. Отримано: немає=[$(& $describeHealthRecovery $healthNoTask)]; вимкнена=[$(& $describeHealthRecovery $healthDisabledTask)]"
+
+    # Disabled — як і раніше, INFO без issue і без запуску задачі; усе працює — нічого.
+    $healthDisabledService = & $runHealthRecovery @('BRAVO') $wmiExchangeDisabled $taskReady
+    $healthAllRunning = & $runHealthRecovery @('BRAVO', 'exchangAPI') $wmiAuto $taskReady
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $healthDisabledService.Thrown -and @($healthDisabledService.Issues).Count -eq 0 -and
+            @($healthDisabledService.Events | Where-Object { $_ -like 'RUN-TASK *' -or $_ -like 'START-SERVICE*' }).Count -eq 0 -and
+            @($healthDisabledService.Events | Where-Object { $_ -like 'LOG-INFO *exchangAPI*Disabled*' }).Count -eq 1 -and
+            $null -eq $healthAllRunning.Thrown -and @($healthAllRunning.Issues).Count -eq 0 -and
+            @($healthAllRunning.Events | Where-Object { $_ -like 'RUN-TASK *' }).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/HealthDisabledServiceNoIssueNoRecoveryTask' `
+        -Failure "#314 FR-7: служба Disabled — INFO, без issue і без запуску задачі; усі служби працюють — задача не запускається. Отримано: Disabled=[$(& $describeHealthRecovery $healthDisabledService)]; Running=[$(& $describeHealthRecovery $healthAllRunning)]"
+
+    # Збій запуску задачі не обриває Health і не підміняється запуском служби;
+    # задача, що вже виконується, — ActionText про відновлення, що триває;
+    # без увімкненого Maintenance (задачу не встановлюють) — колишня поведінка.
+    $healthTaskThrows = & $runHealthRecovery @('BRAVO') $wmiAuto $taskReady 'відмовлено в доступі (stub)'
+    $healthTaskRunning = & $runHealthRecovery @('BRAVO') $wmiAuto ([pscustomobject]@{ Exists = $true; Enabled = $true; AlreadyRunning = $true; Started = $false; Error = $null })
+    $healthNotConfigured = & $runHealthRecovery @('BRAVO') $wmiAuto $taskReady $null $false
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $healthTaskThrows.Thrown -and @($healthTaskThrows.Issues).Count -eq 1 -and
+            $healthTaskThrows.Issues[0].ActionText.Contains('не вдалося запустити') -and
+            @($healthTaskThrows.Events | Where-Object { $_ -like 'START-SERVICE*' }).Count -eq 0 -and
+            $null -eq $healthTaskRunning.Thrown -and @($healthTaskRunning.Issues).Count -eq 1 -and
+            $healthTaskRunning.Issues[0].ActionText.Contains('вже виконується') -and
+            $null -eq $healthNotConfigured.Thrown -and @($healthNotConfigured.Issues).Count -eq 1 -and
+            -not $healthNotConfigured.Issues[0].ActionText.Contains('автоматичне відновлення') -and
+            @($healthNotConfigured.Events | Where-Object { $_ -like 'RUN-TASK *' -or $_ -like 'START-SERVICE*' }).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/HealthRecoveryTaskFailureAndRunningHandled' `
+        -Failure "#314 FR-7: збій запуску задачі — issue з ActionText «не вдалося запустити», без винятку і без Start-Service; задача вже виконується — ActionText про відновлення, що триває; Maintenance вимкнено (задачі не передбачено) — issue як раніше, без запуску задачі. Отримано: збій=[$(& $describeHealthRecovery $healthTaskThrows)]; виконується=[$(& $describeHealthRecovery $healthTaskRunning)]; не налаштовано=[$(& $describeHealthRecovery $healthNotConfigured)]"
+
+    # Start-BRAVOScheduledTask (BRAVO.Compatibility): запуск через ScheduledTasks
+    # (Start-ScheduledTask) або COM RegisteredTask.Run($null) — Windows 7 без
+    # модуля ScheduledTasks; відсутня / вимкнена / уже запущена задача — без запуску.
+    $compatibilityTextForRecovery = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1'), [Text.Encoding]::UTF8)
+    $startTaskStubs = @'
+function Get-BRAVOScheduledTaskState { param($TaskPath, $TaskName) return $script:startTaskState }
+function Start-ScheduledTask { param($InputObject, $ErrorAction) [void]$script:startTaskEvents.Add('START-SCHEDULEDTASK') }
+'@
+    $startTaskModule = $null
+    $startTaskError = ''
+    try {
+        $startTaskModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($startTaskStubs + "`n" + $compatibilityTextForRecovery) `
+            -FunctionNames @('Get-BRAVOScheduledTaskState', 'Start-ScheduledTask', 'Start-BRAVOScheduledTask')
+    } catch {
+        $startTaskError = $_.Exception.Message
+    }
+    $startTaskProbe = {
+        param([string]$Provider, [string]$State, [bool]$Exists)
+        $script:startTaskEvents = New-Object System.Collections.ArrayList
+        $comTask = [pscustomobject]@{ Name = 'BRAVO_SERVICE_RECOVERY' }
+        Add-Member -InputObject $comTask -MemberType ScriptMethod -Name Run -Value { param($Parameters) [void]$script:startTaskEvents.Add('COM-RUN') }
+        $script:startTaskState = [pscustomobject]@{ Exists = $Exists; State = $State; IsRunning = ($State -eq 'Running'); Provider = $Provider; Task = $(if ($Exists) { $comTask } else { $null }) }
+        $outcome = Start-BRAVOScheduledTask -TaskPath '\BRAVO\' -TaskName 'BRAVO_SERVICE_RECOVERY'
+        [pscustomobject]@{ Outcome = $outcome; Events = @($script:startTaskEvents) }
+    }
+    $startTaskCases = @{}
+    if ($null -ne $startTaskModule) {
+        foreach ($startTaskCase in @('COM|Ready|1', 'ScheduledTasks|Ready|1', 'COM|Disabled|1', 'COM|Running|1', 'COM|NotFound|0')) {
+            $startTaskParts = $startTaskCase.Split('|')
+            try {
+                $startTaskCases[$startTaskCase] = & $startTaskModule $startTaskProbe $startTaskParts[0] $startTaskParts[1] ($startTaskParts[2] -eq '1')
+            } catch {
+                $startTaskCases[$startTaskCase] = [pscustomobject]@{ Outcome = $null; Events = @("виняток: $($_.Exception.Message)") }
+            }
+        }
+    }
+    $startTaskOk = {
+        param([string]$Case, [bool]$Started, [string]$Event, [string]$Flag)
+        if (-not $startTaskCases.ContainsKey($Case) -or $null -eq $startTaskCases[$Case].Outcome) { return $false }
+        $caseResult = $startTaskCases[$Case]
+        $eventsOk = if ([string]::IsNullOrEmpty($Event)) { @($caseResult.Events).Count -eq 0 } else { (@($caseResult.Events) -join ',') -eq $Event }
+        $flagOk = switch ($Flag) {
+            'Missing' { -not [bool]$caseResult.Outcome.Exists }
+            'Disabled' { [bool]$caseResult.Outcome.Exists -and -not [bool]$caseResult.Outcome.Enabled }
+            'Running' { [bool]$caseResult.Outcome.AlreadyRunning }
+            default { $true }
+        }
+        return ([bool]$caseResult.Outcome.Started -eq $Started -and $eventsOk -and $flagOk)
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $startTaskModule -and
+            (& $startTaskOk 'COM|Ready|1' $true 'COM-RUN' '') -and
+            (& $startTaskOk 'ScheduledTasks|Ready|1' $true 'START-SCHEDULEDTASK' '') -and
+            (& $startTaskOk 'COM|Disabled|1' $false '' 'Disabled') -and
+            (& $startTaskOk 'COM|Running|1' $false '' 'Running') -and
+            (& $startTaskOk 'COM|NotFound|0' $false '' 'Missing')
+        ) `
+        -Name 'ServiceRecovery/StartScheduledTaskViaComOrScheduledTasks' `
+        -Failure "#314 FR-7: Start-BRAVOScheduledTask запускає задачу через COM RegisteredTask.Run (Windows 7) або Start-ScheduledTask, а відсутню, вимкнену чи вже запущену задачу не запускає. Отримано: $(@($startTaskCases.Keys | Sort-Object | ForEach-Object { '{0} => started={1}; events={2}' -f $_, $(if ($null -ne $startTaskCases[$_].Outcome) { $startTaskCases[$_].Outcome.Started } else { '?' }), (@($startTaskCases[$_].Events) -join ',') }) -join ' | ') $startTaskError"
+
+    # Статично: Health не викликає Start-Service поза watchdog-ом осиротілого
+    # маркера; запуск задачі — лише з Get-ManagedServiceHealthIssues.
+    $healthServiceFunctionText = ''
+    $healthServiceFunctionStart = $healthTextForRecovery.IndexOf('function Get-ManagedServiceHealthIssues')
+    $healthServiceFunctionEnd = $healthTextForRecovery.IndexOf('function Get-BRAVOManagedServiceStatusSnapshot')
+    if ($healthServiceFunctionStart -ge 0 -and $healthServiceFunctionEnd -gt $healthServiceFunctionStart) {
+        $healthServiceFunctionText = $healthTextForRecovery.Substring($healthServiceFunctionStart, $healthServiceFunctionEnd - $healthServiceFunctionStart)
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $healthServiceFunctionText.Contains('Invoke-BRAVOHealthServiceRecoveryTask') -and
+            -not $healthServiceFunctionText.Contains('Start-Service') -and
+            ([regex]::Matches($healthTextForRecovery, 'Start-BRAVOScheduledTask\b')).Count -eq 1
+        ) `
+        -Name 'ServiceRecovery/HealthNeverStartsFailedServiceDirectly' `
+        -Failure '#314 FR-7: Get-ManagedServiceHealthIssues не запускає служби (Start-Service лише у watchdog осиротілого маркера), а для впалої служби викликає Invoke-BRAVOHealthServiceRecoveryTask — єдине місце запуску задачі (Start-BRAVOScheduledTask)'
+}

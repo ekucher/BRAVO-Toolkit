@@ -26259,7 +26259,8 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     # визначення могло б оголошуватись invalid у Diagnose.
     Test-BRAVOCondition `
         -Condition (
-            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")') -and
+            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")') -and
+            $tasksDiagnoseTextForRuntime.Contains("ServiceRecovery = @('-NoPause', '-RecoverServices')") -and
             $tasksDiagnoseTextForRuntime.Contains('function Test-BRAVOScheduledTaskDefinition') -and
             $tasksDiagnoseTextForRuntime.Contains('BAZASync      = @(''-NoPause'', ''-SyncBAZA'')') -and
             $tasksDiagnoseTextForRuntime.Contains('Recovery      = @(''-NoPause'', ''-RunMissedRestoreOnly'')') -and
@@ -27351,6 +27352,25 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 -Name "Config/BackupCatchUpDerived" `
                 -Failure "schedulerSettings.BackupCatchUp: TaskName BRAVO_ARCHIV_CATCHUP, затримка 5-10 хв, ScriptPath BRAVO_ARCHIV.ps1, Enabled = Backup.Enabled і не Recovery.Enabled"
         }
+        & {
+            # #314 FR-4: похідний вузол задачі BRAVO_SERVICE_RECOVERY — завжди,
+            # коли увімкнено Maintenance; профіль -RecoverServices з RuntimeRoot.
+            $serviceRecoveryTaskSettings = $null
+            if ($global:schedulerSettings.Contains('ServiceRecovery')) {
+                $serviceRecoveryTaskSettings = $global:schedulerSettings.ServiceRecovery
+            }
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -ne $serviceRecoveryTaskSettings -and
+                    [string]$serviceRecoveryTaskSettings.TaskName -eq 'BRAVO_SERVICE_RECOVERY' -and
+                    [string]$serviceRecoveryTaskSettings.ScriptPath -like '*BRAVO_MAINTENANCE.ps1' -and
+                    ([string]$serviceRecoveryTaskSettings.ScriptPath).StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                    [double]$serviceRecoveryTaskSettings.ExecutionTimeLimitHours -eq 1 -and
+                    [bool]$serviceRecoveryTaskSettings.Enabled -eq [bool]$global:schedulerSettings.Maintenance.Enabled
+                ) `
+                -Name "Config/ServiceRecoveryDerived" `
+                -Failure "schedulerSettings.ServiceRecovery: TaskName BRAVO_SERVICE_RECOVERY, ScriptPath BRAVO_MAINTENANCE.ps1 з RuntimeRoot, ExecutionTimeLimitHours 1, Enabled = Maintenance.Enabled"
+        }
     } finally {
         Remove-Item -LiteralPath $separateConfigRoot -Recurse -Force -ErrorAction SilentlyContinue
         # Відновити ізольований стан без залежності від служби BRAVO на CI runner.
@@ -27460,6 +27480,65 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
         -Name "TaskDefinition/RecoveryIsSingleBootTriggerWithoutRepetition" `
         -Failure "Recovery-завдання (5.2.0) має мати РІВНО один boot-trigger (Type=8, Enabled=true) БЕЗ Repetition і БЕЗ daily-тригера — 24/7-профіль підхоплює пропущений слот плановим Maintenance, а не окремим розкладом"
 
+    # --- TaskDefinition/ServiceRecoveryComDefinitionHasThreeTriggers (#314
+    # FR-4, ТЗ §6 п. 8): той самий New-BRAVOTaskDefinition на справжньому COM
+    # Schedule.Service (визначення лише в пам'яті, нічого не реєструється).
+    # XML задачі BRAVO_SERVICE_RECOVERY містить рівно три тригери: EventTrigger
+    # (Service Control Manager, Delay PT1M), BootTrigger (Delay PT10M) і
+    # CalendarTrigger з Repetition PT15M / P1D; дія — -RecoverServices -NoPause;
+    # канонічна перевірка Diagnose (Test-BRAVOServiceRecoveryTaskDefinition) на
+    # цьому ж COM-визначенні проблем не знаходить. Підробленим COM ту саму
+    # логіку на будь-якій ОС перевіряє suite ServiceRecovery.
+    $serviceRecoveryTaskServiceForTest = New-Object -ComObject "Schedule.Service"
+    $serviceRecoveryTaskServiceForTest.Connect()
+    $serviceRecoveryComOk = $false
+    $serviceRecoveryComDetail = ''
+    try {
+        $serviceRecoveryComInfo = & $recoveryTriggerModule {
+            param($TaskService, $TaskSettings, $ConfigPath)
+            $result = New-BRAVOTaskDefinition `
+                -TaskService $TaskService `
+                -TaskSettings $TaskSettings `
+                -TaskType 'ServiceRecovery' `
+                -ResolvedConfigPath $ConfigPath
+            [pscustomobject]@{
+                Xml = [string]$result.Definition.XmlText
+                Arguments = [string]@($result.Definition.Actions)[0].Arguments
+                Problems = @(Test-BRAVOServiceRecoveryTaskDefinition -Definition $result.Definition)
+            }
+        } $serviceRecoveryTaskServiceForTest $global:schedulerSettings.ServiceRecovery $resolvedConfig
+        $serviceRecoveryXml = [xml]$serviceRecoveryComInfo.Xml
+        $serviceRecoveryNs = New-Object System.Xml.XmlNamespaceManager($serviceRecoveryXml.NameTable)
+        $serviceRecoveryNs.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        $serviceRecoveryNodeText = {
+            param([string]$XPath)
+            $node = $serviceRecoveryXml.SelectSingleNode($XPath, $serviceRecoveryNs)
+            if ($null -eq $node) { return '' }
+            return [string]$node.InnerText
+        }
+        $serviceRecoveryComOk = (
+            @($serviceRecoveryXml.SelectNodes('/t:Task/t:Triggers/*', $serviceRecoveryNs)).Count -eq 3 -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:EventTrigger/t:Delay') -eq 'PT1M' -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:EventTrigger/t:Subscription').Contains("Provider[@Name='Service Control Manager']") -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:BootTrigger/t:Delay') -eq 'PT10M' -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:CalendarTrigger/t:Repetition/t:Interval') -eq 'PT15M' -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:CalendarTrigger/t:Repetition/t:Duration') -eq 'P1D' -and
+            $serviceRecoveryComInfo.Arguments.Contains('-RecoverServices') -and
+            $serviceRecoveryComInfo.Arguments.Contains('-NoPause') -and
+            @($serviceRecoveryComInfo.Problems).Count -eq 0
+        )
+        $serviceRecoveryComDetail = "Arguments='$($serviceRecoveryComInfo.Arguments)'; проблеми: $(@($serviceRecoveryComInfo.Problems) -join ' | ')"
+    } catch {
+        $serviceRecoveryComOk = $false
+        $serviceRecoveryComDetail = $_.Exception.Message
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($serviceRecoveryTaskServiceForTest)
+    }
+    Test-BRAVOCondition `
+        -Condition $serviceRecoveryComOk `
+        -Name "TaskDefinition/ServiceRecoveryComDefinitionHasThreeTriggers" `
+        -Failure "#314 FR-4: COM-визначення BRAVO_SERVICE_RECOVERY — три тригери (EventTrigger Service Control Manager / PT1M, BootTrigger / PT10M, CalendarTrigger з Repetition PT15M / P1D), дія -RecoverServices -NoPause, перевірка Diagnose без проблем. $serviceRecoveryComDetail"
+
     # --- TaskDefinition/ConfigPathAutoExplicitMatrix (P0 Configuration
     # Foundation, PR C, Секція 6): МЕХАНІЧНА перевірка ЗГЕНЕРОВАНИХ
     # Arguments реального ITaskDefinition (через New-BRAVOTaskDefinition,
@@ -27471,7 +27550,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
     $configPathMatrixTaskServiceForTest.Connect()
     $configPathMatrixFailures = New-Object System.Collections.Generic.List[string]
     try {
-        foreach ($matrixTaskType in @('Backup', 'Maintenance', 'Health', 'Recovery', 'BAZASync', 'RestoreVerify')) {
+        foreach ($matrixTaskType in @('Backup', 'Maintenance', 'Health', 'Recovery', 'BAZASync', 'RestoreVerify', 'ServiceRecovery')) {
             $matrixTaskSettings = $global:schedulerSettings.$matrixTaskType
             foreach ($matrixCase in @(
                     @{ Explicit = $false; Label = 'AUTO' },
@@ -27505,7 +27584,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
     Test-BRAVOCondition `
         -Condition ($configPathMatrixFailures.Count -eq 0) `
         -Name "TaskDefinition/ConfigPathAutoExplicitMatrix" `
-        -Failure "AUTO-встановлене завдання не повинно містити -ConfigPath у Arguments, EXPLICIT — точний шлях; для ВСІХ типів завдань (Backup/Maintenance/Health/Recovery/BAZASync/RestoreVerify). Розбіжності: $($configPathMatrixFailures -join ' | ')"
+        -Failure "AUTO-встановлене завдання не повинно містити -ConfigPath у Arguments, EXPLICIT — точний шлях; для ВСІХ типів завдань (Backup/Maintenance/Health/Recovery/BAZASync/RestoreVerify/ServiceRecovery). Розбіжності: $($configPathMatrixFailures -join ' | ')"
 
     # --- BootRestore/StartTypeClassificationMatrix: класифікація дій
     # Set-BRAVOBootRestoreServiceStartType (BRAVO.System) для обох профілів;
