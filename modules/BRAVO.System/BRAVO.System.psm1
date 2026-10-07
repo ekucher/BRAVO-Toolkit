@@ -954,7 +954,10 @@ function Test-BRAVOServiceDisabledByOperator {
 #   Name    - ім'я служби Windows;
 #   Enabled - служба керується (компонент увімкнено, службу встановлено,
 #             тип запуску не Disabled від оператора);
-#   Status  - рядок стану ServiceController ($null/'' — невідомий).
+#   Status  - рядок стану ServiceController ($null/'' — невідомий);
+#   Failed  - необов'язково (#314 хвиля 3): служба «впала» (Condition
+#             Failed і Status Stopped, Test-BRAVOServiceRecoveryFailed) —
+#             має намір перезапуску, хоч і не працює.
 # ============================================================
 
 function Get-BRAVOManagedServiceOrder {
@@ -1021,7 +1024,9 @@ function Get-BRAVOServiceStopDecision {
 
 function Get-BRAVOManagedServiceRestartIntent {
     # Намір перезапуску на старті прогону (знімок $serviceWasRunning
-    # Maintenance): керована служба, що працює або стартує. -HoldAllEnabled
+    # Maintenance): керована служба, що працює або стартує, або «впала»
+    # (Failed = $true, #314 хвиля 3: нічний Maintenance піднімає її після
+    # обслуговування). -HoldAllEnabled
     # (boot-hold профілю робочого часу): кожна керована служба незалежно від
     # стану — «hold» є детермінованим кінцевим станом, а не знімком гонитви з
     # Automatic (Delayed Start). Результат — hashtable Key -> bool.
@@ -1034,10 +1039,19 @@ function Get-BRAVOManagedServiceRestartIntent {
     $restartIntent = @{}
     foreach ($service in $Services) {
         $enabled = [bool]$service.Enabled
+        # Failed — необов'язкове поле (hashtable або об'єкт; під StrictMode
+        # відсутня властивість об'єкта не читається напряму).
+        $failed = $false
+        if ($service -is [Collections.IDictionary]) {
+            $failed = [bool]$service['Failed']
+        } else {
+            $failedProperty = $service.PSObject.Properties['Failed']
+            if ($null -ne $failedProperty) { $failed = [bool]$failedProperty.Value }
+        }
         $restartIntent[[string]$service.Key] = if ($HoldAllEnabled) {
             $enabled
         } else {
-            $enabled -and (Test-BRAVOManagedServiceActiveStatus -Status ([string]$service.Status))
+            $enabled -and ($failed -or (Test-BRAVOManagedServiceActiveStatus -Status ([string]$service.Status)))
         }
     }
     return $restartIntent

@@ -2106,7 +2106,6 @@ function Send-SlackAlert {
 # Ранній вихід (exit 20 guard-а -RunMissedRestoreOnly) завершив би процес
 # self-test: стаб фіксує його і перериває сценарій винятком.
 function Send-BRAVOMaintenanceEarlyExitAlerts { param([string]$Reason) Add-LifecycleTrace "EARLYEXIT|$Reason"; throw "LIFECYCLE-EARLY-EXIT|$Reason" }
-function Send-InactiveServiceWarning { param([string[]]$ServiceDescriptions) Add-LifecycleTrace ("INACTIVE|{0}" -f (@($ServiceDescriptions) -join ', ')) }
 function Read-BRAVOServiceQuiescenceState { return $script:fx.Marker }
 function Get-BRAVOManagedServiceCondition {
     # Класифікація за правилами Get-BRAVOManagedServiceCondition (FR-1) з
@@ -2254,29 +2253,40 @@ function Invoke-BRAVOWebApplicationLogRotation { param([string]$SourceDirectory,
     }
     # Еталон знято на коді до винесення (developer 758df84). Order —
     # фактичний порядок зупинки (з kill Bis) і запуску.
+    # #314 хвиля 3 (FR-2), свідома зміна поведінки: зупинена (не Disabled/
+    # OwnedByBravo) керована служба — «впала» і запускається після
+    # обслуговування з обліком спроби та WARNING Recovered; попередження
+    # Send-InactiveServiceWarning прибрано. Сценарії без впалих служб
+    # (AllRunning, BravoStartPendingWebPaused, ExchangeAndWebUnmanaged,
+    # BootHoldAllStopped, ModelIntegrityNotEstablished, ExchangeStartFails,
+    # ExchangeStopFails, BravoStartFails, BravoDisabledNoRestore,
+    # NoApacheLogs) мають ту саму трасу без рядка INACTIVE (порядок
+    # незмінний, змінився лише хеш); у решті впала служба додалася до
+    # маркера і запуску. У InheritedExchangeIntent exchangAPI — під маркером
+    # мертвого власника (OwnedByBravo), як і в реальному класифікаторі.
     $lifecycleScenarios = [ordered]@{
-        AllRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running' }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = '6a746c7748596b180cf6f6fc7b48ca932635cfcb741ae47538f351f585a42e68' }
-        OnlyBravoRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Stopped' }; Order = 'stop: kill Bis BRAVO | start: BRAVO'; Hash = 'f96667d8f8bb57ca2e0ae7d60bd8896bea2da6368936196450e9b90bf7c1c31e' }
-        OnlyExchangeRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped' }; Order = 'stop: exchangAPI | start: exchangAPI'; Hash = '2bcb50717558961fd23e6426a8fe021bd93ea602e100142545d18dfab765a6ba' }
-        OnlyWebRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Running' }; Order = 'stop: Apache2.4 | start: Apache2.4'; Hash = '6924d6385e8992306bc9c15c9cae79ebff5b7cfd6daebf0a7be3e4cd3d551a33' }
-        BravoAndExchangeRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Stopped' }; Order = 'stop: exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI'; Hash = '2129e8e477ad46d00803696134caa74406fb07b0f0c9b502f19754c7531f03fa' }
-        BravoFailedOthersRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Running' }; Order = 'stop: Apache2.4 exchangAPI | start: exchangAPI Apache2.4'; Hash = '0e7f3b14ba5ce8e77af266d92681560829f59b58459ed4a7108f30242788f1b7' }
-        AllStopped = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped' }; Order = 'stop:  | start: '; Hash = '70605e31974a4385c89b176f7f92544ac8894b36275984d12631d646d0a99aa2' }
-        BravoStartPendingWebPaused = @{ Spec = @{ Bravo = 'StartPending'; Exchange = 'Running'; Web = 'Paused' }; Order = 'stop: exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI'; Hash = '5733e13d05a38fd097329673630598ac6195548b5b6919eb8dbeb70197711cc8' }
-        ExchangeAndWebUnmanaged = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ExchangeEnabled = $false; ExchangeDisabled = $true; WebEnabled = $false }; Order = 'stop: kill Bis BRAVO | start: BRAVO'; Hash = '3dd7972d8a9738c92038f04ce9c6e8c52784b5ba1993e0ed7326c96c4a258551' }
-        BootHoldAllStopped = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped'; BootHold = $true; ShouldRestore = $true }; Order = 'stop:  | start: BRAVO exchangAPI Apache2.4'; Hash = '52d6fd6273849fa71c3fc2b9cc68fc1644eb06fbc1090c0a5e7f4396f8567180' }
-        RestoreHoldsAllManaged = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ShouldRestore = $true }; Order = 'stop: Apache2.4 kill Bis BRAVO | start: BRAVO Apache2.4'; Hash = '3bbf6e23224a06c542dcd37680ab677d615e6a948f69cc7b4996cd50e3b48638' }
-        InheritedExchangeIntent = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Stopped'; Foreign = [pscustomobject]@{ Present = $true; OwnerAlive = $false; RestartSuppressed = $false; RestartIntentNames = @('exchangAPI'); Owner = 'BRAVO_MAINTENANCE'; HeldSnapshot = @() } }; Order = 'stop: kill Bis BRAVO | start: BRAVO exchangAPI'; Hash = 'd1bca8b200c63ed2ff2d42469ef1f9dfb51a9ae11851c32fa9cb2743eb0baac7' }
-        ModelIntegrityNotEstablished = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Integrity = $false }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: '; Hash = '3f9c7dafd8394cfc42aa5e5f0cd549d186e380f8af3123a3b5f6dcaf8ce727fb' }
-        BravoStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Stopped'; Failures = @('BRAVO>Stopped') }; Order = 'stop: exchangAPI kill Bis BRAVO | start: exchangAPI'; Hash = '6426d5b9e050681e47ea7b77883d1642e8fde1bf7fdbf6c16ce870a02a13d450' }
-        ExchangeStartFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('exchangAPI>Running') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'f660e4cdd898caf03958fd03ce0479e1c26090a4e10e25931eba27d472ff863c' }
-        WebStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; Failures = @('Apache2.4>Stopped') }; Order = 'stop: Apache2.4 kill Bis BRAVO | start: BRAVO'; Hash = 'bf8d1767d2d02b040e5bc480361a85fcadb50ab29ee42b54af62c7a292b7b75c' }
-        DisabledBravoForceRestore = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped'; BravoEnabled = $false; BravoDisabled = $true; RestoreOnDisabledBravo = $true }; Order = 'stop: exchangAPI kill Bis | start: exchangAPI'; Hash = '2790d901962e0747608467d155f851717066fcb1fb2e245d479f657237c17a1b' }
-        ExchangeStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('exchangAPI>Stopped') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO Apache2.4'; Hash = 'f5b162509d615e0144f9ab8bfce9cf1d346273e44e59b88a6551315b5e1b26a1' }
-        BravoStartFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('BRAVO>Running') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'cb874e107259f1dbbfc2f6c5b69b371736a81b73e1e80d1bed8b4fa064ff343a' }
-        BravoDisabledNoRestore = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Running'; BravoEnabled = $false; BravoDisabled = $true }; Order = 'stop: Apache2.4 exchangAPI | start: exchangAPI Apache2.4'; Hash = 'd8fe2e7ddd8af3ea6493e724e3c993e5eee6ed2d942db636f63a6c75437678d5' }
-        BravoNotInstalled = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped'; BravoEnabled = $false }; Order = 'stop: exchangAPI | start: exchangAPI'; Hash = '2c38150bc11bfea86c02680e010b36113f0cecb4580ff91ebf4f5fb12801e22e' }
-        NoApacheLogs = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; ApacheEnabled = $false; Processes = @() }; Order = 'stop: Apache2.4 exchangAPI BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'b862e5df06e1c2a14852f9d63c81bc16acfa292c8143ff43de8434896eddd559' }
+        AllRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running' }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = '04559c8be40ea57529898ac438fa1935720e1e5b2d7c85650860ca51b5576f53' }
+        OnlyBravoRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Stopped' }; Order = 'stop: kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'b73c13f5cac98d581ee1b2c1f87d9d46c1c5006dffade93386c4e70781827a2d' }
+        OnlyExchangeRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped' }; Order = 'stop: exchangAPI | start: BRAVO exchangAPI Apache2.4'; Hash = 'ddbfe85aa7dc54701d6ceaf984502032560d476146b6150883247d220ae6c804' }
+        OnlyWebRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Running' }; Order = 'stop: Apache2.4 | start: BRAVO exchangAPI Apache2.4'; Hash = '1023df171a69ba9b926391a8895eee4bef5fd0c2fb84a640c958ca9c115e82a0' }
+        BravoAndExchangeRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Stopped' }; Order = 'stop: exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = '6b0d235a11c500877f54f8666c6f918f2cfe165a386735370ab9e27578f6178a' }
+        BravoFailedOthersRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Running' }; Order = 'stop: Apache2.4 exchangAPI | start: BRAVO exchangAPI Apache2.4'; Hash = '7eb4fb00d12931443cb7a5abccb58f6eeabfb03922693220907f76101b476cdf' }
+        AllStopped = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped' }; Order = 'stop:  | start: BRAVO exchangAPI Apache2.4'; Hash = '3391d5389c523068eaad874ff67e0f708defa3e80b66a15c385adfb8d2060a0e' }
+        BravoStartPendingWebPaused = @{ Spec = @{ Bravo = 'StartPending'; Exchange = 'Running'; Web = 'Paused' }; Order = 'stop: exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI'; Hash = '7820af31fee912b7e362b4b705609e13e4c78029f31233610a700dd8fe730518' }
+        ExchangeAndWebUnmanaged = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ExchangeEnabled = $false; ExchangeDisabled = $true; WebEnabled = $false }; Order = 'stop: kill Bis BRAVO | start: BRAVO'; Hash = 'a617ef1e79c8e6809b4cdeea72948c8f3f10a71cf5393727976e5fc31429d854' }
+        BootHoldAllStopped = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped'; BootHold = $true; ShouldRestore = $true }; Order = 'stop:  | start: BRAVO exchangAPI Apache2.4'; Hash = 'd5e9a69f7d9472fbf469e40c3e4fc53432938bcd1ea701687aadaeba345ac19d' }
+        RestoreHoldsAllManaged = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ShouldRestore = $true }; Order = 'stop: Apache2.4 kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = '6d8d01ee8ff7dc2c16f07997ee231a540b17b83b5187f3d5aa4e14c19659680d' }
+        InheritedExchangeIntent = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Stopped'; Foreign = [pscustomobject]@{ Present = $true; OwnerAlive = $false; RestartSuppressed = $false; RestartIntentNames = @('exchangAPI'); Owner = 'BRAVO_MAINTENANCE'; HeldSnapshot = @() }; Conditions = @{ exchangAPI = 'OwnedByBravo' } }; Order = 'stop: kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'fef70ddf21962d79247dad8d8a0704db80c0aca763f8e91a2d2b54da0f497346' }
+        ModelIntegrityNotEstablished = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Integrity = $false }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: '; Hash = 'bba0f62a7854e4c4943ab5d131810cd9a583cfb12192e5aa63eef8c00e8421db' }
+        BravoStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Stopped'; Failures = @('BRAVO>Stopped') }; Order = 'stop: exchangAPI kill Bis BRAVO | start: exchangAPI Apache2.4'; Hash = '4add142801345196e65d64f4f33eaa5ad335cec8c229deca7074db04e28243ac' }
+        ExchangeStartFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('exchangAPI>Running') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'f5e3076b91598d61a588f180d80df4adc45da36448bb7e9a46752928424e6679' }
+        WebStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; Failures = @('Apache2.4>Stopped') }; Order = 'stop: Apache2.4 kill Bis BRAVO | start: BRAVO exchangAPI'; Hash = '62dde77579a5403942b2a27f8f1ff173216f38b6713c67183196b12176adacbe' }
+        DisabledBravoForceRestore = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped'; BravoEnabled = $false; BravoDisabled = $true; RestoreOnDisabledBravo = $true }; Order = 'stop: exchangAPI kill Bis | start: exchangAPI Apache2.4'; Hash = 'b752c332645c737abcdbf10d2ab7a545a87e9d4737f49969da8d4bcea7ad16c5' }
+        ExchangeStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('exchangAPI>Stopped') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO Apache2.4'; Hash = '1a8e477ed2acd85c7a46389b8cdef563682a0774deaac62ce86958993b0cdcb5' }
+        BravoStartFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('BRAVO>Running') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = '874549aa7d4df955beca593b79da74c9045d123a18dbcaf5ac09e4c5e806e094' }
+        BravoDisabledNoRestore = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Running'; BravoEnabled = $false; BravoDisabled = $true }; Order = 'stop: Apache2.4 exchangAPI | start: exchangAPI Apache2.4'; Hash = '1f89afe18b1bd755502fc8ba81d35a19bda610b193bd608312a7863751c1eb25' }
+        BravoNotInstalled = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped'; BravoEnabled = $false }; Order = 'stop: exchangAPI | start: exchangAPI Apache2.4'; Hash = '7052b26159c89c57126529493178c9912f64fe1bc5537a5f2add9e49b52e0f94' }
+        NoApacheLogs = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; ApacheEnabled = $false; Processes = @() }; Order = 'stop: Apache2.4 exchangAPI BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = '1e1141a5aa174f9331491caa98f3d68f4b46f2f967ca88a91a6d46752a182cf9' }
     }
     $lifecycleDiffs = New-Object System.Collections.Generic.List[string]
     $lifecycleActual = [ordered]@{}
@@ -2376,7 +2386,7 @@ function Invoke-BRAVOWebApplicationLogRotation { param([string]$SourceDirectory,
         & $nightlyExpect 'ExchangeFailedStartFails' $run (& $nightlyHas $run "ALERT|True||Не вдалося запустити службу exchangAPI після падіння (ExitCode 1067): fake: exchangAPI не перейшла в Running. Спроба 1 за добу. Журнал: $nightlyLog") 'CRITICAL StartFailed'
         & $nightlyExpect 'ExchangeFailedStartFails' $run (-not ($run.Text -match 'ALERT\|False\|WARNING\|Служба exchangAPI впала')) 'без Recovered'
         & $nightlyExpect 'ExchangeFailedStartFails' $run ((& $nightlyLast $run 'RSTATE-WRITE|') -ceq 'RSTATE-WRITE|exchangAPI=attempts:1,critical:False') 'невдала спроба теж рахується'
-        & $nightlyExpect 'ExchangeFailedStartFails' $run (& $nightlyHas $run 'END|critical=True|warnings=0|restartFailed=True|') 'критична помилка, маркер лишається'
+        & $nightlyExpect 'ExchangeFailedStartFails' $run ((& $nightlyHas $run 'END|critical=True|') -and $run.Text.Contains('|restartFailed=True|')) 'критична помилка, маркер лишається'
         & $nightlyExpect 'ExchangeFailedStartFails' $run ((& $nightlyStarts $run) -ceq 'BRAVO exchangAPI Apache2.4') 'Apache2.4 запускається після невдачі exchangAPI'
 
         # (4) Зупинена служба під маркером BRAVO (OwnedByBravo) — не впала, не запускається.

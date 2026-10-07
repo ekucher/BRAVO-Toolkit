@@ -1529,8 +1529,10 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
                 $rotationIndex -gt 0 -and
                 $rotationIndex -lt $finallyIndex -and
                 $maintenanceScriptText.Contains('$serviceWasRunning') -and
-                $maintenanceScriptText.Contains('if ($serviceWasRunning.ExchangeApi) {') -and
-                $maintenanceScriptText.Contains('if ($serviceWasRunning.BravoWeb) {')
+                # #314 хвиля 3: guard -RunMissedRestoreOnly більше не читає
+                # $serviceWasRunning.* (він дивиться на фактично активні
+                # служби); запуск у finally — за збереженим наміром.
+                $maintenanceScriptText.IndexOf('-RestartIntent $serviceWasRunning', $finallyIndex) -gt $finallyIndex
             ) `
             -Name "LogRotation/27-ServiceRestorationIsIndependentOfRotation" `
             -Failure "ротація має виконуватись усередині try, а відновлення служб — у finally за збереженим початковим станом: помилка ротації не може залишити служби зупиненими"

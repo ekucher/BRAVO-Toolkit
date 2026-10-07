@@ -2,6 +2,31 @@
 
 ## Не випущено (developer)
 
+- **Зміна поведінки: нічний Maintenance запускає впалі служби після обслуговування (#314, хвиля 3, частина 2).**
+  Керована служба, яка на старті прогону зупинена і не є `Disabled` від оператора, `OwnedByBravo` (чинний маркер чи
+  утримання BRAVO) або `NotInstalled` (класифікація `Get-BRAVOManagedServiceCondition`, «впала» = `Failed` і `Stopped`),
+  тепер має намір перезапуску: входить в ownership-маркер з `RestartIntent`, її журнали обробляються, а після
+  обслуговування вона запускається в канонічному порядку BRAVO → exchangAPI → BRAVO Web. Попередження
+  «СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE» (`Send-InactiveServiceWarning`) прибрано; замість нього — INFO
+  «Служба X була зупинена до обслуговування (ExitCode N) — буде запущена після обслуговування». Кожна спроба запуску
+  рахується в `BRAVO_SERVICE_RECOVERY_STATE.json` (нічний прогін паузу між спробами не застосовує, але спробу рахує).
+  Успіх → INFO + сповіщення WARNING «Служба X впала (ExitCode N), журнали збережено, запущена. Спроба K за добу»
+  (без впливу на код завершення); з 3-ї спроби за 24 год — CRITICAL «циклічно падає» (не частіше разу на добу, код
+  завершення не змінює). Невдалий запуск — наявна CRITICAL-гілка (exit 60) з текстом «Не вдалося запустити службу X
+  після падіння (ExitCode N): …». Збій читання/запису state — лише WARNING, запуск не блокується. Guard
+  `-RunMissedRestoreOnly` тепер дивиться на фактично активні служби: впала служба не дає хибного exit 20.
+  Boot-hold профілю робочого часу і `-ForceRestore` при `Disabled` BRAVO (#321) — без змін (Disabled BRAVO не
+  запускається; впалі exchangAPI/BRAVO Web у тому ж прогоні запускаються). Рядок «BRAVO Trace після запуску служби»
+  пишеться лише коли службу BRAVO запустив саме цей прогін. **Увага:** на майданчиках, де служба exchangAPI
+  встановлена, не вимкнена (`Disabled`), але свідомо зупинена, нічний прогін її тепер підніматиме — непотрібну службу
+  слід перевести в `Disabled`. Виправлено `BRAVO.ServiceRecovery`: порожні `lastCriticalAt`/`stableSince` більше не
+  ламають облік спроб (тести модуля PauseLadder і далі не виконувалися). Характеризацію
+  `ServiceRecovery/MaintenanceLifecycleCharacterization` оновлено явно: сценарії без впалих служб мають ту саму трасу
+  без рядка попередження; у сценаріях зі зупиненими службами вони тепер запускаються. Тести:
+  `ServiceRecovery/NightlyMaintenanceStartsFailedServices`, `ServiceRecovery/NightlyMaintenanceDropsInactiveServiceWarning`,
+  `ServiceRecovery/NightlyRecoveredAlertIsWarningCyclicIsCritical`, `ServiceRecovery/LifecyclePlanStartsFailedService`;
+  інвертовано `Notifications/MaintenanceInactiveServices`, оновлено анкер `LogRotation/27-ServiceRestorationIsIndependentOfRotation`.
+
 - **Рефакторинг: цикл «зупинка служб → журнали → запуск» Maintenance винесено у функції без зміни поведінки (#314, хвиля 2).**
   Спершу окремим комітом додано characterization-тест `ServiceRecovery/MaintenanceLifecycleCharacterization`
   (22 сценарії: стани служб, boot-hold, успадкований намір #349, збої зупинки/запуску, Disabled + ForceRestore,
