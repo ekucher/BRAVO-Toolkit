@@ -26,7 +26,16 @@
   `criticalErrorOccurred`/`restoreIntegrityFailed` (exit 41), а в цьому циклі не виконується ні перевірка, ні retention:
   не видаляється нічого. Так само обробляється збій самої перевірки наявності каталогу (`Test-Path` за ACL чи збою
   провайдера): це не вважається відсутнім каталогом. Справді відсутній каталог, як і раніше, дає порожній перелік без
-  помилки. Тести:
+  помилки. ERROR «Не лишилось жодної придатної точки відновлення» з прапорцями exit 41 тепер пишеться завжди, коли не
+  лишилось жодної підтвердженої сесії, незалежно від етапу, на якому сесії забраковано. Раніше умова вимагала збою
+  `7z t`, тож єдина сесія з відсутнім, некоректним, невідповідним чи нечитабельним `.sha512` давала лише exit 10. Це
+  діє і на звичайному шляху retention (сесій більше за `ArchivesKeepCount`, усі забраковано на SHA512). Видалення не
+  розширено: без підтвердженої точки відновлення не видаляється жодна сесія (#422). Крок «Очистка старих даних/логів»
+  має FAIL за збою цілісності архівів реставрації в цьому кроці і тоді, коли `criticalErrorOccurred` уже виставила
+  попередня фаза: облік ведеться власним `-Outcome` (`$restoreArchiveIntegrityOutcome`), а не лише глобальним прапорцем.
+  Каталог архівів реставрації (`ARC_DIR`) тепер переліковується і очищується як буквальний шлях
+  (`-LiteralPath`): символи `[` / `]` у назві каталогу більше не є шаблоном. Раніше такий каталог вважався відсутнім,
+  і перевірка мовчки пропускалась. Тести:
   `Maintenance/RetentionReportOnlyStaleSessionWarnsWithinKeepCount`,
   `Maintenance/RetentionReportOnlyNeverDeletesProvenCorrupt`,
   `Maintenance/RetentionReportOnlySingleBrokenSessionSetsFailureFlags`,
@@ -35,7 +44,11 @@
   `Maintenance/RestoreArchiveEnumerationFailureNoDeletion`,
   `Maintenance/RestoreArchivePathLookupFailureNoDeletion`,
   `Maintenance/RestoreArchiveEnumerationDistinguishesFailureFromEmpty`,
-  `Maintenance/RestoreArchiveMainEnumerationUsesCanonicalHelper`.
+  `Maintenance/RestoreArchiveMainEnumerationUsesCanonicalHelper`,
+  `Maintenance/RetentionReportOnlySoleSessionHashFailureSetsFailureFlags`,
+  `Maintenance/RetentionNoValidRestorePointAfterHashFailureSetsFailureFlags`,
+  `Maintenance/RetentionCleanupStepFailsAfterEarlierCriticalError`,
+  `Maintenance/RestoreArchiveDirectoryWithWildcardCharsIsLiteral`.
 
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
