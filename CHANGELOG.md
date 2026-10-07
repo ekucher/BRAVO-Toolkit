@@ -2,7 +2,6 @@
 
 ## Не випущено (developer)
 
-<<<<<<< HEAD
 - **Perf: проби loader-а в self-test ConfigLoader виконуються в одному дочірньому процесі.**
   84 проби `Import-BravoConfiguration` (local-config, BusyWait/SuccessDedup/storage-switch, intent-матриця, parity,
   security-downgrade, PrimaryStrictness, атомарність, PostUpdate/Malformed) раніше запускали окремий `powershell.exe`
@@ -16,7 +15,6 @@
   (важить код виходу). Нова перевірка `ConfigLoader/ProbesShareOneChildProcess` звіряє кількість проб і результатів,
   один PID раннера (не батьківський) і відсутність витоку канарок (глобальної змінної й змінної середовища) між
   пробами. Production-код не змінено.
-=======
 - **Hardening: придатність сесій архівів реставрації перевіряється й тоді, коли сесій не більше за `ArchivesKeepCount` (#424).**
   Повторну перевірку сесій (SHA512 + `7z t`) і всю діагностику придатності виконує лише retention
   (`Remove-OldRestoreArchives`), а Main запускав його тільки тоді, коли сесій більше за `Restore.ArchivesKeepCount`.
@@ -68,7 +66,6 @@
   `Maintenance/RetentionCleanupStepFailsAfterEarlierCriticalError`,
   `Maintenance/RestoreArchiveDirectoryWithWildcardCharsIsLiteral`.
 
->>>>>>> origin/developer
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
   `Get-BRAVOCredentialSecureSecret` у приватний `Add-BRAVOCredentialReadSecretRecord` із власним try/catch: збій обліку
