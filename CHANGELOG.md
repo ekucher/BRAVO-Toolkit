@@ -2,6 +2,12 @@
 
 ## Не випущено (developer)
 
+- **Fix: Dry run публікує результат `-ResultPath` атомарно (#306).**
+  `BRAVO_TASKS_DIAGNOSE` опитує появу `dry-run.json` і одразу читає його, а dry run писав JSON прямо
+  в кінцевий файл. Diagnose міг прочитати порожній чи частковий файл або натрапити на sharing violation
+  і завершитись помилкою, що валило крок 5 `BRAVO_SETUP` і гейт `Update-BRAVOServer`. Тепер
+  `Write-DryRunOutput` пише повний JSON у тимчасовий файл поруч і переносить його на `ResultPath`
+  через `Move-Item` (як воркер `BRAVO_CREDENTIALS_SETUP`); тимчасовий файл прибирається і при збої.
 - **Fix: SFTP: імена з `[`/`]` більше не трактуються WinSCP як маска (#366).**
   WinSCP читає останній сегмент локального джерела `PutFiles`, шляху `RemoveFiles` і джерела `MoveFile`
   як файлову маску (`*`, `?`, `[...]`), а Windows дозволяє `[`/`]` в іменах. Тож `doc[1].txt` збігався з
