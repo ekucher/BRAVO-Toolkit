@@ -8777,6 +8777,66 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 ) `
                 -Name 'Archive/EstimatedSpaceSingleLargeFileNotPenalised' `
                 -Failure "#279: один великий файл (1000000 B) має давати оцінку 1020000 B + не більше 1 KB метаданих; факт: EstimatedBytes=$($estimateBigFile.ComponentEstimates[0].EstimatedBytes)"
+
+            # #400: дерево з нульовим сумарним розміром, але з файлами, теж
+            # дає оцінку — метадані записів 7-Zip не зникають від того, що
+            # файли порожні. 3 порожні файли з іменем 11 символів:
+            # 3 * (256 + 2*11 + 2) = 840 B.
+            $zeroSizeSource = Join-Path $estimatedSpaceTestRoot 'ZEROSIZE_SRC'
+            $zeroSizeDest = Join-Path $estimatedSpaceTestRoot 'ZEROSIZE_DEST'
+            [void][IO.Directory]::CreateDirectory($zeroSizeSource)
+            [void][IO.Directory]::CreateDirectory($zeroSizeDest)
+            foreach ($zeroSizeName in @('empty_a.txt', 'empty_b.txt', 'empty_c.txt')) {
+                [IO.File]::WriteAllBytes((Join-Path $zeroSizeSource $zeroSizeName), (New-Object byte[] 0))
+            }
+            $estimateZeroSize = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BLOG'; Source = (Join-Path $zeroSizeSource '*'); Destination = $zeroSizeDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateZeroSize.ComponentEstimates[0].SourceBytes -eq 0 -and
+                    $estimateZeroSize.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
+                    $estimateZeroSize.ComponentEstimates[0].EstimatedBytes -eq 840
+                ) `
+                -Name 'Archive/EstimatedSpaceZeroSizeTreeCountsMetadata' `
+                -Failure "#400: 3 порожні файли мають давати оцінку за метаданими 3*(256+2*11+2) = 840 B, а не нульову/невідому; факт: SourceBytes=$($estimateZeroSize.ComponentEstimates[0].SourceBytes), basis=$($estimateZeroSize.ComponentEstimates[0].EstimateBasis), EstimatedBytes=$($estimateZeroSize.ComponentEstimates[0].EstimatedBytes)"
+
+            # #400: точне значення для вкладеного дерева. 7-Zip зберігає
+            # окремі записи для каталогів, тож вони рахуються так само, як
+            # файли (256 B + ім'я). Відносні імена: sub (3), sub\deep (8),
+            # sub\inner.bin (13, 10 B), sub\deep\x.bin (14, 5 B):
+            # ceil(15*1.02)=16 + 4*256 + (8+18+28+30) = 1124 B.
+            $nestedSource = Join-Path $estimatedSpaceTestRoot 'NESTED_SRC'
+            $nestedDest = Join-Path $estimatedSpaceTestRoot 'NESTED_DEST'
+            [void][IO.Directory]::CreateDirectory((Join-Path (Join-Path $nestedSource 'sub') 'deep'))
+            [void][IO.Directory]::CreateDirectory($nestedDest)
+            [IO.File]::WriteAllBytes((Join-Path (Join-Path $nestedSource 'sub') 'inner.bin'), (New-Object byte[] 10))
+            [IO.File]::WriteAllBytes((Join-Path (Join-Path (Join-Path $nestedSource 'sub') 'deep') 'x.bin'), (New-Object byte[] 5))
+            $estimateNested = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'MODEL'; Source = (Join-Path $nestedSource '*'); Destination = $nestedDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateNested.ComponentEstimates[0].SourceBytes -eq 15 -and
+                    $estimateNested.ComponentEstimates[0].SourceFileCount -eq 2 -and
+                    $estimateNested.ComponentEstimates[0].EstimatedBytes -eq 1124
+                ) `
+                -Name 'Archive/EstimatedSpaceNestedTreeExactWithDirectoryEntries' `
+                -Failure "#400: вкладене дерево (2 файли, 2 каталоги) має давати рівно 16 + 4*256 + 84 = 1124 B (каталоги рахуються як записи 7-Zip); факт: SourceBytes=$($estimateNested.ComponentEstimates[0].SourceBytes), files=$($estimateNested.ComponentEstimates[0].SourceFileCount), EstimatedBytes=$($estimateNested.ComponentEstimates[0].EstimatedBytes)"
         }
 
         # D: два компоненти на одному диску — потреби сумуються на цей диск,

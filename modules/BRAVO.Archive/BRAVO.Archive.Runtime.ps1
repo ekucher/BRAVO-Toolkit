@@ -6119,8 +6119,8 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     # розмір джерела. У найгірший випадок 7-Zip (store-режим) архів не
     # менший за джерело плюс контейнерні накладні витрати; з #279 оцінка
     #   sourceBytes * (1 + SourceOverheadPercent/100)
-    #     + fileCount * PerFileOverheadBytes + сума (2 * довжина відносного
-    #       імені + термінатор) по файлах
+    #     + (fileCount + dirCount) * PerFileOverheadBytes + сума (2 * довжина
+    #       відносного імені + термінатор) по файлах і каталогах (#400)
     # є КОНСЕРВАТИВНОЮ оцінкою з урахуванням per-file метаданих, а не
     # доведеною межею (і не прогнозом): відсоток не обмежує заголовки/імена
     # записів (багато дрібних файлів або довгі шляхи), тож метадані
@@ -6137,9 +6137,10 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     #     довелось закрити по-справжньому.
     # Джерело, розмір якого виміряти не вдалось (шлях недоступний, порожній
     # або не заданий), лишає компонент без вимоги — як і до 5.2.4. Так само
-    # без вимоги лишається джерело, виміряне успішно з нульовим розміром
-    # (порожній каталог або лише файли нульової довжини): sourceBytes -eq 0
-    # не дає верхньої оцінки, і SourceUpperBoundBytes/EstimatedBytes = $null.
+    # без вимоги лишається джерело, в якому немає жодного файлу (порожній
+    # каталог): SourceUpperBoundBytes/EstimatedBytes = $null. #400: дерево з
+    # файлами нульової довжини оцінку МАЄ — метадані записів 7-Zip від
+    # розміру файлів не залежать; каталоги рахуються як окремі записи.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object[]]$EnabledArchives,
@@ -6151,7 +6152,8 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
         # на несжимаємих даних архів може вийти на частки відсотка більшим
         # за вхід — 2% покривають це з запасом і не роблять межу марною.
         [double]$SourceOverheadPercent = 2.0,
-        # #279: консервативна оцінка метаданих 7-Zip на ОДИН запис (файл):
+        # #279: консервативна оцінка метаданих 7-Zip на ОДИН запис (файл;
+        # з #400 і каталог — 7-Zip зберігає для нього окремий запис):
         # заголовок у central/end header — атрибути, часи (до 3 x 8 B),
         # розміри, CRC, прапорці емпті-потоку, посилання на folder/substream
         # — разом зазвичай кілька десятків байтів; 256 B свідомо з великим
@@ -6183,6 +6185,8 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
         # #279: кількість файлів і байти імен з ТОГО Ж проходу, що міряє
         # sourceBytes. Для SourceSizeOverrides (лише байти) метаданих немає.
         $sourceFileCount = [int64]0
+        # #400: 7-Zip зберігає окремий запис і для кожного каталогу.
+        $sourceDirectoryCount = [int64]0
         $sourceNameBytes = [int64]0
         if ($PSBoundParameters.ContainsKey('SourceSizeOverrides') -and
             $SourceSizeOverrides.ContainsKey($componentType)) {
@@ -6229,15 +6233,20 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
                         }
                         $measuredBytes = [int64]0
                         $measuredFiles = [int64]0
+                        $measuredDirectories = [int64]0
                         $measuredNameBytes = [int64]0
                         # Потоково (конвеєр), а не foreach по готовому масиву:
                         # на дереві з мільйонами файлів не тримати всі FileInfo
                         # у пам'яті. ForEach-Object виконується в цій самій
                         # області, тож лічильники накопичуються тут.
-                        Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force -ErrorAction Stop | ForEach-Object {
+                        Get-ChildItem -LiteralPath $sourcePath -Recurse -Force -ErrorAction Stop | ForEach-Object {
                             $sourceFile = $_
-                            $measuredBytes += [int64]$sourceFile.Length
-                            $measuredFiles++
+                            if ($sourceFile.PSIsContainer) {
+                                $measuredDirectories++
+                            } else {
+                                $measuredBytes += [int64]$sourceFile.Length
+                                $measuredFiles++
+                            }
                             # Відносне ім'я, як його збереже 7-Zip (UTF-16:
                             # 2 B на символ) + 2 B термінатор.
                             $fullName = [string]$sourceFile.FullName
@@ -6250,6 +6259,7 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
                         }
                         $sourceBytes = $measuredBytes
                         $sourceFileCount = $measuredFiles
+                        $sourceDirectoryCount = $measuredDirectories
                         $sourceNameBytes = $measuredNameBytes
                     }
                 } catch {
@@ -6261,10 +6271,11 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
                 }
             }
         }
-        # Порожнє чи нульове джерело НЕ дає стелі: інакше воно обнулило б
-        # вимогу компонента, який насправді має що архівувати.
-        $sourceMetadataBytes = ($sourceFileCount * [int64]$PerFileOverheadBytes) + $sourceNameBytes
-        $sourceUpperBoundBytes = if ($null -ne $sourceBytes -and $sourceBytes -gt 0) {
+        # Джерело без жодного файлу НЕ дає стелі: інакше воно обнулило б
+        # вимогу компонента, який насправді має що архівувати. Файли нульової
+        # довжини стелю дають (#400): архів з них — це їхні метадані.
+        $sourceMetadataBytes = (($sourceFileCount + $sourceDirectoryCount) * [int64]$PerFileOverheadBytes) + $sourceNameBytes
+        $sourceUpperBoundBytes = if ($null -ne $sourceBytes -and ($sourceBytes -gt 0 -or $sourceFileCount -gt 0)) {
             [int64][math]::Ceiling($sourceBytes * (1.0 + ($SourceOverheadPercent / 100.0))) + $sourceMetadataBytes
         } else {
             $null
@@ -6286,6 +6297,7 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
                 LastValidBytes = $null
                 SourceBytes = $sourceBytes
                 SourceFileCount = $sourceFileCount
+                SourceDirectoryCount = $sourceDirectoryCount
                 SourceMetadataBytes = $sourceMetadataBytes
                 SourceUpperBoundBytes = $sourceUpperBoundBytes
                 EstimateBasis = $(if ($null -ne $sourceUpperBoundBytes) { 'SourceUpperBound' } else { 'Unknown' })
@@ -6308,6 +6320,7 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
             LastValidBytes = $lastBytes
             SourceBytes = $sourceBytes
             SourceFileCount = $sourceFileCount
+            SourceDirectoryCount = $sourceDirectoryCount
             SourceMetadataBytes = $sourceMetadataBytes
             SourceUpperBoundBytes = $sourceUpperBoundBytes
             EstimateBasis = $estimateBasis
@@ -6411,8 +6424,8 @@ function Resolve-BRAVOArchiveSpaceDecision {
     #     Get-BRAVOArchiveEstimatedSpaceRequirement; з 5.2.4 компонент без
     #     валідної історії несе вимогу з нестиснутого розміру джерела, і
     #     RequiredGB лишається невідомим, коли джерело виміряти не вдалось
-    #     або виміряний розмір нульовий (порожнє джерело чи лише файли
-    #     нульової довжини) — тоді GroupRequirementState=Unknown, safe floor
+    #     або в ньому немає жодного файлу (порожній каталог; з #400 файли
+    #     нульової довжини оцінку дають) — тоді GroupRequirementState=Unknown, safe floor
     #     fallback BelowFallbackFloorNoEstimate).
     #
     # ВАЖЛИВО (5.2.4, замінює рішення reviewer #2 від 2026-08-30):
@@ -7429,8 +7442,8 @@ function Main {
     # кожного компонента + запас), а не лише "диск ОС не забитий впритул".
     # Компонент без історії з 5.2.4 оцінюється верхньою оцінкою з
     # розміру джерела; без вимоги лишається лише компонент, джерело якого
-    # виміряти не вдалось або виміряний розмір якого нульовий (порожнє
-    # джерело чи лише файли нульової довжини).
+    # виміряти не вдалось або в якому немає жодного файлу (порожній
+    # каталог; з #400 файли нульової довжини оцінку дають).
     try {
         $archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement `
             -EnabledArchives $enabledArchives `
