@@ -1409,6 +1409,150 @@ Test-BRAVOCondition `
     -Name 'Credentials/ProtectedPayloadWorkerReportsOperationsStarted' `
     -Failure "Invoke-ProtectedPayloadWorker мусить писати OperationsStarted: `$false для збою до операцій зі сховищем (payload) і `$true, щойно почалась транзакція сховища (збій або успіх); факт: moduleError='$credWorkerModuleError' $credWorkerSummary"
 
+# #302 (перевідкрито за A49): наскрізний доказ без заглушок JSON і
+# дешифрування. Справжній Invoke-ProtectedPayloadWorker читає payload і пише
+# result.json справжніми функціями BRAVO.Compatibility; справжній
+# Unprotect-LocalMachineSecret отримує валідний base64, який не є
+# DPAPI-блоком (Action=Set), і кидає виняток. Батьківський бік читає файл
+# тим самим ланцюгом, що й Invoke-AsSystem (Read-BRAVOTextFile |
+# ConvertFrom-BRAVOJson -> Test-SystemWorkerResponseFailed ->
+# New-SystemWorkerFatalError), і маркер «не розпочато» мусить пережити
+# JSON-round-trip. Контроль: збій уже в транзакції сховища (Action=Remove)
+# дає OperationsStarted=$true і жодного маркера; успіх - не збій.
+$credRoundTripStubText = @'
+$script:credRoundTripTransactionCalls = 0
+function Invoke-CredentialOperationsTransactional {
+    param([string]$Operation, $Entries)
+    $script:credRoundTripTransactionCalls++
+    if ($script:credRoundTripScenario -eq 'StoreFailure') { throw 'stub: store write failed' }
+    return @([pscustomobject]@{ Component = 'COMP'; Target = 'TARGET'; Status = 'Removed'; Message = '' })
+}
+'@
+$credRoundTripModule = $null
+$credRoundTripModuleError = $null
+try {
+    $credRoundTripModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($credRollbackText + "`r`n" + $credRoundTripStubText) `
+        -PreferLastDefinitionOnDuplicate `
+        -FunctionNames @(
+            'Invoke-ProtectedPayloadWorker', 'Get-SystemWorkerFatalErrorText', 'Unprotect-LocalMachineSecret',
+            'Test-SystemWorkerResponseFailed', 'New-SystemWorkerFatalError', 'Add-SystemWorkerNotStartedMarker',
+            'Test-SystemWorkerNotStartedError', 'Invoke-CredentialOperationsTransactional'
+        )
+} catch {
+    $credRoundTripModuleError = $_.Exception.Message
+}
+$credRoundTripRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CRED_ROUNDTRIP_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($credRoundTripRoot)
+$credRoundTripOutcomes = @{}
+try {
+    if ($null -ne $credRoundTripModule) {
+        foreach ($credRoundTripScenario in @('DecryptFailure', 'StoreFailure', 'Success')) {
+            $credRoundTripOutcomes[$credRoundTripScenario] = & $credRoundTripModule {
+                param($Scenario, $WorkRoot, $CompatibilityManifest)
+                Set-StrictMode -Version Latest
+                Import-Module -Name $CompatibilityManifest -ErrorAction Stop
+                $script:credRoundTripScenario = $Scenario
+                $script:credRoundTripTransactionCalls = 0
+                # Валідний base64 випадкових байтів: FromBase64String проходить,
+                # а ProtectedData.Unprotect відкидає дані (не DPAPI-блок).
+                $randomBytes = New-Object byte[] 48
+                (New-Object Random 302).NextBytes($randomBytes)
+                $payload = [ordered]@{
+                    Action = $(if ($Scenario -eq 'DecryptFailure') { 'Set' } else { 'Remove' })
+                    Entries = @([ordered]@{
+                        Component = 'COMP'; Target = 'TARGET'; UserName = 'user'
+                        ProtectedSecret = $(if ($Scenario -eq 'DecryptFailure') { [Convert]::ToBase64String($randomBytes) } else { '' })
+                    })
+                }
+                $payloadPath = Join-Path $WorkRoot "$Scenario.payload.json"
+                $resultPath = Join-Path $WorkRoot "$Scenario.result.json"
+                [IO.File]::WriteAllText($payloadPath, ($payload | ConvertTo-BRAVOJson -Depth 6), [Text.Encoding]::UTF8)
+                $workerThrew = ''
+                try {
+                    Invoke-ProtectedPayloadWorker -PayloadPath $payloadPath -WorkerResultPath $resultPath
+                } catch {
+                    $workerThrew = [string]$_.Exception.Message
+                }
+                $response = $null
+                $readError = ''
+                try {
+                    $response = Read-BRAVOTextFile -Path $resultPath | ConvertFrom-BRAVOJson
+                } catch {
+                    $readError = [string]$_.Exception.Message
+                }
+                $startedProperty = $(if ($null -ne $response) { $response.PSObject.Properties['OperationsStarted'] } else { $null })
+                $failed = Test-SystemWorkerResponseFailed -WorkerResponse $response
+                $notStarted = $false
+                $fatalText = ''
+                if ($failed) {
+                    $fatalError = New-SystemWorkerFatalError -WorkerResponse $response
+                    $fatalText = [string]$fatalError.Message
+                    try {
+                        throw $fatalError
+                    } catch {
+                        $notStarted = [bool](Test-SystemWorkerNotStartedError -ErrorRecord $_)
+                    }
+                }
+                [pscustomobject]@{
+                    WorkerThrew = $workerThrew
+                    ReadError = $readError
+                    StartedIsBool = ($null -ne $startedProperty -and $startedProperty.Value -is [bool])
+                    Started = $(if ($null -ne $startedProperty) { [string]$startedProperty.Value } else { '<немає>' })
+                    Failed = [bool]$failed
+                    NotStarted = $notStarted
+                    FatalText = $fatalText
+                    TransactionCalls = [int]$script:credRoundTripTransactionCalls
+                }
+            } $credRoundTripScenario $credRoundTripRoot (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1')
+        }
+    }
+} catch {
+    $credRoundTripModuleError = "scenario: $($_.Exception.Message)"
+} finally {
+    Remove-Item -LiteralPath $credRoundTripRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+$credRoundTripSummary = (@($credRoundTripOutcomes.Keys | Sort-Object) | ForEach-Object {
+    $o = $credRoundTripOutcomes[$_]
+    "$_=started:$($o.Started)/bool:$($o.StartedIsBool)/failed:$($o.Failed)/notStarted:$($o.NotStarted)/tx:$($o.TransactionCalls)/fatal:'$($o.FatalText)'/read:'$($o.ReadError)'/threw:'$($o.WorkerThrew)'"
+}) -join '; '
+$credRoundTripHas = {
+    param([string]$Name)
+    return ($credRoundTripOutcomes.ContainsKey($Name) -and $null -ne $credRoundTripOutcomes[$Name])
+}
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credRoundTripModuleError -and
+        (& $credRoundTripHas 'DecryptFailure') -and
+        $credRoundTripOutcomes['DecryptFailure'].WorkerThrew -eq '' -and
+        $credRoundTripOutcomes['DecryptFailure'].ReadError -eq '' -and
+        $credRoundTripOutcomes['DecryptFailure'].StartedIsBool -and
+        $credRoundTripOutcomes['DecryptFailure'].Started -eq 'False' -and
+        $credRoundTripOutcomes['DecryptFailure'].Failed -and
+        $credRoundTripOutcomes['DecryptFailure'].NotStarted -and
+        $credRoundTripOutcomes['DecryptFailure'].TransactionCalls -eq 0 -and
+        -not [string]::IsNullOrWhiteSpace($credRoundTripOutcomes['DecryptFailure'].FatalText)
+    ) `
+    -Name 'Credentials/WorkerDecryptFailureRoundTripMarksNotStarted' `
+    -Failure "збій дешифрування payload (Action=Set) мусить дати в справжньому result.json булеве OperationsStarted=`$false, а батьківський ланцюг Invoke-AsSystem - виняток з маркером «не розпочато»; факт: moduleError='$credRoundTripModuleError' $credRoundTripSummary"
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credRoundTripModuleError -and
+        (& $credRoundTripHas 'StoreFailure') -and
+        (& $credRoundTripHas 'Success') -and
+        $credRoundTripOutcomes['StoreFailure'].StartedIsBool -and
+        $credRoundTripOutcomes['StoreFailure'].Started -eq 'True' -and
+        $credRoundTripOutcomes['StoreFailure'].Failed -and
+        -not $credRoundTripOutcomes['StoreFailure'].NotStarted -and
+        $credRoundTripOutcomes['StoreFailure'].TransactionCalls -eq 1 -and
+        $credRoundTripOutcomes['StoreFailure'].FatalText -eq 'stub: store write failed' -and
+        $credRoundTripOutcomes['Success'].ReadError -eq '' -and
+        -not $credRoundTripOutcomes['Success'].Failed -and
+        $credRoundTripOutcomes['Success'].TransactionCalls -eq 1
+    ) `
+    -Name 'Credentials/WorkerStoreFailureRoundTripStaysUndetermined' `
+    -Failure "контроль: збій у транзакції сховища після JSON-round-trip має OperationsStarted=`$true і без маркера «не розпочато», а успіх не є збоєм; факт: moduleError='$credRoundTripModuleError' $credRoundTripSummary"
+
 # #395: порожній текст винятку SYSTEM-worker-а не повинен виглядати успіхом.
 # Батьківський бік: FatalError = "" (або пробіли, або без поля) — збій;
 # лише $null — успіх. Виняток для порожнього тексту має зрозуміле повідомлення.
