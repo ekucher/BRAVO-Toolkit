@@ -254,7 +254,9 @@ Remove-Item -LiteralPath $maintenanceOwnLogTestRoot -Recurse -Force -ErrorAction
 # (BRAVO.Credentials), Protect-BRAVOLogSecret / New-BRAVOMaskedLogCopy /
 # Remove-BRAVOMaskedLogCopy (BRAVO.Logging), Get-BRAVODefaultConfiguration
 # (BRAVO.Configuration). Стаби — лише на зовнішніх межах: читання
-# Credential Manager (Get-BRAVOCredentialSecret), SFTP-сесія/транспорт
+# Credential Manager (Get-BRAVOCredential — сам CredRead; ланцюг
+# Get-BRAVOCredentialSecureSecret / Get-BRAVOCredentialSecret /
+# ConvertFrom-BRAVOSecureSecret — справжній), SFTP-сесія/транспорт
 # (Connect-BRAVOOwnLogSftpSession, Send-BRAVOTraceArchiveFile,
 # New-BRAVOBazaRemoteDirectoryRecursive) і лог-синк (Write-Log).
 # Усі секрети нижче — синтетичні плейсхолдери.
@@ -329,7 +331,10 @@ function Get-BRAVOSelfTestLeakedSecretKeys {
 
 $secretMaskStub = @'
 function Write-Log { param([string]$Message, [string]$Level = "INFO") [void]$script:secretMaskTestState.LogLines.Add("[$Level] $Message") }
-function Get-BRAVOCredentialSecret {
+function Get-BRAVOCredential {
+    # Межа = сам CredRead ([BRAVO.Security.CredentialManager]::ReadGeneric):
+    # повертає StoredCredential-подібний об'єкт із SecureString, $null для
+    # відсутнього запису, Win32Exception для недоступного.
     param([string]$Target)
     [void]$script:secretMaskTestState.ReadTargets.Add($Target)
     if (@($script:secretMaskTestState.ThrowTargets) -contains $Target) {
@@ -338,7 +343,17 @@ function Get-BRAVOCredentialSecret {
         # його переказати.
         throw (New-Object System.ComponentModel.Win32Exception(5, ("synthetic CredRead failure for '" + $Target + "' " + $script:secretMaskTestState.ExceptionPayload)))
     }
-    if ($script:secretMaskTestState.SecretByTarget.ContainsKey($Target)) { return [string]$script:secretMaskTestState.SecretByTarget[$Target] }
+    if (@($script:secretMaskTestState.CorruptTargets) -contains $Target) {
+        # CredRead УСПІШНИЙ, але подальша обробка значення падає (тут —
+        # перетворення SecureString -> рядок). Це НЕ збій читання.
+        return [pscustomobject]@{ TargetName = $Target; UserName = ''; Secret = [pscustomobject]@{ SelfTestCorrupt = $true } }
+    }
+    if ($script:secretMaskTestState.SecretByTarget.ContainsKey($Target)) {
+        $selfTestSecure = New-Object System.Security.SecureString
+        foreach ($selfTestChar in ([string]$script:secretMaskTestState.SecretByTarget[$Target]).ToCharArray()) { $selfTestSecure.AppendChar($selfTestChar) }
+        $selfTestSecure.MakeReadOnly()
+        return [pscustomobject]@{ TargetName = $Target; UserName = ''; Secret = $selfTestSecure }
+    }
     return $null
 }
 function Connect-BRAVOOwnLogSftpSession { $script:secretMaskTestState.ConnectCalls++; return [pscustomobject]@{ IsFake = $true } }
@@ -358,8 +373,9 @@ function Get-BRAVOSystemRangeIdLogPath { return $script:secretMaskTestState.Rang
 '@
 
 $secretMaskSourceText = $secretMaskStub + "`n" + $maintenanceOwnLogScriptText + "`n" + $secretMaskCredentialsText + "`n" + $secretMaskLoggingText + "`n" + $secretMaskConfigurationText
-$secretMaskBoundaryAndUploadFunctions = @(
-    'Write-Log', 'Get-BRAVOCredentialSecret', 'Connect-BRAVOOwnLogSftpSession',
+$secretMaskCredentialReadChain = @('Get-BRAVOCredential', 'Get-BRAVOCredentialSecureSecret', 'ConvertFrom-BRAVOSecureSecret', 'Get-BRAVOCredentialSecret')
+$secretMaskBoundaryAndUploadFunctions = $secretMaskCredentialReadChain + @(
+    'Write-Log', 'Connect-BRAVOOwnLogSftpSession',
     'New-BRAVOBazaRemoteDirectoryRecursive', 'Send-BRAVOTraceArchiveFile', 'Get-BRAVOFileHash',
     'Get-BRAVOSystemRangeIdLogPath', 'Send-BRAVOOwnLogFile', 'Invoke-BRAVOMaintenanceOwnLogUpload'
 )
@@ -400,6 +416,7 @@ function Invoke-BRAVOSelfTestSecretMaskScenario {
         [Parameter(Mandatory = $true)][hashtable]$SecretByTarget,
         [Parameter(Mandatory = $true)][hashtable]$TargetsConfig,
         [string[]]$ThrowTargets = @(),
+        [string[]]$CorruptTargets = @(),
         [string]$ExceptionPayload = '',
         [string]$RangeIdLogPath = '',
         [bool]$LockLogFile = $false
@@ -410,13 +427,14 @@ function Invoke-BRAVOSelfTestSecretMaskScenario {
     }
     try {
         & $Module {
-            param($logFilePath, $secretByTarget, $targetsConfig, $throwTargets, $exceptionPayload, $rangeIdLogPath)
+            param($logFilePath, $secretByTarget, $targetsConfig, $throwTargets, $exceptionPayload, $rangeIdLogPath, $corruptTargets)
             $script:secretMaskTestState = [pscustomobject]@{
                 LogLines         = (New-Object System.Collections.Generic.List[string])
                 ReadTargets      = (New-Object System.Collections.Generic.List[string])
                 Uploads          = (New-Object System.Collections.Generic.List[object])
                 SecretByTarget   = $secretByTarget
                 ThrowTargets     = @($throwTargets)
+                CorruptTargets   = @($corruptTargets)
                 ExceptionPayload = $exceptionPayload
                 RangeIdLogPath   = $rangeIdLogPath
                 ConnectCalls     = 0
@@ -444,7 +462,7 @@ function Invoke-BRAVOSelfTestSecretMaskScenario {
                 LeftoverCopies = @($leftoverCopies).Count
                 InvokeError    = $invokeError
             }
-        } $LogFilePath $SecretByTarget $TargetsConfig $ThrowTargets $ExceptionPayload $RangeIdLogPath
+        } $LogFilePath $SecretByTarget $TargetsConfig $ThrowTargets $ExceptionPayload $RangeIdLogPath $CorruptTargets
     } finally {
         if ($null -ne $lockHandle) { $lockHandle.Dispose() }
     }
@@ -627,7 +645,7 @@ if ($null -ne $secretMaskModule) {
             $script:secretMaskTestState = [pscustomobject]@{
                 LogLines = (New-Object System.Collections.Generic.List[string]); ReadTargets = (New-Object System.Collections.Generic.List[string])
                 Uploads = (New-Object System.Collections.Generic.List[object]); SecretByTarget = $secretByTarget
-                ThrowTargets = @($throwTarget); ExceptionPayload = $payload; RangeIdLogPath = ''; ConnectCalls = 0
+                ThrowTargets = @($throwTarget); CorruptTargets = @(); ExceptionPayload = $payload; RangeIdLogPath = ''; ConnectCalls = 0
             }
             Get-BRAVOLogMaskSecretSet -CredentialSettings @{ Targets = $targetsConfig }
         } $secretMaskSetSecrets $secretMaskTargetsConfig ("leak " + $secretMaskSyntheticByKey['SFTPPassword']) $secretMask7zTarget
@@ -779,5 +797,156 @@ Test-BRAVOCondition (
     [string]::IsNullOrEmpty([string]$secretMaskLockedResult.InvokeError)
 ) -Name 'Maintenance/OwnLogUploadFailsClosedWhenMaskedCopyUnavailable' `
     -Failure "збій маскування (копію не створено) — fail-closed: жодної передачі немаскованого логу, WARNING без секретів, виняток назовні не йде; uploads=$($secretMaskLockedUploads.Count); помилка: $secretMaskSetupError"
+
+# ============================================================
+# #365 review (P2): секрет, прочитаний РАНІШЕ в цьому ж процесі, лишається
+# в наборі маскування, навіть якщо до моменту вивантаження запис змінили
+# (ротація BRAVO_7Z_PASSWORD під час довгого Archive), видалили (Operations
+# видаляє API-ключ на 401) або він став нечитабельним. Перечитування лише в
+# момент вивантаження дає тільки ПОТОЧНЕ значення — старе, яке вже могло
+# потрапити в журнал, вивантажилось би як є.
+# Кожен сценарій — у власному свіжому модулі (окремий "процес").
+# ============================================================
+$secretMaskEarlyFunctions = $secretMaskCredentialReadChain + @('Get-BRAVOCredentialTargetName', 'Get-BRAVOLogMaskSecretSet')
+$secretMaskEarlyByKey = [ordered]@{
+    ArchivePasswordBeforeRotation = (& $secretMaskNewValue 'Arch7zOld!')
+    ArchivePasswordAfterRotation  = (& $secretMaskNewValue 'Arch7zNew!')
+    SMBPasswordDeletedMidRun      = (& $secretMaskNewValue 'SmbOld#')
+    OperationsApiKeyUnreadable    = (& $secretMaskNewValue 'opsOld-')
+}
+$secretMaskEarlyResult = $null
+$secretMaskEarlyError = ''
+try {
+    $secretMaskEarlyModule = New-BRAVOSelfTestRuntimeModule -SourceText $secretMaskSourceText -FunctionNames $secretMaskEarlyFunctions
+    $secretMaskEarlyResult = & $secretMaskEarlyModule {
+        param($targetsConfig, $early)
+        $credentialSettings = @{ Targets = $targetsConfig }
+        $sevenZipTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
+        $smbTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SMBPassword'
+        $opsApiTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'OperationsApiKey'
+        $secretByTarget = @{}
+        $secretByTarget[$sevenZipTarget] = $early['ArchivePasswordBeforeRotation']
+        $secretByTarget[$smbTarget] = $early['SMBPasswordDeletedMidRun']
+        $secretByTarget[$opsApiTarget] = $early['OperationsApiKeyUnreadable']
+        $script:secretMaskTestState = [pscustomobject]@{
+            LogLines = (New-Object System.Collections.Generic.List[string]); ReadTargets = (New-Object System.Collections.Generic.List[string])
+            Uploads = (New-Object System.Collections.Generic.List[object]); SecretByTarget = $secretByTarget
+            ThrowTargets = @(); CorruptTargets = @(); ExceptionPayload = ''; RangeIdLogPath = ''; ConnectCalls = 0
+        }
+        # Раніше в прогоні runtime читає секрети справжніми getter-ами:
+        # плейнтекстовим (7-Zip, API-ключ) і SecureString-шляхом (SMB).
+        [void](Get-BRAVOCredentialSecret -Target $sevenZipTarget)
+        [void](Get-BRAVOCredentialSecret -Target $opsApiTarget)
+        [void](Get-BRAVOCredentialSecureSecret -Target $smbTarget)
+        # До вивантаження: 7-Zip ротовано, SMB видалено, API-ключ нечитабельний.
+        $secretByTarget[$sevenZipTarget] = $early['ArchivePasswordAfterRotation']
+        $secretByTarget.Remove($smbTarget)
+        $script:secretMaskTestState.ThrowTargets = @($opsApiTarget)
+        Get-BRAVOLogMaskSecretSet -CredentialSettings $credentialSettings
+    } $secretMaskTargetsConfig $secretMaskEarlyByKey
+} catch { $secretMaskEarlyError = $_.Exception.GetType().FullName }
+$secretMaskEarlyValues = @()
+$secretMaskEarlySkippedText = ''
+if ($null -ne $secretMaskEarlyResult) {
+    $secretMaskEarlyValues = @($secretMaskEarlyResult.Secrets)
+    $secretMaskEarlySkippedText = (@($secretMaskEarlyResult.Skipped | ForEach-Object { "$($_.Target)=$($_.Reason)" }) -join '; ')
+}
+$secretMaskEarlyMissing = New-Object System.Collections.Generic.List[string]
+foreach ($secretMaskKey in @($secretMaskEarlyByKey.Keys)) {
+    if ($secretMaskEarlyValues -cnotcontains [string]$secretMaskEarlyByKey[$secretMaskKey]) { $secretMaskEarlyMissing.Add($secretMaskKey) }
+}
+$secretMaskEarlyDistinct = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+foreach ($secretMaskEarlyValue in $secretMaskEarlyValues) { [void]$secretMaskEarlyDistinct.Add([string]$secretMaskEarlyValue) }
+$secretMaskEarlySkippedLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text $secretMaskEarlySkippedText -SecretByKey $secretMaskEarlyByKey)
+Test-BRAVOCondition (
+    $null -ne $secretMaskEarlyResult -and
+    $secretMaskEarlyMissing.Count -eq 0 -and
+    $secretMaskEarlyDistinct.Count -eq $secretMaskEarlyValues.Count -and
+    $secretMaskEarlySkippedLeaks.Count -eq 0
+) -Name 'Credentials/LogMaskSecretSetIncludesSecretsReadEarlierInProcess' `
+    -Failure "Get-BRAVOLogMaskSecretSet має містити КОЖНЕ значення, яке справжні getter-и повернули раніше в цьому процесі (ротований/видалений/нечитабельний на момент вивантаження запис), плюс поточне — без дублікатів; бракує: $($secretMaskEarlyMissing -join ', '); значень: $($secretMaskEarlyValues.Count), унікальних: $($secretMaskEarlyDistinct.Count); Skipped витекли: $($secretMaskEarlySkippedLeaks -join ', '); помилка: $secretMaskEarlyError"
+
+# --- #365 review (P2): лише збій САМОГО читання Credential Manager дає
+# пропуск target-а. Збій ПІСЛЯ успішного CredRead (тут — перетворення
+# значення на рядок) має вийти назовні, щоб викликач нічого не вивантажив
+# (fail-closed), а не тихо продовжив без цього секрету в наборі.
+$secretMaskPropagateResult = $null
+$secretMaskPropagateError = ''
+try {
+    $secretMaskPropagateModule = New-BRAVOSelfTestRuntimeModule -SourceText $secretMaskSourceText -FunctionNames $secretMaskEarlyFunctions
+    $secretMaskPropagateResult = & $secretMaskPropagateModule {
+        param($secretByTarget, $targetsConfig, $corruptTarget)
+        $script:secretMaskTestState = [pscustomobject]@{
+            LogLines = (New-Object System.Collections.Generic.List[string]); ReadTargets = (New-Object System.Collections.Generic.List[string])
+            Uploads = (New-Object System.Collections.Generic.List[object]); SecretByTarget = $secretByTarget
+            ThrowTargets = @(); CorruptTargets = @($corruptTarget); ExceptionPayload = ''; RangeIdLogPath = ''; ConnectCalls = 0
+        }
+        try {
+            $maskSet = Get-BRAVOLogMaskSecretSet -CredentialSettings @{ Targets = $targetsConfig }
+            [pscustomobject]@{ Threw = $false; SkippedText = (@($maskSet.Skipped | ForEach-Object { "$($_.Target)=$($_.Reason)" }) -join '; '); ErrorText = '' }
+        } catch {
+            [pscustomobject]@{ Threw = $true; SkippedText = ''; ErrorText = [string]$_.Exception.Message }
+        }
+    } $secretMaskSecretByTarget $secretMaskTargetsConfig $secretMask7zTarget
+} catch { $secretMaskPropagateError = $_.Exception.GetType().FullName }
+$secretMaskPropagateLeaks = @()
+if ($null -ne $secretMaskPropagateResult) { $secretMaskPropagateLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text ([string]$secretMaskPropagateResult.ErrorText + [string]$secretMaskPropagateResult.SkippedText) -SecretByKey $secretMaskSyntheticByKey) }
+Test-BRAVOCondition (
+    $null -ne $secretMaskPropagateResult -and
+    [bool]$secretMaskPropagateResult.Threw -and
+    $secretMaskPropagateLeaks.Count -eq 0
+) -Name 'Credentials/LogMaskSecretSetPropagatesNonReadFailure' `
+    -Failure "збій після успішного CredRead (не саме читання) має виходити з Get-BRAVOLogMaskSecretSet винятком, а не перетворюватися на тихий пропуск target-а; виняток: $(if ($null -ne $secretMaskPropagateResult) { [bool]$secretMaskPropagateResult.Threw } else { 'n/a' }); skipped: $(if ($null -ne $secretMaskPropagateResult) { [string]$secretMaskPropagateResult.SkippedText } else { '' }); витекли ключі: $($secretMaskPropagateLeaks -join ', '); помилка: $secretMaskPropagateError"
+
+# Інтеграція того самого: Maintenance нічого не вивантажує, пише WARNING
+# без секретів, виняток назовні не йде (exit code не чіпається — див.
+# Maintenance/OwnLogUploadNeverAssignsRuntimeExitCode).
+$secretMaskSetFailResult = $null
+if ($null -ne $secretMaskUploadModule) {
+    $secretMaskSetFailResult = Invoke-BRAVOSelfTestSecretMaskScenario -Module $secretMaskUploadModule `
+        -LogFilePath $secretMaskLogFile -SecretByTarget $secretMaskSecretByTarget -TargetsConfig $secretMaskTargetsConfig `
+        -CorruptTargets @($secretMask7zTarget)
+}
+$secretMaskSetFailUploads = @()
+$secretMaskSetFailLines = @()
+if ($null -ne $secretMaskSetFailResult) {
+    $secretMaskSetFailUploads = @($secretMaskSetFailResult.Uploads)
+    $secretMaskSetFailLines = @($secretMaskSetFailResult.LogLines)
+}
+$secretMaskSetFailLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text ($secretMaskSetFailLines -join "`n") -SecretByKey $secretMaskSyntheticByKey)
+Test-BRAVOCondition (
+    $null -ne $secretMaskSetFailResult -and
+    $secretMaskSetFailUploads.Count -eq 0 -and
+    @($secretMaskSetFailLines | Where-Object { $_.StartsWith('[WARNING]') }).Count -ge 1 -and
+    $secretMaskSetFailLeaks.Count -eq 0 -and
+    [string]::IsNullOrEmpty([string]$secretMaskSetFailResult.InvokeError)
+) -Name 'Maintenance/OwnLogUploadFailsClosedWhenSecretSetFails' `
+    -Failure "збій збирання набору секретів (не CredRead) — fail-closed: жодної передачі, WARNING без секретів, виняток назовні не йде; uploads=$($secretMaskSetFailUploads.Count); витекли ключі: $($secretMaskSetFailLeaks -join ', '); помилка: $secretMaskSetupError"
+
+# --- #365 review (P3): частково перекриті секрети (кінець одного —
+# початок іншого) і секрети впритул не лишають фрагмента: збіги всіх
+# варіантів шукаються в ОРИГІНАЛЬНОМУ тексті, перекриті/суміжні діапазони
+# зливаються й замінюються одним ***. Значення похідні від одного
+# runtime-значення, без літералів.
+$secretMaskPartialValue = $secretMaskNewValue.Invoke('Part')[0]
+$secretMaskPartialHead = $secretMaskPartialValue.Substring(0, 10)
+$secretMaskPartialTail = $secretMaskPartialValue.Substring(6)
+$secretMaskAdjacentLeft = $secretMaskNewValue.Invoke('AdjL')[0]
+$secretMaskAdjacentRight = $secretMaskNewValue.Invoke('AdjR')[0]
+$secretMaskPartialResult = $null
+$secretMaskPartialError = $secretMaskSetupError
+if ($null -ne $secretMaskModule) {
+    try {
+        $secretMaskPartialResult = & $secretMaskModule {
+            param($whole, $head, $tail, $left, $right)
+            Protect-BRAVOLogSecret -Text "p $whole q $left$right r" -KnownSecret @($head, $tail, $left, $right)
+        } $secretMaskPartialValue $secretMaskPartialHead $secretMaskPartialTail $secretMaskAdjacentLeft $secretMaskAdjacentRight
+    } catch { $secretMaskPartialError = $_.Exception.GetType().FullName }
+}
+$secretMaskPartialFragmentLeft = ([string]$secretMaskPartialResult).Contains($secretMaskPartialValue.Substring(10)) -or ([string]$secretMaskPartialResult).Contains($secretMaskPartialValue.Substring(0, 6))
+Test-BRAVOCondition (
+    [string]$secretMaskPartialResult -ceq 'p *** q *** r'
+) -Name 'Logging/KnownSecretPartialOverlapLeavesNoFragment' `
+    -Failure "частково перекриті й суміжні секрети мають замінюватись одним *** на злитий діапазон (очікується 'p *** q *** r'); фрагмент секрету лишився: $secretMaskPartialFragmentLeft; помилка: $secretMaskPartialError"
 
 Remove-Item -LiteralPath $secretMaskTestRoot -Recurse -Force -ErrorAction SilentlyContinue

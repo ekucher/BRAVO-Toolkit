@@ -227,7 +227,7 @@ Remove-Item -LiteralPath $archiveOwnLogTestRoot -Recurse -Force -ErrorAction Sil
 # Manager (SFTP/SMB/7-Zip/Operations/webhook) замінено на ***, навіть без
 # ключового слова поруч. Справжні production-функції (AST) з
 # BRAVO.Archive.Runtime.ps1, BRAVO.Credentials і BRAVO.Logging; стаби лише
-# на межах: Credential Manager (Get-BRAVOCredentialSecret), WinSCP-
+# на межах: Credential Manager (Get-BRAVOCredential — сам CredRead), WinSCP-
 # транспорт (Send-FileViaWinSCP, Initialize-BRAVOSFTPRemoteDirectories) і
 # лог-синк (Write-BRAVOLog). Секрети — синтетичні плейсхолдери.
 # ============================================================
@@ -274,18 +274,25 @@ function Send-FileViaWinSCP {
     $script:archiveSecretMaskState.SentText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($LocalFilePath))
     return $true
 }
-function Get-BRAVOCredentialSecret {
+function Get-BRAVOCredential {
     param([string]$Target)
     if (@($script:archiveSecretMaskState.ThrowTargets) -contains $Target) {
         throw (New-Object System.ComponentModel.Win32Exception(1312, ("synthetic CredRead failure for '" + $Target + "' " + $script:archiveSecretMaskState.ExceptionPayload)))
     }
-    if ($script:archiveSecretMaskState.SecretByTarget.ContainsKey($Target)) { return [string]$script:archiveSecretMaskState.SecretByTarget[$Target] }
+    if ($script:archiveSecretMaskState.SecretByTarget.ContainsKey($Target)) {
+        $selfTestSecure = New-Object System.Security.SecureString
+        foreach ($selfTestChar in ([string]$script:archiveSecretMaskState.SecretByTarget[$Target]).ToCharArray()) { $selfTestSecure.AppendChar($selfTestChar) }
+        $selfTestSecure.MakeReadOnly()
+        return [pscustomobject]@{ TargetName = $Target; UserName = ''; Secret = $selfTestSecure }
+    }
     return $null
 }
 '@
 
 $archiveSecretMaskSourceText = $archiveSecretMaskStub + "`n" + $archiveScriptText + "`n" + $archiveSecretMaskCredentialsText + "`n" + $archiveSecretMaskLoggingText
-$archiveSecretMaskUploadFunctions = @('Write-BRAVOLog', 'Initialize-BRAVOSFTPRemoteDirectories', 'Send-FileViaWinSCP', 'Get-BRAVOCredentialSecret', 'Invoke-BRAVOArchiveOwnLogUpload')
+$archiveSecretMaskUploadFunctions = @('Write-BRAVOLog', 'Initialize-BRAVOSFTPRemoteDirectories', 'Send-FileViaWinSCP',
+    'Get-BRAVOCredential', 'Get-BRAVOCredentialSecureSecret', 'ConvertFrom-BRAVOSecureSecret', 'Get-BRAVOCredentialSecret',
+    'Invoke-BRAVOArchiveOwnLogUpload')
 $archiveSecretMaskModule = $null
 $archiveSecretMaskSetupError = ''
 try {
@@ -390,6 +397,67 @@ Test-BRAVOCondition -Condition (
     [string]::IsNullOrEmpty([string]$archiveSecretMaskResult.InvokeError)
 ) -Name 'Archive/OwnLogUploadInaccessibleTargetSkippedWithInfoNoLeak' `
     -Failure "недоступний target (CredRead кидає) — INFO з іменем target-а, без WARNING/ERROR, без тексту винятку і жодного секрету в діагностиці, exit code незмінний; INFO=$($archiveSecretMaskInfo.Count) WARNING/ERROR=$($archiveSecretMaskWarn.Count) витекли ключі: $($archiveSecretMaskDiagLeaks -join ', '); помилка: $archiveSecretMaskSetupError"
+
+# --- #365 review: fail-closed і для Archive (дзеркало
+# Maintenance/OwnLogUploadFailsClosedWhenMaskedCopyUnavailable). Лог
+# заблоковано (FileShare.None) -> масковану копію створити неможливо ->
+# Send-FileViaWinSCP НЕ викликається взагалі (немаскований лог назовні не
+# йде), WARNING без секретів, виняток назовні не йде, exit code незмінний.
+$archiveSecretMaskLockedResult = $null
+if ($null -ne $archiveSecretMaskModule) {
+    $archiveSecretMaskLockHandle = [IO.File]::Open($archiveSecretMaskLogFile, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $archiveSecretMaskLockedResult = & $archiveSecretMaskModule {
+            param($logFilePath, $secretByTarget)
+            $script:archiveSecretMaskState = [pscustomobject]@{
+                LogLines         = (New-Object System.Collections.Generic.List[string])
+                SecretByTarget   = $secretByTarget
+                ThrowTargets     = @()
+                ExceptionPayload = ''
+                SentPath         = $null
+                SentText         = $null
+            }
+            $script:archiveCatchUpSkipped = $false
+            $global:componentSettings = [pscustomobject]@{ SFTP = [pscustomobject]@{ ArchiveLogUploadEnabled = $true } }
+            $global:storageEffective = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $true } }
+            $script:credentialSettings = @{}
+            $script:sftpUrl = 'sftp://selftest@127.0.0.1/'
+            $script:sftpHostKey = 'ssh-rsa 2048 aa:bb:cc'
+            $script:winSCPPath = 'C:\Windows\System32\cmd.exe'
+            $script:sftpDirectories = [pscustomobject]@{ ArchivLog = 'logs/archiv' }
+            $script:logFile = $logFilePath
+            $script:processExitCode = 42
+            $invokeError = ''
+            try { Invoke-BRAVOArchiveOwnLogUpload } catch { $invokeError = [string]$_.Exception.Message }
+            [pscustomobject]@{
+                SentPath        = $script:archiveSecretMaskState.SentPath
+                LogLines        = $script:archiveSecretMaskState.LogLines.ToArray()
+                ProcessExitCode = $script:processExitCode
+                InvokeError     = $invokeError
+            }
+        } $archiveSecretMaskLogFile $archiveSecretMaskByTarget
+    } finally {
+        $archiveSecretMaskLockHandle.Dispose()
+    }
+}
+$archiveSecretMaskLockedWarn = @()
+$archiveSecretMaskLockedLeaks = New-Object System.Collections.Generic.List[string]
+if ($null -ne $archiveSecretMaskLockedResult) {
+    $archiveSecretMaskLockedWarn = @($archiveSecretMaskLockedResult.LogLines | Where-Object { $_.StartsWith('[WARNING]') })
+    $archiveSecretMaskLockedDiag = (@($archiveSecretMaskLockedResult.LogLines) -join "`n") + "`n" + [string]$archiveSecretMaskLockedResult.InvokeError
+    foreach ($archiveSecretMaskKey in @($archiveSecretMaskByKey.Keys)) {
+        if ($archiveSecretMaskLockedDiag.Contains([string]$archiveSecretMaskByKey[$archiveSecretMaskKey])) { $archiveSecretMaskLockedLeaks.Add($archiveSecretMaskKey) }
+    }
+}
+Test-BRAVOCondition -Condition (
+    $null -ne $archiveSecretMaskLockedResult -and
+    $null -eq $archiveSecretMaskLockedResult.SentPath -and
+    $archiveSecretMaskLockedWarn.Count -ge 1 -and
+    $archiveSecretMaskLockedLeaks.Count -eq 0 -and
+    [int]$archiveSecretMaskLockedResult.ProcessExitCode -eq 42 -and
+    [string]::IsNullOrEmpty([string]$archiveSecretMaskLockedResult.InvokeError)
+) -Name 'Archive/OwnLogUploadFailsClosedWhenMaskedCopyUnavailable' `
+    -Failure "збій маскування (копію не створено) — fail-closed: жодної передачі немаскованого логу, WARNING без секретів, exit code незмінний, виняток назовні не йде; передано: $(if ($null -ne $archiveSecretMaskLockedResult) { $null -ne $archiveSecretMaskLockedResult.SentPath } else { 'n/a' }); WARNING=$($archiveSecretMaskLockedWarn.Count); витекли ключі: $($archiveSecretMaskLockedLeaks -join ', '); помилка: $archiveSecretMaskSetupError"
 
 Remove-Item -LiteralPath $archiveSecretMaskRoot -Recurse -Force -ErrorAction SilentlyContinue
 
