@@ -92,12 +92,44 @@ function Protect-BRAVOLogSecret {
                 if (-not $secretVariants.Contains($secretVariant)) { $secretVariants.Add($secretVariant) }
             }
         }
-        # Довші — першими: якщо один секрет є підрядком іншого, коротший
-        # першим перетворив би довший на "***<хвіст>", і хвіст витік би.
-        foreach ($secretVariant in @($secretVariants | Sort-Object -Property Length -Descending)) {
-            # String.Replace(string, string) — ordinal і без regex-семантики:
-            # спецсимволи в секреті не інтерпретуються.
-            $sanitized = $sanitized.Replace([string]$secretVariant, '***')
+        # Збіги ВСІХ варіантів шукаються в ОРИГІНАЛЬНОМУ тексті, перекриті й
+        # суміжні діапазони зливаються, і кожен злитий діапазон замінюється
+        # одним ***. Послідовна заміна лишала б фрагмент: для частково
+        # перекритих секретів (кінець одного — початок іншого) перша заміна
+        # руйнує збіг другого, і його "хвіст" витікав би.
+        # IndexOf(..., Ordinal) — без культури і без regex-семантики:
+        # спецсимволи в секреті не інтерпретуються.
+        $spanStarts = New-Object 'System.Collections.Generic.List[int]'
+        $spanEnds = New-Object 'System.Collections.Generic.List[int]'
+        foreach ($secretVariant in $secretVariants) {
+            $matchIndex = $sanitized.IndexOf([string]$secretVariant, 0, [System.StringComparison]::Ordinal)
+            while ($matchIndex -ge 0) {
+                $spanStarts.Add($matchIndex)
+                $spanEnds.Add($matchIndex + $secretVariant.Length)
+                $matchIndex = $sanitized.IndexOf([string]$secretVariant, $matchIndex + 1, [System.StringComparison]::Ordinal)
+            }
+        }
+        if ($spanStarts.Count -gt 0) {
+            [int[]]$orderedStarts = $spanStarts.ToArray()
+            [int[]]$orderedEnds = $spanEnds.ToArray()
+            [Array]::Sort($orderedStarts, $orderedEnds)
+            $maskedBuilder = New-Object System.Text.StringBuilder
+            $copiedUpTo = 0
+            $spanIndex = 0
+            while ($spanIndex -lt $orderedStarts.Length) {
+                $mergedStart = $orderedStarts[$spanIndex]
+                $mergedEnd = $orderedEnds[$spanIndex]
+                $spanIndex++
+                while ($spanIndex -lt $orderedStarts.Length -and $orderedStarts[$spanIndex] -le $mergedEnd) {
+                    if ($orderedEnds[$spanIndex] -gt $mergedEnd) { $mergedEnd = $orderedEnds[$spanIndex] }
+                    $spanIndex++
+                }
+                [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $mergedStart - $copiedUpTo)
+                [void]$maskedBuilder.Append('***')
+                $copiedUpTo = $mergedEnd
+            }
+            [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $sanitized.Length - $copiedUpTo)
+            $sanitized = $maskedBuilder.ToString()
         }
     }
     # Облікові дані всередині URL: sftp://user:password@host -> sftp://user:***@host

@@ -10,10 +10,14 @@
   масковану копію (`New-BRAVOMaskedLogCopy`, BRAVO.Logging) з тим самим ім'ям файлу, де точні значення цих секретів
   замінено на `***`; локальний журнал не змінюється, копія прибирається після передачі. Набір секретів збирає
   `Get-BRAVOLogMaskSecretSet` (BRAVO.Credentials): паролі SFTP/SMB, `ArchivePassword`, `OperationsBootstrapSecret`,
-  `OperationsApiKey` і чотири webhook-и; логіни й параметри установи не маскуються. Імена записів резолвить один
+  `OperationsApiKey` і чотири webhook-и; логіни й параметри установи не маскуються. До поточних значень додаються
+  всі значення цих записів, уже прочитані процесом раніше (приватний реєстр SecureString-копій у BRAVO.Credentials):
+  ротований, видалений чи нечитабельний до вивантаження секрет теж маскується. Пропускається лише збій самого
+  читання Credential Manager; будь-яка інша помилка зупиняє вивантаження (WARNING, нічого не вивантажено). Перекриті
+  й суміжні збіги секретів зливаються в один `***` — фрагмент частково перекритого секрету не лишається. Імена записів резолвить один
   канонічний `Get-BRAVOCredentialTargetName` (дефолти збігаються з `Get-BRAVODefaultConfiguration`);
   `Get-BRAVOArchivePasswordTarget` і SFTP-сесія вивантаження власного логу Maintenance користуються ним.
-  `Protect-BRAVOLogSecret` отримав необов'язковий `-KnownSecret`: довші значення маскуються першими, порожні й
+  `Protect-BRAVOLogSecret` отримав необов'язковий `-KnownSecret`: порожні й
   whitespace-only не маскуються, без параметра поведінка незмінна. Запис, який не вдалося прочитати (під SYSTEM)
   або якого немає, пропускається з одним INFO-рядком (ім'я target-а і тип винятку, без тексту винятку); решта
   секретів маскується, вивантаження триває. Якщо масковану копію створити не вдалося, журнал не вивантажується
@@ -26,7 +30,10 @@
   `Maintenance/OwnLogUploadMasksEveryCredentialSecretInUploadedBytes`, `Maintenance/OwnLogUploadMasksTemporaryCopyNotLocalLog`,
   `Maintenance/OwnLogUploadInaccessibleTargetSkippedWithInfoOthersMasked`, `Maintenance/OwnLogUploadDiagnosticsNeverContainSecret`,
   `Maintenance/OwnLogUploadRangeIdSnapshotAlsoMasked`, `Maintenance/OwnLogUploadFailsClosedWhenMaskedCopyUnavailable`,
-  `Archive/OwnLogUploadMasksCredentialSecretsInUploadedBytes`, `Archive/OwnLogUploadInaccessibleTargetSkippedWithInfoNoLeak`.
+  `Archive/OwnLogUploadMasksCredentialSecretsInUploadedBytes`, `Archive/OwnLogUploadInaccessibleTargetSkippedWithInfoNoLeak`,
+  `Credentials/LogMaskSecretSetIncludesSecretsReadEarlierInProcess`, `Credentials/LogMaskSecretSetPropagatesNonReadFailure`,
+  `Maintenance/OwnLogUploadFailsClosedWhenSecretSetFails`, `Logging/KnownSecretPartialOverlapLeavesNoFragment`,
+  `Archive/OwnLogUploadFailsClosedWhenMaskedCopyUnavailable`.
 - **Fix: Archive: оголошений, але порожній каталог компонента більше не зупиняє нічний прогін (#301).**
   Рішення власника 2026-10-07. Якщо в bravo.ini є шлях компонента (новий BLOG, порожня черга BEXCH), а каталог
   існує й порожній, компонент пропускається без Error (scope `EmptySource`, для споживачів він у списку
