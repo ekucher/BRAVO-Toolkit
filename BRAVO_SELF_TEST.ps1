@@ -23225,6 +23225,16 @@ function Get-BRAVOMaintenanceSummaryResult {
                     StandardOutput = ''; StandardError = ('ERROR: ' + [char]0x0412 + [char]0x0456 + [char]0x0434 + [char]0x043C + [char]0x043E + [char]0x0432 + [char]0x043B + [char]0x0435 + [char]0x043D + [char]0x043E + ' ' + [char]0x0432 + ' ' + [char]0x0434 + [char]0x043E + [char]0x0441 + [char]0x0442 + [char]0x0443 + [char]0x043F + [char]0x0456 + '.')
                 }
             }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-UNSUPPORTED-METHOD') {
+                # #422: 7-Zip відпрацював (код 2), але не підтримує метод
+                # стиснення архіву (інша версія 7-Zip). Для класифікатора це
+                # archive-specific, але не доказ пошкодження вмісту.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = 'ERROR: Unsupported Method : payload.md'
+                }
+            }
             if ($stubArchiveText -ceq 'BRAVO-SELFTEST-WRONG-PASSWORD') {
                 # #422: 7-Zip відпрацював (код 2) і відхилив пароль. Для
                 # класифікатора це archive-specific, але байти архіву
@@ -23668,6 +23678,24 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/RetentionStaleSessionKeptOnWrongPassword" `
         -Failure ("стара сесія, яку 7-Zip не перевірив через відхилений пароль (байти збігаються з перевіреним .sha512), НЕ повинна видалятися: це не доказ пошкодження вмісту; WARNING має назвати сесію і причину; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422WrongPassword.Threw, $retention422WrongPassword.Remaining, $retention422WrongPassword.Log)
+
+    # (a''') 7-Zip не підтримує метод стиснення чи формат архіву (інша
+    # версія 7-Zip): archive-specific для класифікатора, але байти архіву
+    # збігаються з перевіреним .sha512 — це несумісність інструмента, а не
+    # пошкодження вмісту. Сесія лишається з WARNING, що називає причину.
+    $retention422Unsupported = & $retentionFollowupRunScenario 'I422UnsupportedMethod' (
+        @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-UNSUPPORTED-METHOD' $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422Unsupported -and
+            $null -eq $retention422Unsupported.Threw -and
+            (& $retention422HasArchive $retention422Unsupported $retention422Subject) -and
+            (& $retention422ControlOk $retention422Unsupported) -and
+            (& $retention422KeptLine $retention422Unsupported $retention422Subject 'метод стиснення')
+        ) `
+        -Name "Maintenance/RetentionStaleSessionKeptOnUnsupportedMethod" `
+        -Failure ("стара сесія, яку поточний 7-Zip не може перевірити (Unsupported Method; байти збігаються з перевіреним .sha512), НЕ повинна видалятися: це несумісність інструмента, а не доказ пошкодження вмісту; WARNING має назвати сесію і причину; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422Unsupported.Threw, $retention422Unsupported.Remaining, $retention422Unsupported.Log)
 
     # (c)+(d) Перевірка не виконалась або 7-Zip не завершив її (виняток
     # валідатора, таймаут, немає 7-Zip, коди 7/8/255, відмова доступу з
