@@ -1311,6 +1311,146 @@
       -Failure "витіснений item має бути САМЕ найстаріший ($evictEventId1, FIFO/EnqueuedAtUtc) -- новіші items ($evictEventId2/$evictEventId3) мають лишитись в активному Outbox\"
 
     # ---------------------------------------------------------------------
+    # #280 (рішення власника): події, витіснені переповненням outbox, після
+    # enrollment одноразово повертаються з DeadLetter у дренаж; відхилені
+    # бекендом (4xx) і чужої ідентичності лишаються в DeadLetter. Події,
+    # остаточно видалені ретенцією DeadLetter чи пошкоджені, рахуються в
+    # лічильнику втрачених подій.
+    # ---------------------------------------------------------------------
+    $evictDeadLetterItem = $null
+    $evictDeadLetterPath = Join-Path $evictDeadLetterDir "$evictEventId1.json"
+    if (Test-Path -LiteralPath $evictDeadLetterPath -PathType Leaf) {
+        $evictDeadLetterItem = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($evictDeadLetterPath))
+    }
+    Test-BRAVOCondition -Condition (
+        $null -ne $evictDeadLetterItem -and
+        $null -ne $evictDeadLetterItem.PSObject.Properties['DeadLetterKind'] -and
+        [string]$evictDeadLetterItem.DeadLetterKind -eq 'Overflow'
+    ) -Name 'Operations/OverflowEvictionMarksDeadLetterKindOverflow' `
+      -Failure '#280: item, витіснений переповненням, має нести DeadLetterKind=Overflow (лише такі повертаються в дренаж)'
+
+    $redrainDir = Join-Path $opsSelfTestRoot 'OverflowRedrain'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $redrainDir
+    $redrainServerId = Get-BRAVOOperationsServerId
+    $redrainDeadLetterDir = & $evictDeadLetterDirFn
+    $redrainOutboxDir = & $evictOutboxDirFn
+    New-Item -ItemType Directory -Path $redrainDeadLetterDir -Force | Out-Null
+    function New-BRAVOOpsSelfTestDeadLetterFile {
+        param([string]$EventId, [string]$ServerId, [string]$Reason, [string]$Kind)
+        $payload = [ordered]@{
+            Kind = 'event'; ServerId = $ServerId; EventId = $EventId
+            OccurredAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-30).ToString('o')
+            SchemaVersion = 1; ApiPath = '/api/v1/events'
+            RequestBody = @{ category = 'health'; severity = 'SUCCESS' }
+            EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-30).ToString('o')
+            AttemptCount = 0
+            NextRetryAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-30).ToString('o')
+            LastError = $null
+            DeadLetteredAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-20).ToString('o')
+            DeadLetterReason = $Reason
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Kind)) { $payload['DeadLetterKind'] = $Kind }
+        [IO.File]::WriteAllText((Join-Path $redrainDeadLetterDir "$EventId.json"), (([pscustomobject]$payload) | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    }
+    $redrainOverflowId = 'redrain-overflow-' + [guid]::NewGuid().ToString()
+    $redrainLegacyId = 'redrain-legacy-' + [guid]::NewGuid().ToString()
+    $redrainRejectedId = 'redrain-rejected-' + [guid]::NewGuid().ToString()
+    $redrainForeignId = 'redrain-foreign-' + [guid]::NewGuid().ToString()
+    New-BRAVOOpsSelfTestDeadLetterFile -EventId $redrainOverflowId -ServerId $redrainServerId -Reason 'Outbox переповнено (ліміт 500 items) — найстаріший item витіснено' -Kind 'Overflow'
+    New-BRAVOOpsSelfTestDeadLetterFile -EventId $redrainLegacyId -ServerId $redrainServerId -Reason 'Outbox переповнено (ліміт 500 items) — найстаріший item витіснено' -Kind ''
+    New-BRAVOOpsSelfTestDeadLetterFile -EventId $redrainRejectedId -ServerId $redrainServerId -Reason 'HTTP 400 при дренажі: Bad Request' -Kind 'Rejected'
+    New-BRAVOOpsSelfTestDeadLetterFile -EventId $redrainForeignId -ServerId ([guid]::NewGuid().ToString()) -Reason 'Outbox переповнено (ліміт 500 items) — найстаріший item витіснено' -Kind 'Overflow'
+
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    $redrainThrew = $null
+    try {
+        [void](Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl $opsSettings.ApiBaseUrl -ApiKey 'redrain-api-key' `
+            -CredentialTargets $opsCredentialTargets -TimeoutSeconds 5)
+    } catch {
+        $redrainThrew = $_.Exception.Message
+    }
+    # List[object]: лише .Count напряму; обгортка масивом кидає ArgumentException у PS 5.1.
+    $redrainHttpCallCount = $global:BRAVOOpsSelfTestHttpCalls.Count
+    $redrainDeadLetterNames = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($redrainFile in @(Get-ChildItem -LiteralPath $redrainDeadLetterDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        $redrainDeadLetterNames.Add([IO.Path]::GetFileNameWithoutExtension($redrainFile.Name))
+    }
+    $redrainOutboxCount = @(Get-ChildItem -LiteralPath $redrainOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+    Test-BRAVOCondition -Condition (
+        $null -eq $redrainThrew -and
+        $redrainHttpCallCount -eq 2 -and
+        -not $redrainDeadLetterNames.Contains($redrainOverflowId) -and
+        -not $redrainDeadLetterNames.Contains($redrainLegacyId) -and
+        $redrainOutboxCount -eq 0
+    ) -Name 'Operations/DeadLetterOverflowRedrainedOnceAfterEnrollment' `
+      -Failure "#280: витіснені переповненням події (з DeadLetterKind=Overflow і старі з причиною 'Outbox переповнено') мають повернутися з DeadLetter і бути доставлені першим дренажем після enrollment; HTTP-викликів=$redrainHttpCallCount (очікувано 2), у DeadLetter: $($redrainDeadLetterNames -join ', '), в outbox=$redrainOutboxCount, виняток=$redrainThrew"
+    Test-BRAVOCondition -Condition (
+        $redrainDeadLetterNames.Contains($redrainRejectedId) -and
+        $redrainDeadLetterNames.Contains($redrainForeignId)
+    ) -Name 'Operations/DeadLetterRedrainSkipsRejectedAndForeignIdentity' `
+      -Failure "#280: подія, відхилена бекендом (4xx), і подія іншої серверної ідентичності мають лишитися в DeadLetter; у DeadLetter: $($redrainDeadLetterNames -join ', ')"
+
+    $redrainSecondId = 'redrain-second-' + [guid]::NewGuid().ToString()
+    New-BRAVOOpsSelfTestDeadLetterFile -EventId $redrainSecondId -ServerId $redrainServerId -Reason 'Outbox переповнено (ліміт 500 items) — найстаріший item витіснено' -Kind 'Overflow'
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    try {
+        [void](Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl $opsSettings.ApiBaseUrl -ApiKey 'redrain-api-key' `
+            -CredentialTargets $opsCredentialTargets -TimeoutSeconds 5)
+    } catch {
+        $redrainThrew = $_.Exception.Message
+    }
+    Test-BRAVOCondition -Condition (
+        $null -eq $redrainThrew -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0 -and
+        (Test-Path -LiteralPath (Join-Path $redrainDeadLetterDir "$redrainSecondId.json") -PathType Leaf)
+    ) -Name 'Operations/DeadLetterRedrainRunsOncePerServerIdentity' `
+      -Failure "#280: повернення з DeadLetter одноразове для серверної ідентичності — повторний дренаж не має знову забирати витіснені події; HTTP-викликів=$($global:BRAVOOpsSelfTestHttpCalls.Count)"
+    Remove-Item -Path function:New-BRAVOOpsSelfTestDeadLetterFile -Force -ErrorAction SilentlyContinue
+
+    # Лічильник втрачених подій: ретенція DeadLetter (200 найновіших)
+    # видаляє файл -> +1; пошкоджений outbox-файл видаляється -> +1.
+    $lossDir = Join-Path $opsSelfTestRoot 'OutboxLossCounter'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $lossDir
+    $lossDeadLetterDir = & $evictDeadLetterDirFn
+    $lossOutboxDir = & $evictOutboxDirFn
+    New-Item -ItemType Directory -Path $lossDeadLetterDir -Force | Out-Null
+    $lossOldTime = (Get-Date).AddDays(-2)
+    for ($lossIndex = 0; $lossIndex -lt 200; $lossIndex++) {
+        $lossFile = Join-Path $lossDeadLetterDir ("old-dead-letter-{0:D3}.json" -f $lossIndex)
+        [IO.File]::WriteAllText($lossFile, '{"EventId":"old","DeadLetterReason":"HTTP 400"}', (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::SetLastWriteTimeUtc($lossFile, $lossOldTime.ToUniversalTime().AddSeconds($lossIndex))
+    }
+    & $addOutboxItemFn -Kind 'event' -EventId ('loss-first-' + [guid]::NewGuid().ToString()) -OccurredAtUtc (Get-Date).ToUniversalTime().ToString('o') `
+        -SchemaVersion 1 -ApiPath '/api/v1/events' -RequestBody @{ category = 'health'; severity = 'SUCCESS' } -MaxOutboxItems 1
+    Start-Sleep -Milliseconds 20
+    & $addOutboxItemFn -Kind 'event' -EventId ('loss-second-' + [guid]::NewGuid().ToString()) -OccurredAtUtc (Get-Date).ToUniversalTime().ToString('o') `
+        -SchemaVersion 1 -ApiPath '/api/v1/events' -RequestBody @{ category = 'health'; severity = 'SUCCESS' } -MaxOutboxItems 1
+    $lossSummaryCommand = Get-Command -Name 'Get-BRAVOOperationsOutboxLossSummary' -ErrorAction SilentlyContinue
+    $lossAfterRetention = $null
+    if ($null -ne $lossSummaryCommand) { $lossAfterRetention = Get-BRAVOOperationsOutboxLossSummary }
+    Test-BRAVOCondition -Condition (
+        $null -ne $lossAfterRetention -and [int]$lossAfterRetention.LostEventCount -eq 1 -and
+        @(Get-ChildItem -LiteralPath $lossDeadLetterDir -Filter '*.json' -File).Count -eq 200
+    ) -Name 'Operations/DeadLetterRetentionCountsLostEvents' `
+      -Failure "#280: файл, видалений ретенцією DeadLetter, має збільшити лічильник втрачених подій (Get-BRAVOOperationsOutboxLossSummary.LostEventCount=1); факт: $(if ($null -eq $lossSummaryCommand) { 'функцію не експортовано' } elseif ($null -eq $lossAfterRetention) { 'результату немає' } else { $lossAfterRetention.LostEventCount })"
+
+    [IO.File]::WriteAllText((Join-Path $lossOutboxDir 'corrupt-item.json'), '{ not json', (New-Object Text.UTF8Encoding($false)))
+    $lossOutboxItemsFn = & $opsSelfTestModule { ${function:Get-BRAVOOperationsOutboxItems} }
+    [void](& $lossOutboxItemsFn)
+    $lossAfterCorrupt = $null
+    if ($null -ne $lossSummaryCommand) { $lossAfterCorrupt = Get-BRAVOOperationsOutboxLossSummary }
+    Test-BRAVOCondition -Condition (
+        $null -ne $lossAfterCorrupt -and [int]$lossAfterCorrupt.LostEventCount -eq 2 -and
+        -not [string]::IsNullOrWhiteSpace([string]$lossAfterCorrupt.LastLostAtUtc)
+    ) -Name 'Operations/CorruptOutboxItemCountsAsLostEvent' `
+      -Failure "#280: пошкоджений outbox-файл, який видаляється, теж має рахуватися втраченою подією (LostEventCount=2, LastLostAtUtc заповнено); факт: $(if ($null -eq $lossAfterCorrupt) { 'результату немає' } else { $lossAfterCorrupt.LostEventCount })"
+
+    # ---------------------------------------------------------------------
     # Thread 5 (review): event loss during pending enrollment -- подія,
     # надіслана поки enrollment ще pending/не сконфігуровано (apiKey
     # порожній, apiKey ще НЕ намагались отримати мережею в цьому сценарії,
