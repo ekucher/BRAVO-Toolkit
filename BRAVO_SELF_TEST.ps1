@@ -6497,7 +6497,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     try {
         $earlyExitAlertModule = New-BRAVOSelfTestRuntimeModule `
             -SourceText $maintenanceRuntimeSourceForSeverity `
-            -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Send-BRAVOMaintenanceEarlyExitAlerts')
+            -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Send-BRAVOMaintenanceEarlyExitAlerts', 'Send-BRAVOMaintenanceSkippedRunAlert')
     } catch {
         $earlyExitAlertModuleError = $_.Exception.Message
     }
@@ -6641,9 +6641,15 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Failure "#299: без накопичених алертів або в режимі none нічого не надсилається"
 
     $earlyExitLockSkip = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
-        Send-SlackAlert -Message "lock-message-299" -Severity "ERROR"
-        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "operation lock"
+        Send-BRAVOMaintenanceSkippedRunAlert -Message "lock-message-299" -Reason "operation lock"
     }
+    $earlyExitRecoveryTickSkip = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-BRAVOMaintenanceSkippedRunAlert -Message "recovery-tick-299" -Reason "operation lock" -RecoveryTick
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitRecoveryTickSkip -and $earlyExitRecoveryTickSkip.DeliveredCount -eq 0) `
+        -Name "Maintenance/RecoveryTickLockSkipOnlyLogs" `
+        -Failure "#299: пропуск Recovery-тику через lock не надсилає алерт (тик повторюється за розкладом)"
     Test-BRAVOCondition `
         -Condition (
             $null -ne $earlyExitLockSkip -and
@@ -6697,9 +6703,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     Test-BRAVOCondition `
         -Condition (
             $null -ne $lockBusyExitSegment -and
-            $lockBusyExitSegment -match 'Send-SlackAlert[^\r\n]*-Severity "ERROR"' -and
-            $lockBusyExitSegment.Contains('Send-BRAVOMaintenanceEarlyExitAlerts') -and
-            $lockBusyExitSegment.Contains('$RunMissedRestoreOnly')
+            $lockBusyExitSegment.Contains('Send-BRAVOMaintenanceSkippedRunAlert') -and
+            $lockBusyExitSegment.Contains('-RecoveryTick:$RunMissedRestoreOnly')
         ) `
         -Name "Maintenance/LockBusySkipAlertsForScheduledMaintenance" `
         -Failure "#299: пропуск планового Maintenance через lock має одразу надсилати ERROR (Recovery-тик лише логує)"

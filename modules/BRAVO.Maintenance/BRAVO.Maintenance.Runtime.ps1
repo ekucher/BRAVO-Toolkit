@@ -2749,6 +2749,24 @@ function Send-BRAVOMaintenanceEarlyExitAlerts {
     }
 }
 
+# #299: плановий прогін пропущено повністю (lock) — оператор має дізнатися
+# одразу: ERROR (прогін не стає critical, код завершення не змінюється).
+# Recovery-тик лише логує: він повторюється за розкладом, і алерт на кожен
+# тик був би шумом.
+function Send-BRAVOMaintenanceSkippedRunAlert {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [switch]$RecoveryTick
+    )
+
+    if ($RecoveryTick) {
+        return
+    }
+    Send-SlackAlert -Message "Плановий прогін обслуговування пропущено, нічого не виконано. $Message" -Severity "ERROR"
+    Send-BRAVOMaintenanceEarlyExitAlerts -Reason $Reason
+}
+
 function Send-InactiveServiceWarning {
     param([string[]]$ServiceDescriptions)
 
@@ -8704,13 +8722,7 @@ if (-not $maintenanceLockResult.Success) {
         "lock=$($maintenanceLockResult.Path); $($maintenanceLockResult.Error)"
     )
     Write-Log -Message $maintenanceLockSkipMessage -Level "ERROR"
-    # #299: плановий прогін пропущено повністю — оператор має дізнатися
-    # одразу (ERROR, без зміни коду завершення). Recovery-тик лише логує:
-    # він повторюється за розкладом, і алерт на кожен тик був би шумом.
-    if (-not $RunMissedRestoreOnly) {
-        Send-SlackAlert -Message "Плановий прогін обслуговування пропущено, нічого не виконано. $maintenanceLockSkipMessage" -Severity "ERROR"
-        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "операційний lock не отримано"
-    }
+    Send-BRAVOMaintenanceSkippedRunAlert -Message $maintenanceLockSkipMessage -Reason "операційний lock не отримано" -RecoveryTick:$RunMissedRestoreOnly
     Complete-BRAVOProgress
     # Код з канонічного контракту BRAVO.ExitCodes (SkippedLockBusy = 20),
     # а не літерал: ця ж гілка тепер завершує й вичерпаний бюджет очікування
@@ -8751,11 +8763,7 @@ if ([string]$script:startModeRepairResult.Status -eq 'OwnerAlive') {
         $reExchangeEnabled -ne [bool]$exchangAPIServiceEnabled -or
         $reWebEnabled -ne [bool]$BravoWebMaintenanceEnabled) {
         Write-Log -Message "Класифікація служб змінилась, поки очікувався lock (інший прогін тимчасово утримував служби Disabled, #297): Bravo $BravoMaintenanceEnabled->$reBravoEnabled, exchangAPI $exchangAPIServiceEnabled->$reExchangeEnabled, Web $BravoWebMaintenanceEnabled->$reWebEnabled. Рішення цього прогону обчислені зі застарілих даних — прогін завершено без дій, наступний запуск повторить" -Level "WARNING"
-        # #299: той самий пропуск планового прогону, що й при зайнятому lock.
-        if (-not $RunMissedRestoreOnly) {
-            Send-SlackAlert -Message "Плановий прогін обслуговування пропущено, нічого не виконано: класифікація служб змінилась, поки очікувався lock (#297). Наступний запуск повторить." -Severity "ERROR"
-            Send-BRAVOMaintenanceEarlyExitAlerts -Reason "класифікація служб змінилась під час очікування lock"
-        }
+        Send-BRAVOMaintenanceSkippedRunAlert -Message "Класифікація служб змінилась, поки очікувався lock (#297); наступний запуск повторить." -Reason "класифікація служб змінилась під час очікування lock" -RecoveryTick:$RunMissedRestoreOnly
         Exit-BRAVOMaintenanceOperationLock
         Complete-BRAVOProgress
         exit (Resolve-BRAVOExitCode -LockBusy)
