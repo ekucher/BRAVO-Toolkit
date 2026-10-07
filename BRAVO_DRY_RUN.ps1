@@ -1309,6 +1309,8 @@ try {
     # читається. Невстановлений компонент не перевіряється як джерело чи
     # призначення, бо ARCHIV його не копіює.
     $dryRunNotInstalledComponents = @()
+    $dryRunEmptySourceComponents = @()
+    $dryRunEmptySourceWarningComponents = @()
     $dryRunComponentScopeError = $null
     try {
         $dryRunComponentScope = Get-BRAVOBackupNotInstalledComponents `
@@ -1319,6 +1321,8 @@ try {
             -BackupRoot ([string]$global:backupRootPath)
         $dryRunComponentScopeError = [string]$dryRunComponentScope.Error
         $dryRunNotInstalledComponents = @($dryRunComponentScope.NotInstalled)
+        $dryRunEmptySourceComponents = @($dryRunComponentScope.EmptySource)
+        $dryRunEmptySourceWarningComponents = @($dryRunComponentScope.EmptySourceWarning)
     } catch {
         $dryRunComponentScopeError = [string]$_.Exception.Message
     }
@@ -1428,10 +1432,23 @@ try {
         $dryRunNotInstalledComponents -notcontains 'BAZA_WWW') {
         $writeAccessTargets['BAZA_WWW destination'] = [string]$bazaWWWPaths.Destination
     }
-    if ($dryRunNotInstalledComponents.Count -gt 0) {
+    $dryRunNotInstalledOnly = @($dryRunNotInstalledComponents | Where-Object { $dryRunEmptySourceComponents -notcontains $_ })
+    if ($dryRunNotInstalledOnly.Count -gt 0) {
         Add-DryRunResult PASS "Склад" "Не встановлено на цьому сервері" (
-            "$($dryRunNotInstalledComponents -join ', '): не копіюється й не перевіряється"
+            "$($dryRunNotInstalledOnly -join ', '): не копіюється й не перевіряється"
         )
+    }
+    # #301: каталог є, але порожній. Компонент, що раніше мав дані, - WARN.
+    foreach ($dryRunEmptySourceComponent in $dryRunEmptySourceComponents) {
+        if ($dryRunEmptySourceWarningComponents -contains $dryRunEmptySourceComponent) {
+            Add-DryRunResult WARN "Склад" "Каталог джерела $dryRunEmptySourceComponent" (
+                "порожній, хоча раніше мав дані: не копіюється й не перевіряється"
+            )
+        } else {
+            Add-DryRunResult PASS "Склад" "Каталог джерела $dryRunEmptySourceComponent" (
+                "порожній: не копіюється й не перевіряється"
+            )
+        }
     }
     if (-not [string]::IsNullOrWhiteSpace($dryRunComponentScopeError)) {
         Add-DryRunResult WARN "Склад" "Визначення складу" (

@@ -61,6 +61,10 @@ $script:BRAVOHealthStepHistory = New-Object System.Collections.Generic.List[obje
 # прогону, бо підсумок результату й журнал читають її під Set-StrictMode
 # на кожному виході, зокрема ранньому.
 $script:healthNotInstalledComponents = @()
+# #301: підмножина NotInstalled, де каталог джерела є, але порожній, і ті
+# з них, що раніше мали дані (Warning). Звітуються окремо від «не встановлено».
+$script:healthEmptySourceComponents = @()
+$script:healthEmptySourceWarningComponents = @()
 $script:healthComponentScopeError = $null
 # Перевірка цілісності інструментів виконується значно нижче, але
 # Complete-BRAVOHealthResult читає її результат — а через цю функцію
@@ -580,6 +584,8 @@ $healthComponentScope = Get-BRAVOBackupNotInstalledComponents `
     -BackupRoot $backupRootPath
 $script:healthComponentScopeError = [string]$healthComponentScope.Error
 $script:healthNotInstalledComponents = @($healthComponentScope.NotInstalled)
+$script:healthEmptySourceComponents = @($healthComponentScope.EmptySource)
+$script:healthEmptySourceWarningComponents = @($healthComponentScope.EmptySourceWarning)
 $bazaAppHealthInstalled = @($script:healthNotInstalledComponents) -notcontains 'BAZA_APP'
 $bazaWWWHealthInstalled = @($script:healthNotInstalledComponents) -notcontains 'BAZA_WWW'
 
@@ -4834,8 +4840,22 @@ function New-SlackSuccessMessage {
         $resultLines.Add("")
         $resultLines.Add("Компоненти: $enabledComponentCount/$enabledComponentCount")
     }
-    if (@($script:healthNotInstalledComponents).Count -gt 0) {
-        $resultLines.Add(":information_source: Не встановлено на цьому сервері: $(@($script:healthNotInstalledComponents) -join ', ')")
+    # Стан складу читається через Get-Variable: повідомлення будують і
+    # ізольовані перевірки, де частину стану прогону не ініціалізовано.
+    $emptySourceVariable = Get-Variable -Name healthEmptySourceComponents -Scope Script -ErrorAction SilentlyContinue
+    $emptySourceComponents = @(if ($null -ne $emptySourceVariable) { $emptySourceVariable.Value })
+    $emptySourceWarningVariable = Get-Variable -Name healthEmptySourceWarningComponents -Scope Script -ErrorAction SilentlyContinue
+    $emptySourceWarningComponents = @(if ($null -ne $emptySourceWarningVariable) { $emptySourceWarningVariable.Value })
+    $notInstalledOnly = @(@($script:healthNotInstalledComponents) | Where-Object { $emptySourceComponents -notcontains $_ })
+    if ($notInstalledOnly.Count -gt 0) {
+        $resultLines.Add(":information_source: Не встановлено на цьому сервері: $($notInstalledOnly -join ', ')")
+    }
+    $emptySourceInfoOnly = @($emptySourceComponents | Where-Object { $emptySourceWarningComponents -notcontains $_ })
+    if ($emptySourceWarningComponents.Count -gt 0) {
+        $resultLines.Add(":warning: Каталог джерела порожній, хоча раніше мав дані (не копіюється): $($emptySourceWarningComponents -join ', ')")
+    }
+    if ($emptySourceInfoOnly.Count -gt 0) {
+        $resultLines.Add(":information_source: Каталог джерела порожній (не копіюється): $($emptySourceInfoOnly -join ', ')")
     }
 
     return New-BRAVOOperatorNotificationMessage `
@@ -5363,8 +5383,19 @@ if ($SkipIfBackupTaskRunning) {
 Write-HealthLog "Конфігурація: $ConfigPath"
 Write-HealthLog "Сумісність: Windows $($BRAVOCompatibility.WindowsVersion); PowerShell $($BRAVOCompatibility.PowerShellVersion); WMI=$($BRAVOCompatibility.WmiProvider); JSON=$($BRAVOCompatibility.JsonProvider); завдання=$($BRAVOCompatibility.TaskSchedulerProvider)"
 Write-HealthLog "Каталог резервних копій: $backupRootPath"
-if ($script:healthNotInstalledComponents.Count -gt 0) {
-    Write-HealthLog "Не встановлено на цьому сервері (не перевіряється): $($script:healthNotInstalledComponents -join ', ')"
+$healthNotInstalledOnly = @(@($script:healthNotInstalledComponents) | Where-Object {
+    @($script:healthEmptySourceComponents) -notcontains $_
+})
+if ($healthNotInstalledOnly.Count -gt 0) {
+    Write-HealthLog "Не встановлено на цьому сервері (не перевіряється): $($healthNotInstalledOnly -join ', ')"
+}
+foreach ($healthEmptySourceComponent in @($script:healthEmptySourceComponents)) {
+    if (@($script:healthEmptySourceWarningComponents) -contains $healthEmptySourceComponent) {
+        Write-HealthLog ("Каталог джерела $healthEmptySourceComponent порожній, хоча раніше мав дані: компонент не " +
+            "копіюється й не перевіряється. Якщо зміна легітимна, підтвердіть новий baseline.") -Level WARNING
+    } else {
+        Write-HealthLog "Каталог джерела $healthEmptySourceComponent порожній (не копіюється й не перевіряється)"
+    }
 }
 if (-not [string]::IsNullOrWhiteSpace([string]$script:healthComponentScopeError)) {
     Write-HealthLog "Склад компонентів за наявністю не визначено, очікуються всі увімкнені: $($script:healthComponentScopeError)"

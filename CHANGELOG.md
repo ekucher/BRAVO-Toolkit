@@ -6,7 +6,11 @@
   Рішення власника 2026-10-07. Якщо в bravo.ini є шлях компонента (новий BLOG, порожня черга BEXCH), а каталог
   існує й порожній, компонент пропускається без Error (scope `EmptySource`, для споживачів він у списку
   NotInstalled). Якщо компонент раніше мав дані (підтверджений у baseline або мав архів в останній COMPLETE
-  generation), кожен прогін пише WARNING, а крок «Перевірка складу джерел» має статус WARNING. Відсутній чи
+  generation), кожен прогін пише WARNING, а крок «Перевірка складу джерел» має статус WARNING. Доказ з manifest
+  після першого COMPLETE прогону переноситься в baseline (сире джерело), бо нова generation цього компонента вже
+  не містить: без цього Warning зник би вже наступної ночі. Health і Dry Run показують порожній каталог окремо
+  від «не встановлено», а компонент, що раніше мав дані, - попередженням (Health пише WARNING у журнал, Dry Run -
+  WARN). Відсутній чи
   нечитабельний каталог, а також порожній обов'язковий MODEL лишаються Error. Presence-запис має нове поле
   `AbsenceKind` (`Empty`/`NotFound`/`NoPath`). Baseline пише порожнє джерело лише для доведено порожнього
   каталогу, тож після `-ConfirmDiscoveryBaseline` такий компонент дає Info; Error/Ambiguous і відсутній каталог
@@ -15,7 +19,10 @@
   `BackupScope/DeclaredEmptySource*`, `BackupScope/PreviouslyBackedUpEmptySourceWarnsWithoutBaseline`,
   `BackupScope/DeclaredMissingSourceStaysError`, `BackupScope/MandatoryModelEmptySourceStaysError`,
   `BackupScope/BaselineBlanksOnlyProvenEmptySource`, `BackupScope/ReconfirmedEmptySourceIsInfo`,
-  `BackupScope/SetupPreviewUsesBaselineSnapshot`, `BackupScope/DriftWarningReportedAsWarning`.
+  `BackupScope/SetupPreviewUsesBaselineSnapshot`, `BackupScope/DriftWarningReportedAsWarning`,
+  `BackupScope/EmptySourceWarningPersistsAfterFirstRun`, `BackupScope/EmptySourceEvidenceExtendsExistingBaseline`,
+  `BackupScope/ReadOnlyScopeReportsEmptySourceSeparately`, `BackupScope/ExplicitOverrideEmptySourceStaysError`,
+  `BackupScope/ConfirmedModelEmptySourceStaysError`, `Health/EmptySourceReportedSeparatelyFromNotInstalled`.
 - **Fix: Archive: оцінка місця враховує дерева з файлами нульової довжини і записи каталогів (#400).**
   Після #279 оцінка за джерелом додавала метадані кожного файлу, але джерело з нульовим сумарним розміром
   лишалось без оцінки, навіть якщо в ньому тисячі порожніх файлів, а каталоги, для яких 7-Zip теж зберігає
