@@ -576,8 +576,10 @@ try {
             # збереженим знімком (це і є поточний результат), інакше
             # підтвердження легітимної зміни ніколи не "заспокоїло" б вивід
             # у тому самому прогоні.
+            # #301: перегляд будує знімок тією самою функцією, що й справжнє
+            # збереження, інакше він розходився б із записаним baseline.
             $discoveryDriftBaseline = $(if ($ConfirmDiscoveryBaseline) {
-                $bravoDiscoveryResult
+                New-BRAVODiscoveryBaselineSnapshot -DiscoveryResult $bravoDiscoveryResult
             } else {
                 $discoveryBaselineImport.Baseline
             })
@@ -622,7 +624,7 @@ try {
             if ($discoveryDriftFindings.Count -gt 0) {
                 Write-Host 'Склад джерел відносно підтвердженого baseline:'
                 foreach ($driftFinding in $discoveryDriftFindings) {
-                    $driftColor = $(if ($driftFinding.Severity -eq 'Error') { 'Red' } else { 'Gray' })
+                    $driftColor = $(if ($driftFinding.Severity -eq 'Error') { 'Red' } elseif ($driftFinding.Severity -eq 'Warning') { 'Yellow' } else { 'Gray' })
                     Write-Host "  - $($driftFinding.Message)" -ForegroundColor $driftColor
                 }
             }

@@ -7697,7 +7697,7 @@ function Main {
         ) -Level 'ERROR'
     }
     foreach ($driftFinding in $discoveryDriftFindings) {
-        $driftLevel = $(if ([string]$driftFinding.Severity -eq 'Error') { 'ERROR' } else { 'INFO' })
+        $driftLevel = $(if ([string]$driftFinding.Severity -eq 'Error') { 'ERROR' } elseif ([string]$driftFinding.Severity -eq 'Warning') { 'WARNING' } else { 'INFO' })
         Write-BRAVOLog -Component 'DISCOVERY' -Message ([string]$driftFinding.Message) -Level $driftLevel
     }
     # Знахідка з Component='BASELINE' означає "оцінити склад нічим"
@@ -7714,18 +7714,25 @@ function Main {
     if ($discoveryBaselineGlobalFailure -or $driftFailedComponents.Count -gt 0) {
         $discoveryBaselineValid = $false
     }
+    # #301: Warning - компонент пропущено без зупинки (порожній каталог
+    # раніше підтвердженого компонента); крок показується як WARNING.
+    $discoveryDriftWarningComponents = @($discoveryDriftFindings |
+        Where-Object { [string]$_.Severity -eq 'Warning' } |
+        ForEach-Object { [string]$_.Component })
     $discoveryDriftDetails = $(if ($discoveryBaselineGlobalFailure) {
         'склад джерел оцінити не вдалося; деталі у журналі.'
     } elseif ($driftFailedComponents.Count -gt 0) {
         "компонентів із дрейфом: $($driftFailedComponents -join ', '); деталі у журналі."
+    } elseif ($discoveryDriftWarningComponents.Count -gt 0) {
+        "порожній каталог раніше підтвердженого компонента: $($discoveryDriftWarningComponents -join ', '); пропущено, деталі у журналі."
     } elseif ($notInstalledComponents.Count -gt 0) {
-        "не встановлено на цьому сервері: $($notInstalledComponents -join ', ')"
+        "не встановлено або порожній каталог: $($notInstalledComponents -join ', ')"
     } else {
         ''
     })
     Write-BRAVOArchiveStep `
         -Name "Перевірка складу джерел" `
-        -Status $(if ($discoveryBaselineValid) { 'OK' } else { 'ERROR' }) `
+        -Status $(if (-not $discoveryBaselineValid) { 'ERROR' } elseif ($discoveryDriftWarningComponents.Count -gt 0) { 'WARNING' } else { 'OK' }) `
         -Details $discoveryDriftDetails
 
     Write-Log "=== ПЕРЕВIРКА НЕОБХIДНИХ ШЛЯХIВ ==="

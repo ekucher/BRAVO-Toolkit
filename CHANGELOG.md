@@ -2,6 +2,20 @@
 
 ## Не випущено (developer)
 
+- **Fix: Archive: оголошений, але порожній каталог компонента більше не зупиняє нічний прогін (#301).**
+  Рішення власника 2026-10-07. Якщо в bravo.ini є шлях компонента (новий BLOG, порожня черга BEXCH), а каталог
+  існує й порожній, компонент пропускається без Error (scope `EmptySource`, для споживачів він у списку
+  NotInstalled). Якщо компонент раніше мав дані (підтверджений у baseline або мав архів в останній COMPLETE
+  generation), кожен прогін пише WARNING, а крок «Перевірка складу джерел» має статус WARNING. Відсутній чи
+  нечитабельний каталог, а також порожній обов'язковий MODEL лишаються Error. Presence-запис має нове поле
+  `AbsenceKind` (`Empty`/`NotFound`/`NoPath`). Baseline пише порожнє джерело лише для доведено порожнього
+  каталогу, тож після `-ConfirmDiscoveryBaseline` такий компонент дає Info; Error/Ambiguous і відсутній каталог
+  зберігають сире джерело. Попередній перегляд `-ValidateOnly -ConfirmDiscoveryBaseline` будує знімок тією самою
+  функцією `New-BRAVODiscoveryBaselineSnapshot`, що й збереження. Коди завершення не змінено. Тести:
+  `BackupScope/DeclaredEmptySource*`, `BackupScope/PreviouslyBackedUpEmptySourceWarnsWithoutBaseline`,
+  `BackupScope/DeclaredMissingSourceStaysError`, `BackupScope/MandatoryModelEmptySourceStaysError`,
+  `BackupScope/BaselineBlanksOnlyProvenEmptySource`, `BackupScope/ReconfirmedEmptySourceIsInfo`,
+  `BackupScope/SetupPreviewUsesBaselineSnapshot`, `BackupScope/DriftWarningReportedAsWarning`.
 - **Fix: Archive: оцінка місця враховує дерева з файлами нульової довжини і записи каталогів (#400).**
   Після #279 оцінка за джерелом додавала метадані кожного файлу, але джерело з нульовим сумарним розміром
   лишалось без оцінки, навіть якщо в ньому тисячі порожніх файлів, а каталоги, для яких 7-Zip теж зберігає
