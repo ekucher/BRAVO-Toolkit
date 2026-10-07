@@ -1810,13 +1810,21 @@ function Test-BRAVOSevenZipArchiveSpecificFailure {
     # додатковий захист: "7z t" запускається без -scc, 7-Zip пише
     # перенаправлений вивід у OEM-кодовій сторінці, а .NET декодує його в
     # кодуванні консолі, тож кирилиця зазвичай приходить нечитабельною і
-    # покладатися на неї не можна.
+    # покладатися на неї не можна. Тому, якщо відомий шлях архіву, після
+    # текстових ознак виконується ще й незалежна від мови перевірка: архів
+    # відкривається на читання з тим самим режимом спільного доступу, що й
+    # 7-Zip (FileShare.Read), і читається перший байт. Відмова доступу,
+    # зайнятий чи заблокований файл тут дають виняток — це збій виконання,
+    # а не доказ проти архіву, якою б мовою Windows не писала текст.
+    # "System ERROR" враховується лише як окремий рядок-маркер 7-Zip, а не
+    # як частина імені елемента архіву.
     # Поля читаються через PSObject.Properties: не всі джерела результату
     # (стаби, нормалізований порожній результат) мають усі поля (StrictMode).
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [AllowNull()][object]$Result
+        [AllowNull()][object]$Result,
+        [AllowEmptyString()][AllowNull()][string]$ArchivePath
     )
 
     if ($null -eq $Result) { return $false }
@@ -1838,9 +1846,21 @@ function Test-BRAVOSevenZipArchiveSpecificFailure {
     # Локальні змінні, не script scope: функцію виконують і поза модулем
     # (AST-витяг у self-test).
     $archiveContentFailurePattern = '(?i)Data Error|CRC Failed|Headers Error|Unexpected end of (archive|data)|Can ?not open (the )?file as|is not archive|Wrong password|Unsupported (Method|feature)|Unconfirmed start of archive|There are data after the end of archive'
-    $operationalFailurePattern = '(?i)Access is denied|being used by another process|has locked a portion of the file|System ERROR|Відмовлено [ву] доступі|Доступ заборонено|Отказано в доступе|Доступ запрещен|використовується іншим процесом|занят другим процессом'
+    $operationalFailurePattern = '(?i)Access is denied|being used by another process|has locked a portion of the file|(?m:^[ \t]*System ERROR)|Відмовлено [ву] доступі|Доступ заборонено|Отказано в доступе|Доступ запрещен|використовується іншим процесом|занят другим процессом'
     if ($outputText -notmatch $archiveContentFailurePattern) { return $false }
     if ($outputText -match $operationalFailurePattern) { return $false }
+    if (-not [string]::IsNullOrEmpty($ArchivePath)) {
+        $archiveProbe = $null
+        try {
+            $archiveProbe = [IO.File]::Open($ArchivePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            $archiveProbeBuffer = New-Object byte[] 1
+            [void]$archiveProbe.Read($archiveProbeBuffer, 0, 1)
+        } catch {
+            return $false
+        } finally {
+            if ($null -ne $archiveProbe) { $archiveProbe.Dispose() }
+        }
+    }
     return $true
 }
 
@@ -2032,7 +2052,7 @@ function Invoke-BRAVOSevenZipIntegrityTest {
     # Windows). Завершеною перевірка вважається лише тоді, коли канонічний
     # класифікатор (той самий, що в Test-SevenZipArchiveIntegrity) визнає
     # збій archive-specific; усе інше — fail-closed збій виконання.
-    $secondOperationalFailure = -not (Test-BRAVOSevenZipArchiveSpecificFailure -Result $secondAttempt)
+    $secondOperationalFailure = -not (Test-BRAVOSevenZipArchiveSpecificFailure -Result $secondAttempt -ArchivePath $ArchivePath)
     $firstAttempt | Add-Member -MemberType NoteProperty -Name FallbackAttemptOperationalFailure -Value ([bool]$secondOperationalFailure) -Force
     return $firstAttempt
 }

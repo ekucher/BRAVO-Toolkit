@@ -220,7 +220,7 @@ function Test-SevenZipArchiveIntegrity {
     # розгортає колекцію властивостей у масив, і індексація за іменем ламається.
     $resultProperties = $testResult.PSObject.Properties
     $failureTimedOut = ($null -ne $resultProperties['TimedOut'] -and [bool]$testResult.TimedOut)
-    $archiveSpecificFailure = [bool](Test-BRAVOSevenZipArchiveSpecificFailure -Result $testResult)
+    $archiveSpecificFailure = [bool](Test-BRAVOSevenZipArchiveSpecificFailure -Result $testResult -ArchivePath $ArchivePath)
     if ($null -ne $FailureInfo) {
         $FailureInfo['ArchiveSpecific'] = [bool]$archiveSpecificFailure
         $FailureInfo['ExitCode'] = $testResult.ExitCode

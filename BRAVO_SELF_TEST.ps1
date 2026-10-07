@@ -21179,6 +21179,9 @@ try {
         'Cp866MisdecodedTextWithSystemErrorMarker'    = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = ("System ERROR:`n{0}`nERROR: Data Error : payload.txt" -f [Text.Encoding]::UTF8.GetString([Text.Encoding]::GetEncoding(866).GetBytes($sz394RuDenied))); Expected = $false }
         'SevenZipSystemErrorWithContentText'   = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "System ERROR:`n????????? ? ???????.`nERROR: Data Error : payload.txt"; Expected = $false }
         # --- пошкоджений вміст: archive-specific
+        # Ім'я елемента архіву, що містить "System ERROR", — не маркер 7-Zip:
+        # пошкоджений вміст лишається archive-specific.
+        'EntryNamedSystemErrorWithDataError' = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: Data Error : System ERROR report.txt'; Expected = $true }
         'CrcFailed'                = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: CRC Failed : payload.txt'; Expected = $true }
         'DataError'                = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: Data Error : payload.txt'; Expected = $true }
         'HeadersError'             = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: Headers Error'; Expected = $true }
@@ -21337,6 +21340,29 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
                 Test-Path -LiteralPath (Join-Path $runRoot 'SZ394RET_before_20260101_0100.mdz') -PathType Leaf) -Force
             return $runOutcome
         }
+        # Незалежна від мови ознака: архів, який не відкривається на читання
+        # (тут — утримується іншим процесом без спільного доступу), не є
+        # доказом пошкодження, навіть якщо системний текст — мовою, якої
+        # немає в шаблонах (німецька), а маркера "System ERROR" немає.
+        $sz394ProbeResult = New-Object PSObject -Property @{
+            Success = $false; ExitCode = 2; TimedOut = $false; Error = $null; StandardOutput = ''
+            StandardError = "ERROR: Data Error : payload.txt`nZugriff verweigert."
+        }
+        $sz394ProbePath = Join-Path $sz394Root 'probe_locked.7z'
+        [IO.File]::WriteAllText($sz394ProbePath, 'SZ394:probe')
+        $sz394ProbeUnlocked = BRAVO.Compatibility\Test-BRAVOSevenZipArchiveSpecificFailure -Result $sz394ProbeResult -ArchivePath $sz394ProbePath
+        $sz394ProbeLock = [IO.File]::Open($sz394ProbePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            $sz394ProbeLocked = BRAVO.Compatibility\Test-BRAVOSevenZipArchiveSpecificFailure -Result $sz394ProbeResult -ArchivePath $sz394ProbePath
+        } finally {
+            $sz394ProbeLock.Dispose()
+        }
+        $sz394ProbeMissing = BRAVO.Compatibility\Test-BRAVOSevenZipArchiveSpecificFailure -Result $sz394ProbeResult -ArchivePath (Join-Path $sz394Root 'probe_missing.7z')
+        Test-BRAVOCondition `
+            -Condition ($sz394ProbeUnlocked -eq $true -and $sz394ProbeLocked -eq $false -and $sz394ProbeMissing -eq $false) `
+            -Name "SevenZipClassifier/UnreadableArchiveIsOperationalInAnyLocale" `
+            -Failure ("архів, який не відкривається на читання (зайнятий іншим процесом / відсутній), мусить давати збій виконання незалежно від мови системного тексту; доступний={0} (очікується True), зайнятий={1} (очікується False), відсутній={2} (очікується False)" -f $sz394ProbeUnlocked, $sz394ProbeLocked, $sz394ProbeMissing)
+
         $sz394RetentionFailedLine = '(?m)^\[ERROR\] Перев[iі]рка ц[iі]л[iі]сност[iі] 7-Zip не пройдена.*SZ394RET_before_20260101_0100'
         foreach ($sz394RetentionCase in @(
                 @{ Scenario = 'UkrainianAccessDeniedOnly'; Name = 'SevenZipClassifier/RetentionLegacyBomFallbackLocalizedAccessDeniedIsCritical' },
@@ -21410,7 +21436,11 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
             foreach ($sz394CallerAst in $sz394CallerAsts) {
                 $sz394Calls = @($sz394CallerAst.Body.FindAll({
                             param($candidate)
-                            $candidate -is [Management.Automation.Language.CommandAst] -and $candidate.GetCommandName() -eq $sz394CanonicalName
+                            $candidate -is [Management.Automation.Language.CommandAst] -and
+                            $candidate.GetCommandName() -eq $sz394CanonicalName -and
+                            @($candidate.CommandElements | Where-Object {
+                                    $_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'ArchivePath'
+                                }).Count -eq 1
                         }, $true))
                 if ($sz394Calls.Count -gt 0) {
                     [void]$sz394CallersFound.Add(('{0}:{1}' -f $sz394File.Name, $sz394CallerName))
