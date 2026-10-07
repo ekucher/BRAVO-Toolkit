@@ -14,6 +14,70 @@
   `Credentials/WorkerModeFailureReportsOperationsStartedFromEntryFlag`; guard
   `Credentials/SystemWorkerNotStartedMarkerOnlyBeforeTaskLaunch` допускає один маркер у `New-SystemWorkerFatalError`
   лише під умовою булевого `OperationsStarted`.
+- **Fix: Archive: `MUTATION_AUTO_ARCHIVED` більше не вважається збоєм SFTP (#285).**
+  `Invoke-BRAVOBazaCanonicalSync` вважала успіхом лише `COMPLETE`, тому цикл з легітимною мутацією в межах
+  `AutoArchiveMutationThreshold` (INFO за `OPERATIONS.md` і Health) завершувався exit 50 з порожньою причиною
+  «ПОМИЛКА» щоразу. Тепер успіх визначає один експортований helper BazaSync `Test-BRAVOBazaSyncStatusSuccess`
+  (`COMPLETE` і `MUTATION_AUTO_ARCHIVED`; усе інше, включно з незнайомим статусом, не успіх). Статуси
+  `MUTATION_VIOLATION`, `REMOTE_CONFLICT`, `AUDIT_DRIFT`, `INCOMPATIBLE_NAME`, `INCOMPLETE` лишаються збоєм, як і
+  раніше. Регресія: `BazaSync/CanonicalSyncMutationAutoArchivedIsSuccess`, `BazaSync/CanonicalSyncCompleteIsSuccess`,
+  `BazaSync/CanonicalSyncFailureStatusesAreNotSuccess`, `BazaSync/StatusSuccessHelperWhitelistsCompleteAndAutoArchivedOnly`.
+  Якщо після авто-архівування не вдалося зберегти стан BazaSync, `MUTATION_AUTO_ARCHIVED` знижується до `INCOMPLETE`
+  з Error (як і `COMPLETE`), тож такий цикл не рахується успіхом. Регресія: `BazaSync/AutoArchiveStateSaveFailureIsNotSuccess`.
+- **Fix: BazaSync: `MUTATION_AUTO_ARCHIVED` не ховає `AUDIT_DRIFT`, `REMOTE_CONFLICT` і `INCOMPATIBLE_NAME` того самого циклу (#293).**
+  Статус `MUTATION_AUTO_ARCHIVED` обирався раніше за drift/конфлікт/несумісні імена, а Fast Health одразу
+  повертав INFO/healthy, тож на сайті з регулярними мутаціями ці проблеми ставали рядками INFO назавжди
+  (`RemoteConflicts` і `IncompatibleFiles` у стані не зберігаються). Авто-архівування виконується за тих самих умов
+  (поріг не змінено), але підсумковий статус тепер обирає найсуворіший: за непорожніх списків drift/конфлікту/
+  несумісних імен цикл отримує `AUDIT_DRIFT`/`REMOTE_CONFLICT`/`INCOMPATIBLE_NAME` (CRITICAL), а факт
+  авто-архівування лишається в Info. Fast Health повертає INFO лише коли цих списків немає. Регресія:
+  `BazaSync/AutoArchivedDoesNotMaskRemoteConflictInFastHealth`,
+  `BazaSync/AutoArchiveWithSameCycleRemoteConflictIsNotAutoArchivedStatus`.
+- **Fix: Maintenance: зламаний старий архів у retention більше не дає код 41 щоночі (#300).**
+  `Remove-OldRestoreArchives` лише оцінює старі архіви реставрації, але його перевірка `7z t` через
+  `Test-BRAVOMaintenanceSevenZipArchiveIntegrity` виставляла `criticalErrorOccurred` і `restoreIntegrityFailed`.
+  Через один давній пошкоджений архів, який ніхто не відновлює, кожен нічний прогін Maintenance завершувався
+  кодом 41 (збій цілісності реставрації). Тепер обгортка має перемикач `-NoFailureFlags`, і лише retention його
+  використовує: збій лишається WARNING у журналі (щоразу, без одноразової позначки) і архів не зараховується як
+  точка відновлення, але прапорці не виставляються. Решта викликів (Verify-Backup, перевірка після реставрації)
+  поводяться як раніше. Коди завершення не змінено. Межі послаблення: `-NoFailureFlags` діє лише для старіших
+  сесій (не найновішої за тим самим порядком, що й retention) і лише для archive-specific збою (7-Zip відпрацював
+  і повернув код 1/2). Зламана найновіша точка відновлення, відсутність жодної придатної точки після збою `7z t`
+  і збій виконання самої перевірки (немає 7-Zip, помилка запуску, таймаут, інші коди) й надалі дають обидва
+  прапорці (код 41). На warning-only шляху рядок «Перевірка цілісності 7-Zip не пройдена» пишеться рівнем
+  WARNING, а не ERROR (`Test-SevenZipArchiveIntegrity` отримав необов'язкові `-ArchiveFailureLevel` і `-FailureInfo`;
+  без них поведінка інших викликачів незмінна). Регресія:
+  `Maintenance/RetentionBrokenOldArchiveDoesNotSetFailureFlags`, `Maintenance/RetentionBrokenOldArchiveStillLogsWarning`,
+  `Maintenance/DirectIntegrityCheckStillSetsFailureFlags`, `Maintenance/RetentionOldBrokenArchiveNoFlagsSameKeepDeleteSet`,
+  `Maintenance/RetentionOldBrokenArchiveLogsWarningNotError`, `Maintenance/RetentionNewestBrokenRestorePointSetsFailureFlags`,
+  `Maintenance/RetentionAllRestorePointsBrokenSetsFailureFlags`, `Maintenance/RetentionNoValidRestorePointLeftSetsFailureFlags`,
+  `Maintenance/RetentionOldArchiveValidatorMissingSetsFailureFlags`, `Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags`.
+  Уточнення межі: warning-only отримує лише сесія, старша за вже підтверджену придатну точку відновлення (обхід від
+  найновішої), тож збій сесії, новішої за всі придатні (зокрема коли найновіша непридатна лише через `.sha512`), критичний.
+  Код 1/2 вважається archive-specific лише за власними (нелокалізованими) повідомленнями 7-Zip про вміст архіву
+  (`Data Error`, `CRC Failed`, `Wrong password`, `Can not open the file as archive` тощо); локалізована відмова доступу
+  чи зайнятий файл без них — збій виконання (код 41). Якщо в legacy BOM-fallback друга спроба не завершила перевірку
+  (таймаут, помилка запуску, інший код), `Invoke-BRAVOSevenZipIntegrityTest` позначає це `FallbackAttemptOperationalFailure`,
+  і збій не вважається archive-specific. Регресія: `Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags`,
+  `Maintenance/RetentionBrokenNewerThanAnyValidPointSetsFailureFlags`, `LegacyBomFallback/FallbackAttemptTimeoutIsNotArchiveSpecific`,
+  `LegacyBomFallback/CompletedFallbackFailureIsNotOperational`. Друга (legacy BOM) спроба з кодом 1/2 без власних
+  повідомлень 7-Zip про вміст архіву (наприклад, локалізована відмова доступу) теж позначається як незавершена
+  перевірка, а порожній результат валідатора нормалізується до збою виконання до першого читання властивостей.
+  Регресія: `LegacyBomFallback/FallbackAttemptLocalizedAccessFailureIsNotArchiveSpecific`,
+  `ArchiveHelpers/IntegrityNullValidatorResultIsOperationalFailure`. Виняток самої перевірки 7z t у retention (а не
+  результат) теж виставляє прапорці цілісності навіть для старшої сесії (перевірку не виконано). Регресія:
+  `Maintenance/RetentionValidatorExceptionSetsFailureFlags`.
+- **Fix: Archive: таймаут перевірки SFTP повертає `$false` і звільняє lock WinSCP (#290).**
+  `Test-SFTPConnection` після таймауту вбивала WinSCP і кидала виняток раніше, ніж `Complete-BRAVOProcessOutputCapture`
+  звільняла lock `BRAVO_WINSCP`. Викликачі (ручний `-SyncBAZA` і `Main`) не мають `try`, тому прогін завершувався
+  кодом 90 замість шляху «SFTP недоступний», а lock лишався захопленим. Тепер при таймауті ресурси звільняються
+  (збій звільнення логується WARNING), в журнал пишеться ERROR з описом таймауту, функція повертає `$false`,
+  і діє наявна обробка збою SFTP з кодом 50. Значення кодів завершення не змінено. Регресія:
+  `Archive/SftpConnectionTimeoutReturnsFalse`, `Archive/SftpConnectionTimeoutReleasesWinSCPLock`,
+  `Archive/SftpConnectionTimeoutLogsError`. Lock звільняється лише після підтвердженого завершення WinSCP; якщо
+  процес не завершився, lock лишається (capture з lock-потоком зберігається в script scope до завершення процесу BRAVO,
+  щоб GC не звільнив lock), а прогін іде фатальним шляхом, щоб не запустити другий WinSCP паралельно
+  (`Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive`).
 - **Fix: Credentials: виняток SYSTEM-кроку відкочує сховище поточного користувача (#302).**
   `Restore-CredentialOperationSnapshots` запускався лише за рядками результату зі `Status=Error`. Якщо
   `Invoke-AsSystem` кидав виняток (таймаут worker-а, `FatalError`, збій Task Scheduler), блок мав лише `finally`

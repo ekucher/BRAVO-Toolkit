@@ -6616,22 +6616,49 @@ function Invoke-CommandWithLog {
 function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
     param(
         [string]$SevenZipPath,
-        [string]$ArchivePath
+        [string]$ArchivePath,
+        # #300: лише для retention (Remove-OldRestoreArchives) і лише для
+        # СТАРІШИХ (не найновішої) сесій, які він ОЦІНЮЄ: archive-specific
+        # збій (7-Zip відпрацював і забракував архів) дає WARNING, але не
+        # виставляє criticalErrorOccurred/restoreIntegrityFailed (інакше
+        # зламаний старий архів робить кожен нічний прогін exit 41).
+        # Збій ВИКОНАННЯ перевірки (немає 7-Zip, помилка запуску, таймаут)
+        # прапорці виставляє і з цим перемикачем — це не доказ проти
+        # архіву, а непрацююча перевірка (fail-safe).
+        [switch]$NoFailureFlags
     )
 
     # T006: fallback-успіх пише WARNING через цей самий Logger (Write-Log
     # -> BRAVOWarningCount -> код 10) і реєструє ім'я архіву в колекторі
     # прогону для одного сповіщення (Add-BRAVOMaintenanceLegacyBomFallbackAlert).
-    $integrityValid = Test-SevenZipArchiveIntegrity `
-        -SevenZipPath $SevenZipPath `
-        -ArchivePath $ArchivePath `
-        -Password $script:ArchivePassword `
-        -TimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
-        -Logger { param($Message, $Level) Write-Log $Message -Level $Level } `
-        -LegacyBomFallbackCollector $script:MaintenanceLegacyBomFallbackArchives
+    $integrityArguments = @{
+        SevenZipPath = $SevenZipPath
+        ArchivePath = $ArchivePath
+        Password = $script:ArchivePassword
+        TimeoutSeconds = $SevenZipIntegrityTestTimeoutSeconds
+        Logger = { param($Message, $Level) Write-Log $Message -Level $Level }
+        LegacyBomFallbackCollector = $script:MaintenanceLegacyBomFallbackArchives
+    }
+    # Без -NoFailureFlags виклик ідентичний попередньому (без нових
+    # параметрів); з ним — рядок archive-specific збою пишеться WARNING,
+    # а класифікація збою повертається через FailureInfo.
+    $integrityFailureInfo = $null
+    if ($NoFailureFlags) {
+        $integrityFailureInfo = @{}
+        $integrityArguments['ArchiveFailureLevel'] = 'WARNING'
+        $integrityArguments['FailureInfo'] = $integrityFailureInfo
+    }
+    $integrityValid = Test-SevenZipArchiveIntegrity @integrityArguments
     if (-not $integrityValid) {
-        $script:criticalErrorOccurred = $true
-        $script:restoreIntegrityFailed = $true
+        $archiveSpecificFailure = (
+            $null -ne $integrityFailureInfo -and
+            $integrityFailureInfo.ContainsKey('ArchiveSpecific') -and
+            [bool]$integrityFailureInfo['ArchiveSpecific']
+        )
+        if (-not $NoFailureFlags -or -not $archiveSpecificFailure) {
+            $script:criticalErrorOccurred = $true
+            $script:restoreIntegrityFailed = $true
+        }
     }
     return $integrityValid
 }
@@ -6850,10 +6877,19 @@ function Remove-OldRestoreArchives {
     # До ліміту версій зараховуються лише сесії, що мають хоча б один
     # повністю перевірений архів. Неповна нова сесія не повинна витіснити
     # стару придатну точку відновлення.
+    # #300: сесії обходяться від найновішої (Name = мітка часу
+    # yyyyMMdd_HHmm, той самий порядок, що й retention нижче). -NoFailureFlags
+    # отримує лише сесія, СТАРША за вже підтверджену придатну точку
+    # відновлення: збій 7z t найновішої сесії або будь-якої сесії, новішої
+    # за всі придатні (зокрема коли найновіша непридатна лише через hash),
+    # лишається критичним (exit 41), як до #300.
+    $sevenZipIntegrityFailureSeen = $false
+    $validRestorePointNewerSeen = $false
     $validGroups = @()
     $invalidGroups = @()
-    foreach ($group in $archiveGroups) {
+    foreach ($group in @($archiveGroups | Sort-Object Name -Descending)) {
         $validArchiveCount = 0
+        $isOlderGroup = $validRestorePointNewerSeen
         foreach ($archive in @($group.Group)) {
             $hashPath = "$($archive.FullName).sha512"
             $archiveValid = $false
@@ -6873,9 +6909,24 @@ function Remove-OldRestoreArchives {
                 if ($actualHash -cne $expectedHash) {
                     throw "SHA512 не збігається"
                 }
-                if (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
+                # #300: виняток самої перевірки (а не результат) — перевірку не
+                # виконано, це збій виконання, не доказ пошкодження архіву:
+                # fail-closed, прапорці навіть для старшої сесії.
+                $integrityPassed = $false
+                try {
+                    $integrityPassed = Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
                         -SevenZipPath $ARC_PATH `
-                        -ArchivePath $archive.FullName)) {
+                        -ArchivePath $archive.FullName `
+                        -NoFailureFlags:$isOlderGroup
+                } catch {
+                    $sevenZipIntegrityFailureSeen = $true
+                    Write-Log "Перевірку 7z t не виконано: $($archive.Name) — $($_.Exception.Message)" -Level "ERROR"
+                    $script:criticalErrorOccurred = $true
+                    $script:restoreIntegrityFailed = $true
+                    throw "перевірку 7z t не виконано"
+                }
+                if (-not $integrityPassed) {
+                    $sevenZipIntegrityFailureSeen = $true
                     throw "перевірка 7z t не пройдена"
                 }
                 $archiveValid = $true
@@ -6887,9 +6938,19 @@ function Remove-OldRestoreArchives {
 
         if ($validArchiveCount -gt 0) {
             $validGroups += $group
+            $validRestorePointNewerSeen = $true
         } else {
             $invalidGroups += $group
         }
+    }
+
+    # #300: жодної придатної точки відновлення не лишилось, а причиною
+    # (хоча б частково) був збій 7z t — критично, як до #300, навіть якщо
+    # окремі збої старіших сесій були лише WARNING.
+    if (@($validGroups).Count -eq 0 -and $sevenZipIntegrityFailureSeen) {
+        Write-Log "Не лишилось жодної придатної точки відновлення у $Path (перевірка 7z t не пройдена)" -Level "ERROR"
+        $script:criticalErrorOccurred = $true
+        $script:restoreIntegrityFailed = $true
     }
 
     $sortedGroups = @($validGroups | Sort-Object Name -Descending)
