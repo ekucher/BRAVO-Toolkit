@@ -20798,6 +20798,16 @@ try {
             -Name "ArchiveHelpers/IntegrityNullValidatorResultIsOperationalFailure" `
             -Failure "порожній результат валідатора має давати false і ArchiveSpecific=false без винятку; threw='$t006NullThrew', result=$t006NullHelper, archiveSpecific=$($t006NullInfo['ArchiveSpecific'])"
 
+        # #394: збій виконання (порожній результат валідатора) пишеться
+        # рівнем ERROR навіть при -ArchiveFailureLevel WARNING.
+        $t006NullFailedLevels = @($t006FallbackTimeoutEntries |
+            Where-Object { $_.Message.Contains('nullresult_MODEL.7z') -and $_.Message -match 'не пройдена' } |
+            ForEach-Object { $_.Level })
+        Test-BRAVOCondition `
+            -Condition ($t006NullFailedLevels.Count -eq 1 -and $t006NullFailedLevels[0] -ceq 'ERROR') `
+            -Name "ArchiveHelpers/IntegrityNullValidatorResultLogsFailureAtError" `
+            -Failure "порожній результат валідатора — збій виконання: рядок 'не пройдена' має бути рівно один і рівнем ERROR (не ArchiveFailureLevel WARNING); рівні=[$($t006NullFailedLevels -join ',')]"
+
         $t006NormalEntries = New-Object System.Collections.Generic.List[object]
         $t006NormalLogger = & { param($t006NormalEntries) { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006NormalEntries
         $t006NormalCollector = New-Object 'System.Collections.Generic.List[string]'
@@ -21111,6 +21121,305 @@ try {
         ) `
         -Name "RestoreDrill/ScriptImplementsFullDrillCycle" `
         -Failure "BRAVO_RESTORE_TEST.ps1 має вибирати один COMPLETE GenerationId для всіх компонентів через спільні функції BRAVO.ArchiveHelpers (не локальні копії), перевіряти SHA512/7za, розпаковувати в ізольований каталог, повертати контрактний exit code і прибирати за собою"
+
+    # ================================================================
+    # #394: класифікатор власних повідомлень 7-Zip («archive-specific»
+    # збій: 7-Zip відпрацював і сам забракував архів) — одна матриця для
+    # ОБОХ шляхів, що його застосовують:
+    #   * BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity (FailureInfo
+    #     .ArchiveSpecific і рівень рядка "не пройдена": WARNING лише для
+    #     archive-specific при -ArchiveFailureLevel WARNING, інакше ERROR);
+    #   * BRAVO.Compatibility\Invoke-BRAVOSevenZipIntegrityTest (друга,
+    #     legacy BOM-спроба: FallbackAttemptOperationalFailure).
+    # Справжній production-ланцюг; застабовано лише процесний шар 7-Zip
+    # (Invoke-BRAVOSevenZipIntegrityTestCore у BRAVO.Compatibility).
+    # Fail-closed: усе, що не є доведеним збоєм вмісту архіву (коди 7/8/255,
+    # збій запуску, таймаут, відмова доступу / зайнятий файл будь-якою
+    # мовою Windows), — збій виконання (ERROR, прапорці в retention).
+    # ================================================================
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+    # Фікстурне значення складається з частин (прийом проти entropy-евристики
+    # gitleaks, як у T006); нікуди не пишеться.
+    $sz394Secret = @('sz394', 'classifier', 'fixture') -join '-'
+    $sz394UaDenied = 'Відмовлено в доступі.'
+    $sz394RuDenied = 'Отказано в доступе.'
+    $sz394UaInUse = 'Процес не може отримати доступ до файлу, оскільки цей файл використовується іншим процесом.'
+    $sz394RuInUse = 'Процесс не может получить доступ к файлу, так как этот файл занят другим процессом.'
+    $sz394Scenarios = @{
+        # --- збій виконання інструмента: ніколи не archive-specific
+        'Exit7WithContentText'     = @{ ExitCode = 7; TimedOut = $false; Error = $null; StandardError = 'ERROR: Data Error : payload.txt'; Expected = $false }
+        'Exit8WithContentText'     = @{ ExitCode = 8; TimedOut = $false; Error = $null; StandardError = 'ERROR: Data Error : payload.txt'; Expected = $false }
+        'Exit255WithContentText'   = @{ ExitCode = 255; TimedOut = $false; Error = $null; StandardError = 'ERROR: CRC Failed : payload.txt'; Expected = $false }
+        'LaunchFailureNonZeroCode' = @{ ExitCode = 2; TimedOut = $false; Error = 'не вдалося запустити 7-Zip'; StandardError = 'ERROR: Data Error : payload.txt'; Expected = $false }
+        'TimeoutWithArchiveCode'   = @{ ExitCode = 1; TimedOut = $true; Error = $null; StandardError = 'ERROR: CRC Failed : payload.txt'; Expected = $false }
+        'Exit2UnrecognizedText'    = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: unrecognized fixture failure'; Expected = $false }
+        'EnglishAccessDenied'      = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Can not open the file as archive`nAccess is denied."; Expected = $false }
+        'EnglishFileInUse'         = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Unexpected end of archive`nThe process cannot access the file because it is being used by another process."; Expected = $false }
+        'UkrainianAccessDeniedOnly' = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: $sz394UaDenied"; Expected = $false }
+        'RussianAccessDeniedOnly'  = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: $sz394RuDenied"; Expected = $false }
+        'RussianFileInUseOnly'     = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: $sz394RuInUse"; Expected = $false }
+        # --- локалізована відмова доступу / зайнятий файл РАЗОМ із текстом
+        # 7-Zip про вміст: англійська Windows тут уже дає збій виконання,
+        # тож і українська/російська мусять (паритет локалей, fail-closed).
+        'UkrainianAccessDeniedWithContentText' = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Can not open the file as archive`n$sz394UaDenied"; Expected = $false }
+        'RussianAccessDeniedWithContentText'   = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Data Error : payload.txt`n$sz394RuDenied"; Expected = $false }
+        'UkrainianFileInUseWithContentText'    = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Unexpected end of archive`n$sz394UaInUse"; Expected = $false }
+        'RussianFileInUseWithContentText'      = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Headers Error`n$sz394RuInUse"; Expected = $false }
+        # Власний (нелокалізований) маркер 7-Zip системної помилки ОС; текст
+        # після нього — у кодовій сторінці консолі й може бути нечитабельним.
+        'SevenZipSystemErrorWithContentText'   = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "System ERROR:`n????????? ? ???????.`nERROR: Data Error : payload.txt"; Expected = $false }
+        # --- пошкоджений вміст: archive-specific
+        'CrcFailed'                = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: CRC Failed : payload.txt'; Expected = $true }
+        'DataError'                = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: Data Error : payload.txt'; Expected = $true }
+        'HeadersError'             = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: Headers Error'; Expected = $true }
+        'CannotOpenAsArchive'      = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: Can not open the file as archive'; Expected = $true }
+        'CannotOpenAs7zArchive'    = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: Cannot open the file as [7z] archive'; Expected = $true }
+        'Exit1DataAfterEndOfArchive' = @{ ExitCode = 1; TimedOut = $false; Error = $null; StandardError = 'WARNINGS: There are data after the end of archive'; Expected = $true }
+    }
+    $sz394Root = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_SZ394_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($sz394Root)
+    try {
+        & (Get-Module -Name 'BRAVO.Compatibility') {
+            param($Scenarios)
+            $script:sz394StubScenarios = $Scenarios
+            function script:Invoke-BRAVOSevenZipIntegrityTestCore {
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                    'PSAvoidUsingPlainTextForPassword', 'Password',
+                    Justification = 'Self-test стаб процесного шару 7-Zip: той самий контракт параметрів, що production-ядро; значення фікстурне.')]
+                param([string]$SevenZipPath, [string]$ArchivePath, [string]$Password, [int]$TimeoutSeconds)
+                $null = $SevenZipPath
+                $null = $TimeoutSeconds
+                # Вміст фікстури: 'SZ394:ok' | 'SZ394:direct:<сценарій>' | 'SZ394:fb:<сценарій>'.
+                $stubParts = ([IO.File]::ReadAllText($ArchivePath)).Split(':')
+                $stubHasBomPrefix = $Password.Length -gt 0 -and $Password[0] -eq [char]0xFEFF
+                if ($stubParts[1] -eq 'ok') {
+                    return New-Object PSObject -Property @{
+                        Success = $true; ExitCode = 0; Description = 'OK'; TimedOut = $false
+                        StandardOutput = 'Everything is Ok'; StandardError = ''; Error = $null
+                    }
+                }
+                if ($stubParts[1] -eq 'fb' -and -not $stubHasBomPrefix) {
+                    # Перша спроба legacy-архіву: password-failure -> друга (BOM) спроба.
+                    return New-Object PSObject -Property @{
+                        Success = $false; ExitCode = 2; Description = 'Fatal error'; TimedOut = $false
+                        StandardOutput = ''; StandardError = 'ERROR: Data Error in encrypted file. Wrong password? : payload.txt'; Error = $null
+                    }
+                }
+                $stubScenario = $script:sz394StubScenarios[$stubParts[2]]
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = $stubScenario['ExitCode']; Description = 'fixture'
+                    TimedOut = [bool]$stubScenario['TimedOut']; Error = $stubScenario['Error']
+                    StandardOutput = ''; StandardError = [string]$stubScenario['StandardError']
+                }
+            }
+        } $sz394Scenarios
+
+        $sz394Entries = New-Object System.Collections.Generic.List[object]
+        $sz394Logger = & { param($sz394Entries) { param($Message, $Level) $sz394Entries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $sz394Entries
+        $sz394FailedLineLevels = {
+            param([string]$Leaf)
+            return @($sz394Entries |
+                Where-Object { $_.Message.Contains($Leaf) -and $_.Message -match 'не пройдена' } |
+                ForEach-Object { $_.Level })
+        }
+        foreach ($sz394Name in @($sz394Scenarios.Keys | Sort-Object)) {
+            $sz394Expected = [bool]$sz394Scenarios[$sz394Name]['Expected']
+            $sz394ExpectedLevel = if ($sz394Expected) { 'WARNING' } else { 'ERROR' }
+            $sz394DirectLeaf = "direct_$sz394Name.7z"
+            $sz394FallbackLeaf = "fb_$sz394Name.7z"
+            $sz394DirectPath = Join-Path $sz394Root $sz394DirectLeaf
+            $sz394FallbackPath = Join-Path $sz394Root $sz394FallbackLeaf
+            [IO.File]::WriteAllText($sz394DirectPath, "SZ394:direct:$sz394Name")
+            [IO.File]::WriteAllText($sz394FallbackPath, "SZ394:fb:$sz394Name")
+
+            $sz394DirectInfo = @{}
+            $sz394DirectResult = BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity `
+                -SevenZipPath 'stub-7za' -ArchivePath $sz394DirectPath -Password $sz394Secret `
+                -Logger $sz394Logger -ArchiveFailureLevel 'WARNING' -FailureInfo $sz394DirectInfo
+            $sz394FallbackRaw = BRAVO.Compatibility\Invoke-BRAVOSevenZipIntegrityTest `
+                -SevenZipPath 'stub-7za' -ArchivePath $sz394FallbackPath -Password $sz394Secret -TimeoutSeconds 5
+            $sz394FallbackMarker = $sz394FallbackRaw.PSObject.Properties['FallbackAttemptOperationalFailure']
+            $sz394FallbackInfo = @{}
+            $sz394FallbackResult = BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity `
+                -SevenZipPath 'stub-7za' -ArchivePath $sz394FallbackPath -Password $sz394Secret `
+                -Logger $sz394Logger -ArchiveFailureLevel 'WARNING' -FailureInfo $sz394FallbackInfo
+            $sz394DirectLevels = @(& $sz394FailedLineLevels $sz394DirectLeaf)
+            $sz394FallbackLevels = @(& $sz394FailedLineLevels $sz394FallbackLeaf)
+            Test-BRAVOCondition `
+                -Condition (
+                    $false -eq $sz394DirectResult -and
+                    $sz394DirectInfo.ContainsKey('ArchiveSpecific') -and
+                    [bool]$sz394DirectInfo['ArchiveSpecific'] -eq $sz394Expected -and
+                    $sz394DirectLevels.Count -eq 1 -and $sz394DirectLevels[0] -ceq $sz394ExpectedLevel -and
+                    $null -ne $sz394FallbackMarker -and
+                    [bool]$sz394FallbackRaw.FallbackAttemptOperationalFailure -eq (-not $sz394Expected) -and
+                    $false -eq $sz394FallbackResult -and
+                    $sz394FallbackInfo.ContainsKey('ArchiveSpecific') -and
+                    [bool]$sz394FallbackInfo['ArchiveSpecific'] -eq $sz394Expected -and
+                    $sz394FallbackLevels.Count -eq 1 -and $sz394FallbackLevels[0] -ceq $sz394ExpectedLevel
+                ) `
+                -Name "SevenZipClassifier/$sz394Name" `
+                -Failure ("сценарій {0}: очікувано archive-specific={1} (рядок 'не пройдена' рівнем {2}) однаково для Test-SevenZipArchiveIntegrity і для другої (legacy BOM) спроби Invoke-BRAVOSevenZipIntegrityTest; пряма перевірка: result={3}, archiveSpecific={4}, рівні=[{5}]; fallback: FallbackAttemptOperationalFailure={6}, archiveSpecific={7}, рівні=[{8}]" -f $sz394Name, $sz394Expected, $sz394ExpectedLevel, $sz394DirectResult, $sz394DirectInfo['ArchiveSpecific'], ($sz394DirectLevels -join ','), $(if ($null -ne $sz394FallbackMarker) { $sz394FallbackMarker.Value } else { '<немає>' }), $sz394FallbackInfo['ArchiveSpecific'], ($sz394FallbackLevels -join ','))
+        }
+
+        # --- End-to-end retention (Remove-OldRestoreArchives ->
+        # Test-BRAVOMaintenanceSevenZipArchiveIntegrity -> справжні
+        # ArchiveHelpers і Compatibility з legacy BOM-fallback). Стара сесія
+        # (новіша вже підтверджена) — legacy-архів, друга (BOM) спроба якого
+        # завершується локалізованою відмовою доступу. Це збій виконання:
+        # ERROR, critical + restoreIntegrityFailed (exit 41), архів не видалено.
+        $sz394RetentionStubText = @'
+function Write-Log {
+    param($Message, [string]$Level = 'INFO')
+    [void]$script:sz394RetentionLogLines.Add("[$Level] $Message")
+}
+function Get-BRAVOFileHash {
+    param([string]$Path, [string]$Algorithm)
+    return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
+}
+function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity @args }
+'@
+        $sz394RetentionModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($sz394RetentionStubText + "`n" + [IO.File]::ReadAllText(
+                (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)) `
+            -FunctionNames @(
+                'Write-Log', 'Get-BRAVOFileHash', 'Test-SevenZipArchiveIntegrity',
+                'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
+                'Test-BRAVOMaintenanceSevenZipArchiveIntegrity'
+            )
+        $sz394RetentionRun = {
+            param([string]$ScenarioName)
+            $runRoot = Join-Path $sz394Root ("retention_{0}" -f $ScenarioName)
+            [void][IO.Directory]::CreateDirectory($runRoot)
+            foreach ($runSession in @('20260101_0100', '20260102_0100', '20260103_0100')) {
+                $runFileName = "SZ394RET_before_$runSession.mdz"
+                $runArchivePath = Join-Path $runRoot $runFileName
+                $runContent = if ($runSession -eq '20260101_0100') { "SZ394:fb:$ScenarioName" } else { 'SZ394:ok' }
+                [IO.File]::WriteAllText($runArchivePath, $runContent)
+                $runHash = (Get-FileHash -LiteralPath $runArchivePath -Algorithm SHA512).Hash
+                "$runHash *$runFileName" | Out-File -FilePath "$runArchivePath.sha512" -Encoding ASCII
+            }
+            $runOutcome = & $sz394RetentionModule {
+                param($Path, $ArchiveSecretText)
+                Set-StrictMode -Version Latest
+                $script:sz394RetentionLogLines = New-Object System.Collections.ArrayList
+                $script:ArchivePrefixRegex = [regex]::Escape('SZ394RET')
+                $script:ARC_PATH = 'stub-7za'
+                $script:ArchivePassword = $ArchiveSecretText
+                $script:SevenZipIntegrityTestTimeoutSeconds = 5
+                $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
+                $script:criticalErrorOccurred = $false
+                $script:restoreIntegrityFailed = $false
+                $runThrew = $null
+                try {
+                    Remove-OldRestoreArchives -Path $Path -ArchivePrefix 'SZ394RET' -KeepCount 2 -InvalidRetentionDays 30
+                } catch {
+                    $runThrew = $_.Exception.Message
+                }
+                [pscustomobject]@{
+                    Threw = $runThrew
+                    Critical = [bool]$script:criticalErrorOccurred
+                    RestoreFailed = [bool]$script:restoreIntegrityFailed
+                    Log = (@($script:sz394RetentionLogLines) -join "`n")
+                }
+            } $runRoot $sz394Secret
+            $runOutcome | Add-Member -NotePropertyName OldArchiveKept -NotePropertyValue (
+                Test-Path -LiteralPath (Join-Path $runRoot 'SZ394RET_before_20260101_0100.mdz') -PathType Leaf) -Force
+            return $runOutcome
+        }
+        $sz394RetentionFailedLine = '(?m)^\[ERROR\] Перев[iі]рка ц[iі]л[iі]сност[iі] 7-Zip не пройдена.*SZ394RET_before_20260101_0100'
+        foreach ($sz394RetentionCase in @(
+                @{ Scenario = 'UkrainianAccessDeniedOnly'; Name = 'SevenZipClassifier/RetentionLegacyBomFallbackLocalizedAccessDeniedIsCritical' },
+                @{ Scenario = 'UkrainianAccessDeniedWithContentText'; Name = 'SevenZipClassifier/RetentionLegacyBomFallbackLocalizedAccessDeniedWithContentTextIsCritical' })) {
+            $sz394RetentionOutcome = & $sz394RetentionRun $sz394RetentionCase['Scenario']
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -ne $sz394RetentionOutcome -and
+                    $null -eq $sz394RetentionOutcome.Threw -and
+                    $sz394RetentionOutcome.Critical -and
+                    $sz394RetentionOutcome.RestoreFailed -and
+                    $sz394RetentionOutcome.OldArchiveKept -and
+                    [regex]::IsMatch([string]$sz394RetentionOutcome.Log, $sz394RetentionFailedLine)
+                ) `
+                -Name $sz394RetentionCase['Name'] `
+                -Failure ("retention, legacy BOM-fallback, друга спроба — локалізована відмова доступу ({0}): збій виконання має давати ERROR, `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed, архів лишається; critical={1}, restoreIntegrityFailed={2}, kept={3}, threw={4}, журнал: {5}" -f $sz394RetentionCase['Scenario'], $sz394RetentionOutcome.Critical, $sz394RetentionOutcome.RestoreFailed, $sz394RetentionOutcome.OldArchiveKept, $sz394RetentionOutcome.Threw, $sz394RetentionOutcome.Log)
+        }
+    } catch {
+        Test-BRAVOCondition `
+            -Condition $false `
+            -Name "SevenZipClassifier/ScenarioCompleted" `
+            -Failure "#394-сценарій класифікатора 7-Zip впав: $($_.Exception.Message)"
+    } finally {
+        if (Test-Path -LiteralPath $sz394Root) {
+            Remove-Item -LiteralPath $sz394Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        # Прибрати стаб процесного шару для решти self-test.
+        Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+        Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+    }
+
+    # #394: структурний guard — класифікатор існує в ОДНОМУ місці.
+    # Шаблон власних повідомлень 7-Zip про вміст і виняток "відмова доступу /
+    # зайнятий файл" — рядкові літерали рівно одного визначення
+    # (Test-BRAVOSevenZipArchiveSpecificFailure, BRAVO.Compatibility), а
+    # обидва споживачі викликають його. Дубль у двох модулях уже розходився б
+    # при наступній правці одного з них (fail-open в одному шляху).
+    $sz394LiteralOwners = New-Object System.Collections.Generic.List[string]
+    $sz394CallersFound = New-Object System.Collections.Generic.List[string]
+    $sz394CanonicalName = 'Test-BRAVOSevenZipArchiveSpecificFailure'
+    $sz394ModuleFiles = @(
+        Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -File |
+            Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.psm1' }
+    )
+    foreach ($sz394File in $sz394ModuleFiles) {
+        $sz394ParseErrors = $null
+        $sz394Ast = [Management.Automation.Language.Parser]::ParseFile($sz394File.FullName, [ref]$null, [ref]$sz394ParseErrors)
+        $sz394Strings = @($sz394Ast.FindAll({
+                    param($candidate)
+                    if (-not ($candidate -is [Management.Automation.Language.StringConstantExpressionAst] -or
+                            $candidate -is [Management.Automation.Language.ExpandableStringExpressionAst])) {
+                        return $false
+                    }
+                    $candidateText = [string]$candidate.Value
+                    return ($candidateText.Contains('Unconfirmed start of archive') -or
+                        $candidateText.Contains('being used by another process'))
+                }, $true))
+        foreach ($sz394String in $sz394Strings) {
+            $sz394Owner = $sz394String.Parent
+            while ($null -ne $sz394Owner -and -not ($sz394Owner -is [Management.Automation.Language.FunctionDefinitionAst])) {
+                $sz394Owner = $sz394Owner.Parent
+            }
+            $sz394OwnerName = if ($null -ne $sz394Owner) { $sz394Owner.Name } else { '<script>' }
+            [void]$sz394LiteralOwners.Add(('{0}:{1}' -f $sz394File.Name, $sz394OwnerName))
+        }
+        foreach ($sz394CallerName in @('Test-SevenZipArchiveIntegrity', 'Invoke-BRAVOSevenZipIntegrityTest')) {
+            $sz394CallerAsts = @($sz394Ast.FindAll({
+                        param($candidate)
+                        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq $sz394CallerName
+                    }, $true))
+            foreach ($sz394CallerAst in $sz394CallerAsts) {
+                $sz394Calls = @($sz394CallerAst.Body.FindAll({
+                            param($candidate)
+                            $candidate -is [Management.Automation.Language.CommandAst] -and $candidate.GetCommandName() -eq $sz394CanonicalName
+                        }, $true))
+                if ($sz394Calls.Count -gt 0) {
+                    [void]$sz394CallersFound.Add(('{0}:{1}' -f $sz394File.Name, $sz394CallerName))
+                }
+            }
+        }
+    }
+    $sz394DistinctOwners = @($sz394LiteralOwners | Sort-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition (
+            $sz394LiteralOwners.Count -eq 2 -and
+            $sz394DistinctOwners.Count -eq 1 -and
+            $sz394DistinctOwners[0] -ceq "BRAVO.Compatibility.psm1:$sz394CanonicalName" -and
+            $sz394CallersFound.Contains('BRAVO.ArchiveHelpers.psm1:Test-SevenZipArchiveIntegrity') -and
+            $sz394CallersFound.Contains('BRAVO.Compatibility.psm1:Invoke-BRAVOSevenZipIntegrityTest')
+        ) `
+        -Name "SevenZipClassifier/SingleCanonicalClassifierUsedByBothCallers" `
+        -Failure ("шаблон власних повідомлень 7-Zip про вміст архіву і виняток 'відмова доступу / зайнятий файл' мають жити лише в {0} (BRAVO.Compatibility), а Test-SevenZipArchiveIntegrity і Invoke-BRAVOSevenZipIntegrityTest — викликати його; літерали знайдено в [{1}], виклики — [{2}]" -f $sz394CanonicalName, ($sz394LiteralOwners -join ', '), ($sz394CallersFound -join ', '))
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/LegacyBomFallback' } }
 
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'DataRestore') {
@@ -23096,6 +23405,16 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/RetentionValidatorExceptionSetsFailureFlags" `
         -Failure ("виняток самої перевірки 7z t (а не результат) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorThrows.Critical, $retentionFollowupValidatorThrows.RestoreFailed, $retentionFollowupValidatorThrows.Threw, $retentionFollowupValidatorThrows.Log)
+
+    # #394: той самий збій виконання пишеться рівнем ERROR (а не лише
+    # WARNING "не зараховано"), з іменем архіву.
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupValidatorThrows -and
+            [regex]::IsMatch([string]$retentionFollowupValidatorThrows.Log, '(?m)^\[ERROR\] Перев[iі]рку 7z t не виконано: ' + [regex]::Escape("${retentionFollowupPrefix}_before_20260101_0100.mdz"))
+        ) `
+        -Name "Maintenance/RetentionValidatorExceptionLogsError" `
+        -Failure ("виняток самої перевірки 7z t на старій сесії має писати рядок 'Перевірку 7z t не виконано' рівнем ERROR з іменем архіву; журнал: {0}" -f $retentionFollowupValidatorThrows.Log)
 
     # (f) #300 (data-integrity F2): найновіша сесія непридатна лише через
     # відсутній .sha512, друга — зламана (7z t). Друга новіша за БУДЬ-ЯКУ
