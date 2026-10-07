@@ -1970,3 +1970,275 @@ function Restore-BRAVOServiceStartTypeSnapshot {
     }
     }
     #endregion #297-start-type-suppression
+
+    # ============================================================
+    # #314 хвиля 2: характеризація циклу «зупинка служб -> журнали -> запуск»
+    # нічного Maintenance (ТЗ §6 п.2 у формі характеризації). Тест виконує
+    # СПРАВЖНІ фрагменти BRAVO.Maintenance.Runtime.ps1 між стабільними
+    # якорями (знімок/зупинка, обробка журналів, finally-запуск) у
+    # in-memory пісочниці: Get-Service, Invoke-ServiceStateChange,
+    # Get/Stop-Process, маркер і сповіщення затінені стабами, що лише
+    # записують дії в трасу. Траса кожного сценарію порівнюється з
+    # еталоном, знятим на коді ДО винесення циклу у функції: читабельна
+    # частина (порядок зупинки/запуску й kill Bis) і SHA256 повної траси
+    # (тексти журналу, рівні, сповіщення, маркер, кроки) — винесення не
+    # має змінити жодного рядка поведінки.
+    # ============================================================
+    #region #314-wave2-lifecycle-characterization
+    & {
+    $lifecycleRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8).Replace("`r`n", "`n")
+    $lifecycleSystemText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.System\BRAVO.System.psm1"), [Text.Encoding]::UTF8).Replace("`r`n", "`n")
+    $lifecycleSliceProblems = New-Object System.Collections.Generic.List[string]
+    $getLifecycleSlice = {
+        param([string]$Text, [string]$StartAnchor, [string]$EndPattern, [bool]$IncludeStart, [bool]$IncludeEnd, [bool]$LastStart = $false)
+        $startIndex = if ($LastStart) { $Text.LastIndexOf($StartAnchor, [StringComparison]::Ordinal) } else { $Text.IndexOf($StartAnchor, [StringComparison]::Ordinal) }
+        if ($startIndex -lt 0) { [void]$lifecycleSliceProblems.Add("якір '$StartAnchor' не знайдено"); return '' }
+        if (-not $IncludeStart) { $startIndex += $StartAnchor.Length }
+        $endMatch = ([regex]$EndPattern).Match($Text, $startIndex)
+        if (-not $endMatch.Success) { [void]$lifecycleSliceProblems.Add("кінцевий якір '$EndPattern' не знайдено"); return '' }
+        $endIndex = if ($IncludeEnd) { $endMatch.Index + $endMatch.Length } else { $endMatch.Index }
+        return $Text.Substring($startIndex, $endIndex - $startIndex)
+    }
+    # Знімок стану -> маркер -> зупинка (до реставрації). Фрагмент відкриває
+    # два try-блоки прогону, які закриваються далі у файлі.
+    $lifecycleStopSlice = (& $getLifecycleSlice $lifecycleRuntimeText '$script:bravoServiceStartedThisRun = $false' '# ===== ОПЕРАЦІЇ ПІСЛЯ ЗУПИНКИ СЕРВІСІВ =====' $false $false) +
+        "`n} finally { }`n} finally { }`n"
+    # Обробка журналів, поки служби зупинені (останнє входження якоря:
+    # перше належить кроку реставрації).
+    $lifecycleLogSlice = & $getLifecycleSlice $lifecycleRuntimeText '$logsCriticalBefore = $script:criticalErrorOccurred' '(?m)^\} finally \{' $true $false $true
+    $lifecycleStartSlice = & $getLifecycleSlice $lifecycleRuntimeText "Write-BRAVOProgressPhase -Phase 'Відновлення стану служб'" '-WarningsBefore \$restoreServicesWarningsBefore\)' $true $true
+    foreach ($lifecycleSlicePair in @(@('stop', $lifecycleStopSlice), @('logs', $lifecycleLogSlice), @('start', $lifecycleStartSlice))) {
+        $lifecycleParseErrors = $null
+        [void][Management.Automation.Language.Parser]::ParseInput([string]$lifecycleSlicePair[1], [ref]$null, [ref]$lifecycleParseErrors)
+        if (@($lifecycleParseErrors).Count -gt 0) {
+            [void]$lifecycleSliceProblems.Add("фрагмент '$($lifecycleSlicePair[0])' не парситься: $(@($lifecycleParseErrors | ForEach-Object { $_.Message }) -join ' | ')")
+        }
+    }
+    # Усі визначення функцій BRAVO.System і runtime (поза тілами інших
+    # функцій runtime), потім стаби — вони перекривають однойменні справжні функції.
+    $getLifecycleDefinitions = {
+        param([string]$Text)
+        $definitionAst = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+        $definitionTexts = foreach ($functionAst in @($definitionAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+            $parentAst = $functionAst.Parent
+            $nested = $false
+            while ($null -ne $parentAst) {
+                # Тіло runtime — одна функція Invoke-BRAVOMaintenance; її
+                # вкладені функції і є функціями runtime.
+                if ($parentAst -is [Management.Automation.Language.FunctionDefinitionAst] -and $parentAst.Name -ne 'Invoke-BRAVOMaintenance') { $nested = $true; break }
+                $parentAst = $parentAst.Parent
+            }
+            if (-not $nested -and $functionAst.Name -ne 'Invoke-BRAVOMaintenance') { $functionAst.Extent.Text }
+        }
+        return (@($definitionTexts) -join "`n`n")
+    }
+    $lifecycleStubs = @'
+function Add-LifecycleTrace { param([string]$Text) [void]$script:fx.Trace.Add($Text) }
+function Get-Service {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$Name, [string]$DisplayName)
+    if ($script:fx.Services.ContainsKey($Name)) {
+        return [pscustomobject]@{ Name = $Name; DisplayName = $Name; Status = [string]$script:fx.Services[$Name] }
+    }
+    Write-Error -Message "fake: службу $Name не знайдено" -Category ObjectNotFound
+}
+function Get-Process {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$Name)
+    if (@($script:fx.Processes) -contains $Name) { return [pscustomobject]@{ Name = $Name } }
+    Write-Error -Message "fake: процесу $Name немає" -Category ObjectNotFound
+}
+function Stop-Process {
+    param([Parameter(ValueFromPipeline = $true)]$InputObject, [switch]$Force)
+    process { Add-LifecycleTrace ("KILL|{0}|Force={1}" -f $InputObject.Name, [bool]$Force) }
+}
+function Start-Sleep { param([int]$Seconds, [int]$Milliseconds) }
+function Write-BRAVOProgressPhase { param([string]$Phase, [int]$PercentComplete) }
+function Write-Log {
+    param([Parameter(Position = 0)][string]$Message, [Parameter(Position = 1)][string]$Level = 'INFO', [switch]$NoConsole, [switch]$Environmental)
+    if ($Level -eq 'WARNING' -and -not $Environmental) { $script:BRAVOWarningCount++ }
+    Add-LifecycleTrace "LOG|$Level|$Message"
+}
+function Send-SlackAlert {
+    param([string]$Message, [switch]$IsCritical, [string]$Severity)
+    if ($IsCritical) { $script:criticalErrorOccurred = $true }
+    Add-LifecycleTrace ("ALERT|{0}|{1}|{2}" -f [bool]$IsCritical, $Severity, $Message)
+}
+function Send-BRAVOMaintenanceEarlyExitAlerts { param([string]$Reason) Add-LifecycleTrace "EARLYEXIT|$Reason" }
+function Send-InactiveServiceWarning { param([string[]]$ServiceDescriptions) Add-LifecycleTrace ("INACTIVE|{0}" -f (@($ServiceDescriptions) -join ', ')) }
+function Get-BRAVOForeignServiceQuiescenceContext {
+    if ($null -ne $script:fx.Foreign) { return $script:fx.Foreign }
+    return [pscustomobject]@{ Present = $false; OwnerAlive = $false; RestartSuppressed = $false; RestartIntentNames = @(); Owner = $null; HeldSnapshot = @() }
+}
+function New-BRAVOServiceStartTypeSnapshot {
+    param([string[]]$ServiceNames)
+    Add-LifecycleTrace ("SNAPSHOT|{0}" -f (@($ServiceNames) -join ','))
+    return @(@($ServiceNames) | ForEach-Object { [pscustomobject]@{ Name = $_; StartMode = 'Automatic' } })
+}
+function Get-BRAVOMaintenanceUnrestorableServiceNames { param([string[]]$ManagedNames, [object[]]$Snapshot) return @() }
+function Write-BRAVOServiceQuiescenceState {
+    param([string]$Owner, [object[]]$Services, [string]$LogFile, [object[]]$StartTypeSnapshot, [switch]$RestartSuppressed, [switch]$PreserveForeignStartTypeSnapshot)
+    Add-LifecycleTrace ("MARKER|{0}|{1}|suppressed={2}" -f $Owner, (@($Services | ForEach-Object { '{0}={1}' -f $_.Name, [bool]$_.RestartIntent }) -join ','), [bool]$RestartSuppressed)
+}
+function Suspend-BRAVOServiceAutostart {
+    param([object[]]$Snapshot)
+    Add-LifecycleTrace ("SUSPEND|{0}" -f (@($Snapshot | ForEach-Object { $_.Name }) -join ','))
+    return [pscustomobject]@{ Applied = @($Snapshot | ForEach-Object { $_.Name }); Failed = @() }
+}
+function Restore-BRAVOServiceStartTypeSnapshot {
+    param([object[]]$Snapshot)
+    Add-LifecycleTrace ("RESTORETYPES|{0}" -f (@($Snapshot | ForEach-Object { $_.Name }) -join ','))
+    return [pscustomobject]@{ Restored = @($Snapshot | ForEach-Object { $_.Name }); Failed = @(); Foreign = @() }
+}
+function Clear-BRAVOServiceQuiescenceState { Add-LifecycleTrace 'MARKERCLEAR'; return $true }
+function Invoke-ServiceStateChange {
+    param([string]$Name, [string]$DesiredStatus, [int]$TimeoutSeconds, [int]$PollIntervalSeconds = 2, [switch]$Force)
+    Add-LifecycleTrace ("SVC|{0}>{1}|Force={2}" -f $Name, $DesiredStatus, [bool]$Force)
+    if (@($script:fx.Failures) -contains "$Name>$DesiredStatus") {
+        return [pscustomobject]@{ Success = $false; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = [string]$script:fx.Services[$Name]; Error = "fake: $Name не перейшла в $DesiredStatus" }
+    }
+    $script:fx.Services[$Name] = $DesiredStatus
+    return [pscustomobject]@{ Success = $true; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = $DesiredStatus; Error = $null }
+}
+function Write-BRAVOMaintenanceStep { param([string]$Name, [string]$Status, [string]$Details) Add-LifecycleTrace "STEP|$Name|$Status|$Details" }
+function Write-BRAVOMaintenanceOperation { param([string]$Name, [string]$Status, [string]$Details) Add-LifecycleTrace "OPERATION|$Name|$Status|$Details" }
+function Invoke-BRAVOTraceRotation { param([object[]]$Sources, [string]$DestinationDirectory, [int]$RetryCount, [int]$RetryDelaySeconds, $Logger) Add-LifecycleTrace 'ROTATE|trace'; return [pscustomobject]@{ Moved = 2; Errors = 0 } }
+function Invoke-BRAVOExchangeApiLogRotation { param([string]$SourceDirectory, [string]$DestinationDirectory, [object[]]$Patterns, [int]$RetryCount, [int]$RetryDelaySeconds, $Logger) Add-LifecycleTrace 'ROTATE|exchangAPI'; return [pscustomobject]@{ Found = 3; Moved = 3; Errors = 0 } }
+function Invoke-BRAVOApacheLogRotation { param([string]$SourceDirectory, [string]$DestinationDirectory, [string]$Filter, [int]$RetryCount, [int]$RetryDelaySeconds, $Logger) Add-LifecycleTrace 'ROTATE|apache'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
+function Invoke-BRAVOWebApplicationLogRotation { param([string]$SourceDirectory, [string]$DestinationDirectory, [string]$Filter, [int]$RetryCount, [int]$RetryDelaySeconds, $Logger) Add-LifecycleTrace 'ROTATE|www'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
+'@
+    $lifecycleModule = $null
+    if ($lifecycleSliceProblems.Count -eq 0) {
+        $lifecycleModule = New-Module -ScriptBlock {
+            param([string]$DefinitionsText, [string]$StubsText)
+            Set-StrictMode -Version 2.0
+            . ([scriptblock]::Create($DefinitionsText))
+            . ([scriptblock]::Create($StubsText))
+        } -ArgumentList @(((& $getLifecycleDefinitions $lifecycleSystemText) + "`n`n" + (& $getLifecycleDefinitions $lifecycleRuntimeText)), $lifecycleStubs)
+    }
+    $runLifecycleScenario = {
+        param([hashtable]$Scenario)
+        & $lifecycleModule {
+            param([hashtable]$Scenario, [string]$StopSlice, [string]$LogSlice, [string]$StartSlice)
+            $flag = { param([string]$Key, $Default) if ($Scenario.ContainsKey($Key)) { $Scenario[$Key] } else { $Default } }
+            $script:fx = @{
+                Services = @{ 'BRAVO' = $Scenario.Bravo; 'exchangAPI' = $Scenario.Exchange; 'Apache2.4' = $Scenario.Web }
+                Processes = @(& $flag 'Processes' @('Bis'))
+                Failures = @(& $flag 'Failures' @())
+                Foreign = (& $flag 'Foreign' $null)
+                Trace = New-Object System.Collections.Generic.List[string]
+            }
+            $script:criticalErrorOccurred = $false
+            $script:BRAVOWarningCount = 0
+            $script:bravoServiceStartedThisRun = $false
+            $script:modelIntegrityEstablished = [bool](& $flag 'Integrity' $true)
+            $script:BRAVOMaintenanceLogsStepEnabled = $true
+            $BravoServiceName = 'BRAVO'; $ExchangAPIServiceName = 'exchangAPI'; $BravoWebServiceName = 'Apache2.4'
+            $BravoMaintenanceEnabled = [bool](& $flag 'BravoEnabled' $true)
+            $BravoServiceDisabledBySystem = [bool](& $flag 'BravoDisabled' $false)
+            $exchangAPIServiceEnabled = [bool](& $flag 'ExchangeEnabled' $true)
+            $exchangAPIServiceDisabled = [bool](& $flag 'ExchangeDisabled' $false)
+            $BravoWebMaintenanceEnabled = [bool](& $flag 'WebEnabled' $true)
+            $restoreOnDisabledBravo = [bool](& $flag 'RestoreOnDisabledBravo' $false)
+            $bootRestoreIgnoresWindow = [bool](& $flag 'BootHold' $false)
+            $shouldRestore = [bool](& $flag 'ShouldRestore' $false)
+            $RunMissedRestoreOnly = $false; $missedDailyWork = $false; $missedRestoreDue = $false; $scheduledOccurrence = $null
+            $LOG_FILE = 'C:\BRAVO\LOGS\BRAVO_MAINTENANCE_selftest.log'
+            $ARC_DIR = 'D:\ARC'; $ARCH_NAME1 = 'before.mdz'
+            $ServiceStopTimeoutSeconds = 120; $ServiceStartTimeoutSeconds = 180; $ServicePollIntervalSeconds = 2
+            $traceConfiguration = $null
+            $traceOutSources = @('C:\BRAVO\bravo.out'); $TRACE_DIR = 'D:\TRACE'; $MoveRetryCount = 1; $MoveRetryDelaySeconds = 0; $bravoLogRotationLogger = $null
+            $traceOutputProcessedCount = 0; $traceOutputProcessed = $false
+            $exchangAPILogsFoundCount = 0; $exchangAPILogsProcessedCount = 0; $webApacheLogsProcessedCount = 0; $webWwwLogsProcessedCount = 0
+            $exchangeApiRuntime = [pscustomobject]@{ Directory = 'C:\exchangAPI\logs' }
+            $EXCHANGE_LOG_DIR = 'D:\EXCHANGE'; $EXCHANGAPI_LOG_FILTERS = @('*.log')
+            $ApacheEnabled = [bool](& $flag 'ApacheEnabled' $true)
+            $APACHE_LOGS_DIR = 'C:\Apache24\logs'; $APACHE_DAILY_LOG_DIR = 'D:\APACHE'; $APACHE_LOG_FILTER = '*.log'
+            $WWW_LOGS_DIR = 'C:\www\logs'; $BRAVOWEB_APP_DAILY_LOG_DIR = 'D:\WWW'; $BRAVOWEB_APP_LOG_FILTER = '*.log'
+            . ([scriptblock]::Create($StopSlice)) | ForEach-Object { Add-LifecycleTrace "OUT|$_" }
+            # Між зупинкою і журналами runtime знімає стан BRAVO для воріт
+            # файлової фази (поза межами циклу служб) — та сама формула.
+            $bravoStatus = if ($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) { [string](Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
+            $bravoFilePhaseAllowed = (($BravoMaintenanceEnabled -or $restoreOnDisabledBravo) -and $bravoStatus -in @('Stopped', 'Paused'))
+            . ([scriptblock]::Create($LogSlice)) | ForEach-Object { Add-LifecycleTrace "OUT|$_" }
+            Add-LifecycleTrace ("COUNTS|trace={0}/{1}|exchange={2}/{3}|apache={4}|www={5}" -f $traceOutputProcessedCount, $traceOutputProcessed, $exchangAPILogsFoundCount, $exchangAPILogsProcessedCount, $webApacheLogsProcessedCount, $webWwwLogsProcessedCount)
+            . ([scriptblock]::Create($StartSlice)) | ForEach-Object { Add-LifecycleTrace "OUT|$_" }
+            Add-LifecycleTrace ("END|critical={0}|warnings={1}|restartFailed={2}|bravoStarted={3}|final={4}" -f $script:criticalErrorOccurred, $script:BRAVOWarningCount, $serviceRestartFailed, $script:bravoServiceStartedThisRun,
+                $((@('BRAVO', 'exchangAPI', 'Apache2.4') | ForEach-Object { '{0}={1}' -f $_, $script:fx.Services[$_] }) -join ','))
+            return $script:fx.Trace.ToArray()
+        } $Scenario $lifecycleStopSlice $lifecycleLogSlice $lifecycleStartSlice
+    }
+    $getLifecycleOrderSummary = {
+        param([string[]]$Trace)
+        $stopPart = @($Trace | Where-Object { $_ -match '^SVC\|.+>Stopped' -or $_ -like 'KILL|*' } | ForEach-Object { if ($_ -like 'KILL|*') { 'kill ' + $_.Split('|')[1] } else { $_.Split('|')[1].Split('>')[0] } }) -join ' '
+        $startPart = @($Trace | Where-Object { $_ -match '^SVC\|.+>Running' } | ForEach-Object { $_.Split('|')[1].Split('>')[0] }) -join ' '
+        return "stop: $stopPart | start: $startPart"
+    }
+    $getLifecycleTraceHash = {
+        param([string[]]$Trace)
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            return (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($Trace -join "`n"))) | ForEach-Object { $_.ToString('x2') }) -join '')
+        } finally { $sha.Dispose() }
+    }
+    # Еталон знято на коді до винесення (developer 758df84). Order —
+    # фактичний порядок зупинки (з kill Bis) і запуску.
+    $lifecycleScenarios = [ordered]@{
+        AllRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running' }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = '6a746c7748596b180cf6f6fc7b48ca932635cfcb741ae47538f351f585a42e68' }
+        OnlyBravoRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Stopped' }; Order = 'stop: kill Bis BRAVO | start: BRAVO'; Hash = 'f96667d8f8bb57ca2e0ae7d60bd8896bea2da6368936196450e9b90bf7c1c31e' }
+        OnlyExchangeRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped' }; Order = 'stop: exchangAPI | start: exchangAPI'; Hash = '2bcb50717558961fd23e6426a8fe021bd93ea602e100142545d18dfab765a6ba' }
+        OnlyWebRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Running' }; Order = 'stop: Apache2.4 | start: Apache2.4'; Hash = '6924d6385e8992306bc9c15c9cae79ebff5b7cfd6daebf0a7be3e4cd3d551a33' }
+        BravoAndExchangeRunning = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Stopped' }; Order = 'stop: exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI'; Hash = '2129e8e477ad46d00803696134caa74406fb07b0f0c9b502f19754c7531f03fa' }
+        BravoFailedOthersRunning = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Running' }; Order = 'stop: Apache2.4 exchangAPI | start: exchangAPI Apache2.4'; Hash = '0e7f3b14ba5ce8e77af266d92681560829f59b58459ed4a7108f30242788f1b7' }
+        AllStopped = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped' }; Order = 'stop:  | start: '; Hash = '70605e31974a4385c89b176f7f92544ac8894b36275984d12631d646d0a99aa2' }
+        BravoStartPendingWebPaused = @{ Spec = @{ Bravo = 'StartPending'; Exchange = 'Running'; Web = 'Paused' }; Order = 'stop: exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI'; Hash = '5733e13d05a38fd097329673630598ac6195548b5b6919eb8dbeb70197711cc8' }
+        ExchangeAndWebUnmanaged = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ExchangeEnabled = $false; ExchangeDisabled = $true; WebEnabled = $false }; Order = 'stop: kill Bis BRAVO | start: BRAVO'; Hash = '3dd7972d8a9738c92038f04ce9c6e8c52784b5ba1993e0ed7326c96c4a258551' }
+        BootHoldAllStopped = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Stopped'; Web = 'Stopped'; BootHold = $true; ShouldRestore = $true }; Order = 'stop:  | start: BRAVO exchangAPI Apache2.4'; Hash = '52d6fd6273849fa71c3fc2b9cc68fc1644eb06fbc1090c0a5e7f4396f8567180' }
+        RestoreHoldsAllManaged = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; ShouldRestore = $true }; Order = 'stop: Apache2.4 kill Bis BRAVO | start: BRAVO Apache2.4'; Hash = '3bbf6e23224a06c542dcd37680ab677d615e6a948f69cc7b4996cd50e3b48638' }
+        InheritedExchangeIntent = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Stopped'; Foreign = [pscustomobject]@{ Present = $true; OwnerAlive = $false; RestartSuppressed = $false; RestartIntentNames = @('exchangAPI'); Owner = 'BRAVO_MAINTENANCE'; HeldSnapshot = @() } }; Order = 'stop: kill Bis BRAVO | start: BRAVO exchangAPI'; Hash = 'd1bca8b200c63ed2ff2d42469ef1f9dfb51a9ae11851c32fa9cb2743eb0baac7' }
+        ModelIntegrityNotEstablished = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Integrity = $false }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: '; Hash = '3f9c7dafd8394cfc42aa5e5f0cd549d186e380f8af3123a3b5f6dcaf8ce727fb' }
+        BravoStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Stopped'; Failures = @('BRAVO>Stopped') }; Order = 'stop: exchangAPI kill Bis BRAVO | start: exchangAPI'; Hash = '6426d5b9e050681e47ea7b77883d1642e8fde1bf7fdbf6c16ce870a02a13d450' }
+        ExchangeStartFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('exchangAPI>Running') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'f660e4cdd898caf03958fd03ce0479e1c26090a4e10e25931eba27d472ff863c' }
+        WebStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Stopped'; Web = 'Running'; Failures = @('Apache2.4>Stopped') }; Order = 'stop: Apache2.4 kill Bis BRAVO | start: BRAVO'; Hash = 'bf8d1767d2d02b040e5bc480361a85fcadb50ab29ee42b54af62c7a292b7b75c' }
+        DisabledBravoForceRestore = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped'; BravoEnabled = $false; BravoDisabled = $true; RestoreOnDisabledBravo = $true }; Order = 'stop: exchangAPI kill Bis | start: exchangAPI'; Hash = '2790d901962e0747608467d155f851717066fcb1fb2e245d479f657237c17a1b' }
+        ExchangeStopFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('exchangAPI>Stopped') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO Apache2.4'; Hash = 'f5b162509d615e0144f9ab8bfce9cf1d346273e44e59b88a6551315b5e1b26a1' }
+        BravoStartFails = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; Failures = @('BRAVO>Running') }; Order = 'stop: Apache2.4 exchangAPI kill Bis BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'cb874e107259f1dbbfc2f6c5b69b371736a81b73e1e80d1bed8b4fa064ff343a' }
+        BravoDisabledNoRestore = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Running'; BravoEnabled = $false; BravoDisabled = $true }; Order = 'stop: Apache2.4 exchangAPI | start: exchangAPI Apache2.4'; Hash = 'd8fe2e7ddd8af3ea6493e724e3c993e5eee6ed2d942db636f63a6c75437678d5' }
+        BravoNotInstalled = @{ Spec = @{ Bravo = 'Stopped'; Exchange = 'Running'; Web = 'Stopped'; BravoEnabled = $false }; Order = 'stop: exchangAPI | start: exchangAPI'; Hash = '2c38150bc11bfea86c02680e010b36113f0cecb4580ff91ebf4f5fb12801e22e' }
+        NoApacheLogs = @{ Spec = @{ Bravo = 'Running'; Exchange = 'Running'; Web = 'Running'; ApacheEnabled = $false; Processes = @() }; Order = 'stop: Apache2.4 exchangAPI BRAVO | start: BRAVO exchangAPI Apache2.4'; Hash = 'b862e5df06e1c2a14852f9d63c81bc16acfa292c8143ff43de8434896eddd559' }
+    }
+    $lifecycleDiffs = New-Object System.Collections.Generic.List[string]
+    $lifecycleActual = [ordered]@{}
+    if ($null -ne $lifecycleModule) {
+        foreach ($lifecycleName in $lifecycleScenarios.Keys) {
+            $lifecycleCase = $lifecycleScenarios[$lifecycleName]
+            $lifecycleTrace = @()
+            try {
+                $lifecycleTrace = @(& $runLifecycleScenario $lifecycleCase.Spec)
+            } catch {
+                [void]$lifecycleDiffs.Add("${lifecycleName}: виняток $($_.Exception.Message)")
+                continue
+            }
+            $lifecycleOrder = & $getLifecycleOrderSummary $lifecycleTrace
+            $lifecycleHash = & $getLifecycleTraceHash $lifecycleTrace
+            $lifecycleActual[$lifecycleName] = "$lifecycleHash :: $lifecycleOrder"
+            if ($lifecycleOrder -cne [string]$lifecycleCase.Order) {
+                [void]$lifecycleDiffs.Add("${lifecycleName}: порядок '$lifecycleOrder' (очікувався '$($lifecycleCase.Order)')")
+            }
+            if ($lifecycleHash -cne [string]$lifecycleCase.Hash) {
+                [void]$lifecycleDiffs.Add("${lifecycleName}: траса $lifecycleHash (еталон $($lifecycleCase.Hash)): $($lifecycleTrace -join ' ¶ ')")
+            }
+        }
+    }
+    if ($env:BRAVO_SELFTEST_LIFECYCLE_DUMP) {
+        foreach ($lifecycleName in $lifecycleActual.Keys) { Write-Host "LIFECYCLE $lifecycleName = $($lifecycleActual[$lifecycleName])" }
+        if ($env:BRAVO_SELFTEST_LIFECYCLE_DUMP -ne "1") { $lifecycleDumpTrace = @(& $runLifecycleScenario $lifecycleScenarios[$env:BRAVO_SELFTEST_LIFECYCLE_DUMP].Spec); $lifecycleDumpTrace | ForEach-Object { Write-Host "  $_" } }
+    }
+    Test-BRAVOCondition `
+        -Condition ($lifecycleSliceProblems.Count -eq 0 -and $lifecycleDiffs.Count -eq 0) `
+        -Name "ServiceRecovery/MaintenanceLifecycleCharacterization" `
+        -Failure "цикл служб нічного Maintenance (знімок -> маркер -> зупинка Web/exchangAPI/BRAVO -> журнали -> запуск BRAVO/exchangAPI/Web) має поводитися як до винесення у функції: $(@($lifecycleSliceProblems) + @($lifecycleDiffs) -join ' || ')"
+    }
+    #endregion #314-wave2-lifecycle-characterization
