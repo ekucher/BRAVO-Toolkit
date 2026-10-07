@@ -1334,6 +1334,7 @@ function Unprotect-LocalMachineSecret { param([string]$ProtectedValue) return $n
 function Invoke-CredentialOperationsTransactional {
     param([string]$Operation, $Entries)
     if ($script:credWorkerScenario -eq 'StoreFailure') { throw 'stub: store write failed' }
+    if ($script:credWorkerScenario -eq 'EmptyMessageFailure') { throw (New-Object System.InvalidOperationException '') }
     return @([pscustomobject]@{ Component = 'COMP'; Target = 'TARGET'; Status = 'Removed'; Message = '' })
 }
 '@
@@ -1344,7 +1345,7 @@ try {
         -SourceText ($credRollbackText + "`r`n" + $credWorkerStubText) `
         -PreferLastDefinitionOnDuplicate `
         -FunctionNames @(
-            'Invoke-ProtectedPayloadWorker',
+            'Invoke-ProtectedPayloadWorker', 'Get-SystemWorkerFatalErrorText',
             'Read-BRAVOTextFile', 'ConvertFrom-BRAVOJson', 'ConvertTo-BRAVOJson',
             'Unprotect-LocalMachineSecret', 'Invoke-CredentialOperationsTransactional'
         )
@@ -1407,6 +1408,103 @@ Test-BRAVOCondition `
     ) `
     -Name 'Credentials/ProtectedPayloadWorkerReportsOperationsStarted' `
     -Failure "Invoke-ProtectedPayloadWorker мусить писати OperationsStarted: `$false для збою до операцій зі сховищем (payload) і `$true, щойно почалась транзакція сховища (збій або успіх); факт: moduleError='$credWorkerModuleError' $credWorkerSummary"
+
+# #395: порожній текст винятку SYSTEM-worker-а не повинен виглядати успіхом.
+# Батьківський бік: FatalError = "" (або пробіли, або без поля) — збій;
+# лише $null — успіх. Виняток для порожнього тексту має зрозуміле повідомлення.
+$credEmptyFatalModule = $null
+$credEmptyFatalModuleError = $null
+try {
+    $credEmptyFatalModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $credRollbackText `
+        -FunctionNames @(
+            'Test-SystemWorkerResponseFailed', 'New-SystemWorkerFatalError',
+            'Add-SystemWorkerNotStartedMarker', 'Test-SystemWorkerNotStartedError'
+        )
+} catch {
+    $credEmptyFatalModuleError = $_.Exception.Message
+}
+$credEmptyFatalCases = @{}
+if ($null -ne $credEmptyFatalModule) {
+    foreach ($credEmptyFatalCase in @(& $credEmptyFatalModule {
+        $responses = [ordered]@{
+            Empty = [pscustomobject]@{ FatalError = ''; Results = @(); OperationsStarted = $true }
+            Blank = [pscustomobject]@{ FatalError = '   '; Results = @(); OperationsStarted = $true }
+            Missing = [pscustomobject]@{ Results = @() }
+            Message = [pscustomobject]@{ FatalError = 'stub: failed'; Results = @(); OperationsStarted = $true }
+            Success = [pscustomobject]@{ FatalError = $null; Results = @(); OperationsStarted = $true }
+        }
+        foreach ($caseName in $responses.Keys) {
+            $failed = [bool](Test-SystemWorkerResponseFailed -WorkerResponse $responses[$caseName])
+            $message = if ($failed) { [string](New-SystemWorkerFatalError -WorkerResponse $responses[$caseName]).Message } else { '' }
+            [pscustomobject]@{ Case = $caseName; Failed = $failed; Message = $message }
+        }
+    })) {
+        $credEmptyFatalCases[$credEmptyFatalCase.Case] = $credEmptyFatalCase
+    }
+}
+$credEmptyFatalSummary = (@($credEmptyFatalCases.Keys | Sort-Object) | ForEach-Object {
+    "$_=$($credEmptyFatalCases[$_].Failed)/'$($credEmptyFatalCases[$_].Message)'"
+}) -join '; '
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credEmptyFatalModuleError -and
+        $credEmptyFatalCases.Count -eq 5 -and
+        $credEmptyFatalCases['Empty'].Failed -and
+        $credEmptyFatalCases['Blank'].Failed -and
+        $credEmptyFatalCases['Missing'].Failed -and
+        $credEmptyFatalCases['Message'].Failed -and
+        -not $credEmptyFatalCases['Success'].Failed -and
+        -not [string]::IsNullOrWhiteSpace($credEmptyFatalCases['Empty'].Message) -and
+        -not [string]::IsNullOrWhiteSpace($credEmptyFatalCases['Blank'].Message) -and
+        $credEmptyFatalCases['Message'].Message -eq 'stub: failed' -and
+        $credRollbackText.Contains('if (Test-SystemWorkerResponseFailed -WorkerResponse $workerResponse) {')
+    ) `
+    -Name 'Credentials/SystemWorkerEmptyFatalErrorIsFailure' `
+    -Failure "Invoke-AsSystem мусить вважати збоєм будь-яку відповідь worker-а, де FatalError не `$null (порожній рядок, пробіли або поле відсутнє), і давати виняток зі зрозумілим текстом; факт: moduleError='$credEmptyFatalModuleError' cases='$credEmptyFatalSummary'"
+
+# #395, worker-бік: виняток з порожнім текстом записується в FatalError
+# непорожнім рядком (тип винятку), щоб і старий батьківський процес бачив збій.
+$credEmptyWorkerModule = $null
+$credEmptyWorkerModuleError = $null
+try {
+    $credEmptyWorkerModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($credRollbackText + "`r`n" + $credWorkerStubText) `
+        -PreferLastDefinitionOnDuplicate `
+        -FunctionNames @(
+            'Invoke-ProtectedPayloadWorker', 'Get-SystemWorkerFatalErrorText',
+            'Read-BRAVOTextFile', 'ConvertFrom-BRAVOJson', 'ConvertTo-BRAVOJson',
+            'Unprotect-LocalMachineSecret', 'Invoke-CredentialOperationsTransactional'
+        )
+} catch {
+    $credEmptyWorkerModuleError = $_.Exception.Message
+}
+$credEmptyWorkerFatal = $null
+$credEmptyWorkerRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CRED_WORKER_EMPTY_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($credEmptyWorkerRoot)
+try {
+    if ($null -ne $credEmptyWorkerModule) {
+        $credEmptyWorkerFatal = & $credEmptyWorkerModule {
+            param($ResultPath)
+            $script:credWorkerScenario = 'EmptyMessageFailure'
+            Invoke-ProtectedPayloadWorker -PayloadPath 'C:\stub\payload.json' -WorkerResultPath $ResultPath
+            $response = [IO.File]::ReadAllText($ResultPath) | ConvertFrom-Json
+            [string]$response.FatalError
+        } (Join-Path $credEmptyWorkerRoot 'result.json')
+    }
+} catch {
+    $credEmptyWorkerModuleError = $_.Exception.Message
+} finally {
+    Remove-Item -LiteralPath $credEmptyWorkerRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credEmptyWorkerModuleError -and
+        -not [string]::IsNullOrWhiteSpace($credEmptyWorkerFatal) -and
+        ([string]$credEmptyWorkerFatal).Contains('InvalidOperationException')
+    ) `
+    -Name 'Credentials/ProtectedPayloadWorkerNeverWritesEmptyFatalError' `
+    -Failure "Invoke-ProtectedPayloadWorker для винятку з порожнім текстом мусить писати непорожній FatalError (ім'я типу винятку); факт: moduleError='$credEmptyWorkerModuleError' fatal='$credEmptyWorkerFatal'"
 
 # Збій worker-режиму ДО Invoke-ProtectedPayloadWorker (конфігурація,
 # модулі — детермінований тригер #302) пишеться загальним catch скрипта:
