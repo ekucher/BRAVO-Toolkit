@@ -29,7 +29,10 @@
         'Get-BRAVOServiceRecoveryChainPlan',
         'Select-BRAVOServiceRecoveryScmEvents',
         'Get-BRAVOServiceRecoveryScmEvents',
-        'Add-BRAVOServiceRecoverySummaryLine'
+        'Add-BRAVOServiceRecoverySummaryLine',
+        # #314 хвиля 5 (задача BRAVO_SERVICE_RECOVERY)
+        'Add-BRAVOServiceRecoveryTaskTriggers',
+        'Test-BRAVOServiceRecoveryTaskDefinition'
     )
 
     # ============================================================
@@ -59,7 +62,7 @@
             $recoveryMissingDefinitions.Count -eq 0
         ) `
         -Name 'ServiceRecovery/ModuleManifestExportsPublicApi' `
-        -Failure ("modules\BRAVO.ServiceRecovery має містити .psm1 і .psd1 (PowerShellVersion 3.0), що експортує рівно публічний API хвиль 3–4; " +
+        -Failure ("modules\BRAVO.ServiceRecovery має містити .psm1 і .psd1 (PowerShellVersion 3.0), що експортує рівно публічний API хвиль 3–5; " +
             "файли=$recoveryFilesPresent PSVersion='$recoveryManifestPsVersion' експорт=[$($recoveryManifestExports -join ', ')] " +
             "без визначення=[$($recoveryMissingDefinitions -join ', ')]")
 
@@ -1613,4 +1616,615 @@ function Write-Log {
         -Name 'ServiceRecovery/RecoverProfileForbiddenCalls' `
         -Failure ("профіль -RecoverServices не пише стан задачі Maintenance/статус операції, не викликає Stop-BRAVOMaintenanceStrayProcess (точка #316), не змінює типи запуску і керує службами лише через Invoke-ServiceStateChange/Start-BRAVOMaintenanceManagedService; runtime не містить Set-Service. " +
             "функцій=$($w4ProfileFunctions.Count)/$($w4ProfileFunctionNames.Count) заборонені=[$($w4ForbiddenFound -join ', ')]")
+}
+
+# ============================================================
+# #314 хвиля 5: FR-4 задача BRAVO_SERVICE_RECOVERY і FR-7 Health.
+#   Тест 8 — тригери задачі: фейковий ITaskDefinition (Linux), справжній
+#            COM Schedule.Service без реєстрації (лише Windows), чиста
+#            перевірка визначення для BRAVO_TASKS_DIAGNOSE і інсталятор
+#            на фейковому планувальнику.
+#   Тест 9 — Health при Failed+Stopped запускає задачу відновлення (один
+#            раз за прогін), а не службу; відсутня/вимкнена задача —
+#            окремий issue; Disabled — без issue; fingerprint алерту не
+#            залежить від ActionText.
+#   Решта  — похідний вузол schedulerSettings.ServiceRecovery (Derivation
+#            і legacy-гілка завантажувача), проводка типу задачі в
+#            Install/Diagnose/Uninstall.
+# ============================================================
+& {
+    $w5ReadText = {
+        param([string]$RelativePath)
+        [IO.File]::ReadAllText((Join-Path $root $RelativePath), [Text.Encoding]::UTF8)
+    }
+    $w5ModuleText = & $w5ReadText 'modules\BRAVO.ServiceRecovery\BRAVO.ServiceRecovery.psm1'
+    $w5SystemText = & $w5ReadText 'modules\BRAVO.System\BRAVO.System.psm1'
+    $w5InstallText = & $w5ReadText 'BRAVO_TASKS_INSTALL.ps1'
+    $w5DiagnoseText = & $w5ReadText 'BRAVO_TASKS_DIAGNOSE.ps1'
+    $w5UninstallText = & $w5ReadText 'BRAVO_TASKS_UNINSTALL.ps1'
+    $w5HealthText = & $w5ReadText 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'
+    $w5DerivationText = & $w5ReadText 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'
+    $w5LoaderText = & $w5ReadText 'BRAVO_CONFIG_LOADER.ps1'
+    $w5ParityText = & $w5ReadText 'ci\Test-BRAVOConfigFoundationParity.ps1'
+    $w5FunctionNamesIn = {
+        param([string]$Text)
+        $ast = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+        return @($ast.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | ForEach-Object { $_.Name } | Select-Object -Unique)
+    }
+    $w5FindFunction = {
+        param([string]$Text, [string]$FunctionName)
+        $ast = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+        @($ast.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $FunctionName
+                }, $true)) | Select-Object -First 1
+    }
+    # Тестовий модуль лише з тих функцій, що справді є в тексті (RED: відсутня
+    # функція дає збій виклику в тесті, а не падіння фрагмента); заглушки
+    # командлетів прибираються з глобальної області.
+    $w5NewModule = {
+        param([string]$SourceText, [string[]]$FunctionNames)
+        $available = @(& $w5FunctionNamesIn $SourceText)
+        $present = @($FunctionNames | Select-Object -Unique | Where-Object { $available -contains $_ })
+        $module = New-BRAVOSelfTestRuntimeModule -SourceText $SourceText -FunctionNames $present
+        foreach ($stubName in $present) {
+            if ($null -eq (Get-Command -Name $stubName -CommandType Cmdlet -ErrorAction SilentlyContinue)) { continue }
+            $leaked = Get-Command -Name $stubName -CommandType Function -ErrorAction SilentlyContinue
+            if ($null -ne $leaked -and $leaked.ModuleName -eq $module.Name) {
+                Remove-Item -Path ('function:' + $stubName) -Force -ErrorAction Stop
+            }
+        }
+        return $module
+    }
+    $w5ModuleFunctions = @(& $w5FunctionNamesIn $w5ModuleText)
+
+    # Фейковий ITaskDefinition: Triggers/Actions — колекції з методом
+    # Create(type), як у COM Task Scheduler 2.0.
+    $w5NewFakeDefinition = {
+        $triggers = New-Object System.Collections.ArrayList
+        Add-Member -InputObject $triggers -MemberType ScriptMethod -Name Create -Value {
+            param([int]$Type)
+            $trigger = [pscustomobject]@{
+                Type = $Type; Enabled = $false; Delay = ''; Subscription = ''; StartBoundary = ''; DaysInterval = 0
+                Repetition = [pscustomobject]@{ Interval = ''; Duration = ''; StopAtDurationEnd = $true }
+            }
+            [void]$this.Add($trigger)
+            return $trigger
+        }
+        $actions = New-Object System.Collections.ArrayList
+        Add-Member -InputObject $actions -MemberType ScriptMethod -Name Create -Value {
+            param([int]$Type)
+            $action = [pscustomobject]@{ Type = $Type; Path = ''; Arguments = ''; WorkingDirectory = '' }
+            [void]$this.Add($action)
+            return $action
+        }
+        [pscustomobject]@{
+            RegistrationInfo = [pscustomobject]@{ Description = '' }
+            Settings = [pscustomobject]@{
+                Enabled = $false; StartWhenAvailable = $true; WakeToRun = $false; Hidden = $false
+                DisallowStartIfOnBatteries = $true; StopIfGoingOnBatteries = $true; MultipleInstances = 0
+                ExecutionTimeLimit = ''; RestartCount = 0; RestartInterval = ''
+            }
+            Principal = [pscustomobject]@{ UserId = ''; LogonType = 0; RunLevel = 0 }
+            Triggers = $triggers
+            Actions = $actions
+            XmlText = ''
+        }
+    }
+    $w5DescribeTriggers = {
+        param($Definition)
+        @(@($Definition.Triggers) | ForEach-Object {
+                '{0}:{1}:{2}:{3}:{4}' -f $_.Type, [bool]$_.Enabled, $_.Delay, $_.Repetition.Interval, $_.DaysInterval
+            }) -join ' '
+    }
+
+    # ============================================================
+    # Тест 8 (Linux): тригери на фейковому визначенні.
+    # ============================================================
+    $w5TriggerModule = & $w5NewModule ($w5ModuleText + "`n" + $w5SystemText) (@($w5ModuleFunctions) + @('Get-BRAVOManagedServiceOrder'))
+    $w5Fake = & $w5NewFakeDefinition
+    $w5Today = New-Object DateTime(2026, 10, 7, 0, 0, 0)
+    $w5BuildError = $null
+    $w5FakeProblems = @('<не виконано>')
+    try {
+        & $w5TriggerModule {
+            param($Definition, $Today)
+            Set-StrictMode -Version 2.0
+            Add-BRAVOServiceRecoveryTaskTriggers -Definition $Definition -Today $Today
+        } $w5Fake $w5Today
+        $w5FakeProblems = @(& $w5TriggerModule {
+                param($Definition)
+                Set-StrictMode -Version 2.0
+                Test-BRAVOServiceRecoveryTaskDefinition -Definition $Definition
+            } $w5Fake)
+    } catch {
+        $w5BuildError = $_.Exception.Message
+    }
+    $w5FakeTriggers = @($w5Fake.Triggers)
+    $w5EventTrigger = @($w5FakeTriggers | Where-Object { $_.Type -eq 0 }) | Select-Object -First 1
+    $w5DailyTrigger = @($w5FakeTriggers | Where-Object { $_.Type -eq 2 }) | Select-Object -First 1
+    $w5Subscription = if ($null -ne $w5EventTrigger) { [string]$w5EventTrigger.Subscription } else { '' }
+    $w5MissingIds = @(7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034 | Where-Object { $w5Subscription -notmatch "EventID=$_\b" })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5BuildError -and
+            (& $w5DescribeTriggers $w5Fake) -ceq '0:True:PT1M::0 8:True:PT10M::0 2:True::PT15M:1' -and
+            $w5Subscription -match '<QueryList>' -and $w5Subscription -match 'Path="System"' -and
+            $w5Subscription -match "Provider\[@Name='Service Control Manager'\]" -and $w5MissingIds.Count -eq 0 -and
+            $null -ne $w5DailyTrigger -and [string]$w5DailyTrigger.StartBoundary -ceq '2026-10-07T00:00:00' -and
+            [string]$w5DailyTrigger.Repetition.Duration -ceq 'P1D' -and -not [bool]$w5DailyTrigger.Repetition.StopAtDurationEnd -and
+            [int]$w5Fake.Settings.MultipleInstances -eq 2 -and [string]$w5Fake.Settings.ExecutionTimeLimit -ceq 'PT1H' -and
+            -not [bool]$w5Fake.Settings.StartWhenAvailable -and
+            @($w5FakeProblems).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/TaskTriggersBuiltOnFakeDefinition' `
+        -Failure ("Add-BRAVOServiceRecoveryTaskTriggers: три тригери — подія SCM (8 EventID, Delay PT1M), старт ОС (Delay PT10M), щодня з 00:00 з повтором PT15M на P1D; MultipleInstances=2 (IgnoreNew), ExecutionTimeLimit PT1H, StartWhenAvailable=false; Test-BRAVOServiceRecoveryTaskDefinition без проблем. " +
+            "помилка='$w5BuildError' тригери='$(& $w5DescribeTriggers $w5Fake)' без EventID=[$($w5MissingIds -join ',')] проблеми=[$(@($w5FakeProblems) -join ' | ')]")
+
+    # Diagnose: чиста перевірка ловить відсутній тригер і неправильні
+    # параметри (фейк, побудований тією самою функцією, потім зіпсований).
+    $w5Broken = & $w5NewFakeDefinition
+    $w5Damaged = & $w5NewFakeDefinition
+    $w5BrokenProblems = @()
+    $w5DamagedProblems = @()
+    $w5DiagnoseError = $null
+    try {
+        & $w5TriggerModule {
+            param($First, $Second, $Today)
+            Add-BRAVOServiceRecoveryTaskTriggers -Definition $First -Today $Today
+            Add-BRAVOServiceRecoveryTaskTriggers -Definition $Second -Today $Today
+        } $w5Broken $w5Damaged $w5Today
+        $w5Broken.Triggers.RemoveAt(1)
+        $w5DamagedEvent = @($w5Damaged.Triggers)[0]
+        $w5DamagedEvent.Subscription = ([string]$w5DamagedEvent.Subscription) -replace ' or EventID=7034', '' -replace 'EventID=7034 or ', ''
+        $w5DamagedEvent.Delay = 'PT5M'
+        @($w5Damaged.Triggers)[2].Repetition.Interval = 'PT1H'
+        @($w5Damaged.Triggers)[1].Enabled = $false
+        $w5Damaged.Settings.MultipleInstances = 0
+        $w5Damaged.Settings.ExecutionTimeLimit = 'PT72H'
+        $w5BrokenProblems = @(& $w5TriggerModule { param($Definition) Set-StrictMode -Version 2.0; Test-BRAVOServiceRecoveryTaskDefinition -Definition $Definition } $w5Broken)
+        $w5DamagedProblems = @(& $w5TriggerModule { param($Definition) Set-StrictMode -Version 2.0; Test-BRAVOServiceRecoveryTaskDefinition -Definition $Definition } $w5Damaged)
+    } catch {
+        $w5DiagnoseError = $_.Exception.Message
+    }
+    $w5DamagedText = @($w5DamagedProblems) -join ' | '
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5DiagnoseError -and
+            @($w5BrokenProblems).Count -eq 1 -and [string]@($w5BrokenProblems)[0] -match 'старт' -and
+            $w5DamagedText -match '7034' -and $w5DamagedText -match 'PT5M' -and $w5DamagedText -match 'PT1H' -and
+            $w5DamagedText -match 'вимкнено' -and $w5DamagedText -match 'MultipleInstances' -and $w5DamagedText -match 'PT72H'
+        ) `
+        -Name 'ServiceRecovery/DiagnoseDetectsMissingTrigger' `
+        -Failure ("Test-BRAVOServiceRecoveryTaskDefinition: без тригера старту ОС — одна проблема про нього; зіпсоване визначення — проблеми про відсутній EventID 7034, Delay PT5M, повтор PT1H, вимкнений тригер, MultipleInstances і ExecutionTimeLimit PT72H. " +
+            "помилка='$w5DiagnoseError' без boot=[$(@($w5BrokenProblems) -join ' | ')] зіпсоване=[$w5DamagedText]")
+
+    # ============================================================
+    # Тест 8 (лише Windows): справжній COM Schedule.Service, без реєстрації
+    # (NewTask лише в пам'яті; XmlText іншого NewTask — перевірка схеми
+    # планувальником). Поза Windows — доведена відсутність COM.
+    # ============================================================
+    $w5IsWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $w5ComXml = ''
+    $w5ComProblems = @('<не виконано>')
+    $w5ComError = $null
+    $w5ComAbsent = $false
+    if ($w5IsWindows) {
+        $w5TaskService = $null
+        try {
+            $w5TaskService = New-Object -ComObject 'Schedule.Service'
+            $w5TaskService.Connect()
+            $w5ComResult = & $w5TriggerModule {
+                param($TaskService)
+                Set-StrictMode -Version 2.0
+                $definition = $TaskService.NewTask(0)
+                Add-BRAVOServiceRecoveryTaskTriggers -Definition $definition
+                $action = $definition.Actions.Create(0)
+                $action.Path = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $action.Arguments = '-NoProfile -File BRAVO_MAINTENANCE.ps1 -NoPause -RecoverServices'
+                $validated = $TaskService.NewTask(0)
+                $validated.XmlText = $definition.XmlText
+                [pscustomobject]@{
+                    Xml = [string]$validated.XmlText
+                    Problems = @(Test-BRAVOServiceRecoveryTaskDefinition -Definition $validated)
+                }
+            } $w5TaskService
+            $w5ComXml = [string]$w5ComResult.Xml
+            $w5ComProblems = @($w5ComResult.Problems)
+        } catch {
+            $w5ComError = $_.Exception.Message
+        } finally {
+            if ($null -ne $w5TaskService) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($w5TaskService) }
+        }
+    } else {
+        try {
+            [void](New-Object -ComObject 'Schedule.Service' -ErrorAction Stop)
+        } catch {
+            $w5ComAbsent = $true
+        }
+    }
+    $w5ComXmlOk = (
+        $w5ComXml.Contains('<EventTrigger>') -and $w5ComXml.Contains('<BootTrigger>') -and $w5ComXml.Contains('<CalendarTrigger>') -and
+        $w5ComXml.Contains('<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>') -and
+        $w5ComXml.Contains('<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>') -and
+        $w5ComXml.Contains('<Delay>PT1M</Delay>') -and $w5ComXml.Contains('<Delay>PT10M</Delay>') -and
+        $w5ComXml.Contains('<Interval>PT15M</Interval>') -and $w5ComXml.Contains('EventID=7034')
+    )
+    Test-BRAVOCondition `
+        -Condition $(if ($w5IsWindows) { $null -eq $w5ComError -and $w5ComXmlOk -and @($w5ComProblems).Count -eq 0 } else { $w5ComAbsent }) `
+        -Name 'ServiceRecovery/TaskXmlViaComContainsThreeTriggers' `
+        -Failure ("Windows: визначення з Add-BRAVOServiceRecoveryTaskTriggers проходить перевірку XML планувальника — EventTrigger/BootTrigger/CalendarTrigger, IgnoreNew, PT1H, Delay PT1M/PT10M, Interval PT15M, EventID у Subscription — і Test-BRAVOServiceRecoveryTaskDefinition на прочитаному з COM визначенні без проблем; поза Windows COM відсутній. " +
+            "windows=$w5IsWindows помилка='$w5ComError' comВідсутній=$w5ComAbsent проблеми=[$(@($w5ComProblems) -join ' | ')]")
+
+    # ============================================================
+    # Інсталятор на фейковому планувальнику: справжня New-BRAVOTaskDefinition
+    # -TaskType ServiceRecovery (Linux, без COM).
+    # ============================================================
+    $w5InstallModule = & $w5NewModule ($w5InstallText + "`n" + $w5ModuleText + "`n" + $w5SystemText) (
+        @('New-BRAVOTaskDefinition', 'ConvertTo-ScheduleTime', 'ConvertTo-BRAVOMultipleInstancesPolicy',
+            'Get-BRAVOExpectedSchedulerPrincipal', 'ConvertTo-BRAVOSchedulerLogonType', 'ConvertTo-BRAVOSchedulerExecutionTimeLimit') +
+        @($w5ModuleFunctions))
+    $w5ScriptDirectory = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_W5_TASK_' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($w5ScriptDirectory)
+    $w5ScriptPath = Join-Path $w5ScriptDirectory 'BRAVO_MAINTENANCE.ps1'
+    [IO.File]::WriteAllText($w5ScriptPath, '# self-test')
+    $w5FakeService = [pscustomobject]@{ Factory = $w5NewFakeDefinition; Created = (New-Object System.Collections.ArrayList) }
+    Add-Member -InputObject $w5FakeService -MemberType ScriptMethod -Name NewTask -Value {
+        param([int]$Flags)
+        $definition = & $this.Factory
+        [void]$this.Created.Add($definition)
+        return $definition
+    }
+    $w5InstallError = $null
+    try {
+        [void](& $w5InstallModule {
+                param($TaskService, $ScriptPath)
+                Set-StrictMode -Version 2.0
+                $script:schedulerSettings = @{
+                    StartWhenAvailable = $true; WakeToRun = $false; Hidden = $false; AllowStartIfOnBatteries = $true
+                    DontStopIfGoingOnBatteries = $true; MultipleInstances = 'Queue'; RestartCount = 0; RestartIntervalMinutes = 0
+                    RunAsUser = 'SYSTEM'; LogonType = 'ServiceAccount'; WindowStyle = 'Hidden'; PowerShellExecutable = 'powershell.exe'
+                }
+                New-BRAVOTaskDefinition -TaskService $TaskService -TaskType 'ServiceRecovery' -ResolvedConfigPath 'C:\BRAVO\BRAVO.config' -TaskSettings @{
+                    Enabled = $true; TaskName = 'BRAVO_SERVICE_RECOVERY'; Description = 'self-test'
+                    ExecutionTimeLimitHours = 1; ScriptPath = $ScriptPath
+                }
+            } $w5FakeService $w5ScriptPath)
+    } catch {
+        $w5InstallError = $_.Exception.Message
+    } finally {
+        Remove-Item -LiteralPath $w5ScriptDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $w5InstalledDefinition = if ($w5FakeService.Created.Count -gt 0) { $w5FakeService.Created[0] } else { $null }
+    $w5InstalledArguments = if ($null -ne $w5InstalledDefinition -and @($w5InstalledDefinition.Actions).Count -gt 0) { [string]@($w5InstalledDefinition.Actions)[0].Arguments } else { '' }
+    $w5InstalledTriggers = if ($null -ne $w5InstalledDefinition) { & $w5DescribeTriggers $w5InstalledDefinition } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5InstallError -and $null -ne $w5InstalledDefinition -and
+            $w5InstalledTriggers -ceq '0:True:PT1M::0 8:True:PT10M::0 2:True::PT15M:1' -and
+            [int]$w5InstalledDefinition.Settings.MultipleInstances -eq 2 -and
+            [string]$w5InstalledDefinition.Settings.ExecutionTimeLimit -ceq 'PT1H' -and
+            -not [bool]$w5InstalledDefinition.Settings.StartWhenAvailable -and
+            $w5InstalledArguments.Contains("-File `"$w5ScriptPath`"") -and
+            $w5InstalledArguments -match '-NoPause -RecoverServices$' -and
+            $w5InstalledArguments -notmatch '-ConfigPath'
+        ) `
+        -Name 'ServiceRecovery/InstallBuildsRecoveryTaskOnFakeScheduler' `
+        -Failure ("New-BRAVOTaskDefinition -TaskType ServiceRecovery: три тригери з Add-BRAVOServiceRecoveryTaskTriggers, IgnoreNew незалежно від глобального MultipleInstances=Queue, ExecutionTimeLimit PT1H, StartWhenAvailable=false, дія -File BRAVO_MAINTENANCE.ps1 ... -NoPause -RecoverServices без -ConfigPath в AUTO-режимі. " +
+            "помилка='$w5InstallError' тригери='$w5InstalledTriggers' аргументи='$w5InstalledArguments'")
+
+    # ============================================================
+    # Проводка типу задачі: ValidateSet-и, taskPlans, очікувані аргументи
+    # Diagnose, видалення в Uninstall, імпорт модуля, журнал типів запуску.
+    # ============================================================
+    $w5ValidateSetHas = {
+        param([string]$Text, [string]$FunctionName)
+        $function = & $w5FindFunction $Text $FunctionName
+        if ($null -eq $function) { return $false }
+        $attribute = @($function.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.AttributeAst] -and $node.TypeName.Name -eq 'ValidateSet'
+                }, $true)) | Select-Object -First 1
+        return ($null -ne $attribute -and @($attribute.PositionalArguments | ForEach-Object { $_.Value }) -contains 'ServiceRecovery')
+    }
+    $w5NewDefinitionFunction = & $w5FindFunction $w5InstallText 'New-BRAVOTaskDefinition'
+    $w5NewDefinitionText = if ($null -ne $w5NewDefinitionFunction) { $w5NewDefinitionFunction.Extent.Text } else { '' }
+    $w5DefinitionCheckFunction = & $w5FindFunction $w5DiagnoseText 'Test-BRAVOScheduledTaskDefinition'
+    $w5DefinitionCheckText = if ($null -ne $w5DefinitionCheckFunction) { $w5DefinitionCheckFunction.Extent.Text } else { '' }
+    $w5WiringChecks = [ordered]@{
+        InstallValidateSet = (& $w5ValidateSetHas $w5InstallText 'New-BRAVOTaskDefinition')
+        InstallSummaryValidateSet = (& $w5ValidateSetHas $w5InstallText 'Format-BRAVOInstalledTaskSummaryNextRun')
+        InstallBuildsTriggers = $w5NewDefinitionText.Contains('Add-BRAVOServiceRecoveryTaskTriggers -Definition $definition')
+        InstallRecoverServicesArgument = $w5NewDefinitionText.Contains('$actionArguments += " -RecoverServices"')
+        InstallTaskPlan = $w5InstallText.Contains('[pscustomobject]@{ Type = "ServiceRecovery"; Settings = $serviceRecoverySettings }')
+        InstallImportsModule = $w5InstallText.Contains('modules\BRAVO.ServiceRecovery\BRAVO.ServiceRecovery.psd1')
+        InstallStartModeJournal = $w5InstallText.Contains('Get-BRAVOManagedServiceStartModeLines')
+        DiagnoseValidateSet = (& $w5ValidateSetHas $w5DiagnoseText 'Format-BRAVODiagnoseTaskNextRun')
+        DiagnoseArguments = $w5DiagnoseText.Contains("ServiceRecovery = @('-NoPause', '-RecoverServices')")
+        DiagnoseLoop = $w5DiagnoseText.Contains('"RestoreVerify", "BackupCatchUp", "ServiceRecovery")) {')
+        DiagnoseChecksDefinition = $w5DefinitionCheckText.Contains('Test-BRAVOServiceRecoveryTaskDefinition -Definition $definition')
+        DiagnoseImportsModule = $w5DiagnoseText.Contains('modules\BRAVO.ServiceRecovery\BRAVO.ServiceRecovery.psd1')
+        UninstallTaskName = $w5UninstallText.Contains('$taskNames += [string]$schedulerSettings.ServiceRecovery.TaskName')
+    }
+    $w5WiringMissing = @($w5WiringChecks.Keys | Where-Object { -not [bool]$w5WiringChecks[$_] })
+    Test-BRAVOCondition `
+        -Condition ($w5WiringMissing.Count -eq 0) `
+        -Name 'ServiceRecovery/TaskTypeWiredIntoInstallDiagnoseUninstall' `
+        -Failure "тип задачі ServiceRecovery: ValidateSet-и, тригери і -RecoverServices у New-BRAVOTaskDefinition, елемент taskPlans, імпорт BRAVO.ServiceRecovery, журнал типів запуску, очікувані аргументи і перевірка визначення в Diagnose, ім'я в Uninstall; бракує: [$($w5WiringMissing -join ', ')]"
+
+    $w5NextRunModule = & $w5NewModule $w5SystemText @('Format-BRAVOSchedulerNextRun')
+    $w5NextRunText = ''
+    try {
+        $w5NextRunText = [string](& $w5NextRunModule {
+                Format-BRAVOSchedulerNextRun -TaskType 'ServiceRecovery' -NextRunTime (New-Object DateTime(2026, 10, 7, 10, 15, 0))
+            })
+    } catch {
+        $w5NextRunText = "помилка: $($_.Exception.Message)"
+    }
+    Test-BRAVOCondition `
+        -Condition ($w5NextRunText -match 'SCM' -and $w5NextRunText -match 'старту Windows' -and $w5NextRunText -match '15 хв' -and $w5NextRunText -match '07\.10\.2026 10:15') `
+        -Name 'ServiceRecovery/TaskNextRunDescribesAllTriggers' `
+        -Failure "Format-BRAVOSchedulerNextRun -TaskType ServiceRecovery: за подією SCM, після старту Windows, кожні 15 хв і дата наступної періодичної перевірки; отримано '$w5NextRunText'"
+
+    # ============================================================
+    # Похідний вузол schedulerSettings.ServiceRecovery: однаковий у
+    # Derivation і legacy-гілці завантажувача, без нових ключів конфігурації;
+    # кожне поле поіменно в allowlist config-parity.
+    # ============================================================
+    $w5NodeOf = {
+        param([string]$Text)
+        $ast = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+        $assignment = @($ast.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                    $node.Left.Extent.Text -eq '$global:schedulerSettings.ServiceRecovery' -and
+                    $node.Right.Extent.Text.TrimStart().StartsWith('@{')
+                }, $true)) | Select-Object -First 1
+        if ($null -eq $assignment) { return $null }
+        $hashtable = @($assignment.Right.FindAll({ param($node) $node -is [Management.Automation.Language.HashtableAst] }, $true)) | Select-Object -First 1
+        $map = [ordered]@{}
+        foreach ($pair in @($hashtable.KeyValuePairs)) {
+            $map[[string]$pair.Item1.Extent.Text] = [string]$pair.Item2.Extent.Text
+        }
+        return $map
+    }
+    $w5DerivedNode = & $w5NodeOf $w5DerivationText
+    $w5LoaderNode = & $w5NodeOf $w5LoaderText
+    $w5NodeDescribe = {
+        param($Map)
+        if ($null -eq $Map) { return '<немає>' }
+        (@($Map.Keys | Where-Object { $_ -ne 'ScriptPath' } | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $Map[$_] }) -join '; ')
+    }
+    $w5ParityMissing = @('Description', 'Enabled', 'ExecutionTimeLimitHours', 'ScriptPath', 'TaskName' |
+            Where-Object { -not $w5ParityText.Contains("'schedulerSettings.ServiceRecovery.$_'") })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $w5DerivedNode -and $null -ne $w5LoaderNode -and
+            (& $w5NodeDescribe $w5DerivedNode) -ceq (& $w5NodeDescribe $w5LoaderNode) -and
+            [string]$w5DerivedNode['TaskName'] -ceq "'BRAVO_SERVICE_RECOVERY'" -and
+            [string]$w5DerivedNode['ExecutionTimeLimitHours'] -ceq '1' -and
+            [string]$w5DerivedNode['Enabled'] -ceq '$serviceRecoveryMaintenanceEnabled' -and
+            [string]$w5DerivedNode['ScriptPath'] -match "BRAVO_MAINTENANCE\.ps1'" -and
+            $w5LoaderText.Contains("`$global:schedulerSettings.ServiceRecovery.ScriptPath = Join-Path `$RuntimeRoot 'BRAVO_MAINTENANCE.ps1'") -and
+            $w5DerivationText.Contains('[bool]$global:schedulerSettings.Maintenance.Enabled') -and
+            $w5ParityMissing.Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/SchedulerNodeDerivedIdenticallyInDerivationAndLoader' `
+        -Failure ("schedulerSettings.ServiceRecovery — похідний вузол (Enabled = Maintenance.Enabled, TaskName BRAVO_SERVICE_RECOVERY, ExecutionTimeLimitHours 1, ScriptPath BRAVO_MAINTENANCE.ps1), однаковий у Derivation і legacy-гілці BRAVO_CONFIG_LOADER, кожне поле в allowlist Test-BRAVOConfigFoundationParity. " +
+            "derivation='$(& $w5NodeDescribe $w5DerivedNode)' loader='$(& $w5NodeDescribe $w5LoaderNode)' parity без=[$($w5ParityMissing -join ', ')]")
+
+    # ============================================================
+    # Тест 9: Health (FR-7) — справжні Get-ManagedServiceHealthIssues і
+    # Start-BRAVOHealthServiceRecoveryTask зі стабами SCM/WMI/маркера/
+    # планувальника; Start-Service має лишитися невикликаним.
+    # ============================================================
+    $w5HealthStubs = @'
+function Write-HealthLog {
+    param($Message, $Level)
+    $script:W5HealthLog += @("$Level|$Message")
+}
+function Get-Service {
+    param($Name, $DisplayName, $ErrorAction)
+    $key = if (-not [string]::IsNullOrWhiteSpace([string]$Name)) { [string]$Name } else { [string]$DisplayName }
+    if (-not $script:W5Services.ContainsKey($key)) { return $null }
+    $spec = $script:W5Services[$key]
+    return [pscustomobject]@{ Name = $key; Status = [string]$spec.Status; StartType = [string]$spec.StartType }
+}
+function Get-BRAVOWmiInstance { param($ClassName) return @() }
+function Read-BRAVOServiceQuiescenceState { return $null }
+function Get-BRAVOScheduledTaskState {
+    param([string]$TaskPath, [string]$TaskName)
+    $script:W5TaskQueries += @("$TaskPath|$TaskName")
+    return $script:W5TaskState
+}
+function Start-ScheduledTask {
+    param($InputObject, $TaskName, $TaskPath, $ErrorAction)
+    $script:W5ScheduledStarts++
+}
+function Start-Service {
+    param($Name, $InputObject, $ErrorAction)
+    $script:W5ServiceStarts++
+}
+function Invoke-W5Health {
+    param([hashtable]$Services, $TaskState, [bool]$RecoveryEnabled = $true, [bool]$RunThrows = $false)
+    $script:W5Services = $Services
+    $script:W5HealthLog = @()
+    $script:W5TaskQueries = @()
+    $script:W5TaskRuns = 0
+    $script:W5ScheduledStarts = 0
+    $script:W5ServiceStarts = 0
+    $script:W5RunThrows = $RunThrows
+    if ($null -ne $TaskState -and $null -ne $TaskState.Task -and [string]$TaskState.Provider -eq 'COM') {
+        Add-Member -InputObject $TaskState.Task -MemberType ScriptMethod -Name Run -Value {
+            param($Parameters)
+            if ($script:W5RunThrows) { throw 'self-test: доступ заборонено' }
+            $script:W5TaskRuns++
+        } -Force
+    }
+    $script:W5TaskState = $TaskState
+    $script:backupMonitoring = @{ CheckManagedServices = $true }
+    $script:maintenanceSettings = [pscustomobject]@{
+        Services = [pscustomobject]@{ BravoName = 'BRAVO'; ExchangeApiName = 'exchangAPI'; BravoWebEnabled = $false; BravoWebCandidates = @() }
+    }
+    $script:schedulerSettings = @{
+        TaskPath = '\BRAVO\'
+        ServiceRecovery = @{ Enabled = $RecoveryEnabled; TaskName = 'BRAVO_SERVICE_RECOVERY' }
+    }
+    $issues = @()
+    $thrown = $null
+    try { $issues = @(Get-ManagedServiceHealthIssues) } catch { $thrown = $_.Exception.Message }
+    return [pscustomobject]@{
+        Thrown = $thrown
+        Issues = @($issues)
+        Queries = @($script:W5TaskQueries)
+        Runs = $script:W5TaskRuns
+        ScheduledStarts = $script:W5ScheduledStarts
+        ServiceStarts = $script:W5ServiceStarts
+        Log = @($script:W5HealthLog)
+    }
+}
+'@
+    $w5HealthModule = & $w5NewModule ($w5HealthStubs + "`n" + $w5HealthText + "`n" + $w5SystemText) @(
+        'Write-HealthLog', 'Get-Service', 'Get-BRAVOWmiInstance', 'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOScheduledTaskState',
+        'Start-ScheduledTask', 'Start-Service', 'Invoke-W5Health', 'Test-BRAVOSettingEnabled',
+        'Get-ManagedServiceHealthIssues', 'Start-BRAVOHealthServiceRecoveryTask', 'Get-AlertFingerprint', 'Get-BRAVOHealthIssueField',
+        'Get-BRAVOHealthIssueActionText', 'Get-BRAVOWin32ServiceInfo', 'Test-BRAVOServiceDisabledByOperator', 'Get-BRAVOServiceStartMode',
+        'Get-BRAVOManagedServiceCondition')
+    $w5RunHealth = {
+        param([hashtable]$Arguments)
+        & $w5HealthModule {
+            param($HealthArguments)
+            Set-StrictMode -Version 2.0
+            Invoke-W5Health @HealthArguments
+        } $Arguments
+    }
+    $w5ReadyTask = { param([string]$Provider = 'COM') [pscustomobject]@{ Exists = $true; State = 'Ready'; IsRunning = $false; Provider = $Provider; Task = [pscustomobject]@{ Name = 'BRAVO_SERVICE_RECOVERY' } } }
+    $w5BothStopped = @{ BRAVO = @{ Status = 'Stopped'; StartType = 'Automatic' }; exchangAPI = @{ Status = 'Stopped'; StartType = 'Manual' } }
+    $w5HealthDescribe = {
+        param($Result)
+        "помилка='$($Result.Thrown)' issues=[$(@($Result.Issues | ForEach-Object { '{0}/{1}/{2}' -f $_.Component, $_.Reason, $(if ($null -ne $_.PSObject.Properties['ActionText']) { $_.ActionText } else { '-' }) }) -join ' || ')] " +
+            "запити=[$(@($Result.Queries) -join ', ')] run=$($Result.Runs) start-scheduledtask=$($Result.ScheduledStarts) start-service=$($Result.ServiceStarts)"
+    }
+    $w5ActionOf = {
+        param($Issue)
+        if ($null -eq $Issue -or $null -eq $Issue.PSObject.Properties['ActionText']) { return '' }
+        return [string]$Issue.ActionText
+    }
+
+    $w5Started = & $w5RunHealth @{ Services = $w5BothStopped; TaskState = (& $w5ReadyTask) }
+    $w5StartedModern = & $w5RunHealth @{ Services = @{ BRAVO = @{ Status = 'Stopped'; StartType = 'Automatic' } }; TaskState = (& $w5ReadyTask 'ScheduledTasks') }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5Started.Thrown -and @($w5Started.Issues).Count -eq 2 -and
+            @($w5Started.Issues | Where-Object { [string]$_.Reason -ceq 'не запущена (стан: Stopped)' -and (& $w5ActionOf $_) -match 'запущено автоматичне відновлення' -and (& $w5ActionOf $_) -match 'RECOVER' }).Count -eq 2 -and
+            (@($w5Started.Queries) -join ',') -ceq '\BRAVO\|BRAVO_SERVICE_RECOVERY' -and
+            [int]$w5Started.Runs -eq 1 -and [int]$w5Started.ServiceStarts -eq 0 -and
+            $null -eq $w5StartedModern.Thrown -and [int]$w5StartedModern.ScheduledStarts -eq 1 -and [int]$w5StartedModern.ServiceStarts -eq 0
+        ) `
+        -Name 'ServiceRecovery/HealthFailedStartsRecoveryTaskNotService' `
+        -Failure ("Health: дві впалі (Failed+Stopped) служби — один запуск задачі BRAVO_SERVICE_RECOVERY (COM Task.Run або Start-ScheduledTask), Start-Service не викликається, issue з тим самим Reason і ActionText «запущено автоматичне відновлення ... RECOVER». " +
+            "COM: $(& $w5HealthDescribe $w5Started) || ScheduledTasks: $(& $w5HealthDescribe $w5StartedModern)")
+
+    $w5Missing = & $w5RunHealth @{
+        Services = @{ BRAVO = @{ Status = 'Stopped'; StartType = 'Automatic' } }
+        TaskState = [pscustomobject]@{ Exists = $false; State = 'NotFound'; IsRunning = $false; Provider = 'COM'; Task = $null }
+    }
+    $w5DisabledTask = & $w5RunHealth @{
+        Services = @{ BRAVO = @{ Status = 'Stopped'; StartType = 'Automatic' } }
+        TaskState = [pscustomobject]@{ Exists = $true; State = 'Disabled'; IsRunning = $false; Provider = 'COM'; Task = [pscustomobject]@{ Name = 'BRAVO_SERVICE_RECOVERY' } }
+    }
+    $w5TaskIssueOf = {
+        param($Result)
+        @($Result.Issues | Where-Object { [string]$_.Component -ceq 'Задача відновлення служб' }) | Select-Object -First 1
+    }
+    $w5MissingIssue = & $w5TaskIssueOf $w5Missing
+    $w5DisabledIssue = & $w5TaskIssueOf $w5DisabledTask
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5Missing.Thrown -and @($w5Missing.Issues).Count -eq 2 -and $null -ne $w5MissingIssue -and
+            [string]$w5MissingIssue.Kind -ceq 'Service' -and [string]$w5MissingIssue.Location -ceq 'BRAVO_SERVICE_RECOVERY' -and
+            [string]$w5MissingIssue.Reason -match 'відсутня або вимкнена' -and (& $w5ActionOf $w5MissingIssue) -match 'BRAVO_TASKS_INSTALL\.ps1' -and
+            $null -eq $w5DisabledTask.Thrown -and @($w5DisabledTask.Issues).Count -eq 2 -and $null -ne $w5DisabledIssue -and
+            [int]$w5DisabledTask.Runs -eq 0 -and [int]$w5Missing.ServiceStarts -eq 0 -and [int]$w5DisabledTask.ServiceStarts -eq 0
+        ) `
+        -Name 'ServiceRecovery/HealthMissingRecoveryTaskYieldsIssue' `
+        -Failure ("Health: задача BRAVO_SERVICE_RECOVERY відсутня або вимкнена при впалій службі — окремий issue «Задача відновлення служб» (Location BRAVO_SERVICE_RECOVERY, дія BRAVO_TASKS_INSTALL.ps1), задача не запускається, служба теж. " +
+            "відсутня: $(& $w5HealthDescribe $w5Missing) || вимкнена: $(& $w5HealthDescribe $w5DisabledTask)")
+
+    $w5AlreadyRunning = & $w5RunHealth @{
+        Services = $w5BothStopped
+        TaskState = [pscustomobject]@{ Exists = $true; State = 'Running'; IsRunning = $true; Provider = 'COM'; Task = [pscustomobject]@{ Name = 'BRAVO_SERVICE_RECOVERY' } }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5AlreadyRunning.Thrown -and @($w5AlreadyRunning.Issues).Count -eq 2 -and
+            @($w5AlreadyRunning.Queries).Count -eq 1 -and [int]$w5AlreadyRunning.Runs -eq 0 -and [int]$w5AlreadyRunning.ServiceStarts -eq 0 -and
+            @($w5AlreadyRunning.Issues | Where-Object { (& $w5ActionOf $_) -match 'вже виконується' }).Count -eq 2
+        ) `
+        -Name 'ServiceRecovery/HealthRunningTaskNotStartedTwice' `
+        -Failure "Health: задача відновлення вже виконується — не запускати вдруге (один запит стану на прогін), ActionText «автоматичне відновлення вже виконується»: $(& $w5HealthDescribe $w5AlreadyRunning)"
+
+    $w5DisabledService = & $w5RunHealth @{
+        Services = @{ BRAVO = @{ Status = 'Stopped'; StartType = 'Disabled' }; exchangAPI = @{ Status = 'Running'; StartType = 'Automatic' } }
+        TaskState = (& $w5ReadyTask)
+    }
+    $w5PausedService = & $w5RunHealth @{ Services = @{ BRAVO = @{ Status = 'Paused'; StartType = 'Automatic' } }; TaskState = (& $w5ReadyTask) }
+    $w5RecoveryOff = & $w5RunHealth @{ Services = @{ BRAVO = @{ Status = 'Stopped'; StartType = 'Automatic' } }; TaskState = (& $w5ReadyTask); RecoveryEnabled = $false }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5DisabledService.Thrown -and @($w5DisabledService.Issues).Count -eq 0 -and @($w5DisabledService.Queries).Count -eq 0 -and
+            $null -eq $w5PausedService.Thrown -and @($w5PausedService.Issues).Count -eq 1 -and @($w5PausedService.Queries).Count -eq 0 -and
+            (& $w5ActionOf @($w5PausedService.Issues)[0]) -eq '' -and
+            $null -eq $w5RecoveryOff.Thrown -and @($w5RecoveryOff.Issues).Count -eq 1 -and @($w5RecoveryOff.Queries).Count -eq 0 -and
+            (& $w5ActionOf @($w5RecoveryOff.Issues)[0]) -eq '' -and
+            [int]$w5DisabledService.ServiceStarts + [int]$w5PausedService.ServiceStarts + [int]$w5RecoveryOff.ServiceStarts -eq 0
+        ) `
+        -Name 'ServiceRecovery/HealthDisabledServiceStillNoIssue' `
+        -Failure ("Health: Disabled від оператора — без issue і без задачі; призупинена служба (Paused) — issue як і раніше, задача не запускається (§0.3); задачу вимкнено в конфігурації (Maintenance вимкнений) — issue без запуску задачі. " +
+            "Disabled: $(& $w5HealthDescribe $w5DisabledService) || Paused: $(& $w5HealthDescribe $w5PausedService) || вимкнено: $(& $w5HealthDescribe $w5RecoveryOff)")
+
+    $w5RunFails = & $w5RunHealth @{ Services = @{ BRAVO = @{ Status = 'Stopped'; StartType = 'Automatic' } }; TaskState = (& $w5ReadyTask); RunThrows = $true }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5RunFails.Thrown -and @($w5RunFails.Issues).Count -eq 1 -and [int]$w5RunFails.ServiceStarts -eq 0 -and
+            (& $w5ActionOf @($w5RunFails.Issues)[0]) -match 'не вдалося запустити задачу BRAVO_SERVICE_RECOVERY' -and
+            (& $w5ActionOf @($w5RunFails.Issues)[0]) -match 'доступ заборонено' -and
+            (& $w5ActionOf @($w5RunFails.Issues)[0]) -match 'BRAVO_MAINTENANCE\.ps1 -RecoverServices'
+        ) `
+        -Name 'ServiceRecovery/HealthRecoveryTaskStartFailureFallsBackToManual' `
+        -Failure "Health: запуск задачі відновлення завершився помилкою — Health не падає, служба не запускається напряму, ActionText з причиною і ручним запуском BRAVO_MAINTENANCE.ps1 -RecoverServices: $(& $w5HealthDescribe $w5RunFails)"
+
+    # Fingerprint алерту не залежить від ActionText: issue з дією відновлення
+    # дає той самий fingerprint, що й issue у форматі до хвилі 5.
+    $w5FingerprintError = $null
+    $w5Fingerprints = [pscustomobject]@{ New = ''; Legacy = ''; Action = '' }
+    try {
+        $w5Fingerprints = & $w5HealthModule {
+            param($Issue)
+            Set-StrictMode -Version 2.0
+            $legacy = [pscustomobject]@{
+                Kind = 'Service'; Component = [string]$Issue.Component; Reason = [string]$Issue.Reason; FileName = ''
+                LastWriteTime = $null; Location = [string]$Issue.Location; SizeBytes = $null; Details = @()
+            }
+            [pscustomobject]@{
+                New = Get-AlertFingerprint -Issues @($Issue)
+                Legacy = Get-AlertFingerprint -Issues @($legacy)
+                Action = Get-BRAVOHealthIssueActionText -Issues @($Issue)
+            }
+        } (@($w5Started.Issues) | Select-Object -First 1)
+    } catch {
+        $w5FingerprintError = $_.Exception.Message
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w5FingerprintError -and $null -ne $w5Fingerprints -and
+            -not [string]::IsNullOrWhiteSpace([string]$w5Fingerprints.New) -and
+            [string]$w5Fingerprints.New -ceq [string]$w5Fingerprints.Legacy -and
+            [string]$w5Fingerprints.Action -match 'запущено автоматичне відновлення'
+        ) `
+        -Name 'ServiceRecovery/HealthRecoveryActionKeepsAlertFingerprint' `
+        -Failure "Health: issue впалої служби з ActionText відновлення має той самий fingerprint, що й issue до хвилі 5 (ActionText не входить у fingerprint), а дія алерту — текст про автоматичне відновлення: помилка='$w5FingerprintError' new='$($w5Fingerprints.New)' legacy='$($w5Fingerprints.Legacy)' дія='$($w5Fingerprints.Action)'"
 }
