@@ -1477,6 +1477,68 @@
         ) -Name 'BazaSync/100000VerifiedPlus10CandidatesDoesNotStatOldVerifiedEntries' -Failure "на 100000 Verified + 10 нових: усі remote-виклики мають стосуватись ЛИШЕ 10 кандидатів (жодного stat для verified_*); PutFiles=$($hr3PerfSession.State.PutFilesCallCount) verifiedTouches=$($hr3PerfVerifiedTouches.Count) GetFileInfo=$(@($hr3PerfSession.State.GetFileInfoCalledFor).Count)"
 
         # =======================================================================
+        # #366: WinSCP читає локальне джерело PutFiles і джерело MoveFile як
+        # маску. BAZA-імена з `[`/`]` (Windows їх дозволяє) мають передаватись
+        # екранованими: інакше `doc[1].txt` збігається з `doc1.txt`.
+        # =======================================================================
+        $maskLocal = Join-Path $bazaSyncTestRoot "Mask366"
+        New-Item -ItemType Directory -Path $maskLocal -Force | Out-Null
+        $maskRealPath = New-BRAVOSelfTestBazaFile -Directory $maskLocal -RelativePath 'doc[1].txt' -SizeBytes 500
+        [void](New-BRAVOSelfTestBazaFile -Directory $maskLocal -RelativePath 'doc1.txt' -SizeBytes 120)
+        $maskSession = New-BRAVOSelfTestWinSCPMaskSession
+        [void]$maskSession.State.KnownRemoteDirs.Add('/baza_app')
+        $maskEntry = [pscustomobject]@{
+            RelativePath = 'doc[1].txt'
+            Size = [int64]500
+            LastWriteTimeUtc = (Get-Item -LiteralPath $maskRealPath).LastWriteTimeUtc
+            FullPath = $maskRealPath
+        }
+        $maskUpload = Invoke-BRAVOBazaFileUpload -Session $maskSession -Entry $maskEntry -LocalDirectory $maskLocal -RemoteRootPath '/baza_app'
+        Test-BRAVOCondition -Condition (
+            $maskUpload.Success -eq $true -and $maskUpload.Outcome -eq 'Uploaded' -and
+            [int64]$maskSession.State.RemoteSizes['/baza_app/doc[1].txt'] -eq 500 -and
+            (@($maskSession.State.PutFilesLocalArgs) -contains (Join-Path $maskLocal 'doc[[]1].txt'))
+        ) -Name 'BazaSync/UploadEscapesWinSCPLocalFileMask' -Failure "upload doc[1].txt має передавати у PutFiles екрановане джерело і залити саме цей файл (500 B); Outcome=$($maskUpload.Outcome) Error=$($maskUpload.Error) remote=$($maskSession.State.RemoteSizes['/baza_app/doc[1].txt']) put=$(@($maskSession.State.PutFilesLocalArgs) -join ',')"
+
+        $maskRenameSession = New-BRAVOSelfTestWinSCPMaskSession
+        $maskRenameSession.State.RemoteSizes['/baza_app/doc[1].txt'] = [int64]500
+        $maskRenameSession.State.RemoteSizes['/baza_app/doc1.txt'] = [int64]120
+        $maskRenameState = [pscustomobject]@{ Files = @{ 'doc[1].txt' = [pscustomobject]@{ Size = [int64]500 } } }
+        try {
+            $maskRenameResult = & (@(Get-Module -Name BRAVO.BazaSync)[0]) {
+                param($state, $session)
+                Invoke-BRAVOBazaMutationAcceptanceCore -State $state -RemoteRootPath '/baza_app' -Session $session `
+                    -MutationPathLookup @{ 'doc[1].txt' = $true } -AcceptRelativePaths @('doc[1].txt')
+            } $maskRenameState $maskRenameSession
+        } catch {
+            $maskRenameResult = [pscustomobject]@{ Accepted = @(); Failures = @([pscustomobject]@{ Error = "виняток: $($_.Exception.Message)" }) }
+        }
+        $maskRenamedKeys = @($maskRenameSession.State.RemoteSizes.Keys | Where-Object { ([string]$_).StartsWith('/baza_app/doc[1].txt.replaced_', [StringComparison]::Ordinal) })
+        Test-BRAVOCondition -Condition (
+            (@($maskRenameResult.Accepted) -contains 'doc[1].txt') -and
+            @($maskRenameResult.Failures).Count -eq 0 -and
+            $maskRenamedKeys.Count -eq 1 -and
+            [int64]$maskRenameSession.State.RemoteSizes[$maskRenamedKeys[0]] -eq 500 -and
+            -not $maskRenameSession.State.RemoteSizes.ContainsKey('/baza_app/doc[1].txt') -and
+            [int64]$maskRenameSession.State.RemoteSizes['/baza_app/doc1.txt'] -eq 120
+        ) -Name 'BazaSync/MutationRenameEscapesWinSCPFileMask' -Failure "rename прийнятої мутації doc[1].txt має перейменувати саме її (джерело MoveFile екрановане), doc1.txt недоторканий; Failures=$(@($maskRenameResult.Failures | ForEach-Object { $_.Error }) -join '; ') renamed=$($maskRenamedKeys -join ',') decoy=$($maskRenameSession.State.RemoteSizes['/baza_app/doc1.txt'])"
+
+        # Checkpoint-и мають фіксовані імена без символів маски: те саме
+        # правило екранування лишає їх незмінними, тож виклики checkpoint
+        # RemoveFiles/MoveFile/PutFiles коректні без екранування.
+        $maskCheckpointNames = @(
+            (Get-BRAVOBazaRemoteCheckpointName),
+            ('.bravo-sync.json.tmp-' + [guid]::NewGuid().ToString('N')),
+            ('bravo-sync-{0}.json' -f [guid]::NewGuid().ToString('N'))
+        )
+        $maskCheckpointUnsafe = @($maskCheckpointNames | Where-Object {
+            $maskCheckpointName = $_
+            try { (ConvertTo-BRAVOWinSCPFileMask -Path $maskCheckpointName) -cne $maskCheckpointName } catch { $true }
+        })
+        Test-BRAVOCondition -Condition ($maskCheckpointUnsafe.Count -eq 0) `
+            -Name 'BazaSync/CheckpointNamesAreWinSCPMaskSafe' -Failure "імена checkpoint-ів мають бути вільні від символів маски WinSCP; змінюються екрануванням: $($maskCheckpointUnsafe -join ',')"
+
+        # =======================================================================
         # HARDENING ROUND 3, P2: результат RemoveFiles при заміні checkpoint;
         # NewAfterCutoff для INCOMPATIBLE_NAME; обидві категорії у Health
         # =======================================================================
