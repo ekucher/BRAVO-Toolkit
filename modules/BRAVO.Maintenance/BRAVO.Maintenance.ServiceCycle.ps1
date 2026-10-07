@@ -64,6 +64,175 @@ function New-BRAVOMaintenanceServiceSet {
     }
 }
 
+function Get-BRAVOMaintenanceServiceConditionSet {
+    # Класифікація всіх керованих служб набору (#314 FR-1) єдиною функцією
+    # Get-BRAVOManagedServiceCondition (BRAVO.System): ключ служби
+    # (Bravo/ExchangeApi/BravoWeb) -> її стан { Name; Status; StartMode;
+    # ExitCode; ServiceSpecificExitCode; Condition; ... }. Некеровані служби
+    # (не встановлені або Disabled оператором) у результат не потрапляють.
+    # Збій класифікації не обриває прогін: служба отримує Condition =
+    # 'Unknown' і причину в Error — такою вона не вважається впалою.
+    # Лише читає. Нею користуються нічний Maintenance і -RecoverServices.
+    param([Parameter(Mandatory = $true)][object]$ServiceSet)
+
+    $conditions = @{}
+    foreach ($serviceKey in @('Bravo', 'ExchangeApi', 'BravoWeb')) {
+        $managedService = $ServiceSet.$serviceKey
+        if (-not [bool]$managedService.Managed -or [string]::IsNullOrWhiteSpace([string]$managedService.Name)) { continue }
+        try {
+            $conditions[$serviceKey] = Get-BRAVOManagedServiceCondition -Name ([string]$managedService.Name)
+        } catch {
+            $conditions[$serviceKey] = [pscustomobject]@{
+                Name = [string]$managedService.Name; Exists = $null; StartMode = $null; Status = $null
+                ExitCode = $null; ServiceSpecificExitCode = $null; Condition = 'Unknown'; Error = $_.Exception.Message
+            }
+        }
+    }
+    return $conditions
+}
+
+function Add-BRAVOMaintenanceFailedServiceRestartIntent {
+    # #314 FR-2: нічний Maintenance піднімає впалі служби. «Мало працювати» =
+    # Running ∪ StartPending (вже в -RestartIntent зі знімка) ∪ Failed:
+    # керована служба у стані Stopped, яку класифікація FR-1 визнала впалою
+    # (не Disabled, не під ownership-маркером; Automatic чи Manual — не
+    # важливо). Такій службі тут виставляється намір перезапуску: вона
+    # потрапляє в маркер з RestartIntent=$true, її журнали обробляються, а
+    # запуск — у канонічному порядку у finally, як для працюючої.
+    # Не піднімаються:
+    #   - exchangAPI/BRAVO Web, коли BRAVO має тип запуску Disabled (рішення
+    #     оператора; вони залежать від BRAVO) — лише INFO, без попередження
+    #     (рішення власника #321);
+    #   - служба під маркером (OwnedByBravo: зокрема Disabled, виставлений
+    #     самим BRAVO на час реставрації, #329, і маркер з restartSuppressed),
+    #     призупинена (Paused) чи з нечитабельним станом — WARNING «не
+    #     запущені служби» лише в журнал, без окремого сповіщення.
+    # Повертає впалі служби, яким виставлено намір: { Key; Name; ExitCode;
+    # ServiceSpecificExitCode }.
+    param(
+        [Parameter(Mandatory = $true)][object]$ServiceSet,
+        [Parameter(Mandatory = $true)][hashtable]$RestartIntent
+    )
+
+    $conditions = Get-BRAVOMaintenanceServiceConditionSet -ServiceSet $ServiceSet
+    $failedServices = @()
+    $inactiveServices = @()
+    foreach ($serviceKey in @('Bravo', 'ExchangeApi', 'BravoWeb')) {
+        if ($RestartIntent[$serviceKey] -or -not $conditions.ContainsKey($serviceKey)) { continue }
+        $condition = $conditions[$serviceKey]
+        $serviceName = [string]$ServiceSet.$serviceKey.Name
+        $serviceStatus = [string]$condition.Status
+        if ([string]$condition.Condition -eq 'Running' -or [string]$condition.Condition -eq 'Pending') {
+            # Знімок і класифікація читали стан у різні моменти: службу, що
+            # тим часом стартувала, веде lifecycle-контракт (#360), а не FR-2.
+            continue
+        }
+        if ([string]$condition.Condition -eq 'Failed' -and $serviceStatus -eq 'Stopped') {
+            if ($serviceKey -ne 'Bravo' -and [bool]$ServiceSet.Bravo.Disabled) {
+                Write-Log -Message "Служба $serviceName зупинена й не запускатиметься: вона залежить від служби $($ServiceSet.Bravo.Name), яка має тип запуску Disabled" -Level "INFO"
+                continue
+            }
+            $RestartIntent[$serviceKey] = $true
+            $failedServices += [pscustomobject]@{
+                Key = $serviceKey
+                Name = $serviceName
+                ExitCode = $condition.ExitCode
+                ServiceSpecificExitCode = $condition.ServiceSpecificExitCode
+            }
+            Write-Log -Message "Служба $serviceName зупинена до обслуговування ($(Format-BRAVOServiceRecoveryExitCode -ExitCode $condition.ExitCode -ServiceSpecificExitCode $condition.ServiceSpecificExitCode)): її журнали буде оброблено, а службу запущено після обслуговування (#314)" -Level "INFO"
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($serviceStatus)) { $serviceStatus = [string]$condition.Condition }
+        $inactiveServices += "$serviceName ($serviceStatus)"
+    }
+    if ($inactiveServices.Count -gt 0) {
+        Write-Log -Message "До початку maintenance не запущені служби: $($inactiveServices -join ', ')" -Level "WARNING"
+    }
+    return $failedServices
+}
+
+function Revoke-BRAVOMaintenanceFailedServiceRestartIntent {
+    # #314 FR-2: restartSuppressed діє як і раніше. Якщо попередній прогін
+    # перервано посеред реставрації (чужий маркер з restartSuppressed),
+    # цілісність моделі не підтверджено — впалі служби НЕ запускаються:
+    # намір перезапуску, виставлений Add-BRAVOMaintenanceFailedServiceRestartIntent,
+    # знімається, у журнал іде WARNING (службам потрібна ручна дія). Повертає
+    # порожній перелік впалих служб для подальшого обліку.
+    param(
+        [AllowEmptyCollection()][object[]]$FailedServices = @(),
+        [Parameter(Mandatory = $true)][hashtable]$RestartIntent,
+        [string]$Owner
+    )
+
+    $revokedNames = @()
+    foreach ($failedService in @($FailedServices)) {
+        $RestartIntent[[string]$failedService.Key] = $false
+        $revokedNames += [string]$failedService.Name
+    }
+    if ($revokedNames.Count -gt 0) {
+        Write-Log -Message "Впалі служби не запускаються: попередній прогін $Owner перервано посеред реставрації (restartSuppressed), цілісність моделі не підтверджено — $($revokedNames -join ', ') (#314)" -Level "WARNING"
+    }
+    return @()
+}
+
+function Complete-BRAVOMaintenanceFailedServiceRecovery {
+    # #314 FR-2/FR-5/FR-6, нічний прогін — після запуску служб: для кожної
+    # впалої служби, яку справді запускали ($Outcome.Attempted), — рядок
+    # підсумку (INFO «була зупинена до обслуговування (ExitCode N),
+    # запущена»; збій запуску вже став CRITICAL у
+    # Invoke-BRAVOMaintenanceServiceStartSequence), облік спроби в
+    # state-файлі (паузу нічний прогін ігнорує, але спробу рахує) і
+    # CRITICAL-сповіщення «циклічно падає» з порогу спроб за добу (не
+    # частіше разу на добу). Збій обліку — WARNING, на запуск не впливає.
+    # Режим і маршрути сповіщень, журнал прогону — з області
+    # Invoke-BRAVOMaintenance ($script:SlackMode, $bravoSettings,
+    # $script:NotificationWebhookUrls, $LOG_FILE). Повертає текст для
+    # підсумку кроку (порожній, якщо впалих служб не запускали).
+    param(
+        [AllowEmptyCollection()][object[]]$FailedServices = @(),
+        [Parameter(Mandatory = $true)][hashtable]$Outcome
+    )
+
+    $summary = @()
+    $attemptedNames = @()
+    foreach ($failedService in @($FailedServices)) {
+        if (-not $Outcome.Attempted[[string]$failedService.Key]) { continue }
+        $attemptedNames += [string]$failedService.Name
+        if ($Outcome.Started[[string]$failedService.Key]) {
+            $exitText = Format-BRAVOServiceRecoveryExitCode -ExitCode $failedService.ExitCode -ServiceSpecificExitCode $failedService.ServiceSpecificExitCode
+            Write-Log -Message "Служба $($failedService.Name) була зупинена до обслуговування ($exitText), запущена" -Level "INFO"
+            $summary += "$($failedService.Name) ($exitText)"
+        }
+    }
+    if ($attemptedNames.Count -eq 0) { return '' }
+
+    $accounting = Invoke-BRAVOServiceRecoveryAttemptAccounting -ServiceNames $attemptedNames
+    foreach ($accountingWarning in @($accounting.Warnings)) {
+        Write-Log -Message $accountingWarning -Level "WARNING"
+    }
+    foreach ($registration in @($accounting.Registrations | Where-Object { $_.CyclicCriticalDue })) {
+        $cyclicContent = New-BRAVOServiceRecoveryNotificationContent -Kind Cyclic `
+            -ServiceName $registration.ServiceName `
+            -AttemptNumber $registration.AttemptNumber `
+            -FirstAttemptAt $registration.FirstAttemptAt `
+            -LogPath $LOG_FILE
+        Write-Log -Message "$(@($cyclicContent.Details)[0]) (#314)" -Level "WARNING"
+        $routingTable = $null
+        if ($null -ne $bravoSettings -and $null -ne $bravoSettings.PSObject.Properties['NotificationRouting']) { $routingTable = $bravoSettings.NotificationRouting }
+        $cyclicDelivery = Send-BRAVOServiceRecoveryNotification -Content $cyclicContent `
+            -NotificationMode ([string]$script:SlackMode) `
+            -RoutingTable $routingTable `
+            -WebhookUrls $script:NotificationWebhookUrls `
+            -LogPath $LOG_FILE `
+            -Duration ((Get-Date) - $script:ScriptStartTime)
+        if (-not [string]::IsNullOrWhiteSpace([string]$cyclicDelivery.Error)) {
+            Write-Log -Message "Сповіщення «циклічно падає» для $($registration.ServiceName) не доставлено: $($cyclicDelivery.Error)" -Level "ERROR"
+        }
+    }
+    if ($summary.Count -eq 0) { return '' }
+    return "запущено впалі служби: $($summary -join ', ')"
+}
+
 function Invoke-BRAVOMaintenanceServiceStopSequence {
     # Зупинка керованих служб у порядку BRAVO Web -> exchangAPI -> BRAVO.
     # Службу зупиняють лише тоді, коли lifecycle-контракт ($ConfirmStopContract,
@@ -373,10 +542,13 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
     # Запускається лише служба з наміром перезапуску (-RestartIntent: ключі
     # Bravo/ExchangeApi/BravoWeb) і лише коли цілісність моделі встановлено
     # ($script:modelIntegrityEstablished); призупинену оператором службу не
-    # запускають (#360). Після спроби запуску BRAVO в журнал іде діагностичний
-    # рядок про BRAVO Trace (-TraceConfiguration). Будь-який збій запуску —
-    # ERROR, критичне сповіщення, $script:criticalErrorOccurred і
-    # $Outcome.RestartFailed = $true (ownership-маркер тоді лишається).
+    # запускають (#360). Після спроби запуску BRAVO (і лише тоді, #314 FR-2)
+    # в журнал іде діагностичний рядок про BRAVO Trace (-TraceConfiguration).
+    # Будь-який збій запуску — ERROR, критичне сповіщення,
+    # $script:criticalErrorOccurred і $Outcome.RestartFailed = $true
+    # (ownership-маркер тоді лишається). $Outcome.Attempted / $Outcome.Started
+    # (ключ служби -> $true) — чи запускали службу і чи вона запустилась:
+    # з них облік спроб відновлення впалих служб (#314 FR-5).
     param(
         [Parameter(Mandatory = $true)][object]$ServiceSet,
         [Parameter(Mandatory = $true)][hashtable]$RestartIntent,
@@ -394,6 +566,8 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
     $traceConfiguration = $TraceConfiguration
     $ServiceStartTimeoutSeconds = $StartTimeoutSeconds
     $ServicePollIntervalSeconds = $PollIntervalSeconds
+    $Outcome.Attempted = @{}
+    $Outcome.Started = @{}
 
     # 1. Запуск служби BRAVO
     try {
@@ -402,6 +576,7 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
         # Maintenance її не зупиняв, пауза зберігається (#360).
         if ($script:modelIntegrityEstablished -and $serviceWasRunning.Bravo -and [string](Get-Service -Name $BravoServiceName).Status -notin @('Running', 'Paused', 'PausePending', 'ContinuePending')) {
             Write-Log -Message "Запуск служби $BravoServiceName..." -Level "INFO"
+            $Outcome.Attempted.Bravo = $true
             $serviceResult = Invoke-ServiceStateChange `
                 -Name $BravoServiceName `
                 -DesiredStatus Running `
@@ -410,6 +585,7 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
             if ($serviceResult.Success) {
                 Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"
                 $script:bravoServiceStartedThisRun = $true
+                $Outcome.Started.Bravo = $true
             } else {
                 $errorMsg = "$BravoServiceName не запустився автоматично: $($serviceResult.Error)"
                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
@@ -430,7 +606,9 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
     # debug-події, тому його відсутність одразу після старту нормальна. Рядок
     # у журналі потрібен лише для того, щоб при розборі інциденту було видно
     # фактичний стан, а не доводилося здогадуватись. На exit code не впливає.
-    if ($BravoMaintenanceEnabled -and $null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
+    # Лише коли службу BRAVO справді запускали (#314 FR-2): інакше рядок
+    # «після запуску» вводив би в оману.
+    if ($Outcome.Attempted['Bravo'] -and $BravoMaintenanceEnabled -and $null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
         $traceRecreated = Test-Path -LiteralPath $traceConfiguration.TracePath -PathType Leaf
         Write-Log -Message (
             "BRAVO Trace після запуску служби: $(if ($traceRecreated) { 'створено заново' } else { 'ще не створено (очікувано до першої debug-події)' }) — $($traceConfiguration.TracePath)"
@@ -445,6 +623,7 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
             # Призупинену оператором службу (Paused/PausePending/ContinuePending) не запускаємо (#360).
             if ($serviceStatus -notin @('Running', 'Paused', 'PausePending', 'ContinuePending')) {
                 Write-Log -Message "Запуск служби $ExchangAPIServiceName..." -Level "INFO"
+                $Outcome.Attempted.ExchangeApi = $true
                 $serviceResult = Invoke-ServiceStateChange `
                     -Name $ExchangAPIServiceName `
                     -DesiredStatus Running `
@@ -452,6 +631,7 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
                     -PollIntervalSeconds $ServicePollIntervalSeconds
                 if ($serviceResult.Success) {
                     Write-Log -Message "Служба $ExchangAPIServiceName успішно запущена" -Level "SUCCESS"
+                    $Outcome.Started.ExchangeApi = $true
                 } else {
                     throw $serviceResult.Error
                 }
@@ -474,6 +654,7 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
             # Призупинену оператором службу (Paused/PausePending/ContinuePending) не запускаємо (#360).
             if ([string]$ApacheService.Status -notin @('Running', 'Paused', 'PausePending', 'ContinuePending')) {
                 Write-Log -Message "Запуск служби BRAVO Web ($BravoWebServiceName)..." -Level "INFO"
+                $Outcome.Attempted.BravoWeb = $true
                 $serviceResult = Invoke-ServiceStateChange `
                     -Name $BravoWebServiceName `
                     -DesiredStatus Running `
@@ -481,6 +662,7 @@ function Invoke-BRAVOMaintenanceServiceStartSequence {
                     -PollIntervalSeconds $ServicePollIntervalSeconds
                 if ($serviceResult.Success) {
                     Write-Log -Message "Службу BRAVO Web успішно запущено" -Level "SUCCESS"
+                    $Outcome.Started.BravoWeb = $true
                 } else {
                     throw $serviceResult.Error
                 }

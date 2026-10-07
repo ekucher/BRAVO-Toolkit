@@ -431,7 +431,7 @@ $script:SlackMode = $configuredNotificationMode.ToLowerInvariant()
 # кожен REACHABLE маршрут дійсно налаштований) мусить бачити ЕФЕКТИВНИЙ
 # режим. Раніше preflight резолвив/валідував лише той набір маршрутів,
 # що досяжний за СИРИМ $SlackMode, а рантайм-споживачі (Send-SlackAlert,
-# Send-InactiveServiceWarning, Send-FinalReport) вже читали
+# Send-FinalReport) вже читали
 # $script:SlackMode ПІСЛЯ override — при NotificationMode=none/
 # errors_only + -EnableAllSlack це лишало $script:NotificationWebhookUrls
 # недорезолвленим для нового ефективного маршруту: кожен наступний send
@@ -982,7 +982,8 @@ function Get-ConfiguredServiceState {
 }
 
 # Цикл служб (#314, хвиля 2): зупинка -> обробка журналів -> запуск, і точка
-# розширення #316 (Stop-BRAVOMaintenanceStrayProcess) — у сусідньому файлі
+# розширення #316 (Stop-BRAVOMaintenanceStrayProcess); облік спроб відновлення
+# впалих служб і сповіщення про них (#314, хвиля 3) — у сусідніх файлах
 # модуля. Dot-source у scope цієї функції: як і решта функцій runtime, вони
 # бачать змінні тіла через динамічний scope.
 $maintenanceServiceCyclePath = Join-Path $PSScriptRoot 'BRAVO.Maintenance.ServiceCycle.ps1'
@@ -990,6 +991,11 @@ if (-not (Test-Path -LiteralPath $maintenanceServiceCyclePath -PathType Leaf)) {
     throw "Не знайдено цикл служб Maintenance: $maintenanceServiceCyclePath"
 }
 . $maintenanceServiceCyclePath
+$maintenanceServiceRecoveryPath = Join-Path $PSScriptRoot 'BRAVO.Maintenance.ServiceRecovery.ps1'
+if (-not (Test-Path -LiteralPath $maintenanceServiceRecoveryPath -PathType Leaf)) {
+    throw "Не знайдено облік відновлення служб Maintenance: $maintenanceServiceRecoveryPath"
+}
+. $maintenanceServiceRecoveryPath
 
 function Wait-BRAVOServiceStartPendingSettled {
     # #287: службі у StartPending SCM не передає stop (служба ще не приймає
@@ -2761,45 +2767,6 @@ function Send-BRAVOMaintenanceSkippedRunAlert {
     }
     Send-SlackAlert -Message "Плановий прогін обслуговування пропущено, нічого не виконано. $Message" -Severity "ERROR"
     Send-BRAVOMaintenanceEarlyExitAlerts -Reason $Reason
-}
-
-function Send-InactiveServiceWarning {
-    param([string[]]$ServiceDescriptions)
-
-    $inactiveServices = @($ServiceDescriptions | Where-Object {
-        -not [string]::IsNullOrWhiteSpace([string]$_)
-    } | Select-Object -Unique)
-    if ($inactiveServices.Count -eq 0) {
-        return
-    }
-
-    $serviceList = $inactiveServices -join ", "
-    Write-Log -Message "До початку maintenance не запущені служби: $serviceList" -Level "WARNING"
-    if ($script:SlackMode -eq "none") {
-        Write-Log -Message "Сповіщення про зупинені служби вимкнено режимом none" -Level "INFO"
-        return
-    }
-
-    try {
-        $notificationMessage = New-MaintenanceNotificationMessage `
-            -Title "СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE" `
-            -TitleEmoji ":warning:" `
-            -Severity "WARNING" `
-            -Duration ((Get-Date) - $script:ScriptStartTime) `
-            -Details @(
-                "Служби: $serviceList",
-                "Скрипт збереже початковий стан і не запускатиме ці служби автоматично."
-            ) `
-            -LogPath $LOG_FILE
-        $notificationRoute = Resolve-BRAVONotificationRoute `
-            -Severity "WARNING" `
-            -NotificationMode $script:SlackMode `
-            -RoutingTable $bravoSettings.NotificationRouting
-        Invoke-NotificationWebhook -Message $notificationMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
-        Write-Log -Message "Сповіщення про зупинені служби відправлено в $NotificationProviderDisplayName" -Level "SUCCESS"
-    } catch {
-        Write-Log -Message "Не вдалося відправити сповіщення про зупинені служби: $($_.Exception.Message)" -Level "ERROR"
-    }
 }
 
 # Bounded-очікування появи файла контролю діапазонів ID після запуску
@@ -7854,8 +7821,8 @@ function Send-FinalReport {
             # TitleEmoji тепер узгоджений із самим текстом (не завжди
             # ":white_check_mark:"): "УСПІШНО З ПОПЕРЕДЖЕННЯМИ" зі
             # ✅-іконкою була б суперечливою презентацією — канонічний
-            # warning-маркер репозиторію ":warning:" (Send-InactiveServiceWarning
-            # вище, той самий контракт). Це вимагало узгодити й порядок
+            # warning-маркер репозиторію ":warning:" (той самий контракт, що
+            # й решта WARNING-сповіщень). Це вимагало узгодити й порядок
             # перевірок severity всередині New-MaintenanceNotificationMessage
             # (нижче за визначенням) — інакше "$Title -match 'УСПІШ'"
             # все одно перебивав би ":warning:" і severity лишався б
@@ -9176,20 +9143,14 @@ if ($RunMissedRestoreOnly -and $missedDailyWork -and -not $bootRestoreIgnoresWin
         exit 20
     }
 }
-$inactiveServicesAtStart = @()
-if ($BravoMaintenanceEnabled -and -not $serviceWasRunning.Bravo) {
-    $bravoInitialService = Get-Service -Name $BravoServiceName -ErrorAction SilentlyContinue
-    $inactiveServicesAtStart += "$BravoServiceName ($($bravoInitialService.Status))"
-}
-if ($exchangAPIServiceEnabled -and -not $serviceWasRunning.ExchangeApi) {
-    $exchangeInitialService = Get-Service -Name $ExchangAPIServiceName -ErrorAction SilentlyContinue
-    $inactiveServicesAtStart += "$ExchangAPIServiceName ($($exchangeInitialService.Status))"
-}
-if ($BravoWebMaintenanceEnabled -and -not $serviceWasRunning.BravoWeb) {
-    $bravoWebInitialService = Get-Service -Name $BravoWebServiceName -ErrorAction SilentlyContinue
-    $inactiveServicesAtStart += "$BravoWebServiceName ($($bravoWebInitialService.Status))"
-}
-Send-InactiveServiceWarning -ServiceDescriptions $inactiveServicesAtStart
+# Ті самі три служби — для циклу зупинка -> журнали -> запуск (#314).
+$maintenanceServiceSet = New-BRAVOMaintenanceServiceSet `
+    -BravoName $BravoServiceName -BravoManaged $BravoMaintenanceEnabled -BravoDisabled $BravoServiceDisabledBySystem `
+    -ExchangeApiName $ExchangAPIServiceName -ExchangeApiManaged $exchangAPIServiceEnabled -ExchangeApiDisabled $exchangAPIServiceDisabled `
+    -BravoWebName $BravoWebServiceName -BravoWebManaged $BravoWebMaintenanceEnabled
+# #314 FR-2: впала (Failed) служба теж «мала працювати» — намір перезапуску,
+# маркер, журнали і запуск у finally (після перевірки Recovery вище).
+$failedServicesAtStart = @(Add-BRAVOMaintenanceFailedServiceRestartIntent -ServiceSet $maintenanceServiceSet -RestartIntent $serviceWasRunning)
 
 # #349: намір перезапуску служб, які зупинив аварійно перерваний прогін
 # (маркер мертвого власника без restartSuppressed), успадковується: власний
@@ -9223,6 +9184,9 @@ if ($foreignQuiescenceContext.Present -and -not $foreignQuiescenceContext.OwnerA
         Write-Log -Message "Успадковано намір перезапуску служб від аварійно перерваного прогону $($foreignQuiescenceContext.Owner): $($inheritedRestartIntentNames -join ', ') — їх буде запущено після обслуговування (#349)" -Level "INFO"
     }
 }
+if ($foreignQuiescenceContext.Present -and $foreignQuiescenceContext.RestartSuppressed) {
+    $failedServicesAtStart = @(Revoke-BRAVOMaintenanceFailedServiceRestartIntent -FailedServices $failedServicesAtStart -RestartIntent $serviceWasRunning -Owner $foreignQuiescenceContext.Owner)
+}
 
 # #360: lifecycle-контракт служб (склад маркера, утримання, намір
 # перезапуску) фіксується за ФАКТИЧНИМ станом безпосередньо перед зупинкою,
@@ -9242,11 +9206,6 @@ $maintenanceManagedServices = @(
     @{ Key = 'ExchangeApi'; Name = [string]$ExchangAPIServiceName; Enabled = [bool]$exchangAPIServiceEnabled },
     @{ Key = 'BravoWeb'; Name = [string]$BravoWebServiceName; Enabled = [bool]$BravoWebMaintenanceEnabled }
 )
-# Ті самі три служби — для циклу зупинка -> журнали -> запуск (#314).
-$maintenanceServiceSet = New-BRAVOMaintenanceServiceSet `
-    -BravoName $BravoServiceName -BravoManaged $BravoMaintenanceEnabled -BravoDisabled $BravoServiceDisabledBySystem `
-    -ExchangeApiName $ExchangAPIServiceName -ExchangeApiManaged $exchangAPIServiceEnabled -ExchangeApiDisabled $exchangAPIServiceDisabled `
-    -BravoWebName $BravoWebServiceName -BravoWebManaged $BravoWebMaintenanceEnabled
 $serviceActiveBeforeStop = @{ Bravo = $false; ExchangeApi = $false; BravoWeb = $false }
 # Намір перезапуску, записаний Confirm-BRAVOMaintenanceServiceStopContract у
 # поточній операції зупинки (див. Complete-BRAVOMaintenanceServiceStop).
@@ -10291,6 +10250,8 @@ Invoke-BRAVOMaintenanceServiceStartSequence `
 if ($serviceStartOutcome.RestartFailed) {
     $serviceRestartFailed = $true
 }
+# #314 FR-2/5/6: підсумок і облік спроб запуску впалих служб.
+$failedServicesRecoveryText = Complete-BRAVOMaintenanceFailedServiceRecovery -FailedServices $failedServicesAtStart -Outcome $serviceStartOutcome
 
 # Ownership-маркер: прибираємо лише ВЛАСНИЙ (записаний цим прогоном) і
 # лише після ПОВНОГО відновлення служб. Чужий/осиротілий маркер від
@@ -10316,7 +10277,8 @@ Write-BRAVOMaintenanceStep `
     -Name 'Відновлення стану служб' `
     -Status (Get-BRAVOMaintenanceStepStatus `
         -CriticalBefore $restoreServicesCriticalBefore `
-        -WarningsBefore $restoreServicesWarningsBefore)
+        -WarningsBefore $restoreServicesWarningsBefore) `
+    -Details $failedServicesRecoveryText
 }
 
 # dev.15: усе від Range ID до Send-FinalReport раніше не мало жодного

@@ -1,6 +1,9 @@
 ﻿# Домен-фрагмент self-test: цикл служб нічного Maintenance (#314, хвиля 2) —
 # «зупинка служб -> обробка журналів (trace BRAVO / exchangAPI / Apache і
-# BRAVO Web) -> запуск у канонічному порядку BRAVO -> exchangAPI -> BRAVO Web».
+# BRAVO Web) -> запуск у канонічному порядку BRAVO -> exchangAPI -> BRAVO Web» —
+# і автоматичне відновлення впалих служб (#314, хвиля 3: FR-2 нічний
+# Maintenance піднімає впалі служби, FR-5 облік спроб і паузи, FR-6
+# сповіщення; тести ТЗ §6 п. 3, 4, 7, 10).
 #
 # Характеризаційні тести: фіксують ПОТОЧНУ поведінку циклу (які служби
 # зупиняються й запускаються, порядок, що відбувається з журналами,
@@ -10,7 +13,11 @@
 # після винесення циклу з BRAVO.Maintenance.Runtime.ps1 у функції
 # BRAVO.Maintenance.ServiceCycle.ps1: зміна будь-якого рядка журналу,
 # порядку чи складу подій циклу — свідома зміна поведінки, яку мусить
-# супроводжувати зміна очікувань тут (хвилі 3–4 #314).
+# супроводжувати зміна очікувань тут (хвилі 3–4 #314). Хвиля 3 (FR-2)
+# так свідомо змінила сценарії зі службами, зупиненими до прогону: такі
+# служби (не Disabled, не під маркером) тепер входять у маркер і
+# запускаються, а рядок «BRAVO Trace після запуску служби» пишеться лише
+# тоді, коли службу BRAVO справді запускали.
 #
 # Проба та сама, що в Maintenance/Orchestration* кореневого файлу (стаби,
 # seed, збирач runtime з AST) — тексти беруться з BRAVO_SELF_TEST.ps1 за
@@ -95,6 +102,40 @@ function Invoke-BRAVOWebApplicationLogRotation {
     Add-ProbeEvent 'WEBAPP-ROTATION'
     return [pscustomobject]@{ Moved = 1; Errors = 0 }
 }
+# #314 FR-2: служба, яка не стартує (стан лишається Stopped, справжній
+# Invoke-ServiceStateChange дочекається таймауту).
+function Start-Service {
+    param([string]$Name, $WarningAction, $ErrorAction, $ErrorVariable)
+    if (@($script:ProbeStartFailures) -contains $Name) { Add-ProbeEvent "START-FAIL $Name"; return }
+    Add-ProbeEvent "START $Name"
+    $script:ProbeServices[$Name] = 'Running'
+}
+# #314 FR-5: state-файл обліку спроб — у каталозі сценарію (BRAVO.System у
+# пробі не імпортовано: шлях, захист каталогу й атомарний запис — стаби).
+function Get-BRAVOServiceRecoveryStatePath { return $script:ProbeRecoveryStatePath }
+function Protect-BRAVOMachineStateRoot { param([switch]$CheckOnly, [string]$Path) return [pscustomobject]@{ Path = $Path; Compliant = $true; Applied = $false; Issues = @() } }
+function Write-BRAVOStateFileAtomic {
+    param([string]$Path, [AllowEmptyString()][string]$Text)
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+    Add-ProbeEvent 'RECOVERY-STATE-WRITE'
+}
+# #314 FR-6: маршрут і доставка сповіщень (BRAVO.Notifications у пробі не
+# імпортовано): режими none / errors_only / all — як у Resolve-BRAVONotificationRoute.
+function Resolve-BRAVONotificationRoute {
+    param($Severity, $NotificationMode, $RoutingTable)
+    if ($NotificationMode -eq 'none' -or ($NotificationMode -eq 'errors_only' -and $Severity -eq 'SUCCESS')) { return 'none' }
+    if ($Severity -eq 'SUCCESS') { return 'general' }
+    return 'alerts'
+}
+function New-MaintenanceNotificationMessage {
+    param($Title, $TitleEmoji, $Duration, $DurationLabel, $StatusLines, $Details, $LogPath, $Severity)
+    return ('{0}|{1}' -f $Severity, $Title)
+}
+function Invoke-NotificationWebhook {
+    param([string]$Message, [string]$WebhookUrl)
+    Add-ProbeEvent ('NOTIFY {0} -> {1}' -f $Message, $WebhookUrl)
+}
 '@
         # Спільний seed: компонент BRAVO Web з Apache увімкнено (журнали
         # Apache і застосунку BRAVO Web теж обробляються), Bis не запущено.
@@ -110,6 +151,13 @@ $APACHE_LOGS_DIR = Join-Path $probeWorkRoot 'apache\logs'
 $APACHE_LOG_FILTER = '*.log'
 $WWW_LOGS_DIR = Join-Path $probeWorkRoot 'www\log'
 $BRAVOWEB_APP_LOG_FILTER = '*.log'
+# #314 FR-2: справжня класифікація (стаб Get-BRAVOManagedServiceCondition
+# проби): керовані служби мають тип Automatic/Manual, тож зупинена служба
+# поза маркером — впала (Failed).
+$script:ProbeConditionStartModes = @{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Automatic'; 'BravoWeb' = 'Manual' }
+$script:ProbeExitCodes = @{}
+$script:ProbeStartFailures = @()
+$script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'BRAVO_SERVICE_RECOVERY_STATE.json'
 '@
 
         # Реставрація з -ForceRestore (як у сценаріях StartMode* кореневої
@@ -143,10 +191,12 @@ $BRAVOWEB_APP_LOG_FILTER = '*.log'
             'SRWebStopFailure' = @(
                 '$script:ProbeStopFailures = @(''BravoWeb'')'
             )
-            # exchangAPI зупинена до прогону: не зупиняється, не запускається,
-            # але її журнали обробляються (служба фактично зупинена).
+            # #314 FR-2: exchangAPI впала до прогону (ExitCode 1067): входить у
+            # маркер з наміром перезапуску, її журнали обробляються, запуск — у
+            # канонічному порядку; спроба рахується в state-файлі.
             'SRExchangeStoppedBeforeRun' = @(
-                '$script:ProbeServices = @{ ''BRAVO'' = ''Running''; ''exchangAPI'' = ''Stopped''; ''BravoWeb'' = ''Running'' }'
+                '$script:ProbeServices = @{ ''BRAVO'' = ''Running''; ''exchangAPI'' = ''Stopped''; ''BravoWeb'' = ''Running'' }',
+                '$script:ProbeExitCodes = @{ ''exchangAPI'' = 1067 }'
             )
             # Цілісність моделі не встановлено: жодна служба не запускається,
             # маркер лишається.
@@ -182,10 +232,8 @@ $BRAVOWEB_APP_LOG_FILTER = '*.log'
                 '$restoreOnDisabledBravo = $true',
                 '$script:ProbeServices = @{ ''BRAVO'' = ''Stopped''; ''exchangAPI'' = ''Running''; ''BravoWeb'' = ''Running'' }'
             ))
-            # -ForceRestore, exchangAPI зупинена до прогону: утримується разом з
-            # усіма керованими службами (маркер без наміру перезапуску), її
-            # журнали обробляються, але після реставрації її НЕ запускають
-            # (поточна поведінка; FR-2 хвилі 3 це змінює).
+            # -ForceRestore, exchangAPI зупинена до прогону: #314 FR-2 — після
+            # реставрації її теж запускають (раніше лишалась зупиненою).
             'SRForceRestoreExchangeStoppedBeforeRun' = @($serviceRecoveryForceRestoreSeed + @(
                 '$script:ProbeServices = @{ ''BRAVO'' = ''Running''; ''exchangAPI'' = ''Stopped''; ''BravoWeb'' = ''Running'' }'
             ))
@@ -287,12 +335,18 @@ $BRAVOWEB_APP_LOG_FILTER = '*.log'
         }
 
         # Будівельні блоки очікуваних подій (рядки журналу — дослівно).
-        $srAllStoppedAtStart = @(
-            'LOG-WARNING До початку maintenance не запущені служби: BRAVO (Stopped), exchangAPI (Stopped), BravoWeb (Stopped)',
-            'LOG-INFO Сповіщення про зупинені служби вимкнено режимом none')
-        $srExchangeStoppedAtStart = @(
-            'LOG-WARNING До початку maintenance не запущені служби: exchangAPI (Stopped)',
-            'LOG-INFO Сповіщення про зупинені служби вимкнено режимом none')
+        # #314 FR-2: зупинена до прогону служба (не Disabled, не під маркером)
+        # — впала: INFO і намір перезапуску замість WARNING і сповіщення
+        # «служби не запущені» (Send-InactiveServiceWarning прибрано).
+        $srFailedAtStart = {
+            param([string]$Name, [string]$ExitCode)
+            "LOG-INFO Служба $Name зупинена до обслуговування (ExitCode $ExitCode): її журнали буде оброблено, а службу запущено після обслуговування (#314)"
+        }
+        $srFailedStarted = {
+            param([string]$Name, [string]$ExitCode)
+            "LOG-INFO Служба $Name була зупинена до обслуговування (ExitCode $ExitCode), запущена"
+        }
+        $srBravoOwnedAtStart = @('LOG-WARNING До початку maintenance не запущені служби: BRAVO (Stopped)')
         $srStopHeader = @('LOG-INFO ===', 'LOG-INFO === ЗУПИНКА СЛУЖБ ===')
         $srStopWeb = @('LOG-INFO Зупинка служби BRAVO Web (BravoWeb)...', 'STOP BravoWeb', 'LOG-SUCCESS Службу BRAVO Web успішно зупинено')
         $srStopExchange = @('LOG-INFO Зупинка служби exchangAPI...', 'STOP exchangAPI', 'LOG-SUCCESS Служба exchangAPI успішно зупинена')
@@ -312,7 +366,8 @@ $BRAVOWEB_APP_LOG_FILTER = '*.log'
             'LOG-INFO ===', 'LOG-INFO === ОБРОБКА ЛОГІВ BRAVO WEB APPLICATION ===', 'WEBAPP-ROTATION')
         $srStartHeader = @('LOG-INFO ===', 'LOG-INFO === ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ===')
         $srStartBravo = @('LOG-INFO Запуск служби BRAVO...', 'START BRAVO', 'LOG-SUCCESS Служба BRAVO успішно запущена')
-        # Рядок пишеться й тоді, коли службу BRAVO не запускали (FR-2 хвилі 3 це змінює).
+        # #314 FR-2: рядок пишеться лише після спроби запуску служби BRAVO
+        # (до хвилі 3 — і тоді, коли службу не запускали).
         $srTraceAfterStart = @('LOG-INFO BRAVO Trace після запуску служби: ще не створено (очікувано до першої debug-події) — self-test-trace.log')
         $srStartExchange = @('LOG-INFO Запуск служби exchangAPI...', 'START exchangAPI', 'LOG-SUCCESS Служба exchangAPI успішно запущена')
         $srStartWeb = @('LOG-INFO Запуск служби BRAVO Web (BravoWeb)...', 'START BravoWeb', 'LOG-SUCCESS Службу BRAVO Web успішно запущено')
@@ -350,19 +405,24 @@ $BRAVOWEB_APP_LOG_FILTER = '*.log'
             $srStartedClean
         ) 'ServiceRecovery/CycleWebStopFailureSkipsWebLogs' 'BRAVO Web не зупинилась: її журнали пропущено з WARNING, решта зупинена й запущена, код 60'
 
-        # (3) exchangAPI зупинена до прогону: поза маркером, не зупиняється й не
-        # запускається, але її журнали обробляються.
-        & $serviceRecoveryCheck 'SRExchangeStoppedBeforeRun' 10 @(
-            $srExchangeStoppedAtStart
-            $srStopHeader; 'MARKER-WRITE BRAVO,BravoWeb'
+        # (3) #314 FR-2 (ТЗ §6 п. 7) — СВІДОМА ЗМІНА характеризації хвилі 2
+        # (раніше: «зупинена до прогону служба не потрапляє в маркер і не
+        # запускається», WARNING і сповіщення «служби не запущені», код 10).
+        # Тепер впала exchangAPI входить у маркер з наміром перезапуску, її
+        # журнали обробляються, запуск — у канонічному порядку, у підсумку
+        # INFO з ExitCode, спроба рахується в state-файлі; WARNING немає, код 0.
+        & $serviceRecoveryCheck 'SRExchangeStoppedBeforeRun' 0 @(
+            (& $srFailedAtStart 'exchangAPI' '1067')
+            $srStopHeader; 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb'
             $srStopWeb; 'LOG-INFO Служба exchangAPI вже зупинена'; $srStopBravoHead; $srStopBravoTail
             'STEP 3/8 Зупинка служб OK'
             $srRestoreSkipped
             $srTraceLogs; $srExchangeLogs; $srWebLogs
             'STEP 6/8 Обробка trace і логів OK'
-            $srStartHeader; $srStartBravo; $srTraceAfterStart; $srStartWeb
+            $srStartHeader; $srStartBravo; $srTraceAfterStart; $srStartExchange; $srStartWeb
+            (& $srFailedStarted 'exchangAPI' '1067'); 'RECOVERY-STATE-WRITE'
             $srStartedClean
-        ) 'ServiceRecovery/CycleServiceStoppedBeforeRunIsNotStarted' 'служба, зупинена до прогону, не потрапляє в маркер і не запускається (поточна поведінка до FR-2), її журнали обробляються'
+        ) 'ServiceRecovery/NightlyFailedServiceEntersMarkerAndStarts' '#314 FR-2: впала до прогону служба входить у маркер з наміром перезапуску, її журнали обробляються, вона запускається в канонічному порядку, у підсумку INFO з ExitCode; без WARNING і сповіщення «служби не запущені»'
 
         # (4) Гейт цілісності моделі: служби не запускаються, маркер лишається
         # (Health-watchdog), крок відновлення — FAIL, код 60.
@@ -375,38 +435,48 @@ $BRAVOWEB_APP_LOG_FILTER = '*.log'
             'STEP 6/8 Обробка trace і логів OK'
             $srStartHeader
             'LOG-ERROR ПОМИЛКА: Служби BRAVO НЕ піднято: цілісність моделі не встановлено після перерваної реставрації — потрібне ручне відновлення з before-архіву (<ROOT>/backup/MODEL/self-test_before.mdz).'
-            $srTraceAfterStart
+            # #314 FR-2: службу не запускали — рядка «BRAVO Trace після запуску» немає.
             'LOG-WARNING Ownership-маркер зупинки служб збережено: не всі служби запустились — Health-watchdog повторить спробу автоматично'
             'STEP 7/8 Відновлення стану служб FAIL'
         ) 'ServiceRecovery/CycleIntegrityGateKeepsServicesStopped' 'без встановленої цілісності моделі жодна служба не запускається, маркер зберігається, код 60'
 
         # (5) Намір перезапуску від аварійно перерваного прогону (без
-        # restartSuppressed) успадковується: BRAVO запускається.
+        # restartSuppressed) успадковується: BRAVO запускається. #314 FR-2
+        # (свідома зміна): BRAVO під маркером (OwnedByBravo) — не впала, її
+        # веде успадкування #349; exchangAPI і BRAVO Web поза маркером —
+        # впалі, теж входять у маркер і запускаються.
         & $serviceRecoveryCheck 'SRInheritedRestartIntent' 10 @(
-            $srAllStoppedAtStart
+            (& $srFailedAtStart 'exchangAPI' '0'); (& $srFailedAtStart 'BravoWeb' '0')
+            $srBravoOwnedAtStart
             'LOG-INFO Успадковано намір перезапуску служб від аварійно перерваного прогону BRAVO_MAINTENANCE: BRAVO — їх буде запущено після обслуговування (#349)'
-            $srStopHeader; 'MARKER-WRITE BRAVO'
+            $srStopHeader; 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb'
             $srAlreadyStopped
             'STEP 3/8 Зупинка служб OK'
             $srRestoreSkipped
             $srTraceLogs; $srExchangeLogs; $srWebLogs
             'STEP 6/8 Обробка trace і логів OK'
-            $srStartHeader; $srStartBravo; $srTraceAfterStart
+            $srStartHeader; $srStartBravo; $srTraceAfterStart; $srStartExchange; $srStartWeb
+            (& $srFailedStarted 'exchangAPI' '0'); (& $srFailedStarted 'BravoWeb' '0'); 'RECOVERY-STATE-WRITE'
             $srStartedClean
-        ) 'ServiceRecovery/CycleInheritsRestartIntentWithoutSuppression' 'намір перезапуску з маркера мертвого власника без restartSuppressed успадковується: BRAVO у маркері й запускається'
+        ) 'ServiceRecovery/CycleInheritsRestartIntentWithoutSuppression' 'намір перезапуску з маркера мертвого власника без restartSuppressed успадковується: BRAVO у маркері й запускається; впалі exchangAPI і BRAVO Web (FR-2) — теж'
 
         # (6) Той самий маркер з restartSuppressed: намір не успадковується —
-        # жодного маркера, зупинки чи запуску.
+        # жодного маркера, зупинки чи запуску. #314 FR-2: restartSuppressed
+        # діє й на впалі служби — exchangAPI і BRAVO Web класифіковано як
+        # впалі, але намір знято (WARNING), жодна служба не запускається;
+        # рядка «BRAVO Trace після запуску» немає (службу не запускали).
         & $serviceRecoveryCheck 'SRSuppressedRestartIntent' 10 @(
-            $srAllStoppedAtStart
+            (& $srFailedAtStart 'exchangAPI' '0'); (& $srFailedAtStart 'BravoWeb' '0')
+            $srBravoOwnedAtStart
+            'LOG-WARNING Впалі служби не запускаються: попередній прогін BRAVO_MAINTENANCE перервано посеред реставрації (restartSuppressed), цілісність моделі не підтверджено — exchangAPI, BravoWeb (#314)'
             $srAlreadyStopped
             'STEP 3/8 Зупинка служб SKIPPED'
             $srRestoreSkipped
             $srTraceLogs; $srExchangeLogs; $srWebLogs
             'STEP 6/8 Обробка trace і логів OK'
-            $srStartHeader; $srTraceAfterStart
+            $srStartHeader
             'STEP 7/8 Відновлення стану служб OK'
-        ) 'ServiceRecovery/CycleSuppressedRestartIntentNotInherited' 'намір перезапуску з маркера з restartSuppressed не успадковується: жодна служба не запускається'
+        ) 'ServiceRecovery/CycleSuppressedRestartIntentNotInherited' 'намір перезапуску з маркера з restartSuppressed не успадковується, а впалі служби (FR-2) під restartSuppressed не запускаються: жодна служба не запускається'
 
         # (7) -RunMissedRestoreOnly при працюючих службах: Recovery не зупиняє
         # служби — вихід 20 до фази зупинки.
@@ -431,22 +501,27 @@ $BRAVOWEB_APP_LOG_FILTER = '*.log'
             $srStartedClean
         ) 'ServiceRecovery/CycleForceRestoreDisabledBravoClosesBisOnly' '-ForceRestore при Disabled BRAVO: службу BRAVO не чіпають, Bis завершують, exchangAPI і BRAVO Web зупиняють і запускають'
 
-        # (9) -ForceRestore, exchangAPI зупинена до прогону: утримується в маркері
-        # без наміру перезапуску й після реставрації лишається зупиненою.
+        # (9) #314 FR-2 — СВІДОМА ЗМІНА характеризації хвилі 2 (раніше:
+        # «-ForceRestore: зупинена до прогону служба утримується без наміру
+        # перезапуску й лишається зупиненою»). Тепер -ForceRestore теж
+        # завершується запущеними службами: exchangAPI у маркері з наміром
+        # перезапуску й запускається після реставрації.
         & $serviceRecoveryCheck 'SRForceRestoreExchangeStoppedBeforeRun' 40 @(
-            $srExchangeStoppedAtStart
-            $srStopHeader; 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb'; 'MARKER-NO-RESTART exchangAPI'
+            (& $srFailedAtStart 'exchangAPI' '0')
+            $srStopHeader; 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb'
             $srStopWeb; 'LOG-INFO Служба exchangAPI вже зупинена'; $srStopBravoHead; $srStopBravoTail
             'STEP 3/8 Зупинка служб OK'
             $srRestoreFailed
             $srTraceLogs; $srExchangeLogs; $srWebLogs
             'STEP 6/8 Обробка trace і логів OK'
-            $srStartHeader; $srStartBravo; $srTraceAfterStart; $srStartWeb
+            $srStartHeader; $srStartBravo; $srTraceAfterStart; $srStartExchange; $srStartWeb
+            (& $srFailedStarted 'exchangAPI' '0'); 'RECOVERY-STATE-WRITE'
             $srStartedClean
-        ) 'ServiceRecovery/CycleForceRestoreKeepsInitiallyStoppedServiceStopped' '-ForceRestore: зупинена до прогону служба утримується без наміру перезапуску й лишається зупиненою (поточна поведінка до FR-2)'
+        ) 'ServiceRecovery/ForceRestoreStartsInitiallyStoppedService' '#314 FR-2: -ForceRestore завершується запущеними службами — зупинена до прогону exchangAPI у маркері з наміром перезапуску й запускається після реставрації'
     } finally {
         if (Test-Path -LiteralPath $serviceRecoveryRoot -PathType Container) {
             Remove-Item -LiteralPath $serviceRecoveryRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
+

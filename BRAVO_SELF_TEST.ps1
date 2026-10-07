@@ -10103,15 +10103,21 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Maintenance/TraceSftpBlockGloballyDisabledSkipsCredentialsAndSession' `
         -Failure 'componentSettings.SFTP.Enabled=false має пропускати credential-читання ($traceSftpLogin = Get-BRAVOCredentialSecret) і відкриття WinSCP-сесії ПОВНІСТЮ — обидва мусять залишатись у "else"-гілці (SFTP увімкнено), не досяжній при глобально вимкненому SFTP'
 
+    # #314 FR-2 (хвиля 3) свідомо змінила поведінку: зупинена до прогону
+    # служба (не Disabled) більше не дає окремого сповіщення «служби не
+    # запущені» з обіцянкою зберегти стан — Maintenance її запускає, а в
+    # підсумку пише INFO. Поведінку перевіряє suite ServiceRecovery.
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
-            $maintenanceScriptText.Contains("СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE") -and
+            -not $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
+            -not $maintenanceScriptText.Contains("СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE") -and
+            -not $maintenanceScriptText.Contains("збереже початковий стан") -and
+            $maintenanceScriptText.Contains("Add-BRAVOMaintenanceFailedServiceRestartIntent") -and
             $maintenanceScriptText.Contains("BRAVO.Notifications") -and
             $notificationScriptText.Contains('$newlineLength = if ($currentChunk.Length -gt 0) {')
         ) `
-        -Name "Notifications/MaintenanceInactiveServices" `
-        -Failure "maintenance має негайно сповіщати про початково зупинені служби"
+        -Name "Notifications/MaintenanceStoppedServicesStartedWithoutPreWarning" `
+        -Failure "#314 FR-2: maintenance не повинен надсилати сповіщення «служби не запущені» з обіцянкою зберегти стан — зупинену службу (не Disabled) він запускає"
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains("RunMissedRestoreOnly") -and
@@ -15301,6 +15307,23 @@ function Suspend-BRAVOServiceAutostart {
     foreach ($probeHeld in @($Snapshot)) { Add-ProbeEvent ("HOLD " + [string]$probeHeld.Name) }
     return [pscustomobject]@{ Applied = @(@($Snapshot) | ForEach-Object { [string]$_.Name }); Failed = @() }
 }
+# #314 FR-1/FR-2: класифікація керованої служби (BRAVO.System у пробі не
+# імпортовано). Тип запуску — з $script:ProbeConditionStartModes (ім'я -> тип),
+# маркер — $script:ProbeForeignRestartIntent, ExitCode — $script:ProbeExitCodes.
+# Без $script:ProbeConditionStartModes служба класифікується як Disabled:
+# жодної впалої служби, оркестрація — рівно така, як до FR-2 (той самий
+# прийом, що в Get-BRAVOServiceRegistryStartMode нижче). Стан читається з
+# таблиці напряму, без побічних ефектів стабу Get-Service.
+function Get-BRAVOManagedServiceCondition {
+    param([string]$Name)
+    $probeStatus = [string]$script:ProbeServices[$Name]
+    $probeStartMode = 'Disabled'
+    if ($null -ne $script:ProbeConditionStartModes -and $script:ProbeConditionStartModes.ContainsKey($Name)) { $probeStartMode = [string]$script:ProbeConditionStartModes[$Name] }
+    $probeCondition = if ($probeStartMode -eq 'Disabled') { 'Disabled' } elseif ($probeStatus -eq 'Running') { 'Running' } elseif (@('StartPending', 'StopPending', 'ContinuePending', 'PausePending') -contains $probeStatus) { 'Pending' } elseif (@($script:ProbeForeignRestartIntent) -contains $Name) { 'OwnedByBravo' } else { 'Failed' }
+    $probeExitCode = 0
+    if ($null -ne $script:ProbeExitCodes -and $script:ProbeExitCodes.ContainsKey($Name)) { $probeExitCode = $script:ProbeExitCodes[$Name] }
+    return [pscustomobject]@{ Name = $Name; Exists = $true; StartMode = $probeStartMode; Status = $probeStatus; ExitCode = $probeExitCode; ServiceSpecificExitCode = 0; Condition = $probeCondition }
+}
 function Get-BRAVOSevenZipExitCodeDescription { param([int]$ExitCode) return 'self-test' }
 # #349: native-операція (7-Zip архів перед реставрацією, bravocmd) лише
 # реєструється; код 2 зупиняє реставрацію на першій же операції.
@@ -15581,16 +15604,19 @@ try {
             $probeFunctionTexts.Add($probeStatement.Extent.Text)
         }
     }
-    # Цикл служб (#314) винесено в dot-source файл: його функції теж справжні.
-    $probeServiceCycleText = [IO.File]::ReadAllText(
-        (Join-Path $RepositoryRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1'), [Text.Encoding]::UTF8)
-    $probeServiceCycleErrors = $null
-    $probeServiceCycleAst = [Management.Automation.Language.Parser]::ParseInput($probeServiceCycleText, [ref]$null, [ref]$probeServiceCycleErrors)
-    if (@($probeServiceCycleErrors).Count -gt 0) { throw "ServiceCycle не парситься: $($probeServiceCycleErrors[0].Message)" }
-    foreach ($probeStatement in @($probeServiceCycleAst.EndBlock.Statements)) {
-        if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
-            -not $probeStubNames.ContainsKey($probeStatement.Name)) {
-            $probeFunctionTexts.Add($probeStatement.Extent.Text)
+    # Цикл служб і облік відновлення служб (#314) винесено в dot-source
+    # файли: їхні функції теж справжні.
+    foreach ($probeServiceFileName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1')) {
+        $probeServiceCycleText = [IO.File]::ReadAllText(
+            (Join-Path $RepositoryRoot ('modules\BRAVO.Maintenance\' + $probeServiceFileName)), [Text.Encoding]::UTF8)
+        $probeServiceCycleErrors = $null
+        $probeServiceCycleAst = [Management.Automation.Language.Parser]::ParseInput($probeServiceCycleText, [ref]$null, [ref]$probeServiceCycleErrors)
+        if (@($probeServiceCycleErrors).Count -gt 0) { throw "$probeServiceFileName не парситься: $($probeServiceCycleErrors[0].Message)" }
+        foreach ($probeStatement in @($probeServiceCycleAst.EndBlock.Statements)) {
+            if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                -not $probeStubNames.ContainsKey($probeStatement.Name)) {
+                $probeFunctionTexts.Add($probeStatement.Extent.Text)
+            }
         }
     }
     # Дослівна оркестрація до кінця зовнішнього try (включно з exit).
@@ -15646,6 +15672,9 @@ try {
         ('$script:ProbeForeignRestartIntent = {0}' -f $(if ($Scenario -like 'StartMode*IntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { "@('BravoWeb')" } else { '@()' })),
         ('$script:ProbeForeignRestartSuppressed = {0}' -f $(if ($Scenario -eq 'StartModeSuppressedIntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { '$true' } else { '$false' })),
         '$script:ProbePendingReads = @{}',
+        # #314 FR-2: без типів запуску класифікація не бачить впалих служб (див. стаб).
+        '$script:ProbeConditionStartModes = $null',
+        '$script:ProbeExitCodes = $null',
         '$script:ProbeMarkerWrites = 0',
         ('$script:ProbeMarkerWriteFailFrom = {0}' -f $(if ($Scenario -eq 'StartModeLateAfterStopMarkerFailInitiallyStopped') { '2' } else { '0' })),
         # StuckStartPending: старт BRAVO не завершується (StartPending назавжди).
