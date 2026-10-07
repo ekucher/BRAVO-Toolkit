@@ -145,6 +145,7 @@ function Test-BRAVOFileSystemWriteAccess {
     # відсутньому <Dest> створює обидва), тож запам'ятовуємо весь ланцюжок
     # відсутніх каталогів від $Path до найвищого відсутнього предка (#283).
     $createdChain = New-Object System.Collections.Generic.List[string]
+    $createdChainComplete = $false
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         $chainCursor = $Path
         try {
@@ -152,9 +153,11 @@ function Test-BRAVOFileSystemWriteAccess {
                 $createdChain.Add($chainCursor)
                 $chainCursor = [IO.Path]::GetDirectoryName($chainCursor)
             }
+            $createdChainComplete = $true
         } catch {
             # Недоступний предок (UNC без мережі): ланцюжок лишається тим,
-            # що вже зібрано; прибирання не вийде за його межі.
+            # що вже зібрано; прибирання не вийде за його межі, а повідомлення
+            # не стверджуватиме, що прибрано все створене.
         }
         try {
             [void](New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop)
@@ -199,7 +202,7 @@ function Test-BRAVOFileSystemWriteAccess {
     # за собою", а втрата чужих даних.
     $directoryCleanedUp = $false
     if ($createdDirectory) {
-        $directoryCleanedUp = $true
+        $directoryCleanedUp = $createdChainComplete
         foreach ($createdItem in $createdChain) {
             if (-not (Test-Path -LiteralPath $createdItem -PathType Container)) {
                 continue
