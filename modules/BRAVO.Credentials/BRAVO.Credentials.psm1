@@ -223,6 +223,9 @@ function Add-BRAVOCredentialReadSecretRecord {
     )
 
     try {
+        # Локально: некритичні помилки всередині обліку теж стають
+        # винятками й ставлять ознаку неповноти нижче.
+        $ErrorActionPreference = 'Stop'
         if ($Secret -is [Security.SecureString] -and $Secret.Length -gt 0) {
             $readSecretRegistry = $null
             $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
@@ -525,6 +528,11 @@ function Get-BRAVOLogMaskSecretSet {
         'SlackWebhookGeneral', 'SlackWebhookAlerts',
         'DiscordWebhookGeneral', 'DiscordWebhookAlerts'
     )
+    $registryIncompleteMessage = 'Набір маскування секретів неповний: облік секретів, отриманих цим процесом із Credential Manager, не вдався (#417). Вивантаження журналу скасовано (fail-closed).'
+    $registryIncompleteVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistryIncomplete -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $registryIncompleteVariable -and [bool]$registryIncompleteVariable.Value) {
+        throw $registryIncompleteMessage
+    }
     $secrets = New-Object 'System.Collections.Generic.List[string]'
     $skipped = New-Object 'System.Collections.Generic.List[object]'
     foreach ($secretTargetKey in $secretTargetKeys) {
@@ -556,14 +564,22 @@ function Get-BRAVOLogMaskSecretSet {
         $candidateValues = New-Object 'System.Collections.Generic.List[string]'
         if (-not [string]::IsNullOrWhiteSpace($currentValue)) { $candidateValues.Add([string]$currentValue) }
 
-        $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
-        $recordedSecrets = $null
-        if ($null -ne $readSecretRegistryVariable -and $null -ne $readSecretRegistryVariable.Value -and
-            $readSecretRegistryVariable.Value.TryGetValue($targetName, [ref]$recordedSecrets)) {
-            foreach ($recordedSecret in $recordedSecrets) {
-                $recordedValue = ConvertFrom-BRAVOSecureSecret -Secret $recordedSecret
-                if (-not [string]::IsNullOrWhiteSpace($recordedValue)) { $candidateValues.Add([string]$recordedValue) }
+        # Доступ до реєстру: будь-який збій (пошкоджений реєстр) — той самий
+        # фіксований виняток без тексту первинного (fail-closed).
+        $recordedSecretsArray = @()
+        try {
+            $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
+            $recordedSecrets = $null
+            if ($null -ne $readSecretRegistryVariable -and $null -ne $readSecretRegistryVariable.Value -and
+                $readSecretRegistryVariable.Value.TryGetValue($targetName, [ref]$recordedSecrets)) {
+                $recordedSecretsArray = @($recordedSecrets)
             }
+        } catch {
+            throw $registryIncompleteMessage
+        }
+        foreach ($recordedSecret in $recordedSecretsArray) {
+            $recordedValue = ConvertFrom-BRAVOSecureSecret -Secret $recordedSecret
+            if (-not [string]::IsNullOrWhiteSpace($recordedValue)) { $candidateValues.Add([string]$recordedValue) }
         }
         foreach ($candidateValue in $candidateValues) {
             if (-not $secrets.Contains($candidateValue)) { $secrets.Add($candidateValue) }
@@ -575,11 +591,13 @@ function Get-BRAVOLogMaskSecretSet {
     # (fail-closed): викликачі (власний лог Maintenance/Archive) ловлять
     # виняток, пишуть WARNING і нічого не вивантажують; основна операція
     # не зачіпається. Повідомлення не містить ні значень, ні тексту
-    # первинного винятку. Перевірка ПІСЛЯ збирання: читання вище теж
-    # проходять через облік і можуть поставити ознаку.
+    # первинного винятку. Перевірка і ДО будь-якого доступу до реєстру
+    # (пошкоджений реєстр лишається в стані модуля, і його виняток може
+    # нести секрет), і ПІСЛЯ збирання (читання нижче теж проходять через
+    # облік і можуть поставити ознаку).
     $registryIncompleteVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistryIncomplete -Scope Script -ErrorAction SilentlyContinue
     if ($null -ne $registryIncompleteVariable -and [bool]$registryIncompleteVariable.Value) {
-        throw 'Набір маскування секретів неповний: облік секретів, отриманих цим процесом із Credential Manager, не вдався (#417). Вивантаження журналу скасовано (fail-closed).'
+        throw $registryIncompleteMessage
     }
 
     return [pscustomobject]@{

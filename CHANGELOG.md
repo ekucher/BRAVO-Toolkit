@@ -9,7 +9,9 @@
   тоді кидає виняток без значень і без тексту первинного винятку — власний лог Maintenance/Archive не вивантажується
   (WARNING, як для будь-якого збою маскування; результат основної операції не змінюється). `Set-BRAVOCredential` після
   успішного запису теж додає значення в облік, тож записаний цим процесом секрет (напр. API-ключ Operations) маскується,
-  навіть якщо пізніший CredRead упаде. Тести: `Credentials/LogMaskSecretSetIncludesSecretsWrittenInProcess`,
+  навіть якщо пізніший CredRead упаде. Ознака неповноти перевіряється ДО будь-якого доступу до реєстру, а збій доступу до
+  самого реєстру в `Get-BRAVOLogMaskSecretSet` стає тим самим фіксованим винятком: текст винятку пошкодженого реєстру
+  (може нести секрет) не потрапляє у WARNING. Тести: `Credentials/LogMaskSecretSetIncludesSecretsWrittenInProcess`,
   `Credentials/RegistryBookkeepingFailureDoesNotBreakReadButFailsMaskSet`,
   `Maintenance/OwnLogUploadFailsClosedWithoutLeakWhenSecretRegistryIncomplete`.
 

@@ -1050,10 +1050,9 @@ try {
         $readOut = $null
         $readErrorType = ''
         try { $readOut = Get-BRAVOCredentialSecret -Target $sftpTarget } catch { $readErrorType = $_.Exception.GetType().FullName }
-        # Реєстр знову справний (порожній): лишається ЛИШЕ ознака неповноти.
-        # Без fail-closed перевірки набір зібрався б "успішно", хоча облік
-        # прочитаних значень пропустив запис.
-        $script:BRAVOCredentialReadSecretRegistry = $null
+        # Codex P1: пошкоджений реєстр ЛИШАЄТЬСЯ в стані модуля (як у
+        # реальному процесі). Набір маскування має кинути фіксоване
+        # повідомлення, а не виняток самого реєстру (у ньому — секрет).
         $maskThrew = $false
         $maskErrorText = ''
         try {
@@ -1062,21 +1061,41 @@ try {
             $maskThrew = $true
             $maskErrorText = [string]$_.Exception.Message + ' | ' + [string]$_
         }
-        [pscustomobject]@{ ReadValue = [string]$readOut; ReadErrorType = $readErrorType; MaskThrew = $maskThrew; MaskErrorText = $maskErrorText }
+        # Ознака неповноти знята, реєстр і далі пошкоджений: збій доступу до
+        # реєстру в самому наборі маскування теж стає фіксованим
+        # повідомленням (fail-closed), без тексту первинного винятку.
+        $script:BRAVOCredentialReadSecretRegistryIncomplete = $false
+        $maskThrewDirect = $false
+        $maskErrorTextDirect = ''
+        try {
+            [void](Get-BRAVOLogMaskSecretSet -CredentialSettings $credentialSettings)
+        } catch {
+            $maskThrewDirect = $true
+            $maskErrorTextDirect = [string]$_.Exception.Message + ' | ' + [string]$_
+        }
+        [pscustomobject]@{
+            ReadValue = [string]$readOut; ReadErrorType = $readErrorType; MaskThrew = $maskThrew; MaskErrorText = $maskErrorText
+            MaskThrewDirect = $maskThrewDirect; MaskErrorTextDirect = $maskErrorTextDirect
+        }
     } $secretMaskTargetsConfig ([string]$secretMask417ByKey['SftpReadDuringFailure']) ([string]$secretMask417ByKey['RegistryFailurePayload'])
 } catch { $secretMask417BookkeepingError = $_.Exception.GetType().FullName }
 $secretMask417BookkeepingLeaks = @()
 if ($null -ne $secretMask417BookkeepingResult) {
-    $secretMask417BookkeepingLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text ([string]$secretMask417BookkeepingResult.MaskErrorText) -SecretByKey $secretMask417LeakByKey)
+    $secretMask417BookkeepingLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text ([string]$secretMask417BookkeepingResult.MaskErrorText + "`n" + [string]$secretMask417BookkeepingResult.MaskErrorTextDirect) -SecretByKey $secretMask417LeakByKey)
 }
 Test-BRAVOCondition (
     $null -ne $secretMask417BookkeepingResult -and
     [string]$secretMask417BookkeepingResult.ReadValue -ceq [string]$secretMask417ByKey['SftpReadDuringFailure'] -and
     [string]::IsNullOrEmpty([string]$secretMask417BookkeepingResult.ReadErrorType) -and
     [bool]$secretMask417BookkeepingResult.MaskThrew -and
+    [bool]$secretMask417BookkeepingResult.MaskThrewDirect -and
+    ([string]$secretMask417BookkeepingResult.MaskErrorText).Contains('(#417)') -and
+    ([string]$secretMask417BookkeepingResult.MaskErrorTextDirect).Contains('(#417)') -and
+    -not ([string]$secretMask417BookkeepingResult.MaskErrorText).Contains('synthetic registry bookkeeping failure') -and
+    -not ([string]$secretMask417BookkeepingResult.MaskErrorTextDirect).Contains('synthetic registry bookkeeping failure') -and
     $secretMask417BookkeepingLeaks.Count -eq 0
 ) -Name 'Credentials/RegistryBookkeepingFailureDoesNotBreakReadButFailsMaskSet' `
-    -Failure "збій обліку прочитаних секретів не має ламати читання (getter повертає значення), але Get-BRAVOLogMaskSecretSet після цього має кидати (fail-closed) без секрету в повідомленні; читання повернуло значення: $(if ($null -ne $secretMask417BookkeepingResult) { [string]$secretMask417BookkeepingResult.ReadValue -ceq [string]$secretMask417ByKey['SftpReadDuringFailure'] } else { 'n/a' }); виняток читання: $(if ($null -ne $secretMask417BookkeepingResult) { [string]$secretMask417BookkeepingResult.ReadErrorType } else { 'n/a' }); набір кинув: $(if ($null -ne $secretMask417BookkeepingResult) { [bool]$secretMask417BookkeepingResult.MaskThrew } else { 'n/a' }); витекли ключі: $($secretMask417BookkeepingLeaks -join ', '); помилка: $secretMask417BookkeepingError"
+    -Failure "збій обліку прочитаних секретів не має ламати читання (getter повертає значення), але Get-BRAVOLogMaskSecretSet після цього має кидати (fail-closed) без секрету в повідомленні; читання повернуло значення: $(if ($null -ne $secretMask417BookkeepingResult) { [string]$secretMask417BookkeepingResult.ReadValue -ceq [string]$secretMask417ByKey['SftpReadDuringFailure'] } else { 'n/a' }); виняток читання: $(if ($null -ne $secretMask417BookkeepingResult) { [string]$secretMask417BookkeepingResult.ReadErrorType } else { 'n/a' }); набір кинув: $(if ($null -ne $secretMask417BookkeepingResult) { [bool]$secretMask417BookkeepingResult.MaskThrew } else { 'n/a' }); набір кинув за пошкодженого реєстру без ознаки: $(if ($null -ne $secretMask417BookkeepingResult) { [bool]$secretMask417BookkeepingResult.MaskThrewDirect } else { 'n/a' }); повідомлення фіксоване: $(if ($null -ne $secretMask417BookkeepingResult) { -not ([string]$secretMask417BookkeepingResult.MaskErrorText + [string]$secretMask417BookkeepingResult.MaskErrorTextDirect).Contains('synthetic registry bookkeeping failure') } else { 'n/a' }); витекли ключі: $($secretMask417BookkeepingLeaks -join ', '); помилка: $secretMask417BookkeepingError"
 
 # --- (в) інтеграція: Invoke-BRAVOMaintenanceOwnLogUpload після збою обліку
 # нічого не вивантажує, пише WARNING без секретів і без тексту первинного
@@ -1112,7 +1131,7 @@ try {
         $readOut = $null
         $readErrorType = ''
         try { $readOut = Get-BRAVOCredentialSecret -Target $sftpTarget } catch { $readErrorType = $_.Exception.GetType().FullName }
-        $script:BRAVOCredentialReadSecretRegistry = $null
+        # Codex P1: пошкоджений реєстр лишається в стані модуля.
         $invokeError = ''
         try {
             Invoke-BRAVOMaintenanceOwnLogUpload
