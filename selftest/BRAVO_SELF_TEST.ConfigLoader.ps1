@@ -14,6 +14,241 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 — НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 
+# ============================================================
+# Батч-раннер проб loader-а: ОДИН дочірній powershell.exe на фрагмент
+# замість окремого процесу на кожну пробу (старт процесу ≈1,8–2 с).
+# Ізоляцію дає свіжий runspace на кожну пробу
+# ([runspacefactory]::CreateRunspace() + [powershell]::Create()):
+# власні глобальні змінні, функції, модулі й StrictMode, як у нового
+# процесу. Спільне на процес — змінні середовища й поточний каталог .NET;
+# раннер знімає їх перед першою пробою й відновлює після КОЖНОЇ проби
+# (проби ставлять BRAVO_ALLOW_WEAKENED_SECURITY).
+#
+# Протокол: батько записує текст проби в probe-<N>.ps1 і передає N рядком
+# у stdin раннера; раннер виконує пробу, пише result-<N>.txt (вивід,
+# включно з помилками й попередженнями, як колись 2>&1 | Out-String) і
+# result-<N>.meta (PID і канарки ізоляції), а тоді відповідає "DONE <N>".
+# Кожна проба лишається синхронним викликом на тому самому місці, тож
+# порядок файлових фікстур між пробами не змінився.
+#
+# Fail-closed: якщо раннер не стартував, упав або проба не записала
+# результат, Invoke-BRAVOConfigLoaderProbe повертає текст із маркером
+# BRAVO-CONFIGLOADER-PROBE-NO-RESULT. Жодна позитивна умова перевірок його
+# не задовольняє, а перевірки з лише заперечними умовами додатково
+# звіряються з Test-BRAVOConfigLoaderProbeCompleted. Окрема перевірка
+# ConfigLoader/ProbesShareOneChildProcess (секція ConfigLoader/Authorization)
+# звіряє кількість проб і результатів, один PID і канарки ізоляції.
+#
+# Окремим процесом лишаються лише запуски, де важить код виходу або
+# entrypoint: BRAVO_DRY_RUN.ps1, Invoke-BRAVOSelfTestEffectiveSnapshotCapture
+# (exit 1 + ExitCode) і deploy\Get-BRAVOConfigSiteDelta.ps1.
+# ============================================================
+$script:BRAVOConfigLoaderProbeWorker = @{
+    Root     = $null
+    Process  = $null
+    Issued   = 0
+    Failure  = ''
+    Results  = (New-Object System.Collections.ArrayList)
+    NoResult = 'BRAVO-CONFIGLOADER-PROBE-NO-RESULT'
+}
+
+function Start-BRAVOConfigLoaderProbeWorker {
+    $probeWorker = $script:BRAVOConfigLoaderProbeWorker
+    $probeWorker.Root = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGLOADER_PROBES_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($probeWorker.Root)
+    $probeRunnerText = @'
+param($BRAVOConfigLoaderProbeState)
+# Виконується у СВІЖОМУ runspace раннера, у глобальній області (як
+# powershell.exe -Command). Канарки: жодна не має бути видна з попередньої
+# проби — глобальну змінну прибирає новий runspace, змінну середовища
+# відновлює раннер.
+if ($null -ne (Get-Variable -Name 'BRAVOConfigLoaderProbeCanary' -Scope Global -ErrorAction SilentlyContinue)) {
+    [void]$BRAVOConfigLoaderProbeState.Leaks.Add('global:BRAVOConfigLoaderProbeCanary')
+}
+if ($null -ne [Environment]::GetEnvironmentVariable('BRAVO_CONFIGLOADER_PROBE_CANARY')) {
+    [void]$BRAVOConfigLoaderProbeState.Leaks.Add('env:BRAVO_CONFIGLOADER_PROBE_CANARY')
+}
+try {
+    do {
+        . ([scriptblock]::Create([string]$BRAVOConfigLoaderProbeState.Command)) 2>&1 3>&1 |
+            Out-String -Stream |
+            ForEach-Object { [void]$BRAVOConfigLoaderProbeState.Lines.Add([string]$_) }
+    } while ($false)
+} catch {
+    [void]$BRAVOConfigLoaderProbeState.Lines.Add([string]($_ | Out-String))
+}
+$global:BRAVOConfigLoaderProbeCanary = $BRAVOConfigLoaderProbeState.Index
+[Environment]::SetEnvironmentVariable('BRAVO_CONFIGLOADER_PROBE_CANARY', [string]$BRAVOConfigLoaderProbeState.Index)
+$BRAVOConfigLoaderProbeState.Completed = $true
+'@
+    $probeWorkerText = @'
+# Раннер проб BRAVO_SELF_TEST.ConfigLoader.ps1 (див. коментар у фрагменті).
+$ErrorActionPreference = 'Stop'
+$probeUtf8 = New-Object System.Text.UTF8Encoding($false)
+$probeRunnerText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'runner.ps1'), [Text.Encoding]::UTF8)
+$probeEnvironmentBaseline = @{}
+foreach ($probeEnvironmentEntry in @(Get-ChildItem -Path 'Env:')) {
+    $probeEnvironmentBaseline[$probeEnvironmentEntry.Name] = [string]$probeEnvironmentEntry.Value
+}
+$probeCurrentDirectory = [Environment]::CurrentDirectory
+while ($true) {
+    $probeRequest = [Console]::In.ReadLine()
+    if ($null -eq $probeRequest) { break }
+    if ($probeRequest -notmatch '(\d+)') { continue }
+    $probeIndex = [int]$Matches[1]
+    try {
+        $probeState = @{
+            Index     = $probeIndex
+            Command   = [IO.File]::ReadAllText((Join-Path $PSScriptRoot ('probe-{0}.ps1' -f $probeIndex)), [Text.Encoding]::UTF8)
+            Lines     = (New-Object System.Collections.ArrayList)
+            Leaks     = (New-Object System.Collections.ArrayList)
+            Completed = $false
+        }
+        $probeRunspace = $null
+        $probeShell = $null
+        try {
+            $probeRunspace = [runspacefactory]::CreateRunspace()
+            $probeRunspace.Open()
+            $probeShell = [powershell]::Create()
+            $probeShell.Runspace = $probeRunspace
+            [void]$probeShell.AddScript($probeRunnerText).AddArgument($probeState)
+            [void]$probeShell.Invoke()
+        } finally {
+            if ($null -ne $probeShell) { $probeShell.Dispose() }
+            if ($null -ne $probeRunspace) { $probeRunspace.Dispose() }
+            foreach ($probeEnvironmentEntry in @(Get-ChildItem -Path 'Env:')) {
+                if (-not $probeEnvironmentBaseline.ContainsKey($probeEnvironmentEntry.Name)) {
+                    # Remove-Item, а не SetEnvironmentVariable(name, $null): PowerShell
+                    # передає $null у string-параметр як '', а порожнє значення
+                    # видаляє змінну лише в .NET Framework.
+                    Remove-Item -LiteralPath ('Env:' + $probeEnvironmentEntry.Name) -ErrorAction SilentlyContinue
+                }
+            }
+            foreach ($probeEnvironmentName in @($probeEnvironmentBaseline.Keys)) {
+                if ([Environment]::GetEnvironmentVariable($probeEnvironmentName) -cne $probeEnvironmentBaseline[$probeEnvironmentName]) {
+                    [Environment]::SetEnvironmentVariable($probeEnvironmentName, $probeEnvironmentBaseline[$probeEnvironmentName])
+                }
+            }
+            [Environment]::CurrentDirectory = $probeCurrentDirectory
+        }
+        if (-not $probeState.Completed) { throw 'runspace проби не дійшов до кінця' }
+        [IO.File]::WriteAllText((Join-Path $PSScriptRoot ('result-{0}.txt' -f $probeIndex)),
+            (([string]::Join("`r`n", @($probeState.Lines | ForEach-Object { [string]$_ }))) + "`r`n"), $probeUtf8)
+        [IO.File]::WriteAllText((Join-Path $PSScriptRoot ('result-{0}.meta' -f $probeIndex)),
+            ('{0}{1}{2}' -f $PID, "`t", ([string]::Join(',', @($probeState.Leaks | ForEach-Object { [string]$_ })))), $probeUtf8)
+    } catch {
+        [IO.File]::WriteAllText((Join-Path $PSScriptRoot ('result-{0}.error' -f $probeIndex)), [string]$_.Exception.Message, $probeUtf8)
+    }
+    [Console]::Out.WriteLine(('DONE {0}' -f $probeIndex))
+    [Console]::Out.Flush()
+}
+'@
+    $probeBomUtf8 = New-Object System.Text.UTF8Encoding($true)
+    [IO.File]::WriteAllText((Join-Path $probeWorker.Root 'runner.ps1'), $probeRunnerText, $probeBomUtf8)
+    [IO.File]::WriteAllText((Join-Path $probeWorker.Root 'worker.ps1'), $probeWorkerText, $probeBomUtf8)
+    $probeStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $probeStartInfo.FileName = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $probeStartInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+        (Join-Path $probeWorker.Root 'worker.ps1') + '"'
+    $probeStartInfo.UseShellExecute = $false
+    $probeStartInfo.RedirectStandardInput = $true
+    $probeStartInfo.RedirectStandardOutput = $true
+    $probeWorker.Process = [System.Diagnostics.Process]::Start($probeStartInfo)
+}
+
+function Invoke-BRAVOConfigLoaderProbe {
+    # Виконує текст проби (те, що раніше йшло в powershell.exe -Command)
+    # у свіжому runspace спільного дочірнього раннера й повертає вивід
+    # рядком; -AsLines — масивом рядків, як нативний вивід без Out-String.
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [switch]$AsLines
+    )
+    $probeWorker = $script:BRAVOConfigLoaderProbeWorker
+    if ($null -eq $probeWorker.Process -and [string]::IsNullOrEmpty($probeWorker.Failure)) {
+        try {
+            Start-BRAVOConfigLoaderProbeWorker
+        } catch {
+            $probeWorker.Failure = "раннер проб не стартував: $($_.Exception.Message)"
+        }
+    }
+    $probeWorker.Issued = [int]$probeWorker.Issued + 1
+    $probeIndex = [int]$probeWorker.Issued
+    $probeText = $null
+    $probeReason = ''
+    if ([string]::IsNullOrEmpty($probeWorker.Failure)) {
+        try {
+            [IO.File]::WriteAllText((Join-Path $probeWorker.Root "probe-$probeIndex.ps1"), $Command, (New-Object System.Text.UTF8Encoding($true)))
+            $probeWorker.Process.StandardInput.WriteLine([string]$probeIndex)
+            $probeAck = $null
+            do {
+                $probeAck = $probeWorker.Process.StandardOutput.ReadLine()
+            } while ($null -ne $probeAck -and $probeAck -notmatch ('(^|\W)DONE ' + $probeIndex + '$'))
+            if ($null -eq $probeAck) {
+                $probeExitText = if ($probeWorker.Process.WaitForExit(5000)) { [string]$probeWorker.Process.ExitCode } else { 'н/д' }
+                $probeWorker.Failure = "раннер проб завершився (код виходу $probeExitText)"
+            }
+        } catch {
+            $probeWorker.Failure = "зв'язок із раннером проб втрачено: $($_.Exception.Message)"
+        }
+        $probeResultPath = Join-Path $probeWorker.Root "result-$probeIndex.txt"
+        $probeMetaPath = Join-Path $probeWorker.Root "result-$probeIndex.meta"
+        $probeErrorPath = Join-Path $probeWorker.Root "result-$probeIndex.error"
+        if ((Test-Path -LiteralPath $probeResultPath -PathType Leaf) -and (Test-Path -LiteralPath $probeMetaPath -PathType Leaf)) {
+            $probeText = [IO.File]::ReadAllText($probeResultPath, [Text.Encoding]::UTF8)
+            $probeMeta = [IO.File]::ReadAllText($probeMetaPath, [Text.Encoding]::UTF8).Split("`t")
+            [void]$probeWorker.Results.Add([pscustomobject]@{
+                    Index     = $probeIndex
+                    ProcessId = [string]$probeMeta[0]
+                    Leaks     = $(if ($probeMeta.Count -gt 1) { [string]$probeMeta[1] } else { '' })
+                })
+        } elseif (Test-Path -LiteralPath $probeErrorPath -PathType Leaf) {
+            $probeReason = "збій раннера: $([IO.File]::ReadAllText($probeErrorPath, [Text.Encoding]::UTF8))"
+        }
+    }
+    if ($null -eq $probeText) {
+        if ([string]::IsNullOrEmpty($probeReason)) {
+            $probeReason = $(if ([string]::IsNullOrEmpty($probeWorker.Failure)) { 'файл результату відсутній' } else { $probeWorker.Failure })
+        }
+        $probeText = "$($probeWorker.NoResult): проба #$probeIndex не записала результат ($probeReason)`r`n"
+    }
+    if ($AsLines) {
+        return @($probeText.TrimEnd() -split "`r?`n")
+    }
+    return $probeText
+}
+
+function Test-BRAVOConfigLoaderProbeCompleted {
+    # $false, якщо замість виводу проби повернуто маркер відсутнього
+    # результату (fail-closed для перевірок лише із заперечними умовами).
+    param([AllowNull()][AllowEmptyString()][string]$Output)
+    return -not ([string]$Output).Contains($script:BRAVOConfigLoaderProbeWorker.NoResult)
+}
+
+function Stop-BRAVOConfigLoaderProbeWorker {
+    # Закритий stdin завершує цикл раннера; наступна проба (якщо буде)
+    # запустить новий раннер із чистим обліком.
+    $probeWorker = $script:BRAVOConfigLoaderProbeWorker
+    if ($null -ne $probeWorker.Process) {
+        try {
+            $probeWorker.Process.StandardInput.Close()
+            if (-not $probeWorker.Process.WaitForExit(30000)) { $probeWorker.Process.Kill() }
+        } catch {
+            $null = $_
+        }
+        $probeWorker.Process.Dispose()
+    }
+    if (-not [string]::IsNullOrEmpty($probeWorker.Root)) {
+        Remove-Item -LiteralPath $probeWorker.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $probeWorker.Root = $null
+    $probeWorker.Process = $null
+    $probeWorker.Issued = 0
+    $probeWorker.Failure = ''
+    $probeWorker.Results.Clear()
+}
+
 if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/OriginalExceptionMessageNotLost') { try {
 $configLoaderPath = Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'
 $configLoaderScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
@@ -31,11 +266,11 @@ try {
         (New-Object System.Text.UTF8Encoding $false)
     )
 
-    # Окремий дочірній процес: Import-BravoConfiguration встановлює
-    # $global:ScriptVersion/$global:BravoConfigurationMetadata та інший
-    # глобальний стан, який небезпечно змішувати з рештою self-test-прогону
-    # в тому самому процесі.
-    $childOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command @"
+    # Окремий runspace у дочірньому раннері проб: Import-BravoConfiguration
+    # встановлює $global:ScriptVersion/$global:BravoConfigurationMetadata та
+    # інший глобальний стан, який небезпечно змішувати з рештою
+    # self-test-прогону в тому самому процесі.
+    $childOutput = Invoke-BRAVOConfigLoaderProbe -Command @"
 `$ErrorActionPreference = 'Stop'
 try {
     . '$configLoaderPath'
@@ -44,7 +279,7 @@ try {
 } catch {
     Write-Output `$_.Exception.Message
 }
-"@ 2>&1 | Out-String
+"@
 
     $configLoaderErrorMessage = [string]$childOutput
 
@@ -61,6 +296,7 @@ try {
     # мовчазна поведінка для Supported-оточення, яку описує коментар у коді.
     Test-BRAVOCondition `
         -Condition (
+            (Test-BRAVOConfigLoaderProbeCompleted -Output $configLoaderErrorMessage) -and
             -not $configLoaderErrorMessage.Contains('Unsupported') -and
             -not $configLoaderErrorMessage.Contains('LegacyBestEffort')
         ) `
@@ -116,8 +352,8 @@ try {
 
 # ============================================================
 # BRAVO.local.config (5.2.1): локальні site-overrides, що переживають
-# оновлення комплекту. Кожен сценарій — ізольований дочірній
-# powershell.exe (Import-BravoConfiguration змінює глобальний стан).
+# оновлення комплекту. Кожен сценарій — ізольований runspace у дочірньому
+# раннері проб (Import-BravoConfiguration змінює глобальний стан).
 # ============================================================
 $localCfgScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_LOCALCFG_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -161,8 +397,7 @@ try {
         "    'sftpHostTemplate' = '{0}.selftest-example.test'`r`n" +
         "}`r`n"
     ), (New-Object System.Text.UTF8Encoding $false))
-    $localCfgProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+    $localCfgProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
             "Set-StrictMode -Version 2.0; " +
             "try { " +
             ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
@@ -173,7 +408,7 @@ try {
             "[string]`$global:backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold, " +
             "(@(`$global:BravoConfigurationMetadata.LocalConfigOverrides).Count) " +
             "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
-        ) 2>&1
+        )
     $localCfgProbeLast = ([string](@($localCfgProbe)[-1])).Trim()
     Test-BRAVOCondition `
         -Condition ($localCfgProbeLast -eq "$localCfgBackupDir\MODEL|HoldServices|True|77|4") `
@@ -195,8 +430,7 @@ try {
         "    }`r`n" +
         "}`r`n"
     ), (New-Object System.Text.UTF8Encoding $false))
-    $localCfgNestedProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+    $localCfgNestedProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
             "Set-StrictMode -Version 2.0; " +
             "try { " +
             ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
@@ -204,7 +438,7 @@ try {
             "'{0}|{1}' -f [string]`$global:bravoSettings.NotificationRouting.SUCCESS, " +
             "[string]`$global:bravoSettings.NotificationRouting.WARNING " +
             "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
-        ) 2>&1
+        )
     $localCfgNestedProbeLast = ([string](@($localCfgNestedProbe)[-1])).Trim()
     Test-BRAVOCondition `
         -Condition ($localCfgNestedProbeLast -eq 'general|alerts') `
@@ -223,15 +457,14 @@ try {
         "    'defaultLogLevel' = ' ERROR '`r`n" +
         "}`r`n"
     ), (New-Object System.Text.UTF8Encoding $false))
-    $localCfgDefaultLogLevelProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+    $localCfgDefaultLogLevelProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
             "Set-StrictMode -Version 2.0; " +
             "try { " +
             ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
             "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
             "'NOTHREW:' + [string]`$global:defaultLogLevel " +
             "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
-        ) 2>&1
+        )
     $localCfgDefaultLogLevelProbeLast = ([string](@($localCfgDefaultLogLevelProbe)[-1])).Trim()
     Test-BRAVOCondition `
         -Condition ($localCfgDefaultLogLevelProbeLast -eq 'NOTHREW: ERROR') `
@@ -251,15 +484,14 @@ try {
         "    'consoleSettings.OutputEncodingCodePage' = 0`r`n" +
         "}`r`n"
     ), (New-Object System.Text.UTF8Encoding $false))
-    $localCfgCodePageProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+    $localCfgCodePageProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
             "Set-StrictMode -Version 2.0; " +
             "try { " +
             ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
             "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
             "'NOTHREW:' + [string]`$global:consoleSettings.OutputEncodingCodePage " +
             "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
-        ) 2>&1
+        )
     $localCfgCodePageProbeLast = ([string](@($localCfgCodePageProbe)[-1])).Trim()
     Test-BRAVOCondition `
         -Condition ($localCfgCodePageProbeLast -eq 'NOTHREW:0') `
@@ -278,15 +510,14 @@ try {
         "    'sftpPort' = 18446744073709551615`r`n" +
         "}`r`n"
     ), (New-Object System.Text.UTF8Encoding $false))
-    $localCfgSftpPortProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+    $localCfgSftpPortProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
             "Set-StrictMode -Version 2.0; " +
             "try { " +
             ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
             "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
             "'UNEXPECTED-NOTHREW' " +
             "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
-        ) 2>&1
+        )
     $localCfgSftpPortProbeLast = ([string](@($localCfgSftpPortProbe)[-1])).Trim()
     Test-BRAVOCondition `
         -Condition (
@@ -309,15 +540,14 @@ try {
         "    'maintenanceSettings.Logging.Level' = 'SUCCESS'`r`n" +
         "}`r`n"
     ), (New-Object System.Text.UTF8Encoding $false))
-    $localCfgMlSuccessProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+    $localCfgMlSuccessProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
             "Set-StrictMode -Version 2.0; " +
             "try { " +
             ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
             "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
             "'NOTHREW:' + [string]`$global:maintenanceSettings.Logging.Level " +
             "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
-        ) 2>&1
+        )
     $localCfgMlSuccessProbeLast = ([string](@($localCfgMlSuccessProbe)[-1])).Trim()
     Test-BRAVOCondition `
         -Condition ($localCfgMlSuccessProbeLast -eq 'NOTHREW:SUCCESS') `
@@ -336,15 +566,14 @@ try {
             "    'maintenanceSettings.Logging.Level' = '$mlUnsupported'`r`n" +
             "}`r`n"
         ), (New-Object System.Text.UTF8Encoding $false))
-        $localCfgMlUnsupportedProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+        $localCfgMlUnsupportedProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
                 "Set-StrictMode -Version 2.0; " +
                 "try { " +
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
                 "'UNEXPECTED-NOTHREW' " +
                 "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
-            ) 2>&1
+            )
         $localCfgMlUnsupportedProbeLast = ([string](@($localCfgMlUnsupportedProbe)[-1])).Trim()
         Test-BRAVOCondition `
             -Condition (
@@ -361,11 +590,10 @@ try {
         "@{ 'pathSettings.NoSuchKeyRoot.Sub' = 'x' }",
         (New-Object System.Text.UTF8Encoding $false))
     $localCfgTypoProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+        Invoke-BRAVOConfigLoaderProbe -Command (
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW' }"
-            ) 2>&1 | Out-String
+            )
     )
     Test-BRAVOCondition `
         -Condition ($localCfgTypoProbe.Contains('THREW') -and -not $localCfgTypoProbe.Contains('NO-THROW')) `
@@ -382,11 +610,10 @@ try {
         "@{ 'maintenanceSettings.Limits.MinimumFreeSpaceGB' = 'not-a-number' }",
         (New-Object System.Text.UTF8Encoding $false))
     $localCfgWrongTypeProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+        Invoke-BRAVOConfigLoaderProbe -Command (
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW:' + `$_.Exception.Message }"
-            ) 2>&1 | Out-String
+            )
     )
     Test-BRAVOCondition `
         -Condition (
@@ -405,13 +632,12 @@ try {
         "@{ configSchemaVersion = 2`r`n'pathSettings.BackupRoot' = '$localCfgBackupLiteral' }",
         (New-Object System.Text.UTF8Encoding $false))
     $localCfgVersionProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+        Invoke-BRAVOConfigLoaderProbe -Command (
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
                 "'RESULT:' + [string]`$global:BravoConfigurationMetadata.LocalConfigDeclaredSchemaVersion + " +
                 "';' + [string]`$global:pathSettings.BackupRoot } catch { 'THREW:' + `$_.Exception.Message }"
-            ) 2>&1 | Out-String
+            )
     )
     Test-BRAVOCondition `
         -Condition (
@@ -427,11 +653,10 @@ try {
         "@{ configSchemaVersion = 99`r`n'pathSettings.BackupRoot' = '$localCfgBackupLiteral' }",
         (New-Object System.Text.UTF8Encoding $false))
     $localCfgFutureVersionProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+        Invoke-BRAVOConfigLoaderProbe -Command (
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW:' + `$_.Exception.Message }"
-            ) 2>&1 | Out-String
+            )
     )
     Test-BRAVOCondition `
         -Condition (
@@ -447,11 +672,10 @@ try {
         "@{ 'pathSettings.BackupRoot' = (Get-Date).ToString() }",
         (New-Object System.Text.UTF8Encoding $false))
     $localCfgCodeProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+        Invoke-BRAVOConfigLoaderProbe -Command (
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW' }"
-            ) 2>&1 | Out-String
+            )
     )
     Test-BRAVOCondition `
         -Condition ($localCfgCodeProbe.Contains('THREW') -and -not $localCfgCodeProbe.Contains('NO-THROW')) `
@@ -468,11 +692,10 @@ try {
         "@{ 'bravoSettings.NotificationRequestTimeoutSeconds' = 1 + 1 }",
         (New-Object System.Text.UTF8Encoding $false))
     $localCfgExpressionProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+        Invoke-BRAVOConfigLoaderProbe -Command (
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW' }"
-            ) 2>&1 | Out-String
+            )
     )
     Test-BRAVOCondition `
         -Condition ($localCfgExpressionProbe.Contains('THREW') -and -not $localCfgExpressionProbe.Contains('NO-THROW')) `
@@ -482,14 +705,13 @@ try {
     # --- Без файла -> штатне завантаження, metadata порожній.
     Remove-Item -LiteralPath $localCfgOverridePath -Force
     $localCfgAbsentProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+        Invoke-BRAVOConfigLoaderProbe -Command (
                 "try { " +
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
                 "'OK ' + (@(`$global:BravoConfigurationMetadata.LocalConfigOverrides).Count) " +
                 "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
-            ) 2>&1 | Out-String
+            )
     )
     Test-BRAVOCondition `
         -Condition ($localCfgAbsentProbe.Contains('OK 0')) `
@@ -502,8 +724,8 @@ try {
 # ============================================================
 # schedulerSettings.Health.BusyWaitMinutes (5.2.1): loader-нормалізація
 # ліміту очікування зайнятої архівації перед відкладенням health-прогону.
-# Кожен сценарій — ізольований дочірній powershell.exe (Import-BravoConfiguration
-# змінює глобальний стан); конфіг герметизовано явним BackupRoot (та сама
+# Кожен сценарій — ізольований runspace у дочірньому раннері проб
+# (Import-BravoConfiguration змінює глобальний стан); конфіг герметизовано явним BackupRoot (та сама
 # CI-пастка, що й у local-config сценаріях вище).
 # ============================================================
 $busyWaitScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
@@ -559,8 +781,7 @@ try {
             (New-Object System.Text.UTF8Encoding $false)
         )
         $busyWaitProbe = [string](
-            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $busyWaitProbeCommand 2>&1 | Out-String
+            Invoke-BRAVOConfigLoaderProbe -Command $busyWaitProbeCommand
         )
         Test-BRAVOCondition `
             -Condition ($busyWaitProbe.Contains([string]$busyWaitCase.Expected)) `
@@ -667,8 +888,7 @@ try {
             (New-Object System.Text.UTF8Encoding $false)
         )
         $successDedupProbe = [string](
-            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $successDedupProbeCommand 2>&1 | Out-String
+            Invoke-BRAVOConfigLoaderProbe -Command $successDedupProbeCommand
         )
         Test-BRAVOCondition `
             -Condition ($successDedupProbe.Contains([string]$successDedupCase.Expected)) `
@@ -683,7 +903,7 @@ try {
 # master-вимикачі зовнішніх сховищ. Loader-нормалізація (відсутній ключ =
 # $true), strict-bool валідація (не-bool = канонічна помилка), raw vs
 # effective розділення і узгодження bazaSyncEffective/BAZASync.
-# Кожен сценарій — ізольований дочірній powershell.exe.
+# Кожен сценарій — ізольований runspace у дочірньому раннері проб.
 # ============================================================
 $storageSwitchScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_STORAGESW_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -834,8 +1054,7 @@ try {
             Remove-Item -LiteralPath $storageSwitchLocalConfigPath -Force
         }
         $storageSwitchProbe = [string](
-            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $storageSwitchProbeCommand 2>&1 | Out-String
+            Invoke-BRAVOConfigLoaderProbe -Command $storageSwitchProbeCommand
         )
         $storageSwitchMatched = $storageSwitchProbe.Contains([string]$storageSwitchCase.Expected)
         if ($storageSwitchMatched -and $storageSwitchCase.Contains('ExpectedAlso')) {
@@ -855,7 +1074,7 @@ try {
 # override-шаром. Import-BravoSyntheticConfiguration (canonical defaults +
 # Resolve-BRAVORawConfiguration + Resolve-BRAVOConfigurationDerivation) —
 # той самий derivation-резолвер, що й legacy-шлях, без BRAVO.config-файлу.
-# Кожен сценарій — ізольований дочірній powershell.exe; BackupRoot
+# Кожен сценарій — ізольований runspace у дочірньому раннері проб; BackupRoot
 # передається через BRAVO.local.config (герметичність на машині без LIMS,
 # той самий патерн, що й у сценаріях вище).
 # ============================================================
@@ -894,20 +1113,12 @@ try {
         "';LOCKPATH=' + [string]`$global:operationLockSettings.Path " +
         "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
     )
-    # Захоплення виводу дочірнього процесу з кирилицею (InstitutionName/
-    # ObjectName) потребує явного UTF-8 OutputEncoding — інакше системна
-    # кодова сторінка ламає багатобайтові послідовності (той самий
-    # відомий пастка, що й у local-only SFTP/SMB сценарії BRAVO_SELF_TEST.ps1).
-    $noConfigPreviousOutputEncoding = [Console]::OutputEncoding
-    try {
-        [Console]::OutputEncoding = [Text.Encoding]::UTF8
-        $noConfigProbe = [string](
-            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $noConfigProbeCommand 2>&1 | Out-String
-        )
-    } finally {
-        [Console]::OutputEncoding = $noConfigPreviousOutputEncoding
-    }
+    # Кирилиця у виводі (InstitutionName/ObjectName) доходить без утрат:
+    # раннер проб пише результат у файл UTF-8, а не через консольну кодову
+    # сторінку (раніше тут доводилось перемикати [Console]::OutputEncoding).
+    $noConfigProbe = [string](
+        Invoke-BRAVOConfigLoaderProbe -Command $noConfigProbeCommand
+    )
     Test-BRAVOCondition `
         -Condition $noConfigProbe.Contains('FORMAT=synthetic-no-config') `
         -Name "ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic" `
@@ -958,8 +1169,7 @@ try {
         "} catch { 'THREW: ' + `$_.Exception.Message }"
     )
     $noConfigExplicitProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $noConfigExplicitProbeCommand 2>&1 | Out-String
+        Invoke-BRAVOConfigLoaderProbe -Command $noConfigExplicitProbeCommand
     )
     Test-BRAVOCondition `
         -Condition ($noConfigExplicitProbe.Contains('THREW:') -and -not $noConfigExplicitProbe.Contains('NO-THROW')) `
@@ -1061,12 +1271,11 @@ try {
                 "} catch { 'THREW' }"
             )
             $intentMatrixProbe = [string](
-                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $intentMatrixProbeCommand 2>&1 | Out-String
+                Invoke-BRAVOConfigLoaderProbe -Command $intentMatrixProbeCommand
             )
             $intentMatrixThrew = $intentMatrixProbe.Contains('THREW') -and -not $intentMatrixProbe.Contains('NO-THROW')
             Test-BRAVOCondition `
-                -Condition ($intentMatrixThrew -eq [bool]$intentMatrixCase.ExpectThrow) `
+                -Condition ((Test-BRAVOConfigLoaderProbeCompleted -Output $intentMatrixProbe) -and ($intentMatrixThrew -eq [bool]$intentMatrixCase.ExpectThrow)) `
                 -Name ([string]$intentMatrixCase.Name) `
                 -Failure "$($intentMatrixCase.Failure); очікувалось ExpectThrow=$($intentMatrixCase.ExpectThrow), отримано THREW=$intentMatrixThrew, вивід: $intentMatrixProbe"
         }
@@ -1096,8 +1305,7 @@ try {
         " }"
     )
     $noConfigTypoProbe = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $noConfigTypoProbeCommand 2>&1 | Out-String
+        Invoke-BRAVOConfigLoaderProbe -Command $noConfigTypoProbeCommand
     )
     Test-BRAVOCondition `
         -Condition ($noConfigTypoProbe.Contains('THREW') -and -not $noConfigTypoProbe.Contains('NO-THROW')) `
@@ -1154,8 +1362,7 @@ function New-BRAVOConfigLoaderParityProbe {
             "} catch { 'THREW: ' + `$_.Exception.Message }"
         )
         $probeOutput = [string](
-            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+            Invoke-BRAVOConfigLoaderProbe -Command $probeCommand
         )
         return $probeOutput.Trim()
     } finally {
@@ -1260,8 +1467,7 @@ function New-BRAVOConfigLoaderSecurityDowngradeProbe {
             "} catch { 'THREW: ' + `$_.Exception.Message }"
         )
         $probeOutput = [string](
-            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+            Invoke-BRAVOConfigLoaderProbe -Command $probeCommand
         )
         return $probeOutput.Trim()
     } finally {
@@ -1461,8 +1667,7 @@ try {
         "Test-BRAVOEffectiveSecurityInvariants } catch { 'THREW: ' + `$_.Exception.Message }"
     )
     $reqAdminInvariantNonBoolResult = [string](
-        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $reqAdminInvariantNonBoolProbeCommand 2>&1 | Out-String
+        Invoke-BRAVOConfigLoaderProbe -Command $reqAdminInvariantNonBoolProbeCommand
     ).Trim()
     Test-BRAVOCondition `
         -Condition (
@@ -1494,8 +1699,7 @@ $reqAdminMissingProbeCommand = (
     "Test-BRAVOEffectiveSecurityInvariants } catch { 'THREW: ' + `$_.Exception.Message }"
 )
 $reqAdminMissingResult = [string](
-    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $reqAdminMissingProbeCommand 2>&1 | Out-String
+    Invoke-BRAVOConfigLoaderProbe -Command $reqAdminMissingProbeCommand
 ).Trim()
 Test-BRAVOCondition `
     -Condition (
@@ -1523,8 +1727,7 @@ $toolIntegrityWeakenedProbeCommand = (
     "Test-BRAVOEffectiveSecurityInvariants } catch { 'THREW: ' + `$_.Exception.Message }"
 )
 $toolIntegrityWeakenedResult = [string](
-    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolIntegrityWeakenedProbeCommand 2>&1 | Out-String
+    Invoke-BRAVOConfigLoaderProbe -Command $toolIntegrityWeakenedProbeCommand
 ).Trim()
 Test-BRAVOCondition `
     -Condition (
@@ -1559,8 +1762,7 @@ $toolManifestRedirectedProbeCommand = (
     "Test-BRAVOEffectiveSecurityInvariants; 'NO-THROW' } catch { 'THREW: ' + `$_.Exception.Message }"
 )
 $toolManifestRedirectedResult = [string](
-    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestRedirectedProbeCommand 2>&1 | Out-String
+    Invoke-BRAVOConfigLoaderProbe -Command $toolManifestRedirectedProbeCommand
 ).Trim()
 Test-BRAVOCondition `
     -Condition (
@@ -1577,15 +1779,14 @@ $toolManifestCanonicalProbeCommand = (
     "Test-BRAVOEffectiveSecurityInvariants; 'NO-THROW' } catch { 'THREW: ' + `$_.Exception.Message }"
 )
 $toolManifestCanonicalResult = [string](
-    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestCanonicalProbeCommand 2>&1 | Out-String
+    Invoke-BRAVOConfigLoaderProbe -Command $toolManifestCanonicalProbeCommand
 ).Trim()
 Test-BRAVOCondition `
     -Condition ($toolManifestCanonicalResult -eq 'NO-THROW') `
     -Name "ConfigLoader/ToolManifestPathCanonicalAllowed" `
     -Failure "канонічний toolIntegritySettings.ManifestPath (<toolsPath>\TOOLS_MANIFEST.json) не повинен блокуватись; отримано: $toolManifestCanonicalResult"
 
-# Крайові випадки T001 в одному дочірньому процесі (якір довіри —
+# Крайові випадки T001 в одній пробі (якір довіри —
 # <RuntimeRoot>\Tools):
 #   empty/malformed — порожній і синтаксично зіпсований ManifestPath;
 #   dotCanonical    — '..', що після GetFullPath дає той самий канонічний
@@ -1618,8 +1819,7 @@ $toolManifestEdgeProbeCommand = (
     "`$edgeOutcomes -join ';' } catch { 'THREW: ' + `$_.Exception.Message }"
 )
 $toolManifestEdgeResult = [string](
-    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestEdgeProbeCommand 2>&1 | Out-String
+    Invoke-BRAVOConfigLoaderProbe -Command $toolManifestEdgeProbeCommand
 ).Trim()
 Test-BRAVOCondition `
     -Condition ($toolManifestEdgeResult -eq 'empty=BLOCKED;malformed=BLOCKED;dotCanonical=NO-THROW;dotEscape=BLOCKED;caseVariant=BLOCKED;coRedirected=BLOCKED;orderedDict=BLOCKED') `
@@ -1765,8 +1965,7 @@ function New-BRAVOConfigLoaderWeakeningMixedProbe {
             "}"
         )
         $probeOutput = [string](
-            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+            Invoke-BRAVOConfigLoaderProbe -Command $probeCommand
         )
         return $probeOutput.Trim()
     } finally {
@@ -2038,8 +2237,7 @@ $committedConfigProbeCommand = (
     "ConvertTo-Json -InputObject `$primaryRaw -Depth 20 -Compress"
 )
 $committedConfigProbeOutput = [string](
-    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $committedConfigProbeCommand 2>&1 | Out-String
+    Invoke-BRAVOConfigLoaderProbe -Command $committedConfigProbeCommand
 )
 
 function ConvertFrom-BRAVOParityPSCustomObject {
@@ -2228,8 +2426,9 @@ Test-BRAVOCondition `
     function New-BRAVOConfigLoaderPrimaryStrictnessProbe {
         # Сценарій-корінь із КОПІЄЮ реального BRAVO.config (плюс, за потреби,
         # додані рядки) — той самий підхід, що й у parity-проб вище.
-        # Дочірній процес обов'язковий: Import-BravoConfiguration встановлює
-        # десятки $global:, змішувати які з рештою прогону не можна.
+        # Ізольований runspace дочірнього раннера обов'язковий:
+        # Import-BravoConfiguration встановлює десятки $global:, змішувати
+        # які з рештою прогону не можна.
         param([string]$ExtraConfigBody = '')
 
         $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) (
@@ -2258,8 +2457,7 @@ Test-BRAVOCondition `
                 "} catch { 'THREW: ' + `$_.Exception.Message }"
             )
             $probeOutput = [string](
-                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+                Invoke-BRAVOConfigLoaderProbe -Command $probeCommand
             )
             return $probeOutput.Trim()
         } finally {
@@ -2326,6 +2524,8 @@ Test-BRAVOCondition `
         # мусять ЗАВАНТАЖИТИСЬ. Рішення про сувору відмову — окреме (D3).
         Test-BRAVOCondition `
             -Condition (
+                (Test-BRAVOConfigLoaderProbeCompleted -Output $strictnessUnknownGlobal) -and
+                (Test-BRAVOConfigLoaderProbeCompleted -Output $strictnessUnknownNested) -and
                 -not $strictnessUnknownGlobal.StartsWith('THREW') -and
                 -not $strictnessUnknownNested.StartsWith('THREW')
             ) `
@@ -2350,8 +2550,7 @@ Test-BRAVOCondition `
         # зв'язується СЛАБШЕ за виклик методу, тож однорядковий варіант
         # означав би [string]($output.Trim()) — не те, що записано.
         $strictnessHelperRaw = [string](
-            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $strictnessHelperCommand 2>&1 | Out-String
+            Invoke-BRAVOConfigLoaderProbe -Command $strictnessHelperCommand
         )
         $strictnessHelperOutput = $strictnessHelperRaw.Trim()
         Test-BRAVOCondition `
@@ -2402,7 +2601,7 @@ if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/Authorization' -DependsOn 'Co
             # Перевірка стану ВСЕРЕДИНІ catch — якщо Import-BravoConfiguration
             # кидає виняток ДО Set-Variable-проєкції top-level ключів
             # (Complete-BRAVOConfigurationLoad), $global:archiveRetentionDays
-            # НІКОЛИ не оголошується в цьому дочірньому процесі. Це прямий
+            # НІКОЛИ не оголошується в runspace цієї проби. Це прямий
             # доказ атомарності (не лише "виняток кинуто", а "жоден валідний
             # override з того самого файлу не потрапив у ефективний стан").
             $probeCommand = (
@@ -2417,8 +2616,7 @@ if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/Authorization' -DependsOn 'Co
                 "}"
             )
             $probeOutput = [string](
-                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+                Invoke-BRAVOConfigLoaderProbe -Command $probeCommand
             )
             return $probeOutput.Trim()
         } finally {
@@ -2978,8 +3176,7 @@ try {
                 "} catch { 'THREW: ' + `$_.Exception.Message }"
             )
             $probeOutput = [string](
-                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+                Invoke-BRAVOConfigLoaderProbe -Command $probeCommand
             )
             return $probeOutput.Trim()
         } finally {
@@ -3065,8 +3262,7 @@ try {
                 "}"
             )
             $probeOutput = [string](
-                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
-                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+                Invoke-BRAVOConfigLoaderProbe -Command $probeCommand
             )
             return $probeOutput.Trim()
         } finally {
@@ -3126,6 +3322,34 @@ try {
         ) `
         -Name "ConfigLoader/MalformedLocalConfigEmptyKeyFailsClosed" `
         -Failure "BRAVO.local.config з порожнім ключем поруч із валідним override мусить fail closed ЦІЛИМ шаром (атомарно) — сусідній archiveRetentionDays=999 НЕ повинен потрапити в ефективний `$global:-стан; отримано: $malformedEmptyKeyResult"
+}
+
+# --- ConfigLoader/ProbesShareOneChildProcess: усі проби фрагмента досі
+# пройшли через ОДИН дочірній раннер (не в батьківському процесі), кожна
+# записала результат, і жодна не побачила канарок попередньої: глобальної
+# змінної (свіжий runspace) і змінної середовища (раннер відновлює
+# середовище після кожної проби). Остання секція з пробами — тож раннер
+# одразу зупиняється.
+& {
+    $probeBatchWorker = $script:BRAVOConfigLoaderProbeWorker
+    $probeBatchIssued = [int]$probeBatchWorker.Issued
+    $probeBatchResults = @($probeBatchWorker.Results)
+    $probeBatchProcessIds = @($probeBatchResults | ForEach-Object { [string]$_.ProcessId } | Sort-Object -Unique)
+    $probeBatchLeaks = @($probeBatchResults | Where-Object { -not [string]::IsNullOrEmpty([string]$_.Leaks) } |
+        ForEach-Object { "#$($_.Index): $($_.Leaks)" })
+    $probeBatchFailure = [string]$probeBatchWorker.Failure
+    Stop-BRAVOConfigLoaderProbeWorker
+    Test-BRAVOCondition `
+        -Condition (
+            $probeBatchIssued -ge 2 -and
+            $probeBatchResults.Count -eq $probeBatchIssued -and
+            $probeBatchProcessIds.Count -eq 1 -and
+            $probeBatchProcessIds[0] -ne [string]$PID -and
+            $probeBatchLeaks.Count -eq 0 -and
+            [string]::IsNullOrEmpty($probeBatchFailure)
+        ) `
+        -Name "ConfigLoader/ProbesShareOneChildProcess" `
+        -Failure "проби loader-а мають виконатися в одному дочірньому раннері, кожна у свіжому runspace і з власним результатом; проб $probeBatchIssued, результатів $($probeBatchResults.Count), PID раннера: $($probeBatchProcessIds -join ', ') (батько $PID), витоки канарок: $($probeBatchLeaks -join '; '), збій раннера: '$probeBatchFailure'"
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/Authorization' } }
 if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' -DependsOn 'ConfigLoader/RequireAdministratorMissingBlocks', 'ConfigLoader/Authorization') { try {
@@ -3788,3 +4012,6 @@ if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' -De
     }
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' } }
+# Раннер проб зупиняється в ConfigLoader/Authorization; тут — на випадок,
+# коли ту секцію пропущено або вона впала раніше.
+Stop-BRAVOConfigLoaderProbeWorker
