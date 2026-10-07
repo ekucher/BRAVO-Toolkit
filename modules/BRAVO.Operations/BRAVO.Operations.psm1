@@ -153,7 +153,11 @@ function Write-BRAVOOperationsAtomicJsonFile {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)]$Object
+        [Parameter(Mandatory = $true)]$Object,
+        # #397: ексклюзивне створення — наявний файл ніколи не замінюється
+        # (File.Move без перезапису кидає IOException; на NTFS — і для
+        # імені, що відрізняється лише регістром).
+        [switch]$NoClobber
     )
 
     $directory = Split-Path -Path $Path -Parent
@@ -167,7 +171,9 @@ function Write-BRAVOOperationsAtomicJsonFile {
     try {
         $json = $Object | ConvertTo-Json -Depth 8
         [IO.File]::WriteAllText($temporaryPath, $json, (New-Object Text.UTF8Encoding($false)))
-        if ([IO.File]::Exists($Path)) {
+        if ($NoClobber) {
+            [IO.File]::Move($temporaryPath, $Path)
+        } elseif ([IO.File]::Exists($Path)) {
             [IO.File]::Replace($temporaryPath, $Path, $backupPath)
             $wasReplaced = $true
         } else {
@@ -1520,9 +1526,17 @@ function Get-BRAVOOperationsOutboxItemEventId {
     # відновлення) кидала виняток у логуванні й dead-letter-і, і дренаж
     # зупинявся на цьому елементі на кожному прогоні. Порожній рядок,
     # якщо поля немає.
+    # #397: EventId — лише JSON-рядок (усі продюсери пишуть рядок-GUID через
+    # [string]$EventId в Add-BRAVOOperationsOutboxItem). Масив/об'єкт/число/
+    # bool після [string]-приведення виглядали б присутніми й подія йшла б
+    # у транспорт — повертаємо порожній рядок, як для відсутнього поля.
     param([AllowNull()]$Item)
 
-    return [string](Get-BRAVOOperationsJsonPropertyString -Object $Item -Name 'EventId')
+    if ($null -eq $Item) { return '' }
+    if ($Item.PSObject.Properties.Name -notcontains 'EventId') { return '' }
+    $eventIdValue = $Item.EventId
+    if ($eventIdValue -isnot [string]) { return '' }
+    return $eventIdValue
 }
 
 function Move-BRAVOOperationsOutboxItemToDeadLetter {
@@ -1559,8 +1573,27 @@ function Move-BRAVOOperationsOutboxItemToDeadLetter {
                 'missing-eventid-' + [guid]::NewGuid().ToString('N')
             }
         }
-        $targetPath = Get-BRAVOOperationsOutboxItemPath -EventId $deadLetterName -DeadLetter
-        Write-BRAVOOperationsAtomicJsonFile -Path $targetPath -Object $Item
+        # #397: карантин ніколи не знищує попередній dead-letter-артефакт.
+        # Канонічне ім'я не унікальне (ручне повернення того самого файлу,
+        # збіг після санітизації `a b`/`a_b`, регістр на NTFS, повтор того
+        # самого EventId) — тому створення ексклюзивне, а на зайняте ім'я
+        # береться нове з GUID-суфіксом. Якщо всі спроби зайняті — виняток:
+        # outbox-файл лишається на місці, нічого не втрачено.
+        $deadLetterWritten = $false
+        for ($deadLetterAttempt = 0; $deadLetterAttempt -lt 5 -and -not $deadLetterWritten; $deadLetterAttempt++) {
+            $candidateName = $deadLetterName
+            if ($deadLetterAttempt -gt 0) { $candidateName = $deadLetterName + '-' + [guid]::NewGuid().ToString('N') }
+            $targetPath = Get-BRAVOOperationsOutboxItemPath -EventId $candidateName -DeadLetter
+            try {
+                Write-BRAVOOperationsAtomicJsonFile -Path $targetPath -Object $Item -NoClobber
+                $deadLetterWritten = $true
+            } catch {
+                if (-not [IO.File]::Exists($targetPath)) { throw }
+            }
+        }
+        if (-not $deadLetterWritten) {
+            throw "не вдалося підібрати вільне ім'я dead-letter для '$deadLetterName'"
+        }
         if ($Item.PSObject.Properties.Name -contains '__Path' -and [IO.File]::Exists([string]$Item.__Path)) {
             Remove-Item -LiteralPath ([string]$Item.__Path) -Force -ErrorAction SilentlyContinue
         }
@@ -1814,7 +1847,7 @@ function Invoke-BRAVOOperationsOutboxDrain {
                 # #305: без EventId сервер не дедуплікує повтор, а сама подія
                 # не простежується — карантин з окремою причиною, без надсилання.
                 if ([string]::IsNullOrWhiteSpace((Get-BRAVOOperationsOutboxItemEventId -Item $item))) {
-                    throw "EventId відсутній або порожній — подію не можна ні простежити, ні безпечно повторити"
+                    throw "EventId відсутній, порожній або не рядок — подію не можна ні простежити, ні безпечно повторити"
                 }
                 $itemApiPath = Get-BRAVOOperationsJsonPropertyString -Object $item -Name 'ApiPath'
                 if ([string]::IsNullOrWhiteSpace($itemApiPath)) {
