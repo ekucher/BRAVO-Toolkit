@@ -17897,6 +17897,54 @@ try {
             -Name "Discovery/BazaWwwUsesHttpdConfDocumentRoot" `
             -Failure "BAZA_WWW має братись з DocumentRoot реального httpd.conf встановленої Apache-служби, а не з фолбек-здогадки <WEB_ROOT>\www"
 
+        # #301 (рев'ю #391, Codex 64d0e94): порожній <DocumentRoot>\BAZA - це
+        # той самий «каталог є, але порожній», що й для компонентів з bravo.ini.
+        # Presence-запис має нести AbsenceKind 'Empty', і підтверджений раніше
+        # BAZA_WWW дає Warning (EmptySource), а не Error.
+        $emptyBazaWwwPlaceholder = Join-Path $fakeBazaWwwDir 'placeholder.txt'
+        $emptyBazaWwwPresence = $null
+        $emptyBazaWwwScope = $null
+        $emptyBazaWwwError = ''
+        try {
+            Remove-Item -LiteralPath $emptyBazaWwwPlaceholder -Force
+            $emptyBazaWwwDiscovery = Resolve-BRAVOInstallationDiscovery `
+                -LimsRoot $discoveryTestRoot `
+                -BravoServiceName "BRAVO" `
+                -WebServiceCandidates @("Apache2.4") `
+                -Services $syntheticServices `
+                -SystemRoot $noSuchSystemRoot
+            $emptyBazaWwwPresence = $emptyBazaWwwDiscovery.Components['BAZA_WWW']
+            $emptyBazaWwwScope = Resolve-BRAVOBackupComponentScope -DiscoveryResult $emptyBazaWwwDiscovery `
+                -Baseline ([pscustomobject]@{ BAZA_WWW = $fakeBazaWwwDir }) -BaselineSourceKind 'Canonical' `
+                -EnabledComponents @{ BAZA_WWW = $true }
+        } catch {
+            $emptyBazaWwwError = $_.Exception.Message
+        } finally {
+            [IO.File]::WriteAllText($emptyBazaWwwPlaceholder, 'baza-www-fixture', (New-Object Text.UTF8Encoding($false)))
+        }
+        $emptyBazaWwwAbsenceKind = ''
+        if ($null -ne $emptyBazaWwwPresence -and $null -ne $emptyBazaWwwPresence.PSObject.Properties['AbsenceKind']) {
+            $emptyBazaWwwAbsenceKind = [string]$emptyBazaWwwPresence.AbsenceKind
+        }
+        $emptyBazaWwwScopeValue = ''
+        $emptyBazaWwwFindings = @()
+        if ($null -ne $emptyBazaWwwScope) {
+            $emptyBazaWwwScopeValue = [string]$emptyBazaWwwScope.Components['BAZA_WWW']
+            $emptyBazaWwwFindings = @(@($emptyBazaWwwScope.Findings) | Where-Object { [string]$_.Component -eq 'BAZA_WWW' })
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $emptyBazaWwwError -eq '' -and
+                $null -ne $emptyBazaWwwPresence -and
+                [string]$emptyBazaWwwPresence.Presence -eq 'Absent' -and
+                $emptyBazaWwwAbsenceKind -eq 'Empty' -and
+                $emptyBazaWwwScopeValue -eq 'EmptySource' -and
+                @($emptyBazaWwwFindings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
+                @($emptyBazaWwwFindings | Where-Object { [string]$_.Severity -eq 'Warning' }).Count -eq 1
+            ) `
+            -Name "Discovery/EmptyBazaWwwDocumentRootIsEmptySourceWarning" `
+            -Failure "порожній <DocumentRoot>\BAZA має дати Absent з AbsenceKind 'Empty', а підтверджений раніше BAZA_WWW - EmptySource з Warning без Error; absenceKind='$emptyBazaWwwAbsenceKind' scope='$emptyBazaWwwScopeValue' findings='$(@($emptyBazaWwwFindings | ForEach-Object { [string]$_.Severity }) -join ',')' error='$emptyBazaWwwError'"
+
         # Архітектурний інваріант (safety-review): стан Windows-служб не
         # повинен керувати можливістю створення backup. Ці тести — про
         # DISCOVERY (Resolve-BRAVOInstallationDiscovery: чи резолвиться
