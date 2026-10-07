@@ -2433,7 +2433,8 @@
           -Failure 'Invoke-BRAVOBazaCanonicalSync: legacy mirror лише за явного Mode=Legacy, невідомий Mode — fail-closed (не legacy), успіх incremental лише COMPLETE'
 
         Test-BRAVOCondition -Condition (
-            $sbArchiveText.Contains('$script:processExitCode = if ($manualSyncSuccess) { 0 } else { Resolve-BRAVOExitCode -SftpFailed }') -and
+            $sbArchiveText.Contains('$script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess') -and
+            $sbArchiveText.Contains('if (-not $SyncSucceeded) { return (Resolve-BRAVOExitCode -SftpFailed) }') -and
             $sbArchiveText.Contains('$manualSyncSuccess = [bool]$manualSyncResult.Success') -and
             $sbArchiveText.Contains('$script:archiveFinalOperationsEventContext = @{') -and
             $sbArchiveText.Contains('syncBaza = $true')

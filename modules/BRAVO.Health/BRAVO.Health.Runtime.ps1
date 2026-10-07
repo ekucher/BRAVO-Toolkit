@@ -5158,8 +5158,10 @@ function Get-BRAVOHealthSuccessFingerprint {
         }
         $canonicalLines.Add("archive=$([string]$archiveIdentity.Type):$identityText")
     }
-    if (@($EmptySourceWarningComponents).Count -gt 0) {
-        $canonicalLines.Add('emptySourceWarning=' + ((@($EmptySourceWarningComponents) | Sort-Object) -join ','))
+    $warningComponentNames = @(@($EmptySourceWarningComponents) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($warningComponentNames.Count -gt 0) {
+        $canonicalLines.Add('emptySourceWarning=' + ((@($warningComponentNames) | Sort-Object) -join ','))
     }
 
     $canonicalText = ($canonicalLines -join "`n")

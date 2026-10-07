@@ -13336,15 +13336,17 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 param($Case)
                 Set-StrictMode -Version Latest
                 $summary = [pscustomobject]@{ LocalVerified = $true; SftpVerified = $true; SmbVerified = $false }
+                [string[]]$warningComponents = @()
+                if ($Case -eq 'Warned') { $warningComponents = @('BLOG') }
                 if ($Case -eq 'Legacy') {
                     Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -EnabledCheckNames @('sftp_archives')
                 } else {
                     Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -EnabledCheckNames @('sftp_archives') `
-                        -EmptySourceWarningComponents $(if ($Case -eq 'Warned') { @('BLOG') } else { @() })
+                        -EmptySourceWarningComponents $warningComponents
                 }
             } $cleanRunFingerprintCase)
         }
-    } catch { $cleanRunPlanError = $_.Exception.Message }
+    } catch { $cleanRunPlanError = "$($_.Exception.Message) $($_.InvocationInfo.PositionMessage)" }
     $cleanRunMessageSeverity = @{}
     foreach ($cleanRunMessageCase in @('Warned', 'Clean')) {
         $cleanRunMessageSeverity[$cleanRunMessageCase] = [string](& $sftpDeferredMessageModule {
