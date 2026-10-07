@@ -1502,10 +1502,10 @@ function Invoke-ProtectedPayloadWorker {
         OperationsStarted = $false
     }
     try {
-        # MUTATION (scratch ref only): marker set before decryption
-        $response.OperationsStarted = $true
         $payload = Read-BRAVOTextFile -Path $PayloadPath |
             ConvertFrom-BRAVOJson
+        # MUTATION (scratch ref only): marker set after payload read, before decryption
+        $response.OperationsStarted = $true
         $workerEntries = @($payload.Entries | ForEach-Object {
             $secureSecret = if ($payload.Action -in @("Add", "Update", "Set")) {
                 Unprotect-LocalMachineSecret -ProtectedValue ([string]$_.ProtectedSecret)
