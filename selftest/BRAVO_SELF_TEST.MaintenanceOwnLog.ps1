@@ -428,6 +428,10 @@ function Invoke-BRAVOSelfTestSecretMaskScenario {
     try {
         & $Module {
             param($logFilePath, $secretByTarget, $targetsConfig, $throwTargets, $exceptionPayload, $rangeIdLogPath, $corruptTargets)
+            # Кожен сценарій стартує з порожнім реєстром раніше прочитаних секретів
+            # BRAVO.Credentials: модуль спільний, і значення з попередніх сценаріїв
+            # інакше маскували б усе й ховали б регресії (false pass).
+            $script:BRAVOCredentialReadSecretRegistry = $null
             $script:secretMaskTestState = [pscustomobject]@{
                 LogLines         = (New-Object System.Collections.Generic.List[string])
                 ReadTargets      = (New-Object System.Collections.Generic.List[string])
@@ -642,6 +646,10 @@ if ($null -ne $secretMaskModule) {
     try {
         $secretMaskSetResult = & $secretMaskModule {
             param($secretByTarget, $targetsConfig, $payload, $throwTarget)
+            # Кожен сценарій стартує з порожнім реєстром раніше прочитаних секретів
+            # BRAVO.Credentials: модуль спільний, і значення з попередніх сценаріїв
+            # інакше маскували б усе й ховали б регресії (false pass).
+            $script:BRAVOCredentialReadSecretRegistry = $null
             $script:secretMaskTestState = [pscustomobject]@{
                 LogLines = (New-Object System.Collections.Generic.List[string]); ReadTargets = (New-Object System.Collections.Generic.List[string])
                 Uploads = (New-Object System.Collections.Generic.List[object]); SecretByTarget = $secretByTarget
