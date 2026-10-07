@@ -13,7 +13,9 @@
   (BRAVO.Compatibility; ArchiveHelpers імпортує Compatibility, зворотної залежності немає). Він fail-closed: таймаут,
   виняток запуску, коди поза 1/2 (7, 8, 255), незавершена legacy BOM-спроба, відсутність власних повідомлень 7-Zip
   про вміст, відмова доступу чи зайнятий файл англійською, українською або російською, а також маркер 7-Zip
-  `System ERROR` — збій виконання (ERROR, прапорці). Пошкоджений вміст (`CRC Failed`, `Data Error`, `Headers Error`,
+  `System ERROR` — збій виконання (ERROR, прапорці); так само блокування частини файлу (ERROR_LOCK_VIOLATION).
+  Головна ознака в production — `System ERROR` і англійський текст: `7z t` запускається без `-scc`, тож кирилиця
+  системного повідомлення зазвичай приходить нечитабельною, і український/російський текст — лише додатковий захист. Пошкоджений вміст (`CRC Failed`, `Data Error`, `Headers Error`,
   `Can not open the file as archive`) класифікується як і раніше. Контракти викликачів (bool, `FailureInfo`,
   `FallbackAttemptOperationalFailure`, рівні журналу) і коди завершення не змінено. Тести: матриця
   `SevenZipClassifier/*` (обидва шляхи, рівень рядка «не пройдена»), `SevenZipClassifier/RetentionLegacyBomFallbackLocalizedAccessDeniedIsCritical`,

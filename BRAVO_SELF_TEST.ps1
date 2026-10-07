@@ -21168,6 +21168,15 @@ try {
         'RussianFileInUseWithContentText'      = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Headers Error`n$sz394RuInUse"; Expected = $false }
         # Власний (нелокалізований) маркер 7-Zip системної помилки ОС; текст
         # після нього — у кодовій сторінці консолі й може бути нечитабельним.
+        # Варіанти локалізованого тексту відмови доступу і блокування частини
+        # файлу (ERROR_LOCK_VIOLATION) разом із текстом 7-Zip про вміст.
+        'UkrainianAccessDeniedVariantWithContentText' = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Data Error : payload.txt`nВідмовлено у доступі."; Expected = $false }
+        'UkrainianAccessForbiddenWithContentText'     = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Data Error : payload.txt`nДоступ заборонено."; Expected = $false }
+        'RussianAccessForbiddenWithContentText'       = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Data Error : payload.txt`nДоступ запрещен."; Expected = $false }
+        'EnglishLockViolationWithContentText'         = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "ERROR: Data Error : payload.txt`nThe process cannot access the file because another process has locked a portion of the file."; Expected = $false }
+        # Реальний шлях виводу: OEM-байти (cp866) декодовані як UTF-8 —
+        # кирилиця нечитабельна, рішення тримає маркер "System ERROR".
+        'Cp866MisdecodedTextWithSystemErrorMarker'    = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = ("System ERROR:`n{0}`nERROR: Data Error : payload.txt" -f [Text.Encoding]::UTF8.GetString([Text.Encoding]::GetEncoding(866).GetBytes($sz394RuDenied))); Expected = $false }
         'SevenZipSystemErrorWithContentText'   = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = "System ERROR:`n????????? ? ???????.`nERROR: Data Error : payload.txt"; Expected = $false }
         # --- пошкоджений вміст: archive-specific
         'CrcFailed'                = @{ ExitCode = 2; TimedOut = $false; Error = $null; StandardError = 'ERROR: CRC Failed : payload.txt'; Expected = $true }

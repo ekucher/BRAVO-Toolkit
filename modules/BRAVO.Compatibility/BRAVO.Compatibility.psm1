@@ -1804,10 +1804,13 @@ function Test-BRAVOSevenZipArchiveSpecificFailure {
     # $null або поза 1/2 (7 — командний рядок, 8 — пам'ять, 255 — зупинено),
     # позначка незавершеної fallback-спроби, відсутність власних
     # (нелокалізованих) повідомлень 7-Zip про вміст, а також будь-яка ознака
-    # відмови доступу чи зайнятого файлу. Системний текст Windows
-    # локалізований, тож ознаки — англійською, українською й російською,
-    # плюс власний маркер 7-Zip "System ERROR" (не локалізується; текст після
-    # нього може бути нечитабельним у кодовій сторінці консолі).
+    # відмови доступу, зайнятого чи заблокованого файлу. Головна ознака у
+    # production — власний маркер 7-Zip "System ERROR" (не локалізується) та
+    # англійський системний текст. Український і російський тексти — лише
+    # додатковий захист: "7z t" запускається без -scc, 7-Zip пише
+    # перенаправлений вивід у OEM-кодовій сторінці, а .NET декодує його в
+    # кодуванні консолі, тож кирилиця зазвичай приходить нечитабельною і
+    # покладатися на неї не можна.
     # Поля читаються через PSObject.Properties: не всі джерела результату
     # (стаби, нормалізований порожній результат) мають усі поля (StrictMode).
     [CmdletBinding()]
@@ -1835,7 +1838,7 @@ function Test-BRAVOSevenZipArchiveSpecificFailure {
     # Локальні змінні, не script scope: функцію виконують і поза модулем
     # (AST-витяг у self-test).
     $archiveContentFailurePattern = '(?i)Data Error|CRC Failed|Headers Error|Unexpected end of (archive|data)|Can ?not open (the )?file as|is not archive|Wrong password|Unsupported (Method|feature)|Unconfirmed start of archive|There are data after the end of archive'
-    $operationalFailurePattern = '(?i)Access is denied|being used by another process|System ERROR|Відмовлено в доступі|Отказано в доступе|використовується іншим процесом|занят другим процессом'
+    $operationalFailurePattern = '(?i)Access is denied|being used by another process|has locked a portion of the file|System ERROR|Відмовлено [ву] доступі|Доступ заборонено|Отказано в доступе|Доступ запрещен|використовується іншим процесом|занят другим процессом'
     if ($outputText -notmatch $archiveContentFailurePattern) { return $false }
     if ($outputText -match $operationalFailurePattern) { return $false }
     return $true
