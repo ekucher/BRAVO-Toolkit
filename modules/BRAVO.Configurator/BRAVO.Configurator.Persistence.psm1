@@ -351,7 +351,8 @@ function ConvertTo-BRAVOConfiguratorLocalConfigText {
     $lines.Add((Get-BRAVOConfigurationSchemaVersionDeclarationLine))
     foreach ($key in ($MergedOverrides.Keys | Sort-Object)) {
         $literalValue = ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value $MergedOverrides[$key]
-        $lines.Add("    '$key' = $literalValue")
+        $literalKey = ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value ([string]$key)
+        $lines.Add("    $literalKey = $literalValue")
     }
     $lines.Add('}')
     return [string]::Join([Environment]::NewLine, $lines)
