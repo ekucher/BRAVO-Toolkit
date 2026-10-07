@@ -754,6 +754,8 @@ try {
     # (a) Порожній каталог, раніше не підтверджений: пропуск з Info, без Error.
     $scope301EmptyDiscovery = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Empty
     $scope301EmptyNew = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301EmptyDiscovery
+    $scope301EmptyNewThrewProperty = $scope301EmptyNew.PSObject.Properties['Threw']
+    $scope301EmptyNewThrew = $(if ($null -ne $scope301EmptyNewThrewProperty) { [string]$scope301EmptyNewThrewProperty.Value } else { '' })
     Test-BRAVOCondition -Condition (
         [string]$scope301EmptyDiscovery.Components['BLOG'].Presence -eq 'Absent' -and
         [string]$scope301EmptyDiscovery.Components['BLOG'].Source -eq 'BravoIni' -and
@@ -763,7 +765,7 @@ try {
         @($scope301EmptyNew.Findings | Where-Object { [string]$_.Severity -in @('Error', 'Warning') }).Count -eq 0 -and
         (Get-BRAVOSelfTestScope301Findings -Scope $scope301EmptyNew -Component 'BLOG' -Severity 'Info').Count -eq 1
     ) -Name 'BackupScope/DeclaredEmptySourceNeverConfirmedIsSkippedWithInfo' `
-        -Failure "оголошений (bravo.ini), але порожній каталог без підтвердження має пропускатись з Info (scope EmptySource), без Error; scope='$($scope301EmptyNew.Components['BLOG'])' threw='$(@($scope301EmptyNew.PSObject.Properties['Threw'] | ForEach-Object { $_.Value }))'"
+        -Failure "оголошений (bravo.ini), але порожній каталог без підтвердження має пропускатись з Info (scope EmptySource), без Error; scope='$($scope301EmptyNew.Components['BLOG'])' threw='$scope301EmptyNewThrew'"
 
     # (b) Компонент був підтверджений у baseline, тепер каталог порожній:
     # WARNING на кожному прогоні, без Error і без зупинки.
