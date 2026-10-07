@@ -1296,12 +1296,6 @@ function Test-SystemWorkerNotStartedError {
     return $false
 }
 
-# #302 (follow-up): FatalError worker-а після Run. Worker повідомляє
-# OperationsStarted = $false лише тоді, коли впав ДО першої операції зі
-# сховищем (конфігурація, модулі, читання payload): SYSTEM-сховище не
-# змінено, тож виняток позначається «не розпочато» і поточне сховище
-# відкочується. Відсутнє поле (старий worker) або будь-що, крім булевого
-# $false, = невизначений стан (fail-safe). Self-test перевіряє цю умову.
 # #395: відповідь worker-а — збій, якщо FatalError не $null. Порожній
 # рядок чи пробіли (виняток без тексту) і відсутнє поле — теж збій: інакше
 # порожній список результатів виглядав би успіхом SYSTEM-кроку.
@@ -1331,6 +1325,12 @@ function Get-SystemWorkerFatalErrorText {
     return $Exception.Message
 }
 
+# #302 (follow-up): FatalError worker-а після Run. Worker повідомляє
+# OperationsStarted = $false лише тоді, коли впав ДО першої операції зі
+# сховищем (конфігурація, модулі, читання payload): SYSTEM-сховище не
+# змінено, тож виняток позначається «не розпочато» і поточне сховище
+# відкочується. Відсутнє поле (старий worker) або будь-що, крім булевого
+# $false, = невизначений стан (fail-safe). Self-test перевіряє цю умову.
 function New-SystemWorkerFatalError {
     param([object]$WorkerResponse)
 
@@ -1344,7 +1344,6 @@ function New-SystemWorkerFatalError {
     }
     $fatalError = New-Object System.Management.Automation.RuntimeException ($fatalErrorText)
     $operationsStartedProperty = if ($null -ne $WorkerResponse) { $WorkerResponse.PSObject.Properties['OperationsStarted'] } else { $null }
-    $operationsStartedProperty = $WorkerResponse.PSObject.Properties['OperationsStarted']
     if ($null -ne $operationsStartedProperty -and
         $operationsStartedProperty.Value -is [bool] -and
         -not $operationsStartedProperty.Value) {
