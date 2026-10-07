@@ -302,7 +302,8 @@ $taskInstallerText = [IO.File]::ReadAllText(
             [void]$script:dryRunResults.Add([pscustomobject]@{ Status = 'WARN'; Category = 'Завдання'; Name = 'probe-2'; Detail = 'x' })
             . ([scriptblock]::Create($FunctionText))
             Write-DryRunOutput
-            $parsed = @([IO.File]::ReadAllText($ResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json)
+            $parsedJson = [IO.File]::ReadAllText($ResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            $parsed = @($parsedJson)
             [pscustomobject]@{
                 Rows = @($parsed | ForEach-Object { $_ })
                 Leftovers = @(Get-ChildItem -LiteralPath (Split-Path -Path $ResultPath -Parent) -Force | Where-Object { $_.Name -ne 'dry-run.json' } | ForEach-Object { $_.Name })
