@@ -1033,6 +1033,47 @@ try {
         $scope301ConfirmNoneBlog -eq '' -and $scope301ConfirmStaleBlog -eq ''
     ) -Name 'BackupScope/ConcurrentBaselineConfirmationKeepsEmptyField' `
         -Failure "baseline, підтверджений під час прогону, не має отримати сирий шлях порожнього каталогу: без baseline BLOG='$scope301ConfirmNoneBlog' ($scope301ConfirmNoneError); старий baseline BLOG='$scope301ConfirmStaleBlog' ($scope301ConfirmStaleError)"
+
+    # (p) Рев'ю #391 (Codex 5f0dc37): -SyncBAZA бере попередження про
+    # порожній BAZA-каталог з того самого складу, що й нічний Archive, і
+    # завершується кодом попередження, а не чистим SKIPPED/exit 0.
+    $scope301WarnedAll = @()
+    $scope301WarnedBaza = @()
+    $scope301WarnedError = ''
+    $scope301SyncCodes = @{}
+    try {
+        $scope301WarnedAll = @(Get-BRAVOEmptySourceWarningComponents -ScopeResult $scope301Night1)
+        $scope301WarnedBaza = @(Get-BRAVOEmptySourceWarningComponents -ScopeResult $scope301Night1 -Components @('BAZA_APP', 'BAZA_WWW'))
+        if (-not (Get-Command -Name 'Resolve-BRAVOExitCode' -ErrorAction SilentlyContinue)) {
+            Import-Module -Name (Join-Path $root 'modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1') -ErrorAction Stop
+        }
+        $scope301SyncModule = New-BRAVOSelfTestRuntimeModule -SourceText $scopeArchiveText `
+            -FunctionNames @('Resolve-BRAVOSyncBazaExitCode')
+        foreach ($scope301SyncCase in @(
+            @{ Name = 'CleanOk'; Ok = $true; Warn = 0 },
+            @{ Name = 'WarnedOk'; Ok = $true; Warn = 1 },
+            @{ Name = 'WarnedFailed'; Ok = $false; Warn = 1 }
+        )) {
+            $scope301SyncCodes[$scope301SyncCase.Name] = [int](& $scope301SyncModule {
+                param($Case)
+                Resolve-BRAVOSyncBazaExitCode -SyncSucceeded ([bool]$Case.Ok) -EmptySourceWarningCount ([int]$Case.Warn)
+            } $scope301SyncCase)
+        }
+    } catch { $scope301WarnedError = $_.Exception.Message }
+    $scope301ExpectedWarningCode = $(if (Get-Command -Name 'Resolve-BRAVOExitCode' -ErrorAction SilentlyContinue) { [int](Resolve-BRAVOExitCode -HasWarnings) } else { -1 })
+    $scope301ExpectedSftpCode = $(if (Get-Command -Name 'Resolve-BRAVOExitCode' -ErrorAction SilentlyContinue) { [int](Resolve-BRAVOExitCode -SftpFailed) } else { -1 })
+    Test-BRAVOCondition -Condition (
+        $scope301WarnedError -eq '' -and
+        $scope301WarnedAll -contains 'BLOG' -and
+        $scope301WarnedBaza.Count -eq 0 -and
+        $scope301SyncCodes['CleanOk'] -eq 0 -and
+        $scope301SyncCodes['WarnedOk'] -eq $scope301ExpectedWarningCode -and
+        $scope301SyncCodes['WarnedFailed'] -eq $scope301ExpectedSftpCode -and
+        $scopeArchiveText.Contains("Get-BRAVOEmptySourceWarningComponents -ScopeResult `$backupScope -Components @('BAZA_APP', 'BAZA_WWW')") -and
+        $scopeArchiveText.Contains('Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $true -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count') -and
+        $scopeArchiveText.Contains('Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count')
+    ) -Name 'BackupScope/SyncBazaReportsEmptySourceWarning' `
+        -Failure "-SyncBAZA має бачити попередження про порожній BAZA-каталог і завершуватись кодом попередження: all='$($scope301WarnedAll -join ',')' baza='$($scope301WarnedBaza -join ',')' codes='$(@($scope301SyncCodes.Keys | Sort-Object | ForEach-Object { "${_}=$($scope301SyncCodes[$_])" }) -join '; ')' error='$scope301WarnedError'"
 } finally {
     if (Test-Path -LiteralPath $scope301Root) {
         Remove-Item -LiteralPath $scope301Root -Recurse -Force -ErrorAction SilentlyContinue
