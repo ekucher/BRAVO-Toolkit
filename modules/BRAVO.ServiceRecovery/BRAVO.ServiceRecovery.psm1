@@ -137,12 +137,18 @@ function New-BRAVOServiceRecoveryServiceEntry {
         [AllowNull()][string]$StableSince
     )
 
-    if ([string]::IsNullOrWhiteSpace($LastCriticalAt)) { $LastCriticalAt = $null }
-    if ([string]::IsNullOrWhiteSpace($StableSince)) { $StableSince = $null }
+    # Параметри типізовані [string]: присвоєння їм $null дає '' (змінна з
+    # обмеженням типу), тому порожнє значення -> $null через окремі
+    # нетипізовані змінні. Інакше '' потрапляв у стан як «дата» і ламав
+    # обчислення вікна/пауз.
+    $lastCriticalValue = $null
+    if (-not [string]::IsNullOrWhiteSpace($LastCriticalAt)) { $lastCriticalValue = $LastCriticalAt }
+    $stableSinceValue = $null
+    if (-not [string]::IsNullOrWhiteSpace($StableSince)) { $stableSinceValue = $StableSince }
     return [pscustomobject]@{
         attempts       = [object[]]@($Attempts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        lastCriticalAt = $LastCriticalAt
-        stableSince    = $StableSince
+        lastCriticalAt = $lastCriticalValue
+        stableSince    = $stableSinceValue
     }
 }
 
