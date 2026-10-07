@@ -1410,6 +1410,41 @@
         (Test-Path -LiteralPath (Join-Path $redrainDeadLetterDir "$redrainSecondId.json") -PathType Leaf)
     ) -Name 'Operations/DeadLetterRedrainRunsOncePerServerIdentity' `
       -Failure "#280: повернення з DeadLetter одноразове для серверної ідентичності — повторний дренаж не має знову забирати витіснені події; HTTP-викликів=$($global:BRAVOOpsSelfTestHttpCalls.Count)"
+
+    # Повний outbox (типовий випадок переповнення): повернення не має місця,
+    # тож позначка «виконано» не ставиться; щойно місце звільняється,
+    # наступний виклик повертає подію і ставить позначку.
+    $redrainFullDir = Join-Path $opsSelfTestRoot 'OverflowRedrainFullOutbox'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $redrainFullDir
+    $redrainServerId = Get-BRAVOOperationsServerId
+    $redrainDeadLetterDir = & $evictDeadLetterDirFn
+    $redrainFullOutboxDir = & $evictOutboxDirFn
+    New-Item -ItemType Directory -Path $redrainDeadLetterDir -Force | Out-Null
+    $redrainFullBlockerId = 'redrain-full-blocker-' + [guid]::NewGuid().ToString()
+    & $addOutboxItemFn -Kind 'event' -EventId $redrainFullBlockerId -OccurredAtUtc (Get-Date).ToUniversalTime().ToString('o') `
+        -SchemaVersion 1 -ApiPath '/api/v1/events' -RequestBody @{ category = 'health'; severity = 'SUCCESS' } -MaxOutboxItems 1
+    $redrainFullId = 'redrain-full-' + [guid]::NewGuid().ToString()
+    New-BRAVOOpsSelfTestDeadLetterFile -EventId $redrainFullId -ServerId $redrainServerId -Reason 'Outbox переповнено (ліміт 1 items) — найстаріший item витіснено' -Kind 'Overflow'
+    $redrainFn = & $opsSelfTestModule { ${function:Invoke-BRAVOOperationsOverflowDeadLetterRedrain} }
+    $redrainStatePath = Join-Path $redrainFullDir 'BRAVO_OPERATIONS_OUTBOX_REDRAIN.json'
+    $redrainFullFirstMarker = $null
+    $redrainFullFirstInDeadLetter = $null
+    if ($null -ne $redrainFn) {
+        & $redrainFn -MaxOutboxItems 1
+        $redrainFullFirstMarker = Test-Path -LiteralPath $redrainStatePath -PathType Leaf
+        $redrainFullFirstInDeadLetter = Test-Path -LiteralPath (Join-Path $redrainDeadLetterDir "$redrainFullId.json") -PathType Leaf
+        Remove-Item -LiteralPath (Join-Path $redrainFullOutboxDir "$redrainFullBlockerId.json") -Force
+        & $redrainFn -MaxOutboxItems 1
+    }
+    Test-BRAVOCondition -Condition (
+        $null -ne $redrainFn -and
+        $redrainFullFirstMarker -eq $false -and
+        $redrainFullFirstInDeadLetter -eq $true -and
+        (Test-Path -LiteralPath (Join-Path $redrainFullOutboxDir "$redrainFullId.json") -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $redrainDeadLetterDir "$redrainFullId.json") -PathType Leaf) -and
+        (Test-Path -LiteralPath $redrainStatePath -PathType Leaf)
+    ) -Name 'Operations/DeadLetterRedrainWaitsForFreeOutboxSlots' `
+      -Failure "#280: коли outbox повний, витіснена подія лишається в DeadLetter без позначки «виконано» і повертається, щойно звільняється місце; перший виклик: позначка=$redrainFullFirstMarker, у DeadLetter=$redrainFullFirstInDeadLetter"
     Remove-Item -Path function:New-BRAVOOpsSelfTestDeadLetterFile -Force -ErrorAction SilentlyContinue
 
     # Лічильник втрачених подій: ретенція DeadLetter (200 найновіших)

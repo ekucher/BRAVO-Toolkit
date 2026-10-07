@@ -1400,9 +1400,12 @@ function Invoke-BRAVOOperationsOverflowDeadLetterRedrain {
     # валідним API-ключем) ОДИН раз на серверну ідентичність повертає з
     # DeadLetter події, витіснені переповненням outbox, щоб бекенд отримав
     # цю частину історії. Повертається не більше, ніж є вільного місця в
-    # outbox (ліміт MaxOutboxItems), найстаріші першими; решта лишається в
-    # DeadLetter. Never-throw: збій лише логується, позначка не ставиться,
-    # тож наступний дренаж спробує знову.
+    # outbox (ліміт MaxOutboxItems), найстаріші першими. Переповнення
+    # трапляється саме тоді, коли outbox повний, тож перший дренаж після
+    # enrollment часто не має місця: позначка «виконано» ставиться лише
+    # коли в DeadLetter не лишилось витіснених подій, а доти кожен дренаж
+    # повертає стільки, скільки звільнилось. Never-throw: збій лише
+    # логується, позначка не ставиться, тож наступний дренаж спробує знову.
     param(
         [int]$MaxOutboxItems = 500
     )
@@ -1450,25 +1453,33 @@ function Invoke-BRAVOOperationsOverflowDeadLetterRedrain {
         $nowText = (Get-Date).ToUniversalTime().ToString('o')
         foreach ($candidate in @($orderedCandidates | Select-Object -First $freeSlots)) {
             $deadLetterPath = [string]$candidate.__DeadLetterPath
+            $restoredPath = Get-BRAVOOperationsOutboxItemPath -EventId (Get-BRAVOOperationsOutboxItemEventId -Item $candidate)
+            if ([IO.File]::Exists($restoredPath)) {
+                # Та сама подія вже в outbox (напр. попереднє повернення
+                # перервалось до видалення з DeadLetter) — не перезаписуємо
+                # її стан повторів, лише прибираємо копію з DeadLetter.
+                Remove-Item -LiteralPath $deadLetterPath -Force -ErrorAction SilentlyContinue
+                $returnedCount++
+                continue
+            }
             $restored = $candidate | Select-Object * -ExcludeProperty __DeadLetterPath, DeadLetteredAtUtc, DeadLetterReason, DeadLetterKind
             $restored | Add-Member -MemberType NoteProperty -Name 'NextRetryAtUtc' -Value $nowText -Force
-            Write-BRAVOOperationsAtomicJsonFile `
-                -Path (Get-BRAVOOperationsOutboxItemPath -EventId (Get-BRAVOOperationsOutboxItemEventId -Item $candidate)) `
-                -Object $restored
+            Write-BRAVOOperationsAtomicJsonFile -Path $restoredPath -Object $restored
             Remove-Item -LiteralPath $deadLetterPath -Force -ErrorAction SilentlyContinue
             $returnedCount++
         }
         $remainingCount = $orderedCandidates.Count - $returnedCount
 
-        Write-BRAVOOperationsAtomicJsonFile -Path $statePath -Object ([pscustomobject]@{
-            ServerId = $serverId
-            RedrainedAtUtc = $nowText
-            ReturnedCount = $returnedCount
-            RemainingCount = $remainingCount
-        })
+        if ($remainingCount -eq 0) {
+            Write-BRAVOOperationsAtomicJsonFile -Path $statePath -Object ([pscustomobject]@{
+                ServerId = $serverId
+                RedrainedAtUtc = $nowText
+                ReturnedCount = $returnedCount
+            })
+        }
         if ($orderedCandidates.Count -gt 0) {
             Write-BRAVOOperationsLog -Level 'INFO' `
-                -Message "Operations: повернуто з dead-letter у дренаж подій, витіснених переповненням outbox: $returnedCount; лишилось у dead-letter (немає місця в outbox): $remainingCount"
+                -Message "Operations: повернуто з dead-letter у дренаж подій, витіснених переповненням outbox: $returnedCount; лишилось у dead-letter до звільнення місця в outbox: $remainingCount"
         }
     } catch {
         Write-BRAVOOperationsLog -Level 'WARNING' `
