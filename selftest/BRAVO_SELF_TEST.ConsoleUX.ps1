@@ -266,6 +266,63 @@ $taskInstallerText = [IO.File]::ReadAllText(
         -Name "ConsoleUX/17-DryRunFourStatuses" `
         -Failure "Dry Run має власні кольори для всіх чотирьох статусів PASS/WARN/FAIL/PLAN"
 
+    # #306: TASKS_DIAGNOSE опитує появу ResultPath і одразу читає файл, тож
+    # dry run має публікувати результат атомарно: повний JSON у тимчасовий
+    # файл поруч, потім Move-Item на ResultPath (як воркер Credentials Setup).
+    $dryRunOutputFunctionMatch = [regex]::Match(
+        $dryRunScriptText,
+        '(?s)function Write-DryRunOutput \{.*?\n\}'
+    )
+    $dryRunOutputFunctionText = if ($dryRunOutputFunctionMatch.Success) { $dryRunOutputFunctionMatch.Value } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($dryRunOutputFunctionText) -and
+            $dryRunOutputFunctionText -notmatch 'WriteAllText\(\s*\$ResultPath\b' -and
+            $dryRunOutputFunctionText -match 'WriteAllText\(\s*\$temporaryResultPath\b' -and
+            $dryRunOutputFunctionText.Contains('Move-Item -LiteralPath $temporaryResultPath -Destination $ResultPath -Force')
+        ) `
+        -Name "DryRun/ResultFilePublishedAtomically" `
+        -Failure "Write-DryRunOutput має писати JSON у тимчасовий файл і переносити його на ResultPath через Move-Item, а не писати ResultPath напряму"
+
+    $dryRunOutputProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DRYRUN_RESULT_" + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $dryRunOutputProbeRoot -Force)
+    try {
+        $dryRunOutputAst = [System.Management.Automation.Language.Parser]::ParseInput($dryRunScriptText, [ref]$null, [ref]$null)
+        $dryRunOutputDefinition = $dryRunOutputAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-DryRunOutput'
+        }, $true)
+        $dryRunOutputResultPath = Join-Path $dryRunOutputProbeRoot 'dry-run.json'
+        [IO.File]::WriteAllText($dryRunOutputResultPath, 'stale result from an earlier run')
+        $dryRunOutputProbe = & {
+            param($FunctionText, $ResultPath)
+            $AsJson = $false
+            $script:dryRunResults = New-Object System.Collections.Generic.List[object]
+            [void]$script:dryRunResults.Add([pscustomobject]@{ Status = 'PASS'; Category = 'Конфігурація'; Name = 'probe'; Detail = "здоров$([char]0x2019)я" })
+            [void]$script:dryRunResults.Add([pscustomobject]@{ Status = 'WARN'; Category = 'Завдання'; Name = 'probe-2'; Detail = 'x' })
+            . ([scriptblock]::Create($FunctionText))
+            Write-DryRunOutput
+            $parsedJson = [IO.File]::ReadAllText($ResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            $parsed = @($parsedJson)
+            [pscustomobject]@{
+                Rows = @($parsed | ForEach-Object { $_ })
+                Leftovers = @(Get-ChildItem -LiteralPath (Split-Path -Path $ResultPath -Parent) -Force | Where-Object { $_.Name -ne 'dry-run.json' } | ForEach-Object { $_.Name })
+            }
+        } $dryRunOutputDefinition.Extent.Text $dryRunOutputResultPath
+        $dryRunOutputRows = @($dryRunOutputProbe.Rows)
+        Test-BRAVOCondition `
+            -Condition (
+                $dryRunOutputRows.Count -eq 2 -and
+                [string]$dryRunOutputRows[0].Detail -ceq "здоров$([char]0x2019)я" -and
+                [string]$dryRunOutputRows[1].Status -eq 'WARN' -and
+                @($dryRunOutputProbe.Leftovers).Count -eq 0
+            ) `
+            -Name "DryRun/ResultFileReplacesPreviousWithoutTempLeftover" `
+            -Failure "Write-DryRunOutput має замінити попередній ResultPath повним JSON (2 рядки) і не лишити тимчасових файлів; рядків=$($dryRunOutputRows.Count), залишки: $(@($dryRunOutputProbe.Leftovers) -join ', ')"
+    } finally {
+        Remove-Item -LiteralPath $dryRunOutputProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # 18. Setup: DISCOVERY-блок виводить реальні джерела (не заглушку) —
     # BRAVO_ROOT/MODEL/BLOG/BRAVOEXCH/BAZA_APP/WEB_ROOT/BAZA_WWW.
     Test-BRAVOCondition `

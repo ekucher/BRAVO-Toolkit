@@ -967,11 +967,28 @@ function Write-DryRunOutput {
                 -not (Test-Path -LiteralPath $resolvedResultDirectory -PathType Container)) {
                 throw "Каталог ResultPath не існує: $resolvedResultDirectory"
             }
-            [IO.File]::WriteAllText(
-                $ResultPath,
-                [string]$json,
-                (New-Object Text.UTF8Encoding($false))
-            )
+            # #306: BRAVO_TASKS_DIAGNOSE опитує появу ResultPath і одразу
+            # читає файл, тож результат публікується атомарно: повний JSON
+            # у тимчасовий файл поруч, потім Move-Item (як воркер
+            # BRAVO_CREDENTIALS_SETUP). Читач бачить або нічого, або весь JSON.
+            # Повний шлях — від того самого робочого каталогу процесу, від
+            # якого .NET і раніше рахував відносний ResultPath (Move-Item
+            # інакше взяв би поточний каталог провайдера PowerShell). Локальна
+            # копія параметра скрипта, сам параметр не змінюється.
+            $ResultPath = [IO.Path]::GetFullPath($ResultPath)
+            $temporaryResultPath = "$ResultPath.$([guid]::NewGuid().ToString('N')).tmp"
+            try {
+                [IO.File]::WriteAllText(
+                    $temporaryResultPath,
+                    [string]$json,
+                    (New-Object Text.UTF8Encoding($false))
+                )
+                Move-Item -LiteralPath $temporaryResultPath -Destination $ResultPath -Force
+            } finally {
+                if (Test-Path -LiteralPath $temporaryResultPath -PathType Leaf) {
+                    Remove-Item -LiteralPath $temporaryResultPath -Force -ErrorAction SilentlyContinue
+                }
+            }
         }
         if ($AsJson) {
             $json
