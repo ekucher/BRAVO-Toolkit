@@ -4383,7 +4383,44 @@ exit
                     -Message "Не вдалося завершити процес WinSCP після таймауту: $($_.Exception.Message)" `
                     -Level "DEBUG"
             }
-            throw "перевищено таймаут перевірки SFTP-з'єднання"
+            # Lock звільняється лише після ПІДТВЕРДЖЕНОГО завершення WinSCP:
+            # якщо процес досі живий, наступна операція могла б захопити
+            # звільнений lock і запустити другий WinSCP паралельно з першим.
+            # Тоді lock лишається за цим процесом (звільниться з його
+            # завершенням), а прогін іде фатальним шляхом, як до #290.
+            $winSCPExited = $false
+            try {
+                $winSCPExited = [bool]$process.HasExited
+            } catch {
+                $winSCPExited = $false
+            }
+            if (-not $winSCPExited) {
+                # Lock-потік має жити до завершення ПРОЦЕСУ BRAVO: без
+                # довгоживучого посилання FileStream після виходу з функції
+                # міг би бути фіналізований GC і звільнити lock, поки WinSCP
+                # ще працює (а finally Archive далі запускає WinSCP для
+                # вивантаження власного журналу). Тримаємо його в script scope.
+                $script:BRAVOWinSCPLockHeldForLiveProcess = $outputCapture
+                Write-BRAVOLog `
+                    -Component 'SFTP' `
+                    -Message "Перевищено таймаут перевірки SFTP-з'єднання, але WinSCP не завершився; BRAVO_WINSCP lock не звільняється" `
+                    -Level "ERROR"
+                throw "перевищено таймаут перевірки SFTP-з'єднання; WinSCP не завершився"
+            }
+            # Звільняємо ресурси (зокрема BRAVO_WINSCP lock) ДО виходу:
+            # раніше throw оминав Complete-BRAVOProcessOutputCapture, lock
+            # лишався захопленим, а викликачі (без try) завершувались
+            # exit 90 замість шляху "SFTP недоступний".
+            try {
+                [void](Complete-BRAVOProcessOutputCapture -Capture $outputCapture)
+            } catch {
+                Write-BRAVOLog `
+                    -Component 'SFTP' `
+                    -Message "Не вдалося завершити збір виводу WinSCP після таймауту: $($_.Exception.Message)" `
+                    -Level "WARNING"
+            }
+            Write-BRAVOLog -Component 'SFTP' -Message "Перевищено таймаут перевірки SFTP-з'єднання ($([math]::Max(1, [int]$sftpConnectionTimeoutSeconds + 30)) с); WinSCP завершено" -Level "ERROR"
+            return $false
         }
         $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $outputCapture
         $output = $capturedOutput.StandardOutput
@@ -5786,7 +5823,8 @@ function Invoke-BRAVOBazaCanonicalSync {
         $syncResult = Invoke-BRAVOBazaIncrementalSync -Component $Component -LocalDirectory $LocalDirectory -RemoteDirectory $RemoteDirectory
         $outcome.SyncResult = $syncResult
         $outcome.Status = [string]$syncResult.Status
-        $outcome.Success = ($outcome.Status -eq 'COMPLETE')
+        # #285: MUTATION_AUTO_ARCHIVED — успіх (INFO за контрактом), єдиний helper BazaSync/Health.
+        $outcome.Success = [bool](Test-BRAVOBazaSyncStatusSuccess -Status $outcome.Status)
         $outcome.Skipped = ($outcome.Status -eq 'SKIPPED_CONCURRENT')
         $outcome.Completed = [int]($syncResult.Uploaded + $syncResult.AlreadyVerified)
         $outcome.Remaining = [int]$syncResult.Failed
