@@ -208,47 +208,19 @@ function Test-SevenZipArchiveIntegrity {
         return $true
     }
 
-    # #300 (follow-up): archive-specific = 7-Zip реально відпрацював (без
-    # таймауту і без винятку запуску) і повернув код 1/2 про сам архів.
-    # Усе інше (код $null — 7-Zip не знайдено/не стартував, таймаут, 7/8/255,
-    # невідомі коди, відмова доступу/зайнятий файл) — збій виконання
-    # інструмента, НЕ доказ проти архіву: fail-safe, класифікується як
-    # не-archive-specific. Поля TimedOut/Error читаються через
-    # PSObject.Properties (StrictMode: не всі джерела результату їх мають).
-    # Пряме присвоєння, не if-вираз: if-вираз розгортає колекцію властивостей
-    # у масив, і індексація за іменем ламається.
+    # #300 (follow-up): archive-specific = 7-Zip реально відпрацював і сам
+    # забракував архів; усе інше (код $null — 7-Zip не знайдено/не стартував,
+    # таймаут, 7/8/255, невідомі коди, відмова доступу/зайнятий файл будь-якою
+    # мовою, незавершена legacy BOM-спроба) — збій виконання інструмента, НЕ
+    # доказ проти архіву (fail-closed). #394: рішення приймає ЄДИНИЙ
+    # класифікатор Test-BRAVOSevenZipArchiveSpecificFailure (BRAVO.Compatibility),
+    # той самий, що класифікує другу спробу в Invoke-BRAVOSevenZipIntegrityTest.
+    # TimedOut читається через PSObject.Properties (StrictMode: не всі джерела
+    # результату його мають). Пряме присвоєння, не if-вираз: if-вираз
+    # розгортає колекцію властивостей у масив, і індексація за іменем ламається.
     $resultProperties = $testResult.PSObject.Properties
     $failureTimedOut = ($null -ne $resultProperties['TimedOut'] -and [bool]$testResult.TimedOut)
-    $failureErrorText = if ($null -ne $resultProperties['Error']) { [string]$testResult.Error } else { '' }
-    $archiveSpecificFailure = (
-        -not $failureTimedOut -and
-        [string]::IsNullOrWhiteSpace($failureErrorText) -and
-        $null -ne $testResult.ExitCode -and
-        (@(1, 2) -contains [int]$testResult.ExitCode)
-    )
-    # Код 1/2 сам по собі неоднозначний: 7-Zip повертає 2 і для пошкодженого
-    # архіву, і для відмови доступу/зайнятого файлу, а текст системних помилок
-    # Windows локалізований. Тому archive-specific лише за ПОЗИТИВНОЇ ознаки —
-    # власних (нелокалізованих) повідомлень 7-Zip про вміст архіву; без неї
-    # збій вважається збоєм виконання (fail-closed).
-    # Власні повідомлення 7-Zip (англійською незалежно від мови Windows) про
-    # пошкоджений/нечитабельний вміст архіву. Локальна змінна, не script
-    # scope: функцію виконують і поза модулем (AST-витяг у self-test).
-    $archiveContentFailurePattern = '(?i)Data Error|CRC Failed|Headers Error|Unexpected end of (archive|data)|Can ?not open (the )?file as|is not archive|Wrong password|Unsupported (Method|feature)|Unconfirmed start of archive|There are data after the end of archive'
-    $failureOutputText = "$($testResult.StandardError)`n$($testResult.StandardOutput)"
-    if ($archiveSpecificFailure -and
-        ($failureOutputText -notmatch $archiveContentFailurePattern -or
-         $failureOutputText -match 'Access is denied|being used by another process')) {
-        $archiveSpecificFailure = $false
-    }
-    # Legacy BOM-fallback: якщо друга спроба (правильний legacy-пароль)
-    # завершилась збоєм ВИКОНАННЯ (таймаут, помилка запуску), повертається
-    # перша спроба з кодом 2, хоча перевірку фактично не завершено.
-    if ($archiveSpecificFailure -and
-        $null -ne $resultProperties['FallbackAttemptOperationalFailure'] -and
-        [bool]$testResult.FallbackAttemptOperationalFailure) {
-        $archiveSpecificFailure = $false
-    }
+    $archiveSpecificFailure = [bool](Test-BRAVOSevenZipArchiveSpecificFailure -Result $testResult -ArchivePath $ArchivePath)
     if ($null -ne $FailureInfo) {
         $FailureInfo['ArchiveSpecific'] = [bool]$archiveSpecificFailure
         $FailureInfo['ExitCode'] = $testResult.ExitCode

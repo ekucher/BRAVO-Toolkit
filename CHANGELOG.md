@@ -12,6 +12,30 @@
   Allowlist і `.gitleaksignore` не розширено, `pull_request` і `push` не змінились. Тест
   `StaticAnalysis/SecretScanDispatchScopeIsNarrow` тримає обмеження вузьким (лише `workflow_dispatch`, лише
   `refs/remotes/*`, `fetch-depth: 0`, крок перед gitleaks) і ловить три мутанти.
+- **Fix: retention / 7z t: один класифікатор власних повідомлень 7-Zip замість двох копій; відмова доступу і зайнятий файл розпізнаються незалежно від мови Windows (#394).**
+  Шаблон «7-Zip сам забракував архів» (archive-specific) жив двома однаковими копіями: у `Test-SevenZipArchiveIntegrity`
+  (BRAVO.ArchiveHelpers) і в `Invoke-BRAVOSevenZipIntegrityTest` (друга, legacy BOM-спроба, BRAVO.Compatibility).
+  Характеризація: копії не розійшлися, але виняток «відмова доступу / зайнятий файл» знав лише англійський текст
+  Windows. Якщо поруч із повідомленням 7-Zip про вміст (`Can not open the file as archive`, `Data Error` тощо) стояла
+  українська чи російська системна помилка, збій вважався archive-specific: у retention стара сесія давала лише WARNING
+  без `criticalErrorOccurred`/`restoreIntegrityFailed` (код 10 замість 41), тоді як на англійській Windows та сама
+  подія — ERROR і код 41. Тепер обидва шляхи викликають єдиний `Test-BRAVOSevenZipArchiveSpecificFailure`
+  (BRAVO.Compatibility; ArchiveHelpers імпортує Compatibility, зворотної залежності немає). Він fail-closed: таймаут,
+  виняток запуску, коди поза 1/2 (7, 8, 255), незавершена legacy BOM-спроба, відсутність власних повідомлень 7-Zip
+  про вміст, відмова доступу чи зайнятий файл англійською, українською або російською, а також маркер 7-Zip
+  `System ERROR` — збій виконання (ERROR, прапорці); так само блокування частини файлу (ERROR_LOCK_VIOLATION).
+  Головна ознака в production — `System ERROR` і англійський текст: `7z t` запускається без `-scc`, тож кирилиця
+  системного повідомлення зазвичай приходить нечитабельною, і український/російський текст — лише додатковий захист.
+  Тому є й незалежна від мови Windows ознака: коли відомий шлях архіву, класифікатор відкриває його на читання з тим
+  самим спільним доступом, що й 7-Zip, і читає перший байт; недоступний, зайнятий, заблокований чи відсутній файл —
+  збій виконання, хоч би якою мовою був системний текст. `System ERROR` враховується лише як окремий рядок-маркер,
+  а не як частина імені елемента архіву. Пошкоджений вміст (`CRC Failed`, `Data Error`, `Headers Error`,
+  `Can not open the file as archive`) класифікується як і раніше. Контракти викликачів (bool, `FailureInfo`,
+  `FallbackAttemptOperationalFailure`, рівні журналу) і коди завершення не змінено. Тести: матриця
+  `SevenZipClassifier/*` (обидва шляхи, рівень рядка «не пройдена»), `SevenZipClassifier/RetentionLegacyBomFallbackLocalizedAccessDeniedIsCritical`,
+  `SevenZipClassifier/RetentionLegacyBomFallbackLocalizedAccessDeniedWithContentTextIsCritical`,
+  `SevenZipClassifier/SingleCanonicalClassifierUsedByBothCallers`, `ArchiveHelpers/IntegrityNullValidatorResultLogsFailureAtError`,
+  `Maintenance/RetentionValidatorExceptionLogsError`.
 - **Fix: Operations: карантин пошкодженої події більше не перезаписує попередній dead-letter (#397).**
   Ім'я dead-letter-файлу було детермінованим (`<EventId>` або `missing-eventid-<ім'я outbox-файлу>` після
   санітизації `[^A-Za-z0-9-_]` → `_`), а запис ішов через `File.Replace`: повернений вручну той самий файл, імена,
