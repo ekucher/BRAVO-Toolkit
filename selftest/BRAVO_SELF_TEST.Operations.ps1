@@ -1110,6 +1110,275 @@
     ) `
         -Name 'Operations/OutboxItemWithoutEventIdDoesNotBlockOrResendQueue' `
         -Failure "справний item після item-а без EventId МАВ БУТИ доставлений у тому самому дренажі (outcome 'ok'), а сам item без EventId не надсилається; outcome=$noIdDrainOutcome goodRemainsInOutbox=$noIdGoodRemainsInOutbox httpCalls=$noIdHttpCallCount"
+
+    # ---------------------------------------------------------------------
+    # #397: карантин зіпсованої події ніколи не знищує попередній
+    # dead-letter-артефакт (доказ для ручного розбору). Ім'я dead-letter
+    # для елемента без EventId раніше було детермінованим
+    # (`missing-eventid-<санітизоване ім'я outbox-файлу>`), а запис ішов
+    # через File.Replace — повернений вручну файл з тим самим ім'ям,
+    # імена, що збігаються після санітизації (`a b` / `a_b`), і (на Windows)
+    # імена, що відрізняються лише регістром, перезаписували попередній
+    # артефакт. Нерядковий EventId (масив/об'єкт/число/bool) після
+    # `[string]`-приведення вважався присутнім і подія йшла в транспорт.
+    # ---------------------------------------------------------------------
+    function New-BRAVOOpsSelfTestRawOutboxItem {
+        param(
+            [Parameter(Mandatory = $true)][string]$Directory,
+            [Parameter(Mandatory = $true)][string]$FileBase,
+            [Parameter(Mandatory = $true)][string]$Marker,
+            [switch]$OmitEventId,
+            [AllowNull()]$EventId = $null,
+            [string]$ServerId = '',
+            [object]$RequestBody = $null,
+            [int]$EnqueuedOffsetSeconds = -10
+        )
+        $payload = [ordered]@{ Kind = 'event' }
+        if (-not $OmitEventId) { $payload['EventId'] = $EventId }
+        $payload['OccurredAtUtc'] = (Get-Date).ToUniversalTime().ToString('o')
+        $payload['SchemaVersion'] = 1
+        $payload['ApiPath'] = '/api/v1/events'
+        $payload['RequestBody'] = if ($null -ne $RequestBody) { $RequestBody } else { @{ category = 'health'; severity = 'WARNING'; marker = $Marker } }
+        $payload['EnqueuedAtUtc'] = (Get-Date).ToUniversalTime().AddSeconds($EnqueuedOffsetSeconds).ToString('o')
+        $payload['AttemptCount'] = 1
+        $payload['NextRetryAtUtc'] = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('o')
+        $payload['LastError'] = $Marker
+        if (-not [string]::IsNullOrWhiteSpace($ServerId)) { $payload['ServerId'] = $ServerId }
+        $itemPath = Join-Path $Directory "$FileBase.json"
+        [IO.File]::WriteAllText($itemPath, (([pscustomobject]$payload) | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+        return $itemPath
+    }
+    function Get-BRAVOOpsSelfTestDeadLetterSnapshot {
+        param([Parameter(Mandatory = $true)][string]$Directory)
+        $snapshot = New-Object System.Collections.Generic.List[object]
+        foreach ($snapshotFile in @(Get-ChildItem -LiteralPath $Directory -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            $snapshotItem = $null
+            try { $snapshotItem = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($snapshotFile.FullName)) } catch { $snapshotItem = $null }
+            $snapshotMarker = ''
+            $snapshotReason = ''
+            if ($null -ne $snapshotItem -and $null -ne $snapshotItem.PSObject.Properties['LastError']) { $snapshotMarker = [string]$snapshotItem.LastError }
+            if ($null -ne $snapshotItem -and $null -ne $snapshotItem.PSObject.Properties['DeadLetterReason']) { $snapshotReason = [string]$snapshotItem.DeadLetterReason }
+            $snapshot.Add([pscustomobject]@{ Name = $snapshotFile.Name; Marker = $snapshotMarker; Reason = $snapshotReason })
+        }
+        return $snapshot.ToArray()
+    }
+    function Invoke-BRAVOOpsSelfTestDrainQuietly {
+        try {
+            [void](Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl $opsSettings.ApiBaseUrl -ApiKey 'test-api-key' `
+                -CredentialTargets $opsCredentialTargets -TimeoutSeconds 5)
+            return ''
+        } catch {
+            return [string]$_.Exception.Message
+        }
+    }
+
+    # (a) Той самий outbox-файл без EventId двічі (ручне повернення).
+    $dlRepeatDir = Join-Path $opsSelfTestRoot 'DeadLetterRepeatName'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $dlRepeatDir
+    $dlRepeatOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $dlRepeatOutboxDir -Force | Out-Null
+    $dlRepeatBase = '0000-repeat-' + [guid]::NewGuid().ToString('N')
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlRepeatOutboxDir -FileBase $dlRepeatBase -Marker 'dl397-repeat-first' -OmitEventId)
+    $dlRepeatThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlRepeatOutboxDir -FileBase $dlRepeatBase -Marker 'dl397-repeat-second' -OmitEventId)
+    $dlRepeatThrew += Invoke-BRAVOOpsSelfTestDrainQuietly
+    $dlRepeatSnapshot = @(Get-BRAVOOpsSelfTestDeadLetterSnapshot -Directory (& $deadLetterDirFn))
+    $dlRepeatMarkers = @($dlRepeatSnapshot | ForEach-Object { $_.Marker })
+    $dlRepeatOutboxLeft = @(Get-ChildItem -LiteralPath $dlRepeatOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $dlRepeatThrew -eq '' -and
+        $dlRepeatSnapshot.Count -eq 2 -and
+        @($dlRepeatSnapshot | Where-Object { $_.Name -like 'missing-eventid-*' -and $_.Reason -match 'EventId відсутній' }).Count -eq 2 -and
+        $dlRepeatMarkers -contains 'dl397-repeat-first' -and
+        $dlRepeatMarkers -contains 'dl397-repeat-second' -and
+        $dlRepeatOutboxLeft.Count -eq 0 -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0
+    ) -Name 'Operations/DeadLetterRepeatedMissingEventIdFileNameKeepsEarlierArtifact' `
+      -Failure "#397: повторний карантин outbox-файлу з тим самим ім'ям без EventId не має перезаписувати попередній dead-letter; у DeadLetter: $(@($dlRepeatSnapshot | ForEach-Object { $_.Name + '=' + $_.Marker }) -join ', ') (очікувано 2 файли missing-eventid-* з обома маркерами), outbox=$($dlRepeatOutboxLeft.Count), HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count), виняток='$dlRepeatThrew'"
+
+    # (b) Різні імена, що збігаються після санітизації (`a b` / `a_b`).
+    $dlSanitizedDir = Join-Path $opsSelfTestRoot 'DeadLetterSanitizedCollision'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $dlSanitizedDir
+    $dlSanitizedOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $dlSanitizedOutboxDir -Force | Out-Null
+    $dlSanitizedSuffix = [guid]::NewGuid().ToString('N')
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlSanitizedOutboxDir -FileBase ('0000-col ' + $dlSanitizedSuffix) -Marker 'dl397-sanitized-space' -OmitEventId -EnqueuedOffsetSeconds -20)
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlSanitizedOutboxDir -FileBase ('0000-col_' + $dlSanitizedSuffix) -Marker 'dl397-sanitized-underscore' -OmitEventId -EnqueuedOffsetSeconds -10)
+    $dlSanitizedThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
+    $dlSanitizedSnapshot = @(Get-BRAVOOpsSelfTestDeadLetterSnapshot -Directory (& $deadLetterDirFn))
+    $dlSanitizedMarkers = @($dlSanitizedSnapshot | ForEach-Object { $_.Marker })
+    $dlSanitizedOutboxLeft = @(Get-ChildItem -LiteralPath $dlSanitizedOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $dlSanitizedThrew -eq '' -and
+        $dlSanitizedSnapshot.Count -eq 2 -and
+        @($dlSanitizedSnapshot | Where-Object { $_.Name -like 'missing-eventid-*' }).Count -eq 2 -and
+        $dlSanitizedMarkers -contains 'dl397-sanitized-space' -and
+        $dlSanitizedMarkers -contains 'dl397-sanitized-underscore' -and
+        $dlSanitizedOutboxLeft.Count -eq 0 -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0
+    ) -Name 'Operations/DeadLetterSanitizedFileNameCollisionKeepsBothArtifacts' `
+      -Failure "#397: два outbox-файли без EventId, імена яких збігаються після санітизації ('a b' / 'a_b'), мають дати два окремі dead-letter; у DeadLetter: $(@($dlSanitizedSnapshot | ForEach-Object { $_.Name + '=' + $_.Marker }) -join ', '), outbox=$($dlSanitizedOutboxLeft.Count), HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count), виняток='$dlSanitizedThrew'"
+
+    # (c) Імена, що відрізняються лише регістром (NTFS їх не розрізняє).
+    $dlCaseDir = Join-Path $opsSelfTestRoot 'DeadLetterCaseCollision'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $dlCaseDir
+    $dlCaseOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $dlCaseOutboxDir -Force | Out-Null
+    $dlCaseBase = '0000-case-' + [guid]::NewGuid().ToString('N')
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlCaseOutboxDir -FileBase $dlCaseBase.ToUpperInvariant() -Marker 'dl397-case-upper' -OmitEventId)
+    $dlCaseThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlCaseOutboxDir -FileBase $dlCaseBase -Marker 'dl397-case-lower' -OmitEventId)
+    $dlCaseThrew += Invoke-BRAVOOpsSelfTestDrainQuietly
+    $dlCaseSnapshot = @(Get-BRAVOOpsSelfTestDeadLetterSnapshot -Directory (& $deadLetterDirFn))
+    $dlCaseMarkers = @($dlCaseSnapshot | ForEach-Object { $_.Marker })
+    $dlCaseOutboxLeft = @(Get-ChildItem -LiteralPath $dlCaseOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $dlCaseThrew -eq '' -and
+        $dlCaseSnapshot.Count -eq 2 -and
+        @($dlCaseSnapshot | Where-Object { $_.Name -like 'missing-eventid-*' }).Count -eq 2 -and
+        $dlCaseMarkers -contains 'dl397-case-upper' -and
+        $dlCaseMarkers -contains 'dl397-case-lower' -and
+        $dlCaseOutboxLeft.Count -eq 0 -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0
+    ) -Name 'Operations/DeadLetterCaseInsensitiveFileNameCollisionKeepsBothArtifacts' `
+      -Failure "#397: outbox-файли без EventId з іменами, що відрізняються лише регістром, мають дати два окремі dead-letter (NTFS регістр не розрізняє); у DeadLetter: $(@($dlCaseSnapshot | ForEach-Object { $_.Name + '=' + $_.Marker }) -join ', '), outbox=$($dlCaseOutboxLeft.Count), HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count), виняток='$dlCaseThrew'"
+
+    # (d) Відсутній / порожній / whitespace / null EventId — кожен у
+    # DeadLetter під іменем missing-eventid-*, з причиною про EventId, без
+    # надсилання; справний сусід доставляється.
+    $dlBlankDir = Join-Path $opsSelfTestRoot 'DeadLetterBlankEventId'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $dlBlankDir
+    $dlBlankOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $dlBlankOutboxDir -Force | Out-Null
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlBlankOutboxDir -FileBase ('0000-blank-absent-' + [guid]::NewGuid().ToString('N')) -Marker 'dl397-blank-absent' -OmitEventId -EnqueuedOffsetSeconds -40)
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlBlankOutboxDir -FileBase ('0000-blank-empty-' + [guid]::NewGuid().ToString('N')) -Marker 'dl397-blank-empty' -EventId '' -EnqueuedOffsetSeconds -30)
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlBlankOutboxDir -FileBase ('0000-blank-space-' + [guid]::NewGuid().ToString('N')) -Marker 'dl397-blank-space' -EventId '   ' -EnqueuedOffsetSeconds -20)
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlBlankOutboxDir -FileBase ('0000-blank-null-' + [guid]::NewGuid().ToString('N')) -Marker 'dl397-blank-null' -EventId $null -EnqueuedOffsetSeconds -15)
+    $dlBlankGoodEventId = [guid]::NewGuid().ToString()
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlBlankOutboxDir -FileBase $dlBlankGoodEventId -Marker 'dl397-blank-good' -EventId $dlBlankGoodEventId -EnqueuedOffsetSeconds -5)
+    $dlBlankThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
+    $dlBlankSnapshot = @(Get-BRAVOOpsSelfTestDeadLetterSnapshot -Directory (& $deadLetterDirFn))
+    $dlBlankMarkers = @($dlBlankSnapshot | ForEach-Object { $_.Marker })
+    $dlBlankOutboxLeft = @(Get-ChildItem -LiteralPath $dlBlankOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $dlBlankThrew -eq '' -and
+        $dlBlankSnapshot.Count -eq 4 -and
+        @($dlBlankSnapshot | Where-Object { $_.Name -like 'missing-eventid-*' -and $_.Reason -match 'EventId відсутній' }).Count -eq 4 -and
+        $dlBlankMarkers -contains 'dl397-blank-absent' -and
+        $dlBlankMarkers -contains 'dl397-blank-empty' -and
+        $dlBlankMarkers -contains 'dl397-blank-space' -and
+        $dlBlankMarkers -contains 'dl397-blank-null' -and
+        $dlBlankOutboxLeft.Count -eq 0 -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 1
+    ) -Name 'Operations/DeadLetterMissingEmptyWhitespaceNullEventIdUseMissingEventIdName' `
+      -Failure "#397: відсутній/порожній/whitespace/null EventId -- кожен елемент у DeadLetter як missing-eventid-* з причиною про EventId, без надсилання; справний сусід доставлено (1 HTTP); у DeadLetter: $(@($dlBlankSnapshot | ForEach-Object { $_.Name + '=' + $_.Marker }) -join ', '), outbox=$($dlBlankOutboxLeft.Count), HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count), виняток='$dlBlankThrew'"
+
+    # (e) Чужа ServerId + відсутній EventId: гілка карантину ідентичності
+    # (раніше за перевірку EventId), той самий файл двічі.
+    $dlForeignDir = Join-Path $opsSelfTestRoot 'DeadLetterForeignNoEventId'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $dlForeignDir
+    $dlForeignOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $dlForeignOutboxDir -Force | Out-Null
+    $dlForeignDrainServerId = [string](& $opsSelfTestModule { Get-BRAVOOperationsServerId })
+    $dlForeignServerId = [guid]::NewGuid().ToString()
+    $dlForeignBase = '0000-foreign-' + [guid]::NewGuid().ToString('N')
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlForeignOutboxDir -FileBase $dlForeignBase -Marker 'dl397-foreign-first' -OmitEventId -ServerId $dlForeignServerId)
+    $dlForeignThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlForeignOutboxDir -FileBase $dlForeignBase -Marker 'dl397-foreign-second' -OmitEventId -ServerId $dlForeignServerId)
+    $dlForeignThrew += Invoke-BRAVOOpsSelfTestDrainQuietly
+    $dlForeignSnapshot = @(Get-BRAVOOpsSelfTestDeadLetterSnapshot -Directory (& $deadLetterDirFn))
+    $dlForeignMarkers = @($dlForeignSnapshot | ForEach-Object { $_.Marker })
+    $dlForeignOutboxLeft = @(Get-ChildItem -LiteralPath $dlForeignOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $dlForeignThrew -eq '' -and
+        -not [string]::IsNullOrWhiteSpace($dlForeignDrainServerId) -and
+        $dlForeignSnapshot.Count -eq 2 -and
+        @($dlForeignSnapshot | Where-Object { $_.Name -like 'missing-eventid-*' -and $_.Reason -match [regex]::Escape($dlForeignServerId) }).Count -eq 2 -and
+        $dlForeignMarkers -contains 'dl397-foreign-first' -and
+        $dlForeignMarkers -contains 'dl397-foreign-second' -and
+        $dlForeignOutboxLeft.Count -eq 0 -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0
+    ) -Name 'Operations/DeadLetterForeignServerIdWithoutEventIdKeepsEveryArtifact' `
+      -Failure "#397: елемент чужої ідентичності без EventId карантиниться гілкою ідентичності (причина з чужою ServerId), без надсилання, а повтор того самого файлу не перезаписує попередній dead-letter; у DeadLetter: $(@($dlForeignSnapshot | ForEach-Object { $_.Name + '=' + $_.Marker }) -join ', '), outbox=$($dlForeignOutboxLeft.Count), HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count), виняток='$dlForeignThrew'"
+
+    # (f) Нерядковий EventId (масив/об'єкт/число/bool): продюсери пишуть
+    # лише рядок-GUID ([string]$EventId у Add-BRAVOOperationsOutboxItem),
+    # тож такий елемент — пошкоджений: dead-letter, а не надсилання.
+    $dlTypeDir = Join-Path $opsSelfTestRoot 'DeadLetterMalformedEventIdType'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $dlTypeDir
+    $dlTypeOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $dlTypeOutboxDir -Force | Out-Null
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    for ($dlTypeIndex = 0; $dlTypeIndex -lt 5; $dlTypeIndex++) { Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' } }
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlTypeOutboxDir -FileBase ('0000-type-array-' + [guid]::NewGuid().ToString('N')) -Marker 'dl397-type-array' -EventId @('evt-part-a', 'evt-part-b') -EnqueuedOffsetSeconds -40)
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlTypeOutboxDir -FileBase ('0000-type-object-' + [guid]::NewGuid().ToString('N')) -Marker 'dl397-type-object' -EventId @{ nested = 'evt-nested' } -EnqueuedOffsetSeconds -30)
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlTypeOutboxDir -FileBase ('0000-type-number-' + [guid]::NewGuid().ToString('N')) -Marker 'dl397-type-number' -EventId 12345 -EnqueuedOffsetSeconds -20)
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlTypeOutboxDir -FileBase ('0000-type-bool-' + [guid]::NewGuid().ToString('N')) -Marker 'dl397-type-bool' -EventId $true -EnqueuedOffsetSeconds -15)
+    $dlTypeGoodEventId = [guid]::NewGuid().ToString()
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlTypeOutboxDir -FileBase $dlTypeGoodEventId -Marker 'dl397-type-good' -EventId $dlTypeGoodEventId -EnqueuedOffsetSeconds -5)
+    $dlTypeThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
+    $dlTypeSnapshot = @(Get-BRAVOOpsSelfTestDeadLetterSnapshot -Directory (& $deadLetterDirFn))
+    $dlTypeMarkers = @($dlTypeSnapshot | ForEach-Object { $_.Marker })
+    $dlTypeOutboxLeft = @(Get-ChildItem -LiteralPath $dlTypeOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $dlTypeThrew -eq '' -and
+        $dlTypeSnapshot.Count -eq 4 -and
+        @($dlTypeSnapshot | Where-Object { $_.Name -like 'missing-eventid-*' -and $_.Reason -match 'EventId відсутній' }).Count -eq 4 -and
+        $dlTypeMarkers -contains 'dl397-type-array' -and
+        $dlTypeMarkers -contains 'dl397-type-object' -and
+        $dlTypeMarkers -contains 'dl397-type-number' -and
+        $dlTypeMarkers -contains 'dl397-type-bool' -and
+        $dlTypeOutboxLeft.Count -eq 0 -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 1
+    ) -Name 'Operations/MalformedEventIdTypeIsDeadLetteredNotSent' `
+      -Failure "#397: EventId не-рядок (масив/об'єкт/число/bool) -- пошкоджений елемент: DeadLetter missing-eventid-* з причиною про EventId і без надсилання; доставлено лише справний рядковий EventId (1 HTTP); у DeadLetter: $(@($dlTypeSnapshot | ForEach-Object { $_.Name + '=' + $_.Marker }) -join ', '), outbox=$($dlTypeOutboxLeft.Count), HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count), виняток='$dlTypeThrew'"
+
+    # (g) Валідний EventId, що вже має dead-letter (ручне повернення
+    # пошкодженої події): той самий інваріант для канонічного імені.
+    $dlSameIdDir = Join-Path $opsSelfTestRoot 'DeadLetterRepeatedEventId'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $dlSameIdDir
+    $dlSameIdOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $dlSameIdOutboxDir -Force | Out-Null
+    $dlSameIdDeadLetterDir = & $deadLetterDirFn
+    New-Item -ItemType Directory -Path $dlSameIdDeadLetterDir -Force | Out-Null
+    $dlSameIdEventId = [guid]::NewGuid().ToString()
+    $dlSameIdEarlierPath = Join-Path $dlSameIdDeadLetterDir "$dlSameIdEventId.json"
+    [IO.File]::WriteAllText($dlSameIdEarlierPath, (([pscustomobject]@{
+        Kind = 'event'; EventId = $dlSameIdEventId; ApiPath = '/api/v1/events'
+        RequestBody = 'not-an-object-earlier'; LastError = 'dl397-sameid-earlier'
+        DeadLetteredAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-30).ToString('o')
+        DeadLetterReason = 'Пошкоджений outbox item (earlier)'; DeadLetterKind = 'Rejected'
+    }) | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    [void](New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlSameIdOutboxDir -FileBase $dlSameIdEventId -Marker 'dl397-sameid-later' -EventId $dlSameIdEventId -RequestBody 'not-an-object-later')
+    $dlSameIdThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
+    $dlSameIdSnapshot = @(Get-BRAVOOpsSelfTestDeadLetterSnapshot -Directory $dlSameIdDeadLetterDir)
+    $dlSameIdEarlier = @($dlSameIdSnapshot | Where-Object { $_.Name -eq "$dlSameIdEventId.json" })
+    $dlSameIdLater = @($dlSameIdSnapshot | Where-Object { $_.Name -like "$dlSameIdEventId*" -and $_.Marker -eq 'dl397-sameid-later' })
+    $dlSameIdOutboxLeft = @(Get-ChildItem -LiteralPath $dlSameIdOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $dlSameIdThrew -eq '' -and
+        $dlSameIdSnapshot.Count -eq 2 -and
+        $dlSameIdEarlier.Count -eq 1 -and
+        $dlSameIdEarlier[0].Marker -eq 'dl397-sameid-earlier' -and
+        $dlSameIdLater.Count -eq 1 -and
+        $dlSameIdOutboxLeft.Count -eq 0 -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0
+    ) -Name 'Operations/DeadLetterRepeatedEventIdKeepsEarlierArtifact' `
+      -Failure "#397: повторний карантин події з тим самим EventId не має перезаписувати попередній dead-letter <EventId>.json; новий артефакт -- окремий файл з тим самим префіксом; у DeadLetter: $(@($dlSameIdSnapshot | ForEach-Object { $_.Name + '=' + $_.Marker }) -join ', '), outbox=$($dlSameIdOutboxLeft.Count), HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count), виняток='$dlSameIdThrew'"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Operations/ApprovedWithoutApiKeyMeansTtlExpiredReturnsNullNoThrow' } }
     if (Enter-BRAVOSelfTestSection -Name 'Operations/EnabledWithEmptyApiBaseUrlFailsClosedReturnsNull' -DependsOn 'Operations/UrlNormalizationTrailingSlashInvariant') { try {
 
