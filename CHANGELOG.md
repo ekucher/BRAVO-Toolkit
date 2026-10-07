@@ -2,6 +2,25 @@
 
 ## Не випущено (developer)
 
+- **Fix: Archive: `MUTATION_AUTO_ARCHIVED` більше не вважається збоєм SFTP (#285).**
+  `Invoke-BRAVOBazaCanonicalSync` вважала успіхом лише `COMPLETE`, тому цикл з легітимною мутацією в межах
+  `AutoArchiveMutationThreshold` (INFO за `OPERATIONS.md` і Health) завершувався exit 50 з порожньою причиною
+  «ПОМИЛКА» щоразу. Тепер успіх визначає один експортований helper BazaSync `Test-BRAVOBazaSyncStatusSuccess`
+  (`COMPLETE` і `MUTATION_AUTO_ARCHIVED`; усе інше, включно з незнайомим статусом, не успіх). Статуси
+  `MUTATION_VIOLATION`, `REMOTE_CONFLICT`, `AUDIT_DRIFT`, `INCOMPATIBLE_NAME`, `INCOMPLETE` лишаються збоєм, як і
+  раніше. Регресія: `BazaSync/CanonicalSyncMutationAutoArchivedIsSuccess`, `BazaSync/CanonicalSyncCompleteIsSuccess`,
+  `BazaSync/CanonicalSyncFailureStatusesAreNotSuccess`, `BazaSync/StatusSuccessHelperWhitelistsCompleteAndAutoArchivedOnly`.
+  Якщо після авто-архівування не вдалося зберегти стан BazaSync, `MUTATION_AUTO_ARCHIVED` знижується до `INCOMPLETE`
+  з Error (як і `COMPLETE`), тож такий цикл не рахується успіхом. Регресія: `BazaSync/AutoArchiveStateSaveFailureIsNotSuccess`.
+- **Fix: BazaSync: `MUTATION_AUTO_ARCHIVED` не ховає `AUDIT_DRIFT`, `REMOTE_CONFLICT` і `INCOMPATIBLE_NAME` того самого циклу (#293).**
+  Статус `MUTATION_AUTO_ARCHIVED` обирався раніше за drift/конфлікт/несумісні імена, а Fast Health одразу
+  повертав INFO/healthy, тож на сайті з регулярними мутаціями ці проблеми ставали рядками INFO назавжди
+  (`RemoteConflicts` і `IncompatibleFiles` у стані не зберігаються). Авто-архівування виконується за тих самих умов
+  (поріг не змінено), але підсумковий статус тепер обирає найсуворіший: за непорожніх списків drift/конфлікту/
+  несумісних імен цикл отримує `AUDIT_DRIFT`/`REMOTE_CONFLICT`/`INCOMPATIBLE_NAME` (CRITICAL), а факт
+  авто-архівування лишається в Info. Fast Health повертає INFO лише коли цих списків немає. Регресія:
+  `BazaSync/AutoArchivedDoesNotMaskRemoteConflictInFastHealth`,
+  `BazaSync/AutoArchiveWithSameCycleRemoteConflictIsNotAutoArchivedStatus`.
 - **Fix: Maintenance: зламаний старий архів у retention більше не дає код 41 щоночі (#300).**
   `Remove-OldRestoreArchives` лише оцінює старі архіви реставрації, але його перевірка `7z t` через
   `Test-BRAVOMaintenanceSevenZipArchiveIntegrity` виставляла `criticalErrorOccurred` і `restoreIntegrityFailed`.
