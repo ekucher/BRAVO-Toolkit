@@ -51,6 +51,26 @@ function Set-BRAVOSelfTestQuiescenceStatePath {
             Set-BRAVOSelfTestQuiescenceStatePath -Path $Path
         } $quiescenceTestStatePath
 
+        # #314 FR-3: профіль -RecoverServices пише маркер власником
+        # BRAVO_MAINTENANCE_RECOVER — Write і Read (а отже Health watchdog і
+        # Repair-BRAVOOrphanedServiceStartTypes) мають його визнавати.
+        $recoverOwnerState = & $quiescenceStateModule {
+            [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE_RECOVER' -Services @(@{ Name = 'exchangAPI'; RestartIntent = $true }) -LogFile 'C:\LOGS\maintenance-recover.log')
+            Read-BRAVOServiceQuiescenceState
+        }
+        # Прибирання — напряму за шляхом: зняття власником перевіряє
+        # ClearIsIdempotentAndReadReturnsNull, тут лише власник маркера.
+        if ([IO.File]::Exists($quiescenceTestStatePath)) { [IO.File]::Delete($quiescenceTestStatePath) }
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $recoverOwnerState -and
+                [string]$recoverOwnerState.owner -eq 'BRAVO_MAINTENANCE_RECOVER' -and
+                @($recoverOwnerState.services).Count -eq 1 -and
+                [bool]$recoverOwnerState.services[0].RestartIntent
+            ) `
+            -Name "ServiceQuiescence/RecoverProfileOwnerAcceptedByMarker" `
+            -Failure "#314 FR-3: маркер власника BRAVO_MAINTENANCE_RECOVER має записуватися і читатися (Health watchdog і Repair-BRAVOOrphanedServiceStartTypes бачать його через Read)"
+
         [void](& $quiescenceStateModule {
             Write-BRAVOServiceQuiescenceState `
                 -Owner 'BRAVO_MAINTENANCE' `

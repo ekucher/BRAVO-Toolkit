@@ -2,6 +2,25 @@
 
 ## Не випущено (developer)
 
+- **Нове: профіль `BRAVO_MAINTENANCE.ps1 -RecoverServices` — відновлення впалих служб BRAVO (#314, хвиля 4).**
+  Профіль лише піднімає впалі служби: без реставрації, перевірки розмірів, очистки, міграції журналів, trace-архіву/SFTP,
+  BRAVO_ARCHIV і автовимкнення. Якщо впалих служб немає — миттєвий вихід з кодом 0 без lock-а, файлу журналу й сповіщень.
+  Якщо для всіх впалих служб пауза (0 / 5 / 15 / 60 хв) ще не минула — код 0 і один рядок INFO у добовому
+  `BRAVO_MAINTENANCE_<дата>_RECOVER_PAUSE.log`. Далі операційний lock без очікування (зайнятий — код 20 без змін і
+  сповіщень), повторна класифікація під lock-ом, ownership-маркер власником `BRAVO_MAINTENANCE_RECOVER` до першої
+  зупинки/запуску (збій запису — CRITICAL, код 60, служби не чіпаються). Ланцюжок: впала BRAVO — зупинка працюючих
+  BRAVO Web і exchangAPI, запуск BRAVO → exchangAPI → BRAVO Web; впала exchangAPI чи BRAVO Web — лише вона; кілька —
+  об'єднання в канонічному порядку. Службу у стані `Paused` профіль не запускає (INFO). Докази в
+  `BRAVO_MAINTENANCE_<ts>_RECOVER_PID<pid>.log`: StartMode, Status, ExitCode, ServiceSpecificExitCode і до 50 подій
+  Service Control Manager (7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034) від старту ОС; збій читання подій — лише
+  WARNING. Журнали служб обробляються тими самими функціями циклу служб. Сповіщення: «відновлено» — WARNING, «не вдалося
+  підняти» — CRITICAL, «циклічно падає» — CRITICAL. Без встановленої цілісності моделі, під маркером з
+  `restartSuppressed` чи під чинним маркером іншого власника служби не запускаються. `-RecoverServices` разом з
+  `-ForceRestore` або `-RunMissedRestoreOnly` — код 30. Коди завершення 0 / 10 / 20 / 30 / 60, нових немає.
+  `Enter-BRAVOMaintenanceOperationLock` отримав `-NoWait`; Health і `Repair-BRAVOOrphanedServiceStartTypes` визнають
+  власника `BRAVO_MAINTENANCE_RECOVER`. Задачу Планувальника для профілю додасть хвиля 5. Код:
+  `modules\BRAVO.Maintenance\BRAVO.Maintenance.RecoverServices.ps1`.
+
 - **Зміна поведінки: нічний Maintenance запускає зупинені служби BRAVO (#314, хвиля 3).**
   Керована служба (BRAVO, exchangAPI, BRAVO Web), яка стоїть до початку обслуговування і не має типу запуску `Disabled`,
   тепер вважається впалою і проходить повний цикл: потрапляє в ownership-маркер із наміром перезапуску, її журнали

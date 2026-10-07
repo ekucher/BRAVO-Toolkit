@@ -77,10 +77,13 @@ function Read-BRAVOServiceRecoveryState {
     # Відсутній файл — порожній облік без попередження. Пошкоджений або
     # записаний іншим хостом файл перейменовується в <файл>.corrupt-<ts>,
     # облік починається заново, а Warning містить текст для WARNING.
+    # -ReadOnly (профіль -RecoverServices до взяття lock-а): файл не
+    # перейменовується — лише порожній облік і Warning.
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$HostName,
-        [Parameter(Mandatory = $true)][DateTimeOffset]$Now
+        [Parameter(Mandatory = $true)][DateTimeOffset]$Now,
+        [switch]$ReadOnly
     )
 
     $result = [pscustomobject]@{ State = (New-BRAVOServiceRecoveryState -HostName $HostName); Warning = $null; CorruptPath = $null }
@@ -126,6 +129,10 @@ function Read-BRAVOServiceRecoveryState {
         }
     } catch {
         $problem = "файл пошкоджений: $($_.Exception.Message)"
+    }
+    if ($ReadOnly) {
+        $result.Warning = "State-файл відновлення служб $Path не прочитано ($problem)"
+        return $result
     }
 
     $corruptPath = '{0}.corrupt-{1}' -f $Path, $Now.ToString('yyyyMMddHHmmss', [Globalization.CultureInfo]::InvariantCulture)

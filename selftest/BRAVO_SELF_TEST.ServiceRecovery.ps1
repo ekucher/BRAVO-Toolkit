@@ -1051,8 +1051,9 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
                     $node -is [Management.Automation.Language.ParameterAst] -and $node.Name.VariablePath.UserPath -eq 'RecoverServices' -and
                     $node.Extent.Text -match '^\[switch\]\$RecoverServices$'
                 }, $true)).Count
-        $recoverBranchIndex = $recoverRuntimeText.IndexOf('if ($RecoverServices) {')
         $recoverLogFileIndex = $recoverRuntimeText.IndexOf('$script:LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"')
+        # Гілка профілю — перша після шляхів журналів (рядок елевації теж містить 'if ($RecoverServices) {').
+        $recoverBranchIndex = if ($recoverLogFileIndex -ge 0) { $recoverRuntimeText.IndexOf('if ($RecoverServices) {', $recoverLogFileIndex) } else { -1 }
         $recoverStepsIndex = $recoverRuntimeText.IndexOf('Initialize-BRAVOMaintenanceSteps -Total 8')
         $recoverBranchText = if ($recoverBranchIndex -ge 0) { $recoverRuntimeText.Substring($recoverBranchIndex, [Math]::Min(400, $recoverRuntimeText.Length - $recoverBranchIndex)) } else { '' }
         Test-BRAVOCondition `

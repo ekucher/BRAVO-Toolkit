@@ -2,6 +2,7 @@
 param(
     [switch]$ForceRestore,
     [switch]$RunMissedRestoreOnly,
+    [switch]$RecoverServices,
     [switch]$DisableSizeCheck,
     [switch]$EnableAllSlack,
     [switch]$DisableAllSlack,
@@ -150,6 +151,7 @@ try {
 }
 $parameters = @{
     ForceRestore = $ForceRestore; RunMissedRestoreOnly = $RunMissedRestoreOnly
+    RecoverServices = $RecoverServices
     DisableSizeCheck = $DisableSizeCheck; EnableAllSlack = $EnableAllSlack
     DisableAllSlack = $DisableAllSlack; ConfigPath = $ConfigPath
     ConfigPathWasExplicit = $configPathWasExplicit

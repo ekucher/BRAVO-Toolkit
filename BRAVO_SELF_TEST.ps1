@@ -14979,7 +14979,7 @@ try {
         $maintenanceWrapperProbeEmit = @'
 [pscustomobject]@{
     Bound = ((@($PSBoundParameters.Keys) | Sort-Object) -join ',')
-    Values = ((@(foreach ($probeName in @('ForceRestore', 'RunMissedRestoreOnly', 'DisableSizeCheck', 'EnableAllSlack', 'DisableAllSlack', 'AutoShutdown', 'ArchiveAfterMaintenance', 'ConfigPath', 'ConfigPathWasExplicit', 'NoPause', 'RuntimeRoot', 'EntryScriptPath')) {
+    Values = ((@(foreach ($probeName in @('ForceRestore', 'RunMissedRestoreOnly', 'RecoverServices', 'DisableSizeCheck', 'EnableAllSlack', 'DisableAllSlack', 'AutoShutdown', 'ArchiveAfterMaintenance', 'ConfigPath', 'ConfigPathWasExplicit', 'NoPause', 'RuntimeRoot', 'EntryScriptPath')) {
         $probeValue = Get-Variable -Name $probeName -ValueOnly
         '{0}={1}:{2}' -f $probeName, $(if ($null -eq $probeValue) { 'null' } else { $probeValue.GetType().Name }), [string]$probeValue
     })) -join ';')
@@ -14995,7 +14995,7 @@ try {
                 @{ RuntimeRoot = 'R'; EntryScriptPath = 'E' },
                 @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; AutoShutdown = 'on'; ArchivLims = 'off' },
                 @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; ConfigPath = 'C:\probe\BRAVO.config'; ConfigPathWasExplicit = $true; NoPause = $true; ForceRestore = $true; DisableAllSlack = $true },
-                @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; EnableAllSlack = $false; ArchiveAfterMaintenance = 'on'; RunMissedRestoreOnly = $true; DisableSizeCheck = $true }
+                @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; EnableAllSlack = $false; ArchiveAfterMaintenance = 'on'; RunMissedRestoreOnly = $true; DisableSizeCheck = $true; RecoverServices = $true }
             )) {
             $maintenanceWrapperDirect = @(& $maintenanceWrapperDirectProbe @maintenanceWrapperProbeArguments)
             $maintenanceWrapperWrapped = @(& $maintenanceWrapperWrappedProbe @maintenanceWrapperProbeArguments)
@@ -29171,7 +29171,7 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains('if ($Message -match "^=== .* ===$") {') -and
-            $maintenanceScriptText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Maintenance.ServiceCycle.ps1'") -and
+            $maintenanceScriptText.Contains("'BRAVO.Maintenance.ServiceCycle.ps1'") -and
             -not $maintenanceServiceCycleTextForHeadings.Contains('function Write-Log') -and
             $maintenanceScriptText.Contains('Write-BRAVOMaintenanceLogFile -Entry $Message') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ДЖЕРЕЛА ЖУРНАЛІВ ==="') -and

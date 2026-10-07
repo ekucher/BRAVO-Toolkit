@@ -7,6 +7,7 @@
 param (
     [switch]$ForceRestore,
     [switch]$RunMissedRestoreOnly,
+    [switch]$RecoverServices,
     [switch]$DisableSizeCheck,
     [switch]$EnableAllSlack,
     [switch]$DisableAllSlack,
@@ -48,6 +49,7 @@ function Invoke-BRAVOMaintenance {
     param (
         [switch]$ForceRestore,
         [switch]$RunMissedRestoreOnly,
+        [switch]$RecoverServices,
         [switch]$DisableSizeCheck,
         [switch]$EnableAllSlack,
         [switch]$DisableAllSlack,
@@ -133,6 +135,7 @@ If (-not $isLocalSystem -and -not $currentPrincipal.IsInRole([Security.Principal
 	$elevatedArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$EntryScriptPath`"")
 	if ($ForceRestore) { $elevatedArguments += "-ForceRestore" }
 	if ($RunMissedRestoreOnly) { $elevatedArguments += "-RunMissedRestoreOnly" }
+	if ($RecoverServices) { $elevatedArguments += "-RecoverServices" }
 	if ($DisableSizeCheck) { $elevatedArguments += "-DisableSizeCheck" }
 	if ($EnableAllSlack) { $elevatedArguments += "-EnableAllSlack" }
 	if ($DisableAllSlack) { $elevatedArguments += "-DisableAllSlack" }
@@ -981,21 +984,14 @@ function Get-ConfiguredServiceState {
     }
 }
 
-# Цикл служб (#314, хвиля 2): зупинка -> обробка журналів -> запуск, і точка
-# розширення #316 (Stop-BRAVOMaintenanceStrayProcess); облік спроб відновлення
-# впалих служб і сповіщення про них (#314, хвиля 3) — у сусідніх файлах
-# модуля. Dot-source у scope цієї функції: як і решта функцій runtime, вони
-# бачать змінні тіла через динамічний scope.
-$maintenanceServiceCyclePath = Join-Path $PSScriptRoot 'BRAVO.Maintenance.ServiceCycle.ps1'
-if (-not (Test-Path -LiteralPath $maintenanceServiceCyclePath -PathType Leaf)) {
-    throw "Не знайдено цикл служб Maintenance: $maintenanceServiceCyclePath"
+# #314: цикл служб (+#316), облік відновлення й сповіщення, профіль -RecoverServices —
+# у сусідніх файлах модуля. Dot-source у scope цієї функції (foreach не створює
+# scope): як і решта функцій runtime, вони бачать змінні тіла динамічно.
+foreach ($maintenancePartName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1', 'BRAVO.Maintenance.RecoverServices.ps1')) {
+    $maintenancePartPath = Join-Path $PSScriptRoot $maintenancePartName
+    if (-not (Test-Path -LiteralPath $maintenancePartPath -PathType Leaf)) { throw "Не знайдено частину модуля Maintenance: $maintenancePartPath" }
+    . $maintenancePartPath
 }
-. $maintenanceServiceCyclePath
-$maintenanceServiceRecoveryPath = Join-Path $PSScriptRoot 'BRAVO.Maintenance.ServiceRecovery.ps1'
-if (-not (Test-Path -LiteralPath $maintenanceServiceRecoveryPath -PathType Leaf)) {
-    throw "Не знайдено облік відновлення служб Maintenance: $maintenanceServiceRecoveryPath"
-}
-. $maintenanceServiceRecoveryPath
 
 function Wait-BRAVOServiceStartPendingSettled {
     # #287: службі у StartPending SCM не передає stop (служба ще не приймає
@@ -1205,7 +1201,8 @@ function Enter-BRAVOMaintenanceOperationLock {
     param(
         # Задача Планувальника, у якій іде прогін: визначає ліміт очікування
         # lock (Get-BRAVOOperationLockWaitBudget, BRAVO.System).
-        [Parameter(Mandatory = $true)][ValidateSet('Maintenance', 'Recovery')][string]$TaskType
+        [Parameter(Mandatory = $true)][ValidateSet('Maintenance', 'Recovery')][string]$TaskType,
+        [switch]$NoWait  # #314 FR-3: профіль -RecoverServices — одна спроба без очікування.
     )
     $lockPath = [string]$operationLockSettings.Path
     try {
@@ -1221,7 +1218,7 @@ function Enter-BRAVOMaintenanceOperationLock {
         $lockWaitBudget = Get-BRAVOOperationLockWaitBudget `
             -SchedulerSettings $schedulerSettings `
             -TaskType $TaskType
-        $waitMinutes = $lockWaitBudget.EffectiveMinutes
+        $waitMinutes = if ($NoWait) { 0 } else { $lockWaitBudget.EffectiveMinutes }
         $waitLimitDescription = [string]$lockWaitBudget.LimitDescription
         $deadline = (Get-Date).AddMinutes($waitMinutes)
         $stream = $null
@@ -8281,6 +8278,9 @@ $freeSpaceExclusionsText = if ($FREE_SPACE_EXCLUDED_DRIVES.Count -gt 0) {
     "немає"
 }
 
+if ($RecoverServices) {  # #314 FR-3: лише відновлення впалих служб.
+    exit (Invoke-BRAVOMaintenanceRecoverServicesProfile -ForceRestore:$ForceRestore -RunMissedRestoreOnly:$RunMissedRestoreOnly)
+}
 # ===== СТВОРЕННЯ НЕОБХІДНИХ ДИРЕКТОРІЙ =====
 # ===== ПОЧАТОК ВИКОНАННЯ =====
 $maintenanceConfiguredStepWidth = if ($null -ne $consoleSettings.StepWidth) {

@@ -411,7 +411,7 @@ function Write-BRAVOServiceQuiescenceState {
     # по-своєму — watchdog не повинен резолвити сам).
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE')][string]$Owner,
+        [Parameter(Mandatory = $true)][ValidateSet('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE', 'BRAVO_MAINTENANCE_RECOVER')][string]$Owner,
         [Parameter(Mandatory = $true)][object[]]$Services,
         [string]$LogFile,
         [switch]$RestartSuppressed,
@@ -521,7 +521,7 @@ function Read-BRAVOServiceQuiescenceState {
         return $null
     }
     if ($null -eq $state.PSObject.Properties['schemaVersion'] -or [int]$state.schemaVersion -ne 1) { return $null }
-    if ([string]$state.owner -notin @('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE')) { return $null }
+    if ([string]$state.owner -notin @('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE', 'BRAVO_MAINTENANCE_RECOVER')) { return $null }
     if ([string]$state.hostname -ne [Environment]::MachineName) { return $null }
     foreach ($requiredPropertyName in @('pid', 'processStartTime', 'createdAt', 'logFile', 'restartSuppressed', 'services')) {
         if ($null -eq $state.PSObject.Properties[$requiredPropertyName]) { return $null }
