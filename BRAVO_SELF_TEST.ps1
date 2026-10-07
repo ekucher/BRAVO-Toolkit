@@ -12102,7 +12102,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 ) `
                 -Name 'Maintenance/ForceRestoreDisabledKillsStrayBis' `
                 -Failure 'при -ForceRestore + Disabled має завершуватись сторонній Bis тим самим хелпером Stop-BRAVOMaintenanceStrayProcess'
-        } $maintenanceRestoreWindowText
+        } ($maintenanceRestoreWindowText + "`r`n" + [IO.File]::ReadAllText(
+                (Join-Path $PSScriptRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1')
+            ))
 
         # Structural: обидва бар'єри реально СТОЯТЬ там, де мають — перед
         # входом у restore sequence і безпосередньо перед bravocmd.exe, а не
@@ -15574,6 +15576,18 @@ try {
     $probeFunctionTexts = New-Object System.Collections.Generic.List[string]
     for ($probeIndex = 0; $probeIndex -lt $probeStepsStart; $probeIndex++) {
         $probeStatement = $probeStatements[$probeIndex]
+        if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            -not $probeStubNames.ContainsKey($probeStatement.Name)) {
+            $probeFunctionTexts.Add($probeStatement.Extent.Text)
+        }
+    }
+    # Цикл служб (#314) винесено в dot-source файл: його функції теж справжні.
+    $probeServiceCycleText = [IO.File]::ReadAllText(
+        (Join-Path $RepositoryRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1'), [Text.Encoding]::UTF8)
+    $probeServiceCycleErrors = $null
+    $probeServiceCycleAst = [Management.Automation.Language.Parser]::ParseInput($probeServiceCycleText, [ref]$null, [ref]$probeServiceCycleErrors)
+    if (@($probeServiceCycleErrors).Count -gt 0) { throw "ServiceCycle не парситься: $($probeServiceCycleErrors[0].Message)" }
+    foreach ($probeStatement in @($probeServiceCycleAst.EndBlock.Statements)) {
         if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
             -not $probeStubNames.ContainsKey($probeStatement.Name)) {
             $probeFunctionTexts.Add($probeStatement.Extent.Text)
