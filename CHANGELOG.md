@@ -2,6 +2,35 @@
 
 ## Не випущено (developer)
 
+- **Feat: профілі напрямків резервного копіювання — «куди копіювати» (#282, хвиля 2).**
+  Чотири профілі власника лягають на наявні пресети Configurator і пишуть наявні прапорці, без нових
+  ключів конфігурації: `Cloud` (Хмара, дефолт) = `LocalPlusSFTP`, `CloudAndSamba` = `LocalPlusSFTPAndSMB`,
+  `SambaOnly` = `LocalPlusSMB`, `LocalOnly` = `LocalOnly`. Таблиця пресетів винесена в чисту
+  `Get-BRAVOConfiguratorPresetOverrideSet` (поведінка `Invoke-BRAVOConfiguratorPreset` не змінилась), а профіль
+  будує `Get-BRAVOConfiguratorBackupDestinationProfile` поверх неї. Профілі з Samba додатково пишуть
+  `componentSettings.SMB.ArchiveCopy = $true`: дефолт `ArchiveCopy = $false`, і `SMB.Enabled` сам нічого не
+  копіює, тож профіль «Samba» без нього мовчки не давав би копії на NAS. `SambaOnly` вмикає
+  `BAZA_APP_LOCAL`/`BAZA_WWW_LOCAL`, бо BAZA-over-SMB немає, а `BAZA_*_SFTP` без SFTP не діють. Пресет
+  Configurator на налаштованому сервері, як і раніше, не чіпає `ArchiveUpload`/`ArchiveCopy`.
+  `deploy\Install-BRAVOServer.ps1` отримав `-BackupDestination` (ValidateSet, дефолт `Cloud`): профіль
+  застосовується лише з `-SeedLocalConfig` і лише до НОВОГО `BRAVO.local.config`, який пише канонічний
+  `New-BRAVOConfiguratorSeedLocalConfig` (той самий серіалізатор і перевірка повторним читанням із
+  відкатом, що й Apply; атомарний запис без перезапису). Наявний файл не змінюється, і інсталятор
+  повідомляє, який профіль не застосовано. Глобальний дефолт `SMB.Enabled` не змінено: розгорнуті
+  сервери поводяться як раніше, а «Samba вимкнено» для нових інсталяцій — явне значення в новому файлі.
+  Health показує вимкнений головним вимикачем напрямок одним INFO-рядком у підсумку консолі
+  (`Complete-BRAVOHealthResult`) і у звіті «ВСЕ СПРАВНО»: «Хмара (SFTP): вимкнено конфігурацією»,
+  «NAS/SMB: вимкнено конфігурацією» (`Get-BRAVOHealthDisabledDestinationLines`), без WARNING і без зміни
+  коду завершення. «Лише локально» охоплює дані й журнали; сповіщення, Operations і запит публічної IP —
+  ні (рішення власника). Новий набір self-test `BackupDestinations`: точні прапорці кожного профілю,
+  ефективні напрямки через канонічні функції, запис нового й незмінність наявного файлу (реальний блок
+  кроку 4 інсталятора в окремому процесі), рядки Health, і сторож вихідних каналів
+  `BackupDestinations/EveryOutboundChannelGatedByStorageEffective`: кожне місце runtime-коду, що
+  відкриває WinSCP-сесію чи процес WinSCP.com або підключає NAS через `New-PSDrive`, має бути досяжне
+  лише під `storageEffective.SFTP`/`SMB` (AST-аналіз умов, ранніх виходів і всіх викликів функції).
+  Винятки названо з причиною: `BRAVO_BAZA_RECONCILE.ps1` і ручне відновлення
+  `BRAVO_DATA_RESTORE.ps1 -Source SFTP`.
+
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
   `Get-BRAVOCredentialSecureSecret` у приватний `Add-BRAVOCredentialReadSecretRecord` із власним try/catch: збій обліку

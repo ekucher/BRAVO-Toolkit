@@ -29,7 +29,14 @@ atomic activation, автозавантаження за розкладом і �
 .\Install-BRAVOServer.ps1
 .\Install-BRAVOServer.ps1 -ZipPath D:\dist\BRAVO-Toolkit-5.2.4.zip
 .\Install-BRAVOServer.ps1 -RuntimeRoot 'D:\BRAVO' -SeedLocalConfig -SkipSelfTest
+.\Install-BRAVOServer.ps1 -SeedLocalConfig -BackupDestination LocalOnly
 ```
+
+`-BackupDestination` — профіль напрямків для нового `BRAVO.local.config`
+(лише разом із `-SeedLocalConfig`): `Cloud` (дефолт: хмара SFTP, Samba
+вимкнено), `CloudAndSamba`, `SambaOnly`, `LocalOnly`. Таблиця профілів —
+README, розділ 3.1. Якщо `BRAVO.local.config` уже є, профіль не
+застосовується, і скрипт це повідомляє.
 
 Зупиняється до налаштування: credentials і завдання Планувальника лишаються
 за інтерактивним `BRAVO_SETUP.ps1`. Наявну інсталяцію не оновлює — відмовляє
@@ -175,10 +182,12 @@ releaseChannel відсутній                         -> ВІДМОВА
   щось, що треба «полагодити». Мовчки створений активний override був би
   зміною конфігурації, якої оператор не просив;
 - **інсталяція створює його лише на явний запит.** `Install-BRAVOServer.ps1`
-  копіює приклад в активний файл **тільки** з `-SeedLocalConfig`; якщо файл
-  уже є — не чіпає його взагалі. Приклад містить рівно один активний рядок
-  (`configSchemaVersion = 2`), тому скопійований файл валідний, версійований
-  і при цьому нічого не перевизначає;
+  створює активний файл **тільки** з `-SeedLocalConfig`; якщо файл уже є —
+  не чіпає його взагалі. Новий файл пише канонічний код Configurator
+  (`New-BRAVOConfiguratorSeedLocalConfig`: той самий серіалізатор і
+  перевірка повторним читанням, що й Apply): маркер версії формату й рівно
+  прапорці профілю `-BackupDestination` (дефолт `Cloud`). Повний каталог
+  ключів лишається в `BRAVO.local.config.example` поруч;
 - **site-файл ніколи не потрапляє в артефакт.** `BRAVO.local.config` у
   `.gitignore`, а `ci\New-BRAVOReleaseArtifact.ps1` збирає zip виключно
   через `git archive`. Тому файл одного сервера фізично не може приїхати на

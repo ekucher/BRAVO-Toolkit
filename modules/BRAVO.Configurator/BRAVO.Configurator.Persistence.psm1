@@ -653,11 +653,106 @@ function Invoke-BRAVOConfiguratorApply {
     }
 }
 
+function New-BRAVOConfiguratorSeedLocalConfig {
+    <#
+    .SYNOPSIS
+        Створює НОВИЙ BRAVO.local.config із заданого набору override-значень
+        (інсталятор, -SeedLocalConfig). Наявний файл ніколи не змінюється.
+    .DESCRIPTION
+        Той самий серіалізатор (ConvertTo-BRAVOConfiguratorLocalConfigText)
+        і та сама перевірка після запису з відкатом
+        (Test-BRAVOConfiguratorPostApplyVerification, канонічний
+        Read-BRAVOLocalConfigurationOverrides), що й Invoke-BRAVOConfiguratorApply;
+        другого запису чи парсера site-файлу тут немає.
+
+        Повний Apply-конвеєр (Model, обчислення Effective дочірнім
+        процесом, race-перевірки наявного файлу) для нового файлу не
+        потрібен: файлу ще немає, тому нема чого зливати й відкочувати до
+        backup. Запис атомарний і без перезапису: тимчасовий файл у тому
+        самому каталозі переноситься [IO.File]::Move, який відмовляє, якщо
+        BRAVO.local.config з'явився паралельно.
+    .OUTPUTS
+        [pscustomobject] { Created; Stage; Path; Reasons; AppliedPaths }
+        Stage: Complete | Exists | Serialization | Write | PostApplyVerification
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$ConfigDirectory,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Overrides
+    )
+
+    $localConfigPath = Join-Path $ConfigDirectory 'BRAVO.local.config'
+    if (Test-Path -LiteralPath $localConfigPath) {
+        return [pscustomobject]@{
+            Created      = $false
+            Stage        = 'Exists'
+            Path         = $localConfigPath
+            Reasons      = @('BRAVO.local.config уже існує — файл не змінено.')
+            AppliedPaths = @()
+        }
+    }
+
+    $mergedOverrides = @{}
+    foreach ($overrideKey in @($Overrides.Keys)) {
+        $mergedOverrides[[string]$overrideKey] = $Overrides[$overrideKey]
+    }
+    try {
+        $candidateText = ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides $mergedOverrides
+    } catch {
+        return [pscustomobject]@{
+            Created      = $false
+            Stage        = 'Serialization'
+            Path         = $localConfigPath
+            Reasons      = @("Не вдалося серіалізувати BRAVO.local.config: $($_.Exception.Message). Файл не створено.")
+            AppliedPaths = @()
+        }
+    }
+
+    $tempWritePath = "$localConfigPath.tmp-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        [IO.File]::WriteAllText($tempWritePath, $candidateText, (New-Object System.Text.UTF8Encoding($false)))
+        [IO.File]::Move($tempWritePath, $localConfigPath)
+    } catch {
+        Remove-Item -LiteralPath $tempWritePath -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{
+            Created      = $false
+            Stage        = 'Write'
+            Path         = $localConfigPath
+            Reasons      = @("Не вдалося записати BRAVO.local.config: $($_.Exception.Message). Наявний файл (якщо з'явився паралельно) не змінено.")
+            AppliedPaths = @()
+        }
+    }
+
+    # Порожній BackupPath: до запису файлу не було, тож відкат видаляє його.
+    $postWriteFailure = Test-BRAVOConfiguratorPostApplyVerification `
+        -RuntimeRoot $RuntimeRoot -ProductionConfigDirectory $ConfigDirectory `
+        -ProductionConfigPath $localConfigPath -BackupPath ''
+    if ($null -ne $postWriteFailure) {
+        return [pscustomobject]@{
+            Created      = $false
+            Stage        = 'PostApplyVerification'
+            Path         = $localConfigPath
+            Reasons      = @($postWriteFailure.Reasons)
+            AppliedPaths = @()
+        }
+    }
+
+    return [pscustomobject]@{
+        Created      = $true
+        Stage        = 'Complete'
+        Path         = $localConfigPath
+        Reasons      = @()
+        AppliedPaths = @($mergedOverrides.Keys | Sort-Object)
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-BRAVOConfiguratorProductionOverrideState',
     'Merge-BRAVOConfiguratorCandidateOverrides',
     'Test-BRAVOConfiguratorCandidateOverrides',
     'ConvertTo-BRAVOConfiguratorLocalConfigText',
     'Test-BRAVOConfiguratorPostApplyVerification',
-    'Invoke-BRAVOConfiguratorApply'
+    'Invoke-BRAVOConfiguratorApply',
+    'New-BRAVOConfiguratorSeedLocalConfig'
 )

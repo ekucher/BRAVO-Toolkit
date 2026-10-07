@@ -344,6 +344,50 @@ componentSettings.SMB.Enabled
 Приклади override у `BRAVO.local.config` — розділ "Глобальні вимикачі
 зовнішніх сховищ" у `BRAVO.local.config.example`.
 
+#### Профілі напрямків резервного копіювання
+
+Профіль — назва для пари головних вимикачів; нових ключів конфігурації
+немає. Відображення має одне джерело —
+`Get-BRAVOConfiguratorBackupDestinationProfile`
+(`modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1`), побудоване
+поверх наборів пресетів Configurator.
+
+| Профіль (`-BackupDestination`) | Пресет Configurator | `SFTP.Enabled` | `SMB.Enabled` | `SMB.ArchiveCopy` | BAZA |
+|---|---|---|---|---|---|
+| `Cloud` — Хмара (дефолт) | `LocalPlusSFTP` | `$true` | `$false` | — | `BAZA_*_SFTP = $true`, `BAZA_*_LOCAL = $false` |
+| `CloudAndSamba` — Хмара + Samba | `LocalPlusSFTPAndSMB` | `$true` | `$true` | `$true` | як `Cloud` |
+| `SambaOnly` — Лише Samba | `LocalPlusSMB` | `$false` | `$true` | `$true` | `BAZA_*_LOCAL = $true` |
+| `LocalOnly` — Лише локально | `LocalOnly` | `$false` | `$false` | — | `BAZA_*_LOCAL = $true` |
+
+Профіль застосовує `deploy\Install-BRAVOServer.ps1 -SeedLocalConfig
+-BackupDestination <профіль>` і **лише** до нового `BRAVO.local.config`;
+наявний файл ніколи не змінюється (інсталятор повідомляє, що профіль не
+застосовано). Тому розгорнуті сервери поведінку не змінюють, а глобальний
+дефолт `SMB.Enabled = $true` лишається як був: «Samba вимкнено» для нових
+інсталяцій дає явне значення в новому файлі.
+
+Чому профілі з Samba пишуть `SMB.ArchiveCopy = $true`: дефолт
+`ArchiveCopy` — `$false`, а `SMB.Enabled` сам по собі нічого не копіює.
+`SambaOnly` вмикає локальну BAZA, бо BAZA-over-SMB не існує, а
+`BAZA_*_SFTP` при вимкненому SFTP не діють. Пресет Configurator на вже
+налаштованому сервері, як і раніше, перемикає лише головні вимикачі (і
+BAZA-прапорці) та не чіпає `ArchiveUpload`/`ArchiveCopy`.
+
+«Лише локально» охоплює дані й журнали: архіви, BAZA SFTP-синхронізацію,
+вивантаження журналів Trace/exchangAPI і власних журналів. Сповіщення
+Slack/Discord, Operations-звітність і запит публічної IP цей профіль не
+вимикає (рішення власника). Self-test
+`BackupDestinations/EveryOutboundChannelGatedByStorageEffective` перевіряє,
+що кожне місце runtime-коду, яке відкриває WinSCP-сесію чи процес
+WinSCP.com або підключає NAS через `New-PSDrive`, досяжне лише під
+`storageEffective.SFTP`/`SMB`; винятки — ручні інструменти оператора
+(`BRAVO_BAZA_RECONCILE.ps1`, `BRAVO_DATA_RESTORE.ps1 -Source SFTP`).
+
+Health показує свідомо вимкнений напрямок одним інформаційним рядком у
+підсумку консолі й у звіті «ВСЕ СПРАВНО» (`Хмара (SFTP): вимкнено
+конфігурацією`, `NAS/SMB: вимкнено конфігурацією`), без WARNING і без
+рядків по компонентах.
+
 > Обмеження: `SMB.Enabled` не керує UNC-шляхами в `pathSettings`
 > (наприклад, `BackupRoot`, якщо він вказаний як `\\server\share`) —
 > це окремий, не пов'язаний з `componentSettings.SMB` механізм.

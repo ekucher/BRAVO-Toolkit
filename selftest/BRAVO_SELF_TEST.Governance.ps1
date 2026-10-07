@@ -4269,7 +4269,8 @@ Test-BRAVOCondition `
     -Failure "deploy\Update-BRAVOServer.ps1 не повинен створювати активний BRAVO.local.config із прикладу — мовчазний override є зміною конфігурації, якої оператор не просив"
 
 # --- Install/DoesNotTreatExampleAsActiveConfig ---
-# Інсталяція копіює приклад ЛИШЕ на явний -SeedLocalConfig і ніколи не
+# Інсталяція створює site-файл ЛИШЕ на явний -SeedLocalConfig (з #282,
+# хвиля 2, — профілем напрямків, а не копією прикладу) і ніколи не
 # перезаписує наявний файл.
 Test-BRAVOCondition `
     -Condition (

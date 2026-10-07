@@ -250,6 +250,41 @@ function Get-BRAVOHealthSummaryResult {
     }
 }
 
+function Get-BRAVOHealthDisabledDestinationLines {
+    # Хвиля 2 «куди копіювати» (#282): напрямок, вимкнений головним
+    # вимикачем (componentSettings.SFTP.Enabled / SMB.Enabled = $false,
+    # канонічний Get-BRAVOEffectiveStorageConfiguration), — свідомий вибір
+    # профілю, а не збій. У підсумку консолі й у звіті «ВСЕ СПРАВНО» він
+    # дає рівно один інформаційний рядок на напрямок, ніколи WARNING і без
+    # похідних рядків по компонентах. Чиста функція: стан передається
+    # параметром, бо підсумок будують і ранні виходи, де конфігурацію ще не
+    # завантажено ($null -> жодного рядка).
+    param($StorageEffective)
+
+    if ($null -eq $StorageEffective) {
+        return @()
+    }
+    $disabledDestinations = @()
+    foreach ($destination in @(
+        @{ Name = 'SFTP'; Label = 'Хмара (SFTP)' },
+        @{ Name = 'SMB';  Label = 'NAS/SMB' }
+    )) {
+        $destinationProperty = $StorageEffective.PSObject.Properties[$destination.Name]
+        if ($null -eq $destinationProperty -or $null -eq $destinationProperty.Value) {
+            continue
+        }
+        $enabledProperty = $destinationProperty.Value.PSObject.Properties['Enabled']
+        if ($null -ne $enabledProperty -and -not [bool]$enabledProperty.Value) {
+            $disabledDestinations += [pscustomobject]@{
+                Destination = $destination.Name
+                Label = $destination.Label
+                Text = ($destination.Label + ': вимкнено конфігурацією')
+            }
+        }
+    }
+    return $disabledDestinations
+}
+
 function Complete-BRAVOHealthResult {
     param([Parameter(Mandatory = $true)]$Result)
 
@@ -433,6 +468,13 @@ function Complete-BRAVOHealthResult {
                 if ($null -ne $property -and $null -ne $property.Value) {
                     Write-BRAVOResultField -Label $destination.Title -Value ([string]$property.Value)
                 }
+            }
+            # Напрямок, вимкнений головним вимикачем, — один рядок замість
+            # мовчазної відсутності: оператор бачить, що копії туди не
+            # робляться свідомо (#282, хвиля 2).
+            $summaryStorageEffective = Get-Variable -Name storageEffective -ValueOnly -ErrorAction SilentlyContinue
+            foreach ($disabledDestination in @(Get-BRAVOHealthDisabledDestinationLines -StorageEffective $summaryStorageEffective)) {
+                Write-BRAVOResultField -Label $disabledDestination.Label -Value 'вимкнено конфігурацією'
             }
             if ($script:BRAVOHealthNotificationStepEnabled -and
                 $null -ne $Result.PSObject.Properties['Notification']) {
@@ -4882,6 +4924,10 @@ function New-SlackSuccessMessage {
         $backupMonitoring.SMB.CheckArchiveCopies -and
         [bool]$storageEffective.SMB.ArchiveCopy) {
         $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":minidisc:" -Name "SMB"))
+    }
+    # #282, хвиля 2: свідомо вимкнений напрямок — один INFO-рядок.
+    foreach ($disabledDestination in @(Get-BRAVOHealthDisabledDestinationLines -StorageEffective $storageEffective)) {
+        $resultLines.Add(":information_source: $($disabledDestination.Text)")
     }
 
     $enabledComponentCount = @(Get-EnabledBackupComponentNames).Count

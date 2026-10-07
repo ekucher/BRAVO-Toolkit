@@ -1147,6 +1147,19 @@ Health-моніторинг, `BRAVO_DRY_RUN.ps1` проби) і знімає в�
 
 Задавайте через `BRAVO.local.config` (приклад — `BRAVO.local.config.example`).
 
+**Профілі для нової інсталяції.** `deploy\Install-BRAVOServer.ps1
+-SeedLocalConfig -BackupDestination Cloud|CloudAndSamba|SambaOnly|LocalOnly`
+(дефолт `Cloud`: SFTP увімкнено, Samba вимкнено явно) записує вимикачі в
+новий `BRAVO.local.config`; наявний файл не змінюється. Таблиця профілів і
+пояснення, чому профілі з Samba пишуть `SMB.ArchiveCopy = $true`, — README,
+розділ 3.1 «Профілі напрямків резервного копіювання». Для `CloudAndSamba` і
+`SambaOnly` задайте `smbSettings.RootPath` до `BRAVO_SETUP.ps1`.
+
+**Як це видно в Health.** Підсумок консолі й звіт «ВСЕ СПРАВНО» мають по
+одному рядку на вимкнений напрямок: `Хмара (SFTP): вимкнено конфігурацією`,
+`NAS/SMB: вимкнено конфігурацією`. Це INFO: код завершення й лічильник
+попереджень не змінюються, рядків «прострочено» по компонентах немає.
+
 **Що продовжує працювати в local-only режимі:** локальна архівація
 `MODEL`/`BLOG`/`BRAVOEXCH`, локальна BAZA, службовий Health, локальний
 backup Health, notifications. Scheduled завдання

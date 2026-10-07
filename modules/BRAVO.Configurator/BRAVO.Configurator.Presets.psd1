@@ -6,7 +6,7 @@
     # Залежить від BRAVO.Configurator.Model (Set-BRAVOConfiguratorOverride)
     # — RequiredModules навмисно НЕ оголошено, див. пояснення в
     # BRAVO.Configurator.Model.psd1.
-    FunctionsToExport = @('Get-BRAVOConfiguratorPresetCatalog', 'Invoke-BRAVOConfiguratorPreset')
+    FunctionsToExport = @('Get-BRAVOConfiguratorPresetCatalog', 'Invoke-BRAVOConfiguratorPreset', 'Get-BRAVOConfiguratorPresetOverrideSet', 'Get-BRAVOConfiguratorBackupDestinationProfile')
     VariablesToExport = @()
     CmdletsToExport = @()
     AliasesToExport = @()

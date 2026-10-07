@@ -5,6 +5,15 @@ param(
     [string]$ZipPath,
     [string]$StagingRoot = 'C:\Temp\BRAVO_INSTALL',
     [switch]$SeedLocalConfig,
+    # Профіль напрямків резервного копіювання для НОВОГО BRAVO.local.config
+    # (лише разом із -SeedLocalConfig; наявний файл не змінюється):
+    #   Cloud         — хмара SFTP, Samba вимкнено (дефолт);
+    #   CloudAndSamba — хмара SFTP і копія на NAS/SMB;
+    #   SambaOnly     — лише NAS/SMB, SFTP вимкнено;
+    #   LocalOnly     — жодної копії за межі сервера.
+    # Відображення профіль -> прапорці: Get-BRAVOConfiguratorBackupDestinationProfile.
+    [ValidateSet('Cloud', 'CloudAndSamba', 'SambaOnly', 'LocalOnly')]
+    [string]$BackupDestination = 'Cloud',
     [switch]$AllowPrereleaseChannel,
     [switch]$SkipSelfTest,
     [switch]$Force,
@@ -152,6 +161,9 @@ if (-not $isElevated) {
         [void]$argumentParts.Add('-StagingRoot'); [void]$argumentParts.Add('"' + $StagingRoot + '"')
     }
     if ($SeedLocalConfig) { [void]$argumentParts.Add('-SeedLocalConfig') }
+    if ($PSBoundParameters.ContainsKey('BackupDestination')) {
+        [void]$argumentParts.Add('-BackupDestination'); [void]$argumentParts.Add($BackupDestination)
+    }
     if ($AllowPrereleaseChannel) { [void]$argumentParts.Add('-AllowPrereleaseChannel') }
     if ($SkipSelfTest) { [void]$argumentParts.Add('-SkipSelfTest') }
     if ($Force) { [void]$argumentParts.Add('-Force') }
@@ -411,18 +423,45 @@ Write-Step '4. Шар site-відмінностей'
 
 $localConfig = Join-Path $RuntimeRoot 'BRAVO.local.config'
 $localExample = Join-Path $RuntimeRoot 'BRAVO.local.config.example'
+$backupDestinationExplicit = $PSBoundParameters.ContainsKey('BackupDestination')
+$backupDestinationSkippedExisting = $false
 if (Test-Path -LiteralPath $localConfig -PathType Leaf) {
     Write-Ok 'BRAVO.local.config уже існує — не чіпаємо'
+    $backupDestinationSkippedExisting = $SeedLocalConfig -or $backupDestinationExplicit
 } elseif ($SeedLocalConfig) {
-    if (-not (Test-Path -LiteralPath $localExample -PathType Leaf)) {
-        throw ('Немає прикладу ' + $localExample)
+    # Новий файл пише канонічний код Configurator (той самий серіалізатор і
+    # перевірка повторним читанням, що й Apply) — інсталятор не має власного
+    # запису чи парсера BRAVO.local.config. Модулі вже розгорнуто з архіву,
+    # SHA-256 якого звірено в кроці 1.
+    $configuratorModuleRoot = Join-Path $RuntimeRoot 'modules\BRAVO.Configurator'
+    foreach ($configuratorModuleName in @('BRAVO.Configurator.Effective', 'BRAVO.Configurator.Persistence', 'BRAVO.Configurator.Presets')) {
+        Import-Module -Name (Join-Path $configuratorModuleRoot ($configuratorModuleName + '.psm1')) -Force -ErrorAction Stop
     }
-    Copy-Item -LiteralPath $localExample -Destination $localConfig
-    Write-Ok ('створено з прикладу: ' + $localConfig)
-    Write-Warn2 'усі ключі в ньому закоментовані — внесіть site-відмінності ДО BRAVO_SETUP.'
+    $destinationProfile = Get-BRAVOConfiguratorBackupDestinationProfile -Destination $BackupDestination
+    $seedResult = New-BRAVOConfiguratorSeedLocalConfig -RuntimeRoot $RuntimeRoot `
+        -ConfigDirectory $RuntimeRoot -Overrides $destinationProfile.Overrides
+    if (-not $seedResult.Created) {
+        throw ('BRAVO.local.config не створено (' + $seedResult.Stage + '): ' + (@($seedResult.Reasons) -join ' '))
+    }
+    Write-Ok ('створено: ' + $localConfig)
+    Write-Ok ('профіль напрямків: ' + $BackupDestination + ' — ' + $destinationProfile.Label)
+    foreach ($appliedPath in @($seedResult.AppliedPaths)) {
+        Write-Note ($appliedPath + ' = ' + [string]$destinationProfile.Overrides[$appliedPath])
+    }
+    if ([bool]$destinationProfile.Overrides['componentSettings.SMB.ArchiveCopy']) {
+        Write-Warn2 'для Samba задайте smbSettings.RootPath (UNC \\сервер\ресурс) у BRAVO.local.config ДО BRAVO_SETUP.'
+    }
+    Write-Note ('інші site-відмінності — за каталогом ключів ' + $localExample)
 } else {
     Write-Note ('не створено (додайте -SeedLocalConfig або скопіюйте вручну з ' +
         'BRAVO.local.config.example)')
+    if ($backupDestinationExplicit) {
+        Write-Warn2 ('профіль напрямків ' + $BackupDestination + ' НЕ застосовано: він діє лише разом із -SeedLocalConfig')
+    }
+}
+if ($backupDestinationSkippedExisting) {
+    Write-Note ('профіль напрямків ' + $BackupDestination + ' НЕ застосовано: наявний файл не змінюється ' +
+        '(напрямки задає BRAVO_CONFIGURATOR.ps1)')
 }
 Write-Note 'BRAVO.config з комплекту не редагується — site-значення належать BRAVO.local.config.'
 
