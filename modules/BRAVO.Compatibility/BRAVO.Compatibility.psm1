@@ -1699,6 +1699,25 @@ function ConvertTo-BRAVOWindowsCommandLineArgument {
     return $builder.ToString()
 }
 
+function ConvertTo-BRAVOWinSCPFileMask {
+    # WinSCP .NET трактує останній сегмент локального джерела PutFiles,
+    # шляху RemoveFiles і джерела MoveFile (скриптові put/rm/mv) як файлову
+    # маску: `*`, `?` і `[...]` — шаблони. Windows дозволяє `[`/`]` в іменах,
+    # тож без екранування `Trace[1].mdz` збігся б з `Trace1.mdz` (#366).
+    # Правило те саме, що RemotePath.EscapeFileMask: лише останній сегмент
+    # (після останнього `/` або `\`), `[` -> `[[]`, `*` -> `[*]`, `?` -> `[?]`.
+    # Каталог не змінюється: маска в ньому не діє. FileExists/GetFileInfo
+    # приймають буквальний шлях і екранування не потребують.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path
+    )
+    $separatorIndex = $Path.LastIndexOfAny([char[]]@('/', '\'))
+    $directoryPart = $Path.Substring(0, $separatorIndex + 1)
+    $leaf = $Path.Substring($separatorIndex + 1)
+    return ($directoryPart + $leaf.Replace('[', '[[]').Replace('*', '[*]').Replace('?', '[?]'))
+}
+
 function Write-BRAVOProcessInputText {
     # Детермінований запис у stdin дочірнього процесу: UTF-8 БЕЗ BOM через
     # BaseStream, незалежно від кодування StreamWriter-а StandardInput
