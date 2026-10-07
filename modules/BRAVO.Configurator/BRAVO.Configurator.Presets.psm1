@@ -23,8 +23,9 @@
 # Хвиля 2 «куди копіювати» (#282): набір значень кожного preset-а винесено
 # в чисту Get-BRAVOConfiguratorPresetOverrideSet; профілі напрямків
 # інсталятора (Get-BRAVOConfiguratorBackupDestinationProfile:
-# Cloud/CloudAndSamba/SambaOnly/LocalOnly) будуються поверх того самого
-# набору, а не власної копії таблиці прапорців.
+# Cloud/CloudAndSamba/SambaOnly/LocalOnly) мають власні явні набори, бо
+# свідомо відрізняються від UI-пресетів: BAZA_*_SFTP лишаються на
+# конфігураційних дефолтах (див. докстрінг функції).
 
 Set-StrictMode -Version 2.0
 
@@ -98,8 +99,8 @@ function Invoke-BRAVOConfiguratorPreset {
     )
 
     # Набір override-значень preset-а має одне джерело —
-    # Get-BRAVOConfiguratorPresetOverrideSet; той самий набір бере профіль
-    # напрямків інсталятора (Get-BRAVOConfiguratorBackupDestinationProfile).
+    # Get-BRAVOConfiguratorPresetOverrideSet (профілі напрямків інсталятора
+    # мають власні явні набори — див. Get-BRAVOConfiguratorBackupDestinationProfile).
     # Порядок застосування й шляхи ті самі, що й до винесення.
     $overrideSet = Get-BRAVOConfiguratorPresetOverrideSet -PresetName $PresetName
     if ($overrideSet.Count -eq 0) {
@@ -170,31 +171,38 @@ function Get-BRAVOConfiguratorBackupDestinationProfile {
         override-значень для НОВОГО BRAVO.local.config.
     .DESCRIPTION
         Рішення власника (хвиля 2 «куди копіювати»): чотири профілі
-        відображаються на наявні пресети, і profile не вводить нових
-        листів конфігурації:
+        інсталятора відповідають топологіям наявних пресетів Configurator
+        і не вводять нових листів конфігурації:
 
-          Cloud          (Хмара, дефолт)  -> LocalPlusSFTP
-          CloudAndSamba  (Хмара + Samba)  -> LocalPlusSFTPAndSMB
-          SambaOnly      (Лише Samba)     -> LocalPlusSMB
-          LocalOnly      (Лише локально)  -> LocalOnly
+          Cloud          (Хмара, дефолт)  ~ LocalPlusSFTP
+          CloudAndSamba  (Хмара + Samba)  ~ LocalPlusSFTPAndSMB
+          SambaOnly      (Лише Samba)     ~ LocalPlusSMB
+          LocalOnly      (Лише локально)  ~ LocalOnly
 
-        Відмінності від пресета Configurator (лише для нового файлу, де
-        немає попередніх дочірніх значень, які можна було б стерти):
+        Набори значень профілів визначено ЯВНО, а не похідно від
+        Get-BRAVOConfiguratorPresetOverrideSet, бо вони свідомо
+        відрізняються від UI-пресетів (сам UI-preset лишається без змін):
 
-          * профілі з Samba додатково пишуть
-            componentSettings.SMB.ArchiveCopy = $true. Дефолт ArchiveCopy —
-            $false, а SMB.Enabled сам по собі нічого не копіює
-            (Get-BRAVOEffectiveStorageConfiguration: ArchiveCopy = Enabled
-            AND child), тож профіль «Samba» без цього прапорця мовчки не
-            давав би жодної копії на NAS;
-          * SambaOnly додатково пише BAZA_APP_LOCAL/BAZA_WWW_LOCAL = $true:
-            BAZA-over-SMB transport не існує, а BAZA_*_SFTP при вимкненому
-            SFTP ефективно вимкнені, тож без локальної синхронізації BAZA
-            лишилась би без жодної копії (той самий вибір, що LocalOnly).
+          * правило власника: дефолти нової інсталяції дорівнюють
+            дефолтам конфігурації, крім вимикачів напрямків. Тому профілі
+            з SFTP НЕ пишуть BAZA-прапорців: BAZA_*_SFTP лишаються на
+            конфігураційних дефолтах (BAZA_WWW_SFTP за замовчуванням
+            $false і вмикається свідомо для конкретного сервера), тоді як
+            UI-пресети LocalPlusSFTP/LocalPlusSFTPAndSMB вмикають
+            BAZA_APP_SFTP/BAZA_WWW_SFTP;
+          * профілі з Samba пишуть componentSettings.SMB.ArchiveCopy =
+            $true. Дефолт ArchiveCopy — $false, а SMB.Enabled сам по собі
+            нічого не копіює (Get-BRAVOEffectiveStorageConfiguration:
+            ArchiveCopy = Enabled AND child), тож профіль «Samba» без
+            цього прапорця мовчки не давав би жодної копії на NAS;
+          * профілі без SFTP (SambaOnly, LocalOnly) пишуть
+            BAZA_APP_LOCAL/BAZA_WWW_LOCAL = $true: BAZA-over-SMB transport
+            не існує, а BAZA_*_SFTP при вимкненому SFTP ефективно вимкнені,
+            тож без локальної синхронізації BAZA лишилась би без жодної
+            копії.
 
-        Сам preset Configurator і далі не торкається ArchiveUpload/
-        ArchiveCopy (Invoke-BRAVOConfiguratorPreset), бо він застосовується
-        до вже налаштованого сервера.
+        PresetName — довідкова відповідність UI-пресету для повідомлень,
+        а не джерело значень.
     .OUTPUTS
         [pscustomobject] { Destination; PresetName; Label; Overrides }
     #>
@@ -207,20 +215,38 @@ function Get-BRAVOConfiguratorBackupDestinationProfile {
 
     $presetName = $null
     $label = $null
+    $overrides = [ordered]@{}
     switch ($Destination) {
-        'Cloud'         { $presetName = 'LocalPlusSFTP';       $label = 'Хмара (SFTP)' }
-        'CloudAndSamba' { $presetName = 'LocalPlusSFTPAndSMB'; $label = 'Хмара (SFTP) + Samba (NAS/SMB)' }
-        'SambaOnly'     { $presetName = 'LocalPlusSMB';        $label = 'Лише Samba (NAS/SMB)' }
-        'LocalOnly'     { $presetName = 'LocalOnly';           $label = 'Лише локально' }
-    }
-
-    $overrides = Get-BRAVOConfiguratorPresetOverrideSet -PresetName $presetName
-    if ([bool]$overrides['componentSettings.SMB.Enabled']) {
-        $overrides['componentSettings.SMB.ArchiveCopy'] = $true
-    }
-    if ($Destination -eq 'SambaOnly') {
-        $overrides['componentSettings.Synchronization.BAZA_APP_LOCAL'] = $true
-        $overrides['componentSettings.Synchronization.BAZA_WWW_LOCAL'] = $true
+        'Cloud' {
+            $presetName = 'LocalPlusSFTP'
+            $label = 'Хмара (SFTP)'
+            $overrides['componentSettings.SFTP.Enabled'] = $true
+            $overrides['componentSettings.SMB.Enabled'] = $false
+        }
+        'CloudAndSamba' {
+            $presetName = 'LocalPlusSFTPAndSMB'
+            $label = 'Хмара (SFTP) + Samba (NAS/SMB)'
+            $overrides['componentSettings.SFTP.Enabled'] = $true
+            $overrides['componentSettings.SMB.Enabled'] = $true
+            $overrides['componentSettings.SMB.ArchiveCopy'] = $true
+        }
+        'SambaOnly' {
+            $presetName = 'LocalPlusSMB'
+            $label = 'Лише Samba (NAS/SMB)'
+            $overrides['componentSettings.SFTP.Enabled'] = $false
+            $overrides['componentSettings.SMB.Enabled'] = $true
+            $overrides['componentSettings.SMB.ArchiveCopy'] = $true
+            $overrides['componentSettings.Synchronization.BAZA_APP_LOCAL'] = $true
+            $overrides['componentSettings.Synchronization.BAZA_WWW_LOCAL'] = $true
+        }
+        'LocalOnly' {
+            $presetName = 'LocalOnly'
+            $label = 'Лише локально'
+            $overrides['componentSettings.SFTP.Enabled'] = $false
+            $overrides['componentSettings.SMB.Enabled'] = $false
+            $overrides['componentSettings.Synchronization.BAZA_APP_LOCAL'] = $true
+            $overrides['componentSettings.Synchronization.BAZA_WWW_LOCAL'] = $true
+        }
     }
 
     return [pscustomobject]@{

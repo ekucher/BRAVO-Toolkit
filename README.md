@@ -349,13 +349,15 @@ componentSettings.SMB.Enabled
 Профіль — назва для пари головних вимикачів; нових ключів конфігурації
 немає. Відображення має одне джерело —
 `Get-BRAVOConfiguratorBackupDestinationProfile`
-(`modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1`), побудоване
-поверх наборів пресетів Configurator.
+(`modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1`). Топологія
+профілю відповідає пресету Configurator, але набір значень визначено явно:
+дефолти нової інсталяції дорівнюють дефолтам конфігурації, крім вимикачів
+напрямків.
 
 | Профіль (`-BackupDestination`) | Пресет Configurator | `SFTP.Enabled` | `SMB.Enabled` | `SMB.ArchiveCopy` | BAZA |
 |---|---|---|---|---|---|
-| `Cloud` — Хмара (дефолт) | `LocalPlusSFTP` | `$true` | `$false` | — | `BAZA_*_SFTP = $true`, `BAZA_*_LOCAL = $false` |
-| `CloudAndSamba` — Хмара + Samba | `LocalPlusSFTPAndSMB` | `$true` | `$true` | `$true` | як `Cloud` |
+| `Cloud` — Хмара (дефолт) | `LocalPlusSFTP` | `$true` | `$false` | — | не змінюється (дефолти) |
+| `CloudAndSamba` — Хмара + Samba | `LocalPlusSFTPAndSMB` | `$true` | `$true` | `$true` | не змінюється (дефолти) |
 | `SambaOnly` — Лише Samba | `LocalPlusSMB` | `$false` | `$true` | `$true` | `BAZA_*_LOCAL = $true` |
 | `LocalOnly` — Лише локально | `LocalOnly` | `$false` | `$false` | — | `BAZA_*_LOCAL = $true` |
 
@@ -368,10 +370,15 @@ componentSettings.SMB.Enabled
 
 Чому профілі з Samba пишуть `SMB.ArchiveCopy = $true`: дефолт
 `ArchiveCopy` — `$false`, а `SMB.Enabled` сам по собі нічого не копіює.
-`SambaOnly` вмикає локальну BAZA, бо BAZA-over-SMB не існує, а
-`BAZA_*_SFTP` при вимкненому SFTP не діють. Пресет Configurator на вже
-налаштованому сервері, як і раніше, перемикає лише головні вимикачі (і
-BAZA-прапорці) та не чіпає `ArchiveUpload`/`ArchiveCopy`.
+Профілі з SFTP не пишуть BAZA-прапорців: діють дефолти конфігурації
+(`BAZA_APP_SFTP = $true`, `BAZA_WWW_SFTP = $false`), а синхронізацію
+BAZA WWW через SFTP вмикають свідомо для конкретного сервера.
+`SambaOnly` і `LocalOnly` вмикають локальну BAZA (`BAZA_*_LOCAL = $true`),
+бо BAZA-over-SMB не існує, а `BAZA_*_SFTP` при вимкненому SFTP не діють.
+Пресет Configurator на вже налаштованому сервері, як і раніше, перемикає
+головні вимикачі й BAZA-прапорці (зокрема `LocalPlusSFTP` вмикає
+`BAZA_*_SFTP`) та не чіпає `ArchiveUpload`/`ArchiveCopy` — тому профілі
+інсталятора й пресети UI свідомо різняться BAZA-прапорцями.
 
 «Лише локально» охоплює дані й журнали: архіви, BAZA SFTP-синхронізацію,
 вивантаження журналів Trace/exchangAPI і власних журналів. Сповіщення

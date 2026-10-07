@@ -3,8 +3,11 @@
 # ============================================================
 # Рішення власника (дизайн «Резервне копіювання лише того, що є, і лише
 # туди, куди дозволено», розділи 4-6):
-#   * чотири профілі напрямків лягають на наявні пресети Configurator і
-#     пишуть наявні прапорці (Get-BRAVOConfiguratorBackupDestinationProfile);
+#   * чотири профілі напрямків відповідають топологіям наявних пресетів
+#     Configurator і пишуть лише наявні прапорці
+#     (Get-BRAVOConfiguratorBackupDestinationProfile); дефолти нової
+#     інсталяції дорівнюють дефолтам конфігурації, крім вимикачів напрямків
+#     (BAZA_*_SFTP профіль не чіпає: BAZA_WWW_SFTP вмикається свідомо);
 #   * профіль застосовує лише інсталятор і лише до НОВОГО BRAVO.local.config;
 #   * свідомо вимкнений напрямок у Health — один INFO-рядок, без WARNING;
 #   * «Лише локально» охоплює дані й журнали: жоден автоматичний прогін не
@@ -35,10 +38,6 @@ $bdExpectedProfiles = [ordered]@{
         Overrides = @{
             'componentSettings.SFTP.Enabled' = $true
             'componentSettings.SMB.Enabled' = $false
-            'componentSettings.Synchronization.BAZA_APP_LOCAL' = $false
-            'componentSettings.Synchronization.BAZA_APP_SFTP' = $true
-            'componentSettings.Synchronization.BAZA_WWW_LOCAL' = $false
-            'componentSettings.Synchronization.BAZA_WWW_SFTP' = $true
         }
     }
     CloudAndSamba = @{
@@ -47,10 +46,6 @@ $bdExpectedProfiles = [ordered]@{
             'componentSettings.SFTP.Enabled' = $true
             'componentSettings.SMB.Enabled' = $true
             'componentSettings.SMB.ArchiveCopy' = $true
-            'componentSettings.Synchronization.BAZA_APP_LOCAL' = $false
-            'componentSettings.Synchronization.BAZA_APP_SFTP' = $true
-            'componentSettings.Synchronization.BAZA_WWW_LOCAL' = $false
-            'componentSettings.Synchronization.BAZA_WWW_SFTP' = $true
         }
     }
     SambaOnly = @{
@@ -88,15 +83,21 @@ foreach ($bdDestination in @($bdExpectedProfiles.Keys)) {
         -Failure "профіль $bdDestination має відповідати preset $($bdExpected.PresetName) і писати рівно: $bdExpectedText; фактично preset=$($bdProfile.PresetName): $bdActualText"
 }
 
-# Профіль будується з канонічного набору preset-а, а не з власної копії
-# таблиці: усе, що пише preset, профіль пише так само.
+# Профіль має ту саму топологію, що й відповідний preset Configurator
+# (master-вимикачі SFTP/SMB збігаються), але свідомо не пише BAZA_*_SFTP:
+# ці прапорці лишаються на конфігураційних дефолтах (рішення власника).
 $bdPresetSubsetMismatches = @()
 foreach ($bdDestination in @($bdExpectedProfiles.Keys)) {
     $bdPresetSet = Get-BRAVOConfiguratorPresetOverrideSet -PresetName ([string]$bdProfiles[$bdDestination].PresetName)
-    foreach ($bdPath in @($bdPresetSet.Keys)) {
+    foreach ($bdPath in @('componentSettings.SFTP.Enabled', 'componentSettings.SMB.Enabled')) {
         if (-not $bdProfiles[$bdDestination].Overrides.Contains($bdPath) -or
             $bdProfiles[$bdDestination].Overrides[$bdPath] -ne $bdPresetSet[$bdPath]) {
             $bdPresetSubsetMismatches += "$bdDestination/$bdPath"
+        }
+    }
+    foreach ($bdPath in @($bdProfiles[$bdDestination].Overrides.Keys)) {
+        if ($bdPath -match '\.BAZA_(APP|WWW)_SFTP$') {
+            $bdPresetSubsetMismatches += "$bdDestination/$bdPath (BAZA SFTP не входить у профіль)"
         }
     }
 }
@@ -110,8 +111,8 @@ Test-BRAVOCondition -Condition (
     $bdPresetChildFlags.Count -eq 0 -and
     (Get-BRAVOConfiguratorPresetOverrideSet -PresetName 'Current').Count -eq 0 -and
     (Get-BRAVOConfiguratorPresetOverrideSet -PresetName 'Manual').Count -eq 0
-) -Name 'BackupDestinations/ProfilesExtendCanonicalPresetSets' `
-    -Failure "профіль має містити весь набір свого preset-а, а preset Configurator не торкається ArchiveUpload/ArchiveCopy; розбіжності: $($bdPresetSubsetMismatches -join ', '); дочірні прапорці в preset: $($bdPresetChildFlags -join ', ')"
+) -Name 'BackupDestinations/ProfilesMatchPresetTopology' `
+    -Failure "профіль має збігатися з preset-ом за master-вимикачами SFTP/SMB і не писати BAZA_*_SFTP, а preset Configurator не торкається ArchiveUpload/ArchiveCopy; розбіжності: $($bdPresetSubsetMismatches -join ', '); дочірні прапорці в preset: $($bdPresetChildFlags -join ', ')"
 
 # Invoke-BRAVOConfiguratorPreset застосовує саме канонічний набір (той
 # самий контракт після винесення таблиці в Get-BRAVOConfiguratorPresetOverrideSet).
@@ -202,7 +203,13 @@ foreach ($bdDestination in @($bdProfiles.Keys)) {
         -GlobalSftpEnabled ([bool]$bdStorage.SFTP.Enabled)
     $bdExpectSftp = @('Cloud', 'CloudAndSamba') -contains $bdDestination
     $bdExpectSmb = @('CloudAndSamba', 'SambaOnly') -contains $bdDestination
-    $bdBazaWithoutChannel = @($bdBaza.Components | Where-Object { -not [bool]$_.AnyEnabled } | ForEach-Object { $_.Name })
+    # Профілі з SFTP лишають BAZA на дефолтах комплекту: BAZA_WWW без
+    # каналу — дефолт (BAZA_WWW_SFTP вмикається свідомо). Профілі без SFTP
+    # мають тримати кожен BAZA-компонент хоча б локально.
+    $bdAllowedWithoutChannel = @()
+    if ($bdExpectSftp) { $bdAllowedWithoutChannel = @('BAZA_WWW') }
+    $bdBazaWithoutChannel = @($bdBaza.Components | Where-Object { -not [bool]$_.AnyEnabled } | ForEach-Object { $_.Name } |
+        Where-Object { $bdAllowedWithoutChannel -notcontains $_ })
     if ([bool]$bdStorage.SFTP.Enabled -ne $bdExpectSftp -or [bool]$bdStorage.SFTP.ArchiveUpload -ne $bdExpectSftp -or
         [bool]$bdStorage.SMB.Enabled -ne $bdExpectSmb -or [bool]$bdStorage.SMB.ArchiveCopy -ne $bdExpectSmb -or
         [bool]$bdBaza.ScheduledSftpSyncRequired -ne $bdExpectSftp -or $bdBazaWithoutChannel.Count -gt 0) {
@@ -213,7 +220,7 @@ foreach ($bdDestination in @($bdProfiles.Keys)) {
 }
 Test-BRAVOCondition -Condition ($bdEffectiveMismatches.Count -eq 0) `
     -Name 'BackupDestinations/ProfilesYieldExpectedEffectiveDestinations' `
-    -Failure "ефективні напрямки профілів (Хмара: лише SFTP; Хмара + Samba: SFTP і копія NAS; Лише Samba: лише копія NAS; Лише локально: нічого) і жодного BAZA-компонента без каналу: $($bdEffectiveMismatches -join ' | ')"
+    -Failure "ефективні напрямки профілів (Хмара: лише SFTP; Хмара + Samba: SFTP і копія NAS; Лише Samba: лише копія NAS; Лише локально: нічого) і жодного BAZA-компонента без каналу (крім дефолтного BAZA_WWW у профілях з SFTP): $($bdEffectiveMismatches -join ' | ')"
 
 # ------------------------------------------------------------
 # (3) Запис нового BRAVO.local.config канонічним кодом Configurator.

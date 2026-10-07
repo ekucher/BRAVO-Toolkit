@@ -3,13 +3,16 @@
 ## Не випущено (developer)
 
 - **Feat: профілі напрямків резервного копіювання — «куди копіювати» (#282, хвиля 2).**
-  Чотири профілі власника лягають на наявні пресети Configurator і пишуть наявні прапорці, без нових
-  ключів конфігурації: `Cloud` (Хмара, дефолт) = `LocalPlusSFTP`, `CloudAndSamba` = `LocalPlusSFTPAndSMB`,
-  `SambaOnly` = `LocalPlusSMB`, `LocalOnly` = `LocalOnly`. Таблиця пресетів винесена в чисту
-  `Get-BRAVOConfiguratorPresetOverrideSet` (поведінка `Invoke-BRAVOConfiguratorPreset` не змінилась), а профіль
-  будує `Get-BRAVOConfiguratorBackupDestinationProfile` поверх неї. Профілі з Samba додатково пишуть
+  Чотири профілі власника відповідають топологіям наявних пресетів Configurator і пишуть лише наявні
+  прапорці, без нових ключів конфігурації: `Cloud` (Хмара, дефолт) ~ `LocalPlusSFTP`, `CloudAndSamba` ~
+  `LocalPlusSFTPAndSMB`, `SambaOnly` ~ `LocalPlusSMB`, `LocalOnly` ~ `LocalOnly`. Таблиця пресетів винесена в
+  чисту `Get-BRAVOConfiguratorPresetOverrideSet` (поведінка `Invoke-BRAVOConfiguratorPreset` не змінилась), а
+  набори профілів `Get-BRAVOConfiguratorBackupDestinationProfile` визначено явно: дефолти нової інсталяції
+  дорівнюють дефолтам конфігурації, крім вимикачів напрямків, тож `Cloud`/`CloudAndSamba` не пишуть
+  BAZA-прапорців (`BAZA_WWW_SFTP` лишається `$false` і вмикається свідомо для сервера), на відміну від
+  UI-пресетів `LocalPlusSFTP`/`LocalPlusSFTPAndSMB`. Профілі з Samba додатково пишуть
   `componentSettings.SMB.ArchiveCopy = $true`: дефолт `ArchiveCopy = $false`, і `SMB.Enabled` сам нічого не
-  копіює, тож профіль «Samba» без нього мовчки не давав би копії на NAS. `SambaOnly` вмикає
+  копіює, тож профіль «Samba» без нього мовчки не давав би копії на NAS. `SambaOnly` і `LocalOnly` вмикають
   `BAZA_APP_LOCAL`/`BAZA_WWW_LOCAL`, бо BAZA-over-SMB немає, а `BAZA_*_SFTP` без SFTP не діють. Пресет
   Configurator на налаштованому сервері, як і раніше, не чіпає `ArchiveUpload`/`ArchiveCopy`.
   `deploy\Install-BRAVOServer.ps1` отримав `-BackupDestination` (ValidateSet, дефолт `Cloud`): профіль
