@@ -23,7 +23,13 @@
         'Register-BRAVOServiceRecoveryCriticalSent',
         'Register-BRAVOServiceRecoveryStableObservation',
         'Remove-BRAVOServiceRecoveryExpiredAttempts',
-        'New-BRAVOServiceRecoveryNotificationText'
+        'New-BRAVOServiceRecoveryNotificationText',
+        # #314 хвиля 4 (профіль -RecoverServices)
+        'Get-BRAVOServiceRecoveryConditions',
+        'Get-BRAVOServiceRecoveryChainPlan',
+        'Select-BRAVOServiceRecoveryScmEvents',
+        'Get-BRAVOServiceRecoveryScmEvents',
+        'Add-BRAVOServiceRecoverySummaryLine'
     )
 
     # ============================================================
@@ -53,7 +59,7 @@
             $recoveryMissingDefinitions.Count -eq 0
         ) `
         -Name 'ServiceRecovery/ModuleManifestExportsPublicApi' `
-        -Failure ("modules\BRAVO.ServiceRecovery має містити .psm1 і .psd1 (PowerShellVersion 3.0), що експортує рівно публічний API хвилі 3; " +
+        -Failure ("modules\BRAVO.ServiceRecovery має містити .psm1 і .psd1 (PowerShellVersion 3.0), що експортує рівно публічний API хвиль 3–4; " +
             "файли=$recoveryFilesPresent PSVersion='$recoveryManifestPsVersion' експорт=[$($recoveryManifestExports -join ', ')] " +
             "без визначення=[$($recoveryMissingDefinitions -join ', ')]")
 
@@ -658,4 +664,891 @@ function Write-BRAVOStateTemporaryText {
         -Condition ($nightlyPlanDiffs.Count -eq 0) `
         -Name 'ServiceRecovery/LifecyclePlanStartsFailedService' `
         -Failure "керована «впала» служба (Failed=`$true) має входити в маркер із RestartIntent і запускатися в порядку BRAVO -> exchangAPI -> BRAVO Web без зупинки; некерована чи без Failed — ні: $($nightlyPlanDiffs -join ' || ')"
+}
+
+# ============================================================
+# #314 хвиля 4 (FR-3): профіль BRAVO_MAINTENANCE.ps1 -RecoverServices.
+#   Тест 2 — чистий план ланцюжка Get-BRAVOServiceRecoveryChainPlan
+#            (канонічний порядок BRAVO -> exchangAPI -> BRAVO Web; впала
+#            BRAVO -> зупинка залежних і запуск усіх).
+#   Тест 5 — lock зайнятий: вихід 20 без змін, сповіщень і журналу;
+#            -NoWait не чекає lock.
+#   Тест 6 — маркер із restartSuppressed / чужий живий власник: нічого не
+#            запускати (класифікація і гонка під lock-ом).
+#   Решта  — оркестратор профілю на справжньому тексті runtime зі стабами
+#            побічних дій (Linux, без SCM/WMI), селектор подій SCM, проводка
+#            параметра і статичні заборони профілю.
+# ============================================================
+& {
+    $w4RuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $w4ModuleText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.ServiceRecovery\BRAVO.ServiceRecovery.psm1'), [Text.Encoding]::UTF8)
+    $w4SystemText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8)
+    $w4EntryText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_MAINTENANCE.ps1'), [Text.Encoding]::UTF8)
+    $w4RuntimeAst = [Management.Automation.Language.Parser]::ParseInput($w4RuntimeText, [ref]$null, [ref]$null)
+    $w4FunctionNamesIn = {
+        param([string]$Text)
+        $ast = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+        return @($ast.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | ForEach-Object { $_.Name } | Select-Object -Unique)
+    }
+    $w4ModuleFunctions = @(& $w4FunctionNamesIn $w4ModuleText)
+    $w4FindRuntimeFunction = {
+        param([string]$FunctionName)
+        @($w4RuntimeAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $FunctionName
+                }, $true)) | Select-Object -First 1
+    }
+    # Тестовий модуль лише з тих функцій, що справді є в тексті: до
+    # реалізації (RED) відсутня функція дає збій виклику всередині тесту, а
+    # не падіння всього фрагмента.
+    $w4NewModule = {
+        param([string]$SourceText, [string[]]$FunctionNames)
+        $available = @(& $w4FunctionNamesIn $SourceText)
+        $present = @($FunctionNames | Select-Object -Unique | Where-Object { $available -contains $_ })
+        $module = New-BRAVOSelfTestRuntimeModule -SourceText $SourceText -FunctionNames $present
+        # New-Module імпортує заглушки в глобальну область: заглушки
+        # командлетів (Write-Host, Get-/Start-/Stop-Service, Start-Sleep)
+        # потрібні лише всередині модуля — глобальна копія гасила б вивід
+        # самотесту і справжні командлети наступних перевірок.
+        foreach ($stubName in $present) {
+            if ($null -eq (Get-Command -Name $stubName -CommandType Cmdlet -ErrorAction SilentlyContinue)) { continue }
+            $leaked = Get-Command -Name $stubName -CommandType Function -ErrorAction SilentlyContinue
+            if ($null -ne $leaked -and $leaked.ModuleName -eq $module.Name) {
+                Remove-Item -Path ('function:' + $stubName) -Force -ErrorAction Stop
+            }
+        }
+        return $module
+    }
+
+    # ============================================================
+    # Тест 2: план ланцюжка (чиста функція модуля).
+    # ============================================================
+    $w4ChainModule = & $w4NewModule ($w4ModuleText + "`n" + $w4SystemText) (@($w4ModuleFunctions) + @('Get-BRAVOManagedServiceOrder'))
+    $w4ChainError = $null
+    $w4Chain = $null
+    try {
+        $w4Chain = & $w4ChainModule {
+            Set-StrictMode -Version 2.0
+            $c = {
+                param([string]$Key, [string]$Name, [string]$Condition, [string]$Status)
+                [pscustomobject]@{ Key = $Key; Name = $Name; Condition = $Condition; Status = $Status }
+            }
+            $describe = {
+                param($Plan)
+                'failed: {0} | stop: {1} | start: {2} | deferred: {3} | accounted: {4}' -f (@($Plan.FailedNames) -join ' '),
+                    (@($Plan.StopOrder) -join ' '), (@($Plan.StartOrder) -join ' '), (@($Plan.Deferred) -join ' '),
+                    (@($Plan.AccountedNames) -join ' ')
+            }
+            $result = [ordered]@{}
+            $result.BravoFailed = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Running' 'Running'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Running' 'Running')))
+            $result.ExchangeOnly = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Running' 'Running'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Running' 'Running')))
+            $result.WebOnly = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Running' 'Running'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Running' 'Running'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Failed' 'Stopped')))
+            # Порядок входу не канонічний — план однаково канонічний.
+            $result.Union = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    (& $c 'BravoWeb' 'Apache2.4' 'Failed' 'Stopped'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+                    (& $c 'Bravo' 'BRAVO' 'Running' 'Running')))
+            # Hashtable-входи теж приймаються.
+            $result.UnionBravo = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Condition = 'Failed'; Status = 'Stopped' },
+                    @{ Key = 'BravoWeb'; Name = 'Apache2.4'; Condition = 'Running'; Status = 'Running' },
+                    @{ Key = 'Bravo'; Name = 'BRAVO'; Condition = 'Failed'; Status = 'Stopped' }))
+            $result.SkipDisabled = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Disabled' 'Stopped'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'NotInstalled' '')))
+            $result.DeferPending = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Running' 'Running'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Pending' 'StartPending')))
+            $result.DeferBravoPending = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Pending' 'StartPending'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped')))
+            $result.PausedNotFailed = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Running' 'Running'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Paused'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'OwnedByBravo' 'Stopped')))
+            $result.Eligible = & $describe (Get-BRAVOServiceRecoveryChainPlan -EligibleNames @('Apache2.4') -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Running' 'Running'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Failed' 'Stopped')))
+            $result.BravoInPause = & $describe (Get-BRAVOServiceRecoveryChainPlan -EligibleNames @('exchangAPI') -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Running' 'Running')))
+            $result.Empty = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @())
+            return [pscustomobject]$result
+        }
+    } catch {
+        $w4ChainError = $_.Exception.Message
+    }
+    $w4ChainCheck = {
+        param([hashtable]$Expected)
+        if ($null -ne $w4ChainError) { return @("помилка: $w4ChainError") }
+        return @($Expected.Keys | Sort-Object | Where-Object { [string]$w4Chain.$_ -cne [string]$Expected[$_] } |
+                ForEach-Object { "${_}: '$($w4Chain.$_)' (очікувалось '$($Expected[$_])')" })
+    }
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            BravoFailed = 'failed: BRAVO | stop: Apache2.4 exchangAPI | start: BRAVO exchangAPI Apache2.4 | deferred:  | accounted: BRAVO'
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanBravoFailedStopsDependentsAndStartsAll' `
+        -Failure "впала BRAVO: зупинити працюючі залежні (BRAVO Web, exchangAPI) і запустити всі в порядку BRAVO -> exchangAPI -> BRAVO Web: $($w4ChainDiffs -join ' || ')"
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            ExchangeOnly = 'failed: exchangAPI | stop:  | start: exchangAPI | deferred:  | accounted: exchangAPI'
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanExchangeApiOnly' `
+        -Failure "впала лише exchangAPI: запуск лише exchangAPI, без зупинок: $($w4ChainDiffs -join ' || ')"
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            WebOnly = 'failed: Apache2.4 | stop:  | start: Apache2.4 | deferred:  | accounted: Apache2.4'
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanWebOnly' `
+        -Failure "впала лише BRAVO Web: запуск лише BRAVO Web, без зупинок: $($w4ChainDiffs -join ' || ')"
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            Union = 'failed: exchangAPI Apache2.4 | stop:  | start: exchangAPI Apache2.4 | deferred:  | accounted: exchangAPI Apache2.4'
+            UnionBravo = 'failed: BRAVO exchangAPI | stop: Apache2.4 | start: BRAVO exchangAPI Apache2.4 | deferred:  | accounted: BRAVO exchangAPI'
+            Empty = 'failed:  | stop:  | start:  | deferred:  | accounted: '
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanUnionKeepsCanonicalOrder' `
+        -Failure "кілька впалих: об'єднання планів у канонічному порядку незалежно від порядку входу (pscustomobject і hashtable): $($w4ChainDiffs -join ' || ')"
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            SkipDisabled = 'failed: BRAVO | stop:  | start: BRAVO | deferred:  | accounted: BRAVO'
+            DeferPending = 'failed: BRAVO | stop: exchangAPI | start: BRAVO exchangAPI | deferred: Apache2.4 | accounted: BRAVO'
+            DeferBravoPending = 'failed: exchangAPI | stop:  | start: exchangAPI | deferred: BRAVO | accounted: exchangAPI'
+            PausedNotFailed = 'failed:  | stop:  | start:  | deferred:  | accounted: '
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanSkipsDisabledAndDefersPending' `
+        -Failure "Disabled/NotInstalled/OwnedByBravo/призупинена служба не зупиняється й не запускається; служба в Pending, від якої залежить план, — Deferred (цього тику план не виконується): $($w4ChainDiffs -join ' || ')"
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            Eligible = 'failed: Apache2.4 | stop:  | start: Apache2.4 | deferred:  | accounted: Apache2.4'
+            BravoInPause = 'failed: exchangAPI | stop:  | start: exchangAPI | deferred:  | accounted: exchangAPI'
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanHonorsPauseEligibility' `
+        -Failure "-EligibleNames (служби, чия пауза минула): впала служба в паузі цього тику не запускається і не тягне ланцюжок: $($w4ChainDiffs -join ' || ')"
+
+    $w4ModuleAst = [Management.Automation.Language.Parser]::ParseInput($w4ModuleText, [ref]$null, [ref]$null)
+    $w4ChainFunction = @($w4ModuleAst.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOServiceRecoveryChainPlan'
+            }, $true)) | Select-Object -First 1
+    $w4ChainSideEffects = @()
+    if ($null -ne $w4ChainFunction) {
+        $w4ChainSideEffects = @($w4ChainFunction.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -in @('Get-Service', 'Start-Service', 'Stop-Service', 'Get-BRAVOWmiInstance',
+                        'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOManagedServiceCondition', 'Write-BRAVOStateFileAtomic')
+                }, $true) | ForEach-Object { $_.GetCommandName() })
+    }
+    Test-BRAVOCondition -Condition ($null -ne $w4ChainFunction -and $w4ChainSideEffects.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanIsPure' `
+        -Failure "Get-BRAVOServiceRecoveryChainPlan має бути чистою функцією модуля BRAVO.ServiceRecovery (без SCM/WMI/маркера/диска): визначено=$($null -ne $w4ChainFunction) виклики=[$($w4ChainSideEffects -join ', ')]"
+
+    # ============================================================
+    # Події SCM: чистий селектор (Get-WinEvent — лише Windows CI).
+    # ============================================================
+    $w4ScmError = $null
+    $w4Scm = $null
+    try {
+        $w4Scm = & $w4ChainModule {
+            Set-StrictMode -Version 2.0
+            $base = New-Object DateTime(2026, 10, 7, 10, 0, 0, [DateTimeKind]::Local)
+            $event = {
+                param([int]$Id, [int]$MinutesAgo, [string]$Message, [object[]]$Values)
+                [pscustomobject]@{
+                    Id = $Id; TimeCreated = $base.AddMinutes(-$MinutesAgo); Message = $Message
+                    Properties = @($Values | ForEach-Object { [pscustomobject]@{ Value = $_ } })
+                }
+            }
+            $events = @(
+                (& $event 7034 5 'other text' @('Apache2.4')),
+                (& $event 7034 30 'Служба "exchangAPI" неочікувано завершила роботу.' @('exchangAPI', 1)),
+                (& $event 7031 20 'The BRAVO Web service terminated unexpectedly.' @('BRAVO Web', 2)),
+                (& $event 7034 10 'Служба "Spooler" неочікувано завершила роботу.' @('Spooler', 1)),
+                (& $event 7000 15 'Служба BRAVO не запустилася.' @())
+            )
+            $all = @(Select-BRAVOServiceRecoveryScmEvents -Events $events -ServiceNames @('exchangAPI', 'Apache2.4', 'BRAVO') -MaxEvents 50)
+            $limited = @(Select-BRAVOServiceRecoveryScmEvents -Events $events -ServiceNames @('exchangAPI', 'Apache2.4', 'BRAVO') -MaxEvents 1)
+            $none = @(Select-BRAVOServiceRecoveryScmEvents -Events @() -ServiceNames @('exchangAPI') -MaxEvents 50)
+            return [pscustomobject]@{
+                All = (@($all | ForEach-Object { '{0}:{1}:{2:HH:mm}' -f $_.ServiceName, $_.Id, $_.TimeCreated }) -join ' ')
+                Limited = (@($limited | ForEach-Object { '{0}:{1}' -f $_.ServiceName, $_.Id }) -join ' ')
+                None = $none.Count
+            }
+        }
+    } catch {
+        $w4ScmError = $_.Exception.Message
+    }
+    if ($null -eq $w4Scm) { $w4Scm = [pscustomobject]@{ All = $null; Limited = $null; None = -1 } }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4ScmError -and
+            [string]$w4Scm.All -ceq 'exchangAPI:7034:09:30 BRAVO:7000:09:45 Apache2.4:7034:09:55' -and
+            [string]$w4Scm.Limited -ceq 'Apache2.4:7034' -and
+            [int]$w4Scm.None -eq 0
+        ) `
+        -Name 'ServiceRecovery/ScmEventSelectorFiltersByServiceAndLimits' `
+        -Failure ("Select-BRAVOServiceRecoveryScmEvents: подія належить службі за першим параметром події (ім'я служби), без параметрів — за словом у тексті; чужі служби (Spooler, 'BRAVO Web' для BRAVO) відкинуто; " +
+            "хронологічно, лише MaxEvents найновіших, ServiceName у результаті. помилка='$w4ScmError' all='$($w4Scm.All)' limited='$($w4Scm.Limited)'")
+
+    $w4ScmUnavailable = $null
+    try {
+        $w4ScmUnavailable = & $w4ChainModule {
+            Get-BRAVOServiceRecoveryScmEvents -ServiceNames @('exchangAPI') -MaxEvents 50
+        }
+    } catch {
+        $w4ScmUnavailable = $null
+    }
+    $w4IsWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $w4ScmUnavailable -and
+            $null -ne $w4ScmUnavailable.PSObject.Properties['Available'] -and
+            $null -ne $w4ScmUnavailable.PSObject.Properties['Events'] -and
+            ($w4IsWindows -or (-not [bool]$w4ScmUnavailable.Available -and [string]$w4ScmUnavailable.Reason -match 'недоступн'))
+        ) `
+        -Name 'ServiceRecovery/ScmEventsUnavailableOffWindows' `
+        -Failure "Get-BRAVOServiceRecoveryScmEvents не кидає винятку і повертає Available/Events/Reason; поза Windows — Available=`$false і причина «події SCM недоступні»"
+
+    # ============================================================
+    # Класифікація керованих служб: одне читання маркера на виклик; маркер
+    # із restartSuppressed робить зупинену службу OwnedByBravo (тест 6а).
+    # ============================================================
+    $w4ClassifyStubs = @'
+function Read-BRAVOServiceQuiescenceState {
+    $script:W4MarkerReads++
+    return $script:W4Marker
+}
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    $status = $script:W4ServiceStatus[$Name]
+    if ($null -eq $status) { return $null }
+    return [pscustomobject]@{ Name = $Name; Status = $status; StartType = 'Automatic' }
+}
+function Get-BRAVOWin32ServiceInfo { param([string]$Name) return $null }
+function Invoke-W4Classify {
+    param($Marker, [hashtable]$Statuses, [object[]]$Services)
+    $script:W4Marker = $Marker
+    $script:W4MarkerReads = 0
+    $script:W4ServiceStatus = $Statuses
+    $conditions = @(Get-BRAVOServiceRecoveryConditions -Services $Services)
+    return [pscustomobject]@{
+        Text = (@($conditions | ForEach-Object { '{0}/{1}={2}' -f $_.Key, $_.Name, $_.Condition }) -join ' ')
+        Reads = $script:W4MarkerReads
+    }
+}
+'@
+    $w4ClassifyModule = & $w4NewModule ($w4ClassifyStubs + "`n" + $w4ModuleText + "`n" + $w4SystemText) (
+        @('Read-BRAVOServiceQuiescenceState', 'Get-Service', 'Get-BRAVOWin32ServiceInfo', 'Invoke-W4Classify') + @($w4ModuleFunctions) +
+        @('Get-BRAVOManagedServiceCondition', 'Get-BRAVOServiceStartMode', 'Test-BRAVOServiceDisabledByOperator', 'Get-BRAVOManagedServiceOrder'))
+    $w4SuppressedMarker = [pscustomobject]@{
+        schemaVersion = 1; owner = 'BRAVO_DATA_RESTORE'; hostname = [Environment]::MachineName; pid = 4242
+        processStartTime = '2026-10-07T09:00:00.0000000+03:00'; createdAt = '2026-10-07T09:00:01.0000000+03:00'
+        logFile = 'C:\LOGS\restore.log'; restartSuppressed = $true
+        services = @([pscustomobject]@{ Name = 'exchangAPI'; RestartIntent = $true }); startTypeSnapshot = @()
+    }
+    $w4ClassifyServices = @(
+        @{ Key = 'Bravo'; Name = 'BRAVO'; Enabled = $true },
+        @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $true },
+        @{ Key = 'BravoWeb'; Name = 'Apache2.4'; Enabled = $true },
+        @{ Key = 'BravoWeb'; Name = ''; Enabled = $false }
+    )
+    $w4ClassifyStatuses = @{ BRAVO = 'Running'; exchangAPI = 'Stopped'; 'Apache2.4' = 'Running' }
+    $w4ClassifyError = $null
+    $w4ClassifyMarked = $null
+    $w4ClassifyPlain = $null
+    try {
+        $w4ClassifyMarked = & $w4ClassifyModule {
+            param($Marker, $Statuses, $Services)
+            Set-StrictMode -Version 2.0
+            Invoke-W4Classify -Marker $Marker -Statuses $Statuses -Services $Services
+        } $w4SuppressedMarker $w4ClassifyStatuses $w4ClassifyServices
+        $w4ClassifyPlain = & $w4ClassifyModule {
+            param($Statuses, $Services)
+            Set-StrictMode -Version 2.0
+            Invoke-W4Classify -Marker $null -Statuses $Statuses -Services @($Services | Select-Object -First 3)
+        } $w4ClassifyStatuses $w4ClassifyServices
+    } catch {
+        $w4ClassifyError = $_.Exception.Message
+    }
+    if ($null -eq $w4ClassifyMarked) { $w4ClassifyMarked = [pscustomobject]@{ Text = $null; Reads = -1 } }
+    if ($null -eq $w4ClassifyPlain) { $w4ClassifyPlain = [pscustomobject]@{ Text = $null; Reads = -1 } }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4ClassifyError -and
+            [string]$w4ClassifyMarked.Text -ceq 'Bravo/BRAVO=Running ExchangeApi/exchangAPI=OwnedByBravo BravoWeb/Apache2.4=Running' -and
+            [int]$w4ClassifyMarked.Reads -eq 1 -and
+            [string]$w4ClassifyPlain.Text -ceq 'Bravo/BRAVO=Running ExchangeApi/exchangAPI=Failed BravoWeb/Apache2.4=Running'
+        ) `
+        -Name 'ServiceRecovery/ConditionsClassifyManagedServicesWithOneMarkerRead' `
+        -Failure ("Get-BRAVOServiceRecoveryConditions: лише керовані служби в канонічному порядку (Key додано), маркер читається один раз; служба з маркера restartSuppressed — OwnedByBravo, без маркера зупинена — Failed. " +
+            "помилка='$w4ClassifyError' з маркером='$($w4ClassifyMarked.Text)' читань=$($w4ClassifyMarked.Reads) без маркера='$($w4ClassifyPlain.Text)'")
+
+    # ============================================================
+    # Оркестратор профілю: справжня Invoke-BRAVOMaintenanceServiceRecoveryProfile
+    # (runtime) + справжні чисті функції модуля; побічні дії — стаби з
+    # журналом подій. Перший Write-Log створив би RECOVER-журнал, тож
+    # «журнал не створено» = жодного виклику Write-Log.
+    # ============================================================
+    $w4ProfileStubs = @'
+function Write-Host {
+    param([Parameter(Position = 0)]$Object, $ForegroundColor, [switch]$NoNewline)
+    $script:W4HostLines += @([string]$Object)
+}
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO', [switch]$NoConsole)
+    $script:W4LogCalls += @("$Level|$Message")
+}
+function Get-BRAVOMaintenanceServiceRecoveryServices { return @($script:W4Services) }
+function Read-BRAVOServiceRecoveryState {
+    return [pscustomobject]@{ State = $script:W4RecoveryState; Status = 'Ok'; Warning = $null; QuarantinedPath = $null }
+}
+function Write-BRAVOServiceRecoveryState {
+    param($State, $Now)
+    $script:W4StateWrites++
+    $script:W4WrittenState = $State
+}
+function Add-BRAVOServiceRecoverySummaryLine {
+    param([string]$Path, [string]$Text)
+    $script:W4Events += @("SUMMARY $Text")
+}
+function Enter-BRAVOMaintenanceOperationLock {
+    param([string]$TaskType, [switch]$NoWait, [string]$OperationName)
+    $script:W4LockArgs = '{0}|{1}|{2}' -f $TaskType, [bool]$NoWait, $OperationName
+    if ($script:W4LockBusy) {
+        return [pscustomobject]@{ Success = $false; Stream = $null; Path = 'C:\BRAVO\BRAVO_OPERATION.lock'; Error = 'self-test: lock зайнятий' }
+    }
+    return [pscustomobject]@{ Success = $true; Stream = $null; Path = 'C:\BRAVO\BRAVO_OPERATION.lock'; Error = $null }
+}
+function Exit-BRAVOMaintenanceOperationLock { $script:W4LockExits++ }
+function Resolve-BRAVOExitCode {
+    param([switch]$LockBusy, [switch]$InvalidConfiguration, [switch]$HasWarnings, [switch]$MaintenanceFailed)
+    if ($LockBusy) { return 20 }
+    if ($InvalidConfiguration) { return 30 }
+    if ($MaintenanceFailed) { return 60 }
+    if ($HasWarnings) { return 10 }
+    return 0
+}
+function Get-BRAVOForeignServiceQuiescenceContext { return $script:W4Foreign }
+function Write-BRAVOServiceQuiescenceState {
+    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot)
+    if ($script:W4MarkerWriteFails) { throw 'self-test: маркер не записано' }
+    $script:W4Events += @("MARKER $Owner " + (@($Services | ForEach-Object { '{0}={1}' -f $_.Name, [bool]$_.RestartIntent }) -join ','))
+    $script:W4MarkerLogFile = $LogFile
+}
+function Clear-BRAVOServiceQuiescenceState {
+    param($ExpectedState)
+    $script:W4Events += @('CLEAR')
+    return $true
+}
+function Invoke-ServiceStateChange {
+    param([string]$Name, [string]$DesiredStatus, [int]$TimeoutSeconds, [int]$PollIntervalSeconds, [switch]$Force)
+    $script:W4Events += @("STATE $Name $DesiredStatus")
+    return [pscustomobject]@{ Success = $true; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = $DesiredStatus; Error = $null }
+}
+function Start-BRAVOMaintenanceManagedService {
+    param([string]$Key, [string]$Name, [hashtable]$Outcome, $RecoveryCondition, $LastScmEvent)
+    $script:W4Events += @("START $Name recovery=$($null -ne $RecoveryCondition)")
+    if (@($script:W4StartFailures) -contains $Name) {
+        $Outcome.RestartFailed = $true
+        $script:criticalErrorOccurred = $true
+    }
+}
+function Start-Service { param($Name) $script:W4Events += @("START-SERVICE $Name") }
+function Stop-Service { param($Name) $script:W4Events += @("STOP-SERVICE $Name") }
+function Stop-BRAVOMaintenanceStrayProcess { $script:W4Events += @('STRAY') }
+function Invoke-BRAVOMaintenanceBeforeServiceStopHook { param($Key) $script:W4Events += @('HOOK') }
+function Write-BRAVOTaskExecutionState { param($TaskName) $script:W4Events += @('TASKSTATE') }
+function Write-BRAVOOperationStatus { $script:W4Events += @('OPSTATUS') }
+function Send-SlackAlert {
+    param([string]$Message, [switch]$IsCritical, [string]$Severity)
+    $script:W4Events += @("SLACK $Severity $([bool]$IsCritical)")
+    if ($IsCritical) { $script:criticalErrorOccurred = $true }
+}
+function Send-BRAVOMaintenanceEarlyExitAlerts {
+    param([string]$Reason, [string]$Title, [string]$Summary)
+    $script:W4Events += @('REPORT')
+}
+function Get-BRAVOServiceRecoveryScmEvents {
+    param([string[]]$ServiceNames, [int]$MaxEvents)
+    return [pscustomobject]@{ Available = $false; Events = @(); Reason = 'події SCM недоступні (self-test)' }
+}
+function Initialize-BRAVOMaintenanceServiceRecoveryLogSources {
+    param([string[]]$Keys)
+    return @{ TraceConfiguration = $null; TraceOutSources = @(); BravoFilePhaseAllowed = $false; ExchangeApiRuntime = $null }
+}
+function Invoke-BRAVOMaintenanceServiceLogProcessing {
+    param([string]$Key, [hashtable]$Outcome)
+    $script:W4Events += @("LOGS $Key")
+}
+function Get-BRAVOMaintenanceResolvedExitCode {
+    if ($script:criticalErrorOccurred) { return 60 }
+    return 0
+}
+function Invoke-W4Profile {
+    param(
+        [object[]]$Conditions,
+        $RecoveryState = $null,
+        [bool]$LockBusy = $false,
+        $Foreign = $null,
+        [bool]$MarkerWriteFails = $false,
+        [string[]]$StartFailures = @()
+    )
+    $script:W4Services = @(
+        @{ Key = 'Bravo'; Name = 'BRAVO'; Enabled = $true },
+        @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $true },
+        @{ Key = 'BravoWeb'; Name = 'Apache2.4'; Enabled = $true }
+    )
+    $script:W4Conditions = @($Conditions)
+    $script:W4RecoveryState = $RecoveryState
+    $script:W4LockBusy = $LockBusy
+    $script:W4Foreign = if ($null -ne $Foreign) { $Foreign } else {
+        [pscustomobject]@{ Present = $false; OwnerAlive = $false; Owner = $null; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
+    }
+    $script:W4MarkerWriteFails = $MarkerWriteFails
+    $script:W4StartFailures = @($StartFailures)
+    $script:W4Events = @()
+    $script:W4LogCalls = @()
+    $script:W4HostLines = @()
+    $script:W4LockArgs = $null
+    $script:W4LockExits = 0
+    $script:W4StateWrites = 0
+    $script:W4WrittenState = $null
+    $script:W4ClassifyCount = 0
+    $script:W4MarkerLogFile = $null
+    $script:criticalErrorOccurred = $false
+    $script:LOG_FILE = 'C:\BRAVO\LOGS\BRAVO_MAINTENANCE_20261007_101500_RECOVER_PID1234.log'
+    $script:LOG_DIR = 'C:\BRAVO\LOGS'
+    $script:ServiceStopTimeoutSeconds = 60
+    $script:ServiceStartTimeoutSeconds = 60
+    $script:ServicePollIntervalSeconds = 1
+    $exitCode = $null
+    $profileError = $null
+    try {
+        $exitCode = Invoke-BRAVOMaintenanceServiceRecoveryProfile
+    } catch {
+        $profileError = $_.Exception.Message
+    }
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Error = $profileError
+        Events = @($script:W4Events)
+        LogCalls = @($script:W4LogCalls)
+        HostLines = @($script:W4HostLines)
+        LockArgs = $script:W4LockArgs
+        LockExits = $script:W4LockExits
+        StateWrites = $script:W4StateWrites
+        WrittenState = $script:W4WrittenState
+        ClassifyCount = $script:W4ClassifyCount
+        MarkerLogFile = $script:W4MarkerLogFile
+    }
+}
+'@
+    $w4ConditionsStub = @'
+function Get-BRAVOServiceRecoveryConditions {
+    param($Services)
+    $script:W4ClassifyCount++
+    return @($script:W4Conditions)
+}
+'@
+    $w4ProfileStubNames = @(& $w4FunctionNamesIn $w4ProfileStubs)
+    $w4ProfileModule = & $w4NewModule ($w4ConditionsStub + "`n" + $w4ProfileStubs + "`n" + $w4RuntimeText + "`n" + $w4ModuleText + "`n" + $w4SystemText) (
+        @('Get-BRAVOServiceRecoveryConditions') + $w4ProfileStubNames + @('Invoke-BRAVOMaintenanceServiceRecoveryProfile') + @($w4ModuleFunctions) + @('Get-BRAVOManagedServiceOrder'))
+    $w4Cond = {
+        param([string]$Key, [string]$Name, [string]$Condition, [string]$Status)
+        [pscustomobject]@{
+            Key = $Key; Name = $Name; Exists = $true; StartMode = 'Automatic'; StartModeSource = 'StartType'; Status = $Status
+            ExitCode = $(if ($Condition -eq 'Failed') { 1067 } else { 0 }); ServiceSpecificExitCode = 0
+            Condition = $Condition; HeldByBravo = $false; OriginalStartMode = $null; MarkerOwner = $null
+        }
+    }
+    $w4AllRunning = @(
+        (& $w4Cond 'Bravo' 'BRAVO' 'Running' 'Running'),
+        (& $w4Cond 'ExchangeApi' 'exchangAPI' 'Running' 'Running'),
+        (& $w4Cond 'BravoWeb' 'Apache2.4' 'Running' 'Running'))
+    $w4ExchangeFailed = @(
+        (& $w4Cond 'Bravo' 'BRAVO' 'Running' 'Running'),
+        (& $w4Cond 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+        (& $w4Cond 'BravoWeb' 'Apache2.4' 'Running' 'Running'))
+    $w4BravoFailed = @(
+        (& $w4Cond 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+        (& $w4Cond 'ExchangeApi' 'exchangAPI' 'Running' 'Running'),
+        (& $w4Cond 'BravoWeb' 'Apache2.4' 'Running' 'Running'))
+    $w4RunProfile = {
+        param([hashtable]$Arguments)
+        & $w4ProfileModule {
+            param($ProfileArguments)
+            Set-StrictMode -Version 2.0
+            Invoke-W4Profile @ProfileArguments
+        } $Arguments
+    }
+    $w4Describe = {
+        param($Result)
+        "exit=$($Result.ExitCode) помилка='$($Result.Error)' lock='$($Result.LockArgs)' lockExits=$($Result.LockExits) stateWrites=$($Result.StateWrites) " +
+            "events=[$(@($Result.Events) -join '; ')] log=$(@($Result.LogCalls).Count) перший='$(@($Result.LogCalls) | Select-Object -First 1)'"
+    }
+    $w4ForbiddenEvents = {
+        param($Result)
+        @($Result.Events | Where-Object { $_ -match '^(STRAY|HOOK|TASKSTATE|OPSTATUS|START-SERVICE|STOP-SERVICE)' })
+    }
+
+    # Немає впалих: вихід 0, lock не береться, журнал не створюється, state
+    # не пишеться.
+    $w4NoFailed = & $w4RunProfile @{ Conditions = $w4AllRunning }
+    # ... крім скидання stableSince, коли воно змінилося (служба з обліком
+    # спроб працює — перше спостереження стабільності).
+    $w4StableState = [pscustomobject]@{
+        schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+        services = @{ exchangAPI = [pscustomobject]@{ attempts = @((Get-Date).AddMinutes(-10).ToString('o')); lastCriticalAt = $null; stableSince = $null } }
+    }
+    $w4StableObserved = & $w4RunProfile @{ Conditions = $w4AllRunning; RecoveryState = $w4StableState }
+    $w4StableWrittenSince = $null
+    if ($null -ne $w4StableObserved.WrittenState -and $null -ne $w4StableObserved.WrittenState.services -and
+        $w4StableObserved.WrittenState.services.ContainsKey('exchangAPI')) {
+        $w4StableWrittenSince = $w4StableObserved.WrittenState.services['exchangAPI'].stableSince
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4NoFailed.Error -and [int]$w4NoFailed.ExitCode -eq 0 -and
+            $null -eq $w4NoFailed.LockArgs -and @($w4NoFailed.LogCalls).Count -eq 0 -and
+            [int]$w4NoFailed.StateWrites -eq 0 -and @($w4NoFailed.Events).Count -eq 0 -and
+            $null -eq $w4StableObserved.Error -and [int]$w4StableObserved.ExitCode -eq 0 -and
+            [int]$w4StableObserved.StateWrites -eq 1 -and $null -ne $w4StableWrittenSince -and
+            $null -eq $w4StableObserved.LockArgs -and @($w4StableObserved.LogCalls).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/ProfileNoFailedExitsWithoutDiskWrites' `
+        -Failure ("немає впалих служб: вихід 0 без lock-а, журналу RECOVER і запису state; єдиний дозволений запис — stableSince, коли він змінився. " +
+            "без обліку: $(& $w4Describe $w4NoFailed) || з обліком: $(& $w4Describe $w4StableObserved) stableSince='$w4StableWrittenSince'")
+
+    # Пауза ще не минула (друга спроба через 2 хв після першої, пауза 5 хв):
+    # lock не береться, журнал не створюється, рядок у зведенні.
+    $w4PauseState = [pscustomobject]@{
+        schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+        services = @{ exchangAPI = [pscustomobject]@{ attempts = @((Get-Date).AddMinutes(-2).ToString('o')); lastCriticalAt = $null; stableSince = $null } }
+    }
+    $w4Paused = & $w4RunProfile @{ Conditions = $w4ExchangeFailed; RecoveryState = $w4PauseState }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4Paused.Error -and [int]$w4Paused.ExitCode -eq 0 -and
+            $null -eq $w4Paused.LockArgs -and @($w4Paused.LogCalls).Count -eq 0 -and
+            @($w4Paused.Events | Where-Object { $_ -match '^(START|STATE|MARKER|SLACK|REPORT|LOGS)' }).Count -eq 0 -and
+            @($w4Paused.Events | Where-Object { $_ -match '^SUMMARY .*exchangAPI.*пауза до \d\d:\d\d \(спроба 2\)' }).Count -eq 1
+        ) `
+        -Name 'ServiceRecovery/ProfilePauseSkipsWithoutLock' `
+        -Failure "впала служба в паузі (0/5/15/60): вихід 0 без lock-а, журналу і запуску; рядок «exchangAPI впала, пауза до HH:mm (спроба 2)» у зведенні: $(& $w4Describe $w4Paused)"
+
+    # Тест 5: lock зайнятий -> 20, без змін, сповіщень і журналу.
+    $w4LockBusy = & $w4RunProfile @{ Conditions = $w4ExchangeFailed; LockBusy = $true }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4LockBusy.Error -and [int]$w4LockBusy.ExitCode -eq 20 -and
+            [string]$w4LockBusy.LockArgs -ceq 'Maintenance|True|ServiceRecovery' -and
+            @($w4LockBusy.Events).Count -eq 0 -and @($w4LockBusy.LogCalls).Count -eq 0 -and
+            [int]$w4LockBusy.StateWrites -eq 0 -and [int]$w4LockBusy.LockExits -eq 0
+        ) `
+        -Name 'ServiceRecovery/ProfileLockBusyExits20WithoutChanges' `
+        -Failure "lock зайнятий: Enter-BRAVOMaintenanceOperationLock -TaskType Maintenance -NoWait -OperationName ServiceRecovery, вихід 20 без маркера, запусків, сповіщень, журналу RECOVER і запису state: $(& $w4Describe $w4LockBusy)"
+
+    # Тест 6б: гонка — класифікація без маркера, під lock-ом маркер
+    # мертвого власника з restartSuppressed -> нічого не запускати, INFO.
+    $w4Race = & $w4RunProfile @{
+        Conditions = $w4ExchangeFailed
+        Foreign = [pscustomobject]@{ Present = $true; OwnerAlive = $false; Owner = 'BRAVO_DATA_RESTORE'; RestartSuppressed = $true; RestartIntentNames = @(); HeldSnapshot = @() }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4Race.Error -and [int]$w4Race.ExitCode -eq 0 -and
+            @($w4Race.Events | Where-Object { $_ -match '^(START|STATE|MARKER|LOGS)' }).Count -eq 0 -and
+            @($w4Race.LogCalls | Where-Object { $_ -match '^INFO\|' -and $_ -match 'restartSuppressed' -and $_ -match '43' }).Count -eq 1 -and
+            [int]$w4Race.LockExits -eq 1
+        ) `
+        -Name 'ServiceRecovery/ProfileRaceSuppressedMarkerUnderLockStartsNothing' `
+        -Failure "під lock-ом виявлено маркер із restartSuppressed: жодного запуску/зупинки/маркера, INFO з кодом 43, вихід 0, lock звільнено: $(& $w4Describe $w4Race)"
+
+    # Чужий живий власник маркера під lock-ом -> 20 без дій.
+    $w4LiveOwner = & $w4RunProfile @{
+        Conditions = $w4ExchangeFailed
+        Foreign = [pscustomobject]@{ Present = $true; OwnerAlive = $true; Owner = 'BRAVO_DATA_RESTORE'; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4LiveOwner.Error -and [int]$w4LiveOwner.ExitCode -eq 20 -and
+            @($w4LiveOwner.Events | Where-Object { $_ -match '^(START|STATE|MARKER|LOGS|SLACK)' }).Count -eq 0 -and
+            [int]$w4LiveOwner.LockExits -eq 1
+        ) `
+        -Name 'ServiceRecovery/ProfileForeignLiveOwnerUnderLockExits20' `
+        -Failure "чужий живий власник ownership-маркера: вихід 20 без дій: $(& $w4Describe $w4LiveOwner)"
+
+    # Тест 6а: справжня класифікація з маркером restartSuppressed -> служба
+    # OwnedByBravo -> профіль не бачить впалих і нічого не запускає.
+    $w4RealClassifyModule = & $w4NewModule ($w4ClassifyStubs + "`n" + $w4ProfileStubs + "`n" + $w4RuntimeText + "`n" + $w4ModuleText + "`n" + $w4SystemText) (
+        @('Read-BRAVOServiceQuiescenceState', 'Get-Service', 'Get-BRAVOWin32ServiceInfo') +
+        $w4ProfileStubNames +
+        @('Invoke-BRAVOMaintenanceServiceRecoveryProfile') + @($w4ModuleFunctions) +
+        @('Get-BRAVOManagedServiceCondition', 'Get-BRAVOServiceStartMode', 'Test-BRAVOServiceDisabledByOperator', 'Get-BRAVOManagedServiceOrder'))
+    $w4SuppressedClassified = $null
+    try {
+        $w4SuppressedClassified = & $w4RealClassifyModule {
+            param($Marker)
+            $script:W4Marker = $Marker
+            $script:W4MarkerReads = 0
+            $script:W4ServiceStatus = @{ BRAVO = 'Running'; exchangAPI = 'Stopped'; 'Apache2.4' = 'Running' }
+            Invoke-W4Profile -Conditions @()
+        } $w4SuppressedMarker
+    } catch {
+        $w4SuppressedClassified = [pscustomobject]@{ ExitCode = $null; Error = $_.Exception.Message; Events = @(); LogCalls = @(); LockArgs = $null; LockExits = 0; StateWrites = 0 }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $w4SuppressedClassified -and $null -eq $w4SuppressedClassified.Error -and
+            [int]$w4SuppressedClassified.ExitCode -eq 0 -and $null -eq $w4SuppressedClassified.LockArgs -and
+            @($w4SuppressedClassified.Events | Where-Object { $_ -match '^(START|STATE|MARKER)' }).Count -eq 0 -and
+            @($w4SuppressedClassified.LogCalls).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/ProfileSuppressedMarkerClassifiesOwnedByBravoNoStart' `
+        -Failure "маркер restartSuppressed зі службою exchangAPI: класифікація OwnedByBravo, профіль виходить 0 без lock-а і без запуску: $(& $w4Describe $w4SuppressedClassified)"
+
+    # Щасливий шлях: впала exchangAPI -> маркер BRAVO_MAINTENANCE_RECOVER,
+    # журнал RECOVER з доказами (ExitCode, «події SCM недоступні»), журнали
+    # служби, запуск з обліком спроби, маркер знято, звіт.
+    $w4Exchange = & $w4RunProfile @{ Conditions = $w4ExchangeFailed }
+    $w4ExchangeActions = @($w4Exchange.Events | Where-Object { $_ -match '^(MARKER|STATE|LOGS|START|CLEAR|REPORT)' })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4Exchange.Error -and [int]$w4Exchange.ExitCode -eq 0 -and
+            ($w4ExchangeActions -join '; ') -ceq 'MARKER BRAVO_MAINTENANCE_RECOVER exchangAPI=True; LOGS ExchangeApi; START exchangAPI recovery=True; CLEAR; REPORT' -and
+            [string]$w4Exchange.MarkerLogFile -match '_RECOVER_PID\d+\.log$' -and
+            [string](@($w4Exchange.LogCalls) | Select-Object -First 1) -ceq 'INFO|=== ВІДНОВЛЕННЯ СЛУЖБ (-RecoverServices) ===' -and
+            @($w4Exchange.LogCalls | Where-Object { $_ -match 'exchangAPI' -and $_ -match 'ExitCode=1067' -and $_ -match 'StartMode=Automatic' -and $_ -match 'ServiceSpecificExitCode=0' }).Count -ge 1 -and
+            @($w4Exchange.LogCalls | Where-Object { $_ -match 'події SCM недоступні' }).Count -ge 1 -and
+            (& $w4ForbiddenEvents $w4Exchange).Count -eq 0 -and
+            [int]$w4Exchange.LockExits -eq 1
+        ) `
+        -Name 'ServiceRecovery/ProfileStartsFailedExchangeApiUnderMarker' `
+        -Failure "впала exchangAPI: маркер BRAVO_MAINTENANCE_RECOVER -> журнали служби -> запуск з обліком (-RecoveryCondition) -> маркер знято -> звіт; журнал RECOVER починається заголовком і містить StartMode/Status/ExitCode/ServiceSpecificExitCode і рядок про недоступні події SCM; без Stop-BRAVOMaintenanceStrayProcess, Set-/Start-/Stop-Service напряму і стану задачі Maintenance: $(& $w4Describe $w4Exchange)"
+
+    # Впала BRAVO: зупинка залежних (BRAVO Web -> exchangAPI) без точки
+    # розширення Bis, журнали BRAVO, запуск усіх у порядку BRAVO -> exchangAPI
+    # -> BRAVO Web (обліковується лише впала BRAVO).
+    $w4Bravo = & $w4RunProfile @{ Conditions = $w4BravoFailed }
+    $w4BravoActions = @($w4Bravo.Events | Where-Object { $_ -match '^(MARKER|STATE|LOGS|START|CLEAR|REPORT)' })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4Bravo.Error -and [int]$w4Bravo.ExitCode -eq 0 -and
+            ($w4BravoActions -join '; ') -ceq ('MARKER BRAVO_MAINTENANCE_RECOVER BRAVO=True,exchangAPI=True,Apache2.4=True; STATE Apache2.4 Stopped; STATE exchangAPI Stopped; LOGS Bravo; ' +
+                'START BRAVO recovery=True; START exchangAPI recovery=False; START Apache2.4 recovery=False; CLEAR; REPORT') -and
+            (& $w4ForbiddenEvents $w4Bravo).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/ProfileBravoFailedRestartsDependentsInCanonicalOrder' `
+        -Failure "впала BRAVO: маркер на всі три служби, зупинка BRAVO Web і exchangAPI, журнали BRAVO, запуск BRAVO -> exchangAPI -> BRAVO Web, без Stop-BRAVOMaintenanceStrayProcess: $(& $w4Describe $w4Bravo)"
+
+    # Збій запису маркера -> нічого не зупиняти/запускати, CRITICAL, вихід 60.
+    $w4MarkerFails = & $w4RunProfile @{ Conditions = $w4ExchangeFailed; MarkerWriteFails = $true }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4MarkerFails.Error -and [int]$w4MarkerFails.ExitCode -eq 60 -and
+            @($w4MarkerFails.Events | Where-Object { $_ -match '^(START|STATE|LOGS|CLEAR)' }).Count -eq 0 -and
+            @($w4MarkerFails.Events | Where-Object { $_ -eq 'SLACK  True' }).Count -eq 1 -and
+            [int]$w4MarkerFails.LockExits -eq 1
+        ) `
+        -Name 'ServiceRecovery/ProfileMarkerWriteFailureAbortsWith60' `
+        -Failure "збій запису ownership-маркера: жодних зупинок/запусків, Send-SlackAlert -IsCritical, вихід 60: $(& $w4Describe $w4MarkerFails)"
+
+    # Невдалий запуск -> маркер лишається (Health-watchdog доспробує), вихід 60.
+    $w4StartFails = & $w4RunProfile @{ Conditions = $w4ExchangeFailed; StartFailures = @('exchangAPI') }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4StartFails.Error -and [int]$w4StartFails.ExitCode -eq 60 -and
+            @($w4StartFails.Events | Where-Object { $_ -eq 'START exchangAPI recovery=True' }).Count -eq 1 -and
+            @($w4StartFails.Events | Where-Object { $_ -eq 'CLEAR' }).Count -eq 0 -and
+            @($w4StartFails.Events | Where-Object { $_ -eq 'REPORT' }).Count -eq 1
+        ) `
+        -Name 'ServiceRecovery/ProfileStartFailureKeepsMarker' `
+        -Failure "невдалий запуск впалої служби: маркер не знімається, звіт надсилається, вихід 60: $(& $w4Describe $w4StartFails)"
+
+    # ============================================================
+    # Тест 5 (lock): -NoWait — одна спроба без Start-Sleep і без журналу;
+    # -OperationName — поле operation у JSON lock-а.
+    # ============================================================
+    $w4LockStubs = @'
+function Get-BRAVOOperationLockWaitBudget {
+    param($SchedulerSettings, $TaskType)
+    return [pscustomobject]@{ EffectiveMinutes = 30; LimitDescription = '' }
+}
+function Start-Sleep {
+    param([int]$Seconds)
+    $script:W4Sleeps++
+    throw 'self-test: Start-Sleep під -NoWait заборонено'
+}
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $script:W4LockLog += @($Message)
+}
+'@
+    $w4LockModule = & $w4NewModule ($w4LockStubs + "`n" + $w4RuntimeText) @('Get-BRAVOOperationLockWaitBudget', 'Start-Sleep', 'Write-Log', 'Enter-BRAVOMaintenanceOperationLock')
+    $w4LockRoot = Join-Path ([IO.Path]::GetTempPath()) ("bravo_selftest_w4lock_{0}" -f ([guid]::NewGuid().ToString('N')))
+    [void][IO.Directory]::CreateDirectory($w4LockRoot)
+    $w4LockProbe = $null
+    try {
+        $w4BusyPath = Join-Path $w4LockRoot 'busy.lock'
+        [void][IO.Directory]::CreateDirectory($w4BusyPath)
+        $w4LockProbe = & $w4LockModule {
+            param($BusyPath, $FreePath)
+            $script:operationLockSettings = @{ Path = $BusyPath }
+            $script:schedulerSettings = @{}
+            $script:ScriptVersion = '0.0.0-selftest'
+            $script:ConfigPath = 'C:\BRAVO\BRAVO.config'
+            $script:W4Sleeps = 0
+            $script:W4LockLog = @()
+            $busy = $null; $busyError = $null
+            try { $busy = Enter-BRAVOMaintenanceOperationLock -TaskType Maintenance -NoWait -OperationName 'ServiceRecovery' } catch { $busyError = $_.Exception.Message }
+            $busySleeps = $script:W4Sleeps
+            $busyLog = @($script:W4LockLog).Count
+            $script:operationLockSettings = @{ Path = $FreePath }
+            $free = $null; $freeOperation = $null; $freeError = $null
+            try {
+                $free = Enter-BRAVOMaintenanceOperationLock -TaskType Maintenance -NoWait -OperationName 'ServiceRecovery'
+                if ($null -ne $free -and $free.Success) {
+                    $free.Stream.Dispose()
+                    $freeOperation = [string](([IO.File]::ReadAllText($FreePath)) | ConvertFrom-Json).operation
+                }
+            } catch { $freeError = $_.Exception.Message }
+            $defaultOperation = $null
+            try {
+                $default = Enter-BRAVOMaintenanceOperationLock -TaskType Maintenance
+                if ($null -ne $default -and $default.Success) {
+                    $default.Stream.Dispose()
+                    $defaultOperation = [string](([IO.File]::ReadAllText($FreePath)) | ConvertFrom-Json).operation
+                }
+            } catch { $defaultOperation = "помилка: $($_.Exception.Message)" }
+            return [pscustomobject]@{
+                BusySuccess = $(if ($null -ne $busy) { [bool]$busy.Success } else { $null }); BusyError = $busyError
+                BusySleeps = $busySleeps; BusyLog = $busyLog
+                FreeSuccess = $(if ($null -ne $free) { [bool]$free.Success } else { $null }); FreeOperation = $freeOperation; FreeError = $freeError
+                DefaultOperation = $defaultOperation
+            }
+        } $w4BusyPath (Join-Path $w4LockRoot 'free.lock')
+    } catch {
+        $w4LockProbe = [pscustomobject]@{ BusySuccess = $null; BusyError = $_.Exception.Message; BusySleeps = -1; BusyLog = -1; FreeSuccess = $null; FreeOperation = $null; FreeError = $null; DefaultOperation = $null }
+    } finally {
+        Remove-Item -LiteralPath $w4LockRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4LockProbe.BusyError -and $w4LockProbe.BusySuccess -eq $false -and
+            [int]$w4LockProbe.BusySleeps -eq 0 -and [int]$w4LockProbe.BusyLog -eq 0 -and
+            $w4LockProbe.FreeSuccess -eq $true -and [string]$w4LockProbe.FreeOperation -ceq 'ServiceRecovery' -and
+            [string]$w4LockProbe.DefaultOperation -ceq 'Maintenance'
+        ) `
+        -Name 'ServiceRecovery/LockEnterNoWaitDoesNotSleep' `
+        -Failure ("Enter-BRAVOMaintenanceOperationLock -NoWait: зайнятий lock -> одна спроба, Success=`$false без Start-Sleep і Write-Log; -OperationName пишеться в поле operation (за замовчуванням 'Maintenance'). " +
+            "busy=$($w4LockProbe.BusySuccess) помилка='$($w4LockProbe.BusyError)' sleeps=$($w4LockProbe.BusySleeps) log=$($w4LockProbe.BusyLog) free=$($w4LockProbe.FreeSuccess)/'$($w4LockProbe.FreeOperation)' '$($w4LockProbe.FreeError)' default='$($w4LockProbe.DefaultOperation)'")
+
+    # ============================================================
+    # Проводка параметра і статичні заборони профілю.
+    # ============================================================
+    $w4EntryAst = [Management.Automation.Language.Parser]::ParseInput($w4EntryText, [ref]$null, [ref]$null)
+    $w4EntryParams = @($w4EntryAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    $w4EntryLines = @($w4EntryText -split "`r?`n").Count
+    $w4RuntimeScriptParams = @($w4RuntimeAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    $w4MaintenanceFunction = & $w4FindRuntimeFunction 'Invoke-BRAVOMaintenance'
+    $w4MaintenanceParams = @()
+    if ($null -ne $w4MaintenanceFunction -and $null -ne $w4MaintenanceFunction.Body.ParamBlock) {
+        $w4MaintenanceParams = @($w4MaintenanceFunction.Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $w4EntryParams -contains 'RecoverServices' -and
+            $w4EntryText -match 'RecoverServices\s*=\s*\$RecoverServices' -and
+            $w4EntryLines -le 250 -and
+            $w4RuntimeScriptParams -contains 'RecoverServices' -and
+            $w4MaintenanceParams -contains 'RecoverServices' -and
+            $w4RuntimeText -match 'if \(\$RecoverServices\) \{ \$elevatedArguments \+= "-RecoverServices" \}'
+        ) `
+        -Name 'ServiceRecovery/RecoverServicesParameterWiring' `
+        -Failure "-RecoverServices: параметр BRAVO_MAINTENANCE.ps1 (≤250 рядків, рядків=$w4EntryLines) передається в runtime, є в param() скрипта і Invoke-BRAVOMaintenance і зберігається при елевації; entry=[$($w4EntryParams -join ',')] runtime=[$($w4RuntimeScriptParams -join ',')] fn=[$($w4MaintenanceParams -join ',')]"
+
+    $w4ConflictIf = $null
+    if ($null -ne $w4MaintenanceFunction) {
+        $w4ConflictIf = @($w4MaintenanceFunction.Body.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -match '\$RecoverServices' -and
+                    $node.Clauses[0].Item1.Extent.Text -match '\$ForceRestore' -and
+                    $node.Clauses[0].Item1.Extent.Text -match '\$RunMissedRestoreOnly'
+                }, $true)) | Select-Object -First 1
+    }
+    $w4ConflictOffset = if ($null -ne $w4ConflictIf) { $w4ConflictIf.Extent.StartOffset } else { -1 }
+    $w4ElevationOffset = $w4RuntimeText.IndexOf('$elevatedProcess = Start-Process powershell.exe')
+    $w4ClearHostOffset = $w4RuntimeText.IndexOf("`nClear-Host")
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $w4ConflictIf -and
+            $w4ConflictIf.Clauses[0].Item2.Extent.Text -match 'exit \(Resolve-BRAVOExitCode -InvalidConfiguration\)' -and
+            $w4ConflictOffset -ge 0 -and $w4ElevationOffset -gt $w4ConflictOffset -and $w4ClearHostOffset -gt $w4ConflictOffset
+        ) `
+        -Name 'ServiceRecovery/RecoverServicesConflictExits30' `
+        -Failure "-RecoverServices з -ForceRestore/-RunMissedRestoreOnly: exit (Resolve-BRAVOExitCode -InvalidConfiguration) = 30 до елевації і Clear-Host; знайдено=$($null -ne $w4ConflictIf) offset=$w4ConflictOffset elevation=$w4ElevationOffset clear=$w4ClearHostOffset"
+
+    $w4LogFileAnchor = $w4RuntimeText.IndexOf('$script:LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"')
+    $w4StepsAnchor = $w4RuntimeText.IndexOf('Initialize-BRAVOMaintenanceSteps -Total 8')
+    $w4BranchIf = $null
+    if ($null -ne $w4MaintenanceFunction) {
+        $w4BranchIf = @($w4MaintenanceFunction.Body.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -eq '$RecoverServices' -and
+                    $node.Clauses[0].Item2.Extent.Text.Contains('Invoke-BRAVOMaintenanceServiceRecoveryProfile')
+                }, $true)) | Select-Object -First 1
+    }
+    $w4BranchOffset = if ($null -ne $w4BranchIf) { $w4BranchIf.Extent.StartOffset } else { -1 }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $w4BranchIf -and $w4LogFileAnchor -ge 0 -and $w4StepsAnchor -gt $w4BranchOffset -and $w4BranchOffset -gt $w4LogFileAnchor -and
+            $w4BranchIf.Extent.Text -match 'BRAVO_MAINTENANCE_\{0\}_RECOVER_PID\{1\}\.log' -and
+            $w4BranchIf.Extent.Text -match '\bexit\b'
+        ) `
+        -Name 'ServiceRecovery/RecoverProfileBranchesBeforeFirstLogWrite' `
+        -Failure "розгалуження if (`$RecoverServices) { ... Invoke-BRAVOMaintenanceServiceRecoveryProfile ... exit } — після визначення LOG_FILE і до Initialize-BRAVOMaintenanceSteps, журнал BRAVO_MAINTENANCE_<ts>_RECOVER_PID<pid>.log; знайдено=$($null -ne $w4BranchIf) offset=$w4BranchOffset logFile=$w4LogFileAnchor steps=$w4StepsAnchor"
+
+    $w4ProfileFunctionNames = @('Invoke-BRAVOMaintenanceServiceRecoveryProfile', 'Initialize-BRAVOMaintenanceServiceRecoveryLogSources', 'Get-BRAVOMaintenanceServiceRecoveryServices')
+    $w4ProfileFunctions = @($w4ProfileFunctionNames | ForEach-Object { & $w4FindRuntimeFunction $_ } | Where-Object { $null -ne $_ })
+    $w4ForbiddenCommands = @('Stop-BRAVOMaintenanceStrayProcess', 'Invoke-BRAVOMaintenanceBeforeServiceStopHook', 'Stop-BRAVOMaintenanceManagedService',
+        'Stop-BRAVOMaintenanceManagedServices', 'Start-BRAVOMaintenanceManagedServices', 'Write-BRAVOTaskExecutionState', 'Write-BRAVOOperationStatus',
+        'Send-BRAVOMaintenanceOperationsEvent', 'Send-FinalReport', 'Set-Service', 'Set-BRAVOServiceStartMode', 'Suspend-BRAVOServiceAutostart',
+        'Start-Service', 'Stop-Service', 'Initialize-BRAVOMaintenanceSteps')
+    $w4ForbiddenFound = @($w4ProfileFunctions | ForEach-Object {
+            $_.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true) |
+                Where-Object { $w4ForbiddenCommands -contains $_.GetCommandName() } |
+                ForEach-Object { $_.GetCommandName() }
+        } | Select-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition (
+            $w4ProfileFunctions.Count -eq $w4ProfileFunctionNames.Count -and
+            $w4ForbiddenFound.Count -eq 0 -and
+            $w4RuntimeText -notmatch 'Set-Service'
+        ) `
+        -Name 'ServiceRecovery/RecoverProfileForbiddenCalls' `
+        -Failure ("профіль -RecoverServices не пише стан задачі Maintenance/статус операції, не викликає Stop-BRAVOMaintenanceStrayProcess (точка #316), не змінює типи запуску і керує службами лише через Invoke-ServiceStateChange/Start-BRAVOMaintenanceManagedService; runtime не містить Set-Service. " +
+            "функцій=$($w4ProfileFunctions.Count)/$($w4ProfileFunctionNames.Count) заборонені=[$($w4ForbiddenFound -join ', ')]")
 }

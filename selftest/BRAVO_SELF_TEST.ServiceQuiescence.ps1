@@ -394,6 +394,66 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
         -Name "ServiceQuiescence/WatchdogRespectsSuppressedMarker" `
         -Failure "suppressed-маркер: жодного старту, маркер лишається, issue про потребу ручного відновлення"
 
+    # (в-2) #314 хвиля 4: профіль BRAVO_MAINTENANCE.ps1 -RecoverServices пише
+    # маркер з owner BRAVO_MAINTENANCE_RECOVER. Справжні Write/Read
+    # (BRAVO.System) мають приймати цього owner (round-trip), а watchdog —
+    # відновлювати служби за осиротілим маркером цього owner так само, як за
+    # маркером нічного Maintenance (аварійно перерваний профіль).
+    $recoverOwnerTestRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "bravo_selftest_recover_owner_{0}" -f ([guid]::NewGuid().ToString("N"))
+    )
+    [void][IO.Directory]::CreateDirectory($recoverOwnerTestRoot)
+    $recoverOwnerWriteError = $null
+    $recoverOwnerReadState = $null
+    try {
+        $recoverOwnerReadState = & $quiescenceStateModule {
+            param($Path)
+            Set-BRAVOSelfTestQuiescenceStatePath -Path $Path
+            [void](Write-BRAVOServiceQuiescenceState `
+                -Owner 'BRAVO_MAINTENANCE_RECOVER' `
+                -Services @(
+                    @{ Name = 'BRAVO'; RestartIntent = $true },
+                    @{ Name = 'exchangAPI'; RestartIntent = $true }
+                ) `
+                -LogFile 'C:\LOGS\BRAVO_MAINTENANCE_20261007_101500_RECOVER_PID1234.log')
+            Read-BRAVOServiceQuiescenceState
+        } (Join-Path $recoverOwnerTestRoot 'BRAVO_SERVICE_QUIESCENCE.json')
+    } catch {
+        $recoverOwnerWriteError = $_.Exception.Message
+    } finally {
+        Remove-Item -LiteralPath $recoverOwnerTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $recoverOwnerWriteError -and
+            $null -ne $recoverOwnerReadState -and
+            [string]$recoverOwnerReadState.owner -eq 'BRAVO_MAINTENANCE_RECOVER' -and
+            @($recoverOwnerReadState.services).Count -eq 2 -and
+            [bool]$recoverOwnerReadState.services[1].RestartIntent -eq $true -and
+            [bool]$recoverOwnerReadState.restartSuppressed -eq $false
+        ) `
+        -Name "ServiceQuiescence/StateRoundTripAcceptsRecoverOwner" `
+        -Failure "Write/Read-BRAVOServiceQuiescenceState мають приймати owner BRAVO_MAINTENANCE_RECOVER (профіль -RecoverServices, #314); помилка: '$recoverOwnerWriteError' прочитано: $($null -ne $recoverOwnerReadState)"
+
+    $recoverOwnerMarker = $orphanedQuiescenceMarker.PSObject.Copy()
+    $recoverOwnerMarker.owner = 'BRAVO_MAINTENANCE_RECOVER'
+    $recoverOwnerMarker.logFile = 'C:\LOGS\BRAVO_MAINTENANCE_20261007_101500_RECOVER_PID1234.log'
+    $recoverOwnerScenario = & $quiescenceWatchdogModule {
+        param($State)
+        Invoke-BRAVOSelfTestQuiescenceScenario -State $State -OwnerAlive $false -StartFailures @()
+    } $recoverOwnerMarker
+    Test-BRAVOCondition `
+        -Condition (
+            @($recoverOwnerScenario.StartedServices).Count -eq 2 -and
+            @($recoverOwnerScenario.StartedServices) -contains 'BRAVO' -and
+            @($recoverOwnerScenario.StartedServices) -contains 'exchangAPI' -and
+            $recoverOwnerScenario.MarkerCleared -eq $true -and
+            @($recoverOwnerScenario.Issues).Count -eq 1 -and
+            [string]$recoverOwnerScenario.Issues[0].Reason -match 'BRAVO_MAINTENANCE_RECOVER'
+        ) `
+        -Name "Health/WatchdogRecognizesRecoverOwner" `
+        -Failure "осиротілий маркер owner BRAVO_MAINTENANCE_RECOVER (мертвий власник): watchdog стартує RestartIntent-служби, чистить маркер і називає owner у issue; стартовано: [$(@($recoverOwnerScenario.StartedServices) -join ', ')]"
+
     # (г) РЕГРЕСІЯ ГОЛОВНОЇ ВИМОГИ: маркера немає (техпідтримка зупинила
     # служби вручну) -> watchdog НІКОЛИ не стартує.
     $manualStopScenario = & $quiescenceWatchdogModule {
