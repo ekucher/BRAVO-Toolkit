@@ -24536,6 +24536,10 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_PREFLIGHT_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
     try {
+        # Корінь створюється заздалегідь: probe прибирає ВЕСЬ ланцюжок
+        # каталогів, які сам створив (#283), тож корінь, якого ще не було б,
+        # теж зник би, а нижче він потрібен як "каталог, що реально існує".
+        New-Item -ItemType Directory -Path $preflightTestRoot -Force | Out-Null
         $missingDirectory = Join-Path $preflightTestRoot "created\by\probe"
         $writeResult = & $dryRunProbeModule {
             param($Path)
@@ -24548,12 +24552,10 @@ function Get-BRAVOMaintenanceSummaryResult {
             param($Path)
             Test-BRAVOFileSystemReadAccess -Path $Path
         } (Join-Path $preflightTestRoot "no-such-directory")
-        # $preflightTestRoot (не $missingDirectory) — після фікса "cleanup
-        # порожнього probe-каталогу" сам $missingDirectory (лист .\created\
-        # by\probe) прибирається, якщо лишився порожнім; батьківський
-        # $preflightTestRoot прибирання не чіпає (лише сам $Path, не
-        # предків), тому лишається надійною ціллю для "read access на
-        # каталог, що реально існує".
+        # $preflightTestRoot (не $missingDirectory) — probe прибирає
+        # порожній ланцюжок .\created\by\probe, який сам створив, а
+        # $preflightTestRoot існував до probe і не чіпається, тому лишається
+        # надійною ціллю для "read access на каталог, що реально існує".
         $readExisting = & $dryRunProbeModule {
             param($Path)
             Test-BRAVOFileSystemReadAccess -Path $Path
@@ -24581,6 +24583,37 @@ function Get-BRAVOMaintenanceSummaryResult {
             ) `
             -Name 'Runtime/08-WriteProbeCleansUpEmptyCreatedDirectory' `
             -Failure 'write-probe має прибирати за собою каталог, який САМ створив, якщо після перевірки він лишився порожнім — "dry" run не повинен лишати побічний production-каталог на диску'
+        # #283: probe на <Dest>\.work, коли <Dest> ще немає, створює обидва
+        # каталоги; прибрати треба весь створений ланцюжок, а не лише .work.
+        $missingDestination = Join-Path $preflightTestRoot 'missing-dest'
+        $nestedWorkResult = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOFileSystemWriteAccess -Path $Path
+        } (Join-Path $missingDestination '.work')
+        Test-BRAVOCondition `
+            -Condition (
+                [bool]$nestedWorkResult.Success -and
+                -not (Test-Path -LiteralPath $missingDestination) -and
+                (Test-Path -LiteralPath $preflightTestRoot -PathType Container) -and
+                ([string]$nestedWorkResult.Detail).Contains('тимчасово створювався для перевірки й прибраний після неї')
+            ) `
+            -Name 'Runtime/08-WriteProbeRemovesCreatedEmptyAncestors' `
+            -Failure 'write-probe на <Dest>\.work не повинен лишати порожній <Dest>, який створив сам; наявний батьківський каталог має лишитися'
+        # Наявний (навіть порожній) предок не належить probe і лишається.
+        $existingParent = Join-Path $preflightTestRoot 'existing-parent'
+        New-Item -ItemType Directory -Path $existingParent -Force | Out-Null
+        $existingParentResult = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOFileSystemWriteAccess -Path $Path
+        } (Join-Path $existingParent 'new-dest\.work')
+        Test-BRAVOCondition `
+            -Condition (
+                [bool]$existingParentResult.Success -and
+                (Test-Path -LiteralPath $existingParent -PathType Container) -and
+                -not (Test-Path -LiteralPath (Join-Path $existingParent 'new-dest'))
+            ) `
+            -Name 'Runtime/08-WriteProbeKeepsPreexistingAncestor' `
+            -Failure 'write-probe має прибрати лише каталоги, які створив сам; каталог, що існував до перевірки, не видаляється навіть порожнім'
         Test-BRAVOCondition `
             -Condition (
                 $archiveScriptText.Contains('function Test-BRAVOFileSystemWriteProbe') -and
