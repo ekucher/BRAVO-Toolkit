@@ -1827,9 +1827,12 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
     }
 
     # 2. Паузи 0/5/15/60 хв між спробами (FR-5). Далі — лише служби, чия
-    # пауза минула.
+    # пауза минула. Впала BRAVO у паузі утримує впалі залежні (exchangAPI,
+    # BRAVO Web): без BRAVO вони не працюють, тож у цьому тику їх не
+    # запускають і не обліковують — лише рядок у зведенні.
     $allowedNames = @()
     $pausedTexts = @()
+    $bravoPausedUntil = $null
     foreach ($failedCondition in $failedConditions) {
         $attemptDecision = Get-BRAVOServiceRecoveryAttemptDecision -State $recoveryState -ServiceName ([string]$failedCondition.Name) -Now $recoveryNow
         if ([bool]$attemptDecision.Allowed) {
@@ -1837,7 +1840,17 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
         } else {
             $pausedTexts += ('{0}: {1} впала, пауза до {2} (спроба {3})' -f $recoveryNow.ToString('yyyy-MM-dd'), $failedCondition.Name,
                 ([datetime]$attemptDecision.NextAllowedAt).ToString('HH:mm'), $attemptDecision.AttemptNumber)
+            if ([string]$failedCondition.Key -eq 'Bravo') { $bravoPausedUntil = [datetime]$attemptDecision.NextAllowedAt }
         }
+    }
+    if ($allowedNames.Count -gt 0) {
+        $pausePlan = Get-BRAVOServiceRecoveryChainPlan -Conditions $recoveryConditions -EligibleNames $allowedNames
+        foreach ($heldName in @($pausePlan.HeldByBravoNames)) {
+            if (@($allowedNames) -notcontains [string]$heldName) { continue }
+            $pausedTexts += ('{0}: {1} впала, чекає на BRAVO (BRAVO у паузі до {2})' -f $recoveryNow.ToString('yyyy-MM-dd'), $heldName,
+                $(if ($null -ne $bravoPausedUntil) { $bravoPausedUntil.ToString('HH:mm') } else { '?' }))
+        }
+        if (@($pausePlan.FailedNames).Count -eq 0) { $allowedNames = @() }
     }
     if ($allowedNames.Count -eq 0) {
         foreach ($pausedText in $pausedTexts) {

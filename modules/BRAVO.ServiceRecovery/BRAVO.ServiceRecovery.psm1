@@ -683,6 +683,10 @@ function Get-BRAVOServiceRecoveryChainPlan {
     #     запускається (і обліковується); залежна в Pending -> Deferred;
     #   - впала exchangAPI / BRAVO Web без впалої BRAVO: запускається лише
     #     вона; BRAVO в Pending -> Deferred;
+    #   - впала BRAVO у паузі (не в -EligibleNames): залежні від неї
+    #     exchangAPI і BRAVO Web у цьому тику не запускаються, не
+    #     зупиняються і не обліковуються, навіть якщо їхня власна пауза
+    #     минула; впалі з них — у HeldByBravoNames (рядок зведення);
     #   - Disabled, NotInstalled, OwnedByBravo, призупинена (Failed, але не
     #     Stopped — §0.3) — поза планом.
     # Deferred непорожній = план цього тику НЕ виконується (служба саме
@@ -690,7 +694,8 @@ function Get-BRAVOServiceRecoveryChainPlan {
     # Результат: FailedKeys/FailedNames (обліковуються як спроба;
     # AccountedNames — те саме), StopKeys/StopOrder (порядок зупинки BRAVO
     # Web -> exchangAPI), StartKeys/StartOrder (канонічний порядок запуску),
-    # Deferred (імена).
+    # Deferred (імена), HeldByBravoNames (впалі залежні, утримані паузою
+    # BRAVO).
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Conditions,
@@ -721,8 +726,10 @@ function Get-BRAVOServiceRecoveryChainPlan {
     $stop = @{}
     $start = @{}
     $deferred = @{}
+    $held = @{}
     $bravo = $byKey['Bravo']
     $bravoFailed = ($null -ne $bravo -and (& $isEligible $bravo))
+    $bravoHeld = (-not $bravoFailed -and $null -ne $bravo -and (Test-BRAVOServiceRecoveryFailed -Condition $bravo))
     if ($bravoFailed) {
         $failed['Bravo'] = $true
         $start['Bravo'] = $true
@@ -730,7 +737,9 @@ function Get-BRAVOServiceRecoveryChainPlan {
     foreach ($dependentKey in @('ExchangeApi', 'BravoWeb')) {
         $dependent = $byKey[$dependentKey]
         if ($null -eq $dependent) { continue }
-        if ($bravoFailed) {
+        if ($bravoHeld) {
+            if (Test-BRAVOServiceRecoveryFailed -Condition $dependent) { $held[$dependentKey] = $true }
+        } elseif ($bravoFailed) {
             if (Test-BRAVOServiceRecoveryFailed -Condition $dependent) {
                 $failed[$dependentKey] = $true
                 $start[$dependentKey] = $true
@@ -754,16 +763,18 @@ function Get-BRAVOServiceRecoveryChainPlan {
     $stopKeys = @(Get-BRAVOManagedServiceOrder -Direction Stop | Where-Object { $stop.ContainsKey($_) })
     $startKeys = @($startKeyOrder | Where-Object { $start.ContainsKey($_) })
     $deferredKeys = @($startKeyOrder | Where-Object { $deferred.ContainsKey($_) })
+    $heldKeys = @($startKeyOrder | Where-Object { $held.ContainsKey($_) })
     $failedNames = @($failedKeys | ForEach-Object { $byKey[$_].Name })
     return [pscustomobject]@{
-        FailedKeys     = $failedKeys
-        FailedNames    = $failedNames
-        StopKeys       = $stopKeys
-        StopOrder      = @($stopKeys | ForEach-Object { $byKey[$_].Name })
-        StartKeys      = $startKeys
-        StartOrder     = @($startKeys | ForEach-Object { $byKey[$_].Name })
-        Deferred       = @($deferredKeys | ForEach-Object { $byKey[$_].Name })
-        AccountedNames = $failedNames
+        FailedKeys       = $failedKeys
+        FailedNames      = $failedNames
+        StopKeys         = $stopKeys
+        StopOrder        = @($stopKeys | ForEach-Object { $byKey[$_].Name })
+        StartKeys        = $startKeys
+        StartOrder       = @($startKeys | ForEach-Object { $byKey[$_].Name })
+        Deferred         = @($deferredKeys | ForEach-Object { $byKey[$_].Name })
+        AccountedNames   = $failedNames
+        HeldByBravoNames = @($heldKeys | ForEach-Object { $byKey[$_].Name })
     }
 }
 
