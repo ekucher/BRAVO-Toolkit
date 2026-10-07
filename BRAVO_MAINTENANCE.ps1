@@ -8,7 +8,9 @@ param(
     [ValidateSet('on', 'off')][string]$AutoShutdown,
     [Alias('ArchivLims')][ValidateSet('on', 'off')][string]$ArchiveAfterMaintenance,
     [string]$ConfigPath,
-    [switch]$NoPause
+    [switch]$NoPause,
+    # #314: профіль відновлення впалих служб (задача BRAVO_SERVICE_RECOVERY).
+    [switch]$RecoverServices
 )
 
 # Пауза перед закриттям вікна тут навмисно самодостатня — див. коментар
@@ -153,7 +155,7 @@ $parameters = @{
     DisableSizeCheck = $DisableSizeCheck; EnableAllSlack = $EnableAllSlack
     DisableAllSlack = $DisableAllSlack; ConfigPath = $ConfigPath
     ConfigPathWasExplicit = $configPathWasExplicit
-    NoPause = $NoPause
+    NoPause = $NoPause; RecoverServices = $RecoverServices
     RuntimeRoot = $PSScriptRoot; EntryScriptPath = $PSCommandPath
 }
 if ($PSBoundParameters.ContainsKey('AutoShutdown')) { $parameters.AutoShutdown = $AutoShutdown }

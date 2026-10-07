@@ -18,6 +18,7 @@ param (
     [string]$ConfigPath,
     [bool]$ConfigPathWasExplicit = $false,
     [switch]$NoPause,
+    [switch]$RecoverServices,
     [Parameter(Mandatory = $true)][string]$RuntimeRoot,
     [Parameter(Mandatory = $true)][string]$EntryScriptPath
 )
@@ -59,6 +60,7 @@ function Invoke-BRAVOMaintenance {
         [string]$ConfigPath,
         [bool]$ConfigPathWasExplicit = $false,
         [switch]$NoPause,
+        [switch]$RecoverServices,
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [Parameter(Mandatory = $true)][string]$EntryScriptPath
     )
@@ -125,6 +127,14 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
 
+# #314 хвиля 4 (FR-3): -RecoverServices — окремий легкий профіль
+# відновлення впалих служб (без реставрації й обслуговування). Поєднання з
+# реставраційними режимами суперечливе — відмова до елевації та будь-яких дій.
+if ($RecoverServices -and ($ForceRestore -or $RunMissedRestoreOnly)) {
+    Write-Host "ПОМИЛКА: -RecoverServices несумісний з -ForceRestore і -RunMissedRestoreOnly" -ForegroundColor Red
+    exit (Resolve-BRAVOExitCode -InvalidConfiguration)
+}
+
 # Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass –Force
 
 # За потреби запит на підвищення дозволу виконання скрипта. SYSTEM не має
@@ -139,6 +149,7 @@ If (-not $isLocalSystem -and -not $currentPrincipal.IsInRole([Security.Principal
 	if ($DisableSizeCheck) { $elevatedArguments += "-DisableSizeCheck" }
 	if ($EnableAllSlack) { $elevatedArguments += "-EnableAllSlack" }
 	if ($DisableAllSlack) { $elevatedArguments += "-DisableAllSlack" }
+	if ($RecoverServices) { $elevatedArguments += "-RecoverServices" }
 	if ($PSBoundParameters.ContainsKey('AutoShutdown')) { $elevatedArguments += @("-AutoShutdown", $AutoShutdown) }
 	if ($PSBoundParameters.ContainsKey('ArchiveAfterMaintenance')) {
         $elevatedArguments += @("-ArchiveAfterMaintenance", $ArchiveAfterMaintenance)
@@ -1300,10 +1311,12 @@ function Send-BRAVOMaintenanceServiceRecoveredAlert {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [AllowNull()][object]$Condition,
-        [Parameter(Mandatory = $true)][object]$Attempt
+        [Parameter(Mandatory = $true)][object]$Attempt,
+        # Остання подія SCM служби (профіль -RecoverServices): Id і час у тексті.
+        [AllowNull()][object]$LastScmEvent
     )
 
-    $recoveredText = New-BRAVOServiceRecoveryNotificationText -Kind 'Recovered' -ServiceName $Name -Condition $Condition -AttemptNumber ([int]$Attempt.AttemptNumber) -LogPath $LOG_FILE
+    $recoveredText = New-BRAVOServiceRecoveryNotificationText -Kind 'Recovered' -ServiceName $Name -Condition $Condition -AttemptNumber ([int]$Attempt.AttemptNumber) -LogPath $LOG_FILE -LastScmEvent $LastScmEvent
     Send-SlackAlert -Message $recoveredText -Severity 'WARNING'
     if ([bool]$Attempt.CyclicAlertDue) {
         $cyclicNow = Get-Date
@@ -1573,7 +1586,10 @@ function Start-BRAVOMaintenanceManagedService {
         [Parameter(Mandatory = $true)][ValidateSet('Bravo', 'ExchangeApi', 'BravoWeb')][string]$Key,
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][hashtable]$Outcome,
-        [AllowNull()][object]$RecoveryCondition
+        [AllowNull()][object]$RecoveryCondition,
+        # Профіль -RecoverServices (#314 хвиля 4): остання подія SCM впалої
+        # служби для тексту Recovered.
+        [AllowNull()][object]$LastScmEvent
     )
 
     $isBravoWeb = ($Key -eq 'BravoWeb')
@@ -1602,7 +1618,7 @@ function Start-BRAVOMaintenanceManagedService {
                 }
                 if ($isRecovery) {
                     Write-Log -Message "Служба $Name була зупинена до обслуговування ($(Get-BRAVOMaintenanceServiceExitCodeText -Condition $RecoveryCondition)), запущена" -Level "INFO"
-                    Send-BRAVOMaintenanceServiceRecoveredAlert -Name $Name -Condition $RecoveryCondition -Attempt $recoveryAttempt
+                    Send-BRAVOMaintenanceServiceRecoveredAlert -Name $Name -Condition $RecoveryCondition -Attempt $recoveryAttempt -LastScmEvent $LastScmEvent
                 }
             } elseif ($Key -eq 'Bravo') {
                 $errorMsg = if ($isRecovery) {
@@ -1689,6 +1705,305 @@ function Start-BRAVOMaintenanceManagedServices {
     }
 }
 
+# ===== ПРОФІЛЬ -RecoverServices: ВІДНОВЛЕННЯ ВПАЛИХ СЛУЖБ (#314 хвиля 4, FR-3) =====
+# BRAVO_MAINTENANCE.ps1 -RecoverServices — легкий профіль, який задача
+# BRAVO_SERVICE_RECOVERY запускає за подією SCM, після старту ОС і кожні
+# 15 хв. Він не виконує обслуговування: класифікує керовані служби (без
+# lock-а), за потреби бере операційний lock без очікування, зберігає докази
+# (стан служби, ExitCode, події SCM) у власному журналі
+# BRAVO_MAINTENANCE_<ts>_RECOVER_PID<pid>.log, обробляє журнали впалих служб
+# і запускає їх у порядку BRAVO -> exchangAPI -> BRAVO Web під
+# ownership-маркером BRAVO_MAINTENANCE_RECOVER. Цикл служб — ті самі функції,
+# що в нічному прогоні (Invoke-ServiceStateChange,
+# Invoke-BRAVOMaintenanceServiceLogProcessing, Start-BRAVOMaintenanceManagedService
+# з обліком спроб і сповіщеннями FR-5/FR-6); рішення — чисті функції
+# BRAVO.ServiceRecovery. Профіль НЕ пише стан задачі Maintenance і статус
+# операції (інакше зламалися б Test-BRAVOTaskWasMissed і heartbeat), не
+# змінює типи запуску і не завершує сторонні процеси
+# (Stop-BRAVOMaintenanceStrayProcess, точка #316: Bis не заважає запуску).
+
+function Get-BRAVOMaintenanceServiceRecoveryServices {
+    # Керовані служби профілю — той самий опис, що $maintenanceManagedServices
+    # нічного прогону (Disabled від оператора не керується).
+    return @(
+        @{ Key = 'Bravo'; Name = [string]$BravoServiceName; Enabled = [bool]$BravoMaintenanceEnabled },
+        @{ Key = 'ExchangeApi'; Name = [string]$ExchangAPIServiceName; Enabled = [bool]$exchangAPIServiceEnabled },
+        @{ Key = 'BravoWeb'; Name = [string]$BravoWebServiceName; Enabled = [bool]$BravoWebMaintenanceEnabled }
+    )
+}
+
+function Initialize-BRAVOMaintenanceServiceRecoveryLogSources {
+    # Джерела журналів і каталоги призначення лише для впалих служб (-Keys) —
+    # те, що нічний прогін готує в блоках «ДЖЕРЕЛА ЖУРНАЛІВ» і «СТВОРЕННЯ
+    # НЕОБХІДНИХ ДИРЕКТОРІЙ». Результат — змінні, які читає
+    # Invoke-BRAVOMaintenanceServiceLogProcessing.
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Keys)
+
+    $sources = @{ TraceConfiguration = $null; TraceOutSources = @(); BravoFilePhaseAllowed = $false; ExchangeApiRuntime = $null }
+    $directories = @()
+    if ($Keys -contains 'Bravo' -and $BravoMaintenanceEnabled) {
+        $sources.TraceConfiguration = Get-BRAVOTraceConfiguration `
+            -DiscoveryResult $bravoDiscoveryResult `
+            -TraceRootDirectory $TRACE_DIR `
+            -DateFolderName $LOG_DATE_FOLDER
+        $traceSrvPath = if ($sources.TraceConfiguration.IsValid) { [string]$sources.TraceConfiguration.TracePath } else { '' }
+        if (-not $sources.TraceConfiguration.IsValid) {
+            Write-Log -Message "BRAVO Trace [Debug]/FILE не визначено: $($sources.TraceConfiguration.Reason) — обробляються лише *.out кореня інсталяції" -Level "WARNING"
+        }
+        $traceOutEnumeration = Get-BRAVOInstallationTraceOutSources `
+            -InstallationRoot ([string]$bravoDiscoveryResult.BRAVO_ROOT) `
+            -LimsRoot $ROOT_LIMS `
+            -SrvTracePath $traceSrvPath `
+            -ExplicitBisPath ([string]$MaintenanceConfig.Trace.BISSourcePath)
+        $sources.TraceOutSources = @($traceOutEnumeration.Sources)
+        $sources.BravoFilePhaseAllowed = $true
+        Write-Log -Message "BRAVO Trace *.out: джерел $(@($sources.TraceOutSources).Count) -> $TRACE_DIR" -Level "INFO"
+        $directories += $TRACE_DIR
+    }
+    if ($Keys -contains 'ExchangeApi' -and $exchangAPIServiceEnabled) {
+        $sources.ExchangeApiRuntime = Resolve-BRAVOExchangeApiRuntimeDirectory `
+            -ServiceName $ExchangAPIServiceName `
+            -FallbackDirectory $ROOT_LIMS
+        Write-Log -Message "exchangAPI робочий каталог: $($sources.ExchangeApiRuntime.Directory) ($($sources.ExchangeApiRuntime.Reason)) -> $EXCHANGE_LOG_DIR" -Level "INFO"
+        $directories += $EXCHANGE_LOG_DIR
+    }
+    if ($Keys -contains 'BravoWeb' -and $BravoWebMaintenanceEnabled -and $ApacheEnabled) {
+        $directories += $BRAVOWEB_LOG_DIR, $APACHE_LOG_DIR, $APACHE_DAILY_LOG_DIR, $BRAVOWEB_APP_LOG_DIR, $BRAVOWEB_APP_DAILY_LOG_DIR
+    }
+    foreach ($directory in $directories) {
+        if (Test-Path -LiteralPath $directory -PathType Container) { continue }
+        try {
+            [void](New-Item -Path $directory -ItemType Directory -Force -ErrorAction Stop)
+            Write-Log -Message "Створено директорію: $directory" -Level "SUCCESS"
+        } catch {
+            # Ротація цього компонента сама повідомить про збій; запуск служби
+            # відсутній каталог журналів не блокує.
+            Write-Log -Message "Не вдалося створити директорію ${directory}: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
+    return $sources
+}
+
+function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
+    # Повертає код завершення: 0 — немає що робити / усе піднято; 10 — піднято
+    # з попередженнями; 20 — lock зайнятий або ownership-маркер живого
+    # чужого власника; 60 — критична помилка (маркер не записано, служба не
+    # запустилась).
+    # Профіль іде кожні 15 хв: SFTP-вивантаження власного журналу (зовнішній
+    # finally runtime) йому не потрібне.
+    $script:maintenanceOwnLogUploadAttempted = $true
+    $recoveryServices = @(Get-BRAVOMaintenanceServiceRecoveryServices)
+
+    # 1. Класифікація без lock-а. Немає впалих — вихід 0 без запису на диск
+    # (журнал RECOVER не створюється); єдиний дозволений запис — state, коли
+    # змінилося спостереження стабільності (stableSince / скидання обліку).
+    $recoveryConditions = @(Get-BRAVOServiceRecoveryConditions -Services $recoveryServices)
+    $failedConditions = @($recoveryConditions | Where-Object { Test-BRAVOServiceRecoveryFailed -Condition $_ })
+    $recoveryStateRead = Read-BRAVOServiceRecoveryState
+    $recoveryState = $recoveryStateRead.State
+    $recoveryNow = Get-Date
+    if (-not [string]::IsNullOrWhiteSpace([string]$recoveryStateRead.Warning)) {
+        Write-Host "УВАГА: $($recoveryStateRead.Warning)" -ForegroundColor Yellow
+    }
+    if ($failedConditions.Count -eq 0) {
+        $recoveryStateChanged = $false
+        foreach ($recoveryCondition in $recoveryConditions) {
+            if ([string]$recoveryCondition.Condition -ne 'Running') { continue }
+            $stableObservation = Register-BRAVOServiceRecoveryStableObservation -State $recoveryState -ServiceName ([string]$recoveryCondition.Name) -Now $recoveryNow
+            if ([bool]$stableObservation.Changed) {
+                $recoveryState = $stableObservation.State
+                $recoveryStateChanged = $true
+            }
+        }
+        if ($recoveryStateChanged) {
+            try {
+                Write-BRAVOServiceRecoveryState -State $recoveryState -Now $recoveryNow
+            } catch {
+                Write-Host "УВАГА: не вдалося записати state відновлення служб: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+        Write-Host "Відновлення служб: впалих керованих служб немає — дій не потрібно"
+        return 0
+    }
+
+    # 2. Паузи 0/5/15/60 хв між спробами (FR-5). Далі — лише служби, чия
+    # пауза минула.
+    $allowedNames = @()
+    $pausedTexts = @()
+    foreach ($failedCondition in $failedConditions) {
+        $attemptDecision = Get-BRAVOServiceRecoveryAttemptDecision -State $recoveryState -ServiceName ([string]$failedCondition.Name) -Now $recoveryNow
+        if ([bool]$attemptDecision.Allowed) {
+            $allowedNames += [string]$failedCondition.Name
+        } else {
+            $pausedTexts += ('{0}: {1} впала, пауза до {2} (спроба {3})' -f $recoveryNow.ToString('yyyy-MM-dd'), $failedCondition.Name,
+                ([datetime]$attemptDecision.NextAllowedAt).ToString('HH:mm'), $attemptDecision.AttemptNumber)
+        }
+    }
+    if ($allowedNames.Count -eq 0) {
+        foreach ($pausedText in $pausedTexts) {
+            try {
+                [void](Add-BRAVOServiceRecoverySummaryLine -Path ([IO.Path]::Combine([string]$LOG_DIR, 'BRAVO_SERVICE_RECOVERY_SUMMARY.log')) -Text $pausedText)
+            } catch {
+                Write-Host "УВАГА: не вдалося дописати зведення відновлення служб: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            Write-Host "Відновлення служб: $pausedText"
+        }
+        return 0
+    }
+
+    # 3. Lock без очікування. Зайнятий (нічний Maintenance, архівація,
+    # DataRestore) — вихід 20 без журналу, змін і сповіщень.
+    $recoveryLock = Enter-BRAVOMaintenanceOperationLock -TaskType 'Maintenance' -NoWait -OperationName 'ServiceRecovery'
+    if (-not $recoveryLock.Success) {
+        Write-Host "Відновлення служб відкладено: операційний lock зайнятий ($($recoveryLock.Path)) — наступна перевірка повторить" -ForegroundColor Yellow
+        return (Resolve-BRAVOExitCode -LockBusy)
+    }
+    $script:maintenanceOperationLock = $recoveryLock.Stream
+    $script:maintenanceOperationLockPath = $recoveryLock.Path
+    try {
+        # 4. Під lock-ом: чужий ownership-маркер. Живий власник — його робота
+        # ще йде (20); restartSuppressed — модель могла лишитися
+        # неконсистентною, запуск лише вручну (код 43); маркер мертвого
+        # власника без suppression відновлює Health-watchdog.
+        $foreignQuiescence = Get-BRAVOForeignServiceQuiescenceContext
+        if ($foreignQuiescence.Present -and $foreignQuiescence.OwnerAlive) {
+            Write-Host "Відновлення служб відкладено: ownership-маркер належить живому процесу $($foreignQuiescence.Owner)" -ForegroundColor Yellow
+            return (Resolve-BRAVOExitCode -LockBusy)
+        }
+        if ($foreignQuiescence.Present -and $foreignQuiescence.RestartSuppressed) {
+            Write-Log -Message "Ownership-маркер $($foreignQuiescence.Owner) з restartSuppressed — автоматичний запуск служб заборонено, потрібне ручне відновлення (код 43, OPERATIONS.md)" -Level "INFO"
+            return 0
+        }
+        if ($foreignQuiescence.Present) {
+            Write-Log -Message "Осиротілий ownership-маркер $($foreignQuiescence.Owner): служби з нього відновлює Health-watchdog — профіль -RecoverServices не втручається" -Level "INFO"
+            return 0
+        }
+
+        # 5. Повторна класифікація під lock-ом і план ланцюжка.
+        $recoveryConditions = @(Get-BRAVOServiceRecoveryConditions -Services $recoveryServices)
+        $chainPlan = Get-BRAVOServiceRecoveryChainPlan -Conditions $recoveryConditions -EligibleNames $allowedNames
+        if (@($chainPlan.FailedNames).Count -eq 0) {
+            Write-Host "Відновлення служб: під час отримання lock служби вже не потребують запуску"
+            return 0
+        }
+        if (@($chainPlan.Deferred).Count -gt 0) {
+            Write-Host "Відновлення служб відкладено: служба(и) $(@($chainPlan.Deferred) -join ', ') саме змінюють стан — наступна перевірка повторить" -ForegroundColor Yellow
+            return 0
+        }
+        $conditionByKey = @{}
+        foreach ($recoveryCondition in $recoveryConditions) { $conditionByKey[[string]$recoveryCondition.Key] = $recoveryCondition }
+
+        # 6. Ownership-маркер ДО першої зупинки/запуску: аварія профілю не
+        # лишить служби без сліду власника (Health-watchdog підніме їх).
+        try {
+            [void](Write-BRAVOServiceQuiescenceState `
+                -Owner 'BRAVO_MAINTENANCE_RECOVER' `
+                -Services @($chainPlan.StartOrder | ForEach-Object { @{ Name = [string]$_; RestartIntent = $true } }) `
+                -LogFile ([string]$LOG_FILE))
+        } catch {
+            $markerError = "Відновлення служб скасовано: не вдалося записати ownership-маркер BRAVO_MAINTENANCE_RECOVER: $($_.Exception.Message)"
+            Write-Log -Message $markerError -Level "ERROR"
+            Send-SlackAlert -Message $markerError -IsCritical
+            Send-BRAVOMaintenanceEarlyExitAlerts -Reason 'збій запису ownership-маркера' -Title 'ВІДНОВЛЕННЯ СЛУЖБ BRAVO' -Summary 'Відновлення служб (-RecoverServices) скасовано: служби не запускались'
+            return (Get-BRAVOMaintenanceResolvedExitCode)
+        }
+
+        # 7. Докази: стан кожної впалої служби і події SCM (перший Write-Log —
+        # тут: він створює журнал RECOVER).
+        Write-Log -Message "=== ВІДНОВЛЕННЯ СЛУЖБ (-RecoverServices) ==="
+        foreach ($failedKey in @($chainPlan.FailedKeys)) {
+            $failedCondition = $conditionByKey[$failedKey]
+            Write-Log -Message ("Служба {0} впала: StartMode={1}, Status={2}, ExitCode={3}, ServiceSpecificExitCode={4}" -f $failedCondition.Name,
+                $failedCondition.StartMode, $failedCondition.Status, $(if ($null -ne $failedCondition.ExitCode) { $failedCondition.ExitCode } else { 'невідомий' }),
+                $(if ($null -ne $failedCondition.ServiceSpecificExitCode) { $failedCondition.ServiceSpecificExitCode } else { 'невідомий' })) -Level "INFO"
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$recoveryStateRead.Warning)) {
+            Write-Log -Message ([string]$recoveryStateRead.Warning) -Level "WARNING"
+        }
+        if (@($chainPlan.StopOrder).Count -gt 0 -or @($chainPlan.StartOrder).Count -gt @($chainPlan.FailedNames).Count) {
+            Write-Log -Message "Впала служба BRAVO: залежні служби буде зупинено ($(@($chainPlan.StopOrder) -join ', ')) і запущено в порядку $(@($chainPlan.StartOrder) -join ' -> ')" -Level "INFO"
+        }
+        $lastScmEvent = @{}
+        $scmEvents = Get-BRAVOServiceRecoveryScmEvents -ServiceNames @($chainPlan.FailedNames) -MaxEvents ([int](Get-BRAVOServiceRecoveryPolicy).MaxScmEvents)
+        if (-not [bool]$scmEvents.Available) {
+            Write-Log -Message "Події SCM: $($scmEvents.Reason)" -Level "INFO"
+        } elseif (@($scmEvents.Events).Count -eq 0) {
+            Write-Log -Message "Події SCM для $(@($chainPlan.FailedNames) -join ', ') з моменту завантаження ОС не знайдено" -Level "INFO"
+        } else {
+            foreach ($scmEvent in @($scmEvents.Events)) {
+                $scmEventTime = if ($null -ne $scmEvent.TimeCreated) { ([datetime]$scmEvent.TimeCreated).ToString('yyyy-MM-dd HH:mm:ss') } else { '?' }
+                Write-Log -Message "Подія SCM $($scmEvent.Id) о ${scmEventTime} ($($scmEvent.ServiceName)): $(([string]$scmEvent.Message) -replace '\s+', ' ')" -Level "INFO"
+                $lastScmEvent[[string]$scmEvent.ServiceName] = $scmEvent
+            }
+        }
+
+        # 8. Зупинка працюючих залежних (лише коли впала BRAVO) — без точки
+        # розширення #316, і журнали впалих служб, поки вони зупинені.
+        foreach ($stopKey in @($chainPlan.StopKeys)) {
+            $stopName = [string]$conditionByKey[$stopKey].Name
+            Write-Log -Message "Зупинка залежної служби $stopName перед запуском BRAVO..." -Level "INFO"
+            $stopResult = Invoke-ServiceStateChange -Name $stopName -DesiredStatus Stopped -TimeoutSeconds $ServiceStopTimeoutSeconds -PollIntervalSeconds $ServicePollIntervalSeconds -Force
+            if ($stopResult.Success) {
+                Write-Log -Message "Служба $stopName зупинена" -Level "SUCCESS"
+            } else {
+                $stopError = "Не вдалося зупинити залежну службу $stopName перед запуском BRAVO: $($stopResult.Error)"
+                Write-Log -Message "ПОМИЛКА: $stopError" -Level "ERROR"
+                Send-SlackAlert -Message $stopError -IsCritical
+            }
+        }
+        $recoveryLogSources = Initialize-BRAVOMaintenanceServiceRecoveryLogSources -Keys @($chainPlan.FailedKeys)
+        # Змінні, які читає Invoke-BRAVOMaintenanceServiceLogProcessing.
+        $traceOutSources = @($recoveryLogSources.TraceOutSources)
+        $bravoFilePhaseAllowed = [bool]$recoveryLogSources.BravoFilePhaseAllowed
+        $exchangeApiRuntime = $recoveryLogSources.ExchangeApiRuntime
+        $bravoLogRotationLogger = { param($Message, $Level) Write-Log -Message $Message -Level $Level }
+        $recoveryLogOutcome = @{
+            TraceProcessedCount = 0; TraceProcessed = $false; ExchangeApiFoundCount = 0
+            ExchangeApiProcessedCount = 0; ApacheProcessedCount = 0; WebApplicationProcessedCount = 0
+        }
+        foreach ($failedKey in @($chainPlan.FailedKeys)) {
+            Invoke-BRAVOMaintenanceServiceLogProcessing -Key $failedKey -Outcome $recoveryLogOutcome
+        }
+
+        # 9–10. Запуск у канонічному порядку; спроба впалої служби
+        # обліковується перед запуском (Start-BRAVOMaintenanceManagedService
+        # -RecoveryCondition), успіх -> WARNING Recovered (+ CRITICAL
+        # «циклічно падає»), невдача -> CRITICAL StartFailed (exit 60).
+        $script:maintenanceServiceRecoveryState = $recoveryState
+        $recoveryStartOutcome = @{ RestartFailed = $false }
+        foreach ($startKey in @($chainPlan.StartKeys)) {
+            $startName = [string]$conditionByKey[$startKey].Name
+            $startRecoveryCondition = if (@($chainPlan.FailedKeys) -contains $startKey) { $conditionByKey[$startKey] } else { $null }
+            Start-BRAVOMaintenanceManagedService -Key $startKey -Name $startName -Outcome $recoveryStartOutcome `
+                -RecoveryCondition $startRecoveryCondition -LastScmEvent $lastScmEvent[$startName]
+        }
+
+        # 11. Маркер знімається лише коли всі запуски вдалися; інакше лишається
+        # — Health-watchdog доспробує підняти служби.
+        if (-not $recoveryStartOutcome.RestartFailed) {
+            try {
+                if (Clear-BRAVOServiceQuiescenceState) {
+                    Write-Log -Message "Ownership-маркер BRAVO_MAINTENANCE_RECOVER знято: служби запущено" -Level "INFO"
+                } else {
+                    Write-Log -Message "Ownership-маркер уже належить іншому власнику — залишено без змін" -Level "WARNING"
+                }
+            } catch {
+                Write-Log -Message "Не вдалося зняти ownership-маркер BRAVO_MAINTENANCE_RECOVER: $($_.Exception.Message) — його відпрацює Health-watchdog" -Level "WARNING"
+            }
+        } else {
+            Write-Log -Message "Не всі служби запущено — ownership-маркер BRAVO_MAINTENANCE_RECOVER залишено: Health-watchdog доспробує підняти служби" -Level "INFO"
+        }
+        $recoveryExitCode = Get-BRAVOMaintenanceResolvedExitCode
+        Write-Log -Message "=== ВІДНОВЛЕННЯ СЛУЖБ ЗАВЕРШЕНО (код $recoveryExitCode) ==="
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason 'відновлення служб' -Title 'ВІДНОВЛЕННЯ СЛУЖБ BRAVO' `
+            -Summary "Відновлення служб (-RecoverServices) завершено з кодом $recoveryExitCode"
+        Write-Host "Відновлення служб завершено з кодом ${recoveryExitCode}: $(@($chainPlan.FailedNames) -join ', '). Журнал: $LOG_FILE"
+        return $recoveryExitCode
+    } finally {
+        Exit-BRAVOMaintenanceOperationLock
+    }
+}
+
 $bravoServiceState = Get-ConfiguredServiceState -Name $BravoServiceName
 $bravoService = $bravoServiceState.Service
 $BravoServiceDisabledBySystem = $bravoServiceState.Disabled
@@ -1748,7 +2063,12 @@ function Enter-BRAVOMaintenanceOperationLock {
     param(
         # Задача Планувальника, у якій іде прогін: визначає ліміт очікування
         # lock (Get-BRAVOOperationLockWaitBudget, BRAVO.System).
-        [Parameter(Mandatory = $true)][ValidateSet('Maintenance', 'Recovery')][string]$TaskType
+        [Parameter(Mandatory = $true)][ValidateSet('Maintenance', 'Recovery')][string]$TaskType,
+        # #314 хвиля 4: профіль -RecoverServices не чекає lock — одна спроба
+        # без Start-Sleep і без рядка журналу (зайнятий lock = вихід 20).
+        [switch]$NoWait,
+        # Поле operation у JSON lock-а (хто тримає lock, для діагностики).
+        [ValidateNotNullOrEmpty()][string]$OperationName = 'Maintenance'
     )
     $lockPath = [string]$operationLockSettings.Path
     try {
@@ -1766,6 +2086,10 @@ function Enter-BRAVOMaintenanceOperationLock {
             -TaskType $TaskType
         $waitMinutes = $lockWaitBudget.EffectiveMinutes
         $waitLimitDescription = [string]$lockWaitBudget.LimitDescription
+        if ($NoWait) {
+            $waitMinutes = 0
+            $waitLimitDescription = ' (-NoWait: без очікування)'
+        }
         $deadline = (Get-Date).AddMinutes($waitMinutes)
         $stream = $null
         $lastLockError = $null
@@ -1852,7 +2176,7 @@ function Enter-BRAVOMaintenanceOperationLock {
         } catch {
             $null
         }
-        $lockText = ([pscustomobject]@{
+        $lockMetadata = [ordered]@{
             pid = $PID
             processStartTime = $lockProcessStartTime
             hostname = [Environment]::MachineName
@@ -1861,7 +2185,11 @@ function Enter-BRAVOMaintenanceOperationLock {
             packageVersion = [string]$script:ScriptVersion
             config = $ConfigPath
             generationId = $null
-        } | ConvertTo-Json -Compress)
+        }
+        # -OperationName уточнює, хто тримає lock (профіль -RecoverServices:
+        # 'ServiceRecovery'); за замовчуванням — 'Maintenance', як і раніше.
+        $lockMetadata.operation = $OperationName
+        $lockText = ([pscustomobject]$lockMetadata | ConvertTo-Json -Compress)
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockText)
         $stream.SetLength(0)
         $stream.Write($bytes, 0, $bytes.Length)
@@ -3215,8 +3543,13 @@ function Send-SlackAlert {
 # Під StrictMode може викликатися до ініціалізації сповіщень (дуже ранній
 # exit) — тоді просто нічого не робить.
 function Send-BRAVOMaintenanceEarlyExitAlerts {
+    # -Title/-Summary (#314 хвиля 4): профіль -RecoverServices доставляє цією ж
+    # функцією свої накопичені сповіщення (Recovered/Cyclic/StartFailed) одним
+    # повідомленням із власним заголовком і підсумковим рядком.
     param(
-        [Parameter(Mandatory = $true)][string]$Reason
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Title = "ОБСЛУГОВУВАННЯ ПЕРЕРВАНО",
+        [string]$Summary
     )
 
     $slackModeVariable = Get-Variable -Name SlackMode -Scope Script -ErrorAction SilentlyContinue
@@ -3267,9 +3600,14 @@ function Send-BRAVOMaintenanceEarlyExitAlerts {
         "ERROR" { ":x:" }
         default { ":warning:" }
     }
+    $earlyExitSummary = if ([string]::IsNullOrWhiteSpace($Summary)) {
+        "Обслуговування завершено достроково: $Reason"
+    } else {
+        $Summary
+    }
     $earlyExitDetails = @($pendingCritical.ToArray()) +
         @($pendingQueue | ForEach-Object { [string]$_.Message }) +
-        @("Обслуговування завершено достроково: $Reason")
+        @($earlyExitSummary)
 
     try {
         $notificationRoute = Resolve-BRAVONotificationRoute `
@@ -3280,7 +3618,7 @@ function Send-BRAVOMaintenanceEarlyExitAlerts {
             return
         }
         $earlyExitMessage = New-MaintenanceNotificationMessage `
-            -Title "ОБСЛУГОВУВАННЯ ПЕРЕРВАНО" `
+            -Title $Title `
             -TitleEmoji $earlyExitTitleEmoji `
             -Severity $earlyExitSeverity `
             -Duration ((Get-Date) - $script:ScriptStartTime) `
@@ -8821,6 +9159,17 @@ $freeSpaceExclusionsText = if ($FREE_SPACE_EXCLUDED_DRIVES.Count -gt 0) {
     $FREE_SPACE_EXCLUDED_DRIVES -join ", "
 } else {
     "немає"
+}
+
+# #314 хвиля 4 (FR-3): профіль -RecoverServices розгалужується тут — після
+# конфігурації, класифікації компонентів і похідних шляхів, але ДО першого
+# Write-Log (він створює журнал), кроків, заголовка й плану операцій
+# нічного прогону: перевірка без впалих служб лишає диск чистим. Власний
+# журнал профілю — BRAVO_MAINTENANCE_<ts>_RECOVER_PID<pid>.log.
+if ($RecoverServices) {
+    $script:LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_{0}_RECOVER_PID{1}.log" -f $currentDate.ToString("yyyyMMdd_HHmmss"), $PID
+    $script:maintenanceRuntimeExitCode = Invoke-BRAVOMaintenanceServiceRecoveryProfile
+    exit $script:maintenanceRuntimeExitCode
 }
 
 # ===== СТВОРЕННЯ НЕОБХІДНИХ ДИРЕКТОРІЙ =====

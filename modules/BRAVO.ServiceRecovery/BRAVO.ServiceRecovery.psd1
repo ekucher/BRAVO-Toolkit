@@ -14,7 +14,12 @@
         'Register-BRAVOServiceRecoveryCriticalSent',
         'Register-BRAVOServiceRecoveryStableObservation',
         'Remove-BRAVOServiceRecoveryExpiredAttempts',
-        'New-BRAVOServiceRecoveryNotificationText'
+        'New-BRAVOServiceRecoveryNotificationText',
+        'Get-BRAVOServiceRecoveryConditions',
+        'Get-BRAVOServiceRecoveryChainPlan',
+        'Select-BRAVOServiceRecoveryScmEvents',
+        'Get-BRAVOServiceRecoveryScmEvents',
+        'Add-BRAVOServiceRecoverySummaryLine'
     )
     VariablesToExport = @()
     CmdletsToExport = @()
