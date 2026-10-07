@@ -6604,6 +6604,235 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Maintenance/MixedAlertQueue_ErrorPlusCriticalResolvesToCritical" `
         -Failure "черга ERROR+CRITICAL має дати підсумкову content-severity CRITICAL, execution лишається некритичним"
 
+    # --- Maintenance #299: ранні виходи (recovery guard, збій quiescence-
+    # маркера, tool integrity, lock) не доходять до Send-FinalReport, тож
+    # накопичені Send-SlackAlert -IsCritical губилися. Send-BRAVOMaintenance-
+    # EarlyExitAlerts надсилає ще не доставлені алерти одразу; повторний
+    # виклик і виклик після Send-FinalReport нічого не дублюють.
+    $earlyExitAlertModule = $null
+    $earlyExitAlertModuleError = $null
+    try {
+        $earlyExitAlertModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $maintenanceRuntimeSourceForSeverity `
+            -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Send-BRAVOMaintenanceEarlyExitAlerts', 'Send-BRAVOMaintenanceSkippedRunAlert')
+    } catch {
+        $earlyExitAlertModuleError = $_.Exception.Message
+    }
+
+    function Invoke-MaintenanceEarlyExitAlertScenario {
+        param([scriptblock]$Calls, [string]$Mode = 'errors_only', [switch]$FailFinalReportMessage)
+        if ($null -eq $earlyExitAlertModule) { return $null }
+        & $earlyExitAlertModule {
+            param($CallsInner, $ModeInner, $FailFinalReportMessageInner)
+            $script:SlackMode = $ModeInner
+            $script:CriticalErrors = $false
+            $script:criticalErrorOccurred = $false
+            $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+            $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            $script:maintenanceDeliveredCriticalAlertCount = 0
+            $script:maintenanceDeliveredAlertQueueCount = 0
+            $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
+            $script:ScriptStartTime = Get-Date
+            $bravoSettings = @{ NotificationRouting = @{} }
+            $LOG_FILE = "STUB-LOG-PATH"
+            $NotificationProviderDisplayName = "STUB"
+            $script:deliveredMessages = New-Object System.Collections.Generic.List[object]
+
+            function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+            function Resolve-BRAVONotificationRoute {
+                param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                if ($NotificationMode -eq "none") { return "none" }
+                if ($Severity -eq "SUCCESS") {
+                    if ($NotificationMode -eq "errors_only") { return "none" }
+                    return "general"
+                }
+                return "alerts"
+            }
+            function Invoke-NotificationWebhook {
+                param([string]$Message, [string]$WebhookUrl)
+                $script:deliveredMessages.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+            }
+            function New-MaintenanceNotificationMessage {
+                param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                if ($FailFinalReportMessageInner -and $Title -eq "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ") {
+                    throw "self-test: побудова фінального звіту впала"
+                }
+                return "TITLE=$Title|EMOJI=$TitleEmoji|SEVERITY=$Severity|DETAILS=$($Details -join ';')"
+            }
+            function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
+
+            & $CallsInner
+
+            $deliveredTexts = New-Object System.Collections.Generic.List[string]
+            foreach ($delivered in $script:deliveredMessages) { $deliveredTexts.Add([string]$delivered.Message) }
+            [pscustomobject]@{
+                CriticalErrorOccurred = $script:criticalErrorOccurred
+                DeliveredCount = $script:deliveredMessages.Count
+                DeliveredMessages = $deliveredTexts
+                DeliveredWebhook = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].WebhookUrl } else { $null }
+            }
+        } $Calls $Mode ([bool]$FailFinalReportMessage)
+    }
+
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitAlertModule) `
+        -Name "Maintenance/EarlyExitAlertFunctionAvailable" `
+        -Failure "#299: Send-BRAVOMaintenanceEarlyExitAlerts не підготовлено для runtime-тесту: $earlyExitAlertModuleError"
+
+    $earlyExitFlush = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-SlackAlert -Message "guard-message-299" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "recovery guard"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitFlush -and
+            $earlyExitFlush.DeliveredCount -eq 1 -and
+            $earlyExitFlush.DeliveredWebhook -eq "STUB-ALERTS-URL" -and
+            $earlyExitFlush.DeliveredMessages[0].Contains("SEVERITY=CRITICAL") -and
+            $earlyExitFlush.DeliveredMessages[0].Contains("guard-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsFlushQueuedCriticalImmediately" `
+        -Failure "#299: накопичений -IsCritical алерт має бути надісланий одразу (1 повідомлення CRITICAL в ALERTS з текстом алерту); факт: $(if ($null -eq $earlyExitFlush) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitFlush.DeliveredCount)" })"
+
+    $earlyExitTwice = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-SlackAlert -Message "marker-message-299" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "quiescence marker"
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitTwice -and $earlyExitTwice.DeliveredCount -eq 1) `
+        -Name "Maintenance/EarlyExitAlertsSecondFlushDoesNotResend" `
+        -Failure "#299: повторний виклик (явний перед виходом + страховка у finally) не повинен надсилати той самий алерт удруге; факт: $(if ($null -eq $earlyExitTwice) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitTwice.DeliveredCount)" })"
+
+    $earlyExitAfterFinal = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-SlackAlert -Message "final-message-299" -IsCritical
+        Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitAfterFinal -and $earlyExitAfterFinal.DeliveredCount -eq 1) `
+        -Name "Maintenance/EarlyExitAlertsNoDuplicateAfterFinalReport" `
+        -Failure "#299: алерт, уже надісланий Send-FinalReport, не повинен дублюватися страховкою у finally; факт: $(if ($null -eq $earlyExitAfterFinal) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitAfterFinal.DeliveredCount)" })"
+
+    $earlyExitLate = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+        Send-SlackAlert -Message "late-message-299" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitLate -and
+            $earlyExitLate.DeliveredCount -eq 1 -and
+            $earlyExitLate.DeliveredMessages[0].Contains("late-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsDeliverCriticalRaisedAfterFinalReport" `
+        -Failure "#299: критичний алерт, піднятий після Send-FinalReport, має бути надісланий страховкою; факт: $(if ($null -eq $earlyExitLate) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitLate.DeliveredCount)" })"
+
+    $earlyExitFinalThrows = Invoke-MaintenanceEarlyExitAlertScenario -FailFinalReportMessage -Calls {
+        Send-SlackAlert -Message "final-throws-message-299" -IsCritical
+        try { Send-FinalReport -LOG_FILE "STUB-LOG-PATH" } catch { [void]$_ }
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitFinalThrows -and
+            $earlyExitFinalThrows.DeliveredCount -eq 1 -and
+            $earlyExitFinalThrows.DeliveredMessages[0].Contains("final-throws-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsDeliverWhenFinalReportThrowsBeforeSend" `
+        -Failure "#299: якщо Send-FinalReport кинув виняток до відправки, страховка має надіслати накопичений алерт; факт: $(if ($null -eq $earlyExitFinalThrows) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitFinalThrows.DeliveredCount)" })"
+
+    $earlyExitEmpty = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    $earlyExitModeNone = Invoke-MaintenanceEarlyExitAlertScenario -Mode 'none' -Calls {
+        Send-SlackAlert -Message "none-message-299" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "recovery guard"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitEmpty -and $earlyExitEmpty.DeliveredCount -eq 0 -and
+            $null -ne $earlyExitModeNone -and $earlyExitModeNone.DeliveredCount -eq 0
+        ) `
+        -Name "Maintenance/EarlyExitAlertsSilentWhenNothingQueuedOrModeNone" `
+        -Failure "#299: без накопичених алертів або в режимі none нічого не надсилається"
+
+    $earlyExitLockSkip = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-BRAVOMaintenanceSkippedRunAlert -Message "lock-message-299" -Reason "operation lock"
+    }
+    $earlyExitRecoveryTickSkip = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-BRAVOMaintenanceSkippedRunAlert -Message "recovery-tick-299" -Reason "operation lock" -RecoveryTick
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitRecoveryTickSkip -and $earlyExitRecoveryTickSkip.DeliveredCount -eq 0) `
+        -Name "Maintenance/RecoveryTickLockSkipOnlyLogs" `
+        -Failure "#299: пропуск Recovery-тику через lock не надсилає алерт (тик повторюється за розкладом)"
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitLockSkip -and
+            -not $earlyExitLockSkip.CriticalErrorOccurred -and
+            $earlyExitLockSkip.DeliveredCount -eq 1 -and
+            $earlyExitLockSkip.DeliveredMessages[0].Contains("SEVERITY=ERROR") -and
+            $earlyExitLockSkip.DeliveredMessages[0].Contains("lock-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsKeepNotificationOnlySeverity" `
+        -Failure "#299: notification-only ERROR (пропуск через lock) надсилається одразу з severity ERROR і не робить прогін critical"
+
+    # Кожен ранній вихід викликає надсилання ДО exit/throw (між місцем
+    # алерту і самим виходом), а спільний finally має страховку перед
+    # завантаженням власного логу.
+    function Get-MaintenanceEarlyExitSegment {
+        param([string]$StartMarker, [string]$EndMarker)
+        $segmentStart = $maintenanceRuntimeSourceForSeverity.IndexOf($StartMarker)
+        if ($segmentStart -lt 0) { return $null }
+        $segmentEnd = $maintenanceRuntimeSourceForSeverity.IndexOf($EndMarker, $segmentStart)
+        if ($segmentEnd -lt 0 -or ($segmentEnd - $segmentStart) -gt 2500) { return $null }
+        return $maintenanceRuntimeSourceForSeverity.Substring($segmentStart, $segmentEnd - $segmentStart)
+    }
+    $toolIntegrityExitSegment = Get-MaintenanceEarlyExitSegment `
+        -StartMarker 'if ($script:BRAVOToolManifest.ShouldBlock) {' `
+        -EndMarker 'exit (Resolve-BRAVOExitCode -ToolIntegrityViolation)'
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $toolIntegrityExitSegment -and
+            $toolIntegrityExitSegment -match 'Send-SlackAlert[^\r\n]*-IsCritical' -and
+            $toolIntegrityExitSegment.Contains('Send-BRAVOMaintenanceEarlyExitAlerts')
+        ) `
+        -Name "Maintenance/ToolIntegrityExitSendsCriticalImmediately" `
+        -Failure "#299 (рішення власника): блокування через цілісність інструментів має одразу надсилати CRITICAL (Send-SlackAlert -IsCritical + Send-BRAVOMaintenanceEarlyExitAlerts перед exit)"
+    $recoveryGuardExitSegment = Get-MaintenanceEarlyExitSegment `
+        -StartMarker 'Send-SlackAlert -Message $message -IsCritical' `
+        -EndMarker 'exit 20'
+    Test-BRAVOCondition `
+        -Condition ($null -ne $recoveryGuardExitSegment -and $recoveryGuardExitSegment.Contains('Send-BRAVOMaintenanceEarlyExitAlerts')) `
+        -Name "Maintenance/RecoveryGuardExitFlushesCriticalAlert" `
+        -Failure "#299: recovery guard має надіслати CRITICAL до exit 20"
+    $quiescenceMarkerExitSegment = Get-MaintenanceEarlyExitSegment `
+        -StartMarker 'Send-SlackAlert -Message $quiescenceMarkerError -IsCritical' `
+        -EndMarker 'throw $quiescenceMarkerError'
+    Test-BRAVOCondition `
+        -Condition ($null -ne $quiescenceMarkerExitSegment -and $quiescenceMarkerExitSegment.Contains('Send-BRAVOMaintenanceEarlyExitAlerts')) `
+        -Name "Maintenance/QuiescenceMarkerFailureFlushesCriticalAlert" `
+        -Failure "#299: збій запису quiescence-маркера має надіслати CRITICAL до throw"
+    $lockBusyExitSegment = Get-MaintenanceEarlyExitSegment `
+        -StartMarker 'if (-not $maintenanceLockResult.Success) {' `
+        -EndMarker 'exit (Resolve-BRAVOExitCode -LockBusy)'
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $lockBusyExitSegment -and
+            $lockBusyExitSegment.Contains('Send-BRAVOMaintenanceSkippedRunAlert') -and
+            $lockBusyExitSegment.Contains('-RecoveryTick:$RunMissedRestoreOnly')
+        ) `
+        -Name "Maintenance/LockBusySkipAlertsForScheduledMaintenance" `
+        -Failure "#299: пропуск планового Maintenance через lock має одразу надсилати ERROR (Recovery-тик лише логує)"
+    $outerFinallyStart = $maintenanceRuntimeSourceForSeverity.IndexOf('Закриває try, відкритий одразу після імпорту модулів')
+    $outerFinallyUpload = $maintenanceRuntimeSourceForSeverity.LastIndexOf('Wait-BRAVOManualExit -NoPause:$NoPause')
+    $outerFinallyFlush = $maintenanceRuntimeSourceForSeverity.LastIndexOf('Send-BRAVOMaintenanceEarlyExitAlerts')
+    Test-BRAVOCondition `
+        -Condition ($outerFinallyStart -gt 0 -and $outerFinallyFlush -gt $outerFinallyStart -and $outerFinallyFlush -lt $outerFinallyUpload) `
+        -Name "Maintenance/OuterFinallyFlushesUndeliveredAlerts" `
+        -Failure "#299: спільний finally має надсилати ще не доставлені алерти (страховка для будь-якого раннього exit/throw)"
+
     # --- Maintenance: -EnableAllSlack/-DisableAllSlack ефективний режим
     # обчислюється ОДИН раз, ДО webhook-route preflight (регресійний тест
     # хотфіксу 5.0.1: PR #39 резолвив reachable-маршрути за сирим
