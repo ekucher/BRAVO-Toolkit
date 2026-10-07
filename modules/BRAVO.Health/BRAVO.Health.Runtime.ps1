@@ -87,6 +87,30 @@ function Initialize-BRAVOHealthSteps {
     $script:BRAVOHealthLastStepTime = Get-Date
 }
 
+function Get-BRAVOHealthCleanRunOperationsVerdict {
+    # Severity Operations-події для прогону, у якому перевірки не дали issue.
+    # Вона має збігатися з кодом завершення: ShouldBlock маніфесту
+    # інструментів перекриває результат ToolIntegrityViolation (review thread
+    # 15 PR #225), а WARNING у журналі дає код 10 (#301, рев'ю #391: порожній
+    # каталог, що раніше мав дані). Лічильник - той самий $script:BRAVOWarningCount,
+    # з якого рахується код завершення.
+    param(
+        [bool]$ToolIntegrityShouldBlock,
+        [int]$LogWarningCount
+    )
+
+    $operationsHealthSeverity = 'SUCCESS'
+    $operationsHealthMessage = 'Health-перевірка успішна'
+    if ($ToolIntegrityShouldBlock) {
+        $operationsHealthSeverity = 'CRITICAL'
+        $operationsHealthMessage = 'Health-перевірки без issue, але порушено цілісність комплекту інструментів — результат Health перекривається ToolIntegrityViolation'
+    } elseif ($LogWarningCount -gt 0) {
+        $operationsHealthSeverity = 'WARNING'
+        $operationsHealthMessage = "Health-перевірки без issue, але журнал має попереджень: $LogWarningCount (код завершення 10)"
+    }
+    return [pscustomobject]@{ Severity = $operationsHealthSeverity; Message = $operationsHealthMessage }
+}
+
 function Write-BRAVOHealthStep {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -6172,12 +6196,13 @@ if ($healthIssues.Count -eq 0) {
             # #296: ShouldBlock тепер завжди дає issue «Цілісність
             # інструментів» (див. збирання $healthIssues), тож ця гілка при
             # ShouldBlock недосяжна; перевірку лишено як захисну.
-            $operationsHealthSeverity = 'SUCCESS'
-            $operationsHealthMessage = 'Health-перевірка успішна'
-            if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
-                $operationsHealthSeverity = 'CRITICAL'
-                $operationsHealthMessage = 'Health-перевірки без issue, але порушено цілісність комплекту інструментів — результат Health перекривається ToolIntegrityViolation'
-            }
+            # #301 (рев'ю #391): WARNING у журналі дає код 10, тож подія теж
+            # WARNING, а не SUCCESS.
+            $operationsHealthVerdict = Get-BRAVOHealthCleanRunOperationsVerdict `
+                -ToolIntegrityShouldBlock ([bool]($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock)) `
+                -LogWarningCount $script:BRAVOWarningCount
+            $operationsHealthSeverity = [string]$operationsHealthVerdict.Severity
+            $operationsHealthMessage = [string]$operationsHealthVerdict.Message
             Send-BRAVOOperationsEvent `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
@@ -6198,6 +6223,7 @@ if ($healthIssues.Count -eq 0) {
                     okCount = $script:BRAVOHealthStepOkCount
                     warnCount = $script:BRAVOHealthStepWarningCount
                     errorCount = $script:BRAVOHealthStepErrorCount
+                    logWarningCount = $script:BRAVOWarningCount
                     durationMs = [Math]::Round($operationsHealthDuration.TotalMilliseconds)
                     toolIntegrityShouldBlock = [bool]($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock)
                 }

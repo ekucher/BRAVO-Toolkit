@@ -1899,6 +1899,11 @@ function Resolve-BRAVOBackupComponentScope {
         NotInstalled = $notInstalled.ToArray()
         EmptySource = $emptySource.ToArray()
         EmptySourceRetained = $emptySourceRetained.ToArray()
+        # Час COMPLETE manifest, на якому тримається EmptySourceRetained
+        # ($null, якщо доказ узято за відсутнього baseline). За ним
+        # Update-BRAVODiscoveryBaselineFromScope розпізнає baseline,
+        # підтверджений оператором уже після цього рішення.
+        EmptySourceEvidenceAt = $PreviousCompleteAt
         EffectiveEnabledComponents = $effectiveEnabled
         EmptyComposition = $emptyComposition
         Findings = $findings.ToArray()
@@ -2421,6 +2426,28 @@ function Get-BRAVODiscoveryDestinationPaths {
     return $paths
 }
 
+function Test-BRAVOEmptySourceEvidenceNewerThanBaseline {
+    # Чи доказ EmptySourceRetained (COMPLETE manifest) досі новіший за
+    # baseline, прочитаний наприкінці прогону. Та сама умова, за якою
+    # Resolve-BRAVOBackupComponentScope вважав поле baseline «ще нічого не
+    # доводить». Немає часу доказу, немає SavedAt чи він не новіший - $false.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$ScopeResult,
+        [object]$Baseline
+    )
+
+    if ($null -eq $Baseline) { return $false }
+    $evidenceProperty = $ScopeResult.PSObject.Properties['EmptySourceEvidenceAt']
+    if ($null -eq $evidenceProperty -or $null -eq $evidenceProperty.Value) { return $false }
+    $savedAtProperty = $Baseline.PSObject.Properties['SavedAt']
+    $savedAt = [datetime]::MinValue
+    if ($null -eq $savedAtProperty -or -not [datetime]::TryParse([string]$savedAtProperty.Value, [ref]$savedAt)) {
+        return $false
+    }
+    return ($savedAt.ToUniversalTime() -lt ([datetime]$evidenceProperty.Value).ToUniversalTime())
+}
+
 function Update-BRAVODiscoveryBaselineFromScope {
     # Автоматичне створення й доповнення baseline після COMPLETE generation
     # (рішення власника 2026-10-01, опис дизайну у CHANGELOG).
@@ -2459,6 +2486,13 @@ function Update-BRAVODiscoveryBaselineFromScope {
     # підтвердить новий baseline.
     $retainedProperty = $ScopeResult.PSObject.Properties['EmptySourceRetained']
     $retainedComponents = @(if ($null -ne $retainedProperty) { $retainedProperty.Value })
+    if ($retainedComponents.Count -gt 0 -and [string]$import.Source -ne 'None' -and
+        -not (Test-BRAVOEmptySourceEvidenceNewerThanBaseline -ScopeResult $ScopeResult -Baseline $import.Baseline)) {
+        # Рев'ю #391: baseline з'явився або підтверджений оператором
+        # (-ConfirmDiscoveryBaseline), поки йшов прогін. Його свідомо порожнє
+        # поле головніше за доказ manifest, тож сирий шлях не повертається.
+        $retainedComponents = @()
+    }
     $protectedComponents = @($plannedComponents) + @($retainedComponents)
 
     if ([string]$import.Source -eq 'None') {
