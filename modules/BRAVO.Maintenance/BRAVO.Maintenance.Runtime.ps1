@@ -7091,6 +7091,12 @@ function Remove-OldRestoreArchives {
                     # #422: доказ пошкодження вмісту — лише archive-specific
                     # збій за канонічним класифікатором (7-Zip відпрацював і
                     # сам забракував архів); решта — збій виконання перевірки.
+                    # Відхилений пароль — не доказ: байти архіву вже збіглися
+                    # з перевіреним .sha512, тож змінився пароль, а не вміст.
+                    if ($integrityFailureInfo.ContainsKey('PasswordRejected') -and
+                        [bool]$integrityFailureInfo['PasswordRejected']) {
+                        throw "перевірка 7z t не пройдена (7-Zip відхилив пароль — це не доказ пошкодження архіву: SHA512 збігається з перевіреним)"
+                    }
                     if ($integrityFailureInfo.ContainsKey('ArchiveSpecific') -and
                         [bool]$integrityFailureInfo['ArchiveSpecific']) {
                         $archiveState = 'PROVEN_CORRUPT'

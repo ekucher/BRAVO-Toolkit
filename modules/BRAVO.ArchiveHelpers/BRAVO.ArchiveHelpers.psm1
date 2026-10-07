@@ -225,6 +225,16 @@ function Test-SevenZipArchiveIntegrity {
         $FailureInfo['ArchiveSpecific'] = [bool]$archiveSpecificFailure
         $FailureInfo['ExitCode'] = $testResult.ExitCode
         $FailureInfo['TimedOut'] = [bool]$failureTimedOut
+        # #422: 7-Zip відхилив пароль. Класифікацію (рівень рядка, коди) це
+        # не змінює; викликач, що вирішує про видалення, не має вважати
+        # такий збій доказом пошкодження вмісту (пароль міг змінитися).
+        $failureOutputText = ''
+        foreach ($failureOutputName in @('StandardError', 'StandardOutput')) {
+            if ($null -ne $resultProperties[$failureOutputName]) {
+                $failureOutputText += "$([string]$resultProperties[$failureOutputName].Value)`n"
+            }
+        }
+        $FailureInfo['PasswordRejected'] = [bool]($failureOutputText -match '(?i)Wrong password')
     }
     $failureLevel = if ($archiveSpecificFailure) { $ArchiveFailureLevel } else { 'ERROR' }
 
