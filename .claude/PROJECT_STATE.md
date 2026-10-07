@@ -19,7 +19,7 @@
 Це останній runtime-merge Autonomous Correctness Green Wave 2026-10-06/07;
 PR із цим файлом змінює лише документацію й зливається після нього.
 Попередній baseline — `b0f3b2e` (Merge PR #323, 2026-10-01). Між ними в
-`developer` злито 53 PR (first-parent, деталі нижче).
+`developer` злито 54 PR (`git rev-list --count --first-parent b0f3b2e..c27a3e6` = 54, усі — merge PR; деталі нижче).
 
 Це commit `developer`, відносно якого перевірено handoff; він не мусить
 дорівнювати commit-у, що містить сам файл. Якщо `origin/developer` пішов
@@ -79,14 +79,16 @@ live-перевірки `GET /branches/{b}`.
 
 ## Злите з попереднього baseline (перевірено `git log --first-parent`, 2026-10-07)
 
-Між `b0f3b2e` і `c27a3e6` злито 53 PR; усі звичайними merge-комітами,
+Між `b0f3b2e` і `c27a3e6` злито 54 PR; усі звичайними merge-комітами,
 кожен на окремій авторизації власника (merge train-и й Lead-треди
 2026-10-01…10-07). Подробиці кожного — у тілі PR і коментарі закриття
 issue.
 
 **Autonomous Correctness Green Wave (2026-10-06/07)**, кожен PR: RED
-(лише тести, Windows CI падає рівно на нових тестах) → фікс → рев'ю →
-8/8 exact-head Windows CI з першої спроби → merge → TREE_EQUAL →
+(лише тести, self-test на Windows PowerShell 5.1 падає рівно на нових
+тестах) → фікс → рев'ю → 8/8 exact-head перевірок CI з першої спроби
+(шість на Windows, `Secret scanning (gitleaks)` і `GitGuardian` — поза
+Windows) → merge → TREE_EQUAL →
 закриття issue з відповідністю критеріїв доказам:
 
 | PR | Merge | Зміст | Issue |
@@ -120,8 +122,9 @@ issue.
 
 Раніше в тому ж проміжку (окремі хвилі, git-історія й звіти поза
 репозиторієм у `/mnt/project-files/bravo-backlog/`): Production Safety
-(#323…#331), Wave 2 (#334, #336, #340, #341, #343, #344, #345), self-test
-стабілізація (#346, #348, #355, #375, #378), DataRestore UNC (#342),
+state (#331), Wave 2 (#334, #336, #340, #341, #343, #344, #345), self-test
+стабілізація (#346, #348, #351, #355, #375, #378), Configurator кеш
+DefaultConfig (#352), політика оркестрації агентів v2 (#356), DataRestore UNC і reparse-тести (#342, #358),
 Maintenance StartMode/lifecycle (#353, #361), range-ID (#359), Affected
 self-test (#367, #368, #370, #371), validation docs (#362), retention
 (#363), B-4/D-1/J-1 (#372–#374), хвиля інтеграції (#376, #377, #379 —
