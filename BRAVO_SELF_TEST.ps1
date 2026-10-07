@@ -8201,7 +8201,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # C: компонент без валідної історії І без вимірюваного джерела —
         # вимоги вивести нізвідки, тож він пропускається з оцінки. Це
         # ЄДИНИЙ випадок, коли bootstrap лишається без вимоги: у 5.2.4
-        # вимірюване джерело дає доведену верхню межу (тест C2 нижче).
+        # вимірюване джерело дає консервативну оцінку (тест C2 нижче).
         $estimatedSpaceEmptyDir = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_EMPTY'
         [void][IO.Directory]::CreateDirectory($estimatedSpaceEmptyDir)
         $estimateNoHistory = & $archiveEstimateRuntimeModule {
@@ -8236,8 +8236,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # решти дочірніх блоків файлу.
         & {
             # C2 (5.2.4): той самий bootstrap, але джерело вимірюване. Вимога
-            # виводиться з нестиснутого розміру джерела — доведеної верхньої
-            # межі розміру архіву. Свідомо через РЕАЛЬНИЙ обхід файлової
+            # виводиться з нестиснутого розміру джерела плюс per-file метадані
+            # (#279) — консервативної верхньої оцінки розміру архіву. Свідомо через РЕАЛЬНИЙ обхід файлової
             # системи (без -SourceSizeOverrides): інакше production-гілка
             # Get-ChildItem/Measure-Object лишилась би непокритою.
             $estimatedSpaceBootstrapSource = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_SRC'
@@ -8261,11 +8261,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     -not $estimateBootstrapSource.ComponentEstimates[0].HasHistory -and
                     $estimateBootstrapSource.ComponentEstimates[0].SourceBytes -eq 40000 -and
                     $estimateBootstrapSource.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
-                    $estimateBootstrapSource.ComponentEstimates[0].EstimatedBytes -eq 40800 -and
+                    $estimateBootstrapSource.ComponentEstimates[0].EstimatedBytes -eq 41080 -and
                     @($estimateBootstrapSource.VolumeStatus).Count -eq 1
                 ) `
                 -Name 'Archive/EstimatedSpaceBootstrapUsesSourceUpperBound' `
-                -Failure '5.2.4: компонент без історії, але з вимірюваним джерелом (40000 B), має отримати вимогу з доведеної верхньої межі 40000*1.02 = 40800 B і брати участь у розрахунку по тому — до 5.2.4 він мовчки випадав з оцінки взагалі'
+                -Failure '5.2.4: компонент без історії, але з вимірюваним джерелом (40000 B), має отримати вимогу з консервативної оцінки 40000*1.02 + 256 + 2*(11+1) = 41080 B (#279: один файл payload.bin) і брати участь у розрахунку по тому — до 5.2.4 він мовчки випадав з оцінки взагалі'
 
             # C3 (5.2.4): джерело менше за history-прогноз — межа працює як
             # СТЕЛЯ, роблячи вимогу тіснішою. Архів не може бути більшим за
@@ -8289,9 +8289,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $estimateCapped.ComponentEstimates[0].HasHistory -and
                     $estimateCapped.ComponentEstimates[0].LastValidBytes -eq 100000 -and
                     $estimateCapped.ComponentEstimates[0].EstimateBasis -eq 'HistoryCappedBySource' -and
-                    $estimateCapped.ComponentEstimates[0].EstimatedBytes -eq 51000
+                    $estimateCapped.ComponentEstimates[0].EstimatedBytes -eq 51280
                 ) `
-                -Failure '5.2.4: history-прогноз 125000 B має обмежуватись доведеною межею джерела 50000*1.02 = 51000 B; стеля робить вимогу тіснішою і ніколи не більшою' `
+                -Failure '5.2.4: history-прогноз 125000 B має обмежуватись консервативною оцінкою джерела 50000*1.02 + 280 = 51280 B; стеля робить вимогу тіснішою і ніколи не більшою' `
                 -Name 'Archive/EstimatedSpaceHistoryCappedBySmallerSource'
 
             # #284: production-джерела задаються у формі "<SRC>\*"
@@ -8316,11 +8316,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     -not $estimateBootstrapStarSource.ComponentEstimates[0].HasHistory -and
                     $estimateBootstrapStarSource.ComponentEstimates[0].SourceBytes -eq 40000 -and
                     $estimateBootstrapStarSource.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
-                    $estimateBootstrapStarSource.ComponentEstimates[0].EstimatedBytes -eq 40800 -and
+                    $estimateBootstrapStarSource.ComponentEstimates[0].EstimatedBytes -eq 41080 -and
                     @($estimateBootstrapStarSource.VolumeStatus).Count -eq 1
                 ) `
                 -Name 'Archive/EstimatedSpaceBootstrapMeasuresProductionStarSource' `
-                -Failure "#284: джерело у production-формі '<SRC>\*' без історії має виміряти вміст каталогу (40000 B) і дати вимогу 40800 B; факт: SourceBytes=$($estimateBootstrapStarSource.ComponentEstimates[0].SourceBytes), basis=$($estimateBootstrapStarSource.ComponentEstimates[0].EstimateBasis)"
+                -Failure "#284: джерело у production-формі '<SRC>\*' без історії має виміряти вміст каталогу (40000 B) і дати вимогу 41080 B; факт: SourceBytes=$($estimateBootstrapStarSource.ComponentEstimates[0].SourceBytes), basis=$($estimateBootstrapStarSource.ComponentEstimates[0].EstimateBasis)"
 
             $estimateCappedStar = & $archiveEstimateRuntimeModule {
                 param($EnabledArchives, $Drives)
@@ -8338,10 +8338,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $estimateCappedStar.ComponentEstimates[0].HasHistory -and
                     $estimateCappedStar.ComponentEstimates[0].SourceBytes -eq 50000 -and
                     $estimateCappedStar.ComponentEstimates[0].EstimateBasis -eq 'HistoryCappedBySource' -and
-                    $estimateCappedStar.ComponentEstimates[0].EstimatedBytes -eq 51000
+                    $estimateCappedStar.ComponentEstimates[0].EstimatedBytes -eq 51280
                 ) `
                 -Name 'Archive/EstimatedSpaceHistoryCappedByProductionStarSource' `
-                -Failure "#284: стеля джерела має діяти і для production-форми '<SRC>\*' (50000*1.02 = 51000 B); факт: SourceBytes=$($estimateCappedStar.ComponentEstimates[0].SourceBytes), basis=$($estimateCappedStar.ComponentEstimates[0].EstimateBasis)"
+                -Failure "#284: стеля джерела має діяти і для production-форми '<SRC>\*' (50000*1.02 + 280 = 51280 B); факт: SourceBytes=$($estimateCappedStar.ComponentEstimates[0].SourceBytes), basis=$($estimateCappedStar.ComponentEstimates[0].EstimateBasis)"
 
             # C4 (5.2.4): межа НЕ застосовується, коли джерело порожнє —
             # інакше нульове/недоступне джерело обнулило б вимогу компонента,
@@ -8366,6 +8366,71 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 ) `
                 -Name 'Archive/EstimatedSpaceEmptySourceDoesNotZeroRequirement' `
                 -Failure 'порожнє джерело не дає стелі: вимога має лишитись history-оцінкою 125000 B, інакше нульовий вимір обнулив би захист'
+        }
+
+        # #279: оцінка за розміром джерела мусить враховувати per-file
+        # метадані 7-Zip (заголовок запису, ім'я у UTF-16, атрибути, часи,
+        # CRC), які НЕ обмежені 2% від нестиснутого розміру: багато дрібних
+        # файлів з довгими іменами дають архів більший за sourceBytes*1.02.
+        # Дочірній scope — ліміт 4096 змінних script-scope (див. вище).
+        & {
+            $manyFilesSource = Join-Path $estimatedSpaceTestRoot 'MANYFILES_SRC'
+            $manyFilesDest = Join-Path $estimatedSpaceTestRoot 'MANYFILES_DEST'
+            [void][IO.Directory]::CreateDirectory($manyFilesSource)
+            [void][IO.Directory]::CreateDirectory($manyFilesDest)
+            for ($manyIndex = 0; $manyIndex -lt 2000; $manyIndex++) {
+                [IO.File]::WriteAllBytes(
+                    (Join-Path $manyFilesSource ('long_file_name_for_estimate_{0:D5}.dat' -f $manyIndex)),
+                    [byte[]]@(1))
+            }
+            $manyFilesRootLength = $manyFilesSource.TrimEnd('\', '/').Length
+            $manyFilesFloor = [int64]0
+            $manyFilesCount = 0
+            foreach ($manyFile in (Get-ChildItem -LiteralPath $manyFilesSource -Recurse -File -Force)) {
+                $manyRelative = $manyFile.FullName.Substring($manyFilesRootLength).TrimStart('\', '/')
+                $manyFilesFloor += [int64]$manyFile.Length + (2 * $manyRelative.Length) + 128
+                $manyFilesCount++
+            }
+            $estimateManyFiles = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BRAVOEXCH'; Source = (Join-Path $manyFilesSource '*'); Destination = $manyFilesDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $manyFilesCount -eq 2000 -and
+                    $estimateManyFiles.ComponentEstimates[0].SourceBytes -eq 2000 -and
+                    $estimateManyFiles.ComponentEstimates[0].EstimatedBytes -ge $manyFilesFloor
+                ) `
+                -Name 'Archive/EstimatedSpaceCountsPerFileMetadataForManySmallFiles' `
+                -Failure "#279: 2000 файлів по 1 B з довгими іменами мають давати оцінку не менше суми розмірів + 2*довжина імені + 128 B на файл (нижня межа $manyFilesFloor B); факт: EstimatedBytes=$($estimateManyFiles.ComponentEstimates[0].EstimatedBytes) (стара формула 2000*1.02 = 2040 B ігнорує метадані)"
+
+            $bigFileSource = Join-Path $estimatedSpaceTestRoot 'BIGFILE_SRC'
+            [void][IO.Directory]::CreateDirectory($bigFileSource)
+            [IO.File]::WriteAllBytes((Join-Path $bigFileSource 'big.bin'), (New-Object byte[] 1000000))
+            $estimateBigFile = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BRAVOEXCH'; Source = $bigFileSource; Destination = $manyFilesDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateBigFile.ComponentEstimates[0].SourceBytes -eq 1000000 -and
+                    $estimateBigFile.ComponentEstimates[0].EstimatedBytes -ge 1020000 -and
+                    $estimateBigFile.ComponentEstimates[0].EstimatedBytes -le (1020000 + 1024)
+                ) `
+                -Name 'Archive/EstimatedSpaceSingleLargeFileNotPenalised' `
+                -Failure "#279: один великий файл (1000000 B) має давати оцінку 1020000 B + не більше 1 KB метаданих; факт: EstimatedBytes=$($estimateBigFile.ComponentEstimates[0].EstimatedBytes)"
         }
 
         # D: два компоненти на одному диску — потреби сумуються на цей диск,
