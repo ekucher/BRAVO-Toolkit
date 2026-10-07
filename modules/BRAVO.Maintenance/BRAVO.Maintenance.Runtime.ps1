@@ -1303,7 +1303,6 @@ function Invoke-BRAVOMaintenanceServiceLogProcessing {
     if ($Key -eq 'Bravo') {
         # Обробка Trace належить лише до компонента основної служби BRAVO.
         if ($bravoFilePhaseAllowed) {
-            Write-BRAVOProgressPhase -Phase 'Обробка trace і логів' -PercentComplete 60
             try {
                 if ($BravoMaintenanceEnabled) {
                     Write-Log -Message "==="
@@ -10525,6 +10524,11 @@ if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
 # чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.
 $logsCriticalBefore = $script:criticalErrorOccurred
 $logsWarningsBefore = $script:BRAVOWarningCount
+# Фаза прогресу — тут, одразу після зрізу (як до #314 хвилі 2): trace BRAVO
+# обробляється першим, тож момент фази не змінився.
+if ($bravoFilePhaseAllowed) {
+    Write-BRAVOProgressPhase -Phase 'Обробка trace і логів' -PercentComplete 60
+}
 # Журнали кожної служби обробляються, поки вона зупинена, у канонічному
 # порядку служб: trace BRAVO -> exchangAPI -> Apache/BRAVO Web
 # (Invoke-BRAVOMaintenanceServiceLogProcessing, #314 хвиля 2).
