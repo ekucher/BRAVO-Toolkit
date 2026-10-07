@@ -126,6 +126,25 @@ function Get-BRAVOOperationsOutboxDeadLetterDirectory {
     return (Join-Path (Get-BRAVOOperationsOutboxDirectory) 'DeadLetter')
 }
 
+function Get-BRAVOOperationsOutboxLossStatePath {
+    # #280: лічильник подій, остаточно втрачених без доставки (видалені
+    # ретенцією DeadLetter, пошкоджені outbox-файли, невдалий запис у
+    # outbox). Поруч з іншим станом Operations.
+    [CmdletBinding()]
+    param()
+
+    return (Join-Path (Get-BRAVOOperationsStateDirectory) 'BRAVO_OPERATIONS_OUTBOX_LOSS.json')
+}
+
+function Get-BRAVOOperationsOutboxRedrainStatePath {
+    # #280: позначка одноразового повернення витіснених переповненням подій
+    # з DeadLetter у дренаж — на серверну ідентичність.
+    [CmdletBinding()]
+    param()
+
+    return (Join-Path (Get-BRAVOOperationsStateDirectory) 'BRAVO_OPERATIONS_OUTBOX_REDRAIN.json')
+}
+
 function Write-BRAVOOperationsAtomicJsonFile {
     # Спільний write-to-temp-then-Replace/Move патерн — той самий, що
     # Get-BRAVOOperationsServerId нижче використовував локально; винесено
@@ -1241,7 +1260,7 @@ function Add-BRAVOOperationsOutboxItem {
             if ($existingCount -ge $MaxOutboxItems) {
                 $evictCount = ($existingCount - $MaxOutboxItems) + 1
                 foreach ($stale in @($existingItems | Select-Object -First $evictCount)) {
-                    Move-BRAVOOperationsOutboxItemToDeadLetter -Item $stale -Reason "Outbox переповнено (ліміт $MaxOutboxItems items) — найстаріший item витіснено"
+                    Move-BRAVOOperationsOutboxItemToDeadLetter -Item $stale -Kind 'Overflow' -Reason "Outbox переповнено (ліміт $MaxOutboxItems items) — найстаріший item витіснено"
                 }
                 Write-BRAVOOperationsLog -Level 'WARNING' `
                     -Message "Outbox Operations переповнено (ліміт $MaxOutboxItems) — витіснено $evictCount найстаріших item(ів) у dead-letter"
@@ -1301,6 +1320,159 @@ function Add-BRAVOOperationsOutboxItem {
     } catch {
         Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Не вдалося поставити подію Operations ($Kind, eventId=$EventId) в outbox: $($_.Exception.Message) — подію втрачено"
+        Add-BRAVOOperationsOutboxLoss -Count 1 -Reason 'не вдалося записати подію в outbox'
+    }
+}
+
+function Get-BRAVOOperationsOutboxLossSummary {
+    # #280: скільки подій Operations остаточно втрачено без доставки на
+    # цьому сервері (наростаючим підсумком) і коли востаннє. Never-throw:
+    # нечитаний файл — нульовий підсумок.
+    [CmdletBinding()]
+    param()
+
+    $summary = [pscustomobject]@{
+        LostEventCount = 0
+        LastLostAtUtc = $null
+        LastLostReason = $null
+    }
+    try {
+        $path = Get-BRAVOOperationsOutboxLossStatePath
+        if ([IO.File]::Exists($path)) {
+            $raw = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding($false))))
+            $countText = Get-BRAVOOperationsJsonPropertyString -Object $raw -Name 'LostEventCount'
+            $parsedCount = 0
+            if ([int]::TryParse($countText, [ref]$parsedCount) -and $parsedCount -gt 0) {
+                $summary.LostEventCount = $parsedCount
+            }
+            $summary.LastLostAtUtc = Get-BRAVOOperationsJsonPropertyString -Object $raw -Name 'LastLostAtUtc'
+            $summary.LastLostReason = Get-BRAVOOperationsJsonPropertyString -Object $raw -Name 'LastLostReason'
+        }
+    } catch {
+        # Нечитаний стан лічильника — повертаємо нульовий підсумок.
+    }
+    return $summary
+}
+
+function Add-BRAVOOperationsOutboxLoss {
+    # #280: збільшує лічильник втрачених подій і пише WARNING з наростаючим
+    # підсумком. Never-throw.
+    param(
+        [Parameter(Mandatory = $true)][int]$Count,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    if ($Count -le 0) { return }
+    try {
+        $summary = Get-BRAVOOperationsOutboxLossSummary
+        $total = [int]$summary.LostEventCount + $Count
+        $nowText = (Get-Date).ToUniversalTime().ToString('o')
+        Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsOutboxLossStatePath) -Object ([pscustomobject]@{
+            LostEventCount = $total
+            LastLostAtUtc = $nowText
+            LastLostReason = $Reason
+        })
+        Write-BRAVOOperationsLog -Level 'WARNING' `
+            -Message "Operations: остаточно втрачено подій без доставки: $Count ($Reason); усього на цьому сервері: $total"
+    } catch {
+        Write-BRAVOOperationsLog -Level 'WARNING' `
+            -Message "Operations: не вдалося оновити лічильник втрачених подій (+$Count, $Reason): $($_.Exception.Message)"
+    }
+}
+
+function Test-BRAVOOperationsDeadLetterItemIsOverflow {
+    # #280: лише події, витіснені переповненням outbox (бекенд їх ніколи не
+    # бачив), можна повернути в дренаж. Нові записи несуть
+    # DeadLetterKind=Overflow; старі (до #280) розпізнаються за причиною.
+    # Відхилені бекендом (HTTP 4xx), пошкоджені та чужої ідентичності — ні.
+    param([AllowNull()]$Item)
+
+    $kind = Get-BRAVOOperationsJsonPropertyString -Object $Item -Name 'DeadLetterKind'
+    if (-not [string]::IsNullOrWhiteSpace($kind)) {
+        return ($kind -eq 'Overflow')
+    }
+    $reason = Get-BRAVOOperationsJsonPropertyString -Object $Item -Name 'DeadLetterReason'
+    return ([string]$reason).StartsWith('Outbox переповнено', [StringComparison]::Ordinal)
+}
+
+function Invoke-BRAVOOperationsOverflowDeadLetterRedrain {
+    # #280 (рішення власника): після enrollment (дренаж викликається лише з
+    # валідним API-ключем) ОДИН раз на серверну ідентичність повертає з
+    # DeadLetter події, витіснені переповненням outbox, щоб бекенд отримав
+    # цю частину історії. Повертається не більше, ніж є вільного місця в
+    # outbox (ліміт MaxOutboxItems), найстаріші першими; решта лишається в
+    # DeadLetter. Never-throw: збій лише логується, позначка не ставиться,
+    # тож наступний дренаж спробує знову.
+    param(
+        [int]$MaxOutboxItems = 500
+    )
+
+    try {
+        $serverId = $null
+        try { $serverId = Get-BRAVOOperationsServerId } catch { $serverId = $null }
+        if ([string]::IsNullOrWhiteSpace($serverId)) {
+            return
+        }
+        $statePath = Get-BRAVOOperationsOutboxRedrainStatePath
+        if ([IO.File]::Exists($statePath)) {
+            try {
+                $redrainState = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($statePath, (New-Object Text.UTF8Encoding($false))))
+                if ((Get-BRAVOOperationsJsonPropertyString -Object $redrainState -Name 'ServerId') -eq $serverId) {
+                    return
+                }
+            } catch {
+                # Нечитана позначка — вважаємо, що повернення ще не було.
+            }
+        }
+
+        $deadLetterDirectory = Get-BRAVOOperationsOutboxDeadLetterDirectory
+        $candidates = New-Object System.Collections.Generic.List[object]
+        if (Test-Path -LiteralPath $deadLetterDirectory -PathType Container) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $deadLetterDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+                try {
+                    $deadLetterItem = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($file.FullName, (New-Object Text.UTF8Encoding($false))))
+                } catch {
+                    continue
+                }
+                if (-not (Test-BRAVOOperationsDeadLetterItemIsOverflow -Item $deadLetterItem)) { continue }
+                if ([string]::IsNullOrWhiteSpace((Get-BRAVOOperationsOutboxItemEventId -Item $deadLetterItem))) { continue }
+                $itemServerId = Get-BRAVOOperationsJsonPropertyString -Object $deadLetterItem -Name 'ServerId'
+                if (-not [string]::IsNullOrWhiteSpace($itemServerId) -and $itemServerId -ne $serverId) { continue }
+                $deadLetterItem | Add-Member -MemberType NoteProperty -Name '__DeadLetterPath' -Value $file.FullName -Force
+                [void]$candidates.Add($deadLetterItem)
+            }
+        }
+
+        $freeSlots = $MaxOutboxItems - @(Get-BRAVOOperationsOutboxItems).Count
+        if ($freeSlots -lt 0) { $freeSlots = 0 }
+        $orderedCandidates = @($candidates | Sort-Object -Property @{ Expression = { [string](Get-BRAVOOperationsJsonPropertyString -Object $_ -Name 'EnqueuedAtUtc') } })
+        $returnedCount = 0
+        $nowText = (Get-Date).ToUniversalTime().ToString('o')
+        foreach ($candidate in @($orderedCandidates | Select-Object -First $freeSlots)) {
+            $deadLetterPath = [string]$candidate.__DeadLetterPath
+            $restored = $candidate | Select-Object * -ExcludeProperty __DeadLetterPath, DeadLetteredAtUtc, DeadLetterReason, DeadLetterKind
+            $restored | Add-Member -MemberType NoteProperty -Name 'NextRetryAtUtc' -Value $nowText -Force
+            Write-BRAVOOperationsAtomicJsonFile `
+                -Path (Get-BRAVOOperationsOutboxItemPath -EventId (Get-BRAVOOperationsOutboxItemEventId -Item $candidate)) `
+                -Object $restored
+            Remove-Item -LiteralPath $deadLetterPath -Force -ErrorAction SilentlyContinue
+            $returnedCount++
+        }
+        $remainingCount = $orderedCandidates.Count - $returnedCount
+
+        Write-BRAVOOperationsAtomicJsonFile -Path $statePath -Object ([pscustomobject]@{
+            ServerId = $serverId
+            RedrainedAtUtc = $nowText
+            ReturnedCount = $returnedCount
+            RemainingCount = $remainingCount
+        })
+        if ($orderedCandidates.Count -gt 0) {
+            Write-BRAVOOperationsLog -Level 'INFO' `
+                -Message "Operations: повернуто з dead-letter у дренаж подій, витіснених переповненням outbox: $returnedCount; лишилось у dead-letter (немає місця в outbox): $remainingCount"
+        }
+    } catch {
+        Write-BRAVOOperationsLog -Level 'WARNING' `
+            -Message "Operations: не вдалося повернути витіснені події з dead-letter: $($_.Exception.Message)"
     }
 }
 
@@ -1325,6 +1497,7 @@ function Get-BRAVOOperationsOutboxItems {
             [void]$items.Add($parsed)
         } catch {
             Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            Add-BRAVOOperationsOutboxLoss -Count 1 -Reason "пошкоджений outbox-файл $($file.Name)"
         }
     }
     return @($items | Sort-Object -Property EnqueuedAtUtc)
@@ -1350,7 +1523,11 @@ function Move-BRAVOOperationsOutboxItemToDeadLetter {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Item,
-        [string]$Reason
+        [string]$Reason,
+        # #280: Overflow — витіснено переповненням (бекенд подію не бачив,
+        # після enrollment її можна повернути в дренаж); Rejected — усе інше
+        # (HTTP 4xx, пошкоджений конверт, чужа ідентичність).
+        [ValidateSet('Overflow', 'Rejected')][string]$Kind = 'Rejected'
     )
 
     try {
@@ -1360,6 +1537,7 @@ function Move-BRAVOOperationsOutboxItemToDeadLetter {
         }
         $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetteredAtUtc' -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force
         $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetterReason' -Value $Reason -Force
+        $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetterKind' -Value $Kind -Force
         # #305: без EventId ім'я dead-letter файлу береться з імені файлу
         # outbox (або нового GUID), щоб карантин не падав сам.
         $deadLetterName = Get-BRAVOOperationsOutboxItemEventId -Item $Item
@@ -1378,9 +1556,12 @@ function Move-BRAVOOperationsOutboxItemToDeadLetter {
 
         $deadLetterFiles = @(Get-ChildItem -LiteralPath $deadLetterDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
         if ($deadLetterFiles.Count -gt 200) {
+            $retentionRemovedCount = 0
             foreach ($stale in @($deadLetterFiles | Select-Object -Skip 200)) {
                 Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
+                if (-not [IO.File]::Exists($stale.FullName)) { $retentionRemovedCount++ }
             }
+            Add-BRAVOOperationsOutboxLoss -Count $retentionRemovedCount -Reason 'видалено ретенцією dead-letter (200 найновіших)'
         }
     } catch {
         Write-BRAVOOperationsLog -Level 'WARNING' `
@@ -1544,6 +1725,10 @@ function Invoke-BRAVOOperationsOutboxDrain {
     )
 
     try {
+        # #280: дренаж викликається лише з валідним API-ключем (після
+        # enrollment) — саме тоді одноразово повертаємо витіснені
+        # переповненням події з dead-letter.
+        Invoke-BRAVOOperationsOverflowDeadLetterRedrain
         $items = Get-BRAVOOperationsOutboxItems
         # Review finding (thread 16): ідентичність, під якою дренаж
         # фактично відправляє (саме їй належить $ApiKey). Items з ІНШОЮ
