@@ -2,6 +2,28 @@
 
 ## Не випущено (developer)
 
+- **Feature: модуль обліку відновлення впалих служб `BRAVO.ServiceRecovery` (#314, хвиля 3, частина 1).**
+  Новий модуль (PowerShell 3.0+, без звернень до SCM/WMI) — основа для запуску впалих служб нічним Maintenance і
+  профілем відновлення; runtime цим записом ще не змінюється. `Get-BRAVOServiceRecoveryPolicy` — єдине джерело
+  констант до cutover #216: паузи між спробами 0/5/15 хв і далі 60 хв, вікно 24 год, CRITICAL «циклічно падає» з
+  3-ї спроби, скидання обліку після 30 хв стабільної роботи. State-файл
+  `%ProgramData%\BRAVO\State\BRAVO_SERVICE_RECOVERY_STATE.json` (schemaVersion 1, UTF-8 без BOM, атомарний запис через
+  `Write-BRAVOStateFileAtomic`): пошкоджений, з невідомою схемою або з іншого хоста файл переноситься в
+  `.corrupt-<yyyyMMdd_HHmmss>` з WARNING і НЕ блокує спробу запуску; файл із BOM читається. Функції стану чисті
+  (стан передається явно і повертається новим об'єктом): `Get-BRAVOServiceRecoveryAttemptDecision` (`-IgnorePause`
+  для нічного прогону — пауза не діє, спроба рахується), `Register-BRAVOServiceRecoveryAttempt` (ознака
+  `CyclicAlertDue` — не частіше разу на 24 год), `Register-BRAVOServiceRecoveryCriticalSent`,
+  `Register-BRAVOServiceRecoveryStableObservation`, `Remove-BRAVOServiceRecoveryExpiredAttempts`. Тексти сповіщень FR-6
+  (`New-BRAVOServiceRecoveryNotificationText`: Recovered/StartFailed/Cyclic, з ExitCode або «ExitCode невідомий»).
+  `Test-BRAVOServiceRecoveryFailed`: «впала» = Condition `Failed` і стан `Stopped` (призупинена служба — ні, #360).
+  Новий suite `ServiceRecovery`; тести: `ServiceRecovery/ModuleManifestExportsPublicApi`,
+  `ServiceRecovery/PolicyConstants`, `ServiceRecovery/FailedMeansFailedAndStopped`, `ServiceRecovery/PauseLadder0-5-15-60`,
+  `ServiceRecovery/WindowSlides24h`, `ServiceRecovery/StableFor30MinResets`, `ServiceRecovery/NightlyIgnoresPauseButCounts`,
+  `ServiceRecovery/StateMissingIsEmpty`, `ServiceRecovery/StateCorruptIsQuarantinedAndNotBlocking`,
+  `ServiceRecovery/StateForeignHostIsQuarantined`, `ServiceRecovery/StateWithBomIsReadable`,
+  `ServiceRecovery/StateWriteIsAtomicNoBom`, `ServiceRecovery/NotificationTexts`,
+  `ServiceRecovery/CyclicCriticalAtMostOncePer24h`.
+
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
   `Get-BRAVOCredentialSecureSecret` у приватний `Add-BRAVOCredentialReadSecretRecord` із власним try/catch: збій обліку

@@ -102,6 +102,7 @@ function Get-BRAVOSelfTestSuiteForChangedPath {
         'DiskSpace'              = 'DiskSpace'
         'Operations'             = 'Operations'
         'RestoreVerify'          = 'RestoreVerify'
+        'ServiceRecovery'        = 'ServiceRecovery'
         'Status'                 = 'Status'
     }
     $moduleLookup = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
