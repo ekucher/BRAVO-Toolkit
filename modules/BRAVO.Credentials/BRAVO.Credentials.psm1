@@ -192,6 +192,89 @@ function Get-BRAVOCredential {
     return [BRAVO.Security.CredentialManager]::ReadGeneric($Target)
 }
 
+function Add-BRAVOCredentialReadSecretRecord {
+    # ПРИВАТНИЙ (не експортується).
+    # #365: реєстр значень, які цей процес УЖЕ отримав із Credential
+    # Manager (target -> SecureString-копії), щоб Get-BRAVOLogMaskSecretSet
+    # маскував і їх: запис, ротований/видалений/нечитабельний до моменту
+    # вивантаження журналу, міг потрапити в журнал раніше. Через
+    # Get-BRAVOCredentialSecureSecret проходить і Get-BRAVOCredentialSecret,
+    # тож покрито обидва шляхи читання. Зберігаються SecureString-копії (не рядки): SecureString-шлях (SMB)
+    # не отримує плейнтексту й тут. Реєстр — приватна змінна модуля на час
+    # життя процесу: не експортується, не логується. Дублікати
+    # порівнюються через BSTR (занулюється) без керованого рядка.
+    #
+    # #417: викликається з Get-BRAVOCredentialSecureSecret (прочитане
+    # значення) і з Set-BRAVOCredential (записане цим процесом значення —
+    # напр. API-ключ Operations, збережений під час Maintenance). Облік —
+    # допоміжна дія: будь-який її збій (BSTR, пам'ять, пошкоджений реєстр)
+    # НЕ виходить назовні, бо інакше зламав би звичайне читання/запис
+    # секрету. Натомість ставиться ознака неповного реєстру, і
+    # Get-BRAVOLogMaskSecretSet після цього кидає (fail-closed): власний
+    # лог не вивантажується з неповним набором маскування. Текст винятку
+    # не зберігається й не логується — він може нести що завгодно.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Target,
+
+        [AllowNull()]
+        $Secret
+    )
+
+    try {
+        # Локально: некритичні помилки всередині обліку теж стають
+        # винятками й ставлять ознаку неповноти нижче.
+        $ErrorActionPreference = 'Stop'
+        if ($Secret -is [Security.SecureString] -and $Secret.Length -gt 0) {
+            $readSecretRegistry = $null
+            $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
+            if ($null -ne $readSecretRegistryVariable) { $readSecretRegistry = $readSecretRegistryVariable.Value }
+            if ($null -eq $readSecretRegistry) {
+                $readSecretRegistry = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[System.Security.SecureString]]' ([StringComparer]::OrdinalIgnoreCase)
+                $script:BRAVOCredentialReadSecretRegistry = $readSecretRegistry
+            }
+            $targetReadSecrets = $null
+            if (-not $readSecretRegistry.TryGetValue($Target, [ref]$targetReadSecrets)) {
+                $targetReadSecrets = New-Object 'System.Collections.Generic.List[System.Security.SecureString]'
+                $readSecretRegistry[$Target] = $targetReadSecrets
+            }
+            $alreadyRecorded = $false
+            foreach ($recordedSecret in $targetReadSecrets) {
+                if ($recordedSecret.Length -ne $Secret.Length) { continue }
+                $recordedPointer = [IntPtr]::Zero
+                $currentPointer = [IntPtr]::Zero
+                $sameValue = $true
+                try {
+                    $recordedPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($recordedSecret)
+                    $currentPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
+                    for ($charIndex = 0; $charIndex -lt $Secret.Length; $charIndex++) {
+                        if ([Runtime.InteropServices.Marshal]::ReadInt16($recordedPointer, $charIndex * 2) -ne
+                            [Runtime.InteropServices.Marshal]::ReadInt16($currentPointer, $charIndex * 2)) {
+                            $sameValue = $false
+                            break
+                        }
+                    }
+                } finally {
+                    if ($recordedPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($recordedPointer) }
+                    if ($currentPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($currentPointer) }
+                }
+                if ($sameValue) {
+                    $alreadyRecorded = $true
+                    break
+                }
+            }
+            if (-not $alreadyRecorded) {
+                $recordedCopy = $Secret.Copy()
+                $recordedCopy.MakeReadOnly()
+                $targetReadSecrets.Add($recordedCopy)
+            }
+        }
+    } catch {
+        $script:BRAVOCredentialReadSecretRegistryIncomplete = $true
+    }
+}
+
 function Get-BRAVOCredentialSecureSecret {
     # Секрет, який НІКОЛИ не перетворюється на відкритий рядок. Використовуйте
     # цю функцію скрізь, де плейнтекст не потрібен — наприклад, там, де далі
@@ -208,60 +291,10 @@ function Get-BRAVOCredentialSecureSecret {
         return $null
     }
     $secureSecret = $credential.Secret
-
-    # #365: реєстр значень, які цей процес УЖЕ отримав із Credential
-    # Manager (target -> SecureString-копії), щоб Get-BRAVOLogMaskSecretSet
-    # маскував і їх: запис, ротований/видалений/нечитабельний до моменту
-    # вивантаження журналу, міг потрапити в журнал раніше. Через цю функцію
-    # проходить і Get-BRAVOCredentialSecret, тож покрито обидва шляхи.
-    # Зберігаються SecureString-копії (не рядки): SecureString-шлях (SMB)
-    # не отримує плейнтексту й тут. Реєстр — приватна змінна модуля на час
-    # життя процесу: не експортується, не логується. Дублікати
-    # порівнюються через BSTR (занулюється) без керованого рядка.
-    if ($secureSecret -is [Security.SecureString] -and $secureSecret.Length -gt 0) {
-        $readSecretRegistry = $null
-        $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
-        if ($null -ne $readSecretRegistryVariable) { $readSecretRegistry = $readSecretRegistryVariable.Value }
-        if ($null -eq $readSecretRegistry) {
-            $readSecretRegistry = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[System.Security.SecureString]]' ([StringComparer]::OrdinalIgnoreCase)
-            $script:BRAVOCredentialReadSecretRegistry = $readSecretRegistry
-        }
-        $targetReadSecrets = $null
-        if (-not $readSecretRegistry.TryGetValue($Target, [ref]$targetReadSecrets)) {
-            $targetReadSecrets = New-Object 'System.Collections.Generic.List[System.Security.SecureString]'
-            $readSecretRegistry[$Target] = $targetReadSecrets
-        }
-        $alreadyRecorded = $false
-        foreach ($recordedSecret in $targetReadSecrets) {
-            if ($recordedSecret.Length -ne $secureSecret.Length) { continue }
-            $recordedPointer = [IntPtr]::Zero
-            $currentPointer = [IntPtr]::Zero
-            $sameValue = $true
-            try {
-                $recordedPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($recordedSecret)
-                $currentPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSecret)
-                for ($charIndex = 0; $charIndex -lt $secureSecret.Length; $charIndex++) {
-                    if ([Runtime.InteropServices.Marshal]::ReadInt16($recordedPointer, $charIndex * 2) -ne
-                        [Runtime.InteropServices.Marshal]::ReadInt16($currentPointer, $charIndex * 2)) {
-                        $sameValue = $false
-                        break
-                    }
-                }
-            } finally {
-                if ($recordedPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($recordedPointer) }
-                if ($currentPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($currentPointer) }
-            }
-            if ($sameValue) {
-                $alreadyRecorded = $true
-                break
-            }
-        }
-        if (-not $alreadyRecorded) {
-            $recordedCopy = $secureSecret.Copy()
-            $recordedCopy.MakeReadOnly()
-            $targetReadSecrets.Add($recordedCopy)
-        }
-    }
+    # #365/#417: облік отриманого значення — окремий helper зі своїм
+    # try/catch: збій обліку не ламає саме читання (див.
+    # Add-BRAVOCredentialReadSecretRecord).
+    Add-BRAVOCredentialReadSecretRecord -Target $Target -Secret $secureSecret
     return $secureSecret
 }
 
@@ -333,7 +366,22 @@ function Set-BRAVOCredential {
     )
 
     Initialize-BRAVOCredentialManager
-    [BRAVO.Security.CredentialManager]::WriteGeneric($Target, $UserName, $Secret)
+    # #417: збій CredWrite завжди перериває функцію (і за викликача без
+    # try, де виняток .NET-методу інакше лише завершив би інструкцію), тож
+    # облік нижче виконується тільки після успішного запису.
+    $credentialWritten = $false
+    try {
+        [BRAVO.Security.CredentialManager]::WriteGeneric($Target, $UserName, $Secret)
+        $credentialWritten = $true
+    } catch {
+        throw
+    }
+    # #417: записане цим процесом значення теж маскується у власних журналах,
+    # навіть якщо пізніший CredRead у Get-BRAVOLogMaskSecretSet упаде. Лише
+    # після успішного CredWrite.
+    if ($credentialWritten) {
+        Add-BRAVOCredentialReadSecretRecord -Target $Target -Secret $Secret
+    }
 }
 
 function Remove-BRAVOCredential {
@@ -467,6 +515,12 @@ function Get-BRAVOLogMaskSecretSet {
         значення) виходить назовні — викликач тоді нічого не вивантажує
         (fail-closed).
 
+        #417: у реєстр потрапляють і значення, записані цим процесом через
+        Set-BRAVOCredential. Якщо облік хоча б одного значення не вдався
+        (Add-BRAVOCredentialReadSecretRecord), набір неповний — функція
+        кидає виняток без значень і без тексту первинного винятку
+        (fail-closed).
+
         Повертає [pscustomobject]@{ Secrets = [string[]]; Skipped = [object[]] }
         де Skipped — @{ Key; Target; Reason }.
     #>
@@ -485,6 +539,11 @@ function Get-BRAVOLogMaskSecretSet {
         'SlackWebhookGeneral', 'SlackWebhookAlerts',
         'DiscordWebhookGeneral', 'DiscordWebhookAlerts'
     )
+    $registryIncompleteMessage = 'Набір маскування секретів неповний: облік секретів, отриманих цим процесом із Credential Manager, не вдався (#417). Вивантаження журналу скасовано (fail-closed).'
+    $registryIncompleteVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistryIncomplete -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $registryIncompleteVariable -and [bool]$registryIncompleteVariable.Value) {
+        throw $registryIncompleteMessage
+    }
     $secrets = New-Object 'System.Collections.Generic.List[string]'
     $skipped = New-Object 'System.Collections.Generic.List[object]'
     foreach ($secretTargetKey in $secretTargetKeys) {
@@ -516,18 +575,40 @@ function Get-BRAVOLogMaskSecretSet {
         $candidateValues = New-Object 'System.Collections.Generic.List[string]'
         if (-not [string]::IsNullOrWhiteSpace($currentValue)) { $candidateValues.Add([string]$currentValue) }
 
-        $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
-        $recordedSecrets = $null
-        if ($null -ne $readSecretRegistryVariable -and $null -ne $readSecretRegistryVariable.Value -and
-            $readSecretRegistryVariable.Value.TryGetValue($targetName, [ref]$recordedSecrets)) {
-            foreach ($recordedSecret in $recordedSecrets) {
-                $recordedValue = ConvertFrom-BRAVOSecureSecret -Secret $recordedSecret
-                if (-not [string]::IsNullOrWhiteSpace($recordedValue)) { $candidateValues.Add([string]$recordedValue) }
+        # Доступ до реєстру: будь-який збій (пошкоджений реєстр) — той самий
+        # фіксований виняток без тексту первинного (fail-closed).
+        $recordedSecretsArray = @()
+        try {
+            $readSecretRegistryVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistry -Scope Script -ErrorAction SilentlyContinue
+            $recordedSecrets = $null
+            if ($null -ne $readSecretRegistryVariable -and $null -ne $readSecretRegistryVariable.Value -and
+                $readSecretRegistryVariable.Value.TryGetValue($targetName, [ref]$recordedSecrets)) {
+                $recordedSecretsArray = @($recordedSecrets)
             }
+        } catch {
+            throw $registryIncompleteMessage
+        }
+        foreach ($recordedSecret in $recordedSecretsArray) {
+            $recordedValue = ConvertFrom-BRAVOSecureSecret -Secret $recordedSecret
+            if (-not [string]::IsNullOrWhiteSpace($recordedValue)) { $candidateValues.Add([string]$recordedValue) }
         }
         foreach ($candidateValue in $candidateValues) {
             if (-not $secrets.Contains($candidateValue)) { $secrets.Add($candidateValue) }
         }
+    }
+
+    # #417: облік секретів процесу пропустив хоча б одне значення —
+    # набір неповний, тож маскування не можна вважати надійним. Кидаємо
+    # (fail-closed): викликачі (власний лог Maintenance/Archive) ловлять
+    # виняток, пишуть WARNING і нічого не вивантажують; основна операція
+    # не зачіпається. Повідомлення не містить ні значень, ні тексту
+    # первинного винятку. Перевірка і ДО будь-якого доступу до реєстру
+    # (пошкоджений реєстр лишається в стані модуля, і його виняток може
+    # нести секрет), і ПІСЛЯ збирання (читання нижче теж проходять через
+    # облік і можуть поставити ознаку).
+    $registryIncompleteVariable = Get-Variable -Name BRAVOCredentialReadSecretRegistryIncomplete -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $registryIncompleteVariable -and [bool]$registryIncompleteVariable.Value) {
+        throw $registryIncompleteMessage
     }
 
     return [pscustomobject]@{
