@@ -1030,6 +1030,86 @@
     Test-BRAVOCondition -Condition (-not $noPathGoodRemainsInOutbox -and $noPathDrainOutcome -eq 'ok') `
         -Name 'Operations/OutboxItemWithoutApiPathDoesNotBlockRemainingQueueDrain' `
         -Failure "справний item після item-а без ApiPath МАВ БУТИ доставлений у тому самому дренажі, а результат дренажу -- 'ok', а не 'transient'; outcome=$noPathDrainOutcome goodRemainsInOutbox=$noPathGoodRemainsInOutbox"
+
+    # ---------------------------------------------------------------------
+    # #305: item без EventId (валідний JSON, ручна правка / часткове
+    # відновлення). Під StrictMode 2.0 `$item.EventId` кидав виняток уже в
+    # логуванні/dead-letter, виняток минав поелементну ізоляцію, і дренаж
+    # зупинявся на цьому item на КОЖНОМУ прогоні. Тепер item карантиниться
+    # в DeadLetter з окремою причиною ДО транспорту, решта черги йде далі.
+    # ---------------------------------------------------------------------
+    $noIdDir = Join-Path $opsSelfTestRoot 'OutboxMissingEventId'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $noIdDir
+    $noIdOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $noIdOutboxDir -Force | Out-Null
+
+    $noIdGoodEventId = [guid]::NewGuid().ToString()
+    $noIdGoodPayload = [pscustomobject]@{
+        Kind = 'event'; EventId = $noIdGoodEventId
+        OccurredAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        SchemaVersion = 1; ApiPath = '/api/v1/events'
+        RequestBody = @{ category = 'health'; severity = 'SUCCESS' }
+        EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-1).ToString('o')
+        AttemptCount = 1
+        NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('o')
+        LastError = $null
+    }
+    [IO.File]::WriteAllText((Join-Path $noIdOutboxDir "$noIdGoodEventId.json"), ($noIdGoodPayload | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+
+    # Без EventId і без EnqueuedAtUtc: сортується ПЕРШИМ, як в описі #305.
+    # ApiPath/RequestBody валідні — без карантину подія пішла б у транспорт.
+    $noIdFileBase = '0000-noeventid-' + [guid]::NewGuid().ToString('N')
+    $noIdItemPath = Join-Path $noIdOutboxDir "$noIdFileBase.json"
+    $noIdPayload = [pscustomobject]@{
+        Kind = 'event'
+        OccurredAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        SchemaVersion = 1; ApiPath = '/api/v1/events'
+        RequestBody = @{ category = 'health'; severity = 'WARNING' }
+        AttemptCount = 1
+        NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('o')
+        LastError = $null
+    }
+    [IO.File]::WriteAllText($noIdItemPath, ($noIdPayload | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    $noIdDrainOutcome = $null
+    $noIdDrainThrew = $null
+    try {
+        $noIdDrainOutcome = Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl $opsSettings.ApiBaseUrl -ApiKey 'test-api-key' `
+            -CredentialTargets $opsCredentialTargets -TimeoutSeconds 5
+    } catch {
+        $noIdDrainThrew = $_.Exception.Message
+    }
+
+    $noIdDeadLetterDir = & $deadLetterDirFn
+    $noIdDeadLetterReasons = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($deadLetterFile in @(Get-ChildItem -LiteralPath $noIdDeadLetterDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        $deadLetterItem = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($deadLetterFile.FullName))
+        if ($null -ne $deadLetterItem.PSObject.Properties['DeadLetterReason']) { $noIdDeadLetterReasons.Add([string]$deadLetterItem.DeadLetterReason) }
+    }
+    $noIdRemainsInOutbox = Test-Path -LiteralPath $noIdItemPath -PathType Leaf
+    $noIdGoodRemainsInOutbox = Test-Path -LiteralPath (Join-Path $noIdOutboxDir "$noIdGoodEventId.json") -PathType Leaf
+    # List[object]: лише .Count напряму; обгортка масивом кидає ArgumentException у PS 5.1.
+    $noIdHttpCallCount = $global:BRAVOOpsSelfTestHttpCalls.Count
+
+    Test-BRAVOCondition -Condition (
+        $null -eq $noIdDrainThrew -and
+        -not $noIdRemainsInOutbox -and
+        $noIdDeadLetterReasons.Count -eq 1 -and
+        $noIdDeadLetterReasons[0] -match 'EventId'
+    ) `
+        -Name 'Operations/OutboxItemWithoutEventIdIsDeadLetteredWithOwnReason' `
+        -Failure "item без EventId має бути карантинований у DeadLetter з причиною про EventId, а не блокувати дренаж; threw='$noIdDrainThrew' remainsInOutbox=$noIdRemainsInOutbox deadLetterReasons='$($noIdDeadLetterReasons -join ' | ')'"
+    Test-BRAVOCondition -Condition (
+        -not $noIdGoodRemainsInOutbox -and
+        $noIdDrainOutcome -eq 'ok' -and
+        $noIdHttpCallCount -eq 1
+    ) `
+        -Name 'Operations/OutboxItemWithoutEventIdDoesNotBlockOrResendQueue' `
+        -Failure "справний item після item-а без EventId МАВ БУТИ доставлений у тому самому дренажі (outcome 'ok'), а сам item без EventId не надсилається; outcome=$noIdDrainOutcome goodRemainsInOutbox=$noIdGoodRemainsInOutbox httpCalls=$noIdHttpCallCount"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Operations/ApprovedWithoutApiKeyMeansTtlExpiredReturnsNullNoThrow' } }
     if (Enter-BRAVOSelfTestSection -Name 'Operations/EnabledWithEmptyApiBaseUrlFailsClosedReturnsNull' -DependsOn 'Operations/UrlNormalizationTrailingSlashInvariant') { try {
 

@@ -1330,6 +1330,17 @@ function Get-BRAVOOperationsOutboxItems {
     return @($items | Sort-Object -Property EnqueuedAtUtc)
 }
 
+function Get-BRAVOOperationsOutboxItemEventId {
+    # #305: EventId outbox-елемента без прямого `$Item.EventId`: під
+    # StrictMode 2.0 відсутня властивість (ручна правка, часткове
+    # відновлення) кидала виняток у логуванні й dead-letter-і, і дренаж
+    # зупинявся на цьому елементі на кожному прогоні. Порожній рядок,
+    # якщо поля немає.
+    param([AllowNull()]$Item)
+
+    return [string](Get-BRAVOOperationsJsonPropertyString -Object $Item -Name 'EventId')
+}
+
 function Move-BRAVOOperationsOutboxItemToDeadLetter {
     # Немає сенсу ретраяти справжню 4xx-помилку валідації (напр. 400
     # malformed payload) — вона не стане "успішною" з часом. Переносимо
@@ -1349,7 +1360,17 @@ function Move-BRAVOOperationsOutboxItemToDeadLetter {
         }
         $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetteredAtUtc' -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force
         $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetterReason' -Value $Reason -Force
-        $targetPath = Get-BRAVOOperationsOutboxItemPath -EventId ([string]$Item.EventId) -DeadLetter
+        # #305: без EventId ім'я dead-letter файлу береться з імені файлу
+        # outbox (або нового GUID), щоб карантин не падав сам.
+        $deadLetterName = Get-BRAVOOperationsOutboxItemEventId -Item $Item
+        if ([string]::IsNullOrWhiteSpace($deadLetterName)) {
+            $deadLetterName = if ($Item.PSObject.Properties.Name -contains '__Path' -and -not [string]::IsNullOrWhiteSpace([string]$Item.__Path)) {
+                'missing-eventid-' + [IO.Path]::GetFileNameWithoutExtension([string]$Item.__Path)
+            } else {
+                'missing-eventid-' + [guid]::NewGuid().ToString('N')
+            }
+        }
+        $targetPath = Get-BRAVOOperationsOutboxItemPath -EventId $deadLetterName -DeadLetter
         Write-BRAVOOperationsAtomicJsonFile -Path $targetPath -Object $Item
         if ($Item.PSObject.Properties.Name -contains '__Path' -and [IO.File]::Exists([string]$Item.__Path)) {
             Remove-Item -LiteralPath ([string]$Item.__Path) -Force -ErrorAction SilentlyContinue
@@ -1363,7 +1384,7 @@ function Move-BRAVOOperationsOutboxItemToDeadLetter {
         }
     } catch {
         Write-BRAVOOperationsLog -Level 'WARNING' `
-            -Message "Не вдалося перемістити подію Operations (eventId=$([string]$Item.EventId)) у dead-letter: $($_.Exception.Message)"
+            -Message "Не вдалося перемістити подію Operations (eventId=$(Get-BRAVOOperationsOutboxItemEventId -Item $Item)) у dead-letter: $($_.Exception.Message)"
     }
 }
 
@@ -1390,7 +1411,7 @@ function Update-BRAVOOperationsOutboxItemAfterFailure {
         $Item.AttemptCount = $nextAttempt
         $Item.NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds((Get-BRAVOOperationsOutboxBackoffSeconds -AttemptCount $nextAttempt)).ToString('o')
         $Item.LastError = $LastError
-        $path = if ($Item.PSObject.Properties.Name -contains '__Path') { [string]$Item.__Path } else { Get-BRAVOOperationsOutboxItemPath -EventId ([string]$Item.EventId) }
+        $path = if ($Item.PSObject.Properties.Name -contains '__Path') { [string]$Item.__Path } else { Get-BRAVOOperationsOutboxItemPath -EventId (Get-BRAVOOperationsOutboxItemEventId -Item $Item) }
         $toWrite = $Item | Select-Object * -ExcludeProperty __Path
         Write-BRAVOOperationsAtomicJsonFile -Path $path -Object $toWrite
     } catch {
@@ -1562,7 +1583,7 @@ function Invoke-BRAVOOperationsOutboxDrain {
                 Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item `
                     -Reason "Item належить іншій серверній ідентичності ($itemServerId), а дренаж виконується під $drainServerId — надсилання приписало б подію старого сервера новому"
                 Write-BRAVOOperationsLog -Level 'WARNING' `
-                    -Message "Outbox item (eventId=$([string]$item.EventId)) породжений іншою серверною ідентичністю ($itemServerId), ніж поточна ($drainServerId) — переміщено в dead-letter без надсилання. Це очікувано після свідомої заміни ідентичності (відновлення від claim_mismatch); історія старої ідентичності лишається в dead-letter."
+                    -Message "Outbox item (eventId=$(Get-BRAVOOperationsOutboxItemEventId -Item $item)) породжений іншою серверною ідентичністю ($itemServerId), ніж поточна ($drainServerId) — переміщено в dead-letter без надсилання. Це очікувано після свідомої заміни ідентичності (відновлення від claim_mismatch); історія старої ідентичності лишається в dead-letter."
                 continue
             }
             if ($nextRetry -gt $now) {
@@ -1594,6 +1615,11 @@ function Invoke-BRAVOOperationsOutboxDrain {
             $requestBodyHashtable = $null
             try {
                 $requestBodyHashtable = @{}
+                # #305: без EventId сервер не дедуплікує повтор, а сама подія
+                # не простежується — карантин з окремою причиною, без надсилання.
+                if ([string]::IsNullOrWhiteSpace((Get-BRAVOOperationsOutboxItemEventId -Item $item))) {
+                    throw "EventId відсутній або порожній — подію не можна ні простежити, ні безпечно повторити"
+                }
                 $itemApiPath = Get-BRAVOOperationsJsonPropertyString -Object $item -Name 'ApiPath'
                 if ([string]::IsNullOrWhiteSpace($itemApiPath)) {
                     throw "ApiPath відсутнє або порожнє — надіслати item нікуди"
@@ -1605,9 +1631,9 @@ function Invoke-BRAVOOperationsOutboxDrain {
                     $requestBodyHashtable[$property.Name] = $property.Value
                 }
             } catch {
-                Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item -Reason "Пошкоджений outbox item (невалідний конверт: ApiPath/RequestBody) при дренажі: $($_.Exception.Message)"
+                Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item -Reason "Пошкоджений outbox item (невалідний конверт: EventId/ApiPath/RequestBody) при дренажі: $($_.Exception.Message)"
                 Write-BRAVOOperationsLog -Level 'WARNING' `
-                    -Message "Пошкоджений outbox item (eventId=$([string]$item.EventId)) переміщено в dead-letter при дренажі — решта черги обробляється далі. Причина: $($_.Exception.Message)"
+                    -Message "Пошкоджений outbox item (eventId=$(Get-BRAVOOperationsOutboxItemEventId -Item $item)) переміщено в dead-letter при дренажі — решта черги обробляється далі. Причина: $($_.Exception.Message)"
                 continue
             }
 
@@ -1619,7 +1645,7 @@ function Invoke-BRAVOOperationsOutboxDrain {
                     -TimeoutSeconds $TimeoutSeconds)
                 Remove-BRAVOOperationsOutboxItem -Item $item
                 Write-BRAVOOperationsLog -Level 'SUCCESS' `
-                    -Message "Подію Operations з outbox доставлено (eventId=$([string]$item.EventId))"
+                    -Message "Подію Operations з outbox доставлено (eventId=$(Get-BRAVOOperationsOutboxItemEventId -Item $item))"
             } catch {
                 $statusCode = Get-BRAVOOperationsHttpStatusCode -ErrorRecord $_
                 if ($statusCode -eq 401) {
