@@ -403,6 +403,46 @@ try {
     Remove-Item -LiteralPath $configuratorPersistScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- #307: типографські апострофи U+2018–U+201B PowerShell теж вважає
+# одинарними лапками; без екранування значення на кшталт «здоров’я»
+# закривало літерал і згенерований BRAVO.local.config не парсився. ---
+$typographicQuoteValues = [ordered]@{
+    'bravoSettings.InstitutionName' = "Центр здоров$([char]0x2019)я"
+    'bravoSettings.InstitutionCode' = "O'Neil $([char]0x2018)A$([char]0x2019) $([char]0x201A)B$([char]0x201B)"
+}
+$typographicQuoteOverrides = @{}
+foreach ($typographicQuoteKey in $typographicQuoteValues.Keys) { $typographicQuoteOverrides[$typographicQuoteKey] = $typographicQuoteValues[$typographicQuoteKey] }
+$typographicQuoteOverrides['bravoSettings.Tags'] = @("a$([char]0x2019)b", "c'd")
+$typographicQuoteProblems = New-Object System.Collections.Generic.List[string]
+try {
+    $typographicQuoteText = ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides $typographicQuoteOverrides
+    $typographicQuoteTokens = $null
+    $typographicQuoteErrors = $null
+    $typographicQuoteAst = [System.Management.Automation.Language.Parser]::ParseInput($typographicQuoteText, [ref]$typographicQuoteTokens, [ref]$typographicQuoteErrors)
+    foreach ($typographicQuoteError in @($typographicQuoteErrors)) { [void]$typographicQuoteProblems.Add("parse: $($typographicQuoteError.Message)") }
+    if (@($typographicQuoteErrors).Count -eq 0) {
+        $typographicQuoteHashtable = $typographicQuoteAst.Find({ param($node) $node -is [System.Management.Automation.Language.HashtableAst] }, $true)
+        $typographicQuoteParsed = @{}
+        foreach ($typographicQuotePair in $typographicQuoteHashtable.KeyValuePairs) {
+            $typographicQuoteParsed[[string]$typographicQuotePair.Item1.SafeGetValue()] = $typographicQuotePair.Item2.SafeGetValue()
+        }
+        foreach ($typographicQuoteKey in $typographicQuoteValues.Keys) {
+            if ([string]$typographicQuoteParsed[$typographicQuoteKey] -cne [string]$typographicQuoteValues[$typographicQuoteKey]) {
+                [void]$typographicQuoteProblems.Add("$typographicQuoteKey -> '$($typographicQuoteParsed[$typographicQuoteKey])'")
+            }
+        }
+        $typographicQuoteTags = @($typographicQuoteParsed['bravoSettings.Tags'])
+        if ($typographicQuoteTags.Count -ne 2 -or [string]$typographicQuoteTags[0] -cne "a$([char]0x2019)b" -or [string]$typographicQuoteTags[1] -cne "c'd") {
+            [void]$typographicQuoteProblems.Add("bravoSettings.Tags -> $($typographicQuoteTags -join ' | ')")
+        }
+    }
+} catch {
+    [void]$typographicQuoteProblems.Add("виняток: $($_.Exception.Message)")
+}
+Test-BRAVOCondition ($typographicQuoteProblems.Count -eq 0) `
+    'Configurator Persistence: типографські апострофи в значеннях екрануються, BRAVO.local.config парситься без змін значень' `
+    ($typographicQuoteProblems -join '; ')
+
 # --- DefaultConfig-кеш Apply: один дочірній процес на незмінний ключ ---
 $defaultCacheApplyComputations = & $configuratorPersistenceModule { $script:DefaultConfigComputationCount }
 Test-BRAVOCondition ($defaultCacheApplyComputations -eq 1) `
