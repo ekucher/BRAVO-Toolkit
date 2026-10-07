@@ -124,6 +124,54 @@
             ) `
             -Name "StaticAnalysis/CiUsesSettingsAndForbiddenPatterns" `
             -Failure "ci.yml має викликати ci\Invoke-BRAVOSecurityAnalysis.ps1 і ci\Test-BRAVOForbiddenPattern.ps1"
+
+        # Ручний прогін (workflow_dispatch) gitleaks-action сканує без
+        # діапазону, тобто `git log --all`: без обмеження він падав на
+        # фікстурах із чужих покинутих гілок, хоча перевірена гілка чиста.
+        # Обмеження мусить лишатися вузьким: лише workflow_dispatch, лише
+        # локальні refs/remotes раннера, повна історія (fetch-depth: 0) —
+        # інакше «зелений» скан перестає означати «вся історія гілки чиста».
+        $secretScanFindViolations = {
+            param([string]$WorkflowText)
+            $jobMatch = [regex]::Match($WorkflowText, '(?ms)^  secret-scan:\r?\n.*?(?=^  [A-Za-z0-9_-]+:\r?$|\z)')
+            if (-not $jobMatch.Success) { return 'задача secret-scan відсутня' }
+            $jobText = $jobMatch.Value
+            if ($jobText -notmatch '(?m)^\s+fetch-depth:\s*0\s*$') { 'secret-scan мусить мати fetch-depth: 0' }
+            $stepMatch = [regex]::Match($jobText, '(?ms)^      - name:[^\r\n]*\r?\n(?:(?!^      - ).)*update-ref(?:(?!^      - ).)*')
+            if (-not $stepMatch.Success) { return 'secret-scan мусить обмежувати скан workflow_dispatch запущеною гілкою' }
+            $stepText = $stepMatch.Value
+            if ($stepText -notmatch "(?m)^\s+if:\s*github\.event_name == 'workflow_dispatch'\s*$") {
+                'крок обмеження скану мусить виконуватися лише на workflow_dispatch'
+            }
+            if ($stepText -notmatch "for-each-ref --format='%\(refname\)' refs/remotes/ \|" -or
+                $stepText -notmatch 'update-ref --no-deref -d "\$ref"' -or
+                @([regex]::Matches($stepText, 'update-ref')).Count -ne 1) {
+                'крок обмеження скану може видаляти лише refs/remotes/* (з --no-deref)'
+            }
+            if ($stepText -notmatch 'test -z "\$\(git for-each-ref refs/remotes/\)"') {
+                'крок обмеження скану мусить перевіряти, що refs/remotes/ порожній'
+            }
+            if ([regex]::Match($jobText, '(?ms)update-ref.*^      - name: gitleaks\s*$').Success -eq $false) {
+                'крок обмеження скану мусить стояти перед кроком gitleaks'
+            }
+        }
+        $secretScanViolations = @(& $secretScanFindViolations $ciWorkflowText)
+        $secretScanStepPattern = "if: github.event_name == 'workflow_dispatch'"
+        $secretScanMutants = @(
+            @{ Name = 'BezIf'; Text = $ciWorkflowText.Replace($secretScanStepPattern, "if: always()") },
+            @{ Name = 'Heads'; Text = $ciWorkflowText.Replace("for-each-ref --format='%(refname)' refs/remotes/ |", "for-each-ref --format='%(refname)' refs/ |") },
+            @{ Name = 'Shallow'; Text = [regex]::Replace($ciWorkflowText, '(?ms)(^  secret-scan:.*?fetch-depth:\s*)0', '${1}1') }
+        )
+        $secretScanMutantsMissed = @(
+            $secretScanMutants | Where-Object { @(& $secretScanFindViolations $_.Text).Count -eq 0 } |
+                ForEach-Object { $_.Name }
+        )
+        Test-BRAVOCondition `
+            -Condition ($secretScanViolations.Count -eq 0 -and $secretScanMutantsMissed.Count -eq 0) `
+            -Name "StaticAnalysis/SecretScanDispatchScopeIsNarrow" `
+            -Failure ("secret-scan у ci.yml: на workflow_dispatch скан обмежується запущеною гілкою лише через " +
+                "видалення локальних refs/remotes, з повною історією. Порушення: [$($secretScanViolations -join '; ')]; " +
+                "непомічені мутанти: [$($secretScanMutantsMissed -join ', ')]")
     }
 
     # T015: статичний конструктор `[T]::new(...)` існує лише з PowerShell

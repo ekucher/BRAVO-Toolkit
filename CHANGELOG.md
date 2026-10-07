@@ -2,6 +2,16 @@
 
 ## Не випущено (developer)
 
+- **CI: ручний прогін (workflow_dispatch) більше не падає на gitleaks через чужі гілки.**
+  На `workflow_dispatch` gitleaks-action не має діапазону комітів і запускає `gitleaks detect` без `--log-opts`,
+  тобто `git log --all`. Checkout з `fetch-depth: 0` приносить усі гілки репозиторію як `refs/remotes/origin/*`,
+  тож задача `Secret scanning (gitleaks) (push)` падала на КОЖНОМУ ручному прогоні будь-якої гілки (`leaks found: 17`):
+  усі 17 знахідок — синтетичні тестові значення у двох покинутих гілках закритих PR, яких немає ні в `developer`,
+  ні в `master`. Новий крок перед gitleaks (лише на `workflow_dispatch`) видаляє локальні remote-tracking refs
+  раннера; запущена гілка з повною історією і всі теги лишаються в скані, репозиторій на GitHub не змінюється.
+  Allowlist і `.gitleaksignore` не розширено, `pull_request` і `push` не змінились. Тест
+  `StaticAnalysis/SecretScanDispatchScopeIsNarrow` тримає обмеження вузьким (лише `workflow_dispatch`, лише
+  `refs/remotes/*`, `fetch-depth: 0`, крок перед gitleaks) і ловить три мутанти.
 - **Fix: Operations: карантин пошкодженої події більше не перезаписує попередній dead-letter (#397).**
   Ім'я dead-letter-файлу було детермінованим (`<EventId>` або `missing-eventid-<ім'я outbox-файлу>` після
   санітизації `[^A-Za-z0-9-_]` → `_`), а запис ішов через `File.Replace`: повернений вручну той самий файл, імена,
