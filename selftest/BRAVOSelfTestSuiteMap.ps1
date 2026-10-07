@@ -25,7 +25,7 @@ $script:BRAVOSelfTestSuiteCatalog = @(
     'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
     'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
     'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
-    'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence',
+    'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence', 'ServiceRecovery',
     'SftpCredentialsRequired', 'Status', 'TraceArchive'
 )
 
@@ -102,6 +102,7 @@ function Get-BRAVOSelfTestSuiteForChangedPath {
         'DiskSpace'              = 'DiskSpace'
         'Operations'             = 'Operations'
         'RestoreVerify'          = 'RestoreVerify'
+        'ServiceRecovery'        = 'ServiceRecovery'
         'Status'                 = 'Status'
     }
     $moduleLookup = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)

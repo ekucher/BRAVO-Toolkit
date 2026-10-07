@@ -21494,6 +21494,14 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceQuiescence' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ServiceRecovery') {
+        Enter-BRAVOSelfTestSuite -Name 'ServiceRecovery'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ServiceRecovery') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceRecovery.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceRecovery' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Enter-BRAVOSelfTestSection -Name 'Root/SizeSanity') { try {
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
@@ -32532,7 +32540,8 @@ foreach ($case in $cases) {
 
     # M3. Таблиця модулів закріплена: ПОВНИЙ перелік каталогів modules\BRAVO.* і
     # відповідний suite для кожного. Новий модуль ламає тест і вимагає свідомого
-    # рішення про мапу (станом на базу гілки: 23 модулі, 10 з suite).
+    # рішення про мапу (станом на базу гілки: 23 модулі, 10 з suite; #314 додав
+    # BRAVO.ServiceRecovery -> suite ServiceRecovery: 24 модулі, 11 з suite).
     $suiteMapModuleSuites = @{
         'Archive'                = 'Archive'
         'BazaSync'               = 'BazaSync'
@@ -32543,6 +32552,7 @@ foreach ($case in $cases) {
         'DiskSpace'              = 'DiskSpace'
         'Operations'             = 'Operations'
         'RestoreVerify'          = 'RestoreVerify'
+        'ServiceRecovery'        = 'ServiceRecovery'
         'Status'                 = 'Status'
     }
     $suiteMapModulesWithoutSuite = @('ArchiveHelpers', 'ArchiveRuntime', 'Compatibility', 'Console', 'Credentials',
