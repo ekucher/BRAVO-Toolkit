@@ -2,6 +2,21 @@
 
 ## Не випущено (developer)
 
+- **Fix: Operations: карантин пошкодженої події більше не перезаписує попередній dead-letter (#397).**
+  Ім'я dead-letter-файлу було детермінованим (`<EventId>` або `missing-eventid-<ім'я outbox-файлу>` після
+  санітизації `[^A-Za-z0-9-_]` → `_`), а запис ішов через `File.Replace`: повернений вручну той самий файл, імена,
+  що збігаються після санітизації (`a b` / `a_b`), імена, що відрізняються лише регістром (NTFS), і повтор того
+  самого EventId мовчки знищували попередній артефакт для розбору. Тепер `Move-BRAVOOperationsOutboxItemToDeadLetter`
+  створює файл ексклюзивно (`Write-BRAVOOperationsAtomicJsonFile -NoClobber`, `File.Move` без перезапису), а на
+  зайняте ім'я бере нове з GUID-суфіксом (`<канонічне ім'я>-<guid>`); якщо вільного імені не знайдено, outbox-файл
+  лишається на місці. Без колізії імена не змінились. EventId, що не є JSON-рядком (масив, об'єкт, число, bool),
+  трактується як відсутній: подія не надсилається, а карантиниться з причиною про EventId (усі продюсери пишуть
+  рядок-GUID). Коди завершення не змінено. Тести: `Operations/DeadLetterRepeatedMissingEventIdFileNameKeepsEarlierArtifact`,
+  `Operations/DeadLetterSanitizedFileNameCollisionKeepsBothArtifacts`,
+  `Operations/DeadLetterCaseInsensitiveFileNameCollisionKeepsBothArtifacts`,
+  `Operations/DeadLetterMissingEmptyWhitespaceNullEventIdUseMissingEventIdName`,
+  `Operations/DeadLetterForeignServerIdWithoutEventIdKeepsEveryArtifact`, `Operations/MalformedEventIdTypeIsDeadLetteredNotSent`,
+  `Operations/DeadLetterRepeatedEventIdKeepsEarlierArtifact`.
 - **Security: власні журнали Maintenance і Archive йдуть на SFTP з маскованими точними значеннями секретів Credential Manager (#365).**
   Раніше журнал перед вивантаженням маскувався лише шаблонами `Protect-BRAVOLogSecret` (`password=...`,
   `user:pass@`, webhook-и Slack/Discord), тож сирий пароль 7-Zip, SFTP/SMB-пароль, bootstrap-секрет чи API-ключ
