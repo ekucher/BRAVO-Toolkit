@@ -62,13 +62,44 @@ function Get-BRAVOLogSeverityValue {
 
 function Protect-BRAVOLogSecret {
     [CmdletBinding()]
-    param([AllowEmptyString()][AllowNull()][string]$Text)
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Text,
+
+        # #365: точні значення секретів (Get-BRAVOLogMaskSecretSet), які
+        # маскуються НЕЗАЛЕЖНО від ключового слова поруч. Шаблони нижче
+        # ловлять лише "password=...", URL-креди і webhook-и відомих
+        # провайдерів; сирий пароль 7-Zip чи API-ключ без контексту вони
+        # пропускають. Без параметра поведінка функції незмінна.
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret
+    )
 
     if ([string]::IsNullOrEmpty($Text)) {
         return $Text
     }
 
     $sanitized = $Text
+    if ($null -ne $KnownSecret) {
+        # Правило значень: порожнє і whitespace-only НЕ маскуються (інакше
+        # *** замінило б кожен пробіл, а секрету там немає); будь-яке інше
+        # значення маскується незалежно від довжини — коротке значення
+        # краще зіпсує читабельність, ніж витече. Значення з краєвими
+        # пробілами маскується і як є, і в обрізаній формі (так його
+        # зазвичай і використовують/логують).
+        $secretVariants = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($knownSecretValue in $KnownSecret) {
+            if ([string]::IsNullOrWhiteSpace($knownSecretValue)) { continue }
+            foreach ($secretVariant in @($knownSecretValue, $knownSecretValue.Trim())) {
+                if (-not $secretVariants.Contains($secretVariant)) { $secretVariants.Add($secretVariant) }
+            }
+        }
+        # Довші — першими: якщо один секрет є підрядком іншого, коротший
+        # першим перетворив би довший на "***<хвіст>", і хвіст витік би.
+        foreach ($secretVariant in @($secretVariants | Sort-Object -Property Length -Descending)) {
+            # String.Replace(string, string) — ordinal і без regex-семантики:
+            # спецсимволи в секреті не інтерпретуються.
+            $sanitized = $sanitized.Replace([string]$secretVariant, '***')
+        }
+    }
     # Облікові дані всередині URL: sftp://user:password@host -> sftp://user:***@host
     $sanitized = $sanitized -replace '(?i)([a-z][a-z0-9+.-]*://[^:/\s@]+):[^@\s]+@', '$1:***@'
     # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
@@ -83,6 +114,67 @@ function Protect-BRAVOLogSecret {
     $sanitized = $sanitized -replace '(?i)(hooks\.slack\.com/services/)\S+', '$1***'
     $sanitized = $sanitized -replace '(?i)(discord(?:app)?\.com/api/webhooks/)\S+', '$1***'
     return $sanitized
+}
+
+# #365: маскована КОПІЯ журналу для передачі назовні (SFTP). Маскування
+# застосовується саме до байтів, що вивантажуються, а не до локального
+# журналу заднім числом: локальний файл лишається повним джерелом
+# діагностики на сервері, де він і так під тим самим захистом, що й
+# Credential Manager. Копія кладеться в окремий унікальний каталог під тим
+# самим ім'ям файлу — тому remote-ім'я (WinSCP put бере leaf-ім'я
+# джерела) не змінюється. Будь-яка помилка читання/запису — виняток:
+# викликач НЕ вивантажує нічого (fail-closed), а не оригінал.
+function New-BRAVOMaskedLogCopy {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret
+    )
+
+    $copyDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('BRAVO_masked_log_' + [guid]::NewGuid().ToString('N'))
+    [void][System.IO.Directory]::CreateDirectory($copyDirectory)
+    try {
+        $copyPath = Join-Path $copyDirectory ([System.IO.Path]::GetFileName($Path))
+        # FileShare.ReadWrite: журнал прогону може бути відкритий на дозапис
+        # іншим записувачем; читаємо узгоджений знімок, не блокуючи його.
+        $sourceStream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            # BOM визначає кодування (UTF-8 з BOM — конвенція журналів
+            # проєкту); без BOM — UTF-8 без BOM. Те саме кодування (і та сама
+            # наявність преамбули) зберігається в копії.
+            $sourceReader = New-Object System.IO.StreamReader($sourceStream, (New-Object System.Text.UTF8Encoding($false)), $true)
+            try {
+                $sourceText = $sourceReader.ReadToEnd()
+                $sourceEncoding = $sourceReader.CurrentEncoding
+            } finally {
+                $sourceReader.Dispose()
+            }
+        } finally {
+            $sourceStream.Dispose()
+        }
+        $maskedText = Protect-BRAVOLogSecret -Text $sourceText -KnownSecret $KnownSecret
+        if ($null -eq $maskedText) { $maskedText = '' }
+        [System.IO.File]::WriteAllText($copyPath, $maskedText, $sourceEncoding)
+        return $copyPath
+    } catch {
+        Remove-Item -LiteralPath $copyDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Remove-BRAVOMaskedLogCopy {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $copyDirectory = [System.IO.Path]::GetDirectoryName($Path)
+    # Прибирається лише власний каталог New-BRAVOMaskedLogCopy — ніколи не
+    # довільний батьківський каталог переданого шляху.
+    if ([string]::IsNullOrWhiteSpace($copyDirectory) -or
+        -not ([System.IO.Path]::GetFileName($copyDirectory)).StartsWith('BRAVO_masked_log_', [System.StringComparison]::Ordinal)) {
+        return
+    }
+    Remove-Item -LiteralPath $copyDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function Initialize-BRAVOLog {
@@ -292,6 +384,8 @@ Export-ModuleMember -Function @(
     'Write-BRAVOLog',
     'Write-BRAVOLogException',
     'Protect-BRAVOLogSecret',
+    'New-BRAVOMaskedLogCopy',
+    'Remove-BRAVOMaskedLogCopy',
     'Get-BRAVOLogStatistics',
     'Complete-BRAVOLog'
 )

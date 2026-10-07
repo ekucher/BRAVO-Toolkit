@@ -297,6 +297,74 @@ function Get-BRAVOCredentialIdentity {
     return [Security.Principal.WindowsIdentity]::GetCurrent().Name
 }
 
+function Get-BRAVOCredentialTargetName {
+    <#
+        #365: ЄДИНИЙ resolver імені запису Credential Manager для ключа
+        credentialSettings.Targets.<Key>: значення з конфігурації, а якщо
+        воно відсутнє/порожнє — канонічний дефолт. Таблиця дефолтів
+        дзеркалить credentialSettings.Targets у Get-BRAVODefaultConfiguration
+        (BRAVO.Configuration) — розбіжність ловить self-test
+        Credentials/TargetNameResolverIsCanonicalAndMatchesDefaults.
+        Невідомий ключ — виняток (опечатка в імені ключа не має мовчки
+        давати порожній target).
+
+        Приймає hashtable або PSCustomObject (обидві форми конфігурації
+        трапляються в runtime) і безпечний під Set-StrictMode.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'CredentialSettings',
+        Justification = 'Хибне спрацювання: $CredentialSettings — це налаштування (назви записів Credential Manager), не секрет.')]
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $CredentialSettings,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Key
+    )
+
+    $defaultTargets = @{
+        SFTPLogin                 = 'BRAVO_SFTP_LOGIN'
+        SFTPPassword              = 'BRAVO_SFTP_PASSWORD'
+        SMBLogin                  = 'BRAVO_SMB_LOGIN'
+        SMBPassword               = 'BRAVO_SMB_PASSWORD'
+        SlackWebhookGeneral       = 'BRAVO_SLACK_GENERAL_URL'
+        SlackWebhookAlerts        = 'BRAVO_SLACK_ALERTS_URL'
+        DiscordWebhookGeneral     = 'BRAVO_DISCORD_GENERAL_URL'
+        DiscordWebhookAlerts      = 'BRAVO_DISCORD_ALERTS_URL'
+        ArchivePassword           = 'BRAVO_7Z_PASSWORD'
+        InstitutionName           = 'BRAVO_INSTITUTION_NAME'
+        InstitutionCode           = 'BRAVO_INSTITUTION_CODE'
+        ArchivePrefix             = 'BRAVO_ARCHIVE_PREFIX'
+        OperationsBootstrapSecret = 'BRAVO_OPERATIONS_BOOTSTRAP_SECRET'
+        OperationsApiKey          = 'BRAVO_OPERATIONS_API_KEY'
+    }
+    if (-not $defaultTargets.ContainsKey($Key)) {
+        throw "Невідомий ключ credentialSettings.Targets: '$Key'"
+    }
+
+    $targets = $null
+    if ($null -ne $CredentialSettings) {
+        if ($CredentialSettings -is [System.Collections.IDictionary]) {
+            if ($CredentialSettings.Contains('Targets')) { $targets = $CredentialSettings['Targets'] }
+        } elseif ($null -ne $CredentialSettings.PSObject.Properties['Targets']) {
+            $targets = $CredentialSettings.Targets
+        }
+    }
+    $configuredTarget = $null
+    if ($null -ne $targets) {
+        if ($targets -is [System.Collections.IDictionary]) {
+            if ($targets.Contains($Key)) { $configuredTarget = [string]$targets[$Key] }
+        } elseif ($null -ne $targets.PSObject.Properties[$Key]) {
+            $configuredTarget = [string]$targets.$Key
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($configuredTarget)) {
+        return $configuredTarget
+    }
+    return [string]$defaultTargets[$Key]
+}
+
 function Get-BRAVOArchivePasswordTarget {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'CredentialSettings',
@@ -309,12 +377,77 @@ function Get-BRAVOArchivePasswordTarget {
         [string]$InstitutionCode
     )
 
-    $configuredTarget = [string]$CredentialSettings.Targets.ArchivePassword
-    if (-not [string]::IsNullOrWhiteSpace($configuredTarget)) {
-        return $configuredTarget
+    # #365: делегує канонічному resolver-у — без власної копії дефолту.
+    return (Get-BRAVOCredentialTargetName -CredentialSettings $CredentialSettings -Key 'ArchivePassword')
+}
+
+function Get-BRAVOLogMaskSecretSet {
+    <#
+        #365: точні значення секретів Credential Manager, які маскуються в
+        журналах перед вивантаженням на SFTP (Protect-BRAVOLogSecret
+        -KnownSecret). Target-и — через Get-BRAVOCredentialTargetName.
+
+        Набір: паролі SFTP/SMB, пароль архівів 7-Zip, bootstrap-секрет і
+        API-ключ Operations, чотири webhook-URL (Slack/Discord, general/
+        alerts). Логіни SFTP/SMB і параметри установи (назва/код/префікс)
+        свідомо НЕ входять: це ідентифікатори, а не облікові секрети, і
+        вони потрібні в журналі для діагностики (SFTP-хост резолвиться з
+        логіна).
+
+        Недоступний target (CredRead кидає — під SYSTEM без доступу до
+        запису/профілю, або Credential Manager недоступний узагалі) і
+        відсутній target пропускаються: Skipped з причиною, у якій НЕМАЄ
+        тексту винятку (лише тип) — текст може нести що завгодно. Логіка
+        безпеки: процес, що не може прочитати секрет зараз, не міг і
+        записати його у свій журнал раніше, тож пропуск не відкриває
+        витоку; решта секретів маскується далі. Будь-яка інша помилка
+        (напр. невідомий ключ) НЕ ловиться — викликач тоді нічого не
+        вивантажує (fail-closed).
+
+        Повертає [pscustomobject]@{ Secrets = [string[]]; Skipped = [object[]] }
+        де Skipped — @{ Key; Target; Reason }.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'CredentialSettings',
+        Justification = 'Хибне спрацювання: $CredentialSettings — це налаштування (назви записів Credential Manager), не секрет.')]
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $CredentialSettings
+    )
+
+    $secretTargetKeys = @(
+        'SFTPPassword', 'SMBPassword', 'ArchivePassword',
+        'OperationsBootstrapSecret', 'OperationsApiKey',
+        'SlackWebhookGeneral', 'SlackWebhookAlerts',
+        'DiscordWebhookGeneral', 'DiscordWebhookAlerts'
+    )
+    $secrets = New-Object 'System.Collections.Generic.List[string]'
+    $skipped = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($secretTargetKey in $secretTargetKeys) {
+        $targetName = Get-BRAVOCredentialTargetName -CredentialSettings $CredentialSettings -Key $secretTargetKey
+        $secretValue = $null
+        try {
+            $secretValue = Get-BRAVOCredentialSecret -Target $targetName
+        } catch {
+            $skipped.Add([pscustomobject]@{
+                Key    = $secretTargetKey
+                Target = $targetName
+                Reason = "недоступний ($($_.Exception.GetType().FullName))"
+            })
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($secretValue)) {
+            $skipped.Add([pscustomobject]@{ Key = $secretTargetKey; Target = $targetName; Reason = 'відсутній' })
+            continue
+        }
+        if (-not $secrets.Contains([string]$secretValue)) { $secrets.Add([string]$secretValue) }
     }
 
-    return "BRAVO_7Z_PASSWORD"
+    return [pscustomobject]@{
+        Secrets = [string[]]$secrets.ToArray()
+        Skipped = [object[]]$skipped.ToArray()
+    }
 }
 
 function Test-BRAVOInstitutionSettingValue {
