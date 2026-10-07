@@ -1296,6 +1296,35 @@ function Test-SystemWorkerNotStartedError {
     return $false
 }
 
+# #395: відповідь worker-а — збій, якщо FatalError не $null. Порожній
+# рядок чи пробіли (виняток без тексту) і відсутнє поле — теж збій: інакше
+# порожній список результатів виглядав би успіхом SYSTEM-кроку.
+function Test-SystemWorkerResponseFailed {
+    param([object]$WorkerResponse)
+
+    if ($null -eq $WorkerResponse) {
+        return $true
+    }
+    $fatalErrorProperty = $WorkerResponse.PSObject.Properties['FatalError']
+    if ($null -eq $fatalErrorProperty) {
+        return $true
+    }
+    return ($null -ne $fatalErrorProperty.Value)
+}
+
+# #395: текст FatalError worker-а; для винятку без тексту — ім'я типу.
+function Get-SystemWorkerFatalErrorText {
+    param([System.Exception]$Exception)
+
+    if ($null -eq $Exception) {
+        return 'SYSTEM worker: невідома помилка'
+    }
+    if ([string]::IsNullOrWhiteSpace($Exception.Message)) {
+        return "SYSTEM worker: виняток $($Exception.GetType().FullName) без тексту помилки"
+    }
+    return $Exception.Message
+}
+
 # #302 (follow-up): FatalError worker-а після Run. Worker повідомляє
 # OperationsStarted = $false лише тоді, коли впав ДО першої операції зі
 # сховищем (конфігурація, модулі, читання payload): SYSTEM-сховище не
@@ -1305,8 +1334,16 @@ function Test-SystemWorkerNotStartedError {
 function New-SystemWorkerFatalError {
     param([object]$WorkerResponse)
 
-    $fatalError = New-Object System.Management.Automation.RuntimeException ([string]$WorkerResponse.FatalError)
-    $operationsStartedProperty = $WorkerResponse.PSObject.Properties['OperationsStarted']
+    $fatalErrorText = if ($null -ne $WorkerResponse -and $null -ne $WorkerResponse.PSObject.Properties['FatalError']) {
+        [string]$WorkerResponse.FatalError
+    } else {
+        ''
+    }
+    if ([string]::IsNullOrWhiteSpace($fatalErrorText)) {
+        $fatalErrorText = 'SYSTEM worker повідомив про збій без тексту помилки'
+    }
+    $fatalError = New-Object System.Management.Automation.RuntimeException ($fatalErrorText)
+    $operationsStartedProperty = if ($null -ne $WorkerResponse) { $WorkerResponse.PSObject.Properties['OperationsStarted'] } else { $null }
     if ($null -ne $operationsStartedProperty -and
         $operationsStartedProperty.Value -is [bool] -and
         -not $operationsStartedProperty.Value) {
@@ -1429,7 +1466,7 @@ function Invoke-AsSystem {
 
         $workerResponse = Read-BRAVOTextFile -Path $workerResultPath |
             ConvertFrom-BRAVOJson
-        if ($workerResponse.FatalError) {
+        if (Test-SystemWorkerResponseFailed -WorkerResponse $workerResponse) {
             throw (New-SystemWorkerFatalError -WorkerResponse $workerResponse)
         }
         return @($workerResponse.Results)
@@ -1487,7 +1524,7 @@ function Invoke-ProtectedPayloadWorker {
                 -Entries $workerEntries
         )
     } catch {
-        $response.FatalError = $_.Exception.Message
+        $response.FatalError = Get-SystemWorkerFatalErrorText -Exception $_.Exception
     }
     $temporaryResultPath = "$WorkerResultPath.tmp"
     [IO.File]::WriteAllText(
@@ -1837,7 +1874,7 @@ try {
             $failureResponse = @{
                 Identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
                 Results = @()
-                FatalError = $_.Exception.Message
+                FatalError = Get-SystemWorkerFatalErrorText -Exception $_.Exception
                 # #302: до входу в Invoke-ProtectedPayloadWorker операцій зі
                 # сховищем не було; після входу — невизначено ($true).
                 OperationsStarted = [bool](Get-Variable -Name BRAVOCredentialWorkerEntered -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
