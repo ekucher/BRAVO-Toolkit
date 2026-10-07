@@ -6503,10 +6503,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     }
 
     function Invoke-MaintenanceEarlyExitAlertScenario {
-        param([scriptblock]$Calls, [string]$Mode = 'errors_only')
+        param([scriptblock]$Calls, [string]$Mode = 'errors_only', [switch]$FailFinalReportMessage)
         if ($null -eq $earlyExitAlertModule) { return $null }
         & $earlyExitAlertModule {
-            param($CallsInner, $ModeInner)
+            param($CallsInner, $ModeInner, $FailFinalReportMessageInner)
             $script:SlackMode = $ModeInner
             $script:CriticalErrors = $false
             $script:criticalErrorOccurred = $false
@@ -6537,6 +6537,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             }
             function New-MaintenanceNotificationMessage {
                 param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                if ($FailFinalReportMessageInner -and $Title -eq "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ") {
+                    throw "self-test: побудова фінального звіту впала"
+                }
                 return "TITLE=$Title|EMOJI=$TitleEmoji|SEVERITY=$Severity|DETAILS=$($Details -join ';')"
             }
             function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
@@ -6551,7 +6554,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 DeliveredMessages = $deliveredTexts
                 DeliveredWebhook = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].WebhookUrl } else { $null }
             }
-        } $Calls $Mode
+        } $Calls $Mode ([bool]$FailFinalReportMessage)
     }
 
     Test-BRAVOCondition `
@@ -6607,6 +6610,20 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Maintenance/EarlyExitAlertsDeliverCriticalRaisedAfterFinalReport" `
         -Failure "#299: критичний алерт, піднятий після Send-FinalReport, має бути надісланий страховкою; факт: $(if ($null -eq $earlyExitLate) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitLate.DeliveredCount)" })"
+
+    $earlyExitFinalThrows = Invoke-MaintenanceEarlyExitAlertScenario -FailFinalReportMessage -Calls {
+        Send-SlackAlert -Message "final-throws-message-299" -IsCritical
+        try { Send-FinalReport -LOG_FILE "STUB-LOG-PATH" } catch { [void]$_ }
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitFinalThrows -and
+            $earlyExitFinalThrows.DeliveredCount -eq 1 -and
+            $earlyExitFinalThrows.DeliveredMessages[0].Contains("final-throws-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsDeliverWhenFinalReportThrowsBeforeSend" `
+        -Failure "#299: якщо Send-FinalReport кинув виняток до відправки, страховка має надіслати накопичений алерт; факт: $(if ($null -eq $earlyExitFinalThrows) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitFinalThrows.DeliveredCount)" })"
 
     $earlyExitEmpty = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
         Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"

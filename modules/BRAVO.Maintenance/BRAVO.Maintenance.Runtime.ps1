@@ -7533,11 +7533,17 @@ function Send-FinalReport {
 
     # #299: усе, що вже в чергах, передається цьому звіту; страховка
     # Send-BRAVOMaintenanceEarlyExitAlerts надсилатиме лише пізніші записи.
-    $script:maintenanceDeliveredCriticalAlertCount = $script:CriticalErrorsList.Count
-    $script:maintenanceDeliveredAlertQueueCount = $script:NotificationAlertQueue.Count
+    # Знімок береться тут, а доставленими записи позначаються лише перед
+    # самою відправкою (або коли звіт свідомо нічого не надсилає): якщо
+    # побудова тексту чи маршрутизація кине виняток, страховка у finally
+    # надішле їх.
+    $finalReportCriticalSnapshot = $script:CriticalErrorsList.Count
+    $finalReportAlertQueueSnapshot = $script:NotificationAlertQueue.Count
 
     # Перевірка режиму "none" - повне вимкнення
     if ($script:SlackMode -eq "none") {
+        $script:maintenanceDeliveredCriticalAlertCount = $finalReportCriticalSnapshot
+        $script:maintenanceDeliveredAlertQueueCount = $finalReportAlertQueueSnapshot
         return
     }
 
@@ -7688,6 +7694,8 @@ function Send-FinalReport {
 
     # Якщо повідомлення не повинно відправлятися - виходимо
     if (-not $shouldSend) {
+        $script:maintenanceDeliveredCriticalAlertCount = $finalReportCriticalSnapshot
+        $script:maintenanceDeliveredAlertQueueCount = $finalReportAlertQueueSnapshot
         return
     }
 
@@ -7700,6 +7708,8 @@ function Send-FinalReport {
         -Severity $notificationSeverity `
         -NotificationMode $script:SlackMode `
         -RoutingTable $bravoSettings.NotificationRouting
+    $script:maintenanceDeliveredCriticalAlertCount = $finalReportCriticalSnapshot
+    $script:maintenanceDeliveredAlertQueueCount = $finalReportAlertQueueSnapshot
     try {
         Invoke-NotificationWebhook -Message $notificationMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
         Write-Log -Message "Фінальне повідомлення відправлено в $NotificationProviderDisplayName" -Level "SUCCESS"
@@ -8741,6 +8751,11 @@ if ([string]$script:startModeRepairResult.Status -eq 'OwnerAlive') {
         $reExchangeEnabled -ne [bool]$exchangAPIServiceEnabled -or
         $reWebEnabled -ne [bool]$BravoWebMaintenanceEnabled) {
         Write-Log -Message "Класифікація служб змінилась, поки очікувався lock (інший прогін тимчасово утримував служби Disabled, #297): Bravo $BravoMaintenanceEnabled->$reBravoEnabled, exchangAPI $exchangAPIServiceEnabled->$reExchangeEnabled, Web $BravoWebMaintenanceEnabled->$reWebEnabled. Рішення цього прогону обчислені зі застарілих даних — прогін завершено без дій, наступний запуск повторить" -Level "WARNING"
+        # #299: той самий пропуск планового прогону, що й при зайнятому lock.
+        if (-not $RunMissedRestoreOnly) {
+            Send-SlackAlert -Message "Плановий прогін обслуговування пропущено, нічого не виконано: класифікація служб змінилась, поки очікувався lock (#297). Наступний запуск повторить." -Severity "ERROR"
+            Send-BRAVOMaintenanceEarlyExitAlerts -Reason "класифікація служб змінилась під час очікування lock"
+        }
         Exit-BRAVOMaintenanceOperationLock
         Complete-BRAVOProgress
         exit (Resolve-BRAVOExitCode -LockBusy)
