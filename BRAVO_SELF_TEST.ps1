@@ -25004,9 +25004,14 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     # ПЕРЕД цим call site, тож фіксований 1400-символьний lookback
     # більше не дотягувався до SKIPPED/Get-BRAVOMaintenanceStepStatus
     # вище.
+    # Вікно 2000 -> 2600: #424 (раунди 1 і 3) додав між
+    # Get-BRAVOMaintenanceStepStatus і цим call site перевизначення статусу
+    # (WARN/FAIL понад SKIPPED, FAIL за $restoreArchiveIntegrityOutcome) з
+    # коментарями, тож 2000-символьний lookback уже не дотягувався до
+    # Get-BRAVOMaintenanceStepStatus і $cleanupWarningsBefore.
     $cleanupResultCallIndex = $maintenanceScriptText.IndexOf("-Name 'Очистка старих даних/логів' ``", $planCleanupIndex)
     $cleanupResultCallWindow = if ($cleanupResultCallIndex -ge 0) {
-        $maintenanceScriptText.Substring([Math]::Max(0, $cleanupResultCallIndex - 2000), 2000)
+        $maintenanceScriptText.Substring([Math]::Max(0, $cleanupResultCallIndex - 2600), 2600)
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
