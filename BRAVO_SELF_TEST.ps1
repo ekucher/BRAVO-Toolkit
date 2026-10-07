@@ -27474,7 +27474,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
     # не чіпаються).
     $bootRestoreStartTypeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $systemSourceTextForScheduler `
-        -FunctionNames @('Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
+        -FunctionNames @('Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
     $bootRestoreStartTypeProbe = & $bootRestoreStartTypeModule {
         $script:BRAVOSelfTestStartTypeStates = @{
             SVC_AUTO_PLAIN   = @{ StartType = 'Automatic'; Delayed = $false }

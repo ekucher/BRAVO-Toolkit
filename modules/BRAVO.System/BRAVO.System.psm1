@@ -661,6 +661,21 @@ function Get-BRAVOServiceDelayedAutoStart {
     return ([int]$properties.DelayedAutostart -eq 1)
 }
 
+function Get-BRAVOServiceWin32Info {
+    # Єдиний запит рядка Win32_Service за точним іменем служби (R379-3):
+    # раніше той самий WMI-запит дублювався в Get-BRAVOServiceStartMode і
+    # Get-BRAVOManagedServiceCondition. Повертає перший рядок або $null.
+    # Помилку WMI/CIM НЕ ковтає — кожен викликач обробляє її по-своєму
+    # (причина в FailureReason або тихий fallback). Наявність
+    # Get-BRAVOWmiInstance (BRAVO.Compatibility) перевіряє викликач.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $escapedName = $Name.Replace("'", "''")
+    return (@(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
+            Select-Object -First 1)
+}
+
 function Get-BRAVOServiceStartMode {
     # Єдиний канонічний читач типу запуску служби Windows (#319).
     # ServiceController.StartType існує лише з .NET Framework 4.6.1, а
@@ -743,9 +758,7 @@ function Get-BRAVOServiceStartMode {
         [void]$reasons.Add('Get-BRAVOWmiInstance (BRAVO.Compatibility) недоступна')
     } else {
         try {
-            $escapedName = $serviceName.Replace("'", "''")
-            $serviceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
-                Select-Object -First 1
+            $serviceInfo = Get-BRAVOServiceWin32Info -Name $serviceName
             $startModeProperty = if ($null -ne $serviceInfo) { $serviceInfo.PSObject.Properties['StartMode'] } else { $null }
             if ($null -eq $startModeProperty) {
                 [void]$reasons.Add('WMI не повернув Win32_Service.StartMode')
@@ -833,9 +846,7 @@ function Get-BRAVOManagedServiceCondition {
         $ServiceInfo = $null
         if (-not $NoWmiQuery -and $null -ne (Get-Command -Name 'Get-BRAVOWmiInstance' -ErrorAction SilentlyContinue)) {
             try {
-                $escapedName = $result.Name.Replace("'", "''")
-                $ServiceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
-                    Select-Object -First 1
+                $ServiceInfo = Get-BRAVOServiceWin32Info -Name $result.Name
             } catch {
                 $ServiceInfo = $null
             }

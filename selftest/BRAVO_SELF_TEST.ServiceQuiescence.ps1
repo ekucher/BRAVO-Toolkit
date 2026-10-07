@@ -760,7 +760,7 @@ function Get-BRAVOWmiInstance {
     $startTypeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startTypeStubs + "`n" + $healthRuntimeTextForQuiescence + "`n" + $systemModuleTextForQuiescence) `
         -FunctionNames @('Write-HealthLog', 'Get-Service', 'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled',
-            'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition', 'Get-ManagedServiceHealthIssues')
+            'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition', 'Get-ManagedServiceHealthIssues')
     $startTypeProbe = {
         param($ServiceName, [bool]$WmiFails = $false, $Marker = $null, [bool]$MarkerThrows = $false)
         Set-StrictMode -Version 2.0
@@ -875,7 +875,7 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
     $conditionModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($conditionStubs + "`n" + $systemModuleTextForQuiescence) `
         -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Read-BRAVOServiceQuiescenceState',
-            'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition')
+            'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition')
     $conditionMarker = [pscustomobject]@{
         owner = 'BRAVO_MAINTENANCE'
         services = @(
@@ -1017,7 +1017,7 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
                 }, $true) | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)
     }
     $conditionAllowedCommands = @('Get-Service', 'Get-Command', 'Get-BRAVOWmiInstance', 'Select-Object', 'Where-Object',
-        'Get-BRAVOServiceStartMode', 'Read-BRAVOServiceQuiescenceState')
+        'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Read-BRAVOServiceQuiescenceState')
     $conditionUnexpectedCommands = @($conditionCommandNames | Where-Object { $conditionAllowedCommands -notcontains $_ })
     Test-BRAVOCondition `
         -Condition ($null -ne $conditionFunctionAst -and $conditionCommandNames.Count -gt 0 -and $conditionUnexpectedCommands.Count -eq 0) `
@@ -1080,7 +1080,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # 1) Юніт-тести канонічного helper-а (нормалізація, пріоритет джерел, Unknown).
     $startModeHelperModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode')
     $startModeHelperProbe = & $startModeHelperModule {
         Set-StrictMode -Version 2.0
         $out = [ordered]@{}
@@ -1141,7 +1141,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # Test-BRAVOServiceDisabledBySystem (верхній рівень, безумовне читання).
     $startModeMaintenanceModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueMaintenanceText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-ConfiguredServiceState', 'Test-BRAVOServiceDisabledBySystem')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Get-ConfiguredServiceState', 'Test-BRAVOServiceDisabledBySystem')
     $startModeMaintenanceProbe = & $startModeMaintenanceModule {
         param($Scenarios)
         Set-StrictMode -Version 2.0
@@ -1193,7 +1193,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # 3) DataRestore: Get-BRAVODataRestoreServiceSnapshot (fallback після збою WMI).
     $startModeDataRestoreModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueDataRestoreText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-BRAVODataRestoreServiceSnapshot')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Get-BRAVODataRestoreServiceSnapshot')
     $startModeDataRestoreProbe = & $startModeDataRestoreModule {
         param($Scenarios)
         Set-StrictMode -Version 2.0
@@ -1230,7 +1230,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # 4) BRAVO_DRY_RUN.ps1: Get-BRAVODryRunConfiguredServiceState (StartType -> WMI).
     $startModeDryRunModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueDryRunText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-BRAVODryRunConfiguredServiceState')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Get-BRAVODryRunConfiguredServiceState')
     $startModeDryRunProbe = & $startModeDryRunModule {
         param($Scenarios)
         Set-StrictMode -Version 2.0
@@ -1264,7 +1264,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # 5) BRAVO.System: Set-BRAVOBootRestoreServiceStartType без StartType.
     $startModeBootRestoreModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceDelayedAutoStart', 'Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceDelayedAutoStart', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
     $startModeBootRestoreProbe = & $startModeBootRestoreModule {
         param($Scenarios)
         Set-StrictMode -Version 2.0

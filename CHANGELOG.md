@@ -2,6 +2,20 @@
 
 ## Не випущено (developer)
 
+- **Refactor: цикл служб Maintenance винесено в окремий файл без зміни поведінки (#314, хвиля 2).**
+  Цикл «зупинка служб → обробка журналів (Trace BRAVO, exchangAPI, Apache і BRAVO Web) → запуск BRAVO → exchangAPI →
+  BRAVO Web» перенесено з `BRAVO.Maintenance.Runtime.ps1` у `modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1`
+  (dot-source усередині `Invoke-BRAVOMaintenance`, той самий динамічний scope): `New-BRAVOMaintenanceServiceSet`,
+  `Invoke-BRAVOMaintenanceServiceStopSequence`, `Invoke-BRAVOMaintenanceServiceLogProcessing`,
+  `Invoke-BRAVOMaintenanceServiceStartSequence`. Тіла перенесено дослівно; порядок служб, журнали, маркер, гейт
+  цілісності моделі, `-RunMissedRestoreOnly` і `-ForceRestore` не змінено, коди завершення ті самі. Завершення
+  стороннього `Bis` (`Stop-BRAVOMaintenanceStrayProcess`) лишається окремим викликом-хуком перед зупинкою служби — точка
+  розширення для #316. Перед винесенням додано характеризаційний suite `ServiceRecovery`
+  (`selftest\BRAVO_SELF_TEST.ServiceRecovery.ps1`: 9 сценаріїв `ServiceRecovery/Cycle*` і
+  `ServiceRecovery/CharacterizationProbeAvailable`), зелений до і після винесення.
+  Дубль WMI-запиту `Win32_Service` у `BRAVO.System` (R379-3) замінено одним приватним `Get-BRAVOServiceWin32Info`
+  поверх `Get-BRAVOWmiInstance`, який використовують `Get-BRAVOServiceStartMode` і `Get-BRAVOManagedServiceCondition`.
+
 - **Hardening: придатність сесій архівів реставрації перевіряється й тоді, коли сесій не більше за `ArchivesKeepCount` (#424).**
   Повторну перевірку сесій (SHA512 + `7z t`) і всю діагностику придатності виконує лише retention
   (`Remove-OldRestoreArchives`), а Main запускав його тільки тоді, коли сесій більше за `Restore.ArchivesKeepCount`.
