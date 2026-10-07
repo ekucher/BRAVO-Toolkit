@@ -2,6 +2,7 @@
 
 ## Не випущено (developer)
 
+<<<<<<< HEAD
 - **Perf: проби loader-а в self-test ConfigLoader виконуються в одному дочірньому процесі.**
   84 проби `Import-BravoConfiguration` (local-config, BusyWait/SuccessDedup/storage-switch, intent-матриця, parity,
   security-downgrade, PrimaryStrictness, атомарність, PostUpdate/Malformed) раніше запускали окремий `powershell.exe`
@@ -15,6 +16,59 @@
   (важить код виходу). Нова перевірка `ConfigLoader/ProbesShareOneChildProcess` звіряє кількість проб і результатів,
   один PID раннера (не батьківський) і відсутність витоку канарок (глобальної змінної й змінної середовища) між
   пробами. Production-код не змінено.
+=======
+- **Hardening: придатність сесій архівів реставрації перевіряється й тоді, коли сесій не більше за `ArchivesKeepCount` (#424).**
+  Повторну перевірку сесій (SHA512 + `7z t`) і всю діагностику придатності виконує лише retention
+  (`Remove-OldRestoreArchives`), а Main запускав його тільки тоді, коли сесій більше за `Restore.ArchivesKeepCount`.
+  Коли сесій ≤ `ArchivesKeepCount` (наприклад, `ArchivesKeepCount = 1` і єдина сесія, що стала непридатною вже після
+  створення: зміна пароля, пошкодження, видалений `.sha512`), жодна діагностика не писалась. Тепер у цьому стані Main
+  викликає `Remove-OldRestoreArchives -ReportOnly`: та сама валідація і ті самі рядки (WARNING «Архів реставрації не
+  зараховано як точку відновлення», WARNING #422 «Непридатну сесію … НЕ видалено», ERROR «Не лишилось жодної придатної
+  точки відновлення» з прапорцями `criticalErrorOccurred`/`restoreIntegrityFailed`), але функція повертається до будь-якого
+  видалення: не видаляється нічого, навіть доведено пошкоджена стара сесія (для неї окремий WARNING «НЕ видалено:
+  retention працює лише в режимі перевірки»). Зміна поведінки (рішення власника 2026-10-07, «Повна перевірка»): за
+  сесій ≤ `ArchivesKeepCount` Maintenance щоночі виконує `7z t` для цих сесій; непридатна сесія дає exit 10
+  (WARNING), поки лишається хоча б одна підтверджена точка відновлення, зокрема коли найновішу сесію забраковано на
+  SHA512, а старша пройшла SHA512 і `7z t`. Exit 41 — коли не лишилось жодної підтвердженої точки відновлення, а
+  також, як і до #424 (#300), за збою `7z t` найновішої сесії чи сесії, новішої за всі підтверджені, і за збою
+  виконання самої перевірки `7z t`. Гейт звичайного retention (сесій більше за
+  `ArchivesKeepCount`, поточна restore-сесія не аварійна) і саме видалення не змінено; за аварійної restore-сесії
+  перевірка, як і retention, пропускається з тим самим WARNING. Крок «Очистка старих даних/логів» тепер показує WARN
+  або FAIL (і рахується в `stepsError`), коли за цей крок з'явилися WARNING чи помилка з прапорцями exit 41, навіть якщо
+  застарілих даних для очищення немає. Раніше перевірка лише-перевірки не вважалась роботою кроку, і крок лишався
+  SKIPPED за exit 41. Без нових попереджень і помилок крок, як і раніше, SKIPPED «даних для очищення немає».
+  Перелік архівів реставрації (спільний `Get-BRAVORestoreArchiveMainFiles` для Main і `Remove-OldRestoreArchives`)
+  відрізняє збій від порожнього каталогу. Раніше `Get-ChildItem -ErrorAction SilentlyContinue` за відмови доступу давав
+  0 архівів (нічна перевірка мовчки пропускалась) або лише частину, і частковий перелік ішов у retention. Тепер за збою
+  переліку пишеться ERROR «Не вдалося отримати перелік архівів реставрації», виставляються
+  `criticalErrorOccurred`/`restoreIntegrityFailed` (exit 41), а в цьому циклі не виконується ні перевірка, ні retention:
+  не видаляється нічого. Так само обробляється збій самої перевірки наявності каталогу (`Test-Path` за ACL чи збою
+  провайдера): це не вважається відсутнім каталогом. Справді відсутній каталог, як і раніше, дає порожній перелік без
+  помилки. ERROR «Не лишилось жодної придатної точки відновлення» з прапорцями exit 41 тепер пишеться завжди, коли не
+  лишилось жодної підтвердженої сесії, незалежно від етапу, на якому сесії забраковано. Раніше умова вимагала збою
+  `7z t`, тож єдина сесія з відсутнім, некоректним, невідповідним чи нечитабельним `.sha512` давала лише exit 10. Це
+  діє і на звичайному шляху retention (сесій більше за `ArchivesKeepCount`, усі забраковано на SHA512). Видалення не
+  розширено: без підтвердженої точки відновлення не видаляється жодна сесія (#422). Крок «Очистка старих даних/логів»
+  має FAIL за збою цілісності архівів реставрації в цьому кроці і тоді, коли `criticalErrorOccurred` уже виставила
+  попередня фаза: облік ведеться власним `-Outcome` (`$restoreArchiveIntegrityOutcome`), а не лише глобальним прапорцем.
+  Каталог архівів реставрації (`ARC_DIR`) тепер переліковується і очищується як буквальний шлях
+  (`-LiteralPath`): символи `[` / `]` у назві каталогу більше не є шаблоном. Раніше такий каталог вважався відсутнім,
+  і перевірка мовчки пропускалась. Тести:
+  `Maintenance/RetentionReportOnlyStaleSessionWarnsWithinKeepCount`,
+  `Maintenance/RetentionReportOnlyNeverDeletesProvenCorrupt`,
+  `Maintenance/RetentionReportOnlySingleBrokenSessionSetsFailureFlags`,
+  `Maintenance/RetentionReportOnlyMainBranchWithinKeepCount`,
+  `Maintenance/RetentionReportOnlyCleanupStepReportsFailure`,
+  `Maintenance/RestoreArchiveEnumerationFailureNoDeletion`,
+  `Maintenance/RestoreArchivePathLookupFailureNoDeletion`,
+  `Maintenance/RestoreArchiveEnumerationDistinguishesFailureFromEmpty`,
+  `Maintenance/RestoreArchiveMainEnumerationUsesCanonicalHelper`,
+  `Maintenance/RetentionReportOnlySoleSessionHashFailureSetsFailureFlags`,
+  `Maintenance/RetentionNoValidRestorePointAfterHashFailureSetsFailureFlags`,
+  `Maintenance/RetentionCleanupStepFailsAfterEarlierCriticalError`,
+  `Maintenance/RestoreArchiveDirectoryWithWildcardCharsIsLiteral`.
+
+>>>>>>> origin/developer
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
   `Get-BRAVOCredentialSecureSecret` у приватний `Add-BRAVOCredentialReadSecretRecord` із власним try/catch: збій обліку
@@ -48,8 +102,8 @@
   точка відновлення (за `ArchivesKeepCount = 0` — ніколи);
   коли непридатне все, причина швидше системна (пароль, 7-Zip, доступ), і не видаляється нічого. Кожна збережена
   стара сесія дає WARNING з назвою сесії і причиною («НЕ видалено: непридатність не доведена — …»), тож оператор
-  бачить, що її треба перевірити вручну (WARNING з'являється в ті прогони, коли retention запускається, тобто коли
-  сесій більше за `Restore.ArchivesKeepCount`; умову запуску не змінено). Звичайний retention валідних сесій понад `Restore.ArchivesKeepCount`, прапорці
+  бачить, що її треба перевірити вручну (з #424 WARNING з'являється в кожному нічному прогоні: коли сесій не більше за
+  `Restore.ArchivesKeepCount`, сесії перевіряються в режимі лише перевірки, див. запис #424). Звичайний retention валідних сесій понад `Restore.ArchivesKeepCount`, прапорці
   `criticalErrorOccurred`/`restoreIntegrityFailed` і коди завершення не змінено; `Test-BRAVOMaintenanceSevenZipArchiveIntegrity`
   отримав необов'язковий `-FailureInfo` (bool-контракт повернення і політика прапорців ті самі). Тести:
   `Maintenance/RetentionStaleSessionKeptOnValidationFailure/*` (виняток валідатора, таймаут, немає 7-Zip, коди 7/8/255,
