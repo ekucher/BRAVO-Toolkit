@@ -1854,14 +1854,27 @@ function Restore-BRAVOServiceStartTypeSnapshot {
         $bravocmdRunIndex = $maintenanceTextForStartMode.IndexOf('-Description "Виконання реставрації моделі')
         $finallyIndex = $maintenanceTextForStartMode.IndexOf("Write-BRAVOProgressPhase -Phase 'Відновлення стану служб'")
         $finallyRestoreIndex = $maintenanceTextForStartMode.IndexOf('Restore-BRAVOServiceStartTypeSnapshot -Snapshot $script:startTypeSnapshot')
-        $firstServiceStartIndex = $maintenanceTextForStartMode.IndexOf('# 1. Запуск служби BRAVO')
+        # #314 (хвиля 2): запуск служб — виклик Invoke-BRAVOMaintenanceServiceStartSequence
+        # у finally runtime; тіло (# 1. Запуск служби BRAVO ...) — у
+        # BRAVO.Maintenance.ServiceCycle.ps1. Порядок перевіряється за викликом.
+        $serviceStartCallForStartMode = [regex]::Match($maintenanceTextForStartMode, '(?m)^\s*Invoke-BRAVOMaintenanceServiceStartSequence\s+`')
+        $firstServiceStartIndex = if ($serviceStartCallForStartMode.Success) { $serviceStartCallForStartMode.Index } else { -1 }
+        $serviceCycleTextForStartMode = [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1"),
+            [Text.Encoding]::UTF8
+        )
+        $serviceStartFunctionForStartMode = [regex]::Match($serviceCycleTextForStartMode, '(?s)function Invoke-BRAVOMaintenanceServiceStartSequence \{.*?\r?\n\}')
         Test-BRAVOCondition `
             -Condition (
                 $repairCallIndex -ge 0 -and $repairCallIndex -lt $firstStartModeReadIndex -and
                 $markerWriteIndex -ge 0 -and $suspendIndex -gt $markerWriteIndex -and
                 $archiveRecheckIndex -ge 0 -and $archiveRecheckIndex -lt $archiveRunIndex -and
                 $bravocmdRecheckIndex -gt $archiveRunIndex -and $bravocmdRecheckIndex -lt $bravocmdRunIndex -and
-                $finallyIndex -ge 0 -and $finallyRestoreIndex -gt $finallyIndex -and $finallyRestoreIndex -lt $firstServiceStartIndex
+                $finallyIndex -ge 0 -and $finallyRestoreIndex -gt $finallyIndex -and $finallyRestoreIndex -lt $firstServiceStartIndex -and
+                -not $maintenanceTextForStartMode.Contains('# 1. Запуск служби BRAVO') -and
+                $serviceStartFunctionForStartMode.Success -and
+                $serviceStartFunctionForStartMode.Value.Contains('# 1. Запуск служби BRAVO') -and
+                -not $serviceCycleTextForStartMode.Contains('Restore-BRAVOServiceStartTypeSnapshot')
             ) `
             -Name "ServiceQuiescence/MaintenanceOrdersRepairSuppressRecheckRestore" `
             -Failure "Maintenance: Repair до читання start type; знімок у маркері до Suspend; Confirm перед before-archive і перед bravocmd; Restore start type у finally ПЕРЕД стартом служб"

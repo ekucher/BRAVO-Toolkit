@@ -22176,10 +22176,20 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
                 $rangeIdWaitGateIndex,
                 [Math]::Min(3600, $maintenanceScriptText.Length - $rangeIdWaitGateIndex))
         } else { '' }
-        $rangeIdStartFlagAssignments = [regex]::Matches(
+        # #314 (хвиля 2): запуск служби BRAVO (і прапорець) — у винесеному
+        # циклі служб BRAVO.Maintenance.ServiceCycle.ps1; у runtime прапорець
+        # лише скидається. Рахуємо присвоєння в обох файлах: рівно одне, і
+        # саме в success-гілці запуску BRAVO у циклі служб.
+        $rangeIdServiceCycleText = [IO.File]::ReadAllText(
+            (Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1'),
+            [Text.Encoding]::UTF8)
+        $rangeIdRuntimeFlagAssignments = [regex]::Matches(
             $maintenanceScriptText,
             [regex]::Escape('$script:bravoServiceStartedThisRun = $true'))
-        $rangeIdStartSuccessIndex = $maintenanceScriptText.IndexOf(
+        $rangeIdStartFlagAssignments = [regex]::Matches(
+            $rangeIdServiceCycleText,
+            [regex]::Escape('$script:bravoServiceStartedThisRun = $true'))
+        $rangeIdStartSuccessIndex = $rangeIdServiceCycleText.IndexOf(
             'Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"')
         Test-BRAVOCondition `
             -Condition (
@@ -22187,6 +22197,7 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
                 $rangeIdWaitGateWindow.Contains('$rangeIdWaitTimeoutSeconds = if ($script:bravoServiceStartedThisRun) { 30 } else { 0 }') -and
                 $rangeIdWaitGateWindow.Contains('Wait-BRAVORangeIdLogFile') -and
                 $rangeIdWaitGateWindow.Contains('-WaitedForFileSeconds $rangeIdWaitedForFileSeconds') -and
+                $rangeIdRuntimeFlagAssignments.Count -eq 0 -and
                 $rangeIdStartFlagAssignments.Count -eq 1 -and
                 $rangeIdStartSuccessIndex -ge 0 -and
                 $rangeIdStartFlagAssignments[0].Index -gt $rangeIdStartSuccessIndex -and
@@ -29122,17 +29133,25 @@ function Write-BRAVOLog {
         -Name 'Maintenance/SectionSeparatorsDoNotEmitBareLogRecords' `
         -Failure 'голий роздільник "==="/"=" у Maintenance Write-Log має лише return, без Write-BRAVOMaintenanceLogFile — реальний DEV-LIMS лог показував рядки зі 100 символами "=" між звичайними секціями без жодної діагностичної цінності'
 
+    # #314 (хвиля 2): заголовки обробки trace/exchangAPI пише винесений цикл
+    # служб (BRAVO.Maintenance.ServiceCycle.ps1), dot-source-нутий у scope
+    # runtime — тобто тим самим Write-Log Maintenance.
+    $maintenanceServiceCycleTextForHeadings = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1'),
+        [Text.Encoding]::UTF8)
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains('if ($Message -match "^=== .* ===$") {') -and
+            $maintenanceScriptText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Maintenance.ServiceCycle.ps1'") -and
+            -not $maintenanceServiceCycleTextForHeadings.Contains('function Write-Log') -and
             $maintenanceScriptText.Contains('Write-BRAVOMaintenanceLogFile -Entry $Message') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ДЖЕРЕЛА ЖУРНАЛІВ ==="') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==="') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ЗУПИНКА СЛУЖБ ==="') -and
             $maintenanceScriptText.Contains('=== ПЕРЕВІРКА РОЗМІРІВ .MD ФАЙЛІВ ===') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== РЕСТАВРАЦІЯ МОДЕЛІ ==="') -and
-            $maintenanceScriptText.Contains('Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"') -and
-            $maintenanceScriptText.Contains('Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"') -and
+            $maintenanceServiceCycleTextForHeadings.Contains('Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"') -and
+            $maintenanceServiceCycleTextForHeadings.Contains('Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ==="') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ОЧИСТКА СТАРИХ ДАНИХ ==="') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ ==="')
