@@ -942,3 +942,639 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
         }
     }
 }
+
+# Профіль BRAVO_MAINTENANCE.ps1 -RecoverServices (#314, хвиля 4, FR-3;
+# ТЗ §6 п. 2, 5, 6). Ланцюжок — напряму над Get-BRAVOServiceRecoveryPlan
+# (функція лише обчислює). Сам профіль — у дочірньому процесі: справжні
+# функції BRAVO.Maintenance.RecoverServices.ps1, циклу служб
+# (ServiceCycle.ps1) і обліку відновлення (ServiceRecovery.ps1), справжні
+# Get-BRAVOMaintenanceResolvedExitCode / Get-BRAVOMaintenanceFinalStatus
+# runtime (за AST) і BRAVO.ExitCodes; служби, класифікація, lock, маркер,
+# журнали, події SCM і доставка сповіщень — стаби, що пишуть події.
+& {
+    $recoverRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_RECOVER_SERVICES_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($recoverRoot)
+        $recoverProfilePath = Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.RecoverServices.ps1'
+        $recoverProfileText = ''
+        if (Test-Path -LiteralPath $recoverProfilePath -PathType Leaf) {
+            $recoverProfileText = [IO.File]::ReadAllText($recoverProfilePath, [Text.Encoding]::UTF8)
+        }
+        $recoverProfileAst = [Management.Automation.Language.Parser]::ParseInput($recoverProfileText, [ref]$null, [ref]$null)
+        $recoverFunctionNames = @($recoverProfileAst.EndBlock.Statements | Where-Object {
+                $_ -is [Management.Automation.Language.FunctionDefinitionAst]
+            } | ForEach-Object { $_.Name })
+
+        # --- ТЗ §6 п. 2: ланцюжки і порядок ---
+        $recoverPlanText = @($recoverProfileAst.EndBlock.Statements | Where-Object {
+                $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Get-BRAVOServiceRecoveryPlan'
+            } | ForEach-Object { $_.Extent.Text }) -join "`n"
+        $recoverPlanChecks = New-Object System.Collections.Generic.List[string]
+        if ([string]::IsNullOrWhiteSpace($recoverPlanText)) {
+            $recoverPlanChecks.Add('немає функції Get-BRAVOServiceRecoveryPlan')
+        } else {
+            . ([scriptblock]::Create($recoverPlanText))
+            $recoverPlanSet = [pscustomobject]@{
+                Bravo = [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Managed = $true; Disabled = $false }
+                ExchangeApi = [pscustomobject]@{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Managed = $true; Disabled = $false }
+                BravoWeb = [pscustomobject]@{ Key = 'BravoWeb'; Name = 'BravoWeb'; Managed = $true; Disabled = $false }
+            }
+            $recoverPlanDisabledBravo = [pscustomobject]@{
+                Bravo = [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Managed = $false; Disabled = $true }
+                ExchangeApi = $recoverPlanSet.ExchangeApi
+                BravoWeb = $recoverPlanSet.BravoWeb
+            }
+            $recoverCondition = {
+                param([string]$Condition, [string]$Status)
+                [pscustomobject]@{ Condition = $Condition; Status = $Status }
+            }
+            $recoverPlanCases = @(
+                @{ Name = 'BRAVO'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Failed' 'Stopped'); ExchangeApi = (& $recoverCondition 'Running' 'Running'); BravoWeb = (& $recoverCondition 'Running' 'Running') }; Deferred = @(); Expected = 'F=Bravo;S=BravoWeb,ExchangeApi;R=Bravo,ExchangeApi,BravoWeb;P=;D=' },
+                @{ Name = 'exchangAPI'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Running' 'Running'); ExchangeApi = (& $recoverCondition 'Failed' 'Stopped'); BravoWeb = (& $recoverCondition 'Running' 'Running') }; Deferred = @(); Expected = 'F=ExchangeApi;S=;R=ExchangeApi;P=;D=' },
+                @{ Name = 'BRAVO Web'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Running' 'Running'); ExchangeApi = (& $recoverCondition 'Running' 'Running'); BravoWeb = (& $recoverCondition 'Failed' 'Stopped') }; Deferred = @(); Expected = 'F=BravoWeb;S=;R=BravoWeb;P=;D=' },
+                @{ Name = 'BRAVO + exchangAPI'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Failed' 'Stopped'); ExchangeApi = (& $recoverCondition 'Failed' 'Stopped'); BravoWeb = (& $recoverCondition 'Running' 'Running') }; Deferred = @(); Expected = 'F=Bravo,ExchangeApi;S=BravoWeb;R=Bravo,ExchangeApi,BravoWeb;P=;D=' },
+                @{ Name = 'BRAVO + BRAVO Web'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Failed' 'Stopped'); ExchangeApi = (& $recoverCondition 'Running' 'Running'); BravoWeb = (& $recoverCondition 'Failed' 'Stopped') }; Deferred = @(); Expected = 'F=Bravo,BravoWeb;S=ExchangeApi;R=Bravo,ExchangeApi,BravoWeb;P=;D=' },
+                @{ Name = 'exchangAPI + BRAVO Web'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Running' 'Running'); ExchangeApi = (& $recoverCondition 'Failed' 'Stopped'); BravoWeb = (& $recoverCondition 'Failed' 'Stopped') }; Deferred = @(); Expected = 'F=ExchangeApi,BravoWeb;S=;R=ExchangeApi,BravoWeb;P=;D=' },
+                @{ Name = 'усі три'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Failed' 'Stopped'); ExchangeApi = (& $recoverCondition 'Failed' 'Stopped'); BravoWeb = (& $recoverCondition 'Failed' 'Stopped') }; Deferred = @(); Expected = 'F=Bravo,ExchangeApi,BravoWeb;S=;R=Bravo,ExchangeApi,BravoWeb;P=;D=' },
+                @{ Name = 'BRAVO, exchangAPI призупинена'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Failed' 'Stopped'); ExchangeApi = (& $recoverCondition 'Failed' 'Paused'); BravoWeb = (& $recoverCondition 'Running' 'Running') }; Deferred = @(); Expected = 'F=Bravo;S=BravoWeb;R=Bravo,BravoWeb;P=ExchangeApi;D=' },
+                @{ Name = 'BRAVO, BRAVO Web не керується'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Failed' 'Stopped'); ExchangeApi = (& $recoverCondition 'Running' 'Running') }; Deferred = @(); Expected = 'F=Bravo;S=ExchangeApi;R=Bravo,ExchangeApi;P=;D=' },
+                @{ Name = 'BRAVO, exchangAPI під маркером'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Failed' 'Stopped'); ExchangeApi = (& $recoverCondition 'OwnedByBravo' 'Stopped'); BravoWeb = (& $recoverCondition 'Running' 'Running') }; Deferred = @(); Expected = 'F=Bravo;S=BravoWeb;R=Bravo,BravoWeb;P=;D=' },
+                @{ Name = 'BRAVO Disabled, exchangAPI зупинена'; Set = $recoverPlanDisabledBravo; Conditions = @{ ExchangeApi = (& $recoverCondition 'Failed' 'Stopped'); BravoWeb = (& $recoverCondition 'Running' 'Running') }; Deferred = @(); Expected = 'F=;S=;R=;P=;D=' },
+                @{ Name = 'пауза exchangAPI не минула'; Set = $recoverPlanSet; Conditions = @{ Bravo = (& $recoverCondition 'Running' 'Running'); ExchangeApi = (& $recoverCondition 'Failed' 'Stopped'); BravoWeb = (& $recoverCondition 'Failed' 'Stopped') }; Deferred = @('ExchangeApi'); Expected = 'F=BravoWeb;S=;R=BravoWeb;P=;D=ExchangeApi' }
+            )
+            foreach ($recoverPlanCase in $recoverPlanCases) {
+                $recoverPlan = Get-BRAVOServiceRecoveryPlan -ServiceSet $recoverPlanCase.Set -Conditions $recoverPlanCase.Conditions -DeferredKeys $recoverPlanCase.Deferred
+                $recoverPlanActual = 'F={0};S={1};R={2};P={3};D={4}' -f (@($recoverPlan.FailedKeys) -join ','), (@($recoverPlan.StopKeys) -join ','), (@($recoverPlan.StartKeys) -join ','), (@($recoverPlan.PausedKeys) -join ','), (@($recoverPlan.DeferredKeys) -join ',')
+                if ($recoverPlanActual -cne $recoverPlanCase.Expected) {
+                    $recoverPlanChecks.Add("$($recoverPlanCase.Name): очікувалось $($recoverPlanCase.Expected), отримано $recoverPlanActual")
+                }
+            }
+            $recoverDependent = Get-BRAVOServiceRecoveryPlan -ServiceSet $recoverPlanDisabledBravo -Conditions @{ ExchangeApi = (& $recoverCondition 'Failed' 'Stopped') }
+            if ((@($recoverDependent.DependentSkippedKeys) -join ',') -cne 'ExchangeApi') {
+                $recoverPlanChecks.Add("BRAVO Disabled: exchangAPI має потрапити в DependentSkippedKeys, отримано '$(@($recoverDependent.DependentSkippedKeys) -join ',')'")
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition ($recoverPlanChecks.Count -eq 0) `
+            -Name 'ServiceRecovery/RecoverServicesChainPlan' `
+            -Failure "#314 FR-3 крок 5 (ТЗ §6 п. 2): Failed BRAVO -> зупинка працюючих BRAVO Web і exchangAPI, запуск BRAVO -> exchangAPI -> BRAVO Web; Failed exchangAPI / BRAVO Web -> лише вона; кілька -> об'єднання в канонічному порядку; призупинена не чіпається: $($recoverPlanChecks -join '; ')"
+
+        # --- Статичні межі профілю ---
+        $recoverCommandNames = @($recoverProfileAst.FindAll({
+                    param($node) $node -is [Management.Automation.Language.CommandAst]
+                }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)
+        $recoverForbidden = @('Restore-FromArchive', 'Invoke-BRAVOModelRestoreRecovery', 'Compare-FileSizes', 'Check-MdFileSizes',
+            'Process-OldData', 'Remove-OldLogFiles', 'Remove-OldRestoreArchives', 'Remove-BRAVOExpiredCompressedLogs',
+            'Invoke-BRAVOLegacyLogMigration', 'Invoke-BRAVOLegacySweep', 'Invoke-BRAVOTraceArchiveMaintenance', 'Send-BRAVOTraceArchive',
+            'Invoke-BRAVOTraceRemoteLogMigration', 'Invoke-BRAVOMaintenanceOwnLogUpload', 'Invoke-AutoShutdown', 'Start-Process',
+            'Invoke-CommandWithLog', 'Send-FinalReport', 'Write-BRAVOOperationStatus', 'Write-BRAVOTaskExecutionState',
+            'Invoke-ServiceStateChange', 'Start-Service', 'Stop-Service')
+        $recoverForbiddenUsed = @($recoverCommandNames | Where-Object { $recoverForbidden -contains $_ })
+        $recoverReused = @('Invoke-BRAVOMaintenanceServiceStopSequence', 'Invoke-BRAVOMaintenanceServiceLogProcessing',
+            'Invoke-BRAVOMaintenanceServiceStartSequence', 'Get-BRAVOMaintenanceServiceConditionSet', 'Enter-BRAVOMaintenanceOperationLock',
+            'Write-BRAVOServiceQuiescenceState', 'Test-BRAVOServiceRecoveryPauseElapsed', 'Invoke-BRAVOServiceRecoveryAttemptAccounting',
+            'New-BRAVOServiceRecoveryNotificationContent', 'Send-BRAVOServiceRecoveryNotification')
+        $recoverReusedMissing = @($recoverReused | Where-Object { $recoverCommandNames -notcontains $_ })
+        Test-BRAVOCondition `
+            -Condition ($recoverFunctionNames.Count -gt 0 -and $recoverForbiddenUsed.Count -eq 0 -and $recoverReusedMissing.Count -eq 0) `
+            -Name 'ServiceRecovery/RecoverServicesOnlyRecoversServices' `
+            -Failure "#314 FR-3: профіль -RecoverServices не виконує реставрацію, перевірку розмірів, очистку, міграцію журналів, trace-архів/SFTP, BRAVO_ARCHIV і автовимкнення, а служби зупиняє/запускає лише функціями циклу служб (без копіювання); заборонені виклики: $($recoverForbiddenUsed -join ', '); не використано: $($recoverReusedMissing -join ', ')"
+
+        $recoverEntryText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_MAINTENANCE.ps1'), [Text.Encoding]::UTF8)
+        $recoverEntryLines = @($recoverEntryText -split "`r?`n").Count
+        $recoverRuntimeText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+        $recoverRuntimeAst = [Management.Automation.Language.Parser]::ParseInput($recoverRuntimeText, [ref]$null, [ref]$null)
+        $recoverRuntimeParamCount = @($recoverRuntimeAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.ParameterAst] -and $node.Name.VariablePath.UserPath -eq 'RecoverServices' -and
+                    $node.Extent.Text -match '^\[switch\]\$RecoverServices$'
+                }, $true)).Count
+        $recoverBranchIndex = $recoverRuntimeText.IndexOf('if ($RecoverServices) {')
+        $recoverLogFileIndex = $recoverRuntimeText.IndexOf('$script:LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"')
+        $recoverStepsIndex = $recoverRuntimeText.IndexOf('Initialize-BRAVOMaintenanceSteps -Total 8')
+        $recoverBranchText = if ($recoverBranchIndex -ge 0) { $recoverRuntimeText.Substring($recoverBranchIndex, [Math]::Min(400, $recoverRuntimeText.Length - $recoverBranchIndex)) } else { '' }
+        Test-BRAVOCondition `
+            -Condition (
+                $recoverEntryText.Contains('[switch]$RecoverServices') -and
+                $recoverEntryText.Contains('RecoverServices = $RecoverServices') -and
+                $recoverEntryLines -le 250 -and
+                $recoverRuntimeParamCount -eq 2 -and
+                $recoverRuntimeText.Contains('if ($RecoverServices) { $elevatedArguments += "-RecoverServices" }') -and
+                $recoverRuntimeText.Contains("'BRAVO.Maintenance.RecoverServices.ps1'") -and
+                $recoverLogFileIndex -ge 0 -and $recoverBranchIndex -gt $recoverLogFileIndex -and $recoverBranchIndex -lt $recoverStepsIndex -and
+                $recoverBranchText -match 'exit \(Invoke-BRAVOMaintenanceRecoverServicesProfile -ForceRestore:\$ForceRestore -RunMissedRestoreOnly:\$RunMissedRestoreOnly\)'
+            ) `
+            -Name 'ServiceRecovery/RecoverServicesWiredThroughEntrypointAndRuntime' `
+            -Failure "#314 FR-3: -RecoverServices — switch тонкого entrypoint (≤250 рядків, зараз $recoverEntryLines), той самий switch у param() runtime (скрипт і функція: $recoverRuntimeParamCount з 2) і в аргументах елевації, профіль підключено з BRAVO.Maintenance.RecoverServices.ps1 і викликано до кроків нічного прогону (після визначення шляхів журналів), код завершення — його"
+
+        # --- Operation-lock без очікування (FR-3 крок 3) ---
+        $recoverLockText = @($recoverRuntimeAst.FindAll({
+                    param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Enter-BRAVOMaintenanceOperationLock'
+                }, $true) | ForEach-Object { $_.Extent.Text }) -join "`n"
+        $recoverLockResult = $null
+        $recoverLockError = ''
+        $recoverLockSleeps = 0
+        $recoverLockLogs = 0
+        if (-not [string]::IsNullOrWhiteSpace($recoverLockText)) {
+            $recoverLockScenario = & {
+                $operationLockSettings = @{ Path = $recoverRoot }
+                $schedulerSettings = @{}
+                $script:recoverLockSleeps = 0
+                $script:recoverLockLogs = 0
+                function Get-BRAVOOperationLockWaitBudget { param($SchedulerSettings, $TaskType) [pscustomobject]@{ EffectiveMinutes = 0.02; LimitDescription = '' } }
+                function Start-Sleep { param($Seconds, $Milliseconds) $script:recoverLockSleeps++ }
+                function Write-Log { param($Message, $Level) $script:recoverLockLogs++ }
+                . ([scriptblock]::Create($recoverLockText))
+                try {
+                    # Каталог замість файлу lock-а: відкриття гарантовано не вдається — як зайнятий lock.
+                    $lockResult = Enter-BRAVOMaintenanceOperationLock -TaskType Maintenance -NoWait
+                    [pscustomobject]@{ Result = $lockResult; Error = ''; Sleeps = $script:recoverLockSleeps; Logs = $script:recoverLockLogs }
+                } catch {
+                    [pscustomobject]@{ Result = $null; Error = $_.Exception.Message; Sleeps = $script:recoverLockSleeps; Logs = $script:recoverLockLogs }
+                }
+            }
+            $recoverLockResult = $recoverLockScenario.Result
+            $recoverLockError = [string]$recoverLockScenario.Error
+            $recoverLockSleeps = [int]$recoverLockScenario.Sleeps
+            $recoverLockLogs = [int]$recoverLockScenario.Logs
+        }
+        Test-BRAVOCondition `
+            -Condition ($null -ne $recoverLockResult -and -not $recoverLockResult.Success -and $recoverLockSleeps -eq 0 -and $recoverLockLogs -eq 0) `
+            -Name 'ServiceRecovery/RecoverServicesLockWithoutWaiting' `
+            -Failure "#314 FR-3 крок 3: Enter-BRAVOMaintenanceOperationLock -NoWait робить рівно одну спробу без очікування й без рядків журналу; помилка: '$recoverLockError'; очікувань: $recoverLockSleeps; рядків журналу: $recoverLockLogs"
+
+        # --- Профіль у дочірньому процесі ---
+        $recoverProbeScript = @'
+param([string]$RepositoryRoot, [string]$ProbeRoot)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+$probeResults = [ordered]@{}
+try {
+    Import-Module -Name (Join-Path $RepositoryRoot 'modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1') -Force -ErrorAction Stop
+    foreach ($probeFileName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1', 'BRAVO.Maintenance.RecoverServices.ps1')) {
+        $probeFileText = [IO.File]::ReadAllText((Join-Path $RepositoryRoot ('modules\BRAVO.Maintenance\' + $probeFileName)), [Text.Encoding]::UTF8)
+        foreach ($probeStatement in @([Management.Automation.Language.Parser]::ParseInput($probeFileText, [ref]$null, [ref]$null).EndBlock.Statements)) {
+            if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst]) { . ([scriptblock]::Create($probeStatement.Extent.Text)) }
+        }
+    }
+    $probeRuntimeText = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+    foreach ($probeRuntimeFunction in @([Management.Automation.Language.Parser]::ParseInput($probeRuntimeText, [ref]$null, [ref]$null).FindAll({
+                    param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    @('Get-BRAVOMaintenanceResolvedExitCode', 'Get-BRAVOMaintenanceFinalStatus') -contains $node.Name
+                }, $true))) {
+        . ([scriptblock]::Create($probeRuntimeFunction.Extent.Text))
+    }
+} catch {
+    [IO.File]::WriteAllText((Join-Path $ProbeRoot 'results.json'), (@{ ProbeError = $_.Exception.Message } | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+    exit 1
+}
+
+# Стаби (визначені після справжніх функцій — перекривають їх).
+function Add-ProbeEvent { param([string]$Text) $script:ProbeEvents.Add($Text) }
+function Write-Host { param([Parameter(Position = 0)]$Object, $ForegroundColor, [switch]$NoNewline) Add-ProbeEvent ('HOST ' + [string]$Object) }
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO', [int]$SeparatorLength = 100, [switch]$NoTimestamp, [switch]$NoConsole, [switch]$Environmental)
+    if ($Level -eq 'WARNING' -and -not $Environmental) { $script:BRAVOWarningCount++ }
+    Add-ProbeEvent ('LOG-{0} {1}' -f $Level, $Message)
+    if ([string]::IsNullOrWhiteSpace([string]$script:LOG_FILE)) { Add-ProbeEvent 'LOG-WITHOUT-FILE'; return }
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName([string]$script:LOG_FILE))
+    [IO.File]::AppendAllText([string]$script:LOG_FILE, ('[{0}] {1}' -f $Level, $Message) + "`n", (New-Object Text.UTF8Encoding($false)))
+}
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    if (-not $script:ProbeServices.ContainsKey($Name)) {
+        if ([string]$ErrorAction -eq 'SilentlyContinue') { return $null }
+        throw "self-test: невідома служба $Name"
+    }
+    $probeService = [pscustomobject]@{ Name = $Name; DisplayName = ('{0} Display' -f $Name); Status = [string]$script:ProbeServices[$Name] }
+    $probeService | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+    return $probeService
+}
+function Get-BRAVOManagedServiceCondition {
+    param([string]$Name)
+    $probeStatus = [string]$script:ProbeServices[$Name]
+    $probeMode = [string]$script:ProbeStartModes[$Name]
+    $probeCondition = if ($probeMode -eq 'Disabled') { 'Disabled' } elseif ($probeStatus -eq 'Running') { 'Running' } elseif (@('StartPending', 'StopPending', 'ContinuePending', 'PausePending') -contains $probeStatus) { 'Pending' } elseif (@($script:ProbeMarkerNames) -contains $Name) { 'OwnedByBravo' } else { 'Failed' }
+    $probeExitCode = 0
+    if ($script:ProbeExitCodes.ContainsKey($Name)) { $probeExitCode = $script:ProbeExitCodes[$Name] }
+    return [pscustomobject]@{ Name = $Name; Exists = $true; StartMode = $probeMode; Status = $probeStatus; ExitCode = $probeExitCode; ServiceSpecificExitCode = 0; Condition = $probeCondition }
+}
+function Invoke-ServiceStateChange {
+    param([string]$Name, [string]$DesiredStatus, [int]$TimeoutSeconds, [int]$PollIntervalSeconds, [switch]$Force)
+    if ($DesiredStatus -eq 'Stopped') {
+        Add-ProbeEvent "STOP $Name"
+        $script:ProbeServices[$Name] = 'Stopped'
+        return [pscustomobject]@{ Success = $true; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = 'Stopped'; Error = $null }
+    }
+    if (@($script:ProbeStartFailures) -contains $Name) {
+        Add-ProbeEvent "START-FAIL $Name"
+        return [pscustomobject]@{ Success = $false; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = 'Stopped'; Error = 'self-test: служба не стартувала' }
+    }
+    Add-ProbeEvent "START $Name"
+    $script:ProbeServices[$Name] = 'Running'
+    return [pscustomobject]@{ Success = $true; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = 'Running'; Error = $null }
+}
+function Get-Process { param($Name, $ErrorAction) if (@($script:ProbeStrayProcesses) -contains [string]$Name) { return [pscustomobject]@{ Name = [string]$Name } } }
+function Stop-Process { param([Parameter(ValueFromPipeline = $true)]$InputObject, [switch]$Force) process { Add-ProbeEvent ('STOP-PROCESS ' + [string]$InputObject.Name) } }
+function Start-Sleep { param($Seconds, $Milliseconds) }
+function Send-SlackAlert {
+    param([string]$Message, [switch]$IsCritical, [string]$Severity)
+    if ($IsCritical) { $script:criticalErrorOccurred = $true; $script:CriticalErrorsList.Add($Message) }
+    Add-ProbeEvent 'ALERT-QUEUED'
+}
+function Enter-BRAVOMaintenanceOperationLock {
+    param([string]$TaskType, [switch]$NoWait)
+    if ($script:ProbeLockBusy) { Add-ProbeEvent 'LOCK-BUSY'; return [pscustomobject]@{ Success = $false; Stream = $null; Path = 'self-test-lock'; Error = 'self-test: зайнято' } }
+    Add-ProbeEvent ('LOCK-ENTER NoWait={0}' -f [bool]$NoWait)
+    return [pscustomobject]@{ Success = $true; Stream = $null; Path = 'self-test-lock'; Error = $null }
+}
+function Exit-BRAVOMaintenanceOperationLock { Add-ProbeEvent 'LOCK-EXIT' }
+function Write-BRAVOServiceQuiescenceState {
+    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
+    if ($script:ProbeMarkerWriteFails) { Add-ProbeEvent 'MARKER-WRITE-FAIL'; throw 'self-test: імітований збій запису ownership-маркера' }
+    Add-ProbeEvent ('MARKER-WRITE {0} {1}' -f $Owner, ((@($Services) | ForEach-Object { '{0}={1}' -f $_.Name, [bool]$_.RestartIntent }) -join ','))
+}
+function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
+function Get-BRAVOForeignServiceQuiescenceContext { return $script:ProbeForeignContext }
+function Get-BRAVOServiceRecoveryStatePath { return $script:ProbeStatePath }
+function Protect-BRAVOMachineStateRoot { param([switch]$CheckOnly, [string]$Path) return [pscustomobject]@{ Path = $Path; Compliant = $true; Applied = $false; Issues = @() } }
+function Write-BRAVOStateFileAtomic {
+    param([string]$Path, [AllowEmptyString()][string]$Text)
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+    Add-ProbeEvent 'RECOVERY-STATE-WRITE'
+}
+function Resolve-BRAVONotificationRoute {
+    param($Severity, $NotificationMode, $RoutingTable)
+    if ($NotificationMode -eq 'none' -or ($NotificationMode -eq 'errors_only' -and $Severity -eq 'SUCCESS')) { return 'none' }
+    if ($Severity -eq 'SUCCESS') { return 'general' }
+    return 'alerts'
+}
+function New-MaintenanceNotificationMessage { param($Title, $TitleEmoji, $Duration, $DurationLabel, $StatusLines, $Details, $LogPath, $Severity) return ('{0}|{1}' -f $Severity, $Title) }
+function Invoke-NotificationWebhook { param([string]$Message, [string]$WebhookUrl) Add-ProbeEvent ('NOTIFY ' + $Message) }
+function Invoke-BRAVOTraceRotation { param($Sources, $DestinationDirectory, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'TRACE-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
+function Invoke-BRAVOExchangeApiLogRotation { param($SourceDirectory, $DestinationDirectory, $Patterns, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'EXCHANGE-ROTATION'; return [pscustomobject]@{ Found = 1; Moved = 1; Errors = 0 } }
+function Invoke-BRAVOApacheLogRotation { param($SourceDirectory, $DestinationDirectory, $Filter, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'APACHE-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
+function Invoke-BRAVOWebApplicationLogRotation { param($SourceDirectory, $DestinationDirectory, $Filter, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'WEBAPP-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
+function Get-BRAVOTraceConfiguration { param($DiscoveryResult, $TraceRootDirectory, $DateFolderName) return [pscustomobject]@{ IsValid = $true; TracePath = 'self-test-trace.log'; Reason = $null } }
+function Get-BRAVOInstallationTraceOutSources { param($InstallationRoot, $LimsRoot, $SrvTracePath, $ExplicitBisPath) return [pscustomobject]@{ Sources = @(); ScanRoot = 'self-test'; ScanRootReason = 'self-test' } }
+function Resolve-BRAVOExchangeApiRuntimeDirectory { param($ServiceName, $FallbackDirectory) return [pscustomobject]@{ Directory = 'self-test'; Reason = 'self-test' } }
+function Get-BRAVOWmiInstance { param($ClassName, $Filter) return [pscustomobject]@{ LastBootUpTime = (Get-Date).AddHours(-3) } }
+function Get-WinEvent {
+    param($FilterHashtable, $MaxEvents, $ErrorAction)
+    Add-ProbeEvent 'SCM-READ'
+    if ($script:ProbeScmReadFails) { throw 'self-test: журнал System недоступний' }
+    return @($script:ProbeScmEvents)
+}
+
+$probeNow = [DateTimeOffset]::Now
+$probeScenarios = [ordered]@{
+    'RSAllRunning' = { }
+    'RSExchangeFailed' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeExitCodes['exchangAPI'] = 1067
+        $script:ProbeScmEvents = @([pscustomobject]@{ TimeCreated = (Get-Date).AddMinutes(-2); Id = 7034; Message = 'self-test: служба завершилась несподівано'; Properties = @([pscustomobject]@{ Value = 'exchangAPI Display' }, [pscustomobject]@{ Value = '1' }) })
+    }
+    'RSBravoFailed' = { $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeExitCodes['BRAVO'] = 1067 }
+    'RSWebFailed' = { $script:ProbeServices['BravoWeb'] = 'Stopped' }
+    'RSBravoAndWebFailed' = { $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeServices['BravoWeb'] = 'Stopped' }
+    'RSExchangeAndWebFailed' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeServices['BravoWeb'] = 'Stopped' }
+    'RSBravoFailedExchangePaused' = { $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeServices['exchangAPI'] = 'Paused' }
+    'RSPausedOnly' = { $script:ProbeServices['exchangAPI'] = 'Paused' }
+    'RSDisabledBravoDependent' = {
+        $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeStartModes['BRAVO'] = 'Disabled'
+        $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeSeedBravoDisabled = $true
+    }
+    'RSLockBusy' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true }
+    'RSPauseNotElapsed' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeStateSeed = ([ordered]@{ schemaVersion = 1; hostname = [Environment]::MachineName; services = [ordered]@{ exchangAPI = [ordered]@{ attempts = @($probeNow.AddMinutes(-1).ToString('o')); lastCriticalAt = $null; stableSince = $null } } } | ConvertTo-Json -Depth 6)
+    }
+    'RSCyclicThirdAttempt' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeStateSeed = ([ordered]@{ schemaVersion = 1; hostname = [Environment]::MachineName; services = [ordered]@{ exchangAPI = [ordered]@{ attempts = @($probeNow.AddHours(-2).ToString('o'), $probeNow.AddMinutes(-30).ToString('o')); lastCriticalAt = $null; stableSince = $null } } } | ConvertTo-Json -Depth 6)
+    }
+    'RSStableCounterReset' = {
+        $script:ProbeStateSeed = ([ordered]@{ schemaVersion = 1; hostname = [Environment]::MachineName; services = [ordered]@{ exchangAPI = [ordered]@{ attempts = @($probeNow.AddMinutes(-50).ToString('o')); lastCriticalAt = $null; stableSince = $probeNow.AddMinutes(-40).ToString('o') } } } | ConvertTo-Json -Depth 6)
+    }
+    'RSSuppressedMarker' = {
+        $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeMarkerNames = @('BRAVO')
+        $script:ProbeForeignContext = [pscustomobject]@{ Present = $true; OwnerAlive = $false; Owner = 'BRAVO_MAINTENANCE'; RestartSuppressed = $true; RestartIntentNames = @('BRAVO'); HeldSnapshot = @() }
+    }
+    'RSForeignOwnerAlive' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeForeignContext = [pscustomobject]@{ Present = $true; OwnerAlive = $true; Owner = 'BRAVO_DATA_RESTORE'; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
+    }
+    'RSIntegrityGateClosed' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:modelIntegrityEstablished = $false }
+    'RSMarkerWriteFails' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeMarkerWriteFails = $true }
+    'RSStartFails' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeStartFailures = @('exchangAPI') }
+    'RSScmReadFails' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeScmReadFails = $true }
+    'RSConflictForceRestore' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeForceRestore = $true }
+    'RSConflictRunMissedRestoreOnly' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeRunMissedRestoreOnly = $true }
+}
+foreach ($probeScenarioName in @($probeScenarios.Keys)) {
+    $probeScenarioRoot = Join-Path $ProbeRoot $probeScenarioName
+    [void][IO.Directory]::CreateDirectory($probeScenarioRoot)
+    $probeResults[$probeScenarioName] = & {
+        param([string]$ScenarioRoot, [scriptblock]$ScenarioSeed)
+        try {
+            $script:ProbeEvents = New-Object System.Collections.Generic.List[string]
+            $script:ScriptStartTime = Get-Date
+            $script:BRAVOWarningCount = 0
+            $script:criticalErrorOccurred = $false
+            $script:CriticalErrors = $false
+            $script:CriticalErrorsList = New-Object 'System.Collections.Generic.List[string]'
+            $script:NotificationAlertQueue = New-Object 'System.Collections.Generic.List[object]'
+            $script:maintenanceDeliveredCriticalAlertCount = 0
+            $script:maintenanceDeliveredAlertQueueCount = 0
+            $script:restoreArchiveFailed = $false
+            $script:restoreIntegrityFailed = $false
+            $script:restoreFailed = $false
+            $script:modelIntegrityEstablished = $true
+            $script:maintenanceOperationLock = $null
+            $script:maintenanceOperationLockPath = $null
+            $script:maintenanceOwnLogUploadAttempted = $false
+            $script:bravoServiceStartedThisRun = $false
+            $script:SlackMode = 'errors_only'
+            $script:NotificationWebhookUrls = @{ alerts = 'https://alerts.example.invalid/hook' }
+            $script:LOG_FILE = $null
+            $script:ProbeServices = @{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }
+            $script:ProbeStartModes = @{ 'BRAVO' = 'Automatic'; 'exchangAPI' = 'Automatic'; 'BravoWeb' = 'Manual' }
+            $script:ProbeExitCodes = @{}
+            $script:ProbeMarkerNames = @()
+            $script:ProbeStartFailures = @()
+            $script:ProbeStrayProcesses = @('Bis')
+            $script:ProbeLockBusy = $false
+            $script:ProbeMarkerWriteFails = $false
+            $script:ProbeScmReadFails = $false
+            $script:ProbeScmEvents = @()
+            $script:ProbeStateSeed = $null
+            $script:ProbeSeedBravoDisabled = $false
+            $script:ProbeForceRestore = $false
+            $script:ProbeRunMissedRestoreOnly = $false
+            $script:ProbeForeignContext = [pscustomobject]@{ Present = $false; OwnerAlive = $false; Owner = $null; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
+            $script:ProbeStatePath = Join-Path (Join-Path $ScenarioRoot 'state') 'BRAVO_SERVICE_RECOVERY_STATE.json'
+            . $ScenarioSeed
+            if ($null -ne $script:ProbeStateSeed) {
+                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($script:ProbeStatePath))
+                [IO.File]::WriteAllText($script:ProbeStatePath, [string]$script:ProbeStateSeed, (New-Object Text.UTF8Encoding($false)))
+            }
+
+            # Змінні тіла runtime, які профіль і цикл служб читають через динамічний scope.
+            $bravoSettings = [pscustomobject]@{ NotificationRouting = $null }
+            $BravoServiceName = 'BRAVO'
+            $ExchangAPIServiceName = 'exchangAPI'
+            $BravoWebServiceName = 'BravoWeb'
+            $BravoMaintenanceEnabled = -not $script:ProbeSeedBravoDisabled
+            $BravoServiceDisabledBySystem = [bool]$script:ProbeSeedBravoDisabled
+            $exchangAPIServiceEnabled = $true
+            $exchangAPIServiceDisabled = $false
+            $BravoWebMaintenanceEnabled = $true
+            $ApacheEnabled = $true
+            $LOG_DIR = Join-Path $ScenarioRoot 'logs'
+            $ServiceStartTimeoutSeconds = 1
+            $ServiceStopTimeoutSeconds = 1
+            $ServicePollIntervalSeconds = 1
+            $bravoDiscoveryResult = [pscustomobject]@{ BRAVO_ROOT = ''; MODEL_SOURCE = ''; MODEL_PROJECT_FILE = '' }
+            $ROOT_LIMS = Join-Path $ScenarioRoot 'lims'
+            $TRACE_DIR = Join-Path $ScenarioRoot 'system\Trace'
+            $LOG_DATE_FOLDER = 'self-test'
+            $MaintenanceConfig = [pscustomobject]@{ Trace = [pscustomobject]@{ BISSourcePath = '' } }
+            $EXCHANGE_LOG_DIR = Join-Path $ScenarioRoot 'system\exchangAPI'
+            $EXCHANGAPI_LOG_FILTERS = @('exchangAPI*.log')
+            $MoveRetryCount = 0
+            $MoveRetryDelaySeconds = 0
+            $APACHE_LOGS_DIR = Join-Path $ScenarioRoot 'apache\logs'
+            $APACHE_DAILY_LOG_DIR = Join-Path $ScenarioRoot 'system\BravoWeb\Apache\daily'
+            $APACHE_LOG_FILTER = '*.log'
+            $WWW_LOGS_DIR = Join-Path $ScenarioRoot 'www\log'
+            $BRAVOWEB_APP_DAILY_LOG_DIR = Join-Path $ScenarioRoot 'system\BravoWeb\Application\daily'
+            $BRAVOWEB_APP_LOG_FILTER = '*.log'
+
+            $probeExitCode = Invoke-BRAVOMaintenanceRecoverServicesProfile -ForceRestore:$script:ProbeForceRestore -RunMissedRestoreOnly:$script:ProbeRunMissedRestoreOnly
+            $probeLogFiles = @()
+            if (Test-Path -LiteralPath $LOG_DIR -PathType Container) { $probeLogFiles = @([IO.Directory]::GetFiles($LOG_DIR) | ForEach-Object { [IO.Path]::GetFileName($_) } | Sort-Object) }
+            $probeLogText = ''
+            foreach ($probeLogFile in $probeLogFiles) { $probeLogText += [IO.File]::ReadAllText((Join-Path $LOG_DIR $probeLogFile), [Text.Encoding]::UTF8) }
+            $probeStateText = ''
+            if ([IO.File]::Exists($script:ProbeStatePath)) { $probeStateText = [IO.File]::ReadAllText($script:ProbeStatePath, [Text.Encoding]::UTF8) }
+            [pscustomobject]@{
+                ExitCode = $probeExitCode
+                Events = @($script:ProbeEvents)
+                LogFiles = @($probeLogFiles)
+                LogText = $probeLogText
+                StateText = $probeStateText
+                QueuedCritical = $script:CriticalErrorsList.Count
+                DeliveredCritical = [int]$script:maintenanceDeliveredCriticalAlertCount
+                OwnLogUploadSuppressed = [bool]$script:maintenanceOwnLogUploadAttempted
+            }
+        } catch {
+            [pscustomobject]@{ ProbeError = ('{0} @ {1}' -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) }
+        }
+    } $probeScenarioRoot $probeScenarios[$probeScenarioName]
+}
+[IO.File]::WriteAllText((Join-Path $ProbeRoot 'results.json'), ($probeResults | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+'@
+        $recoverResults = $null
+        $recoverProbeError = ''
+        if ($recoverFunctionNames.Count -gt 0) {
+            $recoverProbePath = Join-Path $recoverRoot 'probe.ps1'
+            [IO.File]::WriteAllText($recoverProbePath, $recoverProbeScript, (New-Object Text.UTF8Encoding($true)))
+            $recoverHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            $null = & $recoverHost -NoLogo -NoProfile -NonInteractive -File $recoverProbePath -RepositoryRoot $root -ProbeRoot $recoverRoot
+            $recoverResultsPath = Join-Path $recoverRoot 'results.json'
+            if (Test-Path -LiteralPath $recoverResultsPath -PathType Leaf) {
+                $recoverResults = [IO.File]::ReadAllText($recoverResultsPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                if ($null -ne $recoverResults.PSObject.Properties['ProbeError']) { $recoverProbeError = [string]$recoverResults.ProbeError; $recoverResults = $null }
+            } else {
+                $recoverProbeError = "проба не записала results.json (код виходу $LASTEXITCODE)"
+            }
+        } else {
+            $recoverProbeError = 'немає BRAVO.Maintenance.RecoverServices.ps1 з функціями профілю'
+        }
+        Test-BRAVOCondition `
+            -Condition ($null -ne $recoverResults) `
+            -Name 'ServiceRecovery/RecoverServicesProbeAvailable' `
+            -Failure "проба профілю -RecoverServices: $recoverProbeError"
+
+        # Дії профілю (без рядків журналу й консолі) — у порядку виконання.
+        $recoverActions = {
+            param([string]$Scenario)
+            if ($null -eq $recoverResults -or $null -eq $recoverResults.PSObject.Properties[$Scenario]) { return @('<немає результату>') }
+            $result = $recoverResults.$Scenario
+            if ($null -ne $result.PSObject.Properties['ProbeError']) { return @("<помилка проби: $($result.ProbeError)>") }
+            return @(@($result.Events) | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike 'LOG-*' -and $_ -notlike 'HOST *' -and $_ -ne 'ALERT-QUEUED' })
+        }
+        $recoverCheck = {
+            param([string]$Scenario, [int]$ExpectedExitCode, [string[]]$ExpectedActions, [string]$LogFilePattern, [scriptblock]$Extra, [string]$Name, [string]$Meaning)
+            $result = $null
+            if ($null -ne $recoverResults -and $null -ne $recoverResults.PSObject.Properties[$Scenario]) { $result = $recoverResults.$Scenario }
+            $actualActions = @(& $recoverActions $Scenario)
+            $actualExitCode = $null
+            $logFiles = @()
+            $extraOk = $false
+            if ($null -ne $result -and $null -eq $result.PSObject.Properties['ProbeError']) {
+                $actualExitCode = [int]$result.ExitCode
+                $logFiles = @($result.LogFiles | ForEach-Object { [string]$_ })
+                $extraOk = [bool](& $Extra $result)
+            }
+            $logFilesOk = if ([string]::IsNullOrEmpty($LogFilePattern)) { $logFiles.Count -eq 0 } else { $logFiles.Count -eq 1 -and $logFiles[0] -cmatch $LogFilePattern }
+            Test-BRAVOCondition `
+                -Condition ($actualExitCode -eq $ExpectedExitCode -and ($actualActions -join ' | ') -ceq ($ExpectedActions -join ' | ') -and $logFilesOk -and $extraOk) `
+                -Name $Name `
+                -Failure "$Meaning. Код: очікувався $ExpectedExitCode, отримано $actualExitCode; дії: очікувались [$($ExpectedActions -join ' | ')], отримано [$($actualActions -join ' | ')]; файли журналу: [$($logFiles -join ', ')] (очікувались: '$LogFilePattern'); додаткові умови: $extraOk; події: $(if ($null -ne $result -and $null -ne $result.PSObject.Properties['Events']) { @($result.Events) -join ' || ' })"
+        }
+        $recoverLogName = '^BRAVO_MAINTENANCE_\d{8}_\d{6}_RECOVER_PID\d+\.log$'
+        $recoverOk = { param($Result) $true }
+        $recoverLock = 'LOCK-ENTER NoWait=True'
+        $recoverMarker = { param([string[]]$Names) 'MARKER-WRITE BRAVO_MAINTENANCE_RECOVER ' + (@($Names | ForEach-Object { "$_=True" }) -join ',') }
+        $recoverRecovered = 'NOTIFY WARNING|СЛУЖБУ BRAVO ВІДНОВЛЕНО'
+        $recoverFailed = 'NOTIFY CRITICAL|СЛУЖБУ BRAVO НЕ ВДАЛОСЯ ПІДНЯТИ'
+        $recoverStateCount = {
+            param($Result, [string]$ServiceName)
+            if ([string]::IsNullOrWhiteSpace([string]$Result.StateText)) { return 0 }
+            $stateObject = [string]$Result.StateText | ConvertFrom-Json
+            $entry = $stateObject.services.PSObject.Properties[$ServiceName]
+            if ($null -eq $entry) { return 0 }
+            return @($entry.Value.attempts).Count
+        }
+
+        # Крок 1: усі служби працюють — нічого не робиться, файлу журналу немає.
+        & $recoverCheck 'RSAllRunning' 0 @() '' { param($Result) @($Result.Events) -contains 'HOST Відновлення служб: впалих керованих служб немає' } `
+            'ServiceRecovery/RecoverServicesFastExitWithoutLogFile' `
+            '#314 FR-3 крок 1: жодної впалої служби — код 0 без lock-а, без файлу журналу і без сповіщень'
+        & $recoverCheck 'RSPausedOnly' 0 @() '' $recoverOk `
+            'ServiceRecovery/RecoverServicesPausedServiceNotStarted' `
+            '#314 FR-3: призупинена служба (Paused) профілем не запускається і не вважається впалою — швидкий вихід'
+        & $recoverCheck 'RSDisabledBravoDependent' 0 @() '' $recoverOk `
+            'ServiceRecovery/RecoverServicesDependentOfDisabledBravoIgnored' `
+            '#314 FR-3/#321: exchangAPI при BRAVO з типом запуску Disabled не піднімається — швидкий вихід без журналу й сповіщень'
+
+        # ТЗ §6 п. 2: ланцюжки через справжній цикл служб.
+        & $recoverCheck 'RSExchangeFailed' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result)
+            ([string]$Result.LogText).Contains('Служба exchangAPI: StartMode=Automatic; Status=Stopped; ExitCode=1067; ServiceSpecificExitCode=0') -and
+            ([string]$Result.LogText).Contains('Події Service Control Manager з ') -and
+            ([string]$Result.LogText) -match '\[INFO\] Подія 7034 [0-9-]{10} [0-9:]{8} \[exchangAPI Display\]: self-test: служба завершилась несподівано' -and
+            (& $recoverStateCount $Result 'exchangAPI') -eq 1 -and [bool]$Result.OwnLogUploadSuppressed
+        } 'ServiceRecovery/RecoverServicesExchangeApiOnly' `
+            '#314 FR-3: впала exchangAPI — lock без очікування, докази (StartMode, Status, ExitCode, подія SCM) у журналі _RECOVER_PID, маркер BRAVO_MAINTENANCE_RECOVER, її журнали, запуск лише exchangAPI, облік спроби, маркер прибрано, WARNING «відновлено»'
+        & $recoverCheck 'RSBravoFailed' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('BRAVO', 'exchangAPI', 'BravoWeb'))
+            'STOP BravoWeb'; 'STOP exchangAPI'
+            'TRACE-ROTATION'; 'EXCHANGE-ROTATION'; 'APACHE-ROTATION'; 'WEBAPP-ROTATION'
+            'START BRAVO'; 'START exchangAPI'; 'START BravoWeb'
+            'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result)
+            (& $recoverStateCount $Result 'BRAVO') -eq 1 -and (& $recoverStateCount $Result 'exchangAPI') -eq 0 -and (& $recoverStateCount $Result 'BravoWeb') -eq 0
+        } 'ServiceRecovery/RecoverServicesBravoChain' `
+            '#314 FR-3: впала BRAVO — спершу зупинка працюючих BRAVO Web і exchangAPI (Bis не чіпається: BRAVO вже зупинена), журнали всіх трьох, запуск BRAVO -> exchangAPI -> BRAVO Web; спроба рахується лише для BRAVO'
+        & $recoverCheck 'RSWebFailed' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('BravoWeb'))
+            'APACHE-ROTATION'; 'WEBAPP-ROTATION'; 'START BravoWeb'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName $recoverOk 'ServiceRecovery/RecoverServicesBravoWebOnly' `
+            '#314 FR-3: впала BRAVO Web — лише її журнали й запуск'
+        & $recoverCheck 'RSBravoAndWebFailed' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('BRAVO', 'exchangAPI', 'BravoWeb'))
+            'STOP exchangAPI'
+            'TRACE-ROTATION'; 'EXCHANGE-ROTATION'; 'APACHE-ROTATION'; 'WEBAPP-ROTATION'
+            'START BRAVO'; 'START exchangAPI'; 'START BravoWeb'
+            'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result) (& $recoverStateCount $Result 'BRAVO') -eq 1 -and (& $recoverStateCount $Result 'BravoWeb') -eq 1 -and (& $recoverStateCount $Result 'exchangAPI') -eq 0
+        } 'ServiceRecovery/RecoverServicesBravoAndWebUnion' `
+            '#314 FR-3: впали BRAVO і BRAVO Web — об''єднання ланцюжків: зупинка лише працюючої exchangAPI, запуск у канонічному порядку, дві спроби й два сповіщення'
+        & $recoverCheck 'RSExchangeAndWebFailed' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI', 'BravoWeb'))
+            'EXCHANGE-ROTATION'; 'APACHE-ROTATION'; 'WEBAPP-ROTATION'
+            'START exchangAPI'; 'START BravoWeb'
+            'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName $recoverOk 'ServiceRecovery/RecoverServicesExchangeApiAndWebUnion' `
+            '#314 FR-3: впали exchangAPI і BRAVO Web — без зупинок, запуск exchangAPI -> BRAVO Web'
+        & $recoverCheck 'RSBravoFailedExchangePaused' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('BRAVO', 'BravoWeb'))
+            'STOP BravoWeb'
+            'TRACE-ROTATION'; 'APACHE-ROTATION'; 'WEBAPP-ROTATION'
+            'START BRAVO'; 'START BravoWeb'
+            'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Служба exchangAPI у стані Paused — профіль її не запускає, стан збережено')
+        } 'ServiceRecovery/RecoverServicesBravoChainKeepsPausedService' `
+            '#314 FR-3: призупинена exchangAPI не зупиняється й не запускається при відновленні BRAVO (INFO у журнал)'
+
+        # Крок 2: пауза не минула — код 0, без lock-а, лише рядок INFO у добовий файл.
+        & $recoverCheck 'RSPauseNotElapsed' 0 @() '^BRAVO_MAINTENANCE_\d{8}_RECOVER_PAUSE\.log$' {
+            param($Result) ([string]$Result.LogText) -match '\[INFO\] Відновлення служб відкладено: пауза між спробами ще не минула — exchangAPI \(спроб за добу: 1, пауза 5 хв'
+        } 'ServiceRecovery/RecoverServicesPauseNotElapsed' `
+            '#314 FR-3 крок 2 / FR-5: пауза для всіх впалих служб не минула — код 0 без lock-а і без змін, рядок INFO у BRAVO_MAINTENANCE_<дата>_RECOVER_PAUSE.log'
+
+        # ТЗ §6 п. 5: lock зайнятий — код 20, без змін і сповіщень, без журналу.
+        & $recoverCheck 'RSLockBusy' 20 @('LOCK-BUSY') '' $recoverOk `
+            'ServiceRecovery/RecoverServicesLockBusy' `
+            '#314 FR-3 крок 3 (ТЗ §6 п. 5): lock зайнятий — код 20, жодної зупинки чи запуску, без сповіщення і без файлу журналу'
+
+        # ТЗ §6 п. 6: restartSuppressed чужого маркера і гейт цілісності моделі.
+        & $recoverCheck 'RSSuppressedMarker' 10 @($recoverLock; 'LOCK-EXIT') $recoverLogName {
+            param($Result) ([string]$Result.LogText).Contains('[WARNING] Попередній прогін BRAVO_MAINTENANCE перервано посеред реставрації (restartSuppressed)')
+        } 'ServiceRecovery/RecoverServicesRestartSuppressedNotStarted' `
+            '#314 FR-3 (ТЗ §6 п. 6): маркер з restartSuppressed — служби не запускаються, маркер не перезаписується, WARNING і код 10, без сповіщень'
+        & $recoverCheck 'RSIntegrityGateClosed' 10 @($recoverLock; 'LOCK-EXIT') $recoverLogName {
+            param($Result) ([string]$Result.LogText).Contains('[WARNING] Цілісність моделі не встановлено — служби не запускаються (#314)')
+        } 'ServiceRecovery/RecoverServicesIntegrityGateNotStarted' `
+            '#314 FR-3 (ТЗ §6 п. 6): цілісність моделі не встановлено — служби не запускаються'
+        & $recoverCheck 'RSForeignOwnerAlive' 0 @($recoverLock; 'LOCK-EXIT') $recoverLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Службами розпоряджається BRAVO_DATA_RESTORE')
+        } 'ServiceRecovery/RecoverServicesForeignOwnerNotDisturbed' `
+            '#314 FR-3: чинний маркер іншого власника (DataRestore) — профіль не втручається'
+
+        # Збій запису маркера — abort (fail-closed), код 60, CRITICAL.
+        & $recoverCheck 'RSMarkerWriteFails' 60 @($recoverLock; 'SCM-READ'; 'MARKER-WRITE-FAIL'; $recoverFailed; 'LOCK-EXIT') $recoverLogName $recoverOk `
+            'ServiceRecovery/RecoverServicesMarkerWriteFailureAborts' `
+            '#314 FR-3 крок 6: збій запису ownership-маркера — жодної зупинки чи запуску, CRITICAL і код 60'
+        & $recoverCheck 'RSStartFails' 60 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START-FAIL exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverFailed; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result) (& $recoverStateCount $Result 'exchangAPI') -eq 1 -and [int]$Result.QueuedCritical -gt 0 -and [int]$Result.DeliveredCritical -eq [int]$Result.QueuedCritical
+        } 'ServiceRecovery/RecoverServicesStartFailureCritical' `
+            '#314 FR-3/FR-6: служба не стартувала — спроба рахується, CRITICAL «не вдалося підняти» і код 60; загальні критичні алерти циклу не дублюються страховкою runtime'
+        & $recoverCheck 'RSCyclicThirdAttempt' 10 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'NOTIFY CRITICAL|СЛУЖБА BRAVO ЦИКЛІЧНО ПАДАЄ'; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result) (& $recoverStateCount $Result 'exchangAPI') -eq 3
+        } 'ServiceRecovery/RecoverServicesCyclicThirdAttempt' `
+            '#314 FR-5/FR-6: 3-тя спроба за добу (пауза 15 хв минула) — запуск, WARNING «відновлено» і CRITICAL «циклічно падає», код 10'
+        & $recoverCheck 'RSScmReadFails' 10 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result) ([string]$Result.LogText).Contains('[WARNING] Події Service Control Manager не прочитано: self-test: журнал System недоступний')
+        } 'ServiceRecovery/RecoverServicesScmEventReadFailureNotBlocking' `
+            '#314 FR-3 крок 7: збій читання подій SCM — WARNING, відновлення не блокується (код 10)'
+        & $recoverCheck 'RSStableCounterReset' 0 @($recoverLock; 'RECOVERY-STATE-WRITE'; 'LOCK-EXIT') '' {
+            param($Result) (& $recoverStateCount $Result 'exchangAPI') -eq 0
+        } 'ServiceRecovery/RecoverServicesStableCounterResetUnderLock' `
+            '#314 FR-5: служба працює 30 хв після останньої спроби — облік обнуляється під operation-lock, без файлу журналу'
+
+        # Несумісні параметри — помилка параметрів, код 30, нічого не змінюється.
+        & $recoverCheck 'RSConflictForceRestore' 30 @() '' $recoverOk `
+            'ServiceRecovery/RecoverServicesRejectsForceRestore' `
+            '#314 FR-3: -RecoverServices з -ForceRestore — код 30 без будь-яких дій'
+        & $recoverCheck 'RSConflictRunMissedRestoreOnly' 30 @() '' $recoverOk `
+            'ServiceRecovery/RecoverServicesRejectsRunMissedRestoreOnly' `
+            '#314 FR-3: -RecoverServices з -RunMissedRestoreOnly — код 30 без будь-яких дій'
+    } finally {
+        if (Test-Path -LiteralPath $recoverRoot -PathType Container) {
+            Remove-Item -LiteralPath $recoverRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
