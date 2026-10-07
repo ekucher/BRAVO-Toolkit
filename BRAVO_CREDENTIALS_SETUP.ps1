@@ -1502,6 +1502,8 @@ function Invoke-ProtectedPayloadWorker {
         OperationsStarted = $false
     }
     try {
+        # MUTATION (scratch ref only): marker set before decryption
+        $response.OperationsStarted = $true
         $payload = Read-BRAVOTextFile -Path $PayloadPath |
             ConvertFrom-BRAVOJson
         $workerEntries = @($payload.Entries | ForEach-Object {
