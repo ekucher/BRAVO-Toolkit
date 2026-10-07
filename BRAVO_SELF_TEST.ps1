@@ -13232,6 +13232,47 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/DeferredSftpSuccessMessageShowsSkippedNotOk' `
         -Failure "за відкладеної SFTP-перевірки рядки SFTP і BAZA_APP мають бути WARNING «перевірку відкладено», а не SUCCESS; відкладено: $sftpDeferredSuccess ||| контроль: $sftpCheckedSuccess"
+    # #301 (рев'ю #391): порожній каталог джерела не звітується як «не
+    # встановлено»; компонент, що раніше мав дані, показано рядком :warning:.
+    $emptySourceSuccess = [string](& $sftpDeferredMessageModule {
+        Set-StrictMode -Version Latest
+        $script:NotificationProvider = 'slack'
+        $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $false
+        $script:healthNotInstalledComponents = @('BLOG', 'BRAVOEXCH', 'BAZA_WWW')
+        $script:healthEmptySourceComponents = @('BLOG', 'BRAVOEXCH')
+        $script:healthEmptySourceWarningComponents = @('BLOG')
+        $script:healthLatestArchives = @{}
+        $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+        $backupMonitoring = [pscustomobject]@{
+            MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'
+            SFTP = [pscustomobject]@{ Enabled = $true; CheckBAZASynchronization = $true; CheckArchiveUploads = $true }
+            SMB = [pscustomobject]@{ Enabled = $false; CheckArchiveCopies = $false }
+        }
+        $storageEffective = [pscustomobject]@{
+            SFTP = [pscustomobject]@{ Enabled = $true; ArchiveUpload = $true }
+            SMB = [pscustomobject]@{ Enabled = $false; ArchiveCopy = $false }
+        }
+        $bazaAppLocalHealthEnabled = $false; $bazaWWWLocalHealthEnabled = $false
+        $bazaAppSFTPHealthEnabled = $true; $bazaWWWSFTPHealthEnabled = $false
+        $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+        function Get-HostInformation { return $null }
+        function Get-EnabledBackupComponentNames { return @() }
+        function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+        function Format-BRAVOOperatorStatusLine { param($Status, $Icon, $Name, $Detail) return "[$Status] $Name — $Detail" }
+        function New-BRAVOOperatorNotificationMessage { param($ResultLines, $ReasonLines) return (@($ReasonLines) + @($ResultLines)) -join "`n" }
+        New-SlackSuccessMessage -Duration ([timespan]::FromSeconds(1))
+    })
+    $emptySourceNotInstalledLine = [string](@($emptySourceSuccess -split "`n" | Where-Object { $_ -match 'Не встановлено на цьому сервері' }) -join ' | ')
+    Test-BRAVOCondition `
+        -Condition (
+            $emptySourceNotInstalledLine -match 'BAZA_WWW' -and
+            $emptySourceNotInstalledLine -notmatch 'BLOG' -and
+            $emptySourceNotInstalledLine -notmatch 'BRAVOEXCH' -and
+            $emptySourceSuccess -match ':warning: Каталог джерела порожній, хоча раніше мав дані \(не копіюється\): BLOG' -and
+            $emptySourceSuccess -match ':information_source: Каталог джерела порожній \(не копіюється\): BRAVOEXCH'
+        ) `
+        -Name 'Health/EmptySourceReportedSeparatelyFromNotInstalled' `
+        -Failure "Health має показувати порожній каталог джерела окремо від «не встановлено», з :warning: для компонента, що мав дані: $emptySourceSuccess"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.SftpDeferredMessage' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.LocalSyncIssueWithoutExitCode' -DependsOn 'Root/Runtime') { try {
     # #286: проблема LocalSynchronization без поля ExitCode (7 з 9 гілок
