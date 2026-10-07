@@ -23294,7 +23294,9 @@ function Get-BRAVOMaintenanceSummaryResult {
         return @{ Session = $Session; Content = $Content; Stale = $Stale; NoHash = $NoHash }
     }
     $retentionFollowupRunScenario = {
-        param([string]$ScenarioName, [object[]]$Sessions, [int]$KeepCount)
+        # #424: необов'язковий ReportOnly передає -ReportOnly у
+        # Remove-OldRestoreArchives (перевірка без видалення).
+        param([string]$ScenarioName, [object[]]$Sessions, [int]$KeepCount, [bool]$ReportOnly = $false)
         $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
             ("BRAVO_RETENTION_FOLLOWUP_{0}_{1}" -f $ScenarioName, [guid]::NewGuid().ToString("N"))
         [void][IO.Directory]::CreateDirectory($scenarioRoot)
@@ -23340,7 +23342,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                 }
             }
             $scenarioOutcome = & $retentionFollowupModule {
-                param($Path, $Prefix, $StubScriptText, $Keep)
+                param($Path, $Prefix, $StubScriptText, $Keep, $RetentionReportOnly)
                 Set-StrictMode -Version Latest
                 . ([scriptblock]::Create($StubScriptText))
                 $script:retentionFollowupLogLines = New-Object System.Collections.ArrayList
@@ -23353,7 +23355,17 @@ function Get-BRAVOMaintenanceSummaryResult {
                 $script:restoreIntegrityFailed = $false
                 $retentionThrew = $null
                 try {
-                    Remove-OldRestoreArchives -Path $Path -ArchivePrefix $Prefix -KeepCount $Keep -InvalidRetentionDays 30
+                    $retentionArgs = @{ Path = $Path; ArchivePrefix = $Prefix; KeepCount = $Keep; InvalidRetentionDays = 30 }
+                    if ($RetentionReportOnly) {
+                        # Проста (не advanced) функція мовчки поклала б
+                        # невідомий -ReportOnly в $args — тому відсутній
+                        # параметр є явним провалом сценарію.
+                        if (-not (Get-Command -Name Remove-OldRestoreArchives -CommandType Function).Parameters.ContainsKey('ReportOnly')) {
+                            throw 'Remove-OldRestoreArchives не має параметра -ReportOnly'
+                        }
+                        $retentionArgs['ReportOnly'] = $true
+                    }
+                    Remove-OldRestoreArchives @retentionArgs
                 } catch {
                     $retentionThrew = $_.Exception.Message
                 }
@@ -23363,7 +23375,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                     RestoreFailed = [bool]$script:restoreIntegrityFailed
                     Log = (@($script:retentionFollowupLogLines) -join "`n")
                 }
-            } $scenarioRoot $retentionFollowupPrefix $retentionFollowupStubScriptText $KeepCount
+            } $scenarioRoot $retentionFollowupPrefix $retentionFollowupStubScriptText $KeepCount $ReportOnly
             $remainingNames = @(
                 Get-ChildItem -LiteralPath $scenarioRoot -File -ErrorAction SilentlyContinue |
                     ForEach-Object { $_.Name } | Sort-Object
@@ -23796,6 +23808,183 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/RetentionNoValidRestorePointNothingInvalidDeleted" `
         -Failure ("без жодної підтвердженої точки відновлення retention НЕ повинен видаляти жодної непридатної сесії (навіть із CRC-помилкою); ERROR і прапорці — як і раніше; WARNING для кожної збереженої сесії; лишилось=[{0}], critical={1}, restoreIntegrityFailed={2}, threw={3}, журнал: {4}" -f $retention422NoValid.Remaining, $retention422NoValid.Critical, $retention422NoValid.RestoreFailed, $retention422NoValid.Threw, $retention422NoValid.Log)
+
+    # ================================================================
+    # #424: коли сесій архівів реставрації ≤ ArchivesKeepCount, Main не
+    # запускав retention, тож сесії ніхто повторно не перевіряв і жодна
+    # діагностика придатності (WARNING для кожного архіву, WARNING #422,
+    # ERROR «Не лишилось жодної придатної точки відновлення» + exit 41) не
+    # з'являлась. Рішення власника (2026-10-07, «Повна перевірка»): у цьому
+    # стані Main викликає Remove-OldRestoreArchives -ReportOnly — та сама
+    # валідація й діагностика, але БЕЗ жодного видалення (інваріант #422:
+    # невідоме / непройдена перевірка → не видаляти). Той самий харнес:
+    # реальні Remove-OldRestoreArchives і перевірки 7-Zip, застабовано
+    # лише процесний шар 7-Zip; тимчасовий каталог на сценарій.
+    # ================================================================
+    # (a) KeepCount = 2: придатна сесія + стара сесія з SHA512, що не
+    # збігається (UNKNOWN). Retention не запускався б (2 ≤ 2), але WARNING
+    # #422 має з'явитися, а всі файли — лишитися.
+    $retention424Stale = & $retentionFollowupRunScenario 'I424StaleWithinKeep' @(
+        (& $retentionFollowupSession '20260111_0100' 'synthetic-ok-1'),
+        @{ Session = $retention422Subject; Content = 'synthetic-ok-mismatch'; Stale = $true; NoHash = $false; HashMode = 'Mismatch' }
+    ) 2 $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424Stale -and
+            $null -eq $retention424Stale.Threw -and
+            [string]$retention424Stale.Remaining -ceq (& $retentionFollowupExpectedFiles @($retention422Subject, '20260111_0100')) -and
+            (& $retention422KeptLine $retention424Stale $retention422Subject 'SHA512 не збігається') -and
+            -not $retention424Stale.Critical -and
+            -not $retention424Stale.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionReportOnlyStaleSessionWarnsWithinKeepCount" `
+        -Failure ("Remove-OldRestoreArchives -ReportOnly за сесій ≤ ArchivesKeepCount має перевірити сесії й записати WARNING #422 про непридатну сесію, не видаливши жодного файлу; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention424Stale.Threw, $retention424Stale.Remaining, $retention424Stale.Log)
+
+    # (b) -ReportOnly не видаляє НІЧОГО, навіть те, що звичайний retention
+    # видалив би: стара сесія з доведеним пошкодженням (CRC Failed) і
+    # придатні сесії понад KeepCount = 1. Контроль без -ReportOnly на тому
+    # самому наборі видаляє їх, як і раніше.
+    $retention424Sessions = @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-CRC-FAILED' $true)
+    $retention424Proven = & $retentionFollowupRunScenario 'I424ProvenReportOnly' $retention424Sessions 1 $true
+    $retention424ProvenControl = & $retentionFollowupRunScenario 'I424ProvenControl' $retention424Sessions 1
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424Proven -and
+            $null -eq $retention424Proven.Threw -and
+            [string]$retention424Proven.Remaining -ceq (& $retentionFollowupExpectedFiles @($retention422Subject, '20260105_0100', '20260110_0100', '20260111_0100')) -and
+            -not [regex]::IsMatch([string]$retention424Proven.Log, '(?m)Видал') -and
+            $null -ne $retention424ProvenControl -and
+            $null -eq $retention424ProvenControl.Threw -and
+            [string]$retention424ProvenControl.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100'))
+        ) `
+        -Name "Maintenance/RetentionReportOnlyNeverDeletesProvenCorrupt" `
+        -Failure ("Remove-OldRestoreArchives -ReportOnly не повинен видаляти жодного файлу — ні доведено пошкоджену стару сесію, ні придатні сесії понад KeepCount; контроль без -ReportOnly має видаляти їх, як і раніше; ReportOnly: threw={0}, лишилось=[{1}], журнал: {2}; контроль: threw={3}, лишилось=[{4}]" -f $retention424Proven.Threw, $retention424Proven.Remaining, $retention424Proven.Log, $retention424ProvenControl.Threw, $retention424ProvenControl.Remaining)
+
+    # (c) KeepCount = 1, єдина сесія стала непридатною (7-Zip забракував
+    # архів): ERROR «Не лишилось жодної придатної точки відновлення» і
+    # прапорці critical/restoreIntegrityFailed (exit 41) — як на звичайному
+    # шляху retention; архів лишається на диску.
+    $retention424Single = & $retentionFollowupRunScenario 'I424SingleBroken' @(
+        (& $retentionFollowupSession '20260111_0100' $retentionFollowupBroken)
+    ) 1 $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424Single -and
+            $null -eq $retention424Single.Threw -and
+            [string]$retention424Single.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100')) -and
+            $retention424Single.Critical -and
+            $retention424Single.RestoreFailed -and
+            [regex]::IsMatch([string]$retention424Single.Log, '(?m)^\[ERROR\] Не лишилось жодної придатної точки відновлення') -and
+            [regex]::IsMatch([string]$retention424Single.Log, '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ')
+        ) `
+        -Name "Maintenance/RetentionReportOnlySingleBrokenSessionSetsFailureFlags" `
+        -Failure ("за ArchivesKeepCount = 1 і єдиної зламаної сесії Remove-OldRestoreArchives -ReportOnly має записати WARNING для архіву, ERROR «Не лишилось жодної придатної точки відновлення» і виставити critical/restoreIntegrityFailed (exit 41), не видаляючи архів; threw={0}, critical={1}, restoreIntegrityFailed={2}, лишилось=[{3}], журнал: {4}" -f $retention424Single.Threw, $retention424Single.Critical, $retention424Single.RestoreFailed, $retention424Single.Remaining, $retention424Single.Log)
+
+    # (d) Гейт Main: справжній оператор if/elseif із Runtime (AST-екстракція
+    # if, що викликає Remove-OldRestoreArchives поза самою функцією)
+    # виконується з застабованими Remove-OldRestoreArchives і Write-Log у
+    # кількох станах. Сесій ≤ KeepCount → виклик лише з -ReportOnly;
+    # сесій > KeepCount → звичайний retention без -ReportOnly; поточна
+    # restore-сесія unsafe, Maintenance вимкнено чи сесій немає → жодного
+    # виклику. Окремо (AST): Main рахує сесії в $restoreArchiveGroupCount.
+    $retention424GateTokens = $null
+    $retention424GateErrors = $null
+    $retention424GateAst = [Management.Automation.Language.Parser]::ParseInput(
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        ),
+        [ref]$retention424GateTokens,
+        [ref]$retention424GateErrors
+    )
+    # Найближчий if-предок кожного виклику Remove-OldRestoreArchives поза
+    # самою функцією; усі виклики мають належати одному гейту.
+    $retention424GateIfs = @()
+    foreach ($retention424Call in @($retention424GateAst.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -eq 'Remove-OldRestoreArchives'
+            },
+            $true
+        ))) {
+        $retention424Ancestor = $retention424Call.Parent
+        $retention424CallIf = $null
+        while ($null -ne $retention424Ancestor) {
+            if ($retention424Ancestor -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $retention424Ancestor.Name -eq 'Remove-OldRestoreArchives') {
+                $retention424CallIf = $null
+                break
+            }
+            if ($null -eq $retention424CallIf -and
+                $retention424Ancestor -is [Management.Automation.Language.IfStatementAst]) {
+                $retention424CallIf = $retention424Ancestor
+            }
+            $retention424Ancestor = $retention424Ancestor.Parent
+        }
+        if ($null -ne $retention424CallIf -and
+            @($retention424GateIfs | Where-Object { $_.Extent.StartOffset -eq $retention424CallIf.Extent.StartOffset }).Count -eq 0) {
+            $retention424GateIfs += $retention424CallIf
+        }
+    }
+    $retention424GroupCountAssigned = @($retention424GateAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $candidate.Left.Extent.Text -ceq '$restoreArchiveGroupCount' -and
+            $candidate.Right.Extent.Text -match '\$sortedGroups'
+        },
+        $true
+    )).Count -gt 0
+    $retention424RunGate = {
+        param([string]$GateText, [bool]$Enabled, [int]$GroupCount, [int]$KeepCount, [bool]$Unsafe)
+        $gateScript = [scriptblock]::Create(@'
+param($BravoMaintenanceEnabled, $restoreArchiveGroupCount, $restoreArchiveDeleteCandidateGroups, $restoreSessionUnsafeForRetention, $RESTORE_ARCHIVES_KEEP_COUNT)
+Set-StrictMode -Version Latest
+$retention424Calls = New-Object System.Collections.ArrayList
+function Remove-OldRestoreArchives {
+    param([string]$Path, [string]$ArchivePrefix, [int]$KeepCount, [int]$InvalidRetentionDays, [switch]$ReportOnly)
+    $null = $Path; $null = $ArchivePrefix; $null = $InvalidRetentionDays
+    [void]$retention424Calls.Add(('ReportOnly={0};Keep={1}' -f [bool]$ReportOnly, $KeepCount))
+}
+function Write-Log { param($Message, [string]$Level = 'INFO'); $null = $Message; $null = $Level }
+$ARC_DIR = 'unused-selftest-arc-dir'
+$ArchivePrefix = 'RETFUP'
+$FAILED_ARCHIVE_RETENTION_DAYS = 30
+'@ + "`n" + $GateText + "`n" + '@($retention424Calls) -join ''|''')
+        $candidates = @()
+        if ($GroupCount -gt $KeepCount) {
+            $candidates = @(1..($GroupCount - $KeepCount))
+        }
+        try {
+            return [string](& $gateScript $Enabled $GroupCount $candidates $Unsafe $KeepCount)
+        } catch {
+            return ('THREW: ' + $_.Exception.Message)
+        }
+    }
+    $retention424GateText = ''
+    if ($retention424GateIfs.Count -eq 1) {
+        $retention424GateText = $retention424GateIfs[0].Extent.Text
+    }
+    $retention424GateWithin = & $retention424RunGate $retention424GateText $true 1 1 $false
+    $retention424GateWithinTwo = & $retention424RunGate $retention424GateText $true 2 2 $false
+    $retention424GateBeyond = & $retention424RunGate $retention424GateText $true 3 1 $false
+    $retention424GateUnsafe = & $retention424RunGate $retention424GateText $true 1 1 $true
+    $retention424GateDisabled = & $retention424RunGate $retention424GateText $false 1 1 $false
+    $retention424GateEmpty = & $retention424RunGate $retention424GateText $true 0 1 $false
+    Test-BRAVOCondition `
+        -Condition (
+            $retention424GateIfs.Count -eq 1 -and
+            $retention424GroupCountAssigned -and
+            $retention424GateWithin -ceq 'ReportOnly=True;Keep=1' -and
+            $retention424GateWithinTwo -ceq 'ReportOnly=True;Keep=2' -and
+            $retention424GateBeyond -ceq 'ReportOnly=False;Keep=1' -and
+            $retention424GateUnsafe -ceq '' -and
+            $retention424GateDisabled -ceq '' -and
+            $retention424GateEmpty -ceq ''
+        ) `
+        -Name "Maintenance/RetentionReportOnlyMainBranchWithinKeepCount" `
+        -Failure ("гейт Main має за сесій ≤ ArchivesKeepCount викликати Remove-OldRestoreArchives лише з -ReportOnly, за сесій > ArchivesKeepCount — звичайний retention без -ReportOnly, а для unsafe-сесії, вимкненого Maintenance чи відсутності сесій — не викликати нічого; Main має рахувати сесії в `$restoreArchiveGroupCount; if-гейтів={0}, лічильник={1}, ≤1/1=[{2}], ≤2/2=[{3}], >3/1=[{4}], unsafe=[{5}], вимкнено=[{6}], порожньо=[{7}]" -f $retention424GateIfs.Count, $retention424GroupCountAssigned, $retention424GateWithin, $retention424GateWithinTwo, $retention424GateBeyond, $retention424GateUnsafe, $retention424GateDisabled, $retention424GateEmpty)
 
     # ================================================================
     # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)
