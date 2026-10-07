@@ -2074,26 +2074,10 @@ function Save-BRAVODiscoveryBaseline {
         }
     }
     $componentFieldNames = @($script:BRAVODiscoveryComponentSourceFields.Values)
-    # #301: сире поле джерела (BLOG_SOURCE тощо) лишається шляхом з bravo.ini
-    # і для компонента зі станом Absent/Ambiguous/Error (порожній каталог).
-    # Такий шлях у baseline перетворював би «ніколи не було» на «був
-    # підтверджений» і давав Error-дрейф на кожному запуску. Підтвердженим
-    # вважається лише Present; для решти пишемо ''.
-    $nonPresentFields = @{}
-    if ($null -ne $DiscoveryResult.PSObject.Properties['Components'] -and
-        $DiscoveryResult.Components -is [System.Collections.IDictionary]) {
-        foreach ($componentName in $script:BRAVODiscoveryComponentSourceFields.Keys) {
-            $presenceEntry = $DiscoveryResult.Components[$componentName]
-            if ($null -ne $presenceEntry -and [string]$presenceEntry.Presence -ne 'Present') {
-                $nonPresentFields[[string]$script:BRAVODiscoveryComponentSourceFields[$componentName]] = $true
-            }
-        }
-    }
     foreach ($fieldName in $script:BRAVODiscoveryBaselineFields) {
-        if ($nonPresentFields.ContainsKey($fieldName) -or
-            ($null -ne $restrictedFields -and
+        if ($null -ne $restrictedFields -and
             $componentFieldNames -contains $fieldName -and
-            -not $restrictedFields.ContainsKey($fieldName))) {
+            -not $restrictedFields.ContainsKey($fieldName)) {
             $snapshot[$fieldName] = ''
         } else {
             $snapshot[$fieldName] = [string]$DiscoveryResult.$fieldName

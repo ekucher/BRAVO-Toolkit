@@ -691,17 +691,18 @@ Test-BRAVOCondition -Condition (
 ) -Name 'BackupScope/SetupDestinationCheckHonoursNotInstalled' `
     -Failure 'SETUP має перевіряти призначення BAZA_* лише за увімкненої *_LOCAL синхронізації (рядок "false" = вимкнено) і не вимагати призначення для NotInstalled-компонента'
 
-# (#301) Baseline не має фіксувати шлях компонента, який НЕ Present. Сирі
-# поля discovery (BLOG_SOURCE тощо) лишаються заповненими шляхом з bravo.ini,
-# навіть коли каталог порожній (presence Absent). Раніше Save-BRAVODiscoveryBaseline
-# переносив цей шлях у baseline, і Test-BRAVODiscoveryComponentDrift трактував
-# «Absent + непорожнє поле baseline» як зниклий компонент (Error) - хибна
-# тривога на кожному запуску. Тести проходять реальний ланцюг
-# Save -> Import -> Drift на справжніх каталогах.
+# (#301) Оголошений, але порожній каталог компонента (новий BLOG, порожня черга
+# BEXCH). Рішення власника 2026-10-07: Warning, не блокує. Порожній каталог
+# пропускається без Error; якщо компонент раніше був підтверджений (baseline
+# або архів в останній COMPLETE generation), кожен прогін пише WARNING.
+# Відсутній чи нечитабельний каталог, як і раніше, - Error; обов'язковий MODEL
+# з порожнім каталогом - Error. Presence дає production-функція на справжніх
+# каталогах, склад - Resolve-BRAVOBackupComponentScope, як у BRAVO_ARCHIV.
 $scope301Root = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_BASELINE301_' + [guid]::NewGuid().ToString('N'))
 try {
     $scope301Full = Join-Path $scope301Root 'full'
     $scope301Empty = Join-Path $scope301Root 'empty'
+    $scope301Missing = Join-Path $scope301Root 'missing'
     $scope301State = Join-Path $scope301Root 'state'
     $scope301Runtime = Join-Path $scope301Root 'runtime'
     foreach ($scope301Dir in @($scope301Full, $scope301Empty, $scope301State, $scope301Runtime)) {
@@ -709,71 +710,164 @@ try {
     }
     [IO.File]::WriteAllText((Join-Path $scope301Full 'data.txt'), 'x')
 
-    function New-BRAVOSelfTestScope301Discovery {
-        # Discovery, де BLOG береться з реального каталогу: presence дає
-        # production-функція, а сире поле лишається шляхом (як у discovery).
-        param([string]$BlogPath)
-        $discovery = New-BRAVOSelfTestScopeDiscovery -Presence @{ MODEL = 'Present'; BLOG = 'Present'; BRAVOEXCH = 'Present'; BAZA_APP = 'Present'; BAZA_WWW = 'Present' }
-        $discovery.BLOG_SOURCE = $BlogPath
-        $discovery.Components['BLOG'] = Resolve-BRAVODiscoveryPathComponentPresenceForSelfTest -Path $BlogPath
-        return $discovery
-    }
-    function Resolve-BRAVODiscoveryPathComponentPresenceForSelfTest {
-        param([string]$Path)
+    function Resolve-BRAVOSelfTestScope301Presence {
+        param([string]$Component, [string]$Path)
         $moduleScope = Get-Module -Name 'BRAVO.Discovery'
         return (& $moduleScope {
-            param($p)
-            Resolve-BRAVODiscoveryPathComponentPresence -Component 'BLOG' -Path $p -Source 'BravoIni' -Reason 'bravo.ini'
-        } $Path)
+            param($c, $p)
+            Resolve-BRAVODiscoveryPathComponentPresence -Component $c -Path $p -Source 'BravoIni' -Reason 'bravo.ini'
+        } $Component $Path)
     }
-    function Save-BRAVOSelfTestScope301Baseline {
-        param([object]$Discovery)
-        $baselinePath = Get-BRAVODiscoveryBaselinePath -StateRoot $scope301State
-        Save-BRAVODiscoveryBaseline -DiscoveryResult $Discovery -BaselinePath $baselinePath
-        return $baselinePath
+    function New-BRAVOSelfTestScope301Discovery {
+        # Discovery, де компонент береться з реального каталогу: presence дає
+        # production-функція, а сире поле лишається шляхом (як у discovery).
+        param([string]$BlogPath, [string]$ModelPath)
+        $discovery = New-BRAVOSelfTestScopeDiscovery -Presence @{ MODEL = 'Present'; BLOG = 'Present'; BRAVOEXCH = 'Present'; BAZA_APP = 'Present'; BAZA_WWW = 'Present' }
+        $discovery.BLOG_SOURCE = $BlogPath
+        $discovery.Components['BLOG'] = Resolve-BRAVOSelfTestScope301Presence -Component 'BLOG' -Path $BlogPath
+        if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
+            $discovery.MODEL_SOURCE = $ModelPath
+            $discovery.Components['MODEL'] = Resolve-BRAVOSelfTestScope301Presence -Component 'MODEL' -Path $ModelPath
+        }
+        return $discovery
     }
+    function Get-BRAVOSelfTestScope301Findings {
+        param([object]$Scope, [string]$Component, [string]$Severity)
+        return @(@($Scope.Findings) | Where-Object {
+            [string]$_.Component -eq $Component -and [string]$_.Severity -eq $Severity
+        })
+    }
+    function Invoke-BRAVOSelfTestScope301Resolve {
+        # Повертає scope або текст винятку: на старому коді тест має впасти
+        # власною умовою, а не обірвати секцію.
+        param([object]$Discovery, [object]$Baseline, [string]$BaselineSourceKind = 'None', [string[]]$Previous = @())
+        try {
+            return (Resolve-BRAVOBackupComponentScope -DiscoveryResult $Discovery -Baseline $Baseline `
+                -BaselineSourceKind $BaselineSourceKind -EnabledComponents $scopeAllEnabled `
+                -PreviousCompleteComponents $Previous)
+        } catch {
+            return [pscustomobject]@{ Components = @{}; NotInstalled = @(); Findings = @(); EffectiveEnabledComponents = @{}; Threw = $_.Exception.Message }
+        }
+    }
+    $scope301ConfirmedBaseline = [pscustomobject]@{ MODEL_SOURCE = 'C:\ExampleLims\Model'; BLOG_SOURCE = $scope301Full }
 
-    # (a) BLOG порожній на момент baseline і лишається порожнім -> без Error.
-    $scope301AbsentDiscovery = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Empty
-    $scope301AbsentPath = Save-BRAVOSelfTestScope301Baseline -Discovery $scope301AbsentDiscovery
-    $scope301AbsentImport = Import-BRAVODiscoveryBaseline -StateRoot $scope301State -RuntimeRoot $scope301Runtime -ReadOnly
-    $scope301AbsentFindings = @(Test-BRAVODiscoveryComponentDrift `
-        -DiscoveryResult $scope301AbsentDiscovery `
-        -Baseline $scope301AbsentImport.Baseline -BaselineSourceKind ([string]$scope301AbsentImport.Source) `
-        -EnabledComponents $scopeAllEnabled)
+    # (a) Порожній каталог, раніше не підтверджений: пропуск з Info, без Error.
+    $scope301EmptyDiscovery = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Empty
+    $scope301EmptyNew = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301EmptyDiscovery
     Test-BRAVOCondition -Condition (
-        [string]$scope301AbsentDiscovery.Components['BLOG'].Presence -eq 'Absent' -and
-        [string]$scope301AbsentImport.Source -eq 'Canonical' -and
-        @($scope301AbsentFindings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
-        @($scope301AbsentFindings | Where-Object { [string]$_.Component -eq 'BLOG' -and [string]$_.Severity -eq 'Info' }).Count -eq 1
-    ) -Name 'BackupScope/BaselineAbsentComponentStillAbsentIsNotDrift' `
-        -Failure 'компонент, якого не було на момент baseline (порожній каталог, Absent) і який лишається Absent, не має давати Error-дрейф'
+        [string]$scope301EmptyDiscovery.Components['BLOG'].Presence -eq 'Absent' -and
+        [string]$scope301EmptyDiscovery.Components['BLOG'].Source -eq 'BravoIni' -and
+        [string]$scope301EmptyNew.Components['BLOG'] -eq 'EmptySource' -and
+        @($scope301EmptyNew.NotInstalled) -contains 'BLOG' -and
+        -not [bool]$scope301EmptyNew.EffectiveEnabledComponents['BLOG'] -and
+        @($scope301EmptyNew.Findings | Where-Object { [string]$_.Severity -in @('Error', 'Warning') }).Count -eq 0 -and
+        (Get-BRAVOSelfTestScope301Findings -Scope $scope301EmptyNew -Component 'BLOG' -Severity 'Info').Count -eq 1
+    ) -Name 'BackupScope/DeclaredEmptySourceNeverConfirmedIsSkippedWithInfo' `
+        -Failure "оголошений (bravo.ini), але порожній каталог без підтвердження має пропускатись з Info (scope EmptySource), без Error; scope='$($scope301EmptyNew.Components['BLOG'])' threw='$(@($scope301EmptyNew.PSObject.Properties['Threw'] | ForEach-Object { $_.Value }))'"
 
-    # (c) Baseline-файл зберігає '' для не-Present компонента, а Present - шлях.
-    $scope301AbsentJson = Get-Content -LiteralPath $scope301AbsentPath -Raw | ConvertFrom-Json
+    # (b) Компонент був підтверджений у baseline, тепер каталог порожній:
+    # WARNING на кожному прогоні, без Error і без зупинки.
+    $scope301Emptied = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301EmptyDiscovery `
+        -Baseline $scope301ConfirmedBaseline -BaselineSourceKind 'Canonical'
     Test-BRAVOCondition -Condition (
-        [string]$scope301AbsentJson.BLOG_SOURCE -eq '' -and
-        [string]$scope301AbsentJson.MODEL_SOURCE -eq 'C:\ExampleLims\Model'
-    ) -Name 'BackupScope/BaselineStoresEmptySourceForNonPresentComponent' `
-        -Failure 'Save-BRAVODiscoveryBaseline має писати порожнє джерело для компонента не в стані Present (а Present лишає зі шляхом)'
+        [string]$scope301Emptied.Components['BLOG'] -eq 'EmptySource' -and
+        @($scope301Emptied.NotInstalled) -contains 'BLOG' -and
+        @($scope301Emptied.Findings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
+        (Get-BRAVOSelfTestScope301Findings -Scope $scope301Emptied -Component 'BLOG' -Severity 'Warning').Count -eq 1
+    ) -Name 'BackupScope/DeclaredEmptySourcePreviouslyConfirmedWarns' `
+        -Failure "раніше підтверджений компонент з порожнім каталогом має давати Warning без Error (рішення власника #301); scope='$($scope301Emptied.Components['BLOG'])'"
 
-    # (b) Guard: BLOG був Present (непорожній каталог) у baseline, потім
-    # каталог став порожнім -> Error лишається.
-    $scope301PresentDiscovery = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Full
-    [void](Save-BRAVOSelfTestScope301Baseline -Discovery $scope301PresentDiscovery)
-    $scope301PresentImport = Import-BRAVODiscoveryBaseline -StateRoot $scope301State -RuntimeRoot $scope301Runtime -ReadOnly
-    $scope301LaterEmpty = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Empty
-    $scope301VanishedFindings = @(Test-BRAVODiscoveryComponentDrift `
-        -DiscoveryResult $scope301LaterEmpty `
-        -Baseline $scope301PresentImport.Baseline -BaselineSourceKind ([string]$scope301PresentImport.Source) `
-        -EnabledComponents $scopeAllEnabled)
+    # (c) Baseline ще немає, але компонент мав архів в останній COMPLETE
+    # generation: теж «раніше мав дані» -> Warning, не Error.
+    $scope301PrevEmpty = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301EmptyDiscovery -Previous @('MODEL', 'BLOG')
     Test-BRAVOCondition -Condition (
-        [string]$scope301PresentDiscovery.Components['BLOG'].Presence -eq 'Present' -and
-        [string]$scope301PresentImport.Baseline.BLOG_SOURCE -eq $scope301Full -and
-        [string]$scope301LaterEmpty.Components['BLOG'].Presence -eq 'Absent' -and
-        @($scope301VanishedFindings | Where-Object { [string]$_.Severity -eq 'Error' -and [string]$_.Component -eq 'BLOG' }).Count -eq 1
-    ) -Name 'BackupScope/BaselinePresentComponentLaterEmptyStillRaisesError' `
-        -Failure 'компонент, що був Present у baseline і згодом став порожнім (Absent), має й надалі давати Error-дрейф'
+        [string]$scope301PrevEmpty.Components['BLOG'] -eq 'EmptySource' -and
+        @($scope301PrevEmpty.Findings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
+        (Get-BRAVOSelfTestScope301Findings -Scope $scope301PrevEmpty -Component 'BLOG' -Severity 'Warning').Count -eq 1
+    ) -Name 'BackupScope/PreviouslyBackedUpEmptySourceWarnsWithoutBaseline' `
+        -Failure "без baseline компонент, що мав архів в останній COMPLETE generation і тепер має порожній каталог, має давати Warning без Error; scope='$($scope301PrevEmpty.Components['BLOG'])'"
+
+    # (d) Guard: відсутній оголошений каталог лишається Error з baseline і без.
+    $scope301MissingDiscovery = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Missing
+    $scope301MissingNew = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301MissingDiscovery
+    $scope301MissingConfirmed = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301MissingDiscovery `
+        -Baseline $scope301ConfirmedBaseline -BaselineSourceKind 'Canonical'
+    Test-BRAVOCondition -Condition (
+        [string]$scope301MissingNew.Components['BLOG'] -eq 'Missing' -and
+        (Get-BRAVOSelfTestScope301Findings -Scope $scope301MissingNew -Component 'BLOG' -Severity 'Error').Count -ge 1 -and
+        @($scope301MissingNew.NotInstalled) -notcontains 'BLOG' -and
+        [string]$scope301MissingConfirmed.Components['BLOG'] -eq 'Missing' -and
+        (Get-BRAVOSelfTestScope301Findings -Scope $scope301MissingConfirmed -Component 'BLOG' -Severity 'Error').Count -ge 1
+    ) -Name 'BackupScope/DeclaredMissingSourceStaysError' `
+        -Failure "відсутній оголошений каталог має лишатись Missing (Error) і з baseline, і без нього; без baseline='$($scope301MissingNew.Components['BLOG'])' з baseline='$($scope301MissingConfirmed.Components['BLOG'])'"
+
+    # (e) Guard: обов'язковий MODEL з порожнім каталогом - Error.
+    $scope301ModelEmpty = Invoke-BRAVOSelfTestScope301Resolve `
+        -Discovery (New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Full -ModelPath $scope301Empty)
+    Test-BRAVOCondition -Condition (
+        [string]$scope301ModelEmpty.Components['MODEL'] -eq 'Missing' -and
+        @($scope301ModelEmpty.NotInstalled) -notcontains 'MODEL' -and
+        (Get-BRAVOSelfTestScope301Findings -Scope $scope301ModelEmpty -Component 'MODEL' -Severity 'Error').Count -eq 1
+    ) -Name 'BackupScope/MandatoryModelEmptySourceStaysError' `
+        -Failure "обов'язковий MODEL з порожнім каталогом має бути Missing (Error); scope='$($scope301ModelEmpty.Components['MODEL'])'"
+
+    # (f) Baseline пише '' лише для доведено порожнього каталогу; Present,
+    # відсутній каталог і Error/Ambiguous зберігають сире джерело.
+    $scope301SaveDiscovery = New-BRAVOSelfTestScope301Discovery -BlogPath $scope301Empty
+    $scope301SaveDiscovery.BRAVOEXCH_SOURCE = $scope301Missing
+    $scope301SaveDiscovery.Components['BRAVOEXCH'] = Resolve-BRAVOSelfTestScope301Presence -Component 'BRAVOEXCH' -Path $scope301Missing
+    $scope301SaveDiscovery.BAZA_APP = 'C:\ExampleLims\BAZA'
+    $scope301SaveDiscovery.Components['BAZA_APP'] = [pscustomobject]@{
+        Component = 'BAZA_APP'; Presence = 'Error'; Source = 'BravoIni'; Path = $null; Reason = 'синтетично: не прочитано'
+    }
+    $scope301BaselinePath = Get-BRAVODiscoveryBaselinePath -StateRoot $scope301State
+    Save-BRAVODiscoveryBaseline -DiscoveryResult $scope301SaveDiscovery -BaselinePath $scope301BaselinePath
+    $scope301SavedJson = Get-Content -LiteralPath $scope301BaselinePath -Raw | ConvertFrom-Json
+    Test-BRAVOCondition -Condition (
+        [string]$scope301SavedJson.BLOG_SOURCE -eq '' -and
+        [string]$scope301SavedJson.MODEL_SOURCE -eq 'C:\ExampleLims\Model' -and
+        [string]$scope301SavedJson.BRAVOEXCH_SOURCE -eq $scope301Missing -and
+        [string]$scope301SavedJson.BAZA_APP -eq 'C:\ExampleLims\BAZA'
+    ) -Name 'BackupScope/BaselineBlanksOnlyProvenEmptySource' `
+        -Failure "baseline має писати '' лише для доведено порожнього каталогу; BLOG='$($scope301SavedJson.BLOG_SOURCE)' BRAVOEXCH='$($scope301SavedJson.BRAVOEXCH_SOURCE)' BAZA_APP='$($scope301SavedJson.BAZA_APP)'"
+
+    # (g) Наскрізно #301: оператор підтвердив baseline з порожнім каталогом ->
+    # наступний прогін дає Info без Warning і без Error.
+    $scope301Import = Import-BRAVODiscoveryBaseline -StateRoot $scope301State -RuntimeRoot $scope301Runtime -ReadOnly
+    $scope301Reconfirmed = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301EmptyDiscovery `
+        -Baseline $scope301Import.Baseline -BaselineSourceKind ([string]$scope301Import.Source)
+    Test-BRAVOCondition -Condition (
+        [string]$scope301Import.Source -eq 'Canonical' -and
+        [string]$scope301Reconfirmed.Components['BLOG'] -eq 'EmptySource' -and
+        @($scope301Reconfirmed.Findings | Where-Object { [string]$_.Severity -in @('Error', 'Warning') }).Count -eq 0 -and
+        (Get-BRAVOSelfTestScope301Findings -Scope $scope301Reconfirmed -Component 'BLOG' -Severity 'Info').Count -eq 1
+    ) -Name 'BackupScope/ReconfirmedEmptySourceIsInfo' `
+        -Failure "після підтвердження baseline з порожнім каталогом наступний прогін має дати Info без Warning/Error; scope='$($scope301Reconfirmed.Components['BLOG'])' source='$($scope301Import.Source)'"
+
+    # (h) Попередній перегляд -ValidateOnly -ConfirmDiscoveryBaseline будує
+    # baseline тією самою функцією, що й справжнє збереження.
+    $scope301SnapshotCommand = Get-Command -Name 'New-BRAVODiscoveryBaselineSnapshot' -ErrorAction SilentlyContinue
+    $scope301Snapshot = $null
+    if ($null -ne $scope301SnapshotCommand) {
+        $scope301Snapshot = New-BRAVODiscoveryBaselineSnapshot -DiscoveryResult $scope301SaveDiscovery
+    }
+    $scope301SetupText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SETUP.ps1'))
+    Test-BRAVOCondition -Condition (
+        $null -ne $scope301Snapshot -and
+        [string]$scope301Snapshot.BLOG_SOURCE -eq '' -and
+        [string]$scope301Snapshot.MODEL_SOURCE -eq 'C:\ExampleLims\Model' -and
+        $scope301SetupText -match 'New-BRAVODiscoveryBaselineSnapshot\s+-DiscoveryResult\s+\$bravoDiscoveryResult'
+    ) -Name 'BackupScope/SetupPreviewUsesBaselineSnapshot' `
+        -Failure 'BRAVO_SETUP -ValidateOnly -ConfirmDiscoveryBaseline має будувати попередній baseline через New-BRAVODiscoveryBaselineSnapshot (та сама логіка, що й Save-BRAVODiscoveryBaseline)'
+
+    # (i) Warning-знахідки доходять до журналу Archive і виводу SETUP як
+    # попередження, а не губляться як INFO.
+    $scope301ArchiveText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'))
+    Test-BRAVOCondition -Condition (
+        $scope301ArchiveText -match "Severity -eq 'Warning'\) \{ 'WARNING' \}" -and
+        $scope301SetupText -match "Severity -eq 'Warning'\) \{ 'Yellow' \}"
+    ) -Name 'BackupScope/DriftWarningReportedAsWarning' `
+        -Failure 'Archive має писати Warning-знахідку складу рівнем WARNING, а SETUP - жовтим'
 } finally {
     if (Test-Path -LiteralPath $scope301Root) {
         Remove-Item -LiteralPath $scope301Root -Recurse -Force -ErrorAction SilentlyContinue
