@@ -4521,7 +4521,9 @@ function Send-BRAVOTraceArchiveFile {
     $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
     $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::On
 
-    $transferResult = $Session.PutFiles($LocalPath, $remoteTempPath, $false, $transferOptions)
+    # Джерело PutFiles, шлях RemoveFiles і джерело MoveFile — маски WinSCP
+    # (#366): екрануються, щоб ім'я з `[`/`]` не зачепило сусідній файл.
+    $transferResult = $Session.PutFiles((ConvertTo-BRAVOWinSCPFileMask -Path $LocalPath), $remoteTempPath, $false, $transferOptions)
     if (-not $transferResult.IsSuccess) {
         $failureMessages = @(
             $transferResult.Transfers | Where-Object { $null -ne $_.Error } |
@@ -4537,12 +4539,12 @@ function Send-BRAVOTraceArchiveFile {
     # Стара версія прибирається ЛИШЕ після верифікованого .new: SFTP-rename
     # не перезаписує ціль, тому шлях звільняється явним RemoveFiles.
     if ($Session.FileExists($RemoteFinalPath)) {
-        $removeResult = $Session.RemoveFiles($RemoteFinalPath)
+        $removeResult = $Session.RemoveFiles((ConvertTo-BRAVOWinSCPFileMask -Path $RemoteFinalPath))
         if (-not $removeResult.IsSuccess) {
             return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = "не вдалося звільнити $RemoteFinalPath для публікації нової версії (верифікований .new залишено)" }
         }
     }
-    $Session.MoveFile($remoteTempPath, $RemoteFinalPath)
+    $Session.MoveFile((ConvertTo-BRAVOWinSCPFileMask -Path $remoteTempPath), $RemoteFinalPath)
     $finalInfo = $Session.GetFileInfo($RemoteFinalPath)
     if ($null -eq $finalInfo -or [int64]$finalInfo.Length -ne [int64]$localItem.Length) {
         return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = "фінальна верифікація $RemoteFinalPath не пройдена після публікації" }
@@ -4886,7 +4888,7 @@ function Invoke-BRAVOTraceRemoteLogMigration {
                     }
                     continue
                 }
-                $Session.MoveFile($sourcePath, $targetPath)
+                $Session.MoveFile((ConvertTo-BRAVOWinSCPFileMask -Path $sourcePath), $targetPath)
                 if ($Session.FileExists($targetPath) -and -not $Session.FileExists($sourcePath)) {
                     $result.Moved++
                     Write-BRAVOLogRotationMessage -Logger $Logger `

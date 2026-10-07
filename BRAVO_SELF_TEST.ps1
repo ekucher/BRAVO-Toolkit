@@ -1279,6 +1279,95 @@ function New-BRAVOSelfTestFakeBazaSession {
     return $session
 }
 
+# #366: фейк-сесія зі СТРОГОЮ моделлю масок WinSCP .NET поверх
+# New-BRAVOSelfTestFakeBazaSession. Реальна WinSCP трактує останній
+# сегмент локального джерела PutFiles, шляху RemoveFiles і джерела
+# MoveFile (скриптові put/rm/mv) як файлову маску: `*`, `?`, `[...]`.
+# FileExists/GetFileInfo приймають буквальний шлях. Без екранування
+# `Trace[1].mdz` збігається з `Trace1.mdz` — саме це тут і моделюється.
+# Звичайна фейк-сесія лишається буквальною: наявні перевірки не змінюються.
+function New-BRAVOSelfTestWinSCPMaskSession {
+    $session = New-BRAVOSelfTestFakeBazaSession
+    $session.State | Add-Member -MemberType NoteProperty -Name PutFilesLocalArgs -Value (New-Object System.Collections.Generic.List[string])
+    $session.State | Add-Member -MemberType NoteProperty -Name ResolveMask -Value {
+        param([string]$MaskPath)
+        $separatorIndex = $MaskPath.LastIndexOfAny([char[]]@('/', '\'))
+        $leaf = $MaskPath.Substring($separatorIndex + 1)
+        $pattern = New-Object System.Text.StringBuilder
+        [void]$pattern.Append('^')
+        $index = 0
+        while ($index -lt $leaf.Length) {
+            $character = [string]$leaf[$index]
+            $closeIndex = -1
+            if ($character -eq '[') { $closeIndex = $leaf.IndexOf(']', $index + 2) }
+            if ($character -eq '*') {
+                [void]$pattern.Append('.*')
+            } elseif ($character -eq '?') {
+                [void]$pattern.Append('.')
+            } elseif ($closeIndex -gt 0) {
+                $setText = $leaf.Substring($index + 1, $closeIndex - $index - 1)
+                [void]$pattern.Append('[' + [regex]::Escape($setText).Replace(']', '\]') + ']')
+                $index = $closeIndex
+            } else {
+                [void]$pattern.Append([regex]::Escape($character))
+            }
+            $index++
+        }
+        [void]$pattern.Append('$')
+        return [pscustomobject]@{ Directory = $MaskPath.Substring(0, $separatorIndex + 1); Pattern = $pattern.ToString() }
+    }
+    $session.State | Add-Member -MemberType NoteProperty -Name FindRemoteMatches -Value {
+        param($RemoteSizes, $Mask)
+        $found = New-Object System.Collections.Generic.List[string]
+        foreach ($remoteKey in @($RemoteSizes.Keys)) {
+            if (-not ([string]$remoteKey).StartsWith($Mask.Directory, [StringComparison]::Ordinal)) { continue }
+            $remoteLeaf = ([string]$remoteKey).Substring($Mask.Directory.Length)
+            if ($remoteLeaf.Contains('/')) { continue }
+            if ($remoteLeaf -cmatch $Mask.Pattern) { [void]$found.Add([string]$remoteKey) }
+        }
+        return ,$found
+    }
+    $session | Add-Member -Force -MemberType ScriptMethod -Name PutFiles -Value {
+        param($localPath, $remotePath, $remove, $options)
+        $this.State.PutFilesCallCount++
+        [void]$this.State.PutFilesCalledFor.Add([string]$remotePath)
+        [void]$this.State.PutFilesLocalArgs.Add([string]$localPath)
+        $mask = & $this.State.ResolveMask ([string]$localPath)
+        $matchedFiles = @(Get-ChildItem -LiteralPath $mask.Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer -and $_.Name -match $mask.Pattern })
+        if ($matchedFiles.Count -ne 1) {
+            $errObj = [pscustomobject]@{ Error = [pscustomobject]@{ Message = "маска '$localPath' збіглася з $($matchedFiles.Count) файлами" } }
+            return [pscustomobject]@{ IsSuccess = $false; Transfers = @($errObj) }
+        }
+        $this.State.RemoteSizes[[string]$remotePath] = [int64]$matchedFiles[0].Length
+        return [pscustomobject]@{ IsSuccess = $true; Transfers = @() }
+    }
+    $session | Add-Member -Force -MemberType ScriptMethod -Name RemoveFiles -Value {
+        param($path)
+        [void]$this.State.RemoveFilesCalls.Add([string]$path)
+        $mask = & $this.State.ResolveMask ([string]$path)
+        foreach ($matchedKey in (& $this.State.FindRemoteMatches $this.State.RemoteSizes $mask)) {
+            $this.State.RemoteSizes.Remove($matchedKey)
+        }
+        return [pscustomobject]@{ IsSuccess = $true }
+    }
+    $session | Add-Member -Force -MemberType ScriptMethod -Name MoveFile -Value {
+        param($sourcePath, $targetPath)
+        [void]$this.State.MoveFileCalls.Add("$sourcePath -> $targetPath")
+        $mask = & $this.State.ResolveMask ([string]$sourcePath)
+        $matchedKeys = & $this.State.FindRemoteMatches $this.State.RemoteSizes $mask
+        if ($matchedKeys.Count -ne 1) {
+            throw "WinSCP mv: маска '$sourcePath' збіглася з $($matchedKeys.Count) файлами"
+        }
+        if ($this.State.RemoteSizes.ContainsKey([string]$targetPath)) {
+            throw "simulated rename failure: target already exists: $targetPath"
+        }
+        $this.State.RemoteSizes[[string]$targetPath] = $this.State.RemoteSizes[$matchedKeys[0]]
+        $this.State.RemoteSizes.Remove($matchedKeys[0])
+    }
+    return $session
+}
+
 # P0 fail-fast/telemetry: друкує суто ДОДАТКОВУ (assertion-level і
 # suite-level) телеметрію. Викликається з Complete-BRAVOSelfTestReport
 # ПІСЛЯ незмінних machine-readable маркерів (SELF-TEST PASSED/FAILED,
@@ -2411,6 +2500,34 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             )) `
         -Name "Compatibility/ImportHasNoConsoleSideEffects" `
         -Failure "імпорт Compatibility не повинен змінювати global OutputEncoding"
+
+    # --- #366: WinSCP трактує останній сегмент шляху як файлову маску ---
+    # Екранування — як RemotePath.EscapeFileMask: лише останній сегмент
+    # (після останнього `/` або `\`), `[` -> `[[]`, `*` -> `[*]`, `?` -> `[?]`;
+    # каталог і звичайні імена не змінюються.
+    $winScpMaskCases = @(
+        @('/trace/Trace[1]*?.mdz', '/trace/Trace[[]1][*][?].mdz'),
+        @('C:\dir[x]\file[2].txt', 'C:\dir[x]\file[[]2].txt'),
+        @('/baza[a]/sub/doc].txt', '/baza[a]/sub/doc].txt'),
+        @('/trace/Trace_20260815.mdz', '/trace/Trace_20260815.mdz'),
+        @('name[1]', 'name[[]1]'),
+        @('', '')
+    )
+    $winScpMaskMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($winScpMaskCase in $winScpMaskCases) {
+        try {
+            $winScpMaskActual = ConvertTo-BRAVOWinSCPFileMask -Path $winScpMaskCase[0]
+        } catch {
+            $winScpMaskActual = "<виняток: $($_.Exception.Message)>"
+        }
+        if ($winScpMaskActual -cne $winScpMaskCase[1]) {
+            [void]$winScpMaskMismatches.Add("'$($winScpMaskCase[0])' -> '$winScpMaskActual' (очікувалось '$($winScpMaskCase[1])')")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($winScpMaskMismatches.Count -eq 0) `
+        -Name "Compatibility/WinSCPFileMaskEscapesOnlyLastSegment" `
+        -Failure "ConvertTo-BRAVOWinSCPFileMask має екранувати лише останній сегмент: $($winScpMaskMismatches -join '; ')"
 
     # --- T030: TLS 1.2 вмикається АДИТИВНО в усіх production-точках ---
     # Регресія: Maintenance/DataRestore runtime і dry-run webhook-перевірка
