@@ -791,6 +791,26 @@ function Write-BRAVOStateTemporaryText {
                     (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
                     (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
                     (& $c 'BravoWeb' 'Apache2.4' 'Running' 'Running')))
+            $result.BravoInPauseRunning = & $describe (Get-BRAVOServiceRecoveryChainPlan -EligibleNames @() -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Running' 'Running'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Running' 'Running')))
+            # Залежні, утримані паузою BRAVO (не запускаються й не
+            # обліковуються в цьому тику).
+            $heldPlan = Get-BRAVOServiceRecoveryChainPlan -EligibleNames @('exchangAPI', 'Apache2.4') -Conditions @(
+                (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+                (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+                (& $c 'BravoWeb' 'Apache2.4' 'Failed' 'Stopped'))
+            $result.BravoInPauseAllDependents = & $describe $heldPlan
+            $heldNames = {
+                param($Plan)
+                if ($null -eq $Plan.PSObject.Properties['HeldByBravoNames']) { return '<немає HeldByBravoNames>' }
+                return (@($Plan.HeldByBravoNames) -join ' ')
+            }
+            $result.BravoInPauseHeld = & $heldNames $heldPlan
+            $result.BravoRunningHeld = & $heldNames (Get-BRAVOServiceRecoveryChainPlan -EligibleNames @('exchangAPI') -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Running' 'Running'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped')))
             $result.Empty = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @())
             return [pscustomobject]$result
         }
@@ -840,11 +860,26 @@ function Write-BRAVOStateTemporaryText {
         -Failure "Disabled/NotInstalled/OwnedByBravo/призупинена служба не зупиняється й не запускається; служба в Pending, від якої залежить план, — Deferred (цього тику план не виконується): $($w4ChainDiffs -join ' || ')"
     $w4ChainDiffs = @(& $w4ChainCheck @{
             Eligible = 'failed: Apache2.4 | stop:  | start: Apache2.4 | deferred:  | accounted: Apache2.4'
-            BravoInPause = 'failed: exchangAPI | stop:  | start: exchangAPI | deferred:  | accounted: exchangAPI'
         })
     Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
         -Name 'ServiceRecovery/ChainPlanHonorsPauseEligibility' `
         -Failure "-EligibleNames (служби, чия пауза минула): впала служба в паузі цього тику не запускається і не тягне ланцюжок: $($w4ChainDiffs -join ' || ')"
+    # Впала BRAVO у паузі: залежні (exchangAPI, BRAVO Web) від неї залежать —
+    # у цьому тику їх не запускають і не обліковують, навіть якщо їхня власна
+    # пауза минула (HeldByBravoNames — для рядка зведення); працюючі залежні
+    # не зупиняються. Самостійно впала залежна при працюючій BRAVO — як і
+    # раніше за власною паузою.
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            BravoInPause = 'failed:  | stop:  | start:  | deferred:  | accounted: '
+            BravoInPauseRunning = 'failed:  | stop:  | start:  | deferred:  | accounted: '
+            BravoInPauseAllDependents = 'failed:  | stop:  | start:  | deferred:  | accounted: '
+            BravoInPauseHeld = 'exchangAPI Apache2.4'
+            BravoRunningHeld = ''
+            ExchangeOnly = 'failed: exchangAPI | stop:  | start: exchangAPI | deferred:  | accounted: exchangAPI'
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanBravoInPauseHoldsDependents' `
+        -Failure "впала BRAVO у паузі: впалі залежні не запускаються і не обліковуються (HeldByBravoNames), працюючі не зупиняються; при працюючій BRAVO залежна — за своєю паузою: $($w4ChainDiffs -join ' || ')"
 
     $w4ModuleAst = [Management.Automation.Language.Parser]::ParseInput($w4ModuleText, [ref]$null, [ref]$null)
     $w4ChainFunction = @($w4ModuleAst.FindAll({
@@ -1256,6 +1291,33 @@ function Get-BRAVOServiceRecoveryConditions {
         ) `
         -Name 'ServiceRecovery/ProfilePauseSkipsWithoutLock' `
         -Failure "впала служба в паузі (0/5/15/60): вихід 0 без lock-а, журналу і запуску; рядок «exchangAPI впала, пауза до HH:mm (спроба 2)» у зведенні: $(& $w4Describe $w4Paused)"
+
+    # Впала BRAVO у паузі, впала exchangAPI без обліку (її пауза минула):
+    # exchangAPI залежить від BRAVO — lock не береться, журнал не
+    # створюється, запуску й обліку немає; у зведенні — рядок паузи BRAVO і
+    # рядок «exchangAPI чекає на BRAVO».
+    $w4BravoPauseState = [pscustomobject]@{
+        schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+        services = @{ BRAVO = [pscustomobject]@{ attempts = @((Get-Date).AddMinutes(-2).ToString('o')); lastCriticalAt = $null; stableSince = $null } }
+    }
+    $w4BravoPausedHeld = & $w4RunProfile @{
+        Conditions = @(
+            (& $w4Cond 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+            (& $w4Cond 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+            (& $w4Cond 'BravoWeb' 'Apache2.4' 'Running' 'Running'))
+        RecoveryState = $w4BravoPauseState
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4BravoPausedHeld.Error -and [int]$w4BravoPausedHeld.ExitCode -eq 0 -and
+            $null -eq $w4BravoPausedHeld.LockArgs -and @($w4BravoPausedHeld.LogCalls).Count -eq 0 -and
+            [int]$w4BravoPausedHeld.StateWrites -eq 0 -and
+            @($w4BravoPausedHeld.Events | Where-Object { $_ -match '^(START|STATE|MARKER|SLACK|REPORT|LOGS)' }).Count -eq 0 -and
+            @($w4BravoPausedHeld.Events | Where-Object { $_ -match '^SUMMARY .*BRAVO впала, пауза до \d\d:\d\d \(спроба 2\)' }).Count -eq 1 -and
+            @($w4BravoPausedHeld.Events | Where-Object { $_ -match '^SUMMARY .*exchangAPI.*чекає на BRAVO' }).Count -eq 1
+        ) `
+        -Name 'ServiceRecovery/ProfileBravoInPauseHoldsDependentsWithoutLock' `
+        -Failure "впала BRAVO у паузі і впала exchangAPI: exchangAPI залежить від BRAVO — вихід 0 без lock-а, журналу RECOVER, запуску й обліку; у зведенні пауза BRAVO і «exchangAPI ... чекає на BRAVO»: $(& $w4Describe $w4BravoPausedHeld)"
 
     # Тест 5: lock зайнятий -> 20, без змін, сповіщень і журналу.
     $w4LockBusy = & $w4RunProfile @{ Conditions = $w4ExchangeFailed; LockBusy = $true }
