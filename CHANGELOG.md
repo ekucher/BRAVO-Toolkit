@@ -2,6 +2,13 @@
 
 ## Не випущено (developer)
 
+- **Fix: Dry run публікує результат `-ResultPath` атомарно (#306).**
+  `BRAVO_TASKS_DIAGNOSE` опитує появу `dry-run.json` і одразу читає його, а dry run писав JSON прямо
+  в кінцевий файл. Diagnose міг прочитати порожній чи частковий файл або натрапити на sharing violation
+  і завершитись помилкою, що валило крок 5 `BRAVO_SETUP` і гейт `Update-BRAVOServer`. Тепер
+  `Write-DryRunOutput` пише повний JSON у тимчасовий файл поруч і переносить його на `ResultPath`
+  через `Move-Item` (як воркер `BRAVO_CREDENTIALS_SETUP`); тимчасовий файл прибирається і при збої.
+
 - **Fix: Maintenance: ранні виходи більше не гублять критичні алерти (#299).**
   `Send-SlackAlert -IsCritical` лише додає запис у чергу, а надсилає її `Send-FinalReport`, до якого ранні виходи
   не доходили: recovery guard (`exit 20`), збій запису quiescence-маркера (`throw` → 90), блокування через
