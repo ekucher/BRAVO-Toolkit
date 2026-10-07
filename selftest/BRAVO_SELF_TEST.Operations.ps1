@@ -1379,6 +1379,82 @@
         $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0
     ) -Name 'Operations/DeadLetterRepeatedEventIdKeepsEarlierArtifact' `
       -Failure "#397: повторний карантин події з тим самим EventId не має перезаписувати попередній dead-letter <EventId>.json; новий артефакт -- окремий файл з тим самим префіксом; у DeadLetter: $(@($dlSameIdSnapshot | ForEach-Object { $_.Name + '=' + $_.Marker }) -join ', '), outbox=$($dlSameIdOutboxLeft.Count), HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count), виняток='$dlSameIdThrew'"
+
+    # (h) Запис dead-letter не вдається (канонічне ім'я зайняте КАТАЛОГОМ:
+    # File.Move кидає, а File.Exists для каталогу -- $false, тож це не
+    # колізія, а справжня помилка). Інваріант #397: outbox-файл лишається,
+    # без надсилання, WARNING з причиною, попередній артефакт не змінено;
+    # лог дренажу не має стверджувати "переміщено в dead-letter".
+    $dlFailDir = Join-Path $opsSelfTestRoot 'DeadLetterWriteFailure'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $dlFailDir
+    $dlFailOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $dlFailOutboxDir -Force | Out-Null
+    $dlFailDeadLetterDir = & $deadLetterDirFn
+    New-Item -ItemType Directory -Path $dlFailDeadLetterDir -Force | Out-Null
+    [void](& $opsSelfTestModule { Get-BRAVOOperationsServerId })
+    $dlFailPoisonBase = '0000-wfail-poison-' + [guid]::NewGuid().ToString('N')
+    $dlFailForeignBase = '0000-wfail-foreign-' + [guid]::NewGuid().ToString('N')
+    $dlFailPoisonPath = New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlFailOutboxDir -FileBase $dlFailPoisonBase -Marker 'dl397-wfail-poison' -OmitEventId -EnqueuedOffsetSeconds -20
+    $dlFailForeignPath = New-BRAVOOpsSelfTestRawOutboxItem -Directory $dlFailOutboxDir -FileBase $dlFailForeignBase -Marker 'dl397-wfail-foreign' -OmitEventId -ServerId ([guid]::NewGuid().ToString()) -EnqueuedOffsetSeconds -10
+    $dlFailPoisonBytesBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($dlFailPoisonPath))
+    $dlFailForeignBytesBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($dlFailForeignPath))
+    $dlFailBlockers = @(
+        (Join-Path $dlFailDeadLetterDir "missing-eventid-$dlFailPoisonBase.json"),
+        (Join-Path $dlFailDeadLetterDir "missing-eventid-$dlFailForeignBase.json")
+    )
+    foreach ($dlFailBlocker in $dlFailBlockers) { New-Item -ItemType Directory -Path $dlFailBlocker -Force | Out-Null }
+    $dlFailEarlierPath = Join-Path $dlFailDeadLetterDir ('missing-eventid-0000-earlier-' + [guid]::NewGuid().ToString('N') + '.json')
+    [IO.File]::WriteAllText($dlFailEarlierPath, (([pscustomobject]@{
+        Kind = 'event'; LastError = 'dl397-wfail-earlier'
+        DeadLetteredAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-30).ToString('o')
+        DeadLetterReason = 'EventId відсутній (earlier)'; DeadLetterKind = 'Rejected'
+    }) | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    $dlFailEarlierBytesBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($dlFailEarlierPath))
+
+    $global:BRAVOOpsSelfTestDeadLetterWarnings = New-Object System.Collections.Generic.List[object]
+    $originalWriteBravoLogForDeadLetterTest = Get-Command -Name Write-BRAVOLog -CommandType Function -ErrorAction SilentlyContinue
+    [void](New-Module -ScriptBlock {
+        function Write-BRAVOLog {
+            param([string]$Component, [string]$Level, [string]$Message, [switch]$Secondary)
+            if ($Component -eq 'Operations' -and $Level -eq 'WARNING') {
+                [void]$global:BRAVOOpsSelfTestDeadLetterWarnings.Add($Message)
+            }
+        }
+    })
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    $dlFailThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
+    if ($null -ne $originalWriteBravoLogForDeadLetterTest) {
+        Set-Item -Path function:Write-BRAVOLog -Value $originalWriteBravoLogForDeadLetterTest.ScriptBlock -Force
+    } else {
+        Remove-Item -Path function:Write-BRAVOLog -Force -ErrorAction SilentlyContinue
+    }
+    $dlFailWarnings = $global:BRAVOOpsSelfTestDeadLetterWarnings.ToArray()
+    $dlFailMoveWarnings = @($dlFailWarnings | Where-Object { $_ -like '*Не вдалося перемістити*dead-letter*' })
+    $dlFailPoisonKept = (Test-Path -LiteralPath $dlFailPoisonPath -PathType Leaf) -and ([Convert]::ToBase64String([IO.File]::ReadAllBytes($dlFailPoisonPath)) -eq $dlFailPoisonBytesBefore)
+    $dlFailForeignKept = (Test-Path -LiteralPath $dlFailForeignPath -PathType Leaf) -and ([Convert]::ToBase64String([IO.File]::ReadAllBytes($dlFailForeignPath)) -eq $dlFailForeignBytesBefore)
+    $dlFailEarlierKept = (Test-Path -LiteralPath $dlFailEarlierPath -PathType Leaf) -and ([Convert]::ToBase64String([IO.File]::ReadAllBytes($dlFailEarlierPath)) -eq $dlFailEarlierBytesBefore)
+    $dlFailBlockersKept = @($dlFailBlockers | Where-Object { Test-Path -LiteralPath $_ -PathType Container }).Count -eq 2
+    $dlFailDeadLetterFiles = @(Get-ChildItem -LiteralPath $dlFailDeadLetterDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $dlFailThrew -eq '' -and
+        $dlFailPoisonKept -and
+        $dlFailForeignKept -and
+        $dlFailEarlierKept -and
+        $dlFailBlockersKept -and
+        $dlFailDeadLetterFiles.Count -eq 1 -and
+        $dlFailMoveWarnings.Count -eq 2 -and
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0
+    ) -Name 'Operations/DeadLetterWriteFailureKeepsOutboxItemAndEarlierArtifact' `
+      -Failure "#397: якщо dead-letter не записався, outbox-файл має лишитися без змін, без надсилання, з WARNING про невдале переміщення, а попередні dead-letter-артефакти -- незмінними; poisonKept=$dlFailPoisonKept foreignKept=$dlFailForeignKept earlierKept=$dlFailEarlierKept blockersKept=$dlFailBlockersKept deadLetterFiles=$($dlFailDeadLetterFiles.Count) moveWarnings=$($dlFailMoveWarnings.Count) HTTP=$($global:BRAVOOpsSelfTestHttpCalls.Count) виняток='$dlFailThrew'"
+    $dlFailClaimedMoved = @($dlFailWarnings | Where-Object { $_ -like '*переміщено в dead-letter*' })
+    $dlFailStayed = @($dlFailWarnings | Where-Object { $_ -like '*лишається в outbox*' })
+    Test-BRAVOCondition -Condition (
+        $dlFailClaimedMoved.Count -eq 0 -and
+        $dlFailStayed.Count -eq 2
+    ) -Name 'Operations/DeadLetterWriteFailureIsNotLoggedAsMoved' `
+      -Failure "#397: після невдалого карантину (гілки ідентичності й пошкодженого конверта) лог дренажу не має казати 'переміщено в dead-letter', а має казати, що item лишається в outbox; WARNING: $($dlFailWarnings -join ' | ')"
+    Remove-Variable -Name BRAVOOpsSelfTestDeadLetterWarnings -Scope Global -Force -ErrorAction SilentlyContinue
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Operations/ApprovedWithoutApiKeyMeansTtlExpiredReturnsNullNoThrow' } }
     if (Enter-BRAVOSelfTestSection -Name 'Operations/EnabledWithEmptyApiBaseUrlFailsClosedReturnsNull' -DependsOn 'Operations/UrlNormalizationTrailingSlashInvariant') { try {
 
