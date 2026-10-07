@@ -2,6 +2,16 @@
 
 ## Не випущено (developer)
 
+- **CI: ручний прогін (workflow_dispatch) більше не падає на gitleaks через чужі гілки.**
+  На `workflow_dispatch` gitleaks-action не має діапазону комітів і запускає `gitleaks detect` без `--log-opts`,
+  тобто `git log --all`. Checkout з `fetch-depth: 0` приносить усі гілки репозиторію як `refs/remotes/origin/*`,
+  тож задача `Secret scanning (gitleaks) (push)` падала на КОЖНОМУ ручному прогоні будь-якої гілки (`leaks found: 17`):
+  усі 17 знахідок — синтетичні тестові значення у двох покинутих гілках закритих PR, яких немає ні в `developer`,
+  ні в `master`. Новий крок перед gitleaks (лише на `workflow_dispatch`) видаляє локальні remote-tracking refs
+  раннера; запущена гілка з повною історією і всі теги лишаються в скані, репозиторій на GitHub не змінюється.
+  Allowlist і `.gitleaksignore` не розширено, `pull_request` і `push` не змінились. Тест
+  `StaticAnalysis/SecretScanDispatchScopeIsNarrow` тримає обмеження вузьким (лише `workflow_dispatch`, лише
+  `refs/remotes/*`, `fetch-depth: 0`, крок перед gitleaks) і ловить три мутанти.
 - **Fix: retention / 7z t: один класифікатор власних повідомлень 7-Zip замість двох копій; відмова доступу і зайнятий файл розпізнаються незалежно від мови Windows (#394).**
   Шаблон «7-Zip сам забракував архів» (archive-specific) жив двома однаковими копіями: у `Test-SevenZipArchiveIntegrity`
   (BRAVO.ArchiveHelpers) і в `Invoke-BRAVOSevenZipIntegrityTest` (друга, legacy BOM-спроба, BRAVO.Compatibility).
