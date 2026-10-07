@@ -23225,6 +23225,55 @@ function Get-BRAVOMaintenanceSummaryResult {
                     StandardOutput = ''; StandardError = ('ERROR: ' + [char]0x0412 + [char]0x0456 + [char]0x0434 + [char]0x043C + [char]0x043E + [char]0x0432 + [char]0x043B + [char]0x0435 + [char]0x043D + [char]0x043E + ' ' + [char]0x0432 + ' ' + [char]0x0434 + [char]0x043E + [char]0x0441 + [char]0x0442 + [char]0x0443 + [char]0x043F + [char]0x0456 + '.')
                 }
             }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-UNSUPPORTED-METHOD') {
+                # #422: 7-Zip відпрацював (код 2), але не підтримує метод
+                # стиснення архіву (інша версія 7-Zip). Для класифікатора це
+                # archive-specific, але не доказ пошкодження вмісту.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = 'ERROR: Unsupported Method : payload.md'
+                }
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-WRONG-PASSWORD') {
+                # #422: 7-Zip відпрацював (код 2) і відхилив пароль. Для
+                # класифікатора це archive-specific, але байти архіву
+                # збігаються з перевіреним .sha512 — це ознака зміни пароля,
+                # а не доказ пошкодження вмісту.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = 'ERROR: Data Error in encrypted file. Wrong password? : payload.md'
+                }
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-CRC-FAILED') {
+                # #422: доведене пошкодження вмісту — 7-Zip відпрацював
+                # (код 2) і сам повідомив про CRC-помилку.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = 'ERROR: CRC Failed : payload.md'
+                }
+            }
+            if ($stubArchiveText -cmatch '^BRAVO-SELFTEST-EXIT-(\d+)$') {
+                # #422: 7-Zip завершився кодом поза 1/2 (7 — командний рядок,
+                # 8 — пам'ять, 255 — зупинено). Текст про вміст навмисно
+                # присутній: збоєм виконання це робить саме код.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = [int]$Matches[1]
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = 'ERROR: Data Error : payload.md'
+                }
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-SYSTEM-ERROR-ACCESS-DENIED') {
+                # #422: код 2 з текстом про вміст, але з маркером 7-Zip
+                # "System ERROR" і відмовою доступу — збій виконання.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = "ERROR: Data Error : payload.md`nSystem ERROR:`nAccess is denied."
+                }
+            }
             if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT') {
                 return New-Object PSObject -Property @{
                     Success = $false; ExitCode = $null
@@ -23249,17 +23298,45 @@ function Get-BRAVOMaintenanceSummaryResult {
         $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
             ("BRAVO_RETENTION_FOLLOWUP_{0}_{1}" -f $ScenarioName, [guid]::NewGuid().ToString("N"))
         [void][IO.Directory]::CreateDirectory($scenarioRoot)
+        # #422: hash-файли, утримувані без спільного доступу на час прогону
+        # (HashMode 'Locked' — hash-файл не читається).
+        $scenarioHashLocks = New-Object System.Collections.ArrayList
         try {
             foreach ($scenarioSession in $Sessions) {
-                $fileName = "{0}_before_{1}.mdz" -f $retentionFollowupPrefix, $scenarioSession['Session']
-                $archivePath = Join-Path $scenarioRoot $fileName
-                [IO.File]::WriteAllText($archivePath, [string]$scenarioSession['Content'])
-                if (-not $scenarioSession['NoHash']) {
-                    $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash
-                    "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+                # #422: необов'язковий after-архів сесії (AfterContent) і
+                # режим hash-файлу before-архіву (HashMode: '' — коректний,
+                # 'Mismatch' — SHA512 іншого вмісту, 'Malformed' — не SHA512,
+                # 'Locked' — коректний, але не читається). Без цих ключів
+                # сесія — як раніше: лише before-архів із коректним hash.
+                $scenarioArchives = New-Object System.Collections.ArrayList
+                [void]$scenarioArchives.Add(@{ Kind = 'before'; Content = [string]$scenarioSession['Content']; HashMode = [string]$scenarioSession['HashMode'] })
+                if ($null -ne $scenarioSession['AfterContent']) {
+                    [void]$scenarioArchives.Add(@{ Kind = 'after'; Content = [string]$scenarioSession['AfterContent']; HashMode = '' })
                 }
-                if ($scenarioSession['Stale']) {
-                    [IO.File]::SetLastWriteTime($archivePath, (Get-Date).AddDays(-90))
+                foreach ($scenarioArchive in $scenarioArchives) {
+                    $fileName = "{0}_{1}_{2}.mdz" -f $retentionFollowupPrefix, $scenarioArchive['Kind'], $scenarioSession['Session']
+                    $archivePath = Join-Path $scenarioRoot $fileName
+                    [IO.File]::WriteAllText($archivePath, [string]$scenarioArchive['Content'])
+                    if (-not $scenarioSession['NoHash']) {
+                        $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash
+                        if ($scenarioArchive['HashMode'] -ceq 'Mismatch') {
+                            $otherHasher = [Security.Cryptography.SHA512]::Create()
+                            try {
+                                $hash = -join @($otherHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes('BRAVO-SELFTEST-OTHER-CONTENT')) | ForEach-Object { $_.ToString('X2') })
+                            } finally {
+                                $otherHasher.Dispose()
+                            }
+                        } elseif ($scenarioArchive['HashMode'] -ceq 'Malformed') {
+                            $hash = 'not-a-sha512-value'
+                        }
+                        "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+                        if ($scenarioArchive['HashMode'] -ceq 'Locked') {
+                            [void]$scenarioHashLocks.Add([IO.File]::Open("$archivePath.sha512", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None))
+                        }
+                    }
+                    if ($scenarioSession['Stale']) {
+                        [IO.File]::SetLastWriteTime($archivePath, (Get-Date).AddDays(-90))
+                    }
                 }
             }
             $scenarioOutcome = & $retentionFollowupModule {
@@ -23294,6 +23371,9 @@ function Get-BRAVOMaintenanceSummaryResult {
             $scenarioOutcome | Add-Member -NotePropertyName Remaining -NotePropertyValue ($remainingNames -join '|') -Force
             return $scenarioOutcome
         } finally {
+            foreach ($scenarioHashLock in @($scenarioHashLocks)) {
+                $scenarioHashLock.Dispose()
+            }
             if (Test-Path -LiteralPath $scenarioRoot) {
                 Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
             }
@@ -23490,6 +23570,232 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/RetentionBrokenNewerThanAnyValidPointSetsFailureFlags" `
         -Failure ("збій 7z t сесії, новішої за всі підтверджені точки відновлення (найновіша непридатна лише через hash), має бути критичним; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupNewestUnhashed.Critical, $retentionFollowupNewestUnhashed.RestoreFailed, $retentionFollowupNewestUnhashed.Threw, $retentionFollowupNewestUnhashed.Log)
+
+    # ================================================================
+    # #422: aging непридатних сесій (InvalidRetentionDays, конфіг
+    # Retention.FailedArchiveDays). Непридатна сесія, старша за поріг,
+    # видалялась незалежно від ПРИЧИНИ непридатності: збій виконання
+    # перевірки (виняток валідатора, таймаут, немає 7-Zip, коди 7/8/255,
+    # відмова доступу) чи проблема hash-файлу так само вели до видалення,
+    # як і доведене пошкодження вмісту — навіть коли жодної придатної
+    # точки відновлення не лишилось. Інваріант: неможливість довести, що
+    # сесію безпечно видаляти, НЕ є доказом, що її можна видалити.
+    # Автоматично видаляється лише сесія, усі архіви якої 7-Zip сам
+    # забракував (канонічний Test-BRAVOSevenZipArchiveSpecificFailure),
+    # і лише поки є хоча б одна підтверджена точка відновлення. Решта
+    # лишається з WARNING, що називає сесію і причину. Той самий харнес:
+    # реальні Remove-OldRestoreArchives, Test-BRAVOMaintenanceSevenZipArchiveIntegrity,
+    # Test-SevenZipArchiveIntegrity і класифікатор; застабовано лише
+    # процесний шар 7-Zip. Кожен сценарій має контроль: стару валідну
+    # сесію понад KeepCount=2, яку звичайний retention і далі видаляє.
+    # ================================================================
+    $retention422Subject = '20260101_0100'
+    $retention422Base = {
+        return @(
+            (& $retentionFollowupSession '20260105_0100' 'synthetic-ok-old' $true),
+            (& $retentionFollowupSession '20260110_0100' 'synthetic-ok-1'),
+            (& $retentionFollowupSession '20260111_0100' 'synthetic-ok-2')
+        )
+    }
+    $retention422HasArchive = {
+        param($Outcome, [string]$Session, [string]$Kind)
+        if ([string]::IsNullOrEmpty($Kind)) { $Kind = 'before' }
+        $expectedArchiveName = "{0}_{1}_{2}.mdz" -f $retentionFollowupPrefix, $Kind, $Session
+        return ($null -ne $Outcome -and (@(([string]$Outcome.Remaining) -split '\|') -contains $expectedArchiveName))
+    }
+    $retention422KeptLine = {
+        param($Outcome, [string]$Session, [string]$ReasonPattern)
+        $keptLinePattern = '(?m)^\[WARNING\] Непридатну сесію ' + [regex]::Escape($Session) + ' .*НЕ видалено: .*' + $ReasonPattern
+        return ($null -ne $Outcome -and [regex]::IsMatch([string]$Outcome.Log, $keptLinePattern))
+    }
+    $retention422ControlOk = {
+        param($Outcome)
+        return (
+            $null -ne $Outcome -and
+            -not (& $retention422HasArchive $Outcome '20260105_0100') -and
+            (& $retention422HasArchive $Outcome '20260110_0100') -and
+            (& $retention422HasArchive $Outcome '20260111_0100')
+        )
+    }
+
+    # (a)+(b) Доведене пошкодження вмісту (CRC Failed, код 2) старої
+    # сесії при наявних підтверджених точках — видаляється, як і раніше
+    # (канонічний контракт #300/#394: archive-specific = доказ проти
+    # архіву); стара валідна сесія понад KeepCount — теж (без регресії).
+    $retention422Proven = & $retentionFollowupRunScenario 'I422ProvenCorrupt' (
+        @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-CRC-FAILED' $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422Proven -and
+            $null -eq $retention422Proven.Threw -and
+            (& $retention422ControlOk $retention422Proven)
+        ) `
+        -Name "Maintenance/RetentionStaleValidSessionBeyondKeepCountStillDeleted" `
+        -Failure ("стара валідна сесія понад KeepCount має і далі видалятися звичайним retention, дві найновіші валідні — лишатися; threw={0}, лишилось=[{1}]" -f $retention422Proven.Threw, $retention422Proven.Remaining)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422Proven -and
+            $null -eq $retention422Proven.Threw -and
+            -not (& $retention422HasArchive $retention422Proven $retention422Subject) -and
+            -not $retention422Proven.Critical -and
+            -not $retention422Proven.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionStaleProvenCorruptSessionStillDeleted" `
+        -Failure ("стара сесія з доведеним пошкодженням вмісту (7-Zip: CRC Failed, код 2) за наявних підтверджених точок відновлення має видалятися, як і раніше, без прапорців; critical={0}, restoreIntegrityFailed={1}, threw={2}, лишилось=[{3}]" -f $retention422Proven.Critical, $retention422Proven.RestoreFailed, $retention422Proven.Threw, $retention422Proven.Remaining)
+
+    # (a') ArchivesKeepCount = 0: після прогону не лишається жодної
+    # підтвердженої точки відновлення (придатні сесії теж видаляються),
+    # тож навіть доведено пошкоджену стару сесію НЕ видаляємо — WARNING
+    # називає сесію і причину.
+    $retention422KeepZero = & $retentionFollowupRunScenario 'I422KeepZero' (
+        @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-CRC-FAILED' $true)
+    ) 0
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422KeepZero -and
+            $null -eq $retention422KeepZero.Threw -and
+            (& $retention422HasArchive $retention422KeepZero $retention422Subject) -and
+            (& $retention422KeptLine $retention422KeepZero $retention422Subject 'не лишається жодної підтвердженої')
+        ) `
+        -Name "Maintenance/RetentionStaleProvenCorruptSessionKeptWhenNothingRemains" `
+        -Failure ("за ArchivesKeepCount = 0 після прогону не лишається підтвердженої точки відновлення, тож доведено пошкоджена стара сесія НЕ повинна видалятися, а WARNING має назвати сесію і причину; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422KeepZero.Threw, $retention422KeepZero.Remaining, $retention422KeepZero.Log)
+
+    # (a'') 7-Zip відхилив пароль (наприклад, після зміни пароля): для
+    # класифікатора це archive-specific, але SHA512 архіву збігається з
+    # перевіреним, тож вміст не змінився — це не доказ пошкодження. Сесія
+    # лишається, WARNING називає сесію і причину (пароль).
+    $retention422WrongPassword = & $retentionFollowupRunScenario 'I422WrongPassword' (
+        @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-WRONG-PASSWORD' $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422WrongPassword -and
+            $null -eq $retention422WrongPassword.Threw -and
+            (& $retention422HasArchive $retention422WrongPassword $retention422Subject) -and
+            (& $retention422ControlOk $retention422WrongPassword) -and
+            (& $retention422KeptLine $retention422WrongPassword $retention422Subject 'відхилив пароль')
+        ) `
+        -Name "Maintenance/RetentionStaleSessionKeptOnWrongPassword" `
+        -Failure ("стара сесія, яку 7-Zip не перевірив через відхилений пароль (байти збігаються з перевіреним .sha512), НЕ повинна видалятися: це не доказ пошкодження вмісту; WARNING має назвати сесію і причину; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422WrongPassword.Threw, $retention422WrongPassword.Remaining, $retention422WrongPassword.Log)
+
+    # (a''') 7-Zip не підтримує метод стиснення чи формат архіву (інша
+    # версія 7-Zip): archive-specific для класифікатора, але байти архіву
+    # збігаються з перевіреним .sha512 — це несумісність інструмента, а не
+    # пошкодження вмісту. Сесія лишається з WARNING, що називає причину.
+    $retention422Unsupported = & $retentionFollowupRunScenario 'I422UnsupportedMethod' (
+        @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-UNSUPPORTED-METHOD' $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422Unsupported -and
+            $null -eq $retention422Unsupported.Threw -and
+            (& $retention422HasArchive $retention422Unsupported $retention422Subject) -and
+            (& $retention422ControlOk $retention422Unsupported) -and
+            (& $retention422KeptLine $retention422Unsupported $retention422Subject 'метод стиснення')
+        ) `
+        -Name "Maintenance/RetentionStaleSessionKeptOnUnsupportedMethod" `
+        -Failure ("стара сесія, яку поточний 7-Zip не може перевірити (Unsupported Method; байти збігаються з перевіреним .sha512), НЕ повинна видалятися: це несумісність інструмента, а не доказ пошкодження вмісту; WARNING має назвати сесію і причину; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422Unsupported.Threw, $retention422Unsupported.Remaining, $retention422Unsupported.Log)
+
+    # (c)+(d) Перевірка не виконалась або 7-Zip не завершив її (виняток
+    # валідатора, таймаут, немає 7-Zip, коди 7/8/255, відмова доступу з
+    # маркером System ERROR чи локалізована) — це не доказ проти архіву:
+    # сесія лишається, прапорці (exit 41) — як і раніше, WARNING називає
+    # сесію і причину.
+    foreach ($retention422Case in @(
+            @{ Name = 'ValidatorThrows'; Content = 'BRAVO-SELFTEST-VALIDATOR-THROWS' },
+            @{ Name = 'ValidatorTimeout'; Content = 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT' },
+            @{ Name = 'ValidatorMissing'; Content = 'BRAVO-SELFTEST-VALIDATOR-MISSING' },
+            @{ Name = 'ExitCode7'; Content = 'BRAVO-SELFTEST-EXIT-7' },
+            @{ Name = 'ExitCode8'; Content = 'BRAVO-SELFTEST-EXIT-8' },
+            @{ Name = 'ExitCode255'; Content = 'BRAVO-SELFTEST-EXIT-255' },
+            @{ Name = 'SystemErrorAccessDenied'; Content = 'BRAVO-SELFTEST-SYSTEM-ERROR-ACCESS-DENIED' },
+            @{ Name = 'LocalizedAccessDenied'; Content = 'BRAVO-SELFTEST-LOCALIZED-ACCESS-DENIED' })) {
+        $retention422Outcome = & $retentionFollowupRunScenario ('I422' + $retention422Case['Name']) (
+            @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject $retention422Case['Content'] $true)
+        ) 2
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $retention422Outcome -and
+                $null -eq $retention422Outcome.Threw -and
+                (& $retention422HasArchive $retention422Outcome $retention422Subject) -and
+                (& $retention422ControlOk $retention422Outcome) -and
+                $retention422Outcome.Critical -and
+                $retention422Outcome.RestoreFailed -and
+                (& $retention422KeptLine $retention422Outcome $retention422Subject '7z t')
+            ) `
+            -Name ("Maintenance/RetentionStaleSessionKeptOnValidationFailure/{0}" -f $retention422Case['Name']) `
+            -Failure ("сценарій {0}: стара непридатна сесія, перевірку якої не виконано або не завершено (збій виконання, не доказ пошкодження), НЕ повинна видалятися; прапорці critical/restoreIntegrityFailed — як і раніше; WARNING має назвати сесію і причину; лишилось=[{1}], critical={2}, restoreIntegrityFailed={3}, threw={4}, журнал: {5}" -f $retention422Case['Name'], $retention422Outcome.Remaining, $retention422Outcome.Critical, $retention422Outcome.RestoreFailed, $retention422Outcome.Threw, $retention422Outcome.Log)
+    }
+
+    # (e) Проблема hash-файлу (немає, не SHA512, SHA512 іншого вмісту, не
+    # читається): .sha512 пишеться лише після успішної 7z t, тож це
+    # ознака «не перевірено / не збігається», а не доведене пошкодження
+    # вмісту — 7-Zip цей архів не забракував. Сесія лишається з WARNING.
+    foreach ($retention422Case in @(
+            @{ Name = 'MissingHash'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-unhashed'; Stale = $true; NoHash = $true }; Reason = 'відсутній hash-файл' },
+            @{ Name = 'MalformedHash'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-malformed'; Stale = $true; NoHash = $false; HashMode = 'Malformed' }; Reason = 'некоректний формат hash-файлу' },
+            @{ Name = 'HashMismatch'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-mismatch'; Stale = $true; NoHash = $false; HashMode = 'Mismatch' }; Reason = 'SHA512 не збігається' },
+            @{ Name = 'UnreadableHash'; Session = @{ Session = $retention422Subject; Content = 'synthetic-ok-locked'; Stale = $true; NoHash = $false; HashMode = 'Locked' }; Reason = ''; ReasonPattern = '\S+ — \S' })) {
+        $retention422Outcome = & $retentionFollowupRunScenario ('I422' + $retention422Case['Name']) (
+            @(& $retention422Base) + @($retention422Case['Session'])
+        ) 2
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $retention422Outcome -and
+                $null -eq $retention422Outcome.Threw -and
+                (& $retention422HasArchive $retention422Outcome $retention422Subject) -and
+                (& $retention422ControlOk $retention422Outcome) -and
+                (& $retention422KeptLine $retention422Outcome $retention422Subject $(if ($retention422Case.ContainsKey('ReasonPattern')) { [string]$retention422Case['ReasonPattern'] } else { [regex]::Escape([string]$retention422Case['Reason']) }))
+            ) `
+            -Name ("Maintenance/RetentionStaleSessionKeptOnHashFileProblem/{0}" -f $retention422Case['Name']) `
+            -Failure ("сценарій {0}: стара сесія з проблемою hash-файлу (не доведене пошкодження вмісту) НЕ повинна видалятися; WARNING має назвати сесію і причину; лишилось=[{1}], threw={2}, журнал: {3}" -f $retention422Case['Name'], $retention422Outcome.Remaining, $retention422Outcome.Threw, $retention422Outcome.Log)
+    }
+
+    # Змішана сесія: before доведено пошкоджений (CRC), after — збій
+    # виконання (таймаут). Видаляється лише сесія, у якій доведено
+    # пошкодження ВСІХ архівів: after може бути придатною точкою.
+    $retention422Mixed = & $retentionFollowupRunScenario 'I422Mixed' (
+        @(& $retention422Base) + @(@{ Session = $retention422Subject; Content = 'BRAVO-SELFTEST-CRC-FAILED'; AfterContent = 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT'; Stale = $true; NoHash = $false })
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422Mixed -and
+            $null -eq $retention422Mixed.Threw -and
+            (& $retention422HasArchive $retention422Mixed $retention422Subject 'before') -and
+            (& $retention422HasArchive $retention422Mixed $retention422Subject 'after') -and
+            (& $retention422ControlOk $retention422Mixed) -and
+            (& $retention422KeptLine $retention422Mixed $retention422Subject '7z t')
+        ) `
+        -Name "Maintenance/RetentionStaleMixedSessionKeptWhenNotAllArchivesProvenCorrupt" `
+        -Failure ("стара сесія, де лише частину архівів 7-Zip забракував, а перевірку решти не завершено, НЕ повинна видалятися; лишилось=[{0}], threw={1}, журнал: {2}" -f $retention422Mixed.Remaining, $retention422Mixed.Threw, $retention422Mixed.Log)
+
+    # (f) Жодної підтвердженої точки відновлення: усі сесії старі й
+    # непридатні (CRC, таймаут, немає .sha512). Масова непридатність
+    # швидше системна (пароль, 7-Zip, доступ), ніж пошкодження кожного
+    # архіву, — не видаляється нічого, навіть сесія з CRC; ERROR «не
+    # лишилось жодної придатної точки» і прапорці — як і раніше.
+    $retention422NoValid = & $retentionFollowupRunScenario 'I422NoValid' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-CRC-FAILED' $true),
+        (& $retentionFollowupSession '20260102_0100' 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT' $true),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-unhashed' $true $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention422NoValid -and
+            $null -eq $retention422NoValid.Threw -and
+            (& $retention422HasArchive $retention422NoValid '20260101_0100') -and
+            (& $retention422HasArchive $retention422NoValid '20260102_0100') -and
+            (& $retention422HasArchive $retention422NoValid '20260103_0100') -and
+            $retention422NoValid.Critical -and
+            $retention422NoValid.RestoreFailed -and
+            [regex]::IsMatch([string]$retention422NoValid.Log, '(?m)^\[ERROR\] Не лишилось жодної придатної точки відновлення') -and
+            (& $retention422KeptLine $retention422NoValid '20260101_0100' 'жодної підтвердженої точки відновлення') -and
+            (& $retention422KeptLine $retention422NoValid '20260102_0100' '7z t') -and
+            (& $retention422KeptLine $retention422NoValid '20260103_0100' 'відсутній hash-файл')
+        ) `
+        -Name "Maintenance/RetentionNoValidRestorePointNothingInvalidDeleted" `
+        -Failure ("без жодної підтвердженої точки відновлення retention НЕ повинен видаляти жодної непридатної сесії (навіть із CRC-помилкою); ERROR і прапорці — як і раніше; WARNING для кожної збереженої сесії; лишилось=[{0}], critical={1}, restoreIntegrityFailed={2}, threw={3}, журнал: {4}" -f $retention422NoValid.Remaining, $retention422NoValid.Critical, $retention422NoValid.RestoreFailed, $retention422NoValid.Threw, $retention422NoValid.Log)
 
     # ================================================================
     # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)

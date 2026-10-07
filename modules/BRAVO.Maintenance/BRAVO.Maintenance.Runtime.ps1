@@ -6761,7 +6761,12 @@ function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
         # Збій ВИКОНАННЯ перевірки (немає 7-Zip, помилка запуску, таймаут)
         # прапорці виставляє і з цим перемикачем — це не доказ проти
         # архіву, а непрацююча перевірка (fail-safe).
-        [switch]$NoFailureFlags
+        [switch]$NoFailureFlags,
+        # #422: необов'язковий hashtable, у який передається класифікація
+        # збою з Test-SevenZipArchiveIntegrity (ArchiveSpecific, ExitCode,
+        # TimedOut) — за нею retention вирішує, чи доведено пошкодження
+        # вмісту. Bool-контракт повернення і політика прапорців не змінені.
+        [AllowNull()][hashtable]$FailureInfo
     )
 
     # T006: fallback-успіх пише WARNING через цей самий Logger (Write-Log
@@ -6775,13 +6780,20 @@ function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
         Logger = { param($Message, $Level) Write-Log $Message -Level $Level }
         LegacyBomFallbackCollector = $script:MaintenanceLegacyBomFallbackArchives
     }
-    # Без -NoFailureFlags виклик ідентичний попередньому (без нових
-    # параметрів); з ним — рядок archive-specific збою пишеться WARNING,
-    # а класифікація збою повертається через FailureInfo.
+    # Без -NoFailureFlags і -FailureInfo виклик ідентичний попередньому
+    # (без нових параметрів); з -NoFailureFlags рядок archive-specific
+    # збою пишеться WARNING, а класифікація збою повертається через
+    # FailureInfo (#422: і в hashtable викликача, якщо його передано).
     $integrityFailureInfo = $null
-    if ($NoFailureFlags) {
+    if ($null -ne $FailureInfo) {
+        $integrityFailureInfo = $FailureInfo
+    } elseif ($NoFailureFlags) {
         $integrityFailureInfo = @{}
+    }
+    if ($NoFailureFlags) {
         $integrityArguments['ArchiveFailureLevel'] = 'WARNING'
+    }
+    if ($null -ne $integrityFailureInfo) {
         $integrityArguments['FailureInfo'] = $integrityFailureInfo
     }
     $integrityValid = Test-SevenZipArchiveIntegrity @integrityArguments
@@ -7023,12 +7035,23 @@ function Remove-OldRestoreArchives {
     $validRestorePointNewerSeen = $false
     $validGroups = @()
     $invalidGroups = @()
+    # #422: явний стан кожної непридатної сесії для aging (InvalidRetentionDays):
+    # PROVEN_DELETABLE — 7-Zip сам забракував вміст УСІХ її архівів;
+    # UNKNOWN — усе інше (hash-файл відсутній/некоректний/не читається/не
+    # збігається, виняток чи збій виконання 7z t). Неможливість довести,
+    # що сесію безпечно видаляти, не є доказом, що її можна видалити.
+    $invalidGroupStates = @{}
     foreach ($group in @($archiveGroups | Sort-Object Name -Descending)) {
         $validArchiveCount = 0
         $isOlderGroup = $validRestorePointNewerSeen
+        $groupAllArchivesProvenCorrupt = $true
+        $groupUnknownReason = $null
         foreach ($archive in @($group.Group)) {
             $hashPath = "$($archive.FullName).sha512"
             $archiveValid = $false
+            # #422: VALID / PROVEN_CORRUPT / UNKNOWN; типово UNKNOWN —
+            # будь-який шлях, що не дійшов до доказу, лишається невідомим.
+            $archiveState = 'UNKNOWN'
             try {
                 if (-not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
                     throw "відсутній hash-файл"
@@ -7049,11 +7072,13 @@ function Remove-OldRestoreArchives {
                 # виконано, це збій виконання, не доказ пошкодження архіву:
                 # fail-closed, прапорці навіть для старшої сесії.
                 $integrityPassed = $false
+                $integrityFailureInfo = @{}
                 try {
                     $integrityPassed = Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
                         -SevenZipPath $ARC_PATH `
                         -ArchivePath $archive.FullName `
-                        -NoFailureFlags:$isOlderGroup
+                        -NoFailureFlags:$isOlderGroup `
+                        -FailureInfo $integrityFailureInfo
                 } catch {
                     $sevenZipIntegrityFailureSeen = $true
                     Write-Log "Перевірку 7z t не виконано: $($archive.Name) — $($_.Exception.Message)" -Level "ERROR"
@@ -7063,12 +7088,40 @@ function Remove-OldRestoreArchives {
                 }
                 if (-not $integrityPassed) {
                     $sevenZipIntegrityFailureSeen = $true
-                    throw "перевірка 7z t не пройдена"
+                    # #422: доказ пошкодження вмісту — лише archive-specific
+                    # збій за канонічним класифікатором (7-Zip відпрацював і
+                    # сам забракував архів); решта — збій виконання перевірки.
+                    # Відхилений пароль — не доказ: байти архіву вже збіглися
+                    # з перевіреним .sha512, тож змінився пароль, а не вміст.
+                    if ($integrityFailureInfo.ContainsKey('PasswordRejected') -and
+                        [bool]$integrityFailureInfo['PasswordRejected']) {
+                        throw "перевірка 7z t не пройдена (7-Zip відхилив пароль — це не доказ пошкодження архіву: SHA512 збігається з перевіреним)"
+                    }
+                    # Доказ — лише власні повідомлення 7-Zip про пошкоджені
+                    # дані (ContentCorruption); непідтримуваний метод чи
+                    # формат — несумісність інструмента, не вмісту.
+                    if ($integrityFailureInfo.ContainsKey('ArchiveSpecific') -and
+                        [bool]$integrityFailureInfo['ArchiveSpecific']) {
+                        if ($integrityFailureInfo.ContainsKey('ContentCorruption') -and
+                            [bool]$integrityFailureInfo['ContentCorruption']) {
+                            $archiveState = 'PROVEN_CORRUPT'
+                            throw "перевірка 7z t не пройдена (7-Zip забракував вміст архіву)"
+                        }
+                        throw "перевірка 7z t не пройдена (7-Zip не зміг перевірити архів: метод стиснення, формат чи версія 7-Zip — це не доказ пошкодження архіву: SHA512 збігається з перевіреним)"
+                    }
+                    throw "перевірка 7z t не пройдена (збій виконання перевірки, не доказ пошкодження архіву)"
                 }
                 $archiveValid = $true
+                $archiveState = 'VALID'
                 $validArchiveCount++
             } catch {
                 Write-Log "Архів реставрації не зараховано як точку відновлення: $($archive.Name) — $($_.Exception.Message)" -Level "WARNING"
+                if ($archiveState -cne 'PROVEN_CORRUPT' -and $null -eq $groupUnknownReason) {
+                    $groupUnknownReason = "$($archive.Name) — $($_.Exception.Message)"
+                }
+            }
+            if ($archiveState -cne 'PROVEN_CORRUPT') {
+                $groupAllArchivesProvenCorrupt = $false
             }
         }
 
@@ -7077,6 +7130,14 @@ function Remove-OldRestoreArchives {
             $validRestorePointNewerSeen = $true
         } else {
             $invalidGroups += $group
+            $invalidGroupState = 'UNKNOWN'
+            if ($groupAllArchivesProvenCorrupt) {
+                $invalidGroupState = 'PROVEN_DELETABLE'
+            }
+            $invalidGroupStates[[string]$group.Name] = @{
+                State = $invalidGroupState
+                Reason = $groupUnknownReason
+            }
         }
     }
 
@@ -7099,9 +7160,32 @@ function Remove-OldRestoreArchives {
             $null -ne $newestInvalidFile -and $newestInvalidFile.LastWriteTime -lt $invalidCutoff
         }
     )
-    if ($staleInvalidGroups.Count -gt 0) {
-        Write-Log "Видаляємо $($staleInvalidGroups.Count) непридатних сесій, старших за $InvalidRetentionDays днів" -Level "WARNING"
-        $groupsToDelete = @($groupsToDelete) + @($staleInvalidGroups)
+    # #422: стару непридатну сесію видаляємо лише за доказом (PROVEN_DELETABLE)
+    # і лише поки після цього прогону лишається хоча б одна підтверджена
+    # точка відновлення ($groupsToKeep, а не всі $validGroups: за
+    # ArchivesKeepCount = 0 придатні сесії теж видаляються): коли
+    # непридатне все, причина швидше системна (пароль, 7-Zip, доступ), ніж
+    # пошкодження кожного архіву. Решта лишається з WARNING, що називає
+    # сесію і причину.
+    $staleDeletableGroups = @()
+    foreach ($staleGroup in $staleInvalidGroups) {
+        $staleGroupState = $invalidGroupStates[[string]$staleGroup.Name]
+        $staleGroupProven = ($null -ne $staleGroupState -and $staleGroupState['State'] -ceq 'PROVEN_DELETABLE')
+        if ($staleGroupProven -and @($groupsToKeep).Count -gt 0) {
+            $staleDeletableGroups += $staleGroup
+        } elseif ($staleGroupProven) {
+            Write-Log "Непридатну сесію $($staleGroup.Name) (старшу за $InvalidRetentionDays днів) НЕ видалено: після прогону не лишається жодної підтвердженої точки відновлення — непридатність усіх сесій може бути системною (пароль, 7-Zip, доступ), а не пошкодженням архівів. Перевірте архіви сесії вручну." -Level "WARNING"
+        } else {
+            $staleGroupReason = 'причину не визначено'
+            if ($null -ne $staleGroupState -and $null -ne $staleGroupState['Reason']) {
+                $staleGroupReason = [string]$staleGroupState['Reason']
+            }
+            Write-Log "Непридатну сесію $($staleGroup.Name) (старшу за $InvalidRetentionDays днів) НЕ видалено: непридатність не доведена — $staleGroupReason. Автоматично видаляється лише сесія, вміст усіх архівів якої забракував 7-Zip; перевірте архіви сесії вручну." -Level "WARNING"
+        }
+    }
+    if ($staleDeletableGroups.Count -gt 0) {
+        Write-Log "Видаляємо $($staleDeletableGroups.Count) непридатних сесій, старших за $InvalidRetentionDays днів (7-Zip забракував вміст усіх їхніх архівів)" -Level "WARNING"
+        $groupsToDelete = @($groupsToDelete) + @($staleDeletableGroups)
     }
 
     if ($groupsToDelete.Count -eq 0) {

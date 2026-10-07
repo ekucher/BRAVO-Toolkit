@@ -2,6 +2,33 @@
 
 ## Не випущено (developer)
 
+- **Fix: retention архівів реставрації більше не видаляє стару непридатну сесію без доказу пошкодження (#422).**
+  `Remove-OldRestoreArchives` видаляв кожну непридатну сесію, старшу за `Retention.FailedArchiveDays` (типово 30 днів),
+  незалежно від причини непридатності: виняток валідатора, таймаут `7z t`, відсутній чи непрацюючий 7-Zip, коди 7/8/255,
+  відмова доступу, відсутній, некоректний, нечитабельний чи невідповідний `.sha512` вели до видалення так само, як
+  доведене пошкодження вмісту, — навіть коли жодної підтвердженої точки відновлення не лишалось. Тепер кожна
+  непридатна сесія має явний стан: `PROVEN_DELETABLE` лише тоді, коли 7-Zip сам забракував вміст УСІХ її архівів
+  (archive-specific за канонічним `Test-BRAVOSevenZipArchiveSpecificFailure`, контракт #300/#394), інакше — `UNKNOWN`.
+  Відхилений пароль («Wrong password») доказом не є: 7z t запускається лише після збігу SHA512 з перевіреним `.sha512`,
+  тож вміст не змінився, а змінився пароль (`Test-SevenZipArchiveIntegrity` записує у `-FailureInfo` ознаку
+  `PasswordRejected`; рівень рядка і коди класифікатора не змінено). Так само не є доказом непідтримуваний метод
+  стиснення чи формат: `PROVEN_CORRUPT` дає лише ознака `ContentCorruption` (власні повідомлення 7-Zip про CRC,
+  Data Error, пошкоджені заголовки чи обрив даних).
+  Стара сесія видаляється лише в стані `PROVEN_DELETABLE` і лише поки після прогону лишається хоча б одна підтверджена
+  точка відновлення (за `ArchivesKeepCount = 0` — ніколи);
+  коли непридатне все, причина швидше системна (пароль, 7-Zip, доступ), і не видаляється нічого. Кожна збережена
+  стара сесія дає WARNING з назвою сесії і причиною («НЕ видалено: непридатність не доведена — …»), тож оператор
+  бачить, що її треба перевірити вручну (WARNING з'являється в ті прогони, коли retention запускається, тобто коли
+  сесій більше за `Restore.ArchivesKeepCount`; умову запуску не змінено). Звичайний retention валідних сесій понад `Restore.ArchivesKeepCount`, прапорці
+  `criticalErrorOccurred`/`restoreIntegrityFailed` і коди завершення не змінено; `Test-BRAVOMaintenanceSevenZipArchiveIntegrity`
+  отримав необов'язковий `-FailureInfo` (bool-контракт повернення і політика прапорців ті самі). Тести:
+  `Maintenance/RetentionStaleSessionKeptOnValidationFailure/*` (виняток валідатора, таймаут, немає 7-Zip, коди 7/8/255,
+  відмова доступу з `System ERROR` і локалізована), `Maintenance/RetentionStaleSessionKeptOnHashFileProblem/*`
+  (немає, некоректний, невідповідний, нечитабельний `.sha512`), `Maintenance/RetentionStaleMixedSessionKeptWhenNotAllArchivesProvenCorrupt`,
+  `Maintenance/RetentionNoValidRestorePointNothingInvalidDeleted`; характеризація без змін:
+  `Maintenance/RetentionStaleProvenCorruptSessionStillDeleted`, `Maintenance/RetentionStaleValidSessionBeyondKeepCountStillDeleted`.
+  `UnreadableHash` доказовий на Windows (блокування файлу без спільного доступу; приймальний прогін — Windows CI).
+
 - **CI: ручний прогін (workflow_dispatch) більше не падає на gitleaks через чужі гілки.**
   На `workflow_dispatch` gitleaks-action не має діапазону комітів і запускає `gitleaks detect` без `--log-opts`,
   тобто `git log --all`. Checkout з `fetch-depth: 0` приносить усі гілки репозиторію як `refs/remotes/origin/*`,
