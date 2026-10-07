@@ -6216,11 +6216,26 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
             if (-not [string]::IsNullOrWhiteSpace($sourcePath)) {
                 try {
                     if (Test-Path -LiteralPath $sourcePath) {
-                        $rootLength = [IO.Path]::GetFullPath($sourcePath).TrimEnd('\', '/').Length
+                        # Довжина кореня — лише для відносних імен. Якщо шлях
+                        # не вдається нормалізувати (довгий шлях на старому
+                        # .NET), корінь 0: ім'я рахується повністю, тобто з
+                        # запасом, а не робить межу невідомою.
+                        $rootLength = 0
+                        try {
+                            $rootFullName = [string](Get-Item -LiteralPath $sourcePath -Force -ErrorAction Stop).FullName
+                            $rootLength = $rootFullName.TrimEnd('\', '/').Length
+                        } catch {
+                            $rootLength = 0
+                        }
                         $measuredBytes = [int64]0
                         $measuredFiles = [int64]0
                         $measuredNameBytes = [int64]0
-                        foreach ($sourceFile in (Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force -ErrorAction Stop)) {
+                        # Потоково (конвеєр), а не foreach по готовому масиву:
+                        # на дереві з мільйонами файлів не тримати всі FileInfo
+                        # у пам'яті. ForEach-Object виконується в цій самій
+                        # області, тож лічильники накопичуються тут.
+                        Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force -ErrorAction Stop | ForEach-Object {
+                            $sourceFile = $_
                             $measuredBytes += [int64]$sourceFile.Length
                             $measuredFiles++
                             # Відносне ім'я, як його збереже 7-Zip (UTF-16:
