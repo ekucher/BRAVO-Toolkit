@@ -6984,6 +6984,37 @@ function Process-OldData {
     Compress-OldData -ParentPath $Path -ArchiveNamePrefix $ArchiveNamePrefix -RetentionDays $RetentionDays -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
 }
 
+# #424 (review): канонічний перелік основних архівів реставрації
+# (before/after .mdz, без .sha512) для Main і для Remove-OldRestoreArchives.
+# Відсутній каталог — успішний порожній перелік, як і раніше. Збій самого
+# переліку (відмова доступу тощо) НЕ плутається з порожнім каталогом:
+# ERROR, прапорці critical/restoreIntegrityFailed (exit 41) і Failed =
+# $true, а частковий перелік не повертається. Викликач за Failed не
+# перевіряє й не видаляє жодної сесії в цьому циклі (#422: невідомий стан
+# → не видаляти).
+function Get-BRAVORestoreArchiveMainFiles {
+    param(
+        [string]$Path,
+        [string]$ArchivePrefix
+    )
+
+    if (-not (Test-Path $Path)) {
+        return @{ Files = @(); Failed = $false }
+    }
+    $enumeratedFiles = @()
+    try {
+        foreach ($archivePattern in @("${ArchivePrefix}_before_*.mdz", "${ArchivePrefix}_after_*.mdz")) {
+            $enumeratedFiles += @(Get-ChildItem -Path $Path -Filter $archivePattern -ErrorAction Stop)
+        }
+    } catch {
+        Write-Log "Не вдалося отримати перелік архівів реставрації у ${Path}: $($_.Exception.Message). Перевірку придатності й retention сесій реставрації в цьому циклі пропущено, жодну сесію не видалено." -Level "ERROR"
+        $script:criticalErrorOccurred = $true
+        $script:restoreIntegrityFailed = $true
+        return @{ Files = @(); Failed = $true }
+    }
+    return @{ Files = $enumeratedFiles; Failed = $false }
+}
+
 # Функція видалення старих архівів реставрації (за кількістю версій)
 function Remove-OldRestoreArchives {
     param(
@@ -7002,16 +7033,14 @@ function Remove-OldRestoreArchives {
         return
     }
 
-    # Шаблони для пошуку основних архівів (без .sha512)
-    $mainArchivePatterns = @(
-        "${ArchivePrefix}_before_*.mdz",
-        "${ArchivePrefix}_after_*.mdz"
-    )
-
-    # Збираємо основні архіви (без контрольних сум)
-    $mainArchiveFiles = @($mainArchivePatterns | ForEach-Object {
-        Get-ChildItem -Path $Path -Filter $_ -ErrorAction SilentlyContinue
-    })
+    # Збираємо основні архіви (без контрольних сум). #424 (review): збій
+    # переліку — ERROR і прапорці exit 41 уже записано; жодної перевірки
+    # чи видалення за неповним переліком.
+    $mainArchiveEnumeration = Get-BRAVORestoreArchiveMainFiles -Path $Path -ArchivePrefix $ArchivePrefix
+    if ($mainArchiveEnumeration.Failed) {
+        return
+    }
+    $mainArchiveFiles = @($mainArchiveEnumeration.Files)
 
     if (-not $mainArchiveFiles -or $mainArchiveFiles.Count -eq 0) {
         Write-Log "Немає основних архівів реставрації для обробки у $Path" -Level "DEBUG"
@@ -11316,10 +11345,12 @@ if ($BravoMaintenanceEnabled) {
              $_.Name -like "restore_done_*.marker")
         })
 
-    $mainArchivePatterns = @("${ArchivePrefix}_before_*.mdz", "${ArchivePrefix}_after_*.mdz")
-    $mainArchiveFiles = @($mainArchivePatterns | ForEach-Object {
-        Get-ChildItem -Path $ARC_DIR -Filter $_ -ErrorAction SilentlyContinue
-    })
+    # #424 (review): той самий канонічний перелік, що й у
+    # Remove-OldRestoreArchives. За збою (ERROR і прапорці exit 41 уже
+    # записано) груп 0, тож гейт нижче не запускає ні retention, ні
+    # перевірку: за невідомого стану нічого не видаляється.
+    $restoreArchiveEnumeration = Get-BRAVORestoreArchiveMainFiles -Path $ARC_DIR -ArchivePrefix $ArchivePrefix
+    $mainArchiveFiles = @($restoreArchiveEnumeration.Files)
 
     if ($mainArchiveFiles.Count -gt 0) {
         $archiveGroups = $mainArchiveFiles | Group-Object {
@@ -11532,10 +11563,17 @@ if ($BravoMaintenanceEnabled -and $restoreArchiveDeleteCandidateGroups.Count -gt
 $cleanupOperationDirCandidateCount = $traceOldDirs.Count + $exchangAPIOldDirs.Count +
     $apacheOldDirs.Count + $bravoWebAppOldDirs.Count + $bravoWebLegacyOldDirs.Count
 $cleanupOperationFileCandidateCount = $traceOldLogs.Count + $expiredCompressedLogCount
+# #424 (review): WARN/FAIL мають пріоритет над SKIPPED. Перевірка сесій
+# реставрації в режимі лише перевірки чи збій їх переліку не роблять
+# $hasDataToClean істинним, але можуть дати WARNING або ERROR із exit 41;
+# крок і stepsError не повинні це приховувати. Без нових попереджень і
+# помилок за $hasDataToClean = false крок, як і раніше, SKIPPED.
 $cleanupOperationStatus = Get-BRAVOMaintenanceStepStatus `
     -CriticalBefore $cleanupCriticalBefore `
-    -WarningsBefore $cleanupWarningsBefore `
-    -Skipped:(-not $hasDataToClean)
+    -WarningsBefore $cleanupWarningsBefore
+if ($cleanupOperationStatus -eq 'OK' -and -not $hasDataToClean) {
+    $cleanupOperationStatus = 'SKIPPED'
+}
 $cleanupOperationDetails = if ($cleanupOperationStatus -eq 'SKIPPED') {
     'даних для очищення немає'
 } elseif ($cleanupOperationStatus -eq 'WARN' -or $cleanupOperationStatus -eq 'FAIL') {

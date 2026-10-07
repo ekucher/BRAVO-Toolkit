@@ -15,11 +15,24 @@
   сесій ≤ `ArchivesKeepCount` Maintenance щоночі виконує `7z t` для цих сесій; непридатна сесія дає exit 10
   (WARNING), а непридатна найновіша чи єдина точка відновлення — exit 41. Гейт звичайного retention (сесій більше за
   `ArchivesKeepCount`, поточна restore-сесія не аварійна) і саме видалення не змінено; за аварійної restore-сесії
-  перевірка, як і retention, пропускається з тим самим WARNING. Тести:
+  перевірка, як і retention, пропускається з тим самим WARNING. Крок «Очистка старих даних/логів» тепер показує WARN
+  або FAIL (і рахується в `stepsError`), коли за цей крок з'явилися WARNING чи помилка з прапорцями exit 41, навіть якщо
+  застарілих даних для очищення немає. Раніше перевірка лише-перевірки не вважалась роботою кроку, і крок лишався
+  SKIPPED за exit 41. Без нових попереджень і помилок крок, як і раніше, SKIPPED «даних для очищення немає».
+  Перелік архівів реставрації (спільний `Get-BRAVORestoreArchiveMainFiles` для Main і `Remove-OldRestoreArchives`)
+  відрізняє збій від порожнього каталогу. Раніше `Get-ChildItem -ErrorAction SilentlyContinue` за відмови доступу давав
+  0 архівів (нічна перевірка мовчки пропускалась) або лише частину, і частковий перелік ішов у retention. Тепер за збою
+  переліку пишеться ERROR «Не вдалося отримати перелік архівів реставрації», виставляються
+  `criticalErrorOccurred`/`restoreIntegrityFailed` (exit 41), а в цьому циклі не виконується ні перевірка, ні retention:
+  не видаляється нічого. Відсутній каталог, як і раніше, дає порожній перелік без помилки. Тести:
   `Maintenance/RetentionReportOnlyStaleSessionWarnsWithinKeepCount`,
   `Maintenance/RetentionReportOnlyNeverDeletesProvenCorrupt`,
   `Maintenance/RetentionReportOnlySingleBrokenSessionSetsFailureFlags`,
-  `Maintenance/RetentionReportOnlyMainBranchWithinKeepCount`.
+  `Maintenance/RetentionReportOnlyMainBranchWithinKeepCount`,
+  `Maintenance/RetentionReportOnlyCleanupStepReportsFailure`,
+  `Maintenance/RestoreArchiveEnumerationFailureNoDeletion`,
+  `Maintenance/RestoreArchiveEnumerationDistinguishesFailureFromEmpty`,
+  `Maintenance/RestoreArchiveMainEnumerationUsesCanonicalHelper`.
 
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
