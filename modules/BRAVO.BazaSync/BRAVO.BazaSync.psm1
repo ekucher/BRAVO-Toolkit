@@ -602,7 +602,9 @@ function Invoke-BRAVOBazaFileUpload {
         # "довших імен": обрив передачі великого BAZA-файлу без resume
         # коштує дорожче, ніж 9 байт запасу в імені.
         $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::On
-        $transferResult = $Session.PutFiles($Entry.FullPath, $remoteFullPath, $false, $transferOptions)
+        # Локальне джерело PutFiles — маска WinSCP (#366): BAZA-ім'я з
+        # `[`/`]` без екранування збіглося б із сусіднім файлом.
+        $transferResult = $Session.PutFiles((ConvertTo-BRAVOWinSCPFileMask -Path $Entry.FullPath), $remoteFullPath, $false, $transferOptions)
         if (-not $transferResult.IsSuccess) {
             $failureMessages = @(
                 $transferResult.Transfers | Where-Object { $null -ne $_.Error } |
@@ -2071,7 +2073,8 @@ function Invoke-BRAVOBazaMutationAcceptanceCore {
         $remoteFullPath = ($RemoteRootPath.TrimEnd('/') + '/' + $acceptPath.Replace('\', '/'))
         try {
             if ($Session.FileExists($remoteFullPath)) {
-                $Session.MoveFile($remoteFullPath, $remoteFullPath + $renameSuffix)
+                # Джерело MoveFile — маска WinSCP (#366).
+                $Session.MoveFile((ConvertTo-BRAVOWinSCPFileMask -Path $remoteFullPath), $remoteFullPath + $renameSuffix)
                 $result.RenamedRemote += [pscustomobject]@{ RelativePath = $acceptPath; RemotePath = $remoteFullPath; RenamedTo = $remoteFullPath + $renameSuffix }
             } else {
                 # Remote відсутній (нетиповий стан: state вірив, файлу
