@@ -1142,6 +1142,8 @@ Test-BRAVOCondition `
 # Invoke-AsSystem, чий try-оператор цілком лежить ДО запуску worker-а
 # ($registeredTask.Run(...)). Так майбутня правка не позначить виняток
 # після запуску (таймаут, FatalError) як безпечний для відкоту.
+# Єдиний виняток (#302 follow-up): New-SystemWorkerFatalError, і лише в
+# if, умова якого вимагає булевого OperationsStarted від worker-а.
 $credMarkerParseErrors = $null
 $credMarkerAst = [System.Management.Automation.Language.Parser]::ParseInput(
     $credRollbackText, [ref]$null, [ref]$credMarkerParseErrors
@@ -1158,6 +1160,12 @@ $credMarkerAllCalls = @($credMarkerAst.FindAll({
 }, $true))
 $credMarkerLaunchCalls = @()
 $credMarkerCalls = @()
+$credMarkerFatalCalls = @()
+$credMarkerFatalFunctions = @($credMarkerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'New-SystemWorkerFatalError'
+}, $true))
 $credMarkerViolations = New-Object System.Collections.ArrayList
 if ($credMarkerFunctions.Count -eq 1) {
     $credMarkerLaunchCalls = @($credMarkerFunctions[0].Body.FindAll({
@@ -1171,6 +1179,37 @@ if ($credMarkerFunctions.Count -eq 1) {
         $node -is [System.Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -eq 'Add-SystemWorkerNotStartedMarker'
     }, $true))
+}
+if ($credMarkerFatalFunctions.Count -eq 1) {
+    $credMarkerFatalCalls = @($credMarkerFatalFunctions[0].Body.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Add-SystemWorkerNotStartedMarker'
+    }, $true))
+    foreach ($credMarkerFatalCall in $credMarkerFatalCalls) {
+        $credMarkerIf = $credMarkerFatalCall.Parent
+        while ($null -ne $credMarkerIf -and
+            -not ($credMarkerIf -is [System.Management.Automation.Language.IfStatementAst]) -and
+            -not ($credMarkerIf -is [System.Management.Automation.Language.FunctionDefinitionAst])) {
+            $credMarkerIf = $credMarkerIf.Parent
+        }
+        $credMarkerIfGuarded = $false
+        if ($credMarkerIf -is [System.Management.Automation.Language.IfStatementAst]) {
+            foreach ($credMarkerClause in $credMarkerIf.Clauses) {
+                $credMarkerConditionText = [string]$credMarkerClause.Item1.Extent.Text
+                if ($credMarkerClause.Item2.Extent.StartOffset -le $credMarkerFatalCall.Extent.StartOffset -and
+                    $credMarkerClause.Item2.Extent.EndOffset -ge $credMarkerFatalCall.Extent.EndOffset -and
+                    $credMarkerConditionText -match 'OperationsStarted' -and
+                    $credMarkerConditionText -match '-is\s+\[bool\]' -and
+                    $credMarkerConditionText -match '-not\s+\$\w+\.Value') {
+                    $credMarkerIfGuarded = $true
+                }
+            }
+        }
+        if (-not $credMarkerIfGuarded) {
+            [void]$credMarkerViolations.Add("line $($credMarkerFatalCall.Extent.StartLineNumber): маркер у New-SystemWorkerFatalError поза if (булеве OperationsStarted = `$false)")
+        }
+    }
 }
 if ($credMarkerLaunchCalls.Count -eq 1) {
     $credMarkerLaunchStart = $credMarkerLaunchCalls[0].Extent.StartOffset
@@ -1199,8 +1238,198 @@ Test-BRAVOCondition `
         $credMarkerFunctions.Count -eq 1 -and
         $credMarkerLaunchCalls.Count -eq 1 -and
         $credMarkerCalls.Count -ge 2 -and
-        $credMarkerAllCalls.Count -eq $credMarkerCalls.Count -and
+        $credMarkerFatalCalls.Count -le 1 -and
+        $credMarkerAllCalls.Count -eq ($credMarkerCalls.Count + $credMarkerFatalCalls.Count) -and
         $credMarkerViolations.Count -eq 0
     ) `
     -Name 'Credentials/SystemWorkerNotStartedMarkerOnlyBeforeTaskLaunch' `
-    -Failure "Add-SystemWorkerNotStartedMarker дозволено лише в catch-блоках Invoke-AsSystem, чий try цілком лежить до `$registeredTask.Run(...) (запуск SYSTEM worker-а); факт: functions=$($credMarkerFunctions.Count) runCalls=$($credMarkerLaunchCalls.Count) markers=$($credMarkerCalls.Count) markersInFile=$($credMarkerAllCalls.Count) violations='$(@($credMarkerViolations) -join '; ')'"
+    -Failure "Add-SystemWorkerNotStartedMarker дозволено лише в catch-блоках Invoke-AsSystem, чий try цілком лежить до `$registeredTask.Run(...) (запуск SYSTEM worker-а); факт: functions=$($credMarkerFunctions.Count) runCalls=$($credMarkerLaunchCalls.Count) markers=$($credMarkerCalls.Count) fatalMarkers=$($credMarkerFatalCalls.Count) markersInFile=$($credMarkerAllCalls.Count) violations='$(@($credMarkerViolations) -join '; ')'"
+
+# #302 (follow-up): FatalError worker-а ПІСЛЯ Run. Worker повідомляє
+# OperationsStarted=$false лише коли впав до першої операції зі сховищем
+# (конфігурація, читання payload); тоді виняток позначається «не розпочато»
+# і поточне сховище відкочується. Відсутнє поле або будь-що, крім булевого
+# $false, лишається невизначеним станом (fail-safe).
+$credFatalModule = $null
+$credFatalModuleError = $null
+try {
+    $credFatalModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $credRollbackText `
+        -FunctionNames @(
+            'New-SystemWorkerFatalError',
+            'Add-SystemWorkerNotStartedMarker', 'Test-SystemWorkerNotStartedError'
+        )
+} catch {
+    $credFatalModuleError = $_.Exception.Message
+}
+$credFatalCases = @()
+if ($null -ne $credFatalModule) {
+    $credFatalCases = @(& $credFatalModule {
+        $responses = [ordered]@{
+            NotStarted = [pscustomobject]@{ FatalError = 'stub: config load failed'; OperationsStarted = $false }
+            Started = [pscustomobject]@{ FatalError = 'stub: store write failed'; OperationsStarted = $true }
+            Legacy = [pscustomobject]@{ FatalError = 'stub: legacy worker' }
+            NonBool = [pscustomobject]@{ FatalError = 'stub: odd worker'; OperationsStarted = 'false' }
+        }
+        foreach ($caseName in $responses.Keys) {
+            $caseException = New-SystemWorkerFatalError -WorkerResponse $responses[$caseName]
+            $caseRecord = $null
+            try { throw $caseException } catch { $caseRecord = $_ }
+            [pscustomobject]@{
+                Case = $caseName
+                Message = [string]$caseException.Message
+                NotStarted = [bool](Test-SystemWorkerNotStartedError -ErrorRecord $caseRecord)
+            }
+        }
+    })
+}
+$credFatalByCase = @{}
+foreach ($credFatalCase in $credFatalCases) { $credFatalByCase[$credFatalCase.Case] = $credFatalCase }
+$credFatalSummary = (@($credFatalCases) | ForEach-Object { "$($_.Case)=$($_.NotStarted)/'$($_.Message)'" }) -join '; '
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credFatalModuleError -and
+        $credFatalByCase.ContainsKey('NotStarted') -and
+        $credFatalByCase['NotStarted'].NotStarted -and
+        $credFatalByCase['NotStarted'].Message -eq 'stub: config load failed'
+    ) `
+    -Name 'Credentials/SystemWorkerFatalBeforeOperationsIsNotStarted' `
+    -Failure "FatalError worker-а з OperationsStarted=`$false (впав до операцій зі сховищем) мусить давати виняток з маркером «не розпочато» і текстом FatalError; факт: moduleError='$credFatalModuleError' cases='$credFatalSummary'"
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credFatalModuleError -and
+        $credFatalByCase.ContainsKey('Started') -and $credFatalByCase.ContainsKey('Legacy') -and $credFatalByCase.ContainsKey('NonBool') -and
+        -not $credFatalByCase['Started'].NotStarted -and
+        -not $credFatalByCase['Legacy'].NotStarted -and
+        -not $credFatalByCase['NonBool'].NotStarted -and
+        $credFatalByCase['Started'].Message -eq 'stub: store write failed' -and
+        $credFatalByCase['Legacy'].Message -eq 'stub: legacy worker'
+    ) `
+    -Name 'Credentials/SystemWorkerFatalAfterOperationsStaysIndeterminate' `
+    -Failure "FatalError з OperationsStarted=`$true, без поля (старий worker) або з не-булевим значенням лишається невизначеним станом (без маркера); факт: moduleError='$credFatalModuleError' cases='$credFatalSummary'"
+
+# Worker-бік: OperationsStarted у result.json справжньої
+# Invoke-ProtectedPayloadWorker. Заглушки лише на межі читання payload,
+# дешифрування і самої транзакції сховища.
+$credWorkerStubText = @'
+function Read-BRAVOTextFile {
+    param([string]$Path)
+    if ($script:credWorkerScenario -eq 'PayloadUnreadable') { throw 'stub: payload unreadable' }
+    return 'stub-payload'
+}
+function ConvertFrom-BRAVOJson {
+    param([Parameter(ValueFromPipeline = $true)][string]$InputObject)
+    process {
+        return [pscustomobject]@{
+            Action = 'Remove'
+            Entries = @([pscustomobject]@{ Component = 'COMP'; Target = 'TARGET'; UserName = 'user'; ProtectedSecret = '' })
+        }
+    }
+}
+function ConvertTo-BRAVOJson {
+    param([Parameter(ValueFromPipeline = $true)]$InputObject, [int]$Depth = 4)
+    process { return ($InputObject | ConvertTo-Json -Depth $Depth) }
+}
+function Unprotect-LocalMachineSecret { param([string]$ProtectedValue) return $null }
+function Invoke-CredentialOperationsTransactional {
+    param([string]$Operation, $Entries)
+    if ($script:credWorkerScenario -eq 'StoreFailure') { throw 'stub: store write failed' }
+    return @([pscustomobject]@{ Component = 'COMP'; Target = 'TARGET'; Status = 'Removed'; Message = '' })
+}
+'@
+$credWorkerModule = $null
+$credWorkerModuleError = $null
+try {
+    $credWorkerModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($credRollbackText + "`r`n" + $credWorkerStubText) `
+        -PreferLastDefinitionOnDuplicate `
+        -FunctionNames @(
+            'Invoke-ProtectedPayloadWorker',
+            'Read-BRAVOTextFile', 'ConvertFrom-BRAVOJson', 'ConvertTo-BRAVOJson',
+            'Unprotect-LocalMachineSecret', 'Invoke-CredentialOperationsTransactional'
+        )
+} catch {
+    $credWorkerModuleError = $_.Exception.Message
+}
+$credWorkerRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CRED_WORKER_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($credWorkerRoot)
+$credWorkerOutcomes = @{}
+try {
+    if ($null -ne $credWorkerModule) {
+        foreach ($credWorkerScenario in @('PayloadUnreadable', 'StoreFailure', 'Success')) {
+            $credWorkerResultPath = Join-Path $credWorkerRoot "$credWorkerScenario.json"
+            $credWorkerOutcomes[$credWorkerScenario] = & $credWorkerModule {
+                param($Scenario, $ResultPath)
+                $script:credWorkerScenario = $Scenario
+                $workerThrew = $null
+                try {
+                    Invoke-ProtectedPayloadWorker -PayloadPath 'C:\stub\payload.json' -WorkerResultPath $ResultPath
+                } catch {
+                    $workerThrew = $_.Exception.Message
+                }
+                $response = $null
+                if (Test-Path -LiteralPath $ResultPath -PathType Leaf) {
+                    $response = [IO.File]::ReadAllText($ResultPath) | ConvertFrom-Json
+                }
+                $hasField = ($null -ne $response -and $null -ne $response.PSObject.Properties['OperationsStarted'])
+                [pscustomobject]@{
+                    Threw = $workerThrew
+                    HasField = $hasField
+                    OperationsStarted = if ($hasField) { $response.OperationsStarted } else { $null }
+                    FatalError = if ($null -ne $response) { [string]$response.FatalError } else { $null }
+                }
+            } $credWorkerScenario $credWorkerResultPath
+        }
+    }
+} finally {
+    Remove-Item -LiteralPath $credWorkerRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+$credWorkerSummary = (@($credWorkerOutcomes.Keys | Sort-Object) | ForEach-Object {
+    $o = $credWorkerOutcomes[$_]
+    "$_=field:$($o.HasField)/started:$($o.OperationsStarted)/fatal:'$($o.FatalError)'/threw:'$($o.Threw)'"
+}) -join '; '
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credWorkerModuleError -and
+        $credWorkerOutcomes.ContainsKey('PayloadUnreadable') -and
+        $credWorkerOutcomes.ContainsKey('StoreFailure') -and
+        $credWorkerOutcomes.ContainsKey('Success') -and
+        $credWorkerOutcomes['PayloadUnreadable'].HasField -and
+        $credWorkerOutcomes['PayloadUnreadable'].OperationsStarted -is [bool] -and
+        -not $credWorkerOutcomes['PayloadUnreadable'].OperationsStarted -and
+        $credWorkerOutcomes['PayloadUnreadable'].FatalError -eq 'stub: payload unreadable' -and
+        $credWorkerOutcomes['StoreFailure'].HasField -and
+        $credWorkerOutcomes['StoreFailure'].OperationsStarted -eq $true -and
+        $credWorkerOutcomes['StoreFailure'].FatalError -eq 'stub: store write failed' -and
+        $credWorkerOutcomes['Success'].HasField -and
+        $credWorkerOutcomes['Success'].OperationsStarted -eq $true -and
+        [string]::IsNullOrEmpty($credWorkerOutcomes['Success'].FatalError)
+    ) `
+    -Name 'Credentials/ProtectedPayloadWorkerReportsOperationsStarted' `
+    -Failure "Invoke-ProtectedPayloadWorker мусить писати OperationsStarted: `$false для збою до операцій зі сховищем (payload) і `$true, щойно почалась транзакція сховища (збій або успіх); факт: moduleError='$credWorkerModuleError' $credWorkerSummary"
+
+# Збій worker-режиму ДО Invoke-ProtectedPayloadWorker (конфігурація,
+# модулі — детермінований тригер #302) пишеться загальним catch скрипта:
+# OperationsStarted там береться з прапорця входу у worker-функцію.
+$credWorkerFunctionAst = @($credMarkerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Invoke-ProtectedPayloadWorker'
+}, $true))
+$credWorkerFirstStatement = if ($credWorkerFunctionAst.Count -eq 1 -and
+    $null -ne $credWorkerFunctionAst[0].Body.EndBlock -and
+    @($credWorkerFunctionAst[0].Body.EndBlock.Statements).Count -gt 0) {
+    [string]@($credWorkerFunctionAst[0].Body.EndBlock.Statements)[0].Extent.Text
+} else { '' }
+$credFailureResponseMatch = [regex]::Match(
+    $credRollbackText,
+    '(?s)\$failureResponse\s*=\s*@\{(?<body>.*?)\}\s*\|\s*ConvertTo-BRAVOJson'
+)
+Test-BRAVOCondition `
+    -Condition (
+        $credWorkerFirstStatement -match '^\$script:BRAVOCredentialWorkerEntered\s*=\s*\$true$' -and
+        $credFailureResponseMatch.Success -and
+        $credFailureResponseMatch.Groups['body'].Value -match 'OperationsStarted\s*=\s*\[bool\]\s*\(\s*Get-Variable\s+-Name\s+BRAVOCredentialWorkerEntered\s+-Scope\s+Script\s+-ValueOnly\s+-ErrorAction\s+SilentlyContinue\s*\)'
+    ) `
+    -Name 'Credentials/WorkerModeFailureReportsOperationsStartedFromEntryFlag' `
+    -Failure "Invoke-ProtectedPayloadWorker має першим оператором ставити `$script:BRAVOCredentialWorkerEntered = `$true, а загальний catch worker-режиму — писати OperationsStarted = [bool](Get-Variable -Name BRAVOCredentialWorkerEntered -Scope Script -ValueOnly -ErrorAction SilentlyContinue); факт: first='$credWorkerFirstStatement' failureResponse=$($credFailureResponseMatch.Success)"
