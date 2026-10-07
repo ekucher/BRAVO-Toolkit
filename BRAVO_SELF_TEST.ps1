@@ -15740,6 +15740,15 @@ try {
         # exchangAPI вимкнена оператором (Disabled) — працює, але не керується.
         $probeRestoreSeed = @('$exchangAPIServiceEnabled = $false', '$exchangAPIServiceDisabled = $true') -join "`n"
     }
+    # #314: необов'язковий seed сценарію (scenario-seed.ps1 у каталозі
+    # сценарію) — останнє слово перед оркестрацією. Ним користуються
+    # характеризаційні сценарії циклу служб (suite ServiceRecovery), яким
+    # потрібні значення поза наборами за іменем сценарію вище.
+    $probeScenarioSeedPath = Join-Path $ProbeRoot 'scenario-seed.ps1'
+    $probeScenarioSeedFile = ''
+    if (Test-Path -LiteralPath $probeScenarioSeedPath -PathType Leaf) {
+        $probeScenarioSeedFile = [IO.File]::ReadAllText($probeScenarioSeedPath, [Text.Encoding]::UTF8)
+    }
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
         'function Invoke-BRAVOMaintenanceOrchestrationProbe {',
@@ -15749,6 +15758,7 @@ try {
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
         $probeRestoreSeed,
+        $probeScenarioSeedFile,
         'try {',
         $probeRegion.ToString(),
         ('} finally ' + $probeOuterTry.Finally.Extent.Text),
@@ -21483,6 +21493,14 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
         if (Enter-BRAVOSelfTestSection -Name 'Suite/ServiceQuiescence') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceQuiescence.ps1')
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceQuiescence' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ServiceRecovery') {
+        Enter-BRAVOSelfTestSuite -Name 'ServiceRecovery'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ServiceRecovery') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceRecovery.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceRecovery' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Enter-BRAVOSelfTestSection -Name 'Root/SizeSanity') { try {

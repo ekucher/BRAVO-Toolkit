@@ -25,7 +25,7 @@ $script:BRAVOSelfTestSuiteCatalog = @(
     'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
     'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
     'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
-    'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence',
+    'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence', 'ServiceRecovery',
     'SftpCredentialsRequired', 'Status', 'TraceArchive'
 )
 
