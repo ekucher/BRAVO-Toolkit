@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Fix: Maintenance: критична помилка без запису в чергах дає алерт за `errors_only` (#298).**
+  Багато місць (ротація логів, архів і SFTP Trace, BRAVO_ARCHIV, перевірки 7-Zip) ставлять лише
+  `criticalErrorOccurred` і не додають запис у `CriticalErrorsList`, тож `Send-FinalReport` за `errors_only`
+  повертався нічого не надіславши, хоча прогін завершувався кодом 60. Тепер `criticalErrorOccurred` без записів
+  у `CriticalErrorsList` є окремою причиною: надсилається один CRITICAL-алерт з узагальненим текстом «без
+  детальної причини» і шляхом до журналу. Коли `CriticalErrorsList` непорожній, повідомлення не змінюється
+  (без дубля), успішний прогін за `errors_only` і далі нічого не надсилає, коди завершення не змінено.
+  Маршрутизація кожного місця окремо не робилась. Тести: `Maintenance/CriticalFlagWithoutEntriesAlertsInErrorsOnly`,
+  `Maintenance/NoCriticalFlagSendsNothingInErrorsOnly`, `Maintenance/CriticalFlagWithEntryKeepsExistingMessage`.
 - **Fix: Archive: `MUTATION_AUTO_ARCHIVED` більше не вважається збоєм SFTP (#285).**
   `Invoke-BRAVOBazaCanonicalSync` вважала успіхом лише `COMPLETE`, тому цикл з легітимною мутацією в межах
   `AutoArchiveMutationThreshold` (INFO за `OPERATIONS.md` і Health) завершувався exit 50 з порожньою причиною
