@@ -20707,8 +20707,17 @@ try {
         $t006FallbackTimeoutPath = Join-Path ([IO.Path]::GetTempPath()) 'fallbacktimeout_MODEL.7z'
         $t006FallbackTimeoutResult = Invoke-BRAVOSevenZipIntegrityTest `
             -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackTimeoutPath -Password $t006Secret -TimeoutSeconds 5
-        $t006WrongLegacyResult = Invoke-BRAVOSevenZipIntegrityTest `
-            -SevenZipPath 'stub-7za' -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'normal_WRONG.7z') -Password ([char]0xFEFF + $t006Secret) -TimeoutSeconds 5
+        # #394: класифікатор перевіряє, що архів читається (незалежна від мови
+        # ознака збою виконання), тож «завершена перевірка з кодом 2» моделюється
+        # реальним файлом, як у production, де 7-Zip його прочитав.
+        $t006WrongLegacyPath = Join-Path ([IO.Path]::GetTempPath()) ('normal_WRONG_{0}.7z' -f [guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($t006WrongLegacyPath, 'T006:wrong-legacy-fixture')
+        try {
+            $t006WrongLegacyResult = Invoke-BRAVOSevenZipIntegrityTest `
+                -SevenZipPath 'stub-7za' -ArchivePath $t006WrongLegacyPath -Password ([char]0xFEFF + $t006Secret) -TimeoutSeconds 5
+        } finally {
+            Remove-Item -LiteralPath $t006WrongLegacyPath -Force -ErrorAction SilentlyContinue
+        }
         $t006FallbackTimeoutInfo = @{}
         $t006FallbackTimeoutEntries = New-Object System.Collections.Generic.List[object]
         $t006FallbackTimeoutLogger = & { param($t006FallbackTimeoutEntries) { param($Message, $Level) $t006FallbackTimeoutEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006FallbackTimeoutEntries
