@@ -87,6 +87,31 @@ function Initialize-BRAVOHealthSteps {
     $script:BRAVOHealthLastStepTime = Get-Date
 }
 
+function Get-BRAVOHealthCleanRunNotificationPlan {
+    # Чи надсилати Slack/Discord-звіт прогону без issue і з якою severity.
+    # Порожній каталог, що раніше мав дані (#301), - WARNING: звіт іде
+    # маршрутом alerts і в режимі errors_only, незалежно від NotifyOnSuccess,
+    # як і код завершення 10. Без нього - як раніше: SUCCESS лише за
+    # NotifyOnSuccess/ForceNotification у режимі all.
+    param(
+        [bool]$NotifyOnSuccess,
+        [bool]$ForceNotification,
+        [bool]$NoSlack,
+        [string]$NotificationMode,
+        [int]$EmptySourceWarningCount
+    )
+
+    $warned = $EmptySourceWarningCount -gt 0
+    $send = (-not $NoSlack) -and (
+        (($NotifyOnSuccess -or $ForceNotification) -and $NotificationMode -eq 'all') -or
+        ($warned -and @('all', 'errors_only') -contains $NotificationMode)
+    )
+    return [pscustomobject]@{
+        Send = [bool]$send
+        Severity = $(if ($warned) { 'WARNING' } else { 'SUCCESS' })
+    }
+}
+
 function Get-BRAVOHealthCleanRunOperationsVerdict {
     # Severity Operations-події для прогону, у якому перевірки не дали issue.
     # Вона має збігатися з кодом завершення: ShouldBlock маніфесту
@@ -4882,9 +4907,12 @@ function New-SlackSuccessMessage {
         $resultLines.Add(":information_source: Каталог джерела порожній (не копіюється): $($emptySourceInfoOnly -join ', ')")
     }
 
+    # #301: порожній каталог, що мав дані, - звіт з попередженням, а не
+    # «ВСЕ СПРАВНО» (код завершення 10).
     return New-BRAVOOperatorNotificationMessage `
-        -Severity "SUCCESS" `
-        -Operation "BRAVO BACKUP — ВСЕ СПРАВНО" `
+        -Severity $(if ($emptySourceWarningComponents.Count -gt 0) { "WARNING" } else { "SUCCESS" }) `
+        -Operation $(if ($emptySourceWarningComponents.Count -gt 0) { "BRAVO BACKUP — СПРАВНО, Є ПОПЕРЕДЖЕННЯ" } else { "BRAVO BACKUP — ВСЕ СПРАВНО" }) `
+        -ActionText $(if ($emptySourceWarningComponents.Count -gt 0) { "перевірити порожній каталог джерела або підтвердити новий baseline (BRAVO_SETUP.ps1 -Action Test -ValidateOnly -ConfirmDiscoveryBaseline)" } else { "" }) `
         -InstitutionName ([string]$backupMonitoring.InstitutionName) `
         -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
         -HostInformation $hostInformation `
@@ -5106,7 +5134,10 @@ function Get-BRAVOHealthSuccessFingerprint {
         [Parameter(Mandatory = $true)]$DestinationSummary,
         [bool]$SftpDeferred,
         [string[]]$EnabledCheckNames = @(),
-        [array]$ArchiveIdentities = @()
+        [array]$ArchiveIdentities = @(),
+        # #301: порожні каталоги, що мали дані. Рядок додається лише коли
+        # список непорожній, тож відбиток без них не змінився.
+        [string[]]$EmptySourceWarningComponents = @()
     )
 
     $canonicalLines = New-Object System.Collections.Generic.List[string]
@@ -5126,6 +5157,9 @@ function Get-BRAVOHealthSuccessFingerprint {
             'unknown'
         }
         $canonicalLines.Add("archive=$([string]$archiveIdentity.Type):$identityText")
+    }
+    if (@($EmptySourceWarningComponents).Count -gt 0) {
+        $canonicalLines.Add('emptySourceWarning=' + ((@($EmptySourceWarningComponents) | Sort-Object) -join ','))
     }
 
     $canonicalText = ($canonicalLines -join "`n")
@@ -6132,11 +6166,16 @@ if ($healthIssues.Count -eq 0) {
     $operationalRecoveryPending = [bool](Get-BRAVOHealthOperationalState).RecoveryPending
     Clear-AlertState
 
-    $sendSuccessNotification = (
-        ($NotifyOnSuccess -or $ForceNotification) -and
-        -not $NoSlack -and
-        $NotificationMode -eq "all"
-    )
+    # #301: порожній каталог, що мав дані, надсилається як WARNING і в
+    # режимі errors_only (Get-BRAVOHealthCleanRunNotificationPlan).
+    $successNotificationPlan = Get-BRAVOHealthCleanRunNotificationPlan `
+        -NotifyOnSuccess ([bool]$NotifyOnSuccess) `
+        -ForceNotification ([bool]$ForceNotification) `
+        -NoSlack ([bool]$NoSlack) `
+        -NotificationMode ([string]$NotificationMode) `
+        -EmptySourceWarningCount @($script:healthEmptySourceWarningComponents).Count
+    $sendSuccessNotification = [bool]$successNotificationPlan.Send
+    $successNotificationSeverity = [string]$successNotificationPlan.Severity
     # 5.2.1: semantic + recovery-aware дедуплікація зелених звітів.
     # Embedded post-backup виклик з Archive (SuppressHeader) не дедупиться —
     # це первинне підтвердження свіжої копії; standalone-прогін мовчить лише
@@ -6170,7 +6209,8 @@ if ($healthIssues.Count -eq 0) {
         -DestinationSummary $destinationSummary `
         -SftpDeferred ([bool]$script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) `
         -EnabledCheckNames $successEnabledCheckNames `
-        -ArchiveIdentities $successArchiveIdentities
+        -ArchiveIdentities $successArchiveIdentities `
+        -EmptySourceWarningComponents @($script:healthEmptySourceWarningComponents)
 
     # Operations: НАВМИСНО ПОЗА $sendSuccessNotification/success-dedup
     # гейтингом нижче (review finding) — healthy-подія на dashboard не
@@ -6273,7 +6313,7 @@ if ($healthIssues.Count -eq 0) {
         $successMessage = New-SlackSuccessMessage -Duration $healthDuration
         try {
             $successRoute = Resolve-BRAVONotificationRoute `
-                -Severity "SUCCESS" `
+                -Severity $successNotificationSeverity `
                 -NotificationMode $NotificationMode `
                 -RoutingTable $backupMonitoring.NotificationRouting
             $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage

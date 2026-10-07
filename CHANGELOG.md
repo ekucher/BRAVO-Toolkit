@@ -13,12 +13,16 @@
   WARN). Якщо оператор підтвердив baseline, поки архівація ще йшла, доказ з manifest не повертає сирий шлях
   у свідомо порожнє поле. Operations-подія Health для прогону без issue, але з WARNING у журналі (код 10), тепер
   має severity WARNING, а не SUCCESS, і поле `logWarningCount`. Порожній `<DocumentRoot>\BAZA` для BAZA_WWW
-  обробляється так само (presence-запис має `AbsenceKind = 'Empty'`). Відсутній чи
+  обробляється так само (presence-запис має `AbsenceKind = 'Empty'` і `EmptyPath`, і доказ з manifest переходить у
+  baseline шляхом цього каталогу). Попередження доходить до всіх каналів: Slack/Discord-звіт Health без issue має
+  severity WARNING і йде маршрутом alerts (зокрема в режимі `errors_only`, без `NotifyOnSuccess`), а відбиток
+  дедуплікації містить ці компоненти; `-SyncBAZA` пише WARNING для порожнього BAZA-каталогу й завершується кодом 10.
+  Відсутній чи
   нечитабельний каталог, а також порожній обов'язковий MODEL лишаються Error. Presence-запис має нове поле
   `AbsenceKind` (`Empty`/`NotFound`/`NoPath`). Baseline пише порожнє джерело лише для доведено порожнього
   каталогу, тож після `-ConfirmDiscoveryBaseline` такий компонент дає Info; Error/Ambiguous і відсутній каталог
   зберігають сире джерело. Попередній перегляд `-ValidateOnly -ConfirmDiscoveryBaseline` будує знімок тією самою
-  функцією `New-BRAVODiscoveryBaselineSnapshot`, що й збереження. Коди завершення не змінено. Тести:
+  функцією `New-BRAVODiscoveryBaselineSnapshot`, що й збереження. Нових кодів завершення немає. Тести:
   `BackupScope/DeclaredEmptySource*`, `BackupScope/PreviouslyBackedUpEmptySourceWarnsWithoutBaseline`,
   `BackupScope/DeclaredMissingSourceStaysError`, `BackupScope/MandatoryModelEmptySourceStaysError`,
   `BackupScope/BaselineBlanksOnlyProvenEmptySource`, `BackupScope/ReconfirmedEmptySourceIsInfo`,
@@ -27,7 +31,8 @@
   `BackupScope/ReadOnlyScopeReportsEmptySourceSeparately`, `BackupScope/ExplicitOverrideEmptySourceStaysError`,
   `BackupScope/ConfirmedModelEmptySourceStaysError`, `BackupScope/ConcurrentBaselineConfirmationKeepsEmptyField`,
   `Health/EmptySourceReportedSeparatelyFromNotInstalled`, `Health/CleanRunOperationsEventFollowsWarningExitCode`,
-  `Discovery/EmptyBazaWwwDocumentRootIsEmptySourceWarning`.
+  `Discovery/EmptyBazaWwwDocumentRootIsEmptySourceWarning`, `Discovery/EmptyBazaWwwManifestEvidencePersistsInBaseline`,
+  `Health/EmptySourceWarningNotifiesAsWarning`, `BackupScope/SyncBazaReportsEmptySourceWarning`.
 - **Fix: Archive: оцінка місця враховує дерева з файлами нульової довжини і записи каталогів (#400).**
   Після #279 оцінка за джерелом додавала метадані кожного файлу, але джерело з нульовим сумарним розміром
   лишалось без оцінки, навіть якщо в ньому тисячі порожніх файлів, а каталоги, для яких 7-Zip теж зберігає

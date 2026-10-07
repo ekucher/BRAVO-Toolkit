@@ -574,6 +574,20 @@ if ($consoleSettings.ClearOnStart) {
     }
 }
 
+function Resolve-BRAVOSyncBazaExitCode {
+    # Код завершення -SyncBAZA. Збій синхронізації - SftpFailed, як і раніше.
+    # #301: порожній BAZA-каталог, що раніше мав дані, - код попередження
+    # (10), щоб 4-годинний BAZASync не ховав його за чистим exit 0.
+    param(
+        [bool]$SyncSucceeded,
+        [int]$EmptySourceWarningCount
+    )
+
+    if (-not $SyncSucceeded) { return (Resolve-BRAVOExitCode -SftpFailed) }
+    if ($EmptySourceWarningCount -gt 0) { return (Resolve-BRAVOExitCode -HasWarnings) }
+    return 0
+}
+
 # =============================================
 # ФУНКЦІЇ ПЕРЕВІРКИ СУМІСНОСТІ
 # =============================================
@@ -7083,8 +7097,18 @@ function Main {
         # після цього синхронізувати нічого, це той самий чистий SKIPPED
         # exit 0, що й для глобально вимкненого SFTP, а не exit 50 кожні
         # кілька годин на сервері, де BAZA_APP ніколи не було.
+        # #301: порожній BAZA-каталог, що раніше мав дані, - не «не
+        # встановлено», а попередження, як і в нічному Archive.
+        $syncBazaEmptySourceWarned = @(if ($null -ne $backupScope) {
+            Get-BRAVOEmptySourceWarningComponents -ScopeResult $backupScope -Components @('BAZA_APP', 'BAZA_WWW')
+        })
         foreach ($notInstalledBazaComponent in @($notInstalledComponents | Where-Object { @('BAZA_APP', 'BAZA_WWW') -contains $_ })) {
-            Write-Log "Компонент $notInstalledBazaComponent на цьому сервері не встановлено: синхронізацію пропущено без помилки" -Level "INFO" -NoTimestamp
+            if ($syncBazaEmptySourceWarned -contains $notInstalledBazaComponent) {
+                Write-Log ("Каталог джерела $notInstalledBazaComponent порожній, хоча раніше мав дані: синхронізацію пропущено. " +
+                    "Якщо зміна легітимна, підтвердіть новий baseline.") -Level "WARNING" -NoTimestamp
+            } else {
+                Write-Log "Компонент $notInstalledBazaComponent на цьому сервері не встановлено: синхронізацію пропущено без помилки" -Level "INFO" -NoTimestamp
+            }
         }
         $manualSyncNotInstalledOnly = (-not $bazaAppSFTPSyncEnabled) -and (-not $bazaWWWSFTPSyncEnabled) -and (
             ([bool]$componentSettings.Synchronization.BAZA_APP_SFTP -and -not $bazaAppInstalled) -or
@@ -7095,13 +7119,13 @@ function Main {
             Write-Log "==="
             Write-Log "=== РУЧНА СИНХРОНIЗАЦIЯ BAZA_APP / BAZA_WWW НА SFTP: SKIPPED ==="
             Write-Log $notInstalledSyncReason -Level "INFO" -NoTimestamp
-            $script:processExitCode = 0
+            $script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $true -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count
             Show-ScriptProgress -Status "Завершено" -PercentComplete 100
             Complete-BRAVOProgress
             Initialize-BRAVOArchiveSteps -Total 1
             Write-BRAVOArchiveStep `
                 -Name 'SFTP: BAZA_APP/BAZA_WWW' `
-                -Status 'SKIPPED' `
+                -Status $(if ($syncBazaEmptySourceWarned.Count -gt 0) { 'WARNING' } else { 'SKIPPED' }) `
                 -Details $notInstalledSyncReason
             $notInstalledSyncMetrics = New-Object System.Collections.Specialized.OrderedDictionary
             $notInstalledSyncMetrics.Add('Операція', 'Ручна синхронізація BAZA_APP / BAZA_WWW')
@@ -7128,7 +7152,7 @@ function Main {
         Write-Log "Тривалiсть: $($manualSyncDuration.ToString($durationFormat))" -NoTimestamp
         Write-Log "Лог-файл: $logFile" -NoTimestamp
         # -SyncBAZA — це суто SFTP-операція за визначенням.
-        $script:processExitCode = if ($manualSyncSuccess) { 0 } else { Resolve-BRAVOExitCode -SftpFailed }
+        $script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count
         # #292: фінальна Operations-подія -SyncBAZA несе режим і статус
         # канонічного двигуна по кожному компоненту (MUTATION_VIOLATION,
         # REMOTE_CONFLICT, AUDIT_DRIFT, INCOMPATIBLE_NAME ...), а не лише код.
