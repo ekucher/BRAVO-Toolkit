@@ -763,7 +763,7 @@ try {
         @($scope301EmptyNew.NotInstalled) -contains 'BLOG' -and
         -not [bool]$scope301EmptyNew.EffectiveEnabledComponents['BLOG'] -and
         @($scope301EmptyNew.Findings | Where-Object { [string]$_.Severity -in @('Error', 'Warning') }).Count -eq 0 -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301EmptyNew -Component 'BLOG' -Severity 'Info').Count -eq 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301EmptyNew -Component 'BLOG' -Severity 'Info').Count -eq 1
     ) -Name 'BackupScope/DeclaredEmptySourceNeverConfirmedIsSkippedWithInfo' `
         -Failure "оголошений (bravo.ini), але порожній каталог без підтвердження має пропускатись з Info (scope EmptySource), без Error; scope='$($scope301EmptyNew.Components['BLOG'])' threw='$scope301EmptyNewThrew'"
 
@@ -775,7 +775,7 @@ try {
         [string]$scope301Emptied.Components['BLOG'] -eq 'EmptySource' -and
         @($scope301Emptied.NotInstalled) -contains 'BLOG' -and
         @($scope301Emptied.Findings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301Emptied -Component 'BLOG' -Severity 'Warning').Count -eq 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301Emptied -Component 'BLOG' -Severity 'Warning').Count -eq 1
     ) -Name 'BackupScope/DeclaredEmptySourcePreviouslyConfirmedWarns' `
         -Failure "раніше підтверджений компонент з порожнім каталогом має давати Warning без Error (рішення власника #301); scope='$($scope301Emptied.Components['BLOG'])'"
 
@@ -785,7 +785,7 @@ try {
     Test-BRAVOCondition -Condition (
         [string]$scope301PrevEmpty.Components['BLOG'] -eq 'EmptySource' -and
         @($scope301PrevEmpty.Findings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301PrevEmpty -Component 'BLOG' -Severity 'Warning').Count -eq 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301PrevEmpty -Component 'BLOG' -Severity 'Warning').Count -eq 1
     ) -Name 'BackupScope/PreviouslyBackedUpEmptySourceWarnsWithoutBaseline' `
         -Failure "без baseline компонент, що мав архів в останній COMPLETE generation і тепер має порожній каталог, має давати Warning без Error; scope='$($scope301PrevEmpty.Components['BLOG'])'"
 
@@ -796,10 +796,10 @@ try {
         -Baseline $scope301ConfirmedBaseline -BaselineSourceKind 'Canonical'
     Test-BRAVOCondition -Condition (
         [string]$scope301MissingNew.Components['BLOG'] -eq 'Missing' -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301MissingNew -Component 'BLOG' -Severity 'Error').Count -ge 1 -and
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301MissingNew -Component 'BLOG' -Severity 'Error').Count -ge 1 -and
         @($scope301MissingNew.NotInstalled) -notcontains 'BLOG' -and
         [string]$scope301MissingConfirmed.Components['BLOG'] -eq 'Missing' -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301MissingConfirmed -Component 'BLOG' -Severity 'Error').Count -ge 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301MissingConfirmed -Component 'BLOG' -Severity 'Error').Count -ge 1
     ) -Name 'BackupScope/DeclaredMissingSourceStaysError' `
         -Failure "відсутній оголошений каталог має лишатись Missing (Error) і з baseline, і без нього; без baseline='$($scope301MissingNew.Components['BLOG'])' з baseline='$($scope301MissingConfirmed.Components['BLOG'])'"
 
@@ -809,7 +809,7 @@ try {
     Test-BRAVOCondition -Condition (
         [string]$scope301ModelEmpty.Components['MODEL'] -eq 'Missing' -and
         @($scope301ModelEmpty.NotInstalled) -notcontains 'MODEL' -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301ModelEmpty -Component 'MODEL' -Severity 'Error').Count -eq 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301ModelEmpty -Component 'MODEL' -Severity 'Error').Count -eq 1
     ) -Name 'BackupScope/MandatoryModelEmptySourceStaysError' `
         -Failure "обов'язковий MODEL з порожнім каталогом має бути Missing (Error); scope='$($scope301ModelEmpty.Components['MODEL'])'"
 
@@ -842,7 +842,7 @@ try {
         [string]$scope301Import.Source -eq 'Canonical' -and
         [string]$scope301Reconfirmed.Components['BLOG'] -eq 'EmptySource' -and
         @($scope301Reconfirmed.Findings | Where-Object { [string]$_.Severity -in @('Error', 'Warning') }).Count -eq 0 -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301Reconfirmed -Component 'BLOG' -Severity 'Info').Count -eq 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301Reconfirmed -Component 'BLOG' -Severity 'Info').Count -eq 1
     ) -Name 'BackupScope/ReconfirmedEmptySourceIsInfo' `
         -Failure "після підтвердження baseline з порожнім каталогом наступний прогін має дати Info без Warning/Error; scope='$($scope301Reconfirmed.Components['BLOG'])' source='$($scope301Import.Source)'"
 
@@ -902,13 +902,13 @@ try {
     $scope301Night2 = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301EmptyDiscovery `
         -Baseline $scope301Night2Import.Baseline -BaselineSourceKind ([string]$scope301Night2Import.Source) -Previous @('MODEL')
     Test-BRAVOCondition -Condition (
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301Night1 -Component 'BLOG' -Severity 'Warning').Count -eq 1 -and
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301Night1 -Component 'BLOG' -Severity 'Warning').Count -eq 1 -and
         $scope301Night1UpdateError -eq '' -and
         [string]$scope301Night2Import.Source -eq 'Canonical' -and
         $scope301Night2BlogBaseline -eq $scope301Empty -and
         [string]$scope301Night2.Components['BLOG'] -eq 'EmptySource' -and
         @($scope301Night2.Findings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301Night2 -Component 'BLOG' -Severity 'Warning').Count -eq 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301Night2 -Component 'BLOG' -Severity 'Warning').Count -eq 1
     ) -Name 'BackupScope/EmptySourceWarningPersistsAfterFirstRun' `
         -Failure "Warning для порожнього каталогу, доведеного лише manifest, має повторитись і наступного прогону: baseline BLOG='$scope301Night2BlogBaseline' source='$($scope301Night2Import.Source)' scope='$($scope301Night2.Components['BLOG'])' update='$scope301Night1UpdateError'"
 
@@ -933,11 +933,11 @@ try {
         -Baseline $scope301BlankNight2Import.Baseline -BaselineSourceKind ([string]$scope301BlankNight2Import.Source) -Previous @('MODEL')
     Test-BRAVOCondition -Condition (
         [string]$scope301BlankImport.Source -eq 'Canonical' -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301BlankNight1 -Component 'BLOG' -Severity 'Warning').Count -eq 1 -and
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301BlankNight1 -Component 'BLOG' -Severity 'Warning').Count -eq 1 -and
         $scope301BlankUpdateError -eq '' -and
         $scope301BlankNight2BlogBaseline -eq $scope301Empty -and
         (Get-BRAVOSelfTestScope301BaselineValue -Import $scope301BlankNight2Import -Field 'MODEL_SOURCE') -eq 'C:\ExampleLims\Model' -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301BlankNight2 -Component 'BLOG' -Severity 'Warning').Count -eq 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301BlankNight2 -Component 'BLOG' -Severity 'Warning').Count -eq 1
     ) -Name 'BackupScope/EmptySourceEvidenceExtendsExistingBaseline' `
         -Failure "доказ manifest для порожнього каталогу має дописатись у наявний baseline з порожнім полем: BLOG='$scope301BlankNight2BlogBaseline' update='$scope301BlankUpdateError'"
 
@@ -977,7 +977,7 @@ try {
         [string]$scope301OverrideDiscovery.Components['BLOG'].Presence -eq 'Error' -and
         [string]$scope301Override.Components['BLOG'] -ne 'EmptySource' -and
         @($scope301Override.NotInstalled) -notcontains 'BLOG' -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301Override -Component 'BLOG' -Severity 'Error').Count -ge 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301Override -Component 'BLOG' -Severity 'Error').Count -ge 1
     ) -Name 'BackupScope/ExplicitOverrideEmptySourceStaysError' `
         -Failure "явний override на порожній каталог має лишатись Error; presence='$($scope301OverrideDiscovery.Components['BLOG'].Presence)' scope='$($scope301Override.Components['BLOG'])'"
 
@@ -988,7 +988,7 @@ try {
         -Baseline ([pscustomobject]@{ MODEL_SOURCE = $scope301Empty; BLOG_SOURCE = $scope301Full }) -BaselineSourceKind 'Canonical'
     Test-BRAVOCondition -Condition (
         [string]$scope301ModelConfirmed.Components['MODEL'] -eq 'Missing' -and
-        (Get-BRAVOSelfTestScope301Findings -Scope $scope301ModelConfirmed -Component 'MODEL' -Severity 'Error').Count -ge 1
+        @(Get-BRAVOSelfTestScope301Findings -Scope $scope301ModelConfirmed -Component 'MODEL' -Severity 'Error').Count -ge 1
     ) -Name 'BackupScope/ConfirmedModelEmptySourceStaysError' `
         -Failure "підтверджений у baseline MODEL з порожнім каталогом має бути Missing (Error); scope='$($scope301ModelConfirmed.Components['MODEL'])'"
 } finally {
