@@ -2,6 +2,25 @@
 
 ## Не випущено (developer)
 
+- **Hardening: придатність сесій архівів реставрації перевіряється й тоді, коли сесій не більше за `ArchivesKeepCount` (#424).**
+  Повторну перевірку сесій (SHA512 + `7z t`) і всю діагностику придатності виконує лише retention
+  (`Remove-OldRestoreArchives`), а Main запускав його тільки тоді, коли сесій більше за `Restore.ArchivesKeepCount`.
+  Коли сесій ≤ `ArchivesKeepCount` (наприклад, `ArchivesKeepCount = 1` і єдина сесія, що стала непридатною вже після
+  створення: зміна пароля, пошкодження, видалений `.sha512`), жодна діагностика не писалась. Тепер у цьому стані Main
+  викликає `Remove-OldRestoreArchives -ReportOnly`: та сама валідація і ті самі рядки (WARNING «Архів реставрації не
+  зараховано як точку відновлення», WARNING #422 «Непридатну сесію … НЕ видалено», ERROR «Не лишилось жодної придатної
+  точки відновлення» з прапорцями `criticalErrorOccurred`/`restoreIntegrityFailed`), але функція повертається до будь-якого
+  видалення: не видаляється нічого, навіть доведено пошкоджена стара сесія (для неї окремий WARNING «НЕ видалено:
+  retention працює лише в режимі перевірки»). Зміна поведінки (рішення власника 2026-10-07, «Повна перевірка»): за
+  сесій ≤ `ArchivesKeepCount` Maintenance щоночі виконує `7z t` для цих сесій; непридатна сесія дає exit 10
+  (WARNING), а непридатна найновіша чи єдина точка відновлення — exit 41. Гейт звичайного retention (сесій більше за
+  `ArchivesKeepCount`, поточна restore-сесія не аварійна) і саме видалення не змінено; за аварійної restore-сесії
+  перевірка, як і retention, пропускається з тим самим WARNING. Тести:
+  `Maintenance/RetentionReportOnlyStaleSessionWarnsWithinKeepCount`,
+  `Maintenance/RetentionReportOnlyNeverDeletesProvenCorrupt`,
+  `Maintenance/RetentionReportOnlySingleBrokenSessionSetsFailureFlags`,
+  `Maintenance/RetentionReportOnlyMainBranchWithinKeepCount`.
+
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
   `Get-BRAVOCredentialSecureSecret` у приватний `Add-BRAVOCredentialReadSecretRecord` із власним try/catch: збій обліку
@@ -35,8 +54,8 @@
   точка відновлення (за `ArchivesKeepCount = 0` — ніколи);
   коли непридатне все, причина швидше системна (пароль, 7-Zip, доступ), і не видаляється нічого. Кожна збережена
   стара сесія дає WARNING з назвою сесії і причиною («НЕ видалено: непридатність не доведена — …»), тож оператор
-  бачить, що її треба перевірити вручну (WARNING з'являється в ті прогони, коли retention запускається, тобто коли
-  сесій більше за `Restore.ArchivesKeepCount`; умову запуску не змінено). Звичайний retention валідних сесій понад `Restore.ArchivesKeepCount`, прапорці
+  бачить, що її треба перевірити вручну (з #424 WARNING з'являється в кожному нічному прогоні: коли сесій не більше за
+  `Restore.ArchivesKeepCount`, сесії перевіряються в режимі лише перевірки, див. запис #424). Звичайний retention валідних сесій понад `Restore.ArchivesKeepCount`, прапорці
   `criticalErrorOccurred`/`restoreIntegrityFailed` і коди завершення не змінено; `Test-BRAVOMaintenanceSevenZipArchiveIntegrity`
   отримав необов'язковий `-FailureInfo` (bool-контракт повернення і політика прапорців ті самі). Тести:
   `Maintenance/RetentionStaleSessionKeptOnValidationFailure/*` (виняток валідатора, таймаут, немає 7-Zip, коди 7/8/255,

@@ -6990,7 +6990,11 @@ function Remove-OldRestoreArchives {
         [string]$Path,
         [string]$ArchivePrefix,
         [int]$KeepCount = 2,
-        [int]$InvalidRetentionDays = 30
+        [int]$InvalidRetentionDays = 30,
+        # #424: лише перевірка й діагностика придатності сесій (SHA512 +
+        # 7z t, ті самі WARNING/ERROR і прапорці exit 41), БЕЗ жодного
+        # видалення. Main використовує його, коли сесій ≤ ArchivesKeepCount.
+        [switch]$ReportOnly
     )
 
     if (-not (Test-Path $Path)) {
@@ -7183,6 +7187,16 @@ function Remove-OldRestoreArchives {
             Write-Log "Непридатну сесію $($staleGroup.Name) (старшу за $InvalidRetentionDays днів) НЕ видалено: непридатність не доведена — $staleGroupReason. Автоматично видаляється лише сесія, вміст усіх архівів якої забракував 7-Zip; перевірте архіви сесії вручну." -Level "WARNING"
         }
     }
+    # #424: у режимі лише перевірки вся діагностика вище вже записана;
+    # повертаємось до будь-якого видалення (ні сесій понад KeepCount, ні
+    # доведено непридатних). Інваріант #422: перевірка без видалення.
+    if ($ReportOnly) {
+        foreach ($staleGroup in $staleDeletableGroups) {
+            Write-Log "Непридатну сесію $($staleGroup.Name) (старшу за $InvalidRetentionDays днів) НЕ видалено: retention працює лише в режимі перевірки (сесій не більше за ArchivesKeepCount = $KeepCount). 7-Zip забракував вміст усіх її архівів; звичайний retention видалить її, коли сесій стане більше за ArchivesKeepCount." -Level "WARNING"
+        }
+        return
+    }
+
     if ($staleDeletableGroups.Count -gt 0) {
         Write-Log "Видаляємо $($staleDeletableGroups.Count) непридатних сесій, старших за $InvalidRetentionDays днів (7-Zip забракував вміст усіх їхніх архівів)" -Level "WARNING"
         $groupsToDelete = @($groupsToDelete) + @($staleDeletableGroups)
@@ -11283,6 +11297,9 @@ $traceOldLogs = @()
 # Однакова назва в різних scope вводила б в оману, ніби це те саме
 # значення.
 $restoreArchiveDeleteCandidateGroups = @()
+# #424: кількість усіх сесій архівів реставрації (без валідації) — для
+# гілки «лише перевірка», коли сесій ≤ ArchivesKeepCount.
+$restoreArchiveGroupCount = 0
 if ($BravoMaintenanceEnabled) {
     $emptyLogDateDirResult = Remove-BRAVOEmptyLogDateDirectories -Path $TRACE_DIR -Label 'Trace'
     $emptyLogDateDirDeletedCount += $emptyLogDateDirResult.DeletedCount
@@ -11313,6 +11330,7 @@ if ($BravoMaintenanceEnabled) {
             }
         }
         $sortedGroups = $archiveGroups | Sort-Object Name -Descending
+        $restoreArchiveGroupCount = @($sortedGroups).Count
         $restoreArchiveDeleteCandidateGroups = @($sortedGroups | Select-Object -Skip $RESTORE_ARCHIVES_KEEP_COUNT)
         $hasDataToClean = $hasDataToClean -or ($restoreArchiveDeleteCandidateGroups.Count -gt 0)
     }
@@ -11489,6 +11507,17 @@ if ($BravoMaintenanceEnabled -and $restoreArchiveDeleteCandidateGroups.Count -gt
         -InvalidRetentionDays $FAILED_ARCHIVE_RETENTION_DAYS
 } elseif ($restoreSessionUnsafeForRetention) {
     Write-Log -Message "Retention архівів реставрації пропущено: поточна restore-сесія завершилась помилкою або rollback." -Level "WARNING"
+} elseif ($BravoMaintenanceEnabled -and $restoreArchiveGroupCount -gt 0) {
+    # #424: сесій ≤ ArchivesKeepCount — видаляти нічого, але придатність
+    # сесій перевіряється щоночі з тією самою діагностикою (WARNING → exit
+    # 10; немає жодної придатної точки → ERROR, exit 41). Без видалення.
+    Write-Log -Message "Retention архівів реставрації: сесій $restoreArchiveGroupCount ≤ ArchivesKeepCount $RESTORE_ARCHIVES_KEEP_COUNT — лише перевірка придатності, без видалення." -Level "DEBUG"
+    Remove-OldRestoreArchives `
+        -Path $ARC_DIR `
+        -ArchivePrefix $ArchivePrefix `
+        -KeepCount $RESTORE_ARCHIVES_KEEP_COUNT `
+        -InvalidRetentionDays $FAILED_ARCHIVE_RETENTION_DAYS `
+        -ReportOnly
 }
 
 # dev.16: execution result очистки — unnumbered top-level операція (не
