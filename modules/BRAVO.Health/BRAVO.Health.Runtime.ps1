@@ -4090,6 +4090,62 @@ function Get-EnabledBackupComponentNames {
     return @($orderedNames | Select-Object -Unique)
 }
 
+function Start-BRAVOHealthServiceRecoveryTask {
+    # FR-7 #314 (хвиля 5): впалу службу Health НЕ запускає сам — він запускає
+    # задачу BRAVO_SERVICE_RECOVERY (BRAVO_MAINTENANCE.ps1 -RecoverServices),
+    # бо запускати служби дозволено лише Maintenance (lock, ownership-маркер,
+    # журнали, паузи, CRITICAL «циклічно падає»). Другий дозволений виняток
+    # із read-only політики Health — запуск задачі, не служби.
+    # Результат: Started / AlreadyRunning / Missing (задачі немає або вона
+    # вимкнена) / NotConfigured (вузол ServiceRecovery вимкнено разом із
+    # Maintenance) / Error (текст помилки запуску).
+    $result = [pscustomobject]@{
+        TaskName = 'BRAVO_SERVICE_RECOVERY'
+        Started = $false
+        AlreadyRunning = $false
+        Missing = $false
+        NotConfigured = $false
+        Error = $null
+    }
+    try {
+        $taskPath = '\'
+        $schedulerSettingsValue = Get-Variable -Name 'schedulerSettings' -ValueOnly -ErrorAction SilentlyContinue
+        if ($schedulerSettingsValue -is [System.Collections.IDictionary]) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$schedulerSettingsValue['TaskPath'])) {
+                $taskPath = [string]$schedulerSettingsValue['TaskPath']
+            }
+            $recoverySettings = $schedulerSettingsValue['ServiceRecovery']
+            if ($recoverySettings -is [System.Collections.IDictionary]) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$recoverySettings['TaskName'])) {
+                    $result.TaskName = [string]$recoverySettings['TaskName']
+                }
+                if ($recoverySettings.Contains('Enabled') -and -not [bool]$recoverySettings['Enabled']) {
+                    $result.NotConfigured = $true
+                    return $result
+                }
+            }
+        }
+        $taskState = Get-BRAVOScheduledTaskState -TaskPath $taskPath -TaskName $result.TaskName
+        if (-not [bool]$taskState.Exists -or [string]$taskState.State -eq 'Disabled') {
+            $result.Missing = $true
+            return $result
+        }
+        if ([bool]$taskState.IsRunning) {
+            $result.AlreadyRunning = $true
+            return $result
+        }
+        if ([string]$taskState.Provider -eq 'ScheduledTasks') {
+            Start-ScheduledTask -InputObject $taskState.Task -ErrorAction Stop
+        } else {
+            [void]$taskState.Task.Run($null)
+        }
+        $result.Started = $true
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+    return $result
+}
+
 function Get-ManagedServiceHealthIssues {
     $checkManagedServices = if ($backupMonitoring.Contains("CheckManagedServices")) {
         Test-BRAVOSettingEnabled -Value $backupMonitoring.CheckManagedServices
@@ -4152,6 +4208,10 @@ function Get-ManagedServiceHealthIssues {
     try { $quiescenceState = Read-BRAVOServiceQuiescenceState } catch { $quiescenceState = $null }
 
     $issues = @()
+    # FR-7 #314: задача відновлення запускається один раз за прогін, навіть
+    # якщо впало кілька служб (Get-ManagedServiceHealthIssues викликається
+    # один раз на прогін Health).
+    $recoveryTaskStart = $null
     foreach ($service in @($services)) {
         # Класифікація — єдина реалізація FR-1 #314 (BRAVO.System). StartType
         # читається через PSObject.Properties (.NET < 4.6.1 його не має),
@@ -4185,13 +4245,59 @@ function Get-ManagedServiceHealthIssues {
         } else {
             "не запущена (стан: $($serviceCondition.Status))"
         }
-        $issues += [pscustomobject]@{
+        $serviceIssue = [pscustomobject]@{
             Kind = "Service"
             Component = "Служба $($service.Name)"
             Reason = $serviceIssueReason
             FileName = ""
             LastWriteTime = $null
             Location = [string]$service.Name
+            SizeBytes = $null
+            Details = @()
+        }
+        # «Впала» = Failed і Stopped (план #314 §0.3, Test-BRAVOServiceRecoveryFailed):
+        # призупинену службу Maintenance не запускає, тож і задачу не будимо.
+        # Reason не змінюється — fingerprint алерту (Get-AlertFingerprint)
+        # лишається тим самим; ActionText у fingerprint не входить.
+        if ($serviceCondition.Condition -eq 'Failed' -and [string]$serviceCondition.Status -eq 'Stopped') {
+            if ($null -eq $recoveryTaskStart) {
+                $recoveryTaskStart = Start-BRAVOHealthServiceRecoveryTask
+                if ($recoveryTaskStart.Started) {
+                    Write-HealthLog "Служба $($service.Name) не працює: запущено задачу відновлення $($recoveryTaskStart.TaskName)" -Level "WARNING"
+                } elseif ($recoveryTaskStart.AlreadyRunning) {
+                    Write-HealthLog "Служба $($service.Name) не працює: задача відновлення $($recoveryTaskStart.TaskName) уже виконується" -Level "INFO"
+                } elseif ($recoveryTaskStart.Missing) {
+                    Write-HealthLog "Задача відновлення $($recoveryTaskStart.TaskName) відсутня або вимкнена — впалі служби автоматично не відновлюються" -Level "ERROR"
+                } elseif (-not [string]::IsNullOrWhiteSpace([string]$recoveryTaskStart.Error)) {
+                    Write-HealthLog "Не вдалося запустити задачу відновлення $($recoveryTaskStart.TaskName): $($recoveryTaskStart.Error)" -Level "ERROR"
+                }
+            }
+            $recoveryActionText = if ($recoveryTaskStart.Started) {
+                "служба $($service.Name) не працює; запущено автоматичне відновлення, перевірте журнал BRAVO_MAINTENANCE_*_RECOVER_*.log у LOGS"
+            } elseif ($recoveryTaskStart.AlreadyRunning) {
+                "служба $($service.Name) не працює; автоматичне відновлення вже виконується, перевірте журнал BRAVO_MAINTENANCE_*_RECOVER_*.log у LOGS"
+            } elseif ($recoveryTaskStart.Missing) {
+                "служба $($service.Name) не працює; задача $($recoveryTaskStart.TaskName) відсутня або вимкнена — виконайте BRAVO_TASKS_INSTALL.ps1 або запустіть BRAVO_MAINTENANCE.ps1 -RecoverServices вручну"
+            } elseif (-not [string]::IsNullOrWhiteSpace([string]$recoveryTaskStart.Error)) {
+                "служба $($service.Name) не працює; не вдалося запустити задачу $($recoveryTaskStart.TaskName): $($recoveryTaskStart.Error) — запустіть BRAVO_MAINTENANCE.ps1 -RecoverServices вручну"
+            } else {
+                $null
+            }
+            if ($null -ne $recoveryActionText) {
+                Add-Member -InputObject $serviceIssue -MemberType NoteProperty -Name 'ActionText' -Value $recoveryActionText
+            }
+        }
+        $issues += $serviceIssue
+    }
+    if ($null -ne $recoveryTaskStart -and $recoveryTaskStart.Missing) {
+        $issues += [pscustomobject]@{
+            Kind = "Service"
+            Component = "Задача відновлення служб"
+            Reason = "задача $($recoveryTaskStart.TaskName) відсутня або вимкнена"
+            ActionText = "виконайте BRAVO_TASKS_INSTALL.ps1"
+            FileName = ""
+            LastWriteTime = $null
+            Location = [string]$recoveryTaskStart.TaskName
             SizeBytes = $null
             Details = @()
         }
@@ -5491,11 +5597,14 @@ if ($script:BRAVOToolIntegrity.HasIntegrityIssue) {
 # Health — діагностичний, read-only runtime: він НЕ блокує себе, а
 # звітує. Саме він має першим помітити підміну й підняти тривогу навіть
 # тоді, коли архівація ще не запускалась. Блокують Archive і Maintenance.
-# ЄДИНИЙ дозволений виняток з read-only політики —
-# Invoke-BRAVOServiceQuiescenceWatchdog: старт служб, перелічених у
-# ВЛАСНОМУ осиротілому ownership-маркері BRAVO (аварійне переривання
-# Maintenance/DataRestore). Ручні зупинки техпідтримки (без маркера)
-# Health ніколи не чіпає.
+# Дозволені винятки з read-only політики:
+#   1. Invoke-BRAVOServiceQuiescenceWatchdog: старт служб, перелічених у
+#      ВЛАСНОМУ осиротілому ownership-маркері BRAVO (аварійне переривання
+#      Maintenance/DataRestore);
+#   2. Start-BRAVOHealthServiceRecoveryTask (#314 FR-7): запуск ЗАДАЧІ
+#      BRAVO_SERVICE_RECOVERY, коли керована служба впала (не служби —
+#      службу запускає BRAVO_MAINTENANCE.ps1 -RecoverServices).
+# Служби з типом запуску Disabled Health ніколи не чіпає.
 $script:BRAVOToolManifestMode = 'Enforce'
 $script:BRAVOToolManifestPath = Join-Path $toolsPath "TOOLS_MANIFEST.json"
 if ($toolIntegritySettings -is [System.Collections.IDictionary]) {
@@ -5755,7 +5864,7 @@ function Get-BRAVOQuiescenceWatchdogAllowedServiceNames {
 }
 
 function Invoke-BRAVOServiceQuiescenceWatchdog {
-    # ЄДИНИЙ дозволений Health виняток з read-only політики (див. політику
+    # Дозволений Health виняток з read-only політики (див. політику
     # нижче в цьому файлі та BRAVO.config): якщо Maintenance/DataRestore
     # зупинив служби, записав ownership-маркер BRAVO_SERVICE_QUIESCENCE.json
     # (BRAVO.System) і загинув ЖОРСТКО (kill/живлення — finally не
