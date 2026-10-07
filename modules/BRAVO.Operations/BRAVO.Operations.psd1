@@ -6,6 +6,7 @@
     FunctionsToExport = @(
         'Get-BRAVOOperationsServerId',
         'Invoke-BRAVOOperationsEnrollment',
+        'Get-BRAVOOperationsOutboxLossSummary',
         'Invoke-BRAVOOperationsOutboxDrain',
         'Send-BRAVOOperationsEvent',
         'Send-BRAVOOperationsHeartbeat'
