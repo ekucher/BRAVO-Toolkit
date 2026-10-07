@@ -374,6 +374,12 @@ function Get-BRAVOSystemRangeIdLogPath { return $script:secretMaskTestState.Rang
 
 $secretMaskSourceText = $secretMaskStub + "`n" + $maintenanceOwnLogScriptText + "`n" + $secretMaskCredentialsText + "`n" + $secretMaskLoggingText + "`n" + $secretMaskConfigurationText
 $secretMaskCredentialReadChain = @('Get-BRAVOCredential', 'Get-BRAVOCredentialSecureSecret', 'ConvertFrom-BRAVOSecureSecret', 'Get-BRAVOCredentialSecret')
+# #417: облік прочитаних/записаних секретів винесено в приватний helper
+# BRAVO.Credentials; до його появи ланцюг лишається попереднім (тести #417
+# тоді падають на поведінці, а не на відсутності функції).
+if ($secretMaskCredentialsText.Contains('function Add-BRAVOCredentialReadSecretRecord')) {
+    $secretMaskCredentialReadChain += @('Add-BRAVOCredentialReadSecretRecord')
+}
 $secretMaskBoundaryAndUploadFunctions = $secretMaskCredentialReadChain + @(
     'Write-Log', 'Connect-BRAVOOwnLogSftpSession',
     'New-BRAVOBazaRemoteDirectoryRecursive', 'Send-BRAVOTraceArchiveFile', 'Get-BRAVOFileHash',
@@ -930,6 +936,221 @@ Test-BRAVOCondition (
     [string]::IsNullOrEmpty([string]$secretMaskSetFailResult.InvokeError)
 ) -Name 'Maintenance/OwnLogUploadFailsClosedWhenSecretSetFails' `
     -Failure "збій збирання набору секретів (не CredRead) — fail-closed: жодної передачі, WARNING без секретів, виняток назовні не йде; uploads=$($secretMaskSetFailUploads.Count); витекли ключі: $($secretMaskSetFailLeaks -join ', '); помилка: $secretMaskSetupError"
+
+# ============================================================
+# #417: облік секретів процесу (реєстр BRAVO.Credentials) ізольований від
+# самого читання і доповнюється записами Set-BRAVOCredential.
+# (а) значення, записане Set-BRAVOCredential у цьому процесі (Operations
+#     зберігає API-ключ під час Maintenance), маскується навіть тоді, коли
+#     пізніший CredRead у Get-BRAVOLogMaskSecretSet падає;
+# (б) збій обліку не ламає звичайне читання секрету, але робить набір
+#     маскування неповним -> Get-BRAVOLogMaskSecretSet кидає (fail-closed);
+# (в) на цьому fail-closed шляху власний лог не вивантажується, а
+#     діагностика не переказує ні секрет, ні текст первинного винятку.
+# Межі: CredWrite ([BRAVO.Security.CredentialManager]::WriteGeneric —
+# у тексті Set-BRAVOCredential замінюється на тестовий записувач) і CredRead
+# (Get-BRAVOCredential). Решта — справжній production-код. Збій обліку
+# імітується пошкодженим реєстром модуля: його TryGetValue кидає виняток,
+# у повідомленні якого — синтетичний секрет.
+# Кожен сценарій — у власному свіжому модулі (окремий "процес").
+# ============================================================
+$secretMask417ByKey = [ordered]@{
+    OperationsApiKeyWritten = (& $secretMaskNewValue 'opsW-')
+    SftpReadDuringFailure   = (& $secretMaskNewValue 'SftpR')
+    RegistryFailurePayload  = (& $secretMaskNewValue 'RegX')
+}
+$secretMask417LeakByKey = [ordered]@{}
+foreach ($secretMaskKey in @($secretMaskSyntheticByKey.Keys)) { $secretMask417LeakByKey[$secretMaskKey] = $secretMaskSyntheticByKey[$secretMaskKey] }
+foreach ($secretMaskKey in @($secretMask417ByKey.Keys)) { $secretMask417LeakByKey[$secretMaskKey] = $secretMask417ByKey[$secretMaskKey] }
+
+# Тестовий записувач замість CredWrite: фіксує лише target, значення в
+# SecretByTarget НЕ потрапляє (пізніший CredRead його не поверне). Заміна
+# має відбутися рівно один раз — інакше справжній CredWrite лишився б
+# досяжним, і сценарій не запускається взагалі.
+$secretMask417WriteBoundary = '[BRAVO.Security.CredentialManager]::WriteGeneric('
+$secretMask417WriteBoundaryCount = @([regex]::Matches($secretMaskCredentialsText, [regex]::Escape($secretMask417WriteBoundary))).Count
+$secretMask417WriteStub = @'
+function Initialize-BRAVOCredentialManager { }
+'@
+$secretMask417WriteSourceText = $secretMask417WriteStub + "`n" + $secretMaskStub + "`n" +
+    $secretMaskCredentialsText.Replace($secretMask417WriteBoundary, '$script:secretMaskTestState.CredentialWriter.WriteGeneric(')
+
+$secretMask417WrittenResult = $null
+$secretMask417WrittenError = ''
+if ($secretMask417WriteBoundaryCount -eq 1) {
+    try {
+        $secretMask417WrittenModule = New-BRAVOSelfTestRuntimeModule -SourceText $secretMask417WriteSourceText `
+            -FunctionNames ($secretMaskEarlyFunctions + @('Initialize-BRAVOCredentialManager', 'Set-BRAVOCredential'))
+        $secretMask417WrittenResult = & $secretMask417WrittenModule {
+            param($targetsConfig, $writtenValue)
+            $credentialSettings = @{ Targets = $targetsConfig }
+            $opsApiTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'OperationsApiKey'
+            $writer = New-Object psobject
+            Add-Member -InputObject $writer -MemberType NoteProperty -Name Calls -Value (New-Object System.Collections.Generic.List[string])
+            Add-Member -InputObject $writer -MemberType ScriptMethod -Name WriteGeneric -Value {
+                param($target, $userName, $secret)
+                [void]$this.Calls.Add([string]$target)
+            }
+            # CredRead для API-ключа падає (SYSTEM без доступу тощо).
+            $script:secretMaskTestState = [pscustomobject]@{
+                LogLines = (New-Object System.Collections.Generic.List[string]); ReadTargets = (New-Object System.Collections.Generic.List[string])
+                Uploads = (New-Object System.Collections.Generic.List[object]); SecretByTarget = @{}
+                ThrowTargets = @($opsApiTarget); CorruptTargets = @(); ExceptionPayload = ''; RangeIdLogPath = ''; ConnectCalls = 0
+                CredentialWriter = $writer
+            }
+            $writtenSecure = New-Object System.Security.SecureString
+            foreach ($writtenChar in $writtenValue.ToCharArray()) { $writtenSecure.AppendChar($writtenChar) }
+            $writtenSecure.MakeReadOnly()
+            Set-BRAVOCredential -Target $opsApiTarget -Secret $writtenSecure
+            $maskSet = Get-BRAVOLogMaskSecretSet -CredentialSettings $credentialSettings
+            [pscustomobject]@{
+                Secrets      = [string[]]@($maskSet.Secrets)
+                SkippedText  = (@($maskSet.Skipped | ForEach-Object { "$($_.Target)=$($_.Reason)" }) -join '; ')
+                WriteCalls   = [string[]]$writer.Calls.ToArray()
+                OpsApiTarget = $opsApiTarget
+            }
+        } $secretMaskTargetsConfig ([string]$secretMask417ByKey['OperationsApiKeyWritten'])
+    } catch { $secretMask417WrittenError = $_.Exception.GetType().FullName }
+} else {
+    $secretMask417WrittenError = "межа CredWrite у Set-BRAVOCredential не знайдена рівно один раз (знайдено: $secretMask417WriteBoundaryCount)"
+}
+$secretMask417WrittenSecrets = @()
+$secretMask417WrittenCalls = @()
+$secretMask417WrittenLeaks = @()
+if ($null -ne $secretMask417WrittenResult) {
+    $secretMask417WrittenSecrets = @($secretMask417WrittenResult.Secrets)
+    $secretMask417WrittenCalls = @($secretMask417WrittenResult.WriteCalls)
+    $secretMask417WrittenLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text ([string]$secretMask417WrittenResult.SkippedText) -SecretByKey $secretMask417LeakByKey)
+}
+Test-BRAVOCondition (
+    $null -ne $secretMask417WrittenResult -and
+    $secretMask417WrittenCalls.Count -eq 1 -and
+    [string]$secretMask417WrittenCalls[0] -eq [string]$secretMask417WrittenResult.OpsApiTarget -and
+    $secretMask417WrittenSecrets -ccontains [string]$secretMask417ByKey['OperationsApiKeyWritten'] -and
+    $secretMask417WrittenLeaks.Count -eq 0
+) -Name 'Credentials/LogMaskSecretSetIncludesSecretsWrittenInProcess' `
+    -Failure "значення, записане Set-BRAVOCredential у цьому процесі, має бути в наборі маскування навіть коли пізніший CredRead того самого target-а падає; викликів CredWrite: $($secretMask417WrittenCalls.Count); значень у наборі: $($secretMask417WrittenSecrets.Count); записане значення в наборі: $($secretMask417WrittenSecrets -ccontains [string]$secretMask417ByKey['OperationsApiKeyWritten']); Skipped витекли: $($secretMask417WrittenLeaks -join ', '); помилка: $secretMask417WrittenError"
+
+# --- (б) збій обліку: читання успішне, набір маскування — fail-closed.
+$secretMask417BookkeepingResult = $null
+$secretMask417BookkeepingError = ''
+try {
+    $secretMask417BookkeepingModule = New-BRAVOSelfTestRuntimeModule -SourceText $secretMaskSourceText -FunctionNames $secretMaskEarlyFunctions
+    $secretMask417BookkeepingResult = & $secretMask417BookkeepingModule {
+        param($targetsConfig, $readValue, $payload)
+        $credentialSettings = @{ Targets = $targetsConfig }
+        $sftpTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
+        $secretByTarget = @{}
+        $secretByTarget[$sftpTarget] = $readValue
+        $script:secretMaskTestState = [pscustomobject]@{
+            LogLines = (New-Object System.Collections.Generic.List[string]); ReadTargets = (New-Object System.Collections.Generic.List[string])
+            Uploads = (New-Object System.Collections.Generic.List[object]); SecretByTarget = $secretByTarget
+            ThrowTargets = @(); CorruptTargets = @(); ExceptionPayload = ''; RangeIdLogPath = ''; ConnectCalls = 0
+        }
+        $failureText = 'synthetic registry bookkeeping failure ' + $payload
+        $brokenRegistry = New-Object psobject
+        Add-Member -InputObject $brokenRegistry -MemberType ScriptMethod -Name TryGetValue -Value ({ throw $failureText }.GetNewClosure())
+        $script:BRAVOCredentialReadSecretRegistry = $brokenRegistry
+        $readOut = $null
+        $readErrorType = ''
+        try { $readOut = Get-BRAVOCredentialSecret -Target $sftpTarget } catch { $readErrorType = $_.Exception.GetType().FullName }
+        # Реєстр знову справний (порожній): лишається ЛИШЕ ознака неповноти.
+        # Без fail-closed перевірки набір зібрався б "успішно", хоча облік
+        # прочитаних значень пропустив запис.
+        $script:BRAVOCredentialReadSecretRegistry = $null
+        $maskThrew = $false
+        $maskErrorText = ''
+        try {
+            [void](Get-BRAVOLogMaskSecretSet -CredentialSettings $credentialSettings)
+        } catch {
+            $maskThrew = $true
+            $maskErrorText = [string]$_.Exception.Message + ' | ' + [string]$_
+        }
+        [pscustomobject]@{ ReadValue = [string]$readOut; ReadErrorType = $readErrorType; MaskThrew = $maskThrew; MaskErrorText = $maskErrorText }
+    } $secretMaskTargetsConfig ([string]$secretMask417ByKey['SftpReadDuringFailure']) ([string]$secretMask417ByKey['RegistryFailurePayload'])
+} catch { $secretMask417BookkeepingError = $_.Exception.GetType().FullName }
+$secretMask417BookkeepingLeaks = @()
+if ($null -ne $secretMask417BookkeepingResult) {
+    $secretMask417BookkeepingLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text ([string]$secretMask417BookkeepingResult.MaskErrorText) -SecretByKey $secretMask417LeakByKey)
+}
+Test-BRAVOCondition (
+    $null -ne $secretMask417BookkeepingResult -and
+    [string]$secretMask417BookkeepingResult.ReadValue -ceq [string]$secretMask417ByKey['SftpReadDuringFailure'] -and
+    [string]::IsNullOrEmpty([string]$secretMask417BookkeepingResult.ReadErrorType) -and
+    [bool]$secretMask417BookkeepingResult.MaskThrew -and
+    $secretMask417BookkeepingLeaks.Count -eq 0
+) -Name 'Credentials/RegistryBookkeepingFailureDoesNotBreakReadButFailsMaskSet' `
+    -Failure "збій обліку прочитаних секретів не має ламати читання (getter повертає значення), але Get-BRAVOLogMaskSecretSet після цього має кидати (fail-closed) без секрету в повідомленні; читання повернуло значення: $(if ($null -ne $secretMask417BookkeepingResult) { [string]$secretMask417BookkeepingResult.ReadValue -ceq [string]$secretMask417ByKey['SftpReadDuringFailure'] } else { 'n/a' }); виняток читання: $(if ($null -ne $secretMask417BookkeepingResult) { [string]$secretMask417BookkeepingResult.ReadErrorType } else { 'n/a' }); набір кинув: $(if ($null -ne $secretMask417BookkeepingResult) { [bool]$secretMask417BookkeepingResult.MaskThrew } else { 'n/a' }); витекли ключі: $($secretMask417BookkeepingLeaks -join ', '); помилка: $secretMask417BookkeepingError"
+
+# --- (в) інтеграція: Invoke-BRAVOMaintenanceOwnLogUpload після збою обліку
+# нічого не вивантажує, пише WARNING без секретів і без тексту первинного
+# винятку, виняток назовні не йде.
+$secretMask417UploadResult = $null
+$secretMask417UploadError = $secretMaskSetupError
+try {
+    $secretMask417UploadModule = New-BRAVOSelfTestRuntimeModule -SourceText $secretMaskSourceText `
+        -FunctionNames ($secretMaskBoundaryAndUploadFunctions + @(
+            'Get-BRAVOCredentialTargetName', 'Get-BRAVOLogMaskSecretSet', 'Get-BRAVOArchivePasswordTarget',
+            'Protect-BRAVOLogSecret', 'New-BRAVOMaskedLogCopy', 'Remove-BRAVOMaskedLogCopy',
+            'Copy-BRAVOConfigurationGraphDeep', 'Get-BRAVODefaultConfiguration'
+        ))
+    $secretMask417UploadResult = & $secretMask417UploadModule {
+        param($logFilePath, $secretByTarget, $targetsConfig, $payload)
+        $script:secretMaskTestState = [pscustomobject]@{
+            LogLines = (New-Object System.Collections.Generic.List[string]); ReadTargets = (New-Object System.Collections.Generic.List[string])
+            Uploads = (New-Object System.Collections.Generic.List[object]); SecretByTarget = $secretByTarget
+            ThrowTargets = @(); CorruptTargets = @(); ExceptionPayload = ''; RangeIdLogPath = ''; ConnectCalls = 0
+        }
+        $global:componentSettings = [pscustomobject]@{ SFTP = [pscustomobject]@{ MaintenanceLogUploadEnabled = $true } }
+        $global:storageEffective = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $true } }
+        $script:credentialSettings = @{ Targets = $targetsConfig }
+        $script:sftpDirectories = [pscustomobject]@{ MaintenanceLog = 'logs/maintenance' }
+        $script:LOG_FILE = $logFilePath
+        $script:maintenanceLogRunId = 'selftest_417_run'
+        $script:maintenanceOwnLogUploadAttempted = $false
+        $sftpTarget = Get-BRAVOCredentialTargetName -CredentialSettings $script:credentialSettings -Key 'SFTPPassword'
+        $failureText = 'synthetic registry bookkeeping failure ' + $payload
+        $brokenRegistry = New-Object psobject
+        Add-Member -InputObject $brokenRegistry -MemberType ScriptMethod -Name TryGetValue -Value ({ throw $failureText }.GetNewClosure())
+        $script:BRAVOCredentialReadSecretRegistry = $brokenRegistry
+        $readOut = $null
+        $readErrorType = ''
+        try { $readOut = Get-BRAVOCredentialSecret -Target $sftpTarget } catch { $readErrorType = $_.Exception.GetType().FullName }
+        $script:BRAVOCredentialReadSecretRegistry = $null
+        $invokeError = ''
+        try {
+            Invoke-BRAVOMaintenanceOwnLogUpload
+        } catch {
+            $invokeError = [string]$_.Exception.Message
+        }
+        [pscustomobject]@{
+            ReadValue     = [string]$readOut
+            ReadErrorType = $readErrorType
+            Uploads       = $script:secretMaskTestState.Uploads.ToArray()
+            LogLines      = $script:secretMaskTestState.LogLines.ToArray()
+            InvokeError   = $invokeError
+        }
+    } $secretMaskLogFile $secretMaskSecretByTarget $secretMaskTargetsConfig ([string]$secretMask417ByKey['RegistryFailurePayload'])
+} catch { $secretMask417UploadError = "$secretMask417UploadError; $($_.Exception.GetType().FullName)" }
+$secretMask417UploadUploads = @()
+$secretMask417UploadLines = @()
+$secretMask417UploadLeaks = @()
+if ($null -ne $secretMask417UploadResult) {
+    $secretMask417UploadUploads = @($secretMask417UploadResult.Uploads | ForEach-Object { $_ })
+    $secretMask417UploadLines = @($secretMask417UploadResult.LogLines)
+    $secretMask417UploadLeaks = @(Get-BRAVOSelfTestLeakedSecretKeys -Text (($secretMask417UploadLines -join "`n") + "`n" + [string]$secretMask417UploadResult.InvokeError) -SecretByKey $secretMask417LeakByKey)
+}
+Test-BRAVOCondition (
+    $null -ne $secretMask417UploadResult -and
+    [string]$secretMask417UploadResult.ReadValue -ceq [string]$secretMaskSyntheticByKey['SFTPPassword'] -and
+    [string]::IsNullOrEmpty([string]$secretMask417UploadResult.ReadErrorType) -and
+    $secretMask417UploadUploads.Count -eq 0 -and
+    @($secretMask417UploadLines | Where-Object { $_.StartsWith('[WARNING]') }).Count -ge 1 -and
+    @($secretMask417UploadLines | Where-Object { $_.Contains('synthetic registry bookkeeping failure') }).Count -eq 0 -and
+    $secretMask417UploadLeaks.Count -eq 0 -and
+    [string]::IsNullOrEmpty([string]$secretMask417UploadResult.InvokeError)
+) -Name 'Maintenance/OwnLogUploadFailsClosedWithoutLeakWhenSecretRegistryIncomplete' `
+    -Failure "після збою обліку секретів: читання успішне, власний лог НЕ вивантажується, WARNING без секрету й без тексту первинного винятку, виняток назовні не йде; виняток читання: $(if ($null -ne $secretMask417UploadResult) { [string]$secretMask417UploadResult.ReadErrorType } else { 'n/a' }); uploads=$($secretMask417UploadUploads.Count); витекли ключі: $($secretMask417UploadLeaks -join ', '); помилка: $secretMask417UploadError"
 
 # --- #365 review (P3): частково перекриті секрети (кінець одного —
 # початок іншого) і секрети впритул не лишають фрагмента: збіги всіх
