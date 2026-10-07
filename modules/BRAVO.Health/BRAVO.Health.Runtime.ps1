@@ -61,6 +61,10 @@ $script:BRAVOHealthStepHistory = New-Object System.Collections.Generic.List[obje
 # прогону, бо підсумок результату й журнал читають її під Set-StrictMode
 # на кожному виході, зокрема ранньому.
 $script:healthNotInstalledComponents = @()
+# #301: підмножина NotInstalled, де каталог джерела є, але порожній, і ті
+# з них, що раніше мали дані (Warning). Звітуються окремо від «не встановлено».
+$script:healthEmptySourceComponents = @()
+$script:healthEmptySourceWarningComponents = @()
 $script:healthComponentScopeError = $null
 # Перевірка цілісності інструментів виконується значно нижче, але
 # Complete-BRAVOHealthResult читає її результат — а через цю функцію
@@ -81,6 +85,55 @@ function Initialize-BRAVOHealthSteps {
     $script:BRAVOHealthStepWarningCount = 0
     $script:BRAVOHealthStepErrorCount = 0
     $script:BRAVOHealthLastStepTime = Get-Date
+}
+
+function Get-BRAVOHealthCleanRunNotificationPlan {
+    # Чи надсилати Slack/Discord-звіт прогону без issue і з якою severity.
+    # Порожній каталог, що раніше мав дані (#301), - WARNING: звіт іде
+    # маршрутом alerts і в режимі errors_only, незалежно від NotifyOnSuccess,
+    # як і код завершення 10. Без нього - як раніше: SUCCESS лише за
+    # NotifyOnSuccess/ForceNotification у режимі all.
+    param(
+        [bool]$NotifyOnSuccess,
+        [bool]$ForceNotification,
+        [bool]$NoSlack,
+        [string]$NotificationMode,
+        [int]$EmptySourceWarningCount
+    )
+
+    $warned = $EmptySourceWarningCount -gt 0
+    $send = (-not $NoSlack) -and (
+        (($NotifyOnSuccess -or $ForceNotification) -and $NotificationMode -eq 'all') -or
+        ($warned -and @('all', 'errors_only') -contains $NotificationMode)
+    )
+    return [pscustomobject]@{
+        Send = [bool]$send
+        Severity = $(if ($warned) { 'WARNING' } else { 'SUCCESS' })
+    }
+}
+
+function Get-BRAVOHealthCleanRunOperationsVerdict {
+    # Severity Operations-події для прогону, у якому перевірки не дали issue.
+    # Вона має збігатися з кодом завершення: ShouldBlock маніфесту
+    # інструментів перекриває результат ToolIntegrityViolation (review thread
+    # 15 PR #225), а WARNING у журналі дає код 10 (#301, рев'ю #391: порожній
+    # каталог, що раніше мав дані). Лічильник - той самий $script:BRAVOWarningCount,
+    # з якого рахується код завершення.
+    param(
+        [bool]$ToolIntegrityShouldBlock,
+        [int]$LogWarningCount
+    )
+
+    $operationsHealthSeverity = 'SUCCESS'
+    $operationsHealthMessage = 'Health-перевірка успішна'
+    if ($ToolIntegrityShouldBlock) {
+        $operationsHealthSeverity = 'CRITICAL'
+        $operationsHealthMessage = 'Health-перевірки без issue, але порушено цілісність комплекту інструментів — результат Health перекривається ToolIntegrityViolation'
+    } elseif ($LogWarningCount -gt 0) {
+        $operationsHealthSeverity = 'WARNING'
+        $operationsHealthMessage = "Health-перевірки без issue, але журнал має попереджень: $LogWarningCount (код завершення 10)"
+    }
+    return [pscustomobject]@{ Severity = $operationsHealthSeverity; Message = $operationsHealthMessage }
 }
 
 function Write-BRAVOHealthStep {
@@ -580,6 +633,8 @@ $healthComponentScope = Get-BRAVOBackupNotInstalledComponents `
     -BackupRoot $backupRootPath
 $script:healthComponentScopeError = [string]$healthComponentScope.Error
 $script:healthNotInstalledComponents = @($healthComponentScope.NotInstalled)
+$script:healthEmptySourceComponents = @($healthComponentScope.EmptySource)
+$script:healthEmptySourceWarningComponents = @($healthComponentScope.EmptySourceWarning)
 $bazaAppHealthInstalled = @($script:healthNotInstalledComponents) -notcontains 'BAZA_APP'
 $bazaWWWHealthInstalled = @($script:healthNotInstalledComponents) -notcontains 'BAZA_WWW'
 
@@ -4834,13 +4889,30 @@ function New-SlackSuccessMessage {
         $resultLines.Add("")
         $resultLines.Add("Компоненти: $enabledComponentCount/$enabledComponentCount")
     }
-    if (@($script:healthNotInstalledComponents).Count -gt 0) {
-        $resultLines.Add(":information_source: Не встановлено на цьому сервері: $(@($script:healthNotInstalledComponents) -join ', ')")
+    # Стан складу читається через Get-Variable: повідомлення будують і
+    # ізольовані перевірки, де частину стану прогону не ініціалізовано.
+    $emptySourceVariable = Get-Variable -Name healthEmptySourceComponents -Scope Script -ErrorAction SilentlyContinue
+    $emptySourceComponents = @(if ($null -ne $emptySourceVariable) { $emptySourceVariable.Value })
+    $emptySourceWarningVariable = Get-Variable -Name healthEmptySourceWarningComponents -Scope Script -ErrorAction SilentlyContinue
+    $emptySourceWarningComponents = @(if ($null -ne $emptySourceWarningVariable) { $emptySourceWarningVariable.Value })
+    $notInstalledOnly = @(@($script:healthNotInstalledComponents) | Where-Object { $emptySourceComponents -notcontains $_ })
+    if ($notInstalledOnly.Count -gt 0) {
+        $resultLines.Add(":information_source: Не встановлено на цьому сервері: $($notInstalledOnly -join ', ')")
+    }
+    $emptySourceInfoOnly = @($emptySourceComponents | Where-Object { $emptySourceWarningComponents -notcontains $_ })
+    if ($emptySourceWarningComponents.Count -gt 0) {
+        $resultLines.Add(":warning: Каталог джерела порожній, хоча раніше мав дані (не копіюється): $($emptySourceWarningComponents -join ', ')")
+    }
+    if ($emptySourceInfoOnly.Count -gt 0) {
+        $resultLines.Add(":information_source: Каталог джерела порожній (не копіюється): $($emptySourceInfoOnly -join ', ')")
     }
 
+    # #301: порожній каталог, що мав дані, - звіт з попередженням, а не
+    # «ВСЕ СПРАВНО» (код завершення 10).
     return New-BRAVOOperatorNotificationMessage `
-        -Severity "SUCCESS" `
-        -Operation "BRAVO BACKUP — ВСЕ СПРАВНО" `
+        -Severity $(if ($emptySourceWarningComponents.Count -gt 0) { "WARNING" } else { "SUCCESS" }) `
+        -Operation $(if ($emptySourceWarningComponents.Count -gt 0) { "BRAVO BACKUP — СПРАВНО, Є ПОПЕРЕДЖЕННЯ" } else { "BRAVO BACKUP — ВСЕ СПРАВНО" }) `
+        -ActionText $(if ($emptySourceWarningComponents.Count -gt 0) { "перевірити порожній каталог джерела або підтвердити новий baseline (BRAVO_SETUP.ps1 -Action Test -ValidateOnly -ConfirmDiscoveryBaseline)" } else { "" }) `
         -InstitutionName ([string]$backupMonitoring.InstitutionName) `
         -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
         -HostInformation $hostInformation `
@@ -5062,7 +5134,10 @@ function Get-BRAVOHealthSuccessFingerprint {
         [Parameter(Mandatory = $true)]$DestinationSummary,
         [bool]$SftpDeferred,
         [string[]]$EnabledCheckNames = @(),
-        [array]$ArchiveIdentities = @()
+        [array]$ArchiveIdentities = @(),
+        # #301: порожні каталоги, що мали дані. Рядок додається лише коли
+        # список непорожній, тож відбиток без них не змінився.
+        [string[]]$EmptySourceWarningComponents = @()
     )
 
     $canonicalLines = New-Object System.Collections.Generic.List[string]
@@ -5082,6 +5157,11 @@ function Get-BRAVOHealthSuccessFingerprint {
             'unknown'
         }
         $canonicalLines.Add("archive=$([string]$archiveIdentity.Type):$identityText")
+    }
+    $warningComponentNames = @(@($EmptySourceWarningComponents) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($warningComponentNames.Count -gt 0) {
+        $canonicalLines.Add('emptySourceWarning=' + ((@($warningComponentNames) | Sort-Object) -join ','))
     }
 
     $canonicalText = ($canonicalLines -join "`n")
@@ -5363,8 +5443,19 @@ if ($SkipIfBackupTaskRunning) {
 Write-HealthLog "Конфігурація: $ConfigPath"
 Write-HealthLog "Сумісність: Windows $($BRAVOCompatibility.WindowsVersion); PowerShell $($BRAVOCompatibility.PowerShellVersion); WMI=$($BRAVOCompatibility.WmiProvider); JSON=$($BRAVOCompatibility.JsonProvider); завдання=$($BRAVOCompatibility.TaskSchedulerProvider)"
 Write-HealthLog "Каталог резервних копій: $backupRootPath"
-if ($script:healthNotInstalledComponents.Count -gt 0) {
-    Write-HealthLog "Не встановлено на цьому сервері (не перевіряється): $($script:healthNotInstalledComponents -join ', ')"
+$healthNotInstalledOnly = @(@($script:healthNotInstalledComponents) | Where-Object {
+    @($script:healthEmptySourceComponents) -notcontains $_
+})
+if ($healthNotInstalledOnly.Count -gt 0) {
+    Write-HealthLog "Не встановлено на цьому сервері (не перевіряється): $($healthNotInstalledOnly -join ', ')"
+}
+foreach ($healthEmptySourceComponent in @($script:healthEmptySourceComponents)) {
+    if (@($script:healthEmptySourceWarningComponents) -contains $healthEmptySourceComponent) {
+        Write-HealthLog ("Каталог джерела $healthEmptySourceComponent порожній, хоча раніше мав дані: компонент не " +
+            "копіюється й не перевіряється. Якщо зміна легітимна, підтвердіть новий baseline.") -Level WARNING
+    } else {
+        Write-HealthLog "Каталог джерела $healthEmptySourceComponent порожній (не копіюється й не перевіряється)"
+    }
 }
 if (-not [string]::IsNullOrWhiteSpace([string]$script:healthComponentScopeError)) {
     Write-HealthLog "Склад компонентів за наявністю не визначено, очікуються всі увімкнені: $($script:healthComponentScopeError)"
@@ -6077,11 +6168,16 @@ if ($healthIssues.Count -eq 0) {
     $operationalRecoveryPending = [bool](Get-BRAVOHealthOperationalState).RecoveryPending
     Clear-AlertState
 
-    $sendSuccessNotification = (
-        ($NotifyOnSuccess -or $ForceNotification) -and
-        -not $NoSlack -and
-        $NotificationMode -eq "all"
-    )
+    # #301: порожній каталог, що мав дані, надсилається як WARNING і в
+    # режимі errors_only (Get-BRAVOHealthCleanRunNotificationPlan).
+    $successNotificationPlan = Get-BRAVOHealthCleanRunNotificationPlan `
+        -NotifyOnSuccess ([bool]$NotifyOnSuccess) `
+        -ForceNotification ([bool]$ForceNotification) `
+        -NoSlack ([bool]$NoSlack) `
+        -NotificationMode ([string]$NotificationMode) `
+        -EmptySourceWarningCount @($script:healthEmptySourceWarningComponents).Count
+    $sendSuccessNotification = [bool]$successNotificationPlan.Send
+    $successNotificationSeverity = [string]$successNotificationPlan.Severity
     # 5.2.1: semantic + recovery-aware дедуплікація зелених звітів.
     # Embedded post-backup виклик з Archive (SuppressHeader) не дедупиться —
     # це первинне підтвердження свіжої копії; standalone-прогін мовчить лише
@@ -6115,7 +6211,8 @@ if ($healthIssues.Count -eq 0) {
         -DestinationSummary $destinationSummary `
         -SftpDeferred ([bool]$script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) `
         -EnabledCheckNames $successEnabledCheckNames `
-        -ArchiveIdentities $successArchiveIdentities
+        -ArchiveIdentities $successArchiveIdentities `
+        -EmptySourceWarningComponents @($script:healthEmptySourceWarningComponents)
 
     # Operations: НАВМИСНО ПОЗА $sendSuccessNotification/success-dedup
     # гейтингом нижче (review finding) — healthy-подія на dashboard не
@@ -6141,12 +6238,13 @@ if ($healthIssues.Count -eq 0) {
             # #296: ShouldBlock тепер завжди дає issue «Цілісність
             # інструментів» (див. збирання $healthIssues), тож ця гілка при
             # ShouldBlock недосяжна; перевірку лишено як захисну.
-            $operationsHealthSeverity = 'SUCCESS'
-            $operationsHealthMessage = 'Health-перевірка успішна'
-            if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
-                $operationsHealthSeverity = 'CRITICAL'
-                $operationsHealthMessage = 'Health-перевірки без issue, але порушено цілісність комплекту інструментів — результат Health перекривається ToolIntegrityViolation'
-            }
+            # #301 (рев'ю #391): WARNING у журналі дає код 10, тож подія теж
+            # WARNING, а не SUCCESS.
+            $operationsHealthVerdict = Get-BRAVOHealthCleanRunOperationsVerdict `
+                -ToolIntegrityShouldBlock ([bool]($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock)) `
+                -LogWarningCount $script:BRAVOWarningCount
+            $operationsHealthSeverity = [string]$operationsHealthVerdict.Severity
+            $operationsHealthMessage = [string]$operationsHealthVerdict.Message
             Send-BRAVOOperationsEvent `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
@@ -6167,6 +6265,7 @@ if ($healthIssues.Count -eq 0) {
                     okCount = $script:BRAVOHealthStepOkCount
                     warnCount = $script:BRAVOHealthStepWarningCount
                     errorCount = $script:BRAVOHealthStepErrorCount
+                    logWarningCount = $script:BRAVOWarningCount
                     durationMs = [Math]::Round($operationsHealthDuration.TotalMilliseconds)
                     toolIntegrityShouldBlock = [bool]($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock)
                 }
@@ -6216,7 +6315,7 @@ if ($healthIssues.Count -eq 0) {
         $successMessage = New-SlackSuccessMessage -Duration $healthDuration
         try {
             $successRoute = Resolve-BRAVONotificationRoute `
-                -Severity "SUCCESS" `
+                -Severity $successNotificationSeverity `
                 -NotificationMode $NotificationMode `
                 -RoutingTable $backupMonitoring.NotificationRouting
             $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage

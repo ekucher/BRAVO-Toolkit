@@ -496,7 +496,15 @@ function New-BRAVODiscoveryComponentPresence {
         [string]$Presence,
         [string]$Source = 'None',
         [string]$Path,
-        [string]$Reason
+        [string]$Reason,
+        # Лише для Absent (#301): чому джерела немає - 'Empty' (каталог
+        # існує, але порожній), 'NotFound' чи 'NoPath'. Порожній оголошений
+        # каталог пропускається з Info/Warning, а відсутній лишається Error.
+        [string]$AbsenceKind,
+        # Лише для AbsenceKind 'Empty': шлях порожнього каталогу. Path для
+        # не-Present лишається порожнім (інваріант), а цей шлях потрібен як
+        # доказ у baseline, коли сире поле компонента порожнє (BAZA_WWW).
+        [string]$EmptyPath
     )
 
     return [pscustomobject]@{
@@ -505,6 +513,8 @@ function New-BRAVODiscoveryComponentPresence {
         Source = $Source
         Path = $(if ($Presence -eq 'Present' -and -not [string]::IsNullOrWhiteSpace($Path)) { $Path } else { $null })
         Reason = $Reason
+        AbsenceKind = $(if ($Presence -eq 'Absent' -and -not [string]::IsNullOrWhiteSpace($AbsenceKind)) { $AbsenceKind } else { $null })
+        EmptyPath = $(if ($Presence -eq 'Absent' -and $AbsenceKind -eq 'Empty' -and -not [string]::IsNullOrWhiteSpace($EmptyPath)) { $EmptyPath } else { $null })
     }
 }
 
@@ -542,7 +552,7 @@ function Resolve-BRAVODiscoveryPathComponentPresence {
     if (-not (Test-BRAVOAbsolutePath -Path $Path)) {
         return New-BRAVODiscoveryComponentPresence -Component $Component `
             -Presence $failurePresence -Source $Source `
-            -Reason "$Reason [шлях не є absolute: '$Path']"
+            -Reason "$Reason [шлях не є absolute: '$Path']" -AbsenceKind 'NoPath'
     }
 
     $structural = Test-BRAVODiscoverySourceDirectory -Path $Path -ComponentLabel $Component
@@ -552,7 +562,7 @@ function Resolve-BRAVODiscoveryPathComponentPresence {
         }
         return New-BRAVODiscoveryComponentPresence -Component $Component `
             -Presence $failurePresence -Source $Source `
-            -Reason "$Reason [$($structural.Reason)]"
+            -Reason "$Reason [$($structural.Reason)]" -AbsenceKind ([string]$structural.Kind)
     }
 
     return New-BRAVODiscoveryComponentPresence -Component $Component `
@@ -1069,6 +1079,10 @@ function Resolve-BRAVOInstallationDiscovery {
     } else { $null }
     $bazaWwwPresence = $null
     $bazaWwwSource = 'None'
+    # #301: 'Empty', коли <DocumentRoot>\BAZA існує, але порожній (як і для
+    # компонентів з bravo.ini у Resolve-BRAVODiscoveryPathComponentPresence).
+    $bazaWwwAbsenceKind = $null
+    $bazaWwwEmptyPath = $null
     if (-not [string]::IsNullOrWhiteSpace($bazaWwwOverride)) {
         $overrides['BAZA_WWW'] = $true
         $bazaWwwSource = 'ExplicitOverride'
@@ -1112,6 +1126,10 @@ function Resolve-BRAVOInstallationDiscovery {
             # discovery-механізму. Тому Absent, не Error (розділ 6 ТЗ:
             # сама наявність Apache не означає BAZA_WWW).
             $bazaWwwPresence = 'Absent'
+            if ([string]$bazaWwwStructural.Kind -eq 'Empty') {
+                $bazaWwwAbsenceKind = 'Empty'
+                $bazaWwwEmptyPath = $bazaWwwCandidate
+            }
             $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "Apache знайдено, DocumentRoot=$apacheDocumentRoot, але $($bazaWwwStructural.Reason) — BAZA_WWW на цьому Apache відсутній" }
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($apacheServerRoot)) {
@@ -1264,7 +1282,8 @@ function Resolve-BRAVOInstallationDiscovery {
     # тут його НЕ переобчислюємо, лише приводимо до спільної структури.
     $components['BAZA_WWW'] = New-BRAVODiscoveryComponentPresence -Component 'BAZA_WWW' `
         -Presence $bazaWwwPresence -Source $bazaWwwSource `
-        -Path ([string]$bazaWwwResolved.Value) -Reason ([string]$bazaWwwResolved.Reason)
+        -Path ([string]$bazaWwwResolved.Value) -Reason ([string]$bazaWwwResolved.Reason) `
+        -AbsenceKind ([string]$bazaWwwAbsenceKind) -EmptyPath ([string]$bazaWwwEmptyPath)
 
     return [pscustomobject]@{
         BRAVO_ROOT = $bravoRoot
@@ -1497,14 +1516,26 @@ $script:BRAVODiscoveryBaselineFields = @(
 
 $script:BRAVODiscoveryBaselineFileName = 'DISCOVERY_BASELINE.json'
 
+function Get-BRAVODiscoveryAbsenceKind {
+    # AbsenceKind presence-запису (#301) або $null. Синтетичні й старі
+    # записи поля не мають, тому читання безпечне під StrictMode.
+    param([object]$Entry)
+
+    if ($null -eq $Entry) { return $null }
+    $property = $Entry.PSObject.Properties['AbsenceKind']
+    if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) { return $null }
+    return [string]$property.Value
+}
+
 function New-BRAVODiscoveryDriftFinding {
-    # Спільна структура знахідки дрейфу (#158, етап 3). Severity лише
-    # 'Error' або 'Info': третього рівня тут навмисно немає — знахідка
-    # або зупиняє прогін, або пояснює оператору легітимний стан.
+    # Спільна структура знахідки дрейфу (#158, етап 3). Severity:
+    # 'Error' зупиняє прогін, 'Info' пояснює легітимний стан, 'Warning'
+    # (#301, рішення власника 2026-10-07) - компонент пропущено без
+    # зупинки, але оператор має це бачити на кожному прогоні.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Component,
-        [Parameter(Mandatory = $true)][ValidateSet('Error', 'Info')][string]$Severity,
+        [Parameter(Mandatory = $true)][ValidateSet('Error', 'Warning', 'Info')][string]$Severity,
         [string]$Presence = 'Unknown',
         [string]$BaselineSource,
         [Parameter(Mandatory = $true)][string]$Message
@@ -1530,6 +1561,9 @@ function Test-BRAVODiscoveryComponentDrift {
     #   Present                          -> компонент активний, знахідки немає
     #   Absent  + у baseline немає       -> Info (легітимна відсутність)
     #   Absent  + у baseline є           -> Error (fail-closed)
+    #   Absent (каталог порожній, #301)  -> Info, або Warning, якщо в
+    #                                       baseline є (рішення власника
+    #                                       2026-10-07: не блокує)
     #   Ambiguous                        -> Error (fail-closed)
     #   Error                            -> Error (fail-closed)
     #   вимкнено в конфігурації           -> Info (свідома політика оператора)
@@ -1606,6 +1640,29 @@ function Test-BRAVODiscoveryComponentDrift {
             continue
         }
 
+        if ($presence -eq 'Absent' -and
+            (Get-BRAVODiscoveryAbsenceKind -Entry $componentEntry) -eq 'Empty') {
+            # #301: каталог існує, але порожній (новий BLOG, порожня черга
+            # BEXCH). Це не зникнення інсталяції, тому прогін не зупиняється.
+            # Раніше підтверджений компонент дає Warning на кожному прогоні:
+            # каталог, що раптом спорожнів, лишається видимим.
+            if ($wasConfirmed) {
+                $findings.Add((New-BRAVODiscoveryDriftFinding `
+                    -Component $componentName -Severity 'Warning' -Presence $presence `
+                    -BaselineSource $baselineValue `
+                    -Message ("Компонент '$componentName' раніше був підтверджений у baseline (джерело: " +
+                        "$baselineValue), а зараз його каталог порожній ($presenceReason). Компонент пропущено " +
+                        'в цьому прогоні без помилки; попередження повторюватиметься, доки в каталозі не ' +
+                        "з'являться дані. $confirmHint")))
+            } else {
+                $findings.Add((New-BRAVODiscoveryDriftFinding `
+                    -Component $componentName -Severity 'Info' -Presence $presence `
+                    -Message ("Компонент '$componentName' пропущено: його каталог порожній і в baseline " +
+                        "раніше не підтверджувався ($presenceReason).")))
+            }
+            continue
+        }
+
         if ($presence -eq 'Absent') {
             if ($wasConfirmed) {
                 $findings.Add((New-BRAVODiscoveryDriftFinding `
@@ -1672,6 +1729,10 @@ function Resolve-BRAVOBackupComponentScope {
     #           другий доказ присутності для серверів, що бекапилися до
     #           появи baseline; зниклий компонент не стає «не встановленим»
     #   Ambiguous / Error                   -> Unknown          (Error, як і раніше)
+    #   Absent, каталог існує, але порожній (#301, рішення власника
+    #           2026-10-07)                 -> EmptySource (пропуск без помилки:
+    #           Info, або Warning, якщо компонент раніше був у baseline чи в
+    #           останній COMPLETE generation); обов'язковий MODEL - Missing
     #
     # Інваріант #158 не послаблено: раніше підтверджений компонент не має
     # права тихо зникнути, а «не вдалося визначити» не дорівнює «немає».
@@ -1711,6 +1772,12 @@ function Resolve-BRAVOBackupComponentScope {
     $scopes = [ordered]@{}
     $planned = New-Object System.Collections.Generic.List[string]
     $notInstalled = New-Object System.Collections.Generic.List[string]
+    $emptySource = New-Object System.Collections.Generic.List[string]
+    # EmptySource, доказ присутності якого є лише в останньому COMPLETE
+    # manifest: Update-BRAVODiscoveryBaselineFromScope переносить його в
+    # baseline, бо наступна generation цей компонент уже не містить, і без
+    # baseline Warning зник би після першого прогону.
+    $emptySourceRetained = New-Object System.Collections.Generic.List[string]
     $effectiveEnabled = @{}
     $confirmHint = "Якщо зміна легітимна — підтвердіть новий baseline: $script:BRAVODiscoveryConfirmBaselineCommand"
 
@@ -1733,6 +1800,50 @@ function Resolve-BRAVOBackupComponentScope {
             }
         }
 
+        $baselineBlankForComponent = ([string]$BaselineSourceKind -eq 'None')
+        if (-not $baselineBlankForComponent -and $null -ne $PreviousCompleteAt -and $null -ne $Baseline) {
+            # Baseline старіший за COMPLETE manifest: компонент міг з'явитись
+            # після нього, і порожнє поле baseline ще нічого не доводить.
+            $savedAtProperty = $Baseline.PSObject.Properties['SavedAt']
+            $savedAt = [datetime]::MinValue
+            if ($null -ne $savedAtProperty -and
+                [datetime]::TryParse([string]$savedAtProperty.Value, [ref]$savedAt) -and
+                $savedAt.ToUniversalTime() -lt ([datetime]$PreviousCompleteAt).ToUniversalTime()) {
+                $baselineBlankForComponent = $true
+            }
+        }
+        $previouslyBackedUp = ($scope -eq 'NotInstalled' -and
+            $baselineBlankForComponent -and
+            @($PreviousCompleteComponents) -contains $componentName)
+
+        # #301: оголошений каталог існує, але порожній. Компонент пропускається
+        # (у списку NotInstalled для споживачів, scope EmptySource); якщо він
+        # раніше мав дані (baseline або останній COMPLETE manifest) - Warning.
+        $absenceKind = Get-BRAVODiscoveryAbsenceKind -Entry $DiscoveryResult.Components[$componentName]
+        if ($scope -eq 'NotInstalled' -and $absenceKind -eq 'Empty' -and
+            $script:BRAVOBackupMandatoryComponents -notcontains $componentName) {
+            $scope = 'EmptySource'
+            $emptyFinding = $(if ($componentFinding.Count -gt 0) { $componentFinding[0] } else { $null })
+            if ($null -ne $emptyFinding -and [string]$emptyFinding.Severity -eq 'Warning') {
+                $findings.Add($emptyFinding)
+            } elseif ($previouslyBackedUp) {
+                $emptySourceRetained.Add($componentName)
+                $findings.Add((New-BRAVODiscoveryDriftFinding `
+                    -Component $componentName -Severity 'Warning' -Presence 'Absent' `
+                    -Message ("Компонент '$componentName' мав архів в останній COMPLETE generation, а зараз його " +
+                        "каталог порожній ($([string]$DiscoveryResult.Components[$componentName].Reason)). Компонент " +
+                        "пропущено в цьому прогоні без помилки; попередження повторюватиметься, доки в каталозі " +
+                        "не з'являться дані. $confirmHint")))
+            } elseif ($null -ne $emptyFinding) {
+                $findings.Add($emptyFinding)
+            }
+            $scopes[$componentName] = $scope
+            $notInstalled.Add($componentName)
+            $emptySource.Add($componentName)
+            $effectiveEnabled[$componentName] = $false
+            continue
+        }
+
         # Оголошене джерело (bravo.ini/служба/override), яке не вдалося
         # підтвердити, не може бути «не встановлено»: NotInstalled лише коли
         # джерело не оголошено (Source 'None') або Apache не хостить BAZA.
@@ -1750,22 +1861,6 @@ function Resolve-BRAVOBackupComponentScope {
             $effectiveEnabled[$componentName] = $isEnabled
             continue
         }
-
-        $baselineBlankForComponent = ([string]$BaselineSourceKind -eq 'None')
-        if (-not $baselineBlankForComponent -and $null -ne $PreviousCompleteAt -and $null -ne $Baseline) {
-            # Baseline старіший за COMPLETE manifest: компонент міг з'явитись
-            # після нього, і порожнє поле baseline ще нічого не доводить.
-            $savedAtProperty = $Baseline.PSObject.Properties['SavedAt']
-            $savedAt = [datetime]::MinValue
-            if ($null -ne $savedAtProperty -and
-                [datetime]::TryParse([string]$savedAtProperty.Value, [ref]$savedAt) -and
-                $savedAt.ToUniversalTime() -lt ([datetime]$PreviousCompleteAt).ToUniversalTime()) {
-                $baselineBlankForComponent = $true
-            }
-        }
-        $previouslyBackedUp = ($scope -eq 'NotInstalled' -and
-            $baselineBlankForComponent -and
-            @($PreviousCompleteComponents) -contains $componentName)
 
         if ($previouslyBackedUp -and $script:BRAVOBackupMandatoryComponents -notcontains $componentName) {
             $scope = 'Missing'
@@ -1816,6 +1911,13 @@ function Resolve-BRAVOBackupComponentScope {
         Components = $scopes
         Planned = $planned.ToArray()
         NotInstalled = $notInstalled.ToArray()
+        EmptySource = $emptySource.ToArray()
+        EmptySourceRetained = $emptySourceRetained.ToArray()
+        # Час COMPLETE manifest, на якому тримається EmptySourceRetained
+        # ($null, якщо доказ узято за відсутнього baseline). За ним
+        # Update-BRAVODiscoveryBaselineFromScope розпізнає baseline,
+        # підтверджений оператором уже після цього рішення.
+        EmptySourceEvidenceAt = $PreviousCompleteAt
         EffectiveEnabledComponents = $effectiveEnabled
         EmptyComposition = $emptyComposition
         Findings = $findings.ToArray()
@@ -2046,6 +2148,62 @@ function Import-BRAVODiscoveryBaseline {
     }
 }
 
+function New-BRAVODiscoveryBaselineSnapshot {
+    # Знімок baseline з результату discovery (#301). Його використовують і
+    # Save-BRAVODiscoveryBaseline, і попередній перегляд
+    # BRAVO_SETUP -ValidateOnly -ConfirmDiscoveryBaseline, щоб перегляд
+    # погоджувався з тим, що справді буде записано.
+    #
+    # Сире поле джерела (BLOG_SOURCE тощо) лишається шляхом з bravo.ini і
+    # для порожнього каталогу. Записане в baseline, воно перетворило б
+    # «каталог ще порожній» на «раніше підтверджений компонент» і давало б
+    # Warning на кожному прогоні. Тому для доведено порожнього каталогу
+    # (Absent з AbsenceKind 'Empty') пишеться ''. Error/Ambiguous і
+    # відсутній каталог зберігають сире значення: це «невідомо» або
+    # «зникло», а не «порожньо», і стирати доказ не можна.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$DiscoveryResult,
+        # Якщо задано, у поля джерел компонентів потрапляють лише ці
+        # компоненти (решта компонентних полів лишається порожньою).
+        [string[]]$Components
+    )
+
+    $snapshot = [ordered]@{ SavedAt = (Get-Date).ToString("o") }
+    $restrictedFields = $null
+    if ($PSBoundParameters.ContainsKey('Components')) {
+        $restrictedFields = @{}
+        foreach ($componentName in @($Components)) {
+            if ($script:BRAVODiscoveryComponentSourceFields.Contains($componentName)) {
+                $restrictedFields[[string]$script:BRAVODiscoveryComponentSourceFields[$componentName]] = $true
+            }
+        }
+    }
+    $componentFieldNames = @($script:BRAVODiscoveryComponentSourceFields.Values)
+    $emptySourceFields = @{}
+    $componentsProperty = $DiscoveryResult.PSObject.Properties['Components']
+    if ($null -ne $componentsProperty -and $componentsProperty.Value -is [System.Collections.IDictionary]) {
+        foreach ($componentName in $script:BRAVODiscoveryComponentSourceFields.Keys) {
+            $presenceEntry = $componentsProperty.Value[$componentName]
+            if ($null -ne $presenceEntry -and [string]$presenceEntry.Presence -eq 'Absent' -and
+                (Get-BRAVODiscoveryAbsenceKind -Entry $presenceEntry) -eq 'Empty') {
+                $emptySourceFields[[string]$script:BRAVODiscoveryComponentSourceFields[$componentName]] = $true
+            }
+        }
+    }
+    foreach ($fieldName in $script:BRAVODiscoveryBaselineFields) {
+        if ($emptySourceFields.ContainsKey($fieldName) -or
+            ($null -ne $restrictedFields -and
+            $componentFieldNames -contains $fieldName -and
+            -not $restrictedFields.ContainsKey($fieldName))) {
+            $snapshot[$fieldName] = ''
+        } else {
+            $snapshot[$fieldName] = [string]$DiscoveryResult.$fieldName
+        }
+    }
+    return [pscustomobject]$snapshot
+}
+
 function Save-BRAVODiscoveryBaseline {
     # AUD-007 (аудит P1.1/P1.2): зберігає останній підтверджений discovery-
     # результат на диск (JSON, без BOM — узгоджено з VERSION.json), щоб
@@ -2063,32 +2221,17 @@ function Save-BRAVODiscoveryBaseline {
         [string[]]$Components
     )
 
-    $snapshot = [ordered]@{ SavedAt = (Get-Date).ToString("o") }
-    $restrictedFields = $null
     if ($PSBoundParameters.ContainsKey('Components')) {
-        $restrictedFields = @{}
-        foreach ($componentName in @($Components)) {
-            if ($script:BRAVODiscoveryComponentSourceFields.Contains($componentName)) {
-                $restrictedFields[[string]$script:BRAVODiscoveryComponentSourceFields[$componentName]] = $true
-            }
-        }
-    }
-    $componentFieldNames = @($script:BRAVODiscoveryComponentSourceFields.Values)
-    foreach ($fieldName in $script:BRAVODiscoveryBaselineFields) {
-        if ($null -ne $restrictedFields -and
-            $componentFieldNames -contains $fieldName -and
-            -not $restrictedFields.ContainsKey($fieldName)) {
-            $snapshot[$fieldName] = ''
-        } else {
-            $snapshot[$fieldName] = [string]$DiscoveryResult.$fieldName
-        }
+        $snapshot = New-BRAVODiscoveryBaselineSnapshot -DiscoveryResult $DiscoveryResult -Components $Components
+    } else {
+        $snapshot = New-BRAVODiscoveryBaselineSnapshot -DiscoveryResult $DiscoveryResult
     }
 
     # #158 (етап 1): запис АТОМАРНИЙ. Раніше був простий WriteAllText —
     # перерваний запис (живлення, kill) лишав би baseline напівзаписаним,
     # а пошкоджений baseline знецінює саме той доказ, заради якого він
     # існує. Каталог створює сам helper.
-    $json = [pscustomobject]$snapshot | ConvertTo-Json
+    $json = $snapshot | ConvertTo-Json
     Write-BRAVODiscoveryBaselineTextAtomic -Path $BaselinePath -Text $json
 }
 
@@ -2164,6 +2307,27 @@ function Get-BRAVOLastCompleteBackupComponents {
     return @((Get-BRAVOLastCompleteBackupEvidence -BackupRoot $BackupRoot).Components)
 }
 
+function Get-BRAVOEmptySourceWarningComponents {
+    # #301: компоненти з порожнім каталогом джерела, для яких склад має
+    # Warning (раніше мали дані). Спільне для read-only складу (Health, Dry
+    # Run) і -SyncBAZA, щоб жоден споживач не губив це попередження.
+    # -Components обмежує результат переліком компонентів.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$ScopeResult,
+        [string[]]$Components
+    )
+
+    $restrictToComponents = $PSBoundParameters.ContainsKey('Components')
+    $emptySourceProperty = $ScopeResult.PSObject.Properties['EmptySource']
+    $emptySource = @(if ($null -ne $emptySourceProperty) { $emptySourceProperty.Value })
+    return @(@($ScopeResult.Findings) | Where-Object {
+        [string]$_.Severity -eq 'Warning' -and
+        $emptySource -contains [string]$_.Component -and
+        (-not $restrictToComponents -or @($Components) -contains [string]$_.Component)
+    } | ForEach-Object { [string]$_.Component } | Select-Object -Unique)
+}
+
 function Get-BRAVOBackupNotInstalledComponents {
     # Read-only варіант складу backup set для споживачів, які лише
     # звітують (Health, Dry Run): baseline читається з -ReadOnly, нічого
@@ -2188,7 +2352,7 @@ function Get-BRAVOBackupNotInstalledComponents {
             -RuntimeRoot $RuntimeRoot `
             -ReadOnly
         if ([string]$baselineImport.Source -eq 'Unreadable') {
-            return [pscustomobject]@{ NotInstalled = @(); Error = $null }
+            return [pscustomobject]@{ NotInstalled = @(); EmptySource = @(); EmptySourceWarning = @(); Error = $null }
         }
         $previousEvidence = Get-BRAVOLastCompleteBackupEvidence -BackupRoot $BackupRoot
         $scope = Resolve-BRAVOBackupComponentScope `
@@ -2198,9 +2362,18 @@ function Get-BRAVOBackupNotInstalledComponents {
             -EnabledComponents $EnabledComponents `
             -PreviousCompleteComponents @($previousEvidence.Components) `
             -PreviousCompleteAt $previousEvidence.CreatedAtUtc
-        return [pscustomobject]@{ NotInstalled = @($scope.NotInstalled); Error = $null }
+        # #301: EmptySource входить у NotInstalled (архів не очікується), але
+        # звітується окремо: «каталог порожній» не дорівнює «не встановлено»,
+        # а Warning-знахідка (компонент раніше мав дані) має бути видна й тут.
+        $emptySourceWarning = @(Get-BRAVOEmptySourceWarningComponents -ScopeResult $scope)
+        return [pscustomobject]@{
+            NotInstalled = @($scope.NotInstalled)
+            EmptySource = @($scope.EmptySource)
+            EmptySourceWarning = $emptySourceWarning
+            Error = $null
+        }
     } catch {
-        return [pscustomobject]@{ NotInstalled = @(); Error = $_.Exception.Message }
+        return [pscustomobject]@{ NotInstalled = @(); EmptySource = @(); EmptySourceWarning = @(); Error = $_.Exception.Message }
     }
 }
 
@@ -2286,6 +2459,51 @@ function Get-BRAVODiscoveryDestinationPaths {
     return $paths
 }
 
+function Get-BRAVOEmptySourceEvidenceValue {
+    # Значення, яке Update-BRAVODiscoveryBaselineFromScope пише в baseline
+    # для EmptySourceRetained: сире поле джерела, а якщо воно порожнє
+    # (BAZA_WWW: Absent дає $null), - шлях порожнього каталогу з
+    # presence-запису. Порожній рядок - доказу немає.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$DiscoveryResult,
+        [Parameter(Mandatory = $true)][string]$Component,
+        [Parameter(Mandatory = $true)][string]$FieldName
+    )
+
+    $rawValue = [string]$DiscoveryResult.$FieldName
+    if (-not [string]::IsNullOrWhiteSpace($rawValue)) { return $rawValue }
+    $componentsProperty = $DiscoveryResult.PSObject.Properties['Components']
+    if ($null -eq $componentsProperty -or $componentsProperty.Value -isnot [System.Collections.IDictionary]) { return '' }
+    $entry = $componentsProperty.Value[$Component]
+    if ($null -eq $entry) { return '' }
+    $emptyPathProperty = $entry.PSObject.Properties['EmptyPath']
+    if ($null -eq $emptyPathProperty) { return '' }
+    return [string]$emptyPathProperty.Value
+}
+
+function Test-BRAVOEmptySourceEvidenceNewerThanBaseline {
+    # Чи доказ EmptySourceRetained (COMPLETE manifest) досі новіший за
+    # baseline, прочитаний наприкінці прогону. Та сама умова, за якою
+    # Resolve-BRAVOBackupComponentScope вважав поле baseline «ще нічого не
+    # доводить». Немає часу доказу, немає SavedAt чи він не новіший - $false.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$ScopeResult,
+        [object]$Baseline
+    )
+
+    if ($null -eq $Baseline) { return $false }
+    $evidenceProperty = $ScopeResult.PSObject.Properties['EmptySourceEvidenceAt']
+    if ($null -eq $evidenceProperty -or $null -eq $evidenceProperty.Value) { return $false }
+    $savedAtProperty = $Baseline.PSObject.Properties['SavedAt']
+    $savedAt = [datetime]::MinValue
+    if ($null -eq $savedAtProperty -or -not [datetime]::TryParse([string]$savedAtProperty.Value, [ref]$savedAt)) {
+        return $false
+    }
+    return ($savedAt.ToUniversalTime() -lt ([datetime]$evidenceProperty.Value).ToUniversalTime())
+}
+
 function Update-BRAVODiscoveryBaselineFromScope {
     # Автоматичне створення й доповнення baseline після COMPLETE generation
     # (рішення власника 2026-10-01, опис дизайну у CHANGELOG).
@@ -2317,17 +2535,52 @@ function Update-BRAVODiscoveryBaselineFromScope {
     $import = Import-BRAVODiscoveryBaseline -StateRoot $StateRoot -RuntimeRoot $RuntimeRoot
     $baselinePath = Get-BRAVODiscoveryBaselinePath -StateRoot $StateRoot
     $plannedComponents = @($ScopeResult.Planned)
+    # #301: порожній каталог компонента, що мав архів в останній COMPLETE
+    # generation. Нова generation його вже не містить, тому доказ
+    # переноситься в baseline (сире поле джерела), і Warning повторюється на
+    # кожному прогоні, доки в каталозі не з'являться дані або оператор не
+    # підтвердить новий baseline.
+    $retainedProperty = $ScopeResult.PSObject.Properties['EmptySourceRetained']
+    $retainedComponents = @(if ($null -ne $retainedProperty) { $retainedProperty.Value })
+    if ($retainedComponents.Count -gt 0 -and [string]$import.Source -ne 'None' -and
+        -not (Test-BRAVOEmptySourceEvidenceNewerThanBaseline -ScopeResult $ScopeResult -Baseline $import.Baseline)) {
+        # Рев'ю #391: baseline з'явився або підтверджений оператором
+        # (-ConfirmDiscoveryBaseline), поки йшов прогін. Його свідомо порожнє
+        # поле головніше за доказ manifest, тож сирий шлях не повертається.
+        $retainedComponents = @()
+    }
+    $protectedComponents = @($plannedComponents) + @($retainedComponents)
 
     if ([string]$import.Source -eq 'None') {
-        if ($plannedComponents.Count -eq 0) {
+        if ($protectedComponents.Count -eq 0) {
             return [pscustomobject]@{ Action = 'Skipped'; AddedComponents = @(); Path = $baselinePath }
         }
-        # Перший запис, як і доповнення нижче, містить лише Planned-компоненти:
-        # DisabledByConfig не було доведено безпечним першим виявленням, тому
-        # вимкнений компонент не береться під захист від зникнення.
-        Save-BRAVODiscoveryBaseline -DiscoveryResult $DiscoveryResult -BaselinePath $baselinePath `
-            -Components $plannedComponents
-        return [pscustomobject]@{ Action = 'Created'; AddedComponents = $plannedComponents; Path = $baselinePath }
+        # Перший запис, як і доповнення нижче, містить лише Planned-компоненти
+        # (і EmptySourceRetained): DisabledByConfig не було доведено безпечним
+        # першим виявленням, тому вимкнений компонент не береться під захист
+        # від зникнення.
+        if ($retainedComponents.Count -eq 0) {
+            Save-BRAVODiscoveryBaseline -DiscoveryResult $DiscoveryResult -BaselinePath $baselinePath `
+                -Components $plannedComponents
+        } else {
+            $firstSnapshot = [ordered]@{}
+            $firstBaseline = New-BRAVODiscoveryBaselineSnapshot -DiscoveryResult $DiscoveryResult `
+                -Components $plannedComponents
+            foreach ($property in $firstBaseline.PSObject.Properties) {
+                $firstSnapshot[$property.Name] = $property.Value
+            }
+            # Snapshot пише '' для порожнього каталогу; для EmptySourceRetained
+            # потрібне саме сире значення як доказ.
+            foreach ($componentName in $retainedComponents) {
+                if (-not $script:BRAVODiscoveryComponentSourceFields.Contains($componentName)) { continue }
+                $fieldName = [string]$script:BRAVODiscoveryComponentSourceFields[$componentName]
+                $firstSnapshot[$fieldName] = Get-BRAVOEmptySourceEvidenceValue -DiscoveryResult $DiscoveryResult `
+                    -Component $componentName -FieldName $fieldName
+            }
+            Write-BRAVODiscoveryBaselineTextAtomic -Path $baselinePath `
+                -Text ([pscustomobject]$firstSnapshot | ConvertTo-Json)
+        }
+        return [pscustomobject]@{ Action = 'Created'; AddedComponents = $protectedComponents; Path = $baselinePath }
     }
 
     if (@('Canonical', 'MigratedFromLegacy') -notcontains [string]$import.Source -or
@@ -2340,10 +2593,14 @@ function Update-BRAVODiscoveryBaselineFromScope {
         $snapshot[$property.Name] = $property.Value
     }
     $added = New-Object System.Collections.Generic.List[string]
-    foreach ($componentName in $plannedComponents) {
+    foreach ($componentName in $protectedComponents) {
         if (-not $script:BRAVODiscoveryComponentSourceFields.Contains($componentName)) { continue }
         $fieldName = [string]$script:BRAVODiscoveryComponentSourceFields[$componentName]
         $currentValue = [string]$DiscoveryResult.$fieldName
+        if ([string]::IsNullOrWhiteSpace($currentValue) -and $retainedComponents -contains $componentName) {
+            $currentValue = Get-BRAVOEmptySourceEvidenceValue -DiscoveryResult $DiscoveryResult `
+                -Component $componentName -FieldName $fieldName
+        }
         if ([string]::IsNullOrWhiteSpace($currentValue)) { continue }
         $baselineValue = $(if ($snapshot.Contains($fieldName)) { [string]$snapshot[$fieldName] } else { '' })
         if (-not [string]::IsNullOrWhiteSpace($baselineValue)) { continue }
@@ -2740,6 +2997,7 @@ Export-ModuleMember -Function @(
     'Test-BRAVODiscoveryComponentDrift',
     'Resolve-BRAVOBackupComponentScope',
     'Get-BRAVOBackupNotInstalledComponents',
+    'Get-BRAVOEmptySourceWarningComponents',
     'Get-BRAVOLastCompleteBackupEvidence',
     'Get-BRAVOLastCompleteBackupComponents',
     'Select-BRAVOExpectedArchiveDefinition',
@@ -2749,6 +3007,7 @@ Export-ModuleMember -Function @(
     'Update-BRAVODiscoveryBaselineFromScope',
     'Write-BRAVODiscoveryPresenceReport',
     'Save-BRAVODiscoveryBaseline',
+    'New-BRAVODiscoveryBaselineSnapshot',
     'Compare-BRAVODiscoveryBaseline',
     'Get-BRAVODiscoveryBaselinePath',
     'Get-BRAVODiscoveryLegacyBaselinePath',

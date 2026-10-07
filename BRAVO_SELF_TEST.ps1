@@ -13232,6 +13232,174 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/DeferredSftpSuccessMessageShowsSkippedNotOk' `
         -Failure "за відкладеної SFTP-перевірки рядки SFTP і BAZA_APP мають бути WARNING «перевірку відкладено», а не SUCCESS; відкладено: $sftpDeferredSuccess ||| контроль: $sftpCheckedSuccess"
+    # #301 (рев'ю #391): порожній каталог джерела не звітується як «не
+    # встановлено»; компонент, що раніше мав дані, показано рядком :warning:.
+    $emptySourceSuccess = [string](& $sftpDeferredMessageModule {
+        Set-StrictMode -Version Latest
+        $script:NotificationProvider = 'slack'
+        $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $false
+        $script:healthNotInstalledComponents = @('BLOG', 'BRAVOEXCH', 'BAZA_WWW')
+        $script:healthEmptySourceComponents = @('BLOG', 'BRAVOEXCH')
+        $script:healthEmptySourceWarningComponents = @('BLOG')
+        $script:healthLatestArchives = @{}
+        $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+        $backupMonitoring = [pscustomobject]@{
+            MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'
+            SFTP = [pscustomobject]@{ Enabled = $true; CheckBAZASynchronization = $true; CheckArchiveUploads = $true }
+            SMB = [pscustomobject]@{ Enabled = $false; CheckArchiveCopies = $false }
+        }
+        $storageEffective = [pscustomobject]@{
+            SFTP = [pscustomobject]@{ Enabled = $true; ArchiveUpload = $true }
+            SMB = [pscustomobject]@{ Enabled = $false; ArchiveCopy = $false }
+        }
+        $bazaAppLocalHealthEnabled = $false; $bazaWWWLocalHealthEnabled = $false
+        $bazaAppSFTPHealthEnabled = $true; $bazaWWWSFTPHealthEnabled = $false
+        $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+        function Get-HostInformation { return $null }
+        function Get-EnabledBackupComponentNames { return @() }
+        function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+        function Format-BRAVOOperatorStatusLine { param($Status, $Icon, $Name, $Detail) return "[$Status] $Name — $Detail" }
+        function New-BRAVOOperatorNotificationMessage { param($ResultLines, $ReasonLines) return (@($ReasonLines) + @($ResultLines)) -join "`n" }
+        New-SlackSuccessMessage -Duration ([timespan]::FromSeconds(1))
+    })
+    $emptySourceNotInstalledLine = [string](@($emptySourceSuccess -split "`n" | Where-Object { $_ -match 'Не встановлено на цьому сервері' }) -join ' | ')
+    Test-BRAVOCondition `
+        -Condition (
+            $emptySourceNotInstalledLine -match 'BAZA_WWW' -and
+            $emptySourceNotInstalledLine -notmatch 'BLOG' -and
+            $emptySourceNotInstalledLine -notmatch 'BRAVOEXCH' -and
+            $emptySourceSuccess -match ':warning: Каталог джерела порожній, хоча раніше мав дані \(не копіюється\): BLOG' -and
+            $emptySourceSuccess -match ':information_source: Каталог джерела порожній \(не копіюється\): BRAVOEXCH'
+        ) `
+        -Name 'Health/EmptySourceReportedSeparatelyFromNotInstalled' `
+        -Failure "Health має показувати порожній каталог джерела окремо від «не встановлено», з :warning: для компонента, що мав дані: $emptySourceSuccess"
+    # #301 (рев'ю #391, Codex 510e35e): прогін без issue, але з WARNING у
+    # журналі (порожній каталог, що мав дані) завершується кодом 10, тож
+    # Operations-подія не може рапортувати SUCCESS. Severity береться з того
+    # самого лічильника, що й код завершення.
+    $cleanRunVerdicts = @{}
+    $cleanRunVerdictError = ''
+    try {
+        $cleanRunVerdictModule = New-BRAVOSelfTestRuntimeModule -SourceText $healthScriptText `
+            -FunctionNames @('Get-BRAVOHealthCleanRunOperationsVerdict')
+        foreach ($cleanRunCase in @('Clean', 'Warned', 'Blocked')) {
+            $cleanRunVerdicts[$cleanRunCase] = [string](& $cleanRunVerdictModule {
+                param($Case)
+                Set-StrictMode -Version Latest
+                (Get-BRAVOHealthCleanRunOperationsVerdict `
+                    -ToolIntegrityShouldBlock ($Case -eq 'Blocked') `
+                    -LogWarningCount $(if ($Case -eq 'Clean') { 0 } else { 2 })).Severity
+            } $cleanRunCase)
+        }
+    } catch { $cleanRunVerdictError = $_.Exception.Message }
+    Test-BRAVOCondition `
+        -Condition (
+            $cleanRunVerdictError -eq '' -and
+            $cleanRunVerdicts['Clean'] -eq 'SUCCESS' -and
+            $cleanRunVerdicts['Warned'] -eq 'WARNING' -and
+            $cleanRunVerdicts['Blocked'] -eq 'CRITICAL' -and
+            $healthScriptText.Contains('-LogWarningCount $script:BRAVOWarningCount')
+        ) `
+        -Name 'Health/CleanRunOperationsEventFollowsWarningExitCode' `
+        -Failure "Operations-подія Health без issue має бути WARNING, коли журнал має WARNING (код 10), і CRITICAL при ShouldBlock: clean='$($cleanRunVerdicts['Clean'])' warned='$($cleanRunVerdicts['Warned'])' blocked='$($cleanRunVerdicts['Blocked'])' error='$cleanRunVerdictError'"
+    # #301 (рев'ю #391, Codex 5f0dc37): прогін без issue, але з порожнім
+    # каталогом, що мав дані, - це WARNING і для Slack/Discord: звіт іде
+    # маршрутом alerts і в режимі errors_only, незалежно від NotifyOnSuccess.
+    # Відбиток дедуплікації містить ці компоненти, тож зникнення попередження
+    # дає новий звіт, а стан без них має той самий відбиток, що й раніше.
+    $cleanRunPlans = @{}
+    $cleanRunPlanError = ''
+    $cleanRunFingerprints = @{}
+    try {
+        $cleanRunPlanModule = New-BRAVOSelfTestRuntimeModule -SourceText $healthScriptText `
+            -FunctionNames @('Get-BRAVOHealthCleanRunNotificationPlan', 'Get-BRAVOHealthSuccessFingerprint')
+        foreach ($cleanRunPlanCase in @(
+            @{ Name = 'ErrorsOnlyWarned'; Mode = 'errors_only'; Notify = $false; NoSlack = $false; Warn = 1 },
+            @{ Name = 'ErrorsOnlyClean'; Mode = 'errors_only'; Notify = $true; NoSlack = $false; Warn = 0 },
+            @{ Name = 'AllClean'; Mode = 'all'; Notify = $true; NoSlack = $false; Warn = 0 },
+            @{ Name = 'AllCleanNoNotify'; Mode = 'all'; Notify = $false; NoSlack = $false; Warn = 0 },
+            @{ Name = 'AllWarnedNoNotify'; Mode = 'all'; Notify = $false; NoSlack = $false; Warn = 1 },
+            @{ Name = 'NoSlackWarned'; Mode = 'errors_only'; Notify = $false; NoSlack = $true; Warn = 1 },
+            @{ Name = 'NoneWarned'; Mode = 'none'; Notify = $false; NoSlack = $false; Warn = 1 }
+        )) {
+            $cleanRunPlans[$cleanRunPlanCase.Name] = [string](& $cleanRunPlanModule {
+                param($Case)
+                Set-StrictMode -Version Latest
+                $plan = Get-BRAVOHealthCleanRunNotificationPlan -NotifyOnSuccess ([bool]$Case.Notify) `
+                    -ForceNotification $false -NoSlack ([bool]$Case.NoSlack) -NotificationMode ([string]$Case.Mode) `
+                    -EmptySourceWarningCount ([int]$Case.Warn)
+                "$([bool]$plan.Send)/$([string]$plan.Severity)"
+            } $cleanRunPlanCase)
+        }
+        foreach ($cleanRunFingerprintCase in @('Legacy', 'NoWarning', 'Warned')) {
+            $cleanRunFingerprints[$cleanRunFingerprintCase] = [string](& $cleanRunPlanModule {
+                param($Case)
+                Set-StrictMode -Version Latest
+                $summary = [pscustomobject]@{ LocalVerified = $true; SftpVerified = $true; SmbVerified = $false }
+                [string[]]$warningComponents = @()
+                if ($Case -eq 'Warned') { $warningComponents = @('BLOG') }
+                if ($Case -eq 'Legacy') {
+                    Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -EnabledCheckNames @('sftp_archives')
+                } else {
+                    Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -EnabledCheckNames @('sftp_archives') `
+                        -EmptySourceWarningComponents $warningComponents
+                }
+            } $cleanRunFingerprintCase)
+        }
+    } catch { $cleanRunPlanError = "$($_.Exception.Message) $($_.InvocationInfo.PositionMessage)" }
+    $cleanRunMessageSeverity = @{}
+    foreach ($cleanRunMessageCase in @('Warned', 'Clean')) {
+        $cleanRunMessageSeverity[$cleanRunMessageCase] = [string](& $sftpDeferredMessageModule {
+            param($Case)
+            Set-StrictMode -Version Latest
+            $script:NotificationProvider = 'slack'
+            $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $false
+            $script:healthNotInstalledComponents = @('BLOG')
+            $script:healthEmptySourceComponents = @('BLOG')
+            $script:healthEmptySourceWarningComponents = $(if ($Case -eq 'Warned') { @('BLOG') } else { @() })
+            $script:healthLatestArchives = @{}
+            $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+            $backupMonitoring = [pscustomobject]@{
+                MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'
+                SFTP = [pscustomobject]@{ Enabled = $false; CheckBAZASynchronization = $false; CheckArchiveUploads = $false }
+                SMB = [pscustomobject]@{ Enabled = $false; CheckArchiveCopies = $false }
+            }
+            $storageEffective = [pscustomobject]@{
+                SFTP = [pscustomobject]@{ Enabled = $false; ArchiveUpload = $false }
+                SMB = [pscustomobject]@{ Enabled = $false; ArchiveCopy = $false }
+            }
+            $bazaAppLocalHealthEnabled = $false; $bazaWWWLocalHealthEnabled = $false
+            $bazaAppSFTPHealthEnabled = $false; $bazaWWWSFTPHealthEnabled = $false
+            $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+            function Get-HostInformation { return $null }
+            function Get-EnabledBackupComponentNames { return @() }
+            function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+            function Format-BRAVOOperatorStatusLine { param($Status, $Icon, $Name, $Detail) return "[$Status] $Name — $Detail" }
+            function New-BRAVOOperatorNotificationMessage { param($Severity, $Operation, $ResultLines, $ReasonLines) return "$Severity|$Operation" }
+            New-SlackSuccessMessage -Duration ([timespan]::FromSeconds(1))
+        } $cleanRunMessageCase)
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $cleanRunPlanError -eq '' -and
+            $cleanRunPlans['ErrorsOnlyWarned'] -eq 'True/WARNING' -and
+            $cleanRunPlans['ErrorsOnlyClean'] -eq 'False/SUCCESS' -and
+            $cleanRunPlans['AllClean'] -eq 'True/SUCCESS' -and
+            $cleanRunPlans['AllCleanNoNotify'] -eq 'False/SUCCESS' -and
+            $cleanRunPlans['AllWarnedNoNotify'] -eq 'True/WARNING' -and
+            $cleanRunPlans['NoSlackWarned'] -eq 'False/WARNING' -and
+            $cleanRunPlans['NoneWarned'] -eq 'False/WARNING' -and
+            $cleanRunFingerprints['Legacy'] -ne '' -and
+            $cleanRunFingerprints['Legacy'] -eq $cleanRunFingerprints['NoWarning'] -and
+            $cleanRunFingerprints['Warned'] -ne $cleanRunFingerprints['NoWarning'] -and
+            $cleanRunMessageSeverity['Warned'] -like 'WARNING|*' -and
+            $cleanRunMessageSeverity['Warned'] -notmatch 'ВСЕ СПРАВНО' -and
+            $cleanRunMessageSeverity['Clean'] -eq 'SUCCESS|BRAVO BACKUP — ВСЕ СПРАВНО' -and
+            $healthScriptText.Contains('-EmptySourceWarningCount @($script:healthEmptySourceWarningComponents).Count') -and
+            $healthScriptText.Contains('-Severity $successNotificationSeverity')
+        ) `
+        -Name 'Health/EmptySourceWarningNotifiesAsWarning' `
+        -Failure "порожній каталог, що мав дані, має йти в Slack/Discord як WARNING (alerts, і в errors_only), з окремим відбитком дедуплікації: plans='$(@($cleanRunPlans.Keys | Sort-Object | ForEach-Object { "${_}=$($cleanRunPlans[$_])" }) -join '; ')' message='$($cleanRunMessageSeverity['Warned'])' / '$($cleanRunMessageSeverity['Clean'])' error='$cleanRunPlanError'"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.SftpDeferredMessage' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.LocalSyncIssueWithoutExitCode' -DependsOn 'Root/Runtime') { try {
     # #286: проблема LocalSynchronization без поля ExitCode (7 з 9 гілок
@@ -17826,6 +17994,108 @@ try {
             ) `
             -Name "Discovery/BazaWwwUsesHttpdConfDocumentRoot" `
             -Failure "BAZA_WWW має братись з DocumentRoot реального httpd.conf встановленої Apache-служби, а не з фолбек-здогадки <WEB_ROOT>\www"
+
+        # #301 (рев'ю #391, Codex 64d0e94): порожній <DocumentRoot>\BAZA - це
+        # той самий «каталог є, але порожній», що й для компонентів з bravo.ini.
+        # Presence-запис має нести AbsenceKind 'Empty', і підтверджений раніше
+        # BAZA_WWW дає Warning (EmptySource), а не Error.
+        $emptyBazaWwwPlaceholder = Join-Path $fakeBazaWwwDir 'placeholder.txt'
+        $emptyBazaWwwPresence = $null
+        $emptyBazaWwwScope = $null
+        $emptyBazaWwwError = ''
+        try {
+            Remove-Item -LiteralPath $emptyBazaWwwPlaceholder -Force
+            $emptyBazaWwwDiscovery = Resolve-BRAVOInstallationDiscovery `
+                -LimsRoot $discoveryTestRoot `
+                -BravoServiceName "BRAVO" `
+                -WebServiceCandidates @("Apache2.4") `
+                -Services $syntheticServices `
+                -SystemRoot $noSuchSystemRoot
+            $emptyBazaWwwPresence = $emptyBazaWwwDiscovery.Components['BAZA_WWW']
+            $emptyBazaWwwScope = Resolve-BRAVOBackupComponentScope -DiscoveryResult $emptyBazaWwwDiscovery `
+                -Baseline ([pscustomobject]@{ BAZA_WWW = $fakeBazaWwwDir }) -BaselineSourceKind 'Canonical' `
+                -EnabledComponents @{ BAZA_WWW = $true }
+        } catch {
+            $emptyBazaWwwError = $_.Exception.Message
+        } finally {
+            [IO.File]::WriteAllText($emptyBazaWwwPlaceholder, 'baza-www-fixture', (New-Object Text.UTF8Encoding($false)))
+        }
+        $emptyBazaWwwAbsenceKind = ''
+        if ($null -ne $emptyBazaWwwPresence -and $null -ne $emptyBazaWwwPresence.PSObject.Properties['AbsenceKind']) {
+            $emptyBazaWwwAbsenceKind = [string]$emptyBazaWwwPresence.AbsenceKind
+        }
+        $emptyBazaWwwScopeValue = ''
+        $emptyBazaWwwFindings = @()
+        if ($null -ne $emptyBazaWwwScope) {
+            $emptyBazaWwwScopeValue = [string]$emptyBazaWwwScope.Components['BAZA_WWW']
+            $emptyBazaWwwFindings = @(@($emptyBazaWwwScope.Findings) | Where-Object { [string]$_.Component -eq 'BAZA_WWW' })
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $emptyBazaWwwError -eq '' -and
+                $null -ne $emptyBazaWwwPresence -and
+                [string]$emptyBazaWwwPresence.Presence -eq 'Absent' -and
+                $emptyBazaWwwAbsenceKind -eq 'Empty' -and
+                $emptyBazaWwwScopeValue -eq 'EmptySource' -and
+                @($emptyBazaWwwFindings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -eq 0 -and
+                @($emptyBazaWwwFindings | Where-Object { [string]$_.Severity -eq 'Warning' }).Count -eq 1
+            ) `
+            -Name "Discovery/EmptyBazaWwwDocumentRootIsEmptySourceWarning" `
+            -Failure "порожній <DocumentRoot>\BAZA має дати Absent з AbsenceKind 'Empty', а підтверджений раніше BAZA_WWW - EmptySource з Warning без Error; absenceKind='$emptyBazaWwwAbsenceKind' scope='$emptyBazaWwwScopeValue' findings='$(@($emptyBazaWwwFindings | ForEach-Object { [string]$_.Severity }) -join ',')' error='$emptyBazaWwwError'"
+
+        # #301 (рев'ю #391, Codex 5f0dc37): BAZA_WWW, відомий лише з останнього
+        # COMPLETE manifest. Сире поле BAZA_WWW для порожнього каталогу - $null,
+        # тож доказ має перейти в baseline шляхом кандидата; інакше Warning
+        # другої ночі тихо став би Info.
+        $retainedBazaWwwState = Join-Path $discoveryTestRoot 'state-bazawww-retained'
+        $retainedBazaWwwRuntime = Join-Path $discoveryTestRoot 'runtime-bazawww-retained'
+        $retainedBazaWwwNight1 = $null
+        $retainedBazaWwwNight2 = $null
+        $retainedBazaWwwValue = ''
+        $retainedBazaWwwError = ''
+        try {
+            Remove-Item -LiteralPath $emptyBazaWwwPlaceholder -Force
+            $retainedBazaWwwDiscovery = Resolve-BRAVOInstallationDiscovery `
+                -LimsRoot $discoveryTestRoot `
+                -BravoServiceName "BRAVO" `
+                -WebServiceCandidates @("Apache2.4") `
+                -Services $syntheticServices `
+                -SystemRoot $noSuchSystemRoot
+            $retainedBazaWwwNight1 = Resolve-BRAVOBackupComponentScope -DiscoveryResult $retainedBazaWwwDiscovery `
+                -BaselineSourceKind 'None' -EnabledComponents @{ BAZA_WWW = $true } `
+                -PreviousCompleteComponents @('BAZA_WWW')
+            [void](Update-BRAVODiscoveryBaselineFromScope -DiscoveryResult $retainedBazaWwwDiscovery `
+                -ScopeResult $retainedBazaWwwNight1 -StateRoot $retainedBazaWwwState -RuntimeRoot $retainedBazaWwwRuntime)
+            $retainedBazaWwwImport = Import-BRAVODiscoveryBaseline -StateRoot $retainedBazaWwwState `
+                -RuntimeRoot $retainedBazaWwwRuntime -ReadOnly
+            if ($null -ne $retainedBazaWwwImport.Baseline -and
+                $null -ne $retainedBazaWwwImport.Baseline.PSObject.Properties['BAZA_WWW']) {
+                $retainedBazaWwwValue = [string]$retainedBazaWwwImport.Baseline.BAZA_WWW
+            }
+            $retainedBazaWwwNight2 = Resolve-BRAVOBackupComponentScope -DiscoveryResult $retainedBazaWwwDiscovery `
+                -Baseline $retainedBazaWwwImport.Baseline -BaselineSourceKind ([string]$retainedBazaWwwImport.Source) `
+                -EnabledComponents @{ BAZA_WWW = $true }
+        } catch {
+            $retainedBazaWwwError = $_.Exception.Message
+        } finally {
+            [IO.File]::WriteAllText($emptyBazaWwwPlaceholder, 'baza-www-fixture', (New-Object Text.UTF8Encoding($false)))
+        }
+        $retainedBazaWwwWarnings = @(foreach ($retainedBazaWwwScope in @($retainedBazaWwwNight1, $retainedBazaWwwNight2)) {
+            if ($null -eq $retainedBazaWwwScope) { 0; continue }
+            @(@($retainedBazaWwwScope.Findings) | Where-Object {
+                [string]$_.Component -eq 'BAZA_WWW' -and [string]$_.Severity -eq 'Warning'
+            }).Count
+        })
+        Test-BRAVOCondition `
+            -Condition (
+                $retainedBazaWwwError -eq '' -and
+                $retainedBazaWwwWarnings.Count -eq 2 -and
+                $retainedBazaWwwWarnings[0] -eq 1 -and
+                $retainedBazaWwwValue -eq $fakeBazaWwwDir -and
+                $retainedBazaWwwWarnings[1] -eq 1
+            ) `
+            -Name "Discovery/EmptyBazaWwwManifestEvidencePersistsInBaseline" `
+            -Failure "BAZA_WWW, відомий лише з manifest, має перейти в baseline шляхом кандидата, і Warning має повторитись наступної ночі: baseline='$retainedBazaWwwValue' warnings='$($retainedBazaWwwWarnings -join ',')' error='$retainedBazaWwwError'"
 
         # Архітектурний інваріант (safety-review): стан Windows-служб не
         # повинен керувати можливістю створення backup. Ці тести — про
