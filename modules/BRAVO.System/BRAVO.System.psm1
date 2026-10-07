@@ -661,6 +661,21 @@ function Get-BRAVOServiceDelayedAutoStart {
     return ([int]$properties.DelayedAutostart -eq 1)
 }
 
+function Get-BRAVOWin32ServiceInfo {
+    # R379-3 (#314): єдиний пошук рядка Win32_Service за точним іменем служби
+    # (через Get-BRAVOWmiInstance з BRAVO.Compatibility) для читачів типу
+    # запуску й стану служби в цьому модулі. Повертає перший рядок або $null.
+    # Виняток WMI/CIM не перехоплюється: кожен викликач сам вирішує, як його
+    # трактувати (Get-BRAVOServiceStartMode пише причину, класифікація стану
+    # служби переходить на fallback).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $escapedName = $Name.Replace("'", "''")
+    return (@(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
+            Select-Object -First 1)
+}
+
 function Get-BRAVOServiceStartMode {
     # Єдиний канонічний читач типу запуску служби Windows (#319).
     # ServiceController.StartType існує лише з .NET Framework 4.6.1, а
@@ -743,9 +758,7 @@ function Get-BRAVOServiceStartMode {
         [void]$reasons.Add('Get-BRAVOWmiInstance (BRAVO.Compatibility) недоступна')
     } else {
         try {
-            $escapedName = $serviceName.Replace("'", "''")
-            $serviceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
-                Select-Object -First 1
+            $serviceInfo = Get-BRAVOWin32ServiceInfo -Name $serviceName
             $startModeProperty = if ($null -ne $serviceInfo) { $serviceInfo.PSObject.Properties['StartMode'] } else { $null }
             if ($null -eq $startModeProperty) {
                 [void]$reasons.Add('WMI не повернув Win32_Service.StartMode')
@@ -833,9 +846,7 @@ function Get-BRAVOManagedServiceCondition {
         $ServiceInfo = $null
         if (-not $NoWmiQuery -and $null -ne (Get-Command -Name 'Get-BRAVOWmiInstance' -ErrorAction SilentlyContinue)) {
             try {
-                $escapedName = $result.Name.Replace("'", "''")
-                $ServiceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
-                    Select-Object -First 1
+                $ServiceInfo = Get-BRAVOWin32ServiceInfo -Name $result.Name
             } catch {
                 $ServiceInfo = $null
             }
@@ -863,6 +874,7 @@ function Get-BRAVOManagedServiceCondition {
     }
     $markedForRestart = $false
     $heldSnapshotEntry = $null
+    $heldServiceNames = @()
     if ($null -ne $QuiescenceState) {
         $markerServicesProperty = $QuiescenceState.PSObject.Properties['services']
         if ($null -ne $markerServicesProperty) {
@@ -872,6 +884,7 @@ function Get-BRAVOManagedServiceCondition {
         }
         $markerSnapshotProperty = $QuiescenceState.PSObject.Properties['startTypeSnapshot']
         if ($null -ne $markerSnapshotProperty) {
+            $heldServiceNames = @(@($markerSnapshotProperty.Value) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Name })
             $heldSnapshotEntry = @(@($markerSnapshotProperty.Value) | Where-Object {
                     $null -ne $_ -and [string]$_.Name -ieq $result.Name
                 }) | Select-Object -First 1
@@ -883,12 +896,14 @@ function Get-BRAVOManagedServiceCondition {
     }
 
     if ($result.StartMode -eq 'Disabled') {
-        if ($null -ne $heldSnapshotEntry) {
+        # R379-4: спільний з DataRestore контракт «Disabled від оператора чи
+        # тимчасове утримання BRAVO» (Test-BRAVOServiceDisabledByOperator).
+        if (Test-BRAVOServiceDisabledByOperator -Name $result.Name -StartMode $result.StartMode -HeldServiceNames $heldServiceNames) {
+            $result.Condition = 'Disabled'
+        } else {
             $result.Condition = 'OwnedByBravo'
             $result.HeldByBravo = $true
             $result.OriginalStartMode = [string]$heldSnapshotEntry.StartMode
-        } else {
-            $result.Condition = 'Disabled'
         }
         return $result
     }
@@ -902,6 +917,263 @@ function Get-BRAVOManagedServiceCondition {
         $result.Condition = 'Failed'
     }
     return $result
+}
+
+function Test-BRAVOServiceDisabledByOperator {
+    # R379-4 (#314): спільний контракт «тимчасовий Disabled» для класифікації
+    # стану служби (Get-BRAVOManagedServiceCondition) і знімка служб
+    # DataRestore. Тип запуску Disabled означає рішення оператора («навмисно
+    # вимкнено»), КРІМ служб, які BRAVO сам тимчасово перевів у Disabled на
+    # час реставрації зі знімком початкового типу в ownership-маркері
+    # (#297/#329/#333): їхні імена викликач передає в -HeldServiceNames
+    # (startTypeSnapshot маркера або HeldSnapshot чужого аварійного прогону).
+    # Інакше осиротілий знімок після аварії назавжди «вимкнув» би службу.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()][AllowEmptyString()][string]$StartMode,
+        [AllowNull()][AllowEmptyCollection()][string[]]$HeldServiceNames = @()
+    )
+
+    if ([string]$StartMode -ine 'Disabled') { return $false }
+    return (@(@($HeldServiceNames) | Where-Object { [string]$_ -ieq $Name }).Count -eq 0)
+}
+
+# ============================================================
+# #314 хвиля 2: план життєвого циклу керованих служб (BRAVO, exchangAPI,
+# BRAVO Web) — «кого зупиняти, кого запускати і в якому порядку».
+# ЧИСТІ функції: рішення обчислюються лише зі станів, які передав
+# викликач; жодних звернень до SCM, WMI, маркера, журналу чи сповіщень.
+# Побічні дії (читання стану служб, Invoke-ServiceStateChange, маркер,
+# журнали) виконує runtime Maintenance (Stop-/Start-
+# BRAVOMaintenanceManagedServices) поверх цих рішень, перечитуючи стан
+# кожної служби безпосередньо перед дією (#360).
+#
+# Опис служби в -Services (hashtable або об'єкт):
+#   Key     - Bravo | ExchangeApi | BravoWeb;
+#   Name    - ім'я служби Windows;
+#   Enabled - служба керується (компонент увімкнено, службу встановлено,
+#             тип запуску не Disabled від оператора);
+#   Status  - рядок стану ServiceController ($null/'' — невідомий).
+# ============================================================
+
+function Get-BRAVOManagedServiceOrder {
+    # Канонічний порядок (рішення власника #314): запуск BRAVO -> exchangAPI
+    # -> BRAVO Web (exchangAPI і BRAVO Web залежать лише від BRAVO, одна від
+    # одної — ні), зупинка — у зворотному порядку.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][ValidateSet('Start', 'Stop')][string]$Direction)
+
+    if ($Direction -eq 'Start') { return @('Bravo', 'ExchangeApi', 'BravoWeb') }
+    return @('BravoWeb', 'ExchangeApi', 'Bravo')
+}
+
+function Test-BRAVOManagedServiceActiveStatus {
+    # «Служба працює»: StartPending рахується нарівні з Running — служба, що
+    # саме стартує, однаково буде зупинена за фактичним станом і без наміру
+    # перезапуску лишилася б лежати після обслуговування (та сама семантика,
+    # що ShouldRestartAfterRestore у DataRestore).
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Status)
+
+    return ([string]$Status -in @('Running', 'StartPending'))
+}
+
+function Test-BRAVOServiceStartRequired {
+    # Чи запускати службу, яка має намір перезапуску, за її поточним станом:
+    # Running уже працює; призупинену оператором (Paused, PausePending,
+    # ContinuePending) Maintenance не зупиняв і не запускає — пауза
+    # зберігається (#360).
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Status)
+
+    return ([string]$Status -notin @('Running', 'Paused', 'PausePending', 'ContinuePending'))
+}
+
+function Get-BRAVOServiceStopDecision {
+    # Lifecycle-контракт зупинки (#287/#360): службу зупиняють лише тоді,
+    # коли ownership-маркер уже містить її з наміром перезапуску. Рішення:
+    #   NotActive       - стан невідомий або Stopped: зупиняти нічого;
+    #   KeepState       - Paused/PausePending/ContinuePending або StopPending
+    #                     без наміру: стан служби зберігається (призупинена
+    #                     служба втрачає намір перезапуску);
+    #   OutsideContract - активна служба поза складом маркера (запущена вже
+    #                     після його запису): не зупиняється;
+    #   PromoteIntent   - Running/StartPending без наміру (запущена після
+    #                     знімка): намір записати в маркер ДО зупинки;
+    #   Stop            - зупиняти.
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Status,
+        [bool]$HasRestartIntent,
+        [bool]$InQuiescenceScope
+    )
+
+    if ([string]::IsNullOrEmpty($Status) -or $Status -eq 'Stopped') { return 'NotActive' }
+    if ($Status -notin @('Running', 'StartPending', 'StopPending') -or
+        ($Status -eq 'StopPending' -and -not $HasRestartIntent)) {
+        return 'KeepState'
+    }
+    if (-not $InQuiescenceScope) { return 'OutsideContract' }
+    if (-not $HasRestartIntent) { return 'PromoteIntent' }
+    return 'Stop'
+}
+
+function Get-BRAVOManagedServiceRestartIntent {
+    # Намір перезапуску на старті прогону (знімок $serviceWasRunning
+    # Maintenance): керована служба, що працює або стартує. -HoldAllEnabled
+    # (boot-hold профілю робочого часу): кожна керована служба незалежно від
+    # стану — «hold» є детермінованим кінцевим станом, а не знімком гонитви з
+    # Automatic (Delayed Start). Результат — hashtable Key -> bool.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Services,
+        [switch]$HoldAllEnabled
+    )
+
+    $restartIntent = @{}
+    foreach ($service in $Services) {
+        $enabled = [bool]$service.Enabled
+        $restartIntent[[string]$service.Key] = if ($HoldAllEnabled) {
+            $enabled
+        } else {
+            $enabled -and (Test-BRAVOManagedServiceActiveStatus -Status ([string]$service.Status))
+        }
+    }
+    return $restartIntent
+}
+
+function Get-BRAVOInheritedServiceRestartIntent {
+    # #349: керовані служби без власного наміру перезапуску, які аварійно
+    # перерваний прогін (маркер мертвого власника без restartSuppressed)
+    # зупинив із наміром їх запустити (-ForeignRestartIntentNames). Їхній
+    # намір успадковується. Повертає @{Key; Name} у порядку -Services.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Services,
+        [Parameter(Mandatory = $true)][hashtable]$RestartIntent,
+        [AllowNull()][AllowEmptyCollection()][string[]]$ForeignRestartIntentNames = @()
+    )
+
+    $inherited = @()
+    foreach ($service in $Services) {
+        if (-not [bool]$service.Enabled -or [bool]$RestartIntent[[string]$service.Key]) { continue }
+        $serviceName = [string]$service.Name
+        if (@(@($ForeignRestartIntentNames) | Where-Object { [string]$_ -ieq $serviceName }).Count -gt 0) {
+            $inherited += [pscustomobject]@{ Key = [string]$service.Key; Name = $serviceName }
+        }
+    }
+    return @($inherited)
+}
+
+function Get-BRAVOServiceQuiescenceScope {
+    # Склад ownership-маркера зупинки служб (#349/#360): служба з наміром
+    # перезапуску, активна безпосередньо перед зупинкою, або — коли
+    # заплановано реставрацію (-HoldAllEnabled) — будь-яка керована служба.
+    # RestartIntent елемента — лише намір перезапуску. Порядок — канонічний
+    # порядок запуску. Елементи — hashtable @{ Name; RestartIntent }:
+    # викликач змінює RestartIntent на місці (#360).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Services,
+        [Parameter(Mandatory = $true)][hashtable]$RestartIntent,
+        [Parameter(Mandatory = $true)][hashtable]$ActiveBeforeStop,
+        [switch]$HoldAllEnabled
+    )
+
+    $scope = @()
+    foreach ($serviceKey in @(Get-BRAVOManagedServiceOrder -Direction Start)) {
+        $service = @($Services | Where-Object { [string]$_.Key -eq $serviceKey }) | Select-Object -First 1
+        if ($null -eq $service) { continue }
+        if ([bool]$RestartIntent[$serviceKey] -or [bool]$ActiveBeforeStop[$serviceKey] -or
+            ($HoldAllEnabled -and [bool]$service.Enabled)) {
+            $scope += @{ Name = [string]$service.Name; RestartIntent = [bool]$RestartIntent[$serviceKey] }
+        }
+    }
+    return @($scope)
+}
+
+function Get-BRAVOManagedServiceLifecyclePlan {
+    # План циклу «зупинка -> журнали -> запуск» для ОДНОГО знімка станів
+    # керованих служб: склад маркера, кого зупинити (порядок зупинки) і кого
+    # потім запустити (порядок запуску). Це те саме рішення, яке runtime
+    # Maintenance ухвалює покроково з тих самих функцій
+    # (Get-BRAVOManagedServiceRestartIntent, Get-BRAVOInheritedServiceRestartIntent,
+    # Get-BRAVOServiceQuiescenceScope, Get-BRAVOServiceStopDecision,
+    # Test-BRAVOServiceStartRequired), але на свіжих станах перед кожною дією.
+    # Тут стан між знімком і зупинкою вважається незмінним, а кожна
+    # зупинка — успішною. Основа для хвиль 3-5 (#314: нічний Maintenance і
+    # -RecoverServices піднімають впалі служби) і для перевірки порядку без Windows.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Services,
+        # boot-hold профілю робочого часу: намір перезапуску для всіх керованих.
+        [switch]$HoldAllEnabled,
+        # заплановано реставрацію: маркер утримує всі керовані служби.
+        [switch]$HoldAllManagedForRestore,
+        [AllowNull()][AllowEmptyCollection()][string[]]$InheritedRestartIntentNames = @(),
+        [bool]$ModelIntegrityEstablished = $true
+    )
+
+    $restartIntent = Get-BRAVOManagedServiceRestartIntent -Services $Services -HoldAllEnabled:$HoldAllEnabled
+    foreach ($inheritedService in @(Get-BRAVOInheritedServiceRestartIntent -Services $Services -RestartIntent $restartIntent -ForeignRestartIntentNames $InheritedRestartIntentNames)) {
+        $restartIntent[[string]$inheritedService.Key] = $true
+    }
+    $activeBeforeStop = @{}
+    foreach ($service in $Services) {
+        $activeBeforeStop[[string]$service.Key] = [bool]$service.Enabled -and (Test-BRAVOManagedServiceActiveStatus -Status ([string]$service.Status))
+    }
+    $quiescenceServices = @(Get-BRAVOServiceQuiescenceScope -Services $Services -RestartIntent $restartIntent -ActiveBeforeStop $activeBeforeStop -HoldAllEnabled:$HoldAllManagedForRestore)
+
+    $statusAfterStop = @{}
+    $stopOrder = @()
+    foreach ($serviceKey in @(Get-BRAVOManagedServiceOrder -Direction Stop)) {
+        $service = @($Services | Where-Object { [string]$_.Key -eq $serviceKey }) | Select-Object -First 1
+        if ($null -eq $service -or -not [bool]$service.Enabled) { continue }
+        $serviceName = [string]$service.Name
+        $serviceStatus = [string]$service.Status
+        $statusAfterStop[$serviceKey] = $serviceStatus
+        $scopeEntries = @($quiescenceServices | Where-Object { [string]$_.Name -ieq $serviceName })
+        $decision = Get-BRAVOServiceStopDecision `
+            -Status $serviceStatus `
+            -HasRestartIntent ([bool]$restartIntent[$serviceKey]) `
+            -InQuiescenceScope ($scopeEntries.Count -gt 0)
+        switch ($decision) {
+            'PromoteIntent' {
+                $restartIntent[$serviceKey] = $true
+                foreach ($scopeEntry in $scopeEntries) { $scopeEntry.RestartIntent = $true }
+            }
+            'KeepState' {
+                if ($serviceStatus -in @('Paused', 'PausePending', 'ContinuePending')) {
+                    $restartIntent[$serviceKey] = $false
+                    foreach ($scopeEntry in $scopeEntries) { $scopeEntry.RestartIntent = $false }
+                }
+            }
+        }
+        if ($decision -in @('PromoteIntent', 'Stop')) {
+            $stopOrder += $serviceName
+            $statusAfterStop[$serviceKey] = 'Stopped'
+        }
+    }
+
+    $startOrder = @()
+    if ($ModelIntegrityEstablished) {
+        foreach ($serviceKey in @(Get-BRAVOManagedServiceOrder -Direction Start)) {
+            if (-not [bool]$restartIntent[$serviceKey]) { continue }
+            $service = @($Services | Where-Object { [string]$_.Key -eq $serviceKey }) | Select-Object -First 1
+            if ($null -eq $service) { continue }
+            if (Test-BRAVOServiceStartRequired -Status ([string]$statusAfterStop[$serviceKey])) {
+                $startOrder += [string]$service.Name
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        RestartIntent = $restartIntent
+        QuiescenceServices = @($quiescenceServices)
+        StopOrder = @($stopOrder)
+        StartOrder = @($startOrder)
+    }
 }
 
 function Set-BRAVOBootRestoreServiceStartType {

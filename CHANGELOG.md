@@ -2,6 +2,23 @@
 
 ## Не випущено (developer)
 
+- **Рефакторинг: цикл «зупинка служб → журнали → запуск» Maintenance винесено у функції без зміни поведінки (#314, хвиля 2).**
+  Спершу окремим комітом додано characterization-тест `ServiceRecovery/MaintenanceLifecycleCharacterization`
+  (22 сценарії: стани служб, boot-hold, успадкований намір #349, збої зупинки/запуску, Disabled + ForceRestore,
+  відсутня служба) — він зелений і до, і після винесення (ідентичні SHA256 трас). Чисті рішення «що зупиняти /
+  що запускати і в якому порядку» перенесено в `BRAVO.System`: `Get-BRAVOManagedServiceOrder`,
+  `Test-BRAVOManagedServiceActiveStatus`, `Test-BRAVOServiceStartRequired`, `Get-BRAVOServiceStopDecision`,
+  `Get-BRAVOManagedServiceRestartIntent`, `Get-BRAVOInheritedServiceRestartIntent`, `Get-BRAVOServiceQuiescenceScope`,
+  `Get-BRAVOManagedServiceLifecyclePlan` (порядок запуску BRAVO → exchangAPI → BRAVO Web, зупинки — зворотний).
+  Побічні ефекти лишилися в рантаймі: `Stop-BRAVOMaintenanceManagedService(s)`, `Invoke-BRAVOMaintenanceServiceLogProcessing`,
+  `Start-BRAVOMaintenanceManagedService(s)`. Точка розширення для #316 — `Invoke-BRAVOMaintenanceBeforeServiceStopHook`:
+  єдине місце виклику `Stop-BRAVOMaintenanceStrayProcess` (Bis), викликається перед зупинкою служби BRAVO і для
+  Disabled + ForceRestore. R379-3: пошук `Win32_Service` у `BRAVO.System` зведено до одного `Get-BRAVOWin32ServiceInfo`.
+  R379-4: DataRestore визначає «Disabled оператором» через спільний контракт `Test-BRAVOServiceDisabledByOperator`
+  (той самий, що й `Get-BRAVOManagedServiceCondition`). Тести: `ServiceRecovery/LifecyclePlanStopStartOrderMatrix`,
+  `ServiceRecovery/LifecyclePlanFunctionsArePure`, `ServiceRecovery/MaintenanceUsesLifecyclePlanAndBisHook`,
+  `ServiceRecovery/SingleWin32ServiceLookupAndSharedHeldDisabledContract`.
+
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
   `Get-BRAVOCredentialSecureSecret` у приватний `Add-BRAVOCredentialReadSecretRecord` із власним try/catch: збій обліку

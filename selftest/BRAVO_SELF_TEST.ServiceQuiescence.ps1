@@ -621,13 +621,37 @@ function Get-Service {
         (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
         [Text.Encoding]::UTF8
     )
-    $maintenanceMarkerWriteIndex = $maintenanceRuntimeTextForQuiescence.IndexOf('Write-BRAVOServiceQuiescenceState')
-    $maintenanceFirstStopIndex = $maintenanceRuntimeTextForQuiescence.IndexOf('-DesiredStatus Stopped')
+    # #314 хвиля 2: зупинка служб винесена у функції runtime
+    # (Stop-BRAVOMaintenanceManagedServices / Get-BRAVOMaintenancePreArchiveBarrierPlan),
+    # тому порядок перевіряється за ВИКЛИКАМИ в тілі прогону (AST, поза
+    # тілами вкладених функцій): запис маркера йде до виклику фази зупинки,
+    # і жодного прямого Invoke-ServiceStateChange -DesiredStatus Stopped у
+    # тілі прогону немає.
+    $maintenanceQuiescenceAst = [Management.Automation.Language.Parser]::ParseInput($maintenanceRuntimeTextForQuiescence, [ref]$null, [ref]$null)
+    $maintenanceBodyAst = @($maintenanceQuiescenceAst.FindAll({
+                param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-BRAVOMaintenance'
+            }, $true)) | Select-Object -First 1
+    $maintenanceBodyCommands = @()
+    if ($null -ne $maintenanceBodyAst) {
+        $maintenanceBodyCommands = @($maintenanceBodyAst.Body.FindAll({
+                    param($node)
+                    if ($node -isnot [Management.Automation.Language.CommandAst]) { return $false }
+                    $ownerAst = $node.Parent
+                    while ($null -ne $ownerAst -and $ownerAst -isnot [Management.Automation.Language.FunctionDefinitionAst]) { $ownerAst = $ownerAst.Parent }
+                    $null -ne $ownerAst -and $ownerAst.Name -eq 'Invoke-BRAVOMaintenance'
+                }, $true) | Sort-Object { $_.Extent.StartOffset })
+    }
+    $maintenanceMarkerWriteCall = @($maintenanceBodyCommands | Where-Object { $_.GetCommandName() -eq 'Write-BRAVOServiceQuiescenceState' }) | Select-Object -First 1
+    $maintenanceStopPhaseCall = @($maintenanceBodyCommands | Where-Object { $_.GetCommandName() -eq 'Stop-BRAVOMaintenanceManagedServices' }) | Select-Object -First 1
+    $maintenanceInlineStops = @($maintenanceBodyCommands | Where-Object {
+            $_.GetCommandName() -eq 'Invoke-ServiceStateChange' -and $_.Extent.Text -match '-DesiredStatus\s+Stopped'
+        })
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceMarkerWriteIndex -ge 0 -and
-            $maintenanceFirstStopIndex -ge 0 -and
-            $maintenanceMarkerWriteIndex -lt $maintenanceFirstStopIndex
+            $null -ne $maintenanceMarkerWriteCall -and
+            $null -ne $maintenanceStopPhaseCall -and
+            $maintenanceMarkerWriteCall.Extent.StartOffset -lt $maintenanceStopPhaseCall.Extent.StartOffset -and
+            $maintenanceInlineStops.Count -eq 0
         ) `
         -Name "ServiceQuiescence/MaintenanceWritesMarkerBeforeFirstServiceStop" `
         -Failure "Maintenance має писати ownership-маркер ДО першої зупинки служби (fail-closed)"
@@ -665,24 +689,31 @@ function Get-Service {
     # у зупинку/маркер/restart-intent незалежно від того, чи встигли вони
     # піднятися на момент знімка (інакше SCM стартував би delayed-службу
     # посеред деструктивної фази, а маркер її не покривав би).
+    # #314 хвиля 2: знімок наміру — Get-BRAVOManagedServiceRestartIntent
+    # (BRAVO.System) з -HoldAllEnabled для boot-hold; поведінку перевіряє
+    # ServiceRecovery/LifecyclePlan* і характеризація циклу служб.
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceRuntimeTextForQuiescence.Contains('if ($bootRestoreIgnoresWindow) {') -and
-            $maintenanceRuntimeTextForQuiescence.Contains('$serviceWasRunning.Bravo = $BravoMaintenanceEnabled') -and
-            $maintenanceRuntimeTextForQuiescence.Contains('$serviceWasRunning.ExchangeApi = $exchangAPIServiceEnabled') -and
-            $maintenanceRuntimeTextForQuiescence.Contains('$serviceWasRunning.BravoWeb = $BravoWebMaintenanceEnabled')
+            $maintenanceRuntimeTextForQuiescence.Contains('$serviceWasRunning = Get-BRAVOManagedServiceRestartIntent') -and
+            $maintenanceRuntimeTextForQuiescence.Contains('-HoldAllEnabled:([bool]$bootRestoreIgnoresWindow)') -and
+            $maintenanceRuntimeTextForQuiescence.Contains("@{ Key = 'Bravo'; Name = [string]`$BravoServiceName; Enabled = [bool]`$BravoMaintenanceEnabled;") -and
+            $maintenanceRuntimeTextForQuiescence.Contains("@{ Key = 'ExchangeApi'; Name = [string]`$ExchangAPIServiceName; Enabled = [bool]`$exchangAPIServiceEnabled;") -and
+            $maintenanceRuntimeTextForQuiescence.Contains("@{ Key = 'BravoWeb'; Name = [string]`$BravoWebServiceName; Enabled = [bool]`$BravoWebMaintenanceEnabled;")
         ) `
         -Name "ServiceQuiescence/MaintenanceBootHoldForcesManagedServicesIntoQuiescenceScope" `
         -Failure "boot-профіль (bootRestoreIgnoresWindow) має примусово включати всі увімкнені керовані служби у зупинку/маркер/restart-intent"
     # РЕГРЕСІЯ (#64 review, п.3): знімок стану служб рахує StartPending як
     # «працювала» — інакше служба, що саме стартує, була б зупинена без
     # restart-intent і лишилася лежати після обслуговування.
+    # #314 хвиля 2: одна канонічна перевірка Test-BRAVOManagedServiceActiveStatus
+    # (BRAVO.System) і для знімка (через Get-BRAVOManagedServiceRestartIntent),
+    # і для активності перед зупинкою.
     Test-BRAVOCondition `
         -Condition (
-            @([regex]::Matches(
-                $maintenanceRuntimeTextForQuiescence,
-                [regex]::Escape("-in @('Running', 'StartPending')")
-            )).Count -eq 3
+            $systemModuleTextForQuiescence.Contains("return ([string]`$Status -in @('Running', 'StartPending'))") -and
+            $maintenanceRuntimeTextForQuiescence.Contains('$serviceWasRunning = Get-BRAVOManagedServiceRestartIntent') -and
+            $maintenanceRuntimeTextForQuiescence.Contains('if (-not (Test-BRAVOManagedServiceActiveStatus -Status $managedServiceStatus)) { continue }') -and
+            $maintenanceRuntimeTextForQuiescence -notmatch [regex]::Escape("-in @('Running', 'StartPending')")
         ) `
         -Name "ServiceQuiescence/MaintenanceServiceSnapshotIncludesStartPending" `
         -Failure "усі три перевірки знімка служб Maintenance мають рахувати StartPending нарівні з Running"
@@ -760,6 +791,7 @@ function Get-BRAVOWmiInstance {
     $startTypeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startTypeStubs + "`n" + $healthRuntimeTextForQuiescence + "`n" + $systemModuleTextForQuiescence) `
         -FunctionNames @('Write-HealthLog', 'Get-Service', 'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled',
+            'Get-BRAVOWin32ServiceInfo', 'Test-BRAVOServiceDisabledByOperator',
             'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition', 'Get-ManagedServiceHealthIssues')
     $startTypeProbe = {
         param($ServiceName, [bool]$WmiFails = $false, $Marker = $null, [bool]$MarkerThrows = $false)
@@ -875,6 +907,7 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
     $conditionModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($conditionStubs + "`n" + $systemModuleTextForQuiescence) `
         -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Read-BRAVOServiceQuiescenceState',
+            'Get-BRAVOWin32ServiceInfo', 'Test-BRAVOServiceDisabledByOperator',
             'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition')
     $conditionMarker = [pscustomobject]@{
         owner = 'BRAVO_MAINTENANCE'
@@ -1016,8 +1049,8 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
                     param($node) $node -is [Management.Automation.Language.CommandAst]
                 }, $true) | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)
     }
-    $conditionAllowedCommands = @('Get-Service', 'Get-Command', 'Get-BRAVOWmiInstance', 'Select-Object', 'Where-Object',
-        'Get-BRAVOServiceStartMode', 'Read-BRAVOServiceQuiescenceState')
+    $conditionAllowedCommands = @('Get-Service', 'Get-Command', 'Get-BRAVOWin32ServiceInfo', 'Select-Object', 'Where-Object',
+        'ForEach-Object', 'Get-BRAVOServiceStartMode', 'Read-BRAVOServiceQuiescenceState', 'Test-BRAVOServiceDisabledByOperator')
     $conditionUnexpectedCommands = @($conditionCommandNames | Where-Object { $conditionAllowedCommands -notcontains $_ })
     Test-BRAVOCondition `
         -Condition ($null -ne $conditionFunctionAst -and $conditionCommandNames.Count -gt 0 -and $conditionUnexpectedCommands.Count -eq 0) `
@@ -1080,7 +1113,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # 1) Юніт-тести канонічного helper-а (нормалізація, пріоритет джерел, Unknown).
     $startModeHelperModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOWin32ServiceInfo', 'Get-BRAVOServiceStartMode')
     $startModeHelperProbe = & $startModeHelperModule {
         Set-StrictMode -Version 2.0
         $out = [ordered]@{}
@@ -1141,7 +1174,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # Test-BRAVOServiceDisabledBySystem (верхній рівень, безумовне читання).
     $startModeMaintenanceModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueMaintenanceText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-ConfiguredServiceState', 'Test-BRAVOServiceDisabledBySystem')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOWin32ServiceInfo', 'Get-BRAVOServiceStartMode', 'Get-ConfiguredServiceState', 'Test-BRAVOServiceDisabledBySystem')
     $startModeMaintenanceProbe = & $startModeMaintenanceModule {
         param($Scenarios)
         Set-StrictMode -Version 2.0
@@ -1193,7 +1226,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # 3) DataRestore: Get-BRAVODataRestoreServiceSnapshot (fallback після збою WMI).
     $startModeDataRestoreModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueDataRestoreText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-BRAVODataRestoreServiceSnapshot')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOWin32ServiceInfo', 'Test-BRAVOServiceDisabledByOperator', 'Get-BRAVOServiceStartMode', 'Get-BRAVODataRestoreServiceSnapshot')
     $startModeDataRestoreProbe = & $startModeDataRestoreModule {
         param($Scenarios)
         Set-StrictMode -Version 2.0
@@ -1230,7 +1263,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # 4) BRAVO_DRY_RUN.ps1: Get-BRAVODryRunConfiguredServiceState (StartType -> WMI).
     $startModeDryRunModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueDryRunText + "`n" + $startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceStartMode', 'Get-BRAVODryRunConfiguredServiceState')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOWin32ServiceInfo', 'Get-BRAVOServiceStartMode', 'Get-BRAVODryRunConfiguredServiceState')
     $startModeDryRunProbe = & $startModeDryRunModule {
         param($Scenarios)
         Set-StrictMode -Version 2.0
@@ -1264,7 +1297,7 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
     # 5) BRAVO.System: Set-BRAVOBootRestoreServiceStartType без StartType.
     $startModeBootRestoreModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueStubs + "`n" + $startModeIssueSystemText) `
-        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOServiceDelayedAutoStart', 'Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
+        -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Get-BRAVOWin32ServiceInfo', 'Get-BRAVOServiceDelayedAutoStart', 'Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
     $startModeBootRestoreProbe = & $startModeBootRestoreModule {
         param($Scenarios)
         Set-StrictMode -Version 2.0
@@ -1854,7 +1887,7 @@ function Restore-BRAVOServiceStartTypeSnapshot {
         $bravocmdRunIndex = $maintenanceTextForStartMode.IndexOf('-Description "Виконання реставрації моделі')
         $finallyIndex = $maintenanceTextForStartMode.IndexOf("Write-BRAVOProgressPhase -Phase 'Відновлення стану служб'")
         $finallyRestoreIndex = $maintenanceTextForStartMode.IndexOf('Restore-BRAVOServiceStartTypeSnapshot -Snapshot $script:startTypeSnapshot')
-        $firstServiceStartIndex = $maintenanceTextForStartMode.IndexOf('# 1. Запуск служби BRAVO')
+        $firstServiceStartIndex = $maintenanceTextForStartMode.IndexOf('Start-BRAVOMaintenanceManagedServices `', [Math]::Max(0, $finallyIndex))
         Test-BRAVOCondition `
             -Condition (
                 $repairCallIndex -ge 0 -and $repairCallIndex -lt $firstStartModeReadIndex -and
@@ -2242,3 +2275,194 @@ function Invoke-BRAVOWebApplicationLogRotation { param([string]$SourceDirectory,
         -Failure "цикл служб нічного Maintenance (знімок -> маркер -> зупинка Web/exchangAPI/BRAVO -> журнали -> запуск BRAVO/exchangAPI/Web) має поводитися як до винесення у функції: $(@($lifecycleSliceProblems) + @($lifecycleDiffs) -join ' || ')"
     }
     #endregion #314-wave2-lifecycle-characterization
+
+    # ============================================================
+    # #314 хвиля 2: чисті функції плану життєвого циклу керованих служб
+    # (BRAVO.System) — «кого зупиняти / кого запускати і в якому порядку»
+    # без Windows (ТЗ §6 п.2). Порядки збігаються з характеризацією циклу
+    # служб нічного Maintenance вище (без kill Bis — це точка розширення
+    # #316, а не рішення плану). StrictMode 2.0; 0/1/кілька служб.
+    # ============================================================
+    #region #314-wave2-lifecycle-plan
+    & {
+    $lifecyclePlanModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $systemModuleTextForQuiescence `
+        -FunctionNames @('Get-BRAVOManagedServiceOrder', 'Test-BRAVOManagedServiceActiveStatus', 'Test-BRAVOServiceStartRequired',
+            'Get-BRAVOServiceStopDecision', 'Get-BRAVOManagedServiceRestartIntent', 'Get-BRAVOInheritedServiceRestartIntent',
+            'Get-BRAVOServiceQuiescenceScope', 'Get-BRAVOManagedServiceLifecyclePlan', 'Test-BRAVOServiceDisabledByOperator')
+    $lifecyclePlanProbe = & $lifecyclePlanModule {
+        Set-StrictMode -Version 2.0
+        $newServices = {
+            param([string]$Bravo, [string]$Exchange, [string]$Web, [bool]$BravoEnabled = $true, [bool]$ExchangeEnabled = $true, [bool]$WebEnabled = $true)
+            @(
+                @{ Key = 'Bravo'; Name = 'BRAVO'; Enabled = $BravoEnabled; Status = $Bravo },
+                @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $ExchangeEnabled; Status = $Exchange },
+                @{ Key = 'BravoWeb'; Name = 'Apache2.4'; Enabled = $WebEnabled; Status = $Web }
+            )
+        }
+        $formatPlan = {
+            param($Plan)
+            'stop: {0} | start: {1} | marker: {2}' -f (@($Plan.StopOrder) -join ' '), (@($Plan.StartOrder) -join ' '),
+                (@($Plan.QuiescenceServices | ForEach-Object { '{0}={1}' -f $_.Name, $_.RestartIntent }) -join ',')
+        }
+        $out = [ordered]@{}
+        $out['Order'] = '{0} / {1}' -f (@(Get-BRAVOManagedServiceOrder -Direction Start) -join ','), (@(Get-BRAVOManagedServiceOrder -Direction Stop) -join ',')
+        $out['AllRunning'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Running' 'Running' 'Running'))
+        $out['OnlyBravoRunning'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Running' 'Stopped' 'Stopped'))
+        $out['OnlyExchangeRunning'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Stopped' 'Running' 'Stopped'))
+        $out['OnlyWebRunning'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Stopped' 'Stopped' 'Running'))
+        $out['BravoAndExchangeRunning'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Running' 'Running' 'Stopped'))
+        $out['BravoFailedOthersRunning'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Stopped' 'Running' 'Running'))
+        $out['AllStopped'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Stopped' 'Stopped' 'Stopped'))
+        $out['BravoStartPendingWebPaused'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'StartPending' 'Running' 'Paused'))
+        $out['ExchangeAndWebUnmanaged'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Running' 'Stopped' 'Running' $true $false $false))
+        $out['BravoUnmanaged'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Stopped' 'Running' 'Running' $false $true $true))
+        $out['BootHoldAllStopped'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Stopped' 'Stopped' 'Stopped') -HoldAllEnabled -HoldAllManagedForRestore)
+        $out['RestoreHoldsAllManaged'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Running' 'Stopped' 'Running') -HoldAllManagedForRestore)
+        $out['InheritedExchangeIntent'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Running' 'Stopped' 'Stopped') -InheritedRestartIntentNames @('EXCHANGAPI'))
+        $out['ModelIntegrityNotEstablished'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'Running' 'Running' 'Running') -ModelIntegrityEstablished $false)
+        $out['BravoStopPendingNoIntent'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services (& $newServices 'StopPending' 'Running' 'Stopped'))
+        $out['SingleServiceList'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services @(@{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $true; Status = 'Running' }))
+        $out['EmptyServiceList'] = & $formatPlan (Get-BRAVOManagedServiceLifecyclePlan -Services @())
+        # Знімок наміру: StartPending = працює; boot-hold — усі керовані.
+        $intent = Get-BRAVOManagedServiceRestartIntent -Services (& $newServices 'StartPending' 'Paused' $null $true $true $false)
+        $intentHold = Get-BRAVOManagedServiceRestartIntent -Services (& $newServices 'Stopped' 'Stopped' 'Stopped' $true $true $false) -HoldAllEnabled
+        $out['RestartIntent'] = 'Bravo={0},ExchangeApi={1},BravoWeb={2} / hold: Bravo={3},ExchangeApi={4},BravoWeb={5}' -f $intent.Bravo, $intent.ExchangeApi, $intent.BravoWeb, $intentHold.Bravo, $intentHold.ExchangeApi, $intentHold.BravoWeb
+        $inherited = @(Get-BRAVOInheritedServiceRestartIntent -Services (& $newServices 'Running' 'Stopped' 'Stopped' $true $true $false) -RestartIntent @{ Bravo = $true; ExchangeApi = $false; BravoWeb = $false } -ForeignRestartIntentNames @('BRAVO', 'exchangapi', 'Apache2.4'))
+        $out['Inherited'] = @($inherited | ForEach-Object { '{0}:{1}' -f $_.Key, $_.Name }) -join ','
+        # Рішення зупинки (#360) і запуску.
+        $out['StopDecision'] = @(
+            @($null, $false, $true), @('', $true, $true), @('Stopped', $true, $true), @('Paused', $true, $true), @('PausePending', $false, $true),
+            @('ContinuePending', $true, $true), @('StopPending', $false, $true), @('StopPending', $true, $true), @('Running', $true, $false),
+            @('StartPending', $false, $true), @('Running', $false, $true), @('Running', $true, $true)
+        ) | ForEach-Object { '{0}/{1}/{2}={3}' -f $_[0], $_[1], $_[2], (Get-BRAVOServiceStopDecision -Status $_[0] -HasRestartIntent $_[1] -InQuiescenceScope $_[2]) }
+        $out['StopDecision'] = @($out['StopDecision']) -join ' '
+        $out['StartRequired'] = @(@('Running', 'Paused', 'PausePending', 'ContinuePending', 'Stopped', 'StopPending', 'StartPending', '') |
+                ForEach-Object { '{0}={1}' -f $_, (Test-BRAVOServiceStartRequired -Status $_) }) -join ' '
+        $out['ActiveStatus'] = @(@('Running', 'StartPending', 'StopPending', 'Paused', 'Stopped', '') |
+                ForEach-Object { '{0}={1}' -f $_, (Test-BRAVOManagedServiceActiveStatus -Status $_) }) -join ' '
+        # R379-4: Disabled від оператора vs тимчасове утримання BRAVO.
+        $out['DisabledByOperator'] = @(
+            @('BRAVO', 'Disabled', @()), @('BRAVO', 'disabled', @('Other')), @('BRAVO', 'Disabled', @('bravo')),
+            @('BRAVO', 'Automatic', @()), @('BRAVO', 'Manual', @('BRAVO')), @('BRAVO', $null, @())
+        ) | ForEach-Object { '{0}/{1}/{2}={3}' -f $_[0], $_[1], (@($_[2]) -join '+'), (Test-BRAVOServiceDisabledByOperator -Name $_[0] -StartMode $_[1] -HeldServiceNames $_[2]) }
+        $out['DisabledByOperator'] = @($out['DisabledByOperator']) -join ' '
+        $out
+    }
+    $lifecyclePlanExpected = [ordered]@{
+        Order = 'Bravo,ExchangeApi,BravoWeb / BravoWeb,ExchangeApi,Bravo'
+        AllRunning = 'stop: Apache2.4 exchangAPI BRAVO | start: BRAVO exchangAPI Apache2.4 | marker: BRAVO=True,exchangAPI=True,Apache2.4=True'
+        OnlyBravoRunning = 'stop: BRAVO | start: BRAVO | marker: BRAVO=True'
+        OnlyExchangeRunning = 'stop: exchangAPI | start: exchangAPI | marker: exchangAPI=True'
+        OnlyWebRunning = 'stop: Apache2.4 | start: Apache2.4 | marker: Apache2.4=True'
+        BravoAndExchangeRunning = 'stop: exchangAPI BRAVO | start: BRAVO exchangAPI | marker: BRAVO=True,exchangAPI=True'
+        BravoFailedOthersRunning = 'stop: Apache2.4 exchangAPI | start: exchangAPI Apache2.4 | marker: exchangAPI=True,Apache2.4=True'
+        AllStopped = 'stop:  | start:  | marker: '
+        BravoStartPendingWebPaused = 'stop: exchangAPI BRAVO | start: BRAVO exchangAPI | marker: BRAVO=True,exchangAPI=True'
+        ExchangeAndWebUnmanaged = 'stop: BRAVO | start: BRAVO | marker: BRAVO=True'
+        BravoUnmanaged = 'stop: Apache2.4 exchangAPI | start: exchangAPI Apache2.4 | marker: exchangAPI=True,Apache2.4=True'
+        BootHoldAllStopped = 'stop:  | start: BRAVO exchangAPI Apache2.4 | marker: BRAVO=True,exchangAPI=True,Apache2.4=True'
+        RestoreHoldsAllManaged = 'stop: Apache2.4 BRAVO | start: BRAVO Apache2.4 | marker: BRAVO=True,exchangAPI=False,Apache2.4=True'
+        InheritedExchangeIntent = 'stop: BRAVO | start: BRAVO exchangAPI | marker: BRAVO=True,exchangAPI=True'
+        ModelIntegrityNotEstablished = 'stop: Apache2.4 exchangAPI BRAVO | start:  | marker: BRAVO=True,exchangAPI=True,Apache2.4=True'
+        BravoStopPendingNoIntent = 'stop: exchangAPI | start: exchangAPI | marker: exchangAPI=True'
+        SingleServiceList = 'stop: exchangAPI | start: exchangAPI | marker: exchangAPI=True'
+        EmptyServiceList = 'stop:  | start:  | marker: '
+        RestartIntent = 'Bravo=True,ExchangeApi=False,BravoWeb=False / hold: Bravo=True,ExchangeApi=True,BravoWeb=False'
+        Inherited = 'ExchangeApi:exchangAPI'
+        StopDecision = '/False/True=NotActive /True/True=NotActive Stopped/True/True=NotActive Paused/True/True=KeepState PausePending/False/True=KeepState ContinuePending/True/True=KeepState StopPending/False/True=KeepState StopPending/True/True=Stop Running/True/False=OutsideContract StartPending/False/True=PromoteIntent Running/False/True=PromoteIntent Running/True/True=Stop'
+        StartRequired = 'Running=False Paused=False PausePending=False ContinuePending=False Stopped=True StopPending=True StartPending=True =True'
+        ActiveStatus = 'Running=True StartPending=True StopPending=False Paused=False Stopped=False =False'
+        DisabledByOperator = 'BRAVO/Disabled/=True BRAVO/disabled/Other=True BRAVO/Disabled/bravo=False BRAVO/Automatic/=False BRAVO/Manual/BRAVO=False BRAVO//=False'
+    }
+    $lifecyclePlanDiffs = @($lifecyclePlanExpected.Keys | Where-Object { [string]$lifecyclePlanProbe[$_] -cne [string]$lifecyclePlanExpected[$_] } |
+        ForEach-Object { "$_ => '$($lifecyclePlanProbe[$_])' (очікувалось '$($lifecyclePlanExpected[$_])')" })
+    Test-BRAVOCondition `
+        -Condition ($lifecyclePlanDiffs.Count -eq 0) `
+        -Name "ServiceRecovery/LifecyclePlanStopStartOrderMatrix" `
+        -Failure "план циклу служб (BRAVO.System) має давати канонічний порядок зупинки Web -> exchangAPI -> BRAVO і запуску BRAVO -> exchangAPI -> Web для кожної комбінації станів, як нічний Maintenance: $($lifecyclePlanDiffs -join ' | ')"
+
+    # Чистота: функції плану не звертаються до SCM/WMI/маркера/журналу —
+    # лише одна до одної та до вбудованих cmdlet-ів обробки колекцій.
+    $lifecyclePlanAst = [Management.Automation.Language.Parser]::ParseInput($systemModuleTextForQuiescence, [ref]$null, [ref]$null)
+    $lifecyclePlanFunctionNames = @('Get-BRAVOManagedServiceOrder', 'Test-BRAVOManagedServiceActiveStatus', 'Test-BRAVOServiceStartRequired',
+        'Get-BRAVOServiceStopDecision', 'Get-BRAVOManagedServiceRestartIntent', 'Get-BRAVOInheritedServiceRestartIntent',
+        'Get-BRAVOServiceQuiescenceScope', 'Get-BRAVOManagedServiceLifecyclePlan', 'Test-BRAVOServiceDisabledByOperator')
+    $lifecyclePlanAllowedCommands = @($lifecyclePlanFunctionNames) + @('Where-Object', 'ForEach-Object', 'Select-Object')
+    $lifecyclePlanImpure = New-Object System.Collections.Generic.List[string]
+    foreach ($lifecyclePlanFunctionName in $lifecyclePlanFunctionNames) {
+        $lifecyclePlanFunctionAst = @($lifecyclePlanAst.FindAll({
+                    param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $lifecyclePlanFunctionName
+                }, $true)) | Select-Object -First 1
+        if ($null -eq $lifecyclePlanFunctionAst) { [void]$lifecyclePlanImpure.Add("$lifecyclePlanFunctionName відсутня"); continue }
+        foreach ($lifecyclePlanCommand in @($lifecyclePlanFunctionAst.Body.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true))) {
+            $lifecyclePlanCommandName = [string]$lifecyclePlanCommand.GetCommandName()
+            if ($lifecyclePlanAllowedCommands -notcontains $lifecyclePlanCommandName) { [void]$lifecyclePlanImpure.Add("$lifecyclePlanFunctionName -> $lifecyclePlanCommandName") }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($lifecyclePlanImpure.Count -eq 0) `
+        -Name "ServiceRecovery/LifecyclePlanFunctionsArePure" `
+        -Failure "функції плану циклу служб у BRAVO.System мають бути чистими (без Get-Service/WMI/маркера/журналу): $($lifecyclePlanImpure -join ', ')"
+
+    # Maintenance ухвалює рішення тими самими чистими функціями (без копій
+    # логіки), а побічні дії живуть в окремих функціях runtime; #316 —
+    # явна точка розширення перед зупинкою служби.
+    $lifecycleRuntimeTextForPlan = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $lifecycleRuntimeAstForPlan = [Management.Automation.Language.Parser]::ParseInput($lifecycleRuntimeTextForPlan, [ref]$null, [ref]$null)
+    $getLifecycleRuntimeFunction = {
+        param([string]$Name)
+        @($lifecycleRuntimeAstForPlan.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name }, $true)) |
+            Select-Object -First 1
+    }
+    $getLifecycleCalls = {
+        param($FunctionAst)
+        if ($null -eq $FunctionAst) { return @() }
+        @($FunctionAst.Body.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true) |
+                Sort-Object { $_.Extent.StartOffset } | ForEach-Object { [string]$_.GetCommandName() })
+    }
+    $stopServiceCalls = @(& $getLifecycleCalls (& $getLifecycleRuntimeFunction 'Stop-BRAVOMaintenanceManagedService'))
+    $stopPhaseCalls = @(& $getLifecycleCalls (& $getLifecycleRuntimeFunction 'Stop-BRAVOMaintenanceManagedServices'))
+    $startPhaseCalls = @(& $getLifecycleCalls (& $getLifecycleRuntimeFunction 'Start-BRAVOMaintenanceManagedServices'))
+    $startServiceCalls = @(& $getLifecycleCalls (& $getLifecycleRuntimeFunction 'Start-BRAVOMaintenanceManagedService'))
+    $hookCalls = @(& $getLifecycleCalls (& $getLifecycleRuntimeFunction 'Invoke-BRAVOMaintenanceBeforeServiceStopHook'))
+    $contractCalls = @(& $getLifecycleCalls (& $getLifecycleRuntimeFunction 'Confirm-BRAVOMaintenanceServiceStopContract'))
+    $hookIndex = [array]::IndexOf($stopServiceCalls, 'Invoke-BRAVOMaintenanceBeforeServiceStopHook')
+    $stopInvokeIndex = [array]::IndexOf($stopServiceCalls, 'Invoke-ServiceStateChange')
+    $confirmIndex = [array]::IndexOf($stopServiceCalls, 'Confirm-BRAVOMaintenanceServiceStopContract')
+    Test-BRAVOCondition `
+        -Condition (
+            $confirmIndex -ge 0 -and $hookIndex -gt $confirmIndex -and $stopInvokeIndex -gt $hookIndex -and
+            $hookCalls -contains 'Stop-BRAVOMaintenanceStrayProcess' -and
+            $stopPhaseCalls -contains 'Get-BRAVOManagedServiceOrder' -and $stopPhaseCalls -contains 'Invoke-BRAVOMaintenanceBeforeServiceStopHook' -and
+            $startPhaseCalls -contains 'Get-BRAVOManagedServiceOrder' -and $startServiceCalls -contains 'Test-BRAVOServiceStartRequired' -and
+            $contractCalls -contains 'Get-BRAVOServiceStopDecision' -and
+            $lifecycleRuntimeTextForPlan.Contains('$quiescenceServices = @(Get-BRAVOServiceQuiescenceScope') -and
+            $lifecycleRuntimeTextForPlan.Contains('Get-BRAVOInheritedServiceRestartIntent') -and
+            @([regex]::Matches($lifecycleRuntimeTextForPlan, 'Stop-BRAVOMaintenanceStrayProcess(?!\s*\{)')).Count -ge 1 -and
+            @($lifecycleRuntimeAstForPlan.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Stop-BRAVOMaintenanceStrayProcess' }, $true)).Count -eq 1
+        ) `
+        -Name "ServiceRecovery/MaintenanceUsesLifecyclePlanAndBisHook" `
+        -Failure "Maintenance має зупиняти/запускати служби через Stop-/Start-BRAVOMaintenanceManagedServices у порядку Get-BRAVOManagedServiceOrder, рішення — чистими функціями BRAVO.System, а Stop-BRAVOMaintenanceStrayProcess викликатися лише з точки розширення #316 Invoke-BRAVOMaintenanceBeforeServiceStopHook перед Invoke-ServiceStateChange (виклики Stop-BRAVOMaintenanceManagedService: $($stopServiceCalls -join ', '))"
+
+    # R379-3/R379-4: один пошук Win32_Service за іменем у BRAVO.System; спільний
+    # контракт тимчасового Disabled для класифікації й DataRestore.
+    $lifecycleDataRestoreText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $win32FilterQueries = @([regex]::Matches($systemModuleTextForQuiescence, "-ClassName Win32_Service -Filter")).Count
+    $conditionFunctionForR379 = @($lifecyclePlanAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOManagedServiceCondition' }, $true)) | Select-Object -First 1
+    $startModeFunctionForR379 = @($lifecyclePlanAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOServiceStartMode' }, $true)) | Select-Object -First 1
+    Test-BRAVOCondition `
+        -Condition (
+            $win32FilterQueries -eq 1 -and
+            $null -ne $conditionFunctionForR379 -and $conditionFunctionForR379.Extent.Text.Contains('Get-BRAVOWin32ServiceInfo -Name') -and
+            $conditionFunctionForR379.Extent.Text.Contains('Test-BRAVOServiceDisabledByOperator') -and
+            $null -ne $startModeFunctionForR379 -and $startModeFunctionForR379.Extent.Text.Contains('Get-BRAVOWin32ServiceInfo -Name') -and
+            $lifecycleDataRestoreText.Contains('Disabled = (Test-BRAVOServiceDisabledByOperator -Name $ServiceName -StartMode $startMode -HeldServiceNames $TemporarilyDisabledServiceNames)') -and
+            $lifecycleDataRestoreText -notmatch '-ClassName\s+Win32_Service\s+`?\s*-Filter'
+        ) `
+        -Name "ServiceRecovery/SingleWin32ServiceLookupAndSharedHeldDisabledContract" `
+        -Failure "R379-3/R379-4: пошук Win32_Service за іменем має бути один (Get-BRAVOWin32ServiceInfo, знайдено -Filter-запитів: $win32FilterQueries), а Get-BRAVOManagedServiceCondition і знімок служб DataRestore — спиратися на спільний Test-BRAVOServiceDisabledByOperator"
+    }
+    #endregion #314-wave2-lifecycle-plan

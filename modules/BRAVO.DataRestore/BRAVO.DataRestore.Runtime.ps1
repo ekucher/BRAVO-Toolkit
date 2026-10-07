@@ -1666,11 +1666,7 @@ function Get-BRAVODataRestoreServiceSnapshot {
         $startMode = ""
         if ($service) {
             try {
-                $escapedName = $ServiceName.Replace("'", "''")
-                $serviceInfo = Get-BRAVOWmiInstance `
-                    -ClassName Win32_Service `
-                    -Filter "Name = '$escapedName'" |
-                    Select-Object -First 1
+                $serviceInfo = Get-BRAVOWin32ServiceInfo -Name $ServiceName
             } catch {
                 $serviceInfo = $null
             }
@@ -1679,7 +1675,9 @@ function Get-BRAVODataRestoreServiceSnapshot {
         }
         [pscustomobject]@{
             Exists = ($null -ne $service)
-            Disabled = ($startMode -ieq 'Disabled' -and @($TemporarilyDisabledServiceNames | Where-Object { $_ -ieq $ServiceName }).Count -eq 0)
+            # R379-4: той самий контракт «тимчасовий Disabled від BRAVO», що в
+            # Get-BRAVOManagedServiceCondition (BRAVO.System).
+            Disabled = (Test-BRAVOServiceDisabledByOperator -Name $ServiceName -StartMode $startMode -HeldServiceNames $TemporarilyDisabledServiceNames)
             Running = ($null -ne $service -and [string]$service.Status -eq 'Running')
             Status = if ($null -ne $service) { [string]$service.Status } else { $null }
         }

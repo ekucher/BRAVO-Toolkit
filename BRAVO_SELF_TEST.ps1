@@ -12059,9 +12059,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 -Failure 'ворота restore sequence, читання стану служби, каталог $ARC_DIR і fail-closed гілка «служба все ще працює» мають враховувати $restoreOnDisabledBravo'
 
             # Disabled-інваріант: служба лишається зупиненою й Disabled — жодного
-            # старту (serviceWasRunning.Bravo залежить лише від $BravoMaintenanceEnabled),
+            # старту (serviceWasRunning.Bravo залежить лише від $BravoMaintenanceEnabled:
+            # #314 хвиля 2 — Enabled опису керованої BRAVO, з якого
+            # Get-BRAVOManagedServiceRestartIntent будує намір),
             # жодної зміни StartupType, INFO (не WARNING) лише після УСПІШНОЇ реставрації.
-            $serviceWasRunningIndex = $RuntimeText.IndexOf('$serviceWasRunning = @{')
+            $serviceWasRunningIndex = $RuntimeText.IndexOf('$maintenanceManagedServices = @(')
             $serviceWasRunningWindow = if ($serviceWasRunningIndex -ge 0) {
                 $RuntimeText.Substring($serviceWasRunningIndex, [Math]::Min(400, $RuntimeText.Length - $serviceWasRunningIndex))
             } else { '' }
@@ -12072,9 +12074,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             } else { '' }
             Test-BRAVOCondition `
                 -Condition (
-                    $serviceWasRunningWindow.Contains('Bravo = $BravoMaintenanceEnabled -and') -and
+                    $serviceWasRunningWindow.Contains("@{ Key = 'Bravo'; Name = [string]`$BravoServiceName; Enabled = [bool]`$BravoMaintenanceEnabled;") -and
                     -not $serviceWasRunningWindow.Contains('restoreOnDisabledBravo') -and
-                    $RuntimeText.Contains('$serviceWasRunning.Bravo = $BravoMaintenanceEnabled') -and
+                    $RuntimeText.Contains('$serviceWasRunning = Get-BRAVOManagedServiceRestartIntent') -and
                     $RuntimeText -notmatch 'Set-Service|-StartupType|Start-Service\s+-Name\s+\$BravoServiceName' -and
                     $successBranchWindow.Contains('$restoreDisabledBravoInfo = "Реставрацію виконано; служба $BravoServiceName має тип Disabled — не запускалась"') -and
                     $successBranchWindow -match '(?s)if \(\$restoreOnDisabledBravo\) \{.{0,900}?Write-Log -Message \$restoreDisabledBravoInfo -Level "INFO"' -and
@@ -12084,8 +12086,14 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 -Failure 'Disabled-служба не має ні зупинятись/стартувати, ні змінювати StartupType (serviceWasRunning.Bravo лише від $BravoMaintenanceEnabled); INFO «Реставрацію виконано; служба BRAVO має тип Disabled — не запускалась» — лише в гілці успішної реставрації, рівнем INFO, і в Details кроку'
 
             # Stray Bis може тримати файли моделі під bravocmd: при Disabled+Force
-            # той самий спільний хелпер викликається в Disabled-гілці зупинки.
-            $strayDisabledIndex = $RuntimeText.IndexOf('} elseif ($BravoServiceDisabledBySystem) {')
+            # той самий спільний хелпер викликається в Disabled-гілці зупинки —
+            # через точку розширення #316 Invoke-BRAVOMaintenanceBeforeServiceStopHook
+            # (#314 хвиля 2: фаза зупинки — Stop-BRAVOMaintenanceManagedServices).
+            $strayDisabledIndex = $RuntimeText.IndexOf("} elseif (`$serviceKey -eq 'Bravo' -and `$service.Disabled) {")
+            $strayHookIndex = $RuntimeText.IndexOf('function Invoke-BRAVOMaintenanceBeforeServiceStopHook {')
+            $strayHookWindow = if ($strayHookIndex -ge 0) {
+                $RuntimeText.Substring($strayHookIndex, [Math]::Min(1600, $RuntimeText.Length - $strayHookIndex))
+            } else { '' }
             $strayDisabledWindow = if ($strayDisabledIndex -ge 0) {
                 $RuntimeText.Substring($strayDisabledIndex, [Math]::Min(700, $RuntimeText.Length - $strayDisabledIndex))
             } else { '' }
@@ -12093,8 +12101,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 -Condition (
                     $RuntimeText.Contains('function Stop-BRAVOMaintenanceStrayProcess {') -and
                     $RuntimeText.Contains('$processNames = @("Bis")') -and
-                    $strayDisabledWindow -match '(?s)if \(\$restoreOnDisabledBravo\) \{.{0,400}?Stop-BRAVOMaintenanceStrayProcess' -and
-                    ([regex]::Matches($RuntimeText, 'Stop-BRAVOMaintenanceStrayProcess')).Count -ge 3
+                    $strayDisabledWindow -match '(?s)if \(\$RestoreOnDisabledBravo\) \{.{0,400}?Invoke-BRAVOMaintenanceBeforeServiceStopHook -Key ''Bravo''' -and
+                    $strayHookWindow -match "(?s)if \(\`$Key -eq 'Bravo'\) \{\s*Stop-BRAVOMaintenanceStrayProcess" -and
+                    $RuntimeText.Contains('-RestoreOnDisabledBravo ([bool]$restoreOnDisabledBravo)')
                 ) `
                 -Name 'Maintenance/ForceRestoreDisabledKillsStrayBis' `
                 -Failure 'при -ForceRestore + Disabled має завершуватись сторонній Bis тим самим хелпером Stop-BRAVOMaintenanceStrayProcess'
@@ -22143,8 +22152,10 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
         $rangeIdStartFlagAssignments = [regex]::Matches(
             $maintenanceScriptText,
             [regex]::Escape('$script:bravoServiceStartedThisRun = $true'))
+        # #314 хвиля 2: запуск служб — Start-BRAVOMaintenanceManagedService;
+        # прапорець ставиться лише в success-гілці запуску саме BRAVO.
         $rangeIdStartSuccessIndex = $maintenanceScriptText.IndexOf(
-            'Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"')
+            '{ "Служба $Name успішно запущена" }) -Level "SUCCESS"')
         Test-BRAVOCondition `
             -Condition (
                 $rangeIdWaitGateIndex -ge 0 -and
@@ -26781,7 +26792,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
     # не чіпаються).
     $bootRestoreStartTypeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $systemSourceTextForScheduler `
-        -FunctionNames @('Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
+        -FunctionNames @('Get-BRAVOWin32ServiceInfo', 'Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
     $bootRestoreStartTypeProbe = & $bootRestoreStartTypeModule {
         $script:BRAVOSelfTestStartTypeStates = @{
             SVC_AUTO_PLAIN   = @{ StartType = 'Automatic'; Delayed = $false }

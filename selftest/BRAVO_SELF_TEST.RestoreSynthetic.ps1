@@ -431,7 +431,8 @@ Test-BRAVOCondition `
 Test-BRAVOCondition `
     -Condition (
         $restoreSyntheticRuntimeText.Contains('$recovery = Invoke-BRAVOModelRestoreRecovery') -and
-        $restoreSyntheticRuntimeText.Contains('$script:modelIntegrityEstablished -and $serviceWasRunning.Bravo')
+        $restoreSyntheticRuntimeText.Contains('-ModelIntegrityEstablished ([bool]$script:modelIntegrityEstablished)') -and
+        $restoreSyntheticRuntimeText.Contains('if ($null -ne $service -and $ModelIntegrityEstablished -and [bool]$RestartIntent[$serviceKey]) {')
     ) `
     -Name "RestoreSynthetic/ServiceRestartGatedByIntegrity" `
     -Failure 'рестарт BRAVO має бути гейтований на $script:modelIntegrityEstablished, а recovery — через Invoke-BRAVOModelRestoreRecovery'
