@@ -4937,8 +4937,12 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # +1 integrity (#300, Claude QA 386-Q2): retention виставляє
             # restoreIntegrityFailed, коли сама перевірка 7z t кинула виняток
             # (перевірку не виконано — fail-closed і для старших сесій).
+            # +1 integrity (#424): канонічний перелік архівів реставрації
+            # (Get-BRAVORestoreArchiveMainFiles) виставляє restoreIntegrityFailed
+            # за збою переліку чи перевірки наявності каталогу (не відсутній
+            # каталог) — сесії не перевірено, нічого не видаляється.
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 13) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 12)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 13)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
         -Failure "Maintenance має розрізняти локальну архівацію (40), перевірку цілісності (41) і провал реставрації з відкатом (43), а не зводити все до 60"
@@ -21315,7 +21319,7 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
                 (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)) `
             -FunctionNames @(
                 'Write-Log', 'Get-BRAVOFileHash', 'Test-SevenZipArchiveIntegrity',
-                'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
+                'Remove-OldRestoreArchives', 'Get-BRAVORestoreArchiveMainFiles', 'Get-SHA512HashCompatible',
                 'Test-BRAVOMaintenanceSevenZipArchiveIntegrity'
             )
         $sz394RetentionRun = {
@@ -22869,7 +22873,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # ================================================================
     $restoreCleanupModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceScriptText `
-        -FunctionNames @('Remove-OldRestoreArchives')
+        -FunctionNames @('Remove-OldRestoreArchives', 'Get-BRAVORestoreArchiveMainFiles')
     $restoreCleanupPrefix = 'RESTORECLEANUP'
 
     # --- Спільний stub-набір: Write-Log echo-ить у output stream (щоб
@@ -23047,7 +23051,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     $retentionIntegrityModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $retentionIntegritySourceText `
         -FunctionNames @(
-            'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
+            'Remove-OldRestoreArchives', 'Get-BRAVORestoreArchiveMainFiles', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
             'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
             'Register-BRAVOLegacyBomPasswordFallback',
@@ -23191,15 +23195,21 @@ function Get-BRAVOMaintenanceSummaryResult {
     $retentionFollowupModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $retentionIntegritySourceText `
         -FunctionNames @(
-            'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
+            'Remove-OldRestoreArchives', 'Get-BRAVORestoreArchiveMainFiles', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
             'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
             'Register-BRAVOLegacyBomPasswordFallback',
-            'Test-BRAVOSevenZipArchiveSpecificFailure'
+            'Test-BRAVOSevenZipArchiveSpecificFailure',
+            # #424 (review): реальний облік статусу кроку очистки
+            # (WARN/FAIL/SKIPPED і лічильник stepsError).
+            'Get-BRAVOMaintenanceStepStatus', 'Add-BRAVOMaintenanceStepOutcome'
         )
     $retentionFollowupStubScriptText = {
         function Write-Log {
             param($Message, [string]$Level = 'INFO')
+            # #424 (review): як справжній Write-Log — WARNING рахується в
+            # $script:BRAVOWarningCount (з нього статус кроку бере WARN).
+            if ($Level -eq 'WARNING') { $script:BRAVOWarningCount++ }
             [void]$script:retentionFollowupLogLines.Add("[$Level] $Message")
         }
         function Get-BRAVOFileHash {
@@ -23313,7 +23323,21 @@ function Get-BRAVOMaintenanceSummaryResult {
         return @{ Session = $Session; Content = $Content; Stale = $Stale; NoHash = $NoHash }
     }
     $retentionFollowupRunScenario = {
-        param([string]$ScenarioName, [object[]]$Sessions, [int]$KeepCount)
+        # #424: необов'язковий ReportOnly передає -ReportOnly у
+        # Remove-OldRestoreArchives (перевірка без видалення).
+        # #424 (review): CleanupStatusText — справжній фрагмент Main, що
+        # обчислює статус кроку «Очистка старих даних/логів» (AST-екстракція),
+        # виконується після retention за $hasDataToClean = $false;
+        # FailAfterEnumeration — перелік *_after_*.mdz завершується
+        # помилкою доступу (Get-ChildItem пише non-terminating error).
+        param([string]$ScenarioName, [object[]]$Sessions, [int]$KeepCount, [bool]$ReportOnly = $false,
+            [string]$CleanupStatusText = '', [bool]$FailAfterEnumeration = $false,
+            # FailPathLookup — Test-Path каталогу архівів (без -PathType)
+            # пише non-terminating error (ACL / збій провайдера) і нічого не повертає.
+            [bool]$FailPathLookup = $false,
+            # #424 (Codex P2, раунд 3): PriorCritical — до кроку очистки
+            # якась попередня фаза вже виставила criticalErrorOccurred.
+            [bool]$PriorCritical = $false)
         $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
             ("BRAVO_RETENTION_FOLLOWUP_{0}_{1}" -f $ScenarioName, [guid]::NewGuid().ToString("N"))
         [void][IO.Directory]::CreateDirectory($scenarioRoot)
@@ -23348,7 +23372,8 @@ function Get-BRAVOMaintenanceSummaryResult {
                         } elseif ($scenarioArchive['HashMode'] -ceq 'Malformed') {
                             $hash = 'not-a-sha512-value'
                         }
-                        "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+                        # -LiteralPath: каталог сценарію може містити [ / ] (#424, Codex P2, раунд 3).
+                        "$hash *$fileName" | Out-File -LiteralPath "$archivePath.sha512" -Encoding ASCII
                         if ($scenarioArchive['HashMode'] -ceq 'Locked') {
                             [void]$scenarioHashLocks.Add([IO.File]::Open("$archivePath.sha512", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None))
                         }
@@ -23359,10 +23384,44 @@ function Get-BRAVOMaintenanceSummaryResult {
                 }
             }
             $scenarioOutcome = & $retentionFollowupModule {
-                param($Path, $Prefix, $StubScriptText, $Keep)
+                param($Path, $Prefix, $StubScriptText, $Keep, $RetentionReportOnly, $CleanupStatusSource, $AfterEnumerationFails, $PathLookupFails, $CriticalBeforeCleanup)
                 Set-StrictMode -Version Latest
                 . ([scriptblock]::Create($StubScriptText))
                 $script:retentionFollowupLogLines = New-Object System.Collections.ArrayList
+                $script:BRAVOWarningCount = 0
+                $script:BRAVOMaintenanceStepOkCount = 0
+                $script:BRAVOMaintenanceStepWarnCount = 0
+                $script:BRAVOMaintenanceStepSkippedCount = 0
+                $script:BRAVOMaintenanceStepFailCount = 0
+                $script:BRAVOMaintenanceStepLog = New-Object System.Collections.ArrayList
+                if ($AfterEnumerationFails) {
+                    # Динамічна область видимості: Remove-OldRestoreArchives,
+                    # викликаний нижче з цієї області, бачить саме цю заглушку.
+                    function Get-ChildItem {
+                        [CmdletBinding()]
+                        param([string]$Path, [string]$Filter, [string]$LiteralPath, [switch]$File)
+                        if ($Filter -like '*_after_*') {
+                            Write-Error -Message 'BRAVO self-test: доступ до каталогу архівів заборонено' -Category PermissionDenied
+                            return
+                        }
+                        Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
+                    }
+                }
+                if ($PathLookupFails) {
+                    # Перевірка наявності каталогу — Test-Path без -PathType
+                    # (через -Path чи -LiteralPath); перевірка hash-файлу
+                    # (-PathType Leaf) працює як справжня.
+                    function Test-Path {
+                        [CmdletBinding()]
+                        param([Parameter(Position = 0)][string]$Path, [string]$LiteralPath, [string]$PathType)
+                        if ((-not [string]::IsNullOrEmpty($Path) -or -not [string]::IsNullOrEmpty($LiteralPath)) -and
+                            [string]::IsNullOrEmpty($PathType)) {
+                            Write-Error -Message 'BRAVO self-test: збій ACL під час перевірки каталогу архівів' -Category PermissionDenied
+                            return
+                        }
+                        Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
+                    }
+                }
                 $script:ArchivePrefixRegex = [regex]::Escape($Prefix)
                 $script:ARC_PATH = 'unused-stub-path'
                 $script:ArchivePassword = 'selftest-fixture'
@@ -23370,19 +23429,53 @@ function Get-BRAVOMaintenanceSummaryResult {
                 $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
                 $script:criticalErrorOccurred = $false
                 $script:restoreIntegrityFailed = $false
+                if ($CriticalBeforeCleanup) {
+                    $script:criticalErrorOccurred = $true
+                }
+                # #424 (Codex P2, раунд 3): власний облік збою цілісності
+                # кроку очистки, як у Main ($restoreArchiveIntegrityOutcome).
+                $restoreArchiveIntegrityOutcome = @{ IntegrityFailed = $false }
                 $retentionThrew = $null
                 try {
-                    Remove-OldRestoreArchives -Path $Path -ArchivePrefix $Prefix -KeepCount $Keep -InvalidRetentionDays 30
+                    $retentionArgs = @{ Path = $Path; ArchivePrefix = $Prefix; KeepCount = $Keep; InvalidRetentionDays = 30 }
+                    if ((Get-Command -Name Remove-OldRestoreArchives -CommandType Function).Parameters.ContainsKey('Outcome')) {
+                        $retentionArgs['Outcome'] = $restoreArchiveIntegrityOutcome
+                    }
+                    if ($RetentionReportOnly) {
+                        # Проста (не advanced) функція мовчки поклала б
+                        # невідомий -ReportOnly в $args — тому відсутній
+                        # параметр є явним провалом сценарію.
+                        if (-not (Get-Command -Name Remove-OldRestoreArchives -CommandType Function).Parameters.ContainsKey('ReportOnly')) {
+                            throw 'Remove-OldRestoreArchives не має параметра -ReportOnly'
+                        }
+                        $retentionArgs['ReportOnly'] = $true
+                    }
+                    Remove-OldRestoreArchives @retentionArgs
                 } catch {
                     $retentionThrew = $_.Exception.Message
+                }
+                $cleanupStatusResult = $null
+                if (-not [string]::IsNullOrEmpty($CleanupStatusSource)) {
+                    try {
+                        $hasDataToClean = $false
+                        $cleanupCriticalBefore = [bool]$CriticalBeforeCleanup
+                        $cleanupWarningsBefore = 0
+                        . ([scriptblock]::Create($CleanupStatusSource))
+                        Add-BRAVOMaintenanceStepOutcome -Name 'Очистка старих даних/логів' -Status $cleanupOperationStatus
+                        $cleanupStatusResult = [string]$cleanupOperationStatus
+                    } catch {
+                        $cleanupStatusResult = 'THREW: ' + $_.Exception.Message
+                    }
                 }
                 [pscustomobject]@{
                     Threw = $retentionThrew
                     Critical = [bool]$script:criticalErrorOccurred
                     RestoreFailed = [bool]$script:restoreIntegrityFailed
                     Log = (@($script:retentionFollowupLogLines) -join "`n")
+                    CleanupStatus = $cleanupStatusResult
+                    StepsError = [int]$script:BRAVOMaintenanceStepFailCount
                 }
-            } $scenarioRoot $retentionFollowupPrefix $retentionFollowupStubScriptText $KeepCount
+            } $scenarioRoot $retentionFollowupPrefix $retentionFollowupStubScriptText $KeepCount $ReportOnly $CleanupStatusText $FailAfterEnumeration $FailPathLookup $PriorCritical
             $remainingNames = @(
                 Get-ChildItem -LiteralPath $scenarioRoot -File -ErrorAction SilentlyContinue |
                     ForEach-Object { $_.Name } | Sort-Object
@@ -23815,6 +23908,569 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/RetentionNoValidRestorePointNothingInvalidDeleted" `
         -Failure ("без жодної підтвердженої точки відновлення retention НЕ повинен видаляти жодної непридатної сесії (навіть із CRC-помилкою); ERROR і прапорці — як і раніше; WARNING для кожної збереженої сесії; лишилось=[{0}], critical={1}, restoreIntegrityFailed={2}, threw={3}, журнал: {4}" -f $retention422NoValid.Remaining, $retention422NoValid.Critical, $retention422NoValid.RestoreFailed, $retention422NoValid.Threw, $retention422NoValid.Log)
+
+    # ================================================================
+    # #424: коли сесій архівів реставрації ≤ ArchivesKeepCount, Main не
+    # запускав retention, тож сесії ніхто повторно не перевіряв і жодна
+    # діагностика придатності (WARNING для кожного архіву, WARNING #422,
+    # ERROR «Не лишилось жодної придатної точки відновлення» + exit 41) не
+    # з'являлась. Рішення власника (2026-10-07, «Повна перевірка»): у цьому
+    # стані Main викликає Remove-OldRestoreArchives -ReportOnly — та сама
+    # валідація й діагностика, але БЕЗ жодного видалення (інваріант #422:
+    # невідоме / непройдена перевірка → не видаляти). Той самий харнес:
+    # реальні Remove-OldRestoreArchives і перевірки 7-Zip, застабовано
+    # лише процесний шар 7-Zip; тимчасовий каталог на сценарій.
+    # ================================================================
+    # (a) KeepCount = 2: придатна сесія + стара сесія з SHA512, що не
+    # збігається (UNKNOWN). Retention не запускався б (2 ≤ 2), але WARNING
+    # #422 має з'явитися, а всі файли — лишитися.
+    $retention424Stale = & $retentionFollowupRunScenario 'I424StaleWithinKeep' @(
+        (& $retentionFollowupSession '20260111_0100' 'synthetic-ok-1'),
+        @{ Session = $retention422Subject; Content = 'synthetic-ok-mismatch'; Stale = $true; NoHash = $false; HashMode = 'Mismatch' }
+    ) 2 $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424Stale -and
+            $null -eq $retention424Stale.Threw -and
+            [string]$retention424Stale.Remaining -ceq (& $retentionFollowupExpectedFiles @($retention422Subject, '20260111_0100')) -and
+            (& $retention422KeptLine $retention424Stale $retention422Subject 'SHA512 не збігається') -and
+            -not $retention424Stale.Critical -and
+            -not $retention424Stale.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionReportOnlyStaleSessionWarnsWithinKeepCount" `
+        -Failure ("Remove-OldRestoreArchives -ReportOnly за сесій ≤ ArchivesKeepCount має перевірити сесії й записати WARNING #422 про непридатну сесію, не видаливши жодного файлу; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention424Stale.Threw, $retention424Stale.Remaining, $retention424Stale.Log)
+
+    # (b) -ReportOnly не видаляє НІЧОГО, навіть те, що звичайний retention
+    # видалив би: стара сесія з доведеним пошкодженням (CRC Failed) і
+    # придатні сесії понад KeepCount = 1. Контроль без -ReportOnly на тому
+    # самому наборі видаляє їх, як і раніше.
+    $retention424Sessions = @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-CRC-FAILED' $true)
+    $retention424Proven = & $retentionFollowupRunScenario 'I424ProvenReportOnly' $retention424Sessions 1 $true
+    $retention424ProvenControl = & $retentionFollowupRunScenario 'I424ProvenControl' $retention424Sessions 1
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424Proven -and
+            $null -eq $retention424Proven.Threw -and
+            [string]$retention424Proven.Remaining -ceq (& $retentionFollowupExpectedFiles @($retention422Subject, '20260105_0100', '20260110_0100', '20260111_0100')) -and
+            -not [regex]::IsMatch([string]$retention424Proven.Log, '(?m)Видал') -and
+            [regex]::IsMatch([string]$retention424Proven.Log, ('(?m)^\[WARNING\] Непридатну сесію ' + [regex]::Escape($retention422Subject) + ' .*НЕ видалено: retention працює лише в режимі перевірки')) -and
+            $null -ne $retention424ProvenControl -and
+            $null -eq $retention424ProvenControl.Threw -and
+            [string]$retention424ProvenControl.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100'))
+        ) `
+        -Name "Maintenance/RetentionReportOnlyNeverDeletesProvenCorrupt" `
+        -Failure ("Remove-OldRestoreArchives -ReportOnly не повинен видаляти жодного файлу — ні доведено пошкоджену стару сесію, ні придатні сесії понад KeepCount, — і має записати для доведено пошкодженої старої сесії WARNING «НЕ видалено: retention працює лише в режимі перевірки»; контроль без -ReportOnly має видаляти їх, як і раніше; ReportOnly: threw={0}, лишилось=[{1}], журнал: {2}; контроль: threw={3}, лишилось=[{4}]" -f $retention424Proven.Threw, $retention424Proven.Remaining, $retention424Proven.Log, $retention424ProvenControl.Threw, $retention424ProvenControl.Remaining)
+
+    # (c) KeepCount = 1, єдина сесія стала непридатною (7-Zip забракував
+    # архів): ERROR «Не лишилось жодної придатної точки відновлення» і
+    # прапорці critical/restoreIntegrityFailed (exit 41) — як на звичайному
+    # шляху retention; архів лишається на диску.
+    $retention424Single = & $retentionFollowupRunScenario 'I424SingleBroken' @(
+        (& $retentionFollowupSession '20260111_0100' $retentionFollowupBroken)
+    ) 1 $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424Single -and
+            $null -eq $retention424Single.Threw -and
+            [string]$retention424Single.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100')) -and
+            $retention424Single.Critical -and
+            $retention424Single.RestoreFailed -and
+            [regex]::IsMatch([string]$retention424Single.Log, '(?m)^\[ERROR\] Не лишилось жодної придатної точки відновлення') -and
+            [regex]::IsMatch([string]$retention424Single.Log, '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ')
+        ) `
+        -Name "Maintenance/RetentionReportOnlySingleBrokenSessionSetsFailureFlags" `
+        -Failure ("за ArchivesKeepCount = 1 і єдиної зламаної сесії Remove-OldRestoreArchives -ReportOnly має записати WARNING для архіву, ERROR «Не лишилось жодної придатної точки відновлення» і виставити critical/restoreIntegrityFailed (exit 41), не видаляючи архів; threw={0}, critical={1}, restoreIntegrityFailed={2}, лишилось=[{3}], журнал: {4}" -f $retention424Single.Threw, $retention424Single.Critical, $retention424Single.RestoreFailed, $retention424Single.Remaining, $retention424Single.Log)
+
+    # (d) Гейт Main: справжній оператор if/elseif із Runtime (AST-екстракція
+    # if, що викликає Remove-OldRestoreArchives поза самою функцією)
+    # виконується з застабованими Remove-OldRestoreArchives і Write-Log у
+    # кількох станах. Сесій ≤ KeepCount → виклик лише з -ReportOnly;
+    # сесій > KeepCount → звичайний retention без -ReportOnly; поточна
+    # restore-сесія unsafe, Maintenance вимкнено чи сесій немає → жодного
+    # виклику. Окремо (AST): Main рахує сесії в $restoreArchiveGroupCount.
+    $retention424GateTokens = $null
+    $retention424GateErrors = $null
+    $retention424GateAst = [Management.Automation.Language.Parser]::ParseInput(
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        ),
+        [ref]$retention424GateTokens,
+        [ref]$retention424GateErrors
+    )
+    # Найближчий if-предок кожного виклику Remove-OldRestoreArchives поза
+    # самою функцією; усі виклики мають належати одному гейту.
+    $retention424GateIfs = @()
+    foreach ($retention424Call in @($retention424GateAst.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -eq 'Remove-OldRestoreArchives'
+            },
+            $true
+        ))) {
+        $retention424Ancestor = $retention424Call.Parent
+        $retention424CallIf = $null
+        while ($null -ne $retention424Ancestor) {
+            if ($retention424Ancestor -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $retention424Ancestor.Name -eq 'Remove-OldRestoreArchives') {
+                $retention424CallIf = $null
+                break
+            }
+            if ($null -eq $retention424CallIf -and
+                $retention424Ancestor -is [Management.Automation.Language.IfStatementAst]) {
+                $retention424CallIf = $retention424Ancestor
+            }
+            $retention424Ancestor = $retention424Ancestor.Parent
+        }
+        if ($null -ne $retention424CallIf -and
+            @($retention424GateIfs | Where-Object { $_.Extent.StartOffset -eq $retention424CallIf.Extent.StartOffset }).Count -eq 0) {
+            $retention424GateIfs += $retention424CallIf
+        }
+    }
+    $retention424GroupCountAssigned = @($retention424GateAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $candidate.Left.Extent.Text -ceq '$restoreArchiveGroupCount' -and
+            $candidate.Right.Extent.Text -match '\$sortedGroups'
+        },
+        $true
+    )).Count -gt 0
+    $retention424RunGate = {
+        param([string]$GateText, [bool]$Enabled, [int]$GroupCount, [int]$KeepCount, [bool]$Unsafe)
+        $gateScript = [scriptblock]::Create(@'
+param($BravoMaintenanceEnabled, $restoreArchiveGroupCount, $restoreArchiveDeleteCandidateGroups, $restoreSessionUnsafeForRetention, $RESTORE_ARCHIVES_KEEP_COUNT)
+Set-StrictMode -Version Latest
+$retention424Calls = New-Object System.Collections.ArrayList
+function Remove-OldRestoreArchives {
+    param([string]$Path, [string]$ArchivePrefix, [int]$KeepCount, [int]$InvalidRetentionDays, [switch]$ReportOnly, [hashtable]$Outcome)
+    $null = $Path; $null = $ArchivePrefix; $null = $InvalidRetentionDays
+    [void]$retention424Calls.Add(('ReportOnly={0};Keep={1};Outcome={2}' -f [bool]$ReportOnly, $KeepCount, [object]::ReferenceEquals($Outcome, $restoreArchiveIntegrityOutcome)))
+}
+function Write-Log { param($Message, [string]$Level = 'INFO'); $null = $Message; $null = $Level }
+$restoreArchiveIntegrityOutcome = @{ IntegrityFailed = $false }
+$ARC_DIR = 'unused-selftest-arc-dir'
+$ArchivePrefix = 'RETFUP'
+$FAILED_ARCHIVE_RETENTION_DAYS = 30
+'@ + "`n" + $GateText + "`n" + '@($retention424Calls) -join ''|''')
+        $candidates = @()
+        if ($GroupCount -gt $KeepCount) {
+            $candidates = @(1..($GroupCount - $KeepCount))
+        }
+        try {
+            return [string](& $gateScript $Enabled $GroupCount $candidates $Unsafe $KeepCount)
+        } catch {
+            return ('THREW: ' + $_.Exception.Message)
+        }
+    }
+    $retention424GateText = ''
+    if ($retention424GateIfs.Count -eq 1) {
+        $retention424GateText = $retention424GateIfs[0].Extent.Text
+    }
+    $retention424GateWithin = & $retention424RunGate $retention424GateText $true 1 1 $false
+    $retention424GateWithinTwo = & $retention424RunGate $retention424GateText $true 2 2 $false
+    $retention424GateBeyond = & $retention424RunGate $retention424GateText $true 3 1 $false
+    $retention424GateUnsafe = & $retention424RunGate $retention424GateText $true 1 1 $true
+    $retention424GateDisabled = & $retention424RunGate $retention424GateText $false 1 1 $false
+    $retention424GateEmpty = & $retention424RunGate $retention424GateText $true 0 1 $false
+    Test-BRAVOCondition `
+        -Condition (
+            $retention424GateIfs.Count -eq 1 -and
+            $retention424GroupCountAssigned -and
+            $retention424GateWithin -ceq 'ReportOnly=True;Keep=1;Outcome=True' -and
+            $retention424GateWithinTwo -ceq 'ReportOnly=True;Keep=2;Outcome=True' -and
+            $retention424GateBeyond -ceq 'ReportOnly=False;Keep=1;Outcome=True' -and
+            $retention424GateUnsafe -ceq '' -and
+            $retention424GateDisabled -ceq '' -and
+            $retention424GateEmpty -ceq ''
+        ) `
+        -Name "Maintenance/RetentionReportOnlyMainBranchWithinKeepCount" `
+        -Failure ("гейт Main має за сесій ≤ ArchivesKeepCount викликати Remove-OldRestoreArchives лише з -ReportOnly, за сесій > ArchivesKeepCount — звичайний retention без -ReportOnly (обидва — з -Outcome `$restoreArchiveIntegrityOutcome), а для unsafe-сесії, вимкненого Maintenance чи відсутності сесій — не викликати нічого; Main має рахувати сесії в `$restoreArchiveGroupCount; if-гейтів={0}, лічильник={1}, ≤1/1=[{2}], ≤2/2=[{3}], >3/1=[{4}], unsafe=[{5}], вимкнено=[{6}], порожньо=[{7}]" -f $retention424GateIfs.Count, $retention424GroupCountAssigned, $retention424GateWithin, $retention424GateWithinTwo, $retention424GateBeyond, $retention424GateUnsafe, $retention424GateDisabled, $retention424GateEmpty)
+
+    # ================================================================
+    # #424 (review Codex P2): статус кроку «Очистка старих даних/логів».
+    # Гілка «лише перевірка» не робить $hasDataToClean істинним, тож
+    # раніше статус ставав SKIPPED ще до урахування WARN/FAIL: крок і
+    # лічильник stepsError приховували збій цілісності (exit 41). Справжній
+    # фрагмент Main (від присвоєння $cleanupOperationStatus до
+    # $cleanupOperationDetails, AST-екстракція) виконується після
+    # реального Remove-OldRestoreArchives -ReportOnly.
+    # ================================================================
+    $retention424CleanupSourceText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $retention424CleanupTokens = $null
+    $retention424CleanupErrors = $null
+    $retention424CleanupAst = [Management.Automation.Language.Parser]::ParseInput(
+        $retention424CleanupSourceText,
+        [ref]$retention424CleanupTokens,
+        [ref]$retention424CleanupErrors
+    )
+    $retention424FirstAssignment = {
+        param([string]$VariableText)
+        return (@($retention424CleanupAst.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $candidate.Left.Extent.Text -ceq $VariableText
+            },
+            $true
+        )) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
+    }
+    $retention424StatusAssignment = & $retention424FirstAssignment '$cleanupOperationStatus'
+    $retention424DetailsAssignment = & $retention424FirstAssignment '$cleanupOperationDetails'
+    $retention424CleanupStatusText = ''
+    if ($null -ne $retention424StatusAssignment -and $null -ne $retention424DetailsAssignment -and
+        $retention424DetailsAssignment.Extent.StartOffset -gt $retention424StatusAssignment.Extent.StartOffset) {
+        $retention424CleanupStatusText = $retention424CleanupSourceText.Substring(
+            $retention424StatusAssignment.Extent.StartOffset,
+            $retention424DetailsAssignment.Extent.StartOffset - $retention424StatusAssignment.Extent.StartOffset)
+    }
+    $retention424StepBroken = & $retentionFollowupRunScenario 'I424StepBroken' @(
+        (& $retentionFollowupSession '20260111_0100' $retentionFollowupBroken)
+    ) 1 $true $retention424CleanupStatusText
+    $retention424StepStale = & $retentionFollowupRunScenario 'I424StepStale' @(
+        (& $retentionFollowupSession '20260111_0100' 'synthetic-ok-1'),
+        @{ Session = $retention422Subject; Content = 'synthetic-ok-mismatch'; Stale = $true; NoHash = $false; HashMode = 'Mismatch' }
+    ) 2 $true $retention424CleanupStatusText
+    $retention424StepClean = & $retentionFollowupRunScenario 'I424StepClean' @(
+        (& $retentionFollowupSession '20260111_0100' 'synthetic-ok-1')
+    ) 1 $true $retention424CleanupStatusText
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrEmpty($retention424CleanupStatusText) -and
+            $null -ne $retention424StepBroken -and
+            $retention424StepBroken.Critical -and
+            [string]$retention424StepBroken.CleanupStatus -ceq 'FAIL' -and
+            $retention424StepBroken.StepsError -ge 1 -and
+            $null -ne $retention424StepStale -and
+            -not $retention424StepStale.Critical -and
+            [string]$retention424StepStale.CleanupStatus -ceq 'WARN' -and
+            $retention424StepStale.StepsError -eq 0 -and
+            $null -ne $retention424StepClean -and
+            -not $retention424StepClean.Critical -and
+            -not [regex]::IsMatch([string]$retention424StepClean.Log, '(?m)^\[(WARNING|ERROR)\]') -and
+            [string]$retention424StepClean.CleanupStatus -ceq 'SKIPPED' -and
+            $retention424StepClean.StepsError -eq 0
+        ) `
+        -Name "Maintenance/RetentionReportOnlyCleanupStepReportsFailure" `
+        -Failure ("за сесій ≤ ArchivesKeepCount крок «Очистка старих даних/логів» має бути FAIL (stepsError ≥ 1), коли перевірка лише-перевірки виставила прапорці exit 41, і WARN за WARNING без critical; без жодної проблеми — SKIPPED, як і раніше; фрагмент знайдено={0}; зламана: статус=[{1}], stepsError={2}, critical={3}; UNKNOWN: статус=[{4}], stepsError={5}; чиста: статус=[{6}], stepsError={7}, журнал: {8}" -f (-not [string]::IsNullOrEmpty($retention424CleanupStatusText)), $retention424StepBroken.CleanupStatus, $retention424StepBroken.StepsError, $retention424StepBroken.Critical, $retention424StepStale.CleanupStatus, $retention424StepStale.StepsError, $retention424StepClean.CleanupStatus, $retention424StepClean.StepsError, $retention424StepClean.Log)
+
+    # ================================================================
+    # #424 (review Codex P2): збій переліку архівів реставрації (відмова
+    # доступу тощо) не можна плутати з порожнім каталогом. Раніше
+    # Get-ChildItem -ErrorAction SilentlyContinue давав 0 (або лише частину)
+    # архівів: нічна перевірка мовчки пропускалась, а частковий перелік ще
+    # й ішов у retention. Тепер: ERROR, прапорці critical/restoreIntegrityFailed
+    # (exit 41) і жодного видалення в цьому циклі.
+    # ================================================================
+    # (e) Remove-OldRestoreArchives: перелік *_after_*.mdz падає, *_before_*
+    # — успішний; три придатні сесії понад KeepCount = 1 (звичайний
+    # retention видалив би дві). Контроль без збою видаляє їх, як і раніше.
+    $retention424EnumSessions = @(
+        (& $retentionFollowupSession '20260109_0100' 'synthetic-ok-0'),
+        (& $retentionFollowupSession '20260110_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260111_0100' 'synthetic-ok-2')
+    )
+    $retention424EnumFailed = & $retentionFollowupRunScenario 'I424EnumFailed' $retention424EnumSessions 1 $false $retention424CleanupStatusText $true
+    $retention424EnumControl = & $retentionFollowupRunScenario 'I424EnumControl' $retention424EnumSessions 1
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424EnumFailed -and
+            $null -eq $retention424EnumFailed.Threw -and
+            [string]$retention424EnumFailed.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260109_0100', '20260110_0100', '20260111_0100')) -and
+            -not [regex]::IsMatch([string]$retention424EnumFailed.Log, '(?m)Видал') -and
+            [regex]::IsMatch([string]$retention424EnumFailed.Log, '(?m)^\[ERROR\] Не вдалося отримати перелік архівів реставрації') -and
+            $retention424EnumFailed.Critical -and
+            $retention424EnumFailed.RestoreFailed -and
+            [string]$retention424EnumFailed.CleanupStatus -ceq 'FAIL' -and
+            $null -ne $retention424EnumControl -and
+            $null -eq $retention424EnumControl.Threw -and
+            [string]$retention424EnumControl.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100'))
+        ) `
+        -Name "Maintenance/RestoreArchiveEnumerationFailureNoDeletion" `
+        -Failure ("збій переліку архівів реставрації має дати ERROR і прапорці critical/restoreIntegrityFailed (exit 41) без жодного видалення, крок очистки — FAIL; контроль без збою видаляє сесії понад KeepCount, як і раніше; збій: threw={0}, лишилось=[{1}], critical={2}, restoreIntegrityFailed={3}, статус=[{4}], журнал: {5}; контроль: threw={6}, лишилось=[{7}]" -f $retention424EnumFailed.Threw, $retention424EnumFailed.Remaining, $retention424EnumFailed.Critical, $retention424EnumFailed.RestoreFailed, $retention424EnumFailed.CleanupStatus, $retention424EnumFailed.Log, $retention424EnumControl.Threw, $retention424EnumControl.Remaining)
+
+    # (e2) Codex P2 (раунд 2): каталог існує, але сам Test-Path пише
+    # non-terminating error (ACL / збій провайдера) і нічого не повертає.
+    # Раніше це вважалось відсутнім каталогом: ні ERROR, ні exit 41, і
+    # перевірка мовчки пропускалась. Тепер — той самий fail-closed шлях.
+    $retention424LookupFailed = & $retentionFollowupRunScenario 'I424LookupFailed' $retention424EnumSessions 1 $false $retention424CleanupStatusText $false $true
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424LookupFailed -and
+            $null -eq $retention424LookupFailed.Threw -and
+            [string]$retention424LookupFailed.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260109_0100', '20260110_0100', '20260111_0100')) -and
+            -not [regex]::IsMatch([string]$retention424LookupFailed.Log, '(?m)Видал') -and
+            [regex]::IsMatch([string]$retention424LookupFailed.Log, '(?m)^\[ERROR\] Не вдалося отримати перелік архівів реставрації') -and
+            $retention424LookupFailed.Critical -and
+            $retention424LookupFailed.RestoreFailed -and
+            [string]$retention424LookupFailed.CleanupStatus -ceq 'FAIL'
+        ) `
+        -Name "Maintenance/RestoreArchivePathLookupFailureNoDeletion" `
+        -Failure ("збій Test-Path каталогу архівів реставрації (ACL / провайдер) має дати ERROR і прапорці critical/restoreIntegrityFailed (exit 41) без жодного видалення, крок очистки — FAIL, а не вважатися відсутнім каталогом; threw={0}, лишилось=[{1}], critical={2}, restoreIntegrityFailed={3}, статус=[{4}], журнал: {5}" -f $retention424LookupFailed.Threw, $retention424LookupFailed.Remaining, $retention424LookupFailed.Critical, $retention424LookupFailed.RestoreFailed, $retention424LookupFailed.CleanupStatus, $retention424LookupFailed.Log)
+
+    # (f) Канонічний перелік (Get-BRAVORestoreArchiveMainFiles) напряму:
+    # відсутній каталог і порожній каталог — успішний порожній перелік без
+    # ERROR і прапорців (як і раніше); збій переліку — Failed, ERROR, прапорці.
+    $retention424EnumDirect = {
+        param([string]$Path, [bool]$FailAfter, [bool]$FailLookup = $false)
+        try {
+            return (& $retentionFollowupModule {
+                param($StubScriptText, $EnumPath, $AfterEnumerationFails, $PathLookupFails)
+                Set-StrictMode -Version Latest
+                . ([scriptblock]::Create($StubScriptText))
+                $script:retentionFollowupLogLines = New-Object System.Collections.ArrayList
+                $script:BRAVOWarningCount = 0
+                $script:criticalErrorOccurred = $false
+                $script:restoreIntegrityFailed = $false
+                if ($AfterEnumerationFails) {
+                    function Get-ChildItem {
+                        [CmdletBinding()]
+                        param([string]$Path, [string]$Filter, [string]$LiteralPath, [switch]$File)
+                        if ($Filter -like '*_after_*') {
+                            Write-Error -Message 'BRAVO self-test: доступ до каталогу архівів заборонено' -Category PermissionDenied
+                            return
+                        }
+                        Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
+                    }
+                }
+                if ($PathLookupFails) {
+                    function Test-Path {
+                        [CmdletBinding()]
+                        param([Parameter(Position = 0)][string]$Path, [string]$LiteralPath, [string]$PathType)
+                        if ((-not [string]::IsNullOrEmpty($Path) -or -not [string]::IsNullOrEmpty($LiteralPath)) -and
+                            [string]::IsNullOrEmpty($PathType)) {
+                            Write-Error -Message 'BRAVO self-test: збій ACL під час перевірки каталогу архівів' -Category PermissionDenied
+                            return
+                        }
+                        Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
+                    }
+                }
+                $enumResult = Get-BRAVORestoreArchiveMainFiles -Path $EnumPath -ArchivePrefix 'RETFUP'
+                [pscustomobject]@{
+                    Failed = [bool]$enumResult.Failed
+                    Count = @($enumResult.Files).Count
+                    Critical = [bool]$script:criticalErrorOccurred
+                    RestoreFailed = [bool]$script:restoreIntegrityFailed
+                    Log = (@($script:retentionFollowupLogLines) -join "`n")
+                }
+            } $retentionFollowupStubScriptText $Path $FailAfter $FailLookup)
+        } catch {
+            return [pscustomobject]@{ Failed = $null; Count = -1; Critical = $null; RestoreFailed = $null; Log = ('THREW: ' + $_.Exception.Message) }
+        }
+    }
+    $retention424EnumRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RETENTION_ENUM_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $retention424EnumMissing = & $retention424EnumDirect (Join-Path $retention424EnumRoot 'missing') $false
+        [void][IO.Directory]::CreateDirectory($retention424EnumRoot)
+        $retention424EnumEmpty = & $retention424EnumDirect $retention424EnumRoot $false
+        [IO.File]::WriteAllText((Join-Path $retention424EnumRoot 'RETFUP_before_20260111_0100.mdz'), 'synthetic-ok')
+        $retention424EnumOk = & $retention424EnumDirect $retention424EnumRoot $false
+        $retention424EnumDenied = & $retention424EnumDirect $retention424EnumRoot $true
+        # Codex P2 (раунд 2): збій самого Test-Path каталогу (ACL / провайдер).
+        $retention424EnumLookup = & $retention424EnumDirect $retention424EnumRoot $false $true
+    } finally {
+        if (Test-Path -LiteralPath $retention424EnumRoot) {
+            Remove-Item -LiteralPath $retention424EnumRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $retention424EnumMissing.Failed -eq $false -and $retention424EnumMissing.Count -eq 0 -and
+            -not $retention424EnumMissing.Critical -and -not $retention424EnumMissing.RestoreFailed -and
+            [string]::IsNullOrEmpty([string]$retention424EnumMissing.Log) -and
+            $retention424EnumEmpty.Failed -eq $false -and $retention424EnumEmpty.Count -eq 0 -and
+            -not $retention424EnumEmpty.Critical -and
+            [string]::IsNullOrEmpty([string]$retention424EnumEmpty.Log) -and
+            $retention424EnumOk.Failed -eq $false -and $retention424EnumOk.Count -eq 1 -and
+            -not $retention424EnumOk.Critical -and
+            $retention424EnumDenied.Failed -eq $true -and $retention424EnumDenied.Count -eq 0 -and
+            $retention424EnumDenied.Critical -and $retention424EnumDenied.RestoreFailed -and
+            [regex]::IsMatch([string]$retention424EnumDenied.Log, '(?m)^\[ERROR\] Не вдалося отримати перелік архівів реставрації') -and
+            $retention424EnumLookup.Failed -eq $true -and $retention424EnumLookup.Count -eq 0 -and
+            $retention424EnumLookup.Critical -and $retention424EnumLookup.RestoreFailed -and
+            [regex]::IsMatch([string]$retention424EnumLookup.Log, '(?m)^\[ERROR\] Не вдалося отримати перелік архівів реставрації')
+        ) `
+        -Name "Maintenance/RestoreArchiveEnumerationDistinguishesFailureFromEmpty" `
+        -Failure ("Get-BRAVORestoreArchiveMainFiles: відсутній і порожній каталог — успішний порожній перелік без ERROR і прапорців; збій переліку — Failed, порожній перелік, ERROR і прапорці exit 41; відсутній: failed={0}, count={1}, журнал: {2}; порожній: failed={3}, count={4}; один архів: failed={5}, count={6}; збій: failed={7}, count={8}, critical={9}, журнал: {10}; збій Test-Path: failed={11}, count={12}, critical={13}, журнал: {14}" -f $retention424EnumMissing.Failed, $retention424EnumMissing.Count, $retention424EnumMissing.Log, $retention424EnumEmpty.Failed, $retention424EnumEmpty.Count, $retention424EnumOk.Failed, $retention424EnumOk.Count, $retention424EnumDenied.Failed, $retention424EnumDenied.Count, $retention424EnumDenied.Critical, $retention424EnumDenied.Log, $retention424EnumLookup.Failed, $retention424EnumLookup.Count, $retention424EnumLookup.Critical, $retention424EnumLookup.Log)
+
+    # (g) Main (тіло Invoke-BRAVOMaintenance поза вкладеними функціями):
+    # перелік ARC_DIR, що живить і звичайний
+    # retention, і гілку «лише перевірка», іде лише через
+    # Get-BRAVORestoreArchiveMainFiles — жодного прямого Get-ChildItem по
+    # $ARC_DIR. Тоді за збою переліку груп 0, і гейт (тест вище) не
+    # викликає Remove-OldRestoreArchives у жодній гілці.
+    $retention424MainCommands = @($retention424CleanupAst.FindAll(
+        {
+            param($candidate)
+            if (-not ($candidate -is [Management.Automation.Language.CommandAst])) { return $false }
+            $ancestor = $candidate.Parent
+            while ($null -ne $ancestor) {
+                if ($ancestor -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $ancestor.Name -ne 'Invoke-BRAVOMaintenance') { return $false }
+                $ancestor = $ancestor.Parent
+            }
+            return $true
+        },
+        $true
+    ))
+    $retention424MainEnumCalls = @($retention424MainCommands | Where-Object {
+        $_.GetCommandName() -eq 'Get-BRAVORestoreArchiveMainFiles' -and $_.Extent.Text -match '\$ARC_DIR'
+    })
+    $retention424MainRawArcDirScans = @($retention424MainCommands | Where-Object {
+        $_.GetCommandName() -eq 'Get-ChildItem' -and $_.Extent.Text -match '\$ARC_DIR'
+    })
+    Test-BRAVOCondition `
+        -Condition (
+            $retention424MainEnumCalls.Count -eq 1 -and
+            $retention424MainRawArcDirScans.Count -eq 0
+        ) `
+        -Name "Maintenance/RestoreArchiveMainEnumerationUsesCanonicalHelper" `
+        -Failure ("Main має переліковувати архіви реставрації в ARC_DIR рівно одним викликом Get-BRAVORestoreArchiveMainFiles і без прямого Get-ChildItem по `$ARC_DIR; викликів={0}, прямих Get-ChildItem={1}" -f $retention424MainEnumCalls.Count, $retention424MainRawArcDirScans.Count)
+
+    # ================================================================
+    # #424 (Codex P1, раунд 3): «немає жодної підтвердженої точки
+    # відновлення» не залежить від того, на якому етапі перевірки
+    # забраковано сесію. Раніше ERROR і прапорці exit 41 з'являлись лише
+    # тоді, коли хоча б одна сесія дійшла до 7z t; сесія, забракована вже
+    # на SHA512 (hash-файл відсутній / некоректний / не збігається), до
+    # 7z t не доходила, і єдина непридатна точка відновлення давала лише
+    # exit 10. Рішення власника #424: нуль підтверджених точок → ERROR і
+    # exit 41. Той самий блок діє і на звичайному шляху retention; там
+    # нічого нового не видаляється (інваріант #422).
+    # ================================================================
+    # (h) -ReportOnly, KeepCount = 1, єдина сесія: hash-файл відсутній /
+    # SHA512 не збігається / некоректний формат.
+    $retention424SoleMissing = & $retentionFollowupRunScenario 'I424SoleNoHash' @(
+        @{ Session = '20260111_0100'; Content = 'synthetic-ok-1'; Stale = $false; NoHash = $true }
+    ) 1 $true
+    $retention424SoleMismatch = & $retentionFollowupRunScenario 'I424SoleMismatch' @(
+        @{ Session = '20260111_0100'; Content = 'synthetic-ok-1'; Stale = $false; NoHash = $false; HashMode = 'Mismatch' }
+    ) 1 $true
+    $retention424SoleMalformed = & $retentionFollowupRunScenario 'I424SoleMalformed' @(
+        @{ Session = '20260111_0100'; Content = 'synthetic-ok-1'; Stale = $false; NoHash = $false; HashMode = 'Malformed' }
+    ) 1 $true
+    $retention424SoleFailClosed = {
+        param($Outcome, [string]$ExpectedRemaining, [string]$ExpectedReason)
+        return (
+            $null -ne $Outcome -and
+            $null -eq $Outcome.Threw -and
+            [string]$Outcome.Remaining -ceq $ExpectedRemaining -and
+            $Outcome.Critical -and
+            $Outcome.RestoreFailed -and
+            -not [regex]::IsMatch([string]$Outcome.Log, '(?m)Видал') -and
+            [regex]::IsMatch([string]$Outcome.Log, '(?m)^\[ERROR\] Не лишилось жодної придатної точки відновлення') -and
+            [regex]::IsMatch([string]$Outcome.Log, ('(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: .*' + [regex]::Escape($ExpectedReason)))
+        )
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            (& $retention424SoleFailClosed $retention424SoleMissing ('{0}_before_20260111_0100.mdz' -f $retentionFollowupPrefix) 'відсутній hash-файл') -and
+            (& $retention424SoleFailClosed $retention424SoleMismatch (& $retentionFollowupExpectedFiles @('20260111_0100')) 'SHA512 не збігається') -and
+            (& $retention424SoleFailClosed $retention424SoleMalformed (& $retentionFollowupExpectedFiles @('20260111_0100')) 'некоректний формат hash-файлу')
+        ) `
+        -Name "Maintenance/RetentionReportOnlySoleSessionHashFailureSetsFailureFlags" `
+        -Failure ("за ArchivesKeepCount = 1 і єдиної сесії, забракованої на SHA512 (hash-файл відсутній / не збігається / некоректний), Remove-OldRestoreArchives -ReportOnly має записати ERROR «Не лишилось жодної придатної точки відновлення» і виставити critical/restoreIntegrityFailed (exit 41) без жодного видалення; відсутній: critical={0}, restoreIntegrityFailed={1}, лишилось=[{2}], журнал: {3}; не збігається: critical={4}, лишилось=[{5}], журнал: {6}; некоректний: critical={7}, лишилось=[{8}], журнал: {9}" -f $retention424SoleMissing.Critical, $retention424SoleMissing.RestoreFailed, $retention424SoleMissing.Remaining, $retention424SoleMissing.Log, $retention424SoleMismatch.Critical, $retention424SoleMismatch.Remaining, $retention424SoleMismatch.Log, $retention424SoleMalformed.Critical, $retention424SoleMalformed.Remaining, $retention424SoleMalformed.Log)
+
+    # (i) Звичайний retention (сесій 2 > KeepCount = 1), обидві сесії
+    # забраковано на SHA512, обидві старші за InvalidRetentionDays: ERROR і
+    # прапорці exit 41, жодного видалення (UNKNOWN, а підтвердженої точки
+    # для збереження немає).
+    $retention424NormalNoValid = & $retentionFollowupRunScenario 'I424NormalHashOnly' @(
+        @{ Session = '20260110_0100'; Content = 'synthetic-ok-0'; Stale = $true; NoHash = $true },
+        @{ Session = '20260111_0100'; Content = 'synthetic-ok-1'; Stale = $true; NoHash = $false; HashMode = 'Mismatch' }
+    ) 1
+    Test-BRAVOCondition `
+        -Condition (
+            (& $retention424SoleFailClosed $retention424NormalNoValid (@(
+                ('{0}_before_20260110_0100.mdz' -f $retentionFollowupPrefix),
+                ('{0}_before_20260111_0100.mdz' -f $retentionFollowupPrefix),
+                ('{0}_before_20260111_0100.mdz.sha512' -f $retentionFollowupPrefix)
+            ) -join '|') 'SHA512 не збігається') -and
+            (& $retention422KeptLine $retention424NormalNoValid '20260110_0100' 'відсутній hash-файл') -and
+            (& $retention422KeptLine $retention424NormalNoValid '20260111_0100' 'SHA512 не збігається')
+        ) `
+        -Name "Maintenance/RetentionNoValidRestorePointAfterHashFailureSetsFailureFlags" `
+        -Failure ("звичайний retention, коли всі сесії забраковано на SHA512, має записати ERROR «Не лишилось жодної придатної точки відновлення» і виставити critical/restoreIntegrityFailed (exit 41), не видаляючи жодної сесії, і WARNING «НЕ видалено» для кожної; threw={0}, critical={1}, restoreIntegrityFailed={2}, лишилось=[{3}], журнал: {4}" -f $retention424NormalNoValid.Threw, $retention424NormalNoValid.Critical, $retention424NormalNoValid.RestoreFailed, $retention424NormalNoValid.Remaining, $retention424NormalNoValid.Log)
+
+    # ================================================================
+    # #424 (Codex P2, раунд 3): статус кроку очистки не спирається лише на
+    # глобальний Boolean criticalErrorOccurred. Якщо попередня фаза вже
+    # виставила його, новий збій цілісності в кроці очистки раніше давав
+    # WARN (не FAIL) і не рахувався в stepsError. Тепер крок бере власний
+    # облік ($restoreArchiveIntegrityOutcome, -Outcome).
+    # ================================================================
+    $retention424PriorBroken = & $retentionFollowupRunScenario 'I424PriorBroken' @(
+        (& $retentionFollowupSession '20260111_0100' $retentionFollowupBroken)
+    ) 1 $true $retention424CleanupStatusText $false $false $true
+    $retention424PriorHashOnly = & $retentionFollowupRunScenario 'I424PriorHashOnly' @(
+        @{ Session = '20260111_0100'; Content = 'synthetic-ok-1'; Stale = $false; NoHash = $true }
+    ) 1 $true $retention424CleanupStatusText $false $false $true
+    $retention424PriorEnumFailed = & $retentionFollowupRunScenario 'I424PriorEnumFailed' $retention424EnumSessions 1 $false $retention424CleanupStatusText $true $false $true
+    $retention424PriorClean = & $retentionFollowupRunScenario 'I424PriorClean' @(
+        (& $retentionFollowupSession '20260111_0100' 'synthetic-ok-1')
+    ) 1 $true $retention424CleanupStatusText $false $false $true
+    $retention424PriorStale = & $retentionFollowupRunScenario 'I424PriorStale' @(
+        (& $retentionFollowupSession '20260111_0100' 'synthetic-ok-1'),
+        @{ Session = $retention422Subject; Content = 'synthetic-ok-mismatch'; Stale = $true; NoHash = $false; HashMode = 'Mismatch' }
+    ) 2 $true $retention424CleanupStatusText $false $false $true
+    $retention424MainMarksEnumFailure = [regex]::IsMatch(
+        $retention424CleanupSourceText,
+        'if \(\$restoreArchiveEnumeration\.Failed\) \{\s*\$restoreArchiveIntegrityOutcome\[''IntegrityFailed''\] = \$true\s*\}')
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrEmpty($retention424CleanupStatusText) -and
+            $retention424MainMarksEnumFailure -and
+            $null -ne $retention424PriorBroken -and
+            [string]$retention424PriorBroken.CleanupStatus -ceq 'FAIL' -and
+            $retention424PriorBroken.StepsError -ge 1 -and
+            $null -ne $retention424PriorHashOnly -and
+            [string]$retention424PriorHashOnly.CleanupStatus -ceq 'FAIL' -and
+            $retention424PriorHashOnly.StepsError -ge 1 -and
+            $null -ne $retention424PriorEnumFailed -and
+            [string]$retention424PriorEnumFailed.CleanupStatus -ceq 'FAIL' -and
+            $retention424PriorEnumFailed.StepsError -ge 1 -and
+            $null -ne $retention424PriorClean -and
+            [string]$retention424PriorClean.CleanupStatus -ceq 'SKIPPED' -and
+            $retention424PriorClean.StepsError -eq 0 -and
+            $null -ne $retention424PriorStale -and
+            [string]$retention424PriorStale.CleanupStatus -ceq 'WARN' -and
+            $retention424PriorStale.StepsError -eq 0
+        ) `
+        -Name "Maintenance/RetentionCleanupStepFailsAfterEarlierCriticalError" `
+        -Failure ("коли попередня фаза вже виставила criticalErrorOccurred, крок «Очистка старих даних/логів» має бути FAIL (stepsError ≥ 1) за нового збою цілісності архівів реставрації (7z t, SHA512, перелік), WARN — лише за WARNING без збою цілісності, SKIPPED — без жодної проблеми; Main має позначати збій власного переліку в `$restoreArchiveIntegrityOutcome ({0}); 7z t: статус=[{1}], stepsError={2}; SHA512: статус=[{3}], stepsError={4}; перелік: статус=[{5}], stepsError={6}; чиста: статус=[{7}], stepsError={8}; UNKNOWN: статус=[{9}], stepsError={10}" -f $retention424MainMarksEnumFailure, $retention424PriorBroken.CleanupStatus, $retention424PriorBroken.StepsError, $retention424PriorHashOnly.CleanupStatus, $retention424PriorHashOnly.StepsError, $retention424PriorEnumFailed.CleanupStatus, $retention424PriorEnumFailed.StepsError, $retention424PriorClean.CleanupStatus, $retention424PriorClean.StepsError, $retention424PriorStale.CleanupStatus, $retention424PriorStale.StepsError)
+
+    # ================================================================
+    # #424 (Codex P2, раунд 3): налаштований каталог архівів реставрації —
+    # буквальний шлях. З -Path символи [ / ] у назві каталогу були
+    # шаблоном: наявний каталог вважався відсутнім (нічна перевірка мовчки
+    # пропускалась), а перелік чи видалення могли зачепити сусідній
+    # каталог, що збігся з шаблоном. Тепер -LiteralPath — і для переліку,
+    # і для видалення сесій.
+    # ================================================================
+    $retention424BracketBroken = & $retentionFollowupRunScenario 'I424Bracket[x]Broken' @(
+        (& $retentionFollowupSession '20260111_0100' $retentionFollowupBroken)
+    ) 1 $true
+    $retention424BracketRetention = & $retentionFollowupRunScenario 'I424Bracket[x]Retention' $retention424EnumSessions 1
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retention424BracketBroken -and
+            $null -eq $retention424BracketBroken.Threw -and
+            [string]$retention424BracketBroken.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100')) -and
+            $retention424BracketBroken.Critical -and
+            $retention424BracketBroken.RestoreFailed -and
+            [regex]::IsMatch([string]$retention424BracketBroken.Log, '(?m)^\[ERROR\] Не лишилось жодної придатної точки відновлення') -and
+            -not [regex]::IsMatch([string]$retention424BracketBroken.Log, '(?m)не знайдена') -and
+            $null -ne $retention424BracketRetention -and
+            $null -eq $retention424BracketRetention.Threw -and
+            -not $retention424BracketRetention.Critical -and
+            [string]$retention424BracketRetention.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100'))
+        ) `
+        -Name "Maintenance/RestoreArchiveDirectoryWithWildcardCharsIsLiteral" `
+        -Failure ("каталог архівів реставрації з [ / ] у назві має бути знайдений і перевірений (єдина зламана сесія → ERROR і exit 41), а звичайний retention має видалити сесії понад KeepCount саме в цьому каталозі; зламана: threw={0}, critical={1}, лишилось=[{2}], журнал: {3}; retention: threw={4}, critical={5}, лишилось=[{6}], журнал: {7}" -f $retention424BracketBroken.Threw, $retention424BracketBroken.Critical, $retention424BracketBroken.Remaining, $retention424BracketBroken.Log, $retention424BracketRetention.Threw, $retention424BracketRetention.Critical, $retention424BracketRetention.Remaining, $retention424BracketRetention.Log)
 
     # ================================================================
     # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)
@@ -24367,9 +25023,14 @@ function Get-BRAVOMaintenanceSummaryResult {
     # ПЕРЕД цим call site, тож фіксований 1400-символьний lookback
     # більше не дотягувався до SKIPPED/Get-BRAVOMaintenanceStepStatus
     # вище.
+    # Вікно 2000 -> 2600: #424 (раунди 1 і 3) додав між
+    # Get-BRAVOMaintenanceStepStatus і цим call site перевизначення статусу
+    # (WARN/FAIL понад SKIPPED, FAIL за $restoreArchiveIntegrityOutcome) з
+    # коментарями, тож 2000-символьний lookback уже не дотягувався до
+    # Get-BRAVOMaintenanceStepStatus і $cleanupWarningsBefore.
     $cleanupResultCallIndex = $maintenanceScriptText.IndexOf("-Name 'Очистка старих даних/логів' ``", $planCleanupIndex)
     $cleanupResultCallWindow = if ($cleanupResultCallIndex -ge 0) {
-        $maintenanceScriptText.Substring([Math]::Max(0, $cleanupResultCallIndex - 2000), 2000)
+        $maintenanceScriptText.Substring([Math]::Max(0, $cleanupResultCallIndex - 2600), 2600)
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
