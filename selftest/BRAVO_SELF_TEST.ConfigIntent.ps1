@@ -1345,7 +1345,7 @@ try {
         -SourceText ($credRollbackText + "`r`n" + $credWorkerStubText) `
         -PreferLastDefinitionOnDuplicate `
         -FunctionNames @(
-            'Invoke-ProtectedPayloadWorker',
+            'Invoke-ProtectedPayloadWorker', 'Get-SystemWorkerFatalErrorText',
             'Read-BRAVOTextFile', 'ConvertFrom-BRAVOJson', 'ConvertTo-BRAVOJson',
             'Unprotect-LocalMachineSecret', 'Invoke-CredentialOperationsTransactional'
         )
