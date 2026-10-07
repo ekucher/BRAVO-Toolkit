@@ -1243,6 +1243,59 @@ function Set-PrivateDirectoryAcl {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
+# #302: класифікація винятку SYSTEM-кроку для відкоту поточного сховища.
+# Маркер ставиться ЛИШЕ в catch-блоках Invoke-AsSystem, чий try охоплює код
+# ДО $registeredTask.Run($null): завдання без тригерів до Run не стартує,
+# тож SYSTEM worker гарантовано не торкався SYSTEM-сховища. Run і все після
+# нього (таймаут, FatalError, нечитабельний result.json) маркера не мають =
+# невизначений стан (fail-safe). Self-test перевіряє розташування маркерів.
+function Add-SystemWorkerNotStartedMarker {
+    param([Exception]$Exception)
+
+    if ($null -eq $Exception) {
+        return
+    }
+    try {
+        $Exception.Data["BRAVOSystemWorkerNotStarted"] = $true
+    } catch {
+        # Data лише для читання: без маркера виняток вважається невизначеним,
+        # тобто відкоту не буде (безпечний бік), а оригінал пропагується.
+    }
+}
+
+function Test-SystemWorkerNotStartedError {
+    param([Management.Automation.ErrorRecord]$ErrorRecord)
+
+    if ($null -eq $ErrorRecord) {
+        return $false
+    }
+    # Маркер шукається в самому винятку, його InnerException-ланцюжку та в
+    # ErrorRecord.Exception обгорток (ActionPreferenceStopException тощо):
+    # PowerShell може обгорнути перекинутий виняток на межі функції.
+    $pending = New-Object System.Collections.Queue
+    $pending.Enqueue($ErrorRecord.Exception)
+    $visited = 0
+    while ($pending.Count -gt 0 -and $visited -lt 32) {
+        $exception = $pending.Dequeue()
+        if ($null -eq $exception) {
+            continue
+        }
+        $visited++
+        if ($null -ne $exception.Data -and
+            $exception.Data.Contains("BRAVOSystemWorkerNotStarted") -and
+            [bool]$exception.Data["BRAVOSystemWorkerNotStarted"]) {
+            return $true
+        }
+        $pending.Enqueue($exception.InnerException)
+        if ($exception -is [Management.Automation.IContainsErrorRecord] -and
+            $null -ne $exception.ErrorRecord -and
+            -not [object]::ReferenceEquals($exception.ErrorRecord.Exception, $exception)) {
+            $pending.Enqueue($exception.ErrorRecord.Exception)
+        }
+    }
+    return $false
+}
+
 function Invoke-AsSystem {
     param(
         [string]$ResolvedConfigPath,
@@ -1257,79 +1310,94 @@ function Invoke-AsSystem {
         [object[]]$Entries
     )
 
-    $setupRoot = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "BRAVO\CredentialSetup"
-    if (-not (Test-Path -LiteralPath $setupRoot -PathType Container)) {
-        New-Item -ItemType Directory -Path $setupRoot -Force | Out-Null
+    # До запуску worker-а (див. Add-SystemWorkerNotStartedMarker).
+    try {
+        $setupRoot = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "BRAVO\CredentialSetup"
+        if (-not (Test-Path -LiteralPath $setupRoot -PathType Container)) {
+            New-Item -ItemType Directory -Path $setupRoot -Force | Out-Null
+        }
+
+        $operationId = [guid]::NewGuid().ToString("N")
+        $workingDirectory = Join-Path $setupRoot $operationId
+        New-Item -ItemType Directory -Path $workingDirectory -Force | Out-Null
+        Set-PrivateDirectoryAcl -Path $workingDirectory
+
+        $payloadPath = Join-Path $workingDirectory "payload.json"
+        $workerResultPath = Join-Path $workingDirectory "result.json"
+        $taskName = "BRAVO_CREDENTIAL_SETUP_$operationId"
+        $taskService = New-Object -ComObject "Schedule.Service"
+        $taskService.Connect()
+        $rootTaskFolder = $taskService.GetFolder("\")
+    } catch {
+        Add-SystemWorkerNotStartedMarker -Exception $_.Exception
+        throw
     }
 
-    $operationId = [guid]::NewGuid().ToString("N")
-    $workingDirectory = Join-Path $setupRoot $operationId
-    New-Item -ItemType Directory -Path $workingDirectory -Force | Out-Null
-    Set-PrivateDirectoryAcl -Path $workingDirectory
-
-    $payloadPath = Join-Path $workingDirectory "payload.json"
-    $workerResultPath = Join-Path $workingDirectory "result.json"
-    $taskName = "BRAVO_CREDENTIAL_SETUP_$operationId"
-    $taskService = New-Object -ComObject "Schedule.Service"
-    $taskService.Connect()
-    $rootTaskFolder = $taskService.GetFolder("\")
-
     try {
-        $payloadEntries = @($Entries | ForEach-Object {
-            $protectedSecret = if ($Operation -in @("Add", "Update", "Set")) {
-                Protect-SecureStringForLocalMachine -SecureValue $_.SecureSecret
+        # До $registeredTask.Run($null): worker ще не запущено, SYSTEM-сховище
+        # незмінне — виняток позначається як "не розпочато".
+        try {
+            $payloadEntries = @($Entries | ForEach-Object {
+                $protectedSecret = if ($Operation -in @("Add", "Update", "Set")) {
+                    Protect-SecureStringForLocalMachine -SecureValue $_.SecureSecret
+                } else {
+                    $null
+                }
+                if ($null -ne $_.SecureSecret) {
+                    $_.SecureSecret.Dispose()
+                    $_.SecureSecret = $null
+                }
+                [pscustomobject]@{
+                    Component = $_.Component
+                    Target = $_.Target
+                    UserName = $_.UserName
+                    ProtectedSecret = $protectedSecret
+                }
+            })
+            $payload = @{
+                Action = $Operation
+                Entries = $payloadEntries
+            } | ConvertTo-BRAVOJson -Depth 6
+            [IO.File]::WriteAllText($payloadPath, $payload, [Text.Encoding]::UTF8)
+
+            $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+            $workerConfigArgumentText = if ($ConfigPathWasExplicit) {
+                " -ConfigPath `"$ResolvedConfigPath`""
             } else {
+                ""
+            }
+            $arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " +
+                "-File `"$PSCommandPath`"$workerConfigArgumentText " +
+                "-ProtectedPayloadPath `"$payloadPath`" -ResultPath `"$workerResultPath`""
+            $taskDefinition = $taskService.NewTask(0)
+            $taskDefinition.RegistrationInfo.Description = "BRAVO temporary credential worker"
+            $taskDefinition.Principal.UserId = "SYSTEM"
+            $taskDefinition.Principal.LogonType = 5 # TASK_LOGON_SERVICE_ACCOUNT
+            $taskDefinition.Principal.RunLevel = 1 # TASK_RUNLEVEL_HIGHEST
+            $taskDefinition.Settings.Enabled = $true
+            $taskDefinition.Settings.ExecutionTimeLimit = "PT2M"
+            $taskDefinition.Settings.DisallowStartIfOnBatteries = $false
+            $taskDefinition.Settings.StopIfGoingOnBatteries = $false
+            $taskAction = $taskDefinition.Actions.Create(0) # TASK_ACTION_EXEC
+            $taskAction.Path = $powerShellPath
+            $taskAction.Arguments = $arguments
+            $taskAction.WorkingDirectory = Split-Path -Path $PSCommandPath -Parent
+
+            $registeredTask = $rootTaskFolder.RegisterTaskDefinition(
+                $taskName,
+                $taskDefinition,
+                6,
+                "SYSTEM",
+                $null,
+                5,
                 $null
-            }
-            if ($null -ne $_.SecureSecret) {
-                $_.SecureSecret.Dispose()
-                $_.SecureSecret = $null
-            }
-            [pscustomobject]@{
-                Component = $_.Component
-                Target = $_.Target
-                UserName = $_.UserName
-                ProtectedSecret = $protectedSecret
-            }
-        })
-        $payload = @{
-            Action = $Operation
-            Entries = $payloadEntries
-        } | ConvertTo-BRAVOJson -Depth 6
-        [IO.File]::WriteAllText($payloadPath, $payload, [Text.Encoding]::UTF8)
-
-        $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-        $workerConfigArgumentText = if ($ConfigPathWasExplicit) {
-            " -ConfigPath `"$ResolvedConfigPath`""
-        } else {
-            ""
+            )
+        } catch {
+            Add-SystemWorkerNotStartedMarker -Exception $_.Exception
+            throw
         }
-        $arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " +
-            "-File `"$PSCommandPath`"$workerConfigArgumentText " +
-            "-ProtectedPayloadPath `"$payloadPath`" -ResultPath `"$workerResultPath`""
-        $taskDefinition = $taskService.NewTask(0)
-        $taskDefinition.RegistrationInfo.Description = "BRAVO temporary credential worker"
-        $taskDefinition.Principal.UserId = "SYSTEM"
-        $taskDefinition.Principal.LogonType = 5 # TASK_LOGON_SERVICE_ACCOUNT
-        $taskDefinition.Principal.RunLevel = 1 # TASK_RUNLEVEL_HIGHEST
-        $taskDefinition.Settings.Enabled = $true
-        $taskDefinition.Settings.ExecutionTimeLimit = "PT2M"
-        $taskDefinition.Settings.DisallowStartIfOnBatteries = $false
-        $taskDefinition.Settings.StopIfGoingOnBatteries = $false
-        $taskAction = $taskDefinition.Actions.Create(0) # TASK_ACTION_EXEC
-        $taskAction.Path = $powerShellPath
-        $taskAction.Arguments = $arguments
-        $taskAction.WorkingDirectory = Split-Path -Path $PSCommandPath -Parent
-
-        $registeredTask = $rootTaskFolder.RegisterTaskDefinition(
-            $taskName,
-            $taskDefinition,
-            6,
-            "SYSTEM",
-            $null,
-            5,
-            $null
-        )
+        # Run і все нижче: worker міг уже змінити SYSTEM-сховище, тож винятки
+        # звідси НЕ позначаються (невизначений стан).
         [void]$registeredTask.Run($null)
 
         $deadline = (Get-Date).AddSeconds(60)
@@ -1405,6 +1473,138 @@ function Invoke-ProtectedPayloadWorker {
         [Text.Encoding]::UTF8
     )
     Move-Item -LiteralPath $temporaryResultPath -Destination $WorkerResultPath -Force
+}
+
+function Invoke-CredentialOperationsViaSystemWorker {
+    param(
+        [string]$Action,
+        [object[]]$OperationEntries,
+        [string]$resolvedConfigPath,
+        [bool]$configPathWasExplicit,
+        [string]$currentIdentity
+    )
+
+    Write-Host "Сховища для облікових записів: $currentIdentity та NT AUTHORITY\SYSTEM"
+    $currentUserEntries = @(Copy-OperationEntries -Entries $OperationEntries)
+    $systemEntries = @(Copy-OperationEntries -Entries $OperationEntries)
+    Clear-OperationEntries -Entries $OperationEntries
+
+    # @(...) навколо if-виразу: порожній масив з if розгортається в $null, а
+    # Clear-CredentialOperationSnapshots тоді ітерував би один $null.
+    $currentUserSnapshots = @(if ($Action -eq "Test") {
+        @()
+    } else {
+        @(Get-CredentialOperationSnapshots -Entries $currentUserEntries)
+    })
+    # $true з моменту виклику Invoke-AsSystem: виняток до нього (поточне
+    # сховище) гарантовано не зачепив SYSTEM-сховище.
+    $systemStepStarted = $false
+    try {
+        $currentUserResults = @(
+            Invoke-CredentialOperationsTransactional `
+                -Operation $Action `
+                -Entries $currentUserEntries
+        )
+        $currentUserResults = @(Set-OperationResultScope -Results $currentUserResults -Scope $currentIdentity)
+        if (@($currentUserResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
+            Clear-OperationEntries -Entries $systemEntries
+            $systemResults = @([pscustomobject]@{
+                Component = "SYSTEM"
+                Target = ""
+                Status = "Error"
+                Error = "операцію не розпочато через помилку поточного сховища"
+                Scope = "SYSTEM"
+            })
+        } else {
+            $systemStepStarted = $true
+            $systemResults = @(
+                Invoke-AsSystem `
+                    -ResolvedConfigPath $resolvedConfigPath `
+                    -ConfigPathWasExplicit $configPathWasExplicit `
+                    -Operation $Action `
+                    -Entries $systemEntries
+            )
+            $systemResults = @(Set-OperationResultScope -Results $systemResults -Scope "SYSTEM")
+            if ($Action -ne "Test" -and
+                @($systemResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
+                $rollbackResults = @(
+                    Restore-CredentialOperationSnapshots `
+                        -Snapshots $currentUserSnapshots
+                )
+                if ($rollbackResults.Count -gt 0) {
+                    $currentUserResults += @(
+                        Set-OperationResultScope `
+                            -Results $rollbackResults `
+                            -Scope $currentIdentity
+                    )
+                } else {
+                    Write-Host "Поточне сховище повернуто до стану перед операцією." -ForegroundColor Yellow
+                }
+            }
+        }
+    } catch {
+        # Виняток SYSTEM-кроку раніше оминав rollback, бо Restore-... запускався
+        # лише за рядками Status=Error. Але відкіт поточного сховища безпечний
+        # лише тоді, коли доведено, що SYSTEM worker нічого не змінив: інакше
+        # (worker встиг записати SYSTEM, а потім таймаут/FatalError/збій
+        # result.json) відкіт дав би ту саму розбіжність навпаки.
+        #  - доведено "не розпочато" (виняток до виклику Invoke-AsSystem або
+        #    позначений Add-SystemWorkerNotStartedMarker) -> відкіт знімку;
+        #  - інакше стан SYSTEM невизначений -> БЕЗ відкоту, Warning з
+        #    переліком Target і порадою повторити команду.
+        # В обох випадках перекидається ОРИГІНАЛЬНИЙ виняток. Усі Write-Warning
+        # тут мають -WarningAction Continue: за $WarningPreference='Stop'
+        # Warning став би термінальним і замаскував би оригінал.
+        $systemStepError = $_
+        if ($Action -ne "Test") {
+            $systemWorkerNotStarted = (-not $systemStepStarted) -or
+                (Test-SystemWorkerNotStartedError -ErrorRecord $systemStepError)
+            if ($systemWorkerNotStarted) {
+                try {
+                    $rollbackResults = @(
+                        Restore-CredentialOperationSnapshots `
+                            -Snapshots $currentUserSnapshots
+                    )
+                    foreach ($rollbackResult in $rollbackResults) {
+                        Write-Warning -WarningAction Continue -Message (
+                            "Rollback після винятку SYSTEM-кроку не виконано для " +
+                            "'$($rollbackResult.Target)': $($rollbackResult.Error)"
+                        )
+                    }
+                    if ($rollbackResults.Count -eq 0) {
+                        Write-Host "Поточне сховище повернуто до стану перед операцією (SYSTEM worker не запускався)." -ForegroundColor Yellow
+                    }
+                } catch {
+                    Write-Warning -WarningAction Continue -Message "Rollback після винятку SYSTEM-кроку завершився винятком: $($_.Exception.Message)"
+                }
+            } else {
+                try {
+                    $indeterminateTargets = @(
+                        $currentUserEntries |
+                            ForEach-Object { [string]$_.Target } |
+                            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                    ) -join ", "
+                    Write-Warning -WarningAction Continue -Message (
+                        "Стан SYSTEM-сховища невизначений: SYSTEM worker міг уже застосувати зміни " +
+                        "до винятку ($($systemStepError.Exception.Message)). Поточне сховище НЕ відкочено, " +
+                        "тож сховища поточного користувача і SYSTEM можуть відрізнятися для: " +
+                        "$indeterminateTargets. Повторіть ту саму команду (або -Action Test для перевірки), " +
+                        "щоб узгодити сховища."
+                    )
+                } catch {
+                    Write-Warning -WarningAction Continue -Message "Стан SYSTEM-сховища невизначений; поточне сховище НЕ відкочено. Повторіть ту саму команду."
+                }
+            }
+        }
+        throw $systemStepError
+    } finally {
+        # currentUserSnapshots повинні звільнятися, навіть якщо
+        # Invoke-AsSystem кине виняток (worker timeout, FatalError,
+        # збій Task Scheduler тощо) — інакше SecureString.Copy() з
+        # моменту знімку лишиться недиспоузнутим.
+        Clear-CredentialOperationSnapshots -Snapshots $currentUserSnapshots
+    }
+    return (@($currentUserResults) + @($systemResults))
 }
 
 try {
@@ -1575,66 +1775,14 @@ try {
     }
 
     if ($useSystemWorker -and $currentUserStoreRequested) {
-        Write-Host "Сховища для облікових записів: $currentIdentity та NT AUTHORITY\SYSTEM"
-        $currentUserEntries = @(Copy-OperationEntries -Entries $operationEntries)
-        $systemEntries = @(Copy-OperationEntries -Entries $operationEntries)
-        Clear-OperationEntries -Entries $operationEntries
-
-        $currentUserSnapshots = if ($Action -eq "Test") {
-            @()
-        } else {
-            @(Get-CredentialOperationSnapshots -Entries $currentUserEntries)
-        }
-        try {
-            $currentUserResults = @(
-                Invoke-CredentialOperationsTransactional `
-                    -Operation $Action `
-                    -Entries $currentUserEntries
-            )
-            $currentUserResults = @(Set-OperationResultScope -Results $currentUserResults -Scope $currentIdentity)
-            if (@($currentUserResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
-                Clear-OperationEntries -Entries $systemEntries
-                $systemResults = @([pscustomobject]@{
-                    Component = "SYSTEM"
-                    Target = ""
-                    Status = "Error"
-                    Error = "операцію не розпочато через помилку поточного сховища"
-                    Scope = "SYSTEM"
-                })
-            } else {
-                $systemResults = @(
-                    Invoke-AsSystem `
-                        -ResolvedConfigPath $resolvedConfigPath `
-                        -ConfigPathWasExplicit $configPathWasExplicit `
-                        -Operation $Action `
-                        -Entries $systemEntries
-                )
-                $systemResults = @(Set-OperationResultScope -Results $systemResults -Scope "SYSTEM")
-                if ($Action -ne "Test" -and
-                    @($systemResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
-                    $rollbackResults = @(
-                        Restore-CredentialOperationSnapshots `
-                            -Snapshots $currentUserSnapshots
-                    )
-                    if ($rollbackResults.Count -gt 0) {
-                        $currentUserResults += @(
-                            Set-OperationResultScope `
-                                -Results $rollbackResults `
-                                -Scope $currentIdentity
-                        )
-                    } else {
-                        Write-Host "Поточне сховище повернуто до стану перед операцією." -ForegroundColor Yellow
-                    }
-                }
-            }
-        } finally {
-            # currentUserSnapshots повинні звільнятися, навіть якщо
-            # Invoke-AsSystem кине виняток (worker timeout, FatalError,
-            # збій Task Scheduler тощо) — інакше SecureString.Copy() з
-            # моменту знімку лишиться недиспоузнутим.
-            Clear-CredentialOperationSnapshots -Snapshots $currentUserSnapshots
-        }
-        $operationResults = @($currentUserResults) + @($systemResults)
+        $operationResults = @(
+            Invoke-CredentialOperationsViaSystemWorker `
+                -Action $Action `
+                -OperationEntries $operationEntries `
+                -resolvedConfigPath $resolvedConfigPath `
+                -configPathWasExplicit $configPathWasExplicit `
+                -currentIdentity $currentIdentity
+        )
     } elseif ($useSystemWorker) {
         Write-Host "Сховище для облікового запису: NT AUTHORITY\SYSTEM"
         $operationResults = @(Invoke-AsSystem -ResolvedConfigPath $resolvedConfigPath -ConfigPathWasExplicit $configPathWasExplicit -Operation $Action -Entries $operationEntries)
