@@ -9,11 +9,15 @@
   тоді кидає виняток без значень і без тексту первинного винятку — власний лог Maintenance/Archive не вивантажується
   (WARNING, як для будь-якого збою маскування; результат основної операції не змінюється). `Set-BRAVOCredential` після
   успішного запису теж додає значення в облік, тож записаний цим процесом секрет (напр. API-ключ Operations) маскується,
-  навіть якщо пізніший CredRead упаде. Ознака неповноти перевіряється ДО будь-якого доступу до реєстру, а збій доступу до
+  навіть якщо пізніший CredRead упаде; збій самого CredWrite тепер завжди перериває `Set-BRAVOCredential` (і за викликача без
+  try) і нічого не додає в облік. Ознака неповноти перевіряється ДО будь-якого доступу до реєстру, а збій доступу до
   самого реєстру в `Get-BRAVOLogMaskSecretSet` стає тим самим фіксованим винятком: текст винятку пошкодженого реєстру
   (може нести секрет) не потрапляє у WARNING. Тести: `Credentials/LogMaskSecretSetIncludesSecretsWrittenInProcess`,
   `Credentials/RegistryBookkeepingFailureDoesNotBreakReadButFailsMaskSet`,
-  `Maintenance/OwnLogUploadFailsClosedWithoutLeakWhenSecretRegistryIncomplete`.
+  `Maintenance/OwnLogUploadFailsClosedWithoutLeakWhenSecretRegistryIncomplete`,
+  `Credentials/RecordFailureWithReadableRegistryFailsMaskSetByFlag`,
+  `Maintenance/OwnLogUploadFailsClosedWhenRecordFailsButRegistryReadable`,
+  `Credentials/SetCredentialFailedWriteRecordsNothingAndPropagates`.
 
 - **Fix: retention архівів реставрації більше не видаляє стару непридатну сесію без доказу пошкодження (#422).**
   `Remove-OldRestoreArchives` видаляв кожну непридатну сесію, старшу за `Retention.FailedArchiveDays` (типово 30 днів),

@@ -366,11 +366,22 @@ function Set-BRAVOCredential {
     )
 
     Initialize-BRAVOCredentialManager
-    [BRAVO.Security.CredentialManager]::WriteGeneric($Target, $UserName, $Secret)
+    # #417: збій CredWrite завжди перериває функцію (і за викликача без
+    # try, де виняток .NET-методу інакше лише завершив би інструкцію), тож
+    # облік нижче виконується тільки після успішного запису.
+    $credentialWritten = $false
+    try {
+        [BRAVO.Security.CredentialManager]::WriteGeneric($Target, $UserName, $Secret)
+        $credentialWritten = $true
+    } catch {
+        throw
+    }
     # #417: записане цим процесом значення теж маскується у власних журналах,
     # навіть якщо пізніший CredRead у Get-BRAVOLogMaskSecretSet упаде. Лише
     # після успішного CredWrite.
-    Add-BRAVOCredentialReadSecretRecord -Target $Target -Secret $Secret
+    if ($credentialWritten) {
+        Add-BRAVOCredentialReadSecretRecord -Target $Target -Secret $Secret
+    }
 }
 
 function Remove-BRAVOCredential {
