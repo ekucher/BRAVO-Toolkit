@@ -1074,6 +1074,9 @@ function Resolve-BRAVOInstallationDiscovery {
     } else { $null }
     $bazaWwwPresence = $null
     $bazaWwwSource = 'None'
+    # #301: 'Empty', коли <DocumentRoot>\BAZA існує, але порожній (як і для
+    # компонентів з bravo.ini у Resolve-BRAVODiscoveryPathComponentPresence).
+    $bazaWwwAbsenceKind = $null
     if (-not [string]::IsNullOrWhiteSpace($bazaWwwOverride)) {
         $overrides['BAZA_WWW'] = $true
         $bazaWwwSource = 'ExplicitOverride'
@@ -1117,6 +1120,7 @@ function Resolve-BRAVOInstallationDiscovery {
             # discovery-механізму. Тому Absent, не Error (розділ 6 ТЗ:
             # сама наявність Apache не означає BAZA_WWW).
             $bazaWwwPresence = 'Absent'
+            if ([string]$bazaWwwStructural.Kind -eq 'Empty') { $bazaWwwAbsenceKind = 'Empty' }
             $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "Apache знайдено, DocumentRoot=$apacheDocumentRoot, але $($bazaWwwStructural.Reason) — BAZA_WWW на цьому Apache відсутній" }
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($apacheServerRoot)) {
@@ -1269,7 +1273,8 @@ function Resolve-BRAVOInstallationDiscovery {
     # тут його НЕ переобчислюємо, лише приводимо до спільної структури.
     $components['BAZA_WWW'] = New-BRAVODiscoveryComponentPresence -Component 'BAZA_WWW' `
         -Presence $bazaWwwPresence -Source $bazaWwwSource `
-        -Path ([string]$bazaWwwResolved.Value) -Reason ([string]$bazaWwwResolved.Reason)
+        -Path ([string]$bazaWwwResolved.Value) -Reason ([string]$bazaWwwResolved.Reason) `
+        -AbsenceKind ([string]$bazaWwwAbsenceKind)
 
     return [pscustomobject]@{
         BRAVO_ROOT = $bravoRoot
