@@ -26509,7 +26509,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     # визначення могло б оголошуватись invalid у Diagnose.
     Test-BRAVOCondition `
         -Condition (
-            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")') -and
+            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")') -and
             $tasksDiagnoseTextForRuntime.Contains('function Test-BRAVOScheduledTaskDefinition') -and
             $tasksDiagnoseTextForRuntime.Contains('BAZASync      = @(''-NoPause'', ''-SyncBAZA'')') -and
             $tasksDiagnoseTextForRuntime.Contains('Recovery      = @(''-NoPause'', ''-RunMissedRestoreOnly'')') -and
@@ -27600,6 +27600,24 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 ) `
                 -Name "Config/BackupCatchUpDerived" `
                 -Failure "schedulerSettings.BackupCatchUp: TaskName BRAVO_ARCHIV_CATCHUP, затримка 5-10 хв, ScriptPath BRAVO_ARCHIV.ps1, Enabled = Backup.Enabled і не Recovery.Enabled"
+        }
+        & {
+            # #314 хвиля 5: похідний вузол задачі BRAVO_SERVICE_RECOVERY.
+            $serviceRecoverySettings = $null
+            if ($global:schedulerSettings.Contains('ServiceRecovery')) {
+                $serviceRecoverySettings = $global:schedulerSettings.ServiceRecovery
+            }
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -ne $serviceRecoverySettings -and
+                    [string]$serviceRecoverySettings.TaskName -eq 'BRAVO_SERVICE_RECOVERY' -and
+                    [double]$serviceRecoverySettings.ExecutionTimeLimitHours -eq 1 -and
+                    [string]$serviceRecoverySettings.ScriptPath -like '*BRAVO_MAINTENANCE.ps1' -and
+                    ([string]$serviceRecoverySettings.ScriptPath).StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                    [bool]$serviceRecoverySettings.Enabled -eq [bool]$global:schedulerSettings.Maintenance.Enabled
+                ) `
+                -Name "Config/ServiceRecoveryDerived" `
+                -Failure "schedulerSettings.ServiceRecovery: TaskName BRAVO_SERVICE_RECOVERY, ExecutionTimeLimitHours 1, ScriptPath BRAVO_MAINTENANCE.ps1 з RuntimeRoot, Enabled = Maintenance.Enabled"
         }
     } finally {
         Remove-Item -LiteralPath $separateConfigRoot -Recurse -Force -ErrorAction SilentlyContinue

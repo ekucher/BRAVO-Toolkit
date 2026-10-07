@@ -67,17 +67,24 @@ function Format-BRAVOSchedulerNextRun {
         return "після наступного старту Windows"
     }
 
+    $nextRunText = 'невідомо'
     try {
         # .Year -gt 1900 відкидає sentinel 30.12.1899 (він БІЛЬШИЙ за
         # DateTime.MinValue, тому стара перевірка -gt MinValue його пропускала).
         if ($NextRunTime -is [datetime] -and $NextRunTime.Year -gt 1900) {
-            return $NextRunTime.ToString('dd.MM.yyyy HH:mm')
+            $nextRunText = $NextRunTime.ToString('dd.MM.yyyy HH:mm')
         }
     } catch {
         # Доступ до COM-властивості NextRunTime може кинути виняток; це не
-        # помилка діагностики — трактуємо як 'невідомо' (значення нижче).
+        # помилка діагностики — трактуємо як 'невідомо'.
+        $nextRunText = 'невідомо'
     }
-    return 'невідомо'
+    # ServiceRecovery (#314 хвиля 5): NextRunTime показує лише періодичний
+    # тригер; подієвий і boot-тригер описуються словами.
+    if ($TaskType -eq 'ServiceRecovery') {
+        return "за подією SCM (~1 хв), після старту Windows (~10 хв) і кожні 15 хв; наступна періодична перевірка: $nextRunText"
+    }
+    return $nextRunText
 }
 
 function Get-BRAVOBackupCatchUpDecision {

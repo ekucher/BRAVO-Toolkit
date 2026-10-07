@@ -1,5 +1,5 @@
 ﻿# ============================================================
-# BRAVO.ServiceRecovery — облік відновлення впалих служб (#314, хвилі 3–4).
+# BRAVO.ServiceRecovery — облік відновлення впалих служб (#314, хвилі 3–5).
 #
 # Чиста логіка без звернень до SCM/WMI: політика пауз, state-файл спроб
 # (FR-5), рішення «чи можна запускати зараз», облік CRITICAL «циклічно
@@ -8,7 +8,10 @@
 # функції профілю: класифікація керованих служб
 # (Get-BRAVOServiceRecoveryConditions) і події SCM із журналу System
 # (Get-BRAVOServiceRecoveryScmEvents). Запускає служби лише Maintenance —
-# цей модуль нічого не запускає і нічого не надсилає.
+# цей модуль нічого не запускає і нічого не надсилає. Хвиля 5: тригери
+# задачі BRAVO_SERVICE_RECOVERY (Add-BRAVOServiceRecoveryTaskTriggers,
+# BRAVO_TASKS_INSTALL) і чиста перевірка її визначення
+# (Test-BRAVOServiceRecoveryTaskDefinition, BRAVO_TASKS_DIAGNOSE).
 #
 # State: %ProgramData%\BRAVO\State\BRAVO_SERVICE_RECOVERY_STATE.json
 # (поряд із BRAVO_SERVICE_QUIESCENCE.json), UTF-8 без BOM, атомарний запис
@@ -966,4 +969,129 @@ function Add-BRAVOServiceRecoverySummaryLine {
     }
     [IO.File]::AppendAllText($Path, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
     return $true
+}
+
+function Get-BRAVOServiceRecoveryTaskEventSubscription {
+    # XPath-фільтр подієвого тригера задачі BRAVO_SERVICE_RECOVERY: журнал
+    # System, джерело Service Control Manager, EventID з політики. Фільтра за
+    # іменем служби немає свідомо (7034 несе display name, а профіль
+    # -RecoverServices без впалих керованих служб виходить за секунди).
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [int[]]$EventIds = @((Get-BRAVOServiceRecoveryPolicy).ScmEventIds)
+    )
+
+    $eventFilter = (@($EventIds) | ForEach-Object { 'EventID={0}' -f [int]$_ }) -join ' or '
+    return ('<QueryList><Query Id="0" Path="System"><Select Path="System">' +
+        "*[System[Provider[@Name='Service Control Manager'] and ($eventFilter)]]" +
+        '</Select></Query></QueryList>')
+}
+
+function Add-BRAVOServiceRecoveryTaskTriggers {
+    # Тригери і налаштування задачі BRAVO_SERVICE_RECOVERY (FR-4) у
+    # визначенні Task Scheduler 2.0 (COM ITaskDefinition або об'єкт тієї ж
+    # форми: Triggers.Create(type), Settings). Нічого не реєструє.
+    #   - подія SCM (TASK_TRIGGER_EVENT = 0) із затримкою EventTriggerDelay;
+    #   - старт ОС (TASK_TRIGGER_BOOT = 8) із затримкою BootTriggerDelay;
+    #   - щодня з 00:00 (TASK_TRIGGER_DAILY = 2) з повтором RepeatInterval
+    #     протягом доби — страховка, якщо подію пропущено.
+    # MultipleInstances = IgnoreNew (2) незалежно від глобального
+    # schedulerSettings.MultipleInstances: шторм подій SCM не множить
+    # екземпляри; ExecutionTimeLimit обмежує завислий запуск;
+    # StartWhenAvailable вимкнено — пропущений періодичний тик не потрібен.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Definition,
+        [object]$Policy = (Get-BRAVOServiceRecoveryPolicy),
+        [datetime]$Today = (Get-Date).Date
+    )
+
+    $Definition.Settings.MultipleInstances = 2
+    $Definition.Settings.StartWhenAvailable = $false
+    $Definition.Settings.ExecutionTimeLimit = [string]$Policy.TaskExecutionTimeLimit
+
+    $eventTrigger = $Definition.Triggers.Create(0) # TASK_TRIGGER_EVENT
+    $eventTrigger.Subscription = Get-BRAVOServiceRecoveryTaskEventSubscription -EventIds @($Policy.ScmEventIds)
+    $eventTrigger.Delay = [string]$Policy.EventTriggerDelay
+    $eventTrigger.Enabled = $true
+
+    $bootTrigger = $Definition.Triggers.Create(8) # TASK_TRIGGER_BOOT
+    $bootTrigger.Delay = [string]$Policy.BootTriggerDelay
+    $bootTrigger.Enabled = $true
+
+    $dailyTrigger = $Definition.Triggers.Create(2) # TASK_TRIGGER_DAILY
+    $dailyTrigger.StartBoundary = $Today.Date.ToString("yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
+    $dailyTrigger.DaysInterval = 1
+    $dailyTrigger.Repetition.Interval = [string]$Policy.RepeatInterval
+    $dailyTrigger.Repetition.Duration = 'P1D'
+    $dailyTrigger.Repetition.StopAtDurationEnd = $false
+    $dailyTrigger.Enabled = $true
+}
+
+function Test-BRAVOServiceRecoveryTaskDefinition {
+    # Перевірка ФАКТИЧНОГО визначення задачі BRAVO_SERVICE_RECOVERY для
+    # BRAVO_TASKS_DIAGNOSE (ті самі правила, що Add-BRAVOServiceRecoveryTaskTriggers).
+    # ЧИСТА: приймає COM ITaskDefinition або об'єкт тієї ж форми. Повертає
+    # перелік проблем (порожній — визначення правильне).
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory = $true)][object]$Definition,
+        [object]$Policy = (Get-BRAVOServiceRecoveryPolicy)
+    )
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $triggers = @(@($Definition.Triggers) | Where-Object { $null -ne $_ })
+    $firstOfType = {
+        param([int]$Type)
+        @($triggers | Where-Object { [int]$_.Type -eq $Type }) | Select-Object -First 1
+    }
+
+    $eventTrigger = & $firstOfType 0
+    if ($null -eq $eventTrigger) {
+        $problems.Add('немає тригера за подією SCM (EventTrigger)')
+    } else {
+        $subscription = [string]$eventTrigger.Subscription
+        if ($subscription -notmatch 'Service Control Manager') {
+            $problems.Add('тригер за подією SCM: фільтр не на джерело Service Control Manager')
+        }
+        foreach ($eventId in @($Policy.ScmEventIds)) {
+            if ($subscription -notmatch ('EventID={0}(?!\d)' -f [int]$eventId)) {
+                $problems.Add("тригер за подією SCM: у фільтрі немає EventID $eventId")
+            }
+        }
+        if ([string]$eventTrigger.Delay -ne [string]$Policy.EventTriggerDelay) {
+            $problems.Add("тригер за подією SCM: Delay='$($eventTrigger.Delay)', очікується $($Policy.EventTriggerDelay)")
+        }
+        if (-not [bool]$eventTrigger.Enabled) { $problems.Add('тригер за подією SCM вимкнено') }
+    }
+
+    $bootTrigger = & $firstOfType 8
+    if ($null -eq $bootTrigger) {
+        $problems.Add('немає тригера після старту Windows (BootTrigger)')
+    } else {
+        if ([string]$bootTrigger.Delay -ne [string]$Policy.BootTriggerDelay) {
+            $problems.Add("тригер після старту Windows: Delay='$($bootTrigger.Delay)', очікується $($Policy.BootTriggerDelay)")
+        }
+        if (-not [bool]$bootTrigger.Enabled) { $problems.Add('тригер після старту Windows вимкнено') }
+    }
+
+    $dailyTrigger = & $firstOfType 2
+    if ($null -eq $dailyTrigger) {
+        $problems.Add('немає щоденного тригера з повтором (CalendarTrigger)')
+    } else {
+        if ([string]$dailyTrigger.Repetition.Interval -ne [string]$Policy.RepeatInterval) {
+            $problems.Add("щоденний тригер: повтор '$($dailyTrigger.Repetition.Interval)', очікується $($Policy.RepeatInterval)")
+        }
+        if (-not [bool]$dailyTrigger.Enabled) { $problems.Add('щоденний тригер вимкнено') }
+    }
+
+    if ([int]$Definition.Settings.MultipleInstances -ne 2) {
+        $problems.Add("MultipleInstances=$($Definition.Settings.MultipleInstances), очікується 2 (IgnoreNew)")
+    }
+    if ([string]$Definition.Settings.ExecutionTimeLimit -ne [string]$Policy.TaskExecutionTimeLimit) {
+        $problems.Add("ExecutionTimeLimit='$($Definition.Settings.ExecutionTimeLimit)', очікується $($Policy.TaskExecutionTimeLimit)")
+    }
+    return $problems.ToArray()
 }

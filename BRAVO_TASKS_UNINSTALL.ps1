@@ -135,6 +135,13 @@ try {
         $taskNames += [string]$schedulerSettings.BackupCatchUp.TaskName
         $expectedTaskNameCount++
     }
+    # ServiceRecovery (BRAVO_SERVICE_RECOVERY, #314 хвиля 5) — так само
+    # через Contains: вузла може не бути в конфігурації старішого комплекту.
+    if ($schedulerSettings.Contains('ServiceRecovery') -and
+        $schedulerSettings.ServiceRecovery -is [System.Collections.IDictionary]) {
+        $taskNames += [string]$schedulerSettings.ServiceRecovery.TaskName
+        $expectedTaskNameCount++
+    }
     if ($taskNames.Count -ne $expectedTaskNameCount -or
         @($taskNames | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -match '[\\/]' }).Count -gt 0) {
         throw "У конфігурації вказано некоректні імена завдань"

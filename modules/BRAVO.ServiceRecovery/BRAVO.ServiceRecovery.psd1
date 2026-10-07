@@ -19,7 +19,9 @@
         'Get-BRAVOServiceRecoveryChainPlan',
         'Select-BRAVOServiceRecoveryScmEvents',
         'Get-BRAVOServiceRecoveryScmEvents',
-        'Add-BRAVOServiceRecoverySummaryLine'
+        'Add-BRAVOServiceRecoverySummaryLine',
+        'Add-BRAVOServiceRecoveryTaskTriggers',
+        'Test-BRAVOServiceRecoveryTaskDefinition'
     )
     VariablesToExport = @()
     CmdletsToExport = @()

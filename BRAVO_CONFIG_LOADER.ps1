@@ -597,6 +597,27 @@ function Assert-BravoLoadedConfiguration {
                 $global:schedulerSettings.BackupCatchUp.ScriptPath = Join-Path $RuntimeRoot 'BRAVO_ARCHIV.ps1'
             }
         }
+
+        # ServiceRecovery (задача BRAVO_SERVICE_RECOVERY, #314 хвиля 5):
+        # legacy site-config без вузла отримує його тут, щоб після
+        # переінсталяції задач відновлення служб працювало на всьому флоті.
+        # Похідний Enabled — те саме правило, що в Derivation: разом із
+        # Maintenance.
+        if (-not $global:schedulerSettings.Contains('ServiceRecovery') -or
+            -not ($global:schedulerSettings.ServiceRecovery -is [hashtable])) {
+            $serviceRecoveryMaintenanceEnabled = $global:schedulerSettings.Contains('Maintenance') -and
+                $global:schedulerSettings.Maintenance -is [hashtable] -and
+                [bool]$global:schedulerSettings.Maintenance.Enabled
+            $global:schedulerSettings.ServiceRecovery = @{
+                Enabled = $serviceRecoveryMaintenanceEnabled
+                TaskName = 'BRAVO_SERVICE_RECOVERY'
+                Description = 'Автоматичне відновлення служб BRAVO після падіння'
+                ExecutionTimeLimitHours = 1
+            }
+            if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+                $global:schedulerSettings.ServiceRecovery.ScriptPath = Join-Path $RuntimeRoot 'BRAVO_MAINTENANCE.ps1'
+            }
+        }
     }
     $restoreVerifyVariable = Get-Variable -Name 'restoreVerifySettings' -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $restoreVerifyVariable -or -not ($global:restoreVerifySettings -is [hashtable])) {

@@ -31,6 +31,13 @@ if (-not (Test-Path -LiteralPath $compatibilityHelpersPath -PathType Leaf)) {
     throw "Не знайдено PowerShell-модуль сумісності: $compatibilityHelpersPath"
 }
 Import-Module -Name $compatibilityHelpersPath -ErrorAction Stop
+# Перевірка визначення задачі BRAVO_SERVICE_RECOVERY (#314 хвиля 5) — те
+# саме правило, за яким BRAVO_TASKS_INSTALL будує її тригери.
+$serviceRecoveryHelpersPath = Join-Path $scriptRoot 'modules\BRAVO.ServiceRecovery\BRAVO.ServiceRecovery.psd1'
+if (-not (Test-Path -LiteralPath $serviceRecoveryHelpersPath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль відновлення служб: $serviceRecoveryHelpersPath"
+}
+Import-Module -Name $serviceRecoveryHelpersPath -ErrorAction Stop
 # P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
 # ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту.
 $configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
@@ -66,7 +73,7 @@ function Get-BRAVOTaskResultDescription {
 
 function Format-BRAVODiagnoseTaskNextRun {
     param(
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")]
         [string]$TaskType,
         $TaskSettings,
         $NextRunTime
@@ -270,6 +277,15 @@ function Test-BRAVOScheduledTaskDefinition {
         }
     }
 
+    # ServiceRecovery (#314 хвиля 5): три тригери (подія SCM, старт ОС,
+    # щодня з повтором 15 хв), IgnoreNew, ExecutionTimeLimit PT1H — чиста
+    # перевірка з BRAVO.ServiceRecovery, тією самою політикою, що в Installer.
+    if ($TaskType -eq 'ServiceRecovery') {
+        foreach ($serviceRecoveryProblem in @(Test-BRAVOServiceRecoveryTaskDefinition -Definition $definition)) {
+            $problems.Add([string]$serviceRecoveryProblem)
+        }
+    }
+
     return $problems.ToArray()
 }
 
@@ -416,8 +432,9 @@ try {
         BAZASync      = @('-NoPause', '-SyncBAZA')
         RestoreVerify = @('-NoPause', '-NotifyOnSuccess')
         BackupCatchUp = @('-NoPause', '-CatchUpMissedBackup')
+        ServiceRecovery = @('-NoPause', '-RecoverServices')
     }
-    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")) {
+    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")) {
         $settings = $schedulerSettings[$taskType]
         if ($null -eq $settings -or -not [bool]$settings.Enabled) {
             Write-Host "[SKIP] ${taskType}: вимкнено в конфігурації" -ForegroundColor Gray
@@ -509,7 +526,8 @@ try {
     }
     Write-Host (
         "[INFO] MultipleInstances=$($schedulerSettings.MultipleInstances): за політикою IgnoreNew " +
-        "новий тригер ПРОПУСКАЄТЬСЯ, якщо попередній екземпляр ще виконується."
+        "новий тригер ПРОПУСКАЄТЬСЯ, якщо попередній екземпляр ще виконується. " +
+        "BRAVO_SERVICE_RECOVERY завжди має IgnoreNew."
     ) -ForegroundColor Gray
 
     if ($InspectOnly) {
