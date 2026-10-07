@@ -137,12 +137,18 @@ function New-BRAVOServiceRecoveryServiceEntry {
         [AllowNull()][string]$StableSince
     )
 
-    if ([string]::IsNullOrWhiteSpace($LastCriticalAt)) { $LastCriticalAt = $null }
-    if ([string]::IsNullOrWhiteSpace($StableSince)) { $StableSince = $null }
+    # Присвоєння $null змінній, типізованій [string] (параметр), у Windows
+    # PowerShell 5.1 дає '' — тоді перевірка «$null -ne lastCriticalAt»
+    # хибно спрацьовує і порожня дата потрапляє в [datetime]-параметр.
+    # Тому значення полів — у нетипізованих локальних змінних.
+    $lastCriticalValue = $null
+    if (-not [string]::IsNullOrWhiteSpace($LastCriticalAt)) { $lastCriticalValue = [string]$LastCriticalAt }
+    $stableSinceValue = $null
+    if (-not [string]::IsNullOrWhiteSpace($StableSince)) { $stableSinceValue = [string]$StableSince }
     return [pscustomobject]@{
         attempts       = [object[]]@($Attempts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        lastCriticalAt = $LastCriticalAt
-        stableSince    = $StableSince
+        lastCriticalAt = $lastCriticalValue
+        stableSince    = $stableSinceValue
     }
 }
 
