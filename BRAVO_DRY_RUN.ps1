@@ -141,7 +141,24 @@ function Test-BRAVOFileSystemWriteAccess {
         }
     }
     $createdDirectory = $false
+    # New-Item -Force створює й відсутніх предків (probe на <Dest>\.work при
+    # відсутньому <Dest> створює обидва), тож запам'ятовуємо весь ланцюжок
+    # відсутніх каталогів від $Path до найвищого відсутнього предка (#283).
+    $createdChain = New-Object System.Collections.Generic.List[string]
+    $createdChainComplete = $false
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        $chainCursor = $Path
+        try {
+            while (-not [string]::IsNullOrEmpty($chainCursor) -and -not (Test-Path -LiteralPath $chainCursor)) {
+                $createdChain.Add($chainCursor)
+                $chainCursor = [IO.Path]::GetDirectoryName($chainCursor)
+            }
+            $createdChainComplete = $true
+        } catch {
+            # Недоступний предок (UNC без мережі): ланцюжок лишається тим,
+            # що вже зібрано; прибирання не вийде за його межі, а повідомлення
+            # не стверджуватиме, що прибрано все створене.
+        }
         try {
             [void](New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop)
             $createdDirectory = $true
@@ -176,19 +193,29 @@ function Test-BRAVOFileSystemWriteAccess {
 
     # Тимчасовий probe не повинен лишати production-каталог, якого до нього
     # не існувало: якщо каталог створив САМЕ ЦЕЙ виклик і після видалення
-    # probe-файла він лишився порожнім, прибираємо і каталог — інакше "dry"
+    # probe-файла він лишився порожнім, прибираємо і каталог, а потім так
+    # само кожного предка, якого створив цей виклик (від глибшого до
+    # вищого, зупиняючись на першому непорожньому) — інакше "dry"
     # run (заголовок скрипта прямо обіцяє "не створює каталоги") насправді
     # лишає за собою побічний ефект на диску. Непорожній каталог (щось інше
     # паралельно туди щось поклало) НЕ видаляється — це вже не "прибирання
     # за собою", а втрата чужих даних.
     $directoryCleanedUp = $false
-    if ($createdDirectory -and (Test-Path -LiteralPath $Path -PathType Container)) {
-        $remainingItems = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
-        if ($remainingItems.Count -eq 0) {
+    if ($createdDirectory) {
+        $directoryCleanedUp = $createdChainComplete
+        foreach ($createdItem in $createdChain) {
+            if (-not (Test-Path -LiteralPath $createdItem -PathType Container)) {
+                continue
+            }
+            $remainingItems = @(Get-ChildItem -LiteralPath $createdItem -Force -ErrorAction SilentlyContinue)
+            if ($remainingItems.Count -ne 0) {
+                $directoryCleanedUp = $false
+                break
+            }
             try {
-                Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
-                $directoryCleanedUp = $true
+                Remove-Item -LiteralPath $createdItem -Force -ErrorAction Stop
             } catch {
+                $directoryCleanedUp = $false
                 # Не критично для readiness-результату: сам probe уже
                 # підтвердив (або спростував) запис/читання; неможливість
                 # прибрати порожній каталог після себе — залишковий побічний
@@ -967,11 +994,28 @@ function Write-DryRunOutput {
                 -not (Test-Path -LiteralPath $resolvedResultDirectory -PathType Container)) {
                 throw "Каталог ResultPath не існує: $resolvedResultDirectory"
             }
-            [IO.File]::WriteAllText(
-                $ResultPath,
-                [string]$json,
-                (New-Object Text.UTF8Encoding($false))
-            )
+            # #306: BRAVO_TASKS_DIAGNOSE опитує появу ResultPath і одразу
+            # читає файл, тож результат публікується атомарно: повний JSON
+            # у тимчасовий файл поруч, потім Move-Item (як воркер
+            # BRAVO_CREDENTIALS_SETUP). Читач бачить або нічого, або весь JSON.
+            # Повний шлях — від того самого робочого каталогу процесу, від
+            # якого .NET і раніше рахував відносний ResultPath (Move-Item
+            # інакше взяв би поточний каталог провайдера PowerShell). Локальна
+            # копія параметра скрипта, сам параметр не змінюється.
+            $ResultPath = [IO.Path]::GetFullPath($ResultPath)
+            $temporaryResultPath = "$ResultPath.$([guid]::NewGuid().ToString('N')).tmp"
+            try {
+                [IO.File]::WriteAllText(
+                    $temporaryResultPath,
+                    [string]$json,
+                    (New-Object Text.UTF8Encoding($false))
+                )
+                Move-Item -LiteralPath $temporaryResultPath -Destination $ResultPath -Force
+            } finally {
+                if (Test-Path -LiteralPath $temporaryResultPath -PathType Leaf) {
+                    Remove-Item -LiteralPath $temporaryResultPath -Force -ErrorAction SilentlyContinue
+                }
+            }
         }
         if ($AsJson) {
             $json

@@ -1279,6 +1279,95 @@ function New-BRAVOSelfTestFakeBazaSession {
     return $session
 }
 
+# #366: фейк-сесія зі СТРОГОЮ моделлю масок WinSCP .NET поверх
+# New-BRAVOSelfTestFakeBazaSession. Реальна WinSCP трактує останній
+# сегмент локального джерела PutFiles, шляху RemoveFiles і джерела
+# MoveFile (скриптові put/rm/mv) як файлову маску: `*`, `?`, `[...]`.
+# FileExists/GetFileInfo приймають буквальний шлях. Без екранування
+# `Trace[1].mdz` збігається з `Trace1.mdz` — саме це тут і моделюється.
+# Звичайна фейк-сесія лишається буквальною: наявні перевірки не змінюються.
+function New-BRAVOSelfTestWinSCPMaskSession {
+    $session = New-BRAVOSelfTestFakeBazaSession
+    $session.State | Add-Member -MemberType NoteProperty -Name PutFilesLocalArgs -Value (New-Object System.Collections.Generic.List[string])
+    $session.State | Add-Member -MemberType NoteProperty -Name ResolveMask -Value {
+        param([string]$MaskPath)
+        $separatorIndex = $MaskPath.LastIndexOfAny([char[]]@('/', '\'))
+        $leaf = $MaskPath.Substring($separatorIndex + 1)
+        $pattern = New-Object System.Text.StringBuilder
+        [void]$pattern.Append('^')
+        $index = 0
+        while ($index -lt $leaf.Length) {
+            $character = [string]$leaf[$index]
+            $closeIndex = -1
+            if ($character -eq '[') { $closeIndex = $leaf.IndexOf(']', $index + 2) }
+            if ($character -eq '*') {
+                [void]$pattern.Append('.*')
+            } elseif ($character -eq '?') {
+                [void]$pattern.Append('.')
+            } elseif ($closeIndex -gt 0) {
+                $setText = $leaf.Substring($index + 1, $closeIndex - $index - 1)
+                [void]$pattern.Append('[' + [regex]::Escape($setText).Replace(']', '\]') + ']')
+                $index = $closeIndex
+            } else {
+                [void]$pattern.Append([regex]::Escape($character))
+            }
+            $index++
+        }
+        [void]$pattern.Append('$')
+        return [pscustomobject]@{ Directory = $MaskPath.Substring(0, $separatorIndex + 1); Pattern = $pattern.ToString() }
+    }
+    $session.State | Add-Member -MemberType NoteProperty -Name FindRemoteMatches -Value {
+        param($RemoteSizes, $Mask)
+        $found = New-Object System.Collections.Generic.List[string]
+        foreach ($remoteKey in @($RemoteSizes.Keys)) {
+            if (-not ([string]$remoteKey).StartsWith($Mask.Directory, [StringComparison]::Ordinal)) { continue }
+            $remoteLeaf = ([string]$remoteKey).Substring($Mask.Directory.Length)
+            if ($remoteLeaf.Contains('/')) { continue }
+            if ($remoteLeaf -cmatch $Mask.Pattern) { [void]$found.Add([string]$remoteKey) }
+        }
+        return ,$found
+    }
+    $session | Add-Member -Force -MemberType ScriptMethod -Name PutFiles -Value {
+        param($localPath, $remotePath, $remove, $options)
+        $this.State.PutFilesCallCount++
+        [void]$this.State.PutFilesCalledFor.Add([string]$remotePath)
+        [void]$this.State.PutFilesLocalArgs.Add([string]$localPath)
+        $mask = & $this.State.ResolveMask ([string]$localPath)
+        $matchedFiles = @(Get-ChildItem -LiteralPath $mask.Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer -and $_.Name -match $mask.Pattern })
+        if ($matchedFiles.Count -ne 1) {
+            $errObj = [pscustomobject]@{ Error = [pscustomobject]@{ Message = "маска '$localPath' збіглася з $($matchedFiles.Count) файлами" } }
+            return [pscustomobject]@{ IsSuccess = $false; Transfers = @($errObj) }
+        }
+        $this.State.RemoteSizes[[string]$remotePath] = [int64]$matchedFiles[0].Length
+        return [pscustomobject]@{ IsSuccess = $true; Transfers = @() }
+    }
+    $session | Add-Member -Force -MemberType ScriptMethod -Name RemoveFiles -Value {
+        param($path)
+        [void]$this.State.RemoveFilesCalls.Add([string]$path)
+        $mask = & $this.State.ResolveMask ([string]$path)
+        foreach ($matchedKey in (& $this.State.FindRemoteMatches $this.State.RemoteSizes $mask)) {
+            $this.State.RemoteSizes.Remove($matchedKey)
+        }
+        return [pscustomobject]@{ IsSuccess = $true }
+    }
+    $session | Add-Member -Force -MemberType ScriptMethod -Name MoveFile -Value {
+        param($sourcePath, $targetPath)
+        [void]$this.State.MoveFileCalls.Add("$sourcePath -> $targetPath")
+        $mask = & $this.State.ResolveMask ([string]$sourcePath)
+        $matchedKeys = & $this.State.FindRemoteMatches $this.State.RemoteSizes $mask
+        if ($matchedKeys.Count -ne 1) {
+            throw "WinSCP mv: маска '$sourcePath' збіглася з $($matchedKeys.Count) файлами"
+        }
+        if ($this.State.RemoteSizes.ContainsKey([string]$targetPath)) {
+            throw "simulated rename failure: target already exists: $targetPath"
+        }
+        $this.State.RemoteSizes[[string]$targetPath] = $this.State.RemoteSizes[$matchedKeys[0]]
+        $this.State.RemoteSizes.Remove($matchedKeys[0])
+    }
+    return $session
+}
+
 # P0 fail-fast/telemetry: друкує суто ДОДАТКОВУ (assertion-level і
 # suite-level) телеметрію. Викликається з Complete-BRAVOSelfTestReport
 # ПІСЛЯ незмінних machine-readable маркерів (SELF-TEST PASSED/FAILED,
@@ -2411,6 +2500,34 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             )) `
         -Name "Compatibility/ImportHasNoConsoleSideEffects" `
         -Failure "імпорт Compatibility не повинен змінювати global OutputEncoding"
+
+    # --- #366: WinSCP трактує останній сегмент шляху як файлову маску ---
+    # Екранування — як RemotePath.EscapeFileMask: лише останній сегмент
+    # (після останнього `/` або `\`), `[` -> `[[]`, `*` -> `[*]`, `?` -> `[?]`;
+    # каталог і звичайні імена не змінюються.
+    $winScpMaskCases = @(
+        @('/trace/Trace[1]*?.mdz', '/trace/Trace[[]1][*][?].mdz'),
+        @('C:\dir[x]\file[2].txt', 'C:\dir[x]\file[[]2].txt'),
+        @('/baza[a]/sub/doc].txt', '/baza[a]/sub/doc].txt'),
+        @('/trace/Trace_20260815.mdz', '/trace/Trace_20260815.mdz'),
+        @('name[1]', 'name[[]1]'),
+        @('', '')
+    )
+    $winScpMaskMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($winScpMaskCase in $winScpMaskCases) {
+        try {
+            $winScpMaskActual = ConvertTo-BRAVOWinSCPFileMask -Path $winScpMaskCase[0]
+        } catch {
+            $winScpMaskActual = "<виняток: $($_.Exception.Message)>"
+        }
+        if ($winScpMaskActual -cne $winScpMaskCase[1]) {
+            [void]$winScpMaskMismatches.Add("'$($winScpMaskCase[0])' -> '$winScpMaskActual' (очікувалось '$($winScpMaskCase[1])')")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($winScpMaskMismatches.Count -eq 0) `
+        -Name "Compatibility/WinSCPFileMaskEscapesOnlyLastSegment" `
+        -Failure "ConvertTo-BRAVOWinSCPFileMask має екранувати лише останній сегмент: $($winScpMaskMismatches -join '; ')"
 
     # --- T030: TLS 1.2 вмикається АДИТИВНО в усіх production-точках ---
     # Регресія: Maintenance/DataRestore runtime і dry-run webhook-перевірка
@@ -4813,8 +4930,15 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # 7z t» / «не вдалося створити SHA512») злито в одну гілку
             # Verify-Backup (7z t + SHA512); збій 7z t і далі виставляє
             # restoreIntegrityFailed у Test-BRAVOMaintenanceSevenZipArchiveIntegrity.
+            # +1 integrity (#300): retention (Remove-OldRestoreArchives) виставляє
+            # restoreIntegrityFailed, коли після збою 7z t не лишилось жодної
+            # придатної точки відновлення (старіші сесії перевіряються з
+            # -NoFailureFlags, тож цей backstop — окрема точка).
+            # +1 integrity (#300, Claude QA 386-Q2): retention виставляє
+            # restoreIntegrityFailed, коли сама перевірка 7z t кинула виняток
+            # (перевірку не виконано — fail-closed і для старших сесій).
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 13) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 10)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 12)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
         -Failure "Maintenance має розрізняти локальну архівацію (40), перевірку цілісності (41) і провал реставрації з відкатом (43), а не зводити все до 60"
@@ -6239,15 +6363,19 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # Clear-CredentialOperationSnapshots для $currentUserSnapshots
         # захищено try/finally — переживає виняток з Invoke-AsSystem
         # (worker timeout, FatalError, збій Task Scheduler тощо).
+        # #302: гілку винесено в Invoke-CredentialOperationsViaSystemWorker;
+        # якір кінця блоку — її return, а виклик з StoreFor Both
+        # перевіряється окремо, тож жодну з умов не послаблено.
         $bothStoreBlockMatch = [regex]::Match(
             $credentialsSetupScriptText,
-            '\$currentUserSnapshots\s*=\s*if\s*\(\$Action[\s\S]*?\$operationResults\s*=\s*@\(\$currentUserResults\)\s*\+\s*@\(\$systemResults\)'
+            '\$currentUserSnapshots\s*=\s*@\(if\s*\(\$Action[\s\S]*?return\s*\(@\(\$currentUserResults\)\s*\+\s*@\(\$systemResults\)\)'
         )
         $bothStoreBlockText = if ($bothStoreBlockMatch.Success) { $bothStoreBlockMatch.Value } else { '' }
 
         Test-BRAVOCondition `
             -Condition (
                 $bothStoreBlockMatch.Success -and
+                $credentialsSetupScriptText -match 'if\s*\(\$useSystemWorker\s+-and\s+\$currentUserStoreRequested\)\s*\{\s*\$operationResults\s*=\s*@\(\s*Invoke-CredentialOperationsViaSystemWorker' -and
                 $bothStoreBlockText -match 'try\s*\{' -and
                 $bothStoreBlockText -match '\}\s*finally\s*\{[\s\S]*Clear-CredentialOperationSnapshots -Snapshots \$currentUserSnapshots' -and
                 $bothStoreBlockText.Contains('Restore-CredentialOperationSnapshots') -and
@@ -6475,6 +6603,235 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Maintenance/MixedAlertQueue_ErrorPlusCriticalResolvesToCritical" `
         -Failure "черга ERROR+CRITICAL має дати підсумкову content-severity CRITICAL, execution лишається некритичним"
+
+    # --- Maintenance #299: ранні виходи (recovery guard, збій quiescence-
+    # маркера, tool integrity, lock) не доходять до Send-FinalReport, тож
+    # накопичені Send-SlackAlert -IsCritical губилися. Send-BRAVOMaintenance-
+    # EarlyExitAlerts надсилає ще не доставлені алерти одразу; повторний
+    # виклик і виклик після Send-FinalReport нічого не дублюють.
+    $earlyExitAlertModule = $null
+    $earlyExitAlertModuleError = $null
+    try {
+        $earlyExitAlertModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $maintenanceRuntimeSourceForSeverity `
+            -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Send-BRAVOMaintenanceEarlyExitAlerts', 'Send-BRAVOMaintenanceSkippedRunAlert')
+    } catch {
+        $earlyExitAlertModuleError = $_.Exception.Message
+    }
+
+    function Invoke-MaintenanceEarlyExitAlertScenario {
+        param([scriptblock]$Calls, [string]$Mode = 'errors_only', [switch]$FailFinalReportMessage)
+        if ($null -eq $earlyExitAlertModule) { return $null }
+        & $earlyExitAlertModule {
+            param($CallsInner, $ModeInner, $FailFinalReportMessageInner)
+            $script:SlackMode = $ModeInner
+            $script:CriticalErrors = $false
+            $script:criticalErrorOccurred = $false
+            $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+            $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            $script:maintenanceDeliveredCriticalAlertCount = 0
+            $script:maintenanceDeliveredAlertQueueCount = 0
+            $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
+            $script:ScriptStartTime = Get-Date
+            $bravoSettings = @{ NotificationRouting = @{} }
+            $LOG_FILE = "STUB-LOG-PATH"
+            $NotificationProviderDisplayName = "STUB"
+            $script:deliveredMessages = New-Object System.Collections.Generic.List[object]
+
+            function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+            function Resolve-BRAVONotificationRoute {
+                param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                if ($NotificationMode -eq "none") { return "none" }
+                if ($Severity -eq "SUCCESS") {
+                    if ($NotificationMode -eq "errors_only") { return "none" }
+                    return "general"
+                }
+                return "alerts"
+            }
+            function Invoke-NotificationWebhook {
+                param([string]$Message, [string]$WebhookUrl)
+                $script:deliveredMessages.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+            }
+            function New-MaintenanceNotificationMessage {
+                param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                if ($FailFinalReportMessageInner -and $Title -eq "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ") {
+                    throw "self-test: побудова фінального звіту впала"
+                }
+                return "TITLE=$Title|EMOJI=$TitleEmoji|SEVERITY=$Severity|DETAILS=$($Details -join ';')"
+            }
+            function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
+
+            & $CallsInner
+
+            $deliveredTexts = New-Object System.Collections.Generic.List[string]
+            foreach ($delivered in $script:deliveredMessages) { $deliveredTexts.Add([string]$delivered.Message) }
+            [pscustomobject]@{
+                CriticalErrorOccurred = $script:criticalErrorOccurred
+                DeliveredCount = $script:deliveredMessages.Count
+                DeliveredMessages = $deliveredTexts
+                DeliveredWebhook = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].WebhookUrl } else { $null }
+            }
+        } $Calls $Mode ([bool]$FailFinalReportMessage)
+    }
+
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitAlertModule) `
+        -Name "Maintenance/EarlyExitAlertFunctionAvailable" `
+        -Failure "#299: Send-BRAVOMaintenanceEarlyExitAlerts не підготовлено для runtime-тесту: $earlyExitAlertModuleError"
+
+    $earlyExitFlush = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-SlackAlert -Message "guard-message-299" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "recovery guard"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitFlush -and
+            $earlyExitFlush.DeliveredCount -eq 1 -and
+            $earlyExitFlush.DeliveredWebhook -eq "STUB-ALERTS-URL" -and
+            $earlyExitFlush.DeliveredMessages[0].Contains("SEVERITY=CRITICAL") -and
+            $earlyExitFlush.DeliveredMessages[0].Contains("guard-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsFlushQueuedCriticalImmediately" `
+        -Failure "#299: накопичений -IsCritical алерт має бути надісланий одразу (1 повідомлення CRITICAL в ALERTS з текстом алерту); факт: $(if ($null -eq $earlyExitFlush) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitFlush.DeliveredCount)" })"
+
+    $earlyExitTwice = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-SlackAlert -Message "marker-message-299" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "quiescence marker"
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitTwice -and $earlyExitTwice.DeliveredCount -eq 1) `
+        -Name "Maintenance/EarlyExitAlertsSecondFlushDoesNotResend" `
+        -Failure "#299: повторний виклик (явний перед виходом + страховка у finally) не повинен надсилати той самий алерт удруге; факт: $(if ($null -eq $earlyExitTwice) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitTwice.DeliveredCount)" })"
+
+    $earlyExitAfterFinal = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-SlackAlert -Message "final-message-299" -IsCritical
+        Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitAfterFinal -and $earlyExitAfterFinal.DeliveredCount -eq 1) `
+        -Name "Maintenance/EarlyExitAlertsNoDuplicateAfterFinalReport" `
+        -Failure "#299: алерт, уже надісланий Send-FinalReport, не повинен дублюватися страховкою у finally; факт: $(if ($null -eq $earlyExitAfterFinal) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitAfterFinal.DeliveredCount)" })"
+
+    $earlyExitLate = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+        Send-SlackAlert -Message "late-message-299" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitLate -and
+            $earlyExitLate.DeliveredCount -eq 1 -and
+            $earlyExitLate.DeliveredMessages[0].Contains("late-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsDeliverCriticalRaisedAfterFinalReport" `
+        -Failure "#299: критичний алерт, піднятий після Send-FinalReport, має бути надісланий страховкою; факт: $(if ($null -eq $earlyExitLate) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitLate.DeliveredCount)" })"
+
+    $earlyExitFinalThrows = Invoke-MaintenanceEarlyExitAlertScenario -FailFinalReportMessage -Calls {
+        Send-SlackAlert -Message "final-throws-message-299" -IsCritical
+        try { Send-FinalReport -LOG_FILE "STUB-LOG-PATH" } catch { [void]$_ }
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitFinalThrows -and
+            $earlyExitFinalThrows.DeliveredCount -eq 1 -and
+            $earlyExitFinalThrows.DeliveredMessages[0].Contains("final-throws-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsDeliverWhenFinalReportThrowsBeforeSend" `
+        -Failure "#299: якщо Send-FinalReport кинув виняток до відправки, страховка має надіслати накопичений алерт; факт: $(if ($null -eq $earlyExitFinalThrows) { 'сценарій не виконано' } else { "DeliveredCount=$($earlyExitFinalThrows.DeliveredCount)" })"
+
+    $earlyExitEmpty = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "аварійне завершення"
+    }
+    $earlyExitModeNone = Invoke-MaintenanceEarlyExitAlertScenario -Mode 'none' -Calls {
+        Send-SlackAlert -Message "none-message-299" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "recovery guard"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitEmpty -and $earlyExitEmpty.DeliveredCount -eq 0 -and
+            $null -ne $earlyExitModeNone -and $earlyExitModeNone.DeliveredCount -eq 0
+        ) `
+        -Name "Maintenance/EarlyExitAlertsSilentWhenNothingQueuedOrModeNone" `
+        -Failure "#299: без накопичених алертів або в режимі none нічого не надсилається"
+
+    $earlyExitLockSkip = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-BRAVOMaintenanceSkippedRunAlert -Message "lock-message-299" -Reason "operation lock"
+    }
+    $earlyExitRecoveryTickSkip = Invoke-MaintenanceEarlyExitAlertScenario -Calls {
+        Send-BRAVOMaintenanceSkippedRunAlert -Message "recovery-tick-299" -Reason "operation lock" -RecoveryTick
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $earlyExitRecoveryTickSkip -and $earlyExitRecoveryTickSkip.DeliveredCount -eq 0) `
+        -Name "Maintenance/RecoveryTickLockSkipOnlyLogs" `
+        -Failure "#299: пропуск Recovery-тику через lock не надсилає алерт (тик повторюється за розкладом)"
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $earlyExitLockSkip -and
+            -not $earlyExitLockSkip.CriticalErrorOccurred -and
+            $earlyExitLockSkip.DeliveredCount -eq 1 -and
+            $earlyExitLockSkip.DeliveredMessages[0].Contains("SEVERITY=ERROR") -and
+            $earlyExitLockSkip.DeliveredMessages[0].Contains("lock-message-299")
+        ) `
+        -Name "Maintenance/EarlyExitAlertsKeepNotificationOnlySeverity" `
+        -Failure "#299: notification-only ERROR (пропуск через lock) надсилається одразу з severity ERROR і не робить прогін critical"
+
+    # Кожен ранній вихід викликає надсилання ДО exit/throw (між місцем
+    # алерту і самим виходом), а спільний finally має страховку перед
+    # завантаженням власного логу.
+    function Get-MaintenanceEarlyExitSegment {
+        param([string]$StartMarker, [string]$EndMarker)
+        $segmentStart = $maintenanceRuntimeSourceForSeverity.IndexOf($StartMarker)
+        if ($segmentStart -lt 0) { return $null }
+        $segmentEnd = $maintenanceRuntimeSourceForSeverity.IndexOf($EndMarker, $segmentStart)
+        if ($segmentEnd -lt 0 -or ($segmentEnd - $segmentStart) -gt 2500) { return $null }
+        return $maintenanceRuntimeSourceForSeverity.Substring($segmentStart, $segmentEnd - $segmentStart)
+    }
+    $toolIntegrityExitSegment = Get-MaintenanceEarlyExitSegment `
+        -StartMarker 'if ($script:BRAVOToolManifest.ShouldBlock) {' `
+        -EndMarker 'exit (Resolve-BRAVOExitCode -ToolIntegrityViolation)'
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $toolIntegrityExitSegment -and
+            $toolIntegrityExitSegment -match 'Send-SlackAlert[^\r\n]*-IsCritical' -and
+            $toolIntegrityExitSegment.Contains('Send-BRAVOMaintenanceEarlyExitAlerts')
+        ) `
+        -Name "Maintenance/ToolIntegrityExitSendsCriticalImmediately" `
+        -Failure "#299 (рішення власника): блокування через цілісність інструментів має одразу надсилати CRITICAL (Send-SlackAlert -IsCritical + Send-BRAVOMaintenanceEarlyExitAlerts перед exit)"
+    $recoveryGuardExitSegment = Get-MaintenanceEarlyExitSegment `
+        -StartMarker 'Send-SlackAlert -Message $message -IsCritical' `
+        -EndMarker 'exit 20'
+    Test-BRAVOCondition `
+        -Condition ($null -ne $recoveryGuardExitSegment -and $recoveryGuardExitSegment.Contains('Send-BRAVOMaintenanceEarlyExitAlerts')) `
+        -Name "Maintenance/RecoveryGuardExitFlushesCriticalAlert" `
+        -Failure "#299: recovery guard має надіслати CRITICAL до exit 20"
+    $quiescenceMarkerExitSegment = Get-MaintenanceEarlyExitSegment `
+        -StartMarker 'Send-SlackAlert -Message $quiescenceMarkerError -IsCritical' `
+        -EndMarker 'throw $quiescenceMarkerError'
+    Test-BRAVOCondition `
+        -Condition ($null -ne $quiescenceMarkerExitSegment -and $quiescenceMarkerExitSegment.Contains('Send-BRAVOMaintenanceEarlyExitAlerts')) `
+        -Name "Maintenance/QuiescenceMarkerFailureFlushesCriticalAlert" `
+        -Failure "#299: збій запису quiescence-маркера має надіслати CRITICAL до throw"
+    $lockBusyExitSegment = Get-MaintenanceEarlyExitSegment `
+        -StartMarker 'if (-not $maintenanceLockResult.Success) {' `
+        -EndMarker 'exit (Resolve-BRAVOExitCode -LockBusy)'
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $lockBusyExitSegment -and
+            $lockBusyExitSegment.Contains('Send-BRAVOMaintenanceSkippedRunAlert') -and
+            $lockBusyExitSegment.Contains('-RecoveryTick:$RunMissedRestoreOnly')
+        ) `
+        -Name "Maintenance/LockBusySkipAlertsForScheduledMaintenance" `
+        -Failure "#299: пропуск планового Maintenance через lock має одразу надсилати ERROR (Recovery-тик лише логує)"
+    $outerFinallyStart = $maintenanceRuntimeSourceForSeverity.IndexOf('Закриває try, відкритий одразу після імпорту модулів')
+    $outerFinallyUpload = $maintenanceRuntimeSourceForSeverity.LastIndexOf('Wait-BRAVOManualExit -NoPause:$NoPause')
+    $outerFinallyFlush = $maintenanceRuntimeSourceForSeverity.LastIndexOf('Send-BRAVOMaintenanceEarlyExitAlerts')
+    Test-BRAVOCondition `
+        -Condition ($outerFinallyStart -gt 0 -and $outerFinallyFlush -gt $outerFinallyStart -and $outerFinallyFlush -lt $outerFinallyUpload) `
+        -Name "Maintenance/OuterFinallyFlushesUndeliveredAlerts" `
+        -Failure "#299: спільний finally має надсилати ще не доставлені алерти (страховка для будь-якого раннього exit/throw)"
 
     # --- Maintenance: -EnableAllSlack/-DisableAllSlack ефективний режим
     # обчислюється ОДИН раз, ДО webhook-route preflight (регресійний тест
@@ -6718,6 +7075,76 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Name "Maintenance/SuccessNotificationCompletedLines_$($completedLinesScenario.Name)" `
             -Failure "успішне сповіщення (mode=all) мало передати в -Details $($expectedCompletedLines.Count) рядк(ів) '$($expectedCompletedLines -join '|')'; отримано: $(if ($null -eq $completedLinesCapture) { '<немає результату>' } else { '{0} доставлено, {1} рядк(ів) ''{2}''' -f $completedLinesCapture.DeliveredCount, $completedLinesCapture.DetailsCount, $completedLinesCapture.DetailsJoined })"
     }
+    # --- Maintenance (#298): criticalErrorOccurred без записів у
+    # CriticalErrorsList/NotificationAlertQueue (багато місць ставлять лише
+    # прапорець -> exit 60) за errors_only мав мовчки повертатись. Реальна
+    # Send-FinalReport; стабляться лише webhook і конструктор тексту.
+    $criticalFlagReportModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceRuntimeSourceForSeverity `
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
+    function Invoke-MaintenanceCriticalFlagReportScenario {
+        param([bool]$CriticalFlag, [string[]]$CriticalEntries = @())
+        & $criticalFlagReportModule {
+            param([bool]$FlagInner, [string[]]$EntriesInner)
+            Set-StrictMode -Version 2.0
+            $script:SlackMode = "errors_only"
+            $script:criticalErrorOccurred = $FlagInner
+            $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+            foreach ($entryInner in $EntriesInner) { $script:CriticalErrorsList.Add($entryInner) }
+            $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
+            $script:ScriptStartTime = Get-Date
+            $bravoSettings = @{ NotificationRouting = @{} }
+            $NotificationProviderDisplayName = "STUB"
+            $script:deliveredMessages = New-Object System.Collections.Generic.List[object]
+
+            function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+            function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
+            function Resolve-BRAVONotificationRoute {
+                param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                if ($Severity -eq "SUCCESS" -and $NotificationMode -eq "errors_only") { return "none" }
+                return "alerts"
+            }
+            function Invoke-NotificationWebhook {
+                param([string]$Message, [string]$WebhookUrl)
+                $script:deliveredMessages.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+            }
+            function New-MaintenanceNotificationMessage {
+                param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                return "TITLE=$Title|SEVERITY=$Severity|DETAILS=$($Details -join ';')|LOG=$LogPath"
+            }
+
+            Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+
+            [pscustomobject]@{
+                DeliveredCount = $script:deliveredMessages.Count
+                DeliveredMessage = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].Message } else { $null }
+            }
+        } $CriticalFlag $CriticalEntries
+    }
+    $criticalFlagOnly = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalFlagOnly.DeliveredCount -eq 1 -and
+            $criticalFlagOnly.DeliveredMessage.Contains("SEVERITY=CRITICAL") -and
+            $criticalFlagOnly.DeliveredMessage.Contains("без детальної причини") -and
+            $criticalFlagOnly.DeliveredMessage.Contains("LOG=STUB-LOG-PATH")
+        ) `
+        -Name "Maintenance/CriticalFlagWithoutEntriesAlertsInErrorsOnly" `
+        -Failure "errors_only + `$script:criticalErrorOccurred без записів у чергах мав надіслати рівно один CRITICAL-алерт із узагальненою причиною та шляхом до журналу; доставлено: $($criticalFlagOnly.DeliveredCount)"
+    $noCriticalNoAlert = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $false
+    Test-BRAVOCondition `
+        -Condition ($noCriticalNoAlert.DeliveredCount -eq 0) `
+        -Name "Maintenance/NoCriticalFlagSendsNothingInErrorsOnly" `
+        -Failure "errors_only без критичної помилки не повинен нічого надсилати; доставлено: $($noCriticalNoAlert.DeliveredCount)"
+    $criticalFlagWithEntry = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true -CriticalEntries @("конкретна критична помилка")
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalFlagWithEntry.DeliveredCount -eq 1 -and
+            $criticalFlagWithEntry.DeliveredMessage -eq "TITLE=КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ|SEVERITY=CRITICAL|DETAILS=конкретна критична помилка|LOG=STUB-LOG-PATH"
+        ) `
+        -Name "Maintenance/CriticalFlagWithEntryKeepsExistingMessage" `
+        -Failure "за наявності запису в CriticalErrorsList повідомлення має лишитись незмінним (без узагальненого рядка); отримано: $($criticalFlagWithEntry.DeliveredMessage)"
 
     # --- Maintenance: перевищення порогу діапазонів ID (запис у
     # CriticalErrorsList через Test-RangeIdUsage -> Send-SlackAlert
@@ -8120,7 +8547,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # C: компонент без валідної історії І без вимірюваного джерела —
         # вимоги вивести нізвідки, тож він пропускається з оцінки. Це
         # ЄДИНИЙ випадок, коли bootstrap лишається без вимоги: у 5.2.4
-        # вимірюване джерело дає доведену верхню межу (тест C2 нижче).
+        # вимірюване джерело дає консервативну оцінку (тест C2 нижче).
         $estimatedSpaceEmptyDir = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_EMPTY'
         [void][IO.Directory]::CreateDirectory($estimatedSpaceEmptyDir)
         $estimateNoHistory = & $archiveEstimateRuntimeModule {
@@ -8155,8 +8582,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # решти дочірніх блоків файлу.
         & {
             # C2 (5.2.4): той самий bootstrap, але джерело вимірюване. Вимога
-            # виводиться з нестиснутого розміру джерела — доведеної верхньої
-            # межі розміру архіву. Свідомо через РЕАЛЬНИЙ обхід файлової
+            # виводиться з нестиснутого розміру джерела плюс per-file метадані
+            # (#279) — консервативної верхньої оцінки розміру архіву. Свідомо через РЕАЛЬНИЙ обхід файлової
             # системи (без -SourceSizeOverrides): інакше production-гілка
             # Get-ChildItem/Measure-Object лишилась би непокритою.
             $estimatedSpaceBootstrapSource = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_SRC'
@@ -8180,11 +8607,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     -not $estimateBootstrapSource.ComponentEstimates[0].HasHistory -and
                     $estimateBootstrapSource.ComponentEstimates[0].SourceBytes -eq 40000 -and
                     $estimateBootstrapSource.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
-                    $estimateBootstrapSource.ComponentEstimates[0].EstimatedBytes -eq 40800 -and
+                    $estimateBootstrapSource.ComponentEstimates[0].EstimatedBytes -eq 41080 -and
                     @($estimateBootstrapSource.VolumeStatus).Count -eq 1
                 ) `
                 -Name 'Archive/EstimatedSpaceBootstrapUsesSourceUpperBound' `
-                -Failure '5.2.4: компонент без історії, але з вимірюваним джерелом (40000 B), має отримати вимогу з доведеної верхньої межі 40000*1.02 = 40800 B і брати участь у розрахунку по тому — до 5.2.4 він мовчки випадав з оцінки взагалі'
+                -Failure '5.2.4: компонент без історії, але з вимірюваним джерелом (40000 B), має отримати вимогу з консервативної оцінки 40000*1.02 + 256 + 2*(11+1) = 41080 B (#279: один файл payload.bin) і брати участь у розрахунку по тому — до 5.2.4 він мовчки випадав з оцінки взагалі'
 
             # C3 (5.2.4): джерело менше за history-прогноз — межа працює як
             # СТЕЛЯ, роблячи вимогу тіснішою. Архів не може бути більшим за
@@ -8208,9 +8635,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $estimateCapped.ComponentEstimates[0].HasHistory -and
                     $estimateCapped.ComponentEstimates[0].LastValidBytes -eq 100000 -and
                     $estimateCapped.ComponentEstimates[0].EstimateBasis -eq 'HistoryCappedBySource' -and
-                    $estimateCapped.ComponentEstimates[0].EstimatedBytes -eq 51000
+                    $estimateCapped.ComponentEstimates[0].EstimatedBytes -eq 51280
                 ) `
-                -Failure '5.2.4: history-прогноз 125000 B має обмежуватись доведеною межею джерела 50000*1.02 = 51000 B; стеля робить вимогу тіснішою і ніколи не більшою' `
+                -Failure '5.2.4: history-прогноз 125000 B має обмежуватись консервативною оцінкою джерела 50000*1.02 + 280 = 51280 B; стеля робить вимогу тіснішою і ніколи не більшою' `
                 -Name 'Archive/EstimatedSpaceHistoryCappedBySmallerSource'
 
             # #284: production-джерела задаються у формі "<SRC>\*"
@@ -8235,11 +8662,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     -not $estimateBootstrapStarSource.ComponentEstimates[0].HasHistory -and
                     $estimateBootstrapStarSource.ComponentEstimates[0].SourceBytes -eq 40000 -and
                     $estimateBootstrapStarSource.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
-                    $estimateBootstrapStarSource.ComponentEstimates[0].EstimatedBytes -eq 40800 -and
+                    $estimateBootstrapStarSource.ComponentEstimates[0].EstimatedBytes -eq 41080 -and
                     @($estimateBootstrapStarSource.VolumeStatus).Count -eq 1
                 ) `
                 -Name 'Archive/EstimatedSpaceBootstrapMeasuresProductionStarSource' `
-                -Failure "#284: джерело у production-формі '<SRC>\*' без історії має виміряти вміст каталогу (40000 B) і дати вимогу 40800 B; факт: SourceBytes=$($estimateBootstrapStarSource.ComponentEstimates[0].SourceBytes), basis=$($estimateBootstrapStarSource.ComponentEstimates[0].EstimateBasis)"
+                -Failure "#284: джерело у production-формі '<SRC>\*' без історії має виміряти вміст каталогу (40000 B) і дати вимогу 41080 B; факт: SourceBytes=$($estimateBootstrapStarSource.ComponentEstimates[0].SourceBytes), basis=$($estimateBootstrapStarSource.ComponentEstimates[0].EstimateBasis)"
 
             $estimateCappedStar = & $archiveEstimateRuntimeModule {
                 param($EnabledArchives, $Drives)
@@ -8257,10 +8684,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $estimateCappedStar.ComponentEstimates[0].HasHistory -and
                     $estimateCappedStar.ComponentEstimates[0].SourceBytes -eq 50000 -and
                     $estimateCappedStar.ComponentEstimates[0].EstimateBasis -eq 'HistoryCappedBySource' -and
-                    $estimateCappedStar.ComponentEstimates[0].EstimatedBytes -eq 51000
+                    $estimateCappedStar.ComponentEstimates[0].EstimatedBytes -eq 51280
                 ) `
                 -Name 'Archive/EstimatedSpaceHistoryCappedByProductionStarSource' `
-                -Failure "#284: стеля джерела має діяти і для production-форми '<SRC>\*' (50000*1.02 = 51000 B); факт: SourceBytes=$($estimateCappedStar.ComponentEstimates[0].SourceBytes), basis=$($estimateCappedStar.ComponentEstimates[0].EstimateBasis)"
+                -Failure "#284: стеля джерела має діяти і для production-форми '<SRC>\*' (50000*1.02 + 280 = 51280 B); факт: SourceBytes=$($estimateCappedStar.ComponentEstimates[0].SourceBytes), basis=$($estimateCappedStar.ComponentEstimates[0].EstimateBasis)"
 
             # C4 (5.2.4): межа НЕ застосовується, коли джерело порожнє —
             # інакше нульове/недоступне джерело обнулило б вимогу компонента,
@@ -8285,6 +8712,131 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 ) `
                 -Name 'Archive/EstimatedSpaceEmptySourceDoesNotZeroRequirement' `
                 -Failure 'порожнє джерело не дає стелі: вимога має лишитись history-оцінкою 125000 B, інакше нульовий вимір обнулив би захист'
+        }
+
+        # #279: оцінка за розміром джерела мусить враховувати per-file
+        # метадані 7-Zip (заголовок запису, ім'я у UTF-16, атрибути, часи,
+        # CRC), які НЕ обмежені 2% від нестиснутого розміру: багато дрібних
+        # файлів з довгими іменами дають архів більший за sourceBytes*1.02.
+        # Дочірній scope — ліміт 4096 змінних script-scope (див. вище).
+        & {
+            $manyFilesSource = Join-Path $estimatedSpaceTestRoot 'MANYFILES_SRC'
+            $manyFilesDest = Join-Path $estimatedSpaceTestRoot 'MANYFILES_DEST'
+            [void][IO.Directory]::CreateDirectory($manyFilesSource)
+            [void][IO.Directory]::CreateDirectory($manyFilesDest)
+            for ($manyIndex = 0; $manyIndex -lt 2000; $manyIndex++) {
+                [IO.File]::WriteAllBytes(
+                    (Join-Path $manyFilesSource ('long_file_name_for_estimate_{0:D5}.dat' -f $manyIndex)),
+                    [byte[]]@(1))
+            }
+            $manyFilesRootLength = $manyFilesSource.TrimEnd('\', '/').Length
+            $manyFilesFloor = [int64]0
+            $manyFilesCount = 0
+            foreach ($manyFile in (Get-ChildItem -LiteralPath $manyFilesSource -Recurse -File -Force)) {
+                $manyRelative = $manyFile.FullName.Substring($manyFilesRootLength).TrimStart('\', '/')
+                $manyFilesFloor += [int64]$manyFile.Length + (2 * $manyRelative.Length) + 128
+                $manyFilesCount++
+            }
+            $estimateManyFiles = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BRAVOEXCH'; Source = (Join-Path $manyFilesSource '*'); Destination = $manyFilesDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $manyFilesCount -eq 2000 -and
+                    $estimateManyFiles.ComponentEstimates[0].SourceBytes -eq 2000 -and
+                    $estimateManyFiles.ComponentEstimates[0].EstimatedBytes -ge $manyFilesFloor
+                ) `
+                -Name 'Archive/EstimatedSpaceCountsPerFileMetadataForManySmallFiles' `
+                -Failure "#279: 2000 файлів по 1 B з довгими іменами мають давати оцінку не менше суми розмірів + 2*довжина імені + 128 B на файл (нижня межа $manyFilesFloor B); факт: EstimatedBytes=$($estimateManyFiles.ComponentEstimates[0].EstimatedBytes) (стара формула 2000*1.02 = 2040 B ігнорує метадані)"
+
+            $bigFileSource = Join-Path $estimatedSpaceTestRoot 'BIGFILE_SRC'
+            [void][IO.Directory]::CreateDirectory($bigFileSource)
+            [IO.File]::WriteAllBytes((Join-Path $bigFileSource 'big.bin'), (New-Object byte[] 1000000))
+            $estimateBigFile = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BRAVOEXCH'; Source = $bigFileSource; Destination = $manyFilesDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateBigFile.ComponentEstimates[0].SourceBytes -eq 1000000 -and
+                    $estimateBigFile.ComponentEstimates[0].EstimatedBytes -ge 1020000 -and
+                    $estimateBigFile.ComponentEstimates[0].EstimatedBytes -le (1020000 + 1024)
+                ) `
+                -Name 'Archive/EstimatedSpaceSingleLargeFileNotPenalised' `
+                -Failure "#279: один великий файл (1000000 B) має давати оцінку 1020000 B + не більше 1 KB метаданих; факт: EstimatedBytes=$($estimateBigFile.ComponentEstimates[0].EstimatedBytes)"
+
+            # #400: дерево з нульовим сумарним розміром, але з файлами, теж
+            # дає оцінку — метадані записів 7-Zip не зникають від того, що
+            # файли порожні. 3 порожні файли з іменем 11 символів:
+            # 3 * (256 + 2*11 + 2) = 840 B.
+            $zeroSizeSource = Join-Path $estimatedSpaceTestRoot 'ZEROSIZE_SRC'
+            $zeroSizeDest = Join-Path $estimatedSpaceTestRoot 'ZEROSIZE_DEST'
+            [void][IO.Directory]::CreateDirectory($zeroSizeSource)
+            [void][IO.Directory]::CreateDirectory($zeroSizeDest)
+            foreach ($zeroSizeName in @('empty_a.txt', 'empty_b.txt', 'empty_c.txt')) {
+                [IO.File]::WriteAllBytes((Join-Path $zeroSizeSource $zeroSizeName), (New-Object byte[] 0))
+            }
+            $estimateZeroSize = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BLOG'; Source = (Join-Path $zeroSizeSource '*'); Destination = $zeroSizeDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateZeroSize.ComponentEstimates[0].SourceBytes -eq 0 -and
+                    $estimateZeroSize.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
+                    $estimateZeroSize.ComponentEstimates[0].EstimatedBytes -eq 840
+                ) `
+                -Name 'Archive/EstimatedSpaceZeroSizeTreeCountsMetadata' `
+                -Failure "#400: 3 порожні файли мають давати оцінку за метаданими 3*(256+2*11+2) = 840 B, а не нульову/невідому; факт: SourceBytes=$($estimateZeroSize.ComponentEstimates[0].SourceBytes), basis=$($estimateZeroSize.ComponentEstimates[0].EstimateBasis), EstimatedBytes=$($estimateZeroSize.ComponentEstimates[0].EstimatedBytes)"
+
+            # #400: точне значення для вкладеного дерева. 7-Zip зберігає
+            # окремі записи для каталогів, тож вони рахуються так само, як
+            # файли (256 B + ім'я). Відносні імена: sub (3), sub\deep (8),
+            # sub\inner.bin (13, 10 B), sub\deep\x.bin (14, 5 B):
+            # ceil(15*1.02)=16 + 4*256 + (8+18+28+30) = 1124 B.
+            $nestedSource = Join-Path $estimatedSpaceTestRoot 'NESTED_SRC'
+            $nestedDest = Join-Path $estimatedSpaceTestRoot 'NESTED_DEST'
+            [void][IO.Directory]::CreateDirectory((Join-Path (Join-Path $nestedSource 'sub') 'deep'))
+            [void][IO.Directory]::CreateDirectory($nestedDest)
+            [IO.File]::WriteAllBytes((Join-Path (Join-Path $nestedSource 'sub') 'inner.bin'), (New-Object byte[] 10))
+            [IO.File]::WriteAllBytes((Join-Path (Join-Path (Join-Path $nestedSource 'sub') 'deep') 'x.bin'), (New-Object byte[] 5))
+            $estimateNested = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'MODEL'; Source = (Join-Path $nestedSource '*'); Destination = $nestedDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateNested.ComponentEstimates[0].SourceBytes -eq 15 -and
+                    $estimateNested.ComponentEstimates[0].SourceFileCount -eq 2 -and
+                    $estimateNested.ComponentEstimates[0].EstimatedBytes -eq 1124
+                ) `
+                -Name 'Archive/EstimatedSpaceNestedTreeExactWithDirectoryEntries' `
+                -Failure "#400: вкладене дерево (2 файли, 2 каталоги) має давати рівно 16 + 4*256 + 84 = 1124 B (каталоги рахуються як записи 7-Zip); факт: SourceBytes=$($estimateNested.ComponentEstimates[0].SourceBytes), files=$($estimateNested.ComponentEstimates[0].SourceFileCount), EstimatedBytes=$($estimateNested.ComponentEstimates[0].EstimatedBytes)"
         }
 
         # D: два компоненти на одному диску — потреби сумуються на цей диск,
@@ -12606,6 +13158,81 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Health/StaleGenerationDiagnosisKeepsKindAndComponent' `
         -Failure 'Diagnosis — додаткове поле: Kind=LocalBackupGeneration, Component=Generation і Reason stale-issue не змінюються (action text, Operations, exit code)'
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.SftpDeferredMessage' -DependsOn 'Root/Runtime') { try {
+    # #303: коли SFTP-перевірку відкладено через зайнятий WinSCP, перевірки
+    # не було. Повідомлення не мають показувати SFTP/BAZA SFTP як справні;
+    # контрольний прогін без відкладення показує ті самі рядки як справні.
+    $sftpDeferredMessageModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Format-FileSize', 'Format-BackupAge', 'ConvertTo-BRAVOUtcDateTime', 'Get-BRAVOUtcAge',
+            'Get-HealthIssueComponentName', 'ConvertTo-NotificationLiteralText', 'Format-HealthIssueFileName',
+            'Format-CompactLocalIssue', 'Format-CompactSFTPIssue', 'Format-CompactSMBIssue',
+            'Get-BRAVOHealthCollapsedCloudIssues', 'Get-BRAVOHealthIssueActionText', 'New-SlackAlertMessage',
+            'New-SlackSuccessMessage'
+        )
+    $sftpDeferredMessages = @{}
+    # Контроль іде першим і прапорець не задає взагалі — як наявні виклики
+    # поза основним потоком (StrictMode не має падати на неініціалізованому прапорці).
+    foreach ($sftpDeferredCase in @($false, $true)) {
+        $sftpDeferredMessages[$sftpDeferredCase] = & $sftpDeferredMessageModule {
+            param([bool]$Deferred)
+            Set-StrictMode -Version Latest
+            $script:NotificationProvider = 'slack'
+            if ($Deferred) { $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $true }
+            $script:healthNotInstalledComponents = @()
+            $script:healthLatestArchives = @{}
+            $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+            $backupMonitoring = [pscustomobject]@{
+                MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'
+                SFTP = [pscustomobject]@{ Enabled = $true; CheckBAZASynchronization = $true; CheckArchiveUploads = $true }
+                SMB = [pscustomobject]@{ Enabled = $false; CheckArchiveCopies = $false }
+            }
+            $storageEffective = [pscustomobject]@{
+                SFTP = [pscustomobject]@{ Enabled = $true; ArchiveUpload = $true }
+                SMB = [pscustomobject]@{ Enabled = $false; ArchiveCopy = $false }
+            }
+            $bazaAppLocalHealthEnabled = $false; $bazaWWWLocalHealthEnabled = $false
+            $bazaAppSFTPHealthEnabled = $true; $bazaWWWSFTPHealthEnabled = $false
+            $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+            function Get-HostInformation { return $null }
+            function Get-EnabledBackupComponentNames { return @() }
+            function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+            function Format-BRAVOOperatorStatusLine { param($Status, $Icon, $Name, $Detail) return "[$Status] $Name — $Detail" }
+            function New-BRAVOOperatorNotificationMessage { param($ResultLines, $ReasonLines) return (@($ReasonLines) + @($ResultLines)) -join "`n" }
+            $localIssue = [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; SizeBytes = 1; Diagnosis = 'завдання BRAVO_ARCHIV вимкнене' }
+            [pscustomobject]@{
+                Alert = [string](New-SlackAlertMessage -Issues @($localIssue) -Duration ([timespan]::FromSeconds(1)))
+                Success = [string](New-SlackSuccessMessage -Duration ([timespan]::FromSeconds(1)))
+            }
+        } $sftpDeferredCase
+    }
+    $sftpDeferredAlert = [string]$sftpDeferredMessages[$true].Alert
+    $sftpDeferredSuccess = [string]$sftpDeferredMessages[$true].Success
+    $sftpCheckedAlert = [string]$sftpDeferredMessages[$false].Alert
+    $sftpCheckedSuccess = [string]$sftpDeferredMessages[$false].Success
+    Test-BRAVOCondition `
+        -Condition (
+            $sftpCheckedAlert -match 'BAZA_APP — SFTP актуальна' -and
+            $sftpDeferredAlert -notmatch 'SFTP актуальн' -and
+            $sftpDeferredAlert -match 'BAZA_APP — SFTP: перевірку відкладено'
+        ) `
+        -Name 'Health/DeferredSftpAlertDoesNotClaimBazaSftpCurrent' `
+        -Failure "за відкладеної SFTP-перевірки алерт не має писати «SFTP актуальна», а має показати відкладення; відкладено: $sftpDeferredAlert ||| контроль: $sftpCheckedAlert"
+    Test-BRAVOCondition `
+        -Condition (
+            $sftpCheckedSuccess -match '\[SUCCESS\] SFTP — ' -and
+            $sftpCheckedSuccess -match '\[SUCCESS\] BAZA_APP — синхронізовано' -and
+            $sftpDeferredSuccess -notmatch '\[SUCCESS\] SFTP' -and
+            $sftpDeferredSuccess -notmatch '\[SUCCESS\] BAZA_APP' -and
+            $sftpDeferredSuccess -notmatch 'синхронізовано' -and
+            $sftpDeferredSuccess -match '\[WARNING\] SFTP — перевірку відкладено' -and
+            $sftpDeferredSuccess -match '\[WARNING\] BAZA_APP — перевірку відкладено' -and
+            $sftpDeferredSuccess -match '\[SUCCESS\] Local'
+        ) `
+        -Name 'Health/DeferredSftpSuccessMessageShowsSkippedNotOk' `
+        -Failure "за відкладеної SFTP-перевірки рядки SFTP і BAZA_APP мають бути WARNING «перевірку відкладено», а не SUCCESS; відкладено: $sftpDeferredSuccess ||| контроль: $sftpCheckedSuccess"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.SftpDeferredMessage' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.LocalSyncIssueWithoutExitCode' -DependsOn 'Root/Runtime') { try {
     # #286: проблема LocalSynchronization без поля ExitCode (7 з 9 гілок
     # Get-BAZALocalSyncHealthIssues) валила Health із кодом 90 під StrictMode:
@@ -19726,7 +20353,23 @@ try {
                 # Ordinal-перевірка першого символу: культурна StartsWith
                 # ігнорує U+FEFF (ignorable) і дала б true для будь-якого рядка.
                 $hasBomPrefix = $Secret.Length -gt 0 -and $Secret[0] -eq [char]0xFEFF
-                $opened = if ($leaf -like 'legacy*') { $hasBomPrefix } else { -not $hasBomPrefix }
+                # #300: legacy-архів, на якому друга (BOM) спроба не завершує
+                # перевірку (таймаут) — перша дає password-failure з кодом 2.
+                if ($leaf -like 'fallbacktimeout*' -and $hasBomPrefix) {
+                    return New-Object PSObject -Property @{
+                        Success = $false; ExitCode = $null; Description = 'перевищено час очікування'; TimedOut = $true
+                        StandardOutput = ''; StandardError = ''; Error = $null
+                    }
+                }
+                # #300: друга (BOM) спроба завершується кодом 2 з локалізованим
+                # системним текстом (відмова доступу), без повідомлень 7-Zip про вміст.
+                if ($leaf -like 'fallbackaccess*' -and $hasBomPrefix) {
+                    return New-Object PSObject -Property @{
+                        Success = $false; ExitCode = 2; Description = 'Fatal error'; TimedOut = $false; Error = $null
+                        StandardOutput = ''; StandardError = ('ERROR: ' + [char]0x0412 + [char]0x0456 + [char]0x0434 + [char]0x043C + [char]0x043E + [char]0x0432 + [char]0x043B + [char]0x0435 + [char]0x043D + [char]0x043E + ' ' + [char]0x0432 + ' ' + [char]0x0434 + [char]0x043E + [char]0x0441 + [char]0x0442 + [char]0x0443 + [char]0x043F + [char]0x0456 + '.')
+                    }
+                }
+                $opened = if ($leaf -like 'legacy*') { $hasBomPrefix } elseif ($leaf -like 'fallbacktimeout*' -or $leaf -like 'fallbackaccess*') { $false } else { -not $hasBomPrefix }
                 if ($opened) {
                     return New-Object PSObject -Property @{
                         Success = $true; ExitCode = 0; Description = 'OK'; TimedOut = $false
@@ -19786,6 +20429,104 @@ try {
             -Condition ($t006FallbackWarnings.Count -gt 0 -and -not ($t006FallbackWarnings[0].Message -match '5\.2\.0 під UTF-8|до 5\.2\.0')) `
             -Name "LegacyBomFallback/WarningDoesNotClaimPre520Only" `
             -Failure "Текст попередження має існувати й не стверджувати, що такі архіви створені лише версіями до 5.2.0 (BOM-префікс давали й 5.2.x): $(@($t006FallbackWarnings | ForEach-Object { $_.Message }) -join ' | ')"
+
+        # #300: друга (legacy BOM) спроба не завершила перевірку (таймаут) —
+        # повертається перша спроба з кодом 2, але результат позначено як
+        # незавершену перевірку, і retention-класифікація НЕ вважає його
+        # доведеним пошкодженням архіву (fail-closed).
+        $t006FallbackTimeoutPath = Join-Path ([IO.Path]::GetTempPath()) 'fallbacktimeout_MODEL.7z'
+        $t006FallbackTimeoutResult = Invoke-BRAVOSevenZipIntegrityTest `
+            -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackTimeoutPath -Password $t006Secret -TimeoutSeconds 5
+        $t006WrongLegacyResult = Invoke-BRAVOSevenZipIntegrityTest `
+            -SevenZipPath 'stub-7za' -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'normal_WRONG.7z') -Password ([char]0xFEFF + $t006Secret) -TimeoutSeconds 5
+        $t006FallbackTimeoutInfo = @{}
+        $t006FallbackTimeoutEntries = New-Object System.Collections.Generic.List[object]
+        $t006FallbackTimeoutLogger = & { param($t006FallbackTimeoutEntries) { param($Message, $Level) $t006FallbackTimeoutEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006FallbackTimeoutEntries
+        $t006FallbackTimeoutHelper = Test-SevenZipArchiveIntegrity `
+            -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackTimeoutPath -Password $t006Secret `
+            -Logger $t006FallbackTimeoutLogger -ArchiveFailureLevel 'WARNING' -FailureInfo $t006FallbackTimeoutInfo
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$t006FallbackTimeoutResult.Success -and
+                $null -ne $t006FallbackTimeoutResult.PSObject.Properties['FallbackAttemptOperationalFailure'] -and
+                [bool]$t006FallbackTimeoutResult.FallbackAttemptOperationalFailure -and
+                -not [bool]$t006FallbackTimeoutHelper -and
+                $t006FallbackTimeoutInfo.ContainsKey('ArchiveSpecific') -and
+                -not [bool]$t006FallbackTimeoutInfo['ArchiveSpecific'] -and
+                @($t006FallbackTimeoutEntries | Where-Object { $_.Level -eq 'ERROR' }).Count -ge 1
+            ) `
+            -Name "LegacyBomFallback/FallbackAttemptTimeoutIsNotArchiveSpecific" `
+            -Failure "таймаут другої (legacy BOM) спроби має позначати результат FallbackAttemptOperationalFailure і не класифікуватись як archive-specific (рядок лишається ERROR); success=$($t006FallbackTimeoutResult.Success), marker=$($t006FallbackTimeoutResult.PSObject.Properties['FallbackAttemptOperationalFailure']), archiveSpecific=$($t006FallbackTimeoutInfo['ArchiveSpecific'])"
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$t006WrongLegacyResult.Success -and
+                (($null -eq $t006WrongLegacyResult.PSObject.Properties['FallbackAttemptOperationalFailure']) -or
+                 -not [bool]$t006WrongLegacyResult.FallbackAttemptOperationalFailure)
+            ) `
+            -Name "LegacyBomFallback/CompletedFallbackFailureIsNotOperational" `
+            -Failure "якщо обидві спроби завершили перевірку з кодом 2, результат не має позначатися як незавершена перевірка; marker=$($t006WrongLegacyResult.PSObject.Properties['FallbackAttemptOperationalFailure'])"
+
+        # #300: друга (legacy BOM) спроба повернула код 2 з локалізованою
+        # відмовою доступу (без повідомлень 7-Zip про вміст) — перевірку не
+        # завершено; перша спроба з "Wrong password" не стає доказом
+        # пошкодження архіву.
+        $t006FallbackAccessPath = Join-Path ([IO.Path]::GetTempPath()) 'fallbackaccess_MODEL.7z'
+        $t006FallbackAccessResult = Invoke-BRAVOSevenZipIntegrityTest `
+            -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackAccessPath -Password $t006Secret -TimeoutSeconds 5
+        $t006FallbackAccessInfo = @{}
+        $t006FallbackAccessHelper = Test-SevenZipArchiveIntegrity `
+            -SevenZipPath 'stub-7za' -ArchivePath $t006FallbackAccessPath -Password $t006Secret `
+            -Logger $t006FallbackTimeoutLogger -ArchiveFailureLevel 'WARNING' -FailureInfo $t006FallbackAccessInfo
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$t006FallbackAccessResult.Success -and
+                $null -ne $t006FallbackAccessResult.PSObject.Properties['FallbackAttemptOperationalFailure'] -and
+                [bool]$t006FallbackAccessResult.FallbackAttemptOperationalFailure -and
+                -not [bool]$t006FallbackAccessHelper -and
+                $t006FallbackAccessInfo.ContainsKey('ArchiveSpecific') -and
+                -not [bool]$t006FallbackAccessInfo['ArchiveSpecific']
+            ) `
+            -Name "LegacyBomFallback/FallbackAttemptLocalizedAccessFailureIsNotArchiveSpecific" `
+            -Failure "код 2 другої (legacy BOM) спроби з локалізованою відмовою доступу має позначати FallbackAttemptOperationalFailure і не класифікуватись як archive-specific; marker=$($t006FallbackAccessResult.PSObject.Properties['FallbackAttemptOperationalFailure']), archiveSpecific=$($t006FallbackAccessInfo['ArchiveSpecific'])"
+
+        # #300: валідатор нічого не повернув — Test-SevenZipArchiveIntegrity
+        # повертає структурований збій виконання (false, не archive-specific),
+        # а не кидає виняток StrictMode до встановлення FailureInfo.
+        $t006NullInfo = @{}
+        $t006NullThrew = ''
+        $t006NullHelper = $null
+        try {
+            # Dot-source у верхню область модуля: StrictMode діє на самий
+            # Test-SevenZipArchiveIntegrity (виклик з StrictMode-області
+            # конфігураційного завантажувача), стаб перекриває імпорт.
+            . (Get-Module -Name 'BRAVO.ArchiveHelpers') {
+                Set-StrictMode -Version Latest
+                function script:Invoke-BRAVOSevenZipIntegrityTest {
+                    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                        'PSAvoidUsingPlainTextForPassword', 'Password',
+                        Justification = 'Self-test стаб валідатора: той самий контракт параметрів; значення фікстурне.')]
+                    param([string]$SevenZipPath, [string]$ArchivePath, [string]$Password, [int]$TimeoutSeconds)
+                }
+            }
+            $t006NullHelper = Test-SevenZipArchiveIntegrity `
+                -SevenZipPath 'stub-7za' -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'nullresult_MODEL.7z') -Password $t006Secret `
+                -Logger $t006FallbackTimeoutLogger -ArchiveFailureLevel 'WARNING' -FailureInfo $t006NullInfo
+        } catch {
+            $t006NullThrew = $_.Exception.Message
+        } finally {
+            # Стаб і StrictMode змінили область модуля — повторний імпорт
+            # (-Force, нова область) повертає справжній ланцюг для наступних перевірок.
+            Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrEmpty($t006NullThrew) -and
+                $false -eq $t006NullHelper -and
+                $t006NullInfo.ContainsKey('ArchiveSpecific') -and
+                -not [bool]$t006NullInfo['ArchiveSpecific']
+            ) `
+            -Name "ArchiveHelpers/IntegrityNullValidatorResultIsOperationalFailure" `
+            -Failure "порожній результат валідатора має давати false і ArchiveSpecific=false без винятку; threw='$t006NullThrew', result=$t006NullHelper, archiveSpecific=$($t006NullInfo['ArchiveSpecific'])"
 
         $t006NormalEntries = New-Object System.Collections.Generic.List[object]
         $t006NormalLogger = & { param($t006NormalEntries) { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure() } $t006NormalEntries
@@ -21630,6 +22371,482 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure ("коли після видалення лишається рівно один файл із префіксом, `$remainingFiles.Count не повинен кидати виняток під Set-StrictMode; кинуто: {0}" -f $restoreCleanupRemainingErrorMessage)
 
     # ================================================================
+    # #300: retention (Remove-OldRestoreArchives) лише ОЦІНЮЄ старі архіви.
+    # Зламаний старий архів дає WARNING "не зараховано як точку
+    # відновлення", але НЕ має виставляти critical/restoreIntegrity-
+    # прапорці (інакше кожен нічний прогін завершується кодом 41 через
+    # архів, який ніхто не відновлює). Реальні функції (AST):
+    # Remove-OldRestoreArchives, Test-BRAVOMaintenanceSevenZipArchiveIntegrity,
+    # канонічний Test-SevenZipArchiveIntegrity; застабовано лише процесний
+    # шар 7-Zip (Invoke-BRAVOSevenZipIntegrityTest) — як у Verify-Backup-пробах.
+    # Контроль області дії: ПРЯМИЙ (не retention) виклик обгортки на тому
+    # самому зламаному архіві мусить, як і раніше, виставляти обидва прапорці.
+    # ================================================================
+    $retentionIntegritySourceText = (
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        ) + "`n" +
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1"),
+            [Text.Encoding]::UTF8
+        )
+    )
+    $retentionIntegrityModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $retentionIntegritySourceText `
+        -FunctionNames @(
+            'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
+            'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
+            'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            'Register-BRAVOLegacyBomPasswordFallback'
+        )
+    $retentionIntegrityStubScriptText = {
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO')
+            [void]$script:retentionIntegrityLogLines.Add("[$Level] $Message")
+        }
+        function Get-BRAVOFileHash {
+            param([string]$Path, [string]$Algorithm)
+            return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
+        }
+        function Invoke-BRAVOSevenZipIntegrityTest {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSAvoidUsingPlainTextForPassword', 'Password',
+                Justification = 'Self-test stub: сигнатура справжнього Invoke-BRAVOSevenZipIntegrityTest.')]
+            param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+            $null = $SevenZipPath
+            $null = $Password
+            $null = $TimeoutSeconds
+            if ([IO.File]::ReadAllText($ArchivePath) -ceq 'BRAVO-SELFTEST-BROKEN-ARCHIVE') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'
+                    StandardOutput = ''; StandardError = 'ERROR: Data Error'
+                }
+            }
+            return New-Object PSObject -Property @{
+                Success = $true; ExitCode = 0; Description = 'No error'
+                StandardOutput = 'Everything is Ok'; StandardError = ''
+            }
+        }
+    }.ToString()
+    $retentionIntegrityPrefix = 'RETINTEG'
+    $retentionIntegrityBrokenName = "${retentionIntegrityPrefix}_before_20260101_0100.mdz"
+    $retentionIntegrityRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_RETENTION_INTEGRITY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($retentionIntegrityRoot)
+    $retentionIntegrityOutcome = $null
+    try {
+        # Три сесії; найстаріша (20260101) зламана для 7z t, але SHA512
+        # збігається — тож retention дійде саме до 7z-перевірки.
+        foreach ($sessionTime in @('20260101_0100', '20260102_0100', '20260103_0100')) {
+            $fileName = "${retentionIntegrityPrefix}_before_$sessionTime.mdz"
+            $archivePath = Join-Path $retentionIntegrityRoot $fileName
+            $content = if ($sessionTime -eq '20260101_0100') { 'BRAVO-SELFTEST-BROKEN-ARCHIVE' } else { "synthetic-ok-$sessionTime" }
+            [IO.File]::WriteAllText($archivePath, $content)
+            $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash
+            "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+        }
+        $retentionIntegrityBrokenPath = Join-Path $retentionIntegrityRoot $retentionIntegrityBrokenName
+
+        $retentionIntegrityOutcome = & $retentionIntegrityModule {
+            param($Path, $Prefix, $BrokenPath, $StubScriptText)
+            Set-StrictMode -Version Latest
+            . ([scriptblock]::Create($StubScriptText))
+            $script:retentionIntegrityLogLines = New-Object System.Collections.ArrayList
+            $script:ArchivePrefixRegex = [regex]::Escape($Prefix)
+            $script:ARC_PATH = 'unused-stub-path'
+            $script:ArchivePassword = 'selftest-fixture'
+            $script:SevenZipIntegrityTestTimeoutSeconds = 60
+            $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
+
+            # 1) retention
+            $script:criticalErrorOccurred = $false
+            $script:restoreIntegrityFailed = $false
+            $retentionThrew = $null
+            try {
+                Remove-OldRestoreArchives -Path $Path -ArchivePrefix $Prefix -KeepCount 2 -InvalidRetentionDays 30
+            } catch {
+                $retentionThrew = $_.Exception.Message
+            }
+            $retentionCritical = [bool]$script:criticalErrorOccurred
+            $retentionRestoreFailed = [bool]$script:restoreIntegrityFailed
+            $retentionLog = (@($script:retentionIntegrityLogLines) -join "`n")
+
+            # 2) прямий виклик обгортки (не retention) на зламаному архіві
+            $script:criticalErrorOccurred = $false
+            $script:restoreIntegrityFailed = $false
+            $directResult = Test-BRAVOMaintenanceSevenZipArchiveIntegrity -SevenZipPath 'unused-stub-path' -ArchivePath $BrokenPath
+            [pscustomobject]@{
+                RetentionThrew = $retentionThrew
+                RetentionCritical = $retentionCritical
+                RetentionRestoreFailed = $retentionRestoreFailed
+                RetentionLog = $retentionLog
+                DirectResult = $directResult
+                DirectCritical = [bool]$script:criticalErrorOccurred
+                DirectRestoreFailed = [bool]$script:restoreIntegrityFailed
+            }
+        } $retentionIntegrityRoot $retentionIntegrityPrefix $retentionIntegrityBrokenPath $retentionIntegrityStubScriptText
+    } finally {
+        if (Test-Path -LiteralPath $retentionIntegrityRoot) {
+            Remove-Item -LiteralPath $retentionIntegrityRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $retentionIntegrityWarningPattern = '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ' +
+        [regex]::Escape($retentionIntegrityBrokenName)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionIntegrityOutcome -and
+            $null -eq $retentionIntegrityOutcome.RetentionThrew -and
+            -not $retentionIntegrityOutcome.RetentionCritical -and
+            -not $retentionIntegrityOutcome.RetentionRestoreFailed
+        ) `
+        -Name "Maintenance/RetentionBrokenOldArchiveDoesNotSetFailureFlags" `
+        -Failure ("retention, що лише оцінює зламаний старий архів, не повинен виставляти `$script:criticalErrorOccurred / `$script:restoreIntegrityFailed (інакше кожен прогін = exit 41); critical={0}, restoreIntegrityFailed={1}, threw={2}" -f $retentionIntegrityOutcome.RetentionCritical, $retentionIntegrityOutcome.RetentionRestoreFailed, $retentionIntegrityOutcome.RetentionThrew)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionIntegrityOutcome -and
+            [regex]::IsMatch([string]$retentionIntegrityOutcome.RetentionLog, $retentionIntegrityWarningPattern)
+        ) `
+        -Name "Maintenance/RetentionBrokenOldArchiveStillLogsWarning" `
+        -Failure ("retention має і далі писати WARNING про зламаний архів {0}; журнал: {1}" -f $retentionIntegrityBrokenName, $retentionIntegrityOutcome.RetentionLog)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionIntegrityOutcome -and
+            $retentionIntegrityOutcome.DirectResult -eq $false -and
+            $retentionIntegrityOutcome.DirectCritical -and
+            $retentionIntegrityOutcome.DirectRestoreFailed
+        ) `
+        -Name "Maintenance/DirectIntegrityCheckStillSetsFailureFlags" `
+        -Failure "прямий (не retention) виклик Test-BRAVOMaintenanceSevenZipArchiveIntegrity на зламаному архіві має, як і раніше, повертати `$false і виставляти обидва прапорці"
+
+    # ================================================================
+    # #300 (follow-up review): -NoFailureFlags у retention дозволено лише
+    # для СТАРІШИХ сесій і лише для archive-specific збою (7-Zip
+    # відпрацював і забракував архів). Критичними (critical +
+    # restoreIntegrityFailed, exit 41) лишаються: зламана НАЙНОВІША
+    # точка відновлення; відсутність жодної придатної точки; збій
+    # ВИКОНАННЯ перевірки (немає 7-Zip / таймаут) навіть для старої
+    # сесії. На warning-only шляху рядок "не пройдена" — WARNING, не
+    # ERROR; набори збережених/видалених файлів — як до зміни.
+    # Реальні функції (AST): Remove-OldRestoreArchives,
+    # Test-BRAVOMaintenanceSevenZipArchiveIntegrity, канонічний
+    # Test-SevenZipArchiveIntegrity; застабовано лише процесний шар
+    # 7-Zip (Invoke-BRAVOSevenZipIntegrityTest), повертаючи ту саму
+    # форму результату, що Invoke-BRAVOSevenZipIntegrityTestCore.
+    # ================================================================
+    $retentionFollowupModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $retentionIntegritySourceText `
+        -FunctionNames @(
+            'Remove-OldRestoreArchives', 'Get-SHA512HashCompatible',
+            'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
+            'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            'Register-BRAVOLegacyBomPasswordFallback'
+        )
+    $retentionFollowupStubScriptText = {
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO')
+            [void]$script:retentionFollowupLogLines.Add("[$Level] $Message")
+        }
+        function Get-BRAVOFileHash {
+            param([string]$Path, [string]$Algorithm)
+            return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
+        }
+        function Invoke-BRAVOSevenZipIntegrityTest {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSAvoidUsingPlainTextForPassword', 'Password',
+                Justification = 'Self-test stub: сигнатура справжнього Invoke-BRAVOSevenZipIntegrityTest.')]
+            param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+            $null = $Password
+            $null = $TimeoutSeconds
+            $stubArchiveText = [IO.File]::ReadAllText($ArchivePath)
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-BROKEN-ARCHIVE') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = 'ERROR: Data Error'
+                }
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-THROWS') {
+                # #300: сам валідатор кидає виняток (а не повертає результат).
+                throw 'BRAVO self-test: валідатор 7-Zip кинув виняток'
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-MISSING') {
+                # Форма Invoke-BRAVOSevenZipIntegrityTestCore, коли 7-Zip
+                # не знайдено: виняток до запуску процесу, ExitCode $null.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = $null
+                    Description = "7-Zip не знайдено: $SevenZipPath"; TimedOut = $false
+                    Error = "7-Zip не знайдено: $SevenZipPath"
+                    StandardOutput = ''; StandardError = ''
+                }
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-LOCALIZED-ACCESS-DENIED') {
+                # #300: код 2 з локалізованим системним текстом (не англійська
+                # Windows) і без власних повідомлень 7-Zip про вміст архіву.
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'; TimedOut = $false; Error = $null
+                    StandardOutput = ''; StandardError = ('ERROR: ' + [char]0x0412 + [char]0x0456 + [char]0x0434 + [char]0x043C + [char]0x043E + [char]0x0432 + [char]0x043B + [char]0x0435 + [char]0x043D + [char]0x043E + ' ' + [char]0x0432 + ' ' + [char]0x0434 + [char]0x043E + [char]0x0441 + [char]0x0442 + [char]0x0443 + [char]0x043F + [char]0x0456 + '.')
+                }
+            }
+            if ($stubArchiveText -ceq 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = $null
+                    Description = 'перевищено час очікування'; TimedOut = $true; Error = $null
+                    StandardOutput = ''; StandardError = ''
+                }
+            }
+            return New-Object PSObject -Property @{
+                Success = $true; ExitCode = 0; Description = 'No error'
+                TimedOut = $false; Error = $null
+                StandardOutput = 'Everything is Ok'; StandardError = ''
+            }
+        }
+    }.ToString()
+    $retentionFollowupPrefix = 'RETFUP'
+    $retentionFollowupSession = {
+        param([string]$Session, [string]$Content, [bool]$Stale = $false, [bool]$NoHash = $false)
+        return @{ Session = $Session; Content = $Content; Stale = $Stale; NoHash = $NoHash }
+    }
+    $retentionFollowupRunScenario = {
+        param([string]$ScenarioName, [object[]]$Sessions, [int]$KeepCount)
+        $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+            ("BRAVO_RETENTION_FOLLOWUP_{0}_{1}" -f $ScenarioName, [guid]::NewGuid().ToString("N"))
+        [void][IO.Directory]::CreateDirectory($scenarioRoot)
+        try {
+            foreach ($scenarioSession in $Sessions) {
+                $fileName = "{0}_before_{1}.mdz" -f $retentionFollowupPrefix, $scenarioSession['Session']
+                $archivePath = Join-Path $scenarioRoot $fileName
+                [IO.File]::WriteAllText($archivePath, [string]$scenarioSession['Content'])
+                if (-not $scenarioSession['NoHash']) {
+                    $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash
+                    "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+                }
+                if ($scenarioSession['Stale']) {
+                    [IO.File]::SetLastWriteTime($archivePath, (Get-Date).AddDays(-90))
+                }
+            }
+            $scenarioOutcome = & $retentionFollowupModule {
+                param($Path, $Prefix, $StubScriptText, $Keep)
+                Set-StrictMode -Version Latest
+                . ([scriptblock]::Create($StubScriptText))
+                $script:retentionFollowupLogLines = New-Object System.Collections.ArrayList
+                $script:ArchivePrefixRegex = [regex]::Escape($Prefix)
+                $script:ARC_PATH = 'unused-stub-path'
+                $script:ArchivePassword = 'selftest-fixture'
+                $script:SevenZipIntegrityTestTimeoutSeconds = 60
+                $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
+                $script:criticalErrorOccurred = $false
+                $script:restoreIntegrityFailed = $false
+                $retentionThrew = $null
+                try {
+                    Remove-OldRestoreArchives -Path $Path -ArchivePrefix $Prefix -KeepCount $Keep -InvalidRetentionDays 30
+                } catch {
+                    $retentionThrew = $_.Exception.Message
+                }
+                [pscustomobject]@{
+                    Threw = $retentionThrew
+                    Critical = [bool]$script:criticalErrorOccurred
+                    RestoreFailed = [bool]$script:restoreIntegrityFailed
+                    Log = (@($script:retentionFollowupLogLines) -join "`n")
+                }
+            } $scenarioRoot $retentionFollowupPrefix $retentionFollowupStubScriptText $KeepCount
+            $remainingNames = @(
+                Get-ChildItem -LiteralPath $scenarioRoot -File -ErrorAction SilentlyContinue |
+                    ForEach-Object { $_.Name } | Sort-Object
+            )
+            $scenarioOutcome | Add-Member -NotePropertyName Remaining -NotePropertyValue ($remainingNames -join '|') -Force
+            return $scenarioOutcome
+        } finally {
+            if (Test-Path -LiteralPath $scenarioRoot) {
+                Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    $retentionFollowupExpectedFiles = {
+        param([string[]]$SessionNames)
+        $expectedNames = foreach ($expectedSession in $SessionNames) {
+            "{0}_before_{1}.mdz" -f $retentionFollowupPrefix, $expectedSession
+            "{0}_before_{1}.mdz.sha512" -f $retentionFollowupPrefix, $expectedSession
+        }
+        return (@($expectedNames | Sort-Object) -join '|')
+    }
+    $retentionFollowupFailedLinePattern = 'Перев[iі]рка ц[iі]л[iі]сност[iі] 7-Zip не пройдена'
+    $retentionFollowupBroken = 'BRAVO-SELFTEST-BROKEN-ARCHIVE'
+
+    # (a) Зламані СТАРІ сесії (одна свіжа за mtime, одна застаріла) при
+    # трьох валідних новіших, KeepCount=2. Як і до зміни: свіжа зламана
+    # лишається (непридатна, але не старша за 30 днів), застаріла зламана
+    # видаляється, найстаріша валідна понад ліміт видаляється.
+    $retentionFollowupOld = & $retentionFollowupRunScenario 'OldBroken' @(
+        (& $retentionFollowupSession '20260101_0100' $retentionFollowupBroken),
+        (& $retentionFollowupSession '20260101_0200' $retentionFollowupBroken $true),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2'),
+        (& $retentionFollowupSession '20260104_0100' 'synthetic-ok-3')
+    ) 2
+    $retentionFollowupOldExpected = & $retentionFollowupExpectedFiles @('20260101_0100', '20260103_0100', '20260104_0100')
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupOld -and
+            $null -eq $retentionFollowupOld.Threw -and
+            -not $retentionFollowupOld.Critical -and
+            -not $retentionFollowupOld.RestoreFailed -and
+            $retentionFollowupOld.Remaining -ceq $retentionFollowupOldExpected
+        ) `
+        -Name "Maintenance/RetentionOldBrokenArchiveNoFlagsSameKeepDeleteSet" `
+        -Failure ("зламані старі сесії: без прапорців і з тим самим набором збережених/видалених файлів; critical={0}, restoreIntegrityFailed={1}, threw={2}, лишилось=[{3}], очікувано=[{4}]" -f $retentionFollowupOld.Critical, $retentionFollowupOld.RestoreFailed, $retentionFollowupOld.Threw, $retentionFollowupOld.Remaining, $retentionFollowupOldExpected)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupOld -and
+            [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[WARNING\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100') -and
+            [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ' + [regex]::Escape("${retentionFollowupPrefix}_before_20260101_0100.mdz")) -and
+            -not [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[ERROR\]')
+        ) `
+        -Name "Maintenance/RetentionOldBrokenArchiveLogsWarningNotError" `
+        -Failure ("warning-only шлях (стара сесія, archive-specific збій) має писати рядок 'не пройдена' і 'не зараховано' рівнем WARNING і жодного ERROR; журнал: {0}" -f $retentionFollowupOld.Log)
+
+    # (b) Зламана НАЙНОВІША точка відновлення — критично, як до #300.
+    $retentionFollowupNewest = & $retentionFollowupRunScenario 'NewestBroken' @(
+        (& $retentionFollowupSession '20260101_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-2'),
+        (& $retentionFollowupSession '20260103_0100' $retentionFollowupBroken)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupNewest -and
+            $null -eq $retentionFollowupNewest.Threw -and
+            $retentionFollowupNewest.Critical -and
+            $retentionFollowupNewest.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupNewest.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260103_0100') -and
+            $retentionFollowupNewest.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260101_0100', '20260102_0100', '20260103_0100'))
+        ) `
+        -Name "Maintenance/RetentionNewestBrokenRestorePointSetsFailureFlags" `
+        -Failure ("збій 7z t НАЙНОВІШОЇ сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed (exit 41) і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupNewest.Critical, $retentionFollowupNewest.RestoreFailed, $retentionFollowupNewest.Threw, $retentionFollowupNewest.Log)
+
+    # (c) Усі сесії зламані — жодної придатної точки відновлення.
+    $retentionFollowupAll = & $retentionFollowupRunScenario 'AllBroken' @(
+        (& $retentionFollowupSession '20260101_0100' $retentionFollowupBroken),
+        (& $retentionFollowupSession '20260102_0100' $retentionFollowupBroken)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupAll -and
+            $null -eq $retentionFollowupAll.Threw -and
+            $retentionFollowupAll.Critical -and
+            $retentionFollowupAll.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionAllRestorePointsBrokenSetsFailureFlags" `
+        -Failure ("коли зламані всі сесії, `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed мають бути виставлені; critical={0}, restoreIntegrityFailed={1}, threw={2}" -f $retentionFollowupAll.Critical, $retentionFollowupAll.RestoreFailed, $retentionFollowupAll.Threw)
+
+    # (c2) Найновіша сесія непридатна без 7z (немає .sha512), старіша
+    # зламана для 7z t — придатних точок 0; критично, як до #300.
+    $retentionFollowupNone = & $retentionFollowupRunScenario 'NoValidLeft' @(
+        (& $retentionFollowupSession '20260101_0100' $retentionFollowupBroken),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-unhashed' $false $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupNone -and
+            $null -eq $retentionFollowupNone.Threw -and
+            $retentionFollowupNone.Critical -and
+            $retentionFollowupNone.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionNoValidRestorePointLeftSetsFailureFlags" `
+        -Failure ("якщо після оцінки не лишилось жодної придатної точки відновлення через збій 7z t, прапорці мають бути виставлені; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupNone.Critical, $retentionFollowupNone.RestoreFailed, $retentionFollowupNone.Threw, $retentionFollowupNone.Log)
+
+    # (d) Стара сесія, але перевірка НЕ ВИКОНАЛАСЬ (немає 7-Zip / таймаут)
+    # — це не доказ проти архіву, а непрацюючий валідатор: fail-safe.
+    $retentionFollowupValidatorMissing = & $retentionFollowupRunScenario 'ValidatorMissing' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-VALIDATOR-MISSING'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2')
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupValidatorMissing -and
+            $null -eq $retentionFollowupValidatorMissing.Threw -and
+            $retentionFollowupValidatorMissing.Critical -and
+            $retentionFollowupValidatorMissing.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupValidatorMissing.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100')
+        ) `
+        -Name "Maintenance/RetentionOldArchiveValidatorMissingSetsFailureFlags" `
+        -Failure ("збій виконання 7z t (не archive-specific: 7-Zip не знайдено) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorMissing.Critical, $retentionFollowupValidatorMissing.RestoreFailed, $retentionFollowupValidatorMissing.Threw, $retentionFollowupValidatorMissing.Log)
+
+    $retentionFollowupValidatorTimeout = & $retentionFollowupRunScenario 'ValidatorTimeout' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-VALIDATOR-TIMEOUT'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2')
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupValidatorTimeout -and
+            $null -eq $retentionFollowupValidatorTimeout.Threw -and
+            $retentionFollowupValidatorTimeout.Critical -and
+            $retentionFollowupValidatorTimeout.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupValidatorTimeout.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100')
+        ) `
+        -Name "Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags" `
+        -Failure ("збій виконання 7z t (не archive-specific: таймаут) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorTimeout.Critical, $retentionFollowupValidatorTimeout.RestoreFailed, $retentionFollowupValidatorTimeout.Threw, $retentionFollowupValidatorTimeout.Log)
+
+    # (e) #300 (Codex 386-C4): код 2 з локалізованим текстом відмови доступу
+    # без власних повідомлень 7-Zip про вміст — збій виконання, не доказ
+    # пошкодження: навіть на старій сесії це ERROR і прапорці.
+    $retentionFollowupLocalizedDenied = & $retentionFollowupRunScenario 'LocalizedAccessDenied' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-LOCALIZED-ACCESS-DENIED'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2')
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupLocalizedDenied -and
+            $null -eq $retentionFollowupLocalizedDenied.Threw -and
+            $retentionFollowupLocalizedDenied.Critical -and
+            $retentionFollowupLocalizedDenied.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupLocalizedDenied.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100')
+        ) `
+        -Name "Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags" `
+        -Failure ("код 2 без власних повідомлень 7-Zip про вміст (локалізована відмова доступу) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupLocalizedDenied.Critical, $retentionFollowupLocalizedDenied.RestoreFailed, $retentionFollowupLocalizedDenied.Threw, $retentionFollowupLocalizedDenied.Log)
+
+    # (e2) #300 (Claude QA 386-Q2): перевірка 7z t старої сесії кинула
+    # виняток замість результату — перевірку не виконано, це збій виконання:
+    # прапорці виставляються навіть на старій сесії (fail-closed).
+    $retentionFollowupValidatorThrows = & $retentionFollowupRunScenario 'ValidatorThrows' @(
+        (& $retentionFollowupSession '20260101_0100' 'BRAVO-SELFTEST-VALIDATOR-THROWS'),
+        (& $retentionFollowupSession '20260102_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-2')
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupValidatorThrows -and
+            $null -eq $retentionFollowupValidatorThrows.Threw -and
+            $retentionFollowupValidatorThrows.Critical -and
+            $retentionFollowupValidatorThrows.RestoreFailed
+        ) `
+        -Name "Maintenance/RetentionValidatorExceptionSetsFailureFlags" `
+        -Failure ("виняток самої перевірки 7z t (а не результат) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorThrows.Critical, $retentionFollowupValidatorThrows.RestoreFailed, $retentionFollowupValidatorThrows.Threw, $retentionFollowupValidatorThrows.Log)
+
+    # (f) #300 (data-integrity F2): найновіша сесія непридатна лише через
+    # відсутній .sha512, друга — зламана (7z t). Друга новіша за БУДЬ-ЯКУ
+    # підтверджену точку відновлення, тож її збій критичний, а не WARNING.
+    $retentionFollowupNewestUnhashed = & $retentionFollowupRunScenario 'NewestUnhashed' @(
+        (& $retentionFollowupSession '20260101_0100' 'synthetic-ok-1'),
+        (& $retentionFollowupSession '20260102_0100' $retentionFollowupBroken),
+        (& $retentionFollowupSession '20260103_0100' 'synthetic-ok-unhashed' $false $true)
+    ) 2
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $retentionFollowupNewestUnhashed -and
+            $null -eq $retentionFollowupNewestUnhashed.Threw -and
+            $retentionFollowupNewestUnhashed.Critical -and
+            $retentionFollowupNewestUnhashed.RestoreFailed -and
+            [regex]::IsMatch([string]$retentionFollowupNewestUnhashed.Log, '(?m)^\[ERROR\] ' + $retentionFollowupFailedLinePattern + '.*20260102_0100')
+        ) `
+        -Name "Maintenance/RetentionBrokenNewerThanAnyValidPointSetsFailureFlags" `
+        -Failure ("збій 7z t сесії, новішої за всі підтверджені точки відновлення (найновіша непридатна лише через hash), має бути критичним; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupNewestUnhashed.Critical, $retentionFollowupNewestUnhashed.RestoreFailed, $retentionFollowupNewestUnhashed.Threw, $retentionFollowupNewestUnhashed.Log)
+
+    # ================================================================
     # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)
     # мусить РЕАЛЬНО перевіряти архів, а не лише писати .sha512 і
     # повертати $true для будь-якого наявного файлу. Реальні функції
@@ -23379,6 +24596,10 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_PREFLIGHT_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
     try {
+        # Корінь створюється заздалегідь: probe прибирає ВЕСЬ ланцюжок
+        # каталогів, які сам створив (#283), тож корінь, якого ще не було б,
+        # теж зник би, а нижче він потрібен як "каталог, що реально існує".
+        New-Item -ItemType Directory -Path $preflightTestRoot -Force | Out-Null
         $missingDirectory = Join-Path $preflightTestRoot "created\by\probe"
         $writeResult = & $dryRunProbeModule {
             param($Path)
@@ -23391,12 +24612,10 @@ function Get-BRAVOMaintenanceSummaryResult {
             param($Path)
             Test-BRAVOFileSystemReadAccess -Path $Path
         } (Join-Path $preflightTestRoot "no-such-directory")
-        # $preflightTestRoot (не $missingDirectory) — після фікса "cleanup
-        # порожнього probe-каталогу" сам $missingDirectory (лист .\created\
-        # by\probe) прибирається, якщо лишився порожнім; батьківський
-        # $preflightTestRoot прибирання не чіпає (лише сам $Path, не
-        # предків), тому лишається надійною ціллю для "read access на
-        # каталог, що реально існує".
+        # $preflightTestRoot (не $missingDirectory) — probe прибирає
+        # порожній ланцюжок .\created\by\probe, який сам створив, а
+        # $preflightTestRoot існував до probe і не чіпається, тому лишається
+        # надійною ціллю для "read access на каталог, що реально існує".
         $readExisting = & $dryRunProbeModule {
             param($Path)
             Test-BRAVOFileSystemReadAccess -Path $Path
@@ -23424,6 +24643,37 @@ function Get-BRAVOMaintenanceSummaryResult {
             ) `
             -Name 'Runtime/08-WriteProbeCleansUpEmptyCreatedDirectory' `
             -Failure 'write-probe має прибирати за собою каталог, який САМ створив, якщо після перевірки він лишився порожнім — "dry" run не повинен лишати побічний production-каталог на диску'
+        # #283: probe на <Dest>\.work, коли <Dest> ще немає, створює обидва
+        # каталоги; прибрати треба весь створений ланцюжок, а не лише .work.
+        $missingDestination = Join-Path $preflightTestRoot 'missing-dest'
+        $nestedWorkResult = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOFileSystemWriteAccess -Path $Path
+        } (Join-Path $missingDestination '.work')
+        Test-BRAVOCondition `
+            -Condition (
+                [bool]$nestedWorkResult.Success -and
+                -not (Test-Path -LiteralPath $missingDestination) -and
+                (Test-Path -LiteralPath $preflightTestRoot -PathType Container) -and
+                ([string]$nestedWorkResult.Detail).Contains('тимчасово створювався для перевірки й прибраний після неї')
+            ) `
+            -Name 'Runtime/08-WriteProbeRemovesCreatedEmptyAncestors' `
+            -Failure 'write-probe на <Dest>\.work не повинен лишати порожній <Dest>, який створив сам; наявний батьківський каталог має лишитися'
+        # Наявний (навіть порожній) предок не належить probe і лишається.
+        $existingParent = Join-Path $preflightTestRoot 'existing-parent'
+        New-Item -ItemType Directory -Path $existingParent -Force | Out-Null
+        $existingParentResult = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOFileSystemWriteAccess -Path $Path
+        } (Join-Path $existingParent 'new-dest\.work')
+        Test-BRAVOCondition `
+            -Condition (
+                [bool]$existingParentResult.Success -and
+                (Test-Path -LiteralPath $existingParent -PathType Container) -and
+                -not (Test-Path -LiteralPath (Join-Path $existingParent 'new-dest'))
+            ) `
+            -Name 'Runtime/08-WriteProbeKeepsPreexistingAncestor' `
+            -Failure 'write-probe має прибрати лише каталоги, які створив сам; каталог, що існував до перевірки, не видаляється навіть порожнім'
         Test-BRAVOCondition `
             -Condition (
                 $archiveScriptText.Contains('function Test-BRAVOFileSystemWriteProbe') -and

@@ -912,3 +912,622 @@ Test-BRAVOCondition `
         'команду -File BRAVO_CREDENTIALS_SETUP.ps1 зі збереженими ' +
         '-ConfigPath (за наміром) / -ProtectedPayloadPath / -ResultPath'
     )
+
+# ===== Regression #302: виняток SYSTEM-кроку мусить відкотити поточне сховище =====
+# Restore-CredentialOperationSnapshots раніше викликався лише коли рядки
+# результату SYSTEM мали Status=Error. Якщо Invoke-AsSystem КИДАВ виняток
+# (worker timeout, FatalError, збій Task Scheduler), блок мав лише finally,
+# що звільняє знімки, — сховище поточного користувача лишалося зміненим, а
+# SYSTEM — ні (розбіжність 7z/SFTP секретів). Реальні production-функції
+# екстрагуються по AST; заглушені лише межі: Windows Credential Manager
+# (Get/Set/Remove-BRAVOCredential, in-memory) та сам виклик SYSTEM-worker-а
+# (Invoke-AsSystem кидає виняток). Справжніх сховищ тест не торкається.
+# Review PR #390: відкіт дозволено лише для доведеного "worker не
+# розпочато" (виняток позначено production-функцією
+# Add-SystemWorkerNotStartedMarker — заглушка позначає так само); непозначений
+# виняток (таймаут, FatalError) = невизначений стан SYSTEM -> без відкоту,
+# лише Warning. Warning-и обробника не мусять ставати термінальними за
+# $WarningPreference='Stop' і маскувати оригінальний виняток.
+$credRollbackText = [IO.File]::ReadAllText(
+    (Join-Path $root 'BRAVO_CREDENTIALS_SETUP.ps1'), [Text.Encoding]::UTF8
+)
+# Заглушки йдуть ПІСЛЯ production-тексту з -PreferLastDefinitionOnDuplicate:
+# production Invoke-AsSystem не мусить підміняти заглушку SYSTEM-межі.
+$credRollbackStubText = @'
+$script:credStore = @{}
+$script:credSetCalls = New-Object System.Collections.ArrayList
+$script:credRemoveCalls = New-Object System.Collections.ArrayList
+$script:credFailSetDuringRestore = $false
+$script:credSystemCalls = 0
+$script:credSystemFailureKind = 'NotStarted'
+function Get-BRAVOCredential {
+    param([string]$Target)
+    if (-not $script:credStore.ContainsKey($Target)) { return $null }
+    $item = $script:credStore[$Target]
+    return [pscustomobject]@{ UserName = $item.UserName; Secret = $item.Secret.Copy() }
+}
+function Set-BRAVOCredential {
+    param([string]$Target, [string]$UserName, $Secret)
+    if ($script:credFailSetDuringRestore -and $script:credSystemCalls -gt 0) {
+        throw 'stub: credential store write failed'
+    }
+    [void]$script:credSetCalls.Add($Target)
+    $script:credStore[$Target] = @{ UserName = $UserName; Secret = $Secret.Copy() }
+}
+function Remove-BRAVOCredential {
+    param([string]$Target)
+    [void]$script:credRemoveCalls.Add($Target)
+    $existed = $script:credStore.ContainsKey($Target)
+    $script:credStore.Remove($Target)
+    return $existed
+}
+function Invoke-AsSystem {
+    param($ResolvedConfigPath, $ConfigPathWasExplicit, $Operation, $Entries)
+    $script:credSystemCalls++
+    foreach ($entry in @($Entries)) {
+        if ($null -ne $entry.SecureSecret) { $entry.SecureSecret.Dispose() }
+    }
+    if ($script:credSystemFailureKind -eq 'NotStarted') {
+        # Збій до запуску worker-а (напр. RegisterTaskDefinition): позначка
+        # тією ж production-функцією, що й у справжньому Invoke-AsSystem.
+        $notStartedError = New-Object System.InvalidOperationException 'stub: SYSTEM task registration failed'
+        Add-SystemWorkerNotStartedMarker -Exception $notStartedError
+        throw $notStartedError
+    }
+    # Непозначений виняток після запуску worker-а = невизначений стан SYSTEM.
+    throw 'stub: SYSTEM worker timeout'
+}
+'@
+$credRollbackModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText ($credRollbackText + "`r`n" + $credRollbackStubText) `
+    -PreferLastDefinitionOnDuplicate `
+    -FunctionNames @(
+        'Invoke-CredentialOperationsViaSystemWorker',
+        'Copy-OperationEntries', 'Clear-OperationEntries', 'Set-OperationResultScope',
+        'Invoke-CredentialOperations', 'Invoke-CredentialOperationsTransactional',
+        'Get-CredentialOperationSnapshots', 'Restore-CredentialOperationSnapshots',
+        'Clear-CredentialOperationSnapshots',
+        'Add-SystemWorkerNotStartedMarker', 'Test-SystemWorkerNotStartedError',
+        'Get-BRAVOCredential', 'Set-BRAVOCredential', 'Remove-BRAVOCredential', 'Invoke-AsSystem'
+    )
+
+function Invoke-BRAVOSelfTestCredentialsRollbackScenario {
+    param(
+        [Parameter(Mandatory = $true)][object]$Module,
+        [string]$Action = 'Set',
+        [bool]$FailRestore = $false,
+        [ValidateSet('NotStarted', 'Indeterminate')][string]$SystemFailure = 'NotStarted',
+        [bool]$WarningPreferenceStop = $false
+    )
+    & $Module {
+        param($ScenarioAction, $ScenarioFailRestore, $ScenarioSystemFailure, $ScenarioWarningStop)
+        $script:credSystemFailureKind = $ScenarioSystemFailure
+        $script:credStore = @{}
+        $script:credSetCalls = New-Object System.Collections.ArrayList
+        $script:credRemoveCalls = New-Object System.Collections.ArrayList
+        $script:credSystemCalls = 0
+        $script:credFailSetDuringRestore = $ScenarioFailRestore
+        $oldSecret = New-Object System.Security.SecureString
+        foreach ($c in 'old-value'.ToCharArray()) { $oldSecret.AppendChar($c) }
+        $script:credStore['TARGET_EXISTING'] = @{ UserName = 'user-old'; Secret = $oldSecret }
+        $newSecretA = New-Object System.Security.SecureString
+        foreach ($c in 'new-a'.ToCharArray()) { $newSecretA.AppendChar($c) }
+        $newSecretB = New-Object System.Security.SecureString
+        foreach ($c in 'new-b'.ToCharArray()) { $newSecretB.AppendChar($c) }
+        $entries = @(
+            [pscustomobject]@{ Component = 'COMP_EXISTING'; Target = 'TARGET_EXISTING'; UserName = 'user-new'; SecureSecret = $newSecretA },
+            [pscustomobject]@{ Component = 'COMP_NEW'; Target = 'TARGET_NEW'; UserName = 'user-new'; SecureSecret = $newSecretB }
+        )
+        $script:credSetCalls.Clear()
+        $script:credCaught = $null
+        # Warning-потік збираємо, навіть коли функція кидає виняток.
+        # $WarningPreference ставиться у script-scope модуля: функції модуля
+        # не бачать preference-змінних зі scope виклику.
+        $hadModuleWarningPreference = $null -ne (Get-Variable -Name WarningPreference -Scope Script -ErrorAction SilentlyContinue)
+        $previousModuleWarningPreference = if ($hadModuleWarningPreference) { $script:WarningPreference } else { $null }
+        if ($ScenarioWarningStop) {
+            $script:WarningPreference = 'Stop'
+        }
+        try {
+            $warnings = @(& {
+                try {
+                    [void](Invoke-CredentialOperationsViaSystemWorker `
+                        -Action $ScenarioAction `
+                        -OperationEntries $entries `
+                        -resolvedConfigPath 'C:\stub\BRAVO.config' `
+                        -configPathWasExplicit $false `
+                        -currentIdentity 'STUB\user')
+                } catch {
+                    $script:credCaught = $_
+                }
+            } 3>&1)
+        } finally {
+            if ($hadModuleWarningPreference) {
+                $script:WarningPreference = $previousModuleWarningPreference
+            } else {
+                Remove-Variable -Name WarningPreference -Scope Script -ErrorAction SilentlyContinue
+            }
+        }
+        $caught = $script:credCaught
+        $existing = $script:credStore['TARGET_EXISTING']
+        $existingPlain = $null
+        if ($null -ne $existing) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($existing.Secret)
+            try { $existingPlain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        }
+        [pscustomobject]@{
+            Caught = $caught
+            Output = $warnings
+            SystemCalls = $script:credSystemCalls
+            SetCalls = @($script:credSetCalls).Count
+            RemoveCalls = @($script:credRemoveCalls)
+            ExistingPlain = $existingPlain
+            ExistingUser = if ($null -ne $existing) { [string]$existing.UserName } else { $null }
+            NewTargetPresent = $script:credStore.ContainsKey('TARGET_NEW')
+        }
+    } $Action $FailRestore $SystemFailure $WarningPreferenceStop
+}
+
+$credRollbackMain = Invoke-BRAVOSelfTestCredentialsRollbackScenario -Module $credRollbackModule -Action 'Set'
+Test-BRAVOCondition `
+    -Condition (
+        $credRollbackMain.SystemCalls -eq 1 -and
+        $null -ne $credRollbackMain.Caught -and
+        [string]$credRollbackMain.Caught.Exception.Message -eq 'stub: SYSTEM task registration failed' -and
+        $credRollbackMain.ExistingPlain -eq 'old-value' -and
+        $credRollbackMain.ExistingUser -eq 'user-old' -and
+        -not $credRollbackMain.NewTargetPresent -and
+        @($credRollbackMain.RemoveCalls) -contains 'TARGET_NEW'
+    ) `
+    -Name 'Credentials/SystemWorkerExceptionRollsBackSnapshots' `
+    -Failure "доведено не розпочатий SYSTEM worker (виняток позначено Add-SystemWorkerNotStartedMarker): виняток Invoke-AsSystem мусить відкотити сховище поточного користувача до знімку (старий запис відновлено, новий видалено) і пропагувати оригінальний виняток; факт: systemCalls=$($credRollbackMain.SystemCalls) caught=$($null -ne $credRollbackMain.Caught) existing='$($credRollbackMain.ExistingPlain)' newTargetPresent=$($credRollbackMain.NewTargetPresent)"
+
+$credRollbackFail = Invoke-BRAVOSelfTestCredentialsRollbackScenario -Module $credRollbackModule -Action 'Set' -FailRestore $true
+$credRollbackFailText = (@($credRollbackFail.Output) | ForEach-Object { [string]$_ }) -join ' | '
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $credRollbackFail.Caught -and
+        [string]$credRollbackFail.Caught.Exception.Message -eq 'stub: SYSTEM task registration failed' -and
+        $credRollbackFailText.Contains('TARGET_EXISTING') -and
+        $credRollbackFailText.Contains('stub: credential store write failed')
+    ) `
+    -Name 'Credentials/SystemWorkerExceptionRollbackFailureReportedNotMasked' `
+    -Failure "збій відкоту при винятку SYSTEM-кроку мусить бути виведений (Warning з Target і причиною), але не маскувати оригінальний виняток; факт: caught='$(if ($null -ne $credRollbackFail.Caught) { $credRollbackFail.Caught.Exception.Message })' output='$credRollbackFailText'"
+
+$credRollbackTest = Invoke-BRAVOSelfTestCredentialsRollbackScenario -Module $credRollbackModule -Action 'Test'
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $credRollbackTest.Caught -and
+        [string]$credRollbackTest.Caught.Exception.Message -eq 'stub: SYSTEM task registration failed' -and
+        $credRollbackTest.SetCalls -eq 0 -and
+        @($credRollbackTest.RemoveCalls).Count -eq 0
+    ) `
+    -Name 'Credentials/SystemWorkerExceptionTestActionDoesNotRestore' `
+    -Failure 'Action=Test не мутує сховище й не робить знімків: при винятку SYSTEM-кроку відкіт не виконується, виняток пропагується'
+
+$credIndeterminate = Invoke-BRAVOSelfTestCredentialsRollbackScenario -Module $credRollbackModule -Action 'Set' -SystemFailure 'Indeterminate'
+$credIndeterminateText = (@($credIndeterminate.Output) | ForEach-Object { [string]$_ }) -join ' | '
+Test-BRAVOCondition `
+    -Condition (
+        $credIndeterminate.SystemCalls -eq 1 -and
+        $null -ne $credIndeterminate.Caught -and
+        [string]$credIndeterminate.Caught.Exception.Message -eq 'stub: SYSTEM worker timeout' -and
+        $credIndeterminate.ExistingPlain -eq 'new-a' -and
+        $credIndeterminate.ExistingUser -eq 'user-new' -and
+        $credIndeterminate.NewTargetPresent -and
+        @($credIndeterminate.RemoveCalls).Count -eq 0 -and
+        $credIndeterminateText.Contains('SYSTEM') -and
+        $credIndeterminateText.Contains('невизначений') -and
+        $credIndeterminateText.Contains('TARGET_EXISTING') -and
+        $credIndeterminateText.Contains('TARGET_NEW') -and
+        $credIndeterminateText.Contains('stub: SYSTEM worker timeout')
+    ) `
+    -Name 'Credentials/SystemWorkerIndeterminateFailureDoesNotRollBack' `
+    -Failure "непозначений виняток SYSTEM-кроку (worker міг уже змінити SYSTEM) не мусить відкочувати поточне сховище: нове значення лишається, Warning про невизначений стан SYSTEM з переліком Target, оригінальний виняток пропагується; факт: caught='$(if ($null -ne $credIndeterminate.Caught) { $credIndeterminate.Caught.Exception.Message })' existing='$($credIndeterminate.ExistingPlain)' newTargetPresent=$($credIndeterminate.NewTargetPresent) removeCalls=$(@($credIndeterminate.RemoveCalls).Count) output='$credIndeterminateText'"
+
+$credWarnStop = Invoke-BRAVOSelfTestCredentialsRollbackScenario -Module $credRollbackModule -Action 'Set' -FailRestore $true -WarningPreferenceStop $true
+$credWarnStopText = (@($credWarnStop.Output) | ForEach-Object { [string]$_ }) -join ' | '
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $credWarnStop.Caught -and
+        [string]$credWarnStop.Caught.Exception.Message -eq 'stub: SYSTEM task registration failed' -and
+        $credWarnStopText.Contains('TARGET_EXISTING') -and
+        $credWarnStopText.Contains('stub: credential store write failed')
+    ) `
+    -Name 'Credentials/SystemWorkerRollbackWarningsSurviveWarningPreferenceStop' `
+    -Failure "за `$WarningPreference='Stop' Warning-и обробника відкоту не мусять ставати термінальними: пропагується ОРИГІНАЛЬНИЙ виняток SYSTEM-кроку, а збій відкоту все одно виведено; факт: caught='$(if ($null -ne $credWarnStop.Caught) { $credWarnStop.Caught.Exception.Message })' output='$credWarnStopText'"
+
+# Source-level: маркер "не розпочато" ставиться лише в catch-блоках
+# Invoke-AsSystem, чий try-оператор цілком лежить ДО запуску worker-а
+# ($registeredTask.Run(...)). Так майбутня правка не позначить виняток
+# після запуску (таймаут, FatalError) як безпечний для відкоту.
+# Єдиний виняток (#302 follow-up): New-SystemWorkerFatalError, і лише в
+# if, умова якого вимагає булевого OperationsStarted від worker-а.
+$credMarkerParseErrors = $null
+$credMarkerAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    $credRollbackText, [ref]$null, [ref]$credMarkerParseErrors
+)
+$credMarkerFunctions = @($credMarkerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Invoke-AsSystem'
+}, $true))
+$credMarkerAllCalls = @($credMarkerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -eq 'Add-SystemWorkerNotStartedMarker'
+}, $true))
+$credMarkerLaunchCalls = @()
+$credMarkerCalls = @()
+$credMarkerFatalCalls = @()
+$credMarkerFatalFunctions = @($credMarkerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'New-SystemWorkerFatalError'
+}, $true))
+$credMarkerViolations = New-Object System.Collections.ArrayList
+if ($credMarkerFunctions.Count -eq 1) {
+    $credMarkerLaunchCalls = @($credMarkerFunctions[0].Body.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+        $node.Member.Value -eq 'Run'
+    }, $true))
+    $credMarkerCalls = @($credMarkerFunctions[0].Body.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Add-SystemWorkerNotStartedMarker'
+    }, $true))
+}
+if ($credMarkerFatalFunctions.Count -eq 1) {
+    $credMarkerFatalCalls = @($credMarkerFatalFunctions[0].Body.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Add-SystemWorkerNotStartedMarker'
+    }, $true))
+    foreach ($credMarkerFatalCall in $credMarkerFatalCalls) {
+        $credMarkerIf = $credMarkerFatalCall.Parent
+        while ($null -ne $credMarkerIf -and
+            -not ($credMarkerIf -is [System.Management.Automation.Language.IfStatementAst]) -and
+            -not ($credMarkerIf -is [System.Management.Automation.Language.FunctionDefinitionAst])) {
+            $credMarkerIf = $credMarkerIf.Parent
+        }
+        $credMarkerIfGuarded = $false
+        if ($credMarkerIf -is [System.Management.Automation.Language.IfStatementAst]) {
+            foreach ($credMarkerClause in $credMarkerIf.Clauses) {
+                $credMarkerConditionText = [string]$credMarkerClause.Item1.Extent.Text
+                if ($credMarkerClause.Item2.Extent.StartOffset -le $credMarkerFatalCall.Extent.StartOffset -and
+                    $credMarkerClause.Item2.Extent.EndOffset -ge $credMarkerFatalCall.Extent.EndOffset -and
+                    $credMarkerConditionText -match 'OperationsStarted' -and
+                    $credMarkerConditionText -match '-is\s+\[bool\]' -and
+                    $credMarkerConditionText -match '-not\s+\$\w+\.Value') {
+                    $credMarkerIfGuarded = $true
+                }
+            }
+        }
+        if (-not $credMarkerIfGuarded) {
+            [void]$credMarkerViolations.Add("line $($credMarkerFatalCall.Extent.StartLineNumber): маркер у New-SystemWorkerFatalError поза if (булеве OperationsStarted = `$false)")
+        }
+    }
+}
+if ($credMarkerLaunchCalls.Count -eq 1) {
+    $credMarkerLaunchStart = $credMarkerLaunchCalls[0].Extent.StartOffset
+    foreach ($credMarkerCall in $credMarkerCalls) {
+        $credMarkerCatch = $credMarkerCall.Parent
+        while ($null -ne $credMarkerCatch -and
+            -not ($credMarkerCatch -is [System.Management.Automation.Language.CatchClauseAst]) -and
+            -not ($credMarkerCatch -is [System.Management.Automation.Language.FunctionDefinitionAst])) {
+            $credMarkerCatch = $credMarkerCatch.Parent
+        }
+        if ($null -eq $credMarkerCatch -or
+            -not ($credMarkerCatch -is [System.Management.Automation.Language.CatchClauseAst])) {
+            [void]$credMarkerViolations.Add("line $($credMarkerCall.Extent.StartLineNumber): маркер поза catch")
+            continue
+        }
+        $credMarkerTry = $credMarkerCatch.Parent
+        if (-not ($credMarkerTry -is [System.Management.Automation.Language.TryStatementAst]) -or
+            $credMarkerTry.Extent.EndOffset -ge $credMarkerLaunchStart) {
+            [void]$credMarkerViolations.Add("line $($credMarkerCall.Extent.StartLineNumber): try/catch маркера не закінчується до Run")
+        }
+    }
+}
+Test-BRAVOCondition `
+    -Condition (
+        @($credMarkerParseErrors).Count -eq 0 -and
+        $credMarkerFunctions.Count -eq 1 -and
+        $credMarkerLaunchCalls.Count -eq 1 -and
+        $credMarkerCalls.Count -ge 2 -and
+        $credMarkerFatalCalls.Count -le 1 -and
+        $credMarkerAllCalls.Count -eq ($credMarkerCalls.Count + $credMarkerFatalCalls.Count) -and
+        $credMarkerViolations.Count -eq 0
+    ) `
+    -Name 'Credentials/SystemWorkerNotStartedMarkerOnlyBeforeTaskLaunch' `
+    -Failure "Add-SystemWorkerNotStartedMarker дозволено лише в catch-блоках Invoke-AsSystem, чий try цілком лежить до `$registeredTask.Run(...) (запуск SYSTEM worker-а); факт: functions=$($credMarkerFunctions.Count) runCalls=$($credMarkerLaunchCalls.Count) markers=$($credMarkerCalls.Count) fatalMarkers=$($credMarkerFatalCalls.Count) markersInFile=$($credMarkerAllCalls.Count) violations='$(@($credMarkerViolations) -join '; ')'"
+
+# #302 (follow-up): FatalError worker-а ПІСЛЯ Run. Worker повідомляє
+# OperationsStarted=$false лише коли впав до першої операції зі сховищем
+# (конфігурація, читання payload); тоді виняток позначається «не розпочато»
+# і поточне сховище відкочується. Відсутнє поле або будь-що, крім булевого
+# $false, лишається невизначеним станом (fail-safe).
+$credFatalModule = $null
+$credFatalModuleError = $null
+try {
+    $credFatalModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $credRollbackText `
+        -FunctionNames @(
+            'New-SystemWorkerFatalError',
+            'Add-SystemWorkerNotStartedMarker', 'Test-SystemWorkerNotStartedError'
+        )
+} catch {
+    $credFatalModuleError = $_.Exception.Message
+}
+$credFatalCases = @()
+if ($null -ne $credFatalModule) {
+    $credFatalCases = @(& $credFatalModule {
+        $responses = [ordered]@{
+            NotStarted = [pscustomobject]@{ FatalError = 'stub: config load failed'; OperationsStarted = $false }
+            Started = [pscustomobject]@{ FatalError = 'stub: store write failed'; OperationsStarted = $true }
+            Legacy = [pscustomobject]@{ FatalError = 'stub: legacy worker' }
+            NonBool = [pscustomobject]@{ FatalError = 'stub: odd worker'; OperationsStarted = 'false' }
+        }
+        foreach ($caseName in $responses.Keys) {
+            $caseException = New-SystemWorkerFatalError -WorkerResponse $responses[$caseName]
+            $caseRecord = $null
+            try { throw $caseException } catch { $caseRecord = $_ }
+            [pscustomobject]@{
+                Case = $caseName
+                Message = [string]$caseException.Message
+                NotStarted = [bool](Test-SystemWorkerNotStartedError -ErrorRecord $caseRecord)
+            }
+        }
+    })
+}
+$credFatalByCase = @{}
+foreach ($credFatalCase in $credFatalCases) { $credFatalByCase[$credFatalCase.Case] = $credFatalCase }
+$credFatalSummary = (@($credFatalCases) | ForEach-Object { "$($_.Case)=$($_.NotStarted)/'$($_.Message)'" }) -join '; '
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credFatalModuleError -and
+        $credFatalByCase.ContainsKey('NotStarted') -and
+        $credFatalByCase['NotStarted'].NotStarted -and
+        $credFatalByCase['NotStarted'].Message -eq 'stub: config load failed'
+    ) `
+    -Name 'Credentials/SystemWorkerFatalBeforeOperationsIsNotStarted' `
+    -Failure "FatalError worker-а з OperationsStarted=`$false (впав до операцій зі сховищем) мусить давати виняток з маркером «не розпочато» і текстом FatalError; факт: moduleError='$credFatalModuleError' cases='$credFatalSummary'"
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credFatalModuleError -and
+        $credFatalByCase.ContainsKey('Started') -and $credFatalByCase.ContainsKey('Legacy') -and $credFatalByCase.ContainsKey('NonBool') -and
+        -not $credFatalByCase['Started'].NotStarted -and
+        -not $credFatalByCase['Legacy'].NotStarted -and
+        -not $credFatalByCase['NonBool'].NotStarted -and
+        $credFatalByCase['Started'].Message -eq 'stub: store write failed' -and
+        $credFatalByCase['Legacy'].Message -eq 'stub: legacy worker'
+    ) `
+    -Name 'Credentials/SystemWorkerFatalAfterOperationsStaysIndeterminate' `
+    -Failure "FatalError з OperationsStarted=`$true, без поля (старий worker) або з не-булевим значенням лишається невизначеним станом (без маркера); факт: moduleError='$credFatalModuleError' cases='$credFatalSummary'"
+
+# Worker-бік: OperationsStarted у result.json справжньої
+# Invoke-ProtectedPayloadWorker. Заглушки лише на межі читання payload,
+# дешифрування і самої транзакції сховища.
+$credWorkerStubText = @'
+function Read-BRAVOTextFile {
+    param([string]$Path)
+    if ($script:credWorkerScenario -eq 'PayloadUnreadable') { throw 'stub: payload unreadable' }
+    return 'stub-payload'
+}
+function ConvertFrom-BRAVOJson {
+    param([Parameter(ValueFromPipeline = $true)][string]$InputObject)
+    process {
+        return [pscustomobject]@{
+            Action = 'Remove'
+            Entries = @([pscustomobject]@{ Component = 'COMP'; Target = 'TARGET'; UserName = 'user'; ProtectedSecret = '' })
+        }
+    }
+}
+function ConvertTo-BRAVOJson {
+    param([Parameter(ValueFromPipeline = $true)]$InputObject, [int]$Depth = 4)
+    process { return ($InputObject | ConvertTo-Json -Depth $Depth) }
+}
+function Unprotect-LocalMachineSecret { param([string]$ProtectedValue) return $null }
+function Invoke-CredentialOperationsTransactional {
+    param([string]$Operation, $Entries)
+    if ($script:credWorkerScenario -eq 'StoreFailure') { throw 'stub: store write failed' }
+    if ($script:credWorkerScenario -eq 'EmptyMessageFailure') { throw (New-Object System.InvalidOperationException '') }
+    return @([pscustomobject]@{ Component = 'COMP'; Target = 'TARGET'; Status = 'Removed'; Message = '' })
+}
+'@
+$credWorkerModule = $null
+$credWorkerModuleError = $null
+try {
+    $credWorkerModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($credRollbackText + "`r`n" + $credWorkerStubText) `
+        -PreferLastDefinitionOnDuplicate `
+        -FunctionNames @(
+            'Invoke-ProtectedPayloadWorker', 'Get-SystemWorkerFatalErrorText',
+            'Read-BRAVOTextFile', 'ConvertFrom-BRAVOJson', 'ConvertTo-BRAVOJson',
+            'Unprotect-LocalMachineSecret', 'Invoke-CredentialOperationsTransactional'
+        )
+} catch {
+    $credWorkerModuleError = $_.Exception.Message
+}
+$credWorkerRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CRED_WORKER_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($credWorkerRoot)
+$credWorkerOutcomes = @{}
+try {
+    if ($null -ne $credWorkerModule) {
+        foreach ($credWorkerScenario in @('PayloadUnreadable', 'StoreFailure', 'Success')) {
+            $credWorkerResultPath = Join-Path $credWorkerRoot "$credWorkerScenario.json"
+            $credWorkerOutcomes[$credWorkerScenario] = & $credWorkerModule {
+                param($Scenario, $ResultPath)
+                $script:credWorkerScenario = $Scenario
+                $workerThrew = $null
+                try {
+                    Invoke-ProtectedPayloadWorker -PayloadPath 'C:\stub\payload.json' -WorkerResultPath $ResultPath
+                } catch {
+                    $workerThrew = $_.Exception.Message
+                }
+                $response = $null
+                if (Test-Path -LiteralPath $ResultPath -PathType Leaf) {
+                    $response = [IO.File]::ReadAllText($ResultPath) | ConvertFrom-Json
+                }
+                $hasField = ($null -ne $response -and $null -ne $response.PSObject.Properties['OperationsStarted'])
+                [pscustomobject]@{
+                    Threw = $workerThrew
+                    HasField = $hasField
+                    OperationsStarted = if ($hasField) { $response.OperationsStarted } else { $null }
+                    FatalError = if ($null -ne $response) { [string]$response.FatalError } else { $null }
+                }
+            } $credWorkerScenario $credWorkerResultPath
+        }
+    }
+} finally {
+    Remove-Item -LiteralPath $credWorkerRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+$credWorkerSummary = (@($credWorkerOutcomes.Keys | Sort-Object) | ForEach-Object {
+    $o = $credWorkerOutcomes[$_]
+    "$_=field:$($o.HasField)/started:$($o.OperationsStarted)/fatal:'$($o.FatalError)'/threw:'$($o.Threw)'"
+}) -join '; '
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credWorkerModuleError -and
+        $credWorkerOutcomes.ContainsKey('PayloadUnreadable') -and
+        $credWorkerOutcomes.ContainsKey('StoreFailure') -and
+        $credWorkerOutcomes.ContainsKey('Success') -and
+        $credWorkerOutcomes['PayloadUnreadable'].HasField -and
+        $credWorkerOutcomes['PayloadUnreadable'].OperationsStarted -is [bool] -and
+        -not $credWorkerOutcomes['PayloadUnreadable'].OperationsStarted -and
+        $credWorkerOutcomes['PayloadUnreadable'].FatalError -eq 'stub: payload unreadable' -and
+        $credWorkerOutcomes['StoreFailure'].HasField -and
+        $credWorkerOutcomes['StoreFailure'].OperationsStarted -eq $true -and
+        $credWorkerOutcomes['StoreFailure'].FatalError -eq 'stub: store write failed' -and
+        $credWorkerOutcomes['Success'].HasField -and
+        $credWorkerOutcomes['Success'].OperationsStarted -eq $true -and
+        [string]::IsNullOrEmpty($credWorkerOutcomes['Success'].FatalError)
+    ) `
+    -Name 'Credentials/ProtectedPayloadWorkerReportsOperationsStarted' `
+    -Failure "Invoke-ProtectedPayloadWorker мусить писати OperationsStarted: `$false для збою до операцій зі сховищем (payload) і `$true, щойно почалась транзакція сховища (збій або успіх); факт: moduleError='$credWorkerModuleError' $credWorkerSummary"
+
+# #395: порожній текст винятку SYSTEM-worker-а не повинен виглядати успіхом.
+# Батьківський бік: FatalError = "" (або пробіли, або без поля) — збій;
+# лише $null — успіх. Виняток для порожнього тексту має зрозуміле повідомлення.
+$credEmptyFatalModule = $null
+$credEmptyFatalModuleError = $null
+try {
+    $credEmptyFatalModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $credRollbackText `
+        -FunctionNames @(
+            'Test-SystemWorkerResponseFailed', 'New-SystemWorkerFatalError',
+            'Add-SystemWorkerNotStartedMarker', 'Test-SystemWorkerNotStartedError'
+        )
+} catch {
+    $credEmptyFatalModuleError = $_.Exception.Message
+}
+$credEmptyFatalCases = @{}
+if ($null -ne $credEmptyFatalModule) {
+    foreach ($credEmptyFatalCase in @(& $credEmptyFatalModule {
+        $responses = [ordered]@{
+            Empty = [pscustomobject]@{ FatalError = ''; Results = @(); OperationsStarted = $true }
+            Blank = [pscustomobject]@{ FatalError = '   '; Results = @(); OperationsStarted = $true }
+            Missing = [pscustomobject]@{ Results = @() }
+            Message = [pscustomobject]@{ FatalError = 'stub: failed'; Results = @(); OperationsStarted = $true }
+            Success = [pscustomobject]@{ FatalError = $null; Results = @(); OperationsStarted = $true }
+        }
+        foreach ($caseName in $responses.Keys) {
+            $failed = [bool](Test-SystemWorkerResponseFailed -WorkerResponse $responses[$caseName])
+            $message = if ($failed) { [string](New-SystemWorkerFatalError -WorkerResponse $responses[$caseName]).Message } else { '' }
+            [pscustomobject]@{ Case = $caseName; Failed = $failed; Message = $message }
+        }
+    })) {
+        $credEmptyFatalCases[$credEmptyFatalCase.Case] = $credEmptyFatalCase
+    }
+}
+$credEmptyFatalSummary = (@($credEmptyFatalCases.Keys | Sort-Object) | ForEach-Object {
+    "$_=$($credEmptyFatalCases[$_].Failed)/'$($credEmptyFatalCases[$_].Message)'"
+}) -join '; '
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credEmptyFatalModuleError -and
+        $credEmptyFatalCases.Count -eq 5 -and
+        $credEmptyFatalCases['Empty'].Failed -and
+        $credEmptyFatalCases['Blank'].Failed -and
+        $credEmptyFatalCases['Missing'].Failed -and
+        $credEmptyFatalCases['Message'].Failed -and
+        -not $credEmptyFatalCases['Success'].Failed -and
+        -not [string]::IsNullOrWhiteSpace($credEmptyFatalCases['Empty'].Message) -and
+        -not [string]::IsNullOrWhiteSpace($credEmptyFatalCases['Blank'].Message) -and
+        $credEmptyFatalCases['Message'].Message -eq 'stub: failed' -and
+        $credRollbackText.Contains('if (Test-SystemWorkerResponseFailed -WorkerResponse $workerResponse) {')
+    ) `
+    -Name 'Credentials/SystemWorkerEmptyFatalErrorIsFailure' `
+    -Failure "Invoke-AsSystem мусить вважати збоєм будь-яку відповідь worker-а, де FatalError не `$null (порожній рядок, пробіли або поле відсутнє), і давати виняток зі зрозумілим текстом; факт: moduleError='$credEmptyFatalModuleError' cases='$credEmptyFatalSummary'"
+
+# #395, worker-бік: виняток з порожнім текстом записується в FatalError
+# непорожнім рядком (тип винятку), щоб і старий батьківський процес бачив збій.
+$credEmptyWorkerModule = $null
+$credEmptyWorkerModuleError = $null
+try {
+    $credEmptyWorkerModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($credRollbackText + "`r`n" + $credWorkerStubText) `
+        -PreferLastDefinitionOnDuplicate `
+        -FunctionNames @(
+            'Invoke-ProtectedPayloadWorker', 'Get-SystemWorkerFatalErrorText',
+            'Read-BRAVOTextFile', 'ConvertFrom-BRAVOJson', 'ConvertTo-BRAVOJson',
+            'Unprotect-LocalMachineSecret', 'Invoke-CredentialOperationsTransactional'
+        )
+} catch {
+    $credEmptyWorkerModuleError = $_.Exception.Message
+}
+$credEmptyWorkerFatal = $null
+$credEmptyWorkerRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CRED_WORKER_EMPTY_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($credEmptyWorkerRoot)
+try {
+    if ($null -ne $credEmptyWorkerModule) {
+        $credEmptyWorkerFatal = & $credEmptyWorkerModule {
+            param($ResultPath)
+            $script:credWorkerScenario = 'EmptyMessageFailure'
+            Invoke-ProtectedPayloadWorker -PayloadPath 'C:\stub\payload.json' -WorkerResultPath $ResultPath
+            $response = [IO.File]::ReadAllText($ResultPath) | ConvertFrom-Json
+            [string]$response.FatalError
+        } (Join-Path $credEmptyWorkerRoot 'result.json')
+    }
+} catch {
+    $credEmptyWorkerModuleError = $_.Exception.Message
+} finally {
+    Remove-Item -LiteralPath $credEmptyWorkerRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+Test-BRAVOCondition `
+    -Condition (
+        $null -eq $credEmptyWorkerModuleError -and
+        -not [string]::IsNullOrWhiteSpace($credEmptyWorkerFatal) -and
+        ([string]$credEmptyWorkerFatal).Contains('InvalidOperationException')
+    ) `
+    -Name 'Credentials/ProtectedPayloadWorkerNeverWritesEmptyFatalError' `
+    -Failure "Invoke-ProtectedPayloadWorker для винятку з порожнім текстом мусить писати непорожній FatalError (ім'я типу винятку); факт: moduleError='$credEmptyWorkerModuleError' fatal='$credEmptyWorkerFatal'"
+
+# Збій worker-режиму ДО Invoke-ProtectedPayloadWorker (конфігурація,
+# модулі — детермінований тригер #302) пишеться загальним catch скрипта:
+# OperationsStarted там береться з прапорця входу у worker-функцію.
+$credWorkerFunctionAst = @($credMarkerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Invoke-ProtectedPayloadWorker'
+}, $true))
+$credWorkerFirstStatement = if ($credWorkerFunctionAst.Count -eq 1 -and
+    $null -ne $credWorkerFunctionAst[0].Body.EndBlock -and
+    @($credWorkerFunctionAst[0].Body.EndBlock.Statements).Count -gt 0) {
+    [string]@($credWorkerFunctionAst[0].Body.EndBlock.Statements)[0].Extent.Text
+} else { '' }
+$credFailureResponseMatch = [regex]::Match(
+    $credRollbackText,
+    '(?s)\$failureResponse\s*=\s*@\{(?<body>.*?)\}\s*\|\s*ConvertTo-BRAVOJson'
+)
+Test-BRAVOCondition `
+    -Condition (
+        $credWorkerFirstStatement -match '^\$script:BRAVOCredentialWorkerEntered\s*=\s*\$true$' -and
+        $credFailureResponseMatch.Success -and
+        $credFailureResponseMatch.Groups['body'].Value -match 'OperationsStarted\s*=\s*\[bool\]\s*\(\s*Get-Variable\s+-Name\s+BRAVOCredentialWorkerEntered\s+-Scope\s+Script\s+-ValueOnly\s+-ErrorAction\s+SilentlyContinue\s*\)'
+    ) `
+    -Name 'Credentials/WorkerModeFailureReportsOperationsStartedFromEntryFlag' `
+    -Failure "Invoke-ProtectedPayloadWorker має першим оператором ставити `$script:BRAVOCredentialWorkerEntered = `$true, а загальний catch worker-режиму — писати OperationsStarted = [bool](Get-Variable -Name BRAVOCredentialWorkerEntered -Scope Script -ValueOnly -ErrorAction SilentlyContinue); факт: first='$credWorkerFirstStatement' failureResponse=$($credFailureResponseMatch.Success)"

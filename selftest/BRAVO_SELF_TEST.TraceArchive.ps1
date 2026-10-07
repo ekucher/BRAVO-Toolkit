@@ -47,6 +47,7 @@ function ConvertTo-BRAVOWindowsCommandLineArgument { BRAVO.Compatibility\Convert
 function Start-BRAVOProcessOutputCapture { BRAVO.Compatibility\Start-BRAVOProcessOutputCapture @args }
 function Write-BRAVOProcessInputText { BRAVO.Compatibility\Write-BRAVOProcessInputText @args }
 function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVOProcessOutputCapture @args }
+function ConvertTo-BRAVOWinSCPFileMask { BRAVO.Compatibility\ConvertTo-BRAVOWinSCPFileMask @args }
 # Прозорий passthrough до реальної Get-BRAVODirectories з єдиним опційним
 # test-only гаком (P2-2, PR #136 review): $script:taP2VanishAfterDiscoveryPath,
 # коли встановлено, синхронно й детерміновано видаляє вказаний каталог
@@ -83,6 +84,7 @@ function Get-BRAVODirectories {
             "Start-BRAVOProcessOutputCapture",
             "Write-BRAVOProcessInputText",
             "Complete-BRAVOProcessOutputCapture",
+            "ConvertTo-BRAVOWinSCPFileMask",
             "Write-BRAVOLogRotationMessage",
             "Format-CommandOutput",
             "Invoke-CommandWithLog",
@@ -317,6 +319,32 @@ function Get-BRAVODirectories {
             (@($taSendSession.State.RemoveFilesCalls) -contains '/trace/Trace_20260815.mdz') -and
             [string]$taSendSession.State.LastResumeSupportState -eq 'On'
         ) -Name 'TraceArchive/SftpPublishGoesThroughVerifiedTempName' -Failure "успішна публікація: передача у .new (Resume=On), verify, звільнення старої версії, rename, фінальний розмір 300/140; факт: $($taSendResult.Error)"
+
+        # --- #366: імена з `[`/`]` — WinSCP трактує джерело put/rm/mv як
+        # маску. Без екранування `Trace[1].mdz` збігається з `Trace1.mdz`:
+        # передався б сусідній файл, а remove/rename зачепили б не той шлях.
+        # Строга фейк-сесія моделює маски так, як їх читає WinSCP. ---
+        $taMaskLocalDir = Join-Path $traceArchiveTestRoot "send_mask"
+        [void](New-Item -ItemType Directory -Path $taMaskLocalDir -Force)
+        $taMaskArchive = Join-Path $taMaskLocalDir 'Trace[1].mdz'
+        [IO.File]::WriteAllText($taMaskArchive, ('m' * 300))
+        [IO.File]::WriteAllText((Join-Path $taMaskLocalDir 'Trace1.mdz'), ('d' * 50))
+        $taMaskSession = New-BRAVOSelfTestWinSCPMaskSession
+        $taMaskSession.State.RemoteSizes['/trace/Trace[1].mdz'] = [int64]111
+        $taMaskSession.State.RemoteSizes['/trace/Trace1.mdz'] = [int64]77
+        try {
+            $taMaskResult = & $traceArchiveModule { param($s, $l, $r) Send-BRAVOTraceArchiveFile -Session $s -LocalPath $l -RemoteFinalPath $r } $taMaskSession $taMaskArchive '/trace/Trace[1].mdz'
+        } catch {
+            $taMaskResult = [pscustomobject]@{ Success = $false; Error = "виняток: $($_.Exception.Message)" }
+        }
+        Test-BRAVOCondition -Condition (
+            $taMaskResult.Success -eq $true -and
+            [int64]$taMaskSession.State.RemoteSizes['/trace/Trace[1].mdz'] -eq 300 -and
+            [int64]$taMaskSession.State.RemoteSizes['/trace/Trace1.mdz'] -eq 77 -and
+            (@($taMaskSession.State.PutFilesLocalArgs) -contains (Join-Path $taMaskLocalDir 'Trace[[]1].mdz')) -and
+            (@($taMaskSession.State.RemoveFilesCalls) -contains '/trace/Trace[[]1].mdz') -and
+            (@($taMaskSession.State.MoveFileCalls) -contains '/trace/Trace[[]1].mdz.new -> /trace/Trace[1].mdz')
+        ) -Name 'TraceArchive/SftpPublishEscapesWinSCPFileMasks' -Failure "ім'я з [ ] має передаватись у WinSCP екранованим (PutFiles-джерело, RemoveFiles, MoveFile-джерело), сусідній Trace1.mdz недоторканий; факт: error=$($taMaskResult.Error) final=$($taMaskSession.State.RemoteSizes['/trace/Trace[1].mdz']) decoy=$($taMaskSession.State.RemoteSizes['/trace/Trace1.mdz']) put=$(@($taMaskSession.State.PutFilesLocalArgs) -join ',') rm=$(@($taMaskSession.State.RemoveFilesCalls) -join ',') mv=$(@($taMaskSession.State.MoveFileCalls) -join ',')"
 
         # --- РЕГРЕСІЯ (реальний DEV-LIMS): remote-каталог /trace/ не існував,
         # session.PutFiles його НЕ створює, і кожен прогін падав із
@@ -1070,6 +1098,26 @@ function Get-BRAVODirectories {
             -not $taMigrationSession.State.RemoteSizes.ContainsKey('/trace/Trace_20260810.mdz') -and
             $taMigrationSession.State.RemoteSizes.ContainsKey('/trace/unrelated.txt')
         ) -Name 'TraceArchive/RemoteMigrationMovesArchivesWithVerify' -Failure "міграція має перенести .mdz+.sha512 (2 файли) у /logs/trace з верифікацією, не чіпаючи сторонній unrelated.txt; факт: attempted=$($taMigrationResult.Attempted) moved=$($taMigrationResult.Moved) errors=$($taMigrationResult.Errors)"
+
+        # #366: джерело MoveFile — маска WinSCP; архів з `[`/`]` в імені
+        # має переноситись саме він, а не сусідній збіг маски.
+        $taMigrationMaskSession = New-BRAVOSelfTestWinSCPMaskSession
+        [void]$taMigrationMaskSession.State.KnownRemoteDirs.Add('/trace')
+        $taMigrationMaskSession.State.RemoteSizes['/trace/Trace[1].mdz'] = [int64]300
+        $taMigrationMaskSession.State.RemoteSizes['/trace/Trace1.mdz'] = [int64]77
+        try {
+            $taMigrationMaskResult = & $traceArchiveModule { param($s) Invoke-BRAVOTraceRemoteLogMigration -Session $s -LegacyDirectory 'trace' -TargetDirectory 'logs/trace' } $taMigrationMaskSession
+        } catch {
+            $taMigrationMaskResult = [pscustomobject]@{ Attempted = -1; Moved = -1; Errors = -1 }
+        }
+        Test-BRAVOCondition -Condition (
+            [int]$taMigrationMaskResult.Attempted -eq 2 -and
+            [int]$taMigrationMaskResult.Moved -eq 2 -and
+            [int]$taMigrationMaskResult.Errors -eq 0 -and
+            [int64]$taMigrationMaskSession.State.RemoteSizes['/logs/trace/Trace[1].mdz'] -eq 300 -and
+            [int64]$taMigrationMaskSession.State.RemoteSizes['/logs/trace/Trace1.mdz'] -eq 77 -and
+            (@($taMigrationMaskSession.State.MoveFileCalls) -contains '/trace/Trace[[]1].mdz -> /logs/trace/Trace[1].mdz')
+        ) -Name 'TraceArchive/RemoteMigrationEscapesWinSCPFileMask' -Failure "міграція має переносити Trace[1].mdz під власним ім'ям (джерело MoveFile екрановане), Trace1.mdz окремо; факт: attempted=$($taMigrationMaskResult.Attempted) moved=$($taMigrationMaskResult.Moved) errors=$($taMigrationMaskResult.Errors) target=$($taMigrationMaskSession.State.RemoteSizes['/logs/trace/Trace[1].mdz']) mv=$(@($taMigrationMaskSession.State.MoveFileCalls) -join ',')"
 
         $taMigrationConflictSession = New-BRAVOSelfTestFakeBazaSession
         [void]$taMigrationConflictSession.State.KnownRemoteDirs.Add('/trace')

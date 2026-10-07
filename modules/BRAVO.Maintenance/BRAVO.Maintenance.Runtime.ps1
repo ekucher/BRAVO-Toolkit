@@ -1168,6 +1168,12 @@ $script:CriticalErrorsList = New-Object 'System.Collections.Generic.List[string]
 # Send-FinalReport не ескалював notification-severity WARNING до
 # "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ"/CRITICAL (review finding #2).
 $script:NotificationAlertQueue = New-Object 'System.Collections.Generic.List[object]'
+# #299: скільки записів CriticalErrorsList/NotificationAlertQueue уже
+# передано на доставку (Send-FinalReport або Send-BRAVOMaintenanceEarlyExitAlerts).
+# Ранні виходи надсилають лише записи після цих індексів, тож нічого не
+# дублюється, а алерт, піднятий після підсумкового звіту, не губиться.
+$script:maintenanceDeliveredCriticalAlertCount = 0
+$script:maintenanceDeliveredAlertQueueCount = 0
 # T006: імена архівів, що пройшли 7z t лише через legacy BOM-у-паролі
 # fallback (колектор Register-BRAVOLegacyBomPasswordFallback, BRAVO.ArchiveHelpers).
 # Один WARNING-запис у NotificationAlertQueue на прогін — перед Send-FinalReport.
@@ -2653,6 +2659,112 @@ function Send-SlackAlert {
             Message = $Message
         })
     }
+}
+
+# #299: ранні виходи (recovery guard, збій quiescence-маркера, цілісність
+# інструментів, lock) і необроблені винятки не доходять до Send-FinalReport,
+# тож накопичені Send-SlackAlert -IsCritical раніше губилися. Ця функція
+# одразу надсилає ще не доставлені записи CriticalErrorsList і
+# NotificationAlertQueue одним повідомленням. Ідемпотентна: повторний виклик
+# (явний перед виходом + страховка у спільному finally) нічого не дублює.
+# Під StrictMode може викликатися до ініціалізації сповіщень (дуже ранній
+# exit) — тоді просто нічого не робить.
+function Send-BRAVOMaintenanceEarlyExitAlerts {
+    param(
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    $slackModeVariable = Get-Variable -Name SlackMode -Scope Script -ErrorAction SilentlyContinue
+    $criticalListVariable = Get-Variable -Name CriticalErrorsList -Scope Script -ErrorAction SilentlyContinue
+    $alertQueueVariable = Get-Variable -Name NotificationAlertQueue -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $slackModeVariable -or $null -eq $criticalListVariable -or $null -eq $alertQueueVariable -or
+        $null -eq $criticalListVariable.Value -or $null -eq $alertQueueVariable.Value) {
+        return
+    }
+    if ([string]$slackModeVariable.Value -eq "none") {
+        return
+    }
+
+    $deliveredCriticalCount = Get-Variable -Name maintenanceDeliveredCriticalAlertCount -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $deliveredCriticalCount) { $deliveredCriticalCount = 0 }
+    $deliveredQueueCount = Get-Variable -Name maintenanceDeliveredAlertQueueCount -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $deliveredQueueCount) { $deliveredQueueCount = 0 }
+
+    $criticalList = $criticalListVariable.Value
+    $alertQueue = $alertQueueVariable.Value
+    $pendingCritical = New-Object 'System.Collections.Generic.List[string]'
+    for ($criticalIndex = [int]$deliveredCriticalCount; $criticalIndex -lt $criticalList.Count; $criticalIndex++) {
+        $pendingCritical.Add([string]$criticalList[$criticalIndex])
+    }
+    $pendingQueue = New-Object 'System.Collections.Generic.List[object]'
+    for ($queueIndex = [int]$deliveredQueueCount; $queueIndex -lt $alertQueue.Count; $queueIndex++) {
+        $pendingQueue.Add($alertQueue[$queueIndex])
+    }
+    if ($pendingCritical.Count -eq 0 -and $pendingQueue.Count -eq 0) {
+        return
+    }
+
+    # Позначаємо доставленим до спроби: збій webhook не має призводити до
+    # повторної відправки того самого тексту зі страховки у finally.
+    $script:maintenanceDeliveredCriticalAlertCount = $criticalList.Count
+    $script:maintenanceDeliveredAlertQueueCount = $alertQueue.Count
+
+    $queuedSeverities = @($pendingQueue | ForEach-Object { [string]$_.Severity })
+    $earlyExitSeverity = if ($pendingCritical.Count -gt 0 -or $queuedSeverities -contains "CRITICAL") {
+        "CRITICAL"
+    } elseif ($queuedSeverities -contains "ERROR") {
+        "ERROR"
+    } else {
+        "WARNING"
+    }
+    $earlyExitTitleEmoji = switch ($earlyExitSeverity) {
+        "CRITICAL" { ":rotating_light:" }
+        "ERROR" { ":x:" }
+        default { ":warning:" }
+    }
+    $earlyExitDetails = @($pendingCritical.ToArray()) +
+        @($pendingQueue | ForEach-Object { [string]$_.Message }) +
+        @("Обслуговування завершено достроково: $Reason")
+
+    try {
+        $notificationRoute = Resolve-BRAVONotificationRoute `
+            -Severity $earlyExitSeverity `
+            -NotificationMode $script:SlackMode `
+            -RoutingTable $bravoSettings.NotificationRouting
+        if ($notificationRoute -eq "none") {
+            return
+        }
+        $earlyExitMessage = New-MaintenanceNotificationMessage `
+            -Title "ОБСЛУГОВУВАННЯ ПЕРЕРВАНО" `
+            -TitleEmoji $earlyExitTitleEmoji `
+            -Severity $earlyExitSeverity `
+            -Duration ((Get-Date) - $script:ScriptStartTime) `
+            -Details $earlyExitDetails `
+            -LogPath $LOG_FILE
+        Invoke-NotificationWebhook -Message $earlyExitMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
+        Write-Log "Сповіщення про дострокове завершення ($Reason) відправлено в $NotificationProviderDisplayName" -Level "INFO"
+    }
+    catch {
+        Write-Log "ПОМИЛКА відправки сповіщення про дострокове завершення ($Reason): $($_.Exception.Message)" -Level "ERROR"
+    }
+}
+
+# #299: плановий прогін пропущено повністю (lock) — оператор має дізнатися
+# одразу: ERROR (прогін не стає critical, код завершення не змінюється).
+# Recovery-тик лише логує: він повторюється за розкладом, і алерт на кожен
+# тик був би шумом.
+function Send-BRAVOMaintenanceSkippedRunAlert {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [switch]$RecoveryTick
+    )
+
+    if ($RecoveryTick) {
+        return
+    }
+    Send-SlackAlert -Message "Плановий прогін обслуговування пропущено, нічого не виконано. $Message" -Severity "ERROR"
+    Send-BRAVOMaintenanceEarlyExitAlerts -Reason $Reason
 }
 
 function Send-InactiveServiceWarning {
@@ -4409,7 +4521,9 @@ function Send-BRAVOTraceArchiveFile {
     $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
     $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::On
 
-    $transferResult = $Session.PutFiles($LocalPath, $remoteTempPath, $false, $transferOptions)
+    # Джерело PutFiles, шлях RemoveFiles і джерело MoveFile — маски WinSCP
+    # (#366): екрануються, щоб ім'я з `[`/`]` не зачепило сусідній файл.
+    $transferResult = $Session.PutFiles((ConvertTo-BRAVOWinSCPFileMask -Path $LocalPath), $remoteTempPath, $false, $transferOptions)
     if (-not $transferResult.IsSuccess) {
         $failureMessages = @(
             $transferResult.Transfers | Where-Object { $null -ne $_.Error } |
@@ -4425,12 +4539,12 @@ function Send-BRAVOTraceArchiveFile {
     # Стара версія прибирається ЛИШЕ після верифікованого .new: SFTP-rename
     # не перезаписує ціль, тому шлях звільняється явним RemoveFiles.
     if ($Session.FileExists($RemoteFinalPath)) {
-        $removeResult = $Session.RemoveFiles($RemoteFinalPath)
+        $removeResult = $Session.RemoveFiles((ConvertTo-BRAVOWinSCPFileMask -Path $RemoteFinalPath))
         if (-not $removeResult.IsSuccess) {
             return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = "не вдалося звільнити $RemoteFinalPath для публікації нової версії (верифікований .new залишено)" }
         }
     }
-    $Session.MoveFile($remoteTempPath, $RemoteFinalPath)
+    $Session.MoveFile((ConvertTo-BRAVOWinSCPFileMask -Path $remoteTempPath), $RemoteFinalPath)
     $finalInfo = $Session.GetFileInfo($RemoteFinalPath)
     if ($null -eq $finalInfo -or [int64]$finalInfo.Length -ne [int64]$localItem.Length) {
         return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = "фінальна верифікація $RemoteFinalPath не пройдена після публікації" }
@@ -4774,7 +4888,7 @@ function Invoke-BRAVOTraceRemoteLogMigration {
                     }
                     continue
                 }
-                $Session.MoveFile($sourcePath, $targetPath)
+                $Session.MoveFile((ConvertTo-BRAVOWinSCPFileMask -Path $sourcePath), $targetPath)
                 if ($Session.FileExists($targetPath) -and -not $Session.FileExists($sourcePath)) {
                     $result.Moved++
                     Write-BRAVOLogRotationMessage -Logger $Logger `
@@ -6616,22 +6730,49 @@ function Invoke-CommandWithLog {
 function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
     param(
         [string]$SevenZipPath,
-        [string]$ArchivePath
+        [string]$ArchivePath,
+        # #300: лише для retention (Remove-OldRestoreArchives) і лише для
+        # СТАРІШИХ (не найновішої) сесій, які він ОЦІНЮЄ: archive-specific
+        # збій (7-Zip відпрацював і забракував архів) дає WARNING, але не
+        # виставляє criticalErrorOccurred/restoreIntegrityFailed (інакше
+        # зламаний старий архів робить кожен нічний прогін exit 41).
+        # Збій ВИКОНАННЯ перевірки (немає 7-Zip, помилка запуску, таймаут)
+        # прапорці виставляє і з цим перемикачем — це не доказ проти
+        # архіву, а непрацююча перевірка (fail-safe).
+        [switch]$NoFailureFlags
     )
 
     # T006: fallback-успіх пише WARNING через цей самий Logger (Write-Log
     # -> BRAVOWarningCount -> код 10) і реєструє ім'я архіву в колекторі
     # прогону для одного сповіщення (Add-BRAVOMaintenanceLegacyBomFallbackAlert).
-    $integrityValid = Test-SevenZipArchiveIntegrity `
-        -SevenZipPath $SevenZipPath `
-        -ArchivePath $ArchivePath `
-        -Password $script:ArchivePassword `
-        -TimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
-        -Logger { param($Message, $Level) Write-Log $Message -Level $Level } `
-        -LegacyBomFallbackCollector $script:MaintenanceLegacyBomFallbackArchives
+    $integrityArguments = @{
+        SevenZipPath = $SevenZipPath
+        ArchivePath = $ArchivePath
+        Password = $script:ArchivePassword
+        TimeoutSeconds = $SevenZipIntegrityTestTimeoutSeconds
+        Logger = { param($Message, $Level) Write-Log $Message -Level $Level }
+        LegacyBomFallbackCollector = $script:MaintenanceLegacyBomFallbackArchives
+    }
+    # Без -NoFailureFlags виклик ідентичний попередньому (без нових
+    # параметрів); з ним — рядок archive-specific збою пишеться WARNING,
+    # а класифікація збою повертається через FailureInfo.
+    $integrityFailureInfo = $null
+    if ($NoFailureFlags) {
+        $integrityFailureInfo = @{}
+        $integrityArguments['ArchiveFailureLevel'] = 'WARNING'
+        $integrityArguments['FailureInfo'] = $integrityFailureInfo
+    }
+    $integrityValid = Test-SevenZipArchiveIntegrity @integrityArguments
     if (-not $integrityValid) {
-        $script:criticalErrorOccurred = $true
-        $script:restoreIntegrityFailed = $true
+        $archiveSpecificFailure = (
+            $null -ne $integrityFailureInfo -and
+            $integrityFailureInfo.ContainsKey('ArchiveSpecific') -and
+            [bool]$integrityFailureInfo['ArchiveSpecific']
+        )
+        if (-not $NoFailureFlags -or -not $archiveSpecificFailure) {
+            $script:criticalErrorOccurred = $true
+            $script:restoreIntegrityFailed = $true
+        }
     }
     return $integrityValid
 }
@@ -6850,10 +6991,19 @@ function Remove-OldRestoreArchives {
     # До ліміту версій зараховуються лише сесії, що мають хоча б один
     # повністю перевірений архів. Неповна нова сесія не повинна витіснити
     # стару придатну точку відновлення.
+    # #300: сесії обходяться від найновішої (Name = мітка часу
+    # yyyyMMdd_HHmm, той самий порядок, що й retention нижче). -NoFailureFlags
+    # отримує лише сесія, СТАРША за вже підтверджену придатну точку
+    # відновлення: збій 7z t найновішої сесії або будь-якої сесії, новішої
+    # за всі придатні (зокрема коли найновіша непридатна лише через hash),
+    # лишається критичним (exit 41), як до #300.
+    $sevenZipIntegrityFailureSeen = $false
+    $validRestorePointNewerSeen = $false
     $validGroups = @()
     $invalidGroups = @()
-    foreach ($group in $archiveGroups) {
+    foreach ($group in @($archiveGroups | Sort-Object Name -Descending)) {
         $validArchiveCount = 0
+        $isOlderGroup = $validRestorePointNewerSeen
         foreach ($archive in @($group.Group)) {
             $hashPath = "$($archive.FullName).sha512"
             $archiveValid = $false
@@ -6873,9 +7023,24 @@ function Remove-OldRestoreArchives {
                 if ($actualHash -cne $expectedHash) {
                     throw "SHA512 не збігається"
                 }
-                if (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
+                # #300: виняток самої перевірки (а не результат) — перевірку не
+                # виконано, це збій виконання, не доказ пошкодження архіву:
+                # fail-closed, прапорці навіть для старшої сесії.
+                $integrityPassed = $false
+                try {
+                    $integrityPassed = Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
                         -SevenZipPath $ARC_PATH `
-                        -ArchivePath $archive.FullName)) {
+                        -ArchivePath $archive.FullName `
+                        -NoFailureFlags:$isOlderGroup
+                } catch {
+                    $sevenZipIntegrityFailureSeen = $true
+                    Write-Log "Перевірку 7z t не виконано: $($archive.Name) — $($_.Exception.Message)" -Level "ERROR"
+                    $script:criticalErrorOccurred = $true
+                    $script:restoreIntegrityFailed = $true
+                    throw "перевірку 7z t не виконано"
+                }
+                if (-not $integrityPassed) {
+                    $sevenZipIntegrityFailureSeen = $true
                     throw "перевірка 7z t не пройдена"
                 }
                 $archiveValid = $true
@@ -6887,9 +7052,19 @@ function Remove-OldRestoreArchives {
 
         if ($validArchiveCount -gt 0) {
             $validGroups += $group
+            $validRestorePointNewerSeen = $true
         } else {
             $invalidGroups += $group
         }
+    }
+
+    # #300: жодної придатної точки відновлення не лишилось, а причиною
+    # (хоча б частково) був збій 7z t — критично, як до #300, навіть якщо
+    # окремі збої старіших сесій були лише WARNING.
+    if (@($validGroups).Count -eq 0 -and $sevenZipIntegrityFailureSeen) {
+        Write-Log "Не лишилось жодної придатної точки відновлення у $Path (перевірка 7z t не пройдена)" -Level "ERROR"
+        $script:criticalErrorOccurred = $true
+        $script:restoreIntegrityFailed = $true
     }
 
     $sortedGroups = @($validGroups | Sort-Object Name -Descending)
@@ -7376,8 +7551,19 @@ function Send-FinalReport {
         $LOG_FILE
     )
 
+    # #299: усе, що вже в чергах, передається цьому звіту; страховка
+    # Send-BRAVOMaintenanceEarlyExitAlerts надсилатиме лише пізніші записи.
+    # Знімок береться тут, а доставленими записи позначаються лише перед
+    # самою відправкою (або коли звіт свідомо нічого не надсилає): якщо
+    # побудова тексту чи маршрутизація кине виняток, страховка у finally
+    # надішле їх.
+    $finalReportCriticalSnapshot = $script:CriticalErrorsList.Count
+    $finalReportAlertQueueSnapshot = $script:NotificationAlertQueue.Count
+
     # Перевірка режиму "none" - повне вимкнення
     if ($script:SlackMode -eq "none") {
+        $script:maintenanceDeliveredCriticalAlertCount = $finalReportCriticalSnapshot
+        $script:maintenanceDeliveredAlertQueueCount = $finalReportAlertQueueSnapshot
         return
     }
 
@@ -7394,6 +7580,27 @@ function Send-FinalReport {
             -Severity "CRITICAL" `
             -Duration $elapsedTime `
             -Details (@($script:CriticalErrorsList.ToArray()) +
+                @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
+                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
+            -LogPath $LOG_FILE
+        $notificationSeverity = "CRITICAL"
+        $shouldSend = $true
+    }
+    # Get-Variable замість прямого читання: під StrictMode Send-FinalReport
+    # може викликатися там, де criticalErrorOccurred ще не ініціалізовано
+    # (ізольований виклик у self-test); тоді гілка просто не спрацьовує.
+    elseif ((Get-Variable -Name criticalErrorOccurred -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq $true) {
+        # #298: багато місць лише ставлять criticalErrorOccurred (-> exit 60)
+        # і не додають запис у CriticalErrorsList. Без цієї гілки errors_only
+        # мовчки повертався б. Окрема причина алерту: узагальнене CRITICAL
+        # без деталей; записи NotificationAlertQueue (якщо є) додаються, щоб
+        # не загубитись. Коди завершення не змінюються.
+        $notificationMessage = New-MaintenanceNotificationMessage `
+            -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
+            -TitleEmoji ":rotating_light:" `
+            -Severity "CRITICAL" `
+            -Duration $elapsedTime `
+            -Details (@("Maintenance завершився з критичною помилкою без детальної причини. Подробиці дивіться в журналі.") +
                 @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
                 @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
             -LogPath $LOG_FILE
@@ -7507,6 +7714,8 @@ function Send-FinalReport {
 
     # Якщо повідомлення не повинно відправлятися - виходимо
     if (-not $shouldSend) {
+        $script:maintenanceDeliveredCriticalAlertCount = $finalReportCriticalSnapshot
+        $script:maintenanceDeliveredAlertQueueCount = $finalReportAlertQueueSnapshot
         return
     }
 
@@ -7519,6 +7728,8 @@ function Send-FinalReport {
         -Severity $notificationSeverity `
         -NotificationMode $script:SlackMode `
         -RoutingTable $bravoSettings.NotificationRouting
+    $script:maintenanceDeliveredCriticalAlertCount = $finalReportCriticalSnapshot
+    $script:maintenanceDeliveredAlertQueueCount = $finalReportAlertQueueSnapshot
     try {
         Invoke-NotificationWebhook -Message $notificationMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
         Write-Log -Message "Фінальне повідомлення відправлено в $NotificationProviderDisplayName" -Level "SUCCESS"
@@ -8118,6 +8329,10 @@ if (-not $script:BRAVOToolManifest.IsValid) {
     $manifestLevel = if ($script:BRAVOToolManifest.ShouldBlock) { "ERROR" } else { "WARNING" }
     Write-Log -Message $script:BRAVOToolManifest.Message -Level $manifestLevel
     if ($script:BRAVOToolManifest.ShouldBlock) {
+        # #299 (рішення власника): підмінений 7za/WinSCP — CRITICAL одразу,
+        # а не лише рядок ERROR у лозі.
+        Send-SlackAlert -Message "Обслуговування заблоковано перевіркою цілісності інструментів: $($script:BRAVOToolManifest.Message)" -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "перевірка цілісності інструментів"
         exit (Resolve-BRAVOExitCode -ToolIntegrityViolation)
     }
 } elseif (-not [string]::IsNullOrWhiteSpace([string]$script:BRAVOToolManifest.Message)) {
@@ -8504,10 +8719,12 @@ Write-BRAVOProgressPhase -Phase 'Зупинка служб' -PercentComplete 20
 $maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock `
     -TaskType $(if ($RunMissedRestoreOnly) { 'Recovery' } else { 'Maintenance' })
 if (-not $maintenanceLockResult.Success) {
-    Write-Log -Message (
+    $maintenanceLockSkipMessage = (
         "Maintenance відкладено: BRAVO_ARCHIV або інший maintenance уже працює; " +
         "lock=$($maintenanceLockResult.Path); $($maintenanceLockResult.Error)"
-    ) -Level "ERROR"
+    )
+    Write-Log -Message $maintenanceLockSkipMessage -Level "ERROR"
+    Send-BRAVOMaintenanceSkippedRunAlert -Message $maintenanceLockSkipMessage -Reason "операційний lock не отримано" -RecoveryTick:$RunMissedRestoreOnly
     Complete-BRAVOProgress
     # Код з канонічного контракту BRAVO.ExitCodes (SkippedLockBusy = 20),
     # а не літерал: ця ж гілка тепер завершує й вичерпаний бюджет очікування
@@ -8548,6 +8765,7 @@ if ([string]$script:startModeRepairResult.Status -eq 'OwnerAlive') {
         $reExchangeEnabled -ne [bool]$exchangAPIServiceEnabled -or
         $reWebEnabled -ne [bool]$BravoWebMaintenanceEnabled) {
         Write-Log -Message "Класифікація служб змінилась, поки очікувався lock (інший прогін тимчасово утримував служби Disabled, #297): Bravo $BravoMaintenanceEnabled->$reBravoEnabled, exchangAPI $exchangAPIServiceEnabled->$reExchangeEnabled, Web $BravoWebMaintenanceEnabled->$reWebEnabled. Рішення цього прогону обчислені зі застарілих даних — прогін завершено без дій, наступний запуск повторить" -Level "WARNING"
+        Send-BRAVOMaintenanceSkippedRunAlert -Message "Класифікація служб змінилась, поки очікувався lock (#297); наступний запуск повторить." -Reason "класифікація служб змінилась під час очікування lock" -RecoveryTick:$RunMissedRestoreOnly
         Exit-BRAVOMaintenanceOperationLock
         Complete-BRAVOProgress
         exit (Resolve-BRAVOExitCode -LockBusy)
@@ -8774,6 +8992,7 @@ if ($RunMissedRestoreOnly -and $missedDailyWork -and -not $bootRestoreIgnoresWin
             Write-BRAVORestoreState -ScheduledOccurrence $scheduledOccurrence -Status 'Pending' -Reason $message
         }
         Send-SlackAlert -Message $message -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "recovery guard: служби вже працюють"
         exit 20
     }
 }
@@ -8962,6 +9181,7 @@ if ($quiescenceServices.Count -gt 0) {
         $quiescenceMarkerError = "Не вдалося записати ownership-маркер зупинки служб — зупинку служб і обслуговування перервано (без маркера аварійне переривання лишило б служби зупиненими без автоматичного відновлення): $($_.Exception.Message)"
         Write-Log -Message $quiescenceMarkerError -Level 'ERROR'
         Send-SlackAlert -Message $quiescenceMarkerError -IsCritical
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "збій запису ownership-маркера зупинки служб"
         throw $quiescenceMarkerError
     }
     if ($script:startTypeSnapshot.Count -gt 0) {
@@ -11646,6 +11866,14 @@ exit $script:maintenanceRuntimeExitCode
     # шляху тут не станеться повторної спроби. Виклик ДО Wait-
     # BRAVOManualExit: оператор має побачити результат upload (або
     # WARNING) у консолі до паузи, а не після.
+    #
+    # #299: страховка для будь-якого раннього exit/throw — ще не доставлені
+    # критичні алерти надсилаються тут (ідемпотентно; після Send-FinalReport
+    # нічого не дублюється). До upload, щоб рядок про відправку потрапив у лог.
+    # Get-Command: дуже ранній exit стається ще до визначення функції.
+    if (Get-Command -Name Send-BRAVOMaintenanceEarlyExitAlerts -CommandType Function -ErrorAction SilentlyContinue) {
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason "дострокове завершення прогону"
+    }
     Invoke-BRAVOMaintenanceOwnLogUpload
     Wait-BRAVOManualExit -NoPause:$NoPause
 }

@@ -4383,7 +4383,44 @@ exit
                     -Message "Не вдалося завершити процес WinSCP після таймауту: $($_.Exception.Message)" `
                     -Level "DEBUG"
             }
-            throw "перевищено таймаут перевірки SFTP-з'єднання"
+            # Lock звільняється лише після ПІДТВЕРДЖЕНОГО завершення WinSCP:
+            # якщо процес досі живий, наступна операція могла б захопити
+            # звільнений lock і запустити другий WinSCP паралельно з першим.
+            # Тоді lock лишається за цим процесом (звільниться з його
+            # завершенням), а прогін іде фатальним шляхом, як до #290.
+            $winSCPExited = $false
+            try {
+                $winSCPExited = [bool]$process.HasExited
+            } catch {
+                $winSCPExited = $false
+            }
+            if (-not $winSCPExited) {
+                # Lock-потік має жити до завершення ПРОЦЕСУ BRAVO: без
+                # довгоживучого посилання FileStream після виходу з функції
+                # міг би бути фіналізований GC і звільнити lock, поки WinSCP
+                # ще працює (а finally Archive далі запускає WinSCP для
+                # вивантаження власного журналу). Тримаємо його в script scope.
+                $script:BRAVOWinSCPLockHeldForLiveProcess = $outputCapture
+                Write-BRAVOLog `
+                    -Component 'SFTP' `
+                    -Message "Перевищено таймаут перевірки SFTP-з'єднання, але WinSCP не завершився; BRAVO_WINSCP lock не звільняється" `
+                    -Level "ERROR"
+                throw "перевищено таймаут перевірки SFTP-з'єднання; WinSCP не завершився"
+            }
+            # Звільняємо ресурси (зокрема BRAVO_WINSCP lock) ДО виходу:
+            # раніше throw оминав Complete-BRAVOProcessOutputCapture, lock
+            # лишався захопленим, а викликачі (без try) завершувались
+            # exit 90 замість шляху "SFTP недоступний".
+            try {
+                [void](Complete-BRAVOProcessOutputCapture -Capture $outputCapture)
+            } catch {
+                Write-BRAVOLog `
+                    -Component 'SFTP' `
+                    -Message "Не вдалося завершити збір виводу WinSCP після таймауту: $($_.Exception.Message)" `
+                    -Level "WARNING"
+            }
+            Write-BRAVOLog -Component 'SFTP' -Message "Перевищено таймаут перевірки SFTP-з'єднання ($([math]::Max(1, [int]$sftpConnectionTimeoutSeconds + 30)) с); WinSCP завершено" -Level "ERROR"
+            return $false
         }
         $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $outputCapture
         $output = $capturedOutput.StandardOutput
@@ -5786,7 +5823,8 @@ function Invoke-BRAVOBazaCanonicalSync {
         $syncResult = Invoke-BRAVOBazaIncrementalSync -Component $Component -LocalDirectory $LocalDirectory -RemoteDirectory $RemoteDirectory
         $outcome.SyncResult = $syncResult
         $outcome.Status = [string]$syncResult.Status
-        $outcome.Success = ($outcome.Status -eq 'COMPLETE')
+        # #285: MUTATION_AUTO_ARCHIVED — успіх (INFO за контрактом), єдиний helper BazaSync/Health.
+        $outcome.Success = [bool](Test-BRAVOBazaSyncStatusSuccess -Status $outcome.Status)
         $outcome.Skipped = ($outcome.Status -eq 'SKIPPED_CONCURRENT')
         $outcome.Completed = [int]($syncResult.Uploaded + $syncResult.AlreadyVerified)
         $outcome.Remaining = [int]$syncResult.Failed
@@ -6078,11 +6116,15 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     # виявлення підозріло малих архівів) плюс запас на зростання джерела.
     #
     # 5.2.4: додано другу, НЕЗАЛЕЖНУ від історії величину — нестиснутий
-    # розмір джерела. Архів фізично не може бути більшим за своє джерело
-    # (найгірший випадок 7-Zip — store-режим), тому
+    # розмір джерела. У найгірший випадок 7-Zip (store-режим) архів не
+    # менший за джерело плюс контейнерні накладні витрати; з #279 оцінка
     #   sourceBytes * (1 + SourceOverheadPercent/100)
-    # є ДОВЕДЕНОЮ верхньою межею, а не прогнозом. Вона застосовується
-    # двояко:
+    #     + (fileCount + dirCount) * PerFileOverheadBytes + сума (2 * довжина
+    #       відносного імені + термінатор) по файлах і каталогах (#400)
+    # є КОНСЕРВАТИВНОЮ оцінкою з урахуванням per-file метаданих, а не
+    # доведеною межею (і не прогнозом): відсоток не обмежує заголовки/імена
+    # записів (багато дрібних файлів або довгі шляхи), тож метадані
+    # додаються окремим доданком. Вона застосовується двояко:
     #   - як стеля для history-оцінки: якщо джерело з часу останнього
     #     архіву зменшилось, вимога зменшується разом з ним (тісніше,
     #     ніколи не більше);
@@ -6095,9 +6137,10 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     #     довелось закрити по-справжньому.
     # Джерело, розмір якого виміряти не вдалось (шлях недоступний, порожній
     # або не заданий), лишає компонент без вимоги — як і до 5.2.4. Так само
-    # без вимоги лишається джерело, виміряне успішно з нульовим розміром
-    # (порожній каталог або лише файли нульової довжини): sourceBytes -eq 0
-    # не дає верхньої оцінки, і SourceUpperBoundBytes/EstimatedBytes = $null.
+    # без вимоги лишається джерело, в якому немає жодного файлу (порожній
+    # каталог): SourceUpperBoundBytes/EstimatedBytes = $null. #400: дерево з
+    # файлами нульової довжини оцінку МАЄ — метадані записів 7-Zip від
+    # розміру файлів не залежать; каталоги рахуються як окремі записи.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object[]]$EnabledArchives,
@@ -6109,6 +6152,15 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
         # на несжимаємих даних архів може вийти на частки відсотка більшим
         # за вхід — 2% покривають це з запасом і не роблять межу марною.
         [double]$SourceOverheadPercent = 2.0,
+        # #279: консервативна оцінка метаданих 7-Zip на ОДИН запис (файл;
+        # з #400 і каталог — 7-Zip зберігає для нього окремий запис):
+        # заголовок у central/end header — атрибути, часи (до 3 x 8 B),
+        # розміри, CRC, прапорці емпті-потоку, посилання на folder/substream
+        # — разом зазвичай кілька десятків байтів; 256 B свідомо з великим
+        # запасом, щоб оцінка не була заниженою для дрібних файлів. Це
+        # параметр (а не script-константа), бо функцію self-test
+        # AST-екстрактить окремо від решти файлу.
+        [ValidateRange(0, 65536)][int]$PerFileOverheadBytes = 256,
         # Той самий injectable-override принцип, що -Drives у
         # Get-BRAVOArchiveFreeSpaceResult вище: детермінований self-test
         # без залежності від реального вільного місця на CI/dev-машині.
@@ -6124,11 +6176,18 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
         $componentType = [string]$archive.Type
         $destination = [string]$archive.Destination
 
-        # Нестиснутий розмір джерела — доведена верхня межа розміру архіву.
+        # Нестиснутий розмір джерела (+ per-file метадані, #279) — консервативна
+        # верхня оцінка розміру архіву.
         # Обхід каталогу навмисно тут, у preflight: те саме дерево 7-Zip
         # прочитає далі в будь-якому разі, а помилка доступу тут має
         # означати «межу невідомо», а не крах оцінки.
         $sourceBytes = $null
+        # #279: кількість файлів і байти імен з ТОГО Ж проходу, що міряє
+        # sourceBytes. Для SourceSizeOverrides (лише байти) метаданих немає.
+        $sourceFileCount = [int64]0
+        # #400: 7-Zip зберігає окремий запис і для кожного каталогу.
+        $sourceDirectoryCount = [int64]0
+        $sourceNameBytes = [int64]0
         if ($PSBoundParameters.ContainsKey('SourceSizeOverrides') -and
             $SourceSizeOverrides.ContainsKey($componentType)) {
             $overrideValue = $SourceSizeOverrides[$componentType]
@@ -6161,11 +6220,47 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
             if (-not [string]::IsNullOrWhiteSpace($sourcePath)) {
                 try {
                     if (Test-Path -LiteralPath $sourcePath) {
-                        $measuredSource = Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force -ErrorAction Stop |
-                            Measure-Object -Property Length -Sum
-                        if ($null -ne $measuredSource -and $null -ne $measuredSource.Sum) {
-                            $sourceBytes = [int64]$measuredSource.Sum
+                        # Довжина кореня — лише для відносних імен. Якщо шлях
+                        # не вдається нормалізувати (довгий шлях на старому
+                        # .NET), корінь 0: ім'я рахується повністю, тобто з
+                        # запасом, а не робить межу невідомою.
+                        $rootLength = 0
+                        try {
+                            $rootFullName = [string](Get-Item -LiteralPath $sourcePath -Force -ErrorAction Stop).FullName
+                            $rootLength = $rootFullName.TrimEnd('\', '/').Length
+                        } catch {
+                            $rootLength = 0
                         }
+                        $measuredBytes = [int64]0
+                        $measuredFiles = [int64]0
+                        $measuredDirectories = [int64]0
+                        $measuredNameBytes = [int64]0
+                        # Потоково (конвеєр), а не foreach по готовому масиву:
+                        # на дереві з мільйонами файлів не тримати всі FileInfo
+                        # у пам'яті. ForEach-Object виконується в цій самій
+                        # області, тож лічильники накопичуються тут.
+                        Get-ChildItem -LiteralPath $sourcePath -Recurse -Force -ErrorAction Stop | ForEach-Object {
+                            $sourceFile = $_
+                            if ($sourceFile.PSIsContainer) {
+                                $measuredDirectories++
+                            } else {
+                                $measuredBytes += [int64]$sourceFile.Length
+                                $measuredFiles++
+                            }
+                            # Відносне ім'я, як його збереже 7-Zip (UTF-16:
+                            # 2 B на символ) + 2 B термінатор.
+                            $fullName = [string]$sourceFile.FullName
+                            $relativeLength = if ($fullName.Length -gt $rootLength) {
+                                $fullName.Length - $rootLength - 1
+                            } else {
+                                ([string]$sourceFile.Name).Length
+                            }
+                            $measuredNameBytes += (2 * [int64]$relativeLength) + 2
+                        }
+                        $sourceBytes = $measuredBytes
+                        $sourceFileCount = $measuredFiles
+                        $sourceDirectoryCount = $measuredDirectories
+                        $sourceNameBytes = $measuredNameBytes
                     }
                 } catch {
                     # Недоступне чи частково недоступне джерело не робить
@@ -6176,10 +6271,12 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
                 }
             }
         }
-        # Порожнє чи нульове джерело НЕ дає стелі: інакше воно обнулило б
-        # вимогу компонента, який насправді має що архівувати.
-        $sourceUpperBoundBytes = if ($null -ne $sourceBytes -and $sourceBytes -gt 0) {
-            [int64][math]::Ceiling($sourceBytes * (1.0 + ($SourceOverheadPercent / 100.0)))
+        # Джерело без жодного файлу НЕ дає стелі: інакше воно обнулило б
+        # вимогу компонента, який насправді має що архівувати. Файли нульової
+        # довжини стелю дають (#400): архів з них — це їхні метадані.
+        $sourceMetadataBytes = (($sourceFileCount + $sourceDirectoryCount) * [int64]$PerFileOverheadBytes) + $sourceNameBytes
+        $sourceUpperBoundBytes = if ($null -ne $sourceBytes -and ($sourceBytes -gt 0 -or $sourceFileCount -gt 0)) {
+            [int64][math]::Ceiling($sourceBytes * (1.0 + ($SourceOverheadPercent / 100.0))) + $sourceMetadataBytes
         } else {
             $null
         }
@@ -6191,13 +6288,17 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
             -MaxCount 1)
 
         if ($history.Count -eq 0) {
-            # Bootstrap: історії немає, тож єдина підстава — доведена межа.
+            # Bootstrap: історії немає, тож єдина підстава — консервативна
+            # оцінка за джерелом (з per-file метаданими).
             [void]$componentEstimates.Add([pscustomobject]@{
                 Type = $componentType
                 Destination = $destination
                 HasHistory = $false
                 LastValidBytes = $null
                 SourceBytes = $sourceBytes
+                SourceFileCount = $sourceFileCount
+                SourceDirectoryCount = $sourceDirectoryCount
+                SourceMetadataBytes = $sourceMetadataBytes
                 SourceUpperBoundBytes = $sourceUpperBoundBytes
                 EstimateBasis = $(if ($null -ne $sourceUpperBoundBytes) { 'SourceUpperBound' } else { 'Unknown' })
                 EstimatedBytes = $sourceUpperBoundBytes
@@ -6218,6 +6319,9 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
             HasHistory = $true
             LastValidBytes = $lastBytes
             SourceBytes = $sourceBytes
+            SourceFileCount = $sourceFileCount
+            SourceDirectoryCount = $sourceDirectoryCount
+            SourceMetadataBytes = $sourceMetadataBytes
             SourceUpperBoundBytes = $sourceUpperBoundBytes
             EstimateBasis = $estimateBasis
             EstimatedBytes = $estimatedBytes
@@ -6320,13 +6424,13 @@ function Resolve-BRAVOArchiveSpaceDecision {
     #     Get-BRAVOArchiveEstimatedSpaceRequirement; з 5.2.4 компонент без
     #     валідної історії несе вимогу з нестиснутого розміру джерела, і
     #     RequiredGB лишається невідомим, коли джерело виміряти не вдалось
-    #     або виміряний розмір нульовий (порожнє джерело чи лише файли
-    #     нульової довжини) — тоді GroupRequirementState=Unknown, safe floor
+    #     або в ньому немає жодного файлу (порожній каталог; з #400 файли
+    #     нульової довжини оцінку дають) — тоді GroupRequirementState=Unknown, safe floor
     #     fallback BelowFallbackFloorNoEstimate).
     #
     # ВАЖЛИВО (5.2.4, замінює рішення reviewer #2 від 2026-08-30):
     # RequirementPolicy='ArchivePeakSafe'. MinimumFreeSpaceGB — захист
-    # ЗДОРОВ'Я тому, а не гейт операції: якщо доведена вимога влазить у
+    # ЗДОРОВ'Я тому, а не гейт операції: якщо консервативна вимога влазить у
     # доступне місце, прогін ДОЗВОЛЯЄТЬСЯ з WARNING
     # (BelowHealthFloorButRequirementSatisfied), навіть коли вільного
     # менше за поріг. Блокує лише невиконана вимога
@@ -6341,8 +6445,8 @@ function Resolve-BRAVOArchiveSpaceDecision {
     # AvailableGB, бо вимірювання відбувається до створення нової.
     # Реальною дірою було інше — компонент без історії взагалі випадав з
     # оцінки. Її закрито в Get-BRAVOArchiveEstimatedSpaceRequirement вище
-    # доведеною верхньою межею з нестиснутого розміру джерела, і саме це
-    # дає право увімкнути ArchivePeakSafe.
+    # консервативною оцінкою з нестиснутого розміру джерела плюс per-file
+    # метадані 7-Zip (#279), і саме це дає право увімкнути ArchivePeakSafe.
     #
     # Наслідок 5.2.3, який це прибирає: сервер із 715 GB вільного і
     # потребою 0.07 GB блокувався лише тому, що поріг стояв вище за
@@ -7338,8 +7442,8 @@ function Main {
     # кожного компонента + запас), а не лише "диск ОС не забитий впритул".
     # Компонент без історії з 5.2.4 оцінюється верхньою оцінкою з
     # розміру джерела; без вимоги лишається лише компонент, джерело якого
-    # виміряти не вдалось або виміряний розмір якого нульовий (порожнє
-    # джерело чи лише файли нульової довжини).
+    # виміряти не вдалось або в якому немає жодного файлу (порожній
+    # каталог; з #400 файли нульової довжини оцінку дають).
     try {
         $archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement `
             -EnabledArchives $enabledArchives `

@@ -7,6 +7,199 @@
   (наприклад, порожній каталог), через що `Test-BRAVODiscoveryComponentDrift` на кожному запуску бачив «раніше
   підтверджений компонент зник» (Error). Тепер для не-Present компонента пишеться порожнє джерело; компонент, що
   був Present у baseline і зник, як і раніше дає Error. Тести: `BackupScope/Baseline*`.
+- **Fix: Archive: оцінка місця враховує дерева з файлами нульової довжини і записи каталогів (#400).**
+  Після #279 оцінка за джерелом додавала метадані кожного файлу, але джерело з нульовим сумарним розміром
+  лишалось без оцінки, навіть якщо в ньому тисячі порожніх файлів, а каталоги, для яких 7-Zip теж зберігає
+  окремі записи, не рахувались. Тепер `Get-BRAVOArchiveEstimatedSpaceRequirement` дає оцінку за метаданими і
+  для таких дерев, а кожен каталог рахується як запис (256 B + ім'я); нове поле `SourceDirectoryCount`.
+  Порожній каталог без файлів, як і раніше, оцінки не дає. Коди завершення не змінено.
+- **Fix: Credentials: порожній текст винятку SYSTEM-worker-а більше не сприймається як успіх (#395).**
+  Worker писав `FatalError = $_.Exception.Message`, а батьківський процес перевіряв правдивість рядка, тож виняток
+  без тексту давав `FatalError = ""` і порожній список результатів вважався успіхом: SYSTEM-крок не виконано,
+  сховища розходились, відкат не запускався. Тепер `Invoke-AsSystem` вважає збоєм будь-яку відповідь, де
+  `FatalError` не `$null` (зокрема порожній рядок чи відсутнє поле), а worker для винятку без тексту пише ім'я
+  типу винятку. Коди завершення не змінено.
+- **Fix: Configurator: типографський апостроф у значенні більше не ламає BRAVO.local.config (#307).**
+  PowerShell вважає одинарною лапкою не лише ASCII `'`, а й `‘ ’ ‚ ‛` (U+2018–U+201B), а Configurator
+  екранував лише ASCII. Значення на кшталт «здоров’я» закривало літерал, і Preview та Apply падали з
+  оманливою помилкою парсингу. Тепер усі ці лапки подвоюються (як `CodeGeneration.EscapeSingleQuotedStringContent`)
+  у значеннях, ключах і шляху RuntimeRoot ізольованого обчислення; для значень без таких символів
+  згенерований текст не змінився.
+- **Fix: Health: відкладена SFTP-перевірка більше не показується в повідомленні як справна (#303).**
+  Коли інший `WinSCP.com` працює, `Get-SFTPHealthIssues` відкладає SFTP-перевірку і не повертає
+  issues. Кроки вже позначались SKIPPED, але повідомлення писали «SFTP ✓», «BAZA_APP — синхронізовано»
+  і «BAZA_APP — SFTP актуальна». Тепер у звіті про успіх ці рядки WARNING з текстом «перевірку
+  відкладено, WinSCP зайнятий іншою операцією», а в алерті рядок «SFTP актуальна» замінено на
+  попередження про відкладену перевірку. Без відкладення повідомлення не змінились.
+- **Fix: Dry run: write-probe більше не лишає порожніх батьківських каталогів (#283).**
+  Probe на `<Dest>\.work` при відсутньому `<Dest>` створював обидва каталоги (`New-Item -Force`), а прибирав лише
+  `.work`, тож dry run, який обіцяє не створювати каталогів, лишав порожні `<BackupRoot>\<COMP>` і `SystemLogRoot`.
+  Тепер `Test-BRAVOFileSystemWriteAccess` запам'ятовує весь ланцюжок каталогів, яких не було до probe, і після
+  перевірки прибирає їх від глибшого до вищого, зупиняючись на першому непорожньому. Каталоги, що існували до
+  probe, не чіпаються. Коди завершення не змінено.
+- **Fix: Dry run публікує результат `-ResultPath` атомарно (#306).**
+  `BRAVO_TASKS_DIAGNOSE` опитує появу `dry-run.json` і одразу читає його, а dry run писав JSON прямо
+  в кінцевий файл. Diagnose міг прочитати порожній чи частковий файл або натрапити на sharing violation
+  і завершитись помилкою, що валило крок 5 `BRAVO_SETUP` і гейт `Update-BRAVOServer`. Тепер
+  `Write-DryRunOutput` пише повний JSON у тимчасовий файл поруч і переносить його на `ResultPath`
+  через `Move-Item` (як воркер `BRAVO_CREDENTIALS_SETUP`); тимчасовий файл прибирається і при збої.
+- **Fix: SFTP: імена з `[`/`]` більше не трактуються WinSCP як маска (#366).**
+  WinSCP читає останній сегмент локального джерела `PutFiles`, шляху `RemoveFiles` і джерела `MoveFile`
+  як файлову маску (`*`, `?`, `[...]`), а Windows дозволяє `[`/`]` в іменах. Тож `doc[1].txt` збігався з
+  `doc1.txt`: передавався б сусідній файл, а видалення чи перейменування зачепили б не той шлях. Новий
+  `ConvertTo-BRAVOWinSCPFileMask` (BRAVO.Compatibility) екранує лише останній сегмент так само, як
+  `RemotePath.EscapeFileMask`; застосовано в публікації trace-архівів і власного логу, міграції
+  `/trace` -> `/logs/trace`, upload BAZA і перейменуванні прийнятої мутації BAZA. Імена checkpoint-ів
+  BAZA фіксовані й вільні від символів маски (перевіряє тест), тож ці виклики не змінено.
+
+- **Fix: Operations: витіснені переповненням outbox події повертаються після enrollment, втрати рахуються (#280).**
+  Коли outbox переповнювався (500 подій), найстаріші мовчки йшли в DeadLetter і після enrollment не доставлялися,
+  а ретенція DeadLetter (200 файлів) видаляла їх безповоротно без жодного підсумку. Тепер (рішення власника)
+  витіснення позначається `DeadLetterKind = Overflow`, і дренажі після enrollment повертають такі події з DeadLetter
+  в outbox (найстаріші першими, не більше вільного місця в outbox; старі записи розпізнаються за причиною «Outbox
+  переповнено»), доки не повернуть усі; після цього повернення для серверної ідентичності більше не повторюється. Події, відхилені бекендом (HTTP 4xx), пошкоджені й
+  чужої ідентичності лишаються в DeadLetter. Події, остаточно видалені ретенцією DeadLetter, пошкоджені
+  outbox-файли і невдалий запис в outbox збільшують наростаючий лічильник втрачених подій
+  (`BRAVO_OPERATIONS_OUTBOX_LOSS.json`, `Get-BRAVOOperationsOutboxLossSummary`) з WARNING у журналі. Коди завершення
+  не змінено.
+- **Fix: Maintenance: ранні виходи більше не гублять критичні алерти (#299).**
+  `Send-SlackAlert -IsCritical` лише додає запис у чергу, а надсилає її `Send-FinalReport`, до якого ранні виходи
+  не доходили: recovery guard (`exit 20`), збій запису quiescence-маркера (`throw` → 90), блокування через
+  цілісність інструментів і пропуск через lock. Новий `Send-BRAVOMaintenanceEarlyExitAlerts` одразу надсилає ще не
+  доставлені записи обох черг одним повідомленням «ОБСЛУГОВУВАННЯ ПЕРЕРВАНО»; він викликається перед кожним із цих
+  виходів і як страховка у спільному finally (ідемпотентно, після `Send-FinalReport` нічого не дублюється, а алерт,
+  піднятий після звіту, теж доставляється). Підмінений 7za/WinSCP тепер одразу дає CRITICAL (рішення власника).
+  Пропуск планового прогону через lock (зайнятий lock або зміна класифікації служб під час очікування) дає ERROR
+  без зміни коду завершення; Recovery-тик через lock лише логує.
+  Коди завершення не змінено.
+- **Fix: Archive: оцінка місця за розміром джерела враховує метадані кожного файлу (#279).**
+  Для компонента без валідної історії `Get-BRAVOArchiveEstimatedSpaceRequirement` рахував лише
+  `sourceBytes * 1.02`, і коментарі називали це доведеною верхньою межею. Але 7-Zip зберігає для кожного
+  запису заголовок, ім'я та метадані, які не обмежені 2%: багато дрібних файлів або довгі шляхи давали
+  архів більший за оцінку, і політика `ArchivePeakSafe` могла дозволити backup нижче
+  `MinimumFreeSpaceGB`. Тепер до оцінки додається `fileCount * PerFileOverheadBytes` (256 B на файл,
+  свідомо консервативно) та сума `2 * довжина відносного імені + 2` по файлах; кількість файлів і довжини
+  імен беруться з того самого проходу, що міряє `sourceBytes` (потоково, без масиву всіх файлів у пам'яті; якщо
+  корінь не вдається нормалізувати, імена рахуються повністю, тобто з запасом). Та сама оцінка слугує стелею для
+  history-оцінки; сама history-оцінка (за розміром реальних попередніх архівів) не змінена. Коментарі
+  тепер називають її консервативною оцінкою з урахуванням per-file метаданих, а не доведеною межею.
+  Додано поля `SourceFileCount` і `SourceMetadataBytes`, наявні поля не змінено; `MinimumFreeSpaceGB`,
+  коди завершення і логіка `ArchivePeakSafe` не змінені. Тести:
+  `Archive/EstimatedSpaceCountsPerFileMetadataForManySmallFiles`,
+  `Archive/EstimatedSpaceSingleLargeFileNotPenalised`; очікувані значення наявних bootstrap/cap-тестів
+  оновлено (+280 B за один файл `payload.bin`).
+
+- **Fix: Operations: outbox-елемент без EventId більше не блокує доставку подій (#305).**
+  Під StrictMode 2.0 прямий `$item.EventId` кидав виняток для outbox-файлу без цього поля (ручна правка, часткове
+  відновлення) — у логуванні, у самому dead-letter і в логу успіху. Виняток минав поелементну ізоляцію дренажу:
+  дренаж зупинявся на цьому елементі на кожному прогоні Archive/Health/Maintenance/heartbeat, події за ним не
+  доставлялися, а з валідними ApiPath/RequestBody подія ще й надсилалась повторно на кожному циклі backoff. Тепер
+  EventId читається через `Get-BRAVOOperationsOutboxItemEventId`; елемент без EventId до транспорту переміщується в
+  DeadLetter з окремою причиною (ім'я файлу береться з імені файлу outbox), решта черги обробляється далі. Коди
+  завершення не змінено. Тести: `Operations/OutboxItemWithoutEventIdIsDeadLetteredWithOwnReason`,
+  `Operations/OutboxItemWithoutEventIdDoesNotBlockOrResendQueue`.
+- **Fix: Credentials: FatalError SYSTEM-worker-а до запису у сховище теж відкочує поточне сховище (#302).**
+  Детермінований тригер з #302 (worker під SYSTEM падає ще на завантаженні конфігурації, напр. через
+  `BRAVO_ALLOW_WEAKENED_SECURITY` лише в сесії оператора) повертав `FatalError` після `Run` і йшов шляхом
+  «невизначено» без відкоту. Тепер worker пише в `result.json` поле `OperationsStarted`: `$false`, якщо збій стався
+  до першої операції зі сховищем (конфігурація, модулі, читання чи дешифрування payload), і `$true`, щойно почалась
+  транзакція сховища. `New-SystemWorkerFatalError` позначає виняток «не розпочато» лише за булевим `$false`;
+  відсутнє поле (старий worker) чи інше значення лишається невизначеним станом, як і раніше. Коди завершення не
+  змінено. Тести: `Credentials/SystemWorkerFatalBeforeOperationsIsNotStarted`,
+  `Credentials/SystemWorkerFatalAfterOperationsStaysIndeterminate`, `Credentials/ProtectedPayloadWorkerReportsOperationsStarted`,
+  `Credentials/WorkerModeFailureReportsOperationsStartedFromEntryFlag`; guard
+  `Credentials/SystemWorkerNotStartedMarkerOnlyBeforeTaskLaunch` допускає один маркер у `New-SystemWorkerFatalError`
+  лише під умовою булевого `OperationsStarted`.
+- **Fix: Maintenance: критична помилка без запису в чергах дає алерт за `errors_only` (#298).**
+  Багато місць (ротація логів, архів і SFTP Trace, BRAVO_ARCHIV, перевірки 7-Zip) ставлять лише
+  `criticalErrorOccurred` і не додають запис у `CriticalErrorsList`, тож `Send-FinalReport` за `errors_only`
+  повертався нічого не надіславши, хоча прогін завершувався кодом 60. Тепер `criticalErrorOccurred` без записів
+  у `CriticalErrorsList` є окремою причиною: надсилається один CRITICAL-алерт з узагальненим текстом «без
+  детальної причини» і шляхом до журналу. Коли `CriticalErrorsList` непорожній, повідомлення не змінюється
+  (без дубля), успішний прогін за `errors_only` і далі нічого не надсилає, коди завершення не змінено.
+  Маршрутизація кожного місця окремо не робилась. Тести: `Maintenance/CriticalFlagWithoutEntriesAlertsInErrorsOnly`,
+  `Maintenance/NoCriticalFlagSendsNothingInErrorsOnly`, `Maintenance/CriticalFlagWithEntryKeepsExistingMessage`.
+- **Fix: Archive: `MUTATION_AUTO_ARCHIVED` більше не вважається збоєм SFTP (#285).**
+  `Invoke-BRAVOBazaCanonicalSync` вважала успіхом лише `COMPLETE`, тому цикл з легітимною мутацією в межах
+  `AutoArchiveMutationThreshold` (INFO за `OPERATIONS.md` і Health) завершувався exit 50 з порожньою причиною
+  «ПОМИЛКА» щоразу. Тепер успіх визначає один експортований helper BazaSync `Test-BRAVOBazaSyncStatusSuccess`
+  (`COMPLETE` і `MUTATION_AUTO_ARCHIVED`; усе інше, включно з незнайомим статусом, не успіх). Статуси
+  `MUTATION_VIOLATION`, `REMOTE_CONFLICT`, `AUDIT_DRIFT`, `INCOMPATIBLE_NAME`, `INCOMPLETE` лишаються збоєм, як і
+  раніше. Регресія: `BazaSync/CanonicalSyncMutationAutoArchivedIsSuccess`, `BazaSync/CanonicalSyncCompleteIsSuccess`,
+  `BazaSync/CanonicalSyncFailureStatusesAreNotSuccess`, `BazaSync/StatusSuccessHelperWhitelistsCompleteAndAutoArchivedOnly`.
+  Якщо після авто-архівування не вдалося зберегти стан BazaSync, `MUTATION_AUTO_ARCHIVED` знижується до `INCOMPLETE`
+  з Error (як і `COMPLETE`), тож такий цикл не рахується успіхом. Регресія: `BazaSync/AutoArchiveStateSaveFailureIsNotSuccess`.
+- **Fix: BazaSync: `MUTATION_AUTO_ARCHIVED` не ховає `AUDIT_DRIFT`, `REMOTE_CONFLICT` і `INCOMPATIBLE_NAME` того самого циклу (#293).**
+  Статус `MUTATION_AUTO_ARCHIVED` обирався раніше за drift/конфлікт/несумісні імена, а Fast Health одразу
+  повертав INFO/healthy, тож на сайті з регулярними мутаціями ці проблеми ставали рядками INFO назавжди
+  (`RemoteConflicts` і `IncompatibleFiles` у стані не зберігаються). Авто-архівування виконується за тих самих умов
+  (поріг не змінено), але підсумковий статус тепер обирає найсуворіший: за непорожніх списків drift/конфлікту/
+  несумісних імен цикл отримує `AUDIT_DRIFT`/`REMOTE_CONFLICT`/`INCOMPATIBLE_NAME` (CRITICAL), а факт
+  авто-архівування лишається в Info. Fast Health повертає INFO лише коли цих списків немає. Регресія:
+  `BazaSync/AutoArchivedDoesNotMaskRemoteConflictInFastHealth`,
+  `BazaSync/AutoArchiveWithSameCycleRemoteConflictIsNotAutoArchivedStatus`.
+- **Fix: Maintenance: зламаний старий архів у retention більше не дає код 41 щоночі (#300).**
+  `Remove-OldRestoreArchives` лише оцінює старі архіви реставрації, але його перевірка `7z t` через
+  `Test-BRAVOMaintenanceSevenZipArchiveIntegrity` виставляла `criticalErrorOccurred` і `restoreIntegrityFailed`.
+  Через один давній пошкоджений архів, який ніхто не відновлює, кожен нічний прогін Maintenance завершувався
+  кодом 41 (збій цілісності реставрації). Тепер обгортка має перемикач `-NoFailureFlags`, і лише retention його
+  використовує: збій лишається WARNING у журналі (щоразу, без одноразової позначки) і архів не зараховується як
+  точка відновлення, але прапорці не виставляються. Решта викликів (Verify-Backup, перевірка після реставрації)
+  поводяться як раніше. Коди завершення не змінено. Межі послаблення: `-NoFailureFlags` діє лише для старіших
+  сесій (не найновішої за тим самим порядком, що й retention) і лише для archive-specific збою (7-Zip відпрацював
+  і повернув код 1/2). Зламана найновіша точка відновлення, відсутність жодної придатної точки після збою `7z t`
+  і збій виконання самої перевірки (немає 7-Zip, помилка запуску, таймаут, інші коди) й надалі дають обидва
+  прапорці (код 41). На warning-only шляху рядок «Перевірка цілісності 7-Zip не пройдена» пишеться рівнем
+  WARNING, а не ERROR (`Test-SevenZipArchiveIntegrity` отримав необов'язкові `-ArchiveFailureLevel` і `-FailureInfo`;
+  без них поведінка інших викликачів незмінна). Регресія:
+  `Maintenance/RetentionBrokenOldArchiveDoesNotSetFailureFlags`, `Maintenance/RetentionBrokenOldArchiveStillLogsWarning`,
+  `Maintenance/DirectIntegrityCheckStillSetsFailureFlags`, `Maintenance/RetentionOldBrokenArchiveNoFlagsSameKeepDeleteSet`,
+  `Maintenance/RetentionOldBrokenArchiveLogsWarningNotError`, `Maintenance/RetentionNewestBrokenRestorePointSetsFailureFlags`,
+  `Maintenance/RetentionAllRestorePointsBrokenSetsFailureFlags`, `Maintenance/RetentionNoValidRestorePointLeftSetsFailureFlags`,
+  `Maintenance/RetentionOldArchiveValidatorMissingSetsFailureFlags`, `Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags`.
+  Уточнення межі: warning-only отримує лише сесія, старша за вже підтверджену придатну точку відновлення (обхід від
+  найновішої), тож збій сесії, новішої за всі придатні (зокрема коли найновіша непридатна лише через `.sha512`), критичний.
+  Код 1/2 вважається archive-specific лише за власними (нелокалізованими) повідомленнями 7-Zip про вміст архіву
+  (`Data Error`, `CRC Failed`, `Wrong password`, `Can not open the file as archive` тощо); локалізована відмова доступу
+  чи зайнятий файл без них — збій виконання (код 41). Якщо в legacy BOM-fallback друга спроба не завершила перевірку
+  (таймаут, помилка запуску, інший код), `Invoke-BRAVOSevenZipIntegrityTest` позначає це `FallbackAttemptOperationalFailure`,
+  і збій не вважається archive-specific. Регресія: `Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags`,
+  `Maintenance/RetentionBrokenNewerThanAnyValidPointSetsFailureFlags`, `LegacyBomFallback/FallbackAttemptTimeoutIsNotArchiveSpecific`,
+  `LegacyBomFallback/CompletedFallbackFailureIsNotOperational`. Друга (legacy BOM) спроба з кодом 1/2 без власних
+  повідомлень 7-Zip про вміст архіву (наприклад, локалізована відмова доступу) теж позначається як незавершена
+  перевірка, а порожній результат валідатора нормалізується до збою виконання до першого читання властивостей.
+  Регресія: `LegacyBomFallback/FallbackAttemptLocalizedAccessFailureIsNotArchiveSpecific`,
+  `ArchiveHelpers/IntegrityNullValidatorResultIsOperationalFailure`. Виняток самої перевірки 7z t у retention (а не
+  результат) теж виставляє прапорці цілісності навіть для старшої сесії (перевірку не виконано). Регресія:
+  `Maintenance/RetentionValidatorExceptionSetsFailureFlags`.
+- **Fix: Archive: таймаут перевірки SFTP повертає `$false` і звільняє lock WinSCP (#290).**
+  `Test-SFTPConnection` після таймауту вбивала WinSCP і кидала виняток раніше, ніж `Complete-BRAVOProcessOutputCapture`
+  звільняла lock `BRAVO_WINSCP`. Викликачі (ручний `-SyncBAZA` і `Main`) не мають `try`, тому прогін завершувався
+  кодом 90 замість шляху «SFTP недоступний», а lock лишався захопленим. Тепер при таймауті ресурси звільняються
+  (збій звільнення логується WARNING), в журнал пишеться ERROR з описом таймауту, функція повертає `$false`,
+  і діє наявна обробка збою SFTP з кодом 50. Значення кодів завершення не змінено. Регресія:
+  `Archive/SftpConnectionTimeoutReturnsFalse`, `Archive/SftpConnectionTimeoutReleasesWinSCPLock`,
+  `Archive/SftpConnectionTimeoutLogsError`. Lock звільняється лише після підтвердженого завершення WinSCP; якщо
+  процес не завершився, lock лишається (capture з lock-потоком зберігається в script scope до завершення процесу BRAVO,
+  щоб GC не звільнив lock), а прогін іде фатальним шляхом, щоб не запустити другий WinSCP паралельно
+  (`Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive`).
+- **Fix: Credentials: виняток SYSTEM-кроку відкочує сховище поточного користувача (#302).**
+  `Restore-CredentialOperationSnapshots` запускався лише за рядками результату зі `Status=Error`. Якщо
+  `Invoke-AsSystem` кидав виняток (таймаут worker-а, `FatalError`, збій Task Scheduler), блок мав лише `finally`
+  зі звільненням знімків: секрети 7z/SFTP у сховищі поточного користувача лишалися зміненими, а в SYSTEM — ні.
+  Тепер для мутуючих дій (`Action` не `Test`) знімок відновлюється, після чого перекидається оригінальний
+  виняток, тож шлях завершення і коди виходу не змінилися. Збій самого відкоту виводиться як Warning і не
+  маскує оригінал. Блок винесено у `Invoke-CredentialOperationsViaSystemWorker` без зміни поведінки; порожній
+  масив знімків для `Test` більше не розгортається в `$null`. Тести: `Credentials/SystemWorkerException*`.
+  Після review відкіт виконується лише тоді, коли доведено, що SYSTEM worker не запускався (виняток до
+  `$registeredTask.Run`, позначений `Add-SystemWorkerNotStartedMarker`). Таймаут, `FatalError` чи збій
+  `result.json` після запуску означають невизначений стан SYSTEM-сховища: поточне сховище НЕ відкочується
+  (інакше розбіжність виникла б навпаки), виводиться Warning з переліком Target і порадою повторити ту саму
+  команду (або `-Action Test`), а оригінальний виняток пропагується. Warning-и обробника мають
+  `-WarningAction Continue` і не маскують оригінал за `$WarningPreference='Stop'`. Тести:
+  `Credentials/SystemWorkerIndeterminateFailureDoesNotRollBack`,
+  `Credentials/SystemWorkerRollbackWarningsSurviveWarningPreferenceStop`,
+  `Credentials/SystemWorkerNotStartedMarkerOnlyBeforeTaskLaunch`.
 - **Fix: Archive: status-файл оновлюється і при ранніх виходах (#291).**
   `BRAVO_STATUS_Archive.json` писався лише у хвості `Main` і у fatal catch. Провал preflight вільного
   місця (exit 40), провал очищення orphan VSS (exit 40) і `exit` усередині `Test-Compatibility`

@@ -1699,6 +1699,25 @@ function ConvertTo-BRAVOWindowsCommandLineArgument {
     return $builder.ToString()
 }
 
+function ConvertTo-BRAVOWinSCPFileMask {
+    # WinSCP .NET трактує останній сегмент локального джерела PutFiles,
+    # шляху RemoveFiles і джерела MoveFile (скриптові put/rm/mv) як файлову
+    # маску: `*`, `?` і `[...]` — шаблони. Windows дозволяє `[`/`]` в іменах,
+    # тож без екранування `Trace[1].mdz` збігся б з `Trace1.mdz` (#366).
+    # Правило те саме, що RemotePath.EscapeFileMask: лише останній сегмент
+    # (після останнього `/` або `\`), `[` -> `[[]`, `*` -> `[*]`, `?` -> `[?]`.
+    # Каталог не змінюється: маска в ньому не діє. FileExists/GetFileInfo
+    # приймають буквальний шлях і екранування не потребують.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path
+    )
+    $separatorIndex = $Path.LastIndexOfAny([char[]]@('/', '\'))
+    $directoryPart = $Path.Substring(0, $separatorIndex + 1)
+    $leaf = $Path.Substring($separatorIndex + 1)
+    return ($directoryPart + $leaf.Replace('[', '[[]').Replace('*', '[*]').Replace('?', '[?]'))
+}
+
 function Write-BRAVOProcessInputText {
     # Детермінований запис у stdin дочірнього процесу: UTF-8 БЕЗ BOM через
     # BaseStream, незалежно від кодування StreamWriter-а StandardInput
@@ -1954,6 +1973,33 @@ function Invoke-BRAVOSevenZipIntegrityTest {
     }
     # Обидві спроби невдалі — повертаємо ПЕРШУ (нормальний пароль) як
     # основну причину відмови, не приховуючи її fallback-спробою.
+    # #300: але якщо друга спроба не ЗАВЕРШИЛА перевірку (таймаут, помилка
+    # запуску, код поза 1/2), це позначається, щоб споживачі не вважали
+    # результат доведеним пошкодженням архіву.
+    $secondProperties = $secondAttempt.PSObject.Properties
+    $secondTimedOut = ($null -ne $secondProperties['TimedOut'] -and [bool]$secondAttempt.TimedOut)
+    $secondErrorText = if ($null -ne $secondProperties['Error']) { [string]$secondAttempt.Error } else { '' }
+    $secondOperationalFailure = (
+        $secondTimedOut -or
+        -not [string]::IsNullOrWhiteSpace($secondErrorText) -or
+        $null -eq $secondAttempt.ExitCode -or
+        -not (@(1, 2) -contains [int]$secondAttempt.ExitCode)
+    )
+    # #300: код 1/2 другої спроби сам по собі неоднозначний (відмова доступу
+    # чи зайнятий файл дають той самий код із локалізованим текстом Windows).
+    # Завершеною перевірка вважається лише за власними (нелокалізованими)
+    # повідомленнями 7-Zip про вміст архіву: той самий fail-closed
+    # класифікатор, що в Test-SevenZipArchiveIntegrity (BRAVO.ArchiveHelpers).
+    # Локальна змінна: функцію виконують і поза модулем (AST-витяг у self-test).
+    if (-not $secondOperationalFailure) {
+        $archiveContentFailurePattern = '(?i)Data Error|CRC Failed|Headers Error|Unexpected end of (archive|data)|Can ?not open (the )?file as|is not archive|Wrong password|Unsupported (Method|feature)|Unconfirmed start of archive|There are data after the end of archive'
+        $secondOutputText = "$($secondAttempt.StandardError)`n$($secondAttempt.StandardOutput)"
+        if ($secondOutputText -notmatch $archiveContentFailurePattern -or
+            $secondOutputText -match 'Access is denied|being used by another process') {
+            $secondOperationalFailure = $true
+        }
+    }
+    $firstAttempt | Add-Member -MemberType NoteProperty -Name FallbackAttemptOperationalFailure -Value ([bool]$secondOperationalFailure) -Force
     return $firstAttempt
 }
 
