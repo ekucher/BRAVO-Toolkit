@@ -85,11 +85,23 @@ live-перевірки `GET /branches/{b}`.
 issue.
 
 **Autonomous Correctness Green Wave (2026-10-06/07)**, кожен PR: RED
-(лише тести, self-test на Windows PowerShell 5.1 падає рівно на нових
-тестах) → фікс → рев'ю → 8/8 exact-head перевірок CI з першої спроби
-(шість на Windows, `Secret scanning (gitleaks)` і `GitGuardian` — поза
-Windows) → merge → TREE_EQUAL →
-закриття issue з відповідністю критеріїв доказам:
+(лише тести, self-test на Windows PowerShell 5.1 падає на нових тестах)
+→ фікс → рев'ю → 8/8 exact-head перевірок CI з першої спроби → merge →
+TREE_EQUAL → закриття issue з відповідністю критеріїв доказам.
+
+* RED: у #388, #393, #403 і #404 перший RED-прогін був недійсним
+  (дефект тестового каркаса або неоновлений `RUNTIME_MANIFEST.json`);
+  доказом для них є повторний RED на незміненому runtime. У #406 одна
+  з двох нових перевірок проходить і на старому коді (лише регресійний
+  guard). Деталі й номери прогонів — у тілі кожного PR.
+* 8 перевірок exact-head (за check-runs PR): на Windows —
+  `Parser / BOM / JSON`, `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`,
+  `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`, `Config parity
+  (BRAVO_CONFIG_LOADER)`, `Build + verify + happy-path + rollback +
+  failure-injection`; на Ubuntu — `Secret scanning (gitleaks)`; зовнішній
+  застосунок — `GitGuardian Security Checks`. `Telegram summary logic
+  test` (Ubuntu) запускається лише на зміни своїх файлів і в ці 8 не
+  входив.
 
 | PR | Merge | Зміст | Issue |
 | --- | --- | --- | --- |
@@ -115,10 +127,13 @@ Windows) → merge → TREE_EQUAL →
 | #409 | `b146a09` | порожній FatalError SYSTEM-worker-а — збій, не успіх | #395 |
 | #410 | `c27a3e6` | оцінка місця: дерева з нульовими файлами і записи каталогів | #400 |
 
-Рев'ю: з 2026-09-30 до 2026-10-07 Codex був недоступний (ліміт), тож
-рев'ю виконував Claude QA fallback (`review_source: claude-qa-fallback`,
-`independence: degraded`). З 2026-10-07 Codex знову доступний і
-переглянув #405, #409, #410 без зауважень.
+Рев'ю: на початку хвилі (до ~23:22 UTC 2026-10-06) PR переглядав Codex,
+і його зауваження виправлено до merge: #384 (P1 і P2: 13592a2, a6baff9),
+#385 (P2: 3665c5c), #386 (P2), #387 (P1: таймаут WinSCP без звільнення
+lock), #388 (388-C1). Далі ліміт Codex вичерпався, і рев'ю виконував
+Claude QA fallback (`review_source: claude-qa-fallback`, `independence:
+degraded`). З 2026-10-07 Codex знову доступний і переглянув #405, #409,
+#410 без зауважень.
 
 Раніше в тому ж проміжку (окремі хвилі, git-історія й звіти поза
 репозиторієм у `/mnt/project-files/bravo-backlog/`): Production Safety
@@ -216,7 +231,12 @@ BLOCKED.
    PR у developer (потрібна нова авторизація на merge).
 6. B5: довести pilot до PILOT ACCEPTED (PublicIPLookupEnabled),
    рішення про модель міграції парку. До доказів B5 — hard stop нижче.
-Перед кроком 1 перечитати: git rev-parse origin/developer, GET /pulls?state=open.
+Перед кроком 1 перевірити кандидат hotfix (RC незмінний після публікації):
+  git rev-parse origin/hotfix/5.2.5        # очікується 9790a50
+  git show origin/hotfix/5.2.5:VERSION.json # 5.2.5-rc.5, sourceCommit 3f181ba
+  CI на 9790a50 зелений (workflow_dispatch run 37528388423)
+  git ls-remote --tags origin 'v5.2.5-rc.5*' і список release — порожні
+Перед кроками 2–5 перечитати: git rev-parse origin/developer, GET /pulls?state=open.
 ```
 
 Merge `developer` → `master`, теги, RC/stable release, GitHub Release і
