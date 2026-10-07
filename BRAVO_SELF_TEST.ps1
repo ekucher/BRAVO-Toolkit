@@ -13098,6 +13098,81 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Health/StaleGenerationDiagnosisKeepsKindAndComponent' `
         -Failure 'Diagnosis — додаткове поле: Kind=LocalBackupGeneration, Component=Generation і Reason stale-issue не змінюються (action text, Operations, exit code)'
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.StaleGenerationDiagnosis' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Health.SftpDeferredMessage' -DependsOn 'Root/Runtime') { try {
+    # #303: коли SFTP-перевірку відкладено через зайнятий WinSCP, перевірки
+    # не було. Повідомлення не мають показувати SFTP/BAZA SFTP як справні;
+    # контрольний прогін без відкладення показує ті самі рядки як справні.
+    $sftpDeferredMessageModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Format-FileSize', 'Format-BackupAge', 'ConvertTo-BRAVOUtcDateTime', 'Get-BRAVOUtcAge',
+            'Get-HealthIssueComponentName', 'ConvertTo-NotificationLiteralText', 'Format-HealthIssueFileName',
+            'Format-CompactLocalIssue', 'Format-CompactSFTPIssue', 'Format-CompactSMBIssue',
+            'Get-BRAVOHealthCollapsedCloudIssues', 'Get-BRAVOHealthIssueActionText', 'New-SlackAlertMessage',
+            'New-SlackSuccessMessage'
+        )
+    $sftpDeferredMessages = @{}
+    # Контроль іде першим і прапорець не задає взагалі — як наявні виклики
+    # поза основним потоком (StrictMode не має падати на неініціалізованому прапорці).
+    foreach ($sftpDeferredCase in @($false, $true)) {
+        $sftpDeferredMessages[$sftpDeferredCase] = & $sftpDeferredMessageModule {
+            param([bool]$Deferred)
+            Set-StrictMode -Version Latest
+            $script:NotificationProvider = 'slack'
+            if ($Deferred) { $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $true }
+            $script:healthNotInstalledComponents = @()
+            $script:healthLatestArchives = @{}
+            $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'
+            $backupMonitoring = [pscustomobject]@{
+                MaxBackupAgeHours = 24; InstitutionName = 'Лабораторія-1'; InstitutionCode = 'LAB1'
+                SFTP = [pscustomobject]@{ Enabled = $true; CheckBAZASynchronization = $true; CheckArchiveUploads = $true }
+                SMB = [pscustomobject]@{ Enabled = $false; CheckArchiveCopies = $false }
+            }
+            $storageEffective = [pscustomobject]@{
+                SFTP = [pscustomobject]@{ Enabled = $true; ArchiveUpload = $true }
+                SMB = [pscustomobject]@{ Enabled = $false; ArchiveCopy = $false }
+            }
+            $bazaAppLocalHealthEnabled = $false; $bazaWWWLocalHealthEnabled = $false
+            $bazaAppSFTPHealthEnabled = $true; $bazaWWWSFTPHealthEnabled = $false
+            $healthCheckStarted = Get-Date; $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime(); $healthLogFile = 'self-test.log'
+            function Get-HostInformation { return $null }
+            function Get-EnabledBackupComponentNames { return @() }
+            function Get-BRAVOHealthLatestBackupSummary { return [pscustomobject]@{ Found = $false; TimestampText = 'немає'; AgeText = ''; ComponentLines = @() } }
+            function Format-BRAVOOperatorStatusLine { param($Status, $Icon, $Name, $Detail) return "[$Status] $Name — $Detail" }
+            function New-BRAVOOperatorNotificationMessage { param($ResultLines, $ReasonLines) return (@($ReasonLines) + @($ResultLines)) -join "`n" }
+            $localIssue = [pscustomobject]@{ Kind = 'LocalBackupGeneration'; Component = 'Generation'; Reason = 'остання COMPLETE generation старша за 24 год.'; FileName = 'BRAVO_BACKUP_G.json'; LastWriteTime = $null; SizeBytes = 1; Diagnosis = 'завдання BRAVO_ARCHIV вимкнене' }
+            [pscustomobject]@{
+                Alert = [string](New-SlackAlertMessage -Issues @($localIssue) -Duration ([timespan]::FromSeconds(1)))
+                Success = [string](New-SlackSuccessMessage -Duration ([timespan]::FromSeconds(1)))
+            }
+        } $sftpDeferredCase
+    }
+    $sftpDeferredAlert = [string]$sftpDeferredMessages[$true].Alert
+    $sftpDeferredSuccess = [string]$sftpDeferredMessages[$true].Success
+    $sftpCheckedAlert = [string]$sftpDeferredMessages[$false].Alert
+    $sftpCheckedSuccess = [string]$sftpDeferredMessages[$false].Success
+    Test-BRAVOCondition `
+        -Condition (
+            $sftpCheckedAlert -match 'BAZA_APP — SFTP актуальна' -and
+            $sftpDeferredAlert -notmatch 'SFTP актуальн' -and
+            $sftpDeferredAlert -match 'BAZA_APP — SFTP: перевірку відкладено'
+        ) `
+        -Name 'Health/DeferredSftpAlertDoesNotClaimBazaSftpCurrent' `
+        -Failure "за відкладеної SFTP-перевірки алерт не має писати «SFTP актуальна», а має показати відкладення; відкладено: $sftpDeferredAlert ||| контроль: $sftpCheckedAlert"
+    Test-BRAVOCondition `
+        -Condition (
+            $sftpCheckedSuccess -match '\[SUCCESS\] SFTP — ' -and
+            $sftpCheckedSuccess -match '\[SUCCESS\] BAZA_APP — синхронізовано' -and
+            $sftpDeferredSuccess -notmatch '\[SUCCESS\] SFTP' -and
+            $sftpDeferredSuccess -notmatch '\[SUCCESS\] BAZA_APP' -and
+            $sftpDeferredSuccess -notmatch 'синхронізовано' -and
+            $sftpDeferredSuccess -match '\[WARNING\] SFTP — перевірку відкладено' -and
+            $sftpDeferredSuccess -match '\[WARNING\] BAZA_APP — перевірку відкладено' -and
+            $sftpDeferredSuccess -match '\[SUCCESS\] Local'
+        ) `
+        -Name 'Health/DeferredSftpSuccessMessageShowsSkippedNotOk' `
+        -Failure "за відкладеної SFTP-перевірки рядки SFTP і BAZA_APP мають бути WARNING «перевірку відкладено», а не SUCCESS; відкладено: $sftpDeferredSuccess ||| контроль: $sftpCheckedSuccess"
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health.SftpDeferredMessage' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Health.LocalSyncIssueWithoutExitCode' -DependsOn 'Root/Runtime') { try {
     # #286: проблема LocalSynchronization без поля ExitCode (7 з 9 гілок
     # Get-BAZALocalSyncHealthIssues) валила Health із кодом 90 під StrictMode:
