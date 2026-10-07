@@ -12995,12 +12995,14 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             'New-SlackSuccessMessage'
         )
     $sftpDeferredMessages = @{}
-    foreach ($sftpDeferredCase in @($true, $false)) {
+    # Контроль іде першим і прапорець не задає взагалі — як наявні виклики
+    # поза основним потоком (StrictMode не має падати на неініціалізованому прапорці).
+    foreach ($sftpDeferredCase in @($false, $true)) {
         $sftpDeferredMessages[$sftpDeferredCase] = & $sftpDeferredMessageModule {
             param([bool]$Deferred)
             Set-StrictMode -Version Latest
             $script:NotificationProvider = 'slack'
-            $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $Deferred
+            if ($Deferred) { $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $true }
             $script:healthNotInstalledComponents = @()
             $script:healthLatestArchives = @{}
             $global:ScriptVersion = 'self-test'; $global:ScriptBuildId = 'self-test'

@@ -4665,7 +4665,9 @@ function New-SlackAlertMessage {
         }).Count -eq 0
     # #303: відкладена через зайнятий WinSCP SFTP-перевірка не дає issues,
     # але й нічого не підтверджує — такий рядок показується як відкладений.
-    $sftpCheckDeferred = [bool]$script:BRAVOHealthSftpCheckDeferredByBusyWinSCP
+    # Безпечне читання: функцію викликають і поза основним потоком, де
+    # прапорець не ініціалізовано (StrictMode).
+    $sftpCheckDeferred = [bool](Get-Variable -Scope Script -Name BRAVOHealthSftpCheckDeferredByBusyWinSCP -ValueOnly -ErrorAction SilentlyContinue)
     $bazaSftpDeferredLine = "SFTP: перевірку відкладено, WinSCP зайнятий іншою операцією"
     $bazaAppSFTPChecked = [bool]$backupMonitoring.SFTP.Enabled -and
         [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
@@ -4783,7 +4785,9 @@ function New-SlackSuccessMessage {
 
     # #303: відкладена SFTP-перевірка (WinSCP зайнятий) нічого не
     # підтвердила — її рядки WARNING «перевірку відкладено», а не SUCCESS.
-    $sftpCheckDeferred = [bool]$script:BRAVOHealthSftpCheckDeferredByBusyWinSCP
+    # Безпечне читання: функцію викликають і поза основним потоком, де
+    # прапорець не ініціалізовано (StrictMode).
+    $sftpCheckDeferred = [bool](Get-Variable -Scope Script -Name BRAVOHealthSftpCheckDeferredByBusyWinSCP -ValueOnly -ErrorAction SilentlyContinue)
     $sftpDeferredDetail = 'перевірку відкладено, WinSCP зайнятий іншою операцією'
 
     if ($backupMonitoring.SFTP.Enabled -and
