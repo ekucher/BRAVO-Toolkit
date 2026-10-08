@@ -2018,6 +2018,9 @@ function Write-Log {
         StartWhenAvailable = @({ param($d) $d.Settings.StartWhenAvailable = $true }, 'StartWhenAvailable')
         SubscriptionPath = @({ param($d) $e = @($d.Triggers)[0]; $e.Subscription = ([string]$e.Subscription) -replace 'Path="System"', 'Path="Application"' }, 'журнал.*System')
         RestartCount = @({ param($d) $d.Settings.RestartCount = 3; $d.Settings.RestartInterval = 'PT5M' }, 'RestartCount=3')
+        # Рев'ю PR #429: щоденний тригер «раз на 2 доби» пропускав би кожну
+        # другу добу страховочних перевірок.
+        DaysInterval = @({ param($d) @($d.Triggers)[2].DaysInterval = 2 }, 'DaysInterval=2.*1')
     }
     $w5DriftDiffs = @()
     foreach ($w5DriftName in @($w5DriftCases.Keys)) {
@@ -2036,7 +2039,7 @@ function Write-Log {
     Test-BRAVOCondition `
         -Condition ($w5DriftDiffs.Count -eq 0) `
         -Name 'ServiceRecovery/DiagnoseDetectsSettingsDrift' `
-        -Failure ("Test-BRAVOServiceRecoveryTaskDefinition: по одній проблемі на Repetition.Duration≠P1D, StopAtDurationEnd=true, StartWhenAvailable=true, підписку не на журнал System і RestartCount>0. " +
+        -Failure ("Test-BRAVOServiceRecoveryTaskDefinition: по одній проблемі на Repetition.Duration≠P1D, StopAtDurationEnd=true, StartWhenAvailable=true, підписку не на журнал System, RestartCount>0 і DaysInterval≠1. " +
             ($w5DriftDiffs -join ' || '))
 
     # ============================================================
