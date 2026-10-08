@@ -33,6 +33,17 @@
   лише під `storageEffective.SFTP`/`SMB` (AST-аналіз умов, ранніх виходів і всіх викликів функції).
   Винятки названо з причиною: `BRAVO_BAZA_RECONCILE.ps1` і ручне відновлення
   `BRAVO_DATA_RESTORE.ps1 -Source SFTP`.
+  Явний `-BackupDestination LocalOnly` більше не fail-open (#434): раніше без `-SeedLocalConfig` або з
+  наявним `BRAVO.local.config` інсталятор лише попереджав «НЕ застосовано» і завершувався кодом 0, хоча
+  SFTP/SMB лишались ефективно увімкненими. Тепер без `-SeedLocalConfig` і без наявного файла інсталятор
+  зупиняється в кроці 0, до UAC-перезапуску, завантаження й будь-якого запису; наявний файл крок 4
+  перевіряє за ефективними значеннями (канонічні `Read-BRAVOLocalConfigurationOverrides` ->
+  `Resolve-BRAVORawConfiguration` -> `Get-BRAVOEffectiveStorageConfiguration` і нова чиста
+  `Test-BRAVOConfiguratorBackupDestinationEffective`) і за ефективно ввімкненого SFTP чи SMB зупиняється
+  з назвою каналу та порадою, що змінити; файл не змінюється. Якщо наявний файл уже вимикає обидва
+  канали, інсталятор повідомляє, що `LocalOnly` у силі. Поведінка без `-BackupDestination` і для
+  `Cloud`/`CloudAndSamba`/`SambaOnly` не змінилась; `BackupDestinations/InstallerExistingConfigUntouched`
+  тепер закріплює «файл не чіпаємо / без seed не створюємо» на `CloudAndSamba`/`SambaOnly`.
 - **Hardening: маскування закодованих форм відомих секретів у журналах перед вивантаженням (#417).**
   `Protect-BRAVOLogSecret -KnownSecret` (маскована копія власного журналу Maintenance/Archive і знімка
   `range_id_log.json` перед SFTP) тепер маскує не лише сирий секрет, а й його URL-кодовану форму

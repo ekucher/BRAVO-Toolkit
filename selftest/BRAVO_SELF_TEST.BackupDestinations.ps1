@@ -223,6 +223,43 @@ Test-BRAVOCondition -Condition ($bdEffectiveMismatches.Count -eq 0) `
     -Failure "ефективні напрямки профілів (Хмара: лише SFTP; Хмара + Samba: SFTP і копія NAS; Лише Samba: лише копія NAS; Лише локально: нічого) і жодного BAZA-компонента без каналу (крім дефолтного BAZA_WWW у профілях з SFTP): $($bdEffectiveMismatches -join ' | ')"
 
 # ------------------------------------------------------------
+# (2a) Відповідність профілю за ЕФЕКТИВНИМИ значеннями (#434):
+# Test-BRAVOConfiguratorBackupDestinationEffective порівнює головні вимикачі
+# канонічного Get-BRAVOEffectiveStorageConfiguration з профілем. Результат
+# профілю сам із собою — Compliant; дефолти (SFTP і SMB увімкнені) для
+# LocalOnly — ні, з обома каналами; відсутні ефективні значення — ні.
+# ------------------------------------------------------------
+Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
+$bdEffectiveCheckFailures = @()
+$bdDestinationNames = @($bdExpectedProfiles.Keys)
+foreach ($bdDestination in $bdDestinationNames) {
+    $bdOwnMerged = Resolve-BRAVORawConfiguration -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+        -PrimaryOverrides $null -LocalOverrides $bdProfiles[$bdDestination].Overrides
+    $bdOwnStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings $bdOwnMerged['componentSettings']
+    foreach ($bdCandidate in $bdDestinationNames) {
+        $bdCheck = Test-BRAVOConfiguratorBackupDestinationEffective -Destination $bdCandidate -EffectiveStorage $bdOwnStorage
+        $bdCandidateOverrides = $bdProfiles[$bdCandidate].Overrides
+        $bdOwnOverrides = $bdProfiles[$bdDestination].Overrides
+        $bdShouldMatch = ([bool]$bdCandidateOverrides['componentSettings.SFTP.Enabled'] -eq [bool]$bdOwnOverrides['componentSettings.SFTP.Enabled']) -and
+            ([bool]$bdCandidateOverrides['componentSettings.SMB.Enabled'] -eq [bool]$bdOwnOverrides['componentSettings.SMB.Enabled'])
+        if ([bool]$bdCheck.Compliant -ne $bdShouldMatch -or ($bdShouldMatch -and @($bdCheck.ConflictingChannels).Count -ne 0)) {
+            $bdEffectiveCheckFailures += "$bdCandidate проти ефективних значень $bdDestination : Compliant=$($bdCheck.Compliant) конфлікти=$(@($bdCheck.ConflictingChannels) -join ',')"
+        }
+    }
+}
+$bdDefaultStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings (Get-BRAVODefaultConfiguration)['componentSettings']
+$bdDefaultCheck = Test-BRAVOConfiguratorBackupDestinationEffective -Destination 'LocalOnly' -EffectiveStorage $bdDefaultStorage
+if ([bool]$bdDefaultCheck.Compliant -or (@($bdDefaultCheck.ConflictingChannels) -join ',') -ne 'SFTP,SMB' -or
+    (@($bdDefaultCheck.Reasons) -join ' ') -notmatch '[\u0400-\u04FF]') {
+    $bdEffectiveCheckFailures += "LocalOnly проти дефолтів: Compliant=$($bdDefaultCheck.Compliant) конфлікти=$(@($bdDefaultCheck.ConflictingChannels) -join ',') причини=$(@($bdDefaultCheck.Reasons) -join ' ')"
+}
+$bdNullCheck = Test-BRAVOConfiguratorBackupDestinationEffective -Destination 'LocalOnly' -EffectiveStorage $null
+if ([bool]$bdNullCheck.Compliant) { $bdEffectiveCheckFailures += 'LocalOnly без ефективних значень визнано Compliant' }
+Test-BRAVOCondition -Condition ($bdEffectiveCheckFailures.Count -eq 0) `
+    -Name 'BackupDestinations/EffectiveDestinationCheckMatchesProfiles' `
+    -Failure "Test-BRAVOConfiguratorBackupDestinationEffective має визнавати відповідність профілю лише за ефективними SFTP.Enabled/SMB.Enabled і fail-closed без ефективних значень: $($bdEffectiveCheckFailures -join ' | ')"
+
+# ------------------------------------------------------------
 # (3) Запис нового BRAVO.local.config канонічним кодом Configurator.
 # ------------------------------------------------------------
 function Read-BRAVOSelfTestDestinationOverrides {
@@ -362,22 +399,26 @@ try {
         -Failure "інсталятор з -SeedLocalConfig має створити BRAVO.local.config із профілем (явний SambaOnly і дефолт Cloud); SambaOnly: exit=$($bdRunSamba.ExitCode) $bdRunSambaOverrides; $($bdRunSamba.Output) ||| Cloud: exit=$($bdRunDefault.ExitCode) $bdRunDefaultOverrides; $($bdRunDefault.Output)"
 
     # Наявний файл не змінюється, і вивід називає незастосований профіль.
+    # #434: тут свідомо НЕ LocalOnly — явний LocalOnly при наявному файлі або
+    # без -SeedLocalConfig більше не завершується кодом 0 з «НЕ застосовано»
+    # (fail-closed, перевірки (4a) нижче). Для інших профілів поведінка
+    # «файл не чіпаємо / без seed не створюємо, код 0» лишається.
     $bdExistingText = "@{`r`n    'pathSettings.BackupRoot' = 'D:\ExampleArchive'`r`n}`r`n"
     [IO.File]::WriteAllText($bdLocalConfigPath, $bdExistingText, (New-Object Text.UTF8Encoding($false)))
     $bdExistingBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdLocalConfigPath))
-    $bdRunExisting = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly')
+    $bdRunExisting = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-SeedLocalConfig', '-BackupDestination', 'CloudAndSamba')
     $bdExistingAfter = [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdLocalConfigPath))
     Remove-Item -LiteralPath $bdLocalConfigPath -Force -ErrorAction SilentlyContinue
     # Без -SeedLocalConfig файл не створюється, а явний профіль названо незастосованим.
-    $bdRunNoSeed = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-BackupDestination', 'LocalOnly')
+    $bdRunNoSeed = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-BackupDestination', 'SambaOnly')
     Test-BRAVOCondition -Condition (
         $bdRunExisting.ExitCode -eq 0 -and
         $bdExistingBefore -ceq $bdExistingAfter -and
         $bdRunExisting.Output.Contains('BRAVO.local.config уже існує') -and
-        $bdRunExisting.Output.Contains('профіль напрямків LocalOnly НЕ застосовано') -and
+        $bdRunExisting.Output.Contains('профіль напрямків CloudAndSamba НЕ застосовано') -and
         $bdRunNoSeed.ExitCode -eq 0 -and
         -not (Test-Path -LiteralPath $bdLocalConfigPath) -and
-        $bdRunNoSeed.Output.Contains('профіль напрямків LocalOnly НЕ застосовано') -and
+        $bdRunNoSeed.Output.Contains('профіль напрямків SambaOnly НЕ застосовано') -and
         @(Get-ChildItem -LiteralPath $bdInstallRoot -Force -Filter 'BRAVO.local.config*').Count -eq 0
     ) -Name 'BackupDestinations/InstallerExistingConfigUntouched' `
         -Failure "наявний BRAVO.local.config інсталятор не змінює й повідомляє, який профіль не застосовано; без -SeedLocalConfig файл не створюється; наявний: exit=$($bdRunExisting.ExitCode) байти_збіглись=$($bdExistingBefore -ceq $bdExistingAfter) $($bdRunExisting.Output) ||| без seed: exit=$($bdRunNoSeed.ExitCode) $($bdRunNoSeed.Output)"

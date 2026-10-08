@@ -6,7 +6,9 @@ param(
     [string]$StagingRoot = 'C:\Temp\BRAVO_INSTALL',
     [switch]$SeedLocalConfig,
     # Профіль напрямків резервного копіювання для НОВОГО BRAVO.local.config
-    # (лише разом із -SeedLocalConfig; наявний файл не змінюється):
+    # (лише разом із -SeedLocalConfig; наявний файл не змінюється). Явний
+    # LocalOnly не ігнорується мовчки: якщо його не можна застосувати або
+    # підтвердити за ефективними значеннями, інсталяція зупиняється (#434):
     #   Cloud         — хмара SFTP, Samba вимкнено (дефолт);
     #   CloudAndSamba — хмара SFTP і копія на NAS/SMB;
     #   SambaOnly     — лише NAS/SMB, SFTP вимкнено;
@@ -121,6 +123,22 @@ if (-not (Test-Path -LiteralPath $script:ReleaseGatePath -PathType Leaf)) {
 # --- 0. Передумови ----------------------------------------------------------
 
 Write-Step '0. Передумови'
+
+# Явний -BackupDestination LocalOnly (#434) — рішення ДО першого запису чи
+# завантаження. Без -SeedLocalConfig і без наявного BRAVO.local.config діють
+# дефолти комплекту, а в них SFTP і SMB увімкнені: «Лише локально» не можна
+# ні застосувати, ні підтвердити, тож продовжувати з кодом 0 означало б
+# мовчки випустити дані за межі сервера. Наявний файл перевіряється за
+# ефективними значеннями в кроці 4 (до гейтів, self-test і BRAVO_SETUP).
+# Перевірка стоїть до UAC-перезапуску: причину видно в консолі оператора.
+if ($PSBoundParameters.ContainsKey('BackupDestination') -and $BackupDestination -eq 'LocalOnly' -and
+    -not $SeedLocalConfig -and -not (Test-Path -LiteralPath (Join-Path $RuntimeRoot 'BRAVO.local.config') -PathType Leaf)) {
+    throw ('-BackupDestination LocalOnly не застосовано: без -SeedLocalConfig новий BRAVO.local.config ' +
+        'не створюється, а дефолти комплекту вмикають SFTP і SMB. Повторіть запуск із ' +
+        '-SeedLocalConfig -BackupDestination LocalOnly або покладіть у ' + $RuntimeRoot +
+        ' BRAVO.local.config з componentSettings.SFTP.Enabled = $false і ' +
+        'componentSettings.SMB.Enabled = $false. Нічого не завантажено й не записано.')
+}
 
 $isElevated = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -424,16 +442,45 @@ Write-Step '4. Шар site-відмінностей'
 $localConfig = Join-Path $RuntimeRoot 'BRAVO.local.config'
 $localExample = Join-Path $RuntimeRoot 'BRAVO.local.config.example'
 $backupDestinationExplicit = $PSBoundParameters.ContainsKey('BackupDestination')
+$localOnlyRequested = $backupDestinationExplicit -and $BackupDestination -eq 'LocalOnly'
 $backupDestinationSkippedExisting = $false
+$localConfigExists = $false
+# Модулі Configurator (і для запису, і для читання site-файлу) вже розгорнуто
+# з архіву, SHA-256 якого звірено в кроці 1.
+$configuratorModuleRoot = Join-Path $RuntimeRoot 'modules\BRAVO.Configurator'
+# Явний LocalOnly (#434): рішення за ЕФЕКТИВНИМИ значеннями (дефолти <
+# BRAVO.local.config: канонічні reader, Resolve-BRAVORawConfiguration і
+# Get-BRAVOEffectiveStorageConfiguration), а не за текстом файла. Файл не
+# змінюється й не «виправляється» автоматично.
+function Assert-BRAVOInstallLocalOnlyEffective {
+    foreach ($assertModuleName in @('BRAVO.Configurator.Persistence', 'BRAVO.Configurator.Presets')) {
+        Import-Module -Name (Join-Path $configuratorModuleRoot ($assertModuleName + '.psm1')) -ErrorAction Stop
+    }
+    Import-Module -Name (Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
+    Import-Module -Name (Join-Path $RuntimeRoot 'modules\BRAVO.Discovery\BRAVO.Discovery.psd1') -ErrorAction Stop
+    $overrideState = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $RuntimeRoot -ProductionConfigDirectory $RuntimeRoot
+    $mergedConfiguration = Resolve-BRAVORawConfiguration -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+        -PrimaryOverrides $null -LocalOverrides $overrideState.Overrides
+    $effectiveStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings $mergedConfiguration['componentSettings']
+    $destinationCheck = Test-BRAVOConfiguratorBackupDestinationEffective -Destination 'LocalOnly' -EffectiveStorage $effectiveStorage
+    if (-not $destinationCheck.Compliant) {
+        throw ('-BackupDestination LocalOnly не в силі: з ' + $localConfig + ' ефективно увімкнено ' +
+            (@($destinationCheck.ConflictingChannels) -join ' і ') + '. ' +
+            (@($destinationCheck.Reasons) -join ' ') + ' Наявний BRAVO.local.config не змінено. ' +
+            'Задайте в ньому componentSettings.SFTP.Enabled = $false і componentSettings.SMB.Enabled = $false ' +
+            '(вручну або профілем «Лише локально» в BRAVO_CONFIGURATOR.ps1) і повторіть запуск, ' +
+            'або запустіть без -BackupDestination LocalOnly.')
+    }
+    Write-Ok 'профіль напрямків LocalOnly у силі: SFTP і SMB ефективно вимкнені'
+}
 if (Test-Path -LiteralPath $localConfig -PathType Leaf) {
     Write-Ok 'BRAVO.local.config уже існує — не чіпаємо'
-    $backupDestinationSkippedExisting = $SeedLocalConfig -or $backupDestinationExplicit
+    $localConfigExists = $true
+    $backupDestinationSkippedExisting = ($SeedLocalConfig -or $backupDestinationExplicit) -and -not $localOnlyRequested
 } elseif ($SeedLocalConfig) {
     # Новий файл пише канонічний код Configurator (той самий серіалізатор і
     # перевірка повторним читанням, що й Apply) — інсталятор не має власного
-    # запису чи парсера BRAVO.local.config. Модулі вже розгорнуто з архіву,
-    # SHA-256 якого звірено в кроці 1.
-    $configuratorModuleRoot = Join-Path $RuntimeRoot 'modules\BRAVO.Configurator'
+    # запису чи парсера BRAVO.local.config.
     foreach ($configuratorModuleName in @('BRAVO.Configurator.Effective', 'BRAVO.Configurator.Persistence', 'BRAVO.Configurator.Presets')) {
         Import-Module -Name (Join-Path $configuratorModuleRoot ($configuratorModuleName + '.psm1')) -Force -ErrorAction Stop
     }
@@ -451,13 +498,24 @@ if (Test-Path -LiteralPath $localConfig -PathType Leaf) {
     if ([bool]$destinationProfile.Overrides['componentSettings.SMB.ArchiveCopy']) {
         Write-Warn2 'для Samba задайте smbSettings.RootPath (UNC \\сервер\ресурс) у BRAVO.local.config ДО BRAVO_SETUP.'
     }
+    if ($localOnlyRequested) { Assert-BRAVOInstallLocalOnlyEffective }
     Write-Note ('інші site-відмінності — за каталогом ключів ' + $localExample)
 } else {
     Write-Note ('не створено (додайте -SeedLocalConfig або скопіюйте вручну з ' +
         'BRAVO.local.config.example)')
+    if ($localOnlyRequested) {
+        # Захист на глибину: крок 0 уже відмовив би в цьому випадку.
+        throw ('-BackupDestination LocalOnly не застосовано: без -SeedLocalConfig і без BRAVO.local.config ' +
+            'діють дефолти комплекту (SFTP і SMB увімкнені). Повторіть запуск із -SeedLocalConfig ' +
+            '-BackupDestination LocalOnly або покладіть BRAVO.local.config з componentSettings.SFTP.Enabled = $false ' +
+            'і componentSettings.SMB.Enabled = $false.')
+    }
     if ($backupDestinationExplicit) {
         Write-Warn2 ('профіль напрямків ' + $BackupDestination + ' НЕ застосовано: він діє лише разом із -SeedLocalConfig')
     }
+}
+if ($localConfigExists -and $localOnlyRequested) {
+    Assert-BRAVOInstallLocalOnlyEffective
 }
 if ($backupDestinationSkippedExisting) {
     Write-Note ('профіль напрямків ' + $BackupDestination + ' НЕ застосовано: наявний файл не змінюється ' +

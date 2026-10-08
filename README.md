@@ -368,6 +368,13 @@ componentSettings.SMB.Enabled
 дефолт `SMB.Enabled = $true` лишається як був: «Samba вимкнено» для нових
 інсталяцій дає явне значення в новому файлі.
 
+Явний `-BackupDestination LocalOnly` інсталятор не ігнорує мовчки (#434):
+він перевіряє ЕФЕКТИВНІ значення (`Get-BRAVOEffectiveStorageConfiguration`
+поверх дефолтів і `BRAVO.local.config`). Без `-SeedLocalConfig` і без
+наявного файла інсталяція зупиняється до завантаження й будь-якого запису; з
+наявним файлом, за якого SFTP або SMB ефективно увімкнені, — зупиняється в
+кроці 4 з назвою каналу, і файл не змінюється. Деталі — `deploy\README.md`.
+
 Чому профілі з Samba пишуть `SMB.ArchiveCopy = $true`: дефолт
 `ArchiveCopy` — `$false`, а `SMB.Enabled` сам по собі нічого не копіює.
 Профілі з SFTP не пишуть BAZA-прапорців: діють дефолти конфігурації

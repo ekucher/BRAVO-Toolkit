@@ -257,9 +257,78 @@ function Get-BRAVOConfiguratorBackupDestinationProfile {
     }
 }
 
+function Test-BRAVOConfiguratorBackupDestinationEffective {
+    <#
+    .SYNOPSIS
+        Чиста функція: чи ЕФЕКТИВНІ вимикачі напрямків відповідають
+        профілю -BackupDestination (#434).
+    .DESCRIPTION
+        Рішення ухвалюється за ефективними значеннями, а не за текстом
+        BRAVO.local.config: викликач передає результат канонічного
+        Get-BRAVOEffectiveStorageConfiguration (BRAVO.Discovery), обчислений
+        над Resolve-BRAVORawConfiguration (дефолти < BRAVO.local.config).
+        Порівнюються головні вимикачі componentSettings.SFTP.Enabled і
+        componentSettings.SMB.Enabled з набору профілю
+        Get-BRAVOConfiguratorBackupDestinationProfile. Для LocalOnly це
+        означає: SFTP і SMB ефективно вимкнені.
+
+        Функція нічого не читає й не пише; відповідь — лише висновок і
+        причини українською для діагностики викликача.
+    .OUTPUTS
+        [pscustomobject] { Destination; Compliant; ConflictingChannels; Reasons }
+        ConflictingChannels — 'SFTP'/'SMB', чий ефективний стан суперечить профілю.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Cloud', 'CloudAndSamba', 'SambaOnly', 'LocalOnly')]
+        [string]$Destination,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        $EffectiveStorage
+    )
+
+    $destinationProfile = Get-BRAVOConfiguratorBackupDestinationProfile -Destination $Destination
+    $conflicting = New-Object System.Collections.Generic.List[string]
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $EffectiveStorage) {
+        [void]$reasons.Add('ефективні значення напрямків не обчислено — відповідність профілю ' + $Destination + ' не підтверджено.')
+        return [pscustomobject]@{
+            Destination = $Destination
+            Compliant = $false
+            ConflictingChannels = @()
+            Reasons = @($reasons)
+        }
+    }
+
+    foreach ($channel in @('SFTP', 'SMB')) {
+        $expected = [bool]$destinationProfile.Overrides['componentSettings.' + $channel + '.Enabled']
+        $channelNode = $EffectiveStorage.$channel
+        $actual = $false
+        if ($null -ne $channelNode) { $actual = [bool]$channelNode.Enabled }
+        if ($actual -ne $expected) {
+            [void]$conflicting.Add($channel)
+            $expectedText = $(if ($expected) { 'увімкнено' } else { 'вимкнено' })
+            $actualText = $(if ($actual) { 'увімкнено' } else { 'вимкнено' })
+            [void]$reasons.Add($channel + ': ефективно ' + $actualText + ', профіль ' + $Destination +
+                ' вимагає «' + $expectedText + '» (componentSettings.' + $channel + '.Enabled = ' +
+                $(if ($expected) { '$true' } else { '$false' }) + ').')
+        }
+    }
+
+    return [pscustomobject]@{
+        Destination = $Destination
+        Compliant = ($conflicting.Count -eq 0)
+        ConflictingChannels = @($conflicting)
+        Reasons = @($reasons)
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-BRAVOConfiguratorPresetCatalog',
     'Invoke-BRAVOConfiguratorPreset',
     'Get-BRAVOConfiguratorPresetOverrideSet',
-    'Get-BRAVOConfiguratorBackupDestinationProfile'
+    'Get-BRAVOConfiguratorBackupDestinationProfile',
+    'Test-BRAVOConfiguratorBackupDestinationEffective'
 )

@@ -38,6 +38,27 @@ atomic activation, автозавантаження за розкладом і �
 README, розділ 3.1. Якщо `BRAVO.local.config` уже є, профіль не
 застосовується, і скрипт це повідомляє.
 
+Явний `-BackupDestination LocalOnly` мовчки не ігнорується (#434). Рішення
+ухвалюється за ефективними значеннями (дефолти комплекту + `BRAVO.local.config`,
+канонічний `Get-BRAVOEffectiveStorageConfiguration`), а не за текстом файла:
+
+- без `-SeedLocalConfig` і без наявного `BRAVO.local.config` скрипт
+  зупиняється ще в кроці 0, до завантаження й будь-якого запису: дефолти
+  комплекту вмикають SFTP і SMB. Повторіть запуск із
+  `-SeedLocalConfig -BackupDestination LocalOnly`;
+- якщо `BRAVO.local.config` уже є, а з ним SFTP або SMB ефективно увімкнені,
+  крок 4 завершується помилкою з назвою каналу. Файл не змінюється: задайте
+  в ньому `componentSettings.SFTP.Enabled = $false` і
+  `componentSettings.SMB.Enabled = $false` (вручну або профілем «Лише
+  локально» в `BRAVO_CONFIGURATOR.ps1`) і повторіть запуск;
+- якщо наявний файл уже вимикає обидва канали, інсталяція продовжується, а
+  скрипт повідомляє, що `LocalOnly` у силі.
+
+Для `Cloud`, `CloudAndSamba` і `SambaOnly` поведінка поки що та сама, що й
+раніше: без `-SeedLocalConfig` чи при наявному файлі профіль не
+застосовується, скрипт це повідомляє і завершується кодом 0. Запуск без
+`-BackupDestination` не змінився.
+
 Зупиняється до налаштування: credentials і завдання Планувальника лишаються
 за інтерактивним `BRAVO_SETUP.ps1`. Наявну інсталяцію не оновлює — відмовляє
 й посилає на `Update-BRAVOServer.ps1`.

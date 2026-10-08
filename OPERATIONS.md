@@ -1151,7 +1151,11 @@ Health-моніторинг, `BRAVO_DRY_RUN.ps1` проби) і знімає в�
 **Профілі для нової інсталяції.** `deploy\Install-BRAVOServer.ps1
 -SeedLocalConfig -BackupDestination Cloud|CloudAndSamba|SambaOnly|LocalOnly`
 (дефолт `Cloud`: SFTP увімкнено, Samba вимкнено явно) записує вимикачі в
-новий `BRAVO.local.config`; наявний файл не змінюється. Таблиця профілів і
+новий `BRAVO.local.config`; наявний файл не змінюється. Явний `LocalOnly`
+fail-closed (#434): без `-SeedLocalConfig` і без наявного файла інсталятор
+зупиняється до завантаження; з наявним файлом, за якого SFTP або SMB
+ефективно увімкнені, — зупиняється з назвою каналу й файл не чіпає (вимкніть
+`componentSettings.SFTP.Enabled`/`SMB.Enabled` у файлі й повторіть). Таблиця профілів і
 пояснення, чому профілі з Samba пишуть `SMB.ArchiveCopy = $true`, — README,
 розділ 3.1 «Профілі напрямків резервного копіювання». Для `CloudAndSamba` і
 `SambaOnly` задайте `smbSettings.RootPath` до `BRAVO_SETUP.ps1`.
