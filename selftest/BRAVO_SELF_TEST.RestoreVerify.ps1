@@ -136,9 +136,15 @@
 
     $taskInstallerTextForVerify = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_INSTALL.ps1'), [Text.Encoding]::UTF8)
     $taskUninstallerTextForVerify = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_UNINSTALL.ps1'), [Text.Encoding]::UTF8)
+    # ValidateSet перевіряється в КОЖНОМУ наборі типів задач інсталятора
+    # (New-BRAVOTaskDefinition і план задач), а не за точним хвостом переліку:
+    # #314 додав після "BackupCatchUp" тип "ServiceRecovery", і точний рядок
+    # перестав збігатися, хоча інваріант не порушено.
+    $taskTypeValidateSets = @([regex]::Matches($taskInstallerTextForVerify, '\[ValidateSet\("Backup",[^\)]*\)\]') | ForEach-Object { $_.Value })
     Test-BRAVOCondition `
         -Condition (
-            $taskInstallerTextForVerify.Contains('"BAZASync", "RestoreVerify", "BackupCatchUp")') -and
+            $taskTypeValidateSets.Count -eq 2 -and
+            @($taskTypeValidateSets | Where-Object { -not $_.Contains('"BAZASync", "RestoreVerify", "BackupCatchUp"') }).Count -eq 0 -and
             $taskInstallerTextForVerify.Contains('$definition.Triggers.Create(3) # TASK_TRIGGER_WEEKLY') -and
             $taskInstallerTextForVerify.Contains('ConvertTo-BRAVODaysOfWeekMask -DayOfWeek ([string]$TaskSettings.WeeklyOn)') -and
             $taskInstallerTextForVerify.Contains('Type = "RestoreVerify"; Settings = $schedulerSettings.RestoreVerify') -and
