@@ -1581,6 +1581,48 @@ Test-BRAVOCondition (
 ) -Name 'Logging/KnownSecretJsonEscapedFormMasked' `
     -Failure "JSON-екранована форма відомого секрету (обидва варіанти ConvertTo-Json: PS 5.1 і PS 7) має маскуватись (очікується '{`"k`":`"***`",`"h`":`"***`",`"n`":`"***`"}'); лишились форми: strict=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonStrict)) html=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonHtmlSafe)) native=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonNative)); помилка: $secretMaskJsonError"
 
+# #435: строга JSON-форма (PowerShell 7, Newtonsoft.Json) екранує також
+# U+0085, U+2028 і U+2029 як \u + 4 hex у нижньому регістрі. Секрет із
+# кожним із цих символів має маскуватись і в такій формі, і у фактичному
+# виводі ConvertTo-Json поточного хоста. Символи — лише з кодів, значення
+# будуються під час запуску.
+$secretMaskJsonLineSecrets = New-Object 'System.Collections.Generic.List[string]'
+$secretMaskJsonLineEscaped = New-Object 'System.Collections.Generic.List[string]'
+$secretMaskJsonLineNative = New-Object 'System.Collections.Generic.List[string]'
+foreach ($secretMaskJsonLineCode in @(0x0085, 0x2028, 0x2029)) {
+    $secretMaskJsonLineBase = $secretMaskNewValue.Invoke('Ln' + $secretMaskJsonLineCode.ToString('x4'))[0]
+    $secretMaskJsonLineSecret = $secretMaskJsonLineBase.Substring(0, 6) + [string][char]$secretMaskJsonLineCode + $secretMaskJsonLineBase.Substring(6)
+    $secretMaskJsonLineSecrets.Add($secretMaskJsonLineSecret)
+    $secretMaskJsonLineEscaped.Add($secretMaskJsonLineSecret.Replace([string][char]$secretMaskJsonLineCode, ([string][char]92 + 'u' + $secretMaskJsonLineCode.ToString('x4'))))
+    $secretMaskJsonLineNativeText = [string]($secretMaskJsonLineSecret | ConvertTo-Json -Compress)
+    $secretMaskJsonLineNative.Add($secretMaskJsonLineNativeText.Substring(1, $secretMaskJsonLineNativeText.Length - 2))
+}
+$secretMaskJsonLineText = ''
+for ($secretMaskJsonLineIndex = 0; $secretMaskJsonLineIndex -lt $secretMaskJsonLineSecrets.Count; $secretMaskJsonLineIndex++) {
+    $secretMaskJsonLineText += '{"k":"' + $secretMaskJsonLineEscaped[$secretMaskJsonLineIndex] + '","n":"' + $secretMaskJsonLineNative[$secretMaskJsonLineIndex] + '"} '
+}
+$secretMaskJsonLineResult = $null
+$secretMaskJsonLineError = $secretMaskSetupError
+if ($null -ne $secretMaskModule) {
+    try {
+        $secretMaskJsonLineResult = & $secretMaskModule {
+            param($text, $secrets)
+            Protect-BRAVOLogSecret -Text $text -KnownSecret $secrets
+        } $secretMaskJsonLineText $secretMaskJsonLineSecrets.ToArray()
+    } catch { $secretMaskJsonLineError = $_.Exception.GetType().FullName }
+}
+$secretMaskJsonLineLeft = New-Object 'System.Collections.Generic.List[string]'
+for ($secretMaskJsonLineIndex = 0; $secretMaskJsonLineIndex -lt $secretMaskJsonLineSecrets.Count; $secretMaskJsonLineIndex++) {
+    $secretMaskJsonLineLabel = ([int][char]$secretMaskJsonLineSecrets[$secretMaskJsonLineIndex][6]).ToString('X4')
+    if (([string]$secretMaskJsonLineResult).Contains($secretMaskJsonLineEscaped[$secretMaskJsonLineIndex])) { $secretMaskJsonLineLeft.Add("strict:U+$secretMaskJsonLineLabel") }
+    if (([string]$secretMaskJsonLineResult).Contains($secretMaskJsonLineNative[$secretMaskJsonLineIndex])) { $secretMaskJsonLineLeft.Add("native:U+$secretMaskJsonLineLabel") }
+}
+Test-BRAVOCondition (
+    @($secretMaskJsonLineEscaped | Where-Object { $_.IndexOf([string][char]92 + 'u') -lt 0 }).Count -eq 0 -and
+    [string]$secretMaskJsonLineResult -ceq '{"k":"***","n":"***"} {"k":"***","n":"***"} {"k":"***","n":"***"} '
+) -Name 'Logging/KnownSecretJsonEscapedLineSeparatorsMasked' `
+    -Failure "JSON-екранована форма відомого секрету з U+0085/U+2028/U+2029 (\u0085, \u2028, \u2029 — строга форма PS 7) і фактичний вивід ConvertTo-Json поточного хоста мають маскуватись; лишились форми: $(@($secretMaskJsonLineLeft) -join ', '); помилка: $secretMaskJsonLineError"
+
 # Регресія: секрет без спецсимволів (закодовані форми збігаються з сирою)
 # маскується рівно як раніше — одне *** на входження, без *** поруч
 # (артефакт подвійного маскування) і без змін у решті тексту.
@@ -1657,13 +1699,25 @@ $targetsGuardFindHits = {
 # детектор (0 знахідок завжди) мовчки дав би PASS.
 $targetsGuardSelfCheckProblems = New-Object System.Collections.Generic.List[string]
 try {
+    # #435: обходи через псевдонім таблиці ($t = ...Targets; $t.X / $t['X'],
+    # зокрема ланцюжок псевдонімів) і через .PSObject.Properties['X'].Value
+    # — теж читання ключа.
     $targetsGuardPositive = @(& $targetsGuardFindHits ('$a = [string]$credentialSettings.Targets.SFTPLogin' + "`n" +
             '$b = $global:credentialSettings.Targets[''SMBLogin'']' + "`n" +
-            '$c = $CredentialSettings.Targets.ArchivePassword'))
-    if ($targetsGuardPositive.Count -ne 3) { $targetsGuardSelfCheckProblems.Add("позитивні зразки: $($targetsGuardPositive.Count) з 3") }
+            '$c = $CredentialSettings.Targets.ArchivePassword' + "`n" +
+            '$t = $credentialSettings.Targets' + "`n" +
+            '$d = $t.SFTPLogin' + "`n" +
+            '$e = $t[''SMBLogin'']' + "`n" +
+            '$u = ($t)' + "`n" +
+            '$f = [string]$u.SFTPPassword' + "`n" +
+            '$g = $credentialSettings.Targets.PSObject.Properties[''ArchivePassword''].Value' + "`n" +
+            '$h = $t.PSObject.Properties[''SMBPassword''].Value'))
+    if ($targetsGuardPositive.Count -ne 8) { $targetsGuardSelfCheckProblems.Add("позитивні зразки: $($targetsGuardPositive.Count) з 8") }
     $targetsGuardNegative = @(& $targetsGuardFindHits ('Send-X -CredentialTargets $credentialSettings.Targets' + "`n" +
             'foreach ($p in $credentialSettings.Targets.PSObject.Properties) { }' + "`n" +
             '$t = $credentialSettings.Targets' + "`n" +
+            'Send-X -CredentialTargets $t' + "`n" +
+            'foreach ($p in $t.PSObject.Properties) { }' + "`n" +
             '$n = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key ''SFTPLogin'''))
     if ($targetsGuardNegative.Count -ne 0) { $targetsGuardSelfCheckProblems.Add("негативні зразки дали знахідки: $($targetsGuardNegative.Count)") }
 } catch {
