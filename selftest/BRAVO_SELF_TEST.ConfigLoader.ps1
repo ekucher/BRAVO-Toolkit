@@ -2290,7 +2290,10 @@ try {
         # BSYSTEM Operations (5.3.0): імена записів Credential Manager для
         # bootstrap-секрету self-enrollment і виданого API-ключа.
         'credentialSettings.Targets.OperationsApiKey',
-        'credentialSettings.Targets.OperationsBootstrapSecret'
+        'credentialSettings.Targets.OperationsBootstrapSecret',
+        # Поріг «малого» файлу MODEL для самоперевірки після bravocmd
+        # repair (Compare-FileSizes): новий канонічний лист Restore.
+        'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes'
     )
     $parityAdditiveAbsenceSuffix = ' : відсутнє в BRAVO.config'
     $parityDiffs = @(@($parityDiffsList.ToArray()) | Where-Object {
