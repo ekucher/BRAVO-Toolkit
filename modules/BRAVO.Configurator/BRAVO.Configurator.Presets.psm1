@@ -274,9 +274,16 @@ function Test-BRAVOConfiguratorBackupDestinationEffective {
         дорівнює тому, що дав би свіжий seed профілю: SMB.Enabled профілю
         AND componentSettings.SMB.ArchiveCopy профілю (відсутній ключ —
         дефолт $false), тобто те саме правило, що в
-        Get-BRAVOEffectiveStorageConfiguration. Профіль «в силі» лише тоді,
-        коли збігаються всі три значення. Для LocalOnly це означає: SFTP і
-        SMB ефективно вимкнені.
+        Get-BRAVOEffectiveStorageConfiguration. Для SFTP так само
+        порівнюється ефективне вивантаження архіву (SFTP.ArchiveUpload):
+        очікуване = SFTP.Enabled профілю AND componentSettings.SFTP.ArchiveUpload
+        профілю, а коли профіль його не пише — дефолт
+        Get-BRAVODefaultConfiguration (BRAVO.Configuration з того самого
+        комплекту), бо саме його дав би свіжий seed. Для профілів без SFTP
+        (SambaOnly, LocalOnly) очікуване вивантаження — $false, а ефективне
+        за вимкненого SFTP теж $false, тож окремої відмови воно не дає.
+        Профіль «в силі» лише тоді, коли збігаються всі чотири значення. Для
+        LocalOnly це означає: SFTP і SMB ефективно вимкнені.
 
         Функція нічого не читає й не пише; відповідь — лише висновок і
         причини українською для діагностики викликача.
@@ -321,6 +328,41 @@ function Test-BRAVOConfiguratorBackupDestinationEffective {
             [void]$reasons.Add($channel + ': ефективно ' + $actualText + ', профіль ' + $Destination +
                 ' вимагає «' + $expectedText + '» (componentSettings.' + $channel + '.Enabled = ' +
                 $(if ($expected) { '$true' } else { '$false' }) + ').')
+        }
+        if ($channel -eq 'SFTP' -and $expected -and -not $channelConflict) {
+            # Вивантаження архіву: SFTP.Enabled сам по собі архів у хмару не
+            # відправляє, тож профіль із хмарою без ефективного ArchiveUpload
+            # не «в силі». Профілі без SFTP сюди не доходять ($expected = $false).
+            $expectedUploadRaw = $null
+            if ($destinationProfile.Overrides.Contains('componentSettings.SFTP.ArchiveUpload')) {
+                $expectedUploadRaw = $destinationProfile.Overrides['componentSettings.SFTP.ArchiveUpload']
+            } else {
+                Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
+                $defaultSftp = (Get-BRAVODefaultConfiguration)['componentSettings']['SFTP']
+                if ($defaultSftp -is [System.Collections.IDictionary] -and $defaultSftp.Contains('ArchiveUpload')) {
+                    $expectedUploadRaw = $defaultSftp['ArchiveUpload']
+                }
+            }
+            # Те саме тлумачення значення, що в Get-BRAVOEffectiveStorageConfiguration:
+            # відсутнє чи нерозпізнане = $false.
+            $expectedUpload = $false
+            if ($null -ne $expectedUploadRaw) {
+                try { $expectedUpload = [System.Convert]::ToBoolean($expectedUploadRaw) } catch { $expectedUpload = $false }
+            }
+            $actualUpload = $false
+            if ($channelNode -is [System.Collections.IDictionary]) {
+                if ($channelNode.Contains('ArchiveUpload')) { $actualUpload = [bool]$channelNode['ArchiveUpload'] }
+            } elseif ($null -ne $channelNode -and $null -ne $channelNode.PSObject.Properties['ArchiveUpload']) {
+                $actualUpload = [bool]$channelNode.ArchiveUpload
+            }
+            if ($actualUpload -ne $expectedUpload) {
+                $channelConflict = $true
+                $expectedUploadText = $(if ($expectedUpload) { 'увімкнено' } else { 'вимкнено' })
+                $actualUploadText = $(if ($actualUpload) { 'увімкнено' } else { 'вимкнено' })
+                [void]$reasons.Add('SFTP: вивантаження архіву ефективно ' + $actualUploadText + ', профіль ' + $Destination +
+                    ' вимагає «' + $expectedUploadText + '» (componentSettings.SFTP.ArchiveUpload = ' +
+                    $(if ($expectedUpload) { '$true' } else { '$false' }) + ' при componentSettings.SFTP.Enabled = $true).')
+            }
         }
         if ($channel -eq 'SMB') {
             # Копія на NAS: SMB.Enabled сам по собі нічого не копіює, тож
