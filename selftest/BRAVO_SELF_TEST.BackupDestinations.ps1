@@ -775,7 +775,7 @@ Test-BRAVOCondition -Condition (
         $bdE2eHelpers = @($bdInstallAst.EndBlock.Statements | Where-Object {
             $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $bdE2eHelperNames -notcontains $_.Name
         } | ForEach-Object { $_.Extent.Text })
-        $bdE2eParamText = [regex]::Replace([string]$bdInstallAst.ParamBlock.Extent.Text, '^(?i)param\s*\(', 'param([string]$OutputLog, ')
+        $bdE2eParamText = [regex]::Replace([string]$bdInstallAst.ParamBlock.Extent.Text, '^(?i)param\s*\(', 'param([string]$OutputLog, [string]$SelfTestSiteMutationSource, ')
         $bdE2eChildPath = Join-Path $bdE2eRoot 'Invoke-InstallSteps0to4.ps1'
         $bdE2eChildText = (@(
             '[CmdletBinding()]',
@@ -783,7 +783,15 @@ Test-BRAVOCondition -Condition (
             'Set-StrictMode -Version 2.0',
             '$ErrorActionPreference = ''Stop''',
             'function Write-StepOutput { param([string]$T) [IO.File]::AppendAllText($OutputLog, ($T + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false))) }',
-            'function Write-Step { param([string]$T) Write-StepOutput (''=== '' + $T) }',
+            'function Write-Step {',
+            '    param([string]$T)',
+            '    Write-StepOutput (''=== '' + $T)',
+            '    # Гачок харнеса: зміна BRAVO.local.config МІЖ перевіркою кроку 1 і копіюванням.',
+            '    if ($T -like ''2.*'' -and -not [string]::IsNullOrEmpty($SelfTestSiteMutationSource)) {',
+            '        [void](New-Item -ItemType Directory -Path $RuntimeRoot -Force)',
+            '        Copy-Item -LiteralPath $SelfTestSiteMutationSource -Destination (Join-Path $RuntimeRoot ''BRAVO.local.config'') -Force',
+            '    }',
+            '}',
             'function Write-Ok { param([string]$T) Write-StepOutput (''[OK] '' + $T) }',
             'function Write-Note { param([string]$T) Write-StepOutput (''[..] '' + $T) }',
             'function Write-Warn2 { param([string]$T) Write-StepOutput (''[УВАГА] '' + $T) }',
@@ -827,7 +835,7 @@ Test-BRAVOCondition -Condition (
             if (@($StripFunctions).Count -gt 0) {
                 # Форма знімка developer: файли BRAVO.Configurator є, а функцій
                 # профілю напрямків у них немає (визначення вирізано за AST).
-                foreach ($moduleFile in @(Get-ChildItem -LiteralPath (Join-Path $bundleDir 'modules\BRAVO.Configurator') -Filter '*.psm1')) {
+                foreach ($moduleFile in @(Get-ChildItem -LiteralPath (Join-Path $bundleDir 'modules') -Recurse -Filter '*.psm1')) {
                     $moduleText = [IO.File]::ReadAllText($moduleFile.FullName, [Text.Encoding]::UTF8)
                     $moduleTokens = $null; $moduleErrors = $null
                     $moduleAst = [Management.Automation.Language.Parser]::ParseInput($moduleText, [ref]$moduleTokens, [ref]$moduleErrors)
@@ -842,10 +850,11 @@ Test-BRAVOCondition -Condition (
             }
             $markerPath = Join-Path $bdE2eRoot ('imported_' + $Name + '.marker')
             $markModules = {
-                # Будь-який імпорт модуля з комплекту лишає маркер.
+                # Будь-який імпорт модуля з комплекту лишає маркер — рядок із
+                # каталогом, з якого модуль імпортовано ($PSScriptRoot).
                 foreach ($moduleFile in @(Get-ChildItem -LiteralPath (Join-Path $bundleDir 'modules') -Recurse -Filter '*.psm1')) {
                     [IO.File]::AppendAllText($moduleFile.FullName,
-                        ("`r`n[IO.File]::WriteAllText('" + $markerPath.Replace("'", "''") + "', 'imported')`r`n"), $utf8)
+                        ("`r`n[IO.File]::AppendAllText('" + $markerPath.Replace("'", "''") + "', (`$PSScriptRoot + [Environment]::NewLine))`r`n"), $utf8)
                 }
             }
             if ($MarkImports -and -not $TamperAfterManifest) { & $markModules }
@@ -879,14 +888,15 @@ Test-BRAVOCondition -Condition (
             -StripFunctions $bdE2eCapabilityFunctions
 
         function Invoke-BRAVOSelfTestInstallE2E {
-            param([string]$RuntimeRoot, [string]$ZipPath, [string[]]$Arguments)
+            param([string]$RuntimeRoot, [string]$ZipPath, [string[]]$Arguments, [string]$SiteMutationSource)
             $runId = [guid]::NewGuid().ToString('N')
             $stagingRoot = Join-Path $bdE2eRoot ('staging_' + $runId)
             $outputLog = Join-Path $bdE2eRoot ('out_' + $runId + '.log')
+            $hookArguments = @($(if (-not [string]::IsNullOrEmpty($SiteMutationSource)) { '-SelfTestSiteMutationSource'; $SiteMutationSource }))
             # Без -ExecutionPolicy: політика успадковується від процесу self-test.
             $streamOutput = @(& $bdE2eHostPath -NoProfile -NonInteractive -File $bdE2eChildPath -OutputLog $outputLog `
                 -RuntimeRoot $RuntimeRoot -Tag ('v' + $bdE2eVersion) -ZipPath $ZipPath -StagingRoot $stagingRoot `
-                -NoElevation -NoPause @Arguments 2>&1 | ForEach-Object { [string]$_ })
+                -NoElevation -NoPause @hookArguments @Arguments 2>&1 | ForEach-Object { [string]$_ })
             $exitCode = $LASTEXITCODE
             $logText = $(if (Test-Path -LiteralPath $outputLog -PathType Leaf) { [IO.File]::ReadAllText($outputLog, [Text.Encoding]::UTF8) } else { '' })
             $throwText = (@([regex]::Matches($logText, '(?m)^THROW: (.*)$') | ForEach-Object { $_.Groups[1].Value }) -join ' ')
@@ -896,6 +906,7 @@ Test-BRAVOCondition -Condition (
                 Throw = $throwText
                 RobocopyCalled = $logText.Contains('STUB: robocopy')
                 StagingCreated = (Test-Path -LiteralPath $stagingRoot)
+                StagingLeaf = ('staging_' + $runId)
                 Label = ('[' + (@($Arguments) -join ' ') + ']')
             }
         }
@@ -1277,6 +1288,83 @@ Test-BRAVOCondition -Condition (
             -Name 'BackupDestinations/InstallerRefusesTamperedBundleBeforeImport' `
             -Failure "комплект, модулі якого не збігаються з RUNTIME_MANIFEST.json (архів і .sha256 узгоджені), не можна імпортувати: явний -BackupDestination — відмова ДО копіювання з українською причиною (RUNTIME_MANIFEST.json, підмінений файл), неявний -SeedLocalConfig — зупинка до імпорту Configurator без створення BRAVO.local.config: $($bdE2eTamperFailures -join ' | ')"
 
+        # (Codex P1, раунд 2) TOCTOU: $StagingRoot може бути доступний на запис
+        # звичайному користувачеві, тож код комплекту для перевірки кроку 1 не
+        # імпортується звідти. Маркер у кожному .psm1 записує каталог імпорту:
+        # жодного імпорту з $StagingRoot, імпорт кроку 1 — з окремого
+        # каталогу, якого після прогону вже немає.
+        $bdE2ePrivateFailures = @()
+        $bdE2eMarkedBundle = New-BRAVOSelfTestInstallBundle -Name 'marked' -ModuleDirectories $bdE2eCurrentModules -MarkImports
+        $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLocalOnlyLines
+        $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eMarkedBundle.ZipPath -Arguments @('-BackupDestination', 'LocalOnly', '-Force')
+        $bdE2eImportDirs = @($(if (Test-Path -LiteralPath $bdE2eMarkedBundle.MarkerPath) {
+            [IO.File]::ReadAllLines($bdE2eMarkedBundle.MarkerPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique }))
+        $bdE2eRuntimeLeaf = Split-Path -Leaf $bdE2eRuntime
+        $bdE2eStagingImports = @($bdE2eImportDirs | Where-Object { $_.Contains($bdE2eRun.StagingLeaf) })
+        $bdE2ePrivateImports = @($bdE2eImportDirs | Where-Object { -not $_.Contains($bdE2eRun.StagingLeaf) -and -not $_.Contains($bdE2eRuntimeLeaf) })
+        if ($bdE2eRun.ExitCode -ne 0) { $bdE2ePrivateFailures += "$($bdE2eRun.Label) exit=$($bdE2eRun.ExitCode) throw='$($bdE2eRun.Throw)'" }
+        foreach ($bdE2eImportDir in $bdE2eStagingImports) { $bdE2ePrivateFailures += "імпорт із `$StagingRoot: $bdE2eImportDir" }
+        if ($bdE2ePrivateImports.Count -eq 0) { $bdE2ePrivateFailures += "імпорту кроку 1 з окремого каталогу не було (імпорти: $($bdE2eImportDirs -join ', '))" }
+        foreach ($bdE2eImportDir in $bdE2ePrivateImports) {
+            if (Test-Path -LiteralPath $bdE2eImportDir) { $bdE2ePrivateFailures += "каталог перевірки не видалено: $bdE2eImportDir" }
+        }
+        Test-BRAVOCondition -Condition ($bdE2ePrivateFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerStep1ImportsFromPrivateVerifiedCopy' `
+            -Failure "явний -BackupDestination: код комплекту для перевірки кроку 1 не імпортується з `$StagingRoot (доступний на запис іншим — підміна між перевіркою цілісності й Import-Module), а з приватної перевіреної копії, яку видалено після перевірки: $($bdE2ePrivateFailures -join ' | ')"
+
+        # (Codex P2, раунд 2) BRAVO.local.config, змінений МІЖ перевіркою кроку 1
+        # і копіюванням (гачок харнеса в Write-Step '2.'), — відмова ДО першого
+        # запису в каталог інсталяції: без VERSION.json і без копіювання; файл
+        # лишається таким, яким його залишили.
+        $bdE2eMutationFailures = @()
+        $bdE2eMutationSource = Join-Path $bdE2eRoot 'site_mutation.config'
+        [IO.File]::WriteAllText($bdE2eMutationSource, "@{`r`n    'pathSettings.BackupRoot' = 'D:\ExampleArchive'`r`n}`r`n", (New-Object Text.UTF8Encoding($false)))
+        $bdE2eMutationHash = (Get-FileHash -LiteralPath $bdE2eMutationSource -Algorithm SHA256).Hash
+        foreach ($bdE2eCase in @(
+            @{ Arguments = @('-BackupDestination', 'LocalOnly', '-Force'); Existing = $true },
+            @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly'); Existing = $false }
+        )) {
+            $bdE2eRuntime = $(if ($bdE2eCase.Existing) { New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLocalOnlyLines } else { New-BRAVOSelfTestE2ERuntimeRoot })
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments $bdE2eCase.Arguments `
+                -SiteMutationSource $bdE2eMutationSource
+            $bdE2eMutationFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries @('BRAVO.local.config') -RequiredTexts @('BRAVO.local.config', 'змінився', 'Нічого не розгорнуто'))
+            if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eMutationHash) {
+                $bdE2eMutationFailures += "$($bdE2eRun.Label) BRAVO.local.config після відмови не той, що залишив оператор"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eMutationFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerSiteConfigChangedAfterCheckRefusedBeforeCopy' `
+            -Failure "BRAVO.local.config, змінений чи створений після перевірки -BackupDestination у кроці 1, має зупинити інсталяцію ДО першого запису в каталог інсталяції (без VERSION.json і копіювання) з українською причиною, файл не змінено: $($bdE2eMutationFailures -join ' | ')"
+
+        # (Codex P2, раунд 2) Можливості BRAVO.Configuration/BRAVO.Discovery
+        # звіряються за визначеннями функцій, а не лише за наявністю .psd1:
+        # комплект без Get-BRAVOEffectiveStorageConfiguration — явний профіль
+        # відхиляється ДО копіювання з назвою відсутньої функції.
+        $bdE2eNoStorageFailures = @()
+        $bdE2eNoStorageBundle = New-BRAVOSelfTestInstallBundle -Name 'nostorage' -ModuleDirectories $bdE2eCurrentModules `
+            -StripFunctions @('Get-BRAVOEffectiveStorageConfiguration')
+        if ([IO.File]::ReadAllText((Join-Path $bdE2eRoot 'bundle_nostorage\modules\BRAVO.Discovery\BRAVO.Discovery.psm1'), [Text.Encoding]::UTF8).Contains('function Get-BRAVOEffectiveStorageConfiguration')) {
+            $bdE2eNoStorageFailures += 'фікстура: Get-BRAVOEffectiveStorageConfiguration не вирізано з BRAVO.Discovery.psm1'
+        }
+        foreach ($bdE2eCase in @(
+            @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly'); Existing = $false },
+            @{ Arguments = @('-BackupDestination', 'LocalOnly', '-Force'); Existing = $true }
+        )) {
+            $bdE2eRuntime = $(if ($bdE2eCase.Existing) { New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLocalOnlyLines } else { New-BRAVOSelfTestE2ERuntimeRoot })
+            $bdE2eHashBefore = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eNoStorageBundle.ZipPath -Arguments $bdE2eCase.Arguments
+            $bdE2eAllowed = $(if ($bdE2eCase.Existing) { @('BRAVO.local.config') } else { @() })
+            $bdE2eNoStorageFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries $bdE2eAllowed -RequiredTexts @('-BackupDestination', 'Get-BRAVOEffectiveStorageConfiguration'))
+            if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eHashBefore) {
+                $bdE2eNoStorageFailures += "$($bdE2eRun.Label) BRAVO.local.config змінено або створено"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eNoStorageFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerExplicitDestinationRequiresConfigurationFunctions' `
+            -Failure "комплект без функції BRAVO.Discovery/BRAVO.Configuration, яку викликає перевірка профілю (Get-BRAVOEffectiveStorageConfiguration), має відхиляти явний -BackupDestination ДО копіювання з назвою функції в причині: $($bdE2eNoStorageFailures -join ' | ')"
+
         # Регресійний запобіжник (не RED): модулі комплекту не імпортуються до
         # гейтів SHA-256 і провенансу — маркер у кожному .psm1 комплекту лишається
         # нествореним; статично: жоден Import-Module з $staged* не стоїть до
@@ -1322,10 +1410,54 @@ Test-BRAVOCondition -Condition (
             $node -is [Management.Automation.Language.CommandAst] -and -not (Test-BRAVOSelfTestInsideFunction -Node $node) -and
             ([string]$node.GetCommandName() -eq 'Import-Module' -or [string]$node.GetCommandName() -eq 'Get-BRAVOInstallSiteComponentSettings' -or
                 $node.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot) -and
-            $node.Extent.Text -match '(?i)\$(staged|RuntimeRoot|configuratorModuleRoot)\b'
+            $node.Extent.Text -match '(?i)\$(staged|StagingRoot|RuntimeRoot|configuratorModuleRoot|verifiedBundle)\b'
         }, $true))
+        # (Codex P1, раунд 2) Корінь імпорту — змінна аргументу -ModuleRoot чи
+        # -Name (перша змінна); $configuratorModuleRoot = $RuntimeRoot. Корінь
+        # не може походити з $StagingRoot/$staged (транзитивно за присвоєннями):
+        # той каталог може бути доступний на запис іншим. Імпорт кроку 1 — з
+        # приватного каталогу [IO.Path]::GetTempPath(), і цілісність
+        # перевіряється над ТИМ самим коренем (домінування нижче).
+        function Get-BRAVOSelfTestInstallVariableOrigin {
+            param([string]$VariableName, [int]$Depth = 0)
+            $originText = @()
+            if ($Depth -gt 6) { return @() }
+            foreach ($assignment in @($bdInstallAst.FindAll({ param($node)
+                $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -eq $VariableName }, $true))) {
+                $originText += $assignment.Right.Extent.Text
+                foreach ($reference in @($assignment.Right.FindAll({ param($node) $node -is [Management.Automation.Language.VariableExpressionAst] }, $true))) {
+                    if ($reference.VariablePath.UserPath -ne $VariableName) {
+                        $originText += @(Get-BRAVOSelfTestInstallVariableOrigin -VariableName $reference.VariablePath.UserPath -Depth ($Depth + 1))
+                    }
+                }
+            }
+            return @($originText)
+        }
+        $bdE2ePrivateRootImports = 0
         foreach ($bdE2eImport in $bdE2eBundleImports) {
-            $bdE2eImportRoot = $(if ($bdE2eImport.Extent.Text -match '(?i)\$staged\b') { '$staged' } else { '$RuntimeRoot' })
+            $bdE2eRootElement = @($(if ([string]$bdE2eImport.GetCommandName() -eq 'Get-BRAVOInstallSiteComponentSettings') {
+                $bdE2eModuleRootIndex = -1
+                for ($bdE2eIndex = 0; $bdE2eIndex -lt $bdE2eImport.CommandElements.Count - 1; $bdE2eIndex++) {
+                    if ($bdE2eImport.CommandElements[$bdE2eIndex].Extent.Text -eq '-ModuleRoot') { $bdE2eModuleRootIndex = $bdE2eIndex + 1 }
+                }
+                if ($bdE2eModuleRootIndex -ge 0) { $bdE2eImport.CommandElements[$bdE2eModuleRootIndex] }
+            } else { $bdE2eImport }))
+            $bdE2eRootVariables = @($(if ($bdE2eRootElement.Count -eq 1) {
+                @($bdE2eRootElement[0].FindAll({ param($node) $node -is [Management.Automation.Language.VariableExpressionAst] }, $true)) |
+                    Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1 }))
+            $bdE2eImportRoot = $(if ($bdE2eRootVariables.Count -eq 1) { '$' + $bdE2eRootVariables[0].VariablePath.UserPath } else { '' })
+            if ($bdE2eImportRoot -eq '$configuratorModuleRoot') { $bdE2eImportRoot = '$RuntimeRoot' }
+            $bdE2eImportOrigin = @($(if ($bdE2eImportRoot -ne '') { Get-BRAVOSelfTestInstallVariableOrigin -VariableName $bdE2eImportRoot.Substring(1) }))
+            if ($bdE2eImportRoot -eq '' -or $bdE2eImportRoot -match '(?i)^\$(staged|StagingRoot)$' -or
+                @($bdE2eImportOrigin | Where-Object { $_ -match '(?i)\$(staged|StagingRoot)\b' }).Count -gt 0) {
+                $bdE2eTrustFailures += "рядок $($bdE2eImport.Extent.StartLineNumber): імпорт коду комплекту з `$StagingRoot (або корінь не визначено: '$bdE2eImportRoot'): $($bdE2eImport.Extent.Text)"
+                continue
+            }
+            if ($bdE2eImportRoot -ne '$RuntimeRoot' -and @($bdE2eImportOrigin | Where-Object { $_ -match 'GetTempPath\(\)' }).Count -gt 0) {
+                $bdE2ePrivateRootImports++
+            }
             $bdE2eDominated = $false
             foreach ($bdE2eIntegrityCall in $bdE2eIntegrityCalls) {
                 $bdE2eRootArgument = @($bdE2eIntegrityCall.CommandElements | Where-Object {
@@ -1347,6 +1479,7 @@ Test-BRAVOCondition -Condition (
             }
         }
         if ($bdE2eBundleImports.Count -eq 0) { $bdE2eTrustFailures += 'харнес: імпортів коду комплекту в головному try не знайдено' }
+        if ($bdE2ePrivateRootImports -eq 0) { $bdE2eTrustFailures += 'імпорт кроку 1 не з приватного каталогу [IO.Path]::GetTempPath()' }
         $bdE2eIntegrityFunction = @($bdInstallAst.FindAll({
             param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-BRAVOInstallBundleIntegrity'
         }, $true))
@@ -1672,9 +1805,45 @@ function Test-BRAVOSelfTestOutboundStopsFlow {
     }, $true)).Count -gt 0
 }
 
+function Test-BRAVOSelfTestOutboundPositiveGate {
+    # Умова вимагає вимикач ПОЗИТИВНО (Codex P2, раунд 2): термін, що збігається
+    # з вимикачем, стоїть не під -not/!, а з іншими термінами поєднаний лише
+    # через -and — тож хибний вимикач робить умову хибною. «-not вимикач»,
+    # «вимикач -or інше», порівняння й виклики команд не зараховуються.
+    param($Condition, [string]$Regex)
+    $node = $Condition
+    if ($node -is [Management.Automation.Language.PipelineAst]) {
+        if (@($node.PipelineElements).Count -ne 1) { return $false }
+        $node = $node.PipelineElements[0]
+    }
+    if ($node -is [Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression }
+    # Test-SettingEnabled <значення> (BRAVO_DRY_RUN.ps1) — перетворювач
+    # істинності без зміни полярності: зараховується за своїм єдиним аргументом.
+    if ($node -is [Management.Automation.Language.CommandAst] -and [string]$node.GetCommandName() -eq 'Test-SettingEnabled' -and
+        @($node.CommandElements).Count -eq 2) {
+        return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.CommandElements[1] -Regex $Regex)
+    }
+    if ($node -is [Management.Automation.Language.ParenExpressionAst]) {
+        return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Pipeline -Regex $Regex)
+    }
+    if ($node -is [Management.Automation.Language.ConvertExpressionAst]) {
+        return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Child -Regex $Regex)
+    }
+    if ($node -is [Management.Automation.Language.BinaryExpressionAst]) {
+        if ($node.Operator -ne [Management.Automation.Language.TokenKind]::And) { return $false }
+        return ((Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Left -Regex $Regex) -or
+            (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Right -Regex $Regex))
+    }
+    if ($node -is [Management.Automation.Language.UnaryExpressionAst] -or
+        $node -is [Management.Automation.Language.CommandBaseAst] -or
+        $node -is [Management.Automation.Language.PipelineBaseAst]) { return $false }
+    return ($node.Extent.Text -match $Regex)
+}
+
 function Test-BRAVOSelfTestOutboundNegatedGate {
     # Умова — рівно заперечення вимикача: -not <вимикач> чи !<вимикач>, без
-    # -and/-or навколо (інакше хибність умови не означає істинність вимикача).
+    # -and/-or навколо (інакше хибність умови не означає істинність вимикача);
+    # під запереченням — позитивна вимога вимикача.
     param($Condition, [string]$Regex)
     if (-not ($Condition -is [Management.Automation.Language.PipelineAst]) -or @($Condition.PipelineElements).Count -ne 1) { return $false }
     $element = $Condition.PipelineElements[0]
@@ -1682,7 +1851,7 @@ function Test-BRAVOSelfTestOutboundNegatedGate {
     $expression = $element.Expression
     if (-not ($expression -is [Management.Automation.Language.UnaryExpressionAst])) { return $false }
     if (@([Management.Automation.Language.TokenKind]::Not, [Management.Automation.Language.TokenKind]::Exclaim) -notcontains $expression.TokenKind) { return $false }
-    return ($expression.Child.Extent.Text -match $Regex)
+    return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $expression.Child -Regex $Regex)
 }
 
 function Test-BRAVOSelfTestOutboundGated {
@@ -1701,7 +1870,7 @@ function Test-BRAVOSelfTestOutboundGated {
             $located = $false
             foreach ($clause in $parent.Clauses) {
                 $inBody = $clause.Item2.Extent.StartOffset -le $child.Extent.StartOffset -and $clause.Item2.Extent.EndOffset -ge $child.Extent.EndOffset
-                if ($inBody -and $clause.Item1.Extent.Text -match $regex) {
+                if ($inBody -and (Test-BRAVOSelfTestOutboundPositiveGate -Condition $clause.Item1 -Regex $regex)) {
                     return [pscustomobject]@{ Gated = $true; Evidence = "if L$($clause.Item1.Extent.StartLineNumber)" }
                 }
                 $inCondition = $clause.Item1.Extent.StartOffset -le $child.Extent.StartOffset -and $clause.Item1.Extent.EndOffset -ge $child.Extent.EndOffset
@@ -1719,7 +1888,7 @@ function Test-BRAVOSelfTestOutboundGated {
         }
         if ($parent -is [Management.Automation.Language.BinaryExpressionAst] -and
             $parent.Operator -eq [Management.Automation.Language.TokenKind]::And -and
-            [object]::ReferenceEquals($parent.Right, $child) -and $parent.Left.Extent.Text -match $regex) {
+            [object]::ReferenceEquals($parent.Right, $child) -and (Test-BRAVOSelfTestOutboundPositiveGate -Condition $parent.Left -Regex $regex)) {
             return [pscustomobject]@{ Gated = $true; Evidence = "-and L$($parent.Extent.StartLineNumber)" }
         }
         if ($parent -is [Management.Automation.Language.StatementBlockAst] -or $parent -is [Management.Automation.Language.NamedBlockAst]) {
@@ -1825,6 +1994,36 @@ Test-BRAVOCondition -Condition (
     -not [bool]$bdBranchSites['Send-ExampleNegatedOrElse'].Gated
 ) -Name 'BackupDestinations/OutboundGuardCountsOnlyOwnBranchCondition' `
     -Failure "сторож має зараховувати вимикач лише з умови гілки, у тілі якої стоїть канал: else і пізніша elseif — незахищені (крім else після рівно «-not вимикач»), if і elseif із власною умовою — захищені: $(@($bdBranchSites.Values | ForEach-Object { "$($_.Function): gated=$($_.Gated) $($_.Evidence)" }) -join ' | ')"
+
+# Codex P2 (раунд 2): полярність. Вимикач зараховується лише як позитивна
+# вимога на власній гілці каналу: «-not вимикач» у тілі й «вимикач -or інше»
+# каналу не захищають; «вимикач -and інше» — захищає; else після рівно
+# «-not вимикач» лишається захищеним.
+$bdPolarityFixture = @(
+    [pscustomobject]@{ File = 'modules\Example\Example.Polarity.ps1'; Text = @'
+function Send-ExampleNegatedBody { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExampleOrBody { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExampleNegatedAndRight { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExampleAndBody { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExampleNegatedElseKept { $session = New-Object WinSCP.Session; $session.Open($null) }
+if (-not $storageEffective.SFTP.Enabled) { Send-ExampleNegatedBody }
+if ($storageEffective.SFTP.Enabled -or $exampleOtherFlag) { Send-ExampleOrBody }
+(-not $storageEffective.SFTP.Enabled) -and (Send-ExampleNegatedAndRight)
+if ($storageEffective.SFTP.Enabled -and $exampleOtherFlag) { Send-ExampleAndBody }
+if (!$storageEffective.SFTP.Enabled) { Write-Output 'off' } else { Send-ExampleNegatedElseKept }
+'@ }
+)
+$bdPolaritySites = @{}
+foreach ($bdPolaritySite in @(Get-BRAVOSelfTestOutboundSites -Sources $bdPolarityFixture)) { $bdPolaritySites[$bdPolaritySite.Function] = $bdPolaritySite }
+Test-BRAVOCondition -Condition (
+    $bdPolaritySites.Count -eq 5 -and
+    -not [bool]$bdPolaritySites['Send-ExampleNegatedBody'].Gated -and
+    -not [bool]$bdPolaritySites['Send-ExampleOrBody'].Gated -and
+    -not [bool]$bdPolaritySites['Send-ExampleNegatedAndRight'].Gated -and
+    [bool]$bdPolaritySites['Send-ExampleAndBody'].Gated -and
+    [bool]$bdPolaritySites['Send-ExampleNegatedElseKept'].Gated
+) -Name 'BackupDestinations/OutboundGuardRequiresPositiveSwitch' `
+    -Failure "сторож має зараховувати вимикач лише як позитивну вимогу гілки каналу (не під -not/!, поєднану лише через -and): «if (-not вимикач) { канал }», «if (вимикач -or інше) { канал }» і «(-not вимикач) -and (канал)» — незахищені; «вимикач -and інше» і else після «!вимикач» — захищені: $(@($bdPolaritySites.Values | ForEach-Object { "$($_.Function): gated=$($_.Gated) $($_.Evidence)" }) -join ' | ')"
 
 $bdOutboundSites = @(Get-BRAVOSelfTestOutboundSites -Sources (Get-BRAVOSelfTestOutboundSourceSet -Root $root))
 $bdUngatedSites = @($bdOutboundSites | Where-Object { -not $_.Gated -and -not (Test-BRAVOSelfTestOutboundException -Site $_) })

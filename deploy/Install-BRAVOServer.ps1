@@ -114,7 +114,7 @@ function Write-Warn2{ param([string]$T) Write-Host ('  [УВАГА] ' + $T) -For
 # парсером PowerShell (AST). Знімок developer має файли BRAVO.Configurator,
 # але не має цих функцій, тож одного Test-Path недостатньо (P3-1). Повертає
 # перелік відсутнього; порожній перелік = комплект підтримує профіль. Одна
-# перевірка і для явного профілю в кроці 1 ($staged), і для вибору між
+# перевірка і для явного профілю в кроці 1 (приватна копія комплекту), і для вибору між
 # канонічним seed і копією прикладу в кроці 4 (розгорнутий каталог).
 function Get-BRAVOInstallBackupDestinationMissingCapabilities {
     param([Parameter(Mandatory = $true)][string]$ModuleRoot)
@@ -123,7 +123,9 @@ function Get-BRAVOInstallBackupDestinationMissingCapabilities {
         'modules\BRAVO.Configurator\BRAVO.Configurator.Persistence.psm1' = @('Get-BRAVOConfiguratorProductionOverrideState', 'New-BRAVOConfiguratorSeedLocalConfig')
         'modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1'     = @('Get-BRAVOConfiguratorBackupDestinationProfile', 'Test-BRAVOConfiguratorBackupDestinationEffective')
         'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'           = @()
+        'modules\BRAVO.Configuration\BRAVO.Configuration.psm1'           = @('Get-BRAVODefaultConfiguration', 'Resolve-BRAVORawConfiguration')
         'modules\BRAVO.Discovery\BRAVO.Discovery.psd1'                   = @()
+        'modules\BRAVO.Discovery\BRAVO.Discovery.psm1'                   = @('Get-BRAVOEffectiveStorageConfiguration')
     }
     $missing = @()
     foreach ($relativePath in @($requiredModules.Keys)) {
@@ -156,8 +158,8 @@ function Get-BRAVOInstallBackupDestinationMissingCapabilities {
 # Цілісність комплекту за RUNTIME_MANIFEST.json ДО першого імпорту його коду
 # (#434). SHA-256 архіву не захищає від локального архіву зі «своїм» .sha256
 # поруч чи від підміни розпакованих файлів, а крок 5 (guard) запускається вже
-# після кроку 4. Тому перед КОЖНИМ Import-Module коду комплекту — над staged у
-# кроці 1 і над розгорнутим каталогом у кроці 4 — виконується канонічна
+# після кроку 4. Тому перед КОЖНИМ Import-Module коду комплекту — над приватною
+# копією в кроці 1 і над розгорнутим каталогом у кроці 4 — виконується канонічна
 # перевірка Test-BRAVORuntimeManifestIntegrity з BRAVO_RUNTIME_GUARD.ps1 того
 # самого комплекту, той самий код, що крок 5. Порядок довіри guard-а:
 # pre-trust guard -> цілісність -> лише потім Import-Module. Guard
@@ -209,7 +211,7 @@ function Assert-BRAVOInstallBundleIntegrity {
 # порівняння з профілем — канонічне Test-BRAVOConfiguratorBackupDestinationEffective.
 # Файл не змінюється й не «виправляється» автоматично. $ModuleRoot — комплект,
 # чиї модулі вже пройшли SHA-256, провенанс, гейт каналу й
-# Assert-BRAVOInstallBundleIntegrity (staged у кроці 1 або розгорнутий каталог
+# Assert-BRAVOInstallBundleIntegrity (приватна копія в кроці 1 або розгорнутий каталог
 # у кроці 4). -BeforeDeploy — виклик у кроці 1, коли
 # в каталог інсталяції ще нічого не скопійовано (так і пише причина).
 function Get-BRAVOInstallSiteComponentSettings {
@@ -236,6 +238,16 @@ function Get-BRAVOInstallSiteComponentSettings {
             'BRAVO_CONFIGURATOR.ps1) і повторіть запуск.')
     }
     return $mergedConfiguration['componentSettings']
+}
+
+# Відбиток BRAVO.local.config для явного профілю (#434): SHA-256 файла або ''
+# за його відсутності. Знімається в кроці 1 ДО читання файла й звіряється
+# перед першим записом у каталог інсталяції: файл, змінений після перевірки,
+# не повинен дати відмову вже після копіювання (часткове розгортання).
+function Get-BRAVOInstallSiteConfigFingerprint {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
 function Assert-BRAVOInstallBackupDestinationEffective {
@@ -532,25 +544,57 @@ Write-Ok 'обов''язкові файли комплекту на місці'
 # повторний запуск з тими самими аргументами після виправлення працює.
 # Неявний профіль (без -BackupDestination) цих перевірок не має: комплекти
 # без BRAVO.Configurator встановлюються, як раніше.
+$existingSiteConfig = Join-Path $RuntimeRoot 'BRAVO.local.config'
+$siteConfigCheckedFingerprint = $null
 if ($PSBoundParameters.ContainsKey('BackupDestination')) {
-    $stagedMissingCapabilities = @(Get-BRAVOInstallBackupDestinationMissingCapabilities -ModuleRoot $staged)
-    if ($stagedMissingCapabilities.Count -gt 0) {
-        throw ('Комплект ' + $targetVersion + ' не підтримує -BackupDestination ' + $BackupDestination +
-            ': бракує модулів чи функцій BRAVO.Configurator/конфігурації (' + ($stagedMissingCapabilities -join ', ') +
-            '). Нічого не розгорнуто. Вкажіть -Tag або -ZipPath комплекту, що містить BRAVO.Configurator, ' +
-            'або запустіть без -BackupDestination (напрямки потім задає BRAVO_CONFIGURATOR.ps1).')
-    }
-    Write-Ok ('комплект підтримує -BackupDestination ' + $BackupDestination)
-    # Цілісність staged за RUNTIME_MANIFEST.json — до першого імпорту коду
-    # комплекту нижче і до копіювання (відмова не лишає часткового runtime).
-    Assert-BRAVOInstallBundleIntegrity -BundleRoot $staged -BeforeDeploy
-    $existingSiteConfig = Join-Path $RuntimeRoot 'BRAVO.local.config'
-    if (Test-Path -LiteralPath $existingSiteConfig -PathType Leaf) {
-        $stagedSiteStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings (
-            Get-BRAVOInstallSiteComponentSettings -ModuleRoot $staged -ConfigDirectory $RuntimeRoot `
-                -Destination $BackupDestination -BeforeDeploy)
-        Assert-BRAVOInstallBackupDestinationEffective -Destination $BackupDestination `
-            -EffectiveStorage $stagedSiteStorage -SiteConfigPath $existingSiteConfig -BeforeDeploy
+    # Код комплекту для цієї перевірки не імпортується з $StagingRoot: той
+    # каталог може бути створений заздалегідь і доступний на запис звичайному
+    # користувачеві, тож файл, підмінений між перевіркою цілісності й
+    # Import-Module, виконався б із піднятими правами (TOCTOU). Тому — свіжий
+    # приватний каталог елевованого процесу ([IO.Path]::GetTempPath(),
+    # випадкова назва): туди копіюється архів, його SHA-256 звіряється з уже
+    # перевіреним значенням, і комплект розпаковується заново. Можливості,
+    # цілісність за RUNTIME_MANIFEST.json і імпорт — над ЦИМ самим коренем.
+    # Каталог видаляється у finally.
+    $verifiedBundleRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('BRAVO_INSTALL_VERIFY_' + [guid]::NewGuid().ToString('N'))
+    try {
+        [void](New-Item -ItemType Directory -Path $verifiedBundleRoot)
+        $verifiedZipPath = Join-Path $verifiedBundleRoot (Split-Path -Leaf $ZipPath)
+        Copy-Item -LiteralPath $ZipPath -Destination $verifiedZipPath
+        if ((Get-FileHash -LiteralPath $verifiedZipPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $actual) {
+            throw ('Архів ' + $ZipPath + ' змінився після перевірки SHA-256 (копія для перевірки -BackupDestination ' +
+                'не збігається з ' + $actual + '). Нічого не розгорнуто. Перевірте, хто має право запису в каталог ' +
+                'архіву, і повторіть запуск.')
+        }
+        $verifiedBundle = Join-Path $verifiedBundleRoot 'bundle'
+        Expand-Archive -LiteralPath $verifiedZipPath -DestinationPath $verifiedBundle -Force
+        $stagedMissingCapabilities = @(Get-BRAVOInstallBackupDestinationMissingCapabilities -ModuleRoot $verifiedBundle)
+        if ($stagedMissingCapabilities.Count -gt 0) {
+            throw ('Комплект ' + $targetVersion + ' не підтримує -BackupDestination ' + $BackupDestination +
+                ': бракує модулів чи функцій BRAVO.Configurator/конфігурації (' + ($stagedMissingCapabilities -join ', ') +
+                '). Нічого не розгорнуто. Вкажіть -Tag або -ZipPath комплекту, що містить BRAVO.Configurator, ' +
+                'або запустіть без -BackupDestination (напрямки потім задає BRAVO_CONFIGURATOR.ps1).')
+        }
+        Write-Ok ('комплект підтримує -BackupDestination ' + $BackupDestination)
+        # Цілісність за RUNTIME_MANIFEST.json — до першого імпорту коду
+        # комплекту нижче і до копіювання (відмова не лишає часткового runtime).
+        Assert-BRAVOInstallBundleIntegrity -BundleRoot $verifiedBundle -BeforeDeploy
+        # Відбиток знімається ДО читання файла; крок 3 звіряє його перед
+        # першим записом у каталог інсталяції.
+        $siteConfigCheckedFingerprint = Get-BRAVOInstallSiteConfigFingerprint -Path $existingSiteConfig
+        if (Test-Path -LiteralPath $existingSiteConfig -PathType Leaf) {
+            $stagedSiteStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings (
+                Get-BRAVOInstallSiteComponentSettings -ModuleRoot $verifiedBundle -ConfigDirectory $RuntimeRoot `
+                    -Destination $BackupDestination -BeforeDeploy)
+            Assert-BRAVOInstallBackupDestinationEffective -Destination $BackupDestination `
+                -EffectiveStorage $stagedSiteStorage -SiteConfigPath $existingSiteConfig -BeforeDeploy
+        }
+    } finally {
+        try {
+            if (Test-Path -LiteralPath $verifiedBundleRoot) { Remove-Item -LiteralPath $verifiedBundleRoot -Recurse -Force -ErrorAction Stop }
+        } catch {
+            Write-Warn2 ('тимчасовий каталог перевірки не видалено: ' + $verifiedBundleRoot + ' (' + $_.Exception.Message + ')')
+        }
     }
 }
 
@@ -593,6 +637,17 @@ if ($null -ne $freeBytes) {
 # --- 3. Розгортання ---------------------------------------------------------
 
 Write-Step '3. Розгортання'
+
+# Явний профіль (#434): BRAVO.local.config, перевірений у кроці 1, мусить
+# бути тим самим і зараз — до ПЕРШОГО запису в каталог інсталяції. Інакше
+# крок 4 відмовив би вже після копіювання, лишивши VERSION.json і частковий
+# runtime.
+if ($null -ne $siteConfigCheckedFingerprint -and
+    (Get-BRAVOInstallSiteConfigFingerprint -Path $existingSiteConfig) -ne $siteConfigCheckedFingerprint) {
+    throw ($existingSiteConfig + ' (BRAVO.local.config) змінився, з''явився чи зник після перевірки -BackupDestination ' +
+        $BackupDestination + ' у кроці 1. Нічого не розгорнуто, файл не змінено. Завершіть редагування ' +
+        'BRAVO.local.config і повторіть запуск.')
+}
 
 if (-not $targetExists) {
     [void](New-Item -ItemType Directory -Path $RuntimeRoot -Force)
