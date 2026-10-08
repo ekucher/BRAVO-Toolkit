@@ -1248,7 +1248,11 @@ function Invoke-BRAVOWebApplicationLogRotation { param($SourceDirectory, $Destin
 function Get-BRAVOTraceConfiguration { param($DiscoveryResult, $TraceRootDirectory, $DateFolderName) return [pscustomobject]@{ IsValid = $true; TracePath = 'self-test-trace.log'; Reason = $null } }
 function Get-BRAVOInstallationTraceOutSources { param($InstallationRoot, $LimsRoot, $SrvTracePath, $ExplicitBisPath) return [pscustomobject]@{ Sources = @(); ScanRoot = 'self-test'; ScanRootReason = 'self-test' } }
 function Resolve-BRAVOExchangeApiRuntimeDirectory { param($ServiceName, $FallbackDirectory) return [pscustomobject]@{ Directory = 'self-test'; Reason = 'self-test' } }
-function Get-BRAVOWmiInstance { param($ClassName, $Filter) return [pscustomobject]@{ LastBootUpTime = (Get-Date).AddMinutes(-[int]$script:ProbeUptimeMinutes) } }
+function Get-BRAVOWmiInstance {
+    param($ClassName, $Filter)
+    if ($ClassName -eq 'Win32_OperatingSystem' -and $script:ProbeBootTimeUnreadable) { throw 'self-test: WMI недоступний' }
+    return [pscustomobject]@{ LastBootUpTime = (Get-Date).AddMinutes(-[int]$script:ProbeUptimeMinutes) }
+}
 function Get-WinEvent {
     param($FilterHashtable, $MaxEvents, $ErrorAction)
     Add-ProbeEvent 'SCM-READ'
@@ -1289,6 +1293,11 @@ $probeScenarios = [ordered]@{
         $script:ProbeLockHolder = [pscustomobject]@{ Operation = 'Archive'; Pid = 4242; ProcessStartTime = 'self-test-start'; HostName = [Environment]::MachineName; StartedAt = ''; GenerationId = ''; Description = 'operation=Archive; pid=4242' }
     }
     'RSBootGrace' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 5 }
+    'RSBootHoldDelay' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 25; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 30; $script:ProbeRestorePending = $false }
+    'RSBootHoldPendingRestore' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 30; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 7; $script:ProbeRestorePending = $true }
+    'RSBootHoldBootTimeUnknown' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeBootTimeUnreadable = $true; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 7; $script:ProbeRestorePending = $false }
+    'RSBootHoldElapsed' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 180; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 7; $script:ProbeRestorePending = $false }
+    'RSBootTimeUnknownNoHold' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeBootTimeUnreadable = $true }
     'RSOrphanOwnMarker' = {
         $script:ProbeServices['exchangAPI'] = 'Stopped'
         $script:ProbeMarkerNames = @('exchangAPI')
@@ -1372,6 +1381,10 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             $script:ProbeLockHolder = $null
             $script:ProbeLockHolderAlive = $true
             $script:ProbeUptimeMinutes = 180
+            $script:ProbeBootTimeUnreadable = $false
+            $script:ProbeBootRestoreMode = $null
+            $script:ProbeStartupDelay = $null
+            $script:ProbeRestorePending = $null
             $script:ProbeMarkerWriteFails = $false
             $script:ProbeScmReadFails = $false
             $script:ProbeScmEvents = @()
@@ -1417,6 +1430,13 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             $WWW_LOGS_DIR = Join-Path $ScenarioRoot 'www\log'
             $BRAVOWEB_APP_DAILY_LOG_DIR = Join-Path $ScenarioRoot 'system\BravoWeb\Application\daily'
             $BRAVOWEB_APP_LOG_FILTER = '*.log'
+
+            # Профіль HoldServices: налаштування реставрації і стан пропущеної
+            # реставрації ($automaticRestoreDue runtime) — лише в сценаріях, що їх задають.
+            if ($null -ne $script:ProbeBootRestoreMode) {
+                $maintenanceSettings = @{ Restore = @{ BootRestoreMode = $script:ProbeBootRestoreMode; StartupDelayMinutes = $script:ProbeStartupDelay } }
+            }
+            if ($null -ne $script:ProbeRestorePending) { $automaticRestoreDue = [bool]$script:ProbeRestorePending }
 
             $probeExitCode = Invoke-BRAVOMaintenanceRecoverServicesProfile -ForceRestore:$script:ProbeForceRestore -RunMissedRestoreOnly:$script:ProbeRunMissedRestoreOnly
             $probeLogFiles = @()
@@ -1608,6 +1628,31 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: ОС працює менше 9 хв')
         } 'ServiceRecovery/RecoverServicesBootGrace' `
             "Рев'ю PR #432 (A-P3-4): ОС працює 5 хв — профіль без lock-а і без змін виходить з кодом 0, рядок INFO у RECOVER_PAUSE.log"
+        # Рев'ю PR #432 (Codex P1): на профілі HoldServices вікно виводиться із
+        # затримки boot-тригера Recovery (Restore.StartupDelayMinutes) і стану
+        # пропущеної реставрації; час старту ОС не прочитано — fail-closed.
+        & $recoverCheck 'RSBootHoldDelay' 0 @() $recoverPauseLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: ОС працює менше 40 хв (профіль HoldServices: затримка boot-тригера Recovery 30 хв + запас 10 хв)')
+        } 'ServiceRecovery/RecoverServicesBootGraceFollowsHoldServicesDelay' `
+            "Рев'ю PR #432 (Codex P1): HoldServices із затримкою boot-тригера 30 хв, ОС працює 25 хв — профіль не випереджає boot-реставрацію: код 0 без змін, вікно 30 + 10 хв"
+        & $recoverCheck 'RSBootHoldPendingRestore' 0 @() $recoverPauseLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: ОС працює менше 67 хв (профіль HoldServices: затримка boot-тригера Recovery 7 хв + запас 60 хв, пропущена реставрація ще чекає)')
+        } 'ServiceRecovery/RecoverServicesBootGraceExtendedWhileRestorePending' `
+            "Рев'ю PR #432 (Codex P1): HoldServices і пропущена реставрація ще чекає — вікно довше (затримка + 60 хв), ОС працює 30 хв — код 0 без змін"
+        & $recoverCheck 'RSBootHoldBootTimeUnknown' 0 @() $recoverPauseLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: час старту ОС не визначено (профіль HoldServices')
+        } 'ServiceRecovery/RecoverServicesHoldServicesUnknownBootTimeFailClosed' `
+            "Рев'ю PR #432 (Codex P1): HoldServices, час старту ОС не прочитано — fail-closed: тик пропущено (код 0, INFO), служби не змінювались"
+        & $recoverCheck 'RSBootHoldElapsed' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName $recoverOk 'ServiceRecovery/RecoverServicesHoldServicesAfterGraceRecovers' `
+            "Рев'ю PR #432 (Codex P1): HoldServices, вікно після старту ОС минуло — служба відновлюється як звичайно"
+        & $recoverCheck 'RSBootTimeUnknownNoHold' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName $recoverOk 'ServiceRecovery/RecoverServicesUnknownBootTimeWithoutHoldRecovers' `
+            "Рев'ю PR #432 (Codex P1): профіль без HoldServices, час старту ОС не прочитано — як і раніше, відновлення не відкладається"
         # Рев'ю PR #432 (B-P3-1): осиротілий маркер власного профілю переймається.
         & $recoverCheck 'RSOrphanOwnMarker' 0 @(
             $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))

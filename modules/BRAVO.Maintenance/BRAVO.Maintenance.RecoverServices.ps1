@@ -447,17 +447,29 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
         return 0
     }
 
-    # Рев'ю PR #432 (A-P3-4 / B-P3-3): перші хвилини після старту ОС служби
-    # піднімає boot-тригер (-RunMissedRestoreOnly, з урахуванням
-    # HoldServices); event- чи daily-тригер профілю не випереджає його.
-    $bootGraceMinutes = [int](Get-BRAVOServiceRecoveryPolicy).BootGraceMinutes
-    $bootTime = Get-BRAVOServiceRecoveryBootTime
-    if ($null -ne $bootTime) {
-        $uptimeMinutes = ((Get-Date) - [datetime]$bootTime).TotalMinutes
-        if ($uptimeMinutes -ge 0 -and $uptimeMinutes -lt $bootGraceMinutes) {
-            Write-BRAVOMaintenanceServiceRecoveryDayLine -Message ('Відновлення служб відкладено: ОС працює менше ' + $bootGraceMinutes + ' хв — службами після старту розпоряджається boot-тригер; служби не змінювались')
-            return 0
-        }
+    # Рев'ю PR #432 (A-P3-4 / B-P3-3, Codex P1): перші хвилини після старту
+    # ОС служби піднімає boot-тригер (-RunMissedRestoreOnly, з урахуванням
+    # HoldServices); event- чи daily-тригер профілю не випереджає його. Для
+    # HoldServices вікно виводиться із затримки boot-тригера Recovery
+    # (Restore.StartupDelayMinutes) і стану пропущеної реставрації
+    # ($automaticRestoreDue runtime: персистентний BRAVO_RESTORE_STATE.json).
+    $restoreSettings = $null
+    $maintenanceSettingsValue = Get-Variable -Name maintenanceSettings -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $maintenanceSettingsValue -and $maintenanceSettingsValue -is [System.Collections.IDictionary] -and $maintenanceSettingsValue.Contains('Restore')) { $restoreSettings = $maintenanceSettingsValue.Restore }
+    $bootRestoreMode = $null
+    $startupDelayMinutes = $null
+    if ($restoreSettings -is [System.Collections.IDictionary]) {
+        if ($restoreSettings.Contains('BootRestoreMode')) { $bootRestoreMode = [string]$restoreSettings.BootRestoreMode }
+        if ($restoreSettings.Contains('StartupDelayMinutes')) { $startupDelayMinutes = $restoreSettings.StartupDelayMinutes }
+    }
+    # Невідомий стан реставрації — як «ще чекає» (довше вікно, fail-closed).
+    $restorePendingVariable = Get-Variable -Name automaticRestoreDue -ErrorAction SilentlyContinue
+    $restorePending = ($null -eq $restorePendingVariable) -or [bool]$restorePendingVariable.Value
+    $bootGate = Get-BRAVOServiceRecoveryBootGate -BootTime (Get-BRAVOServiceRecoveryBootTime) -Now (Get-Date) `
+        -BootRestoreMode $bootRestoreMode -StartupDelayMinutes $startupDelayMinutes -RestorePending $restorePending
+    if ($bootGate.Defer) {
+        Write-BRAVOMaintenanceServiceRecoveryDayLine -Message ('Відновлення служб відкладено: ' + [string]$bootGate.Reason + ' — службами після старту розпоряджається boot-тригер; служби не змінювались')
+        return 0
     }
 
     # Крок 2: паузи між спробами (FR-5).

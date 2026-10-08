@@ -37,9 +37,16 @@ function Get-BRAVOServiceRecoveryPolicy {
     #   StableMinutes          - стільки служба має працювати після останньої
     #                            спроби, щоб облік обнулився;
     #   BootGraceMinutes       - перші хвилини після старту ОС профіль служб
-    #                            не змінює: ними розпоряджається boot-тригер
-    #                            (-RunMissedRestoreOnly, HoldServices); менше
-    #                            за затримку Boot-тригера задачі (10 хв).
+    #                            не змінює; менше за затримку Boot-тригера
+    #                            задачі (10 хв). Для профілю HoldServices — нижня
+    #                            межа вікна (див. Get-BRAVOServiceRecoveryBootGate);
+    #   BootHoldMarginMinutes  - HoldServices: запас понад затримку boot-тригера
+    #                            Recovery (Restore.StartupDelayMinutes) на запуск
+    #                            задачі й захоплення operation-lock;
+    #   BootHoldPendingRestoreMarginMinutes
+    #                          - те саме, коли пропущена реставрація ще чекає
+    #                            (boot-прогін мав би її виконати): довший запас
+    #                            на випадок запізнілого старту задачі.
     return [pscustomobject]@{
         PauseMinutes = @(0, 5, 15, 60)
         WindowHours = 24
@@ -47,7 +54,72 @@ function Get-BRAVOServiceRecoveryPolicy {
         CyclicReminderHours = 24
         StableMinutes = 30
         BootGraceMinutes = 9
+        BootHoldMarginMinutes = 10
+        BootHoldPendingRestoreMarginMinutes = 60
     }
+}
+
+function Get-BRAVOServiceRecoveryBootGate {
+    # Чи відкладає профіль -RecoverServices відновлення після старту ОС
+    # (рев'ю PR #432: A-P3-4 / B-P3-3, Codex P1). Службами після старту
+    # розпоряджається boot-тригер; event- чи daily-тригер профілю не
+    # випереджає його.
+    #   BootRestoreMode HoldServices (сервер робочого часу): boot-тригер
+    #     Recovery (-RunMissedRestoreOnly) стартує через -StartupDelayMinutes
+    #     (Restore.StartupDelayMinutes) і виконує пропущену реставрацію до
+    #     запуску служб. Вікно = затримка + BootHoldMarginMinutes, а коли
+    #     пропущена реставрація ще чекає (-RestorePending, персистентний стан
+    #     реставрації) — затримка + BootHoldPendingRestoreMarginMinutes; не
+    #     менше за BootGraceMinutes. Час старту ОС не прочитано, затримка
+    #     невідома чи час старту в майбутньому — fail-closed: відкласти.
+    #   Інші профілі: вікно BootGraceMinutes; час старту ОС не прочитано —
+    #     не відкладати (як і раніше).
+    # Лише обчислює. Повертає { Defer; GraceMinutes; Reason } (Reason — для
+    # рядка INFO, коли Defer).
+    param(
+        [AllowNull()][object]$BootTime,
+        [Parameter(Mandatory = $true)][datetime]$Now,
+        [AllowNull()][string]$BootRestoreMode,
+        [AllowNull()][object]$StartupDelayMinutes,
+        [bool]$RestorePending = $true
+    )
+
+    $policy = Get-BRAVOServiceRecoveryPolicy
+    $graceMinutes = [int]$policy.BootGraceMinutes
+    $holdServices = ([string]$BootRestoreMode -eq 'HoldServices')
+    $holdDetails = ''
+    if ($holdServices) {
+        $delayMinutes = $null
+        if ($null -ne $StartupDelayMinutes -and -not [string]::IsNullOrWhiteSpace([string]$StartupDelayMinutes)) {
+            $delayMinutes = $StartupDelayMinutes -as [int]
+        }
+        if ($null -eq $delayMinutes -or $delayMinutes -lt 0) {
+            return [pscustomobject]@{ Defer = $true; GraceMinutes = $null; Reason = ('профіль HoldServices, а затримку boot-тригера Recovery (Restore.StartupDelayMinutes = ''' + [string]$StartupDelayMinutes + ''') не визначено') }
+        }
+        $marginMinutes = [int]$policy.BootHoldMarginMinutes
+        $holdDetails = 'профіль HoldServices: затримка boot-тригера Recovery ' + $delayMinutes + ' хв + запас ' + $marginMinutes + ' хв'
+        if ($RestorePending) {
+            $marginMinutes = [int]$policy.BootHoldPendingRestoreMarginMinutes
+            $holdDetails = 'профіль HoldServices: затримка boot-тригера Recovery ' + $delayMinutes + ' хв + запас ' + $marginMinutes + ' хв, пропущена реставрація ще чекає'
+        }
+        $graceMinutes = [math]::Max($graceMinutes, $delayMinutes + $marginMinutes)
+    }
+    if ($null -eq $BootTime) {
+        if ($holdServices) {
+            return [pscustomobject]@{ Defer = $true; GraceMinutes = $graceMinutes; Reason = ('час старту ОС не визначено (' + $holdDetails + ')') }
+        }
+        return [pscustomobject]@{ Defer = $false; GraceMinutes = $graceMinutes; Reason = $null }
+    }
+    $uptimeMinutes = ($Now - [datetime]$BootTime).TotalMinutes
+    if ($uptimeMinutes -lt 0 -and $holdServices) {
+        return [pscustomobject]@{ Defer = $true; GraceMinutes = $graceMinutes; Reason = ('час старту ОС пізніший за поточний (' + $holdDetails + ')') }
+    }
+    if ($uptimeMinutes -ge 0 -and $uptimeMinutes -lt $graceMinutes) {
+        $reason = 'ОС працює менше ' + $graceMinutes + ' хв'
+        if ($holdServices) { $reason += ' (' + $holdDetails + ')' }
+        return [pscustomobject]@{ Defer = $true; GraceMinutes = $graceMinutes; Reason = $reason }
+    }
+    return [pscustomobject]@{ Defer = $false; GraceMinutes = $graceMinutes; Reason = $null }
 }
 
 function Get-BRAVOServiceRecoveryStatePath {
