@@ -780,7 +780,8 @@ Test-BRAVOCondition -Condition (
         # елевованому процесі Windows. Харнес і так підставляє $isElevated =
         # $true, тож поза елевованим Windows (Linux, неелевована консоль)
         # New-BRAVOInstallPrivateDirectory замінено звичайним створенням
-        # каталогу; справжню функцію перевіряє InstallerPrivateVerifyDirectoryProtectedBeforeFirstWrite.
+        # каталогу, а основа $env:SystemRoot\Temp — [IO.Path]::GetTempPath();
+        # справжні функції перевіряє InstallerPrivateVerifyDirectoryProtectedBeforeFirstWrite.
         $bdE2eIsWindows = ($env:OS -eq 'Windows_NT')
         $bdE2eIsElevated = $false
         if ($bdE2eIsWindows) {
@@ -788,6 +789,7 @@ Test-BRAVOCondition -Condition (
                 [Security.Principal.WindowsBuiltInRole]::Administrator)
         }
         $bdE2ePrivateDirectoryStub = @($(if (-not ($bdE2eIsWindows -and $bdE2eIsElevated)) {
+            'function Get-BRAVOInstallPrivateDirectoryBase { return [IO.Path]::GetTempPath() }',
             'function New-BRAVOInstallPrivateDirectory { param([string]$Path) Write-StepOutput ''STUB: private-acl''; [void](New-Item -ItemType Directory -Path $Path) }'
         }))
         $bdE2eParamText = [regex]::Replace([string]$bdInstallAst.ParamBlock.Extent.Text, '^(?i)param\s*\(', 'param([string]$OutputLog, [string]$SelfTestSiteMutationSource, ')
@@ -1484,7 +1486,8 @@ Test-BRAVOCondition -Condition (
             -Failure "крок 1 має читати знімок BRAVO.local.config, з байтів якого знято відбиток, а зміну живого файла після знімка — зупиняти перед першим записом у каталог інсталяції («змінився»): $($bdE2eSnapshotFailures -join ' | ')"
 
         # (Codex P1, раунд 3) Приватний каталог перевірки кроку 1 лежить у
-        # [IO.Path]::GetTempPath() і без явного DACL успадкував би права %TEMP%:
+        # $env:SystemRoot\Temp (не %TEMP% користувача, де той має FILE_DELETE_CHILD
+        # і міг би перейменувати каталог) і без явного DACL успадкував би права:
         # процес того самого користувача без елевації підмінив би .psm1 між
         # перевіркою цілісності й Import-Module. Статично: каталог створює лише
         # New-BRAVOInstallPrivateDirectory (DACL з SetAccessRuleProtection, лише
@@ -1529,6 +1532,43 @@ Test-BRAVOCondition -Condition (
                     $bdE2eAclFailures += "рядок $($bdE2eAclUse.Extent.StartLineNumber): корінь приватного каталогу створено без захищеного DACL: $($bdE2eAclUse.Extent.Text)"
                 }
             }
+        }
+        # Основа — $env:SystemRoot\Temp через Get-BRAVOInstallPrivateDirectoryBase,
+        # не GetTempPath(); відсутність основи — відмова.
+        $bdE2eAclRootAssignments = @($(if ($bdE2eAclTry.Count -eq 1) { $bdE2eAclTry[0].Body.FindAll({ param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+            $node.Left.VariablePath.UserPath -eq 'verifiedBundleRoot' }, $true) }))
+        if ($bdE2eAclRootAssignments.Count -ne 1 -or $bdE2eAclRootAssignments[0].Right.Extent.Text -notmatch '^Join-Path \(Get-BRAVOInstallPrivateDirectoryBase\) ' -or
+            $bdE2eAclRootAssignments[0].Right.Extent.Text -match 'GetTempPath') {
+            $bdE2eAclFailures += "`$verifiedBundleRoot має будуватися як Join-Path (Get-BRAVOInstallPrivateDirectoryBase) ...: $(@($bdE2eAclRootAssignments | ForEach-Object { $_.Extent.Text }) -join ' | ')"
+        }
+        $bdE2eAclBaseFunction = @($bdInstallAst.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOInstallPrivateDirectoryBase' }, $true))
+        if ($bdE2eAclBaseFunction.Count -ne 1) {
+            $bdE2eAclFailures += 'Get-BRAVOInstallPrivateDirectoryBase не визначено в інсталяторі'
+        } else {
+            $bdE2eAclBaseBody = $bdE2eAclBaseFunction[0].Body.Extent.Text
+            if (-not $bdE2eAclBaseBody.Contains('$env:SystemRoot') -or -not $bdE2eAclBaseBody.Contains("Join-Path `$systemRoot 'Temp'") -or
+                $bdE2eAclBaseBody.Contains('GetTempPath') -or $bdE2eAclBaseBody.Contains('$env:TEMP') -or -not $bdE2eAclBaseBody.Contains('throw')) {
+                $bdE2eAclFailures += 'Get-BRAVOInstallPrivateDirectoryBase: основа — Join-Path $env:SystemRoot ''Temp'' з відмовою за відсутності, без GetTempPath/$env:TEMP'
+            }
+            # Поведінка: без $env:SystemRoot чи з неіснуючим — відмова з українською причиною.
+            $bdE2eAclBaseCases = & {
+                param([string]$FunctionText, [string]$MissingRoot)
+                . ([scriptblock]::Create($FunctionText))
+                $savedSystemRoot = $env:SystemRoot
+                $outcomes = @()
+                try {
+                    foreach ($caseRoot in @('', $MissingRoot)) {
+                        $env:SystemRoot = $caseRoot
+                        try { [void](Get-BRAVOInstallPrivateDirectoryBase); $outcomes += "'$caseRoot': без відмови" } catch {
+                            if ($_.Exception.Message -notmatch '[\u0400-\u04FF]') { $outcomes += "'$caseRoot': причина не українська" }
+                        }
+                    }
+                } finally { $env:SystemRoot = $savedSystemRoot }
+                return @($outcomes)
+            } $bdE2eAclBaseFunction[0].Extent.Text (Join-Path $bdE2eRoot ('no_systemroot_' + [guid]::NewGuid().ToString('N')))
+            foreach ($bdE2eAclBaseCase in @($bdE2eAclBaseCases)) { $bdE2eAclFailures += "Get-BRAVOInstallPrivateDirectoryBase $bdE2eAclBaseCase" }
         }
         $bdE2eAclFunction = @($bdInstallAst.FindAll({ param($node)
             $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-BRAVOInstallPrivateDirectory' }, $true))
@@ -1641,7 +1681,7 @@ Test-BRAVOCondition -Condition (
         # -Name (перша змінна); $configuratorModuleRoot = $RuntimeRoot. Корінь
         # не може походити з $StagingRoot/$staged (транзитивно за присвоєннями):
         # той каталог може бути доступний на запис іншим. Імпорт кроку 1 — з
-        # приватного каталогу [IO.Path]::GetTempPath(), і цілісність
+        # приватного каталогу Get-BRAVOInstallPrivateDirectoryBase ($env:SystemRoot\Temp), і цілісність
         # перевіряється над ТИМ самим коренем (домінування нижче).
         function Get-BRAVOSelfTestInstallVariableOrigin {
             param([string]$VariableName, [int]$Depth = 0)
@@ -1680,7 +1720,7 @@ Test-BRAVOCondition -Condition (
                 $bdE2eTrustFailures += "рядок $($bdE2eImport.Extent.StartLineNumber): імпорт коду комплекту з `$StagingRoot (або корінь не визначено: '$bdE2eImportRoot'): $($bdE2eImport.Extent.Text)"
                 continue
             }
-            if ($bdE2eImportRoot -ne '$RuntimeRoot' -and @($bdE2eImportOrigin | Where-Object { $_ -match 'GetTempPath\(\)' }).Count -gt 0) {
+            if ($bdE2eImportRoot -ne '$RuntimeRoot' -and @($bdE2eImportOrigin | Where-Object { $_ -match 'Get-BRAVOInstallPrivateDirectoryBase' }).Count -gt 0) {
                 $bdE2ePrivateRootImports++
             }
             $bdE2eDominated = $false
@@ -1704,7 +1744,7 @@ Test-BRAVOCondition -Condition (
             }
         }
         if ($bdE2eBundleImports.Count -eq 0) { $bdE2eTrustFailures += 'харнес: імпортів коду комплекту в головному try не знайдено' }
-        if ($bdE2ePrivateRootImports -eq 0) { $bdE2eTrustFailures += 'імпорт кроку 1 не з приватного каталогу [IO.Path]::GetTempPath()' }
+        if ($bdE2ePrivateRootImports -eq 0) { $bdE2eTrustFailures += 'імпорт кроку 1 не з приватного каталогу Get-BRAVOInstallPrivateDirectoryBase ($env:SystemRoot\Temp)' }
         $bdE2eIntegrityFunction = @($bdInstallAst.FindAll({
             param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-BRAVOInstallBundleIntegrity'
         }, $true))

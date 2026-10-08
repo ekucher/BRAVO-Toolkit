@@ -306,8 +306,24 @@ function Get-BRAVOInstallSiteConfigSnapshot {
     return [pscustomobject]@{ Exists = $true; Bytes = $bytes; Fingerprint = $fingerprint }
 }
 
-# Приватний каталог перевірки кроку 1 (#434, Codex P1, раунд 3). Він лежить у
-# [IO.Path]::GetTempPath(), і з успадкованим DACL %TEMP% процес того самого
+# Основа приватного каталогу перевірки кроку 1 (#434, Codex P1, раунд 3):
+# $env:SystemRoot\Temp, а не [IO.Path]::GetTempPath(). %TEMP% елевованого
+# адміністратора — профіль того самого користувача, і процес без елевації має
+# там FILE_DELETE_CHILD: міг би перейменувати захищений каталог і підкласти
+# на його місце свій. У $env:SystemRoot\Temp звичайні користувачі такого права
+# на батьківський каталог не мають. Немає каталогу — відмова (fail closed).
+function Get-BRAVOInstallPrivateDirectoryBase {
+    $systemRoot = $env:SystemRoot
+    $privateBase = $(if ([string]::IsNullOrWhiteSpace($systemRoot)) { '' } else { Join-Path $systemRoot 'Temp' })
+    if ([string]::IsNullOrEmpty($privateBase) -or -not (Test-Path -LiteralPath $privateBase -PathType Container)) {
+        throw ('Немає каталогу для приватної перевірки -BackupDestination: ' + $(if ([string]::IsNullOrEmpty($privateBase)) { '$env:SystemRoot не задано' } else { $privateBase }) +
+            '. Нічого не розгорнуто. Перевірте $env:SystemRoot\Temp на сервері й повторіть запуск.')
+    }
+    return $privateBase
+}
+
+# Приватний каталог перевірки кроку 1 (#434, Codex P1, раунд 3). Без явного
+# DACL він успадкував би права батьківського каталогу, і процес того самого
 # користувача без елевації міг би підмінити .psm1 між перевіркою цілісності
 # й Import-Module. Тому каталог створюється ОДРАЗУ з явним захищеним DACL
 # (як New-BRAVOWinSCPTemporaryScriptPath у BRAVO.ArchiveRuntime: не
@@ -672,13 +688,13 @@ if ($PSBoundParameters.ContainsKey('BackupDestination')) {
     # каталог може бути створений заздалегідь і доступний на запис звичайному
     # користувачеві, тож файл, підмінений між перевіркою цілісності й
     # Import-Module, виконався б із піднятими правами (TOCTOU). Тому — свіжий
-    # приватний каталог елевованого процесу ([IO.Path]::GetTempPath(),
-    # випадкова назва): туди копіюється архів, його SHA-256 звіряється з уже
+    # приватний каталог елевованого процесу ($env:SystemRoot\Temp,
+    # Get-BRAVOInstallPrivateDirectoryBase; випадкова назва): туди копіюється архів, його SHA-256 звіряється з уже
     # перевіреним значенням, і комплект розпаковується заново. Можливості,
     # цілісність за RUNTIME_MANIFEST.json і імпорт — над ЦИМ самим коренем.
     # Каталог створюється одразу із захищеним DACL (New-BRAVOInstallPrivateDirectory),
     # до першого запису в нього; видаляється у finally.
-    $verifiedBundleRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('BRAVO_INSTALL_VERIFY_' + [guid]::NewGuid().ToString('N'))
+    $verifiedBundleRoot = Join-Path (Get-BRAVOInstallPrivateDirectoryBase) ('BRAVO_INSTALL_VERIFY_' + [guid]::NewGuid().ToString('N'))
     try {
         New-BRAVOInstallPrivateDirectory -Path $verifiedBundleRoot
         $verifiedZipPath = Join-Path $verifiedBundleRoot (Split-Path -Leaf $ZipPath)
