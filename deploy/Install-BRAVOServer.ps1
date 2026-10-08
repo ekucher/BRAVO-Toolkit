@@ -127,7 +127,7 @@ function Get-BRAVOInstallBackupDestinationRequiredFunctions {
         'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'           = @()
         'modules\BRAVO.Configuration\BRAVO.Configuration.psm1'           = @('Get-BRAVODefaultConfiguration', 'Resolve-BRAVORawConfiguration')
         'modules\BRAVO.Discovery\BRAVO.Discovery.psd1'                   = @()
-        'modules\BRAVO.Discovery\BRAVO.Discovery.psm1'                   = @('Get-BRAVOEffectiveStorageConfiguration')
+        'modules\BRAVO.Discovery\BRAVO.Discovery.psm1'                   = @('Get-BRAVOEffectiveStorageConfiguration', 'Get-BRAVOEffectiveSynchronizationConfiguration')
     }
 }
 
@@ -214,7 +214,8 @@ function Assert-BRAVOInstallBundleIntegrity {
 # BRAVO.local.config. Читання — канонічний reader
 # (Get-BRAVOConfiguratorProductionOverrideState) і злиття
 # Resolve-BRAVORawConfiguration (дефолти < BRAVO.local.config); ефективні
-# напрямки — Get-BRAVOEffectiveStorageConfiguration у місці виклику;
+# напрямки — Get-BRAVOEffectiveStorageConfiguration (і BAZA —
+# Get-BRAVOEffectiveSynchronizationConfiguration) у місці виклику;
 # порівняння з профілем — канонічне Test-BRAVOConfiguratorBackupDestinationEffective.
 # Файл не змінюється й не «виправляється» автоматично. $ModuleRoot — комплект,
 # чиї модулі вже пройшли SHA-256, провенанс, гейт каналу й
@@ -421,10 +422,14 @@ function Assert-BRAVOInstallBackupDestinationEffective {
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][AllowNull()]$EffectiveStorage,
         [Parameter(Mandatory = $true)][string]$SiteConfigPath,
+        # Результат канонічного Get-BRAVOEffectiveSynchronizationConfiguration
+        # над тими самими злитими значеннями (BAZA_*_LOCAL для SambaOnly/LocalOnly).
+        [AllowNull()]$EffectiveSynchronization = $null,
         [switch]$BeforeDeploy
     )
     $deployState = $(if ($BeforeDeploy) { ' Нічого не розгорнуто.' } else { '' })
-    $destinationCheck = Test-BRAVOConfiguratorBackupDestinationEffective -Destination $Destination -EffectiveStorage $EffectiveStorage
+    $destinationCheck = Test-BRAVOConfiguratorBackupDestinationEffective -Destination $Destination -EffectiveStorage $EffectiveStorage `
+        -EffectiveSynchronization $EffectiveSynchronization
     if (-not $destinationCheck.Compliant) {
         throw ('-BackupDestination ' + $Destination + ' не в силі: з ' + $SiteConfigPath +
             ' (BRAVO.local.config) ефективно суперечать ' + (@($destinationCheck.ConflictingChannels) -join ' і ') + '. ' +
@@ -468,7 +473,9 @@ if ($PSBoundParameters.ContainsKey('BackupDestination') -and
         'жодному профілю напрямків. Повторіть запуск із -SeedLocalConfig -BackupDestination ' + $BackupDestination +
         ' або покладіть у ' + $RuntimeRoot + ' BRAVO.local.config, ефективні напрямки якого відповідають ' +
         'профілю ' + $BackupDestination + ' (для LocalOnly: componentSettings.SFTP.Enabled = $false і ' +
-        'componentSettings.SMB.Enabled = $false). Нічого не завантажено й не записано.')
+        'componentSettings.SMB.Enabled = $false; для LocalOnly і SambaOnly ще й ' +
+        'componentSettings.Synchronization.BAZA_APP_LOCAL = $true і componentSettings.Synchronization.BAZA_WWW_LOCAL = $true). ' +
+        'Нічого не завантажено й не записано.')
 }
 
 $isElevated = ([Security.Principal.WindowsPrincipal] `
@@ -755,11 +762,14 @@ if ($PSBoundParameters.ContainsKey('BackupDestination')) {
             $verifiedSiteConfigDirectory = Join-Path $verifiedBundleRoot 'site'
             [void](New-Item -ItemType Directory -Path $verifiedSiteConfigDirectory)
             [System.IO.File]::WriteAllBytes((Join-Path $verifiedSiteConfigDirectory 'BRAVO.local.config'), $siteConfigSnapshot.Bytes)
-            $stagedSiteStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings (
-                Get-BRAVOInstallSiteComponentSettings -ModuleRoot $verifiedBundle -ConfigDirectory $verifiedSiteConfigDirectory `
-                    -SiteConfigPath $existingSiteConfig -Destination $BackupDestination -BeforeDeploy)
+            $stagedSiteSettings = Get-BRAVOInstallSiteComponentSettings -ModuleRoot $verifiedBundle -ConfigDirectory $verifiedSiteConfigDirectory `
+                -SiteConfigPath $existingSiteConfig -Destination $BackupDestination -BeforeDeploy
+            $stagedSiteStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings $stagedSiteSettings
+            $stagedSiteSynchronization = Get-BRAVOEffectiveSynchronizationConfiguration -Synchronization $stagedSiteSettings['Synchronization'] `
+                -GlobalSftpEnabled ([bool]$stagedSiteStorage.SFTP.Enabled)
             Assert-BRAVOInstallBackupDestinationEffective -Destination $BackupDestination `
-                -EffectiveStorage $stagedSiteStorage -SiteConfigPath $existingSiteConfig -BeforeDeploy
+                -EffectiveStorage $stagedSiteStorage -EffectiveSynchronization $stagedSiteSynchronization `
+                -SiteConfigPath $existingSiteConfig -BeforeDeploy
         } else {
             # Файла немає (буде -SeedLocalConfig): модулі, якими крок 4 його
             # засіє й перевірить, звіряються за експортом уже тут, до копіювання.
@@ -832,8 +842,12 @@ if (-not $targetExists) {
 
 # Без /MIR і без /PURGE: цільовий каталог порожній, а знищувальні режими
 # robocopy на кореневому каталозі — саме те, чого тут не має бути.
+# /XF BRAVO.local.config (#434, Codex Security P1): site-файл не входить у
+# RUNTIME_MANIFEST.json, тож комплект із ним лишається «цілісним», а копія
+# переписала б наявний файл (уже після звірки відбитка вище) чи підклала б
+# чужий замість seed. Site-файл у каталозі інсталяції створює лише крок 4.
 $robocopyLog = Join-Path $StagingRoot ('robocopy_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
-$null = & robocopy.exe $staged $RuntimeRoot /E /R:2 /W:2 /NFL /NDL /NP ('/LOG:' + $robocopyLog)
+$null = & robocopy.exe $staged $RuntimeRoot /E /R:2 /W:2 /NFL /NDL /NP /XF 'BRAVO.local.config' ('/LOG:' + $robocopyLog)
 $robocopyCode = $LASTEXITCODE
 if ($robocopyCode -ge 8) {
     throw ('robocopy завершився кодом ' + $robocopyCode + '; журнал: ' + $robocopyLog)
@@ -922,10 +936,12 @@ if ($backupDestinationExplicit) {
     # той самий висновок, що в кроці 1, тепер над розгорнутими модулями, які
     # перед імпортом знову звіряються з RUNTIME_MANIFEST.json).
     Assert-BRAVOInstallBundleIntegrity -BundleRoot $RuntimeRoot
-    $siteStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings (
-        Get-BRAVOInstallSiteComponentSettings -ModuleRoot $RuntimeRoot -ConfigDirectory $RuntimeRoot -Destination $BackupDestination)
+    $siteSettings = Get-BRAVOInstallSiteComponentSettings -ModuleRoot $RuntimeRoot -ConfigDirectory $RuntimeRoot -Destination $BackupDestination
+    $siteStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings $siteSettings
+    $siteSynchronization = Get-BRAVOEffectiveSynchronizationConfiguration -Synchronization $siteSettings['Synchronization'] `
+        -GlobalSftpEnabled ([bool]$siteStorage.SFTP.Enabled)
     Assert-BRAVOInstallBackupDestinationEffective -Destination $BackupDestination `
-        -EffectiveStorage $siteStorage -SiteConfigPath $localConfig
+        -EffectiveStorage $siteStorage -EffectiveSynchronization $siteSynchronization -SiteConfigPath $localConfig
 }
 Write-Note 'BRAVO.config з комплекту не редагується — site-значення належать BRAVO.local.config.'
 

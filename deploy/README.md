@@ -41,7 +41,9 @@ README, розділ 3.1. Наявний `BRAVO.local.config` ніколи не 
 ігнорується — fail-closed (#434). Профіль «в силі» лише тоді, коли ефективні
 `SFTP.Enabled`, `SMB.Enabled`, `SMB.ArchiveCopy`, а лише для `Cloud` і
 `CloudAndSamba` ще й `SFTP.ArchiveUpload` (дефолти комплекту +
-`BRAVO.local.config`, канонічний `Get-BRAVOEffectiveStorageConfiguration`)
+`BRAVO.local.config`, канонічний `Get-BRAVOEffectiveStorageConfiguration`),
+а для `SambaOnly` і `LocalOnly` ще й `BAZA_APP_LOCAL`/`BAZA_WWW_LOCAL`
+(канонічний `Get-BRAVOEffectiveSynchronizationConfiguration`),
 дорівнюють тим, що записав би свіжий `-SeedLocalConfig` цього профілю.
 Рішення ухвалюється за ефективними значеннями, а не за текстом файла:
 

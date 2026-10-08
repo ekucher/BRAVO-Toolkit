@@ -1166,7 +1166,7 @@ Health-моніторинг, `BRAVO_DRY_RUN.ps1` проби) і знімає в�
 fail-closed (#434): без `-SeedLocalConfig` і без наявного файла інсталятор
 зупиняється до завантаження; комплект без `BRAVO.Configurator`, нерозбірний
 наявний файл або наявний файл, з яким ефективні `SFTP.Enabled`/`SMB.Enabled`/`SMB.ArchiveCopy`
-(а для `Cloud` і `CloudAndSamba` ще й `SFTP.ArchiveUpload`) суперечать профілю, зупиняють його до копіювання в каталог інсталяції з
+(а для `Cloud` і `CloudAndSamba` ще й `SFTP.ArchiveUpload`, для `SambaOnly` і `LocalOnly` — `BAZA_APP_LOCAL`/`BAZA_WWW_LOCAL`) суперечать профілю, зупиняють його до копіювання в каталог інсталяції з
 назвою каналу, а файл він не чіпає (узгодьте файл і повторіть той самий запуск). Таблиця профілів і
 пояснення, чому профілі з Samba пишуть `SMB.ArchiveCopy = $true`, — README,
 розділ 3.1 «Профілі напрямків резервного копіювання». Для `CloudAndSamba` і

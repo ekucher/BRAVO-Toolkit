@@ -285,11 +285,20 @@ function Test-BRAVOConfiguratorBackupDestinationEffective {
         Профіль «в силі» лише тоді, коли збігаються всі чотири значення. Для
         LocalOnly це означає: SFTP і SMB ефективно вимкнені.
 
+        -EffectiveSynchronization (опційно) — результат канонічного
+        Get-BRAVOEffectiveSynchronizationConfiguration над тими самими злитими
+        componentSettings.Synchronization (-GlobalSftpEnabled = ефективний
+        SFTP.Enabled). Для профілів, що пишуть BAZA_*_LOCAL (SambaOnly,
+        LocalOnly), Components[BAZA_APP|BAZA_WWW].LocalEnabled має дорівнювати
+        значенню профілю: інакше BAZA лишилась би без жодного каналу копії
+        (BAZA-over-SMB немає, SFTP вимкнено). Розбіжність дає конфлікт каналу
+        'BAZA'. Без параметра BAZA не перевіряється (поведінка до #434 P1).
+
         Функція нічого не читає й не пише; відповідь — лише висновок і
         причини українською для діагностики викликача.
     .OUTPUTS
         [pscustomobject] { Destination; Compliant; ConflictingChannels; Reasons }
-        ConflictingChannels — 'SFTP'/'SMB', чий ефективний стан суперечить профілю.
+        ConflictingChannels — 'SFTP'/'SMB'/'BAZA', чий ефективний стан суперечить профілю.
     #>
     [CmdletBinding()]
     param(
@@ -299,7 +308,10 @@ function Test-BRAVOConfiguratorBackupDestinationEffective {
 
         [Parameter(Mandatory = $true)]
         [AllowNull()]
-        $EffectiveStorage
+        $EffectiveStorage,
+
+        [AllowNull()]
+        $EffectiveSynchronization = $null
     )
 
     $destinationProfile = Get-BRAVOConfiguratorBackupDestinationProfile -Destination $Destination
@@ -385,6 +397,38 @@ function Test-BRAVOConfiguratorBackupDestinationEffective {
             }
         }
         if ($channelConflict) { [void]$conflicting.Add($channel) }
+    }
+
+    if ($null -ne $EffectiveSynchronization) {
+        # BAZA для профілів без SFTP (#434, Codex Security P1): єдиний канал
+        # копії — локальна синхронізація BAZA_*_LOCAL. Відсутній компонент чи
+        # Components — ефективно вимкнено (fail closed).
+        $bazaConflict = $false
+        $syncComponents = @()
+        if ($null -ne $EffectiveSynchronization.PSObject.Properties['Components']) {
+            $syncComponents = @($EffectiveSynchronization.Components)
+        }
+        foreach ($componentName in @('BAZA_APP', 'BAZA_WWW')) {
+            $profileKey = 'componentSettings.Synchronization.' + $componentName + '_LOCAL'
+            if (-not $destinationProfile.Overrides.Contains($profileKey)) { continue }
+            $expectedLocal = [bool]$destinationProfile.Overrides[$profileKey]
+            $actualLocal = $false
+            foreach ($syncComponent in $syncComponents) {
+                if ($null -ne $syncComponent -and $null -ne $syncComponent.PSObject.Properties['Name'] -and
+                    [string]$syncComponent.Name -eq $componentName -and $null -ne $syncComponent.PSObject.Properties['LocalEnabled']) {
+                    $actualLocal = [bool]$syncComponent.LocalEnabled
+                }
+            }
+            if ($actualLocal -ne $expectedLocal) {
+                $bazaConflict = $true
+                $expectedLocalText = $(if ($expectedLocal) { 'увімкнено' } else { 'вимкнено' })
+                $actualLocalText = $(if ($actualLocal) { 'увімкнено' } else { 'вимкнено' })
+                [void]$reasons.Add('BAZA: локальна синхронізація ' + $componentName + ' ефективно ' + $actualLocalText +
+                    ', профіль ' + $Destination + ' вимагає «' + $expectedLocalText + '» (' + $profileKey + ' = ' +
+                    $(if ($expectedLocal) { '$true' } else { '$false' }) + '): без SFTP це єдиний канал копії BAZA.')
+            }
+        }
+        if ($bazaConflict) { [void]$conflicting.Add('BAZA') }
     }
 
     return [pscustomobject]@{

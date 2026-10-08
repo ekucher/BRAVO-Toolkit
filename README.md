@@ -376,7 +376,9 @@ componentSettings.SMB.Enabled
 (#434): він перевіряє ЕФЕКТИВНІ `SFTP.Enabled`, `SMB.Enabled`,
 `SMB.ArchiveCopy`, а лише для `Cloud` і `CloudAndSamba` ще й `SFTP.ArchiveUpload`
 (`Get-BRAVOEffectiveStorageConfiguration` поверх дефолтів і
-`BRAVO.local.config`) проти значень профілю. Без `-SeedLocalConfig` і без
+`BRAVO.local.config`) проти значень профілю; для `SambaOnly` і `LocalOnly` —
+ще й `BAZA_APP_LOCAL`/`BAZA_WWW_LOCAL` (`Get-BRAVOEffectiveSynchronizationConfiguration`),
+бо без SFTP це єдиний канал копії BAZA. Без `-SeedLocalConfig` і без
 наявного файла інсталяція зупиняється до завантаження й будь-якого запису;
 комплект без `BRAVO.Configurator`, нерозбірний наявний файл або наявний файл,
 що суперечить профілю, зупиняють її до копіювання в каталог інсталяції з
