@@ -494,6 +494,9 @@ $knownIntentionalDiffPrefixes = @(
     'componentSettings.SFTP.ArchiveLogUploadEnabled',
     'componentSettings.SFTP.MaintenanceLogUploadEnabled',
     'maintenanceSettings.Retention.RawSourceGraceDays',
+    # Поріг «малого» файлу самоперевірки реставрації (Compare-FileSizes):
+    # адитивний ключ із дефолтом 1048576; у BEFORE (42cf9ad) не існує.
+    'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes',
     'sftpDirectories.ArchivLog',
     'sftpDirectories.MaintenanceLog',
     # BSYSTEM Operations (5.3.0), коміт 021fdbf — нові credential-target
