@@ -92,6 +92,49 @@ function Protect-BRAVOLogSecret {
                 if (-not $secretVariants.Contains($secretVariant)) { $secretVariants.Add($secretVariant) }
             }
         }
+        # #417 (пункт 4b): секрет може потрапити в текст не лише сирим, а й
+        # закодованим — URL-кодованим ([Uri]::EscapeDataString, тією самою
+        # функцією, що й New-BRAVOSftpUrl) чи JSON-екранованим (тіло рядка
+        # ConvertTo-Json без лапок). Такі форми маскуються як додаткові
+        # варіанти, лише коли відрізняються від сирого значення: секрет без
+        # спецсимволів дає рівно ті самі варіанти, що й до #417. JSON-форма
+        # будується детерміновано, а не через ConvertTo-Json, бо хости
+        # екранують по-різному: обидва варіанти екранують " \ і керівні
+        # символи (\b \f \n \r \t, решта < 0x20 — \u з 4 hex у нижньому
+        # регістрі), Windows PowerShell 5.1 (JavaScriptSerializer)
+        # додатково & ' < > — тому маскуються обидві форми. Base64 свідомо
+        # не додається: його підрядки залежать від вирівнювання і не
+        # впізнаються надійно. Виняток кодування не перехоплюється — він
+        # іде до викликача (New-BRAVOMaskedLogCopy -> нічого не
+        # вивантажується, fail-closed).
+        $rawSecretVariants = $secretVariants.ToArray()
+        foreach ($rawSecretVariant in $rawSecretVariants) {
+            $encodedSecretVariants = New-Object 'System.Collections.Generic.List[string]'
+            $encodedSecretVariants.Add([System.Uri]::EscapeDataString($rawSecretVariant))
+            foreach ($jsonEscapeHtmlChars in @($false, $true)) {
+                $jsonBuilder = New-Object System.Text.StringBuilder
+                foreach ($secretChar in $rawSecretVariant.ToCharArray()) {
+                    $secretCharCode = [int]$secretChar
+                    if ($secretCharCode -eq 34) { [void]$jsonBuilder.Append('\"') }
+                    elseif ($secretCharCode -eq 92) { [void]$jsonBuilder.Append('\\') }
+                    elseif ($secretCharCode -eq 8) { [void]$jsonBuilder.Append('\b') }
+                    elseif ($secretCharCode -eq 12) { [void]$jsonBuilder.Append('\f') }
+                    elseif ($secretCharCode -eq 10) { [void]$jsonBuilder.Append('\n') }
+                    elseif ($secretCharCode -eq 13) { [void]$jsonBuilder.Append('\r') }
+                    elseif ($secretCharCode -eq 9) { [void]$jsonBuilder.Append('\t') }
+                    elseif ($secretCharCode -lt 32 -or ($jsonEscapeHtmlChars -and ($secretCharCode -eq 38 -or $secretCharCode -eq 39 -or $secretCharCode -eq 60 -or $secretCharCode -eq 62))) {
+                        [void]$jsonBuilder.Append([string][char]92 + 'u' + $secretCharCode.ToString('x4'))
+                    } else { [void]$jsonBuilder.Append($secretChar) }
+                }
+                $encodedSecretVariants.Add($jsonBuilder.ToString())
+            }
+            foreach ($encodedSecretVariant in $encodedSecretVariants) {
+                if (-not [string]::Equals($encodedSecretVariant, $rawSecretVariant, [System.StringComparison]::Ordinal) -and
+                    -not $secretVariants.Contains($encodedSecretVariant)) {
+                    $secretVariants.Add($encodedSecretVariant)
+                }
+            }
+        }
         # Збіги ВСІХ варіантів шукаються в ОРИГІНАЛЬНОМУ тексті, перекриті й
         # суміжні діапазони зливаються, і кожен злитий діапазон замінюється
         # одним ***. Послідовна заміна лишала б фрагмент: для частково

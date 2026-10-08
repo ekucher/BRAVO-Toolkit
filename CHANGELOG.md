@@ -2,6 +2,16 @@
 
 ## Не випущено (developer)
 
+- **Hardening: маскування закодованих форм відомих секретів у журналах перед вивантаженням (#417).**
+  `Protect-BRAVOLogSecret -KnownSecret` (маскована копія власного журналу Maintenance/Archive і знімка
+  `range_id_log.json` перед SFTP) тепер маскує не лише сирий секрет, а й його URL-кодовану форму
+  (`[Uri]::EscapeDataString`, як у `New-BRAVOSftpUrl`) і JSON-екрановану форму (тіло рядка без лапок; обидва
+  варіанти екранування — Windows PowerShell 5.1 і PowerShell 7), коли вони відрізняються від сирого значення.
+  Секрет без спецсимволів маскується рівно як раніше; Base64-форма свідомо не маскується. Збій маскування,
+  як і раніше, блокує вивантаження (fail-closed). Конвеєри Trace/exchangAPI/backup і generation manifest не
+  змінювались. Тести: `Logging/KnownSecretUrlEncodedFormMasked`, `Logging/KnownSecretJsonEscapedFormMasked`,
+  `Logging/KnownSecretPlainFormStillMasked`, `TraceArchive/DailyArchiveAddParametersAlwaysCarryPassword`.
+
 - **Виправлено: автоматичне відновлення служб після рев'ю PR #432 (#314).**
   Штатну зупинку (`Stop-Service` пише лише подію 7036) задача `BRAVO_SERVICE_RECOVERY` тепер підхоплює окремим
   Event-тригером за ~1–2 хв: 7036 фільтрується за відображуваними іменами керованих служб (`param1`); служба, якої
