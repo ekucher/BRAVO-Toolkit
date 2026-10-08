@@ -298,7 +298,7 @@ Test-BRAVOCondition -Condition (
 $bdInstallRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_DEST_INSTALL_' + [guid]::NewGuid().ToString('N'))
 try {
     [void](New-Item -ItemType Directory -Path (Join-Path $bdInstallRoot 'modules') -Force)
-    foreach ($bdModuleDirectory in @('BRAVO.Configurator', 'BRAVO.Configuration', 'BRAVO.System')) {
+    foreach ($bdModuleDirectory in @('BRAVO.Compatibility', 'BRAVO.Configurator', 'BRAVO.Configuration', 'BRAVO.Discovery', 'BRAVO.System')) {
         Copy-Item -LiteralPath (Join-Path $root ('modules\' + $bdModuleDirectory)) `
             -Destination (Join-Path $bdInstallRoot 'modules') -Recurse -Force
     }
@@ -381,11 +381,235 @@ try {
         @(Get-ChildItem -LiteralPath $bdInstallRoot -Force -Filter 'BRAVO.local.config*').Count -eq 0
     ) -Name 'BackupDestinations/InstallerExistingConfigUntouched' `
         -Failure "наявний BRAVO.local.config інсталятор не змінює й повідомляє, який профіль не застосовано; без -SeedLocalConfig файл не створюється; наявний: exit=$($bdRunExisting.ExitCode) байти_збіглись=$($bdExistingBefore -ceq $bdExistingAfter) $($bdRunExisting.Output) ||| без seed: exit=$($bdRunNoSeed.ExitCode) $($bdRunNoSeed.Output)"
+
+    # ------------------------------------------------------------
+    # (4a) Явний -BackupDestination LocalOnly — твердження про ЕФЕКТИВНИЙ стан
+    # (#434, P2 fail-open). Оператор, який явно просить «Лише локально», має
+    # отримати або ефективно вимкнені SFTP і SMB, або ненульовий код і
+    # зрозумілу причину; «УВАГА» з кодом 0 при ефективно ввімкненому
+    # SFTP/SMB — мовчазний вихід даних за межі сервера.
+    # Ефективні значення рахуються канонічно: reader BRAVO.local.config ->
+    # Resolve-BRAVORawConfiguration поверх Get-BRAVODefaultConfiguration ->
+    # Get-BRAVOEffectiveStorageConfiguration (не текст файлу).
+    # ------------------------------------------------------------
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
+    function Get-BRAVOSelfTestInstalledEffectiveStorage {
+        $localOverrides = $null
+        if (Test-Path -LiteralPath $bdLocalConfigPath -PathType Leaf) {
+            $localOverrides = (Read-BRAVOSelfTestDestinationOverrides -ConfigDirectory $bdInstallRoot).Overrides
+        }
+        $merged = Resolve-BRAVORawConfiguration -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+            -PrimaryOverrides $null -LocalOverrides $localOverrides
+        return Get-BRAVOEffectiveStorageConfiguration -ComponentSettings $merged['componentSettings']
+    }
+    function Get-BRAVOSelfTestInstallThrowText {
+        param([string]$Output)
+        return (@([regex]::Matches($Output, '(?m)^THROW: (.*)$') | ForEach-Object { $_.Groups[1].Value }) -join ' ')
+    }
+    function Get-BRAVOSelfTestLocalConfigHash {
+        if (-not (Test-Path -LiteralPath $bdLocalConfigPath -PathType Leaf)) { return '' }
+        return (Get-FileHash -LiteralPath $bdLocalConfigPath -Algorithm SHA256).Hash
+    }
+    function Set-BRAVOSelfTestLocalConfigFixture {
+        param([string[]]$Lines)
+        $fixtureText = "@{`r`n" + ((@($Lines) | ForEach-Object { '    ' + $_ }) -join "`r`n") + "`r`n}`r`n"
+        [IO.File]::WriteAllText($bdLocalConfigPath, $fixtureText, (New-Object Text.UTF8Encoding($false)))
+    }
+    $bdCyrillicPattern = '[\u0400-\u04FF]'
+    Remove-Item -LiteralPath $bdLocalConfigPath -Force -ErrorAction SilentlyContinue
+
+    # (1) LocalOnly без -SeedLocalConfig і без наявного файла: ефективна
+    # конфігурація = дефолти комплекту (SFTP і SMB увімкнені) -> відмова.
+    $bdLoDefaultsEffective = Get-BRAVOSelfTestInstalledEffectiveStorage
+    $bdLoNoSeed = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-BackupDestination', 'LocalOnly')
+    $bdLoNoSeedThrow = Get-BRAVOSelfTestInstallThrowText -Output $bdLoNoSeed.Output
+    Test-BRAVOCondition -Condition (
+        ([bool]$bdLoDefaultsEffective.SFTP.Enabled -or [bool]$bdLoDefaultsEffective.SMB.Enabled) -and
+        $bdLoNoSeed.ExitCode -ne 0 -and
+        -not [string]::IsNullOrWhiteSpace($bdLoNoSeedThrow) -and
+        $bdLoNoSeedThrow -match $bdCyrillicPattern -and
+        $bdLoNoSeedThrow.Contains('LocalOnly') -and
+        $bdLoNoSeedThrow.Contains('-SeedLocalConfig') -and
+        -not (Test-Path -LiteralPath $bdLocalConfigPath) -and
+        @(Get-ChildItem -LiteralPath $bdInstallRoot -Force -Filter 'BRAVO.local.config*').Count -eq 0
+    ) -Name 'BackupDestinations/InstallerLocalOnlyWithoutSeedFailsClosed' `
+        -Failure "явний -BackupDestination LocalOnly без -SeedLocalConfig і без BRAVO.local.config лишає ефективними дефолти (SFTP=$($bdLoDefaultsEffective.SFTP.Enabled), SMB=$($bdLoDefaultsEffective.SMB.Enabled)) — інсталятор має завершитися ненульовим кодом з українською причиною, що називає LocalOnly і -SeedLocalConfig, і не створювати файл; exit=$($bdLoNoSeed.ExitCode) throw='$bdLoNoSeedThrow' вивід: $($bdLoNoSeed.Output)"
+
+    # (2) Наявний BRAVO.local.config, з яким SFTP або SMB ЕФЕКТИВНО увімкнені
+    # (зокрема файл, що взагалі не згадує напрямки, — дефолти) -> відмова,
+    # файл не змінюється. І з -SeedLocalConfig, і без нього.
+    $bdLoRemoteFixtures = [ordered]@{
+        DefaultsOnly = @{
+            Lines = @("'pathSettings.BackupRoot' = 'D:\ExampleArchive'")
+            Channels = @('SFTP', 'SMB')
+        }
+        SftpEnabled = @{
+            Lines = @("'componentSettings.SFTP.Enabled' = `$true", "'componentSettings.SMB.Enabled' = `$false")
+            Channels = @('SFTP')
+        }
+        SmbEnabled = @{
+            Lines = @("'componentSettings.SFTP.Enabled' = `$false", "'componentSettings.SMB.Enabled' = `$true",
+                "'componentSettings.SMB.ArchiveCopy' = `$true")
+            Channels = @('SMB')
+        }
+    }
+    $bdLoRemoteFailures = @()
+    foreach ($bdLoFixtureName in @($bdLoRemoteFixtures.Keys)) {
+        $bdLoFixture = $bdLoRemoteFixtures[$bdLoFixtureName]
+        foreach ($bdLoArguments in @(
+            , @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly')
+            , @('-BackupDestination', 'LocalOnly')
+        )) {
+            Set-BRAVOSelfTestLocalConfigFixture -Lines $bdLoFixture.Lines
+            $bdLoEffective = Get-BRAVOSelfTestInstalledEffectiveStorage
+            $bdLoHashBefore = Get-BRAVOSelfTestLocalConfigHash
+            $bdLoRun = Invoke-BRAVOSelfTestInstallStep4 -Arguments $bdLoArguments
+            $bdLoHashAfter = Get-BRAVOSelfTestLocalConfigHash
+            $bdLoThrow = Get-BRAVOSelfTestInstallThrowText -Output $bdLoRun.Output
+            $bdLoLabel = "$bdLoFixtureName [$($bdLoArguments -join ' ')]"
+            $bdLoEffectiveChannels = @()
+            if ([bool]$bdLoEffective.SFTP.Enabled) { $bdLoEffectiveChannels += 'SFTP' }
+            if ([bool]$bdLoEffective.SMB.Enabled) { $bdLoEffectiveChannels += 'SMB' }
+            if ((@($bdLoEffectiveChannels) -join ',') -ne (@($bdLoFixture.Channels) -join ',')) {
+                $bdLoRemoteFailures += "$bdLoLabel фікстура: ефективно увімкнено '$($bdLoEffectiveChannels -join ',')', очікувалось '$($bdLoFixture.Channels -join ',')'"
+            }
+            if ($bdLoRun.ExitCode -eq 0) { $bdLoRemoteFailures += "$bdLoLabel exit=0" }
+            if ($bdLoHashBefore -cne $bdLoHashAfter) { $bdLoRemoteFailures += "$bdLoLabel файл змінено" }
+            if ([string]::IsNullOrWhiteSpace($bdLoThrow) -or $bdLoThrow -notmatch $bdCyrillicPattern -or
+                -not $bdLoThrow.Contains('LocalOnly') -or -not $bdLoThrow.Contains('BRAVO.local.config')) {
+                $bdLoRemoteFailures += "$bdLoLabel причина без LocalOnly/BRAVO.local.config: '$bdLoThrow'"
+            }
+            foreach ($bdLoChannel in @($bdLoFixture.Channels)) {
+                if (-not $bdLoThrow.Contains($bdLoChannel)) { $bdLoRemoteFailures += "$bdLoLabel причина не називає $bdLoChannel" }
+            }
+            if (@(Get-ChildItem -LiteralPath $bdInstallRoot -Force -Filter 'BRAVO.local.config*').Count -ne 1) {
+                $bdLoRemoteFailures += "$bdLoLabel поруч із BRAVO.local.config з'явилися інші файли"
+            }
+        }
+    }
+    Remove-Item -LiteralPath $bdLocalConfigPath -Force -ErrorAction SilentlyContinue
+    Test-BRAVOCondition -Condition ($bdLoRemoteFailures.Count -eq 0) `
+        -Name 'BackupDestinations/InstallerLocalOnlyRejectsEffectiveRemoteDestination' `
+        -Failure "явний LocalOnly при наявному BRAVO.local.config, з яким SFTP/SMB ефективно увімкнені, має завершитися ненульовим кодом з українською причиною (LocalOnly, BRAVO.local.config, назва каналу) і не змінити файл: $($bdLoRemoteFailures -join ' | ')"
+
+    # (3) Наявний файл, з яким SFTP і SMB ефективно вимкнені (профіль уже в
+    # силі) -> успіх, файл не змінюється, і вивід не стверджує, що LocalOnly
+    # «НЕ застосовано» (ефективно він застосований).
+    $bdLoMatchFailures = @()
+    foreach ($bdLoArguments in @(
+        , @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly')
+        , @('-BackupDestination', 'LocalOnly')
+    )) {
+        Set-BRAVOSelfTestLocalConfigFixture -Lines @(
+            "'pathSettings.BackupRoot' = 'D:\ExampleArchive'",
+            "'componentSettings.SFTP.Enabled' = `$false",
+            "'componentSettings.SMB.Enabled' = `$false"
+        )
+        $bdLoEffective = Get-BRAVOSelfTestInstalledEffectiveStorage
+        $bdLoHashBefore = Get-BRAVOSelfTestLocalConfigHash
+        $bdLoRun = Invoke-BRAVOSelfTestInstallStep4 -Arguments $bdLoArguments
+        $bdLoHashAfter = Get-BRAVOSelfTestLocalConfigHash
+        $bdLoLabel = "[$($bdLoArguments -join ' ')]"
+        if ([bool]$bdLoEffective.SFTP.Enabled -or [bool]$bdLoEffective.SMB.Enabled) {
+            $bdLoMatchFailures += "$bdLoLabel фікстура не вимикає SFTP/SMB ефективно"
+        }
+        if ($bdLoRun.ExitCode -ne 0) { $bdLoMatchFailures += "$bdLoLabel exit=$($bdLoRun.ExitCode): $($bdLoRun.Output)" }
+        if ($bdLoHashBefore -cne $bdLoHashAfter) { $bdLoMatchFailures += "$bdLoLabel файл змінено" }
+        if ($bdLoRun.Output.Contains('профіль напрямків LocalOnly НЕ застосовано')) {
+            $bdLoMatchFailures += "$bdLoLabel вивід стверджує «LocalOnly НЕ застосовано», хоча він ефективно в силі"
+        }
+    }
+    Remove-Item -LiteralPath $bdLocalConfigPath -Force -ErrorAction SilentlyContinue
+    Test-BRAVOCondition -Condition ($bdLoMatchFailures.Count -eq 0) `
+        -Name 'BackupDestinations/InstallerLocalOnlyAcceptsMatchingExistingConfig' `
+        -Failure "явний LocalOnly при наявному BRAVO.local.config, з яким SFTP і SMB ефективно вимкнені, має пройти з кодом 0, не змінити файл і не повідомляти «НЕ застосовано»: $($bdLoMatchFailures -join ' | ')"
+
+    # (4) Повторний запуск інсталятора не перезаписує site-конфігурацію:
+    # перший прогін створює файл профілем LocalOnly, другий (той самий
+    # LocalOnly) проходить без змін, третій з іншим профілем файл не чіпає.
+    $bdLoRepeatFailures = @()
+    $bdLoFirst = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly')
+    $bdLoFirstHash = Get-BRAVOSelfTestLocalConfigHash
+    $bdLoFirstEffective = $(if (-not [string]::IsNullOrEmpty($bdLoFirstHash)) { Get-BRAVOSelfTestInstalledEffectiveStorage } else { $null })
+    if ($bdLoFirst.ExitCode -ne 0 -or [string]::IsNullOrEmpty($bdLoFirstHash) -or $null -eq $bdLoFirstEffective -or
+        [bool]$bdLoFirstEffective.SFTP.Enabled -or [bool]$bdLoFirstEffective.SMB.Enabled) {
+        $bdLoRepeatFailures += "перший прогін: exit=$($bdLoFirst.ExitCode) файл='$bdLoFirstHash' $($bdLoFirst.Output)"
+    } else {
+        $bdLoSecond = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly')
+        if ($bdLoSecond.ExitCode -ne 0) { $bdLoRepeatFailures += "другий прогін: exit=$($bdLoSecond.ExitCode) $($bdLoSecond.Output)" }
+        if ((Get-BRAVOSelfTestLocalConfigHash) -cne $bdLoFirstHash) { $bdLoRepeatFailures += 'другий прогін змінив файл' }
+        if ($bdLoSecond.Output.Contains('профіль напрямків LocalOnly НЕ застосовано')) {
+            $bdLoRepeatFailures += 'другий прогін стверджує «LocalOnly НЕ застосовано», хоча файл першого прогону вже тримає LocalOnly'
+        }
+        $bdLoThird = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-SeedLocalConfig', '-BackupDestination', 'Cloud')
+        $bdLoThirdEffective = Get-BRAVOSelfTestInstalledEffectiveStorage
+        if ((Get-BRAVOSelfTestLocalConfigHash) -cne $bdLoFirstHash) { $bdLoRepeatFailures += "третій прогін (Cloud) змінив файл: exit=$($bdLoThird.ExitCode)" }
+        if ([bool]$bdLoThirdEffective.SFTP.Enabled -or [bool]$bdLoThirdEffective.SMB.Enabled) {
+            $bdLoRepeatFailures += 'після третього прогону SFTP/SMB ефективно увімкнені'
+        }
+    }
+    Remove-Item -LiteralPath $bdLocalConfigPath -Force -ErrorAction SilentlyContinue
+    Test-BRAVOCondition -Condition ($bdLoRepeatFailures.Count -eq 0) `
+        -Name 'BackupDestinations/InstallerRepeatedRunKeepsSiteConfig' `
+        -Failure "повторний запуск інсталятора не перезаписує BRAVO.local.config і не повідомляє «НЕ застосовано» про вже ефективний LocalOnly: $($bdLoRepeatFailures -join ' | ')"
 } finally {
     if (Test-Path -LiteralPath $bdInstallRoot) {
         Remove-Item -LiteralPath $bdInstallRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+# ------------------------------------------------------------
+# (4b) Порядок у Install-BRAVOServer.ps1 (#434): рішення щодо явного
+# LocalOnly без -SeedLocalConfig приймається ДО першої зовнішньої операції
+# чи запису (staging-каталог, завантаження, розпакування, robocopy, запис
+# BRAVO.local.config), а рішення щодо наявного файла в кроці 4 спирається
+# на канонічні ефективні значення (Get-BRAVOEffectiveStorageConfiguration),
+# а не на текст файла. Функції інсталятора (Write-*) і UAC-перезапуск
+# (Start-Process) — не побічні дії над комплектом чи конфігурацією.
+# ------------------------------------------------------------
+$bdSideEffectCommands = @('New-Item', 'Remove-Item', 'Copy-Item', 'Move-Item', 'Set-Content', 'Add-Content', 'Out-File',
+    'Expand-Archive', 'Invoke-WebRequest', 'Invoke-RestMethod', 'robocopy', 'robocopy.exe', 'New-BRAVOConfiguratorSeedLocalConfig')
+function Test-BRAVOSelfTestInsideFunction {
+    param($Node)
+    $parent = $Node.Parent
+    while ($null -ne $parent) {
+        if ($parent -is [Management.Automation.Language.FunctionDefinitionAst]) { return $true }
+        $parent = $parent.Parent
+    }
+    return $false
+}
+$bdFirstSideEffect = @($bdInstallAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and
+    $bdSideEffectCommands -contains [string]$node.GetCommandName() -and
+    -not (Test-BRAVOSelfTestInsideFunction -Node $node)
+}, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
+$bdFirstSideEffectOffset = $(if ($bdFirstSideEffect.Count -eq 1) { $bdFirstSideEffect[0].Extent.StartOffset } else { -1 })
+$bdEarlyLocalOnlyGuards = @($bdInstallAst.FindAll({
+    param($node)
+    if (-not ($node -is [Management.Automation.Language.IfStatementAst])) { return $false }
+    if (Test-BRAVOSelfTestInsideFunction -Node $node) { return $false }
+    foreach ($clause in $node.Clauses) {
+        $conditionText = $clause.Item1.Extent.Text
+        if ($conditionText -match 'LocalOnly' -and $conditionText -match '(?i)\$SeedLocalConfig\b' -and
+            $null -ne $clause.Item2.Find({ param($inner) $inner -is [Management.Automation.Language.ThrowStatementAst] }, $true)) {
+            return $true
+        }
+    }
+    return $false
+}, $true) | Where-Object { $bdFirstSideEffectOffset -ge 0 -and $_.Extent.EndOffset -lt $bdFirstSideEffectOffset })
+$bdEarlyLocalOnlyAsserts = @($bdInstallAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and
+    [string]$node.GetCommandName() -match '^Assert-BRAVO\S*BackupDestination' -and
+    -not (Test-BRAVOSelfTestInsideFunction -Node $node)
+}, $true) | Where-Object { $bdFirstSideEffectOffset -ge 0 -and $_.Extent.EndOffset -lt $bdFirstSideEffectOffset })
+Test-BRAVOCondition -Condition (
+    $bdFirstSideEffectOffset -ge 0 -and
+    ($bdEarlyLocalOnlyGuards.Count + $bdEarlyLocalOnlyAsserts.Count) -ge 1 -and
+    $bdStepText.Contains('Get-BRAVOEffectiveStorageConfiguration')
+) -Name 'BackupDestinations/InstallerLocalOnlyDecisionPrecedesSideEffects' `
+    -Failure "Install-BRAVOServer.ps1: відмова для явного LocalOnly без -SeedLocalConfig має стояти ДО першої побічної дії ($(if ($bdFirstSideEffect.Count -eq 1) { 'рядок ' + $bdFirstSideEffect[0].Extent.StartLineNumber + ': ' + $bdFirstSideEffect[0].GetCommandName() } else { 'не знайдено' })) — if з умовою на LocalOnly і `$SeedLocalConfig і throw у тілі або виклик Assert-BRAVO*BackupDestination*; знайдено if-guard: $($bdEarlyLocalOnlyGuards.Count), assert: $($bdEarlyLocalOnlyAsserts.Count); крок 4 має вирішувати за Get-BRAVOEffectiveStorageConfiguration: $($bdStepText.Contains('Get-BRAVOEffectiveStorageConfiguration'))"
 
 # ------------------------------------------------------------
 # (5) Health: свідомо вимкнений напрямок — один INFO-рядок.
