@@ -370,17 +370,14 @@ if ($credentialHelperLoaded -and -not $NoPause -and
     ($archiveCredentialRequired -or $sftpCredentialRequired)) {
     $missingRequiredCredentialTargets = New-Object System.Collections.Generic.List[string]
     if ($archiveCredentialRequired) {
-        $checkTarget = [string]$credentialSettings.Targets.ArchivePassword
-        if ([string]::IsNullOrWhiteSpace($checkTarget)) { $checkTarget = "BRAVO_7Z_PASSWORD" }
+        $checkTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
         if ([string]::IsNullOrWhiteSpace((Get-BRAVOCredentialSecret -Target $checkTarget))) {
             [void]$missingRequiredCredentialTargets.Add($checkTarget)
         }
     }
     if ($sftpCredentialRequired) {
-        $checkLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
-        if ([string]::IsNullOrWhiteSpace($checkLoginTarget)) { $checkLoginTarget = "BRAVO_SFTP_LOGIN" }
-        $checkPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
-        if ([string]::IsNullOrWhiteSpace($checkPasswordTarget)) { $checkPasswordTarget = "BRAVO_SFTP_PASSWORD" }
+        $checkLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPLogin'
+        $checkPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
         if ([string]::IsNullOrWhiteSpace((Get-BRAVOCredentialSecret -Target $checkLoginTarget))) {
             [void]$missingRequiredCredentialTargets.Add($checkLoginTarget)
         }
@@ -445,10 +442,7 @@ if ($credentialHelperLoaded) {
 
 if ($credentialHelperLoaded -and $archiveCredentialRequired) {
     try {
-        $archiveCredentialTarget = [string]$credentialSettings.Targets.ArchivePassword
-        if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
-            $archiveCredentialTarget = "BRAVO_7Z_PASSWORD"
-        }
+        $archiveCredentialTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
         if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
             throw "не вдалося визначити назву запису Credential Manager для пароля архівів"
         }
@@ -463,14 +457,8 @@ if ($credentialHelperLoaded -and $archiveCredentialRequired) {
 
 if ($credentialHelperLoaded -and $sftpCredentialRequired) {
     try {
-        $sftpLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
-        $sftpPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
-        if ([string]::IsNullOrWhiteSpace($sftpLoginTarget)) {
-            $sftpLoginTarget = "BRAVO_SFTP_LOGIN"
-        }
-        if ([string]::IsNullOrWhiteSpace($sftpPasswordTarget)) {
-            $sftpPasswordTarget = "BRAVO_SFTP_PASSWORD"
-        }
+        $sftpLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPLogin'
+        $sftpPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
 
         $storedSftpLogin = Get-BRAVOCredentialSecret -Target $sftpLoginTarget
         $storedSftpPassword = Get-BRAVOCredentialSecret -Target $sftpPasswordTarget
@@ -502,14 +490,8 @@ if ($credentialHelperLoaded -and $sftpCredentialRequired) {
 
 if ($credentialHelperLoaded -and $smbCredentialRequired) {
     try {
-        $smbLoginTarget = [string]$credentialSettings.Targets.SMBLogin
-        $smbPasswordTarget = [string]$credentialSettings.Targets.SMBPassword
-        if ([string]::IsNullOrWhiteSpace($smbLoginTarget)) {
-            $smbLoginTarget = "BRAVO_SMB_LOGIN"
-        }
-        if ([string]::IsNullOrWhiteSpace($smbPasswordTarget)) {
-            $smbPasswordTarget = "BRAVO_SMB_PASSWORD"
-        }
+        $smbLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SMBLogin'
+        $smbPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SMBPassword'
 
         $storedSmbLogin = Get-BRAVOCredentialSecret -Target $smbLoginTarget
         # SecureString, не рядок: далі потрібен лише PSCredential, тому

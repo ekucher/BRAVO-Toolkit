@@ -1531,3 +1531,188 @@ Test-BRAVOCondition (
     -Failure "частково перекриті й суміжні секрети мають замінюватись одним *** на злитий діапазон (очікується 'p *** q *** r'); фрагмент секрету лишився: $secretMaskPartialFragmentLeft; помилка: $secretMaskPartialError"
 
 Remove-Item -LiteralPath $secretMaskTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+# ============================================================
+# #417: ЄДИНИЙ resolver імен записів Credential Manager.
+# Get-BRAVOCredentialTargetName (BRAVO.Credentials) — канонічний власник
+# розв'язання credentialSettings.Targets.<Key>: значення з конфігурації,
+# а якщо воно відсутнє/порожнє/лише з пробілів — канонічний дефолт. Ключ
+# реєстру прочитаних секретів і пошук у Get-BRAVOLogMaskSecretSet мусять
+# давати те саме ім'я, тому незалежна копія цієї політики в runtime-файлі
+# — дрейф, який рано чи пізно розсинхронізує маскування.
+# ============================================================
+
+# --- (1) Структурний guard: жодного прямого читання ключа з
+# credentialSettings.Targets поза власниками. Обсяг — runtime-файли
+# комплекту (.ps1/.psm1 з RUNTIME_MANIFEST.json); виключені власник
+# resolver-а (modules\BRAVO.Credentials), власник схеми й дефолтів
+# конфігурації (modules\BRAVO.Configuration), self-test і CI-інструменти.
+# Передача таблиці цілком (-CredentialTargets $credentialSettings.Targets
+# для BRAVO.Notifications) і перелік її властивостей (.PSObject) — не
+# читання ключа й не порушення.
+$targetsGuardFindHits = {
+    param([string]$SourceText)
+    $hits = New-Object System.Collections.Generic.List[int]
+    $guardTokens = $null
+    $guardErrors = $null
+    $guardAst = [System.Management.Automation.Language.Parser]::ParseInput($SourceText, [ref]$guardTokens, [ref]$guardErrors)
+    if (@($guardErrors).Count -gt 0) { throw "файл не розбирається ($(@($guardErrors).Count) помилок)" }
+    $isTargetsTable = {
+        param($node)
+        if ($node -isnot [System.Management.Automation.Language.MemberExpressionAst]) { return $false }
+        if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return $false }
+        if ($node.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+        if ([string]$node.Member.Value -ine 'Targets') { return $false }
+        if ($node.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+        return ([string]$node.Expression.VariablePath.UserPath -imatch '^((global|script):)?credentialSettings$')
+    }
+    foreach ($node in @($guardAst.FindAll({ param($candidate)
+                    $candidate -is [System.Management.Automation.Language.MemberExpressionAst] -or
+                    $candidate -is [System.Management.Automation.Language.IndexExpressionAst] }, $true))) {
+        if ($node -is [System.Management.Automation.Language.IndexExpressionAst]) {
+            if (& $isTargetsTable $node.Target) { $hits.Add($node.Extent.StartLineNumber) }
+            continue
+        }
+        if (-not (& $isTargetsTable $node.Expression)) { continue }
+        if ($node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+            [string]$node.Member.Value -ieq 'PSObject') { continue }
+        $hits.Add($node.Extent.StartLineNumber)
+    }
+    $hits
+}
+
+# Самоперевірка детектора на синтетичному тексті: інакше зламаний
+# детектор (0 знахідок завжди) мовчки дав би PASS.
+$targetsGuardSelfCheckProblems = New-Object System.Collections.Generic.List[string]
+try {
+    $targetsGuardPositive = @(& $targetsGuardFindHits ('$a = [string]$credentialSettings.Targets.SFTPLogin' + "`n" +
+            '$b = $global:credentialSettings.Targets[''SMBLogin'']' + "`n" +
+            '$c = $CredentialSettings.Targets.ArchivePassword'))
+    if ($targetsGuardPositive.Count -ne 3) { $targetsGuardSelfCheckProblems.Add("позитивні зразки: $($targetsGuardPositive.Count) з 3") }
+    $targetsGuardNegative = @(& $targetsGuardFindHits ('Send-X -CredentialTargets $credentialSettings.Targets' + "`n" +
+            'foreach ($p in $credentialSettings.Targets.PSObject.Properties) { }' + "`n" +
+            '$t = $credentialSettings.Targets' + "`n" +
+            '$n = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key ''SFTPLogin'''))
+    if ($targetsGuardNegative.Count -ne 0) { $targetsGuardSelfCheckProblems.Add("негативні зразки дали знахідки: $($targetsGuardNegative.Count)") }
+} catch {
+    $targetsGuardSelfCheckProblems.Add("детектор кинув: $($_.Exception.Message)")
+}
+
+$targetsGuardHits = New-Object System.Collections.Generic.List[string]
+$targetsGuardScanned = 0
+$targetsGuardError = ''
+try {
+    $targetsGuardManifest = [IO.File]::ReadAllText((Join-Path $root 'RUNTIME_MANIFEST.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $targetsGuardPaths = @($targetsGuardManifest.files.PSObject.Properties | ForEach-Object { [string]$_.Name } | Where-Object {
+            $_ -imatch '\.(ps1|psm1)$' -and
+            $_ -inotmatch '^(selftest|ci)\\' -and
+            $_ -inotmatch '^BRAVO_SELF_TEST' -and
+            $_ -inotmatch '^modules\\BRAVO\.(Credentials|Configuration)\\'
+        } | Sort-Object)
+    foreach ($targetsGuardRelativePath in $targetsGuardPaths) {
+        $targetsGuardText = [IO.File]::ReadAllText((Join-Path $root $targetsGuardRelativePath), [Text.Encoding]::UTF8)
+        $targetsGuardScanned++
+        foreach ($targetsGuardLine in @(& $targetsGuardFindHits $targetsGuardText)) {
+            $targetsGuardHits.Add("${targetsGuardRelativePath}:$targetsGuardLine")
+        }
+    }
+} catch {
+    $targetsGuardError = $_.Exception.Message
+}
+Test-BRAVOCondition (
+    [string]::IsNullOrEmpty($targetsGuardError) -and
+    $targetsGuardSelfCheckProblems.Count -eq 0 -and
+    $targetsGuardScanned -gt 20 -and
+    $targetsGuardHits.Count -eq 0
+) -Name 'Credentials/NoDirectTargetsReadOutsideResolver' `
+    -Failure "ім'я запису Credential Manager розв'язується лише через Get-BRAVOCredentialTargetName (BRAVO.Credentials); прямі читання credentialSettings.Targets.<Key>/[...] поза BRAVO.Credentials і BRAVO.Configuration: $($targetsGuardHits.Count) [$(@($targetsGuardHits) -join ', ')]; проскановано файлів: $targetsGuardScanned; самоперевірка детектора: $(@($targetsGuardSelfCheckProblems) -join '; '); помилка: $targetsGuardError"
+
+# --- (2) Характеризація BRAVO_CREDENTIALS_SETUP.ps1: Get-CredentialTarget
+# (імена компонентів setup) — тонка проекція на канонічний resolver.
+# Справжні функції з джерела; доступу до Credential Manager немає.
+$setupTargetComponentKeyMap = [ordered]@{
+    'SFTPLogin'                 = 'SFTPLogin'
+    'SFTPPassword'              = 'SFTPPassword'
+    'SMBLogin'                  = 'SMBLogin'
+    'SMBPassword'               = 'SMBPassword'
+    'Slack.General'             = 'SlackWebhookGeneral'
+    'Slack.Alerts'              = 'SlackWebhookAlerts'
+    'Discord.General'           = 'DiscordWebhookGeneral'
+    'Discord.Alerts'            = 'DiscordWebhookAlerts'
+    'Archive'                   = 'ArchivePassword'
+    'InstitutionName'           = 'InstitutionName'
+    'InstitutionCode'           = 'InstitutionCode'
+    'ArchivePrefix'             = 'ArchivePrefix'
+    'OperationsBootstrapSecret' = 'OperationsBootstrapSecret'
+}
+$setupTargetModule = $null
+$setupTargetSetupError = ''
+try {
+    $setupTargetSourceText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CREDENTIALS_SETUP.ps1'), [Text.Encoding]::UTF8) + "`n" +
+        [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Credentials\BRAVO.Credentials.psm1'), [Text.Encoding]::UTF8)
+    $setupTargetModule = New-BRAVOSelfTestRuntimeModule -SourceText $setupTargetSourceText `
+        -FunctionNames @('Get-CredentialTarget', 'Get-BRAVOCredentialTargetName')
+} catch {
+    $setupTargetSetupError = $_.Exception.Message
+}
+
+# (2a) Конфігуроване значення лише з пробілів -> канонічний дефолт (як
+# у resolver-і й у кожному runtime-читанні), а не пробіли дослівно.
+$setupTargetWhitespaceMismatches = New-Object System.Collections.Generic.List[string]
+$setupTargetWhitespaceError = $setupTargetSetupError
+if ($null -ne $setupTargetModule) {
+    try {
+        $setupTargetWhitespaceMismatches = & $setupTargetModule {
+            param($componentKeyMap)
+            $mismatches = New-Object System.Collections.Generic.List[string]
+            $whitespaceTargets = @{}
+            foreach ($key in @($componentKeyMap.Values)) { $whitespaceTargets[$key] = "  `t " }
+            $script:credentialSettings = @{ Targets = $whitespaceTargets }
+            foreach ($component in @($componentKeyMap.Keys)) {
+                $expected = Get-BRAVOCredentialTargetName -CredentialSettings $null -Key $componentKeyMap[$component]
+                $actual = Get-CredentialTarget -Name $component
+                if ([string]$actual -cne [string]$expected) { $mismatches.Add("${component}='$actual'") }
+            }
+            ,$mismatches
+        } $setupTargetComponentKeyMap
+    } catch { $setupTargetWhitespaceError = $_.Exception.Message; $setupTargetWhitespaceMismatches.Add('error') }
+} else {
+    $setupTargetWhitespaceMismatches.Add('setup')
+}
+Test-BRAVOCondition (@($setupTargetWhitespaceMismatches).Count -eq 0) `
+    -Name 'Credentials/SetupCredentialTargetWhitespaceUsesCanonicalDefault' `
+    -Failure "Get-CredentialTarget (BRAVO_CREDENTIALS_SETUP.ps1) для target-у лише з пробілів має повертати канонічний дефолт Get-BRAVOCredentialTargetName, а не пробіли; розбіжності: $(@($setupTargetWhitespaceMismatches) -join ', '); помилка: $setupTargetWhitespaceError"
+
+# (2b) Незмінна поведінка: непорожнє значення з конфігурації — дослівно;
+# відсутній/порожній ключ — канонічний дефолт; невідомий компонент — throw.
+$setupTargetMapMismatches = New-Object System.Collections.Generic.List[string]
+$setupTargetMapError = $setupTargetSetupError
+if ($null -ne $setupTargetModule) {
+    try {
+        $setupTargetMapMismatches = & $setupTargetModule {
+            param($componentKeyMap)
+            $mismatches = New-Object System.Collections.Generic.List[string]
+            $configuredTargets = @{}
+            foreach ($key in @($componentKeyMap.Values)) { $configuredTargets[$key] = "SELFTEST_417_$key" }
+            $script:credentialSettings = @{ Targets = $configuredTargets }
+            foreach ($component in @($componentKeyMap.Keys)) {
+                $actual = Get-CredentialTarget -Name $component
+                if ([string]$actual -cne ("SELFTEST_417_" + $componentKeyMap[$component])) { $mismatches.Add("configured:$component") }
+            }
+            $script:credentialSettings = @{ Targets = @{ SFTPLogin = '' } }
+            foreach ($component in @($componentKeyMap.Keys)) {
+                $expected = Get-BRAVOCredentialTargetName -CredentialSettings $null -Key $componentKeyMap[$component]
+                if ([string](Get-CredentialTarget -Name $component) -cne [string]$expected) { $mismatches.Add("default:$component") }
+            }
+            $unknownThrew = $false
+            try { [void](Get-CredentialTarget -Name 'NoSuchSelfTestComponent') } catch { $unknownThrew = $true }
+            if (-not $unknownThrew) { $mismatches.Add('unknown-component-must-throw') }
+            ,$mismatches
+        } $setupTargetComponentKeyMap
+    } catch { $setupTargetMapError = $_.Exception.Message; $setupTargetMapMismatches.Add('error') }
+} else {
+    $setupTargetMapMismatches.Add('setup')
+}
+Test-BRAVOCondition (@($setupTargetMapMismatches).Count -eq 0) `
+    -Name 'Credentials/SetupCredentialTargetMapsOntoResolver' `
+    -Failure "Get-CredentialTarget (BRAVO_CREDENTIALS_SETUP.ps1): непорожній target з конфігурації — дослівно, відсутній/порожній — канонічний дефолт, невідомий компонент — throw; розбіжності: $(@($setupTargetMapMismatches) -join ', '); помилка: $setupTargetMapError"

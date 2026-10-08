@@ -379,20 +379,12 @@ function Get-BRAVODryRunRangeIdPlan {
 }
 
 function Get-ConfiguredTarget {
-    param(
-        [string]$PropertyName,
-        [string]$DefaultValue
-    )
+    # #417: ім'я запису Credential Manager — лише через канонічний resolver
+    # Get-BRAVOCredentialTargetName (BRAVO.Credentials): значення з
+    # конфігурації, а якщо відсутнє/порожнє — канонічний дефолт.
+    param([string]$PropertyName)
 
-    $configuredValue = $null
-    if ($null -ne $credentialSettings -and
-        $null -ne $credentialSettings.Targets) {
-        $configuredValue = [string]$credentialSettings.Targets[$PropertyName]
-    }
-    if ([string]::IsNullOrWhiteSpace($configuredValue)) {
-        return $DefaultValue
-    }
-    return $configuredValue
+    return (Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key $PropertyName)
 }
 
 function Get-RequiredCredentialDescriptors {
@@ -403,17 +395,17 @@ function Get-RequiredCredentialDescriptors {
         $null -ne $bravoSettings.ArchivePrefix) {
         [void]$descriptors.Add([pscustomobject]@{
             Name = "Назва установи"
-            Target = Get-ConfiguredTarget "InstitutionName" "BRAVO_INSTITUTION_NAME"
+            Target = Get-ConfiguredTarget "InstitutionName"
             Kind = "InstitutionName"
         })
         [void]$descriptors.Add([pscustomobject]@{
             Name = "Код установи"
-            Target = Get-ConfiguredTarget "InstitutionCode" "BRAVO_INSTITUTION_CODE"
+            Target = Get-ConfiguredTarget "InstitutionCode"
             Kind = "InstitutionCode"
         })
         [void]$descriptors.Add([pscustomobject]@{
             Name = "Префікс архівів"
-            Target = Get-ConfiguredTarget "ArchivePrefix" "BRAVO_ARCHIVE_PREFIX"
+            Target = Get-ConfiguredTarget "ArchivePrefix"
             Kind = "ArchivePrefix"
         })
     }
@@ -429,7 +421,7 @@ function Get-RequiredCredentialDescriptors {
     if ($archiveEnabled) {
         [void]$descriptors.Add([pscustomobject]@{
             Name = "Пароль архівів"
-            Target = Get-ConfiguredTarget "ArchivePassword" "BRAVO_7Z_PASSWORD"
+            Target = Get-ConfiguredTarget "ArchivePassword"
             Kind = "Archive"
         })
     }
@@ -454,12 +446,12 @@ function Get-RequiredCredentialDescriptors {
     if ($sftpEnabled) {
         [void]$descriptors.Add([pscustomobject]@{
             Name = "SFTP логін"
-            Target = Get-ConfiguredTarget "SFTPLogin" "BRAVO_SFTP_LOGIN"
+            Target = Get-ConfiguredTarget "SFTPLogin"
             Kind = "SFTPLogin"
         })
         [void]$descriptors.Add([pscustomobject]@{
             Name = "SFTP пароль"
-            Target = Get-ConfiguredTarget "SFTPPassword" "BRAVO_SFTP_PASSWORD"
+            Target = Get-ConfiguredTarget "SFTPPassword"
             Kind = "SFTPPassword"
         })
     }
@@ -468,12 +460,12 @@ function Get-RequiredCredentialDescriptors {
     if ($smbEnabled) {
         [void]$descriptors.Add([pscustomobject]@{
             Name = "SMB логін"
-            Target = Get-ConfiguredTarget "SMBLogin" "BRAVO_SMB_LOGIN"
+            Target = Get-ConfiguredTarget "SMBLogin"
             Kind = "SMBLogin"
         })
         [void]$descriptors.Add([pscustomobject]@{
             Name = "SMB пароль"
-            Target = Get-ConfiguredTarget "SMBPassword" "BRAVO_SMB_PASSWORD"
+            Target = Get-ConfiguredTarget "SMBPassword"
             Kind = "SMBPassword"
         })
     }
@@ -488,7 +480,7 @@ function Get-RequiredCredentialDescriptors {
                 # фактичну перевірку канальних записів робить
                 # Test-DryRunWebhookCredential через канонічний resolver,
                 # Target тут — лише інформаційний підпис.
-                Target = "$(Get-ConfiguredTarget 'SlackWebhookGeneral' 'BRAVO_SLACK_GENERAL_URL') / $(Get-ConfiguredTarget 'SlackWebhookAlerts' 'BRAVO_SLACK_ALERTS_URL')"
+                Target = "$(Get-ConfiguredTarget 'SlackWebhookGeneral') / $(Get-ConfiguredTarget 'SlackWebhookAlerts')"
                 Kind = "Webhook"
                 NotificationProvider = "slack"
             })
@@ -499,7 +491,7 @@ function Get-RequiredCredentialDescriptors {
                 # фактичну перевірку канальних записів робить
                 # Test-DryRunWebhookCredential через канонічний resolver,
                 # Target тут — лише інформаційний підпис.
-                Target = "$(Get-ConfiguredTarget 'DiscordWebhookGeneral' 'BRAVO_DISCORD_GENERAL_URL') / $(Get-ConfiguredTarget 'DiscordWebhookAlerts' 'BRAVO_DISCORD_ALERTS_URL')"
+                Target = "$(Get-ConfiguredTarget 'DiscordWebhookGeneral') / $(Get-ConfiguredTarget 'DiscordWebhookAlerts')"
                 Kind = "Webhook"
                 NotificationProvider = "discord"
             })

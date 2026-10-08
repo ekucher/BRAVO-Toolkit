@@ -226,10 +226,8 @@ try {
 
     # SFTP-креденшли: той самий канонічний шлях, що Health/DataRestore —
     # Credential Manager -> Resolve-BRAVOSftpHostName -> New-BRAVOSftpUrl.
-    $sftpLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
-    $sftpPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
-    if ([string]::IsNullOrWhiteSpace($sftpLoginTarget)) { $sftpLoginTarget = 'BRAVO_SFTP_LOGIN' }
-    if ([string]::IsNullOrWhiteSpace($sftpPasswordTarget)) { $sftpPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
+    $sftpLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPLogin'
+    $sftpPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
     $storedSftpLogin = Get-BRAVOCredentialSecret -Target $sftpLoginTarget
     $storedSftpPassword = Get-BRAVOCredentialSecret -Target $sftpPasswordTarget
     if ([string]::IsNullOrWhiteSpace($storedSftpLogin) -or [string]::IsNullOrWhiteSpace($storedSftpPassword)) {

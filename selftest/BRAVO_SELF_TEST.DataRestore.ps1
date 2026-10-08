@@ -4420,6 +4420,9 @@ function Format-BRAVODuration { param($Duration) return 'self-test' }
 function Test-BRAVODataRestoreToolIntegrity { param($ToolNames) return [pscustomobject]@{ Problems = @(); Mode = 'Enforce' } }
 function Initialize-BRAVOCredentialManager { }
 function Get-BRAVOCredentialSecret { param($Target) return 'self-test-placeholder' }
+# #417: runtime розв'язує ім'я запису через канонічний resolver BRAVO.Credentials;
+# модуль у пробі не імпортується, тож resolver — стаб поруч із Get-BRAVOCredentialSecret.
+function Get-BRAVOCredentialTargetName { param($CredentialSettings, [string]$Key) return "self-test-$Key" }
 function Enter-BRAVODataRestoreOperationLock {
     Add-ProbeEvent 'LOCK-ENTER'
     return [pscustomobject]@{ Success = $true; Stream = $null; Path = 'self-test-lock'; Error = $null }

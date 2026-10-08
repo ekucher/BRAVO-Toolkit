@@ -510,7 +510,7 @@ try {
         $null -eq (Get-Command -Name Initialize-BRAVOCredentialManager -ErrorAction SilentlyContinue)) {
         throw "вбудований Credential Manager недоступний"
     }
-    $archiveCredentialTarget = [string]$credentialSettings.Targets.ArchivePassword
+    $archiveCredentialTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
     if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
         $archiveCredentialTarget = "BRAVO_7Z_PASSWORD"
     }
@@ -10766,8 +10766,8 @@ if (-not $BravoMaintenanceEnabled) {
             Write-Log -Message ([string]$storageEffective.SFTP.DisabledReason) -Level "INFO"
         } else {
             try {
-                $traceSftpLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
-                $traceSftpPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
+                $traceSftpLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPLogin'
+                $traceSftpPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
                 if ([string]::IsNullOrWhiteSpace($traceSftpLoginTarget)) { $traceSftpLoginTarget = 'BRAVO_SFTP_LOGIN' }
                 if ([string]::IsNullOrWhiteSpace($traceSftpPasswordTarget)) { $traceSftpPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
                 $traceSftpLogin = Get-BRAVOCredentialSecret -Target $traceSftpLoginTarget

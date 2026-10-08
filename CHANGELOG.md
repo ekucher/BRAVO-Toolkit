@@ -170,6 +170,20 @@
   `Maintenance/RetentionCleanupStepFailsAfterEarlierCriticalError`,
   `Maintenance/RestoreArchiveDirectoryWithWildcardCharsIsLiteral`.
 
+- **Hardening: ім'я запису Credential Manager розв'язується лише канонічним resolver-ом (#417).**
+  Прямі читання `credentialSettings.Targets.<Key>` із власним дефолтом у runtime-файлах (`BRAVO.Archive.Runtime.ps1`,
+  `BRAVO.Health.Runtime.ps1`, `BRAVO.DataRestore.Runtime.ps1`, `BRAVO.Maintenance.Runtime.ps1`,
+  `BRAVO_BAZA_RECONCILE.ps1`, `BRAVO_RESTORE_TEST.ps1`, `Get-ConfiguredTarget` у `BRAVO_DRY_RUN.ps1`) замінено на
+  `Get-BRAVOCredentialTargetName` (BRAVO.Credentials). Імена записів не змінилися: значення з конфігурації, а якщо воно
+  відсутнє, порожнє чи лише з пробілів — той самий канонічний дефолт; ключ реєстру прочитаних секретів і пошук у
+  `Get-BRAVOLogMaskSecretSet` тепер не можуть розійтися через окрему копію політики. `Get-CredentialTarget` у
+  `BRAVO_CREDENTIALS_SETUP.ps1` став тонкою проекцією імен компонентів setup на resolver; єдина зміна поведінки —
+  target лише з пробілів більше не використовується дослівно, а дає канонічний дефолт, як у runtime. `OperationsApiKey`
+  до компонентів setup не додано: цей запис створює enrollment BRAVO.Operations. Тести:
+  `Credentials/NoDirectTargetsReadOutsideResolver`,
+  `Credentials/SetupCredentialTargetWhitespaceUsesCanonicalDefault`,
+  `Credentials/SetupCredentialTargetMapsOntoResolver`.
+
 - **Hardening: облік секретів процесу не ламає читання й не дає вивантажити журнал із неповним маскуванням (#417).**
   Облік значень, отриманих процесом із Credential Manager (реєстр для `Get-BRAVOLogMaskSecretSet`, #365), винесено з
   `Get-BRAVOCredentialSecureSecret` у приватний `Add-BRAVOCredentialReadSecretRecord` із власним try/catch: збій обліку
