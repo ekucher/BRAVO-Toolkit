@@ -361,6 +361,10 @@ componentSettings.SMB.Enabled
 | `SambaOnly` — Лише Samba | `LocalPlusSMB` | `$false` | `$true` | `$true` | `BAZA_*_LOCAL = $true` |
 | `LocalOnly` — Лише локально | `LocalOnly` | `$false` | `$false` | — | `BAZA_*_LOCAL = $true` |
 
+`SFTP.ArchiveUpload` жоден профіль не пише: для `Cloud` і `CloudAndSamba`
+очікуване значення — дефолт конфігурації (`$true`); для `SambaOnly` і
+`LocalOnly` вивантаження за вимкненого SFTP ефективно вимкнене.
+
 Профіль застосовує `deploy\Install-BRAVOServer.ps1 -SeedLocalConfig
 -BackupDestination <профіль>` і **лише** до нового `BRAVO.local.config`;
 наявний файл ніколи не змінюється (без явного `-BackupDestination`
@@ -369,8 +373,9 @@ componentSettings.SMB.Enabled
 інсталяцій дає явне значення в новому файлі.
 
 Явний `-BackupDestination` (будь-який профіль) інсталятор не ігнорує мовчки
-(#434): він перевіряє ЕФЕКТИВНІ `SFTP.Enabled`, `SMB.Enabled` і
-`SMB.ArchiveCopy` (`Get-BRAVOEffectiveStorageConfiguration` поверх дефолтів і
+(#434): він перевіряє ЕФЕКТИВНІ `SFTP.Enabled`, `SMB.Enabled`,
+`SMB.ArchiveCopy`, а лише для `Cloud` і `CloudAndSamba` ще й `SFTP.ArchiveUpload`
+(`Get-BRAVOEffectiveStorageConfiguration` поверх дефолтів і
 `BRAVO.local.config`) проти значень профілю. Без `-SeedLocalConfig` і без
 наявного файла інсталяція зупиняється до завантаження й будь-якого запису;
 комплект без `BRAVO.Configurator`, нерозбірний наявний файл або наявний файл,

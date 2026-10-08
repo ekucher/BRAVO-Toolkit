@@ -39,7 +39,8 @@ README, розділ 3.1. Наявний `BRAVO.local.config` ніколи не 
 
 Явний `-BackupDestination` (будь-який із чотирьох профілів) мовчки не
 ігнорується — fail-closed (#434). Профіль «в силі» лише тоді, коли ефективні
-`SFTP.Enabled`, `SMB.Enabled` і `SMB.ArchiveCopy` (дефолти комплекту +
+`SFTP.Enabled`, `SMB.Enabled`, `SMB.ArchiveCopy`, а лише для `Cloud` і
+`CloudAndSamba` ще й `SFTP.ArchiveUpload` (дефолти комплекту +
 `BRAVO.local.config`, канонічний `Get-BRAVOEffectiveStorageConfiguration`)
 дорівнюють тим, що записав би свіжий `-SeedLocalConfig` цього профілю.
 Рішення ухвалюється за ефективними значеннями, а не за текстом файла:
