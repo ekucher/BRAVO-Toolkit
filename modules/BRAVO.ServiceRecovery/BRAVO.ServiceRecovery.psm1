@@ -741,12 +741,20 @@ function Get-BRAVOServiceRecoveryChainPlan {
         if ($null -eq $item) { continue }
         $itemKey = [string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'Key')
         if ([string]::IsNullOrWhiteSpace($itemKey) -or $byKey.ContainsKey($itemKey)) { continue }
-        $byKey[$itemKey] = [pscustomobject]@{
+        $entry = [pscustomobject]@{
             Key       = $itemKey
             Name      = [string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'Name')
             Condition = [string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'Condition')
             Status    = [string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'Status')
         }
+        # Тип запуску переноситься, лише коли опис його має: невідомий тип —
+        # не «впала» (Test-BRAVOServiceRecoveryStartModeUnknown), а опис без
+        # StartMode, як і раніше, вважається з відомим типом.
+        $hasStartMode = if ($item -is [Collections.IDictionary]) { $item.Contains('StartMode') } else { $null -ne $item.PSObject.Properties['StartMode'] }
+        if ($hasStartMode) {
+            Add-Member -InputObject $entry -NotePropertyName 'StartMode' -NotePropertyValue ([string](Get-BRAVOServiceRecoveryItemValue -Item $item -Name 'StartMode'))
+        }
+        $byKey[$itemKey] = $entry
     }
     $filterEligible = $PSBoundParameters.ContainsKey('EligibleNames') -and $null -ne $EligibleNames
     $isEligible = {
