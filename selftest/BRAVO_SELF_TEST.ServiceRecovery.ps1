@@ -15,6 +15,8 @@
     $recoveryExpectedExports = @(
         'Get-BRAVOServiceRecoveryPolicy',
         'Test-BRAVOServiceRecoveryFailed',
+        # Рев'ю PR #429: невідомий тип запуску — не кандидат на відновлення
+        'Test-BRAVOServiceRecoveryStartModeUnknown',
         'Get-BRAVOServiceRecoveryStatePath',
         'Read-BRAVOServiceRecoveryState',
         'Write-BRAVOServiceRecoveryState',

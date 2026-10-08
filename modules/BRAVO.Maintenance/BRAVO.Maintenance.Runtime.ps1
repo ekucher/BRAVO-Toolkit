@@ -1194,7 +1194,9 @@ function Get-BRAVOMaintenanceManagedServiceStatus {
     # Failed і Status Stopped, Test-BRAVOServiceRecoveryFailed) дає
     # Failed = $true і намір перезапуску. Disabled від оператора,
     # OwnedByBravo (чинний маркер або утримання BRAVO) і NotInstalled не
-    # впалі. Маркер читається один раз на виклик.
+    # впалі. Зупинена служба з невідомим типом запуску — теж ні (fail-closed:
+    # могла бути вимкнена оператором), лише WARNING. Маркер читається один
+    # раз на виклик.
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Services,
         [switch]$ClassifyFailed
@@ -1218,6 +1220,9 @@ function Get-BRAVOMaintenanceManagedServiceStatus {
             try {
                 $serviceCondition = Get-BRAVOManagedServiceCondition -Name ([string]$service.Name) -QuiescenceState $quiescenceState
                 $serviceFailed = [bool](Test-BRAVOServiceRecoveryFailed -Condition $serviceCondition)
+                if (Test-BRAVOServiceRecoveryStartModeUnknown -Condition $serviceCondition) {
+                    Write-Log -Message "Служба $($service.Name) зупинена, але її тип запуску не визначено (ServiceController без StartType, WMI недоступний) — автоматично не запускається: вона могла бути вимкнена оператором, перевірте службу вручну (#314)" -Level "WARNING"
+                }
             } catch {
                 # Невизначений стан не є «впалою» службою: поведінка до #314
                 # (не запускати), без зупинки прогону.
@@ -1828,8 +1833,9 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
     }
 
     # 1. Класифікація без lock-а. Немає впалих — вихід 0 без запису на диск
-    # (журнал RECOVER не створюється); єдиний дозволений запис — state, коли
-    # змінилося спостереження стабільності (stableSince / скидання обліку).
+    # (журнал RECOVER не створюється); дозволені записи — state, коли
+    # змінилося спостереження стабільності (stableSince / скидання обліку), і
+    # рядок зведення про службу з невідомим типом запуску.
     $recoveryConditions = @(Get-BRAVOServiceRecoveryConditions -Services $recoveryServices)
     $failedConditions = @($recoveryConditions | Where-Object { Test-BRAVOServiceRecoveryFailed -Condition $_ })
     $recoveryStateRead = Read-BRAVOServiceRecoveryState
@@ -1837,6 +1843,19 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
     $recoveryNow = Get-Date
     if (-not [string]::IsNullOrWhiteSpace([string]$recoveryStateRead.Warning)) {
         Write-Host "УВАГА: $($recoveryStateRead.Warning)" -ForegroundColor Yellow
+    }
+    # Зупинена служба з невідомим типом запуску (fail-closed, рев'ю PR #429):
+    # могла бути вимкнена оператором — профіль її не запускає, лише рядок у
+    # зведенні (раз на добу: однаковий рядок не дублюється) і консолі.
+    $recoverySummaryPath = [IO.Path]::Combine([string]$LOG_DIR, 'BRAVO_SERVICE_RECOVERY_SUMMARY.log')
+    foreach ($unknownCondition in @($recoveryConditions | Where-Object { Test-BRAVOServiceRecoveryStartModeUnknown -Condition $_ })) {
+        $unknownText = '{0}: {1} зупинена, тип запуску не визначено — автоматично не запускається, перевірте службу вручну' -f $recoveryNow.ToString('yyyy-MM-dd'), $unknownCondition.Name
+        try {
+            [void](Add-BRAVOServiceRecoverySummaryLine -Path $recoverySummaryPath -Text $unknownText)
+        } catch {
+            Write-Host "УВАГА: не вдалося дописати зведення відновлення служб: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        Write-Host "УВАГА: відновлення служб: $unknownText" -ForegroundColor Yellow
     }
     if ($failedConditions.Count -eq 0) {
         $recoveryStateChanged = $false
@@ -1888,7 +1907,7 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
     if ($allowedNames.Count -eq 0) {
         foreach ($pausedText in $pausedTexts) {
             try {
-                [void](Add-BRAVOServiceRecoverySummaryLine -Path ([IO.Path]::Combine([string]$LOG_DIR, 'BRAVO_SERVICE_RECOVERY_SUMMARY.log')) -Text $pausedText)
+                [void](Add-BRAVOServiceRecoverySummaryLine -Path $recoverySummaryPath -Text $pausedText)
             } catch {
                 Write-Host "УВАГА: не вдалося дописати зведення відновлення служб: $($_.Exception.Message)" -ForegroundColor Yellow
             }
@@ -1965,6 +1984,14 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$recoveryStateRead.Warning)) {
             Write-Log -Message ([string]$recoveryStateRead.Warning) -Level "WARNING"
+        }
+        # Служби поза планом цього тику: у власній паузі (і та, що чекає на
+        # BRAVO) — INFO; зупинена з невідомим типом запуску — WARNING.
+        foreach ($pausedText in $pausedTexts) {
+            Write-Log -Message "Відновлення служб: $pausedText" -Level "INFO"
+        }
+        foreach ($unknownCondition in @($recoveryConditions | Where-Object { Test-BRAVOServiceRecoveryStartModeUnknown -Condition $_ })) {
+            Write-Log -Message "Служба $($unknownCondition.Name) зупинена, але її тип запуску не визначено (ServiceController без StartType, WMI недоступний) — автоматично не запускається: вона могла бути вимкнена оператором, перевірте службу вручну" -Level "WARNING"
         }
         if (@($chainPlan.StopOrder).Count -gt 0 -or @($chainPlan.StartOrder).Count -gt @($chainPlan.FailedNames).Count) {
             Write-Log -Message "Впала служба BRAVO: залежні служби буде зупинено ($(@($chainPlan.StopOrder) -join ', ')) і запущено в порядку $(@($chainPlan.StartOrder) -join ' -> ')" -Level "INFO"

@@ -6,6 +6,7 @@
     FunctionsToExport = @(
         'Get-BRAVOServiceRecoveryPolicy',
         'Test-BRAVOServiceRecoveryFailed',
+        'Test-BRAVOServiceRecoveryStartModeUnknown',
         'Get-BRAVOServiceRecoveryStatePath',
         'Read-BRAVOServiceRecoveryState',
         'Write-BRAVOServiceRecoveryState',

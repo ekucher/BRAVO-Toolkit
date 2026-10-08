@@ -66,7 +66,10 @@ function Test-BRAVOServiceRecoveryFailed {
     # «Впала служба» для Maintenance і профілю відновлення (#314, план §0.3):
     # класифікатор Get-BRAVOManagedServiceCondition дає Failed і для Paused,
     # але призупинену службу BRAVO не зупиняє і не запускає (#360). Тому
-    # «впала» = Condition 'Failed' І Status 'Stopped'.
+    # «впала» = Condition 'Failed' І Status 'Stopped' І тип запуску відомий:
+    # зупинена служба з невідомим типом запуску
+    # (Test-BRAVOServiceRecoveryStartModeUnknown) могла бути вимкнена
+    # оператором — автоматично не запускається (fail-closed, рев'ю PR #429).
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowNull()][object]$Condition
@@ -76,7 +79,33 @@ function Test-BRAVOServiceRecoveryFailed {
     $conditionProperty = $Condition.PSObject.Properties['Condition']
     $statusProperty = $Condition.PSObject.Properties['Status']
     if ($null -eq $conditionProperty -or $null -eq $statusProperty) { return $false }
-    return ([string]$conditionProperty.Value -eq 'Failed' -and [string]$statusProperty.Value -eq 'Stopped')
+    if ([string]$conditionProperty.Value -ne 'Failed' -or [string]$statusProperty.Value -ne 'Stopped') { return $false }
+    return (-not (Test-BRAVOServiceRecoveryStartModeUnknown -Condition $Condition))
+}
+
+function Test-BRAVOServiceRecoveryStartModeUnknown {
+    # Зупинена служба (Condition 'Failed', Status 'Stopped'), чий тип запуску
+    # не визначено: ServiceController без StartType (.NET Framework < 4.6.1)
+    # і WMI недоступний -> Get-BRAVOServiceStartMode дає StartMode 'Unknown'.
+    # Disabled від оператора тоді не відрізнити від Automatic/Manual, тож
+    # така служба НЕ кандидат на автоматичне відновлення ні в профілі
+    # -RecoverServices, ні в нічному Maintenance (викликач пише WARNING).
+    # Класифікація Get-BRAVOManagedServiceCondition (Health) не змінюється.
+    # Опис без властивості StartMode (не з класифікатора) — тип вважається
+    # відомим, як і до рев'ю.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Condition
+    )
+
+    if ($null -eq $Condition) { return $false }
+    $conditionProperty = $Condition.PSObject.Properties['Condition']
+    $statusProperty = $Condition.PSObject.Properties['Status']
+    $startModeProperty = $Condition.PSObject.Properties['StartMode']
+    if ($null -eq $conditionProperty -or $null -eq $statusProperty -or $null -eq $startModeProperty) { return $false }
+    if ([string]$conditionProperty.Value -ne 'Failed' -or [string]$statusProperty.Value -ne 'Stopped') { return $false }
+    $startMode = [string]$startModeProperty.Value
+    return ([string]::IsNullOrWhiteSpace($startMode) -or $startMode -eq 'Unknown')
 }
 
 function Get-BRAVOServiceRecoveryStatePath {
@@ -693,7 +722,7 @@ function Get-BRAVOServiceRecoveryChainPlan {
     #     зупиняються і не обліковуються, навіть якщо їхня власна пауза
     #     минула; впалі з них — у HeldByBravoNames (рядок зведення);
     #   - Disabled, NotInstalled, OwnedByBravo, призупинена (Failed, але не
-    #     Stopped — §0.3) — поза планом.
+    #     Stopped — §0.3), зупинена з невідомим типом запуску — поза планом.
     # Deferred непорожній = план цього тику НЕ виконується (служба саме
     # змінює стан; наступна перевірка через <= 15 хв).
     # Результат: FailedKeys/FailedNames (обліковуються як спроба;
