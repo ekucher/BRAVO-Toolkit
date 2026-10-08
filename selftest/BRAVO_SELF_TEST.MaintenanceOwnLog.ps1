@@ -1624,6 +1624,56 @@ Test-BRAVOCondition (
 ) -Name 'Logging/KnownSecretJsonEscapedLineSeparatorsMasked' `
     -Failure "JSON-екранована форма відомого секрету з U+0085/U+2028/U+2029 (\u0085, \u2028, \u2029 — строга форма PS 7) і фактичний вивід ConvertTo-Json поточного хоста мають маскуватись; лишились форми: $(@($secretMaskJsonLineLeft) -join ', '); помилка: $secretMaskJsonLineError"
 
+# #435: HTML-безпечна JSON-форма (Windows PowerShell 5.1,
+# JavaScriptSerializer -> HttpEncoder.JavaScriptStringEncode) екранує
+# водночас і & ' < >, і U+0085/U+2028/U+2029 — обидва як \u + 4 hex у
+# нижньому регістрі. Секрет, що містить HTML-символ І один із цих
+# роздільників, у виводі PS 5.1 не збігається ні зі строгою формою
+# (там HTML-символ сирий), ні з формою, де екрановано лише HTML-символи,
+# — тож ця форма теж має маскуватись, як і фактичний вивід ConvertTo-Json
+# поточного хоста. Символи — лише з кодів, значення будуються під час
+# запуску.
+$secretMaskJsonMixLineCodes = @(0x0085, 0x2028, 0x2029)
+$secretMaskJsonMixHtmlCodes = @(60, 38, 62)
+$secretMaskJsonMixSecrets = New-Object 'System.Collections.Generic.List[string]'
+$secretMaskJsonMixHtmlSafe = New-Object 'System.Collections.Generic.List[string]'
+$secretMaskJsonMixNative = New-Object 'System.Collections.Generic.List[string]'
+for ($secretMaskJsonMixIndex = 0; $secretMaskJsonMixIndex -lt $secretMaskJsonMixLineCodes.Count; $secretMaskJsonMixIndex++) {
+    $secretMaskJsonMixLineCode = [int]$secretMaskJsonMixLineCodes[$secretMaskJsonMixIndex]
+    $secretMaskJsonMixHtmlCode = [int]$secretMaskJsonMixHtmlCodes[$secretMaskJsonMixIndex]
+    $secretMaskJsonMixBase = $secretMaskNewValue.Invoke('Mx' + $secretMaskJsonMixLineCode.ToString('x4'))[0]
+    $secretMaskJsonMixSecret = $secretMaskJsonMixBase.Substring(0, 5) + [string][char]$secretMaskJsonMixHtmlCode + $secretMaskJsonMixBase.Substring(5, 3) + [string][char]34 + $secretMaskJsonMixBase.Substring(8, 2) + [string][char]$secretMaskJsonMixLineCode + $secretMaskJsonMixBase.Substring(10)
+    $secretMaskJsonMixSecrets.Add($secretMaskJsonMixSecret)
+    $secretMaskJsonMixHtmlSafe.Add($secretMaskJsonMixSecret.Replace([string][char]92, '\\').Replace([string][char]34, '\"').Replace([string][char]$secretMaskJsonMixHtmlCode, ([string][char]92 + 'u' + $secretMaskJsonMixHtmlCode.ToString('x4'))).Replace([string][char]$secretMaskJsonMixLineCode, ([string][char]92 + 'u' + $secretMaskJsonMixLineCode.ToString('x4'))))
+    $secretMaskJsonMixNativeText = [string]($secretMaskJsonMixSecret | ConvertTo-Json -Compress)
+    $secretMaskJsonMixNative.Add($secretMaskJsonMixNativeText.Substring(1, $secretMaskJsonMixNativeText.Length - 2))
+}
+$secretMaskJsonMixText = ''
+for ($secretMaskJsonMixIndex = 0; $secretMaskJsonMixIndex -lt $secretMaskJsonMixSecrets.Count; $secretMaskJsonMixIndex++) {
+    $secretMaskJsonMixText += '{"h":"' + $secretMaskJsonMixHtmlSafe[$secretMaskJsonMixIndex] + '","n":"' + $secretMaskJsonMixNative[$secretMaskJsonMixIndex] + '"} '
+}
+$secretMaskJsonMixResult = $null
+$secretMaskJsonMixError = $secretMaskSetupError
+if ($null -ne $secretMaskModule) {
+    try {
+        $secretMaskJsonMixResult = & $secretMaskModule {
+            param($text, $secrets)
+            Protect-BRAVOLogSecret -Text $text -KnownSecret $secrets
+        } $secretMaskJsonMixText $secretMaskJsonMixSecrets.ToArray()
+    } catch { $secretMaskJsonMixError = $_.Exception.GetType().FullName }
+}
+$secretMaskJsonMixLeft = New-Object 'System.Collections.Generic.List[string]'
+for ($secretMaskJsonMixIndex = 0; $secretMaskJsonMixIndex -lt $secretMaskJsonMixSecrets.Count; $secretMaskJsonMixIndex++) {
+    $secretMaskJsonMixLabel = ([int]$secretMaskJsonMixLineCodes[$secretMaskJsonMixIndex]).ToString('X4') + '+' + ([int]$secretMaskJsonMixHtmlCodes[$secretMaskJsonMixIndex]).ToString('X4')
+    if (([string]$secretMaskJsonMixResult).Contains($secretMaskJsonMixHtmlSafe[$secretMaskJsonMixIndex])) { $secretMaskJsonMixLeft.Add("html:U+$secretMaskJsonMixLabel") }
+    if (([string]$secretMaskJsonMixResult).Contains($secretMaskJsonMixNative[$secretMaskJsonMixIndex])) { $secretMaskJsonMixLeft.Add("native:U+$secretMaskJsonMixLabel") }
+}
+Test-BRAVOCondition (
+    @($secretMaskJsonMixHtmlSafe | Where-Object { ([regex]::Matches($_, '\\u[0-9a-f]{4}')).Count -ne 2 }).Count -eq 0 -and
+    [string]$secretMaskJsonMixResult -ceq '{"h":"***","n":"***"} {"h":"***","n":"***"} {"h":"***","n":"***"} '
+) -Name 'Logging/KnownSecretJsonEscapedHtmlAndSeparatorMasked' `
+    -Failure "HTML-безпечна JSON-форма відомого секрету з HTML-символом (< & >) і U+0085/U+2028/U+2029 (обидва екрановані як \u + 4 hex — форма PS 5.1) і фактичний вивід ConvertTo-Json поточного хоста мають маскуватись; лишились форми: $(@($secretMaskJsonMixLeft) -join ', '); помилка: $secretMaskJsonMixError"
+
 # Регресія: секрет без спецсимволів (закодовані форми збігаються з сирою)
 # маскується рівно як раніше — одне *** на входження, без *** поруч
 # (артефакт подвійного маскування) і без змін у решті тексту.
