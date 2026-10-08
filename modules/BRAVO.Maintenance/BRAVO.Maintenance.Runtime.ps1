@@ -511,12 +511,6 @@ try {
         throw "вбудований Credential Manager недоступний"
     }
     $archiveCredentialTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
-    if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
-        $archiveCredentialTarget = "BRAVO_7Z_PASSWORD"
-    }
-    if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
-        throw "не вдалося визначити назву запису Credential Manager для пароля архівів"
-    }
     $script:ArchivePassword = Get-BRAVOCredentialSecret -Target $archiveCredentialTarget
     if ([string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
         throw "запис Credential Manager '$archiveCredentialTarget' не знайдено або він порожній для $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
@@ -10768,8 +10762,6 @@ if (-not $BravoMaintenanceEnabled) {
             try {
                 $traceSftpLoginTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPLogin'
                 $traceSftpPasswordTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'SFTPPassword'
-                if ([string]::IsNullOrWhiteSpace($traceSftpLoginTarget)) { $traceSftpLoginTarget = 'BRAVO_SFTP_LOGIN' }
-                if ([string]::IsNullOrWhiteSpace($traceSftpPasswordTarget)) { $traceSftpPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
                 $traceSftpLogin = Get-BRAVOCredentialSecret -Target $traceSftpLoginTarget
                 $traceSftpPassword = Get-BRAVOCredentialSecret -Target $traceSftpPasswordTarget
                 if ([string]::IsNullOrWhiteSpace($traceSftpLogin) -or [string]::IsNullOrWhiteSpace($traceSftpPassword)) {

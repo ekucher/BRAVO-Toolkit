@@ -443,9 +443,6 @@ if ($credentialHelperLoaded) {
 if ($credentialHelperLoaded -and $archiveCredentialRequired) {
     try {
         $archiveCredentialTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
-        if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
-            throw "не вдалося визначити назву запису Credential Manager для пароля архівів"
-        }
         $script:archivePassword = Get-BRAVOCredentialSecret -Target $archiveCredentialTarget
         if ([string]::IsNullOrWhiteSpace($script:archivePassword)) {
             throw "запис Credential Manager '$archiveCredentialTarget' не знайдено або він порожній для $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"

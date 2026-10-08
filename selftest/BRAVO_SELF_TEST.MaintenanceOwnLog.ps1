@@ -1558,7 +1558,8 @@ Test-BRAVOCondition (
 
 # JSON-екранування відрізняється між хостами: Windows PowerShell 5.1
 # (JavaScriptSerializer) додатково екранує & < > ' як \u00XX, PowerShell 7
-# — лише " \ і керівні символи. Перевіряються ОБИДВІ форми, побудовані
+# — " \, керівні символи й U+0085/U+2028/U+2029 (окремий тест нижче).
+# Перевіряються ОБИДВІ форми, побудовані
 # детерміновано, і фактичний вивід ConvertTo-Json поточного хоста.
 $secretMaskJsonSecret = $secretMaskEncodedBase.Substring(0, 5) + [char]34 + $secretMaskEncodedBase.Substring(5, 4) + [char]92 + 'c' + [char]38 + 'd' + [char]60 + [char]39 + $secretMaskEncodedBase.Substring(9)
 $secretMaskJsonStrict = $secretMaskJsonSecret.Replace([string][char]92, '\\').Replace([string][char]34, '\"')
@@ -1664,6 +1665,11 @@ Remove-Item -LiteralPath $secretMaskTestRoot -Recurse -Force -ErrorAction Silent
 # Передача таблиці цілком (-CredentialTargets $credentialSettings.Targets
 # для BRAVO.Notifications) і перелік її властивостей (.PSObject) — не
 # читання ключа й не порушення.
+# #435: таблицею вважається й змінна-псевдонім, якій присвоєно таблицю
+# ($t = $credentialSettings.Targets, також через [тип], (...) і ланцюжок
+# псевдонімів; обсяг — увесь файл, без урахування областей видимості, тож
+# детектор радше перестрахується). Читання ключа через
+# <таблиця>.PSObject.Properties['X'] / .Item('X') — теж порушення.
 $targetsGuardFindHits = {
     param([string]$SourceText)
     $hits = New-Object System.Collections.Generic.List[int]
@@ -1671,8 +1677,36 @@ $targetsGuardFindHits = {
     $guardErrors = $null
     $guardAst = [System.Management.Automation.Language.Parser]::ParseInput($SourceText, [ref]$guardTokens, [ref]$guardErrors)
     if (@($guardErrors).Count -gt 0) { throw "файл не розбирається ($(@($guardErrors).Count) помилок)" }
+    $aliasNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $getVariableName = {
+        param($variableNode)
+        return (([string]$variableNode.VariablePath.UserPath) -ireplace '^(global|script|local|private):', '')
+    }
+    $unwrapExpression = {
+        param($node)
+        while ($null -ne $node) {
+            if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) { $node = $node.Child; continue }
+            if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) { $node = $node.Pipeline; continue }
+            if ($node -is [System.Management.Automation.Language.PipelineAst]) {
+                if (@($node.PipelineElements).Count -ne 1) { break }
+                $node = $node.PipelineElements[0]
+                continue
+            }
+            if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                if (@($node.Redirections).Count -gt 0) { break }
+                $node = $node.Expression
+                continue
+            }
+            break
+        }
+        return $node
+    }
     $isTargetsTable = {
         param($node)
+        $node = & $unwrapExpression $node
+        if ($node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            return $aliasNames.Contains((& $getVariableName $node))
+        }
         if ($node -isnot [System.Management.Automation.Language.MemberExpressionAst]) { return $false }
         if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return $false }
         if ($node.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
@@ -1680,11 +1714,43 @@ $targetsGuardFindHits = {
         if ($node.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
         return ([string]$node.Expression.VariablePath.UserPath -imatch '^((global|script):)?credentialSettings$')
     }
+    $isNamedMember = {
+        param($node, [string]$MemberName)
+        if ($node -isnot [System.Management.Automation.Language.MemberExpressionAst]) { return $false }
+        if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return $false }
+        if ($node.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+        return ([string]$node.Member.Value -ieq $MemberName)
+    }
+    # <таблиця>.PSObject.Properties — колекція властивостей таблиці.
+    $isTargetsPropertyCollection = {
+        param($node)
+        if (-not (& $isNamedMember $node 'Properties')) { return $false }
+        if (-not (& $isNamedMember $node.Expression 'PSObject')) { return $false }
+        return (& $isTargetsTable $node.Expression.Expression)
+    }
+    # Псевдоніми: до нерухомої точки, щоб ланцюжок $u = $t теж ловився.
+    $assignmentNodes = @($guardAst.FindAll({ param($candidate)
+                $candidate -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
+    $aliasAdded = $true
+    while ($aliasAdded) {
+        $aliasAdded = $false
+        foreach ($assignmentNode in $assignmentNodes) {
+            $assignedNode = & $unwrapExpression $assignmentNode.Left
+            if ($assignedNode -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            if (-not (& $isTargetsTable $assignmentNode.Right)) { continue }
+            if ($aliasNames.Add((& $getVariableName $assignedNode))) { $aliasAdded = $true }
+        }
+    }
     foreach ($node in @($guardAst.FindAll({ param($candidate)
                     $candidate -is [System.Management.Automation.Language.MemberExpressionAst] -or
                     $candidate -is [System.Management.Automation.Language.IndexExpressionAst] }, $true))) {
         if ($node -is [System.Management.Automation.Language.IndexExpressionAst]) {
-            if (& $isTargetsTable $node.Target) { $hits.Add($node.Extent.StartLineNumber) }
+            if ((& $isTargetsTable $node.Target) -or (& $isTargetsPropertyCollection $node.Target)) { $hits.Add($node.Extent.StartLineNumber) }
+            continue
+        }
+        if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            (& $isTargetsPropertyCollection $node.Expression)) {
+            $hits.Add($node.Extent.StartLineNumber)
             continue
         }
         if (-not (& $isTargetsTable $node.Expression)) { continue }
