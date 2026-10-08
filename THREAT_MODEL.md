@@ -121,6 +121,11 @@ redirected stdin, не в аргументи процесу; `Protect-BRAVOLogSe
 `finally`; SFTP-пароль очищається зі script-scope одразу після побудови
 URL.
 
+Добові `Trace_YYYYMMDD.mdz` і `exchangAPI_YYYYMMDD.mdz` — журнали самого продукту, а не
+toolkit: на SFTP вони вивантажуються лише зашифрованими паролем архівів (bare `-p`, пароль через
+stdin; без пароля блок Trace не виконується), тому маскування `Protect-BRAVOLogSecret` до них
+свідомо не застосовується (#417).
+
 Читання з Credential Manager повертає `SecureString`: декодування йде в
 `char[]` із посимвольним `AppendChar`, обидва масиви зануляються, а
 перетворення в плейнтекст зібрано в одну функцію
