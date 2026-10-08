@@ -593,10 +593,15 @@ function Write-BRAVOStateTemporaryText {
     # -IsCritical (служба піднята, прогін не провалений); Cyclic — CRITICAL без
     # -IsCritical; невдалий запуск впалої служби — текст StartFailed у
     # наявній CRITICAL-гілці (-IsCritical -> exit 60).
+    # Cyclic винесено в Send-BRAVOMaintenanceServiceCyclicAlert: її викликає
+    # і Recovered, і обидві гілки невдалого запуску (#314 A-2).
     $nightlyRecoveredFunction = & $nightlyFindFunction 'Send-BRAVOMaintenanceServiceRecoveredAlert'
-    $nightlyRecoveredAlerts = @(& $nightlyCommandCalls $nightlyRecoveredFunction 'Send-SlackAlert')
-    $nightlyRecoveredKinds = @(& $nightlyCommandCalls $nightlyRecoveredFunction 'New-BRAVOServiceRecoveryNotificationText' |
+    $nightlyCyclicFunction = & $nightlyFindFunction 'Send-BRAVOMaintenanceServiceCyclicAlert'
+    $nightlyRecoveredAlerts = @(@(& $nightlyCommandCalls $nightlyRecoveredFunction 'Send-SlackAlert') + @(& $nightlyCommandCalls $nightlyCyclicFunction 'Send-SlackAlert'))
+    $nightlyRecoveredKinds = @(@(& $nightlyCommandCalls $nightlyRecoveredFunction 'New-BRAVOServiceRecoveryNotificationText') +
+        @(& $nightlyCommandCalls $nightlyCyclicFunction 'New-BRAVOServiceRecoveryNotificationText') |
             ForEach-Object { & $nightlyParameterValue $_ 'Kind' })
+    $nightlyCyclicFromRecovered = @(& $nightlyCommandCalls $nightlyRecoveredFunction 'Send-BRAVOMaintenanceServiceCyclicAlert')
     $nightlyRecoveredSeverities = @($nightlyRecoveredAlerts | ForEach-Object { & $nightlyParameterValue $_ 'Severity' })
     $nightlyRecoveredCriticalFlags = @($nightlyRecoveredAlerts | Where-Object { $null -ne (& $nightlyParameterValue $_ 'IsCritical') })
     $nightlyStartFunction = & $nightlyFindFunction 'Start-BRAVOMaintenanceManagedService'
@@ -610,7 +615,9 @@ function Write-BRAVOStateTemporaryText {
             (@($nightlyRecoveredSeverities | Sort-Object) -join ',') -eq 'CRITICAL,WARNING' -and
             $nightlyRecoveredCriticalFlags.Count -eq 0 -and
             (@($nightlyRecoveredKinds | Sort-Object) -join ',') -eq 'Cyclic,Recovered' -and
-            $nightlyRecoveredFunction.Extent.Text.Contains('Register-BRAVOServiceRecoveryCriticalSent') -and
+            $null -ne $nightlyCyclicFunction -and
+            $nightlyCyclicFunction.Extent.Text.Contains('Register-BRAVOServiceRecoveryCriticalSent') -and
+            $nightlyCyclicFromRecovered.Count -eq 1 -and
             $nightlyStartFailedKinds -contains 'StartFailed' -and
             $nightlyRecoveredCallers.Count -ge 1
         ) `
@@ -1087,16 +1094,30 @@ function Resolve-BRAVOExitCode {
     if ($HasWarnings) { return 10 }
     return 0
 }
-function Get-BRAVOForeignServiceQuiescenceContext { return $script:W4Foreign }
+function Get-BRAVOForeignServiceQuiescenceContext {
+    # Перший виклик за прогін — до lock-а (A-3), далі — під lock-ом.
+    $script:W4ForeignCalls++
+    if ($script:W4ForeignCalls -eq 1 -and $null -ne $script:W4ForeignBeforeLock) { return $script:W4ForeignBeforeLock }
+    return $script:W4Foreign
+}
 function Write-BRAVOServiceQuiescenceState {
     param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot)
     if ($script:W4MarkerWriteFails) { throw 'self-test: маркер не записано' }
     $script:W4Events += @("MARKER $Owner " + (@($Services | ForEach-Object { '{0}={1}' -f $_.Name, [bool]$_.RestartIntent }) -join ','))
     $script:W4MarkerLogFile = $LogFile
+    # Маркер «на диску» для справжньої класифікації наступного тику.
+    $script:W4Marker = [pscustomobject]@{
+        schemaVersion = 1; owner = $Owner; hostname = [Environment]::MachineName; pid = 4343
+        processStartTime = '2026-10-07T10:00:00.0000000+03:00'; createdAt = '2026-10-07T10:00:01.0000000+03:00'
+        logFile = $LogFile; restartSuppressed = [bool]$RestartSuppressed
+        services = @($Services | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; RestartIntent = [bool]$_.RestartIntent } })
+        startTypeSnapshot = @()
+    }
 }
 function Clear-BRAVOServiceQuiescenceState {
     param($ExpectedState)
     $script:W4Events += @('CLEAR')
+    $script:W4Marker = $null
     return $true
 }
 function Invoke-ServiceStateChange {
@@ -1149,6 +1170,7 @@ function Invoke-W4Profile {
         $RecoveryState = $null,
         [bool]$LockBusy = $false,
         $Foreign = $null,
+        $ForeignBeforeLock = $null,
         [bool]$MarkerWriteFails = $false,
         [string[]]$StartFailures = @()
     )
@@ -1163,6 +1185,8 @@ function Invoke-W4Profile {
     $script:W4Foreign = if ($null -ne $Foreign) { $Foreign } else {
         [pscustomobject]@{ Present = $false; OwnerAlive = $false; Owner = $null; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
     }
+    $script:W4ForeignBeforeLock = $ForeignBeforeLock
+    $script:W4ForeignCalls = 0
     $script:W4MarkerWriteFails = $MarkerWriteFails
     $script:W4StartFailures = @($StartFailures)
     $script:W4Events = @()
@@ -1350,9 +1374,11 @@ function Get-BRAVOServiceRecoveryConditions {
         -Name 'ServiceRecovery/ProfileRaceSuppressedMarkerUnderLockStartsNothing' `
         -Failure "під lock-ом виявлено маркер із restartSuppressed: жодного запуску/зупинки/маркера, INFO з кодом 43, вихід 0, lock звільнено: $(& $w4Describe $w4Race)"
 
-    # Чужий живий власник маркера під lock-ом -> 20 без дій.
+    # Чужий живий власник маркера під lock-ом (маркер з'явився після
+    # перевірки до lock-а) -> 20 без дій.
     $w4LiveOwner = & $w4RunProfile @{
         Conditions = $w4ExchangeFailed
+        ForeignBeforeLock = [pscustomobject]@{ Present = $false; OwnerAlive = $false; Owner = $null; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
         Foreign = [pscustomobject]@{ Present = $true; OwnerAlive = $true; Owner = 'BRAVO_DATA_RESTORE'; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
     }
     Test-BRAVOCondition `
@@ -1363,6 +1389,27 @@ function Get-BRAVOServiceRecoveryConditions {
         ) `
         -Name 'ServiceRecovery/ProfileForeignLiveOwnerUnderLockExits20' `
         -Failure "чужий живий власник ownership-маркера: вихід 20 без дій: $(& $w4Describe $w4LiveOwner)"
+
+    # §9.5 (A-3): іде нічний Maintenance — його живий маркер робить зупинені
+    # ним служби OwnedByBravo. Профіль виходить 20 ще до швидкого виходу
+    # «впалих немає» (0): без lock-а, журналу, запису state і дій.
+    $w4NightlyRunning = & $w4RunProfile @{
+        Conditions = @(
+            (& $w4Cond 'Bravo' 'BRAVO' 'OwnedByBravo' 'Stopped'),
+            (& $w4Cond 'ExchangeApi' 'exchangAPI' 'OwnedByBravo' 'Stopped'),
+            (& $w4Cond 'BravoWeb' 'Apache2.4' 'OwnedByBravo' 'Stopped'))
+        RecoveryState = $w4StableState
+        Foreign = [pscustomobject]@{ Present = $true; OwnerAlive = $true; Owner = 'BRAVO_MAINTENANCE'; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4NightlyRunning.Error -and [int]$w4NightlyRunning.ExitCode -eq 20 -and
+            $null -eq $w4NightlyRunning.LockArgs -and [int]$w4NightlyRunning.LockExits -eq 0 -and
+            @($w4NightlyRunning.Events).Count -eq 0 -and @($w4NightlyRunning.LogCalls).Count -eq 0 -and
+            [int]$w4NightlyRunning.StateWrites -eq 0
+        ) `
+        -Name 'ServiceRecovery/ProfileForeignLiveOwnerExits20BeforeFastExit' `
+        -Failure "живий чужий ownership-маркер (нічний Maintenance): вихід 20 до класифікації «впалих немає», без lock-а, журналу RECOVER, запису state і дій (§9.5): $(& $w4Describe $w4NightlyRunning)"
 
     # Тест 6а: справжня класифікація з маркером restartSuppressed -> служба
     # OwnedByBravo -> профіль не бачить впалих і нічого не запускає.
@@ -1439,17 +1486,175 @@ function Get-BRAVOServiceRecoveryConditions {
         -Name 'ServiceRecovery/ProfileMarkerWriteFailureAbortsWith60' `
         -Failure "збій запису ownership-маркера: жодних зупинок/запусків, Send-SlackAlert -IsCritical, вихід 60: $(& $w4Describe $w4MarkerFails)"
 
-    # Невдалий запуск -> маркер лишається (Health-watchdog доспробує), вихід 60.
+    # Невдалий запуск (A-1) -> власний маркер знімається після фази запуску
+    # (служба, що лишилась зупиненою, — звичайна «впала» для наступного
+    # тику з паузою 0/5/15/60), звіт, вихід 60.
     $w4StartFails = & $w4RunProfile @{ Conditions = $w4ExchangeFailed; StartFailures = @('exchangAPI') }
+    $w4StartFailsActions = @($w4StartFails.Events | Where-Object { $_ -match '^(MARKER|START|CLEAR|REPORT)' })
     Test-BRAVOCondition `
         -Condition (
             $null -eq $w4StartFails.Error -and [int]$w4StartFails.ExitCode -eq 60 -and
-            @($w4StartFails.Events | Where-Object { $_ -eq 'START exchangAPI recovery=True' }).Count -eq 1 -and
-            @($w4StartFails.Events | Where-Object { $_ -eq 'CLEAR' }).Count -eq 0 -and
-            @($w4StartFails.Events | Where-Object { $_ -eq 'REPORT' }).Count -eq 1
+            ($w4StartFailsActions -join '; ') -ceq 'MARKER BRAVO_MAINTENANCE_RECOVER exchangAPI=True; START exchangAPI recovery=True; CLEAR; REPORT'
         ) `
-        -Name 'ServiceRecovery/ProfileStartFailureKeepsMarker' `
-        -Failure "невдалий запуск впалої служби: маркер не знімається, звіт надсилається, вихід 60: $(& $w4Describe $w4StartFails)"
+        -Name 'ServiceRecovery/ProfileStartFailureClearsOwnMarker' `
+        -Failure "невдалий запуск впалої служби: власний маркер BRAVO_MAINTENANCE_RECOVER знімається після фази запуску, звіт надсилається, вихід 60: $(& $w4Describe $w4StartFails)"
+
+    # §9.4 (A-1): після невдалого запуску наступний тик (пауза 5 хв минула)
+    # на справжній класифікації бачить службу «впалою» і робить спробу 2, а
+    # не класифікує її OwnedByBravo через власний маркер попереднього тику.
+    $w4RetryModule = & $w4NewModule ($w4ClassifyStubs + "`n" + $w4ProfileStubs + "`n" + $w4RuntimeText + "`n" + $w4ModuleText + "`n" + $w4SystemText) (
+        @('Read-BRAVOServiceQuiescenceState', 'Get-Service', 'Get-BRAVOWin32ServiceInfo') +
+        $w4ProfileStubNames +
+        @('Invoke-BRAVOMaintenanceServiceRecoveryProfile') + @($w4ModuleFunctions) +
+        @('Get-BRAVOManagedServiceCondition', 'Get-BRAVOServiceStartMode', 'Test-BRAVOServiceDisabledByOperator', 'Get-BRAVOManagedServiceOrder'))
+    $w4RetryError = $null
+    $w4RetryTick1 = $null
+    $w4RetryTick2 = $null
+    $w4RetryMarkerAfterTick1 = $null
+    try {
+        $w4RetryTick1 = & $w4RetryModule {
+            Set-StrictMode -Version 2.0
+            $script:W4Marker = $null
+            $script:W4MarkerReads = 0
+            $script:W4ServiceStatus = @{ BRAVO = 'Running'; exchangAPI = 'Stopped'; 'Apache2.4' = 'Running' }
+            Invoke-W4Profile -Conditions @() -StartFailures @('exchangAPI')
+        }
+        $w4RetryMarkerAfterTick1 = & $w4RetryModule { $script:W4Marker }
+        $w4RetryState = [pscustomobject]@{
+            schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+            services = @{ exchangAPI = [pscustomobject]@{ attempts = @((Get-Date).AddMinutes(-6).ToString('o')); lastCriticalAt = $null; stableSince = $null } }
+        }
+        $w4RetryTick2 = & $w4RetryModule {
+            param($RecoveryState)
+            Set-StrictMode -Version 2.0
+            $script:W4MarkerReads = 0
+            Invoke-W4Profile -Conditions @() -RecoveryState $RecoveryState
+        } $w4RetryState
+    } catch {
+        $w4RetryError = $_.Exception.Message
+    }
+    if ($null -eq $w4RetryTick1) { $w4RetryTick1 = [pscustomobject]@{ ExitCode = $null; Error = $w4RetryError; Events = @(); LogCalls = @(); LockArgs = $null; LockExits = 0; StateWrites = 0 } }
+    if ($null -eq $w4RetryTick2) { $w4RetryTick2 = [pscustomobject]@{ ExitCode = $null; Error = $w4RetryError; Events = @(); LogCalls = @(); LockArgs = $null; LockExits = 0; StateWrites = 0 } }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4RetryError -and $null -eq $w4RetryTick1.Error -and $null -eq $w4RetryTick2.Error -and
+            [int]$w4RetryTick1.ExitCode -eq 60 -and $null -eq $w4RetryMarkerAfterTick1 -and
+            @($w4RetryTick2.Events | Where-Object { $_ -eq 'START exchangAPI recovery=True' }).Count -eq 1 -and
+            [int]$w4RetryTick2.ExitCode -eq 0
+        ) `
+        -Name 'ServiceRecovery/ProfileRetriesAfterStartFailureNextTick' `
+        -Failure ("невдалий запуск exchangAPI, наступний тик після паузи 5 хв: служба знову «впала» (власний маркер знято), спроба 2 з обліком; маркер після тику 1 = $($null -ne $w4RetryMarkerAfterTick1). " +
+            "помилка='$w4RetryError' тик 1: $(& $w4Describe $w4RetryTick1) || тик 2: $(& $w4Describe $w4RetryTick2)")
+
+    # §9.4 (A-2): невдалий запуск 3-ї спроби за 24 год — CRITICAL «циклічно
+    # падає» (крім CRITICAL StartFailed) і lastCriticalAt у state; 4-та
+    # невдала спроба в тих самих 24 год — лише StartFailed. Справжні
+    # Start-BRAVOMaintenanceManagedService, облік спроб і тексти сповіщень.
+    $w4CyclicStubs = @'
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO', [switch]$NoConsole)
+    $script:A2Log += @("$Level|$Message")
+}
+function Send-SlackAlert {
+    param([string]$Message, [switch]$IsCritical, [string]$Severity)
+    $script:A2Slack += @("$Severity|$([bool]$IsCritical)|$Message")
+}
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    return [pscustomobject]@{ Name = $Name; Status = 'Stopped' }
+}
+function Invoke-ServiceStateChange {
+    param([string]$Name, [string]$DesiredStatus, [int]$TimeoutSeconds, [int]$PollIntervalSeconds, [switch]$Force)
+    return [pscustomobject]@{ Success = $false; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = 'Stopped'; Error = 'self-test: служба не стартувала' }
+}
+function Save-BRAVOMaintenanceServiceRecoveryState {
+    param([datetime]$Now)
+    $script:A2Saves++
+}
+function Invoke-A2Start {
+    param([string]$Key, [string]$Name, $State)
+    $script:A2Log = @()
+    $script:A2Slack = @()
+    $script:A2Saves = 0
+    $script:maintenanceServiceRecoveryState = $State
+    $script:criticalErrorOccurred = $false
+    $script:LOG_FILE = 'C:\BRAVO\LOGS\BRAVO_MAINTENANCE_20261007_101500_RECOVER_PID1234.log'
+    $script:ServiceStartTimeoutSeconds = 60
+    $script:ServicePollIntervalSeconds = 1
+    $outcome = @{ RestartFailed = $false }
+    $condition = [pscustomobject]@{ Name = $Name; Condition = 'Failed'; Status = 'Stopped'; ExitCode = 1067 }
+    $startError = $null
+    try {
+        Start-BRAVOMaintenanceManagedService -Key $Key -Name $Name -Outcome $outcome -RecoveryCondition $condition
+    } catch {
+        $startError = $_.Exception.Message
+    }
+    $entry = $null
+    if ($null -ne $script:maintenanceServiceRecoveryState) { $entry = $script:maintenanceServiceRecoveryState.services[$Name] }
+    return [pscustomobject]@{
+        Error = $startError
+        RestartFailed = [bool]$outcome.RestartFailed
+        Slack = @($script:A2Slack)
+        Saves = $script:A2Saves
+        LastCriticalAt = $(if ($null -ne $entry) { $entry.lastCriticalAt } else { $null })
+        Attempts = $(if ($null -ne $entry) { @($entry.attempts).Count } else { -1 })
+        State = $script:maintenanceServiceRecoveryState
+    }
+}
+'@
+    $w4CyclicModule = & $w4NewModule ($w4CyclicStubs + "`n" + $w4RuntimeText + "`n" + $w4ModuleText + "`n" + $w4SystemText) (
+        @(& $w4FunctionNamesIn $w4CyclicStubs) +
+        @('Start-BRAVOMaintenanceManagedService', 'Send-BRAVOMaintenanceServiceRecoveredAlert', 'Send-BRAVOMaintenanceServiceCyclicAlert',
+            'Register-BRAVOMaintenanceServiceRecoveryAttempt', 'Get-BRAVOMaintenanceServiceRecoveryState', 'Get-BRAVOMaintenanceServiceExitCodeText') +
+        @($w4ModuleFunctions) + @('Test-BRAVOServiceStartRequired'))
+    $w4CyclicResults = @{}
+    $w4CyclicError = $null
+    try {
+        foreach ($w4CyclicCase in @(@('Bravo', 'BRAVO'), @('ExchangeApi', 'exchangAPI'))) {
+            $w4CyclicState = [pscustomobject]@{
+                schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+                services = @{ ([string]$w4CyclicCase[1]) = [pscustomobject]@{
+                        attempts = @((Get-Date).AddMinutes(-90).ToString('o'), (Get-Date).AddMinutes(-80).ToString('o')); lastCriticalAt = $null; stableSince = $null } }
+            }
+            $w4CyclicThird = & $w4CyclicModule {
+                param($Key, $Name, $State)
+                Set-StrictMode -Version 2.0
+                Invoke-A2Start -Key $Key -Name $Name -State $State
+            } $w4CyclicCase[0] $w4CyclicCase[1] $w4CyclicState
+            $w4CyclicFourth = & $w4CyclicModule {
+                param($Key, $Name, $State)
+                Set-StrictMode -Version 2.0
+                Invoke-A2Start -Key $Key -Name $Name -State $State
+            } $w4CyclicCase[0] $w4CyclicCase[1] $w4CyclicThird.State
+            $w4CyclicResults[[string]$w4CyclicCase[0]] = @($w4CyclicThird, $w4CyclicFourth)
+        }
+    } catch {
+        $w4CyclicError = $_.Exception.Message
+    }
+    $w4CyclicDiffs = @()
+    if ($null -ne $w4CyclicError) { $w4CyclicDiffs += "помилка: $w4CyclicError" }
+    foreach ($w4CyclicKey in @('Bravo', 'ExchangeApi')) {
+        $w4CyclicPair = $w4CyclicResults[$w4CyclicKey]
+        if ($null -eq $w4CyclicPair) { $w4CyclicDiffs += "${w4CyclicKey}: немає результату"; continue }
+        $w4Third = $w4CyclicPair[0]
+        $w4Fourth = $w4CyclicPair[1]
+        $w4ThirdCyclic = @($w4Third.Slack | Where-Object { $_ -match '^CRITICAL\|False\|.*циклічно падає: 3 падінь' })
+        $w4ThirdStartFailed = @($w4Third.Slack | Where-Object { $_ -match '^\|True\|Не вдалося запустити службу .*Спроба 3 за добу' })
+        $w4FourthCyclic = @($w4Fourth.Slack | Where-Object { $_ -match 'циклічно падає' })
+        $w4FourthStartFailed = @($w4Fourth.Slack | Where-Object { $_ -match '^\|True\|Не вдалося запустити службу .*Спроба 4 за добу' })
+        if ($null -ne $w4Third.Error -or -not $w4Third.RestartFailed -or $w4ThirdCyclic.Count -ne 1 -or $w4ThirdStartFailed.Count -ne 1 -or
+            $null -eq $w4Third.LastCriticalAt -or [int]$w4Third.Attempts -ne 3) {
+            $w4CyclicDiffs += "${w4CyclicKey} спроба 3: помилка='$($w4Third.Error)' restartFailed=$($w4Third.RestartFailed) lastCriticalAt='$($w4Third.LastCriticalAt)' спроб=$($w4Third.Attempts) slack=[$(@($w4Third.Slack) -join ' || ')]"
+        }
+        if ($null -ne $w4Fourth.Error -or $w4FourthCyclic.Count -ne 0 -or $w4FourthStartFailed.Count -ne 1 -or [int]$w4Fourth.Attempts -ne 4) {
+            $w4CyclicDiffs += "${w4CyclicKey} спроба 4: помилка='$($w4Fourth.Error)' спроб=$($w4Fourth.Attempts) slack=[$(@($w4Fourth.Slack) -join ' || ')]"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($w4CyclicDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/StartFailureSendsCyclicCriticalOncePer24h' `
+        -Failure ("невдалий запуск впалої служби (BRAVO — гілка StartFailed, exchangAPI — catch): 3-тя спроба за 24 год — CRITICAL «циклічно падає» без -IsCritical разом із CRITICAL StartFailed і lastCriticalAt у state; 4-та — лише StartFailed. " +
+            ($w4CyclicDiffs -join ' | '))
 
     # ============================================================
     # Тест 5 (lock): -NoWait — одна спроба без Start-Sleep і без журналу;

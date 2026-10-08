@@ -31,6 +31,13 @@
   `ServiceRecovery/SchedulerNodeDerivedIdenticallyInDerivationAndLoader`, `ServiceRecovery/Health*` (6),
   `ServiceRecovery/ChainPlanBravoInPauseHoldsDependents`, `ServiceRecovery/ProfileBravoInPauseHoldsDependentsWithoutLock`,
   `Config/ServiceRecoveryDerived` (Windows).
+  Виправлення за рев'ю PR #429: профіль `-RecoverServices` знімає власний маркер `BRAVO_MAINTENANCE_RECOVER` і після
+  невдалого запуску — служба, що лишилась зупиненою, наступного тику знову «впала», і спроби тривають за паузами
+  0/5/15/60 хв (раніше маркер робив її `OwnedByBravo`, і профіль більше не повторював спроб); CRITICAL «циклічно
+  падає» (не частіше разу на 24 год, `lastCriticalAt`) надсилається і коли запуск не вдався; маркер живого чужого
+  власника (нічний Maintenance, DataRestore) → вихід 20 ще до швидкого виходу «впалих немає». Тести:
+  `ServiceRecovery/ProfileStartFailureClearsOwnMarker`, `ServiceRecovery/ProfileRetriesAfterStartFailureNextTick`,
+  `ServiceRecovery/StartFailureSendsCyclicCriticalOncePer24h`, `ServiceRecovery/ProfileForeignLiveOwnerExits20BeforeFastExit`.
 
 - **Feature: профіль відновлення впалих служб `BRAVO_MAINTENANCE.ps1 -RecoverServices` (#314, хвиля 4, FR-3).**
   Новий перемикач запускає не обслуговування, а легкий профіль: класифікація керованих служб без lock-а

@@ -1302,12 +1302,32 @@ function Register-BRAVOMaintenanceServiceRecoveryAttempt {
     return $recoveryAttempt
 }
 
+function Send-BRAVOMaintenanceServiceCyclicAlert {
+    # FR-6: за CyclicAlertDue спроби (3-тя спроба за 24 год, далі не частіше
+    # разу на добу) — CRITICAL «циклічно падає» без -IsCritical, і момент
+    # надсилання фіксується в state (lastCriticalAt). Викликається після
+    # будь-якого результату спроби запуску — і успішного (разом із
+    # Recovered), і невдалого (разом із StartFailed, #314 A-2).
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()][object]$Condition,
+        [Parameter(Mandatory = $true)][object]$Attempt
+    )
+
+    if (-not [bool]$Attempt.CyclicAlertDue) { return }
+    $cyclicNow = Get-Date
+    $cyclicText = New-BRAVOServiceRecoveryNotificationText -Kind 'Cyclic' -ServiceName $Name -Condition $Condition -AttemptNumber ([int]$Attempt.AttemptNumber) -LogPath $LOG_FILE -FirstAttemptAt $Attempt.FirstAttemptAt -Now $cyclicNow
+    Write-Log -Message $cyclicText -Level "ERROR"
+    Send-SlackAlert -Message $cyclicText -Severity 'CRITICAL'
+    $script:maintenanceServiceRecoveryState = Register-BRAVOServiceRecoveryCriticalSent -State $script:maintenanceServiceRecoveryState -ServiceName $Name -Now $cyclicNow
+    Save-BRAVOMaintenanceServiceRecoveryState -Now $cyclicNow
+}
+
 function Send-BRAVOMaintenanceServiceRecoveredAlert {
     # FR-6: впалу службу запущено. Recovered — WARNING без -IsCritical
     # (служба піднята, прогін не провалений, exit code не змінюється);
-    # за CyclicAlertDue (3-тя спроба за 24 год, далі не частіше разу на
-    # добу) — CRITICAL «циклічно падає», теж без -IsCritical, і момент
-    # надсилання фіксується в state (lastCriticalAt).
+    # далі — CRITICAL «циклічно падає», коли настав його час
+    # (Send-BRAVOMaintenanceServiceCyclicAlert).
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [AllowNull()][object]$Condition,
@@ -1318,14 +1338,7 @@ function Send-BRAVOMaintenanceServiceRecoveredAlert {
 
     $recoveredText = New-BRAVOServiceRecoveryNotificationText -Kind 'Recovered' -ServiceName $Name -Condition $Condition -AttemptNumber ([int]$Attempt.AttemptNumber) -LogPath $LOG_FILE -LastScmEvent $LastScmEvent
     Send-SlackAlert -Message $recoveredText -Severity 'WARNING'
-    if ([bool]$Attempt.CyclicAlertDue) {
-        $cyclicNow = Get-Date
-        $cyclicText = New-BRAVOServiceRecoveryNotificationText -Kind 'Cyclic' -ServiceName $Name -Condition $Condition -AttemptNumber ([int]$Attempt.AttemptNumber) -LogPath $LOG_FILE -FirstAttemptAt $Attempt.FirstAttemptAt -Now $cyclicNow
-        Write-Log -Message $cyclicText -Level "ERROR"
-        Send-SlackAlert -Message $cyclicText -Severity 'CRITICAL'
-        $script:maintenanceServiceRecoveryState = Register-BRAVOServiceRecoveryCriticalSent -State $script:maintenanceServiceRecoveryState -ServiceName $Name -Now $cyclicNow
-        Save-BRAVOMaintenanceServiceRecoveryState -Now $cyclicNow
-    }
+    Send-BRAVOMaintenanceServiceCyclicAlert -Name $Name -Condition $Condition -Attempt $Attempt
 }
 
 function Stop-BRAVOMaintenanceManagedService {
@@ -1579,9 +1592,9 @@ function Start-BRAVOMaintenanceManagedService {
     # Health-watchdog доспробує підняти службу).
     # -RecoveryCondition (#314 хвиля 3): служба впала до обслуговування
     # (класифікація Get-BRAVOManagedServiceCondition на старті). Спроба її
-    # запуску рахується в state; успіх -> INFO + WARNING Recovered (+ CRITICAL
-    # «циклічно падає»), невдача -> та сама CRITICAL-гілка з текстом
-    # StartFailed («після падіння (ExitCode N)»).
+    # запуску рахується в state; успіх -> INFO + WARNING Recovered, невдача ->
+    # та сама CRITICAL-гілка з текстом StartFailed («після падіння (ExitCode
+    # N)»); в обох випадках за CyclicAlertDue — CRITICAL «циклічно падає».
     param(
         [Parameter(Mandatory = $true)][ValidateSet('Bravo', 'ExchangeApi', 'BravoWeb')][string]$Key,
         [Parameter(Mandatory = $true)][string]$Name,
@@ -1595,6 +1608,7 @@ function Start-BRAVOMaintenanceManagedService {
     $isBravoWeb = ($Key -eq 'BravoWeb')
     $isRecovery = ($null -ne $RecoveryCondition)
     $recoveryAttempt = $null
+    $recoveryStartSucceeded = $false
     try {
         $serviceStatus = if ($Key -eq 'Bravo') {
             [string](Get-Service -Name $Name).Status
@@ -1617,6 +1631,7 @@ function Start-BRAVOMaintenanceManagedService {
                     $script:bravoServiceStartedThisRun = $true
                 }
                 if ($isRecovery) {
+                    $recoveryStartSucceeded = $true
                     Write-Log -Message "Служба $Name була зупинена до обслуговування ($(Get-BRAVOMaintenanceServiceExitCodeText -Condition $RecoveryCondition)), запущена" -Level "INFO"
                     Send-BRAVOMaintenanceServiceRecoveredAlert -Name $Name -Condition $RecoveryCondition -Attempt $recoveryAttempt -LastScmEvent $LastScmEvent
                 }
@@ -1630,6 +1645,9 @@ function Start-BRAVOMaintenanceManagedService {
                 Send-SlackAlert -Message $errorMsg -IsCritical
                 $script:criticalErrorOccurred = $true
                 $Outcome.RestartFailed = $true
+                if ($isRecovery) {
+                    Send-BRAVOMaintenanceServiceCyclicAlert -Name $Name -Condition $RecoveryCondition -Attempt $recoveryAttempt
+                }
             } else {
                 throw $serviceResult.Error
             }
@@ -1658,6 +1676,11 @@ function Start-BRAVOMaintenanceManagedService {
         Send-SlackAlert -Message $errorMsg -IsCritical
         $script:criticalErrorOccurred = $true
         $Outcome.RestartFailed = $true
+        # Спробу вже обліковано, а запуск не вдався — та сама перевірка
+        # «циклічно падає», що й після успіху (#314 A-2).
+        if ($isRecovery -and $null -ne $recoveryAttempt -and -not $recoveryStartSucceeded) {
+            Send-BRAVOMaintenanceServiceCyclicAlert -Name $Name -Condition $RecoveryCondition -Attempt $recoveryAttempt
+        }
     }
 }
 
@@ -1793,6 +1816,16 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
     # finally runtime) йому не потрібне.
     $script:maintenanceOwnLogUploadAttempted = $true
     $recoveryServices = @(Get-BRAVOMaintenanceServiceRecoveryServices)
+
+    # 0. Живий чужий ownership-маркер (нічний Maintenance, DataRestore) —
+    # його робота ще йде, а зупинені ним служби класифікуються OwnedByBravo.
+    # Вихід 20 (§9.5) ще до швидкого виходу «впалих немає» (0): без lock-а,
+    # журналу, змін і сповіщень. Під lock-ом (крок 4) перевірка повторюється.
+    $liveForeignQuiescence = Get-BRAVOForeignServiceQuiescenceContext
+    if ($liveForeignQuiescence.Present -and $liveForeignQuiescence.OwnerAlive) {
+        Write-Host "Відновлення служб відкладено: ownership-маркер належить живому процесу $($liveForeignQuiescence.Owner) — наступна перевірка повторить" -ForegroundColor Yellow
+        return (Resolve-BRAVOExitCode -LockBusy)
+    }
 
     # 1. Класифікація без lock-а. Немає впалих — вихід 0 без запису на диск
     # (журнал RECOVER не створюється); єдиний дозволений запис — state, коли
@@ -1991,20 +2024,26 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
                 -RecoveryCondition $startRecoveryCondition -LastScmEvent $lastScmEvent[$startName]
         }
 
-        # 11. Маркер знімається лише коли всі запуски вдалися; інакше лишається
-        # — Health-watchdog доспробує підняти служби.
-        if (-not $recoveryStartOutcome.RestartFailed) {
-            try {
-                if (Clear-BRAVOServiceQuiescenceState) {
-                    Write-Log -Message "Ownership-маркер BRAVO_MAINTENANCE_RECOVER знято: служби запущено" -Level "INFO"
-                } else {
-                    Write-Log -Message "Ownership-маркер уже належить іншому власнику — залишено без змін" -Level "WARNING"
-                }
-            } catch {
-                Write-Log -Message "Не вдалося зняти ownership-маркер BRAVO_MAINTENANCE_RECOVER: $($_.Exception.Message) — його відпрацює Health-watchdog" -Level "WARNING"
-            }
+        # 11. Власний маркер знімається після фази запуску за будь-якого
+        # результату (#314 A-1): кожну службу плану вже спробували запустити.
+        # Служба, що лишилась зупиненою, — звичайна «впала» для наступного
+        # тику (паузи 0/5/15/60 хв, CRITICAL «циклічно падає»); лишений маркер
+        # робив би її OwnedByBravo, і профіль більше не повторював би спроб.
+        # Маркер профілю, що аварійно завершився посеред зупинок/запусків,
+        # як і раніше відпрацьовує Health-watchdog.
+        $markerClearedText = if ($recoveryStartOutcome.RestartFailed) {
+            'не всі служби запущено — наступна перевірка повторить спробу після паузи'
         } else {
-            Write-Log -Message "Не всі служби запущено — ownership-маркер BRAVO_MAINTENANCE_RECOVER залишено: Health-watchdog доспробує підняти служби" -Level "INFO"
+            'служби запущено'
+        }
+        try {
+            if (Clear-BRAVOServiceQuiescenceState) {
+                Write-Log -Message "Ownership-маркер BRAVO_MAINTENANCE_RECOVER знято: $markerClearedText" -Level "INFO"
+            } else {
+                Write-Log -Message "Ownership-маркер уже належить іншому власнику — залишено без змін" -Level "WARNING"
+            }
+        } catch {
+            Write-Log -Message "Не вдалося зняти ownership-маркер BRAVO_MAINTENANCE_RECOVER: $($_.Exception.Message) — його відпрацює Health-watchdog" -Level "WARNING"
         }
         $recoveryExitCode = Get-BRAVOMaintenanceResolvedExitCode
         Write-Log -Message "=== ВІДНОВЛЕННЯ СЛУЖБ ЗАВЕРШЕНО (код $recoveryExitCode) ==="
