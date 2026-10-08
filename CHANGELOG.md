@@ -106,6 +106,19 @@
   Дубль WMI-запиту `Win32_Service` у `BRAVO.System` (R379-3) замінено одним приватним `Get-BRAVOServiceWin32Info`
   поверх `Get-BRAVOWmiInstance`, який використовують `Get-BRAVOServiceStartMode` і `Get-BRAVOManagedServiceCondition`.
 
+- **Perf: проби loader-а в self-test ConfigLoader виконуються в одному дочірньому процесі.**
+  84 проби `Import-BravoConfiguration` (local-config, BusyWait/SuccessDedup/storage-switch, intent-матриця, parity,
+  security-downgrade, PrimaryStrictness, атомарність, PostUpdate/Malformed) раніше запускали окремий `powershell.exe`
+  кожна. Тепер `Invoke-BRAVOConfigLoaderProbe` передає текст проби одному дочірньому раннеру, який виконує кожну
+  пробу у свіжому runspace (`[runspacefactory]::CreateRunspace()`), пише результат в окремий файл і після кожної
+  проби відновлює змінні середовища й поточний каталог. Проба без результату дає маркер
+  `BRAVO-CONFIGLOADER-PROBE-NO-RESULT`, і її перевірка FAIL (fail-closed). Імена перевірок не змінились; у трьох
+  місцях, де умова могла б пройти й без виводу (`NoHintOnSupportedEnvironment`, `IntentMatrix*`,
+  `DiagnosticsNeverRejectConfiguration`), її доповнено вимогою наявності результату. Окремими процесами лишились
+  `BRAVO_DRY_RUN.ps1`, `Invoke-BRAVOSelfTestEffectiveSnapshotCapture` і `deploy\Get-BRAVOConfigSiteDelta.ps1`
+  (важить код виходу). Нова перевірка `ConfigLoader/ProbesShareOneChildProcess` звіряє кількість проб і результатів,
+  один PID раннера (не батьківський) і відсутність витоку канарок (глобальної змінної й змінної середовища) між
+  пробами. Production-код не змінено.
 - **Hardening: придатність сесій архівів реставрації перевіряється й тоді, коли сесій не більше за `ArchivesKeepCount` (#424).**
   Повторну перевірку сесій (SHA512 + `7z t`) і всю діагностику придатності виконує лише retention
   (`Remove-OldRestoreArchives`), а Main запускав його тільки тоді, коли сесій більше за `Restore.ArchivesKeepCount`.
