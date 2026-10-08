@@ -2481,6 +2481,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         @{ Kind = 'RuntimeGenerated'; Target = 'BRAVO_VERSION_STATE.json' },
         @{ Kind = 'RuntimeGenerated'; Target = 'BRAVO_VSS_OWNERSHIP.json' },
         @{ Kind = 'RuntimeGenerated'; Target = 'BRAVO_SERVICE_RECOVERY_STATE.json' },
+        @{ Kind = 'RuntimeGenerated'; Target = 'BRAVO_RESTORE_STATE.json' },
         @{ Kind = 'RuntimeGenerated'; Target = '.bravo-sync.json' },
         # Маніфест релізного артефакта, створює ci/New-BRAVOReleaseArtifact.ps1.
         @{ Kind = 'RuntimeGenerated'; Target = 'release-manifest.json' }
