@@ -1309,10 +1309,20 @@ function Register-BRAVOMaintenanceServiceRecoveryAttempt {
 
 function Send-BRAVOMaintenanceServiceCyclicAlert {
     # FR-6: за CyclicAlertDue спроби (3-тя спроба за 24 год, далі не частіше
-    # разу на добу) — CRITICAL «циклічно падає» без -IsCritical, і момент
-    # надсилання фіксується в state (lastCriticalAt). Викликається після
-    # будь-якого результату спроби запуску — і успішного (разом із
+    # разу на добу) — CRITICAL «циклічно падає» без -IsCritical. Викликається
+    # після будь-якого результату спроби запуску — і успішного (разом із
     # Recovered), і невдалого (разом із StartFailed, #314 A-2).
+    # lastCriticalAt (придушення на 24 год) фіксується лише після
+    # ПІДТВЕРДЖЕНОЇ доставки (рев'ю PR #429): Send-SlackAlert лише ставить
+    # CRITICAL у чергу NotificationAlertQueue, а доставляє її
+    # Send-BRAVOMaintenanceEarlyExitAlerts (профіль) або Send-FinalReport
+    # (нічний прогін). Тому запис черги позначається ServiceRecoveryCyclic, і
+    # lastCriticalAt ставить Confirm-BRAVOMaintenanceServiceCyclicAlertDelivery
+    # після успішного webhook; збій доставки нічого не фіксує — наступна
+    # спроба запуску надішле CRITICAL знову. Якщо запис у чергу не потрапив,
+    # сповіщення свідомо вимкнено оператором (режим none або маршрут CRITICAL
+    # none): lastCriticalAt фіксується одразу, щоб рядок ERROR у журналі
+    # повторювався раз на добу, а не на кожній спробі.
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [AllowNull()][object]$Condition,
@@ -1323,9 +1333,43 @@ function Send-BRAVOMaintenanceServiceCyclicAlert {
     $cyclicNow = Get-Date
     $cyclicText = New-BRAVOServiceRecoveryNotificationText -Kind 'Cyclic' -ServiceName $Name -Condition $Condition -AttemptNumber ([int]$Attempt.AttemptNumber) -LogPath $LOG_FILE -FirstAttemptAt $Attempt.FirstAttemptAt -Now $cyclicNow
     Write-Log -Message $cyclicText -Level "ERROR"
+    # Без if-виразу: присвоєння з конвеєра розгорнуло б List (порожній — у $null).
+    $alertQueue = $null
+    $alertQueueVariable = Get-Variable -Name NotificationAlertQueue -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $alertQueueVariable) { $alertQueue = $alertQueueVariable.Value }
+    $queuedBefore = -1
+    if ($null -ne $alertQueue) { $queuedBefore = $alertQueue.Count }
     Send-SlackAlert -Message $cyclicText -Severity 'CRITICAL'
+    if ($queuedBefore -ge 0 -and $alertQueue.Count -gt $queuedBefore) {
+        Add-Member -InputObject $alertQueue[$alertQueue.Count - 1] -NotePropertyName 'ServiceRecoveryCyclic' `
+            -NotePropertyValue ([pscustomobject]@{ ServiceName = $Name; SentAt = $cyclicNow }) -Force
+        return
+    }
     $script:maintenanceServiceRecoveryState = Register-BRAVOServiceRecoveryCriticalSent -State $script:maintenanceServiceRecoveryState -ServiceName $Name -Now $cyclicNow
     Save-BRAVOMaintenanceServiceRecoveryState -Now $cyclicNow
+}
+
+function Confirm-BRAVOMaintenanceServiceCyclicAlertDelivery {
+    # Викликається після УСПІШНОЇ доставки сповіщення
+    # (Send-BRAVOMaintenanceEarlyExitAlerts / Send-FinalReport) з доставленими
+    # записами черги, позначеними ServiceRecoveryCyclic: фіксує lastCriticalAt
+    # моментом постановки CRITICAL у чергу і зберігає state (рев'ю PR #429).
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$DeliveredAlerts)
+
+    $confirmedAt = $null
+    foreach ($deliveredAlert in @($DeliveredAlerts)) {
+        if ($null -eq $deliveredAlert) { continue }
+        $cyclicProperty = $deliveredAlert.PSObject.Properties['ServiceRecoveryCyclic']
+        if ($null -eq $cyclicProperty -or $null -eq $cyclicProperty.Value) { continue }
+        $script:maintenanceServiceRecoveryState = Register-BRAVOServiceRecoveryCriticalSent `
+            -State (Get-BRAVOMaintenanceServiceRecoveryState) `
+            -ServiceName ([string]$cyclicProperty.Value.ServiceName) `
+            -Now ([datetime]$cyclicProperty.Value.SentAt)
+        $confirmedAt = Get-Date
+    }
+    if ($null -ne $confirmedAt) {
+        Save-BRAVOMaintenanceServiceRecoveryState -Now $confirmedAt
+    }
 }
 
 function Send-BRAVOMaintenanceServiceRecoveredAlert {
@@ -3719,6 +3763,12 @@ function Send-BRAVOMaintenanceEarlyExitAlerts {
             -LogPath $LOG_FILE
         Invoke-NotificationWebhook -Message $earlyExitMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
         Write-Log "Сповіщення про дострокове завершення ($Reason) відправлено в $NotificationProviderDisplayName" -Level "INFO"
+        # #314 (рев'ю PR #429): CRITICAL «циклічно падає» доставлено — лише
+        # тепер lastCriticalAt.
+        $deliveredCyclicAlerts = @($pendingQueue | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['ServiceRecoveryCyclic'] })
+        if ($deliveredCyclicAlerts.Count -gt 0) {
+            Confirm-BRAVOMaintenanceServiceCyclicAlertDelivery -DeliveredAlerts $deliveredCyclicAlerts
+        }
     }
     catch {
         Write-Log "ПОМИЛКА відправки сповіщення про дострокове завершення ($Reason): $($_.Exception.Message)" -Level "ERROR"
@@ -8853,6 +8903,13 @@ function Send-FinalReport {
     try {
         Invoke-NotificationWebhook -Message $notificationMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
         Write-Log -Message "Фінальне повідомлення відправлено в $NotificationProviderDisplayName" -Level "SUCCESS"
+        # #314 (рев'ю PR #429): звіт містить усю чергу до знімка — доставлені
+        # CRITICAL «циклічно падає» отримують lastCriticalAt лише тепер.
+        $deliveredCyclicAlerts = @($script:NotificationAlertQueue | Select-Object -First $finalReportAlertQueueSnapshot |
+                Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['ServiceRecoveryCyclic'] })
+        if ($deliveredCyclicAlerts.Count -gt 0) {
+            Confirm-BRAVOMaintenanceServiceCyclicAlertDelivery -DeliveredAlerts $deliveredCyclicAlerts
+        }
     }
     catch {
         $errorDetails = $_.Exception.Message
