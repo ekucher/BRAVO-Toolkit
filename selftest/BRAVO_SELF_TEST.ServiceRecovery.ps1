@@ -147,6 +147,40 @@ function Write-BRAVOStateTemporaryText {
         -Name 'ServiceRecovery/FailedMeansFailedAndStopped' `
         -Failure "«впала» = Condition Failed І Status Stopped (Paused/Disabled/OwnedByBravo/Running/null — ні); розбіжності: [$($recoveryFailedMismatches -join ', ')] null=$recoveryFailedNull"
 
+    # Рев'ю PR #429 (fail-closed): тип запуску не визначено (ServiceController
+    # без StartType на .NET < 4.6.1 і WMI недоступний -> StartMode Unknown) —
+    # служба могла бути вимкнена оператором, тож вона не кандидат на
+    # автоматичне відновлення; класифікатор BRAVO.System (Health хвилі 1) не
+    # змінюється. Відомий тип запуску (Automatic/Manual) — як і раніше.
+    $recoveryUnknownError = $null
+    $recoveryUnknown = $null
+    try {
+        $recoveryUnknown = & $recoveryModule {
+            Set-StrictMode -Version 2.0
+            $make = { param([string]$StartMode) [pscustomobject]@{ Name = 'exchangAPI'; Condition = 'Failed'; Status = 'Stopped'; StartMode = $StartMode } }
+            return [pscustomobject]@{
+                UnknownFailed = [bool](Test-BRAVOServiceRecoveryFailed -Condition (& $make 'Unknown'))
+                EmptyFailed = [bool](Test-BRAVOServiceRecoveryFailed -Condition (& $make ''))
+                ManualFailed = [bool](Test-BRAVOServiceRecoveryFailed -Condition (& $make 'Manual'))
+                AutomaticFailed = [bool](Test-BRAVOServiceRecoveryFailed -Condition (& $make 'Automatic'))
+                UnknownFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition (& $make 'Unknown'))
+                ManualFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition (& $make 'Manual'))
+                RunningUnknownFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition ([pscustomobject]@{ Name = 'BRAVO'; Condition = 'Running'; Status = 'Running'; StartMode = 'Unknown' }))
+            }
+        }
+    } catch {
+        $recoveryUnknownError = $_.Exception.Message
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $recoveryUnknownError -and $null -ne $recoveryUnknown -and
+            -not $recoveryUnknown.UnknownFailed -and -not $recoveryUnknown.EmptyFailed -and
+            $recoveryUnknown.ManualFailed -and $recoveryUnknown.AutomaticFailed -and
+            $recoveryUnknown.UnknownFlag -and -not $recoveryUnknown.ManualFlag -and -not $recoveryUnknown.RunningUnknownFlag
+        ) `
+        -Name 'ServiceRecovery/UnknownStartModeIsNotRecoveryCandidate' `
+        -Failure "зупинена служба з невідомим типом запуску (StartMode Unknown/порожній) — не «впала» для відновлення (Test-BRAVOServiceRecoveryFailed=`$false, Test-BRAVOServiceRecoveryStartModeUnknown=`$true); Automatic/Manual — «впала». помилка='$recoveryUnknownError' результат=[$(if ($null -ne $recoveryUnknown) { ($recoveryUnknown.PSObject.Properties | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value }) -join ' ' })]"
+
     # ============================================================
     # Тест 3: паузи, ковзне вікно, скидання після 30 хв стабільності,
     # нічний прогін ігнорує паузу, але рахує спробу.
@@ -822,6 +856,17 @@ function Write-BRAVOStateTemporaryText {
                     (& $c 'Bravo' 'BRAVO' 'Running' 'Running'),
                     (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped')))
             $result.Empty = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @())
+            # Рев'ю PR #429: впала BRAVO, пауза якої минула, не тягне впалу
+            # залежну в її власній паузі (не запускається, не обліковується);
+            # працюючу залежну, як і раніше, зупиняє і перезапускає ланцюг.
+            $result.BravoFailedDependentInPause = & $describe (Get-BRAVOServiceRecoveryChainPlan -EligibleNames @('BRAVO') -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Running' 'Running')))
+            $result.BravoFailedDependentEligible = & $describe (Get-BRAVOServiceRecoveryChainPlan -EligibleNames @('BRAVO', 'exchangAPI') -Conditions @(
+                    (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+                    (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+                    (& $c 'BravoWeb' 'Apache2.4' 'Failed' 'Stopped')))
             return [pscustomobject]$result
         }
     } catch {
@@ -890,6 +935,14 @@ function Write-BRAVOStateTemporaryText {
     Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
         -Name 'ServiceRecovery/ChainPlanBravoInPauseHoldsDependents' `
         -Failure "впала BRAVO у паузі: впалі залежні не запускаються і не обліковуються (HeldByBravoNames), працюючі не зупиняються; при працюючій BRAVO залежна — за своєю паузою: $($w4ChainDiffs -join ' || ')"
+
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            BravoFailedDependentInPause = 'failed: BRAVO | stop: Apache2.4 | start: BRAVO Apache2.4 | deferred:  | accounted: BRAVO'
+            BravoFailedDependentEligible = 'failed: BRAVO exchangAPI | stop:  | start: BRAVO exchangAPI | deferred:  | accounted: BRAVO exchangAPI'
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanBravoFailedHonorsDependentPause' `
+        -Failure "впала BRAVO (пауза минула): впала залежна запускається й обліковується лише коли минула її власна пауза (-EligibleNames); працюючі залежні зупиняються і запускаються ланцюгом: $($w4ChainDiffs -join ' || ')"
 
     $w4ModuleAst = [Management.Automation.Language.Parser]::ParseInput($w4ModuleText, [ref]$null, [ref]$null)
     $w4ChainFunction = @($w4ModuleAst.FindAll({
@@ -1546,6 +1599,96 @@ function Get-BRAVOServiceRecoveryConditions {
         -Failure ("невдалий запуск exchangAPI, наступний тик після паузи 5 хв: служба знову «впала» (власний маркер знято), спроба 2 з обліком; маркер після тику 1 = $($null -ne $w4RetryMarkerAfterTick1). " +
             "помилка='$w4RetryError' тик 1: $(& $w4Describe $w4RetryTick1) || тик 2: $(& $w4Describe $w4RetryTick2)")
 
+    # Рев'ю PR #429: BRAVO не запустилась — залежні (exchangAPI, BRAVO Web)
+    # у цьому тику не запускаються і не обліковуються (без BRAVO вони не
+    # працюють); наступна перевірка повторить ланцюг після паузи BRAVO.
+    $w4BravoStartFailedRun = & $w4RunProfile @{ Conditions = $w4BravoFailed; StartFailures = @('BRAVO') }
+    $w4BravoAndExchangeFailed = @(
+        (& $w4Cond 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
+        (& $w4Cond 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
+        (& $w4Cond 'BravoWeb' 'Apache2.4' 'Running' 'Running'))
+    $w4BravoStartFailedWithDependent = & $w4RunProfile @{ Conditions = $w4BravoAndExchangeFailed; StartFailures = @('BRAVO') }
+    $w4DependentStarts = {
+        param($Result)
+        @($Result.Events | Where-Object { $_ -match '^START (exchangAPI|Apache2\.4) ' })
+    }
+    $w4DeferLogs = {
+        param($Result)
+        @($Result.LogCalls | Where-Object { $_ -match 'відкладено' -and $_ -match 'BRAVO не запустилась' })
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4BravoStartFailedRun.Error -and [int]$w4BravoStartFailedRun.ExitCode -eq 60 -and
+            @($w4BravoStartFailedRun.Events | Where-Object { $_ -eq 'START BRAVO recovery=True' }).Count -eq 1 -and
+            @(& $w4DependentStarts $w4BravoStartFailedRun).Count -eq 0 -and @(& $w4DeferLogs $w4BravoStartFailedRun).Count -eq 2 -and
+            @($w4BravoStartFailedRun.Events | Where-Object { $_ -eq 'CLEAR' }).Count -eq 1 -and
+            $null -eq $w4BravoStartFailedWithDependent.Error -and [int]$w4BravoStartFailedWithDependent.ExitCode -eq 60 -and
+            @(& $w4DependentStarts $w4BravoStartFailedWithDependent).Count -eq 0 -and @(& $w4DeferLogs $w4BravoStartFailedWithDependent).Count -eq 2
+        ) `
+        -Name 'ServiceRecovery/ProfileDefersDependentsWhenBravoStartFails' `
+        -Failure ("BRAVO не запустилась (-RecoverServices): exchangAPI і BRAVO Web не запускаються (і впала exchangAPI не обліковується — Start-BRAVOMaintenanceManagedService не викликається), рядок «запуск відкладено: BRAVO не запустилась» на кожну, маркер знято, вихід 60. " +
+            "працюючі залежні: $(& $w4Describe $w4BravoStartFailedRun) відкладено=[$(@(& $w4DeferLogs $w4BravoStartFailedRun) -join ' || ')] || впала exchangAPI: $(& $w4Describe $w4BravoStartFailedWithDependent)")
+
+    # Рев'ю PR #429 (fail-closed): зупинена служба з невідомим типом запуску
+    # профіль не запускає — без lock-а і журналу RECOVER, рядок у зведенні
+    # (повторюється не частіше разу на добу — Add-BRAVOServiceRecoverySummaryLine).
+    $w4UnknownExchange = & $w4Cond 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'
+    $w4UnknownExchange.StartMode = 'Unknown'
+    $w4UnknownExchange.StartModeSource = 'None'
+    $w4UnknownRun = & $w4RunProfile @{ Conditions = @((& $w4Cond 'Bravo' 'BRAVO' 'Running' 'Running'), $w4UnknownExchange, (& $w4Cond 'BravoWeb' 'Apache2.4' 'Running' 'Running')) }
+    $w4UnknownSummary = @($w4UnknownRun.Events | Where-Object { $_ -match '^SUMMARY .*exchangAPI.*тип запуску' })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4UnknownRun.Error -and [int]$w4UnknownRun.ExitCode -eq 0 -and $null -eq $w4UnknownRun.LockArgs -and
+            @($w4UnknownRun.Events | Where-Object { $_ -match '^(START|STATE|MARKER)' }).Count -eq 0 -and
+            $w4UnknownSummary.Count -eq 1 -and @($w4UnknownRun.HostLines | Where-Object { $_ -match 'exchangAPI.*тип запуску' }).Count -ge 1
+        ) `
+        -Name 'ServiceRecovery/ProfileSkipsUnknownStartMode' `
+        -Failure ("зупинена служба з невідомим типом запуску (StartMode Unknown): профіль не запускає її (вихід 0, без lock-а, маркера і запуску), попередження в зведенні й консолі. $(& $w4Describe $w4UnknownRun)")
+
+    # Рев'ю PR #429: стабільність кожної працюючої служби обліковується
+    # незалежно від інших — exchangAPI працює 30+ хв, поки BRAVO Web лежить
+    # (у паузі): облік exchangAPI скидається, облік BRAVO Web — ні.
+    $w4IndependentState = [pscustomobject]@{
+        schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+        services = @{
+            exchangAPI = [pscustomobject]@{ attempts = @((Get-Date).AddMinutes(-90).ToString('o')); lastCriticalAt = $null; stableSince = (Get-Date).AddMinutes(-31).ToString('o') }
+            'Apache2.4' = [pscustomobject]@{ attempts = @((Get-Date).AddMinutes(-2).ToString('o')); lastCriticalAt = $null; stableSince = $null }
+        }
+    }
+    $w4IndependentRun = & $w4RunProfile @{
+        Conditions = @((& $w4Cond 'Bravo' 'BRAVO' 'Running' 'Running'), (& $w4Cond 'ExchangeApi' 'exchangAPI' 'Running' 'Running'), (& $w4Cond 'BravoWeb' 'Apache2.4' 'Failed' 'Stopped'))
+        RecoveryState = $w4IndependentState
+    }
+    $w4IndependentServices = $null
+    if ($null -ne $w4IndependentRun.WrittenState) { $w4IndependentServices = $w4IndependentRun.WrittenState.services }
+    $w4FirstObservationState = [pscustomobject]@{
+        schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+        services = @{
+            exchangAPI = [pscustomobject]@{ attempts = @((Get-Date).AddMinutes(-20).ToString('o')); lastCriticalAt = $null; stableSince = $null }
+            'Apache2.4' = [pscustomobject]@{ attempts = @((Get-Date).AddMinutes(-2).ToString('o')); lastCriticalAt = $null; stableSince = $null }
+        }
+    }
+    $w4FirstObservationRun = & $w4RunProfile @{
+        Conditions = @((& $w4Cond 'Bravo' 'BRAVO' 'Running' 'Running'), (& $w4Cond 'ExchangeApi' 'exchangAPI' 'Running' 'Running'), (& $w4Cond 'BravoWeb' 'Apache2.4' 'Failed' 'Stopped'))
+        RecoveryState = $w4FirstObservationState
+    }
+    $w4FirstObservationSince = $null
+    if ($null -ne $w4FirstObservationRun.WrittenState -and $w4FirstObservationRun.WrittenState.services.ContainsKey('exchangAPI')) {
+        $w4FirstObservationSince = $w4FirstObservationRun.WrittenState.services['exchangAPI'].stableSince
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $w4IndependentRun.Error -and [int]$w4IndependentRun.ExitCode -eq 0 -and $null -eq $w4IndependentRun.LockArgs -and
+            [int]$w4IndependentRun.StateWrites -eq 1 -and $null -ne $w4IndependentServices -and
+            -not $w4IndependentServices.ContainsKey('exchangAPI') -and $w4IndependentServices.ContainsKey('Apache2.4') -and
+            @($w4IndependentServices['Apache2.4'].attempts).Count -eq 1 -and
+            $null -eq $w4FirstObservationRun.Error -and [int]$w4FirstObservationRun.StateWrites -eq 1 -and $null -ne $w4FirstObservationSince
+        ) `
+        -Name 'ServiceRecovery/ProfileStableResetIndependentPerService' `
+        -Failure ("стабільність працюючої служби обліковується, навіть коли інша служба лежить: exchangAPI 30+ хв Running — облік скинуто, облік BRAVO Web (у паузі) збережено; перше спостереження — stableSince. " +
+            "скидання: $(& $w4Describe $w4IndependentRun) служби=[$(if ($null -ne $w4IndependentServices) { @($w4IndependentServices.Keys) -join ',' })] || перше спостереження: $(& $w4Describe $w4FirstObservationRun) stableSince='$w4FirstObservationSince'")
+
     # §9.4 (A-2): невдалий запуск 3-ї спроби за 24 год — CRITICAL «циклічно
     # падає» (крім CRITICAL StartFailed) і lastCriticalAt у state; 4-та
     # невдала спроба в тих самих 24 год — лише StartFailed. Справжні
@@ -1655,6 +1798,172 @@ function Invoke-A2Start {
         -Name 'ServiceRecovery/StartFailureSendsCyclicCriticalOncePer24h' `
         -Failure ("невдалий запуск впалої служби (BRAVO — гілка StartFailed, exchangAPI — catch): 3-тя спроба за 24 год — CRITICAL «циклічно падає» без -IsCritical разом із CRITICAL StartFailed і lastCriticalAt у state; 4-та — лише StartFailed. " +
             ($w4CyclicDiffs -join ' | '))
+
+    # Рев'ю PR #429: CRITICAL «циклічно падає» ставиться в чергу сповіщень
+    # (Send-SlackAlert -Severity CRITICAL), а доставляє її пізніше
+    # Send-BRAVOMaintenanceEarlyExitAlerts (профіль) або Send-FinalReport
+    # (нічний прогін). lastCriticalAt — лише після підтвердженої доставки:
+    # збій webhook не має придушувати CRITICAL на 24 год, наступна спроба
+    # надсилає її знову. Режим сповіщень none (оператор свідомо вимкнув
+    # сповіщення) — фіксується одразу: інакше рядок ERROR у журналі
+    # повторювався б на кожній спробі.
+    $t1CyclicStubs = @'
+function Write-Log {
+    param([Parameter(Position = 0)][string]$Message, [string]$Level = 'INFO', [switch]$NoConsole)
+    $script:T1Log += @("$Level|$Message")
+}
+function Save-BRAVOMaintenanceServiceRecoveryState {
+    param([datetime]$Now)
+    $script:T1Saves++
+}
+function Resolve-BRAVONotificationRoute {
+    param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+    if ($NotificationMode -eq 'none') { return 'none' }
+    return 'alerts'
+}
+function New-MaintenanceNotificationMessage {
+    param([string]$Title, [string]$TitleEmoji, [string]$Severity, $Duration, [object[]]$Details, [object[]]$StatusLines, [string]$LogPath)
+    return ($Title + ' :: ' + (@($Details) -join ' || '))
+}
+function Invoke-NotificationWebhook {
+    param([string]$Message, [string]$WebhookUrl)
+    $script:T1Webhook += @($Message)
+    if ($script:T1WebhookFails) { throw 'self-test: webhook недоступний' }
+}
+function Get-BRAVOMaintenanceFinalReportCheckLinesSafe { return @() }
+function Invoke-T1Cyclic {
+    param([string]$Delivery, [string]$Mode = 'errors_only', [bool]$WebhookFails = $false)
+    $script:T1Log = @()
+    $script:T1Saves = 0
+    $script:T1Webhook = @()
+    $script:T1WebhookFails = $WebhookFails
+    $script:SlackMode = $Mode
+    $script:CriticalErrors = $false
+    $script:criticalErrorOccurred = $false
+    $script:CriticalErrorsList = New-Object 'System.Collections.Generic.List[string]'
+    $script:NotificationAlertQueue = New-Object 'System.Collections.Generic.List[object]'
+    $script:maintenanceDeliveredCriticalAlertCount = 0
+    $script:maintenanceDeliveredAlertQueueCount = 0
+    $script:ScriptStartTime = Get-Date
+    $script:bravoSettings = @{ NotificationRouting = @{} }
+    $script:NotificationWebhookUrls = @{ alerts = 'https://alerts.example.invalid/hook' }
+    $script:NotificationProviderDisplayName = 'Webhook'
+    $script:LOG_FILE = 'C:\BRAVO\LOGS\BRAVO_MAINTENANCE_20261007_101500_RECOVER_PID1234.log'
+    $script:maintenanceServiceRecoveryState = [pscustomobject]@{
+        schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+        services = @{ exchangAPI = [pscustomobject]@{
+                attempts = @((Get-Date).AddMinutes(-90).ToString('o'), (Get-Date).AddMinutes(-80).ToString('o')); lastCriticalAt = $null; stableSince = $null } }
+    }
+    $condition = [pscustomobject]@{ Name = 'exchangAPI'; Condition = 'Failed'; Status = 'Stopped'; ExitCode = 1067 }
+    $third = Register-BRAVOMaintenanceServiceRecoveryAttempt -Name 'exchangAPI'
+    Send-BRAVOMaintenanceServiceCyclicAlert -Name 'exchangAPI' -Condition $condition -Attempt $third
+    $beforeDelivery = $script:maintenanceServiceRecoveryState.services['exchangAPI'].lastCriticalAt
+    if ($Delivery -eq 'EarlyExit') {
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason 'відновлення служб' -Title 'ВІДНОВЛЕННЯ СЛУЖБ BRAVO' -Summary 'self-test'
+        # Страховка у finally runtime: повторний виклик нічого не дублює.
+        Send-BRAVOMaintenanceEarlyExitAlerts -Reason 'дострокове завершення прогону'
+    } elseif ($Delivery -eq 'FinalReport') {
+        Send-FinalReport -LOG_FILE $script:LOG_FILE
+    }
+    $afterDelivery = $script:maintenanceServiceRecoveryState.services['exchangAPI'].lastCriticalAt
+    $fourth = Register-BRAVOMaintenanceServiceRecoveryAttempt -Name 'exchangAPI'
+    return [pscustomobject]@{
+        ThirdDue = [bool]$third.CyclicAlertDue
+        BeforeDelivery = $beforeDelivery
+        AfterDelivery = $afterDelivery
+        FourthDue = [bool]$fourth.CyclicAlertDue
+        Webhook = @($script:T1Webhook)
+        CyclicDelivered = @($script:T1Webhook | Where-Object { $_ -match 'циклічно падає' }).Count
+    }
+}
+'@
+    $t1CyclicModule = & $w4NewModule ($t1CyclicStubs + "`n" + $w4RuntimeText + "`n" + $w4ModuleText + "`n" + $w4SystemText) (
+        @(& $w4FunctionNamesIn $t1CyclicStubs) +
+        @('Send-BRAVOMaintenanceServiceCyclicAlert', 'Send-SlackAlert', 'Send-BRAVOMaintenanceEarlyExitAlerts', 'Send-FinalReport',
+            'Confirm-BRAVOMaintenanceServiceCyclicAlertDelivery', 'Register-BRAVOMaintenanceServiceRecoveryAttempt',
+            'Get-BRAVOMaintenanceServiceRecoveryState') +
+        @($w4ModuleFunctions))
+    $t1CyclicCases = [ordered]@{
+        EarlyExitDelivered = @{ Delivery = 'EarlyExit'; Mode = 'errors_only'; WebhookFails = $false; Recorded = $true }
+        EarlyExitWebhookFails = @{ Delivery = 'EarlyExit'; Mode = 'errors_only'; WebhookFails = $true; Recorded = $false }
+        FinalReportDelivered = @{ Delivery = 'FinalReport'; Mode = 'errors_only'; WebhookFails = $false; Recorded = $true }
+        FinalReportWebhookFails = @{ Delivery = 'FinalReport'; Mode = 'errors_only'; WebhookFails = $true; Recorded = $false }
+        NotificationsOff = @{ Delivery = 'EarlyExit'; Mode = 'none'; WebhookFails = $false; Recorded = $true }
+    }
+    $t1CyclicDiffs = @()
+    foreach ($t1CaseName in @($t1CyclicCases.Keys)) {
+        $t1Case = $t1CyclicCases[$t1CaseName]
+        try {
+            $t1Result = & $t1CyclicModule {
+                param($Case)
+                Set-StrictMode -Version 2.0
+                Invoke-T1Cyclic -Delivery $Case.Delivery -Mode $Case.Mode -WebhookFails $Case.WebhookFails
+            } $t1Case
+            $t1Recorded = ($null -ne $t1Result.AfterDelivery)
+            $t1ExpectPendingBefore = ($t1Case.Mode -ne 'none')
+            $t1ExpectedCyclicDelivered = if ($t1Case.Mode -eq 'none') { 0 } else { 1 }
+            if (-not $t1Result.ThirdDue -or $t1Recorded -ne [bool]$t1Case.Recorded -or
+                ($t1ExpectPendingBefore -and $null -ne $t1Result.BeforeDelivery) -or
+                $t1Result.FourthDue -ne (-not [bool]$t1Case.Recorded) -or
+                [int]$t1Result.CyclicDelivered -ne $t1ExpectedCyclicDelivered) {
+                $t1CyclicDiffs += "${t1CaseName}: 3-тя due=$($t1Result.ThirdDue) до доставки='$($t1Result.BeforeDelivery)' після='$($t1Result.AfterDelivery)' 4-та due=$($t1Result.FourthDue) доставлено cyclic=$($t1Result.CyclicDelivered) webhook=[$(@($t1Result.Webhook) -join ' ## ')]"
+            }
+        } catch {
+            $t1CyclicDiffs += "${t1CaseName}: помилка $($_.Exception.Message)"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($t1CyclicDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/CyclicCriticalRecordedOnlyAfterDelivery' `
+        -Failure ("lastCriticalAt CRITICAL «циклічно падає» — лише після підтвердженої доставки (Send-BRAVOMaintenanceEarlyExitAlerts / Send-FinalReport); збій webhook — не фіксується, 4-та спроба знову CyclicAlertDue; режим сповіщень none — фіксується одразу (свідоме вимкнення оператором). " +
+            ($t1CyclicDiffs -join ' | '))
+
+    # Рев'ю PR #429 (fail-closed): нічний прогін — зупинена служба з невідомим
+    # типом запуску не «впала» (без наміру перезапуску), WARNING у журналі.
+    $t4NightlyStubs = @'
+function Write-Log {
+    param([Parameter(Position = 0)][string]$Message, [string]$Level = 'INFO', [switch]$NoConsole)
+    $script:T4Log += @("$Level|$Message")
+}
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    return [pscustomobject]@{ Name = $Name; Status = 'Stopped' }
+}
+function Read-BRAVOServiceQuiescenceState { return $null }
+function Get-BRAVOManagedServiceCondition {
+    param([string]$Name, $QuiescenceState)
+    $startMode = if ($Name -eq 'exchangAPI') { 'Unknown' } else { 'Automatic' }
+    return [pscustomobject]@{ Name = $Name; Condition = 'Failed'; Status = 'Stopped'; StartMode = $startMode; StartModeSource = $(if ($startMode -eq 'Unknown') { 'None' } else { 'StartType' }); ExitCode = 1067 }
+}
+'@
+    $t4NightlyModule = & $w4NewModule ($t4NightlyStubs + "`n" + $w4RuntimeText + "`n" + $w4ModuleText + "`n" + $w4SystemText) (
+        @(& $w4FunctionNamesIn $t4NightlyStubs) + @('Get-BRAVOMaintenanceManagedServiceStatus') + @($w4ModuleFunctions))
+    $t4NightlyError = $null
+    $t4Nightly = $null
+    try {
+        $t4Nightly = & $t4NightlyModule {
+            Set-StrictMode -Version 2.0
+            $script:T4Log = @()
+            $statuses = @(Get-BRAVOMaintenanceManagedServiceStatus -ClassifyFailed -Services @(
+                    @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Enabled = $true },
+                    @{ Key = 'BravoWeb'; Name = 'Apache2.4'; Enabled = $true }))
+            return [pscustomobject]@{
+                Failed = (@($statuses | ForEach-Object { '{0}={1}' -f $_.Name, [bool]$_.Failed }) -join ' ')
+                Warnings = @($script:T4Log | Where-Object { $_ -match '^WARNING\|.*exchangAPI.*тип запуску' })
+                Log = @($script:T4Log)
+            }
+        }
+    } catch {
+        $t4NightlyError = $_.Exception.Message
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $t4NightlyError -and $null -ne $t4Nightly -and
+            [string]$t4Nightly.Failed -ceq 'exchangAPI=False Apache2.4=True' -and @($t4Nightly.Warnings).Count -eq 1
+        ) `
+        -Name 'ServiceRecovery/NightlySkipsUnknownStartMode' `
+        -Failure ("нічний Maintenance (Get-BRAVOMaintenanceManagedServiceStatus -ClassifyFailed): зупинена служба з невідомим типом запуску — Failed=`$false і WARNING у журналі; з відомим — Failed=`$true. " +
+            "помилка='$t4NightlyError' failed='$(if ($null -ne $t4Nightly) { $t4Nightly.Failed })' журнал=[$(if ($null -ne $t4Nightly) { @($t4Nightly.Log) -join ' || ' })]")
 
     # ============================================================
     # Тест 5 (lock): -NoWait — одна спроба без Start-Sleep і без журналу;
