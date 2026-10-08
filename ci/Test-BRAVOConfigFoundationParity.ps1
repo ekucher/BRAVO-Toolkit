@@ -531,6 +531,15 @@ $knownIntentionalDiffPrefixes = @(
     'schedulerSettings.BackupCatchUp.ScriptPath',
     'schedulerSettings.BackupCatchUp.StartupDelayMinutes',
     'schedulerSettings.BackupCatchUp.TaskName',
+    # ServiceRecovery (#314, хвиля 5) — так само ПОХІДНИЙ вузол
+    # планувальника (Derivation + backfill у BRAVO_CONFIG_LOADER.ps1):
+    # задача BRAVO_SERVICE_RECOVERY (BRAVO_MAINTENANCE.ps1 -RecoverServices).
+    # У BEFORE вузла не існує; наявні поля не змінено. Поіменно.
+    'schedulerSettings.ServiceRecovery.Description',
+    'schedulerSettings.ServiceRecovery.Enabled',
+    'schedulerSettings.ServiceRecovery.ExecutionTimeLimitHours',
+    'schedulerSettings.ServiceRecovery.ScriptPath',
+    'schedulerSettings.ServiceRecovery.TaskName',
     # Секція 5, задокументований canonical-default фікс (перевірено
     # окремим self-test ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults):
     # "E:\Archiv" (застарілий placeholder BRAVO.config) -> "" (canonical).

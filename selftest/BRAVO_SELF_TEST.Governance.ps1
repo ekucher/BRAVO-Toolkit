@@ -2453,6 +2453,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         @{ Kind = 'Cmdlet'; Target = 'Stop-Service' },
         @{ Kind = 'Cmdlet'; Target = 'Test-Path' },
         @{ Kind = 'Cmdlet'; Target = 'Write-Error' },
+        @{ Kind = 'Cmdlet'; Target = 'Add-Type' },
         # Видалено в 5.2.3; README згадує в примітці про оновлення з 5.2.1/5.2.2.
         @{ Kind = 'Historical'; Target = 'Merge-BRAVOArchiveSpaceCheckResults' },
         # Застарілі root-бібліотеки, які README велить видалити при оновленні.
@@ -2479,6 +2480,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         # Файли стану, які runtime пише на сервері.
         @{ Kind = 'RuntimeGenerated'; Target = 'BRAVO_VERSION_STATE.json' },
         @{ Kind = 'RuntimeGenerated'; Target = 'BRAVO_VSS_OWNERSHIP.json' },
+        @{ Kind = 'RuntimeGenerated'; Target = 'BRAVO_SERVICE_RECOVERY_STATE.json' },
+        @{ Kind = 'RuntimeGenerated'; Target = 'BRAVO_RESTORE_STATE.json' },
         @{ Kind = 'RuntimeGenerated'; Target = '.bravo-sync.json' },
         # Маніфест релізного артефакта, створює ci/New-BRAVOReleaseArtifact.ps1.
         @{ Kind = 'RuntimeGenerated'; Target = 'release-manifest.json' }

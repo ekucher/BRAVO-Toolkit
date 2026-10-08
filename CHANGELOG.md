@@ -2,6 +2,110 @@
 
 ## Не випущено (developer)
 
+- **Виправлено: автоматичне відновлення служб після рев'ю PR #432 (#314).**
+  Штатну зупинку (`Stop-Service` пише лише подію 7036) задача `BRAVO_SERVICE_RECOVERY` тепер підхоплює окремим
+  Event-тригером за ~1–2 хв: 7036 фільтрується за відображуваними іменами керованих служб (`param1`); служба, якої
+  немає, чи ім'я з обома видами лапок — `[WARNING]` в журналі інсталятора, і тоді зупинку підхопить тик Daily
+  (до 15 хв). `BRAVO_TASKS_DIAGNOSE.ps1` додатково ловить фільтр 7036, що не відповідає поточним іменам служб,
+  підписку не на журнал System, зайві й дубльовані тригери та `StopAtDurationEnd` — `[FAIL] ServiceRecovery`,
+  лікування `BRAVO_TASKS_INSTALL.ps1`. **Зміни поведінки профілю `-RecoverServices`:** operation-lock
+  зайнятий будь-ким, зокрема BRAVO_ARCHIV (Archive / BackupCatchUp / BAZASync), — код 20 без змін служб і рядок INFO
+  з власником у `RECOVER_PAUSE.log`: відновлення без lock-а немає, бо BRAVO_ARCHIV може звільнити lock посеред
+  циклу, і тоді накладуться нічний Maintenance чи DataRestore. Під lock-ом живого BRAVO_ARCHIV для впалої служби
+  приходить WARNING «СЛУЖБА BRAVO НЕ ПРАЦЮЄ: ВІДНОВЛЕННЯ ВІДКЛАДЕНО» не частіше разу на 60 хв на службу (мітки —
+  `BRAVO_SERVICE_RECOVERY_BACKUP_DEFERRAL.json`); службу підніме перший тик після бекапу.
+  Перші 9 хв після старту ОС профіль служб не змінює (код 0, INFO): ними
+  розпоряджається boot-тригер. Осиротілий маркер `BRAVO_MAINTENANCE_RECOVER` профіль переймає сам. Критичні помилки
+  прогону без «не вдалося підняти» (збій зупинки залежної служби, ротації журналів, непередбачений виняток) —
+  окреме CRITICAL «ВІДНОВЛЕННЯ СЛУЖБ BRAVO: КРИТИЧНІ ПОМИЛКИ»; непередбачений виняток — код 60 замість 1; таймаут
+  зупинки служби, що лишилась Running, більше не дає хибного «зупинено, але не запущено». Зупинена служба з
+  невідомим типом запуску (немає ні StartType, ні WMI, ні значення реєстру) — стан `Unknown`, не запускається.
+  `-RunMissedRestoreOnly` впалих служб не запускає. Health: дія алерту — «запущено задачу відновлення … результат
+  дивіться в журналі …»; помилка COM при читанні задачі — «не вдалося запустити», а не «задача відсутня»; фігурні
+  дужки в тексті помилки більше не ламають побудову алерту. Нові коди завершення не з'явились. Після оновлення
+  комплекту виконайте `BRAVO_TASKS_INSTALL.ps1`.
+  Вікно після старту ОС на `HoldServices` — `Restore.StartupDelayMinutes` + 10 хв, час старту ОС не прочитано —
+  тик пропускається; поки пропущена реставрація чекає (або її стан невідомий), профіль служб не запускає без
+  обмеження часу (код 0, INFO «очікується пропущена реставрація»); інші профілі — 9 хв, як раніше. Залежна
+  служба, яку запустили поза профілем під час збору журналів, — успіх, без CRITICAL. Health для призупиненої
+  (`Paused`) служби задачу відновлення не запускає — лише issue.
+
+- **Нове: задача Планувальника `BRAVO_SERVICE_RECOVERY` і запуск відновлення з Health (#314, хвиля 5).**
+  `BRAVO_TASKS_INSTALL.ps1` ставить (завжди, коли увімкнено Maintenance) задачу `BRAVO_SERVICE_RECOVERY` під SYSTEM:
+  `BRAVO_MAINTENANCE.ps1 -RecoverServices -NoPause` за трьома тригерами — подія System log від Service Control Manager
+  (7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034) із затримкою 1 хв, старт ОС із затримкою 10 хв і щоденний тригер
+  з повтором кожні 15 хв протягом доби; `MultipleInstances=IgnoreNew`, `ExecutionTimeLimit=1 год`,
+  `StartWhenAvailable=false`. `BRAVO_TASKS_DIAGNOSE.ps1` перевіряє дію і всі три тригери (відсутній або змінений
+  тригер — FAIL), `BRAVO_TASKS_UNINSTALL.ps1` її видаляє. Інсталятор пише в журнал тип запуску й стан усіх трьох
+  керованих служб, включно з BRAVO Web. Похідний вузол `schedulerSettings.ServiceRecovery` (як BackupCatchUp, без
+  нових ключів конфігурації). **Зміна поведінки Health:** впалу службу `BRAVO_HEALTH` більше не лишає лише на alert —
+  він стартує задачу `BRAVO_SERVICE_RECOVERY` (один раз за перевірку), а не саму службу; issue лишається з дією
+  «служба X не працює; запущено автоматичне відновлення, перевірте журнал …». Відсутня або вимкнена задача — окремий
+  issue «задача відновлення служб відсутня — виконайте BRAVO_TASKS_INSTALL». Watchdog ownership-маркера і поведінка
+  для `Disabled` не змінились. Нові хелпери: `Start-BRAVOScheduledTask` (BRAVO.Compatibility; ScheduledTasks або COM
+  на Windows 7), `Initialize-/Test-BRAVOServiceRecoveryTaskDefinition`, `Get-BRAVOManagedServiceStartModeSummary`
+  (BRAVO.System). Після оновлення комплекту виконайте `BRAVO_TASKS_INSTALL.ps1`. Опис для підтримки — OPERATIONS.md,
+  розділ «Служби BRAVO: автоматичне відновлення».
+
+- **Нове: профіль `BRAVO_MAINTENANCE.ps1 -RecoverServices` — відновлення впалих служб BRAVO (#314, хвиля 4).**
+  Профіль лише піднімає впалі служби: без реставрації, перевірки розмірів, очистки, міграції журналів, trace-архіву/SFTP,
+  BRAVO_ARCHIV і автовимкнення. Якщо впалих служб немає — миттєвий вихід з кодом 0 без lock-а, файлу журналу й сповіщень.
+  Якщо для всіх впалих служб пауза (0 / 5 / 15 / 60 хв) ще не минула — код 0 і один рядок INFO у добовому
+  `BRAVO_MAINTENANCE_<дата>_RECOVER_PAUSE.log`. Далі операційний lock без очікування (зайнятий — код 20 без змін і
+  сповіщень), повторна класифікація під lock-ом, ownership-маркер власником `BRAVO_MAINTENANCE_RECOVER` до першої
+  зупинки/запуску (збій запису — CRITICAL, код 60, служби не чіпаються). Ланцюжок: впала BRAVO — зупинка працюючих
+  BRAVO Web і exchangAPI, запуск BRAVO → exchangAPI → BRAVO Web; впала exchangAPI чи BRAVO Web — лише вона; кілька —
+  об'єднання в канонічному порядку. Службу у стані `Paused` профіль не запускає (INFO). Докази в
+  `BRAVO_MAINTENANCE_<ts>_RECOVER_PID<pid>.log`: StartMode, Status, ExitCode, ServiceSpecificExitCode і до 50 подій
+  Service Control Manager (7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034) від старту ОС; збій читання подій — лише
+  WARNING. Журнали служб обробляються тими самими функціями циклу служб. Сповіщення: «відновлено» — WARNING, «не вдалося
+  підняти» — CRITICAL, «циклічно падає» — CRITICAL. Без встановленої цілісності моделі, під маркером з
+  `restartSuppressed` чи під чинним маркером іншого власника служби не запускаються. `-RecoverServices` разом з
+  `-ForceRestore` або `-RunMissedRestoreOnly` — код 30. Коди завершення 0 / 10 / 20 / 30 / 60, нових немає.
+  `Enter-BRAVOMaintenanceOperationLock` отримав `-NoWait`; Health і `Repair-BRAVOOrphanedServiceStartTypes` визнають
+  власника `BRAVO_MAINTENANCE_RECOVER`. Задача Планувальника для профілю — `BRAVO_SERVICE_RECOVERY` (хвиля 5). Код:
+  `modules\BRAVO.Maintenance\BRAVO.Maintenance.RecoverServices.ps1`.
+
+- **Зміна поведінки: нічний Maintenance запускає зупинені служби BRAVO (#314, хвиля 3).**
+  Керована служба (BRAVO, exchangAPI, BRAVO Web), яка стоїть до початку обслуговування і не має типу запуску `Disabled`,
+  тепер вважається впалою і проходить повний цикл: потрапляє в ownership-маркер із наміром перезапуску, її журнали
+  обробляються, після обслуговування її запускають у канонічному порядку BRAVO → exchangAPI → BRAVO Web. Тип `Automatic`
+  чи `Manual` на рішення не впливає; навмисно вимкнена служба — лише `Disabled`. Раніше такі служби лишались зупиненими,
+  а Maintenance надсилав WARNING «СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE» з обіцянкою зберегти початковий стан.
+  Це сповіщення прибрано. Натомість у журналі й підсумку кроку «Відновлення стану служб» з'являється INFO «служба X була
+  зупинена до обслуговування (ExitCode N), запущена». Збій запуску, як і раніше, — CRITICAL і код 60.
+  `-ForceRestore` теж завершується запущеними службами. Якщо служба BRAVO має тип `Disabled` (#321), реставрація
+  виконується, але ні BRAVO, ні залежні від неї exchangAPI та BRAVO Web не запускаються: у журнал іде лише INFO, без
+  WARNING і без сповіщення. Як і раніше, без встановленої цілісності моделі та під маркером з `restartSuppressed` служби
+  не запускаються. Службу під маркером, зокрема `Disabled`, виставлений самим BRAVO на час реставрації, Maintenance
+  впалою не вважає. Гілку `-RunMissedRestoreOnly` не змінено. Рядок «BRAVO Trace після запуску служби» тепер пишеться
+  лише тоді, коли службу BRAVO справді запускали.
+  **Що зробити перед оновленням:** службу, яку техпідтримка зупинила без наміру її запускати, переведіть у `Disabled`,
+  інакше наступний нічний Maintenance її підніме. Це стосується й встановлених, але не потрібних exchangAPI або BRAVO Web.
+  Новий облік спроб відновлення: `%ProgramData%\BRAVO\State\BRAVO_SERVICE_RECOVERY_STATE.json` (UTF-8 без BOM,
+  атомарний запис). Кожен запуск впалої служби рахується як спроба; мітки старші за 24 год. видаляються. Пошкоджений
+  файл або файл з іншого хоста дає WARNING і перейменовується в `.corrupt-<ts>`, облік починається заново, запуск служби
+  це не блокує. Третя спроба за 24 год. дає CRITICAL «служба X циклічно падає», не частіше разу на добу; режими
+  сповіщень `none` / `errors_only` / `all` поважаються. Паузи між спробами (0 / 5 / 15 / далі 60 хв) і скидання обліку
+  після 30 хв стабільної роботи нічний прогін не застосовує. Їх використає профіль `-RecoverServices` (хвиля 4). Код:
+  `modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceRecovery.ps1` і `BRAVO.Maintenance.ServiceCycle.ps1`. Нових
+  ключів конфігурації й кодів завершення немає. Тести — suite `ServiceRecovery`; характеризаційні сценарії хвилі 2 зі
+  службами, зупиненими до прогону, свідомо оновлено під нову поведінку.
+
+- **Refactor: цикл служб Maintenance винесено в окремий файл без зміни поведінки (#314, хвиля 2).**
+  Цикл «зупинка служб → обробка журналів (Trace BRAVO, exchangAPI, Apache і BRAVO Web) → запуск BRAVO → exchangAPI →
+  BRAVO Web» перенесено з `BRAVO.Maintenance.Runtime.ps1` у `modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1`
+  (dot-source усередині `Invoke-BRAVOMaintenance`, той самий динамічний scope): `New-BRAVOMaintenanceServiceSet`,
+  `Invoke-BRAVOMaintenanceServiceStopSequence`, `Invoke-BRAVOMaintenanceServiceLogProcessing`,
+  `Invoke-BRAVOMaintenanceServiceStartSequence`. Тіла перенесено дослівно; порядок служб, журнали, маркер, гейт
+  цілісності моделі, `-RunMissedRestoreOnly` і `-ForceRestore` не змінено, коди завершення ті самі. Завершення
+  стороннього `Bis` (`Stop-BRAVOMaintenanceStrayProcess`) лишається окремим викликом-хуком перед зупинкою служби — точка
+  розширення для #316. Перед винесенням додано характеризаційний suite `ServiceRecovery`
+  (`selftest\BRAVO_SELF_TEST.ServiceRecovery.ps1`: 9 сценаріїв `ServiceRecovery/Cycle*` і
+  `ServiceRecovery/CharacterizationProbeAvailable`), зелений до і після винесення.
+  Дубль WMI-запиту `Win32_Service` у `BRAVO.System` (R379-3) замінено одним приватним `Get-BRAVOServiceWin32Info`
+  поверх `Get-BRAVOWmiInstance`, який використовують `Get-BRAVOServiceStartMode` і `Get-BRAVOManagedServiceCondition`.
+
 - **Perf: проби loader-а в self-test ConfigLoader виконуються в одному дочірньому процесі.**
   84 проби `Import-BravoConfiguration` (local-config, BusyWait/SuccessDedup/storage-switch, intent-матриця, parity,
   security-downgrade, PrimaryStrictness, атомарність, PostUpdate/Malformed) раніше запускали окремий `powershell.exe`

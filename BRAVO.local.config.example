@@ -192,6 +192,10 @@
     # ОБСЛУГОВУВАННЯ (maintenanceSettings) — фаза 1
     # =========================================================
     # --- Служби ---
+    # Запускати й зупиняти керовані служби має право лише BRAVO_MAINTENANCE.ps1
+    # (нічний прогін і профіль -RecoverServices, #314); BRAVO_HEALTH лише
+    # стартує задачу BRAVO_SERVICE_RECOVERY. Службу, тип запуску якої не
+    # Disabled, BRAVO піднімає автоматично.
     # Додатковий DisplayName служби BRAVO (див. коментар у BRAVO.config —
     # ДОДАВАЙТЕ до списку, не замінюйте його двома дефолтними):
     # 'maintenanceSettings.Services.BravoDisplayName' = @('BRAVO Service', 'BRAVO Server', 'BRAVO LIMS')

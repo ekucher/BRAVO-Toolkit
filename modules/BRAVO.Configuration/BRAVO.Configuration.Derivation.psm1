@@ -453,6 +453,24 @@ function Resolve-BRAVOConfigurationDerivation {
         ExecutionTimeLimitHours = 30
         ScriptPath = Join-Path $runtimeRoot "BRAVO_ARCHIV.ps1"
     }
+    # ServiceRecovery (#314 FR-4): задача BRAVO_SERVICE_RECOVERY запускає
+    # BRAVO_MAINTENANCE.ps1 -RecoverServices — відновлення впалих служб BRAVO
+    # за подією Service Control Manager, після старту ОС і кожні 15 хв. Вузол
+    # повністю похідний, канонічних листів конфігурації не додає (окремого
+    # вимикача до Config V2 #216 немає): задача є завжди, коли увімкнено
+    # Maintenance. Тригери й налаштування — константи
+    # Get-BRAVOServiceRecoveryTaskTriggerSpec (BRAVO.System). Те саме правило
+    # для legacy-конфігурації — у BRAVO_CONFIG_LOADER.ps1.
+    $maintenanceTaskEnabled = $global:schedulerSettings.Contains('Maintenance') -and
+        $global:schedulerSettings.Maintenance -is [hashtable] -and
+        [bool]$global:schedulerSettings.Maintenance.Enabled
+    $global:schedulerSettings.ServiceRecovery = @{
+        Enabled = $maintenanceTaskEnabled
+        TaskName = "BRAVO_SERVICE_RECOVERY"
+        Description = "Автоматичне відновлення впалих служб BRAVO (BRAVO_MAINTENANCE.ps1 -RecoverServices)"
+        ExecutionTimeLimitHours = 1
+        ScriptPath = Join-Path $runtimeRoot "BRAVO_MAINTENANCE.ps1"
+    }
     if ($global:schedulerSettings.Contains('BAZASync') -and $global:schedulerSettings.BAZASync -is [hashtable]) {
         # BAZASync — суто SFTP-синхронізація BAZA_APP/BAZA_WWW.
         # Enabled береться з канонічного $bazaSyncEffective (APP_SFTP OR
