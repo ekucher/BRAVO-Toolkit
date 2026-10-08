@@ -1716,9 +1716,10 @@ Remove-Item -LiteralPath $secretMaskTestRoot -Recurse -Force -ErrorAction Silent
 # для BRAVO.Notifications) і перелік її властивостей (.PSObject) — не
 # читання ключа й не порушення.
 # #435: таблицею вважається й змінна-псевдонім, якій присвоєно таблицю
-# ($t = $credentialSettings.Targets, також через [тип], (...) і ланцюжок
-# псевдонімів; обсяг — увесь файл, без урахування областей видимості, тож
-# детектор радше перестрахується). Читання ключа через
+# ($t = $credentialSettings.Targets, також через [тип], (...), ланцюжок
+# псевдонімів і ланцюжок присвоєнь $t = $u = ... / $t = ($u = ...);
+# обсяг — увесь файл, без урахування областей видимості, тож детектор
+# радше перестрахується). Читання ключа через
 # <таблиця>.PSObject.Properties['X'] / .Item('X') — теж порушення.
 $targetsGuardFindHits = {
     param([string]$SourceText)
@@ -1816,7 +1817,8 @@ $targetsGuardFindHits = {
 $targetsGuardSelfCheckProblems = New-Object System.Collections.Generic.List[string]
 try {
     # #435: обходи через псевдонім таблиці ($t = ...Targets; $t.X / $t['X'],
-    # зокрема ланцюжок псевдонімів) і через .PSObject.Properties['X'].Value
+    # зокрема ланцюжок псевдонімів і ланцюжок присвоєнь $v = $w = ...Targets /
+    # $x = ($y = ...Targets)) і через .PSObject.Properties['X'].Value
     # — теж читання ключа.
     $targetsGuardPositive = @(& $targetsGuardFindHits ('$a = [string]$credentialSettings.Targets.SFTPLogin' + "`n" +
             '$b = $global:credentialSettings.Targets[''SMBLogin'']' + "`n" +
@@ -1827,8 +1829,12 @@ try {
             '$u = ($t)' + "`n" +
             '$f = [string]$u.SFTPPassword' + "`n" +
             '$g = $credentialSettings.Targets.PSObject.Properties[''ArchivePassword''].Value' + "`n" +
-            '$h = $t.PSObject.Properties[''SMBPassword''].Value'))
-    if ($targetsGuardPositive.Count -ne 8) { $targetsGuardSelfCheckProblems.Add("позитивні зразки: $($targetsGuardPositive.Count) з 8") }
+            '$h = $t.PSObject.Properties[''SMBPassword''].Value' + "`n" +
+            '$v = $w = $credentialSettings.Targets' + "`n" +
+            '$i = $v.SFTPLogin' + "`n" +
+            '$x = ($y = $credentialSettings.Targets)' + "`n" +
+            '$j = $x.SMBLogin'))
+    if ($targetsGuardPositive.Count -ne 10) { $targetsGuardSelfCheckProblems.Add("позитивні зразки: $($targetsGuardPositive.Count) з 10") }
     $targetsGuardNegative = @(& $targetsGuardFindHits ('Send-X -CredentialTargets $credentialSettings.Targets' + "`n" +
             'foreach ($p in $credentialSettings.Targets.PSObject.Properties) { }' + "`n" +
             '$t = $credentialSettings.Targets' + "`n" +
