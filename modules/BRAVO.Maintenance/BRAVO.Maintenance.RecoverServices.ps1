@@ -22,7 +22,8 @@
 #      і без сповіщень (стабільність лічильника спроб — лише під lock-ом);
 #   2. для всіх впалих пауза (FR-5) ще не минула -> 0, рядок INFO у добовий
 #      файл BRAVO_MAINTENANCE_<дата>_RECOVER_PAUSE.log;
-#   3. operation-lock без очікування; зайнятий -> 20 без сповіщення і змін;
+#   3. operation-lock без очікування; зайнятий -> 20 без сповіщення і змін
+#      (крім підтвердженого володіння BRAVO_ARCHIV — тоді без lock-а);
 #   4-11. під lock-ом: повторна класифікація, ланцюжок, докази, маркер
 #      власника BRAVO_MAINTENANCE_RECOVER, журнали, запуск, облік спроби,
 #      сповіщення; код 0 / 10 / 60.
@@ -157,24 +158,121 @@ function Get-BRAVOServiceRecoveryBootTime {
     return $null
 }
 
+function Get-BRAVOServiceRecoveryPowerShellProcess {
+    # Процеси PowerShell цього хоста (powershell.exe, pwsh.exe) з командними
+    # рядками — Win32_Process через канонічний Get-BRAVOWmiInstance
+    # (BRAVO.Compatibility). Кожен — { ProcessId; CommandLine } (порожній
+    # CommandLine — рядок не прочитано). Збій запиту — виняток: викликач
+    # трактує його як невизначеність (fail-closed).
+    return @(@(Get-BRAVOWmiInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'") | ForEach-Object {
+            [pscustomobject]@{ ProcessId = ($_.ProcessId -as [int]); CommandLine = [string]$_.CommandLine }
+        })
+}
+
 function Test-BRAVOServiceRecoveryLockHolderAllowsRecovery {
-    # Рев'ю PR #432 (B-P2-2): чи дозволяє власник зайнятого operation-lock
-    # відновлення служб без lock-а. Так — лише BRAVO_ARCHIV (operation
-    # 'Archive': Archive, BackupCatchUp, BAZASync) на цьому ж хості з живим
-    # процесом (pid + processStartTime): він служб не зупиняє й не запускає.
-    # Нечитабельний lock, інший власник, інший хост, процес без
-    # processStartTime чи мертвий процес — $false (fail-closed: код 20).
+    # Рев'ю PR #432 (B-P2-2, Codex P1): чи дозволяє власник зайнятого
+    # operation-lock відновлення служб без lock-а. Метадані у файлі lock-а
+    # можуть бути застарілими: новий власник (Maintenance, DataRestore) уже
+    # тримає lock, але ще не переписав JSON попереднього (Archive), — тож
+    # непідтверджене володіння = зайнято. Дозволено лише коли ВСЕ підтверджено:
+    #   - запис operation 'Archive' (BRAVO_ARCHIV: Archive, BackupCatchUp,
+    #     BAZASync — служб не зупиняє й не запускає) цього хоста, з pid і
+    #     processStartTime, процес живий (Test-BRAVOProcessAlive);
+    #   - командний рядок цього pid (-Processes, Win32_Process) справді
+    #     запускає BRAVO_ARCHIV.ps1;
+    #   - серед процесів PowerShell (крім -CurrentProcessId) немає
+    #     BRAVO_DATA_RESTORE.ps1 і BRAVO_MAINTENANCE.ps1 без -RecoverServices
+    #     (нічний Maintenance, -RunMissedRestoreOnly), а командний рядок
+    #     кожного прочитано;
+    #   - повторне читання власника після паузи (-HolderRecheck) дає той
+    #     самий запис (pid, processStartTime, startedAt, operation).
+    # Будь-яка невизначеність — Allowed $false з причиною (код 20). Лише
+    # обчислює (процес-живий — Test-BRAVOProcessAlive). Повертає { Allowed; Reason }.
     param(
         [AllowNull()][object]$Holder,
-        [Parameter(Mandatory = $true)][string]$HostName
+        [Parameter(Mandatory = $true)][string]$HostName,
+        [AllowNull()][object[]]$Processes,
+        [int]$CurrentProcessId = $PID,
+        [AllowNull()][object]$HolderRecheck
     )
 
-    if ($null -eq $Holder) { return $false }
-    if ([string]$Holder.Operation -ne 'Archive') { return $false }
-    if ([string]$Holder.HostName -ne $HostName) { return $false }
-    if ($null -eq $Holder.Pid -or [int]$Holder.Pid -le 0) { return $false }
-    if ([string]::IsNullOrWhiteSpace([string]$Holder.ProcessStartTime)) { return $false }
-    return [bool](Test-BRAVOProcessAlive -ProcessId ([int]$Holder.Pid) -ProcessStartTime ([string]$Holder.ProcessStartTime))
+    $deny = { param([string]$Reason) [pscustomobject]@{ Allowed = $false; Reason = $Reason } }
+    if ($null -eq $Holder) { return (& $deny 'метадані власника не прочитано') }
+    if ([string]$Holder.Operation -ne 'Archive') { return (& $deny ('власник — ' + [string]$Holder.Operation + ', не BRAVO_ARCHIV')) }
+    if ([string]$Holder.HostName -ne $HostName) { return (& $deny 'lock записано іншим хостом') }
+    if ($null -eq $Holder.Pid -or [int]$Holder.Pid -le 0) { return (& $deny 'у записі власника немає pid') }
+    if ([string]::IsNullOrWhiteSpace([string]$Holder.ProcessStartTime)) { return (& $deny 'у записі власника немає processStartTime') }
+    $holderPid = [int]$Holder.Pid
+    if (-not [bool](Test-BRAVOProcessAlive -ProcessId $holderPid -ProcessStartTime ([string]$Holder.ProcessStartTime))) {
+        return (& $deny ('процес власника pid=' + $holderPid + ' не живий'))
+    }
+    if ($null -eq $Processes) { return (& $deny 'список процесів PowerShell не прочитано') }
+    $holderProcess = @(@($Processes) | Where-Object { $null -ne $_ -and ($_.ProcessId -as [int]) -eq $holderPid }) | Select-Object -First 1
+    if ($null -eq $holderProcess -or [string]::IsNullOrWhiteSpace([string]$holderProcess.CommandLine)) {
+        return (& $deny ('командний рядок процесу власника pid=' + $holderPid + ' не прочитано'))
+    }
+    if ([string]$holderProcess.CommandLine -notmatch '(?i)(^|[\\/"''\s])BRAVO_ARCHIV\.ps1\b') {
+        return (& $deny ('процес pid=' + $holderPid + ' не є BRAVO_ARCHIV'))
+    }
+    foreach ($process in @($Processes)) {
+        if ($null -eq $process) { continue }
+        $processId = $process.ProcessId -as [int]
+        if ($processId -eq $CurrentProcessId -or $processId -eq $holderPid) { continue }
+        $commandLine = [string]$process.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) {
+            return (& $deny ('командний рядок процесу PowerShell pid=' + $processId + ' не прочитано'))
+        }
+        if ($commandLine -match '(?i)(^|[\\/"''\s])BRAVO_DATA_RESTORE\.ps1\b') {
+            return (& $deny ('виконується BRAVO_DATA_RESTORE (pid=' + $processId + ')'))
+        }
+        if ($commandLine -match '(?i)(^|[\\/"''\s])BRAVO_MAINTENANCE\.ps1\b' -and $commandLine -notmatch '(?i)(^|\s)[-/]RecoverServices\b') {
+            return (& $deny ('виконується BRAVO_MAINTENANCE (pid=' + $processId + ')'))
+        }
+    }
+    if ($null -eq $HolderRecheck) { return (& $deny 'повторно метадані власника не прочитано') }
+    foreach ($fieldName in @('Operation', 'Pid', 'ProcessStartTime', 'StartedAt', 'HostName')) {
+        if ([string]$HolderRecheck.$fieldName -ne [string]$Holder.$fieldName) {
+            return (& $deny 'метадані власника змінилися під час перевірки')
+        }
+    }
+    return [pscustomobject]@{ Allowed = $true; Reason = $null }
+}
+
+function Resolve-BRAVOServiceRecoveryLockBypass {
+    # Збирає докази для Test-BRAVOServiceRecoveryLockHolderAllowsRecovery:
+    # власник lock-а (Read-BRAVOOperationLockHolder, BRAVO.System), а для
+    # запису Archive — процеси PowerShell і повторне читання власника після
+    # паузи -RecheckDelaySeconds. Повертає { Allowed; Reason; Holder }.
+    param(
+        [AllowNull()][string]$LockPath,
+        [int]$RecheckDelaySeconds = 2
+    )
+
+    $holder = $null
+    if (-not [string]::IsNullOrWhiteSpace($LockPath)) { $holder = Read-BRAVOOperationLockHolder -Path $LockPath }
+    $processes = $null
+    $holderRecheck = $null
+    if ($null -ne $holder -and [string]$holder.Operation -eq 'Archive') {
+        try { $processes = @(Get-BRAVOServiceRecoveryPowerShellProcess) } catch { $processes = $null }
+        Start-Sleep -Seconds $RecheckDelaySeconds
+        $holderRecheck = Read-BRAVOOperationLockHolder -Path $LockPath
+    }
+    $decision = Test-BRAVOServiceRecoveryLockHolderAllowsRecovery -Holder $holder -HostName ([Environment]::MachineName) `
+        -Processes $processes -CurrentProcessId $PID -HolderRecheck $holderRecheck
+    return [pscustomobject]@{ Allowed = [bool]$decision.Allowed; Reason = [string]$decision.Reason; Holder = $holder }
+}
+
+function Test-BRAVOServiceRecoveryOwnMarkerHeld {
+    # Чинний ownership-маркер записав саме цей процес. Відсутній,
+    # невалідний, чужий чи нечитабельний маркер — $false: службами вже
+    # розпоряджається інший власник (рев'ю PR #432, Codex P1).
+    try {
+        $markerState = Read-BRAVOServiceQuiescenceState
+        if ($null -eq $markerState) { return $false }
+        return [bool](Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess -State $markerState)
+    } catch {
+        return $false
+    }
 }
 
 function Convert-BRAVOServiceRecoveryOrphanedOwnConditions {
@@ -485,17 +583,23 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
     # DataRestore — власник сам підніме служби (код 20). Зайнятий BRAVO_ARCHIV
     # (Archive / BackupCatchUp / BAZASync, operation=Archive) — він служб не
     # зупиняє й не запускає, тож відновлення йде без lock-а (рев'ю PR #432,
-    # B-P2-2): маркер fail-closed, state-файл атомарний, а реставрацію від
-    # запущених служб захищає Confirm-BRAVOServicesQuiesced.
+    # B-P2-2), але лише коли володіння Archive ПІДТВЕРДЖЕНО (Codex P1: метадані
+    # lock-а бувають застарілими) — Resolve-BRAVOServiceRecoveryLockBypass; будь-яка
+    # невизначеність — код 20. Без lock-а: маркер fail-closed, перед кожним
+    # запуском служби — перевірка, що маркер досі наш, state-файл атомарний, а
+    # реставрацію від запущених служб захищає Confirm-BRAVOServicesQuiesced.
     $lockResult = Enter-BRAVOMaintenanceOperationLock -TaskType Maintenance -NoWait
     $lockHeld = [bool]$lockResult.Success
     $lockHolder = $null
     if (-not $lockHeld) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$lockResult.Path)) { $lockHolder = Read-BRAVOOperationLockHolder -Path ([string]$lockResult.Path) }
-        if (-not (Test-BRAVOServiceRecoveryLockHolderAllowsRecovery -Holder $lockHolder -HostName ([Environment]::MachineName))) {
+        $lockBypass = Resolve-BRAVOServiceRecoveryLockBypass -LockPath ([string]$lockResult.Path)
+        $lockHolder = $lockBypass.Holder
+        if (-not $lockBypass.Allowed) {
             $holderText = 'невідомо'
             if ($null -ne $lockHolder) { $holderText = [string]$lockHolder.Description }
-            Write-BRAVOMaintenanceServiceRecoveryDayLine -Message ('Відновлення служб відкладено: операційний lock зайнятий (' + [string]$lockResult.Path + '); тримає: ' + $holderText + '; служби не змінювались')
+            $bypassText = ''
+            if ($null -ne $lockHolder -and [string]$lockHolder.Operation -eq 'Archive') { $bypassText = '; відновлення без lock-а не підтверджено: ' + [string]$lockBypass.Reason }
+            Write-BRAVOMaintenanceServiceRecoveryDayLine -Message ('Відновлення служб відкладено: операційний lock зайнятий (' + [string]$lockResult.Path + '); тримає: ' + $holderText + $bypassText + '; служби не змінювались')
             return (Resolve-BRAVOExitCode -LockBusy)
         }
     } else {
@@ -507,7 +611,7 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
         if (-not $lockHeld) {
             Write-Log -Message ('Операційний lock (' + [string]$lockResult.Path + ') тримає BRAVO_ARCHIV (' + [string]$lockHolder.Description + '): він служб не зупиняє — відновлення виконується без lock-а') -Level "INFO"
         }
-        Invoke-BRAVOMaintenanceServiceRecoveryUnderLock -ServiceSet $serviceSet -StatePath $statePath -Outcome $Outcome
+        Invoke-BRAVOMaintenanceServiceRecoveryUnderLock -ServiceSet $serviceSet -StatePath $statePath -Outcome $Outcome -LockHeld $lockHeld
         $exitCode = Get-BRAVOMaintenanceResolvedExitCode
         $finalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $exitCode
         Write-Log -Message "=== СТАТУС: $($finalStatus.Text) ($exitCode — $(Get-BRAVOExitCodeName -Code $exitCode)) ===" -Level "INFO"
@@ -523,11 +627,14 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
 function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
     # Кроки 4-11 FR-3 під operation-lock. Результат — у прапорцях прогону
     # ($script:criticalErrorOccurred, лічильник WARNING), з них викликач
-    # обчислює код завершення.
+    # обчислює код завершення. -LockHeld $false — lock тримає підтверджений
+    # BRAVO_ARCHIV (Resolve-BRAVOServiceRecoveryLockBypass): перед кожним
+    # запуском служби перевіряється, що ownership-маркер досі наш.
     param(
         [Parameter(Mandatory = $true)][object]$ServiceSet,
         [AllowNull()][string]$StatePath,
-        [hashtable]$Outcome = @{ NotifiedKeys = @(); FailedNotifications = 0; CoveredCriticalFrom = -1; CoveredCriticalTo = -1 }
+        [hashtable]$Outcome = @{ NotifiedKeys = @(); FailedNotifications = 0; CoveredCriticalFrom = -1; CoveredCriticalTo = -1 },
+        [bool]$LockHeld = $true
     )
 
     $now = [DateTimeOffset]::Now
@@ -715,17 +822,31 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
         -WebLogsEnabled ([bool]$ApacheEnabled) `
         -Counters $serviceLogCounters
 
-    # Крок 9: запуск у канонічному порядку.
+    # Крок 9: запуск у канонічному порядку — по одній службі тим самим циклом
+    # служб. Без lock-а (рев'ю PR #432, Codex P1) перед кожним запуском маркер
+    # має бути досі наш: інакше lock і службами розпоряджається інший власник (нічний
+    # Maintenance перезаписує маркер) — запуск скасовується, WARNING.
     Write-Log -Message "=== ЗАПУСК СЛУЖБ ===" -Level "INFO"
-    $startOutcome = @{ RestartFailed = $false }
+    $startOutcome = @{ RestartFailed = $false; Attempted = @{}; Started = @{} }
     $Outcome.CoveredCriticalFrom = $script:CriticalErrorsList.Count
-    Invoke-BRAVOMaintenanceServiceStartSequence `
-        -ServiceSet $chainServiceSet `
-        -RestartIntent $restartIntent `
-        -TraceConfiguration $traceConfiguration `
-        -StartTimeoutSeconds $ServiceStartTimeoutSeconds `
-        -PollIntervalSeconds $ServicePollIntervalSeconds `
-        -Outcome $startOutcome
+    foreach ($startKey in @('Bravo', 'ExchangeApi', 'BravoWeb')) {
+        if (-not $restartIntent[$startKey]) { continue }
+        if (-not $LockHeld -and -not (Test-BRAVOServiceRecoveryOwnMarkerHeld)) {
+            Write-Log -Message "Ownership-маркер більше не належить профілю -RecoverServices (його перейняв інший власник) — запуск служб скасовано, службами розпоряджається він" -Level "WARNING"
+            break
+        }
+        $keyOutcome = @{ RestartFailed = $false }
+        Invoke-BRAVOMaintenanceServiceStartSequence `
+            -ServiceSet $chainServiceSet `
+            -RestartIntent @{ Bravo = ($startKey -eq 'Bravo'); ExchangeApi = ($startKey -eq 'ExchangeApi'); BravoWeb = ($startKey -eq 'BravoWeb') } `
+            -TraceConfiguration $traceConfiguration `
+            -StartTimeoutSeconds $ServiceStartTimeoutSeconds `
+            -PollIntervalSeconds $ServicePollIntervalSeconds `
+            -Outcome $keyOutcome
+        if ($keyOutcome.Attempted[$startKey]) { $startOutcome.Attempted[$startKey] = $true }
+        if ($keyOutcome.Started[$startKey]) { $startOutcome.Started[$startKey] = $true }
+        if ($keyOutcome.RestartFailed) { $startOutcome.RestartFailed = $true }
+    }
     $Outcome.CoveredCriticalTo = $script:CriticalErrorsList.Count
 
     # Крок 10: облік спроби (лише впалі служби, які справді запускали).
