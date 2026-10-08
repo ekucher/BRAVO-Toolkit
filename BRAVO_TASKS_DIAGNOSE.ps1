@@ -66,7 +66,7 @@ function Get-BRAVOTaskResultDescription {
 
 function Format-BRAVODiagnoseTaskNextRun {
     param(
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")]
         [string]$TaskType,
         $TaskSettings,
         $NextRunTime
@@ -148,7 +148,10 @@ function Test-BRAVOScheduledTaskDefinition {
         [string[]]$RequiredArgumentTokens,
         [Parameter(Mandatory = $true)][string]$ExpectedAccount,
         [Parameter(Mandatory = $true)][int]$ExpectedLogonType,
-        [Parameter(Mandatory = $true)][int]$ExpectedRunLevel
+        [Parameter(Mandatory = $true)][int]$ExpectedRunLevel,
+        # #314: поточні відображувані імена керованих служб для звірки
+        # фільтра події 7036 задачі ServiceRecovery; $null — не звіряти.
+        [AllowNull()][string[]]$ServiceRecoveryStopEventDisplayNames = $null
     )
 
     $problems = New-Object System.Collections.Generic.List[string]
@@ -267,6 +270,22 @@ function Test-BRAVOScheduledTaskDefinition {
             if ($actualDaysMask -ne $expectedDaysMask) {
                 $problems.Add("DaysOfWeek=$actualDaysMask, очікується $expectedDaysMask ($($TaskSettings.WeeklyOn))")
             }
+        }
+    }
+
+    # ServiceRecovery (#314 FR-4): наявність і параметри всіх трьох тригерів
+    # (подія Service Control Manager, старт ОС, кожні 15 хв) і фіксовані
+    # MultipleInstances/StartWhenAvailable/ExecutionTimeLimit — тим самим
+    # канонічним описом (BRAVO.System), за яким задачу будує Installer.
+    # З -ServiceRecoveryStopEventDisplayNames — ще й фільтр події 7036
+    # (штатна зупинка) проти поточних відображуваних імен служб.
+    if ($TaskType -eq 'ServiceRecovery') {
+        $serviceRecoveryCheckArguments = @{ Definition = $definition }
+        if ($null -ne $ServiceRecoveryStopEventDisplayNames) {
+            $serviceRecoveryCheckArguments['ExpectedStopEventDisplayNames'] = @($ServiceRecoveryStopEventDisplayNames)
+        }
+        foreach ($serviceRecoveryProblem in @(Test-BRAVOServiceRecoveryTaskDefinition @serviceRecoveryCheckArguments)) {
+            $problems.Add([string]$serviceRecoveryProblem)
         }
     }
 
@@ -416,8 +435,9 @@ try {
         BAZASync      = @('-NoPause', '-SyncBAZA')
         RestoreVerify = @('-NoPause', '-NotifyOnSuccess')
         BackupCatchUp = @('-NoPause', '-CatchUpMissedBackup')
+        ServiceRecovery = @('-NoPause', '-RecoverServices')
     }
-    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")) {
+    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")) {
         $settings = $schedulerSettings[$taskType]
         if ($null -eq $settings -or -not [bool]$settings.Enabled) {
             Write-Host "[SKIP] ${taskType}: вимкнено в конфігурації" -ForegroundColor Gray
@@ -473,7 +493,21 @@ try {
         # Installer. Diagnose перевіряє фактичне визначення проти НЬОГО, а не
         # проти жорстко прописаних SYSTEM/5/1.
         $expectedPrincipal = Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings $schedulerSettings
+        # #314: фільтр події 7036 задачі ServiceRecovery звіряється з
+        # відображуваними іменами служб, прочитаними так само, як інсталятор.
+        $serviceRecoveryStopEventDisplayNames = $null
+        if ($taskType -eq 'ServiceRecovery') {
+            $discoveryVariableForTask = Get-Variable -Name bravoDiscoveryResult -Scope Global -ErrorAction SilentlyContinue
+            $serviceRecoveryStopEventFilter = Get-BRAVOServiceRecoveryStopEventFilter -ServiceNames @(Get-BRAVOServiceRecoveryManagedServiceNames `
+                -ServicesSettings $maintenanceSettings.Services `
+                -DiscoveryResult $(if ($null -ne $discoveryVariableForTask) { $discoveryVariableForTask.Value }))
+            foreach ($serviceRecoveryStopEventWarning in @($serviceRecoveryStopEventFilter.Warnings)) {
+                Write-Host "[WARN] ${taskType}: $serviceRecoveryStopEventWarning (штатну зупинку підхопить 15-хвилинний тик)" -ForegroundColor Yellow
+            }
+            $serviceRecoveryStopEventDisplayNames = @($serviceRecoveryStopEventFilter.DisplayNames)
+        }
         $definitionProblems = @(Test-BRAVOScheduledTaskDefinition `
+            -ServiceRecoveryStopEventDisplayNames $serviceRecoveryStopEventDisplayNames `
             -TaskType $taskType `
             -RegisteredTask $registeredTask `
             -TaskSettings $settings `

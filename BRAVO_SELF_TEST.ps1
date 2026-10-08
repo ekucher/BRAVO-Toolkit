@@ -10103,15 +10103,21 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Maintenance/TraceSftpBlockGloballyDisabledSkipsCredentialsAndSession' `
         -Failure 'componentSettings.SFTP.Enabled=false має пропускати credential-читання ($traceSftpLogin = Get-BRAVOCredentialSecret) і відкриття WinSCP-сесії ПОВНІСТЮ — обидва мусять залишатись у "else"-гілці (SFTP увімкнено), не досяжній при глобально вимкненому SFTP'
 
+    # #314 FR-2 (хвиля 3) свідомо змінила поведінку: зупинена до прогону
+    # служба (не Disabled) більше не дає окремого сповіщення «служби не
+    # запущені» з обіцянкою зберегти стан — Maintenance її запускає, а в
+    # підсумку пише INFO. Поведінку перевіряє suite ServiceRecovery.
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
-            $maintenanceScriptText.Contains("СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE") -and
+            -not $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
+            -not $maintenanceScriptText.Contains("СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE") -and
+            -not $maintenanceScriptText.Contains("збереже початковий стан") -and
+            $maintenanceScriptText.Contains("Add-BRAVOMaintenanceFailedServiceRestartIntent") -and
             $maintenanceScriptText.Contains("BRAVO.Notifications") -and
             $notificationScriptText.Contains('$newlineLength = if ($currentChunk.Length -gt 0) {')
         ) `
-        -Name "Notifications/MaintenanceInactiveServices" `
-        -Failure "maintenance має негайно сповіщати про початково зупинені служби"
+        -Name "Notifications/MaintenanceStoppedServicesStartedWithoutPreWarning" `
+        -Failure "#314 FR-2: maintenance не повинен надсилати сповіщення «служби не запущені» з обіцянкою зберегти стан — зупинену службу (не Disabled) він запускає"
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains("RunMissedRestoreOnly") -and
@@ -12102,7 +12108,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 ) `
                 -Name 'Maintenance/ForceRestoreDisabledKillsStrayBis' `
                 -Failure 'при -ForceRestore + Disabled має завершуватись сторонній Bis тим самим хелпером Stop-BRAVOMaintenanceStrayProcess'
-        } $maintenanceRestoreWindowText
+        } ($maintenanceRestoreWindowText + "`r`n" + [IO.File]::ReadAllText(
+                (Join-Path $PSScriptRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1')
+            ))
 
         # Structural: обидва бар'єри реально СТОЯТЬ там, де мають — перед
         # входом у restore sequence і безпосередньо перед bravocmd.exe, а не
@@ -14971,7 +14979,7 @@ try {
         $maintenanceWrapperProbeEmit = @'
 [pscustomobject]@{
     Bound = ((@($PSBoundParameters.Keys) | Sort-Object) -join ',')
-    Values = ((@(foreach ($probeName in @('ForceRestore', 'RunMissedRestoreOnly', 'DisableSizeCheck', 'EnableAllSlack', 'DisableAllSlack', 'AutoShutdown', 'ArchiveAfterMaintenance', 'ConfigPath', 'ConfigPathWasExplicit', 'NoPause', 'RuntimeRoot', 'EntryScriptPath')) {
+    Values = ((@(foreach ($probeName in @('ForceRestore', 'RunMissedRestoreOnly', 'RecoverServices', 'DisableSizeCheck', 'EnableAllSlack', 'DisableAllSlack', 'AutoShutdown', 'ArchiveAfterMaintenance', 'ConfigPath', 'ConfigPathWasExplicit', 'NoPause', 'RuntimeRoot', 'EntryScriptPath')) {
         $probeValue = Get-Variable -Name $probeName -ValueOnly
         '{0}={1}:{2}' -f $probeName, $(if ($null -eq $probeValue) { 'null' } else { $probeValue.GetType().Name }), [string]$probeValue
     })) -join ';')
@@ -14987,7 +14995,7 @@ try {
                 @{ RuntimeRoot = 'R'; EntryScriptPath = 'E' },
                 @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; AutoShutdown = 'on'; ArchivLims = 'off' },
                 @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; ConfigPath = 'C:\probe\BRAVO.config'; ConfigPathWasExplicit = $true; NoPause = $true; ForceRestore = $true; DisableAllSlack = $true },
-                @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; EnableAllSlack = $false; ArchiveAfterMaintenance = 'on'; RunMissedRestoreOnly = $true; DisableSizeCheck = $true }
+                @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; EnableAllSlack = $false; ArchiveAfterMaintenance = 'on'; RunMissedRestoreOnly = $true; DisableSizeCheck = $true; RecoverServices = $true }
             )) {
             $maintenanceWrapperDirect = @(& $maintenanceWrapperDirectProbe @maintenanceWrapperProbeArguments)
             $maintenanceWrapperWrapped = @(& $maintenanceWrapperWrappedProbe @maintenanceWrapperProbeArguments)
@@ -15299,6 +15307,23 @@ function Suspend-BRAVOServiceAutostart {
     foreach ($probeHeld in @($Snapshot)) { Add-ProbeEvent ("HOLD " + [string]$probeHeld.Name) }
     return [pscustomobject]@{ Applied = @(@($Snapshot) | ForEach-Object { [string]$_.Name }); Failed = @() }
 }
+# #314 FR-1/FR-2: класифікація керованої служби (BRAVO.System у пробі не
+# імпортовано). Тип запуску — з $script:ProbeConditionStartModes (ім'я -> тип),
+# маркер — $script:ProbeForeignRestartIntent, ExitCode — $script:ProbeExitCodes.
+# Без $script:ProbeConditionStartModes служба класифікується як Disabled:
+# жодної впалої служби, оркестрація — рівно така, як до FR-2 (той самий
+# прийом, що в Get-BRAVOServiceRegistryStartMode нижче). Стан читається з
+# таблиці напряму, без побічних ефектів стабу Get-Service.
+function Get-BRAVOManagedServiceCondition {
+    param([string]$Name)
+    $probeStatus = [string]$script:ProbeServices[$Name]
+    $probeStartMode = 'Disabled'
+    if ($null -ne $script:ProbeConditionStartModes -and $script:ProbeConditionStartModes.ContainsKey($Name)) { $probeStartMode = [string]$script:ProbeConditionStartModes[$Name] }
+    $probeCondition = if ($probeStartMode -eq 'Disabled') { 'Disabled' } elseif ($probeStatus -eq 'Running') { 'Running' } elseif (@('StartPending', 'StopPending', 'ContinuePending', 'PausePending') -contains $probeStatus) { 'Pending' } elseif (@($script:ProbeForeignRestartIntent) -contains $Name) { 'OwnedByBravo' } else { 'Failed' }
+    $probeExitCode = 0
+    if ($null -ne $script:ProbeExitCodes -and $script:ProbeExitCodes.ContainsKey($Name)) { $probeExitCode = $script:ProbeExitCodes[$Name] }
+    return [pscustomobject]@{ Name = $Name; Exists = $true; StartMode = $probeStartMode; Status = $probeStatus; ExitCode = $probeExitCode; ServiceSpecificExitCode = 0; Condition = $probeCondition }
+}
 function Get-BRAVOSevenZipExitCodeDescription { param([int]$ExitCode) return 'self-test' }
 # #349: native-операція (7-Zip архів перед реставрацією, bravocmd) лише
 # реєструється; код 2 зупиняє реставрацію на першій же операції.
@@ -15579,6 +15604,21 @@ try {
             $probeFunctionTexts.Add($probeStatement.Extent.Text)
         }
     }
+    # Цикл служб і облік відновлення служб (#314) винесено в dot-source
+    # файли: їхні функції теж справжні.
+    foreach ($probeServiceFileName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1')) {
+        $probeServiceCycleText = [IO.File]::ReadAllText(
+            (Join-Path $RepositoryRoot ('modules\BRAVO.Maintenance\' + $probeServiceFileName)), [Text.Encoding]::UTF8)
+        $probeServiceCycleErrors = $null
+        $probeServiceCycleAst = [Management.Automation.Language.Parser]::ParseInput($probeServiceCycleText, [ref]$null, [ref]$probeServiceCycleErrors)
+        if (@($probeServiceCycleErrors).Count -gt 0) { throw "$probeServiceFileName не парситься: $($probeServiceCycleErrors[0].Message)" }
+        foreach ($probeStatement in @($probeServiceCycleAst.EndBlock.Statements)) {
+            if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                -not $probeStubNames.ContainsKey($probeStatement.Name)) {
+                $probeFunctionTexts.Add($probeStatement.Extent.Text)
+            }
+        }
+    }
     # Дослівна оркестрація до кінця зовнішнього try (включно з exit).
     # Затінені стабами визначення функцій усередині неї замінюються
     # пробілами, інакше вони перевизначили б стаб під час виконання.
@@ -15632,6 +15672,9 @@ try {
         ('$script:ProbeForeignRestartIntent = {0}' -f $(if ($Scenario -like 'StartMode*IntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { "@('BravoWeb')" } else { '@()' })),
         ('$script:ProbeForeignRestartSuppressed = {0}' -f $(if ($Scenario -eq 'StartModeSuppressedIntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { '$true' } else { '$false' })),
         '$script:ProbePendingReads = @{}',
+        # #314 FR-2: без типів запуску класифікація не бачить впалих служб (див. стаб).
+        '$script:ProbeConditionStartModes = $null',
+        '$script:ProbeExitCodes = $null',
         '$script:ProbeMarkerWrites = 0',
         ('$script:ProbeMarkerWriteFailFrom = {0}' -f $(if ($Scenario -eq 'StartModeLateAfterStopMarkerFailInitiallyStopped') { '2' } else { '0' })),
         # StuckStartPending: старт BRAVO не завершується (StartPending назавжди).
@@ -15744,6 +15787,15 @@ try {
         # exchangAPI вимкнена оператором (Disabled) — працює, але не керується.
         $probeRestoreSeed = @('$exchangAPIServiceEnabled = $false', '$exchangAPIServiceDisabled = $true') -join "`n"
     }
+    # #314: необов'язковий seed сценарію (scenario-seed.ps1 у каталозі
+    # сценарію) — останнє слово перед оркестрацією. Ним користуються
+    # характеризаційні сценарії циклу служб (suite ServiceRecovery), яким
+    # потрібні значення поза наборами за іменем сценарію вище.
+    $probeScenarioSeedPath = Join-Path $ProbeRoot 'scenario-seed.ps1'
+    $probeScenarioSeedFile = ''
+    if (Test-Path -LiteralPath $probeScenarioSeedPath -PathType Leaf) {
+        $probeScenarioSeedFile = [IO.File]::ReadAllText($probeScenarioSeedPath, [Text.Encoding]::UTF8)
+    }
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
         'function Invoke-BRAVOMaintenanceOrchestrationProbe {',
@@ -15753,6 +15805,7 @@ try {
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
         $probeRestoreSeed,
+        $probeScenarioSeedFile,
         'try {',
         $probeRegion.ToString(),
         ('} finally ' + $probeOuterTry.Finally.Extent.Text),
@@ -21489,6 +21542,14 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceQuiescence' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ServiceRecovery') {
+        Enter-BRAVOSelfTestSuite -Name 'ServiceRecovery'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ServiceRecovery') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceRecovery.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ServiceRecovery' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Enter-BRAVOSelfTestSection -Name 'Root/SizeSanity') { try {
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
@@ -22144,10 +22205,20 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
                 $rangeIdWaitGateIndex,
                 [Math]::Min(3600, $maintenanceScriptText.Length - $rangeIdWaitGateIndex))
         } else { '' }
-        $rangeIdStartFlagAssignments = [regex]::Matches(
+        # #314 (хвиля 2): запуск служби BRAVO (і прапорець) — у винесеному
+        # циклі служб BRAVO.Maintenance.ServiceCycle.ps1; у runtime прапорець
+        # лише скидається. Рахуємо присвоєння в обох файлах: рівно одне, і
+        # саме в success-гілці запуску BRAVO у циклі служб.
+        $rangeIdServiceCycleText = [IO.File]::ReadAllText(
+            (Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1'),
+            [Text.Encoding]::UTF8)
+        $rangeIdRuntimeFlagAssignments = [regex]::Matches(
             $maintenanceScriptText,
             [regex]::Escape('$script:bravoServiceStartedThisRun = $true'))
-        $rangeIdStartSuccessIndex = $maintenanceScriptText.IndexOf(
+        $rangeIdStartFlagAssignments = [regex]::Matches(
+            $rangeIdServiceCycleText,
+            [regex]::Escape('$script:bravoServiceStartedThisRun = $true'))
+        $rangeIdStartSuccessIndex = $rangeIdServiceCycleText.IndexOf(
             'Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"')
         Test-BRAVOCondition `
             -Condition (
@@ -22155,6 +22226,7 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
                 $rangeIdWaitGateWindow.Contains('$rangeIdWaitTimeoutSeconds = if ($script:bravoServiceStartedThisRun) { 30 } else { 0 }') -and
                 $rangeIdWaitGateWindow.Contains('Wait-BRAVORangeIdLogFile') -and
                 $rangeIdWaitGateWindow.Contains('-WaitedForFileSeconds $rangeIdWaitedForFileSeconds') -and
+                $rangeIdRuntimeFlagAssignments.Count -eq 0 -and
                 $rangeIdStartFlagAssignments.Count -eq 1 -and
                 $rangeIdStartSuccessIndex -ge 0 -and
                 $rangeIdStartFlagAssignments[0].Index -gt $rangeIdStartSuccessIndex -and
@@ -26187,7 +26259,8 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     # визначення могло б оголошуватись invalid у Diagnose.
     Test-BRAVOCondition `
         -Condition (
-            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")') -and
+            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")') -and
+            $tasksDiagnoseTextForRuntime.Contains("ServiceRecovery = @('-NoPause', '-RecoverServices')") -and
             $tasksDiagnoseTextForRuntime.Contains('function Test-BRAVOScheduledTaskDefinition') -and
             $tasksDiagnoseTextForRuntime.Contains('BAZASync      = @(''-NoPause'', ''-SyncBAZA'')') -and
             $tasksDiagnoseTextForRuntime.Contains('Recovery      = @(''-NoPause'', ''-RunMissedRestoreOnly'')') -and
@@ -26730,9 +26803,12 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
         $lockLogRuns = @{}
         try {
             [void](New-Item -ItemType Directory -Path $lockLogRoot -Force -ErrorAction Stop)
+            # Рев'ю PR #432 (B-P2-2): peek власника — канонічний
+            # Read-BRAVOOperationLockHolder (BRAVO.System), тож він входить у модуль тесту.
+            $lockLogSystemText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8)
             $lockLogModule = New-BRAVOSelfTestRuntimeModule `
-                -SourceText ($lockLogStubs + "`n" + $maintenanceScriptText) `
-                -FunctionNames @('Start-Sleep', 'Write-Log', 'Set-LockLogHolder', 'Enter-BRAVOMaintenanceOperationLock')
+                -SourceText ($lockLogStubs + "`n" + $maintenanceScriptText + "`n" + $lockLogSystemText) `
+                -FunctionNames @('Start-Sleep', 'Write-Log', 'Set-LockLogHolder', 'Enter-BRAVOMaintenanceOperationLock', 'Read-BRAVOOperationLockHolder')
             foreach ($lockLogCase in @('Readable', 'Unreadable', 'PartialJson')) {
                 $lockLogPath = Join-Path $lockLogRoot "BRAVO_OPERATION_$lockLogCase.lock"
                 # Readable/PartialJson: holder тримає FileShare.Read (як справжній lock) —
@@ -27279,6 +27355,25 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 -Name "Config/BackupCatchUpDerived" `
                 -Failure "schedulerSettings.BackupCatchUp: TaskName BRAVO_ARCHIV_CATCHUP, затримка 5-10 хв, ScriptPath BRAVO_ARCHIV.ps1, Enabled = Backup.Enabled і не Recovery.Enabled"
         }
+        & {
+            # #314 FR-4: похідний вузол задачі BRAVO_SERVICE_RECOVERY — завжди,
+            # коли увімкнено Maintenance; профіль -RecoverServices з RuntimeRoot.
+            $serviceRecoveryTaskSettings = $null
+            if ($global:schedulerSettings.Contains('ServiceRecovery')) {
+                $serviceRecoveryTaskSettings = $global:schedulerSettings.ServiceRecovery
+            }
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -ne $serviceRecoveryTaskSettings -and
+                    [string]$serviceRecoveryTaskSettings.TaskName -eq 'BRAVO_SERVICE_RECOVERY' -and
+                    [string]$serviceRecoveryTaskSettings.ScriptPath -like '*BRAVO_MAINTENANCE.ps1' -and
+                    ([string]$serviceRecoveryTaskSettings.ScriptPath).StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                    [double]$serviceRecoveryTaskSettings.ExecutionTimeLimitHours -eq 1 -and
+                    [bool]$serviceRecoveryTaskSettings.Enabled -eq [bool]$global:schedulerSettings.Maintenance.Enabled
+                ) `
+                -Name "Config/ServiceRecoveryDerived" `
+                -Failure "schedulerSettings.ServiceRecovery: TaskName BRAVO_SERVICE_RECOVERY, ScriptPath BRAVO_MAINTENANCE.ps1 з RuntimeRoot, ExecutionTimeLimitHours 1, Enabled = Maintenance.Enabled"
+        }
     } finally {
         Remove-Item -LiteralPath $separateConfigRoot -Recurse -Force -ErrorAction SilentlyContinue
         # Відновити ізольований стан без залежності від служби BRAVO на CI runner.
@@ -27388,6 +27483,65 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
         -Name "TaskDefinition/RecoveryIsSingleBootTriggerWithoutRepetition" `
         -Failure "Recovery-завдання (5.2.0) має мати РІВНО один boot-trigger (Type=8, Enabled=true) БЕЗ Repetition і БЕЗ daily-тригера — 24/7-профіль підхоплює пропущений слот плановим Maintenance, а не окремим розкладом"
 
+    # --- TaskDefinition/ServiceRecoveryComDefinitionHasThreeTriggers (#314
+    # FR-4, ТЗ §6 п. 8): той самий New-BRAVOTaskDefinition на справжньому COM
+    # Schedule.Service (визначення лише в пам'яті, нічого не реєструється).
+    # XML задачі BRAVO_SERVICE_RECOVERY містить рівно три тригери: EventTrigger
+    # (Service Control Manager, Delay PT1M), BootTrigger (Delay PT10M) і
+    # CalendarTrigger з Repetition PT15M / P1D; дія — -RecoverServices -NoPause;
+    # канонічна перевірка Diagnose (Test-BRAVOServiceRecoveryTaskDefinition) на
+    # цьому ж COM-визначенні проблем не знаходить. Підробленим COM ту саму
+    # логіку на будь-якій ОС перевіряє suite ServiceRecovery.
+    $serviceRecoveryTaskServiceForTest = New-Object -ComObject "Schedule.Service"
+    $serviceRecoveryTaskServiceForTest.Connect()
+    $serviceRecoveryComOk = $false
+    $serviceRecoveryComDetail = ''
+    try {
+        $serviceRecoveryComInfo = & $recoveryTriggerModule {
+            param($TaskService, $TaskSettings, $ConfigPath)
+            $result = New-BRAVOTaskDefinition `
+                -TaskService $TaskService `
+                -TaskSettings $TaskSettings `
+                -TaskType 'ServiceRecovery' `
+                -ResolvedConfigPath $ConfigPath
+            [pscustomobject]@{
+                Xml = [string]$result.Definition.XmlText
+                Arguments = [string]@($result.Definition.Actions)[0].Arguments
+                Problems = @(Test-BRAVOServiceRecoveryTaskDefinition -Definition $result.Definition)
+            }
+        } $serviceRecoveryTaskServiceForTest $global:schedulerSettings.ServiceRecovery $resolvedConfig
+        $serviceRecoveryXml = [xml]$serviceRecoveryComInfo.Xml
+        $serviceRecoveryNs = New-Object System.Xml.XmlNamespaceManager($serviceRecoveryXml.NameTable)
+        $serviceRecoveryNs.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        $serviceRecoveryNodeText = {
+            param([string]$XPath)
+            $node = $serviceRecoveryXml.SelectSingleNode($XPath, $serviceRecoveryNs)
+            if ($null -eq $node) { return '' }
+            return [string]$node.InnerText
+        }
+        $serviceRecoveryComOk = (
+            @($serviceRecoveryXml.SelectNodes('/t:Task/t:Triggers/*', $serviceRecoveryNs)).Count -eq 3 -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:EventTrigger/t:Delay') -eq 'PT1M' -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:EventTrigger/t:Subscription').Contains("Provider[@Name='Service Control Manager']") -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:BootTrigger/t:Delay') -eq 'PT10M' -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:CalendarTrigger/t:Repetition/t:Interval') -eq 'PT15M' -and
+            (& $serviceRecoveryNodeText '/t:Task/t:Triggers/t:CalendarTrigger/t:Repetition/t:Duration') -eq 'P1D' -and
+            $serviceRecoveryComInfo.Arguments.Contains('-RecoverServices') -and
+            $serviceRecoveryComInfo.Arguments.Contains('-NoPause') -and
+            @($serviceRecoveryComInfo.Problems).Count -eq 0
+        )
+        $serviceRecoveryComDetail = "Arguments='$($serviceRecoveryComInfo.Arguments)'; проблеми: $(@($serviceRecoveryComInfo.Problems) -join ' | ')"
+    } catch {
+        $serviceRecoveryComOk = $false
+        $serviceRecoveryComDetail = $_.Exception.Message
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($serviceRecoveryTaskServiceForTest)
+    }
+    Test-BRAVOCondition `
+        -Condition $serviceRecoveryComOk `
+        -Name "TaskDefinition/ServiceRecoveryComDefinitionHasThreeTriggers" `
+        -Failure "#314 FR-4: COM-визначення BRAVO_SERVICE_RECOVERY — три тригери (EventTrigger Service Control Manager / PT1M, BootTrigger / PT10M, CalendarTrigger з Repetition PT15M / P1D), дія -RecoverServices -NoPause, перевірка Diagnose без проблем. $serviceRecoveryComDetail"
+
     # --- TaskDefinition/ConfigPathAutoExplicitMatrix (P0 Configuration
     # Foundation, PR C, Секція 6): МЕХАНІЧНА перевірка ЗГЕНЕРОВАНИХ
     # Arguments реального ITaskDefinition (через New-BRAVOTaskDefinition,
@@ -27399,7 +27553,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
     $configPathMatrixTaskServiceForTest.Connect()
     $configPathMatrixFailures = New-Object System.Collections.Generic.List[string]
     try {
-        foreach ($matrixTaskType in @('Backup', 'Maintenance', 'Health', 'Recovery', 'BAZASync', 'RestoreVerify')) {
+        foreach ($matrixTaskType in @('Backup', 'Maintenance', 'Health', 'Recovery', 'BAZASync', 'RestoreVerify', 'ServiceRecovery')) {
             $matrixTaskSettings = $global:schedulerSettings.$matrixTaskType
             foreach ($matrixCase in @(
                     @{ Explicit = $false; Label = 'AUTO' },
@@ -27433,7 +27587,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
     Test-BRAVOCondition `
         -Condition ($configPathMatrixFailures.Count -eq 0) `
         -Name "TaskDefinition/ConfigPathAutoExplicitMatrix" `
-        -Failure "AUTO-встановлене завдання не повинно містити -ConfigPath у Arguments, EXPLICIT — точний шлях; для ВСІХ типів завдань (Backup/Maintenance/Health/Recovery/BAZASync/RestoreVerify). Розбіжності: $($configPathMatrixFailures -join ' | ')"
+        -Failure "AUTO-встановлене завдання не повинно містити -ConfigPath у Arguments, EXPLICIT — точний шлях; для ВСІХ типів завдань (Backup/Maintenance/Health/Recovery/BAZASync/RestoreVerify/ServiceRecovery). Розбіжності: $($configPathMatrixFailures -join ' | ')"
 
     # --- BootRestore/StartTypeClassificationMatrix: класифікація дій
     # Set-BRAVOBootRestoreServiceStartType (BRAVO.System) для обох профілів;
@@ -27442,7 +27596,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
     # не чіпаються).
     $bootRestoreStartTypeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $systemSourceTextForScheduler `
-        -FunctionNames @('Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
+        -FunctionNames @('Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Set-BRAVOBootRestoreServiceStartType')
     $bootRestoreStartTypeProbe = & $bootRestoreStartTypeModule {
         $script:BRAVOSelfTestStartTypeStates = @{
             SVC_AUTO_PLAIN   = @{ StartType = 'Automatic'; Delayed = $false }
@@ -29090,17 +29244,25 @@ function Write-BRAVOLog {
         -Name 'Maintenance/SectionSeparatorsDoNotEmitBareLogRecords' `
         -Failure 'голий роздільник "==="/"=" у Maintenance Write-Log має лише return, без Write-BRAVOMaintenanceLogFile — реальний DEV-LIMS лог показував рядки зі 100 символами "=" між звичайними секціями без жодної діагностичної цінності'
 
+    # #314 (хвиля 2): заголовки обробки trace/exchangAPI пише винесений цикл
+    # служб (BRAVO.Maintenance.ServiceCycle.ps1), dot-source-нутий у scope
+    # runtime — тобто тим самим Write-Log Maintenance.
+    $maintenanceServiceCycleTextForHeadings = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1'),
+        [Text.Encoding]::UTF8)
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains('if ($Message -match "^=== .* ===$") {') -and
+            $maintenanceScriptText.Contains("'BRAVO.Maintenance.ServiceCycle.ps1'") -and
+            -not $maintenanceServiceCycleTextForHeadings.Contains('function Write-Log') -and
             $maintenanceScriptText.Contains('Write-BRAVOMaintenanceLogFile -Entry $Message') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ДЖЕРЕЛА ЖУРНАЛІВ ==="') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==="') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ЗУПИНКА СЛУЖБ ==="') -and
             $maintenanceScriptText.Contains('=== ПЕРЕВІРКА РОЗМІРІВ .MD ФАЙЛІВ ===') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== РЕСТАВРАЦІЯ МОДЕЛІ ==="') -and
-            $maintenanceScriptText.Contains('Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"') -and
-            $maintenanceScriptText.Contains('Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"') -and
+            $maintenanceServiceCycleTextForHeadings.Contains('Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"') -and
+            $maintenanceServiceCycleTextForHeadings.Contains('Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ==="') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ОЧИСТКА СТАРИХ ДАНИХ ==="') -and
             $maintenanceScriptText.Contains('Write-Log -Message "=== ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ ==="')

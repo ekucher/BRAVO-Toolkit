@@ -428,10 +428,20 @@ Test-BRAVOCondition `
     -Failure "Invoke-CommandWithLog під час ~2с процесу має видати >=1 running-підстатус формату '<Опис> — Виконується ...' і завершити скиданням detail=''; отримано ExitCode=$($runningDetailResult.ExitCode), ticks=$($runningTicks.Count), lastDetail='$(@($runningDetailResult.Calls)[-1])'"
 
 # --- Анкери коду: before-CSV+Compare розчеплені від CheckSize; гейт служб.
+# #314 (хвиля 2): запуск служб винесено в Invoke-BRAVOMaintenanceServiceStartSequence
+# (BRAVO.Maintenance.ServiceCycle.ps1); runtime передає їй намір перезапуску
+# ($serviceWasRunning), а гейт цілісності стоїть у самій функції.
+$restoreSyntheticServiceCycleText = [IO.File]::ReadAllText(
+    (Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1'),
+    [Text.Encoding]::UTF8)
+$restoreSyntheticStartFunction = [regex]::Match($restoreSyntheticServiceCycleText, '(?s)function Invoke-BRAVOMaintenanceServiceStartSequence \{.*?\r?\n\}')
 Test-BRAVOCondition `
     -Condition (
         $restoreSyntheticRuntimeText.Contains('$recovery = Invoke-BRAVOModelRestoreRecovery') -and
-        $restoreSyntheticRuntimeText.Contains('$script:modelIntegrityEstablished -and $serviceWasRunning.Bravo')
+        $restoreSyntheticRuntimeText.Contains('-RestartIntent $serviceWasRunning') -and
+        $restoreSyntheticStartFunction.Success -and
+        $restoreSyntheticStartFunction.Value.Contains('$serviceWasRunning = $RestartIntent') -and
+        $restoreSyntheticStartFunction.Value.Contains('$script:modelIntegrityEstablished -and $serviceWasRunning.Bravo')
     ) `
     -Name "RestoreSynthetic/ServiceRestartGatedByIntegrity" `
     -Failure 'рестарт BRAVO має бути гейтований на $script:modelIntegrityEstablished, а recovery — через Invoke-BRAVOModelRestoreRecovery'

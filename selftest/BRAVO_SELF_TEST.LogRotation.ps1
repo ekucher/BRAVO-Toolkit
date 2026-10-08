@@ -1519,15 +1519,31 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         # Реальні служби не чіпаємо (ТЗ §103) — перевіряємо структуру:
         # уся ротація живе всередині try, а запуск служб — у finally, тому
         # жодна помилка ротації не може залишити production зупиненим.
+        # #314 (хвиля 2): тіла ротації й запуску служб винесено у функції
+        # BRAVO.Maintenance.ServiceCycle.ps1. Інваріант той самий: у runtime
+        # виклик обробки журналів стоїть у try, виклик запуску служб — у
+        # finally (після нього), а самі тіла живуть у відповідних функціях.
         $serviceRestoreBlockIndex = $maintenanceScriptText.IndexOf('=== ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ===')
-        $finallyIndex = $maintenanceScriptText.LastIndexOf('} finally {', $serviceRestoreBlockIndex)
-        $rotationIndex = $maintenanceScriptText.IndexOf('=== ОБРОБКА TRACE-ФАЙЛІВ ===')
+        $finallyIndex = $maintenanceScriptText.LastIndexOf('} finally {', [Math]::Max(0, $serviceRestoreBlockIndex))
+        $rotationCall = [regex]::Match($maintenanceScriptText, '(?m)^\s*Invoke-BRAVOMaintenanceServiceLogProcessing\s+`')
+        $rotationIndex = if ($rotationCall.Success) { $rotationCall.Index } else { -1 }
+        $serviceStartCall = [regex]::Match($maintenanceScriptText, '(?m)^\s*Invoke-BRAVOMaintenanceServiceStartSequence\s+`')
+        $serviceCycleTextForRotation = [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.ServiceCycle.ps1"),
+            [Text.Encoding]::UTF8
+        )
+        $rotationFunctionBody = [regex]::Match($serviceCycleTextForRotation, '(?s)function Invoke-BRAVOMaintenanceServiceLogProcessing \{.*?\r?\n\}')
+        $startFunctionBody = [regex]::Match($serviceCycleTextForRotation, '(?s)function Invoke-BRAVOMaintenanceServiceStartSequence \{.*?\r?\n\}')
         Test-BRAVOCondition `
             -Condition (
                 $serviceRestoreBlockIndex -gt 0 -and
                 $finallyIndex -gt 0 -and
                 $rotationIndex -gt 0 -and
                 $rotationIndex -lt $finallyIndex -and
+                $serviceStartCall.Success -and $serviceStartCall.Index -gt $serviceRestoreBlockIndex -and
+                $rotationFunctionBody.Success -and $rotationFunctionBody.Value.Contains('=== ОБРОБКА TRACE-ФАЙЛІВ ===') -and
+                -not $maintenanceScriptText.Contains('=== ОБРОБКА TRACE-ФАЙЛІВ ===') -and
+                $startFunctionBody.Success -and $startFunctionBody.Value.Contains('# 1. Запуск служби BRAVO') -and
                 $maintenanceScriptText.Contains('$serviceWasRunning') -and
                 $maintenanceScriptText.Contains('if ($serviceWasRunning.ExchangeApi) {') -and
                 $maintenanceScriptText.Contains('if ($serviceWasRunning.BravoWeb) {')

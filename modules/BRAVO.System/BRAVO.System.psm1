@@ -411,7 +411,7 @@ function Write-BRAVOServiceQuiescenceState {
     # по-своєму — watchdog не повинен резолвити сам).
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE')][string]$Owner,
+        [Parameter(Mandatory = $true)][ValidateSet('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE', 'BRAVO_MAINTENANCE_RECOVER')][string]$Owner,
         [Parameter(Mandatory = $true)][object[]]$Services,
         [string]$LogFile,
         [switch]$RestartSuppressed,
@@ -521,7 +521,7 @@ function Read-BRAVOServiceQuiescenceState {
         return $null
     }
     if ($null -eq $state.PSObject.Properties['schemaVersion'] -or [int]$state.schemaVersion -ne 1) { return $null }
-    if ([string]$state.owner -notin @('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE')) { return $null }
+    if ([string]$state.owner -notin @('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE', 'BRAVO_MAINTENANCE_RECOVER')) { return $null }
     if ([string]$state.hostname -ne [Environment]::MachineName) { return $null }
     foreach ($requiredPropertyName in @('pid', 'processStartTime', 'createdAt', 'logFile', 'restartSuppressed', 'services')) {
         if ($null -eq $state.PSObject.Properties[$requiredPropertyName]) { return $null }
@@ -661,6 +661,21 @@ function Get-BRAVOServiceDelayedAutoStart {
     return ([int]$properties.DelayedAutostart -eq 1)
 }
 
+function Get-BRAVOServiceWin32Info {
+    # Єдиний запит рядка Win32_Service за точним іменем служби (R379-3):
+    # раніше той самий WMI-запит дублювався в Get-BRAVOServiceStartMode і
+    # Get-BRAVOManagedServiceCondition. Повертає перший рядок або $null.
+    # Помилку WMI/CIM НЕ ковтає — кожен викликач обробляє її по-своєму
+    # (причина в FailureReason або тихий fallback). Наявність
+    # Get-BRAVOWmiInstance (BRAVO.Compatibility) перевіряє викликач.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $escapedName = $Name.Replace("'", "''")
+    return (@(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
+            Select-Object -First 1)
+}
+
 function Get-BRAVOServiceStartMode {
     # Єдиний канонічний читач типу запуску служби Windows (#319).
     # ServiceController.StartType існує лише з .NET Framework 4.6.1, а
@@ -743,9 +758,7 @@ function Get-BRAVOServiceStartMode {
         [void]$reasons.Add('Get-BRAVOWmiInstance (BRAVO.Compatibility) недоступна')
     } else {
         try {
-            $escapedName = $serviceName.Replace("'", "''")
-            $serviceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
-                Select-Object -First 1
+            $serviceInfo = Get-BRAVOServiceWin32Info -Name $serviceName
             $startModeProperty = if ($null -ne $serviceInfo) { $serviceInfo.PSObject.Properties['StartMode'] } else { $null }
             if ($null -eq $startModeProperty) {
                 [void]$reasons.Add('WMI не повернув Win32_Service.StartMode')
@@ -778,7 +791,11 @@ function Get-BRAVOManagedServiceCondition {
     #   Running      - працює;
     #   Pending      - StartPending/StopPending/ContinuePending/PausePending;
     #   Failed       - не працює, не Disabled і не під маркером. Automatic чи
-    #                  Manual на рішення не впливає (рішення власника #314).
+    #                  Manual на рішення не впливає (рішення власника #314);
+    #   Unknown      - не працює, а тип запуску не визначено ні з StartType,
+    #                  ні з WMI, ні з реєстру SCM. Такої служби BRAVO не
+    #                  запускає: вона могла бути вимкнена (fail-closed, рев'ю
+    #                  PR #432, B-P3-2).
     # Маркер мертвого власника теж дає OwnedByBravo: його відпрацьовує
     # Health-watchdog, а не загальна логіка «впалої» служби.
     #
@@ -833,9 +850,7 @@ function Get-BRAVOManagedServiceCondition {
         $ServiceInfo = $null
         if (-not $NoWmiQuery -and $null -ne (Get-Command -Name 'Get-BRAVOWmiInstance' -ErrorAction SilentlyContinue)) {
             try {
-                $escapedName = $result.Name.Replace("'", "''")
-                $ServiceInfo = @(Get-BRAVOWmiInstance -ClassName Win32_Service -Filter "Name = '$escapedName'") |
-                    Select-Object -First 1
+                $ServiceInfo = Get-BRAVOServiceWin32Info -Name $result.Name
             } catch {
                 $ServiceInfo = $null
             }
@@ -857,6 +872,23 @@ function Get-BRAVOManagedServiceCondition {
     $startModeResult = Get-BRAVOServiceStartMode -Service $Service -FallbackStartMode $fallbackStartMode -NoWmiQuery
     $result.StartMode = [string]$startModeResult.StartMode
     $result.StartModeSource = [string]$startModeResult.Source
+    # Рев'ю PR #432 (B-P3-2): ні StartType, ні WMI не дали тип запуску —
+    # останнє джерело реєстр SCM (Get-BRAVOServiceRegistryStartMode).
+    if ($result.StartMode -eq 'Unknown') {
+        $registryStartMode = $null
+        try { $registryStartMode = Get-BRAVOServiceRegistryStartMode -ServiceName $result.Name } catch { $registryStartMode = $null }
+        $registryMappedMode = $null
+        switch ([string]$registryStartMode) {
+            'Automatic' { $registryMappedMode = 'Automatic' }
+            'AutomaticDelayed' { $registryMappedMode = 'Automatic' }
+            'Manual' { $registryMappedMode = 'Manual' }
+            'Disabled' { $registryMappedMode = 'Disabled' }
+        }
+        if ($null -ne $registryMappedMode) {
+            $result.StartMode = $registryMappedMode
+            $result.StartModeSource = 'Registry'
+        }
+    }
 
     if (-not $PSBoundParameters.ContainsKey('QuiescenceState')) {
         try { $QuiescenceState = Read-BRAVOServiceQuiescenceState } catch { $QuiescenceState = $null }
@@ -898,6 +930,8 @@ function Get-BRAVOManagedServiceCondition {
         $result.Condition = 'Pending'
     } elseif ($markedForRestart) {
         $result.Condition = 'OwnedByBravo'
+    } elseif ($result.StartMode -eq 'Unknown') {
+        $result.Condition = 'Unknown'
     } else {
         $result.Condition = 'Failed'
     }
@@ -1604,4 +1638,434 @@ function Get-BRAVOOperationLockWaitBudget {
         Capped = $capped
         LimitDescription = $limitDescription
     }
+}
+
+function ConvertTo-BRAVOEventXPathLiteral {
+    # Рядковий літерал XPath 1.0 для фільтра журналу подій Windows, уже
+    # екранований для вставки в текст XML підписки (QueryList). Екранування
+    # лапок у XPath 1.0 немає: значення без апострофа береться в апострофи,
+    # значення з апострофом, але без подвійних лапок, — у подвійні лапки;
+    # значення з обома видами лапок записати неможливо — $null (викликач тоді
+    # не додає фільтр і пише попередження). &, < і > — XML-сутності.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+
+    $quote = "'"
+    if ($Value.Contains("'")) {
+        if ($Value.Contains('"')) { return $null }
+        $quote = '"'
+    }
+    $escaped = $Value.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    return ($quote + $escaped + $quote)
+}
+
+function Get-BRAVOServiceRecoveryManagedServiceNames {
+    # Імена керованих служб, які відновлює задача BRAVO_SERVICE_RECOVERY:
+    # BRAVO і exchangAPI з maintenanceSettings.Services, BRAVO Web — ім'я з
+    # discovery, коли компонент увімкнено (BravoWebEnabled). Єдиний перелік
+    # для інсталятора (журнал типів запуску, фільтр події 7036) і Diagnose.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowNull()][object]$ServicesSettings,
+        [AllowNull()][object]$DiscoveryResult
+    )
+
+    $names = @()
+    if ($null -eq $ServicesSettings) { return $names }
+    foreach ($settingName in @('BravoName', 'ExchangeApiName')) {
+        $value = $null
+        if ($ServicesSettings -is [System.Collections.IDictionary]) {
+            if ($ServicesSettings.Contains($settingName)) { $value = $ServicesSettings[$settingName] }
+        } elseif ($null -ne $ServicesSettings.PSObject.Properties[$settingName]) {
+            $value = $ServicesSettings.$settingName
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$value)) { $names += [string]$value }
+    }
+    $bravoWebEnabled = $false
+    try {
+        $bravoWebEnabledValue = $null
+        if ($ServicesSettings -is [System.Collections.IDictionary]) {
+            if ($ServicesSettings.Contains('BravoWebEnabled')) { $bravoWebEnabledValue = $ServicesSettings['BravoWebEnabled'] }
+        } elseif ($null -ne $ServicesSettings.PSObject.Properties['BravoWebEnabled']) {
+            $bravoWebEnabledValue = $ServicesSettings.BravoWebEnabled
+        }
+        $bravoWebEnabled = [System.Convert]::ToBoolean($bravoWebEnabledValue)
+    } catch {
+        $bravoWebEnabled = $false
+    }
+    if ($bravoWebEnabled -and $null -ne $DiscoveryResult -and
+        $null -ne $DiscoveryResult.PSObject.Properties['WebServiceName'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$DiscoveryResult.WebServiceName)) {
+        $names += [string]$DiscoveryResult.WebServiceName
+    }
+    return $names
+}
+
+function Get-BRAVOServiceRecoveryStopEventFilter {
+    # Відображувані імена керованих служб для фільтра події 7036 («служба
+    # перейшла в стан ...») event-тригера BRAVO_SERVICE_RECOVERY (#314):
+    # штатний Stop-Service пише в System log лише 7036, а її param1 —
+    # відображуване ім'я служби (не ім'я служби). Імена читаються під час
+    # інсталяції; Diagnose читає їх так само й звіряє із зареєстрованою
+    # підпискою. Служба, якої немає, або ім'я, яке не можна записати
+    # літералом XPath, у фільтр не потрапляє — текст у Warnings (тоді
+    # штатну зупинку цієї служби підхоплює лише 15-хвилинний тик). Лише
+    # читає. Повертає { DisplayNames; Warnings }.
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$ServiceNames = @())
+
+    $displayNames = @()
+    $warnings = @()
+    $seenNames = @()
+    foreach ($serviceName in @($ServiceNames)) {
+        if ([string]::IsNullOrWhiteSpace($serviceName) -or ($seenNames -contains $serviceName)) { continue }
+        $seenNames += $serviceName
+        $service = @(Get-Service -Name $serviceName -ErrorAction SilentlyContinue) | Select-Object -First 1
+        if ($null -eq $service) {
+            $warnings += "службу $serviceName не знайдено — її штатну зупинку (подія 7036) задача не відстежує"
+            continue
+        }
+        $displayName = [string]$service.DisplayName
+        if ([string]::IsNullOrWhiteSpace($displayName)) {
+            $warnings += "служба $serviceName не має відображуваного імені — її штатну зупинку (подія 7036) задача не відстежує"
+            continue
+        }
+        if ($null -eq (ConvertTo-BRAVOEventXPathLiteral -Value $displayName)) {
+            $warnings += "відображуване ім'я служби $serviceName містить і апостроф, і подвійні лапки — фільтр події 7036 для неї не додано"
+            continue
+        }
+        if ($displayNames -notcontains $displayName) { $displayNames += $displayName }
+    }
+    return [pscustomobject]@{ DisplayNames = @($displayNames); Warnings = @($warnings) }
+}
+
+function Read-BRAVOOperationLockHolder {
+    # Метадані власника спільного operation-lock (Archive / Maintenance /
+    # DataRestore): JSON, який власник пише у файл lock-а (pid,
+    # processStartTime, hostname, operation, startedAt, generationId).
+    # Читання — best-effort peek: власник тримає файл з FileShare.Read, тож
+    # читається й поки lock зайнятий; у вузькому вікні між відкриттям і
+    # записом власника вміст порожній або ще старий. $null — прочитати не
+    # вдалося. Повертає { Operation; Pid; ProcessStartTime; HostName;
+    # StartedAt; GenerationId; Description } (Description — рядок для
+    # журналу очікування lock-а: «operation=...; pid=...; ...», '?' для
+    # відсутніх полів). Лише читає.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $peekStream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        try {
+            $peekReader = New-Object System.IO.StreamReader($peekStream, [System.Text.Encoding]::UTF8)
+            $peekText = $peekReader.ReadToEnd()
+        } finally {
+            $peekStream.Dispose()
+        }
+        if ([string]::IsNullOrWhiteSpace($peekText)) { return $null }
+        $holderInfo = $peekText | ConvertFrom-Json
+        $fieldValue = {
+            param([string]$FieldName)
+            $holderProperty = $holderInfo.PSObject.Properties[$FieldName]
+            if ($null -ne $holderProperty) { return $holderProperty.Value }
+            return $null
+        }
+        $holderFields = foreach ($holderField in @('operation', 'pid', 'hostname', 'startedAt', 'generationId')) {
+            $value = & $fieldValue $holderField
+            "$holderField=$(if ($null -ne $value) { $value } else { '?' })"
+        }
+        $holderPid = & $fieldValue 'pid'
+        if ($null -ne $holderPid) { $holderPid = $holderPid -as [int] }
+        return [pscustomobject]@{
+            Operation = [string](& $fieldValue 'operation')
+            Pid = $holderPid
+            ProcessStartTime = [string](& $fieldValue 'processStartTime')
+            HostName = [string](& $fieldValue 'hostname')
+            StartedAt = [string](& $fieldValue 'startedAt')
+            GenerationId = [string](& $fieldValue 'generationId')
+            Description = (@($holderFields) -join '; ')
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Get-BRAVOServiceRecoveryTaskTriggerSpec {
+    # Канонічні параметри задачі Планувальника BRAVO_SERVICE_RECOVERY (#314
+    # FR-4; ТЗ §8 — константи в коді до cutover Config V2 #216). Задача
+    # запускає BRAVO_MAINTENANCE.ps1 -RecoverServices за трьома тригерами:
+    #   Event — події System log від Service Control Manager, затримка 1 хв:
+    #           падіння служби (7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034 —
+    #           той самий набір, що профіль збирає як докази) — без фільтра за
+    #           іменем: запуск через подію чужої служби коштує один швидкий
+    #           вихід профілю; і зміна стану (7036) лише керованих служб — за
+    #           їх відображуваними іменами (-StopEventDisplayNames, param1
+    #           події): штатний Stop-Service пише лише 7036. Без імен 7036 не
+    #           підписується (зупинку підхопить тик Daily);
+    #   Boot  — служба Automatic не піднялась після старту ОС; затримка 10 хв;
+    #   Daily — запасна перевірка кожні 15 хв протягом доби (подію могли
+    #           пропустити, а службу могли зупинити без події падіння).
+    # Обидва набори подій — окремі Select одного Query (об'єднання): XPath
+    # журналу подій (Windows 7 / Server 2008 R2+) підтримує
+    # EventData[Data[@Name='param1']='...'].
+    # MultipleInstances = IgnoreNew (2): шторм подій не запускає паралельних
+    # копій. StartWhenAvailable = false: пропущений 15-хвилинний тик не
+    # наздоганяється — наступний прийде сам. Інсталятор будує визначення
+    # (Initialize-BRAVOServiceRecoveryTaskDefinition), Diagnose перевіряє
+    # зареєстроване проти цих самих значень (Test-BRAVOServiceRecoveryTaskDefinition).
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$StopEventDisplayNames = @())
+
+    $eventIds = @(7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034)
+    $eventIdFilter = @($eventIds | ForEach-Object { 'EventID={0}' -f $_ }) -join ' or '
+    $stopEventId = 7036
+    $displayNames = @()
+    $displayNameFilters = @()
+    foreach ($displayName in @($StopEventDisplayNames)) {
+        if ([string]::IsNullOrWhiteSpace($displayName) -or ($displayNames -contains $displayName)) { continue }
+        $literal = ConvertTo-BRAVOEventXPathLiteral -Value $displayName
+        if ($null -eq $literal) { continue }
+        $displayNames += $displayName
+        $displayNameFilters += "Data[@Name='param1']=$literal"
+    }
+    $subscription = (
+        '<QueryList><Query Id="0" Path="System"><Select Path="System">' +
+        "*[System[Provider[@Name='Service Control Manager'] and ($eventIdFilter)]]" +
+        '</Select>'
+    )
+    if ($displayNameFilters.Count -gt 0) {
+        $subscription += (
+            '<Select Path="System">' +
+            "*[System[Provider[@Name='Service Control Manager'] and EventID=$stopEventId] and EventData[$($displayNameFilters -join ' or ')]]" +
+            '</Select>'
+        )
+    }
+    $subscription += '</Query></QueryList>'
+    return [pscustomobject]@{
+        EventIds = $eventIds
+        EventProvider = 'Service Control Manager'
+        StopEventId = $stopEventId
+        StopEventDisplayNames = @($displayNames)
+        EventSubscription = $subscription
+        EventDelay = 'PT1M'
+        BootDelay = 'PT10M'
+        RepetitionInterval = 'PT15M'
+        RepetitionDuration = 'P1D'
+        MultipleInstances = 2
+        ExecutionTimeLimit = 'PT1H'
+        StartWhenAvailable = $false
+    }
+}
+
+function Initialize-BRAVOServiceRecoveryTaskDefinition {
+    # Три тригери й власні налаштування задачі BRAVO_SERVICE_RECOVERY на
+    # COM ITaskDefinition (Task Scheduler 2.0: Windows 7 / Server 2008 R2+;
+    # TASK_TRIGGER_EVENT = 0, TASK_TRIGGER_DAILY = 2, TASK_TRIGGER_BOOT = 8).
+    # Викликається інсталятором ПІСЛЯ загальних налаштувань визначення:
+    # MultipleInstances, StartWhenAvailable і ExecutionTimeLimit задачі
+    # фіксовані й не беруться з глобальних schedulerSettings.
+    # -StopEventDisplayNames — відображувані імена керованих служб для
+    # фільтра події 7036 (Get-BRAVOServiceRecoveryStopEventFilter).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Definition,
+        [datetime]$Now = (Get-Date),
+        [AllowEmptyCollection()][string[]]$StopEventDisplayNames = @()
+    )
+
+    $spec = Get-BRAVOServiceRecoveryTaskTriggerSpec -StopEventDisplayNames $StopEventDisplayNames
+    $Definition.Settings.MultipleInstances = $spec.MultipleInstances
+    $Definition.Settings.StartWhenAvailable = $spec.StartWhenAvailable
+    $Definition.Settings.ExecutionTimeLimit = $spec.ExecutionTimeLimit
+
+    $eventTrigger = $Definition.Triggers.Create(0)
+    $eventTrigger.Subscription = $spec.EventSubscription
+    $eventTrigger.Delay = $spec.EventDelay
+    $eventTrigger.Enabled = $true
+
+    $bootTrigger = $Definition.Triggers.Create(8)
+    $bootTrigger.Delay = $spec.BootDelay
+    $bootTrigger.Enabled = $true
+
+    $dailyTrigger = $Definition.Triggers.Create(2)
+    $dailyTrigger.StartBoundary = $Now.Date.ToString("yyyy-MM-dd'T'HH:mm:ss")
+    $dailyTrigger.DaysInterval = 1
+    $dailyTrigger.Repetition.Interval = $spec.RepetitionInterval
+    $dailyTrigger.Repetition.Duration = $spec.RepetitionDuration
+    $dailyTrigger.Repetition.StopAtDurationEnd = $false
+    $dailyTrigger.Enabled = $true
+}
+
+function Get-BRAVOServiceRecoverySubscriptionStopEventNames {
+    # Відображувані імена з фільтра події 7036 у тексті підписки event-тригера
+    # (XML QueryList): значення Data[@Name='param1'] у Select-ах з EventID=7036.
+    # Повертає { Names; Paths; Error }: Paths — журнали всіх Query/Select
+    # (Path), Error — текст, якщо підписка не є XML.
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Subscription)
+
+    $result = [pscustomobject]@{ Names = @(); Paths = @(); Error = $null }
+    $subscriptionXml = $null
+    try {
+        $subscriptionXml = [xml]$Subscription
+    } catch {
+        $result.Error = $_.Exception.Message
+        return $result
+    }
+    $paths = @()
+    $names = @()
+    foreach ($node in @($subscriptionXml.SelectNodes('//Query | //Select | //Suppress'))) {
+        $pathAttribute = $node.Attributes.GetNamedItem('Path')
+        if ($null -ne $pathAttribute) { $paths += [string]$pathAttribute.Value }
+        if ($node.LocalName -ne 'Select') { continue }
+        $xpath = [string]$node.InnerText
+        if ($xpath -notmatch '\bEventID\s*=\s*7036\b') { continue }
+        foreach ($nameMatch in [regex]::Matches($xpath, "Data\[@Name='param1'\]\s*=\s*(?:'(?<value>[^']*)'|""(?<value>[^""]*)"")")) {
+            $names += [string]$nameMatch.Groups['value'].Value
+        }
+    }
+    $result.Paths = @($paths)
+    $result.Names = @($names)
+    return $result
+}
+
+function Test-BRAVOServiceRecoveryTaskDefinition {
+    # Перевірка ФАКТИЧНОГО визначення задачі BRAVO_SERVICE_RECOVERY проти
+    # Get-BRAVOServiceRecoveryTaskTriggerSpec: рівно по одному тригеру
+    # кожного з трьох типів і жодних інших, параметри тригерів (підписка
+    # лише на журнал System, повтор без StopAtDurationEnd) і налаштування
+    # задачі. З -ExpectedStopEventDisplayNames — ще й фільтр події 7036
+    # проти поточних відображуваних імен керованих служб. Повертає тексти
+    # проблем (порожній масив — визначення правильне). Лише читає.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory = $true)]$Definition,
+        [AllowNull()][string[]]$ExpectedStopEventDisplayNames
+    )
+
+    $spec = Get-BRAVOServiceRecoveryTaskTriggerSpec
+    $problems = New-Object System.Collections.Generic.List[string]
+    $sameDuration = {
+        param($Actual, [string]$Expected)
+        if ([string]::IsNullOrWhiteSpace([string]$Actual)) { return $false }
+        try {
+            return ([System.Xml.XmlConvert]::ToTimeSpan([string]$Actual) -eq [System.Xml.XmlConvert]::ToTimeSpan($Expected))
+        } catch {
+            return $false
+        }
+    }
+    $triggers = @($Definition.Triggers)
+    $triggerTypeNames = @{ 0 = 'event'; 2 = 'daily'; 8 = 'boot' }
+    foreach ($triggerType in @(0, 8, 2)) {
+        $sameTypeCount = @($triggers | Where-Object { [int]$_.Type -eq $triggerType }).Count
+        if ($sameTypeCount -gt 1) {
+            $problems.Add("дубльовані тригери: $($triggerTypeNames[$triggerType]) — $sameTypeCount, очікується один")
+        }
+    }
+    $extraTriggers = @($triggers | Where-Object { @(0, 2, 8) -notcontains [int]$_.Type })
+    if ($extraTriggers.Count -gt 0) {
+        $problems.Add("зайві тригери (тип $(@($extraTriggers | ForEach-Object { [int]$_.Type }) -join ', ')): задача має лише event, boot і daily")
+    }
+
+    $eventTriggers = @($triggers | Where-Object { [int]$_.Type -eq 0 })
+    if ($eventTriggers.Count -eq 0) {
+        $problems.Add("немає event-тригера (TASK_TRIGGER_EVENT) на події $($spec.EventProvider)")
+    } else {
+        $eventTrigger = $eventTriggers[0]
+        if (-not [bool]$eventTrigger.Enabled) { $problems.Add('event-тригер вимкнено') }
+        if (-not (& $sameDuration $eventTrigger.Delay $spec.EventDelay)) {
+            $problems.Add("event-тригер: Delay='$($eventTrigger.Delay)', очікується $($spec.EventDelay)")
+        }
+        $subscriptionText = [string]$eventTrigger.Subscription
+        $missingEventIds = @($spec.EventIds | Where-Object { $subscriptionText -notmatch ('EventID\s*=\s*{0}\b' -f $_) })
+        if (-not $subscriptionText.Contains($spec.EventProvider) -or $missingEventIds.Count -gt 0) {
+            $problems.Add("event-тригер: підписка не охоплює $($spec.EventProvider) з подіями $($spec.EventIds -join ', ')$(if ($missingEventIds.Count -gt 0) { ' (бракує ' + ($missingEventIds -join ', ') + ')' })")
+        }
+        $subscriptionInfo = Get-BRAVOServiceRecoverySubscriptionStopEventNames -Subscription $subscriptionText
+        if ($null -ne $subscriptionInfo.Error) {
+            $problems.Add("event-тригер: підписка не є коректним XML QueryList ($($subscriptionInfo.Error))")
+        } else {
+            $foreignPaths = @($subscriptionInfo.Paths | Where-Object { [string]$_ -ne 'System' } | Select-Object -Unique)
+            if ($foreignPaths.Count -gt 0 -or @($subscriptionInfo.Paths).Count -eq 0) {
+                $problems.Add("event-тригер: підписка читає журнал $(if ($foreignPaths.Count -gt 0) { $foreignPaths -join ', ' } else { '(не вказано)' }), очікується лише System")
+            }
+            if ($PSBoundParameters.ContainsKey('ExpectedStopEventDisplayNames')) {
+                $expectedNames = @(@($ExpectedStopEventDisplayNames) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+                $registeredNames = @(@($subscriptionInfo.Names) | Sort-Object -Unique)
+                if (($expectedNames -join "`n") -cne ($registeredNames -join "`n")) {
+                    $problems.Add("event-тригер: фільтр події $($spec.StopEventId) не відповідає поточним відображуваним іменам керованих служб (зареєстровано: $(if ($registeredNames.Count -gt 0) { $registeredNames -join '; ' } else { 'немає' }); поточні: $(if ($expectedNames.Count -gt 0) { $expectedNames -join '; ' } else { 'немає' })) — виконайте BRAVO_TASKS_INSTALL")
+                }
+            }
+        }
+    }
+
+    $bootTriggers = @($triggers | Where-Object { [int]$_.Type -eq 8 })
+    if ($bootTriggers.Count -eq 0) {
+        $problems.Add('немає boot-тригера (TASK_TRIGGER_BOOT)')
+    } else {
+        if (-not [bool]$bootTriggers[0].Enabled) { $problems.Add('boot-тригер вимкнено') }
+        if (-not (& $sameDuration $bootTriggers[0].Delay $spec.BootDelay)) {
+            $problems.Add("boot-тригер: Delay='$($bootTriggers[0].Delay)', очікується $($spec.BootDelay)")
+        }
+    }
+
+    $dailyTriggers = @($triggers | Where-Object { [int]$_.Type -eq 2 })
+    if ($dailyTriggers.Count -eq 0) {
+        $problems.Add("немає daily-тригера (TASK_TRIGGER_DAILY) з повтором кожні $($spec.RepetitionInterval)")
+    } else {
+        $dailyTrigger = $dailyTriggers[0]
+        if (-not [bool]$dailyTrigger.Enabled) { $problems.Add('daily-тригер вимкнено') }
+        if (-not (& $sameDuration $dailyTrigger.Repetition.Interval $spec.RepetitionInterval) -or
+            -not (& $sameDuration $dailyTrigger.Repetition.Duration $spec.RepetitionDuration)) {
+            $problems.Add("daily-тригер: Repetition Interval='$($dailyTrigger.Repetition.Interval)' Duration='$($dailyTrigger.Repetition.Duration)', очікується $($spec.RepetitionInterval) / $($spec.RepetitionDuration)")
+        }
+        if ([bool]$dailyTrigger.Repetition.StopAtDurationEnd) {
+            $problems.Add('daily-тригер: Repetition StopAtDurationEnd=True — запущений екземпляр зупинявся б наприкінці доби, очікується False')
+        }
+    }
+
+    $settings = $Definition.Settings
+    if ([int]$settings.MultipleInstances -ne $spec.MultipleInstances) {
+        $problems.Add("MultipleInstances=$($settings.MultipleInstances), очікується $($spec.MultipleInstances) (IgnoreNew)")
+    }
+    if ([bool]$settings.StartWhenAvailable -ne $spec.StartWhenAvailable) {
+        $problems.Add("StartWhenAvailable=$($settings.StartWhenAvailable), очікується $($spec.StartWhenAvailable)")
+    }
+    if (-not (& $sameDuration $settings.ExecutionTimeLimit $spec.ExecutionTimeLimit)) {
+        $problems.Add("ExecutionTimeLimit='$($settings.ExecutionTimeLimit)', очікується $($spec.ExecutionTimeLimit)")
+    }
+
+    return $problems.ToArray()
+}
+
+function Get-BRAVOManagedServiceStartModeSummary {
+    # Рядок для журналу інсталятора задач (#314 FR-4): тип запуску і стан
+    # кожної керованої служби — BRAVO, exchangAPI і BRAVO Web. Класифікація —
+    # канонічна Get-BRAVOManagedServiceCondition; лише читає. Disabled тут —
+    # єдиний тип, за якого BRAVO службу не відновлює.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowEmptyCollection()][string[]]$ServiceNames = @())
+
+    $parts = @()
+    $seenNames = @()
+    foreach ($serviceName in @($ServiceNames)) {
+        if ([string]::IsNullOrWhiteSpace($serviceName) -or ($seenNames -contains $serviceName)) { continue }
+        $seenNames += $serviceName
+        $condition = Get-BRAVOManagedServiceCondition -Name $serviceName
+        if (-not [bool]$condition.Exists) {
+            $parts += ('{0}: не встановлена' -f $serviceName)
+            continue
+        }
+        $parts += ('{0}: {1}, {2}' -f $condition.Name, $condition.StartMode, $condition.Status)
+    }
+    if ($parts.Count -eq 0) { return 'керованих служб не налаштовано' }
+    return ($parts -join '; ')
 }
