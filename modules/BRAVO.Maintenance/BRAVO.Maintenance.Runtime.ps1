@@ -2046,13 +2046,23 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
         # обліковується перед запуском (Start-BRAVOMaintenanceManagedService
         # -RecoveryCondition), успіх -> WARNING Recovered (+ CRITICAL
         # «циклічно падає»), невдача -> CRITICAL StartFailed (exit 60).
+        # BRAVO не запустилась — залежні (exchangAPI, BRAVO Web) без неї не
+        # працюють: їхній запуск відкладено, спроба не обліковується (рев'ю
+        # PR #429). Наступна перевірка після паузи BRAVO повторить ланцюг:
+        # без маркера залежні, які зупинив цей тик, — звичайні «впалі».
         $script:maintenanceServiceRecoveryState = $recoveryState
         $recoveryStartOutcome = @{ RestartFailed = $false }
+        $bravoStartFailed = $false
         foreach ($startKey in @($chainPlan.StartKeys)) {
             $startName = [string]$conditionByKey[$startKey].Name
+            if ($bravoStartFailed) {
+                Write-Log -Message "Запуск служби $startName відкладено: служба BRAVO не запустилась — наступна перевірка повторить після паузи BRAVO" -Level "WARNING"
+                continue
+            }
             $startRecoveryCondition = if (@($chainPlan.FailedKeys) -contains $startKey) { $conditionByKey[$startKey] } else { $null }
             Start-BRAVOMaintenanceManagedService -Key $startKey -Name $startName -Outcome $recoveryStartOutcome `
                 -RecoveryCondition $startRecoveryCondition -LastScmEvent $lastScmEvent[$startName]
+            if ($startKey -eq 'Bravo' -and [bool]$recoveryStartOutcome.RestartFailed) { $bravoStartFailed = $true }
         }
 
         # 11. Власний маркер знімається після фази запуску за будь-якого
