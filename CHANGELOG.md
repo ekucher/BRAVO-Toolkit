@@ -49,6 +49,24 @@
   `ServiceRecovery/ScheduledTaskStateSeparatesNotFoundFromAccessError`,
   `ServiceRecovery/InstallValidateOnlyDescribesRecoverySchedule`; AST-проби `Health/ManagedService*` отримали
   `Start-BRAVOHealthServiceRecoveryTask`.
+  Друге коло рев'ю PR #429: `lastCriticalAt` (придушення CRITICAL «циклічно падає» на 24 год) фіксується лише після
+  підтвердженої доставки сповіщення (`Send-BRAVOMaintenanceEarlyExitAlerts` у профілі, `Send-FinalReport` уночі) —
+  збій webhook більше не глушить CRITICAL на добу, наступна спроба надсилає її знову; коли сповіщення свідомо
+  вимкнено (режим `none` або маршрут CRITICAL `none`), `lastCriticalAt` фіксується одразу, як і раніше. Профіль
+  `-RecoverServices`: BRAVO не запустилась → запуск exchangAPI/BRAVO Web відкладено (WARNING у журналі RECOVER),
+  спроба їм не обліковується; впала BRAVO більше не тягне впалу залежну, чия власна пауза ще триває (працюючі залежні,
+  як і раніше, зупиняються і перезапускаються ланцюгом); стабільність кожної працюючої служби (`stableSince`,
+  скидання обліку після 30 хв) обліковується, навіть коли інша служба лежить. Fail-closed: зупинена служба з
+  невідомим типом запуску (`StartMode = Unknown`: ServiceController без `StartType` і WMI недоступний) — не кандидат
+  на автоматичне відновлення ні в профілі, ні в нічному Maintenance (вона могла бути вимкнена оператором): WARNING у
+  журналі, у профілі — рядок у `BRAVO_SERVICE_RECOVERY_SUMMARY.log` (`Test-BRAVOServiceRecoveryStartModeUnknown`);
+  класифікація `Get-BRAVOManagedServiceCondition` і Health не змінюються. Diagnose ловить `DaysInterval≠1` щоденного
+  тригера. Тести: `ServiceRecovery/CyclicCriticalRecordedOnlyAfterDelivery`,
+  `ServiceRecovery/ProfileDefersDependentsWhenBravoStartFails`, `ServiceRecovery/ChainPlanBravoFailedHonorsDependentPause`,
+  `ServiceRecovery/UnknownStartModeIsNotRecoveryCandidate`, `ServiceRecovery/ProfileSkipsUnknownStartMode`,
+  `ServiceRecovery/NightlySkipsUnknownStartMode`, `ServiceRecovery/ProfileStableResetIndependentPerService`,
+  `ServiceRecovery/DiagnoseDetectsSettingsDrift` (DaysInterval); `Maintenance/StartModeInitiallyStoppedFailedServiceIsHeldAndRestarted`
+  оновлено: служба з типом запуску `Other` утримується для реставрації, але у finally не стартує.
 
 - **Feature: профіль відновлення впалих служб `BRAVO_MAINTENANCE.ps1 -RecoverServices` (#314, хвиля 4, FR-3).**
   Новий перемикач запускає не обслуговування, а легкий профіль: класифікація керованих служб без lock-а
