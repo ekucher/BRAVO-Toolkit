@@ -386,7 +386,7 @@ Slack/Discord, Operations-звітність і запит публічної IP
 вимикає (рішення власника). Self-test
 `BackupDestinations/EveryOutboundChannelGatedByStorageEffective` перевіряє,
 що кожне місце runtime-коду, яке відкриває WinSCP-сесію чи процес
-WinSCP.com або підключає NAS через `New-PSDrive`, досяжне лише під
+WinSCP.com або підключає NAS як мережевий диск, досяжне лише під
 `storageEffective.SFTP`/`SMB`; винятки — ручні інструменти оператора
 (`BRAVO_BAZA_RECONCILE.ps1`, `BRAVO_DATA_RESTORE.ps1 -Source SFTP`).
 
