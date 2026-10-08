@@ -775,6 +775,21 @@ Test-BRAVOCondition -Condition (
         $bdE2eHelpers = @($bdInstallAst.EndBlock.Statements | Where-Object {
             $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $bdE2eHelperNames -notcontains $_.Name
         } | ForEach-Object { $_.Extent.Text })
+        # (Codex P1, раунд 3) Приватний каталог кроку 1 інсталятор створює з
+        # DACL лише для BUILTIN\Administrators і SYSTEM — це можливо лише в
+        # елевованому процесі Windows. Харнес і так підставляє $isElevated =
+        # $true, тож поза елевованим Windows (Linux, неелевована консоль)
+        # New-BRAVOInstallPrivateDirectory замінено звичайним створенням
+        # каталогу; справжню функцію перевіряє InstallerPrivateVerifyDirectoryProtectedBeforeFirstWrite.
+        $bdE2eIsWindows = ($env:OS -eq 'Windows_NT')
+        $bdE2eIsElevated = $false
+        if ($bdE2eIsWindows) {
+            $bdE2eIsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+                [Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+        $bdE2ePrivateDirectoryStub = @($(if (-not ($bdE2eIsWindows -and $bdE2eIsElevated)) {
+            'function New-BRAVOInstallPrivateDirectory { param([string]$Path) Write-StepOutput ''STUB: private-acl''; [void](New-Item -ItemType Directory -Path $Path) }'
+        }))
         $bdE2eParamText = [regex]::Replace([string]$bdInstallAst.ParamBlock.Extent.Text, '^(?i)param\s*\(', 'param([string]$OutputLog, [string]$SelfTestSiteMutationSource, ')
         $bdE2eChildPath = Join-Path $bdE2eRoot 'Invoke-InstallSteps0to4.ps1'
         $bdE2eChildText = (@(
@@ -803,7 +818,7 @@ Test-BRAVOCondition -Condition (
             '}',
             'function Invoke-WebRequest { throw ''self-test: мережа заборонена'' }',
             'function Start-Process { throw ''self-test: Start-Process заборонено'' }'
-        ) + $bdE2eHelpers + @('try {') + $bdE2eStatements + @(
+        ) + $bdE2eHelpers + $bdE2ePrivateDirectoryStub + @('try {') + $bdE2eStatements + @(
             'exit 0',
             '} catch { Write-StepOutput (''THROW: '' + $_.Exception.Message); exit 1 }'
         )) -join "`r`n"
@@ -812,7 +827,8 @@ Test-BRAVOCondition -Condition (
         # --- Фейковий комплект: zip + .sha256 поруч, без release-manifest.json ---
         function New-BRAVOSelfTestInstallBundle {
             param([string]$Name, [string[]]$ModuleDirectories, [string]$SourceCommit = ('a1b2c3d4' * 5),
-                [switch]$MarkImports, [switch]$CorruptChecksum, [string[]]$StripFunctions = @(), [switch]$TamperAfterManifest)
+                [switch]$MarkImports, [switch]$CorruptChecksum, [string[]]$StripFunctions = @(), [switch]$TamperAfterManifest,
+                [string[]]$UnexportFunctions = @(), [string]$PersistenceImportHook = '')
             $bundleDir = Join-Path $bdE2eRoot ('bundle_' + $Name)
             [void](New-Item -ItemType Directory -Path (Join-Path $bundleDir 'modules') -Force)
             [void](New-Item -ItemType Directory -Path (Join-Path $bundleDir 'Tools') -Force)
@@ -820,6 +836,10 @@ Test-BRAVOCondition -Condition (
             $versionJson = '{ "product": "BRAVO-Toolkit", "packageVersion": "' + $bdE2eVersion + '", "releaseChannel": "stable", ' +
                 '"buildId": "' + $buildId + '", "sourceCommit": "' + $SourceCommit + '" }'
             $utf8 = New-Object Text.UTF8Encoding($false)
+            # Переписаний модуль зберігає BOM джерела: без нього Windows PowerShell 5.1
+            # читає .psm1/.psd1 як ANSI, байти 0x91-0x94 кирилиці в UTF-8 стають
+            # «розумними» лапками, і ParseFile дає помилки («не розібрано»).
+            $utf8Bom = New-Object Text.UTF8Encoding($true)
             [IO.File]::WriteAllText((Join-Path $bundleDir 'VERSION.json'), $versionJson, $utf8)
             [IO.File]::WriteAllText((Join-Path $bundleDir 'RUNTIME_MANIFEST.json'), '{}', $utf8)
             [IO.File]::WriteAllText((Join-Path $bundleDir 'Tools\TOOLS_MANIFEST.json'), '{}', $utf8)
@@ -845,8 +865,47 @@ Test-BRAVOCondition -Condition (
                     foreach ($stripNode in $stripNodes) {
                         $moduleText = $moduleText.Remove($stripNode.Extent.StartOffset, $stripNode.Extent.EndOffset - $stripNode.Extent.StartOffset)
                     }
-                    if ($stripNodes.Count -gt 0) { [IO.File]::WriteAllText($moduleFile.FullName, $moduleText, $utf8) }
+                    if ($stripNodes.Count -gt 0) { [IO.File]::WriteAllText($moduleFile.FullName, $moduleText, $utf8Bom) }
                 }
+            }
+            if (@($UnexportFunctions).Count -gt 0) {
+                # Визначення функції лишається, але модуль її не експортує:
+                # ім'я вирізано зі списків Export-ModuleMember (.psm1) і
+                # FunctionsToExport (.psd1) за AST.
+                foreach ($moduleFile in @(Get-ChildItem -LiteralPath (Join-Path $bundleDir 'modules') -Recurse -File |
+                    Where-Object { @('.psm1', '.psd1') -contains $_.Extension.ToLowerInvariant() })) {
+                    $moduleText = [IO.File]::ReadAllText($moduleFile.FullName, [Text.Encoding]::UTF8)
+                    $moduleTokens = $null; $moduleErrors = $null
+                    $moduleAst = [Management.Automation.Language.Parser]::ParseInput($moduleText, [ref]$moduleTokens, [ref]$moduleErrors)
+                    $isManifest = ($moduleFile.Extension.ToLowerInvariant() -eq '.psd1')
+                    $exportNodes = @($moduleAst.FindAll({ param($node)
+                        if (-not ($node -is [Management.Automation.Language.StringConstantExpressionAst]) -or @($UnexportFunctions) -notcontains $node.Value) { return $false }
+                        if ($isManifest) { return $true }
+                        $ancestor = $node.Parent
+                        while ($null -ne $ancestor) {
+                            if ($ancestor -is [Management.Automation.Language.CommandAst] -and [string]$ancestor.GetCommandName() -eq 'Export-ModuleMember') { return $true }
+                            $ancestor = $ancestor.Parent
+                        }
+                        return $false
+                    }, $true) | Sort-Object { $_.Extent.StartOffset } -Descending)
+                    foreach ($exportNode in $exportNodes) {
+                        $removeStart = $exportNode.Extent.StartOffset
+                        $removeEnd = $exportNode.Extent.EndOffset
+                        $trailingComma = [regex]::Match($moduleText.Substring($removeEnd), '^\s*,')
+                        if ($trailingComma.Success) { $removeEnd += $trailingComma.Length } else {
+                            $leadingComma = [regex]::Match($moduleText.Substring(0, $removeStart), ',\s*$')
+                            if ($leadingComma.Success) { $removeStart -= $leadingComma.Length }
+                        }
+                        $moduleText = $moduleText.Remove($removeStart, $removeEnd - $removeStart)
+                    }
+                    if ($exportNodes.Count -gt 0) { [IO.File]::WriteAllText($moduleFile.FullName, $moduleText, $utf8Bom) }
+                }
+            }
+            if (-not [string]::IsNullOrEmpty($PersistenceImportHook)) {
+                # Код, що виконується при КОЖНОМУ імпорті Persistence.psm1 (до
+                # маніфесту — комплект цілісний).
+                [IO.File]::AppendAllText((Join-Path $bundleDir 'modules\BRAVO.Configurator\BRAVO.Configurator.Persistence.psm1'),
+                    ("`r`n" + $PersistenceImportHook + "`r`n"), $utf8)
             }
             $markerPath = Join-Path $bdE2eRoot ('imported_' + $Name + '.marker')
             $markModules = {
@@ -1347,6 +1406,10 @@ Test-BRAVOCondition -Condition (
         if ([IO.File]::ReadAllText((Join-Path $bdE2eRoot 'bundle_nostorage\modules\BRAVO.Discovery\BRAVO.Discovery.psm1'), [Text.Encoding]::UTF8).Contains('function Get-BRAVOEffectiveStorageConfiguration')) {
             $bdE2eNoStorageFailures += 'фікстура: Get-BRAVOEffectiveStorageConfiguration не вирізано з BRAVO.Discovery.psm1'
         }
+        $bdE2eNoStorageHead = [IO.File]::ReadAllBytes((Join-Path $bdE2eRoot 'bundle_nostorage\modules\BRAVO.Discovery\BRAVO.Discovery.psm1'))
+        if ($bdE2eNoStorageHead.Length -lt 3 -or $bdE2eNoStorageHead[0] -ne 0xEF -or $bdE2eNoStorageHead[1] -ne 0xBB -or $bdE2eNoStorageHead[2] -ne 0xBF) {
+            $bdE2eNoStorageFailures += 'фікстура: переписаний BRAVO.Discovery.psm1 без UTF-8 BOM (Windows PowerShell 5.1 розбере його як ANSI)'
+        }
         foreach ($bdE2eCase in @(
             @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly'); Existing = $false },
             @{ Arguments = @('-BackupDestination', 'LocalOnly', '-Force'); Existing = $true }
@@ -1364,6 +1427,167 @@ Test-BRAVOCondition -Condition (
         Test-BRAVOCondition -Condition ($bdE2eNoStorageFailures.Count -eq 0) `
             -Name 'BackupDestinations/InstallerExplicitDestinationRequiresConfigurationFunctions' `
             -Failure "комплект без функції BRAVO.Discovery/BRAVO.Configuration, яку викликає перевірка профілю (Get-BRAVOEffectiveStorageConfiguration), має відхиляти явний -BackupDestination ДО копіювання з назвою функції в причині: $($bdE2eNoStorageFailures -join ' | ')"
+
+        # (Codex P2, раунд 3) Можливість — це ЕКСПОРТОВАНА функція: визначення,
+        # якого модуль не експортує (Export-ModuleMember/FunctionsToExport),
+        # викликати не можна. Явний профіль: після імпорту приватної копії
+        # Get-Command мусить знайти кожну потрібну функцію з її модуля; інакше
+        # відмова ДО копіювання з назвою функції. Фікстура: визначення
+        # Get-BRAVOConfiguratorBackupDestinationProfile є, експорту немає.
+        $bdE2eNoExportFailures = @()
+        $bdE2eNoExportBundle = New-BRAVOSelfTestInstallBundle -Name 'noexport' -ModuleDirectories $bdE2eCurrentModules `
+            -UnexportFunctions @('Get-BRAVOConfiguratorBackupDestinationProfile')
+        $bdE2eNoExportPresets = [IO.File]::ReadAllText((Join-Path $bdE2eRoot 'bundle_noexport\modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1'), [Text.Encoding]::UTF8)
+        if (-not $bdE2eNoExportPresets.Contains('function Get-BRAVOConfiguratorBackupDestinationProfile') -or
+            $bdE2eNoExportPresets.Contains("'Get-BRAVOConfiguratorBackupDestinationProfile'")) {
+            $bdE2eNoExportFailures += 'фікстура: визначення має лишитися, а ім''я — зникнути з Export-ModuleMember у Presets.psm1'
+        }
+        foreach ($bdE2eCase in @(
+            @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly'); Existing = $false },
+            @{ Arguments = @('-BackupDestination', 'LocalOnly', '-Force'); Existing = $true }
+        )) {
+            $bdE2eRuntime = $(if ($bdE2eCase.Existing) { New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLocalOnlyLines } else { New-BRAVOSelfTestE2ERuntimeRoot })
+            $bdE2eHashBefore = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eNoExportBundle.ZipPath -Arguments $bdE2eCase.Arguments
+            $bdE2eAllowed = $(if ($bdE2eCase.Existing) { @('BRAVO.local.config') } else { @() })
+            $bdE2eNoExportFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries $bdE2eAllowed -RequiredTexts @('-BackupDestination', 'Get-BRAVOConfiguratorBackupDestinationProfile', 'Нічого не розгорнуто'))
+            if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eHashBefore) {
+                $bdE2eNoExportFailures += "$($bdE2eRun.Label) BRAVO.local.config змінено або створено"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eNoExportFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerExplicitDestinationRequiresExportedFunctions' `
+            -Failure "комплект, модуль якого визначає, але не експортує потрібну функцію (Get-BRAVOConfiguratorBackupDestinationProfile), має відхиляти явний -BackupDestination ДО копіювання (без VERSION.json) з назвою функції в причині: $($bdE2eNoExportFailures -join ' | ')"
+
+        # (Codex P2, раунд 3) Відбиток BRAVO.local.config і те, що прочитав
+        # канонічний reader у кроці 1, — ті самі байти. Фікстура: імпорт
+        # Persistence.psm1 (між зняттям знімка й читанням) підміняє живий файл
+        # (сумісний LocalOnly) на суперечливий. Рішення кроку 1 має спиратися на
+        # знімок (сумісний), а підміну має зупинити звірка перед першим записом
+        # у каталог інсталяції («змінився»), а не читання живого файла після
+        # відбитка («не в силі»).
+        $bdE2eSnapshotFailures = @()
+        $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLocalOnlyLines
+        $bdE2eSwappedText = "@{`r`n    'pathSettings.BackupRoot' = 'D:\ExampleArchive'`r`n}`r`n"
+        $bdE2eSnapshotHook = "[IO.File]::WriteAllText('" + (Join-Path $bdE2eRuntime 'BRAVO.local.config').Replace("'", "''") + "', '" +
+            $bdE2eSwappedText.Replace("'", "''") + "', (New-Object Text.UTF8Encoding(`$false)))"
+        $bdE2eSnapshotBundle = New-BRAVOSelfTestInstallBundle -Name 'swapsite' -ModuleDirectories $bdE2eCurrentModules -PersistenceImportHook $bdE2eSnapshotHook
+        $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eSnapshotBundle.ZipPath -Arguments @('-BackupDestination', 'LocalOnly', '-Force')
+        $bdE2eSnapshotFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+            -AllowedEntries @('BRAVO.local.config') -RequiredTexts @('BRAVO.local.config', 'змінився', 'Нічого не розгорнуто'))
+        if ($bdE2eRun.Throw.Contains('не в силі')) {
+            $bdE2eSnapshotFailures += "$($bdE2eRun.Label) крок 1 прочитав живий файл після відбитка (відмова «не в силі»), а не знімок"
+        }
+        Test-BRAVOCondition -Condition ($bdE2eSnapshotFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerStep1ReadsFingerprintedSiteConfigSnapshot' `
+            -Failure "крок 1 має читати знімок BRAVO.local.config, з байтів якого знято відбиток, а зміну живого файла після знімка — зупиняти перед першим записом у каталог інсталяції («змінився»): $($bdE2eSnapshotFailures -join ' | ')"
+
+        # (Codex P1, раунд 3) Приватний каталог перевірки кроку 1 лежить у
+        # [IO.Path]::GetTempPath() і без явного DACL успадкував би права %TEMP%:
+        # процес того самого користувача без елевації підмінив би .psm1 між
+        # перевіркою цілісності й Import-Module. Статично: каталог створює лише
+        # New-BRAVOInstallPrivateDirectory (DACL з SetAccessRuleProtection, лише
+        # S-1-5-32-544 і S-1-5-18, власник S-1-5-32-544, повторна перевірка
+        # Get-Acl), і цей виклик стоїть до ПЕРШОГО запису в каталог, до
+        # перевірки цілісності й до імпорту. На Windows — ще й фактичний DACL.
+        $bdE2eAclFailures = @()
+        $bdE2eAclTry = @($bdE2eMainTry)
+        $bdE2eAclCreates = @($(if ($bdE2eAclTry.Count -eq 1) { $bdE2eAclTry[0].Body.FindAll({ param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and [string]$node.GetCommandName() -eq 'New-BRAVOInstallPrivateDirectory' }, $true) }))
+        $bdE2eAclPrivateVariables = @('verifiedBundleRoot')
+        foreach ($bdE2eAclAssignment in @($(if ($bdE2eAclTry.Count -eq 1) { $bdE2eAclTry[0].Body.FindAll({ param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left -is [Management.Automation.Language.VariableExpressionAst] }, $true) }))) {
+            if ($bdE2eAclAssignment.Right.Extent.Text -match '(?i)\$verifiedBundleRoot\b' -and $bdE2eAclPrivateVariables -notcontains $bdE2eAclAssignment.Left.VariablePath.UserPath) {
+                $bdE2eAclPrivateVariables += $bdE2eAclAssignment.Left.VariablePath.UserPath
+            }
+        }
+        $bdE2eAclPrivatePattern = '(?i)\$(' + ((@($bdE2eAclPrivateVariables) | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\b'
+        $bdE2eAclWriteCommands = @('New-Item', 'Copy-Item', 'Move-Item', 'Expand-Archive', 'Set-Content', 'Add-Content', 'Out-File',
+            'Assert-BRAVOInstallBundleIntegrity', 'Import-Module', 'Import-BRAVOInstallBackupDestinationModules',
+            'Get-BRAVOInstallSiteComponentSettings', 'Get-BRAVOInstallBackupDestinationMissingCapabilities')
+        $bdE2eAclUses = @($(if ($bdE2eAclTry.Count -eq 1) { $bdE2eAclTry[0].Body.FindAll({ param($node)
+            (($node -is [Management.Automation.Language.CommandAst] -and $bdE2eAclWriteCommands -contains [string]$node.GetCommandName()) -or
+             ($node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Member.Extent.Text -match '^(?i)(Write\w*|Create\w*|Copy|Move|ExtractToDirectory)$')) -and
+            $node.Extent.Text -match $bdE2eAclPrivatePattern }, $true) }))
+        if ($bdE2eAclCreates.Count -ne 1) {
+            $bdE2eAclFailures += "New-BRAVOInstallPrivateDirectory у головному try: $($bdE2eAclCreates.Count) викликів (очікувався рівно один)"
+        } else {
+            $bdE2eAclCreate = $bdE2eAclCreates[0]
+            if ($bdE2eAclCreate.Extent.Text -notmatch '(?i)-Path\s+\$verifiedBundleRoot\b') {
+                $bdE2eAclFailures += "New-BRAVOInstallPrivateDirectory не над `$verifiedBundleRoot: $($bdE2eAclCreate.Extent.Text)"
+            }
+            if (@($bdE2eAclUses | Where-Object { $_ -is [Management.Automation.Language.CommandAst] -and [string]$_.GetCommandName() -eq 'Assert-BRAVOInstallBundleIntegrity' }).Count -eq 0) {
+                $bdE2eAclFailures += 'харнес: перевірки цілісності приватної копії не знайдено'
+            }
+            foreach ($bdE2eAclUse in $bdE2eAclUses) {
+                if ($bdE2eAclUse.Extent.StartOffset -lt $bdE2eAclCreate.Extent.EndOffset) {
+                    $bdE2eAclFailures += "рядок $($bdE2eAclUse.Extent.StartLineNumber): запис/перевірка/імпорт у приватному каталозі до New-BRAVOInstallPrivateDirectory: $($bdE2eAclUse.Extent.Text)"
+                }
+                if ($bdE2eAclUse -is [Management.Automation.Language.CommandAst] -and [string]$bdE2eAclUse.GetCommandName() -eq 'New-Item' -and
+                    $bdE2eAclUse.Extent.Text -match '(?i)-Path\s+\$verifiedBundleRoot\b') {
+                    $bdE2eAclFailures += "рядок $($bdE2eAclUse.Extent.StartLineNumber): корінь приватного каталогу створено без захищеного DACL: $($bdE2eAclUse.Extent.Text)"
+                }
+            }
+        }
+        $bdE2eAclFunction = @($bdInstallAst.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-BRAVOInstallPrivateDirectory' }, $true))
+        if ($bdE2eAclFunction.Count -ne 1) {
+            $bdE2eAclFailures += 'New-BRAVOInstallPrivateDirectory не визначено в інсталяторі'
+        } else {
+            $bdE2eAclBody = $bdE2eAclFunction[0].Body.Extent.Text
+            foreach ($bdE2eAclRequired in @('SetAccessRuleProtection($true, $false)', "'S-1-5-32-544'", "'S-1-5-18'", 'SetOwner(', 'CreateDirectory', 'Get-Acl', 'AreAccessRulesProtected', 'IsInherited', 'throw')) {
+                if (-not $bdE2eAclBody.Contains($bdE2eAclRequired)) { $bdE2eAclFailures += "New-BRAVOInstallPrivateDirectory: немає '$bdE2eAclRequired'" }
+            }
+            # Каталог створюється одразу з DACL (без вікна з успадкованими
+            # правами %TEMP%), а не New-Item + Set-Acl.
+            if (@($bdE2eAclFunction[0].Body.FindAll({ param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and @('New-Item', 'Set-Acl', 'mkdir', 'md') -contains [string]$node.GetCommandName() }, $true)).Count -ne 0) {
+                $bdE2eAclFailures += 'New-BRAVOInstallPrivateDirectory: каталог має створюватися одразу з DACL (CreateDirectory з DirectorySecurity), без New-Item/Set-Acl'
+            }
+            if ($bdE2eIsWindows) {
+                # Фактичний DACL — справжньою функцією інсталятора у дочірній області.
+                $bdE2eAclProbe = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_DEST_ACL_' + [guid]::NewGuid().ToString('N'))
+                $bdE2eAclResult = & {
+                    param([string]$FunctionText, [string]$ProbePath)
+                    . ([scriptblock]::Create($FunctionText))
+                    try {
+                        New-BRAVOInstallPrivateDirectory -Path $ProbePath
+                        return [pscustomobject]@{ Threw = $false; Message = ''; Acl = (Get-Acl -LiteralPath $ProbePath) }
+                    } catch {
+                        return [pscustomobject]@{ Threw = $true; Message = $_.Exception.Message; Acl = $null }
+                    }
+                } $bdE2eAclFunction[0].Extent.Text $bdE2eAclProbe
+                try {
+                    if ($bdE2eIsElevated) {
+                        if ($bdE2eAclResult.Threw -or $null -eq $bdE2eAclResult.Acl) {
+                            $bdE2eAclFailures += "елевований Windows: каталог не створено: $($bdE2eAclResult.Message)"
+                        } else {
+                            $bdE2eAclRules = @($bdE2eAclResult.Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+                            $bdE2eAclSids = @($bdE2eAclRules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+                            if (-not $bdE2eAclResult.Acl.AreAccessRulesProtected) { $bdE2eAclFailures += 'успадкування DACL не вимкнено' }
+                            if (@($bdE2eAclRules | Where-Object { $_.IsInherited }).Count -ne 0) { $bdE2eAclFailures += 'є успадковані правила' }
+                            if (($bdE2eAclSids -join ',') -ne 'S-1-5-18,S-1-5-32-544') { $bdE2eAclFailures += "SID у DACL: $($bdE2eAclSids -join ',')" }
+                            if (@($bdE2eAclRules | Where-Object { [string]$_.AccessControlType -ne 'Allow' -or
+                                ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl }).Count -ne 0) {
+                                $bdE2eAclFailures += 'правила DACL не FullControl/Allow'
+                            }
+                            $bdE2eAclOwner = $bdE2eAclResult.Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+                            if ($bdE2eAclOwner -ne 'S-1-5-32-544') { $bdE2eAclFailures += "власник: $bdE2eAclOwner" }
+                        }
+                    } elseif (-not $bdE2eAclResult.Threw -or $bdE2eAclResult.Message -notmatch '[\u0400-\u04FF]') {
+                        # Без елевації DACL «лише Administrators/SYSTEM» з
+                        # власником Administrators не встановити — fail closed.
+                        $bdE2eAclFailures += "неелевований Windows: очікувалась відмова з українською причиною, отримано Threw=$($bdE2eAclResult.Threw) '$($bdE2eAclResult.Message)'"
+                    }
+                } finally {
+                    if (Test-Path -LiteralPath $bdE2eAclProbe) { Remove-Item -LiteralPath $bdE2eAclProbe -Recurse -Force -ErrorAction SilentlyContinue }
+                }
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eAclFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerPrivateVerifyDirectoryProtectedBeforeFirstWrite' `
+            -Failure "приватний каталог перевірки кроку 1 має створюватися одразу із захищеним DACL (без успадкування; лише BUILTIN\Administrators і NT AUTHORITY\SYSTEM, власник Administrators) до першого запису, перевірки цілісності й імпорту; невдача — відмова: $($bdE2eAclFailures -join ' | ')"
 
         # Регресійний запобіжник (не RED): модулі комплекту не імпортуються до
         # гейтів SHA-256 і провенансу — маркер у кожному .psm1 комплекту лишається
@@ -1395,7 +1619,8 @@ Test-BRAVOCondition -Condition (
         if ($bdE2eChannelGate.Count -ne 1) { $bdE2eTrustFailures += 'Get-BRAVODeployReleaseChannelDecision не знайдено' }
         foreach ($bdE2eImport in $bdE2eEarlyStagedImports) { $bdE2eTrustFailures += "рядок $($bdE2eImport.Extent.StartLineNumber): $($bdE2eImport.Extent.Text)" }
         # (Codex P1) Кожен імпорт коду комплекту в головному try (Import-Module,
-        # dot-source, Get-BRAVOInstallSiteComponentSettings) має бути домінований
+        # dot-source, Get-BRAVOInstallSiteComponentSettings,
+        # Import-BRAVOInstallBackupDestinationModules) має бути домінований
         # викликом Assert-BRAVOInstallBundleIntegrity над тим самим коренем:
         # виклик — окремий оператор раніше в тому самому чи зовнішньому блоці.
         # Сама перевірка — канонічна Test-BRAVORuntimeManifestIntegrity з
@@ -1408,7 +1633,7 @@ Test-BRAVOCondition -Condition (
         $bdE2eBundleImports = @($bdInstallAst.FindAll({
             param($node)
             $node -is [Management.Automation.Language.CommandAst] -and -not (Test-BRAVOSelfTestInsideFunction -Node $node) -and
-            ([string]$node.GetCommandName() -eq 'Import-Module' -or [string]$node.GetCommandName() -eq 'Get-BRAVOInstallSiteComponentSettings' -or
+            (@('Import-Module', 'Get-BRAVOInstallSiteComponentSettings', 'Import-BRAVOInstallBackupDestinationModules') -contains [string]$node.GetCommandName() -or
                 $node.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot) -and
             $node.Extent.Text -match '(?i)\$(staged|StagingRoot|RuntimeRoot|configuratorModuleRoot|verifiedBundle)\b'
         }, $true))
@@ -1437,7 +1662,7 @@ Test-BRAVOCondition -Condition (
         }
         $bdE2ePrivateRootImports = 0
         foreach ($bdE2eImport in $bdE2eBundleImports) {
-            $bdE2eRootElement = @($(if ([string]$bdE2eImport.GetCommandName() -eq 'Get-BRAVOInstallSiteComponentSettings') {
+            $bdE2eRootElement = @($(if (@('Get-BRAVOInstallSiteComponentSettings', 'Import-BRAVOInstallBackupDestinationModules') -contains [string]$bdE2eImport.GetCommandName()) {
                 $bdE2eModuleRootIndex = -1
                 for ($bdE2eIndex = 0; $bdE2eIndex -lt $bdE2eImport.CommandElements.Count - 1; $bdE2eIndex++) {
                     if ($bdE2eImport.CommandElements[$bdE2eIndex].Extent.Text -eq '-ModuleRoot') { $bdE2eModuleRootIndex = $bdE2eIndex + 1 }
