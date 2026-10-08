@@ -63,7 +63,8 @@
   класифікація `Get-BRAVOManagedServiceCondition` і Health не змінюються. Diagnose ловить `DaysInterval≠1` щоденного
   тригера. Тести: `ServiceRecovery/CyclicCriticalRecordedOnlyAfterDelivery`,
   `ServiceRecovery/ProfileDefersDependentsWhenBravoStartFails`, `ServiceRecovery/ChainPlanBravoFailedHonorsDependentPause`,
-  `ServiceRecovery/UnknownStartModeIsNotRecoveryCandidate`, `ServiceRecovery/ProfileSkipsUnknownStartMode`,
+  `ServiceRecovery/UnknownStartModeIsNotRecoveryCandidate`, `ServiceRecovery/ChainPlanSkipsUnknownStartMode`,
+  `ServiceRecovery/ProfileSkipsUnknownStartMode`,
   `ServiceRecovery/NightlySkipsUnknownStartMode`, `ServiceRecovery/ProfileStableResetIndependentPerService`,
   `ServiceRecovery/DiagnoseDetectsSettingsDrift` (DaysInterval); `Maintenance/StartModeInitiallyStoppedFailedServiceIsHeldAndRestarted`
   оновлено: служба з типом запуску `Other` утримується для реставрації, але у finally не стартує.

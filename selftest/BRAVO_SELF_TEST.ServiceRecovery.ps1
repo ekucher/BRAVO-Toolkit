@@ -168,14 +168,6 @@ function Write-BRAVOStateTemporaryText {
                 UnknownFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition (& $make 'Unknown'))
                 ManualFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition (& $make 'Manual'))
                 RunningUnknownFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition ([pscustomobject]@{ Name = 'BRAVO'; Condition = 'Running'; Status = 'Running'; StartMode = 'Unknown' }))
-                # План ланцюжка без -EligibleNames: тип запуску з опису служби
-                # (об'єкт або hashtable) не губиться.
-                ChainUnknownBravo = (@((Get-BRAVOServiceRecoveryChainPlan -Conditions @(
-                                [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Unknown' },
-                                [pscustomobject]@{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Condition = 'Running'; Status = 'Running'; StartMode = 'Automatic' })).StartOrder) -join ' ')
-                ChainUnknownDependent = (@((Get-BRAVOServiceRecoveryChainPlan -Conditions @(
-                                [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Automatic' },
-                                @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Unknown' })).StartOrder) -join ' ')
             }
         }
     } catch {
@@ -186,8 +178,7 @@ function Write-BRAVOStateTemporaryText {
             $null -eq $recoveryUnknownError -and $null -ne $recoveryUnknown -and
             -not $recoveryUnknown.UnknownFailed -and -not $recoveryUnknown.EmptyFailed -and
             $recoveryUnknown.ManualFailed -and $recoveryUnknown.AutomaticFailed -and
-            $recoveryUnknown.UnknownFlag -and -not $recoveryUnknown.ManualFlag -and -not $recoveryUnknown.RunningUnknownFlag -and
-            [string]$recoveryUnknown.ChainUnknownBravo -ceq '' -and [string]$recoveryUnknown.ChainUnknownDependent -ceq 'BRAVO'
+            $recoveryUnknown.UnknownFlag -and -not $recoveryUnknown.ManualFlag -and -not $recoveryUnknown.RunningUnknownFlag
         ) `
         -Name 'ServiceRecovery/UnknownStartModeIsNotRecoveryCandidate' `
         -Failure "зупинена служба з невідомим типом запуску (StartMode Unknown/порожній) — не «впала» для відновлення (Test-BRAVOServiceRecoveryFailed=`$false, Test-BRAVOServiceRecoveryStartModeUnknown=`$true); Automatic/Manual — «впала». помилка='$recoveryUnknownError' результат=[$(if ($null -ne $recoveryUnknown) { ($recoveryUnknown.PSObject.Properties | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value }) -join ' ' })]"
@@ -874,6 +865,14 @@ function Write-BRAVOStateTemporaryText {
                     (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
                     (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
                     (& $c 'BravoWeb' 'Apache2.4' 'Running' 'Running')))
+            # План без -EligibleNames: тип запуску з опису служби (об'єкт або
+            # hashtable) не губиться — невідомий тип не «впала».
+            $result.ChainUnknownBravo = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Unknown' },
+                    [pscustomobject]@{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Condition = 'Running'; Status = 'Running'; StartMode = 'Automatic' }))
+            $result.ChainUnknownDependent = & $describe (Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                    [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Automatic' },
+                    @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Unknown' }))
             $result.BravoFailedDependentEligible = & $describe (Get-BRAVOServiceRecoveryChainPlan -EligibleNames @('BRAVO', 'exchangAPI') -Conditions @(
                     (& $c 'Bravo' 'BRAVO' 'Failed' 'Stopped'),
                     (& $c 'ExchangeApi' 'exchangAPI' 'Failed' 'Stopped'),
@@ -954,6 +953,13 @@ function Write-BRAVOStateTemporaryText {
     Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
         -Name 'ServiceRecovery/ChainPlanBravoFailedHonorsDependentPause' `
         -Failure "впала BRAVO (пауза минула): впала залежна запускається й обліковується лише коли минула її власна пауза (-EligibleNames); працюючі залежні зупиняються і запускаються ланцюгом: $($w4ChainDiffs -join ' || ')"
+    $w4ChainDiffs = @(& $w4ChainCheck @{
+            ChainUnknownBravo = 'failed:  | stop:  | start:  | deferred:  | accounted: '
+            ChainUnknownDependent = 'failed: BRAVO | stop:  | start: BRAVO | deferred:  | accounted: BRAVO'
+        })
+    Test-BRAVOCondition -Condition ($w4ChainDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/ChainPlanSkipsUnknownStartMode' `
+        -Failure "план ланцюжка: зупинена служба з невідомим типом запуску (StartMode Unknown в описі — об'єкт чи hashtable) не «впала» — не запускається і не тягне ланцюг: $($w4ChainDiffs -join ' || ')"
 
     $w4ModuleAst = [Management.Automation.Language.Parser]::ParseInput($w4ModuleText, [ref]$null, [ref]$null)
     $w4ChainFunction = @($w4ModuleAst.FindAll({
