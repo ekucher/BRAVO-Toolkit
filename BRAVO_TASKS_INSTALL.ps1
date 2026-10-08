@@ -276,7 +276,7 @@ function New-BRAVOTaskDefinition {
     param(
         $TaskService,
         [hashtable]$TaskSettings,
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")]
         [string]$TaskType,
         [string]$ResolvedConfigPath,
 
@@ -345,6 +345,9 @@ function New-BRAVOTaskDefinition {
             -SettingName "$TaskType.StartAt"
     } elseif ($TaskType -eq "Recovery" -or $TaskType -eq "BackupCatchUp") {
         $null
+    } elseif ($TaskType -eq "ServiceRecovery") {
+        # Розклад задачі — три фіксовані тригери нижче, не час із конфігурації.
+        $null
     } elseif ($TaskType -eq "RestoreVerify") {
         ConvertTo-ScheduleTime -Value $TaskSettings.At -SettingName "$TaskType.At"
     } else {
@@ -373,6 +376,14 @@ function New-BRAVOTaskDefinition {
             )
         }
         $trigger.Enabled = $true
+    } elseif ($TaskType -eq "ServiceRecovery") {
+        # #314 FR-4: BRAVO_SERVICE_RECOVERY — три тригери (подія Service
+        # Control Manager із затримкою 1 хв, старт ОС із затримкою 10 хв,
+        # кожні 15 хв протягом доби) і фіксовані MultipleInstances=IgnoreNew,
+        # StartWhenAvailable=false, ExecutionTimeLimit=PT1H. Канонічна
+        # реалізація — BRAVO.System; Diagnose перевіряє зареєстровану задачу
+        # проти тих самих значень (Test-BRAVOServiceRecoveryTaskDefinition).
+        Initialize-BRAVOServiceRecoveryTaskDefinition -Definition $definition
     } elseif ($TaskType -eq "RestoreVerify") {
         # Щотижневий restore drill (P1.1): один weekly-тригер. DaysOfWeek —
         # канонічний bitmask ConvertTo-BRAVODaysOfWeekMask (BRAVO.System),
@@ -430,6 +441,9 @@ function New-BRAVOTaskDefinition {
     if ($TaskType -eq "BackupCatchUp") {
         $actionArguments += " -CatchUpMissedBackup"
     }
+    if ($TaskType -eq "ServiceRecovery") {
+        $actionArguments += " -RecoverServices"
+    }
     if ($TaskType -eq "BAZASync") {
         $actionArguments += " -SyncBAZA"
     }
@@ -457,7 +471,7 @@ function New-BRAVOTaskDefinition {
 
 function Format-BRAVOInstalledTaskSummaryNextRun {
     param(
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")]
         [string]$TaskType,
         $TaskSettings,
         $NextRunTime
@@ -472,6 +486,17 @@ function Format-BRAVOInstalledTaskSummaryNextRun {
     }
 
     return Format-BRAVOSchedulerNextRun @nextRunArguments
+}
+
+function Get-BRAVOServiceRecoveryTaskSettings {
+    # Вузол schedulerSettings.ServiceRecovery (#314 FR-4, похідний від
+    # Maintenance.Enabled) або $null, якщо його немає.
+    if ($schedulerSettings -is [System.Collections.IDictionary] -and
+        $schedulerSettings.Contains('ServiceRecovery') -and
+        $schedulerSettings.ServiceRecovery -is [System.Collections.IDictionary]) {
+        return $schedulerSettings.ServiceRecovery
+    }
+    return $null
 }
 
 function Get-BRAVOBackupCatchUpTaskSettings {
@@ -586,6 +611,10 @@ function Test-SchedulerConfiguration {
     if ($null -ne $backupCatchUpSettings) {
         Test-TaskName -TaskName $backupCatchUpSettings.TaskName -SettingName "BackupCatchUp.TaskName"
     }
+    $serviceRecoverySettings = Get-BRAVOServiceRecoveryTaskSettings
+    if ($null -ne $serviceRecoverySettings) {
+        Test-TaskName -TaskName $serviceRecoverySettings.TaskName -SettingName "ServiceRecovery.TaskName"
+    }
     $taskNames = @(
         [string]$schedulerSettings.Backup.TaskName,
         [string]$schedulerSettings.Maintenance.TaskName,
@@ -597,8 +626,11 @@ function Test-SchedulerConfiguration {
     if ($null -ne $backupCatchUpSettings) {
         $taskNames += [string]$backupCatchUpSettings.TaskName
     }
+    if ($null -ne $serviceRecoverySettings) {
+        $taskNames += [string]$serviceRecoverySettings.TaskName
+    }
     if (@($taskNames | Select-Object -Unique).Count -ne $taskNames.Count) {
-        throw "Імена Backup, Maintenance, Health, Recovery, BAZASync, RestoreVerify і BackupCatchUp завдань повинні відрізнятися"
+        throw "Імена Backup, Maintenance, Health, Recovery, BAZASync, RestoreVerify, BackupCatchUp і ServiceRecovery завдань повинні відрізнятися"
     }
 
     foreach ($taskSettings in @(
@@ -608,7 +640,8 @@ function Test-SchedulerConfiguration {
         $schedulerSettings.Recovery,
         $schedulerSettings.BAZASync,
         $schedulerSettings.RestoreVerify,
-        $backupCatchUpSettings
+        $backupCatchUpSettings,
+        $serviceRecoverySettings
     )) {
         if ($null -eq $taskSettings) { continue }
         if ($taskSettings.Enabled -and -not (Test-Path -Path $taskSettings.ScriptPath -PathType Leaf)) {
@@ -830,6 +863,10 @@ try {
     if ($null -ne $backupCatchUpSettings) {
         $taskPlans += [pscustomobject]@{ Type = "BackupCatchUp"; Settings = $backupCatchUpSettings }
     }
+    $serviceRecoverySettings = Get-BRAVOServiceRecoveryTaskSettings
+    if ($null -ne $serviceRecoverySettings) {
+        $taskPlans += [pscustomobject]@{ Type = "ServiceRecovery"; Settings = $serviceRecoverySettings }
+    }
 
     $requireProtectedRuntime = (
         $schedulerSettings.Contains("RequireProtectedRuntime") -and
@@ -910,6 +947,30 @@ try {
     } else {
         Write-BRAVOTasksInstallStep -Name 'Start type служб (BootRestoreMode)' -Status OK -Details "змін не потрібно: $startTypeDetailsText"
     }
+    # #314 FR-4: тип запуску ВСІХ трьох керованих служб (і BRAVO Web) — у
+    # журнал інсталятора: задача BRAVO_SERVICE_RECOVERY відновлює кожну з них,
+    # крім Disabled, тож саме цей рядок показує, що буде підніматися.
+    $managedServiceNamesForLog = @(
+        [string]$maintenanceSettings.Services.BravoName
+        [string]$maintenanceSettings.Services.ExchangeApiName
+    )
+    $bravoWebEnabledForLog = $false
+    try { $bravoWebEnabledForLog = [System.Convert]::ToBoolean($maintenanceSettings.Services.BravoWebEnabled) } catch { $bravoWebEnabledForLog = $false }
+    $discoveryVariableForLog = Get-Variable -Name bravoDiscoveryResult -Scope Global -ErrorAction SilentlyContinue
+    if ($bravoWebEnabledForLog -and $null -ne $discoveryVariableForLog -and $null -ne $discoveryVariableForLog.Value -and
+        $null -ne $discoveryVariableForLog.Value.PSObject.Properties['WebServiceName'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$discoveryVariableForLog.Value.WebServiceName)) {
+        $managedServiceNamesForLog += [string]$discoveryVariableForLog.Value.WebServiceName
+    }
+    $managedServiceStartModeText = try {
+        Get-BRAVOManagedServiceStartModeSummary -ServiceNames $managedServiceNamesForLog
+    } catch {
+        "не вдалося прочитати: $($_.Exception.Message)"
+    }
+    Write-Host (
+        "Тип запуску керованих служб (автоматичне відновлення не чіпає лише Disabled): " +
+        $managedServiceStartModeText
+    ) -ForegroundColor DarkGray
 
     $taskFolder = Get-BRAVOScheduledTaskFolder -TaskService $taskService -TaskPath $taskPath
     if (-not $ValidateOnly -and @($taskPlans | Where-Object { $_.Settings.Enabled }).Count -gt 0) {
@@ -980,6 +1041,8 @@ try {
                 "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.; профіль робочого часу)"
             } elseif ($taskPlan.Type -eq "BackupCatchUp") {
                 "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.), лише якщо нічну копію пропущено"
+            } elseif ($taskPlan.Type -eq "ServiceRecovery") {
+                "за подією падіння служби (затримка 1 хв.), після старту сервера (затримка 10 хв.) і кожні 15 хв."
             } elseif ($taskPlan.Type -eq "BAZASync") {
                 "кожні $($taskSettings.RepeatEveryHours) год., починаючи з $($taskSettings.StartAt)"
             } elseif ($taskPlan.Type -eq "RestoreVerify") {

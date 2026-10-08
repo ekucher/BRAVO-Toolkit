@@ -66,7 +66,7 @@ function Get-BRAVOTaskResultDescription {
 
 function Format-BRAVODiagnoseTaskNextRun {
     param(
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")]
         [string]$TaskType,
         $TaskSettings,
         $NextRunTime
@@ -270,6 +270,16 @@ function Test-BRAVOScheduledTaskDefinition {
         }
     }
 
+    # ServiceRecovery (#314 FR-4): наявність і параметри всіх трьох тригерів
+    # (подія Service Control Manager, старт ОС, кожні 15 хв) і фіксовані
+    # MultipleInstances/StartWhenAvailable/ExecutionTimeLimit — тим самим
+    # канонічним описом (BRAVO.System), за яким задачу будує Installer.
+    if ($TaskType -eq 'ServiceRecovery') {
+        foreach ($serviceRecoveryProblem in @(Test-BRAVOServiceRecoveryTaskDefinition -Definition $definition)) {
+            $problems.Add([string]$serviceRecoveryProblem)
+        }
+    }
+
     return $problems.ToArray()
 }
 
@@ -416,8 +426,9 @@ try {
         BAZASync      = @('-NoPause', '-SyncBAZA')
         RestoreVerify = @('-NoPause', '-NotifyOnSuccess')
         BackupCatchUp = @('-NoPause', '-CatchUpMissedBackup')
+        ServiceRecovery = @('-NoPause', '-RecoverServices')
     }
-    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")) {
+    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp", "ServiceRecovery")) {
         $settings = $schedulerSettings[$taskType]
         if ($null -eq $settings -or -not [bool]$settings.Enabled) {
             Write-Host "[SKIP] ${taskType}: вимкнено в конфігурації" -ForegroundColor Gray

@@ -142,6 +142,11 @@ function Get-BRAVODefaultConfiguration {
             General = @{
                 BravoWebDirectory = "C:\Br-a-vo.web"
             }
+            # Керовані служби (BRAVO, exchangAPI, BRAVO Web). Запускати й зупиняти
+            # їх має право лише BRAVO_MAINTENANCE.ps1 — нічний прогін і профіль
+            # -RecoverServices (#314); BRAVO_HEALTH лише стартує задачу
+            # BRAVO_SERVICE_RECOVERY. Службу, тип запуску якої не Disabled,
+            # BRAVO піднімає автоматично.
             Services = @{
                 BravoName = "BRAVO"
                 BravoDisplayName = @("BRAVO Service", "BRAVO Server")

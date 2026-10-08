@@ -1089,6 +1089,55 @@ function Get-BRAVOScheduledTaskState {
     }
 }
 
+function Start-BRAVOScheduledTask {
+    # Запуск зареєстрованої задачі Планувальника «зараз» (#314 FR-7: Health
+    # просить Планувальник запустити BRAVO_SERVICE_RECOVERY, а не стартує
+    # службу сам). Той самий вибір провайдера, що в Get-BRAVOScheduledTaskState:
+    # Start-ScheduledTask (Windows 8+), інакше COM IRegisteredTask.Run($null)
+    # (Task Scheduler 2.0, Windows 7 / Server 2008 R2 без модуля ScheduledTasks).
+    # Відсутню, вимкнену чи вже запущену задачу не запускає (MultipleInstances
+    # задачі вирішив би те саме, але викликач має знати причину). Не кидає:
+    # збій запуску — у Error. Повертає { Exists; Enabled; AlreadyRunning; Started; Error }.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskPath,
+        [Parameter(Mandatory = $true)][string]$TaskName
+    )
+
+    $result = New-Object PSObject -Property @{
+        Exists = $false
+        Enabled = $false
+        AlreadyRunning = $false
+        Started = $false
+        Error = $null
+    }
+    try {
+        $taskState = Get-BRAVOScheduledTaskState -TaskPath $TaskPath -TaskName $TaskName
+    } catch {
+        $result.Error = $_.Exception.Message
+        return $result
+    }
+    if (-not [bool]$taskState.Exists) { return $result }
+    $result.Exists = $true
+    $result.Enabled = ([string]$taskState.State -ne 'Disabled')
+    if (-not $result.Enabled) { return $result }
+    if ([bool]$taskState.IsRunning) {
+        $result.AlreadyRunning = $true
+        return $result
+    }
+    try {
+        if ([string]$taskState.Provider -eq 'ScheduledTasks') {
+            Start-ScheduledTask -InputObject $taskState.Task -ErrorAction Stop
+        } else {
+            [void]$taskState.Task.Run($null)
+        }
+        $result.Started = $true
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+    return $result
+}
+
 function Enable-BRAVOTls12 {
     # 3072 = TLS 1.2. Число працює навіть у старих .NET, де enum Tls12
     # ще не має символічного імені.

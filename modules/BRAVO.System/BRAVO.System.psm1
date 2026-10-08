@@ -1616,3 +1616,177 @@ function Get-BRAVOOperationLockWaitBudget {
         LimitDescription = $limitDescription
     }
 }
+
+function Get-BRAVOServiceRecoveryTaskTriggerSpec {
+    # Канонічні параметри задачі Планувальника BRAVO_SERVICE_RECOVERY (#314
+    # FR-4; ТЗ §8 — константи в коді до cutover Config V2 #216). Задача
+    # запускає BRAVO_MAINTENANCE.ps1 -RecoverServices за трьома тригерами:
+    #   Event — падіння служби: події System log від Service Control Manager
+    #           (7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034) — той самий
+    #           набір, що профіль збирає як докази; затримка 1 хв;
+    #   Boot  — служба Automatic не піднялась після старту ОС; затримка 10 хв;
+    #   Daily — запасна перевірка кожні 15 хв протягом доби (подію могли
+    #           пропустити, а службу могли зупинити без події падіння).
+    # Подія не фільтрується за іменем служби: відображувані імена різняться
+    # між майданчиками, а запуск через подію чужої служби коштує один швидкий
+    # вихід профілю (впалих керованих служб немає — код 0, без запису на диск).
+    # MultipleInstances = IgnoreNew (2): шторм подій не запускає паралельних
+    # копій. StartWhenAvailable = false: пропущений 15-хвилинний тик не
+    # наздоганяється — наступний прийде сам. Інсталятор будує визначення
+    # (Initialize-BRAVOServiceRecoveryTaskDefinition), Diagnose перевіряє
+    # зареєстроване проти цих самих значень (Test-BRAVOServiceRecoveryTaskDefinition).
+    $eventIds = @(7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034)
+    $eventIdFilter = @($eventIds | ForEach-Object { 'EventID={0}' -f $_ }) -join ' or '
+    $subscription = (
+        '<QueryList><Query Id="0" Path="System"><Select Path="System">' +
+        "*[System[Provider[@Name='Service Control Manager'] and ($eventIdFilter)]]" +
+        '</Select></Query></QueryList>'
+    )
+    return [pscustomobject]@{
+        EventIds = $eventIds
+        EventProvider = 'Service Control Manager'
+        EventSubscription = $subscription
+        EventDelay = 'PT1M'
+        BootDelay = 'PT10M'
+        RepetitionInterval = 'PT15M'
+        RepetitionDuration = 'P1D'
+        MultipleInstances = 2
+        ExecutionTimeLimit = 'PT1H'
+        StartWhenAvailable = $false
+    }
+}
+
+function Initialize-BRAVOServiceRecoveryTaskDefinition {
+    # Три тригери й власні налаштування задачі BRAVO_SERVICE_RECOVERY на
+    # COM ITaskDefinition (Task Scheduler 2.0: Windows 7 / Server 2008 R2+;
+    # TASK_TRIGGER_EVENT = 0, TASK_TRIGGER_DAILY = 2, TASK_TRIGGER_BOOT = 8).
+    # Викликається інсталятором ПІСЛЯ загальних налаштувань визначення:
+    # MultipleInstances, StartWhenAvailable і ExecutionTimeLimit задачі
+    # фіксовані й не беруться з глобальних schedulerSettings.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Definition,
+        [datetime]$Now = (Get-Date)
+    )
+
+    $spec = Get-BRAVOServiceRecoveryTaskTriggerSpec
+    $Definition.Settings.MultipleInstances = $spec.MultipleInstances
+    $Definition.Settings.StartWhenAvailable = $spec.StartWhenAvailable
+    $Definition.Settings.ExecutionTimeLimit = $spec.ExecutionTimeLimit
+
+    $eventTrigger = $Definition.Triggers.Create(0)
+    $eventTrigger.Subscription = $spec.EventSubscription
+    $eventTrigger.Delay = $spec.EventDelay
+    $eventTrigger.Enabled = $true
+
+    $bootTrigger = $Definition.Triggers.Create(8)
+    $bootTrigger.Delay = $spec.BootDelay
+    $bootTrigger.Enabled = $true
+
+    $dailyTrigger = $Definition.Triggers.Create(2)
+    $dailyTrigger.StartBoundary = $Now.Date.ToString("yyyy-MM-dd'T'HH:mm:ss")
+    $dailyTrigger.DaysInterval = 1
+    $dailyTrigger.Repetition.Interval = $spec.RepetitionInterval
+    $dailyTrigger.Repetition.Duration = $spec.RepetitionDuration
+    $dailyTrigger.Repetition.StopAtDurationEnd = $false
+    $dailyTrigger.Enabled = $true
+}
+
+function Test-BRAVOServiceRecoveryTaskDefinition {
+    # Перевірка ФАКТИЧНОГО визначення задачі BRAVO_SERVICE_RECOVERY проти
+    # Get-BRAVOServiceRecoveryTaskTriggerSpec: наявність і параметри всіх
+    # трьох тригерів і налаштування задачі. Повертає тексти проблем (порожній
+    # масив — визначення правильне). Лише читає.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory = $true)]$Definition)
+
+    $spec = Get-BRAVOServiceRecoveryTaskTriggerSpec
+    $problems = New-Object System.Collections.Generic.List[string]
+    $sameDuration = {
+        param($Actual, [string]$Expected)
+        if ([string]::IsNullOrWhiteSpace([string]$Actual)) { return $false }
+        try {
+            return ([System.Xml.XmlConvert]::ToTimeSpan([string]$Actual) -eq [System.Xml.XmlConvert]::ToTimeSpan($Expected))
+        } catch {
+            return $false
+        }
+    }
+    $triggers = @($Definition.Triggers)
+
+    $eventTriggers = @($triggers | Where-Object { [int]$_.Type -eq 0 })
+    if ($eventTriggers.Count -eq 0) {
+        $problems.Add("немає event-тригера (TASK_TRIGGER_EVENT) на події $($spec.EventProvider)")
+    } else {
+        $eventTrigger = $eventTriggers[0]
+        if (-not [bool]$eventTrigger.Enabled) { $problems.Add('event-тригер вимкнено') }
+        if (-not (& $sameDuration $eventTrigger.Delay $spec.EventDelay)) {
+            $problems.Add("event-тригер: Delay='$($eventTrigger.Delay)', очікується $($spec.EventDelay)")
+        }
+        $subscriptionText = [string]$eventTrigger.Subscription
+        $missingEventIds = @($spec.EventIds | Where-Object { $subscriptionText -notmatch ('EventID\s*=\s*{0}\b' -f $_) })
+        if (-not $subscriptionText.Contains($spec.EventProvider) -or $missingEventIds.Count -gt 0) {
+            $problems.Add("event-тригер: підписка не охоплює $($spec.EventProvider) з подіями $($spec.EventIds -join ', ')$(if ($missingEventIds.Count -gt 0) { ' (бракує ' + ($missingEventIds -join ', ') + ')' })")
+        }
+    }
+
+    $bootTriggers = @($triggers | Where-Object { [int]$_.Type -eq 8 })
+    if ($bootTriggers.Count -eq 0) {
+        $problems.Add('немає boot-тригера (TASK_TRIGGER_BOOT)')
+    } else {
+        if (-not [bool]$bootTriggers[0].Enabled) { $problems.Add('boot-тригер вимкнено') }
+        if (-not (& $sameDuration $bootTriggers[0].Delay $spec.BootDelay)) {
+            $problems.Add("boot-тригер: Delay='$($bootTriggers[0].Delay)', очікується $($spec.BootDelay)")
+        }
+    }
+
+    $dailyTriggers = @($triggers | Where-Object { [int]$_.Type -eq 2 })
+    if ($dailyTriggers.Count -eq 0) {
+        $problems.Add("немає daily-тригера (TASK_TRIGGER_DAILY) з повтором кожні $($spec.RepetitionInterval)")
+    } else {
+        $dailyTrigger = $dailyTriggers[0]
+        if (-not [bool]$dailyTrigger.Enabled) { $problems.Add('daily-тригер вимкнено') }
+        if (-not (& $sameDuration $dailyTrigger.Repetition.Interval $spec.RepetitionInterval) -or
+            -not (& $sameDuration $dailyTrigger.Repetition.Duration $spec.RepetitionDuration)) {
+            $problems.Add("daily-тригер: Repetition Interval='$($dailyTrigger.Repetition.Interval)' Duration='$($dailyTrigger.Repetition.Duration)', очікується $($spec.RepetitionInterval) / $($spec.RepetitionDuration)")
+        }
+    }
+
+    $settings = $Definition.Settings
+    if ([int]$settings.MultipleInstances -ne $spec.MultipleInstances) {
+        $problems.Add("MultipleInstances=$($settings.MultipleInstances), очікується $($spec.MultipleInstances) (IgnoreNew)")
+    }
+    if ([bool]$settings.StartWhenAvailable -ne $spec.StartWhenAvailable) {
+        $problems.Add("StartWhenAvailable=$($settings.StartWhenAvailable), очікується $($spec.StartWhenAvailable)")
+    }
+    if (-not (& $sameDuration $settings.ExecutionTimeLimit $spec.ExecutionTimeLimit)) {
+        $problems.Add("ExecutionTimeLimit='$($settings.ExecutionTimeLimit)', очікується $($spec.ExecutionTimeLimit)")
+    }
+
+    return $problems.ToArray()
+}
+
+function Get-BRAVOManagedServiceStartModeSummary {
+    # Рядок для журналу інсталятора задач (#314 FR-4): тип запуску і стан
+    # кожної керованої служби — BRAVO, exchangAPI і BRAVO Web. Класифікація —
+    # канонічна Get-BRAVOManagedServiceCondition; лише читає. Disabled тут —
+    # єдиний тип, за якого BRAVO службу не відновлює.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowEmptyCollection()][string[]]$ServiceNames = @())
+
+    $parts = @()
+    $seenNames = @()
+    foreach ($serviceName in @($ServiceNames)) {
+        if ([string]::IsNullOrWhiteSpace($serviceName) -or ($seenNames -contains $serviceName)) { continue }
+        $seenNames += $serviceName
+        $condition = Get-BRAVOManagedServiceCondition -Name $serviceName
+        if (-not [bool]$condition.Exists) {
+            $parts += ('{0}: не встановлена' -f $serviceName)
+            continue
+        }
+        $parts += ('{0}: {1}, {2}' -f $condition.Name, $condition.StartMode, $condition.Status)
+    }
+    if ($parts.Count -eq 0) { return 'керованих служб не налаштовано' }
+    return ($parts -join '; ')
+}
