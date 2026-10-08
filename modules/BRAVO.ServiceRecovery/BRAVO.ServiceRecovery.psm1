@@ -1092,6 +1092,25 @@ function Test-BRAVOServiceRecoveryTaskDefinition {
         param([int]$Type)
         @($triggers | Where-Object { [int]$_.Type -eq $Type }) | Select-Object -First 1
     }
+    # Рівно по одному тригеру кожного з трьох типів і жодного іншого (рев'ю
+    # PR #429): другий тригер за подією SCM, другий BootTrigger, другий
+    # щоденний чи тригер іншого типу запускали б профіль поза розкладом
+    # 0/5/15/60, а перевірка лише першого тригера типу їх не бачила.
+    # Параметри нижче перевіряються на першому тригері кожного типу.
+    $expectedTriggerTypes = @(
+        @(0, 'тригерів за подією SCM (EventTrigger)'),
+        @(8, 'тригерів після старту Windows (BootTrigger)'),
+        @(2, 'щоденних тригерів (CalendarTrigger)')
+    )
+    foreach ($expectedTriggerType in $expectedTriggerTypes) {
+        $typeCount = @($triggers | Where-Object { [int]$_.Type -eq [int]$expectedTriggerType[0] }).Count
+        if ($typeCount -gt 1) {
+            $problems.Add(('{0}: {1}, очікується 1' -f $expectedTriggerType[1], $typeCount))
+        }
+    }
+    foreach ($unexpectedType in @($triggers | ForEach-Object { [int]$_.Type } | Where-Object { @(0, 8, 2) -notcontains $_ } | Sort-Object -Unique)) {
+        $problems.Add(('зайвий тригер типу {0}: очікуються лише тригер за подією SCM, після старту Windows і щоденний' -f $unexpectedType))
+    }
 
     $eventTrigger = & $firstOfType 0
     if ($null -eq $eventTrigger) {
