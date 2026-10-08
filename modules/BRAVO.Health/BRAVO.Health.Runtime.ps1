@@ -4098,13 +4098,15 @@ function Start-BRAVOHealthServiceRecoveryTask {
     # із read-only політики Health — запуск задачі, не служби.
     # Результат: Started / AlreadyRunning / Missing (задачі немає або вона
     # вимкнена) / NotConfigured (вузол ServiceRecovery вимкнено разом із
-    # Maintenance) / Error (текст помилки запуску).
+    # Maintenance) / SchedulerError (стан задачі не прочитано: COM/доступ до
+    # Планувальника — це НЕ «задача відсутня») / Error (текст помилки запуску).
     $result = [pscustomobject]@{
         TaskName = 'BRAVO_SERVICE_RECOVERY'
         Started = $false
         AlreadyRunning = $false
         Missing = $false
         NotConfigured = $false
+        SchedulerError = $null
         Error = $null
     }
     try {
@@ -4126,6 +4128,12 @@ function Start-BRAVOHealthServiceRecoveryTask {
             }
         }
         $taskState = Get-BRAVOScheduledTaskState -TaskPath $taskPath -TaskName $result.TaskName
+        $taskStateError = $taskState.PSObject.Properties['Error']
+        if (-not [bool]$taskState.Exists -and $null -ne $taskStateError -and
+            -not [string]::IsNullOrWhiteSpace([string]$taskStateError.Value)) {
+            $result.SchedulerError = [string]$taskStateError.Value
+            return $result
+        }
         if (-not [bool]$taskState.Exists -or [string]$taskState.State -eq 'Disabled') {
             $result.Missing = $true
             return $result
@@ -4268,6 +4276,8 @@ function Get-ManagedServiceHealthIssues {
                     Write-HealthLog "Служба $($service.Name) не працює: задача відновлення $($recoveryTaskStart.TaskName) уже виконується" -Level "INFO"
                 } elseif ($recoveryTaskStart.Missing) {
                     Write-HealthLog "Задача відновлення $($recoveryTaskStart.TaskName) відсутня або вимкнена — впалі служби автоматично не відновлюються" -Level "ERROR"
+                } elseif (-not [string]::IsNullOrWhiteSpace([string]$recoveryTaskStart.SchedulerError)) {
+                    Write-HealthLog "Стан задачі відновлення $($recoveryTaskStart.TaskName) не прочитано — помилка доступу до Планувальника завдань: $($recoveryTaskStart.SchedulerError); впалі служби автоматично не відновлюються" -Level "ERROR"
                 } elseif (-not [string]::IsNullOrWhiteSpace([string]$recoveryTaskStart.Error)) {
                     Write-HealthLog "Не вдалося запустити задачу відновлення $($recoveryTaskStart.TaskName): $($recoveryTaskStart.Error)" -Level "ERROR"
                 }
@@ -4278,6 +4288,8 @@ function Get-ManagedServiceHealthIssues {
                 "служба $($service.Name) не працює; автоматичне відновлення вже виконується, перевірте журнал BRAVO_MAINTENANCE_*_RECOVER_*.log у LOGS"
             } elseif ($recoveryTaskStart.Missing) {
                 "служба $($service.Name) не працює; задача $($recoveryTaskStart.TaskName) відсутня або вимкнена — виконайте BRAVO_TASKS_INSTALL.ps1 або запустіть BRAVO_MAINTENANCE.ps1 -RecoverServices вручну"
+            } elseif (-not [string]::IsNullOrWhiteSpace([string]$recoveryTaskStart.SchedulerError)) {
+                "служба $($service.Name) не працює; стан задачі $($recoveryTaskStart.TaskName) не прочитано — помилка доступу до Планувальника завдань: $($recoveryTaskStart.SchedulerError) — перевірте службу Планувальника завдань і права облікового запису Health або запустіть BRAVO_MAINTENANCE.ps1 -RecoverServices вручну"
             } elseif (-not [string]::IsNullOrWhiteSpace([string]$recoveryTaskStart.Error)) {
                 "служба $($service.Name) не працює; не вдалося запустити задачу $($recoveryTaskStart.TaskName): $($recoveryTaskStart.Error) — запустіть BRAVO_MAINTENANCE.ps1 -RecoverServices вручну"
             } else {

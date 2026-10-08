@@ -999,7 +999,10 @@ function Add-BRAVOServiceRecoveryTaskTriggers {
     # MultipleInstances = IgnoreNew (2) незалежно від глобального
     # schedulerSettings.MultipleInstances: шторм подій SCM не множить
     # екземпляри; ExecutionTimeLimit обмежує завислий запуск;
-    # StartWhenAvailable вимкнено — пропущений періодичний тик не потрібен.
+    # StartWhenAvailable вимкнено — пропущений періодичний тик не потрібен;
+    # RestartCount = 0 незалежно від глобального schedulerSettings.RestartCount:
+    # ненульовий код профілю (10/20/60) Планувальник вважає збоєм і
+    # перезапускав би задачу поза паузами 0/5/15/60 (FR-5).
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object]$Definition,
@@ -1009,6 +1012,7 @@ function Add-BRAVOServiceRecoveryTaskTriggers {
 
     $Definition.Settings.MultipleInstances = 2
     $Definition.Settings.StartWhenAvailable = $false
+    $Definition.Settings.RestartCount = 0
     $Definition.Settings.ExecutionTimeLimit = [string]$Policy.TaskExecutionTimeLimit
 
     $eventTrigger = $Definition.Triggers.Create(0) # TASK_TRIGGER_EVENT
@@ -1056,6 +1060,9 @@ function Test-BRAVOServiceRecoveryTaskDefinition {
         if ($subscription -notmatch 'Service Control Manager') {
             $problems.Add('тригер за подією SCM: фільтр не на джерело Service Control Manager')
         }
+        if ($subscription -notmatch 'Path="System"') {
+            $problems.Add('тригер за подією SCM: підписка не на журнал System')
+        }
         foreach ($eventId in @($Policy.ScmEventIds)) {
             if ($subscription -notmatch ('EventID={0}(?!\d)' -f [int]$eventId)) {
                 $problems.Add("тригер за подією SCM: у фільтрі немає EventID $eventId")
@@ -1084,6 +1091,14 @@ function Test-BRAVOServiceRecoveryTaskDefinition {
         if ([string]$dailyTrigger.Repetition.Interval -ne [string]$Policy.RepeatInterval) {
             $problems.Add("щоденний тригер: повтор '$($dailyTrigger.Repetition.Interval)', очікується $($Policy.RepeatInterval)")
         }
+        # Повтор має покривати всю добу: з Duration=PT1H перевірка кожні
+        # 15 хв працювала б лише першу годину після 00:00.
+        if ([string]$dailyTrigger.Repetition.Duration -ne 'P1D') {
+            $problems.Add("щоденний тригер: тривалість повтору Duration='$($dailyTrigger.Repetition.Duration)', очікується P1D")
+        }
+        if ([bool]$dailyTrigger.Repetition.StopAtDurationEnd) {
+            $problems.Add('щоденний тригер: StopAtDurationEnd=true, очікується false')
+        }
         if (-not [bool]$dailyTrigger.Enabled) { $problems.Add('щоденний тригер вимкнено') }
     }
 
@@ -1092,6 +1107,12 @@ function Test-BRAVOServiceRecoveryTaskDefinition {
     }
     if ([string]$Definition.Settings.ExecutionTimeLimit -ne [string]$Policy.TaskExecutionTimeLimit) {
         $problems.Add("ExecutionTimeLimit='$($Definition.Settings.ExecutionTimeLimit)', очікується $($Policy.TaskExecutionTimeLimit)")
+    }
+    if ([bool]$Definition.Settings.StartWhenAvailable) {
+        $problems.Add('StartWhenAvailable=true, очікується false (пропущений періодичний тик не наздоганяється)')
+    }
+    if ([int]$Definition.Settings.RestartCount -ne 0) {
+        $problems.Add("RestartCount=$($Definition.Settings.RestartCount) (RestartInterval='$($Definition.Settings.RestartInterval)'), очікується 0: повтори задає профіль -RecoverServices паузами 0/5/15/60")
     }
     return $problems.ToArray()
 }

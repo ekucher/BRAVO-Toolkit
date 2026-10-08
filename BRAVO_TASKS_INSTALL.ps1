@@ -328,7 +328,10 @@ function New-BRAVOTaskDefinition {
     $definition.Settings.ExecutionTimeLimit = [System.Xml.XmlConvert]::ToString(
         (ConvertTo-BRAVOSchedulerExecutionTimeLimit -Hours $TaskSettings.ExecutionTimeLimitHours)
     )
-    if ([int]$schedulerSettings.RestartCount -gt 0) {
+    # ServiceRecovery — без глобального RestartCount (A-7 #314): повтори
+    # задає профіль -RecoverServices паузами 0/5/15/60, а ненульовий код
+    # профілю Планувальник трактував би як збій і перезапускав задачу.
+    if ([int]$schedulerSettings.RestartCount -gt 0 -and $TaskType -ne "ServiceRecovery") {
         $definition.Settings.RestartCount = [int]$schedulerSettings.RestartCount
         $definition.Settings.RestartInterval = [System.Xml.XmlConvert]::ToString(
             [timespan]::FromMinutes([int]$schedulerSettings.RestartIntervalMinutes)
@@ -1070,6 +1073,10 @@ try {
                 "кожні $($taskSettings.RepeatEveryHours) год., починаючи з $($taskSettings.StartAt)"
             } elseif ($taskPlan.Type -eq "RestoreVerify") {
                 "щотижня ($($taskSettings.WeeklyOn)) о $($taskSettings.At)"
+            } elseif ($taskPlan.Type -eq "ServiceRecovery") {
+                # Розклад — тригери Add-BRAVOServiceRecoveryTaskTriggers, у вузлі
+                # конфігурації немає StartAt/RepeatEveryMinutes.
+                "за подією SCM (~1 хв), після старту Windows (~10 хв) і кожні 15 хв"
             } else {
                 if (([int]$taskSettings.RepeatEveryMinutes % 60) -eq 0) {
                     "кожні $([int]$taskSettings.RepeatEveryMinutes / 60) год., починаючи з $($taskSettings.StartAt)"

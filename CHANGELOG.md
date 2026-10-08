@@ -38,6 +38,17 @@
   власника (нічний Maintenance, DataRestore) → вихід 20 ще до швидкого виходу «впалих немає». Тести:
   `ServiceRecovery/ProfileStartFailureClearsOwnMarker`, `ServiceRecovery/ProfileRetriesAfterStartFailureNextTick`,
   `ServiceRecovery/StartFailureSendsCyclicCriticalOncePer24h`, `ServiceRecovery/ProfileForeignLiveOwnerExits20BeforeFastExit`.
+  Також за рев'ю: задача `BRAVO_SERVICE_RECOVERY` не бере глобальні `RestartCount`/`RestartInterval` Планувальника
+  (ненульовий код профілю інакше перезапускав би її поза паузами); Diagnose додатково ловить тривалість повтору
+  щоденного тригера не `P1D`, `StopAtDurationEnd=true`, `StartWhenAvailable=true`, підписку не на журнал System і
+  `RestartCount>0`; `Get-BRAVOScheduledTaskState` відрізняє «задачі немає» (COM `0x80070002`/`0x80070003`) від іншої
+  помилки COM (`State=Unavailable`, текст у `Error`), і Health за помилки доступу до Планувальника пише окремий текст
+  замість «задача відсутня — виконайте `BRAVO_TASKS_INSTALL.ps1`»; `BRAVO_TASKS_INSTALL.ps1 -ValidateOnly` більше не
+  завершується кодом 1 на рядку розкладу задачі відновлення (читав відсутній `RepeatEveryMinutes` під StrictMode).
+  Тести: `ServiceRecovery/DiagnoseDetectsSettingsDrift`, `ServiceRecovery/HealthSchedulerAccessErrorIsNotMissingTask`,
+  `ServiceRecovery/ScheduledTaskStateSeparatesNotFoundFromAccessError`,
+  `ServiceRecovery/InstallValidateOnlyDescribesRecoverySchedule`; AST-проби `Health/ManagedService*` отримали
+  `Start-BRAVOHealthServiceRecoveryTask`.
 
 - **Feature: профіль відновлення впалих служб `BRAVO_MAINTENANCE.ps1 -RecoverServices` (#314, хвиля 4, FR-3).**
   Новий перемикач запускає не обслуговування, а легкий профіль: класифікація керованих служб без lock-а

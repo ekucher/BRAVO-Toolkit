@@ -1047,6 +1047,7 @@ function Get-BRAVOScheduledTaskState {
                 IsRunning = ([string]$task.State -eq "Running")
                 Provider = "ScheduledTasks"
                 Task = $task
+                Error = $null
             }
         } catch {
             # Windows 8+ може мати модуль, але провайдер іноді недоступний.
@@ -1077,14 +1078,35 @@ function Get-BRAVOScheduledTaskState {
             IsRunning = ([int]$task.State -eq 4)
             Provider = "COM"
             Task = $task
+            Error = $null
         }
     } catch {
+        # «Задачі немає» — лише COM HRESULT 0x80070002 (файл) або 0x80070003
+        # (тека задач). Будь-яка інша помилка (служба Schedule недоступна,
+        # доступ заборонено) — State=Unavailable з текстом у Error: викликач
+        # не повинен радити перевстановити задачі, коли причина інша.
+        $notFound = $false
+        $exception = $_.Exception
+        while ($null -ne $exception) {
+            $hresult = if ($exception -is [System.Runtime.InteropServices.ExternalException]) {
+                [int]$exception.ErrorCode
+            } else {
+                $hresultProperty = $exception.PSObject.Properties['HResult']
+                if ($null -ne $hresultProperty) { [int]$hresultProperty.Value } else { 0 }
+            }
+            if ($hresult -eq -2147024894 -or $hresult -eq -2147024893) {
+                $notFound = $true
+                break
+            }
+            $exception = $exception.InnerException
+        }
         return New-Object PSObject -Property @{
             Exists = $false
-            State = "NotFound"
+            State = $(if ($notFound) { "NotFound" } else { "Unavailable" })
             IsRunning = $false
             Provider = "COM"
             Task = $null
+            Error = $(if ($notFound) { $null } else { [string]$_.Exception.Message })
         }
     }
 }
