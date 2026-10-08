@@ -168,6 +168,14 @@ function Write-BRAVOStateTemporaryText {
                 UnknownFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition (& $make 'Unknown'))
                 ManualFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition (& $make 'Manual'))
                 RunningUnknownFlag = [bool](Test-BRAVOServiceRecoveryStartModeUnknown -Condition ([pscustomobject]@{ Name = 'BRAVO'; Condition = 'Running'; Status = 'Running'; StartMode = 'Unknown' }))
+                # План ланцюжка без -EligibleNames: тип запуску з опису служби
+                # (об'єкт або hashtable) не губиться.
+                ChainUnknownBravo = (@((Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                                [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Unknown' },
+                                [pscustomobject]@{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Condition = 'Running'; Status = 'Running'; StartMode = 'Automatic' })).StartOrder) -join ' ')
+                ChainUnknownDependent = (@((Get-BRAVOServiceRecoveryChainPlan -Conditions @(
+                                [pscustomobject]@{ Key = 'Bravo'; Name = 'BRAVO'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Automatic' },
+                                @{ Key = 'ExchangeApi'; Name = 'exchangAPI'; Condition = 'Failed'; Status = 'Stopped'; StartMode = 'Unknown' })).StartOrder) -join ' ')
             }
         }
     } catch {
@@ -178,7 +186,8 @@ function Write-BRAVOStateTemporaryText {
             $null -eq $recoveryUnknownError -and $null -ne $recoveryUnknown -and
             -not $recoveryUnknown.UnknownFailed -and -not $recoveryUnknown.EmptyFailed -and
             $recoveryUnknown.ManualFailed -and $recoveryUnknown.AutomaticFailed -and
-            $recoveryUnknown.UnknownFlag -and -not $recoveryUnknown.ManualFlag -and -not $recoveryUnknown.RunningUnknownFlag
+            $recoveryUnknown.UnknownFlag -and -not $recoveryUnknown.ManualFlag -and -not $recoveryUnknown.RunningUnknownFlag -and
+            [string]$recoveryUnknown.ChainUnknownBravo -ceq '' -and [string]$recoveryUnknown.ChainUnknownDependent -ceq 'BRAVO'
         ) `
         -Name 'ServiceRecovery/UnknownStartModeIsNotRecoveryCandidate' `
         -Failure "зупинена служба з невідомим типом запуску (StartMode Unknown/порожній) — не «впала» для відновлення (Test-BRAVOServiceRecoveryFailed=`$false, Test-BRAVOServiceRecoveryStartModeUnknown=`$true); Automatic/Manual — «впала». помилка='$recoveryUnknownError' результат=[$(if ($null -ne $recoveryUnknown) { ($recoveryUnknown.PSObject.Properties | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value }) -join ' ' })]"
