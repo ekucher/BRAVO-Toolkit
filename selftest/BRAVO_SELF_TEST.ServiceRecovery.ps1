@@ -1597,7 +1597,7 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
     try {
         $taskModule = New-BRAVOSelfTestRuntimeModule `
             -SourceText $taskSystemText `
-            -FunctionNames @('Get-BRAVOServiceRecoveryTaskTriggerSpec', 'Initialize-BRAVOServiceRecoveryTaskDefinition', 'Test-BRAVOServiceRecoveryTaskDefinition')
+            -FunctionNames @('ConvertTo-BRAVOEventXPathLiteral', 'Get-BRAVOServiceRecoveryTaskTriggerSpec', 'Initialize-BRAVOServiceRecoveryTaskDefinition', 'Get-BRAVOServiceRecoverySubscriptionStopEventNames', 'Test-BRAVOServiceRecoveryTaskDefinition')
     } catch {
         $taskModuleError = $_.Exception.Message
     }
@@ -1631,6 +1631,10 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             'BootNoDelay' { @($triggerList | Where-Object { $_.Type -eq 8 })[0].Delay = '' }
             'EventMissingId' { $eventTriggerToEdit = @($triggerList | Where-Object { $_.Type -eq 0 })[0]; $eventTriggerToEdit.Subscription = $eventTriggerToEdit.Subscription.Replace(' or EventID=7034', '') }
             'Parallel' { $Definition.Settings.MultipleInstances = 0 }
+            'ForeignLog' { $eventTriggerToEdit = @($triggerList | Where-Object { $_.Type -eq 0 })[0]; $eventTriggerToEdit.Subscription = $eventTriggerToEdit.Subscription.Replace('<Select Path="System">', '<Select Path="Application">') }
+            'DuplicateBoot' { $duplicateBoot = $Definition.Triggers.Create(8); $duplicateBoot.Delay = 'PT10M'; $duplicateBoot.Enabled = $true }
+            'ExtraTrigger' { [void]$Definition.Triggers.Create(1) }
+            'StopAtDurationEnd' { @($triggerList | Where-Object { $_.Type -eq 2 })[0].Repetition.StopAtDurationEnd = $true }
         }
         $spec = Get-BRAVOServiceRecoveryTaskTriggerSpec
         $subscriptionXml = $null
@@ -1693,6 +1697,10 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
         BootNoDelay = 'boot-тригер: Delay'
         EventMissingId = 'бракує 7034'
         Parallel = 'MultipleInstances'
+        ForeignLog = 'читає журнал Application'
+        DuplicateBoot = 'дубльовані тригери: boot'
+        ExtraTrigger = 'зайві тригери (тип 1)'
+        StopAtDurationEnd = 'StopAtDurationEnd=True'
     }
     $taskMutationMisses = @()
     foreach ($taskMutation in $taskMutations.Keys) {
@@ -1705,7 +1713,7 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
     Test-BRAVOCondition `
         -Condition ($null -ne $taskModule -and $taskMutationMisses.Count -eq 0) `
         -Name 'ServiceRecovery/TaskDefinitionCheckCatchesMissingTrigger' `
-        -Failure "#314 FR-4: перевірка визначення ловить відсутній тригер і неправильні параметри (event / boot / daily, затримка, повтор, ідентифікатори подій, MultipleInstances). Пропущено: $($taskMutationMisses -join '; ') $taskModuleError"
+        -Failure "#314 FR-4: перевірка визначення ловить відсутній тригер і неправильні параметри (event / boot / daily, затримка, повтор, ідентифікатори подій, MultipleInstances), підписку на інший журнал, дубльований і зайвий тригер, StopAtDurationEnd. Пропущено: $($taskMutationMisses -join '; ') $taskModuleError"
 
     # Diagnose: Test-BRAVOScheduledTaskDefinition для ServiceRecovery додає
     # проблеми тригерів (відсутній boot-тригер — FAIL), для інших типів — ні.
@@ -1717,8 +1725,8 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
         $diagnoseTaskModule = New-BRAVOSelfTestRuntimeModule `
             -SourceText ($diagnoseTextForTask + "`n" + $compatibilityTextForTask + "`n" + $taskSystemText) `
             -FunctionNames @('Test-BRAVOMappedNetworkDrive', 'ConvertTo-BRAVOAccountSidValue', 'Test-BRAVOAccountIdentityEquivalent',
-                'Get-BRAVOServiceRecoveryTaskTriggerSpec', 'Initialize-BRAVOServiceRecoveryTaskDefinition', 'Test-BRAVOServiceRecoveryTaskDefinition',
-                'Test-BRAVOScheduledTaskDefinition')
+                'ConvertTo-BRAVOEventXPathLiteral', 'Get-BRAVOServiceRecoveryTaskTriggerSpec', 'Initialize-BRAVOServiceRecoveryTaskDefinition',
+                'Get-BRAVOServiceRecoverySubscriptionStopEventNames', 'Test-BRAVOServiceRecoveryTaskDefinition', 'Test-BRAVOScheduledTaskDefinition')
     } catch {
         $diagnoseTaskError = $_.Exception.Message
     }
@@ -1759,6 +1767,161 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
         -Name 'ServiceRecovery/DiagnoseChecksServiceRecoveryTriggers' `
         -Failure "#314 FR-4: BRAVO_TASKS_DIAGNOSE (Test-BRAVOScheduledTaskDefinition) перевіряє три тригери задачі ServiceRecovery через Test-BRAVOServiceRecoveryTaskDefinition: правильне визначення — без проблем тригерів, без boot-тригера — FAIL; інших типів задач перевірка не стосується. Отримано: правильне=[$(@(& $diagnoseTriggerProblems 'ServiceRecovery|') -join ' | ')]; без boot=[$(@(& $diagnoseTriggerProblems 'ServiceRecovery|NoBoot') -join ' | ')]; Maintenance=[$(@(& $diagnoseTriggerProblems 'Maintenance|NoBoot') -join ' | ')] $diagnoseTaskError"
 
+    # Рев'ю PR #432 (A-P2): штатний Stop-Service пише в System log лише 7036.
+    # Підписка event-тригера має другий Select — 7036 лише для відображуваних
+    # імен керованих служб (param1 події); апостроф — у подвійних лапках, обидва
+    # види лапок — ім'я пропускається; &, <, > — XML-сутності. Diagnose звіряє
+    # зареєстрований фільтр з поточними іменами.
+    $stopEventApostropheName = "BRAVO O'Service"
+    $stopEventBothQuotesName = 'BRAVO "Q" O''S'
+    $stopEventProbe = {
+        param($Definition, [string[]]$Names, [string[]]$ExpectedNames, [bool]$BindExpected)
+        $spec = Get-BRAVOServiceRecoveryTaskTriggerSpec -StopEventDisplayNames $Names
+        $definition = $Definition
+        Initialize-BRAVOServiceRecoveryTaskDefinition -Definition $definition -StopEventDisplayNames $Names
+        $checkArguments = @{ Definition = $definition }
+        if ($BindExpected) { $checkArguments['ExpectedStopEventDisplayNames'] = $ExpectedNames }
+        $xml = $null
+        try { $xml = [xml]$spec.EventSubscription } catch { $xml = $null }
+        [pscustomobject]@{
+            Subscription = [string]$spec.EventSubscription
+            SpecNames = @($spec.StopEventDisplayNames)
+            SelectCount = if ($null -ne $xml) { @($xml.QueryList.Query.Select).Count } else { -1 }
+            ParsedNames = @((Get-BRAVOServiceRecoverySubscriptionStopEventNames -Subscription $spec.EventSubscription).Names)
+            Problems = @(Test-BRAVOServiceRecoveryTaskDefinition @checkArguments)
+        }
+    }
+    $stopEventRun = {
+        param([string[]]$Names, [string[]]$ExpectedNames, [bool]$BindExpected)
+        if ($null -eq $taskModule) { return $null }
+        try { return (& $taskModule $stopEventProbe (& $newFakeDefinition) $Names $ExpectedNames $BindExpected) } catch { return [pscustomobject]@{ Error = $_.Exception.Message } }
+    }
+    $stopEventNames = @('BRAVO Display', $stopEventApostropheName, 'BRAVO & Web <x>', $stopEventBothQuotesName)
+    $stopEventBuilt = & $stopEventRun $stopEventNames @('BRAVO Display', $stopEventApostropheName, 'BRAVO & Web <x>') $true
+    $stopEventNone = & $stopEventRun @() @() $true
+    $stopEventStale = & $stopEventRun @('BRAVO Display') @('BRAVO Display (renamed)') $true
+    $stopEventUnbound = & $stopEventRun @('BRAVO Display') @() $false
+    $stopEventStaleNone = & $stopEventRun @() @('BRAVO Display') $true
+    $stopEventOk = (
+        $null -ne $stopEventBuilt -and $null -eq $stopEventBuilt.PSObject.Properties['Error'] -and
+        $stopEventBuilt.SelectCount -eq 2 -and
+        $stopEventBuilt.Subscription.Contains("and EventID=7036] and EventData[Data[@Name='param1']='BRAVO Display' or Data[@Name='param1']=""BRAVO O'Service"" or Data[@Name='param1']='BRAVO &amp; Web &lt;x&gt;']]") -and
+        -not $stopEventBuilt.Subscription.Contains('"Q"') -and
+        (@($stopEventBuilt.SpecNames) -join '|') -ceq ('BRAVO Display|' + $stopEventApostropheName + '|BRAVO & Web <x>') -and
+        (@($stopEventBuilt.ParsedNames) -join '|') -ceq ('BRAVO Display|' + $stopEventApostropheName + '|BRAVO & Web <x>') -and
+        @($stopEventBuilt.Problems).Count -eq 0 -and
+        $null -ne $stopEventNone -and $stopEventNone.SelectCount -eq 1 -and -not $stopEventNone.Subscription.Contains('7036') -and @($stopEventNone.Problems).Count -eq 0 -and
+        $null -ne $stopEventUnbound -and @($stopEventUnbound.Problems).Count -eq 0 -and
+        $null -ne $stopEventStale -and @($stopEventStale.Problems | Where-Object { ([string]$_).Contains('фільтр події 7036 не відповідає') -and ([string]$_).Contains('BRAVO Display (renamed)') }).Count -eq 1 -and
+        $null -ne $stopEventStaleNone -and @($stopEventStaleNone.Problems | Where-Object { ([string]$_).Contains('зареєстровано: немає') }).Count -eq 1
+    )
+    Test-BRAVOCondition `
+        -Condition $stopEventOk `
+        -Name 'ServiceRecovery/TaskStopEventFilteredByDisplayName' `
+        -Failure "Рев'ю PR #432 (A-P2): event-тригер підписаний і на 7036 (штатна зупинка), але лише для відображуваних імен керованих служб (EventData/Data[@Name='param1']); апостроф — у подвійних лапках, обидва види лапок — без фільтра, XML-сутності для &, <, >; без імен 7036 не підписується; перевірка визначення ловить розбіжність фільтра з поточними іменами. Отримано: підписка='$(if ($null -ne $stopEventBuilt -and $null -ne $stopEventBuilt.PSObject.Properties['Subscription']) { $stopEventBuilt.Subscription })'; імена=[$(if ($null -ne $stopEventBuilt -and $null -ne $stopEventBuilt.PSObject.Properties['ParsedNames']) { @($stopEventBuilt.ParsedNames) -join ' | ' })]; проблеми розбіжності=[$(if ($null -ne $stopEventStale -and $null -ne $stopEventStale.PSObject.Properties['Problems']) { @($stopEventStale.Problems) -join ' | ' })] $(if ($null -ne $stopEventBuilt -and $null -ne $stopEventBuilt.PSObject.Properties['Error']) { $stopEventBuilt.Error }) $taskModuleError"
+
+    # Відображувані імена читаються з Get-Service (той самий шлях у
+    # інсталятора й Diagnose): відсутня служба й ім'я з обома видами лапок —
+    # попередження, без фільтра; перелік керованих служб — з налаштувань
+    # (BRAVO Web — лише з BravoWebEnabled і discovery).
+    $stopEventFilterModule = $null
+    $stopEventFilterError = ''
+    try {
+        $stopEventFilterModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText (@'
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    if ($Name -eq 'BravoMissing') { return $null }
+    $displayNames = @{ 'BRAVO' = 'BRAVO Display'; 'exchangAPI' = 'BRAVO exchangAPI Display'; 'BravoQuoted' = $script:stopEventBothQuotesName; 'BravoNoDisplay' = '' }
+    return [pscustomobject]@{ Name = $Name; DisplayName = $displayNames[$Name] }
+}
+function Get-BRAVOManagedServiceCondition {
+    param([string]$Name)
+    if ($Name -eq 'BravoMissing') { return [pscustomobject]@{ Name = $Name; Exists = $false; StartMode = $null; Status = $null } }
+    return [pscustomobject]@{ Name = $Name; Exists = $true; StartMode = 'Automatic'; Status = 'Running' }
+}
+'@ + "`n" + $taskSystemText) `
+            -FunctionNames @('Get-Service', 'Get-BRAVOManagedServiceCondition', 'ConvertTo-BRAVOEventXPathLiteral', 'Get-BRAVOServiceRecoveryManagedServiceNames', 'Get-BRAVOServiceRecoveryStopEventFilter', 'Get-BRAVOManagedServiceStartModeSummary')
+    } catch {
+        $stopEventFilterError = $_.Exception.Message
+    }
+    $stopEventFilterResult = $null
+    if ($null -ne $stopEventFilterModule) {
+        try {
+            $stopEventFilterResult = & $stopEventFilterModule {
+                param([string]$BothQuotesName)
+                Set-StrictMode -Version 2.0
+                $script:stopEventBothQuotesName = $BothQuotesName
+                $filter = Get-BRAVOServiceRecoveryStopEventFilter -ServiceNames @('BRAVO', 'exchangAPI', 'BRAVO', 'BravoMissing', 'BravoQuoted', 'BravoNoDisplay', '')
+                $discovery = [pscustomobject]@{ WebServiceName = 'BravoWebSvc' }
+                [pscustomobject]@{
+                    DisplayNames = @($filter.DisplayNames)
+                    Warnings = @($filter.Warnings)
+                    NamesWithWeb = @(Get-BRAVOServiceRecoveryManagedServiceNames -ServicesSettings @{ BravoName = 'BRAVO'; ExchangeApiName = 'exchangAPI'; BravoWebEnabled = 'true' } -DiscoveryResult $discovery)
+                    NamesWebOff = @(Get-BRAVOServiceRecoveryManagedServiceNames -ServicesSettings @{ BravoName = 'BRAVO'; ExchangeApiName = 'exchangAPI'; BravoWebEnabled = $false } -DiscoveryResult $discovery)
+                    NamesWebNoFlag = @(Get-BRAVOServiceRecoveryManagedServiceNames -ServicesSettings ([pscustomobject]@{ BravoName = 'BRAVO'; ExchangeApiName = '' }) -DiscoveryResult $discovery)
+                    NamesNoSettings = @(Get-BRAVOServiceRecoveryManagedServiceNames -ServicesSettings $null -DiscoveryResult $discovery)
+                    Summary = Get-BRAVOManagedServiceStartModeSummary -ServiceNames @('BRAVO', 'BravoMissing', 'BRAVO', '')
+                    SummaryEmpty = Get-BRAVOManagedServiceStartModeSummary -ServiceNames @()
+                }
+            } $stopEventBothQuotesName
+        } catch {
+            $stopEventFilterError = $_.Exception.Message
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $stopEventFilterResult -and
+            (@($stopEventFilterResult.DisplayNames) -join '|') -ceq 'BRAVO Display|BRAVO exchangAPI Display' -and
+            @($stopEventFilterResult.Warnings).Count -eq 3 -and
+            @($stopEventFilterResult.Warnings | Where-Object { ([string]$_).Contains('BravoMissing не знайдено') }).Count -eq 1 -and
+            @($stopEventFilterResult.Warnings | Where-Object { ([string]$_).Contains('BravoQuoted містить і апостроф, і подвійні лапки') }).Count -eq 1 -and
+            (@($stopEventFilterResult.NamesWithWeb) -join '|') -ceq 'BRAVO|exchangAPI|BravoWebSvc' -and
+            (@($stopEventFilterResult.NamesWebOff) -join '|') -ceq 'BRAVO|exchangAPI' -and
+            (@($stopEventFilterResult.NamesWebNoFlag) -join '|') -ceq 'BRAVO' -and
+            @($stopEventFilterResult.NamesNoSettings).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/StopEventDisplayNamesReadFromServices' `
+        -Failure "Рев'ю PR #432 (A-P2): відображувані імена для фільтра 7036 — з Get-Service для керованих служб (без дублікатів); відсутня служба, порожнє ім'я і ім'я з обома видами лапок — попередження без фільтра; перелік служб: BRAVO, exchangAPI і BRAVO Web лише з BravoWebEnabled. Отримано: $(if ($null -ne $stopEventFilterResult) { 'імена=' + (@($stopEventFilterResult.DisplayNames) -join ' | ') + '; попередження=' + (@($stopEventFilterResult.Warnings) -join ' | ') + '; служби=' + (@($stopEventFilterResult.NamesWithWeb) -join ',') + '/' + (@($stopEventFilterResult.NamesWebOff) -join ',') + '/' + (@($stopEventFilterResult.NamesWebNoFlag) -join ',') }) $stopEventFilterError"
+
+    # Рев'ю PR #432 (A-P3-5): рядок журналу інсталятора про типи запуску —
+    # поведінково, а не лише grep-ом: дублікати й порожні імена пропускаються,
+    # відсутня служба — «не встановлена», без служб — окремий текст.
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $stopEventFilterResult -and
+            [string]$stopEventFilterResult.Summary -ceq 'BRAVO: Automatic, Running; BravoMissing: не встановлена' -and
+            [string]$stopEventFilterResult.SummaryEmpty -ceq 'керованих служб не налаштовано'
+        ) `
+        -Name 'ServiceRecovery/ManagedServiceStartModeSummaryBehaviour' `
+        -Failure "Рев'ю PR #432 (A-P3-5): Get-BRAVOManagedServiceStartModeSummary — «ім'я: тип, стан» через '; ', без дублікатів і порожніх імен, відсутня служба — «не встановлена», порожній перелік — «керованих служб не налаштовано». Отримано: '$(if ($null -ne $stopEventFilterResult) { $stopEventFilterResult.Summary })' / '$(if ($null -ne $stopEventFilterResult) { $stopEventFilterResult.SummaryEmpty })' $stopEventFilterError"
+
+    # Diagnose передає поточні імена в перевірку: зареєстрований фільтр 7036
+    # зі старими іменами — FAIL.
+    $diagnoseStopEventProblems = @()
+    if ($null -ne $diagnoseTaskModule) {
+        $diagnoseStopEventDefinition = & $newFakeDefinition
+        Add-Member -InputObject $diagnoseStopEventDefinition -MemberType NoteProperty -Name Principal -Value ([pscustomobject]@{ UserId = 'S-1-5-18'; LogonType = 5; RunLevel = 1 })
+        Add-Member -InputObject $diagnoseStopEventDefinition -MemberType NoteProperty -Name Actions -Value @()
+        try {
+            $diagnoseStopEventProblems = @(& $diagnoseTaskModule {
+                    param($Definition)
+                    Initialize-BRAVOServiceRecoveryTaskDefinition -Definition $Definition -StopEventDisplayNames @('BRAVO Display')
+                    Test-BRAVOScheduledTaskDefinition `
+                        -TaskType 'ServiceRecovery' -RegisteredTask ([pscustomobject]@{ Enabled = $true; Definition = $Definition }) -TaskSettings @{} `
+                        -ExpectedConfigPath '' -ExpectedExecutable '' -RequiredArgumentTokens @() `
+                        -ExpectedAccount 'SYSTEM' -ExpectedLogonType 5 -ExpectedRunLevel 1 `
+                        -ServiceRecoveryStopEventDisplayNames @('BRAVO Display (renamed)')
+                } $diagnoseStopEventDefinition)
+        } catch {
+            $diagnoseStopEventProblems = @("виняток: $($_.Exception.Message)")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $diagnoseTaskModule -and @($diagnoseStopEventProblems | Where-Object { ([string]$_).Contains('фільтр події 7036 не відповідає') }).Count -eq 1) `
+        -Name 'ServiceRecovery/DiagnoseChecksStopEventFilter' `
+        -Failure "Рев'ю PR #432 (A-P2): BRAVO_TASKS_DIAGNOSE (Test-BRAVOScheduledTaskDefinition -ServiceRecoveryStopEventDisplayNames) — FAIL, коли фільтр 7036 зареєстровано зі старими відображуваними іменами. Отримано: $($diagnoseStopEventProblems -join ' | ') $diagnoseTaskError"
+
     # Підключення: тип ServiceRecovery у трьох скриптах задач, похідний вузол
     # конфігурації (Enabled = Maintenance.Enabled), дія -RecoverServices.
     $installTextForTask = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_INSTALL.ps1'), [Text.Encoding]::UTF8)
@@ -1776,7 +1939,11 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
         'Diagnose: ValidateSet' = $diagnoseTextForTask.Contains("[ValidateSet($taskTypeSet)]")
         'Diagnose: перелік задач' = $diagnoseTextForTask.Contains("foreach (`$taskType in @($taskTypeSet))")
         'Diagnose: аргументи' = $diagnoseTextForTask.Contains("ServiceRecovery = @('-NoPause', '-RecoverServices')")
-        'Diagnose: тригери' = $diagnoseTextForTask.Contains('Test-BRAVOServiceRecoveryTaskDefinition -Definition $definition')
+        # #314 (рев'ю PR #432, A-P2): виклик перевірки тригерів — через splat,
+        # щоб передати поточні імена служб для фільтра події 7036.
+        'Diagnose: тригери' = $diagnoseTextForTask.Contains('Test-BRAVOServiceRecoveryTaskDefinition @serviceRecoveryCheckArguments')
+        'Diagnose: фільтр 7036' = $diagnoseTextForTask.Contains('-ServiceRecoveryStopEventDisplayNames $serviceRecoveryStopEventDisplayNames') -and $diagnoseTextForTask.Contains('Get-BRAVOServiceRecoveryStopEventFilter -ServiceNames @(Get-BRAVOServiceRecoveryManagedServiceNames')
+        'Install: фільтр 7036' = $installTextForTask.Contains('Get-BRAVOServiceRecoveryStopEventFilter -ServiceNames $managedServiceNamesForLog') -and $installTextForTask.Contains('-StopEventDisplayNames $ServiceRecoveryStopEventDisplayNames') -and $installTextForTask.Contains('-ServiceRecoveryStopEventDisplayNames @($serviceRecoveryStopEventFilter.DisplayNames)')
         'Uninstall: ім''я задачі' = $uninstallTextForTask.Contains('$schedulerSettings.ServiceRecovery.TaskName')
         'Derivation: вузол' = ($derivationTextForTask.Contains('$global:schedulerSettings.ServiceRecovery = @{') -and $derivationTextForTask.Contains('TaskName = "BRAVO_SERVICE_RECOVERY"') -and $derivationTextForTask.Contains('ScriptPath = Join-Path $runtimeRoot "BRAVO_MAINTENANCE.ps1"'))
         'Loader: legacy-вузол' = ($loaderTextForTask.Contains('$global:schedulerSettings.ServiceRecovery = @{') -and $loaderTextForTask.Contains("TaskName = 'BRAVO_SERVICE_RECOVERY'"))

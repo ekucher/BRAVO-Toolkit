@@ -290,7 +290,11 @@ function New-BRAVOTaskDefinition {
         # сама визначає no-config/legacy-primary шлях). EXPLICIT-інсталяція
         # (оператор свідомо передав -ConfigPath, зокрема зовнішній
         # ConfigRoot != RuntimeRoot) зберігає точний шлях у задачі.
-        [bool]$ConfigPathWasExplicit
+        [bool]$ConfigPathWasExplicit,
+
+        # #314: відображувані імена керованих служб для фільтра події 7036
+        # задачі ServiceRecovery (Get-BRAVOServiceRecoveryStopEventFilter).
+        [AllowEmptyCollection()][string[]]$ServiceRecoveryStopEventDisplayNames = @()
     )
 
     # Task Scheduler 2.0 COM API доступний починаючи з Windows Vista/7 і
@@ -383,7 +387,7 @@ function New-BRAVOTaskDefinition {
         # StartWhenAvailable=false, ExecutionTimeLimit=PT1H. Канонічна
         # реалізація — BRAVO.System; Diagnose перевіряє зареєстровану задачу
         # проти тих самих значень (Test-BRAVOServiceRecoveryTaskDefinition).
-        Initialize-BRAVOServiceRecoveryTaskDefinition -Definition $definition
+        Initialize-BRAVOServiceRecoveryTaskDefinition -Definition $definition -StopEventDisplayNames $ServiceRecoveryStopEventDisplayNames
     } elseif ($TaskType -eq "RestoreVerify") {
         # Щотижневий restore drill (P1.1): один weekly-тригер. DaysOfWeek —
         # канонічний bitmask ConvertTo-BRAVODaysOfWeekMask (BRAVO.System),
@@ -950,18 +954,10 @@ try {
     # #314 FR-4: тип запуску ВСІХ трьох керованих служб (і BRAVO Web) — у
     # журнал інсталятора: задача BRAVO_SERVICE_RECOVERY відновлює кожну з них,
     # крім Disabled, тож саме цей рядок показує, що буде підніматися.
-    $managedServiceNamesForLog = @(
-        [string]$maintenanceSettings.Services.BravoName
-        [string]$maintenanceSettings.Services.ExchangeApiName
-    )
-    $bravoWebEnabledForLog = $false
-    try { $bravoWebEnabledForLog = [System.Convert]::ToBoolean($maintenanceSettings.Services.BravoWebEnabled) } catch { $bravoWebEnabledForLog = $false }
     $discoveryVariableForLog = Get-Variable -Name bravoDiscoveryResult -Scope Global -ErrorAction SilentlyContinue
-    if ($bravoWebEnabledForLog -and $null -ne $discoveryVariableForLog -and $null -ne $discoveryVariableForLog.Value -and
-        $null -ne $discoveryVariableForLog.Value.PSObject.Properties['WebServiceName'] -and
-        -not [string]::IsNullOrWhiteSpace([string]$discoveryVariableForLog.Value.WebServiceName)) {
-        $managedServiceNamesForLog += [string]$discoveryVariableForLog.Value.WebServiceName
-    }
+    $managedServiceNamesForLog = @(Get-BRAVOServiceRecoveryManagedServiceNames `
+        -ServicesSettings $maintenanceSettings.Services `
+        -DiscoveryResult $(if ($null -ne $discoveryVariableForLog) { $discoveryVariableForLog.Value }))
     $managedServiceStartModeText = try {
         Get-BRAVOManagedServiceStartModeSummary -ServiceNames $managedServiceNamesForLog
     } catch {
@@ -970,6 +966,17 @@ try {
     Write-Host (
         "Тип запуску керованих служб (автоматичне відновлення не чіпає лише Disabled): " +
         $managedServiceStartModeText
+    ) -ForegroundColor DarkGray
+    # #314: штатну зупинку служби (подія 7036) задача BRAVO_SERVICE_RECOVERY
+    # підхоплює за відображуваними іменами, прочитаними тут; без імені —
+    # лише 15-хвилинний тик. Diagnose звіряє фільтр з поточними іменами.
+    $serviceRecoveryStopEventFilter = Get-BRAVOServiceRecoveryStopEventFilter -ServiceNames $managedServiceNamesForLog
+    foreach ($serviceRecoveryStopEventWarning in @($serviceRecoveryStopEventFilter.Warnings)) {
+        Write-Host "[WARNING] Фільтр події 7036 задачі відновлення служб: $serviceRecoveryStopEventWarning" -ForegroundColor Yellow
+    }
+    Write-Host (
+        "Фільтр події 7036 (штатна зупинка) задачі відновлення служб: " +
+        $(if (@($serviceRecoveryStopEventFilter.DisplayNames).Count -gt 0) { @($serviceRecoveryStopEventFilter.DisplayNames) -join '; ' } else { 'немає служб — зупинку підхопить 15-хвилинний тик' })
     ) -ForegroundColor DarkGray
 
     $taskFolder = Get-BRAVOScheduledTaskFolder -TaskService $taskService -TaskPath $taskPath
@@ -1032,7 +1039,8 @@ try {
             -TaskSettings $taskSettings `
             -TaskType $taskPlan.Type `
             -ResolvedConfigPath $resolvedConfigPath `
-            -ConfigPathWasExplicit $configPathWasExplicit
+            -ConfigPathWasExplicit $configPathWasExplicit `
+            -ServiceRecoveryStopEventDisplayNames @($serviceRecoveryStopEventFilter.DisplayNames)
 
         if ($ValidateOnly) {
             $scheduleText = if ($taskPlan.Type -eq "Backup" -or $taskPlan.Type -eq "Maintenance") {
