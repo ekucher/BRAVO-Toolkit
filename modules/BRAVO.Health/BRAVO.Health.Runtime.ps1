@@ -4127,7 +4127,10 @@ function Invoke-BRAVOHealthServiceRecoveryTask {
     }
     try {
         $taskStart = Start-BRAVOScheduledTask -TaskPath $taskPath -TaskName $taskName
-        if (-not [bool]$taskStart.Exists) {
+        if (-not [bool]$taskStart.Exists -and -not [string]::IsNullOrWhiteSpace([string]$taskStart.Error)) {
+            # Стан задачі не прочитано (помилка COM) — це не «задачі немає».
+            $outcome.Error = [string]$taskStart.Error
+        } elseif (-not [bool]$taskStart.Exists) {
             $outcome.Outcome = 'Missing'
         } elseif (-not [bool]$taskStart.Enabled) {
             $outcome.Outcome = 'Disabled'
@@ -4237,6 +4240,10 @@ function Get-ManagedServiceHealthIssues {
         # Get-Service і Refresh(): стану вже немає, тож причина явна.
         $serviceIssueReason = if ($serviceCondition.Condition -eq 'NotInstalled') {
             "не знайдена (службу видалено під час перевірки)"
+        } elseif ($serviceCondition.Condition -eq 'Unknown') {
+            # Рев'ю PR #432 (B-P3-2): тип запуску не визначено — автоматичне
+            # відновлення таку службу не запускає.
+            "не запущена (стан: $($serviceCondition.Status)); тип запуску не визначено — автоматичне відновлення її не запускає"
         } else {
             "не запущена (стан: $($serviceCondition.Status))"
         }
@@ -4267,15 +4274,19 @@ function Get-ManagedServiceHealthIssues {
             $recoveryLogHint = Join-Path ([string]$logPathVariable.Value) $recoveryLogHint
         }
         $failedNamesText = @($failedServiceIssues | ForEach-Object { [string]$_.Location }) -join ', '
-        $recoveryActionTemplate = $null
+        # Дія алерту = «служба <ім'я> не працює» + суфікс. Конкатенація, а не
+        # -f: текст помилки й шлях журналу можуть містити фігурні дужки (рев'ю
+        # PR #432, A-P3-1). Запуск задачі ще не означає відновлення: профіль
+        # може відкласти його (пауза, lock, старт ОС) — дія нейтральна (B-P3-7).
+        $recoveryActionSuffix = $null
         switch ([string]$recoveryTask.Outcome) {
             'Started' {
                 Write-HealthLog "Служби не працюють ($failedNamesText) — запущено задачу автоматичного відновлення $($recoveryTask.TaskName)" -Level "INFO"
-                $recoveryActionTemplate = "служба {0} не працює; запущено автоматичне відновлення, перевірте журнал $recoveryLogHint"
+                $recoveryActionSuffix = " не працює; запущено задачу відновлення $($recoveryTask.TaskName) — результат дивіться в журналі $recoveryLogHint"
             }
             'AlreadyRunning' {
                 Write-HealthLog "Служби не працюють ($failedNamesText) — задача автоматичного відновлення $($recoveryTask.TaskName) вже виконується" -Level "INFO"
-                $recoveryActionTemplate = "служба {0} не працює; автоматичне відновлення вже виконується, перевірте журнал $recoveryLogHint"
+                $recoveryActionSuffix = " не працює; задача відновлення $($recoveryTask.TaskName) вже виконується — результат дивіться в журналі $recoveryLogHint"
             }
             { $_ -in @('Missing', 'Disabled') } {
                 $recoveryTaskState = if ([string]$recoveryTask.Outcome -eq 'Missing') { 'не знайдена' } else { 'вимкнена' }
@@ -4298,13 +4309,13 @@ function Get-ManagedServiceHealthIssues {
             }
             default {
                 Write-HealthLog "Не вдалося запустити задачу автоматичного відновлення $($recoveryTask.TaskName): $($recoveryTask.Error)" -Level "WARNING"
-                $recoveryActionTemplate = "служба {0} не працює; задачу автоматичного відновлення $($recoveryTask.TaskName) не вдалося запустити ($($recoveryTask.Error)) — запустіть BRAVO_MAINTENANCE.ps1 -RecoverServices вручну"
+                $recoveryActionSuffix = " не працює; задачу автоматичного відновлення $($recoveryTask.TaskName) не вдалося запустити ($($recoveryTask.Error)) — запустіть BRAVO_MAINTENANCE.ps1 -RecoverServices вручну"
             }
         }
-        if ($null -ne $recoveryActionTemplate) {
+        if ($null -ne $recoveryActionSuffix) {
             foreach ($failedServiceIssue in $failedServiceIssues) {
                 Add-Member -InputObject $failedServiceIssue -MemberType NoteProperty -Name 'ActionText' `
-                    -Value ($recoveryActionTemplate -f [string]$failedServiceIssue.Location) -Force
+                    -Value ('служба ' + [string]$failedServiceIssue.Location + $recoveryActionSuffix) -Force
             }
         }
     }

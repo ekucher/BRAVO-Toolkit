@@ -223,6 +223,14 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
                 '$missedDailyWork = $true',
                 '$missedRestoreDue = $false'
             )
+            # Рев'ю PR #432 (B-P3-5): -RunMissedRestoreOnly із пропущеною роботою,
+            # а всі служби зупинені — служби лишаються зупиненими («без змін»).
+            'SRRunMissedRestoreOnlyServicesStopped' = @(
+                '$RunMissedRestoreOnly = $true',
+                '$missedDailyWork = $true',
+                '$missedRestoreDue = $false',
+                '$script:ProbeServices = @{ ''BRAVO'' = ''Stopped''; ''exchangAPI'' = ''Stopped''; ''BravoWeb'' = ''Stopped'' }'
+            )
             # -ForceRestore при Disabled BRAVO (#321): службу BRAVO не чіпають,
             # але Bis завершується; exchangAPI і BRAVO Web проходять цикл.
             'SRForceRestoreDisabledBravo' = @($serviceRecoveryForceRestoreSeed + @(
@@ -534,6 +542,18 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
             'LOG-WARNING Пропущені Backup/Maintenance не виконані: уже працюють служби BRAVO, exchangAPI, BravoWeb. Recovery не зупиняє служби. Реставрація слоту вже виконана раніше — її стан не змінюється.'
             'LOCK-EXIT'; 'OWNLOG-UPLOAD'; 'MANUAL-EXIT NoPause=True'
         ) 'ServiceRecovery/CycleRunMissedRestoreOnlyNeverStopsRunningServices' '-RunMissedRestoreOnly при працюючих службах завершується кодом 20 без зупинки й запуску служб'
+
+        # (7a) Рев'ю PR #432 (B-P3-5): -RunMissedRestoreOnly, усі служби
+        # зупинені — FR-2 не діє, служби не запускаються.
+        & $serviceRecoveryCheck 'SRRunMissedRestoreOnlyServicesStopped' 0 @(
+            $srAlreadyStopped
+            'STEP 3/8 Зупинка служб SKIPPED'
+            $srRestoreSkipped
+            $srTraceLogs; $srExchangeLogs; $srWebLogs
+            'STEP 6/8 Обробка trace і логів OK'
+            $srStartHeader
+            'STEP 7/8 Відновлення стану служб OK'
+        ) 'ServiceRecovery/CycleRunMissedRestoreOnlyLeavesStoppedServices' "Рев'ю PR #432 (B-P3-5): -RunMissedRestoreOnly не запускає зупинених до прогону служб (ТЗ: «без змін»); впалі піднімає задача BRAVO_SERVICE_RECOVERY"
 
         # (8) -ForceRestore при Disabled BRAVO (#321): BRAVO не зупиняють і не
         # запускають, Bis завершується, trace не обробляється; exchangAPI і
@@ -2067,7 +2087,9 @@ function Get-BRAVOManagedServiceCondition {
 # #314 хвиля 5 (FR-7, ТЗ §6 п. 9): Health для впалої служби (Failed) НЕ
 # запускає службу сам, а просить Планувальник запустити задачу
 # BRAVO_SERVICE_RECOVERY (Start-BRAVOScheduledTask, BRAVO.Compatibility).
-# Issue лишається, ActionText — «запущено автоматичне відновлення». Задачі
+# Issue лишається, ActionText — «запущено задачу відновлення … результат
+# дивіться в журналі» (рев'ю PR #432, B-P3-7: свідомо нейтральний — профіль
+# може відкласти відновлення). Задачі
 # немає або вона вимкнена — окремий issue «виконайте BRAVO_TASKS_INSTALL».
 # Disabled — без issue і без запуску задачі. Стаби: Get-Service, WMI, маркер,
 # Start-Service (фіксує заборонений виклик) і Start-BRAVOScheduledTask.
@@ -2087,6 +2109,7 @@ function Get-Service {
 function Start-Service { param($Name, $ErrorAction) [void]$script:healthRecoveryEvents.Add(('START-SERVICE {0}' -f $Name)) }
 function Read-BRAVOServiceQuiescenceState { return $null }
 function Get-BRAVOWmiInstance { param($ClassName) return @($script:healthRecoveryWmi) }
+function Get-BRAVOServiceRegistryStartMode { param($ServiceName) return $null }
 function Start-BRAVOScheduledTask {
     param($TaskPath, $TaskName)
     [void]$script:healthRecoveryEvents.Add(('RUN-TASK {0}{1}' -f $TaskPath, $TaskName))
@@ -2100,7 +2123,7 @@ function Start-BRAVOScheduledTask {
         $healthRecoveryModule = New-BRAVOSelfTestRuntimeModule `
             -SourceText ($healthRecoveryStubs + "`n" + $healthTextForRecovery + "`n" + $systemTextForRecovery) `
             -FunctionNames @('Write-HealthLog', 'Get-Service', 'Start-Service', 'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOWmiInstance',
-                'Start-BRAVOScheduledTask', 'Test-BRAVOSettingEnabled', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode',
+                'Get-BRAVOServiceRegistryStartMode', 'Start-BRAVOScheduledTask', 'Test-BRAVOSettingEnabled', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode',
                 'Get-BRAVOManagedServiceCondition', 'Invoke-BRAVOHealthServiceRecoveryTask', 'Get-ManagedServiceHealthIssues')
     } catch {
         $healthRecoveryError = $_.Exception.Message
@@ -2169,20 +2192,20 @@ function Start-BRAVOScheduledTask {
             $null -eq $healthFailed.Thrown -and
             @($healthFailed.Issues).Count -eq 1 -and $healthFailedIssue.Count -eq 1 -and
             $healthFailedIssue[0].ActionText.Contains('служба exchangAPI не працює') -and
-            $healthFailedIssue[0].ActionText.Contains('запущено автоматичне відновлення') -and
+            $healthFailedIssue[0].ActionText.Contains('запущено задачу відновлення BRAVO_SERVICE_RECOVERY — результат дивіться в журналі') -and
             $healthFailedIssue[0].ActionText.Contains('_RECOVER_') -and
             @($healthFailed.Events | Where-Object { $_ -eq 'RUN-TASK \BRAVO\BRAVO_SERVICE_RECOVERY' }).Count -eq 1 -and
             @($healthFailed.Events | Where-Object { $_ -like 'START-SERVICE*' }).Count -eq 0
         ) `
         -Name 'ServiceRecovery/HealthFailedServiceStartsRecoveryTaskNotService' `
-        -Failure "#314 FR-7: Health для Failed-служби запускає задачу BRAVO_SERVICE_RECOVERY (а не службу), issue лишається з ActionText «служба X не працює; запущено автоматичне відновлення, перевірте журнал …_RECOVER_….log». Отримано: $(& $describeHealthRecovery $healthFailed)"
+        -Failure "#314 FR-7: Health для Failed-служби запускає задачу BRAVO_SERVICE_RECOVERY (а не службу), issue лишається з ActionText «служба X не працює; запущено задачу відновлення BRAVO_SERVICE_RECOVERY — результат дивіться в журналі …_RECOVER_….log». Отримано: $(& $describeHealthRecovery $healthFailed)"
 
     # Дві впалі служби — одна задача на прогін Health.
     $healthTwoFailed = & $runHealthRecovery @() $wmiAuto $taskReady
     Test-BRAVOCondition `
         -Condition (
             $null -eq $healthTwoFailed.Thrown -and @($healthTwoFailed.Issues).Count -eq 2 -and
-            @($healthTwoFailed.Issues | Where-Object { $_.ActionText.Contains('запущено автоматичне відновлення') }).Count -eq 2 -and
+            @($healthTwoFailed.Issues | Where-Object { $_.ActionText.Contains('запущено задачу відновлення') }).Count -eq 2 -and
             @($healthTwoFailed.Events | Where-Object { $_ -like 'RUN-TASK *' }).Count -eq 1 -and
             @($healthTwoFailed.Events | Where-Object { $_ -like 'START-SERVICE*' }).Count -eq 0
         ) `
@@ -2200,7 +2223,7 @@ function Start-BRAVOScheduledTask {
             $null -eq $Result.Thrown -and @($Result.Issues).Count -eq 2 -and
             $taskIssues.Count -eq 1 -and $taskIssues[0].ActionText.Contains('задача відновлення служб відсутня — виконайте BRAVO_TASKS_INSTALL') -and
             [string]$Result.Issues[0].Location -eq 'BRAVO_SERVICE_RECOVERY' -and
-            $serviceIssues.Count -eq 1 -and -not $serviceIssues[0].ActionText.Contains('запущено автоматичне відновлення') -and
+            $serviceIssues.Count -eq 1 -and -not $serviceIssues[0].ActionText.Contains('запущено задачу відновлення') -and
             @($Result.Events | Where-Object { $_ -like 'START-SERVICE*' }).Count -eq 0
         )
     }
@@ -2242,6 +2265,36 @@ function Start-BRAVOScheduledTask {
         ) `
         -Name 'ServiceRecovery/HealthRecoveryTaskFailureAndRunningHandled' `
         -Failure "#314 FR-7: збій запуску задачі — issue з ActionText «не вдалося запустити», без винятку і без Start-Service; задача вже виконується — ActionText про відновлення, що триває; Maintenance вимкнено (задачі не передбачено) — issue як раніше, без запуску задачі. Отримано: збій=[$(& $describeHealthRecovery $healthTaskThrows)]; виконується=[$(& $describeHealthRecovery $healthTaskRunning)]; не налаштовано=[$(& $describeHealthRecovery $healthNotConfigured)]"
+
+    # Рев'ю PR #432 (A-P3-1): текст помилки з фігурними дужками не ламає
+    # побудову дії алерту (раніше — -f і FormatException на весь Health).
+    # A-P3-2: стан задачі не прочитано (помилка COM) — не «задачі немає»:
+    # без issue «виконайте BRAVO_TASKS_INSTALL», дія — «не вдалося запустити».
+    $healthBracesError = & $runHealthRecovery @('BRAVO') $wmiAuto $taskReady 'відмовлено {0} {доступ}'
+    $healthTaskUnreadable = & $runHealthRecovery @('BRAVO') $wmiAuto ([pscustomobject]@{ Exists = $false; Enabled = $false; AlreadyRunning = $false; Started = $false; Error = 'стан задачі не прочитано: self-test COM' })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $healthBracesError.Thrown -and @($healthBracesError.Issues).Count -eq 1 -and
+            $healthBracesError.Issues[0].ActionText.Contains('служба exchangAPI не працює; задачу автоматичного відновлення BRAVO_SERVICE_RECOVERY не вдалося запустити (відмовлено {0} {доступ})') -and
+            $null -eq $healthTaskUnreadable.Thrown -and @($healthTaskUnreadable.Issues).Count -eq 1 -and
+            [string]$healthTaskUnreadable.Issues[0].Location -eq 'exchangAPI' -and
+            $healthTaskUnreadable.Issues[0].ActionText.Contains('не вдалося запустити (стан задачі не прочитано: self-test COM)')
+        ) `
+        -Name 'ServiceRecovery/HealthRecoveryActionTextSafeAndUnreadableTaskNotMissing' `
+        -Failure "Рев'ю PR #432 (A-P3-1/A-P3-2): дія алерту будується без -f (фігурні дужки в тексті помилки не кидають FormatException), а нечитабельний стан задачі — збій запуску, не «задачу відсутня». Отримано: дужки=[$(& $describeHealthRecovery $healthBracesError)]; нечитабельна=[$(& $describeHealthRecovery $healthTaskUnreadable)]"
+
+    # Рев'ю PR #432 (B-P3-2): тип запуску зупиненої служби не визначено (немає
+    # StartType, рядка WMI і значення реєстру) — issue з поясненням, але задача
+    # відновлення не запускається.
+    $healthUnknownMode = & $runHealthRecovery @('BRAVO') @([pscustomobject]@{ Name = 'BRAVO'; StartMode = 'Auto'; ExitCode = 0 }) $taskReady
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $healthUnknownMode.Thrown -and @($healthUnknownMode.Issues).Count -eq 1 -and
+            $healthUnknownMode.Issues[0].Reason.Contains('тип запуску не визначено — автоматичне відновлення її не запускає') -and
+            @($healthUnknownMode.Events | Where-Object { $_ -like 'RUN-TASK *' -or $_ -like 'START-SERVICE*' }).Count -eq 0
+        ) `
+        -Name 'ServiceRecovery/HealthUnknownStartModeNotRecovered' `
+        -Failure "Рев'ю PR #432 (B-P3-2): зупинена служба з невідомим типом запуску — issue з причиною, без запуску задачі відновлення. Отримано: $(& $describeHealthRecovery $healthUnknownMode)"
 
     # Start-BRAVOScheduledTask (BRAVO.Compatibility): запуск через ScheduledTasks
     # (Start-ScheduledTask) або COM RegisteredTask.Run($null) — Windows 7 без
@@ -2304,6 +2357,63 @@ function Start-ScheduledTask { param($InputObject, $ErrorAction) [void]$script:s
         ) `
         -Name 'ServiceRecovery/StartScheduledTaskViaComOrScheduledTasks' `
         -Failure "#314 FR-7: Start-BRAVOScheduledTask запускає задачу через COM RegisteredTask.Run (Windows 7) або Start-ScheduledTask, а відсутню, вимкнену чи вже запущену задачу не запускає. Отримано: $(@($startTaskCases.Keys | Sort-Object | ForEach-Object { '{0} => started={1}; events={2}' -f $_, $(if ($null -ne $startTaskCases[$_].Outcome) { $startTaskCases[$_].Outcome.Started } else { '?' }), (@($startTaskCases[$_].Events) -join ',') }) -join ' | ') $startTaskError"
+
+    # Рев'ю PR #432 (A-P3-2): Get-BRAVOScheduledTaskState через COM — «задачі
+    # немає» лише для HRESULT 0x80070002/0x80070003; інша помилка COM —
+    # State 'Unavailable' з Error, а Start-BRAVOScheduledTask передає її в Error.
+    $taskStateStubs = @'
+function Test-BRAVOCommandAvailable { param($Name) return $false }
+function New-Object {
+    param([Parameter(Position = 0)][string]$TypeName, [Parameter(Position = 1)][object[]]$ArgumentList, [string]$ComObject, [System.Collections.IDictionary]$Property)
+    if (-not $ComObject) { return (Microsoft.PowerShell.Utility\New-Object @PSBoundParameters) }
+    $fakeService = [pscustomobject]@{ HResult = $script:taskStateHResult }
+    Add-Member -InputObject $fakeService -MemberType ScriptMethod -Name Connect -Value { }
+    Add-Member -InputObject $fakeService -MemberType ScriptMethod -Name GetFolder -Value {
+        param($Path)
+        throw (Microsoft.PowerShell.Utility\New-Object System.Runtime.InteropServices.COMException('self-test COM', [int]$this.HResult))
+    }
+    return $fakeService
+}
+'@
+    $taskStateModule = $null
+    $taskStateError = ''
+    $taskStateCases = @{}
+    try {
+        $taskStateModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($taskStateStubs + "`n" + $compatibilityTextForRecovery) `
+            -FunctionNames @('Test-BRAVOCommandAvailable', 'New-Object', 'Get-BRAVOScheduledTaskState', 'Start-BRAVOScheduledTask')
+        foreach ($taskStateCase in @(@('NotFound', -2147024894), @('NoFolder', -2147024893), @('AccessDenied', -2147024891))) {
+            $taskStateCases[$taskStateCase[0]] = & $taskStateModule {
+                param([int]$HResult)
+                Set-StrictMode -Version 2.0
+                $script:taskStateHResult = $HResult
+                [pscustomobject]@{
+                    State = Get-BRAVOScheduledTaskState -TaskPath '\BRAVO\' -TaskName 'BRAVO_SERVICE_RECOVERY'
+                    Start = Start-BRAVOScheduledTask -TaskPath '\BRAVO\' -TaskName 'BRAVO_SERVICE_RECOVERY'
+                }
+            } $taskStateCase[1]
+        }
+    } catch {
+        $taskStateError = $_.Exception.Message
+    }
+    # Error читається через PSObject.Properties: до виправлення його не було.
+    $taskStateErrorText = { param($Object) if ($null -ne $Object -and $null -ne $Object.PSObject.Properties['Error']) { [string]$Object.Error } else { '' } }
+    $taskStateMissingOk = {
+        param($Case)
+        $null -ne $Case -and -not [bool]$Case.State.Exists -and [string]$Case.State.State -eq 'NotFound' -and
+            [string]::IsNullOrEmpty((& $taskStateErrorText $Case.State)) -and -not [bool]$Case.Start.Exists -and [string]::IsNullOrEmpty([string]$Case.Start.Error)
+    }
+    $taskStateDenied = $taskStateCases['AccessDenied']
+    Test-BRAVOCondition `
+        -Condition (
+            [string]::IsNullOrEmpty($taskStateError) -and
+            (& $taskStateMissingOk $taskStateCases['NotFound']) -and (& $taskStateMissingOk $taskStateCases['NoFolder']) -and
+            $null -ne $taskStateDenied -and -not [bool]$taskStateDenied.State.Exists -and [string]$taskStateDenied.State.State -eq 'Unavailable' -and
+            (& $taskStateErrorText $taskStateDenied.State).Contains('self-test COM') -and
+            ([string]$taskStateDenied.Start.Error).StartsWith('стан задачі не прочитано: ') -and -not [bool]$taskStateDenied.Start.Started
+        ) `
+        -Name 'ServiceRecovery/ScheduledTaskComErrorIsNotMissingTask' `
+        -Failure "Рев'ю PR #432 (A-P3-2): COM 0x80070002/0x80070003 — задачі немає (NotFound, без Error); інша помилка COM (0x80070005) — State 'Unavailable' з Error, і Start-BRAVOScheduledTask повертає її в Error. Помилка: '$taskStateError'; результат: $(@($taskStateCases.Keys | Sort-Object | ForEach-Object { '{0} => state={1}; error={2}; startError={3}' -f $_, $taskStateCases[$_].State.State, (& $taskStateErrorText $taskStateCases[$_].State), (& $taskStateErrorText $taskStateCases[$_].Start) }) -join ' | ')"
 
     # Статично: Health не викликає Start-Service поза watchdog-ом осиротілого
     # маркера; запуск задачі — лише з Get-ManagedServiceHealthIssues.

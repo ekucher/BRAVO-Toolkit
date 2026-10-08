@@ -1079,12 +1079,21 @@ function Get-BRAVOScheduledTaskState {
             Task = $task
         }
     } catch {
+        # Рев'ю PR #432 (A-P3-2): «задачі немає» — лише HRESULT 0x80070002
+        # (задачу не знайдено) чи 0x80070003 (немає теки задач). Інша помилка
+        # COM (доступ, недоступна служба Планувальника) — State 'Unavailable'
+        # з текстом у Error: викликач не має приймати її за відсутню задачу.
+        $comNotFound = $false
+        for ($comException = $_.Exception; $null -ne $comException; $comException = $comException.InnerException) {
+            if (@(-2147024894, -2147024893) -contains [int]$comException.HResult) { $comNotFound = $true; break }
+        }
         return New-Object PSObject -Property @{
             Exists = $false
-            State = "NotFound"
+            State = $(if ($comNotFound) { "NotFound" } else { "Unavailable" })
             IsRunning = $false
             Provider = "COM"
             Task = $null
+            Error = $(if ($comNotFound) { $null } else { $_.Exception.Message })
         }
     }
 }
@@ -1097,7 +1106,9 @@ function Start-BRAVOScheduledTask {
     # (Task Scheduler 2.0, Windows 7 / Server 2008 R2 без модуля ScheduledTasks).
     # Відсутню, вимкнену чи вже запущену задачу не запускає (MultipleInstances
     # задачі вирішив би те саме, але викликач має знати причину). Не кидає:
-    # збій запуску — у Error. Повертає { Exists; Enabled; AlreadyRunning; Started; Error }.
+    # збій запуску — у Error. Exists = $false з непорожнім Error — стан задачі
+    # не прочитано (помилка COM), а не «задачі немає».
+    # Повертає { Exists; Enabled; AlreadyRunning; Started; Error }.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$TaskPath,
@@ -1117,7 +1128,14 @@ function Start-BRAVOScheduledTask {
         $result.Error = $_.Exception.Message
         return $result
     }
-    if (-not [bool]$taskState.Exists) { return $result }
+    if (-not [bool]$taskState.Exists) {
+        # Стан не прочитано (не «задачі немає», A-P3-2) — причина в Error.
+        $stateErrorProperty = $taskState.PSObject.Properties['Error']
+        if ($null -ne $stateErrorProperty -and -not [string]::IsNullOrWhiteSpace([string]$stateErrorProperty.Value)) {
+            $result.Error = 'стан задачі не прочитано: ' + [string]$stateErrorProperty.Value
+        }
+        return $result
+    }
     $result.Exists = $true
     $result.Enabled = ([string]$taskState.State -ne 'Disabled')
     if (-not $result.Enabled) { return $result }

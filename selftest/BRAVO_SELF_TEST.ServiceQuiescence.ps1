@@ -898,11 +898,21 @@ function Get-BRAVOWmiInstance {
     return [pscustomobject]@{ Name = 'BravoQueried'; StartMode = 'Manual'; ExitCode = 1067; ServiceSpecificExitCode = 0 }
 }
 function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
+function Get-BRAVOServiceRegistryStartMode {
+    param($ServiceName)
+    switch ([string]$ServiceName) {
+        'BravoRegistryDelayed' { return 'AutomaticDelayed' }
+        'BravoRegistryDisabled' { return 'Disabled' }
+        'BravoRegistryOther' { return 'Other' }
+        'BravoRegistryThrows' { throw 'self-test: реєстр недоступний' }
+    }
+    return $null
+}
 '@
     $conditionModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($conditionStubs + "`n" + $systemModuleTextForQuiescence) `
         -FunctionNames @('Get-Service', 'Get-BRAVOWmiInstance', 'Read-BRAVOServiceQuiescenceState',
-            'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition')
+            'Get-BRAVOServiceRegistryStartMode', 'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition')
     $conditionMarker = [pscustomobject]@{
         owner = 'BRAVO_MAINTENANCE'
         services = @(
@@ -922,7 +932,16 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
         @{ Case = 'AutoContinuePending'; StartType = 'Automatic'; Status = 'ContinuePending'; Marker = $false; Expected = 'Pending' },
         @{ Case = 'AutoPausePending'; StartType = 'Automatic'; Status = 'PausePending'; Marker = $false; Expected = 'Pending' },
         @{ Case = 'AutoPaused'; StartType = 'Automatic'; Status = 'Paused'; Marker = $false; Expected = 'Failed' },
-        @{ Case = 'UnknownStartModeStopped'; StartType = 'Boot'; Status = 'Stopped'; Marker = $false; Expected = 'Failed' },
+        # Рев'ю PR #432 (B-P3-2) свідомо змінило очікування: невідомий тип
+        # запуску зупиненої служби (немає й значення реєстру) — Unknown, а не
+        # Failed (fail-closed); реєстр SCM — останнє джерело типу.
+        @{ Case = 'UnknownStartModeStopped'; StartType = 'Boot'; Status = 'Stopped'; Marker = $false; Expected = 'Unknown' },
+        @{ Case = 'UnknownStartModeRunning'; StartType = 'Boot'; Status = 'Running'; Marker = $false; Expected = 'Running' },
+        @{ Case = 'UnknownStartModeInMarker'; Name = 'BRAVO'; StartType = 'Boot'; Status = 'Stopped'; Marker = $true; Expected = 'OwnedByBravo' },
+        @{ Case = 'RegistryDelayedStopped'; Name = 'BravoRegistryDelayed'; StartType = 'Boot'; Status = 'Stopped'; Marker = $false; Expected = 'Failed' },
+        @{ Case = 'RegistryDisabledStopped'; Name = 'BravoRegistryDisabled'; StartType = 'Boot'; Status = 'Stopped'; Marker = $false; Expected = 'Disabled' },
+        @{ Case = 'RegistryOtherStopped'; Name = 'BravoRegistryOther'; StartType = 'Boot'; Status = 'Stopped'; Marker = $false; Expected = 'Unknown' },
+        @{ Case = 'RegistryThrowsStopped'; Name = 'BravoRegistryThrows'; StartType = 'Boot'; Status = 'Stopped'; Marker = $false; Expected = 'Unknown' },
         @{ Case = 'DisabledStopped'; StartType = 'Disabled'; Status = 'Stopped'; Marker = $false; Expected = 'Disabled' },
         @{ Case = 'DisabledRunning'; StartType = 'Disabled'; Status = 'Running'; Marker = $false; Expected = 'Disabled' },
         @{ Case = 'AutoStoppedInMarker'; Name = 'bravo'; StartType = 'Automatic'; Status = 'Stopped'; Marker = $true; Expected = 'OwnedByBravo' },
@@ -1022,12 +1041,12 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
             $conditionDetail.QueriedExitCode -eq 1067 -and
             $conditionDetail.QueriedFilter -eq "Name = 'BravoQueried'" -and
             $conditionDetail.WmiFiltersAfterQuery -eq 1 -and $conditionDetail.WmiFiltersTotal -eq 1 -and
-            $conditionDetail.NoWmiCondition -eq 'Failed' -and $conditionDetail.NoWmiStartMode -eq 'Unknown' -and
+            $conditionDetail.NoWmiCondition -eq 'Unknown' -and $conditionDetail.NoWmiStartMode -eq 'Unknown' -and
             $null -eq $conditionDetail.NoWmiExitCode -and
             $conditionDetail.FallbackCondition -eq 'Disabled'
         ) `
         -Name "ServiceRecovery/ConditionSourcesAndExitCode" `
-        -Failure "Get-BRAVOManagedServiceCondition: відсутня служба -> NotInstalled; без StartType тип береться з одного WMI-запиту за іменем (разом з ExitCode), маркер читається сам; -NoWmiQuery не робить запиту (тип Unknown -> Failed). Виняток: '$conditionDetailThrown'; отримано: $(if ($null -ne $conditionDetail) { ($conditionDetail | Out-String).Trim() })"
+        -Failure "Get-BRAVOManagedServiceCondition: відсутня служба -> NotInstalled; без StartType тип береться з одного WMI-запиту за іменем (разом з ExitCode), маркер читається сам; -NoWmiQuery не робить запиту (тип Unknown без значення реєстру -> Unknown, рев'ю PR #432 B-P3-2). Виняток: '$conditionDetailThrown'; отримано: $(if ($null -ne $conditionDetail) { ($conditionDetail | Out-String).Trim() })"
 
     # Функція лише читає: у тілі немає жодної команди, що змінює службу,
     # тип запуску, маркер чи файли.
@@ -1044,7 +1063,9 @@ function Read-BRAVOServiceQuiescenceState { return $script:conditionMarker }
                 }, $true) | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)
     }
     $conditionAllowedCommands = @('Get-Service', 'Get-Command', 'Get-BRAVOWmiInstance', 'Select-Object', 'Where-Object',
-        'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Read-BRAVOServiceQuiescenceState')
+        'Get-BRAVOServiceWin32Info', 'Get-BRAVOServiceStartMode', 'Read-BRAVOServiceQuiescenceState',
+        # Рев'ю PR #432 (B-P3-2): реєстр SCM — останнє джерело типу запуску (лише читає).
+        'Get-BRAVOServiceRegistryStartMode')
     $conditionUnexpectedCommands = @($conditionCommandNames | Where-Object { $conditionAllowedCommands -notcontains $_ })
     Test-BRAVOCondition `
         -Condition ($null -ne $conditionFunctionAst -and $conditionCommandNames.Count -gt 0 -and $conditionUnexpectedCommands.Count -eq 0) `

@@ -791,7 +791,11 @@ function Get-BRAVOManagedServiceCondition {
     #   Running      - працює;
     #   Pending      - StartPending/StopPending/ContinuePending/PausePending;
     #   Failed       - не працює, не Disabled і не під маркером. Automatic чи
-    #                  Manual на рішення не впливає (рішення власника #314).
+    #                  Manual на рішення не впливає (рішення власника #314);
+    #   Unknown      - не працює, а тип запуску не визначено ні з StartType,
+    #                  ні з WMI, ні з реєстру SCM. Такої служби BRAVO не
+    #                  запускає: вона могла бути вимкнена (fail-closed, рев'ю
+    #                  PR #432, B-P3-2).
     # Маркер мертвого власника теж дає OwnedByBravo: його відпрацьовує
     # Health-watchdog, а не загальна логіка «впалої» служби.
     #
@@ -868,6 +872,23 @@ function Get-BRAVOManagedServiceCondition {
     $startModeResult = Get-BRAVOServiceStartMode -Service $Service -FallbackStartMode $fallbackStartMode -NoWmiQuery
     $result.StartMode = [string]$startModeResult.StartMode
     $result.StartModeSource = [string]$startModeResult.Source
+    # Рев'ю PR #432 (B-P3-2): ні StartType, ні WMI не дали тип запуску —
+    # останнє джерело реєстр SCM (Get-BRAVOServiceRegistryStartMode).
+    if ($result.StartMode -eq 'Unknown') {
+        $registryStartMode = $null
+        try { $registryStartMode = Get-BRAVOServiceRegistryStartMode -ServiceName $result.Name } catch { $registryStartMode = $null }
+        $registryMappedMode = $null
+        switch ([string]$registryStartMode) {
+            'Automatic' { $registryMappedMode = 'Automatic' }
+            'AutomaticDelayed' { $registryMappedMode = 'Automatic' }
+            'Manual' { $registryMappedMode = 'Manual' }
+            'Disabled' { $registryMappedMode = 'Disabled' }
+        }
+        if ($null -ne $registryMappedMode) {
+            $result.StartMode = $registryMappedMode
+            $result.StartModeSource = 'Registry'
+        }
+    }
 
     if (-not $PSBoundParameters.ContainsKey('QuiescenceState')) {
         try { $QuiescenceState = Read-BRAVOServiceQuiescenceState } catch { $QuiescenceState = $null }
@@ -909,6 +930,8 @@ function Get-BRAVOManagedServiceCondition {
         $result.Condition = 'Pending'
     } elseif ($markedForRestart) {
         $result.Condition = 'OwnedByBravo'
+    } elseif ($result.StartMode -eq 'Unknown') {
+        $result.Condition = 'Unknown'
     } else {
         $result.Condition = 'Failed'
     }

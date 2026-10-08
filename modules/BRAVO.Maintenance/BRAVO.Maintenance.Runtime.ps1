@@ -9127,9 +9127,9 @@ $maintenanceServiceSet = New-BRAVOMaintenanceServiceSet `
     -BravoName $BravoServiceName -BravoManaged $BravoMaintenanceEnabled -BravoDisabled $BravoServiceDisabledBySystem `
     -ExchangeApiName $ExchangAPIServiceName -ExchangeApiManaged $exchangAPIServiceEnabled -ExchangeApiDisabled $exchangAPIServiceDisabled `
     -BravoWebName $BravoWebServiceName -BravoWebManaged $BravoWebMaintenanceEnabled
-# #314 FR-2: впала (Failed) служба теж «мала працювати» — намір перезапуску,
-# маркер, журнали і запуск у finally (після перевірки Recovery вище).
-$failedServicesAtStart = @(Add-BRAVOMaintenanceFailedServiceRestartIntent -ServiceSet $maintenanceServiceSet -RestartIntent $serviceWasRunning)
+# #314 FR-2: впала (Failed) служба теж «мала працювати» — намір перезапуску, маркер, журнали, запуск у finally.
+# Крім -RunMissedRestoreOnly («без змін»): впалі піднімає BRAVO_SERVICE_RECOVERY (рев'ю PR #432, B-P3-5).
+$failedServicesAtStart = @(if (-not $RunMissedRestoreOnly) { Add-BRAVOMaintenanceFailedServiceRestartIntent -ServiceSet $maintenanceServiceSet -RestartIntent $serviceWasRunning })
 
 # #349: намір перезапуску служб, які зупинив аварійно перерваний прогін
 # (маркер мертвого власника без restartSuppressed), успадковується: власний
