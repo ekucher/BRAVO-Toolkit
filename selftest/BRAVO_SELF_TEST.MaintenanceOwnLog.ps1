@@ -1736,6 +1736,9 @@ $targetsGuardFindHits = {
     $unwrapExpression = {
         param($node)
         while ($null -ne $node) {
+            # Ланцюжок присвоєнь ($t = $u = X, $t = ($u = X)): значення —
+            # права частина вкладеного присвоєння.
+            if ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) { $node = $node.Right; continue }
             if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) { $node = $node.Child; continue }
             if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) { $node = $node.Pipeline; continue }
             if ($node -is [System.Management.Automation.Language.PipelineAst]) {
