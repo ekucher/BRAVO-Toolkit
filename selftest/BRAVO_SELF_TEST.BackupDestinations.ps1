@@ -328,7 +328,9 @@ try {
     function Invoke-BRAVOSelfTestInstallStep4 {
         param([string[]]$Arguments)
         Remove-Item -LiteralPath $bdOutputLogPath -Force -ErrorAction SilentlyContinue
-        $streamOutput = @(& $bdHostPath -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $bdChildPath `
+        # Без -ExecutionPolicy: дочірній процес успадковує політику процесу self-test
+        # (PSExecutionPolicyPreference), а Bypass поза allowlist заборонено гейтом CI.
+        $streamOutput = @(& $bdHostPath -NoProfile -NonInteractive -File $bdChildPath `
             -RuntimeRoot $bdInstallRoot -OutputLog $bdOutputLogPath @Arguments 2>&1 | ForEach-Object { [string]$_ })
         $exitCode = $LASTEXITCODE
         $logText = $(if (Test-Path -LiteralPath $bdOutputLogPath -PathType Leaf) { [IO.File]::ReadAllText($bdOutputLogPath, [Text.Encoding]::UTF8) } else { '' })
