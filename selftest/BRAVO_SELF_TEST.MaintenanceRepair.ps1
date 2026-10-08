@@ -95,7 +95,9 @@ function Invoke-BRAVOCompareFileSizesScenario {
         # FullName від Get-ChildItem. Перемикач передає Compare-FileSizes
         # той самий каталог, але з повністю зміненим регістром рядка шляху —
         # Windows-резолюція шляху ідентична, відрізняється лише рядок.
-        [switch]$InvertModelPathCase
+        [switch]$InvertModelPathCase,
+        # Поріг «малого» файлу; $null — не передавати (дефолт функції 1 МБ).
+        $SmallFileThresholdBytes = $null
     )
     $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
         ("BRAVO_COMPAREFILESIZES_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -124,10 +126,14 @@ function Invoke-BRAVOCompareFileSizesScenario {
         $beforeRows | Export-Csv -Path $beforeCsvPath -NoTypeInformation -Encoding UTF8
 
         return & $compareFileSizesModule {
-            param($BeforeFile, $ModelPath, $MainModelRelativePath)
+            param($BeforeFile, $ModelPath, $MainModelRelativePath, $SmallFileThresholdBytes)
             Set-StrictMode -Version Latest
-            Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath $MainModelRelativePath
-        } $beforeCsvPath $effectiveModelPath $MainModelRelativePath
+            $compareExtraParameters = @{}
+            if ($null -ne $SmallFileThresholdBytes) {
+                $compareExtraParameters['SmallFileThresholdBytes'] = [long]$SmallFileThresholdBytes
+            }
+            Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath $MainModelRelativePath @compareExtraParameters
+        } $beforeCsvPath $effectiveModelPath $MainModelRelativePath $SmallFileThresholdBytes
     } finally {
         if (Test-Path -LiteralPath $scenarioRoot) {
             Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -188,8 +194,10 @@ Test-BRAVOCondition `
     -Failure "відсутність основної моделі після repair має бути CRITICAL (MainModelValid=false), навіть якщо MainModelRelativePath переданий"
 
 # --- TestProject: основна модель <= 2048 байт після repair -> CRITICAL.
+# Основна модель тут 5 МБ — понад поріг «малого» файлу (1 МБ), тобто діє
+# повне правило (<= MinSizeBytes / >= 50%); реальні основні моделі — ГБ.
 $resultMainTiny = Invoke-BRAVOCompareFileSizesScenario `
-    -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -BeforeFiles @{ 'TestProject.md' = 5242880; 'ACT.000' = 100000 } `
     -AfterFiles  @{ 'TestProject.md' = 100; 'ACT.000' = 100000 } `
     -MainModelRelativePath 'TestProject.md'
 Test-BRAVOCondition `
@@ -574,8 +582,8 @@ Test-BRAVOCondition `
 # --- missing vs редукція: різні короткі формати (structured, без parsing) ---
 Clear-BRAVOCompareCaptured
 [void](Invoke-BRAVOCompareFileSizesScenario `
-    -BeforeFiles @{ 'TestProject.md' = 500000; 'GONE.md' = 2048000; 'DATABASE.md' = 1000000 } `
-    -AfterFiles  @{ 'TestProject.md' = 500000; 'DATABASE.md' = 200000 } `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'GONE.md' = 2048000; 'DATABASE.md' = 5000000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000; 'DATABASE.md' = 1000000 } `
     -MainModelRelativePath 'TestProject.md')
 $compactKindAlerts = @(Get-BRAVOCompareCaptured -Kind Alerts)
 Test-BRAVOCondition `
@@ -585,7 +593,7 @@ Test-BRAVOCondition `
         $compactKindAlerts[0] -match 'DATABASE\.md — .+ → .+ \(-80[,.]0%\)'
     ) `
     -Name "Maintenance/CompactAlertDistinguishesMissingVsReduction" `
-    -Failure "missing -> 'файл відсутній (було ...)'; редукція 1000000->200000 -> '<before> → <after> (-80,0%)'; факт: $(if (@($compactKindAlerts).Count) { $compactKindAlerts[0] } else { 'alert відсутній' })"
+    -Failure "missing -> 'файл відсутній (було ...)'; редукція 5000000->1000000 -> '<before> → <after> (-80,0%)'; факт: $(if (@($compactKindAlerts).Count) { $compactKindAlerts[0] } else { 'alert відсутній' })"
 
 # --- Unicode/вкладені шляхи/пробіли не ламають compact-формат ---
 Clear-BRAVOCompareCaptured
@@ -621,6 +629,169 @@ Test-BRAVOCondition `
     ) `
     -Name "Maintenance/MainModelHintDerivedFromMainModelFile" `
     -Failure "hint/writer/lookup мають деривувати відносний шлях канонічним Get-BRAVOModelRelativePath (регістронезалежно), без залишків ordinal Replace+TrimStart і без здогаду `"`$MODEL_NAME.md`""
+
+# ============================================================
+# Поріг «малого» файлу (SmallFileThresholdBytes, типово 1 МБ).
+# Реальний хибний rollback (exit 43): невеликий табличний файл після
+# легітимного ущільнення repair-ом зменшився 4,5 КБ -> 2,0 КБ (-55,6%).
+# Для файлів < порогу ДО реставрації критичними є лише зникнення та
+# обнулення; файли від порогу — незмінне правило (>= 50% / <= 2048 байт).
+# ============================================================
+# --- Малий файл 4608 -> 2046 байт (-55,6%, і <= 2048) -> НЕ критично,
+# але видимий в INFO-журналі; жодного alert.
+Clear-BRAVOCompareCaptured
+$smallShrinkResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 4608 } `
+    -AfterFiles  @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 2046 } `
+    -MainModelRelativePath 'TestProject.md'
+$smallShrinkAlerts = @(Get-BRAVOCompareCaptured -Kind Alerts)
+$smallShrinkInfoLog = @(@(Get-BRAVOCompareCaptured -Kind Logs) | Where-Object { $_ -like '*малих файлів MODEL*' -and $_ -like '*TABLE-A.md*' })
+Test-BRAVOCondition `
+    -Condition (
+        -not $smallShrinkResult.HasCriticalChanges -and
+        $smallShrinkResult.MainModelValid -and
+        @($smallShrinkResult.CriticalFiles).Count -eq 0 -and
+        $smallShrinkResult.SmallFileReductionCount -eq 1 -and
+        @($smallShrinkAlerts).Count -eq 0 -and
+        @($smallShrinkInfoLog).Count -eq 1 -and
+        ($smallShrinkInfoLog[0].Contains('-55,6%') -or $smallShrinkInfoLog[0].Contains('-55.6%'))
+    ) `
+    -Name "Maintenance/CompareFileSizesSmallFileShrinkNotCritical" `
+    -Failure "малий файл 4608 -> 2046 байт має бути НЕ критичним (без alert/rollback), але видимим в INFO-журналі; отримано HasCriticalChanges=$($smallShrinkResult.HasCriticalChanges), SmallFileReductionCount=$($smallShrinkResult.SmallFileReductionCount), alerts=$(@($smallShrinkAlerts).Count), infoLog=$(@($smallShrinkInfoLog).Count)"
+
+# --- Малий файл обнулено (0 байт, файл існує) -> CRITICAL.
+$smallZeroResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 4608 } `
+    -AfterFiles  @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 0 } `
+    -MainModelRelativePath 'TestProject.md'
+Test-BRAVOCondition `
+    -Condition (
+        $smallZeroResult.HasCriticalChanges -and
+        @($smallZeroResult.CriticalFiles).Count -eq 1 -and
+        [string]$smallZeroResult.CriticalFiles[0].File -eq 'TABLE-A.md' -and
+        $smallZeroResult.SmallFileReductionCount -eq 0
+    ) `
+    -Name "Maintenance/CompareFileSizesSmallFileZeroedCritical" `
+    -Failure "малий файл, обнулений до 0 байт, має лишатися CRITICAL; отримано HasCriticalChanges=$($smallZeroResult.HasCriticalChanges), CriticalFiles=$(@($smallZeroResult.CriticalFiles).Count)"
+
+# --- Малий (не транзитний) файл зник -> CRITICAL (логіка відсутніх файлів
+# незмінна).
+$smallMissingResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 4608 } `
+    -AfterFiles  @{ 'TestProject.md' = 5242880 } `
+    -MainModelRelativePath 'TestProject.md'
+Test-BRAVOCondition `
+    -Condition (
+        $smallMissingResult.HasCriticalChanges -and
+        @($smallMissingResult.CriticalFiles).Count -eq 1 -and
+        [bool]$smallMissingResult.CriticalFiles[0].Missing -and
+        $smallMissingResult.RemovedByRepairCount -eq 0
+    ) `
+    -Name "Maintenance/CompareFileSizesSmallFileMissingCritical" `
+    -Failure "зниклий малий файл (не сегмент .NNN) має лишатися CRITICAL; отримано HasCriticalChanges=$($smallMissingResult.HasCriticalChanges), CriticalFiles=$(@($smallMissingResult.CriticalFiles).Count), RemovedByRepairCount=$($smallMissingResult.RemovedByRepairCount)"
+
+# --- Великий файл 4 МБ -> 1,5 МБ (-62,5%) -> CRITICAL (правило 50% діє).
+$largeShrinkResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 5242880; 'FILE-A.md' = 4194304 } `
+    -AfterFiles  @{ 'TestProject.md' = 5242880; 'FILE-A.md' = 1572864 } `
+    -MainModelRelativePath 'TestProject.md'
+Test-BRAVOCondition `
+    -Condition (
+        $largeShrinkResult.HasCriticalChanges -and
+        @($largeShrinkResult.CriticalFiles).Count -eq 1 -and
+        [string]$largeShrinkResult.CriticalFiles[0].File -eq 'FILE-A.md' -and
+        $largeShrinkResult.SmallFileReductionCount -eq 0
+    ) `
+    -Name "Maintenance/CompareFileSizesLargeFileHalfShrinkCritical" `
+    -Failure "великий файл 4 МБ -> 1,5 МБ (>= 50%) має лишатися CRITICAL; отримано HasCriticalChanges=$($largeShrinkResult.HasCriticalChanges), CriticalFiles=$(@($largeShrinkResult.CriticalFiles).Count)"
+
+# --- Великий файл 4 МБ -> 3 МБ (-25%) -> НЕ критично.
+$largeMildResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 5242880; 'FILE-A.md' = 4194304 } `
+    -AfterFiles  @{ 'TestProject.md' = 5242880; 'FILE-A.md' = 3145728 } `
+    -MainModelRelativePath 'TestProject.md'
+Test-BRAVOCondition `
+    -Condition (-not $largeMildResult.HasCriticalChanges -and $largeMildResult.SmallFileReductionCount -eq 0) `
+    -Name "Maintenance/CompareFileSizesLargeFileMildShrinkNotCritical" `
+    -Failure "великий файл 4 МБ -> 3 МБ (-25%) не має бути CRITICAL; отримано HasCriticalChanges=$($largeMildResult.HasCriticalChanges)"
+
+# --- Поріг 0 = найсуворіший режим: правило 50% знову діє і для малих
+# файлів (той самий 4608 -> 2046 стає CRITICAL).
+$strictThresholdResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 4608 } `
+    -AfterFiles  @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 2046 } `
+    -MainModelRelativePath 'TestProject.md' `
+    -SmallFileThresholdBytes 0
+Test-BRAVOCondition `
+    -Condition ($strictThresholdResult.HasCriticalChanges -and @($strictThresholdResult.CriticalFiles).Count -eq 1) `
+    -Name "Maintenance/CompareFileSizesZeroThresholdKeepsFullRule" `
+    -Failure "SmallFileThresholdBytes=0 має застосовувати повне правило до всіх файлів; отримано HasCriticalChanges=$($strictThresholdResult.HasCriticalChanges)"
+
+# --- Від'ємний поріг, переданий напряму, -> типові 1 МБ (fail-closed):
+# малий файл 4608 -> 2046 не критичний, а великий 4 МБ -> 1,5 МБ —
+# критичний (перевірку не вимкнено).
+$negativeThresholdResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 4608; 'FILE-A.md' = 4194304 } `
+    -AfterFiles  @{ 'TestProject.md' = 5242880; 'TABLE-A.md' = 2046; 'FILE-A.md' = 1572864 } `
+    -MainModelRelativePath 'TestProject.md' `
+    -SmallFileThresholdBytes -5
+Test-BRAVOCondition `
+    -Condition (
+        $negativeThresholdResult.HasCriticalChanges -and
+        @($negativeThresholdResult.CriticalFiles).Count -eq 1 -and
+        [string]$negativeThresholdResult.CriticalFiles[0].File -eq 'FILE-A.md' -and
+        $negativeThresholdResult.SmallFileReductionCount -eq 1
+    ) `
+    -Name "Maintenance/CompareFileSizesNegativeThresholdFallsBackToDefault" `
+    -Failure "від'ємний SmallFileThresholdBytes має давати типовий поріг 1 МБ; отримано HasCriticalChanges=$($negativeThresholdResult.HasCriticalChanges), CriticalFiles=$(@($negativeThresholdResult.CriticalFiles).Count), SmallFileReductionCount=$($negativeThresholdResult.SmallFileReductionCount)"
+
+# --- Resolve-BRAVORestoreSmallFileThresholdBytes: читання конфігурації
+# Restore.IntegritySmallFileThresholdBytes. Некоректне значення ніколи не
+# вимикає перевірку: типові 1048576 + InvalidValue для WARNING.
+$thresholdResolverModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText $maintenanceRepairScriptText `
+    -FunctionNames @('Resolve-BRAVORestoreSmallFileThresholdBytes')
+$thresholdResolverCases = @(
+    @{ Label = 'Missing';        Value = $null;        Expected = 1048576;   ExpectInvalid = $false }
+    @{ Label = 'ValidInt';       Value = 524288;       Expected = 524288;    ExpectInvalid = $false }
+    @{ Label = 'ValidString';    Value = ' 2097152 ';  Expected = 2097152;   ExpectInvalid = $false }
+    @{ Label = 'Zero';           Value = 0;            Expected = 0;         ExpectInvalid = $false }
+    @{ Label = 'Maximum';        Value = 104857600;    Expected = 104857600; ExpectInvalid = $false }
+    @{ Label = 'Negative';       Value = -1;           Expected = 1048576;   ExpectInvalid = $true }
+    @{ Label = 'AboveMaximum';   Value = 104857601;    Expected = 1048576;   ExpectInvalid = $true }
+    @{ Label = 'Fraction';       Value = 1.5;          Expected = 1048576;   ExpectInvalid = $true }
+    @{ Label = 'NotANumber';     Value = 'abc';        Expected = 1048576;   ExpectInvalid = $true }
+    @{ Label = 'EmptyString';    Value = '';           Expected = 1048576;   ExpectInvalid = $true }
+    @{ Label = 'Boolean';        Value = $true;        Expected = 1048576;   ExpectInvalid = $true }
+)
+foreach ($thresholdCase in $thresholdResolverCases) {
+    $thresholdResolved = & $thresholdResolverModule {
+        param($Value)
+        Set-StrictMode -Version Latest
+        Resolve-BRAVORestoreSmallFileThresholdBytes -Value $Value
+    } $thresholdCase.Value
+    $thresholdIsInvalid = $null -ne $thresholdResolved.InvalidValue
+    Test-BRAVOCondition `
+        -Condition (
+            [long]$thresholdResolved.ThresholdBytes -eq [long]$thresholdCase.Expected -and
+            $thresholdIsInvalid -eq [bool]$thresholdCase.ExpectInvalid
+        ) `
+        -Name "Maintenance/RestoreSmallFileThresholdConfig[$($thresholdCase.Label)]" `
+        -Failure "Resolve-BRAVORestoreSmallFileThresholdBytes('$($thresholdCase.Value)') має дати $($thresholdCase.Expected) (InvalidValue очікувано: $($thresholdCase.ExpectInvalid)); отримано $($thresholdResolved.ThresholdBytes), InvalidValue='$($thresholdResolved.InvalidValue)'"
+}
+
+# --- Ключ конфігурації протягнуто до реальної перевірки: runtime читає
+# Restore.IntegritySmallFileThresholdBytes через резолвер і передає
+# результат у Invoke-BRAVOModelRestoreRecovery, а той — в обидва
+# виклики Compare-FileSizes (до і після відкату).
+Test-BRAVOCondition `
+    -Condition (
+        $maintenanceRepairScriptText.Contains('$RestoreSmallFileThreshold = Resolve-BRAVORestoreSmallFileThresholdBytes -Value $restoreSmallFileThresholdRawValue') -and
+        $maintenanceRepairScriptText.Contains('-SmallFileThresholdBytes $RestoreSmallFileThreshold.ThresholdBytes') -and
+        ([regex]::Matches($maintenanceRepairScriptText, '-SmallFileThresholdBytes \$SmallFileThresholdBytes')).Count -eq 2
+    ) `
+    -Name "Maintenance/RestoreSmallFileThresholdWiredToCompare" `
+    -Failure "поріг Restore.IntegritySmallFileThresholdBytes має доходити від конфігурації до обох викликів Compare-FileSizes у Invoke-BRAVOModelRestoreRecovery"
 
 # ============================================================
 # Discord HTTP 429: обмежений retry з пріоритетом на Retry-After.
