@@ -1816,6 +1816,138 @@ function Invoke-A2Start {
         -Failure ("невдалий запуск впалої служби (BRAVO — гілка StartFailed, exchangAPI — catch): 3-тя спроба за 24 год — CRITICAL «циклічно падає» без -IsCritical разом із CRITICAL StartFailed і lastCriticalAt у state; 4-та — лише StartFailed. " +
             ($w4CyclicDiffs -join ' | '))
 
+    # Рев'ю PR #429 (P2): облік спроби скидає stableSince, тому успішний
+    # запуск впалої служби одразу стає першим спостереженням стабільності
+    # (stableSince = момент підтвердженого Running). Інакше 30-хвилинне вікно
+    # скидання починалося б лише з наступного тику профілю (до ~45 хв).
+    # Спостереження лише відкриває вікно: облік спроб не скидається, а
+    # скидання — тільки після 30 хв Running від цього моменту.
+    $p2StableStubs = @'
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO', [switch]$NoConsole)
+    $script:P2Log += @("$Level|$Message")
+}
+function Send-SlackAlert {
+    param([string]$Message, [switch]$IsCritical, [string]$Severity)
+    $script:P2Slack += @("$Severity|$([bool]$IsCritical)|$Message")
+}
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    return [pscustomobject]@{ Name = $Name; Status = 'Stopped' }
+}
+function Invoke-ServiceStateChange {
+    param([string]$Name, [string]$DesiredStatus, [int]$TimeoutSeconds, [int]$PollIntervalSeconds, [switch]$Force)
+    $script:P2AttemptStableSince = $script:maintenanceServiceRecoveryState.services[$Name].stableSince
+    Start-Sleep -Milliseconds 20
+    $script:P2ConfirmedAt = Get-Date
+    return [pscustomobject]@{ Success = $script:P2StartSucceeds; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = $(if ($script:P2StartSucceeds) { 'Running' } else { 'Stopped' }); Error = 'self-test: служба не стартувала' }
+}
+function Save-BRAVOMaintenanceServiceRecoveryState {
+    param([datetime]$Now)
+    $script:P2Saves++
+    $script:P2SavedStableSince = $script:maintenanceServiceRecoveryState.services[$script:P2Name].stableSince
+}
+function Invoke-P2Start {
+    param([string]$Key, [string]$Name, $State, [bool]$Succeeds)
+    $script:P2Log = @()
+    $script:P2Slack = @()
+    $script:P2Saves = 0
+    $script:P2Name = $Name
+    $script:P2StartSucceeds = $Succeeds
+    $script:P2AttemptStableSince = 'не викликано'
+    $script:P2SavedStableSince = $null
+    $script:P2ConfirmedAt = $null
+    $script:maintenanceServiceRecoveryState = $State
+    $script:criticalErrorOccurred = $false
+    $script:bravoServiceStartedThisRun = $false
+    $script:LOG_FILE = 'C:\BRAVO\LOGS\BRAVO_MAINTENANCE_20261007_101500_RECOVER_PID1234.log'
+    $script:ServiceStartTimeoutSeconds = 60
+    $script:ServicePollIntervalSeconds = 1
+    $outcome = @{ RestartFailed = $false }
+    $condition = [pscustomobject]@{ Name = $Name; Condition = 'Failed'; Status = 'Stopped'; ExitCode = 1067 }
+    $startError = $null
+    try {
+        Start-BRAVOMaintenanceManagedService -Key $Key -Name $Name -Outcome $outcome -RecoveryCondition $condition
+    } catch {
+        $startError = $_.Exception.Message
+    }
+    $entry = $script:maintenanceServiceRecoveryState.services[$Name]
+    $stableSince = $null
+    $at29 = $null
+    $at31 = $null
+    if ($null -ne $entry -and $null -ne $entry.stableSince) {
+        $stableSince = [datetime]::Parse([string]$entry.stableSince, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        $at29 = Register-BRAVOServiceRecoveryStableObservation -State $script:maintenanceServiceRecoveryState -ServiceName $Name -Now $stableSince.AddMinutes(29)
+        $at31 = Register-BRAVOServiceRecoveryStableObservation -State $script:maintenanceServiceRecoveryState -ServiceName $Name -Now $stableSince.AddMinutes(31)
+    }
+    return [pscustomobject]@{
+        Error = $startError
+        RestartFailed = [bool]$outcome.RestartFailed
+        CriticalSlack = @($script:P2Slack | Where-Object { $_ -match '^\|True\|' }).Count
+        Saves = $script:P2Saves
+        AttemptStableSince = $script:P2AttemptStableSince
+        ConfirmedAt = $script:P2ConfirmedAt
+        StableSince = $stableSince
+        SavedStableSince = $script:P2SavedStableSince
+        Attempts = $(if ($null -ne $entry) { @($entry.attempts).Count } else { -1 })
+        At29Reset = $(if ($null -ne $at29) { [bool]$at29.Reset } else { $null })
+        At29Attempts = $(if ($null -ne $at29 -and $at29.State.services.ContainsKey($Name)) { @($at29.State.services[$Name].attempts).Count } else { -1 })
+        At31Reset = $(if ($null -ne $at31) { [bool]$at31.Reset } else { $null })
+    }
+}
+'@
+    $p2StableModule = & $w4NewModule ($p2StableStubs + "`n" + $w4RuntimeText + "`n" + $w4ModuleText + "`n" + $w4SystemText) (
+        @(& $w4FunctionNamesIn $p2StableStubs) +
+        @('Start-BRAVOMaintenanceManagedService', 'Send-BRAVOMaintenanceServiceRecoveredAlert', 'Send-BRAVOMaintenanceServiceCyclicAlert',
+            'Register-BRAVOMaintenanceServiceRecoveryAttempt', 'Register-BRAVOMaintenanceServiceRecoveryStartConfirmed',
+            'Get-BRAVOMaintenanceServiceRecoveryState', 'Get-BRAVOMaintenanceServiceExitCodeText') +
+        @($w4ModuleFunctions) + @('Test-BRAVOServiceStartRequired'))
+    $p2StableResults = @{}
+    $p2StableError = $null
+    try {
+        foreach ($p2StableCase in @(@('Bravo', 'BRAVO', $true), @('ExchangeApi', 'exchangAPI', $true), @('Bravo', 'BRAVO', $false))) {
+            # Попередня спроба з уже відкритим вікном стабільності: нова
+            # спроба його скидає, успіх — відкриває заново від підтвердження.
+            $p2StableState = [pscustomobject]@{
+                schemaVersion = 1; hostname = [Environment]::MachineName; updatedAt = $null
+                services = @{ ([string]$p2StableCase[1]) = [pscustomobject]@{
+                        attempts = @((Get-Date).AddMinutes(-20).ToString('o')); lastCriticalAt = $null; stableSince = (Get-Date).AddMinutes(-10).ToString('o') } }
+            }
+            $p2StableResults[('{0}|{1}' -f $p2StableCase[0], $p2StableCase[2])] = & $p2StableModule {
+                param($Key, $Name, $State, $Succeeds)
+                Set-StrictMode -Version 2.0
+                Invoke-P2Start -Key $Key -Name $Name -State $State -Succeeds $Succeeds
+            } $p2StableCase[0] $p2StableCase[1] $p2StableState $p2StableCase[2]
+        }
+    } catch {
+        $p2StableError = $_.Exception.Message
+    }
+    $p2StableDiffs = @()
+    if ($null -ne $p2StableError) { $p2StableDiffs += "помилка: $p2StableError" }
+    foreach ($p2StableKey in @('Bravo|True', 'ExchangeApi|True')) {
+        $p2 = $p2StableResults[$p2StableKey]
+        if ($null -eq $p2) { $p2StableDiffs += "${p2StableKey}: немає результату"; continue }
+        if ($null -ne $p2.Error -or $p2.RestartFailed -or [int]$p2.CriticalSlack -ne 0 -or $null -ne $p2.AttemptStableSince -or
+            $null -eq $p2.StableSince -or $null -eq $p2.ConfirmedAt -or $p2.StableSince -lt $p2.ConfirmedAt -or
+            $null -eq $p2.SavedStableSince -or [int]$p2.Attempts -ne 2 -or
+            $p2.At29Reset -ne $false -or [int]$p2.At29Attempts -ne 2 -or $p2.At31Reset -ne $true) {
+            $p2StableDiffs += ("{0}: помилка='{1}' restartFailed={2} critical={3} stableSince при спробі='{4}' підтверджено='{5}' stableSince='{6}' збережено='{7}' спроб={8} 29хв.скидання={9} 29хв.спроб={10} 31хв.скидання={11}" -f
+                $p2StableKey, $p2.Error, $p2.RestartFailed, $p2.CriticalSlack, $p2.AttemptStableSince, $p2.ConfirmedAt, $p2.StableSince,
+                $p2.SavedStableSince, $p2.Attempts, $p2.At29Reset, $p2.At29Attempts, $p2.At31Reset)
+        }
+    }
+    $p2Failed = $p2StableResults['Bravo|False']
+    if ($null -eq $p2Failed) {
+        $p2StableDiffs += 'невдалий запуск: немає результату'
+    } elseif (-not $p2Failed.RestartFailed -or $null -ne $p2Failed.StableSince -or [int]$p2Failed.Attempts -ne 2) {
+        $p2StableDiffs += "невдалий запуск: restartFailed=$($p2Failed.RestartFailed) stableSince='$($p2Failed.StableSince)' спроб=$($p2Failed.Attempts)"
+    }
+    Test-BRAVOCondition `
+        -Condition ($p2StableDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/SuccessfulStartOpensStableWindow' `
+        -Failure ("успішний запуск впалої служби (BRAVO, exchangAPI) — перше спостереження стабільності: stableSince = момент підтвердженого Running, збережено в state, облік спроб не скинуто; через 29 хв облік ще є, через 31 хв — скидання; невдалий запуск stableSince не ставить. " +
+            ($p2StableDiffs -join ' | '))
+
     # Рев'ю PR #429: CRITICAL «циклічно падає» ставиться в чергу сповіщень
     # (Send-SlackAlert -Severity CRITICAL), а доставляє її пізніше
     # Send-BRAVOMaintenanceEarlyExitAlerts (профіль) або Send-FinalReport
@@ -2367,6 +2499,39 @@ function Write-Log {
         -Name 'ServiceRecovery/DiagnoseDetectsSettingsDrift' `
         -Failure ("Test-BRAVOServiceRecoveryTaskDefinition: по одній проблемі на Repetition.Duration≠P1D, StopAtDurationEnd=true, StartWhenAvailable=true, підписку не на журнал System, RestartCount>0 і DaysInterval≠1. " +
             ($w5DriftDiffs -join ' || '))
+
+    # Рев'ю PR #429 (P2): зайві тригери. Перевірка дивилася лише на перший
+    # тригер кожного типу, тож другий тригер за подією SCM, другий BootTrigger,
+    # другий щоденний чи тригер іншого типу (вхід користувача, щотижневий)
+    # проходили непоміченими — а кожен із них запускає профіль поза
+    # розкладом 0/5/15/60. Очікується рівно по одному з трьох тригерів і
+    # жодного іншого; кожне порушення — одна проблема.
+    $p2ExtraCases = [ordered]@{
+        ExtraEvent = @({ param($d) $first = @($d.Triggers)[0]; $t = $d.Triggers.Create(0); $t.Subscription = $first.Subscription; $t.Delay = $first.Delay; $t.Enabled = $true }, 'SCM.*: 2, очікується 1')
+        ExtraBoot = @({ param($d) $t = $d.Triggers.Create(8); $t.Delay = @($d.Triggers)[1].Delay; $t.Enabled = $true }, 'старту Windows.*: 2, очікується 1')
+        ExtraDaily = @({ param($d) $first = @($d.Triggers)[2]; $t = $d.Triggers.Create(2); $t.StartBoundary = $first.StartBoundary; $t.DaysInterval = 1; $t.Repetition.Interval = $first.Repetition.Interval; $t.Repetition.Duration = 'P1D'; $t.Repetition.StopAtDurationEnd = $false; $t.Enabled = $true }, 'щоденних.*: 2, очікується 1')
+        LogonTrigger = @({ param($d) $t = $d.Triggers.Create(9); $t.Enabled = $true }, 'зайвий тригер типу 9')
+        WeeklyTrigger = @({ param($d) $t = $d.Triggers.Create(3); $t.Enabled = $true }, 'зайвий тригер типу 3')
+    }
+    $p2ExtraDiffs = @()
+    foreach ($p2ExtraName in @($p2ExtraCases.Keys)) {
+        $p2ExtraDefinition = & $w5NewFakeDefinition
+        try {
+            & $w5TriggerModule { param($Definition, $Today) Add-BRAVOServiceRecoveryTaskTriggers -Definition $Definition -Today $Today } $p2ExtraDefinition $w5Today
+            & $p2ExtraCases[$p2ExtraName][0] $p2ExtraDefinition
+            $p2ExtraProblems = @(& $w5TriggerModule { param($Definition) Set-StrictMode -Version 2.0; Test-BRAVOServiceRecoveryTaskDefinition -Definition $Definition } $p2ExtraDefinition)
+            if ($p2ExtraProblems.Count -ne 1 -or [string]$p2ExtraProblems[0] -notmatch $p2ExtraCases[$p2ExtraName][1]) {
+                $p2ExtraDiffs += "${p2ExtraName}: [$($p2ExtraProblems -join ' | ')]"
+            }
+        } catch {
+            $p2ExtraDiffs += "${p2ExtraName}: помилка $($_.Exception.Message)"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($p2ExtraDiffs.Count -eq 0) `
+        -Name 'ServiceRecovery/DiagnoseRejectsExtraTriggers' `
+        -Failure ("Test-BRAVOServiceRecoveryTaskDefinition: рівно один тригер за подією SCM, один після старту Windows і один щоденний; другий тригер будь-якого з цих типів або тригер іншого типу (вхід користувача, щотижневий) — одна проблема. " +
+            ($p2ExtraDiffs -join ' || '))
 
     # ============================================================
     # Тест 8 (лише Windows): справжній COM Schedule.Service, без реєстрації
