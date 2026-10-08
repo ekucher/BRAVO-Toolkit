@@ -16312,6 +16312,11 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
             # (Other -> fail-closed ДО архіву), але має намір перезапуску з самого
             # старту: маркер без MARKER-NO-RESTART, у finally вона стартує
             # останньою (BRAVO -> exchangAPI -> BRAVO Web) з обліком спроби.
+            # Рев'ю PR #429 (fail-closed): зупинена служба з НЕВІДОМИМ типом
+            # запуску (Other -> класифікатор StartMode Unknown) — не «впала»:
+            # вона могла бути вимкнена оператором, тож у finally не стартує і
+            # спроба не обліковується, лише WARNING; утримання для реставрації
+            # (Other -> fail-closed ДО архіву) — як і раніше.
             $maintenanceStartModeOtherFailed = & $maintenanceStartModeOutcome 'StartModeOtherInitiallyStopped'
             $maintenanceStartModeHeldFailed = & $maintenanceStartModeOutcome 'StartModeHeldInitiallyStopped'
             Test-BRAVOCondition `
@@ -16323,8 +16328,9 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
                     $maintenanceStartModeOtherFailed.RestoreCancelled -and
                     @($maintenanceStartModeOtherFailed.UnrestorableErrors).Count -eq 1 -and
                     [string]$maintenanceStartModeOtherFailed.UnrestorableErrors[0] -like '*BravoWeb (тип запуску: Other)*' -and
-                    (@($maintenanceStartModeOtherFailed.Events | Where-Object { $_ -like 'START *' }) -join ',') -ceq 'START BRAVO,START exchangAPI,START BravoWeb' -and
-                    (@($maintenanceStartModeOtherFailed.Events | Where-Object { $_ -like 'RSTATE-WRITE *' }) -join '|') -ceq 'RSTATE-WRITE BravoWeb=1' -and
+                    (@($maintenanceStartModeOtherFailed.Events | Where-Object { $_ -like 'START *' }) -join ',') -ceq 'START BRAVO,START exchangAPI' -and
+                    @($maintenanceStartModeOtherFailed.Events | Where-Object { $_ -like 'RSTATE-WRITE *' }).Count -eq 0 -and
+                    @($maintenanceStartModeOtherFailed.Events | Where-Object { $_ -like 'LOG-WARNING Служба BravoWeb зупинена, але її тип запуску не визначено*' }).Count -eq 1 -and
                     $maintenanceStartModeHeldFailed.ProbeOk -and $maintenanceStartModeHeldFailed.StepOrderOk -and
                     (& $maintenanceMarkerTrailEarly $maintenanceStartModeHeldFailed.Events) -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
                     ($maintenanceStartModeHeldFailed.Held -join ',') -ceq 'BRAVO,exchangAPI,BravoWeb' -and
@@ -16334,7 +16340,7 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
                     @($maintenanceStartModeHeldFailed.Events | Where-Object { $_ -like 'ALERT WARNING critical=False Служба BravoWeb впала *' }).Count -eq 1
                 ) `
                 -Name "Maintenance/StartModeInitiallyStoppedFailedServiceIsHeldAndRestarted" `
-                -Failure ("Maintenance (#314 FR-2): впала до прогону служба при запланованій реставрації має утримуватись і перевірятись (Other -> fail-closed), мати намір перезапуску з початку й стартувати у finally з обліком спроби; події: " + ($maintenanceStartModeOtherFailed.Events -join ' | ') + ' || ' + ($maintenanceStartModeHeldFailed.Events -join ' | '))
+                -Failure ("Maintenance (#314 FR-2): впала до прогону служба при запланованій реставрації має утримуватись і перевірятись, мати намір перезапуску з початку й стартувати у finally з обліком спроби; зупинена з невідомим типом запуску (Other) — утримується (fail-closed), але не стартує і не обліковується, WARNING (рев'ю PR #429); події: " + ($maintenanceStartModeOtherFailed.Events -join ' | ') + ' || ' + ($maintenanceStartModeHeldFailed.Events -join ' | '))
             # #349 (рев'ю): служба, яку зупинив аварійно перерваний прогін із наміром
             # перезапуску, не втрачає цей намір, коли маркер перезаписується: вона
             # утримується з RestartIntent і стартує у finally. Маркер із
