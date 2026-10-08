@@ -68,6 +68,12 @@
   `ServiceRecovery/NightlySkipsUnknownStartMode`, `ServiceRecovery/ProfileStableResetIndependentPerService`,
   `ServiceRecovery/DiagnoseDetectsSettingsDrift` (DaysInterval); `Maintenance/StartModeInitiallyStoppedFailedServiceIsHeldAndRestarted`
   оновлено: служба з типом запуску `Other` утримується для реставрації, але у finally не стартує.
+  Третє коло рев'ю PR #429: успішний запуск впалої служби одразу ставить `stableSince` (момент підтвердженого
+  Running), тож облік спроб скидається через 30 хв стабільної роботи, а не до ~45 хв (наступним тиком профілю).
+  Diagnose вимагає рівно один тригер за подією SCM, один після старту Windows і один щоденний; другий тригер цих типів
+  чи тригер іншого типу — окрема проблема. Тести: `ServiceRecovery/SuccessfulStartOpensStableWindow`,
+  `ServiceRecovery/DiagnoseRejectsExtraTriggers`; `Maintenance/OrchestrationRestoreStartsFailedServiceStoppedBeforeRun` і
+  `Maintenance/StartModeInitiallyStoppedFailedServiceIsHeldAndRestarted` очікують другий запис state після запуску.
 
 - **Feature: профіль відновлення впалих служб `BRAVO_MAINTENANCE.ps1 -RecoverServices` (#314, хвиля 4, FR-3).**
   Новий перемикач запускає не обслуговування, а легкий профіль: класифікація керованих служб без lock-а
