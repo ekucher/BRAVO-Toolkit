@@ -253,6 +253,54 @@ $RestoreWindowEnd = if ($MaintenanceConfig.Restore -is [System.Collections.IDict
     "03:00"
 }
 $RESTORE_ARCHIVES_KEEP_COUNT = [int]$MaintenanceConfig.Restore.ArchivesKeepCount
+# Поріг «малого» файлу MODEL для самоперевірки реставрації (Compare-FileSizes).
+# Файли, менші за поріг ДО реставрації, НЕ оцінюються відсотковим правилом
+# (>= 50%) і правилом «після <= MinSizeBytes»: легітимне ущільнення
+# невеликої таблиці під час repair (реальний випадок: 4,5 КБ -> 2,0 КБ,
+# -55,6%) давало хибний CRITICAL, відкат моделі й exit 43. Критичними для
+# малих файлів лишаються лише зникнення файлу (незмінна логіка відсутніх
+# файлів) та обнулення до 0 байт. Файли від порогу й більші перевіряються
+# незмінним правилом (>= 50% або <= MinSizeBytes після реставрації).
+#
+# Fail-closed: некоректне значення (не ціле число, від'ємне, понад 100 МБ)
+# НЕ вимикає перевірку і НЕ розширює послаблення на великі файли — замість
+# нього діє типовий поріг 1 МБ, а викликач логує WARNING. 0 — найсуворіший
+# режим: відсоткове правило для всіх файлів, як до цього порогу. Верхня
+# межа 100 МБ гарантує, що основна модель (гігабайтні .md) ніколи не
+# потрапить під послаблене правило через помилку в конфігурації.
+function Resolve-BRAVORestoreSmallFileThresholdBytes {
+    param([AllowNull()]$Value)
+
+    $defaultBytes = [long]1048576
+    $maximumBytes = [long]104857600
+    if ($null -eq $Value) {
+        return [pscustomobject]@{ ThresholdBytes = $defaultBytes; InvalidValue = $null }
+    }
+    $valueText = ([string]$Value).Trim()
+    $parsedBytes = [long]0
+    $isValid = (
+        -not ($Value -is [bool]) -and
+        -not ($Value -is [array]) -and
+        -not [string]::IsNullOrWhiteSpace($valueText) -and
+        [long]::TryParse(
+            $valueText,
+            [System.Globalization.NumberStyles]::Integer,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedBytes) -and
+        $parsedBytes -ge 0 -and
+        $parsedBytes -le $maximumBytes
+    )
+    if (-not $isValid) {
+        return [pscustomobject]@{ ThresholdBytes = $defaultBytes; InvalidValue = $valueText }
+    }
+    return [pscustomobject]@{ ThresholdBytes = $parsedBytes; InvalidValue = $null }
+}
+$restoreSmallFileThresholdRawValue = $null
+if ($MaintenanceConfig.Restore -is [System.Collections.IDictionary] -and
+    $MaintenanceConfig.Restore.Contains("IntegritySmallFileThresholdBytes")) {
+    $restoreSmallFileThresholdRawValue = $MaintenanceConfig.Restore["IntegritySmallFileThresholdBytes"]
+}
+$RestoreSmallFileThreshold = Resolve-BRAVORestoreSmallFileThresholdBytes -Value $restoreSmallFileThresholdRawValue
 $ARCHIVE_RETENTION_DAYS = [int]$MaintenanceConfig.Retention.ArchiveDays
 $LOG_RETENTION_DAYS = [int]$MaintenanceConfig.Retention.LogDays
 # Скільки днів зберігати вже стиснуті .mdz програмних журналів. Окрема
@@ -4930,7 +4978,8 @@ function New-BRAVOCompareFileSizesResult {
         [bool]$HasCriticalChanges,
         [array]$CriticalFiles = @(),
         [array]$RemovedByRepairFiles = @(),
-        [bool]$MainModelValid = $true
+        [bool]$MainModelValid = $true,
+        [array]$SmallFileReductionFiles = @()
     )
     return [PSCustomObject]@{
         HasCriticalChanges = $HasCriticalChanges
@@ -4938,6 +4987,10 @@ function New-BRAVOCompareFileSizesResult {
         RemovedByRepairFiles = @($RemovedByRepairFiles)
         RemovedByRepairCount = @($RemovedByRepairFiles).Count
         MainModelValid = $MainModelValid
+        # Малі файли (до реставрації < SmallFileThresholdBytes), що
+        # зменшились за старим правилом, але НЕ є критичними — лише INFO.
+        SmallFileReductionFiles = @($SmallFileReductionFiles)
+        SmallFileReductionCount = @($SmallFileReductionFiles).Count
     }
 }
 
@@ -4946,8 +4999,17 @@ function Compare-FileSizes {
         [string]$BeforeFile,
         [string]$ModelPath,
         [int]$MinSizeBytes = 2048,
-        [AllowNull()][string]$MainModelRelativePath = $null
+        [AllowNull()][string]$MainModelRelativePath = $null,
+        # Поріг «малого» файлу (байти, розмір ДО реставрації): для файлів,
+        # менших за нього, критичними є лише зникнення та обнулення (0 байт);
+        # див. Resolve-BRAVORestoreSmallFileThresholdBytes. Від'ємне значення
+        # трактується як типовий 1 МБ (fail-closed), 0 — правило для всіх.
+        [long]$SmallFileThresholdBytes = 1048576
     )
+
+    if ($SmallFileThresholdBytes -lt 0) {
+        $SmallFileThresholdBytes = 1048576
+    }
 
     try {
         if (-not (Test-Path $BeforeFile)) {
@@ -4990,6 +5052,7 @@ function Compare-FileSizes {
 
         $criticalFiles = @()
         $removedByRepairFiles = @()
+        $smallFileReductionFiles = @()
         $mainModelValid = $true
         $missingFileCount = 0
         $currentLookup = @{}
@@ -5032,11 +5095,30 @@ function Compare-FileSizes {
             } else {
                 100
             }
-            $isCriticalReduction = (
+            $isSizeRuleReduction = (
                 $initialSizeBytes -gt $MinSizeBytes -and
                 $currentSizeBytes -lt $initialSizeBytes -and
                 ($currentSizeBytes -le $MinSizeBytes -or $reductionPercent -ge 50)
             )
+            # Малий файл (до реставрації < SmallFileThresholdBytes): відсоткове
+            # правило і «<= MinSizeBytes» не застосовуються — repair штатно
+            # ущільнює невеликі таблиці (4,5 КБ -> 2,0 КБ = -55,6% без втрати
+            # даних). Критичним лишається обнулення наявного файлу; зникнення
+            # обробляє незмінна логіка відсутніх файлів нижче. Великі файли —
+            # без змін.
+            $isSmallFile = (
+                $SmallFileThresholdBytes -gt 0 -and
+                $initialSizeBytes -lt $SmallFileThresholdBytes
+            )
+            if ($isSmallFile) {
+                $isCriticalReduction = (
+                    -not $isMissing -and
+                    $initialSizeBytes -gt $MinSizeBytes -and
+                    $currentSizeBytes -eq 0
+                )
+            } else {
+                $isCriticalReduction = $isSizeRuleReduction
+            }
             # Fail-closed: без відомого MainModelRelativePath (викликач не
             # зміг визначити основну модель) будь-який відсутній файл лишається
             # критичним — стара поведінка. З відомим MainModelRelativePath
@@ -5062,6 +5144,15 @@ function Compare-FileSizes {
                     BeforeSizeBytes = $initialSizeBytes
                 }
                 continue
+            }
+
+            if ($isSmallFile -and $isSizeRuleReduction -and -not $isMissing -and -not $isCriticalReduction) {
+                $smallFileReductionFiles += [PSCustomObject]@{
+                    File = $relativePath
+                    BeforeSizeBytes = $initialSizeBytes
+                    AfterSizeBytes = $currentSizeBytes
+                    ReductionPercent = $reductionPercent
+                }
             }
 
             if ($isCriticalMissing -or $isCriticalReduction) {
@@ -5096,6 +5187,19 @@ function Compare-FileSizes {
                 $removedSummary += " - $($file.File) (було: $(Format-FileSize $file.BeforeSizeBytes))`n"
             }
             Write-Log $removedSummary -Level "INFO"
+        }
+
+        # Малі файли, що зменшились за старим правилом: оператор бачить їх у
+        # журналі, але це НЕ критична зміна — без alert і без відкату.
+        if (@($smallFileReductionFiles).Count -gt 0) {
+            $smallFileSummary = ("Зменшення розміру малих файлів MODEL після реставрації (до реставрації менше " +
+                "$(Format-FileSize $SmallFileThresholdBytes); критичним НЕ вважається, відкат не потрібен): " +
+                "$(@($smallFileReductionFiles).Count) файл(ів):`n")
+            foreach ($file in $smallFileReductionFiles) {
+                $smallFileSummary += (" - $($file.File): $(Format-FileSize $file.BeforeSizeBytes) → " +
+                    "$(Format-FileSize $file.AfterSizeBytes) (-$(([double]$file.ReductionPercent).ToString('0.0'))%)`n")
+            }
+            Write-Log $smallFileSummary -Level "INFO"
         }
 
         if ($criticalFiles.Count -gt 0) {
@@ -5156,13 +5260,15 @@ function Compare-FileSizes {
                 -HasCriticalChanges $true `
                 -CriticalFiles $criticalFiles `
                 -RemovedByRepairFiles $removedByRepairFiles `
-                -MainModelValid $mainModelValid
+                -MainModelValid $mainModelValid `
+                -SmallFileReductionFiles $smallFileReductionFiles
         } else {
             Write-Log "Критичних змін розміру не знайдено (RemovedByRepair: $(@($removedByRepairFiles).Count))" -Level "INFO"
             return New-BRAVOCompareFileSizesResult `
                 -HasCriticalChanges $false `
                 -RemovedByRepairFiles $removedByRepairFiles `
-                -MainModelValid $mainModelValid
+                -MainModelValid $mainModelValid `
+                -SmallFileReductionFiles $smallFileReductionFiles
         }
     }
     catch {
@@ -5295,14 +5401,16 @@ function Invoke-BRAVOModelRestoreRecovery {
         [AllowNull()][string]$MainModelRelativePath = $null,
         [Parameter(Mandatory = $true)][string]$BeforeArchivePath,
         [Parameter(Mandatory = $true)]$ARC_PATH,
-        [int]$MinSizeBytes = 2048
+        [int]$MinSizeBytes = 2048,
+        [long]$SmallFileThresholdBytes = 1048576
     )
 
     $compare = Compare-FileSizes `
         -BeforeFile $BeforeFile `
         -ModelPath $ModelPath `
         -MinSizeBytes $MinSizeBytes `
-        -MainModelRelativePath $MainModelRelativePath
+        -MainModelRelativePath $MainModelRelativePath `
+        -SmallFileThresholdBytes $SmallFileThresholdBytes
 
     $rollbackStatus = 'NONE'
     $integrityEstablished = -not $compare.HasCriticalChanges -and $compare.MainModelValid
@@ -5320,7 +5428,8 @@ function Invoke-BRAVOModelRestoreRecovery {
                 -BeforeFile $BeforeFile `
                 -ModelPath $ModelPath `
                 -MinSizeBytes $MinSizeBytes `
-                -MainModelRelativePath $MainModelRelativePath
+                -MainModelRelativePath $MainModelRelativePath `
+                -SmallFileThresholdBytes $SmallFileThresholdBytes
             if (-not $postRollback.HasCriticalChanges -and $postRollback.MainModelValid) {
                 Write-Log -Message "Модель успішно відновлена з before-архіву; консистентність підтверджено" -Level "SUCCESS"
                 $rollbackStatus = 'SUCCESS'
@@ -7825,6 +7934,14 @@ if ($bravoFilePhaseAllowed) {
                         $mainModelRelativeHint = $null
                     }
 
+                    if ($null -ne $RestoreSmallFileThreshold.InvalidValue) {
+                        Write-Log -Message ("Некоректне значення Restore.IntegritySmallFileThresholdBytes " +
+                            "'$($RestoreSmallFileThreshold.InvalidValue)' (очікується ціле число байт від 0 до 104857600); " +
+                            "використано типовий поріг $($RestoreSmallFileThreshold.ThresholdBytes) байт") -Level "WARNING"
+                    }
+                    Write-Log -Message ("Поріг малого файлу для перевірки розмірів MODEL: " +
+                        "$($RestoreSmallFileThreshold.ThresholdBytes) байт (менші файли критичні лише при зникненні або обнуленні)") -Level "INFO"
+
                     # Механізм перевірки+відкату — невідʼємна частина реставрації,
                     # виконується завжди (незалежно від -DisableSizeCheck).
                     $recovery = Invoke-BRAVOModelRestoreRecovery `
@@ -7834,7 +7951,8 @@ if ($bravoFilePhaseAllowed) {
                         -MainModelRelativePath $mainModelRelativeHint `
                         -BeforeArchivePath "$ARC_DIR\$ARCH_NAME1" `
                         -ARC_PATH $ARC_PATH `
-                        -MinSizeBytes 2048
+                        -MinSizeBytes 2048 `
+                        -SmallFileThresholdBytes $RestoreSmallFileThreshold.ThresholdBytes
                     $restoreRemovedByRepairCount = $recovery.RemovedByRepairCount
                     $restoreCriticalCount = $recovery.CriticalCount
                     $restoreMainModelValid = $recovery.MainModelValid
