@@ -683,7 +683,9 @@ function Get-BRAVOServiceRecoveryChainPlan {
     # Правила (рішення власника #314, порядок BRAVO -> exchangAPI -> BRAVO Web):
     #   - впала BRAVO: працюючі залежні (exchangAPI, BRAVO Web) зупиняються
     #     перед її запуском і запускаються після неї; впала залежна теж
-    #     запускається (і обліковується); залежна в Pending -> Deferred;
+    #     запускається (і обліковується), але лише коли минула її власна
+    #     пауза (-EligibleNames), інакше в цьому тику не чіпається (рядок
+    #     паузи пише профіль); залежна в Pending -> Deferred;
     #   - впала exchangAPI / BRAVO Web без впалої BRAVO: запускається лише
     #     вона; BRAVO в Pending -> Deferred;
     #   - впала BRAVO у паузі (не в -EligibleNames): залежні від неї
@@ -744,8 +746,10 @@ function Get-BRAVOServiceRecoveryChainPlan {
             if (Test-BRAVOServiceRecoveryFailed -Condition $dependent) { $held[$dependentKey] = $true }
         } elseif ($bravoFailed) {
             if (Test-BRAVOServiceRecoveryFailed -Condition $dependent) {
-                $failed[$dependentKey] = $true
-                $start[$dependentKey] = $true
+                if (& $isEligible $dependent) {
+                    $failed[$dependentKey] = $true
+                    $start[$dependentKey] = $true
+                }
             } elseif ($dependent.Condition -eq 'Running') {
                 $stop[$dependentKey] = $true
                 $start[$dependentKey] = $true
