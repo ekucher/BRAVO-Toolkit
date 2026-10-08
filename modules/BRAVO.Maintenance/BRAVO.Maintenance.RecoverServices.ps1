@@ -157,6 +157,72 @@ function Get-BRAVOServiceRecoveryBootTime {
     return $null
 }
 
+function Test-BRAVOServiceRecoveryLockHolderAllowsRecovery {
+    # Рев'ю PR #432 (B-P2-2): чи дозволяє власник зайнятого operation-lock
+    # відновлення служб без lock-а. Так — лише BRAVO_ARCHIV (operation
+    # 'Archive': Archive, BackupCatchUp, BAZASync) на цьому ж хості з живим
+    # процесом (pid + processStartTime): він служб не зупиняє й не запускає.
+    # Нечитабельний lock, інший власник, інший хост, процес без
+    # processStartTime чи мертвий процес — $false (fail-closed: код 20).
+    param(
+        [AllowNull()][object]$Holder,
+        [Parameter(Mandatory = $true)][string]$HostName
+    )
+
+    if ($null -eq $Holder) { return $false }
+    if ([string]$Holder.Operation -ne 'Archive') { return $false }
+    if ([string]$Holder.HostName -ne $HostName) { return $false }
+    if ($null -eq $Holder.Pid -or [int]$Holder.Pid -le 0) { return $false }
+    if ([string]::IsNullOrWhiteSpace([string]$Holder.ProcessStartTime)) { return $false }
+    return [bool](Test-BRAVOProcessAlive -ProcessId ([int]$Holder.Pid) -ProcessStartTime ([string]$Holder.ProcessStartTime))
+}
+
+function Convert-BRAVOServiceRecoveryOrphanedOwnConditions {
+    # Рев'ю PR #432 (B-P3-1): ownership-маркер власного профілю
+    # (BRAVO_MAINTENANCE_RECOVER), чий процес аварійно завершився, не чекає
+    # Health-watchdog: служби, які той прогін зупинив із наміром запуску,
+    # знову вважаються впалими (OwnedByBravo -> Failed). Лише для маркера без
+    # restartSuppressed і без знімка типів запуску (служба не тримається в
+    # Disabled; такий маркер перезаписується). Змінює -Conditions на місці;
+    # повертає ключі перейнятих служб.
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Conditions,
+        [AllowNull()][object]$Foreign
+    )
+
+    $takenKeys = @()
+    if ($null -eq $Foreign -or -not [bool]$Foreign.Present -or [bool]$Foreign.OwnerAlive) { return $takenKeys }
+    if ([string]$Foreign.Owner -ne 'BRAVO_MAINTENANCE_RECOVER' -or [bool]$Foreign.RestartSuppressed) { return $takenKeys }
+    if (@($Foreign.HeldSnapshot).Count -gt 0) { return $takenKeys }
+    foreach ($conditionKey in @($Conditions.Keys)) {
+        $condition = $Conditions[$conditionKey]
+        if ([string]$condition.Condition -ne 'OwnedByBravo' -or [string]$condition.Status -ne 'Stopped') { continue }
+        $heldProperty = $condition.PSObject.Properties['HeldByBravo']
+        if ($null -ne $heldProperty -and [bool]$heldProperty.Value) { continue }
+        if (@($Foreign.RestartIntentNames) -notcontains [string]$condition.Name) { continue }
+        $condition.Condition = 'Failed'
+        $takenKeys += $conditionKey
+    }
+    return $takenKeys
+}
+
+function Write-BRAVOMaintenanceServiceRecoveryDayLine {
+    # Рядок INFO профілю, що завершився без змін (пауза FR-5, вікно після
+    # старту ОС, зайнятий lock): у консоль і в добовий
+    # BRAVO_MAINTENANCE_<дата>_RECOVER_PAUSE.log — без окремого журналу
+    # прогону на кожен тик тригера.
+    param([Parameter(Mandatory = $true)][string]$Message)
+
+    $dayLine = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] [INFO] ' + $Message
+    Write-Host $dayLine
+    try {
+        if (-not (Test-Path -LiteralPath $LOG_DIR -PathType Container)) { [void](New-Item -ItemType Directory -Path $LOG_DIR -Force -ErrorAction Stop) }
+        $dayLine | Out-File -FilePath (Join-Path $LOG_DIR ('BRAVO_MAINTENANCE_{0}_RECOVER_PAUSE.log' -f (Get-Date -Format 'yyyyMMdd'))) -Append -Encoding UTF8
+    } catch {
+        Write-Host "УВАГА: рядок у добовий журнал профілю не записано: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 function Send-BRAVOMaintenanceServiceRecoveryNotification {
     # Доставка сповіщення #314 FR-6 (зміст — New-BRAVOServiceRecoveryNotificationContent)
     # з режимом і маршрутами сповіщень прогону ($script:SlackMode,
@@ -354,6 +420,7 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
     # Крок 1: класифікація без lock-а. Нічого не пишемо на диск.
     $Outcome.ServiceSet = $serviceSet
     $conditions = Get-BRAVOMaintenanceServiceConditionSet -ServiceSet $serviceSet
+    [void](Convert-BRAVOServiceRecoveryOrphanedOwnConditions -Conditions $conditions -Foreign (Get-BRAVOForeignServiceQuiescenceContext))
     $plan = Get-BRAVOServiceRecoveryPlan -ServiceSet $serviceSet -Conditions $conditions
     $Outcome.FailedKeys = @($plan.FailedKeys)
     $quietState = $null
@@ -380,33 +447,54 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
         return 0
     }
 
-    # Крок 2: паузи між спробами (FR-5).
-    if ($null -ne $quietState) {
-        $deferred = Get-BRAVOMaintenanceServiceRecoveryDeferredKey -ServiceSet $serviceSet -FailedKeys $plan.FailedKeys -State $quietState -Now $now
-        if ($deferred.Keys.Count -eq $plan.FailedKeys.Count) {
-            $pauseLine = "[{0}] [INFO] Відновлення служб відкладено: пауза між спробами ще не минула — {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), (@($deferred.Notes) -join '; ')
-            Write-Host $pauseLine
-            try {
-                if (-not (Test-Path -LiteralPath $LOG_DIR -PathType Container)) { [void](New-Item -ItemType Directory -Path $LOG_DIR -Force -ErrorAction Stop) }
-                $pauseLine | Out-File -FilePath (Join-Path $LOG_DIR ('BRAVO_MAINTENANCE_{0}_RECOVER_PAUSE.log' -f (Get-Date -Format 'yyyyMMdd'))) -Append -Encoding UTF8
-            } catch {
-                Write-Host "УВАГА: рядок про паузу не записано: $($_.Exception.Message)" -ForegroundColor Yellow
-            }
+    # Рев'ю PR #432 (A-P3-4 / B-P3-3): перші хвилини після старту ОС служби
+    # піднімає boot-тригер (-RunMissedRestoreOnly, з урахуванням
+    # HoldServices); event- чи daily-тригер профілю не випереджає його.
+    $bootGraceMinutes = [int](Get-BRAVOServiceRecoveryPolicy).BootGraceMinutes
+    $bootTime = Get-BRAVOServiceRecoveryBootTime
+    if ($null -ne $bootTime) {
+        $uptimeMinutes = ((Get-Date) - [datetime]$bootTime).TotalMinutes
+        if ($uptimeMinutes -ge 0 -and $uptimeMinutes -lt $bootGraceMinutes) {
+            Write-BRAVOMaintenanceServiceRecoveryDayLine -Message ('Відновлення служб відкладено: ОС працює менше ' + $bootGraceMinutes + ' хв — службами після старту розпоряджається boot-тригер; служби не змінювались')
             return 0
         }
     }
 
-    # Крок 3: operation-lock без очікування. Зайнятий — його власник
-    # (нічний Maintenance, BRAVO_ARCHIV, DataRestore) сам підніме служби.
-    $lockResult = Enter-BRAVOMaintenanceOperationLock -TaskType Maintenance -NoWait
-    if (-not $lockResult.Success) {
-        Write-Host "Відновлення служб відкладено: операційний lock зайнятий ($($lockResult.Path)); служби не змінювались"
-        return (Resolve-BRAVOExitCode -LockBusy)
+    # Крок 2: паузи між спробами (FR-5).
+    if ($null -ne $quietState) {
+        $deferred = Get-BRAVOMaintenanceServiceRecoveryDeferredKey -ServiceSet $serviceSet -FailedKeys $plan.FailedKeys -State $quietState -Now $now
+        if ($deferred.Keys.Count -eq $plan.FailedKeys.Count) {
+            Write-BRAVOMaintenanceServiceRecoveryDayLine -Message ('Відновлення служб відкладено: пауза між спробами ще не минула — ' + (@($deferred.Notes) -join '; '))
+            return 0
+        }
     }
-    $script:maintenanceOperationLock = $lockResult.Stream
-    $script:maintenanceOperationLockPath = $lockResult.Path
+
+    # Крок 3: operation-lock без очікування. Зайнятий нічним Maintenance чи
+    # DataRestore — власник сам підніме служби (код 20). Зайнятий BRAVO_ARCHIV
+    # (Archive / BackupCatchUp / BAZASync, operation=Archive) — він служб не
+    # зупиняє й не запускає, тож відновлення йде без lock-а (рев'ю PR #432,
+    # B-P2-2): маркер fail-closed, state-файл атомарний, а реставрацію від
+    # запущених служб захищає Confirm-BRAVOServicesQuiesced.
+    $lockResult = Enter-BRAVOMaintenanceOperationLock -TaskType Maintenance -NoWait
+    $lockHeld = [bool]$lockResult.Success
+    $lockHolder = $null
+    if (-not $lockHeld) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$lockResult.Path)) { $lockHolder = Read-BRAVOOperationLockHolder -Path ([string]$lockResult.Path) }
+        if (-not (Test-BRAVOServiceRecoveryLockHolderAllowsRecovery -Holder $lockHolder -HostName ([Environment]::MachineName))) {
+            $holderText = 'невідомо'
+            if ($null -ne $lockHolder) { $holderText = [string]$lockHolder.Description }
+            Write-BRAVOMaintenanceServiceRecoveryDayLine -Message ('Відновлення служб відкладено: операційний lock зайнятий (' + [string]$lockResult.Path + '); тримає: ' + $holderText + '; служби не змінювались')
+            return (Resolve-BRAVOExitCode -LockBusy)
+        }
+    } else {
+        $script:maintenanceOperationLock = $lockResult.Stream
+        $script:maintenanceOperationLockPath = $lockResult.Path
+    }
     try {
         $script:LOG_FILE = Join-Path $LOG_DIR ('BRAVO_MAINTENANCE_{0}_RECOVER_PID{1}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $PID)
+        if (-not $lockHeld) {
+            Write-Log -Message ('Операційний lock (' + [string]$lockResult.Path + ') тримає BRAVO_ARCHIV (' + [string]$lockHolder.Description + '): він служб не зупиняє — відновлення виконується без lock-а') -Level "INFO"
+        }
         Invoke-BRAVOMaintenanceServiceRecoveryUnderLock -ServiceSet $serviceSet -StatePath $statePath -Outcome $Outcome
         $exitCode = Get-BRAVOMaintenanceResolvedExitCode
         $finalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $exitCode
@@ -416,7 +504,7 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
     } finally {
         # Критичні алерти, не покриті FR-6, доставляє
         # Send-BRAVOMaintenanceServiceRecoveryRunAlerts (finally профілю).
-        Exit-BRAVOMaintenanceOperationLock
+        if ($lockHeld) { Exit-BRAVOMaintenanceOperationLock }
     }
 }
 
@@ -443,8 +531,13 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
     }
 
     # Чинний маркер іншого власника або гейт цілісності моделі: не втручаємось.
+    # Осиротілий маркер власного профілю переймається (B-P3-1): його служби
+    # знову впалі, а маркер перезапише крок 6.
     $foreign = Get-BRAVOForeignServiceQuiescenceContext
-    if ($foreign.Present) {
+    $takenKeys = @(Convert-BRAVOServiceRecoveryOrphanedOwnConditions -Conditions $conditions -Foreign $foreign)
+    if ($takenKeys.Count -gt 0) {
+        Write-Log -Message "Перейнято ownership-маркер аварійно перерваного прогону $($foreign.Owner): служби $(@($takenKeys | ForEach-Object { $ServiceSet.$_.Name }) -join ', ') знову вважаються впалими" -Level "INFO"
+    } elseif ($foreign.Present) {
         if ($foreign.OwnerAlive) {
             Write-Log -Message "Службами розпоряджається $($foreign.Owner) (ownership-маркер живого процесу) — профіль -RecoverServices не втручається" -Level "INFO"
         } elseif ($foreign.RestartSuppressed) {

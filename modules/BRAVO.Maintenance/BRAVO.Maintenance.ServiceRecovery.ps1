@@ -35,13 +35,18 @@ function Get-BRAVOServiceRecoveryPolicy {
     #                            «циклічно падає»;
     #   CyclicReminderHours    - CRITICAL «циклічно падає» не частіше;
     #   StableMinutes          - стільки служба має працювати після останньої
-    #                            спроби, щоб облік обнулився.
+    #                            спроби, щоб облік обнулився;
+    #   BootGraceMinutes       - перші хвилини після старту ОС профіль служб
+    #                            не змінює: ними розпоряджається boot-тригер
+    #                            (-RunMissedRestoreOnly, HoldServices); менше
+    #                            за затримку Boot-тригера задачі (10 хв).
     return [pscustomobject]@{
         PauseMinutes = @(0, 5, 15, 60)
         WindowHours = 24
         CyclicAttemptThreshold = 3
         CyclicReminderHours = 24
         StableMinutes = 30
+        BootGraceMinutes = 9
     }
 }
 

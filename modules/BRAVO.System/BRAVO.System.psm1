@@ -1718,6 +1718,61 @@ function Get-BRAVOServiceRecoveryStopEventFilter {
     return [pscustomobject]@{ DisplayNames = @($displayNames); Warnings = @($warnings) }
 }
 
+function Read-BRAVOOperationLockHolder {
+    # Метадані власника спільного operation-lock (Archive / Maintenance /
+    # DataRestore): JSON, який власник пише у файл lock-а (pid,
+    # processStartTime, hostname, operation, startedAt, generationId).
+    # Читання — best-effort peek: власник тримає файл з FileShare.Read, тож
+    # читається й поки lock зайнятий; у вузькому вікні між відкриттям і
+    # записом власника вміст порожній або ще старий. $null — прочитати не
+    # вдалося. Повертає { Operation; Pid; ProcessStartTime; HostName;
+    # StartedAt; GenerationId; Description } (Description — рядок для
+    # журналу очікування lock-а: «operation=...; pid=...; ...», '?' для
+    # відсутніх полів). Лише читає.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $peekStream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        try {
+            $peekReader = New-Object System.IO.StreamReader($peekStream, [System.Text.Encoding]::UTF8)
+            $peekText = $peekReader.ReadToEnd()
+        } finally {
+            $peekStream.Dispose()
+        }
+        if ([string]::IsNullOrWhiteSpace($peekText)) { return $null }
+        $holderInfo = $peekText | ConvertFrom-Json
+        $fieldValue = {
+            param([string]$FieldName)
+            $holderProperty = $holderInfo.PSObject.Properties[$FieldName]
+            if ($null -ne $holderProperty) { return $holderProperty.Value }
+            return $null
+        }
+        $holderFields = foreach ($holderField in @('operation', 'pid', 'hostname', 'startedAt', 'generationId')) {
+            $value = & $fieldValue $holderField
+            "$holderField=$(if ($null -ne $value) { $value } else { '?' })"
+        }
+        $holderPid = & $fieldValue 'pid'
+        if ($null -ne $holderPid) { $holderPid = $holderPid -as [int] }
+        return [pscustomobject]@{
+            Operation = [string](& $fieldValue 'operation')
+            Pid = $holderPid
+            ProcessStartTime = [string](& $fieldValue 'processStartTime')
+            HostName = [string](& $fieldValue 'hostname')
+            StartedAt = [string](& $fieldValue 'startedAt')
+            GenerationId = [string](& $fieldValue 'generationId')
+            Description = (@($holderFields) -join '; ')
+        }
+    } catch {
+        return $null
+    }
+}
+
 function Get-BRAVOServiceRecoveryTaskTriggerSpec {
     # Канонічні параметри задачі Планувальника BRAVO_SERVICE_RECOVERY (#314
     # FR-4; ТЗ §8 — константи в коді до cutover Config V2 #216). Задача

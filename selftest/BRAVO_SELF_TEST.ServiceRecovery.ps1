@@ -1196,6 +1196,8 @@ function Enter-BRAVOMaintenanceOperationLock {
     return [pscustomobject]@{ Success = $true; Stream = $null; Path = 'self-test-lock'; Error = $null }
 }
 function Exit-BRAVOMaintenanceOperationLock { Add-ProbeEvent 'LOCK-EXIT' }
+function Read-BRAVOOperationLockHolder { param([string]$Path) return $script:ProbeLockHolder }
+function Test-BRAVOProcessAlive { param([int]$ProcessId, [string]$ProcessStartTime) return [bool]$script:ProbeLockHolderAlive }
 function Write-BRAVOServiceQuiescenceState {
     param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
     if ($script:ProbeMarkerWriteFails) { Add-ProbeEvent 'MARKER-WRITE-FAIL'; throw 'self-test: імітований збій запису ownership-маркера' }
@@ -1226,7 +1228,7 @@ function Invoke-BRAVOWebApplicationLogRotation { param($SourceDirectory, $Destin
 function Get-BRAVOTraceConfiguration { param($DiscoveryResult, $TraceRootDirectory, $DateFolderName) return [pscustomobject]@{ IsValid = $true; TracePath = 'self-test-trace.log'; Reason = $null } }
 function Get-BRAVOInstallationTraceOutSources { param($InstallationRoot, $LimsRoot, $SrvTracePath, $ExplicitBisPath) return [pscustomobject]@{ Sources = @(); ScanRoot = 'self-test'; ScanRootReason = 'self-test' } }
 function Resolve-BRAVOExchangeApiRuntimeDirectory { param($ServiceName, $FallbackDirectory) return [pscustomobject]@{ Directory = 'self-test'; Reason = 'self-test' } }
-function Get-BRAVOWmiInstance { param($ClassName, $Filter) return [pscustomobject]@{ LastBootUpTime = (Get-Date).AddHours(-3) } }
+function Get-BRAVOWmiInstance { param($ClassName, $Filter) return [pscustomobject]@{ LastBootUpTime = (Get-Date).AddMinutes(-[int]$script:ProbeUptimeMinutes) } }
 function Get-WinEvent {
     param($FilterHashtable, $MaxEvents, $ErrorAction)
     Add-ProbeEvent 'SCM-READ'
@@ -1254,6 +1256,29 @@ $probeScenarios = [ordered]@{
         $script:ProbeSeedBravoDisabled = $true
     }
     'RSLockBusy' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true }
+    'RSLockBusyMaintenance' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true
+        $script:ProbeLockHolder = [pscustomobject]@{ Operation = 'Maintenance'; Pid = 4242; ProcessStartTime = 'self-test-start'; HostName = [Environment]::MachineName; StartedAt = ''; GenerationId = ''; Description = 'operation=Maintenance; pid=4242' }
+    }
+    'RSLockBusyArchive' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true
+        $script:ProbeLockHolder = [pscustomobject]@{ Operation = 'Archive'; Pid = 4242; ProcessStartTime = 'self-test-start'; HostName = [Environment]::MachineName; StartedAt = ''; GenerationId = ''; Description = 'operation=Archive; pid=4242' }
+    }
+    'RSLockBusyArchiveDead' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolderAlive = $false
+        $script:ProbeLockHolder = [pscustomobject]@{ Operation = 'Archive'; Pid = 4242; ProcessStartTime = 'self-test-start'; HostName = [Environment]::MachineName; StartedAt = ''; GenerationId = ''; Description = 'operation=Archive; pid=4242' }
+    }
+    'RSBootGrace' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 5 }
+    'RSOrphanOwnMarker' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeMarkerNames = @('exchangAPI')
+        $script:ProbeForeignContext = [pscustomobject]@{ Present = $true; OwnerAlive = $false; Owner = 'BRAVO_MAINTENANCE_RECOVER'; RestartSuppressed = $false; RestartIntentNames = @('exchangAPI'); HeldSnapshot = @() }
+    }
+    'RSOrphanForeignMarker' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeMarkerNames = @('exchangAPI')
+        $script:ProbeForeignContext = [pscustomobject]@{ Present = $true; OwnerAlive = $false; Owner = 'BRAVO_MAINTENANCE'; RestartSuppressed = $false; RestartIntentNames = @('exchangAPI'); HeldSnapshot = @() }
+    }
     'RSPauseNotElapsed' = {
         $script:ProbeServices['exchangAPI'] = 'Stopped'
         $script:ProbeStateSeed = ([ordered]@{ schemaVersion = 1; hostname = [Environment]::MachineName; services = [ordered]@{ exchangAPI = [ordered]@{ attempts = @($probeNow.AddMinutes(-1).ToString('o')); lastCriticalAt = $null; stableSince = $null } } } | ConvertTo-Json -Depth 6)
@@ -1322,6 +1347,9 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             $script:ProbeExchangeRotationErrors = 0
             $script:ProbeStrayProcesses = @('Bis')
             $script:ProbeLockBusy = $false
+            $script:ProbeLockHolder = $null
+            $script:ProbeLockHolderAlive = $true
+            $script:ProbeUptimeMinutes = 180
             $script:ProbeMarkerWriteFails = $false
             $script:ProbeScmReadFails = $false
             $script:ProbeScmEvents = @()
@@ -1529,10 +1557,47 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
         } 'ServiceRecovery/RecoverServicesPauseNotElapsed' `
             '#314 FR-3 крок 2 / FR-5: пауза для всіх впалих служб не минула — код 0 без lock-а і без змін, рядок INFO у BRAVO_MAINTENANCE_<дата>_RECOVER_PAUSE.log'
 
-        # ТЗ §6 п. 5: lock зайнятий — код 20, без змін і сповіщень, без журналу.
-        & $recoverCheck 'RSLockBusy' 20 @('LOCK-BUSY') '' $recoverOk `
-            'ServiceRecovery/RecoverServicesLockBusy' `
-            '#314 FR-3 крок 3 (ТЗ §6 п. 5): lock зайнятий — код 20, жодної зупинки чи запуску, без сповіщення і без файлу журналу'
+        # ТЗ §6 п. 5: lock зайнятий — код 20, без змін і сповіщень. Рев'ю PR
+        # #432 (B-P2-2) свідомо змінило очікування: рядок INFO з власником
+        # lock-а тепер пишеться в добовий RECOVER_PAUSE.log (раніше — лише
+        # консоль), окремого журналу прогону, як і раніше, немає.
+        $recoverPauseLogName = '^BRAVO_MAINTENANCE_\d{8}_RECOVER_PAUSE\.log$'
+        & $recoverCheck 'RSLockBusy' 20 @('LOCK-BUSY') $recoverPauseLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: операційний lock зайнятий (self-test-lock); тримає: невідомо; служби не змінювались')
+        } 'ServiceRecovery/RecoverServicesLockBusy' `
+            '#314 FR-3 крок 3 (ТЗ §6 п. 5): lock зайнятий, власник невідомий — код 20, жодної зупинки чи запуску, без сповіщення; рядок INFO у RECOVER_PAUSE.log'
+        & $recoverCheck 'RSLockBusyMaintenance' 20 @('LOCK-BUSY') $recoverPauseLogName {
+            param($Result) ([string]$Result.LogText).Contains('тримає: operation=Maintenance; pid=4242; служби не змінювались')
+        } 'ServiceRecovery/RecoverServicesLockBusyNamesHolder' `
+            "Рев'ю PR #432 (B-P2-2): lock тримає нічний Maintenance — код 20, без змін, у рядку INFO названо операцію власника"
+        & $recoverCheck 'RSLockBusyArchive' 0 @(
+            'LOCK-BUSY'; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered
+        ) $recoverLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Операційний lock (self-test-lock) тримає BRAVO_ARCHIV (operation=Archive; pid=4242): він служб не зупиняє — відновлення виконується без lock-а')
+        } 'ServiceRecovery/RecoverServicesUnderArchiveLock' `
+            "Рев'ю PR #432 (B-P2-2): lock тримає живий BRAVO_ARCHIV цього хоста — служба відновлюється без lock-а (маркер, state, FR-6), чужий lock не звільняється"
+        & $recoverCheck 'RSLockBusyArchiveDead' 20 @('LOCK-BUSY') $recoverPauseLogName $recoverOk `
+            'ServiceRecovery/RecoverServicesArchiveLockDeadHolderFailClosed' `
+            "Рев'ю PR #432 (B-P2-2): lock із записом Archive, але процес власника не живий — fail-closed, код 20 без змін"
+        # Рев'ю PR #432 (A-P3-4 / B-P3-3): перші 9 хв після старту ОС служби
+        # піднімає boot-тригер — профіль нічого не змінює, код 0.
+        & $recoverCheck 'RSBootGrace' 0 @() $recoverPauseLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: ОС працює менше 9 хв')
+        } 'ServiceRecovery/RecoverServicesBootGrace' `
+            "Рев'ю PR #432 (A-P3-4): ОС працює 5 хв — профіль без lock-а і без змін виходить з кодом 0, рядок INFO у RECOVER_PAUSE.log"
+        # Рев'ю PR #432 (B-P3-1): осиротілий маркер власного профілю переймається.
+        & $recoverCheck 'RSOrphanOwnMarker' 0 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Перейнято ownership-маркер аварійно перерваного прогону BRAVO_MAINTENANCE_RECOVER: служби exchangAPI')
+        } 'ServiceRecovery/RecoverServicesTakesOverOwnOrphanedMarker' `
+            "Рев'ю PR #432 (B-P3-1): маркер BRAVO_MAINTENANCE_RECOVER мертвого процесу (без restartSuppressed і знімка) — служба знову впала, профіль її піднімає"
+        & $recoverCheck 'RSOrphanForeignMarker' 0 @() '' {
+            param($Result) @($Result.Events) -contains 'HOST Відновлення служб: впалих керованих служб немає'
+        } 'ServiceRecovery/RecoverServicesLeavesForeignOrphanedMarker' `
+            "Рев'ю PR #432 (B-P3-1): маркер мертвого нічного Maintenance не переймається — службою займається Health-watchdog"
 
         # ТЗ §6 п. 6: restartSuppressed чужого маркера і гейт цілісності моделі.
         & $recoverCheck 'RSSuppressedMarker' 10 @($recoverLock; 'LOCK-EXIT') $recoverLogName {
@@ -2256,4 +2321,67 @@ function Start-ScheduledTask { param($InputObject, $ErrorAction) [void]$script:s
         ) `
         -Name 'ServiceRecovery/HealthNeverStartsFailedServiceDirectly' `
         -Failure '#314 FR-7: Get-ManagedServiceHealthIssues не запускає служби (Start-Service лише у watchdog осиротілого маркера), а для впалої служби викликає Invoke-BRAVOHealthServiceRecoveryTask — єдине місце запуску задачі (Start-BRAVOScheduledTask)'
+}
+
+# ============================================================
+# Рев'ю PR #432 (B-P2-2): власника operation-lock читає канонічний
+# Read-BRAVOOperationLockHolder (BRAVO.System) — і гілка очікування
+# Enter-BRAVOMaintenanceOperationLock, і профіль -RecoverServices.
+& {
+    $holderSystemText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8)
+    $holderRoot = Join-Path ([IO.Path]::GetTempPath()) ('bravo-selftest-lockholder-' + [guid]::NewGuid().ToString('N'))
+    $holderResult = $null
+    $holderError = ''
+    try {
+        [void][IO.Directory]::CreateDirectory($holderRoot)
+        $holderLockPath = Join-Path $holderRoot 'operation.lock'
+        $holderPartialPath = Join-Path $holderRoot 'partial.lock'
+        $holderEmptyPath = Join-Path $holderRoot 'empty.lock'
+        [IO.File]::WriteAllText($holderLockPath, '{"pid":4242,"processStartTime":"self-test-start","hostname":"host-a","operation":"Archive","startedAt":"self-test-at","generationId":"self-test-gen"}', (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($holderPartialPath, '{"operation":"Maintenance"}', (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($holderEmptyPath, '', (New-Object Text.UTF8Encoding($false)))
+        $holderModule = New-BRAVOSelfTestRuntimeModule -SourceText $holderSystemText -FunctionNames @('Read-BRAVOOperationLockHolder')
+        $holderResult = & $holderModule {
+            param([string]$Full, [string]$Partial, [string]$Empty, [string]$Missing)
+            Set-StrictMode -Version 2.0
+            [pscustomobject]@{
+                Full = Read-BRAVOOperationLockHolder -Path $Full
+                Partial = Read-BRAVOOperationLockHolder -Path $Partial
+                Empty = Read-BRAVOOperationLockHolder -Path $Empty
+                Missing = Read-BRAVOOperationLockHolder -Path $Missing
+            }
+        } $holderLockPath $holderPartialPath $holderEmptyPath (Join-Path $holderRoot 'missing.lock')
+    } catch {
+        $holderError = $_.Exception.Message
+    } finally {
+        if (Test-Path -LiteralPath $holderRoot -PathType Container) { Remove-Item -LiteralPath $holderRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $holderResult -and $null -ne $holderResult.Full -and
+            [string]$holderResult.Full.Operation -ceq 'Archive' -and [int]$holderResult.Full.Pid -eq 4242 -and
+            [string]$holderResult.Full.ProcessStartTime -ceq 'self-test-start' -and [string]$holderResult.Full.HostName -ceq 'host-a' -and
+            [string]$holderResult.Full.Description -ceq 'operation=Archive; pid=4242; hostname=host-a; startedAt=self-test-at; generationId=self-test-gen' -and
+            $null -ne $holderResult.Partial -and [string]$holderResult.Partial.Description -ceq 'operation=Maintenance; pid=?; hostname=?; startedAt=?; generationId=?' -and
+            $null -eq $holderResult.Partial.Pid -and
+            $null -eq $holderResult.Empty -and $null -eq $holderResult.Missing
+        ) `
+        -Name 'ServiceRecovery/OperationLockHolderReadable' `
+        -Failure "Рев'ю PR #432 (B-P2-2): Read-BRAVOOperationLockHolder повертає поля власника lock-а й опис для журналу ('?' для відсутніх), а порожній чи відсутній файл — `$null. Помилка: '$holderError'; результат: $(if ($null -ne $holderResult) { $holderResult | ConvertTo-Json -Compress -Depth 3 })"
+
+    # Статично: peek власника не дублюється — гілка очікування Maintenance і
+    # профіль -RecoverServices викликають канонічну функцію.
+    $holderRuntimeText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $holderRecoverText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.RecoverServices.ps1'), [Text.Encoding]::UTF8)
+    $holderLockStart = $holderRuntimeText.IndexOf('function Enter-BRAVOMaintenanceOperationLock')
+    $holderLockEnd = if ($holderLockStart -ge 0) { $holderRuntimeText.IndexOf("`nfunction ", $holderLockStart + 10) } else { -1 }
+    $holderLockText = if ($holderLockStart -ge 0 -and $holderLockEnd -gt $holderLockStart) { $holderRuntimeText.Substring($holderLockStart, $holderLockEnd - $holderLockStart) } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $holderLockText.Contains('Read-BRAVOOperationLockHolder -Path $lockPath') -and
+            -not $holderLockText.Contains('$peekStream') -and
+            $holderRecoverText.Contains('Read-BRAVOOperationLockHolder -Path')
+        ) `
+        -Name 'ServiceRecovery/OperationLockHolderSingleImplementation' `
+        -Failure "Рев'ю PR #432 (B-P2-2): власника lock-а читає лише Read-BRAVOOperationLockHolder — його викликають Enter-BRAVOMaintenanceOperationLock (гілка очікування) і профіль -RecoverServices; власного peek у runtime немає"
 }

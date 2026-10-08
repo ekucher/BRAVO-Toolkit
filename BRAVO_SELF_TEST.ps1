@@ -26803,9 +26803,12 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
         $lockLogRuns = @{}
         try {
             [void](New-Item -ItemType Directory -Path $lockLogRoot -Force -ErrorAction Stop)
+            # Рев'ю PR #432 (B-P2-2): peek власника — канонічний
+            # Read-BRAVOOperationLockHolder (BRAVO.System), тож він входить у модуль тесту.
+            $lockLogSystemText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [Text.Encoding]::UTF8)
             $lockLogModule = New-BRAVOSelfTestRuntimeModule `
-                -SourceText ($lockLogStubs + "`n" + $maintenanceScriptText) `
-                -FunctionNames @('Start-Sleep', 'Write-Log', 'Set-LockLogHolder', 'Enter-BRAVOMaintenanceOperationLock')
+                -SourceText ($lockLogStubs + "`n" + $maintenanceScriptText + "`n" + $lockLogSystemText) `
+                -FunctionNames @('Start-Sleep', 'Write-Log', 'Set-LockLogHolder', 'Enter-BRAVOMaintenanceOperationLock', 'Read-BRAVOOperationLockHolder')
             foreach ($lockLogCase in @('Readable', 'Unreadable', 'PartialJson')) {
                 $lockLogPath = Join-Path $lockLogRoot "BRAVO_OPERATION_$lockLogCase.lock"
                 # Readable/PartialJson: holder тримає FileShare.Read (як справжній lock) —

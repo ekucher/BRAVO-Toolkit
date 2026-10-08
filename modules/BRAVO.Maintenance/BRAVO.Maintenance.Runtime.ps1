@@ -1260,32 +1260,11 @@ function Enter-BRAVOMaintenanceOperationLock {
                         # лишається, і тоді просто немає що показати — це не
                         # привід перетворити діагностичний peek на ще одну
                         # причину провалити захоплення lock.
+                        # Peek — канонічний Read-BRAVOOperationLockHolder (BRAVO.System);
+                        # $null (гонка з holder-ом) лишає дефолтний опис.
                         $holderDescription = "невідомо (lock ще не опубліковано або читання наразі неможливе)"
-                        try {
-                            $peekStream = [System.IO.File]::Open(
-                                $lockPath,
-                                [System.IO.FileMode]::Open,
-                                [System.IO.FileAccess]::Read,
-                                [System.IO.FileShare]::ReadWrite
-                            )
-                            try {
-                                $peekReader = New-Object System.IO.StreamReader($peekStream, [System.Text.Encoding]::UTF8)
-                                $peekText = $peekReader.ReadToEnd()
-                            } finally {
-                                $peekStream.Dispose()
-                            }
-                            if (-not [string]::IsNullOrWhiteSpace($peekText)) {
-                                $holderInfo = $peekText | ConvertFrom-Json
-                                $holderFields = foreach ($holderField in @('operation', 'pid', 'hostname', 'startedAt', 'generationId')) {
-                                    $holderProperty = $holderInfo.PSObject.Properties[$holderField]
-                                    "$holderField=$(if ($null -ne $holderProperty) { $holderProperty.Value } else { '?' })"
-                                }
-                                $holderDescription = @($holderFields) -join '; '
-                            }
-                        } catch {
-                            # Peek не вдався (гонка з holder-ом, тимчасова
-                            # недоступність) — лишаємо дефолтний опис вище.
-                        }
+                        $holderInfo = Read-BRAVOOperationLockHolder -Path $lockPath
+                        if ($null -ne $holderInfo) { $holderDescription = [string]$holderInfo.Description }
                         Write-Log "Очікую звільнення операційного lock ($lockPath); тримає: $holderDescription; максимум очікування $waitMinutes хв.$waitLimitDescription" -Level "INFO"
                     }
                     Start-Sleep -Seconds 30
