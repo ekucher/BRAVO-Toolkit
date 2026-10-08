@@ -1857,23 +1857,27 @@ function Invoke-BRAVOMaintenanceServiceRecoveryProfile {
         }
         Write-Host "УВАГА: відновлення служб: $unknownText" -ForegroundColor Yellow
     }
+    # Стабільність кожної працюючої служби обліковується незалежно від того,
+    # чи лежить інша (рев'ю PR #429): перше спостереження Running ставить
+    # stableSince, 30 хв Running — облік служби скидається. Єдиний запис на
+    # диск до lock-а — state, і лише коли спостереження його змінило.
+    $recoveryStateChanged = $false
+    foreach ($recoveryCondition in $recoveryConditions) {
+        if ([string]$recoveryCondition.Condition -ne 'Running') { continue }
+        $stableObservation = Register-BRAVOServiceRecoveryStableObservation -State $recoveryState -ServiceName ([string]$recoveryCondition.Name) -Now $recoveryNow
+        if ([bool]$stableObservation.Changed) {
+            $recoveryState = $stableObservation.State
+            $recoveryStateChanged = $true
+        }
+    }
+    if ($recoveryStateChanged) {
+        try {
+            Write-BRAVOServiceRecoveryState -State $recoveryState -Now $recoveryNow
+        } catch {
+            Write-Host "УВАГА: не вдалося записати state відновлення служб: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
     if ($failedConditions.Count -eq 0) {
-        $recoveryStateChanged = $false
-        foreach ($recoveryCondition in $recoveryConditions) {
-            if ([string]$recoveryCondition.Condition -ne 'Running') { continue }
-            $stableObservation = Register-BRAVOServiceRecoveryStableObservation -State $recoveryState -ServiceName ([string]$recoveryCondition.Name) -Now $recoveryNow
-            if ([bool]$stableObservation.Changed) {
-                $recoveryState = $stableObservation.State
-                $recoveryStateChanged = $true
-            }
-        }
-        if ($recoveryStateChanged) {
-            try {
-                Write-BRAVOServiceRecoveryState -State $recoveryState -Now $recoveryNow
-            } catch {
-                Write-Host "УВАГА: не вдалося записати state відновлення служб: $($_.Exception.Message)" -ForegroundColor Yellow
-            }
-        }
         Write-Host "Відновлення служб: впалих керованих служб немає — дій не потрібно"
         return 0
     }
