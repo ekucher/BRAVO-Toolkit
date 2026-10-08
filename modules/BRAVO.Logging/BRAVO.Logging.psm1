@@ -101,10 +101,11 @@ function Protect-BRAVOLogSecret {
         # будується детерміновано, а не через ConvertTo-Json, бо хости
         # екранують по-різному: обидва варіанти екранують " \ і керівні
         # символи (\b \f \n \r \t, решта < 0x20 — \u з 4 hex у нижньому
-        # регістрі). Строгий варіант (PowerShell 7, Newtonsoft.Json)
-        # додатково екранує U+0085, U+2028 і U+2029 (#435), HTML-безпечний
-        # (Windows PowerShell 5.1, JavaScriptSerializer) — & ' < >; тому
-        # маскуються обидві форми. Base64 свідомо
+        # регістрі), а також U+0085, U+2028 і U+2029 (#435). Строгий
+        # варіант (PowerShell 7, Newtonsoft.Json) іншого не екранує,
+        # HTML-безпечний (Windows PowerShell 5.1, JavaScriptSerializer ->
+        # HttpEncoder.JavaScriptStringEncode) додатково екранує & ' < >;
+        # тому маскуються обидві форми. Base64 свідомо
         # не додається: його підрядки залежать від вирівнювання і не
         # впізнаються надійно. Виняток кодування не перехоплюється — він
         # іде до викликача (New-BRAVOMaskedLogCopy -> нічого не
@@ -125,7 +126,7 @@ function Protect-BRAVOLogSecret {
                     elseif ($secretCharCode -eq 13) { [void]$jsonBuilder.Append('\r') }
                     elseif ($secretCharCode -eq 9) { [void]$jsonBuilder.Append('\t') }
                     elseif ($secretCharCode -lt 32 -or
-                        (-not $jsonEscapeHtmlChars -and ($secretCharCode -eq 0x0085 -or $secretCharCode -eq 0x2028 -or $secretCharCode -eq 0x2029)) -or
+                        $secretCharCode -eq 0x0085 -or $secretCharCode -eq 0x2028 -or $secretCharCode -eq 0x2029 -or
                         ($jsonEscapeHtmlChars -and ($secretCharCode -eq 38 -or $secretCharCode -eq 39 -or $secretCharCode -eq 60 -or $secretCharCode -eq 62))) {
                         [void]$jsonBuilder.Append([string][char]92 + 'u' + $secretCharCode.ToString('x4'))
                     } else { [void]$jsonBuilder.Append($secretChar) }
