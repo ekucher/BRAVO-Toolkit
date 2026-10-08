@@ -1336,7 +1336,8 @@ $probeScenarios = [ordered]@{
     }
     'RSBootGrace' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 5 }
     'RSBootHoldDelay' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 25; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 30; $script:ProbeRestorePending = $false }
-    'RSBootHoldPendingRestore' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 30; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 7; $script:ProbeRestorePending = $true }
+    'RSBootHoldPendingRestore' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 600; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 7; $script:ProbeRestorePending = $true }
+    'RSBootHoldRestoreStateUnknown' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 600; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 7 }
     'RSBootHoldBootTimeUnknown' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeBootTimeUnreadable = $true; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 7; $script:ProbeRestorePending = $false }
     'RSBootHoldElapsed' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeUptimeMinutes = 180; $script:ProbeBootRestoreMode = 'HoldServices'; $script:ProbeStartupDelay = 7; $script:ProbeRestorePending = $false }
     'RSBootTimeUnknownNoHold' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeBootTimeUnreadable = $true }
@@ -1726,10 +1727,18 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: ОС працює менше 40 хв (профіль HoldServices: затримка boot-тригера Recovery 30 хв + запас 10 хв)')
         } 'ServiceRecovery/RecoverServicesBootGraceFollowsHoldServicesDelay' `
             "Рев'ю PR #432 (Codex P1): HoldServices із затримкою boot-тригера 30 хв, ОС працює 25 хв — профіль не випереджає boot-реставрацію: код 0 без змін, вікно 30 + 10 хв"
+        # Рев'ю PR #432 (Codex, раунд 2, P1): поки пропущена реставрація на
+        # HoldServices чекає, гейт закритий без обмеження часу (не затримка +
+        # 60 хв); невідомий стан реставрації — так само (fail-closed).
         & $recoverCheck 'RSBootHoldPendingRestore' 0 @() $recoverPauseLogName {
-            param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: ОС працює менше 67 хв (профіль HoldServices: затримка boot-тригера Recovery 7 хв + запас 60 хв, пропущена реставрація ще чекає)')
-        } 'ServiceRecovery/RecoverServicesBootGraceExtendedWhileRestorePending' `
-            "Рев'ю PR #432 (Codex P1): HoldServices і пропущена реставрація ще чекає — вікно довше (затримка + 60 хв), ОС працює 30 хв — код 0 без змін"
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: очікується пропущена реставрація (профіль HoldServices') -and
+                -not ([string]$Result.LogText).Contains('ОС працює менше')
+        } 'ServiceRecovery/RecoverServicesHoldServicesGateClosedWhileRestorePending' `
+            "Рев'ю PR #432 (Codex, раунд 2, P1): HoldServices і пропущена реставрація ще чекає — ОС працює 10 год, але гейт закритий без обмеження часу: код 0 без змін, INFO «очікується пропущена реставрація»"
+        & $recoverCheck 'RSBootHoldRestoreStateUnknown' 0 @() $recoverPauseLogName {
+            param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: очікується пропущена реставрація (профіль HoldServices')
+        } 'ServiceRecovery/RecoverServicesHoldServicesUnknownRestoreStateGateClosed' `
+            "Рев'ю PR #432 (Codex, раунд 2, P1): HoldServices, стан реставрації невідомий — трактується як «чекає»: гейт закритий, код 0 без змін"
         & $recoverCheck 'RSBootHoldBootTimeUnknown' 0 @() $recoverPauseLogName {
             param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: час старту ОС не визначено (профіль HoldServices')
         } 'ServiceRecovery/RecoverServicesHoldServicesUnknownBootTimeFailClosed' `
