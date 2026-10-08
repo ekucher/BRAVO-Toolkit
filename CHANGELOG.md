@@ -2,6 +2,23 @@
 
 ## Не випущено (developer)
 
+- **Нове: задача Планувальника `BRAVO_SERVICE_RECOVERY` і запуск відновлення з Health (#314, хвиля 5).**
+  `BRAVO_TASKS_INSTALL.ps1` ставить (завжди, коли увімкнено Maintenance) задачу `BRAVO_SERVICE_RECOVERY` під SYSTEM:
+  `BRAVO_MAINTENANCE.ps1 -RecoverServices -NoPause` за трьома тригерами — подія System log від Service Control Manager
+  (7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034) із затримкою 1 хв, старт ОС із затримкою 10 хв і щоденний тригер
+  з повтором кожні 15 хв протягом доби; `MultipleInstances=IgnoreNew`, `ExecutionTimeLimit=1 год`,
+  `StartWhenAvailable=false`. `BRAVO_TASKS_DIAGNOSE.ps1` перевіряє дію і всі три тригери (відсутній або змінений
+  тригер — FAIL), `BRAVO_TASKS_UNINSTALL.ps1` її видаляє. Інсталятор пише в журнал тип запуску й стан усіх трьох
+  керованих служб, включно з BRAVO Web. Похідний вузол `schedulerSettings.ServiceRecovery` (як BackupCatchUp, без
+  нових ключів конфігурації). **Зміна поведінки Health:** впалу службу `BRAVO_HEALTH` більше не лишає лише на alert —
+  він стартує задачу `BRAVO_SERVICE_RECOVERY` (один раз за перевірку), а не саму службу; issue лишається з дією
+  «служба X не працює; запущено автоматичне відновлення, перевірте журнал …». Відсутня або вимкнена задача — окремий
+  issue «задача відновлення служб відсутня — виконайте BRAVO_TASKS_INSTALL». Watchdog ownership-маркера і поведінка
+  для `Disabled` не змінились. Нові хелпери: `Start-BRAVOScheduledTask` (BRAVO.Compatibility; ScheduledTasks або COM
+  на Windows 7), `Initialize-/Test-BRAVOServiceRecoveryTaskDefinition`, `Get-BRAVOManagedServiceStartModeSummary`
+  (BRAVO.System). Після оновлення комплекту виконайте `BRAVO_TASKS_INSTALL.ps1`. Опис для підтримки — OPERATIONS.md,
+  розділ «Служби BRAVO: автоматичне відновлення».
+
 - **Нове: профіль `BRAVO_MAINTENANCE.ps1 -RecoverServices` — відновлення впалих служб BRAVO (#314, хвиля 4).**
   Профіль лише піднімає впалі служби: без реставрації, перевірки розмірів, очистки, міграції журналів, trace-архіву/SFTP,
   BRAVO_ARCHIV і автовимкнення. Якщо впалих служб немає — миттєвий вихід з кодом 0 без lock-а, файлу журналу й сповіщень.
@@ -18,7 +35,7 @@
   `restartSuppressed` чи під чинним маркером іншого власника служби не запускаються. `-RecoverServices` разом з
   `-ForceRestore` або `-RunMissedRestoreOnly` — код 30. Коди завершення 0 / 10 / 20 / 30 / 60, нових немає.
   `Enter-BRAVOMaintenanceOperationLock` отримав `-NoWait`; Health і `Repair-BRAVOOrphanedServiceStartTypes` визнають
-  власника `BRAVO_MAINTENANCE_RECOVER`. Задачу Планувальника для профілю додасть хвиля 5. Код:
+  власника `BRAVO_MAINTENANCE_RECOVER`. Задача Планувальника для профілю — `BRAVO_SERVICE_RECOVERY` (хвиля 5). Код:
   `modules\BRAVO.Maintenance\BRAVO.Maintenance.RecoverServices.ps1`.
 
 - **Зміна поведінки: нічний Maintenance запускає зупинені служби BRAVO (#314, хвиля 3).**
