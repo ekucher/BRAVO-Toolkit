@@ -1425,7 +1425,7 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             $script:ProbeLockHolderReads = 0
             $script:ProbeLockHolderRecheck = $null
             $script:ProbeArchiveHolder = [pscustomobject]@{ Operation = 'Archive'; Pid = 4242; ProcessStartTime = 'self-test-start'; HostName = [Environment]::MachineName; StartedAt = 'self-test-started'; GenerationId = ''; Description = 'operation=Archive; pid=4242' }
-            $script:ProbeProcesses = @([pscustomobject]@{ ProcessId = 4242; CommandLine = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\BRAVO\BRAVO_ARCHIV.ps1" -NoPause' })
+            $script:ProbeProcesses = @([pscustomobject]@{ ProcessId = 4242; CommandLine = 'powershell.exe -NoProfile -File "C:\BRAVO\BRAVO_ARCHIV.ps1" -NoPause' })
             $script:ProbeProcessQueryFails = $false
             $script:ProbeMarkerState = $null
             $script:ProbeMarkerOwned = $true
