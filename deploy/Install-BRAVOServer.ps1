@@ -108,17 +108,49 @@ function Write-Bad  { param([string]$T) Write-Host ('  [FAIL]  ' + $T) -Foregrou
 function Write-Note { param([string]$T) Write-Host ('  [..]    ' + $T) }
 function Write-Warn2{ param([string]$T) Write-Host ('  [УВАГА] ' + $T) -ForegroundColor Yellow }
 
-# Модулі, без яких явний -BackupDestination не можна ні застосувати, ні
-# перевірити (#434). Крок 1 звіряє їх у staged-комплекті лише через
-# Test-Path, без імпорту.
-function Get-BRAVOInstallBackupDestinationModulePaths {
-    return @(
-        'modules\BRAVO.Configurator\BRAVO.Configurator.Effective.psm1',
-        'modules\BRAVO.Configurator\BRAVO.Configurator.Persistence.psm1',
-        'modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1',
-        'modules\BRAVO.Configuration\BRAVO.Configuration.psd1',
-        'modules\BRAVO.Discovery\BRAVO.Discovery.psd1'
-    )
+# Можливості комплекту, без яких профіль напрямків (#434) не можна ні
+# застосувати, ні перевірити: файли модулів і визначення потрібних функцій.
+# Перевірка БЕЗ імпорту й виконання коду комплекту: файли лише розбираються
+# парсером PowerShell (AST). Знімок developer має файли BRAVO.Configurator,
+# але не має цих функцій, тож одного Test-Path недостатньо (P3-1). Повертає
+# перелік відсутнього; порожній перелік = комплект підтримує профіль. Одна
+# перевірка і для явного профілю в кроці 1 ($staged), і для вибору між
+# канонічним seed і копією прикладу в кроці 4 (розгорнутий каталог).
+function Get-BRAVOInstallBackupDestinationMissingCapabilities {
+    param([Parameter(Mandatory = $true)][string]$ModuleRoot)
+    $requiredModules = [ordered]@{
+        'modules\BRAVO.Configurator\BRAVO.Configurator.Effective.psm1'   = @()
+        'modules\BRAVO.Configurator\BRAVO.Configurator.Persistence.psm1' = @('Get-BRAVOConfiguratorProductionOverrideState', 'New-BRAVOConfiguratorSeedLocalConfig')
+        'modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1'     = @('Get-BRAVOConfiguratorBackupDestinationProfile', 'Test-BRAVOConfiguratorBackupDestinationEffective')
+        'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'           = @()
+        'modules\BRAVO.Discovery\BRAVO.Discovery.psd1'                   = @()
+    }
+    $missing = @()
+    foreach ($relativePath in @($requiredModules.Keys)) {
+        $modulePath = Join-Path $ModuleRoot $relativePath
+        if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
+            $missing += $relativePath
+            continue
+        }
+        $requiredFunctions = @($requiredModules[$relativePath])
+        if ($requiredFunctions.Count -eq 0) { continue }
+        $parseTokens = $null
+        $parseErrors = $null
+        $moduleAst = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$parseTokens, [ref]$parseErrors)
+        if (@($parseErrors).Count -gt 0) {
+            $missing += ($relativePath + ' (не розібрано)')
+            continue
+        }
+        $definedFunctions = @($moduleAst.FindAll({
+            param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true) | ForEach-Object { $_.Name })
+        foreach ($functionName in $requiredFunctions) {
+            if ($definedFunctions -notcontains $functionName) {
+                $missing += ($relativePath + ': ' + $functionName)
+            }
+        }
+    }
+    return @($missing)
 }
 
 # Явний профіль (#434): рішення за ЕФЕКТИВНИМИ значеннями, а не за текстом
@@ -452,12 +484,10 @@ Write-Ok 'обов''язкові файли комплекту на місці'
 # Неявний профіль (без -BackupDestination) цих перевірок не має: комплекти
 # без BRAVO.Configurator встановлюються, як раніше.
 if ($PSBoundParameters.ContainsKey('BackupDestination')) {
-    $stagedMissingModules = @(Get-BRAVOInstallBackupDestinationModulePaths | Where-Object {
-        -not (Test-Path -LiteralPath (Join-Path $staged $_) -PathType Leaf)
-    })
-    if ($stagedMissingModules.Count -gt 0) {
+    $stagedMissingCapabilities = @(Get-BRAVOInstallBackupDestinationMissingCapabilities -ModuleRoot $staged)
+    if ($stagedMissingCapabilities.Count -gt 0) {
         throw ('Комплект ' + $targetVersion + ' не підтримує -BackupDestination ' + $BackupDestination +
-            ': бракує модулів BRAVO.Configurator/конфігурації (' + ($stagedMissingModules -join ', ') +
+            ': бракує модулів чи функцій BRAVO.Configurator/конфігурації (' + ($stagedMissingCapabilities -join ', ') +
             '). Нічого не розгорнуто. Вкажіть -Tag або -ZipPath комплекту, що містить BRAVO.Configurator, ' +
             'або запустіть без -BackupDestination (напрямки потім задає BRAVO_CONFIGURATOR.ps1).')
     }
@@ -552,34 +582,39 @@ if (Test-Path -LiteralPath $localConfig -PathType Leaf) {
     $backupDestinationSkippedExisting = $SeedLocalConfig -and -not $backupDestinationExplicit
 } elseif ($SeedLocalConfig) {
     if (-not $backupDestinationExplicit -and
-        -not (Test-Path -LiteralPath (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Presets.psm1') -PathType Leaf)) {
-    # Комплект без BRAVO.Configurator (старші релізи) і неявний профіль:
-    # зворотно сумісна поведінка developer — копія прикладу. Явний профіль
-    # сюди не потрапляє: такий комплект відхилено в кроці 1.
-    Copy-Item -LiteralPath $localExample -Destination $localConfig
-    Write-Ok ('створено з прикладу: ' + $localConfig)
+        @(Get-BRAVOInstallBackupDestinationMissingCapabilities -ModuleRoot $RuntimeRoot).Count -gt 0) {
+        # Комплект без можливостей профілю напрямків (старші релізи або знімок
+        # developer) і неявний профіль: зворотно сумісна поведінка developer —
+        # копія прикладу. Явний профіль сюди не потрапляє: такий комплект
+        # відхилено в кроці 1 тією самою перевіркою.
+        if (-not (Test-Path -LiteralPath $localExample -PathType Leaf)) {
+            throw ('Немає прикладу ' + $localExample)
+        }
+        Copy-Item -LiteralPath $localExample -Destination $localConfig
+        Write-Ok ('створено з прикладу: ' + $localConfig)
+        Write-Warn2 'усі ключі в ньому закоментовані — внесіть site-відмінності ДО BRAVO_SETUP.'
     } else {
-    # Новий файл пише канонічний код Configurator (той самий серіалізатор і
-    # перевірка повторним читанням, що й Apply) — інсталятор не має власного
-    # запису чи парсера BRAVO.local.config.
-    foreach ($configuratorModuleName in @('BRAVO.Configurator.Effective', 'BRAVO.Configurator.Persistence', 'BRAVO.Configurator.Presets')) {
-        Import-Module -Name (Join-Path $configuratorModuleRoot ($configuratorModuleName + '.psm1')) -Force -ErrorAction Stop
-    }
-    $destinationProfile = Get-BRAVOConfiguratorBackupDestinationProfile -Destination $BackupDestination
-    $seedResult = New-BRAVOConfiguratorSeedLocalConfig -RuntimeRoot $RuntimeRoot `
-        -ConfigDirectory $RuntimeRoot -Overrides $destinationProfile.Overrides
-    if (-not $seedResult.Created) {
-        throw ('BRAVO.local.config не створено (' + $seedResult.Stage + '): ' + (@($seedResult.Reasons) -join ' '))
-    }
-    Write-Ok ('створено: ' + $localConfig)
-    Write-Ok ('профіль напрямків: ' + $BackupDestination + ' — ' + $destinationProfile.Label)
-    foreach ($appliedPath in @($seedResult.AppliedPaths)) {
-        Write-Note ($appliedPath + ' = ' + [string]$destinationProfile.Overrides[$appliedPath])
-    }
-    if ([bool]$destinationProfile.Overrides['componentSettings.SMB.ArchiveCopy']) {
-        Write-Warn2 'для Samba задайте smbSettings.RootPath (UNC \\сервер\ресурс) у BRAVO.local.config ДО BRAVO_SETUP.'
-    }
-    Write-Note ('інші site-відмінності — за каталогом ключів ' + $localExample)
+        # Новий файл пише канонічний код Configurator (той самий серіалізатор і
+        # перевірка повторним читанням, що й Apply) — інсталятор не має власного
+        # запису чи парсера BRAVO.local.config.
+        foreach ($configuratorModuleName in @('BRAVO.Configurator.Effective', 'BRAVO.Configurator.Persistence', 'BRAVO.Configurator.Presets')) {
+            Import-Module -Name (Join-Path $configuratorModuleRoot ($configuratorModuleName + '.psm1')) -Force -ErrorAction Stop
+        }
+        $destinationProfile = Get-BRAVOConfiguratorBackupDestinationProfile -Destination $BackupDestination
+        $seedResult = New-BRAVOConfiguratorSeedLocalConfig -RuntimeRoot $RuntimeRoot `
+            -ConfigDirectory $RuntimeRoot -Overrides $destinationProfile.Overrides
+        if (-not $seedResult.Created) {
+            throw ('BRAVO.local.config не створено (' + $seedResult.Stage + '): ' + (@($seedResult.Reasons) -join ' '))
+        }
+        Write-Ok ('створено: ' + $localConfig)
+        Write-Ok ('профіль напрямків: ' + $BackupDestination + ' — ' + $destinationProfile.Label)
+        foreach ($appliedPath in @($seedResult.AppliedPaths)) {
+            Write-Note ($appliedPath + ' = ' + [string]$destinationProfile.Overrides[$appliedPath])
+        }
+        if ([bool]$destinationProfile.Overrides['componentSettings.SMB.ArchiveCopy']) {
+            Write-Warn2 'для Samba задайте smbSettings.RootPath (UNC \\сервер\ресурс) у BRAVO.local.config ДО BRAVO_SETUP.'
+        }
+        Write-Note ('інші site-відмінності — за каталогом ключів ' + $localExample)
     }
 } else {
     Write-Note ('не створено (додайте -SeedLocalConfig або скопіюйте вручну з ' +

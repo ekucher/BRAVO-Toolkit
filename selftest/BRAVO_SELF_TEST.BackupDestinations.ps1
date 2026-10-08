@@ -751,7 +751,7 @@ Test-BRAVOCondition -Condition (
         # --- Фейковий комплект: zip + .sha256 поруч, без release-manifest.json ---
         function New-BRAVOSelfTestInstallBundle {
             param([string]$Name, [string[]]$ModuleDirectories, [string]$SourceCommit = ('a1b2c3d4' * 5),
-                [switch]$MarkImports, [switch]$CorruptChecksum)
+                [switch]$MarkImports, [switch]$CorruptChecksum, [string[]]$StripFunctions = @())
             $bundleDir = Join-Path $bdE2eRoot ('bundle_' + $Name)
             [void](New-Item -ItemType Directory -Path (Join-Path $bundleDir 'modules') -Force)
             [void](New-Item -ItemType Directory -Path (Join-Path $bundleDir 'Tools') -Force)
@@ -769,6 +769,22 @@ Test-BRAVOCondition -Condition (
             Copy-Item -LiteralPath (Join-Path $root 'BRAVO.local.config.example') -Destination $bundleDir -Force
             foreach ($moduleDirectory in @($ModuleDirectories)) {
                 Copy-Item -LiteralPath (Join-Path $root ('modules\' + $moduleDirectory)) -Destination (Join-Path $bundleDir 'modules') -Recurse -Force
+            }
+            if (@($StripFunctions).Count -gt 0) {
+                # Форма знімка developer: файли BRAVO.Configurator є, а функцій
+                # профілю напрямків у них немає (визначення вирізано за AST).
+                foreach ($moduleFile in @(Get-ChildItem -LiteralPath (Join-Path $bundleDir 'modules\BRAVO.Configurator') -Filter '*.psm1')) {
+                    $moduleText = [IO.File]::ReadAllText($moduleFile.FullName, [Text.Encoding]::UTF8)
+                    $moduleTokens = $null; $moduleErrors = $null
+                    $moduleAst = [Management.Automation.Language.Parser]::ParseInput($moduleText, [ref]$moduleTokens, [ref]$moduleErrors)
+                    $stripNodes = @($moduleAst.FindAll({ param($node)
+                        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and @($StripFunctions) -contains $node.Name }, $false) |
+                        Sort-Object { $_.Extent.StartOffset } -Descending)
+                    foreach ($stripNode in $stripNodes) {
+                        $moduleText = $moduleText.Remove($stripNode.Extent.StartOffset, $stripNode.Extent.EndOffset - $stripNode.Extent.StartOffset)
+                    }
+                    if ($stripNodes.Count -gt 0) { [IO.File]::WriteAllText($moduleFile.FullName, $moduleText, $utf8) }
+                }
             }
             $markerPath = Join-Path $bdE2eRoot ('imported_' + $Name + '.marker')
             if ($MarkImports) {
@@ -795,6 +811,12 @@ Test-BRAVOCondition -Condition (
         $bdE2eLegacyModules = @('BRAVO.Compatibility', 'BRAVO.Discovery', 'BRAVO.System')
         $bdE2eCurrentBundle = New-BRAVOSelfTestInstallBundle -Name 'current' -ModuleDirectories $bdE2eCurrentModules
         $bdE2eLegacyBundle = New-BRAVOSelfTestInstallBundle -Name 'legacy' -ModuleDirectories $bdE2eLegacyModules
+        # Форма знімка developer: усі файли модулів на місці, але без функцій
+        # профілю напрямків (#434, P3-1).
+        $bdE2eCapabilityFunctions = @('Get-BRAVOConfiguratorBackupDestinationProfile',
+            'Test-BRAVOConfiguratorBackupDestinationEffective', 'New-BRAVOConfiguratorSeedLocalConfig')
+        $bdE2eNoCapabilityBundle = New-BRAVOSelfTestInstallBundle -Name 'nocapability' -ModuleDirectories $bdE2eCurrentModules `
+            -StripFunctions $bdE2eCapabilityFunctions
 
         function Invoke-BRAVOSelfTestInstallE2E {
             param([string]$RuntimeRoot, [string]$ZipPath, [string[]]$Arguments)
@@ -969,6 +991,42 @@ Test-BRAVOCondition -Condition (
         Test-BRAVOCondition -Condition ($bdE2eLegacyImplicitFailures.Count -eq 0) `
             -Name 'BackupDestinations/InstallerImplicitSeedWithLegacyBundleKeepsDeveloperBehaviour' `
             -Failure "без -BackupDestination комплект без BRAVO.Configurator встановлюється, як на developer: -SeedLocalConfig копіює BRAVO.local.config.example («з прикладу»), без нього файл не створюється, наявний не змінюється, код 0: $($bdE2eLegacyImplicitFailures -join ' | ')"
+
+        # (P3-1) Комплект з файлами BRAVO.Configurator, але без функцій профілю
+        # напрямків (знімок developer): явний профіль відхиляється ДО копіювання
+        # (перевірка за визначеннями функцій, а не лише за наявністю файлів);
+        # неявний -SeedLocalConfig копіює приклад, як на developer.
+        $bdE2eNoCapabilityFailures = @()
+        $bdE2eNoCapabilityStripped = [IO.File]::ReadAllText((Join-Path $bdE2eRoot 'bundle_nocapability\modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1'), [Text.Encoding]::UTF8)
+        if ($bdE2eNoCapabilityStripped.Contains('function Get-BRAVOConfiguratorBackupDestinationProfile')) {
+            $bdE2eNoCapabilityFailures += 'фікстура: функції профілю не вирізано з Presets.psm1'
+        }
+        foreach ($bdE2eCase in @(
+            @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly'); Existing = $false },
+            @{ Arguments = @('-BackupDestination', 'LocalOnly', '-Force'); Existing = $true }
+        )) {
+            $bdE2eRuntime = $(if ($bdE2eCase.Existing) { New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLocalOnlyLines } else { New-BRAVOSelfTestE2ERuntimeRoot })
+            $bdE2eHashBefore = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eNoCapabilityBundle.ZipPath -Arguments $bdE2eCase.Arguments
+            $bdE2eAllowed = $(if ($bdE2eCase.Existing) { @('BRAVO.local.config') } else { @() })
+            $bdE2eNoCapabilityFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries $bdE2eAllowed -RequiredTexts @('BRAVO.Configurator', '-BackupDestination'))
+            if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eHashBefore) {
+                $bdE2eNoCapabilityFailures += "$($bdE2eRun.Label) BRAVO.local.config змінено або створено"
+            }
+        }
+        $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot
+        $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eNoCapabilityBundle.ZipPath -Arguments @('-SeedLocalConfig')
+        $bdE2eSitePath = Join-Path $bdE2eRuntime 'BRAVO.local.config'
+        $bdE2eSiteBytes = $(if (Test-Path -LiteralPath $bdE2eSitePath -PathType Leaf) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdE2eSitePath)) } else { '' })
+        if ($bdE2eRun.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json')) -or
+            $bdE2eSiteBytes -cne $bdE2eNoCapabilityBundle.ExampleBytes -or -not $bdE2eRun.Output.Contains('з прикладу') -or
+            -not $bdE2eRun.Output.Contains('усі ключі в ньому закоментовані')) {
+            $bdE2eNoCapabilityFailures += "$($bdE2eRun.Label): exit=$($bdE2eRun.ExitCode) файл=приклад:$($bdE2eSiteBytes -ceq $bdE2eNoCapabilityBundle.ExampleBytes) throw='$($bdE2eRun.Throw)'"
+        }
+        Test-BRAVOCondition -Condition ($bdE2eNoCapabilityFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerBundleWithoutDestinationFunctionsKeepsDeveloperBehaviour' `
+            -Failure "комплект з файлами BRAVO.Configurator, але без функцій профілю напрямків ($($bdE2eCapabilityFunctions -join ', ')): явний -BackupDestination має зупинитися ДО копіювання (без VERSION.json), а неявний -SeedLocalConfig — скопіювати приклад з попередженням, як на developer: $($bdE2eNoCapabilityFailures -join ' | ')"
 
         # (P2-1/P2-2) Наявний BRAVO.local.config суперечить явному профілю ->
         # відмова ДО копіювання; файл не змінено. Для кожного профілю.

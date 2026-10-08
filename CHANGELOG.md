@@ -46,14 +46,16 @@
   Той самий fail-closed контракт тепер діє для всіх чотирьох профілів, і все, що може відхилити явний
   `-BackupDestination`, перевіряється в кроці 1 — після SHA-256, провенансу й гейта каналу, але ДО
   копіювання в каталог інсталяції, тож відмова не лишає часткового runtime чи `VERSION.json`, а повторний
-  запуск після виправлення працює (#434). Комплект без модулів `BRAVO.Configurator` (лише `Test-Path` у
-  staged-каталозі, без імпорту) відхиляється з підказкою `-Tag`/`-ZipPath`; наявний `BRAVO.local.config`
+  запуск після виправлення працює (#434). Комплект без модулів `BRAVO.Configurator` або без потрібних функцій
+  профілю напрямків (як знімок developer; визначення функцій звіряються розбором AST у staged-каталозі, без
+  імпорту) відхиляється з підказкою `-Tag`/`-ZipPath`; наявний `BRAVO.local.config`
   читається канонічним reader-ом зі staged-комплекту, і нерозбірний файл або файл, з яким ефективні
   `SFTP.Enabled`, `SMB.Enabled` чи `SMB.ArchiveCopy` суперечать профілю, зупиняє інсталяцію з назвою
   профілю й каналу; файл не змінюється. `Test-BRAVOConfiguratorBackupDestinationEffective` для SMB тепер
   порівнює й ефективну копію на NAS (`ArchiveCopy`), тож `CloudAndSamba` при файлі без `ArchiveCopy` не
   вважається в силі. Без `-BackupDestination` поведінка як на developer: для комплекту без
-  `BRAVO.Configurator` `-SeedLocalConfig` знову копіює `BRAVO.local.config.example`.
+  `BRAVO.Configurator` або без цих функцій `-SeedLocalConfig` знову копіює `BRAVO.local.config.example`
+  з попередженням, що всі ключі в ньому закоментовані.
 - **Hardening: маскування закодованих форм відомих секретів у журналах перед вивантаженням (#417).**
   `Protect-BRAVOLogSecret -KnownSecret` (маскована копія власного журналу Maintenance/Archive і знімка
   `range_id_log.json` перед SFTP) тепер маскує не лише сирий секрет, а й його URL-кодовану форму
