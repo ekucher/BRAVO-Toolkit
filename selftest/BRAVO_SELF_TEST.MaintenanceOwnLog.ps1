@@ -1530,6 +1530,78 @@ Test-BRAVOCondition (
 ) -Name 'Logging/KnownSecretPartialOverlapLeavesNoFragment' `
     -Failure "частково перекриті й суміжні секрети мають замінюватись одним *** на злитий діапазон (очікується 'p *** q *** r'); фрагмент секрету лишився: $secretMaskPartialFragmentLeft; помилка: $secretMaskPartialError"
 
+# --- #417 (пункт 4b): закодовані форми відомих секретів. Точний збіг
+# -KnownSecret не впізнавав секрет, який потрапив у текст у URL-кодованій
+# формі ([Uri]::EscapeDataString — так кодує New-BRAVOSftpUrl) чи
+# JSON-екранованій формі (тіло рядка ConvertTo-Json без лапок). Шаблон
+# URL-кредів ловить лише scheme://user:pass@, тож фрагмент без схеми
+# витікав. Значення будуються під час запуску; спецсимволи — з кодів
+# символів, без суцільних секрето-подібних літералів.
+$secretMaskEncodedBase = $secretMaskNewValue.Invoke('Enc')[0]
+$secretMaskUrlSecret = $secretMaskEncodedBase.Substring(0, 7) + [char]64 + $secretMaskEncodedBase.Substring(7) + [char]32 + [char]37 + 'x'
+$secretMaskUrlEncoded = [System.Uri]::EscapeDataString($secretMaskUrlSecret)
+$secretMaskUrlResult = $null
+$secretMaskUrlError = $secretMaskSetupError
+if ($null -ne $secretMaskModule) {
+    try {
+        $secretMaskUrlResult = & $secretMaskModule {
+            param($secret, $encoded)
+            Protect-BRAVOLogSecret -Text ("login selftest-user:" + $encoded + "@host-a done") -KnownSecret @($secret)
+        } $secretMaskUrlSecret $secretMaskUrlEncoded
+    } catch { $secretMaskUrlError = $_.Exception.GetType().FullName }
+}
+Test-BRAVOCondition (
+    $secretMaskUrlEncoded -cne $secretMaskUrlSecret -and
+    [string]$secretMaskUrlResult -ceq 'login selftest-user:***@host-a done'
+) -Name 'Logging/KnownSecretUrlEncodedFormMasked' `
+    -Failure "URL-кодована форма відомого секрету (як у New-BRAVOSftpUrl) без scheme:// має маскуватись (очікується 'login selftest-user:***@host-a done'); закодована форма лишилась: $(([string]$secretMaskUrlResult).Contains($secretMaskUrlEncoded)); помилка: $secretMaskUrlError"
+
+# JSON-екранування відрізняється між хостами: Windows PowerShell 5.1
+# (JavaScriptSerializer) додатково екранує & < > ' як \u00XX, PowerShell 7
+# — лише " \ і керівні символи. Перевіряються ОБИДВІ форми, побудовані
+# детерміновано, і фактичний вивід ConvertTo-Json поточного хоста.
+$secretMaskJsonSecret = $secretMaskEncodedBase.Substring(0, 5) + [char]34 + $secretMaskEncodedBase.Substring(5, 4) + [char]92 + 'c' + [char]38 + 'd' + [char]60 + [char]39 + $secretMaskEncodedBase.Substring(9)
+$secretMaskJsonStrict = $secretMaskJsonSecret.Replace([string][char]92, '\\').Replace([string][char]34, '\"')
+$secretMaskJsonHtmlSafe = $secretMaskJsonStrict.Replace([string][char]38, ([string][char]92 + 'u0026')).Replace([string][char]60, ([string][char]92 + 'u003c')).Replace([string][char]39, ([string][char]92 + 'u0027'))
+$secretMaskJsonNative = [string]($secretMaskJsonSecret | ConvertTo-Json -Compress)
+$secretMaskJsonNative = $secretMaskJsonNative.Substring(1, $secretMaskJsonNative.Length - 2)
+$secretMaskJsonResult = $null
+$secretMaskJsonError = $secretMaskSetupError
+if ($null -ne $secretMaskModule) {
+    try {
+        $secretMaskJsonResult = & $secretMaskModule {
+            param($secret, $strict, $htmlSafe, $native)
+            Protect-BRAVOLogSecret -Text ('{"k":"' + $strict + '","h":"' + $htmlSafe + '","n":"' + $native + '"}') -KnownSecret @($secret)
+        } $secretMaskJsonSecret $secretMaskJsonStrict $secretMaskJsonHtmlSafe $secretMaskJsonNative
+    } catch { $secretMaskJsonError = $_.Exception.GetType().FullName }
+}
+Test-BRAVOCondition (
+    $secretMaskJsonStrict -cne $secretMaskJsonSecret -and
+    [string]$secretMaskJsonResult -ceq '{"k":"***","h":"***","n":"***"}'
+) -Name 'Logging/KnownSecretJsonEscapedFormMasked' `
+    -Failure "JSON-екранована форма відомого секрету (обидва варіанти ConvertTo-Json: PS 5.1 і PS 7) має маскуватись (очікується '{`"k`":`"***`",`"h`":`"***`",`"n`":`"***`"}'); лишились форми: strict=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonStrict)) html=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonHtmlSafe)) native=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonNative)); помилка: $secretMaskJsonError"
+
+# Регресія: секрет без спецсимволів (закодовані форми збігаються з сирою)
+# маскується рівно як раніше — одне *** на входження, без *** поруч
+# (артефакт подвійного маскування) і без змін у решті тексту.
+$secretMaskPlainSecret = $secretMaskNewValue.Invoke('Plain')[0]
+$secretMaskPlainResult = $null
+$secretMaskPlainError = $secretMaskSetupError
+if ($null -ne $secretMaskModule) {
+    try {
+        $secretMaskPlainResult = & $secretMaskModule {
+            param($secret)
+            Protect-BRAVOLogSecret -Text ("a $secret b user:" + $secret + '@host-a {"k":"' + $secret + '"} ' + $secret) -KnownSecret @($secret)
+        } $secretMaskPlainSecret
+    } catch { $secretMaskPlainError = $_.Exception.GetType().FullName }
+}
+Test-BRAVOCondition (
+    [System.Uri]::EscapeDataString($secretMaskPlainSecret) -ceq $secretMaskPlainSecret -and
+    [string]$secretMaskPlainResult -ceq 'a *** b user:***@host-a {"k":"***"} ***' -and
+    -not ([string]$secretMaskPlainResult).Contains('******')
+) -Name 'Logging/KnownSecretPlainFormStillMasked' `
+    -Failure "секрет без спецсимволів має маскуватись як до #417 (очікується 'a *** b user:***@host-a {`"k`":`"***`"} ***', без артефактів подвійного маскування); факт містить секрет: $(([string]$secretMaskPlainResult).Contains($secretMaskPlainSecret)); помилка: $secretMaskPlainError"
+
 Remove-Item -LiteralPath $secretMaskTestRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # ============================================================

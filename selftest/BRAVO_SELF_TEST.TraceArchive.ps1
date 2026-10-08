@@ -1383,6 +1383,88 @@ function Get-BRAVODirectories {
             $taTasksInstallText -notmatch '(?i)BRAVO_TRACE' -and
             $taTasksInstallText -notmatch '(?i)TRACE_ROTATE|TRACE_UPLOAD'
         ) -Name 'TraceArchive/NoDedicatedTraceScheduledTask' -Failure "BRAVO_TASKS_INSTALL не повинен створювати окремих Trace-тасків — Trace обробляє лише BRAVO_MAINTENANCE"
+
+        # #417 (пункт 4a): добові Trace/exchangAPI .mdz вивантажуються на SFTP
+        # без маскування журналів, бо вміст зашифровано паролем архівів. Сторож
+        # фіксує цей інваріант: справжні рядки Runtime, що будують параметри
+        # `7za a`, при непорожньому паролі ЗАВЖДИ дають bare -p (пароль — лише
+        # через redirected stdin, не в аргументах) і не відкидають його
+        # фільтром -r/-aoa/-mhe; при порожньому паролі -p немає. Додавання в
+        # Update-BRAVOTraceDailyArchive передає пароль через -StandardInputText,
+        # а обидва виклики (Trace і exchangAPI) отримують саме ці параметри.
+        $taPwGuardTokens = $null
+        $taPwGuardErrors = $null
+        $taPwGuardAst = [Management.Automation.Language.Parser]::ParseInput($traceArchiveScriptText, [ref]$taPwGuardTokens, [ref]$taPwGuardErrors)
+        $taPwGuardIfAsts = @($taPwGuardAst.FindAll({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.IfStatementAst] -and
+            $candidate.Extent.Text.Contains('$arcCommonParams += "-p"') -and
+            $candidate.Extent.Text.Contains('$script:ArchivePassword')
+        }, $true))
+        $taPwGuardAddAsts = @($taPwGuardAst.FindAll({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $candidate.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+            $candidate.Left.VariablePath.UserPath -eq 'traceArchiveAddParams'
+        }, $true))
+        $taPwGuardCases = $null
+        $taPwGuardError = ''
+        if (@($taPwGuardErrors).Count -eq 0 -and $taPwGuardIfAsts.Count -eq 1 -and $taPwGuardAddAsts.Count -eq 1) {
+            try {
+                $taPwGuardFunctionText = 'function Get-BRAVOSelfTestTraceAddParameters { param([string]$Password, [string[]]$CommonParameters) ' +
+                    '$script:ArchivePassword = $Password; $arcCommonParams = @($CommonParameters)' + "`n" +
+                    $taPwGuardIfAsts[0].Extent.Text + "`n" + $taPwGuardAddAsts[0].Extent.Text + "`n" +
+                    'return @($traceArchiveAddParams) }'
+                $taPwGuardModule = New-Module -ScriptBlock ([scriptblock]::Create($taPwGuardFunctionText + "`nExport-ModuleMember -Function @()"))
+                $taPwGuardCommon = @('a', '-t7z', '-mx=5', '-mhe=on', '-r', '-aoa', '-y')
+                $taPwGuardSecret = 'Ta' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+                $taPwGuardCases = & $taPwGuardModule {
+                    param($secret, $common)
+                    [pscustomobject]@{
+                        WithPassword = @(Get-BRAVOSelfTestTraceAddParameters -Password $secret -CommonParameters $common)
+                        WithoutPassword = @(Get-BRAVOSelfTestTraceAddParameters -Password '' -CommonParameters $common)
+                    }
+                } $taPwGuardSecret $taPwGuardCommon
+            } catch { $taPwGuardError = $_.Exception.Message }
+        } else {
+            $taPwGuardError = "рядки побудови параметрів не знайдено однозначно: parse=$(@($taPwGuardErrors).Count) if=$($taPwGuardIfAsts.Count) assign=$($taPwGuardAddAsts.Count)"
+        }
+        $taPwGuardUpdateFunction = @($taPwGuardAst.FindAll({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Update-BRAVOTraceDailyArchive'
+        }, $true)) | Select-Object -First 1
+        $taPwGuardStdinAddCalls = 0
+        if ($null -ne $taPwGuardUpdateFunction) {
+            foreach ($taPwGuardCommand in @($taPwGuardUpdateFunction.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and $candidate.GetCommandName() -eq 'Invoke-CommandWithLog'
+            }, $true))) {
+                $taPwGuardText = $taPwGuardCommand.Extent.Text
+                if ($taPwGuardText -match '-Arguments\s+\$addArguments\b' -and $taPwGuardText -match '-StandardInputText\s+\$ArchivePassword\b') { $taPwGuardStdinAddCalls++ }
+            }
+        }
+        $taPwGuardCallSites = @($taPwGuardAst.FindAll({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and $candidate.Extent.Text -match '-AddParameters\s+\$traceArchiveAddParams\b'
+        }, $true)).Count
+        $taPwGuardWith = @()
+        $taPwGuardWithout = @()
+        if ($null -ne $taPwGuardCases) {
+            $taPwGuardWith = @($taPwGuardCases.WithPassword)
+            $taPwGuardWithout = @($taPwGuardCases.WithoutPassword)
+        }
+        Test-BRAVOCondition -Condition (
+            $taPwGuardError -eq '' -and
+            $taPwGuardWith.Count -gt 0 -and [string]$taPwGuardWith[0] -ceq 'a' -and
+            @($taPwGuardWith | Where-Object { [string]$_ -ceq '-p' }).Count -eq 1 -and
+            @($taPwGuardWith | Where-Object { [string]$_ -match '^(?i)-p.' }).Count -eq 0 -and
+            @($taPwGuardWith | Where-Object { [string]$_ -match '^(?i)-mhe' -or [string]$_ -eq '-r' -or [string]$_ -eq '-aoa' }).Count -eq 0 -and
+            -not ((@($taPwGuardWith) -join ' ').Contains($taPwGuardSecret)) -and
+            $taPwGuardWithout.Count -gt 0 -and @($taPwGuardWithout | Where-Object { [string]$_ -match '^(?i)-p' }).Count -eq 0 -and
+            $taPwGuardStdinAddCalls -eq 1 -and
+            $taPwGuardCallSites -ge 2
+        ) -Name 'TraceArchive/DailyArchiveAddParametersAlwaysCarryPassword' `
+            -Failure "параметри ``7za a`` для Trace/exchangAPI при непорожньому паролі мають містити рівно один bare -p (пароль лише через stdin) без -mhe/-r/-aoa, при порожньому — без -p; додавання передає пароль через -StandardInputText; обидва виклики отримують `$traceArchiveAddParams; факт: with=[$(@($taPwGuardWith) -join ' ')] without=[$(@($taPwGuardWithout) -join ' ')] stdinAdd=$taPwGuardStdinAddCalls callSites=$taPwGuardCallSites помилка=$taPwGuardError"
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'TraceArchive/EmptyDateDirNoneIsNoop' } }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$traceArchiveTestRoot) -and (Test-Path -LiteralPath $traceArchiveTestRoot)) {
