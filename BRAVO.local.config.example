@@ -215,6 +215,12 @@
     # boot-recovery з утриманням служб; протягується в Recovery.Enabled):
     # 'maintenanceSettings.Restore.BootRestoreMode' = 'HoldServices'
     # 'maintenanceSettings.Restore.StartupDelayMinutes' = 0
+    # Поріг «малого» файлу MODEL (байти, розмір ДО реставрації) для
+    # самоперевірки після bravocmd repair: менші файли критичні (відкат)
+    # лише при зникненні або обнуленні до 0 байт; більші — при зменшенні
+    # на >= 50% або до <= 2048 байт. 0 = правило 50% для всіх файлів.
+    # Некоректне значення (не ціле, від'ємне, понад 104857600) -> 1048576:
+    # 'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes' = 1048576
 
     # --- Retention журналів ---
     # 'maintenanceSettings.Retention.ArchiveDays' = 14

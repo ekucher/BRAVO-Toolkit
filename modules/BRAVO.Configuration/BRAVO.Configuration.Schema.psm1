@@ -513,12 +513,12 @@ function Test-BRAVOConfigurationOverrideSchema {
 # узагалі й проходить повз цей шар так само, як повз type-перевірку.
 # Це свідоме узгодження з D3, не недогляд (WAVE2-CONTRACT.md, розділ 5/11.3).
 #
-# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 277 канонічних листів (а не
+# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 278 канонічних листів (а не
 # лише на DENY/VALIDATOR-підмножину) — навмисно: WAVE2-CONTRACT.md
 # (розділ 8/11.3) вимагає, щоб кожен НОВИЙ канонічний лист отримував
 # явне класифікаційне рішення (навіть якщо це явний ALLOW_SITE), а не
 # мовчазний allow-by-omission. Повнота реєстру перевіряється в
-# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "277/277
+# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "278/278
 # coverage" — фейлить, якщо реєстр і канонічна схема розійшлися в
 # обидва боки: зайвий запис АБО відсутній запис); у цьому модулі немає
 # окремої функції з такою назвою.
@@ -799,6 +799,11 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'maintenanceSettings.Restore.ArchivesKeepCount' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Restore.BootRestoreMode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:None,HoldServices' }
     'maintenanceSettings.Restore.Day' = @{ Class = 'ALLOW_SITE' }
+    # Поріг «малого» файлу самоперевірки реставрації. ALLOW_SITE (як
+    # RangeIdMonitoring.ThresholdPercent): рантайм сам приводить некоректне
+    # значення (не ціле, від'ємне, понад 100 МБ) до типового 1 МБ —
+    # жодне значення не вимикає перевірку зникнення/обнулення файлів.
+    'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Restore.StartupDelayMinutes' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Restore.Time' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Restore.WindowEnd' = @{ Class = 'ALLOW_SITE' }
