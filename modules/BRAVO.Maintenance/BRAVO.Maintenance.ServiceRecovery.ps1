@@ -399,6 +399,45 @@ function New-BRAVOServiceRecoveryNotificationContent {
     }
 }
 
+function New-BRAVOServiceRecoveryRunAlertContent {
+    # FR-6 (рев'ю PR #432, B-P2-1): зміст сповіщення про помилки прогону
+    # відновлення, які не покриває сповіщення про конкретну службу (збій
+    # зупинки залежної служби, ротації журналів, непередбачений виняток).
+    # -CriticalMessages — записи CriticalErrorsList, -QueuedAlerts — записи
+    # NotificationAlertQueue ({ Severity; Message }), -CriticalWithoutDetails —
+    # критичний збій, про який прогін не лишив тексту. Повертає
+    # { Severity; Title; TitleEmoji; Details }.
+    param(
+        [AllowEmptyCollection()][string[]]$CriticalMessages = @(),
+        [AllowEmptyCollection()][object[]]$QueuedAlerts = @(),
+        [switch]$CriticalWithoutDetails,
+        [string]$LogPath
+    )
+
+    $queuedSeverities = @(@($QueuedAlerts) | ForEach-Object { [string]$_.Severity })
+    $severity = 'WARNING'
+    if (@($CriticalMessages).Count -gt 0 -or $CriticalWithoutDetails -or $queuedSeverities -contains 'CRITICAL') {
+        $severity = 'CRITICAL'
+    } elseif ($queuedSeverities -contains 'ERROR') {
+        $severity = 'ERROR'
+    }
+    $details = @(@($CriticalMessages) | ForEach-Object { [string]$_ }) + @(@($QueuedAlerts) | ForEach-Object { [string]$_.Message })
+    if ($CriticalWithoutDetails -and @($CriticalMessages).Count -eq 0) {
+        $details += 'Прогін відновлення служб завершився з критичною помилкою — подробиці в журналі.'
+    }
+    $details += $(if ([string]::IsNullOrWhiteSpace($LogPath)) { 'Журнал: не створено' } else { "Журнал: $LogPath" })
+    $title = 'ВІДНОВЛЕННЯ СЛУЖБ BRAVO: ПОПЕРЕДЖЕННЯ'
+    $titleEmoji = ':warning:'
+    if ($severity -eq 'CRITICAL') {
+        $title = 'ВІДНОВЛЕННЯ СЛУЖБ BRAVO: КРИТИЧНІ ПОМИЛКИ'
+        $titleEmoji = ':rotating_light:'
+    } elseif ($severity -eq 'ERROR') {
+        $title = 'ВІДНОВЛЕННЯ СЛУЖБ BRAVO: ПОМИЛКИ'
+        $titleEmoji = ':x:'
+    }
+    return [pscustomobject]@{ Severity = $severity; Title = $title; TitleEmoji = $titleEmoji; Details = @($details) }
+}
+
 function Format-BRAVOServiceRecoveryExitCode {
     # «ExitCode N» (+ ServiceSpecificExitCode, коли служба повідомила власний код).
     param([AllowNull()][object]$ExitCode, [AllowNull()][object]$ServiceSpecificExitCode)

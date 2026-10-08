@@ -1165,6 +1165,10 @@ function Get-BRAVOManagedServiceCondition {
 function Invoke-ServiceStateChange {
     param([string]$Name, [string]$DesiredStatus, [int]$TimeoutSeconds, [int]$PollIntervalSeconds, [switch]$Force)
     if ($DesiredStatus -eq 'Stopped') {
+        if (@($script:ProbeStopFailures) -contains $Name) {
+            Add-ProbeEvent "STOP-FAIL $Name"
+            return [pscustomobject]@{ Success = $false; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = 'Running'; Error = 'self-test: таймаут зупинки' }
+        }
         Add-ProbeEvent "STOP $Name"
         $script:ProbeServices[$Name] = 'Stopped'
         return [pscustomobject]@{ Success = $true; AlreadyInState = $false; StateChangeIssued = $true; FinalStatus = 'Stopped'; Error = $null }
@@ -1216,7 +1220,7 @@ function Resolve-BRAVONotificationRoute {
 function New-MaintenanceNotificationMessage { param($Title, $TitleEmoji, $Duration, $DurationLabel, $StatusLines, $Details, $LogPath, $Severity) return ('{0}|{1}' -f $Severity, $Title) }
 function Invoke-NotificationWebhook { param([string]$Message, [string]$WebhookUrl) Add-ProbeEvent ('NOTIFY ' + $Message) }
 function Invoke-BRAVOTraceRotation { param($Sources, $DestinationDirectory, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'TRACE-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
-function Invoke-BRAVOExchangeApiLogRotation { param($SourceDirectory, $DestinationDirectory, $Patterns, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'EXCHANGE-ROTATION'; return [pscustomobject]@{ Found = 1; Moved = 1; Errors = 0 } }
+function Invoke-BRAVOExchangeApiLogRotation { param($SourceDirectory, $DestinationDirectory, $Patterns, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'EXCHANGE-ROTATION'; return [pscustomobject]@{ Found = 1; Moved = 1; Errors = [int]$script:ProbeExchangeRotationErrors } }
 function Invoke-BRAVOApacheLogRotation { param($SourceDirectory, $DestinationDirectory, $Filter, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'APACHE-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
 function Invoke-BRAVOWebApplicationLogRotation { param($SourceDirectory, $DestinationDirectory, $Filter, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'WEBAPP-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
 function Get-BRAVOTraceConfiguration { param($DiscoveryResult, $TraceRootDirectory, $DateFolderName) return [pscustomobject]@{ IsValid = $true; TracePath = 'self-test-trace.log'; Reason = $null } }
@@ -1273,6 +1277,12 @@ $probeScenarios = [ordered]@{
     'RSIntegrityGateClosed' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:modelIntegrityEstablished = $false }
     'RSMarkerWriteFails' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeMarkerWriteFails = $true }
     'RSStartFails' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeStartFailures = @('exchangAPI') }
+    'RSRotationErrorCritical' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeExchangeRotationErrors = 1 }
+    'RSStopTimeoutStillRunning' = { $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeStopFailures = @('exchangAPI') }
+    'RSUnexpectedException' = {
+        $script:ProbeServices['exchangAPI'] = 'Stopped'
+        $script:ProbeScmEvents = @([pscustomobject]@{ TimeCreated = 'self-test: не дата'; Id = 7034; Message = 'self-test'; Properties = @([pscustomobject]@{ Value = 'exchangAPI' }) })
+    }
     'RSScmReadFails' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeScmReadFails = $true }
     'RSConflictForceRestore' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeForceRestore = $true }
     'RSConflictRunMissedRestoreOnly' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeRunMissedRestoreOnly = $true }
@@ -1308,6 +1318,8 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             $script:ProbeExitCodes = @{}
             $script:ProbeMarkerNames = @()
             $script:ProbeStartFailures = @()
+            $script:ProbeStopFailures = @()
+            $script:ProbeExchangeRotationErrors = 0
             $script:ProbeStrayProcesses = @('Bis')
             $script:ProbeLockBusy = $false
             $script:ProbeMarkerWriteFails = $false
@@ -1547,6 +1559,37 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             param($Result) (& $recoverStateCount $Result 'exchangAPI') -eq 1 -and [int]$Result.QueuedCritical -gt 0 -and [int]$Result.DeliveredCritical -eq [int]$Result.QueuedCritical
         } 'ServiceRecovery/RecoverServicesStartFailureCritical' `
             '#314 FR-3/FR-6: служба не стартувала — спроба рахується, CRITICAL «не вдалося підняти» і код 60; загальні критичні алерти циклу не дублюються страховкою runtime'
+        # Рев'ю PR #432 (B-P2-1): критична помилка без FR-6 Failed (збій ротації
+        # журналу) — окреме CRITICAL прогону, а не лише WARNING «відновлено».
+        $recoverRunCritical = 'NOTIFY CRITICAL|ВІДНОВЛЕННЯ СЛУЖБ BRAVO: КРИТИЧНІ ПОМИЛКИ'
+        & $recoverCheck 'RSRotationErrorCritical' 60 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
+            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'; $recoverRunCritical
+        ) $recoverLogName {
+            param($Result) [int]$Result.DeliveredCritical -eq [int]$Result.QueuedCritical
+        } 'ServiceRecovery/RecoverServicesUncoveredCriticalDelivered' `
+            "Рев'ю PR #432 (B-P2-1): збій ротації журналу (код 60) — служба піднята (WARNING «відновлено»), а критична помилка прогону доставлена окремим CRITICAL; лічильник доставлених не завищується"
+        # Рев'ю PR #432 (B-P3-6): зупинка exchangAPI завершилась таймаутом, служба
+        # лишилась Running — CRITICAL про збій зупинки, без хибного «зупинено,
+        # але не запущено»; маркер прибрано.
+        & $recoverCheck 'RSStopTimeoutStillRunning' 60 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('BRAVO', 'exchangAPI', 'BravoWeb'))
+            'STOP BravoWeb'; 'STOP-FAIL exchangAPI'
+            'TRACE-ROTATION'; 'APACHE-ROTATION'; 'WEBAPP-ROTATION'
+            'START BRAVO'; 'START BravoWeb'
+            'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'; $recoverRunCritical
+        ) $recoverLogName {
+            param($Result) @($Result.Events | Where-Object { ([string]$_) -like 'NOTIFY CRITICAL|СЛУЖБУ BRAVO НЕ ВДАЛОСЯ ПІДНЯТИ*' }).Count -eq 0
+        } 'ServiceRecovery/RecoverServicesStopTimeoutNoFalseCritical' `
+            "Рев'ю PR #432 (B-P3-6): таймаут зупинки залежної служби, яка лишилась Running — CRITICAL про збій зупинки (код 60), без хибного «зупинено, але не запущено»"
+        # Рев'ю PR #432 (B-P3-4): непередбачений виняток — код 60 (не 1),
+        # FR-6 Failed для впалої служби, lock звільнено.
+        & $recoverCheck 'RSUnexpectedException' 60 @(
+            $recoverLock; 'SCM-READ'; 'LOCK-EXIT'; $recoverFailed
+        ) $recoverLogName {
+            param($Result) ([string]$Result.LogText).Contains('[ERROR] ПОМИЛКА: непередбачена помилка профілю -RecoverServices:')
+        } 'ServiceRecovery/RecoverServicesUnexpectedExceptionIsCritical' `
+            "Рев'ю PR #432 (B-P3-4): непередбачений виняток профілю — ERROR у журнал, FR-6 Failed для впалої служби і код 60"
         & $recoverCheck 'RSCyclicThirdAttempt' 10 @(
             $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
             'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'NOTIFY CRITICAL|СЛУЖБА BRAVO ЦИКЛІЧНО ПАДАЄ'; 'LOCK-EXIT'

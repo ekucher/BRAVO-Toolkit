@@ -258,7 +258,8 @@ function Invoke-BRAVOMaintenanceRecoverServicesProfile {
     # Профіль -RecoverServices (#314 FR-3). Повертає код завершення з
     # BRAVO.ExitCodes: 0 (усе піднято або нічого робити), 10 (піднято з
     # попередженнями або запуск свідомо заблоковано), 20 (operation-lock
-    # зайнятий), 30 (несумісні параметри), 60 (не вдалося підняти).
+    # зайнятий), 30 (несумісні параметри), 60 (не вдалося підняти або
+    # непередбачена помилка профілю).
     param(
         [switch]$ForceRestore,
         [switch]$RunMissedRestoreOnly
@@ -271,6 +272,77 @@ function Invoke-BRAVOMaintenanceRecoverServicesProfile {
     # Профіль не вивантажує власний журнал на SFTP (спільний finally runtime).
     $script:maintenanceOwnLogUploadAttempted = $true
 
+    # Стан прогону для сповіщень (рев'ю PR #432): які служби впали, скільки
+    # сповіщень FR-6 Failed надіслано і які записи CriticalErrorsList вони
+    # покривають (збої запуску служб).
+    $outcome = @{
+        ServiceSet = $null; FailedKeys = @(); NotifiedKeys = @(); FailedNotifications = 0
+        CoveredCriticalFrom = -1; CoveredCriticalTo = -1; CriticalAtStart = [bool]$script:criticalErrorOccurred
+    }
+    try {
+        return (Invoke-BRAVOMaintenanceRecoverServicesSteps -Outcome $outcome)
+    } catch {
+        # Рев'ю PR #432 (B-P3-4): непередбачений виняток — критична помилка
+        # прогону (код 60) і FR-6 Failed для впалих служб, а не код 1.
+        $profileError = "непередбачена помилка профілю -RecoverServices: $($_.Exception.Message)"
+        $script:criticalErrorOccurred = $true
+        try { Write-Log -Message "ПОМИЛКА: $profileError" -Level "ERROR" } catch { Write-Host "ПОМИЛКА: $profileError" -ForegroundColor Red }
+        $unnotifiedKeys = @(@($outcome.FailedKeys) | Where-Object { @($outcome.NotifiedKeys) -notcontains $_ })
+        if ($null -ne $outcome.ServiceSet -and $unnotifiedKeys.Count -gt 0) {
+            foreach ($failedKey in $unnotifiedKeys) {
+                Send-BRAVOMaintenanceServiceRecoveryNotification -Content (New-BRAVOServiceRecoveryNotificationContent -Kind Failed `
+                    -ServiceName ([string]$outcome.ServiceSet.$failedKey.Name) -ExitCode $null -Reason $profileError -LogPath $LOG_FILE)
+                $outcome.FailedNotifications++
+            }
+        } else {
+            $script:CriticalErrorsList.Add($profileError)
+        }
+        return (Get-BRAVOMaintenanceResolvedExitCode)
+    } finally {
+        Send-BRAVOMaintenanceServiceRecoveryRunAlerts -Outcome $outcome
+    }
+}
+
+function Send-BRAVOMaintenanceServiceRecoveryRunAlerts {
+    # Рев'ю PR #432 (B-P2-1): доставка критичних помилок і попереджень
+    # прогону, які не покриває FR-6 про конкретну службу. Записи
+    # CriticalErrorsList про збій запуску служб ([CoveredCriticalFrom,
+    # CoveredCriticalTo)) пропускаються, лише коли на них уже надіслано
+    # стільки ж FR-6 Failed; решта (збій зупинки, ротації журналів, виняток)
+    # — одним сповіщенням. Лічильники доставлених зсуваються до кінця черг:
+    # страховка спільного finally runtime (Send-BRAVOMaintenanceEarlyExitAlerts)
+    # нічого не дублює. Критичний збій без тексту (лише прапорець) теж
+    # доставляється, якщо жодного FR-6 Failed не було.
+    param([Parameter(Mandatory = $true)][hashtable]$Outcome)
+
+    $criticalList = $script:CriticalErrorsList
+    $alertQueue = $script:NotificationAlertQueue
+    $coveredFrom = [int]$Outcome.CoveredCriticalFrom
+    $coveredTo = [int]$Outcome.CoveredCriticalTo
+    $skipCovered = ($coveredTo -gt $coveredFrom) -and ([int]$Outcome.FailedNotifications -ge ($coveredTo - $coveredFrom))
+    $pendingCritical = @()
+    for ($criticalIndex = [int]$script:maintenanceDeliveredCriticalAlertCount; $criticalIndex -lt $criticalList.Count; $criticalIndex++) {
+        if ($skipCovered -and $criticalIndex -ge $coveredFrom -and $criticalIndex -lt $coveredTo) { continue }
+        $pendingCritical += [string]$criticalList[$criticalIndex]
+    }
+    $pendingQueue = @()
+    for ($queueIndex = [int]$script:maintenanceDeliveredAlertQueueCount; $queueIndex -lt $alertQueue.Count; $queueIndex++) {
+        $pendingQueue += $alertQueue[$queueIndex]
+    }
+    $script:maintenanceDeliveredCriticalAlertCount = $criticalList.Count
+    $script:maintenanceDeliveredAlertQueueCount = $alertQueue.Count
+    $criticalWithoutDetails = [bool]$script:criticalErrorOccurred -and -not [bool]$Outcome.CriticalAtStart -and
+        $pendingCritical.Count -eq 0 -and [int]$Outcome.FailedNotifications -eq 0
+    if ($pendingCritical.Count -eq 0 -and $pendingQueue.Count -eq 0 -and -not $criticalWithoutDetails) { return }
+    Send-BRAVOMaintenanceServiceRecoveryNotification -Content (New-BRAVOServiceRecoveryRunAlertContent `
+        -CriticalMessages $pendingCritical -QueuedAlerts $pendingQueue -CriticalWithoutDetails:$criticalWithoutDetails -LogPath $LOG_FILE)
+}
+
+function Invoke-BRAVOMaintenanceRecoverServicesSteps {
+    # Кроки 1-11 профілю -RecoverServices; -Outcome — стан для сповіщень
+    # (див. Invoke-BRAVOMaintenanceRecoverServicesProfile).
+    param([Parameter(Mandatory = $true)][hashtable]$Outcome)
+
     $serviceSet = New-BRAVOMaintenanceServiceSet `
         -BravoName $BravoServiceName -BravoManaged $BravoMaintenanceEnabled -BravoDisabled $BravoServiceDisabledBySystem `
         -ExchangeApiName $ExchangAPIServiceName -ExchangeApiManaged $exchangAPIServiceEnabled -ExchangeApiDisabled $exchangAPIServiceDisabled `
@@ -280,8 +352,10 @@ function Invoke-BRAVOMaintenanceRecoverServicesProfile {
     try { $statePath = Get-BRAVOServiceRecoveryStatePath } catch { $statePath = $null }
 
     # Крок 1: класифікація без lock-а. Нічого не пишемо на диск.
+    $Outcome.ServiceSet = $serviceSet
     $conditions = Get-BRAVOMaintenanceServiceConditionSet -ServiceSet $serviceSet
     $plan = Get-BRAVOServiceRecoveryPlan -ServiceSet $serviceSet -Conditions $conditions
+    $Outcome.FailedKeys = @($plan.FailedKeys)
     $quietState = $null
     if (-not [string]::IsNullOrWhiteSpace([string]$statePath)) {
         $quietState = (Read-BRAVOServiceRecoveryState -Path $statePath -HostName ([Environment]::MachineName) -Now $now -ReadOnly).State
@@ -333,17 +407,15 @@ function Invoke-BRAVOMaintenanceRecoverServicesProfile {
     $script:maintenanceOperationLockPath = $lockResult.Path
     try {
         $script:LOG_FILE = Join-Path $LOG_DIR ('BRAVO_MAINTENANCE_{0}_RECOVER_PID{1}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $PID)
-        Invoke-BRAVOMaintenanceServiceRecoveryUnderLock -ServiceSet $serviceSet -StatePath $statePath
+        Invoke-BRAVOMaintenanceServiceRecoveryUnderLock -ServiceSet $serviceSet -StatePath $statePath -Outcome $Outcome
         $exitCode = Get-BRAVOMaintenanceResolvedExitCode
         $finalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $exitCode
         Write-Log -Message "=== СТАТУС: $($finalStatus.Text) ($exitCode — $(Get-BRAVOExitCodeName -Code $exitCode)) ===" -Level "INFO"
         Write-Host "Відновлення служб: $($finalStatus.Text), код $exitCode. Журнал: $LOG_FILE" -ForegroundColor $finalStatus.Color
         return $exitCode
     } finally {
-        # Сповіщення профілю (FR-6) замінюють загальні критичні алерти циклу
-        # служб: страховка спільного finally runtime не має їх дублювати.
-        $script:maintenanceDeliveredCriticalAlertCount = $script:CriticalErrorsList.Count
-        $script:maintenanceDeliveredAlertQueueCount = $script:NotificationAlertQueue.Count
+        # Критичні алерти, не покриті FR-6, доставляє
+        # Send-BRAVOMaintenanceServiceRecoveryRunAlerts (finally профілю).
         Exit-BRAVOMaintenanceOperationLock
     }
 }
@@ -354,7 +426,8 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
     # обчислює код завершення.
     param(
         [Parameter(Mandatory = $true)][object]$ServiceSet,
-        [AllowNull()][string]$StatePath
+        [AllowNull()][string]$StatePath,
+        [hashtable]$Outcome = @{ NotifiedKeys = @(); FailedNotifications = 0; CoveredCriticalFrom = -1; CoveredCriticalTo = -1 }
     )
 
     $now = [DateTimeOffset]::Now
@@ -462,6 +535,8 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
             Send-BRAVOMaintenanceServiceRecoveryNotification -Content (New-BRAVOServiceRecoveryNotificationContent -Kind Failed `
                 -ServiceName ([string]$ServiceSet.$failedKey.Name) -ExitCode $conditions[$failedKey].ExitCode `
                 -ServiceSpecificExitCode $conditions[$failedKey].ServiceSpecificExitCode -Reason $markerError -LogPath $LOG_FILE)
+            $Outcome.FailedNotifications++
+            $Outcome.NotifiedKeys += $failedKey
         }
         return
     }
@@ -477,12 +552,18 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
         -ExchangeApiName $ServiceSet.ExchangeApi.Name -ExchangeApiManaged ($chainKeys -contains 'ExchangeApi') -ExchangeApiDisabled $false `
         -BravoWebName $ServiceSet.BravoWeb.Name -BravoWebManaged ($chainKeys -contains 'BravoWeb')
     $stopKeys = @($plan.StopKeys)
+    # Рев'ю PR #432 (B-P3-6): «зупинено, але не запущено» — лише про службу,
+    # яку справді зупинили (таймаут зупинки зі службою в Running — це збій
+    # зупинки, про нього вже є CRITICAL циклу служб).
+    $stopCompleted = @{}
     if ($stopKeys.Count -gt 0) {
         Write-Log -Message "=== ЗУПИНКА ЗАЛЕЖНИХ СЛУЖБ ===" -Level "INFO"
         Invoke-BRAVOMaintenanceServiceStopSequence `
             -ServiceSet $chainServiceSet `
             -ConfirmStopContract { param($Key, $Name, $Status) ($stopKeys -contains $Key) -and $Status -in @('Running', 'StartPending') } `
-            -CompleteStop { param($Key, $Name, $Result) if ([string]$Result.FinalStatus -in @('Paused', 'PausePending', 'ContinuePending')) { $restartIntent[$Key] = $false } } `
+            -CompleteStop { param($Key, $Name, $Result)
+                $stopCompleted[$Key] = ([bool]$Result.Success -or [string]$Result.FinalStatus -eq 'Stopped')
+                if ([string]$Result.FinalStatus -in @('Paused', 'PausePending', 'ContinuePending')) { $restartIntent[$Key] = $false } } `
             -StopTimeoutSeconds $ServiceStopTimeoutSeconds `
             -PollIntervalSeconds $ServicePollIntervalSeconds
     }
@@ -532,6 +613,7 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
     # Крок 9: запуск у канонічному порядку.
     Write-Log -Message "=== ЗАПУСК СЛУЖБ ===" -Level "INFO"
     $startOutcome = @{ RestartFailed = $false }
+    $Outcome.CoveredCriticalFrom = $script:CriticalErrorsList.Count
     Invoke-BRAVOMaintenanceServiceStartSequence `
         -ServiceSet $chainServiceSet `
         -RestartIntent $restartIntent `
@@ -539,6 +621,7 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
         -StartTimeoutSeconds $ServiceStartTimeoutSeconds `
         -PollIntervalSeconds $ServicePollIntervalSeconds `
         -Outcome $startOutcome
+    $Outcome.CoveredCriticalTo = $script:CriticalErrorsList.Count
 
     # Крок 10: облік спроби (лише впалі служби, які справді запускали).
     $attemptedFailedKeys = @($plan.FailedKeys | Where-Object { $startOutcome.Attempted[$_] })
@@ -559,7 +642,7 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
     # Маркер знімається, коли кожну службу, яку профіль зупинив, знову
     # запущено: впалі до профілю служби профіль не зупиняв, їх наступну
     # спробу веде пауза FR-5 (маркер затулив би їх як OwnedByBravo).
-    $stoppedNotStarted = @($stopKeys | Where-Object { $restartIntent[$_] -and -not $startOutcome.Started[$_] })
+    $stoppedNotStarted = @($stopKeys | Where-Object { $stopCompleted[$_] -and $restartIntent[$_] -and -not $startOutcome.Started[$_] })
     if ($stoppedNotStarted.Count -eq 0) {
         try {
             if (-not (Clear-BRAVOServiceQuiescenceState)) {
@@ -595,6 +678,8 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
             -ServiceName $serviceName -ExitCode $conditions[$failedKey].ExitCode `
             -ServiceSpecificExitCode $conditions[$failedKey].ServiceSpecificExitCode -EventText $eventText `
             -AttemptNumber $attemptNumber -Reason $reason -LogPath $LOG_FILE)
+        $Outcome.NotifiedKeys += $failedKey
+        if ($kind -eq 'Failed') { $Outcome.FailedNotifications++ }
         if ($null -ne $registration -and $registration.CyclicCriticalDue) {
             $cyclicContent = New-BRAVOServiceRecoveryNotificationContent -Kind Cyclic `
                 -ServiceName $serviceName -AttemptNumber $registration.AttemptNumber `
@@ -607,5 +692,6 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
         Send-BRAVOMaintenanceServiceRecoveryNotification -Content (New-BRAVOServiceRecoveryNotificationContent -Kind Failed `
             -ServiceName ([string]$ServiceSet.$stoppedKey.Name) -ExitCode $null `
             -Reason "службу зупинено для перезапуску $($ServiceSet.Bravo.Name), але не запущено" -LogPath $LOG_FILE)
+        $Outcome.FailedNotifications++
     }
 }
