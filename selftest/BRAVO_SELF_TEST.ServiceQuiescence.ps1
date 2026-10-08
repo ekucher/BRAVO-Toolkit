@@ -847,12 +847,21 @@ function Get-BRAVOWmiInstance {
         [pscustomobject]@{ Name = 'BravoStartTypeAutomatic'; StartMode = 'Disabled' }
     )
 }
+# #314 FR-7: впала служба будить задачу BRAVO_SERVICE_RECOVERY через
+# справжню Start-BRAVOHealthServiceRecoveryTask. Задача вже виконується —
+# без запуску й без окремої issue про задачу, тож лічильник issue цієї
+# проби лишається про саму службу.
+function Get-BRAVOScheduledTaskState {
+    param([string]$TaskPath, [string]$TaskName)
+    return [pscustomobject]@{ Exists = $true; State = 'Running'; IsRunning = $true; Provider = 'COM'; Task = $null; Error = $null }
+}
 '@
     $startTypeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startTypeStubs + "`n" + $healthRuntimeTextForQuiescence + "`n" + $systemModuleTextForQuiescence) `
         -FunctionNames @('Write-HealthLog', 'Get-Service', 'Read-BRAVOServiceQuiescenceState', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled',
             'Get-BRAVOWin32ServiceInfo', 'Test-BRAVOServiceDisabledByOperator',
-            'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition', 'Get-ManagedServiceHealthIssues')
+            'Get-BRAVOServiceStartMode', 'Get-BRAVOManagedServiceCondition', 'Get-ManagedServiceHealthIssues',
+            'Get-BRAVOScheduledTaskState', 'Start-BRAVOHealthServiceRecoveryTask')
     $startTypeProbe = {
         param($ServiceName, [bool]$WmiFails = $false, $Marker = $null, [bool]$MarkerThrows = $false)
         Set-StrictMode -Version 2.0
