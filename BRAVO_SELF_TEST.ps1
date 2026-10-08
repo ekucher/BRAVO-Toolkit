@@ -16106,7 +16106,9 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
             # перезапуску, не зупиняється (вже стоїть) і запускається у finally в
             # порядку BRAVO -> exchangAPI -> BRAVO Web навіть після винятку в
             # кроці; спроба рахується в state (до запуску), після запуску —
-            # WARNING Recovered без -IsCritical.
+            # WARNING Recovered без -IsCritical. Другий запис state після
+            # запуску — stableSince як перше спостереження стабільності (рев'ю
+            # PR #429): облік спроб він не змінює.
             $maintenanceThrowRecoveryWrite = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^RSTATE-WRITE '
             $maintenanceThrowRecoveryStart = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^START exchangAPI$'
             $maintenanceThrowRecoveryAlert = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^ALERT WARNING critical=False Служба exchangAPI впала \(ExitCode невідомий\), журнали збережено, запущена\. Спроба 1 за добу\.'
@@ -16116,7 +16118,7 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
                     (@($maintenanceThrowEvents | Where-Object { $_ -like 'MARKER-WRITE *' -or $_ -like 'MARKER-NO-RESTART *' }) -join '|') -ceq 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb' -and
                     (@($maintenanceThrowEvents | Where-Object { $_ -like 'START *' }) -join '|') -ceq 'START BRAVO|START exchangAPI|START BravoWeb' -and
                     (@($maintenanceThrowEvents | Where-Object { $_ -like 'STOP *' } | Sort-Object) -join '|') -ceq 'STOP BRAVO|STOP BravoWeb' -and
-                    (@($maintenanceThrowEvents | Where-Object { $_ -like 'RSTATE-WRITE *' }) -join '|') -ceq 'RSTATE-WRITE exchangAPI=1' -and
+                    (@($maintenanceThrowEvents | Where-Object { $_ -like 'RSTATE-WRITE *' }) -join '|') -ceq 'RSTATE-WRITE exchangAPI=1|RSTATE-WRITE exchangAPI=1' -and
                     @($maintenanceThrowEvents | Where-Object { $_ -like 'ALERT *' }).Count -eq 1 -and
                     $maintenanceThrowRecoveryWrite -ge 0 -and
                     $maintenanceThrowRecoveryWrite -lt $maintenanceThrowRecoveryStart -and
@@ -16336,7 +16338,7 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
                     ($maintenanceStartModeHeldFailed.Held -join ',') -ceq 'BRAVO,exchangAPI,BravoWeb' -and
                     ($maintenanceStartModeHeldFailed.Native -join '|') -ceq 'NATIVE Архівація моделі перед реставрацією' -and
                     (@($maintenanceStartModeHeldFailed.Events | Where-Object { $_ -like 'START *' }) -join ',') -ceq 'START BRAVO,START exchangAPI,START BravoWeb' -and
-                    (@($maintenanceStartModeHeldFailed.Events | Where-Object { $_ -like 'RSTATE-WRITE *' }) -join '|') -ceq 'RSTATE-WRITE BravoWeb=1' -and
+                    (@($maintenanceStartModeHeldFailed.Events | Where-Object { $_ -like 'RSTATE-WRITE *' }) -join '|') -ceq 'RSTATE-WRITE BravoWeb=1|RSTATE-WRITE BravoWeb=1' -and
                     @($maintenanceStartModeHeldFailed.Events | Where-Object { $_ -like 'ALERT WARNING critical=False Служба BravoWeb впала *' }).Count -eq 1
                 ) `
                 -Name "Maintenance/StartModeInitiallyStoppedFailedServiceIsHeldAndRestarted" `

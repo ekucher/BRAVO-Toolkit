@@ -1307,6 +1307,29 @@ function Register-BRAVOMaintenanceServiceRecoveryAttempt {
     return $recoveryAttempt
 }
 
+function Register-BRAVOMaintenanceServiceRecoveryStartConfirmed {
+    # Успішний запуск впалої служби — перше спостереження стабільності
+    # (рев'ю PR #429): облік спроби скинув stableSince, і без цього
+    # 30-хвилинне вікно скидання відкривалося б лише наступним тиком
+    # профілю (фактично до ~45 хв). stableSince = момент підтвердженого
+    # Running; спостереження лише відкриває вікно — облік спроб скидає
+    # Register-BRAVOServiceRecoveryStableObservation тільки після 30 хв
+    # Running від цього моменту. Збій обліку — лише WARNING: служба вже
+    # запущена, і наступний тик профілю поставить stableSince сам.
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    try {
+        $confirmedNow = Get-Date
+        $stableObservation = Register-BRAVOServiceRecoveryStableObservation -State (Get-BRAVOMaintenanceServiceRecoveryState) -ServiceName $Name -Now $confirmedNow
+        if ([bool]$stableObservation.Changed) {
+            $script:maintenanceServiceRecoveryState = $stableObservation.State
+            Save-BRAVOMaintenanceServiceRecoveryState -Now $confirmedNow
+        }
+    } catch {
+        Write-Log -Message "Не вдалося зафіксувати стабільність служби $Name після запуску: $($_.Exception.Message) — відлік 30 хв почне наступна перевірка (#314)" -Level "WARNING"
+    }
+}
+
 function Send-BRAVOMaintenanceServiceCyclicAlert {
     # FR-6: за CyclicAlertDue спроби (3-тя спроба за 24 год, далі не частіше
     # разу на добу) — CRITICAL «циклічно падає» без -IsCritical. Викликається
@@ -1681,6 +1704,7 @@ function Start-BRAVOMaintenanceManagedService {
                 }
                 if ($isRecovery) {
                     $recoveryStartSucceeded = $true
+                    Register-BRAVOMaintenanceServiceRecoveryStartConfirmed -Name $Name
                     Write-Log -Message "Служба $Name була зупинена до обслуговування ($(Get-BRAVOMaintenanceServiceExitCodeText -Condition $RecoveryCondition)), запущена" -Level "INFO"
                     Send-BRAVOMaintenanceServiceRecoveredAlert -Name $Name -Condition $RecoveryCondition -Attempt $recoveryAttempt -LastScmEvent $LastScmEvent
                 }
