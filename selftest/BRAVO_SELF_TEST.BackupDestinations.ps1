@@ -1462,6 +1462,77 @@ Test-BRAVOCondition -Condition (
             -Name 'BackupDestinations/InstallerExplicitDestinationRequiresExportedFunctions' `
             -Failure "комплект, модуль якого визначає, але не експортує потрібну функцію (Get-BRAVOConfiguratorBackupDestinationProfile), має відхиляти явний -BackupDestination ДО копіювання (без VERSION.json) з назвою функції в причині: $($bdE2eNoExportFailures -join ' | ')"
 
+        # (Codex P2, раунд 4) Звірка експорту спирається на екземпляр модуля,
+        # який щойно повернув Import-Module -PassThru з $ModuleRoot, а не на
+        # Get-Command за ModuleName: однойменний модуль з іншого шляху, уже
+        # завантажений у сесію, не повинен «закрити» функцію, якої свіжий
+        # екземпляр не експортує. Справжні функції інсталятора виконуються в
+        # дочірньому процесі над мінімальними фейковими модулями: застарілий
+        # корінь (усе експортує) імпортовано заздалегідь, свіжий корінь не
+        # експортує Get-BRAVOConfiguratorBackupDestinationProfile → відмова з
+        # назвою функції; повний свіжий корінь при тому самому застарілому → без відмови.
+        $bdE2eStaleFailures = @()
+        $bdE2eStaleDefinitions = @($bdInstallAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            @('Get-BRAVOInstallBackupDestinationRequiredFunctions', 'Import-BRAVOInstallBackupDestinationModules') -contains $_.Name
+        } | ForEach-Object { $_.Extent.Text })
+        if ($bdE2eStaleDefinitions.Count -ne 2) { $bdE2eStaleFailures += "функції інсталятора не знайдено ($($bdE2eStaleDefinitions.Count) з 2)" }
+        $bdE2eStaleModules = [ordered]@{
+            'BRAVO.Configurator\BRAVO.Configurator.Persistence' = @('Get-BRAVOConfiguratorProductionOverrideState', 'New-BRAVOConfiguratorSeedLocalConfig')
+            'BRAVO.Configurator\BRAVO.Configurator.Presets'     = @('Get-BRAVOConfiguratorBackupDestinationProfile', 'Test-BRAVOConfiguratorBackupDestinationEffective')
+            'BRAVO.Configuration\BRAVO.Configuration'           = @('Get-BRAVODefaultConfiguration', 'Resolve-BRAVORawConfiguration')
+            'BRAVO.Discovery\BRAVO.Discovery'                   = @('Get-BRAVOEffectiveStorageConfiguration')
+        }
+        $bdE2eStaleRoots = @{}
+        foreach ($bdE2eStaleRootName in @('stale', 'fresh_noexport', 'fresh_full')) {
+            $bdE2eStaleRoot = Join-Path $bdE2eRoot ('modroot_' + $bdE2eStaleRootName)
+            $bdE2eStaleRoots[$bdE2eStaleRootName] = $bdE2eStaleRoot
+            foreach ($bdE2eStaleModule in @($bdE2eStaleModules.Keys)) {
+                $bdE2eStaleBase = Join-Path (Join-Path $bdE2eStaleRoot 'modules') $bdE2eStaleModule
+                [void](New-Item -ItemType Directory -Path (Split-Path -Parent $bdE2eStaleBase) -Force)
+                $bdE2eStaleNames = @($bdE2eStaleModules[$bdE2eStaleModule])
+                $bdE2eStaleExports = @($bdE2eStaleNames | Where-Object {
+                    -not ($bdE2eStaleRootName -eq 'fresh_noexport' -and $_ -eq 'Get-BRAVOConfiguratorBackupDestinationProfile') })
+                $bdE2eStaleText = ((@($bdE2eStaleNames | ForEach-Object { 'function ' + $_ + " { return '" + $bdE2eStaleRootName + "' }" }) +
+                    @('Export-ModuleMember -Function @(' + ((@($bdE2eStaleExports | ForEach-Object { "'" + $_ + "'" })) -join ', ') + ')')) -join "`r`n") + "`r`n"
+                [IO.File]::WriteAllText($bdE2eStaleBase + '.psm1', $bdE2eStaleText, (New-Object Text.UTF8Encoding($true)))
+                if ($bdE2eStaleModule -notlike 'BRAVO.Configurator\*') {
+                    $bdE2eStaleLeaf = Split-Path -Leaf $bdE2eStaleBase
+                    [IO.File]::WriteAllText($bdE2eStaleBase + '.psd1', ("@{`r`n    RootModule = '" + $bdE2eStaleLeaf + ".psm1'`r`n    ModuleVersion = '1.0.0'`r`n    FunctionsToExport = '*'`r`n}`r`n"),
+                        (New-Object Text.UTF8Encoding($true)))
+                }
+            }
+        }
+        $bdE2eStaleChild = Join-Path $bdE2eRoot 'Invoke-StaleModuleExportCheck.ps1'
+        [IO.File]::WriteAllText($bdE2eStaleChild, ((@(
+            'param([string]$StaleRoot, [string]$FreshRoot)',
+            'Set-StrictMode -Version 2.0',
+            '$ErrorActionPreference = ''Stop'''
+        ) + $bdE2eStaleDefinitions + @(
+            'foreach ($stalePath in @(''modules\BRAVO.Configurator\BRAVO.Configurator.Persistence.psm1'', ''modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1'', ''modules\BRAVO.Configuration\BRAVO.Configuration.psd1'', ''modules\BRAVO.Discovery\BRAVO.Discovery.psd1'')) {',
+            '    Import-Module -Name (Join-Path $StaleRoot $stalePath) -ErrorAction Stop',
+            '}',
+            'try { Import-BRAVOInstallBackupDestinationModules -ModuleRoot $FreshRoot -Destination LocalOnly -BeforeDeploy; ''RESULT: accepted'' } catch { ''RESULT: refused '' + $_.Exception.Message }'
+        )) -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+        foreach ($bdE2eStaleCase in @(
+            @{ Fresh = 'fresh_noexport'; Refused = $true },
+            @{ Fresh = 'fresh_full'; Refused = $false }
+        )) {
+            $bdE2eStaleOutput = (@(& $bdE2eHostPath -NoProfile -NonInteractive -File $bdE2eStaleChild -StaleRoot $bdE2eStaleRoots['stale'] `
+                -FreshRoot $bdE2eStaleRoots[$bdE2eStaleCase.Fresh] 2>&1 | ForEach-Object { [string]$_ }) -join ' ')
+            if ($bdE2eStaleCase.Refused) {
+                if (-not $bdE2eStaleOutput.Contains('RESULT: refused') -or -not $bdE2eStaleOutput.Contains('Get-BRAVOConfiguratorBackupDestinationProfile') -or
+                    -not $bdE2eStaleOutput.Contains('Нічого не розгорнуто')) {
+                    $bdE2eStaleFailures += "$($bdE2eStaleCase.Fresh): очікувано відмову з назвою функції, отримано: $bdE2eStaleOutput"
+                }
+            } elseif (-not $bdE2eStaleOutput.Contains('RESULT: accepted')) {
+                $bdE2eStaleFailures += "$($bdE2eStaleCase.Fresh): очікувано без відмови, отримано: $bdE2eStaleOutput"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eStaleFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerExportCheckIgnoresStaleSameNameModule' `
+            -Failure "звірка експорту має спиратися на щойно імпортований з `$ModuleRoot екземпляр модуля, а не на однойменний модуль з іншого шляху, уже завантажений у сесію: $($bdE2eStaleFailures -join ' | ')"
+
         # (Codex P2, раунд 3) Відбиток BRAVO.local.config і те, що прочитав
         # канонічний reader у кроці 1, — ті самі байти. Фікстура: імпорт
         # Persistence.psm1 (між зняттям знімка й читанням) підміняє живий файл

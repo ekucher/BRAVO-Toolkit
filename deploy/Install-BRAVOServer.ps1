@@ -225,10 +225,14 @@ function Assert-BRAVOInstallBundleIntegrity {
 # раунд 3): AST-перевірка можливостей бачить визначення, але функцію, яку
 # модуль не експортує (Export-ModuleMember/FunctionsToExport), викликати не
 # можна. Тому після імпорту кожна функція з
-# Get-BRAVOInstallBackupDestinationRequiredFunctions мусить знаходитись
-# Get-Command саме з свого модуля; інакше — відмова. Лише для явного профілю
-# (крок 1 над приватною копією, крок 4 над розгорнутим каталогом), де код
-# комплекту однаково імпортується; неявний шлях не імпортує нічого зайвого.
+# Get-BRAVOInstallBackupDestinationRequiredFunctions мусить бути в
+# ExportedFunctions саме того екземпляра модуля, який щойно повернув
+# Import-Module -PassThru, чий Path лежить під $ModuleRoot, і Get-Command має
+# вказувати на цей екземпляр (Codex P2, раунд 4: однойменний модуль з іншого
+# шляху, уже завантажений у сесію, не підміняє перевірку); інакше — відмова.
+# Лише для явного профілю (крок 1 над приватною копією, крок 4 над
+# розгорнутим каталогом), де код комплекту однаково імпортується; неявний
+# шлях не імпортує нічого зайвого.
 function Import-BRAVOInstallBackupDestinationModules {
     param(
         [Parameter(Mandatory = $true)][string]$ModuleRoot,
@@ -236,18 +240,43 @@ function Import-BRAVOInstallBackupDestinationModules {
         [switch]$BeforeDeploy
     )
     $deployState = $(if ($BeforeDeploy) { ' Нічого не розгорнуто.' } else { '' })
-    foreach ($assertModuleName in @('BRAVO.Configurator.Persistence', 'BRAVO.Configurator.Presets')) {
-        Import-Module -Name (Join-Path $ModuleRoot ('modules\BRAVO.Configurator\' + $assertModuleName + '.psm1')) -Force -ErrorAction Stop
+    # Ключ — ім'я модуля (для .psd1 PassThru повертає кореневий модуль з тим
+    # самим ім'ям і Path = його .psm1), значення — PSModuleInfo щойно
+    # імпортованого екземпляра.
+    $importedModules = @{}
+    $importPaths = @(
+        'modules\BRAVO.Configurator\BRAVO.Configurator.Persistence.psm1',
+        'modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1',
+        'modules\BRAVO.Configuration\BRAVO.Configuration.psd1',
+        'modules\BRAVO.Discovery\BRAVO.Discovery.psd1'
+    )
+    foreach ($importPath in $importPaths) {
+        foreach ($importedModule in @(Import-Module -Name (Join-Path $ModuleRoot $importPath) -Force -PassThru -ErrorAction Stop)) {
+            if ($null -ne $importedModule -and -not $importedModules.ContainsKey([string]$importedModule.Name)) {
+                $importedModules[[string]$importedModule.Name] = $importedModule
+            }
+        }
     }
-    Import-Module -Name (Join-Path $ModuleRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force -ErrorAction Stop
-    Import-Module -Name (Join-Path $ModuleRoot 'modules\BRAVO.Discovery\BRAVO.Discovery.psd1') -Force -ErrorAction Stop
+    $moduleRootPrefix = [System.IO.Path]::GetFullPath($ModuleRoot).Replace('/', '\').TrimEnd('\') + '\'
     $requiredModules = Get-BRAVOInstallBackupDestinationRequiredFunctions
     $notExported = @()
     foreach ($relativePath in @($requiredModules.Keys)) {
         $moduleName = [System.IO.Path]::GetFileNameWithoutExtension(@($relativePath -split '\\')[-1])
+        $moduleInfo = $importedModules[$moduleName]
+        $modulePath = ''
+        if ($null -ne $moduleInfo -and -not [string]::IsNullOrEmpty([string]$moduleInfo.Path)) {
+            $modulePath = [System.IO.Path]::GetFullPath([string]$moduleInfo.Path).Replace('/', '\')
+        }
+        $fromModuleRoot = ($modulePath.Length -gt 0 -and
+            $modulePath.StartsWith($moduleRootPrefix, [System.StringComparison]::OrdinalIgnoreCase))
         foreach ($functionName in @($requiredModules[$relativePath])) {
-            $command = @(Get-Command -Name $functionName -CommandType Function -ErrorAction SilentlyContinue)
-            if ($command.Count -ne 1 -or [string]$command[0].ModuleName -ne $moduleName) {
+            $exported = ($fromModuleRoot -and $moduleInfo.ExportedFunctions.ContainsKey($functionName))
+            if ($exported) {
+                $command = @(Get-Command -Name $functionName -CommandType Function -ErrorAction SilentlyContinue)
+                $exported = ($command.Count -eq 1 -and $null -ne $command[0].Module -and
+                    [string]$command[0].Module.Path -eq [string]$moduleInfo.Path)
+            }
+            if (-not $exported) {
                 $notExported += ($moduleName + ': ' + $functionName)
             }
         }
