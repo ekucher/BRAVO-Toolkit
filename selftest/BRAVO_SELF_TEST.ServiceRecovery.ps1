@@ -1216,21 +1216,13 @@ function Enter-BRAVOMaintenanceOperationLock {
     return [pscustomobject]@{ Success = $true; Stream = $null; Path = 'self-test-lock'; Error = $null }
 }
 function Exit-BRAVOMaintenanceOperationLock { Add-ProbeEvent 'LOCK-EXIT' }
-function Read-BRAVOOperationLockHolder {
-    param([string]$Path)
-    $script:ProbeLockHolderReads++
-    if ($script:ProbeLockHolderReads -ge 2 -and $null -ne $script:ProbeLockHolderRecheck) { return $script:ProbeLockHolderRecheck }
-    return $script:ProbeLockHolder
-}
+function Read-BRAVOOperationLockHolder { param([string]$Path) return $script:ProbeLockHolder }
 function Test-BRAVOProcessAlive { param([int]$ProcessId, [string]$ProcessStartTime) return [bool]$script:ProbeLockHolderAlive }
 function Write-BRAVOServiceQuiescenceState {
     param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed, [object[]]$StartTypeSnapshot, [switch]$PreserveForeignStartTypeSnapshot)
     if ($script:ProbeMarkerWriteFails) { Add-ProbeEvent 'MARKER-WRITE-FAIL'; throw 'self-test: імітований збій запису ownership-маркера' }
     Add-ProbeEvent ('MARKER-WRITE {0} {1}' -f $Owner, ((@($Services) | ForEach-Object { '{0}={1}' -f $_.Name, [bool]$_.RestartIntent }) -join ','))
-    $script:ProbeMarkerState = [pscustomobject]@{ owner = $Owner; pid = $PID }
 }
-function Read-BRAVOServiceQuiescenceState { return $script:ProbeMarkerState }
-function Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess { param($State) return [bool]$script:ProbeMarkerOwned }
 function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
 function Get-BRAVOForeignServiceQuiescenceContext { return $script:ProbeForeignContext }
 function Get-BRAVOServiceRecoveryStatePath { return $script:ProbeStatePath }
@@ -1239,6 +1231,7 @@ function Write-BRAVOStateFileAtomic {
     param([string]$Path, [AllowEmptyString()][string]$Text)
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
     [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+    if ([IO.Path]::GetFileName($Path) -eq 'BRAVO_SERVICE_RECOVERY_BACKUP_DEFERRAL.json') { Add-ProbeEvent 'DEFERRAL-STATE-WRITE'; return }
     Add-ProbeEvent 'RECOVERY-STATE-WRITE'
 }
 function Resolve-BRAVONotificationRoute {
@@ -1250,7 +1243,7 @@ function Resolve-BRAVONotificationRoute {
 function New-MaintenanceNotificationMessage { param($Title, $TitleEmoji, $Duration, $DurationLabel, $StatusLines, $Details, $LogPath, $Severity) return ('{0}|{1}' -f $Severity, $Title) }
 function Invoke-NotificationWebhook { param([string]$Message, [string]$WebhookUrl) Add-ProbeEvent ('NOTIFY ' + $Message) }
 function Invoke-BRAVOTraceRotation { param($Sources, $DestinationDirectory, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'TRACE-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
-function Invoke-BRAVOExchangeApiLogRotation { param($SourceDirectory, $DestinationDirectory, $Patterns, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'EXCHANGE-ROTATION'; if ($script:ProbeExternalStartDuringLogs) { $script:ProbeServices['exchangAPI'] = 'Running' }; if ($script:ProbeMarkerTakenOverDuringLogs) { $script:ProbeMarkerOwned = $false }; return [pscustomobject]@{ Found = 1; Moved = 1; Errors = [int]$script:ProbeExchangeRotationErrors } }
+function Invoke-BRAVOExchangeApiLogRotation { param($SourceDirectory, $DestinationDirectory, $Patterns, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'EXCHANGE-ROTATION'; if ($script:ProbeExternalStartDuringLogs) { $script:ProbeServices['exchangAPI'] = 'Running' }; return [pscustomobject]@{ Found = 1; Moved = 1; Errors = [int]$script:ProbeExchangeRotationErrors } }
 function Invoke-BRAVOApacheLogRotation { param($SourceDirectory, $DestinationDirectory, $Filter, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'APACHE-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
 function Invoke-BRAVOWebApplicationLogRotation { param($SourceDirectory, $DestinationDirectory, $Filter, $RetryCount, $RetryDelaySeconds, $Logger) Add-ProbeEvent 'WEBAPP-ROTATION'; return [pscustomobject]@{ Moved = 1; Errors = 0 } }
 function Get-BRAVOTraceConfiguration { param($DiscoveryResult, $TraceRootDirectory, $DateFolderName) return [pscustomobject]@{ IsValid = $true; TracePath = 'self-test-trace.log'; Reason = $null } }
@@ -1259,10 +1252,6 @@ function Resolve-BRAVOExchangeApiRuntimeDirectory { param($ServiceName, $Fallbac
 function Get-BRAVOWmiInstance {
     param($ClassName, $Filter)
     if ($ClassName -eq 'Win32_OperatingSystem' -and $script:ProbeBootTimeUnreadable) { throw 'self-test: WMI недоступний' }
-    if ($ClassName -eq 'Win32_Process') {
-        if ($script:ProbeProcessQueryFails) { throw 'self-test: Win32_Process недоступний' }
-        return @($script:ProbeProcesses)
-    }
     return [pscustomobject]@{ LastBootUpTime = (Get-Date).AddMinutes(-[int]$script:ProbeUptimeMinutes) }
 }
 function Get-WinEvent {
@@ -1300,35 +1289,21 @@ $probeScenarios = [ordered]@{
         $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true
         $script:ProbeLockHolder = [pscustomobject]@{ Operation = 'Archive'; Pid = 4242; ProcessStartTime = 'self-test-start'; HostName = [Environment]::MachineName; StartedAt = ''; GenerationId = ''; Description = 'operation=Archive; pid=4242' }
     }
-    'RSLockBusyArchiveNightlyMaintenance' = {
+    'RSLockBusyArchiveWarnedRecently' = {
         $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder
-        $script:ProbeProcesses = @($script:ProbeProcesses) + @([pscustomobject]@{ ProcessId = 5151; CommandLine = 'powershell.exe -NoProfile -File "C:\BRAVO\BRAVO_MAINTENANCE.ps1" -NoPause' })
+        $script:ProbeDeferralSeed = ([ordered]@{ schemaVersion = 1; hostname = [Environment]::MachineName; services = [ordered]@{ exchangAPI = $probeNow.AddMinutes(-20).ToString('o') } } | ConvertTo-Json -Depth 4)
     }
-    'RSLockBusyArchiveDataRestore' = {
+    'RSLockBusyArchiveWarnedLongAgo' = {
         $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder
-        $script:ProbeProcesses = @($script:ProbeProcesses) + @([pscustomobject]@{ ProcessId = 5252; CommandLine = 'powershell.exe -File C:\BRAVO\BRAVO_DATA_RESTORE.ps1 -NoPause' })
+        $script:ProbeDeferralSeed = ([ordered]@{ schemaVersion = 1; hostname = [Environment]::MachineName; services = [ordered]@{ exchangAPI = $probeNow.AddMinutes(-61).ToString('o') } } | ConvertTo-Json -Depth 4)
     }
-    'RSLockBusyArchiveUnreadableProcess' = {
+    'RSLockBusyArchiveCorruptDeferral' = {
         $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder
-        $script:ProbeProcesses = @($script:ProbeProcesses) + @([pscustomobject]@{ ProcessId = 5353; CommandLine = $null })
+        $script:ProbeDeferralSeed = '{ не json'
     }
-    'RSLockBusyArchiveNotArchiveProcess' = {
-        $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder
-        $script:ProbeProcesses = @([pscustomobject]@{ ProcessId = 4242; CommandLine = 'powershell.exe -File C:\Tools\other.ps1' })
-    }
-    'RSLockBusyArchiveProcessQueryFails' = {
-        $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder; $script:ProbeProcessQueryFails = $true
-    }
-    'RSLockBusyArchiveHolderChanged' = {
-        $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder
-        $script:ProbeLockHolderRecheck = [pscustomobject]@{ Operation = 'Maintenance'; Pid = 5151; ProcessStartTime = 'self-test-start-2'; HostName = [Environment]::MachineName; StartedAt = 'later'; GenerationId = ''; Description = 'operation=Maintenance; pid=5151' }
-    }
-    'RSLockBusyArchiveSiblingRecover' = {
-        $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder
-        $script:ProbeProcesses = @($script:ProbeProcesses) + @([pscustomobject]@{ ProcessId = 6161; CommandLine = 'powershell.exe -File "C:\BRAVO\BRAVO_MAINTENANCE.ps1" -RecoverServices -NoPause' })
-    }
-    'RSLockBusyArchiveMarkerTakenOver' = {
-        $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder; $script:ProbeMarkerTakenOverDuringLogs = $true
+    'RSLockBusyArchiveOtherService' = {
+        $script:ProbeServices['BravoWeb'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolder = $script:ProbeArchiveHolder
+        $script:ProbeDeferralSeed = ([ordered]@{ schemaVersion = 1; hostname = [Environment]::MachineName; services = [ordered]@{ exchangAPI = $probeNow.AddMinutes(-20).ToString('o') } } | ConvertTo-Json -Depth 4)
     }
     'RSLockBusyArchiveDead' = {
         $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeLockBusy = $true; $script:ProbeLockHolderAlive = $false
@@ -1423,14 +1398,8 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             $script:ProbeLockBusy = $false
             $script:ProbeLockHolder = $null
             $script:ProbeLockHolderAlive = $true
-            $script:ProbeLockHolderReads = 0
-            $script:ProbeLockHolderRecheck = $null
             $script:ProbeArchiveHolder = [pscustomobject]@{ Operation = 'Archive'; Pid = 4242; ProcessStartTime = 'self-test-start'; HostName = [Environment]::MachineName; StartedAt = 'self-test-started'; GenerationId = ''; Description = 'operation=Archive; pid=4242' }
-            $script:ProbeProcesses = @([pscustomobject]@{ ProcessId = 4242; CommandLine = 'powershell.exe -NoProfile -File "C:\BRAVO\BRAVO_ARCHIV.ps1" -NoPause' })
-            $script:ProbeProcessQueryFails = $false
-            $script:ProbeMarkerState = $null
-            $script:ProbeMarkerOwned = $true
-            $script:ProbeMarkerTakenOverDuringLogs = $false
+            $script:ProbeDeferralSeed = $null
             $script:ProbeUptimeMinutes = 180
             $script:ProbeBootTimeUnreadable = $false
             $script:ProbeBootRestoreMode = $null
@@ -1445,7 +1414,12 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             $script:ProbeRunMissedRestoreOnly = $false
             $script:ProbeForeignContext = [pscustomobject]@{ Present = $false; OwnerAlive = $false; Owner = $null; RestartSuppressed = $false; RestartIntentNames = @(); HeldSnapshot = @() }
             $script:ProbeStatePath = Join-Path (Join-Path $ScenarioRoot 'state') 'BRAVO_SERVICE_RECOVERY_STATE.json'
+            $probeDeferralPath = Join-Path (Join-Path $ScenarioRoot 'state') 'BRAVO_SERVICE_RECOVERY_BACKUP_DEFERRAL.json'
             . $ScenarioSeed
+            if ($null -ne $script:ProbeDeferralSeed) {
+                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($probeDeferralPath))
+                [IO.File]::WriteAllText($probeDeferralPath, [string]$script:ProbeDeferralSeed, (New-Object Text.UTF8Encoding($false)))
+            }
             if ($null -ne $script:ProbeStateSeed) {
                 [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($script:ProbeStatePath))
                 [IO.File]::WriteAllText($script:ProbeStatePath, [string]$script:ProbeStateSeed, (New-Object Text.UTF8Encoding($false)))
@@ -1496,12 +1470,15 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             foreach ($probeLogFile in $probeLogFiles) { $probeLogText += [IO.File]::ReadAllText((Join-Path $LOG_DIR $probeLogFile), [Text.Encoding]::UTF8) }
             $probeStateText = ''
             if ([IO.File]::Exists($script:ProbeStatePath)) { $probeStateText = [IO.File]::ReadAllText($script:ProbeStatePath, [Text.Encoding]::UTF8) }
+            $probeDeferralText = ''
+            if ([IO.File]::Exists($probeDeferralPath)) { $probeDeferralText = [IO.File]::ReadAllText($probeDeferralPath, [Text.Encoding]::UTF8) }
             [pscustomobject]@{
                 ExitCode = $probeExitCode
                 Events = @($script:ProbeEvents)
                 LogFiles = @($probeLogFiles)
                 LogText = $probeLogText
                 StateText = $probeStateText
+                DeferralText = $probeDeferralText
                 QueuedCritical = $script:CriticalErrorsList.Count
                 DeliveredCritical = [int]$script:maintenanceDeliveredCriticalAlertCount
                 OwnLogUploadSuppressed = [bool]$script:maintenanceOwnLogUploadAttempted
@@ -1663,54 +1640,35 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             param($Result) ([string]$Result.LogText).Contains('тримає: operation=Maintenance; pid=4242; служби не змінювались')
         } 'ServiceRecovery/RecoverServicesLockBusyNamesHolder' `
             "Рев'ю PR #432 (B-P2-2): lock тримає нічний Maintenance — код 20, без змін, у рядку INFO названо операцію власника"
-        & $recoverCheck 'RSLockBusyArchive' 0 @(
-            'LOCK-BUSY'; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
-            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered
-        ) $recoverLogName {
-            param($Result) ([string]$Result.LogText).Contains('[INFO] Операційний lock (self-test-lock) тримає BRAVO_ARCHIV (operation=Archive; pid=4242): він служб не зупиняє — відновлення виконується без lock-а')
-        } 'ServiceRecovery/RecoverServicesUnderArchiveLock' `
-            "Рев'ю PR #432 (B-P2-2): lock тримає живий BRAVO_ARCHIV цього хоста — служба відновлюється без lock-а (маркер, state, FR-6), чужий lock не звільняється"
-        # Рев'ю PR #432 (Codex P1): метадані lock-а можуть бути застарілими —
-        # обхід лише за підтвердженого володіння BRAVO_ARCHIV; будь-яка
-        # невизначеність — код 20 без змін, причина в рядку INFO.
-        $recoverBypassDenied = {
-            param([string]$Scenario, [string]$ReasonText, [string]$Name, [string]$Meaning)
-            $bypassExpectedText = 'тримає: operation=Archive; pid=4242; відновлення без lock-а не підтверджено: ' + $ReasonText + '; служби не змінювались'
-            $bypassExtra = { param($Result) ([string]$Result.LogText).Contains($bypassExpectedText) }.GetNewClosure()
-            & $recoverCheck $Scenario 20 @('LOCK-BUSY') $recoverPauseLogName $bypassExtra $Name $Meaning
-        }
-        & $recoverBypassDenied 'RSLockBusyArchiveNightlyMaintenance' 'виконується BRAVO_MAINTENANCE (pid=5151)' `
-            'ServiceRecovery/RecoverServicesArchiveLockNightlyMaintenanceRunningFailClosed' `
-            "Рев'ю PR #432 (Codex P1): запис lock-а — живий Archive, але вже працює нічний BRAVO_MAINTENANCE (новий власник lock-а ще не переписав метадані) — код 20 без змін"
-        & $recoverBypassDenied 'RSLockBusyArchiveDataRestore' 'виконується BRAVO_DATA_RESTORE (pid=5252)' `
-            'ServiceRecovery/RecoverServicesArchiveLockDataRestoreRunningFailClosed' `
-            "Рев'ю PR #432 (Codex P1): запис lock-а — живий Archive, але працює BRAVO_DATA_RESTORE — код 20 без змін"
-        & $recoverBypassDenied 'RSLockBusyArchiveUnreadableProcess' 'командний рядок процесу PowerShell pid=5353 не прочитано' `
-            'ServiceRecovery/RecoverServicesArchiveLockUnreadableCommandLineFailClosed' `
-            "Рев'ю PR #432 (Codex P1): командний рядок іншого процесу PowerShell не прочитано — невизначеність, код 20"
-        & $recoverBypassDenied 'RSLockBusyArchiveNotArchiveProcess' 'процес pid=4242 не є BRAVO_ARCHIV' `
-            'ServiceRecovery/RecoverServicesArchiveLockHolderNotArchiveProcessFailClosed' `
-            "Рев'ю PR #432 (Codex P1): живий pid із запису Archive виконує не BRAVO_ARCHIV.ps1 — код 20"
-        & $recoverBypassDenied 'RSLockBusyArchiveProcessQueryFails' 'список процесів PowerShell не прочитано' `
-            'ServiceRecovery/RecoverServicesArchiveLockProcessQueryFailureFailClosed' `
-            "Рев'ю PR #432 (Codex P1): запит Win32_Process не вдався — код 20"
-        & $recoverBypassDenied 'RSLockBusyArchiveHolderChanged' 'метадані власника змінилися під час перевірки' `
-            'ServiceRecovery/RecoverServicesArchiveLockHolderChangedFailClosed' `
-            "Рев'ю PR #432 (Codex P1): повторне читання власника після паузи дає інший запис — код 20"
-        & $recoverCheck 'RSLockBusyArchiveSiblingRecover' 0 @(
-            'LOCK-BUSY'; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
-            'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered
-        ) $recoverLogName $recoverOk 'ServiceRecovery/RecoverServicesArchiveLockIgnoresOtherRecoverProfile' `
-            "Рев'ю PR #432 (Codex P1): інший процес BRAVO_MAINTENANCE.ps1 -RecoverServices не є нічним Maintenance — підтверджений Archive дозволяє відновлення без lock-а"
-        & $recoverCheck 'RSLockBusyArchiveMarkerTakenOver' 10 @(
-            'LOCK-BUSY'; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
-            'EXCHANGE-ROTATION'; 'MARKER-CLEAR'
-        ) $recoverLogName {
+        # Рев'ю PR #432 (Codex, раунд 2, P1): відновлення без lock-а прибрано
+        # повністю — BRAVO_ARCHIV може звільнити lock посеред циклу, і тоді на
+        # профіль накладуться нічний Maintenance чи DataRestore. Lock зайнятий —
+        # завжди код 20 без змін служб і без запису state-файлу обліку; для
+        # живого BRAVO_ARCHIV цього хоста — WARNING «служба не працює;
+        # відновлення відкладено до завершення бекапу» не частіше разу на 60 хв
+        # на службу (окремий маленький файл, атомарний запис).
+        $recoverDeferred = 'NOTIFY WARNING|СЛУЖБА BRAVO НЕ ПРАЦЮЄ: ВІДНОВЛЕННЯ ВІДКЛАДЕНО'
+        $recoverArchiveLine = '[INFO] Відновлення служб відкладено: операційний lock зайнятий (self-test-lock); тримає: operation=Archive; pid=4242 — BRAVO_ARCHIV: відновлення відкладено до завершення бекапу; служби не змінювались'
+        & $recoverCheck 'RSLockBusyArchive' 20 @('LOCK-BUSY'; 'DEFERRAL-STATE-WRITE'; $recoverDeferred) $recoverPauseLogName {
             param($Result)
-            ([string]$Result.LogText).Contains('[WARNING] Ownership-маркер більше не належить профілю -RecoverServices (його перейняв інший власник) — запуск служб скасовано') -and
-            @($Result.Events | Where-Object { ([string]$_) -like 'NOTIFY *' }).Count -eq 0
-        } 'ServiceRecovery/RecoverServicesWithoutLockStopsWhenMarkerTakenOver' `
-            "Рев'ю PR #432 (Codex P1): без lock-а маркер перейняв інший власник (нічний Maintenance) — служба не запускається, WARNING і код 10"
+            ([string]$Result.LogText).Contains($recoverArchiveLine) -and [string]::IsNullOrEmpty([string]$Result.StateText) -and
+                ([string]$Result.DeferralText).Contains('"exchangAPI"')
+        } 'ServiceRecovery/RecoverServicesArchiveLockDefersWithWarning' `
+            "Рев'ю PR #432 (Codex, раунд 2, P1): lock тримає живий BRAVO_ARCHIV — код 20, служби не змінюються, state-файл обліку не пишеться; WARNING «відновлення відкладено до завершення бекапу» і мітка тротлінгу"
+        & $recoverCheck 'RSLockBusyArchiveWarnedRecently' 20 @('LOCK-BUSY') $recoverPauseLogName {
+            param($Result) ([string]$Result.LogText).Contains('попереднє сповіщення — менше 60 хв тому')
+        } 'ServiceRecovery/RecoverServicesArchiveLockWarningThrottled' `
+            "Рев'ю PR #432 (Codex, раунд 2, P1): WARNING про ту саму службу вже надсилалось 20 хв тому — код 20 без нового сповіщення"
+        & $recoverCheck 'RSLockBusyArchiveWarnedLongAgo' 20 @('LOCK-BUSY'; 'DEFERRAL-STATE-WRITE'; $recoverDeferred) $recoverPauseLogName $recoverOk `
+            'ServiceRecovery/RecoverServicesArchiveLockWarningRepeatsAfterHour' `
+            "Рев'ю PR #432 (Codex, раунд 2, P1): попереднє WARNING — 61 хв тому, служба досі не працює — сповіщення повторюється"
+        & $recoverCheck 'RSLockBusyArchiveCorruptDeferral' 20 @('LOCK-BUSY'; 'DEFERRAL-STATE-WRITE'; $recoverDeferred) $recoverPauseLogName $recoverOk `
+            'ServiceRecovery/RecoverServicesArchiveLockCorruptThrottleStillWarns' `
+            "Рев'ю PR #432 (Codex, раунд 2, P1): файл тротлінгу пошкоджений — сповіщення надсилається (мовчати про впалу службу не можна), файл перезаписується"
+        & $recoverCheck 'RSLockBusyArchiveOtherService' 20 @('LOCK-BUSY'; 'DEFERRAL-STATE-WRITE'; $recoverDeferred) $recoverPauseLogName {
+            param($Result) ([string]$Result.DeferralText).Contains('"BravoWeb"') -and ([string]$Result.DeferralText).Contains('"exchangAPI"')
+        } 'ServiceRecovery/RecoverServicesArchiveLockThrottlePerService' `
+            "Рев'ю PR #432 (Codex, раунд 2, P1): тротлінг — на службу: впала інша служба — WARNING про неї надсилається, мітка попередньої зберігається"
         & $recoverCheck 'RSLockBusyArchiveDead' 20 @('LOCK-BUSY') $recoverPauseLogName $recoverOk `
             'ServiceRecovery/RecoverServicesArchiveLockDeadHolderFailClosed' `
             "Рев'ю PR #432 (B-P2-2): lock із записом Archive, але процес власника не живий — fail-closed, код 20 без змін"

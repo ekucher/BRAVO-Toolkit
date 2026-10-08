@@ -44,7 +44,11 @@ function Get-BRAVOServiceRecoveryPolicy {
     #                            Recovery (Restore.StartupDelayMinutes) на запуск
     #                            задачі й захоплення operation-lock. Поки
     #                            пропущена реставрація чекає, гейт закритий без
-    #                            обмеження часу (Get-BRAVOServiceRecoveryBootGate).
+    #                            обмеження часу (Get-BRAVOServiceRecoveryBootGate);
+    #   BackupDeferralWarningMinutes
+    #                          - WARNING «служба не працює; відновлення відкладено
+    #                            до завершення бекапу» (operation-lock тримає
+    #                            BRAVO_ARCHIV) — не частіше на службу.
     return [pscustomobject]@{
         PauseMinutes = @(0, 5, 15, 60)
         WindowHours = 24
@@ -53,6 +57,7 @@ function Get-BRAVOServiceRecoveryPolicy {
         StableMinutes = 30
         BootGraceMinutes = 9
         BootHoldMarginMinutes = 10
+        BackupDeferralWarningMinutes = 60
     }
 }
 
@@ -123,6 +128,73 @@ function Get-BRAVOServiceRecoveryBootGate {
 function Get-BRAVOServiceRecoveryStatePath {
     # Поряд з ownership-маркером (BRAVO.System): той самий каталог машинного стану.
     return Join-Path (Split-Path -Path (Get-BRAVOServiceQuiescenceStatePath) -Parent) 'BRAVO_SERVICE_RECOVERY_STATE.json'
+}
+
+function Get-BRAVOServiceRecoveryBackupDeferralPath {
+    # Мітки WARNING «відновлення відкладено до завершення бекапу» — окремий
+    # маленький файл поряд зі state-файлом обліку (-StatePath): той пишуть
+    # лише власники operation-lock, а це WARNING надсилається саме тоді, коли
+    # lock тримає BRAVO_ARCHIV.
+    param([Parameter(Mandatory = $true)][string]$StatePath)
+    return Join-Path (Split-Path -Path $StatePath -Parent) 'BRAVO_SERVICE_RECOVERY_BACKUP_DEFERRAL.json'
+}
+
+function Register-BRAVOServiceRecoveryBackupDeferralWarning {
+    # Тротлінг WARNING «служба не працює; відновлення відкладено до
+    # завершення бекапу» (рев'ю PR #432, Codex раунд 2): не частіше ніж раз
+    # на BackupDeferralWarningMinutes на службу. Формат файлу -Path:
+    #   { "schemaVersion": 1, "hostname": "HOST-01",
+    #     "services": { "exchangAPI": "2026-10-08T10:15:00.0000000+03:00" } }
+    # Відсутній, пошкоджений чи чужий файл — як порожній: про впалу службу
+    # краще повідомити зайвий раз, ніж змовчати. Мітки служб із -ServiceNames,
+    # яким настав час, оновлюються ДО доставки (збій доставки не дає повтору
+    # на кожному тику), запис атомарний (Write-BRAVOStateFileAtomic);
+    # прострочені мітки прибираються. Збій запису — Warning, сповіщення все
+    # одно належить надіслати. Повертає { DueNames; Warning }.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [AllowEmptyCollection()][string[]]$ServiceNames = @(),
+        [Parameter(Mandatory = $true)][string]$HostName,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$Now
+    )
+
+    $intervalMinutes = [int](Get-BRAVOServiceRecoveryPolicy).BackupDeferralWarningMinutes
+    $result = [pscustomobject]@{ DueNames = @(); Warning = $null }
+    $warnedAt = @{}
+    try {
+        if ([IO.File]::Exists($Path)) {
+            $parsed = ConvertFrom-Json -InputObject ([string](Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop)) -ErrorAction Stop
+            if ($null -ne $parsed -and ($parsed.schemaVersion -as [int]) -eq 1 -and [string]$parsed.hostname -ieq $HostName -and $null -ne $parsed.services) {
+                foreach ($serviceProperty in @($parsed.services.PSObject.Properties)) {
+                    $warnedAt[[string]$serviceProperty.Name] = ConvertTo-BRAVOServiceRecoveryInstant -Value $serviceProperty.Value
+                }
+            }
+        }
+    } catch {
+        $warnedAt = @{}
+    }
+    $dueNames = @()
+    foreach ($serviceName in @($ServiceNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })) {
+        $lastWarnedAt = $null
+        if ($warnedAt.ContainsKey([string]$serviceName)) { $lastWarnedAt = $warnedAt[[string]$serviceName] }
+        if ($null -ne $lastWarnedAt -and $lastWarnedAt -le $Now -and ($Now - $lastWarnedAt).TotalMinutes -lt $intervalMinutes) { continue }
+        $dueNames += [string]$serviceName
+        $warnedAt[[string]$serviceName] = $Now
+    }
+    $result.DueNames = @($dueNames)
+    if ($dueNames.Count -eq 0) { return $result }
+    $servicesOut = [ordered]@{}
+    foreach ($serviceName in @($warnedAt.Keys | Sort-Object)) {
+        $stamp = $warnedAt[$serviceName]
+        if ($null -eq $stamp -or $stamp -gt $Now -or ($Now - $stamp).TotalMinutes -ge $intervalMinutes) { continue }
+        $servicesOut[[string]$serviceName] = $stamp.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    try {
+        Write-BRAVOStateFileAtomic -Path $Path -Text ([ordered]@{ schemaVersion = 1; hostname = $HostName; services = $servicesOut } | ConvertTo-Json -Depth 4)
+    } catch {
+        $result.Warning = "Мітку сповіщення про відкладене відновлення не записано ($Path): $($_.Exception.Message) (#314)"
+    }
+    return $result
 }
 
 function New-BRAVOServiceRecoveryState {
@@ -424,10 +496,12 @@ function New-BRAVOServiceRecoveryNotificationContent {
     # FR-6: зміст сповіщення про відновлення служби (без доставки).
     #   Recovered -> WARNING: служба впала, журнали збережено, запущена;
     #   Failed    -> CRITICAL: службу не вдалося підняти, причина;
-    #   Cyclic    -> CRITICAL: служба циклічно падає, потрібне втручання.
+    #   Cyclic    -> CRITICAL: служба циклічно падає, потрібне втручання;
+    #   BackupDeferred -> WARNING: служба не працює, відновлення відкладено до
+    #                завершення бекапу (operation-lock тримає BRAVO_ARCHIV).
     # Повертає { Severity; Title; TitleEmoji; Details }.
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('Recovered', 'Failed', 'Cyclic')][string]$Kind,
+        [Parameter(Mandatory = $true)][ValidateSet('Recovered', 'Failed', 'Cyclic', 'BackupDeferred')][string]$Kind,
         [Parameter(Mandatory = $true)][string]$ServiceName,
         [AllowNull()][object]$ExitCode,
         [AllowNull()][object]$ServiceSpecificExitCode,
@@ -442,6 +516,14 @@ function New-BRAVOServiceRecoveryNotificationContent {
     $causeText = if ([string]::IsNullOrWhiteSpace($EventText)) { $exitText } else { "$exitText, $EventText" }
     $logText = if ([string]::IsNullOrWhiteSpace($LogPath)) { 'Журнал: не створено' } else { "Журнал: $LogPath" }
     switch ($Kind) {
+        'BackupDeferred' {
+            return [pscustomobject]@{
+                Severity = 'WARNING'
+                Title = 'СЛУЖБА BRAVO НЕ ПРАЦЮЄ: ВІДНОВЛЕННЯ ВІДКЛАДЕНО'
+                TitleEmoji = ':warning:'
+                Details = @("Служба $ServiceName не працює ($causeText); відновлення відкладено до завершення бекапу (операційний lock тримає BRAVO_ARCHIV).", 'Після завершення бекапу службу підніме наступна перевірка задачі відновлення (до 15 хв).', $logText)
+            }
+        }
         'Recovered' {
             return [pscustomobject]@{
                 Severity = 'WARNING'
