@@ -735,7 +735,20 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
     # Маркер знімається, коли кожну службу, яку профіль зупинив, знову
     # запущено: впалі до профілю служби профіль не зупиняв, їх наступну
     # спробу веде пауза FR-5 (маркер затулив би їх як OwnedByBravo).
-    $stoppedNotStarted = @($stopKeys | Where-Object { $stopCompleted[$_] -and $restartIntent[$_] -and -not $startOutcome.Started[$_] })
+    # Рев'ю PR #432 (Codex, P2): службу міг запустити хтось інший (оператор,
+    # SCM) поки збирались журнали — тоді цикл її не запускав, але вона
+    # працює. Фінальний стан перечитується: Running — не збій; нечитабельний
+    # стан — як і раніше, «зупинено, але не запущено».
+    $stoppedNotStarted = @()
+    foreach ($stoppedKey in @($stopKeys | Where-Object { $stopCompleted[$_] -and $restartIntent[$_] -and -not $startOutcome.Started[$_] })) {
+        $finalStatus = $null
+        try { $finalStatus = [string](Get-Service -Name ([string]$ServiceSet.$stoppedKey.Name) -ErrorAction Stop).Status } catch { $finalStatus = $null }
+        if ($finalStatus -eq 'Running') {
+            Write-Log -Message "Служба $($ServiceSet.$stoppedKey.Name) вже працює (її запустили поза профілем після зупинки) — повторний запуск не потрібен" -Level "INFO"
+            continue
+        }
+        $stoppedNotStarted += $stoppedKey
+    }
     if ($stoppedNotStarted.Count -eq 0) {
         try {
             if (-not (Clear-BRAVOServiceQuiescenceState)) {
