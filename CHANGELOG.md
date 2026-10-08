@@ -93,6 +93,25 @@
   Administrators; невдача — відмова), `BRAVO.local.config` читається один раз, і канонічний reader розбирає
   копію саме тих байтів, з яких знято відбиток, а для явного `-BackupDestination` після імпорту приватної
   копії кожна потрібна функція мусить бути експортована своїм модулем — інакше відмова до копіювання.
+
+- **Виправлено: хибний відкат моделі після реставрації через ущільнення малих файлів (exit 43).**
+  Самоперевірка реставрації (`Compare-FileSizes`) оголошувала критичною зміну невеликого табличного файлу, який
+  `bravocmd` repair штатно ущільнив (4,5 КБ → 2,0 КБ, -55,6%), — і `Invoke-BRAVOModelRestoreRecovery` відкочував
+  модель із before-архіву, прогін завершувався кодом 43. Тепер для файлів, менших за поріг до реставрації
+  (новий ключ `maintenanceSettings.Restore.IntegritySmallFileThresholdBytes`, типово 1048576 байт = 1 МБ),
+  відсоткове правило й правило «≤ 2048 байт після» не застосовуються: критичними для них лишаються лише зникнення
+  (логіка відсутніх файлів без змін) та обнулення до 0 байт. Помітне зменшення такого файлу видно в журналі рядком
+  `[INFO]` «Зменшення розміру малих файлів MODEL …» — без сповіщення й без відкату. Файли від порогу й більші
+  перевіряються незмінним правилом (зменшення на 50% і більше або до ≤ 2048 байт — критично). Некоректне значення
+  ключа (не ціле, від'ємне, понад 104857600) не вимикає перевірку: діє типовий 1 МБ і `[WARNING]` у журналі;
+  `0` — правило 50% для всіх файлів. Ключ додано в канонічні дефолти, реєстр авторизації (`ALLOW_SITE`, 278
+  канонічних листів), каталог Configurator-а і `BRAVO.local.config.example`. Тести:
+  `Maintenance/CompareFileSizesSmallFileShrinkNotCritical`, `Maintenance/CompareFileSizesSmallFileZeroedCritical`,
+  `Maintenance/CompareFileSizesSmallFileMissingCritical`, `Maintenance/CompareFileSizesLargeFileHalfShrinkCritical`,
+  `Maintenance/CompareFileSizesLargeFileMildShrinkNotCritical`, `Maintenance/CompareFileSizesZeroThresholdKeepsFullRule`,
+  `Maintenance/CompareFileSizesNegativeThresholdFallsBackToDefault`, `Maintenance/RestoreSmallFileThresholdConfig[*]`,
+  `Maintenance/RestoreSmallFileThresholdWiredToCompare`.
+
 - **Hardening: маскування закодованих форм відомих секретів у журналах перед вивантаженням (#417).**
   `Protect-BRAVOLogSecret -KnownSecret` (маскована копія власного журналу Maintenance/Archive і знімка
   `range_id_log.json` перед SFTP) тепер маскує не лише сирий секрет, а й його URL-кодовану форму

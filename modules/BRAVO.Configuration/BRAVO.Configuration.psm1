@@ -172,6 +172,10 @@ function Get-BRAVODefaultConfiguration {
                 ArchivesKeepCount = 1
                 BootRestoreMode = "None"
                 StartupDelayMinutes = 0
+                # Поріг «малого» файлу MODEL (байти, розмір до реставрації)
+                # для самоперевірки після bravocmd repair: менші файли
+                # критичні лише при зникненні або обнуленні.
+                IntegritySmallFileThresholdBytes = 1048576
             }
             Retention = @{
                 ArchiveDays = 14
