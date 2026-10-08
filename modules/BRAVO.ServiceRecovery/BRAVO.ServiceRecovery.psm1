@@ -1088,6 +1088,11 @@ function Test-BRAVOServiceRecoveryTaskDefinition {
     if ($null -eq $dailyTrigger) {
         $problems.Add('немає щоденного тригера з повтором (CalendarTrigger)')
     } else {
+        # Щоденний — саме щодня: з DaysInterval=2 страховочні перевірки
+        # кожні 15 хв працювали б лише через добу.
+        if ([int]$dailyTrigger.DaysInterval -ne 1) {
+            $problems.Add("щоденний тригер: DaysInterval=$($dailyTrigger.DaysInterval), очікується 1")
+        }
         if ([string]$dailyTrigger.Repetition.Interval -ne [string]$Policy.RepeatInterval) {
             $problems.Add("щоденний тригер: повтор '$($dailyTrigger.Repetition.Interval)', очікується $($Policy.RepeatInterval)")
         }
