@@ -2101,7 +2101,7 @@ function Get-BRAVOManagedServiceCondition {
 function Write-HealthLog { param($Message, $Level) [void]$script:healthRecoveryEvents.Add(('LOG-{0} {1}' -f $Level, $Message)) }
 function Get-Service {
     param($Name, $DisplayName, $ErrorAction)
-    $status = if (@($script:healthRecoveryRunning) -contains [string]$Name) { [System.ServiceProcess.ServiceControllerStatus]::Running } else { [System.ServiceProcess.ServiceControllerStatus]::Stopped }
+    $status = if (@($script:healthRecoveryRunning) -contains [string]$Name) { [System.ServiceProcess.ServiceControllerStatus]::Running } elseif (@($script:healthRecoveryPaused) -contains [string]$Name) { [System.ServiceProcess.ServiceControllerStatus]::Paused } else { [System.ServiceProcess.ServiceControllerStatus]::Stopped }
     $svc = [pscustomobject]@{ Name = [string]$Name; Status = $status }
     Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { } -Force
     return $svc
@@ -2129,10 +2129,11 @@ function Start-BRAVOScheduledTask {
         $healthRecoveryError = $_.Exception.Message
     }
     $healthRecoveryProbe = {
-        param([string[]]$Running, $Wmi, $Task, $TaskThrows = $null, [bool]$RecoveryConfigured = $true)
+        param([string[]]$Running, $Wmi, $Task, $TaskThrows = $null, [bool]$RecoveryConfigured = $true, [string[]]$Paused = @())
         Set-StrictMode -Version 2.0
         $script:healthRecoveryEvents = New-Object System.Collections.ArrayList
         $script:healthRecoveryRunning = $Running
+        $script:healthRecoveryPaused = $Paused
         $script:healthRecoveryWmi = $Wmi
         $script:healthRecoveryTask = $Task
         $script:healthRecoveryTaskThrows = $TaskThrows
@@ -2175,9 +2176,9 @@ function Start-BRAVOScheduledTask {
         [pscustomobject]@{ Name = 'exchangAPI'; StartMode = 'Disabled'; ExitCode = 0 }
     )
     $runHealthRecovery = {
-        param([string[]]$Running, $Wmi, $Task, $TaskThrows = $null, [bool]$RecoveryConfigured = $true)
+        param([string[]]$Running, $Wmi, $Task, $TaskThrows = $null, [bool]$RecoveryConfigured = $true, [string[]]$Paused = @())
         if ($null -eq $healthRecoveryModule) { return [pscustomobject]@{ Thrown = $healthRecoveryError; Issues = @(); Events = @() } }
-        return (& $healthRecoveryModule $healthRecoveryProbe $Running $Wmi $Task $TaskThrows $RecoveryConfigured)
+        return (& $healthRecoveryModule $healthRecoveryProbe $Running $Wmi $Task $TaskThrows $RecoveryConfigured $Paused)
     }
     $describeHealthRecovery = {
         param($Result)
@@ -2295,6 +2296,29 @@ function Start-BRAVOScheduledTask {
         ) `
         -Name 'ServiceRecovery/HealthUnknownStartModeNotRecovered' `
         -Failure "Рев'ю PR #432 (B-P3-2): зупинена служба з невідомим типом запуску — issue з причиною, без запуску задачі відновлення. Отримано: $(& $describeHealthRecovery $healthUnknownMode)"
+
+    # Рев'ю PR #432 (Codex, P2): призупинена служба (Paused — Failed за FR-1)
+    # профілем -RecoverServices не запускається, тож Health для неї лише
+    # додає issue: без запуску задачі й без дії «запущено задачу відновлення».
+    $healthPausedOnly = & $runHealthRecovery @('BRAVO') $wmiAuto $taskReady $null $true @('exchangAPI')
+    $healthPausedAndStopped = & $runHealthRecovery @() $wmiAuto $taskReady $null $true @('exchangAPI')
+    $healthPausedIssue = @($healthPausedOnly.Issues | Where-Object { $_.Location -eq 'exchangAPI' })
+    $healthMixedPaused = @($healthPausedAndStopped.Issues | Where-Object { $_.Location -eq 'exchangAPI' })
+    $healthMixedStopped = @($healthPausedAndStopped.Issues | Where-Object { $_.Location -eq 'BRAVO' })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $healthPausedOnly.Thrown -and @($healthPausedOnly.Issues).Count -eq 1 -and $healthPausedIssue.Count -eq 1 -and
+            $healthPausedIssue[0].Reason.Contains('стан: Paused') -and [string]::IsNullOrEmpty($healthPausedIssue[0].ActionText) -and
+            @($healthPausedOnly.Events | Where-Object { $_ -like 'RUN-TASK *' -or $_ -like 'START-SERVICE*' }).Count -eq 0 -and
+            @($healthPausedOnly.Events | Where-Object { $_ -like '*задачу автоматичного відновлення*' }).Count -eq 0 -and
+            $null -eq $healthPausedAndStopped.Thrown -and @($healthPausedAndStopped.Issues).Count -eq 2 -and
+            $healthMixedPaused.Count -eq 1 -and [string]::IsNullOrEmpty($healthMixedPaused[0].ActionText) -and
+            $healthMixedStopped.Count -eq 1 -and $healthMixedStopped[0].ActionText.Contains('запущено задачу відновлення') -and
+            @($healthPausedAndStopped.Events | Where-Object { $_ -like 'RUN-TASK *' }).Count -eq 1 -and
+            @($healthPausedAndStopped.Events | Where-Object { $_ -like 'LOG-INFO Служби не працюють (BRAVO) *' }).Count -eq 1
+        ) `
+        -Name 'ServiceRecovery/HealthPausedServiceNoRecoveryTask' `
+        -Failure "Рев'ю PR #432 (Codex P2): Paused-служба — issue без запуску задачі відновлення і без дії «запущено задачу відновлення»; поряд зі зупиненою — задачу запущено лише заради зупиненої. Отримано: Paused=[$(& $describeHealthRecovery $healthPausedOnly)]; Paused+Stopped=[$(& $describeHealthRecovery $healthPausedAndStopped)]"
 
     # Start-BRAVOScheduledTask (BRAVO.Compatibility): запуск через ScheduledTasks
     # (Start-ScheduledTask) або COM RegisteredTask.Run($null) — Windows 7 без

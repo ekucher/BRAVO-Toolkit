@@ -4258,7 +4258,10 @@ function Get-ManagedServiceHealthIssues {
             Details = @()
         }
         $issues += $serviceIssue
-        if ($serviceCondition.Condition -eq 'Failed') {
+        # Задачу відновлення запускає лише зупинена Failed-служба: призупинену
+        # (Paused, теж Failed за FR-1) профіль -RecoverServices не запускає
+        # (Get-BRAVOServiceRecoveryPlan), тож для неї — лише issue (рев'ю PR #432).
+        if ($serviceCondition.Condition -eq 'Failed' -and [string]$serviceCondition.Status -eq 'Stopped') {
             $failedServiceIssues += $serviceIssue
         }
     }
