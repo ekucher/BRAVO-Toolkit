@@ -13181,7 +13181,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             'Get-HealthIssueComponentName', 'ConvertTo-NotificationLiteralText', 'Format-HealthIssueFileName',
             'Format-CompactLocalIssue', 'Format-CompactSFTPIssue', 'Format-CompactSMBIssue',
             'Get-BRAVOHealthCollapsedCloudIssues', 'Get-BRAVOHealthIssueActionText', 'New-SlackAlertMessage',
-            'New-SlackSuccessMessage'
+            'New-SlackSuccessMessage', 'Get-BRAVOHealthDisabledDestinationLines'
         )
     $sftpDeferredMessages = @{}
     # Контроль іде першим і прапорець не задає взагалі — як наявні виклики
@@ -29541,6 +29541,15 @@ function Write-BRAVOLog {
         if (Enter-BRAVOSelfTestSection -Name 'Suite/BackupScope') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BackupScope.ps1')
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BackupScope' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    # BackupDestinations: куди копіювати — профілі напрямків, рядки Health,
+    # сторож вихідних каналів (#282, хвиля 2).
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'BackupDestinations') {
+        Enter-BRAVOSelfTestSuite -Name 'BackupDestinations'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/BackupDestinations') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BackupDestinations.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BackupDestinations' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'SftpCredentialsRequired') {

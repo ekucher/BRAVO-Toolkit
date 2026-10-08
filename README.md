@@ -344,6 +344,71 @@ componentSettings.SMB.Enabled
 Приклади override у `BRAVO.local.config` — розділ "Глобальні вимикачі
 зовнішніх сховищ" у `BRAVO.local.config.example`.
 
+#### Профілі напрямків резервного копіювання
+
+Профіль — назва для пари головних вимикачів; нових ключів конфігурації
+немає. Відображення має одне джерело —
+`Get-BRAVOConfiguratorBackupDestinationProfile`
+(`modules\BRAVO.Configurator\BRAVO.Configurator.Presets.psm1`). Топологія
+профілю відповідає пресету Configurator, але набір значень визначено явно:
+дефолти нової інсталяції дорівнюють дефолтам конфігурації, крім вимикачів
+напрямків.
+
+| Профіль (`-BackupDestination`) | Пресет Configurator | `SFTP.Enabled` | `SMB.Enabled` | `SMB.ArchiveCopy` | BAZA |
+|---|---|---|---|---|---|
+| `Cloud` — Хмара (дефолт) | `LocalPlusSFTP` | `$true` | `$false` | — | не змінюється (дефолти) |
+| `CloudAndSamba` — Хмара + Samba | `LocalPlusSFTPAndSMB` | `$true` | `$true` | `$true` | не змінюється (дефолти) |
+| `SambaOnly` — Лише Samba | `LocalPlusSMB` | `$false` | `$true` | `$true` | `BAZA_*_LOCAL = $true` |
+| `LocalOnly` — Лише локально | `LocalOnly` | `$false` | `$false` | — | `BAZA_*_LOCAL = $true` |
+
+`SFTP.ArchiveUpload` жоден профіль не пише: для `Cloud` і `CloudAndSamba`
+очікуване значення — дефолт конфігурації (`$true`); для `SambaOnly` і
+`LocalOnly` вивантаження за вимкненого SFTP ефективно вимкнене.
+
+Профіль застосовує `deploy\Install-BRAVOServer.ps1 -SeedLocalConfig
+-BackupDestination <профіль>` і **лише** до нового `BRAVO.local.config`;
+наявний файл ніколи не змінюється (без явного `-BackupDestination`
+інсталятор повідомляє, що профіль не застосовано). Тому розгорнуті сервери поведінку не змінюють, а глобальний
+дефолт `SMB.Enabled = $true` лишається як був: «Samba вимкнено» для нових
+інсталяцій дає явне значення в новому файлі.
+
+Явний `-BackupDestination` (будь-який профіль) інсталятор не ігнорує мовчки
+(#434): він перевіряє ЕФЕКТИВНІ `SFTP.Enabled`, `SMB.Enabled`,
+`SMB.ArchiveCopy`, а лише для `Cloud` і `CloudAndSamba` ще й `SFTP.ArchiveUpload`
+(`Get-BRAVOEffectiveStorageConfiguration` поверх дефолтів і
+`BRAVO.local.config`) проти значень профілю. Без `-SeedLocalConfig` і без
+наявного файла інсталяція зупиняється до завантаження й будь-якого запису;
+комплект без `BRAVO.Configurator`, нерозбірний наявний файл або наявний файл,
+що суперечить профілю, зупиняють її до копіювання в каталог інсталяції з
+назвою профілю й каналу, і файл не змінюється. Деталі — `deploy\README.md`.
+
+Чому профілі з Samba пишуть `SMB.ArchiveCopy = $true`: дефолт
+`ArchiveCopy` — `$false`, а `SMB.Enabled` сам по собі нічого не копіює.
+Профілі з SFTP не пишуть BAZA-прапорців: діють дефолти конфігурації
+(`BAZA_APP_SFTP = $true`, `BAZA_WWW_SFTP = $false`), а синхронізацію
+BAZA WWW через SFTP вмикають свідомо для конкретного сервера.
+`SambaOnly` і `LocalOnly` вмикають локальну BAZA (`BAZA_*_LOCAL = $true`),
+бо BAZA-over-SMB не існує, а `BAZA_*_SFTP` при вимкненому SFTP не діють.
+Пресет Configurator на вже налаштованому сервері, як і раніше, перемикає
+головні вимикачі й BAZA-прапорці (зокрема `LocalPlusSFTP` вмикає
+`BAZA_*_SFTP`) та не чіпає `ArchiveUpload`/`ArchiveCopy` — тому профілі
+інсталятора й пресети UI свідомо різняться BAZA-прапорцями.
+
+«Лише локально» охоплює дані й журнали: архіви, BAZA SFTP-синхронізацію,
+вивантаження журналів Trace/exchangAPI і власних журналів. Сповіщення
+Slack/Discord, Operations-звітність і запит публічної IP цей профіль не
+вимикає (рішення власника). Self-test
+`BackupDestinations/EveryOutboundChannelGatedByStorageEffective` перевіряє,
+що кожне місце runtime-коду, яке відкриває WinSCP-сесію чи процес
+WinSCP.com або підключає NAS як мережевий диск, досяжне лише під
+`storageEffective.SFTP`/`SMB`; винятки — ручні інструменти оператора
+(`BRAVO_BAZA_RECONCILE.ps1`, `BRAVO_DATA_RESTORE.ps1 -Source SFTP`).
+
+Health показує свідомо вимкнений напрямок одним інформаційним рядком у
+підсумку консолі й у звіті «ВСЕ СПРАВНО» (`Хмара (SFTP): вимкнено
+конфігурацією`, `NAS/SMB: вимкнено конфігурацією`), без WARNING і без
+рядків по компонентах.
+
 > Обмеження: `SMB.Enabled` не керує UNC-шляхами в `pathSettings`
 > (наприклад, `BackupRoot`, якщо він вказаний як `\\server\share`) —
 > це окремий, не пов'язаний з `componentSettings.SMB` механізм.

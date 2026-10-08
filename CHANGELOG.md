@@ -2,6 +2,98 @@
 
 ## Не випущено (developer)
 
+- **Feat: профілі напрямків резервного копіювання — «куди копіювати» (#282, хвиля 2).**
+  Чотири профілі власника відповідають топологіям наявних пресетів Configurator і пишуть лише наявні
+  прапорці, без нових ключів конфігурації: `Cloud` (Хмара, дефолт) ~ `LocalPlusSFTP`, `CloudAndSamba` ~
+  `LocalPlusSFTPAndSMB`, `SambaOnly` ~ `LocalPlusSMB`, `LocalOnly` ~ `LocalOnly`. Таблиця пресетів винесена в
+  чисту `Get-BRAVOConfiguratorPresetOverrideSet` (поведінка `Invoke-BRAVOConfiguratorPreset` не змінилась), а
+  набори профілів `Get-BRAVOConfiguratorBackupDestinationProfile` визначено явно: дефолти нової інсталяції
+  дорівнюють дефолтам конфігурації, крім вимикачів напрямків, тож `Cloud`/`CloudAndSamba` не пишуть
+  BAZA-прапорців (`BAZA_WWW_SFTP` лишається `$false` і вмикається свідомо для сервера), на відміну від
+  UI-пресетів `LocalPlusSFTP`/`LocalPlusSFTPAndSMB`. Профілі з Samba додатково пишуть
+  `componentSettings.SMB.ArchiveCopy = $true`: дефолт `ArchiveCopy = $false`, і `SMB.Enabled` сам нічого не
+  копіює, тож профіль «Samba» без нього мовчки не давав би копії на NAS. `SambaOnly` і `LocalOnly` вмикають
+  `BAZA_APP_LOCAL`/`BAZA_WWW_LOCAL`, бо BAZA-over-SMB немає, а `BAZA_*_SFTP` без SFTP не діють. Пресет
+  Configurator на налаштованому сервері, як і раніше, не чіпає `ArchiveUpload`/`ArchiveCopy`.
+  `deploy\Install-BRAVOServer.ps1` отримав `-BackupDestination` (ValidateSet, дефолт `Cloud`): профіль
+  застосовується лише з `-SeedLocalConfig` і лише до НОВОГО `BRAVO.local.config`, який пише канонічний
+  `New-BRAVOConfiguratorSeedLocalConfig` (той самий серіалізатор і перевірка повторним читанням із
+  відкатом, що й Apply; атомарний запис без перезапису). Наявний файл не змінюється, і інсталятор
+  повідомляє, який профіль не застосовано. Глобальний дефолт `SMB.Enabled` не змінено: розгорнуті
+  сервери поводяться як раніше, а «Samba вимкнено» для нових інсталяцій — явне значення в новому файлі.
+  Health показує вимкнений головним вимикачем напрямок одним INFO-рядком у підсумку консолі
+  (`Complete-BRAVOHealthResult`) і у звіті «ВСЕ СПРАВНО»: «Хмара (SFTP): вимкнено конфігурацією»,
+  «NAS/SMB: вимкнено конфігурацією» (`Get-BRAVOHealthDisabledDestinationLines`), без WARNING і без зміни
+  коду завершення. «Лише локально» охоплює дані й журнали; сповіщення, Operations і запит публічної IP —
+  ні (рішення власника). Новий набір self-test `BackupDestinations`: точні прапорці кожного профілю,
+  ефективні напрямки через канонічні функції, запис нового й незмінність наявного файлу (реальний блок
+  кроку 4 інсталятора в окремому процесі), рядки Health, і сторож вихідних каналів
+  `BackupDestinations/EveryOutboundChannelGatedByStorageEffective`: кожне місце runtime-коду, що
+  відкриває WinSCP-сесію чи процес WinSCP.com або підключає NAS через `New-PSDrive`, має бути досяжне
+  лише під `storageEffective.SFTP`/`SMB` (AST-аналіз умов, ранніх виходів і всіх викликів функції).
+  Винятки названо з причиною: `BRAVO_BAZA_RECONCILE.ps1` і ручне відновлення
+  `BRAVO_DATA_RESTORE.ps1 -Source SFTP`.
+  Явний `-BackupDestination LocalOnly` більше не fail-open (#434): раніше без `-SeedLocalConfig` або з
+  наявним `BRAVO.local.config` інсталятор лише попереджав «НЕ застосовано» і завершувався кодом 0, хоча
+  SFTP/SMB лишались ефективно увімкненими. Тепер без `-SeedLocalConfig` і без наявного файла інсталятор
+  зупиняється в кроці 0, до UAC-перезапуску, завантаження й будь-якого запису; наявний файл крок 4
+  перевіряє за ефективними значеннями (канонічні `Read-BRAVOLocalConfigurationOverrides` ->
+  `Resolve-BRAVORawConfiguration` -> `Get-BRAVOEffectiveStorageConfiguration` і нова чиста
+  `Test-BRAVOConfiguratorBackupDestinationEffective`) і за ефективно ввімкненого SFTP чи SMB зупиняється
+  з назвою каналу та порадою, що змінити; файл не змінюється. Якщо наявний файл уже вимикає обидва
+  канали, інсталятор повідомляє, що `LocalOnly` у силі. `BackupDestinations/InstallerExistingConfigUntouched`
+  закріплює «файл не чіпаємо / без seed не створюємо» для запуску без `-BackupDestination`.
+  Той самий fail-closed контракт тепер діє для всіх чотирьох профілів, і все, що може відхилити явний
+  `-BackupDestination`, перевіряється в кроці 1 — після SHA-256, провенансу й гейта каналу, але ДО
+  копіювання в каталог інсталяції, тож відмова не лишає часткового runtime чи `VERSION.json`, а повторний
+  запуск після виправлення працює (#434). Комплект без модулів `BRAVO.Configurator` або без потрібних функцій
+  профілю напрямків (як знімок developer; визначення функцій звіряються розбором AST у staged-каталозі, без
+  імпорту) відхиляється з підказкою `-Tag`/`-ZipPath`; наявний `BRAVO.local.config`
+  читається канонічним reader-ом зі staged-комплекту, і нерозбірний файл або файл, з яким ефективні
+  `SFTP.Enabled`, `SMB.Enabled` чи `SMB.ArchiveCopy` суперечать профілю, зупиняє інсталяцію з назвою
+  профілю й каналу; файл не змінюється. `Test-BRAVOConfiguratorBackupDestinationEffective` для SMB тепер
+  порівнює й ефективну копію на NAS (`ArchiveCopy`), тож `CloudAndSamba` при файлі без `ArchiveCopy` не
+  вважається в силі. Без `-BackupDestination` поведінка як на developer: для комплекту без
+  `BRAVO.Configurator` або без цих функцій `-SeedLocalConfig` знову копіює `BRAVO.local.config.example`
+  з попередженням, що всі ключі в ньому закоментовані.
+  Перед кожним імпортом коду комплекту інсталятор тепер звіряє його з `RUNTIME_MANIFEST.json` (#434):
+  `Assert-BRAVOInstallBundleIntegrity` викликає канонічну `Test-BRAVORuntimeManifestIntegrity` з
+  `BRAVO_RUNTIME_GUARD.ps1` того самого комплекту (той самий код, що й гейт кроку 5; власного переліку хешів
+  в інсталяторі немає). SHA-256 архіву не захищає від локального архіву зі «своїм» `.sha256` поруч чи від
+  підміни розпакованих файлів, а guard кроку 5 запускався вже після імпорту модулів `BRAVO.Configurator` у
+  кроках 1 і 4. Тепер для явного `-BackupDestination` staged-каталог перевіряється в кроці 1, тож підмінений
+  комплект відхиляється до копіювання без `VERSION.json`. Розгорнутий каталог перевіряється в кроці 4 перед
+  канонічним seed і перед перевіркою профілю; за розбіжності інсталятор зупиняється кодом 1 і не імпортує
+  код комплекту. Розгорнуті файли, як і після гейта кроку 5, не видаляються. Неявний запуск із комплектом без
+  `BRAVO.Configurator` (копія прикладу) коду комплекту не імпортує й не змінився.
+  `Test-BRAVOConfiguratorBackupDestinationEffective` для SFTP тепер порівнює й ефективне вивантаження архіву
+  `SFTP.ArchiveUpload` з тим, що дав би seed профілю (профіль його не пише, тож береться дефолт
+  `Get-BRAVODefaultConfiguration`). Тому `Cloud`/`CloudAndSamba` при `SFTP.Enabled = $true`, але
+  `ArchiveUpload = $false` більше не вважаються в силі. Для `SambaOnly`/`LocalOnly` значення `ArchiveUpload`
+  на рішення не впливає. Сторож `EveryOutboundChannelGatedByStorageEffective` зараховує вимикач лише з умови тієї
+  гілки, у тілі якої стоїть канал. Канал у `else` чи в пізнішій `elseif` більше не вважається захищеним умовою
+  попередньої гілки, окрім `else` після умови, що є рівно запереченням вимикача.
+  Для явного `-BackupDestination` код комплекту в кроці 1 більше не імпортується з `-StagingRoot` (#434):
+  цей каталог (дефолт `C:\Temp\BRAVO_INSTALL`) може бути створений заздалегідь і доступний на запис
+  звичайному користувачеві, тож модуль, підмінений між перевіркою цілісності й `Import-Module`, виконався б
+  із правами адміністратора. Тепер архів копіюється в приватний тимчасовий каталог елевованого процесу
+  (`$env:SystemRoot\Temp`, випадкова назва), його SHA-256 повторно звіряється з уже перевіреним
+  значенням, і перевірка можливостей, `Assert-BRAVOInstallBundleIntegrity` та імпорт виконуються над тією
+  самою розпакованою копією; каталог видаляється після перевірки. Копіювання robocopy зі staged-каталогу
+  в каталог інсталяції не змінилось. SHA-256 `BRAVO.local.config` (або факт його відсутності), знятий у
+  кроці 1, звіряється перед першим записом у каталог інсталяції: файл, змінений чи створений після
+  перевірки, зупиняє інсталяцію до копіювання, а не після неї. Перевірка можливостей комплекту тепер
+  вимагає й визначень `Get-BRAVODefaultConfiguration`, `Resolve-BRAVORawConfiguration`
+  (`BRAVO.Configuration.psm1`) і `Get-BRAVOEffectiveStorageConfiguration` (`BRAVO.Discovery.psm1`), а не лише
+  наявності їхніх `.psd1`. Сторож `EveryOutboundChannelGatedByStorageEffective` зараховує вимикач у
+  власній гілці каналу лише як позитивну вимогу: не під `-not`/`!` і поєднану з іншими умовами лише через
+  `-and`. `if (-not <вимикач>) { канал }` і `if (<вимикач> -or <інше>) { канал }` більше не вважаються
+  захищеними. Приватний каталог перевірки кроку 1 тепер лежить у `$env:SystemRoot\Temp`, а не в
+  `%TEMP%` користувача, і створюється одразу із захищеним DACL (без успадкування; FullControl лише `BUILTIN\Administrators` і `NT AUTHORITY\SYSTEM`, власник
+  Administrators; невдача — відмова), `BRAVO.local.config` читається один раз, і канонічний reader розбирає
+  копію саме тих байтів, з яких знято відбиток, а для явного `-BackupDestination` після імпорту приватної
+  копії кожна потрібна функція мусить бути експортована своїм модулем — інакше відмова до копіювання.
+
 - **Виправлено: хибний відкат моделі після реставрації через ущільнення малих файлів (exit 43).**
   Самоперевірка реставрації (`Compare-FileSizes`) оголошувала критичною зміну невеликого табличного файлу, який
   `bravocmd` repair штатно ущільнив (4,5 КБ → 2,0 КБ, -55,6%), — і `Invoke-BRAVOModelRestoreRecovery` відкочував
