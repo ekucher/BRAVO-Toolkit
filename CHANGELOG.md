@@ -41,9 +41,19 @@
   `Resolve-BRAVORawConfiguration` -> `Get-BRAVOEffectiveStorageConfiguration` і нова чиста
   `Test-BRAVOConfiguratorBackupDestinationEffective`) і за ефективно ввімкненого SFTP чи SMB зупиняється
   з назвою каналу та порадою, що змінити; файл не змінюється. Якщо наявний файл уже вимикає обидва
-  канали, інсталятор повідомляє, що `LocalOnly` у силі. Поведінка без `-BackupDestination` і для
-  `Cloud`/`CloudAndSamba`/`SambaOnly` не змінилась; `BackupDestinations/InstallerExistingConfigUntouched`
-  тепер закріплює «файл не чіпаємо / без seed не створюємо» на `CloudAndSamba`/`SambaOnly`.
+  канали, інсталятор повідомляє, що `LocalOnly` у силі. `BackupDestinations/InstallerExistingConfigUntouched`
+  закріплює «файл не чіпаємо / без seed не створюємо» для запуску без `-BackupDestination`.
+  Той самий fail-closed контракт тепер діє для всіх чотирьох профілів, і все, що може відхилити явний
+  `-BackupDestination`, перевіряється в кроці 1 — після SHA-256, провенансу й гейта каналу, але ДО
+  копіювання в каталог інсталяції, тож відмова не лишає часткового runtime чи `VERSION.json`, а повторний
+  запуск після виправлення працює (#434). Комплект без модулів `BRAVO.Configurator` (лише `Test-Path` у
+  staged-каталозі, без імпорту) відхиляється з підказкою `-Tag`/`-ZipPath`; наявний `BRAVO.local.config`
+  читається канонічним reader-ом зі staged-комплекту, і нерозбірний файл або файл, з яким ефективні
+  `SFTP.Enabled`, `SMB.Enabled` чи `SMB.ArchiveCopy` суперечать профілю, зупиняє інсталяцію з назвою
+  профілю й каналу; файл не змінюється. `Test-BRAVOConfiguratorBackupDestinationEffective` для SMB тепер
+  порівнює й ефективну копію на NAS (`ArchiveCopy`), тож `CloudAndSamba` при файлі без `ArchiveCopy` не
+  вважається в силі. Без `-BackupDestination` поведінка як на developer: для комплекту без
+  `BRAVO.Configurator` `-SeedLocalConfig` знову копіює `BRAVO.local.config.example`.
 - **Hardening: маскування закодованих форм відомих секретів у журналах перед вивантаженням (#417).**
   `Protect-BRAVOLogSecret -KnownSecret` (маскована копія власного журналу Maintenance/Archive і знімка
   `range_id_log.json` перед SFTP) тепер маскує не лише сирий секрет, а й його URL-кодовану форму

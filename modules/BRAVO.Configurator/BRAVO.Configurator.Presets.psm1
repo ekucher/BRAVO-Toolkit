@@ -269,8 +269,14 @@ function Test-BRAVOConfiguratorBackupDestinationEffective {
         над Resolve-BRAVORawConfiguration (дефолти < BRAVO.local.config).
         Порівнюються головні вимикачі componentSettings.SFTP.Enabled і
         componentSettings.SMB.Enabled з набору профілю
-        Get-BRAVOConfiguratorBackupDestinationProfile. Для LocalOnly це
-        означає: SFTP і SMB ефективно вимкнені.
+        Get-BRAVOConfiguratorBackupDestinationProfile, а для SMB ще й
+        ефективна копія архіву на NAS (SMB.ArchiveCopy). Очікувана копія
+        дорівнює тому, що дав би свіжий seed профілю: SMB.Enabled профілю
+        AND componentSettings.SMB.ArchiveCopy профілю (відсутній ключ —
+        дефолт $false), тобто те саме правило, що в
+        Get-BRAVOEffectiveStorageConfiguration. Профіль «в силі» лише тоді,
+        коли збігаються всі три значення. Для LocalOnly це означає: SFTP і
+        SMB ефективно вимкнені.
 
         Функція нічого не читає й не пише; відповідь — лише висновок і
         причини українською для діагностики викликача.
@@ -307,14 +313,36 @@ function Test-BRAVOConfiguratorBackupDestinationEffective {
         $channelNode = $EffectiveStorage.$channel
         $actual = $false
         if ($null -ne $channelNode) { $actual = [bool]$channelNode.Enabled }
+        $channelConflict = $false
         if ($actual -ne $expected) {
-            [void]$conflicting.Add($channel)
+            $channelConflict = $true
             $expectedText = $(if ($expected) { 'увімкнено' } else { 'вимкнено' })
             $actualText = $(if ($actual) { 'увімкнено' } else { 'вимкнено' })
             [void]$reasons.Add($channel + ': ефективно ' + $actualText + ', профіль ' + $Destination +
                 ' вимагає «' + $expectedText + '» (componentSettings.' + $channel + '.Enabled = ' +
                 $(if ($expected) { '$true' } else { '$false' }) + ').')
         }
+        if ($channel -eq 'SMB') {
+            # Копія на NAS: SMB.Enabled сам по собі нічого не копіює, тож
+            # профіль із Samba без ефективного ArchiveCopy не «в силі».
+            $expectedCopy = $expected -and [bool]$destinationProfile.Overrides['componentSettings.SMB.ArchiveCopy']
+            $actualCopy = $false
+            if ($channelNode -is [System.Collections.IDictionary]) {
+                if ($channelNode.Contains('ArchiveCopy')) { $actualCopy = [bool]$channelNode['ArchiveCopy'] }
+            } elseif ($null -ne $channelNode -and $null -ne $channelNode.PSObject.Properties['ArchiveCopy']) {
+                $actualCopy = [bool]$channelNode.ArchiveCopy
+            }
+            if ($actualCopy -ne $expectedCopy) {
+                $channelConflict = $true
+                $expectedCopyText = $(if ($expectedCopy) { 'увімкнено' } else { 'вимкнено' })
+                $actualCopyText = $(if ($actualCopy) { 'увімкнено' } else { 'вимкнено' })
+                [void]$reasons.Add('SMB: копія архіву на NAS ефективно ' + $actualCopyText + ', профіль ' + $Destination +
+                    ' вимагає «' + $expectedCopyText + '» (componentSettings.SMB.ArchiveCopy = ' +
+                    $(if ($expectedCopy) { '$true' } else { '$false' }) + ' при componentSettings.SMB.Enabled = ' +
+                    $(if ($expected) { '$true' } else { '$false' }) + ').')
+            }
+        }
+        if ($channelConflict) { [void]$conflicting.Add($channel) }
     }
 
     return [pscustomobject]@{
