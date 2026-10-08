@@ -308,13 +308,23 @@ $bdInstallTokens = $null
 $bdInstallErrors = $null
 $bdInstallAst = [Management.Automation.Language.Parser]::ParseInput($bdInstallText, [ref]$bdInstallTokens, [ref]$bdInstallErrors)
 # Єдиний запис site-файлу в інсталяторі — New-BRAVOConfiguratorSeedLocalConfig;
-# жодна інша команда не пише в $localConfig (копія прикладу, Set-Content тощо).
-$bdInstallWrites = @($bdInstallAst.FindAll({
+# жодна інша команда не пише в $localConfig (Set-Content тощо). Виняток —
+# рівно одна копія прикладу у формі developer: зворотно сумісний неявний
+# -SeedLocalConfig для комплекту без BRAVO.Configurator (#434, P1-1; рішення
+# власника), поведінково закріплена в (4c).
+$bdInstallWriteNodes = @($bdInstallAst.FindAll({
     param($node)
     $node -is [Management.Automation.Language.CommandAst] -and
     @('Copy-Item', 'Move-Item', 'Set-Content', 'Add-Content', 'Out-File', 'New-Item') -contains [string]$node.GetCommandName() -and
     $node.Extent.Text -match '(?i)\$localConfig\b|BRAVO\.local\.config'''
 }, $true))
+$bdInstallLegacyExampleCopies = @($bdInstallWriteNodes | Where-Object {
+    $_.Extent.Text -ceq 'Copy-Item -LiteralPath $localExample -Destination $localConfig'
+})
+$bdInstallWrites = @($bdInstallWriteNodes | Where-Object {
+    $bdInstallLegacyExampleCopies.Count -gt 1 -or
+    $_.Extent.Text -cne 'Copy-Item -LiteralPath $localExample -Destination $localConfig'
+})
 $bdInstallParam = @($bdInstallAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'BackupDestination' })
 $bdInstallValidateSet = @($(if ($bdInstallParam.Count -eq 1) {
     @($bdInstallParam[0].Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' } |
@@ -351,7 +361,15 @@ try {
         'function Write-Ok { param([string]$T) Write-StepOutput (''[OK] '' + $T) }',
         'function Write-Note { param([string]$T) Write-StepOutput (''[..] '' + $T) }',
         'function Write-Warn2 { param([string]$T) Write-StepOutput (''[УВАГА] '' + $T) }',
-        'function Write-Bad { param([string]$T) Write-StepOutput (''[FAIL] '' + $T) }',
+        'function Write-Bad { param([string]$T) Write-StepOutput (''[FAIL] '' + $T) }'
+    ) + @(
+        # Функції інсталятора поза головним try (крім виводу й паузи) — щоб
+        # крок 4 міг викликати спільні з кроком 1 перевірки (#434).
+        $bdInstallAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            @('Write-Step', 'Write-Ok', 'Write-Bad', 'Write-Note', 'Write-Warn2', 'Wait-BRAVODeployCompletion', 'Restore-BRAVOConsoleEncoding') -notcontains $_.Name
+        } | ForEach-Object { $_.Extent.Text }
+    ) + @(
         'try {',
         $bdStepText,
         'exit 0',
@@ -398,30 +416,30 @@ try {
     ) -Name 'BackupDestinations/InstallerNewConfigGetsProfile' `
         -Failure "інсталятор з -SeedLocalConfig має створити BRAVO.local.config із профілем (явний SambaOnly і дефолт Cloud); SambaOnly: exit=$($bdRunSamba.ExitCode) $bdRunSambaOverrides; $($bdRunSamba.Output) ||| Cloud: exit=$($bdRunDefault.ExitCode) $bdRunDefaultOverrides; $($bdRunDefault.Output)"
 
-    # Наявний файл не змінюється, і вивід називає незастосований профіль.
-    # #434: тут свідомо НЕ LocalOnly — явний LocalOnly при наявному файлі або
-    # без -SeedLocalConfig більше не завершується кодом 0 з «НЕ застосовано»
-    # (fail-closed, перевірки (4a) нижче). Для інших профілів поведінка
-    # «файл не чіпаємо / без seed не створюємо, код 0» лишається.
+    # Наявний файл не змінюється; без -SeedLocalConfig файл не створюється.
+    # #434: тут свідомо НЕЯВНИЙ профіль (без -BackupDestination). Явний
+    # профіль, якому файл чи дефолти ЕФЕКТИВНО суперечать, більше не
+    # завершується кодом 0 з «НЕ застосовано» (рішення власника, P2-2): ті
+    # сценарії — fail-closed у (4a)/(4c), де «файл не змінено / не створено»
+    # перевіряється тим самим SHA-256 разом із відмовою.
     $bdExistingText = "@{`r`n    'pathSettings.BackupRoot' = 'D:\ExampleArchive'`r`n}`r`n"
     [IO.File]::WriteAllText($bdLocalConfigPath, $bdExistingText, (New-Object Text.UTF8Encoding($false)))
     $bdExistingBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdLocalConfigPath))
-    $bdRunExisting = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-SeedLocalConfig', '-BackupDestination', 'CloudAndSamba')
+    $bdRunExisting = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-SeedLocalConfig')
     $bdExistingAfter = [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdLocalConfigPath))
     Remove-Item -LiteralPath $bdLocalConfigPath -Force -ErrorAction SilentlyContinue
-    # Без -SeedLocalConfig файл не створюється, а явний профіль названо незастосованим.
-    $bdRunNoSeed = Invoke-BRAVOSelfTestInstallStep4 -Arguments @('-BackupDestination', 'SambaOnly')
+    # Без -SeedLocalConfig файл не створюється.
+    $bdRunNoSeed = Invoke-BRAVOSelfTestInstallStep4 -Arguments @()
     Test-BRAVOCondition -Condition (
         $bdRunExisting.ExitCode -eq 0 -and
         $bdExistingBefore -ceq $bdExistingAfter -and
         $bdRunExisting.Output.Contains('BRAVO.local.config уже існує') -and
-        $bdRunExisting.Output.Contains('профіль напрямків CloudAndSamba НЕ застосовано') -and
         $bdRunNoSeed.ExitCode -eq 0 -and
         -not (Test-Path -LiteralPath $bdLocalConfigPath) -and
-        $bdRunNoSeed.Output.Contains('профіль напрямків SambaOnly НЕ застосовано') -and
+        $bdRunNoSeed.Output.Contains('не створено') -and
         @(Get-ChildItem -LiteralPath $bdInstallRoot -Force -Filter 'BRAVO.local.config*').Count -eq 0
     ) -Name 'BackupDestinations/InstallerExistingConfigUntouched' `
-        -Failure "наявний BRAVO.local.config інсталятор не змінює й повідомляє, який профіль не застосовано; без -SeedLocalConfig файл не створюється; наявний: exit=$($bdRunExisting.ExitCode) байти_збіглись=$($bdExistingBefore -ceq $bdExistingAfter) $($bdRunExisting.Output) ||| без seed: exit=$($bdRunNoSeed.ExitCode) $($bdRunNoSeed.Output)"
+        -Failure "наявний BRAVO.local.config інсталятор не змінює (-SeedLocalConfig, профіль за замовчуванням); без -SeedLocalConfig файл не створюється; наявний: exit=$($bdRunExisting.ExitCode) байти_збіглись=$($bdExistingBefore -ceq $bdExistingAfter) $($bdRunExisting.Output) ||| без seed: exit=$($bdRunNoSeed.ExitCode) $($bdRunNoSeed.Output)"
 
     # ------------------------------------------------------------
     # (4a) Явний -BackupDestination LocalOnly — твердження про ЕФЕКТИВНИЙ стан
@@ -632,7 +650,7 @@ $bdEarlyLocalOnlyGuards = @($bdInstallAst.FindAll({
     if (Test-BRAVOSelfTestInsideFunction -Node $node) { return $false }
     foreach ($clause in $node.Clauses) {
         $conditionText = $clause.Item1.Extent.Text
-        if ($conditionText -match 'LocalOnly' -and $conditionText -match '(?i)\$SeedLocalConfig\b' -and
+        if ($conditionText -match 'LocalOnly|BackupDestination' -and $conditionText -match '(?i)\$SeedLocalConfig\b' -and
             $null -ne $clause.Item2.Find({ param($inner) $inner -is [Management.Automation.Language.ThrowStatementAst] }, $true)) {
             return $true
         }
@@ -651,6 +669,488 @@ Test-BRAVOCondition -Condition (
     $bdStepText.Contains('Get-BRAVOEffectiveStorageConfiguration')
 ) -Name 'BackupDestinations/InstallerLocalOnlyDecisionPrecedesSideEffects' `
     -Failure "Install-BRAVOServer.ps1: відмова для явного LocalOnly без -SeedLocalConfig має стояти ДО першої побічної дії ($(if ($bdFirstSideEffect.Count -eq 1) { 'рядок ' + $bdFirstSideEffect[0].Extent.StartLineNumber + ': ' + $bdFirstSideEffect[0].GetCommandName() } else { 'не знайдено' })) — if з умовою на LocalOnly і `$SeedLocalConfig і throw у тілі або виклик Assert-BRAVO*BackupDestination*; знайдено if-guard: $($bdEarlyLocalOnlyGuards.Count), assert: $($bdEarlyLocalOnlyAsserts.Count); крок 4 має вирішувати за Get-BRAVOEffectiveStorageConfiguration: $($bdStepText.Contains('Get-BRAVOEffectiveStorageConfiguration'))"
+
+# ------------------------------------------------------------
+# (4c) Install-BRAVOServer.ps1 від кроку 0 до кроку 4 на ФЕЙКОВОМУ комплекті
+# (#434: P1-1, P2-1, P2-2). Реальний код інсталятора (усі оператори головного
+# try до «Write-Step '5.» і функції поза ним) виконується в окремому процесі
+# з локальним zip і .sha256 — без мережі, без UAC, без кроків 5-7. Підмінено
+# лише: перевірку прав ($isElevated = $true), robocopy.exe (копіювання тим
+# самим Copy-Item з маркером виклику), Invoke-WebRequest і Start-Process
+# (заборонені). Справжні: розпакування, SHA-256, провенанс, канал релізу,
+# перевірка обов'язкових файлів, крок 4.
+#
+# Контракт власника:
+#   * P1-1: явний -BackupDestination з комплектом без BRAVO.Configurator
+#     (форма v5.2.4) зупиняється ДО копіювання в каталог інсталяції;
+#     неявний -SeedLocalConfig з таким комплектом лишає поведінку developer
+#     (копія прикладу) і завершується кодом 0;
+#   * P2-1/P2-2: для КОЖНОГО явного профілю наявний BRAVO.local.config
+#     перевіряється за ефективними значеннями ДО копіювання; суперечність =
+#     ефективні SFTP.Enabled, SMB.Enabled чи SMB.ArchiveCopy відрізняються від
+#     тих, що дав би свіжий -SeedLocalConfig -BackupDestination <профіль>;
+#     без -SeedLocalConfig і без файла явний профіль відхиляється в кроці 0;
+#   * наявний файл ніколи не змінюється (SHA-256), модулі з комплекту не
+#     імпортуються до гейтів SHA-256/провенансу/каналу.
+# ------------------------------------------------------------
+# Блок виконується в дочірній області (& { ... }, конвенція #163): його
+# змінні не накопичуються в області self-test.
+& {
+    $bdE2eRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_DEST_E2E_' + [guid]::NewGuid().ToString('N'))
+    $bdE2eVersion = '9.8.7'
+    $bdE2eHostPath = (Get-Process -Id $PID).Path
+    try {
+        [void](New-Item -ItemType Directory -Path $bdE2eRoot -Force)
+        Copy-Item -LiteralPath (Join-Path $root 'deploy\BRAVO.Deploy.ReleaseGate.ps1') -Destination $bdE2eRoot -Force
+
+        # --- Дочірній скрипт: реальні оператори інсталятора до кроку 5 ---
+        $bdE2eMainTry = @($bdInstallAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.TryStatementAst] -and $_.Body.Extent.Text.Contains("Write-Step '0.")
+        })
+        $bdE2eStatements = @()
+        $bdE2eStopFound = $false
+        if ($bdE2eMainTry.Count -eq 1) {
+            foreach ($bdE2eStatement in @($bdE2eMainTry[0].Body.Statements)) {
+                $bdE2eStatementText = $bdE2eStatement.Extent.Text
+                if ($bdE2eStatementText -match "^Write-Step\s+'5\.") { $bdE2eStopFound = $true; break }
+                if ($bdE2eStatementText -match '^\$isElevated\s*=') { $bdE2eStatements += '$isElevated = $true'; continue }
+                $bdE2eStatements += $bdE2eStatementText
+            }
+        }
+        $bdE2eHelperNames = @('Write-Step', 'Write-Ok', 'Write-Bad', 'Write-Note', 'Write-Warn2',
+            'Wait-BRAVODeployCompletion', 'Restore-BRAVOConsoleEncoding')
+        $bdE2eHelpers = @($bdInstallAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $bdE2eHelperNames -notcontains $_.Name
+        } | ForEach-Object { $_.Extent.Text })
+        $bdE2eParamText = [regex]::Replace([string]$bdInstallAst.ParamBlock.Extent.Text, '^(?i)param\s*\(', 'param([string]$OutputLog, ')
+        $bdE2eChildPath = Join-Path $bdE2eRoot 'Invoke-InstallSteps0to4.ps1'
+        $bdE2eChildText = (@(
+            '[CmdletBinding()]',
+            $bdE2eParamText,
+            'Set-StrictMode -Version 2.0',
+            '$ErrorActionPreference = ''Stop''',
+            'function Write-StepOutput { param([string]$T) [IO.File]::AppendAllText($OutputLog, ($T + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false))) }',
+            'function Write-Step { param([string]$T) Write-StepOutput (''=== '' + $T) }',
+            'function Write-Ok { param([string]$T) Write-StepOutput (''[OK] '' + $T) }',
+            'function Write-Note { param([string]$T) Write-StepOutput (''[..] '' + $T) }',
+            'function Write-Warn2 { param([string]$T) Write-StepOutput (''[УВАГА] '' + $T) }',
+            'function Write-Bad { param([string]$T) Write-StepOutput (''[FAIL] '' + $T) }',
+            'function robocopy.exe {',
+            '    Write-StepOutput ''STUB: robocopy''',
+            '    Get-ChildItem -LiteralPath $args[0] -Force | Copy-Item -Destination $args[1] -Recurse -Force',
+            '    $global:LASTEXITCODE = 1',
+            '}',
+            'function Invoke-WebRequest { throw ''self-test: мережа заборонена'' }',
+            'function Start-Process { throw ''self-test: Start-Process заборонено'' }'
+        ) + $bdE2eHelpers + @('try {') + $bdE2eStatements + @(
+            'exit 0',
+            '} catch { Write-StepOutput (''THROW: '' + $_.Exception.Message); exit 1 }'
+        )) -join "`r`n"
+        [IO.File]::WriteAllText($bdE2eChildPath, $bdE2eChildText, (New-Object Text.UTF8Encoding($true)))
+
+        # --- Фейковий комплект: zip + .sha256 поруч, без release-manifest.json ---
+        function New-BRAVOSelfTestInstallBundle {
+            param([string]$Name, [string[]]$ModuleDirectories, [string]$SourceCommit = ('a1b2c3d4' * 5),
+                [switch]$MarkImports, [switch]$CorruptChecksum)
+            $bundleDir = Join-Path $bdE2eRoot ('bundle_' + $Name)
+            [void](New-Item -ItemType Directory -Path (Join-Path $bundleDir 'modules') -Force)
+            [void](New-Item -ItemType Directory -Path (Join-Path $bundleDir 'Tools') -Force)
+            $buildId = $(if ($SourceCommit.Length -ge 7) { $SourceCommit.Substring(0, 7) } else { $SourceCommit })
+            $versionJson = '{ "product": "BRAVO-Toolkit", "packageVersion": "' + $bdE2eVersion + '", "releaseChannel": "stable", ' +
+                '"buildId": "' + $buildId + '", "sourceCommit": "' + $SourceCommit + '" }'
+            $utf8 = New-Object Text.UTF8Encoding($false)
+            [IO.File]::WriteAllText((Join-Path $bundleDir 'VERSION.json'), $versionJson, $utf8)
+            [IO.File]::WriteAllText((Join-Path $bundleDir 'RUNTIME_MANIFEST.json'), '{}', $utf8)
+            [IO.File]::WriteAllText((Join-Path $bundleDir 'Tools\TOOLS_MANIFEST.json'), '{}', $utf8)
+            foreach ($stubName in @('BRAVO_RUNTIME_GUARD.ps1', 'BRAVO_SETUP.ps1')) {
+                [IO.File]::WriteAllText((Join-Path $bundleDir $stubName), ("# self-test fixture`r`nexit 0`r`n"), $utf8)
+            }
+            Copy-Item -LiteralPath (Join-Path $root 'BRAVO_CONFIG_LOADER.ps1') -Destination $bundleDir -Force
+            Copy-Item -LiteralPath (Join-Path $root 'BRAVO.local.config.example') -Destination $bundleDir -Force
+            foreach ($moduleDirectory in @($ModuleDirectories)) {
+                Copy-Item -LiteralPath (Join-Path $root ('modules\' + $moduleDirectory)) -Destination (Join-Path $bundleDir 'modules') -Recurse -Force
+            }
+            $markerPath = Join-Path $bdE2eRoot ('imported_' + $Name + '.marker')
+            if ($MarkImports) {
+                # Будь-який імпорт модуля з комплекту лишає маркер.
+                foreach ($moduleFile in @(Get-ChildItem -LiteralPath (Join-Path $bundleDir 'modules') -Recurse -Filter '*.psm1')) {
+                    [IO.File]::AppendAllText($moduleFile.FullName,
+                        ("`r`n[IO.File]::WriteAllText('" + $markerPath.Replace("'", "''") + "', 'imported')`r`n"), $utf8)
+                }
+            }
+            $zipDir = Join-Path $bdE2eRoot ('zip_' + $Name)
+            [void](New-Item -ItemType Directory -Path $zipDir -Force)
+            $zipPath = Join-Path $zipDir ('BRAVO-Toolkit-' + $bdE2eVersion + '.zip')
+            Compress-Archive -Path (Join-Path $bundleDir '*') -DestinationPath $zipPath -Force
+            $sha = $(if ($CorruptChecksum) { '0' * 64 } else { (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant() })
+            [IO.File]::WriteAllText($zipPath + '.sha256', ($sha + '  ' + (Split-Path -Leaf $zipPath)), $utf8)
+            return [pscustomobject]@{
+                ZipPath = $zipPath
+                MarkerPath = $markerPath
+                ExampleBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $bundleDir 'BRAVO.local.config.example')))
+            }
+        }
+        $bdE2eCurrentModules = @('BRAVO.Compatibility', 'BRAVO.Configurator', 'BRAVO.Configuration', 'BRAVO.Discovery', 'BRAVO.System')
+        # Форма v5.2.4: немає modules\BRAVO.Configurator і modules\BRAVO.Configuration.
+        $bdE2eLegacyModules = @('BRAVO.Compatibility', 'BRAVO.Discovery', 'BRAVO.System')
+        $bdE2eCurrentBundle = New-BRAVOSelfTestInstallBundle -Name 'current' -ModuleDirectories $bdE2eCurrentModules
+        $bdE2eLegacyBundle = New-BRAVOSelfTestInstallBundle -Name 'legacy' -ModuleDirectories $bdE2eLegacyModules
+
+        function Invoke-BRAVOSelfTestInstallE2E {
+            param([string]$RuntimeRoot, [string]$ZipPath, [string[]]$Arguments)
+            $runId = [guid]::NewGuid().ToString('N')
+            $stagingRoot = Join-Path $bdE2eRoot ('staging_' + $runId)
+            $outputLog = Join-Path $bdE2eRoot ('out_' + $runId + '.log')
+            # Без -ExecutionPolicy: політика успадковується від процесу self-test.
+            $streamOutput = @(& $bdE2eHostPath -NoProfile -NonInteractive -File $bdE2eChildPath -OutputLog $outputLog `
+                -RuntimeRoot $RuntimeRoot -Tag ('v' + $bdE2eVersion) -ZipPath $ZipPath -StagingRoot $stagingRoot `
+                -NoElevation -NoPause @Arguments 2>&1 | ForEach-Object { [string]$_ })
+            $exitCode = $LASTEXITCODE
+            $logText = $(if (Test-Path -LiteralPath $outputLog -PathType Leaf) { [IO.File]::ReadAllText($outputLog, [Text.Encoding]::UTF8) } else { '' })
+            $throwText = (@([regex]::Matches($logText, '(?m)^THROW: (.*)$') | ForEach-Object { $_.Groups[1].Value }) -join ' ')
+            return [pscustomobject]@{
+                ExitCode = $exitCode
+                Output = ($logText + ($streamOutput -join "`n"))
+                Throw = $throwText
+                RobocopyCalled = $logText.Contains('STUB: robocopy')
+                StagingCreated = (Test-Path -LiteralPath $stagingRoot)
+                Label = ('[' + (@($Arguments) -join ' ') + ']')
+            }
+        }
+        function New-BRAVOSelfTestE2ERuntimeRoot {
+            param([string[]]$SiteConfigLines, [string]$SiteConfigText)
+            $runtimeRoot = Join-Path $bdE2eRoot ('runtime_' + [guid]::NewGuid().ToString('N'))
+            if ($PSBoundParameters.ContainsKey('SiteConfigLines') -or $PSBoundParameters.ContainsKey('SiteConfigText')) {
+                [void](New-Item -ItemType Directory -Path $runtimeRoot -Force)
+                $text = $(if ($PSBoundParameters.ContainsKey('SiteConfigText')) { $SiteConfigText } else {
+                    "@{`r`n" + ((@($SiteConfigLines) | ForEach-Object { '    ' + $_ }) -join "`r`n") + "`r`n}`r`n" })
+                [IO.File]::WriteAllText((Join-Path $runtimeRoot 'BRAVO.local.config'), $text, (New-Object Text.UTF8Encoding($false)))
+            }
+            return $runtimeRoot
+        }
+        function Get-BRAVOSelfTestE2ESiteHash {
+            param([string]$RuntimeRoot)
+            $path = Join-Path $RuntimeRoot 'BRAVO.local.config'
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return '' }
+            return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        }
+        function Get-BRAVOSelfTestE2EEntries {
+            param([string]$RuntimeRoot)
+            if (-not (Test-Path -LiteralPath $RuntimeRoot)) { return @() }
+            return @(Get-ChildItem -LiteralPath $RuntimeRoot -Force | ForEach-Object { $_.Name } | Sort-Object)
+        }
+        # Ефективні напрямки — канонічно: дефолти < LocalOverrides ->
+        # Get-BRAVOEffectiveStorageConfiguration. NAS = ефективний SMB.ArchiveCopy.
+        function Get-BRAVOSelfTestEffectiveDestinations {
+            param($LocalOverrides)
+            $merged = Resolve-BRAVORawConfiguration -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+                -PrimaryOverrides $null -LocalOverrides $LocalOverrides
+            $storage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings $merged['componentSettings']
+            return [pscustomobject]@{
+                SFTP = [bool]$storage.SFTP.Enabled
+                SMB = [bool]$storage.SMB.Enabled
+                NAS = [bool]$storage.SMB.ArchiveCopy
+            }
+        }
+        function Get-BRAVOSelfTestDestinationConflicts {
+            # Канали, чий ефективний стан суперечить профілю; NAS-копія звітується як SMB.
+            param($Actual, $Expected)
+            $channels = @()
+            if ($Actual.SFTP -ne $Expected.SFTP) { $channels += 'SFTP' }
+            if ($Actual.SMB -ne $Expected.SMB -or $Actual.NAS -ne $Expected.NAS) { $channels += 'SMB' }
+            return @($channels)
+        }
+        function ConvertTo-BRAVOSelfTestSiteConfigLines {
+            param([System.Collections.IDictionary]$Overrides)
+            return @(@($Overrides.Keys | Sort-Object) | ForEach-Object { "'$_' = `$" + ([string][bool]$Overrides[$_]).ToLowerInvariant() })
+        }
+        # «Що дав би свіжий -SeedLocalConfig -BackupDestination <профіль>».
+        $bdE2eProfileDestinations = @{}
+        foreach ($bdE2eDestination in @($bdExpectedProfiles.Keys)) {
+            $bdE2eProfileDestinations[$bdE2eDestination] = Get-BRAVOSelfTestEffectiveDestinations -LocalOverrides $bdProfiles[$bdE2eDestination].Overrides
+        }
+        $bdE2eDefaultDestinations = Get-BRAVOSelfTestEffectiveDestinations -LocalOverrides $null
+        function Get-BRAVOSelfTestPreDeployRefusalProblems {
+            # Відмова ДО розгортання: код != 0, українська причина з потрібними
+            # словами, robocopy не викликано, у каталозі інсталяції немає нічого,
+            # крім дозволеного (наявного BRAVO.local.config), і VERSION.json.
+            param($Run, [string]$RuntimeRoot, [string[]]$AllowedEntries, [string[]]$RequiredTexts)
+            $problems = @()
+            if ($Run.ExitCode -eq 0) { $problems += "$($Run.Label) exit=0" }
+            if ([string]::IsNullOrWhiteSpace($Run.Throw) -or $Run.Throw -notmatch '[\u0400-\u04FF]') {
+                $problems += "$($Run.Label) немає української причини зупинки"
+            }
+            foreach ($requiredText in @($RequiredTexts)) {
+                if (-not $Run.Throw.Contains($requiredText)) { $problems += "$($Run.Label) причина не містить '$requiredText'" }
+            }
+            if ($Run.RobocopyCalled) { $problems += "$($Run.Label) копіювання в каталог інсталяції вже виконано" }
+            if (Test-Path -LiteralPath (Join-Path $RuntimeRoot 'VERSION.json')) { $problems += "$($Run.Label) у каталозі інсталяції є VERSION.json" }
+            $unexpected = @(Get-BRAVOSelfTestE2EEntries -RuntimeRoot $RuntimeRoot | Where-Object { @($AllowedEntries) -notcontains $_ })
+            if ($unexpected.Count -gt 0) { $problems += "$($Run.Label) у каталозі інсталяції з'явилось: $($unexpected -join ',')" }
+            if ($problems.Count -gt 0) { $problems += "$($Run.Label) throw='$($Run.Throw)'" }
+            return @($problems)
+        }
+
+        # Контроль харнеса: дочірній скрипт зібрано, комплект поточної форми
+        # розгортається, -SeedLocalConfig пише профіль (явний SambaOnly і дефолт Cloud).
+        $bdE2eControlFailures = @()
+        if ($bdE2eMainTry.Count -ne 1 -or -not $bdE2eStopFound) {
+            $bdE2eControlFailures += "харнес: головний try інсталятора або «Write-Step '5.» не знайдено (try=$($bdE2eMainTry.Count))"
+        }
+        foreach ($bdE2eControlCase in @(
+            @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'SambaOnly'); Destination = 'SambaOnly' },
+            @{ Arguments = @('-SeedLocalConfig'); Destination = 'Cloud' }
+        )) {
+            $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments $bdE2eControlCase.Arguments
+            $bdE2eInstalled = $(if (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'BRAVO.local.config')) {
+                ConvertTo-BRAVOSelfTestDestinationText -Overrides (Read-BRAVOSelfTestDestinationOverrides -ConfigDirectory $bdE2eRuntime).Overrides } else { '' })
+            if ($bdE2eRun.ExitCode -ne 0 -or -not $bdE2eRun.RobocopyCalled -or
+                -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json')) -or
+                $bdE2eInstalled -cne (ConvertTo-BRAVOSelfTestDestinationText -Overrides $bdProfiles[$bdE2eControlCase.Destination].Overrides)) {
+                $bdE2eControlFailures += "$($bdE2eRun.Label): exit=$($bdE2eRun.ExitCode) robocopy=$($bdE2eRun.RobocopyCalled) файл='$bdE2eInstalled' $($bdE2eRun.Output)"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eControlFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle' `
+            -Failure "контроль харнеса: кроки 0-4 інсталятора на фейковому комплекті поточної форми мають розгорнути його й створити BRAVO.local.config профілем: $($bdE2eControlFailures -join ' | ')"
+
+        # (P1-1) Явний -BackupDestination з комплектом без BRAVO.Configurator:
+        # зупинка ДО копіювання, причина називає модуль, параметр і вихід (-Tag/-ZipPath).
+        $bdE2eLegacyExplicitFailures = @()
+        $bdE2eLocalOnlyLines = @("'pathSettings.BackupRoot' = 'D:\ExampleArchive'") + @(ConvertTo-BRAVOSelfTestSiteConfigLines -Overrides $bdProfiles['LocalOnly'].Overrides)
+        foreach ($bdE2eCase in @(
+            @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'LocalOnly'); Existing = $false },
+            @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'SambaOnly'); Existing = $false },
+            @{ Arguments = @('-SeedLocalConfig', '-BackupDestination', 'Cloud'); Existing = $false },
+            @{ Arguments = @('-BackupDestination', 'LocalOnly', '-Force'); Existing = $true }
+        )) {
+            $bdE2eRuntime = $(if ($bdE2eCase.Existing) { New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLocalOnlyLines } else { New-BRAVOSelfTestE2ERuntimeRoot })
+            $bdE2eHashBefore = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eLegacyBundle.ZipPath -Arguments $bdE2eCase.Arguments
+            $bdE2eAllowed = $(if ($bdE2eCase.Existing) { @('BRAVO.local.config') } else { @() })
+            $bdE2eLegacyExplicitFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries $bdE2eAllowed -RequiredTexts @('BRAVO.Configurator', '-BackupDestination'))
+            if (-not ($bdE2eRun.Throw.Contains('-Tag') -or $bdE2eRun.Throw.Contains('-ZipPath'))) {
+                $bdE2eLegacyExplicitFailures += "$($bdE2eRun.Label) причина не підказує інший комплект (-Tag/-ZipPath)"
+            }
+            if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eHashBefore) {
+                $bdE2eLegacyExplicitFailures += "$($bdE2eRun.Label) BRAVO.local.config змінено або створено"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eLegacyExplicitFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerExplicitDestinationRejectsBundleWithoutConfigurator' `
+            -Failure "явний -BackupDestination з комплектом без modules\BRAVO.Configurator (форма v5.2.4) має зупинитися ДО копіювання в каталог інсталяції (без VERSION.json і часткового runtime) з українською причиною (BRAVO.Configurator, -BackupDestination, -Tag/-ZipPath), не чіпаючи BRAVO.local.config: $($bdE2eLegacyExplicitFailures -join ' | ')"
+
+        # (P1-1) Неявний шлях з комплектом без BRAVO.Configurator — поведінка
+        # developer: -SeedLocalConfig копіює приклад; без нього файл не створюється;
+        # наявний файл не змінюється; код 0 і розгорнутий VERSION.json.
+        $bdE2eLegacyImplicitFailures = @()
+        $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot
+        $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eLegacyBundle.ZipPath -Arguments @('-SeedLocalConfig')
+        $bdE2eSitePath = Join-Path $bdE2eRuntime 'BRAVO.local.config'
+        $bdE2eSiteBytes = $(if (Test-Path -LiteralPath $bdE2eSitePath -PathType Leaf) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdE2eSitePath)) } else { '' })
+        if ($bdE2eRun.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json')) -or
+            $bdE2eSiteBytes -cne $bdE2eLegacyBundle.ExampleBytes -or -not $bdE2eRun.Output.Contains('з прикладу')) {
+            $bdE2eLegacyImplicitFailures += "$($bdE2eRun.Label): exit=$($bdE2eRun.ExitCode) файл=приклад:$($bdE2eSiteBytes -ceq $bdE2eLegacyBundle.ExampleBytes) throw='$($bdE2eRun.Throw)'"
+        }
+        $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot
+        $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eLegacyBundle.ZipPath -Arguments @()
+        if ($bdE2eRun.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json')) -or
+            (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'BRAVO.local.config'))) {
+            $bdE2eLegacyImplicitFailures += "без параметрів: exit=$($bdE2eRun.ExitCode) throw='$($bdE2eRun.Throw)'"
+        }
+        $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines @("'pathSettings.BackupRoot' = 'D:\ExampleArchive'")
+        $bdE2eHashBefore = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+        $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eLegacyBundle.ZipPath -Arguments @('-SeedLocalConfig', '-Force')
+        if ($bdE2eRun.ExitCode -ne 0 -or (Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eHashBefore) {
+            $bdE2eLegacyImplicitFailures += "$($bdE2eRun.Label) з наявним файлом: exit=$($bdE2eRun.ExitCode) throw='$($bdE2eRun.Throw)'"
+        }
+        Test-BRAVOCondition -Condition ($bdE2eLegacyImplicitFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerImplicitSeedWithLegacyBundleKeepsDeveloperBehaviour' `
+            -Failure "без -BackupDestination комплект без BRAVO.Configurator встановлюється, як на developer: -SeedLocalConfig копіює BRAVO.local.config.example («з прикладу»), без нього файл не створюється, наявний не змінюється, код 0: $($bdE2eLegacyImplicitFailures -join ' | ')"
+
+        # (P2-1/P2-2) Наявний BRAVO.local.config суперечить явному профілю ->
+        # відмова ДО копіювання; файл не змінено. Для кожного профілю.
+        $bdE2eConflictCases = @(
+            @{ Destination = 'LocalOnly'; Arguments = @('-BackupDestination', 'LocalOnly', '-Force')
+               Lines = @("'pathSettings.BackupRoot' = 'D:\ExampleArchive'"); Channels = @('SFTP', 'SMB') },
+            @{ Destination = 'SambaOnly'; Arguments = @('-SeedLocalConfig', '-BackupDestination', 'SambaOnly', '-Force')
+               Lines = @("'componentSettings.SFTP.Enabled' = `$true", "'componentSettings.SMB.Enabled' = `$true", "'componentSettings.SMB.ArchiveCopy' = `$true")
+               Channels = @('SFTP') },
+            @{ Destination = 'Cloud'; Arguments = @('-BackupDestination', 'Cloud', '-Force')
+               Lines = @("'componentSettings.SFTP.Enabled' = `$true", "'componentSettings.SMB.Enabled' = `$true", "'componentSettings.SMB.ArchiveCopy' = `$true")
+               Channels = @('SMB') },
+            @{ Destination = 'CloudAndSamba'; Arguments = @('-SeedLocalConfig', '-BackupDestination', 'CloudAndSamba', '-Force')
+               Lines = @("'componentSettings.SFTP.Enabled' = `$false", "'componentSettings.SMB.Enabled' = `$true", "'componentSettings.SMB.ArchiveCopy' = `$true")
+               Channels = @('SFTP') },
+            # Головні вимикачі збігаються, але копії на NAS ефективно немає
+            # (SMB.ArchiveCopy = $false) — «Хмара + Samba» не в силі.
+            @{ Destination = 'CloudAndSamba'; Arguments = @('-BackupDestination', 'CloudAndSamba', '-Force')
+               Lines = @("'componentSettings.SFTP.Enabled' = `$true", "'componentSettings.SMB.Enabled' = `$true", "'componentSettings.SMB.ArchiveCopy' = `$false")
+               Channels = @('SMB') }
+        )
+        $bdE2eConflictFailures = @()
+        foreach ($bdE2eCase in $bdE2eConflictCases) {
+            $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eCase.Lines
+            $bdE2eActual = Get-BRAVOSelfTestEffectiveDestinations -LocalOverrides (Read-BRAVOSelfTestDestinationOverrides -ConfigDirectory $bdE2eRuntime).Overrides
+            $bdE2eConflicts = @(Get-BRAVOSelfTestDestinationConflicts -Actual $bdE2eActual -Expected $bdE2eProfileDestinations[$bdE2eCase.Destination])
+            if ((@($bdE2eConflicts) -join ',') -ne (@($bdE2eCase.Channels) -join ',')) {
+                $bdE2eConflictFailures += "$($bdE2eCase.Destination) фікстура: суперечність '$($bdE2eConflicts -join ',')', очікувалась '$($bdE2eCase.Channels -join ',')'"
+            }
+            $bdE2eHashBefore = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments $bdE2eCase.Arguments
+            $bdE2eConflictFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries @('BRAVO.local.config') -RequiredTexts (@($bdE2eCase.Destination, 'BRAVO.local.config') + @($bdE2eCase.Channels)))
+            if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eHashBefore) {
+                $bdE2eConflictFailures += "$($bdE2eRun.Label) BRAVO.local.config змінено"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eConflictFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy' `
+            -Failure "явний профіль (Cloud/CloudAndSamba/SambaOnly/LocalOnly), якому ЕФЕКТИВНО суперечить наявний BRAVO.local.config (SFTP.Enabled, SMB.Enabled чи SMB.ArchiveCopy не ті, що дав би -SeedLocalConfig цього профілю), має зупинити інсталяцію ДО копіювання в каталог інсталяції з українською причиною (профіль, BRAVO.local.config, канал) і не змінити файл: $($bdE2eConflictFailures -join ' | ')"
+
+        # (P2-1) Нерозбірний BRAVO.local.config при явному профілі -> відмова ДО
+        # копіювання з причиною, що називає профіль і файл; файл не змінено.
+        $bdE2eBrokenText = "@{`r`n    'componentSettings.SFTP.Enabled' = `r`n"
+        $bdE2eBrokenPremise = $false
+        $bdE2eBrokenProbe = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigText $bdE2eBrokenText
+        try { [void](Read-BRAVOSelfTestDestinationOverrides -ConfigDirectory $bdE2eBrokenProbe) } catch { $bdE2eBrokenPremise = $true }
+        $bdE2eBrokenFailures = @()
+        if (-not $bdE2eBrokenPremise) { $bdE2eBrokenFailures += 'фікстура: канонічний reader прочитав нерозбірний файл без помилки' }
+        foreach ($bdE2eArguments in @(
+            , @('-BackupDestination', 'LocalOnly', '-Force')
+            , @('-SeedLocalConfig', '-BackupDestination', 'SambaOnly', '-Force')
+        )) {
+            $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigText $bdE2eBrokenText
+            $bdE2eHashBefore = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments $bdE2eArguments
+            $bdE2eBrokenFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries @('BRAVO.local.config') -RequiredTexts @($bdE2eArguments[$bdE2eArguments.Count - 2], 'BRAVO.local.config'))
+            if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eHashBefore) {
+                $bdE2eBrokenFailures += "$($bdE2eRun.Label) BRAVO.local.config змінено"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eBrokenFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerUnusableSiteConfigRefusedBeforeDeploy' `
+            -Failure "нерозбірний BRAVO.local.config при явному -BackupDestination має зупинити інсталяцію ДО копіювання з українською причиною (профіль, BRAVO.local.config), файл не змінено: $($bdE2eBrokenFailures -join ' | ')"
+
+        # (P2-1/P2-2) Наявний файл, ефективно сумісний з явним профілем -> код 0,
+        # розгорнуто, файл не змінено, вивід підтверджує «профіль напрямків <X> у
+        # силі» і не каже «НЕ застосовано» (як для LocalOnly у (4a)).
+        $bdE2eCompatibleFailures = @()
+        $bdE2eSeedToggle = $false
+        foreach ($bdE2eDestination in @($bdExpectedProfiles.Keys)) {
+            $bdE2eSeedToggle = -not $bdE2eSeedToggle
+            $bdE2eLines = @("'pathSettings.BackupRoot' = 'D:\ExampleArchive'") + @(ConvertTo-BRAVOSelfTestSiteConfigLines -Overrides $bdProfiles[$bdE2eDestination].Overrides)
+            $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLines
+            $bdE2eActual = Get-BRAVOSelfTestEffectiveDestinations -LocalOverrides (Read-BRAVOSelfTestDestinationOverrides -ConfigDirectory $bdE2eRuntime).Overrides
+            if (@(Get-BRAVOSelfTestDestinationConflicts -Actual $bdE2eActual -Expected $bdE2eProfileDestinations[$bdE2eDestination]).Count -ne 0) {
+                $bdE2eCompatibleFailures += "$bdE2eDestination фікстура не відповідає профілю ефективно"
+            }
+            $bdE2eArguments = @('-BackupDestination', $bdE2eDestination, '-Force')
+            if ($bdE2eSeedToggle) { $bdE2eArguments = @('-SeedLocalConfig') + $bdE2eArguments }
+            $bdE2eHashBefore = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments $bdE2eArguments
+            if ($bdE2eRun.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json'))) {
+                $bdE2eCompatibleFailures += "$($bdE2eRun.Label) exit=$($bdE2eRun.ExitCode) throw='$($bdE2eRun.Throw)'"
+            }
+            if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eHashBefore) { $bdE2eCompatibleFailures += "$($bdE2eRun.Label) файл змінено" }
+            if ($bdE2eRun.Output.Contains("профіль напрямків $bdE2eDestination НЕ застосовано")) {
+                $bdE2eCompatibleFailures += "$($bdE2eRun.Label) вивід стверджує «$bdE2eDestination НЕ застосовано», хоча профіль ефективно в силі"
+            }
+            if (-not $bdE2eRun.Output.Contains("профіль напрямків $bdE2eDestination у силі")) {
+                $bdE2eCompatibleFailures += "$($bdE2eRun.Label) вивід не підтверджує «профіль напрямків $bdE2eDestination у силі»"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eCompatibleFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig' `
+            -Failure "явний профіль при наявному BRAVO.local.config, ефективно сумісному з ним, має пройти з кодом 0, не змінити файл і підтвердити «профіль напрямків <X> у силі» без «НЕ застосовано»: $($bdE2eCompatibleFailures -join ' | ')"
+
+        # (P2-1) Повтор після відмови: оператор виправляє файл і повторює той
+        # самий запуск — інсталяція проходить (відмова нічого не розгорнула);
+        # ще один повтор на вже встановленому каталозі файл не змінює.
+        $bdE2eRepeatFailures = @()
+        $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines @("'pathSettings.BackupRoot' = 'D:\ExampleArchive'")
+        $bdE2eRepeatArguments = @('-BackupDestination', 'LocalOnly', '-Force')
+        $bdE2eRunFirst = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments $bdE2eRepeatArguments
+        if ($bdE2eRunFirst.ExitCode -eq 0 -or (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json'))) {
+            $bdE2eRepeatFailures += "перший прогін (суперечливий файл): exit=$($bdE2eRunFirst.ExitCode) VERSION.json=$(Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json'))"
+        }
+        [IO.File]::WriteAllText((Join-Path $bdE2eRuntime 'BRAVO.local.config'),
+            ("@{`r`n" + ((@($bdE2eLocalOnlyLines) | ForEach-Object { '    ' + $_ }) -join "`r`n") + "`r`n}`r`n"), (New-Object Text.UTF8Encoding($false)))
+        $bdE2eFixedHash = Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime
+        $bdE2eRunSecond = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments $bdE2eRepeatArguments
+        if ($bdE2eRunSecond.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json')) -or
+            (Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eFixedHash) {
+            $bdE2eRepeatFailures += "другий прогін (виправлений файл): exit=$($bdE2eRunSecond.ExitCode) throw='$($bdE2eRunSecond.Throw)'"
+        }
+        $bdE2eRunThird = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments @('-SeedLocalConfig', '-BackupDestination', 'Cloud', '-Force')
+        if ((Get-BRAVOSelfTestE2ESiteHash -RuntimeRoot $bdE2eRuntime) -cne $bdE2eFixedHash) {
+            $bdE2eRepeatFailures += "третій прогін змінив BRAVO.local.config: exit=$($bdE2eRunThird.ExitCode)"
+        }
+        Test-BRAVOCondition -Condition ($bdE2eRepeatFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerRetryAfterRefusalSucceeds' `
+            -Failure "відмова через суперечливий BRAVO.local.config не має нічого розгортати, тож після виправлення файла той самий запуск проходить; повторні запуски файл не змінюють: $($bdE2eRepeatFailures -join ' | ')"
+
+        # (P2-2) Явний профіль без -SeedLocalConfig і без BRAVO.local.config ->
+        # діють дефолти, що суперечать кожному профілю -> відмова в кроці 0: ні
+        # staging-каталогу, ні каталогу інсталяції.
+        $bdE2eStepZeroFailures = @()
+        foreach ($bdE2eDestination in @($bdExpectedProfiles.Keys)) {
+            if (@(Get-BRAVOSelfTestDestinationConflicts -Actual $bdE2eDefaultDestinations -Expected $bdE2eProfileDestinations[$bdE2eDestination]).Count -eq 0) {
+                $bdE2eStepZeroFailures += "$bdE2eDestination передумова: дефолти не суперечать профілю"
+            }
+            $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCurrentBundle.ZipPath -Arguments @('-BackupDestination', $bdE2eDestination)
+            $bdE2eStepZeroFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries @() -RequiredTexts @($bdE2eDestination, '-SeedLocalConfig'))
+            if ($bdE2eRun.StagingCreated -or (Test-Path -LiteralPath $bdE2eRuntime)) {
+                $bdE2eStepZeroFailures += "$($bdE2eRun.Label) відмова не в кроці 0: staging=$($bdE2eRun.StagingCreated) каталог=$(Test-Path -LiteralPath $bdE2eRuntime)"
+            }
+        }
+        Test-BRAVOCondition -Condition ($bdE2eStepZeroFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerExplicitDestinationWithoutSiteConfigFailsAtStep0' `
+            -Failure "явний -BackupDestination (будь-який) без -SeedLocalConfig і без BRAVO.local.config лишає дефолти, що суперечать профілю, — відмова в кроці 0 (до staging/завантаження) з українською причиною (профіль, -SeedLocalConfig): $($bdE2eStepZeroFailures -join ' | ')"
+
+        # Регресійний запобіжник (не RED): модулі комплекту не імпортуються до
+        # гейтів SHA-256 і провенансу — маркер у кожному .psm1 комплекту лишається
+        # нествореним; статично: жоден Import-Module з $staged* не стоїть до
+        # рішення про канал релізу.
+        $bdE2eTrustFailures = @()
+        $bdE2eBadShaBundle = New-BRAVOSelfTestInstallBundle -Name 'badsha' -ModuleDirectories $bdE2eCurrentModules -MarkImports -CorruptChecksum
+        $bdE2eBadProvenanceBundle = New-BRAVOSelfTestInstallBundle -Name 'badprovenance' -ModuleDirectories $bdE2eCurrentModules -MarkImports -SourceCommit 'not-a-commit'
+        foreach ($bdE2eCase in @(
+            @{ Bundle = $bdE2eBadShaBundle; Expect = 'SHA-256' },
+            @{ Bundle = $bdE2eBadProvenanceBundle; Expect = 'провенанс' }
+        )) {
+            $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot -SiteConfigLines $bdE2eLocalOnlyLines
+            $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eCase.Bundle.ZipPath -Arguments @('-BackupDestination', 'LocalOnly', '-Force')
+            $bdE2eTrustFailures += @(Get-BRAVOSelfTestPreDeployRefusalProblems -Run $bdE2eRun -RuntimeRoot $bdE2eRuntime `
+                -AllowedEntries @('BRAVO.local.config') -RequiredTexts @($bdE2eCase.Expect))
+            if (Test-Path -LiteralPath $bdE2eCase.Bundle.MarkerPath) { $bdE2eTrustFailures += "$($bdE2eCase.Expect): модуль комплекту імпортовано до гейта" }
+        }
+        $bdE2eChannelGate = @($bdInstallAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and [string]$node.GetCommandName() -eq 'Get-BRAVODeployReleaseChannelDecision'
+        }, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
+        $bdE2eEarlyStagedImports = @($bdInstallAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and
+            ([string]$node.GetCommandName() -eq 'Import-Module' -or $node.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot) -and
+            $node.Extent.Text -match '(?i)\$staged'
+        }, $true) | Where-Object { $bdE2eChannelGate.Count -ne 1 -or $_.Extent.StartOffset -lt $bdE2eChannelGate[0].Extent.StartOffset })
+        if ($bdE2eChannelGate.Count -ne 1) { $bdE2eTrustFailures += 'Get-BRAVODeployReleaseChannelDecision не знайдено' }
+        foreach ($bdE2eImport in $bdE2eEarlyStagedImports) { $bdE2eTrustFailures += "рядок $($bdE2eImport.Extent.StartLineNumber): $($bdE2eImport.Extent.Text)" }
+        Test-BRAVOCondition -Condition ($bdE2eTrustFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerNeverImportsBundleBeforeTrustGates' `
+            -Failure "модулі розпакованого комплекту не можна імпортувати до перевірки SHA-256, провенансу й каналу релізу: $($bdE2eTrustFailures -join ' | ')"
+    } finally {
+        if (Test-Path -LiteralPath $bdE2eRoot) {
+            Remove-Item -LiteralPath $bdE2eRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 
 # ------------------------------------------------------------
 # (5) Health: свідомо вимкнений напрямок — один INFO-рядок.
