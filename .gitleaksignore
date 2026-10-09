@@ -142,3 +142,33 @@ b8a3b6d0a2ccc1417b6c151395827225206159b8:.claude/hooks/tests/Test-Redact.ps1:gen
 0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:574
 0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:575
 0098dee50f516758999e39458e2b466e039810d8:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:585
+
+# Покинуті гілки claude/sftp-log-secret-masking-365 і
+# claude/sftp-log-secret-masking-365-red (#365, RED-коміт 8cb1f46): таблиці
+# синтетичних секретів для self-test маскування точних значень Credential
+# Manager у власних журналах перед SFTP. Коміт не входить ні в developer, ні
+# в master, ні в hotfix/5.2.5 (#365 потрапив у developer іншими комітами,
+# PR #416), але ручний (workflow_dispatch) прогін gitleaks на hotfix/5.2.5
+# сканує історію всіх гілок (фікс області скану з PR #420 у цю гілку не
+# перенесено). Жоден літерал не існує в поточному стані жодної з цих гілок.
+# Значення — не credentials:
+#   Archive.ps1:238/239, MaintenanceOwnLog.ps1:271/275 — явно синтетичні
+#   плейсхолдери з маркером "Synth"/"synth", які тест сам подає в замоканий
+#   Get-BRAVOCredentialSecret і перевіряє, що в журналі їх немає;
+#   MaintenanceOwnLog.ps1:286/287/293/295/574 — НАЗВИ тестових target-ів
+#   Credential Manager (SELFTEST_365_*), не секрети;
+#   MaintenanceOwnLog.ps1:445 — ім'я тимчасового тестового лог-файлу
+#   (BRAVO_MAINTENANCE_<дата>_PID365.log).
+# Реального Credential Manager чи мережевого виклику тест не торкається.
+# Записи ігнорують лише ці історичні знахідки, без послаблення правила і
+# без видалення гілок чи переписування історії.
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.Archive.ps1:generic-api-key:238
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.Archive.ps1:generic-api-key:239
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:271
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:275
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:286
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:287
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:293
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:295
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:445
+8cb1f4625156364adc641a8487e4b7d443b9124b:selftest/BRAVO_SELF_TEST.MaintenanceOwnLog.ps1:generic-api-key:574
