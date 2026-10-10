@@ -1,4 +1,4 @@
-﻿{
+{
     "autoCompactWindow": 500000,
     "hooks": {
         "PreCompact": [
@@ -50,5 +50,6 @@
                 ]
             }
         ]
-    }
+    },
+    "model": "sonnet"
 }
