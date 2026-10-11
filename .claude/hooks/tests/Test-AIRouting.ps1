@@ -321,6 +321,12 @@ try {
     Assert-Equal 'documentation SCOPE using NTFS stream syntax on a .ps1 is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/source.ps1::`$DATA")))
     Assert-Equal 'documentation SCOPE using a named NTFS stream on a .psm1 is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/module.psm1:hidden")))
     Assert-Equal 'documentation SCOPE with an absolute path is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: C:/BRAVO/docs/x.md")))
+    # Drive-qualified traversal: згортання '..' не повинно перетворювати
+    # абсолютний шлях на дозволений відносний.
+    Assert-Equal 'documentation SCOPE with drive-qualified traversal is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: C:/../docs/x.md")))
+    Assert-Equal 'documentation SCOPE with deep drive-qualified traversal is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: C:/BRAVO/../../docs/x.md")))
+    Assert-Equal 'documentation SCOPE with a UNC path is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: //server/share/docs/x.md")))
+    Assert-Equal 'documentation SCOPE with a device path is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: \\?\C:\docs\x.md")))
     Assert-Equal 'documentation SCOPE with a harmless leading ./ stays allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: ./docs/MANUAL_RUN_CONSOLE_UX.md")))
 
     # 5b) Fallback enforcement must key on an actual mode declaration (QA-003),

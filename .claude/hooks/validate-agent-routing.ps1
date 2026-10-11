@@ -157,7 +157,16 @@ function ConvertTo-NormalizedScopePath {
     param([string]$Path)
 
     $value = ($Path -replace '\\', '/')
-    $isRooted = $value.StartsWith('/')
+
+    # Корінь визначаємо ДО згортання '..'. Інакше 'C:/../docs/x.md' згорнувся б
+    # у звичайний відносний 'docs/x.md' (бо сегмент 'C:' обрізається до 'C', а
+    # наступний '..' його знімає) і пройшов би allow-патерн 'docs/*', хоча
+    # фактично вказує на C:\docs\x.md поза репозиторієм. Позначений коренем
+    # шлях лишається з провідним '/', якого не покриває жоден allow-патерн, бо
+    # межі запису documentation описані лише відносними шляхами.
+    $isRooted = $value.StartsWith('/') -or
+                $value.StartsWith('//') -or
+                ($value -match '^[A-Za-z]:')
 
     $segments = New-Object System.Collections.Generic.List[string]
     foreach ($segment in ($value -split '/')) {
