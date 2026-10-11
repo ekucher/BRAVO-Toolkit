@@ -301,6 +301,30 @@ try {
     Assert-Equal 'documentation editing a PowerShell source is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: fix comment`nSCOPE: BRAVO_ARCHIV.ps1")))
     Assert-Equal 'documentation editing a manifest is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: refresh hashes`nSCOPE: RUNTIME_MANIFEST.json")))
 
+    # 5a) Write-boundary bypass via path traversal (QA-001).
+    #
+    # 'docs/../AGENTS.md' matches the writeAllow pattern 'docs/*' and dodges every
+    # deny pattern, yet resolves to canonical policy outside the boundary. The
+    # boundary must be applied to the normalized path, not to the literal token.
+    Assert-Equal 'documentation SCOPE escaping via ../ is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/../AGENTS.md")))
+    Assert-Equal 'documentation SCOPE escaping via backslash ..\ is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs\..\BRAVO_AGENT_POLICY.md")))
+    Assert-Equal 'documentation SCOPE escaping into a module is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/../modules/BRAVO.Archive/BRAVO.Archive.psm1")))
+    Assert-Equal 'documentation SCOPE escaping above the repository is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: ../other-repo/docs/x.md")))
+    Assert-Equal 'documentation SCOPE with a harmless leading ./ stays allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: ./docs/MANUAL_RUN_CONSOLE_UX.md")))
+
+    # 5b) Fallback enforcement must key on an actual mode declaration (QA-003),
+    # not on any mention of the string, otherwise briefs that implement or test
+    # fallback handling are blocked for no reason.
+    Assert-Equal 'worker brief merely mentioning claude-qa-fallback is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'worker' -Model 'sonnet' -Prompt 'OBJECTIVE: implement tests for claude-qa-fallback handling')))
+    Assert-Equal 'reviewer brief discussing fallback without declaring the mode is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Prompt 'OBJECTIVE: check that claude-qa-fallback wording in the policy is consistent')))
+
+    # 5c) The declared reason must be validated in full (QA-004): a valid prefix
+    # followed by a forbidden remainder must not pass.
+    foreach ($bad in @('quota/timeout', 'quota timeout', 'quota,timeout', 'rate-limit-ish', 'service-unavailable/mcp-error')) {
+        $prompt = 'REVIEW_MODE: claude-qa-fallback' + "`n" + ('fallback_reason: {0}' -f $bad) + "`n" + 'OBJECTIVE: review'
+        Assert-Equal ("fallback_reason '$bad' is blocked") '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Prompt $prompt)))
+    }
+
     # 6) Unmanaged agents are never blocked.
     Assert-Equal 'Explore agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'Explore' -Model 'opus')))
     Assert-Equal 'general-purpose agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'general-purpose' -Model 'haiku')))
@@ -369,6 +393,103 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $emptySandbox -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- Malformed stdin (QA-002) --------------------------------------------
+#
+# A payload the hook cannot parse leaves the role unidentified. The promised
+# fail-closed behavior must still hold for gate-critical roles: the hook has to
+# recover the role name from the raw text rather than silently allowing the call
+# because its own parse failed.
+
+function Invoke-RoutingHookRaw {
+    param(
+        [string]$ProjectDir,
+        [string]$RawStdin
+    )
+
+    if (-not (Test-Path -LiteralPath $hookPath -PathType Leaf)) { return -1 }
+
+    $previous = $env:CLAUDE_PROJECT_DIR
+    $env:CLAUDE_PROJECT_DIR = $ProjectDir
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $RawStdin | & powershell.exe -NoProfile -File $hookPath *>$null
+        return $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+        if ($null -eq $previous) {
+            Remove-Item Env:\CLAUDE_PROJECT_DIR -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:CLAUDE_PROJECT_DIR = $previous
+        }
+    }
+}
+
+$stdinSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-routing-stdin-{0}" -f [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $stdinSandbox '.claude') -Force | Out-Null
+    Copy-Item -LiteralPath $matrixPath -Destination (Join-Path $stdinSandbox '.claude\ai-routing.json') -Force -ErrorAction SilentlyContinue
+
+    $malformedReviewer = '{"tool_name":"Task","tool_input":{"subagent_type":"reviewer",,"prompt":"x"}}'
+    $malformedArchitect = '{"tool_name":"Task","tool_input":{"subagent_type":"architect",,"prompt":"x"}}'
+    $malformedWorker = '{"tool_name":"Task","tool_input":{"subagent_type":"worker",,"prompt":"x"}}'
+
+    Assert-Equal 'malformed stdin naming reviewer blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $malformedReviewer))
+    Assert-Equal 'malformed stdin naming architect blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $malformedArchitect))
+    Assert-Equal 'malformed stdin naming worker allows (fail-open)' '0' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $malformedWorker))
+    Assert-Equal 'empty stdin allows (fail-open, no role to protect)' '0' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin ''))
+
+    $stdinLog = Join-Path $stdinSandbox '.claude\logs\ai-routing.log'
+    Assert-True 'malformed stdin is logged as HOOK-ERROR' ((Test-Path -LiteralPath $stdinLog -PathType Leaf) -and ((Get-Content -LiteralPath $stdinLog -Raw) -match 'HOOK-ERROR'))
+}
+finally {
+    Remove-Item -LiteralPath $stdinSandbox -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- Cost report aggregation (QA-005) ------------------------------------
+#
+# The Stop hook fires at the end of every assistant response, not once per
+# session, and each record carries CUMULATIVE totals re-read from the whole
+# transcript. The report must therefore keep only the latest snapshot per
+# sessionId; summing raw snapshots inflates sessions, tokens and duration.
+
+$reportScript = Join-Path $root 'Tools\Get-AICostReport.ps1'
+Assert-True 'cost report script exists' (Test-Path -LiteralPath $reportScript -PathType Leaf) $reportScript
+
+$costSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-cost-test-{0}" -f [guid]::NewGuid().ToString('N'))
+try {
+    $costLogDir = Join-Path $costSandbox '.claude\logs'
+    New-Item -ItemType Directory -Path $costLogDir -Force | Out-Null
+    $costLog = Join-Path $costLogDir 'ai-cost.jsonl'
+
+    $records = @(
+        '{"recordedAt":"2026-10-12T01:00:00.0000000+03:00","sessionId":"s1","models":["claude-opus-5"],"assistantTurns":3,"inputTokens":10,"outputTokens":100,"cacheCreationTokens":5,"cacheReadTokens":50,"agentCalls":{"scout":1},"codexCalls":{},"fallbackReasons":[],"durationMinutes":5.0}',
+        '{"recordedAt":"2026-10-12T01:30:00.0000000+03:00","sessionId":"s1","models":["claude-opus-5"],"assistantTurns":7,"inputTokens":20,"outputTokens":200,"cacheCreationTokens":9,"cacheReadTokens":90,"agentCalls":{"scout":2},"codexCalls":{"codex_delegate:qa":1},"fallbackReasons":["quota"],"durationMinutes":12.0}',
+        '{"recordedAt":"2026-10-12T02:00:00.0000000+03:00","sessionId":"s2","models":["claude-sonnet-5"],"assistantTurns":2,"inputTokens":1,"outputTokens":30,"cacheCreationTokens":0,"cacheReadTokens":4,"agentCalls":{"worker":1},"codexCalls":{},"fallbackReasons":[],"durationMinutes":3.0}'
+    )
+    Set-Content -LiteralPath $costLog -Value ($records -join "`r`n") -Encoding UTF8
+
+    # Викликаємо в тому ж процесі: через дочірній powershell.exe об'єкт
+    # повернувся б як текст, і перевіряти агрегати було б нічим.
+    $report = & $reportScript -RepoRoot $costSandbox -AsObject
+    Assert-True 'cost report returns an object' ($null -ne $report)
+    if ($null -ne $report) {
+        Assert-Equal 'two cumulative snapshots of one session count as one session' '2' ([string]$report.Sessions)
+        Assert-Equal 'only the latest snapshot per session is counted (turns)' '9' ([string]$report.AssistantTurns)
+        Assert-Equal 'only the latest snapshot per session is counted (output tokens)' '230' ([string]$report.OutputTokens)
+        Assert-Equal 'only the latest snapshot per session is counted (cache reads)' '94' ([string]$report.CacheReadTokens)
+        Assert-Equal 'agent calls are not double counted' '2' ([string]$report.AgentCalls['scout'])
+        Assert-Equal 'duration is not double counted' '15' ([string]$report.TotalMinutes)
+        Assert-Equal 'codex calls come from the latest snapshot' '1' ([string]$report.CodexCalls['codex_delegate:qa'])
+        Assert-Equal 'fallback reasons come from the latest snapshot' '1' ([string]$report.FallbackReasons['quota'])
+    }
+}
+finally {
+    Remove-Item -LiteralPath $costSandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # --- Summary -------------------------------------------------------------

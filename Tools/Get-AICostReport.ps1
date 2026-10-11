@@ -82,6 +82,43 @@ if ($records.Count -eq 0) {
     return
 }
 
+# Хук Stop виконується в кінці КОЖНОЇ відповіді асистента, а не раз на сесію, і
+# кожен його запис містить КУМУЛЯТИВНІ підсумки, перечитані з усього
+# транскрипту. Тому сумувати всі записи поспіль не можна: сесія з двох
+# відповідей давала б дві «сесії» і подвоєні токени, виклики агентів та
+# тривалість. Лишаємо лише найсвіжіший снапшот на кожен sessionId.
+$latestBySession = New-Object 'System.Collections.Specialized.OrderedDictionary'
+$withoutSession = New-Object System.Collections.Generic.List[object]
+
+foreach ($record in $records) {
+    $sessionId = [string]$record.sessionId
+    if ([string]::IsNullOrWhiteSpace($sessionId)) {
+        # Запис без sessionId дедуплікувати нічим — лишаємо як окремий.
+        $withoutSession.Add($record)
+        continue
+    }
+
+    if (-not $latestBySession.Contains($sessionId)) {
+        $latestBySession[$sessionId] = $record
+        continue
+    }
+
+    $kept = $latestBySession[$sessionId]
+    $isNewer = $true
+    try {
+        $isNewer = ([datetime]$record.recordedAt) -ge ([datetime]$kept.recordedAt)
+    }
+    catch {
+        # Непридатна дата: вважаємо новішим пізніший рядок у файлі (append-only).
+        $isNewer = $true
+    }
+    if ($isNewer) { $latestBySession[$sessionId] = $record }
+}
+
+$records = New-Object System.Collections.Generic.List[object]
+foreach ($value in $latestBySession.Values) { $records.Add($value) }
+foreach ($value in $withoutSession) { $records.Add($value) }
+
 $agentTotals = @{}
 $codexTotals = @{}
 $fallbackTotals = @{}

@@ -209,8 +209,9 @@ list: model mismatch against the matrix, a Claude agent briefed with `review_sou
 scoped outside its write boundary. Everything else is logged to `.claude/logs/ai-routing.log`.
 A blocked call is a brief to fix, not a hook to work around.
 
-Per-session usage is recorded by the `Stop` hook into `.claude/logs/ai-cost.jsonl`; summarize it with
-`Tools\Get-AICostReport.ps1` when cost or retry behavior is in question.
+Usage is recorded by the `Stop` hook into `.claude/logs/ai-cost.jsonl` as a cumulative snapshot after
+every assistant response; summarize it with `Tools\Get-AICostReport.ps1` (which keeps only the latest
+snapshot per session) when cost or retry behavior is in question.
 
 ### Cost discipline
 

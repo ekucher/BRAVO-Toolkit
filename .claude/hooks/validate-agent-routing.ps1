@@ -131,11 +131,52 @@ function Get-ScopeToken {
             $token = $piece.Trim().Trim('`', '"', "'", '*', '-', '(', ')', '[', ']')
             if ([string]::IsNullOrWhiteSpace($token)) { continue }
             if ($token -notmatch '[\\/.]') { continue }
-            $tokens.Add(($token -replace '\\', '/'))
+            $tokens.Add((ConvertTo-NormalizedScopePath -Path $token))
         }
     }
 
     return $tokens
+}
+
+function ConvertTo-NormalizedScopePath {
+    <#
+        Нормалізує шлях зі SCOPE перед перевіркою меж запису: уніфікує
+        розділювачі, прибирає './' і логічно згортає '..'.
+
+        Без цього 'docs/../AGENTS.md' проходив би перевірку, бо літерально
+        відповідає writeAllow-патерну 'docs/*' і не відповідає жодному
+        writeDeny-патерну, хоча фактично вказує на канонічну політику поза
+        межами запису. Згортання робиться логічно (не через Resolve-Path): шлях
+        у брифі може ще не існувати на диску, а перевірка межі не повинна
+        залежати від того, створений файл чи ні.
+
+        Якщо шлях виходить за корінь (лишається провідний '..'), повертається
+        рядок із провідним '../', і жоден writeAllow-патерн його не покриє —
+        тобто виклик буде заблокований.
+    #>
+    param([string]$Path)
+
+    $value = ($Path -replace '\\', '/')
+    $isRooted = $value.StartsWith('/')
+
+    $segments = New-Object System.Collections.Generic.List[string]
+    foreach ($segment in ($value -split '/')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -ceq '.') { continue }
+        if ($segment -ceq '..') {
+            if ($segments.Count -gt 0 -and $segments[$segments.Count - 1] -cne '..') {
+                $segments.RemoveAt($segments.Count - 1)
+            }
+            else {
+                $segments.Add('..')
+            }
+            continue
+        }
+        $segments.Add($segment)
+    }
+
+    $normalized = [string]::Join('/', $segments)
+    if ($isRooted) { $normalized = '/' + $normalized }
+    return $normalized
 }
 
 function Test-PatternMatch {
@@ -154,6 +195,8 @@ $projectDir = Resolve-ProjectDir -CwdFromPayload $null
 $agentName = ''
 $modelName = ''
 $toolName = ''
+
+$raw = ''
 
 try {
     $raw = [Console]::In.ReadToEnd()
@@ -180,11 +223,31 @@ try {
 catch {
     # Збій розбору stdin — та сама логіка, що й для пошкодженої матриці:
     # закрито для гейт-критичних ролей, відкрито для решти.
+    #
+    # Роль при цьому ще не визначена, тому її доводиться відновити з сирого
+    # тексту: інакше обіцяне fail-closed не настало б ніколи (порожнє
+    # $agentName не входить до жодного списку, і хук пропускав би будь-який
+    # зіпсований payload, навіть той, що називає reviewer).
     $reason = 'HOOK-ERROR: stdin parse failed: ' + $_.Exception.Message
-    if ($script:FailClosedRoles -contains $agentName) {
-        Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model $modelName -Reason $reason
+    $recovered = ''
+    $recoverMatch = [regex]::Match($raw, '"subagent_type"\s*:\s*"(?<agent>[^"]+)"')
+    if ($recoverMatch.Success) {
+        $recovered = $recoverMatch.Groups['agent'].Value
     }
-    Write-RoutingLog -ProjectDir $projectDir -Decision 'ALLOW' -Tool $toolName -Agent $agentName -Model $modelName -Reason $reason
+    else {
+        # Навіть імені роли не видно: якщо в тексті взагалі згадана гейт-критична
+        # роль, трактуємо виклик як гейт-критичний.
+        foreach ($critical in $script:FailClosedRoles) {
+            if ($raw -match ('"' + [regex]::Escape($critical) + '"')) { $recovered = $critical; break }
+        }
+    }
+
+    if ($script:FailClosedRoles -contains $recovered) {
+        Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $recovered -Model $modelName `
+            -Reason ($reason + ' — gate-critical role recovered from raw payload, blocked (fail-closed)')
+    }
+    Write-RoutingLog -ProjectDir $projectDir -Decision 'ALLOW' -Tool $toolName -Agent $recovered -Model $modelName `
+        -Reason ($reason + ' — no gate-critical role identified, allowed (fail-open)')
     exit 0
 }
 
@@ -237,16 +300,27 @@ if ($codexSourceMatch.Success) {
 }
 
 # 3) Режим claude-qa-fallback вимагає однієї з трьох дозволених причин.
-if ($prompt -match 'claude-qa-fallback') {
+#
+# Тригер — саме ОГОЛОШЕННЯ режиму окремим ключем (REVIEW_MODE / review_source /
+# mode), а не будь-яка згадка рядка 'claude-qa-fallback' у брифі. Інакше
+# блокувались би легітимні виклики: бриф worker-а «реалізуй обробку
+# claude-qa-fallback» або бриф reviewer-а «перевір формулювання про
+# claude-qa-fallback у політиці» — жоден із них не є виконанням ролі fallback.
+$fallbackDeclared = [regex]::IsMatch($prompt, '(?im)^\s*(REVIEW_MODE|review_source|mode)\s*:\s*claude-qa-fallback\s*$')
+if ($fallbackDeclared) {
     $allowedReasons = @($matrix.fallback.allowedReasons)
-    $reasonMatch = [regex]::Match($prompt, '(?im)^\s*fallback_reason\s*:\s*(?<reason>[a-z\-]+)')
+
+    # Причина читається ДО кінця рядка і валідується повністю. Часткове
+    # зіставлення ('quota' у 'quota/timeout') пропускало б явно заборонену
+    # причину, прикриту дозволеним префіксом.
+    $reasonMatch = [regex]::Match($prompt, '(?im)^\s*fallback_reason\s*:\s*(?<reason>.+?)\s*$')
 
     if (-not $reasonMatch.Success) {
         Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model $modelName `
             -Reason 'claude-qa-fallback brief declares no fallback_reason'
     }
 
-    $declared = $reasonMatch.Groups['reason'].Value
+    $declared = $reasonMatch.Groups['reason'].Value.Trim()
     if ($allowedReasons -notcontains $declared) {
         Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model $modelName `
             -Reason ("fallback_reason '$declared' is not allowed — only " + ($allowedReasons -join ', ') + "; anything else is a defect to diagnose, not a fallback trigger")
