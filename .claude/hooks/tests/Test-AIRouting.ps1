@@ -316,6 +316,11 @@ try {
     Assert-Equal 'documentation SCOPE with a trailing dot on a .ps1 is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/source.ps1.")))
     Assert-Equal 'documentation SCOPE with trailing dots on a .psm1 is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/module.psm1...")))
     Assert-Equal 'documentation SCOPE with a trailing dot on a manifest is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: RUNTIME_MANIFEST.json.")))
+    # NTFS-синтаксис альтернативного потоку адресує той самий файл і не повинен
+    # обходити deny-патерни за розширенням.
+    Assert-Equal 'documentation SCOPE using NTFS stream syntax on a .ps1 is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/source.ps1::`$DATA")))
+    Assert-Equal 'documentation SCOPE using a named NTFS stream on a .psm1 is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/module.psm1:hidden")))
+    Assert-Equal 'documentation SCOPE with an absolute path is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: C:/BRAVO/docs/x.md")))
     Assert-Equal 'documentation SCOPE with a harmless leading ./ stays allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: ./docs/MANUAL_RUN_CONSOLE_UX.md")))
 
     # 5b) Fallback enforcement must key on an actual mode declaration (QA-003),
@@ -457,6 +462,19 @@ try {
     Assert-Equal 'malformed stdin with \u-escaped reviewer blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $escapedReviewer))
     Assert-Equal 'malformed stdin with \u-escaped architect blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $escapedArchitect))
     Assert-Equal 'malformed stdin with \u-escaped security-reviewer blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $escapedSecurity))
+    # Розескейпування стирає межі JSON-рядків, тому приклад усередині prompt
+    # може стояти перед справжнім оголошенням роли. Відновлення мусить дивитись
+    # на ВСІ згадки, інакше гейт-критична роль маскується прикладом.
+    $embeddedDecoy = '{"tool_name":"Task","tool_input":{"prompt":"Example: \"subagent_type\":\"worker\"","subagent_type":"reviewer",,}}'
+    Assert-Equal 'malformed stdin where a prompt example precedes the real reviewer blocks' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $embeddedDecoy))
+
+    # Навмисна консервативність: згадка гейт-критичної роли в зіпсованому
+    # payload блокує навіть якщо справжня роль звичайна. Цей шлях досягається
+    # лише при вже зіпсованому payload, і помилкове блокування тут дешевше за
+    # пропущений підмінений гейт.
+    $criticalMention = '{"tool_name":"Task","tool_input":{"prompt":"compare against \"reviewer\" output","subagent_type":"worker",,}}'
+    Assert-Equal 'malformed stdin merely mentioning a gate-critical role blocks (conservative)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $criticalMention))
+
     Assert-Equal 'malformed stdin with \u-escaped worker still allows (fail-open)' '0' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin '{"tool_name":"Task","tool_input":{"subagent_type":"work\u0065r",,"prompt":"x"}}'))
 
     $stdinLog = Join-Path $stdinSandbox '.claude\logs\ai-routing.log'

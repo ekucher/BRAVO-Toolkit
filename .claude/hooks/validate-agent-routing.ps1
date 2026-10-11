@@ -177,6 +177,17 @@ function ConvertTo-NormalizedScopePath {
         # зрізання 'docs/source.ps1.' проходив би межу запису, бо не відповідає
         # deny-патерну '*.ps1', хоча фактично вказує саме на такий файл.
         $trimmed = $segment.TrimEnd('.', ' ')
+
+        # NTFS-синтаксис альтернативного потоку: 'source.ps1::$DATA' і
+        # 'source.ps1:stream' звертаються до того самого файлу, але не
+        # відповідають deny-патерну '*.ps1'. Лишаємо лише частину до першої
+        # двокрапки. Для абсолютного шляху ('C:/...') це дає сегмент без
+        # двокрапки, який однаково не покривається allow-патернами, тобто
+        # абсолютні шляхи лишаються заблокованими.
+        $colonIndex = $trimmed.IndexOf(':')
+        if ($colonIndex -ge 0) { $trimmed = $trimmed.Substring(0, $colonIndex) }
+
+        $trimmed = $trimmed.TrimEnd('.', ' ')
         if ([string]::IsNullOrEmpty($trimmed)) { continue }
         $segments.Add($trimmed)
     }
@@ -271,15 +282,27 @@ catch {
     # тобто гейт-критичний виклик пройшов би саме через escape-послідовність.
     $rawDecoded = ConvertFrom-JsonEscapedText -Value $raw
 
-    $recoverMatch = [regex]::Match($rawDecoded, '"subagent_type"\s*:\s*"(?<agent>[^"]+)"')
-    if ($recoverMatch.Success) {
-        $recovered = $recoverMatch.Groups['agent'].Value
+    # Беремо ВСІ згадки subagent_type, а не першу: розескейпування стирає межі
+    # JSON-рядків, тому приклад усередині prompt ("subagent_type":"worker")
+    # може стояти перед справжнім оголошенням роли й перекрити його. Якщо
+    # будь-яка зі згадок — гейт-критична роль, трактуємо виклик як
+    # гейт-критичний. Це свідомо консервативно: шлях узагалі досягається лише
+    # тоді, коли payload уже зіпсований, і помилкове блокування тут дешевше за
+    # пропущений підмінений гейт.
+    $recoverMatches = @([regex]::Matches($rawDecoded, '"subagent_type"\s*:\s*"(?<agent>[^"]+)"'))
+    foreach ($candidate in $recoverMatches) {
+        $value = $candidate.Groups['agent'].Value
+        if ($script:FailClosedRoles -contains $value) { $recovered = $value; break }
+        if ([string]::IsNullOrEmpty($recovered)) { $recovered = $value }
     }
-    else {
-        # Навіть імені роли не видно: якщо в тексті взагалі згадана гейт-критична
-        # роль, трактуємо виклик як гейт-критичний.
+
+    if ($script:FailClosedRoles -notcontains $recovered) {
+        # Імені роли в розпізнаваній формі немає (або воно не гейт-критичне):
+        # якщо гейт-критична роль узагалі згадана в payload — сирому чи
+        # розескейпованому — трактуємо виклик як гейт-критичний.
         foreach ($critical in $script:FailClosedRoles) {
-            if ($rawDecoded -match ('"' + [regex]::Escape($critical) + '"')) { $recovered = $critical; break }
+            $pattern = '"' + [regex]::Escape($critical) + '"'
+            if ($rawDecoded -match $pattern -or $raw -match $pattern) { $recovered = $critical; break }
         }
     }
 
