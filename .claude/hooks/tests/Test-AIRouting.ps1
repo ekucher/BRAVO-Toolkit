@@ -1,0 +1,379 @@
+﻿<#
+    Test-AIRouting.ps1
+    Tests for the AI role/model routing matrix (.claude/ai-routing.json) and its
+    PreToolUse enforcement hook (.claude/hooks/validate-agent-routing.ps1).
+
+    Not part of BRAVO_SELF_TEST.ps1 — this is local Claude Code tooling,
+    not BRAVO runtime. Run directly:
+
+        powershell -NoProfile -File .claude\hooks\tests\Test-AIRouting.ps1
+
+    Exits 0 on all-pass, 1 on any failure (prints [FAIL] lines).
+
+    The hook is exercised as a real child process over stdin, so every
+    hook assertion is a real exit-code observation, not a simulation of one.
+    Codex quota/rate-limit behavior is asserted against the matrix contract
+    and the hook's own decisions — no real Codex quota is consumed.
+#>
+$ErrorActionPreference = 'Stop'
+
+$root = Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent
+
+$matrixPath = Join-Path $root '.claude\ai-routing.json'
+$hookPath = Join-Path $root '.claude\hooks\validate-agent-routing.ps1'
+$agentsDir = Join-Path $root '.claude\agents'
+
+$script:failures = 0
+$script:total = 0
+
+function Assert-Equal {
+    param([string]$Name, [string]$Expected, [string]$Actual)
+    $script:total++
+    if ($Expected -ceq $Actual) {
+        Write-Host "[PASS] $Name"
+    }
+    else {
+        $script:failures++
+        Write-Host "[FAIL] $Name -- expected '$Expected', got '$Actual'" -ForegroundColor Red
+    }
+}
+
+function Assert-True {
+    param([string]$Name, [bool]$Condition, [string]$Detail = '')
+    $script:total++
+    if ($Condition) {
+        Write-Host "[PASS] $Name"
+    }
+    else {
+        $script:failures++
+        Write-Host "[FAIL] $Name $Detail" -ForegroundColor Red
+    }
+}
+
+# --- Matrix contract ------------------------------------------------------
+
+Assert-True 'matrix file exists' (Test-Path -LiteralPath $matrixPath -PathType Leaf) $matrixPath
+
+$matrix = $null
+if (Test-Path -LiteralPath $matrixPath -PathType Leaf) {
+    try {
+        $matrix = Get-Content -LiteralPath $matrixPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-True 'matrix parses as JSON' $true
+    }
+    catch {
+        Assert-True 'matrix parses as JSON' $false $_.Exception.Message
+    }
+}
+
+if ($null -ne $matrix) {
+    Assert-Equal 'matrix schemaVersion is 1' '1' ([string]$matrix.schemaVersion)
+
+    $expectedRoles = @{
+        'scout'             = 'haiku'
+        'worker'            = 'sonnet'
+        'tester'            = 'sonnet'
+        'documentation'     = 'sonnet'
+        'reviewer'          = 'opus'
+        'architect'         = 'opus'
+        'security-reviewer' = 'opus'
+    }
+
+    foreach ($roleName in $expectedRoles.Keys) {
+        $role = $matrix.roles.$roleName
+        Assert-True "matrix defines role '$roleName'" ($null -ne $role)
+        if ($null -ne $role) {
+            Assert-Equal "role '$roleName' model" $expectedRoles[$roleName] ([string]$role.model)
+        }
+    }
+
+    # Every agent file on disk must be in the matrix, and vice versa, so the
+    # matrix cannot silently drift from what Claude Code actually loads.
+    $agentFiles = @()
+    if (Test-Path -LiteralPath $agentsDir -PathType Container) {
+        $agentFiles = @(Get-ChildItem -LiteralPath $agentsDir -Filter '*.md' -File)
+    }
+    Assert-True 'agents directory is not empty' ($agentFiles.Count -gt 0)
+
+    foreach ($file in $agentFiles) {
+        $agentName = [IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $role = $matrix.roles.$agentName
+        Assert-True "agent '$agentName' is present in the matrix" ($null -ne $role)
+
+        $text = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
+        $modelMatch = [regex]::Match($text, '(?m)^model:\s*(?<model>[A-Za-z0-9._\-\[\]]+)\s*$')
+        Assert-True "agent '$agentName' declares a model in frontmatter" $modelMatch.Success
+        if ($modelMatch.Success -and $null -ne $role) {
+            Assert-Equal "agent '$agentName' frontmatter model matches matrix" ([string]$role.model) $modelMatch.Groups['model'].Value
+        }
+
+        $nameMatch = [regex]::Match($text, '(?m)^name:\s*(?<name>\S+)\s*$')
+        Assert-True "agent '$agentName' frontmatter name matches file name" ($nameMatch.Success -and $nameMatch.Groups['name'].Value -ceq $agentName)
+
+        Assert-True "agent '$agentName' references canonical policy" ($text -match 'BRAVO_AGENT_POLICY\.md')
+        Assert-True "agent '$agentName' carries a HANDOFF block" ($text -match '(?m)^HANDOFF\s*$')
+    }
+
+    foreach ($roleName in $matrix.roles.PSObject.Properties.Name) {
+        $file = Join-Path $agentsDir ($roleName + '.md')
+        Assert-True "matrix role '$roleName' has an agent file" (Test-Path -LiteralPath $file -PathType Leaf)
+    }
+
+    # Read-only roles must not carry write tools in their frontmatter.
+    foreach ($roleName in $matrix.roles.PSObject.Properties.Name) {
+        $role = $matrix.roles.$roleName
+        if ($role.write -eq $false) {
+            $file = Join-Path $agentsDir ($roleName + '.md')
+            if (Test-Path -LiteralPath $file -PathType Leaf) {
+                $text = Get-Content -LiteralPath $file -Raw -Encoding UTF8
+                $toolsMatch = [regex]::Match($text, '(?m)^tools:\s*(?<tools>.+)$')
+                $hasWriteTool = $toolsMatch.Success -and ($toolsMatch.Groups['tools'].Value -match '\b(Edit|Write|NotebookEdit)\b')
+                Assert-True "read-only role '$roleName' declares no write tools" (-not $hasWriteTool) $(if ($toolsMatch.Success) { $toolsMatch.Groups['tools'].Value } else { '(no tools line)' })
+            }
+        }
+    }
+
+    # --- Risk levels map onto BRAVO_AGENT_POLICY.md section 9 -------------
+
+    Assert-True 'LOW requires no Codex gate' (@($matrix.riskLevels.LOW.requiredGates).Count -eq 0 -and $matrix.riskLevels.LOW.codexRequired -eq $false)
+    Assert-True 'MEDIUM requires exactly codex-qa' (@($matrix.riskLevels.MEDIUM.requiredGates) -join ',' -ceq 'codex-qa')
+    Assert-True 'HIGH requires codex-qa and codex-architecture' ((@($matrix.riskLevels.HIGH.requiredGates) -contains 'codex-qa') -and (@($matrix.riskLevels.HIGH.requiredGates) -contains 'codex-architecture'))
+    Assert-True 'HIGH requires the architect role' (@($matrix.riskLevels.HIGH.requiredRoles) -contains 'architect')
+    Assert-True 'CRITICAL requires qa + security + architecture gates' ((@($matrix.riskLevels.CRITICAL.requiredGates) -contains 'codex-qa') -and (@($matrix.riskLevels.CRITICAL.requiredGates) -contains 'codex-security') -and (@($matrix.riskLevels.CRITICAL.requiredGates) -contains 'codex-architecture'))
+    Assert-True 'CRITICAL requires architect and security-reviewer roles' ((@($matrix.riskLevels.CRITICAL.requiredRoles) -contains 'architect') -and (@($matrix.riskLevels.CRITICAL.requiredRoles) -contains 'security-reviewer'))
+
+    # --- Fallback limits (BRAVO_AGENT_POLICY.md section 8.2) --------------
+
+    $allowed = @($matrix.fallback.allowedReasons)
+    Assert-Equal 'exactly three fallback reasons are allowed' '3' ([string]$allowed.Count)
+    Assert-True 'allowed fallback reasons are quota, rate-limit, service-unavailable' (($allowed -contains 'quota') -and ($allowed -contains 'rate-limit') -and ($allowed -contains 'service-unavailable'))
+    Assert-True 'timeout is not an allowed fallback reason' ($allowed -notcontains 'timeout')
+    Assert-True 'mcp-error is not an allowed fallback reason' ($allowed -notcontains 'mcp-error')
+    Assert-True 'configuration defects are explicitly forbidden fallback reasons' ((@($matrix.fallback.forbiddenReasons) -contains 'configuration-error') -and (@($matrix.fallback.forbiddenReasons) -contains 'mcp-error') -and (@($matrix.fallback.forbiddenReasons) -contains 'timeout'))
+    Assert-True 'no second-level fallback to a weaker model' ($matrix.fallback.secondLevelFallback -eq $false)
+    Assert-Equal 'the single Claude fallback role is reviewer' 'reviewer' ([string]$matrix.fallback.claudeFallbackRole)
+    Assert-True 'fallback may not satisfy security/architecture/verification gates' ((@($matrix.fallback.gatesFallbackMayNotSatisfy) -contains 'codex-security') -and (@($matrix.fallback.gatesFallbackMayNotSatisfy) -contains 'codex-architecture') -and (@($matrix.fallback.gatesFallbackMayNotSatisfy) -contains 'codex-verification'))
+
+    # --- documentation write boundaries ----------------------------------
+
+    $deny = @($matrix.roles.documentation.writeDeny)
+    Assert-True 'documentation may write CHANGELOG.md' (@($matrix.roles.documentation.writeAllow) -contains 'CHANGELOG.md')
+    Assert-True 'documentation is denied acceptance evidence' ($deny -contains 'docs/*ACCEPTANCE*')
+    Assert-True 'documentation is denied runbooks' ($deny -contains 'docs/*RUNBOOK*')
+    Assert-True 'documentation is denied canonical policy' ($deny -contains 'BRAVO_AGENT_POLICY.md')
+    Assert-True 'documentation is denied PowerShell sources' ($deny -contains '*.ps1')
+    Assert-True 'documentation is denied integrity manifests' ($deny -contains '*MANIFEST*.json')
+
+    # --- enforcement wiring ----------------------------------------------
+
+    Assert-Equal 'matrix points at the enforcement hook' '.claude/hooks/validate-agent-routing.ps1' ([string]$matrix.enforcement.hook)
+    Assert-True 'unmanaged agents are ignored by design' ($matrix.enforcement.unmanagedAgentsIgnored -eq $true)
+    Assert-True 'fail-closed roles are exactly the gate-critical ones' ((@($matrix.enforcement.failClosedRoles) -contains 'reviewer') -and (@($matrix.enforcement.failClosedRoles) -contains 'architect') -and (@($matrix.enforcement.failClosedRoles) -contains 'security-reviewer') -and (@($matrix.enforcement.failClosedRoles).Count -eq 3))
+}
+
+# --- settings.json registers the hook ------------------------------------
+
+$settingsPath = Join-Path $root '.claude\settings.json'
+Assert-True 'settings.json exists' (Test-Path -LiteralPath $settingsPath -PathType Leaf)
+if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
+    $settingsText = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8
+    Assert-True 'settings.json registers a PreToolUse hook' ($settingsText -match '"PreToolUse"')
+    Assert-True 'settings.json wires validate-agent-routing.ps1' ($settingsText -match 'validate-agent-routing\.ps1')
+    Assert-True 'settings.json keeps the PreCompact hook' ($settingsText -match 'precompact-checkpoint\.ps1')
+    Assert-True 'settings.json keeps the save-task hook' ($settingsText -match 'save-task\.ps1')
+    Assert-True 'settings.json keeps the Slack notification hook' ($settingsText -match 'notify-slack\.ps1')
+    try {
+        $null = $settingsText | ConvertFrom-Json
+        Assert-True 'settings.json parses as JSON' $true
+    }
+    catch {
+        Assert-True 'settings.json parses as JSON' $false $_.Exception.Message
+    }
+}
+
+# --- Hook behavior: real child process, real exit codes ------------------
+
+Assert-True 'enforcement hook exists' (Test-Path -LiteralPath $hookPath -PathType Leaf) $hookPath
+
+function Invoke-RoutingHook {
+    <#
+        Runs the real hook as a child process over stdin and returns its exit
+        code. 0 = allow, 2 = block (Claude Code PreToolUse convention).
+    #>
+    param(
+        [string]$ProjectDir,
+        [hashtable]$Payload
+    )
+
+    if (-not (Test-Path -LiteralPath $hookPath -PathType Leaf)) { return -1 }
+
+    $json = $Payload | ConvertTo-Json -Depth 6 -Compress
+    $previous = $env:CLAUDE_PROJECT_DIR
+    $env:CLAUDE_PROJECT_DIR = $ProjectDir
+
+    # Блокування хука йде в stderr. У Windows PowerShell 5.1 перехоплення
+    # stderr нативного процесу через 2>&1 при $ErrorActionPreference = 'Stop'
+    # перетворює кожен рядок stderr у термінальний NativeCommandError, тому
+    # тут глушимо всі потоки через *> і локально знімаємо 'Stop': перевіряємо
+    # саме exit-код, а не текст діагностики.
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $json | & powershell.exe -NoProfile -File $hookPath *>$null
+        return $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+        if ($null -eq $previous) {
+            Remove-Item Env:\CLAUDE_PROJECT_DIR -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:CLAUDE_PROJECT_DIR = $previous
+        }
+    }
+}
+
+function Get-TaskPayload {
+    param(
+        [string]$Agent,
+        [string]$Model,
+        [string]$Prompt = 'OBJECTIVE: bounded test brief'
+    )
+    $toolInput = @{ subagent_type = $Agent; prompt = $Prompt }
+    if ($PSBoundParameters.ContainsKey('Model') -and -not [string]::IsNullOrEmpty($Model)) {
+        $toolInput['model'] = $Model
+    }
+    return @{
+        session_id      = 'routing-test'
+        hook_event_name = 'PreToolUse'
+        tool_name       = 'Task'
+        cwd             = $root
+        tool_input      = $toolInput
+    }
+}
+
+$sandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-routing-test-{0}" -f [guid]::NewGuid().ToString('N'))
+
+try {
+    New-Item -ItemType Directory -Path (Join-Path $sandbox '.claude') -Force | Out-Null
+    if (Test-Path -LiteralPath $matrixPath -PathType Leaf) {
+        Copy-Item -LiteralPath $matrixPath -Destination (Join-Path $sandbox '.claude\ai-routing.json') -Force
+    }
+
+    # 1) Legitimate calls are allowed.
+    Assert-Equal 'scout on haiku is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'scout' -Model 'haiku')))
+    Assert-Equal 'worker on sonnet is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'worker' -Model 'sonnet')))
+    Assert-Equal 'agent call without an explicit model override is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer')))
+
+    # 2) Model must match the matrix.
+    Assert-Equal 'scout forced onto opus is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'scout' -Model 'opus')))
+    Assert-Equal 'reviewer downgraded to haiku is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Model 'haiku')))
+    Assert-Equal 'reviewer downgraded to sonnet is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Model 'sonnet')))
+
+    # 3) Fallback discipline: reason required, and only the three allowed ones.
+    $fallbackNoReason = 'REVIEW_MODE: claude-qa-fallback' + "`n" + 'OBJECTIVE: review the change'
+    Assert-Equal 'claude-qa-fallback without a reason is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Prompt $fallbackNoReason)))
+
+    foreach ($reason in @('quota', 'rate-limit', 'service-unavailable')) {
+        $prompt = 'REVIEW_MODE: claude-qa-fallback' + "`n" + ('fallback_reason: {0}' -f $reason) + "`n" + 'OBJECTIVE: review the change'
+        Assert-Equal ("claude-qa-fallback with reason '$reason' is allowed") '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Prompt $prompt)))
+    }
+
+    foreach ($reason in @('timeout', 'mcp-error', 'configuration-error', 'not-configured', 'convenience')) {
+        $prompt = 'REVIEW_MODE: claude-qa-fallback' + "`n" + ('fallback_reason: {0}' -f $reason) + "`n" + 'OBJECTIVE: review the change'
+        Assert-Equal ("claude-qa-fallback with forbidden reason '$reason' is blocked") '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Prompt $prompt)))
+    }
+
+    # 4) A Claude agent must never be briefed as a Codex gate.
+    foreach ($source in @('codex-qa', 'codex-security', 'codex-architecture', 'codex-verification')) {
+        $prompt = ('review_source: {0}' -f $source) + "`n" + 'OBJECTIVE: close the gate'
+        Assert-Equal ("claude agent briefed as '$source' is blocked") '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Prompt $prompt)))
+    }
+    Assert-Equal 'architect briefed as the codex architecture gate is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'architect' -Model 'opus' -Prompt "review_source: codex-architecture`nOBJECTIVE: sign off")))
+    Assert-Equal 'security-reviewer briefed as the codex security gate is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'security-reviewer' -Model 'opus' -Prompt "review_source: codex-security`nOBJECTIVE: sign off")))
+    Assert-Equal 'declaring claude-pre-review is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer' -Prompt "review_source: claude-pre-review`nOBJECTIVE: internal pre-review")))
+
+    # 5) documentation write boundaries.
+    Assert-Equal 'documentation writing CHANGELOG.md is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: record the change`nSCOPE: CHANGELOG.md, README.md")))
+    Assert-Equal 'documentation writing a design note is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: update design note`nSCOPE: docs/BRAVO_HEALTH_FUTURE_MONITORING_DESIGN.md")))
+    Assert-Equal 'documentation rewriting acceptance evidence is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: refresh docs`nSCOPE: docs/BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md")))
+    Assert-Equal 'documentation rewriting a runbook is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: refresh docs`nSCOPE: docs/BRAVO_524_FLEET_ROLLOUT_RUNBOOK_20260913.md")))
+    Assert-Equal 'documentation editing canonical policy is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy policy`nSCOPE: BRAVO_AGENT_POLICY.md")))
+    Assert-Equal 'documentation editing a PowerShell source is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: fix comment`nSCOPE: BRAVO_ARCHIV.ps1")))
+    Assert-Equal 'documentation editing a manifest is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: refresh hashes`nSCOPE: RUNTIME_MANIFEST.json")))
+
+    # 6) Unmanaged agents are never blocked.
+    Assert-Equal 'Explore agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'Explore' -Model 'opus')))
+    Assert-Equal 'general-purpose agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'general-purpose' -Model 'haiku')))
+    Assert-Equal 'plugin agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'pr-review-toolkit:code-reviewer' -Model 'opus')))
+
+    # 7) Codex MCP calls are audited, never blocked by this hook.
+    $codexPayload = @{
+        session_id      = 'routing-test'
+        hook_event_name = 'PreToolUse'
+        tool_name       = 'mcp__codex-agent__codex_delegate'
+        cwd             = $root
+        tool_input      = @{ role = 'qa'; prompt = 'review the diff' }
+    }
+    Assert-Equal 'codex_delegate is allowed through' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $codexPayload))
+
+    # 8) Non-Task tools are untouched.
+    $bashPayload = @{
+        session_id      = 'routing-test'
+        hook_event_name = 'PreToolUse'
+        tool_name       = 'Bash'
+        cwd             = $root
+        tool_input      = @{ command = 'git status' }
+    }
+    Assert-Equal 'unrelated tools are allowed through' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $bashPayload))
+
+    # 9) The audit log is actually written.
+    $auditLog = Join-Path $sandbox '.claude\logs\ai-routing.log'
+    Assert-True 'hook writes an audit log' (Test-Path -LiteralPath $auditLog -PathType Leaf) $auditLog
+    if (Test-Path -LiteralPath $auditLog -PathType Leaf) {
+        $logText = Get-Content -LiteralPath $auditLog -Raw
+        Assert-True 'audit log records a block decision' ($logText -match 'BLOCK')
+        Assert-True 'audit log records an allow decision' ($logText -match 'ALLOW')
+    }
+}
+finally {
+    Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- Hook self-failure: fail-closed for gate-critical roles only ---------
+
+$brokenSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-routing-broken-{0}" -f [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $brokenSandbox '.claude') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $brokenSandbox '.claude\ai-routing.json') -Value '{ "schemaVersion": 1, "roles": { ' -Encoding UTF8
+
+    Assert-Equal 'broken matrix blocks reviewer (fail-closed)' '2' ([string](Invoke-RoutingHook -ProjectDir $brokenSandbox -Payload (Get-TaskPayload -Agent 'reviewer')))
+    Assert-Equal 'broken matrix blocks architect (fail-closed)' '2' ([string](Invoke-RoutingHook -ProjectDir $brokenSandbox -Payload (Get-TaskPayload -Agent 'architect')))
+    Assert-Equal 'broken matrix blocks security-reviewer (fail-closed)' '2' ([string](Invoke-RoutingHook -ProjectDir $brokenSandbox -Payload (Get-TaskPayload -Agent 'security-reviewer')))
+    Assert-Equal 'broken matrix still allows worker (fail-open)' '0' ([string](Invoke-RoutingHook -ProjectDir $brokenSandbox -Payload (Get-TaskPayload -Agent 'worker')))
+    Assert-Equal 'broken matrix still allows scout (fail-open)' '0' ([string](Invoke-RoutingHook -ProjectDir $brokenSandbox -Payload (Get-TaskPayload -Agent 'scout')))
+
+    $brokenLog = Join-Path $brokenSandbox '.claude\logs\ai-routing.log'
+    Assert-True 'hook logs its own failure loudly' ((Test-Path -LiteralPath $brokenLog -PathType Leaf) -and ((Get-Content -LiteralPath $brokenLog -Raw) -match 'HOOK-ERROR'))
+}
+finally {
+    Remove-Item -LiteralPath $brokenSandbox -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- Missing matrix behaves the same way ---------------------------------
+
+$emptySandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-routing-empty-{0}" -f [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $emptySandbox '.claude') -Force | Out-Null
+    Assert-Equal 'missing matrix blocks reviewer (fail-closed)' '2' ([string](Invoke-RoutingHook -ProjectDir $emptySandbox -Payload (Get-TaskPayload -Agent 'reviewer')))
+    Assert-Equal 'missing matrix allows worker (fail-open)' '0' ([string](Invoke-RoutingHook -ProjectDir $emptySandbox -Payload (Get-TaskPayload -Agent 'worker')))
+}
+finally {
+    Remove-Item -LiteralPath $emptySandbox -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- Summary -------------------------------------------------------------
+
+Write-Host ''
+Write-Host ("Total: {0}  Failures: {1}" -f $script:total, $script:failures)
+if ($script:failures -gt 0) { exit 1 }
+exit 0

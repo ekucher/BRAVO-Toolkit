@@ -64,6 +64,11 @@ Follow it for agent coordination and reporting. It does not override the
 BRAVO-specific engineering, architecture, security, PowerShell 5.1, or release
 rules defined elsewhere in this file and in `.claude/rules/`.
 
+Role-to-model assignment, per-risk-level gate requirements and fallback limits
+are machine-readable in `.claude/ai-routing.json` and enforced by the
+`PreToolUse` hook `.claude/hooks/validate-agent-routing.ps1`. Resolve a role's
+model from that matrix instead of choosing one per task.
+
 ## Rule loading
 
 Detailed engineering rules for domains this repository has split into a

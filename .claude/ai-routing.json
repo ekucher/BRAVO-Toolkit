@@ -1,0 +1,160 @@
+{
+  "schemaVersion": 1,
+  "description": "Canonical role/model routing matrix for ekucher/BRAVO-Toolkit. Normative agent-orchestration rules live in BRAVO_AGENT_POLICY.md; this file is the machine-readable source of truth for role-to-model assignment, risk-level gates and fallback limits. Operator documentation: docs/ai/MODEL_ROUTING_POLICY.md.",
+  "roles": {
+    "scout": {
+      "model": "haiku",
+      "write": false,
+      "gateCritical": false,
+      "purpose": "read-only context gathering"
+    },
+    "worker": {
+      "model": "sonnet",
+      "write": true,
+      "gateCritical": false,
+      "purpose": "bounded implementation inside assigned SCOPE"
+    },
+    "tester": {
+      "model": "sonnet",
+      "write": true,
+      "gateCritical": false,
+      "purpose": "test authoring inside assigned SCOPE; never production code"
+    },
+    "documentation": {
+      "model": "sonnet",
+      "write": true,
+      "gateCritical": false,
+      "purpose": "audits code-vs-documentation drift always; writes documentation only under an explicit SCOPE",
+      "writeAllow": [
+        "README.md",
+        "CHANGELOG.md",
+        "docs/*"
+      ],
+      "writeDeny": [
+        "docs/*ACCEPTANCE*",
+        "docs/*RUNBOOK*",
+        "docs/*EVIDENCE*",
+        "docs/*DISPOSITION*",
+        "BRAVO_AGENT_POLICY.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".claude/*",
+        "ci/*",
+        "*.ps1",
+        "*.psm1",
+        "*.psd1",
+        "*MANIFEST*.json",
+        "*INTEGRITY*.json",
+        "VERSION.json"
+      ]
+    },
+    "reviewer": {
+      "model": "opus",
+      "write": false,
+      "gateCritical": true,
+      "purpose": "fresh Claude internal pre-review, or temporary QA fallback under BRAVO_AGENT_POLICY.md section 8.2"
+    },
+    "architect": {
+      "model": "opus",
+      "write": false,
+      "gateCritical": true,
+      "purpose": "design and architectural risk analysis; never closes the formal Codex architecture gate"
+    },
+    "security-reviewer": {
+      "model": "opus",
+      "write": false,
+      "gateCritical": true,
+      "purpose": "internal security pre-review; never closes the formal Codex security gate"
+    }
+  },
+  "riskLevels": {
+    "LOW": {
+      "examples": "documentation, search, analytics, simple reports",
+      "requiredRoles": [],
+      "requiredGates": [],
+      "codexRequired": false
+    },
+    "MEDIUM": {
+      "examples": "local fixes, small features, tests",
+      "requiredRoles": [],
+      "requiredGates": [
+        "codex-qa"
+      ],
+      "codexRequired": true
+    },
+    "HIGH": {
+      "examples": "cross-module contracts, configuration, installer, significant behavior change",
+      "requiredRoles": [
+        "architect"
+      ],
+      "requiredGates": [
+        "codex-qa",
+        "codex-architecture"
+      ],
+      "codexRequired": true
+    },
+    "CRITICAL": {
+      "examples": "backup/restore, security, integrity, Scheduler/SYSTEM, authentication, data-loss risk",
+      "requiredRoles": [
+        "architect",
+        "security-reviewer"
+      ],
+      "requiredGates": [
+        "codex-qa",
+        "codex-security",
+        "codex-architecture"
+      ],
+      "codexRequired": true
+    }
+  },
+  "fallback": {
+    "claudeFallbackRole": "reviewer",
+    "allowedReasons": [
+      "quota",
+      "rate-limit",
+      "service-unavailable"
+    ],
+    "forbiddenReasons": [
+      "timeout",
+      "mcp-error",
+      "bridge-defect",
+      "configuration-error",
+      "protocol-error",
+      "parse-failure",
+      "not-configured",
+      "convenience"
+    ],
+    "secondLevelFallback": false,
+    "gatesFallbackMayNotSatisfy": [
+      "codex-security",
+      "codex-architecture",
+      "codex-verification"
+    ],
+    "notes": "A forbidden reason is a defect to diagnose, not a fallback trigger (BRAVO_AGENT_POLICY.md section 8.2). When Codex and the Claude fallback reviewer are both unavailable, the gate is reported NOT RUN / blocked; there is no second-level fallback to a weaker model."
+  },
+  "documentationTriggers": {
+    "note": "Any change with one of these externally observable effects requires the documentation role regardless of risk level.",
+    "effects": [
+      "new or changed configuration key",
+      "new or changed exit code",
+      "new or changed CLI parameter or switch",
+      "changed Scheduled Task definition or service behavior",
+      "changed persisted state format or path",
+      "changed notification or log contract relied on operationally"
+    ]
+  },
+  "enforcement": {
+    "hook": ".claude/hooks/validate-agent-routing.ps1",
+    "hookEvent": "PreToolUse",
+    "unmanagedAgentsIgnored": true,
+    "unmanagedAgentsNote": "Agents absent from roles (Explore, general-purpose, plugin agents) are logged, never blocked.",
+    "failClosedRoles": [
+      "reviewer",
+      "architect",
+      "security-reviewer"
+    ],
+    "failOpenNote": "If the hook itself fails, gate-critical roles are blocked and every other call is allowed with a loud [HOOK-ERROR] log entry.",
+    "auditLog": ".claude/logs/ai-routing.log",
+    "costLog": ".claude/logs/ai-cost.jsonl"
+  }
+}
