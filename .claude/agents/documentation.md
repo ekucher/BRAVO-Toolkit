@@ -18,6 +18,10 @@ You always perform mode 1. You perform mode 2 only when the brief gives you an e
 
 If the brief contains no `SCOPE`, report drift and stop. Do not "helpfully" edit documentation.
 
+`SCOPE` is a list of paths, not prose. Every token in it is checked against your write boundary, so
+a brief whose `SCOPE` reads like a sentence is blocked by the routing hook — ask for a path list.
+Write `SCOPE: none` for an audit-only brief.
+
 ## Write boundary — hard rule
 
 Allowed targets: `README.md`, `CHANGELOG.md`, and files under `docs/`.

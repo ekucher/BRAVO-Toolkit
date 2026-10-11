@@ -329,6 +329,20 @@ try {
     Assert-Equal 'documentation SCOPE with a device path is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: \\?\C:\docs\x.md")))
     Assert-Equal 'documentation SCOPE with a harmless leading ./ stays allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: ./docs/MANUAL_RUN_CONSOLE_UX.md")))
 
+    # 5d) Extensionless and directory scopes must be checked, not discarded.
+    # 'Tools' or 'POLICY' are write targets too; dropping tokens without a
+    # slash or dot let them skip the boundary entirely.
+    Assert-Equal 'documentation SCOPE naming a code directory is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: Tools")))
+    Assert-Equal 'documentation SCOPE naming an extensionless root file is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: write policy`nSCOPE: POLICY")))
+    Assert-Equal 'documentation SCOPE naming the modules tree is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: modules")))
+    Assert-Equal 'documentation SCOPE naming the docs directory stays allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs")))
+    Assert-Equal 'documentation SCOPE declared as none stays allowed (audit-only)' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: audit drift`nSCOPE: none")))
+    # Проза у SCOPE блокується свідомо: SCOPE — список шляхів, і бриф треба
+    # виправити, а не трактувати довільний текст як обсяг запису.
+    Assert-Equal 'documentation SCOPE written as prose is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: only the documentation files that describe the change")))
+    # Інші роли межі запису не мають — їх ця перевірка не стосується.
+    Assert-Equal 'worker SCOPE naming a module stays allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'worker' -Model 'sonnet' -Prompt "OBJECTIVE: implement`nSCOPE: modules/BRAVO.Archive/BRAVO.Archive.psm1")))
+
     # 5b) Fallback enforcement must key on an actual mode declaration (QA-003),
     # not on any mention of the string, otherwise briefs that implement or test
     # fallback handling are blocked for no reason.

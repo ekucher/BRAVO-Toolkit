@@ -40,6 +40,9 @@ $ErrorActionPreference = 'Stop'
 $script:FailClosedRoles = @('reviewer', 'architect', 'security-reviewer')
 $script:CodexToolPrefix = 'mcp__codex-agent__'
 
+# Маркери «SCOPE порожній» — бриф лише на аудит, без права запису.
+$script:EmptyScopeMarkers = @('none', 'n/a', 'na', 'nothing', '-')
+
 function Resolve-ProjectDir {
     param([string]$CwdFromPayload)
 
@@ -130,7 +133,15 @@ function Get-ScopeToken {
         foreach ($piece in ($line -split '[,;\s]+')) {
             $token = $piece.Trim().Trim('`', '"', "'", '*', '-', '(', ')', '[', ']')
             if ([string]::IsNullOrWhiteSpace($token)) { continue }
-            if ($token -notmatch '[\\/.]') { continue }
+
+            # Явні маркери «обсягу запису немає» (аудит без правок).
+            if ($script:EmptyScopeMarkers -contains $token.ToLowerInvariant()) { continue }
+
+            # Токени без '/' і '.' НЕ відкидаються: 'Tools' чи 'POLICY' — це
+            # теж цілі запису (каталог і файл без розширення), і раніше вони
+            # просто зникали перед перевіркою межі. SCOPE за канонічною
+            # політикою (розділ 5) — список файлів/каталогів, а не проза, тому
+            # кожен токен мусить потрапити в allowlist ролі.
             $tokens.Add((ConvertTo-NormalizedScopePath -Path $token))
         }
     }

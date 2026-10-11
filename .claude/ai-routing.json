@@ -28,6 +28,7 @@
       "writeAllow": [
         "README.md",
         "CHANGELOG.md",
+        "docs",
         "docs/*"
       ],
       "writeDeny": [
