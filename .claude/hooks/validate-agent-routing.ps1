@@ -171,12 +171,47 @@ function ConvertTo-NormalizedScopePath {
             }
             continue
         }
-        $segments.Add($segment)
+
+        # Windows відкидає кінцеві точки й пробіли в імені: 'source.ps1.' і
+        # 'source.ps1 ' відкриють той самий файл, що 'source.ps1'. Без цього
+        # зрізання 'docs/source.ps1.' проходив би межу запису, бо не відповідає
+        # deny-патерну '*.ps1', хоча фактично вказує саме на такий файл.
+        $trimmed = $segment.TrimEnd('.', ' ')
+        if ([string]::IsNullOrEmpty($trimmed)) { continue }
+        $segments.Add($trimmed)
     }
 
     $normalized = [string]::Join('/', $segments)
     if ($isRooted) { $normalized = '/' + $normalized }
     return $normalized
+}
+
+function ConvertFrom-JsonEscapedText {
+    <#
+        Розескейпує \uXXXX і прості \-послідовності в сирому тексті payload.
+
+        Потрібно лише на шляху відновлення роли після збою розбору stdin:
+        ConvertFrom-Json там уже впав, а порівнювати ім'я роли з літеральним
+        'reviewer' доводиться по сирому тексту. Без розескейпування
+        "subagent_type":"reviewer" не впізнавався б як гейт-критична роль.
+
+        Реалізовано без MatchEvaluator-скриптблоку: у Windows PowerShell 5.1
+        такий виклик [regex]::Replace поводиться непослідовно між хостами.
+    #>
+    param([string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+
+    $result = $Value
+    foreach ($match in [regex]::Matches($Value, '\\u(?<code>[0-9a-fA-F]{4})')) {
+        $literal = $match.Value
+        $decoded = [string][char][Convert]::ToInt32($match.Groups['code'].Value, 16)
+        $result = $result.Replace($literal, $decoded)
+    }
+
+    # Решта простих escape-послідовностей JSON: прибираємо зворотний слеш,
+    # лишаючи сам символ, щоб "revie\wer" теж не маскувало ім'я роли.
+    return ($result -replace '\\(.)', '$1')
 }
 
 function Test-PatternMatch {
@@ -230,7 +265,13 @@ catch {
     # зіпсований payload, навіть той, що називає reviewer).
     $reason = 'HOOK-ERROR: stdin parse failed: ' + $_.Exception.Message
     $recovered = ''
-    $recoverMatch = [regex]::Match($raw, '"subagent_type"\s*:\s*"(?<agent>[^"]+)"')
+
+    # Сире тіло спершу розескейпуємо: ім'я роли в JSON може бути записане як
+    # "reviewer", і порівняння з літеральним 'reviewer' його не впізнало б —
+    # тобто гейт-критичний виклик пройшов би саме через escape-послідовність.
+    $rawDecoded = ConvertFrom-JsonEscapedText -Value $raw
+
+    $recoverMatch = [regex]::Match($rawDecoded, '"subagent_type"\s*:\s*"(?<agent>[^"]+)"')
     if ($recoverMatch.Success) {
         $recovered = $recoverMatch.Groups['agent'].Value
     }
@@ -238,7 +279,7 @@ catch {
         # Навіть імені роли не видно: якщо в тексті взагалі згадана гейт-критична
         # роль, трактуємо виклик як гейт-критичний.
         foreach ($critical in $script:FailClosedRoles) {
-            if ($raw -match ('"' + [regex]::Escape($critical) + '"')) { $recovered = $critical; break }
+            if ($rawDecoded -match ('"' + [regex]::Escape($critical) + '"')) { $recovered = $critical; break }
         }
     }
 

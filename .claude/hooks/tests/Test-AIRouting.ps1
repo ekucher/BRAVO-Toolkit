@@ -310,6 +310,12 @@ try {
     Assert-Equal 'documentation SCOPE escaping via backslash ..\ is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs\..\BRAVO_AGENT_POLICY.md")))
     Assert-Equal 'documentation SCOPE escaping into a module is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/../modules/BRAVO.Archive/BRAVO.Archive.psm1")))
     Assert-Equal 'documentation SCOPE escaping above the repository is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: ../other-repo/docs/x.md")))
+    # Windows відкидає кінцеві точки й пробіли в імені файлу, тому
+    # 'docs/source.ps1.' відкриває 'docs/source.ps1' — межа запису мусить це
+    # враховувати, інакше deny-патерн '*.ps1' обходиться однією точкою.
+    Assert-Equal 'documentation SCOPE with a trailing dot on a .ps1 is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/source.ps1.")))
+    Assert-Equal 'documentation SCOPE with trailing dots on a .psm1 is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: docs/module.psm1...")))
+    Assert-Equal 'documentation SCOPE with a trailing dot on a manifest is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: RUNTIME_MANIFEST.json.")))
     Assert-Equal 'documentation SCOPE with a harmless leading ./ stays allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: tidy`nSCOPE: ./docs/MANUAL_RUN_CONSOLE_UX.md")))
 
     # 5b) Fallback enforcement must key on an actual mode declaration (QA-003),
@@ -442,6 +448,16 @@ try {
     Assert-Equal 'malformed stdin naming architect blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $malformedArchitect))
     Assert-Equal 'malformed stdin naming worker allows (fail-open)' '0' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $malformedWorker))
     Assert-Equal 'empty stdin allows (fail-open, no role to protect)' '0' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin ''))
+
+    # Ім'я гейт-критичної роли, замасковане escape-послідовностями, не повинно
+    # обходити fail-closed лише через те, що хук порівнює сирий текст.
+    $escapedReviewer = '{"tool_name":"Task","tool_input":{"subagent_type":"rev\u0069ewer",,"prompt":"x"}}'
+    $escapedArchitect = '{"tool_name":"Task","tool_input":{"subagent_type":"arch\u0069tect",,"prompt":"x"}}'
+    $escapedSecurity = '{"tool_name":"Task","tool_input":{"subagent_type":"secur\u0069ty-reviewer",,"prompt":"x"}}'
+    Assert-Equal 'malformed stdin with \u-escaped reviewer blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $escapedReviewer))
+    Assert-Equal 'malformed stdin with \u-escaped architect blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $escapedArchitect))
+    Assert-Equal 'malformed stdin with \u-escaped security-reviewer blocks (fail-closed)' '2' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin $escapedSecurity))
+    Assert-Equal 'malformed stdin with \u-escaped worker still allows (fail-open)' '0' ([string](Invoke-RoutingHookRaw -ProjectDir $stdinSandbox -RawStdin '{"tool_name":"Task","tool_input":{"subagent_type":"work\u0065r",,"prompt":"x"}}'))
 
     $stdinLog = Join-Path $stdinSandbox '.claude\logs\ai-routing.log'
     Assert-True 'malformed stdin is logged as HOOK-ERROR' ((Test-Path -LiteralPath $stdinLog -PathType Leaf) -and ((Get-Content -LiteralPath $stdinLog -Raw) -match 'HOOK-ERROR'))
