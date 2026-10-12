@@ -123,6 +123,7 @@ $agentTotals = @{}
 $codexTotals = @{}
 $fallbackTotals = @{}
 $modelTotals = @{}
+$unknownDelegationTotals = @{}
 
 $sumInput = 0
 $sumOutput = 0
@@ -158,6 +159,15 @@ foreach ($record in $records) {
         }
     }
 
+    # Делегування під іменем інструмента, якого не знає гейт маршрутизації:
+    # enforcement у таких сесіях був неактивний. Це не статистика, а сигнал.
+    if ($null -ne $record.unknownDelegationTools) {
+        foreach ($property in $record.unknownDelegationTools.PSObject.Properties) {
+            $count = [int]$property.Value
+            if ($unknownDelegationTotals.ContainsKey($property.Name)) { $unknownDelegationTotals[$property.Name] += $count } else { $unknownDelegationTotals[$property.Name] = $count }
+        }
+    }
+
     foreach ($reason in @($record.fallbackReasons)) {
         if ([string]::IsNullOrWhiteSpace($reason)) { continue }
         if ($fallbackTotals.ContainsKey($reason)) { $fallbackTotals[$reason]++ } else { $fallbackTotals[$reason] = 1 }
@@ -177,6 +187,7 @@ $summary = [ordered]@{
     AgentCalls          = $agentTotals
     CodexCalls          = $codexTotals
     FallbackReasons     = $fallbackTotals
+    UnknownDelegationTools = $unknownDelegationTotals
 }
 
 if ($AsObject) {
@@ -215,4 +226,15 @@ Write-Breakdown -Title 'Моделі (сесій із цією моделлю):'
 Write-Breakdown -Title 'Делегування агентам:' -Totals $agentTotals
 Write-Breakdown -Title 'Виклики Codex:' -Totals $codexTotals
 Write-Breakdown -Title 'Заявлені причини fallback:' -Totals $fallbackTotals
+if ($unknownDelegationTotals.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'ALERT: делегування під невідомим гейту іменем інструмента'
+    Write-Host '(у цих сесіях PreToolUse-гейт маршрутизації був неактивний):'
+    foreach ($entry in ($unknownDelegationTotals.GetEnumerator() | Sort-Object -Property Value -Descending)) {
+        Write-Host ("  {0,-34} {1}" -f $entry.Key, $entry.Value)
+    }
+    Write-Host 'Дія: синхронізувати DelegationTools у validate-agent-routing.ps1,'
+    Write-Host 'matcher PreToolUse у .claude/settings.json, enforcement.gatedTools у'
+    Write-Host '.claude/ai-routing.json і KnownDelegationTools у record-ai-cost.ps1.'
+}
 Write-Host ''
