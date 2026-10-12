@@ -2158,12 +2158,31 @@ function Sync-Folders {
 
 
 function Write-SevenZipFailureDiagnostics {
-    param([string]$Operation, [string]$StandardOutput, [string]$StandardError)
-    foreach ($line in @($StandardOutput, $StandardError)) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) {
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "${Operation}: $($line.Trim().Substring(0, [math]::Min(4000, $line.Trim().Length)))" -Level 'DEBUG'
-        }
-    }
+    # Тонкий адаптер над канонічним Write-BRAVOSevenZipFailureDiagnostics
+    # (BRAVO.ArchiveHelpers — імпортується вище): він володіє і нормалізацією
+    # рядків, і межами, і правилом рівня. Тут лишається лише мостик до
+    # Write-BRAVOLog — рівно той самий logger-скриптблок, що його передає
+    # виклик Test-SevenZipArchiveIntegrity у New-Archive.
+    #
+    # До цього тут було ДВІ незалежні копії правила рівня, і саме так шляхи
+    # create та test розійшлися. Попередня реалізація, окрім DEBUG, мала ще
+    # два дефекти: foreach ішов по ДВОХ ПОТОКАХ, а не по рядках (тому межі
+    # на 20 рядків не було взагалі, а 4000 символів застосовувались до
+    # кожного потоку окремо), і гілки для порожнього виводу не існувало.
+    param(
+        [string]$Operation,
+        [string]$StandardOutput,
+        [string]$StandardError,
+        [ValidateSet('ERROR', 'WARNING')][string]$Level = 'ERROR',
+        [AllowNull()][AllowEmptyString()][string]$EmptyOutputReason
+    )
+    [void](Write-BRAVOSevenZipFailureDiagnostics `
+        -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level } `
+        -Operation $Operation `
+        -StandardOutput $StandardOutput `
+        -StandardError $StandardError `
+        -Level $Level `
+        -EmptyOutputReason $EmptyOutputReason)
 }
 
 function Get-BRAVOVSSSnapshotSourcePath {
@@ -3524,6 +3543,15 @@ function New-Archive {
 
         if ($archiveTimedOut) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiвацiю перервано: перевищено таймаут $archiveTimeoutSeconds сек.: $displayName" -Level "ERROR"
+            # 878dd86 логував діагностику 7-Zip і на шляху таймауту; разом
+            # з рештою її прибрав ce4855d. Вивід убитого процесу — єдиний
+            # доказ того, на чому саме він завис; якщо потоки порожні, це
+            # теж тепер видно явно.
+            Write-SevenZipFailureDiagnostics `
+                -Operation "Дiагностика 7-Zip create" `
+                -StandardOutput $standardOutput `
+                -StandardError $errorOutput `
+                -EmptyOutputReason "перевищено таймаут $archiveTimeoutSeconds сек. (процес завершено примусово)"
             if (Test-Path -LiteralPath $fullArchivePath -PathType Leaf) {
                 Remove-Item -LiteralPath $fullArchivePath -Force -ErrorAction SilentlyContinue
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Неповний архiв видалено: $fullArchivePath" -Level "WARNING"

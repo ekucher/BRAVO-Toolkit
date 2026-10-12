@@ -143,6 +143,99 @@ function Get-BRAVOLegacyBomFallbackNotificationLines {
     return $lines.ToArray()
 }
 
+function Write-BRAVOSevenZipFailureDiagnostics {
+    # ЄДИНИЙ канонічний запис діагностичного виводу 7-Zip на шляху збою —
+    # і для integrity-тесту (Test-SevenZipArchiveIntegrity нижче), і для
+    # створення архіву (адаптер Write-SevenZipFailureDiagnostics у
+    # BRAVO.Archive.Runtime.ps1).
+    #
+    # ІНВАРІАНТ: діагностика несе рівень того збою, який вона пояснює, і
+    # НІКОЛИ не пише на DEBUG. Причина конкретна й перевірена: файловий
+    # гейт журналу — $script:BRAVOLogFileLevel (BRAVO.Logging), канонічний
+    # дефолт consoleSettings.FileLevel = "INFO" (BRAVO.Configuration), а
+    # DEBUG(1) < INFO(2). Запис на DEBUG відкидається ДО потрапляння у
+    # файл, тому оператор бачив лише «код: 2 — критична помилка» без
+    # жодного тексту від самого інструмента.
+    #
+    # Історія регресії (щоб її не повторили втретє): 878dd86 (2026-07-27)
+    # свідомо підняв ці рядки до ERROR «незалежно від LogLevel» і додав
+    # гілку для порожнього виводу; ce4855d (2026-07-28, рукотворний
+    # release-snapshot v4.0.2) відкотив усе разом із функцією; пізніший
+    # коміт повернув деградовану DEBUG-копію лише для create-шляху.
+    # Підтверджено на production 5.2.4: у 224 архівних логах нуль рядків
+    # [DEBUG], а кожен збій 7-Zip лишився без пояснення.
+    #
+    # Рівень НЕ фіксований на ERROR навмисно: #300/#422 ввели WARNING для
+    # retention старих архівів, і пояснення WARNING-події мусить бути
+    # WARNING, інакше в журналі з'явився б ERROR для архіву, який продукт
+    # свідомо толерує. Видимості це не коштує — WARNING(4) >= INFO(2).
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()][scriptblock]$Logger,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [AllowNull()][AllowEmptyString()][string]$StandardOutput,
+        [AllowNull()][AllowEmptyString()][string]$StandardError,
+        [ValidateSet('ERROR', 'WARNING')][string]$Level = 'ERROR',
+        # Текст причини для випадку, коли 7-Zip не дав ЖОДНОГО рядка
+        # (Error/Description результату). Саме це — production-форма
+        # збоїв «7-Zip не знайдено», «архів не знайдено» і вбитого по
+        # таймауту процесу: потоки порожні, і причина існує лише там.
+        [AllowNull()][AllowEmptyString()][string]$EmptyOutputReason,
+        [ValidateRange(1, 500)][int]$MaximumLines = 20,
+        [ValidateRange(100, 100000)][int]$MaximumLength = 4000
+    )
+
+    # -Last: `7z t` працює з -bb1 (рядок на запис), а операторо-значущий
+    # підсумок ("ERRORS:", "Sub items Errors:", "Wrong password") 7-Zip
+    # друкує В КІНЦІ. Хвіст зберігає вердикт.
+    $diagnosticLines = @(
+        @($StandardError, $StandardOutput) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            ForEach-Object { [string]$_ -split '\r?\n' } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Last $MaximumLines
+    )
+
+    if ($diagnosticLines.Count -eq 0) {
+        # «Інструмент промовчав» мусить відрізнятись від «діагностику
+        # втратили»: саме цієї двозначності не можна було розв'язати по
+        # production-логу.
+        $emptyMessage = "${Operation}: 7-Zip не повернув діагностичного тексту (stdout/stderr порожні)"
+        if (-not [string]::IsNullOrWhiteSpace($EmptyOutputReason)) {
+            $emptyMessage += "; причина: $EmptyOutputReason"
+        }
+        Write-BRAVOArchiveHelperLog -Logger $Logger -Message $emptyMessage -Level $Level
+        return $false
+    }
+
+    $diagnosticText = $diagnosticLines -join [Environment]::NewLine
+    if ($diagnosticText.Length -gt $MaximumLength) {
+        # Обрізання робиться видимим: обрізаний запис не повинен читатись
+        # як повний. Межа лишається, бо ці записи йдуть і у файл журналу,
+        # і в masked-копію, що вивантажується на SFTP — сильно пошкоджений
+        # архів інакше дав би мегабайти на один збій саме тоді, коли
+        # журнал найбільше потрібен читабельним.
+        #
+        # Обрізається ПОЧАТОК, а не кінець. Інакше символьна межа викидала б
+        # саме той вердикт, який вище навмисно збережено `Select-Object -Last`:
+        # 20 довгих рядків із довгими шляхами записів легко перебирають 4000
+        # символів ще до фінального «ERRORS: …», і оператор отримав би обрізаний
+        # запис без причини збою — тобто рівно той дефект, який цей фікс
+        # усуває, лише іншим механізмом.
+        # Маркер входить У БЮДЖЕТ -MaximumLength, а не додається поверх нього:
+        # інакше параметр обіцяв би межу, якої запис не тримає.
+        $truncationMarker = '(обрізано) … '
+        $diagnosticText = $truncationMarker +
+            $diagnosticText.Substring($diagnosticText.Length - ($MaximumLength - $truncationMarker.Length))
+    }
+    Write-BRAVOArchiveHelperLog `
+        -Logger $Logger `
+        -Message "${Operation}: $diagnosticText" `
+        -Level $Level
+    return $true
+}
+
 function Test-SevenZipArchiveIntegrity {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
@@ -253,19 +346,28 @@ function Test-SevenZipArchiveIntegrity {
         -Logger $Logger `
         -Message "Перевiрка цiлiсностi 7-Zip не пройдена (код: $exitCodeText — $($testResult.Description)): $ArchivePath" `
         -Level $failureLevel
-    $diagnosticLines = @(
-        @($testResult.StandardError, $testResult.StandardOutput) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-            ForEach-Object { [string]$_ -split '\r?\n' } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Select-Object -Last 20
-    )
-    if ($diagnosticLines.Count -gt 0) {
-        Write-BRAVOArchiveHelperLog `
-            -Logger $Logger `
-            -Message "Дiагностика 7-Zip test: $($diagnosticLines -join [Environment]::NewLine)" `
-            -Level "DEBUG"
+    # Діагностика пише рівнем $failureLevel — тим самим, що headline-рядок
+    # вище (див. інваріант у Write-BRAVOSevenZipFailureDiagnostics). Раніше
+    # тут був жорсткий "DEBUG", який канонічний FileLevel=INFO відкидав, і
+    # оператор не бачив причини збою взагалі.
+    # Причина для порожнього виводу — Error, інакше Description: під
+    # StrictMode читаються через PSObject.Properties, бо не кожне джерело
+    # результату має обидві властивості.
+    $emptyDiagnosticReason = ''
+    foreach ($reasonPropertyName in @('Error', 'Description')) {
+        if ($null -ne $resultProperties[$reasonPropertyName] -and
+            -not [string]::IsNullOrWhiteSpace([string]$resultProperties[$reasonPropertyName].Value)) {
+            $emptyDiagnosticReason = [string]$resultProperties[$reasonPropertyName].Value
+            break
+        }
     }
+    [void](Write-BRAVOSevenZipFailureDiagnostics `
+        -Logger $Logger `
+        -Operation 'Дiагностика 7-Zip test' `
+        -StandardOutput ([string]$testResult.StandardOutput) `
+        -StandardError ([string]$testResult.StandardError) `
+        -Level $failureLevel `
+        -EmptyOutputReason $emptyDiagnosticReason)
     return $false
 }
 

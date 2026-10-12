@@ -9090,6 +9090,144 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "BackupDiagnostics/SevenZipFailureOutput" `
         -Failure "помилка створення 7-Zip має записувати діагностичний вивід у лог"
+
+    # Гейт вище перевіряє лише НАЯВНІСТЬ підрядків, і саме тому пропустив
+    # регресію ce4855d: виклик лишився на місці, а рівень логування впав до
+    # DEBUG, який канонічний FileLevel=INFO відкидає ще до запису у файл.
+    # «Вивід записується в лог» ≠ «вивід є в лозі». Нижче — доказ рівнем.
+    & {
+        $diagnosticsLevelSources = @(
+            @{ Name = 'BRAVO.Archive.Runtime.ps1'; Text = $archiveScriptText },
+            @{ Name = 'BRAVO.ArchiveHelpers.psm1'; Text = [IO.File]::ReadAllText(
+                (Join-Path $root 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1'), [Text.Encoding]::UTF8) }
+        )
+        # Перевірка по AST, а НЕ по рядках. Порядковий regex тут вакуумний:
+        # у базовій (дефектній) реалізації `-Message "Дiагностика 7-Zip test: …"`
+        # і `-Level "DEBUG"` стоять на РІЗНИХ фізичних рядках (виклик розбито
+        # backtick-продовженням), а create-адаптер логує узагальнений
+        # `${Operation}` — літерал "Дiагностика 7-Zip" там узагалі живе на
+        # call-site. Отже збігів на одному рядку нуль, і гейт позеленів би на
+        # дефектній базі — рівно той самий дефект, який він має ловити.
+        # Тому: беремо ТІЛА функцій, що володіють цією діагностикою, і
+        # стверджуємо, що жоден виклик логування в них не передає -Level DEBUG.
+        # Обидві базові форми дефекту лежать саме в цих тілах:
+        # ArchiveHelpers — усередині Test-SevenZipArchiveIntegrity,
+        # Archive.Runtime — усередині Write-SevenZipFailureDiagnostics.
+        $diagnosticsOwnerFunctions = @(
+            'Write-BRAVOSevenZipFailureDiagnostics',
+            'Test-SevenZipArchiveIntegrity',
+            'Write-SevenZipFailureDiagnostics'
+        )
+        # Без цього гейт тихо вимкнувся б від перейменування: FindAll нічого
+        # не знайшов би, offenders лишились би нулем, і перевірка «позеленіла»
+        # б на коді, якого вона більше не бачить.
+        $diagnosticsOwnersFound = New-Object System.Collections.Generic.List[string]
+        $diagnosticsDebugOffenders = @(
+            foreach ($diagnosticsSource in $diagnosticsLevelSources) {
+                $diagnosticsTokens = $null
+                $diagnosticsErrors = $null
+                $diagnosticsAst = [Management.Automation.Language.Parser]::ParseInput(
+                    $diagnosticsSource.Text, [ref]$diagnosticsTokens, [ref]$diagnosticsErrors)
+                if ($diagnosticsErrors.Count -gt 0) {
+                    "$($diagnosticsSource.Name): не розпарсився — $(($diagnosticsErrors | ForEach-Object { $_.Message }) -join ' | ')"
+                    continue
+                }
+                $diagnosticsFunctionAsts = @(
+                    $diagnosticsAst.FindAll({
+                        param($candidate)
+                        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                        $diagnosticsOwnerFunctions -contains $candidate.Name
+                    }, $true)
+                )
+                foreach ($diagnosticsFunctionAst in $diagnosticsFunctionAsts) {
+                    if (-not $diagnosticsOwnersFound.Contains($diagnosticsFunctionAst.Name)) {
+                        $diagnosticsOwnersFound.Add($diagnosticsFunctionAst.Name)
+                    }
+                    $diagnosticsCommandAsts = @(
+                        $diagnosticsFunctionAst.FindAll({
+                            param($candidate)
+                            $candidate -is [Management.Automation.Language.CommandAst]
+                        }, $true)
+                    )
+                    foreach ($diagnosticsCommandAst in $diagnosticsCommandAsts) {
+                        $diagnosticsElements = @($diagnosticsCommandAst.CommandElements)
+                        for ($diagnosticsIndex = 0; $diagnosticsIndex -lt $diagnosticsElements.Count - 1; $diagnosticsIndex++) {
+                            $diagnosticsParameter = $diagnosticsElements[$diagnosticsIndex]
+                            if ($diagnosticsParameter -isnot [Management.Automation.Language.CommandParameterAst]) { continue }
+                            if ($diagnosticsParameter.ParameterName -ne 'Level') { continue }
+                            $diagnosticsValue = $diagnosticsElements[$diagnosticsIndex + 1]
+                            if ($diagnosticsValue -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                                $diagnosticsValue.Value -eq 'DEBUG') {
+                                "$($diagnosticsSource.Name): $($diagnosticsFunctionAst.Name) -> $($diagnosticsCommandAst.GetCommandName()) -Level DEBUG (рядок $($diagnosticsCommandAst.Extent.StartLineNumber))"
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        $diagnosticsOwnersMissing = @($diagnosticsOwnerFunctions | Where-Object { -not $diagnosticsOwnersFound.Contains($_) })
+        Test-BRAVOCondition `
+            -Condition ($diagnosticsDebugOffenders.Count -eq 0 -and $diagnosticsOwnersMissing.Count -eq 0) `
+            -Name "BackupDiagnostics/SevenZipDiagnosticsNeverLoggedAtDebug" `
+            -Failure ("діагностика 7-Zip не повинна логуватись рівнем DEBUG: канонічний consoleSettings.FileLevel=INFO " +
+                "відкидає DEBUG ДО запису у файл, і оператор лишається з кодом виходу без причини (регресія ce4855d, " +
+                "підтверджена production-логами 5.2.4). Знайдено порушень: " + ($diagnosticsDebugOffenders -join ' | ') +
+                "; не знайдено функцій-власників (гейт втратив предмет перевірки): " + ($diagnosticsOwnersMissing -join ', '))
+
+        # Поведінковий доказ для create-шляху: справжній Write-BRAVOLog у
+        # тимчасовий файл на канонічному FileLevel=INFO. AST-екстракція дає
+        # РЕАЛЬНУ production-функцію; BRAVO.ArchiveHelpers і BRAVO.Logging —
+        # справжні модулі, не заглушки.
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1') -Force -ErrorAction Stop
+        Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Logging\BRAVO.Logging.psd1') -Force -ErrorAction Stop
+        $createDiagLogFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_7Z_CREATE_DIAG_{0}.log" -f [guid]::NewGuid().ToString('N'))
+        try {
+            [void](Initialize-BRAVOLog -LogFile $createDiagLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+            $createDiagModule = New-BRAVOSelfTestRuntimeModule `
+                -SourceText $archiveScriptText `
+                -FunctionNames @('Write-SevenZipFailureDiagnostics')
+            $createDiagMarker = "MARKER{0}" -f [guid]::NewGuid().ToString('N')
+            & $createDiagModule {
+                param($Marker)
+                Write-SevenZipFailureDiagnostics `
+                    -Operation "Дiагностика 7-Zip create" `
+                    -StandardOutput "рядок один`r`n$Marker" `
+                    -StandardError ''
+                Write-SevenZipFailureDiagnostics `
+                    -Operation "Дiагностика 7-Zip create" `
+                    -StandardOutput '' `
+                    -StandardError '' `
+                    -EmptyOutputReason 'синтетична перевірка порожнього виводу'
+            } $createDiagMarker
+            $createDiagLines = @(Get-Content -LiteralPath $createDiagLogFile -Encoding UTF8 -ErrorAction SilentlyContinue)
+            # Запис діагностики багаторядковий, а префікс "<timestamp> [LEVEL]"
+            # стоїть лише на ПЕРШОМУ фізичному рядку. Тому рівень перевіряється
+            # на рядку з префіксом операції, а сам текст 7-Zip — у повному
+            # вмісті файлу (він може лежати на наступних рядках).
+            $createDiagPrefixLines = @($createDiagLines | Where-Object { $_ -match 'Дiагностика 7-Zip create' })
+            $createDiagEmptyLines = @($createDiagLines | Where-Object { $_ -match 'не повернув діагностичного тексту' })
+            $createDiagAllText = $createDiagLines -join "`n"
+            Test-BRAVOCondition `
+                -Condition (
+                    $createDiagPrefixLines.Count -eq 2 -and
+                    @($createDiagPrefixLines | Where-Object { $_ -match '\[ERROR' }).Count -eq 2 -and
+                    $createDiagAllText -match [regex]::Escape($createDiagMarker) -and
+                    $createDiagEmptyLines.Count -eq 1
+                ) `
+                -Name "BackupDiagnostics/SevenZipCreateFailureOutputReachesLogAtInfoLevel" `
+                -Failure ("при FileLevel=INFO діагностика create-шляху мусить фізично попасти у файл журналу рівнем ERROR, " +
+                    "і порожній вивід теж мусить бути видимий; записів діагностики: $($createDiagPrefixLines.Count) (очікується 2), " +
+                    "з них ERROR: $(@($createDiagPrefixLines | Where-Object { $_ -match '\[ERROR' }).Count), " +
+                    "маркер у тексті: $($createDiagAllText -match [regex]::Escape($createDiagMarker)), " +
+                    "рядків про порожній вивід: $($createDiagEmptyLines.Count)")
+        } finally {
+            Remove-Item -LiteralPath $createDiagLogFile -Force -ErrorAction SilentlyContinue
+            Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
+            Import-Module -Name (Join-Path $root 'modules\BRAVO.Logging\BRAVO.Logging.psd1') -Force -ErrorAction Stop
+        }
+    }
+
     Test-BRAVOCondition `
         -Condition (
             -not $archiveScriptText.Contains("Send-BRAVOArchiveInactiveServiceWarning")
@@ -20642,6 +20780,502 @@ try {
                 Test-BRAVOCondition -Condition (-not [bool]$b2TestCorrupt.Success -and -not [bool]$b2TestCorrupt.LegacyBomPasswordFallbackUsed) `
                     -Name "B2/CorruptedArchiveDoesNotTriggerFallback" `
                     -Failure "Пошкоджений (усічений) архів не повинен класифікуватись як password-failure і не повинен отримувати другу спробу; Success=$($b2TestCorrupt.Success),Fallback=$($b2TestCorrupt.LegacyBomPasswordFallbackUsed)"
+
+                # ========================================================
+                # Діагностика збою 7-Zip мусить доходити до оператора при
+                # ШТАТНОМУ production-рівні журналу (consoleSettings.FileLevel
+                # = "INFO", канонічний дефолт BRAVO.Configuration).
+                #
+                # Це поведінкові перевірки через РЕАЛЬНИЙ BRAVO.Logging у
+                # тимчасовий файл, а не AST/substring: саме substring-гейт
+                # (BackupDiagnostics/SevenZipFailureOutput) пропустив
+                # регресію ce4855d, якою діагностику 7-Zip повернули на
+                # рівень DEBUG. DEBUG(1) < INFO(2), тому рядок відкидався
+                # ще до запису у файл, і production-журнал мав «код: 2» без
+                # жодного тексту від самого 7-Zip (підтверджено 224
+                # архівними логами з ураженого сервера: нуль рядків [DEBUG]).
+                #
+                # Контракт, який ці перевірки закріплюють:
+                #   1) при archive-specific збої текст 7-Zip потрапляє у
+                #      журнал на рівні headline-рядка (ERROR типово);
+                #   2) коли 7-Zip не дав ЖОДНОГО тексту, це теж видно —
+                #      «немає діагностики» відрізняється від «діагностику
+                #      втрачено»;
+                #   3) рівень діагностики йде за $failureLevel, а не
+                #      жорстко ERROR: #422/#300 свідомо ввели WARNING для
+                #      retention старих архівів, і WARNING(4) >= INFO(2)
+                #      однаково доходить до файлу;
+                #   4) пароль архіву не потрапляє у журнал.
+                # ========================================================
+                # Блок виконується в ДОЧІРНІЙ області (& { ... }) за
+                # конвенцією на початку файлу: його змінні не осідають у
+                # Root-області self-test (#163, Framework/VariableScopeHeadroom).
+                # $root, $sevenZipToolPath, $b2TestRoot, $b2CorruptArchivePath
+                # читаються з батьківської області; Test-BRAVOCondition і
+                # $script:-лічильники доступні без змін.
+                & {
+                Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+                Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
+                Import-Module -Name (Join-Path $root "modules\BRAVO.Logging\BRAVO.Logging.psd1") -Force -ErrorAction Stop
+
+                # Той самий logger-скриптблок, що його передає production
+                # (BRAVO.Archive.Runtime.ps1, виклик Test-SevenZipArchiveIntegrity).
+                $diagLogger = { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level }
+                $diagLogFile = Join-Path $b2TestRoot ("diag_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                $diagEmptyLogFile = Join-Path $b2TestRoot ("diag_empty_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                $diagWarnLogFile = Join-Path $b2TestRoot ("diag_warn_{0}.log" -f [guid]::NewGuid().ToString("N"))
+
+                # (1) Archive-specific збій: усічений архів. Рівень файлу —
+                # рівно production-дефолт INFO.
+                [void](Initialize-BRAVOLog -LogFile $diagLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Test-SevenZipArchiveIntegrity `
+                    -SevenZipPath $sevenZipToolPath `
+                    -ArchivePath $b2CorruptArchivePath `
+                    -Password "B2LegacyPass" `
+                    -Logger $diagLogger)
+                $diagLogText = if (Test-Path -LiteralPath $diagLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagLogFile)
+                } else { '' }
+                $diagHeadlinePresent = $diagLogText -match 'цiлiсностi 7-Zip не пройдена'
+                $diagBodyPresent = $diagLogText -match 'Дiагностика 7-Zip test'
+                # Текст мусить бути від самого 7-Zip, а не лише наш префікс.
+                $diagToolTextPresent = $diagLogText -match '(?i)Unexpected end of (archive|data)|Data Error|CRC|Headers Error|Cannot open the file as'
+                Test-BRAVOCondition `
+                    -Condition ($diagHeadlinePresent -and $diagBodyPresent -and $diagToolTextPresent) `
+                    -Name "SevenZipDiagnostics/IntegrityFailureTextReachesLogAtInfoFileLevel" `
+                    -Failure ("при FileLevel=INFO журнал мусить містити і headline-рядок, і фактичний текст 7-Zip: " +
+                        "headline=$diagHeadlinePresent, префікс діагностики=$diagBodyPresent, текст інструмента=$diagToolTextPresent. " +
+                        "Якщо текст відсутній — діагностика пишеться рівнем нижче за INFO і оператор бачить лише код виходу")
+
+                # (2) 7-Zip не дав діагностичного тексту взагалі: відсутній
+                # архів — preflight-guard у Invoke-BRAVOSevenZipIntegrityTestCore
+                # кидає ДО запуску процесу, тому stdout/stderr порожні.
+                # «Немає діагностики» мусить бути видно явно.
+                [void](Initialize-BRAVOLog -LogFile $diagEmptyLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Test-SevenZipArchiveIntegrity `
+                    -SevenZipPath $sevenZipToolPath `
+                    -ArchivePath (Join-Path $b2TestRoot "__NO_SUCH_ARCHIVE__.7z") `
+                    -Password "B2LegacyPass" `
+                    -Logger $diagLogger)
+                $diagEmptyLogText = if (Test-Path -LiteralPath $diagEmptyLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagEmptyLogFile)
+                } else { '' }
+                Test-BRAVOCondition `
+                    -Condition ($diagEmptyLogText -match 'не повернув діагностичного тексту') `
+                    -Name "SevenZipDiagnostics/EmptyToolOutputIsExplicitlyObservable" `
+                    -Failure ("коли 7-Zip не повернув жодного діагностичного рядка, журнал мусить сказати це прямо — " +
+                        "інакше «інструмент промовчав» неможливо відрізнити від «діагностику відфільтрував рівень журналу»")
+
+                # (3) Рівень діагностики йде за headline-рівнем. Для
+                # retention (#422/#300) викликач просить WARNING — і
+                # діагностика теж мусить бути WARNING, не ERROR, але
+                # ОДНАКОВО присутня у файлі (WARNING=4 >= INFO=2).
+                [void](Initialize-BRAVOLog -LogFile $diagWarnLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Test-SevenZipArchiveIntegrity `
+                    -SevenZipPath $sevenZipToolPath `
+                    -ArchivePath $b2CorruptArchivePath `
+                    -Password "B2LegacyPass" `
+                    -ArchiveFailureLevel 'WARNING' `
+                    -Logger $diagLogger)
+                $diagWarnLines = @(
+                    Get-Content -LiteralPath $diagWarnLogFile -Encoding UTF8 -ErrorAction SilentlyContinue |
+                        Where-Object { $_ -match 'Дiагностика 7-Zip test' }
+                )
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagWarnLines.Count -gt 0 -and
+                        @($diagWarnLines | Where-Object { $_ -match '\[WARNING' }).Count -eq $diagWarnLines.Count -and
+                        @($diagWarnLines | Where-Object { $_ -match '\[ERROR' }).Count -eq 0
+                    ) `
+                    -Name "SevenZipDiagnostics/DiagnosticLevelFollowsArchiveFailureLevel" `
+                    -Failure ("при -ArchiveFailureLevel WARNING діагностика мусить бути WARNING і все одно попасти у файл " +
+                        "(інакше retention старих архівів за #422/#300 знову давав би щонічний ERROR); знайдено рядків: $($diagWarnLines.Count)")
+
+                # (4) Пароль архіву не повинен з'явитись у журналі ні на
+                # якому зі шляхів діагностики.
+                # Statement-keyword у позиції команди — `( if ... )` замість
+                # `$( if ... )` — валідно парситься і падає лише в рантаймі
+                # (guard Diagnostics/NoKeywordParsedAsCommand). Тому звичайне
+                # присвоєння, без підвиразу взагалі.
+                $diagWarnLogText = ''
+                if (Test-Path -LiteralPath $diagWarnLogFile -PathType Leaf) {
+                    $diagWarnLogText = [IO.File]::ReadAllText($diagWarnLogFile)
+                }
+                $diagAllLogText = $diagLogText + $diagEmptyLogText + $diagWarnLogText
+                Test-BRAVOCondition `
+                    -Condition (-not $diagAllLogText.Contains("B2LegacyPass")) `
+                    -Name "SevenZipDiagnostics/ArchivePasswordNeverAppearsInLog" `
+                    -Failure "пароль архіву не повинен потрапляти у журнал на жодному шляху діагностики 7-Zip"
+
+                # (5) Файл архіву зайнятий іншим процесом. Це НЕ доказ проти
+                # архіву: канонічний класифікатор відкриває файл сам
+                # (FileShare.Read) і при невдачі повертає ArchiveSpecific=$false,
+                # тому рівень мусить лишитись ERROR навіть якщо викликач
+                # просив WARNING — і діагностика теж ERROR.
+                $diagLockLogFile = Join-Path $b2TestRoot ("diag_lock_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagLockLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagLockInfo = @{}
+                $diagLockStream = [IO.File]::Open($b2CorruptArchivePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                try {
+                    [void](Test-SevenZipArchiveIntegrity `
+                        -SevenZipPath $sevenZipToolPath `
+                        -ArchivePath $b2CorruptArchivePath `
+                        -Password "B2LegacyPass" `
+                        -ArchiveFailureLevel 'WARNING' `
+                        -FailureInfo $diagLockInfo `
+                        -Logger $diagLogger)
+                } finally {
+                    $diagLockStream.Dispose()
+                }
+                $diagLockLines = @(
+                    Get-Content -LiteralPath $diagLockLogFile -Encoding UTF8 -ErrorAction SilentlyContinue |
+                        Where-Object { $_ -match 'Дiагностика 7-Zip test' }
+                )
+                Test-BRAVOCondition `
+                    -Condition (
+                        -not [bool]$diagLockInfo['ArchiveSpecific'] -and
+                        $diagLockLines.Count -gt 0 -and
+                        @($diagLockLines | Where-Object { $_ -match '\[ERROR' }).Count -eq $diagLockLines.Count
+                    ) `
+                    -Name "SevenZipDiagnostics/LockedArchiveStaysOperationalFailureWithErrorDiagnostics" `
+                    -Failure ("зайнятий іншим процесом архів — збій ВИКОНАННЯ, не доказ проти вмісту: ArchiveSpecific мусить бути false, " +
+                        "а діагностика ERROR навіть при -ArchiveFailureLevel WARNING; ArchiveSpecific=$($diagLockInfo['ArchiveSpecific']), рядків діагностики: $($diagLockLines.Count)")
+
+                # (9) Не-ASCII пароль. Створення і перевірка йдуть одним
+                # канонічним BOM-free шляхом, тому round-trip мусить
+                # пройти з ПЕРШОЇ спроби без legacy-fallback. Пароль
+                # будується з code point-ів, щоб не залежати від кодування
+                # цього файлу.
+                # Фіксована не-ASCII «голова» (кирилиця + en dash + ß + ć) задає
+                # предмет перевірки — саме ті code point-и, які по-різному
+                # кодуються в OEM/UTF-8; випадковий не-ASCII «хвіст» робить
+                # пароль унікальним на прогін, щоб у комплекті не лежав
+                # повторно використовуваний літерал.
+                $diagNonAsciiCodePoints = @(0x041F, 0x0430, 0x0440, 0x043E, 0x043B, 0x044C, 0x2013, 0x00DF, 0x0107)
+                $diagNonAsciiAlphabet = @(0x0404, 0x0407, 0x0456, 0x0457, 0x0491, 0x00E9, 0x00F6, 0x0119)
+                $diagNonAsciiPassword = (-join @($diagNonAsciiCodePoints | ForEach-Object { [char]$_ })) +
+                    (-join @(1..8 | ForEach-Object { [char]($diagNonAsciiAlphabet | Get-Random) }))
+                $diagNonAsciiArchive = Join-Path $b2TestRoot "nonascii.7z"
+                $diagNonAsciiPsi = New-Object System.Diagnostics.ProcessStartInfo
+                $diagNonAsciiPsi.FileName = $sevenZipToolPath
+                $diagNonAsciiPsi.Arguments = "a -y -p `"$diagNonAsciiArchive`" `"$b2SourceDir`""
+                $diagNonAsciiPsi.RedirectStandardInput = $true
+                $diagNonAsciiPsi.RedirectStandardOutput = $true
+                $diagNonAsciiPsi.RedirectStandardError = $true
+                $diagNonAsciiPsi.UseShellExecute = $false
+                $diagNonAsciiProc = New-Object System.Diagnostics.Process
+                $diagNonAsciiProc.StartInfo = $diagNonAsciiPsi
+                Start-BRAVOProcessWithBomFreeInput -Process $diagNonAsciiProc
+                Write-BRAVOProcessInputText -Process $diagNonAsciiProc -Text $diagNonAsciiPassword
+                [void]$diagNonAsciiProc.StandardOutput.ReadToEnd()
+                [void]$diagNonAsciiProc.StandardError.ReadToEnd()
+                $diagNonAsciiProc.WaitForExit()
+                $diagNonAsciiTest = Invoke-BRAVOSevenZipIntegrityTest `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $diagNonAsciiArchive -Password $diagNonAsciiPassword
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagNonAsciiProc.ExitCode -eq 0 -and
+                        [bool]$diagNonAsciiTest.Success -and
+                        -not [bool]$diagNonAsciiTest.LegacyBomPasswordFallbackUsed
+                    ) `
+                    -Name "SevenZipDiagnostics/NonAsciiPasswordRoundTripsWithoutFallback" `
+                    -Failure ("не-ASCII пароль мусить проходити create -> test одним канонічним BOM-free шляхом без legacy-fallback; " +
+                        "createExit=$($diagNonAsciiProc.ExitCode), Success=$($diagNonAsciiTest.Success), Fallback=$($diagNonAsciiTest.LegacyBomPasswordFallbackUsed)")
+
+                # (10)+(11) Велика кількість записів у архіві: `7za t -bb1`
+                # друкує рядок на запис, тому stdout свідомо перевищує межу
+                # 20 рядків. Перевіряється і сам шлях захоплення виводу при
+                # ненульовому коді, і що зберігається саме ХВІСТ — бо
+                # операторо-значущий підсумок 7-Zip друкує в кінці.
+                $diagManyDir = Join-Path $b2TestRoot "many"
+                [void][IO.Directory]::CreateDirectory($diagManyDir)
+                1..60 | ForEach-Object {
+                    [IO.File]::WriteAllText((Join-Path $diagManyDir ("entry{0:D3}.txt" -f $_)), "diag entry $_")
+                }
+                $diagManyArchive = Join-Path $b2TestRoot "many.7z"
+                # Пароль для архівів, які створює САМ цей блок, генерується на
+                # прогін. Спільна фікстура B2 вище лишається на своєму
+                # historical-літералі: її архіви шифрує код, якого ця зміна не
+                # торкається, і підміна пароля зламала б наявні B2/*-перевірки.
+                $diagRandomPassword = "diag-" + [guid]::NewGuid().ToString('N')
+                $diagManyPsi = New-Object System.Diagnostics.ProcessStartInfo
+                $diagManyPsi.FileName = $sevenZipToolPath
+                $diagManyPsi.Arguments = "a -y -p `"$diagManyArchive`" `"$diagManyDir`""
+                $diagManyPsi.RedirectStandardInput = $true
+                $diagManyPsi.RedirectStandardOutput = $true
+                $diagManyPsi.RedirectStandardError = $true
+                $diagManyPsi.UseShellExecute = $false
+                $diagManyProc = New-Object System.Diagnostics.Process
+                $diagManyProc.StartInfo = $diagManyPsi
+                Start-BRAVOProcessWithBomFreeInput -Process $diagManyProc
+                Write-BRAVOProcessInputText -Process $diagManyProc -Text $diagRandomPassword
+                [void]$diagManyProc.StandardOutput.ReadToEnd()
+                [void]$diagManyProc.StandardError.ReadToEnd()
+                $diagManyProc.WaitForExit()
+                # Успішна перевірка великого архіву не повинна писати
+                # діагностику взагалі.
+                $diagManyOkLogFile = Join-Path $b2TestRoot ("diag_many_ok_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagManyOkLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagManyOk = Test-SevenZipArchiveIntegrity `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $diagManyArchive `
+                    -Password $diagRandomPassword -Logger $diagLogger
+                $diagManyOkText = if (Test-Path -LiteralPath $diagManyOkLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagManyOkLogFile)
+                } else { '' }
+                Test-BRAVOCondition `
+                    -Condition ([bool]$diagManyOk -and -not ($diagManyOkText -match 'Дiагностика 7-Zip')) `
+                    -Name "SevenZipDiagnostics/SuccessfulIntegrityTestWritesNoDiagnostics" `
+                    -Failure ("успішна перевірка цілісності не повинна писати діагностику 7-Zip у журнал; " +
+                        "Success=$diagManyOk, діагностика присутня=$($diagManyOkText -match 'Дiагностика 7-Zip')")
+
+                # Той самий багатозаписний архів, обрізаний: діагностика
+                # мусить існувати і бути обмеженою 20 рядками.
+                $diagManyCorrupt = Join-Path $b2TestRoot "many_corrupt.7z"
+                $diagManyBytes = [IO.File]::ReadAllBytes($diagManyArchive)
+                [IO.File]::WriteAllBytes($diagManyCorrupt, $diagManyBytes[0..([Math]::Max(0, $diagManyBytes.Length - 40))])
+                $diagTailLogFile = Join-Path $b2TestRoot ("diag_tail_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagTailLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagTailInfo = @{}
+                [void](Test-SevenZipArchiveIntegrity `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $diagManyCorrupt `
+                    -Password $diagRandomPassword -FailureInfo $diagTailInfo -Logger $diagLogger)
+                $diagTailText = if (Test-Path -LiteralPath $diagTailLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagTailLogFile)
+                } else { '' }
+                $diagTailRecordMatch = [regex]::Match($diagTailText, '(?s)Дiагностика 7-Zip test: (.*?)(?=\r?\n\d{4}-\d{2}-\d{2} |\z)')
+                $diagTailRecordLines = if ($diagTailRecordMatch.Success) {
+                    @($diagTailRecordMatch.Groups[1].Value -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                } else { @() }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagTailRecordLines.Count -gt 0 -and
+                        $diagTailRecordLines.Count -le 20 -and
+                        (@(1, 2) -contains [int]$diagTailInfo['ExitCode'])
+                    ) `
+                    -Name "SevenZipDiagnostics/MultiEntryCorruptArchiveStillYieldsDiagnostics" `
+                    -Failure ("багатозаписний пошкоджений архів мусить дати діагностичний запис у межах 20 рядків; " +
+                        "рядків у записі: $($diagTailRecordLines.Count), ExitCode=$($diagTailInfo['ExitCode'])")
+
+                # Межі перевіряються ДЕТЕРМІНОВАНО, синтетичним потоком, а не
+                # через реальний 7za. Кількість записів в архіві нічого не
+                # доводить: пошкоджений заголовок змушує 7-Zip відмовити ДО
+                # перелічення записів, тому "рядків <= 20" було б істинним і
+                # для реалізації БЕЗ будь-якої межі. Нижче перебір гарантований.
+                $diagCapLogFile = Join-Path $b2TestRoot ("diag_cap_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagCapLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagCapFirst = 'CAPFIRST'
+                $diagCapLast = 'CAPLAST'
+                $diagCapStream = @(
+                    $diagCapFirst
+                    1..28 | ForEach-Object { "diag-filler-line-$_" }
+                    $diagCapLast
+                ) -join "`r`n"
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput $diagCapStream -StandardError '' -Level 'ERROR')
+                $diagCapText = if (Test-Path -LiteralPath $diagCapLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagCapLogFile)
+                } else { '' }
+                $diagCapMatch = [regex]::Match($diagCapText, '(?s)Дiагностика 7-Zip test: (.*?)(?=\r?\n\d{4}-\d{2}-\d{2} |\z)')
+                $diagCapLines = if ($diagCapMatch.Success) {
+                    @($diagCapMatch.Groups[1].Value -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                } else { @() }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagCapLines.Count -eq 20 -and
+                        $diagCapText -match $diagCapLast -and
+                        $diagCapText -notmatch $diagCapFirst
+                    ) `
+                    -Name "SevenZipDiagnostics/LineCapKeepsExactlyLastTwentyLines" `
+                    -Failure ("30 непорожніх рядків мусять дати РІВНО 20 у записі, зі збереженим ХВОСТОМ: " +
+                        "`7za t -bb1` друкує рядок на запис, а операторо-значущий вердикт — у кінці. " +
+                        "Рядків: $($diagCapLines.Count), хвіст присутній=$($diagCapText -match $diagCapLast), " +
+                        "голова присутня=$($diagCapText -match $diagCapFirst)")
+
+                # Символьна межа мусить обрізати ПОЧАТОК, а не кінець. 20 рядків
+                # по 300 символів = ~6000 > 4000: обрізання з початку (як було
+                # спершу реалізовано) викинуло б саме вердикт, який зберігає
+                # `Select-Object -Last` — той самий дефект «оператор без
+                # причини», лише іншим механізмом.
+                $diagLenLogFile = Join-Path $b2TestRoot ("diag_len_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagLenLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagLenVerdict = 'LENVERDICT'
+                $diagLenHead = 'LENHEAD'
+                $diagLenStream = @(
+                    ($diagLenHead + ('x' * 300))
+                    1..18 | ForEach-Object { "pad$_" + ('y' * 300) }
+                    ($diagLenVerdict + ('z' * 300))
+                ) -join "`r`n"
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput $diagLenStream -StandardError '' -Level 'ERROR')
+                $diagLenText = if (Test-Path -LiteralPath $diagLenLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagLenLogFile)
+                } else { '' }
+                # Межа мусить реально триматись, а маркер — входити в бюджет,
+                # інакше -MaximumLength обіцяв би обмеження, якого немає.
+                $diagLenMatch = [regex]::Match($diagLenText, '(?s)Дiагностика 7-Zip test: (.*?)(?=\r?\n\d{4}-\d{2}-\d{2} |\z)')
+                $diagLenPayloadLength = if ($diagLenMatch.Success) { $diagLenMatch.Groups[1].Value.TrimEnd("`r", "`n").Length } else { -1 }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagLenStream.Length -gt 4000 -and
+                        $diagLenText -match $diagLenVerdict -and
+                        $diagLenText -notmatch $diagLenHead -and
+                        $diagLenText -match '\(обрізано\)' -and
+                        $diagLenPayloadLength -gt 0 -and
+                        $diagLenPayloadLength -le 4000
+                    ) `
+                    -Name "SevenZipDiagnostics/LengthCapKeepsVerdictTailNotHead" `
+                    -Failure ("символьна межа мусить зберігати ХВОСТ, явно позначати обрізання і сама триматись у 4000 " +
+                        "символів разом із маркером; довжина потоку=$($diagLenStream.Length), " +
+                        "довжина запису=$diagLenPayloadLength, вердикт присутній=$($diagLenText -match $diagLenVerdict), " +
+                        "голова присутня=$($diagLenText -match $diagLenHead), маркер обрізання=$($diagLenText -match '\(обрізано\)')")
+
+                # (8) Таймаут. Справжній 12-годинний дефолт
+                # (SevenZipTestTimeoutSeconds = 43200) у self-test не
+                # відтворюється, а `-TimeoutSeconds 1` проти великої
+                # фікстури на швидкому хості нестабільний (7za може встигнути
+                # завершитись) — такий гейт або блимає, або формулюється
+                # настільно слабко, що стає вакуумним. Тому перевіряється
+                # детерміновано саме НОВА поведінка: результат TimedOut з
+                # порожніми потоками мусить дати видимий запис із причиною.
+                # Перевіряється РОУТИНГ, а не лише writer: справжній
+                # Test-SevenZipArchiveIntegrity ганяється з заглушкою на
+                # межі Invoke-BRAVOSevenZipIntegrityTest, яка повертає
+                # TimedOut-результат із порожніми потоками. Подача рядка
+                # прямо у writer нічого не довела б: втрата проброса
+                # Error/Description або WARNING замість ERROR для
+                # операційного збою лишились би зеленими.
+                $diagTimeoutLogFile = Join-Path $b2TestRoot ("diag_timeout_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagTimeoutLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagTimeoutReason = 'перевищено час очікування 43200 сек.'
+                $diagTimeoutStubs = @'
+function Invoke-BRAVOSevenZipIntegrityTest {
+    param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+    New-Object PSObject -Property @{
+        Success = $false; ExitCode = $null; TimedOut = $true
+        Description = 'процес завершено примусово'
+        StandardOutput = ''; StandardError = ''
+        Error = 'перевищено час очікування 43200 сек.'
+    }
+}
+function Test-BRAVOSevenZipArchiveSpecificFailure { param($Result, $ArchivePath) return $false }
+function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, $Collector, $Logger) return $false }
+'@
+                $diagTimeoutModule = New-BRAVOSelfTestRuntimeModule `
+                    -SourceText (([IO.File]::ReadAllText(
+                        (Join-Path $root 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1'),
+                        [Text.Encoding]::UTF8)) + "`r`n" + $diagTimeoutStubs) `
+                    -FunctionNames @(
+                        'Write-BRAVOArchiveHelperLog',
+                        'Write-BRAVOSevenZipFailureDiagnostics',
+                        'Invoke-BRAVOSevenZipIntegrityTest',
+                        'Test-BRAVOSevenZipArchiveSpecificFailure',
+                        'Register-BRAVOLegacyBomPasswordFallback',
+                        'Test-SevenZipArchiveIntegrity'
+                    ) `
+                    -PreferLastDefinitionOnDuplicate
+                $diagTimeoutInfo = @{}
+                $diagTimeoutResult = & $diagTimeoutModule {
+                    param($Logger, $Info)
+                    Test-SevenZipArchiveIntegrity `
+                        -SevenZipPath 'C:\nonexistent\7za.exe' `
+                        -ArchivePath 'C:\nonexistent\timeout.7z' `
+                        -Password 'B2LegacyPass' `
+                        -ArchiveFailureLevel 'WARNING' `
+                        -FailureInfo $Info `
+                        -Logger $Logger
+                } $diagLogger $diagTimeoutInfo
+                $diagTimeoutText = if (Test-Path -LiteralPath $diagTimeoutLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagTimeoutLogFile)
+                } else { '' }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $false -eq [bool]$diagTimeoutResult -and
+                        $true -eq [bool]$diagTimeoutInfo['TimedOut'] -and
+                        $false -eq [bool]$diagTimeoutInfo['ArchiveSpecific'] -and
+                        $diagTimeoutText -match 'не повернув діагностичного тексту' -and
+                        $diagTimeoutText -match ([regex]::Escape($diagTimeoutReason)) -and
+                        $diagTimeoutText -match '\[ERROR' -and
+                        $diagTimeoutText -notmatch '\[WARNING'
+                    ) `
+                    -Name "SevenZipDiagnostics/TimedOutResultRoutesReasonToErrorEvenWhenWarningRequested" `
+                    -Failure ("таймаут — збій ВИКОНАННЯ інструмента, не доказ проти архіву: причина мусить потрапити у журнал " +
+                        "рівнем ERROR через гілку порожнього виводу навіть при -ArchiveFailureLevel WARNING (fail-closed). " +
+                        "Result=$diagTimeoutResult, TimedOut=$($diagTimeoutInfo['TimedOut']), " +
+                        "ArchiveSpecific=$($diagTimeoutInfo['ArchiveSpecific']), " +
+                        "причина присутня=$($diagTimeoutText -match ([regex]::Escape($diagTimeoutReason))), " +
+                        "ERROR=$($diagTimeoutText -match '\[ERROR'), WARNING=$($diagTimeoutText -match '\[WARNING')")
+
+                # Create-шлях: виклик діагностики мусить лежати САМЕ у
+                # timeout-гілці New-Archive. Перевірка по вкладеності AST, а не
+                # по близькості підрядків: видалення виклику валить гейт.
+                $diagTimeoutTokens = $null
+                $diagTimeoutErrors = $null
+                $diagTimeoutAst = [Management.Automation.Language.Parser]::ParseInput(
+                    $archiveScriptText, [ref]$diagTimeoutTokens, [ref]$diagTimeoutErrors)
+                # Береться ТІЛО першої клаузи (Clauses[0].Item2), а не весь
+                # IfStatementAst: інакше виклик, перенесений у `else`, теж
+                # задовольнив би гейт, хоча на шляху таймауту не виконувався б.
+                $diagTimeoutBranches = @(
+                    $diagTimeoutAst.FindAll({
+                        param($candidate)
+                        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                        $candidate.Name -eq 'New-Archive'
+                    }, $true) | ForEach-Object {
+                        $_.FindAll({
+                            param($candidate)
+                            $candidate -is [Management.Automation.Language.IfStatementAst] -and
+                            @($candidate.Clauses)[0].Item1.Extent.Text -match '\$archiveTimedOut'
+                        }, $true)
+                    } | ForEach-Object { @($_.Clauses)[0].Item2 }
+                )
+                $diagTimeoutCallsInBranch = @(
+                    foreach ($diagTimeoutBranch in $diagTimeoutBranches) {
+                        $diagTimeoutBranch.FindAll({
+                            param($candidate)
+                            $candidate -is [Management.Automation.Language.CommandAst] -and
+                            $candidate.GetCommandName() -eq 'Write-SevenZipFailureDiagnostics'
+                        }, $true)
+                    }
+                )
+                Test-BRAVOCondition `
+                    -Condition ($diagTimeoutBranches.Count -ge 1 -and $diagTimeoutCallsInBranch.Count -ge 1) `
+                    -Name "SevenZipDiagnostics/CreateTimeoutBranchCallsDiagnosticsWriter" `
+                    -Failure ("вивід убитого по таймауту 7-Zip — єдиний доказ того, на чому він завис; виклик діагностики " +
+                        "мусить лежати всередині timeout-гілки New-Archive (878dd86 його мав, ce4855d прибрав). " +
+                        "Знайдено гілок: $($diagTimeoutBranches.Count), викликів у них: $($diagTimeoutCallsInBranch.Count)")
+
+                # (12) Всеохопна перевірка нерозкриття: КОЖЕН лог-файл, записаний
+                # цим блоком, проти КОЖНОГО використаного пароля. Рання перевірка
+                # вище дивиться лише перші три логи й один літерал; тут уже
+                # існують і згенерований на прогін, і не-ASCII паролі, і логи
+                # шляхів lock/timeout/cap. Підняття діагностики з DEBUG до рівня,
+                # який реально пишеться у файл, збільшує поверхню розкриття —
+                # тому межа перевіряється по фактично записаних байтах.
+                $diagSecretLogText = ''
+                foreach ($diagSecretLogFile in @(Get-ChildItem -LiteralPath $b2TestRoot -Filter '*.log' -File -ErrorAction SilentlyContinue)) {
+                    $diagSecretLogText += [IO.File]::ReadAllText($diagSecretLogFile.FullName)
+                }
+                $diagSecretLeaks = @(
+                    foreach ($diagSecretCandidate in @('B2LegacyPass', 'B2NormalPass', $diagRandomPassword, $diagNonAsciiPassword)) {
+                        if (-not [string]::IsNullOrEmpty($diagSecretCandidate) -and
+                            $diagSecretLogText.Contains($diagSecretCandidate)) {
+                            # Сам секрет НЕ друкується у повідомленні про збій.
+                            "пароль довжиною $($diagSecretCandidate.Length)"
+                        }
+                    }
+                )
+                Test-BRAVOCondition `
+                    -Condition ($diagSecretLeaks.Count -eq 0 -and $diagSecretLogText.Length -gt 0) `
+                    -Name "SevenZipDiagnostics/NoArchivePasswordInAnyDiagnosticLogFile" `
+                    -Failure ("жоден пароль не повинен потрапити в жоден лог-файл діагностики 7-Zip; " +
+                        "розмір перевіреного тексту: $($diagSecretLogText.Length), витоків: $($diagSecretLeaks.Count) " +
+                        "($($diagSecretLeaks -join ', '))")
+
+                Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
+                Import-Module -Name (Join-Path $root "modules\BRAVO.Logging\BRAVO.Logging.psd1") -Force -ErrorAction Stop
+                } # кінець дочірньої області блоку SevenZipDiagnostics/*
             } finally {
                 if (Test-Path -LiteralPath $b2TestRoot) {
                     Remove-Item -LiteralPath $b2TestRoot -Recurse -Force -ErrorAction SilentlyContinue
