@@ -1066,7 +1066,13 @@ try {
             (New-AssistantLine -ToolName 'Read' -NoSubagentType)
         )
         Assert-True 'ordinary tools raise no ALERT' ($ordinary.RoutingLog -notmatch 'ALERT') $ordinary.RoutingLog
+        # Відсутність ALERT сама по собі не є доказом: якби хук упав на
+        # звичайному інструменті, лог теж був би порожній, і тест прийняв би
+        # втрату обліку за коректну поведінку (QA-002). Тому запис обліку —
+        # обов'язковий, а не умовний.
+        Assert-True 'ordinary tools still produce a cost record' ($null -ne $ordinary.Record)
         if ($null -ne $ordinary.Record) {
+            Assert-Equal 'ordinary tools are still counted as assistant turns' '2' ([string]$ordinary.Record.assistantTurns)
             Assert-True 'ordinary tools add no unknown delegation entries' (@($ordinary.Record.unknownDelegationTools.PSObject.Properties).Count -eq 0)
         }
     }
@@ -1074,7 +1080,27 @@ try {
         Remove-Item -LiteralPath $ordinarySandbox -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # 4. Регістр імені має значення: 'agent' не є 'Agent'.
+    # 4. Зіпсоване значення роли не має приховувати дрейф імені: контракт
+    #    побудований на НАЯВНОСТІ subagent_type, а не на змістовності значення.
+    #    Доки предикат вимагав непорожнього рядка, делегування під невідомим
+    #    іменем із subagent_type="" проходило мовчки (QA-001).
+    foreach ($blankCase in @(@{ Label = 'empty'; Value = '' }, @{ Label = 'whitespace'; Value = '   ' })) {
+        $blankSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-blank-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-Item -ItemType Directory -Path (Join-Path $blankSandbox '.claude\logs') -Force | Out-Null
+            $blank = Invoke-CostHook -ProjectDir $blankSandbox -TranscriptLines @((New-AssistantLine -ToolName 'Dispatch' -SubagentType $blankCase.Value))
+            Assert-True ("drifted tool with {0} subagent_type still raises an ALERT" -f $blankCase.Label) ($blank.RoutingLog -match 'ALERT') $blank.RoutingLog
+            Assert-True ("drifted tool with {0} subagent_type produces a cost record" -f $blankCase.Label) ($null -ne $blank.Record)
+            if ($null -ne $blank.Record) {
+                Assert-Equal ("drifted tool with {0} subagent_type is recorded by name" -f $blankCase.Label) '1' ([string]$blank.Record.unknownDelegationTools.Dispatch)
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $blankSandbox -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # 5. Регістр імені має значення: 'agent' не є 'Agent'.
     $caseSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-case-{0}" -f [guid]::NewGuid().ToString('N'))
     try {
         New-Item -ItemType Directory -Path (Join-Path $caseSandbox '.claude\logs') -Force | Out-Null

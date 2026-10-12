@@ -56,6 +56,32 @@ function Write-CostError {
     }
 }
 
+function Test-HasDelegationMarker {
+    <#
+        Чи несе блок tool_use маркер делегування. Перевіряється САМА НАЯВНІСТЬ
+        властивості subagent_type, а не змістовність її значення: інструмент
+        делегування під невідомим іменем і з порожнім або пробільним
+        subagent_type — це той самий дрейф імені, і він не має права
+        лишитись невидимим лише через зіпсоване значення роли (QA-001).
+        Звичайні інструменти (Bash, Read, Write) цієї властивості не мають
+        узагалі, тому хибних тривог перевірка наявності не додає.
+    #>
+    param($Block)
+
+    if ($null -eq $Block) { return $false }
+    if ($null -eq $Block.input) { return $false }
+
+    $properties = $null
+    try { $properties = $Block.input.PSObject.Properties }
+    catch { return $false }
+    if ($null -eq $properties) { return $false }
+
+    foreach ($property in $properties) {
+        if ($property.Name -ceq 'subagent_type') { return $true }
+    }
+    return $false
+}
+
 function Write-RoutingAlert {
     param([string]$Message)
 
@@ -161,7 +187,7 @@ try {
                 $key = ($toolName -replace '^mcp__codex-agent__', '') + ':' + $role
                 if ($codexCalls.ContainsKey($key)) { $codexCalls[$key]++ } else { $codexCalls[$key] = 1 }
             }
-            elseif ($null -ne $block.input -and -not [string]::IsNullOrWhiteSpace([string]$block.input.subagent_type)) {
+            elseif (Test-HasDelegationMarker -Block $block) {
                 # Делегування під невідомим іменем інструмента: PreToolUse-гейт
                 # маршрутизації його не бачить, тобто enforcement мертвий.
                 # Саме цей клас дефекту був P1 у PR #441.
