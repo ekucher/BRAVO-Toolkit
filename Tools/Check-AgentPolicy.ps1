@@ -188,6 +188,81 @@ if (Test-Path -LiteralPath $matrixPath -PathType Leaf) {
                 }
             }
         }
+
+        # Implementer roles have no writeAllow on purpose (their real boundary is
+        # the task SCOPE, invisible to the hook at write time), but the static
+        # deny list must stay in place: it holds regardless of any brief.
+        foreach ($implementer in @('worker', 'tester')) {
+            $implementerRole = $matrix.roles.$implementer
+            if ($null -eq $implementerRole) { continue }
+            if ($null -ne $implementerRole.writeAllow) {
+                $failures.Add("Routing matrix role '$implementer' must not declare writeAllow; its boundary is the task SCOPE plus a static writeDeny.")
+            }
+            $denyList = @($implementerRole.writeDeny)
+            foreach ($required in @('docs/*ACCEPTANCE*', 'docs/*RUNBOOK*', 'BRAVO_AGENT_POLICY.md', '.claude/*', '*MANIFEST*.json')) {
+                if ($denyList -notcontains $required) {
+                    $failures.Add("Routing matrix role '$implementer' must deny writes to '$required'.")
+                }
+            }
+        }
+    }
+}
+
+# --- Write-gate wiring ---------------------------------------------------
+#
+# The write boundary is only real if the hook actually sees the write. Two
+# independent conditions carry it, and both are asserted here because a silent
+# regression in either turns the documented boundary into prose:
+#   1. the PreToolUse matcher must route the write tools to the hook;
+#   2. a write-bounded role must not hold Bash, which the hook cannot gate.
+
+if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
+    $settings = $null
+    try {
+        $settings = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
+    }
+    catch {
+        $failures.Add("settings.json is not valid JSON: $($_.Exception.Message)")
+    }
+
+    if ($null -ne $settings) {
+        $routingMatcher = ''
+        foreach ($entry in @($settings.hooks.PreToolUse)) {
+            foreach ($hookEntry in @($entry.hooks)) {
+                if ([string]$hookEntry.command -match 'validate-agent-routing\.ps1') {
+                    $routingMatcher = [string]$entry.matcher
+                }
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($routingMatcher)) {
+            $failures.Add('settings.json PreToolUse entry for validate-agent-routing.ps1 declares no matcher; an empty matcher is not evidence of coverage.')
+        }
+        else {
+            foreach ($gatedTool in @('Task', 'Write', 'Edit', 'NotebookEdit')) {
+                if ($routingMatcher -notmatch ('(^|\|)' + [System.Text.RegularExpressions.Regex]::Escape($gatedTool) + '($|\|)')) {
+                    $failures.Add("settings.json PreToolUse matcher must route '$gatedTool' to validate-agent-routing.ps1; current matcher: $routingMatcher")
+                }
+            }
+        }
+    }
+}
+
+$documentationAgent = Join-Path $RepoRoot '.claude\agents\documentation.md'
+if (Test-Path -LiteralPath $documentationAgent -PathType Leaf) {
+    $documentationText = [System.IO.File]::ReadAllText($documentationAgent)
+    $toolsMatch = [System.Text.RegularExpressions.Regex]::Match($documentationText, '(?m)^tools:\s*(?<tools>.+?)\s*$')
+    if (-not $toolsMatch.Success) {
+        $failures.Add('Agent documentation declares no tools in frontmatter.')
+    }
+    elseif ($toolsMatch.Groups['tools'].Value -match '\bBash\b') {
+        $failures.Add('Agent documentation must not hold Bash: the hook cannot gate what a shell command writes, so the write boundary is kept by withholding the tool.')
+    }
+
+    # The prompt must name the mechanism rather than assert blanket coverage: the
+    # hook gates Write/Edit/NotebookEdit, not every possible write path.
+    if ($documentationText -match 'blocks these targets independently of this prompt') {
+        $failures.Add('Agent documentation makes an unqualified claim about hook coverage; state which tools the hook actually gates.')
     }
 }
 

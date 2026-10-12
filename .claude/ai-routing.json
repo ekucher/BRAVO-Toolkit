@@ -12,13 +12,39 @@
       "model": "sonnet",
       "write": true,
       "gateCritical": false,
-      "purpose": "bounded implementation inside assigned SCOPE"
+      "purpose": "bounded implementation inside assigned SCOPE",
+      "writeDenyNote": "No writeAllow: an implementer writes code, so its real boundary is the task SCOPE, which the hook cannot see at write time. These denies are the subset that holds regardless of any brief.",
+      "writeDeny": [
+        "docs/*ACCEPTANCE*",
+        "docs/*RUNBOOK*",
+        "docs/*EVIDENCE*",
+        "docs/*DISPOSITION*",
+        "BRAVO_AGENT_POLICY.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".claude/*",
+        "*MANIFEST*.json",
+        "*INTEGRITY*.json"
+      ]
     },
     "tester": {
       "model": "sonnet",
       "write": true,
       "gateCritical": false,
-      "purpose": "test authoring inside assigned SCOPE; never production code"
+      "purpose": "test authoring inside assigned SCOPE; never production code",
+      "writeDenyNote": "Same reasoning as worker.",
+      "writeDeny": [
+        "docs/*ACCEPTANCE*",
+        "docs/*RUNBOOK*",
+        "docs/*EVIDENCE*",
+        "docs/*DISPOSITION*",
+        "BRAVO_AGENT_POLICY.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".claude/*",
+        "*MANIFEST*.json",
+        "*INTEGRITY*.json"
+      ]
     },
     "documentation": {
       "model": "sonnet",
@@ -147,6 +173,20 @@
   "enforcement": {
     "hook": ".claude/hooks/validate-agent-routing.ps1",
     "hookEvent": "PreToolUse",
+    "gatedTools": [
+      "Task",
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "mcp__codex-agent__*"
+    ],
+    "writeGate": {
+      "note": "The write boundary is enforced on the actual write, keyed on the acting agent from the PreToolUse agent_type field, not only on the SCOPE text of a delegation brief.",
+      "mainSessionExempt": true,
+      "mainSessionNote": "agent_type is absent in the main session; gating it would block the owner's own work. The system constrains delegated executors, not the owner of the process.",
+      "bashNotGated": true,
+      "bashNote": "Bash is deliberately NOT gated: inspecting an arbitrary command for what it would write is a heuristic with guaranteed bypasses. The answer for Bash is to withhold the tool from write-bounded roles, which is why the documentation role has no Bash."
+    },
     "unmanagedAgentsIgnored": true,
     "unmanagedAgentsNote": "Agents absent from roles (Explore, general-purpose, plugin agents) are logged, never blocked.",
     "failClosedRoles": [

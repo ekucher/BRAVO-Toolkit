@@ -3,7 +3,7 @@
     "hooks": {
         "PreToolUse": [
             {
-                "matcher": "Task|mcp__codex-agent__.*",
+                "matcher": "Task|Write|Edit|NotebookEdit|mcp__codex-agent__.*",
                 "hooks": [
                     {
                         "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/validate-agent-routing.ps1\"",

@@ -201,13 +201,29 @@ or path, or an operationally relied-upon log/notification contract — regardles
 audits drift always and writes only inside an explicit `SCOPE`. It must never be scoped onto accepted
 acceptance evidence, runbooks, canonical policy, code, or integrity manifests.
 
+It has no `Bash` tool, so it cannot produce the diff itself. Write the diff to a file and pass
+`DIFF_FILE: <path>` in the brief; without it the agent returns `blocked` rather than auditing your
+prose summary.
+
 ### Enforcement
 
-`.claude/hooks/validate-agent-routing.ps1` runs as a `PreToolUse` hook and blocks a narrow closed
-list: model mismatch against the matrix, a Claude agent briefed with `review_source: codex-*`,
-`claude-qa-fallback` without one of `quota`/`rate-limit`/`service-unavailable`, and `documentation`
-scoped outside its write boundary. Everything else is logged to `.claude/logs/ai-routing.log`.
-A blocked call is a brief to fix, not a hook to work around.
+`.claude/hooks/validate-agent-routing.ps1` runs as a `PreToolUse` hook on `Task`, `Write`, `Edit`,
+`NotebookEdit` and Codex calls, and blocks a narrow closed list:
+
+- model mismatch against the matrix;
+- a Claude agent briefed with `review_source: codex-*`;
+- `claude-qa-fallback` without one of `quota`/`rate-limit`/`service-unavailable`;
+- `documentation` scoped outside its write boundary;
+- an actual write outside the acting role's boundary — any write by a `write: false` role, or a target
+  in `writeDeny` / outside `writeAllow`. The acting role comes from the `agent_type` field of the hook
+  payload; the main session has no `agent_type` and is not write-gated.
+
+`Bash` is deliberately not gated: a shell command is not reliably inspectable for what it would write.
+The boundary is kept real by withholding `Bash` from write-bounded roles — which is why `documentation`
+does not have it. Do not hand a write-bounded role a shell as a convenience.
+
+Everything else is logged to `.claude/logs/ai-routing.log`. A blocked call is a brief to fix, not a
+hook to work around.
 
 Usage is recorded by the `Stop` hook into `.claude/logs/ai-cost.jsonl` as a cumulative snapshot after
 every assistant response; summarize it with `Tools\Get-AICostReport.ps1` (which keeps only the latest

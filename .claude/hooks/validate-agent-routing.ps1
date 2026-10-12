@@ -4,8 +4,10 @@
     .claude/ai-routing.json.
 
     Отримує на stdin JSON із полями session_id, cwd, hook_event_name,
-    tool_name і tool_input. Для tool_name = "Task" перевіряє делегування
-    агентам BRAVO; для викликів mcp__codex-agent__* лише аудитує.
+    tool_name, tool_input і — усередині субагента — agent_id/agent_type. Для
+    tool_name = "Task" перевіряє делегування агентам BRAVO; для Write/Edit/
+    NotebookEdit перевіряє межу запису діючої роли; для викликів
+    mcp__codex-agent__* лише аудитує.
 
     Контракт виходу (конвенція PreToolUse у Claude Code):
         exit 0 — виклик дозволено;
@@ -18,7 +20,12 @@
       3. режим claude-qa-fallback без причини з трьох дозволених
          (quota | rate-limit | service-unavailable);
       4. агент documentation отримує SCOPE поза своїми межами запису
-         (acceptance-докази, runbook-и, канон, код, манифести).
+         (acceptance-докази, runbook-и, канон, код, манифести);
+      5. делегований агент фактично пише поза своєю межею запису
+         (Write/Edit/NotebookEdit): read-only роль — будь-який запис;
+         роль із межею — цілі з writeDeny або поза writeAllow. Діюча роль
+         береться з agent_type; у головній сесії цього поля немає, і вона
+         не гейтиться.
 
     Решта викликів — у журнал .claude/logs/ai-routing.log, без блокування.
     Агенти, відсутні в матриці (Explore, general-purpose, плагінні), не
@@ -42,6 +49,17 @@ $script:CodexToolPrefix = 'mcp__codex-agent__'
 
 # Маркери «SCOPE порожній» — бриф лише на аудит, без права запису.
 $script:EmptyScopeMarkers = @('none', 'n/a', 'na', 'nothing', '-')
+
+# Інструменти запису, які гейтяться за фактичною цільовою адресою.
+# Bash навмисно відсутній: інспекція довільної команди на предмет «що саме вона
+# запише» — евристика з гарантованими обходами; правильна відповідь для Bash —
+# не давати цей інструмент ролі з межею запису (див. ai-routing.json,
+# enforcement.writeGate.bashNote).
+$script:WriteTools = @('Write', 'Edit', 'NotebookEdit')
+
+$isWriteTool = $false
+$writeTarget = ''
+$payloadCwd = ''
 
 function Resolve-ProjectDir {
     param([string]$CwdFromPayload)
@@ -217,6 +235,41 @@ function ConvertTo-NormalizedScopePath {
     return $normalized
 }
 
+function ConvertTo-RepoRelativePath {
+    <#
+        Зводить цільовий шлях запису до шляху, відносного кореня проєкту, щоб
+        його можна було зіставити з патернами межі запису (вони всі відносні).
+
+        Шлях поза коренем проєкту лишається з провідним '/', якого не покриває
+        жоден allow-патерн — тобто для ролі з allowlist він буде заблокований.
+        Згортання '..' і зрізання NTFS-потоку робить ConvertTo-NormalizedScopePath.
+    #>
+    param(
+        [string]$Path,
+        $Roots
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+
+    $normalizedTarget = ConvertTo-NormalizedScopePath -Path $Path
+
+    foreach ($rootCandidate in @($Roots)) {
+        if ([string]::IsNullOrWhiteSpace($rootCandidate)) { continue }
+        $normalizedRoot = ConvertTo-NormalizedScopePath -Path $rootCandidate
+        if ([string]::IsNullOrWhiteSpace($normalizedRoot)) { continue }
+
+        # Порівняння регістронезалежне: Windows-шляхи не розрізняють регістр, і
+        # 'E:/GitHub/...' проти 'e:/github/...' не повинно давати іншого рішення.
+        $rootPrefix = $normalizedRoot.TrimEnd('/') + '/'
+        if ($normalizedTarget.Length -gt $rootPrefix.Length -and
+            $normalizedTarget.Substring(0, $rootPrefix.Length).Equals($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $normalizedTarget.Substring($rootPrefix.Length)
+        }
+    }
+
+    return $normalizedTarget
+}
+
 function ConvertFrom-JsonEscapedText {
     <#
         Розескейпує \uXXXX і прості \-послідовності в сирому тексті payload.
@@ -277,14 +330,31 @@ try {
         Approve-Call -ProjectDir $projectDir -Tool $toolName -Agent "codex:$role" -Model 'codex' -Reason 'codex call audited, not gated by this hook'
     }
 
-    if ($toolName -cne 'Task') {
+    if ($script:WriteTools -contains $toolName) {
+        # Гейт запису. Діючу роль беремо з agent_type: за документацією hooks
+        # спрацьовують і всередині субагента, і payload несе agent_id/agent_type
+        # — тобто ТОГО, ХТО ДІЄ. tool_input.subagent_type тут не підходить: він
+        # описує, кого спавнять, і для Write/Edit його взагалі немає.
+        $isWriteTool = $true
+        $agentName = ''
+        if ($null -ne $payload.agent_type) { $agentName = [string]$payload.agent_type }
+
+        $writeTarget = ''
+        if ($null -ne $payload.tool_input) {
+            if ($null -ne $payload.tool_input.file_path) { $writeTarget = [string]$payload.tool_input.file_path }
+            elseif ($null -ne $payload.tool_input.notebook_path) { $writeTarget = [string]$payload.tool_input.notebook_path }
+        }
+        $payloadCwd = [string]$payload.cwd
+    }
+    elseif ($toolName -cne 'Task') {
         Approve-Call -ProjectDir $projectDir -Tool $toolName -Agent 'n/a' -Model 'n/a' -Reason 'tool not subject to routing policy'
     }
-
-    $agentName = [string]$payload.tool_input.subagent_type
-    if ($null -ne $payload.tool_input.model) { $modelName = [string]$payload.tool_input.model }
-    $prompt = ''
-    if ($null -ne $payload.tool_input.prompt) { $prompt = [string]$payload.tool_input.prompt }
+    else {
+        $agentName = [string]$payload.tool_input.subagent_type
+        if ($null -ne $payload.tool_input.model) { $modelName = [string]$payload.tool_input.model }
+        $prompt = ''
+        if ($null -ne $payload.tool_input.prompt) { $prompt = [string]$payload.tool_input.prompt }
+    }
 }
 catch {
     # Збій розбору stdin — та сама логіка, що й для пошкодженої матриці:
@@ -360,6 +430,65 @@ if ($null -eq $matrix) {
     }
     Write-RoutingLog -ProjectDir $projectDir -Decision 'ALLOW' -Tool $toolName -Agent $agentName -Model $modelName -Reason ($reason + ' — non-gate role allowed (fail-open)')
     exit 0
+}
+
+# --- гейт запису ---------------------------------------------------------
+#
+# Межа запису перевіряється на фактичному записі, а не лише за текстом SCOPE у
+# брифі делегування: SCOPE — це декларація оркестратора, а запис — дія агента, і
+# раніше другий шлях не контролювався взагалі.
+if ($isWriteTool) {
+    # Головна сесія: agent_type у payload відсутній. Гейтити її означало б
+    # блокувати власну роботу власника процесу — система обмежує делегованих
+    # виконавців, а не власника (ai-routing.json, enforcement.writeGate).
+    if ([string]::IsNullOrWhiteSpace($agentName)) {
+        Approve-Call -ProjectDir $projectDir -Tool $toolName -Agent 'main-session' -Model 'n/a' `
+            -Reason 'no agent_type in payload: main session is not write-gated'
+    }
+
+    $writeRole = $matrix.roles.$agentName
+    if ($null -eq $writeRole) {
+        Approve-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
+            -Reason 'agent is not managed by the routing matrix'
+    }
+
+    # Read-only роль не має права на жоден запис, незалежно від цілі — і ця
+    # перевірка мусить стояти ПЕРЕД обробкою нерозпізнаної цілі. Інакше виклик
+    # із полем шляху, якого хук не знає, проходив би саме тому, що хук не зміг
+    # прочитати ціль.
+    if ($writeRole.write -ne $true) {
+        Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
+            -Reason ("role '$agentName' is read-only by .claude/ai-routing.json and may not write (target: '$writeTarget')")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($writeTarget)) {
+        # Ціль нерозпізнана. Для ролі з allowlist це fail-closed: межа описана
+        # через те, що ДОЗВОЛЕНО, і неперевірена ціль у неї не входить. Для
+        # ролі лише з deny-списком (worker/tester) межа все одно не в хуку, а в
+        # SCOPE задачі, тому виклик пропускається з гучним записом у журнал.
+        if ($null -ne $writeRole.writeAllow) {
+            Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
+                -Reason ("write call carries no resolvable target path; role '$agentName' has a write allowlist, so an unverifiable target is blocked (fail-closed)")
+        }
+        Write-RoutingLog -ProjectDir $projectDir -Decision 'ALLOW' -Tool $toolName -Agent $agentName -Model 'n/a' `
+            -Reason 'HOOK-ERROR: write call carries no resolvable target path; deny-list-only role allowed (fail-open)'
+        exit 0
+    }
+
+    $relativeTarget = ConvertTo-RepoRelativePath -Path $writeTarget -Roots @($projectDir, $payloadCwd)
+
+    if (Test-PatternMatch -Value $relativeTarget -Patterns $writeRole.writeDeny) {
+        Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
+            -Reason ("'$relativeTarget' is outside the write boundary of role '$agentName' (denied)")
+    }
+
+    if ($null -ne $writeRole.writeAllow -and -not (Test-PatternMatch -Value $relativeTarget -Patterns $writeRole.writeAllow)) {
+        Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
+            -Reason ("'$relativeTarget' is not inside the write allowlist of role '$agentName'")
+    }
+
+    Approve-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
+        -Reason ("write target '$relativeTarget' is inside the write boundary of role '$agentName'")
 }
 
 $role = $matrix.roles.$agentName
