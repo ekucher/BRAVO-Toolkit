@@ -239,12 +239,25 @@ if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
             $failures.Add('settings.json PreToolUse entry for validate-agent-routing.ps1 declares no matcher; an empty matcher is not evidence of coverage.')
         }
         else {
-            foreach ($gatedTool in @('Task', 'Write', 'Edit', 'NotebookEdit')) {
+            # 'Agent' is the delegation tool name in Claude Code 2.1.x; 'Task'
+            # covers versions that named it so. A live run proved that omitting
+            # 'Agent' silently disables every delegation check.
+            foreach ($gatedTool in @('Agent', 'Task', 'Write', 'Edit', 'NotebookEdit')) {
                 if ($routingMatcher -notmatch ('(^|\|)' + [System.Text.RegularExpressions.Regex]::Escape($gatedTool) + '($|\|)')) {
                     $failures.Add("settings.json PreToolUse matcher must route '$gatedTool' to validate-agent-routing.ps1; current matcher: $routingMatcher")
                 }
             }
         }
+    }
+}
+
+$costHook = Join-Path $RepoRoot '.claude\hooks\record-ai-cost.ps1'
+if (Test-Path -LiteralPath $costHook -PathType Leaf) {
+    # The cost hook counts delegations by tool name. With only 'Task' matched it
+    # reported zero agent calls in every live session.
+    $costHookText = [System.IO.File]::ReadAllText($costHook)
+    if ($costHookText -notmatch "'Agent'") {
+        $failures.Add("record-ai-cost.ps1 must count the 'Agent' delegation tool; counting only 'Task' reports zero delegations in a live session.")
     }
 }
 

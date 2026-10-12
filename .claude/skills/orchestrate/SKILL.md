@@ -207,8 +207,9 @@ prose summary.
 
 ### Enforcement
 
-`.claude/hooks/validate-agent-routing.ps1` runs as a `PreToolUse` hook on `Task`, `Write`, `Edit`,
-`NotebookEdit` and Codex calls, and blocks a narrow closed list:
+`.claude/hooks/validate-agent-routing.ps1` runs as a `PreToolUse` hook on the delegation tool
+(`Agent`, historically `Task`), on `Write`, `Edit`, `NotebookEdit`, and on Codex calls. It blocks a
+narrow closed list:
 
 - model mismatch against the matrix;
 - a Claude agent briefed with `review_source: codex-*`;

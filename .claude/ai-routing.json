@@ -1,4 +1,4 @@
-{
+﻿{
   "schemaVersion": 1,
   "description": "Canonical role/model routing matrix for ekucher/BRAVO-Toolkit. Normative agent-orchestration rules live in BRAVO_AGENT_POLICY.md; this file is the machine-readable source of truth for role-to-model assignment, risk-level gates and fallback limits. Operator documentation: docs/ai/MODEL_ROUTING_POLICY.md.",
   "roles": {
@@ -174,12 +174,14 @@
     "hook": ".claude/hooks/validate-agent-routing.ps1",
     "hookEvent": "PreToolUse",
     "gatedTools": [
+      "Agent",
       "Task",
       "Write",
       "Edit",
       "NotebookEdit",
       "mcp__codex-agent__*"
     ],
+    "delegationToolNote": "The delegation tool is named Agent in Claude Code 2.1.x; Task is kept for versions that named it so. Both must stay gated: a live run on 2026-10-12 showed the hook receives tool_name=Agent, and while only Task was listed every delegation check was skipped as 'not subject to routing policy'.",
     "writeGate": {
       "note": "The write boundary is enforced on the actual write, keyed on the acting agent from the PreToolUse agent_type field, not only on the SCOPE text of a delegation brief.",
       "mainSessionExempt": true,

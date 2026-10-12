@@ -213,14 +213,28 @@ if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
 
     # The matcher must cover the write tools, not only delegation briefs:
     # otherwise the write boundary exists in prompt text only.
-    $matcherMatch = [regex]::Match($settingsText, '"matcher"\s*:\s*"(?<m>[^"]*Task[^"]*)"')
-    Assert-True 'PreToolUse matcher is present for Task' $matcherMatch.Success
+    $matcherMatch = [regex]::Match($settingsText, '"matcher"\s*:\s*"(?<m>[^"]*validate[^"]*|[^"]*Agent[^"]*)"')
+    if (-not $matcherMatch.Success) {
+        $matcherMatch = [regex]::Match($settingsText, '"matcher"\s*:\s*"(?<m>[^"]*Task[^"]*)"')
+    }
+    Assert-True 'PreToolUse matcher is present' $matcherMatch.Success
     if ($matcherMatch.Success) {
         $matcher = $matcherMatch.Groups['m'].Value
+        # 'Agent' is the delegation tool name a live Claude Code 2.1.x session
+        # actually sends. Omitting it silently disables every delegation check.
+        Assert-True 'matcher covers the Agent delegation tool' ($matcher -match '\bAgent\b') $matcher
+        Assert-True 'matcher still covers the legacy Task name' ($matcher -match '\bTask\b') $matcher
         Assert-True 'matcher covers Write' ($matcher -match '\bWrite\b') $matcher
         Assert-True 'matcher covers Edit' ($matcher -match '\bEdit\b') $matcher
         Assert-True 'matcher covers NotebookEdit' ($matcher -match 'NotebookEdit') $matcher
         Assert-True 'matcher still covers Codex calls' ($matcher -match 'codex-agent') $matcher
+    }
+
+    # The cost hook counts delegations by tool name too.
+    $costHookPath = Join-Path $root '.claude\hooks\record-ai-cost.ps1'
+    if (Test-Path -LiteralPath $costHookPath -PathType Leaf) {
+        $costHookSource = Get-Content -LiteralPath $costHookPath -Raw -Encoding UTF8
+        Assert-True 'cost hook counts the Agent delegation tool' ($costHookSource -match "'Agent'")
     }
     Assert-True 'settings.json keeps the PreCompact hook' ($settingsText -match 'precompact-checkpoint\.ps1')
     Assert-True 'settings.json keeps the save-task hook' ($settingsText -match 'save-task\.ps1')
@@ -277,10 +291,16 @@ function Invoke-RoutingHook {
 }
 
 function Get-TaskPayload {
+    <#
+        Payload делегування. $Tool за замовчуванням 'Agent' — саме так
+        інструмент називається в Claude Code 2.1.x, що й показав live-прогін.
+        'Task' лишається перевіряти сумісність зі старшим іменем.
+    #>
     param(
         [string]$Agent,
         [string]$Model,
-        [string]$Prompt = 'OBJECTIVE: bounded test brief'
+        [string]$Prompt = 'OBJECTIVE: bounded test brief',
+        [string]$Tool = 'Agent'
     )
     $toolInput = @{ subagent_type = $Agent; prompt = $Prompt }
     if ($PSBoundParameters.ContainsKey('Model') -and -not [string]::IsNullOrEmpty($Model)) {
@@ -289,7 +309,7 @@ function Get-TaskPayload {
     return @{
         session_id      = 'routing-test'
         hook_event_name = 'PreToolUse'
-        tool_name       = 'Task'
+        tool_name       = $Tool
         cwd             = $sandbox
         tool_input      = $toolInput
     }
@@ -436,6 +456,22 @@ try {
     Assert-Equal 'Explore agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'Explore' -Model 'opus')))
     Assert-Equal 'general-purpose agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'general-purpose' -Model 'haiku')))
     Assert-Equal 'plugin agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'pr-review-toolkit:code-reviewer' -Model 'opus')))
+
+    # 6b) The delegation tool name. Every assertion above runs under tool_name
+    # 'Agent', which is what a real Claude Code 2.1.x session sends — the live
+    # run on 2026-10-12 recorded exactly `tool=Agent` in ai-routing.log. While
+    # the hook recognized only 'Task', all four delegation checks were skipped
+    # in a live session as "tool not subject to routing policy": a wrong model
+    # override and a reasonless claude-qa-fallback both went through. These
+    # assertions pin BOTH names, so neither can regress.
+    foreach ($delegationTool in @('Agent', 'Task')) {
+        Assert-Equal "[$delegationTool] scout forced onto opus is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Tool $delegationTool -Agent 'scout' -Model 'opus')))
+        Assert-Equal "[$delegationTool] reviewer downgraded to sonnet is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Tool $delegationTool -Agent 'reviewer' -Model 'sonnet')))
+        Assert-Equal "[$delegationTool] claude-qa-fallback without a reason is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Tool $delegationTool -Agent 'reviewer' -Prompt "REVIEW_MODE: claude-qa-fallback`nOBJECTIVE: review the change")))
+        Assert-Equal "[$delegationTool] claude agent briefed as a codex gate is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Tool $delegationTool -Agent 'reviewer' -Prompt "review_source: codex-qa`nOBJECTIVE: close the gate")))
+        Assert-Equal "[$delegationTool] documentation SCOPE on acceptance evidence is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Tool $delegationTool -Agent 'documentation' -Model 'sonnet' -Prompt "OBJECTIVE: refresh`nSCOPE: docs/BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md")))
+        Assert-Equal "[$delegationTool] a compliant delegation is still allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Tool $delegationTool -Agent 'scout' -Model 'haiku')))
+    }
 
     # 6a) Write gate: the boundary must hold on the ACTUAL write, not only on
     # the SCOPE text of a delegation brief. The acting agent comes from

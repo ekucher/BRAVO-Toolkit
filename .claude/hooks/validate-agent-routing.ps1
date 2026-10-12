@@ -5,9 +5,9 @@
 
     Отримує на stdin JSON із полями session_id, cwd, hook_event_name,
     tool_name, tool_input і — усередині субагента — agent_id/agent_type. Для
-    tool_name = "Task" перевіряє делегування агентам BRAVO; для Write/Edit/
-    NotebookEdit перевіряє межу запису діючої роли; для викликів
-    mcp__codex-agent__* лише аудитує.
+    інструмента делегування ("Agent", історично "Task") перевіряє делегування
+    агентам BRAVO; для Write/Edit/NotebookEdit перевіряє межу запису діючої
+    роли; для викликів mcp__codex-agent__* лише аудитує.
 
     Контракт виходу (конвенція PreToolUse у Claude Code):
         exit 0 — виклик дозволено;
@@ -56,6 +56,15 @@ $script:EmptyScopeMarkers = @('none', 'n/a', 'na', 'nothing', '-')
 # не давати цей інструмент ролі з межею запису (див. ai-routing.json,
 # enforcement.writeGate.bashNote).
 $script:WriteTools = @('Write', 'Edit', 'NotebookEdit')
+
+# Інструмент делегування. У Claude Code 2.1.x він називається 'Agent'; ім'я
+# 'Task' лишається для сумісності з версіями, де інструмент називався так.
+# Це НЕ косметика: live-прогін 2026-10-12 показав, що хук бачить саме
+# tool_name='Agent', і доки в списку був лише 'Task', усі перевірки делегування
+# (модель, підмінений Codex-гейт, причина fallback, SCOPE documentation) у живій
+# сесії не виконувались узагалі — пропускались як «інструмент не підлягає
+# політиці». Test-AIRouting.ps1 прогонить кожну з них під обома іменами.
+$script:DelegationTools = @('Agent', 'Task')
 
 $isWriteTool = $false
 $writeTarget = ''
@@ -415,7 +424,7 @@ try {
         }
         $payloadCwd = [string]$payload.cwd
     }
-    elseif ($toolName -cne 'Task') {
+    elseif ($script:DelegationTools -notcontains $toolName) {
         Approve-Call -ProjectDir $projectDir -Tool $toolName -Agent 'n/a' -Model 'n/a' -Reason 'tool not subject to routing policy'
     }
     else {

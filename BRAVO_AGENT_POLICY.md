@@ -157,8 +157,9 @@ does not extend it. Where the matrix and this file could be read as disagreeing,
 the matrix is the defect to fix.
 
 The orchestrator resolves role and model from the matrix instead of asking the owner to pick a model
-per task. The `PreToolUse` hook `.claude/hooks/validate-agent-routing.ps1` enforces a narrow closed
-list — model mismatch, a Claude agent briefed as a formal Codex gate, `claude-qa-fallback` without
+per task. The `PreToolUse` hook `.claude/hooks/validate-agent-routing.ps1` runs on the delegation
+tool (`Agent`, historically `Task`), on `Write`/`Edit`/`NotebookEdit`, and on Codex calls, and
+enforces a narrow closed list — model mismatch, a Claude agent briefed as a formal Codex gate, `claude-qa-fallback` without
 one of the three permitted reasons, `documentation` scoped outside its write boundary, and a
 delegated agent's actual `Write`/`Edit`/`NotebookEdit` outside its write boundary — and logs every
 other decision. The acting role for a write comes from the hook payload's `agent_type`; the main

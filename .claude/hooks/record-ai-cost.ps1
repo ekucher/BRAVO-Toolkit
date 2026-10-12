@@ -104,7 +104,11 @@ try {
 
             $toolName = [string]$block.name
 
-            if ($toolName -ceq 'Task') {
+            # 'Agent' — ім'я інструмента делегування в Claude Code 2.1.x;
+            # 'Task' лишається для сумісності з версіями, де він називався так.
+            # Доки тут був лише 'Task', облік делегувань у живій сесії завжди
+            # виходив порожнім (live-прогін 2026-10-12).
+            if ($toolName -ceq 'Agent' -or $toolName -ceq 'Task') {
                 $agent = 'unspecified'
                 if ($null -ne $block.input -and -not [string]::IsNullOrWhiteSpace([string]$block.input.subagent_type)) {
                     $agent = [string]$block.input.subagent_type
