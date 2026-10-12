@@ -235,39 +235,89 @@ function ConvertTo-NormalizedScopePath {
     return $normalized
 }
 
-function ConvertTo-RepoRelativePath {
+function Resolve-WriteTargetPath {
     <#
-        Зводить цільовий шлях запису до шляху, відносного кореня проєкту, щоб
+        Зводить цільовий шлях запису до шляху, відносного кореня ПРОЄКТУ, щоб
         його можна було зіставити з патернами межі запису (вони всі відносні).
 
-        Шлях поза коренем проєкту лишається з провідним '/', якого не покриває
-        жоден allow-патерн — тобто для ролі з allowlist він буде заблокований.
-        Згортання '..' і зрізання NTFS-потоку робить ConvertTo-NormalizedScopePath.
+        Повертає об'єкт { Status; Relative }, де Status один із:
+          'inside'       — ціль під коренем проєкту, Relative придатний до
+                           зіставлення з writeDeny/writeAllow;
+          'outside'      — ціль поза коренем проєкту;
+          'unverifiable' — форма шляху не дозволяє визначити, куда він вкаже.
+
+        ВАЖЛИВО: $Cwd використовується ВИКЛЮЧНО для того, щоб зробити відносний
+        шлях абсолютним. Він НЕ є другим дозволеним коренем. Інакше сесія з
+        cwd поза репозиторієм давала б ролі з allowlist запис будь-куди: шлях
+        'E:/outside/docs/x.md' зрізався б до 'docs/x.md' і проходив патерн
+        'docs/*'. Дозволений корінь — лише корінь проєкту (SEC-002).
+
+        Відносний шлях мусить бути розв'язаний ДО згортання межі: сам лише
+        'ConvertTo-NormalizedScopePath' лишає провідний '..', і спелінг
+        '../<repo-name>/.claude/ai-routing.json' не відповідав би deny-патерну
+        '.claude/*', хоча фактично вказує саме на матрицю (SEC-001).
+
+        Форми, які свідомо вважаються 'unverifiable', бо їхню цільову адресу
+        визначає стан процесу, а не текст шляху:
+          'C:file.txt'   — drive-relative (поточний каталог ТОГО диска);
+          '/foo'         — корінь поточного диска;
+          '//server/...' — UNC і device-простори ('//?/', '//./').
     #>
     param(
         [string]$Path,
-        $Roots
+        [string]$Cwd,
+        [string]$ProjectDir
     )
 
-    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
-
-    $normalizedTarget = ConvertTo-NormalizedScopePath -Path $Path
-
-    foreach ($rootCandidate in @($Roots)) {
-        if ([string]::IsNullOrWhiteSpace($rootCandidate)) { continue }
-        $normalizedRoot = ConvertTo-NormalizedScopePath -Path $rootCandidate
-        if ([string]::IsNullOrWhiteSpace($normalizedRoot)) { continue }
-
-        # Порівняння регістронезалежне: Windows-шляхи не розрізняють регістр, і
-        # 'E:/GitHub/...' проти 'e:/github/...' не повинно давати іншого рішення.
-        $rootPrefix = $normalizedRoot.TrimEnd('/') + '/'
-        if ($normalizedTarget.Length -gt $rootPrefix.Length -and
-            $normalizedTarget.Substring(0, $rootPrefix.Length).Equals($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-            return $normalizedTarget.Substring($rootPrefix.Length)
-        }
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [pscustomobject]@{ Status = 'unverifiable'; Relative = '' }
     }
 
-    return $normalizedTarget
+    $raw = ($Path -replace '\\', '/')
+
+    if ($raw.StartsWith('//')) {
+        return [pscustomobject]@{ Status = 'unverifiable'; Relative = $raw }
+    }
+    if ($raw.StartsWith('/')) {
+        return [pscustomobject]@{ Status = 'unverifiable'; Relative = $raw }
+    }
+
+    $absolute = ''
+    if ($raw -match '^[A-Za-z]:/') {
+        $absolute = $raw
+    }
+    elseif ($raw -match '^[A-Za-z]:') {
+        # 'C:file.txt' — drive-relative, цільову адресу знає лише процес.
+        return [pscustomobject]@{ Status = 'unverifiable'; Relative = $raw }
+    }
+    else {
+        $base = $Cwd
+        if ([string]::IsNullOrWhiteSpace($base)) { $base = $ProjectDir }
+        $base = ($base -replace '\\', '/')
+        if ($base -notmatch '^[A-Za-z]:/') {
+            return [pscustomobject]@{ Status = 'unverifiable'; Relative = $raw }
+        }
+        $absolute = $base.TrimEnd('/') + '/' + $raw
+    }
+
+    $normalizedTarget = ConvertTo-NormalizedScopePath -Path $absolute
+    $normalizedRoot = ''
+    if (-not [string]::IsNullOrWhiteSpace($ProjectDir)) {
+        $normalizedRoot = ConvertTo-NormalizedScopePath -Path $ProjectDir
+    }
+    if ([string]::IsNullOrWhiteSpace($normalizedRoot)) {
+        return [pscustomobject]@{ Status = 'unverifiable'; Relative = $normalizedTarget }
+    }
+
+    # Порівняння регістронезалежне: Windows-шляхи не розрізняють регістр, і
+    # 'E:/GitHub/...' проти 'e:/github/...' не повинно давати іншого рішення.
+    $rootPrefix = $normalizedRoot.TrimEnd('/') + '/'
+    if ($normalizedTarget.Length -gt $rootPrefix.Length -and
+        $normalizedTarget.Substring(0, $rootPrefix.Length).Equals($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ Status = 'inside'; Relative = $normalizedTarget.Substring($rootPrefix.Length) }
+    }
+
+    return [pscustomobject]@{ Status = 'outside'; Relative = $normalizedTarget }
 }
 
 function ConvertFrom-JsonEscapedText {
@@ -461,21 +511,27 @@ if ($isWriteTool) {
             -Reason ("role '$agentName' is read-only by .claude/ai-routing.json and may not write (target: '$writeTarget')")
     }
 
-    if ([string]::IsNullOrWhiteSpace($writeTarget)) {
-        # Ціль нерозпізнана. Для ролі з allowlist це fail-closed: межа описана
-        # через те, що ДОЗВОЛЕНО, і неперевірена ціль у неї не входить. Для
-        # ролі лише з deny-списком (worker/tester) межа все одно не в хуку, а в
-        # SCOPE задачі, тому виклик пропускається з гучним записом у журнал.
+    $resolved = Resolve-WriteTargetPath -Path $writeTarget -Cwd $payloadCwd -ProjectDir $projectDir
+
+    if ($resolved.Status -cne 'inside') {
+        # Ціль не зводиться до шляху під коренем проєкту: або форма шляху не
+        # дозволяє визначити цільову адресу, або ціль поза репозиторієм.
+        #
+        # Для ролі з allowlist це fail-closed: межа описана через те, що
+        # ДОЗВОЛЕНО, і неперевірена чи позарепозиторна ціль у неї не входить.
+        # Для ролі лише з deny-списком (worker/tester) межа все одно не в хуку,
+        # а в SCOPE задачі, і deny-список перелічує саме файли цього
+        # репозиторію — тому виклик пропускається з гучним записом у журнал.
         if ($null -ne $writeRole.writeAllow) {
             Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
-                -Reason ("write call carries no resolvable target path; role '$agentName' has a write allowlist, so an unverifiable target is blocked (fail-closed)")
+                -Reason ("write target '$writeTarget' is " + $resolved.Status + " relative to the project root; role '$agentName' has a write allowlist, so it is blocked (fail-closed)")
         }
         Write-RoutingLog -ProjectDir $projectDir -Decision 'ALLOW' -Tool $toolName -Agent $agentName -Model 'n/a' `
-            -Reason 'HOOK-ERROR: write call carries no resolvable target path; deny-list-only role allowed (fail-open)'
+            -Reason ('HOOK-ERROR: write target ''' + $writeTarget + ''' is ' + $resolved.Status + ' relative to the project root; deny-list-only role allowed (fail-open)')
         exit 0
     }
 
-    $relativeTarget = ConvertTo-RepoRelativePath -Path $writeTarget -Roots @($projectDir, $payloadCwd)
+    $relativeTarget = $resolved.Relative
 
     if (Test-PatternMatch -Value $relativeTarget -Patterns $writeRole.writeDeny) {
         Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `

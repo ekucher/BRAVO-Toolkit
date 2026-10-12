@@ -290,7 +290,7 @@ function Get-TaskPayload {
         session_id      = 'routing-test'
         hook_event_name = 'PreToolUse'
         tool_name       = 'Task'
-        cwd             = $root
+        cwd             = $sandbox
         tool_input      = $toolInput
     }
 }
@@ -441,7 +441,11 @@ try {
     # the SCOPE text of a delegation brief. The acting agent comes from
     # agent_type; the target comes from tool_input.file_path.
 
-    $repoFile = { param($rel) (Join-Path $root $rel) }
+    # Targets live under the SANDBOX, because the sandbox is what the hook sees
+    # as the project root (CLAUDE_PROJECT_DIR). Building them under the real
+    # repository would only pass if the hook treated the payload cwd as a second
+    # authorized root — which is exactly the bypass SEC-002 described.
+    $repoFile = { param($rel) (Join-Path $sandbox $rel) }
 
     # documentation: denied targets
     foreach ($denied in @(
@@ -455,46 +459,106 @@ try {
             '.claude\ai-routing.json',
             'ci\Test-BRAVOForbiddenPattern.ps1'
         )) {
-        Assert-Equal "documentation Write to '$denied' is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path (& $repoFile $denied) -ProjectDir $root)))
-        Assert-Equal "documentation Edit of '$denied' is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Edit' -AgentType 'documentation' -Path (& $repoFile $denied) -ProjectDir $root)))
+        Assert-Equal "documentation Write to '$denied' is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path (& $repoFile $denied) -ProjectDir $sandbox)))
+        Assert-Equal "documentation Edit of '$denied' is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Edit' -AgentType 'documentation' -Path (& $repoFile $denied) -ProjectDir $sandbox)))
     }
 
     # documentation: allowed targets
     foreach ($allowed in @('CHANGELOG.md', 'README.md', 'docs\MANUAL_RUN_CONSOLE_UX.md', 'docs\ai\MODEL_ROUTING_POLICY.md')) {
-        Assert-Equal "documentation Write to '$allowed' is allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path (& $repoFile $allowed) -ProjectDir $root)))
+        Assert-Equal "documentation Write to '$allowed' is allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path (& $repoFile $allowed) -ProjectDir $sandbox)))
     }
 
     # documentation: traversal and stream tricks must not get through the write gate either
-    Assert-Equal 'documentation Write via traversal is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path (& $repoFile 'docs\..\AGENTS.md') -ProjectDir $root)))
-    Assert-Equal 'documentation Write via NTFS stream is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path ((& $repoFile 'docs\source.ps1') + '::$DATA') -ProjectDir $root)))
-    Assert-Equal 'documentation Write outside the repository is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path 'C:\Temp\evil.md' -ProjectDir $root)))
-    Assert-Equal 'documentation NotebookEdit of a denied path is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'NotebookEdit' -AgentType 'documentation' -Path (& $repoFile 'docs\BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md') -ProjectDir $root)))
+    Assert-Equal 'documentation Write via traversal is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path (& $repoFile 'docs\..\AGENTS.md') -ProjectDir $sandbox)))
+    Assert-Equal 'documentation Write via NTFS stream is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path ((& $repoFile 'docs\source.ps1') + '::$DATA') -ProjectDir $sandbox)))
+    Assert-Equal 'documentation Write outside the repository is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'documentation' -Path 'C:\Temp\evil.md' -ProjectDir $sandbox)))
+    Assert-Equal 'documentation NotebookEdit of a denied path is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'NotebookEdit' -AgentType 'documentation' -Path (& $repoFile 'docs\BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md') -ProjectDir $sandbox)))
 
     # Read-only roles must not write at all, whatever their frontmatter says.
     foreach ($readOnly in @('scout', 'reviewer', 'architect', 'security-reviewer')) {
-        Assert-Equal "$readOnly Write to CHANGELOG.md is blocked (write:false)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $readOnly -Path (& $repoFile 'CHANGELOG.md') -ProjectDir $root)))
-        Assert-Equal "$readOnly Edit of a module is blocked (write:false)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Edit' -AgentType $readOnly -Path (& $repoFile 'modules\BRAVO.Archive\BRAVO.Archive.psm1') -ProjectDir $root)))
+        Assert-Equal "$readOnly Write to CHANGELOG.md is blocked (write:false)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $readOnly -Path (& $repoFile 'CHANGELOG.md') -ProjectDir $sandbox)))
+        Assert-Equal "$readOnly Edit of a module is blocked (write:false)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Edit' -AgentType $readOnly -Path (& $repoFile 'modules\BRAVO.Archive\BRAVO.Archive.psm1') -ProjectDir $sandbox)))
     }
 
     # worker/tester: static deny only — they must write code, but never release
     # evidence, canonical policy, agent configuration or integrity manifests.
     foreach ($implementer in @('worker', 'tester')) {
-        Assert-Equal "$implementer Write to a module is allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'modules\BRAVO.Archive\BRAVO.Archive.psm1') -ProjectDir $root)))
-        Assert-Equal "$implementer Write to a root entrypoint is allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'BRAVO_ARCHIV.ps1') -ProjectDir $root)))
-        Assert-Equal "$implementer Write to acceptance evidence is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'docs\BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md') -ProjectDir $root)))
-        Assert-Equal "$implementer Write to canonical policy is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'BRAVO_AGENT_POLICY.md') -ProjectDir $root)))
-        Assert-Equal "$implementer Write to the routing matrix is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile '.claude\ai-routing.json') -ProjectDir $root)))
-        Assert-Equal "$implementer Write to the runtime manifest is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'RUNTIME_MANIFEST.json') -ProjectDir $root)))
+        Assert-Equal "$implementer Write to a module is allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'modules\BRAVO.Archive\BRAVO.Archive.psm1') -ProjectDir $sandbox)))
+        Assert-Equal "$implementer Write to a root entrypoint is allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'BRAVO_ARCHIV.ps1') -ProjectDir $sandbox)))
+        Assert-Equal "$implementer Write to acceptance evidence is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'docs\BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md') -ProjectDir $sandbox)))
+        Assert-Equal "$implementer Write to canonical policy is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'BRAVO_AGENT_POLICY.md') -ProjectDir $sandbox)))
+        Assert-Equal "$implementer Write to the routing matrix is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile '.claude\ai-routing.json') -ProjectDir $sandbox)))
+        Assert-Equal "$implementer Write to the runtime manifest is blocked" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType $implementer -Path (& $repoFile 'RUNTIME_MANIFEST.json') -ProjectDir $sandbox)))
     }
 
     # The main session is not gated: agent_type is absent there, and gating it
     # would block the owner's own work (deliberate, documented decision).
-    Assert-Equal 'main session Write to acceptance evidence is allowed (no agent_type)' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -Path (& $repoFile 'docs\BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md') -ProjectDir $root)))
-    Assert-Equal 'main session Write to canonical policy is allowed (no agent_type)' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -Path (& $repoFile 'BRAVO_AGENT_POLICY.md') -ProjectDir $root)))
+    Assert-Equal 'main session Write to acceptance evidence is allowed (no agent_type)' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -Path (& $repoFile 'docs\BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md') -ProjectDir $sandbox)))
+    Assert-Equal 'main session Write to canonical policy is allowed (no agent_type)' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -Path (& $repoFile 'BRAVO_AGENT_POLICY.md') -ProjectDir $sandbox)))
 
     # Agents outside the matrix are never gated.
-    Assert-Equal 'unmanaged agent Write is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'Explore' -Path (& $repoFile 'BRAVO_AGENT_POLICY.md') -ProjectDir $root)))
-    Assert-Equal 'plugin agent Write is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'pr-review-toolkit:code-reviewer' -Path (& $repoFile 'RUNTIME_MANIFEST.json') -ProjectDir $root)))
+    Assert-Equal 'unmanaged agent Write is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'Explore' -Path (& $repoFile 'BRAVO_AGENT_POLICY.md') -ProjectDir $sandbox)))
+    Assert-Equal 'plugin agent Write is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-WritePayload -Tool 'Write' -AgentType 'pr-review-toolkit:code-reviewer' -Path (& $repoFile 'RUNTIME_MANIFEST.json') -ProjectDir $sandbox)))
+
+    # SEC-001 regression: a RELATIVE target must be resolved against the tool
+    # cwd before the boundary is applied. Without that, the spelling
+    # '../<repo-name>/.claude/ai-routing.json' keeps its leading '..', matches
+    # no deny pattern, and a worker rewrites the routing matrix itself.
+    $sandboxLeaf = Split-Path -Leaf $sandbox
+    foreach ($relative in @(
+            ('../' + $sandboxLeaf + '/.claude/ai-routing.json'),
+            ('..\' + $sandboxLeaf + '\BRAVO_AGENT_POLICY.md'),
+            './.claude/ai-routing.json',
+            '.claude/ai-routing.json',
+            ('docs/../../' + $sandboxLeaf + '/RUNTIME_MANIFEST.json')
+        )) {
+        $relPayload = @{
+            session_id      = 'routing-test'
+            hook_event_name = 'PreToolUse'
+            tool_name       = 'Write'
+            cwd             = $sandbox
+            agent_id        = 'agent-test'
+            agent_type      = 'worker'
+            tool_input      = @{ file_path = $relative; content = 'x' }
+        }
+        Assert-Equal "worker relative write '$relative' is blocked (resolved against cwd)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $relPayload))
+    }
+
+    # SEC-002 regression: the tool cwd is NOT a second authorized root. A
+    # documentation agent whose cwd lies outside the project must not be able to
+    # write 'docs/...' outside the repository just because stripping cwd makes
+    # the path look allowlisted.
+    $outsideRoot = Join-Path ([IO.Path]::GetTempPath()) ("bravo-routing-outside-{0}" -f [guid]::NewGuid().ToString('N'))
+    foreach ($outsideCase in @(
+            @{ Path = (Join-Path $outsideRoot 'docs\policy.md'); Label = 'absolute under a foreign cwd' },
+            @{ Path = 'docs/policy.md'; Label = 'relative under a foreign cwd' }
+        )) {
+        $outsidePayload = @{
+            session_id      = 'routing-test'
+            hook_event_name = 'PreToolUse'
+            tool_name       = 'Write'
+            cwd             = $outsideRoot
+            agent_id        = 'agent-test'
+            agent_type      = 'documentation'
+            tool_input      = @{ file_path = $outsideCase.Path; content = 'x' }
+        }
+        Assert-Equal ("documentation write outside the project root is blocked (" + $outsideCase.Label + ")") '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $outsidePayload))
+    }
+
+    # Path forms whose target is decided by process state, not by the text, are
+    # unverifiable: fail-closed for an allowlisted role.
+    foreach ($ambiguous in @('C:policy.md', '/docs/policy.md', '//localhost/C$/docs/policy.md', '//?/C:/docs/policy.md')) {
+        $ambiguousPayload = @{
+            session_id      = 'routing-test'
+            hook_event_name = 'PreToolUse'
+            tool_name       = 'Write'
+            cwd             = $sandbox
+            agent_id        = 'agent-test'
+            agent_type      = 'documentation'
+            tool_input      = @{ file_path = $ambiguous; content = 'x' }
+        }
+        Assert-Equal "documentation write to ambiguous path '$ambiguous' is blocked (fail-closed)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $ambiguousPayload))
+    }
 
     # Unresolvable target: a write call whose payload carries no path field the
     # hook recognizes. A read-only role must still be blocked — otherwise the
@@ -509,7 +573,7 @@ try {
             session_id      = 'routing-test'
             hook_event_name = 'PreToolUse'
             tool_name       = 'Write'
-            cwd             = $root
+            cwd             = $sandbox
             tool_input      = @{ path = 'BRAVO_AGENT_POLICY.md'; content = 'x' }
         }
         if (-not [string]::IsNullOrEmpty($AgentType)) {
@@ -533,7 +597,7 @@ try {
         session_id      = 'routing-test'
         hook_event_name = 'PreToolUse'
         tool_name       = 'Bash'
-        cwd             = $root
+        cwd             = $sandbox
         agent_id        = 'agent-test'
         agent_type      = 'documentation'
         tool_input      = @{ command = 'Set-Content -Path docs\BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md -Value x' }
@@ -545,7 +609,7 @@ try {
         session_id      = 'routing-test'
         hook_event_name = 'PreToolUse'
         tool_name       = 'mcp__codex-agent__codex_delegate'
-        cwd             = $root
+        cwd             = $sandbox
         tool_input      = @{ role = 'qa'; prompt = 'review the diff' }
     }
     Assert-Equal 'codex_delegate is allowed through' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $codexPayload))
@@ -555,7 +619,7 @@ try {
         session_id      = 'routing-test'
         hook_event_name = 'PreToolUse'
         tool_name       = 'Bash'
-        cwd             = $root
+        cwd             = $sandbox
         tool_input      = @{ command = 'git status' }
     }
     Assert-Equal 'unrelated tools are allowed through' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $bashPayload))
