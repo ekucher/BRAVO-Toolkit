@@ -1,6 +1,18 @@
 ﻿{
     "autoCompactWindow": 500000,
     "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Agent|Task|Write|Edit|NotebookEdit|mcp__codex-agent__.*",
+                "hooks": [
+                    {
+                        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/validate-agent-routing.ps1\"",
+                        "type": "command",
+                        "timeout": 15
+                    }
+                ]
+            }
+        ],
         "PreCompact": [
             {
                 "hooks": [
@@ -46,6 +58,12 @@
                         "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-slack.ps1\"",
                         "async": true,
                         "timeout": 15
+                    },
+                    {
+                        "type": "command",
+                        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/record-ai-cost.ps1\"",
+                        "async": true,
+                        "timeout": 20
                     }
                 ]
             }

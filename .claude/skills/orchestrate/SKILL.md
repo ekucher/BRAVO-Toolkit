@@ -153,16 +153,87 @@ When explicitly requested:
 4. fresh review checks both behavior and test quality;
 5. formal Codex gate follows the review matrix when required.
 
-## Model routing
+## Risk classification and model routing
 
-Default Claude routing:
+The owner states the task, not the model or the agent roster. Resolve both from
+`.claude/ai-routing.json` — it is the machine-readable source of truth for role/model assignment,
+per-risk-level gates, permitted fallback reasons and the `documentation` write boundary. Never ask
+the owner which model to use, and never raise a role to a stronger model without evidence that the
+cheaper one is insufficient.
 
-| Role | Agent | Default model |
-|---|---|---|
-| Lead/orchestrator | main session | user's selected model |
-| Scout | `scout` | haiku |
-| Worker | `worker` | sonnet |
-| Tester | `tester` | sonnet |
-| Internal/fallback reviewer | `reviewer` | opus |
+### Classify first
 
-Codex role routing is controlled by `claude-codex-a2a` policy profiles.
+| Level | What it covers | Required Claude roles | Required gates |
+|---|---|---|---|
+| `LOW` | documentation, search, analytics, simple reports | as needed | none |
+| `MEDIUM` | local fixes, small features, tests | as needed | `codex-qa` |
+| `HIGH` | cross-module contracts, configuration, installer, significant behavior change | `architect` | `codex-qa` + `codex-architecture` |
+| `CRITICAL` | backup/restore, security, integrity, Scheduler/SYSTEM, authentication, data-loss risk | `architect`, `security-reviewer` | `codex-qa` + `codex-security` + `codex-architecture` |
+
+Classification follows the change's reach, not its diff size. A one-line change to credential
+resolution, restore scope, append-only state, or host-key verification is `CRITICAL`.
+
+Read the level's `requiredRoles`/`requiredGates` from the matrix rather than from this table when the
+two could differ; the matrix is what CI and the hook check.
+
+### Default role/model routing
+
+| Role | Agent | Model | Writes |
+|---|---|---|---|
+| Lead/orchestrator | main session | owner's selected model | yes |
+| Context gathering | `scout` | haiku | no |
+| Implementation | `worker` | sonnet | SCOPE only |
+| Tests | `tester` | sonnet | tests in SCOPE only |
+| Documentation audit/update | `documentation` | sonnet | allowlist only |
+| Design/architecture | `architect` | opus | no |
+| Internal security pre-review | `security-reviewer` | opus | no |
+| Internal/fallback reviewer | `reviewer` | opus | no |
+
+`architect` and `security-reviewer` are internal roles: they never satisfy the formal Codex
+`architecture`/`security` gates. Codex role routing stays controlled by `claude-codex-a2a` policy
+profiles.
+
+### Documentation trigger
+
+Dispatch `documentation` whenever the change has an externally observable effect — new or changed
+configuration key, exit code, CLI parameter, Scheduled Task/service behavior, persisted state format
+or path, or an operationally relied-upon log/notification contract — regardless of risk level. It
+audits drift always and writes only inside an explicit `SCOPE`. It must never be scoped onto accepted
+acceptance evidence, runbooks, canonical policy, code, or integrity manifests.
+
+It has no `Bash` tool, so it cannot produce the diff itself. Write the diff to a file and pass
+`DIFF_FILE: <path>` in the brief; without it the agent returns `blocked` rather than auditing your
+prose summary.
+
+### Enforcement
+
+`.claude/hooks/validate-agent-routing.ps1` runs as a `PreToolUse` hook on the delegation tool
+(`Agent`, historically `Task`), on `Write`, `Edit`, `NotebookEdit`, and on Codex calls. It blocks a
+narrow closed list:
+
+- model mismatch against the matrix;
+- a Claude agent briefed with `review_source: codex-*`;
+- `claude-qa-fallback` without one of `quota`/`rate-limit`/`service-unavailable`;
+- `documentation` scoped outside its write boundary;
+- an actual write outside the acting role's boundary — any write by a `write: false` role, or a target
+  in `writeDeny` / outside `writeAllow`. The acting role comes from the `agent_type` field of the hook
+  payload; the main session has no `agent_type` and is not write-gated.
+
+`Bash` is deliberately not gated: a shell command is not reliably inspectable for what it would write.
+The boundary is kept real by withholding `Bash` from write-bounded roles — which is why `documentation`
+does not have it. Do not hand a write-bounded role a shell as a convenience.
+
+Everything else is logged to `.claude/logs/ai-routing.log`. A blocked call is a brief to fix, not a
+hook to work around.
+
+Usage is recorded by the `Stop` hook into `.claude/logs/ai-cost.jsonl` as a cumulative snapshot after
+every assistant response; summarize it with `Tools\Get-AICostReport.ps1` (which keeps only the latest
+snapshot per session) when cost or retry behavior is in question.
+
+### Cost discipline
+
+- Use `scout` for discovery instead of loading large files into the main context.
+- Do not run two agents over the same material to produce the same answer.
+- Do not re-run a gate when nothing in its scope changed; state the prior evidence instead.
+- Do not spend Codex quota on `LOW` work, and do not spend `opus` on mechanical edits.
+- Prefer one well-scoped package over several overlapping ones.
