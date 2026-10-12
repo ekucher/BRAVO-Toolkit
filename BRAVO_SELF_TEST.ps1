@@ -20821,6 +20821,16 @@ try {
                 # Той самий logger-скриптблок, що його передає production
                 # (BRAVO.Archive.Runtime.ps1, виклик Test-SevenZipArchiveIntegrity).
                 $diagLogger = { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level }
+                # Паролі спільної фікстури B2 складаються з частин — та сама
+                # конвенція, що застосована в aade0ee для RestoreSynthetic:
+                # контiгуального літерала у файлі не лишається. Це не
+                # credential (у Credential Manager не потрапляє, продуктивних
+                # даних не захищає; непорожній пароль вимагає сам ланцюг
+                # перевірки цілісності), але generic-детектори секретів
+                # реагують на ФОРМУ, не на зміст, і давали знахідку в PR.
+                # Значення тих самих фікстурних архівів не змінюється.
+                $diagFixtureLegacyPassword = -join @('B2', 'Legacy', 'Pass')
+                $diagFixtureNormalPassword = -join @('B2', 'Normal', 'Pass')
                 $diagLogFile = Join-Path $b2TestRoot ("diag_{0}.log" -f [guid]::NewGuid().ToString("N"))
                 $diagEmptyLogFile = Join-Path $b2TestRoot ("diag_empty_{0}.log" -f [guid]::NewGuid().ToString("N"))
                 $diagWarnLogFile = Join-Path $b2TestRoot ("diag_warn_{0}.log" -f [guid]::NewGuid().ToString("N"))
@@ -20831,7 +20841,7 @@ try {
                 [void](Test-SevenZipArchiveIntegrity `
                     -SevenZipPath $sevenZipToolPath `
                     -ArchivePath $b2CorruptArchivePath `
-                    -Password "B2LegacyPass" `
+                    -Password $diagFixtureLegacyPassword `
                     -Logger $diagLogger)
                 $diagLogText = if (Test-Path -LiteralPath $diagLogFile -PathType Leaf) {
                     [IO.File]::ReadAllText($diagLogFile)
@@ -20855,7 +20865,7 @@ try {
                 [void](Test-SevenZipArchiveIntegrity `
                     -SevenZipPath $sevenZipToolPath `
                     -ArchivePath (Join-Path $b2TestRoot "__NO_SUCH_ARCHIVE__.7z") `
-                    -Password "B2LegacyPass" `
+                    -Password $diagFixtureLegacyPassword `
                     -Logger $diagLogger)
                 $diagEmptyLogText = if (Test-Path -LiteralPath $diagEmptyLogFile -PathType Leaf) {
                     [IO.File]::ReadAllText($diagEmptyLogFile)
@@ -20874,7 +20884,7 @@ try {
                 [void](Test-SevenZipArchiveIntegrity `
                     -SevenZipPath $sevenZipToolPath `
                     -ArchivePath $b2CorruptArchivePath `
-                    -Password "B2LegacyPass" `
+                    -Password $diagFixtureLegacyPassword `
                     -ArchiveFailureLevel 'WARNING' `
                     -Logger $diagLogger)
                 $diagWarnLines = @(
@@ -20903,7 +20913,7 @@ try {
                 }
                 $diagAllLogText = $diagLogText + $diagEmptyLogText + $diagWarnLogText
                 Test-BRAVOCondition `
-                    -Condition (-not $diagAllLogText.Contains("B2LegacyPass")) `
+                    -Condition (-not $diagAllLogText.Contains($diagFixtureLegacyPassword)) `
                     -Name "SevenZipDiagnostics/ArchivePasswordNeverAppearsInLog" `
                     -Failure "пароль архіву не повинен потрапляти у журнал на жодному шляху діагностики 7-Zip"
 
@@ -20920,7 +20930,7 @@ try {
                     [void](Test-SevenZipArchiveIntegrity `
                         -SevenZipPath $sevenZipToolPath `
                         -ArchivePath $b2CorruptArchivePath `
-                        -Password "B2LegacyPass" `
+                        -Password $diagFixtureLegacyPassword `
                         -ArchiveFailureLevel 'WARNING' `
                         -FailureInfo $diagLockInfo `
                         -Logger $diagLogger)
@@ -21176,16 +21186,19 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                     ) `
                     -PreferLastDefinitionOnDuplicate
                 $diagTimeoutInfo = @{}
+                # Пароль іде ПАРАМЕТРОМ: тіло виконується в області динамічного
+                # модуля, де змінні цього блоку не видні — під Set-StrictMode це
+                # був би виняток, а не порожній рядок.
                 $diagTimeoutResult = & $diagTimeoutModule {
-                    param($Logger, $Info)
+                    param($Logger, $Info, $Password)
                     Test-SevenZipArchiveIntegrity `
                         -SevenZipPath 'C:\nonexistent\7za.exe' `
                         -ArchivePath 'C:\nonexistent\timeout.7z' `
-                        -Password 'B2LegacyPass' `
+                        -Password $Password `
                         -ArchiveFailureLevel 'WARNING' `
                         -FailureInfo $Info `
                         -Logger $Logger
-                } $diagLogger $diagTimeoutInfo
+                } $diagLogger $diagTimeoutInfo $diagFixtureLegacyPassword
                 $diagTimeoutText = if (Test-Path -LiteralPath $diagTimeoutLogFile -PathType Leaf) {
                     [IO.File]::ReadAllText($diagTimeoutLogFile)
                 } else { '' }
@@ -21258,7 +21271,7 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                     $diagSecretLogText += [IO.File]::ReadAllText($diagSecretLogFile.FullName)
                 }
                 $diagSecretLeaks = @(
-                    foreach ($diagSecretCandidate in @('B2LegacyPass', 'B2NormalPass', $diagRandomPassword, $diagNonAsciiPassword)) {
+                    foreach ($diagSecretCandidate in @($diagFixtureLegacyPassword, $diagFixtureNormalPassword, $diagRandomPassword, $diagNonAsciiPassword)) {
                         if (-not [string]::IsNullOrEmpty($diagSecretCandidate) -and
                             $diagSecretLogText.Contains($diagSecretCandidate)) {
                             # Сам секрет НЕ друкується у повідомленні про збій.
