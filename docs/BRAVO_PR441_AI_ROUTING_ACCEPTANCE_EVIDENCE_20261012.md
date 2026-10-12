@@ -569,7 +569,8 @@ Merge, переведення з Draft, зміну GitHub Settings, release і �
 | 5 | **живе делегування** | `claude -p` у worktree, делегування `scout` | `2026-10-12 10:27:45 \| ALLOW \| tool=Agent \| agent=scout \| routing policy satisfied` | PASS |
 | 6 | негативний прогін моделі | те саме з `model: opus` | `BLOCK \| tool=Agent \| agent=scout \| model=opus \| role 'scout' is pinned to model 'haiku'` | PASS |
 | 7 | облік вартості | `.claude\logs\ai-cost.jsonl` | 31 запис, `agentCalls: {"scout":1}` у двох останніх сесіях | PASS |
-| 8 | повний self-test | `BRAVO_SELF_TEST.ps1 -NoPause` | 3581 `[PASS]`, «Усі перевірки BRAVO-Toolkit успішно пройдено» (підтверджено змістом логу CI-прогону `38220436409`) | PASS |
+| 8 | повний self-test (локально) | `BRAVO_SELF_TEST.ps1 -NoPause` | 3582 `[PASS]`, 0 `[FAIL]`, exit 0, «Усі перевірки BRAVO-Toolkit успішно пройдено» у `LOGS/HELPERS/BRAVO_SELF_TEST_20261012_110708_546_PID49836.log` | PASS |
+| 8a | повний self-test (CI) | job `BRAVO_SELF_TEST.ps1 (push)`, прогін `38220436409` | 3581 `[PASS]`, той самий канонічний фінальний рядок — перевірено **змістом логу**, не exit-кодом | PASS |
 
 Пункт 5 — не формальність: рядок `ALLOW | tool=Agent` доводить, що
 enforcement живий саме в змердженому стані. Якби на його місці був
