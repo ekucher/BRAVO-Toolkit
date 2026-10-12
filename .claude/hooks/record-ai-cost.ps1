@@ -16,6 +16,13 @@
                                   message.usage.cache_read_input_tokens,
         message.content[] з type="tool_use" -> name, input.subagent_type.
 
+    Додатково скрипт працює детектором перейменування інструмента делегування:
+    якщо в транскрипті є tool_use, вхід якого містить subagent_type, але name не
+    входить до відомого списку імен делегування, це означає, що PreToolUse-гейт
+    маршрутизації більше не бачить делегувань і enforcement тихо мертвий. Такий
+    випадок пишеться як ALERT у .claude/logs/ai-routing.log і як поле
+    unknownDelegationTools у записі ai-cost.jsonl.
+
     Облік — вторинний ефект. Будь-яка помилка тут не повинна впливати на
     сесію: скрипт завжди завершується кодом 0 і за потреби пише діагностику
     в .claude/logs/ai-cost-errors.log.
@@ -26,6 +33,12 @@ $ErrorActionPreference = 'Stop'
 
 $projectDir = $null
 $logDir = $null
+
+# Відомі імена інструмента делегування. 'Agent' — ім'я в Claude Code 2.1.x,
+# 'Task' — історичне ім'я. Список мусить лишатися синхронним із
+# $script:DelegationTools у validate-agent-routing.ps1 та з matcher-ом
+# PreToolUse у .claude/settings.json.
+$script:KnownDelegationTools = @('Agent', 'Task')
 
 function Write-CostError {
     param([string]$Message)
@@ -40,6 +53,22 @@ function Write-CostError {
     }
     catch {
         # свідомо проглочено: облік не має права ламати сесію
+    }
+}
+
+function Write-RoutingAlert {
+    param([string]$Message)
+
+    try {
+        if ($null -eq $logDir) { return }
+        if (-not (Test-Path -LiteralPath $logDir -PathType Container)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
+        $line = '{0} | ALERT | {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+        Add-Content -LiteralPath (Join-Path $logDir 'ai-routing.log') -Value $line -Encoding UTF8
+    }
+    catch {
+        # свідомо проглочено: детектор не має права ламати сесію
     }
 }
 
@@ -66,6 +95,7 @@ try {
     $models = New-Object 'System.Collections.Generic.HashSet[string]'
     $agentCalls = @{}
     $codexCalls = @{}
+    $unknownDelegationTools = @{}
     $fallbackReasons = New-Object 'System.Collections.Generic.HashSet[string]'
     $firstTimestamp = $null
     $lastTimestamp = $null
@@ -108,7 +138,7 @@ try {
             # 'Task' лишається для сумісності з версіями, де він називався так.
             # Доки тут був лише 'Task', облік делегувань у живій сесії завжди
             # виходив порожнім (live-прогін 2026-10-12).
-            if ($toolName -ceq 'Agent' -or $toolName -ceq 'Task') {
+            if ($script:KnownDelegationTools -ccontains $toolName) {
                 $agent = 'unspecified'
                 if ($null -ne $block.input -and -not [string]::IsNullOrWhiteSpace([string]$block.input.subagent_type)) {
                     $agent = [string]$block.input.subagent_type
@@ -130,6 +160,17 @@ try {
                 }
                 $key = ($toolName -replace '^mcp__codex-agent__', '') + ':' + $role
                 if ($codexCalls.ContainsKey($key)) { $codexCalls[$key]++ } else { $codexCalls[$key] = 1 }
+            }
+            elseif ($null -ne $block.input -and -not [string]::IsNullOrWhiteSpace([string]$block.input.subagent_type)) {
+                # Делегування під невідомим іменем інструмента: PreToolUse-гейт
+                # маршрутизації його не бачить, тобто enforcement мертвий.
+                # Саме цей клас дефекту був P1 у PR #441.
+                if ([string]::IsNullOrWhiteSpace($toolName)) { $toolName = 'unnamed' }
+                if ($unknownDelegationTools.ContainsKey($toolName)) {
+                    $unknownDelegationTools[$toolName]++
+                } else {
+                    $unknownDelegationTools[$toolName] = 1
+                }
             }
         }
     }
@@ -156,8 +197,18 @@ try {
         cacheReadTokens     = $cacheReadTokens
         agentCalls          = $agentCalls
         codexCalls          = $codexCalls
+        unknownDelegationTools = $unknownDelegationTools
         fallbackReasons     = @($fallbackReasons)
         durationMinutes     = $durationMinutes
+    }
+
+    foreach ($unknownTool in @($unknownDelegationTools.Keys | Sort-Object)) {
+        Write-RoutingAlert ("tool='" + $unknownTool + "' | calls=" + $unknownDelegationTools[$unknownTool] +
+            " | delegation tool is not in the known list (" + ($script:KnownDelegationTools -join ', ') +
+            "): the PreToolUse routing gate does not see delegations and enforcement is silently inactive." +
+            " Update `$script:DelegationTools in validate-agent-routing.ps1, the PreToolUse matcher in" +
+            " .claude/settings.json, enforcement.gatedTools in .claude/ai-routing.json and" +
+            " `$script:KnownDelegationTools in record-ai-cost.ps1.")
     }
 
     if (-not (Test-Path -LiteralPath $logDir -PathType Container)) {

@@ -198,6 +198,15 @@
     ],
     "failOpenNote": "If the hook itself fails, gate-critical roles are blocked and every other call is allowed with a loud [HOOK-ERROR] log entry.",
     "auditLog": ".claude/logs/ai-routing.log",
-    "costLog": ".claude/logs/ai-cost.jsonl"
+    "costLog": ".claude/logs/ai-cost.jsonl",
+    "driftDetector": {
+      "hook": ".claude/hooks/record-ai-cost.ps1",
+      "hookEvent": "Stop",
+      "note": "The Stop hook is the only component that sees the actual tool name recorded in the transcript. When a tool_use carries subagent_type but its name is outside the known delegation list, the PreToolUse gate never saw that delegation and enforcement was silently inactive for that session.",
+      "alertSink": ".claude/logs/ai-routing.log",
+      "alertPrefix": "ALERT",
+      "costField": "unknownDelegationTools",
+      "report": "Tools/Get-AICostReport.ps1"
+    }
   }
 }
