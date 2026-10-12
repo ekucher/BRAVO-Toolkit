@@ -50,6 +50,13 @@ BRAVO.local.config
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
+# Робочий каталог сторонньої аудит-прогонки (unlazy): власний формат звітів
+# і findings, не формат acceptance-доказів цього репозиторію. Лежить у корені
+# робочої копії й інакше постійно висить у git status, тобто є кандидатом на
+# випадковий `git add -A`.
+.unlazy/
+.unlazy.zip
+
 # Конфігурація MCP-серверів Claude Code — містить абсолютні шляхи до збірок
 # на КОНКРЕТНІЙ робочій станції (той самий клас, що BRAVO.local.config і
 # WinSCP.ini вище). Трекається лише шаблон .mcp.json.example; без локального
