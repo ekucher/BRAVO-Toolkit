@@ -660,6 +660,35 @@ ACCEPTANCE 1: the note matches the code
         Assert-Equal "worker write via device namespace '$devicePrefix' to a module is allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $deviceAllowed))
     }
 
+    # The device prefix may only be stripped when the remainder is
+    # drive-absolute. Otherwise the remainder looks relative and gets joined to
+    # cwd: '//?/GLOBALROOT/Device/HarddiskVolume3/.../BRAVO_AGENT_POLICY.md'
+    # with cwd '<root>/docs' would become
+    # 'docs/GLOBALROOT/Device/.../BRAVO_AGENT_POLICY.md', which passes the
+    # 'docs/*' allowlist while actually addressing the canonical policy.
+    $deviceSandboxTail = ($sandbox -replace '^[A-Za-z]:', '' -replace '\\', '/')
+    foreach ($deviceCase in @(
+            ('//?/GLOBALROOT/Device/HarddiskVolume3' + $deviceSandboxTail + '/BRAVO_AGENT_POLICY.md'),
+            ('\\?\GLOBALROOT\Device\HarddiskVolume3' + ($deviceSandboxTail -replace '/', '\') + '\BRAVO_AGENT_POLICY.md'),
+            '//?/UNC/localhost/C$/docs/policy.md',
+            '//?//?/C:/docs/policy.md',
+            '//?/C:',
+            '//./GLOBALROOT/Device/HarddiskVolume3/docs/policy.md'
+        )) {
+        foreach ($deviceRole in @('documentation', 'worker')) {
+            $devicePayloadBad = @{
+                session_id      = 'routing-test'
+                hook_event_name = 'PreToolUse'
+                tool_name       = 'Write'
+                cwd             = (Join-Path $sandbox 'docs')
+                agent_id        = 'agent-test'
+                agent_type      = $deviceRole
+                tool_input      = @{ file_path = $deviceCase; content = 'x' }
+            }
+            Assert-Equal "$deviceRole write to device path '$deviceCase' is blocked (remainder not drive-absolute)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $devicePayloadBad))
+        }
+    }
+
     # The project root never comes from the payload. With CLAUDE_PROJECT_DIR
     # unset the hook falls back to its own location, not to cwd — otherwise a
     # session whose cwd lies outside the repository would re-open SEC-002

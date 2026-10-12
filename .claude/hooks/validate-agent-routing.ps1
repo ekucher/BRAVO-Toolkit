@@ -309,8 +309,24 @@ function Resolve-WriteTargetPath {
     # написати той самий шлях, тому префікс знімаємо й розбираємо далі звичайно.
     # Без цього '//?/<корінь>/BRAVO_AGENT_POLICY.md' лишався б «неперевірним» і
     # давав би обхід deny-списку через аліас.
-    if ($raw -match '^//[?.]/UNC/') { $raw = '//' + $raw.Substring(8) }
-    elseif ($raw -match '^//[?.]/') { $raw = $raw.Substring(4) }
+    #
+    # Але зняти префікс можна ЛИШЕ тоді, коли залишок — drive-absolute
+    # ('C:/...'). Інакше залишок виглядав би відносним шляхом і склеювався з
+    # cwd: '//?/GLOBALROOT/Device/HarddiskVolume3/.../BRAVO_AGENT_POLICY.md' з
+    # cwd '<корінь>/docs' дало б 'docs/GLOBALROOT/Device/.../BRAVO_AGENT_POLICY.md',
+    # що проходить allow-патерн 'docs/*' і не відповідає deny-патерну на канон,
+    # хоча фактично адресує саме канонічну політику. Такий залишок —
+    # «неперевірний», тобто fail-closed.
+    if ($raw -match '^//[?.]/') {
+        $deviceRemainder = ''
+        if ($raw -match '^//[?.]/UNC/') { $deviceRemainder = '//' + $raw.Substring(8) }
+        else { $deviceRemainder = $raw.Substring(4) }
+
+        if ($deviceRemainder -notmatch '^[A-Za-z]:/') {
+            return [pscustomobject]@{ Status = 'unverifiable'; Relative = $raw }
+        }
+        $raw = $deviceRemainder
+    }
 
     if ($raw.StartsWith('//')) {
         # UNC. Може бути аліасом того самого локального шляху
