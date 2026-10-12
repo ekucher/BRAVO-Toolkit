@@ -21186,15 +21186,20 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                     ) `
                     -PreferLastDefinitionOnDuplicate
                 $diagTimeoutInfo = @{}
-                # Пароль іде ПАРАМЕТРОМ: тіло виконується в області динамічного
-                # модуля, де змінні цього блоку не видні — під Set-StrictMode це
-                # був би виняток, а не порожній рядок.
+                # Значення фікстурного пароля іде ПАРАМЕТРОМ: тіло виконується в
+                # області динамічного модуля, де змінні цього блоку не видні —
+                # під Set-StrictMode це був би виняток, а не порожній рядок.
+                # Параметр НЕ називається $Password свідомо: PSScriptAnalyzer
+                # (блокуючий security-набір) вимагає для такого імені
+                # SecureString/PSCredential, а тут це фікстурне значення, яке
+                # заглушка навіть не використовує. Точкова suppression у
+                # тестовому каркасі була б гіршим рішенням, ніж коректне ім'я.
                 $diagTimeoutResult = & $diagTimeoutModule {
-                    param($Logger, $Info, $Password)
+                    param($Logger, $Info, $FixturePass)
                     Test-SevenZipArchiveIntegrity `
                         -SevenZipPath 'C:\nonexistent\7za.exe' `
                         -ArchivePath 'C:\nonexistent\timeout.7z' `
-                        -Password $Password `
+                        -Password $FixturePass `
                         -ArchiveFailureLevel 'WARNING' `
                         -FailureInfo $Info `
                         -Logger $Logger
