@@ -1016,11 +1016,12 @@ function New-AssistantLine {
     param(
         [string]$ToolName,
         [string]$SubagentType,
-        [switch]$NoSubagentType
+        [switch]$NoSubagentType,
+        [string]$MarkerProperty = 'subagent_type'
     )
 
     $toolInput = @{ prompt = 'OBJECTIVE: bounded brief' }
-    if (-not $NoSubagentType) { $toolInput['subagent_type'] = $SubagentType }
+    if (-not $NoSubagentType) { $toolInput[$MarkerProperty] = $SubagentType }
 
     $entry = @{
         type      = 'assistant'
@@ -1100,7 +1101,34 @@ try {
         }
     }
 
-    # 5. Регістр імені має значення: 'agent' не є 'Agent'.
+    # 5. Перейменування самого маркера не має створювати тієї ж тихої дірки,
+    #    що й перейменування інструмента: ім'я властивості нормалізується.
+    foreach ($markerName in @('Subagent_Type', 'SubAgentType', 'SUBAGENT_TYPE')) {
+        $markerSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-marker-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-Item -ItemType Directory -Path (Join-Path $markerSandbox '.claude\logs') -Force | Out-Null
+            $marker = Invoke-CostHook -ProjectDir $markerSandbox -TranscriptLines @((New-AssistantLine -ToolName 'Dispatch' -SubagentType 'worker' -MarkerProperty $markerName))
+            Assert-True ("drifted tool with marker '{0}' raises an ALERT" -f $markerName) ($marker.RoutingLog -match 'ALERT') $marker.RoutingLog
+            Assert-True ("drifted tool with marker '{0}' produces a cost record" -f $markerName) ($null -ne $marker.Record)
+        }
+        finally {
+            Remove-Item -LiteralPath $markerSandbox -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # 6. Жодної хибної тривоги на властивість, яка лише схожа на маркер.
+    $lookalikeSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-lookalike-{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $lookalikeSandbox '.claude\logs') -Force | Out-Null
+        $lookalike = Invoke-CostHook -ProjectDir $lookalikeSandbox -TranscriptLines @((New-AssistantLine -ToolName 'Bash' -SubagentType 'worker' -MarkerProperty 'subagent_types'))
+        Assert-True 'a look-alike property name raises no ALERT' ($lookalike.RoutingLog -notmatch 'ALERT') $lookalike.RoutingLog
+        Assert-True 'a look-alike property name still produces a cost record' ($null -ne $lookalike.Record)
+    }
+    finally {
+        Remove-Item -LiteralPath $lookalikeSandbox -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # 7. Регістр імені інструмента має значення: 'agent' не є 'Agent'.
     $caseSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-case-{0}" -f [guid]::NewGuid().ToString('N'))
     try {
         New-Item -ItemType Directory -Path (Join-Path $caseSandbox '.claude\logs') -Force | Out-Null

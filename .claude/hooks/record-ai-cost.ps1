@@ -65,6 +65,12 @@ function Test-HasDelegationMarker {
         лишитись невидимим лише через зіпсоване значення роли (QA-001).
         Звичайні інструменти (Bash, Read, Write) цієї властивості не мають
         узагалі, тому хибних тривог перевірка наявності не додає.
+
+        Ім'я властивості нормалізується (нижній регістр, без підкреслень), щоб
+        перейменування схеми на Subagent_Type чи SubAgentType не створило тієї
+        самої тихої дірки, що й перейменування самого інструмента. Жоден
+        звичайний інструмент не має властивості, яка нормалізується в
+        'subagenttype', тому розширення не збільшує хибних тривог.
     #>
     param($Block)
 
@@ -77,7 +83,8 @@ function Test-HasDelegationMarker {
     if ($null -eq $properties) { return $false }
 
     foreach ($property in $properties) {
-        if ($property.Name -ceq 'subagent_type') { return $true }
+        $normalized = ([string]$property.Name).Replace('_', '').ToLowerInvariant()
+        if ($normalized -ceq 'subagenttype') { return $true }
     }
     return $false
 }
