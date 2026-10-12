@@ -259,6 +259,20 @@ if (Test-Path -LiteralPath $costHook -PathType Leaf) {
     if ($costHookText -notmatch "'Agent'") {
         $failures.Add("record-ai-cost.ps1 must count the 'Agent' delegation tool; counting only 'Task' reports zero delegations in a live session.")
     }
+
+    # The Stop hook is the only place that sees the ACTUAL tool name used in the
+    # transcript, so it must alert when a delegation arrives under a name the
+    # PreToolUse gate does not match. Without that detector the next rename
+    # silently disables routing enforcement again (PR #441, LIVE-1, P1).
+    if ($costHookText -notmatch 'unknownDelegationTools') {
+        $failures.Add('record-ai-cost.ps1 must record unknownDelegationTools: a delegation under an unmatched tool name means routing enforcement is silently inactive.')
+    }
+    if ($costHookText -notmatch 'KnownDelegationTools') {
+        $failures.Add('record-ai-cost.ps1 must keep an explicit KnownDelegationTools list to compare the transcript tool name against.')
+    }
+    if ($costHookText -notmatch 'ALERT') {
+        $failures.Add('record-ai-cost.ps1 must log an ALERT for an unknown delegation tool name so the drift is operator-visible in ai-routing.log.')
+    }
 }
 
 $documentationAgent = Join-Path $RepoRoot '.claude\agents\documentation.md'

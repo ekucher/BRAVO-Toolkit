@@ -925,10 +925,222 @@ try {
         Assert-Equal 'duration is not double counted' '15' ([string]$report.TotalMinutes)
         Assert-Equal 'codex calls come from the latest snapshot' '1' ([string]$report.CodexCalls['codex_delegate:qa'])
         Assert-Equal 'fallback reasons come from the latest snapshot' '1' ([string]$report.FallbackReasons['quota'])
+        Assert-True 'report exposes unknown delegation tools' ($null -ne $report.UnknownDelegationTools)
+        if ($null -ne $report.UnknownDelegationTools) {
+            Assert-Equal 'clean records report no unknown delegation tools' '0' ([string]$report.UnknownDelegationTools.Count)
+        }
+    }
+
+    # Запис із делегуванням під невідомим іменем мусить доходити до звіту:
+    # інакше ALERT у логу є, а зведення показує «все добре».
+    $driftLog = Join-Path $costLogDir 'ai-cost.jsonl'
+    Add-Content -LiteralPath $driftLog -Encoding UTF8 -Value '{"recordedAt":"2026-10-12T03:00:00.0000000+03:00","sessionId":"s3","models":["claude-opus-5"],"assistantTurns":1,"inputTokens":1,"outputTokens":1,"cacheCreationTokens":0,"cacheReadTokens":0,"agentCalls":{},"codexCalls":{},"unknownDelegationTools":{"Dispatch":2},"fallbackReasons":[],"durationMinutes":1.0}'
+    $driftReport = & $reportScript -RepoRoot $costSandbox -AsObject
+    Assert-True 'drift report returns an object' ($null -ne $driftReport)
+    if ($null -ne $driftReport) {
+        Assert-Equal 'unknown delegation tools are aggregated in the report' '2' ([string]$driftReport.UnknownDelegationTools['Dispatch'])
     }
 }
 finally {
     Remove-Item -LiteralPath $costSandbox -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- Delegation tool-name drift detector ---------------------------------
+#
+# Найтяжчий дефект PR #441 (LIVE-1, P1) полягав у тому, що інструмент
+# делегування називався 'Agent', а не 'Task': гейт маршрутизації не бачив
+# жодного делегування і enforcement був тихо мертвий. Stop-хук — єдине місце,
+# яке бачить ФАКТИЧНЕ ім'я інструмента в транскрипті, тому саме він мусить
+# кричати, якщо ім'я знову змінилось.
+
+$detectorHook = Join-Path $root '.claude\hooks\record-ai-cost.ps1'
+Assert-True 'cost/detector hook exists' (Test-Path -LiteralPath $detectorHook -PathType Leaf) $detectorHook
+
+function Invoke-CostHook {
+    <#
+        Запускає Stop-хук як дочірній процес зі справжнім транскриптом на диску
+        і повертає розібраний останній запис ai-cost.jsonl разом із текстом
+        ai-routing.log.
+    #>
+    param(
+        [string]$ProjectDir,
+        [string[]]$TranscriptLines
+    )
+
+    $transcriptPath = Join-Path $ProjectDir 'transcript.jsonl'
+    Set-Content -LiteralPath $transcriptPath -Value ($TranscriptLines -join "`r`n") -Encoding UTF8
+
+    $payload = @{
+        session_id      = 'detector-test'
+        hook_event_name = 'Stop'
+        cwd             = $ProjectDir
+        transcript_path = $transcriptPath
+    } | ConvertTo-Json -Depth 4 -Compress
+
+    $previous = $env:CLAUDE_PROJECT_DIR
+    $env:CLAUDE_PROJECT_DIR = $ProjectDir
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $payload | & powershell.exe -NoProfile -File $detectorHook *>$null
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+        if ($null -eq $previous) {
+            Remove-Item Env:\CLAUDE_PROJECT_DIR -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:CLAUDE_PROJECT_DIR = $previous
+        }
+    }
+
+    $record = $null
+    $costPath = Join-Path $ProjectDir '.claude\logs\ai-cost.jsonl'
+    if (Test-Path -LiteralPath $costPath -PathType Leaf) {
+        $lines = @(Get-Content -LiteralPath $costPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($lines.Count -gt 0) {
+            try { $record = $lines[$lines.Count - 1] | ConvertFrom-Json } catch { $record = $null }
+        }
+    }
+
+    $routingLog = ''
+    $routingPath = Join-Path $ProjectDir '.claude\logs\ai-routing.log'
+    if (Test-Path -LiteralPath $routingPath -PathType Leaf) {
+        $routingLog = Get-Content -LiteralPath $routingPath -Raw
+    }
+
+    return [pscustomobject]@{ Record = $record; RoutingLog = $routingLog }
+}
+
+function New-AssistantLine {
+    param(
+        [string]$ToolName,
+        [string]$SubagentType,
+        [switch]$NoSubagentType,
+        [string]$MarkerProperty = 'subagent_type'
+    )
+
+    $toolInput = @{ prompt = 'OBJECTIVE: bounded brief' }
+    if (-not $NoSubagentType) { $toolInput[$MarkerProperty] = $SubagentType }
+
+    $entry = @{
+        type      = 'assistant'
+        timestamp = '2026-10-12T10:00:00.000Z'
+        message   = @{
+            model   = 'claude-opus-5'
+            usage   = @{ input_tokens = 1; output_tokens = 2; cache_creation_input_tokens = 0; cache_read_input_tokens = 0 }
+            content = @(@{ type = 'tool_use'; name = $ToolName; input = $toolInput })
+        }
+    }
+    return ($entry | ConvertTo-Json -Depth 8 -Compress)
+}
+
+$detectorSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-{0}" -f [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $detectorSandbox '.claude\logs') -Force | Out-Null
+
+    # 1. Відоме ім'я — облік працює, ALERT не з'являється.
+    $known = Invoke-CostHook -ProjectDir $detectorSandbox -TranscriptLines @((New-AssistantLine -ToolName 'Agent' -SubagentType 'scout'))
+    Assert-True 'known delegation tool produces a cost record' ($null -ne $known.Record)
+    if ($null -ne $known.Record) {
+        Assert-Equal 'known delegation tool is counted per role' '1' ([string]$known.Record.agentCalls.scout)
+    }
+    Assert-True 'known delegation tool raises no ALERT' ($known.RoutingLog -notmatch 'ALERT') $known.RoutingLog
+
+    # 2. Невідоме ім'я з subagent_type — це і є тихо мертвий enforcement.
+    $drifted = Invoke-CostHook -ProjectDir $detectorSandbox -TranscriptLines @((New-AssistantLine -ToolName 'Dispatch' -SubagentType 'worker'))
+    Assert-True 'drifted delegation tool produces a cost record' ($null -ne $drifted.Record)
+    if ($null -ne $drifted.Record) {
+        Assert-Equal 'drifted delegation tool is recorded by name' '1' ([string]$drifted.Record.unknownDelegationTools.Dispatch)
+        Assert-True 'drifted delegation is not silently counted as a managed role' ($null -eq $drifted.Record.agentCalls.worker)
+    }
+    Assert-True 'drifted delegation tool raises an ALERT' ($drifted.RoutingLog -match 'ALERT') $drifted.RoutingLog
+    Assert-True 'ALERT names the unknown tool' ($drifted.RoutingLog -match "tool='Dispatch'") $drifted.RoutingLog
+    Assert-True 'ALERT names the files that must be updated' ($drifted.RoutingLog -match 'validate-agent-routing\.ps1') $drifted.RoutingLog
+
+    # 3. Жодних хибних тривог на звичайні інструменти без subagent_type.
+    $ordinarySandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-ok-{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $ordinarySandbox '.claude\logs') -Force | Out-Null
+        $ordinary = Invoke-CostHook -ProjectDir $ordinarySandbox -TranscriptLines @(
+            (New-AssistantLine -ToolName 'Bash' -NoSubagentType),
+            (New-AssistantLine -ToolName 'Read' -NoSubagentType)
+        )
+        Assert-True 'ordinary tools raise no ALERT' ($ordinary.RoutingLog -notmatch 'ALERT') $ordinary.RoutingLog
+        # Відсутність ALERT сама по собі не є доказом: якби хук упав на
+        # звичайному інструменті, лог теж був би порожній, і тест прийняв би
+        # втрату обліку за коректну поведінку (QA-002). Тому запис обліку —
+        # обов'язковий, а не умовний.
+        Assert-True 'ordinary tools still produce a cost record' ($null -ne $ordinary.Record)
+        if ($null -ne $ordinary.Record) {
+            Assert-Equal 'ordinary tools are still counted as assistant turns' '2' ([string]$ordinary.Record.assistantTurns)
+            Assert-True 'ordinary tools add no unknown delegation entries' (@($ordinary.Record.unknownDelegationTools.PSObject.Properties).Count -eq 0)
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $ordinarySandbox -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # 4. Зіпсоване значення роли не має приховувати дрейф імені: контракт
+    #    побудований на НАЯВНОСТІ subagent_type, а не на змістовності значення.
+    #    Доки предикат вимагав непорожнього рядка, делегування під невідомим
+    #    іменем із subagent_type="" проходило мовчки (QA-001).
+    foreach ($blankCase in @(@{ Label = 'empty'; Value = '' }, @{ Label = 'whitespace'; Value = '   ' })) {
+        $blankSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-blank-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-Item -ItemType Directory -Path (Join-Path $blankSandbox '.claude\logs') -Force | Out-Null
+            $blank = Invoke-CostHook -ProjectDir $blankSandbox -TranscriptLines @((New-AssistantLine -ToolName 'Dispatch' -SubagentType $blankCase.Value))
+            Assert-True ("drifted tool with {0} subagent_type still raises an ALERT" -f $blankCase.Label) ($blank.RoutingLog -match 'ALERT') $blank.RoutingLog
+            Assert-True ("drifted tool with {0} subagent_type produces a cost record" -f $blankCase.Label) ($null -ne $blank.Record)
+            if ($null -ne $blank.Record) {
+                Assert-Equal ("drifted tool with {0} subagent_type is recorded by name" -f $blankCase.Label) '1' ([string]$blank.Record.unknownDelegationTools.Dispatch)
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $blankSandbox -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # 5. Перейменування самого маркера не має створювати тієї ж тихої дірки,
+    #    що й перейменування інструмента: ім'я властивості нормалізується.
+    foreach ($markerName in @('Subagent_Type', 'SubAgentType', 'SUBAGENT_TYPE')) {
+        $markerSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-marker-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-Item -ItemType Directory -Path (Join-Path $markerSandbox '.claude\logs') -Force | Out-Null
+            $marker = Invoke-CostHook -ProjectDir $markerSandbox -TranscriptLines @((New-AssistantLine -ToolName 'Dispatch' -SubagentType 'worker' -MarkerProperty $markerName))
+            Assert-True ("drifted tool with marker '{0}' raises an ALERT" -f $markerName) ($marker.RoutingLog -match 'ALERT') $marker.RoutingLog
+            Assert-True ("drifted tool with marker '{0}' produces a cost record" -f $markerName) ($null -ne $marker.Record)
+        }
+        finally {
+            Remove-Item -LiteralPath $markerSandbox -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # 6. Жодної хибної тривоги на властивість, яка лише схожа на маркер.
+    $lookalikeSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-lookalike-{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $lookalikeSandbox '.claude\logs') -Force | Out-Null
+        $lookalike = Invoke-CostHook -ProjectDir $lookalikeSandbox -TranscriptLines @((New-AssistantLine -ToolName 'Bash' -SubagentType 'worker' -MarkerProperty 'subagent_types'))
+        Assert-True 'a look-alike property name raises no ALERT' ($lookalike.RoutingLog -notmatch 'ALERT') $lookalike.RoutingLog
+        Assert-True 'a look-alike property name still produces a cost record' ($null -ne $lookalike.Record)
+    }
+    finally {
+        Remove-Item -LiteralPath $lookalikeSandbox -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # 7. Регістр імені інструмента має значення: 'agent' не є 'Agent'.
+    $caseSandbox = Join-Path ([IO.Path]::GetTempPath()) ("bravo-detector-case-{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $caseSandbox '.claude\logs') -Force | Out-Null
+        $cased = Invoke-CostHook -ProjectDir $caseSandbox -TranscriptLines @((New-AssistantLine -ToolName 'agent' -SubagentType 'scout'))
+        Assert-True 'case-shifted delegation tool raises an ALERT' ($cased.RoutingLog -match 'ALERT') $cased.RoutingLog
+    }
+    finally {
+        Remove-Item -LiteralPath $caseSandbox -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+finally {
+    Remove-Item -LiteralPath $detectorSandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # --- Summary -------------------------------------------------------------
