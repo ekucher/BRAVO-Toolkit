@@ -62,10 +62,20 @@ $writeTarget = ''
 $payloadCwd = ''
 
 function Resolve-ProjectDir {
+    <#
+        Корінь проєкту НЕ беремо з payload: `cwd` — це робочий каталог виклику,
+        а не межа політики. Якби він ставав коренем, сесія з cwd поза
+        репозиторієм знову зробила б будь-який 'docs/...' дозволеним для роли з
+        allowlist (та сама вразливість, що SEC-002, лише через інший вхід).
+
+        Власне розташування хука завжди дає правильний корінь: файл лежить у
+        '<корінь>/.claude/hooks/', і саме цей корінь володіє політикою, яку хук
+        виконує. CLAUDE_PROJECT_DIR лишається першим джерелом — його ставить сам
+        Claude Code, а не payload інструмента.
+    #>
     param([string]$CwdFromPayload)
 
     if (-not [string]::IsNullOrWhiteSpace($env:CLAUDE_PROJECT_DIR)) { return $env:CLAUDE_PROJECT_DIR }
-    if (-not [string]::IsNullOrWhiteSpace($CwdFromPayload)) { return $CwdFromPayload }
     return (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 }
 
@@ -275,7 +285,16 @@ function Resolve-WriteTargetPath {
 
     $raw = ($Path -replace '\\', '/')
 
+    # Device-простори Win32 ('//?/C:/...', '//./C:/...') — це лише інший спосіб
+    # написати той самий шлях, тому префікс знімаємо й розбираємо далі звичайно.
+    # Без цього '//?/<корінь>/BRAVO_AGENT_POLICY.md' лишався б «неперевірним» і
+    # давав би обхід deny-списку через аліас.
+    if ($raw -match '^//[?.]/UNC/') { $raw = '//' + $raw.Substring(8) }
+    elseif ($raw -match '^//[?.]/') { $raw = $raw.Substring(4) }
+
     if ($raw.StartsWith('//')) {
+        # UNC. Може бути аліасом того самого локального шляху
+        # ('//localhost/E$/...'), тому зіставленню з коренем не піддається.
         return [pscustomobject]@{ Status = 'unverifiable'; Relative = $raw }
     }
     if ($raw.StartsWith('/')) {
@@ -513,21 +532,30 @@ if ($isWriteTool) {
 
     $resolved = Resolve-WriteTargetPath -Path $writeTarget -Cwd $payloadCwd -ProjectDir $projectDir
 
+    # 'unverifiable' — fail-closed для КОЖНОЇ керованої матрицею роли, не лише
+    # для ролі з allowlist. Форми drive-relative / корінь-диска / UNC можуть бути
+    # аліасом файлу з deny-списку ('//localhost/E$/<корінь>/BRAVO_AGENT_POLICY.md'),
+    # а жоден легітимний бриф таких форм не потребує. Пропускати їх означало б
+    # лишити обхід deny-списку рівно там, де його найлегше застосувати.
+    if ($resolved.Status -ceq 'unverifiable') {
+        Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
+            -Reason ("write target '$writeTarget' cannot be resolved to a path under the project root (drive-relative, drive-root or UNC form); blocked (fail-closed)")
+    }
+
     if ($resolved.Status -cne 'inside') {
-        # Ціль не зводиться до шляху під коренем проєкту: або форма шляху не
-        # дозволяє визначити цільову адресу, або ціль поза репозиторієм.
+        # Ціль поза коренем проєкту.
         #
         # Для ролі з allowlist це fail-closed: межа описана через те, що
-        # ДОЗВОЛЕНО, і неперевірена чи позарепозиторна ціль у неї не входить.
-        # Для ролі лише з deny-списком (worker/tester) межа все одно не в хуку,
-        # а в SCOPE задачі, і deny-список перелічує саме файли цього
-        # репозиторію — тому виклик пропускається з гучним записом у журнал.
+        # ДОЗВОЛЕНО, і позарепозиторна ціль у неї не входить. Для ролі лише з
+        # deny-списком (worker/tester) межа все одно не в хуку, а в SCOPE
+        # задачі, і deny-список перелічує саме файли ЦЬОГО репозиторію — тому
+        # виклик пропускається з гучним записом у журнал.
         if ($null -ne $writeRole.writeAllow) {
             Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model 'n/a' `
-                -Reason ("write target '$writeTarget' is " + $resolved.Status + " relative to the project root; role '$agentName' has a write allowlist, so it is blocked (fail-closed)")
+                -Reason ("write target '$writeTarget' is outside the project root; role '$agentName' has a write allowlist, so it is blocked (fail-closed)")
         }
         Write-RoutingLog -ProjectDir $projectDir -Decision 'ALLOW' -Tool $toolName -Agent $agentName -Model 'n/a' `
-            -Reason ('HOOK-ERROR: write target ''' + $writeTarget + ''' is ' + $resolved.Status + ' relative to the project root; deny-list-only role allowed (fail-open)')
+            -Reason ('HOOK-ERROR: write target ''' + $writeTarget + ''' is outside the project root; deny-list-only role allowed (fail-open)')
         exit 0
     }
 

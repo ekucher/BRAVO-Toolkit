@@ -546,26 +546,77 @@ try {
     }
 
     # Path forms whose target is decided by process state, not by the text, are
-    # unverifiable: fail-closed for an allowlisted role.
-    foreach ($ambiguous in @('C:policy.md', '/docs/policy.md', '//localhost/C$/docs/policy.md', '//?/C:/docs/policy.md')) {
-        $ambiguousPayload = @{
+    # unverifiable and fail closed for EVERY matrix-managed role — including the
+    # deny-list-only ones. A UNC or drive-root form can alias a file that is on
+    # the deny list ('//localhost/E$/<root>/BRAVO_AGENT_POLICY.md'), and no
+    # legitimate brief needs these spellings.
+    foreach ($ambiguous in @(
+            'C:policy.md',
+            '/docs/policy.md',
+            '/BRAVO_AGENT_POLICY.md',
+            '//localhost/C$/docs/policy.md',
+            ('//localhost/' + ($sandbox -replace '^([A-Za-z]):', '$1$') + '/BRAVO_AGENT_POLICY.md')
+        )) {
+        foreach ($anyRole in @('documentation', 'worker', 'tester')) {
+            $ambiguousPayload = @{
+                session_id      = 'routing-test'
+                hook_event_name = 'PreToolUse'
+                tool_name       = 'Write'
+                cwd             = $sandbox
+                agent_id        = 'agent-test'
+                agent_type      = $anyRole
+                tool_input      = @{ file_path = $ambiguous; content = 'x' }
+            }
+            Assert-Equal "$anyRole write to ambiguous path '$ambiguous' is blocked (fail-closed)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $ambiguousPayload))
+        }
+    }
+
+    # Win32 device namespaces are only another spelling of the same path, so the
+    # prefix is stripped and the target is judged normally. Without that, a
+    # deny-listed file reached under '//?/<root>/...' would be merely
+    # "unverifiable" and a deny-list-only role would have slipped through.
+    foreach ($devicePrefix in @('//?/', '//./')) {
+        $devicePayload = @{
             session_id      = 'routing-test'
             hook_event_name = 'PreToolUse'
             tool_name       = 'Write'
             cwd             = $sandbox
             agent_id        = 'agent-test'
-            agent_type      = 'documentation'
-            tool_input      = @{ file_path = $ambiguous; content = 'x' }
+            agent_type      = 'worker'
+            tool_input      = @{ file_path = ($devicePrefix + ($sandbox -replace '\\', '/') + '/BRAVO_AGENT_POLICY.md'); content = 'x' }
         }
-        Assert-Equal "documentation write to ambiguous path '$ambiguous' is blocked (fail-closed)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $ambiguousPayload))
+        Assert-Equal "worker write via device namespace '$devicePrefix' is blocked (prefix stripped, deny applies)" '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $devicePayload))
+
+        $deviceAllowed = @{
+            session_id      = 'routing-test'
+            hook_event_name = 'PreToolUse'
+            tool_name       = 'Write'
+            cwd             = $sandbox
+            agent_id        = 'agent-test'
+            agent_type      = 'worker'
+            tool_input      = @{ file_path = ($devicePrefix + ($sandbox -replace '\\', '/') + '/modules/BRAVO.Archive/BRAVO.Archive.psm1'); content = 'x' }
+        }
+        Assert-Equal "worker write via device namespace '$devicePrefix' to a module is allowed" '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload $deviceAllowed))
     }
 
+    # The project root never comes from the payload. With CLAUDE_PROJECT_DIR
+    # unset the hook falls back to its own location, not to cwd — otherwise a
+    # session whose cwd lies outside the repository would re-open SEC-002
+    # through a different input.
+    $unsetRootPayload = @{
+        session_id      = 'routing-test'
+        hook_event_name = 'PreToolUse'
+        tool_name       = 'Write'
+        cwd             = $outsideRoot
+        agent_id        = 'agent-test'
+        agent_type      = 'documentation'
+        tool_input      = @{ file_path = (Join-Path $outsideRoot 'docs\policy.md'); content = 'x' }
+    }
+    Assert-Equal 'cwd is not the project root when CLAUDE_PROJECT_DIR is unset' '2' ([string](Invoke-RoutingHook -ProjectDir '' -Payload $unsetRootPayload))
+
     # Unresolvable target: a write call whose payload carries no path field the
-    # hook recognizes. A read-only role must still be blocked — otherwise the
-    # bypass is simply "send a field name the hook does not know". A role with
-    # an allowlist is blocked too, because its boundary is defined by what IS
-    # permitted, and an unverifiable target is not in it. A deny-list-only role
-    # is allowed, since its real boundary is the task SCOPE either way.
+    # hook recognizes. Every matrix-managed role is blocked — otherwise the
+    # bypass is simply "send a field name the hook does not know".
     $noTargetPayload = {
         param([string]$AgentType)
 
@@ -585,7 +636,8 @@ try {
     Assert-Equal 'unresolvable write target still blocks reviewer' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (& $noTargetPayload 'reviewer')))
     Assert-Equal 'unresolvable write target still blocks architect' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (& $noTargetPayload 'architect')))
     Assert-Equal 'unresolvable write target blocks an allowlisted role (fail-closed)' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (& $noTargetPayload 'documentation')))
-    Assert-Equal 'unresolvable write target allows a deny-list-only role (fail-open)' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (& $noTargetPayload 'worker')))
+    Assert-Equal 'unresolvable write target blocks a deny-list-only role too (fail-closed)' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (& $noTargetPayload 'worker')))
+    Assert-Equal 'unresolvable write target blocks tester too (fail-closed)' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (& $noTargetPayload 'tester')))
     Assert-Equal 'unresolvable write target in the main session is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (& $noTargetPayload '')))
 
     # KNOWN LIMITATION, pinned on purpose: Bash is not gated. Inspecting an
