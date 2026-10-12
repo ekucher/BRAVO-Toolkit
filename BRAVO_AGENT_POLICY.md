@@ -113,6 +113,13 @@ Use additional Codex roles when the change warrants them:
 
 A Claude `reviewer` may be used earlier as an internal pre-review, but a successful internal review is not represented as a Codex review.
 
+The bridge is configured per workstation in `.mcp.json`, which is deliberately
+untracked because it carries absolute paths to a local `claude-codex-a2a` build.
+Copy `.mcp.json.example` and substitute the real path. A missing or misconfigured
+`.mcp.json` means the Codex gates are simply unreachable on that machine — that is
+a configuration defect to fix, and section 8.2 does **not** permit it as a fallback
+reason.
+
 ### 8.2 Temporary Claude QA fallback when Codex is unavailable by limits
 
 If Codex QA cannot run **specifically because of quota/usage limit, rate limit, or temporary Codex service unavailability**, a fresh Claude Code `reviewer` may temporarily satisfy the **QA role only**.

@@ -49,3 +49,9 @@ BRAVO.local.config
 .claude/worktrees/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Конфігурація MCP-серверів Claude Code — містить абсолютні шляхи до збірок
+# на КОНКРЕТНІЙ робочій станції (той самий клас, що BRAVO.local.config і
+# WinSCP.ini вище). Трекається лише шаблон .mcp.json.example; без локального
+# .mcp.json bridge codex-agent не стартує й гейти codex-* недосяжні.
+.mcp.json
