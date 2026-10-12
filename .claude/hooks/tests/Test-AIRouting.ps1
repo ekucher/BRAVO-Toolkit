@@ -457,6 +457,31 @@ try {
     Assert-Equal 'general-purpose agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'general-purpose' -Model 'haiku')))
     Assert-Equal 'plugin agent is ignored' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'pr-review-toolkit:code-reviewer' -Model 'opus')))
 
+    # 5e) The SCOPE block must end at the next uppercase key even when that key
+    # carries a number or a space ('STEP 1:'). A live run showed a legitimate
+    # brief blocked because the block stayed open and the following prose was
+    # parsed as write targets — the first "path" was the word STEP.
+    $stepBrief = @'
+OBJECTIVE: update the design note
+SCOPE: docs/BRAVO_HEALTH_FUTURE_MONITORING_DESIGN.md
+STEP 1: read the current note and the diff
+STEP 2: rewrite only the section that is now false
+ACCEPTANCE 1: the note matches the code
+'@
+    Assert-Equal 'SCOPE block ends at a numbered uppercase key (STEP 1:)' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt $stepBrief)))
+
+    $spacedKeyBrief = "OBJECTIVE: tidy`nSCOPE: CHANGELOG.md`nNEXT ACTION: hand back to the orchestrator`nRISK NOTES: none"
+    Assert-Equal 'SCOPE block ends at a multi-word uppercase key' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt $spacedKeyBrief)))
+
+    # ...but a drive-qualified path on its own line must NOT be mistaken for a
+    # key, or everything after it would escape the boundary check entirely.
+    $driveLineBrief = "OBJECTIVE: tidy`nSCOPE: CHANGELOG.md`nC:/BRAVO/docs/x.md`nBRAVO_AGENT_POLICY.md"
+    Assert-Equal 'a drive-qualified line does not close the SCOPE block' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt $driveLineBrief)))
+
+    # A lowercase or mixed-case line is a path, never a key.
+    $mixedLineBrief = "OBJECTIVE: tidy`nSCOPE: CHANGELOG.md`ndocs/module.psm1:hidden"
+    Assert-Equal 'an NTFS-stream path line does not close the SCOPE block' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'documentation' -Model 'sonnet' -Prompt $mixedLineBrief)))
+
     # 6b) The delegation tool name. Every assertion above runs under tool_name
     # 'Agent', which is what a real Claude Code 2.1.x session sends — the live
     # run on 2026-10-12 recorded exactly `tool=Agent` in ai-routing.log. While
