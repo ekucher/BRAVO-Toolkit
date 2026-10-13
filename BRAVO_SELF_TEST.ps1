@@ -633,6 +633,28 @@ function Write-BRAVOSelfTestFixtureBanner {
     }
 }
 
+# Пришвидшення self-test: memo індексу визначень функцій для
+# New-BRAVOSelfTestRuntimeModule. Ті самі великі runtime-тексти (Health/
+# Maintenance/Archive) передаються в неї десятки разів, і кожен виклик
+# розбирав текст заново, а потім робив окремий повний scriptblock-обхід
+# дерева на КОЖНЕ ім'я функції.
+#
+# Чому це безпечно: ключ — ПОВНИЙ текст SourceText (словник з
+# StringComparer.Ordinal: хеш лише прискорює пошук, збіг підтверджується
+# точним порівнянням рядків), а ParseInput — чиста функція тексту. Тож будь-
+# яка зміна тексту (інша заглушка, фікстура, мутація) дає новий розбір.
+# Зберігаються лише незмінні рядки: імена й Extent.Text усіх визначень у
+# порядку обходу FindAll — сам AST, модулі й scriptblock-и не кешуються,
+# New-Module (і реєстрація власності) виконується на кожен виклик, як і
+# раніше. Текст із синтаксичними помилками не запам'ятовується: кожен
+# виклик розбирає його й кидає той самий виняток. Кеш живе лише в пам'яті
+# цього процесу. Створюється без New-Object: під час suite ця команда може
+# бути підмінена заглушкою.
+$script:BRAVOSelfTestRuntimeDefinitionIndexCache = [Activator]::CreateInstance(
+    [System.Collections.Generic.Dictionary[string, object]],
+    [object[]]@([StringComparer]::Ordinal)
+)
+
 function New-BRAVOSelfTestRuntimeModule {
     param(
         [Parameter(Mandatory = $true)][string]$SourceText,
@@ -652,40 +674,51 @@ function New-BRAVOSelfTestRuntimeModule {
         [switch]$PreferLastDefinitionOnDuplicate
     )
 
-    $tokens = $null
-    $errors = $null
-    $ast = [Management.Automation.Language.Parser]::ParseInput(
-        $SourceText,
-        [ref]$tokens,
-        [ref]$errors
-    )
-    if ($errors.Count -gt 0) {
-        throw "не вдалося підготувати runtime-тести: $(
-            ($errors | ForEach-Object { $_.Message }) -join ' | '
-        )"
+    # Індекс визначень — див. коментар біля
+    # $script:BRAVOSelfTestRuntimeDefinitionIndexCache вище.
+    $definitionIndex = $null
+    if (-not $script:BRAVOSelfTestRuntimeDefinitionIndexCache.TryGetValue($SourceText, [ref]$definitionIndex)) {
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput(
+            $SourceText,
+            [ref]$tokens,
+            [ref]$errors
+        )
+        if ($errors.Count -gt 0) {
+            throw "не вдалося підготувати runtime-тести: $(
+                ($errors | ForEach-Object { $_.Message }) -join ' | '
+            )"
+        }
+        # Один обхід дерева зі скомпільованим предикатом типу замість
+        # окремого scriptblock-обходу на кожне ім'я. Порядок FindAll той
+        # самий (прямий обхід, з вкладеними визначеннями), тож перше/останнє
+        # визначення з тим самим ім'ям лишається тим самим.
+        $allDefinitionAsts = @($ast.FindAll(
+                (Get-BRAVOSelfTestAstTypePredicate -Type @([Management.Automation.Language.FunctionDefinitionAst])),
+                $true))
+        $definitionIndex = [pscustomobject]@{
+            Names = [string[]]@(foreach ($definitionAst in $allDefinitionAsts) { $definitionAst.Name })
+            Texts = [string[]]@(foreach ($definitionAst in $allDefinitionAsts) { $definitionAst.Extent.Text })
+        }
+        $script:BRAVOSelfTestRuntimeDefinitionIndexCache[$SourceText] = $definitionIndex
     }
 
     $definitions = @()
     foreach ($functionName in $FunctionNames) {
-        $matchingDefinitions = @(
-            $ast.FindAll(
-                {
-                    param($candidate)
-                    $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
-                    $candidate.Name -eq $functionName
-                },
-                $true
-            )
-        )
-        $functionAst = if ($PreferLastDefinitionOnDuplicate) {
-            $matchingDefinitions | Select-Object -Last 1
-        } else {
-            $matchingDefinitions | Select-Object -First 1
+        # Той самий оператор -eq (Name -eq ім'я), що й у колишньому
+        # scriptblock-предикаті; без прапорця — перший збіг, з ним — останній.
+        $functionText = $null
+        for ($definitionPosition = 0; $definitionPosition -lt $definitionIndex.Names.Length; $definitionPosition++) {
+            if ($definitionIndex.Names[$definitionPosition] -eq $functionName) {
+                $functionText = $definitionIndex.Texts[$definitionPosition]
+                if (-not $PreferLastDefinitionOnDuplicate) { break }
+            }
         }
-        if ($null -eq $functionAst) {
+        if ($null -eq $functionText) {
             throw "функцію '$functionName' не знайдено для runtime-тесту"
         }
-        $definitions += $functionAst.Extent.Text
+        $definitions += $functionText
     }
 
     $runtimeModule = New-Module -ScriptBlock {
@@ -2126,13 +2159,12 @@ function Get-BRAVOSelfTestOwnSourceText {
 function Get-BRAVOSelfTestOwnSourceAst {
     Reset-BRAVOSelfTestOwnSourceMemoIfStale
     if ($null -eq $script:BRAVOSelfTestOwnSourceAst) {
-        $ownTokens = $null
-        $ownErrors = $null
-        $script:BRAVOSelfTestOwnSourceAst = [Management.Automation.Language.Parser]::ParseFile(
-            $PSCommandPath,
-            [ref]$ownTokens,
-            [ref]$ownErrors
-        )
+        # Той самий ParseFile($PSCommandPath), але з кешу прогону
+        # (Get-BRAVOSelfTestParsedFile нижче): Root/Parser уже розібрав цей
+        # файл, тож другий розбір найбільшого файлу комплекту зайвий. Кеш
+        # ключується тим самим шляхом + часом модифікації + розміром, що й
+        # цей memo; AST незмінний, тож спільний екземпляр безпечний.
+        $script:BRAVOSelfTestOwnSourceAst = (Get-BRAVOSelfTestParsedFile -Path $PSCommandPath).Ast
     }
     return $script:BRAVOSelfTestOwnSourceAst
 }
@@ -2180,6 +2212,76 @@ function Get-BRAVOSelfTestParsedFile {
     }
     $script:BRAVOSelfTestParsedFileCache[$cacheKey] = $entry
     return $entry
+}
+
+# Заміна для Parser::ParseFile(Path, [ref]Tokens, [ref]Errors) у місцях,
+# що розбирають файли репозиторію: той самий AST, Tokens і Errors, але з
+# кешу прогону вище (ті самі файли вже розібрав Root/Parser). Файли
+# репозиторію під час прогону не змінюються; фікстури, що пишуть тимчасові
+# файли, і далі розбирають їх напряму. Відсутній файл розбирається напряму,
+# як і раніше, — без винятку Get-Item, щоб шлях відмови не змінився.
+function Get-BRAVOSelfTestParsedFileAst {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ref]$Tokens,
+        [ref]$Errors
+    )
+    if (-not [IO.File]::Exists($Path)) {
+        $directTokens = $null
+        $directErrors = $null
+        $directAst = [Management.Automation.Language.Parser]::ParseFile($Path, [ref]$directTokens, [ref]$directErrors)
+        if ($null -ne $Tokens) { $Tokens.Value = $directTokens }
+        if ($null -ne $Errors) { $Errors.Value = $directErrors }
+        return $directAst
+    }
+    $parsedEntry = Get-BRAVOSelfTestParsedFile -Path $Path
+    if ($null -ne $Tokens) { $Tokens.Value = $parsedEntry.Tokens }
+    if ($null -ne $Errors) { $Errors.Value = $parsedEntry.Errors }
+    return $parsedEntry.Ast
+}
+
+# ============================================================
+# Пришвидшення self-test: memo розбору ТЕКСТУ на прогін.
+#
+# Кілька перевірок розбирають той самий великий runtime-текст (Maintenance/
+# Archive/Health) через Parser::ParseInput кожна заново. Get-BRAVOSelfTest-
+# ParsedText — заміна ParseInput(Text, [ref]Tokens, [ref]Errors) з тим самим
+# результатом.
+#
+# Чому це безпечно: ключ — ПОВНИЙ текст (словник з StringComparer.Ordinal:
+# хеш лише прискорює пошук, збіг підтверджується точним порівнянням
+# рядків), а ParseInput — чиста функція тексту, тож будь-яка зміна тексту
+# дає новий розбір. AST незмінний; Tokens і Errors зберігаються разом з ним
+# (включно з розбором, що дав помилки) і віддаються ті самі. Кеш живе лише
+# в пам'яті процесу. Створюється без New-Object: під час suite ця команда
+# може бути підмінена заглушкою.
+# ============================================================
+$script:BRAVOSelfTestParsedTextCache = [Activator]::CreateInstance(
+    [System.Collections.Generic.Dictionary[string, object]],
+    [object[]]@([StringComparer]::Ordinal)
+)
+
+function Get-BRAVOSelfTestParsedText {
+    param(
+        [string]$Text,
+        [ref]$Tokens,
+        [ref]$Errors
+    )
+    $parsedEntry = $null
+    if (-not $script:BRAVOSelfTestParsedTextCache.TryGetValue($Text, [ref]$parsedEntry)) {
+        $parseTokens = $null
+        $parseErrors = $null
+        $parsedAst = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$parseTokens, [ref]$parseErrors)
+        $parsedEntry = [pscustomobject]@{
+            Ast    = $parsedAst
+            Tokens = $parseTokens
+            Errors = $parseErrors
+        }
+        $script:BRAVOSelfTestParsedTextCache[$Text] = $parsedEntry
+    }
+    if ($null -ne $Tokens) { $Tokens.Value = $parsedEntry.Tokens }
+    if ($null -ne $Errors) { $Errors.Value = $parsedEntry.Errors }
+    return $parsedEntry.Ast
 }
 
 # FindAll викликає предикат на КОЖНОМУ вузлі дерева, і саме виклики
@@ -2552,8 +2654,9 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1',
                 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1')) {
             $tls12RuntimeParseErrors = $null
-            $tls12RuntimeAst = [Management.Automation.Language.Parser]::ParseFile(
-                (Join-Path $root $tls12RuntimeRelativePath), [ref]$null, [ref]$tls12RuntimeParseErrors)
+            # Через кеш розбору прогону (Get-BRAVOSelfTestParsedFileAst): файл репо вже розібрано.
+            $tls12RuntimeAst = Get-BRAVOSelfTestParsedFileAst `
+                -Path (Join-Path $root $tls12RuntimeRelativePath) -Errors ([ref]$tls12RuntimeParseErrors)
             # Лише виклик у тілі runtime (не всередині допоміжної функції): саме
             # він виконується на старті runtime перед webhook-ами. Тіло runtime
             # обгорнуте зовнішнім try/finally, тому шукаємо не лише серед
@@ -2578,8 +2681,8 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             }
         }
         $tls12DryRunParseErrors = $null
-        $tls12DryRunAst = [Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $root 'BRAVO_DRY_RUN.ps1'), [ref]$null, [ref]$tls12DryRunParseErrors)
+        $tls12DryRunAst = Get-BRAVOSelfTestParsedFileAst `
+            -Path (Join-Path $root 'BRAVO_DRY_RUN.ps1') -Errors ([ref]$tls12DryRunParseErrors)
         $tls12DryRunFunction = @($tls12DryRunAst.FindAll({
                     param($candidate)
                     $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -3334,8 +3437,9 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $phase0SyntaxTokens = $null
             $phase0SyntaxErrors = $null
             if ([IO.File]::Exists($phase0SyntaxTargetPath)) {
-                [void][Management.Automation.Language.Parser]::ParseFile(
-                    $phase0SyntaxTargetPath, [ref]$phase0SyntaxTokens, [ref]$phase0SyntaxErrors)
+                # Той самий розбір (і ті самі Errors) з кешу прогону.
+                [void](Get-BRAVOSelfTestParsedFileAst -Path $phase0SyntaxTargetPath `
+                        -Tokens ([ref]$phase0SyntaxTokens) -Errors ([ref]$phase0SyntaxErrors))
             } else {
                 $phase0SyntaxErrors = @([pscustomobject]@{ Message = "файл відсутній: $phase0SyntaxTarget" })
             }
@@ -5538,8 +5642,10 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Failure "чанкер Discord: порожнє/null -> одна порожня частина, рівно MaximumLength -> одна частина, +1 символ -> дві, MaximumLength < 100 відхиляється; отримано: empty=$($discordEmptyChunks.Count) null=$($discordNullChunks.Count) exact=$($discordExactChunks.Count) over=$($discordOverChunks.Count) rangeRejected=$discordRangeRejected"
     $discordChunkerDefinitions = New-Object System.Collections.Generic.List[string]
     foreach ($productionScript in @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -File -Include '*.ps1', '*.psm1')) {
-        $productionAst = [Management.Automation.Language.Parser]::ParseFile($productionScript.FullName, [ref]$null, [ref]$null)
-        foreach ($functionAst in @($productionAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+        # Кеш розбору прогону + скомпільований предикат того самого типу
+        # (ім'я далі перевіряється так само, як і раніше).
+        $productionAst = Get-BRAVOSelfTestParsedFileAst -Path $productionScript.FullName
+        foreach ($functionAst in @($productionAst.FindAll((Get-BRAVOSelfTestAstTypePredicate -Type @([Management.Automation.Language.FunctionDefinitionAst])), $true))) {
             if ($functionAst.Name -match '^(global:|script:)?Split-DiscordNotificationText$') {
                 [void]$discordChunkerDefinitions.Add("$($productionScript.Name): $($functionAst.Name)")
             }
@@ -6846,10 +6952,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # найденого вузла присвоєння (не переписаною вручну копією логіки).
     $maintenanceRuntimeTokensForOverride = $null
     $maintenanceRuntimeParseErrorsForOverride = $null
-    $maintenanceRuntimeAstForOverride = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceRuntimeSourceForSeverity,
-        [ref]$maintenanceRuntimeTokensForOverride,
-        [ref]$maintenanceRuntimeParseErrorsForOverride)
+    # Memo розбору тексту (Get-BRAVOSelfTestParsedText): той самий ParseInput.
+    $maintenanceRuntimeAstForOverride = Get-BRAVOSelfTestParsedText `
+        -Text $maintenanceRuntimeSourceForSeverity `
+        -Tokens ([ref]$maintenanceRuntimeTokensForOverride) `
+        -Errors ([ref]$maintenanceRuntimeParseErrorsForOverride)
     $effectiveModeAssignmentAst = @(
         $maintenanceRuntimeAstForOverride.FindAll(
             {
@@ -9214,7 +9321,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # (кореневі BRAVO_*.ps1 окрім self-test, modules\, deploy\). Дозволений
     # шлях запису в stdin дочірнього процесу — лише Write-BRAVOProcessInputText
     # (BaseStream, UTF-8 без BOM). Діагностика — лише файл:рядок.
-    $archiveStdinAst = [Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
+    $archiveStdinAst = Get-BRAVOSelfTestParsedText -Text $archiveScriptText
     $archiveStdinHelperCalls = @($archiveStdinAst.FindAll({
         param($node)
         $node -is [Management.Automation.Language.CommandAst] -and
@@ -13428,7 +13535,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         )
     # Клаузу "LocalSynchronization" журнального switch-а в Invoke-BRAVOHealth
     # виконуємо як є (AST), бо це інлайн-код, а не функція.
-    $localSyncLogAst = [Management.Automation.Language.Parser]::ParseInput($healthScriptText, [ref]$null, [ref]$null)
+    $localSyncLogAst = Get-BRAVOSelfTestParsedText -Text $healthScriptText
     $localSyncLogClauseText = ''
     foreach ($localSyncSwitch in @($localSyncLogAst.FindAll({ param($node) $node -is [Management.Automation.Language.SwitchStatementAst] }, $true))) {
         foreach ($localSyncClause in $localSyncSwitch.Clauses) {
@@ -14635,8 +14742,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # (інакше забутий параметр мовчки перестав би доходити до тіла).
     $dataRestoreRuntimePathForWrapper = Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"
     $dataRestoreWrapperParseErrors = $null
-    $dataRestoreWrapperAst = [Management.Automation.Language.Parser]::ParseFile(
-        $dataRestoreRuntimePathForWrapper, [ref]$null, [ref]$dataRestoreWrapperParseErrors)
+    $dataRestoreWrapperAst = Get-BRAVOSelfTestParsedFileAst `
+        -Path $dataRestoreRuntimePathForWrapper -Errors ([ref]$dataRestoreWrapperParseErrors)
     $dataRestoreWrapperTopStatements = @($dataRestoreWrapperAst.EndBlock.Statements)
     $dataRestoreWrapperFunctions = @($dataRestoreWrapperTopStatements | Where-Object {
             $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVODataRestore'
@@ -14831,8 +14938,8 @@ try {
     $maintenanceWrapperCheck = & {
         $wrapperRuntimePath = Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"
         $wrapperParseErrors = $null
-        $wrapperAst = [Management.Automation.Language.Parser]::ParseFile(
-            $wrapperRuntimePath, [ref]$null, [ref]$wrapperParseErrors)
+        $wrapperAst = Get-BRAVOSelfTestParsedFileAst `
+            -Path $wrapperRuntimePath -Errors ([ref]$wrapperParseErrors)
         $wrapperTopStatements = @($wrapperAst.EndBlock.Statements)
         $wrapperFunctions = @($wrapperTopStatements | Where-Object {
                 $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVOMaintenance'
@@ -16736,8 +16843,8 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
     # режиму, визначеного Test-Compatibility).
     $archiveRuntimePathForWrapper = Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"
     $archiveWrapperParseErrors = $null
-    $archiveWrapperAst = [Management.Automation.Language.Parser]::ParseFile(
-        $archiveRuntimePathForWrapper, [ref]$null, [ref]$archiveWrapperParseErrors)
+    $archiveWrapperAst = Get-BRAVOSelfTestParsedFileAst `
+        -Path $archiveRuntimePathForWrapper -Errors ([ref]$archiveWrapperParseErrors)
     $archiveWrapperTopStatements = @($archiveWrapperAst.EndBlock.Statements)
     $archiveWrapperFunctions = @($archiveWrapperTopStatements | Where-Object {
             $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVOArchive'
@@ -21475,7 +21582,7 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
     )
     foreach ($sz394File in $sz394ModuleFiles) {
         $sz394ParseErrors = $null
-        $sz394Ast = [Management.Automation.Language.Parser]::ParseFile($sz394File.FullName, [ref]$null, [ref]$sz394ParseErrors)
+        $sz394Ast = Get-BRAVOSelfTestParsedFileAst -Path $sz394File.FullName -Errors ([ref]$sz394ParseErrors)
         $sz394Strings = @($sz394Ast.FindAll({
                     param($candidate)
                     if (-not ($candidate -is [Management.Automation.Language.StringConstantExpressionAst] -or
@@ -22635,11 +22742,10 @@ function Get-BRAVOMaintenanceSummaryResult {
     # літералом 8, не виразом (5+optional/9+optional/dynamic тощо).
     $maintenanceStepTotalTokens = $null
     $maintenanceStepTotalErrors = $null
-    $maintenanceStepTotalAst = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceScriptText,
-        [ref]$maintenanceStepTotalTokens,
-        [ref]$maintenanceStepTotalErrors
-    )
+    $maintenanceStepTotalAst = Get-BRAVOSelfTestParsedText `
+        -Text $maintenanceScriptText `
+        -Tokens ([ref]$maintenanceStepTotalTokens) `
+        -Errors ([ref]$maintenanceStepTotalErrors)
     $maintenanceInitStepsCallAst = $maintenanceStepTotalAst.Find(
         {
             param($candidate)
@@ -24043,14 +24149,13 @@ function Get-BRAVOMaintenanceSummaryResult {
     # виклику. Окремо (AST): Main рахує сесії в $restoreArchiveGroupCount.
     $retention424GateTokens = $null
     $retention424GateErrors = $null
-    $retention424GateAst = [Management.Automation.Language.Parser]::ParseInput(
-        [IO.File]::ReadAllText(
+    $retention424GateAst = Get-BRAVOSelfTestParsedText `
+        -Text ([IO.File]::ReadAllText(
             (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
             [Text.Encoding]::UTF8
-        ),
-        [ref]$retention424GateTokens,
-        [ref]$retention424GateErrors
-    )
+        )) `
+        -Tokens ([ref]$retention424GateTokens) `
+        -Errors ([ref]$retention424GateErrors)
     # Найближчий if-предок кожного виклику Remove-OldRestoreArchives поза
     # самою функцією; усі виклики мають належати одному гейту.
     $retention424GateIfs = @()
@@ -24156,11 +24261,10 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     )
     $retention424CleanupTokens = $null
     $retention424CleanupErrors = $null
-    $retention424CleanupAst = [Management.Automation.Language.Parser]::ParseInput(
-        $retention424CleanupSourceText,
-        [ref]$retention424CleanupTokens,
-        [ref]$retention424CleanupErrors
-    )
+    $retention424CleanupAst = Get-BRAVOSelfTestParsedText `
+        -Text $retention424CleanupSourceText `
+        -Tokens ([ref]$retention424CleanupTokens) `
+        -Errors ([ref]$retention424CleanupErrors)
     $retention424FirstAssignment = {
         param([string]$VariableText)
         return (@($retention424CleanupAst.FindAll(
@@ -25283,11 +25387,10 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     # AutoShutdown не є CommandAst і не потрапляє в підрахунок).
     $autoShutdownCallSiteTokens = $null
     $autoShutdownCallSiteErrors = $null
-    $autoShutdownCallSiteAst = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceScriptText,
-        [ref]$autoShutdownCallSiteTokens,
-        [ref]$autoShutdownCallSiteErrors
-    )
+    $autoShutdownCallSiteAst = Get-BRAVOSelfTestParsedText `
+        -Text $maintenanceScriptText `
+        -Tokens ([ref]$autoShutdownCallSiteTokens) `
+        -Errors ([ref]$autoShutdownCallSiteErrors)
     $autoShutdownCallSites = @($autoShutdownCallSiteAst.FindAll(
         {
             param($candidate)
@@ -28101,8 +28204,7 @@ function Write-BRAVOLog {
     # `$healthParameters = @{` до виклику Invoke-BRAVOHealthCheck
     # виконуються ізольовано (окремий New-Module) з підміненим
     # Invoke-BRAVOHealthCheck, що фіксує фактично зв'язані параметри.
-    $archiveHealthNoSlackAst = [Management.Automation.Language.Parser]::ParseInput(
-        $archiveScriptText, [ref]$null, [ref]$null)
+    $archiveHealthNoSlackAst = Get-BRAVOSelfTestParsedText -Text $archiveScriptText
     $archiveHealthTryAst = @(
         $archiveHealthNoSlackAst.FindAll(
             {
@@ -28266,9 +28368,8 @@ function Write-BRAVOLog {
     # перевіряє, що формула складається лише з очікуваних доданків).
     $healthTotalTokens = $null
     $healthTotalErrors = $null
-    $healthTotalAst = [Management.Automation.Language.Parser]::ParseInput(
-        $healthScriptText, [ref]$healthTotalTokens, [ref]$healthTotalErrors
-    )
+    $healthTotalAst = Get-BRAVOSelfTestParsedText `
+        -Text $healthScriptText -Tokens ([ref]$healthTotalTokens) -Errors ([ref]$healthTotalErrors)
     $healthInitStepsCallAst = $healthTotalAst.Find(
         {
             param($candidate)
@@ -28567,9 +28668,8 @@ function Write-BRAVOLog {
     # виразом.
     $archiveTotalTokens = $null
     $archiveTotalErrors = $null
-    $archiveTotalAst = [Management.Automation.Language.Parser]::ParseInput(
-        $archiveScriptText, [ref]$archiveTotalTokens, [ref]$archiveTotalErrors
-    )
+    $archiveTotalAst = Get-BRAVOSelfTestParsedText `
+        -Text $archiveScriptText -Tokens ([ref]$archiveTotalTokens) -Errors ([ref]$archiveTotalErrors)
     $archiveInitStepsCallAsts = @($archiveTotalAst.FindAll(
         {
             param($candidate)
@@ -28854,9 +28954,8 @@ function Write-BRAVOLog {
     # для Групи 3/4 Archive-тестів; тут потрібен раніше).
     $maintenanceFinalStatusFlowTokens = $null
     $maintenanceFinalStatusFlowErrors = $null
-    $maintenanceFinalStatusFlowAst = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceScriptText, [ref]$maintenanceFinalStatusFlowTokens, [ref]$maintenanceFinalStatusFlowErrors
-    )
+    $maintenanceFinalStatusFlowAst = Get-BRAVOSelfTestParsedText `
+        -Text $maintenanceScriptText -Tokens ([ref]$maintenanceFinalStatusFlowTokens) -Errors ([ref]$maintenanceFinalStatusFlowErrors)
     $maintenanceFinalStatusFunctionAst = $null
     $maintenanceResolvedExitCodeFunctionAst = $null
     foreach ($candidateFunctionAst in $maintenanceFinalStatusFlowAst.FindAll(
@@ -29145,9 +29244,8 @@ function Write-BRAVOLog {
     # а не заводить власну паралельну класифікацію).
     $maintenanceTotalTokens = $null
     $maintenanceTotalErrors = $null
-    $maintenanceTotalAst = [Management.Automation.Language.Parser]::ParseInput(
-        $maintenanceScriptText, [ref]$maintenanceTotalTokens, [ref]$maintenanceTotalErrors
-    )
+    $maintenanceTotalAst = Get-BRAVOSelfTestParsedText `
+        -Text $maintenanceScriptText -Tokens ([ref]$maintenanceTotalTokens) -Errors ([ref]$maintenanceTotalErrors)
     $maintenanceSuccessWithWarningsLiteralAsts = @($maintenanceTotalAst.FindAll(
         {
             param($candidate)
@@ -36564,8 +36662,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
         foreach ($boundaryFragmentFile in @(Get-ChildItem -LiteralPath (Join-Path $root 'selftest') -Filter 'BRAVO_SELF_TEST.*.ps1' -File)) {
             $boundaryTokens = $null
             $boundaryErrors = $null
-            $boundaryParsed = [Management.Automation.Language.Parser]::ParseFile(
-                $boundaryFragmentFile.FullName, [ref]$boundaryTokens, [ref]$boundaryErrors)
+            $boundaryParsed = Get-BRAVOSelfTestParsedFileAst -Path $boundaryFragmentFile.FullName `
+                -Tokens ([ref]$boundaryTokens) -Errors ([ref]$boundaryErrors)
             if (@($boundaryErrors).Count -gt 0) { throw "синтаксичні помилки у $($boundaryFragmentFile.Name)" }
             $boundaryFragmentAst[($boundaryFragmentFile.Name -replace '^BRAVO_SELF_TEST\.', '' -replace '\.ps1$', '')] = $boundaryParsed
         }

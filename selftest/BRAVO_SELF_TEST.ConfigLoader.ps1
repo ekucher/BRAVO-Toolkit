@@ -3473,15 +3473,15 @@ if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' -De
 
         $sourcePath = Join-Path $root $RelativePath
         $parseErrors = $null
-        $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$null, [ref]$parseErrors)
+        # Кеш розбору прогону (той самий ParseFile файлу репо, ті самі Errors)
+        # і скомпільований предикат CommandAst; умова на ім'я — та сама.
+        $fileAst = Get-BRAVOSelfTestParsedFileAst -Path $sourcePath -Errors ([ref]$parseErrors)
         if ($parseErrors -and $parseErrors.Count -gt 0) {
             throw "B7: не вдалося розібрати $RelativePath : $($parseErrors[0].Message)"
         }
-        $calls = @($fileAst.FindAll({
-                    param($astNode)
-                    ($astNode -is [System.Management.Automation.Language.CommandAst]) -and
-                    [string]::Equals([string]$astNode.GetCommandName(), 'Import-BravoConfiguration', [StringComparison]::OrdinalIgnoreCase)
-                }, $true))
+        $calls = @($fileAst.FindAll(
+                (Get-BRAVOSelfTestAstTypePredicate -Type @([System.Management.Automation.Language.CommandAst])), $true) |
+                Where-Object { [string]::Equals([string]$_.GetCommandName(), 'Import-BravoConfiguration', [StringComparison]::OrdinalIgnoreCase) })
         if ($calls.Count -ne 1) {
             throw "B7: у $RelativePath очікувався рівно один виклик Import-BravoConfiguration, знайдено $($calls.Count)"
         }
