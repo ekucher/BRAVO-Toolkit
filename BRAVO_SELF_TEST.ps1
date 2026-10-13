@@ -9115,6 +9115,11 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # Archive.Runtime — усередині Write-SevenZipFailureDiagnostics.
         $diagnosticsOwnerFunctions = @(
             'Write-BRAVOSevenZipFailureDiagnostics',
+            # Приватний helper writer-а: сам не логує, але входить у перелік
+            # свідомо — інваріант «ніколи не DEBUG» мусить покривати ВЕСЬ
+            # шлях діагностики, а не лише ті тіла, де виклик логування є
+            # сьогодні.
+            'Get-BRAVOSevenZipDiagnosticStreamLines',
             'Test-SevenZipArchiveIntegrity',
             'Write-SevenZipFailureDiagnostics'
         )
@@ -21141,6 +21146,106 @@ try {
                         "довжина запису=$diagLenPayloadLength, вердикт присутній=$($diagLenText -match $diagLenVerdict), " +
                         "голова присутня=$($diagLenText -match $diagLenHead), маркер обрізання=$($diagLenText -match '\(обрізано\)')")
 
+                # Межа мусить бути ПО ПОТОКУ, а не спільною. Емпірика
+                # (Tools\7za.exe 26.02, `t -y -bb1`): операторо-значущий
+                # вердикт 7-Zip друкує у stderr, а не в хвості stdout —
+                # "ERROR: CRC Failed : <ім'я>" по рядку на пошкоджений запис,
+                # тоді як stdout несе пер-записний прогрес "T <ім'я>" і лише
+                # агрегат "Sub items Errors: N" у кінці. Архів із 40 записів
+                # дає 55 рядків stdout проти 13 stderr, тому СПІЛЬНИЙ
+                # `Select-Object -Last 20` (stderr першим) викидав усі 13
+                # рядків stderr: оператор бачив кількість помилок без імен
+                # записів, а класифікатор (ContentCorruption/PasswordRejected
+                # читає обидва потоки повністю) спирався на рядки, яких у
+                # журналі не було.
+                $diagStreamLogFile = Join-Path $b2TestRoot ("diag_streams_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagStreamLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagStderrLines = @(1..13 | ForEach-Object {
+                    "ERROR: CRC Failed : entry_{0:D3}_with_a_fairly_long_name_to_burn_chars.dat" -f $_
+                })
+                # Імена записів stdout НАВМИСНО відрізняються від stderr
+                # ("progress_" проти "entry_"): інакше токен голови stdout
+                # збігався б із рядком stderr про той самий запис, і
+                # твердження «голова stdout обрізана» стало б вакуумним.
+                $diagStdoutVerbose = @(
+                    1..55 | ForEach-Object {
+                        "T progress_{0:D3}_with_a_fairly_long_name_to_burn_chars.dat" -f $_
+                    }
+                ) -join "`r`n"
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput $diagStdoutVerbose `
+                    -StandardError ($diagStderrLines -join "`r`n") `
+                    -Level 'ERROR')
+                $diagStreamText = if (Test-Path -LiteralPath $diagStreamLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagStreamLogFile)
+                } else { '' }
+                $diagStderrSurvived = @($diagStderrLines | Where-Object {
+                    $diagStreamText.Contains($_)
+                }).Count
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagStderrSurvived -eq $diagStderrLines.Count -and
+                        $diagStreamText -match 'progress_055_' -and
+                        $diagStreamText -notmatch 'progress_001_'
+                    ) `
+                    -Name "SevenZipDiagnostics/StderrVerdictSurvivesVerboseStdout" `
+                    -Failure ("межа мусить застосовуватись ОКРЕМО до stderr і stdout: 13 рядків stderr з " +
+                        "`"CRC Failed`" мусять уціліти повністю навіть при 55 рядках stdout, бо саме вони " +
+                        "називають пошкоджені записи. Уціліло рядків stderr: $diagStderrSurvived з " +
+                        "$($diagStderrLines.Count); хвіст stdout присутній=$($diagStreamText -match 'progress_055_'); " +
+                        "голова stdout обрізана=$($diagStreamText -notmatch 'progress_001_')")
+
+                # Символьний бюджет мусить витрачатись у порядку цінності:
+                # stderr цілим, залишок — на хвіст stdout. Спільне обрізання
+                # початку вбивало б stderr першим, бо він стоїть першим.
+                $diagBudgetLogFile = Join-Path $b2TestRoot ("diag_budget_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagBudgetLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagBudgetStderrHead = 'EHEADTOKEN'
+                $diagBudgetStderrTail = 'ETAILTOKEN'
+                $diagBudgetStdoutHead = 'OHEADTOKEN'
+                $diagBudgetStdoutTail = 'OTAILTOKEN'
+                $diagBudgetStderr = @(
+                    ($diagBudgetStderrHead + ('e' * 140))
+                    1..18 | ForEach-Object { "estub$_" + ('e' * 140) }
+                    ($diagBudgetStderrTail + ('e' * 140))
+                ) -join "`r`n"
+                $diagBudgetStdout = @(
+                    ($diagBudgetStdoutHead + ('o' * 300))
+                    1..18 | ForEach-Object { "ostub$_" + ('o' * 300) }
+                    ($diagBudgetStdoutTail + ('o' * 300))
+                ) -join "`r`n"
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput $diagBudgetStdout -StandardError $diagBudgetStderr -Level 'ERROR')
+                $diagBudgetText = if (Test-Path -LiteralPath $diagBudgetLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagBudgetLogFile)
+                } else { '' }
+                $diagBudgetMatch = [regex]::Match($diagBudgetText, '(?s)Дiагностика 7-Zip test: (.*?)(?=\r?\n\d{4}-\d{2}-\d{2} |\z)')
+                $diagBudgetPayloadLength = if ($diagBudgetMatch.Success) {
+                    $diagBudgetMatch.Groups[1].Value.TrimEnd("`r", "`n").Length
+                } else { -1 }
+                Test-BRAVOCondition `
+                    -Condition (
+                        ($diagBudgetStderr.Length + $diagBudgetStdout.Length) -gt 4000 -and
+                        $diagBudgetText -match $diagBudgetStderrHead -and
+                        $diagBudgetText -match $diagBudgetStderrTail -and
+                        $diagBudgetText -match $diagBudgetStdoutTail -and
+                        $diagBudgetText -notmatch $diagBudgetStdoutHead -and
+                        $diagBudgetText -match '\(обрізано\)' -and
+                        $diagBudgetPayloadLength -gt 0 -and
+                        $diagBudgetPayloadLength -le 4000
+                    ) `
+                    -Name "SevenZipDiagnostics/LengthBudgetKeepsStderrWholeAndTruncatesStdout" `
+                    -Failure ("символьний бюджет мусить зберігати stderr ЦІЛИМ (і голову, і хвіст) та витрачати " +
+                        "залишок на ХВІСТ stdout, лишаючись у 4000 символів разом із маркером. " +
+                        "довжина запису=$diagBudgetPayloadLength; " +
+                        "голова stderr=$($diagBudgetText -match $diagBudgetStderrHead); " +
+                        "хвіст stderr=$($diagBudgetText -match $diagBudgetStderrTail); " +
+                        "хвіст stdout=$($diagBudgetText -match $diagBudgetStdoutTail); " +
+                        "голова stdout обрізана=$($diagBudgetText -notmatch $diagBudgetStdoutHead); " +
+                        "маркер обрізання=$($diagBudgetText -match '\(обрізано\)')")
+
                 # (8) Таймаут. Справжній 12-годинний дефолт
                 # (SevenZipTestTimeoutSeconds = 43200) у self-test не
                 # відтворюється, а `-TimeoutSeconds 1` проти великої
@@ -21178,6 +21283,11 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         [Text.Encoding]::UTF8)) + "`r`n" + $diagTimeoutStubs) `
                     -FunctionNames @(
                         'Write-BRAVOArchiveHelperLog',
+                        # Приватна залежність Write-BRAVOSevenZipFailureDiagnostics
+                        # (хвостова межа ОДНОГО потоку). Динамічний модуль
+                        # матеріалізує лише перелічені функції, тому без неї
+                        # writer падає з CommandNotFoundException.
+                        'Get-BRAVOSevenZipDiagnosticStreamLines',
                         'Write-BRAVOSevenZipFailureDiagnostics',
                         'Invoke-BRAVOSevenZipIntegrityTest',
                         'Test-BRAVOSevenZipArchiveSpecificFailure',

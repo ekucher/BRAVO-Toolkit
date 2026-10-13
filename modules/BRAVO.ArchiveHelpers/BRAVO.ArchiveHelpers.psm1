@@ -143,6 +143,24 @@ function Get-BRAVOLegacyBomFallbackNotificationLines {
     return $lines.ToArray()
 }
 
+function Get-BRAVOSevenZipDiagnosticStreamLines {
+    # Приватний helper Write-BRAVOSevenZipFailureDiagnostics: непорожні рядки
+    # ОДНОГО потоку з хвостовою межею. Винесено окремою функцією саме щоб
+    # межа stderr і межа stdout лишались однією реалізацією, а не двома
+    # копіями, які можуть розійтися (рівно так розійшлися create- і
+    # test-шляхи до цього фікса).
+    param(
+        [AllowNull()][AllowEmptyString()][string]$StreamText,
+        [ValidateRange(1, 500)][int]$MaximumLines
+    )
+
+    return @(
+        [string]$StreamText -split '\r?\n' |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Last $MaximumLines
+    )
+}
+
 function Write-BRAVOSevenZipFailureDiagnostics {
     # ЄДИНИЙ канонічний запис діагностичного виводу 7-Zip на шляху збою —
     # і для integrity-тесту (Test-SevenZipArchiveIntegrity нижче), і для
@@ -186,16 +204,31 @@ function Write-BRAVOSevenZipFailureDiagnostics {
         [ValidateRange(100, 100000)][int]$MaximumLength = 4000
     )
 
-    # -Last: `7z t` працює з -bb1 (рядок на запис), а операторо-значущий
-    # підсумок ("ERRORS:", "Sub items Errors:", "Wrong password") 7-Zip
-    # друкує В КІНЦІ. Хвіст зберігає вердикт.
-    $diagnosticLines = @(
-        @($StandardError, $StandardOutput) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-            ForEach-Object { [string]$_ -split '\r?\n' } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Select-Object -Last $MaximumLines
-    )
+    # Межа застосовується ОКРЕМО до кожного потоку, і stderr отримує власну
+    # квоту та йде ПЕРШИМ. Емпірично (`Tools\7za.exe` 26.02, `t -y -bb1`,
+    # чотири класи збою) операторо-значущий вердикт 7-Zip друкує саме у
+    # stderr, а НЕ в хвості stdout:
+    #
+    #   усічений архів   -> stderr: "ERROR: … / Cannot open the file as archive"
+    #   архів не існує   -> stderr: "ERROR: The system cannot find the file specified."
+    #   невірний пароль  -> stderr: "Cannot open encrypted archive. Wrong password?"
+    #   CRC на записах   -> stderr: "ERROR: CRC Failed : <ім'я запису>" (рядок на запис)
+    #
+    # stdout при цьому несе пер-записний прогрес `-bb1` ("T <ім'я>") і лише
+    # агрегат у самому кінці ("Sub items Errors: 13", "Archives with Errors: 1").
+    #
+    # Тому СПІЛЬНА межа тут небезпечна, і це не теоретично: архів із 40
+    # записів дає 55 рядків stdout проти 13 рядків stderr, і `-Last 20` по
+    # злитій послідовності (stderr першим) викидав ВСІ 13 рядків stderr —
+    # оператор отримував "Sub items Errors: 13" без імен тих 13 записів.
+    # Класифікатор у Test-SevenZipArchiveIntegrity при цьому читає обидва
+    # потоки повністю, тож ContentCorruption/PasswordRejected виставлялись
+    # із рядків, яких у журналі не було.
+    $errorLines = Get-BRAVOSevenZipDiagnosticStreamLines `
+        -StreamText ([string]$StandardError) -MaximumLines $MaximumLines
+    $outputLines = Get-BRAVOSevenZipDiagnosticStreamLines `
+        -StreamText ([string]$StandardOutput) -MaximumLines $MaximumLines
+    $diagnosticLines = @($errorLines) + @($outputLines)
 
     if ($diagnosticLines.Count -eq 0) {
         # «Інструмент промовчав» мусить відрізнятись від «діагностику
@@ -209,25 +242,49 @@ function Write-BRAVOSevenZipFailureDiagnostics {
         return $false
     }
 
-    $diagnosticText = $diagnosticLines -join [Environment]::NewLine
-    if ($diagnosticText.Length -gt $MaximumLength) {
-        # Обрізання робиться видимим: обрізаний запис не повинен читатись
-        # як повний. Межа лишається, бо ці записи йдуть і у файл журналу,
-        # і в masked-копію, що вивантажується на SFTP — сильно пошкоджений
-        # архів інакше дав би мегабайти на один збій саме тоді, коли
-        # журнал найбільше потрібен читабельним.
-        #
-        # Обрізається ПОЧАТОК, а не кінець. Інакше символьна межа викидала б
-        # саме той вердикт, який вище навмисно збережено `Select-Object -Last`:
-        # 20 довгих рядків із довгими шляхами записів легко перебирають 4000
-        # символів ще до фінального «ERRORS: …», і оператор отримав би обрізаний
-        # запис без причини збою — тобто рівно той дефект, який цей фікс
-        # усуває, лише іншим механізмом.
-        # Маркер входить У БЮДЖЕТ -MaximumLength, а не додається поверх нього:
-        # інакше параметр обіцяв би межу, якої запис не тримає.
-        $truncationMarker = '(обрізано) … '
+    # Обрізання робиться видимим: обрізаний запис не повинен читатись як
+    # повний. Межа лишається, бо ці записи йдуть і у файл журналу, і в
+    # masked-копію, що вивантажується на SFTP — сильно пошкоджений архів
+    # інакше дав би мегабайти на один збій саме тоді, коли журнал найбільше
+    # потрібен читабельним.
+    #
+    # Бюджет витрачається в порядку діагностичної цінності: stderr несе
+    # вердикт, тому зберігається ЦІЛИМ; stdout отримує залишок і
+    # обрізається з ПОЧАТКУ, щоб уціліли його кінцеві агрегати. Спільне
+    # обрізання початку було б тим самим дефектом, що й спільна межа
+    # рядків: stderr стоїть першим, тому гинув би першим.
+    #
+    # Маркер входить У БЮДЖЕТ -MaximumLength, а не додається поверх нього:
+    # інакше параметр обіцяв би межу, якої запис не тримає.
+    $separator = [Environment]::NewLine
+    $truncationMarker = '(обрізано) … '
+    $errorText = $errorLines -join $separator
+    $outputText = $outputLines -join $separator
+
+    if ($errorText.Length -gt ($MaximumLength - $truncationMarker.Length)) {
+        # Навіть сам stderr перебирає бюджет (пошкоджено дуже багато
+        # записів): лишаємо його хвіст, stdout не додаємо взагалі — там
+        # усе одно лише пер-записний прогрес.
         $diagnosticText = $truncationMarker +
-            $diagnosticText.Substring($diagnosticText.Length - ($MaximumLength - $truncationMarker.Length))
+            $errorText.Substring($errorText.Length - ($MaximumLength - $truncationMarker.Length))
+    } else {
+        $outputBudget = $MaximumLength - $errorText.Length
+        if ($errorText.Length -gt 0 -and $outputText.Length -gt 0) {
+            $outputBudget -= $separator.Length
+        }
+        if ($outputText.Length -gt $outputBudget) {
+            if ($outputBudget -gt $truncationMarker.Length) {
+                $outputText = $truncationMarker +
+                    $outputText.Substring($outputText.Length - ($outputBudget - $truncationMarker.Length))
+            } else {
+                # Для stdout не лишилось навіть на маркер — пишемо лише stderr.
+                $outputText = ''
+            }
+        }
+        $diagnosticParts = @()
+        if ($errorText.Length -gt 0) { $diagnosticParts += $errorText }
+        if ($outputText.Length -gt 0) { $diagnosticParts += $outputText }
+        $diagnosticText = $diagnosticParts -join $separator
     }
     Write-BRAVOArchiveHelperLog `
         -Logger $Logger `
