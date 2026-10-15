@@ -21841,6 +21841,80 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         "маска присутня=$($diagPathSecretHeadline.Contains('password=***')), " +
                         "уламок значення витік=$($diagPathSecretText.Contains('VVVV'))")
 
+                # Production-топологія модулів. BRAVO_ARCHIV.ps1 імпортує лише
+                # BRAVO.Archive, а той запускає Runtime.ps1 у session state свого
+                # модуля, тож Import-Module BRAVO.Logging там — вкладений, а не
+                # глобальний. Writer у BRAVO.ArchiveHelpers мусить бачити
+                # Protect-BRAVOLogSecret сам (власний імпорт), інакше fail-closed
+                # гілка маскування в production прихована б кожну причину збою.
+                # У цьому процесі self-test BRAVO.Logging уже глобальний, тож
+                # перевірка можлива лише в ОКРЕМОМУ powershell.exe: модуль-обгортка
+                # викликає runtime-скрипт так само, як Invoke-BRAVOArchiveEntrypoint.
+                # Передумова (не вакуумність): у дочірньому процесі
+                # Protect-BRAVOLogSecret НЕ видна глобально. Дочірні скрипти —
+                # лише ASCII (пишуться без BOM).
+                $diagTopologyDir = Join-Path $b2TestRoot ("diag_topology_{0}" -f [guid]::NewGuid().ToString("N"))
+                [void][IO.Directory]::CreateDirectory($diagTopologyDir)
+                $diagTopologyNoBom = New-Object System.Text.UTF8Encoding($false)
+                [IO.File]::WriteAllText((Join-Path $diagTopologyDir 'runtime.ps1'), @'
+param([string]$Root, [string]$Secret)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $Root 'modules\BRAVO.Logging\BRAVO.Logging.psd1') -ErrorAction Stop
+Import-Module -Name (Join-Path $Root 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1') -ErrorAction Stop
+$script:topologyLog = New-Object System.Collections.Generic.List[string]
+$logger = { param($Message, $Level) $script:topologyLog.Add([string]$Message) }
+[void](Write-BRAVOSevenZipFailureDiagnostics -Logger $logger -Operation 'TopologyDiag' `
+    -StandardError ("ERROR: CRC Failed : entry_" + $Secret + ".dat") -StandardOutput 'T entry.dat' `
+    -KnownSecret @($Secret))
+$script:topologyLog.ToArray()
+'@, $diagTopologyNoBom)
+                [IO.File]::WriteAllText((Join-Path $diagTopologyDir 'Wrap.psm1'), @'
+function Invoke-TopologyRuntime {
+    param([string]$Root, [string]$Secret)
+    & (Join-Path $PSScriptRoot 'runtime.ps1') -Root $Root -Secret $Secret
+}
+Export-ModuleMember -Function Invoke-TopologyRuntime
+'@, $diagTopologyNoBom)
+                [IO.File]::WriteAllText((Join-Path $diagTopologyDir 'child.ps1'), @'
+param([string]$Root, [string]$Dir, [string]$Secret, [string]$ResultPath)
+$ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $Dir 'Wrap.psm1') -ErrorAction Stop
+$messages = @(Invoke-TopologyRuntime -Root $Root -Secret $Secret)
+$result = [ordered]@{
+    MaskingVisibleGlobally = [bool](Get-Command -Name 'Protect-BRAVOLogSecret' -ErrorAction SilentlyContinue)
+    Messages = $messages
+}
+($result | ConvertTo-Json -Depth 4) | Out-File -LiteralPath $ResultPath -Encoding utf8
+'@, $diagTopologyNoBom)
+                $diagTopologySecret = -join @('Topo', 'Fixture', 'Key', '57')
+                $diagTopologyResultPath = Join-Path $diagTopologyDir 'result.json'
+                $diagTopologyHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $diagTopologyOutput = & $diagTopologyHost -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                    -File (Join-Path $diagTopologyDir 'child.ps1') `
+                    -Root $root -Dir $diagTopologyDir -Secret $diagTopologySecret -ResultPath $diagTopologyResultPath 2>&1
+                $diagTopologyExit = $LASTEXITCODE
+                $diagTopologyResult = $null
+                if ([IO.File]::Exists($diagTopologyResultPath)) {
+                    $diagTopologyResult = [IO.File]::ReadAllText($diagTopologyResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                }
+                $diagTopologyMessages = if ($null -ne $diagTopologyResult) { @($diagTopologyResult.Messages | ForEach-Object { $_ }) -join "`n" } else { '' }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagTopologyExit -eq 0 -and
+                        $null -ne $diagTopologyResult -and
+                        $false -eq [bool]$diagTopologyResult.MaskingVisibleGlobally -and
+                        $diagTopologyMessages.Contains('CRC Failed') -and
+                        $diagTopologyMessages.Contains('***') -and
+                        -not $diagTopologyMessages.Contains($diagTopologySecret) -and
+                        -not $diagTopologyMessages.Contains('маскування секретів недоступне')
+                    ) `
+                    -Name "SevenZipDiagnostics/MaskingAvailableInProductionModuleTopology" `
+                    -Failure ("у production-топології (runtime у session state модуля, BRAVO.Logging не глобальний) writer мусить " +
+                        "бачити маскування сам і писати замасковану причину збою, а не fail-closed «маскування недоступне». " +
+                        "exit=$diagTopologyExit, маскування глобально видиме=$(if ($null -ne $diagTopologyResult) { $diagTopologyResult.MaskingVisibleGlobally } else { 'n/a' }), " +
+                        "записи: $diagTopologyMessages; вивід дочірнього процесу: $($diagTopologyOutput -join ' | ')")
+
                 # Create-шлях: виклик діагностики мусить лежати САМЕ у
                 # timeout-гілці New-Archive. Перевірка по вкладеності AST, а не
                 # по близькості підрядків: видалення виклику валить гейт.

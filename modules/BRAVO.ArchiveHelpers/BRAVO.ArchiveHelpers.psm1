@@ -1,7 +1,21 @@
-﻿# Shared BRAVO archive helpers with an explicit Compatibility dependency.
+﻿# Shared BRAVO archive helpers with explicit Compatibility and Logging dependencies.
 
 $compatibilityManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Compatibility\BRAVO.Compatibility.psd1'
 Import-Module -Name $compatibilityManifest -ErrorAction Stop
+
+# Protect-BRAVOLogSecret (маскування діагностики 7-Zip до першого запису)
+# мусить бути видимим з області ЦЬОГО модуля. Не можна покладатися на те,
+# що викликач уже імпортував BRAVO.Logging: production-runtime
+# (BRAVO.Archive.Runtime.ps1) виконується в session state модуля
+# BRAVO.Archive, тож його Import-Module BRAVO.Logging — вкладений, а не
+# глобальний, і звідси функції не видно. Без цього імпорту fail-closed
+# гілка маскування спрацьовувала б у кожному production-прогоні й
+# приховувала б саме ту причину збою, яку діагностика має показати.
+# BRAVO.Logging — нижчий інфраструктурний модуль без власних імпортів;
+# уже завантажений у сесії модуль використовується повторно (той самий
+# стан журналу).
+$loggingManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Logging\BRAVO.Logging.psd1'
+Import-Module -Name $loggingManifest -ErrorAction Stop
 
 function Write-BRAVOArchiveHelperLog {
     param(
@@ -622,7 +636,10 @@ function Test-SevenZipArchiveIntegrity {
         $headlineDescription = Get-BRAVOSevenZipDiagnosticReasonText `
             -Reason (Protect-BRAVOLogSecret -Text ([string]$boundedDescription.Text) -KnownSecret @($Password)) `
             -SingleLine -MaximumLength 1000 -AlreadyTruncated:([bool]$boundedDescription.Truncated)
-        $headlinePath = [string](Protect-BRAVOLogSecret -Text ([string]$ArchivePath) -KnownSecret @($Password))
+        # Headline — однорядковий запис: CR/LF у шляху (на NTFS недосяжні, але
+        # -ArchivePath — довільний рядок) замінюються пробілом, щоб шлях не
+        # розгортався в багато рядків журналу.
+        $headlinePath = ([string](Protect-BRAVOLogSecret -Text ([string]$ArchivePath) -KnownSecret @($Password))) -replace '[\r\n]+', ' '
     } catch {
         $headlineDescription = 'опис приховано: маскування секретів недоступне'
         $headlinePath = '(шлях приховано: маскування секретів недоступне)'
