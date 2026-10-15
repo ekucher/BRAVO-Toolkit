@@ -1,6 +1,7 @@
 # BRAVO-Toolkit — поточний стан проекту
 
 Останню перевірку виконано: 2026-10-07 (після Autonomous Correctness Green Wave, #412 і #391) (Git + GitHub REST API, лише читання).
+Hotfix 5.2.5 (рядок «Теги» і крок 1 `NEXT ACTION`) перевірено повторно 2026-10-15; решту файлу — ні.
 
 Кожне змінне твердження нижче має дату й метод перевірки. Це знімок, а не
 гарантія: **перечитати перед дією**. Порядок джерел істини — розділ
@@ -41,7 +42,8 @@ git rev-parse HEAD origin/developer origin/master
 | `origin/master` | `f8fa5aa` (stable `5.2.4`), не змінювався | `git rev-parse origin/master` |
 | `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (далеко позаду `2e3a5da`) | файл у дереві |
 | CI push-прогін `developer` `2e3a5da` | success (run 37596365619, усі jobs ` (push)`) | `GET /commits/2e3a5da/check-runs` |
-| Теги | `v5.3.0-rc.1`; `v5.2.5-rc.1`…`rc.4` (hotfix); `v5.2.5-rc.5` ще не опубліковано | `git ls-remote --tags` |
+| Теги | `v5.3.0-rc.1`; `v5.2.5-rc.1`…`rc.4` (hotfix); `v5.2.5-rc.5` і `rc.6` не опубліковано (перевірено 2026-10-15) | `git ls-remote --tags` |
+| `origin/hotfix/5.2.5` | `c09a5f6` — на один коміт попереду штампу `5.2.5-rc.6` (перевірено 2026-10-15) | `git rev-parse origin/hotfix/5.2.5` |
 | Відкриті PR | лише цей файл | `GET /pulls?state=open` |
 | Відкриті issue | 17 (без PR) | `GET /issues?state=open` |
 
@@ -230,8 +232,23 @@ BLOCKED.
 ## NEXT ACTION
 
 ```text
-1. Власник публікує pre-release v5.2.5-rc.5 (target hotfix/5.2.5,
-   stamp 9790a50) і перевіряє RC на сервері, де падав self-test.
+1. Hotfix 5.2.5 (стан 2026-10-15). Кандидат уже не rc.5, а rc.6:
+   rc.5 (stamp 9790a50) так і не опубліковано, далі в hotfix/5.2.5
+   злито PR #440 (бекпорт #439, поріг малого файлу після реставрації)
+   і поставлено stamp rc.6 (9d9c96e), який містить усе з rc.5.
+   Власник вирішує, з якого commit-а публікувати RC (перевірки нижче):
+   a) rc.6 на 9d9c96e — diff від sourceCommit f414fad лише
+      VERSION.json + RUNTIME_MANIFEST.json, але CI-прогін на ньому
+      червоний (run 37823331415: усі jobs success, крім gitleaks);
+   b) новий stamp rc.7 від поточного tip c09a5f6 — tip після stamp-а
+      змінює лише .gitleaksignore (CI run 38001519868 — success), тож
+      tag на c09a5f6 без нового stamp-а порушив би правило «diff від
+      sourceCommit лише VERSION.json + RUNTIME_MANIFEST.json».
+   Окремо власник вирішує, чи чекає 5.2.5 на #438 (open: після відкату
+   реставрації з before-архіву реставрація повторюється щоночі без
+   ліміту й ескалації; дефект є і в 5.2.4, фіксу немає ні в hotfix, ні
+   в developer). rc.6 прибирає хибний тригер відкату з #438 (малий
+   файл), але не сам безліміт повторів.
 2. Власник застосовує захист developer за RELEASE_POLICY.md §13.4
    (6 канонічних + Config parity); сесія після цього перечитує
    GET /branches/developer і лише тоді оновлює §13.3 та цей файл.
@@ -242,18 +259,24 @@ BLOCKED.
 6. B5: довести pilot до PILOT ACCEPTED (PublicIPLookupEnabled),
    рішення про модель міграції парку. До доказів B5 — hard stop нижче.
 Перед кроком 1 перевірити кандидат hotfix (RC незмінний після публікації):
-  git rev-parse origin/hotfix/5.2.5        # очікується 9790a50
-  git show origin/hotfix/5.2.5:VERSION.json # 5.2.5-rc.5, sourceCommit 3f181ba
-  CI на 9790a50 зелений (workflow_dispatch run 37528388423)
-  git diff --stat 3f181ba 9790a50          # лише VERSION.json і RUNTIME_MANIFEST.json
-  git ls-remote --tags origin 'v5.2.5-rc.5*' і список release — порожні
+  git rev-parse origin/hotfix/5.2.5        # 2026-10-15: c09a5f6
+  git show 9d9c96e:VERSION.json            # 5.2.5-rc.6, sourceCommit f414fad
+  git diff --stat f414fad 9d9c96e          # лише VERSION.json і RUNTIME_MANIFEST.json
+  git diff --stat 9d9c96e c09a5f6          # лише .gitleaksignore
+  git ls-remote --tags origin 'v5.2.5-rc.[5-9]*' і список release — порожні
+  Червоний gitleaks на 9d9c96e — 10 спрацювань generic-api-key у
+  синтетичних фікстурах коміту 8cb1f46, що жив лише в гілках
+  claude/sftp-log-secret-masking-365*; c09a5f6 додав їхні fingerprint-и
+  в .gitleaksignore. Ці гілки видалено з origin 2026-10-15, тож
+  повторний прогін gitleaks на 9d9c96e може вже бути зеленим —
+  перевірити, а не припускати.
   ДО публікації тегу (RELEASE_POLICY.md §8; тег незмінний, а перевірка
   provenance у Release-workflow іде вже після тегу): на тестовому сервері
-  з пакета hotfix/5.2.5 @ 9790a50 запустити BRAVO_SETUP.ps1 -ValidateOnly
+  з пакета обраного кандидата запустити BRAVO_SETUP.ps1 -ValidateOnly
   і BRAVO_DRY_RUN.ps1, записати код завершення та рядки ERROR/WARNING
-  в issue або звіт. Без цих результатів тег v5.2.5-rc.5 не створювати.
+  в issue або звіт. Без цих результатів RC-тег не створювати.
   Сесія цього зробити не може (реальний хост); попереднього запуску на
-  9790a50 у записах немає.
+  9790a50 чи 9d9c96e у записах немає.
 Перед кроками 2–5 перечитати: git rev-parse origin/developer, GET /pulls?state=open.
 ```
 
