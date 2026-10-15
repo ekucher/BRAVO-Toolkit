@@ -538,16 +538,17 @@ function Test-BRAVOSelfTestDuplicateDefinition {
     # усередині ІНШИХ структурних перевірок (Archive/Health/Maintenance
     # ManualModeAndPauseUseSameNoPauseContract тощо) — .Contains()/regex
     # порахував би їх теж і дав хибно завищений count.
-    $selfTestAst = [Management.Automation.Language.Parser]::ParseInput($selfTestScriptText, [ref]$null, [ref]$null)
+    # AST того самого файлу (BRAVO_SELF_TEST.ps1 = $PSCommandPath) — з memo
+    # власного джерела, а не третім розбором 2,4 МБ; AST незмінний. Обхід —
+    # скомпільованим предикатом типу CommandAst, решта умови колишнього
+    # scriptblock-предиката (ім'я команди) застосовується до знайдених вузлів.
+    $selfTestAst = Get-BRAVOSelfTestOwnSourceAst
     $selfTestManualExitCalls = @(
         $selfTestAst.FindAll(
-            {
-                param($candidate)
-                $candidate -is [Management.Automation.Language.CommandAst] -and
-                $candidate.GetCommandName() -eq 'Wait-BRAVOManualExit'
-            },
+            (Get-BRAVOSelfTestAstTypePredicate -Type @([Management.Automation.Language.CommandAst])),
             $true
-        ) | Where-Object { $_.Extent.Text -eq 'Wait-BRAVOManualExit -NoPause:$NoPause' }
+        ) | Where-Object { $_.GetCommandName() -eq 'Wait-BRAVOManualExit' } |
+            Where-Object { $_.Extent.Text -eq 'Wait-BRAVOManualExit -NoPause:$NoPause' }
     )
     Test-BRAVOCondition `
         -Condition (

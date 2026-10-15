@@ -2417,7 +2417,24 @@ function Invoke-WinSCPHealthSession {
                 $process.Kill()
                 [void]$process.WaitForExit(5000)
             } catch {
+                # Процес міг завершитися сам між WaitForExit і Kill().
                 Write-HealthLog "Не вдалося завершити WinSCP після таймауту: $($_.Exception.Message)" -Level "DEBUG"
+            }
+            # Lock звільняється лише після ПІДТВЕРДЖЕНОГО завершення WinSCP (#290):
+            # якщо процес досі живий, наступна операція могла б захопити звільнений
+            # lock і запустити другий WinSCP паралельно з першим.
+            $winSCPExited = $false
+            try {
+                $winSCPExited = [bool]$process.HasExited
+            } catch {
+                $winSCPExited = $false
+            }
+            if (-not $winSCPExited) {
+                # Тримаємо capture (з lock-потоком) у script scope, щоб GC
+                # не звільнив lock, поки WinSCP ще працює.
+                $script:BRAVOHealthWinSCPLockHeldForLiveProcess = $outputCapture
+                Write-HealthLog "Перевищено таймаут SFTP-перевірки, але WinSCP не завершився; BRAVO_WINSCP lock не звільняється" -Level "ERROR"
+                throw "перевищено таймаут SFTP-перевірки ($timeoutSeconds сек.); WinSCP не завершився"
             }
             if ($null -ne $outputCapture) {
                 [void](Complete-BRAVOProcessOutputCapture -Capture $outputCapture)
