@@ -447,8 +447,8 @@
             }
         )
         foreach ($securityProtocolProductionFile in $securityProtocolProductionFiles) {
-            $securityProtocolProductionAst = [Management.Automation.Language.Parser]::ParseFile(
-                $securityProtocolProductionFile.FullName, [ref]$null, [ref]$null)
+            # Через кеш розбору прогону: той самий ParseFile файлу репо.
+            $securityProtocolProductionAst = Get-BRAVOSelfTestParsedFileAst -Path $securityProtocolProductionFile.FullName
             $securityProtocolOverwrites += @(Get-BRAVOSelfTestSecurityProtocolOverwrite `
                     -Ast $securityProtocolProductionAst `
                     -Label $securityProtocolProductionFile.FullName)
@@ -5505,7 +5505,21 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/GenericObjectListBinderGate') {
             [System.Management.Automation.Language.HashtableAst],
             [System.Management.Automation.Language.FunctionDefinitionAst])
         foreach ($sourceItem in $Source) {
-            $unitAst = [System.Management.Automation.Language.Parser]::ParseInput([string]$sourceItem.Text, [ref]$null, [ref]$null)
+            # Файл репозиторію (є Path) уже розібрано кешем прогону — беремо
+            # його AST, але лише якщо текст кореня цього AST ТОЧНО (ordinal)
+            # дорівнює переданому Text: тоді це той самий розбір того самого
+            # тексту (Extent.File аналізатор не читає). Інакше, як і для
+            # рядкових фікстур, — ParseInput.
+            $unitAst = $null
+            if ($null -ne $sourceItem.PSObject.Properties['Path']) {
+                $cachedUnitAst = Get-BRAVOSelfTestParsedFileAst -Path ([string]$sourceItem.Path)
+                if ([string]::Equals($cachedUnitAst.Extent.Text, [string]$sourceItem.Text, [StringComparison]::Ordinal)) {
+                    $unitAst = $cachedUnitAst
+                }
+            }
+            if ($null -eq $unitAst) {
+                $unitAst = [System.Management.Automation.Language.Parser]::ParseInput([string]$sourceItem.Text, [ref]$null, [ref]$null)
+            }
             # Предикат скомпільовано один раз (Get-BRAVOSelfTestAstTypePredicate):
             # scriptblock на кожному вузлі AST був основною вартістю обходу.
             $unitNodes = @($unitAst.FindAll($unitNodePredicate, $true))
@@ -5910,6 +5924,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/GenericObjectListBinderGate') {
         [void]$binderGateSources.Add([pscustomobject]@{
             Name = $binderGateFile.FullName.Substring($binderGateRootPrefix.Length).TrimStart('\', '/')
             Text = [IO.File]::ReadAllText($binderGateFile.FullName, [Text.Encoding]::UTF8)
+            Path = $binderGateFile.FullName
         })
     }
     $binderGateFindings = Find-BRAVOObjectListArraySubexpression -Source $binderGateSources.ToArray()

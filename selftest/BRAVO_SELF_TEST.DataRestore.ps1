@@ -5447,7 +5447,8 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
             # функції звідти не резолвляться. Проба вставляє дослівні функції в один scope, тож
             # приватний виклик вона не ловить; цей статичний тест ловить: runtime DataRestore
             # не викликає жодної функції BRAVO.System, якої немає у FunctionsToExport.
-            $smSystemPsm1Ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'), [ref]$null, [ref]$null)
+            # Обидва файли репо — через кеш розбору прогону (той самий ParseFile).
+            $smSystemPsm1Ast = Get-BRAVOSelfTestParsedFileAst -Path (Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1')
             $smSystemAllFunctions = @($smSystemPsm1Ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { [string]$_.Name })
             $smSystemPsd1Text = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.System\BRAVO.System.psd1'), [Text.Encoding]::UTF8)
             $smSystemExported = @()
@@ -5455,7 +5456,7 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
                 $smSystemExported = @([regex]::Matches($Matches['List'], "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
             }
             $smSystemPrivate = @($smSystemAllFunctions | Where-Object { $smSystemExported -notcontains $_ })
-            $smRuntimeAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1'), [ref]$null, [ref]$null)
+            $smRuntimeAst = Get-BRAVOSelfTestParsedFileAst -Path (Join-Path $root 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1')
             $smRuntimeLocalFunctions = @($smRuntimeAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { [string]$_.Name })
             $smPrivateCalls = @($smRuntimeAst.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true) |
                     ForEach-Object { [string]$_.GetCommandName() } |
