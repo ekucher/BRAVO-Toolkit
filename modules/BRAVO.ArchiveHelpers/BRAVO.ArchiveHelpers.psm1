@@ -229,16 +229,34 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     $outputLines = Get-BRAVOSevenZipDiagnosticStreamLines `
         -StreamText ([string]$StandardOutput) -MaximumLines $MaximumLines
     $diagnosticLines = @($errorLines) + @($outputLines)
+    $separator = [Environment]::NewLine
 
     if ($diagnosticLines.Count -eq 0) {
         # «Інструмент промовчав» мусить відрізнятись від «діагностику
         # втратили»: саме цієї двозначності не можна було розв'язати по
         # production-логу.
-        $emptyMessage = "${Operation}: 7-Zip не повернув діагностичного тексту (stdout/stderr порожні)"
+        $emptyMessage = "7-Zip не повернув діагностичного тексту (stdout/stderr порожні)"
         if (-not [string]::IsNullOrWhiteSpace($EmptyOutputReason)) {
-            $emptyMessage += "; причина: $EmptyOutputReason"
+            # Причина — це Error/Description результату або текст винятку
+            # запуску/preflight, тобто довільний і потенційно багаторядковий
+            # текст. Межі writer-а (-MaximumLines/-MaximumLength) мусять
+            # триматись і тут, інакше один збій дав би необмежений ERROR-запис
+            # і таку саму masked-копію на SFTP. На відміну від потоків 7-Zip,
+            # суть причини — на ПОЧАТКУ (заголовок винятку), тому зберігаються
+            # перші рядки, а обрізається кінець.
+            $reasonLines = @(
+                [string]$EmptyOutputReason -split '\r?\n' |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Select-Object -First $MaximumLines
+            )
+            $emptyMessage += "; причина: " + ($reasonLines -join $separator)
         }
-        Write-BRAVOArchiveHelperLog -Logger $Logger -Message $emptyMessage -Level $Level
+        $tailTruncationMarker = ' … (обрізано)'
+        if ($emptyMessage.Length -gt $MaximumLength) {
+            $emptyMessage = $emptyMessage.Substring(0, $MaximumLength - $tailTruncationMarker.Length) +
+                $tailTruncationMarker
+        }
+        Write-BRAVOArchiveHelperLog -Logger $Logger -Message "${Operation}: $emptyMessage" -Level $Level
         return $false
     }
 
@@ -256,12 +274,15 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     #
     # Маркер входить У БЮДЖЕТ -MaximumLength, а не додається поверх нього:
     # інакше параметр обіцяв би межу, якої запис не тримає.
-    $separator = [Environment]::NewLine
     $truncationMarker = '(обрізано) … '
     $errorText = $errorLines -join $separator
     $outputText = $outputLines -join $separator
 
-    if ($errorText.Length -gt ($MaximumLength - $truncationMarker.Length)) {
+    # Обрізати stderr лише коли він справді НЕ вміщається в бюджет. Порівняння
+    # з (MaximumLength - довжина маркера) обрізало б і stderr, що вміщається
+    # цілим (напр. 3995 символів при межі 4000), — і викидало б саме його
+    # початок, тобто перший рядок вердикту 7-Zip.
+    if ($errorText.Length -gt $MaximumLength) {
         # Навіть сам stderr перебирає бюджет (пошкоджено дуже багато
         # записів): лишаємо його хвіст, stdout не додаємо взагалі — там
         # усе одно лише пер-записний прогрес.

@@ -21383,6 +21383,74 @@ try {
                         "голова stdout обрізана=$($diagBudgetText -notmatch $diagBudgetStdoutHead); " +
                         "маркер обрізання=$($diagBudgetText -match '\(обрізано\)')")
 
+                # stderr, що ВМІЩАЄТЬСЯ в бюджет, не обрізається. Межовий
+                # випадок: довжина між (4000 - довжина маркера) і 4000. Поріг
+                # «бюджет мінус маркер» обрізав би такий stderr і викидав би
+                # саме його початок — перший рядок вердикту 7-Zip.
+                $diagFitLogFile = Join-Path $b2TestRoot ("diag_fit_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagFitLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagFitHead = 'FITHEADTOKEN'
+                $diagFitStderr = $diagFitHead + ('f' * (3995 - $diagFitHead.Length))
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput '' -StandardError $diagFitStderr -Level 'ERROR')
+                $diagFitText = if (Test-Path -LiteralPath $diagFitLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagFitLogFile)
+                } else { '' }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagFitStderr.Length -eq 3995 -and
+                        $diagFitText.Contains($diagFitStderr) -and
+                        $diagFitText -notmatch '\(обрізано\)'
+                    ) `
+                    -Name "SevenZipDiagnostics/StderrWithinBudgetIsNotTruncated" `
+                    -Failure ("stderr довжиною 3995 символів уміщається в межу 4000 і мусить потрапити в журнал ЦІЛИМ, " +
+                        "без маркера обрізання. Повний stderr присутній=$($diagFitText.Contains($diagFitStderr)), " +
+                        "голова присутня=$($diagFitText -match $diagFitHead), " +
+                        "маркер обрізання=$($diagFitText -match '\(обрізано\)')")
+
+                # Гілка порожнього виводу теж тримає межі writer-а: причина
+                # (Error/Description, текст винятку запуску/preflight) —
+                # довільний багаторядковий текст і без межі дала б
+                # необмежений ERROR-запис і таку саму masked-копію на SFTP.
+                # Суть причини — на початку, тож зберігається ГОЛОВА.
+                $diagReasonLogFile = Join-Path $b2TestRoot ("diag_reason_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagReasonLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagReasonHead = 'REASONHEADTOKEN'
+                $diagReasonTail = 'REASONTAILTOKEN'
+                $diagReasonText = @(
+                    ($diagReasonHead + ('r' * 200))
+                    1..48 | ForEach-Object { "rstub$_" + ('r' * 200) }
+                    ($diagReasonTail + ('r' * 200))
+                ) -join "`r`n"
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput '' -StandardError '' -Level 'ERROR' `
+                    -EmptyOutputReason $diagReasonText)
+                $diagReasonLog = if (Test-Path -LiteralPath $diagReasonLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagReasonLogFile)
+                } else { '' }
+                $diagReasonMatch = [regex]::Match($diagReasonLog, '(?s)Дiагностика 7-Zip test: (.*?)(?=\r?\n\d{4}-\d{2}-\d{2} |\z)')
+                $diagReasonPayload = if ($diagReasonMatch.Success) { $diagReasonMatch.Groups[1].Value.TrimEnd("`r", "`n") } else { '' }
+                $diagReasonPayloadLines = @($diagReasonPayload -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagReasonText.Length -gt 4000 -and
+                        $diagReasonPayload -match 'не повернув діагностичного тексту' -and
+                        $diagReasonPayload -match $diagReasonHead -and
+                        $diagReasonPayload -notmatch $diagReasonTail -and
+                        $diagReasonPayload -match '\(обрізано\)' -and
+                        $diagReasonPayload.Length -gt 0 -and
+                        $diagReasonPayload.Length -le 4000 -and
+                        $diagReasonPayloadLines.Count -le 20
+                    ) `
+                    -Name "SevenZipDiagnostics/EmptyOutputReasonIsCapped" `
+                    -Failure ("причина в гілці порожнього виводу мусить триматись меж writer-а (20 рядків, 4000 символів), " +
+                        "зберігати ГОЛОВУ причини і явно позначати обрізання. Довжина запису=$($diagReasonPayload.Length), " +
+                        "рядків=$($diagReasonPayloadLines.Count), голова=$($diagReasonPayload -match $diagReasonHead), " +
+                        "хвіст відсутній=$($diagReasonPayload -notmatch $diagReasonTail), " +
+                        "маркер обрізання=$($diagReasonPayload -match '\(обрізано\)')")
+
                 # (8) Таймаут. Справжній 12-годинний дефолт
                 # (SevenZipTestTimeoutSeconds = 43200) у self-test не
                 # відтворюється, а `-TimeoutSeconds 1` проти великої
@@ -21510,6 +21578,41 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                     -Failure ("вивід убитого по таймауту 7-Zip — єдиний доказ того, на чому він завис; виклик діагностики " +
                         "мусить лежати всередині timeout-гілки New-Archive (878dd86 його мав, ce4855d прибрав). " +
                         "Знайдено гілок: $($diagTimeoutBranches.Count), викликів у них: $($diagTimeoutCallsInBranch.Count)")
+
+                # Те саме для ЗВИЧАЙНОГО (не timeout) збою створення: else-гілка
+                # `if ($process.ExitCode -eq 0)` у New-Archive. Timeout-гілка
+                # повертає раніше, тож виклик там цей шлях не покриває; без
+                # власного виклику найчастіший production-збій знову лишав би
+                # у журналі лише рядок з кодом виходу.
+                $diagExitCodeElseBranches = @(
+                    $diagTimeoutAst.FindAll({
+                        param($candidate)
+                        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                        $candidate.Name -eq 'New-Archive'
+                    }, $true) | ForEach-Object {
+                        $_.FindAll({
+                            param($candidate)
+                            $candidate -is [Management.Automation.Language.IfStatementAst] -and
+                            @($candidate.Clauses)[0].Item1.Extent.Text -match '\$process\.ExitCode\s+-eq\s+0' -and
+                            $null -ne $candidate.ElseClause
+                        }, $true)
+                    } | ForEach-Object { $_.ElseClause }
+                )
+                $diagExitCodeCallsInElse = @(
+                    foreach ($diagExitCodeElse in $diagExitCodeElseBranches) {
+                        $diagExitCodeElse.FindAll({
+                            param($candidate)
+                            $candidate -is [Management.Automation.Language.CommandAst] -and
+                            $candidate.GetCommandName() -eq 'Write-SevenZipFailureDiagnostics'
+                        }, $true)
+                    }
+                )
+                Test-BRAVOCondition `
+                    -Condition ($diagExitCodeElseBranches.Count -ge 1 -and $diagExitCodeCallsInElse.Count -ge 1) `
+                    -Name "SevenZipDiagnostics/CreateNonZeroExitBranchCallsDiagnosticsWriter" `
+                    -Failure ("ненульовий код виходу 7-Zip при створенні архіву мусить записувати діагностику: виклик " +
+                        "Write-SevenZipFailureDiagnostics має лежати в else-гілці `if (`$process.ExitCode -eq 0)` New-Archive. " +
+                        "Знайдено else-гілок: $($diagExitCodeElseBranches.Count), викликів у них: $($diagExitCodeCallsInElse.Count)")
 
                 # (12) Всеохопна перевірка нерозкриття: КОЖЕН лог-файл, записаний
                 # цим блоком, проти КОЖНОГО використаного пароля. Рання перевірка
