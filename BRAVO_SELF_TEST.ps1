@@ -21762,10 +21762,11 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         'Test-SevenZipArchiveIntegrity'
                     ) `
                     -PreferLastDefinitionOnDuplicate
-                # Шлях архіву — extended-length (~3500 символів): разом з
-                # обмеженим описом headline інакше перевищив би 4000 символів.
-                # Ім'я архіву в кінці шляху мусить уціліти.
-                $diagRouteArchivePath = '\\?\C:\nonexistent\' + ('p' * 3500) + '\ROUTEARCHIVELEAF.7z'
+                # Шлях архіву — extended-length (~4500 символів, довший за весь
+                # бюджет запису): headline перевищив би 4000 символів за будь-якої
+                # довжини опису, тож обрізання шляху тут гарантоване. Ім'я архіву
+                # в кінці шляху мусить уціліти.
+                $diagRouteArchivePath = '\\?\C:\nonexistent\' + ('p' * 4500) + '\ROUTEARCHIVELEAF.7z'
                 $diagRouteResult = & $diagRouteModule {
                     param($Logger, $FixturePass, $ArchivePathValue)
                     Test-SevenZipArchiveIntegrity `
