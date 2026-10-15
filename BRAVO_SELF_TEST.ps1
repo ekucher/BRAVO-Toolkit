@@ -21706,6 +21706,37 @@ try {
                         "хвіст=$($diagHugePayload.Contains('_60000.dat')), записів у прогонах зсуву=$diagFragmentRecords з 22, " +
                         "уламки: $($diagFragmentLeaks -join '; ')")
 
+                # Значення ШАБЛОНУ в лапках із пробілами, що перетинає межу грубого
+                # зрізу: `password="A… L…(1000) M…(7000)"` в одному гігантському рядку.
+                # Вікно хвоста починається всередині значення, і «перший пробіл
+                # після межі» — пробіл УСЕРЕДИНІ лапок; без шаблонного маскування
+                # повного тексту ДО зрізу в журнал пішов би уламок `MMM…"` без
+                # ключа `password=`, якого шаблон уже не впізнає. Кілька зсувів
+                # межі — щоб результат не залежав від одного вдалого положення.
+                $diagQuotedLeaks = New-Object System.Collections.Generic.List[string]
+                $diagQuotedRecords = 0
+                foreach ($diagQuotedShift in @(0, 500, 1500, 3000)) {
+                    $diagQuotedLogFile = Join-Path $b2TestRoot ("diag_quoted_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                    [void](Initialize-BRAVOLog -LogFile $diagQuotedLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                    $diagQuotedStream = ('w ' * 100) + 'entry password="' + ('A' * 50) + ' ' + ('L' * (1000 + $diagQuotedShift)) +
+                        ' ' + ('M' * 7000) + '" tail end'
+                    [void](Write-BRAVOSevenZipFailureDiagnostics `
+                        -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                        -StandardError $diagQuotedStream -StandardOutput '' -Level 'ERROR')
+                    $diagQuotedText = if (Test-Path -LiteralPath $diagQuotedLogFile -PathType Leaf) {
+                        [IO.File]::ReadAllText($diagQuotedLogFile)
+                    } else { '' }
+                    if ($diagQuotedText.Contains('Дiагностика 7-Zip test: ')) { $diagQuotedRecords++ }
+                    if ($diagQuotedText.Contains('MMMM') -or $diagQuotedText.Contains('LLLL')) {
+                        $diagQuotedLeaks.Add("shift=$diagQuotedShift")
+                    }
+                }
+                Test-BRAVOCondition `
+                    -Condition ($diagQuotedRecords -eq 4 -and $diagQuotedLeaks.Count -eq 0) `
+                    -Name "SevenZipDiagnostics/QuotedPatternValueMaskedBeforeCoarseCut" `
+                    -Failure ("значення шаблону в лапках із пробілами, що перетинає межу грубого зрізу, мусить бути замасковане " +
+                        "ДО зрізу — жодного уламку в журналі. Записів=$diagQuotedRecords з 4, уламки: $($diagQuotedLeaks -join '; ')")
+
                 # (8) Таймаут. Справжній 12-годинний дефолт
                 # (SevenZipTestTimeoutSeconds = 43200) у self-test не
                 # відтворюється, а `-TimeoutSeconds 1` проти великої

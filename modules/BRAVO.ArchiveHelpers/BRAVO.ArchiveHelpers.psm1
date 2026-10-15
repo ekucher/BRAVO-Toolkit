@@ -180,22 +180,27 @@ function Get-BRAVOSevenZipDiagnosticStreamLines {
 }
 
 function Get-BRAVOSevenZipDiagnosticBoundedText {
-    # Приватний helper: ГРУБА межа сирого тексту ДО маскування. На пізньому
-    # збої великого архіву stdout `-bb1` може мати мільйони рядків; без цієї
-    # межі весь потік ішов би в Protect-BRAVOLogSecret, який будує діапазон
-    # на кожен збіг (для короткого пароля — майже на кожен символ), — і саме
-    # на шляху обробки помилки 32-бітний Windows PowerShell міг би вичерпати
-    # пам'ять. Вікно -MaximumCharacters береться з потрібного кінця
-    # (-Keep Tail для потоків 7-Zip, Head для причин), а маскування й
-    # остаточні межі застосовуються вже до нього.
+    # Приватний helper: ГРУБА межа тексту перед маскуванням ВІДОМИХ секретів.
+    # На пізньому збої великого архіву stdout `-bb1` може мати мільйони
+    # рядків; маскування відомих значень будує діапазон на кожен збіг (для
+    # короткого пароля — майже на кожен символ), і на шляху обробки помилки
+    # 32-бітний Windows PowerShell міг би вичерпати пам'ять. Тому воно
+    # застосовується лише до вікна -MaximumCharacters з потрібного кінця
+    # (-Keep Tail для потоків 7-Zip, Head для причин).
     #
-    # Зріз вікна може розрізати секрет: уламок без ключа (`password=`) чи
-    # неповне відоме значення маскувальник уже не впізнав би. Тому після
-    # зрізу відкидається частковий рядок на межі; якщо меж рядків у вікні
-    # немає — відкидається текст до першого пробілу, не ближчого до межі, ніж
-    # -SecretMargin (довжина найдовшого відомого секрету): уламок відомого
-    # секрету коротший за нього, а значення шаблону (\S+) закінчується
-    # пробілом. Якщо безпечної межі немає зовсім, повертається порожній
+    # ВИМОГА до викликача: текст уже пройшов ШАБЛОННЕ маскування
+    # (Protect-BRAVOLogSecret без -KnownSecret: `password=…` у т.ч. в лапках,
+    # облікові дані в URL, webhook-и) на ПОВНОМУ тексті. Інакше зріз міг би
+    # пройти всередині значення шаблону (напр. пробіл усередині
+    # `password="AAAA LEAK"`) і лишити уламок без ключа, якого шаблон уже не
+    # впізнає. Шаблонне маскування — лише регулярні вирази, лінійне й без
+    # діапазонів, тож на повному тексті воно безпечне.
+    #
+    # Відоме значення секрету теж може бути розрізане межею вікна. Його
+    # уламок коротший за -SecretMargin (довжину найдовшого відомого
+    # секрету), тому межа вікна зсувається до першого пробілу чи переносу
+    # рядка, НЕ ближчого до краю зрізу, ніж -SecretMargin: уламок гарантовано
+    # відкидається. Якщо такої межі немає зовсім, повертається порожній
     # рядок — не сирий уламок (fail-closed).
     #
     # Повертає [pscustomobject]@{ Text; Truncated }.
@@ -211,32 +216,22 @@ function Get-BRAVOSevenZipDiagnosticBoundedText {
         return [pscustomobject]@{ Text = $sourceText; Truncated = $false }
     }
 
-    $lineBreakCharacters = [char[]]@([char]13, [char]10)
+    # \s охоплює і пробіли, і CR/LF: межа рядка — теж безпечна межа слова.
     $whitespacePattern = '\s'
     if ($Keep -eq 'Tail') {
         $window = $sourceText.Substring($sourceText.Length - $MaximumCharacters)
-        $lineBreakIndex = $window.IndexOfAny($lineBreakCharacters)
-        if ($lineBreakIndex -ge 0) {
-            $window = $window.Substring($lineBreakIndex + 1)
-        } else {
-            $searchStart = [math]::Min($SecretMargin, $window.Length)
-            $whitespaceMatch = [regex]::Match($window.Substring($searchStart), $whitespacePattern)
-            $window = if ($whitespaceMatch.Success) {
-                $window.Substring($searchStart + $whitespaceMatch.Index + 1)
-            } else { '' }
-        }
+        $searchStart = [math]::Min($SecretMargin, $window.Length)
+        $whitespaceMatch = [regex]::Match($window.Substring($searchStart), $whitespacePattern)
+        $window = if ($whitespaceMatch.Success) {
+            $window.Substring($searchStart + $whitespaceMatch.Index + 1)
+        } else { '' }
     } else {
         $window = $sourceText.Substring(0, $MaximumCharacters)
-        $lineBreakIndex = $window.LastIndexOfAny($lineBreakCharacters)
-        if ($lineBreakIndex -ge 0) {
-            $window = $window.Substring(0, $lineBreakIndex)
-        } else {
-            $searchEnd = [math]::Max(0, $window.Length - $SecretMargin)
-            $whitespaceMatches = [regex]::Matches($window.Substring(0, $searchEnd), $whitespacePattern)
-            $window = if ($whitespaceMatches.Count -gt 0) {
-                $window.Substring(0, $whitespaceMatches[$whitespaceMatches.Count - 1].Index)
-            } else { '' }
-        }
+        $searchEnd = [math]::Max(0, $window.Length - $SecretMargin)
+        $whitespaceMatches = [regex]::Matches($window.Substring(0, $searchEnd), $whitespacePattern)
+        $window = if ($whitespaceMatches.Count -gt 0) {
+            $window.Substring(0, $whitespaceMatches[$whitespaceMatches.Count - 1].Index)
+        } else { '' }
     }
     return [pscustomobject]@{ Text = $window; Truncated = $true }
 }
@@ -380,17 +375,28 @@ function Write-BRAVOSevenZipFailureDiagnostics {
         }
     }
     $preMaskCharacters = (2 * $MaximumLength) + $secretMargin
-    $boundedStandardError = Get-BRAVOSevenZipDiagnosticBoundedText `
-        -Text ([string]$StandardError) -MaximumCharacters $preMaskCharacters -SecretMargin $secretMargin -Keep Tail
-    $boundedStandardOutput = Get-BRAVOSevenZipDiagnosticBoundedText `
-        -Text ([string]$StandardOutput) -MaximumCharacters $preMaskCharacters -SecretMargin $secretMargin -Keep Tail
-    $boundedEmptyOutputReason = Get-BRAVOSevenZipDiagnosticBoundedText `
-        -Text ([string]$EmptyOutputReason) -MaximumCharacters $preMaskCharacters -SecretMargin $secretMargin -Keep Head
-    $streamsPreTruncated = ($boundedStandardError.Truncated -or $boundedStandardOutput.Truncated)
+    $streamsPreTruncated = $false
     try {
         if ($null -eq (Get-Command -Name 'Protect-BRAVOLogSecret' -CommandType Function -ErrorAction SilentlyContinue)) {
             throw 'Protect-BRAVOLogSecret недоступна'
         }
+        # Два етапи маскування (див. Get-BRAVOSevenZipDiagnosticBoundedText):
+        # 1) шаблони (`password=…` у т.ч. в лапках, URL-креди, webhook-и) — на
+        #    ПОВНОМУ тексті, ДО зрізу: інакше межа вікна могла б розрізати
+        #    значення шаблону й лишити уламок без ключа; це лише регулярні
+        #    вирази, лінійні за довжиною;
+        # 2) відомі значення (-KnownSecret) — лише на обмеженому вікні, бо саме
+        #    вони будують діапазон на кожен збіг.
+        $boundedStandardError = Get-BRAVOSevenZipDiagnosticBoundedText `
+            -Text (Protect-BRAVOLogSecret -Text ([string]$StandardError)) `
+            -MaximumCharacters $preMaskCharacters -SecretMargin $secretMargin -Keep Tail
+        $boundedStandardOutput = Get-BRAVOSevenZipDiagnosticBoundedText `
+            -Text (Protect-BRAVOLogSecret -Text ([string]$StandardOutput)) `
+            -MaximumCharacters $preMaskCharacters -SecretMargin $secretMargin -Keep Tail
+        $boundedEmptyOutputReason = Get-BRAVOSevenZipDiagnosticBoundedText `
+            -Text (Protect-BRAVOLogSecret -Text ([string]$EmptyOutputReason)) `
+            -MaximumCharacters $preMaskCharacters -SecretMargin $secretMargin -Keep Head
+        $streamsPreTruncated = ($boundedStandardError.Truncated -or $boundedStandardOutput.Truncated)
         $safeStandardError = Protect-BRAVOLogSecret -Text ([string]$boundedStandardError.Text) -KnownSecret $KnownSecret
         $safeStandardOutput = Protect-BRAVOLogSecret -Text ([string]$boundedStandardOutput.Text) -KnownSecret $KnownSecret
         $safeEmptyOutputReason = Protect-BRAVOLogSecret -Text ([string]$boundedEmptyOutputReason.Text) -KnownSecret $KnownSecret
@@ -633,8 +639,11 @@ function Test-SevenZipArchiveIntegrity {
             throw 'Protect-BRAVOLogSecret недоступна'
         }
         $headlineSecretMargin = if ([string]::IsNullOrEmpty($Password)) { 0 } else { $Password.Length }
+        # Шаблонне маскування — на повному описі ДО грубого зрізу (див.
+        # Get-BRAVOSevenZipDiagnosticBoundedText), відомий пароль — на вікні.
         $boundedDescription = Get-BRAVOSevenZipDiagnosticBoundedText `
-            -Text ([string]$testResult.Description) -MaximumCharacters (2000 + $headlineSecretMargin) `
+            -Text (Protect-BRAVOLogSecret -Text ([string]$testResult.Description)) `
+            -MaximumCharacters (2000 + $headlineSecretMargin) `
             -SecretMargin $headlineSecretMargin -Keep Head
         $headlineDescription = Get-BRAVOSevenZipDiagnosticReasonText `
             -Reason (Protect-BRAVOLogSecret -Text ([string]$boundedDescription.Text) -KnownSecret @($Password)) `
