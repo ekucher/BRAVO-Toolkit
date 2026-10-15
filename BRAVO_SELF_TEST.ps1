@@ -7585,6 +7585,36 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Health/SuccessRowsDoNotPadStatusIcon" `
         -Failure "BRAVO.Health.Runtime.ps1 не повинен вирівнювати статус-іконку фіксованими пробілами — Discord/Slack рендерять пропорційним шрифтом"
 
+    # #290 (backport у Health): той самий інваріант, що Archive/
+    # SftpConnectionTimeoutKeepsLockWhileWinSCPAlive — Invoke-WinSCPHealthSession
+    # мала дзеркальний пропуск: Complete-BRAVOProcessOutputCapture (звільняє
+    # BRAVO_WINSCP lock) викликався безумовно в гілці таймауту, без перевірки
+    # $process.HasExited. Невбивний процес у self-test не відтворити, тому це
+    # перевірка тексту справжньої гілки таймауту Invoke-WinSCPHealthSession.
+    $healthSftpTimeoutBranchMatch = [regex]::Match(
+        $healthScriptText,
+        'if\s*\(-not \$completed\)\s*\{[\s\S]*?таймаут SFTP-перевірки \(\$timeoutSeconds сек\.\)"\s*\r?\n\s*\}'
+    )
+    $healthSftpTimeoutBranchText = if ($healthSftpTimeoutBranchMatch.Success) { $healthSftpTimeoutBranchMatch.Value } else { '' }
+    $healthSftpNotExitedBlockMatch = [regex]::Match(
+        $healthSftpTimeoutBranchText,
+        'if\s*\(-not \$winSCPExited\)\s*\{[\s\S]*?\bthrow\b[^\r\n]*\r?\n\s*\}'
+    )
+    $healthSftpHasExitedIndex = $healthSftpTimeoutBranchText.IndexOf('$process.HasExited')
+    $healthSftpCompleteIndex = $healthSftpTimeoutBranchText.IndexOf('Complete-BRAVOProcessOutputCapture')
+    Test-BRAVOCondition `
+        -Condition (
+            $healthSftpTimeoutBranchMatch.Success -and
+            $healthSftpNotExitedBlockMatch.Success -and
+            -not $healthSftpNotExitedBlockMatch.Value.Contains('Complete-BRAVOProcessOutputCapture') -and
+            $healthSftpNotExitedBlockMatch.Value -match '\$script:\w+\s*=\s*\$outputCapture\b' -and
+            $healthSftpHasExitedIndex -ge 0 -and
+            $healthSftpCompleteIndex -gt $healthSftpHasExitedIndex -and
+            $healthSftpNotExitedBlockMatch.Index -lt $healthSftpCompleteIndex
+        ) `
+        -Name 'Health/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive' `
+        -Failure 'гілка таймауту Invoke-WinSCPHealthSession має перевірити $process.HasExited ДО Complete-BRAVOProcessOutputCapture і, якщо WinSCP не завершився, кинути виняток без звільнення BRAVO_WINSCP lock, зберігши capture (з lock-потоком) у script scope, щоб GC не звільнив lock'
+
     # ============================================================
     # dev.13: manual elevation + environment preflight (BRAVO_HEALTH.ps1
     # + BRAVO.Health.Runtime.ps1). Root cause: ручний non-elevated запуск
