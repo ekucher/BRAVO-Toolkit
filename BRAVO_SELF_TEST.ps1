@@ -9258,7 +9258,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             # сьогодні.
             'Get-BRAVOSevenZipDiagnosticStreamLines',
             'Get-BRAVOSevenZipDiagnosticReasonText',
-            'Get-BRAVOSevenZipDiagnosticBoundedText',
+            'Protect-BRAVOSevenZipDiagnosticText',
             'Test-SevenZipArchiveIntegrity',
             'Write-SevenZipFailureDiagnostics'
         )
@@ -21507,29 +21507,47 @@ try {
                         "хвіст відсутній=$($diagReasonPayload -notmatch $diagReasonTail), " +
                         "маркер обрізання=$($diagReasonPayload -match '\(обрізано\)')")
 
-                # Причина з одного гігантського токена без пробілів і переносів:
-                # груба межа до маскування відкидає її цілком (уламок міг би бути
-                # частиною секрету). Тоді запис мусить явно показати обрізання, а не
-                # тихо лишити порожню причину.
-                $diagTokenLogFile = Join-Path $b2TestRoot ("diag_token_{0}.log" -f [guid]::NewGuid().ToString("N"))
-                [void](Initialize-BRAVOLog -LogFile $diagTokenLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                # Надто великий текст (понад -MaximumMaskedCharacters) не маскується
+                # і не пишеться (fail-closed, межа пам'яті маскувальника), але й не
+                # зникає тихо: на його місці — позначка з довжиною. Для потоку
+                # вердикт stderr при цьому лишається; для причини — позначка в ній.
+                $diagOversizeLogFile = Join-Path $b2TestRoot ("diag_oversize_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagOversizeLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput ('U' * 1000001) -StandardError 'ERROR: CRC Failed : oversize_entry.dat' -Level 'ERROR')
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
                     -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
                     -StandardOutput '' -StandardError '' -Level 'ERROR' `
-                    -EmptyOutputReason ('T' * 20000))
-                $diagTokenText = if (Test-Path -LiteralPath $diagTokenLogFile -PathType Leaf) {
-                    [IO.File]::ReadAllText($diagTokenLogFile)
+                    -EmptyOutputReason ('T' * 1000001))
+                # Невеликий текст, але з суцільним фрагментом довшим за межу: шаблон
+                # URL-кредів маскувальника квадратичний на такому фрагменті, тож він
+                # теж пропускається з позначкою, а не маскується.
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput (('short ' * 5) + ('W' * 1500)) -StandardError 'ERROR: Data Error : token.dat' -Level 'ERROR')
+                $diagOversizeText = if (Test-Path -LiteralPath $diagOversizeLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagOversizeLogFile)
                 } else { '' }
                 Test-BRAVOCondition `
                     -Condition (
-                        $diagTokenText -match 'не повернув діагностичного тексту' -and
-                        $diagTokenText.Contains('причина: (обрізано)') -and
-                        -not $diagTokenText.Contains('TTTT')
+                        $diagOversizeText.Contains('CRC Failed : oversize_entry.dat') -and
+                        $diagOversizeText.Contains('stdout 7-Zip (1000001 символів) не записано') -and
+                        $diagOversizeText.Contains('причина: (1000001 символів) не записано') -and
+                        $diagOversizeText.Contains('ERROR: Data Error : token.dat') -and
+                        $diagOversizeText.Contains('stdout 7-Zip (1530 символів) не записано') -and
+                        -not $diagOversizeText.Contains('WWWW') -and
+                        -not $diagOversizeText.Contains('UUUU') -and
+                        -not $diagOversizeText.Contains('TTTT')
                     ) `
-                    -Name "SevenZipDiagnostics/DroppedGiantReasonIsMarkedTruncated" `
-                    -Failure ("причина з одного гігантського токена, відкинута до маскування, мусить бути позначена як обрізана " +
-                        "(«причина: (обрізано)»), а не зникати тихо. " +
-                        "маркер=$($diagTokenText.Contains('причина: (обрізано)')), уламок токена=$($diagTokenText.Contains('TTTT'))")
+                    -Name "SevenZipDiagnostics/OversizedTextOmittedWithVisibleMarker" `
+                    -Failure ("потік чи причина понад межу маскування мусять бути пропущені з видимою позначкою довжини (вердикт stderr " +
+                        "лишається), а не записані сирими чи тихо втрачені. " +
+                        "вердикт=$($diagOversizeText.Contains('CRC Failed : oversize_entry.dat')), " +
+                        "позначка stdout=$($diagOversizeText.Contains('stdout 7-Zip (1000001 символів) не записано')), " +
+                        "довгий фрагмент пропущено=$($diagOversizeText.Contains('stdout 7-Zip (1530 символів) не записано')), " +
+                        "позначка причини=$($diagOversizeText.Contains('причина: (1000001 символів) не записано')), " +
+                        "сирий вміст: stdout=$($diagOversizeText.Contains('UUUU')), причина=$($diagOversizeText.Contains('TTTT'))")
 
                 # Межа 20 рядків — ОДНА на весь запис, а не на кожен потік: окремі
                 # квоти давали до 40 рядків. Пріоритет stderr: спершу його хвіст,
@@ -21643,17 +21661,14 @@ try {
                         "Рядків у журналі: $($diagCrLines.Count), хвіст присутній=$($diagCrText.Contains('CRLINE_030')), " +
                         "голова відкинута=$(-not $diagCrText.Contains('CRLINE_010'))")
 
-                # Груба межа ДО маскування: необмежений потік (пізній збій
-                # великого архіву, мільйони рядків `-bb1`) не мусить цілком іти в
-                # маскувальник. Перевіряється (а) що запис тримає межі на потоці в
-                # десятки тисяч рядків з коротким відомим секретом, який
-                # збігається майже всюди, і (б) що зріз вікна не залишає уламка
-                # секрету: потік без меж рядків, де секрет повторюється, зсувається
-                # на кожен із 22 можливих відступів, тож межа вікна гарантовано
-                # проходить усередині секрету хоча б в одному прогоні.
+                # Великий (у межах маскування) потік маскується ЦІЛИМ і лише потім
+                # обмежується: (а) запис тримає межі на потоці в десятки тисяч рядків
+                # з однолітерним відомим секретом, що збігається майже всюди; (б)
+                # остаточне обрізання не лишає уламка відомого секрету на жодному з
+                # 22 зсувів межі (секрет повторюється в рядку без переносів).
                 $diagHugeLogFile = Join-Path $b2TestRoot ("diag_huge_{0}.log" -f [guid]::NewGuid().ToString("N"))
                 [void](Initialize-BRAVOLog -LogFile $diagHugeLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
-                $diagHugeStdout = (1..60000 | ForEach-Object { "T entry_$_.dat" }) -join "`r`n"
+                $diagHugeStdout = (1..10000 | ForEach-Object { "T entry_$_.dat" }) -join "`r`n"
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
                     -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
                     -StandardError '' -StandardOutput $diagHugeStdout `
@@ -21694,32 +21709,30 @@ try {
                         $diagHugePayload.Length -gt 0 -and
                         ('Дiагностика 7-Zip test: '.Length + $diagHugePayload.Length) -le 4000 -and
                         $diagHugeLines.Count -le 20 -and
-                        $diagHugePayload.Contains('_60000.dat') -and
-                        $diagHugePayload.Contains('(обрізано)') -and
+                        $diagHugePayload.Contains('_10000.dat') -and
+                        -not $diagHugePayload.Contains('stdout 7-Zip (') -and
                         $diagFragmentRecords -eq 22 -and
                         $diagFragmentLeaks.Count -eq 0
                     ) `
-                    -Name "SevenZipDiagnostics/HugeStreamBoundedBeforeMaskingWithoutSecretFragments" `
-                    -Failure ("потік у $($diagHugeStdout.Length) символів мусить дати запис у межах 20 рядків / 4000 символів з хвостом " +
-                        "і позначкою обрізання, а зріз вікна до маскування не мусить лишати уламка відомого секрету. " +
+                    -Name "SevenZipDiagnostics/LargeStreamMaskedWholeThenBoundedWithoutSecretFragments" `
+                    -Failure ("потік у $($diagHugeStdout.Length) символів (у межах маскування) мусить бути замаскований цілим і дати запис " +
+                        "у межах 20 рядків / 4000 символів з хвостом, без уламків відомого секрету. " +
                         "Довжина запису=$($diagHugePayload.Length), рядків=$($diagHugeLines.Count), " +
-                        "хвіст=$($diagHugePayload.Contains('_60000.dat')), записів у прогонах зсуву=$diagFragmentRecords з 22, " +
+                        "хвіст=$($diagHugePayload.Contains('_10000.dat')), записів у прогонах зсуву=$diagFragmentRecords з 22, " +
                         "уламки: $($diagFragmentLeaks -join '; ')")
 
-                # Значення ШАБЛОНУ в лапках із пробілами, що перетинає межу грубого
-                # зрізу: `password="A… L…(1000) M…(7000)"` в одному гігантському рядку.
-                # Вікно хвоста починається всередині значення, і «перший пробіл
-                # після межі» — пробіл УСЕРЕДИНІ лапок; без шаблонного маскування
-                # повного тексту ДО зрізу в журнал пішов би уламок `MMM…"` без
-                # ключа `password=`, якого шаблон уже не впізнає. Кілька зсувів
-                # межі — щоб результат не залежав від одного вдалого положення.
+                # Значення ШАБЛОНУ в подвійних лапках із пробілами в одному довгому
+                # рядку (`password="A… L… M…"`): канонічний маскувальник прибирає
+                # його цілим ДО обрізання, тож у записі не лишається жодного уламку,
+                # хоч де пройшла б остаточна межа. Кілька зсувів — щоб результат не
+                # залежав від одного вдалого положення.
                 $diagQuotedLeaks = New-Object System.Collections.Generic.List[string]
                 $diagQuotedRecords = 0
-                foreach ($diagQuotedShift in @(0, 500, 1500, 3000)) {
+                foreach ($diagQuotedShift in @(0, 100, 250, 400)) {
                     $diagQuotedLogFile = Join-Path $b2TestRoot ("diag_quoted_{0}.log" -f [guid]::NewGuid().ToString("N"))
                     [void](Initialize-BRAVOLog -LogFile $diagQuotedLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
-                    $diagQuotedStream = ('w ' * 100) + 'entry password="' + ('A' * 50) + ' ' + ('L' * (1000 + $diagQuotedShift)) +
-                        ' ' + ('M' * 7000) + '" tail end'
+                    $diagQuotedStream = ('w ' * 2000) + 'entry password="' + ('A' * 50) + ' ' + ('L' * (500 + $diagQuotedShift)) +
+                        ' ' + ('M' * 900) + '" tail end'
                     [void](Write-BRAVOSevenZipFailureDiagnostics `
                         -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
                         -StandardError $diagQuotedStream -StandardOutput '' -Level 'ERROR')
@@ -21733,9 +21746,43 @@ try {
                 }
                 Test-BRAVOCondition `
                     -Condition ($diagQuotedRecords -eq 4 -and $diagQuotedLeaks.Count -eq 0) `
-                    -Name "SevenZipDiagnostics/QuotedPatternValueMaskedBeforeCoarseCut" `
-                    -Failure ("значення шаблону в лапках із пробілами, що перетинає межу грубого зрізу, мусить бути замасковане " +
-                        "ДО зрізу — жодного уламку в журналі. Записів=$diagQuotedRecords з 4, уламки: $($diagQuotedLeaks -join '; ')")
+                    -Name "SevenZipDiagnostics/QuotedPatternValueNeverLeaksFragment" `
+                    -Failure ("значення шаблону в лапках із пробілами мусить бути замасковане цілим до обрізання — жодного уламку " +
+                        "в журналі. Записів=$diagQuotedRecords з 4, уламки: $($diagQuotedLeaks -join '; ')")
+
+                # Відомий пароль архіву з пробілами й лапками (форма, яку шаблони
+                # маскувальника розпізнають лише частково: одинарні лапки, `"` перед
+                # пробілом) мусить бути замаскований ЦІЛИМ: канонічний
+                # Protect-BRAVOLogSecret спершу прибирає точні значення відомих
+                # секретів, а вже потім застосовує шаблони, тож жоден шаблон не
+                # руйнує точний збіг пароля. Потік довгий, щоб остаточне обрізання
+                # теж спрацювало.
+                $diagKnownSpacedSecret = -join @('Spaced', ' ', 'Leak', 'Value', '91')
+                $diagKnownQuotedSecret = -join @('""""', ' ', 'Quote', 'Leak', '27')
+                $diagKnownLogFile = Join-Path $b2TestRoot ("diag_known_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagKnownLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagKnownStream = ((1..300 | ForEach-Object {
+                    "w password='$diagKnownSpacedSecret' x $diagKnownQuotedSecret y"
+                }) -join ' ')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardError $diagKnownStream -StandardOutput '' `
+                    -KnownSecret @($diagKnownSpacedSecret, $diagKnownQuotedSecret) -Level 'ERROR')
+                $diagKnownText = if (Test-Path -LiteralPath $diagKnownLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagKnownLogFile)
+                } else { '' }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagKnownText.Contains('Дiагностика 7-Zip test: ') -and
+                        $diagKnownText.Contains('***') -and
+                        -not $diagKnownText.Contains('LeakValue91') -and
+                        -not $diagKnownText.Contains('Spaced') -and
+                        -not $diagKnownText.Contains('QuoteLeak27')
+                    ) `
+                    -Name "SevenZipDiagnostics/KnownSecretWithSpacesAndQuotesMaskedWhole" `
+                    -Failure ("відомий пароль із пробілами в одинарних лапках і з лапками перед пробілом мусить бути замаскований " +
+                        "цілим — жодного уламку. Уламки: LeakValue91=$($diagKnownText.Contains('LeakValue91')), " +
+                        "Spaced=$($diagKnownText.Contains('Spaced')), QuoteLeak27=$($diagKnownText.Contains('QuoteLeak27'))")
 
                 # (8) Таймаут. Справжній 12-годинний дефолт
                 # (SevenZipTestTimeoutSeconds = 43200) у self-test не
@@ -21780,7 +21827,7 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         # writer падає з CommandNotFoundException.
                         'Get-BRAVOSevenZipDiagnosticStreamLines',
                         'Get-BRAVOSevenZipDiagnosticReasonText',
-                        'Get-BRAVOSevenZipDiagnosticBoundedText',
+                        'Protect-BRAVOSevenZipDiagnosticText',
                         'Write-BRAVOSevenZipFailureDiagnostics',
                         'Invoke-BRAVOSevenZipIntegrityTest',
                         'Test-BRAVOSevenZipArchiveSpecificFailure',
@@ -21840,7 +21887,7 @@ function Invoke-BRAVOSevenZipIntegrityTest {
     param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
     New-Object PSObject -Property @{
         Success = $false; ExitCode = 2; TimedOut = $false
-        Description = ("архів не відкрито з паролем " + $Password + " " + ('d' * 3000) + "`r`nROUTESECONDLINETOKEN")
+        Description = ("архів не відкрито з паролем " + $Password + " " + ((1..60 | ForEach-Object { 'd' * 49 }) -join ' ') + "`r`nROUTESECONDLINETOKEN")
         StandardOutput = ''
         StandardError = ("ERROR: Wrong password : " + $Password)
         Error = ''
@@ -21857,7 +21904,7 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         'Write-BRAVOArchiveHelperLog',
                         'Get-BRAVOSevenZipDiagnosticStreamLines',
                         'Get-BRAVOSevenZipDiagnosticReasonText',
-                        'Get-BRAVOSevenZipDiagnosticBoundedText',
+                        'Protect-BRAVOSevenZipDiagnosticText',
                         'Write-BRAVOSevenZipFailureDiagnostics',
                         'Invoke-BRAVOSevenZipIntegrityTest',
                         'Test-BRAVOSevenZipArchiveSpecificFailure',
