@@ -2176,13 +2176,22 @@ function Write-SevenZipFailureDiagnostics {
         [ValidateSet('ERROR', 'WARNING')][string]$Level = 'ERROR',
         [AllowNull()][AllowEmptyString()][string]$EmptyOutputReason
     )
+    # Пароль архіву — відомий секрет для маскування виводу 7-Zip ще до
+    # першого запису. Читається через Get-Variable: під StrictMode змінна
+    # може бути ще не ініціалізована (ранній збій до читання облікових даних).
+    $archivePasswordVariable = Get-Variable -Name archivePassword -Scope Script -ErrorAction SilentlyContinue
+    $knownSecret = @()
+    if ($null -ne $archivePasswordVariable -and -not [string]::IsNullOrEmpty([string]$archivePasswordVariable.Value)) {
+        $knownSecret = @([string]$archivePasswordVariable.Value)
+    }
     [void](Write-BRAVOSevenZipFailureDiagnostics `
         -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level } `
         -Operation $Operation `
         -StandardOutput $StandardOutput `
         -StandardError $StandardError `
         -Level $Level `
-        -EmptyOutputReason $EmptyOutputReason)
+        -EmptyOutputReason $EmptyOutputReason `
+        -KnownSecret $knownSecret)
 }
 
 function Get-BRAVOVSSSnapshotSourcePath {

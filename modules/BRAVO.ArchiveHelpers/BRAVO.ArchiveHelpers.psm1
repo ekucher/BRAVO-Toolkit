@@ -161,6 +161,36 @@ function Get-BRAVOSevenZipDiagnosticStreamLines {
     )
 }
 
+function Get-BRAVOSevenZipDiagnosticReasonText {
+    # Приватний helper: нормалізація причини збою (Error/Description
+    # результату, текст винятку запуску/preflight) — довільного й потенційно
+    # багаторядкового тексту. Перші -MaximumLines непорожніх рядків, бо суть
+    # причини — на ПОЧАТКУ (заголовок винятку), на відміну від потоків 7-Zip.
+    # З -SingleLine — лише перший непорожній рядок (для однорядкових
+    # headline-записів). З -MaximumLength — обрізання кінця з видимою
+    # позначкою, маркер входить у бюджет. Секрети тут НЕ маскуються:
+    # викликач передає вже замаскований текст.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Reason,
+        [ValidateRange(1, 500)][int]$MaximumLines = 20,
+        [ValidateRange(0, 100000)][int]$MaximumLength = 0,
+        [switch]$SingleLine
+    )
+
+    $lineLimit = if ($SingleLine) { 1 } else { $MaximumLines }
+    $reasonLines = @(
+        [string]$Reason -split '\r?\n' |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -First $lineLimit
+    )
+    $reasonText = ($reasonLines | ForEach-Object { $_.Trim() }) -join [Environment]::NewLine
+    $tailTruncationMarker = ' … (обрізано)'
+    if ($MaximumLength -gt $tailTruncationMarker.Length -and $reasonText.Length -gt $MaximumLength) {
+        $reasonText = $reasonText.Substring(0, $MaximumLength - $tailTruncationMarker.Length) + $tailTruncationMarker
+    }
+    return $reasonText
+}
+
 function Write-BRAVOSevenZipFailureDiagnostics {
     # ЄДИНИЙ канонічний запис діагностичного виводу 7-Zip на шляху збою —
     # і для integrity-тесту (Test-SevenZipArchiveIntegrity нижче), і для
@@ -180,8 +210,8 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     # гілку для порожнього виводу; ce4855d (2026-07-28, рукотворний
     # release-snapshot v4.0.2) відкотив усе разом із функцією; пізніший
     # коміт повернув деградовану DEBUG-копію лише для create-шляху.
-    # Підтверджено на production 5.2.4: у 224 архівних логах нуль рядків
-    # [DEBUG], а кожен збій 7-Zip лишився без пояснення.
+    # Наслідок у production: рядків [DEBUG] у журналах архівації немає, і
+    # збій 7-Zip лишався без пояснення.
     #
     # Рівень НЕ фіксований на ERROR навмисно: #300/#422 ввели WARNING для
     # retention старих архівів, і пояснення WARNING-події мусить бути
@@ -200,12 +230,17 @@ function Write-BRAVOSevenZipFailureDiagnostics {
         # збоїв «7-Zip не знайдено», «архів не знайдено» і вбитого по
         # таймауту процесу: потоки порожні, і причина існує лише там.
         [AllowNull()][AllowEmptyString()][string]$EmptyOutputReason,
+        # Точні значення секретів (пароль архіву), які маскуються в усьому,
+        # що пише writer (Protect-BRAVOLogSecret -KnownSecret), — незалежно
+        # від ключового слова поруч.
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
         [ValidateRange(1, 500)][int]$MaximumLines = 20,
         [ValidateRange(100, 100000)][int]$MaximumLength = 4000
     )
 
-    # Межа застосовується ОКРЕМО до кожного потоку, і stderr отримує власну
-    # квоту та йде ПЕРШИМ. Емпірично (`Tools\7za.exe` 26.02, `t -y -bb1`,
+    # Межа рядків — ОДНА на весь запис (-MaximumLines), але stderr має
+    # ПРІОРИТЕТ: спершу береться хвіст stderr, а stdout отримує лише
+    # залишок бюджету. Емпірично (`Tools\7za.exe` 26.02, `t -y -bb1`,
     # чотири класи збою) операторо-значущий вердикт 7-Zip друкує саме у
     # stderr, а НЕ в хвості stdout:
     #
@@ -217,46 +252,75 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     # stdout при цьому несе пер-записний прогрес `-bb1` ("T <ім'я>") і лише
     # агрегат у самому кінці ("Sub items Errors: 13", "Archives with Errors: 1").
     #
-    # Тому СПІЛЬНА межа тут небезпечна, і це не теоретично: архів із 40
-    # записів дає 55 рядків stdout проти 13 рядків stderr, і `-Last 20` по
-    # злитій послідовності (stderr першим) викидав ВСІ 13 рядків stderr —
-    # оператор отримував "Sub items Errors: 13" без імен тих 13 записів.
-    # Класифікатор у Test-SevenZipArchiveIntegrity при цьому читає обидва
-    # потоки повністю, тож ContentCorruption/PasswordRejected виставлялись
-    # із рядків, яких у журналі не було.
-    $errorLines = Get-BRAVOSevenZipDiagnosticStreamLines `
-        -StreamText ([string]$StandardError) -MaximumLines $MaximumLines
-    $outputLines = Get-BRAVOSevenZipDiagnosticStreamLines `
-        -StreamText ([string]$StandardOutput) -MaximumLines $MaximumLines
-    $diagnosticLines = @($errorLines) + @($outputLines)
+    # Тому `-Last N` по злитій послідовності небезпечний: архів із 40 записів
+    # дає 55 рядків stdout проти 13 рядків stderr, і спільний хвіст (stderr
+    # першим) викидав ВСІ 13 рядків stderr — оператор отримував
+    # "Sub items Errors: 13" без імен тих 13 записів. Окремі квоти на кожен
+    # потік цю проблему знімали, але давали запис до 2 x MaximumLines рядків;
+    # пріоритетний розподіл одного бюджету тримає і межу, і вердикт.
     $separator = [Environment]::NewLine
+    $recordPrefix = "${Operation}: "
+
+    # Маскування — ДО будь-якого обрізання і ДО першого запису. Вивід 7-Zip
+    # містить імена записів архіву (`-bb1` друкує рядок на запис), тож у
+    # журнал може потрапити довільний текст, зокрема значення, схоже на
+    # секрет; причина порожнього виводу — текст винятку. Локальний журнал
+    # сам не маскується, а маскування SFTP-копії настає пізніше й лише для
+    # відомих секретів, тому редагування тут — єдиний бар'єр для першого
+    # запису. Порядок «спершу маскування, потім межі» важливий: обрізання
+    # до маскування могло б розрізати секрет, і його уламок уже не
+    # впізнався б як відоме значення. Пароль архіву передається викликачем
+    # як -KnownSecret.
+    #
+    # Fail-closed: якщо маскування недоступне або впало, сирий текст НЕ
+    # пишеться — лише фіксований запис без вмісту потоків.
+    try {
+        if ($null -eq (Get-Command -Name 'Protect-BRAVOLogSecret' -CommandType Function -ErrorAction SilentlyContinue)) {
+            throw 'Protect-BRAVOLogSecret недоступна'
+        }
+        $safeStandardError = Protect-BRAVOLogSecret -Text ([string]$StandardError) -KnownSecret $KnownSecret
+        $safeStandardOutput = Protect-BRAVOLogSecret -Text ([string]$StandardOutput) -KnownSecret $KnownSecret
+        $safeEmptyOutputReason = Protect-BRAVOLogSecret -Text ([string]$EmptyOutputReason) -KnownSecret $KnownSecret
+    } catch {
+        Write-BRAVOArchiveHelperLog `
+            -Logger $Logger `
+            -Message "${recordPrefix}діагностику 7-Zip не записано: маскування секретів недоступне (вивід інструмента свідомо відкинуто)" `
+            -Level $Level
+        return $false
+    }
+
+    $errorLines = @(Get-BRAVOSevenZipDiagnosticStreamLines `
+        -StreamText ([string]$safeStandardError) -MaximumLines $MaximumLines)
+    $outputLines = @()
+    $outputLineBudget = $MaximumLines - $errorLines.Count
+    if ($outputLineBudget -gt 0) {
+        $outputLines = @(Get-BRAVOSevenZipDiagnosticStreamLines `
+            -StreamText ([string]$safeStandardOutput) -MaximumLines $outputLineBudget)
+    }
+    $diagnosticLines = @($errorLines) + @($outputLines)
+
+    # -MaximumLength — межа ВСЬОГО повідомлення, переданого logger-у, разом
+    # із префіксом операції; інакше запис рівно на межі виходив би за неї на
+    # довжину префікса. Мінімум гарантує місце хоча б для маркера обрізання.
+    $truncationMarker = '(обрізано) … '
+    $tailTruncationMarker = ' … (обрізано)'
+    $payloadBudget = [math]::Max($MaximumLength - $recordPrefix.Length, $truncationMarker.Length + 1)
 
     if ($diagnosticLines.Count -eq 0) {
         # «Інструмент промовчав» мусить відрізнятись від «діагностику
         # втратили»: саме цієї двозначності не можна було розв'язати по
         # production-логу.
         $emptyMessage = "7-Zip не повернув діагностичного тексту (stdout/stderr порожні)"
-        if (-not [string]::IsNullOrWhiteSpace($EmptyOutputReason)) {
-            # Причина — це Error/Description результату або текст винятку
-            # запуску/preflight, тобто довільний і потенційно багаторядковий
-            # текст. Межі writer-а (-MaximumLines/-MaximumLength) мусять
-            # триматись і тут, інакше один збій дав би необмежений ERROR-запис
-            # і таку саму masked-копію на SFTP. На відміну від потоків 7-Zip,
-            # суть причини — на ПОЧАТКУ (заголовок винятку), тому зберігаються
-            # перші рядки, а обрізається кінець.
-            $reasonLines = @(
-                [string]$EmptyOutputReason -split '\r?\n' |
-                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-                    Select-Object -First $MaximumLines
-            )
-            $emptyMessage += "; причина: " + ($reasonLines -join $separator)
+        $reasonText = Get-BRAVOSevenZipDiagnosticReasonText `
+            -Reason ([string]$safeEmptyOutputReason) -MaximumLines $MaximumLines
+        if (-not [string]::IsNullOrEmpty($reasonText)) {
+            $emptyMessage += "; причина: $reasonText"
         }
-        $tailTruncationMarker = ' … (обрізано)'
-        if ($emptyMessage.Length -gt $MaximumLength) {
-            $emptyMessage = $emptyMessage.Substring(0, $MaximumLength - $tailTruncationMarker.Length) +
+        if ($emptyMessage.Length -gt $payloadBudget) {
+            $emptyMessage = $emptyMessage.Substring(0, $payloadBudget - $tailTruncationMarker.Length) +
                 $tailTruncationMarker
         }
-        Write-BRAVOArchiveHelperLog -Logger $Logger -Message "${Operation}: $emptyMessage" -Level $Level
+        Write-BRAVOArchiveHelperLog -Logger $Logger -Message ($recordPrefix + $emptyMessage) -Level $Level
         return $false
     }
 
@@ -272,24 +336,22 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     # обрізання початку було б тим самим дефектом, що й спільна межа
     # рядків: stderr стоїть першим, тому гинув би першим.
     #
-    # Маркер входить У БЮДЖЕТ -MaximumLength, а не додається поверх нього:
-    # інакше параметр обіцяв би межу, якої запис не тримає.
-    $truncationMarker = '(обрізано) … '
+    # Маркер входить У БЮДЖЕТ, а не додається поверх нього: інакше параметр
+    # обіцяв би межу, якої запис не тримає.
     $errorText = $errorLines -join $separator
     $outputText = $outputLines -join $separator
 
     # Обрізати stderr лише коли він справді НЕ вміщається в бюджет. Порівняння
-    # з (MaximumLength - довжина маркера) обрізало б і stderr, що вміщається
-    # цілим (напр. 3995 символів при межі 4000), — і викидало б саме його
-    # початок, тобто перший рядок вердикту 7-Zip.
-    if ($errorText.Length -gt $MaximumLength) {
+    # з (бюджет - довжина маркера) обрізало б і stderr, що вміщається цілим, —
+    # і викидало б саме його початок, тобто перший рядок вердикту 7-Zip.
+    if ($errorText.Length -gt $payloadBudget) {
         # Навіть сам stderr перебирає бюджет (пошкоджено дуже багато
         # записів): лишаємо його хвіст, stdout не додаємо взагалі — там
         # усе одно лише пер-записний прогрес.
         $diagnosticText = $truncationMarker +
-            $errorText.Substring($errorText.Length - ($MaximumLength - $truncationMarker.Length))
+            $errorText.Substring($errorText.Length - ($payloadBudget - $truncationMarker.Length))
     } else {
-        $outputBudget = $MaximumLength - $errorText.Length
+        $outputBudget = $payloadBudget - $errorText.Length
         if ($errorText.Length -gt 0 -and $outputText.Length -gt 0) {
             $outputBudget -= $separator.Length
         }
@@ -309,7 +371,7 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     }
     Write-BRAVOArchiveHelperLog `
         -Logger $Logger `
-        -Message "${Operation}: $diagnosticText" `
+        -Message ($recordPrefix + $diagnosticText) `
         -Level $Level
     return $true
 }
@@ -420,9 +482,24 @@ function Test-SevenZipArchiveIntegrity {
     }
     $failureLevel = if ($archiveSpecificFailure) { $ArchiveFailureLevel } else { 'ERROR' }
 
+    # Description може нести довільний текст винятку preflight/запуску
+    # (зокрема повний шлях архіву), тому в однорядковий headline іде лише
+    # його перший рядок, замаскований і обмежений. Fail-closed: без
+    # маскування опис не пишеться зовсім.
+    $headlineDescription = ''
+    try {
+        if ($null -eq (Get-Command -Name 'Protect-BRAVOLogSecret' -CommandType Function -ErrorAction SilentlyContinue)) {
+            throw 'Protect-BRAVOLogSecret недоступна'
+        }
+        $headlineDescription = Get-BRAVOSevenZipDiagnosticReasonText `
+            -Reason (Protect-BRAVOLogSecret -Text ([string]$testResult.Description) -KnownSecret @($Password)) `
+            -SingleLine -MaximumLength 1000
+    } catch {
+        $headlineDescription = 'опис приховано: маскування секретів недоступне'
+    }
     Write-BRAVOArchiveHelperLog `
         -Logger $Logger `
-        -Message "Перевiрка цiлiсностi 7-Zip не пройдена (код: $exitCodeText — $($testResult.Description)): $ArchivePath" `
+        -Message "Перевiрка цiлiсностi 7-Zip не пройдена (код: $exitCodeText — $headlineDescription): $ArchivePath" `
         -Level $failureLevel
     # Діагностика пише рівнем $failureLevel — тим самим, що headline-рядок
     # вище (див. інваріант у Write-BRAVOSevenZipFailureDiagnostics). Раніше
@@ -445,7 +522,8 @@ function Test-SevenZipArchiveIntegrity {
         -StandardOutput ([string]$testResult.StandardOutput) `
         -StandardError ([string]$testResult.StandardError) `
         -Level $failureLevel `
-        -EmptyOutputReason $emptyDiagnosticReason)
+        -EmptyOutputReason $emptyDiagnosticReason `
+        -KnownSecret @($Password))
     return $false
 }
 

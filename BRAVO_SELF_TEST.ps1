@@ -9257,6 +9257,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             # шлях діагностики, а не лише ті тіла, де виклик логування є
             # сьогодні.
             'Get-BRAVOSevenZipDiagnosticStreamLines',
+            'Get-BRAVOSevenZipDiagnosticReasonText',
             'Test-SevenZipArchiveIntegrity',
             'Write-SevenZipFailureDiagnostics'
         )
@@ -20934,8 +20935,8 @@ try {
                 # регресію ce4855d, якою діагностику 7-Zip повернули на
                 # рівень DEBUG. DEBUG(1) < INFO(2), тому рядок відкидався
                 # ще до запису у файл, і production-журнал мав «код: 2» без
-                # жодного тексту від самого 7-Zip (підтверджено 224
-                # архівними логами з ураженого сервера: нуль рядків [DEBUG]).
+                # жодного тексту від самого 7-Zip (рядків [DEBUG] у
+                # production-журналах архівації немає).
                 #
                 # Контракт, який ці перевірки закріплюють:
                 #   1) при archive-specific збої текст 7-Zip потрапляє у
@@ -21275,7 +21276,7 @@ try {
                         $diagLenText -notmatch $diagLenHead -and
                         $diagLenText -match '\(обрізано\)' -and
                         $diagLenPayloadLength -gt 0 -and
-                        $diagLenPayloadLength -le 4000
+                        ('Дiагностика 7-Zip test: '.Length + $diagLenPayloadLength) -le 4000
                     ) `
                     -Name "SevenZipDiagnostics/LengthCapKeepsVerdictTailNotHead" `
                     -Failure ("символьна межа мусить зберігати ХВОСТ, явно позначати обрізання і сама триматись у 4000 " +
@@ -21336,6 +21337,9 @@ try {
                 # Символьний бюджет мусить витрачатись у порядку цінності:
                 # stderr цілим, залишок — на хвіст stdout. Спільне обрізання
                 # початку вбивало б stderr першим, бо він стоїть першим.
+                # Фікстура — 10 + 10 рядків: разом рівно в межі 20 рядків
+                # запису, тож перевіряється саме СИМВОЛЬНИЙ бюджет (~3000
+                # символів stderr + ~3100 stdout > 4000), а не межа рядків.
                 $diagBudgetLogFile = Join-Path $b2TestRoot ("diag_budget_{0}.log" -f [guid]::NewGuid().ToString("N"))
                 [void](Initialize-BRAVOLog -LogFile $diagBudgetLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
                 $diagBudgetStderrHead = 'EHEADTOKEN'
@@ -21343,13 +21347,13 @@ try {
                 $diagBudgetStdoutHead = 'OHEADTOKEN'
                 $diagBudgetStdoutTail = 'OTAILTOKEN'
                 $diagBudgetStderr = @(
-                    ($diagBudgetStderrHead + ('e' * 140))
-                    1..18 | ForEach-Object { "estub$_" + ('e' * 140) }
-                    ($diagBudgetStderrTail + ('e' * 140))
+                    ($diagBudgetStderrHead + ('e' * 290))
+                    1..8 | ForEach-Object { "estub$_" + ('e' * 290) }
+                    ($diagBudgetStderrTail + ('e' * 290))
                 ) -join "`r`n"
                 $diagBudgetStdout = @(
                     ($diagBudgetStdoutHead + ('o' * 300))
-                    1..18 | ForEach-Object { "ostub$_" + ('o' * 300) }
+                    1..8 | ForEach-Object { "ostub$_" + ('o' * 300) }
                     ($diagBudgetStdoutTail + ('o' * 300))
                 ) -join "`r`n"
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
@@ -21371,7 +21375,7 @@ try {
                         $diagBudgetText -notmatch $diagBudgetStdoutHead -and
                         $diagBudgetText -match '\(обрізано\)' -and
                         $diagBudgetPayloadLength -gt 0 -and
-                        $diagBudgetPayloadLength -le 4000
+                        ('Дiагностика 7-Zip test: '.Length + $diagBudgetPayloadLength) -le 4000
                     ) `
                     -Name "SevenZipDiagnostics/LengthBudgetKeepsStderrWholeAndTruncatesStdout" `
                     -Failure ("символьний бюджет мусить зберігати stderr ЦІЛИМ (і голову, і хвіст) та витрачати " +
@@ -21383,14 +21387,17 @@ try {
                         "голова stdout обрізана=$($diagBudgetText -notmatch $diagBudgetStdoutHead); " +
                         "маркер обрізання=$($diagBudgetText -match '\(обрізано\)')")
 
-                # stderr, що ВМІЩАЄТЬСЯ в бюджет, не обрізається. Межовий
-                # випадок: довжина між (4000 - довжина маркера) і 4000. Поріг
-                # «бюджет мінус маркер» обрізав би такий stderr і викидав би
-                # саме його початок — перший рядок вердикту 7-Zip.
+                # stderr, що ВМІЩАЄТЬСЯ в бюджет, не обрізається. Бюджет —
+                # 4000 символів на ВСЕ повідомлення, тобто 4000 мінус префікс
+                # операції. Межовий випадок: довжина між (бюджет - довжина
+                # маркера) і бюджетом. Поріг «бюджет мінус маркер» обрізав би
+                # такий stderr і викидав би саме його початок — перший рядок
+                # вердикту 7-Zip.
                 $diagFitLogFile = Join-Path $b2TestRoot ("diag_fit_{0}.log" -f [guid]::NewGuid().ToString("N"))
                 [void](Initialize-BRAVOLog -LogFile $diagFitLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
                 $diagFitHead = 'FITHEADTOKEN'
-                $diagFitStderr = $diagFitHead + ('f' * (3995 - $diagFitHead.Length))
+                $diagFitBudget = 4000 - 'Дiагностика 7-Zip test: '.Length
+                $diagFitStderr = $diagFitHead + ('f' * ($diagFitBudget - 2 - $diagFitHead.Length))
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
                     -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
                     -StandardOutput '' -StandardError $diagFitStderr -Level 'ERROR')
@@ -21399,12 +21406,12 @@ try {
                 } else { '' }
                 Test-BRAVOCondition `
                     -Condition (
-                        $diagFitStderr.Length -eq 3995 -and
+                        $diagFitStderr.Length -eq ($diagFitBudget - 2) -and
                         $diagFitText.Contains($diagFitStderr) -and
                         $diagFitText -notmatch '\(обрізано\)'
                     ) `
                     -Name "SevenZipDiagnostics/StderrWithinBudgetIsNotTruncated" `
-                    -Failure ("stderr довжиною 3995 символів уміщається в межу 4000 і мусить потрапити в журнал ЦІЛИМ, " +
+                    -Failure ("stderr довжиною $($diagFitStderr.Length) символів уміщається в межу 4000 разом із префіксом і мусить потрапити в журнал ЦІЛИМ, " +
                         "без маркера обрізання. Повний stderr присутній=$($diagFitText.Contains($diagFitStderr)), " +
                         "голова присутня=$($diagFitText -match $diagFitHead), " +
                         "маркер обрізання=$($diagFitText -match '\(обрізано\)')")
@@ -21441,7 +21448,7 @@ try {
                         $diagReasonPayload -notmatch $diagReasonTail -and
                         $diagReasonPayload -match '\(обрізано\)' -and
                         $diagReasonPayload.Length -gt 0 -and
-                        $diagReasonPayload.Length -le 4000 -and
+                        ('Дiагностика 7-Zip test: '.Length + $diagReasonPayload.Length) -le 4000 -and
                         $diagReasonPayloadLines.Count -le 20
                     ) `
                     -Name "SevenZipDiagnostics/EmptyOutputReasonIsCapped" `
@@ -21450,6 +21457,92 @@ try {
                         "рядків=$($diagReasonPayloadLines.Count), голова=$($diagReasonPayload -match $diagReasonHead), " +
                         "хвіст відсутній=$($diagReasonPayload -notmatch $diagReasonTail), " +
                         "маркер обрізання=$($diagReasonPayload -match '\(обрізано\)')")
+
+                # Межа 20 рядків — ОДНА на весь запис, а не на кожен потік: окремі
+                # квоти давали до 40 рядків. Пріоритет stderr: спершу його хвіст,
+                # stdout отримує лише залишок бюджету.
+                $diagSharedRecordLines = {
+                    param([string]$LogPath)
+                    $sharedText = if (Test-Path -LiteralPath $LogPath -PathType Leaf) { [IO.File]::ReadAllText($LogPath) } else { '' }
+                    $sharedMatch = [regex]::Match($sharedText, '(?s)Дiагностика 7-Zip test: (.*?)(?=\r?\n\d{4}-\d{2}-\d{2} |\z)')
+                    if ($sharedMatch.Success) {
+                        @($sharedMatch.Groups[1].Value -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    } else { @() }
+                }
+                $diagSharedFullLog = Join-Path $b2TestRoot ("diag_shared_full_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagSharedFullLog -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardError ((1..25 | ForEach-Object { "ESHARE_{0:D3}" -f $_ }) -join "`r`n") `
+                    -StandardOutput ((1..25 | ForEach-Object { "OSHARE_{0:D3}" -f $_ }) -join "`r`n") `
+                    -Level 'ERROR')
+                $diagSharedFullLines = @(& $diagSharedRecordLines $diagSharedFullLog)
+                $diagSharedMixLog = Join-Path $b2TestRoot ("diag_shared_mix_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagSharedMixLog -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardError ((1..13 | ForEach-Object { "EMIX_{0:D3}" -f $_ }) -join "`r`n") `
+                    -StandardOutput ((1..55 | ForEach-Object { "OMIX_{0:D3}" -f $_ }) -join "`r`n") `
+                    -Level 'ERROR')
+                $diagSharedMixLines = @(& $diagSharedRecordLines $diagSharedMixLog)
+                $diagSharedMixStderr = @($diagSharedMixLines | Where-Object { $_ -match '^EMIX_' }).Count
+                $diagSharedMixStdout = @($diagSharedMixLines | Where-Object { $_ -match '^OMIX_' })
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagSharedFullLines.Count -eq 20 -and
+                        @($diagSharedFullLines | Where-Object { $_ -match '^OSHARE_' }).Count -eq 0 -and
+                        ($diagSharedFullLines -contains 'ESHARE_025') -and
+                        ($diagSharedFullLines -contains 'ESHARE_006') -and
+                        -not ($diagSharedFullLines -contains 'ESHARE_005') -and
+                        $diagSharedMixLines.Count -eq 20 -and
+                        $diagSharedMixStderr -eq 13 -and
+                        $diagSharedMixStdout.Count -eq 7 -and
+                        ($diagSharedMixStdout -contains 'OMIX_055') -and
+                        ($diagSharedMixStdout -contains 'OMIX_049') -and
+                        -not ($diagSharedMixStdout -contains 'OMIX_048')
+                    ) `
+                    -Name "SevenZipDiagnostics/WholeRecordKeepsOneLineBudgetWithStderrPriority" `
+                    -Failure ("межа 20 рядків — на ВЕСЬ запис з пріоритетом stderr: 25+25 рядків мусять дати 20 рядків хвоста stderr " +
+                        "без stdout, а 13+55 — усі 13 рядків stderr і 7 рядків хвоста stdout. " +
+                        "25+25: рядків=$($diagSharedFullLines.Count); 13+55: рядків=$($diagSharedMixLines.Count), " +
+                        "stderr=$diagSharedMixStderr, stdout=$($diagSharedMixStdout.Count)")
+
+                # Маскування ДО першого запису: вивід 7-Zip несе імена записів
+                # архіву, а причина порожнього виводу — текст винятку; локальний
+                # журнал сам не маскується. Пароль архіву (-KnownSecret) і
+                # ключові шаблони (password=...) не мусять потрапити в журнал
+                # жодною гілкою writer-а. Значення зібрано не контіґуальним
+                # літералом (сканери секретів у репозиторії).
+                $diagMaskSecret = -join @('Sz', 'Mask', 'Fixture', '91')
+                $diagMaskInline = -join @('pw', 'Inline', '77')
+                $diagMaskLogFile = Join-Path $b2TestRoot ("diag_mask_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagMaskLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardError ("ERROR: CRC Failed : backup_$diagMaskSecret.dat`r`nentry password=$diagMaskInline") `
+                    -StandardOutput "T entry_$diagMaskSecret.dat" `
+                    -KnownSecret @($diagMaskSecret) -Level 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardError '' -StandardOutput '' `
+                    -EmptyOutputReason "не вдалося відкрити архів із паролем $diagMaskSecret" `
+                    -KnownSecret @($diagMaskSecret) -Level 'ERROR')
+                $diagMaskText = if (Test-Path -LiteralPath $diagMaskLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagMaskLogFile)
+                } else { '' }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagMaskText -match 'CRC Failed' -and
+                        $diagMaskText -match 'не повернув діагностичного тексту' -and
+                        -not $diagMaskText.Contains($diagMaskSecret) -and
+                        -not $diagMaskText.Contains($diagMaskInline) -and
+                        $diagMaskText.Contains('***')
+                    ) `
+                    -Name "SevenZipDiagnostics/SecretsMaskedBeforeFirstWrite" `
+                    -Failure ("відомий секрет (-KnownSecret) і значення після password= мусять бути замасковані в записі writer-а " +
+                        "— і в потоках 7-Zip, і в причині порожнього виводу. Вердикт присутній=$($diagMaskText -match 'CRC Failed'), " +
+                        "секрет витік=$($diagMaskText.Contains($diagMaskSecret)), " +
+                        "inline-значення витекло=$($diagMaskText.Contains($diagMaskInline)), маска присутня=$($diagMaskText.Contains('***'))")
 
                 # (8) Таймаут. Справжній 12-годинний дефолт
                 # (SevenZipTestTimeoutSeconds = 43200) у self-test не
@@ -21493,6 +21586,7 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         # матеріалізує лише перелічені функції, тому без неї
                         # writer падає з CommandNotFoundException.
                         'Get-BRAVOSevenZipDiagnosticStreamLines',
+                        'Get-BRAVOSevenZipDiagnosticReasonText',
                         'Write-BRAVOSevenZipFailureDiagnostics',
                         'Invoke-BRAVOSevenZipIntegrityTest',
                         'Test-BRAVOSevenZipArchiveSpecificFailure',
@@ -21539,6 +21633,73 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         "ArchiveSpecific=$($diagTimeoutInfo['ArchiveSpecific']), " +
                         "причина присутня=$($diagTimeoutText -match ([regex]::Escape($diagTimeoutReason))), " +
                         "ERROR=$($diagTimeoutText -match '\[ERROR'), WARNING=$($diagTimeoutText -match '\[WARNING')")
+
+                # Роутинг Test-SevenZipArchiveIntegrity: headline-рядок «не
+                # пройдена» бере з Description лише ПЕРШИЙ рядок, обмежений і
+                # замаскований, а пароль архіву передається writer-у як відомий
+                # секрет. Заглушка повертає archive-specific збій, де і
+                # Description (довгий, багаторядковий), і stderr несуть пароль.
+                $diagRouteLogFile = Join-Path $b2TestRoot ("diag_route_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagRouteLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagRouteStubs = @'
+function Invoke-BRAVOSevenZipIntegrityTest {
+    param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+    New-Object PSObject -Property @{
+        Success = $false; ExitCode = 2; TimedOut = $false
+        Description = ("архів не відкрито з паролем " + $Password + " " + ('d' * 3000) + "`r`nROUTESECONDLINETOKEN")
+        StandardOutput = ''
+        StandardError = ("ERROR: Wrong password : " + $Password)
+        Error = ''
+    }
+}
+function Test-BRAVOSevenZipArchiveSpecificFailure { param($Result, $ArchivePath) return $true }
+function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, $Collector, $Logger) return $false }
+'@
+                $diagRouteModule = New-BRAVOSelfTestRuntimeModule `
+                    -SourceText (([IO.File]::ReadAllText(
+                        (Join-Path $root 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1'),
+                        [Text.Encoding]::UTF8)) + "`r`n" + $diagRouteStubs) `
+                    -FunctionNames @(
+                        'Write-BRAVOArchiveHelperLog',
+                        'Get-BRAVOSevenZipDiagnosticStreamLines',
+                        'Get-BRAVOSevenZipDiagnosticReasonText',
+                        'Write-BRAVOSevenZipFailureDiagnostics',
+                        'Invoke-BRAVOSevenZipIntegrityTest',
+                        'Test-BRAVOSevenZipArchiveSpecificFailure',
+                        'Register-BRAVOLegacyBomPasswordFallback',
+                        'Test-SevenZipArchiveIntegrity'
+                    ) `
+                    -PreferLastDefinitionOnDuplicate
+                $diagRouteResult = & $diagRouteModule {
+                    param($Logger, $FixturePass)
+                    Test-SevenZipArchiveIntegrity `
+                        -SevenZipPath 'C:\nonexistent\7za.exe' `
+                        -ArchivePath 'C:\nonexistent\route.7z' `
+                        -Password $FixturePass `
+                        -Logger $Logger
+                } $diagLogger $diagFixtureLegacyPassword
+                $diagRouteText = if (Test-Path -LiteralPath $diagRouteLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagRouteLogFile)
+                } else { '' }
+                $diagRouteHeadline = [regex]::Match($diagRouteText, 'Перевiрка цiлiсностi 7-Zip не пройдена[^\r\n]*').Value
+                Test-BRAVOCondition `
+                    -Condition (
+                        $false -eq [bool]$diagRouteResult -and
+                        $diagRouteHeadline.Length -gt 0 -and
+                        $diagRouteHeadline.Length -le 1200 -and
+                        $diagRouteHeadline -match '\(обрізано\)' -and
+                        $diagRouteText -notmatch 'ROUTESECONDLINETOKEN' -and
+                        $diagRouteText -match 'Wrong password' -and
+                        -not $diagRouteText.Contains($diagFixtureLegacyPassword)
+                    ) `
+                    -Name "SevenZipDiagnostics/IntegrityHeadlineReasonIsBoundedAndMasked" `
+                    -Failure ("headline «не пройдена» мусить містити лише перший рядок Description, обмежений (з позначкою обрізання), " +
+                        "а пароль архіву не мусить потрапити в журнал ні з headline, ні з діагностики. " +
+                        "Result=$diagRouteResult, довжина headline=$($diagRouteHeadline.Length), " +
+                        "маркер=$($diagRouteHeadline -match '\(обрізано\)'), " +
+                        "другий рядок витік=$($diagRouteText -match 'ROUTESECONDLINETOKEN'), " +
+                        "вердикт присутній=$($diagRouteText -match 'Wrong password'), " +
+                        "пароль витік=$($diagRouteText.Contains($diagFixtureLegacyPassword))")
 
                 # Create-шлях: виклик діагностики мусить лежати САМЕ у
                 # timeout-гілці New-Archive. Перевірка по вкладеності AST, а не
