@@ -21670,33 +21670,47 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         'Test-SevenZipArchiveIntegrity'
                     ) `
                     -PreferLastDefinitionOnDuplicate
+                # Шлях архіву — extended-length (~3500 символів): разом з
+                # обмеженим описом headline інакше перевищив би 4000 символів.
+                # Ім'я архіву в кінці шляху мусить уціліти.
+                $diagRouteArchivePath = '\\?\C:\nonexistent\' + ('p' * 3500) + '\ROUTEARCHIVELEAF.7z'
                 $diagRouteResult = & $diagRouteModule {
-                    param($Logger, $FixturePass)
+                    param($Logger, $FixturePass, $ArchivePathValue)
                     Test-SevenZipArchiveIntegrity `
                         -SevenZipPath 'C:\nonexistent\7za.exe' `
-                        -ArchivePath 'C:\nonexistent\route.7z' `
+                        -ArchivePath $ArchivePathValue `
                         -Password $FixturePass `
                         -Logger $Logger
-                } $diagLogger $diagFixtureLegacyPassword
+                } $diagLogger $diagFixtureLegacyPassword $diagRouteArchivePath
                 $diagRouteText = if (Test-Path -LiteralPath $diagRouteLogFile -PathType Leaf) {
                     [IO.File]::ReadAllText($diagRouteLogFile)
                 } else { '' }
                 $diagRouteHeadline = [regex]::Match($diagRouteText, 'Перевiрка цiлiсностi 7-Zip не пройдена[^\r\n]*').Value
+                # Опис обрізано з кінця (маркер перед "): "), шлях — з початку
+                # (маркер перед хвостом шляху), ім'я архіву вціліло.
+                $diagRouteDescriptionTruncated = $diagRouteHeadline.Contains(' … (обрізано)): ')
+                $diagRoutePathTruncatedKeepingLeaf = (
+                    $diagRouteHeadline.Contains('(обрізано) … ppp') -and
+                    $diagRouteHeadline.EndsWith('\ROUTEARCHIVELEAF.7z')
+                )
                 Test-BRAVOCondition `
                     -Condition (
                         $false -eq [bool]$diagRouteResult -and
                         $diagRouteHeadline.Length -gt 0 -and
-                        $diagRouteHeadline.Length -le 1200 -and
-                        $diagRouteHeadline -match '\(обрізано\)' -and
+                        $diagRouteHeadline.Length -le 4000 -and
+                        $diagRouteDescriptionTruncated -and
+                        $diagRoutePathTruncatedKeepingLeaf -and
                         $diagRouteText -notmatch 'ROUTESECONDLINETOKEN' -and
                         $diagRouteText -match 'Wrong password' -and
                         -not $diagRouteText.Contains($diagFixtureLegacyPassword)
                     ) `
                     -Name "SevenZipDiagnostics/IntegrityHeadlineReasonIsBoundedAndMasked" `
                     -Failure ("headline «не пройдена» мусить містити лише перший рядок Description, обмежений (з позначкою обрізання), " +
+                        "весь headline разом з extended-length шляхом — не довше 4000 символів зі збереженим ім'ям архіву, " +
                         "а пароль архіву не мусить потрапити в журнал ні з headline, ні з діагностики. " +
                         "Result=$diagRouteResult, довжина headline=$($diagRouteHeadline.Length), " +
-                        "маркер=$($diagRouteHeadline -match '\(обрізано\)'), " +
+                        "опис обрізано=$diagRouteDescriptionTruncated, " +
+                        "шлях обрізано зі збереженим іменем=$diagRoutePathTruncatedKeepingLeaf, " +
                         "другий рядок витік=$($diagRouteText -match 'ROUTESECONDLINETOKEN'), " +
                         "вердикт присутній=$($diagRouteText -match 'Wrong password'), " +
                         "пароль витік=$($diagRouteText.Contains($diagFixtureLegacyPassword))")

@@ -497,9 +497,25 @@ function Test-SevenZipArchiveIntegrity {
     } catch {
         $headlineDescription = 'опис приховано: маскування секретів недоступне'
     }
+    # Межа 4000 символів — на ВЕСЬ headline: шлях архіву (extended-length
+    # шлях — тисячі символів) додається вже після обмеженого опису, тож
+    # обмеження лише опису межі не тримає. Якщо запис не вміщається,
+    # обрізається ПОЧАТОК шляху з видимою позначкою: ім'я архіву в кінці
+    # шляху оператору потрібніше за кореневі каталоги.
+    $headlinePrefix = "Перевiрка цiлiсностi 7-Zip не пройдена (код: $exitCodeText — $headlineDescription): "
+    $headlinePath = [string]$ArchivePath
+    $headlinePathMarker = '(обрізано) … '
+    $headlinePathBudget = 4000 - $headlinePrefix.Length
+    if ($headlinePath.Length -gt $headlinePathBudget) {
+        $headlinePath = if ($headlinePathBudget -gt $headlinePathMarker.Length) {
+            $headlinePathMarker + $headlinePath.Substring($headlinePath.Length - ($headlinePathBudget - $headlinePathMarker.Length))
+        } else {
+            $headlinePathMarker.TrimEnd()
+        }
+    }
     Write-BRAVOArchiveHelperLog `
         -Logger $Logger `
-        -Message "Перевiрка цiлiсностi 7-Zip не пройдена (код: $exitCodeText — $headlineDescription): $ArchivePath" `
+        -Message ($headlinePrefix + $headlinePath) `
         -Level $failureLevel
     # Діагностика пише рівнем $failureLevel — тим самим, що headline-рядок
     # вище (див. інваріант у Write-BRAVOSevenZipFailureDiagnostics). Раніше
