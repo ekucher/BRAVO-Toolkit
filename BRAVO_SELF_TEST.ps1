@@ -9365,6 +9365,54 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     "з них ERROR: $(@($createDiagPrefixLines | Where-Object { $_ -match '\[ERROR' }).Count), " +
                     "маркер у тексті: $($createDiagAllText -match [regex]::Escape($createDiagMarker)), " +
                     "рядків про порожній вивід: $($createDiagEmptyLines.Count)")
+
+            # Create-адаптер мусить передавати пароль архіву
+            # ($script:archivePassword) writer-у як відомий секрет: інакше
+            # перейменування змінної чи зміна її області тихо вимкнули б
+            # маскування на create-шляху. Пароль виставляється в області
+            # модуля адаптера (там, де його читає Get-Variable -Scope Script) і
+            # подається в stderr та в причину порожнього виводу. Значення
+            # зібрано не контіґуальним літералом (сканери секретів).
+            $createDiagPasswordLogFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_7Z_CREATE_PW_{0}.log" -f [guid]::NewGuid().ToString('N'))
+            try {
+                [void](Initialize-BRAVOLog -LogFile $createDiagPasswordLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $createDiagPasswordValue = -join @('Create', 'Adapter', 'Fixture', '83')
+                & $createDiagModule {
+                    param($FixtureValue)
+                    $script:archivePassword = $FixtureValue
+                    try {
+                        Write-SevenZipFailureDiagnostics `
+                            -Operation "Дiагностика 7-Zip create" `
+                            -StandardOutput '' `
+                            -StandardError ("ERROR: Wrong password : " + $FixtureValue)
+                        Write-SevenZipFailureDiagnostics `
+                            -Operation "Дiагностика 7-Zip create" `
+                            -StandardOutput '' `
+                            -StandardError '' `
+                            -EmptyOutputReason ("запуск 7-Zip з паролем " + $FixtureValue + " не вдався")
+                    } finally {
+                        Remove-Variable -Name archivePassword -Scope Script -ErrorAction SilentlyContinue
+                    }
+                } $createDiagPasswordValue
+                $createDiagPasswordText = if (Test-Path -LiteralPath $createDiagPasswordLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($createDiagPasswordLogFile)
+                } else { '' }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $createDiagPasswordText -match 'Wrong password' -and
+                        $createDiagPasswordText -match 'не повернув діагностичного тексту' -and
+                        -not $createDiagPasswordText.Contains($createDiagPasswordValue) -and
+                        $createDiagPasswordText.Contains('***')
+                    ) `
+                    -Name "BackupDiagnostics/SevenZipCreateAdapterMasksArchivePassword" `
+                    -Failure ("create-адаптер мусить передавати `$script:archivePassword writer-у як відомий секрет: пароль не мусить " +
+                        "потрапити в журнал ні з потоку 7-Zip, ні з причини порожнього виводу. " +
+                        "Вердикт присутній=$($createDiagPasswordText -match 'Wrong password'), " +
+                        "пароль витік=$($createDiagPasswordText.Contains($createDiagPasswordValue)), " +
+                        "маска присутня=$($createDiagPasswordText.Contains('***'))")
+            } finally {
+                Remove-Item -LiteralPath $createDiagPasswordLogFile -Force -ErrorAction SilentlyContinue
+            }
         } finally {
             Remove-Item -LiteralPath $createDiagLogFile -Force -ErrorAction SilentlyContinue
             Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
@@ -21458,6 +21506,30 @@ try {
                         "рядків=$($diagReasonPayloadLines.Count), голова=$($diagReasonPayload -match $diagReasonHead), " +
                         "хвіст відсутній=$($diagReasonPayload -notmatch $diagReasonTail), " +
                         "маркер обрізання=$($diagReasonPayload -match '\(обрізано\)')")
+
+                # Причина з одного гігантського токена без пробілів і переносів:
+                # груба межа до маскування відкидає її цілком (уламок міг би бути
+                # частиною секрету). Тоді запис мусить явно показати обрізання, а не
+                # тихо лишити порожню причину.
+                $diagTokenLogFile = Join-Path $b2TestRoot ("diag_token_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagTokenLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput '' -StandardError '' -Level 'ERROR' `
+                    -EmptyOutputReason ('T' * 20000))
+                $diagTokenText = if (Test-Path -LiteralPath $diagTokenLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagTokenLogFile)
+                } else { '' }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagTokenText -match 'не повернув діагностичного тексту' -and
+                        $diagTokenText.Contains('причина: (обрізано)') -and
+                        -not $diagTokenText.Contains('TTTT')
+                    ) `
+                    -Name "SevenZipDiagnostics/DroppedGiantReasonIsMarkedTruncated" `
+                    -Failure ("причина з одного гігантського токена, відкинута до маскування, мусить бути позначена як обрізана " +
+                        "(«причина: (обрізано)»), а не зникати тихо. " +
+                        "маркер=$($diagTokenText.Contains('причина: (обрізано)')), уламок токена=$($diagTokenText.Contains('TTTT'))")
 
                 # Межа 20 рядків — ОДНА на весь запис, а не на кожен потік: окремі
                 # квоти давали до 40 рядків. Пріоритет stderr: спершу його хвіст,

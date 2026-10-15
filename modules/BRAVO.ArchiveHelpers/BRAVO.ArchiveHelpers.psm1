@@ -276,8 +276,11 @@ function Get-BRAVOSevenZipDiagnosticReasonText {
         ($reasonText.Length -gt $MaximumLength -or
             ($truncated -and ($reasonText.Length + $tailTruncationMarker.Length) -gt $MaximumLength))) {
         $reasonText = $reasonText.Substring(0, $MaximumLength - $tailTruncationMarker.Length) + $tailTruncationMarker
-    } elseif ($truncated -and $reasonText.Length -gt 0) {
-        $reasonText += $tailTruncationMarker
+    } elseif ($truncated) {
+        # Обрізання мусить бути видимим і тоді, коли від тексту нічого не
+        # лишилось (груба межа відкинула один гігантський токен без меж
+        # слів): інакше причина тихо зникла б із запису.
+        $reasonText = if ($reasonText.Length -gt 0) { $reasonText + $tailTruncationMarker } else { '(обрізано)' }
     }
     return $reasonText
 }
