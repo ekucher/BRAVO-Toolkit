@@ -515,6 +515,78 @@ Test-BRAVOCondition ($secretMaskPatternMismatches.Count -eq 0) `
     -Name 'Logging/ProtectLogSecretPatternsUnchangedWithoutKnownSecret' `
     -Failure "Protect-BRAVOLogSecret без -KnownSecret має давати рівно ту саму шаблонну масковку, що й до #365; не збіглися очікування: $($secretMaskPatternMismatches -join ' | ')"
 
+# --- (1b) #453: значення в одинарних лапках із пробілом маскуються повністю
+# (не лише до першого пробілу), для всіх трьох шаблонів параметра пароля.
+$secretMaskSingleQuoteCases = @(
+    @{ In = "password='A B'"; Out = 'password=***' },
+    @{ In = "-password='A B'"; Out = '-password=***' },
+    @{ In = " -p'A B'"; Out = ' -p***' }
+)
+$secretMaskSingleQuoteMismatches = New-Object System.Collections.Generic.List[string]
+foreach ($secretMaskCase in $secretMaskSingleQuoteCases) {
+    $secretMaskActual = & $secretMaskProtectOnlyModule { param($t) Protect-BRAVOLogSecret -Text $t } $secretMaskCase.In
+    if ([string]$secretMaskActual -cne [string]$secretMaskCase.Out) {
+        $secretMaskSingleQuoteMismatches.Add("'$($secretMaskCase.In)' -> '$secretMaskActual' (очікувалось '$($secretMaskCase.Out)')")
+    }
+}
+Test-BRAVOCondition ($secretMaskSingleQuoteMismatches.Count -eq 0) `
+    -Name 'Logging/ProtectLogSecretSingleQuotedValueFullyMasked' `
+    -Failure "#453: значення в одинарних лапках із пробілом має маскуватися повністю, а не лише до першого пробілу; розбіжності: $($secretMaskSingleQuoteMismatches -join ' | ')"
+
+# --- (1b-ii) #453 рев'ю (CPR-453-1): межа старту схеми (?<![a-z0-9+.-])
+# не сміє блокувати матч там, де стара (без межі) регулярка його таки
+# знаходила — URL, перед схемою якого стоїть цифра/+/./- без роздільника
+# (напр. у суцільному рядку діагностики), і раніше маскувався.
+$secretMaskUrlBoundaryCases = @(
+    @{ In = '1sftp://u:p@h'; Out = '1sftp://u:***@h' },
+    @{ In = '-sftp://u:p@h'; Out = '-sftp://u:***@h' },
+    @{ In = '.https://u:p@h'; Out = '.https://u:***@h' },
+    @{ In = '+git+ssh://u:p@h'; Out = '+git+ssh://u:***@h' },
+    @{ In = 'remote-https://u:p@h'; Out = 'remote-https://u:***@h' },
+    @{ In = 'x9.http://u:p@h'; Out = 'x9.http://u:***@h' }
+)
+$secretMaskUrlBoundaryMismatches = New-Object System.Collections.Generic.List[string]
+foreach ($secretMaskCase in $secretMaskUrlBoundaryCases) {
+    $secretMaskActual = & $secretMaskProtectOnlyModule { param($t) Protect-BRAVOLogSecret -Text $t } $secretMaskCase.In
+    if ([string]$secretMaskActual -cne [string]$secretMaskCase.Out) {
+        $secretMaskUrlBoundaryMismatches.Add("'$($secretMaskCase.In)' -> '$secretMaskActual' (очікувалось '$($secretMaskCase.Out)')")
+    }
+}
+Test-BRAVOCondition ($secretMaskUrlBoundaryMismatches.Count -eq 0) `
+    -Name 'Logging/ProtectLogSecretUrlPatternMasksNonLetterPrefixedScheme' `
+    -Failure "#453 (CPR-453-1): URL зі схемою, перед якою стоїть цифра/+/./- без роздільника, мусить маскуватися так само, як і без такого префікса; розбіжності: $($secretMaskUrlBoundaryMismatches -join ' | ')"
+
+# --- (1b-iii) #453 рев'ю (CPR-453-2): текст, приклеєний одразу за
+# закриваючою лапкою без пробілу, мусить лишатися замаскованим, а не
+# випливати як хвіст (той самий клас дефекту для обох типів лапок).
+$secretMaskQuoteGlueCases = @(
+    @{ In = "password='abc'def"; Out = 'password=***' },
+    @{ In = 'password="abc"def'; Out = 'password=***' },
+    @{ In = "-password='abc'def ok"; Out = '-password=*** ok' }
+)
+$secretMaskQuoteGlueMismatches = New-Object System.Collections.Generic.List[string]
+foreach ($secretMaskCase in $secretMaskQuoteGlueCases) {
+    $secretMaskActual = & $secretMaskProtectOnlyModule { param($t) Protect-BRAVOLogSecret -Text $t } $secretMaskCase.In
+    if ([string]$secretMaskActual -cne [string]$secretMaskCase.Out) {
+        $secretMaskQuoteGlueMismatches.Add("'$($secretMaskCase.In)' -> '$secretMaskActual' (очікувалось '$($secretMaskCase.Out)')")
+    }
+}
+Test-BRAVOCondition ($secretMaskQuoteGlueMismatches.Count -eq 0) `
+    -Name 'Logging/ProtectLogSecretQuotedValueGluedSuffixMasked' `
+    -Failure "#453 (CPR-453-2): текст, приклеєний одразу за закриваючою лапкою без пробілу, не сміє лишатися незамаскованим хвостом; розбіжності: $($secretMaskQuoteGlueMismatches -join ' | ')"
+
+# --- (1c) #453: шаблон URL-кредів лишається лінійним на суцільному
+# фрагменті без секретів (раніше — O(L^2), фактичне зависання на >=1 000 000).
+$secretMaskSolidRunText = 'U' * 1000000
+$secretMaskSolidRunStopwatch = [Diagnostics.Stopwatch]::StartNew()
+$secretMaskSolidRunResult = & $secretMaskProtectOnlyModule { param($t) Protect-BRAVOLogSecret -Text $t } $secretMaskSolidRunText
+$secretMaskSolidRunStopwatch.Stop()
+$secretMaskSolidRunSeconds = $secretMaskSolidRunStopwatch.Elapsed.TotalSeconds
+Test-BRAVOCondition (
+    [string]$secretMaskSolidRunResult -ceq $secretMaskSolidRunText -and $secretMaskSolidRunSeconds -lt 5
+) -Name 'Logging/ProtectLogSecretUrlPatternLinearOnSolidRun' `
+    -Failure "#453: URL-кредів шаблон має опрацювати суцільний фрагмент 1 000 000 символів за прийнятний час (<5с) без зміни тексту без секретів; фактично: $secretMaskSolidRunSeconds с, текст змінено: $([string]$secretMaskSolidRunResult -cne $secretMaskSolidRunText)"
+
 # --- (2) Сирий секрет без keyword-а маскується точним значенням.
 $secretMaskRawResult = $null
 $secretMaskRawError = $secretMaskSetupError
