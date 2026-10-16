@@ -558,7 +558,7 @@ Test-BRAVOCondition -Condition (
     -Failure "Send-BRAVOArchiveFinalOperationsEvent мусить бути ідемпотентною (прапорець `$script:archiveFinalOperationsEventSent), брати severity з канонічної Get-BRAVOExitCodeSeverity (а не зі статусу generation -- COMPLETE з кодом 10 звітував SUCCESS) і НІКОЛИ не присвоювати `$script:processExitCode (телеметрія не змінює результат прогону)"
 
 Test-BRAVOCondition -Condition (
-    ([Text.RegularExpressions.Regex]::Matches($archiveScriptText, 'Send-BRAVOOperationsEvent\s+`')).Count -ge 1 -and
+    ([Text.RegularExpressions.Regex]::Matches($archiveScriptText, 'Send-BRAVOOperationsEventSafely\s+`')).Count -ge 1 -and
     $archiveFinalOpsEventBody -match 'Send-BRAVOOperationsEvent'
 ) -Name 'Archive/FinalOperationsEventOwnsTheGenerationEmission' `
     -Failure "сама відправка зведеної generation-події мусить жити всередині Send-BRAVOArchiveFinalOperationsEvent, а не дублюватись у хвості Main -- інакше дві копії політики severity/Details розійдуться"
@@ -606,7 +606,7 @@ Test-BRAVOCondition -Condition ($archiveStepHistoryProblems.Count -eq 0) `
 # перевірити не може: який severity і які Details виходять для кожного
 # класу завершення прогону.
 $archiveFinalOpsStub = @'
-function Send-BRAVOOperationsEvent {
+function Send-BRAVOOperationsEventSafely {
     param($OperationsReportingSettings, $CredentialTargets, [string]$InstitutionCode,
           [string]$Category, [string]$Severity, [string]$Message, [string]$Component,
           $Services, $Details)
@@ -784,7 +784,7 @@ function Send-BRAVONotificationChunks {
     param($Provider, $WebhookUrl, $MessageChunks, $TimeoutSeconds)
     throw "self-test: Send-BRAVONotificationChunks НЕ повинен викликатись, коли notification-гейт активний (`$NoSlack=`$true)"
 }
-function Send-BRAVOOperationsEvent {
+function Send-BRAVOOperationsEventSafely {
     param($OperationsReportingSettings, $CredentialTargets, $InstitutionCode, $Category, $Severity, $Component, $Message, $Services, $Details)
     $script:archiveGatingTestState.OperationsEventCalls++
     $script:archiveGatingTestState.LastMessage = $Message
@@ -794,7 +794,7 @@ function Send-BRAVOOperationsEvent {
 $archiveGatingFunctionNames = @(
     'Write-BRAVOLog', 'Protect-BRAVOLogSecret', 'Get-HostInformation', 'Format-BRAVOUkrainianCount',
     'New-BRAVOOperatorNotificationMessage', 'Resolve-BRAVONotificationRoute', 'Resolve-BRAVONotificationEndpoint',
-    'ConvertTo-BRAVONotificationPayloadText', 'Send-BRAVONotificationChunks', 'Send-BRAVOOperationsEvent',
+    'ConvertTo-BRAVONotificationPayloadText', 'Send-BRAVONotificationChunks', 'Send-BRAVOOperationsEventSafely',
     'Send-ToolIntegrityAlert', 'Send-BRAVOArchiveFreeSpaceAlert', 'Send-BAZAIncompatibleNameAlert'
 )
 $archiveGatingCombinedSource = $archiveGatingStub + "`n" + $archiveScriptText
@@ -1014,7 +1014,7 @@ function Write-BRAVOOperationStatus {
     param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details)
     Add-ProbeEvent "STATUS $ExitCode"
 }
-function Send-BRAVOOperationsEvent {
+function Send-BRAVOOperationsEventSafely {
     param($OperationsReportingSettings, $CredentialTargets, $InstitutionCode, $Category, $Severity, $Component, $Message, $Details)
     Add-ProbeEvent ("OPS-EVENT {0} {1}" -f $Details['exitCode'], $Severity)
 }
