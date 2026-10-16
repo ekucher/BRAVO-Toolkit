@@ -1260,6 +1260,10 @@ function Get-BRAVOWmiInstance {
 function Get-WinEvent {
     param($FilterHashtable, $MaxEvents, $ErrorAction)
     Add-ProbeEvent 'SCM-READ'
+    # B-1 (#433): раніше цей стаб повністю ігнорував $FilterHashtable — зламаний
+    # фільтр (інший журнал/провайдер/набір EventID у Get-BRAVOServiceRecoveryScmEvent)
+    # проходив непоміченим. Тепер фільтр зберігається для перевірки змісту.
+    $script:ProbeScmFilterSeen = $FilterHashtable
     if ($script:ProbeScmReadFails) { throw 'self-test: журнал System недоступний' }
     return @($script:ProbeScmEvents)
 }
@@ -1352,6 +1356,13 @@ $probeScenarios = [ordered]@{
     'RSIntegrityGateClosed' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:modelIntegrityEstablished = $false }
     'RSMarkerWriteFails' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeMarkerWriteFails = $true }
     'RSStartFails' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeStartFailures = @('exchangAPI') }
+    # B-4 (#433, характеризація ІСНУЮЧОЇ поведінки, нічого не змінюємо): BRAVO
+    # впала — exchangAPI (Running) зупиняється як залежна для перезапуску
+    # разом з BRAVO, але не стартує назад. Це не "впала до прогону" служба
+    # (plan.FailedKeys = лише Bravo), тож FR-5 (пауза/облік спроб) її не
+    # торкається — маркер BRAVO_MAINTENANCE_RECOVER лишається, підняти службу
+    # може лише Health-watchdog осиротілого маркера.
+    'RSBravoFailedDependentStartFails' = { $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeExitCodes['BRAVO'] = 1067; $script:ProbeStartFailures = @('exchangAPI') }
     'RSRotationErrorCritical' = { $script:ProbeServices['exchangAPI'] = 'Stopped'; $script:ProbeExchangeRotationErrors = 1 }
     'RSStopTimeoutStillRunning' = { $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeStopFailures = @('exchangAPI') }
     'RSDependentStartedExternally' = { $script:ProbeServices['BRAVO'] = 'Stopped'; $script:ProbeExternalStartDuringLogs = $true }
@@ -1411,6 +1422,7 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             $script:ProbeMarkerWriteFails = $false
             $script:ProbeScmReadFails = $false
             $script:ProbeScmEvents = @()
+            $script:ProbeScmFilterSeen = $null
             $script:ProbeStateSeed = $null
             $script:ProbeSeedBravoDisabled = $false
             $script:ProbeForceRestore = $false
@@ -1485,6 +1497,12 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
                 QueuedCritical = $script:CriticalErrorsList.Count
                 DeliveredCritical = [int]$script:maintenanceDeliveredCriticalAlertCount
                 OwnLogUploadSuppressed = [bool]$script:maintenanceOwnLogUploadAttempted
+                # B-1 (#433): зміст фільтра, яким Get-BRAVOServiceRecoveryScmEvent
+                # покликав Get-WinEvent — щоб перевірити журнал/провайдер/EventID,
+                # а не лише форму результату.
+                ScmFilterLogName = $(if ($null -ne $script:ProbeScmFilterSeen) { [string]$script:ProbeScmFilterSeen['LogName'] } else { $null })
+                ScmFilterProviderName = $(if ($null -ne $script:ProbeScmFilterSeen) { [string]$script:ProbeScmFilterSeen['ProviderName'] } else { $null })
+                ScmFilterIds = $(if ($null -ne $script:ProbeScmFilterSeen) { @($script:ProbeScmFilterSeen['Id']) } else { @() })
             }
         } catch {
             [pscustomobject]@{ ProbeError = ('{0} @ {1}' -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) }
@@ -1580,6 +1598,28 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             (& $recoverStateCount $Result 'exchangAPI') -eq 1 -and [bool]$Result.OwnLogUploadSuppressed
         } 'ServiceRecovery/RecoverServicesExchangeApiOnly' `
             '#314 FR-3: впала exchangAPI — lock без очікування, докази (StartMode, Status, ExitCode, подія SCM) у журналі _RECOVER_PID, маркер BRAVO_MAINTENANCE_RECOVER, її журнали, запуск лише exchangAPI, облік спроби, маркер прибрано, WARNING «відновлено»'
+
+        # B-1 (#433): Get-WinEvent попередньо був повністю застабований — тест
+        # перевіряв лише форму результату (Events/Error), тож зламаний
+        # -FilterHashtable (інший журнал, провайдер чи набір EventID у
+        # Get-BRAVOServiceRecoveryScmEvent) пройшов би непоміченим. Тепер стаб
+        # зберігає сам фільтр (ScmFilterLogName/ScmFilterProviderName/ScmFilterIds),
+        # і цей тест звіряє його зміст з документованими 8 EventID.
+        $expectedScmEventIds = @(7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034)
+        $scmFilterResult = $null
+        if ($null -ne $recoverResults -and $null -ne $recoverResults.PSObject.Properties['RSExchangeFailed']) { $scmFilterResult = $recoverResults.RSExchangeFailed }
+        $scmFilterIdsActual = @()
+        if ($null -ne $scmFilterResult) { $scmFilterIdsActual = @(@($scmFilterResult.ScmFilterIds) | ForEach-Object { [int]$_ } | Sort-Object) }
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $scmFilterResult -and
+                [string]$scmFilterResult.ScmFilterLogName -ceq 'System' -and
+                [string]$scmFilterResult.ScmFilterProviderName -ceq 'Service Control Manager' -and
+                (($scmFilterIdsActual -join ',') -eq (($expectedScmEventIds | Sort-Object) -join ','))
+            ) `
+            -Name 'ServiceRecovery/ScmEventFilterMatchesDocumentedEventIds' `
+            -Failure "B-1 (#433): Get-BRAVOServiceRecoveryScmEvent має читати журнал System від Service Control Manager рівно за 8 документованими EventID (7000,7009,7011,7022,7023,7024,7031,7034) через Get-WinEvent -FilterHashtable — перевіряємо зміст фільтра, а не лише форму результату. Отримано: журнал='$(if ($null -ne $scmFilterResult) { $scmFilterResult.ScmFilterLogName })', провайдер='$(if ($null -ne $scmFilterResult) { $scmFilterResult.ScmFilterProviderName })', ID=[$($scmFilterIdsActual -join ', ')]"
+
         & $recoverCheck 'RSBravoFailed' 0 @(
             $recoverLock; 'SCM-READ'; (& $recoverMarker @('BRAVO', 'exchangAPI', 'BravoWeb'))
             'STOP BravoWeb'; 'STOP exchangAPI'
@@ -1752,6 +1792,28 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             param($Result) (& $recoverStateCount $Result 'exchangAPI') -eq 1 -and [int]$Result.QueuedCritical -gt 0 -and [int]$Result.DeliveredCritical -eq [int]$Result.QueuedCritical
         } 'ServiceRecovery/RecoverServicesStartFailureCritical' `
             '#314 FR-3/FR-6: служба не стартувала — спроба рахується, CRITICAL «не вдалося підняти» і код 60; загальні критичні алерти циклу не дублюються страховкою runtime'
+        # B-4 (#433): ХАРАКТЕРИЗАЦІЯ існуючої поведінки — нічого не змінюємо.
+        # BRAVO впала (FailedKeys = лише Bravo) -> exchangAPI зупиняється як
+        # залежна для перезапуску разом з BRAVO, але не стартує назад
+        # (stoppedNotStarted). Вона НЕ входить у plan.FailedKeys, тож FR-5
+        # (Invoke-BRAVOServiceRecoveryAttemptAccounting: пауза/облік спроб) її
+        # не торкається — ні паузи, ні запису в state-файл для exchangAPI
+        # немає. Маркер BRAVO_MAINTENANCE_RECOVER НЕ прибирається (на відміну
+        # від RSStartFails, де впала сама exchangAPI): підняти її може лише
+        # Health-watchdog осиротілого маркера (розділ «Аварійне відновлення
+        # служб» в OPERATIONS.md), без пауз 0/5/15/60 і без обліку спроб.
+        & $recoverCheck 'RSBravoFailedDependentStartFails' 60 @(
+            $recoverLock; 'SCM-READ'; (& $recoverMarker @('BRAVO', 'exchangAPI', 'BravoWeb'))
+            'STOP BravoWeb'; 'STOP exchangAPI'
+            'TRACE-ROTATION'; 'EXCHANGE-ROTATION'; 'APACHE-ROTATION'; 'WEBAPP-ROTATION'
+            'START BRAVO'; 'START-FAIL exchangAPI'; 'START BravoWeb'
+            'RECOVERY-STATE-WRITE'; $recoverRecovered; $recoverFailed; 'LOCK-EXIT'
+        ) $recoverLogName {
+            param($Result)
+            (& $recoverStateCount $Result 'BRAVO') -eq 1 -and (& $recoverStateCount $Result 'exchangAPI') -eq 0 -and
+            ([string]$Result.LogText).Contains('Ownership-маркер залишено: зупинені профілем служби не запущено (exchangAPI) — Health-watchdog повторить спробу')
+        } 'ServiceRecovery/RecoverServicesDependentStartFailureLeavesMarkerForHealthWatchdog' `
+            'B-4 (#433, характеризація): впала BRAVO, exchangAPI зупинена як залежна для перезапуску, але не стартує назад — МАРКЕР BRAVO_MAINTENANCE_RECOVER НЕ прибирається (на відміну від впалої до прогону служби), FR-5 (пауза/облік спроб) exchangAPI не торкається (0 записів у state-файлі), підняти її може лише Health-watchdog осиротілого маркера'
         # Рев'ю PR #432 (B-P2-1): критична помилка без FR-6 Failed (збій ротації
         # журналу) — окреме CRITICAL прогону, а не лише WARNING «відновлено».
         $recoverRunCritical = 'NOTIFY CRITICAL|ВІДНОВЛЕННЯ СЛУЖБ BRAVO: КРИТИЧНІ ПОМИЛКИ'

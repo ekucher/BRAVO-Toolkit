@@ -48,17 +48,62 @@ param(
 
 $protectedWorkerMode = -not [string]::IsNullOrWhiteSpace($ProtectedPayloadPath)
 $helperLoggingPath = Join-Path $PSScriptRoot "modules\BRAVO.HelperLogging\BRAVO.HelperLogging.psd1"
-Import-Module -Name $helperLoggingPath -ErrorAction Stop
-$null = Start-BRAVOHelperLog `
-    -ScriptPath $PSCommandPath `
-    -ConfigPath $ConfigPath `
-    -QuietConsole:$protectedWorkerMode
-
-# Лише для нового неінтерактивного заголовка/РЕЗУЛЬТАТ нижче — інтерактивне
-# меню (Show-BRAVOCredentialMenu) лишається на власному Clear-Host-банері,
-# не мігрується (докладніше — коментар біля використання).
 $credentialsConsoleModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Console\BRAVO.Console.psd1"
-Import-Module -Name $credentialsConsoleModulePath -ErrorAction Stop
+
+# #396 (HARDENING, A48 deferred-debt): до цього моменту HelperLogging/Console
+# можуть бути ще не завантажені, тож Complete-BRAVOCredentialSetup/
+# Complete-BRAVOHelperLog (яка в ній) НЕДОСТУПНІ — виклик когось із них тут
+# лише додав би ще один необроблений виняток. Той самий dependency-free
+# fail path, що бутстрап-гейт цілісності в BRAVO_SELF_TEST.ps1: лише
+# Write-Host і bare exit, без Complete-*.
+#
+# У worker-режимі (-ProtectedPayloadPath/-ResultPath задані) без цього
+# блоку збій тут не писав би result.json УЗАГАЛІ: батьківський Invoke-AsSystem
+# чекав би 60-секундний таймаут і трактував стан як невизначений (безпечно,
+# без відкату, але без точної причини — прийнятий ризик issue #396). Тут
+# пишеться МІНІМАЛЬНИЙ result.json навмисно БЕЗ ConvertTo-BRAVOJson
+# (BRAVO.Compatibility ще не імпортовано на цьому етапі) — лише вбудований
+# ConvertTo-Json. Контракт Identity/Results/FatalError/OperationsStarted
+# (Test-SystemWorkerResponseFailed/New-SystemWorkerFatalError) лишається
+# незмінним; додається лише необов'язкове службове поле
+# LoggingBootstrapFailed, яке батьківський парсер не читає, тож розширення
+# не може нічого зламати. OperationsStarted=$false тут ЧЕСНИЙ: до жодної
+# операції зі сховищем ще не дійшло.
+try {
+    Import-Module -Name $helperLoggingPath -ErrorAction Stop
+    $null = Start-BRAVOHelperLog `
+        -ScriptPath $PSCommandPath `
+        -ConfigPath $ConfigPath `
+        -QuietConsole:$protectedWorkerMode
+
+    # Лише для нового неінтерактивного заголовка/РЕЗУЛЬТАТ нижче — інтерактивне
+    # меню (Show-BRAVOCredentialMenu) лишається на власному Clear-Host-банері,
+    # не мігрується (докладніше — коментар біля використання).
+    Import-Module -Name $credentialsConsoleModulePath -ErrorAction Stop
+} catch {
+    $loggingBootstrapFailureMessage = $_.Exception.Message
+    if (-not [string]::IsNullOrWhiteSpace($ProtectedPayloadPath) -and
+        -not [string]::IsNullOrWhiteSpace($ResultPath)) {
+        try {
+            $loggingBootstrapFailureResponse = [ordered]@{
+                Identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+                Results = @()
+                FatalError = "SYSTEM worker: збій ініціалізації логування до запуску операцій ($loggingBootstrapFailureMessage)"
+                OperationsStarted = $false
+                LoggingBootstrapFailed = $true
+            } | ConvertTo-Json -Depth 4
+            $temporaryLoggingBootstrapFailurePath = "$ResultPath.tmp"
+            [IO.File]::WriteAllText($temporaryLoggingBootstrapFailurePath, $loggingBootstrapFailureResponse, [Text.Encoding]::UTF8)
+            Move-Item -LiteralPath $temporaryLoggingBootstrapFailurePath -Destination $ResultPath -Force
+        } catch {
+            # Немає способу повідомити інакше: батьківський процес зрештою
+            # побачить таймаут 60с (прийнятий ризик A48, issue #396).
+        }
+    } else {
+        Write-Host "ПОМИЛКА ініціалізації логування: $loggingBootstrapFailureMessage" -ForegroundColor Red
+    }
+    exit 1
+}
 
 $interactiveMenuRequested = (
     -not $PSBoundParameters.ContainsKey("Action") -and

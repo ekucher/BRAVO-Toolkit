@@ -300,13 +300,20 @@ function Read-BRAVOServiceRecoveryState {
 
 function Get-BRAVOServiceRecoveryWindowAttempts {
     # Спроби служби в ковзному вікні обліку, від найстаршої. Стан не змінює.
+    # Рев'ю #433 (C-2): мітка пізніша за Now (годинник переведено назад, або
+    # пошкоджений/чужий за змістом state-файл з мітками з майбутнього) не
+    # береться до уваги — довіряти їй небезпечно: NextAllowedAt (FR-5)
+    # рахувався б від майбутньої мітки і міг би придушити відновлення на
+    # години. Такі мітки відсіюються тут же, тож і облік (Write-BRAVOServiceRecoveryState
+    # прибирає записи поза вікном), і рішення про паузу (Test-BRAVOServiceRecoveryPauseElapsed)
+    # їх ігнорують однаково.
     param(
         [AllowNull()][hashtable]$Entry,
         [Parameter(Mandatory = $true)][DateTimeOffset]$Now
     )
     if ($null -eq $Entry) { return @() }
     $windowStart = $Now.AddHours(-1 * (Get-BRAVOServiceRecoveryPolicy).WindowHours)
-    return @(@($Entry.attempts) | Where-Object { $null -ne $_ -and $_ -gt $windowStart } | Sort-Object)
+    return @(@($Entry.attempts) | Where-Object { $null -ne $_ -and $_ -gt $windowStart -and $_ -le $Now } | Sort-Object)
 }
 
 function Write-BRAVOServiceRecoveryState {
