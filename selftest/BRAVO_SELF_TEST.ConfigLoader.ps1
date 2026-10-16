@@ -2293,7 +2293,20 @@ try {
         'credentialSettings.Targets.OperationsBootstrapSecret',
         # Поріг «малого» файлу MODEL для самоперевірки після bravocmd
         # repair (Compare-FileSizes): новий канонічний лист Restore.
-        'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes'
+        'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes',
+        # #316: закриття клієнтів BIS перед реставрацією — нова вкладена
+        # hashtable (чотири нові канонічні листи всередині) після
+        # заморожування фікстури. Compare-BRAVOConfigurationGraphForParity
+        # перевіряє наявність КЛЮЧА на кожному рівні рекурсії ДО спуску в
+        # нього (рядок "-not $Actual.Contains($key)"), тому відсутній
+        # вузол дає ОДИН diff на самому вузлі, а не чотири на листах —
+        # саме цей шлях (а не дочірні WaitMinutes/ReminderMinutes/
+        # PollSeconds/ProcessNames) і треба дозволити.
+        'maintenanceSettings.Restore.ClientClose',
+        # #364: runtime-синхронізація логів через SFTP — тумблер і каталог
+        # призначення, обидва нові канонічні листи після заморожування фікстури.
+        'componentSettings.SFTP.RuntimeLogSyncEnabled',
+        'sftpDirectories.RuntimeLogs'
     )
     $parityAdditiveAbsenceSuffix = ' : відсутнє в BRAVO.config'
     $parityDiffs = @(@($parityDiffsList.ToArray()) | Where-Object {

@@ -18,6 +18,7 @@ function Invoke-BRAVOSelfTestSftpCredentialsRequiredScenario {
         [bool]$ArchiveUploadEnabled = $false,
         [bool]$MaintenanceLogUploadEnabled = $false,
         [bool]$ArchiveLogUploadEnabled = $false,
+        [bool]$RuntimeLogSyncEnabled = $false,
         [bool]$ScheduledSftpSyncRequired = $false,
         [bool]$BackupMonitoringSftpEnabled = $false
     )
@@ -26,6 +27,7 @@ function Invoke-BRAVOSelfTestSftpCredentialsRequiredScenario {
         -ArchiveUploadEnabled $ArchiveUploadEnabled `
         -MaintenanceLogUploadEnabled $MaintenanceLogUploadEnabled `
         -ArchiveLogUploadEnabled $ArchiveLogUploadEnabled `
+        -RuntimeLogSyncEnabled $RuntimeLogSyncEnabled `
         -ScheduledSftpSyncRequired $ScheduledSftpSyncRequired `
         -BackupMonitoringSftpEnabled $BackupMonitoringSftpEnabled
 }
@@ -40,6 +42,7 @@ Test-BRAVOCondition -Condition (
 Test-BRAVOCondition -Condition (
     (Invoke-BRAVOSelfTestSftpCredentialsRequiredScenario -SftpEnabled $false `
         -ArchiveUploadEnabled $true -MaintenanceLogUploadEnabled $true -ArchiveLogUploadEnabled $true `
+        -RuntimeLogSyncEnabled $true `
         -ScheduledSftpSyncRequired $true -BackupMonitoringSftpEnabled $true) -eq $false
 ) -Name 'SftpCredentialsRequired/MasterDisabledOverridesAllChildFlags' `
     -Failure "SftpEnabled=`$false має нейтралізувати геть усі дочірні прапорці"
@@ -74,6 +77,13 @@ Test-BRAVOCondition -Condition (
     (Invoke-BRAVOSelfTestSftpCredentialsRequiredScenario -ArchiveLogUploadEnabled $true) -eq $true
 ) -Name 'SftpCredentialsRequired/ArchiveLogUploadAloneRequires' `
     -Failure "лише ArchiveLogUploadEnabled=`$true (усе інше вимкнено, зокрема ArchiveUpload) МАЄ вимагати SFTP-креденшелі — саме цей сценарій пропускав старий inline-вираз"
+
+# (i) #364: ЛИШЕ RuntimeLogSyncEnabled -> required (той самий клас
+# сценарію, що (f)/(g) для Maintenance/ArchiveLogUploadEnabled).
+Test-BRAVOCondition -Condition (
+    (Invoke-BRAVOSelfTestSftpCredentialsRequiredScenario -RuntimeLogSyncEnabled $true) -eq $true
+) -Name 'SftpCredentialsRequired/RuntimeLogSyncAloneRequires' `
+    -Failure "лише RuntimeLogSyncEnabled=`$true (усе інше вимкнено) МАЄ вимагати SFTP-креденшелі — #364"
 
 # (h) Структурний regression-тест: усі 4 виклик-площини (BRAVO_DRY_RUN.ps1
 # x2, BRAVO_CREDENTIALS_SETUP.ps1, BRAVO.Configurator.Credentials.psm1)

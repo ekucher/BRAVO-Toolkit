@@ -5821,7 +5821,7 @@ if (-not $environmentPreflight.IsWritable) {
     # Operations-звітність — незалежний канал від Slack/Discord-нотифікації.
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -6379,7 +6379,7 @@ if ($healthIssues.Count -eq 0) {
                 -LogWarningCount $script:BRAVOWarningCount
             $operationsHealthSeverity = [string]$operationsHealthVerdict.Severity
             $operationsHealthMessage = [string]$operationsHealthVerdict.Message
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -6606,7 +6606,7 @@ $alertFingerprint = Get-AlertFingerprint -Issues $healthIssues
 # тимчасово пригнічено дедуплікацією однакового алерту на цьому сервері.
 if ($null -ne $operationsReportingSettings) {
     try {
-        Send-BRAVOOperationsEvent `
+        Send-BRAVOOperationsEventSafely `
             -OperationsReportingSettings $operationsReportingSettings `
             -CredentialTargets $credentialSettings.Targets `
             -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `

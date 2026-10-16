@@ -176,6 +176,14 @@ function Get-BRAVODefaultConfiguration {
                 # для самоперевірки після bravocmd repair: менші файли
                 # критичні лише при зникненні або обнуленні.
                 IntegritySmallFileThresholdBytes = 1048576
+                # #316: закриття клієнтів BIS перед реставрацією (власник,
+                # 2026-09-30). WaitMinutes=0 — закривати без очікування.
+                ClientClose = @{
+                    WaitMinutes     = 5
+                    ReminderMinutes = 1
+                    PollSeconds     = 10
+                    ProcessNames    = @('Bis')
+                }
             }
             Retention = @{
                 ArchiveDays = 14
@@ -242,6 +250,10 @@ function Get-BRAVODefaultConfiguration {
                 ArchiveUpload = $true
                 MaintenanceLogUploadEnabled = $false
                 ArchiveLogUploadEnabled = $false
+                # #364: окремий тумблер синхронізації дозволених (allowlist)
+                # runtime-журналів на SFTP — дефолт $false для наявних
+                # установок (owner-approved рішення #2).
+                RuntimeLogSyncEnabled = $false
             }
             SMB = @{
                 Enabled = $true
@@ -376,6 +388,10 @@ function Get-BRAVODefaultConfiguration {
             ExchangeApiLogs = "logs/exchangapi"
             MaintenanceLog = "logs/maintenance"
             ArchivLog = "logs/archiv"
+            # #364: базовий каталог для синхронізації дозволених runtime-
+            # журналів; Maintenance додає сегмент хоста ($env:COMPUTERNAME)
+            # при побудові фактичного шляху (owner-approved рішення #4).
+            RuntimeLogs = "logs/runtime"
         }
 
         backupMonitoring = @{
