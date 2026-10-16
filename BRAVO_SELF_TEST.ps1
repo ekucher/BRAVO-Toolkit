@@ -21553,6 +21553,45 @@ try {
                         "позначка причини=$($diagOversizeText.Contains('причина: (1000001 символів) не записано')), " +
                         "сирий вміст: stdout=$($diagOversizeText.Contains('UUUU')), причина=$($diagOversizeText.Contains('TTTT'))")
 
+                # Позначка пропущеного stdout не витісняє stderr: вона отримує лише
+                # залишок бюджету рядків. (а) MaximumLines=1 — єдиний рядок лишається
+                # за вердиктом stderr; (б) 20 рядків stderr при типовому бюджеті —
+                # усі 20 на місці, позначка stdout не відбирає жодного.
+                $diagPriorityLogFile = Join-Path $b2TestRoot ("diag_priority_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagPriorityLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput ('U' * 200001) -StandardError 'ERROR: CRC Failed : single_verdict.dat' `
+                    -MaximumLines 1 -Level 'ERROR')
+                $diagPrioritySingleText = if (Test-Path -LiteralPath $diagPriorityLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagPriorityLogFile)
+                } else { '' }
+                $diagPriorityFullLogFile = Join-Path $b2TestRoot ("diag_priority_full_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagPriorityFullLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput ('U' * 200001) `
+                    -StandardError ((1..20 | ForEach-Object { "ERROR: CRC Failed : prio_{0:D3}.dat" -f $_ }) -join "`r`n") `
+                    -Level 'ERROR')
+                $diagPriorityFullText = if (Test-Path -LiteralPath $diagPriorityFullLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagPriorityFullLogFile)
+                } else { '' }
+                $diagPriorityFullStderr = @(1..20 | Where-Object { $diagPriorityFullText.Contains(("prio_{0:D3}.dat" -f $_)) }).Count
+                $diagPrioritySingleVerdict = $diagPrioritySingleText.Contains('CRC Failed : single_verdict.dat')
+                $diagPrioritySingleMarker = $diagPrioritySingleText.Contains('stdout 7-Zip (')
+                $diagPriorityFullMarker = $diagPriorityFullText.Contains('stdout 7-Zip (')
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagPrioritySingleVerdict -and
+                        -not $diagPrioritySingleMarker -and
+                        $diagPriorityFullStderr -eq 20 -and
+                        -not $diagPriorityFullMarker
+                    ) `
+                    -Name "SevenZipDiagnostics/OmittedStdoutMarkerNeverDisplacesStderr" `
+                    -Failure ("позначка пропущеного stdout мусить отримувати лише залишок бюджету рядків після stderr. " +
+                        "MaximumLines=1: вердикт=$diagPrioritySingleVerdict, позначка stdout=$diagPrioritySingleMarker; " +
+                        "20 рядків stderr: уціліло=$diagPriorityFullStderr, позначка stdout=$diagPriorityFullMarker")
+
                 # Межа 20 рядків — ОДНА на весь запис, а не на кожен потік: окремі
                 # квоти давали до 40 рядків. Пріоритет stderr: спершу його хвіст,
                 # stdout отримує лише залишок бюджету.

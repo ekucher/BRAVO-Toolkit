@@ -363,28 +363,26 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     }
 
     # Пропущений надто великий потік — видима позначка з довжиною на місці
-    # вмісту, а не тиша: «вивід був, але не записаний» мусить відрізнятись
-    # від «інструмент промовчав». Позначки йдуть першими й входять у бюджет
-    # рядків; вердикт stderr, якщо stderr не пропущено, лишається.
-    $omissionLines = @()
-    if ($maskedStandardError.Omitted) {
-        $omissionLines += "stderr 7-Zip ($($maskedStandardError.Length) символів) не записано: надто великий або з надто довгим суцільним фрагментом для безпечного маскування"
+    # ЙОГО вмісту, а не тиша: «вивід був, але не записаний» мусить
+    # відрізнятись від «інструмент промовчав». Позначка займає місце саме
+    # того потоку, який замінює, тож пріоритет stderr не порушується:
+    # позначка пропущеного stdout отримує лише залишок бюджету рядків після
+    # stderr і ніколи не витісняє вердикт stderr.
+    $errorLines = if ($maskedStandardError.Omitted) {
+        @("stderr 7-Zip ($($maskedStandardError.Length) символів) не записано: надто великий або з надто довгим суцільним фрагментом для безпечного маскування")
+    } else {
+        @(Get-BRAVOSevenZipDiagnosticStreamLines `
+            -StreamText ([string]$maskedStandardError.Text) -MaximumLines $MaximumLines)
     }
-    if ($maskedStandardOutput.Omitted) {
-        $omissionLines += "stdout 7-Zip ($($maskedStandardOutput.Length) символів) не записано: надто великий або з надто довгим суцільним фрагментом для безпечного маскування"
-    }
-    $errorLineBudget = $MaximumLines - $omissionLines.Count
-    $errorLines = @()
-    if ($errorLineBudget -gt 0) {
-        $errorLines = @(Get-BRAVOSevenZipDiagnosticStreamLines `
-            -StreamText ([string]$maskedStandardError.Text) -MaximumLines $errorLineBudget)
-    }
-    $errorLines = @($omissionLines) + @($errorLines)
     $outputLines = @()
     $outputLineBudget = $MaximumLines - $errorLines.Count
     if ($outputLineBudget -gt 0) {
-        $outputLines = @(Get-BRAVOSevenZipDiagnosticStreamLines `
-            -StreamText ([string]$maskedStandardOutput.Text) -MaximumLines $outputLineBudget)
+        $outputLines = if ($maskedStandardOutput.Omitted) {
+            @("stdout 7-Zip ($($maskedStandardOutput.Length) символів) не записано: надто великий або з надто довгим суцільним фрагментом для безпечного маскування")
+        } else {
+            @(Get-BRAVOSevenZipDiagnosticStreamLines `
+                -StreamText ([string]$maskedStandardOutput.Text) -MaximumLines $outputLineBudget)
+        }
     }
     $diagnosticLines = @($errorLines) + @($outputLines)
 
