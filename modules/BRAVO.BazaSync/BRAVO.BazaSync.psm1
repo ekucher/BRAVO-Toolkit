@@ -1514,6 +1514,18 @@ function Write-BRAVOBazaRemoteCheckpoint {
     # failed цикл не повинен публікувати "successful" checkpoint. Метадані
     # лише: жодних credentials/webhook/secret значень (ТЗ п.24).
     #
+    # #398 (P3): "успішний" тут — те саме канонічне визначення, що й для
+    # Archive/Health (Test-BRAVOBazaSyncStatusSuccess: COMPLETE і
+    # MUTATION_AUTO_ARCHIVED), а не лише COMPLETE. Раніше checkpoint
+    # публікувався ЛИШЕ для COMPLETE: цикл, що завершився MUTATION_AUTO_
+    # ARCHIVED (успішний за тим самим контрактом #285/#293), лишав
+    # зовнішнього спостерігача (checkpoint-читача) із ЗАСТАРІЛОЮ міткою
+    # попереднього COMPLETE-циклу — суто спостережуваність, Health сам
+    # checkpoint не читає. Статуси помилок/збоїв (INCOMPLETE,
+    # MUTATION_VIOLATION, AUDIT_DRIFT, REMOTE_CONFLICT, INCOMPATIBLE_NAME,
+    # ERROR, SKIPPED_CONCURRENT) НЕ входять у Test-BRAVOBazaSyncStatusSuccess
+    # і тому й далі не публікують checkpoint.
+    #
     # P2 (deep review): результат більше НЕ [bool] — виклик-точка раніше
     # обгортала виклик у [void](...) і повністю викидала результат: Health
     # не мав способу дізнатись, чи публікація насправді вдалась
@@ -1540,7 +1552,7 @@ function Write-BRAVOBazaRemoteCheckpoint {
         [Parameter(Mandatory = $true)][string]$RemoteRootPath,
         [Parameter(Mandatory = $true)][object]$SyncResult
     )
-    if ($SyncResult.Status -ne 'COMPLETE') {
+    if (-not (Test-BRAVOBazaSyncStatusSuccess -Status $SyncResult.Status)) {
         return [pscustomobject]@{ Attempted = $false; Published = $false; Error = $null }
     }
     $checkpoint = [ordered]@{
@@ -2298,9 +2310,14 @@ function Invoke-BRAVOBazaComponentSyncSession {
             -FullAuditEveryDays $FullAuditEveryDays `
             -ForceFullAudit:$ForceFullAudit
 
-        if ($WriteCheckpoint -and $syncResult.Status -eq 'COMPLETE') {
+        if ($WriteCheckpoint -and (Test-BRAVOBazaSyncStatusSuccess -Status $syncResult.Status)) {
             # P2 (deep review): результат публікації більше НЕ відкидається
             # — Health бачить, чи checkpoint дійсно опублікувався.
+            # #398 (P3): той самий канонічний success-gate, що й у самій
+            # Write-BRAVOBazaRemoteCheckpoint (COMPLETE/MUTATION_AUTO_ARCHIVED)
+            # — цей зовнішній виклик лише узгоджує умову виклику з тим, що
+            # функція однаково перевіряє всередині; дублюючої гілки це не
+            # створює (внутрішня перевірка лишається defense-in-depth).
             $checkpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $session -RemoteRootPath $RemoteRootPath -SyncResult $syncResult
             $syncResult.CheckpointAttempted = $checkpointOutcome.Attempted
             $syncResult.CheckpointPublished = $checkpointOutcome.Published

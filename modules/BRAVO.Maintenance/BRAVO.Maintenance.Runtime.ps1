@@ -81,7 +81,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # Архітектурний борг: префікс Baza в Trace-контексті — свідомий компроміс
 # проти другої власної реалізації; нейтральний власник SFTP-примітивів —
 # тема окремого рефактора.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations', 'BRAVO.LogSync')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -185,6 +185,8 @@ $script:autoShutdownReachable = $false
 # точці встановлення) з тієї ж причини, що autoShutdownReachable вище:
 # читається під Set-StrictMode навіть на шляхах дуже раннього виходу.
 $script:maintenanceOwnLogUploadAttempted = $false
+# #364: той самий принцип для Invoke-BRAVOMaintenanceRuntimeLogSync.
+$script:maintenanceRuntimeLogSyncAttempted = $false
 
 # ===== ЗАВАНТАЖЕННЯ НАЛАШТУВАНЬ =====
 # P0 Configuration Foundation: BRAVO.config став опційним основним
@@ -1029,7 +1031,7 @@ function Get-ConfiguredServiceState {
 # #314: цикл служб (+#316), облік відновлення й сповіщення, профіль -RecoverServices —
 # у сусідніх файлах модуля. Dot-source у scope цієї функції (foreach не створює
 # scope): як і решта функцій runtime, вони бачать змінні тіла динамічно.
-foreach ($maintenancePartName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1', 'BRAVO.Maintenance.RecoverServices.ps1')) {
+foreach ($maintenancePartName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1', 'BRAVO.Maintenance.RecoverServices.ps1', 'BRAVO.Maintenance.ClientGate.ps1')) {
     $maintenancePartPath = Join-Path $PSScriptRoot $maintenancePartName
     if (-not (Test-Path -LiteralPath $maintenancePartPath -PathType Leaf)) { throw "Не знайдено частину модуля Maintenance: $maintenancePartPath" }
     . $maintenancePartPath
@@ -4650,10 +4652,23 @@ function Connect-BRAVOOwnLogSftpSession {
 
 function Send-BRAVOOwnLogFile {
     # Best-effort вивантаження ОДНОГО власного файлу (live-лог прогону,
-    # знімок range_id_log.json) на SFTP. Другорядний/телеметричний ефект:
-    # провал — лише WARNING, ніколи не встановлює
-    # $script:criticalErrorOccurred і не впливає на exit code.
+    # знімок range_id_log.json) на SFTP. Другорядний/телеметричний ефект для
+    # ДВОХ наявних (не змінених) викликів нижче — провал лише WARNING,
+    # ніколи не встановлює $script:criticalErrorOccurred і не впливає на
+    # exit code; обидва викликають функцію як bare statement і НЕ читають
+    # результат.
+    #
+    # #364 (review, P0): для Invoke-BRAVOMaintenanceRuntimeLogSync (нижче)
+    # функція ПОВЕРТАЄ Success/Error явно -- раніше не повертала нічого, і
+    # викликач вважав спробу успішною, якщо функція просто не кинула виняток
+    # (а вона НІКОЛИ не кидає -- усе ловиться тут же). Це означало, що
+    # реальний провал передачі (мережа, диск на віддаленому боці, збій
+    # сесії) усе одно писався в ledger як доставлений і НІКОЛИ не
+    # повторювався -- мовчазна втрата файлу, той самий клас, що й #332, яку
+    # цей PR мав фіксувати. [pscustomobject] Success/Error тут не псує два
+    # наявні bare-виклики: вони результат не читають.
     [CmdletBinding()]
+    [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory = $true)]$Session,
         [Parameter(Mandatory = $true)][string]$LocalLogPath,
@@ -4665,7 +4680,11 @@ function Send-BRAVOOwnLogFile {
         [AllowNull()][scriptblock]$Logger
     )
     try {
-        if (-not (Test-Path -LiteralPath $LocalLogPath -PathType Leaf)) { return }
+        if (-not (Test-Path -LiteralPath $LocalLogPath -PathType Leaf)) {
+            # Локального файлу зараз немає -- нічого вивантажувати, це не
+            # відмова передачі (не варто позначати як Failed для retry-логіки).
+            return [pscustomobject]@{ Success = $true; Error = $null }
+        }
         if ([string]::IsNullOrWhiteSpace($RemoteFileName)) {
             $RemoteFileName = [System.IO.Path]::GetFileName($LocalLogPath)
         }
@@ -4682,8 +4701,10 @@ function Send-BRAVOOwnLogFile {
         if (-not $ownLogResult.Success) {
             Write-Log "Власний лог: передача $LocalLogPath не вдалася: $($ownLogResult.Error)" -Level "WARNING"
         }
+        return [pscustomobject]@{ Success = [bool]$ownLogResult.Success; Error = $ownLogResult.Error }
     } catch {
         Write-Log "Власний лог: передача $LocalLogPath не вдалася: $($_.Exception.Message)" -Level "WARNING"
+        return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
     }
 }
 
@@ -4753,11 +4774,11 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                 $ownLogRemoteDirectory = [string]$sftpDirectories.MaintenanceLog
                 # Копія має те саме ім'я файлу, що й живий лог, тому
                 # remote-ім'я не змінюється.
-                Send-BRAVOOwnLogFile `
+                [void](Send-BRAVOOwnLogFile `
                     -Session $ownLogUploadSession `
                     -LocalLogPath $ownLogMaskedCopyPath `
                     -RemoteDirectory $ownLogRemoteDirectory `
-                    -Logger $null
+                    -Logger $null)
 
                 # R3-3 (round-3 review): range_id_log.json пише служба
                 # BRAVO КОНКУРЕНТНО з цим прогоном (toolkit його лише
@@ -4783,12 +4804,12 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                         # #365: маскована копія знімка; збій -> catch нижче,
                         # знімок НЕ вивантажується (fail-closed).
                         $ownRangeIdLogMaskedCopyPath = New-BRAVOMaskedLogCopy -Path $ownRangeIdLogSnapshotPath -KnownSecret $ownLogMaskSet.Secrets
-                        Send-BRAVOOwnLogFile `
+                        [void](Send-BRAVOOwnLogFile `
                             -Session $ownLogUploadSession `
                             -LocalLogPath $ownRangeIdLogMaskedCopyPath `
                             -RemoteDirectory $ownLogRemoteDirectory `
                             -RemoteFileName ("range_id_log_{0}.json" -f $maintenanceLogRunId) `
-                            -Logger $null
+                            -Logger $null)
                     } catch {
                         Write-Log "Власний лог: не вдалося створити знімок range_id_log.json: $($_.Exception.Message)" -Level "WARNING"
                     }
@@ -4813,6 +4834,116 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
     } catch {
         try {
             Write-Log "Власний лог: вивантаження на SFTP не вдалося: $($_.Exception.Message)" -Level "WARNING"
+        } catch {
+            # Найранніший крах: навіть Write-Log може бути недоступний.
+        }
+    }
+}
+
+# #364: синхронізація ДОЗВОЛЕНИХ runtime-журналів (allowlist, BRAVO.LogSync)
+# на SFTP. Той самий ідемпотентний прапорець-за-функцією, що
+# Invoke-BRAVOMaintenanceOwnLogUpload, але call site лише ОДИН — свідомо
+# НЕ у зовнішньому `finally` (issue #364: "Без виклику з finally після
+# ранніх виходів") — ранній exit означає, що lock і підсумок прогону ще
+# не визначені, а саме це вимога архітектури issue ("лише коли процес
+# володіє operation lock і вже визначено підсумок прогону"). Другорядний/
+# телеметричний ефект: провал — лише WARNING (SuccessWithWarnings(10) за
+# наявний канонічний шлях Write-Log, без нового коду виходу), ніколи не
+# $script:criticalErrorOccurred.
+function Invoke-BRAVOMaintenanceRuntimeLogSync {
+    if ($script:maintenanceRuntimeLogSyncAttempted) { return }
+    $script:maintenanceRuntimeLogSyncAttempted = $true
+
+    try {
+        if (-not (Get-Variable -Name componentSettings -Scope Global -ErrorAction SilentlyContinue) -or
+            -not (Get-Variable -Name storageEffective -Scope Global -ErrorAction SilentlyContinue)) {
+            return
+        }
+        # #364 рішення власника #2: окремий тумблер, дефолт $false для
+        # наявних установок (componentSettings.SFTP.RuntimeLogSyncEnabled).
+        if (-not ([bool]$componentSettings.SFTP.RuntimeLogSyncEnabled -and
+                [bool]$storageEffective.SFTP.Enabled)) {
+            return
+        }
+        # $LOG_DIR — незкваліфіковане присвоєння всередині ОБГОРТКИ
+        # Invoke-BRAVOMaintenance (не $script:/$global:); ця функція вкладена
+        # в ту саму обгортку, тож звичайний (без scope) доступ коректно
+        # резолвиться через lexical scope chain — саме так уже читає
+        # $LOG_FILE/$ARC_DIR решта файлу. Get-Variable -Scope Script/Global
+        # тут НЕ підійшов би: $LOG_DIR не живе в жодному з цих двох scope.
+        if ([string]::IsNullOrWhiteSpace([string]$LOG_DIR) -or
+            -not (Test-Path -LiteralPath $LOG_DIR -PathType Container)) {
+            return
+        }
+        # $stateRoot — $global: (BRAVO.Configuration.Derivation.psm1), той
+        # самий принцип, що componentSettings/storageEffective вище.
+        if (-not (Get-Variable -Name stateRoot -Scope Global -ErrorAction SilentlyContinue) -or
+            [string]::IsNullOrWhiteSpace([string]$stateRoot)) {
+            return
+        }
+
+        $runtimeLogSyncSession = $null
+        try {
+            $runtimeLogSyncSession = Connect-BRAVOOwnLogSftpSession
+            if ($null -eq $runtimeLogSyncSession) { return }
+
+            $runtimeLogSyncMaskSet = Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)
+            # #364 рішення власника #4: сегмент хоста у віддаленому шляху —
+            # computername відповідає за розрізнення серверів парку на
+            # спільному SFTP-акаунті (альтернатива "один акаунт = один
+            # сервер" задокументована в issue, але явний сегмент безпечніший
+            # за мовчазне припущення).
+            $runtimeLogSyncRemoteDirectory = "$([string]$sftpDirectories.RuntimeLogs)/$env:COMPUTERNAME"
+
+            $runtimeLogSyncResult = Invoke-BRAVOLogSyncRun `
+                -LogsDirectory $LOG_DIR `
+                -StateRoot $stateRoot `
+                -RemoteDirectory $runtimeLogSyncRemoteDirectory `
+                -MaskFile { param($localPath) New-BRAVOMaskedLogCopy -Path $localPath -KnownSecret $runtimeLogSyncMaskSet.Secrets } `
+                -RemoveMaskedCopy { param($maskedPath) Remove-BRAVOMaskedLogCopy -Path $maskedPath } `
+                -UploadFile {
+                    param($localPath, $remoteDirectory, $remoteFileName)
+                    try {
+                        # Review (P0): Send-BRAVOOwnLogFile тепер явно повертає
+                        # Success/Error -- раніше тут вважали спробу успішною,
+                        # якщо функція просто не кинула виняток (а вона ніколи
+                        # не кидає, бо ловить усе сама), тож реальний провал
+                        # передачі писався в ledger як доставлений і ніколи не
+                        # повторювався.
+                        Send-BRAVOOwnLogFile `
+                            -Session $runtimeLogSyncSession `
+                            -LocalLogPath $localPath `
+                            -RemoteDirectory $remoteDirectory `
+                            -RemoteFileName $remoteFileName `
+                            -Logger $null
+                    } catch {
+                        [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
+                    }
+                } `
+                -IsSessionHealthy { [bool]$runtimeLogSyncSession.Opened }
+
+            if ($runtimeLogSyncResult.OversizedSkipped.Count -gt 0) {
+                Write-Log ("Runtime-логи: файл(и) більші за MaxTotalBytes пропущено назавжди (ніколи не влізуть у бюджет): " +
+                    ($runtimeLogSyncResult.OversizedSkipped -join ', ')) -Level "WARNING"
+            }
+            if ($runtimeLogSyncResult.Failed -gt 0) {
+                Write-Log ("Runtime-логи: $($runtimeLogSyncResult.Failed) з $($runtimeLogSyncResult.Attempted) файл(ів) не вивантажено: " +
+                    ($runtimeLogSyncResult.Errors -join '; ')) -Level "WARNING"
+            } elseif ($runtimeLogSyncResult.Uploaded -gt 0) {
+                Write-Log "Runtime-логи: вивантажено $($runtimeLogSyncResult.Uploaded) файл(ів) -> $runtimeLogSyncRemoteDirectory" -Level "SUCCESS"
+            }
+        } catch {
+            Write-Log "Runtime-логи: синхронізація на SFTP не вдалася: $($_.Exception.Message)" -Level "WARNING"
+        } finally {
+            if ($null -ne $runtimeLogSyncSession) {
+                try { $runtimeLogSyncSession.Dispose() } catch {
+                    # Best-effort закриття сесії.
+                }
+            }
+        }
+    } catch {
+        try {
+            Write-Log "Runtime-логи: синхронізація на SFTP не вдалася: $($_.Exception.Message)" -Level "WARNING"
         } catch {
             # Найранніший крах: навіть Write-Log може бути недоступний.
         }
@@ -7059,6 +7190,38 @@ function Get-BRAVORestoreArchiveMainFiles {
         # шаблоном (наявний каталог «відсутній» чи збіг із сусіднім).
         # Шаблон імені файлу лишається в -Filter.
         if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) {
+            # #428: сам Test-Path вище міг мовчки повернути $false (без
+            # жодної non-terminating помилки) навіть тоді, коли $Path
+            # насправді недоступний через ШИРШУ проблему доступу до
+            # БАТЬКІВСЬКОГО каталогу (відпав мережевий диск, зникла точка
+            # монтування, ACL на рівні батька) — у такому разі цільовий
+            # каталог архівів лише ВИГЛЯДАЄ відсутнім. Відрізняємо
+            # легітимну відсутність від цього, перевіряючи батьківський
+            # каталог окремо:
+            #   - батьківський каталог існує й доступний -> цільовий
+            #     підкаталог справді відсутній -> легітимно порожній
+            #     перелік (Missing), як і раніше;
+            #   - батьківський каталог ТЕЖ не існує чи недоступний (сам
+            #     Test-Path над ним кидає виняток чи повертає $false) ->
+            #     ознака ширшої проблеми доступу на рівень вище, а не
+            #     свідомої відсутності каталогу архівів -> fail-closed
+            #     (Failed), так само, як збій самого переліку чи
+            #     перевірки $Path (catch нижче).
+            $parentPath = Split-Path -Path $Path -Parent
+            $parentExists = $true
+            if (-not [string]::IsNullOrEmpty($parentPath)) {
+                try {
+                    $parentExists = [bool](Test-Path -LiteralPath $parentPath -ErrorAction Stop)
+                } catch {
+                    $parentExists = $false
+                }
+            }
+            if (-not $parentExists) {
+                Write-Log "Каталог архівів реставрації $Path виглядає відсутнім, але й батьківський каталог $parentPath недоступний або не існує — це ознака ширшої проблеми доступу, а не свідомої відсутності каталогу архівів. Перевірку придатності й retention сесій реставрації в цьому циклі пропущено, жодну сесію не видалено." -Level "ERROR"
+                $script:criticalErrorOccurred = $true
+                $script:restoreIntegrityFailed = $true
+                return @{ Files = @(); Failed = $true; Missing = $false }
+            }
             return @{ Files = @(); Failed = $false; Missing = $true }
         }
         foreach ($archivePattern in @("${ArchivePrefix}_before_*.mdz", "${ArchivePrefix}_after_*.mdz")) {
@@ -7075,6 +7238,14 @@ function Get-BRAVORestoreArchiveMainFiles {
 
 # Функція видалення старих архівів реставрації (за кількістю версій)
 function Remove-OldRestoreArchives {
+    # #428: advanced-функція — раніше невідомий/помилково написаний параметр
+    # (напр. друкарська помилка в імені) мовчки потрапляв у $args замість
+    # явної помилки виклику. Усі виклики в репозиторії (Main — іменовані
+    # параметри, self-test — іменовані параметри чи splatting через
+    # @retentionArgs) сумісні без змін; Windows PowerShell 5.1 підтримує
+    # advanced-функції з таким набором параметрів (string/int/switch/
+    # [AllowNull()][hashtable]) без додаткових застережень.
+    [CmdletBinding()]
     param(
         [string]$Path,
         [string]$ArchivePrefix,
@@ -7772,6 +7943,29 @@ function Get-BRAVOMaintenanceFinalReportCheckLinesSafe {
     }
 }
 
+# #398 (рефакторинг, без зміни поведінки): спільна побудова CRITICAL-
+# повідомлення для ОБОХ гілок Send-FinalReport нижче (CriticalErrorsList і
+# криticalErrorOccurred-без-записів) — відрізняються лише самі "первинні"
+# деталі (конкретні помилки або узагальнена причина), решта (Title/
+# TitleEmoji/Severity/чергa сповіщень/блок статусів етапів/LogPath)
+# ідентична в обох.
+function Get-BRAVOMaintenanceCriticalAlertMessage {
+    param(
+        [string[]]$PrimaryDetails,
+        [TimeSpan]$Duration,
+        $LOG_FILE
+    )
+    return New-MaintenanceNotificationMessage `
+        -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
+        -TitleEmoji ":rotating_light:" `
+        -Severity "CRITICAL" `
+        -Duration $Duration `
+        -Details (@($PrimaryDetails) +
+            @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
+            @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
+        -LogPath $LOG_FILE
+}
+
 # Функція для відправки фінального звіту
 function Send-FinalReport {
     param(
@@ -7801,15 +7995,10 @@ function Send-FinalReport {
 
     if ($script:CriticalErrorsList.Count -gt 0) {
         # Є критичні помилки - відправляємо в режимах "errors_only" та "all"
-        $notificationMessage = New-MaintenanceNotificationMessage `
-            -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
-            -TitleEmoji ":rotating_light:" `
-            -Severity "CRITICAL" `
+        $notificationMessage = Get-BRAVOMaintenanceCriticalAlertMessage `
+            -PrimaryDetails $script:CriticalErrorsList.ToArray() `
             -Duration $elapsedTime `
-            -Details (@($script:CriticalErrorsList.ToArray()) +
-                @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
-                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
-            -LogPath $LOG_FILE
+            -LOG_FILE $LOG_FILE
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
     }
@@ -7822,15 +8011,10 @@ function Send-FinalReport {
         # мовчки повертався б. Окрема причина алерту: узагальнене CRITICAL
         # без деталей; записи NotificationAlertQueue (якщо є) додаються, щоб
         # не загубитись. Коди завершення не змінюються.
-        $notificationMessage = New-MaintenanceNotificationMessage `
-            -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
-            -TitleEmoji ":rotating_light:" `
-            -Severity "CRITICAL" `
+        $notificationMessage = Get-BRAVOMaintenanceCriticalAlertMessage `
+            -PrimaryDetails @("Maintenance завершився з критичною помилкою без детальної причини. Подробиці дивіться в журналі.") `
             -Duration $elapsedTime `
-            -Details (@("Maintenance завершився з критичною помилкою без детальної причини. Подробиці дивіться в журналі.") +
-                @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
-                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
-            -LogPath $LOG_FILE
+            -LOG_FILE $LOG_FILE
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
     }
@@ -8026,7 +8210,7 @@ function Send-BRAVOMaintenanceOperationsEvent {
                 details = if ([string]::IsNullOrWhiteSpace([string]$_.Details)) { $null } else { [string]$_.Details }
             }
         })
-        Send-BRAVOOperationsEvent `
+        Send-BRAVOOperationsEventSafely `
             -OperationsReportingSettings $operationsReportingSettings `
             -CredentialTargets $credentialSettings.Targets `
             -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
@@ -9315,6 +9499,17 @@ foreach ($managedService in $maintenanceManagedServices) {
 }
 if ($lateStartedServiceNames.Count -gt 0) {
     Write-Log -Message "Службу(и) запущено після початкового знімка стану (SCM autostart/recovery або інший актор): $($lateStartedServiceNames -join ', ') — якщо вони лишаться активними до фази зупинки, Maintenance запише намір їх перезапуску в ownership-маркер, зупинить їх і запустить після обслуговування (#360)" -Level "INFO"
+}
+
+# #316 (рішення власника 2026-09-30): перед зупинкою служб (коли планується
+# реставрація) — попередити активні сесії з відкритою BIS, зачекати, примусово
+# закрити тих, хто не встиг. Невдача (BIS не вдалося закрити) скасовує
+# реставрацію ($shouldRestore=$false), але НЕ саму зупинку служб нижче — вона
+# керується фактичним станом служб ($stopServicesRequired), не $shouldRestore.
+if ($shouldRestore) {
+    if (-not (Invoke-BRAVOMaintenanceClientCloseStep)) {
+        $shouldRestore = $false
+    }
 }
 
 # Усі операції зі зупиненими службами захищені finally. Навіть необроблена
@@ -11779,6 +11974,13 @@ Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
 # (Invoke-BRAVOMaintenanceOwnLogUpload, R3-1); ідемпотентний прапорець
 # гарантує рівно одну спробу незалежно від того, який спрацював першим.
 Invoke-BRAVOMaintenanceOwnLogUpload
+
+# #364: синхронізація дозволених runtime-журналів (allowlist) — opt-in
+# (componentSettings.SFTP.RuntimeLogSyncEnabled, дефолт $false). Лише ЦЕЙ
+# call site (не у зовнішньому finally — issue #364 вимагає "без виклику
+# з finally після ранніх виходів": ранній exit означає, що lock і
+# підсумок прогону ще не визначені).
+Invoke-BRAVOMaintenanceRuntimeLogSync
 
 # ===== ВИКЛИК ФУНКЦІЇ АВТОМАТИЧНОГО ВИМКНЕННЯ (P2-6: після SFTP-вивантаження) =====
 # Свідомо ПІСЛЯ Send-BRAVOOwnLogFile/Dispose вище — фактичний shutdown.exe

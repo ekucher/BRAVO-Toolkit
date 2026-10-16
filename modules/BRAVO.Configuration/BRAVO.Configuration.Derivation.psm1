@@ -823,13 +823,18 @@ function Test-BRAVOSftpCredentialsRequired {
         [Parameter(Mandatory = $true)][bool]$MaintenanceLogUploadEnabled,
         [Parameter(Mandatory = $true)][bool]$ArchiveLogUploadEnabled,
         [Parameter(Mandatory = $true)][bool]$ScheduledSftpSyncRequired,
-        [Parameter(Mandatory = $true)][bool]$BackupMonitoringSftpEnabled
+        [Parameter(Mandatory = $true)][bool]$BackupMonitoringSftpEnabled,
+        # #364: той самий принцип, що MaintenanceLogUploadEnabled/
+        # ArchiveLogUploadEnabled — ще один opt-in SFTP-вивантаження, яке
+        # вимагає креденшелів незалежно від Archive/BAZA/Health.
+        [Parameter(Mandatory = $true)][bool]$RuntimeLogSyncEnabled
     )
 
     return $SftpEnabled -and (
         $ArchiveUploadEnabled -or
         $MaintenanceLogUploadEnabled -or
         $ArchiveLogUploadEnabled -or
+        $RuntimeLogSyncEnabled -or
         $ScheduledSftpSyncRequired -or
         $BackupMonitoringSftpEnabled
     )

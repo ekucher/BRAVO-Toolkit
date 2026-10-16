@@ -9,6 +9,7 @@
         'Get-BRAVOOperationsOutboxLossSummary',
         'Invoke-BRAVOOperationsOutboxDrain',
         'Send-BRAVOOperationsEvent',
+        'Send-BRAVOOperationsEventSafely',
         'Send-BRAVOOperationsHeartbeat'
     )
     VariablesToExport = @()
