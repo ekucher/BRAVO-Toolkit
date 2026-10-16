@@ -5045,8 +5045,12 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # (Get-BRAVORestoreArchiveMainFiles) виставляє restoreIntegrityFailed
             # за збою переліку чи перевірки наявності каталогу (не відсутній
             # каталог) — сесії не перевірено, нічого не видаляється.
+            # +1 integrity (#428): той самий Get-BRAVORestoreArchiveMainFiles —
+            # цільовий підкаталог архівів відсутній, АЛЕ батьківський каталог
+            # теж не існує/недоступний (ознака ширшої проблеми доступу, а не
+            # легітимної відсутності) — Failed/fail-closed, а не Missing.
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 13) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 13)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 14)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
         -Failure "Maintenance має розрізняти локальну архівацію (40), перевірку цілісності (41) і провал реставрації з відкатом (43), а не зводити все до 60"
@@ -6543,7 +6547,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
     $sendSlackAlertTestModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Send-SlackAlert', 'Send-FinalReport')
+        -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage')
 
     function Invoke-MaintenanceSeverityLifecycleScenario {
         param([scriptblock]$SendCalls)
@@ -6748,7 +6752,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     try {
         $earlyExitAlertModule = New-BRAVOSelfTestRuntimeModule `
             -SourceText $maintenanceRuntimeSourceForSeverity `
-            -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Send-BRAVOMaintenanceEarlyExitAlerts', 'Send-BRAVOMaintenanceSkippedRunAlert')
+            -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Send-BRAVOMaintenanceEarlyExitAlerts', 'Send-BRAVOMaintenanceSkippedRunAlert', 'Get-BRAVOMaintenanceCriticalAlertMessage')
     } catch {
         $earlyExitAlertModuleError = $_.Exception.Message
     }
@@ -7060,7 +7064,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # WARNING/ALERTS, а не як SUCCESS/GENERAL (review finding #1) ----------
     $finalStatusModuleForSeverity = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage')
     $successWithWarningsRouteCapture = & $finalStatusModuleForSeverity {
         $script:SlackMode = "all"
         $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
@@ -7138,7 +7142,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # StaticAnalysis/NoStaticNewConstructorInProductionCode (Governance).
     $completedLinesModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage')
     $completedLinesScenarios = @(
         @{ Name = 'Zero'; Lines = @() },
         @{ Name = 'One'; Lines = @('Виконано:') },
@@ -7216,17 +7220,34 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # Send-FinalReport; стабляться лише webhook і конструктор тексту.
     $criticalFlagReportModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage')
     function Invoke-MaintenanceCriticalFlagReportScenario {
-        param([bool]$CriticalFlag, [string[]]$CriticalEntries = @())
+        param(
+            [bool]$CriticalFlag,
+            [string[]]$CriticalEntries = @(),
+            [string]$SlackMode = "errors_only",
+            [string[]]$AlertQueueMessages = @(),
+            [switch]$UnsetCriticalFlag
+        )
         & $criticalFlagReportModule {
-            param([bool]$FlagInner, [string[]]$EntriesInner)
+            param([bool]$FlagInner, [string[]]$EntriesInner, [string]$SlackModeInner, [string[]]$AlertQueueMessagesInner, [bool]$UnsetCriticalFlagInner)
             Set-StrictMode -Version 2.0
-            $script:SlackMode = "errors_only"
-            $script:criticalErrorOccurred = $FlagInner
+            $script:SlackMode = $SlackModeInner
+            if ($UnsetCriticalFlagInner) {
+                # П.1 (#398): жодне присвоєння $script:criticalErrorOccurred у
+                # цьому прогоні — лише Get-Variable -ErrorAction
+                # SilentlyContinue (виробничий код) захищає від
+                # PropertyNotFoundException під Set-StrictMode -Version 2.0.
+                Remove-Variable -Name criticalErrorOccurred -Scope Script -ErrorAction SilentlyContinue
+            } else {
+                $script:criticalErrorOccurred = $FlagInner
+            }
             $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
             foreach ($entryInner in $EntriesInner) { $script:CriticalErrorsList.Add($entryInner) }
             $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            foreach ($alertMessageInner in $AlertQueueMessagesInner) {
+                $script:NotificationAlertQueue.Add([pscustomobject]@{ Severity = "WARNING"; Message = $alertMessageInner })
+            }
             $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
             $script:ScriptStartTime = Get-Date
             $bravoSettings = @{ NotificationRouting = @{} }
@@ -7255,7 +7276,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 DeliveredCount = $script:deliveredMessages.Count
                 DeliveredMessage = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].Message } else { $null }
             }
-        } $CriticalFlag $CriticalEntries
+        } $CriticalFlag $CriticalEntries $SlackMode $AlertQueueMessages ([bool]$UnsetCriticalFlag)
     }
     $criticalFlagOnly = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true
     Test-BRAVOCondition `
@@ -7281,6 +7302,59 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Maintenance/CriticalFlagWithEntryKeepsExistingMessage" `
         -Failure "за наявності запису в CriticalErrorsList повідомлення має лишитись незмінним (без узагальненого рядка); отримано: $($criticalFlagWithEntry.DeliveredMessage)"
 
+    # --- Maintenance (#398 п.1): $script:criticalErrorOccurred взагалі НЕ
+    # встановлена (а не просто $false) під Set-StrictMode -Version 2.0 —
+    # окремий сценарій від CriticalFlag=$false вище (та інша присвоює
+    # $false, не знімає змінну). Безпечне читання через Get-Variable
+    # -ErrorAction SilentlyContinue (виробничий код, рядок з коментарем
+    # "Get-Variable замість прямого читання") не повинно кидати виняток.
+    $strictModeUnsetError = $null
+    $strictModeUnsetCapture = $null
+    try {
+        $strictModeUnsetCapture = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $false -UnsetCriticalFlag
+    } catch {
+        $strictModeUnsetError = $_.Exception.Message
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $strictModeUnsetError -and
+            $null -ne $strictModeUnsetCapture -and
+            $strictModeUnsetCapture.DeliveredCount -eq 0
+        ) `
+        -Name "Maintenance/CriticalFlagUnsetVariableIsStrictModeSafe" `
+        -Failure "errors_only зі ЗНЯТОЮ (не ініціалізованою) `$script:criticalErrorOccurred під Set-StrictMode -Version 2.0 має безпечно нічого не надсилати, без винятку; виняток: $(if ($null -eq $strictModeUnsetError) { '<немає>' } else { $strictModeUnsetError }), доставлено: $(if ($null -eq $strictModeUnsetCapture) { '<немає результату>' } else { $strictModeUnsetCapture.DeliveredCount })"
+
+    # --- Maintenance (#398 п.2а): той самий criticalErrorOccurred-без-
+    # записів сценарій, але mode=all — гілка criticalErrorOccurred у Send-
+    # FinalReport не перевіряє SlackMode (на відміну від фінального "else"
+    # з success-повідомленням), тож має надіслати той самий CRITICAL-алерт,
+    # що й у errors_only, а НЕ впасти в гілку успішного звіту "all".
+    $criticalFlagOnlyAllMode = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true -SlackMode "all"
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalFlagOnlyAllMode.DeliveredCount -eq 1 -and
+            $criticalFlagOnlyAllMode.DeliveredMessage.Contains("SEVERITY=CRITICAL") -and
+            $criticalFlagOnlyAllMode.DeliveredMessage.Contains("без детальної причини") -and
+            $criticalFlagOnlyAllMode.DeliveredMessage.Contains("LOG=STUB-LOG-PATH")
+        ) `
+        -Name "Maintenance/CriticalFlagWithoutEntriesAlertsInAllMode" `
+        -Failure "mode=all + `$script:criticalErrorOccurred без записів у чергах мав надіслати рівно один CRITICAL-алерт із узагальненою причиною (так само, як у errors_only), а не success-звіт 'all'; доставлено: $($criticalFlagOnlyAllMode.DeliveredCount), повідомлення: $($criticalFlagOnlyAllMode.DeliveredMessage)"
+
+    # --- Maintenance (#398 п.2б): непорожня NotificationAlertQueue в НОВІЙ
+    # (#298) гілці criticalErrorOccurred-без-записів — записи черги мають
+    # потрапити в -Details поряд з узагальненою причиною (той самий
+    # контракт, що й гілка CriticalErrorsList, перевірена вище для #299).
+    $criticalFlagWithAlertQueue = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true -AlertQueueMessages @("попередження з черги сповіщень")
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalFlagWithAlertQueue.DeliveredCount -eq 1 -and
+            $criticalFlagWithAlertQueue.DeliveredMessage.Contains("SEVERITY=CRITICAL") -and
+            $criticalFlagWithAlertQueue.DeliveredMessage.Contains("без детальної причини") -and
+            $criticalFlagWithAlertQueue.DeliveredMessage.Contains("попередження з черги сповіщень")
+        ) `
+        -Name "Maintenance/CriticalFlagWithoutEntriesIncludesAlertQueue" `
+        -Failure "errors_only + `$script:criticalErrorOccurred без записів у CriticalErrorsList, але з непорожньою NotificationAlertQueue, мав додати записи черги в -Details поряд з узагальненою причиною; отримано: $($criticalFlagWithAlertQueue.DeliveredMessage)"
+
     # --- Maintenance: перевищення порогу діапазонів ID (запис у
     # CriticalErrorsList через Test-RangeIdUsage -> Send-SlackAlert
     # -IsCritical) не повинно ховати решту перевірок. Регресія з продового
@@ -7295,7 +7369,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             'Test-RangeIdUsage', 'Send-SlackAlert',
             'Get-BRAVOMaintenanceStepOutcome', 'New-BRAVOMaintenanceCompletedLines',
             'Get-BRAVOMaintenanceFinalReportCheckLines', 'Get-BRAVOMaintenanceFinalReportCheckLinesSafe',
-            'Send-FinalReport'
+            'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage'
         )
     $rangeIdFinalReportRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RangeIdFinalReport_{0}" -f [guid]::NewGuid().ToString('N'))
     [void](New-Item -ItemType Directory -Path $rangeIdFinalReportRoot -Force)
@@ -22884,7 +22958,7 @@ $result = [ordered]@{
                 'Write-Log', 'Get-BRAVOMaintenanceResolvedExitCode',
                 'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
                 'Add-BRAVOMaintenanceLegacyBomFallbackAlert',
-                'Send-SlackAlert', 'Send-FinalReport'
+                'Send-SlackAlert', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage'
             )
         $t006MaintenanceScenario = {
             param([string[]]$ArchiveNames, [string]$Secret)
@@ -25959,6 +26033,36 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/RetentionReportOnlyNeverDeletesProvenCorrupt" `
         -Failure ("Remove-OldRestoreArchives -ReportOnly не повинен видаляти жодного файлу — ні доведено пошкоджену стару сесію, ні придатні сесії понад KeepCount, — і має записати для доведено пошкодженої старої сесії WARNING «НЕ видалено: retention працює лише в режимі перевірки»; контроль без -ReportOnly має видаляти їх, як і раніше; ReportOnly: threw={0}, лишилось=[{1}], журнал: {2}; контроль: threw={3}, лишилось=[{4}]" -f $retention424Proven.Threw, $retention424Proven.Remaining, $retention424Proven.Log, $retention424ProvenControl.Threw, $retention424ProvenControl.Remaining)
 
+    # #428: окремий, ТОЧНИЙ (не попутний) тест на WARNING режиму ReportOnly
+    # «НЕ видалено: retention працює лише в режимі перевірки» — раніше він
+    # перевірявся лише ПОПУТНО (частковим regex) у тесті вище. Тут —
+    # (1) точний повний текст рядка журналу (а не лише фрагмент), і
+    # (2) умова появи: WARNING з'являється лише тоді, коли ОДНОЧАСНО
+    # виконано ВСІ три умови — ReportOnly, сесія доведено пошкоджена
+    # (PROVEN_DELETABLE, 7-Zip забракував вміст УСІХ її архівів) і старша
+    # за InvalidRetentionDays, і лишається хоч одна підтверджена точка
+    # відновлення після прогону (інакше — зовсім інший WARNING: «після
+    # прогону не лишається жодної підтвердженої точки відновлення»).
+    # Перевикористовуємо вже обчислені вище прогони (без повторного
+    # запуску харнесу):
+    #   - $retention424Proven — усі три умови виконано -> WARNING Є;
+    #   - $retention424ProvenControl — та сама сесія, але БЕЗ -ReportOnly
+    #     (справжнє видалення замість перевірки) -> WARNING НЕМАЄ;
+    #   - $retention424Stale (сценарій (a) вище) — -ReportOnly Є, сесія
+    #     стала, але НЕ доведено пошкоджена (SHA512 не збігається ->
+    #     UNKNOWN, не PROVEN_DELETABLE) -> WARNING НЕМАЄ (інший текст).
+    $retention424ExactReportOnlyWarningLine =
+        "[WARNING] Непридатну сесію $retention422Subject (старшу за 30 днів) НЕ видалено: retention працює лише в режимі перевірки (сесій не більше за ArchivesKeepCount = 1). 7-Zip забракував вміст усіх її архівів; звичайний retention видалить її, коли сесій стане більше за ArchivesKeepCount."
+    $retention424ReportOnlyWarningLines = @([string]$retention424Proven.Log -split "`n")
+    Test-BRAVOCondition `
+        -Condition (
+            ($retention424ReportOnlyWarningLines -ccontains $retention424ExactReportOnlyWarningLine) -and
+            (-not ([string]$retention424ProvenControl.Log).Contains('retention працює лише в режимі перевірки')) -and
+            (-not ([string]$retention424Stale.Log).Contains('retention працює лише в режимі перевірки'))
+        ) `
+        -Name "Maintenance/RetentionReportOnlyExactWarningTextAndCondition" `
+        -Failure ("WARNING «НЕ видалено: retention працює лише в режимі перевірки» має з'являтися РІВНО цим текстом лише за ReportOnly + доведено пошкоджена стала сесія + принаймні одна підтверджена точка відновлення; він НЕ має з'являтися ні без -ReportOnly (справжнє видалення), ні коли стала сесія лише НЕ доведено пошкоджена (UNKNOWN); очікуваний рядок=[{0}], знайдено в ReportOnly-журналі={1}; контроль (без ReportOnly) журнал: {2}; stale/UNKNOWN журнал: {3}" -f $retention424ExactReportOnlyWarningLine, ($retention424ReportOnlyWarningLines -ccontains $retention424ExactReportOnlyWarningLine), $retention424ProvenControl.Log, $retention424Stale.Log)
+
     # (c) KeepCount = 1, єдина сесія стала непридатною (7-Zip забракував
     # архів): ERROR «Не лишилось жодної придатної точки відновлення» і
     # прапорці critical/restoreIntegrityFailed (exit 41) — як на звичайному
@@ -26260,14 +26364,24 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     }
     $retention424EnumRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RETENTION_ENUM_{0}" -f [guid]::NewGuid().ToString("N"))
     try {
-        $retention424EnumMissing = & $retention424EnumDirect (Join-Path $retention424EnumRoot 'missing') $false
+        # #428: батьківський каталог ($retention424EnumRoot) створюємо ПЕРЕД
+        # перевіркою легітимно відсутнього підкаталогу 'missing' — інакше цей
+        # випадок невідрізнимий від нового сценарію "батьківський каталог
+        # теж відсутній" нижче і більше не ізольовано перевіряє саме
+        # легітимну відсутність цільового підкаталогу за доступного батька.
         [void][IO.Directory]::CreateDirectory($retention424EnumRoot)
+        $retention424EnumMissing = & $retention424EnumDirect (Join-Path $retention424EnumRoot 'missing') $false
         $retention424EnumEmpty = & $retention424EnumDirect $retention424EnumRoot $false
         [IO.File]::WriteAllText((Join-Path $retention424EnumRoot 'RETFUP_before_20260111_0100.mdz'), 'synthetic-ok')
         $retention424EnumOk = & $retention424EnumDirect $retention424EnumRoot $false
         $retention424EnumDenied = & $retention424EnumDirect $retention424EnumRoot $true
         # Codex P2 (раунд 2): збій самого Test-Path каталогу (ACL / провайдер).
         $retention424EnumLookup = & $retention424EnumDirect $retention424EnumRoot $false $true
+        # #428: цільовий підкаталог відсутній, і БАТЬКІВСЬКИЙ каталог теж не
+        # існує (жодного 'missing-parent' тут не створено) — ознака ширшої
+        # проблеми доступу на рівень вище, а не свідомої відсутності
+        # каталогу архівів: має дати Failed (fail-closed), а НЕ Missing.
+        $retention424EnumMissingParentMissing = & $retention424EnumDirect (Join-Path $retention424EnumRoot 'missing-parent\missing-child') $false
     } finally {
         if (Test-Path -LiteralPath $retention424EnumRoot) {
             Remove-Item -LiteralPath $retention424EnumRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -26292,6 +26406,25 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         ) `
         -Name "Maintenance/RestoreArchiveEnumerationDistinguishesFailureFromEmpty" `
         -Failure ("Get-BRAVORestoreArchiveMainFiles: відсутній і порожній каталог — успішний порожній перелік без ERROR і прапорців; збій переліку — Failed, порожній перелік, ERROR і прапорці exit 41; відсутній: failed={0}, count={1}, журнал: {2}; порожній: failed={3}, count={4}; один архів: failed={5}, count={6}; збій: failed={7}, count={8}, critical={9}, журнал: {10}; збій Test-Path: failed={11}, count={12}, critical={13}, журнал: {14}" -f $retention424EnumMissing.Failed, $retention424EnumMissing.Count, $retention424EnumMissing.Log, $retention424EnumEmpty.Failed, $retention424EnumEmpty.Count, $retention424EnumOk.Failed, $retention424EnumOk.Count, $retention424EnumDenied.Failed, $retention424EnumDenied.Count, $retention424EnumDenied.Critical, $retention424EnumDenied.Log, $retention424EnumLookup.Failed, $retention424EnumLookup.Count, $retention424EnumLookup.Critical, $retention424EnumLookup.Log)
+
+    # #428: цільовий підкаталог відсутній, АЛЕ батьківський каталог ТЕЖ
+    # недоступний/не існує — це ознака ширшої проблеми доступу (відпав
+    # мережевий диск, зникла точка монтування), а не легітимної відсутності
+    # каталогу архівів реставрації на один рівень глибше. Таке поєднання
+    # має давати Failed (fail-closed), ERROR і прапорці critical/
+    # restoreIntegrityFailed (exit 41) — так само, як збій самого переліку
+    # чи перевірки Test-Path цільового каталогу, а НЕ Missing = $true
+    # (порожній перелік).
+    Test-BRAVOCondition `
+        -Condition (
+            $retention424EnumMissingParentMissing.Failed -eq $true -and
+            $retention424EnumMissingParentMissing.Count -eq 0 -and
+            $retention424EnumMissingParentMissing.Critical -and
+            $retention424EnumMissingParentMissing.RestoreFailed -and
+            [regex]::IsMatch([string]$retention424EnumMissingParentMissing.Log, '(?m)^\[ERROR\] Каталог архівів реставрації .* виглядає відсутнім')
+        ) `
+        -Name "Maintenance/RestoreArchiveMissingParentFailsClosed" `
+        -Failure ("відсутній цільовий підкаталог архівів з ТЕЖ відсутнім батьківським каталогом (ознака ширшої проблеми доступу) має дати Failed/ERROR/critical/restoreIntegrityFailed, а не Missing/порожній перелік; failed={0}, count={1}, critical={2}, restoreIntegrityFailed={3}, журнал: {4}" -f $retention424EnumMissingParentMissing.Failed, $retention424EnumMissingParentMissing.Count, $retention424EnumMissingParentMissing.Critical, $retention424EnumMissingParentMissing.RestoreFailed, $retention424EnumMissingParentMissing.Log)
 
     # (g) Main (тіло Invoke-BRAVOMaintenance поза вкладеними функціями):
     # перелік ARC_DIR, що живить і звичайний
@@ -27026,19 +27159,22 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Maintenance/LogsStepBaselineIsTakenAfterRestore"
 
     # --- Cleanup: SKIPPED/OK/WARN-FAIL wiring у реальному джерелі.
-    # Вікно 1400 -> 2000: P2-2/P2-3 (PR #136 review) додав дві нові
-    # EnumerationWarnings/DeletionWarnings-гілки в $cleanupDetailParts
-    # ПЕРЕД цим call site, тож фіксований 1400-символьний lookback
-    # більше не дотягувався до SKIPPED/Get-BRAVOMaintenanceStepStatus
-    # вище.
-    # Вікно 2000 -> 2600: #424 (раунди 1 і 3) додав між
-    # Get-BRAVOMaintenanceStepStatus і цим call site перевизначення статусу
-    # (WARN/FAIL понад SKIPPED, FAIL за $restoreArchiveIntegrityOutcome) з
-    # коментарями, тож 2000-символьний lookback уже не дотягувався до
-    # Get-BRAVOMaintenanceStepStatus і $cleanupWarningsBefore.
+    # Історія фіксованого lookback-вікна (1400 -> 2000 -> 2600 символів),
+    # яке довелось розширювати двічі, коли код кроку зростав — P2-2/P2-3
+    # (PR #136 review) додав EnumerationWarnings/DeletionWarnings-гілки в
+    # $cleanupDetailParts, #424 (раунди 1 і 3) додав перевизначення статусу
+    # (WARN/FAIL понад SKIPPED, FAIL за $restoreArchiveIntegrityOutcome).
+    # #428: вікно більше НЕ прив'язане до кількості символів — його межі
+    # визначають два стабільні іменовані якорі: Write-BRAVOProgressPhase
+    # самого кроку очистки (початок) і Write-BRAVOProgressPhase НАСТУПНОГО
+    # кроку/фази, 'Запуск BRAVO_ARCHIV' (кінець, ексклюзивно). Це увесь
+    # блок кроку очистки між двома фазами — зростання коду всередині блоку
+    # більше не вимагає розширення вікна.
+    $cleanupStepStartIndex = $maintenanceScriptText.IndexOf("Write-BRAVOProgressPhase -Phase 'Очистка старих даних'")
+    $cleanupStepEndIndex = $maintenanceScriptText.IndexOf("Write-BRAVOProgressPhase -Phase 'Запуск BRAVO_ARCHIV'")
     $cleanupResultCallIndex = $maintenanceScriptText.IndexOf("-Name 'Очистка старих даних/логів' ``", $planCleanupIndex)
-    $cleanupResultCallWindow = if ($cleanupResultCallIndex -ge 0) {
-        $maintenanceScriptText.Substring([Math]::Max(0, $cleanupResultCallIndex - 2600), 2600)
+    $cleanupResultCallWindow = if ($cleanupStepStartIndex -ge 0 -and $cleanupStepEndIndex -gt $cleanupStepStartIndex) {
+        $maintenanceScriptText.Substring($cleanupStepStartIndex, $cleanupStepEndIndex - $cleanupStepStartIndex)
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
