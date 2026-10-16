@@ -3,6 +3,14 @@
 $compatibilityManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Compatibility\BRAVO.Compatibility.psd1'
 Import-Module -Name $compatibilityManifest -ErrorAction Stop
 
+# Get-SanitizedWinSCPDiagnostic маскує вивід WinSCP канонічним
+# Protect-BRAVOLogSecretBounded, тож BRAVO.Logging мусить бути видимим з
+# області ЦЬОГО модуля, а не лише викликача (той самий прийом, що в
+# BRAVO.ArchiveHelpers). BRAVO.Logging — нижчий модуль без власних
+# імпортів, циклу немає; уже завантажений модуль використовується повторно.
+$loggingManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Logging\BRAVO.Logging.psd1'
+Import-Module -Name $loggingManifest -ErrorAction Stop
+
 function Get-BRAVOBazaSyncModeEffective {
     # Одна canonical точка інтерпретації (safety-review ТЗ п.20: "не
     # дублювати business rules у Archive/Health/DryRun/Diagnose — один
@@ -326,11 +334,17 @@ function Get-SanitizedWinSCPDiagnostic {
         return ""
     }
 
-    $sanitized = $Text
-    $sanitized = $sanitized -replace '(?i)(sftp://)[^@\s]+@', '$1***@'
-    $sanitized = $sanitized -replace '(?i)(-password=)(?:"[^"]*"|\S+)', '$1***'
+    # Маскування — ЛИШЕ канонічне (#461). Власні regex-заміни тут маскували
+    # значення в лапках чи з екрануванням лише до пробілу, а вставлене ними
+    # `***` ще й ламало повторне маскування у Write-BRAVOLog: канонічний
+    # шаблон бачив значенням `***` і лишав хвіст секрету.
+    #
+    # Межа рядків — ДО маскування: рядки відкидаються цілими, а жоден
+    # канонічний шаблон не перетинає розрив рядка, тож зріз не розрізає
+    # секрет. Так маскується лише те, що буде повернуто, і великий вивід
+    # синхронізації не впирається в межі вартості маскування.
     $lines = @(
-        $sanitized -split '\r?\n' |
+        $Text -split '\r?\n' |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
 
@@ -343,7 +357,17 @@ function Get-SanitizedWinSCPDiagnostic {
         )
     }
 
-    return ($lines -join [Environment]::NewLine)
+    # Fail-closed: якщо маскування недоступне, впало чи текст понад межі
+    # вартості — сирий вивід НЕ повертається, лише позначка без вмісту.
+    try {
+        $masked = Protect-BRAVOLogSecretBounded -Text ($lines -join [Environment]::NewLine)
+    } catch {
+        return "вивiд WinSCP не записано: маскування секретiв недоступне"
+    }
+    if ($masked.Omitted) {
+        return "вивiд WinSCP ($($masked.Length) символiв) не записано: надто великий або з надто довгим суцiльним фрагментом для безпечного маскування"
+    }
+    return [string]$masked.Text
 }
 
 function Remove-BRAVOWinSCPSensitiveTemporaryScript {
