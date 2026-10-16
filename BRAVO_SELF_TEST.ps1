@@ -21971,9 +21971,14 @@ try {
                 $diagShortSecretMasked = @(
                     [string](Protect-BRAVOLogSecret -Text "ERROR: entry token='AAA SSLEAK1' end" -KnownSecret @("'")),
                     [string](Protect-BRAVOLogSecret -Text 'ERROR: entry token="BBB SSLEAK2" end' -KnownSecret @('"')),
-                    [string](Protect-BRAVOLogSecret -Text 'ERROR: cmd password=my SSLEAK3 tail' -KnownSecret @('my SSLEAK3'))
+                    [string](Protect-BRAVOLogSecret -Text 'ERROR: cmd password=my SSLEAK3 tail' -KnownSecret @('my SSLEAK3')),
+                    # Пробіл, екранований бектіком чи \, у значенні без лапок —
+                    # частина значення: хвіст відомого секрету не лишається.
+                    [string](Protect-BRAVOLogSecret -Text 'ERROR: cmd password=my` SSLEAK4 tail' -KnownSecret @('my SSLEAK4')),
+                    [string](Protect-BRAVOLogSecret -Text 'ERROR: entry token=AAA` SSLEAK5 tail'),
+                    [string](Protect-BRAVOLogSecret -Text 'ERROR: entry secret=BBB\ SSLEAK6 tail')
                 )
-                $diagShortSecretLeaks = @('SSLEAK1', 'SSLEAK2', 'SSLEAK3' | Where-Object { ($diagShortSecretMasked -join "`n").Contains($_) })
+                $diagShortSecretLeaks = @('SSLEAK1', 'SSLEAK2', 'SSLEAK3', 'SSLEAK4', 'SSLEAK5', 'SSLEAK6' | Where-Object { ($diagShortSecretMasked -join "`n").Contains($_) })
                 $diagDoubledLeaks = @('DQLEAKS1', 'DQLEAKD2', 'DQLEAKP3', 'DQLEAKU4', 'DQLEAKB6', 'DQLEAKB7', 'DQLEAKB8', 'DQLEAKT9' |
                     Where-Object { $diagDoubledMasked.Contains($_) })
                 Test-BRAVOCondition `
@@ -21982,13 +21987,16 @@ try {
                         $diagShortSecretLeaks.Count -eq 0 -and
                         $diagShortSecretMasked[0] -ceq 'ERROR: entry token=*** end' -and
                         $diagShortSecretMasked[2] -ceq 'ERROR: cmd password=*** tail' -and
+                        $diagShortSecretMasked[3] -ceq 'ERROR: cmd password=*** tail' -and
+                        $diagShortSecretMasked[4] -ceq 'ERROR: entry token=*** tail' -and
+                        $diagShortSecretMasked[5] -ceq 'ERROR: entry secret=*** tail' -and
                         $diagDoubledMasked.Contains("token=*** end") -and
                         $diagDoubledMasked.Contains("secret=*** end") -and
                         $diagDoubledMasked.Contains("-password=*** x") -and
                         $diagDoubledMasked.Contains("`r`nNEXTRECORD 'kept' INTACT5")
                     ) `
                     -Name "Logging/QuotedSecretValueDoubledAndUnterminatedQuotes" `
-                    -Failure ("значення в лапках із екранованою лапкою ('' / `"`" / \`" / \' / ``) мусить маскуватись цілим, незакрите — до кінця рядка, " +
+                    -Failure ("значення в лапках із екранованою лапкою ('' / `"`" / \`" / \' / ``) мусить маскуватись цілим, незакрите — до кінця рядка, екранований пробіл без лапок — частина значення, " +
                         "без перетину розриву рядка; короткий відомий секрет не руйнує значення. Уламки: [$($diagDoubledLeaks -join ', ')]; " +
                         "уламки з коротким секретом: [$($diagShortSecretLeaks -join ', ')] ($($diagShortSecretMasked -join ' | ')); " +
                         "результат: $($diagDoubledMasked -replace "`r?`n", ' | ')")
