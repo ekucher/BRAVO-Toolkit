@@ -212,11 +212,43 @@ function Get-BRAVOMaintenanceServiceRecoveryDayLogPath {
     return (Join-Path $LOG_DIR ('BRAVO_MAINTENANCE_{0}_RECOVER_PAUSE.log' -f (Get-Date -Format 'yyyyMMdd')))
 }
 
+function Test-BRAVOMaintenanceServiceRecoveryDayLineDuplicate {
+    # Рев'ю #433 (C-3): щотикова подія (SCM — раз на хвилину, Daily — раз на
+    # 15 хв) при незмінному стані (та сама пауза, той самий власник lock-а)
+    # писала б в добовий RECOVER_PAUSE.log однаковий рядок щоразу — файл ріс
+    # би без обмеження. Порівнюємо НОВИЙ (Level; Message) з ОСТАННІМ рядком,
+    # який уже є у файлі (без огляду на часову мітку — вона завжди різна).
+    # Профіль пише в цей файл не більше одного рядка за тик (кожен шлях
+    # завершується return одразу після запису) — крім циклу по службах зі
+    # стабільністю (нижче), де кілька попереджень підряд про РІЗНІ служби
+    # лишаться різними рядками (текст з іменем служби відрізняється), тож
+    # порівняння з останнім рядком файлу тут не змішує служби між собою.
+    # Відсутній чи порожній файл, збій читання — не дублікат (краще зайвий
+    # рядок, ніж мовчки загублене попередження).
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Level,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $lastLine = Get-Content -LiteralPath $Path -Tail 1 -Encoding UTF8 -ErrorAction Stop
+        if ($null -eq $lastLine -or [string]::IsNullOrEmpty([string]$lastLine)) { return $false }
+        $suffix = '] [' + $Level + '] ' + $Message
+        return ([string]$lastLine).EndsWith($suffix)
+    } catch {
+        return $false
+    }
+}
+
 function Write-BRAVOMaintenanceServiceRecoveryDayLine {
     # Рядок профілю, що завершився без змін (пауза FR-5, вікно після старту
     # ОС, зайнятий lock): у консоль і в добовий RECOVER_PAUSE.log
     # (Get-BRAVOMaintenanceServiceRecoveryDayLogPath) — без окремого журналу
-    # прогону на кожен тик тригера.
+    # прогону на кожен тик тригера. Рев'ю #433 (C-3): рядок, що точнісінько
+    # повторює останній запис файлу (Test-BRAVOMaintenanceServiceRecoveryDayLineDuplicate),
+    # у файл НЕ дублюється — у консоль іде завжди.
     param(
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet('INFO', 'WARNING')][string]$Level = 'INFO'
@@ -226,7 +258,10 @@ function Write-BRAVOMaintenanceServiceRecoveryDayLine {
     Write-Host $dayLine
     try {
         if (-not (Test-Path -LiteralPath $LOG_DIR -PathType Container)) { [void](New-Item -ItemType Directory -Path $LOG_DIR -Force -ErrorAction Stop) }
-        $dayLine | Out-File -FilePath (Get-BRAVOMaintenanceServiceRecoveryDayLogPath) -Append -Encoding UTF8
+        $dayLogPath = Get-BRAVOMaintenanceServiceRecoveryDayLogPath
+        if (-not (Test-BRAVOMaintenanceServiceRecoveryDayLineDuplicate -Path $dayLogPath -Level $Level -Message $Message)) {
+            $dayLine | Out-File -FilePath $dayLogPath -Append -Encoding UTF8
+        }
     } catch {
         Write-Host "УВАГА: рядок у добовий журнал профілю не записано: $($_.Exception.Message)" -ForegroundColor Yellow
     }
@@ -487,8 +522,13 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
                 $script:maintenanceOperationLock = $stabilityLock.Stream
                 $script:maintenanceOperationLockPath = $stabilityLock.Path
                 try {
+                    # Рев'ю #433 (A-5): WARNING (зокрема про карантин пошкодженого
+                    # state-файлу, .corrupt-<ts>) ішов лише в консоль — у задачі
+                    # Планувальника він нікуди не потрапляв. Тепер — і в добовий
+                    # RECOVER_PAUSE.log (Write-BRAVOMaintenanceServiceRecoveryDayLine
+                    # пише і в консоль, і у файл).
                     foreach ($stabilityWarning in @(Update-BRAVOMaintenanceServiceRecoveryStability -ServiceSet $serviceSet -Conditions $conditions -StatePath $statePath -Now $now)) {
-                        Write-Host "УВАГА: $stabilityWarning" -ForegroundColor Yellow
+                        Write-BRAVOMaintenanceServiceRecoveryDayLine -Message $stabilityWarning -Level WARNING
                     }
                 } finally {
                     Exit-BRAVOMaintenanceOperationLock
