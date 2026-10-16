@@ -21922,6 +21922,32 @@ try {
                     -Failure ("значення шаблону в одинарних лапках (не відомий секрет) мусить бути замасковане цілим. " +
                         "маска присутня=$diagSingleQuotedMasked, уламок витік=$diagSingleQuotedLeak")
 
+                # Подвоєна лапка всередині значення ('' / "") — екранована лапка, а не
+                # кінець значення; незакрита лапка маскує решту свого рядка, але не
+                # перетинає розрив рядка: New-BRAVOMaskedLogCopy маскує журнал цілим
+                # текстом, і сусідні записи мусять лишитись цілими.
+                $diagDoubledText = @(
+                    "ERROR: entry token='AAA'' DQLEAKS1' end",
+                    'ERROR: entry secret="BBB"" DQLEAKD2" end',
+                    "ERROR: cmd -password='CC'' DQLEAKP3' x",
+                    "ERROR: entry token='OPEN DQLEAKU4",
+                    "NEXTRECORD 'kept' INTACT5"
+                ) -join "`r`n"
+                $diagDoubledMasked = [string](Protect-BRAVOLogSecret -Text $diagDoubledText)
+                $diagDoubledLeaks = @('DQLEAKS1', 'DQLEAKD2', 'DQLEAKP3', 'DQLEAKU4' | Where-Object { $diagDoubledMasked.Contains($_) })
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagDoubledLeaks.Count -eq 0 -and
+                        $diagDoubledMasked.Contains("token=*** end") -and
+                        $diagDoubledMasked.Contains("secret=*** end") -and
+                        $diagDoubledMasked.Contains("-password=*** x") -and
+                        $diagDoubledMasked.Contains("`r`nNEXTRECORD 'kept' INTACT5")
+                    ) `
+                    -Name "Logging/QuotedSecretValueDoubledAndUnterminatedQuotes" `
+                    -Failure ("значення в лапках із подвоєною лапкою мусить маскуватись цілим, незакрите — до кінця рядка, " +
+                        "без перетину розриву рядка. Уламки: [$($diagDoubledLeaks -join ', ')]; " +
+                        "результат: $($diagDoubledMasked -replace "`r?`n", ' | ')")
+
                 # Підробка записів журналу: ім'я запису з CR/LF і керівними символами
                 # не мусить створити рядок, що починається з timestamp (вигляд
                 # справжнього запису), і не мусить донести ESC до журналу/консолі.

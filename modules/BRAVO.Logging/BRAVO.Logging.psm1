@@ -184,14 +184,24 @@ function Protect-BRAVOLogSecret {
     $sanitized = $sanitized -replace '(?i)([a-z][a-z0-9+.-]*://[^:/\s@]+):[^@\s]+@', '$1:***@'
     # Значення шаблонів нижче: у подвійних лапках, в ОДИНАРНИХ лапках (інакше
     # `token='AAA LEAK'` маскувалось би лише до першого пробілу й лишало
-    # `token=*** LEAK'`) або без лапок до пробілу. В одинарно-лапкованому
-    # PowerShell-літералі одинарна лапка подвоюється ('').
+    # `token=*** LEAK'`) або без лапок до пробілу. Подвоєна лапка всередині
+    # значення ('' / "") — екранована лапка, а не кінець значення: інакше
+    # `token='AAA'' LEAK'` маскувалось би до `token=***' LEAK'`. Альтернативи
+    # `[^']` і `''` не перетинаються, тож шаблон лишається лінійним.
+    # Значення в лапках не перетинає розрив рядка: New-BRAVOMaskedLogCopy
+    # маскує журнал ЦІЛИМ текстом, і лапка без пари в одному записі інакше
+    # «з'їла» б усі записи до наступної лапки. Незакрита в межах рядка лапка
+    # (обрізаний чи сформований текст) маскує решту рядка: інакше
+    # `token='AAA LEAK` втратив би лише `'AAA`.
+    # (Тут сам regex — у одинарно-лапкованому PowerShell-літералі, тому
+    # кожна його одинарна лапка записана подвоєною.)
+    $quotedSecretValue = '(?:"(?:[^"\r\n]|"")*(?:"|(?=[\r\n])|\z)|''(?:[^''\r\n]|'''')*(?:''|(?=[\r\n])|\z)|\S+)'
     # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
-    $sanitized = $sanitized -replace '(?i)(-password=)(?:"[^"]*"|''[^'']*''|\S+)', '$1***'
+    $sanitized = $sanitized -replace ('(?i)(-password=)' + $quotedSecretValue), '$1***'
     # (?!ath|assword) — інакше це правило повторно "з'їдає" вже замасковане
     # -password=*** з рядка вище, розпізнавши його як коротку форму -p.
-    $sanitized = $sanitized -replace '(?i)(\s-p)(?!ath|assword)(?:"[^"]*"|''[^'']*''|\S+)', '$1***'
-    $sanitized = $sanitized -replace '(?i)((?:password|passwd|secret|token)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|\S+)', '$1***'
+    $sanitized = $sanitized -replace ('(?i)(\s-p)(?!ath|assword)' + $quotedSecretValue), '$1***'
+    $sanitized = $sanitized -replace ('(?i)((?:password|passwd|secret|token)\s*[:=]\s*)' + $quotedSecretValue), '$1***'
     # Webhook URL — сам bearer-секрет, без user:pass@; підтримувані провайдери
     # (Send-BRAVOWebhookNotification -Provider slack|discord) мають токен
     # прямо у шляху, а не в окремому параметрі.
