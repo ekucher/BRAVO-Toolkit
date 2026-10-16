@@ -21930,11 +21930,15 @@ try {
                     "ERROR: entry token='AAA'' DQLEAKS1' end",
                     'ERROR: entry secret="BBB"" DQLEAKD2" end',
                     "ERROR: cmd -password='CC'' DQLEAKP3' x",
+                    'ERROR: entry token="EEE\" DQLEAKB6" end',
+                    "ERROR: entry secret='FFF\' DQLEAKB7' end",
+                    'ERROR: cmd -password="GG\\\" DQLEAKB8" x',
                     "ERROR: entry token='OPEN DQLEAKU4",
                     "NEXTRECORD 'kept' INTACT5"
                 ) -join "`r`n"
                 $diagDoubledMasked = [string](Protect-BRAVOLogSecret -Text $diagDoubledText)
-                $diagDoubledLeaks = @('DQLEAKS1', 'DQLEAKD2', 'DQLEAKP3', 'DQLEAKU4' | Where-Object { $diagDoubledMasked.Contains($_) })
+                $diagDoubledLeaks = @('DQLEAKS1', 'DQLEAKD2', 'DQLEAKP3', 'DQLEAKU4', 'DQLEAKB6', 'DQLEAKB7', 'DQLEAKB8' |
+                    Where-Object { $diagDoubledMasked.Contains($_) })
                 Test-BRAVOCondition `
                     -Condition (
                         $diagDoubledLeaks.Count -eq 0 -and
@@ -21944,7 +21948,7 @@ try {
                         $diagDoubledMasked.Contains("`r`nNEXTRECORD 'kept' INTACT5")
                     ) `
                     -Name "Logging/QuotedSecretValueDoubledAndUnterminatedQuotes" `
-                    -Failure ("значення в лапках із подвоєною лапкою мусить маскуватись цілим, незакрите — до кінця рядка, " +
+                    -Failure ("значення в лапках із екранованою лапкою ('' / `"`" / \`" / \') мусить маскуватись цілим, незакрите — до кінця рядка, " +
                         "без перетину розриву рядка. Уламки: [$($diagDoubledLeaks -join ', ')]; " +
                         "результат: $($diagDoubledMasked -replace "`r?`n", ' | ')")
 
