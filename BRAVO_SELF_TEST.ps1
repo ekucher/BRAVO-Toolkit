@@ -5045,8 +5045,12 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # (Get-BRAVORestoreArchiveMainFiles) виставляє restoreIntegrityFailed
             # за збою переліку чи перевірки наявності каталогу (не відсутній
             # каталог) — сесії не перевірено, нічого не видаляється.
+            # +1 integrity (#428): той самий Get-BRAVORestoreArchiveMainFiles —
+            # цільовий підкаталог архівів відсутній, АЛЕ батьківський каталог
+            # теж не існує/недоступний (ознака ширшої проблеми доступу, а не
+            # легітимної відсутності) — Failed/fail-closed, а не Missing.
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 13) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 13)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 14)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
         -Failure "Maintenance має розрізняти локальну архівацію (40), перевірку цілісності (41) і провал реставрації з відкатом (43), а не зводити все до 60"
