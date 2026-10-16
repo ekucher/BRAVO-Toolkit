@@ -230,12 +230,13 @@ function Protect-BRAVOSevenZipDiagnosticText {
     # обробка збою могла б зависнути саме тоді, коли діагностика потрібна:
     # - загальна довжина (-MaximumMaskedCharacters): діапазон на кожен збіг
     #   відомого значення й копії тексту на кожен шаблон;
-    # - довжина суцільного фрагмента без пробілів
+    # - довжина суцільного ланцюжка символів схеми URL `[a-z0-9+.-]`
     #   (-MaximumTokenCharacters): шаблон облікових даних в URL у
-    #   канонічному маскувальнику поводиться квадратично на довгому
-    #   суцільному фрагменті (виміряно: 10 тис. символів — ~2 с, 30 тис. —
-    #   ~17 с). Звичайний вивід 7-Zip — короткі імена записів, тож обидві
-    #   межі для нього недосяжні.
+    #   канонічному маскувальнику (`[a-z][a-z0-9+.-]*://…`) поводиться
+    #   квадратично саме на такому ланцюжку (виміряно: 10 тис. символів —
+    #   ~2 с, 30 тис. — ~17 с). Будь-який інший символ (`\`, `_`, пробіл,
+    #   лапки) ланцюжок розриває, тож звичайні шляхи й вивід 7-Zip (короткі
+    #   імена записів) обидві межі не досягають.
     # Текст понад будь-яку межу НЕ маскується і НЕ пишеться (fail-closed):
     # викликач отримує Omitted і записує лише позначку з довжиною.
     #
@@ -249,7 +250,7 @@ function Protect-BRAVOSevenZipDiagnosticText {
 
     $sourceText = [string]$Text
     if ($sourceText.Length -gt $MaximumMaskedCharacters -or
-        [regex]::IsMatch($sourceText, ('\S{' + ($MaximumTokenCharacters + 1) + '}'))) {
+        [regex]::IsMatch($sourceText, ('(?i)[a-z0-9+.\-]{' + ($MaximumTokenCharacters + 1) + '}'))) {
         return [pscustomobject]@{ Text = ''; Omitted = $true; Length = $sourceText.Length }
     }
     return [pscustomobject]@{
@@ -604,7 +605,15 @@ function Test-SevenZipArchiveIntegrity {
         # Headline — однорядковий запис: CR/LF у шляху (на NTFS недосяжні, але
         # -ArchivePath — довільний рядок) замінюються пробілом, щоб шлях не
         # розгортався в багато рядків журналу.
-        $headlinePath = ([string](Protect-BRAVOLogSecret -Text ([string]$ArchivePath) -KnownSecret @($Password))) -replace '[\r\n]+', ' '
+        # Шлях — через ту саму модель із межами вартості, що й решта
+        # діагностики: прямий виклик маскувальника на довгому суцільному
+        # ланцюжку міг би загальмувати шлях обробки збою.
+        $maskedPath = Protect-BRAVOSevenZipDiagnosticText -Text ([string]$ArchivePath) -KnownSecret @($Password)
+        $headlinePath = if ($maskedPath.Omitted) {
+            "(шлях $($maskedPath.Length) символів не записано: надто довгий суцільний фрагмент для безпечного маскування)"
+        } else {
+            ([string]$maskedPath.Text) -replace '[\r\n]+', ' '
+        }
     } catch {
         $headlineDescription = 'опис приховано: маскування секретів недоступне'
         $headlinePath = '(шлях приховано: маскування секретів недоступне)'

@@ -21916,11 +21916,11 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         'Test-SevenZipArchiveIntegrity'
                     ) `
                     -PreferLastDefinitionOnDuplicate
-                # Шлях архіву — extended-length (~4500 символів, довший за весь
-                # бюджет запису): headline перевищив би 4000 символів за будь-якої
-                # довжини опису, тож обрізання шляху тут гарантоване. Ім'я архіву
-                # в кінці шляху мусить уціліти.
-                $diagRouteArchivePath = '\\?\C:\nonexistent\' + ('p' * 4500) + '\ROUTEARCHIVELEAF.7z'
+                # Шлях архіву — extended-length (~4600 символів, довший за весь
+                # бюджет запису) з реалістичними сегментами: headline перевищив би
+                # 4000 символів за будь-якої довжини опису, тож обрізання шляху тут
+                # гарантоване. Ім'я архіву в кінці шляху мусить уціліти.
+                $diagRouteArchivePath = '\\?\C:\nonexistent\' + (('p' * 40 + '\') * 112) + 'ROUTEARCHIVELEAF.7z'
                 $diagRouteResult = & $diagRouteModule {
                     param($Logger, $FixturePass, $ArchivePathValue)
                     Test-SevenZipArchiveIntegrity `
@@ -21937,7 +21937,7 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                 # (маркер перед хвостом шляху), ім'я архіву вціліло.
                 $diagRouteDescriptionTruncated = $diagRouteHeadline.Contains(' … (обрізано)): ')
                 $diagRoutePathTruncatedKeepingLeaf = (
-                    $diagRouteHeadline.Contains('(обрізано) … ppp') -and
+                    $diagRouteHeadline.Contains('(обрізано) … ') -and
                     $diagRouteHeadline.EndsWith('\ROUTEARCHIVELEAF.7z')
                 )
                 Test-BRAVOCondition `
@@ -21969,7 +21969,7 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                 # маскування мусить прибрати його цілком.
                 $diagPathSecretLogFile = Join-Path $b2TestRoot ("diag_pathsecret_{0}.log" -f [guid]::NewGuid().ToString("N"))
                 [void](Initialize-BRAVOLog -LogFile $diagPathSecretLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
-                $diagPathSecretArchivePath = '\\?\C:\nonexistent\password=' + ('V' * 3500) + '\PATHSECRETLEAF.7z'
+                $diagPathSecretArchivePath = '\\?\C:\nonexistent\password=' + (('V' * 40 + '_') * 85) + '\PATHSECRETLEAF.7z'
                 [void](& $diagRouteModule {
                     param($Logger, $FixturePass, $ArchivePathValue)
                     Test-SevenZipArchiveIntegrity `
@@ -21994,6 +21994,37 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         "Довжина headline=$($diagPathSecretHeadline.Length), " +
                         "маска присутня=$($diagPathSecretHeadline.Contains('password=***')), " +
                         "уламок значення витік=$($diagPathSecretText.Contains('VVVV'))")
+
+                # Шлях із довгим суцільним ланцюжком символів схеми URL (на ньому
+                # шаблон URL-кредів маскувальника квадратичний) не маскується і не
+                # пишеться: headline містить позначку з довжиною, а не сирий шлях,
+                # і шлях обробки збою не гальмує.
+                $diagLongPathLogFile = Join-Path $b2TestRoot ("diag_longpath_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagLongPathLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagLongPathArchivePath = 'C:\nonexistent\' + ('q' * 2000) + '\LONGRUNLEAF.7z'
+                [void](& $diagRouteModule {
+                    param($Logger, $FixturePass, $ArchivePathValue)
+                    Test-SevenZipArchiveIntegrity `
+                        -SevenZipPath 'C:\nonexistent\7za.exe' `
+                        -ArchivePath $ArchivePathValue `
+                        -Password $FixturePass `
+                        -Logger $Logger
+                } $diagLogger $diagFixtureLegacyPassword $diagLongPathArchivePath)
+                $diagLongPathText = if (Test-Path -LiteralPath $diagLongPathLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagLongPathLogFile)
+                } else { '' }
+                $diagLongPathHeadline = [regex]::Match($diagLongPathText, 'Перевiрка цiлiсностi 7-Zip не пройдена[^\r\n]*').Value
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagLongPathHeadline.Length -gt 0 -and
+                        $diagLongPathHeadline.Contains("(шлях $($diagLongPathArchivePath.Length) символів не записано") -and
+                        -not $diagLongPathHeadline.Contains('qqqq')
+                    ) `
+                    -Name "SevenZipDiagnostics/IntegrityHeadlineLongRunPathOmitted" `
+                    -Failure ("шлях архіву з довгим суцільним ланцюжком мусить бути пропущений із позначкою довжини, а не " +
+                        "замаскований квадратичним шаблоном чи записаний сирим. " +
+                        "позначка=$($diagLongPathHeadline.Contains('символів не записано')), " +
+                        "сирий шлях=$($diagLongPathHeadline.Contains('qqqq'))")
 
                 # Production-топологія модулів. BRAVO_ARCHIV.ps1 імпортує лише
                 # BRAVO.Archive, а той запускає Runtime.ps1 у session state свого
