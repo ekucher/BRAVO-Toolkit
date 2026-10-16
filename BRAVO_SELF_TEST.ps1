@@ -27587,7 +27587,12 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         'open sftp://u -password=AA` WSLEAK4 x',
         'Error: password=WSLEAK5 token=WSLEAK6',
         ('open ftps://{0}:{1}@nas.local/' -f $winScpMaskUser, ('WSLEAK' + '7')),
-        ("line1`r`n`r`nsftp://{0}:{1}@nas.local/ ok" -f $winScpMaskUser, ('WSLEAK' + '8'))
+        ("line1`r`n`r`nsftp://{0}:{1}@nas.local/ ok" -f $winScpMaskUser, ('WSLEAK' + '8')),
+        # #463: значення в лапках, перенесене на наступний рядок, і URL-пароль
+        # із порожнім логіном.
+        "open sftp://u -password=`"AA`r`nWSLEAK9`" x",
+        "open sftp://u -password='AA`nWSLEAK10' x",
+        ('open sftp://:{0}@nas.local/' -f ('WSLEAK' + '11'))
     )
     $winScpLoggingModule = Get-Module -Name 'BRAVO.Logging' -All | Select-Object -First 1
     $winScpMaskLeaks = New-Object System.Collections.Generic.List[string]
@@ -27604,6 +27609,12 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     $winScpLineLimited = [string](Get-SanitizedWinSCPDiagnostic -MaximumLines 3 -Text (
         (1..100 | ForEach-Object { "row $_ token=WSLEAKROW$_" }) -join "`r`n"))
     $winScpOversized = [string](Get-SanitizedWinSCPDiagnostic -Text ('Error: password=WSLEAKBIG ' + ('U' * 300)))
+    # #463: ключ у рядку, що відкидається межею рядків, а хвіст значення в
+    # лапках — у рядках, що лишаються: маскування до зрізу не лишає хвоста.
+    $winScpCapSplit = [string](Get-SanitizedWinSCPDiagnostic -MaximumLines 3 -Text (
+        "open -password=`"AA`r`n" + ((1..10 | ForEach-Object { "pad $_" }) -join "`r`n") + "`r`nWSLEAKCAP`" tail"))
+    $winScpCanonicalEmptyUser = [string](& $winScpLoggingModule { param($Text) Protect-BRAVOLogSecret -Text $Text } (
+        'sync sftp://:{0}@nas.local/' -f ('WSLEAK' + 'EU')))
     $winScpFailClosed = [string](& (Get-Module -Name 'BRAVO.ArchiveRuntime') {
         function Protect-BRAVOLogSecretBounded { throw 'simulated canonical masking failure' }
         Get-SanitizedWinSCPDiagnostic -Text ('Error: password=' + 'WSLEAK' + 'FC')
@@ -27614,6 +27625,9 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
             $winScpLineLimited.Contains('row 100 token=***') -and
             $winScpLineLimited.Contains('97') -and
             -not $winScpLineLimited.Contains('WSLEAKROW') -and
+            -not $winScpCapSplit.Contains('WSLEAKCAP') -and
+            $winScpCanonicalEmptyUser -eq 'sync sftp://:***@nas.local/' -and
+            $winScpCapSplit.Contains('***') -and
             $winScpOversized.Contains('не записано') -and
             -not $winScpOversized.Contains('WSLEAKBIG') -and
             $winScpFailClosed.Contains('не записано') -and
@@ -27622,7 +27636,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Secrets/WinSCPDiagnosticMaskedCanonically" `
         -Failure ("Get-SanitizedWinSCPDiagnostic має маскувати канонічно й fail-closed (#461). " +
             "Уламки: [$($winScpMaskLeaks -join ' || ')]; межа рядків: $($winScpLineLimited -replace "`r?`n", ' | '); " +
-            "понад межі: $winScpOversized; без маскування: $winScpFailClosed")
+            "зріз після ключа: $($winScpCapSplit -replace "`r?`n", ' | '); понад межі: $winScpOversized; без маскування: $winScpFailClosed")
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains('BRAVO.ArchiveHelpers') -and

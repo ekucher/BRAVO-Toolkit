@@ -70,7 +70,11 @@ function Protect-BRAVOLogSecret {
         # ловлять лише "password=...", URL-креди і webhook-и відомих
         # провайдерів; сирий пароль 7-Zip чи API-ключ без контексту вони
         # пропускають. Без параметра поведінка функції незмінна.
-        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
+
+        # Значення в лапках переходить через розрив рядка (див. нижче) — для
+        # недовіреного виводу інструмента цілим текстом, а не для журналу.
+        [switch]$QuotedValueSpansLines
     )
 
     if ([string]::IsNullOrEmpty($Text)) {
@@ -193,11 +197,23 @@ function Protect-BRAVOLogSecret {
     # включно з пробілом. Інакше password=my, бектік, пробіл, secret
     # (екранований пробіл PowerShell) з відомим секретом `my secret`
     # маскувався б лише до пробілу й лишав `password=*** secret`.
+    # -QuotedValueSpansLines (#463) — для виводу зовнішнього інструмента,
+    # де логічний рядок може бути перенесений (`-password="AA`, розрив,
+    # `SECRET"`): там значення в лапках переходить через розрив рядка, а
+    # незакрита лапка маскує решту тексту. Поза лапками значення так само
+    # закінчується на пробільному символі. Викликач маскує такий вивід
+    # ЦІЛИМ, до будь-яких зрізів по рядках.
     # (Тут сам regex — у одинарно-лапкованому PowerShell-літералі, тому
     # кожна його одинарна лапка записана подвоєною.)
-    $quotedSecretValue = '(?:"(?:[^"\\`\r\n]|[\\`][^\r\n]?|"")*(?:"|(?=[\r\n])|\z)|''(?:[^''\\`\r\n]|[\\`][^\r\n]?|'''')*(?:''|(?=[\r\n])|\z)|(?:[^\s\\`]|[\\`][^\r\n]?)+)'
+    if ($QuotedValueSpansLines) {
+        $quotedSecretValue = '(?:"(?:[^"\\`]|[\\`][\s\S]?|"")*(?:"|\z)|''(?:[^''\\`]|[\\`][\s\S]?|'''')*(?:''|\z)|(?:[^\s\\`]|[\\`][^\r\n]?)+)'
+    } else {
+        $quotedSecretValue = '(?:"(?:[^"\\`\r\n]|[\\`][^\r\n]?|"")*(?:"|(?=[\r\n])|\z)|''(?:[^''\\`\r\n]|[\\`][^\r\n]?|'''')*(?:''|(?=[\r\n])|\z)|(?:[^\s\\`]|[\\`][^\r\n]?)+)'
+    }
     $secretPatterns = @(
-        '(?i)[a-z][a-z0-9+.-]*://[^:/\s@]+:(?<v>[^@\s]+)@',
+        # Логін може бути порожнім (`sftp://:password@host`, #463) — пароль
+        # маскується і тоді.
+        '(?i)[a-z][a-z0-9+.-]*://[^:/\s@]*:(?<v>[^@\s]+)@',
         # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
         ('(?i)-password=(?<v>' + $quotedSecretValue + ')'),
         # (?!ath|assword) — коротка форма -p, але не -path і не -password=
@@ -277,7 +293,8 @@ function Protect-BRAVOLogSecretBounded {
         [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
         [ValidateRange(1000, 50000000)][int]$MaximumMaskedCharacters = 200000,
         [ValidateRange(64, 100000)][int]$MaximumTokenCharacters = 256,
-        [ValidateRange(64, 100000)][int]$MaximumUrlRunCharacters = 512
+        [ValidateRange(64, 100000)][int]$MaximumUrlRunCharacters = 512,
+        [switch]$QuotedValueSpansLines
     )
 
     $sourceText = [string]$Text
@@ -292,7 +309,7 @@ function Protect-BRAVOLogSecretBounded {
         return [pscustomobject]@{ Text = ''; Omitted = $true; Length = $sourceText.Length }
     }
     return [pscustomobject]@{
-        Text = [string](Protect-BRAVOLogSecret -Text $sourceText -KnownSecret $KnownSecret)
+        Text = [string](Protect-BRAVOLogSecret -Text $sourceText -KnownSecret $KnownSecret -QuotedValueSpansLines:$QuotedValueSpansLines)
         Omitted = $false
         Length = $sourceText.Length
     }

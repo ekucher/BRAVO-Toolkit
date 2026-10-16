@@ -319,6 +319,10 @@ function Get-BRAVOWinSCPBusyMessage {
         -Text "Запуск WinSCP для ${Operation} заблоковано: виявлено активний WinSCP.com ($processDetails)")
 }
 
+# Межа загальної довжини виводу WinSCP для маскування (#463): вивід
+# маскується цілим, тож межа має вміщати великий вивід синхронізації.
+$script:WinSCPDiagnosticMaximumMaskedCharacters = 5000000
+
 function Get-SanitizedWinSCPDiagnostic {
     # Спільна санітизація stdout/stderr WinSCP.com для Archive і Health
     # runtime — раніше була продубльована окремо в кожному з них, тож
@@ -339,12 +343,28 @@ function Get-SanitizedWinSCPDiagnostic {
     # `***` ще й ламало повторне маскування у Write-BRAVOLog: канонічний
     # шаблон бачив значенням `***` і лишав хвіст секрету.
     #
-    # Межа рядків — ДО маскування: рядки відкидаються цілими, а жоден
-    # канонічний шаблон не перетинає розрив рядка, тож зріз не розрізає
-    # секрет. Так маскується лише те, що буде повернуто, і великий вивід
-    # синхронізації не впирається в межі вартості маскування.
+    # Маскується ВЕСЬ вивід, ДО відкидання рядків, і значення в лапках
+    # переходить через розрив рядка (#463): перенесений рядок
+    # `-password="AA`, розрив, `SECRET"` інакше лишив би `SECRET"`, а зріз
+    # по рядках до маскування міг би відрізати рядок із ключем і лишити
+    # хвіст без контексту. Межа загальної довжини тут вища, ніж типова:
+    # вивід синхронізації великий, а маскування лінійне (суцільні фрагменти,
+    # на яких канонічний шаблон URL квадратичний, обмежені окремо).
+    #
+    # Fail-closed: якщо маскування недоступне, впало чи текст понад межі
+    # вартості — сирий вивід НЕ повертається, лише позначка без вмісту.
+    try {
+        $masked = Protect-BRAVOLogSecretBounded -Text $Text -QuotedValueSpansLines `
+            -MaximumMaskedCharacters $script:WinSCPDiagnosticMaximumMaskedCharacters
+    } catch {
+        return "вивiд WinSCP не записано: маскування секретiв недоступне"
+    }
+    if ($masked.Omitted) {
+        return "вивiд WinSCP ($($masked.Length) символiв) не записано: надто великий або з надто довгим суцiльним фрагментом для безпечного маскування"
+    }
+
     $lines = @(
-        $Text -split '\r?\n' |
+        ([string]$masked.Text) -split '\r?\n' |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
 
@@ -356,18 +376,7 @@ function Get-SanitizedWinSCPDiagnostic {
             $lines | Select-Object -Last $safeMaximumLines
         )
     }
-
-    # Fail-closed: якщо маскування недоступне, впало чи текст понад межі
-    # вартості — сирий вивід НЕ повертається, лише позначка без вмісту.
-    try {
-        $masked = Protect-BRAVOLogSecretBounded -Text ($lines -join [Environment]::NewLine)
-    } catch {
-        return "вивiд WinSCP не записано: маскування секретiв недоступне"
-    }
-    if ($masked.Omitted) {
-        return "вивiд WinSCP ($($masked.Length) символiв) не записано: надто великий або з надто довгим суцiльним фрагментом для безпечного маскування"
-    }
-    return [string]$masked.Text
+    return ($lines -join [Environment]::NewLine)
 }
 
 function Remove-BRAVOWinSCPSensitiveTemporaryScript {
