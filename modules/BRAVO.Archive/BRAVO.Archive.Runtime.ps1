@@ -2158,12 +2158,40 @@ function Sync-Folders {
 
 
 function Write-SevenZipFailureDiagnostics {
-    param([string]$Operation, [string]$StandardOutput, [string]$StandardError)
-    foreach ($line in @($StandardOutput, $StandardError)) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) {
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "${Operation}: $($line.Trim().Substring(0, [math]::Min(4000, $line.Trim().Length)))" -Level 'DEBUG'
-        }
+    # Тонкий адаптер над канонічним Write-BRAVOSevenZipFailureDiagnostics
+    # (BRAVO.ArchiveHelpers — імпортується вище): він володіє і нормалізацією
+    # рядків, і межами, і правилом рівня. Тут лишається лише мостик до
+    # Write-BRAVOLog — рівно той самий logger-скриптблок, що його передає
+    # виклик Test-SevenZipArchiveIntegrity у New-Archive.
+    #
+    # До цього тут було ДВІ незалежні копії правила рівня, і саме так шляхи
+    # create та test розійшлися. Попередня реалізація, окрім DEBUG, мала ще
+    # два дефекти: foreach ішов по ДВОХ ПОТОКАХ, а не по рядках (тому межі
+    # на 20 рядків не було взагалі, а 4000 символів застосовувались до
+    # кожного потоку окремо), і гілки для порожнього виводу не існувало.
+    param(
+        [string]$Operation,
+        [string]$StandardOutput,
+        [string]$StandardError,
+        [ValidateSet('ERROR', 'WARNING')][string]$Level = 'ERROR',
+        [AllowNull()][AllowEmptyString()][string]$EmptyOutputReason
+    )
+    # Пароль архіву — відомий секрет для маскування виводу 7-Zip ще до
+    # першого запису. Читається через Get-Variable: під StrictMode змінна
+    # може бути ще не ініціалізована (ранній збій до читання облікових даних).
+    $archivePasswordVariable = Get-Variable -Name archivePassword -Scope Script -ErrorAction SilentlyContinue
+    $knownSecret = @()
+    if ($null -ne $archivePasswordVariable -and -not [string]::IsNullOrEmpty([string]$archivePasswordVariable.Value)) {
+        $knownSecret = @([string]$archivePasswordVariable.Value)
     }
+    [void](Write-BRAVOSevenZipFailureDiagnostics `
+        -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level } `
+        -Operation $Operation `
+        -StandardOutput $StandardOutput `
+        -StandardError $StandardError `
+        -Level $Level `
+        -EmptyOutputReason $EmptyOutputReason `
+        -KnownSecret $knownSecret)
 }
 
 function Get-BRAVOVSSSnapshotSourcePath {
@@ -3586,12 +3614,17 @@ function New-Archive {
         if ($showSevenZipProgress) {
             Show-RunningProgress -Id $sevenZipProgressId -Activity $progressActivity -Completed
         }
-        $lastSevenZipOutput = @($standardOutput -split "\r?\n" | Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_)
-        } | Select-Object -Last 1)
-
         if ($archiveTimedOut) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiвацiю перервано: перевищено таймаут $archiveTimeoutSeconds сек.: $displayName" -Level "ERROR"
+            # 878dd86 логував діагностику 7-Zip і на шляху таймауту; разом
+            # з рештою її прибрав ce4855d. Вивід убитого процесу — єдиний
+            # доказ того, на чому саме він завис; якщо потоки порожні, це
+            # теж тепер видно явно.
+            Write-SevenZipFailureDiagnostics `
+                -Operation "Дiагностика 7-Zip create" `
+                -StandardOutput $standardOutput `
+                -StandardError $errorOutput `
+                -EmptyOutputReason "перевищено таймаут $archiveTimeoutSeconds сек. (процес завершено примусово)"
             if (Test-Path -LiteralPath $fullArchivePath -PathType Leaf) {
                 Remove-Item -LiteralPath $fullArchivePath -Force -ErrorAction SilentlyContinue
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Неповний архiв видалено: $fullArchivePath" -Level "WARNING"
@@ -3643,17 +3676,24 @@ function New-Archive {
         } else {
             $toolExitInfo = Get-BRAVOToolExitCodeDescription -Tool '7-Zip' -ExitCode $process.ExitCode
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї 7-Zip (код: $($process.ExitCode) — $($toolExitInfo.OperatorDescription)): $fullArchivePath" -Level "ERROR"
-            Write-SevenZipFailureDiagnostics -Operation "Дiагностика 7-Zip create" -StandardOutput $standardOutput -StandardError $errorOutput
-            if ($showSevenZipProgress) {
-                if (-not [string]::IsNullOrWhiteSpace($lastSevenZipOutput)) {
-                    Write-BRAVOLog -Component 'ARCHIVE' -Message "Останнiй вивiд 7-Zip: $lastSevenZipOutput" -Level "DEBUG"
-                }
-                if (-not [string]::IsNullOrWhiteSpace($errorOutput)) {
-                    Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка 7-Zip: $errorOutput" -Level "DEBUG"
-                }
-            } else {
-                Write-BRAVOLog -Component 'ARCHIVE' -Message "Деталi: $errorOutput" -Level "DEBUG"
-            }
+            # Звичайний (не timeout) збій створення — найчастіша форма
+            # production-збою, тож діагностика мусить бути й тут, а не лише в
+            # timeout-гілці вище (та гілка повертає раніше і сюди не доходить).
+            Write-SevenZipFailureDiagnostics `
+                -Operation "Дiагностика 7-Zip create" `
+                -StandardOutput $standardOutput `
+                -StandardError $errorOutput `
+                -EmptyOutputReason ("7-Zip завершився з кодом {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription)
+            # Це ЄДИНИЙ запис діагностики на цьому шляху. Три попередні рядки
+            # ("Останнiй вивiд 7-Zip", "Помилка 7-Zip", "Деталi") прибрано:
+            # вони дублювали той самий $standardOutput / $errorOutput на рівні
+            # DEBUG, тобто при канонічному FileLevel=INFO не доходили ні до
+            # файлу, ні до консолі, і водночас суперечили інваріанту
+            # Write-BRAVOSevenZipFailureDiagnostics («НІКОЛИ не пише на
+            # DEBUG»). Разом із ними прибрано й обчислення
+            # $lastSevenZipOutput — це був останній непорожній рядок
+            # $standardOutput, тобто підмножина того, що виклик вище вже
+            # отримує цілим потоком; інших читачів у змінної не було.
             $script:lastArchiveToolFailure = [pscustomobject]@{
                 Tool = '7-Zip'
                 ToolExitCodeText = "{0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
