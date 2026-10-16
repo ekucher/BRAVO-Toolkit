@@ -78,6 +78,21 @@ function Protect-BRAVOLogSecret {
     }
 
     $sanitized = $Text
+    # ЄДИНА модель заміни: збіги і відомих значень, і шаблонів шукаються в
+    # ОРИГІНАЛЬНОМУ тексті, перекриті й суміжні діапазони зливаються, і
+    # кожен злитий діапазон замінюється одним ***. Послідовна заміна
+    # лишала б фрагмент, бо перша заміна руйнує контекст для наступної:
+    # - між відомими секретами — для частково перекритих (кінець одного —
+    #   початок іншого) перша заміна руйнує збіг другого;
+    # - між відомим секретом і шаблоном — короткий відомий секрет, що
+    #   збігається із синтаксисом значення (пароль `'`), перетворив би
+    #   `token='AAA LEAK'` на `token=***AAA LEAK***`, і шаблон уже не
+    #   впізнав би лапковане значення, лишивши `LEAK`;
+    # - у зворотному порядку (шаблони першими) — `password=my secret` із
+    #   відомим `my secret` дав би `password=*** secret`, і відоме значення
+    #   вже не знайшлося б цілим.
+    $spanStarts = New-Object 'System.Collections.Generic.List[int]'
+    $spanEnds = New-Object 'System.Collections.Generic.List[int]'
     if ($null -ne $KnownSecret) {
         # Правило значень: порожнє і whitespace-only НЕ маскуються (інакше
         # *** замінило б кожен пробіл, а секрету там немає); будь-яке інше
@@ -140,15 +155,8 @@ function Protect-BRAVOLogSecret {
                 }
             }
         }
-        # Збіги ВСІХ варіантів шукаються в ОРИГІНАЛЬНОМУ тексті, перекриті й
-        # суміжні діапазони зливаються, і кожен злитий діапазон замінюється
-        # одним ***. Послідовна заміна лишала б фрагмент: для частково
-        # перекритих секретів (кінець одного — початок іншого) перша заміна
-        # руйнує збіг другого, і його "хвіст" витікав би.
         # IndexOf(..., Ordinal) — без культури і без regex-семантики:
         # спецсимволи в секреті не інтерпретуються.
-        $spanStarts = New-Object 'System.Collections.Generic.List[int]'
-        $spanEnds = New-Object 'System.Collections.Generic.List[int]'
         foreach ($secretVariant in $secretVariants) {
             $matchIndex = $sanitized.IndexOf([string]$secretVariant, 0, [System.StringComparison]::Ordinal)
             while ($matchIndex -ge 0) {
@@ -157,42 +165,82 @@ function Protect-BRAVOLogSecret {
                 $matchIndex = $sanitized.IndexOf([string]$secretVariant, $matchIndex + 1, [System.StringComparison]::Ordinal)
             }
         }
-        if ($spanStarts.Count -gt 0) {
-            [int[]]$orderedStarts = $spanStarts.ToArray()
-            [int[]]$orderedEnds = $spanEnds.ToArray()
-            [Array]::Sort($orderedStarts, $orderedEnds)
-            $maskedBuilder = New-Object System.Text.StringBuilder
-            $copiedUpTo = 0
-            $spanIndex = 0
-            while ($spanIndex -lt $orderedStarts.Length) {
-                $mergedStart = $orderedStarts[$spanIndex]
-                $mergedEnd = $orderedEnds[$spanIndex]
-                $spanIndex++
-                while ($spanIndex -lt $orderedStarts.Length -and $orderedStarts[$spanIndex] -le $mergedEnd) {
-                    if ($orderedEnds[$spanIndex] -gt $mergedEnd) { $mergedEnd = $orderedEnds[$spanIndex] }
-                    $spanIndex++
-                }
-                [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $mergedStart - $copiedUpTo)
-                [void]$maskedBuilder.Append('***')
-                $copiedUpTo = $mergedEnd
+    }
+    # Шаблони: група `v` — значення, яке маскується; контекст перед нею
+    # (ключ, схема URL) лишається видимим.
+    # Облікові дані всередині URL: sftp://user:password@host -> sftp://user:***@host
+    # Значення шаблонів нижче: у подвійних лапках, в ОДИНАРНИХ лапках (інакше
+    # `token='AAA LEAK'` маскувалось би лише до першого пробілу й лишало
+    # `token=*** LEAK'`) або без лапок до пробілу. Екранована лапка всередині
+    # значення — не кінець значення, в усіх поширених формах: подвоєна
+    # ('' / "", PowerShell, CSV), зі зворотним слешем (\" / \', C-подібні
+    # мови, JSON) і з бектіком (`" — рідне екранування PowerShell). Інакше
+    # `token='AAA'' LEAK'` чи `token="AAA\" LEAK"` давали б
+    # `token=***' LEAK'` / `token=*** LEAK"`. Символ екранування (\ або `)
+    # поглинає наступний символ (будь-який, крім розриву рядка), тож
+    # неоднозначний випадок (`'C:\dir\' tail`) маскує БІЛЬШЕ — до кінця
+    # рядка, — а не менше. Альтернативи `[^"\\`]`, `[\\`].` і `""`
+    # починаються з різних символів і не перетинаються, а завершення
+    # (лапка, розрив рядка чи кінець тексту) досяжне завжди, тож шаблон
+    # лінійний і без відкату.
+    # Значення в лапках не перетинає розрив рядка: New-BRAVOMaskedLogCopy
+    # маскує журнал ЦІЛИМ текстом, і лапка без пари в одному записі інакше
+    # «з'їла» б усі записи до наступної лапки. Незакрита в межах рядка лапка
+    # (обрізаний чи сформований текст) маскує решту рядка: інакше
+    # `token='AAA LEAK` втратив би лише `'AAA`.
+    # Значення без лапок закінчується на пробільному символі, але те саме
+    # правило екранування діє і тут: \ чи ` поглинає наступний символ,
+    # включно з пробілом. Інакше password=my, бектік, пробіл, secret
+    # (екранований пробіл PowerShell) з відомим секретом `my secret`
+    # маскувався б лише до пробілу й лишав `password=*** secret`.
+    # (Тут сам regex — у одинарно-лапкованому PowerShell-літералі, тому
+    # кожна його одинарна лапка записана подвоєною.)
+    $quotedSecretValue = '(?:"(?:[^"\\`\r\n]|[\\`][^\r\n]?|"")*(?:"|(?=[\r\n])|\z)|''(?:[^''\\`\r\n]|[\\`][^\r\n]?|'''')*(?:''|(?=[\r\n])|\z)|(?:[^\s\\`]|[\\`][^\r\n]?)+)'
+    $secretPatterns = @(
+        '(?i)[a-z][a-z0-9+.-]*://[^:/\s@]+:(?<v>[^@\s]+)@',
+        # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
+        ('(?i)-password=(?<v>' + $quotedSecretValue + ')'),
+        # (?!ath|assword) — коротка форма -p, але не -path і не -password=
+        # (той має власний шаблон вище).
+        ('(?i)\s-p(?!ath|assword)(?<v>' + $quotedSecretValue + ')'),
+        ('(?i)(?:password|passwd|secret|token)\s*[:=]\s*(?<v>' + $quotedSecretValue + ')'),
+        # Webhook URL — сам bearer-секрет, без user:pass@; підтримувані провайдери
+        # (Send-BRAVOWebhookNotification -Provider slack|discord) мають токен
+        # прямо у шляху, а не в окремому параметрі.
+        '(?i)hooks\.slack\.com/services/(?<v>\S+)',
+        '(?i)discord(?:app)?\.com/api/webhooks/(?<v>\S+)'
+    )
+    foreach ($secretPattern in $secretPatterns) {
+        foreach ($patternMatch in [regex]::Matches($sanitized, $secretPattern)) {
+            $valueGroup = $patternMatch.Groups['v']
+            if ($valueGroup.Success -and $valueGroup.Length -gt 0) {
+                $spanStarts.Add($valueGroup.Index)
+                $spanEnds.Add($valueGroup.Index + $valueGroup.Length)
             }
-            [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $sanitized.Length - $copiedUpTo)
-            $sanitized = $maskedBuilder.ToString()
         }
     }
-    # Облікові дані всередині URL: sftp://user:password@host -> sftp://user:***@host
-    $sanitized = $sanitized -replace '(?i)([a-z][a-z0-9+.-]*://[^:/\s@]+):[^@\s]+@', '$1:***@'
-    # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
-    $sanitized = $sanitized -replace '(?i)(-password=)(?:"[^"]*"|\S+)', '$1***'
-    # (?!ath|assword) — інакше це правило повторно "з'їдає" вже замасковане
-    # -password=*** з рядка вище, розпізнавши його як коротку форму -p.
-    $sanitized = $sanitized -replace '(?i)(\s-p)(?!ath|assword)(?:"[^"]*"|\S+)', '$1***'
-    $sanitized = $sanitized -replace '(?i)((?:password|passwd|secret|token)\s*[:=]\s*)(?:"[^"]*"|\S+)', '$1***'
-    # Webhook URL — сам bearer-секрет, без user:pass@; підтримувані провайдери
-    # (Send-BRAVOWebhookNotification -Provider slack|discord) мають токен
-    # прямо у шляху, а не в окремому параметрі.
-    $sanitized = $sanitized -replace '(?i)(hooks\.slack\.com/services/)\S+', '$1***'
-    $sanitized = $sanitized -replace '(?i)(discord(?:app)?\.com/api/webhooks/)\S+', '$1***'
+    if ($spanStarts.Count -gt 0) {
+        [int[]]$orderedStarts = $spanStarts.ToArray()
+        [int[]]$orderedEnds = $spanEnds.ToArray()
+        [Array]::Sort($orderedStarts, $orderedEnds)
+        $maskedBuilder = New-Object System.Text.StringBuilder
+        $copiedUpTo = 0
+        $spanIndex = 0
+        while ($spanIndex -lt $orderedStarts.Length) {
+            $mergedStart = $orderedStarts[$spanIndex]
+            $mergedEnd = $orderedEnds[$spanIndex]
+            $spanIndex++
+            while ($spanIndex -lt $orderedStarts.Length -and $orderedStarts[$spanIndex] -le $mergedEnd) {
+                if ($orderedEnds[$spanIndex] -gt $mergedEnd) { $mergedEnd = $orderedEnds[$spanIndex] }
+                $spanIndex++
+            }
+            [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $mergedStart - $copiedUpTo)
+            [void]$maskedBuilder.Append('***')
+            $copiedUpTo = $mergedEnd
+        }
+        [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $sanitized.Length - $copiedUpTo)
+        $sanitized = $maskedBuilder.ToString()
+    }
     return $sanitized
 }
 

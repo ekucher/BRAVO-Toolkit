@@ -441,6 +441,7 @@ function Get-RequiredCredentialDescriptors {
         -ArchiveUploadEnabled (Test-SettingEnabled $storageEffective.SFTP.ArchiveUpload) `
         -MaintenanceLogUploadEnabled (Test-SettingEnabled $componentSettings.SFTP.MaintenanceLogUploadEnabled) `
         -ArchiveLogUploadEnabled (Test-SettingEnabled $componentSettings.SFTP.ArchiveLogUploadEnabled) `
+        -RuntimeLogSyncEnabled (Test-SettingEnabled $componentSettings.SFTP.RuntimeLogSyncEnabled) `
         -ScheduledSftpSyncRequired ([bool]$bazaSyncEffective.ScheduledSftpSyncRequired) `
         -BackupMonitoringSftpEnabled (Test-SettingEnabled $backupMonitoring.SFTP.Enabled)
     if ($sftpEnabled) {
@@ -1501,6 +1502,7 @@ try {
         -ArchiveUploadEnabled (Test-SettingEnabled $storageEffective.SFTP.ArchiveUpload) `
         -MaintenanceLogUploadEnabled (Test-SettingEnabled $componentSettings.SFTP.MaintenanceLogUploadEnabled) `
         -ArchiveLogUploadEnabled (Test-SettingEnabled $componentSettings.SFTP.ArchiveLogUploadEnabled) `
+        -RuntimeLogSyncEnabled (Test-SettingEnabled $componentSettings.SFTP.RuntimeLogSyncEnabled) `
         -ScheduledSftpSyncRequired ([bool]$bazaSyncEffective.ScheduledSftpSyncRequired) `
         -BackupMonitoringSftpEnabled (Test-SettingEnabled $backupMonitoring.SFTP.Enabled)
     if ($sftpConfigured) {

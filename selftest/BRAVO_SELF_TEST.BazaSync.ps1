@@ -386,6 +386,22 @@
             $fastHealthAutoArchive.Message -match 'eqv_11-116\.pdf' -and $fastHealthAutoArchive.Message -notmatch 'ПОТРІБНА ДІЯ'
         ) -Name 'BazaSync/MutationAutoArchivedIsHealthInfoNotCritical' -Failure "MUTATION_AUTO_ARCHIVED має бути INFO/healthy (не блокує): Level=$($fastHealthAutoArchive.Level),Healthy=$($fastHealthAutoArchive.Healthy)"
 
+        # #398 (п.4): MUTATION_AUTO_ARCHIVED — те саме канонічне "успішний"
+        # визначення для remote checkpoint, що й для COMPLETE/Health/Archive
+        # (Test-BRAVOBazaSyncStatusSuccess). Раніше checkpoint публікувався
+        # ЛИШЕ для COMPLETE: цикл, завершений авто-архівуванням, лишав
+        # зовнішнього спостерігача (через checkpoint) із ЗАСТАРІЛОЮ міткою
+        # попереднього COMPLETE-циклу — суто спостережуваність (Health
+        # checkpoint назад не читає, тож на здоров'я це не впливало).
+        $aaOkCheckpointSession = New-BRAVOSelfTestFakeBazaSession
+        $aaOkCheckpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $aaOkCheckpointSession -RemoteRootPath '/baza_app' -SyncResult $aaOkResult2
+        Test-BRAVOCondition -Condition (
+            $aaOkCheckpointOutcome.Attempted -eq $true -and $aaOkCheckpointOutcome.Published -eq $true -and
+            $null -eq $aaOkCheckpointOutcome.Error -and
+            $aaOkCheckpointSession.State.PutFilesCallCount -eq 1 -and
+            $aaOkCheckpointSession.State.MoveFileCalls.Count -eq 1
+        ) -Name 'BazaSync/MutationAutoArchivedPublishesRemoteCheckpoint' -Failure "MUTATION_AUTO_ARCHIVED має публікувати remote checkpoint так само, як COMPLETE (не лишати зовнішнього спостерігача із застарілою міткою); Attempted=$($aaOkCheckpointOutcome.Attempted) Published=$($aaOkCheckpointOutcome.Published) Error=$($aaOkCheckpointOutcome.Error) PutFiles=$($aaOkCheckpointSession.State.PutFilesCallCount)"
+
         # #293: MUTATION_AUTO_ARCHIVED не має ховати remote-конфлікт/audit-drift/
         # несумісні імена ТОГО САМОГО циклу. (a) Fast Health напряму: статус
         # AUTO_ARCHIVED + непорожній RemoteConflicts -> CRITICAL/не healthy, як для
@@ -693,6 +709,48 @@
         Test-BRAVOCondition -Condition ($lock3.Success -eq $true) `
             -Name 'BazaSync/SyncLockIsIndependentPerComponent' -Failure 'BAZA_APP і BAZA_WWW мають незалежні locks'
         $lock1.Stream.Dispose(); $lock3.Stream.Dispose()
+
+        # #398 (п.5b): BAZA_WWW — другий екземпляр того самого generic
+        # рушія (той самий код, інший Component/RemoteRootPath/StateRoot).
+        # До цього BAZA_WWW фігурував лише в незалежності locks вище і в
+        # статичній перевірці архівного скрипта — жодного прямого
+        # наскрізного тесту через Invoke-BRAVOBazaSynchronization. Перший
+        # цикл (bootstrap) + component-специфічне ім'я файлу стану, що НЕ
+        # перетинається з BAZA_APP.
+        $wwwRoot = Join-Path $bazaSyncTestRoot "BAZA_WWW_Parity"
+        $wwwLocal = Join-Path $wwwRoot "local"
+        $wwwState = Join-Path $wwwRoot "state"
+        New-Item -ItemType Directory -Path $wwwLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $wwwLocal -RelativePath "w1.txt" -SizeBytes 100 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $wwwLocal -RelativePath "sub\w2.txt" -SizeBytes 200 | Out-Null
+        $wwwSession1 = New-BRAVOSelfTestFakeBazaSession
+        $wwwResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_WWW' -LocalDirectory $wwwLocal -RemoteRootPath '/baza_www' -Session $wwwSession1 -StateRoot $wwwState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        $wwwStatePath = Get-BRAVOBazaStatePath -StateRoot $wwwState -Component 'BAZA_WWW'
+        $wwwAppStatePath = Get-BRAVOBazaStatePath -StateRoot $wwwState -Component 'BAZA_APP'
+        Test-BRAVOCondition -Condition (
+            $wwwResult1.Status -eq 'COMPLETE' -and $wwwResult1.Uploaded -eq 2 -and $wwwResult1.Failed -eq 0 -and
+            $wwwSession1.State.PutFilesCallCount -eq 2 -and $wwwResult1.DiscoveredWithinCutoff -eq 2 -and
+            (Split-Path $wwwStatePath -Leaf) -eq 'BAZA_WWW.state.json' -and
+            (Test-Path -LiteralPath $wwwStatePath) -and -not (Test-Path -LiteralPath $wwwAppStatePath)
+        ) -Name 'BazaSync/BAZA_WWW_FirstSyncUploadsAllDiscoveredFiles' -Failure "BAZA_WWW (другий екземпляр, аналог BAZA_APP) має синхронізуватись так само і зберігати власний BAZA_WWW.state.json, не зачіпаючи BAZA_APP.state.json; Status=$($wwwResult1.Status),Uploaded=$($wwwResult1.Uploaded),PutFiles=$($wwwSession1.State.PutFilesCallCount)"
+
+        # #398 (п.5b): той самий аналог для другої половини контракту —
+        # авто-архівування + remote-конфлікт того самого циклу має дати
+        # Status=REMOTE_CONFLICT (не MUTATION_AUTO_ARCHIVED) і CRITICAL
+        # Fast Health так само, як для BAZA_APP вище (BazaSync/
+        # AutoArchiveWithSameCycleRemoteConflictIsNotAutoArchivedStatus) —
+        # підтверджує, що драбина статусів і Fast Health не залежать від
+        # конкретного Component.
+        $wwwLadderNow = (Get-Date).ToUniversalTime()
+        $wwwLadderSynthetic = New-BRAVOBazaSyncResult -Component 'BAZA_WWW' -CycleId (New-BRAVOBazaCycleId) -StartedUtc $wwwLadderNow -CutoffUtc $wwwLadderNow
+        $wwwLadderSynthetic.Status = 'MUTATION_AUTO_ARCHIVED'
+        $wwwLadderSynthetic.MutationViolations = @([pscustomobject]@{ RelativePath = 'w_mut.pdf' })
+        $wwwLadderSynthetic.RemoteConflicts = @([pscustomobject]@{ RelativePath = 'w_conflict.txt'; LocalSize = [int64]100; RemoteSize = [int64]55 })
+        $wwwLadderHealth = Get-BRAVOBazaFastHealthResult -SyncResult $wwwLadderSynthetic
+        Test-BRAVOCondition -Condition (
+            $wwwLadderHealth.Healthy -eq $false -and $wwwLadderHealth.Level -eq 'CRITICAL' -and
+            $wwwLadderHealth.Message -match 'w_conflict\.txt'
+        ) -Name 'BazaSync/BAZA_WWW_AutoArchivedDoesNotMaskRemoteConflictInFastHealth' -Failure "BAZA_WWW: MUTATION_AUTO_ARCHIVED + RemoteConflicts має бути CRITICAL/не healthy (як для BAZA_APP), а не INFO: Level=$($wwwLadderHealth.Level),Healthy=$($wwwLadderHealth.Healthy)"
 
         $skippedResult = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId 'x' -StartedUtc (Get-Date) -CutoffUtc (Get-Date)
         $skippedResult.Status = 'SKIPPED_CONCURRENT'
@@ -1268,15 +1326,16 @@
         ) -Name 'BazaSync/IncompatibleCandidateDoesNotAdvanceLastSuccessfulSyncUtc' -Failure "LastSuccessfulSyncUtc/LastCycleId НЕ мають просуватись циклом з несумісними іменами; було=$hr2ProvenanceUtc стало=$($hr2StateAfterCycle2.State.LastSuccessfulSyncUtc)"
 
         # checkpoint для такого циклу: Write-BRAVOBazaRemoteCheckpoint сам
-        # відмовляється (Status != COMPLETE -> Attempted=false, нуль
-        # звернень до сесії), а session-обгортка додатково гейтить виклик.
+        # відмовляється (Status не у Test-BRAVOBazaSyncStatusSuccess ->
+        # Attempted=false, нуль звернень до сесії), а session-обгортка
+        # додатково гейтить виклик тим самим канонічним предикатом (#398).
         $hr2CheckpointSession = New-BRAVOSelfTestFakeBazaSession
         $hr2CheckpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $hr2CheckpointSession -RemoteRootPath '/baza_app' -SyncResult $hr2Cycle2Result
         Test-BRAVOCondition -Condition (
             $hr2CheckpointOutcome.Attempted -eq $false -and $hr2CheckpointOutcome.Published -eq $false -and
             $hr2CheckpointSession.State.PutFilesCallCount -eq 0 -and
             $hr2CheckpointSession.State.MoveFileCalls.Count -eq 0 -and
-            $bazaSyncModuleText.Contains('if ($WriteCheckpoint -and $syncResult.Status -eq ''COMPLETE'')')
+            $bazaSyncModuleText.Contains('if ($WriteCheckpoint -and (Test-BRAVOBazaSyncStatusSuccess -Status $syncResult.Status)) {')
         ) -Name 'BazaSync/IncompatibleCandidateDoesNotPublishSuccessfulCheckpoint' -Failure "INCOMPATIBLE_NAME цикл не має публікувати successful checkpoint (обидва gate: сам Write-* і session-обгортка); Attempted=$($hr2CheckpointOutcome.Attempted) PutFiles=$($hr2CheckpointSession.State.PutFilesCallCount)"
 
         # змішаний цикл: сумісний новий файл передається, стан для нього

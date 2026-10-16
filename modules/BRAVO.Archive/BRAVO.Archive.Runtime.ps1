@@ -772,7 +772,7 @@ function Send-ToolIntegrityAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -885,7 +885,7 @@ function Send-BRAVOArchiveFreeSpaceAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -2158,12 +2158,40 @@ function Sync-Folders {
 
 
 function Write-SevenZipFailureDiagnostics {
-    param([string]$Operation, [string]$StandardOutput, [string]$StandardError)
-    foreach ($line in @($StandardOutput, $StandardError)) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) {
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "${Operation}: $($line.Trim().Substring(0, [math]::Min(4000, $line.Trim().Length)))" -Level 'DEBUG'
-        }
+    # Тонкий адаптер над канонічним Write-BRAVOSevenZipFailureDiagnostics
+    # (BRAVO.ArchiveHelpers — імпортується вище): він володіє і нормалізацією
+    # рядків, і межами, і правилом рівня. Тут лишається лише мостик до
+    # Write-BRAVOLog — рівно той самий logger-скриптблок, що його передає
+    # виклик Test-SevenZipArchiveIntegrity у New-Archive.
+    #
+    # До цього тут було ДВІ незалежні копії правила рівня, і саме так шляхи
+    # create та test розійшлися. Попередня реалізація, окрім DEBUG, мала ще
+    # два дефекти: foreach ішов по ДВОХ ПОТОКАХ, а не по рядках (тому межі
+    # на 20 рядків не було взагалі, а 4000 символів застосовувались до
+    # кожного потоку окремо), і гілки для порожнього виводу не існувало.
+    param(
+        [string]$Operation,
+        [string]$StandardOutput,
+        [string]$StandardError,
+        [ValidateSet('ERROR', 'WARNING')][string]$Level = 'ERROR',
+        [AllowNull()][AllowEmptyString()][string]$EmptyOutputReason
+    )
+    # Пароль архіву — відомий секрет для маскування виводу 7-Zip ще до
+    # першого запису. Читається через Get-Variable: під StrictMode змінна
+    # може бути ще не ініціалізована (ранній збій до читання облікових даних).
+    $archivePasswordVariable = Get-Variable -Name archivePassword -Scope Script -ErrorAction SilentlyContinue
+    $knownSecret = @()
+    if ($null -ne $archivePasswordVariable -and -not [string]::IsNullOrEmpty([string]$archivePasswordVariable.Value)) {
+        $knownSecret = @([string]$archivePasswordVariable.Value)
     }
+    [void](Write-BRAVOSevenZipFailureDiagnostics `
+        -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level } `
+        -Operation $Operation `
+        -StandardOutput $StandardOutput `
+        -StandardError $StandardError `
+        -Level $Level `
+        -EmptyOutputReason $EmptyOutputReason `
+        -KnownSecret $knownSecret)
 }
 
 function Get-BRAVOVSSSnapshotSourcePath {
@@ -2372,12 +2400,61 @@ function New-BRAVOVSSVolumeShadow {
     }
 }
 
+
+# #408: прибирає ланцюжок каталогів, які САМ probe створив (від найглибшого
+# до найвищого), зупиняючись на першому непорожньому чи наявному до probe.
+# Виокремлено з Test-BRAVOFileSystemWriteProbe, щоб алгоритм можна було
+# перевірити напряму на реальних порожніх каталогах, без симуляції збою
+# файлової системи. Той самий алгоритм, що вже проведений у production
+# через BRAVO_DRY_RUN.ps1 (Test-BRAVOFileSystemWriteAccess).
+function Remove-BRAVOWriteProbeCreatedChain {
+    param([AllowNull()][System.Collections.Generic.List[string]]$Chain)
+
+    if ($null -eq $Chain) { return }
+    foreach ($createdItem in $Chain) {
+        if (-not (Test-Path -LiteralPath $createdItem -PathType Container)) {
+            continue
+        }
+        $remainingItems = @(Get-ChildItem -LiteralPath $createdItem -Force -ErrorAction SilentlyContinue)
+        if ($remainingItems.Count -ne 0) {
+            break
+        }
+        try {
+            Remove-Item -LiteralPath $createdItem -Force -ErrorAction Stop
+        } catch {
+            # Не критично для результату probe: сам доступ уже перевірено
+            # (успішно або ні); неможливість прибрати порожній каталог після
+            # себе — залишковий побічний ефект, не провал перевірки прав.
+            break
+        }
+    }
+}
+
 function Test-BRAVOFileSystemWriteProbe {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $probePath = $null
+    # #408: ланцюжок каталогів, яких не існувало ДО цього виклику і які
+    # створив САМЕ ВІН (New-Item -Force створює й відсутніх предків —
+    # probe на <Dest>\.work при відсутньому <Dest> створює обидва). Якщо
+    # сам probe провалиться ПІСЛЯ їхнього створення (запис/читання-назад),
+    # їх треба прибрати — інакше зупинка прогону на preflight лишає на
+    # диску порожні каталоги без жодного архіву. На успіху ланцюжок
+    # лишається: для звичайного прогону ці каталоги одразу потрібні.
+    $createdChain = New-Object System.Collections.Generic.List[string]
     try {
         if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            $chainCursor = $Path
+            try {
+                while (-not [string]::IsNullOrEmpty($chainCursor) -and -not (Test-Path -LiteralPath $chainCursor)) {
+                    $createdChain.Add($chainCursor)
+                    $chainCursor = [IO.Path]::GetDirectoryName($chainCursor)
+                }
+            } catch {
+                # Недоступний предок (напр. UNC без мережі): ланцюжок лишається
+                # тим, що вже зібрано — прибирання на провалі не вийде за його
+                # межі, але принаймні прибере те, що точно зібрано.
+            }
             [void](New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop)
         }
         $probePath = Join-Path $Path ('.bravo_write_probe_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
@@ -2401,6 +2478,25 @@ function Test-BRAVOFileSystemWriteProbe {
         }
         return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null }
     } catch {
+        # Review (P1): catch виконується ПОВНІСТЮ до finally (порядок
+        # PowerShell), тож видалення probe-файлу МАЄ статись тут, ДО
+        # прибирання ланцюжка каталогів — інакше Remove-BRAVOWriteProbeCreatedChain
+        # бачила б probe-файл ще присутнім у $Path (напр. на провалі
+        # read-back ПІСЛЯ успішного запису) і зупинялась би одразу, вважаючи
+        # $Path непорожнім, лишаючи ввесь ланцюжок на диску — саме дефект,
+        # який ця проба мала усунути.
+        if (-not [string]::IsNullOrWhiteSpace($probePath) -and
+            [IO.File]::Exists($probePath)) {
+            try {
+                [IO.File]::Delete($probePath)
+            } catch {
+                # Best-effort; якщо видалення теж не вдалось, прибирання
+                # ланцюжка нижче все одно зупиниться на непорожньому $Path —
+                # той самий безпечний fallback, що для будь-якого стороннього
+                # вмісту.
+            }
+        }
+        Remove-BRAVOWriteProbeCreatedChain -Chain $createdChain
         return [pscustomobject]@{ Success = $false; Path = $Path; Error = $_.Exception.Message }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($probePath) -and
@@ -3518,12 +3614,17 @@ function New-Archive {
         if ($showSevenZipProgress) {
             Show-RunningProgress -Id $sevenZipProgressId -Activity $progressActivity -Completed
         }
-        $lastSevenZipOutput = @($standardOutput -split "\r?\n" | Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_)
-        } | Select-Object -Last 1)
-
         if ($archiveTimedOut) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiвацiю перервано: перевищено таймаут $archiveTimeoutSeconds сек.: $displayName" -Level "ERROR"
+            # 878dd86 логував діагностику 7-Zip і на шляху таймауту; разом
+            # з рештою її прибрав ce4855d. Вивід убитого процесу — єдиний
+            # доказ того, на чому саме він завис; якщо потоки порожні, це
+            # теж тепер видно явно.
+            Write-SevenZipFailureDiagnostics `
+                -Operation "Дiагностика 7-Zip create" `
+                -StandardOutput $standardOutput `
+                -StandardError $errorOutput `
+                -EmptyOutputReason "перевищено таймаут $archiveTimeoutSeconds сек. (процес завершено примусово)"
             if (Test-Path -LiteralPath $fullArchivePath -PathType Leaf) {
                 Remove-Item -LiteralPath $fullArchivePath -Force -ErrorAction SilentlyContinue
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Неповний архiв видалено: $fullArchivePath" -Level "WARNING"
@@ -3575,17 +3676,24 @@ function New-Archive {
         } else {
             $toolExitInfo = Get-BRAVOToolExitCodeDescription -Tool '7-Zip' -ExitCode $process.ExitCode
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї 7-Zip (код: $($process.ExitCode) — $($toolExitInfo.OperatorDescription)): $fullArchivePath" -Level "ERROR"
-            Write-SevenZipFailureDiagnostics -Operation "Дiагностика 7-Zip create" -StandardOutput $standardOutput -StandardError $errorOutput
-            if ($showSevenZipProgress) {
-                if (-not [string]::IsNullOrWhiteSpace($lastSevenZipOutput)) {
-                    Write-BRAVOLog -Component 'ARCHIVE' -Message "Останнiй вивiд 7-Zip: $lastSevenZipOutput" -Level "DEBUG"
-                }
-                if (-not [string]::IsNullOrWhiteSpace($errorOutput)) {
-                    Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка 7-Zip: $errorOutput" -Level "DEBUG"
-                }
-            } else {
-                Write-BRAVOLog -Component 'ARCHIVE' -Message "Деталi: $errorOutput" -Level "DEBUG"
-            }
+            # Звичайний (не timeout) збій створення — найчастіша форма
+            # production-збою, тож діагностика мусить бути й тут, а не лише в
+            # timeout-гілці вище (та гілка повертає раніше і сюди не доходить).
+            Write-SevenZipFailureDiagnostics `
+                -Operation "Дiагностика 7-Zip create" `
+                -StandardOutput $standardOutput `
+                -StandardError $errorOutput `
+                -EmptyOutputReason ("7-Zip завершився з кодом {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription)
+            # Це ЄДИНИЙ запис діагностики на цьому шляху. Три попередні рядки
+            # ("Останнiй вивiд 7-Zip", "Помилка 7-Zip", "Деталi") прибрано:
+            # вони дублювали той самий $standardOutput / $errorOutput на рівні
+            # DEBUG, тобто при канонічному FileLevel=INFO не доходили ні до
+            # файлу, ні до консолі, і водночас суперечили інваріанту
+            # Write-BRAVOSevenZipFailureDiagnostics («НІКОЛИ не пише на
+            # DEBUG»). Разом із ними прибрано й обчислення
+            # $lastSevenZipOutput — це був останній непорожній рядок
+            # $standardOutput, тобто підмножина того, що виклик вище вже
+            # отримує цілим потоком; інших читачів у змінної не було.
             $script:lastArchiveToolFailure = [pscustomobject]@{
                 Tool = '7-Zip'
                 ToolExitCodeText = "{0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
@@ -5067,7 +5175,7 @@ function Send-BAZAIncompatibleNameAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -9577,7 +9685,7 @@ function Send-BRAVOArchiveFinalOperationsEvent {
         $finalOperationsSettings = $operationsReportingSettings
         if ($null -eq $finalOperationsSettings) { return }
         if (-not (Test-Path -LiteralPath 'Variable:credentialSettings')) { return }
-        if (-not (Get-Command -Name 'Send-BRAVOOperationsEvent' -ErrorAction SilentlyContinue)) { return }
+        if (-not (Get-Command -Name 'Send-BRAVOOperationsEventSafely' -ErrorAction SilentlyContinue)) { return }
         if (-not (Get-Command -Name 'Get-BRAVOExitCodeSeverity' -ErrorAction SilentlyContinue)) { return }
 
         $finalExitCode = [int]$script:processExitCode
@@ -9602,7 +9710,7 @@ function Send-BRAVOArchiveFinalOperationsEvent {
         $finalDetails['exitCode'] = $finalExitCode
         $finalDetails['exitCodeName'] = [string]$finalExitCodeName
 
-        Send-BRAVOOperationsEvent `
+        Send-BRAVOOperationsEventSafely `
             -OperationsReportingSettings $finalOperationsSettings `
             -CredentialTargets $credentialSettings.Targets `
             -InstitutionCode $finalInstitutionCode `

@@ -1196,18 +1196,100 @@ if ($credMarkerFatalFunctions.Count -eq 1) {
         $credMarkerIfGuarded = $false
         if ($credMarkerIf -is [System.Management.Automation.Language.IfStatementAst]) {
             foreach ($credMarkerClause in $credMarkerIf.Clauses) {
-                $credMarkerConditionText = [string]$credMarkerClause.Item1.Extent.Text
-                if ($credMarkerClause.Item2.Extent.StartOffset -le $credMarkerFatalCall.Extent.StartOffset -and
-                    $credMarkerClause.Item2.Extent.EndOffset -ge $credMarkerFatalCall.Extent.EndOffset -and
-                    $credMarkerConditionText -match 'OperationsStarted' -and
-                    $credMarkerConditionText -match '-is\s+\[bool\]' -and
-                    $credMarkerConditionText -match '-not\s+\$\w+\.Value') {
+                if ($credMarkerClause.Item2.Extent.StartOffset -gt $credMarkerFatalCall.Extent.StartOffset -or
+                    $credMarkerClause.Item2.Extent.EndOffset -lt $credMarkerFatalCall.Extent.EndOffset) {
+                    continue
+                }
+                $credMarkerCondition = $credMarkerClause.Item1
+
+                # #396: структурна (АСТ) перевірка замість текстового регексу.
+                # Регекс за текстом умови пройшла б і мутацію на кшталт
+                # "(... -and -not $p.Value) -or $true" (текст усе одно
+                # містить потрібні підрядки). Тут натомість вимагаємо
+                # ЧИСТИЙ ланцюжок -and: будь-який -or/-xor у ВСЬОМУ дереві
+                # умови (навіть захований у дужках) одразу провалює guard.
+                $credMarkerLooseOps = @($credMarkerCondition.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                    ($node.Operator -eq [System.Management.Automation.Language.TokenKind]::Or -or
+                     $node.Operator -eq [System.Management.Automation.Language.TokenKind]::Xor)
+                }, $true))
+                if ($credMarkerLooseOps.Count -gt 0) {
+                    continue
+                }
+                $credMarkerAndOps = @($credMarkerCondition.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                    $node.Operator -eq [System.Management.Automation.Language.TokenKind]::And
+                }, $true))
+                if ($credMarkerAndOps.Count -lt 2) {
+                    continue
+                }
+
+                # "$null -ne <var>" — властивість OperationsStarted існує.
+                $credMarkerNullCheckVar = $null
+                foreach ($credMarkerNeBin in @($credMarkerCondition.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                    $node.Operator -eq [System.Management.Automation.Language.TokenKind]::Ine
+                }, $true))) {
+                    $credMarkerOther = $null
+                    if ($credMarkerNeBin.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                        $credMarkerNeBin.Left.VariablePath.UserPath -eq 'null') {
+                        $credMarkerOther = $credMarkerNeBin.Right
+                    } elseif ($credMarkerNeBin.Right -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                        $credMarkerNeBin.Right.VariablePath.UserPath -eq 'null') {
+                        $credMarkerOther = $credMarkerNeBin.Left
+                    }
+                    if ($credMarkerOther -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                        $credMarkerNullCheckVar = $credMarkerOther.VariablePath.UserPath
+                    }
+                }
+
+                # "<var>.Value -is [bool]" — значення властивості булеве.
+                $credMarkerIsBoolVar = $null
+                foreach ($credMarkerIsBin in @($credMarkerCondition.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                    $node.Operator -eq [System.Management.Automation.Language.TokenKind]::Is
+                }, $true))) {
+                    if ($credMarkerIsBin.Left -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                        $credMarkerIsBin.Left.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                        $credMarkerIsBin.Left.Member.Value -eq 'Value' -and
+                        $credMarkerIsBin.Left.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                        $credMarkerIsBin.Right -is [System.Management.Automation.Language.TypeExpressionAst] -and
+                        $credMarkerIsBin.Right.TypeName.Name -eq 'bool') {
+                        $credMarkerIsBoolVar = $credMarkerIsBin.Left.Expression.VariablePath.UserPath
+                    }
+                }
+
+                # "-not <var>.Value" — лише $false маркує «не розпочато».
+                $credMarkerNotVar = $null
+                foreach ($credMarkerUnary in @($credMarkerCondition.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.UnaryExpressionAst] -and
+                    $node.TokenKind -eq [System.Management.Automation.Language.TokenKind]::Not
+                }, $true))) {
+                    $credMarkerNotChild = $credMarkerUnary.Child
+                    if ($credMarkerNotChild -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                        $credMarkerNotChild.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                        $credMarkerNotChild.Member.Value -eq 'Value' -and
+                        $credMarkerNotChild.Expression -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                        $credMarkerNotVar = $credMarkerNotChild.Expression.VariablePath.UserPath
+                    }
+                }
+
+                if ($null -ne $credMarkerNullCheckVar -and
+                    $null -ne $credMarkerIsBoolVar -and
+                    $null -ne $credMarkerNotVar -and
+                    $credMarkerNullCheckVar -eq $credMarkerIsBoolVar -and
+                    $credMarkerIsBoolVar -eq $credMarkerNotVar) {
                     $credMarkerIfGuarded = $true
                 }
             }
         }
         if (-not $credMarkerIfGuarded) {
-            [void]$credMarkerViolations.Add("line $($credMarkerFatalCall.Extent.StartLineNumber): маркер у New-SystemWorkerFatalError поза if (булеве OperationsStarted = `$false)")
+            [void]$credMarkerViolations.Add("line $($credMarkerFatalCall.Extent.StartLineNumber): маркер у New-SystemWorkerFatalError поза if (структурно чистий `$null -ne `$p -and `$p.Value -is [bool] -and -not `$p.Value, без -or/-xor)")
         }
     }
 }
