@@ -2372,12 +2372,61 @@ function New-BRAVOVSSVolumeShadow {
     }
 }
 
+
+# #408: прибирає ланцюжок каталогів, які САМ probe створив (від найглибшого
+# до найвищого), зупиняючись на першому непорожньому чи наявному до probe.
+# Виокремлено з Test-BRAVOFileSystemWriteProbe, щоб алгоритм можна було
+# перевірити напряму на реальних порожніх каталогах, без симуляції збою
+# файлової системи. Той самий алгоритм, що вже проведений у production
+# через BRAVO_DRY_RUN.ps1 (Test-BRAVOFileSystemWriteAccess).
+function Remove-BRAVOWriteProbeCreatedChain {
+    param([AllowNull()][System.Collections.Generic.List[string]]$Chain)
+
+    if ($null -eq $Chain) { return }
+    foreach ($createdItem in $Chain) {
+        if (-not (Test-Path -LiteralPath $createdItem -PathType Container)) {
+            continue
+        }
+        $remainingItems = @(Get-ChildItem -LiteralPath $createdItem -Force -ErrorAction SilentlyContinue)
+        if ($remainingItems.Count -ne 0) {
+            break
+        }
+        try {
+            Remove-Item -LiteralPath $createdItem -Force -ErrorAction Stop
+        } catch {
+            # Не критично для результату probe: сам доступ уже перевірено
+            # (успішно або ні); неможливість прибрати порожній каталог після
+            # себе — залишковий побічний ефект, не провал перевірки прав.
+            break
+        }
+    }
+}
+
 function Test-BRAVOFileSystemWriteProbe {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $probePath = $null
+    # #408: ланцюжок каталогів, яких не існувало ДО цього виклику і які
+    # створив САМЕ ВІН (New-Item -Force створює й відсутніх предків —
+    # probe на <Dest>\.work при відсутньому <Dest> створює обидва). Якщо
+    # сам probe провалиться ПІСЛЯ їхнього створення (запис/читання-назад),
+    # їх треба прибрати — інакше зупинка прогону на preflight лишає на
+    # диску порожні каталоги без жодного архіву. На успіху ланцюжок
+    # лишається: для звичайного прогону ці каталоги одразу потрібні.
+    $createdChain = New-Object System.Collections.Generic.List[string]
     try {
         if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            $chainCursor = $Path
+            try {
+                while (-not [string]::IsNullOrEmpty($chainCursor) -and -not (Test-Path -LiteralPath $chainCursor)) {
+                    $createdChain.Add($chainCursor)
+                    $chainCursor = [IO.Path]::GetDirectoryName($chainCursor)
+                }
+            } catch {
+                # Недоступний предок (напр. UNC без мережі): ланцюжок лишається
+                # тим, що вже зібрано — прибирання на провалі не вийде за його
+                # межі, але принаймні прибере те, що точно зібрано.
+            }
             [void](New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop)
         }
         $probePath = Join-Path $Path ('.bravo_write_probe_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
@@ -2401,6 +2450,7 @@ function Test-BRAVOFileSystemWriteProbe {
         }
         return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null }
     } catch {
+        Remove-BRAVOWriteProbeCreatedChain -Chain $createdChain
         return [pscustomobject]@{ Success = $false; Path = $Path; Error = $_.Exception.Message }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($probePath) -and
