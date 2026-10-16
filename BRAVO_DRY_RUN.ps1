@@ -544,10 +544,13 @@ function Test-DryRunWebhookCredential {
     # (P2-знахідка acceptance 5.2.0: тест завжди падав у ALERTS, бо
     # 'alerts' стояв першим). В errors_only GENERAL не перевіряється —
     # тестове повідомлення піде в ALERTS (єдиний активний канал режиму).
+    # #449: унарна кома — інакше однолементна гілка @('alerts') колапсує в
+    # скаляр String під StrictMode (вихід if-виразу розгортає масив так само,
+    # як вихід функції/пайплайна).
     $requiredRoutes = if ($NotificationMode -eq 'errors_only') {
-        @('alerts')
+        , @('alerts')
     } else {
-        @('general', 'alerts')
+        , @('general', 'alerts')
     }
     foreach ($route in $requiredRoutes) {
         $secret = $null
