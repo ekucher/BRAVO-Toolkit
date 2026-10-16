@@ -15565,6 +15565,11 @@ function Send-BRAVOMaintenanceOperationsEvent { param($ExitCode, $ElapsedTime) }
 function Write-BRAVOTaskExecutionState { param($TaskName) }
 function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
 function Invoke-BRAVOMaintenanceOwnLogUpload { Add-ProbeEvent 'OWNLOG-UPLOAD' }
+# #316: той самий принцип, що Invoke-BRAVOMaintenanceOwnLogUpload вище --
+# пробу цікавить порядок кроків (чи викликається ДО "Зупинка служб" і коли
+# $shouldRestore=$true), не реальна WTS-логіка закриття BIS; реальна функція
+# (Get-BRAVOClientGateInventory/Get-BRAVOWTSSessionInfo) тут НЕ викликається.
+function Invoke-BRAVOMaintenanceClientCloseStep { Add-ProbeEvent 'CLIENT-CLOSE-GATE'; return $true }
 function Wait-BRAVOManualExit { param([switch]$NoPause) Add-ProbeEvent ("MANUAL-EXIT NoPause={0}" -f [bool]$NoPause) }
 '@
             $maintenanceOrchestrationSeed = @'
@@ -15742,7 +15747,9 @@ try {
         }
     }
     # Цикл служб і облік відновлення служб (#314) винесено в dot-source
-    # файли: їхні функції теж справжні.
+    # файли: їхні функції теж справжні. Invoke-BRAVOMaintenanceClientCloseStep
+    # (#316, BRAVO.Maintenance.ClientGate.ps1) стубується вище -- реальні
+    # WTS-функції цього файлу пробі не потрібні.
     foreach ($probeServiceFileName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1')) {
         $probeServiceCycleText = [IO.File]::ReadAllText(
             (Join-Path $RepositoryRoot ('modules\BRAVO.Maintenance\' + $probeServiceFileName)), [Text.Encoding]::UTF8)
@@ -29690,6 +29697,12 @@ function Write-BRAVOLog {
         if (Enter-BRAVOSelfTestSection -Name 'Suite/BazaSync') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaSync.ps1')
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BazaSync' } }
+    }
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ClientGate') {
+        Enter-BRAVOSelfTestSuite -Name 'ClientGate'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ClientGate') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ClientGate.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ClientGate' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Operations') {

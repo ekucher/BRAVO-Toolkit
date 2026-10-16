@@ -176,6 +176,14 @@ function Get-BRAVODefaultConfiguration {
                 # для самоперевірки після bravocmd repair: менші файли
                 # критичні лише при зникненні або обнуленні.
                 IntegritySmallFileThresholdBytes = 1048576
+                # #316: закриття клієнтів BIS перед реставрацією (власник,
+                # 2026-09-30). WaitMinutes=0 — закривати без очікування.
+                ClientClose = @{
+                    WaitMinutes     = 5
+                    ReminderMinutes = 1
+                    PollSeconds     = 10
+                    ProcessNames    = @('Bis')
+                }
             }
             Retention = @{
                 ArchiveDays = 14
