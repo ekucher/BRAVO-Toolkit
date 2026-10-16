@@ -2450,6 +2450,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         @{ Kind = 'Cmdlet'; Target = 'Set-Content' },
         @{ Kind = 'Cmdlet'; Target = 'Start-Service' },
         @{ Kind = 'Cmdlet'; Target = 'Start-Transcript' },
+        @{ Kind = 'Cmdlet'; Target = 'Stop-Process' },
         @{ Kind = 'Cmdlet'; Target = 'Stop-Service' },
         @{ Kind = 'Cmdlet'; Target = 'Test-Path' },
         @{ Kind = 'Cmdlet'; Target = 'Write-Error' },

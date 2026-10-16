@@ -499,6 +499,67 @@ function Assert-BravoLoadedConfiguration {
                 }
             }
         }
+
+        # #316: закриття клієнтів BIS перед реставрацією. WaitMinutes=0 —
+        # закривати без очікування (валідний явний вибір оператора, не помилка).
+        if (-not ($global:maintenanceSettings.Restore -is [hashtable]) -or
+            -not $global:maintenanceSettings.Restore.Contains('ClientClose') -or
+            -not ($global:maintenanceSettings.Restore.ClientClose -is [hashtable])) {
+            if (-not ($global:maintenanceSettings.Restore -is [hashtable])) { $global:maintenanceSettings.Restore = @{} }
+            $global:maintenanceSettings.Restore.ClientClose = @{}
+        }
+        $clientCloseSettingsForValidation = $global:maintenanceSettings.Restore.ClientClose
+
+        if (-not $clientCloseSettingsForValidation.Contains('WaitMinutes')) {
+            $clientCloseSettingsForValidation.WaitMinutes = 5
+        } else {
+            $clientCloseWaitMinutesValue = 0
+            if (-not [int]::TryParse([string]$clientCloseSettingsForValidation.WaitMinutes, [ref]$clientCloseWaitMinutesValue) -or
+                $clientCloseWaitMinutesValue -lt 0) {
+                Write-Warning "maintenanceSettings.Restore.ClientClose.WaitMinutes = '$($clientCloseSettingsForValidation.WaitMinutes)' некоректне — застосовується безпечний дефолт 5 (хв.)."
+                $clientCloseSettingsForValidation.WaitMinutes = 5
+            } else {
+                $clientCloseSettingsForValidation.WaitMinutes = $clientCloseWaitMinutesValue
+            }
+        }
+
+        if (-not $clientCloseSettingsForValidation.Contains('ReminderMinutes')) {
+            $clientCloseSettingsForValidation.ReminderMinutes = 1
+        } else {
+            $clientCloseReminderMinutesValue = 0
+            if (-not [int]::TryParse([string]$clientCloseSettingsForValidation.ReminderMinutes, [ref]$clientCloseReminderMinutesValue) -or
+                $clientCloseReminderMinutesValue -le 0) {
+                Write-Warning "maintenanceSettings.Restore.ClientClose.ReminderMinutes = '$($clientCloseSettingsForValidation.ReminderMinutes)' некоректне — застосовується безпечний дефолт 1 (хв.)."
+                $clientCloseSettingsForValidation.ReminderMinutes = 1
+            } else {
+                $clientCloseSettingsForValidation.ReminderMinutes = $clientCloseReminderMinutesValue
+            }
+        }
+
+        if (-not $clientCloseSettingsForValidation.Contains('PollSeconds')) {
+            $clientCloseSettingsForValidation.PollSeconds = 10
+        } else {
+            $clientClosePollSecondsValue = 0
+            if (-not [int]::TryParse([string]$clientCloseSettingsForValidation.PollSeconds, [ref]$clientClosePollSecondsValue) -or
+                $clientClosePollSecondsValue -le 0) {
+                Write-Warning "maintenanceSettings.Restore.ClientClose.PollSeconds = '$($clientCloseSettingsForValidation.PollSeconds)' некоректне — застосовується безпечний дефолт 10 (сек.)."
+                $clientCloseSettingsForValidation.PollSeconds = 10
+            } else {
+                $clientCloseSettingsForValidation.PollSeconds = $clientClosePollSecondsValue
+            }
+        }
+
+        if (-not $clientCloseSettingsForValidation.Contains('ProcessNames')) {
+            $clientCloseSettingsForValidation.ProcessNames = @('Bis')
+        } else {
+            $clientCloseProcessNamesValue = @(@($clientCloseSettingsForValidation.ProcessNames) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+            if ($clientCloseProcessNamesValue.Count -eq 0) {
+                Write-Warning "maintenanceSettings.Restore.ClientClose.ProcessNames порожній або некоректний — застосовується безпечний дефолт @('Bis')."
+                $clientCloseSettingsForValidation.ProcessNames = @('Bis')
+            } else {
+                $clientCloseSettingsForValidation.ProcessNames = $clientCloseProcessNamesValue
+            }
+        }
     }
 
     if ($global:sftpDirectories -is [hashtable]) {

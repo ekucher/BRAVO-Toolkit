@@ -1031,7 +1031,7 @@ function Get-ConfiguredServiceState {
 # #314: цикл служб (+#316), облік відновлення й сповіщення, профіль -RecoverServices —
 # у сусідніх файлах модуля. Dot-source у scope цієї функції (foreach не створює
 # scope): як і решта функцій runtime, вони бачать змінні тіла динамічно.
-foreach ($maintenancePartName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1', 'BRAVO.Maintenance.RecoverServices.ps1')) {
+foreach ($maintenancePartName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1', 'BRAVO.Maintenance.RecoverServices.ps1', 'BRAVO.Maintenance.ClientGate.ps1')) {
     $maintenancePartPath = Join-Path $PSScriptRoot $maintenancePartName
     if (-not (Test-Path -LiteralPath $maintenancePartPath -PathType Leaf)) { throw "Не знайдено частину модуля Maintenance: $maintenancePartPath" }
     . $maintenancePartPath
@@ -9446,6 +9446,17 @@ foreach ($managedService in $maintenanceManagedServices) {
 }
 if ($lateStartedServiceNames.Count -gt 0) {
     Write-Log -Message "Службу(и) запущено після початкового знімка стану (SCM autostart/recovery або інший актор): $($lateStartedServiceNames -join ', ') — якщо вони лишаться активними до фази зупинки, Maintenance запише намір їх перезапуску в ownership-маркер, зупинить їх і запустить після обслуговування (#360)" -Level "INFO"
+}
+
+# #316 (рішення власника 2026-09-30): перед зупинкою служб (коли планується
+# реставрація) — попередити активні сесії з відкритою BIS, зачекати, примусово
+# закрити тих, хто не встиг. Невдача (BIS не вдалося закрити) скасовує
+# реставрацію ($shouldRestore=$false), але НЕ саму зупинку служб нижче — вона
+# керується фактичним станом служб ($stopServicesRequired), не $shouldRestore.
+if ($shouldRestore) {
+    if (-not (Invoke-BRAVOMaintenanceClientCloseStep)) {
+        $shouldRestore = $false
+    }
 }
 
 # Усі операції зі зупиненими службами захищені finally. Навіть необроблена

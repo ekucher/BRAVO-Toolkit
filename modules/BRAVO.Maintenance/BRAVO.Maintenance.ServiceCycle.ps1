@@ -22,16 +22,30 @@
 # ============================================================
 
 function Stop-BRAVOMaintenanceStrayProcess {
-    # ТОЧКА РОЗШИРЕННЯ #316 (коректне закриття BIS перед реставрацією).
-    # Завершення додаткових процесів, що можуть тримати файли моделі (Bis):
-    # безумовний Stop-Process -Force.
+    # #316 (реалізовано): фінальна перевірка перед самою зупинкою служби
+    # BRAVO — "BIS, відкриту знову, закрити одразу" (пункт 6 рішення
+    # власника). Основні ворота (попередження активних сесій, 5-хвилинне
+    # очікування, нагадування, примусове закриття з журналом) уже
+    # відбулися РАНІШЕ, перед усією фазою "Зупинка служб"
+    # (Invoke-BRAVOMaintenanceClientCloseStep, BRAVO.Maintenance.ClientGate.ps1)
+    # — тут лише негайне закриття БУДЬ-ЯКОГО BIS, що встиг з'явитись знову
+    # за час, доки зупинялись BRAVO Web і exchangAPI; без попередження і
+    # без очікування, бо користувача вже попереджали на основному кроці.
     # Викликається з Invoke-BRAVOMaintenanceServiceStopSequence безпосередньо
     # перед зупинкою працюючої служби BRAVO, а при -ForceRestore і Disabled
-    # BRAVO (#321) — у Disabled-гілці зупинки. Саме ТУТ #316 замінить
-    # безумовне завершення на ворота закриття BIS (попередження активних
-    # сесій, очікування, потім примусове закриття з записом у журнал); інших
-    # місць, де Maintenance завершує Bis, немає.
+    # BRAVO (#321) — у Disabled-гілці зупинки. Інших місць, де Maintenance
+    # завершує Bis, немає.
+    # Класифікація сесій (WTS) тут НЕ потрібна -- на цьому кроці закривається
+    # БУДЬ-ЯКИЙ знайдений BIS незалежно від сесії/стану, тому просто
+    # Get-Process/Stop-Process, без залежності від wtsapi32.dll.
     $processNames = @("Bis")
+    # Test-Path Variable: -- та сама причина, що в Invoke-BRAVOMaintenanceClientCloseStep.
+    if ((Test-Path Variable:maintenanceSettings) -and $maintenanceSettings -is [hashtable] -and
+        $maintenanceSettings.Restore -is [hashtable] -and
+        $maintenanceSettings.Restore.ClientClose -is [hashtable] -and
+        $maintenanceSettings.Restore.ClientClose.Contains('ProcessNames')) {
+        $processNames = @($maintenanceSettings.Restore.ClientClose.ProcessNames)
+    }
     foreach ($procName in $processNames) {
         $process = Get-Process -Name $procName -ErrorAction SilentlyContinue
         if ($process) {
