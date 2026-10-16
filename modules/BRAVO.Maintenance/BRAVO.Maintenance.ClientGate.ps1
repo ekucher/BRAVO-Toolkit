@@ -53,7 +53,7 @@ namespace BRAVO.Interop {
         [DllImport("wtsapi32.dll", SetLastError = true)]
         public static extern bool WTSQuerySessionInformationW(IntPtr hServer, int sessionId, int wtsInfoClass, out IntPtr ppBuffer, out int pBytesReturned);
 
-        [DllImport("wtsapi32.dll", SetLastError = true)]
+        [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool WTSSendMessageW(IntPtr hServer, int sessionId, string pTitle, int titleLength, string pMessage, int messageLength, int style, int timeoutSeconds, out int pResponse, bool bWait);
     }
 }
@@ -65,20 +65,30 @@ function Get-BRAVOWTSSessionInfo {
     # Реальний перелік RDP/консольних сесій цього хоста: SessionId, стан
     # з'єднання (WTS_CONNECTSTATE_CLASS; 0=Active, 4=Disconnected, решта —
     # для цілей #316 трактується як "невідомий"), ім'я користувача
-    # (WTSQuerySessionInformationW, WTSUserName=5; порожнє — сесія без
-    # користувача, зокрема сесія 0 служб).
+    # (WTSQuerySessionInformationW, WTSUserName=5).
+    #
+    # Review (P0, fail-safe напрямок): WTSEnumerateSessionsW, що провалився,
+    # МАЄ повернути $null (не порожній масив) -- викликач (Get-
+    # BRAVOClientGateInventory) розрізняє "не вдалось дізнатись НІЧОГО про
+    # сесії" від "сесій справді немає" і за першого трактує кожен знайдений
+    # BIS як Active (попередити, не вбивати мовчки). Те саме для окремої
+    # сесії, де WTSQuerySessionInformationW не дав ім'я користувача:
+    # UserName = $null (провал запиту), а НЕ '' (успішний запит, дійсно
+    # немає імені) -- колишня поведінка ("" завжди) змушувала класифікацію
+    # нижче трактувати збій одиничного запиту як NoUser і негайно закривати
+    # BIS навіть в активній сесії реального користувача без попередження.
     Add-BRAVOWTSApiType
     $sessions = New-Object System.Collections.Generic.List[object]
     $pSessionInfo = New-Object IntPtr 0
     $count = 0
     $ok = [BRAVO.Interop.WTSApi]::WTSEnumerateSessionsW((New-Object IntPtr 0), 0, 1, [ref]$pSessionInfo, [ref]$count)
-    if (-not $ok) { return $sessions.ToArray() }
+    if (-not $ok) { return $null }
     try {
         $structSize = [Runtime.InteropServices.Marshal]::SizeOf([type]'BRAVO.Interop.WTS_SESSION_INFO')
         for ($sessionIndex = 0; $sessionIndex -lt $count; $sessionIndex++) {
             $currentPtr = New-Object IntPtr ($pSessionInfo.ToInt64() + ($sessionIndex * $structSize))
             $info = [Runtime.InteropServices.Marshal]::PtrToStructure($currentPtr, [type]'BRAVO.Interop.WTS_SESSION_INFO')
-            $userName = ''
+            $userName = $null
             $pBuffer = New-Object IntPtr 0
             $bytesReturned = 0
             $gotUser = [BRAVO.Interop.WTSApi]::WTSQuerySessionInformationW((New-Object IntPtr 0), $info.SessionId, 5, [ref]$pBuffer, [ref]$bytesReturned)
@@ -89,7 +99,7 @@ function Get-BRAVOWTSSessionInfo {
             [void]$sessions.Add([pscustomobject]@{
                 SessionId = [int]$info.SessionId
                 State     = [int]$info.State
-                UserName  = [string]$userName
+                UserName  = $userName
             })
         }
     } finally {
@@ -109,7 +119,13 @@ function Send-BRAVOWTSTextMessage {
     )
     Add-BRAVOWTSApiType
     $response = 0
-    $ok = [BRAVO.Interop.WTSApi]::WTSSendMessageW((New-Object IntPtr 0), $SessionId, $Title, $Title.Length, $Message, $Message.Length, 0, $TimeoutSeconds, [ref]$response, $false)
+    # Review (P1, пов'язано з CharSet-фіксом нижче): WTSSendMessageW
+    # (Win32 docs) приймає довжину в БАЙТАХ, включно з завершальним null-
+    # символом -- не в символах. Unicode (CharSet.Unicode на DllImport) =
+    # 2 байти на символ: (Length+1)*2.
+    $titleLengthBytes = ($Title.Length + 1) * 2
+    $messageLengthBytes = ($Message.Length + 1) * 2
+    $ok = [BRAVO.Interop.WTSApi]::WTSSendMessageW((New-Object IntPtr 0), $SessionId, $Title, $titleLengthBytes, $Message, $messageLengthBytes, 0, $TimeoutSeconds, [ref]$response, $false)
     return [bool]$ok
 }
 
@@ -117,15 +133,29 @@ function Get-BRAVOClientGateInventory {
     # Зводить процеси (за іменем, у БУДЬ-ЯКІЙ сесії) із переліком сесій у
     # класифікацію, потрібну воротам: Active (чекати й попереджати) чи
     # Disconnected/NoUser/Unknown (закривати негайно, без попередження).
+    #
+    # Review (P0, fail-safe напрямок): невизначеність МАЄ класифікуватись як
+    # Active (попередити й чекати), а НЕ як Unknown/NoUser (закрити
+    # негайно без попередження) -- інакше збій самого WTS API (а не
+    # відсутність реальної активної сесії користувача) призводив би до
+    # мовчазного закриття BIS у РЕАЛЬНО активній сесії, саме того, що ця
+    # фіча мала запобігти. Два джерела невизначеності:
+    #   1. $SessionProvider повернув $null -- WTSEnumerateSessionsW
+    #      провалився повністю, про сесії НІЧОГО не відомо.
+    #   2. Сесія знайдена, але WTSQuerySessionInformationW не зміг дати
+    #      ім'я користувача ($null, а НЕ '' -- див. Get-BRAVOWTSSessionInfo).
     param(
         [Parameter(Mandatory = $true)][string[]]$ProcessNames,
         [Parameter(Mandatory = $true)][scriptblock]$ProcessProvider,
         [Parameter(Mandatory = $true)][scriptblock]$SessionProvider
     )
-    $sessions = @(& $SessionProvider)
+    $sessions = & $SessionProvider
+    $enumerationFailed = ($null -eq $sessions)
     $sessionById = @{}
-    foreach ($sessionEntry in $sessions) {
-        $sessionById[[int]$sessionEntry.SessionId] = $sessionEntry
+    if (-not $enumerationFailed) {
+        foreach ($sessionEntry in @($sessions)) {
+            $sessionById[[int]$sessionEntry.SessionId] = $sessionEntry
+        }
     }
 
     $inventory = New-Object System.Collections.Generic.List[object]
@@ -138,20 +168,30 @@ function Get-BRAVOClientGateInventory {
             $userName = ''
             if ($sessionId -eq 0) {
                 # Сесія 0 — службова, без інтерактивного користувача (issue #316, п.2).
+                # Це ДОСТЕМЕННО відоме знання (не невизначеність WTS API),
+                # тож fail-safe-правило вище сюди не застосовується.
                 $classification = 'NoUser'
+            } elseif ($enumerationFailed) {
+                # Невизначеність джерела 1: безпечний дефолт — попередити.
+                $classification = 'Active'
             } elseif (-not $sessionById.ContainsKey($sessionId)) {
                 $classification = 'Unknown'
             } else {
                 $sessionEntry = $sessionById[$sessionId]
-                $userName = [string]$sessionEntry.UserName
-                if ([string]::IsNullOrEmpty($userName)) {
-                    $classification = 'NoUser'
-                } elseif ([int]$sessionEntry.State -eq 0) {
+                if ($null -eq $sessionEntry.UserName) {
+                    # Невизначеність джерела 2: безпечний дефолт — попередити.
                     $classification = 'Active'
-                } elseif ([int]$sessionEntry.State -eq 4) {
-                    $classification = 'Disconnected'
                 } else {
-                    $classification = 'Unknown'
+                    $userName = [string]$sessionEntry.UserName
+                    if ([string]::IsNullOrEmpty($userName)) {
+                        $classification = 'NoUser'
+                    } elseif ([int]$sessionEntry.State -eq 0) {
+                        $classification = 'Active'
+                    } elseif ([int]$sessionEntry.State -eq 4) {
+                        $classification = 'Disconnected'
+                    } else {
+                        $classification = 'Unknown'
+                    }
                 }
             }
             [void]$inventory.Add([pscustomobject]@{

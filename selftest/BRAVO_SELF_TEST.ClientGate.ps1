@@ -213,6 +213,54 @@
 }
 
 # ------------------------------------------------------------
+# 6a. Review (P0, fail-safe): WTSEnumerateSessionsW провалився повністю
+#     (-SessionProvider повертає $null) -- BIS МАЄ попереджатись (Active),
+#     а не закриватись мовчки. Збій WTS API не повинен мати той самий
+#     ефект, що справді відключена/невідома сесія.
+# ------------------------------------------------------------
+& {
+    $worldProcesses = @([pscustomobject]@{ Id = 611; SessionId = 81 })
+
+    $result = Invoke-BRAVOMaintenanceClientCloseGate `
+        -ProcessNames @('Bis') -WaitMinutes 0 -ReminderMinutes 1 -PollSeconds 10 `
+        -ProcessProvider { param($Name) return $worldProcesses } `
+        -SessionProvider { return $null } `
+        -MessageSender { param($SessionId, $Title, $Message) return $true } `
+        -ProcessStopper { param($ProcessId) } `
+        -ClockNow { return (Get-Date '2026-01-01 10:00:00') } `
+        -Waiter { param($Seconds) }
+
+    Test-BRAVOCondition -Condition (
+        $result.ImmediateClosures.Count -eq 1 -and $result.ImmediateClosures[0].Classification -eq 'Active'
+    ) -Name 'ClientGate/WtsEnumerationFailureDefaultsToActiveNotSilentClose' `
+        -Failure "повний провал WTSEnumerateSessionsW (SessionProvider=`$null) мусить класифікувати BIS як Active (попередити), а не Unknown/NoUser (закрити мовчки); факт: $($result.ImmediateClosures | ConvertTo-Json -Compress -Depth 3)"
+}
+
+# ------------------------------------------------------------
+# 6b. Review (P0, fail-safe): WTSQuerySessionInformationW не дав ім'я
+#     користувача для ОДНІЄЇ сесії (UserName=$null, провал запиту, а не
+#     справді порожнє ім'я) -- та сама сесія МАЄ попереджатись (Active).
+# ------------------------------------------------------------
+& {
+    $worldProcesses = @([pscustomobject]@{ Id = 621; SessionId = 82 })
+    $worldSessions = @([pscustomobject]@{ SessionId = 82; State = 0; UserName = $null })
+
+    $result = Invoke-BRAVOMaintenanceClientCloseGate `
+        -ProcessNames @('Bis') -WaitMinutes 0 -ReminderMinutes 1 -PollSeconds 10 `
+        -ProcessProvider { param($Name) return $worldProcesses } `
+        -SessionProvider { return $worldSessions } `
+        -MessageSender { param($SessionId, $Title, $Message) return $true } `
+        -ProcessStopper { param($ProcessId) } `
+        -ClockNow { return (Get-Date '2026-01-01 10:00:00') } `
+        -Waiter { param($Seconds) }
+
+    Test-BRAVOCondition -Condition (
+        $result.ImmediateClosures.Count -eq 1 -and $result.ImmediateClosures[0].Classification -eq 'Active'
+    ) -Name 'ClientGate/WtsUserNameQueryFailureDefaultsToActiveNotNoUser' `
+        -Failure "провал WTSQuerySessionInformationW для ОДНІЄЇ сесії (UserName=`$null) мусить класифікувати її як Active (попередити), а не NoUser (закрити мовчки навіть якщо сесія справді активна); факт: $($result.ImmediateClosures | ConvertTo-Json -Compress -Depth 3)"
+}
+
+# ------------------------------------------------------------
 # 9. Процес не завершився навіть після примусового закриття -- фінальна
 #    перевірка повертає його у StillRunning (=> CRITICAL на рівні кроку).
 # ------------------------------------------------------------
