@@ -331,7 +331,8 @@ function Get-SanitizedWinSCPDiagnostic {
     param(
         [AllowNull()]
         [string]$Text,
-        [int]$MaximumLines = 80
+        [int]$MaximumLines = 80,
+        [int]$MaximumLineCharacters = 2000
     )
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
@@ -376,6 +377,17 @@ function Get-SanitizedWinSCPDiagnostic {
             $lines | Select-Object -Last $safeMaximumLines
         )
     }
+    # Межа довжини рядка (#463): вивід без розривів рядка межа рядків не
+    # обмежує, а Write-BRAVOLog маскує кожне повідомлення повторно. Текст
+    # уже замаскований, тож зріз не лишає уламка секрету.
+    $safeMaximumLineCharacters = [math]::Max(100, $MaximumLineCharacters)
+    $lines = @($lines | ForEach-Object {
+        if ($_.Length -gt $safeMaximumLineCharacters) {
+            $_.Substring(0, $safeMaximumLineCharacters) + " ... [обрiзано символiв: $($_.Length - $safeMaximumLineCharacters)]"
+        } else {
+            $_
+        }
+    })
     return ($lines -join [Environment]::NewLine)
 }
 

@@ -74,7 +74,15 @@ function Protect-BRAVOLogSecret {
 
         # Значення в лапках переходить через розрив рядка (див. нижче) — для
         # недовіреного виводу інструмента цілим текстом, а не для журналу.
-        [switch]$QuotedValueSpansLines
+        [switch]$QuotedValueSpansLines,
+
+        # Межа кількості діапазонів маскування (#463; 0 — без межі). Кожен
+        # збіг — діапазон у пам'яті й у сортуванні, тож для недовіреного
+        # виводу з мільйонами коротких збігів (` -px` поспіль) ціна росте з
+        # їх кількістю. Понад межу — System.OverflowException ДО сортування
+        # і без частково замаскованого результату; Protect-BRAVOLogSecretBounded
+        # перетворює її на Omitted (fail-closed).
+        [ValidateRange(0, 2147483647)][int]$MaximumMaskedSpans = 0
     )
 
     if ([string]::IsNullOrEmpty($Text)) {
@@ -97,6 +105,7 @@ function Protect-BRAVOLogSecret {
     #   вже не знайшлося б цілим.
     $spanStarts = New-Object 'System.Collections.Generic.List[int]'
     $spanEnds = New-Object 'System.Collections.Generic.List[int]'
+    $spanLimitMessage = "Protect-BRAVOLogSecret: понад $MaximumMaskedSpans діапазонів маскування"
     if ($null -ne $KnownSecret) {
         # Правило значень: порожнє і whitespace-only НЕ маскуються (інакше
         # *** замінило б кожен пробіл, а секрету там немає); будь-яке інше
@@ -166,6 +175,9 @@ function Protect-BRAVOLogSecret {
             while ($matchIndex -ge 0) {
                 $spanStarts.Add($matchIndex)
                 $spanEnds.Add($matchIndex + $secretVariant.Length)
+                if ($MaximumMaskedSpans -gt 0 -and $spanStarts.Count -gt $MaximumMaskedSpans) {
+                    throw (New-Object System.OverflowException $spanLimitMessage)
+                }
                 $matchIndex = $sanitized.IndexOf([string]$secretVariant, $matchIndex + 1, [System.StringComparison]::Ordinal)
             }
         }
@@ -231,13 +243,20 @@ function Protect-BRAVOLogSecret {
         '(?i)hooks\.slack\.com/services/(?<v>\S+)',
         '(?i)discord(?:app)?\.com/api/webhooks/(?<v>\S+)'
     )
+    # Збіги перебираються по одному (Match/NextMatch), а не колекцією
+    # Matches: у пам'яті лишаються лише межі діапазонів.
     foreach ($secretPattern in $secretPatterns) {
-        foreach ($patternMatch in [regex]::Matches($sanitized, $secretPattern)) {
+        $patternMatch = [regex]::Match($sanitized, $secretPattern)
+        while ($patternMatch.Success) {
             $valueGroup = $patternMatch.Groups['v']
             if ($valueGroup.Success -and $valueGroup.Length -gt 0) {
                 $spanStarts.Add($valueGroup.Index)
                 $spanEnds.Add($valueGroup.Index + $valueGroup.Length)
+                if ($MaximumMaskedSpans -gt 0 -and $spanStarts.Count -gt $MaximumMaskedSpans) {
+                    throw (New-Object System.OverflowException $spanLimitMessage)
+                }
             }
+            $patternMatch = $patternMatch.NextMatch()
         }
     }
     if ($spanStarts.Count -gt 0) {
@@ -289,7 +308,11 @@ function Protect-BRAVOLogSecretBounded {
     #   на кшталт `a://b:a://b:…` без `@` квадратичний навіть із короткими
     #   ланцюжками схеми (виміряно: ~200 тис. символів одним фрагментом —
     #   ~150 с). Шаблон не перетинає пробільних символів, тож межа на
-    #   фрагмент обмежує роботу лінійно від загальної довжини.
+    #   фрагмент обмежує роботу лінійно від загальної довжини;
+    # - кількість діапазонів маскування (-MaximumMaskedSpans, #463): кожен
+    #   збіг — діапазон у пам'яті й у сортуванні, тож мільйони коротких
+    #   збігів (` -px` поспіль у сформованому виводі) коштували б секунди
+    #   й сотні МБ навіть у межах загальної довжини.
     # Текст понад будь-яку межу НЕ маскується і НЕ пишеться (fail-closed):
     # викликач отримує Omitted і записує лише позначку з довжиною.
     #
@@ -300,6 +323,7 @@ function Protect-BRAVOLogSecretBounded {
         [ValidateRange(1000, 50000000)][int]$MaximumMaskedCharacters = 200000,
         [ValidateRange(64, 100000)][int]$MaximumTokenCharacters = 256,
         [ValidateRange(64, 100000)][int]$MaximumUrlRunCharacters = 512,
+        [ValidateRange(100, 10000000)][int]$MaximumMaskedSpans = 10000,
         [switch]$QuotedValueSpansLines
     )
 
@@ -314,8 +338,14 @@ function Protect-BRAVOLogSecretBounded {
         [regex]::IsMatch($sourceText, $longUrlRunPattern)) {
         return [pscustomobject]@{ Text = ''; Omitted = $true; Length = $sourceText.Length }
     }
+    try {
+        $maskedText = [string](Protect-BRAVOLogSecret -Text $sourceText -KnownSecret $KnownSecret `
+            -QuotedValueSpansLines:$QuotedValueSpansLines -MaximumMaskedSpans $MaximumMaskedSpans)
+    } catch [System.OverflowException] {
+        return [pscustomobject]@{ Text = ''; Omitted = $true; Length = $sourceText.Length }
+    }
     return [pscustomobject]@{
-        Text = [string](Protect-BRAVOLogSecret -Text $sourceText -KnownSecret $KnownSecret -QuotedValueSpansLines:$QuotedValueSpansLines)
+        Text = $maskedText
         Omitted = $false
         Length = $sourceText.Length
     }

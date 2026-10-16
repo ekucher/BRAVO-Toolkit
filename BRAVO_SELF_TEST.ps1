@@ -27619,6 +27619,10 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     $winScpManyRunsWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $winScpManyRunsResult = [string](Get-SanitizedWinSCPDiagnostic -Text $winScpManyRuns)
     $winScpManyRunsWatch.Stop()
+    # #463: мільйони коротких збігів (` -px` поспіль) — позначка без вмісту,
+    # а не секунди й сотні МБ; один довгий рядок без розривів обрізається.
+    $winScpManySpans = [string](Get-SanitizedWinSCPDiagnostic -Text (' -px' * 200000))
+    $winScpLongLine = [string](Get-SanitizedWinSCPDiagnostic -Text ('Error: password=' + 'WSLEAK' + 'LL ' + ('x ' * 20000)))
     $winScpCanonicalEmptyUser = [string](& $winScpLoggingModule { param($Text) Protect-BRAVOLogSecret -Text $Text } (
         'sync sftp://:{0}@nas.local/' -f ('WSLEAK' + 'EU')))
     $winScpFailClosed = [string](& (Get-Module -Name 'BRAVO.ArchiveRuntime') {
@@ -27634,6 +27638,12 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
             -not $winScpCapSplit.Contains('WSLEAKCAP') -and
             $winScpCanonicalEmptyUser -eq 'sync sftp://:***@nas.local/' -and
             $winScpManyRunsWatch.Elapsed.TotalSeconds -lt 10 -and
+            $winScpManySpans.Contains('не записано') -and
+            -not $winScpManySpans.Contains('-px') -and
+            $winScpLongLine.Contains('Error: password=*** x') -and
+            $winScpLongLine.Contains('обрiзано') -and
+            $winScpLongLine.Length -lt 2200 -and
+            -not $winScpLongLine.Contains('WSLEAKLL') -and
             $winScpManyRunsResult.Contains('.7z') -and
             $winScpCapSplit.Contains('***') -and
             $winScpOversized.Contains('не записано') -and
@@ -27644,7 +27654,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Secrets/WinSCPDiagnosticMaskedCanonically" `
         -Failure ("Get-SanitizedWinSCPDiagnostic має маскувати канонічно й fail-closed (#461). " +
             "Уламки: [$($winScpMaskLeaks -join ' || ')]; межа рядків: $($winScpLineLimited -replace "`r?`n", ' | '); " +
-            "багато ланцюжків: $([int]$winScpManyRunsWatch.Elapsed.TotalSeconds) с; зріз після ключа: $($winScpCapSplit -replace "`r?`n", ' | '); понад межі: $winScpOversized; без маскування: $winScpFailClosed")
+            "багато ланцюжків: $([int]$winScpManyRunsWatch.Elapsed.TotalSeconds) с; багато збігів: $winScpManySpans; довгий рядок: $($winScpLongLine.Length) символiв; зріз після ключа: $($winScpCapSplit -replace "`r?`n", ' | '); понад межі: $winScpOversized; без маскування: $winScpFailClosed")
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains('BRAVO.ArchiveHelpers') -and
