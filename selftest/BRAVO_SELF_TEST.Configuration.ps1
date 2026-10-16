@@ -1684,7 +1684,13 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         -Name "Authorization/RegistryCoversEveryCanonicalLeaf" `
         -Failure "авторизаційний реєстр мусить мати рівно один запис на кожен канонічний лист: відсутні=$($authMissingLeaves.Count) ($([string]::Join(', ', $authMissingLeaves))), осиротілі=$($authOrphanEntries.Count) ($([string]::Join(', ', $authOrphanEntries)))"
 
-    # --- Authorization/Exactly278CanonicalLeaves ---
+    # --- Authorization/Exactly280CanonicalLeaves ---
+    # 278 -> 280 (#364, LogSync): componentSettings.SFTP.RuntimeLogSyncEnabled
+    # (тумблер runtime-синхронізації логів через SFTP, ALLOW_SITE) і
+    # sftpDirectories.RuntimeLogs (каталог призначення на SFTP, ALLOW_SITE) —
+    # два нові канонічні листи з ЯВНИМИ записами у реєстрі; жоден наявний
+    # лист класу не змінив (дельта класів нижче — рівно +2 ALLOW_SITE).
+    #
     # 277 -> 278: maintenanceSettings.Restore.IntegritySmallFileThresholdBytes
     # (поріг «малого» файлу самоперевірки реставрації, ALLOW_SITE) — один
     # новий канонічний лист з ЯВНИМ записом у реєстрі; жоден наявний лист
@@ -1703,9 +1709,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     # Жоден НАЯВНИЙ лист не змінив класу — саме тому дельта класів нижче
     # рівно +3 ALLOW_SITE і +3 ALLOW_WITH_VALIDATOR, а не перерозподіл.
     Test-BRAVOCondition `
-        -Condition ($authLeaves.Count -eq 278) `
-        -Name "Authorization/Exactly278CanonicalLeaves" `
-        -Failure "контракт фіксує рівно 278 канонічних листів (271 Wave 2 + 6 BSYSTEM Operations 5.3.0 + 1 Restore.IntegritySmallFileThresholdBytes); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
+        -Condition ($authLeaves.Count -eq 280) `
+        -Name "Authorization/Exactly280CanonicalLeaves" `
+        -Failure "контракт фіксує рівно 280 канонічних листів (271 Wave 2 + 6 BSYSTEM Operations 5.3.0 + 1 Restore.IntegritySmallFileThresholdBytes + 2 #364 LogSync); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
 
     # --- Authorization/AllClassesRecognized ---
     $authUnrecognizedClasses = @(@($authRegistry.Values) | ForEach-Object { [string]$_.Class } | Where-Object { $authKnownClasses -notcontains $_ } | Select-Object -Unique)
@@ -1749,15 +1755,18 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     #
     # Restore.IntegritySmallFileThresholdBytes: +1 ALLOW_SITE (205->206),
     # TOTAL 277->278.
+    #
+    # #364 (LogSync): +2 ALLOW_SITE (206->208) — componentSettings.SFTP.
+    # RuntimeLogSyncEnabled і sftpDirectories.RuntimeLogs. TOTAL 278->280.
     Test-BRAVOCondition `
         -Condition (
-            $authAllowSiteCount -eq 206 -and $authAllowValidatorCount -eq 28 -and
+            $authAllowSiteCount -eq 208 -and $authAllowValidatorCount -eq 28 -and
             $authDenyDerivedCount -eq 0 -and $authDenyCredentialCount -eq 0 -and
             $authDenySecurityCount -eq 6 -and $authDenyExecutionCount -eq 21 -and
             $authDenyInternalCount -eq 17
         ) `
         -Name "Authorization/ClassCountsMatchContract" `
-        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW): ALLOW_SITE=$authAllowSiteCount(206) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(28) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
+        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW і #364 LogSync): ALLOW_SITE=$authAllowSiteCount(208) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(28) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
 
     # --- Authorization/EveryValidatorIdentifierResolves ---
     # Кожен ALLOW_WITH_VALIDATOR-запис мусить посилатись на валідатор,

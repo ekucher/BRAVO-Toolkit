@@ -660,6 +660,7 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'componentSettings.SFTP.ArchiveUpload' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SFTP.Enabled' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SFTP.MaintenanceLogUploadEnabled' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.SFTP.RuntimeLogSyncEnabled' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SMB.ArchiveCopy' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SMB.Enabled' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.Synchronization.BAZA_APP_LOCAL' = @{ Class = 'ALLOW_SITE' }
@@ -943,6 +944,7 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'sftpDirectories.MaintenanceLog' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.Manifest' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.MODEL' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.RuntimeLogs' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.Trace' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.TraceLogs' = @{ Class = 'ALLOW_SITE' }
     'sftpHostKey' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'NonEmptyString' }

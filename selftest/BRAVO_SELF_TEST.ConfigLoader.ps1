@@ -2293,7 +2293,11 @@ try {
         'credentialSettings.Targets.OperationsBootstrapSecret',
         # Поріг «малого» файлу MODEL для самоперевірки після bravocmd
         # repair (Compare-FileSizes): новий канонічний лист Restore.
-        'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes'
+        'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes',
+        # #364: runtime-синхронізація логів через SFTP — тумблер і каталог
+        # призначення, обидва нові канонічні листи після заморожування фікстури.
+        'componentSettings.SFTP.RuntimeLogSyncEnabled',
+        'sftpDirectories.RuntimeLogs'
     )
     $parityAdditiveAbsenceSuffix = ' : відсутнє в BRAVO.config'
     $parityDiffs = @(@($parityDiffsList.ToArray()) | Where-Object {
