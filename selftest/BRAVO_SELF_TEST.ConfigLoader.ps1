@@ -2302,7 +2302,11 @@ try {
         # вузол дає ОДИН diff на самому вузлі, а не чотири на листах —
         # саме цей шлях (а не дочірні WaitMinutes/ReminderMinutes/
         # PollSeconds/ProcessNames) і треба дозволити.
-        'maintenanceSettings.Restore.ClientClose'
+        'maintenanceSettings.Restore.ClientClose',
+        # #364: runtime-синхронізація логів через SFTP — тумблер і каталог
+        # призначення, обидва нові канонічні листи після заморожування фікстури.
+        'componentSettings.SFTP.RuntimeLogSyncEnabled',
+        'sftpDirectories.RuntimeLogs'
     )
     $parityAdditiveAbsenceSuffix = ' : відсутнє в BRAVO.config'
     $parityDiffs = @(@($parityDiffsList.ToArray()) | Where-Object {

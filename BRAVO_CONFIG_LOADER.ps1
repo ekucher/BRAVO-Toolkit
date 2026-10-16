@@ -590,6 +590,13 @@ function Assert-BravoLoadedConfiguration {
             [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.ArchivLog)) {
             $global:sftpDirectories.ArchivLog = 'logs/archiv'
         }
+        # #364: той самий принцип — legacy-конфіги без цього ключа
+        # отримують канонічний дефолт; саме вивантаження лишається
+        # вимкненим окремим opt-in тумблером нижче.
+        if (-not $global:sftpDirectories.Contains('RuntimeLogs') -or
+            [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.RuntimeLogs)) {
+            $global:sftpDirectories.RuntimeLogs = 'logs/runtime'
+        }
     }
 
     # RestoreVerify (P1.1, 5.3.0): щотижневий restore drill. Старі
@@ -801,7 +808,7 @@ function Assert-BravoLoadedConfiguration {
     # SFTP-поведінку, якої оператор не просив.
     if ($global:componentSettings.Contains('SFTP') -and
         ($global:componentSettings.SFTP -is [hashtable])) {
-        foreach ($ownLogUploadToggleName in @('MaintenanceLogUploadEnabled', 'ArchiveLogUploadEnabled')) {
+        foreach ($ownLogUploadToggleName in @('MaintenanceLogUploadEnabled', 'ArchiveLogUploadEnabled', 'RuntimeLogSyncEnabled')) {
             $sftpComponentNode = $global:componentSettings.SFTP
             if (-not $sftpComponentNode.Contains($ownLogUploadToggleName)) {
                 $sftpComponentNode[$ownLogUploadToggleName] = $false

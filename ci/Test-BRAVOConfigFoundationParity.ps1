@@ -502,6 +502,10 @@ $knownIntentionalDiffPrefixes = @(
     'maintenanceSettings.Restore.ClientClose',
     'sftpDirectories.ArchivLog',
     'sftpDirectories.MaintenanceLog',
+    # #364 (LogSync) — runtime-синхронізація логів через SFTP: тумблер і
+    # каталог призначення, обидва адитивні ключі; у BEFORE (42cf9ad) не існує.
+    'componentSettings.SFTP.RuntimeLogSyncEnabled',
+    'sftpDirectories.RuntimeLogs',
     # BSYSTEM Operations (5.3.0), коміт 021fdbf — нові credential-target
     # ключі bootstrap-секрету self-enrollment і виданого API-ключа.
     # У BEFORE (42cf9ad) секції credentialSettings.Targets / legacy

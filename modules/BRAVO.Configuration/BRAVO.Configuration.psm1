@@ -250,6 +250,10 @@ function Get-BRAVODefaultConfiguration {
                 ArchiveUpload = $true
                 MaintenanceLogUploadEnabled = $false
                 ArchiveLogUploadEnabled = $false
+                # #364: окремий тумблер синхронізації дозволених (allowlist)
+                # runtime-журналів на SFTP — дефолт $false для наявних
+                # установок (owner-approved рішення #2).
+                RuntimeLogSyncEnabled = $false
             }
             SMB = @{
                 Enabled = $true
@@ -384,6 +388,10 @@ function Get-BRAVODefaultConfiguration {
             ExchangeApiLogs = "logs/exchangapi"
             MaintenanceLog = "logs/maintenance"
             ArchivLog = "logs/archiv"
+            # #364: базовий каталог для синхронізації дозволених runtime-
+            # журналів; Maintenance додає сегмент хоста ($env:COMPUTERNAME)
+            # при побудові фактичного шляху (owner-approved рішення #4).
+            RuntimeLogs = "logs/runtime"
         }
 
         backupMonitoring = @{

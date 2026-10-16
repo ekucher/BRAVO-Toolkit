@@ -214,6 +214,7 @@ function Resolve-RequestedComponents {
                     -ArchiveUploadEnabled ([bool]$storageEffective.SFTP.ArchiveUpload) `
                     -MaintenanceLogUploadEnabled ([bool]$componentSettings.SFTP.MaintenanceLogUploadEnabled) `
                     -ArchiveLogUploadEnabled ([bool]$componentSettings.SFTP.ArchiveLogUploadEnabled) `
+                    -RuntimeLogSyncEnabled ([bool]$componentSettings.SFTP.RuntimeLogSyncEnabled) `
                     -ScheduledSftpSyncRequired ([bool]$bazaSyncEffective.ScheduledSftpSyncRequired) `
                     -BackupMonitoringSftpEnabled ([bool]$backupMonitoring.SFTP.Enabled)
                 if ($sftpRequired -and -not $resolved.Contains("SFTP")) {

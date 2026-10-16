@@ -15646,6 +15646,11 @@ function Invoke-BRAVOMaintenanceOwnLogUpload { Add-ProbeEvent 'OWNLOG-UPLOAD' }
 # $shouldRestore=$true), не реальна WTS-логіка закриття BIS; реальна функція
 # (Get-BRAVOClientGateInventory/Get-BRAVOWTSSessionInfo) тут НЕ викликається.
 function Invoke-BRAVOMaintenanceClientCloseStep { Add-ProbeEvent 'CLIENT-CLOSE-GATE'; return $true }
+# #364: той самий принцип, що Invoke-BRAVOMaintenanceOwnLogUpload вище —
+# пробу цікавить порядок кроків, не реальна SFTP-синхронізація; реальна
+# функція (ідемпотентний прапорець $script:maintenanceRuntimeLogSyncAttempted)
+# тут НЕ викликається взагалі, тож і прапорець не потребує власного seed.
+function Invoke-BRAVOMaintenanceRuntimeLogSync { Add-ProbeEvent 'RUNTIMELOG-SYNC' }
 function Wait-BRAVOManualExit { param([switch]$NoPause) Add-ProbeEvent ("MANUAL-EXIT NoPause={0}" -f [bool]$NoPause) }
 '@
             $maintenanceOrchestrationSeed = @'
@@ -29854,6 +29859,13 @@ function Write-BRAVOLog {
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/SftpCredentialsRequired' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'LogSync') {
+        Enter-BRAVOSelfTestSuite -Name 'LogSync'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/LogSync') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.LogSync.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/LogSync' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'MaintenanceOwnLog') {
         Enter-BRAVOSelfTestSuite -Name 'MaintenanceOwnLog'
         if (Enter-BRAVOSelfTestSection -Name 'Suite/MaintenanceOwnLog') { try {
@@ -33654,7 +33666,7 @@ foreach ($case in $cases) {
 
     # M3. Таблиця модулів закріплена: ПОВНИЙ перелік каталогів modules\BRAVO.* і
     # відповідний suite для кожного. Новий модуль ламає тест і вимагає свідомого
-    # рішення про мапу (станом на базу гілки: 23 модулі, 10 з suite).
+    # рішення про мапу (станом на #364: 24 модулі, 11 з suite — додано LogSync).
     $suiteMapModuleSuites = @{
         'Archive'                = 'Archive'
         'BazaSync'               = 'BazaSync'
@@ -33663,6 +33675,7 @@ foreach ($case in $cases) {
         'DataRestore'            = 'DataRestore'
         'DataRestore.MatrixTest' = 'DataRestore'
         'DiskSpace'              = 'DiskSpace'
+        'LogSync'                = 'LogSync'
         'Operations'             = 'Operations'
         'RestoreVerify'          = 'RestoreVerify'
         'Status'                 = 'Status'
