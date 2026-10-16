@@ -6239,11 +6239,15 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
 
     $sandbox = Join-Path ([IO.Path]::GetTempPath()) ('bravo_rb289_' + [guid]::NewGuid().ToString('N'))
     $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
     function Write-RbFile { param([string]$Root, [string]$Rel, [string]$Text)
         $full = Join-Path $Root ($Rel -replace '\\', [IO.Path]::DirectorySeparatorChar)
         $dir = [IO.Path]::GetDirectoryName($full)
         if (-not [IO.Directory]::Exists($dir)) { [void][IO.Directory]::CreateDirectory($dir) }
-        [IO.File]::WriteAllText($full, $Text, $utf8)
+        # Згенеровані .ps1 пишемо з BOM: Windows PowerShell 5.1 без BOM читає файл
+        # в ANSI-кодовій сторінці (cp1251), і не-ASCII шлях у тексті ламає парсинг.
+        $enc = if ($Rel -like '*.ps1') { $utf8Bom } else { $utf8 }
+        [IO.File]::WriteAllText($full, $Text, $enc)
     }
     function Write-RbManifest { param([string]$Root, [string[]]$Rels)
         $files = [ordered]@{}
@@ -6430,6 +6434,7 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
     # WARNING) не є збоєм відкату; ненульовий guard, збій Scheduler чи
     # ValidateOnly і чужа VERSION.json дають проблему відкату (=> exit 2).
     $sb3 = Join-Path ([IO.Path]::GetTempPath()) ('bravo_rb289c_' + [guid]::NewGuid().ToString('N'))
+    $script:RbPrevCtl = $env:BRAVO_RB_CTL; $script:RbPrevLog = $env:BRAVO_RB_LOG
     try {
         $orchAst = [System.Management.Automation.Language.Parser]::ParseInput($updaterText, [ref]$null, [ref]$null)
         $orchFn = $orchAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-BRAVODeployUpdaterRollback' }, $true)
@@ -6437,12 +6442,15 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
         function Write-Note { param([string]$T) }
         $orchLog = Join-Path $sb3 'calls.log'
         $orchCtl = Join-Path $sb3 'codes.json'
-        $orchGuard = "`$c = [IO.File]::ReadAllText('$orchCtl') | ConvertFrom-Json`r`n" +
-            "[IO.File]::AppendAllText('$orchLog', ('guard:' + (Get-Location).Path + [Environment]::NewLine))`r`nexit [int]`$c.Guard`r`n"
+        # Шляхи передаються у фейкові скрипти через змінні середовища, а не
+        # вбудовуються в текст коду: не-ASCII шлях TEMP не має ламати літерал.
+        $env:BRAVO_RB_CTL = $orchCtl; $env:BRAVO_RB_LOG = $orchLog
+        $orchGuard = "`$c = [IO.File]::ReadAllText(`$env:BRAVO_RB_CTL) | ConvertFrom-Json`r`n" +
+            "[IO.File]::AppendAllText(`$env:BRAVO_RB_LOG, ('guard:' + (Get-Location).Path + [Environment]::NewLine))`r`nexit [int]`$c.Guard`r`n"
         $orchSetup = "param([string]`$Action, [switch]`$ValidateOnly, [switch]`$NoPause)`r`n" +
-            "`$c = [IO.File]::ReadAllText('$orchCtl') | ConvertFrom-Json`r`n" +
+            "`$c = [IO.File]::ReadAllText(`$env:BRAVO_RB_CTL) | ConvertFrom-Json`r`n" +
             "`$m = if (`$ValidateOnly) { 'ValidateOnly' } else { `$Action }`r`n" +
-            "[IO.File]::AppendAllText('$orchLog', ('setup:' + `$m + ':' + (Get-Content -LiteralPath (Join-Path (Get-Location).Path 'VERSION.json') -Raw | ConvertFrom-Json).packageVersion + [Environment]::NewLine))`r`n" +
+            "[IO.File]::AppendAllText(`$env:BRAVO_RB_LOG, ('setup:' + `$m + ':' + (Get-Content -LiteralPath (Join-Path (Get-Location).Path 'VERSION.json') -Raw | ConvertFrom-Json).packageVersion + [Environment]::NewLine))`r`n" +
             "exit [int]`$c.`$m`r`n"
         $orchRun = {
             param([int]$Guard, [int]$Scheduler, [int]$Validate, [string]$StagedVersion)
@@ -6533,7 +6541,11 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
             function Write-Ok { param([string]$T) }
             function Write-Warn2 { param([string]$T) $script:GateWarnings++ }
             Push-Location $sb3
-            try { . ([scriptblock]::Create($gateAst.Extent.Text)) } finally { Pop-Location }
+            # Виняток блока гейта (напр. ParseException) стає звичайним провалом
+            # перевірки, а не перериває всю секцію.
+            try { . ([scriptblock]::Create($gateAst.Extent.Text)) }
+            catch { [void]$gateFailures.Add('GATE-HARNESS-EXCEPTION: ' + $_.Exception.Message) }
+            finally { Pop-Location }
             return [pscustomobject]@{ Failures = @($gateFailures.ToArray()); Warnings = $script:GateWarnings }
         }
         $gateOk = & $gateRun 0 0
@@ -6593,6 +6605,7 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
             -Failure "deploy\Install-BRAVOServer.ps1: вердикт -ValidateOnly має йти через Get-BRAVODeploySetupExitVerdict (0 PASS, 10 PASS WITH WARNING), без окремого порівняння коду з числом (#330)"
     } finally {
         $script:RollbackProblems = @()
+        $env:BRAVO_RB_CTL = $script:RbPrevCtl; $env:BRAVO_RB_LOG = $script:RbPrevLog
         if (Test-Path -LiteralPath $sb3) { Remove-Item -LiteralPath $sb3 -Recurse -Force -ErrorAction SilentlyContinue }
     }
 

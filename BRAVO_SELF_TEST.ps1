@@ -3458,7 +3458,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $phase0JsonParsedOk = $false
             if ([IO.File]::Exists($phase0JsonTargetPath)) {
                 try {
-                    [void](Get-Content -LiteralPath $phase0JsonTargetPath -Raw | ConvertFrom-Json)
+                    [void](Get-Content -LiteralPath $phase0JsonTargetPath -Raw -Encoding UTF8 | ConvertFrom-Json)
                     $phase0JsonParsedOk = $true
                 } catch {
                     $phase0JsonParsedOk = $false
@@ -9673,7 +9673,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Condition (-not $safelyNullThrew -and $null -eq $safelyNullResult) `
             -Name 'Operations/SendEventSafelyNoOpsOnNullSettingsWithoutRealSendEvent' `
             -Failure "#448: Send-BRAVOOperationsEventSafely з OperationsReportingSettings=`$null має тихо повернутись БЕЗ спроби викликати Send-BRAVOOperationsEvent (якого немає в цьому ізольованому модулі); факт: threw=$safelyNullThrew result=$safelyNullResult"
-    } (Get-Content -Raw (Join-Path $root "modules\BRAVO.Operations\BRAVO.Operations.psm1"))
+    } (Get-Content -Raw -Encoding UTF8 (Join-Path $root "modules\BRAVO.Operations\BRAVO.Operations.psm1"))
 
     $compatibilityScriptText = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"),
