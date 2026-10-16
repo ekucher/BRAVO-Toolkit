@@ -21963,11 +21963,25 @@ try {
                     "NEXTRECORD 'kept' INTACT5"
                 ) -join "`r`n"
                 $diagDoubledMasked = [string](Protect-BRAVOLogSecret -Text $diagDoubledText)
+                # Короткий відомий секрет, що збігається із синтаксисом значення
+                # (пароль архіву `'` чи `"`), не мусить зруйнувати лапковане
+                # значення для шаблону: збіги шукаються в оригінальному тексті й
+                # зливаються. І навпаки: відоме значення з пробілом після ключа
+                # маскується цілим, хоч шаблон без лапок бере лише до пробілу.
+                $diagShortSecretMasked = @(
+                    [string](Protect-BRAVOLogSecret -Text "ERROR: entry token='AAA SSLEAK1' end" -KnownSecret @("'")),
+                    [string](Protect-BRAVOLogSecret -Text 'ERROR: entry token="BBB SSLEAK2" end' -KnownSecret @('"')),
+                    [string](Protect-BRAVOLogSecret -Text 'ERROR: cmd password=my SSLEAK3 tail' -KnownSecret @('my SSLEAK3'))
+                )
+                $diagShortSecretLeaks = @('SSLEAK1', 'SSLEAK2', 'SSLEAK3' | Where-Object { ($diagShortSecretMasked -join "`n").Contains($_) })
                 $diagDoubledLeaks = @('DQLEAKS1', 'DQLEAKD2', 'DQLEAKP3', 'DQLEAKU4', 'DQLEAKB6', 'DQLEAKB7', 'DQLEAKB8', 'DQLEAKT9' |
                     Where-Object { $diagDoubledMasked.Contains($_) })
                 Test-BRAVOCondition `
                     -Condition (
                         $diagDoubledLeaks.Count -eq 0 -and
+                        $diagShortSecretLeaks.Count -eq 0 -and
+                        $diagShortSecretMasked[0] -ceq 'ERROR: entry token=*** end' -and
+                        $diagShortSecretMasked[2] -ceq 'ERROR: cmd password=*** tail' -and
                         $diagDoubledMasked.Contains("token=*** end") -and
                         $diagDoubledMasked.Contains("secret=*** end") -and
                         $diagDoubledMasked.Contains("-password=*** x") -and
@@ -21975,7 +21989,8 @@ try {
                     ) `
                     -Name "Logging/QuotedSecretValueDoubledAndUnterminatedQuotes" `
                     -Failure ("значення в лапках із екранованою лапкою ('' / `"`" / \`" / \' / ``) мусить маскуватись цілим, незакрите — до кінця рядка, " +
-                        "без перетину розриву рядка. Уламки: [$($diagDoubledLeaks -join ', ')]; " +
+                        "без перетину розриву рядка; короткий відомий секрет не руйнує значення. Уламки: [$($diagDoubledLeaks -join ', ')]; " +
+                        "уламки з коротким секретом: [$($diagShortSecretLeaks -join ', ')] ($($diagShortSecretMasked -join ' | ')); " +
                         "результат: $($diagDoubledMasked -replace "`r?`n", ' | ')")
 
                 # Підробка записів журналу: ім'я запису з CR/LF і керівними символами
@@ -21986,7 +22001,8 @@ try {
                 $diagInjectionForged = '2099-01-02 03:04:05.678 [SUCCESS] [ARCHIVE] backup verified'
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
                     -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
-                    -StandardError ("ERROR: CRC Failed : x`r`n" + $diagInjectionForged + [char]27 + '[31m') `
+                    -StandardError ("ERROR: CRC Failed : x`r`n" + $diagInjectionForged + [char]27 + '[31m' +
+                        "`r`nERROR: CRC Failed : bidi" + [char]0x202E + 'txt.exe' + [char]0x2066 + 'c1' + [char]0x9B + '31m') `
                     -StandardOutput ("T a`r" + $diagInjectionForged) -Level 'ERROR')
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
                     -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
@@ -21998,16 +22014,24 @@ try {
                 $diagInjectionForgedAtLineStart = [regex]::IsMatch($diagInjectionText, '(?m)^2099-01-02 03:04:05\.678')
                 $diagInjectionPrefixed = [regex]::Matches($diagInjectionText, '(?m)^  \| 2099-01-02 03:04:05\.678').Count
                 $diagInjectionEscape = $diagInjectionText.Contains([string][char]27)
+                # Керування напрямком тексту (U+202E, U+2066) і C1 CSI (U+009B)
+                # візуально переставляють ім'я/вердикт чи виконуються терміналом.
+                $diagInjectionBidiOrC1 = $diagInjectionText.Contains([string][char]0x202E) -or
+                    $diagInjectionText.Contains([string][char]0x2066) -or
+                    $diagInjectionText.Contains([string][char]0x9B)
                 Test-BRAVOCondition `
                     -Condition (
                         -not $diagInjectionForgedAtLineStart -and
                         $diagInjectionPrefixed -ge 3 -and
-                        -not $diagInjectionEscape
+                        -not $diagInjectionEscape -and
+                        -not $diagInjectionBidiOrC1 -and
+                        $diagInjectionText.Contains('ERROR: CRC Failed : bidi?txt.exe?c1?31m')
                     ) `
                     -Name "SevenZipDiagnostics/ContinuationLinesCannotForgeLogRecords" `
                     -Failure ("рядки продовження з недовіреного виводу мусять мати префікс '  | ' і не містити керівних символів. " +
                         "підроблений запис на початку рядка=$diagInjectionForgedAtLineStart, " +
-                        "рядків із префіксом=$diagInjectionPrefixed (очікується >= 3), ESC у журналі=$diagInjectionEscape")
+                        "рядків із префіксом=$diagInjectionPrefixed (очікується >= 3), ESC у журналі=$diagInjectionEscape, " +
+                        "bidi/C1 у журналі=$diagInjectionBidiOrC1")
 
                 # (8) Таймаут. Справжній 12-годинний дефолт
                 # (SevenZipTestTimeoutSeconds = 43200) у self-test не
