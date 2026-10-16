@@ -152,6 +152,81 @@ function Set-BRAVOProtectedRuntimeAcl {
     ) -ForegroundColor Green
 }
 
+function Set-BRAVOProtectedDataDirectoryAcl {
+    # F6 (security review): LOGS/TEMP/State лежать під RuntimeRoot (або
+    # %ProgramData%\BRAVO), де успадкований/рекурсивний ACL надає
+    # BUILTIN\Users ReadAndExecute. Журнали за політикою мають бути під
+    # захистом, а BRAVO_WINSCP.lock (FileShare.None) не повинен
+    # відкриватися непривілейованим користувачем на читання (блокування
+    # всіх SFTP-операцій). Тому ці каталоги отримують ЗАХИЩЕНИЙ DACL БЕЗ
+    # ACE для Users: SYSTEM і Administrators — FullControl, обліковий запис
+    # завдань (якщо це не SYSTEM) — Modify. ACL runtime-кореня цією
+    # функцією НЕ змінюється. Патерн повторює Set-BRAVOProtectedRuntimeAcl:
+    # порожній security-descriptor замість Get-Acl (неканонічний DACL /
+    # orphaned SID).
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$ModifySid = @()
+    )
+
+    [void][System.IO.Directory]::CreateDirectory($Path)
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $administrators = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    $system = New-Object Security.Principal.SecurityIdentifier("S-1-5-18")
+    $users = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")
+    $modifySids = @(
+        @($ModifySid) | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and
+            $_ -ne $system.Value -and $_ -ne $administrators.Value -and $_ -ne $users.Value
+        } | Select-Object -Unique
+    )
+
+    $items = @($resolvedPath) + @(
+        Get-ChildItem -LiteralPath $resolvedPath -Force -Recurse -ErrorAction Stop |
+            ForEach-Object { $_.FullName }
+    )
+    foreach ($item in $items) {
+        $isDirectory = [System.IO.Directory]::Exists($item)
+        $itemInheritance = if ($isDirectory) {
+            $inheritance
+        } else {
+            [Security.AccessControl.InheritanceFlags]::None
+        }
+        $acl = if ($isDirectory) {
+            New-Object Security.AccessControl.DirectorySecurity
+        } else {
+            New-Object Security.AccessControl.FileSecurity
+        }
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.SetOwner($administrators)
+        foreach ($fullControlSid in @($administrators, $system)) {
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                $fullControlSid,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                $itemInheritance,
+                $propagation,
+                $allow
+            )))
+        }
+        foreach ($sidText in $modifySids) {
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                (New-Object Security.Principal.SecurityIdentifier($sidText)),
+                [Security.AccessControl.FileSystemRights]::Modify,
+                $itemInheritance,
+                $propagation,
+                $allow
+            )))
+        }
+        Set-Acl -LiteralPath $item -AclObject $acl -ErrorAction Stop
+    }
+
+    Write-Host "Каталог даних захищено ACL (без доступу для Users): $resolvedPath" -ForegroundColor Green
+}
+
 function Enable-BRAVOTaskSchedulerOperationalLog {
     $wevtutil = Join-Path $env:SystemRoot "System32\wevtutil.exe"
     if (-not (Test-Path -LiteralPath $wevtutil -PathType Leaf)) {
@@ -907,6 +982,7 @@ try {
         } else {
             Write-BRAVOTasksInstallStep -Name 'Захист runtime ACL' -Status SKIPPED -Details 'лише перевірка'
         }
+        Write-BRAVOTasksInstallStep -Name 'Захист LOGS/TEMP/State ACL' -Status SKIPPED -Details 'лише перевірка'
         Write-BRAVOTasksInstallStep -Name 'Task Scheduler Operational log' -Status SKIPPED -Details 'лише перевірка'
     } else {
         if ($requireProtectedRuntime) {
@@ -915,6 +991,26 @@ try {
         } else {
             Write-BRAVOTasksInstallStep -Name 'Захист runtime ACL' -Status WARNING -Details 'RequireProtectedRuntime=false: SYSTEM виконуватиме файли без автоматичного hardening ACL.'
         }
+        # F6: LOGS/TEMP/State закриваються від BUILTIN\Users ПІСЛЯ рекурсивного
+        # ACL runtime-кореня (інакше той знову додав би Users ACE дочірнім
+        # елементам). Не залежить від RequireProtectedRuntime: журнали й
+        # lock-файли не мають читатися звичайними користувачами в жодному
+        # режимі. Обліковий запис завдань (не SYSTEM) отримує Modify.
+        $dataDirectoryModifySids = @()
+        if (-not [string]::IsNullOrWhiteSpace([string]$schedulerSettings.RunAsUser)) {
+            $runAsSid = ConvertTo-BRAVOAccountSidValue -AccountName ([string]$schedulerSettings.RunAsUser)
+            if (-not [string]::IsNullOrWhiteSpace([string]$runAsSid)) {
+                $dataDirectoryModifySids += [string]$runAsSid
+            }
+        }
+        foreach ($protectedDataDirectory in @(
+                [string]$global:runtimeLogRoot,
+                (Join-Path $runtimeRoot 'TEMP'),
+                [string]$global:stateRoot
+            )) {
+            Set-BRAVOProtectedDataDirectoryAcl -Path $protectedDataDirectory -ModifySid $dataDirectoryModifySids
+        }
+        Write-BRAVOTasksInstallStep -Name 'Захист LOGS/TEMP/State ACL' -Status OK
         Enable-BRAVOTaskSchedulerOperationalLog
         Write-BRAVOTasksInstallStep -Name 'Task Scheduler Operational log' -Status OK
     }

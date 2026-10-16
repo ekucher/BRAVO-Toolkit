@@ -2,6 +2,22 @@
 
 ## Не випущено (developer)
 
+- **Виправлено (безпека): LOGS, TEMP і State закриті від `BUILTIN\Users`; retention не видаляє все за `ArchivesKeepCount < 1`.**
+  ACL кореня комплекту надає `Users` читання й виконання з успадкуванням, тож
+  `<RuntimeRoot>\LOGS`, `<RuntimeRoot>\TEMP` і `%ProgramData%\BRAVO\State`
+  були читабельні для кожного локального користувача, а `BRAVO_WINSCP.lock`
+  (відкривається з `FileShare.None`) міг бути відкритий на читання й
+  заблокувати всі SFTP-операції. `BRAVO_TASKS_INSTALL.ps1` тепер створює ці
+  каталоги й виставляє захищений DACL без ACE для `Users` (SYSTEM і
+  Administrators — FullControl, обліковий запис завдань, якщо не SYSTEM, —
+  Modify); ACL самого кореня комплекту не змінено.
+  `BRAVO_TASKS_DIAGNOSE.ps1` попереджає (`[WARN]`, без зміни коду виходу), якщо
+  LOGS/TEMP/State читаються `Users`. Виправлено хибний коментар у
+  `BRAVO.Logging` про «той самий захист, що й Credential Manager».
+  `Remove-OldRestoreArchives` за `ArchivesKeepCount < 1` записує `ERROR` і
+  пропускає retention (раніше `0` видаляв усі придатні сесії before/after).
+  Потрібне приймання на реальному сервері (повторне встановлення завдань).
+
 - **Виправлено: вивід WinSCP маскується цілим (#461).**
   `Get-SanitizedWinSCPDiagnostic` (stdout/stderr WinSCP.com для SFTP-передачі,
   синхронізації, health-check і DataRestore) мав власні заміни, які маскували

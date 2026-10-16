@@ -1423,4 +1423,59 @@ try {
         Remove-Item -LiteralPath $legacySweepRootScopeRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+    # B7 / F6 + F8 (security review): статичні (AST) перевірки. Поведінка DACL
+    # перевіряється ізольованою probe на scratch-каталозі (не тут: SetOwner
+    # вимагає elevated-токена, який self-test не гарантований мати).
+    $b7ParseFunction = {
+        param([string]$Text, [string]$Name)
+        $b7Ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+        return $b7Ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+        }, $true)
+    }
+    $b7InstallText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_INSTALL.ps1'), [Text.Encoding]::UTF8)
+    $b7DiagnoseText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1'), [Text.Encoding]::UTF8)
+    $b7DataAcl = & $b7ParseFunction $b7InstallText 'Set-BRAVOProtectedDataDirectoryAcl'
+    $b7RuntimeAcl = & $b7ParseFunction $b7InstallText 'Set-BRAVOProtectedRuntimeAcl'
+    $b7DataAclText = if ($null -ne $b7DataAcl) { $b7DataAcl.Extent.Text } else { '' }
+    $b7RuntimeAclText = if ($null -ne $b7RuntimeAcl) { $b7RuntimeAcl.Extent.Text } else { '' }
+    Test-BRAVOCondition -Condition (
+        $null -ne $b7DataAcl -and
+        $b7DataAclText.Contains('SetAccessRuleProtection($true, $false)') -and
+        $b7DataAclText.Contains('[System.IO.Directory]::CreateDirectory($Path)') -and
+        $b7DataAclText.Contains('FileSystemRights]::FullControl') -and
+        -not $b7DataAclText.Contains('ReadAndExecute') -and
+        -not $b7DataAclText.Contains('Get-Acl')
+    ) -Name 'Scheduler/DataDirectoryAclIsProtectedWithoutUsersAce' `
+        -Failure 'Set-BRAVOProtectedDataDirectoryAcl має створювати каталог, вимикати успадкування й видавати лише FullControl/Modify (без ReadAndExecute/Users ACE, без Get-Acl)'
+    Test-BRAVOCondition -Condition (
+        $b7InstallText -match '(?s)Set-BRAVOProtectedRuntimeAcl -RuntimeRoot \$runtimeRoot.*?runtimeLogRoot.*?Join-Path \$runtimeRoot ''TEMP''.*?\$global:stateRoot.*?Set-BRAVOProtectedDataDirectoryAcl -Path \$protectedDataDirectory'
+    ) -Name 'Scheduler/InstallerAppliesProtectedAclToLogsTempState' `
+        -Failure 'інсталятор має застосувати Set-BRAVOProtectedDataDirectoryAcl до LOGS, TEMP і State ПІСЛЯ Set-BRAVOProtectedRuntimeAcl'
+    Test-BRAVOCondition -Condition (
+        $null -ne $b7RuntimeAcl -and
+        $b7RuntimeAclText.Contains('[Security.AccessControl.FileSystemRights]::ReadAndExecute')
+    ) -Name 'Scheduler/RuntimeRootAclKeepsUsersReadAndExecute' `
+        -Failure 'ACL runtime-кореня (Set-BRAVOProtectedRuntimeAcl) не змінюється: Users ReadAndExecute лишається для читання скриптів операторами'
+    $b7DiagnoseFinding = & $b7ParseFunction $b7DiagnoseText 'Get-BRAVOUsersReadableDataDirectoryFinding'
+    $b7DiagnoseFindingText = if ($null -ne $b7DiagnoseFinding) { $b7DiagnoseFinding.Extent.Text } else { '' }
+    Test-BRAVOCondition -Condition (
+        $null -ne $b7DiagnoseFinding -and
+        $b7DiagnoseFindingText.Contains("'S-1-5-32-545'") -and
+        $b7DiagnoseFindingText.Contains('ReadData') -and
+        $b7DiagnoseText -match '(?s)runtimeLogRoot.*?Join-Path \$scriptRoot ''TEMP''.*?\$global:stateRoot.*?Get-BRAVOUsersReadableDataDirectoryFinding -Path' -and
+        $b7DiagnoseText.Contains('[WARN] $($dataDirectoryEntry.Name)')
+    ) -Name 'Scheduler/DiagnoseReportsUsersReadableLogsTempState' `
+        -Failure 'BRAVO_TASKS_DIAGNOSE.ps1 має попереджати (WARN, без зміни коду виходу), коли LOGS/TEMP/State читаються BUILTIN\Users'
+    $b7Retention = & $b7ParseFunction $maintenanceRepairScriptText 'Remove-OldRestoreArchives'
+    $b7RetentionText = if ($null -ne $b7Retention) { $b7Retention.Extent.Text } else { '' }
+    $b7GuardIndex = $b7RetentionText.IndexOf('if ($KeepCount -lt 1) {', [StringComparison]::Ordinal)
+    $b7FirstDeleteIndex = $b7RetentionText.IndexOf('$groupsToDelete.Count -eq 0', [StringComparison]::Ordinal)
+    Test-BRAVOCondition -Condition (
+        $b7GuardIndex -gt 0 -and $b7FirstDeleteIndex -gt $b7GuardIndex -and
+        $b7RetentionText.Substring($b7GuardIndex, 400).Contains('-Level "ERROR"') -and
+        $b7RetentionText.Substring($b7GuardIndex, 400).Contains('return')
+    ) -Name 'Maintenance/RestoreRetentionSkipsWhenKeepCountBelowOne' `
+        -Failure 'Remove-OldRestoreArchives має за KeepCount < 1 записати ERROR і вийти до будь-якого видалення (інакше видаляються всі придатні сесії)'
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'MaintenanceRepair/Notifications' } }

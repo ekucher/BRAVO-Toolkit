@@ -2299,6 +2299,25 @@ Watchdog стартує лише служби з канонічного керо
 SYSTEM/Administrators); якщо SETUP звітує «State ACL: НЕВІДПОВІДНІСТЬ»,
 виконайте повний запуск SETUP з правами адміністратора.
 
+**ACL каталогів даних (LOGS, TEMP, State).** Корінь комплекту (runtime)
+доступний `Users` лише на читання й виконання (оператори можуть читати
+скрипти). Але `<RuntimeRoot>\LOGS` (журнали), `<RuntimeRoot>\TEMP` і
+`%ProgramData%\BRAVO\State` містять операційні деталі та lock-файли
+(`BRAVO_WINSCP.lock` відкривається з `FileShare.None`: читання його
+стороннім користувачем блокує всі SFTP-операції). Тому
+`BRAVO_TASKS_INSTALL.ps1` створює ці каталоги, якщо їх немає, і виставляє
+захищений DACL: успадкування вимкнено, `SYSTEM` та `Administrators` —
+FullControl, обліковий запис завдань (якщо не SYSTEM) — Modify, **жодного
+ACE для `BUILTIN\Users`**. `BRAVO_TASKS_DIAGNOSE.ps1` друкує `[WARN]`, якщо
+LOGS/TEMP/State читаються `Users`, `Authenticated Users` або `Everyone`
+(код виходу не змінюється); виправлення — повторно запустити встановлення
+завдань з правами адміністратора.
+
+**`maintenanceSettings.Restore.ArchivesKeepCount`.** Значення має бути
+цілим числом не менше 1. `Remove-OldRestoreArchives` за значення менше 1
+записує `ERROR` і пропускає retention (жодна сесія не видаляється),
+замість того щоб видалити всі придатні сесії.
+
 ---
 
 ## Ransomware або масове видалення копій
