@@ -450,6 +450,6 @@
 #     мусить бути придатний до компіляції на підтримуваній платформі).
 # ------------------------------------------------------------
 Test-BRAVOCondition -Condition (
-    $(try { Add-BRAVOWTSApiType; ('BRAVO.Interop.WTSApi' -as [type]) -ne $null } catch { $false })
+    $(try { Add-BRAVOWTSApiType; $null -ne ('BRAVO.Interop.WTSApi' -as [type]) } catch { $false })
 ) -Name 'ClientGate/WTSApiTypeCompiles' `
     -Failure 'Add-BRAVOWTSApiType мусить успішно скомпілювати P/Invoke-тип BRAVO.Interop.WTSApi (wtsapi32.dll WTSEnumerateSessionsW/WTSQuerySessionInformationW/WTSSendMessageW/WTSFreeMemory)'
