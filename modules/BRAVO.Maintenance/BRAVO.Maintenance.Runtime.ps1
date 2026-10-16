@@ -81,7 +81,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # Архітектурний борг: префікс Baza в Trace-контексті — свідомий компроміс
 # проти другої власної реалізації; нейтральний власник SFTP-примітивів —
 # тема окремого рефактора.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations', 'BRAVO.LogSync')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -185,6 +185,8 @@ $script:autoShutdownReachable = $false
 # точці встановлення) з тієї ж причини, що autoShutdownReachable вище:
 # читається під Set-StrictMode навіть на шляхах дуже раннього виходу.
 $script:maintenanceOwnLogUploadAttempted = $false
+# #364: той самий принцип для Invoke-BRAVOMaintenanceRuntimeLogSync.
+$script:maintenanceRuntimeLogSyncAttempted = $false
 
 # ===== ЗАВАНТАЖЕННЯ НАЛАШТУВАНЬ =====
 # P0 Configuration Foundation: BRAVO.config став опційним основним
@@ -4813,6 +4815,113 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
     } catch {
         try {
             Write-Log "Власний лог: вивантаження на SFTP не вдалося: $($_.Exception.Message)" -Level "WARNING"
+        } catch {
+            # Найранніший крах: навіть Write-Log може бути недоступний.
+        }
+    }
+}
+
+# #364: синхронізація ДОЗВОЛЕНИХ runtime-журналів (allowlist, BRAVO.LogSync)
+# на SFTP. Той самий ідемпотентний прапорець-за-функцією, що
+# Invoke-BRAVOMaintenanceOwnLogUpload, але call site лише ОДИН — свідомо
+# НЕ у зовнішньому `finally` (issue #364: "Без виклику з finally після
+# ранніх виходів") — ранній exit означає, що lock і підсумок прогону ще
+# не визначені, а саме це вимога архітектури issue ("лише коли процес
+# володіє operation lock і вже визначено підсумок прогону"). Другорядний/
+# телеметричний ефект: провал — лише WARNING (SuccessWithWarnings(10) за
+# наявний канонічний шлях Write-Log, без нового коду виходу), ніколи не
+# $script:criticalErrorOccurred.
+function Invoke-BRAVOMaintenanceRuntimeLogSync {
+    if ($script:maintenanceRuntimeLogSyncAttempted) { return }
+    $script:maintenanceRuntimeLogSyncAttempted = $true
+
+    try {
+        if (-not (Get-Variable -Name componentSettings -Scope Global -ErrorAction SilentlyContinue) -or
+            -not (Get-Variable -Name storageEffective -Scope Global -ErrorAction SilentlyContinue)) {
+            return
+        }
+        # #364 рішення власника #2: окремий тумблер, дефолт $false для
+        # наявних установок (componentSettings.SFTP.RuntimeLogSyncEnabled).
+        if (-not ([bool]$componentSettings.SFTP.RuntimeLogSyncEnabled -and
+                [bool]$storageEffective.SFTP.Enabled)) {
+            return
+        }
+        # $LOG_DIR — незкваліфіковане присвоєння всередині ОБГОРТКИ
+        # Invoke-BRAVOMaintenance (не $script:/$global:); ця функція вкладена
+        # в ту саму обгортку, тож звичайний (без scope) доступ коректно
+        # резолвиться через lexical scope chain — саме так уже читає
+        # $LOG_FILE/$ARC_DIR решта файлу. Get-Variable -Scope Script/Global
+        # тут НЕ підійшов би: $LOG_DIR не живе в жодному з цих двох scope.
+        if ([string]::IsNullOrWhiteSpace([string]$LOG_DIR) -or
+            -not (Test-Path -LiteralPath $LOG_DIR -PathType Container)) {
+            return
+        }
+        # $stateRoot — $global: (BRAVO.Configuration.Derivation.psm1), той
+        # самий принцип, що componentSettings/storageEffective вище.
+        if (-not (Get-Variable -Name stateRoot -Scope Global -ErrorAction SilentlyContinue) -or
+            [string]::IsNullOrWhiteSpace([string]$stateRoot)) {
+            return
+        }
+
+        $runtimeLogSyncSession = $null
+        try {
+            $runtimeLogSyncSession = Connect-BRAVOOwnLogSftpSession
+            if ($null -eq $runtimeLogSyncSession) { return }
+
+            $runtimeLogSyncMaskSet = Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)
+            # #364 рішення власника #4: сегмент хоста у віддаленому шляху —
+            # computername відповідає за розрізнення серверів парку на
+            # спільному SFTP-акаунті (альтернатива "один акаунт = один
+            # сервер" задокументована в issue, але явний сегмент безпечніший
+            # за мовчазне припущення).
+            $runtimeLogSyncRemoteDirectory = "$([string]$sftpDirectories.RuntimeLogs)/$env:COMPUTERNAME"
+
+            $runtimeLogSyncResult = Invoke-BRAVOLogSyncRun `
+                -LogsDirectory $LOG_DIR `
+                -StateRoot $stateRoot `
+                -RemoteDirectory $runtimeLogSyncRemoteDirectory `
+                -MaskFile { param($localPath) New-BRAVOMaskedLogCopy -Path $localPath -KnownSecret $runtimeLogSyncMaskSet.Secrets } `
+                -RemoveMaskedCopy { param($maskedPath) Remove-BRAVOMaskedLogCopy -Path $maskedPath } `
+                -UploadFile {
+                    param($localPath, $remoteDirectory, $remoteFileName)
+                    try {
+                        Send-BRAVOOwnLogFile `
+                            -Session $runtimeLogSyncSession `
+                            -LocalLogPath $localPath `
+                            -RemoteDirectory $remoteDirectory `
+                            -RemoteFileName $remoteFileName `
+                            -Logger $null
+                        # Send-BRAVOOwnLogFile сама best-effort (WARNING у
+                        # лог, без винятку) — її контракт повернення не
+                        # bool/error-об'єкт, тож тут вважаємо спробу
+                        # успішною, якщо вона не кинула виняток. Реальний
+                        # провал передачі вже потрапив у лог окремим
+                        # WARNING-рядком зсередини Send-BRAVOOwnLogFile.
+                        [pscustomobject]@{ Success = $true; Error = $null }
+                    } catch {
+                        [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
+                    }
+                } `
+                -IsSessionHealthy { [bool]$runtimeLogSyncSession.Opened }
+
+            if ($runtimeLogSyncResult.Failed -gt 0) {
+                Write-Log ("Runtime-логи: $($runtimeLogSyncResult.Failed) з $($runtimeLogSyncResult.Attempted) файл(ів) не вивантажено: " +
+                    ($runtimeLogSyncResult.Errors -join '; ')) -Level "WARNING"
+            } elseif ($runtimeLogSyncResult.Uploaded -gt 0) {
+                Write-Log "Runtime-логи: вивантажено $($runtimeLogSyncResult.Uploaded) файл(ів) -> $runtimeLogSyncRemoteDirectory" -Level "SUCCESS"
+            }
+        } catch {
+            Write-Log "Runtime-логи: синхронізація на SFTP не вдалася: $($_.Exception.Message)" -Level "WARNING"
+        } finally {
+            if ($null -ne $runtimeLogSyncSession) {
+                try { $runtimeLogSyncSession.Dispose() } catch {
+                    # Best-effort закриття сесії.
+                }
+            }
+        }
+    } catch {
+        try {
+            Write-Log "Runtime-логи: синхронізація на SFTP не вдалася: $($_.Exception.Message)" -Level "WARNING"
         } catch {
             # Найранніший крах: навіть Write-Log може бути недоступний.
         }
@@ -11779,6 +11888,13 @@ Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
 # (Invoke-BRAVOMaintenanceOwnLogUpload, R3-1); ідемпотентний прапорець
 # гарантує рівно одну спробу незалежно від того, який спрацював першим.
 Invoke-BRAVOMaintenanceOwnLogUpload
+
+# #364: синхронізація дозволених runtime-журналів (allowlist) — opt-in
+# (componentSettings.SFTP.RuntimeLogSyncEnabled, дефолт $false). Лише ЦЕЙ
+# call site (не у зовнішньому finally — issue #364 вимагає "без виклику
+# з finally після ранніх виходів": ранній exit означає, що lock і
+# підсумок прогону ще не визначені).
+Invoke-BRAVOMaintenanceRuntimeLogSync
 
 # ===== ВИКЛИК ФУНКЦІЇ АВТОМАТИЧНОГО ВИМКНЕННЯ (P2-6: після SFTP-вивантаження) =====
 # Свідомо ПІСЛЯ Send-BRAVOOwnLogFile/Dispose вище — фактичний shutdown.exe

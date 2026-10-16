@@ -23,7 +23,7 @@
 $script:BRAVOSelfTestSuiteCatalog = @(
     'Archive', 'ArchiveDiskSpace', 'BackupScope', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
     'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
-    'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
+    'DiskSpace', 'Governance', 'LogRotation', 'LogSync', 'MaintenanceDiskSpace',
     'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
     'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence', 'ServiceRecovery',
     'SftpCredentialsRequired', 'Status', 'TraceArchive'
@@ -100,6 +100,7 @@ function Get-BRAVOSelfTestSuiteForChangedPath {
         'DataRestore'            = 'DataRestore'
         'DataRestore.MatrixTest' = 'DataRestore'
         'DiskSpace'              = 'DiskSpace'
+        'LogSync'                = 'LogSync'
         'Operations'             = 'Operations'
         'RestoreVerify'          = 'RestoreVerify'
         'Status'                 = 'Status'

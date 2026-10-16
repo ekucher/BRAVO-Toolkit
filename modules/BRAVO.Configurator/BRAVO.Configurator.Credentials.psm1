@@ -61,6 +61,7 @@ function Get-BRAVOConfiguratorCredentialRequirement {
         -ArchiveUploadEnabled ([bool]$storage.SFTP.ArchiveUpload) `
         -MaintenanceLogUploadEnabled ([bool]$componentSettings.SFTP.MaintenanceLogUploadEnabled) `
         -ArchiveLogUploadEnabled ([bool]$componentSettings.SFTP.ArchiveLogUploadEnabled) `
+        -RuntimeLogSyncEnabled ([bool]$componentSettings.SFTP.RuntimeLogSyncEnabled) `
         -ScheduledSftpSyncRequired ([bool]$bazaSync.ScheduledSftpSyncRequired) `
         -BackupMonitoringSftpEnabled ([bool]$backupMonitoring.SFTP.Enabled)
     # SMB: storageEffective.SMB.ArchiveCopy вже є (master AND child) —
