@@ -81,9 +81,11 @@ if ($HealthCheckOnly) {
     $healthScriptPath = Join-Path $bravoScriptDirectory 'BRAVO_HEALTH.ps1'
     if (-not (Test-Path -LiteralPath $healthScriptPath -PathType Leaf)) {
         Write-Error "Не знайдено окремий health-скрипт: $healthScriptPath"
-        # Контракт BRAVO.ExitCodes: 37 = EnvironmentUnavailable (передумова
-        # запуску недоступна), а не голий 1, якого немає в таблиці кодів.
-        exit 37
+        # Контракт BRAVO.ExitCodes: 90 — як у BRAVO_ARCHIV.ps1 / BRAVO_HEALTH.ps1
+        # для компонента комплекту, якого бракує вже ПІСЛЯ guard (раніше —
+        # голий 1 поза таблицею кодів). У режимі Enforce сюди не дійти:
+        # BRAVO_HEALTH.ps1 є в RUNTIME_MANIFEST.json, і guard дає 33.
+        exit 90
     }
     # AUTO -> дочірній BRAVO_HEALTH.ps1 сам виконує ту саму auto-derivation
     # проти свого $PSScriptRoot (той самий комплект); EXPLICIT -> точний
