@@ -264,7 +264,14 @@ function Protect-BRAVOSevenZipDiagnosticText {
     #   квадратично саме на такому ланцюжку (виміряно: 10 тис. символів —
     #   ~2 с, 30 тис. — ~17 с). Будь-який інший символ (`\`, `_`, пробіл,
     #   лапки) ланцюжок розриває, тож звичайні шляхи й вивід 7-Zip (короткі
-    #   імена записів) обидві межі не досягають.
+    #   імена записів) обидві межі не досягають;
+    # - довжина суцільного фрагмента без пробільних символів, що містить
+    #   `://` (-MaximumUrlRunCharacters): той самий шаблон після `://…:`
+    #   сканує `[^@\s]+` до кінця фрагмента на КОЖНОМУ входженні, тож текст
+    #   на кшталт `a://b:a://b:…` без `@` квадратичний навіть із короткими
+    #   ланцюжками схеми (виміряно: ~200 тис. символів одним фрагментом —
+    #   ~150 с). Шаблон не перетинає пробільних символів, тож межа на
+    #   фрагмент обмежує роботу лінійно від загальної довжини.
     # Текст понад будь-яку межу НЕ маскується і НЕ пишеться (fail-closed):
     # викликач отримує Omitted і записує лише позначку з довжиною.
     #
@@ -273,12 +280,19 @@ function Protect-BRAVOSevenZipDiagnosticText {
         [AllowNull()][AllowEmptyString()][string]$Text,
         [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
         [ValidateRange(1000, 50000000)][int]$MaximumMaskedCharacters = 200000,
-        [ValidateRange(64, 100000)][int]$MaximumTokenCharacters = 1024
+        [ValidateRange(64, 100000)][int]$MaximumTokenCharacters = 256,
+        [ValidateRange(64, 100000)][int]$MaximumUrlRunCharacters = 512
     )
 
     $sourceText = [string]$Text
+    # Обидві перевірки прив'язані до ПОЧАТКУ ланцюжка/фрагмента
+    # (негативний lookbehind), тож самі лінійні: без прив'язки спроба з
+    # кожної позиції всередині довгого ланцюжка знову була б квадратичною.
+    $longTokenPattern = '(?i)(?<![a-z0-9+.\-])[a-z0-9+.\-]{' + ($MaximumTokenCharacters + 1) + '}'
+    $longUrlRunPattern = '(?<!\S)(?=\S*://)\S{' + ($MaximumUrlRunCharacters + 1) + '}'
     if ($sourceText.Length -gt $MaximumMaskedCharacters -or
-        [regex]::IsMatch($sourceText, ('(?i)[a-z0-9+.\-]{' + ($MaximumTokenCharacters + 1) + '}'))) {
+        [regex]::IsMatch($sourceText, $longTokenPattern) -or
+        [regex]::IsMatch($sourceText, $longUrlRunPattern)) {
         return [pscustomobject]@{ Text = ''; Omitted = $true; Length = $sourceText.Length }
     }
     return [pscustomobject]@{
@@ -449,7 +463,9 @@ function Write-BRAVOSevenZipFailureDiagnostics {
             $MaximumLength - $recordPrefix.Length - ([math]::Max(0, $emptyLineCount - 1) * $continuationPrefixLength),
             $tailTruncationMarker.Length + 1)
         if ($emptyMessage.Length -gt $emptyBudget) {
-            $emptyMessage = $emptyMessage.Substring(0, $emptyBudget - $tailTruncationMarker.Length) +
+            # TrimEnd: зріз міг розірвати CRLF, а одиночний CR у Join
+            # коштує на символ більше, ніж закладено в резерв.
+            $emptyMessage = $emptyMessage.Substring(0, $emptyBudget - $tailTruncationMarker.Length).TrimEnd("`r") +
                 $tailTruncationMarker
         }
         Write-BRAVOArchiveHelperLog -Logger $Logger -Message ($recordPrefix + (Join-BRAVOSevenZipDiagnosticRecordLines -Text $emptyMessage)) -Level $Level
@@ -470,7 +486,10 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     #
     # Маркер входить У БЮДЖЕТ, а не додається поверх нього: інакше параметр
     # обіцяв би межу, якої запис не тримає. Обрізання тут — уже по
-    # замаскованому тексту, тож уламка секрету воно не створює.
+    # замаскованому тексту, тож уламка секрету воно не створює. TrimStart:
+    # зріз хвоста міг розірвати CRLF, а одиночний LF у
+    # Join-BRAVOSevenZipDiagnosticRecordLines коштує на символ більше, ніж
+    # закладено в $continuationReserve.
     $errorText = $errorLines -join $separator
     $outputText = $outputLines -join $separator
 
@@ -482,7 +501,7 @@ function Write-BRAVOSevenZipFailureDiagnostics {
         # записів): лишаємо його хвіст, stdout не додаємо взагалі — там
         # усе одно лише пер-записний прогрес.
         $diagnosticText = $truncationMarker +
-            $errorText.Substring($errorText.Length - ($payloadBudget - $truncationMarker.Length))
+            $errorText.Substring($errorText.Length - ($payloadBudget - $truncationMarker.Length)).TrimStart("`n")
     } else {
         $outputBudget = $payloadBudget - $errorText.Length
         if ($errorText.Length -gt 0 -and $outputText.Length -gt 0) {
@@ -491,7 +510,7 @@ function Write-BRAVOSevenZipFailureDiagnostics {
         if ($outputText.Length -gt $outputBudget) {
             if ($outputBudget -gt $truncationMarker.Length) {
                 $outputText = $truncationMarker +
-                    $outputText.Substring($outputText.Length - ($outputBudget - $truncationMarker.Length))
+                    $outputText.Substring($outputText.Length - ($outputBudget - $truncationMarker.Length)).TrimStart("`n")
             } else {
                 # Для stdout не лишилось навіть на маркер — пишемо лише stderr.
                 $outputText = ''

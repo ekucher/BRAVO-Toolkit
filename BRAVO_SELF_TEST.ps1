@@ -21306,9 +21306,9 @@ try {
                 $diagLenVerdict = 'LENVERDICT'
                 $diagLenHead = 'LENHEAD'
                 $diagLenStream = @(
-                    ($diagLenHead + ('x' * 300))
-                    1..18 | ForEach-Object { "pad$_" + ('y' * 300) }
-                    ($diagLenVerdict + ('z' * 300))
+                    ($diagLenHead + ('x_' * 150))
+                    1..18 | ForEach-Object { "pad$_" + ('y_' * 150) }
+                    ($diagLenVerdict + ('z_' * 150))
                 ) -join "`r`n"
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
                     -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
@@ -21398,14 +21398,14 @@ try {
                 $diagBudgetStdoutHead = 'OHEADTOKEN'
                 $diagBudgetStdoutTail = 'OTAILTOKEN'
                 $diagBudgetStderr = @(
-                    ($diagBudgetStderrHead + ('e' * 290))
-                    1..8 | ForEach-Object { "estub$_" + ('e' * 290) }
-                    ($diagBudgetStderrTail + ('e' * 290))
+                    ($diagBudgetStderrHead + ('e_' * 145))
+                    1..8 | ForEach-Object { "estub$_" + ('e_' * 145) }
+                    ($diagBudgetStderrTail + ('e_' * 145))
                 ) -join "`r`n"
                 $diagBudgetStdout = @(
-                    ($diagBudgetStdoutHead + ('o' * 300))
-                    1..8 | ForEach-Object { "ostub$_" + ('o' * 300) }
-                    ($diagBudgetStdoutTail + ('o' * 300))
+                    ($diagBudgetStdoutHead + ('o_' * 150))
+                    1..8 | ForEach-Object { "ostub$_" + ('o_' * 150) }
+                    ($diagBudgetStdoutTail + ('o_' * 150))
                 ) -join "`r`n"
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
                     -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
@@ -21449,7 +21449,7 @@ try {
                 $diagFitHead = 'FITHEADTOKEN'
                 $diagFitBudget = 4000 - 'Дiагностика 7-Zip test: '.Length
                 # Текст зі слів (а не один суцільний фрагмент): фрагменти понад межу
-                # маскувальника (1024 символи) пропускаються цілком, а тут перевіряється
+                # маскувальника (256 символів) пропускаються цілком, а тут перевіряється
                 # саме межа символьного бюджету. Довжина — рівно бюджет мінус 2.
                 $diagFitStderr = ($diagFitHead + ' ' + (('f' * 49 + ' ') * 100)).Substring(0, $diagFitBudget - 2)
                 if ($diagFitStderr.EndsWith(' ')) { $diagFitStderr = $diagFitStderr.Substring(0, $diagFitStderr.Length - 1) + 'f' }
@@ -21554,6 +21554,72 @@ try {
                         "довгий фрагмент пропущено=$($diagOversizeText.Contains('stdout 7-Zip (1530 символів) не записано')), " +
                         "позначка причини=$($diagOversizeText.Contains('причина: (1000001 символів) не записано')), " +
                         "сирий вміст: stdout=$($diagOversizeText.Contains('UUUU')), причина=$($diagOversizeText.Contains('TTTT'))")
+
+                # Фрагмент без пробільних символів із `://` довший за межу теж
+                # пропускається: шаблон URL-кредів маскувальника квадратичний на
+                # `a://b:a://b:…` без `@`, і короткі ланцюжки схеми цього не
+                # видають. Під межею URL з обліковими даними маскується як завжди.
+                $diagUrlRunRecords = New-Object System.Collections.Generic.List[string]
+                $diagUrlRunLogger = { param($Message, $Level) $diagUrlRunRecords.Add([string]$Message) }.GetNewClosure()
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagUrlRunLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput (('short ' * 5) + ('a://b:' * 100)) -StandardError 'ERROR: Data Error : urlrun.dat' -Level 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagUrlRunLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput '' -StandardError ('ERROR: sftp://user' + ':' + 'URLRUNSECRET77' + '@host/x failed') -Level 'ERROR')
+                $diagUrlRunText = $diagUrlRunRecords -join "`n"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagUrlRunRecords.Count -eq 2 -and
+                        $diagUrlRunText.Contains('ERROR: Data Error : urlrun.dat') -and
+                        $diagUrlRunText.Contains('stdout 7-Zip (630 символів) не записано') -and
+                        -not $diagUrlRunText.Contains('a://b:a://b:') -and
+                        $diagUrlRunText.Contains('sftp://user' + ':***' + '@host/x') -and
+                        -not $diagUrlRunText.Contains('URLRUNSECRET77')
+                    ) `
+                    -Name "SevenZipDiagnostics/LongUrlRunOmittedWithVisibleMarker" `
+                    -Failure ("фрагмент із '://' понад межу маскування мусить бути пропущений з позначкою довжини, а URL під межею — замаскований. " +
+                        "записів=$($diagUrlRunRecords.Count), позначка=$($diagUrlRunText.Contains('stdout 7-Zip (630 символів) не записано')), " +
+                        "сирий фрагмент=$($diagUrlRunText.Contains('a://b:a://b:')), витік=$($diagUrlRunText.Contains('URLRUNSECRET77'))")
+
+                # Межа 4000 символів тримається, коли зріз розриває CRLF: одиночний
+                # LF (хвіст stderr) чи CR (голова причини) у рядках продовження
+                # коштував би на символ більше за резерв. Зсув довжини проходить
+                # повний рядок, тож одна з ітерацій гарантовано ріже саме CRLF.
+                $diagCutRecords = New-Object System.Collections.Generic.List[string]
+                $diagCutLogger = { param($Message, $Level) $diagCutRecords.Add([string]$Message) }.GetNewClosure()
+                # Довжина зсувається вставкою без суцільних ланцюжків понад межу
+                # маскувальника (256), інакше потік пропускався б цілим.
+                $diagCutShiftFill = 's_' * 110
+                $diagCutStderrBase = @(0..19 | ForEach-Object { 'E{0:D2} {1}' -f $_, ('x' * 196) })
+                $diagCutReasonBase = @(0..19 | ForEach-Object { 'R{0:D2} {1}' -f $_, ('y' * 190) })
+                for ($diagCutShift = 0; $diagCutShift -le 212; $diagCutShift++) {
+                    $diagCutStderr = @($diagCutStderrBase)
+                    $diagCutStderr[19] += $diagCutShiftFill.Substring(0, $diagCutShift)
+                    [void](Write-BRAVOSevenZipFailureDiagnostics `
+                        -Logger $diagCutLogger -Operation 'Дiагностика 7-Zip create' `
+                        -StandardOutput '' -StandardError ($diagCutStderr -join "`r`n") -Level 'ERROR')
+                    $diagCutReason = @($diagCutReasonBase)
+                    $diagCutReason[0] += $diagCutShiftFill.Substring(0, $diagCutShift)
+                    $diagCutReason[19] += ('w_' * 250)
+                    [void](Write-BRAVOSevenZipFailureDiagnostics `
+                        -Logger $diagCutLogger -Operation 'Дiагностика 7-Zip create' `
+                        -StandardOutput '' -StandardError '' -Level 'ERROR' `
+                        -EmptyOutputReason ($diagCutReason -join "`r`n"))
+                }
+                $diagCutMaxLength = ($diagCutRecords | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
+                $diagCutMaxLines = ($diagCutRecords | ForEach-Object { @($_ -split '\r\n|\r|\n').Count } | Measure-Object -Maximum).Maximum
+                $diagCutTruncated = @($diagCutRecords | Where-Object { $_.Contains('(обрізано)') }).Count
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagCutRecords.Count -eq 426 -and
+                        $diagCutTruncated -eq 426 -and
+                        $diagCutMaxLength -le 4000 -and
+                        $diagCutMaxLines -le 20
+                    ) `
+                    -Name "SevenZipDiagnostics/TruncationSplittingCrLfStaysWithinBudget" `
+                    -Failure ("зріз, що розриває CRLF, не повинен виводити запис за межі 4000 символів / 20 рядків. " +
+                        "записів=$($diagCutRecords.Count), обрізаних=$diagCutTruncated, макс. довжина=$diagCutMaxLength, макс. рядків=$diagCutMaxLines")
 
                 # Позначка пропущеного stdout не витісняє stderr: вона отримує лише
                 # залишок бюджету рядків. (а) MaximumLines=1 — єдиний рядок лишається
@@ -21780,15 +21846,16 @@ try {
                 foreach ($diagQuotedShift in @(0, 100, 250, 400)) {
                     $diagQuotedLogFile = Join-Path $b2TestRoot ("diag_quoted_{0}.log" -f [guid]::NewGuid().ToString("N"))
                     [void](Initialize-BRAVOLog -LogFile $diagQuotedLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
-                    $diagQuotedStream = ('w ' * 2000) + 'entry password="' + ('A' * 50) + ' ' + ('L' * (500 + $diagQuotedShift)) +
-                        ' ' + ('M' * 900) + '" tail end'
+                    $diagQuotedStream = ('w ' * 2000) + 'entry password="' + ('A' * 50) + ' ' + ('LLLLLLLLL ' * (50 + $diagQuotedShift / 10)) +
+                        ' ' + ('MMMMMMMMM ' * 90) + '" tail end'
                     [void](Write-BRAVOSevenZipFailureDiagnostics `
                         -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
                         -StandardError $diagQuotedStream -StandardOutput '' -Level 'ERROR')
                     $diagQuotedText = if (Test-Path -LiteralPath $diagQuotedLogFile -PathType Leaf) {
                         [IO.File]::ReadAllText($diagQuotedLogFile)
                     } else { '' }
-                    if ($diagQuotedText.Contains('Дiагностика 7-Zip test: ')) { $diagQuotedRecords++ }
+                    # Не вакуумно: потік справді замаскований, а не пропущений цілим.
+                    if ($diagQuotedText.Contains('Дiагностика 7-Zip test: ') -and $diagQuotedText.Contains('password=***')) { $diagQuotedRecords++ }
                     if ($diagQuotedText.Contains('MMMM') -or $diagQuotedText.Contains('LLLL')) {
                         $diagQuotedLeaks.Add("shift=$diagQuotedShift")
                     }
@@ -24770,6 +24837,12 @@ function Get-BRAVOMaintenanceSummaryResult {
             'Remove-OldRestoreArchives', 'Get-BRAVORestoreArchiveMainFiles', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
             'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            # Приватні залежності діагностики й headline-а збою: модуль
+            # матеріалізує лише перелічені функції, і без них headline
+            # деградував би до «маскування секретів недоступне».
+            'Get-BRAVOSevenZipDiagnosticStreamLines', 'Get-BRAVOSevenZipDiagnosticReasonText',
+            'Protect-BRAVOSevenZipDiagnosticText', 'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
+            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Write-BRAVOSevenZipFailureDiagnostics',
             'Register-BRAVOLegacyBomPasswordFallback',
             'Test-BRAVOSevenZipArchiveSpecificFailure'
         )
@@ -24879,7 +24952,8 @@ function Get-BRAVOMaintenanceSummaryResult {
     Test-BRAVOCondition `
         -Condition (
             $null -ne $retentionIntegrityOutcome -and
-            [regex]::IsMatch([string]$retentionIntegrityOutcome.RetentionLog, $retentionIntegrityWarningPattern)
+            [regex]::IsMatch([string]$retentionIntegrityOutcome.RetentionLog, $retentionIntegrityWarningPattern) -and
+            -not ([string]$retentionIntegrityOutcome.RetentionLog).Contains('маскування секретів недоступне')
         ) `
         -Name "Maintenance/RetentionBrokenOldArchiveStillLogsWarning" `
         -Failure ("retention має і далі писати WARNING про зламаний архів {0}; журнал: {1}" -f $retentionIntegrityBrokenName, $retentionIntegrityOutcome.RetentionLog)
@@ -24914,6 +24988,12 @@ function Get-BRAVOMaintenanceSummaryResult {
             'Remove-OldRestoreArchives', 'Get-BRAVORestoreArchiveMainFiles', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
             'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            # Приватні залежності діагностики й headline-а збою: модуль
+            # матеріалізує лише перелічені функції, і без них headline
+            # деградував би до «маскування секретів недоступне».
+            'Get-BRAVOSevenZipDiagnosticStreamLines', 'Get-BRAVOSevenZipDiagnosticReasonText',
+            'Protect-BRAVOSevenZipDiagnosticText', 'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
+            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Write-BRAVOSevenZipFailureDiagnostics',
             'Register-BRAVOLegacyBomPasswordFallback',
             'Test-BRAVOSevenZipArchiveSpecificFailure',
             # #424 (review): реальний облік статусу кроку очистки
@@ -25245,7 +25325,9 @@ function Get-BRAVOMaintenanceSummaryResult {
             $null -ne $retentionFollowupOld -and
             [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[WARNING\] ' + $retentionFollowupFailedLinePattern + '.*20260101_0100') -and
             [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ' + [regex]::Escape("${retentionFollowupPrefix}_before_20260101_0100.mdz")) -and
-            -not [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[ERROR\]')
+            -not [regex]::IsMatch([string]$retentionFollowupOld.Log, '(?m)^\[ERROR\]') -and
+            # Headline не деградований: модуль містить приватні helper-и маскування.
+            -not ([string]$retentionFollowupOld.Log).Contains('маскування секретів недоступне')
         ) `
         -Name "Maintenance/RetentionOldBrokenArchiveLogsWarningNotError" `
         -Failure ("warning-only шлях (стара сесія, archive-specific збій) має писати рядок 'не пройдена' і 'не зараховано' рівнем WARNING і жодного ERROR; журнал: {0}" -f $retentionFollowupOld.Log)
@@ -26223,6 +26305,12 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
             'Verify-Backup', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
             'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            # Приватні залежності діагностики й headline-а збою: модуль
+            # матеріалізує лише перелічені функції, і без них headline
+            # деградував би до «маскування секретів недоступне».
+            'Get-BRAVOSevenZipDiagnosticStreamLines', 'Get-BRAVOSevenZipDiagnosticReasonText',
+            'Protect-BRAVOSevenZipDiagnosticText', 'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
+            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Write-BRAVOSevenZipFailureDiagnostics',
             'Register-BRAVOLegacyBomPasswordFallback',
             'Test-BRAVOSevenZipArchiveSpecificFailure'
         )
@@ -26495,6 +26583,12 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Condition (-not (($verifyBackupAllLogText -join "`n").Contains($verifyBackupPassword))) `
         -Name "Maintenance/VerifyBackupDoesNotLogPassword" `
         -Failure "пароль архіву не повинен потрапляти в журнал Verify-Backup ні на успіху, ні на збої"
+    # Пароль відсутній саме завдяки маскуванню, а не через деградований
+    # headline: модуль матеріалізує приватні helper-и діагностики.
+    Test-BRAVOCondition `
+        -Condition (-not (($verifyBackupAllLogText -join "`n").Contains('маскування секретів недоступне'))) `
+        -Name "Maintenance/VerifyBackupDiagnosticsNotDegraded" `
+        -Failure "журнал Verify-Backup не повинен містити «маскування секретів недоступне»: модулю бракує приватних helper-ів діагностики 7-Zip"
 
     # Додатковий структурний guard: обидва call sites before/after-архіву
     # проходять саме через повну перевірку (з 7-Zip), а не через голий
