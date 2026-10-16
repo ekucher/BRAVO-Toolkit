@@ -44,12 +44,13 @@ function Get-BRAVOConfiguratorCredentialRequirement {
     # НА $null-значенні) кидає виняток, а не повертає $null. Існуючі
     # виклик-площини/фікстури, побудовані до R3-4 (звужені сценарії, що не
     # стосуються own-log toggles), не зобов'язані передавати це поле —
-    # безпечний дефолт (обидва own-log-тумблери = вимкнено) зберігає їхню
-    # сумісність без потреби оновлювати кожну.
+    # безпечний дефолт (усі три own-log/runtime-log тумблери = вимкнено,
+    # включно з #364 RuntimeLogSyncEnabled) зберігає їхню сумісність без
+    # потреби оновлювати кожну.
     $componentSettings = if ($EffectiveConfig.PSObject.Properties['componentSettings']) {
         $EffectiveConfig.componentSettings
     } else {
-        [pscustomobject]@{ SFTP = [pscustomobject]@{ MaintenanceLogUploadEnabled = $false; ArchiveLogUploadEnabled = $false } }
+        [pscustomobject]@{ SFTP = [pscustomobject]@{ MaintenanceLogUploadEnabled = $false; ArchiveLogUploadEnabled = $false; RuntimeLogSyncEnabled = $false } }
     }
 
     # SFTP: canonical Test-BRAVOSftpCredentialsRequired (R3-4, PR #136
@@ -61,6 +62,7 @@ function Get-BRAVOConfiguratorCredentialRequirement {
         -ArchiveUploadEnabled ([bool]$storage.SFTP.ArchiveUpload) `
         -MaintenanceLogUploadEnabled ([bool]$componentSettings.SFTP.MaintenanceLogUploadEnabled) `
         -ArchiveLogUploadEnabled ([bool]$componentSettings.SFTP.ArchiveLogUploadEnabled) `
+        -RuntimeLogSyncEnabled ([bool]$componentSettings.SFTP.RuntimeLogSyncEnabled) `
         -ScheduledSftpSyncRequired ([bool]$bazaSync.ScheduledSftpSyncRequired) `
         -BackupMonitoringSftpEnabled ([bool]$backupMonitoring.SFTP.Enabled)
     # SMB: storageEffective.SMB.ArchiveCopy вже є (master AND child) —

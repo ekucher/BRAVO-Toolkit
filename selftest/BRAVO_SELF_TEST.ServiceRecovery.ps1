@@ -559,6 +559,7 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
         # запускають, Bis завершується, trace не обробляється; exchangAPI і
         # BRAVO Web проходять повний цикл.
         & $serviceRecoveryCheck 'SRForceRestoreDisabledBravo' 40 @(
+            'CLIENT-CLOSE-GATE'
             $srStopHeader; 'MARKER-WRITE exchangAPI,BravoWeb'
             $srStopWeb; $srStopExchange
             'LOG-INFO Служба BRAVO має тип запуску Disabled - компонент BRAVO пропущено'
@@ -578,6 +579,7 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
         # перезапуску й запускається після реставрації.
         & $serviceRecoveryCheck 'SRForceRestoreExchangeStoppedBeforeRun' 40 @(
             (& $srFailedAtStart 'exchangAPI' '0')
+            'CLIENT-CLOSE-GATE'
             $srStopHeader; 'MARKER-WRITE BRAVO,exchangAPI,BravoWeb'
             $srStopWeb; 'LOG-INFO Служба exchangAPI вже зупинена'; $srStopBravoHead; $srStopBravoTail
             'STEP 3/8 Зупинка служб OK'
@@ -595,6 +597,7 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
         # WARNING і без сповіщення (код визначає лише стаб реставрації).
         & $serviceRecoveryCheck 'SRForceRestoreDisabledBravoStoppedExchange' 40 @(
             'LOG-INFO Служба exchangAPI зупинена й не запускатиметься: вона залежить від служби BRAVO, яка має тип запуску Disabled'
+            'CLIENT-CLOSE-GATE'
             $srStopHeader; 'MARKER-WRITE exchangAPI,BravoWeb'; 'MARKER-NO-RESTART exchangAPI'
             $srStopWeb; 'LOG-INFO Служба exchangAPI вже зупинена'
             'LOG-INFO Служба BRAVO має тип запуску Disabled - компонент BRAVO пропущено'

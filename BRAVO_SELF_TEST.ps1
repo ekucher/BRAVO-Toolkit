@@ -7540,7 +7540,18 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Condition (
             $healthEnvironmentGatingMatch.Success -and
             $healthEnvironmentGatingMatch.Groups['gate'].Value -notmatch 'Send-BRAVOOperationsEvent' -and
-            $healthEnvironmentGatingMatch.Groups['after'].Value -match '(?s)if \(\$null -ne \$operationsReportingSettings\) \{\s*try \{\s*Send-BRAVOOperationsEvent'
+            # #448: дедуплікований call site перейменовано на
+            # Send-BRAVOOperationsEventSafely (null-check і побудова
+            # payload централізовані в BRAVO.Operations.psm1), але зовнішній
+            # if ($null -ne $operationsReportingSettings) НА CALL SITE
+            # лишається навмисно — PowerShell обчислює ВСІ аргументи
+            # (включно з $credentialSettings.Targets) ДО виклику функції,
+            # незалежно від її внутрішньої логіки; без цього зовнішнього
+            # гейту $credentialSettings.Targets обчислювався б і тоді, коли
+            # звітність вимкнена, що під StrictMode ламається в сценаріях,
+            # де $credentialSettings теж не заповнений (знайдено реальним
+            # self-test regression-прогоном).
+            $healthEnvironmentGatingMatch.Groups['after'].Value -match '(?s)if \(\$null -ne \$operationsReportingSettings\) \{\s*try \{\s*Send-BRAVOOperationsEventSafely'
         ) `
         -Name "Health/EnvironmentPreflightOperationsEventNotGatedByNotificationSwitch" `
         -Failure "environment-preflight CRITICAL Operations-подія (BRAVO.Health.Runtime.ps1) має викликатись ЗА МЕЖАМИ гейту (-not `$NoSlack) -and (`$NotificationMode -ne 'none') -- інакше dashboard не бачить CRITICAL-подію лише тому, що Slack/Discord вимкнено на цьому сервері (review finding, PR #225 раунд 3)"
@@ -9501,6 +9512,71 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
         [Text.Encoding]::UTF8
     )
+
+    # --- #448: дедуплікація event-wrapper патерна Archive/Health/
+    # Maintenance -> Send-BRAVOOperationsEventSafely (BRAVO.Operations.psm1).
+    # Call-сайти більше не викликають Send-BRAVOOperationsEvent напряму
+    # (крім самої обгортки й Main-fallback-функції Archive, яка має власні
+    # Get-Command-гейти через Test-Path 'Variable:...' і тому НЕ підпадає
+    # під простий дубльований патерн — її єдина зміна тут лише перейменування
+    # викликаної функції, решта захисних перевірок лишились недоторканими).
+    $operationsSafelyCallPattern = '(?m)^\s*Send-BRAVOOperationsEventSafely\s'
+    $operationsSafelyArchiveCount = [regex]::Matches($archiveScriptText, $operationsSafelyCallPattern).Count
+    $operationsSafelyHealthCount = [regex]::Matches($healthScriptText, $operationsSafelyCallPattern).Count
+    $operationsSafelyMaintenanceCount = [regex]::Matches($maintenanceScriptText, $operationsSafelyCallPattern).Count
+    $operationsSafelyTotalCount = $operationsSafelyArchiveCount + $operationsSafelyHealthCount + $operationsSafelyMaintenanceCount
+    Test-BRAVOCondition `
+        -Condition (
+            $operationsSafelyArchiveCount -eq 4 -and
+            $operationsSafelyHealthCount -eq 3 -and
+            $operationsSafelyMaintenanceCount -eq 1 -and
+            $operationsSafelyTotalCount -eq 8 -and
+            # #448 (real regression, fixed): зовнішній null-check НА CALL
+            # SITE лишається навмисно, попри дедуплікацію — PowerShell
+            # обчислює ВСІ аргументи викову (включно з
+            # $credentialSettings.Targets) ДО входу в
+            # Send-BRAVOOperationsEventSafely, тож внутрішній null-check
+            # обгортки НЕ рятує від обчислення аргументів, коли звітність
+            # вимкнена. 3 простих сайти Archive (з 4; четвертий — Main-
+            # fallback із власним Test-Path-гейтом, інша форма) і всі 3
+            # Health-сайти мають зберегти літеральний зовнішній if.
+            ([regex]::Matches($archiveScriptText, [regex]::Escape('if ($null -ne $operationsReportingSettings) {'))).Count -eq 3 -and
+            ([regex]::Matches($healthScriptText, [regex]::Escape('if ($null -ne $operationsReportingSettings) {'))).Count -eq 3
+        ) `
+        -Name 'OperationsHooks/NotificationCallSiteCountMatchesRecord' `
+        -Failure ("кількість викликів Send-BRAVOOperationsEventSafely мусить лишатися Archive=4/Health=3/" +
+            "Maintenance=1 (разом 8), і 3 простих сайти Archive + усі 3 Health-сайти мусять зберігати " +
+            "зовнішній 'if (`$null -ne `$operationsReportingSettings) {' (аргументи викову обчислюються " +
+            "ДО входу в обгортку — внутрішній null-check сам не рятує); " +
+            "фактично Archive=$operationsSafelyArchiveCount, Health=$operationsSafelyHealthCount, " +
+            "Maintenance=$operationsSafelyMaintenanceCount, разом=$operationsSafelyTotalCount")
+
+    & {
+        param([string]$OperationsModuleText)
+        $operationsSafelyModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $OperationsModuleText `
+            -FunctionNames @('Send-BRAVOOperationsEventSafely')
+
+        # 1. Без OperationsReportingSettings — тихо не робить нічого (не
+        # кидає, не викликає Send-BRAVOOperationsEvent, бо його взагалі
+        # немає в цьому ізольованому модулі — CommandNotFoundException тут
+        # був би доказом, що null-check не спрацював РАНІШЕ за сам виклик).
+        $safelyNullResult = $null
+        $safelyNullThrew = $false
+        try {
+            $safelyNullResult = & $operationsSafelyModule {
+                Send-BRAVOOperationsEventSafely `
+                    -OperationsReportingSettings $null `
+                    -CredentialTargets @{} -InstitutionCode 'INST' `
+                    -Category 'backup' -Severity 'CRITICAL' -Message 'тест'
+            }
+        } catch { $safelyNullThrew = $true }
+        Test-BRAVOCondition `
+            -Condition (-not $safelyNullThrew -and $null -eq $safelyNullResult) `
+            -Name 'Operations/SendEventSafelyNoOpsOnNullSettingsWithoutRealSendEvent' `
+            -Failure "#448: Send-BRAVOOperationsEventSafely з OperationsReportingSettings=`$null має тихо повернутись БЕЗ спроби викликати Send-BRAVOOperationsEvent (якого немає в цьому ізольованому модулі); факт: threw=$safelyNullThrew result=$safelyNullResult"
+    } (Get-Content -Raw (Join-Path $root "modules\BRAVO.Operations\BRAVO.Operations.psm1"))
+
     $compatibilityScriptText = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"),
         [Text.Encoding]::UTF8
@@ -15760,6 +15836,16 @@ function Send-BRAVOMaintenanceOperationsEvent { param($ExitCode, $ElapsedTime) }
 function Write-BRAVOTaskExecutionState { param($TaskName) }
 function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
 function Invoke-BRAVOMaintenanceOwnLogUpload { Add-ProbeEvent 'OWNLOG-UPLOAD' }
+# #316: той самий принцип, що Invoke-BRAVOMaintenanceOwnLogUpload вище --
+# пробу цікавить порядок кроків (чи викликається ДО "Зупинка служб" і коли
+# $shouldRestore=$true), не реальна WTS-логіка закриття BIS; реальна функція
+# (Get-BRAVOClientGateInventory/Get-BRAVOWTSSessionInfo) тут НЕ викликається.
+function Invoke-BRAVOMaintenanceClientCloseStep { Add-ProbeEvent 'CLIENT-CLOSE-GATE'; return $true }
+# #364: той самий принцип, що Invoke-BRAVOMaintenanceOwnLogUpload вище —
+# пробу цікавить порядок кроків, не реальна SFTP-синхронізація; реальна
+# функція (ідемпотентний прапорець $script:maintenanceRuntimeLogSyncAttempted)
+# тут НЕ викликається взагалі, тож і прапорець не потребує власного seed.
+function Invoke-BRAVOMaintenanceRuntimeLogSync { Add-ProbeEvent 'RUNTIMELOG-SYNC' }
 function Wait-BRAVOManualExit { param([switch]$NoPause) Add-ProbeEvent ("MANUAL-EXIT NoPause={0}" -f [bool]$NoPause) }
 '@
             $maintenanceOrchestrationSeed = @'
@@ -15937,7 +16023,9 @@ try {
         }
     }
     # Цикл служб і облік відновлення служб (#314) винесено в dot-source
-    # файли: їхні функції теж справжні.
+    # файли: їхні функції теж справжні. Invoke-BRAVOMaintenanceClientCloseStep
+    # (#316, BRAVO.Maintenance.ClientGate.ps1) стубується вище -- реальні
+    # WTS-функції цього файлу пробі не потрібні.
     foreach ($probeServiceFileName in @('BRAVO.Maintenance.ServiceCycle.ps1', 'BRAVO.Maintenance.ServiceRecovery.ps1')) {
         $probeServiceCycleText = [IO.File]::ReadAllText(
             (Join-Path $RepositoryRoot ('modules\BRAVO.Maintenance\' + $probeServiceFileName)), [Text.Encoding]::UTF8)
@@ -31480,6 +31568,13 @@ function Write-BRAVOLog {
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/SftpCredentialsRequired' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'LogSync') {
+        Enter-BRAVOSelfTestSuite -Name 'LogSync'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/LogSync') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.LogSync.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/LogSync' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'MaintenanceOwnLog') {
         Enter-BRAVOSelfTestSuite -Name 'MaintenanceOwnLog'
         if (Enter-BRAVOSelfTestSection -Name 'Suite/MaintenanceOwnLog') { try {
@@ -31492,6 +31587,12 @@ function Write-BRAVOLog {
         if (Enter-BRAVOSelfTestSection -Name 'Suite/BazaSync') { try {
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaSync.ps1')
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/BazaSync' } }
+    }
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ClientGate') {
+        Enter-BRAVOSelfTestSuite -Name 'ClientGate'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/ClientGate') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ClientGate.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/ClientGate' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'Operations') {
@@ -35274,7 +35375,7 @@ foreach ($case in $cases) {
 
     # M3. Таблиця модулів закріплена: ПОВНИЙ перелік каталогів modules\BRAVO.* і
     # відповідний suite для кожного. Новий модуль ламає тест і вимагає свідомого
-    # рішення про мапу (станом на базу гілки: 23 модулі, 10 з suite).
+    # рішення про мапу (станом на #364: 24 модулі, 11 з suite — додано LogSync).
     $suiteMapModuleSuites = @{
         'Archive'                = 'Archive'
         'BazaSync'               = 'BazaSync'
@@ -35283,6 +35384,7 @@ foreach ($case in $cases) {
         'DataRestore'            = 'DataRestore'
         'DataRestore.MatrixTest' = 'DataRestore'
         'DiskSpace'              = 'DiskSpace'
+        'LogSync'                = 'LogSync'
         'Operations'             = 'Operations'
         'RestoreVerify'          = 'RestoreVerify'
         'Status'                 = 'Status'

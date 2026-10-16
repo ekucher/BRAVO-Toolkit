@@ -660,6 +660,7 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'componentSettings.SFTP.ArchiveUpload' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SFTP.Enabled' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SFTP.MaintenanceLogUploadEnabled' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.SFTP.RuntimeLogSyncEnabled' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SMB.ArchiveCopy' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SMB.Enabled' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.Synchronization.BAZA_APP_LOCAL' = @{ Class = 'ALLOW_SITE' }
@@ -798,6 +799,14 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'maintenanceSettings.RangeIdMonitoring.ThresholdPercent' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Restore.ArchivesKeepCount' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Restore.BootRestoreMode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:None,HoldServices' }
+    # #316: закриття клієнтів BIS перед реставрацією. ALLOW_SITE (як
+    # IntegritySmallFileThresholdBytes): BRAVO_CONFIG_LOADER.ps1 сам
+    # приводить некоректні значення до безпечних дефолтів; WaitMinutes=0 —
+    # валідний явний вибір "закривати без очікування", не помилка.
+    'maintenanceSettings.Restore.ClientClose.PollSeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.ClientClose.ProcessNames' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.ClientClose.ReminderMinutes' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.ClientClose.WaitMinutes' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Restore.Day' = @{ Class = 'ALLOW_SITE' }
     # Поріг «малого» файлу самоперевірки реставрації. ALLOW_SITE (як
     # RangeIdMonitoring.ThresholdPercent): рантайм сам приводить некоректне
@@ -943,6 +952,7 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'sftpDirectories.MaintenanceLog' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.Manifest' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.MODEL' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.RuntimeLogs' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.Trace' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.TraceLogs' = @{ Class = 'ALLOW_SITE' }
     'sftpHostKey' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'NonEmptyString' }

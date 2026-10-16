@@ -772,7 +772,7 @@ function Send-ToolIntegrityAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -885,7 +885,7 @@ function Send-BRAVOArchiveFreeSpaceAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -5175,7 +5175,7 @@ function Send-BAZAIncompatibleNameAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -9685,7 +9685,7 @@ function Send-BRAVOArchiveFinalOperationsEvent {
         $finalOperationsSettings = $operationsReportingSettings
         if ($null -eq $finalOperationsSettings) { return }
         if (-not (Test-Path -LiteralPath 'Variable:credentialSettings')) { return }
-        if (-not (Get-Command -Name 'Send-BRAVOOperationsEvent' -ErrorAction SilentlyContinue)) { return }
+        if (-not (Get-Command -Name 'Send-BRAVOOperationsEventSafely' -ErrorAction SilentlyContinue)) { return }
         if (-not (Get-Command -Name 'Get-BRAVOExitCodeSeverity' -ErrorAction SilentlyContinue)) { return }
 
         $finalExitCode = [int]$script:processExitCode
@@ -9710,7 +9710,7 @@ function Send-BRAVOArchiveFinalOperationsEvent {
         $finalDetails['exitCode'] = $finalExitCode
         $finalDetails['exitCodeName'] = [string]$finalExitCodeName
 
-        Send-BRAVOOperationsEvent `
+        Send-BRAVOOperationsEventSafely `
             -OperationsReportingSettings $finalOperationsSettings `
             -CredentialTargets $credentialSettings.Targets `
             -InstitutionCode $finalInstitutionCode `
