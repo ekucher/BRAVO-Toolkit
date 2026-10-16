@@ -7190,6 +7190,38 @@ function Get-BRAVORestoreArchiveMainFiles {
         # шаблоном (наявний каталог «відсутній» чи збіг із сусіднім).
         # Шаблон імені файлу лишається в -Filter.
         if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) {
+            # #428: сам Test-Path вище міг мовчки повернути $false (без
+            # жодної non-terminating помилки) навіть тоді, коли $Path
+            # насправді недоступний через ШИРШУ проблему доступу до
+            # БАТЬКІВСЬКОГО каталогу (відпав мережевий диск, зникла точка
+            # монтування, ACL на рівні батька) — у такому разі цільовий
+            # каталог архівів лише ВИГЛЯДАЄ відсутнім. Відрізняємо
+            # легітимну відсутність від цього, перевіряючи батьківський
+            # каталог окремо:
+            #   - батьківський каталог існує й доступний -> цільовий
+            #     підкаталог справді відсутній -> легітимно порожній
+            #     перелік (Missing), як і раніше;
+            #   - батьківський каталог ТЕЖ не існує чи недоступний (сам
+            #     Test-Path над ним кидає виняток чи повертає $false) ->
+            #     ознака ширшої проблеми доступу на рівень вище, а не
+            #     свідомої відсутності каталогу архівів -> fail-closed
+            #     (Failed), так само, як збій самого переліку чи
+            #     перевірки $Path (catch нижче).
+            $parentPath = Split-Path -Path $Path -Parent
+            $parentExists = $true
+            if (-not [string]::IsNullOrEmpty($parentPath)) {
+                try {
+                    $parentExists = [bool](Test-Path -LiteralPath $parentPath -ErrorAction Stop)
+                } catch {
+                    $parentExists = $false
+                }
+            }
+            if (-not $parentExists) {
+                Write-Log "Каталог архівів реставрації $Path виглядає відсутнім, але й батьківський каталог $parentPath недоступний або не існує — це ознака ширшої проблеми доступу, а не свідомої відсутності каталогу архівів. Перевірку придатності й retention сесій реставрації в цьому циклі пропущено, жодну сесію не видалено." -Level "ERROR"
+                $script:criticalErrorOccurred = $true
+                $script:restoreIntegrityFailed = $true
+                return @{ Files = @(); Failed = $true; Missing = $false }
+            }
             return @{ Files = @(); Failed = $false; Missing = $true }
         }
         foreach ($archivePattern in @("${ArchivePrefix}_before_*.mdz", "${ArchivePrefix}_after_*.mdz")) {
@@ -7206,6 +7238,14 @@ function Get-BRAVORestoreArchiveMainFiles {
 
 # Функція видалення старих архівів реставрації (за кількістю версій)
 function Remove-OldRestoreArchives {
+    # #428: advanced-функція — раніше невідомий/помилково написаний параметр
+    # (напр. друкарська помилка в імені) мовчки потрапляв у $args замість
+    # явної помилки виклику. Усі виклики в репозиторії (Main — іменовані
+    # параметри, self-test — іменовані параметри чи splatting через
+    # @retentionArgs) сумісні без змін; Windows PowerShell 5.1 підтримує
+    # advanced-функції з таким набором параметрів (string/int/switch/
+    # [AllowNull()][hashtable]) без додаткових застережень.
+    [CmdletBinding()]
     param(
         [string]$Path,
         [string]$ArchivePrefix,
