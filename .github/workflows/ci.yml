@@ -14,6 +14,21 @@ on:
   pull_request: {}
   workflow_dispatch:
 
+# Мінімальні права за замовчуванням: жоден крок не пише в репозиторій
+# (checkout, upload-artifact і gitleaks потребують лише читання;
+# upload-artifact іде через окремий runtime-токен, не GITHUB_TOKEN).
+# secret-scan нижче розширює права на рівні задачі.
+permissions:
+  contents: read
+
+# Застарілі прогони PR скасовуються новим пушем у ту саму гілку (кожен
+# повний прогін ~19 хв). Скасування ЛИШЕ для pull_request: push у
+# developer/master і workflow_dispatch ніколи не скасовуються, щоб не
+# губити результат на інтеграційних гілках.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Check names are split by event on purpose (5.1.0 promotion incident,
 # 2026-08-20): master branch protection matches required checks by NAME,
 # and during a stable promotion the same head SHA carries BOTH a green
@@ -29,6 +44,7 @@ on:
 jobs:
   static-checks:
     name: ${{ github.event_name == 'pull_request' && 'Parser / BOM / JSON' || 'Parser / BOM / JSON (push)' }}
+    timeout-minutes: 20
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,6 +155,8 @@ jobs:
           .\BRAVO_RUNTIME_GUARD.ps1
           if ($LASTEXITCODE -ne 0) {
               Write-Host "::error::RUNTIME_MANIFEST.json is out of date - run ci\Update-BRAVORuntimeManifest.ps1 -Apply"
+              # Typical cause: LF-only working-tree file vs eol=crlf. Show the diagnostics.
+              git ls-files --eol -- '*.ps1' '*.psm1' '*.psd1' 'VERSION.json' 'Tools/TOOLS_MANIFEST.json' | Where-Object { $_ -match 'w/(lf|mixed)' }
               exit 1
           }
 
@@ -207,6 +225,7 @@ jobs:
 
   psscriptanalyzer:
     name: ${{ github.event_name == 'pull_request' && 'PSScriptAnalyzer' || 'PSScriptAnalyzer (push)' }}
+    timeout-minutes: 20
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -240,6 +259,7 @@ jobs:
 
   self-test:
     name: ${{ github.event_name == 'pull_request' && 'BRAVO_SELF_TEST.ps1' || 'BRAVO_SELF_TEST.ps1 (push)' }}
+    timeout-minutes: 45
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -254,8 +274,10 @@ jobs:
               exit 1
           }
 
-      - name: Лог self-test (артефакт при падінні)
-        if: failure()
+      # always(): лог (з таймінгами етапів) потрібен і для зеленого
+      # прогону - це єдине джерело тренду тривалості self-test.
+      - name: Лог self-test (артефакт завжди)
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: self-test-log
@@ -264,6 +286,7 @@ jobs:
 
   datarestore-matrix-test:
     name: ${{ github.event_name == 'pull_request' && 'BRAVO_DATA_RESTORE_MATRIX_TEST.ps1' || 'BRAVO_DATA_RESTORE_MATRIX_TEST.ps1 (push)' }}
+    timeout-minutes: 20
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -307,6 +330,7 @@ jobs:
 
   secret-scan:
     name: ${{ github.event_name == 'pull_request' && 'Secret scanning (gitleaks)' || 'Secret scanning (gitleaks) (push)' }}
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     # gitleaks-action на pull_request-подіях звертається до GitHub API за
     # списком комітів PR (GET /pulls/{n}/commits) — без явного дозволу
