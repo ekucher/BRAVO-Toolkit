@@ -28193,6 +28193,89 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         ) `
         -Name "Secrets/WinSCPBusyMessageKeepsDiagnostics" `
         -Failure "санітизація не повинна прибирати корисну діагностику (PID, назву операції): $busyNormalMessage"
+
+    # #461: Get-SanitizedWinSCPDiagnostic маскує ЛИШЕ канонічно. Власні
+    # regex-заміни маскували значення в лапках чи з екрануванням лише до
+    # пробілу, а вставлене ними `***` ламало повторне маскування у
+    # Write-BRAVOLog (канонічний шаблон бачив значенням `***`). Тому кожен
+    # результат перевіряється і сам, і після канонічного
+    # Protect-BRAVOLogSecret — саме так його пише Write-BRAVOLog.
+    $winScpMaskUser = 'bravo'
+    $winScpMaskCases = @(
+        "open sftp://u -password='AA WSLEAK1' x",
+        'open sftp://u -password="AA"" WSLEAK2" x',
+        'open sftp://u -password="AA\" WSLEAK3" x',
+        'open sftp://u -password=AA` WSLEAK4 x',
+        'Error: password=WSLEAK5 token=WSLEAK6',
+        ('open ftps://{0}:{1}@nas.local/' -f $winScpMaskUser, ('WSLEAK' + '7')),
+        ("line1`r`n`r`nsftp://{0}:{1}@nas.local/ ok" -f $winScpMaskUser, ('WSLEAK' + '8')),
+        # #463: значення в лапках, перенесене на наступний рядок, і URL-пароль
+        # із порожнім логіном.
+        ('open sftp://u -password="AA{0}{1}" x' -f "`r`n", ('WSLEAK' + '9')),
+        ("open sftp://u -password='AA{0}{1}' x" -f "`n", ('WSLEAK' + '10')),
+        ('open sftp://:{0}@nas.local/' -f ('WSLEAK' + '11'))
+    )
+    $winScpLoggingModule = Get-Module -Name 'BRAVO.Logging' -All | Select-Object -First 1
+    $winScpMaskLeaks = New-Object System.Collections.Generic.List[string]
+    foreach ($winScpMaskCase in $winScpMaskCases) {
+        $winScpMasked = [string](Get-SanitizedWinSCPDiagnostic -Text $winScpMaskCase)
+        $winScpRelogged = [string](& $winScpLoggingModule { param($Text) Protect-BRAVOLogSecret -Text $Text } $winScpMasked)
+        if ($winScpMasked.Contains('WSLEAK') -or $winScpRelogged.Contains('WSLEAK') -or -not $winScpMasked.Contains('***')) {
+            $winScpMaskLeaks.Add("$winScpMaskCase -> $winScpMasked -> $winScpRelogged")
+        }
+    }
+    # Межа рядків лишається (рядки відкидаються цілими ДО маскування), а
+    # текст понад межі вартості маскування та недоступне маскування дають
+    # позначку без вмісту — сирий вивід не повертається (fail-closed).
+    $winScpLineLimited = [string](Get-SanitizedWinSCPDiagnostic -MaximumLines 3 -Text (
+        (1..100 | ForEach-Object { "row $_ token=WSLEAKROW$_" }) -join "`r`n"))
+    $winScpOversized = [string](Get-SanitizedWinSCPDiagnostic -Text ('Error: password=WSLEAKBIG ' + ('U' * 300)))
+    # #463: ключ у рядку, що відкидається межею рядків, а хвіст значення в
+    # лапках — у рядках, що лишаються: маскування до зрізу не лишає хвоста.
+    $winScpCapSplit = [string](Get-SanitizedWinSCPDiagnostic -MaximumLines 3 -Text (
+        ('open -password="AA{0}{1}{0}{2}" tail' -f "`r`n", ((1..10 | ForEach-Object { "pad $_" }) -join "`r`n"), ('WSLEAK' + 'CAP'))))
+    # #463: тисячі допустимих (до межі ланцюжка) імен у виводі синхронізації
+    # не роблять маскування квадратичним (колишній шаблон URL — десятки секунд).
+    $winScpManyRuns = ((1..12000 | ForEach-Object { 'Uploading ' + ('a' * 250) + '.7z' }) -join "`r`n")
+    $winScpManyRunsWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $winScpManyRunsResult = [string](Get-SanitizedWinSCPDiagnostic -Text $winScpManyRuns)
+    $winScpManyRunsWatch.Stop()
+    # #463: мільйони коротких збігів (` -px` поспіль) — позначка без вмісту,
+    # а не секунди й сотні МБ; один довгий рядок без розривів обрізається.
+    $winScpManySpans = [string](Get-SanitizedWinSCPDiagnostic -Text (' -px' * 200000))
+    $winScpLongLine = [string](Get-SanitizedWinSCPDiagnostic -Text ('Error: password=' + 'WSLEAK' + 'LL ' + ('x ' * 20000)))
+    $winScpCanonicalEmptyUser = [string](& $winScpLoggingModule { param($Text) Protect-BRAVOLogSecret -Text $Text } (
+        'sync sftp://:{0}@nas.local/' -f ('WSLEAK' + 'EU')))
+    $winScpFailClosed = [string](& (Get-Module -Name 'BRAVO.ArchiveRuntime') {
+        function Protect-BRAVOLogSecretBounded { throw 'simulated canonical masking failure' }
+        Get-SanitizedWinSCPDiagnostic -Text ('Error: password=' + 'WSLEAK' + 'FC')
+    })
+    Test-BRAVOCondition `
+        -Condition (
+            $winScpMaskLeaks.Count -eq 0 -and
+            $winScpLineLimited.Contains('row 100 token=***') -and
+            $winScpLineLimited.Contains('97') -and
+            -not $winScpLineLimited.Contains('WSLEAKROW') -and
+            -not $winScpCapSplit.Contains('WSLEAKCAP') -and
+            $winScpCanonicalEmptyUser -eq 'sync sftp://:***@nas.local/' -and
+            $winScpManyRunsWatch.Elapsed.TotalSeconds -lt 10 -and
+            $winScpManySpans.Contains('не записано') -and
+            -not $winScpManySpans.Contains('-px') -and
+            $winScpLongLine.Contains('Error: password=*** x') -and
+            $winScpLongLine.Contains('обрiзано') -and
+            $winScpLongLine.Length -lt 2200 -and
+            -not $winScpLongLine.Contains('WSLEAKLL') -and
+            $winScpManyRunsResult.Contains('.7z') -and
+            $winScpCapSplit.Contains('***') -and
+            $winScpOversized.Contains('не записано') -and
+            -not $winScpOversized.Contains('WSLEAKBIG') -and
+            $winScpFailClosed.Contains('не записано') -and
+            -not $winScpFailClosed.Contains('WSLEAKFC')
+        ) `
+        -Name "Secrets/WinSCPDiagnosticMaskedCanonically" `
+        -Failure ("Get-SanitizedWinSCPDiagnostic має маскувати канонічно й fail-closed (#461). " +
+            "Уламки: [$($winScpMaskLeaks -join ' || ')]; межа рядків: $($winScpLineLimited -replace "`r?`n", ' | '); " +
+            "багато ланцюжків: $([int]$winScpManyRunsWatch.Elapsed.TotalSeconds) с; багато збігів: $winScpManySpans; довгий рядок: $($winScpLongLine.Length) символiв; зріз після ключа: $($winScpCapSplit -replace "`r?`n", ' | '); понад межі: $winScpOversized; без маскування: $winScpFailClosed")
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains('BRAVO.ArchiveHelpers') -and
