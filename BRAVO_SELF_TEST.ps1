@@ -5498,6 +5498,30 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     $legacyHealthyCopyText = "Остання справна " + "копія"
     Test-BRAVOCondition -Condition (-not ($notifySuccess + $notifyWarning).Contains($legacyHealthyCopyText)) -Name "Notifications/HealthDoesNotUseLastHealthyCopyWording" -Failure "operator notification не має використовувати legacy health wording"
     Test-BRAVOCondition -Condition ($notifySuccess -notmatch "\.mdz") -Name "Notifications/HealthSuccessDoesNotExposeArchiveFilename" -Failure "Health SUCCESS не має показувати archive filename"
+    # #413 (п.7): Health/EmptySourceWarningNotifiesAsWarning заміняє (stub)
+    # New-BRAVOOperatorNotificationMessage і не перевіряє справжній текст
+    # -ActionText. Цей тест викликає РЕАЛЬНУ (не заглушену) функцію модуля
+    # Notifications з тим самим -ActionText, що й Invoke-BRAVOHealth для
+    # порожнього каталогу джерела, що раніше мав дані (New-SlackSuccessMessage),
+    # і перевіряє справжній рендер "Потрібна дія: ...".
+    $notifyEmptySourceWarning = New-BRAVOOperatorNotificationMessage `
+        -Severity WARNING `
+        -Operation "BRAVO BACKUP — СПРАВНО, Є ПОПЕРЕДЖЕННЯ" `
+        -ActionText "перевірити порожній каталог джерела або підтвердити новий baseline (BRAVO_SETUP.ps1 -Action Test -ValidateOnly -ConfirmDiscoveryBaseline)" `
+        -ReasonLines @(":warning: Каталог джерела порожній, хоча раніше мав дані (не копіюється): BLOG") `
+        -InstitutionName "TEST-COMPANY" `
+        -InstitutionCode "1234567890" `
+        -HostInformation $notifyHostOff `
+        -ResultLines @(":information_source: Каталог джерела порожній (не копіюється): BRAVOEXCH") `
+        -Timestamp ([datetime]"2026-08-09T14:34:51") `
+        -ProductName "BRAVO Archive" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild"
+    Test-BRAVOCondition -Condition (
+        $notifyEmptySourceWarning.Contains("Потрібна дія: перевірити порожній каталог джерела або підтвердити новий baseline (BRAVO_SETUP.ps1 -Action Test -ValidateOnly -ConfirmDiscoveryBaseline)") -and
+        $notifyEmptySourceWarning.Contains(":warning: BRAVO BACKUP — СПРАВНО, Є ПОПЕРЕДЖЕННЯ")
+    ) -Name "Notifications/EmptySourceWarningActionTextRendersReal" `
+        -Failure "справжній (не заглушений) New-BRAVOOperatorNotificationMessage має рендерити -ActionText порожнього каталогу джерела з префіксом 'Потрібна дія: ': '$notifyEmptySourceWarning'"
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Health' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Notifications' -DependsOn 'Root/Health') { try {
 
