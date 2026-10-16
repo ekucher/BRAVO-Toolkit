@@ -6575,8 +6575,13 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
         $matrixBad = New-Object System.Collections.Generic.List[string]
         foreach ($case in $matrix) {
             $r = & $gateRun $case.S $case.V
+            # Виняток самого harness-у (не вердикт гейта) — завжди розбіжність,
+            # навіть у випадках, де очікується FAIL: інакше зламаний фікстур
+            # маскувався б під «правильний» провал.
+            $harnessExceptions = @($r.Failures | Where-Object { [string]$_ -like 'GATE-HARNESS-EXCEPTION*' })
             $got = if (@($r.Failures).Count -gt 0) { 'FAIL' } elseif ($r.Warnings -gt 0) { 'PASS WITH WARNING' } else { 'PASS' }
-            if ($got -ne $case.E) { [void]$matrixBad.Add(('{0}/{1}: очікувано {2}, отримано {3}' -f $case.S, $case.V, $case.E, $got)) }
+            if ($harnessExceptions.Count -gt 0) { [void]$matrixBad.Add(('{0}/{1}: виняток harness: {2}' -f $case.S, $case.V, ($harnessExceptions -join '; '))) }
+            elseif ($got -ne $case.E) { [void]$matrixBad.Add(('{0}/{1}: очікувано {2}, отримано {3}' -f $case.S, $case.V, $case.E, $got)) }
         }
         $rbMatrix = @(
             @{ C = 0; E = 'PASS' }, @{ C = 10; E = 'PASS WITH WARNING' }, @{ C = 3; E = 'FAIL' }
