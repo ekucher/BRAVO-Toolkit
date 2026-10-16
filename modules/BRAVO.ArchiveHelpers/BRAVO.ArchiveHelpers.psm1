@@ -271,25 +271,10 @@ function Protect-BRAVOSevenZipDiagnosticText {
     # пробілами, закодований варіант пароля), і уламок маскувальник уже не
     # впізнав би.
     #
-    # Ціна маскування повного тексту обмежується двома межами, інакше
-    # обробка збою могла б зависнути саме тоді, коли діагностика потрібна:
-    # - загальна довжина (-MaximumMaskedCharacters): діапазон на кожен збіг
-    #   відомого значення й копії тексту на кожен шаблон;
-    # - довжина суцільного ланцюжка символів схеми URL `[a-z0-9+.-]`
-    #   (-MaximumTokenCharacters): шаблон облікових даних в URL у
-    #   канонічному маскувальнику (`[a-z][a-z0-9+.-]*://…`) поводиться
-    #   квадратично саме на такому ланцюжку (виміряно: 10 тис. символів —
-    #   ~2 с, 30 тис. — ~17 с). Будь-який інший символ (`\`, `_`, пробіл,
-    #   лапки) ланцюжок розриває, тож звичайні шляхи й вивід 7-Zip (короткі
-    #   імена записів) обидві межі не досягають;
-    # - довжина суцільного фрагмента без пробільних символів, що містить
-    #   `://` (-MaximumUrlRunCharacters): той самий шаблон після `://…:`
-    #   сканує `[^@\s]+` до кінця фрагмента на КОЖНОМУ входженні, тож текст
-    #   на кшталт `a://b:a://b:…` без `@` квадратичний навіть із короткими
-    #   ланцюжками схеми (виміряно: ~200 тис. символів одним фрагментом —
-    #   ~150 с). Шаблон не перетинає пробільних символів, тож межа на
-    #   фрагмент обмежує роботу лінійно від загальної довжини.
-    # Текст понад будь-яку межу НЕ маскується і НЕ пишеться (fail-closed):
+    # Межі вартості маскування (довжина, суцільний ланцюжок схеми URL,
+    # фрагмент із `://`) — у канонічному Protect-BRAVOLogSecretBounded
+    # (BRAVO.Logging): ті самі межі діють і для виводу WinSCP (#461).
+    # Текст понад межу НЕ маскується і НЕ пишеться (fail-closed):
     # викликач отримує Omitted і записує лише позначку з довжиною.
     #
     # Повертає [pscustomobject]@{ Text; Omitted; Length }.
@@ -301,22 +286,12 @@ function Protect-BRAVOSevenZipDiagnosticText {
         [ValidateRange(64, 100000)][int]$MaximumUrlRunCharacters = 512
     )
 
-    $sourceText = [string]$Text
-    # Обидві перевірки прив'язані до ПОЧАТКУ ланцюжка/фрагмента
-    # (негативний lookbehind), тож самі лінійні: без прив'язки спроба з
-    # кожної позиції всередині довгого ланцюжка знову була б квадратичною.
-    $longTokenPattern = '(?i)(?<![a-z0-9+.\-])[a-z0-9+.\-]{' + ($MaximumTokenCharacters + 1) + '}'
-    $longUrlRunPattern = '(?<!\S)(?=\S*://)\S{' + ($MaximumUrlRunCharacters + 1) + '}'
-    if ($sourceText.Length -gt $MaximumMaskedCharacters -or
-        [regex]::IsMatch($sourceText, $longTokenPattern) -or
-        [regex]::IsMatch($sourceText, $longUrlRunPattern)) {
-        return [pscustomobject]@{ Text = ''; Omitted = $true; Length = $sourceText.Length }
-    }
-    return [pscustomobject]@{
-        Text = [string](Protect-BRAVOLogSecret -Text $sourceText -KnownSecret $KnownSecret)
-        Omitted = $false
-        Length = $sourceText.Length
-    }
+    return (Protect-BRAVOLogSecretBounded `
+        -Text $Text `
+        -KnownSecret $KnownSecret `
+        -MaximumMaskedCharacters $MaximumMaskedCharacters `
+        -MaximumTokenCharacters $MaximumTokenCharacters `
+        -MaximumUrlRunCharacters $MaximumUrlRunCharacters)
 }
 
 function Write-BRAVOSevenZipFailureDiagnostics {
@@ -404,8 +379,8 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     # Fail-closed: якщо маскування недоступне або впало, сирий текст НЕ
     # пишеться — лише фіксований запис без вмісту потоків.
     try {
-        if ($null -eq (Get-Command -Name 'Protect-BRAVOLogSecret' -CommandType Function -ErrorAction SilentlyContinue)) {
-            throw 'Protect-BRAVOLogSecret недоступна'
+        if ($null -eq (Get-Command -Name 'Protect-BRAVOLogSecretBounded' -CommandType Function -ErrorAction SilentlyContinue)) {
+            throw 'Protect-BRAVOLogSecretBounded недоступна'
         }
         $maskedStandardError = Protect-BRAVOSevenZipDiagnosticText `
             -Text $StandardError -KnownSecret $KnownSecret -MaximumMaskedCharacters $MaximumMaskedCharacters
