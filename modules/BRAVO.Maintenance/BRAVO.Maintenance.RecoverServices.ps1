@@ -556,8 +556,17 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
         if ($restoreSettings.Contains('StartupDelayMinutes')) { $startupDelayMinutes = $restoreSettings.StartupDelayMinutes }
     }
     # Невідомий стан реставрації — як «ще чекає» (гейт закритий, fail-closed).
+    # #438: реставрація, ЗАБЛОКОВАНА лімітом поспіль-невдалих спроб
+    # ($automaticRestoreRetryBlocked), не "чекає": автоматичний шлях її не
+    # виконає, модель не змінюється, а утримувати служби заради неї
+    # означало б тримати їх зупиненими безстроково з хибною причиною.
+    # Блок знімає оператор (-ForceRestore / обнулення лічильника); до того
+    # служби відновлюються за звичайним вікном BootGraceMinutes. Невідомий
+    # прапорець блокування трактується як "не заблоковано" (старий гейт).
     $restorePendingVariable = Get-Variable -Name automaticRestoreDue -ErrorAction SilentlyContinue
-    $restorePending = ($null -eq $restorePendingVariable) -or [bool]$restorePendingVariable.Value
+    $restoreBlockedVariable = Get-Variable -Name automaticRestoreRetryBlocked -ErrorAction SilentlyContinue
+    $restoreBlockedByRetryCap = ($null -ne $restoreBlockedVariable) -and [bool]$restoreBlockedVariable.Value
+    $restorePending = (($null -eq $restorePendingVariable) -or [bool]$restorePendingVariable.Value) -and -not $restoreBlockedByRetryCap
     $bootGate = Get-BRAVOServiceRecoveryBootGate -BootTime (Get-BRAVOServiceRecoveryBootTime) -Now (Get-Date) `
         -BootRestoreMode $bootRestoreMode -StartupDelayMinutes $startupDelayMinutes -RestorePending $restorePending
     if ($bootGate.Defer) {
