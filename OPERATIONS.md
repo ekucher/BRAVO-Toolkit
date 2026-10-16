@@ -1436,7 +1436,8 @@ LIMS у своїй мережі, без вхідного доступу для �
 версію заливає наступний плановий цикл) — **без** підтвердження оператора
 для кожного циклу. `SyncResult.Status = 'MUTATION_AUTO_ARCHIVED'`, Health
 показує це як **інформаційне** повідомлення (не CRITICAL, не "ПОТРІБНА
-ДІЯ").
+ДІЯ"); так само, як і `COMPLETE`, цикл публікує remote checkpoint (див.
+нижче) — зовнішній спостерігач не бачить застарілої мітки.
 
 Понад поріг `N` за один цикл — поведінка **не змінюється**: жорсткий
 блок, `MUTATION_VIOLATION`, CRITICAL, ручний `BRAVO_BAZA_RECONCILE.ps1`, як
@@ -1476,7 +1477,16 @@ incremental sync, але повний 50+ ГБ preview на Health). Стара 
 ### Remote checkpoint (`.bravo-sync.json`)
 
 Після успішного циклу двигун публікує на SFTP поруч із даними невеликий
-checkpoint-файл `.bravo-sync.json` (CycleId, час, підсумки циклу). Це
+checkpoint-файл `.bravo-sync.json` (CycleId, час, підсумки циклу).
+«Успішний» тут — те саме канонічне визначення, що й для Archive/Health
+(`Test-BRAVOBazaSyncStatusSuccess`): `COMPLETE` **і** `MUTATION_AUTO_
+ARCHIVED` (#398 — до цього checkpoint публікувався лише для `COMPLETE`,
+і цикл, що завершився авто-архівуванням, лишав зовнішнього
+спостерігача із застарілою міткою попереднього `COMPLETE`-циклу; на
+Health це не впливало — Health checkpoint не читає). Усі інші статуси
+(`INCOMPLETE`/`MUTATION_VIOLATION`/`AUDIT_DRIFT`/`REMOTE_CONFLICT`/
+`INCOMPATIBLE_NAME`/`ERROR`/`SKIPPED_CONCURRENT`) checkpoint не
+публікують. Це
 **write-only телеметрія для зовнішнього спостерігача** (оператор бачить
 на SFTP-боці, коли завершився останній цикл): production Health його
 **не читає назад** і не будує на ньому freshness-перевірок — здоров'я
