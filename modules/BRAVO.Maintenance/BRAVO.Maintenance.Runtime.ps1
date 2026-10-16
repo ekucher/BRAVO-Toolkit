@@ -8157,7 +8157,7 @@ function Send-BRAVOMaintenanceOperationsEvent {
                 details = if ([string]::IsNullOrWhiteSpace([string]$_.Details)) { $null } else { [string]$_.Details }
             }
         })
-        Send-BRAVOOperationsEvent `
+        Send-BRAVOOperationsEventSafely `
             -OperationsReportingSettings $operationsReportingSettings `
             -CredentialTargets $credentialSettings.Targets `
             -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
