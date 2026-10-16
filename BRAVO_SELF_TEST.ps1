@@ -28114,6 +28114,99 @@ function Write-BRAVOLog {
         -Name 'Archive/ProbeFailureIsScopedToOwner' `
         -Failure 'провал SYSTEM probe має вимикати ЛИШЕ власника шляху: скасування всіх архівів дозволене тільки для спільної інфраструктури, а відсутнє джерело BAZA_WWW не має обнуляти BAZA_APP чи readyArchives'
 
+    # --- #408: write-probe не лишає порожні каталоги, які сам створив,
+    # якщо прогін зупиняється на preflight. Алгоритм прибирання
+    # (Remove-BRAVOWriteProbeCreatedChain) перевіряється напряму на
+    # реальних порожніх каталогах — без симуляції I/O-збою файлової
+    # системи (ненадійно й непортативно в sandboxed self-test середовищі).
+    & {
+        param([string]$RuntimeText)
+        $probeCleanupModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $RuntimeText `
+            -FunctionNames @('Remove-BRAVOWriteProbeCreatedChain', 'Test-BRAVOFileSystemWriteProbe')
+        $probeCleanupRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_408_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void](New-Item -ItemType Directory -Path $probeCleanupRoot -Force)
+
+            # 1. Алгоритм напряму: ланцюжок порожніх каталогів (найглибший
+            # перший — так само передає викликач) прибирається повністю,
+            # зупиняючись на першому НЕПОРОЖНЬОМУ чи наявному до нього.
+            $chainExisting = Join-Path $probeCleanupRoot 'existing'
+            [void](New-Item -ItemType Directory -Path $chainExisting -Force)
+            $chainA = Join-Path $chainExisting 'a'
+            $chainB = Join-Path $chainA 'b'
+            $chainWork = Join-Path $chainB '.work'
+            [void](New-Item -ItemType Directory -Path $chainWork -Force)
+            & $probeCleanupModule {
+                param($chain)
+                Remove-BRAVOWriteProbeCreatedChain -Chain $chain
+            } ([System.Collections.Generic.List[string]]@($chainWork, $chainB, $chainA))
+            Test-BRAVOCondition `
+                -Condition (
+                    -not (Test-Path -LiteralPath $chainA) -and
+                    (Test-Path -LiteralPath $chainExisting -PathType Container)
+                ) `
+                -Name 'Archive/WriteProbeChainCleanupRemovesCreatedAncestorsOnly' `
+                -Failure "#408: Remove-BRAVOWriteProbeCreatedChain має прибрати весь порожній ланцюжок, створений probe-ом (a/b/.work), і зупинитись на наявному до нього 'existing'; факт: chainA exists=$(Test-Path -LiteralPath $chainA), existing exists=$(Test-Path -LiteralPath $chainExisting -PathType Container)"
+
+            # 1b. Непорожній каталог посередині ланцюжка (щось інше туди
+            # паралельно поклало) не видаляється — це вже втрата чужих
+            # даних, не "прибирання за собою".
+            $nonEmptyA = Join-Path $probeCleanupRoot 'nonempty-a'
+            $nonEmptyB = Join-Path $nonEmptyA 'b'
+            [void](New-Item -ItemType Directory -Path $nonEmptyB -Force)
+            Set-Content -LiteralPath (Join-Path $nonEmptyA 'sentinel.txt') -Value 'не чіпати'
+            & $probeCleanupModule {
+                param($chain)
+                Remove-BRAVOWriteProbeCreatedChain -Chain $chain
+            } ([System.Collections.Generic.List[string]]@($nonEmptyB, $nonEmptyA))
+            Test-BRAVOCondition `
+                -Condition (
+                    -not (Test-Path -LiteralPath $nonEmptyB) -and
+                    (Test-Path -LiteralPath (Join-Path $nonEmptyA 'sentinel.txt') -PathType Leaf)
+                ) `
+                -Name 'Archive/WriteProbeChainCleanupStopsAtNonEmptyAncestor' `
+                -Failure "#408: прибирання має зупинитись на першому непорожньому каталозі ланцюжка й не видаляти чужий вміст; факт: b exists=$(Test-Path -LiteralPath $nonEmptyB), sentinel exists=$(Test-Path -LiteralPath (Join-Path $nonEmptyA 'sentinel.txt') -PathType Leaf)"
+
+            # 2. Регресія: успішний probe на звичайному прогоні Archive не
+            # прибирає створені каталоги — вони одразу потрібні для запису.
+            $successTarget = Join-Path $probeCleanupRoot 'success-chain\nested\.work'
+            $successResult = & $probeCleanupModule {
+                param($p) Test-BRAVOFileSystemWriteProbe -Path $p
+            } $successTarget
+            Test-BRAVOCondition `
+                -Condition (
+                    [bool]$successResult.Success -and
+                    (Test-Path -LiteralPath $successTarget -PathType Container)
+                ) `
+                -Name 'Archive/WriteProbeKeepsCreatedDirectoryOnSuccess' `
+                -Failure "#408: успішний write-probe НЕ повинен прибирати створені каталоги — звичайний прогін Archive одразу їх використовує; факт: Success=$($successResult.Success), target exists=$(Test-Path -LiteralPath $successTarget -PathType Container)"
+        } finally {
+            if (Test-Path -LiteralPath $probeCleanupRoot) {
+                Remove-Item -LiteralPath $probeCleanupRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } $archiveScriptText
+
+    # Проводка: Test-BRAVOFileSystemWriteProbe справді викликає прибирання
+    # ланцюжка у catch-гілці (не лише визначає функцію без використання).
+    # Review (P1): catch виконується ПОВНІСТЮ до finally, тож між `} catch {`
+    # і викликом Remove-BRAVOWriteProbeCreatedChain тепер стоїть ще й
+    # видалення probe-файлу (інакше ланцюжок бачив би $Path непорожнім і
+    # зупинявся одразу) — регекс більше не вимагає безпосередньої
+    # суміжності, лише обмежене вікно (до 400 символів), щоб не зачепити
+    # сторонній `} catch {` десь-інде у файлі.
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('function Remove-BRAVOWriteProbeCreatedChain') -and
+            [regex]::IsMatch(
+                $archiveScriptText,
+                'function Test-BRAVOFileSystemWriteProbe[\s\S]*?\} catch \{[\s\S]{0,400}?Remove-BRAVOWriteProbeCreatedChain -Chain \$createdChain'
+            )
+        ) `
+        -Name 'Archive/WriteProbeWiresCleanupIntoFailurePath' `
+        -Failure '#408: Test-BRAVOFileSystemWriteProbe має викликати Remove-BRAVOWriteProbeCreatedChain у своїй catch-гілці, а не лише визначати прибирання без застосування'
+
     # --- Archive: dev.18 — очищення старих журналів мігрувало на numbered
     # Write-BRAVOArchiveStep (раніше unnumbered Write-BRAVOOperationResult
     # — реальний DEV-LIMS вивід показав цю операцію поза [N/TOTAL]).
