@@ -21446,7 +21446,11 @@ try {
                 [void](Initialize-BRAVOLog -LogFile $diagFitLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
                 $diagFitHead = 'FITHEADTOKEN'
                 $diagFitBudget = 4000 - 'Дiагностика 7-Zip test: '.Length
-                $diagFitStderr = $diagFitHead + ('f' * ($diagFitBudget - 2 - $diagFitHead.Length))
+                # Текст зі слів (а не один суцільний фрагмент): фрагменти понад межу
+                # маскувальника (1024 символи) пропускаються цілком, а тут перевіряється
+                # саме межа символьного бюджету. Довжина — рівно бюджет мінус 2.
+                $diagFitStderr = ($diagFitHead + ' ' + (('f' * 49 + ' ') * 100)).Substring(0, $diagFitBudget - 2)
+                if ($diagFitStderr.EndsWith(' ')) { $diagFitStderr = $diagFitStderr.Substring(0, $diagFitStderr.Length - 1) + 'f' }
                 [void](Write-BRAVOSevenZipFailureDiagnostics `
                     -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
                     -StandardOutput '' -StandardError $diagFitStderr -Level 'ERROR')
