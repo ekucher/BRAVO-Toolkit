@@ -1901,10 +1901,19 @@ function Resolve-BRAVOBackupComponentScope {
     $hasError = @($findings | Where-Object { [string]$_.Severity -eq 'Error' }).Count -gt 0
     $emptyComposition = ($anyEnabled -and $planned.Count -eq 0 -and -not $hasError)
     if ($emptyComposition) {
+        # #413 (п.4): $notInstalled включає й EmptySource (каталог є, але
+        # порожній) — «не встановлено» для такого компонента неточне.
+        # Повідомлення називає ці компоненти окремо, коли вони є.
+        $emptyCompositionMessage = "Жоден увімкнений компонент не встановлено на цьому сервері (" +
+            ($notInstalled.ToArray() -join ', ') + ')'
+        if ($emptySource.Count -gt 0) {
+            $emptyCompositionMessage += (" — з них каталог джерела існує, але порожній: " +
+                ($emptySource.ToArray() -join ', '))
+        }
+        $emptyCompositionMessage += '. Резервної копії не буде, прогін зупинено.'
         $findings.Add((New-BRAVODiscoveryDriftFinding `
             -Component 'BASELINE' -Severity 'Error' -Presence 'Absent' `
-            -Message ("Жоден увімкнений компонент не встановлено на цьому сервері (" +
-                ($notInstalled.ToArray() -join ', ') + '). Резервної копії не буде, прогін зупинено.')))
+            -Message $emptyCompositionMessage))
     }
 
     return [pscustomobject]@{
@@ -2204,6 +2213,25 @@ function New-BRAVODiscoveryBaselineSnapshot {
     return [pscustomobject]$snapshot
 }
 
+function Write-BRAVODiscoveryBaselineSnapshot {
+    # #413 (п.3): спільна серіалізація знімка baseline. Save-BRAVODiscoveryBaseline
+    # і перший запис з EmptySourceRetained у Update-BRAVODiscoveryBaselineFromScope
+    # робили те саме (ConvertTo-Json -> атомарний запис) кожен своєю копією;
+    # тепер обидва (і доповнення Extended) викликають цей helper. Чистий
+    # рефакторинг: формат JSON і атомарність запису не змінюються.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][object]$Snapshot
+    )
+
+    # #158 (етап 1): запис АТОМАРНИЙ. Раніше був простий WriteAllText —
+    # перерваний запис (живлення, kill) лишав би baseline напівзаписаним,
+    # а пошкоджений baseline знецінює саме той доказ, заради якого він
+    # існує. Каталог створює сам helper.
+    Write-BRAVODiscoveryBaselineTextAtomic -Path $Path -Text ([pscustomobject]$Snapshot | ConvertTo-Json)
+}
+
 function Save-BRAVODiscoveryBaseline {
     # AUD-007 (аудит P1.1/P1.2): зберігає останній підтверджений discovery-
     # результат на диск (JSON, без BOM — узгоджено з VERSION.json), щоб
@@ -2227,12 +2255,7 @@ function Save-BRAVODiscoveryBaseline {
         $snapshot = New-BRAVODiscoveryBaselineSnapshot -DiscoveryResult $DiscoveryResult
     }
 
-    # #158 (етап 1): запис АТОМАРНИЙ. Раніше був простий WriteAllText —
-    # перерваний запис (живлення, kill) лишав би baseline напівзаписаним,
-    # а пошкоджений baseline знецінює саме той доказ, заради якого він
-    # існує. Каталог створює сам helper.
-    $json = $snapshot | ConvertTo-Json
-    Write-BRAVODiscoveryBaselineTextAtomic -Path $BaselinePath -Text $json
+    Write-BRAVODiscoveryBaselineSnapshot -Path $BaselinePath -Snapshot $snapshot
 }
 
 function Get-BRAVOLastCompleteBackupEvidence {
@@ -2577,8 +2600,7 @@ function Update-BRAVODiscoveryBaselineFromScope {
                 $firstSnapshot[$fieldName] = Get-BRAVOEmptySourceEvidenceValue -DiscoveryResult $DiscoveryResult `
                     -Component $componentName -FieldName $fieldName
             }
-            Write-BRAVODiscoveryBaselineTextAtomic -Path $baselinePath `
-                -Text ([pscustomobject]$firstSnapshot | ConvertTo-Json)
+            Write-BRAVODiscoveryBaselineSnapshot -Path $baselinePath -Snapshot $firstSnapshot
         }
         return [pscustomobject]@{ Action = 'Created'; AddedComponents = $protectedComponents; Path = $baselinePath }
     }
@@ -2613,7 +2635,7 @@ function Update-BRAVODiscoveryBaselineFromScope {
     }
 
     $snapshot['UpdatedAt'] = (Get-Date).ToString('o')
-    Write-BRAVODiscoveryBaselineTextAtomic -Path $baselinePath -Text ([pscustomobject]$snapshot | ConvertTo-Json)
+    Write-BRAVODiscoveryBaselineSnapshot -Path $baselinePath -Snapshot $snapshot
     return [pscustomobject]@{ Action = 'Extended'; AddedComponents = $added.ToArray(); Path = $baselinePath }
 }
 
