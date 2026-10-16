@@ -24,9 +24,13 @@ permissions:
 # Застарілі прогони PR скасовуються новим пушем у ту саму гілку (кожен
 # повний прогін ~19 хв). Скасування ЛИШЕ для pull_request: push у
 # developer/master і workflow_dispatch ніколи не скасовуються, щоб не
-# губити результат на інтеграційних гілках.
+# губити результат на інтеграційних гілках. Для не-PR подій ключ групи —
+# run_id (кожен прогін у власній групі): спільна група за ref навіть із
+# cancel-in-progress=false скасовувала б ОЧІКУВАНИЙ push-прогін під час
+# серії мержів у developer (GitHub тримає в групі один активний і один
+# очікуваний прогін), а telegram-ci-summary трактує cancelled як failed.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Check names are split by event on purpose (5.1.0 promotion incident,

@@ -114,7 +114,9 @@ if (-not $SkipEolCheck) {
             $violationPath = ($violation -split '  \[')[0]
             $gitPath = $violationPath.Replace('\', '/')
             Write-Host "  $violation" -ForegroundColor Red
-            $winPath = $gitPath.Replace('/', '\')
+            # Абсолютний шлях: [IO.File] резолвить відносні шляхи від
+            # [Environment]::CurrentDirectory, який Set-Location у PS 5.1 не оновлює.
+            $winPath = Join-Path $Root $gitPath.Replace('/', '\')
             $fixCommand = '$f = ''' + $winPath + '''; [IO.File]::WriteAllText($f, ([IO.File]::ReadAllText($f) -replace ''(?<!\r)\n'', "`r`n"), (New-Object Text.UTF8Encoding([IO.File]::ReadAllBytes($f)[0] -eq 0xEF)))'
             Write-Host "    виправлення (перетворити на CRLF, потім git add -- $gitPath): $fixCommand" -ForegroundColor Yellow
         }
