@@ -28190,12 +28190,18 @@ function Write-BRAVOLog {
 
     # Проводка: Test-BRAVOFileSystemWriteProbe справді викликає прибирання
     # ланцюжка у catch-гілці (не лише визначає функцію без використання).
+    # Review (P1): catch виконується ПОВНІСТЮ до finally, тож між `} catch {`
+    # і викликом Remove-BRAVOWriteProbeCreatedChain тепер стоїть ще й
+    # видалення probe-файлу (інакше ланцюжок бачив би $Path непорожнім і
+    # зупинявся одразу) — регекс більше не вимагає безпосередньої
+    # суміжності, лише обмежене вікно (до 400 символів), щоб не зачепити
+    # сторонній `} catch {` десь-інде у файлі.
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('function Remove-BRAVOWriteProbeCreatedChain') -and
             [regex]::IsMatch(
                 $archiveScriptText,
-                'function Test-BRAVOFileSystemWriteProbe[\s\S]*?\} catch \{\s*\r?\n\s*Remove-BRAVOWriteProbeCreatedChain -Chain \$createdChain'
+                'function Test-BRAVOFileSystemWriteProbe[\s\S]*?\} catch \{[\s\S]{0,400}?Remove-BRAVOWriteProbeCreatedChain -Chain \$createdChain'
             )
         ) `
         -Name 'Archive/WriteProbeWiresCleanupIntoFailurePath' `

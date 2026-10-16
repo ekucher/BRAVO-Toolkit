@@ -2450,6 +2450,24 @@ function Test-BRAVOFileSystemWriteProbe {
         }
         return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null }
     } catch {
+        # Review (P1): catch виконується ПОВНІСТЮ до finally (порядок
+        # PowerShell), тож видалення probe-файлу МАЄ статись тут, ДО
+        # прибирання ланцюжка каталогів — інакше Remove-BRAVOWriteProbeCreatedChain
+        # бачила б probe-файл ще присутнім у $Path (напр. на провалі
+        # read-back ПІСЛЯ успішного запису) і зупинялась би одразу, вважаючи
+        # $Path непорожнім, лишаючи ввесь ланцюжок на диску — саме дефект,
+        # який ця проба мала усунути.
+        if (-not [string]::IsNullOrWhiteSpace($probePath) -and
+            [IO.File]::Exists($probePath)) {
+            try {
+                [IO.File]::Delete($probePath)
+            } catch {
+                # Best-effort; якщо видалення теж не вдалось, прибирання
+                # ланцюжка нижче все одно зупиниться на непорожньому $Path —
+                # той самий безпечний fallback, що для будь-якого стороннього
+                # вмісту.
+            }
+        }
         Remove-BRAVOWriteProbeCreatedChain -Chain $createdChain
         return [pscustomobject]@{ Success = $false; Path = $Path; Error = $_.Exception.Message }
     } finally {
