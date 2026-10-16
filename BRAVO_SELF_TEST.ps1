@@ -21284,17 +21284,31 @@ try {
                 $diagCapLines = if ($diagCapMatch.Success) {
                     @($diagCapMatch.Groups[1].Value -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
                 } else { @() }
+                # Відкинуті межею рядків рядки позначаються `(обрізано)` у межах
+                # тих самих 20 рядків: короткий хвіст уміщається в символьну межу,
+                # і без позначки читався б як повний вивід. Рівно 20 рядків —
+                # без позначки (нічого не відкинуто).
+                $diagCapExactRecords = New-Object System.Collections.Generic.List[string]
+                $diagCapExactLogger = { param($Message, $Level) $diagCapExactRecords.Add([string]$Message) }.GetNewClosure()
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagCapExactLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardOutput ((1..20 | ForEach-Object { "diag-exact-line-$_" }) -join "`r`n") -StandardError '' -Level 'ERROR')
+                $diagCapExactText = if ($diagCapExactRecords.Count -gt 0) { $diagCapExactRecords[0] } else { '' }
                 Test-BRAVOCondition `
                     -Condition (
                         $diagCapLines.Count -eq 20 -and
                         $diagCapText -match $diagCapLast -and
-                        $diagCapText -notmatch $diagCapFirst
+                        $diagCapText -notmatch $diagCapFirst -and
+                        $diagCapText.Contains('(обрізано)') -and
+                        $diagCapExactText.Contains('diag-exact-line-1') -and
+                        -not $diagCapExactText.Contains('(обрізано)')
                     ) `
                     -Name "SevenZipDiagnostics/LineCapKeepsExactlyLastTwentyLines" `
-                    -Failure ("30 непорожніх рядків мусять дати РІВНО 20 у записі, зі збереженим ХВОСТОМ: " +
+                    -Failure ("30 непорожніх рядків мусять дати РІВНО 20 у записі, зі збереженим ХВОСТОМ і позначкою обрізання: " +
                         "`7za t -bb1` друкує рядок на запис, а операторо-значущий вердикт — у кінці. " +
                         "Рядків: $($diagCapLines.Count), хвіст присутній=$($diagCapText -match $diagCapLast), " +
-                        "голова присутня=$($diagCapText -match $diagCapFirst)")
+                        "голова присутня=$($diagCapText -match $diagCapFirst), позначка=$($diagCapText.Contains('(обрізано)')), " +
+                        "позначка без відкидання (рівно 20)=$($diagCapExactText.Contains('(обрізано)'))")
 
                 # Символьна межа мусить обрізати ПОЧАТОК, а не кінець. 20 рядків
                 # по 300 символів = ~6000 > 4000: обрізання з початку (як було
@@ -21669,10 +21683,13 @@ try {
                     $sharedMatch = [regex]::Match($sharedText, '(?s)Дiагностика 7-Zip test: (.*?)(?=\r?\n\d{4}-\d{2}-\d{2} |\z)')
                     if ($sharedMatch.Success) {
                         # Рядки продовження несуть префікс '  | ' (захист від підробки
-                        # записів журналу) — для точного порівняння вмісту він знімається.
+                        # записів журналу), а перший збережений рядок потоку, з якого
+                        # межа рядків відкинула початок, — позначку обрізання; для
+                        # точного порівняння вмісту обидва знімаються (позначка
+                        # перевіряється окремо).
                         @($sharedMatch.Groups[1].Value -split '\r?\n' |
                             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-                            ForEach-Object { $_ -replace '^  \| ', '' })
+                            ForEach-Object { $_ -replace '^  \| ', '' -replace '^\(обрізано\) … ', '' })
                     } else { @() }
                 }
                 $diagSharedFullLog = Join-Path $b2TestRoot ("diag_shared_full_{0}.log" -f [guid]::NewGuid().ToString("N"))
@@ -21693,8 +21710,13 @@ try {
                 $diagSharedMixLines = @(& $diagSharedRecordLines $diagSharedMixLog)
                 $diagSharedMixStderr = @($diagSharedMixLines | Where-Object { $_ -match '^EMIX_' }).Count
                 $diagSharedMixStdout = @($diagSharedMixLines | Where-Object { $_ -match '^OMIX_' })
+                $diagSharedFullRaw = if (Test-Path -LiteralPath $diagSharedFullLog -PathType Leaf) { [IO.File]::ReadAllText($diagSharedFullLog) } else { '' }
+                $diagSharedMixRaw = if (Test-Path -LiteralPath $diagSharedMixLog -PathType Leaf) { [IO.File]::ReadAllText($diagSharedMixLog) } else { '' }
                 Test-BRAVOCondition `
                     -Condition (
+                        $diagSharedFullRaw.Contains('(обрізано) … ESHARE_006') -and
+                        $diagSharedMixRaw.Contains('(обрізано) … OMIX_049') -and
+                        -not $diagSharedMixRaw.Contains('(обрізано) … EMIX_') -and
                         $diagSharedFullLines.Count -eq 20 -and
                         @($diagSharedFullLines | Where-Object { $_ -match '^OSHARE_' }).Count -eq 0 -and
                         ($diagSharedFullLines -contains 'ESHARE_025') -and
@@ -21711,7 +21733,10 @@ try {
                     -Failure ("межа 20 рядків — на ВЕСЬ запис з пріоритетом stderr: 25+25 рядків мусять дати 20 рядків хвоста stderr " +
                         "без stdout, а 13+55 — усі 13 рядків stderr і 7 рядків хвоста stdout. " +
                         "25+25: рядків=$($diagSharedFullLines.Count); 13+55: рядків=$($diagSharedMixLines.Count), " +
-                        "stderr=$diagSharedMixStderr, stdout=$($diagSharedMixStdout.Count)")
+                        "stderr=$diagSharedMixStderr, stdout=$($diagSharedMixStdout.Count); позначка обрізання: " +
+                        "25+25=$($diagSharedFullRaw.Contains('(обрізано) … ESHARE_006')), " +
+                        "13+55 stdout=$($diagSharedMixRaw.Contains('(обрізано) … OMIX_049')), " +
+                        "13+55 stderr (зайва)=$($diagSharedMixRaw.Contains('(обрізано) … EMIX_'))")
 
                 # Маскування ДО першого запису: вивід 7-Zip несе імена записів
                 # архіву, а причина порожнього виводу — текст винятку; локальний
@@ -21930,6 +21955,7 @@ try {
                     "ERROR: entry token='AAA'' DQLEAKS1' end",
                     'ERROR: entry secret="BBB"" DQLEAKD2" end',
                     "ERROR: cmd -password='CC'' DQLEAKP3' x",
+                    'ERROR: entry token="HHH`" DQLEAKT9" end',
                     'ERROR: entry token="EEE\" DQLEAKB6" end',
                     "ERROR: entry secret='FFF\' DQLEAKB7' end",
                     'ERROR: cmd -password="GG\\\" DQLEAKB8" x',
@@ -21937,7 +21963,7 @@ try {
                     "NEXTRECORD 'kept' INTACT5"
                 ) -join "`r`n"
                 $diagDoubledMasked = [string](Protect-BRAVOLogSecret -Text $diagDoubledText)
-                $diagDoubledLeaks = @('DQLEAKS1', 'DQLEAKD2', 'DQLEAKP3', 'DQLEAKU4', 'DQLEAKB6', 'DQLEAKB7', 'DQLEAKB8' |
+                $diagDoubledLeaks = @('DQLEAKS1', 'DQLEAKD2', 'DQLEAKP3', 'DQLEAKU4', 'DQLEAKB6', 'DQLEAKB7', 'DQLEAKB8', 'DQLEAKT9' |
                     Where-Object { $diagDoubledMasked.Contains($_) })
                 Test-BRAVOCondition `
                     -Condition (
@@ -21948,7 +21974,7 @@ try {
                         $diagDoubledMasked.Contains("`r`nNEXTRECORD 'kept' INTACT5")
                     ) `
                     -Name "Logging/QuotedSecretValueDoubledAndUnterminatedQuotes" `
-                    -Failure ("значення в лапках із екранованою лапкою ('' / `"`" / \`" / \') мусить маскуватись цілим, незакрите — до кінця рядка, " +
+                    -Failure ("значення в лапках із екранованою лапкою ('' / `"`" / \`" / \' / ``) мусить маскуватись цілим, незакрите — до кінця рядка, " +
                         "без перетину розриву рядка. Уламки: [$($diagDoubledLeaks -join ', ')]; " +
                         "результат: $($diagDoubledMasked -replace "`r?`n", ' | ')")
 

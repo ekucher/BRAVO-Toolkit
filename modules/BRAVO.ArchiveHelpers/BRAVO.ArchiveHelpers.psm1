@@ -172,12 +172,24 @@ function Get-BRAVOSevenZipDiagnosticStreamLines {
     # зберігає CR без нормалізації, тож у журналі одиночний CR — це теж
     # окремий візуальний рядок. Розбиття лише по \r?\n дозволило б сотням
     # таких рядків (імена записів з CR) обійти -MaximumLines як «один рядок».
-    return @(
+    $allStreamLines = @(
         [string]$StreamText -split '\r\n|\r|\n' |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $streamLines = @(
+        $allStreamLines |
             Select-Object -Last $MaximumLines |
             ForEach-Object { ConvertTo-BRAVOSevenZipDiagnosticSafeLine -Line $_ }
     )
+    # Відкинуті межею рядків початкові рядки позначаються так само, як
+    # символьне обрізання, і В МЕЖАХ того самого бюджету рядків (маркер —
+    # префікс першого збереженого рядка, а не окремий рядок): інакше
+    # короткий хвіст, що вміщається в символьну межу, читався б як повний
+    # вивід інструмента.
+    if ($allStreamLines.Count -gt $streamLines.Count -and $streamLines.Count -gt 0) {
+        $streamLines[0] = '(обрізано) … ' + $streamLines[0]
+    }
+    return $streamLines
 }
 
 function ConvertTo-BRAVOSevenZipDiagnosticSafeLine {
