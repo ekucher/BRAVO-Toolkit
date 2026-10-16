@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Агентна оркестрація: роль `lead` як визначення агента.** Lead/Orchestrator
+  з `BRAVO_AGENT_POLICY.md` §8 тепер існує як `.claude/agents/lead.md` і роль
+  `lead` у `.claude/ai-routing.json` (`model: inherit` — модель, обрана
+  власником; `mainSessionOnly`). Сесію оркестрації запускають
+  `claude --agent lead`. Хук `validate-agent-routing.ps1` блокує виклик
+  `Agent` із `subagent_type: lead`, щоб оркестрація не вкладалась і не обходила
+  людський merge-gate; тест у `Test-AIRouting.ps1`. Оновлено
+  `docs/ai/MODEL_ROUTING_POLICY.md`, `.claude/skills/orchestrate/SKILL.md`,
+  `.claude/README.md` і §9.1 політики. Runtime-код не змінювався.
 - **Виправлено: збій 7-Zip більше не лишає оператора без причини.**
   Діагностичний вивід 7-Zip (stdout/stderr) на шляху збою записувався рівнем
   `DEBUG`, а канонічний дефолт `consoleSettings.FileLevel` — `INFO`, тому рядок
