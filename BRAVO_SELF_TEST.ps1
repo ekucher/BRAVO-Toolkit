@@ -6519,7 +6519,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
     $sendSlackAlertTestModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Send-SlackAlert', 'Send-FinalReport')
+        -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage')
 
     function Invoke-MaintenanceSeverityLifecycleScenario {
         param([scriptblock]$SendCalls)
@@ -6724,7 +6724,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     try {
         $earlyExitAlertModule = New-BRAVOSelfTestRuntimeModule `
             -SourceText $maintenanceRuntimeSourceForSeverity `
-            -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Send-BRAVOMaintenanceEarlyExitAlerts', 'Send-BRAVOMaintenanceSkippedRunAlert')
+            -FunctionNames @('Send-SlackAlert', 'Send-FinalReport', 'Send-BRAVOMaintenanceEarlyExitAlerts', 'Send-BRAVOMaintenanceSkippedRunAlert', 'Get-BRAVOMaintenanceCriticalAlertMessage')
     } catch {
         $earlyExitAlertModuleError = $_.Exception.Message
     }
@@ -7036,7 +7036,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # WARNING/ALERTS, а не як SUCCESS/GENERAL (review finding #1) ----------
     $finalStatusModuleForSeverity = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage')
     $successWithWarningsRouteCapture = & $finalStatusModuleForSeverity {
         $script:SlackMode = "all"
         $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
@@ -7114,7 +7114,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # StaticAnalysis/NoStaticNewConstructorInProductionCode (Governance).
     $completedLinesModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage')
     $completedLinesScenarios = @(
         @{ Name = 'Zero'; Lines = @() },
         @{ Name = 'One'; Lines = @('Виконано:') },
@@ -7192,17 +7192,34 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # Send-FinalReport; стабляться лише webhook і конструктор тексту.
     $criticalFlagReportModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $maintenanceRuntimeSourceForSeverity `
-        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport')
+        -FunctionNames @('Get-BRAVOMaintenanceFinalReportCheckLines', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage')
     function Invoke-MaintenanceCriticalFlagReportScenario {
-        param([bool]$CriticalFlag, [string[]]$CriticalEntries = @())
+        param(
+            [bool]$CriticalFlag,
+            [string[]]$CriticalEntries = @(),
+            [string]$SlackMode = "errors_only",
+            [string[]]$AlertQueueMessages = @(),
+            [switch]$UnsetCriticalFlag
+        )
         & $criticalFlagReportModule {
-            param([bool]$FlagInner, [string[]]$EntriesInner)
+            param([bool]$FlagInner, [string[]]$EntriesInner, [string]$SlackModeInner, [string[]]$AlertQueueMessagesInner, [bool]$UnsetCriticalFlagInner)
             Set-StrictMode -Version 2.0
-            $script:SlackMode = "errors_only"
-            $script:criticalErrorOccurred = $FlagInner
+            $script:SlackMode = $SlackModeInner
+            if ($UnsetCriticalFlagInner) {
+                # П.1 (#398): жодне присвоєння $script:criticalErrorOccurred у
+                # цьому прогоні — лише Get-Variable -ErrorAction
+                # SilentlyContinue (виробничий код) захищає від
+                # PropertyNotFoundException під Set-StrictMode -Version 2.0.
+                Remove-Variable -Name criticalErrorOccurred -Scope Script -ErrorAction SilentlyContinue
+            } else {
+                $script:criticalErrorOccurred = $FlagInner
+            }
             $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
             foreach ($entryInner in $EntriesInner) { $script:CriticalErrorsList.Add($entryInner) }
             $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            foreach ($alertMessageInner in $AlertQueueMessagesInner) {
+                $script:NotificationAlertQueue.Add([pscustomobject]@{ Severity = "WARNING"; Message = $alertMessageInner })
+            }
             $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
             $script:ScriptStartTime = Get-Date
             $bravoSettings = @{ NotificationRouting = @{} }
@@ -7231,7 +7248,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 DeliveredCount = $script:deliveredMessages.Count
                 DeliveredMessage = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].Message } else { $null }
             }
-        } $CriticalFlag $CriticalEntries
+        } $CriticalFlag $CriticalEntries $SlackMode $AlertQueueMessages ([bool]$UnsetCriticalFlag)
     }
     $criticalFlagOnly = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true
     Test-BRAVOCondition `
@@ -7257,6 +7274,59 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Maintenance/CriticalFlagWithEntryKeepsExistingMessage" `
         -Failure "за наявності запису в CriticalErrorsList повідомлення має лишитись незмінним (без узагальненого рядка); отримано: $($criticalFlagWithEntry.DeliveredMessage)"
 
+    # --- Maintenance (#398 п.1): $script:criticalErrorOccurred взагалі НЕ
+    # встановлена (а не просто $false) під Set-StrictMode -Version 2.0 —
+    # окремий сценарій від CriticalFlag=$false вище (та інша присвоює
+    # $false, не знімає змінну). Безпечне читання через Get-Variable
+    # -ErrorAction SilentlyContinue (виробничий код, рядок з коментарем
+    # "Get-Variable замість прямого читання") не повинно кидати виняток.
+    $strictModeUnsetError = $null
+    $strictModeUnsetCapture = $null
+    try {
+        $strictModeUnsetCapture = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $false -UnsetCriticalFlag
+    } catch {
+        $strictModeUnsetError = $_.Exception.Message
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $strictModeUnsetError -and
+            $null -ne $strictModeUnsetCapture -and
+            $strictModeUnsetCapture.DeliveredCount -eq 0
+        ) `
+        -Name "Maintenance/CriticalFlagUnsetVariableIsStrictModeSafe" `
+        -Failure "errors_only зі ЗНЯТОЮ (не ініціалізованою) `$script:criticalErrorOccurred під Set-StrictMode -Version 2.0 має безпечно нічого не надсилати, без винятку; виняток: $(if ($null -eq $strictModeUnsetError) { '<немає>' } else { $strictModeUnsetError }), доставлено: $(if ($null -eq $strictModeUnsetCapture) { '<немає результату>' } else { $strictModeUnsetCapture.DeliveredCount })"
+
+    # --- Maintenance (#398 п.2а): той самий criticalErrorOccurred-без-
+    # записів сценарій, але mode=all — гілка criticalErrorOccurred у Send-
+    # FinalReport не перевіряє SlackMode (на відміну від фінального "else"
+    # з success-повідомленням), тож має надіслати той самий CRITICAL-алерт,
+    # що й у errors_only, а НЕ впасти в гілку успішного звіту "all".
+    $criticalFlagOnlyAllMode = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true -SlackMode "all"
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalFlagOnlyAllMode.DeliveredCount -eq 1 -and
+            $criticalFlagOnlyAllMode.DeliveredMessage.Contains("SEVERITY=CRITICAL") -and
+            $criticalFlagOnlyAllMode.DeliveredMessage.Contains("без детальної причини") -and
+            $criticalFlagOnlyAllMode.DeliveredMessage.Contains("LOG=STUB-LOG-PATH")
+        ) `
+        -Name "Maintenance/CriticalFlagWithoutEntriesAlertsInAllMode" `
+        -Failure "mode=all + `$script:criticalErrorOccurred без записів у чергах мав надіслати рівно один CRITICAL-алерт із узагальненою причиною (так само, як у errors_only), а не success-звіт 'all'; доставлено: $($criticalFlagOnlyAllMode.DeliveredCount), повідомлення: $($criticalFlagOnlyAllMode.DeliveredMessage)"
+
+    # --- Maintenance (#398 п.2б): непорожня NotificationAlertQueue в НОВІЙ
+    # (#298) гілці criticalErrorOccurred-без-записів — записи черги мають
+    # потрапити в -Details поряд з узагальненою причиною (той самий
+    # контракт, що й гілка CriticalErrorsList, перевірена вище для #299).
+    $criticalFlagWithAlertQueue = Invoke-MaintenanceCriticalFlagReportScenario -CriticalFlag $true -AlertQueueMessages @("попередження з черги сповіщень")
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalFlagWithAlertQueue.DeliveredCount -eq 1 -and
+            $criticalFlagWithAlertQueue.DeliveredMessage.Contains("SEVERITY=CRITICAL") -and
+            $criticalFlagWithAlertQueue.DeliveredMessage.Contains("без детальної причини") -and
+            $criticalFlagWithAlertQueue.DeliveredMessage.Contains("попередження з черги сповіщень")
+        ) `
+        -Name "Maintenance/CriticalFlagWithoutEntriesIncludesAlertQueue" `
+        -Failure "errors_only + `$script:criticalErrorOccurred без записів у CriticalErrorsList, але з непорожньою NotificationAlertQueue, мав додати записи черги в -Details поряд з узагальненою причиною; отримано: $($criticalFlagWithAlertQueue.DeliveredMessage)"
+
     # --- Maintenance: перевищення порогу діапазонів ID (запис у
     # CriticalErrorsList через Test-RangeIdUsage -> Send-SlackAlert
     # -IsCritical) не повинно ховати решту перевірок. Регресія з продового
@@ -7271,7 +7341,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             'Test-RangeIdUsage', 'Send-SlackAlert',
             'Get-BRAVOMaintenanceStepOutcome', 'New-BRAVOMaintenanceCompletedLines',
             'Get-BRAVOMaintenanceFinalReportCheckLines', 'Get-BRAVOMaintenanceFinalReportCheckLinesSafe',
-            'Send-FinalReport'
+            'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage'
         )
     $rangeIdFinalReportRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RangeIdFinalReport_{0}" -f [guid]::NewGuid().ToString('N'))
     [void](New-Item -ItemType Directory -Path $rangeIdFinalReportRoot -Force)
@@ -21178,7 +21248,7 @@ try {
                 'Write-Log', 'Get-BRAVOMaintenanceResolvedExitCode',
                 'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
                 'Add-BRAVOMaintenanceLegacyBomFallbackAlert',
-                'Send-SlackAlert', 'Send-FinalReport'
+                'Send-SlackAlert', 'Send-FinalReport', 'Get-BRAVOMaintenanceCriticalAlertMessage'
             )
         $t006MaintenanceScenario = {
             param([string[]]$ArchiveNames, [string]$Secret)

@@ -7903,6 +7903,29 @@ function Get-BRAVOMaintenanceFinalReportCheckLinesSafe {
     }
 }
 
+# #398 (рефакторинг, без зміни поведінки): спільна побудова CRITICAL-
+# повідомлення для ОБОХ гілок Send-FinalReport нижче (CriticalErrorsList і
+# криticalErrorOccurred-без-записів) — відрізняються лише самі "первинні"
+# деталі (конкретні помилки або узагальнена причина), решта (Title/
+# TitleEmoji/Severity/чергa сповіщень/блок статусів етапів/LogPath)
+# ідентична в обох.
+function Get-BRAVOMaintenanceCriticalAlertMessage {
+    param(
+        [string[]]$PrimaryDetails,
+        [TimeSpan]$Duration,
+        $LOG_FILE
+    )
+    return New-MaintenanceNotificationMessage `
+        -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
+        -TitleEmoji ":rotating_light:" `
+        -Severity "CRITICAL" `
+        -Duration $Duration `
+        -Details (@($PrimaryDetails) +
+            @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
+            @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
+        -LogPath $LOG_FILE
+}
+
 # Функція для відправки фінального звіту
 function Send-FinalReport {
     param(
@@ -7932,15 +7955,10 @@ function Send-FinalReport {
 
     if ($script:CriticalErrorsList.Count -gt 0) {
         # Є критичні помилки - відправляємо в режимах "errors_only" та "all"
-        $notificationMessage = New-MaintenanceNotificationMessage `
-            -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
-            -TitleEmoji ":rotating_light:" `
-            -Severity "CRITICAL" `
+        $notificationMessage = Get-BRAVOMaintenanceCriticalAlertMessage `
+            -PrimaryDetails $script:CriticalErrorsList.ToArray() `
             -Duration $elapsedTime `
-            -Details (@($script:CriticalErrorsList.ToArray()) +
-                @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
-                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
-            -LogPath $LOG_FILE
+            -LOG_FILE $LOG_FILE
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
     }
@@ -7953,15 +7971,10 @@ function Send-FinalReport {
         # мовчки повертався б. Окрема причина алерту: узагальнене CRITICAL
         # без деталей; записи NotificationAlertQueue (якщо є) додаються, щоб
         # не загубитись. Коди завершення не змінюються.
-        $notificationMessage = New-MaintenanceNotificationMessage `
-            -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
-            -TitleEmoji ":rotating_light:" `
-            -Severity "CRITICAL" `
+        $notificationMessage = Get-BRAVOMaintenanceCriticalAlertMessage `
+            -PrimaryDetails @("Maintenance завершився з критичною помилкою без детальної причини. Подробиці дивіться в журналі.") `
             -Duration $elapsedTime `
-            -Details (@("Maintenance завершився з критичною помилкою без детальної причини. Подробиці дивіться в журналі.") +
-                @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
-                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
-            -LogPath $LOG_FILE
+            -LOG_FILE $LOG_FILE
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
     }
