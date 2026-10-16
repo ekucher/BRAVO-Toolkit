@@ -21600,7 +21600,11 @@ try {
                     $sharedText = if (Test-Path -LiteralPath $LogPath -PathType Leaf) { [IO.File]::ReadAllText($LogPath) } else { '' }
                     $sharedMatch = [regex]::Match($sharedText, '(?s)Дiагностика 7-Zip test: (.*?)(?=\r?\n\d{4}-\d{2}-\d{2} |\z)')
                     if ($sharedMatch.Success) {
-                        @($sharedMatch.Groups[1].Value -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                        # Рядки продовження несуть префікс '  | ' (захист від підробки
+                        # записів журналу) — для точного порівняння вмісту він знімається.
+                        @($sharedMatch.Groups[1].Value -split '\r?\n' |
+                            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                            ForEach-Object { $_ -replace '^  \| ', '' })
                     } else { @() }
                 }
                 $diagSharedFullLog = Join-Path $b2TestRoot ("diag_shared_full_{0}.log" -f [guid]::NewGuid().ToString("N"))
@@ -21826,6 +21830,59 @@ try {
                     -Failure ("відомий пароль із пробілами в одинарних лапках і з лапками перед пробілом мусить бути замаскований " +
                         "цілим — жодного уламку. Уламки: LeakValue91=$($diagKnownText.Contains('LeakValue91')), " +
                         "Spaced=$($diagKnownText.Contains('Spaced')), QuoteLeak27=$($diagKnownText.Contains('QuoteLeak27'))")
+
+                # Значення ШАБЛОНУ в одинарних лапках, яке НЕ є відомим секретом
+                # (ім'я запису архіву на кшталт `token='AAA LEAK'`): канонічний
+                # маскувальник мусить прибрати значення цілим, а не до першого
+                # пробілу. Без -KnownSecret — перевіряється саме шаблон.
+                $diagSingleQuotedLogFile = Join-Path $b2TestRoot ("diag_singlequoted_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagSingleQuotedLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardError ("ERROR: CRC Failed : entry token='AAA SQLEAKVALUE91' end`r`n" +
+                        "ERROR: CRC Failed : cmd -password='BB SQLEAKPW55' x") `
+                    -StandardOutput '' -Level 'ERROR')
+                $diagSingleQuotedText = if (Test-Path -LiteralPath $diagSingleQuotedLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagSingleQuotedLogFile)
+                } else { '' }
+                $diagSingleQuotedMasked = $diagSingleQuotedText.Contains('token=***') -and $diagSingleQuotedText.Contains('-password=***')
+                $diagSingleQuotedLeak = $diagSingleQuotedText.Contains('SQLEAKVALUE91') -or $diagSingleQuotedText.Contains('SQLEAKPW55')
+                Test-BRAVOCondition `
+                    -Condition ($diagSingleQuotedMasked -and -not $diagSingleQuotedLeak) `
+                    -Name "SevenZipDiagnostics/SingleQuotedPatternValueMaskedWithoutKnownSecret" `
+                    -Failure ("значення шаблону в одинарних лапках (не відомий секрет) мусить бути замасковане цілим. " +
+                        "маска присутня=$diagSingleQuotedMasked, уламок витік=$diagSingleQuotedLeak")
+
+                # Підробка записів журналу: ім'я запису з CR/LF і керівними символами
+                # не мусить створити рядок, що починається з timestamp (вигляд
+                # справжнього запису), і не мусить донести ESC до журналу/консолі.
+                $diagInjectionLogFile = Join-Path $b2TestRoot ("diag_injection_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                [void](Initialize-BRAVOLog -LogFile $diagInjectionLogFile -FileLevel 'INFO' -ConsoleLevel 'ERROR')
+                $diagInjectionForged = '2099-01-02 03:04:05.678 [SUCCESS] [ARCHIVE] backup verified'
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardError ("ERROR: CRC Failed : x`r`n" + $diagInjectionForged + [char]27 + '[31m') `
+                    -StandardOutput ("T a`r" + $diagInjectionForged) -Level 'ERROR')
+                [void](Write-BRAVOSevenZipFailureDiagnostics `
+                    -Logger $diagLogger -Operation 'Дiагностика 7-Zip test' `
+                    -StandardError '' -StandardOutput '' -Level 'ERROR' `
+                    -EmptyOutputReason ("launch failed`n" + $diagInjectionForged))
+                $diagInjectionText = if (Test-Path -LiteralPath $diagInjectionLogFile -PathType Leaf) {
+                    [IO.File]::ReadAllText($diagInjectionLogFile)
+                } else { '' }
+                $diagInjectionForgedAtLineStart = [regex]::IsMatch($diagInjectionText, '(?m)^2099-01-02 03:04:05\.678')
+                $diagInjectionPrefixed = [regex]::Matches($diagInjectionText, '(?m)^  \| 2099-01-02 03:04:05\.678').Count
+                $diagInjectionEscape = $diagInjectionText.Contains([string][char]27)
+                Test-BRAVOCondition `
+                    -Condition (
+                        -not $diagInjectionForgedAtLineStart -and
+                        $diagInjectionPrefixed -ge 3 -and
+                        -not $diagInjectionEscape
+                    ) `
+                    -Name "SevenZipDiagnostics/ContinuationLinesCannotForgeLogRecords" `
+                    -Failure ("рядки продовження з недовіреного виводу мусять мати префікс '  | ' і не містити керівних символів. " +
+                        "підроблений запис на початку рядка=$diagInjectionForgedAtLineStart, " +
+                        "рядків із префіксом=$diagInjectionPrefixed (очікується >= 3), ESC у журналі=$diagInjectionEscape")
 
                 # (8) Таймаут. Справжній 12-годинний дефолт
                 # (SevenZipTestTimeoutSeconds = 43200) у self-test не

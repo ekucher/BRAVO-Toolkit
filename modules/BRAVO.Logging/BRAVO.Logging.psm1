@@ -182,12 +182,16 @@ function Protect-BRAVOLogSecret {
     }
     # Облікові дані всередині URL: sftp://user:password@host -> sftp://user:***@host
     $sanitized = $sanitized -replace '(?i)([a-z][a-z0-9+.-]*://[^:/\s@]+):[^@\s]+@', '$1:***@'
+    # Значення шаблонів нижче: у подвійних лапках, в ОДИНАРНИХ лапках (інакше
+    # `token='AAA LEAK'` маскувалось би лише до першого пробілу й лишало
+    # `token=*** LEAK'`) або без лапок до пробілу. В одинарно-лапкованому
+    # PowerShell-літералі одинарна лапка подвоюється ('').
     # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
-    $sanitized = $sanitized -replace '(?i)(-password=)(?:"[^"]*"|\S+)', '$1***'
+    $sanitized = $sanitized -replace '(?i)(-password=)(?:"[^"]*"|''[^'']*''|\S+)', '$1***'
     # (?!ath|assword) — інакше це правило повторно "з'їдає" вже замасковане
     # -password=*** з рядка вище, розпізнавши його як коротку форму -p.
-    $sanitized = $sanitized -replace '(?i)(\s-p)(?!ath|assword)(?:"[^"]*"|\S+)', '$1***'
-    $sanitized = $sanitized -replace '(?i)((?:password|passwd|secret|token)\s*[:=]\s*)(?:"[^"]*"|\S+)', '$1***'
+    $sanitized = $sanitized -replace '(?i)(\s-p)(?!ath|assword)(?:"[^"]*"|''[^'']*''|\S+)', '$1***'
+    $sanitized = $sanitized -replace '(?i)((?:password|passwd|secret|token)\s*[:=]\s*)(?:"[^"]*"|''[^'']*''|\S+)', '$1***'
     # Webhook URL — сам bearer-секрет, без user:pass@; підтримувані провайдери
     # (Send-BRAVOWebhookNotification -Provider slack|discord) мають токен
     # прямо у шляху, а не в окремому параметрі.

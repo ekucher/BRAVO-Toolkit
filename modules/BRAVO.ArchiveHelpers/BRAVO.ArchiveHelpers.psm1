@@ -175,8 +175,36 @@ function Get-BRAVOSevenZipDiagnosticStreamLines {
     return @(
         [string]$StreamText -split '\r\n|\r|\n' |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Select-Object -Last $MaximumLines
+            Select-Object -Last $MaximumLines |
+            ForEach-Object { ConvertTo-BRAVOSevenZipDiagnosticSafeLine -Line $_ }
     )
+}
+
+function ConvertTo-BRAVOSevenZipDiagnosticSafeLine {
+    # Приватний helper: один рядок недовіреного тексту (імена записів архіву,
+    # тексти винятків) без керівних символів. Розриви рядків уже розділені
+    # викликачем; решта керівних символів (ESC для ANSI-послідовностей
+    # консолі, VT/FF, NEL, U+2028/U+2029, які деякі переглядачі показують як
+    # розрив) замінюється на '?', щоб сформований архів не міг підробити
+    # вигляд журналу чи консолі. Табуляція лишається.
+    param([AllowNull()][AllowEmptyString()][string]$Line)
+
+    return ([string]$Line -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\u0085\u2028\u2029]', '?')
+}
+
+function Join-BRAVOSevenZipDiagnosticRecordLines {
+    # Приватний helper: багаторядковий payload запису -> текст для logger-а.
+    # Write-BRAVOLog ставить timestamp і рівень лише перед ПЕРШИМ фізичним
+    # рядком; без маркування рядок продовження з недовіреного виводу на
+    # кшталт `2026-10-16 01:00:00.000 [SUCCESS] [ARCHIVE] backup verified`
+    # виглядав би як окремий справжній запис журналу (і в masked-копії на
+    # SFTP, і в консолі). Тому кожен рядок продовження починається з
+    # непідроблюваного префікса — справжній запис журналу завжди
+    # починається з timestamp у першій колонці.
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+
+    $continuationPrefix = '  | '
+    return ([string]$Text -replace '\r\n|\r|\n', ([Environment]::NewLine + $continuationPrefix))
 }
 
 function Get-BRAVOSevenZipDiagnosticReasonText {
@@ -204,7 +232,7 @@ function Get-BRAVOSevenZipDiagnosticReasonText {
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
     $reasonLines = @($allReasonLines | Select-Object -First $lineLimit)
-    $reasonText = ($reasonLines | ForEach-Object { $_.Trim() }) -join [Environment]::NewLine
+    $reasonText = ($reasonLines | ForEach-Object { (ConvertTo-BRAVOSevenZipDiagnosticSafeLine -Line $_).Trim() }) -join [Environment]::NewLine
     $tailTruncationMarker = ' … (обрізано)'
     $linesDropped = ($allReasonLines.Count -gt $reasonLines.Count)
     if ($MaximumLength -gt $tailTruncationMarker.Length -and
@@ -368,21 +396,23 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     # того потоку, який замінює, тож пріоритет stderr не порушується:
     # позначка пропущеного stdout отримує лише залишок бюджету рядків після
     # stderr і ніколи не витісняє вердикт stderr.
-    $errorLines = if ($maskedStandardError.Omitted) {
+    # @(...) навколо if-виразу: if-вираз розгортає порожній масив у $null, і
+    # під StrictMode .Count нижче кинув би виняток (клас дефекту #449).
+    $errorLines = @(if ($maskedStandardError.Omitted) {
         @("stderr 7-Zip ($($maskedStandardError.Length) символів) не записано: надто великий або з надто довгим суцільним фрагментом для безпечного маскування")
     } else {
         @(Get-BRAVOSevenZipDiagnosticStreamLines `
             -StreamText ([string]$maskedStandardError.Text) -MaximumLines $MaximumLines)
-    }
+    })
     $outputLines = @()
     $outputLineBudget = $MaximumLines - $errorLines.Count
     if ($outputLineBudget -gt 0) {
-        $outputLines = if ($maskedStandardOutput.Omitted) {
+        $outputLines = @(if ($maskedStandardOutput.Omitted) {
             @("stdout 7-Zip ($($maskedStandardOutput.Length) символів) не записано: надто великий або з надто довгим суцільним фрагментом для безпечного маскування")
         } else {
             @(Get-BRAVOSevenZipDiagnosticStreamLines `
                 -StreamText ([string]$maskedStandardOutput.Text) -MaximumLines $outputLineBudget)
-        }
+        })
     }
     $diagnosticLines = @($errorLines) + @($outputLines)
 
@@ -391,7 +421,13 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     # довжину префікса. Мінімум гарантує місце хоча б для маркера обрізання.
     $truncationMarker = '(обрізано) … '
     $tailTruncationMarker = ' … (обрізано)'
-    $payloadBudget = [math]::Max($MaximumLength - $recordPrefix.Length, $truncationMarker.Length + 1)
+    # Запас під префікс рядків продовження (Join-BRAVOSevenZipDiagnosticRecordLines):
+    # він додається вже після бюджетування, тож мусить бути врахований тут —
+    # рівно за кількістю рядків цього запису, інакше багаторядковий запис
+    # вийшов би за межу на довжину префіксів.
+    $continuationPrefixLength = '  | '.Length
+    $continuationReserve = [math]::Max(0, $diagnosticLines.Count - 1) * $continuationPrefixLength
+    $payloadBudget = [math]::Max($MaximumLength - $recordPrefix.Length - $continuationReserve, $truncationMarker.Length + 1)
 
     if ($diagnosticLines.Count -eq 0) {
         # «Інструмент промовчав» мусить відрізнятись від «діагностику
@@ -407,11 +443,16 @@ function Write-BRAVOSevenZipFailureDiagnostics {
         if (-not [string]::IsNullOrEmpty($reasonText)) {
             $emptyMessage += "; причина: $reasonText"
         }
-        if ($emptyMessage.Length -gt $payloadBudget) {
-            $emptyMessage = $emptyMessage.Substring(0, $payloadBudget - $tailTruncationMarker.Length) +
+        # Гілка порожнього виводу має власну кількість рядків (рядки причини).
+        $emptyLineCount = @($emptyMessage -split '\r\n|\r|\n').Count
+        $emptyBudget = [math]::Max(
+            $MaximumLength - $recordPrefix.Length - ([math]::Max(0, $emptyLineCount - 1) * $continuationPrefixLength),
+            $tailTruncationMarker.Length + 1)
+        if ($emptyMessage.Length -gt $emptyBudget) {
+            $emptyMessage = $emptyMessage.Substring(0, $emptyBudget - $tailTruncationMarker.Length) +
                 $tailTruncationMarker
         }
-        Write-BRAVOArchiveHelperLog -Logger $Logger -Message ($recordPrefix + $emptyMessage) -Level $Level
+        Write-BRAVOArchiveHelperLog -Logger $Logger -Message ($recordPrefix + (Join-BRAVOSevenZipDiagnosticRecordLines -Text $emptyMessage)) -Level $Level
         return $false
     }
 
@@ -463,7 +504,7 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     }
     Write-BRAVOArchiveHelperLog `
         -Logger $Logger `
-        -Message ($recordPrefix + $diagnosticText) `
+        -Message ($recordPrefix + (Join-BRAVOSevenZipDiagnosticRecordLines -Text $diagnosticText)) `
         -Level $Level
     return $true
 }
