@@ -250,6 +250,14 @@ function Invoke-BRAVOLogSyncRun {
         BudgetExhausted = $false
         SessionBroke = $false
         Errors = New-Object System.Collections.Generic.List[string]
+        # Review (P1): файл, що сам перевищує MaxTotalBytes, раніше ламав
+        # УВЕСЬ цикл (break), а оскільки план сортується за іменем, цей
+        # самий файл назавжди лишався б першим і назавжди блокував би всі
+        # алфавітно пізніші файли від вивантаження в БУДЬ-якому майбутньому
+        # прогоні -- постійна голодовка, не просто обмеження одного прогону.
+        # Такий файл пропускається (не рахується як Failed, не ставить
+        # BudgetExhausted), а цикл іде далі.
+        OversizedSkipped = New-Object System.Collections.Generic.List[string]
     }
 
     $snapshot = Get-BRAVOLogSyncLocalSnapshot -LogsDirectory $LogsDirectory
@@ -279,6 +287,14 @@ function Invoke-BRAVOLogSyncRun {
         if ($result.Attempted -ge $MaxFiles) {
             $result.BudgetExhausted = $true
             break
+        }
+        if ($entry.Size -gt $MaxTotalBytes) {
+            # Цей файл сам більший за весь бюджет -- ніколи не влізе,
+            # скільки прогонів не чекай. Пропускаємо саме його, не весь
+            # прогін (інакше він назавжди блокував би алфавітно пізніші
+            # файли -- саме той дефект, який цей фікс усуває).
+            [void]$result.OversizedSkipped.Add($entry.FileName)
+            continue
         }
         if (($totalBytesThisRun + $entry.Size) -gt $MaxTotalBytes) {
             $result.BudgetExhausted = $true

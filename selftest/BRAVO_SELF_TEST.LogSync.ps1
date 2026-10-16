@@ -112,6 +112,36 @@ try {
     ) -Name 'LogSync/BudgetStopsAfterMaxFiles' `
         -Failure "#364: -MaxFiles 2 має зупинити цикл рівно після 2 спроб і позначити BudgetExhausted; факт Attempted=$($logSyncRun5.Attempted) BudgetExhausted=$($logSyncRun5.BudgetExhausted)"
 
+    # --- LogSync/OversizedFileSkippedNotStarvingRest (review P1) ---
+    # Файл, що сам перевищує MaxTotalBytes, раніше ламав ВЕСЬ цикл (break):
+    # оскільки план сортується за іменем, цей самий файл назавжди лишався б
+    # першим і назавжди блокував би алфавітно пізніші файли від
+    # вивантаження в БУДЬ-якому майбутньому прогоні. 'BRAVO_ARCHIV_...'
+    # сортується раніше за 'script_log_...' -- саме порядок, що відтворює
+    # дефект.
+    $logSyncOversizedDir = Join-Path ([IO.Path]::GetTempPath()) ("logsync_oversized_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($logSyncOversizedDir)
+    $logSyncOversizedState = Join-Path ([IO.Path]::GetTempPath()) ("logsync_oversized_state_{0}" -f [guid]::NewGuid().ToString('N'))
+    [IO.File]::WriteAllText((Join-Path $logSyncOversizedDir 'BRAVO_ARCHIV_huge.log'), ('x' * 200), (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $logSyncOversizedDir 'script_log_small.txt'), 'small', (New-Object Text.UTF8Encoding($false)))
+    $logSyncRun7Attempts = New-Object System.Collections.Generic.List[string]
+    $logSyncRun7 = Invoke-BRAVOLogSyncRun -LogsDirectory $logSyncOversizedDir -StateRoot $logSyncOversizedState `
+        -RemoteDirectory 'logs/runtime/SELFTEST-HOST' -MaxTotalBytes 100 `
+        -MaskFile { param($p) $p } -RemoveMaskedCopy { param($p) } `
+        -UploadFile {
+            param($local, $remoteDir, $remoteName)
+            $logSyncRun7Attempts.Add($remoteName)
+            [pscustomobject]@{ Success = $true; Error = $null }
+        }
+    Test-BRAVOCondition -Condition (
+        $logSyncRun7.OversizedSkipped.Contains('BRAVO_ARCHIV_huge.log') -and
+        -not $logSyncRun7Attempts.Contains('BRAVO_ARCHIV_huge.log') -and
+        $logSyncRun7Attempts.Contains('script_log_small.txt') -and
+        $logSyncRun7.Uploaded -eq 1 -and
+        -not $logSyncRun7.BudgetExhausted
+    ) -Name 'LogSync/OversizedFileSkippedNotStarvingRest' `
+        -Failure "файл, що сам перевищує MaxTotalBytes, мусить бути пропущений (OversizedSkipped), а НЕ ламати цикл для алфавітно пізніших файлів; факт OversizedSkipped=$($logSyncRun7.OversizedSkipped -join ',') Attempts=$($logSyncRun7Attempts -join ',') Uploaded=$($logSyncRun7.Uploaded) BudgetExhausted=$($logSyncRun7.BudgetExhausted)"
+
     # --- LogSync/SessionBreakStopsCycleWithoutRetryStorm (розрив сесії) ---
     $logSyncRun6HealthChecks = 0
     $logSyncRun6 = Invoke-BRAVOLogSyncRun -LogsDirectory $logSyncLogsDir -StateRoot $logSyncStateRoot `

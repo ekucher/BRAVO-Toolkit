@@ -4652,10 +4652,23 @@ function Connect-BRAVOOwnLogSftpSession {
 
 function Send-BRAVOOwnLogFile {
     # Best-effort вивантаження ОДНОГО власного файлу (live-лог прогону,
-    # знімок range_id_log.json) на SFTP. Другорядний/телеметричний ефект:
-    # провал — лише WARNING, ніколи не встановлює
-    # $script:criticalErrorOccurred і не впливає на exit code.
+    # знімок range_id_log.json) на SFTP. Другорядний/телеметричний ефект для
+    # ДВОХ наявних (не змінених) викликів нижче — провал лише WARNING,
+    # ніколи не встановлює $script:criticalErrorOccurred і не впливає на
+    # exit code; обидва викликають функцію як bare statement і НЕ читають
+    # результат.
+    #
+    # #364 (review, P0): для Invoke-BRAVOMaintenanceRuntimeLogSync (нижче)
+    # функція ПОВЕРТАЄ Success/Error явно -- раніше не повертала нічого, і
+    # викликач вважав спробу успішною, якщо функція просто не кинула виняток
+    # (а вона НІКОЛИ не кидає -- усе ловиться тут же). Це означало, що
+    # реальний провал передачі (мережа, диск на віддаленому боці, збій
+    # сесії) усе одно писався в ledger як доставлений і НІКОЛИ не
+    # повторювався -- мовчазна втрата файлу, той самий клас, що й #332, яку
+    # цей PR мав фіксувати. [pscustomobject] Success/Error тут не псує два
+    # наявні bare-виклики: вони результат не читають.
     [CmdletBinding()]
+    [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory = $true)]$Session,
         [Parameter(Mandatory = $true)][string]$LocalLogPath,
@@ -4667,7 +4680,11 @@ function Send-BRAVOOwnLogFile {
         [AllowNull()][scriptblock]$Logger
     )
     try {
-        if (-not (Test-Path -LiteralPath $LocalLogPath -PathType Leaf)) { return }
+        if (-not (Test-Path -LiteralPath $LocalLogPath -PathType Leaf)) {
+            # Локального файлу зараз немає -- нічого вивантажувати, це не
+            # відмова передачі (не варто позначати як Failed для retry-логіки).
+            return [pscustomobject]@{ Success = $true; Error = $null }
+        }
         if ([string]::IsNullOrWhiteSpace($RemoteFileName)) {
             $RemoteFileName = [System.IO.Path]::GetFileName($LocalLogPath)
         }
@@ -4684,8 +4701,10 @@ function Send-BRAVOOwnLogFile {
         if (-not $ownLogResult.Success) {
             Write-Log "Власний лог: передача $LocalLogPath не вдалася: $($ownLogResult.Error)" -Level "WARNING"
         }
+        return [pscustomobject]@{ Success = [bool]$ownLogResult.Success; Error = $ownLogResult.Error }
     } catch {
         Write-Log "Власний лог: передача $LocalLogPath не вдалася: $($_.Exception.Message)" -Level "WARNING"
+        return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
     }
 }
 
@@ -4755,11 +4774,11 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                 $ownLogRemoteDirectory = [string]$sftpDirectories.MaintenanceLog
                 # Копія має те саме ім'я файлу, що й живий лог, тому
                 # remote-ім'я не змінюється.
-                Send-BRAVOOwnLogFile `
+                [void](Send-BRAVOOwnLogFile `
                     -Session $ownLogUploadSession `
                     -LocalLogPath $ownLogMaskedCopyPath `
                     -RemoteDirectory $ownLogRemoteDirectory `
-                    -Logger $null
+                    -Logger $null)
 
                 # R3-3 (round-3 review): range_id_log.json пише служба
                 # BRAVO КОНКУРЕНТНО з цим прогоном (toolkit його лише
@@ -4785,12 +4804,12 @@ function Invoke-BRAVOMaintenanceOwnLogUpload {
                         # #365: маскована копія знімка; збій -> catch нижче,
                         # знімок НЕ вивантажується (fail-closed).
                         $ownRangeIdLogMaskedCopyPath = New-BRAVOMaskedLogCopy -Path $ownRangeIdLogSnapshotPath -KnownSecret $ownLogMaskSet.Secrets
-                        Send-BRAVOOwnLogFile `
+                        [void](Send-BRAVOOwnLogFile `
                             -Session $ownLogUploadSession `
                             -LocalLogPath $ownRangeIdLogMaskedCopyPath `
                             -RemoteDirectory $ownLogRemoteDirectory `
                             -RemoteFileName ("range_id_log_{0}.json" -f $maintenanceLogRunId) `
-                            -Logger $null
+                            -Logger $null)
                     } catch {
                         Write-Log "Власний лог: не вдалося створити знімок range_id_log.json: $($_.Exception.Message)" -Level "WARNING"
                     }
@@ -4885,25 +4904,28 @@ function Invoke-BRAVOMaintenanceRuntimeLogSync {
                 -UploadFile {
                     param($localPath, $remoteDirectory, $remoteFileName)
                     try {
+                        # Review (P0): Send-BRAVOOwnLogFile тепер явно повертає
+                        # Success/Error -- раніше тут вважали спробу успішною,
+                        # якщо функція просто не кинула виняток (а вона ніколи
+                        # не кидає, бо ловить усе сама), тож реальний провал
+                        # передачі писався в ledger як доставлений і ніколи не
+                        # повторювався.
                         Send-BRAVOOwnLogFile `
                             -Session $runtimeLogSyncSession `
                             -LocalLogPath $localPath `
                             -RemoteDirectory $remoteDirectory `
                             -RemoteFileName $remoteFileName `
                             -Logger $null
-                        # Send-BRAVOOwnLogFile сама best-effort (WARNING у
-                        # лог, без винятку) — її контракт повернення не
-                        # bool/error-об'єкт, тож тут вважаємо спробу
-                        # успішною, якщо вона не кинула виняток. Реальний
-                        # провал передачі вже потрапив у лог окремим
-                        # WARNING-рядком зсередини Send-BRAVOOwnLogFile.
-                        [pscustomobject]@{ Success = $true; Error = $null }
                     } catch {
                         [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
                     }
                 } `
                 -IsSessionHealthy { [bool]$runtimeLogSyncSession.Opened }
 
+            if ($runtimeLogSyncResult.OversizedSkipped.Count -gt 0) {
+                Write-Log ("Runtime-логи: файл(и) більші за MaxTotalBytes пропущено назавжди (ніколи не влізуть у бюджет): " +
+                    ($runtimeLogSyncResult.OversizedSkipped -join ', ')) -Level "WARNING"
+            }
             if ($runtimeLogSyncResult.Failed -gt 0) {
                 Write-Log ("Runtime-логи: $($runtimeLogSyncResult.Failed) з $($runtimeLogSyncResult.Attempted) файл(ів) не вивантажено: " +
                     ($runtimeLogSyncResult.Errors -join '; ')) -Level "WARNING"
