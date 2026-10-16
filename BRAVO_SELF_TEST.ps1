@@ -12079,10 +12079,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         Test-BRAVOCondition `
             -Condition (
                 $maintenanceRestoreWindowText -match
-                '\$shouldRestore\s*=\s*\$BravoMaintenanceEnabled\s*-and\s*\(\s*\$ForceRestore\s*-or\s*\(\$automaticRestoreDue\s*-and\s*\(\$restoreWindowOpen\s*-or\s*\$bootRestoreIgnoresWindow\)\)\s*\)'
+                '\$shouldRestore\s*=\s*\$BravoMaintenanceEnabled\s*-and\s*\(\s*\$ForceRestore\s*-or\s*\(\$automaticRestoreDue\s*-and\s*-not\s*\$automaticRestoreRetryBlocked\s*-and\s*\(\$restoreWindowOpen\s*-or\s*\$bootRestoreIgnoresWindow\)\)\s*\)'
             ) `
             -Name 'Maintenance/RestoreWindowGatesAutomaticButNotForce' `
-            -Failure 'вікно має обмежувати автоматичні шляхи 24/7-профілю; винятки — -ForceRestore (будь-коли) і boot-recovery профілю робочого часу ($bootRestoreIgnoresWindow, Restore.BootRestoreMode=HoldServices)'
+            -Failure 'вікно (і #438: ліміт поспіль-відкотів) має обмежувати автоматичні шляхи 24/7-профілю; винятки — -ForceRestore (будь-коли) і boot-recovery профілю робочого часу ($bootRestoreIgnoresWindow, Restore.BootRestoreMode=HoldServices)'
 
         # --- P0 TOCTOU: $shouldRestore/$restoreWindowOpen обчислюються
         # ЗАДОВГО до Enter-BRAVOMaintenanceOperationLock (до
@@ -12165,6 +12165,29 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     ) `
                     -Name "Maintenance/RestoreDecision[$($forceDisabledScenario.Label)]" `
                     -Failure "Get-BRAVOMaintenanceRestoreDecision[$($forceDisabledScenario.Label)]: очікувалось ShouldRestore=$($forceDisabledScenario.Should), RestoreOnDisabledBravo=$($forceDisabledScenario.OnDisabled); отримано $($forceDisabledDecision.ShouldRestore)/$($forceDisabledDecision.RestoreOnDisabledBravo) — -ForceRestore при Disabled має виконувати реставрацію, звичайний Maintenance при Disabled — ні"
+            }
+
+            # --- #438: automaticRestoreRetryBlocked зупиняє АВТОМАТИЧНИЙ
+            # шлях (той самий принцип, що тижнева квота), -ForceRestore не
+            # обмежується (окремий диз'юнкт у формулі).
+            $retryBlockScenarios = @(
+                @{ Label = 'Automatic+Blocked+InWindow'; Args = @($true, $false, $false, $true, $true, $false, $true); Should = $false },
+                @{ Label = 'Automatic+Blocked+BootIgnoresWindow'; Args = @($true, $false, $false, $true, $false, $true, $true); Should = $false },
+                @{ Label = 'Force+Blocked'; Args = @($true, $false, $true, $true, $true, $false, $true); Should = $true },
+                @{ Label = 'Automatic+NotBlocked+InWindow'; Args = @($true, $false, $false, $true, $true, $false, $false); Should = $true }
+            )
+            foreach ($retryBlockScenario in $retryBlockScenarios) {
+                $retryBlockDecision = & $forceDisabledModule {
+                    param($a)
+                    Get-BRAVOMaintenanceRestoreDecision `
+                        -BravoMaintenanceEnabled $a[0] -BravoServiceDisabled $a[1] -ForceRestore $a[2] `
+                        -automaticRestoreDue $a[3] -restoreWindowOpen $a[4] -bootRestoreIgnoresWindow $a[5] `
+                        -automaticRestoreRetryBlocked $a[6]
+                } $retryBlockScenario.Args
+                Test-BRAVOCondition `
+                    -Condition ([bool]$retryBlockDecision.ShouldRestore -eq $retryBlockScenario.Should) `
+                    -Name "Maintenance/RestoreDecision[$($retryBlockScenario.Label)]" `
+                    -Failure "Get-BRAVOMaintenanceRestoreDecision[$($retryBlockScenario.Label)] (#438): очікувалось ShouldRestore=$($retryBlockScenario.Should), отримано $($retryBlockDecision.ShouldRestore) — ліміт поспіль-відкотів мусить зупиняти лише АВТОМАТИЧНИЙ шлях, -ForceRestore не обмежується"
             }
 
             # Проводка: caller передає саме Disabled-стан у рішення.
@@ -12326,6 +12349,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     'Test-BRAVORestoreWeeklyQuotaConsumed',
                     'Write-BRAVORestoreForcedOutcome',
                     'Get-BRAVORestoreLastSuccessfulAt',
+                    # #438: внутрішні залежності Write-BRAVORestoreState (зберігає
+                    # попередній лічильник/fingerprint, якщо викликач їх не передав).
+                    'Get-BRAVORestoreRollbackRetryCount',
+                    'Get-BRAVORestoreRollbackSignature',
                     'Write-BRAVORestoreState'
                 )
             # Слот-фікстури: неділя 03:00 (Restore.Day=7, Time=03:00).
@@ -12461,6 +12488,123 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             }
         }
 
+        # --- #438: лічильник поспіль-відкотів на ТОМУ САМОМУ наборі
+        # критичних файлів зупиняє автоматичні повтори реставрації; без
+        # нього "Rollback=SUCCESS, модель консистентна" повторюється
+        # щоночі без ліміту (реальний інцидент, SRV-LABA 2026-10-11..16).
+        & {
+            param([string]$RuntimeText)
+            $rollbackFingerprintModule = New-BRAVOSelfTestRuntimeModule `
+                -SourceText $RuntimeText `
+                -FunctionNames @('Get-BRAVORestoreRollbackFingerprint')
+
+            # 1. Чистий fingerprint: детерміністичний, порядок-незалежний
+            # (сортує за File), чутливий до зміни розміру/Missing, порожній
+            # масив -> '' (викликач трактує як "немає fingerprint").
+            $fingerprintA1 = & $rollbackFingerprintModule {
+                param($files) Get-BRAVORestoreRollbackFingerprint -CriticalFiles $files
+            } @(
+                [pscustomobject]@{ File = 'lims0.md'; BeforeSizeBytes = 4608; AfterSizeBytes = 2048; Missing = $false },
+                [pscustomobject]@{ File = 'DEPART.md'; BeforeSizeBytes = 1024; AfterSizeBytes = 0; Missing = $true }
+            )
+            # Той самий набір, інший порядок уводу -> той самий fingerprint.
+            $fingerprintA2 = & $rollbackFingerprintModule {
+                param($files) Get-BRAVORestoreRollbackFingerprint -CriticalFiles $files
+            } @(
+                [pscustomobject]@{ File = 'DEPART.md'; BeforeSizeBytes = 1024; AfterSizeBytes = 0; Missing = $true },
+                [pscustomobject]@{ File = 'lims0.md'; BeforeSizeBytes = 4608; AfterSizeBytes = 2048; Missing = $false }
+            )
+            # Інший розмір того самого файлу -> інший fingerprint.
+            $fingerprintB = & $rollbackFingerprintModule {
+                param($files) Get-BRAVORestoreRollbackFingerprint -CriticalFiles $files
+            } @(
+                [pscustomobject]@{ File = 'lims0.md'; BeforeSizeBytes = 4608; AfterSizeBytes = 1999; Missing = $false },
+                [pscustomobject]@{ File = 'DEPART.md'; BeforeSizeBytes = 1024; AfterSizeBytes = 0; Missing = $true }
+            )
+            $fingerprintEmpty = & $rollbackFingerprintModule {
+                param($files) Get-BRAVORestoreRollbackFingerprint -CriticalFiles $files
+            } @()
+            Test-BRAVOCondition `
+                -Condition (
+                    -not [string]::IsNullOrEmpty($fingerprintA1) -and
+                    $fingerprintA1 -ceq $fingerprintA2 -and
+                    $fingerprintA1 -cne $fingerprintB -and
+                    [string]::IsNullOrEmpty($fingerprintEmpty)
+                ) `
+                -Name "Maintenance/RollbackFingerprintIsOrderIndependentAndSizeSensitive" `
+                -Failure "Get-BRAVORestoreRollbackFingerprint (#438) мусить давати однаковий fingerprint для того самого набору файлів незалежно від порядку вводу, різний — для іншого розміру, і порожній рядок для порожнього масиву; факти: A1=$fingerprintA1 A2=$fingerprintA2 B=$fingerprintB Empty='$fingerprintEmpty'"
+
+            # 2. Повний цикл: той самий fingerprint 2 рази поспіль -> лічильник
+            # 1 -> 2 -> ПОРІГ -> Get-BRAVOMaintenanceRestoreDecision блокує
+            # АВТОМАТИЧНИЙ шлях, але не -ForceRestore. Інший fingerprint ->
+            # лічильник скидається на 1 (проблему змінено, не вирішено —
+            # не блокується). Status='Succeeded' скидає геть (вирішено).
+            $retryCycleModule = New-BRAVOSelfTestRuntimeModule `
+                -SourceText $RuntimeText `
+                -FunctionNames @(
+                    'Read-BRAVORestoreState', 'Write-BRAVORestoreState',
+                    'Get-BRAVORestoreRollbackRetryCount', 'Get-BRAVORestoreRollbackSignature',
+                    'Get-BRAVORestoreForcedCoveredSlot', 'Get-BRAVORestoreLastSuccessfulAt',
+                    'Get-BRAVOMaintenanceRestoreDecision'
+                )
+            $retryCycleStateRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RESTORE_RETRY438_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+            try {
+                [void](New-Item -ItemType Directory -Path $retryCycleStateRoot -Force)
+                $retryCycleSlot = [datetime]'2026-10-11 22:00:00'
+                $retryCycleResult = & $retryCycleModule {
+                    param($root, $slot, $fpA)
+                    $script:stateRoot = $root
+                    $r = [ordered]@{}
+
+                    # Відкат #1: новий fingerprint -> лічильник = 1, не блокує.
+                    Write-BRAVORestoreState -ScheduledOccurrence $slot -Status 'Pending' -Reason 'rollback1' -RollbackRetryCount 1 -RollbackSignature $fpA
+                    $afterFirst = Read-BRAVORestoreState
+                    $r.CountAfterFirst = Get-BRAVORestoreRollbackRetryCount -State $afterFirst
+                    $decisionAfterFirst = Get-BRAVOMaintenanceRestoreDecision -BravoMaintenanceEnabled $true -BravoServiceDisabled $false -ForceRestore $false `
+                        -automaticRestoreDue $true -restoreWindowOpen $true -bootRestoreIgnoresWindow $false `
+                        -automaticRestoreRetryBlocked ($r.CountAfterFirst -ge 2)
+                    $r.BlockedAfterFirst = -not [bool]$decisionAfterFirst.ShouldRestore
+
+                    # Відкат #2: ТОЙ САМИЙ fingerprint -> лічильник = 2, блокує автоматичний.
+                    Write-BRAVORestoreState -ScheduledOccurrence $slot -Status 'Pending' -Reason 'rollback2' -RollbackRetryCount 2 -RollbackSignature $fpA
+                    $afterSecond = Read-BRAVORestoreState
+                    $r.CountAfterSecond = Get-BRAVORestoreRollbackRetryCount -State $afterSecond
+                    $r.SignatureAfterSecond = Get-BRAVORestoreRollbackSignature -State $afterSecond
+                    $decisionAuto = Get-BRAVOMaintenanceRestoreDecision -BravoMaintenanceEnabled $true -BravoServiceDisabled $false -ForceRestore $false `
+                        -automaticRestoreDue $true -restoreWindowOpen $true -bootRestoreIgnoresWindow $false `
+                        -automaticRestoreRetryBlocked ($r.CountAfterSecond -ge 2)
+                    $decisionForce = Get-BRAVOMaintenanceRestoreDecision -BravoMaintenanceEnabled $true -BravoServiceDisabled $false -ForceRestore $true `
+                        -automaticRestoreDue $true -restoreWindowOpen $true -bootRestoreIgnoresWindow $false `
+                        -automaticRestoreRetryBlocked ($r.CountAfterSecond -ge 2)
+                    $r.AutomaticBlockedAfterSecond = -not [bool]$decisionAuto.ShouldRestore
+                    $r.ForceStillAllowedAfterSecond = [bool]$decisionForce.ShouldRestore
+
+                    # Успішна реставрація вирішує проблему -> повний скид.
+                    Write-BRAVORestoreState -ScheduledOccurrence $slot -Status 'Succeeded' -Reason 'resolved'
+                    $afterSucceeded = Read-BRAVORestoreState
+                    $r.CountAfterSucceeded = Get-BRAVORestoreRollbackRetryCount -State $afterSucceeded
+                    $r.SignatureAfterSucceeded = Get-BRAVORestoreRollbackSignature -State $afterSucceeded
+
+                    [pscustomobject]$r
+                } $retryCycleStateRoot $retryCycleSlot 'lims0.md|4608|2048|False;DEPART.md|1024|0|True'
+                Test-BRAVOCondition `
+                    -Condition (
+                        $retryCycleResult.CountAfterFirst -eq 1 -and -not $retryCycleResult.BlockedAfterFirst -and
+                        $retryCycleResult.CountAfterSecond -eq 2 -and
+                        $retryCycleResult.AutomaticBlockedAfterSecond -and
+                        $retryCycleResult.ForceStillAllowedAfterSecond -and
+                        $retryCycleResult.CountAfterSucceeded -eq 0 -and
+                        [string]::IsNullOrEmpty($retryCycleResult.SignatureAfterSucceeded)
+                    ) `
+                    -Name "Maintenance/RestoreRollbackRetryCapStopsAutomaticNotForce" `
+                    -Failure "#438: 2 поспіль відкоти з ТИМ САМИМ fingerprint мають блокувати автоматичний шлях (не -ForceRestore), а Status='Succeeded' мусить скидати лічильник/signature; факти: $($retryCycleResult | ConvertTo-Json -Compress)"
+            } finally {
+                if (Test-Path -LiteralPath $retryCycleStateRoot) {
+                    Remove-Item -LiteralPath $retryCycleStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } $maintenanceRestoreWindowText
+
         # --- Стан завдань: явне UTF-8 читання й атомарний запис (T017) ---
         # BRAVO_RESTORE_STATE.json і BRAVO_TASK_EXECUTION_STATE.json пишуться
         # UTF-8 без BOM, а Get-Content у Windows PowerShell 5.1 без -Encoding
@@ -12482,6 +12626,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 'Read-BRAVORestoreState',
                 'Get-BRAVORestoreForcedCoveredSlot',
                 'Get-BRAVORestoreLastSuccessfulAt',
+                # #438: внутрішні залежності Write-BRAVORestoreState (зберігає
+                # попередній лічильник/fingerprint, якщо викликач їх не передав).
+                'Get-BRAVORestoreRollbackRetryCount',
+                'Get-BRAVORestoreRollbackSignature',
                 'Write-BRAVORestoreState',
                 'Get-BRAVOTaskExecutionState',
                 'Write-BRAVOTaskExecutionState'
@@ -15621,6 +15769,11 @@ $restoreOnDisabledBravo = $false
 $restoreReason = ''
 $weeklyRestoreQuotaConsumed = $false
 $restoreSkippedByWindow = $false
+# #438: той самий принцип, що $restoreSkippedByWindow вище — обчислюється
+# ДО probeRegion (before Initialize-BRAVOMaintenanceSteps), читається
+# всередині нього; probeRegion саму точку обчислення не включає.
+$automaticRestoreRetryBlocked = $false
+$restoreSkippedByRetryBlock = $false
 $isRestoreDay = $false
 $isAfterRestoreTime = $false
 $maintenanceDailyAtInsideRestoreWindow = $true

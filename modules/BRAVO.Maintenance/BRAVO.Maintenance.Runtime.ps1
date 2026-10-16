@@ -698,9 +698,14 @@ function Get-BRAVOMaintenanceRestoreDecision {
         [bool]$ForceRestore,
         [bool]$automaticRestoreDue,
         [bool]$restoreWindowOpen,
-        [bool]$bootRestoreIgnoresWindow
+        [bool]$bootRestoreIgnoresWindow,
+        # #438: після N поспіль відкотів на тому самому наборі файлів
+        # (Issue #438 — реставрація інакше повторюється щоночі без ліміту).
+        # Той самий принцип, що тижнева квота: -ForceRestore НЕ обмежується
+        # (окремий диз'юнкт нижче) — свідома дія оператора завжди проходить.
+        [bool]$automaticRestoreRetryBlocked
     )
-    $shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)))
+    $shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and -not $automaticRestoreRetryBlocked -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)))
     $restoreOnDisabledBravo = [bool]($ForceRestore -and $BravoServiceDisabled -and -not $BravoMaintenanceEnabled)
     return [pscustomobject]@{
         ShouldRestore = [bool]($shouldRestore -or $restoreOnDisabledBravo)
@@ -2182,11 +2187,50 @@ function Write-BRAVORestoreForcedOutcome {
     Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json -Depth 3)
 }
 
+
+# #438: лічильник поспіль-відкотів НА ТОМУ САМОМУ наборі критичних файлів
+# — StrictMode-безпечне читання (той самий ідіом, що Get-BRAVORestoreForcedCoveredSlot
+# вище): стан, збережений попередньою версією, цього поля не має —
+# відсутність означає "лічильник = 0", тобто точну попередню поведінку.
+function Get-BRAVORestoreRollbackRetryCount {
+    param($State)
+    if ($null -eq $State) { return 0 }
+    if ($null -eq $State.PSObject.Properties['RollbackRetryCount']) { return 0 }
+    [int]$parsed = 0
+    if ([int]::TryParse([string]$State.RollbackRetryCount, [ref]$parsed) -and $parsed -ge 0) { return $parsed }
+    return 0
+}
+
+function Get-BRAVORestoreRollbackSignature {
+    param($State)
+    if ($null -eq $State) { return '' }
+    if ($null -eq $State.PSObject.Properties['RollbackSignature']) { return '' }
+    return [string]$State.RollbackSignature
+}
+
+# #438: детерміністичний fingerprint набору критичних файлів із
+# Compare-FileSizes (через Invoke-BRAVOModelRestoreRecovery.CriticalFiles).
+# Мета — відрізнити "той самий" збій (той самий файл(и), той самий
+# розмір до/після) від "іншого" збою того самого розміру набору; НЕ
+# криптографічний хеш (не потрібен — лише порівняння рівності в межах
+# одного стейт-файлу). Порожній масив -> '' (викликач трактує '' як
+# "немає fingerprint", ніколи не рахує це повтором).
+function Get-BRAVORestoreRollbackFingerprint {
+    param([array]$CriticalFiles = @())
+    $sorted = @($CriticalFiles) | Sort-Object -Property @{ Expression = { [string]$_.File } } -CaseSensitive
+    $parts = @(foreach ($item in $sorted) {
+        '{0}|{1}|{2}|{3}' -f [string]$item.File, [string]$item.BeforeSizeBytes, [string]$item.AfterSizeBytes, [string]([bool]$item.Missing)
+    })
+    return [string]::Join(';', $parts)
+}
+
 function Write-BRAVORestoreState {
     param(
         [datetime]$ScheduledOccurrence,
         [string]$Status,
-        [string]$Reason
+        [string]$Reason,
+        [int]$RollbackRetryCount,
+        [string]$RollbackSignature
     )
     $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
     if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
@@ -2207,12 +2251,32 @@ function Write-BRAVORestoreState {
     } else {
         Get-BRAVORestoreLastSuccessfulAt -State $existingRestoreState
     }
+    # #438: Status='Succeeded' завжди скидає лічильник/fingerprint —
+    # проблему вирішено. Якщо викликач ці параметри не передав (наприклад,
+    # наявний виклик зі статусом 'Pending' при lock-skip), значення
+    # зберігається — той самий принцип, що ForcedRestoreCoversSlot вище.
+    $resolvedRollbackRetryCount = if ($Status -eq 'Succeeded') {
+        0
+    } elseif ($PSBoundParameters.ContainsKey('RollbackRetryCount')) {
+        $RollbackRetryCount
+    } else {
+        Get-BRAVORestoreRollbackRetryCount -State $existingRestoreState
+    }
+    $resolvedRollbackSignature = if ($Status -eq 'Succeeded') {
+        ''
+    } elseif ($PSBoundParameters.ContainsKey('RollbackSignature')) {
+        $RollbackSignature
+    } else {
+        Get-BRAVORestoreRollbackSignature -State $existingRestoreState
+    }
     $state = [pscustomobject]@{
         ScheduledOccurrence = $ScheduledOccurrence.ToString('o')
         Status = $Status
         Reason = $Reason
         ForcedRestoreCoversSlot = $(if ($null -ne $preservedForcedCoversSlot) { ([datetime]$preservedForcedCoversSlot).ToString('o') } else { $null })
         LastSuccessfulRestoreAt = $(if ($null -ne $lastSuccessfulRestoreAt) { ([datetime]$lastSuccessfulRestoreAt).ToString('o') } else { $null })
+        RollbackRetryCount = $resolvedRollbackRetryCount
+        RollbackSignature = $resolvedRollbackSignature
         UpdatedAt = ([datetime]::Now).ToString('o')
     }
     Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json -Depth 3)
@@ -6639,6 +6703,11 @@ function Invoke-BRAVOModelRestoreRecovery {
         HasCriticalChanges   = $compare.HasCriticalChanges
         RemovedByRepairCount = $compare.RemovedByRepairCount
         CriticalCount        = @($compare.CriticalFiles).Count
+        # #438: file-level деталі (File/BeforeSizeBytes/AfterSizeBytes/Missing)
+        # потрібні викликачу для Get-BRAVORestoreRollbackFingerprint — лише
+        # CriticalCount не розрізняє "той самий" набір файлів від "іншого"
+        # набору того самого розміру.
+        CriticalFiles        = @($compare.CriticalFiles)
         MainModelValid       = $compare.MainModelValid
     }
 }
@@ -8311,6 +8380,15 @@ $weeklyRestoreQuotaConsumed = Test-BRAVORestoreWeeklyQuotaConsumed `
     -ForcedCoveredSlot $forcedRestoreCoveredSlot `
     -ScheduledOccurrence $scheduledOccurrence
 $automaticRestoreDue = ($scheduledRestoreDue -or $missedRestoreDue) -and -not $weeklyRestoreQuotaConsumed
+# #438: ліміт поспіль-відкотів на ТОМУ САМОМУ наборі критичних файлів.
+# Без цього "Rollback=SUCCESS, модель консистентна" (repair не вдався, але
+# цілісність доведено) ніколи не пише Status='Succeeded' — $missedRestoreDue
+# лишається true назавжди, і автоматичний шлях зупиняє служби й запускає
+# bravocmd r щоночі без кінця (реальний інцидент, Issue #438). Поріг і
+# fingerprint-логіка підтверджені власником (N=2); -ForceRestore не
+# обмежується (окремий диз'юнкт у Get-BRAVOMaintenanceRestoreDecision).
+$RestoreRollbackRetryLimit = 2
+$automaticRestoreRetryBlocked = (Get-BRAVORestoreRollbackRetryCount -State $restoreState) -ge $RestoreRollbackRetryLimit
 # Профіль сервера РОБОЧОГО ЧАСУ (Restore.BootRestoreMode="HoldServices"):
 # Recovery-прогін, запущений boot-тригером, ігнорує вікно реставрації —
 # служби (Automatic Delayed Start) ще не запущені, клієнтів у програмі
@@ -8320,13 +8398,18 @@ $automaticRestoreDue = ($scheduledRestoreDue -or $missedRestoreDue) -and -not $w
 $bootRestoreIgnoresWindow = $RunMissedRestoreOnly -and
     ([string]$maintenanceSettings.Restore.BootRestoreMode -eq 'HoldServices')
 $restoreSkippedByWindow = $automaticRestoreDue -and -not $restoreWindowOpen -and -not $ForceRestore -and -not $bootRestoreIgnoresWindow
+# #438: той самий диз'юнкт, що $restoreSkippedByWindow, але для причини
+# "ліміт поспіль-відкотів", а не "поза вікном" — текст і severity нижче
+# свідомо РІЗНІ (це не штатна відкладена ситуація).
+$restoreSkippedByRetryBlock = $automaticRestoreDue -and $automaticRestoreRetryBlocked -and -not $ForceRestore
 $restoreDecision = Get-BRAVOMaintenanceRestoreDecision `
     -BravoMaintenanceEnabled ([bool]$BravoMaintenanceEnabled) `
     -BravoServiceDisabled ([bool]$BravoServiceDisabledBySystem) `
     -ForceRestore ([bool]$ForceRestore) `
     -automaticRestoreDue ([bool]$automaticRestoreDue) `
     -restoreWindowOpen ([bool]$restoreWindowOpen) `
-    -bootRestoreIgnoresWindow ([bool]$bootRestoreIgnoresWindow)
+    -bootRestoreIgnoresWindow ([bool]$bootRestoreIgnoresWindow) `
+    -automaticRestoreRetryBlocked ([bool]$automaticRestoreRetryBlocked)
 $shouldRestore = [bool]$restoreDecision.ShouldRestore
 # true = -ForceRestore при службі BRAVO з типом запуску Disabled (#321).
 # Компонент BRAVO лишається вимкненим для решти операцій (trace, .md,
@@ -8676,6 +8759,22 @@ if ($BravoMaintenanceEnabled) {
             "$RestoreWindowStart-$RestoreWindowEnd. Слот буде підхоплено автоматично у вікні; " +
             "для позапланового запуску зараз використайте -ForceRestore."
         ) -Level "INFO"
+    }
+    # #438: WARNING, не INFO — на відміну від $restoreSkippedByWindow вище,
+    # це НЕ штатна відкладена ситуація: автоматичні повтори зупинені після
+    # $RestoreRollbackRetryLimit поспіль відкотів на тому самому наборі
+    # файлів, і без втручання оператора слот сам по собі не виконається.
+    # Критичний алерт із деталями вже надіслано в ніч, коли ліміт
+    # досягнуто (гілка Invoke-BRAVOModelRestoreRecovery нижче); цей рядок —
+    # нагадування щоночі, доки слот лишається заблокованим.
+    if ($restoreSkippedByRetryBlock) {
+        Write-Log -Message (
+            "Реставрацію пропущено: автоматичні повтори зупинені після $RestoreRollbackRetryLimit " +
+            "поспіль відкотів на тому самому наборі критичних файлів (Issue #438). ПОТРІБНА ДІЯ " +
+            "ОПЕРАТОРА: дослідити причину; слот лишається невиконаним, доки оператор не запустить " +
+            "реставрацію вручну (-ForceRestore), або доки наступний автоматичний прогін не побачить " +
+            "ІНШИЙ набір критичних змін (лічильник скидається)."
+        ) -Level "WARNING"
     }
     if ($ForceRestore -and -not $restoreWindowOpen) {
         # INFO, не WARNING: це констатація СВІДОМОЇ дії оператора (він сам
@@ -10086,6 +10185,38 @@ if ($bravoFilePhaseAllowed) {
                             }
                             Write-Log -Message "Реставрація не завершилась успішно (bravocmd exit=$restoreBravocmdExitCode, rollback=$restoreRollbackStatus); $stateSuffix. Архів до реставрації збережено: $ARC_DIR\$ARCH_NAME1. after-архів і маркер успіху не створюються." -Level "ERROR"
                             Send-SlackAlert -Message "Реставрація не завершилась успішно, але модель консистентна ($stateSuffix). Плановий слот не позначено виконаним." -IsCritical
+                            # #438: лічильник поспіль-відкотів НА ТОМУ САМОМУ
+                            # наборі критичних файлів — лише для rollback='SUCCESS'
+                            # (HasCriticalChanges=true, repair дійсно не вдався).
+                            # Без цього саме ЦЯ гілка (слот НЕ закривається
+                            # Status='Succeeded' навмисно) повторюється щоночі
+                            # без ліміту (Issue #438). Status='Pending' тут не
+                            # змінює значення Status порівняно з попереднім
+                            # записом (однаково не 'Succeeded') — лише додає
+                            # лічильник/fingerprint до того самого слоту.
+                            if ($restoreRollbackStatus -eq 'SUCCESS') {
+                                $restoreRollbackFingerprint = Get-BRAVORestoreRollbackFingerprint -CriticalFiles $recovery.CriticalFiles
+                                $restoreRollbackPriorSignature = Get-BRAVORestoreRollbackSignature -State $restoreState
+                                $restoreRollbackPriorCount = Get-BRAVORestoreRollbackRetryCount -State $restoreState
+                                $restoreRollbackRetryCount = if (
+                                    -not [string]::IsNullOrEmpty($restoreRollbackFingerprint) -and
+                                    $restoreRollbackFingerprint -ceq $restoreRollbackPriorSignature
+                                ) { $restoreRollbackPriorCount + 1 } else { 1 }
+                                Write-BRAVORestoreState -ScheduledOccurrence $scheduledOccurrence -Status 'Pending' -Reason $restoreReason `
+                                    -RollbackRetryCount $restoreRollbackRetryCount -RollbackSignature $restoreRollbackFingerprint
+                                if ($restoreRollbackRetryCount -ge $RestoreRollbackRetryLimit) {
+                                    $restoreRollbackBlockMessage = (
+                                        "Реставрація відкочена $restoreRollbackRetryCount раз(и) поспіль на тому самому наборі " +
+                                        "критичних файлів ($($recovery.CriticalCount) файл(ів)) — автоматичні повтори ЗУПИНЕНО, щоб " +
+                                        "не зупиняти служби щоночі на той самий збій (Issue #438). ПОТРІБНА ДІЯ ОПЕРАТОРА: " +
+                                        "дослідити причину зміни моделі; слот лишається невиконаним, доки оператор не запустить " +
+                                        "реставрацію вручну (-ForceRestore), або доки наступний автоматичний прогін не побачить " +
+                                        "ІНШИЙ набір критичних змін (лічильник скидається)."
+                                    )
+                                    Write-Log -Message "КРИТИЧНО: $restoreRollbackBlockMessage" -Level "ERROR"
+                                    Send-SlackAlert -Message $restoreRollbackBlockMessage -IsCritical
+                                }
+                            }
                         } else {
                             # Цілісність НЕ встановлено (відкат провалився або
                             # before-архів невалідний) — служби НЕ піднімати
