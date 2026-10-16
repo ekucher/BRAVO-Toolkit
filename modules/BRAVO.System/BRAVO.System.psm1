@@ -1984,9 +1984,33 @@ function Test-BRAVOServiceRecoveryTaskDefinition {
             $problems.Add("event-тригер: Delay='$($eventTrigger.Delay)', очікується $($spec.EventDelay)")
         }
         $subscriptionText = [string]$eventTrigger.Subscription
-        $missingEventIds = @($spec.EventIds | Where-Object { $subscriptionText -notmatch ('EventID\s*=\s*{0}\b' -f $_) })
-        if (-not $subscriptionText.Contains($spec.EventProvider) -or $missingEventIds.Count -gt 0) {
-            $problems.Add("event-тригер: підписка не охоплює $($spec.EventProvider) з подіями $($spec.EventIds -join ', ')$(if ($missingEventIds.Count -gt 0) { ' (бракує ' + ($missingEventIds -join ', ') + ')' })")
+        # Рев'ю #433 (C-4): раніше шукали лише ВІДСУТНІ EventID — фільтр із
+        # зайвим EventID (крім очікуваних восьми) проходив непоміченим.
+        # Тепер множина EventID у Select без EventData (падіння служби,
+        # а не 7036 про зміну стану) має збігатися з $spec.EventIds ТОЧНО:
+        # і бракує, і зайві — обидва FAIL.
+        $mainEventIds = $null
+        $mainSelectProblem = $null
+        try {
+            $mainSelectNodes = @(([xml]$subscriptionText).SelectNodes('//Select') | Where-Object { ([string]$_.InnerText) -notmatch 'EventData' })
+            if ($mainSelectNodes.Count -ne 1) {
+                $mainSelectProblem = "очікувався рівно один Select без EventData (падіння служби), знайдено $($mainSelectNodes.Count)"
+            } else {
+                $mainEventIds = @([regex]::Matches([string]$mainSelectNodes[0].InnerText, 'EventID\s*=\s*(\d+)') | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Unique)
+            }
+        } catch {
+            $mainSelectProblem = "підписка не є коректним XML QueryList ($($_.Exception.Message))"
+        }
+        $expectedEventIds = @($spec.EventIds | Sort-Object -Unique)
+        if ($null -ne $mainSelectProblem) {
+            $problems.Add("event-тригер: $mainSelectProblem")
+        } elseif (-not $subscriptionText.Contains($spec.EventProvider) -or (($mainEventIds -join ',') -ne ($expectedEventIds -join ','))) {
+            $missingEventIds = @($expectedEventIds | Where-Object { $mainEventIds -notcontains $_ })
+            $extraEventIds = @($mainEventIds | Where-Object { $expectedEventIds -notcontains $_ })
+            $mismatchDetails = @()
+            if ($missingEventIds.Count -gt 0) { $mismatchDetails += 'бракує ' + ($missingEventIds -join ', ') }
+            if ($extraEventIds.Count -gt 0) { $mismatchDetails += 'зайві ' + ($extraEventIds -join ', ') }
+            $problems.Add("event-тригер: підписка не охоплює $($spec.EventProvider) рівно подіями $($spec.EventIds -join ', ')$(if ($mismatchDetails.Count -gt 0) { ' (' + ($mismatchDetails -join '; ') + ')' })")
         }
         $subscriptionInfo = Get-BRAVOServiceRecoverySubscriptionStopEventNames -Subscription $subscriptionText
         if ($null -ne $subscriptionInfo.Error) {
