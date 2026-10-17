@@ -2523,14 +2523,16 @@ function Write-BRAVORestoreState {
 # наявного стану НЕ чіпаються (ні в автоматичному, ні в примусовому шляху):
 # 'Succeeded' слоту не можна знижувати до 'Pending' — це дало б ще одну
 # автоматичну реставрацію тієї ж ночі (клас інциденту guard-а
-# "recovery guard" у Main). Якщо стану ще немає, створюється мінімальний
-# запис (поточний слот, Status='Pending'). Пошкоджений стан копіюється в
+# "recovery guard" у Main). Якщо стану ще немає, автоматичний шлях створює
+# мінімальний запис (поточний слот, Status='Pending'); примусовий шлях
+# (-ForceRestore) поля слоту не створює взагалі. Пошкоджений стан копіюється в
 # .corrupt-<мітка> і записується з лічильником = ліміт (блок лишається).
 function Write-BRAVORestoreRetryState {
     param(
         [Parameter(Mandatory = $true)][datetime]$ScheduledOccurrence,
         [Parameter(Mandatory = $true)]$Decision,
-        [string]$Reason = ''
+        [string]$Reason = '',
+        [bool]$ForceRestore = $false
     )
     $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
     if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
@@ -2542,9 +2544,17 @@ function Write-BRAVORestoreRetryState {
         Write-Log -Message "restore state пошкоджено ($($readResult.Error)); копію збережено: $corruptCopyPath. Блокування автоматичної реставрації збережено." -Level 'ERROR'
     }
     $map = ConvertTo-BRAVORestoreStateMap -State $readResult.State
-    if (-not $map.Contains('ScheduledOccurrence')) { $map['ScheduledOccurrence'] = $ScheduledOccurrence.ToString('o') }
-    if (-not $map.Contains('Status')) { $map['Status'] = 'Pending' }
-    if (-not $map.Contains('Reason')) { $map['Reason'] = $Reason }
+    # #438 (P3-4): примусовий шлях НІКОЛИ не створює поля слоту
+    # (ScheduledOccurrence/Status/Reason): невдалий -ForceRestore при
+    # відсутньому стані не повинен вигадувати 'Pending' для планового слоту
+    # (це замовляло б автоматичну реставрацію). Лише лічильник/клас/
+    # write-ahead. Читач слоту (Main, $scheduledSucceeded) StrictMode-безпечний
+    # до відсутності цих полів.
+    if (-not $ForceRestore) {
+        if (-not $map.Contains('ScheduledOccurrence')) { $map['ScheduledOccurrence'] = $ScheduledOccurrence.ToString('o') }
+        if (-not $map.Contains('Status')) { $map['Status'] = 'Pending' }
+        if (-not $map.Contains('Reason')) { $map['Reason'] = $Reason }
+    }
     if (-not $map.Contains('ForcedRestoreCoversSlot')) { $map['ForcedRestoreCoversSlot'] = $null }
     if (-not $map.Contains('LastSuccessfulRestoreAt')) { $map['LastSuccessfulRestoreAt'] = $null }
     $map['RollbackRetryCount'] = [int]$Decision.Count
@@ -2567,7 +2577,8 @@ function Get-BRAVORestoreRetryBlockedMessage {
         return (
             "Автоматичну реставрацію ЗАБЛОКОВАНО: файл BRAVO_RESTORE_STATE.json існує, але не читається " +
             "(пошкоджений чи порожній), тож лічильник невдалих спроб невідомий (fail-closed, Issue #438). " +
-            "Файл НЕ перезаписано. Служби не зупиняються, модель не змінюється. ПОТРІБНА ДІЯ ОПЕРАТОРА: " +
+            "Ця перевірка файл не змінює; будь-який наступний запис стану спершу зберігає копію BRAVO_RESTORE_STATE.json.corrupt-<мітка>. " +
+            "Служби не зупиняються заради реставрації, модель не змінюється. ПОТРІБНА ДІЯ ОПЕРАТОРА: " +
             "блок знімає лише оператор — виправте чи видаліть файл, або запустіть реставрацію вручну " +
             "(-ForceRestore; перед записом нового стану пошкоджений файл копіюється як " +
             "BRAVO_RESTORE_STATE.json.corrupt-<мітка>)."
@@ -2577,7 +2588,7 @@ function Get-BRAVORestoreRetryBlockedMessage {
     $escalationText = if ($Escalation) { 'Ліміт досягнуто під час цього прогону. ' } else { '' }
     return (
         "Автоматичну реставрацію ЗАБЛОКОВАНО: $Count поспіль невдалих спроб (ліміт $Limit; клас збою: $signatureText), " +
-        "Issue #438. ${escalationText}Служби не зупиняються, модель не змінюється. ПОТРІБНА ДІЯ ОПЕРАТОРА: " +
+        "Issue #438. ${escalationText}Служби не зупиняються заради реставрації, модель не змінюється. ПОТРІБНА ДІЯ ОПЕРАТОРА: " +
         "дослідити причину; блок знімає лише оператор — запустіть реставрацію вручну (-ForceRestore; " +
         "успішний запуск скидає лічильник) або обнуліть RollbackRetryCount у BRAVO_RESTORE_STATE.json " +
         "після розбору. Нова ніч, новий плановий слот чи інший набір файлів блок НЕ знімають."
@@ -2617,7 +2628,7 @@ function Register-BRAVORestoreAttemptFailure {
     $decision = Get-BRAVORestoreRollbackRetryDecision -State $readResult.State -Phase 'Failed' -Fingerprint $Fingerprint `
         -ForceRestore $ForceRestore -StateCorrupt $stateCorrupt -Limit $Limit
     if ($decision.Write) {
-        Write-BRAVORestoreRetryState -ScheduledOccurrence $ScheduledOccurrence -Decision $decision -Reason $Reason
+        Write-BRAVORestoreRetryState -ScheduledOccurrence $ScheduledOccurrence -Decision $decision -Reason $Reason -ForceRestore $ForceRestore
     }
     return $decision
 }
@@ -8886,10 +8897,14 @@ $restoreStateReadResult = Get-BRAVORestoreStateReadResult
 $restoreState = $restoreStateReadResult.State
 $restoreStateCorrupt = ($restoreStateReadResult.Status -ceq 'Corrupt')
 if ($restoreStateCorrupt) {
-    Write-Log -Message "BRAVO_RESTORE_STATE.json пошкоджено або не читається ($($restoreStateReadResult.Error)); автоматична реставрація заблокована (fail-closed), файл не перезаписано." -Level "ERROR"
+    Write-Log -Message "BRAVO_RESTORE_STATE.json пошкоджено або не читається ($($restoreStateReadResult.Error)); автоматична реставрація заблокована (fail-closed); ця перевірка файл не змінює (наступний запис стану спершу збереже копію .corrupt-<мітка>)." -Level "ERROR"
 }
 $scheduledSucceeded = (Test-Path -LiteralPath $scheduledMarkerFile) -or (
     $null -ne $restoreState -and
+    # #438 (P3-4): стан може не мати Status/ScheduledOccurrence (його створив
+    # невдалий -ForceRestore лише з лічильником) — StrictMode-безпечне читання.
+    $null -ne $restoreState.PSObject.Properties['Status'] -and
+    $null -ne $restoreState.PSObject.Properties['ScheduledOccurrence'] -and
     [string]$restoreState.Status -eq 'Succeeded' -and
     [string]$restoreState.ScheduledOccurrence -eq $scheduledOccurrence.ToString('o')
 )
@@ -9286,15 +9301,21 @@ if ($RunMissedRestoreOnly -and -not $missedDailyWork -and -not $missedRestoreAct
     # Зовнішній try/finally (рядок ~55) все одно охоплює цей exit —
     # Wait-BRAVOManualExit спрацьовує так само, як і завжди.
     Complete-BRAVOProgress
+    # #438 (P3-1): заблокована лімітом ніч — НЕ чистий успіх (WARNING у
+    # журналі + критичний алерт вище), тож підсумок жовтий, а код завершення
+    # 10 (SuccessWithWarnings, наявний код) — це й обіцяє OPERATIONS.md.
+    # Прогін без блокування лишається чистим успіхом: код 0.
+    $recoveryNoWorkExitCode = $(if ($restoreSkippedByRetryBlock) { 10 } else { 0 })
+    $recoveryNoWorkStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $recoveryNoWorkExitCode
     Write-BRAVOFinalSummaryHeader `
         -Title 'BRAVO MAINTENANCE' `
-        -Status 'УСПІШНО' `
-        -StatusColor Green
-    Write-BRAVOResultField -Label 'Статус' -Value 'УСПІШНО' -Color Green
-    Write-BRAVOResultField -Label 'Код завершення' -Value ("0 — {0}" -f (Get-BRAVOExitCodeName -Code 0))
+        -Status $recoveryNoWorkStatus.Text `
+        -StatusColor $recoveryNoWorkStatus.Color
+    Write-BRAVOResultField -Label 'Статус' -Value $recoveryNoWorkStatus.Text -Color $recoveryNoWorkStatus.Color
+    Write-BRAVOResultField -Label 'Код завершення' -Value ("{0} — {1}" -f $recoveryNoWorkExitCode, (Get-BRAVOExitCodeName -Code $recoveryNoWorkExitCode))
     Write-BRAVOResultField -Label 'Результат' -Value $(if ($restoreSkippedByRetryBlock) { 'Автоматичну реставрацію заблоковано — потрібна дія оператора (див. журнал)' } else { 'Пропущених операцій не знайдено' })
     Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
-    exit 0
+    exit $recoveryNoWorkExitCode
 }
 Write-Log -Message "Повідомлення: $NotificationProviderDisplayName; режим $(switch ($script:SlackMode) {'none' {'ВИМКНЕНО'} 'errors_only' {'ЛИШЕ ПОМИЛКИ'} 'all' {'УСІ ПОВІДОМЛЕННЯ'}})" -NoTimestamp
 
@@ -10615,6 +10636,14 @@ if ($bravoFilePhaseAllowed) {
                             Send-SlackAlert -Message $errorMsg -IsCritical
                             $script:criticalErrorOccurred = $true
                             $script:restoreArchiveFailed = $true
+                            # #438 (P3-3): модель не торкнута, а маркер уже
+                            # переведено в suppressed — повертаємо право
+                            # автостарту (no-op, якщо маркер не suppressed).
+                            # Менша й безпечніша зміна, ніж переставляти
+                            # write-ahead ПЕРЕД suppression: тоді збій
+                            # suppression лишав би лічильник збільшеним без
+                            # жодної спроби bravocmd.
+                            Restore-BRAVOMaintenanceQuiescenceAutostart
                         }
                     }
                     if ($quiescenceSuppressionReady) {
