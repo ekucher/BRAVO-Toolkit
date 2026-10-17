@@ -849,7 +849,7 @@ try {
     }
     $scope301BaselinePath = Get-BRAVODiscoveryBaselinePath -StateRoot $scope301State
     Save-BRAVODiscoveryBaseline -DiscoveryResult $scope301SaveDiscovery -BaselinePath $scope301BaselinePath
-    $scope301SavedJson = Get-Content -LiteralPath $scope301BaselinePath -Raw | ConvertFrom-Json
+    $scope301SavedJson = Get-Content -LiteralPath $scope301BaselinePath -Raw -Encoding UTF8 | ConvertFrom-Json
     Test-BRAVOCondition -Condition (
         [string]$scope301SavedJson.BLOG_SOURCE -eq '' -and
         [string]$scope301SavedJson.MODEL_SOURCE -eq 'C:\ExampleLims\Model' -and
