@@ -4658,6 +4658,52 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "Logging/ProtectSecretMasksKnownShapes" `
         -Failure "Protect-BRAVOLogSecret має маскувати SFTP-паролі, Slack/Discord webhook-токени і паролі 7-Zip, не займаючи -path"
+    # #453: облікові дані в URL маскуються лінійно — голова regex-ом, межа
+    # значення окремо. Результат має збігатися з колишнім єдиним шаблоном
+    # (еталон нижче — він самий, через -replace) на межових формах, а
+    # фрагменти, на яких шаблон був квадратичним, маскуються за секунди.
+    $urlEquivPassword = 'Url' + 'Leak' + '453'
+    $urlEquivReference = '(?i)(?<![a-z0-9+.\-])((?>[a-z0-9+.\-]+)://[^:/\s@]*:)[^@\s]+@'
+    $urlEquivCases = @(
+        ('open sftp://u:{0}@h:22' -f $urlEquivPassword),
+        ('sftp://:{0}@h/' -f $urlEquivPassword),
+        ('x sftp://u:{0} no-at' -f $urlEquivPassword),
+        ('a://b:c://d:{0}@f' -f $urlEquivPassword),
+        ('ftps://u:{0}@h ftps://v:{0}@h2' -f $urlEquivPassword),
+        ('1sftp://u:{0}@h' -f $urlEquivPassword),
+        ('a://b:{0} d@e' -f $urlEquivPassword),
+        ("a://b:{0}`td@e" -f $urlEquivPassword),
+        ("a://b:{0}$([char]0x00A0)d@e" -f $urlEquivPassword),
+        ('a://b:@c a://b:{0}@c@d' -f $urlEquivPassword),
+        'http://h/path:x@y',
+        'mailto:u@h C:\dir\file',
+        (('a://b:' * 50) + 'x@'),
+        (('a://b:' * 50) + ' x@')
+    )
+    $urlEquivMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($urlEquivCase in $urlEquivCases) {
+        $urlEquivActual = Protect-BRAVOLogSecret -Text $urlEquivCase
+        $urlEquivExpected = $urlEquivCase -replace $urlEquivReference, '$1***@'
+        if ($urlEquivActual -cne $urlEquivExpected) {
+            $urlEquivMismatches.Add("$urlEquivCase -> $urlEquivActual (очiкувано $urlEquivExpected)")
+        }
+    }
+    $urlLinearWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $urlLinearNoAt = Protect-BRAVOLogSecret -Text ('a://b:' * 200000)
+    $urlLinearEmptyUser = Protect-BRAVOLogSecret -Text ('x://:p' * 200000)
+    $urlLinearLongRun = Protect-BRAVOLogSecret -Text ('U' * 1000000)
+    $urlLinearWatch.Stop()
+    Test-BRAVOCondition `
+        -Condition (
+            $urlEquivMismatches.Count -eq 0 -and
+            $urlLinearNoAt.Length -eq 1200000 -and
+            $urlLinearEmptyUser.Length -eq 1200000 -and
+            $urlLinearLongRun.Length -eq 1000000 -and
+            $urlLinearWatch.Elapsed.TotalSeconds -lt 15
+        ) `
+        -Name "Logging/UrlCredentialMaskingLinearAndUnchanged" `
+        -Failure ("Облiковi данi в URL мають маскуватись як колишнiм шаблоном i лiнiйно (#453). " +
+            "Розбiжностi: [$($urlEquivMismatches -join ' || ')]; час: $([int]$urlLinearWatch.Elapsed.TotalSeconds) с")
     # Review PR #225 (P1): -Secondary -- діагностика ДРУГОРЯДНОЇ операції
     # (телеметрія Operations). Лишається видимим WARNING-ом, але НЕ важить у
     # спільному лічильнику попереджень, бо BRAVO_ARCHIV резолвить будь-яке

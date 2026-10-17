@@ -222,15 +222,47 @@ function Protect-BRAVOLogSecret {
     } else {
         $quotedSecretValue = '(?:"(?:[^"\\`\r\n]|[\\`][^\r\n]?|"")*(?:"|(?=[\r\n])|\z)|''(?:[^''\\`\r\n]|[\\`][^\r\n]?|'''')*(?:''|(?=[\r\n])|\z)|(?:[^\s\\`]|[\\`][^\r\n]?)+)'
     }
+    # Облікові дані в URL — те саме, що шаблон
+    # (?i)(?<![a-z0-9+.\-])(?>[a-z0-9+.\-]+)://[^:/\s@]*:(?<v>[^@\s]+)@
+    # але без квадратичної вартості (#453). Логін може бути порожнім
+    # (`sftp://:password@host`, #463). Схема — ЦІЛИЙ ланцюжок `[a-z0-9+.-]`
+    # від його початку, атомарно (#463): спроба лише з початку ланцюжка і
+    # без повернення; колишня форма `[a-z][a-z0-9+.-]*` пробувала з КОЖНОГО
+    # символу довгого ланцюжка, а цілий ланцюжок охоплює будь-який колишній
+    # збіг, тож маскується не менше.
+    # Значення `[^@\s]+@` закінчується на ПЕРШОМУ `@` чи пробільному
+    # символі після голови `схема://логін:`, і збіг є, лише якщо це `@`. Як
+    # частина regex воно на КОЖНІЙ голові сканувало до кінця фрагмента:
+    # `a://b:a://b:…` без `@` — квадратично (120 тис. символів — ~80 с). Тому
+    # regex шукає лише голову (сама вона лінійна: `[^:/\s@]*` не перетинає
+    # наступного `://`), а межу значення шукає окремо `[@\s]` і запам'ятовує:
+    # голови йдуть за зростанням, і поки голова лежить у вже перевіреному
+    # проміжку без межі, межа та сама. Кожен символ сканується один раз.
+    # Після збігу пошук іде з-за `@`, як і в Regex.Matches.
+    $urlHeadRegex = New-Object System.Text.RegularExpressions.Regex '(?i)(?<![a-z0-9+.\-])(?>[a-z0-9+.\-]+)://[^:/\s@]*:'
+    $urlStopRegex = New-Object System.Text.RegularExpressions.Regex '[@\s]'
+    $urlStopSearchedFrom = -1
+    $urlStop = -1
+    $urlHead = $urlHeadRegex.Match($sanitized)
+    while ($urlHead.Success) {
+        $urlValueStart = $urlHead.Index + $urlHead.Length
+        if ($urlValueStart -lt $urlStopSearchedFrom -or $urlValueStart -gt $urlStop) {
+            $urlStopMatch = $urlStopRegex.Match($sanitized, $urlValueStart)
+            if ($urlStopMatch.Success) { $urlStop = $urlStopMatch.Index } else { $urlStop = $sanitized.Length }
+            $urlStopSearchedFrom = $urlValueStart
+        }
+        if ($urlStop -gt $urlValueStart -and $urlStop -lt $sanitized.Length -and $sanitized[$urlStop] -eq [char]'@') {
+            $spanStarts.Add($urlValueStart)
+            $spanEnds.Add($urlStop)
+            if ($MaximumMaskedSpans -gt 0 -and $spanStarts.Count -gt $MaximumMaskedSpans) {
+                throw (New-Object System.OverflowException $spanLimitMessage)
+            }
+            $urlHead = $urlHeadRegex.Match($sanitized, $urlStop + 1)
+        } else {
+            $urlHead = $urlHead.NextMatch()
+        }
+    }
     $secretPatterns = @(
-        # Логін може бути порожнім (`sftp://:password@host`, #463) — пароль
-        # маскується і тоді. Схема — ЦІЛИЙ ланцюжок `[a-z0-9+.-]` від його
-        # початку, атомарно (#463): спроба лише з початку ланцюжка і без
-        # повернення, тож робота лінійна. Колишня форма `[a-z][a-z0-9+.-]*`
-        # пробувала з КОЖНОГО символу довгого ланцюжка (тисячі імен файлів
-        # по 255 символів у виводі синхронізації — десятки секунд). Цілий
-        # ланцюжок охоплює будь-який колишній збіг, тож маскується не менше.
-        '(?i)(?<![a-z0-9+.\-])(?>[a-z0-9+.\-]+)://[^:/\s@]*:(?<v>[^@\s]+)@',
         # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
         ('(?i)-password=(?<v>' + $quotedSecretValue + ')'),
         # (?!ath|assword) — коротка форма -p, але не -path і не -password=
@@ -299,7 +331,7 @@ function Protect-BRAVOLogSecretBounded {
     #   URL (`[a-z][a-z0-9+.-]*://…`) поводилась квадратично саме на
     #   такому ланцюжку (виміряно: 10 тис. символів — ~2 с, 30 тис. —
     #   ~17 с); схема тепер атомарна й лінійна (#463), межа лишається як
-    #   запобіжник. Будь-який інший символ (`\`, `_`, пробіл,
+    #   запобіжник (як і наступна, див. #453). Будь-який інший символ (`\`, `_`, пробіл,
     #   лапки) ланцюжок розриває, тож звичайні шляхи й вивід 7-Zip (короткі
     #   імена записів) обидві межі не досягають;
     # - довжина суцільного фрагмента без пробільних символів, що містить
