@@ -2,6 +2,60 @@
 
 ## Не випущено (developer)
 
+- **Виправлено (Maintenance, реставрація): рішення про реставрацію перераховується після отримання lock і перед `bravocmd.exe` (#476).**
+  `$shouldRestore` і `$missedRestoreDue` обчислювалися один раз до очікування
+  lock (до `OperationLockWaitMinutes`, типово 360 хв). Якщо інший прогін за
+  цей час виконав той самий слот (маркер, `Status=Succeeded`), спожив тижневу
+  квоту примусовою реставрацією, вичерпав ліміт поспіль-невдалих спроб чи
+  залишив пошкоджений `BRAVO_RESTORE_STATE.json`, цей прогін повторював
+  деструктивну реставрацію за застарілим знімком (клієнтів вигнано, служби
+  зупинено, модель перезаписано вдруге). Логіку рішення винесено в чисту
+  `Get-BRAVOMaintenanceRestoreDecisionSnapshot` (час заморожено, читає лише
+  файли); `Get-BRAVOMaintenanceRestoreSnapshotVeto` порівнює знімок до lock зі
+  знімком після нього і може лише ЗАБОРОНИТИ реставрацію (причини:
+  `SucceededByOtherRun`, `StateCorrupt`, `RetryBlocked`, `WeeklyQuotaConsumed`,
+  `NoLongerDue`; перехід «не планувалась → тепер потрібна» її не вмикає,
+  `-ForceRestore` вето не підлягає). Знімок після lock стоїть до запису
+  `Pending`, вигнання клієнтів (#316) і зупинки служб; ту саму перевірку
+  виконує бар'єр 2 безпосередньо перед `bravocmd.exe` (після довгої архівації
+  моделі), а `Register-BRAVORestoreAttemptBegin` відхиляє write-ahead, якщо
+  ліміт повторів уже досягнуто. Recovery без пропущеної денної роботи після
+  такого скасування завершується без дій (код `0`, для `RetryBlocked`/
+  `StateCorrupt` — `10`); скасування через ліміт чи пошкоджений стан — `WARNING`
+  і критичне сповіщення. Тести: `Maintenance/RestoreDecisionRecheckedAfterLockVetoesCompletedSlot`,
+  `Maintenance/RestoreVetoNeverEnablesAndNeverBlocksForce`,
+  `Maintenance/RestoreWriteAheadRejectedWhenCapReachedAfterLock`, сценарії
+  оркестрації `PostLockVetoSucceeded`, `RecoveryPostLockVetoNoWork`,
+  `RecoveryPostLockVetoRetryBlocked`, `PreDestructiveVetoBlocked` і структурний
+  `Maintenance/RestoreRecheckAndFailClosedAreWiredInOrder`.
+- **Виправлено (Maintenance, реставрація): виняток після запуску `bravocmd.exe` — код `43` і служби не стартують (#477).**
+  Виняток посеред деструктивної фази (після запуску `bravocmd.exe`, до результату
+  перевірки/відкату) потрапляв у загальний `catch` як збій архівації (код `40`),
+  а `$script:modelIntegrityEstablished` лишався `true` — служби BRAVO піднімалися
+  над напіввідновленою моделлю. Тепер прапорець цілісності стає `false` у момент
+  запуску деструктиву (до результату `Invoke-BRAVOModelRestoreRecovery`), а
+  `catch` через чисту `Get-BRAVORestoreExceptionDisposition` розрізняє виняток до
+  `bravocmd.exe` (без змін: код `40`, служби піднімаються) і після нього:
+  `restoreFailed`, код `43`, прапорці архіву/цілісності повернуто до значень до
+  сесії (у `Resolve-BRAVOExitCode` `40` і `41` стоять вище за `43`), спробу
+  пораховано (клас `CLASS:EXCEPTION-AFTER-BRAVOCMD`, рівно один раз), служби не
+  стартують, quiescence-маркер лишається suppressed, критичне сповіщення з
+  вказівкою ручного відновлення MODEL із before-архіву. Retention архівів
+  реставрації теж пропускається, коли цілісність не встановлено. Те саме
+  правило для `rollback=FAILED`: ненульовий код `bravocmd.exe` більше не
+  підміняє `43` на `40`, а `restoreIntegrityFailed`, виставлений перевіркою
+  розмірів чи відкатом ще до провалу відкату, — на `41`. Невірифікована модель
+  після деструктивної фази дає `43` незалежно від того, виняток чи невдалий
+  відкат її спричинив; справжній `41` лишається лише тоді, коли деструктивну
+  фазу не було розпочато. Супутні посилення (рев'ю): прапорець обліку спроби
+  виставляється ДО виклику обліку (виняток із його хвоста не дає другого обліку
+  й не скидає ліміт); повторна перевірка після lock лише вето (`pre=false`,
+  `post=true` лишає `false`); пріоритет причин вето — пошкоджений стан → ліміт
+  повторів → слот виконано іншим прогоном → квота → слот більше не потрібен.
+  Тести: `Maintenance/RestoreExceptionAfterBravocmdIsUnverifiedFailureCountedOnce`,
+  сценарії оркестрації `ThrowAfterBravocmd` (код `43`, жодного `START`, маркер
+  не прибрано), `ThrowBeforeBravocmd` (код `40`), `RollbackFailed` (код `43`,
+  `Maintenance/RestoreRollbackFailedResolvesTo43`).
 - **Виправлено (безпека): LOGS, TEMP і State закриті від `BUILTIN\Users`; retention не видаляє все за `ArchivesKeepCount < 1`.**
   ACL кореня комплекту надає `Users` читання й виконання з успадкуванням, тож
   `<RuntimeRoot>\LOGS`, `<RuntimeRoot>\TEMP` і `%ProgramData%\BRAVO\State`
