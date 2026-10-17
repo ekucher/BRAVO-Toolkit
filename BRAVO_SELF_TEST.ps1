@@ -32030,11 +32030,13 @@ function Write-BRAVOLog {
     # статусу 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' (як STRING-літерал в AST, не
     # рахуючи пояснювальні коментарі) має існувати РІВНО один раз —
     # усередині самої Get-BRAVOMaintenanceFinalStatus, — а сама функція
-    # має викликатися рівно п'ять разів поза власним визначенням (звичайні
+    # має викликатися рівно шість разів поза власним визначенням (звичайні
     # ЛОГ/консоль/notification Title + ранній disk-preflight summary + PR
     # #225 Send-BRAVOMaintenanceOperationsEvent, яка навмисно повторно
     # використовує ЦЕЙ САМИЙ канонічний резолвер для Operations-severity,
-    # а не заводить власну паралельну класифікацію).
+    # а не заводить власну паралельну класифікацію, + #438 Recovery без
+    # роботи: заблокована retry-cap реставрація повертає 10 і бере текст
+    # «УСПІШНО З ПОПЕРЕДЖЕННЯМИ» з того самого резолвера).
     $maintenanceTotalTokens = $null
     $maintenanceTotalErrors = $null
     $maintenanceTotalAst = Get-BRAVOSelfTestParsedText `
@@ -32058,10 +32060,10 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $maintenanceSuccessWithWarningsLiteralAsts.Count -eq 1 -and
-            $maintenanceFinalStatusCallAsts.Count -eq 5
+            $maintenanceFinalStatusCallAsts.Count -eq 6
         ) `
         -Name 'Maintenance/FinalStatusDoesNotCallIndependentWarningPolicy' `
-        -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 5 разів (ЛОГ/консоль/notification/ранній disk-preflight summary/Send-BRAVOMaintenanceOperationsEvent), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
+        -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 6 разів (ЛОГ/консоль/notification/ранній disk-preflight summary/Send-BRAVOMaintenanceOperationsEvent/#438 Recovery без роботи), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
 
     # --- PR #225 review thread 9/Maintenance (414b4a4): regression-guard
     # AST-канарка на ПОРЯДОК -- Send-BRAVOMaintenanceOperationsEvent (ЦЕЙ
