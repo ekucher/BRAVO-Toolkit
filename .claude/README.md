@@ -7,6 +7,9 @@ This directory contains project-level Claude Code instructions, scoped rules, an
 - `CLAUDE.md` — concise project-wide operating contract.
 - `rules/` — always-on or path-scoped rules.
 - `skills/` — task-specific workflows loaded on demand.
+- `agents/` — role definitions from `ai-routing.json`: `lead` (the orchestrator; start the session
+  with `claude --agent lead`) and the delegated roles `scout`, `worker`, `tester`, `documentation`,
+  `reviewer`, `architect`, `security-reviewer`.
 
 ## Useful commands
 

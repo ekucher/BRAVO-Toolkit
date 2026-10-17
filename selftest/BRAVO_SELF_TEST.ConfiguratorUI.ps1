@@ -446,7 +446,7 @@ Test-BRAVOCondition (
 # всередині Get-BRAVOConfiguratorUIStartupSize (де вони — верхня стеля,
 # не хардкод присвоєння формі) — регресія перевіряє саме РЯДКОВИЙ
 # патерн прямого присвоєння контролу, який P2-B прибрав.
-$configuratorUIRawSource = Get-Content -LiteralPath $configuratorUIModulePath -Raw
+$configuratorUIRawSource = Get-Content -LiteralPath $configuratorUIModulePath -Raw -Encoding UTF8
 $configuratorUIFixedLayoutDebtPatterns = @(
     '\$rowPanel\.Width\s*=\s*700\b'
     '\$form\.Width\s*=\s*1150\b'
