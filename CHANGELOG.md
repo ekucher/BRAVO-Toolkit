@@ -16,6 +16,10 @@
   `BRAVO.Logging` про «той самий захист, що й Credential Manager».
   `Remove-OldRestoreArchives` за `ArchivesKeepCount < 1` записує `ERROR` і
   пропускає retention (раніше `0` видаляв усі придатні сесії before/after).
+  Тест `Maintenance/RetentionStaleProvenCorruptSessionKeptWhenNothingRemains`
+  (сценарій `KeepCount = 0`) замінено на
+  `Maintenance/RetentionKeepCountBelowOneRefusesToDeleteAnything`: нова поведінка
+  - ERROR і жодного видалення.
   Потрібне приймання на реальному сервері (повторне встановлення завдань).
   Повторне security-review (B7): `Set-BRAVOProtectedDataDirectoryAcl` більше
   не слідує за попередньо підкладеним junction/symlink. До будь-якого

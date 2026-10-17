@@ -25828,10 +25828,12 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/RetentionStaleProvenCorruptSessionStillDeleted" `
         -Failure ("стара сесія з доведеним пошкодженням вмісту (7-Zip: CRC Failed, код 2) за наявних підтверджених точок відновлення має видалятися, як і раніше, без прапорців; critical={0}, restoreIntegrityFailed={1}, threw={2}, лишилось=[{3}]" -f $retention422Proven.Critical, $retention422Proven.RestoreFailed, $retention422Proven.Threw, $retention422Proven.Remaining)
 
-    # (a') ArchivesKeepCount = 0: після прогону не лишається жодної
-    # підтвердженої точки відновлення (придатні сесії теж видаляються),
-    # тож навіть доведено пошкоджену стару сесію НЕ видаляємо — WARNING
-    # називає сесію і причину.
+    # (a') ArchivesKeepCount = 0: B7 (PR #474) - Remove-OldRestoreArchives за
+    # KeepCount < 1 пише ERROR і пропускає retention, тож НІЧОГО не видаляється
+    # (раніше 0 видаляв усі придатні сесії). Гілка «після прогону не лишається
+    # жодної підтвердженої точки відновлення» через KeepCount більше недосяжна,
+    # тому й WARNING «НЕ видалено: ... не лишається жодної підтвердженої» не
+    # з'являється. Тест перевіряє новий контракт поведінково.
     $retention422KeepZero = & $retentionFollowupRunScenario 'I422KeepZero' (
         @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-CRC-FAILED' $true)
     ) 0
@@ -25840,10 +25842,14 @@ function Get-BRAVOMaintenanceSummaryResult {
             $null -ne $retention422KeepZero -and
             $null -eq $retention422KeepZero.Threw -and
             (& $retention422HasArchive $retention422KeepZero $retention422Subject) -and
-            (& $retention422KeptLine $retention422KeepZero $retention422Subject 'не лишається жодної підтвердженої')
+            (& $retention422HasArchive $retention422KeepZero '20260105_0100') -and
+            (& $retention422HasArchive $retention422KeepZero '20260110_0100') -and
+            (& $retention422HasArchive $retention422KeepZero '20260111_0100') -and
+            [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[ERROR\] ArchivesKeepCount = 0 \(< 1\): retention архівів реставрації ПРОПУЩЕНО') -and
+            -not [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[WARNING\] .*НЕ видалено')
         ) `
-        -Name "Maintenance/RetentionStaleProvenCorruptSessionKeptWhenNothingRemains" `
-        -Failure ("за ArchivesKeepCount = 0 після прогону не лишається підтвердженої точки відновлення, тож доведено пошкоджена стара сесія НЕ повинна видалятися, а WARNING має назвати сесію і причину; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422KeepZero.Threw, $retention422KeepZero.Remaining, $retention422KeepZero.Log)
+        -Name "Maintenance/RetentionKeepCountBelowOneRefusesToDeleteAnything" `
+        -Failure ("за ArchivesKeepCount = 0 retention має бути пропущено з ERROR, а всі чотири before-архіви (включно з доведено пошкодженою старою сесією) - лишитися; WARNING «НЕ видалено» не очікується; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422KeepZero.Threw, $retention422KeepZero.Remaining, $retention422KeepZero.Log)
 
     # (a'') 7-Zip відхилив пароль (наприклад, після зміни пароля): для
     # класифікатора це archive-specific, але SHA512 архіву збігається з
