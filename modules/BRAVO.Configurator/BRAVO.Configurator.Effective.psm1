@@ -186,38 +186,52 @@ function Invoke-BRAVOConfiguratorEffectiveComputation {
 
     try {
         $childScriptPath = Join-Path $isolatedRoot 'Invoke-EffectiveChild.ps1'
-        $capturedNamesLiteral = '@(' + (($script:CapturedGlobalNames | ForEach-Object { "'$_'" }) -join ', ') + ')'
-        # RuntimeRoot — caller-supplied шлях (реальний BRAVO install root),
-        # на відміну від $isolatedRoot/$resultJsonPath/$errorJsonPath (GUID-
-        # засновані, безпечні). Апостроф у шляху (легальний NTFS-символ)
-        # зламав би генерований single-quoted літерал нижче — той самий
-        # escaping, що ConvertTo-BRAVOConfiguratorPowerShellLiteral уже
-        # застосовує для значень (P2-фікс за результатами незалежного
-        # review).
-        $escapedRuntimeRoot = ConvertTo-BRAVOConfiguratorSingleQuotedContent -Value $RuntimeRoot
-
+        # Жоден шлях НЕ вбудовується в текст дочірнього скрипта: ні
+        # $isolatedRoot/$resultJsonPath/$errorJsonPath (лежать під
+        # [IO.Path]::GetTempPath(), тобто в профілі оператора, який може
+        # містити кирилицю або апостроф), ні RuntimeRoot. Раніше вони йшли
+        # single-quoted літералами; скрипт без BOM Windows PowerShell 5.1
+        # читає в ANSI-кодовій сторінці, тож байт 0x82 кириличної «т»
+        # (cp1251) ставав U+201A (типографська лапка) і ламав літерал, а
+        # апостроф (O'Neil) ламав його навіть із BOM. Тепер значення
+        # передаються аргументами після -File (param-блок; імена змінних — одним
+        # рядком через ';'; локальна змінна в дочірньому скрипті НЕ може мати
+        # ім'я param-а з точністю до регістру), а сам скрипт
+        # пишеться UTF-8 З BOM.
         $childScriptLines = @(
+            'param([string]$IsolatedRoot, [string]$RuntimeRoot, [string]$ResultJsonPath, [string]$ErrorJsonPath, [string]$CapturedNames)',
             'Set-StrictMode -Version 2.0',
             '$ErrorActionPreference = ''Stop''',
             'try {',
-            "    . (Join-Path '$escapedRuntimeRoot' 'BRAVO_CONFIG_LOADER.ps1')",
-            "    `$null = Import-BravoConfiguration -ConfigRoot '$isolatedRoot' -RuntimeRoot '$escapedRuntimeRoot' -DisallowLegacyPrimaryAutoDetect -PassThru",
-            "    `$capturedNames = $capturedNamesLiteral",
+            '    . (Join-Path $RuntimeRoot ''BRAVO_CONFIG_LOADER.ps1'')',
+            '    $null = Import-BravoConfiguration -ConfigRoot $IsolatedRoot -RuntimeRoot $RuntimeRoot -DisallowLegacyPrimaryAutoDetect -PassThru',
+            '    $nameList = @($CapturedNames -split '';'')',
             '    $snapshot = [ordered]@{}',
-            '    foreach ($name in $capturedNames) {',
+            '    foreach ($name in $nameList) {',
             '        $variable = Get-Variable -Name $name -Scope Global -ErrorAction SilentlyContinue',
             '        $snapshot[$name] = if ($null -ne $variable) { $variable.Value } else { $null }',
             '    }',
-            "    `$snapshot | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath '$resultJsonPath' -Encoding UTF8",
+            '    $snapshot | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $ResultJsonPath -Encoding UTF8',
             '} catch {',
             '    $errorDetail = [pscustomobject]@{ Message = $_.Exception.Message; ScriptStackTrace = $_.ScriptStackTrace }',
-            "    `$errorDetail | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath '$errorJsonPath' -Encoding UTF8",
+            '    $errorDetail | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ErrorJsonPath -Encoding UTF8',
             '    exit 1',
             '}'
         )
-        [IO.File]::WriteAllText($childScriptPath, [string]::Join([Environment]::NewLine, $childScriptLines), (New-Object System.Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($childScriptPath, [string]::Join([Environment]::NewLine, $childScriptLines), (New-Object System.Text.UTF8Encoding($true)))
 
-        $processArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $childScriptPath)
+        # Start-Process -ArgumentList (масив) у PS 5.1 з'єднує елементи
+        # пробілами БЕЗ лапок, тож кожне значення лапкуємо самі (CommandLineToArgvW-
+        # правила): шлях зі пробілами/апострофом/кирилицею лишається одним
+        # аргументом; кінцеві '\' перед закриваючою лапкою подвоюються.
+        $quoteChildArgument = {
+            param([string]$Value)
+            '"' + ([regex]::Replace($Value, '(\\*)$', '$1$1')) + '"'
+        }
+        $processArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (& $quoteChildArgument $childScriptPath),
+            (& $quoteChildArgument $isolatedRoot), (& $quoteChildArgument $RuntimeRoot),
+            (& $quoteChildArgument $resultJsonPath), (& $quoteChildArgument $errorJsonPath),
+            (& $quoteChildArgument (@($script:CapturedGlobalNames) -join ';')))
         # -Wait без обмеження в часі дав би незавершуваному canonical
         # loader-у (напр. Resolve-BRAVOInstallationDiscovery зависає на
         # недоступному WMI/службі) шанс заблокувати Configurator назавжди.
