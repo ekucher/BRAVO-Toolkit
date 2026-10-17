@@ -1650,7 +1650,7 @@ function Start-Sleep { param($Seconds) }
             [void](Set-BRAVOServiceQuiescenceRestartSuppressed)
             $suppressed = Read-BRAVOServiceQuiescenceState
             $path = Get-BRAVOServiceQuiescenceStatePath
-            $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
             $raw.startTypeSnapshot = @(
                 [pscustomobject]@{ Name = 'BRAVO'; StartMode = 'Bogus' },
                 [pscustomobject]@{ Name = 'exchangAPI'; StartMode = 'Disabled' },
@@ -1780,7 +1780,7 @@ function Start-Sleep { param($Seconds) }
             $out.OutsideMode = $script:Q297Modes['SomeOtherSvc']
             # 6e: маркер чужого hostname -> Read = $null -> NoMarker
             $path = Get-BRAVOServiceQuiescenceStatePath
-            $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
             $raw.hostname = 'SRV-OTHER-HOST'
             [IO.File]::WriteAllText($path, ($raw | ConvertTo-Json -Depth 5))
             Reset-BRAVOSelfTestStartModes -Modes @{ BRAVO = 'Disabled' }
@@ -1939,7 +1939,7 @@ function Restore-BRAVOServiceStartTypeSnapshot {
             $makeForeign = {
                 param($Snapshot)
                 [void](Write-BRAVOServiceQuiescenceState -Owner 'BRAVO_MAINTENANCE' -Services @(@{ Name = 'BRAVO'; RestartIntent = $true }) -LogFile 'x' -StartTypeSnapshot $Snapshot)
-                $raw = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+                $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
                 $raw.pid = 1
                 [IO.File]::WriteAllText($path, ($raw | ConvertTo-Json -Depth 5))
             }

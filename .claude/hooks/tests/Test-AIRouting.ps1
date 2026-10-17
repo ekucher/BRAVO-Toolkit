@@ -69,6 +69,7 @@ if ($null -ne $matrix) {
     Assert-Equal 'matrix schemaVersion is 1' '1' ([string]$matrix.schemaVersion)
 
     $expectedRoles = @{
+        'lead'              = 'inherit'
         'scout'             = 'haiku'
         'worker'            = 'sonnet'
         'tester'            = 'sonnet'
@@ -359,6 +360,10 @@ try {
     Assert-Equal 'scout on haiku is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'scout' -Model 'haiku')))
     Assert-Equal 'worker on sonnet is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'worker' -Model 'sonnet')))
     Assert-Equal 'agent call without an explicit model override is allowed' '0' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'reviewer')))
+
+    # 1a) The lead is the main session; it is never nested through the delegation tool.
+    Assert-Equal 'lead dispatched as a subagent is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'lead')))
+    Assert-Equal 'lead dispatched as a subagent with an explicit model is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'lead' -Model 'opus')))
 
     # 2) Model must match the matrix.
     Assert-Equal 'scout forced onto opus is blocked' '2' ([string](Invoke-RoutingHook -ProjectDir $sandbox -Payload (Get-TaskPayload -Agent 'scout' -Model 'opus')))
