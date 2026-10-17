@@ -7831,6 +7831,45 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name 'Health/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive' `
         -Failure 'гілка таймауту Invoke-WinSCPHealthSession має перевірити $process.HasExited ДО Complete-BRAVOProcessOutputCapture і, якщо WinSCP не завершився, кинути виняток без звільнення BRAVO_WINSCP lock, зберігши capture (з lock-потоком) у script scope, щоб GC не звільнив lock'
 
+    # Health/WinSCPScriptUsesProtectedHelper — командний файл WinSCP містить
+    # `open sftp://user:PASSWORD@host`, тому Invoke-WinSCPHealthSession має
+    # отримувати його шлях лише від canonical New-BRAVOWinSCPTemporaryScriptPath
+    # (protected DACL з моменту створення), прибирати через
+    # Remove-BRAVOWinSCPSensitiveTemporaryScript (збій = WARNING) і не писати
+    # WriteAllLines у шлях, побудований Join-Path у незахищеному TEMP, де
+    # BUILTIN\Users має ReadAndExecute.
+    $healthSessionParseErrors = $null
+    $healthSessionAst = [Management.Automation.Language.Parser]::ParseInput($healthScriptText, [ref]$null, [ref]$healthSessionParseErrors)
+    $healthSessionFunctionAst = @($healthSessionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $candidate.Name -eq 'Invoke-WinSCPHealthSession'
+            }, $true)) | Select-Object -First 1
+    $healthSessionCommandNames = @()
+    $healthSessionText = ''
+    if ($null -ne $healthSessionFunctionAst) {
+        $healthSessionText = $healthSessionFunctionAst.Extent.Text
+        $healthSessionCommandNames = @($healthSessionFunctionAst.FindAll({
+                    param($candidate)
+                    $candidate -is [Management.Automation.Language.CommandAst]
+                }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $null -ne $_ })
+    }
+    $healthSessionHelperCallIndex = $healthSessionText.IndexOf('$temporaryScriptPath = New-BRAVOWinSCPTemporaryScriptPath')
+    $healthSessionSecretWriteIndex = $healthSessionText.IndexOf('[System.IO.File]::WriteAllLines($temporaryScriptPath')
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $healthSessionFunctionAst -and
+            @($healthSessionParseErrors).Count -eq 0 -and
+            $healthSessionCommandNames -contains 'New-BRAVOWinSCPTemporaryScriptPath' -and
+            $healthSessionCommandNames -contains 'Remove-BRAVOWinSCPSensitiveTemporaryScript' -and
+            $healthSessionHelperCallIndex -ge 0 -and
+            $healthSessionSecretWriteIndex -gt $healthSessionHelperCallIndex -and
+            $healthSessionText -notmatch '\$temporaryScriptPath\s*=\s*Join-Path' -and
+            $healthSessionText -match 'Remove-BRAVOWinSCPSensitiveTemporaryScript[\s\S]{0,200}?catch\s*\{[\s\S]{0,400}?"WARNING"'
+        ) `
+        -Name 'Health/WinSCPScriptUsesProtectedHelper' `
+        -Failure 'Invoke-WinSCPHealthSession має отримувати шлях WinSCP-скрипта з обліковими даними від New-BRAVOWinSCPTemporaryScriptPath ДО запису, прибирати через Remove-BRAVOWinSCPSensitiveTemporaryScript з WARNING при збої і не будувати шлях скрипта через Join-Path у незахищеному TEMP'
+
     # ============================================================
     # dev.13: manual elevation + environment preflight (BRAVO_HEALTH.ps1
     # + BRAVO.Health.Runtime.ps1). Root cause: ручний non-elevated запуск
