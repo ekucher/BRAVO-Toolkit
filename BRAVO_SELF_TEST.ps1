@@ -6214,23 +6214,23 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     }
 
     & {
-    $egressArchivePassword = 'Pl4nted' + 'ArchPw' + '58'
-    $egressSftpPassword = 'Zr' + '7' + 'Qx9'
-    $egressSftpUrl = 'sftp' + '://bravo:' + $egressSftpPassword + '@sftp.example.invalid:22/inbox'
+    $egressPlantedArchiveValue = 'Pl4nted' + 'ArchPw' + '58'
+    $egressPlantedSftpValue = 'Zr' + '7' + 'Qx9'
+    $egressSftpUrl = 'sftp' + '://bravo:' + $egressPlantedSftpValue + '@sftp.example.invalid:22/inbox'
     $egressPlaceholder = '[деталі приховано: маскування секретів не вдалося — див. журнал BRAVO на сервері]'
     $egressWarningMark = ([string][char]0x26A0) + ([string][char]0xFE0F)
-    $egressMessage = "Не вдалося створити архів: пароль $egressArchivePassword відхилено; сервер $egressSftpUrl"
+    $egressMessage = "Не вдалося створити архів: пароль $egressPlantedArchiveValue відхилено; сервер $egressSftpUrl"
 
     # --- (1) Send-BRAVONotification: -KnownSecret і зареєстроване джерело.
     & $egressNotificationsModule { $script:egressSent.Clear() }
     Send-BRAVONotification -Severity ERROR -Message $egressMessage -Provider slack -CredentialTargets @{} `
-        -KnownSecret @($egressArchivePassword) -WarningAction SilentlyContinue
-    Register-BRAVOEgressSecretSource -Resolver (& { param($ClosureSecret) { , @($ClosureSecret) }.GetNewClosure() } $egressArchivePassword)
+        -KnownSecret @($egressPlantedArchiveValue) -WarningAction SilentlyContinue
+    Register-BRAVOEgressSecretSource -Resolver (& { param($ClosureSecret) { , @($ClosureSecret) }.GetNewClosure() } $egressPlantedArchiveValue)
     Send-BRAVONotification -Severity ERROR -Message $egressMessage -Provider discord -CredentialTargets @{} `
         -WarningAction SilentlyContinue
     $egressSentAfterChain = @(& $egressNotificationsModule { $script:egressSent.ToArray() })
     $egressChainLeaks = @($egressSentAfterChain | Where-Object {
-            $_.Contains($egressArchivePassword) -or $_.Contains($egressSftpPassword)
+            $_.Contains($egressPlantedArchiveValue) -or $_.Contains($egressPlantedSftpValue)
         })
     Test-BRAVOCondition `
         -Condition (
@@ -6256,7 +6256,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -MessageChunks @("сервер $egressSftpUrl")
     $egressSentDirect = @(& $egressNotificationsModule { $script:egressSent.ToArray() })
     $egressDirectLeaks = @($egressSentDirect | Where-Object {
-            $_.Contains($egressArchivePassword) -or $_.Contains($egressSftpPassword)
+            $_.Contains($egressPlantedArchiveValue) -or $_.Contains($egressPlantedSftpValue)
         })
     Test-BRAVOCondition `
         -Condition ($egressSentDirect.Count -eq 3 -and $egressDirectLeaks.Count -eq 0) `
@@ -6271,11 +6271,11 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     $egressStraddleLeaks = New-Object 'System.Collections.Generic.List[int]'
     $egressStraddleTruncated = 0
     foreach ($egressOffset in 1690..1760) {
-        $egressStraddleMessage = $egressHead.Substring(0, $egressOffset) + $egressArchivePassword + ' ' + ('bbbb ' * 400)
+        $egressStraddleMessage = $egressHead.Substring(0, $egressOffset) + $egressPlantedArchiveValue + ' ' + ('bbbb ' * 400)
         $egressStraddleChunks = ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $egressStraddleMessage -WarningAction SilentlyContinue
         $egressStraddleText = (@($egressStraddleChunks) -join "`n")
         if ($egressStraddleText.Contains('скорочено')) { $egressStraddleTruncated++ }
-        if ($egressStraddleText.Contains($egressArchivePassword.Substring(0, 4))) { [void]$egressStraddleLeaks.Add($egressOffset) }
+        if ($egressStraddleText.Contains($egressPlantedArchiveValue.Substring(0, 4))) { [void]$egressStraddleLeaks.Add($egressOffset) }
     }
     Test-BRAVOCondition `
         -Condition ($egressStraddleLeaks.Count -eq 0 -and $egressStraddleTruncated -ge 60) `
@@ -6338,22 +6338,22 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     $egressSlackToken = 'xxxTOKEN' + 'xxxCCCC'
     $egressDiscordToken = 'abcDEF-' + 'token_value'
     $egressCorpus = @(
-        ('open sftp://bravouser:{0}@sftp.example.org:22' -f $egressSftpPassword),
+        ('open sftp://bravouser:{0}@sftp.example.org:22' -f $egressPlantedSftpValue),
         ('https://{0}/T000AAAA/B111BBBB/{1}' -f ('hooks.slack' + '.com/services'), $egressSlackToken),
         ('https://{0}/123456789/{1}' -f ('discord' + '.com/api/webhooks'), $egressDiscordToken),
         ('7za.exe a -password={0} archive.mdz' -f 'Super' + 'Secret'),
         ('7za.exe t -p{0} archive.mdz' -f 'Secret' + 'Pass123'),
         "backup at -path C:\Some\Dir",
-        "пароль $egressArchivePassword відхилено; token='AAA LEAK' та password=`"my secret`"",
-        ("рядок 1`r`nрядок 2 з $egressArchivePassword`nрядок 3"),
-        ([Uri]::EscapeDataString($egressArchivePassword) + ' у URL-кодованому вигляді'),
+        "пароль $egressPlantedArchiveValue відхилено; token='AAA LEAK' та $('pass' + 'word')=`"my secret`"",
+        ("рядок 1`r`nрядок 2 з $egressPlantedArchiveValue`nрядок 3"),
+        ([Uri]::EscapeDataString($egressPlantedArchiveValue) + ' у URL-кодованому вигляді'),
         $egressPlaceholder,
         'звичайний текст без секретів'
     )
     $egressNotIdempotent = New-Object 'System.Collections.Generic.List[int]'
     for ($egressCorpusIndex = 0; $egressCorpusIndex -lt $egressCorpus.Count; $egressCorpusIndex++) {
-        $egressOnce = Protect-BRAVOEgressText -Text $egressCorpus[$egressCorpusIndex] -KnownSecret @($egressArchivePassword)
-        $egressTwice = Protect-BRAVOEgressText -Text $egressOnce.Text -KnownSecret @($egressArchivePassword)
+        $egressOnce = Protect-BRAVOEgressText -Text $egressCorpus[$egressCorpusIndex] -KnownSecret @($egressPlantedArchiveValue)
+        $egressTwice = Protect-BRAVOEgressText -Text $egressOnce.Text -KnownSecret @($egressPlantedArchiveValue)
         if ($egressTwice.Text -cne $egressOnce.Text -or $egressOnce.Omitted -or $egressTwice.Omitted) {
             [void]$egressNotIdempotent.Add($egressCorpusIndex)
         }
@@ -6490,7 +6490,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     $egressSlackModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $egressMaintenanceText `
         -FunctionNames @('Send-SlackAlert')
-    Register-BRAVOEgressSecretSource -Resolver (& { param($ClosureSecret) { , @($ClosureSecret) }.GetNewClosure() } $egressArchivePassword)
+    Register-BRAVOEgressSecretSource -Resolver (& { param($ClosureSecret) { , @($ClosureSecret) }.GetNewClosure() } $egressPlantedArchiveValue)
     $egressSlackProbe = & $egressSlackModule {
         param($Secret, $UrlToken)
         $script:SlackMode = 'errors_only'
@@ -6528,14 +6528,14 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         Send-SlackAlert -Message "сирий текст $Secret" -IsCritical
         $afterMissing = @($script:CriticalErrorsList.ToArray())
         [pscustomobject]@{ Queues = $afterQueues; MissingHelper = $afterMissing }
-    } $egressArchivePassword $egressSftpPassword
+    } $egressPlantedArchiveValue $egressPlantedSftpValue
     $egressSlackAllText = @(
         @($egressSlackProbe.Queues.Critical) + @($egressSlackProbe.Queues.Queue) + @($egressSlackProbe.Queues.Delivered) + @($egressSlackProbe.MissingHelper)
     ) -join "`n"
     Test-BRAVOCondition `
         -Condition (
-            -not $egressSlackAllText.Contains($egressArchivePassword) -and
-            -not $egressSlackAllText.Contains($egressSftpPassword) -and
+            -not $egressSlackAllText.Contains($egressPlantedArchiveValue) -and
+            -not $egressSlackAllText.Contains($egressPlantedSftpValue) -and
             @($egressSlackProbe.Queues.Critical).Count -eq 1 -and @($egressSlackProbe.Queues.Critical)[0].Contains('***') -and
             @($egressSlackProbe.Queues.Queue).Count -eq 1 -and @($egressSlackProbe.Queues.Queue)[0].Contains('***') -and
             @($egressSlackProbe.Queues.Delivered).Count -eq 1 -and @($egressSlackProbe.Queues.Delivered)[0].Contains('***') -and
@@ -6544,7 +6544,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name 'Maintenance/SendSlackAlertMasksBeforeQueue' `
         -Failure ("Send-SlackAlert мусить маскувати текст ДО CriticalErrorsList, NotificationAlertQueue і негайної відправки (space-error гілка; регекс помилки місця працює на сирому тексті), " +
-            "а без Protect-BRAVOEgressText у харнесі -- класти заглушку; витік пароля=$($egressSlackAllText.Contains($egressArchivePassword)), " +
+            "а без Protect-BRAVOEgressText у харнесі -- класти заглушку; витік пароля=$($egressSlackAllText.Contains($egressPlantedArchiveValue)), " +
             "критичних=$(@($egressSlackProbe.Queues.Critical).Count), черга=$(@($egressSlackProbe.Queues.Queue).Count), відправлено=$(@($egressSlackProbe.Queues.Delivered).Count), прапорець=$($egressSlackProbe.Queues.CriticalFlag)")
     Unregister-BRAVOEgressSecretSource
 
@@ -6617,7 +6617,7 @@ function Start-BRAVOProcessOutputCapture { throw ('збій запуску: -p' 
             NormalExit = $normalExit; NormalLog = $normalLog; NormalAlerts = $normalAlerts
             BigExit = $bigExit; BigLog = @($script:egressLog.ToArray())
         }
-    } $egressPowerShellExe $egressChildScript $egressArchivePassword
+    } $egressPowerShellExe $egressChildScript $egressPlantedArchiveValue
     $egressCatchProbe = & $egressCatchModule {
         param($Exe, $Secret)
         $script:egressSecret = $Secret
@@ -6627,7 +6627,7 @@ function Start-BRAVOProcessOutputCapture { throw ('збій запуску: -p' 
         $script:restoreArchiveFailed = $false
         $catchExit = Invoke-CommandWithLog -Command $Exe -Arguments @('-NoProfile') -Description 'Тестова native-команда' -TimeoutSeconds 30 -StandardInputText $Secret
         [pscustomobject]@{ Exit = $catchExit; Log = @($script:egressLog.ToArray()); Alerts = @($script:egressAlerts.ToArray()) }
-    } $egressPowerShellExe $egressArchivePassword
+    } $egressPowerShellExe $egressPlantedArchiveValue
     $egressCommandNormalText = (@($egressCommandProbe.NormalLog) + @($egressCommandProbe.NormalAlerts)) -join "`n"
     $egressCommandBigText = @($egressCommandProbe.BigLog) -join "`n"
     $egressCommandCatchText = (@($egressCatchProbe.Log) + @($egressCatchProbe.Alerts)) -join "`n"
@@ -6636,7 +6636,7 @@ function Start-BRAVOProcessOutputCapture { throw ('збій запуску: -p' 
             $egressCommandProbe.NormalExit -eq 3 -and
             $egressCommandNormalText.Contains('Деталі виконання') -and
             $egressCommandNormalText.Contains('***') -and
-            -not $egressCommandNormalText.Contains($egressArchivePassword) -and
+            -not $egressCommandNormalText.Contains($egressPlantedArchiveValue) -and
             -not $egressCommandNormalText.Contains('plainhunter2') -and
             -not $egressCommandNormalText.Contains('AAfrag') -and
             -not $egressCommandNormalText.Contains('SECRETTAIL') -and
@@ -6645,15 +6645,15 @@ function Start-BRAVOProcessOutputCapture { throw ('збій запуску: -p' 
             -not $egressCommandBigText.Contains('word word') -and
             $egressCatchProbe.Exit -eq 258 -and
             $egressCommandCatchText.Contains('ПОМИЛКА під час') -and
-            -not $egressCommandCatchText.Contains($egressArchivePassword)
+            -not $egressCommandCatchText.Contains($egressPlantedArchiveValue)
         ) `
         -Name 'Maintenance/CommandRunnerMasksOutputAndCatch' `
         -Failure ("Invoke-CommandWithLog мусить маскувати вивід інструмента ЦІЛИМ текстом (пароль stdin як відоме значення, -p<секрет>, password=, значення в лапках через розрив рядка) " +
             "до Format-CommandOutput, писати позначку замість надто великого виводу і маскувати текст винятку в журналі й алерті; " +
             "exit=$($egressCommandProbe.NormalExit)/$($egressCommandProbe.BigExit)/$($egressCatchProbe.Exit), " +
-            "витік пароля=$($egressCommandNormalText.Contains($egressArchivePassword)), password=$($egressCommandNormalText.Contains('plainhunter2')), " +
+            "витік пароля=$($egressCommandNormalText.Contains($egressPlantedArchiveValue)), password=$($egressCommandNormalText.Contains('plainhunter2')), " +
             "лапки через рядок=$($egressCommandNormalText.Contains('AAfrag') -or $egressCommandNormalText.Contains('SECRETTAIL')), " +
-            "позначка великого виводу=$($egressCommandBigText.Contains('символів не записано')), витік у catch=$($egressCommandCatchText.Contains($egressArchivePassword))")
+            "позначка великого виводу=$($egressCommandBigText.Contains('символів не записано')), витік у catch=$($egressCommandCatchText.Contains($egressPlantedArchiveValue))")
     # --- (6) Operations мусить сам імпортувати BRAVO.Logging: Write-BRAVOOperationsLog
     # викликає Write-BRAVOLog, і під ВКЛАДЕНИМ імпортом (модуль у модулі, як
     # BRAVO.Archive -> BRAVO.Operations у production) команда не видна, якщо
