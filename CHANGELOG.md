@@ -50,6 +50,56 @@
   (точний набір SID зі stub `Set-Acl`, junction-корінь/дитина, власник,
   DIAGNOSE на реальних ACL).
 
+- **CI: скасування застарілих PR-прогонів, ліміти часу, лог self-test завжди, fail-fast на EOL-дрейф маніфесту.**
+  У `.github/workflows/ci.yml` додано `concurrency`: новий пуш у гілку PR
+  скасовує попередній незавершений прогін (~19 хв кожен); прогони `push` у
+  `developer`/`master` і `workflow_dispatch` ніколи не скасовуються — для
+  не-PR подій ключ групи містить `run_id`, тож кожен такий прогін у власній
+  групі (спільна група за ref скасовувала б очікуваний push-прогін під час
+  серії мержів). Кожна
+  задача отримала `timeout-minutes` (self-test 45, решта 20 замість 360 за
+  замовчуванням) і workflow має `permissions: contents: read` (задача
+  `secret-scan` зберігає власні розширені права). Артефакт `self-test-log`
+  тепер завантажується завжди (`if: always()`), а не лише при падінні, тож
+  тривалість self-test можна відстежувати і для зелених прогонів. Назви задач
+  і required checks не змінено.
+  `ci\Update-BRAVORuntimeManifest.ps1` перед хешуванням (і в `-Apply`) звіряє
+  кінці рядків через `git ls-files --eol`: якщо файл комплекту має LF або
+  змішані кінці при `eol=crlf` у `.gitattributes` (типово новий файл, створений
+  інструментом з LF), скрипт одразу завершується з кодом 1, називає файл і
+  друкує команду виправлення, замість того щоб випустити маніфест, який CI
+  відхилить. Для середовищ без git є перемикач `-SkipEolCheck`. Крок CI
+  "Integrity manifests are current" при падінні друкує `--eol`-діагностику.
+
+- **Виправлено: ранні виходи `BRAVO_ARCHIV.ps1` повертають канонічні коди
+  `BRAVO.ExitCodes` замість голого `1`.** `BRAVO.Archive.Runtime.ps1`
+  завершувався літеральним `exit 1` (поза контрактом) при збої завантаження
+  конфігурації, відхиленому UAC-запиті, збої локальних параметрів установи з
+  Credential Manager та відсутньому `BRAVO_HEALTH.ps1` у режимі
+  `-HealthCheckOnly`. Тепер: конфігурація і параметри установи — `30`
+  (`InvalidConfiguration`, як у Maintenance/DataRestore), відхилений UAC — `36`
+  (`PrivilegeRequired`, як у `BRAVO_HEALTH.ps1`), відсутній health-скрипт —
+  `90` (як у `BRAVO_ARCHIV.ps1`/`BRAVO_HEALTH.ps1` для компонента комплекту,
+  якого бракує після guard; у режимі Enforce цей шлях недосяжний — guard
+  дає `33`, тож `90` можливий лише при `BRAVO_RUNTIME_INTEGRITY_MODE=Warn`).
+  Для оператора: у Task Scheduler `Last Run Result` завдання Archive у цих
+  випадках замість `1` покаже `30`/`36` (а `90` — лише в режимі Warn);
+  правила моніторингу, що очікують саме `1`, треба оновити. Тексти журналу й
+  порядок виконання не змінено. Maintenance, що запускає Archive дочірнім
+  процесом, і так трактує будь-який код, окрім `0`/`10`, як помилку. Додано
+  статичну перевірку: кожен `exit <число>` у Archive.Runtime мусить бути з
+  множини `BRAVO.ExitCodes`.
+
+- **Агентна оркестрація: роль `lead` як визначення агента.** Lead/Orchestrator
+  з `BRAVO_AGENT_POLICY.md` §8 тепер існує як `.claude/agents/lead.md` і роль
+  `lead` у `.claude/ai-routing.json` (`model: inherit` — модель, обрана
+  власником; `mainSessionOnly`). Сесію оркестрації запускають
+  `claude --agent lead`. Хук `validate-agent-routing.ps1` блокує виклик
+  `Agent` із `subagent_type: lead`, щоб оркестрація не вкладалась і не обходила
+  людський merge-gate; тест у `Test-AIRouting.ps1`. Оновлено
+  `docs/ai/MODEL_ROUTING_POLICY.md`, `.claude/skills/orchestrate/SKILL.md`,
+  `.claude/README.md` і §9.1 політики. Runtime-код не змінювався.
+
 - **Виправлено: вивід WinSCP маскується цілим (#461).**
   `Get-SanitizedWinSCPDiagnostic` (stdout/stderr WinSCP.com для SFTP-передачі,
   синхронізації, health-check і DataRestore) мав власні заміни, які маскували

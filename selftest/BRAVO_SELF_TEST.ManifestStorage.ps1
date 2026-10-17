@@ -109,7 +109,7 @@ function Write-BRAVOLog {
             param($State, $BackupRoot)
             Write-BRAVOBackupGenerationManifest -GenerationState $State -BackupRoot $BackupRoot
         } $writerGenerationState $writerTestRoot
-        $rewrittenManifest = Get-Content -LiteralPath $rewrittenManifestPath -Raw | ConvertFrom-Json
+        $rewrittenManifest = Get-Content -LiteralPath $rewrittenManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $orphanManifestBackups = @(
             Get-ChildItem -LiteralPath (Split-Path $rewrittenManifestPath -Parent) -File -Filter '.BRAVO_BACKUP_*.bak'
         )

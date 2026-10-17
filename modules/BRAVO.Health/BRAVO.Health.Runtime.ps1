@@ -2378,11 +2378,23 @@ function Invoke-WinSCPHealthSession {
     # зі старими версіями клієнта. Тому всі вставлені в нього локальні шляхи,
     # а також службові файли сеансу тримаємо в гарантовано ASCII-каталозі.
     $temporaryRoot = Get-BRAVOHealthTemporaryRoot
-    $temporaryScriptPath = Join-Path $temporaryRoot "$temporaryName.txt"
+    # Командний файл містить SFTP URL з обліковими даними (open ...), тому
+    # його шлях видає canonical New-BRAVOWinSCPTemporaryScriptPath
+    # (BRAVO.ArchiveRuntime, той самий helper, що Archive/DataRestore): файл
+    # одразу створюється з protected DACL (поточний обліковий запис/SYSTEM/
+    # Administrators), без вікна з успадкованими правами (BUILTIN\Users має
+    # ReadAndExecute на корені runtime). XML-журнал секретів не містить і
+    # лишається в ASCII-безпечному temp-каталозі.
+    $temporaryScriptPath = $null
     $temporaryXmlPath = Join-Path $temporaryRoot "$temporaryName.xml"
     $process = $null
 
     try {
+        if ($null -eq (Get-Command -Name 'New-BRAVOWinSCPTemporaryScriptPath' -ErrorAction SilentlyContinue) -or
+            $null -eq (Get-Command -Name 'Remove-BRAVOWinSCPSensitiveTemporaryScript' -ErrorAction SilentlyContinue)) {
+            throw "canonical helper захищеного WinSCP-скрипта (BRAVO.ArchiveRuntime) недоступний; SFTP-перевірку скасовано без запису облікових даних"
+        }
+        $temporaryScriptPath = New-BRAVOWinSCPTemporaryScriptPath
         $scriptLines = @(
             "option batch continue",
             "option confirm off",
@@ -2483,7 +2495,14 @@ function Invoke-WinSCPHealthSession {
             Error = $_.Exception.Message
         }
     } finally {
-        foreach ($temporaryPath in @($temporaryScriptPath, $temporaryXmlPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($temporaryScriptPath)) {
+            try {
+                Remove-BRAVOWinSCPSensitiveTemporaryScript -Path $temporaryScriptPath
+            } catch {
+                Write-HealthLog "Не вдалося прибрати тимчасовий WinSCP-скрипт з обліковими даними ($temporaryScriptPath): $($_.Exception.Message). Видаліть файл вручну." "WARNING"
+            }
+        }
+        foreach ($temporaryPath in @($temporaryXmlPath)) {
             if (Test-Path -LiteralPath $temporaryPath) {
                 Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
             }

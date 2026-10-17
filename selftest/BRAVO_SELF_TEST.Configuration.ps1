@@ -2202,7 +2202,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         # проти ОРИГІНАЛЬНОЇ guard-реалізації (до Codex review 5290816507)
         # і МУСИТЬ проходити на поточній.
         $ssgSchemaPath = Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psm1'
-        $ssgLines = Get-Content -LiteralPath $ssgSchemaPath
+        $ssgLines = Get-Content -LiteralPath $ssgSchemaPath -Encoding UTF8
         $ssgRawSrc = [string]::Join([Environment]::NewLine, $ssgLines)
         # ВАЖЛИВО: спершу прибираємо <# ... #> block-коментарі (comment-
         # based help) із СИРОГО тексту, ДО пострядкового `#`-фільтра.

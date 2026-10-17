@@ -1664,3 +1664,32 @@ Test-BRAVOCondition `
     ) `
     -Name 'Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive' `
     -Failure 'гілка таймауту Test-SFTPConnection має перевірити $process.HasExited ДО Complete-BRAVOProcessOutputCapture і, якщо WinSCP не завершився, кинути виняток без звільнення BRAVO_WINSCP lock, зберігши capture (з lock-потоком) у script scope, щоб GC не звільнив lock'
+
+# ============================================================
+# Контракт кодів завершення: кожен літеральний `exit <число>` у
+# BRAVO.Archive.Runtime.ps1 має належати канонічній множині
+# BRAVO.ExitCodes. Множина виводиться з таблиці $script:BRAVOExitCodeNames
+# модуля під час тесту (не копія). Голий `exit 1` (конфігурація, UAC,
+# параметри установи) раніше був поза контрактом.
+# ============================================================
+
+$archiveExitCodesModulePath = Join-Path $root 'modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psm1'
+$archiveExitCodesText = [IO.File]::ReadAllText($archiveExitCodesModulePath, [Text.Encoding]::UTF8)
+$archiveCanonicalExitCodes = @(
+    [regex]::Matches($archiveExitCodesText, '(?m)^\s+(\d+)\s*=\s*"[A-Za-z]+"\s*$') |
+        ForEach-Object { [int]$_.Groups[1].Value }
+)
+$archiveLiteralExitCodes = @(
+    [regex]::Matches($archiveScriptText, '(?im)^\s*exit\s+(\d+)\b') |
+        ForEach-Object { [int]$_.Groups[1].Value }
+)
+$archiveNonCanonicalExitCodes = @($archiveLiteralExitCodes | Where-Object { $archiveCanonicalExitCodes -notcontains $_ } | Sort-Object -Unique)
+Test-BRAVOCondition `
+    -Condition (
+        $archiveCanonicalExitCodes.Count -ge 15 -and
+        $archiveCanonicalExitCodes -contains 30 -and
+        $archiveLiteralExitCodes.Count -ge 5 -and
+        $archiveNonCanonicalExitCodes.Count -eq 0
+    ) `
+    -Name 'Archive/LiteralExitCodesAreCanonical' `
+    -Failure "кожен літеральний exit <число> у BRAVO.Archive.Runtime.ps1 має бути кодом із BRAVO.ExitCodes; поза контрактом: [$($archiveNonCanonicalExitCodes -join ', ')]; літералів: $($archiveLiteralExitCodes.Count); канонічних кодів: $($archiveCanonicalExitCodes.Count)"

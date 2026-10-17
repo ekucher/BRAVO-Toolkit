@@ -291,7 +291,9 @@ function Get-SetupConfiguration {
         # -ConfigPath — кожен дочірній процес сам виконує ту саму
         # AUTO-резолюцію проти власного RuntimeRoot (той самий контракт,
         # що BRAVO_TASKS_INSTALL.ps1, Секція 6).
-        ConfigPathArgument = if ($ConfigPathWasExplicit) { @('-ConfigPath', $resolvedPath) } else { @() }
+        # #449: унарна кома — порожня гілка @() інакше розгортається в $null,
+        # а не в Object[] довжини 0, при виході через if-вираз.
+        ConfigPathArgument = if ($ConfigPathWasExplicit) { , @('-ConfigPath', $resolvedPath) } else { , @() }
         PrimaryConfigPresent = [bool]$global:BravoConfigurationMetadata.PrimaryConfigPresent
         Root = $runtimeRoot
         BackupRoot = [string]$global:backupRootPath
@@ -692,10 +694,12 @@ try {
     # У режимах Full/Credentials перевіряється запитаний scope. У Test/Scheduler
     # перевіряємо стандартний безпечний набір Required для обох облікових записів.
     if ($Action -in @("Full", "Credentials", "Scheduler", "Test")) {
+        # #449: унарна кома — $CredentialComponent типово одноелементний
+        # (ValidateSet-перемикач), інакше колапсує в скаляр String.
         $testComponents = if ($credentialWorkRequested) {
-            @($CredentialComponent)
+            , @($CredentialComponent)
         } else {
-            @("Required")
+            , @("Required")
         }
         $testStore = if ($credentialWorkRequested) { $StoreFor } else { "Both" }
         $credentialTestArguments = @($setup.ConfigPathArgument) + @(
