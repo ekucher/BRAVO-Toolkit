@@ -8,6 +8,11 @@ description: Coordinate BRAVO research, implementation, tests, review and Codex 
 You are the **Lead/Orchestrator**. Read `BRAVO_AGENT_POLICY.md` and `CLAUDE.md` first.
 The canonical policy overrides this skill.
 
+The lead is a first-class agent definition, `.claude/agents/lead.md`: start the session with
+`claude --agent lead` (or `"agent": "lead"` in settings) so the orchestrator contract is loaded
+from the first turn. It runs only as the main session — the routing hook denies `Agent` calls with
+`subagent_type: lead`.
+
 Claude subagents own bounded work:
 
 - `scout` — context gathering;
@@ -180,7 +185,7 @@ two could differ; the matrix is what CI and the hook check.
 
 | Role | Agent | Model | Writes |
 |---|---|---|---|
-| Lead/orchestrator | main session | owner's selected model | yes |
+| Lead/orchestrator | `lead` (main session only, `claude --agent lead`) | `inherit` (owner's selected model) | yes |
 | Context gathering | `scout` | haiku | no |
 | Implementation | `worker` | sonnet | SCOPE only |
 | Tests | `tester` | sonnet | tests in SCOPE only |

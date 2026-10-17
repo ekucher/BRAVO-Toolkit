@@ -1497,6 +1497,73 @@ try {
     } finally {
         Remove-Item -LiteralPath $configuratorLegacyRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+# ===== Child-script non-ASCII/apostrophe regression: Invoke-EffectiveChild.ps1
+# раніше писався UTF-8 БЕЗ BOM із шляхами (під GetTempPath() профілю оператора)
+# як single-quoted літерали. Windows PowerShell 5.1 читає BOM-less .ps1 в ANSI,
+# тож байт 0x82 кириличної «т» ставав U+201A (лапка) і ламав літерал; апостроф
+# (O'Neil) ламав його навіть із BOM. Шляхи тепер передаються аргументами (param),
+# скрипт пишеться з BOM. Дві поведінкові перевірки (кирилиця; апостроф) крутять
+# справжній дочірній процес, підмінивши TMP/TEMP процесу на каталог під
+# власним тимчасовим коренем (реальний %TEMP% не використовується), а також
+# RuntimeRoot із пробілом. «т» будується через [char], файл лишається ASCII-safe. =====
+& {
+    $configuratorChildEffectiveText = [IO.File]::ReadAllText((Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Effective.psm1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition (
+        $configuratorChildEffectiveText -match '(?m)WriteAllText\(\$childScriptPath,[^\r\n]*UTF8Encoding\(\$true\)' -and
+        $configuratorChildEffectiveText -notmatch '(?m)WriteAllText\(\$childScriptPath,[^\r\n]*UTF8Encoding\(\$false\)' -and
+        $configuratorChildEffectiveText -match "'param\(\[string\]\`$IsolatedRoot" -and
+        $configuratorChildEffectiveText -notmatch "'\`$(isolatedRoot|resultJsonPath|errorJsonPath)'" -and
+        $configuratorChildEffectiveText -notmatch '\$escapedRuntimeRoot'
+    ) `
+        'Configurator/ChildScript/WrittenWithBomAndNoPathLiterals' `
+        'Invoke-EffectiveChild.ps1 мусить писатись UTF8Encoding($true) (BOM), мати param-блок і не вбудовувати $isolatedRoot/$resultJsonPath/$errorJsonPath/RuntimeRoot у single-quoted літерали'
+
+    $configuratorChildCases = [ordered]@{
+        'Cyrillic'  = ('A' + [string][char]0x0442 + 'B')
+        'Apostrophe' = "O'Neil"
+    }
+    $configuratorChildFixtureBase = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CONFIGURATOR_CHILDARGS_{0}" -f [guid]::NewGuid().ToString('N'))
+    $configuratorChildOldTmp = $env:TMP
+    $configuratorChildOldTemp = $env:TEMP
+    try {
+        foreach ($configuratorChildCaseName in $configuratorChildCases.Keys) {
+            $configuratorChildTmp = Join-Path $configuratorChildFixtureBase ($configuratorChildCases[$configuratorChildCaseName])
+            $configuratorChildRuntime = Join-Path $configuratorChildTmp 'runtime root'
+            [void][IO.Directory]::CreateDirectory($configuratorChildRuntime)
+            Copy-Item -LiteralPath (Join-Path $root 'BRAVO_CONFIG_LOADER.ps1') -Destination (Join-Path $configuratorChildRuntime 'BRAVO_CONFIG_LOADER.ps1') -Force
+            Copy-Item -LiteralPath (Join-Path $root 'VERSION.json') -Destination (Join-Path $configuratorChildRuntime 'VERSION.json') -Force
+            $null = cmd.exe /c mklink /J "$configuratorChildRuntime\modules" "$root\modules" 2>&1
+            [void][IO.Directory]::CreateDirectory((Join-Path $configuratorChildRuntime 'FIXTURE_LIMS'))
+            [void][IO.Directory]::CreateDirectory((Join-Path $configuratorChildRuntime 'FIXTURE_BACKUP'))
+            $configuratorChildResult = $null
+            $configuratorChildError = ''
+            try {
+                $env:TMP = $configuratorChildTmp
+                $env:TEMP = $configuratorChildTmp
+                $configuratorChildResult = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorChildRuntime -CandidateOverrides @{
+                    'pathSettings.LIMSRoot'   = (Join-Path $configuratorChildRuntime 'FIXTURE_LIMS')
+                    'pathSettings.BackupRoot' = (Join-Path $configuratorChildRuntime 'FIXTURE_BACKUP')
+                    'consoleSettings.ConsoleLevel' = 'ERROR'
+                }
+            } catch { $configuratorChildError = $_.Exception.Message }
+            finally {
+                $env:TMP = $configuratorChildOldTmp
+                $env:TEMP = $configuratorChildOldTemp
+            }
+            Test-BRAVOCondition ($null -ne $configuratorChildResult -and [string]$configuratorChildResult.consoleSettings.ConsoleLevel -ceq 'ERROR') `
+                "Configurator/ChildScript/EffectiveWorksWithSpecialCharsInTempAndRuntimeRoot/$configuratorChildCaseName" `
+                "Effective-обчислення мусить працювати, коли TEMP та RuntimeRoot містять '$($configuratorChildCases[$configuratorChildCaseName])' і пробіл; помилка: $configuratorChildError"
+        }
+    } finally {
+        $env:TMP = $configuratorChildOldTmp
+        $env:TEMP = $configuratorChildOldTemp
+        foreach ($configuratorChildCaseName in $configuratorChildCases.Keys) {
+            $configuratorChildJunction = Join-Path (Join-Path (Join-Path $configuratorChildFixtureBase ($configuratorChildCases[$configuratorChildCaseName])) 'runtime root') 'modules'
+            if (Test-Path -LiteralPath $configuratorChildJunction) { cmd.exe /c rmdir "$configuratorChildJunction" 2>&1 | Out-Null }
+        }
+        Remove-Item -LiteralPath $configuratorChildFixtureBase -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Configurator/ConfiguratorNestedBaselineChangedIsDirty' } }
 if (Enter-BRAVOSelfTestSection -Name 'Configurator/Authorization' -DependsOn 'Configurator/Schema1') { try {

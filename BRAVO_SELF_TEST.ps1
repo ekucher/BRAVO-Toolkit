@@ -3458,7 +3458,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $phase0JsonParsedOk = $false
             if ([IO.File]::Exists($phase0JsonTargetPath)) {
                 try {
-                    [void](Get-Content -LiteralPath $phase0JsonTargetPath -Raw | ConvertFrom-Json)
+                    [void](Get-Content -LiteralPath $phase0JsonTargetPath -Raw -Encoding UTF8 | ConvertFrom-Json)
                     $phase0JsonParsedOk = $true
                 } catch {
                     $phase0JsonParsedOk = $false
@@ -9712,7 +9712,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Condition (-not $safelyNullThrew -and $null -eq $safelyNullResult) `
             -Name 'Operations/SendEventSafelyNoOpsOnNullSettingsWithoutRealSendEvent' `
             -Failure "#448: Send-BRAVOOperationsEventSafely з OperationsReportingSettings=`$null має тихо повернутись БЕЗ спроби викликати Send-BRAVOOperationsEvent (якого немає в цьому ізольованому модулі); факт: threw=$safelyNullThrew result=$safelyNullResult"
-    } (Get-Content -Raw (Join-Path $root "modules\BRAVO.Operations\BRAVO.Operations.psm1"))
+    } (Get-Content -Raw -Encoding UTF8 (Join-Path $root "modules\BRAVO.Operations\BRAVO.Operations.psm1"))
 
     $compatibilityScriptText = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"),
@@ -17393,11 +17393,11 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
     # виконується (без guard-а воно б відпрацювало й завершило процес, а
     # функції runtime, як-от Main, лишилися б визначеними). Invoke: справжній
     # production-шлях Invoke-BRAVOArchiveEntrypoint -> & runtime -> guard ->
-    # тіло; явно вказаний відсутній -ConfigPath дає exit 1 з catch
-    # завантаження конфігурації ВСЕРЕДИНІ функції (поточний код; те, що це
-    # 1, а не контрактний 30, — окремий відомий дефект, і його виправлення
-    # має оновити цю перевірку). $LASTEXITCODE перед викликом = 77, тож
-    # пропущене тіло не може випадково дати 1.
+    # тіло; явно вказаний відсутній -ConfigPath дає контрактний exit 30
+    # (InvalidConfiguration) з catch завантаження конфігурації ВСЕРЕДИНІ
+    # функції (раніше — голий exit 1, поза контрактом BRAVO.ExitCodes).
+    # $LASTEXITCODE перед викликом = 77, тож пропущене тіло не може
+    # випадково дати 30.
     $archiveWrapperProbeRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_ARCHIVE_WRAPPER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -17464,10 +17464,10 @@ try {
         Test-BRAVOCondition `
             -Condition (
                 $null -eq $archiveWrapperInvoke.PSObject.Properties['ProbeError'] -and
-                $archiveWrapperInvoke.ExitCode -eq 1
+                $archiveWrapperInvoke.ExitCode -eq 30
             ) `
             -Name "Console/ArchiveRuntimeDirectInvocationRunsBody" `
-            -Failure "Invoke-BRAVOArchiveEntrypoint з явно вказаним відсутнім -ConfigPath має виконати тіло через guard і повернути exit 1 з catch завантаження конфігурації; проба: $($archiveWrapperInvoke | ConvertTo-Json -Compress)"
+            -Failure "Invoke-BRAVOArchiveEntrypoint з явно вказаним відсутнім -ConfigPath має виконати тіло через guard і повернути exit 30 з catch завантаження конфігурації; проба: $($archiveWrapperInvoke | ConvertTo-Json -Compress)"
     } finally {
         if (Test-Path -LiteralPath $archiveWrapperProbeRoot -PathType Container) {
             Remove-Item -LiteralPath $archiveWrapperProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -20832,6 +20832,84 @@ try {
                 ) `
                 -Name 'DiscoveryBaseline/DriftAssignmentSurvivesStrictModeCountAccess' `
                 -Failure "if/else-як-вираз навколо Compare-BRAVODiscoveryBaseline (той самий шаблон, що й у BRAVO_SETUP.ps1) не сміє кидати виняток або втрачати Count при читанні .Count: noDriftThrew=$countTestNoDriftThrew noDriftCount=$countTestNoDriftCount driftThrew=$countTestDriftThrew driftCount=$countTestDriftCount noBaselineThrew=$countTestNoBaselineThrew noBaselineCount=$countTestNoBaselineCount"
+
+            # --- ArrayCollapseHardening/BranchAssignmentsKeepArrayShape ---
+            # #449: той самий клас дефекту, що й DriftAssignmentSurvivesStrictModeCountAccess
+            # вище, латентно існував ще у 4 місцях, де `$var = if (cond) {
+            # @(singleOrEmpty) } else { @(otherShape) }` — жоден активний
+            # споживач сьогодні не покладається на форму масиву, але
+            # майбутній `.Count`/індексація впав би так само. Усі 5 місць
+            # (нижче) уже отримали унарну кому `,@(...)` в обох гілках;
+            # цей блок характеризує сам вираз під Set-StrictMode -Version
+            # 2.0 для 0-, 1- і N-елементних форм, щоб регресія була
+            # виявлена тестом, а не наступним реальним VM-прогоном.
+            & {
+                Set-StrictMode -Version 2.0
+                $arrayCollapseCases = New-Object System.Collections.Generic.List[object]
+
+                # BRAVO_DRY_RUN.ps1 ~547: $requiredRoutes
+                $notificationModeErrorsOnly = $true
+                $requiredRoutesErrorsOnly = if ($notificationModeErrorsOnly) { ,@('alerts') } else { ,@('general', 'alerts') }
+                $notificationModeErrorsOnly = $false
+                $requiredRoutesAll = if ($notificationModeErrorsOnly) { ,@('alerts') } else { ,@('general', 'alerts') }
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'DryRun/RequiredRoutes(errors_only)'; Value = $requiredRoutesErrorsOnly; ExpectedCount = 1 })
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'DryRun/RequiredRoutes(all)'; Value = $requiredRoutesAll; ExpectedCount = 2 })
+
+                # BRAVO_SETUP.ps1 ~697: $testComponents
+                $credentialWorkRequestedProbe = $true
+                $credentialComponentProbe = 'Configurator'
+                $testComponentsScoped = if ($credentialWorkRequestedProbe) { ,@($credentialComponentProbe) } else { ,@("Required") }
+                $credentialWorkRequestedProbe = $false
+                $testComponentsDefault = if ($credentialWorkRequestedProbe) { ,@($credentialComponentProbe) } else { ,@("Required") }
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'Setup/TestComponents(scoped)'; Value = $testComponentsScoped; ExpectedCount = 1 })
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'Setup/TestComponents(default)'; Value = $testComponentsDefault; ExpectedCount = 1 })
+
+                # BRAVO_SETUP.ps1 ~294: ConfigPathArgument (явна/AUTO-гілки)
+                $configPathWasExplicitProbe = $true
+                $resolvedPathProbe = 'C:\ProgramData\BRAVO\BRAVO.config'
+                $configPathArgumentExplicit = if ($configPathWasExplicitProbe) { ,@('-ConfigPath', $resolvedPathProbe) } else { ,@() }
+                $configPathWasExplicitProbe = $false
+                $configPathArgumentAuto = if ($configPathWasExplicitProbe) { ,@('-ConfigPath', $resolvedPathProbe) } else { ,@() }
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'Setup/ConfigPathArgument(explicit)'; Value = $configPathArgumentExplicit; ExpectedCount = 2 })
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'Setup/ConfigPathArgument(auto)'; Value = $configPathArgumentAuto; ExpectedCount = 0 })
+
+                # BRAVO_CREDENTIALS_SETUP.ps1 ~1875: $failureStatuses
+                $credentialActionProbe = 'Test'
+                $failureStatusesTest = if ($credentialActionProbe -eq "Test") { ,@("Error", "Missing") } else { ,@("Error") }
+                $credentialActionProbe = 'Add'
+                $failureStatusesAdd = if ($credentialActionProbe -eq "Test") { ,@("Error", "Missing") } else { ,@("Error") }
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'CredentialsSetup/FailureStatuses(Test)'; Value = $failureStatusesTest; ExpectedCount = 2 })
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'CredentialsSetup/FailureStatuses(Add)'; Value = $failureStatusesAdd; ExpectedCount = 1 })
+
+                # ci/Test-BRAVOReleasePolicy.ps1 ~235: $expectedForGitChannel
+                $gitChannelProbe = 'stable'
+                $expectedForGitChannelStable = if ($gitChannelProbe -eq 'stable') { ,@('stable') } else { ,@('development', 'prerelease') }
+                $gitChannelProbe = 'developer'
+                $expectedForGitChannelDev = if ($gitChannelProbe -eq 'stable') { ,@('stable') } else { ,@('development', 'prerelease') }
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'ReleasePolicy/ExpectedForGitChannel(stable)'; Value = $expectedForGitChannelStable; ExpectedCount = 1 })
+                $arrayCollapseCases.Add([pscustomobject]@{ Name = 'ReleasePolicy/ExpectedForGitChannel(developer)'; Value = $expectedForGitChannelDev; ExpectedCount = 2 })
+
+                $arrayCollapseFailures = New-Object System.Collections.Generic.List[string]
+                foreach ($case in $arrayCollapseCases) {
+                    $threw = $false
+                    $actualCount = -1
+                    $isArray = $false
+                    try {
+                        $isArray = $case.Value -is [System.Array]
+                        $actualCount = $case.Value.Count
+                    } catch {
+                        $threw = $true
+                    }
+                    if ($threw -or -not $isArray -or $actualCount -ne $case.ExpectedCount) {
+                        [void]$arrayCollapseFailures.Add("$($case.Name): threw=$threw isArray=$isArray count=$actualCount очікувано=$($case.ExpectedCount)")
+                    }
+                }
+
+                Test-BRAVOCondition `
+                    -Condition ($arrayCollapseFailures.Count -eq 0) `
+                    -Name 'ArrayCollapseHardening/BranchAssignmentsKeepArrayShape' `
+                    -Failure ("Унарна кома `,@(...)` у 5 профілактично зміцнених `if/else`-присвоєннях (BRAVO_DRY_RUN.ps1, BRAVO_SETUP.ps1 x2, BRAVO_CREDENTIALS_SETUP.ps1, ci/Test-BRAVOReleasePolicy.ps1) мусить утримувати форму масиву під Set-StrictMode -Version 2.0 для 0/1/N-елементних гілок; провали: " + ($arrayCollapseFailures -join '; '))
+            }
 
             # --- DiscoveryBaseline/InvalidCanonicalFailsClosed ---
             # Найважливіший сценарій: пошкоджений canonical НЕ сміє мовчки
