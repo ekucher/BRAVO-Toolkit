@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 ## Не випущено (developer)
 
@@ -21,8 +21,17 @@
   не слідує за попередньо підкладеним junction/symlink. До будь-якого
   `Set-Acl` перевіряються каталог даних і всі його предки до `RuntimeRoot`
   (LOGS/TEMP) або `%ProgramData%` (State): reparse point або власник не
-  SYSTEM/Administrators/обліковий запис завдань — `throw` (fail-closed,
-  встановлення переривається без зміни ACL); дочірні reparse point
+  SYSTEM/Administrators/поточна elevated-особа інсталятора — `throw`
+  (fail-closed, встановлення переривається до зміни ACL цього каталогу;
+  runtime ACL і LOGS на той момент можуть бути вже застосовані). Предки
+  `%ProgramData%\BRAVO` мають належати SYSTEM, Administrators або
+  адміністратору, що встановлює (вбудований Administrator RID 500 володіє
+  створеним каталогом під власним SID). Обліковий запис завдань не довірений
+  як власник предків і на корені каталогу даних не має DELETE (корінь:
+  ReadAndExecute|Write, Modify для вмісту — окремий inherit-only ACE).
+  Перед кожним переліком вмісту ланцюг reparse point перевіряється повторно;
+  у разі зміни каталог пропускається з `WARNING`, а помилка посеред обходу
+  називає не оброблені елементи. Дочірні reparse point
   пропускаються з `WARNING` (не обходяться). Якщо `RunAsUser` заданий, але
   його SID не визначено, встановлення переривається до зміни ACL.
   `BRAVO_TASKS_DIAGNOSE.ps1` також вважає широкими `INTERACTIVE` і

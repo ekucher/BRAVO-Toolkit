@@ -1447,10 +1447,9 @@ try {
         $null -ne $b7DataAcl -and
         $b7DataAclText.Contains('SetAccessRuleProtection($true, $false)') -and
         $b7DataAclText.Contains('[System.IO.Directory]::CreateDirectory($fullPath)') -and
-        -not $b7DataAclText.Contains('ReadAndExecute') -and
         -not $b7DataAclText.Contains('Get-Acl')
     ) -Name 'Scheduler/DataDirectoryAclIsProtectedWithoutUsersAce' `
-        -Failure 'Set-BRAVOProtectedDataDirectoryAcl має створювати каталог, вимикати успадкування й не містити ReadAndExecute/Get-Acl (поведінку див. DataDirectoryAclExactSidSetBehavioural)'
+        -Failure 'Set-BRAVOProtectedDataDirectoryAcl має створювати каталог, вимикати успадкування й не містити Get-Acl (поведінку див. DataDirectoryAclExactSidSetBehavioural)'
     & {
         # B7 / P1+P2 (повторний security-review): поведінкові перевірки замість
         # текстових. Функції витягуються через AST у ЧИСТИЙ scope, Set-Acl
@@ -1526,6 +1525,8 @@ try {
                 [void]$b7Problems.Add("набір шляхів Set-Acl: $($b7RecordedPaths -join ', ')")
             }
             $b7Sid = [Security.Principal.SecurityIdentifier]
+            $b7RootOwnAceCount = 0
+            $b7RootInheritOnlyCount = 0
             foreach ($b7Call in @($b7Result.Calls)) {
                 $b7IsDirectory = [IO.Directory]::Exists($b7Call.Path)
                 $b7Acl = $b7Call.Acl
@@ -1538,8 +1539,29 @@ try {
                 $b7ExpectedInheritance = if ($b7IsDirectory) {
                     [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
                 } else { [Security.AccessControl.InheritanceFlags]::None }
+                $b7IsRoot = ($b7Call.Path -eq $b7Data)
                 foreach ($b7Rule in $b7Rules) {
                     $b7RuleSid = $b7Rule.IdentityReference.Value
+                    if ($b7IsRoot -and $b7RuleSid -eq $b7ModifySid) {
+                        # P2: корінь - ReadAndExecute|Write без DELETE (no inherit) + окремий inherit-only Modify.
+                        $b7RootDeleteMask = [int][Security.AccessControl.FileSystemRights]::Delete -bor [int][Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles
+                        $b7IsInheritOnly = ($b7Rule.PropagationFlags -eq [Security.AccessControl.PropagationFlags]::InheritOnly)
+                        if ($b7IsInheritOnly) {
+                            if ($b7Rule.InheritanceFlags -ne $b7ExpectedInheritance -or
+                                ([int]$b7Rule.FileSystemRights -band (-bnot [int][Security.AccessControl.FileSystemRights]::Synchronize)) -ne ([int][Security.AccessControl.FileSystemRights]::Modify -band (-bnot [int][Security.AccessControl.FileSystemRights]::Synchronize))) {
+                                [void]$b7Problems.Add("корінь: inherit-only ACE для ModifySid має бути Modify з CI|OI: $($b7Rule.FileSystemRights)/$($b7Rule.InheritanceFlags)")
+                            }
+                            $b7RootInheritOnlyCount++
+                        } else {
+                            if ($b7Rule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None -or
+                                ([int]$b7Rule.FileSystemRights -band $b7RootDeleteMask) -ne 0 -or
+                                ([int]$b7Rule.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::Write) -ne [int][Security.AccessControl.FileSystemRights]::Write) {
+                                [void]$b7Problems.Add("корінь: власний ACE для ModifySid має бути Write без Delete/DeleteSubdirectoriesAndFiles, без успадкування: $($b7Rule.FileSystemRights)/$($b7Rule.InheritanceFlags)")
+                            }
+                            $b7RootOwnAceCount++
+                        }
+                        continue
+                    }
                     $b7ExpectedRights = if ($b7RuleSid -eq $b7ModifySid) { [Security.AccessControl.FileSystemRights]::Modify } else { [Security.AccessControl.FileSystemRights]::FullControl }
                     if ($b7Rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { [void]$b7Problems.Add("$($b7Call.Path): не Allow для $b7RuleSid") }
                     if (([int]$b7Rule.FileSystemRights -band (-bnot [int][Security.AccessControl.FileSystemRights]::Synchronize)) -ne ([int]$b7ExpectedRights -band (-bnot [int][Security.AccessControl.FileSystemRights]::Synchronize))) { [void]$b7Problems.Add("$($b7Call.Path): права $b7RuleSid = $($b7Rule.FileSystemRights)") }
@@ -1549,6 +1571,9 @@ try {
                 foreach ($b7BroadSid in @('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0', 'S-1-5-4')) {
                     if ($b7SidSet.Contains($b7BroadSid)) { [void]$b7Problems.Add("$($b7Call.Path): широкий принципал $b7BroadSid") }
                 }
+            }
+            if ($b7RootOwnAceCount -ne 1 -or $b7RootInheritOnlyCount -ne 1) {
+                [void]$b7Problems.Add("корінь: очікується рівно один власний і один inherit-only ACE для ModifySid ($b7RootOwnAceCount/$b7RootInheritOnlyCount)")
             }
             Test-BRAVOCondition -Condition ($b7Problems.Count -eq 0 -and $b7Result.Calls.Count -eq 4) `
                 -Name 'Scheduler/DataDirectoryAclExactSidSetBehavioural' `
@@ -1562,6 +1587,38 @@ try {
                 $b7OwnerResult.Error.Contains('власник') -and $b7OwnerResult.Error.Contains($b7OwnerData)
             ) -Name 'Scheduler/DataDirectoryAclRefusesUntrustedOwner' `
                 -Failure 'каталог даних із власником не SYSTEM/Administrators має призвести до throw (з назвою шляху) ДО будь-якого Set-Acl'
+
+            # 2a) P1: власник НЕ підмінений. Каталог створює сама функція (власник =
+            # поточна elevated-особа: built-in Administrator RID 500 під власним SID
+            # або Administrators у split-token) - має пройти, а ACL мають точний набір SID.
+            $b7FreshData = Join-Path $b7Scratch 'fresh-real-owner\data'
+            $b7FreshResult = & $b7Probe $b7InstallFunctionText $b7FreshData @($b7ModifySid) (Join-Path $b7Scratch 'fresh-real-owner') '' @()
+            $b7FreshProblems = New-Object System.Collections.ArrayList
+            if ($null -ne $b7FreshResult.Error) { [void]$b7FreshProblems.Add("помилка: $($b7FreshResult.Error)") }
+            if ($b7FreshResult.Calls.Count -ne 1) { [void]$b7FreshProblems.Add("кількість Set-Acl: $($b7FreshResult.Calls.Count)") }
+            foreach ($b7FreshCall in @($b7FreshResult.Calls)) {
+                $b7FreshSidSet = (@($b7FreshCall.Acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique) -join '|')
+                if ($b7FreshSidSet -ne ((@('S-1-5-32-544', 'S-1-5-18', $b7ModifySid) | Sort-Object) -join '|')) { [void]$b7FreshProblems.Add("набір SID '$b7FreshSidSet'") }
+            }
+            . ([scriptblock]::Create((& $b7ParseFunction $b7InstallText 'Get-BRAVOPathOwnerSid').Extent.Text))
+            $b7FreshOwner = Get-BRAVOPathOwnerSid -Path $b7FreshData
+            $b7FreshCurrent = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            Test-BRAVOCondition -Condition (
+                $b7FreshProblems.Count -eq 0 -and
+                (@('S-1-5-32-544', 'S-1-5-18', $b7FreshCurrent) -contains $b7FreshOwner)
+            ) -Name 'Scheduler/DataDirectoryAclAcceptsSelfCreatedDirRealOwner' `
+                -Failure ("функція має приймати каталог, який сама створила (реальний власник $b7FreshOwner, поточна особа $b7FreshCurrent; без підміни Get-BRAVOPathOwnerSid): " + ($b7FreshProblems -join '; '))
+
+            # 2b) ModifySid (RunAsUser) не є довіреним власником ПРЕДКА (P2):
+            # предок 'anc' із власником = ModifySid -> throw, листок data - допустимий.
+            $b7AncestorData = Join-Path $b7Scratch 'anc\data'
+            $b7AncestorResult = & $b7Probe $b7InstallFunctionText $b7AncestorData @($b7ModifySid) $b7Scratch $b7ModifySid @()
+            Test-BRAVOCondition -Condition (
+                $b7AncestorResult.Calls.Count -eq 0 -and $null -ne $b7AncestorResult.Error -and
+                $b7AncestorResult.Error.Contains('власник') -and $b7AncestorResult.Error.Contains((Join-Path $b7Scratch 'anc')) -and
+                -not $b7AncestorResult.Error.Contains($b7AncestorData)
+            ) -Name 'Scheduler/DataDirectoryAclRefusesUntrustedAncestorOwner' `
+                -Failure ("предок із власником ModifySid має призвести до throw (ModifySid довірений лише як власник самого каталогу даних): " + [string]$b7AncestorResult.Error)
 
             # 3) Junction як корінь/предок каталогу даних -> throw, ціль не чіпається.
             $b7JunctionTarget = Join-Path $b7Scratch 'victim'
