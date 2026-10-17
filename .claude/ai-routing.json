@@ -2,6 +2,14 @@
   "schemaVersion": 1,
   "description": "Canonical role/model routing matrix for ekucher/BRAVO-Toolkit. Normative agent-orchestration rules live in BRAVO_AGENT_POLICY.md; this file is the machine-readable source of truth for role-to-model assignment, risk-level gates and fallback limits. Operator documentation: docs/ai/MODEL_ROUTING_POLICY.md.",
   "roles": {
+    "lead": {
+      "model": "inherit",
+      "write": true,
+      "gateCritical": false,
+      "mainSessionOnly": true,
+      "purpose": "Lead/Orchestrator: runs only as the main session (claude --agent lead); plans, classifies risk, dispatches bounded packages, verifies HANDOFFs; never dispatched through the Agent tool",
+      "mainSessionOnlyNote": "BRAVO_AGENT_POLICY.md section 8 makes the main session the orchestrator and keeps all dispatch/A2A routing there. 'inherit' means the owner's selected model. The PreToolUse hook denies Agent calls with subagent_type 'lead' so orchestration cannot be nested."
+    },
     "scout": {
       "model": "haiku",
       "write": false,

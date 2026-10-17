@@ -616,6 +616,14 @@ if ($null -eq $role) {
     Approve-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model $modelName -Reason 'agent is not managed by the routing matrix'
 }
 
+# 0) Роль лише для головної сесії (lead) не делегується: уся диспетчеризація
+# та A2A-маршрутизація лишаються в головній сесії (BRAVO_AGENT_POLICY.md,
+# розділ 8). Вкладений оркестратор обійшов би і цей гейт, і людський merge-gate.
+if ($role.mainSessionOnly -eq $true) {
+    Deny-Call -ProjectDir $projectDir -Tool $toolName -Agent $agentName -Model $modelName `
+        -Reason ("role '$agentName' runs only as the main session (claude --agent $agentName); it is never dispatched through the delegation tool")
+}
+
 # 1) Модель мусить відповідати матриці.
 if (-not [string]::IsNullOrWhiteSpace($modelName)) {
     $expectedModel = [string]$role.model
