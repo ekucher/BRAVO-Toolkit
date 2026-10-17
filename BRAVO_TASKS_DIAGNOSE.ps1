@@ -292,6 +292,58 @@ function Test-BRAVOScheduledTaskDefinition {
     return $problems.ToArray()
 }
 
+function Get-BRAVOUsersReadableDataDirectoryFinding {
+    # F6: LOGS/TEMP/State не повинні читатися BUILTIN\Users (журнали;
+    # BRAVO_WINSCP.lock відкривається продуктом з FileShare.None, тож
+    # читання сторонньою особою блокує всі SFTP-операції). Повертає опис
+    # знахідки або $null. Лише читання ACL; відсутній каталог — не знахідка.
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not [System.IO.Directory]::Exists($Path)) {
+        return $null
+    }
+    $broadReaderSids = @{
+        'S-1-5-32-545' = 'BUILTIN\Users'
+        'S-1-5-11'     = 'Authenticated Users'
+        'S-1-1-0'      = 'Everyone'
+        'S-1-5-4'      = 'INTERACTIVE'
+    }
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    } catch {
+        return "не вдалося прочитати ACL: $($_.Exception.Message)"
+    }
+    $readRights = [int][Security.AccessControl.FileSystemRights]::ReadData
+    foreach ($rule in @($acl.Access)) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            continue
+        }
+        try {
+            $ruleSid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            continue
+        }
+        # B7 / P3b: Domain Users (S-1-5-21-<домен>-513) теж широка група
+        # (узгоджено з Protect-BRAVOMachineStateRoot / BRAVO_SETUP).
+        $broadReaderName = $null
+        if ($broadReaderSids.ContainsKey($ruleSid)) {
+            $broadReaderName = $broadReaderSids[$ruleSid]
+        } elseif ($ruleSid -match '^S-1-5-21-\d+-\d+-\d+-513$') {
+            $broadReaderName = 'Domain Users'
+        }
+        if ($null -ne $broadReaderName -and
+            (([int]$rule.FileSystemRights -band $readRights) -ne 0)) {
+            return (
+                "доступний для читання групі $broadReaderName " +
+                "($($rule.FileSystemRights)); перевстановіть завдання " +
+                "(BRAVO_TASKS_INSTALL.ps1), щоб застосувати захищений ACL"
+            )
+        }
+    }
+    return $null
+}
+
 function Get-BRAVOTaskFolder {
     param($Service, [string]$TaskPath)
     $comPath = if ($TaskPath -eq "\") { "\" } else { $TaskPath.TrimEnd("\") }
@@ -418,6 +470,18 @@ try {
             $pathRootsFailed = $true
         } else {
             Write-Host "[INFO] $($rootEntry.Key): $($rootEntry.Value)" -ForegroundColor Gray
+        }
+    }
+
+    # F6: лише попередження (WARN) — код виходу діагностики не змінюється.
+    foreach ($dataDirectoryEntry in @(
+            @{ Name = 'RuntimeLogRoot'; Path = [string]$global:runtimeLogRoot },
+            @{ Name = 'TEMP'; Path = (Join-Path $(if (-not [string]::IsNullOrWhiteSpace([string]$global:runtimeRoot)) { [string]$global:runtimeRoot } else { $scriptRoot }) 'TEMP') },
+            @{ Name = 'StateRoot'; Path = [string]$global:stateRoot }
+        )) {
+        $usersReadableFinding = Get-BRAVOUsersReadableDataDirectoryFinding -Path $dataDirectoryEntry.Path
+        if ($null -ne $usersReadableFinding) {
+            Write-Host "[WARN] $($dataDirectoryEntry.Name): $($dataDirectoryEntry.Path) — $usersReadableFinding" -ForegroundColor Yellow
         }
     }
 

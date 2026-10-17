@@ -2447,6 +2447,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         @{ Kind = 'Cmdlet'; Target = 'Remove-Item' },
         @{ Kind = 'Cmdlet'; Target = 'Rename-Item' },
         @{ Kind = 'Cmdlet'; Target = 'Select-String' },
+        @{ Kind = 'Cmdlet'; Target = 'Set-Acl' },
         @{ Kind = 'Cmdlet'; Target = 'Set-Content' },
         @{ Kind = 'Cmdlet'; Target = 'Start-Service' },
         @{ Kind = 'Cmdlet'; Target = 'Start-Transcript' },

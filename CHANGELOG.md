@@ -2,6 +2,54 @@
 
 ## Не випущено (developer)
 
+- **Виправлено (безпека): LOGS, TEMP і State закриті від `BUILTIN\Users`; retention не видаляє все за `ArchivesKeepCount < 1`.**
+  ACL кореня комплекту надає `Users` читання й виконання з успадкуванням, тож
+  `<RuntimeRoot>\LOGS`, `<RuntimeRoot>\TEMP` і `%ProgramData%\BRAVO\State`
+  були читабельні для кожного локального користувача, а `BRAVO_WINSCP.lock`
+  (відкривається з `FileShare.None`) міг бути відкритий на читання й
+  заблокувати всі SFTP-операції. `BRAVO_TASKS_INSTALL.ps1` тепер створює ці
+  каталоги й виставляє захищений DACL без ACE для `Users` (SYSTEM і
+  Administrators — FullControl, обліковий запис завдань, якщо не SYSTEM, —
+  Modify); ACL самого кореня комплекту не змінено.
+  `BRAVO_TASKS_DIAGNOSE.ps1` попереджає (`[WARN]`, без зміни коду виходу), якщо
+  LOGS/TEMP/State читаються `Users`. Виправлено хибний коментар у
+  `BRAVO.Logging` про «той самий захист, що й Credential Manager».
+  `Remove-OldRestoreArchives` за `ArchivesKeepCount < 1` записує `ERROR` і
+  пропускає retention (раніше `0` видаляв усі придатні сесії before/after).
+  Тест `Maintenance/RetentionStaleProvenCorruptSessionKeptWhenNothingRemains`
+  (сценарій `KeepCount = 0`) замінено на
+  `Maintenance/RetentionKeepCountBelowOneRefusesToDeleteAnything`: нова поведінка
+  - ERROR і жодного видалення.
+  Потрібне приймання на реальному сервері (повторне встановлення завдань).
+  Повторне security-review (B7): `Set-BRAVOProtectedDataDirectoryAcl` більше
+  не слідує за попередньо підкладеним junction/symlink. До будь-якого
+  `Set-Acl` перевіряються каталог даних і всі його предки до `RuntimeRoot`
+  (LOGS/TEMP) або `%ProgramData%` (State): reparse point або власник не
+  SYSTEM/Administrators/поточна elevated-особа інсталятора — `throw`
+  (fail-closed, встановлення переривається до зміни ACL цього каталогу;
+  runtime ACL і LOGS на той момент можуть бути вже застосовані). Предки
+  `%ProgramData%\BRAVO` мають належати SYSTEM, Administrators або
+  адміністратору, що встановлює (вбудований Administrator RID 500 володіє
+  створеним каталогом під власним SID). Обліковий запис завдань не довірений
+  як власник предків і на корені каталогу даних не має DELETE (корінь:
+  ReadAndExecute|Write, Modify для вмісту — окремий inherit-only ACE).
+  Перед кожним переліком вмісту ланцюг reparse point перевіряється повторно;
+  у разі зміни каталог пропускається з `WARNING`, а помилка посеред обходу
+  називає не оброблені елементи. Обхід двофазний: спершу згори вниз кожен каталог
+  і файл лишається лише з SYSTEM/Administrators (обліковий запис завдань втрачає
+  право підмінити вже оброблений компонент), перед кожним `Set-Acl` перевіряється
+  кожен компонент шляху до `BoundaryRoot`, і лише потім додаються ACE облікового
+  запису завдань - знизу вгору (нащадки раніше за предків, корінь останнім: поки елемент отримує ACE, його батько ще не дозволяє обліковому запису завдань перейменувати чи підмінити його). Дочірні reparse point
+  пропускаються з `WARNING` (не обходяться). Якщо `RunAsUser` заданий, але
+  його SID не визначено, встановлення переривається до зміни ACL.
+  `BRAVO_TASKS_DIAGNOSE.ps1` також вважає широкими `INTERACTIVE` і
+  `Domain Users`, а TEMP виводить із `RuntimeRoot` так само, як інсталятор.
+  `Remove-OldRestoreArchives`: guard `KeepCount < 1` винесено перед першим
+  `Select-Object -First/-Skip`, тож від'ємне значення дає `ERROR`, а не
+  ParameterBinding exception. Статичні перевірки доповнено поведінковими
+  (точний набір SID зі stub `Set-Acl`, junction-корінь/дитина, власник,
+  DIAGNOSE на реальних ACL).
+
 - **Виправлено: автоматична реставрація MODEL більше не повторюється щоночі
   без ліміту (Issue #438).** Коли `bravocmd r` давав критичні зміни моделі й
   виконувався успішний відкат (`rollback=SUCCESS`), плановий слот лишався
