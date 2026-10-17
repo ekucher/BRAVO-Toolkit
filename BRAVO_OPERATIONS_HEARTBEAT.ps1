@@ -142,6 +142,10 @@ try {
     exit 30
 }
 
+# #481: heartbeat зливає Operations outbox (Invoke-BRAVOOperationsOutboxDrain), тож
+# реєструє джерело секретів для egress-маскування так само, як решта runtime-ів.
+Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
+
 if (-not (Test-Path -LiteralPath 'Variable:global:operationsReportingSettings')) {
     Write-Host "operationsReportingSettings відсутній у конфігурації — heartbeat пропущено" -ForegroundColor Yellow
     Wait-BRAVOEarlyManualExit -NoPause:$NoPause
