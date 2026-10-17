@@ -81,7 +81,11 @@ if ($HealthCheckOnly) {
     $healthScriptPath = Join-Path $bravoScriptDirectory 'BRAVO_HEALTH.ps1'
     if (-not (Test-Path -LiteralPath $healthScriptPath -PathType Leaf)) {
         Write-Error "Не знайдено окремий health-скрипт: $healthScriptPath"
-        exit 1
+        # Контракт BRAVO.ExitCodes: 90 — як у BRAVO_ARCHIV.ps1 / BRAVO_HEALTH.ps1
+        # для компонента комплекту, якого бракує вже ПІСЛЯ guard (раніше —
+        # голий 1 поза таблицею кодів). У режимі Enforce сюди не дійти:
+        # BRAVO_HEALTH.ps1 є в RUNTIME_MANIFEST.json, і guard дає 33.
+        exit 90
     }
     # AUTO -> дочірній BRAVO_HEALTH.ps1 сам виконує ту саму auto-derivation
     # проти свого $PSScriptRoot (той самий комплект); EXPLICIT -> точний
@@ -151,7 +155,9 @@ try {
     Write-Host "Конфiгурацiю завантажено успiшно: $configPath" -ForegroundColor $logColors.SUCCESS
 } catch {
     Write-Host "ПОМИЛКА: Не вдалося завантажити конфiгурацiю: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
-    Exit 1
+    # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration, як у Maintenance
+    # і DataRestore для тієї самої відмови (раніше — голий 1).
+    Exit 30
 }
 
 # Archive використовує ту саму політику вільного місця, що й Maintenance.
@@ -243,7 +249,8 @@ if ($requireAdministrator) {
         } catch {
             Write-Host "UAC запит вiдхилено або сталася помилка: $($_.Exception.Message)" -ForegroundColor $logColors.ERROR
             Write-Host "Запустiть PowerShell з правами адмiнiстратора вручну" -ForegroundColor $logColors.WARNING
-            Exit 1
+            # Контракт BRAVO.ExitCodes: 36 = PrivilegeRequired (раніше — голий 1).
+            Exit 36
         }
     }
 }
@@ -432,12 +439,14 @@ if ($credentialHelperLoaded) {
     } catch {
         Write-Host "ПОМИЛКА: Некоректні локальні параметри установи у Credential Manager: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" `
             -ForegroundColor $logColors.ERROR
-        exit 1
+        # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
+        exit 30
     }
 } elseif ($institutionSettingsRequired) {
     Write-Host "ПОМИЛКА: Не вдалося завантажити локальні параметри установи: $($script:institutionSettingsInitializationError)" `
         -ForegroundColor $logColors.ERROR
-    exit 1
+    # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
+    exit 30
 }
 
 if ($credentialHelperLoaded -and $archiveCredentialRequired) {
