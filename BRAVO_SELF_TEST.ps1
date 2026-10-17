@@ -13499,6 +13499,20 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 $r.D_Level = [string]$vetoD.Level
                 $r.D_FilesAfterSnapshots = @(Get-ChildItem -LiteralPath $d -Force).Count
 
+                # (3b) Маркер присутній І стан пошкоджено: пріоритет StateCorrupt (WARNING), а не
+                # INFO "слот виконано іншим прогоном" (пошкоджений стан не ховається за маркером).
+                & $clean
+                $d = New-Retry476Dir 'd2'
+                $preD2 = & $snap 'PreLock'
+                [IO.File]::WriteAllText($schedMarker, 'done'); [IO.File]::WriteAllText($todayMarker, 'done')
+                [IO.File]::WriteAllText((Join-Path $d 'BRAVO_RESTORE_STATE.json'), 'not json {', (New-Object Text.UTF8Encoding($false)))
+                $postD2 = & $snap 'PostLock'
+                $vetoD2 = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preD2 -After $postD2 -ForceRestore $false
+                $r.D2_MarkerPresent = [bool]$postD2.TodayMarkerPresent
+                $r.D2_Veto = [bool]$vetoD2.Veto
+                $r.D2_Reason = [string]$vetoD2.Reason
+                $r.D2_Level = [string]$vetoD2.Level
+
                 # (4) -ForceRestore вето не підлягає ніколи.
                 & $clean
                 $d = New-Retry476Dir 'e'
@@ -13560,6 +13574,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $retry476Snapshot.C_Level -ceq 'WARNING' -and $retry476Snapshot.C_MessageBlocked -and
                     $retry476Snapshot.D_Veto -and $retry476Snapshot.D_Reason -ceq 'StateCorrupt' -and $retry476Snapshot.D_Level -ceq 'WARNING' -and
                     $retry476Snapshot.D_FilesAfterSnapshots -eq 1 -and
+                    $retry476Snapshot.D2_MarkerPresent -and $retry476Snapshot.D2_Veto -and $retry476Snapshot.D2_Reason -ceq 'StateCorrupt' -and $retry476Snapshot.D2_Level -ceq 'WARNING' -and
                     $retry476Snapshot.H_PreShould -and $retry476Snapshot.H_Veto -and $retry476Snapshot.H_Reason -ceq 'WeeklyQuotaConsumed' -and
                     $retry476Snapshot.H_Level -ceq 'INFO'
                 ) `
@@ -13750,6 +13765,12 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     # Сесія з невстановленою цілісністю (rollback=FAILED) повертає restoreArchiveFailed до
                     # значення ДО сесії (Resolve-BRAVOExitCode: 40 вище за 43), справжній 41 лишається.
                     $retry438FailureBranch.Contains('$script:restoreArchiveFailed = $restoreArchiveFailedBefore') -and
+                    # ...і так само restoreIntegrityFailed (інакше 41 перекрив би 43 для невірифікованої моделі).
+                    $retry438FailureBranch.Contains('$script:restoreIntegrityFailed = $restoreIntegrityFailedBefore') -and
+                    # Повторна перевірка після lock лише ВЕТУЄ: pre=false/post=true лишає false.
+                    $RuntimeText.Contains('$missedRestoreDue = $missedRestoreDue -and [bool]$postLockRestoreSnapshot.MissedRestoreDue') -and
+                    # Прапорець обліку виставляється ДО виклику обліку (виняток з хвоста не дає другого обліку).
+                    [regex]::Matches($RuntimeText, '\$restoreFailureAccounted = \$true\s+(?:#[^\r\n]*\s+)*\[void\]\(Invoke-BRAVORestoreAttemptFailureAccounting').Count -eq 3 -and
                     # #476: Recovery без пропущеної денної роботи після вето виходить без дій.
                     $RuntimeText.Contains('if ($RunMissedRestoreOnly -and -not $missedDailyWork) {') -and
                     $RuntimeText.Contains('$recoveryVetoExitCode')
@@ -16809,6 +16830,12 @@ function Invoke-BRAVOModelRestoreRecovery {
     param($BravocmdExitCode, $BeforeFile, $ModelPath, $MainModelRelativePath, $BeforeArchivePath, $ARC_PATH, $MinSizeBytes, $SmallFileThresholdBytes)
     Add-ProbeEvent 'RECOVERY-CALL'
     if ($script:ProbeRecoveryThrows) { throw 'self-test: імітований виняток recovery після bravocmd' }
+    # RollbackFailed: Compare-FileSizes/відкат виставили restoreIntegrityFailed (41) ДО
+    # провалу відкату; цілісність моделі не встановлено (CRITICAL-алерти вже надіслано).
+    if ($script:ProbeRecoveryRollbackFailed) {
+        $script:restoreIntegrityFailed = $true
+        return [pscustomobject]@{ RemovedByRepairCount = 0; CriticalCount = 1; MainModelValid = $false; RollbackStatus = 'FAILED'; IntegrityEstablished = $false; HasCriticalChanges = $true; CriticalFiles = @(); FailureClass = '' }
+    }
     return [pscustomobject]@{ RemovedByRepairCount = 0; CriticalCount = 0; MainModelValid = $true; RollbackStatus = 'NOT REQUIRED'; IntegrityEstablished = $true; HasCriticalChanges = $false; CriticalFiles = @(); FailureClass = '' }
 }
 # План $script:ProbeRestoreSnapshotPlan: Purpose (PostLock/PreDestructive) -> Unchanged
@@ -17210,7 +17237,7 @@ try {
     }
     # #476/#477 (B1): сценарії з реставрацією БЕЗ -ForceRestore (рішення після lock,
     # бар'єр 2, виняток після bravocmd).
-    $probeB1Scenarios = @('PostLockVetoSucceeded', 'RecoveryPostLockVetoNoWork', 'RecoveryPostLockVetoRetryBlocked', 'PreDestructiveVetoBlocked', 'ThrowAfterBravocmd', 'ThrowBeforeBravocmd')
+    $probeB1Scenarios = @('PostLockVetoSucceeded', 'RecoveryPostLockVetoNoWork', 'RecoveryPostLockVetoRetryBlocked', 'PreDestructiveVetoBlocked', 'ThrowAfterBravocmd', 'ThrowBeforeBravocmd', 'RollbackFailed')
     $probeScenarioSeed = @(
         ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
         ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
@@ -17222,9 +17249,10 @@ try {
                 'PreDestructiveVetoBlocked' { "@{ 'PreDestructive' = 'SucceededByOtherRun' }" }
                 default { '@{}' }
             })),
-        ('$script:ProbeNativeExitCodeByDescription = {0}' -f $(if ($probeB1Scenarios -contains $Scenario) { "@{ 'Архівація моделі перед реставрацією' = 0; 'Виконання реставрації моделі' = 0 }" } else { '$null' })),
+        ('$script:ProbeNativeExitCodeByDescription = {0}' -f $(if ($probeB1Scenarios -contains $Scenario) { "@{ 'Архівація моделі перед реставрацією' = 0; 'Виконання реставрації моделі' = $(if ($Scenario -eq 'RollbackFailed') { 1 } else { 0 }) }" } else { '$null' })),
         ('$script:ProbeNativeThrowByDescription = {0}' -f $(if ($Scenario -eq 'ThrowBeforeBravocmd') { "@('Архівація моделі перед реставрацією')" } else { '@()' })),
         ('$script:ProbeRecoveryThrows = {0}' -f $(if ($Scenario -eq 'ThrowAfterBravocmd') { '$true' } else { '$false' })),
+        ('$script:ProbeRecoveryRollbackFailed = {0}' -f $(if ($Scenario -eq 'RollbackFailed') { '$true' } else { '$false' })),
         ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck' -or $Scenario -eq 'LateStartThrow') { '$true' } else { '$false' })),
         ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' })),
         ('$script:ProbeForeignRestartIntent = {0}' -f $(if ($Scenario -like 'StartMode*IntentInitiallyStopped' -or $Scenario -eq 'StartModeSuppressedLateStartInitiallyStopped') { "@('BravoWeb')" } else { '@()' })),
@@ -17434,7 +17462,7 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
             [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $maintenanceOrchestrationResults = @{}
-            $maintenanceOrchestrationScenarios = @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped', 'StartModeLatePendingAfterStopInitiallyStopped', 'PausedServicesPreserved', 'BravoPausedPreserved', 'StartModePausedHeld', 'PausedAfterSnapshot', 'LateStartBeforeTrace', 'PausedBeforeStop', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'InitiallyStartPendingFails', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck', 'StartModeLateBeforeBarrierInitiallyStopped', 'ExchangeApiUnreadableAtStop', 'PausePendingBeforeRestart', 'BravoPausePendingBeforeRestart', 'StartModeAllStoppedLateAfterMarker', 'AllStoppedExchangeApiUnreadable', 'PostLockVetoSucceeded', 'RecoveryPostLockVetoNoWork', 'RecoveryPostLockVetoRetryBlocked', 'PreDestructiveVetoBlocked', 'ThrowAfterBravocmd', 'ThrowBeforeBravocmd')
+            $maintenanceOrchestrationScenarios = @('Happy', 'ThrowInSizeCheck', 'StopFailure', 'StartModeOther', 'StartModeUnreadable', 'StartModeOtherAndUnreadable', 'StartModeQueryThrows', 'StartModeHeld', 'StartModeOperatorDisabled', 'StartModeOtherInitiallyStopped', 'StartModeHeldInitiallyStopped', 'StartModeOrphanIntentInitiallyStopped', 'StartModeSuppressedIntentInitiallyStopped', 'LateStartAllStopped', 'LateStartPartial', 'LateStartPending', 'InitiallyStartPending', 'LateStartThrow', 'LateStartOperatorDisabled', 'LateStartAfterMarker', 'StartModeLateStartInitiallyStopped', 'StartModeLateAfterMarkerInitiallyStopped', 'StartModeSuppressedLateStartInitiallyStopped', 'StartModeLateAfterStopInitiallyStopped', 'BootRecoveryLateStart', 'StuckStartPending', 'StartModeLateAfterStopMarkerFailInitiallyStopped', 'StartModeLatePendingAfterStopInitiallyStopped', 'PausedServicesPreserved', 'BravoPausedPreserved', 'StartModePausedHeld', 'PausedAfterSnapshot', 'LateStartBeforeTrace', 'PausedBeforeStop', 'LateStartSelfStoppedBeforeStop', 'StartModeAllStoppedLateAfterStop', 'LateStartPendingFailsBeforeStop', 'InitiallyStartPendingFails', 'LateStartStopPendingBeforeStop', 'LateStartStopRejectedSelfStopped', 'LateStartStopPendingStuck', 'StartModeLateBeforeBarrierInitiallyStopped', 'ExchangeApiUnreadableAtStop', 'PausePendingBeforeRestart', 'BravoPausePendingBeforeRestart', 'StartModeAllStoppedLateAfterMarker', 'AllStoppedExchangeApiUnreadable', 'PostLockVetoSucceeded', 'RecoveryPostLockVetoNoWork', 'RecoveryPostLockVetoRetryBlocked', 'PreDestructiveVetoBlocked', 'ThrowAfterBravocmd', 'ThrowBeforeBravocmd', 'RollbackFailed')
             foreach ($maintenanceOrchestrationScenario in $maintenanceOrchestrationScenarios) {
                 [void][IO.Directory]::CreateDirectory((Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario))
             }
@@ -17833,12 +17861,14 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
                     }
                 }
                 foreach ($maintenanceLifecycleName in $maintenanceLifecycleStopped) {
-                    # ThrowAfterBravocmd (#477): виняток після запуску bravocmd.exe лишає цілісність
-                    # моделі невстановленою, тож служби свідомо НЕ стартують (fail-closed, маркер
-                    # лишається suppressed) — це перевіряє окремий тест
-                    # Maintenance/RestoreExceptionAfterBravocmdFailsClosedWithCode43.
+                    # ThrowAfterBravocmd (#477) і RollbackFailed (відкат провалився): цілісність
+                    # моделі невстановлена, тож служби свідомо НЕ стартують (fail-closed, маркер
+                    # лишається suppressed) — це перевіряють окремі тести
+                    # Maintenance/RestoreExceptionAfterBravocmdFailsClosedWithCode43 та
+                    # Maintenance/RestoreRollbackFailedResolvesTo43.
                     if ($maintenanceLifecycleStarted -notcontains $maintenanceLifecycleName -and
-                        $maintenanceLifecycleScenario -cne 'ThrowAfterBravocmd') {
+                        $maintenanceLifecycleScenario -cne 'ThrowAfterBravocmd' -and
+                        $maintenanceLifecycleScenario -cne 'RollbackFailed') {
                         $maintenanceLifecycleViolations += "${maintenanceLifecycleScenario}: $maintenanceLifecycleName зупинено, але не запущено у finally"
                     }
                 }
@@ -18359,6 +18389,7 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
             # деструктиву: модель не торкнута, код 40, служби піднімаються.
             $maintenanceThrowAfter = & $maintenanceStartModeOutcome 'ThrowAfterBravocmd'
             $maintenanceThrowBefore = & $maintenanceStartModeOutcome 'ThrowBeforeBravocmd'
+            $maintenanceRollbackFailed = & $maintenanceStartModeOutcome 'RollbackFailed'
             Test-BRAVOCondition `
                 -Condition (
                     $maintenanceThrowAfter.ProbeOk -and $maintenanceThrowAfter.StepOrderOk -and
@@ -18381,6 +18412,21 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
                 ) `
                 -Name "Maintenance/RestoreExceptionAfterBravocmdFailsClosedWithCode43" `
                 -Failure ("#477: виняток після запуску bravocmd.exe (цілісність моделі не перевірена) має дати код 43, НЕ стартувати служби, лишити маркер suppressed і порахувати спробу (CLASS:EXCEPTION-AFTER-BRAVOCMD); виняток ДО bravocmd — код 40 зі стартом служб; після=$($maintenanceThrowAfter.ExitCode) до=$($maintenanceThrowBefore.ExitCode); події після: " + ($maintenanceThrowAfter.Events -join ' | '))
+            # RollbackFailed: bravocmd exit != 0, відкат провалився (IntegrityEstablished=false),
+            # а restoreIntegrityFailed (41) виставлено ще до провалу відкату. Невірифікована
+            # модель після деструктивної фази завжди дає 43 (не 41): служби НЕ стартують,
+            # маркер лишається suppressed.
+            Test-BRAVOCondition `
+                -Condition (
+                    $maintenanceRollbackFailed.ProbeOk -and $maintenanceRollbackFailed.StepOrderOk -and
+                    $maintenanceRollbackFailed.ExitCode -eq 43 -and
+                    @($maintenanceRollbackFailed.Events | Where-Object { $_ -like 'NATIVE Виконання реставрації моделі*' }).Count -eq 1 -and
+                    @($maintenanceRollbackFailed.Events | Where-Object { $_ -ceq 'RECOVERY-CALL' }).Count -eq 1 -and
+                    @($maintenanceRollbackFailed.Events | Where-Object { $_ -like 'START *' }).Count -eq 0 -and
+                    -not $maintenanceRollbackFailed.MarkerCleared
+                ) `
+                -Name "Maintenance/RestoreRollbackFailedResolvesTo43" `
+                -Failure ("#477: невдалий відкат після bravocmd (цілісність моделі не встановлено, restoreIntegrityFailed виставлено до провалу відкату) має дати код 43, а не 41, НЕ стартувати служби і лишити маркер suppressed; exit=$($maintenanceRollbackFailed.ExitCode); події: " + ($maintenanceRollbackFailed.Events -join ' | '))
         } finally {
             if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
                 Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
