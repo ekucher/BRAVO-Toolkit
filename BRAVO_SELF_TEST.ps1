@@ -16807,7 +16807,14 @@ function Invoke-CommandWithLog {
     }
     if ($null -ne $script:ProbeNativeExitCodeByDescription) {
         foreach ($probeCodeKey in @($script:ProbeNativeExitCodeByDescription.Keys)) {
-            if ($Description -like "*$probeCodeKey*") { return [int]$script:ProbeNativeExitCodeByDescription[$probeCodeKey] }
+            if ($Description -like "*$probeCodeKey*") {
+                $probeNativeCode = [int]$script:ProbeNativeExitCodeByDescription[$probeCodeKey]
+                # Як і реальний Invoke-CommandWithLog: ненульовий код native-операції
+                # виставляє restoreArchiveFailed (40) — щоб сценарій RollbackFailed
+                # поведінково доводив скидання ОБОХ прапорців до значень ДО сесії (43).
+                if ($probeNativeCode -ne 0) { $script:restoreArchiveFailed = $true }
+                return $probeNativeCode
+            }
         }
     }
     return 2
