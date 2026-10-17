@@ -107,11 +107,11 @@
         }
 
         function New-BRAVOOpsSelfTestFakeHttpError {
-            param([int]$StatusCode, [string]$Body = '{}')
+            param([int]$StatusCode, [string]$Body = '{}', [string]$Message = '')
             $stream = New-Object IO.MemoryStream(, [Text.Encoding]::UTF8.GetBytes($Body))
             $fakeResponse = [pscustomobject]@{ StatusCode = $StatusCode }
             $fakeResponse | Add-Member -MemberType ScriptMethod -Name GetResponseStream -Value { return $stream }.GetNewClosure()
-            $ex = New-Object Exception("simulated http $StatusCode")
+            $ex = New-Object Exception($(if ([string]::IsNullOrEmpty($Message)) { "simulated http $StatusCode" } else { $Message }))
             $ex | Add-Member -MemberType NoteProperty -Name Response -Value $fakeResponse -Force
             return $ex
         }
@@ -135,7 +135,11 @@
                 return [pscustomobject]@{ Content = $next.Content }
             }
             if ($next.Type -eq 'HttpError') {
-                throw (New-BRAVOOpsSelfTestFakeHttpError -StatusCode $next.StatusCode -Body $next.Body)
+                $fakeMessage = if ($null -ne $next.PSObject.Properties['Message']) { [string]$next.Message } else { '' }
+                throw (New-BRAVOOpsSelfTestFakeHttpError -StatusCode $next.StatusCode -Body $next.Body -Message $fakeMessage)
+            }
+            if ($next.Type -eq 'NetworkErrorMessage') {
+                throw (New-Object Exception([string]$next.Message))
             }
             # NetworkError: звичайний виняток БЕЗ .Response -- Get-BRAVOOperationsHttpStatusCode
             # має повернути $null (транзиєнтний/мережевий збій), не HTTP-статус.
@@ -153,6 +157,31 @@
     }
     function Enqueue-BRAVOOpsSelfTestHttpNetworkError {
         $global:BRAVOOpsSelfTestHttpQueue.Enqueue([pscustomobject]@{ Type = 'NetworkError' })
+    }
+
+    # F4/#481: BRAVO.Operations тепер сам імпортує BRAVO.Logging, тож
+    # Write-BRAVOLog у ньому резолвиться в module scope Logging, а НЕ в
+    # глобальну заглушку (раніше глобальний мок підміняв його саме через
+    # відсутність власного імпорту -- це й був дефект). Тести, що перевіряють
+    # WARNING-и Operations, захоплюють їх тепер із РЕАЛЬНОГО журналу
+    # (тимчасовий файл), а не підміною функції.
+    function Start-BRAVOOpsSelfTestLogCapture {
+        $captureLogPath = Join-Path $opsSelfTestRoot ('capture_{0}.log' -f [guid]::NewGuid().ToString('N'))
+        [void](Initialize-BRAVOLog -LogFile $captureLogPath -FileLevel 'INFO' -ConsoleLevel 'FATAL')
+        return $captureLogPath
+    }
+    function Get-BRAVOOpsSelfTestCapturedMessage {
+        param([Parameter(Mandatory = $true)][string]$LogPath, [string]$Level = 'WARNING')
+        $capturedMessages = New-Object 'System.Collections.Generic.List[string]'
+        if (Test-Path -LiteralPath $LogPath -PathType Leaf) {
+            foreach ($captureLine in [IO.File]::ReadAllLines($LogPath, [Text.Encoding]::UTF8)) {
+                $captureMatch = [regex]::Match($captureLine, '^\S+ \S+ \[(?<level>[A-Z]+)\s*\] \[Operations\] (?<message>.*)$')
+                if ($captureMatch.Success -and $captureMatch.Groups['level'].Value -eq $Level) {
+                    $capturedMessages.Add($captureMatch.Groups['message'].Value)
+                }
+            }
+        }
+        return $capturedMessages.ToArray()
     }
 
     $opsSelfTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("bravo_ops_selftest_" + [guid]::NewGuid().ToString('N'))
@@ -704,15 +733,7 @@
     Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'approved' }   # apiKey deliberately absent -> TTL expired
 
     $global:BRAVOOpsSelfTestTtlExpiredWarnings = New-Object System.Collections.Generic.List[object]
-    $originalWriteBravoLogForTtlTest = Get-Command -Name Write-BRAVOLog -CommandType Function -ErrorAction SilentlyContinue
-    [void](New-Module -ScriptBlock {
-        function Write-BRAVOLog {
-            param([string]$Component, [string]$Level, [string]$Message, [switch]$Secondary)
-            if ($Component -eq 'Operations' -and $Level -eq 'WARNING' -and $Message -like '*API-ключ*') {
-                [void]$global:BRAVOOpsSelfTestTtlExpiredWarnings.Add($Message)
-            }
-        }
-    })
+    $ttlLogCapturePath = Start-BRAVOOpsSelfTestLogCapture
 
     $ttlWarnResult = $null
     $ttlWarnThrew = $false
@@ -723,10 +744,8 @@
         $ttlWarnThrew = $true
     }
 
-    if ($null -ne $originalWriteBravoLogForTtlTest) {
-        Set-Item -Path function:Write-BRAVOLog -Value $originalWriteBravoLogForTtlTest.ScriptBlock -Force
-    } else {
-        Remove-Item -Path function:Write-BRAVOLog -Force -ErrorAction SilentlyContinue
+    foreach ($ttlCapturedMessage in @(Get-BRAVOOpsSelfTestCapturedMessage -LogPath $ttlLogCapturePath | Where-Object { $_ -like '*API-ключ*' })) {
+        [void]$global:BRAVOOpsSelfTestTtlExpiredWarnings.Add($ttlCapturedMessage)
     }
 
     $ttlWarningText = if ($global:BRAVOOpsSelfTestTtlExpiredWarnings.Count -gt 0) { [string]$global:BRAVOOpsSelfTestTtlExpiredWarnings[0] } else { '' }
@@ -1412,22 +1431,12 @@
     $dlFailEarlierBytesBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($dlFailEarlierPath))
 
     $global:BRAVOOpsSelfTestDeadLetterWarnings = New-Object System.Collections.Generic.List[object]
-    $originalWriteBravoLogForDeadLetterTest = Get-Command -Name Write-BRAVOLog -CommandType Function -ErrorAction SilentlyContinue
-    [void](New-Module -ScriptBlock {
-        function Write-BRAVOLog {
-            param([string]$Component, [string]$Level, [string]$Message, [switch]$Secondary)
-            if ($Component -eq 'Operations' -and $Level -eq 'WARNING') {
-                [void]$global:BRAVOOpsSelfTestDeadLetterWarnings.Add($Message)
-            }
-        }
-    })
+    $deadLetterLogCapturePath = Start-BRAVOOpsSelfTestLogCapture
     $global:BRAVOOpsSelfTestHttpQueue.Clear()
     $global:BRAVOOpsSelfTestHttpCalls.Clear()
     $dlFailThrew = Invoke-BRAVOOpsSelfTestDrainQuietly
-    if ($null -ne $originalWriteBravoLogForDeadLetterTest) {
-        Set-Item -Path function:Write-BRAVOLog -Value $originalWriteBravoLogForDeadLetterTest.ScriptBlock -Force
-    } else {
-        Remove-Item -Path function:Write-BRAVOLog -Force -ErrorAction SilentlyContinue
+    foreach ($deadLetterCapturedMessage in @(Get-BRAVOOpsSelfTestCapturedMessage -LogPath $deadLetterLogCapturePath)) {
+        [void]$global:BRAVOOpsSelfTestDeadLetterWarnings.Add($deadLetterCapturedMessage)
     }
     $dlFailWarnings = $global:BRAVOOpsSelfTestDeadLetterWarnings.ToArray()
     $dlFailMoveWarnings = @($dlFailWarnings | Where-Object { $_ -like '*Не вдалося перемістити*dead-letter*' })
@@ -1469,50 +1478,28 @@
     $global:BRAVOOpsSelfTestCredentialStore = @{}
     $emptyUrlSettings = @{ Enabled = $true; ApiBaseUrl = ''; ProductType = 'LIMS'; RequestTimeoutSeconds = 5 }
 
-    $emptyUrlWarnings = New-Object System.Collections.Generic.List[object]
-    $originalWriteBravoLog = Get-Command -Name Write-BRAVOLog -CommandType Function -ErrorAction SilentlyContinue
-    [void](New-Module -ScriptBlock {
-        function Write-BRAVOLog {
-            param([string]$Component, [string]$Level, [string]$Message, [switch]$Secondary)
-            if ($Component -eq 'Operations' -and $Level -eq 'WARNING' -and $Message -like '*ApiBaseUrl порожній*') {
-                [void]$global:BRAVOOpsSelfTestApiBaseUrlWarnings.Add($Message)
-            }
-        }
-    })
-    $global:BRAVOOpsSelfTestApiBaseUrlWarnings = $emptyUrlWarnings
+    $emptyUrlLogCapturePath = Start-BRAVOOpsSelfTestLogCapture
 
     # Перший виклик: Enabled=true, ApiBaseUrl порожній -> має повернути
     # $null (fail-closed, не намагається енролитись без URL) І залогувати
     # РІВНО один throttled WARNING (не мовчазний no-op, review P2).
     $emptyUrl1 = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $emptyUrlSettings `
         -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
-    $emptyUrlWarningsAfterFirst = $emptyUrlWarnings.Count
+    $emptyUrlWarningsAfterFirst = @(Get-BRAVOOpsSelfTestCapturedMessage -LogPath $emptyUrlLogCapturePath | Where-Object { $_ -like '*ApiBaseUrl порожній*' }).Count
 
     # Другий виклик одразу за першим (у межах throttle-вікна) -- НЕ повинен
     # додати ще один WARNING (throttle працює), лишаючись при цьому
     # so само fail-closed ($null).
     $emptyUrl2 = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $emptyUrlSettings `
         -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
-    $emptyUrlWarningsAfterSecond = $emptyUrlWarnings.Count
+    $emptyUrlWarningsAfterSecond = @(Get-BRAVOOpsSelfTestCapturedMessage -LogPath $emptyUrlLogCapturePath | Where-Object { $_ -like '*ApiBaseUrl порожній*' }).Count
 
-    # Pre-existing self-test harness bug (виявлено регресійними тестами
-    # PR #225 раунд 3, thread 4/5 нижче): $originalWriteBravoLog вище
-    # захоплював РЕАЛЬНИЙ Write-BRAVOLog ДО перевизначення, але ніколи не
-    # використовувався для відновлення -- голий Remove-Item просто видаляв
-    # global Function:-drive entry ПОВНІСТЮ (New-Module -ScriptBlock
-    # матеріалізує функцію напряму в $global:Function:-drive, замінюючи
-    # той самий entry, що Import-Module BRAVO.Logging туди поклав; Remove-
-    # Item після цього лишає ІМ'Я взагалі без жодного визначення -- не
-    # "падіння" назад до module-exported версії). Будь-який Operations-код,
-    # що викликає Write-BRAVOLog ПІСЛЯ цього блоку (наприклад,
-    # Invoke-BRAVOOperationsOutboxDrain у тестах нижче), падав з "term
-    # 'Write-BRAVOLog' is not recognized". Фікс: відновити РЕАЛЬНИЙ
-    # ScriptBlock, захоплений вище, замість видалення entry.
-    if ($null -ne $originalWriteBravoLog) {
-        Set-Item -Path function:Write-BRAVOLog -Value $originalWriteBravoLog.ScriptBlock -Force
-    } else {
-        Remove-Item -Path function:Write-BRAVOLog -Force -ErrorAction SilentlyContinue
-    }
+    # Історія: раніше тут глобальна заглушка Write-BRAVOLog підміняла реальну
+    # функцію, і після неї її доводилось відновлювати (голе Remove-Item лишало
+    # ім'я без визначення -- "term 'Write-BRAVOLog' is not recognized" у
+    # наступних тестах). Захоплення з реального журналу (див.
+    # Start-BRAVOOpsSelfTestLogCapture) глобальних функцій не підміняє, тож
+    # відновлювати нічого.
 
     Test-BRAVOCondition -Condition ($null -eq $emptyUrl1 -and $null -eq $emptyUrl2) `
         -Name 'Operations/EnabledWithEmptyApiBaseUrlFailsClosedReturnsNull' `
@@ -1524,7 +1511,7 @@
         -Name 'Operations/EnabledWithEmptyApiBaseUrlWarningIsThrottledNotSpammed' `
         -Failure "повторний виклик у межах throttle-вікна (типово 15 хв) НЕ повинен додавати ще один WARNING -- очікувано лишити лічильник=1, отримано $emptyUrlWarningsAfterSecond"
 
-    Remove-Variable -Name BRAVOOpsSelfTestApiBaseUrlWarnings -Scope Global -Force -ErrorAction SilentlyContinue
+    # (глобальної змінної захоплення WARNING-ів тут більше немає)
 
     # =====================================================================
     # PR #225 review-фікси (раунд 3): regression-тести для двох виправлень
@@ -1945,6 +1932,174 @@
         "знову підніматиме лічильник попереджень і даватиме успішному бекапу exit code 10; прямих Write-BRAVOLog рядків=$($opsDirectLogLines.Count) " +
         "(очікувано рівно 1 -- усередині обгортки, з -Secondary), викликів обгортки=$($opsWrapperCallLines.Count)")
 
+
+    # ---------------------------------------------------------------------
+    # F4/#481: єдиний egress-шар маскування для Operations. Подія (message,
+    # component, services, вкладені details) маскується ДО конверта, тож на
+    # диск (outbox/dead-letter) і в мережу іде лише замаскована копія; те саме
+    # для причин збою (LastError/DeadLetterReason). Застарілі items, записані
+    # до виправлення, містять сирий payload -- файли не переписуються, а
+    # тіло маскується безпосередньо перед відправкою дренажем.
+    #
+    # Фікстури складаються з частин (конвенція Logging/ProtectSecretMasksKnownShapes):
+    # суцільного літерала секрету чи URL з обліковими даними у файлі немає.
+    # ---------------------------------------------------------------------
+    $opsEgressSecret = 'Pl4nted' + 'OpsKey' + '77'
+    $opsEgressUrlPassword = 'Pw' + '99' + 'Zq'
+    $opsEgressSftpUrl = 'sftp' + '://bravo:' + $opsEgressUrlPassword + '@host.example.invalid/path'
+    # Closure будується у вузькому дочірньому scope (ідіома Governance/SelfTestClosureScope).
+    Register-BRAVOEgressSecretSource -Resolver (& { param($ClosureSecret) { , @($ClosureSecret) }.GetNewClosure() } $opsEgressSecret)
+    $opsEgressDetails = @{
+        stages = @(
+            @{ name = 'archive'; details = "7za a -p$opsEgressSecret не вдалося" },
+            [pscustomobject]@{ name = 'sync'; details = @(@{ text = "відкрито $opsEgressSftpUrl" }) }
+        )
+        attempts = 3
+    }
+    $opsEgressServices = @("служба $opsEgressSecret")
+    $opsEgressMessage = "Збій: пароль $opsEgressSecret та $opsEgressSftpUrl"
+
+    # (a) pending enrollment -> outbox (гілка "немає ключа").
+    $opsEgressPendingDir = Join-Path $opsSelfTestRoot 'EgressPending'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $opsEgressPendingDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{}
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Send-BRAVOOperationsEvent -OperationsReportingSettings $opsSettings -CredentialTargets $opsCredentialTargets `
+        -InstitutionCode 'INST1' -Category 'backup' -Severity 'ERROR' -Component "Comp-$opsEgressSecret" `
+        -Message $opsEgressMessage -Services $opsEgressServices -Details $opsEgressDetails
+    $opsEgressPendingFiles = @(Get-ChildItem -LiteralPath (Join-Path $opsEgressPendingDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $opsEgressPendingText = if ($opsEgressPendingFiles.Count -eq 1) { [IO.File]::ReadAllText($opsEgressPendingFiles[0].FullName, [Text.UTF8Encoding]::new($false)) } else { '' }
+    $opsEgressPendingObject = if ($opsEgressPendingText.Length -gt 0) { $opsEgressPendingText | ConvertFrom-Json } else { $null }
+    Test-BRAVOCondition -Condition (
+        $opsEgressPendingFiles.Count -eq 1 -and
+        -not $opsEgressPendingText.Contains($opsEgressSecret) -and
+        -not $opsEgressPendingText.Contains($opsEgressUrlPassword) -and
+        $opsEgressPendingText.Contains('***') -and
+        $null -ne $opsEgressPendingObject -and
+        ([string]$opsEgressPendingObject.RequestBody.payload.details.stages[0].details).Contains('***') -and
+        ([string]$opsEgressPendingObject.RequestBody.payload.details.stages[1].details[0].text).Contains('***') -and
+        [int]$opsEgressPendingObject.RequestBody.payload.details.attempts -eq 3
+    ) -Name 'Operations/OutboxItemOnDiskHasNoSecretPendingBranch' `
+      -Failure "item у outbox (гілка pending enrollment) мусить містити лише замасковані message/component/services/вкладені details (stages[].details); файлів=$($opsEgressPendingFiles.Count), секрет на диску=$($opsEgressPendingText.Contains($opsEgressSecret)), пароль URL на диску=$($opsEgressPendingText.Contains($opsEgressUrlPassword))"
+
+    # (b) transient збій негайної відправки -> outbox; LastError теж чистий.
+    $opsEgressTransientDir = Join-Path $opsSelfTestRoot 'EgressTransient'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $opsEgressTransientDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'egress-test-api-key' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    $global:BRAVOOpsSelfTestHttpQueue.Enqueue([pscustomobject]@{ Type = 'NetworkErrorMessage'; Message = "мережа впала для -p$opsEgressSecret" })
+    Send-BRAVOOperationsEvent -OperationsReportingSettings $opsSettings -CredentialTargets $opsCredentialTargets `
+        -InstitutionCode 'INST1' -Category 'backup' -Severity 'ERROR' -Component 'Archive' `
+        -Message $opsEgressMessage -Services $opsEgressServices -Details $opsEgressDetails
+    $opsEgressTransientFiles = @(Get-ChildItem -LiteralPath (Join-Path $opsEgressTransientDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $opsEgressTransientText = if ($opsEgressTransientFiles.Count -eq 1) { [IO.File]::ReadAllText($opsEgressTransientFiles[0].FullName, [Text.UTF8Encoding]::new($false)) } else { '' }
+    $opsEgressTransientObject = if ($opsEgressTransientText.Length -gt 0) { $opsEgressTransientText | ConvertFrom-Json } else { $null }
+    $opsEgressSentBody = if ($global:BRAVOOpsSelfTestHttpCalls.Count -gt 0) { [string]$global:BRAVOOpsSelfTestHttpCalls[$global:BRAVOOpsSelfTestHttpCalls.Count - 1].BodyText } else { '' }
+    Test-BRAVOCondition -Condition (
+        $opsEgressTransientFiles.Count -eq 1 -and
+        -not $opsEgressTransientText.Contains($opsEgressSecret) -and
+        -not $opsEgressTransientText.Contains($opsEgressUrlPassword) -and
+        $null -ne $opsEgressTransientObject -and
+        -not [string]::IsNullOrWhiteSpace([string]$opsEgressTransientObject.LastError) -and
+        ([string]$opsEgressTransientObject.RequestBody.payload.details.stages[0].details).Contains('***') -and
+        $opsEgressSentBody.Length -gt 0 -and
+        -not $opsEgressSentBody.Contains($opsEgressSecret) -and
+        -not $opsEgressSentBody.Contains($opsEgressUrlPassword)
+    ) -Name 'Operations/OutboxItemOnDiskHasNoSecretTransientBranch' `
+      -Failure "item після transient-збою негайної відправки мусить бути чистим (payload і LastError), так само як тіло POST; файлів=$($opsEgressTransientFiles.Count), секрет на диску=$($opsEgressTransientText.Contains($opsEgressSecret)), секрет у тілі POST=$($opsEgressSentBody.Contains($opsEgressSecret))"
+
+    # (c) dead-letter: причина збою (DeadLetterReason) з тексту винятку чиста.
+    $opsEgressDeadDir = Join-Path $opsSelfTestRoot 'EgressDeadLetter'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $opsEgressDeadDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'egress-test-api-key' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpQueue.Enqueue([pscustomobject]@{ Type = 'HttpError'; StatusCode = 400; Body = '{}'; Message = "відхилено: -p$opsEgressSecret" })
+    Send-BRAVOOperationsEvent -OperationsReportingSettings $opsSettings -CredentialTargets $opsCredentialTargets `
+        -InstitutionCode 'INST1' -Category 'backup' -Severity 'ERROR' -Component 'Archive' `
+        -Message $opsEgressMessage -Details $opsEgressDetails
+    $opsEgressDeadFiles = @(Get-ChildItem -LiteralPath (Join-Path $opsEgressDeadDir 'Outbox\DeadLetter') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $opsEgressDeadText = if ($opsEgressDeadFiles.Count -eq 1) { [IO.File]::ReadAllText($opsEgressDeadFiles[0].FullName, [Text.UTF8Encoding]::new($false)) } else { '' }
+    $opsEgressDeadObject = if ($opsEgressDeadText.Length -gt 0) { $opsEgressDeadText | ConvertFrom-Json } else { $null }
+    Test-BRAVOCondition -Condition (
+        $opsEgressDeadFiles.Count -eq 1 -and
+        -not $opsEgressDeadText.Contains($opsEgressSecret) -and
+        -not $opsEgressDeadText.Contains($opsEgressUrlPassword) -and
+        $null -ne $opsEgressDeadObject -and
+        ([string]$opsEgressDeadObject.DeadLetterReason).Contains('HTTP 400') -and
+        ([string]$opsEgressDeadObject.DeadLetterReason).Contains('***')
+    ) -Name 'Operations/OutboxItemOnDiskHasNoSecretDeadLetterReason' `
+      -Failure "dead-letter item мусить мати замасковані payload і DeadLetterReason; файлів=$($opsEgressDeadFiles.Count), секрет на диску=$($opsEgressDeadText.Contains($opsEgressSecret))"
+
+    # (d) застарілий item (сирий payload на диску) -> дренаж маскує тіло
+    # безпосередньо перед відправкою; файл до відправки не переписується.
+    $opsEgressLegacyDir = Join-Path $opsSelfTestRoot 'EgressLegacyDrain'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $opsEgressLegacyDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'egress-test-api-key' }
+    $opsEgressLegacyOutbox = Join-Path $opsEgressLegacyDir 'Outbox'
+    [void][IO.Directory]::CreateDirectory($opsEgressLegacyOutbox)
+    $opsEgressLegacyEventId = [guid]::NewGuid().ToString()
+    $opsEgressLegacyItem = [ordered]@{
+        Kind = 'event'
+        EventId = $opsEgressLegacyEventId
+        OccurredAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o')
+        SchemaVersion = 1
+        ApiPath = '/api/v1/events'
+        RequestBody = [ordered]@{
+            category = 'backup'
+            severity = 'ERROR'
+            payload = [ordered]@{
+                message = "legacy: $opsEgressMessage"
+                details = [ordered]@{ stages = @([ordered]@{ details = "7za -p$opsEgressSecret" }) }
+            }
+            eventId = $opsEgressLegacyEventId
+            occurredAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o')
+            schemaVersion = 1
+        }
+        EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o')
+        AttemptCount = 1
+        NextRetryAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o')
+        LastError = $null
+    }
+    $opsEgressLegacyPath = Join-Path $opsEgressLegacyOutbox ($opsEgressLegacyEventId + '.json')
+    [IO.File]::WriteAllText($opsEgressLegacyPath, ($opsEgressLegacyItem | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }   # дренаж застарілого item
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }   # сам heartbeat
+    Send-BRAVOOperationsHeartbeat -OperationsReportingSettings $opsSettings -CredentialTargets $opsCredentialTargets `
+        -InstitutionCode 'INST1' -BravoVersion '9.9.9-egress'
+    $opsEgressLegacyCalls = @($global:BRAVOOpsSelfTestHttpCalls.ToArray() | Where-Object { [string]$_.BodyText -like "*$opsEgressLegacyEventId*" })
+    $opsEgressLegacyBody = if ($opsEgressLegacyCalls.Count -ge 1) { [string]$opsEgressLegacyCalls[0].BodyText } else { '' }
+    Test-BRAVOCondition -Condition (
+        $opsEgressLegacyCalls.Count -eq 1 -and
+        $opsEgressLegacyBody.Contains('legacy:') -and
+        -not $opsEgressLegacyBody.Contains($opsEgressSecret) -and
+        -not $opsEgressLegacyBody.Contains($opsEgressUrlPassword) -and
+        $opsEgressLegacyBody.Contains('***')
+    ) -Name 'Operations/OutboxItemOnDiskHasNoSecretLegacyDrainMasksBody' `
+      -Failure "тіло POST застарілого item (сирий payload на диску) мусить бути замасковане дренажем перед відправкою; викликів з eventId=$($opsEgressLegacyCalls.Count), секрет у тілі=$($opsEgressLegacyBody.Contains($opsEgressSecret)), пароль URL у тілі=$($opsEgressLegacyBody.Contains($opsEgressUrlPassword))"
+
+    # Недоступне джерело секретів (resolver кидає) -> подія не губиться, але
+    # вільний текст замінюється заглушкою, а не йде сирим.
+    Register-BRAVOEgressSecretSource -Resolver { throw 'джерело секретів недоступне' }
+    $opsEgressFailClosedDir = Join-Path $opsSelfTestRoot 'EgressFailClosed'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $opsEgressFailClosedDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{}
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    Send-BRAVOOperationsEvent -OperationsReportingSettings $opsSettings -CredentialTargets $opsCredentialTargets `
+        -InstitutionCode 'INST1' -Category 'backup' -Severity 'ERROR' -Message "sentinel-leak-$opsEgressSecret" -Details @{ x = "sentinel-leak-$opsEgressSecret" }
+    $opsEgressFailClosedFiles = @(Get-ChildItem -LiteralPath (Join-Path $opsEgressFailClosedDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $opsEgressFailClosedText = if ($opsEgressFailClosedFiles.Count -eq 1) { [IO.File]::ReadAllText($opsEgressFailClosedFiles[0].FullName, [Text.UTF8Encoding]::new($false)) } else { '' }
+    Test-BRAVOCondition -Condition (
+        $opsEgressFailClosedFiles.Count -eq 1 -and
+        -not $opsEgressFailClosedText.Contains('sentinel-leak') -and
+        $opsEgressFailClosedText.Contains('деталі приховано')
+    ) -Name 'Operations/OutboxItemOnDiskHasNoSecretWhenSecretSourceUnavailable' `
+      -Failure "коли джерело секретів недоступне, item мусить нести заглушку замість сирого тексту; файлів=$($opsEgressFailClosedFiles.Count), сирий текст на диску=$($opsEgressFailClosedText.Contains('sentinel-leak'))"
+    Unregister-BRAVOEgressSecretSource
+
     # ---------------------------------------------------------------
     # Прибирання: зняти всі self-test overrides з function:-drive (той
     # самий клас cleanup, що Clear-BRAVOSelfTestOwnedRuntimeModules робить
@@ -1957,6 +2112,8 @@
     Remove-Item -Path function:Set-BRAVOCredential -Force -ErrorAction SilentlyContinue
     Remove-Item -Path function:Remove-BRAVOCredential -Force -ErrorAction SilentlyContinue
     Remove-Item -Path function:Set-BRAVOOpsSelfTestStateDirectory -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path function:Start-BRAVOOpsSelfTestLogCapture -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path function:Get-BRAVOOpsSelfTestCapturedMessage -Force -ErrorAction SilentlyContinue
     Remove-Item -Path function:New-BRAVOOpsSelfTestFakeHttpError -Force -ErrorAction SilentlyContinue
     Remove-Item -Path function:Enqueue-BRAVOOpsSelfTestHttpSuccess -Force -ErrorAction SilentlyContinue
     Remove-Item -Path function:Enqueue-BRAVOOpsSelfTestHttpError -Force -ErrorAction SilentlyContinue

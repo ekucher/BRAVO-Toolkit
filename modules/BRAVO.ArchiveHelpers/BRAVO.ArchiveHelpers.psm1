@@ -520,6 +520,36 @@ function Write-BRAVOSevenZipFailureDiagnostics {
     return $true
 }
 
+function Format-BRAVOSevenZipLogPath {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'Password',
+        Justification = 'Відоме значення пароля архіву лише маскується в тексті шляху (як у Test-SevenZipArchiveIntegrity); нікуди не передається і не зберігається.')]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Path,
+        [AllowNull()][AllowEmptyString()][string]$Password
+    )
+    # #452 (пункт 1) / F5: єдине форматування шляху архіву для УСІХ рядків
+    # журналу перевірки цілісності (INFO-початок, SUCCESS, headline збою).
+    # Шлях маскується ДО будь-якого обрізання тією самою моделлю з межами
+    # вартості, що й решта діагностики 7-Zip (пароль архіву — відоме
+    # значення), а CR/LF замінюються пробілом, щоб один шлях не розгортався
+    # в багато рядків журналу. Fail-closed: без маскування сирий шлях не
+    # пишеться; повертає завжди однорядковий рядок.
+
+    try {
+        if ($null -eq (Get-Command -Name 'Protect-BRAVOLogSecret' -CommandType Function -ErrorAction SilentlyContinue)) {
+            throw 'Protect-BRAVOLogSecret недоступна'
+        }
+        $maskedPath = Protect-BRAVOSevenZipDiagnosticText -Text ([string]$Path) -KnownSecret @($Password)
+        if ($maskedPath.Omitted) {
+            return "(шлях $($maskedPath.Length) символів не записано: надто довгий суцільний фрагмент для безпечного маскування)"
+        }
+        return ([string]$maskedPath.Text) -replace '[\r\n]+', ' '
+    } catch {
+        return '(шлях приховано: маскування секретів недоступне)'
+    }
+}
+
 function Test-SevenZipArchiveIntegrity {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
@@ -549,7 +579,7 @@ function Test-SevenZipArchiveIntegrity {
 
     Write-BRAVOArchiveHelperLog `
         -Logger $Logger `
-        -Message "Перевiрка цiлiсностi 7-Zip: $(Split-Path $ArchivePath -Leaf)"
+        -Message "Перевiрка цiлiсностi 7-Zip: $(Format-BRAVOSevenZipLogPath -Path (Split-Path $ArchivePath -Leaf) -Password $Password)"
     $testResult = Invoke-BRAVOSevenZipIntegrityTest `
         -SevenZipPath $SevenZipPath `
         -ArchivePath $ArchivePath `
@@ -575,7 +605,7 @@ function Test-SevenZipArchiveIntegrity {
     if ($testResult.Success) {
         Write-BRAVOArchiveHelperLog `
             -Logger $Logger `
-            -Message "Цiлiснiсть архiву пiдтверджено 7-Zip (код: 0): $ArchivePath" `
+            -Message "Цiлiснiсть архiву пiдтверджено 7-Zip (код: 0): $(Format-BRAVOSevenZipLogPath -Path $ArchivePath -Password $Password)" `
             -Level "SUCCESS"
         [void](Register-BRAVOLegacyBomPasswordFallback `
             -Result $testResult `
@@ -639,7 +669,7 @@ function Test-SevenZipArchiveIntegrity {
     # впізнав би ні Write-BRAVOLog, ні маскування SFTP-копії. Без
     # маскування сирий шлях не пишеться.
     $headlineDescription = ''
-    $headlinePath = ''
+    $headlinePath = Format-BRAVOSevenZipLogPath -Path ([string]$ArchivePath) -Password $Password
     try {
         if ($null -eq (Get-Command -Name 'Protect-BRAVOLogSecret' -CommandType Function -ErrorAction SilentlyContinue)) {
             throw 'Protect-BRAVOLogSecret недоступна'
@@ -652,21 +682,11 @@ function Test-SevenZipArchiveIntegrity {
             Get-BRAVOSevenZipDiagnosticReasonText `
                 -Reason ([string]$maskedDescription.Text) -SingleLine -MaximumLength 1000
         }
-        # Headline — однорядковий запис: CR/LF у шляху (на NTFS недосяжні, але
-        # -ArchivePath — довільний рядок) замінюються пробілом, щоб шлях не
-        # розгортався в багато рядків журналу.
-        # Шлях — через ту саму модель із межами вартості, що й решта
-        # діагностики: прямий виклик маскувальника на довгому суцільному
-        # ланцюжку міг би загальмувати шлях обробки збою.
-        $maskedPath = Protect-BRAVOSevenZipDiagnosticText -Text ([string]$ArchivePath) -KnownSecret @($Password)
-        $headlinePath = if ($maskedPath.Omitted) {
-            "(шлях $($maskedPath.Length) символів не записано: надто довгий суцільний фрагмент для безпечного маскування)"
-        } else {
-            ([string]$maskedPath.Text) -replace '[\r\n]+', ' '
-        }
+        # Headline — однорядковий запис: шлях форматує спільний
+        # Format-BRAVOSevenZipLogPath (маскування з межами вартості, CR/LF ->
+        # пробіл), ТОЙ САМИЙ, що й для INFO-початку та SUCCESS-рядка.
     } catch {
         $headlineDescription = 'опис приховано: маскування секретів недоступне'
-        $headlinePath = '(шлях приховано: маскування секретів недоступне)'
     }
     # Межа 4000 символів — на ВЕСЬ headline: шлях архіву (extended-length
     # шлях — тисячі символів) додається вже після обмеженого опису, тож

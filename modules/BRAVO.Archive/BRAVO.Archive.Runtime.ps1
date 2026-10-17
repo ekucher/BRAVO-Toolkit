@@ -431,6 +431,14 @@ if ($credentialHelperLoaded -and -not $NoPause -and
     }
 }
 
+# F4/#481: джерело секретів для єдиного egress-шару маскування
+# (Protect-BRAVOEgressText). Реєструється одразу після появи
+# $credentialSettings і ДО будь-якого сповіщення; викликається на кожну
+# подію без кешу, тож значення, прочитані пізніше, теж маскуються.
+if ($credentialHelperLoaded) {
+    Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
+}
+
 if ($credentialHelperLoaded) {
     try {
         [void](Import-BRAVOInstitutionSettings `

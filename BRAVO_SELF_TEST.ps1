@@ -6171,6 +6171,510 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name 'DryRun/SlackTopologyMirrorsDiscordContract' `
         -Failure 'Slack мусить мати той самий контракт, що Discord: legacy-only інсталяція (лише BRAVO_SLACK_URL) -> FAIL з міграційною діагностикою; errors_only з лише ALERTS -> PASS'
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Notifications.PayloadGuardTruncatesSlackToSingleMessage' } }
+    if (Enter-BRAVOSelfTestSection -Name 'Root/Egress' -DependsOn 'Root/Notifications') { try {
+    # ====================================================================
+    # F4/#481: єдиний fail-closed шар маскування тексту, що залишає сервер
+    # (Slack/Discord, Operations, алерти Maintenance). Це ПОВЕДІНКОВІ
+    # перевірки через реальний ланцюг імпорту (Logging -> Notifications), а
+    # не substring-гейти: застарілий екземпляр Logging після Remove-Module
+    # -Force мовчки деградував би до маскування лише за шаблонами. Тому
+    # секція сама перезавантажує Logging і Notifications (у порядку
+    # залежностей), а наприкінці лишає свіжі екземпляри без заглушок.
+    #
+    # Фікстури складаються з частин (конвенція Logging/ProtectSecretMasksKnownShapes):
+    # суцільного літерала секрету чи URL з обліковими даними у файлі немає.
+    # ====================================================================
+    $egressTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_EGRESS_SELF_TEST_{0}' -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($egressTestRoot)
+    try {
+    Remove-Module -Name 'BRAVO.Notifications' -Force -ErrorAction SilentlyContinue
+    Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Logging\BRAVO.Logging.psd1') -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Notifications\BRAVO.Notifications.psd1') -Force -ErrorAction Stop
+    $egressNotificationsModule = Get-Module -Name 'BRAVO.Notifications'
+    $egressLogFile = Join-Path $egressTestRoot 'egress.log'
+    [void](Initialize-BRAVOLog -LogFile $egressLogFile -FileLevel 'INFO' -ConsoleLevel 'FATAL')
+    Unregister-BRAVOEgressSecretSource
+
+    # Транспорт підміняється В module scope самого Notifications (функція
+    # script: усередині module-bound блоку): Send-BRAVONotificationChunks
+    # викликає Send-BRAVOWebhookNotification саме звідти. Решту ланцюга
+    # (Send-BRAVONotification -> ConvertTo-... -> Limit-... -> Chunks) виконує
+    # РЕАЛЬНИЙ код.
+    & $egressNotificationsModule {
+        $script:egressSent = New-Object 'System.Collections.Generic.List[string]'
+        function script:Send-BRAVOWebhookNotification {
+            param([string]$Provider, [string]$WebhookUrl, [string]$Message, [int]$TimeoutSeconds)
+            [void]$script:egressSent.Add($Message)
+        }
+        function script:Resolve-BRAVONotificationEndpoint {
+            param([string]$Provider, [string]$Route, [hashtable]$CredentialTargets)
+            return 'https://example.invalid/hook'
+        }
+    }
+
+    & {
+    $egressArchivePassword = 'Pl4nted' + 'ArchPw' + '58'
+    $egressSftpPassword = 'Zr' + '7' + 'Qx9'
+    $egressSftpUrl = 'sftp' + '://bravo:' + $egressSftpPassword + '@sftp.example.invalid:22/inbox'
+    $egressPlaceholder = '[деталі приховано: маскування секретів не вдалося — див. журнал BRAVO на сервері]'
+    $egressWarningMark = ([string][char]0x26A0) + ([string][char]0xFE0F)
+    $egressMessage = "Не вдалося створити архів: пароль $egressArchivePassword відхилено; сервер $egressSftpUrl"
+
+    # --- (1) Send-BRAVONotification: -KnownSecret і зареєстроване джерело.
+    & $egressNotificationsModule { $script:egressSent.Clear() }
+    Send-BRAVONotification -Severity ERROR -Message $egressMessage -Provider slack -CredentialTargets @{} `
+        -KnownSecret @($egressArchivePassword) -WarningAction SilentlyContinue
+    Register-BRAVOEgressSecretSource -Resolver (& { param($ClosureSecret) { , @($ClosureSecret) }.GetNewClosure() } $egressArchivePassword)
+    Send-BRAVONotification -Severity ERROR -Message $egressMessage -Provider discord -CredentialTargets @{} `
+        -WarningAction SilentlyContinue
+    $egressSentAfterChain = @(& $egressNotificationsModule { $script:egressSent.ToArray() })
+    $egressChainLeaks = @($egressSentAfterChain | Where-Object {
+            $_.Contains($egressArchivePassword) -or $_.Contains($egressSftpPassword)
+        })
+    Test-BRAVOCondition `
+        -Condition (
+            $egressSentAfterChain.Count -eq 2 -and
+            $egressChainLeaks.Count -eq 0 -and
+            @($egressSentAfterChain | Where-Object { $_.Contains('***') -and $_.Contains('Не вдалося створити архів') }).Count -eq 2
+        ) `
+        -Name 'Egress/NotificationMasksPlantedSecrets' `
+        -Failure ("Send-BRAVONotification -> Send-BRAVONotificationChunks -> транспорт: підкинутий пароль архіву (через -KnownSecret і окремо через " +
+            "зареєстроване джерело) і пароль в sftp-URL не повинні потрапити в жодне надіслане повідомлення; надіслано=$($egressSentAfterChain.Count), витоків=$($egressChainLeaks.Count)")
+
+    # --- (2) Прямий шлях ConvertTo-... + Send-BRAVONotificationChunks
+    # (так викликають Health/Archive/Maintenance): маскування у ConvertTo,
+    # жодних правок у викликачів.
+    & $egressNotificationsModule { $script:egressSent.Clear() }
+    foreach ($egressDirectProvider in @('slack', 'discord')) {
+        $egressDirectChunks = ConvertTo-BRAVONotificationPayloadText -Provider $egressDirectProvider -Message $egressMessage
+        Send-BRAVONotificationChunks -Provider $egressDirectProvider -WebhookUrl 'https://example.invalid/hook' -MessageChunks $egressDirectChunks
+    }
+    # Defence in depth: чанк, що минув ConvertTo, ще раз проходить шаблонне
+    # маскування безпосередньо перед транспортом.
+    Send-BRAVONotificationChunks -Provider slack -WebhookUrl 'https://example.invalid/hook' `
+        -MessageChunks @("сервер $egressSftpUrl")
+    $egressSentDirect = @(& $egressNotificationsModule { $script:egressSent.ToArray() })
+    $egressDirectLeaks = @($egressSentDirect | Where-Object {
+            $_.Contains($egressArchivePassword) -or $_.Contains($egressSftpPassword)
+        })
+    Test-BRAVOCondition `
+        -Condition ($egressSentDirect.Count -eq 3 -and $egressDirectLeaks.Count -eq 0) `
+        -Name 'Egress/DirectConvertPathMasks' `
+        -Failure ("прямий шлях ConvertTo-BRAVONotificationPayloadText + Send-BRAVONotificationChunks (без змін у викликачах) мусить маскувати зареєстровані секрети, " +
+            "а Send-BRAVONotificationChunks -- ще й шаблонні URL-креди; надіслано=$($egressSentDirect.Count), витоків=$($egressDirectLeaks.Count)")
+
+    # Секрет, що перетинає межу обрізання (safe limit 1800): маскування ДО
+    # Limit-BRAVONotificationPayload. Якби воно йшло після, зріз розрізав би
+    # значення, і уламок маскувальник уже не впізнав би.
+    $egressHead = 'aaaa ' * 450
+    $egressStraddleLeaks = New-Object 'System.Collections.Generic.List[int]'
+    $egressStraddleTruncated = 0
+    foreach ($egressOffset in 1690..1760) {
+        $egressStraddleMessage = $egressHead.Substring(0, $egressOffset) + $egressArchivePassword + ' ' + ('bbbb ' * 400)
+        $egressStraddleChunks = ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $egressStraddleMessage -WarningAction SilentlyContinue
+        $egressStraddleText = (@($egressStraddleChunks) -join "`n")
+        if ($egressStraddleText.Contains('скорочено')) { $egressStraddleTruncated++ }
+        if ($egressStraddleText.Contains($egressArchivePassword.Substring(0, 4))) { [void]$egressStraddleLeaks.Add($egressOffset) }
+    }
+    Test-BRAVOCondition `
+        -Condition ($egressStraddleLeaks.Count -eq 0 -and $egressStraddleTruncated -ge 60) `
+        -Name 'Egress/DirectConvertPathMasksSecretStraddlingTruncation' `
+        -Failure ("секрет на межі обрізання payload мусить маскуватися цілком (маскування ДО Limit-BRAVONotificationPayload); " +
+            "зсуви з уламком секрету=$($egressStraddleLeaks -join ','), зсувів з обрізанням (має бути майже всі 71)=$egressStraddleTruncated")
+
+    # --- (3) Fail-closed: заглушка замість тексту, ніколи '' чи сирий текст.
+    $egressWarningsBefore = [int](Get-BRAVOLogStatistics).Warnings
+    $egressLeakMark = 'LEAKFRAGMENT'
+    & $egressNotificationsModule { $script:egressSent.Clear() }
+    $egressMachineName = [Environment]::MachineName
+    # (a) понад межу довжини
+    Send-BRAVONotification -Severity CRITICAL -Message (($egressLeakMark + ' ') * 20000) -Provider slack -CredentialTargets @{} -WarningAction SilentlyContinue
+    # (b) понад межу кількості діапазонів маскування
+    Send-BRAVONotification -Severity WARNING -Message ($egressLeakMark + (' -pa' * 12000)) -Provider slack -CredentialTargets @{} -WarningAction SilentlyContinue
+    # (c) джерело секретів недоступне
+    Register-BRAVOEgressSecretSource -Resolver { throw 'джерело секретів недоступне' }
+    Send-BRAVONotification -Severity ERROR -Message "$egressLeakMark звичайний текст" -Provider discord -CredentialTargets @{} -WarningAction SilentlyContinue
+    $egressSentFailClosed = @(& $egressNotificationsModule { $script:egressSent.ToArray() })
+    $egressExpectedMessages = @(
+        "$egressWarningMark BRAVO-Toolkit ($egressMachineName) CRITICAL: $egressPlaceholder",
+        "$egressWarningMark BRAVO-Toolkit ($egressMachineName) WARNING: $egressPlaceholder",
+        "$egressWarningMark BRAVO-Toolkit ($egressMachineName) ERROR: $egressPlaceholder"
+    )
+    $egressFailClosedExact = $egressSentFailClosed.Count -eq 3
+    if ($egressFailClosedExact) {
+        for ($egressIndex = 0; $egressIndex -lt 3; $egressIndex++) {
+            if ($egressSentFailClosed[$egressIndex] -cne $egressExpectedMessages[$egressIndex]) { $egressFailClosedExact = $false }
+        }
+    }
+    # (d) виняток усередині маскування (надто довге відоме значення ->
+    # UriFormatException в EscapeDataString): MaskingError.
+    $egressDirectMaskingError = Protect-BRAVOEgressText -Text 'звичайний текст' -KnownSecret @('x' * 70000) -SecretSet ([pscustomobject]@{ Secrets = [string[]]@(); Available = $true })
+    $egressEmptyInput = Protect-BRAVOEgressText -Text '' -SecretSet ([pscustomobject]@{ Secrets = [string[]]@(); Available = $true })
+    $egressLogText = if (Test-Path -LiteralPath $egressLogFile -PathType Leaf) { [IO.File]::ReadAllText($egressLogFile, [Text.Encoding]::UTF8) } else { '' }
+    $egressWarningsAfter = [int](Get-BRAVOLogStatistics).Warnings
+    Test-BRAVOCondition `
+        -Condition (
+            $egressFailClosedExact -and
+            -not (($egressSentFailClosed -join "`n").Contains($egressLeakMark)) -and
+            $egressDirectMaskingError.Omitted -and $egressDirectMaskingError.Reason -eq 'MaskingError' -and
+            $egressDirectMaskingError.Text -ceq $egressPlaceholder -and
+            $egressEmptyInput.Text -ceq '' -and -not $egressEmptyInput.Omitted -and
+            $egressLogText -match '\[WARNING\s*\] \[EGRESS\] Egress \(notification/slack\): текст \(\d+ симв\.\) замінено заглушкою: Limit' -and
+            $egressLogText -match 'Egress \(notification/discord\): текст \(\d+ симв\.\) замінено заглушкою: SecretSourceUnavailable' -and
+            $egressLogText -match 'Egress \(egress\): текст \(\d+ симв\.\) замінено заглушкою: MaskingError' -and
+            -not $egressLogText.Contains($egressLeakMark) -and
+            $egressWarningsAfter -eq $egressWarningsBefore
+        ) `
+        -Name 'Egress/FailClosedPlaceholder' `
+        -Failure ("коли маскування неможливе (понад межі довжини/діапазонів, недоступне джерело секретів, виняток), назовні йде РІВНО заглушка (з контекстом severity), " +
+            "а не '' чи сирий текст; у журнал -- WARNING без тексту, лічильник попереджень не змінюється. " +
+            "надіслано=$($egressSentFailClosed.Count), точний збіг=$egressFailClosedExact, " +
+            "MaskingError=$($egressDirectMaskingError.Reason), попереджень до/після=$egressWarningsBefore/$egressWarningsAfter")
+    Unregister-BRAVOEgressSecretSource
+
+    # --- (4) Ідемпотентність: Protect(Protect(x)) -ceq Protect(x) на корпусі
+    # фікстур Logging/ProtectSecretMasksKnownShapes.
+    $egressSlackToken = 'xxxTOKEN' + 'xxxCCCC'
+    $egressDiscordToken = 'abcDEF-' + 'token_value'
+    $egressCorpus = @(
+        ('open sftp://bravouser:{0}@sftp.example.org:22' -f $egressSftpPassword),
+        ('https://{0}/T000AAAA/B111BBBB/{1}' -f ('hooks.slack' + '.com/services'), $egressSlackToken),
+        ('https://{0}/123456789/{1}' -f ('discord' + '.com/api/webhooks'), $egressDiscordToken),
+        ('7za.exe a -password={0} archive.mdz' -f 'Super' + 'Secret'),
+        ('7za.exe t -p{0} archive.mdz' -f 'Secret' + 'Pass123'),
+        "backup at -path C:\Some\Dir",
+        "пароль $egressArchivePassword відхилено; token='AAA LEAK' та password=`"my secret`"",
+        ("рядок 1`r`nрядок 2 з $egressArchivePassword`nрядок 3"),
+        ([Uri]::EscapeDataString($egressArchivePassword) + ' у URL-кодованому вигляді'),
+        $egressPlaceholder,
+        'звичайний текст без секретів'
+    )
+    $egressNotIdempotent = New-Object 'System.Collections.Generic.List[int]'
+    for ($egressCorpusIndex = 0; $egressCorpusIndex -lt $egressCorpus.Count; $egressCorpusIndex++) {
+        $egressOnce = Protect-BRAVOEgressText -Text $egressCorpus[$egressCorpusIndex] -KnownSecret @($egressArchivePassword)
+        $egressTwice = Protect-BRAVOEgressText -Text $egressOnce.Text -KnownSecret @($egressArchivePassword)
+        if ($egressTwice.Text -cne $egressOnce.Text -or $egressOnce.Omitted -or $egressTwice.Omitted) {
+            [void]$egressNotIdempotent.Add($egressCorpusIndex)
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($egressNotIdempotent.Count -eq 0) `
+        -Name 'Egress/IdempotentDoubleMask' `
+        -Failure "повторне маскування вже замаскованого тексту мусить бути тотожним (Protect(Protect(x)) -ceq Protect(x)) без заглушки; елементи корпусу, що не пройшли: $($egressNotIdempotent -join ',')"
+
+    # --- Структурні гейти (AST): єдина точка виклику транспорту, конвеєр
+    # ConvertTo-... перед кожним Send-BRAVONotificationChunks, реєстрація
+    # джерела секретів у кожному runtime.
+    $egressAstFiles = @(
+        Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -Include '*.ps1', '*.psm1' -File
+        Get-ChildItem -LiteralPath $root -Filter 'BRAVO_*.ps1' -File | Where-Object { $_.Name -notlike 'BRAVO_SELF_TEST*' }
+    )
+    $egressTransportCallSites = New-Object 'System.Collections.Generic.List[string]'
+    $egressChunkCallProblems = New-Object 'System.Collections.Generic.List[string]'
+    $egressChunkCallCount = 0
+    foreach ($egressAstFile in $egressAstFiles) {
+        $egressAstTokens = $null
+        $egressAstErrors = $null
+        $egressAst = [System.Management.Automation.Language.Parser]::ParseFile($egressAstFile.FullName, [ref]$egressAstTokens, [ref]$egressAstErrors)
+        $egressCommandAsts = @($egressAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
+        foreach ($egressCommandAst in $egressCommandAsts) {
+            $egressCommandName = $egressCommandAst.GetCommandName()
+            $egressEnclosing = $egressCommandAst.Parent
+            while ($null -ne $egressEnclosing -and $egressEnclosing -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $egressEnclosing = $egressEnclosing.Parent }
+            $egressEnclosingName = if ($null -ne $egressEnclosing) { $egressEnclosing.Name } else { '<script>' }
+            if ($egressCommandName -eq 'Send-BRAVOWebhookNotification') {
+                [void]$egressTransportCallSites.Add("$($egressAstFile.Name):$egressEnclosingName")
+            }
+            if ($egressCommandName -eq 'Send-BRAVONotificationChunks') {
+                $egressChunkCallCount++
+                $egressChunksVariable = $null
+                $egressCommandElements = $egressCommandAst.CommandElements
+                for ($egressElementIndex = 0; $egressElementIndex -lt $egressCommandElements.Count; $egressElementIndex++) {
+                    $egressElement = $egressCommandElements[$egressElementIndex]
+                    if ($egressElement -is [System.Management.Automation.Language.CommandParameterAst] -and $egressElement.ParameterName -eq 'MessageChunks') {
+                        $egressArgument = if ($null -ne $egressElement.Argument) { $egressElement.Argument } elseif ($egressElementIndex + 1 -lt $egressCommandElements.Count) { $egressCommandElements[$egressElementIndex + 1] } else { $null }
+                        if ($egressArgument -is [System.Management.Automation.Language.VariableExpressionAst]) { $egressChunksVariable = $egressArgument.VariablePath.UserPath }
+                    }
+                }
+                $egressScopeAst = if ($null -ne $egressEnclosing) { $egressEnclosing } else { $egressAst }
+                $egressConverted = $false
+                if ($null -ne $egressChunksVariable) {
+                    $egressAssignments = @($egressScopeAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
+                    foreach ($egressAssignment in $egressAssignments) {
+                        if ($egressAssignment.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                            $egressAssignment.Left.VariablePath.UserPath -eq $egressChunksVariable) {
+                            $egressRightCommands = @($egressAssignment.Right.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'ConvertTo-BRAVONotificationPayloadText' }, $true))
+                            if ($egressRightCommands.Count -gt 0) { $egressConverted = $true }
+                        }
+                    }
+                }
+                if (-not $egressConverted) {
+                    [void]$egressChunkCallProblems.Add("$($egressAstFile.Name):$($egressCommandAst.Extent.StartLineNumber) ($egressEnclosingName)")
+                }
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $egressTransportCallSites.Count -eq 1 -and
+            $egressTransportCallSites[0] -eq 'BRAVO.Notifications.psm1:Send-BRAVONotificationChunks'
+        ) `
+        -Name 'Egress/WebhookTransportCalledOnlyFromChunkSender' `
+        -Failure "Send-BRAVOWebhookNotification має викликатися лише з Send-BRAVONotificationChunks (BRAVO.Notifications) -- інакше повз egress-шар; місця виклику: $($egressTransportCallSites -join '; ')"
+    Test-BRAVOCondition `
+        -Condition ($egressChunkCallCount -ge 9 -and $egressChunkCallProblems.Count -eq 0) `
+        -Name 'Egress/EveryChunkSenderCallUsesConvertedChunks' `
+        -Failure "-MessageChunks кожного виклику Send-BRAVONotificationChunks має походити від ConvertTo-BRAVONotificationPayloadText у тій самій функції (виклики=$egressChunkCallCount); порушники: $($egressChunkCallProblems -join '; ')"
+    $egressRuntimeFiles = @(
+        'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1',
+        'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1',
+        'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1',
+        'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1',
+        'BRAVO_RESTORE_TEST.ps1'
+    )
+    $egressRuntimesWithoutRegistration = @($egressRuntimeFiles | Where-Object {
+            $egressRuntimeText = [IO.File]::ReadAllText((Join-Path $root $_), [Text.Encoding]::UTF8)
+            -not ($egressRuntimeText -match 'Register-BRAVOEgressSecretSource\s+-Resolver\s+\{[^}]*Get-BRAVOLogMaskSecretSet')
+        })
+    Test-BRAVOCondition `
+        -Condition ($egressRuntimesWithoutRegistration.Count -eq 0) `
+        -Name 'Egress/EveryRuntimeRegistersSecretSource' `
+        -Failure "кожен runtime (Maintenance/Archive/Health/DataRestore/RESTORE_TEST) мусить реєструвати джерело секретів (Register-BRAVOEgressSecretSource -Resolver { ... Get-BRAVOLogMaskSecretSet ... }); без нього egress маскує лише за шаблонами; не реєструють: $($egressRuntimesWithoutRegistration -join ', ')"
+
+    # --- (7) Maintenance: Send-SlackAlert маскує текст ДО черг.
+    $egressMaintenanceText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $egressSlackModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $egressMaintenanceText `
+        -FunctionNames @('Send-SlackAlert')
+    Register-BRAVOEgressSecretSource -Resolver (& { param($ClosureSecret) { , @($ClosureSecret) }.GetNewClosure() } $egressArchivePassword)
+    $egressSlackProbe = & $egressSlackModule {
+        param($Secret, $UrlToken)
+        $script:SlackMode = 'errors_only'
+        $script:CriticalErrors = $false
+        $script:criticalErrorOccurred = $false
+        $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+        $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+        $script:NotificationWebhookUrls = @{ alerts = 'STUB-ALERTS-URL'; general = 'STUB-GENERAL-URL' }
+        $script:ScriptStartTime = Get-Date
+        $bravoSettings = @{ NotificationRouting = @{} }
+        $LOG_FILE = 'STUB-LOG-PATH'
+        $NotificationProviderDisplayName = 'STUB'
+        $script:egressDelivered = New-Object System.Collections.Generic.List[string]
+        function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+        function Resolve-BRAVONotificationRoute { param([string]$Severity, [string]$NotificationMode, $RoutingTable) return 'alerts' }
+        function Invoke-NotificationWebhook { param([string]$Message, [string]$WebhookUrl) [void]$script:egressDelivered.Add($Message) }
+        function New-MaintenanceNotificationMessage {
+            param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+            return "TITLE=$Title|DETAILS=$($Details -join ';')"
+        }
+
+        Send-SlackAlert -Message "Збій архівації: пароль $Secret та sftp://bravo:${UrlToken}@h" -IsCritical
+        Send-SlackAlert -Message "Попередження: пароль $Secret" -Severity 'WARNING'
+        Send-SlackAlert -Message "Недостатньо вільного місця на диску, пароль $Secret" -Severity 'ERROR'
+        $afterQueues = [pscustomobject]@{
+            Critical = @($script:CriticalErrorsList.ToArray())
+            Queue = @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message })
+            Delivered = @($script:egressDelivered.ToArray())
+            CriticalFlag = [bool]$script:criticalErrorOccurred
+        }
+
+        # Ізольований харнес без Logging: команда відсутня -> заглушка, а не сирий текст.
+        function Get-Command { param($Name, $ErrorAction) return $null }
+        $script:CriticalErrorsList.Clear()
+        Send-SlackAlert -Message "сирий текст $Secret" -IsCritical
+        $afterMissing = @($script:CriticalErrorsList.ToArray())
+        [pscustomobject]@{ Queues = $afterQueues; MissingHelper = $afterMissing }
+    } $egressArchivePassword $egressSftpPassword
+    $egressSlackAllText = @(
+        @($egressSlackProbe.Queues.Critical) + @($egressSlackProbe.Queues.Queue) + @($egressSlackProbe.Queues.Delivered) + @($egressSlackProbe.MissingHelper)
+    ) -join "`n"
+    Test-BRAVOCondition `
+        -Condition (
+            -not $egressSlackAllText.Contains($egressArchivePassword) -and
+            -not $egressSlackAllText.Contains($egressSftpPassword) -and
+            @($egressSlackProbe.Queues.Critical).Count -eq 1 -and @($egressSlackProbe.Queues.Critical)[0].Contains('***') -and
+            @($egressSlackProbe.Queues.Queue).Count -eq 1 -and @($egressSlackProbe.Queues.Queue)[0].Contains('***') -and
+            @($egressSlackProbe.Queues.Delivered).Count -eq 1 -and @($egressSlackProbe.Queues.Delivered)[0].Contains('***') -and
+            $egressSlackProbe.Queues.CriticalFlag -and
+            @($egressSlackProbe.MissingHelper).Count -eq 1 -and @($egressSlackProbe.MissingHelper)[0] -ceq $egressPlaceholder
+        ) `
+        -Name 'Maintenance/SendSlackAlertMasksBeforeQueue' `
+        -Failure ("Send-SlackAlert мусить маскувати текст ДО CriticalErrorsList, NotificationAlertQueue і негайної відправки (space-error гілка; регекс помилки місця працює на сирому тексті), " +
+            "а без Protect-BRAVOEgressText у харнесі -- класти заглушку; витік пароля=$($egressSlackAllText.Contains($egressArchivePassword)), " +
+            "критичних=$(@($egressSlackProbe.Queues.Critical).Count), черга=$(@($egressSlackProbe.Queues.Queue).Count), відправлено=$(@($egressSlackProbe.Queues.Delivered).Count), прапорець=$($egressSlackProbe.Queues.CriticalFlag)")
+    Unregister-BRAVOEgressSecretSource
+
+    # --- (8) F7: Invoke-CommandWithLog -- вивід інструмента і текст винятку
+    # маскуються ДО журналу й алерту. Справжній дочірній процес
+    # (powershell.exe) друкує секрети в різних формах і завершується з кодом 3.
+    $egressChildScript = Join-Path $egressTestRoot 'tool.ps1'
+    [IO.File]::WriteAllText($egressChildScript, @'
+param([string]$Mode = 'normal')
+# Пароль приходить через stdin -- як у продуктивному Maintenance (в Arguments
+# його немає, тож заголовок діагностики з Arguments секрету не містить).
+$Secret = [Console]::In.ReadLine()
+if ($Mode -eq 'big') {
+    [Console]::Out.Write(('word ' * 60000))
+    exit 3
+}
+[Console]::Out.WriteLine('tool failed with -p' + $Secret)
+[Console]::Out.WriteLine('bare value ' + $Secret)
+[Console]::Out.WriteLine('password=plainhunter2')
+[Console]::Out.WriteLine('-password="AAfrag')
+[Console]::Out.WriteLine('SECRETTAIL"')
+exit 3
+'@, (New-Object System.Text.UTF8Encoding($false)))
+    $egressCommandStubText = @'
+function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp) $script:egressLog.Add("$Level|$Message") }
+function Send-SlackAlert { param($Message, [switch]$IsCritical) $script:egressAlerts.Add([string]$Message) }
+function Write-BRAVOProgressDetail { param($Detail) }
+function Format-BRAVORunningDetail { param($ElapsedSeconds, $Detail) return "run $ElapsedSeconds" }
+function Format-BRAVODuration { param($Duration) return [string]$Duration }
+function ConvertTo-BRAVOWindowsCommandLineArgument { BRAVO.Compatibility\ConvertTo-BRAVOWindowsCommandLineArgument @args }
+function Start-BRAVOProcessOutputCapture { BRAVO.Compatibility\Start-BRAVOProcessOutputCapture @args }
+function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVOProcessOutputCapture @args }
+function Write-BRAVOProcessInputText { BRAVO.Compatibility\Write-BRAVOProcessInputText @args }
+function Write-BRAVOLog { param($Component, $Message, $Level, [switch]$Secondary) }
+'@
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1') -ErrorAction Stop
+    $egressCommandFunctionNames = @(
+        'Write-Log', 'Send-SlackAlert', 'Write-BRAVOProgressDetail', 'Format-BRAVORunningDetail', 'Format-BRAVODuration',
+        'ConvertTo-BRAVOWindowsCommandLineArgument', 'Start-BRAVOProcessOutputCapture', 'Complete-BRAVOProcessOutputCapture',
+        'Write-BRAVOProcessInputText', 'Write-BRAVOLog', 'Format-CommandOutput', 'Invoke-CommandWithLog'
+    )
+    $egressCommandModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($egressCommandStubText + "`n" + $egressMaintenanceText) `
+        -FunctionNames $egressCommandFunctionNames
+    $egressThrowingCaptureStub = @'
+function Start-BRAVOProcessOutputCapture { throw ('збій запуску: -p' + $script:egressSecret + ' bare ' + $script:egressSecret) }
+'@
+    $egressCatchFunctionNames = @($egressCommandFunctionNames | Where-Object { $_ -ne 'Start-BRAVOProcessOutputCapture' }) + @('Start-BRAVOProcessOutputCapture')
+    $egressCatchModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($egressThrowingCaptureStub + "`n" + $egressCommandStubText + "`n" + $egressMaintenanceText) `
+        -FunctionNames $egressCatchFunctionNames
+    $egressPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $egressCommandProbe = & $egressCommandModule {
+        param($Exe, $ChildScript, $Secret)
+        $script:egressLog = New-Object System.Collections.Generic.List[string]
+        $script:egressAlerts = New-Object System.Collections.Generic.List[string]
+        $script:criticalErrorOccurred = $false
+        $script:restoreArchiveFailed = $false
+        $normalExit = Invoke-CommandWithLog -Command $Exe `
+            -Arguments @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ChildScript) `
+            -Description 'Тестова native-команда' -TimeoutSeconds 120 -StandardInputText $Secret
+        $normalLog = @($script:egressLog.ToArray())
+        $normalAlerts = @($script:egressAlerts.ToArray())
+        $script:egressLog.Clear()
+        $script:egressAlerts.Clear()
+        $bigExit = Invoke-CommandWithLog -Command $Exe `
+            -Arguments @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ChildScript, '-Mode', 'big') `
+            -Description 'Тестова native-команда з великим виводом' -TimeoutSeconds 120 -StandardInputText $Secret
+        [pscustomobject]@{
+            NormalExit = $normalExit; NormalLog = $normalLog; NormalAlerts = $normalAlerts
+            BigExit = $bigExit; BigLog = @($script:egressLog.ToArray())
+        }
+    } $egressPowerShellExe $egressChildScript $egressArchivePassword
+    $egressCatchProbe = & $egressCatchModule {
+        param($Exe, $Secret)
+        $script:egressSecret = $Secret
+        $script:egressLog = New-Object System.Collections.Generic.List[string]
+        $script:egressAlerts = New-Object System.Collections.Generic.List[string]
+        $script:criticalErrorOccurred = $false
+        $script:restoreArchiveFailed = $false
+        $catchExit = Invoke-CommandWithLog -Command $Exe -Arguments @('-NoProfile') -Description 'Тестова native-команда' -TimeoutSeconds 30 -StandardInputText $Secret
+        [pscustomobject]@{ Exit = $catchExit; Log = @($script:egressLog.ToArray()); Alerts = @($script:egressAlerts.ToArray()) }
+    } $egressPowerShellExe $egressArchivePassword
+    $egressCommandNormalText = (@($egressCommandProbe.NormalLog) + @($egressCommandProbe.NormalAlerts)) -join "`n"
+    $egressCommandBigText = @($egressCommandProbe.BigLog) -join "`n"
+    $egressCommandCatchText = (@($egressCatchProbe.Log) + @($egressCatchProbe.Alerts)) -join "`n"
+    Test-BRAVOCondition `
+        -Condition (
+            $egressCommandProbe.NormalExit -eq 3 -and
+            $egressCommandNormalText.Contains('Деталі виконання') -and
+            $egressCommandNormalText.Contains('***') -and
+            -not $egressCommandNormalText.Contains($egressArchivePassword) -and
+            -not $egressCommandNormalText.Contains('plainhunter2') -and
+            -not $egressCommandNormalText.Contains('AAfrag') -and
+            -not $egressCommandNormalText.Contains('SECRETTAIL') -and
+            $egressCommandProbe.BigExit -eq 3 -and
+            $egressCommandBigText.Contains('символів не записано') -and
+            -not $egressCommandBigText.Contains('word word') -and
+            $egressCatchProbe.Exit -eq 258 -and
+            $egressCommandCatchText.Contains('ПОМИЛКА під час') -and
+            -not $egressCommandCatchText.Contains($egressArchivePassword)
+        ) `
+        -Name 'Maintenance/CommandRunnerMasksOutputAndCatch' `
+        -Failure ("Invoke-CommandWithLog мусить маскувати вивід інструмента ЦІЛИМ текстом (пароль stdin як відоме значення, -p<секрет>, password=, значення в лапках через розрив рядка) " +
+            "до Format-CommandOutput, писати позначку замість надто великого виводу і маскувати текст винятку в журналі й алерті; " +
+            "exit=$($egressCommandProbe.NormalExit)/$($egressCommandProbe.BigExit)/$($egressCatchProbe.Exit), " +
+            "витік пароля=$($egressCommandNormalText.Contains($egressArchivePassword)), password=$($egressCommandNormalText.Contains('plainhunter2')), " +
+            "лапки через рядок=$($egressCommandNormalText.Contains('AAfrag') -or $egressCommandNormalText.Contains('SECRETTAIL')), " +
+            "позначка великого виводу=$($egressCommandBigText.Contains('символів не записано')), витік у catch=$($egressCommandCatchText.Contains($egressArchivePassword))")
+    # --- (6) Operations мусить сам імпортувати BRAVO.Logging: Write-BRAVOOperationsLog
+    # викликає Write-BRAVOLog, і під ВКЛАДЕНИМ імпортом (модуль у модулі, як
+    # BRAVO.Archive -> BRAVO.Operations у production) команда не видна, якщо
+    # Logging не імпортовано глобально. У цьому процесі Logging уже глобальний,
+    # тож перевірка можлива лише в ОКРЕМОМУ powershell.exe, де Logging не
+    # завантажено ніде, крім як самим Operations.
+    $egressImportProbeDir = Join-Path $egressTestRoot 'ImportProbe'
+    [void][IO.Directory]::CreateDirectory($egressImportProbeDir)
+    $egressImportProbeNoBom = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText((Join-Path $egressImportProbeDir 'Host.psm1'), @'
+param()
+Import-Module -Name $env:BRAVO_OPS_PROBE_MODULE -ErrorAction Stop
+function Invoke-HostProbe {
+    $loggingVisibleToHost = [bool](Get-Command -Name 'Write-BRAVOLog' -ErrorAction SilentlyContinue)
+    $resolved = $false
+    $errorText = ''
+    try {
+        & (Get-Module -Name 'BRAVO.Operations') { Write-BRAVOOperationsLog -Level 'DEBUG' -Message 'probe' }
+        $resolved = $true
+    } catch {
+        $errorText = [string]$_.Exception.Message
+    }
+    [pscustomobject]@{ LoggingVisibleToHost = $loggingVisibleToHost; Resolved = $resolved; Error = $errorText }
+}
+Export-ModuleMember -Function Invoke-HostProbe
+'@, $egressImportProbeNoBom)
+    [IO.File]::WriteAllText((Join-Path $egressImportProbeDir 'child.ps1'), @'
+param([string]$Dir, [string]$ResultPath)
+$ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $Dir 'Host.psm1') -ErrorAction Stop
+(Invoke-HostProbe | ConvertTo-Json -Compress) | Out-File -LiteralPath $ResultPath -Encoding utf8
+'@, $egressImportProbeNoBom)
+    $egressImportProbeResultPath = Join-Path $egressImportProbeDir 'result.json'
+    $env:BRAVO_OPS_PROBE_MODULE = Join-Path $root 'modules\BRAVO.Operations\BRAVO.Operations.psd1'
+    $egressImportProbeHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    try {
+        $egressImportProbeOutput = & $egressImportProbeHost -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File (Join-Path $egressImportProbeDir 'child.ps1') -Dir $egressImportProbeDir -ResultPath $egressImportProbeResultPath 2>&1
+    } finally {
+        Remove-Item -Path Env:\BRAVO_OPS_PROBE_MODULE -ErrorAction SilentlyContinue
+    }
+    $egressImportProbeResult = $null
+    if ([IO.File]::Exists($egressImportProbeResultPath)) {
+        $egressImportProbeResult = [IO.File]::ReadAllText($egressImportProbeResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    }
+    Test-BRAVOCondition -Condition (
+        $null -ne $egressImportProbeResult -and
+        $false -eq [bool]$egressImportProbeResult.LoggingVisibleToHost -and
+        $true -eq [bool]$egressImportProbeResult.Resolved
+    ) -Name 'Operations/ModuleImportsLogging' `
+      -Failure ("BRAVO.Operations мусить сам імпортувати BRAVO.Logging: під вкладеним імпортом (Logging НЕ глобальний) Write-BRAVOOperationsLog мусить знаходити Write-BRAVOLog. " +
+        "Результат=$(if ($null -ne $egressImportProbeResult) { $egressImportProbeResult | ConvertTo-Json -Compress } else { 'немає: ' + (@($egressImportProbeOutput) -join ' ') })")
+    } # кінець дочірньої області Root/Egress
+    } finally {
+        try { Unregister-BRAVOEgressSecretSource } catch { $null = $_ }
+        try { [void](Complete-BRAVOLog) } catch { $null = $_ }
+        # Свіжі екземпляри без підмінених заглушок для наступних секцій.
+        Remove-Module -Name 'BRAVO.Notifications' -Force -ErrorAction SilentlyContinue
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Notifications\BRAVO.Notifications.psd1') -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $egressTestRoot) {
+            Remove-Item -LiteralPath $egressTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Egress' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/RestoreDrill') { try {
     # --- 5.2.1: source-контракти міграції з legacy provider-wide webhook-ів.
     # (1) Restore Drill мусить іти канонічним конвеєром BRAVO.Notifications і
@@ -8690,7 +9194,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             param([string]$Component, [string]$Message, [string]$Level)
             [void]$script:alertLogs.Add("$Level|$Message")
         }
-        function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+        # F4/#481: тотожна заглушка Protect-BRAVOLogSecret прибрана -- модуль
+        # бачить реальну функцію з глобального BRAVO.Logging, тож ланцюг
+        # маскування в цьому харнесі справжній, а не вимкнений.
 
         Send-BRAVOArchiveFreeSpaceAlert -Result $Result -MinimumFreeSpaceGB 20
         $enabledSentCount = $script:sentMessages.Count
@@ -23560,6 +24066,7 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         'Protect-BRAVOSevenZipDiagnosticText',
                         'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
                         'Join-BRAVOSevenZipDiagnosticRecordLines',
+                        'Format-BRAVOSevenZipLogPath',
                         'Write-BRAVOSevenZipFailureDiagnostics',
                         'Invoke-BRAVOSevenZipIntegrityTest',
                         'Test-BRAVOSevenZipArchiveSpecificFailure',
@@ -23639,6 +24146,7 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         'Protect-BRAVOSevenZipDiagnosticText',
                         'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
                         'Join-BRAVOSevenZipDiagnosticRecordLines',
+                        'Format-BRAVOSevenZipLogPath',
                         'Write-BRAVOSevenZipFailureDiagnostics',
                         'Invoke-BRAVOSevenZipIntegrityTest',
                         'Test-BRAVOSevenZipArchiveSpecificFailure',
@@ -23755,6 +24263,73 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         "замаскований квадратичним шаблоном чи записаний сирим. " +
                         "позначка=$($diagLongPathHeadline.Contains('символів не записано')), " +
                         "сирий шлях=$($diagLongPathHeadline.Contains('qqqq'))")
+
+                # #452 (пункт 1) / F5: усі три записи про шлях архіву (INFO-початок,
+                # SUCCESS, headline збою) форматує ОДИН хелпер
+                # (Format-BRAVOSevenZipLogPath): пароль архіву, що опинився в шляху,
+                # маскується, а CR/LF не розгортають запис у кілька рядків. Раніше
+                # маскувався й згладжувався лише headline, а SUCCESS писав сирий шлях.
+                $diagFormatStubs = @'
+function Invoke-BRAVOSevenZipIntegrityTest {
+    param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+    $okResult = ([string]$ArchivePath).EndsWith('ok.7z')
+    New-Object PSObject -Property @{
+        Success = $okResult; ExitCode = $(if ($okResult) { 0 } else { 2 }); TimedOut = $false
+        Description = 'формат шляху'; StandardOutput = ''; StandardError = ''; Error = ''
+    }
+}
+function Test-BRAVOSevenZipArchiveSpecificFailure { param($Result, $ArchivePath) return $true }
+function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, $Collector, $Logger) return $false }
+'@
+                $diagFormatModule = New-BRAVOSelfTestRuntimeModule `
+                    -SourceText (([IO.File]::ReadAllText(
+                        (Join-Path $root 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1'),
+                        [Text.Encoding]::UTF8)) + "`r`n" + $diagFormatStubs) `
+                    -FunctionNames @(
+                        'Write-BRAVOArchiveHelperLog',
+                        'Get-BRAVOSevenZipDiagnosticStreamLines',
+                        'Get-BRAVOSevenZipDiagnosticReasonText',
+                        'Protect-BRAVOSevenZipDiagnosticText',
+                        'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
+                        'Join-BRAVOSevenZipDiagnosticRecordLines',
+                        'Write-BRAVOSevenZipFailureDiagnostics',
+                        'Format-BRAVOSevenZipLogPath',
+                        'Invoke-BRAVOSevenZipIntegrityTest',
+                        'Test-BRAVOSevenZipArchiveSpecificFailure',
+                        'Register-BRAVOLegacyBomPasswordFallback',
+                        'Test-SevenZipArchiveIntegrity'
+                    ) `
+                    -PreferLastDefinitionOnDuplicate
+                $diagFormatRecords = @(& $diagFormatModule {
+                    param($FixturePass)
+                    $script:diagFormatCollected = New-Object System.Collections.Generic.List[string]
+                    $diagFormatLogger = { param($Message, $Level) [void]$script:diagFormatCollected.Add([string]$Message) }
+                    [void](Test-SevenZipArchiveIntegrity -SevenZipPath 'C:\nonexistent\7za.exe' `
+                        -ArchivePath ("C:\nonexistent\dir-$FixturePass`r`nx\leaf-$FixturePass`r`nTAIL-ok.7z") `
+                        -Password $FixturePass -Logger $diagFormatLogger)
+                    [void](Test-SevenZipArchiveIntegrity -SevenZipPath 'C:\nonexistent\7za.exe' `
+                        -ArchivePath ("C:\nonexistent\dir-$FixturePass`r`nx\leaf-$FixturePass`r`nTAIL.7z") `
+                        -Password $FixturePass -Logger $diagFormatLogger)
+                    $script:diagFormatCollected.ToArray()
+                } $diagFixtureLegacyPassword)
+                $diagFormatPathRecords = @($diagFormatRecords | Where-Object {
+                        $_ -match '^(Перевiрка цiлiсностi 7-Zip|Цiлiснiсть архiву пiдтверджено)'
+                    })
+                $diagFormatSuccessRecords = @($diagFormatPathRecords | Where-Object { $_ -match '^Цiлiснiсть архiву пiдтверджено' })
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagFormatPathRecords.Count -eq 4 -and
+                        $diagFormatSuccessRecords.Count -eq 1 -and
+                        $diagFormatSuccessRecords[0].Contains('***') -and
+                        @($diagFormatRecords | Where-Object { $_.Contains($diagFixtureLegacyPassword) }).Count -eq 0 -and
+                        @($diagFormatPathRecords | Where-Object { $_ -match '[\r\n]' }).Count -eq 0
+                    ) `
+                    -Name "SevenZipDiagnostics/AllRecordsFormatPathIdentically" `
+                    -Failure ("усі записи про шлях архіву (INFO-початок, SUCCESS, headline) мусять форматуватися одним хелпером: " +
+                        "пароль архіву в шляху замаскований, CR/LF не розбивають запис на кілька рядків. " +
+                        "записів про шлях=$($diagFormatPathRecords.Count) (очікувано 4), SUCCESS=$($diagFormatSuccessRecords.Count), " +
+                        "пароль витік=$(@($diagFormatRecords | Where-Object { $_.Contains($diagFixtureLegacyPassword) }).Count), " +
+                        "записів з розривом рядка=$(@($diagFormatPathRecords | Where-Object { $_ -match '[\r\n]' }).Count)")
 
                 # Production-топологія модулів. BRAVO_ARCHIV.ps1 імпортує лише
                 # BRAVO.Archive, а той запускає Runtime.ps1 у session state свого
@@ -24272,7 +24847,8 @@ $result = [ordered]@{
                 $NotificationProviderDisplayName = 'STUB'
                 $script:t006LogFileEntries = New-Object System.Collections.Generic.List[string]
                 $script:t006Delivered = New-Object System.Collections.Generic.List[object]
-                function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+                # F4/#481: тотожна заглушка Protect-BRAVOLogSecret прибрана -- Send-SlackAlert
+                # викликає реальний Protect-BRAVOEgressText з глобального BRAVO.Logging.
                 function Write-BRAVOConsoleMessage { param($Message, $Level) }
                 function Write-BRAVOMaintenanceLogFile { param([AllowEmptyString()][string]$Entry) $script:t006LogFileEntries.Add($Entry) }
                 function Resolve-BRAVONotificationRoute {
@@ -24365,7 +24941,7 @@ $result = [ordered]@{
                 $script:t006ArchiveSent = New-Object System.Collections.Generic.List[object]
                 function Write-BRAVOLog { param($Component, $Message, $Level) }
                 function Get-HostInformation { return 'STUB-HOST' }
-                function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+                # F4/#481: тотожна заглушка Protect-BRAVOLogSecret прибрана (реальна функція з глобального BRAVO.Logging).
                 function New-BRAVOOperatorNotificationMessage {
                     param($Severity, $Operation, $ActionText, $InstitutionName, $InstitutionCode, $HostInformation,
                         [string[]]$ResultLines, $Timestamp, $ProductName, $Version, $BuildId, $LogPath, $LogLabel)
@@ -26403,7 +26979,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             # деградував би до «маскування секретів недоступне».
             'Get-BRAVOSevenZipDiagnosticStreamLines', 'Get-BRAVOSevenZipDiagnosticReasonText',
             'Protect-BRAVOSevenZipDiagnosticText', 'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
-            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Write-BRAVOSevenZipFailureDiagnostics',
+            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Format-BRAVOSevenZipLogPath', 'Write-BRAVOSevenZipFailureDiagnostics',
             'Register-BRAVOLegacyBomPasswordFallback',
             'Test-BRAVOSevenZipArchiveSpecificFailure'
         )
@@ -26554,7 +27130,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             # деградував би до «маскування секретів недоступне».
             'Get-BRAVOSevenZipDiagnosticStreamLines', 'Get-BRAVOSevenZipDiagnosticReasonText',
             'Protect-BRAVOSevenZipDiagnosticText', 'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
-            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Write-BRAVOSevenZipFailureDiagnostics',
+            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Format-BRAVOSevenZipLogPath', 'Write-BRAVOSevenZipFailureDiagnostics',
             'Register-BRAVOLegacyBomPasswordFallback',
             'Test-BRAVOSevenZipArchiveSpecificFailure',
             # #424 (review): реальний облік статусу кроку очистки
@@ -27940,7 +28516,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
             # деградував би до «маскування секретів недоступне».
             'Get-BRAVOSevenZipDiagnosticStreamLines', 'Get-BRAVOSevenZipDiagnosticReasonText',
             'Protect-BRAVOSevenZipDiagnosticText', 'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
-            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Write-BRAVOSevenZipFailureDiagnostics',
+            'Join-BRAVOSevenZipDiagnosticRecordLines', 'Format-BRAVOSevenZipLogPath', 'Write-BRAVOSevenZipFailureDiagnostics',
             'Register-BRAVOLegacyBomPasswordFallback',
             'Test-BRAVOSevenZipArchiveSpecificFailure'
         )

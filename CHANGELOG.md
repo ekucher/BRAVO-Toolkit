@@ -2,6 +2,37 @@
 
 ## Не випущено (developer)
 
+- **Виправлено (безпека): єдиний fail-closed шар маскування секретів для сповіщень, подій Operations і алертів Maintenance (#481, F7, #452 п. 1).**
+  Текст, що залишає сервер, раніше мав різні й неповні бар'єри: сповіщення
+  `BRAVO.Notifications` не маскували нічого (пароль 7-Zip без `-p`/`password=`
+  контексту, тексти винятків CredRead), події Operations і їхній локальний
+  outbox зберігали сирі `message`/`details` та тексти помилок, Maintenance
+  `Send-SlackAlert` клав сирий текст у черги, а `Invoke-CommandWithLog` писав у
+  журнал і в алерт сирий вивід 7-Zip/`bravocmd.exe` та текст винятку запуску.
+  Тепер `BRAVO.Logging` експортує `Register-BRAVOEgressSecretSource`,
+  `Unregister-BRAVOEgressSecretSource`, `Resolve-BRAVOEgressSecretSet` і
+  `Protect-BRAVOEgressText`: кожен runtime (Archive/Health/Maintenance/
+  DataRestore, `BRAVO_RESTORE_TEST.ps1`) реєструє джерело секретів на
+  `Get-BRAVOLogMaskSecretSet`, а `ConvertTo-BRAVONotificationPayloadText`
+  (нові `-KnownSecret`, `-OmittedContext`) маскує текст ДО обрізання по
+  довжині; `Send-BRAVONotificationChunks` додатково маскує кожен chunk за
+  шаблонами, винятки CredRead і `EndpointError` теж маскуються.
+  `Send-BRAVOOperationsEvent` маскує `message`/`component`/`services`/`details`
+  (рекурсивно до глибини 8) до конверта, а `LastError`/`DeadLetterReason`
+  маскуються централізовано; дренаж маскує `payload` застарілих items перед
+  відправкою (файли на диску не переписуються). Коли маскування неможливе,
+  назовні йде заглушка, а в журнал — один WARNING без тексту
+  (`-Secondary`, код завершення не змінюється). `Invoke-CommandWithLog`
+  маскує вивід і текст винятку; `BRAVO.Operations` тепер сам імпортує
+  `BRAVO.Logging` (вкладений імпорт раніше давав `CommandNotFound` у
+  `Write-BRAVOLog`). #452 п. 1: INFO-початок, SUCCESS і headline збою
+  перевірки цілісності 7-Zip форматують шлях архіву одним хелпером
+  `Format-BRAVOSevenZipLogPath` (маскування пароля, CR/LF -> пробіл); п. 2
+  (політика коротких паролів) лишається відкритим рішенням власника. Тести:
+  `Egress/*`, `Operations/OutboxItemOnDiskHasNoSecret*`,
+  `Operations/ModuleImportsLogging`, `Maintenance/SendSlackAlertMasksBeforeQueue`,
+  `Maintenance/CommandRunnerMasksOutputAndCatch`,
+  `SevenZipDiagnostics/AllRecordsFormatPathIdentically`.
 - **Виправлено (Maintenance, реставрація): рішення про реставрацію перераховується після отримання lock і перед `bravocmd.exe` (#476).**
   `$shouldRestore` і `$missedRestoreDue` обчислювалися один раз до очікування
   lock (до `OperationLockWaitMinutes`, типово 360 хв). Якщо інший прогін за
