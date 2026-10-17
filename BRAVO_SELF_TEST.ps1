@@ -17354,11 +17354,11 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
     # виконується (без guard-а воно б відпрацювало й завершило процес, а
     # функції runtime, як-от Main, лишилися б визначеними). Invoke: справжній
     # production-шлях Invoke-BRAVOArchiveEntrypoint -> & runtime -> guard ->
-    # тіло; явно вказаний відсутній -ConfigPath дає exit 1 з catch
-    # завантаження конфігурації ВСЕРЕДИНІ функції (поточний код; те, що це
-    # 1, а не контрактний 30, — окремий відомий дефект, і його виправлення
-    # має оновити цю перевірку). $LASTEXITCODE перед викликом = 77, тож
-    # пропущене тіло не може випадково дати 1.
+    # тіло; явно вказаний відсутній -ConfigPath дає контрактний exit 30
+    # (InvalidConfiguration) з catch завантаження конфігурації ВСЕРЕДИНІ
+    # функції (раніше — голий exit 1, поза контрактом BRAVO.ExitCodes).
+    # $LASTEXITCODE перед викликом = 77, тож пропущене тіло не може
+    # випадково дати 30.
     $archiveWrapperProbeRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_ARCHIVE_WRAPPER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -17425,10 +17425,10 @@ try {
         Test-BRAVOCondition `
             -Condition (
                 $null -eq $archiveWrapperInvoke.PSObject.Properties['ProbeError'] -and
-                $archiveWrapperInvoke.ExitCode -eq 1
+                $archiveWrapperInvoke.ExitCode -eq 30
             ) `
             -Name "Console/ArchiveRuntimeDirectInvocationRunsBody" `
-            -Failure "Invoke-BRAVOArchiveEntrypoint з явно вказаним відсутнім -ConfigPath має виконати тіло через guard і повернути exit 1 з catch завантаження конфігурації; проба: $($archiveWrapperInvoke | ConvertTo-Json -Compress)"
+            -Failure "Invoke-BRAVOArchiveEntrypoint з явно вказаним відсутнім -ConfigPath має виконати тіло через guard і повернути exit 30 з catch завантаження конфігурації; проба: $($archiveWrapperInvoke | ConvertTo-Json -Compress)"
     } finally {
         if (Test-Path -LiteralPath $archiveWrapperProbeRoot -PathType Container) {
             Remove-Item -LiteralPath $archiveWrapperProbeRoot -Recurse -Force -ErrorAction SilentlyContinue

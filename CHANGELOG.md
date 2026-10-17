@@ -2,6 +2,25 @@
 
 ## Не випущено (developer)
 
+- **Виправлено: ранні виходи `BRAVO_ARCHIV.ps1` повертають канонічні коди
+  `BRAVO.ExitCodes` замість голого `1`.** `BRAVO.Archive.Runtime.ps1`
+  завершувався літеральним `exit 1` (поза контрактом) при збої завантаження
+  конфігурації, відхиленому UAC-запиті, збої локальних параметрів установи з
+  Credential Manager та відсутньому `BRAVO_HEALTH.ps1` у режимі
+  `-HealthCheckOnly`. Тепер: конфігурація і параметри установи — `30`
+  (`InvalidConfiguration`, як у Maintenance/DataRestore), відхилений UAC — `36`
+  (`PrivilegeRequired`, як у `BRAVO_HEALTH.ps1`), відсутній health-скрипт —
+  `90` (як у `BRAVO_ARCHIV.ps1`/`BRAVO_HEALTH.ps1` для компонента комплекту,
+  якого бракує після guard; у режимі Enforce цей шлях недосяжний — guard
+  дає `33`, тож `90` можливий лише при `BRAVO_RUNTIME_INTEGRITY_MODE=Warn`).
+  Для оператора: у Task Scheduler `Last Run Result` завдання Archive у цих
+  випадках замість `1` покаже `30`/`36` (а `90` — лише в режимі Warn);
+  правила моніторингу, що очікують саме `1`, треба оновити. Тексти журналу й
+  порядок виконання не змінено. Maintenance, що запускає Archive дочірнім
+  процесом, і так трактує будь-який код, окрім `0`/`10`, як помилку. Додано
+  статичну перевірку: кожен `exit <число>` у Archive.Runtime мусить бути з
+  множини `BRAVO.ExitCodes`.
+
 - **Агентна оркестрація: роль `lead` як визначення агента.** Lead/Orchestrator
   з `BRAVO_AGENT_POLICY.md` §8 тепер існує як `.claude/agents/lead.md` і роль
   `lead` у `.claude/ai-routing.json` (`model: inherit` — модель, обрана
