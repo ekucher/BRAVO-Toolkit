@@ -491,6 +491,26 @@ function Send-BRAVOMaintenanceServiceRecoveryRunAlerts {
         -CriticalMessages $pendingCritical -QueuedAlerts $pendingQueue -CriticalWithoutDetails:$criticalWithoutDetails -LogPath $LOG_FILE)
 }
 
+function Get-BRAVOMaintenanceRecoverRestorePending {
+    # #438 (P2-3): окремий шов для HoldServices-гейта (раніше inline в
+    # Invoke-BRAVOMaintenanceRecoverServicesSteps), щоб поведінку можна було
+    # перевірити без вантажу кроків. Читає $automaticRestoreDue і
+    # $automaticRestoreRetryBlocked динамічним пошуком змінних (Get-Variable
+    # йде вгору по ланцюжку областей викликача).
+    # Невідомий стан реставрації — як «ще чекає» (гейт закритий, fail-closed).
+    # Реставрація, ЗАБЛОКОВАНА лімітом поспіль-невдалих спроб, не «чекає»:
+    # автоматичний шлях її не виконає, модель не змінюється, а утримувати
+    # служби заради неї означало б тримати їх зупиненими безстроково з
+    # хибною причиною. Блок знімає оператор (-ForceRestore / обнулення
+    # лічильника); до того служби відновлюються за звичайним вікном
+    # BootGraceMinutes. Невідомий прапорець блокування трактується як «не
+    # заблоковано» (старий гейт).
+    $restorePendingVariable = Get-Variable -Name automaticRestoreDue -ErrorAction SilentlyContinue
+    $restoreBlockedVariable = Get-Variable -Name automaticRestoreRetryBlocked -ErrorAction SilentlyContinue
+    $restoreBlockedByRetryCap = ($null -ne $restoreBlockedVariable) -and [bool]$restoreBlockedVariable.Value
+    return [bool]((($null -eq $restorePendingVariable) -or [bool]$restorePendingVariable.Value) -and -not $restoreBlockedByRetryCap)
+}
+
 function Invoke-BRAVOMaintenanceRecoverServicesSteps {
     # Кроки 1-11 профілю -RecoverServices; -Outcome — стан для сповіщень
     # (див. Invoke-BRAVOMaintenanceRecoverServicesProfile).
@@ -555,9 +575,9 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
         if ($restoreSettings.Contains('BootRestoreMode')) { $bootRestoreMode = [string]$restoreSettings.BootRestoreMode }
         if ($restoreSettings.Contains('StartupDelayMinutes')) { $startupDelayMinutes = $restoreSettings.StartupDelayMinutes }
     }
-    # Невідомий стан реставрації — як «ще чекає» (гейт закритий, fail-closed).
-    $restorePendingVariable = Get-Variable -Name automaticRestoreDue -ErrorAction SilentlyContinue
-    $restorePending = ($null -eq $restorePendingVariable) -or [bool]$restorePendingVariable.Value
+    # Невідомий стан реставрації — «ще чекає»; заблокована лімітом #438 — ні
+    # (див. Get-BRAVOMaintenanceRecoverRestorePending).
+    $restorePending = Get-BRAVOMaintenanceRecoverRestorePending
     $bootGate = Get-BRAVOServiceRecoveryBootGate -BootTime (Get-BRAVOServiceRecoveryBootTime) -Now (Get-Date) `
         -BootRestoreMode $bootRestoreMode -StartupDelayMinutes $startupDelayMinutes -RestorePending $restorePending
     if ($bootGate.Defer) {
