@@ -207,6 +207,9 @@ function Set-BRAVOProtectedDataDirectoryAcl {
     # зник під час проходу, перериває встановлення (fail-closed) з точним
     # переліком не оброблених каталогів: на час перевстановлення завдання
     # мають бути зупинені.
+    # Обхід двофазний: фаза 1 (згори вниз) залишає кожному елементу лише
+    # SYSTEM + Administrators, перед кожним Set-Acl/переліком перевіряється кожен
+    # компонент шляху до BoundaryRoot; фаза 2 додає ACE ModifySid.
     # Корінь отримує для ModifySid лише ReadAndExecute|Write БЕЗ DELETE
     # (обліковий запис завдань не може перейменувати/замінити корінь), а
     # Modify для вмісту — окремим inherit-only ACE.
@@ -294,7 +297,7 @@ function Set-BRAVOProtectedDataDirectoryAcl {
     & $assertChainSafe $true
 
     $applyProtectedAcl = {
-        param([string]$Item, [bool]$IsDirectory, [bool]$IsRoot = $false)
+        param([string]$Item, [bool]$IsDirectory, [bool]$IsRoot = $false, [bool]$Grant = $false)
         $itemInheritance = if ($IsDirectory) {
             $inheritance
         } else {
@@ -316,7 +319,10 @@ function Set-BRAVOProtectedDataDirectoryAcl {
                 $allow
             )))
         }
-        foreach ($sidText in $modifySids) {
+        # Фаза 1 ($Grant = $false): лише SYSTEM + Administrators. ModifySid
+        # додається у фазі 2 ($Grant = $true).
+        $grantSids = if ($Grant) { $modifySids } else { @() }
+        foreach ($sidText in $grantSids) {
             $modifySidObject = New-Object Security.Principal.SecurityIdentifier($sidText)
             if ($IsRoot) {
                 # Корінь: без DELETE/DeleteSubdirectoriesAndFiles для облікового
@@ -350,29 +356,66 @@ function Set-BRAVOProtectedDataDirectoryAcl {
         Set-Acl -LiteralPath $Item -AclObject $acl -ErrorAction Stop
     }
 
-    # Спершу захищається корінь (Users втрачають право створювати в ньому
-    # нові елементи/junction), лише потім перелічується вміст.
-    & $applyProtectedAcl $fullPath $true $true
+    # Двофазний обхід (повторний security-review, P2).
+    # Фаза 1 (згори вниз, pre-order): корінь і кожен нащадок отримують DACL лише
+    # з SYSTEM + Administrators (власник Administrators, без успадкування).
+    # Обліковий запис завдань втрачає DELETE/AddSubdirectory на каталозі ДО
+    # того, як перелічуються його діти, тож підмінити вже оброблений
+    # компонент (rename + junction) він не може. ПЕРЕД кожним Set-Acl і кожним
+    # переліком перевіряється КОЖЕН компонент від елемента до BoundaryRoot
+    # окремо (GetAttributes на повному шляху пройшов би крізь junction
+    # проміжного компонента). Фаза 2 (лише за наявності ModifySid): повторна
+    # перевірка ланцюга й додавання ACE для ModifySid лише для елементів,
+    # успішно оброблених у фазі 1.
+    $findChangedComponent = {
+        param([string]$Item)
+        $walker = $Item
+        while (-not $walker.Equals($fullPath, [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-BRAVOPathIsReparsePoint -Path $walker) { return $walker }
+            $walkerParent = [System.IO.Path]::GetDirectoryName($walker)
+            if ([string]::IsNullOrEmpty($walkerParent) -or $walkerParent.Length -ge $walker.Length) { break }
+            $walker = $walkerParent
+        }
+        foreach ($component in $chain) {
+            if (Test-BRAVOPathIsReparsePoint -Path $component) { return [string]$component }
+        }
+        return ''
+    }
+
     $skippedReparsePoints = New-Object 'System.Collections.Generic.List[string]'
     $unprocessedDirectories = New-Object 'System.Collections.Generic.List[string]'
+    $changedChainItems = New-Object 'System.Collections.Generic.List[string]'
+    $processedItems = New-Object 'System.Collections.Generic.List[object]'
     $pendingDirectories = New-Object 'System.Collections.Generic.Stack[string]'
-    $pendingDirectories.Push($fullPath)
     $currentDirectory = ''
     $currentItem = ''
+    $phase = 1
+    $phaseTwoIndex = 0
+
+    $stripItem = {
+        param([string]$Item, [bool]$IsDirectory, [bool]$IsRoot)
+        $currentItem = $Item
+        $changed = & $findChangedComponent $Item
+        if ($changed -ne '') {
+            $changedChainItems.Add("$Item (змінений компонент: $changed)")
+            return $false
+        }
+        & $applyProtectedAcl $Item $IsDirectory $IsRoot $false
+        [void]$processedItems.Add([pscustomobject]@{ Path = $Item; IsDirectory = $IsDirectory; IsRoot = $IsRoot })
+        return $true
+    }
+
     try {
+        # Фаза 1: корінь першим (Users втрачають право створювати в ньому
+        # нові елементи/junction), потім вміст.
+        $currentItem = $fullPath
+        if (& $stripItem $fullPath $true $true) { $pendingDirectories.Push($fullPath) }
         while ($pendingDirectories.Count -gt 0) {
             $currentDirectory = $pendingDirectories.Pop()
             $currentItem = $currentDirectory
-            # Повторна перевірка ланцюга (корінь -> BoundaryRoot) і самого
-            # каталогу ПЕРЕД переліком: шлях резолвиться рядком, тож
-            # підміна компонента на junction посеред обходу інакше
-            # перенаправила б Set-Acl у чужий каталог.
-            $chainChanged = $false
-            foreach ($component in $chain) {
-                if (Test-BRAVOPathIsReparsePoint -Path $component) { $chainChanged = $true; break }
-            }
-            if ($chainChanged -or (Test-BRAVOPathIsReparsePoint -Path $currentDirectory)) {
-                $unprocessedDirectories.Add($currentDirectory)
+            $changed = & $findChangedComponent $currentDirectory
+            if ($changed -ne '') {
+                $unprocessedDirectories.Add("$currentDirectory (змінений компонент: $changed)")
                 continue
             }
             foreach ($child in @(Get-ChildItem -LiteralPath $currentDirectory -Force -ErrorAction Stop)) {
@@ -383,24 +426,49 @@ function Set-BRAVOProtectedDataDirectoryAcl {
                     continue
                 }
                 $childIsDirectory = [bool]$child.PSIsContainer
-                & $applyProtectedAcl $childPath $childIsDirectory
-                if ($childIsDirectory) { $pendingDirectories.Push($childPath) }
+                if ((& $stripItem $childPath $childIsDirectory $false) -and $childIsDirectory) {
+                    $pendingDirectories.Push($childPath)
+                }
+            }
+        }
+
+        # Фаза 2: ACE для ModifySid.
+        if ($modifySids.Count -gt 0) {
+            $phase = 2
+            for ($phaseTwoIndex = 0; $phaseTwoIndex -lt $processedItems.Count; $phaseTwoIndex++) {
+                $processed = $processedItems[$phaseTwoIndex]
+                $currentItem = [string]$processed.Path
+                $changed = & $findChangedComponent $processed.Path
+                if ($changed -ne '') {
+                    $changedChainItems.Add("$($processed.Path) (змінений компонент: $changed; ACE облікового запису завдань не додано)")
+                    continue
+                }
+                & $applyProtectedAcl ([string]$processed.Path) ([bool]$processed.IsDirectory) ([bool]$processed.IsRoot) $true
             }
         }
     } catch {
         $failureMessage = $_.Exception.Message
-        $leftItems = @($currentDirectory, $currentItem) + @($pendingDirectories.ToArray()) + @($unprocessedDirectories)
+        if ($phase -eq 2) {
+            $leftItems = @()
+            for ($leftIndex = $phaseTwoIndex; $leftIndex -lt $processedItems.Count; $leftIndex++) {
+                $leftItems += [string]$processedItems[$leftIndex].Path
+            }
+            $leftItems = @($leftItems) + @($unprocessedDirectories)
+        } else {
+            $leftItems = @($currentDirectory, $currentItem) + @($pendingDirectories.ToArray()) + @($unprocessedDirectories)
+        }
         $leftItems = @($leftItems | Where-Object { -not [string]::IsNullOrEmpty($_) } | Select-Object -Unique)
         throw (
-            "Обхід каталогу даних $fullPath перервано на '$currentItem': $failureMessage. " +
+            "Обхід каталогу даних $fullPath перервано на '$currentItem' (фаза $phase): $failureMessage. " +
             "ACL застосовано частково; не оброблені каталоги/елементи: " + ($leftItems -join '; ') +
             ". Зупиніть завдання й повторіть встановлення."
         )
     }
-    if ($unprocessedDirectories.Count -gt 0) {
+    if ($unprocessedDirectories.Count -gt 0 -or $changedChainItems.Count -gt 0) {
         Write-Warning (
-            "Ланцюг reparse point каталогу даних $fullPath змінився під час обходу; ACL цих каталогів " +
-            "НЕ змінено (вміст не обходився): " + ($unprocessedDirectories -join '; ') +
+            "Ланцюг reparse point каталогу даних $fullPath змінився під час обходу; ці елементи пропущено " +
+            "(ACL не змінено або ACE облікового запису завдань не додано, вміст не обходився): " +
+            ((@($unprocessedDirectories) + @($changedChainItems)) -join '; ') +
             ". Перевірте каталоги й повторіть встановлення."
         )
     }
