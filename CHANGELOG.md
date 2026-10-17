@@ -8,17 +8,25 @@
   лапок: значення `*` вимикало перевірку ключа сервера, а CR/LF у значенні
   дозволяв дописати довільні команди WinSCP. Тепер `Test-BRAVOSshHostKeyFingerprint`
   / `ConvertTo-BRAVOSshHostKeyFingerprint` (BRAVO.Configuration.Schema) приймають лише
-  `<тип> <біти> <відбиток>` (SHA-256 з префіксом `SHA256:` або без, або MD5 з 16 hex-пар;
-  кілька ключів через `;`), валідатор реєстру `SshHostKeyFingerprint` замінив
+  `<тип> <біти> <відбиток>` (SHA-256 — 43 символи base64, `SHA256:` на вході приймається й відсікається під час
+  нормалізації, бо .NET-збірка WinSCP відхиляє префіксну форму; або MD5 з 16 hex-пар;
+  кілька ключів через `;`; `ssh-ed448` не допускається — збірка його відхиляє), валідатор реєстру `SshHostKeyFingerprint` замінив
   `NonEmptyString`, а кожен споживач (Archive, Health, DataRestore, BazaSync,
   Maintenance, `BRAVO_DRY_RUN`, `BRAVO_BAZA_RECONCILE`) перевіряє значення сам
   (покриває і legacy `BRAVO.config`) та пише `-hostkey="..."` у лапках.
   **Зміна поведінки (BREAKING для майданчиків із `*` чи значенням не за форматом):**
   `BRAVO.local.config` з невалідним `sftpHostKey` зупиняє завантаження конфігурації
   (`30`, до локального архіву); у `BRAVO.config` Archive створює локальний архів без
-  SFTP і завершується `30`, `-SyncBAZA` і Health (замість `70`) також дають `30`.
+  SFTP і завершується `30`, `-SyncBAZA` і Health (замість `70`) також дають `30`;
+  `-SyncBAZA` тепер повертає `30` для БУДЬ-ЯКОЇ помилки SFTP-конфігурації
+  (`Test-SFTPConfig` = false: немає WinSCP, облікових даних, невалідний host key), раніше `50`;
+  `BRAVO_BAZA_RECONCILE` з невалідним ключем завершується `30` (не `90`); Maintenance
+  (trace/власний лог) за невалідного ключа лише `WARNING` і пропуск (без `30`), Health за
+  зайнятого WinSCP відкладає перевірку на наступний запуск (`10`). Перший ASCII-бар'єр
+  валідатора тепер регістрозалежний (`-cnotmatch`): U+212A/U+0130 відхиляються.
   Повідомлення не містять значення. Тести: `SshHostKey/FormatValidatorTable`,
-  `SshHostKey/RegistryUsesFormatValidator`, `SshHostKey/EveryConsumerQuotesAndValidatesHostKey`,
+  `SshHostKey/RegistryUsesFormatValidator`, `SshHostKey/EveryConsumerQuotesAndValidatesHostKey` (тепер вимагає `ConvertTo-` для кожної змінної в `-hostkey="$var"`),
+  `SshHostKey/NormalizedValueAcceptedByWinScpAssembly`, `SshHostKey/ReconcileInvalidHostKeyExitsInvalidConfiguration`,
   `Loader/SftpHostKeyAcceptAnyOverrideFailsClosed`, `Archive/HostKey*`,
   `Archive/SyncBazaInvalidSftpConfigurationExits30`, `Health/OrchestrationInvalidHostKeyGivesInvalidConfiguration`,
   `BazaSync/InvalidHostKeyFailsBeforeWinSCPSession`.

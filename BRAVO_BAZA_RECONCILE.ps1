@@ -257,7 +257,16 @@ try {
     }
     $sessionOptions = New-Object WinSCP.SessionOptions
     $sessionOptions.ParseUrl($repositorySftpUrl)
-    $sessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $global:sftpHostKey
+    # Невалідний sftpHostKey — помилка КОНФІГУРАЦІЇ (30), а не внутрішня (90): без цього
+    # ArgumentException із ConvertTo- потрапляла б у зовнішній catch. Сире значення не логуємо.
+    $validatedHostKey = $null
+    try {
+        $validatedHostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $global:sftpHostKey
+    } catch [System.ArgumentException] {
+        Write-Host 'ПОМИЛКА: sftpHostKey має невалідний формат (очікується <тип> <біти> <відбиток>); значення не виводиться — виправте BRAVO.local.config.' -ForegroundColor Red
+        Exit-BRAVOBazaReconcile -ExitCode (Resolve-BRAVOExitCode -InvalidConfiguration)
+    }
+    $sessionOptions.SshHostKeyFingerprint = $validatedHostKey
     $sessionOptions.Timeout = [timespan]::FromSeconds(30)
     $session = New-Object WinSCP.Session
     $session.ExecutablePath = $winSCPComponents.ExecutablePath

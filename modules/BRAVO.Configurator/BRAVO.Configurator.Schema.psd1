@@ -172,7 +172,7 @@
         # ===== Storage / SFTP (скаляри) — фаза 1 =====
         @{ Path = 'sftpHostTemplate'; Group = 'Storage'; Section = 'SFTP'; Label = 'Шаблон хоста SFTP'; Description = '{0} = логін зі сховища credentials.'; Type = 'String'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 10 }
         @{ Path = 'sftpPort'; Group = 'Storage'; Section = 'SFTP'; Label = 'Порт SFTP'; Description = ''; Type = 'Integer'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 20 }
-        @{ Path = 'sftpHostKey'; Group = 'Storage'; Section = 'SFTP'; Label = 'SSH host-key (pinning)'; Description = 'Обов''язковий; значення з панелі провайдера. Security-critical — не accept-any-host-key. Формат: ssh-ed25519 255 SHA256:<відбиток>; ''*''/acceptnew заборонені.'; Type = 'String'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 30 }
+        @{ Path = 'sftpHostKey'; Group = 'Storage'; Section = 'SFTP'; Label = 'SSH host-key (pinning)'; Description = 'Обов''язковий; значення з панелі провайдера. Security-critical — не accept-any-host-key. Формат: ssh-ed25519 255 <43 символи base64> (префікс SHA256: з ssh-keygen -lf/WinSCP GUI приймається й відсікається); ''*''/acceptnew заборонені.'; Type = 'String'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 30 }
         @{ Path = 'sftpConnectionTimeoutSeconds'; Group = 'Storage'; Section = 'SFTP'; Label = 'Таймаут з''єднання SFTP (с)'; Description = ''; Type = 'Integer'; Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 40 }
 
         # ===== Storage / SFTP каталоги (sftpDirectories) — фаза 2 =====

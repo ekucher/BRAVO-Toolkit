@@ -1422,7 +1422,8 @@ function Test-BRAVOSshHostKeyFingerprint {
     }
     $raw = [string]$Value
     # \A..\z (не ^..$): $ у .NET збігається перед фінальним LF.
-    if ($raw -notmatch '\A[\x20-\x7E]{1,1024}\z') {
+    # -cnotmatch: регістронезалежний -notmatch пропускає U+212A (Kelvin) і U+0130 як 'k'/'i'.
+    if ($raw -cnotmatch '\A[\x20-\x7E]{1,1024}\z') {
         return (& $fail 'ControlOrNonAscii' $msgControl)
     }
     $text = $raw.Trim(' ')
@@ -1447,17 +1448,25 @@ function Test-BRAVOSshHostKeyFingerprint {
             return (& $fail 'AcceptAnyHostKey' $msgAccept)
         }
     }
-    $formatPattern = '\A(?<type>ssh-ed25519|ssh-ed448|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa|ssh-dss) (?<bits>[1-9][0-9]{2,4}) (?<fp>(?:[0-9a-fA-F]{2}:){15}[0-9a-fA-F]{2}|(?:SHA256:)?[A-Za-z0-9+/]{43}=?)\z'
+    $formatPattern = '\A(?<type>ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa|ssh-dss) (?<bits>[1-9][0-9]{2,4}) (?<fp>(?:[0-9a-fA-F]{2}:){15}[0-9a-fA-F]{2}|(?:SHA256:)?[A-Za-z0-9+/]{43}=?)\z'
     $index = 0
     foreach ($entry in $entries) {
         $index++
         if ($entry -cnotmatch $formatPattern) {
-            return (& $fail 'Format' "SFTP host key, запис ${index}: очікується '<тип> <біти> <відбиток>' (тип: ssh-ed25519|ecdsa-sha2-nistp256/384/521|ssh-rsa|ssh-dss|ssh-ed448; відбиток: SHA-256 — 43 символи base64, з префіксом SHA256: або без, або MD5 — 16 hex-пар через ':').")
+            return (& $fail 'Format' "SFTP host key, запис ${index}: очікується '<тип> <біти> <відбиток>' (тип: ssh-ed25519|ecdsa-sha2-nistp256/384/521|ssh-rsa|ssh-dss; відбиток: SHA-256 — 43 символи base64, з префіксом SHA256: або без, або MD5 — 16 hex-пар через ':').")
         }
+    }
+    # Нормалізація: префікс 'SHA256:' ПРИЙМАЄТЬСЯ на вході (вивід ssh-keygen -lf / WinSCP GUI),
+    # але ВІДСІКАЄТЬСЯ: WinSCP.com приймає і голу форму, а .NET-збірка WinSCPnet.dll
+    # (SessionOptions.SshHostKeyFingerprint) ВІДХИЛЯЄ 'ssh-ed25519 255 SHA256:<43>'.
+    # ssh-ed448 не допускається: сетер збірки його відхиляє.
+    $normalized = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in $entries) {
+        [void]$normalized.Add(($entry -creplace ' SHA256:(?=[A-Za-z0-9+/]{43}=?\z)', ' '))
     }
     return [pscustomobject]@{
         IsValid    = $true
-        Normalized = ($entries -join ';')
+        Normalized = ($normalized -join ';')
         Reason     = $null
         Message    = $null
     }

@@ -1831,10 +1831,10 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         @{ Name = 'Md5Unquoted'; Value = ('ssh-rsa 2048 ' + $hkMd5); Expect = ('ssh-rsa 2048 ' + $hkMd5) }
         @{ Name = 'Ed25519Base64'; Value = ('ssh-ed25519 255 ' + $hkB64); Expect = ('ssh-ed25519 255 ' + $hkB64) }
         @{ Name = 'Ed25519Base64Padded'; Value = ('ssh-ed25519 255 ' + $hkB64 + '='); Expect = ('ssh-ed25519 255 ' + $hkB64 + '=') }
-        @{ Name = 'Ed25519Sha256Prefix'; Value = ('ssh-ed25519 255 SHA256:' + $hkB64); Expect = ('ssh-ed25519 255 SHA256:' + $hkB64) }
-        @{ Name = 'Ecdsa384'; Value = ('ecdsa-sha2-nistp384 384 SHA256:' + $hkB64); Expect = ('ecdsa-sha2-nistp384 384 SHA256:' + $hkB64) }
-        @{ Name = 'TwoEntries'; Value = ('ssh-ed25519 255 SHA256:' + $hkB64 + ';ssh-rsa 2048 ' + $hkMd5); Expect = ('ssh-ed25519 255 SHA256:' + $hkB64 + ';ssh-rsa 2048 ' + $hkMd5) }
-        @{ Name = 'OuterSpaces'; Value = ('  ssh-ed25519 255 SHA256:' + $hkB64 + '  '); Expect = ('ssh-ed25519 255 SHA256:' + $hkB64) }
+        @{ Name = 'Ed25519Sha256Prefix'; Value = ('ssh-ed25519 255 SHA256:' + $hkB64); Expect = ('ssh-ed25519 255 ' + $hkB64) }
+        @{ Name = 'Ecdsa384'; Value = ('ecdsa-sha2-nistp384 384 SHA256:' + $hkB64); Expect = ('ecdsa-sha2-nistp384 384 ' + $hkB64) }
+        @{ Name = 'TwoEntries'; Value = ('ssh-ed25519 255 SHA256:' + $hkB64 + ';ssh-rsa 2048 ' + $hkMd5); Expect = ('ssh-ed25519 255 ' + $hkB64 + ';ssh-rsa 2048 ' + $hkMd5) }
+        @{ Name = 'OuterSpaces'; Value = ('  ssh-ed25519 255 SHA256:' + $hkB64 + '  '); Expect = ('ssh-ed25519 255 ' + $hkB64) }
     )
     $hkInvalidCases = @(
         @{ Name = 'Star'; Value = '*'; Reason = 'AcceptAnyHostKey' }
@@ -1848,6 +1848,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         @{ Name = 'Tab'; Value = ("ssh-ed25519`t255 " + $hkB64); Reason = 'ControlOrNonAscii' }
         @{ Name = 'Nul'; Value = ('ssh-ed25519 255 ' + $hkB64 + [string][char]0); Reason = 'ControlOrNonAscii' }
         @{ Name = 'LineSeparator'; Value = ('ssh-ed25519 255 ' + $hkB64 + [string][char]0x2028); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'KelvinSignAsciiBarrier'; Value = ('ssh-ed25519 255 ' + $hkB64 + [string][char]0x212A); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'DottedCapitalIAsciiBarrier'; Value = ('ssh-ed25519 255 ' + $hkB64 + [string][char]0x0130); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'Ed448NotAcceptedByWinScpAssembly'; Value = ('ssh-ed448 448 ' + $hkB64); Reason = 'Format' }
         @{ Name = 'ShortMd5'; Value = 'ssh-rsa 2048 aa:bb:cc'; Reason = 'Format' }
         @{ Name = 'SelfTestFingerprint'; Value = 'ssh-ed25519 255 self-test'; Reason = 'Format' }
         @{ Name = 'Fake'; Value = 'fake'; Reason = 'Format' }
@@ -1893,6 +1896,34 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         -Name "SshHostKey/FormatValidatorTable" `
         -Failure "Test-/ConvertTo-BRAVOSshHostKeyFingerprint та authorization-валідатор SshHostKeyFingerprint мусять приймати валідні формати й fail-closed відхиляти '*'/accept*/керуючі символи/неповні відбитки без ехо значення у повідомленні; збої: $([string]::Join(', ', $hkTableFailures))"
 
+    # --- SshHostKey/NormalizedValueAcceptedByWinScpAssembly ---
+    # Поведінковий контракт: КОЖНЕ валідне Normalized має прийматися сетером
+    # WinSCP.SessionOptions.SshHostKeyFingerprint із вбудованої Tools\WinSCPnet.dll
+    # (збірка відхиляє 'SHA256:'-префікс і ssh-ed448, на відміну від WinSCP.com).
+    # Окремий powershell.exe: Add-Type не блокує збірку в процесі self-test.
+    $hkAsmDll = Join-Path $root 'Tools\WinSCPnet.dll'
+    $hkAsmLimitation = ''
+    $hkAsmOutput = ''
+    if (-not (Test-Path -LiteralPath $hkAsmDll -PathType Leaf)) {
+        $hkAsmLimitation = 'Tools\WinSCPnet.dll відсутня (НЕДОСТУПНО)'
+    } else {
+        $hkAsmValues = @(foreach ($hkCase in $hkValidCases) { "'" + ([string](Test-BRAVOSshHostKeyFingerprint -Value $hkCase.Value).Normalized) + "'" })
+        $hkAsmCommand = (
+            "`$ErrorActionPreference = 'Stop'; try { " +
+            "Add-Type -Path '" + $hkAsmDll + "'; `$n = 0; " +
+            "foreach (`$v in @(" + ($hkAsmValues -join ',') + ")) { " +
+            "`$o = New-Object WinSCP.SessionOptions; `$o.SshHostKeyFingerprint = `$v; `$n++ }; " +
+            "'ASM-OK:' + `$n } catch { 'ASM-ERROR: ' + `$_.Exception.GetType().FullName }"
+        )
+        $hkAsmOutput = ([string](@(& (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command $hkAsmCommand 2>&1)[-1])).Trim()
+    }
+    Test-BRAVOCondition `
+        -Condition ($hkAsmOutput -ceq ('ASM-OK:' + @($hkValidCases).Count)) `
+        -Name "SshHostKey/NormalizedValueAcceptedByWinScpAssembly" `
+        -EnvironmentLimitation $hkAsmLimitation `
+        -Failure "Normalized-значення Test-BRAVOSshHostKeyFingerprint мусять приймати WinSCP.SessionOptions.SshHostKeyFingerprint (Tools\WinSCPnet.dll); отримано: '$hkAsmOutput'"
+
     # --- SshHostKey/RegistryUsesFormatValidator ---
     # Реєстр авторизації мусить вказувати саме SshHostKeyFingerprint, а не NonEmptyString.
     Test-BRAVOCondition `
@@ -1927,11 +1958,22 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         if ($hkScanText.IndexOf('hostkey', [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
         $hkScanRelative = $hkScanFile.FullName.Substring($root.Length).TrimStart('\')
         foreach ($hkScanMatch in [regex]::Matches($hkScanText, '(?i)-hostkey=(?<tail>[^\r\n]{0,24})')) {
-            if ($hkScanMatch.Groups['tail'].Value -cmatch '^`?"\$[A-Za-z_][A-Za-z0-9_]*`?"') {
+            $hkScanVar = [regex]::Match($hkScanMatch.Groups['tail'].Value, '^`?"\$(?<name>[A-Za-z_][A-Za-z0-9_]*)`?"')
+            if ($hkScanVar.Success) {
                 $hkScanQuotedCount++
+                # Змінна мусить бути присвоєна з ConvertTo- у тому ж файлі ($validatedHostKey — дозволена назва).
+                $hkScanVarName = $hkScanVar.Groups['name'].Value
+                $hkScanVarOk = $hkScanText -cmatch ('\$' + [regex]::Escape($hkScanVarName) + '\s*=\s*ConvertTo-BRAVOSshHostKeyFingerprint\s')
+                if (-not $hkScanVarOk) {
+                    [void]$hkScanFailures.Add("${hkScanRelative}: -hostkey= зі змінною '$hkScanVarName' без присвоєння з ConvertTo-BRAVOSshHostKeyFingerprint")
+                }
             } else {
                 [void]$hkScanFailures.Add("${hkScanRelative}: -hostkey= без лапок/змінної")
             }
+        }
+        # Варіанти `-hostkey "` та `/hostkey=` (пробіл замість '=' або слеш-синтаксис) теж заборонені.
+        if ([regex]::IsMatch($hkScanText, '(?i)[-/]hostkey\s+"|/hostkey=')) {
+            [void]$hkScanFailures.Add("${hkScanRelative}: заборонений варіант '-hostkey ' з лапками або '/hostkey=' (дозволено лише -hostkey=...)")
         }
         foreach ($hkScanMatch in [regex]::Matches($hkScanText, '(?m)\.SshHostKeyFingerprint\s*=(?!=)\s*(?<rhs>[^\r\n]*)')) {
             $hkScanAssignmentCount++
@@ -1948,6 +1990,14 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         -Condition ($hkScanFailures.Count -eq 0 -and $hkScanQuotedCount -ge 6 -and $hkScanAssignmentCount -ge 8) `
         -Name "SshHostKey/EveryConsumerQuotesAndValidatesHostKey" `
         -Failure "кожен -hostkey= у продуктових WinSCP-скриптах має бути у лапках зі змінною (-hostkey=`"`$var`"), а кожне SshHostKeyFingerprint = — брати значення з ConvertTo-BRAVOSshHostKeyFingerprint; знайдено лапкових=$hkScanQuotedCount присвоєнь=$hkScanAssignmentCount; порушення: $([string]::Join('; ', $hkScanFailures))"
+
+    # --- SshHostKey/ReconcileInvalidHostKeyExitsInvalidConfiguration (#480 review, F5) ---
+    # Статична перевірка: невалідний sftpHostKey у BRAVO_BAZA_RECONCILE — код 30, а не 90 зовнішнього catch.
+    $hkReconcileText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_BAZA_RECONCILE.ps1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition ($hkReconcileText -cmatch '(?s)\$validatedHostKey\s*=\s*ConvertTo-BRAVOSshHostKeyFingerprint[^\r\n]*\r?\n\s*\}\s*catch\s*\[System\.ArgumentException\]\s*\{.{0,400}?Resolve-BRAVOExitCode\s+-InvalidConfiguration') `
+        -Name "SshHostKey/ReconcileInvalidHostKeyExitsInvalidConfiguration" `
+        -Failure "BRAVO_BAZA_RECONCILE.ps1: ConvertTo-BRAVOSshHostKeyFingerprint мусить бути в try з catch [System.ArgumentException] -> Resolve-BRAVOExitCode -InvalidConfiguration (30), інакше помилка конфігурації стає внутрішньою (90)."
 
     # --- Authorization/UnknownValidatorIdFailsClosed ---
     $authUnknownValidatorThrew = $false
