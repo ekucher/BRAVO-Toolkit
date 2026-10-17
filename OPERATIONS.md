@@ -2300,8 +2300,9 @@ SYSTEM/Administrators); якщо SETUP звітує «State ACL: НЕВІДПО�
 виконайте повний запуск SETUP з правами адміністратора.
 
 **ACL каталогів даних (LOGS, TEMP, State).** Корінь комплекту (runtime)
-доступний `Users` лише на читання й виконання (оператори можуть читати
-скрипти). Але `<RuntimeRoot>\LOGS` (журнали), `<RuntimeRoot>\TEMP` і
+за `RequireProtectedRuntime=true` доступний `Users` лише на читання й виконання (оператори можуть читати скрипти); за
+`RequireProtectedRuntime=false` hardening ACL кореня не виконується.
+Але `<RuntimeRoot>\LOGS` (журнали), `<RuntimeRoot>\TEMP` і
 `%ProgramData%\BRAVO\State` містять операційні деталі та lock-файли
 (`BRAVO_WINSCP.lock` відкривається з `FileShare.None`: читання його
 стороннім користувачем блокує всі SFTP-операції). Тому
@@ -2312,6 +2313,21 @@ ACE для `BUILTIN\Users`**. `BRAVO_TASKS_DIAGNOSE.ps1` друкує `[WARN]`, 
 LOGS/TEMP/State читаються `Users`, `Authenticated Users` або `Everyone`
 (код виходу не змінюється); виправлення — повторно запустити встановлення
 завдань з правами адміністратора.
+
+
+Захист від підкладеного посилання: до будь-якої зміни ACL інсталятор
+перевіряє каталог даних і його предки до `RuntimeRoot` (LOGS/TEMP) або
+`%ProgramData%` (State). Reparse point (junction/symlink) у цьому ланцюгу або
+власник, що не є SYSTEM/Administrators/обліковим записом завдань, — помилка
+з назвою шляху, встановлення переривається без зміни ACL (видаліть
+посилання або змініть власника від імені адміністратора й повторіть).
+Дочірні reparse point усередині каталогу даних пропускаються з `WARNING`
+(ACL не змінюється, вміст не обходиться). Якщо `RunAsUser` заданий, але SID
+не визначено, встановлення також переривається до зміни ACL. Файл, що зник
+під час проходу, теж перериває встановлення (fail-closed): на час
+перевстановлення завдання мають бути зупинені. Не охоплено цим hardening:
+запасний `%ProgramData%\BRAVO\TEMP` (Health/DataRestore) та ACL самого кореня
+комплекту.
 
 **`maintenanceSettings.Restore.ArchivesKeepCount`.** Значення має бути
 цілим числом не менше 1. `Remove-OldRestoreArchives` за значення менше 1

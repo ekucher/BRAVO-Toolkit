@@ -17,6 +17,21 @@
   `Remove-OldRestoreArchives` за `ArchivesKeepCount < 1` записує `ERROR` і
   пропускає retention (раніше `0` видаляв усі придатні сесії before/after).
   Потрібне приймання на реальному сервері (повторне встановлення завдань).
+  Повторне security-review (B7): `Set-BRAVOProtectedDataDirectoryAcl` більше
+  не слідує за попередньо підкладеним junction/symlink. До будь-якого
+  `Set-Acl` перевіряються каталог даних і всі його предки до `RuntimeRoot`
+  (LOGS/TEMP) або `%ProgramData%` (State): reparse point або власник не
+  SYSTEM/Administrators/обліковий запис завдань — `throw` (fail-closed,
+  встановлення переривається без зміни ACL); дочірні reparse point
+  пропускаються з `WARNING` (не обходяться). Якщо `RunAsUser` заданий, але
+  його SID не визначено, встановлення переривається до зміни ACL.
+  `BRAVO_TASKS_DIAGNOSE.ps1` також вважає широкими `INTERACTIVE` і
+  `Domain Users`, а TEMP виводить із `RuntimeRoot` так само, як інсталятор.
+  `Remove-OldRestoreArchives`: guard `KeepCount < 1` винесено перед першим
+  `Select-Object -First/-Skip`, тож від'ємне значення дає `ERROR`, а не
+  ParameterBinding exception. Статичні перевірки доповнено поведінковими
+  (точний набір SID зі stub `Set-Acl`, junction-корінь/дитина, власник,
+  DIAGNOSE на реальних ACL).
 
 - **Виправлено: вивід WinSCP маскується цілим (#461).**
   `Get-SanitizedWinSCPDiagnostic` (stdout/stderr WinSCP.com для SFTP-передачі,

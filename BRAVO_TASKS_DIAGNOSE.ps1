@@ -307,6 +307,7 @@ function Get-BRAVOUsersReadableDataDirectoryFinding {
         'S-1-5-32-545' = 'BUILTIN\Users'
         'S-1-5-11'     = 'Authenticated Users'
         'S-1-1-0'      = 'Everyone'
+        'S-1-5-4'      = 'INTERACTIVE'
     }
     try {
         $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
@@ -323,10 +324,18 @@ function Get-BRAVOUsersReadableDataDirectoryFinding {
         } catch {
             continue
         }
-        if ($broadReaderSids.ContainsKey($ruleSid) -and
+        # B7 / P3b: Domain Users (S-1-5-21-<домен>-513) теж широка група
+        # (узгоджено з Protect-BRAVOMachineStateRoot / BRAVO_SETUP).
+        $broadReaderName = $null
+        if ($broadReaderSids.ContainsKey($ruleSid)) {
+            $broadReaderName = $broadReaderSids[$ruleSid]
+        } elseif ($ruleSid -match '^S-1-5-21-\d+-\d+-\d+-513$') {
+            $broadReaderName = 'Domain Users'
+        }
+        if ($null -ne $broadReaderName -and
             (([int]$rule.FileSystemRights -band $readRights) -ne 0)) {
             return (
-                "доступний для читання групі $($broadReaderSids[$ruleSid]) " +
+                "доступний для читання групі $broadReaderName " +
                 "($($rule.FileSystemRights)); перевстановіть завдання " +
                 "(BRAVO_TASKS_INSTALL.ps1), щоб застосувати захищений ACL"
             )
@@ -467,7 +476,7 @@ try {
     # F6: лише попередження (WARN) — код виходу діагностики не змінюється.
     foreach ($dataDirectoryEntry in @(
             @{ Name = 'RuntimeLogRoot'; Path = [string]$global:runtimeLogRoot },
-            @{ Name = 'TEMP'; Path = (Join-Path $scriptRoot 'TEMP') },
+            @{ Name = 'TEMP'; Path = (Join-Path $(if (-not [string]::IsNullOrWhiteSpace([string]$global:runtimeRoot)) { [string]$global:runtimeRoot } else { $scriptRoot }) 'TEMP') },
             @{ Name = 'StateRoot'; Path = [string]$global:stateRoot }
         )) {
         $usersReadableFinding = Get-BRAVOUsersReadableDataDirectoryFinding -Path $dataDirectoryEntry.Path

@@ -152,6 +152,28 @@ function Set-BRAVOProtectedRuntimeAcl {
     ) -ForegroundColor Green
 }
 
+function Test-BRAVOPathIsReparsePoint {
+    # B7 / P1: junction/symlink/mount point у шляху даних. Відсутній шлях —
+    # не reparse point; інші помилки доступу не ковтаємо (fail-closed).
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $attributes = [System.IO.File]::GetAttributes($Path)
+    } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
+        return $false
+    }
+    return (([int]$attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Get-BRAVOPathOwnerSid {
+    # B7 / P1: SID власника каталогу (лише Owner-секція, без DACL).
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $directoryInfo = New-Object System.IO.DirectoryInfo($Path)
+    $security = $directoryInfo.GetAccessControl([Security.AccessControl.AccessControlSections]::Owner)
+    return [string]($security.GetOwner([Security.Principal.SecurityIdentifier])).Value
+}
+
 function Set-BRAVOProtectedDataDirectoryAcl {
     # F6 (security review): LOGS/TEMP/State лежать під RuntimeRoot (або
     # %ProgramData%\BRAVO), де успадкований/рекурсивний ACL надає
@@ -164,13 +186,24 @@ function Set-BRAVOProtectedDataDirectoryAcl {
     # функцією НЕ змінюється. Патерн повторює Set-BRAVOProtectedRuntimeAcl:
     # порожній security-descriptor замість Get-Acl (неканонічний DACL /
     # orphaned SID).
+    #
+    # B7 / P1 (захист від попередньо підкладеного junction): інсталятор
+    # працює elevated, а %ProgramData% і записуваний runtime дозволяють
+    # звичайному користувачеві створити каталог/junction. Тому ДО будь-якого
+    # Set-Acl: (1) жоден наявний компонент шляху від каталогу даних до
+    # BoundaryRoot включно не може бути reparse point; (2) власник кожного
+    # наявного компонента нижче BoundaryRoot — SYSTEM, Administrators або
+    # обліковий запис завдань (ModifySid), інакше throw (fail-closed);
+    # (3) під час рекурсії дочірні reparse point пропускаються (не
+    # заходимо всередину, Set-Acl не викликаємо) з WARNING. Файл, що зник
+    # під час проходу, перериває встановлення (fail-closed): на час
+    # перевстановлення завдання мають бути зупинені.
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [string[]]$ModifySid = @()
+        [string[]]$ModifySid = @(),
+        [string]$BoundaryRoot = ''
     )
 
-    [void][System.IO.Directory]::CreateDirectory($Path)
-    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
     $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
         [Security.AccessControl.InheritanceFlags]::ObjectInherit
     $propagation = [Security.AccessControl.PropagationFlags]::None
@@ -184,19 +217,69 @@ function Set-BRAVOProtectedDataDirectoryAcl {
             $_ -ne $system.Value -and $_ -ne $administrators.Value -and $_ -ne $users.Value
         } | Select-Object -Unique
     )
+    $trustedOwnerSids = @($administrators.Value, $system.Value) + @($modifySids)
 
-    $items = @($resolvedPath) + @(
-        Get-ChildItem -LiteralPath $resolvedPath -Force -Recurse -ErrorAction Stop |
-            ForEach-Object { $_.FullName }
-    )
-    foreach ($item in $items) {
-        $isDirectory = [System.IO.Directory]::Exists($item)
-        $itemInheritance = if ($isDirectory) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $boundaryPath = ''
+    if (-not [string]::IsNullOrWhiteSpace($BoundaryRoot)) {
+        $candidateBoundary = [System.IO.Path]::GetFullPath($BoundaryRoot).TrimEnd('\')
+        if ($fullPath.Equals($candidateBoundary, [StringComparison]::OrdinalIgnoreCase) -or
+            $fullPath.StartsWith($candidateBoundary + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            $boundaryPath = $candidateBoundary
+        }
+    }
+    # Ланцюг: каталог даних -> ... -> BoundaryRoot (включно).
+    $chain = New-Object 'System.Collections.Generic.List[string]'
+    $cursor = $fullPath
+    while ($true) {
+        $chain.Add($cursor)
+        if ($boundaryPath -eq '' -or $cursor.Equals($boundaryPath, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $parentPath = [System.IO.Path]::GetDirectoryName($cursor)
+        if ([string]::IsNullOrEmpty($parentPath)) { break }
+        $cursor = $parentPath
+    }
+
+    $assertChainSafe = {
+        param([bool]$CheckOwner)
+        foreach ($component in $chain) {
+            if (Test-BRAVOPathIsReparsePoint -Path $component) {
+                throw (
+                    "Небезпечний шлях даних: '$component' є reparse point (junction/symlink). " +
+                    "Встановлення перервано до зміни ACL (Set-Acl через посилання змінив би " +
+                    "сторонній каталог). Видаліть посилання від імені адміністратора й повторіть."
+                )
+            }
+            if (-not $CheckOwner) { continue }
+            if ($boundaryPath -ne '' -and $component.Equals($boundaryPath, [StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+            if (-not [System.IO.Directory]::Exists($component)) { continue }
+            $ownerSid = Get-BRAVOPathOwnerSid -Path $component
+            if ($trustedOwnerSids -notcontains $ownerSid) {
+                throw (
+                    "Небезпечний власник каталогу даних: '$component' належить $ownerSid, " +
+                    "очікується SYSTEM або Administrators. Каталог міг бути створений " +
+                    "стороннім користувачем; встановлення перервано до зміни ACL. " +
+                    "Перевірте вміст, змініть власника (takeown /A) або видаліть каталог."
+                )
+            }
+        }
+    }
+
+    & $assertChainSafe $false
+    [void][System.IO.Directory]::CreateDirectory($fullPath)
+    & $assertChainSafe $true
+
+    $applyProtectedAcl = {
+        param([string]$Item, [bool]$IsDirectory)
+        $itemInheritance = if ($IsDirectory) {
             $inheritance
         } else {
             [Security.AccessControl.InheritanceFlags]::None
         }
-        $acl = if ($isDirectory) {
+        $acl = if ($IsDirectory) {
             New-Object Security.AccessControl.DirectorySecurity
         } else {
             New-Object Security.AccessControl.FileSecurity
@@ -221,10 +304,36 @@ function Set-BRAVOProtectedDataDirectoryAcl {
                 $allow
             )))
         }
-        Set-Acl -LiteralPath $item -AclObject $acl -ErrorAction Stop
+        Set-Acl -LiteralPath $Item -AclObject $acl -ErrorAction Stop
     }
 
-    Write-Host "Каталог даних захищено ACL (без доступу для Users): $resolvedPath" -ForegroundColor Green
+    # Спершу захищається корінь (Users втрачають право створювати в ньому
+    # нові елементи/junction), лише потім перелічується вміст.
+    & $applyProtectedAcl $fullPath $true
+    $skippedReparsePoints = New-Object 'System.Collections.Generic.List[string]'
+    $pendingDirectories = New-Object 'System.Collections.Generic.Stack[string]'
+    $pendingDirectories.Push($fullPath)
+    while ($pendingDirectories.Count -gt 0) {
+        $currentDirectory = $pendingDirectories.Pop()
+        foreach ($child in @(Get-ChildItem -LiteralPath $currentDirectory -Force -ErrorAction Stop)) {
+            $childPath = [string]$child.FullName
+            if (Test-BRAVOPathIsReparsePoint -Path $childPath) {
+                $skippedReparsePoints.Add($childPath)
+                continue
+            }
+            $childIsDirectory = [bool]$child.PSIsContainer
+            & $applyProtectedAcl $childPath $childIsDirectory
+            if ($childIsDirectory) { $pendingDirectories.Push($childPath) }
+        }
+    }
+    if ($skippedReparsePoints.Count -gt 0) {
+        Write-Warning (
+            "У каталозі даних $fullPath пропущено reparse point (ACL не змінено, вміст не обходився): " +
+            ($skippedReparsePoints -join '; ')
+        )
+    }
+
+    Write-Host "Каталог даних захищено ACL (без доступу для Users): $fullPath" -ForegroundColor Green
 }
 
 function Enable-BRAVOTaskSchedulerOperationalLog {
@@ -985,6 +1094,20 @@ try {
         Write-BRAVOTasksInstallStep -Name 'Захист LOGS/TEMP/State ACL' -Status SKIPPED -Details 'лише перевірка'
         Write-BRAVOTasksInstallStep -Name 'Task Scheduler Operational log' -Status SKIPPED -Details 'лише перевірка'
     } else {
+        # B7 / P3a: обліковий запис завдань резолвиться ДО будь-якої зміни ACL;
+        # якщо RunAsUser заданий, але SID не визначено — throw (інакше ACE
+        # Modify мовчки пропустився б і завдання втратили б доступ до даних).
+        $dataDirectoryModifySids = @()
+        if (-not [string]::IsNullOrWhiteSpace([string]$schedulerSettings.RunAsUser)) {
+            $runAsSid = ConvertTo-BRAVOAccountSidValue -AccountName ([string]$schedulerSettings.RunAsUser)
+            if ([string]::IsNullOrWhiteSpace([string]$runAsSid)) {
+                throw (
+                    "Не вдалося визначити SID облікового запису завдань '$($schedulerSettings.RunAsUser)'; " +
+                    "ACL LOGS/TEMP/State не змінено. Перевірте RunAsUser у BRAVO.config."
+                )
+            }
+            $dataDirectoryModifySids += [string]$runAsSid
+        }
         if ($requireProtectedRuntime) {
             Set-BRAVOProtectedRuntimeAcl -RuntimeRoot $runtimeRoot
             Write-BRAVOTasksInstallStep -Name 'Захист runtime ACL' -Status OK
@@ -996,19 +1119,19 @@ try {
         # елементам). Не залежить від RequireProtectedRuntime: журнали й
         # lock-файли не мають читатися звичайними користувачами в жодному
         # режимі. Обліковий запис завдань (не SYSTEM) отримує Modify.
-        $dataDirectoryModifySids = @()
-        if (-not [string]::IsNullOrWhiteSpace([string]$schedulerSettings.RunAsUser)) {
-            $runAsSid = ConvertTo-BRAVOAccountSidValue -AccountName ([string]$schedulerSettings.RunAsUser)
-            if (-not [string]::IsNullOrWhiteSpace([string]$runAsSid)) {
-                $dataDirectoryModifySids += [string]$runAsSid
-            }
-        }
         foreach ($protectedDataDirectory in @(
                 [string]$global:runtimeLogRoot,
                 (Join-Path $runtimeRoot 'TEMP'),
                 [string]$global:stateRoot
             )) {
-            Set-BRAVOProtectedDataDirectoryAcl -Path $protectedDataDirectory -ModifySid $dataDirectoryModifySids
+            # BoundaryRoot: перевірка reparse point/власника йде від каталогу
+            # даних вгору до RuntimeRoot (LOGS/TEMP) або %ProgramData% (State).
+            $dataDirectoryBoundary = if (
+                ([System.IO.Path]::GetFullPath($protectedDataDirectory).TrimEnd('\') + '\').StartsWith(
+                    ([System.IO.Path]::GetFullPath($runtimeRoot).TrimEnd('\') + '\'),
+                    [StringComparison]::OrdinalIgnoreCase)
+            ) { $runtimeRoot } else { [Environment]::GetFolderPath('CommonApplicationData') }
+            Set-BRAVOProtectedDataDirectoryAcl -Path $protectedDataDirectory -ModifySid $dataDirectoryModifySids -BoundaryRoot $dataDirectoryBoundary
         }
         Write-BRAVOTasksInstallStep -Name 'Захист LOGS/TEMP/State ACL' -Status OK
         Enable-BRAVOTaskSchedulerOperationalLog

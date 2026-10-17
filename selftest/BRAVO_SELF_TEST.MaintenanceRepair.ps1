@@ -1440,17 +1440,229 @@ try {
     $b7RuntimeAcl = & $b7ParseFunction $b7InstallText 'Set-BRAVOProtectedRuntimeAcl'
     $b7DataAclText = if ($null -ne $b7DataAcl) { $b7DataAcl.Extent.Text } else { '' }
     $b7RuntimeAclText = if ($null -ne $b7RuntimeAcl) { $b7RuntimeAcl.Extent.Text } else { '' }
+    # Статична перевірка лишається лише як доповнення до поведінкових нижче:
+    # функція існує, не користується Get-Acl і не видає ReadAndExecute.
+    # (B7: текст CreateDirectory($Path) змінено на $fullPath — пін оновлено.)
     Test-BRAVOCondition -Condition (
         $null -ne $b7DataAcl -and
         $b7DataAclText.Contains('SetAccessRuleProtection($true, $false)') -and
-        $b7DataAclText.Contains('[System.IO.Directory]::CreateDirectory($Path)') -and
-        $b7DataAclText.Contains('FileSystemRights]::FullControl') -and
+        $b7DataAclText.Contains('[System.IO.Directory]::CreateDirectory($fullPath)') -and
         -not $b7DataAclText.Contains('ReadAndExecute') -and
         -not $b7DataAclText.Contains('Get-Acl')
     ) -Name 'Scheduler/DataDirectoryAclIsProtectedWithoutUsersAce' `
-        -Failure 'Set-BRAVOProtectedDataDirectoryAcl має створювати каталог, вимикати успадкування й видавати лише FullControl/Modify (без ReadAndExecute/Users ACE, без Get-Acl)'
+        -Failure 'Set-BRAVOProtectedDataDirectoryAcl має створювати каталог, вимикати успадкування й не містити ReadAndExecute/Get-Acl (поведінку див. DataDirectoryAclExactSidSetBehavioural)'
+    & {
+        # B7 / P1+P2 (повторний security-review): поведінкові перевірки замість
+        # текстових. Функції витягуються через AST у ЧИСТИЙ scope, Set-Acl
+        # підміняється записувачем (SetOwner/реальний Set-Acl вимагають
+        # elevated-токена, self-test його не гарантує), а Test-BRAVOPathIsReparsePoint
+        # і Get-BRAVOPathOwnerSid — реальні (junction створюється через mklink /J).
+        $b7InstallFunctionText = (@(
+                'Test-BRAVOPathIsReparsePoint', 'Get-BRAVOPathOwnerSid', 'Set-BRAVOProtectedDataDirectoryAcl'
+            ) | ForEach-Object {
+                $b7FunctionAst = & $b7ParseFunction $b7InstallText $_
+                if ($null -ne $b7FunctionAst) { $b7FunctionAst.Extent.Text } else { '' }
+            }) -join "`n`n"
+        $b7Probe = {
+            param(
+                [string]$FunctionText, [string]$Path, [string[]]$ModifySid, [string]$Boundary,
+                [string]$OwnerSid, [string[]]$StubReparsePaths
+            )
+            $recordedCalls = New-Object System.Collections.ArrayList
+            $recordedWarnings = New-Object System.Collections.ArrayList
+            . ([scriptblock]::Create($FunctionText))
+            function Set-Acl {
+                param($LiteralPath, $AclObject, $ErrorAction)
+                [void]$recordedCalls.Add([pscustomobject]@{ Path = [string]$LiteralPath; Acl = $AclObject })
+            }
+            function Write-Warning { param($Message) [void]$recordedWarnings.Add([string]$Message) }
+            function Write-Host { param($Object, $ForegroundColor) }
+            if (-not [string]::IsNullOrWhiteSpace($OwnerSid)) {
+                function Get-BRAVOPathOwnerSid { param([string]$Path) return $OwnerSid }
+            }
+            if (@($StubReparsePaths | Where-Object { $_ }).Count -gt 0) {
+                function Test-BRAVOPathIsReparsePoint {
+                    param([string]$Path)
+                    return (@($StubReparsePaths) -contains $Path.TrimEnd('\'))
+                }
+            }
+            $errorMessage = $null
+            try {
+                $null = Set-BRAVOProtectedDataDirectoryAcl -Path $Path -ModifySid $ModifySid -BoundaryRoot $Boundary
+            } catch {
+                $errorMessage = $_.Exception.Message
+            }
+            return [pscustomobject]@{
+                Calls = @($recordedCalls)
+                Warnings = @($recordedWarnings)
+                Error = $errorMessage
+            }
+        }
+        $b7Scratch = Join-Path ([IO.Path]::GetTempPath()) ('bravo-b7-' + [guid]::NewGuid().ToString('N'))
+        $b7ScratchJunctions = New-Object System.Collections.ArrayList
+        try {
+            [void][IO.Directory]::CreateDirectory($b7Scratch)
+            $b7ModifySid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+            $b7NewJunction = {
+                param([string]$LinkPath, [string]$TargetPath)
+                & cmd.exe /c mklink /J "$LinkPath" "$TargetPath" 2>&1 | Out-Null
+                $created = [IO.Directory]::Exists($LinkPath) -and
+                    (([int][IO.File]::GetAttributes($LinkPath) -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)
+                if ($created) { [void]$b7ScratchJunctions.Add($LinkPath) }
+                return $created
+            }
+
+            # 1) Точний набір SID/прав/успадкування для кореня, файлу й підкаталогу.
+            $b7Data = Join-Path $b7Scratch 'data'
+            [void][IO.Directory]::CreateDirectory((Join-Path $b7Data 'sub'))
+            [IO.File]::WriteAllText((Join-Path $b7Data 'f.txt'), 'x')
+            [IO.File]::WriteAllText((Join-Path $b7Data 'sub\g.txt'), 'x')
+            $b7Result = & $b7Probe $b7InstallFunctionText $b7Data @($b7ModifySid) $b7Scratch 'S-1-5-32-544' @()
+            $b7ExpectedPaths = @($b7Data, (Join-Path $b7Data 'f.txt'), (Join-Path $b7Data 'sub'), (Join-Path $b7Data 'sub\g.txt'))
+            $b7Problems = New-Object System.Collections.ArrayList
+            if ($null -ne $b7Result.Error) { [void]$b7Problems.Add("помилка: $($b7Result.Error)") }
+            $b7RecordedPaths = @($b7Result.Calls | ForEach-Object { $_.Path })
+            if ((@($b7RecordedPaths | Sort-Object) -join '|') -ne (@($b7ExpectedPaths | Sort-Object) -join '|')) {
+                [void]$b7Problems.Add("набір шляхів Set-Acl: $($b7RecordedPaths -join ', ')")
+            }
+            $b7Sid = [Security.Principal.SecurityIdentifier]
+            foreach ($b7Call in @($b7Result.Calls)) {
+                $b7IsDirectory = [IO.Directory]::Exists($b7Call.Path)
+                $b7Acl = $b7Call.Acl
+                if (-not $b7Acl.AreAccessRulesProtected) { [void]$b7Problems.Add("$($b7Call.Path): успадкування не вимкнено") }
+                if ([string]$b7Acl.GetOwner($b7Sid).Value -ne 'S-1-5-32-544') { [void]$b7Problems.Add("$($b7Call.Path): власник не Administrators") }
+                $b7Rules = @($b7Acl.GetAccessRules($true, $false, $b7Sid))
+                $b7SidSet = (@($b7Rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique) -join '|')
+                $b7ExpectedSidSet = (@('S-1-5-32-544', 'S-1-5-18', $b7ModifySid) | Sort-Object) -join '|'
+                if ($b7SidSet -ne $b7ExpectedSidSet) { [void]$b7Problems.Add("$($b7Call.Path): набір SID '$b7SidSet'") }
+                $b7ExpectedInheritance = if ($b7IsDirectory) {
+                    [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+                } else { [Security.AccessControl.InheritanceFlags]::None }
+                foreach ($b7Rule in $b7Rules) {
+                    $b7RuleSid = $b7Rule.IdentityReference.Value
+                    $b7ExpectedRights = if ($b7RuleSid -eq $b7ModifySid) { [Security.AccessControl.FileSystemRights]::Modify } else { [Security.AccessControl.FileSystemRights]::FullControl }
+                    if ($b7Rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { [void]$b7Problems.Add("$($b7Call.Path): не Allow для $b7RuleSid") }
+                    if (([int]$b7Rule.FileSystemRights -band (-bnot [int][Security.AccessControl.FileSystemRights]::Synchronize)) -ne ([int]$b7ExpectedRights -band (-bnot [int][Security.AccessControl.FileSystemRights]::Synchronize))) { [void]$b7Problems.Add("$($b7Call.Path): права $b7RuleSid = $($b7Rule.FileSystemRights)") }
+                    if ($b7Rule.InheritanceFlags -ne $b7ExpectedInheritance) { [void]$b7Problems.Add("$($b7Call.Path): InheritanceFlags $b7RuleSid = $($b7Rule.InheritanceFlags)") }
+                    if ($b7Rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) { [void]$b7Problems.Add("$($b7Call.Path): PropagationFlags $b7RuleSid") }
+                }
+                foreach ($b7BroadSid in @('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0', 'S-1-5-4')) {
+                    if ($b7SidSet.Contains($b7BroadSid)) { [void]$b7Problems.Add("$($b7Call.Path): широкий принципал $b7BroadSid") }
+                }
+            }
+            Test-BRAVOCondition -Condition ($b7Problems.Count -eq 0 -and $b7Result.Calls.Count -eq 4) `
+                -Name 'Scheduler/DataDirectoryAclExactSidSetBehavioural' `
+                -Failure ("Set-BRAVOProtectedDataDirectoryAcl: DACL має бути protected, SID == {Administrators, SYSTEM, ModifySid} (FullControl/FullControl/Modify), без Users/Authenticated Users/Everyone/INTERACTIVE, правильні прапори успадкування для каталогів і файлів: " + ($b7Problems -join '; '))
+
+            # 2) Власник не SYSTEM/Administrators -> throw до будь-якого Set-Acl.
+            $b7OwnerData = Join-Path $b7Scratch 'owner-data'
+            $b7OwnerResult = & $b7Probe $b7InstallFunctionText $b7OwnerData @() $b7Scratch 'S-1-5-21-9-9-9-1001' @()
+            Test-BRAVOCondition -Condition (
+                $b7OwnerResult.Calls.Count -eq 0 -and $null -ne $b7OwnerResult.Error -and
+                $b7OwnerResult.Error.Contains('власник') -and $b7OwnerResult.Error.Contains($b7OwnerData)
+            ) -Name 'Scheduler/DataDirectoryAclRefusesUntrustedOwner' `
+                -Failure 'каталог даних із власником не SYSTEM/Administrators має призвести до throw (з назвою шляху) ДО будь-якого Set-Acl'
+
+            # 3) Junction як корінь/предок каталогу даних -> throw, ціль не чіпається.
+            $b7JunctionTarget = Join-Path $b7Scratch 'victim'
+            [void][IO.Directory]::CreateDirectory($b7JunctionTarget)
+            [IO.File]::WriteAllText((Join-Path $b7JunctionTarget 'secret.txt'), 'x')
+            $b7JunctionRoot = Join-Path $b7Scratch 'junction-root'
+            $b7JunctionCreated = & $b7NewJunction $b7JunctionRoot $b7JunctionTarget
+            $b7RootStubs = if ($b7JunctionCreated) { @() } else { @($b7JunctionRoot) }
+            if (-not $b7JunctionCreated) {
+                # mklink /J недоступний у середовищі: перевіряємо власну логіку
+                # функції з підміненим предикатом reparse point.
+                [void][IO.Directory]::CreateDirectory($b7JunctionRoot)
+            }
+            $b7RootResult = & $b7Probe $b7InstallFunctionText $b7JunctionRoot @() $b7Scratch 'S-1-5-32-544' $b7RootStubs
+            $b7ChildOfJunctionResult = & $b7Probe $b7InstallFunctionText (Join-Path $b7JunctionRoot 'State') @() $b7Scratch 'S-1-5-32-544' $b7RootStubs
+            Test-BRAVOCondition -Condition (
+                $b7RootResult.Calls.Count -eq 0 -and $null -ne $b7RootResult.Error -and $b7RootResult.Error.Contains('reparse point') -and
+                $b7ChildOfJunctionResult.Calls.Count -eq 0 -and $null -ne $b7ChildOfJunctionResult.Error -and $b7ChildOfJunctionResult.Error.Contains('reparse point') -and
+                -not [IO.Directory]::Exists((Join-Path $b7JunctionTarget 'State')) -and
+                -not $b7RootResult.Error.Contains('Небезпечний власник')
+            ) -Name 'Scheduler/DataDirectoryAclRefusesJunctionRoot' `
+                -Failure ("junction як каталог даних (або його предок) має призвести до throw ДО Set-Acl і без створення каталогів у цілі (junction справжній: $b7JunctionCreated): " + [string]$b7RootResult.Error)
+
+            # 4) Junction-дитина пропускається з WARNING; її ціль не обходиться.
+            $b7ChildData = Join-Path $b7Scratch 'child-data'
+            [void][IO.Directory]::CreateDirectory($b7ChildData)
+            [IO.File]::WriteAllText((Join-Path $b7ChildData 'real.txt'), 'x')
+            $b7ChildLink = Join-Path $b7ChildData 'link'
+            $b7ChildCreated = & $b7NewJunction $b7ChildLink $b7JunctionTarget
+            $b7ChildStubs = @()
+            if (-not $b7ChildCreated) {
+                [void][IO.Directory]::CreateDirectory($b7ChildLink)
+                $b7ChildStubs = @($b7ChildLink)
+            }
+            $b7ChildResult = & $b7Probe $b7InstallFunctionText $b7ChildData @() $b7Scratch 'S-1-5-32-544' $b7ChildStubs
+            $b7ChildPaths = @($b7ChildResult.Calls | ForEach-Object { $_.Path })
+            Test-BRAVOCondition -Condition (
+                $null -eq $b7ChildResult.Error -and
+                ($b7ChildPaths -contains $b7ChildData) -and ($b7ChildPaths -contains (Join-Path $b7ChildData 'real.txt')) -and
+                -not ($b7ChildPaths -contains $b7ChildLink) -and
+                -not (@($b7ChildPaths | Where-Object { $_.StartsWith($b7JunctionTarget, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) -and
+                (@($b7ChildResult.Warnings | Where-Object { $_.Contains($b7ChildLink) }).Count -eq 1)
+            ) -Name 'Scheduler/DataDirectoryAclSkipsJunctionChild' `
+                -Failure ("дочірній reparse point не повинен отримувати Set-Acl, ціль не обходиться, WARNING називає посилання (junction справжній: $b7ChildCreated): " + (($b7ChildPaths + $b7ChildResult.Warnings + [string]$b7ChildResult.Error) -join ' | '))
+
+            # 5) Предикат reparse point на справжньому junction/звичайному/відсутньому шляху.
+            if ($b7JunctionCreated) {
+                . ([scriptblock]::Create((& $b7ParseFunction $b7InstallText 'Test-BRAVOPathIsReparsePoint').Extent.Text))
+                Test-BRAVOCondition -Condition (
+                    (Test-BRAVOPathIsReparsePoint -Path $b7JunctionRoot) -and
+                    -not (Test-BRAVOPathIsReparsePoint -Path $b7Data) -and
+                    -not (Test-BRAVOPathIsReparsePoint -Path (Join-Path $b7Scratch 'missing'))
+                ) -Name 'Scheduler/ReparsePointPredicateDetectsJunction' `
+                    -Failure 'Test-BRAVOPathIsReparsePoint: junction -> true; звичайний і відсутній шлях -> false'
+            }
+
+            # 6) DIAGNOSE: Get-BRAVOUsersReadableDataDirectoryFinding на реальних ACL.
+            . ([scriptblock]::Create((& $b7ParseFunction $b7DiagnoseText 'Get-BRAVOUsersReadableDataDirectoryFinding').Extent.Text))
+            $b7CurrentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $b7MakeDirectory = {
+                param([string]$Name, [string[]]$ExtraReaderSids)
+                $directory = Join-Path $b7Scratch $Name
+                [void][IO.Directory]::CreateDirectory($directory)
+                $security = New-Object Security.AccessControl.DirectorySecurity
+                $security.SetAccessRuleProtection($true, $false)
+                foreach ($sidText in @('S-1-5-32-544', 'S-1-5-18', $b7CurrentSid.Value) + @($ExtraReaderSids)) {
+                    $rights = if (@($ExtraReaderSids) -contains $sidText) { 'ReadAndExecute' } else { 'FullControl' }
+                    $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                        (New-Object Security.Principal.SecurityIdentifier($sidText)), $rights, 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                }
+                Set-Acl -LiteralPath $directory -AclObject $security
+                return $directory
+            }
+            $b7CleanDirectory = & $b7MakeDirectory 'diag-clean' @()
+            $b7CleanFinding = Get-BRAVOUsersReadableDataDirectoryFinding -Path $b7CleanDirectory
+            Test-BRAVOCondition -Condition ($null -eq $b7CleanFinding) `
+                -Name 'Scheduler/DiagnoseNoFindingForProtectedDirectory' `
+                -Failure ("каталог лише з SYSTEM/Administrators/поточним користувачем не повинен давати знахідку: $b7CleanFinding")
+            $b7BroadProblems = New-Object System.Collections.ArrayList
+            foreach ($b7BroadSid in @('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0', 'S-1-5-4', 'S-1-5-21-1111111111-2222222222-3333333333-513')) {
+                $b7BroadDirectory = & $b7MakeDirectory ('diag-' + $b7BroadSid.Replace('S-1-', '')) @($b7BroadSid)
+                if ($null -eq (Get-BRAVOUsersReadableDataDirectoryFinding -Path $b7BroadDirectory)) {
+                    [void]$b7BroadProblems.Add($b7BroadSid)
+                }
+            }
+            Test-BRAVOCondition -Condition ($b7BroadProblems.Count -eq 0) `
+                -Name 'Scheduler/DiagnoseFlagsBroadReaderAce' `
+                -Failure ("явний ACE для Users/Authenticated Users/Everyone/INTERACTIVE/Domain Users має давати знахідку; пропущено: " + ($b7BroadProblems -join ', '))
+        } finally {
+            foreach ($b7Junction in @($b7ScratchJunctions)) {
+                if ([IO.Directory]::Exists($b7Junction)) { & cmd.exe /c rmdir "$b7Junction" 2>&1 | Out-Null }
+            }
+            if ([IO.Directory]::Exists($b7Scratch)) {
+                Remove-Item -LiteralPath $b7Scratch -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
     Test-BRAVOCondition -Condition (
-        $b7InstallText -match '(?s)Set-BRAVOProtectedRuntimeAcl -RuntimeRoot \$runtimeRoot.*?runtimeLogRoot.*?Join-Path \$runtimeRoot ''TEMP''.*?\$global:stateRoot.*?Set-BRAVOProtectedDataDirectoryAcl -Path \$protectedDataDirectory'
+        $b7InstallText -match '(?s)Set-BRAVOProtectedRuntimeAcl -RuntimeRoot \$runtimeRoot.*?runtimeLogRoot.*?Join-Path \$runtimeRoot ''TEMP''.*?\$global:stateRoot.*?Set-BRAVOProtectedDataDirectoryAcl -Path \$protectedDataDirectory' -and
+        $b7InstallText.IndexOf('Не вдалося визначити SID облікового запису завдань', [StringComparison]::Ordinal) -gt 0 -and
+        $b7InstallText.IndexOf('Не вдалося визначити SID облікового запису завдань', [StringComparison]::Ordinal) -lt $b7InstallText.IndexOf('Set-BRAVOProtectedRuntimeAcl -RuntimeRoot $runtimeRoot', [StringComparison]::Ordinal)
     ) -Name 'Scheduler/InstallerAppliesProtectedAclToLogsTempState' `
         -Failure 'інсталятор має застосувати Set-BRAVOProtectedDataDirectoryAcl до LOGS, TEMP і State ПІСЛЯ Set-BRAVOProtectedRuntimeAcl'
     Test-BRAVOCondition -Condition (
@@ -1464,7 +1676,7 @@ try {
         $null -ne $b7DiagnoseFinding -and
         $b7DiagnoseFindingText.Contains("'S-1-5-32-545'") -and
         $b7DiagnoseFindingText.Contains('ReadData') -and
-        $b7DiagnoseText -match '(?s)runtimeLogRoot.*?Join-Path \$scriptRoot ''TEMP''.*?\$global:stateRoot.*?Get-BRAVOUsersReadableDataDirectoryFinding -Path' -and
+        $b7DiagnoseText -match '(?s)runtimeLogRoot.*?Join-Path \$\(if \(-not \[string\]::IsNullOrWhiteSpace\(\[string\]\$global:runtimeRoot\)\) \{ \[string\]\$global:runtimeRoot \} else \{ \$scriptRoot \}\) ''TEMP''.*?\$global:stateRoot.*?Get-BRAVOUsersReadableDataDirectoryFinding -Path' -and
         $b7DiagnoseText.Contains('[WARN] $($dataDirectoryEntry.Name)')
     ) -Name 'Scheduler/DiagnoseReportsUsersReadableLogsTempState' `
         -Failure 'BRAVO_TASKS_DIAGNOSE.ps1 має попереджати (WARN, без зміни коду виходу), коли LOGS/TEMP/State читаються BUILTIN\Users'
