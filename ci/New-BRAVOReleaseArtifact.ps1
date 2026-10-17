@@ -167,7 +167,9 @@ try {
     & .\ci\Update-BRAVOToolsManifest.ps1
     if ($LASTEXITCODE -ne 0) { throw "TOOLS_MANIFEST.json не відповідає комплекту в артефакті (код $LASTEXITCODE)." }
 
-    & .\ci\Update-BRAVORuntimeManifest.ps1
+    # Staging — не git-робоче дерево (каталог у .gitignore або поза репозиторієм),
+    # а кінці рядків у ньому вже канонічні з git archive, тож EOL-перевірку пропускаємо.
+    & .\ci\Update-BRAVORuntimeManifest.ps1 -SkipEolCheck
     if ($LASTEXITCODE -ne 0) { throw "RUNTIME_MANIFEST.json не відповідає комплекту в артефакті (код $LASTEXITCODE)." }
 
     & .\BRAVO_RUNTIME_GUARD.ps1
