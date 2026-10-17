@@ -435,7 +435,8 @@ function Set-BRAVOProtectedDataDirectoryAcl {
         # Фаза 2: ACE для ModifySid.
         if ($modifySids.Count -gt 0) {
             $phase = 2
-            for ($phaseTwoIndex = 0; $phaseTwoIndex -lt $processedItems.Count; $phaseTwoIndex++) {
+            # Зворотний порядок: поки елемент отримує ACE, його батько ще позбавлений AddSubdirectory/DELETE для облікового запису завдань (елемент не перейменувати/підмінити); корінь (Write) - останнім.
+            for ($phaseTwoIndex = $processedItems.Count - 1; $phaseTwoIndex -ge 0; $phaseTwoIndex--) {
                 $processed = $processedItems[$phaseTwoIndex]
                 $currentItem = [string]$processed.Path
                 $changed = & $findChangedComponent $processed.Path
@@ -450,7 +451,7 @@ function Set-BRAVOProtectedDataDirectoryAcl {
         $failureMessage = $_.Exception.Message
         if ($phase -eq 2) {
             $leftItems = @()
-            for ($leftIndex = $phaseTwoIndex; $leftIndex -lt $processedItems.Count; $leftIndex++) {
+            for ($leftIndex = $phaseTwoIndex; $leftIndex -ge 0; $leftIndex--) {
                 $leftItems += [string]$processedItems[$leftIndex].Path
             }
             $leftItems = @($leftItems) + @($unprocessedDirectories)

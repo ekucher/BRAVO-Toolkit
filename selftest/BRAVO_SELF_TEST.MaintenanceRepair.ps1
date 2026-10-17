@@ -1546,6 +1546,24 @@ try {
                     [void]$b7OrderProblems.Add("$($b7PathGroup.Name): викликів $($b7GroupCalls.Count), перший з ModifySid: $b7FirstHasModify")
                 }
             }
+            # Безпека порядку фази 2: поки елемент отримує ACE, його батько ще має бути
+            # позбавлений AddSubdirectory/DELETE для ModifySid, тому нащадки (глибші шляхи)
+            # отримують ACE ДО предків, а корінь - останній Set-Acl взагалі.
+            $b7PhaseTwoDone = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $b7PhaseTwoCalls = @($b7Result.Calls | Where-Object {
+                    @($_.Acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) |
+                        Where-Object { $_.IdentityReference.Value -eq $b7ModifySid }).Count -gt 0 })
+            foreach ($b7PhaseTwoCall in $b7PhaseTwoCalls) {
+                foreach ($b7Descendant in @($b7ExpectedPaths | Where-Object { $_.StartsWith($b7PhaseTwoCall.Path + '\', [StringComparison]::OrdinalIgnoreCase) })) {
+                    if (-not $b7PhaseTwoDone.Contains($b7Descendant)) {
+                        [void]$b7OrderProblems.Add("фаза 2: $($b7PhaseTwoCall.Path) отримав ACE раніше за нащадка $b7Descendant")
+                    }
+                }
+                [void]$b7PhaseTwoDone.Add($b7PhaseTwoCall.Path)
+            }
+            if (@($b7Result.Calls).Count -eq 0 -or @($b7Result.Calls)[-1].Path -ne $b7Data) {
+                [void]$b7OrderProblems.Add("останній Set-Acl має бути фазою 2 кореня, а не: $(@($b7Result.Calls)[-1].Path)")
+            }
             Test-BRAVOCondition -Condition ($b7OrderProblems.Count -eq 0 -and $b7SeenModifyCall) `
                 -Name 'Scheduler/DataDirectoryAclTwoPhaseOrdering' `
                 -Failure ("перший Set-Acl кожного елемента має бути без ModifySid (фаза 1), ACE ModifySid - лише в пізніших викликах (фаза 2): " + ($b7OrderProblems -join '; '))
@@ -1750,6 +1768,87 @@ try {
             ) -Name 'Scheduler/DataDirectoryAclMidWalkComponentSwapIsRefused' `
                 -Failure ("підміна проміжного компонента root\sub посеред обходу: жоден Set-Acl не має зачепити VICTIM, ModifySid ACE не додається після підміни, WARNING називає компонент (junction справжній: $($b7SwapResult.Junction), підмінено: $($b7SwapResult.Swapped)): " + (($b7SwapPaths + $b7SwapResult.Warnings + [string]$b7SwapResult.Error) -join ' | '))
 
+            # 4b) P2 (четвертий security-review): підміна ПЕРЕД записом фази 2 для root\sub\deep.
+            # Режим 'attacker': хук моделює обліковий запис завдань - перейменовує root\sub й
+            # ставить junction -> VICTIM одразу перед Set-Acl для deep, але ЛИШЕ якщо sub уже
+            # отримав ACE ModifySid (до того в нього немає DELETE/AddSubdirectory і підміна
+            # неможлива). Зворотний порядок фази 2 не дає такої можливості: підміни немає.
+            # Режим 'elevated': хук (elevated) підміняє sub одразу після першого Set-Acl фази 2 -
+            # повторна перевірка компонентів має відмовити у всіх наступних елементах під sub.
+            $b7Swap2Problems = New-Object System.Collections.ArrayList
+            $b7Swap2Details = New-Object System.Collections.ArrayList
+            $b7Swap2Probe = {
+                param([string]$FunctionText, [string]$Path, [string[]]$ModifySid, [string]$Boundary,
+                    [string]$SwapSub, [string]$SwapDeep, [string]$Victim, [string]$Mode)
+                $recordedCalls = New-Object System.Collections.ArrayList
+                $recordedWarnings = New-Object System.Collections.ArrayList
+                $swapState = @{ Done = $false; Junction = $false }
+                $swapNow = {
+                    $swapState.Done = $true
+                    [IO.Directory]::Move($SwapSub, $SwapSub + '.moved')
+                    & cmd.exe /c mklink /J "$SwapSub" "$Victim" 2>&1 | Out-Null
+                    $swapState.Junction = [IO.Directory]::Exists($SwapSub) -and
+                        (([int][IO.File]::GetAttributes($SwapSub) -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)
+                    if (-not $swapState.Junction) { [IO.Directory]::CreateDirectory($SwapSub) | Out-Null }
+                }
+                . ([scriptblock]::Create($FunctionText))
+                function Set-Acl {
+                    param($LiteralPath, $AclObject, $ErrorAction)
+                    $hasModify = @($AclObject.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) |
+                            Where-Object { $_.IdentityReference.Value -eq $ModifySid[0] }).Count -gt 0
+                    $trigger = $false
+                    if (-not $swapState.Done -and $hasModify) {
+                        if ($Mode -eq 'attacker') {
+                            $trigger = ([string]$LiteralPath -eq $SwapDeep) -and
+                                (@($recordedCalls | Where-Object { $_.Path -eq $SwapSub -and $_.HasModify }).Count -gt 0)
+                        } else { $trigger = $true }
+                    }
+                    if ($trigger -and $Mode -eq 'attacker') { & $swapNow }
+                    [void]$recordedCalls.Add([pscustomobject]@{ Path = [string]$LiteralPath; Acl = $AclObject; AfterSwap = $swapState.Done; HasModify = $hasModify })
+                    if ($trigger -and $Mode -ne 'attacker') { & $swapNow }
+                }
+                function Write-Warning { param($Message) [void]$recordedWarnings.Add([string]$Message) }
+                function Write-Host { param($Object, $ForegroundColor) }
+                function Get-BRAVOPathOwnerSid { param([string]$Path) return 'S-1-5-32-544' }
+                $realPredicate = ${function:Test-BRAVOPathIsReparsePoint}
+                function Test-BRAVOPathIsReparsePoint {
+                    param([string]$Path)
+                    if ($swapState.Done -and -not $swapState.Junction -and $Path.TrimEnd('\') -eq $SwapSub) { return $true }
+                    return (& $realPredicate -Path $Path)
+                }
+                $errorMessage = $null
+                try { $null = Set-BRAVOProtectedDataDirectoryAcl -Path $Path -ModifySid $ModifySid -BoundaryRoot $Boundary }
+                catch { $errorMessage = $_.Exception.Message }
+                return [pscustomobject]@{ Calls = @($recordedCalls); Warnings = @($recordedWarnings); Error = $errorMessage; Junction = $swapState.Junction; Swapped = $swapState.Done }
+            }
+            foreach ($b7Swap2Mode in @('attacker', 'elevated')) {
+                $b7Swap2Victim = Join-Path $b7Scratch "swap2-victim-$b7Swap2Mode"
+                [void][IO.Directory]::CreateDirectory((Join-Path $b7Swap2Victim 'deep'))
+                [IO.File]::WriteAllText((Join-Path $b7Swap2Victim 'deep\victim.txt'), 'victim')
+                $b7Swap2Root = Join-Path $b7Scratch "swap2-data-$b7Swap2Mode"
+                [void][IO.Directory]::CreateDirectory((Join-Path $b7Swap2Root 'sub\deep'))
+                [IO.File]::WriteAllText((Join-Path $b7Swap2Root 'sub\deep\inner.txt'), 'x')
+                $b7Swap2Sub = Join-Path $b7Swap2Root 'sub'
+                $b7Swap2Deep = Join-Path $b7Swap2Sub 'deep'
+                $b7Swap2Result = & $b7Swap2Probe $b7InstallFunctionText $b7Swap2Root @($b7ModifySid) $b7Scratch $b7Swap2Sub $b7Swap2Deep $b7Swap2Victim $b7Swap2Mode
+                if ($b7Swap2Result.Junction) { [void]$b7ScratchJunctions.Add($b7Swap2Sub) }
+                $b7Swap2Paths = @($b7Swap2Result.Calls | ForEach-Object { $_.Path })
+                $b7Swap2SubAfter = @($b7Swap2Result.Calls | Where-Object {
+                        $_.AfterSwap -and ($_.Path -eq $b7Swap2Sub -or $_.Path.StartsWith($b7Swap2Sub + '\', [StringComparison]::OrdinalIgnoreCase)) })
+                if ($null -ne $b7Swap2Result.Error) { [void]$b7Swap2Problems.Add("${b7Swap2Mode}: помилка $($b7Swap2Result.Error)") }
+                if (@($b7Swap2Paths | Where-Object { $_.StartsWith($b7Swap2Victim, [StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) { [void]$b7Swap2Problems.Add("${b7Swap2Mode}: Set-Acl зачепив VICTIM") }
+                if ($b7Swap2SubAfter.Count -ne 0) { [void]$b7Swap2Problems.Add("${b7Swap2Mode}: Set-Acl по підміненому sub: $(@($b7Swap2SubAfter | ForEach-Object { $_.Path }) -join ', ')") }
+                if (@(Get-ChildItem -LiteralPath $b7Swap2Victim -Recurse -Force | ForEach-Object { $_.FullName }).Count -ne 2 -or
+                    [IO.File]::ReadAllText((Join-Path $b7Swap2Victim 'deep\victim.txt')) -ne 'victim') { [void]$b7Swap2Problems.Add("${b7Swap2Mode}: VICTIM змінено") }
+                if ($b7Swap2Mode -eq 'attacker' -and $b7Swap2Result.Swapped) { [void]$b7Swap2Problems.Add('attacker: підміна sub можлива до видачі ACE нащадкам (порядок фази 2 не зворотний)') }
+                if ($b7Swap2Mode -eq 'elevated' -and (-not $b7Swap2Result.Swapped -or @($b7Swap2Result.Warnings | Where-Object { $_.Contains($b7Swap2Sub) }).Count -lt 1)) {
+                    [void]$b7Swap2Problems.Add('elevated: підмінений компонент має бути названий у WARNING')
+                }
+                [void]$b7Swap2Details.Add("${b7Swap2Mode}: junction=$($b7Swap2Result.Junction), підмінено=$($b7Swap2Result.Swapped), шляхи=" + ($b7Swap2Paths -join ' | '))
+            }
+            Test-BRAVOCondition -Condition ($b7Swap2Problems.Count -eq 0) `
+                -Name 'Scheduler/DataDirectoryAclPhaseTwoSwapIsRefused' `
+                -Failure ("підміна root\sub перед фазою 2 для root\sub\deep: " + ($b7Swap2Problems -join '; ') + ' || ' + ($b7Swap2Details -join ' || '))
             # 5) Предикат reparse point на справжньому junction/звичайному/відсутньому шляху.
             if ($b7JunctionCreated) {
                 . ([scriptblock]::Create((& $b7ParseFunction $b7InstallText 'Test-BRAVOPathIsReparsePoint').Extent.Text))
