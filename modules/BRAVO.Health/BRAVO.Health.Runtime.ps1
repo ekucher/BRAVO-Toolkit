@@ -285,6 +285,12 @@ function Complete-BRAVOHealthResult {
     if ($healthExitCode -eq 0 -and $script:BRAVOWarningCount -gt 0) {
         $healthExitCode = Resolve-BRAVOExitCode -HasWarnings
     }
+    # #480: відхилений форматною валідацією sftpHostKey -> InvalidConfiguration (30),
+    # а не загальний HealthCritical; issue SFTPConnection лишається, щоб алерт ніс причину.
+    $sftpHostKeyRejected = [bool](Get-Variable -Scope Script -Name BRAVOHealthSftpHostKeyRejected -ValueOnly -ErrorAction SilentlyContinue)
+    if ($sftpHostKeyRejected -and $healthExitCode -in @(0, 10, 70)) {
+        $healthExitCode = Resolve-BRAVOExitCode -InvalidConfiguration
+    }
     # Порушення цілісності інструментів перекриває будь-який інший
     # результат Health — те саме застереження, що раніше стояло в кінці
     # файлу, перенесене сюди без зміни умови.
@@ -506,6 +512,15 @@ foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.Arc
     }
     Import-Module -Name $modulePath -ErrorAction Stop
 }
+# #480: формат-валідація sftpHostKey обов'язкова і в Health (legacy BRAVO.config валідатором loader-а не покривається).
+$hostKeySchemaModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+if (-not (Test-Path -LiteralPath $hostKeySchemaModulePath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль схеми конфігурації: $hostKeySchemaModulePath"
+}
+Import-Module -Name $hostKeySchemaModulePath -ErrorAction Stop
+# sftpHostKey відхилено форматною валідацією -> Health exit 30 (InvalidConfiguration).
+# Ініціалізація на старті runtime (StrictMode; Health також викликається вбудовано з Archive).
+$script:BRAVOHealthSftpHostKeyRejected = $false
 Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
@@ -2183,8 +2198,15 @@ function Test-SFTPHealthConfiguration {
     if ([string]::IsNullOrWhiteSpace($sftpUrl) -or -not $sftpUrl.StartsWith("sftp://")) {
         $errors += "не вдалося сформувати SFTP URL із захищених облікових даних"
     }
+    $hostKeyRejected = $false
     if ([string]::IsNullOrWhiteSpace($sftpHostKey)) {
         $errors += "не встановлено SFTP host key"
+    } else {
+        $hostKeyCheck = Test-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
+        if (-not $hostKeyCheck.IsValid) {
+            $errors += [string]$hostKeyCheck.Message
+            $hostKeyRejected = $true
+        }
     }
     if ([string]::IsNullOrWhiteSpace($winSCPPath) -or -not (Test-Path -Path $winSCPPath -PathType Leaf)) {
         $errors += "не знайдено WinSCP"
@@ -2239,6 +2261,7 @@ function Test-SFTPHealthConfiguration {
         # інструментів, — за нею оркестрація не додає окремий issue
         # «Цілісність інструментів» (без дубля в алерті).
         ToolIntegrityBlocked = $toolIntegrityBlocked
+        HostKeyRejected = $hostKeyRejected
     }
 }
 
@@ -2274,7 +2297,7 @@ function Get-SFTPRemoteArchiveChecksumResults {
         }
         $sessionOptions = New-Object WinSCP.SessionOptions
         $sessionOptions.ParseUrl($sftpUrl)
-        $sessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+        $sessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $sessionOptions.Timeout = [timespan]::FromSeconds(
             [math]::Max(1, [int]$sftpConnectionTimeoutSeconds)
         )
@@ -2394,11 +2417,13 @@ function Invoke-WinSCPHealthSession {
             $null -eq (Get-Command -Name 'Remove-BRAVOWinSCPSensitiveTemporaryScript' -ErrorAction SilentlyContinue)) {
             throw "canonical helper захищеного WinSCP-скрипта (BRAVO.ArchiveRuntime) недоступний; SFTP-перевірку скасовано без запису облікових даних"
         }
+        # #480: fail-closed ДО створення командного файлу; throw -> існуючий catch.
+        $validatedHostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $temporaryScriptPath = New-BRAVOWinSCPTemporaryScriptPath
         $scriptLines = @(
             "option batch continue",
             "option confirm off",
-            "open $sftpUrl -hostkey=$sftpHostKey -timeout=$sftpConnectionTimeoutSeconds"
+            "open $sftpUrl -hostkey=`"$validatedHostKey`" -timeout=$sftpConnectionTimeoutSeconds"
         )
         $scriptLines += @($Commands)
         $scriptLines += "exit"
@@ -3336,7 +3361,7 @@ function Invoke-WinSCPBAZAComparison {
 
         $sessionOptions = New-Object WinSCP.SessionOptions
         $sessionOptions.ParseUrl($sftpUrl)
-        $sessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+        $sessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $sessionOptions.Timeout = [timespan]::FromSeconds(
             [math]::Max(1, [int]$sftpConnectionTimeoutSeconds)
         )
@@ -3544,6 +3569,9 @@ function Get-SFTPHealthIssues {
         -CheckBAZA $checkBAZA `
         -CheckBAZAWWW $checkBAZAWWW
     if (-not $configurationResult.Valid) {
+        if ([bool]$configurationResult.HostKeyRejected) {
+            $script:BRAVOHealthSftpHostKeyRejected = $true
+        }
         return @([pscustomobject]@{
             Kind = "SFTPConnection"
             Component = "SFTP"

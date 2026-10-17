@@ -2,6 +2,26 @@
 
 ## Не випущено (developer)
 
+- **Безпека (SFTP, #480, F3): `sftpHostKey` перевіряється за форматом скрізь, `*`/`acceptnew`/керуючі символи відхиляються fail-closed, значення береться в лапки в WinSCP-скриптах.**
+  Раніше валідатор авторизації лише вимагав непорожній рядок і діяв лише для
+  `BRAVO.local.config`, а `-hostkey=$HostKey` вставлявся в WinSCP-скрипт без
+  лапок: значення `*` вимикало перевірку ключа сервера, а CR/LF у значенні
+  дозволяв дописати довільні команди WinSCP. Тепер `Test-BRAVOSshHostKeyFingerprint`
+  / `ConvertTo-BRAVOSshHostKeyFingerprint` (BRAVO.Configuration.Schema) приймають лише
+  `<тип> <біти> <відбиток>` (SHA-256 з префіксом `SHA256:` або без, або MD5 з 16 hex-пар;
+  кілька ключів через `;`), валідатор реєстру `SshHostKeyFingerprint` замінив
+  `NonEmptyString`, а кожен споживач (Archive, Health, DataRestore, BazaSync,
+  Maintenance, `BRAVO_DRY_RUN`, `BRAVO_BAZA_RECONCILE`) перевіряє значення сам
+  (покриває і legacy `BRAVO.config`) та пише `-hostkey="..."` у лапках.
+  **Зміна поведінки (BREAKING для майданчиків із `*` чи значенням не за форматом):**
+  `BRAVO.local.config` з невалідним `sftpHostKey` зупиняє завантаження конфігурації
+  (`30`, до локального архіву); у `BRAVO.config` Archive створює локальний архів без
+  SFTP і завершується `30`, `-SyncBAZA` і Health (замість `70`) також дають `30`.
+  Повідомлення не містять значення. Тести: `SshHostKey/FormatValidatorTable`,
+  `SshHostKey/RegistryUsesFormatValidator`, `SshHostKey/EveryConsumerQuotesAndValidatesHostKey`,
+  `Loader/SftpHostKeyAcceptAnyOverrideFailsClosed`, `Archive/HostKey*`,
+  `Archive/SyncBazaInvalidSftpConfigurationExits30`, `Health/OrchestrationInvalidHostKeyGivesInvalidConfiguration`,
+  `BazaSync/InvalidHostKeyFailsBeforeWinSCPSession`.
 - **Виправлено (Maintenance, реставрація): рішення про реставрацію перераховується після отримання lock і перед `bravocmd.exe` (#476).**
   `$shouldRestore` і `$missedRestoreDue` обчислювалися один раз до очікування
   lock (до `OperationLockWaitMinutes`, типово 360 хв). Якщо інший прогін за

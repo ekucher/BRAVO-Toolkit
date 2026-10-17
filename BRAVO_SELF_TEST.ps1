@@ -19037,7 +19037,7 @@ $script:NotificationWebhookUrls = @{ alerts = $probeAlertsWebhook; general = 'ht
 $script:Login = 'self-test'
 $script:resolvedSftpHost = 'self-test.invalid'
 $script:sftpUrl = 'sftp://self-test.invalid/'
-$sftpHostKey = 'ssh-ed25519 255 self-test'
+$sftpHostKey = $probeHostKey
 $sftpArchivesHealthEnabled = $probeSftpEnabled
 $sftpBazaAppHealthEnabled = $false
 $sftpBazaWWWHealthEnabled = $false
@@ -19158,7 +19158,9 @@ try {
         ('$script:ProbePreflightPrivilegeFailure = {0}' -f (& $probeFlag ($Scenario -eq 'EnvironmentPrivilege'))),
         ('$script:ProbeToolIntegrityViolation = {0}' -f (& $probeFlag ($Scenario -like 'ToolIntegrity*'))),
         ('$script:ProbeWinScpBusy = {0}' -f (& $probeFlag ($Scenario -in @('WinScpBusy', 'ToolIntegrityWinScpBusy')))),
-        ('$probeSftpEnabled = {0}' -f (& $probeFlag ($Scenario -ne 'ToolIntegritySftpDisabled')))
+        ('$probeSftpEnabled = {0}' -f (& $probeFlag ($Scenario -ne 'ToolIntegritySftpDisabled'))),
+        # #480: валідний відбиток (SHA256, 43 base64) у всіх сценаріях, крім InvalidHostKey.
+        ('$probeHostKey = ''{0}''' -f $(if ($Scenario -eq 'InvalidHostKey') { 'ssh-ed25519 255 self-test' } else { 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' }))
     ) -join "`n"
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
@@ -19180,6 +19182,8 @@ try {
     foreach ($probeModule in @('BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Logging', 'BRAVO.Health')) {
         Import-Module -Name (Join-Path $RepositoryRoot "modules\$probeModule\$probeModule.psd1") -Force
     }
+    # #480: Test-BRAVOSshHostKeyFingerprint для справжньої Test-SFTPHealthConfiguration.
+    Import-Module -Name (Join-Path $RepositoryRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
     & (Get-Module -Name 'BRAVO.Health') { param($Path) $script:runtimePath = $Path } $probeGeneratedPath
     $probeParameters = @{
         RuntimeRoot = $ProbeRoot
@@ -19226,7 +19230,8 @@ try {
             foreach ($healthOrchestrationScenario in @(
                     'Happy', 'HappyNoSlack', 'Failures', 'FailuresNoSlack', 'ToolIntegrity',
                     'ToolIntegritySftpDisabled', 'ToolIntegrityWinScpBusy',
-                    'WinScpBusy', 'NotificationFailure', 'EnvironmentPrivilege', 'MonitoringDisabled', 'InsecureWebhook'
+                    'WinScpBusy', 'NotificationFailure', 'EnvironmentPrivilege', 'MonitoringDisabled', 'InsecureWebhook',
+                    'InvalidHostKey'
                 )) {
                 $healthOrchestrationScenarioRoot = Join-Path $healthOrchestrationRoot $healthOrchestrationScenario
                 [void][IO.Directory]::CreateDirectory($healthOrchestrationScenarioRoot)
@@ -19527,6 +19532,28 @@ try {
                 ) `
                 -Name "Health/OrchestrationEarlyExitsSkipChecks" `
                 -Failure "ранні виходи Health мають завершуватися до перевірок: вимкнений моніторинг -> 0, небезпечний webhook -> 30, недоступний LOGS через права -> 36 без служб/копій/SFTP; проби: $($healthMonitoringDisabled | ConvertTo-Json -Compress -Depth 4) || $($healthInsecureWebhook | ConvertTo-Json -Compress -Depth 4) || $($healthEnvironmentPrivilege | ConvertTo-Json -Compress -Depth 4)"
+
+            # #480 (F3): невалідний sftpHostKey (формат; тут — не відбиток) -> SFTP-перевірка
+            # не запускає WinSCP, issue SFTPConnection несе причину в алерті (без сирого
+            # значення), а підсумок Health — 30 (InvalidConfiguration), а не 70.
+            $healthInvalidHostKey = $healthOrchestrationResults['InvalidHostKey']
+            $healthInvalidHostKeyEvents = @(& $healthOrchestrationEvents 'InvalidHostKey')
+            $healthInvalidHostKeyAlerts = @($healthInvalidHostKeyEvents | Where-Object { $_ -like 'ALERT-ISSUE *' })
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'InvalidHostKey') -and
+                    $healthInvalidHostKey.ExitCode -eq 30 -and
+                    $healthInvalidHostKey.ExitCodeName -eq 'InvalidConfiguration' -and
+                    $healthInvalidHostKeyEvents -notcontains 'WINSCP-SESSION' -and
+                    @($healthInvalidHostKeyEvents | Where-Object { $_ -like 'WINSCP-COPY*' }).Count -eq 0 -and
+                    $healthInvalidHostKeyAlerts.Count -eq 1 -and
+                    $healthInvalidHostKeyAlerts[0].StartsWith('ALERT-ISSUE SFTP | перевірку не виконано: ') -and
+                    $healthInvalidHostKeyAlerts[0].Contains('SFTP host key') -and
+                    -not $healthInvalidHostKeyAlerts[0].Contains('ssh-ed25519 255 self-test') -and
+                    ($healthInvalidHostKeyEvents -contains 'STATUS 30')
+                ) `
+                -Name "Health/OrchestrationInvalidHostKeyGivesInvalidConfiguration" `
+                -Failure "#480: невалідний sftpHostKey має давати Health exit 30 (InvalidConfiguration) з issue SFTPConnection у алерті без сирого значення і без запуску WinSCP; отримано код $($healthInvalidHostKey.ExitCode); події: $($healthInvalidHostKeyEvents -join '|')"
         } finally {
             if (Test-Path -LiteralPath $healthOrchestrationRoot -PathType Container) {
                 Remove-Item -LiteralPath $healthOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue

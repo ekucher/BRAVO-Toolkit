@@ -12,7 +12,9 @@
         'Test-BRAVOConfigurationOverrideAuthorization',
         'Get-BRAVOConfigurationSchemaAuthorizationClass',
         'Test-BRAVOConfigurationAuthorizationValidatorValue',
-        'Test-BRAVOConfigurationWeakeningEscapeHatchAllowed'
+        'Test-BRAVOConfigurationWeakeningEscapeHatchAllowed',
+        'Test-BRAVOSshHostKeyFingerprint',
+        'ConvertTo-BRAVOSshHostKeyFingerprint'
     )
     VariablesToExport = @()
     CmdletsToExport = @()

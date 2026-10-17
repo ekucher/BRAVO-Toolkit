@@ -955,7 +955,7 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'sftpDirectories.RuntimeLogs' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.Trace' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.TraceLogs' = @{ Class = 'ALLOW_SITE' }
-    'sftpHostKey' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'NonEmptyString' }
+    'sftpHostKey' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'SshHostKeyFingerprint' }
     'sftpHostTemplate' = @{ Class = 'ALLOW_SITE' }
     'sftpPort' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:1,65535' }
     'sftpSynchronizationOptions' = @{ Class = 'DENY_EXECUTION_CONTROL' }
@@ -1387,6 +1387,115 @@ function Test-BRAVOConfigurationAuthorizationNonEmptyString {
     return [pscustomobject]@{ IsValid = $true; Message = $null }
 }
 
+# ---------------------------------------------------------------------------
+# SSH host key fingerprint (#480, F3): формат-валідація sftpHostKey.
+# Єдине джерело правди для loader-валідатора авторизації та runtime-перевірок
+# у кожному споживачі (legacy BRAVO.config валідатором авторизації не
+# покривається, тому runtime-перевірка обов'язкова). Fail-closed: '*',
+# acceptnew/accept*, керуючі символи та не-ASCII відхиляються. Повідомлення
+# НІКОЛИ не містять сирого значення (воно потрапляє в логи й throw лоадера).
+# ---------------------------------------------------------------------------
+function Test-BRAVOSshHostKeyFingerprint {
+    <#
+    .SYNOPSIS
+        Перевіряє формат SFTP host key (WinSCP -hostkey) і повертає нормалізоване значення.
+    .OUTPUTS
+        [pscustomobject] IsValid, Normalized, Reason, Message. Ніколи не кидає виняток.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][AllowEmptyCollection()]$Value
+    )
+
+    $fail = {
+        param([string]$Reason, [string]$Message)
+        return [pscustomobject]@{ IsValid = $false; Normalized = $null; Reason = $Reason; Message = $Message }
+    }
+    $msgEmpty = "SFTP host key не задано."
+    $msgControl = "SFTP host key містить керуючі (CR/LF/TAB/NUL) або не-ASCII символи — відхилено, щоб унеможливити ін'єкцію команд у WinSCP-скрипт."
+    $msgAccept = "SFTP host key '*'/'acceptnew'/'accept…' вимикає перевірку ключа сервера (ризик MITM) — заборонено; вкажіть відбиток ключа сервера."
+    $msgQuote = "SFTP host key: дозволена лише одна пара зовнішніх подвійних лапок."
+
+    if ($null -eq $Value -or $Value -isnot [string] -or $Value.Length -eq 0) {
+        return (& $fail 'Empty' $msgEmpty)
+    }
+    $raw = [string]$Value
+    # \A..\z (не ^..$): $ у .NET збігається перед фінальним LF.
+    if ($raw -notmatch '\A[\x20-\x7E]{1,1024}\z') {
+        return (& $fail 'ControlOrNonAscii' $msgControl)
+    }
+    $text = $raw.Trim(' ')
+    if ($text.Length -ge 2 -and $text.StartsWith('"') -and $text.EndsWith('"')) {
+        $text = $text.Substring(1, $text.Length - 2).Trim(' ')
+    }
+    if ($text.Length -eq 0) {
+        return (& $fail 'Empty' $msgEmpty)
+    }
+    if ($text.Contains('"')) {
+        return (& $fail 'EmbeddedQuote' $msgQuote)
+    }
+
+    $entries = @($text.Split(';') | ForEach-Object { $_.Trim(' ') })
+    $index = 0
+    foreach ($entry in $entries) {
+        $index++
+        if ($entry.Length -eq 0) {
+            return (& $fail 'Format' "SFTP host key, запис ${index}: порожній запис.")
+        }
+        if ($entry.Contains('*') -or $entry -match '(?i)\A(accept[\w-]*|any|none)\z') {
+            return (& $fail 'AcceptAnyHostKey' $msgAccept)
+        }
+    }
+    $formatPattern = '\A(?<type>ssh-ed25519|ssh-ed448|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa|ssh-dss) (?<bits>[1-9][0-9]{2,4}) (?<fp>(?:[0-9a-fA-F]{2}:){15}[0-9a-fA-F]{2}|(?:SHA256:)?[A-Za-z0-9+/]{43}=?)\z'
+    $index = 0
+    foreach ($entry in $entries) {
+        $index++
+        if ($entry -cnotmatch $formatPattern) {
+            return (& $fail 'Format' "SFTP host key, запис ${index}: очікується '<тип> <біти> <відбиток>' (тип: ssh-ed25519|ecdsa-sha2-nistp256/384/521|ssh-rsa|ssh-dss|ssh-ed448; відбиток: SHA-256 — 43 символи base64, з префіксом SHA256: або без, або MD5 — 16 hex-пар через ':').")
+        }
+    }
+    return [pscustomobject]@{
+        IsValid    = $true
+        Normalized = ($entries -join ';')
+        Reason     = $null
+        Message    = $null
+    }
+}
+
+function ConvertTo-BRAVOSshHostKeyFingerprint {
+    <#
+    .SYNOPSIS
+        Повертає нормалізований (без лапок) host key або кидає ArgumentException (fail-closed).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][AllowEmptyCollection()]$Value
+    )
+
+    $result = Test-BRAVOSshHostKeyFingerprint -Value $Value
+    if (-not $result.IsValid) {
+        throw (New-Object -TypeName System.ArgumentException -ArgumentList ([string]$result.Message))
+    }
+    return [string]$result.Normalized
+}
+
+function Test-BRAVOConfigurationAuthorizationSshHostKeyFingerprint {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $result = Test-BRAVOSshHostKeyFingerprint -Value $Value
+    if (-not $result.IsValid) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: $($result.Message)" }
+    }
+    return [pscustomobject]@{ IsValid = $true; Message = $null }
+}
+
 function Test-BRAVOConfigurationAuthorizationValidatorValue {
     <#
     .SYNOPSIS
@@ -1445,6 +1554,7 @@ function Test-BRAVOConfigurationAuthorizationValidatorValue {
         'DotNetEncodingName' { return Test-BRAVOConfigurationAuthorizationEncodingName -Value $Value -Path $Path }
         'TaskSchedulerPath'  { return Test-BRAVOConfigurationAuthorizationTaskSchedulerPath -Value $Value -Path $Path }
         'NonEmptyString'     { return Test-BRAVOConfigurationAuthorizationNonEmptyString -Value $Value -Path $Path }
+        'SshHostKeyFingerprint' { return Test-BRAVOConfigurationAuthorizationSshHostKeyFingerprint -Value $Value -Path $Path }
         default {
             throw "Схема авторизації конфігурації: невідомий ідентифікатор валідатора '$ValidatorId' для '$Path' — це дефект реєстру схеми, не значення оператора."
         }
@@ -1848,4 +1958,6 @@ Export-ModuleMember -Function @(
     ,'Get-BRAVOConfigurationSchemaAuthorizationClass'
     ,'Test-BRAVOConfigurationAuthorizationValidatorValue'
     ,'Test-BRAVOConfigurationWeakeningEscapeHatchAllowed'
+    ,'Test-BRAVOSshHostKeyFingerprint'
+    ,'ConvertTo-BRAVOSshHostKeyFingerprint'
 )

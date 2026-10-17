@@ -530,6 +530,43 @@ try {
         -Name "Loader/SftpPortOversizedValueFailsClosedWithoutOverflowException" `
         -Failure "sftpPort=[uint64]::MaxValue мусить fail-closed зупинити завантаження КЕРОВАНИМ throw ('неавторизоване перевизначення'), БЕЗ OverflowException; отримано: '$localCfgSftpPortProbeLast'"
 
+    # --- Loader/SftpHostKeyAcceptAnyOverrideFailsClosed (#480, F3) ---
+    # sftpHostKey='*' (accept-any-host-key) у BRAVO.local.config МУСИТЬ зупиняти
+    # завантаження керованим throw валідатора SshHostKeyFingerprint; так само
+    # CRLF-ін'єкція команд WinSCP-скрипта.
+    $localCfgHostKeyCases = @(
+        @{ Name = 'Star'; Literal = "'*'" }
+        @{ Name = 'AcceptNew'; Literal = "'acceptnew'" }
+        @{ Name = 'CrLfPut'; Literal = "'ssh-rsa 2048 aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99`r`nput C:\x /'" }
+    )
+    $localCfgHostKeyFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($localCfgHostKeyCase in $localCfgHostKeyCases) {
+        [IO.File]::WriteAllText($localCfgOverridePath, (
+            "@{`r`n" +
+            "    'sftpHostKey' = $($localCfgHostKeyCase.Literal)`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding $false))
+        $localCfgHostKeyProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
+                "Set-StrictMode -Version 2.0; " +
+                "try { " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+                "'UNEXPECTED-NOTHREW' " +
+                "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+            )
+        $localCfgHostKeyProbeText = [string]::Join(' ', @($localCfgHostKeyProbe | ForEach-Object { [string]$_ }))
+        if (-not ($localCfgHostKeyProbeText.Contains('CHILD-ERROR:') -and
+                $localCfgHostKeyProbeText.Contains('неавторизоване перевизначення') -and
+                $localCfgHostKeyProbeText.Contains('sftpHostKey') -and
+                -not $localCfgHostKeyProbeText.Contains('UNEXPECTED-NOTHREW'))) {
+            [void]$localCfgHostKeyFailures.Add([string]$localCfgHostKeyCase.Name)
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($localCfgHostKeyFailures.Count -eq 0) `
+        -Name "Loader/SftpHostKeyAcceptAnyOverrideFailsClosed" `
+        -Failure "BRAVO.local.config з sftpHostKey='*'/'acceptnew'/CRLF-ін'єкцією мусить зупиняти Import-BravoConfiguration керованим throw ('неавторизоване перевизначення'); збої: $([string]::Join(', ', $localCfgHostKeyFailures))"
+
     # --- Loader/MaintenanceLoggingSuccessLoadsSuccessfully (PR #224 review,
     # шосте коло, P2 "Restrict maintenance log levels to runtime-supported
     # values"): SUCCESS — runtime-підтримуваний рівень (Maintenance

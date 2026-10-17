@@ -15,6 +15,9 @@ $compatibilityManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Com
 Import-Module -Name $compatibilityManifest -ErrorAction Stop
 $archiveRuntimeManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1'
 Import-Module -Name $archiveRuntimeManifest -ErrorAction Stop
+# #480: ConvertTo-BRAVOSshHostKeyFingerprint — fail-closed валідація sftpHostKey перед WinSCP-сесією.
+$configurationSchemaManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+Import-Module -Name $configurationSchemaManifest -ErrorAction Stop
 
 $script:BazaStateSchemaVersion = 1
 
@@ -2276,6 +2279,8 @@ function Invoke-BRAVOBazaComponentSyncSession {
 
     $session = $null
     try {
+        # #480: невалідний/accept-any host key -> throw ДО Add-Type і створення WinSCP-сесії (catch -> ERROR).
+        $validatedHostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
         # Guard (acceptance DEV-LIMS, 2026-08-13): .NET-асемблі потрібен
         # САМЕ winscp.exe. Якщо сюди передати WinSCP.com (консольний
         # CLI-стаб), Session.Open запускає ІНТЕРАКТИВНУ консоль — у вікні
@@ -2289,7 +2294,7 @@ function Invoke-BRAVOBazaComponentSyncSession {
         }
         $sessionOptions = New-Object WinSCP.SessionOptions
         $sessionOptions.ParseUrl($RepositorySFTPUrl)
-        $sessionOptions.SshHostKeyFingerprint = ([string]$HostKey).Trim().Trim('"')
+        $sessionOptions.SshHostKeyFingerprint = $validatedHostKey
         $sessionOptions.Timeout = [timespan]::FromSeconds([math]::Max(1, $ConnectionTimeoutSeconds))
 
         $session = New-Object WinSCP.Session

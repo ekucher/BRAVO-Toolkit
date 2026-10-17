@@ -137,7 +137,8 @@ try {
         'modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1',
         'modules\BRAVO.Credentials\BRAVO.Credentials.psd1',
         'modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1',
-        'modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1'
+        'modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1',
+        'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
     )) {
         Import-Module -Name (Join-Path $PSScriptRoot $moduleRelativePath) -ErrorAction Stop
     }
@@ -256,7 +257,7 @@ try {
     }
     $sessionOptions = New-Object WinSCP.SessionOptions
     $sessionOptions.ParseUrl($repositorySftpUrl)
-    $sessionOptions.SshHostKeyFingerprint = ([string]$global:sftpHostKey).Trim().Trim('"')
+    $sessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $global:sftpHostKey
     $sessionOptions.Timeout = [timespan]::FromSeconds(30)
     $session = New-Object WinSCP.Session
     $session.ExecutablePath = $winSCPComponents.ExecutablePath

@@ -339,7 +339,10 @@
     # Шаблон хоста ({0} = логін зі сховища credentials):
     # 'sftpHostTemplate' = '{0}.your-storagebox.de'
     # 'sftpPort' = 22
-    # SSH host-key pinning (обов'язковий; значення — з панелі провайдера):
+    # SSH host-key pinning (обов'язковий; значення — з панелі провайдера).
+    # Плейсхолдер xx:xx:… НАВМИСНО невалідний: поки там не справжній відбиток,
+    # запуск завершується кодом 30. Формат: '<тип> <біти> <відбиток>', наприклад
+    # 'ssh-ed25519 255 SHA256:<43 символи base64>'; '*' та acceptnew заборонені.
     # 'sftpHostKey' = '"ssh-rsa 2048 xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"'
     # 'sftpConnectionTimeoutSeconds' = 30
 

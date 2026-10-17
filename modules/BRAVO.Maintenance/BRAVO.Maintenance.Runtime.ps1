@@ -88,6 +88,12 @@ foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.Arc
     }
     Import-Module -Name $modulePath -ErrorAction Stop
 }
+# #480: формат-валідація sftpHostKey (ConvertTo-BRAVOSshHostKeyFingerprint) у кожному споживачі.
+$hostKeySchemaModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+if (-not (Test-Path -LiteralPath $hostKeySchemaModulePath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль схеми конфігурації: $hostKeySchemaModulePath"
+}
+Import-Module -Name $hostKeySchemaModulePath -ErrorAction Stop
 Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
@@ -5289,7 +5295,7 @@ function Connect-BRAVOOwnLogSftpSession {
         $ownLogSessionOptions = New-Object WinSCP.SessionOptions
         $ownLogSessionOptions.ParseUrl($ownLogSftpUrl)
         $ownLogSftpUrl = $null
-        $ownLogSessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+        $ownLogSessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $ownLogSessionOptions.Timeout = [timespan]::FromSeconds([math]::Max(15, [int]$sftpConnectionTimeoutSeconds))
         $ownLogSession = New-Object WinSCP.Session
         $ownLogSession.ExecutablePath = $ownLogWinScpComponents.ExecutablePath
@@ -12051,7 +12057,7 @@ if (-not $BravoMaintenanceEnabled) {
                 $traceSessionOptions = New-Object WinSCP.SessionOptions
                 $traceSessionOptions.ParseUrl($traceRepositorySftpUrl)
                 $traceRepositorySftpUrl = $null
-                $traceSessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+                $traceSessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
                 $traceSessionOptions.Timeout = [timespan]::FromSeconds([math]::Max(15, [int]$sftpConnectionTimeoutSeconds))
                 $traceSftpSession = New-Object WinSCP.Session
                 $traceSftpSession.ExecutablePath = $traceWinScpComponents.ExecutablePath

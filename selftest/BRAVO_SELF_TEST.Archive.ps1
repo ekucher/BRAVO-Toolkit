@@ -15,6 +15,8 @@
 
 $archiveScriptPath = Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'
 $archiveScriptText = [IO.File]::ReadAllText($archiveScriptPath, [Text.Encoding]::UTF8)
+# #480: рантайм-функції Archive викликають Test-/ConvertTo-BRAVOSshHostKeyFingerprint зі Schema-модуля.
+Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force -ErrorAction Stop
 
 # ============================================================
 # P2-1: Get-BRAVOSFTPOrderedDirectorySegments — чисте розгортання у
@@ -83,12 +85,13 @@ Test-BRAVOCondition -Condition (
 # ============================================================
 
 Test-BRAVOCondition -Condition (
-    $archiveScriptText -match '(?s)option batch continue\r?\noption confirm off\r?\nopen \$RepositorySFTPUrl -hostkey=\$HostKey.*?\$mkdirCommands'
+    $archiveScriptText -match '(?s)option batch continue\r?\noption confirm off\r?\nopen \$RepositorySFTPUrl -hostkey="\$HostKey".*?\$mkdirCommands'
 ) -Name 'Archive/SftpMkdirBatchContinuesPastIntermediateFailure' `
     -Failure "'option batch continue' має передувати mkdir-командам, щоб провал одного сегмента (уже наявний/проміжний) не зупиняв решту пакета"
 
 Test-BRAVOCondition -Condition (
-    $archiveScriptText -match '-hostkey=\$HostKey' -and
+    $archiveScriptText -match '-hostkey="\$HostKey"' -and
+    $archiveScriptText -notmatch '-hostkey=\$' -and
     $archiveScriptText -notmatch '(?i)accept.?any.?host.?key|AcceptAny|-hostkey=\*'
 ) -Name 'Archive/SftpMkdirPreservesHostKeyPinning' `
     -Failure "рекурсивне створення каталогів не повинно послаблювати обов'язкове SSH host-key pinning"
@@ -146,10 +149,11 @@ function Invoke-BRAVOSelfTestArchiveOwnLogUploadScenario {
         [bool]$DefineConfig = $true,
         [bool]$SendShouldThrow = $false,
         [bool]$SendReturnValue = $true,
+        [string]$HostKey = 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE',
         [string]$LogFilePath
     )
     & $Module {
-        param($enabled, $sftpEnabled, $defineConfig, $sendShouldThrow, $sendReturnValue, $logFilePath)
+        param($enabled, $sftpEnabled, $defineConfig, $sendShouldThrow, $sendReturnValue, $logFilePath, $hostKey)
         $script:archiveOwnLogTestState = [pscustomobject]@{
             InitDirCalls    = 0
             SendCalls       = 0
@@ -165,7 +169,7 @@ function Invoke-BRAVOSelfTestArchiveOwnLogUploadScenario {
             $global:componentSettings = [pscustomobject]@{ SFTP = [pscustomobject]@{ ArchiveLogUploadEnabled = $enabled } }
             $global:storageEffective = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $sftpEnabled } }
             $script:sftpUrl = 'sftp://selftest@127.0.0.1/'
-            $script:sftpHostKey = 'ssh-rsa 2048 aa:bb:cc'
+            $script:sftpHostKey = $hostKey
             $script:winSCPPath = 'C:\Windows\System32\cmd.exe'
             $script:sftpDirectories = [pscustomobject]@{ ArchivLog = 'logs/archiv' }
             $script:logFile = $logFilePath
@@ -181,7 +185,7 @@ function Invoke-BRAVOSelfTestArchiveOwnLogUploadScenario {
             SendCalls         = $script:archiveOwnLogTestState.SendCalls
             ProcessExitCode   = $script:processExitCode
         }
-    } $Enabled $SftpEnabled $DefineConfig $SendShouldThrow $SendReturnValue $LogFilePath
+    } $Enabled $SftpEnabled $DefineConfig $SendShouldThrow $SendReturnValue $LogFilePath $HostKey
 }
 
 # (a) Тумблер вимкнений (дефолт) -> 0 спроб вивантаження.
@@ -341,7 +345,7 @@ if ($null -ne $archiveSecretMaskModule) {
         $global:storageEffective = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $true } }
         $script:credentialSettings = @{}
         $script:sftpUrl = 'sftp://selftest@127.0.0.1/'
-        $script:sftpHostKey = 'ssh-rsa 2048 aa:bb:cc'
+        $script:sftpHostKey = 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
         $script:winSCPPath = 'C:\Windows\System32\cmd.exe'
         $script:sftpDirectories = [pscustomobject]@{ ArchivLog = 'logs/archiv' }
         $script:logFile = $logFilePath
@@ -422,7 +426,7 @@ if ($null -ne $archiveSecretMaskModule) {
             $global:storageEffective = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $true } }
             $script:credentialSettings = @{}
             $script:sftpUrl = 'sftp://selftest@127.0.0.1/'
-            $script:sftpHostKey = 'ssh-rsa 2048 aa:bb:cc'
+            $script:sftpHostKey = 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
             $script:winSCPPath = 'C:\Windows\System32\cmd.exe'
             $script:sftpDirectories = [pscustomobject]@{ ArchivLog = 'logs/archiv' }
             $script:logFile = $logFilePath
@@ -1590,7 +1594,7 @@ try {
         $thrown = $null
         $result = $null
         try {
-            $result = @(Test-SFTPConnection -WinSCPPath $StubPath -RepositorySFTPUrl 'sftp://selftest@127.0.0.1/' -HostKey 'ssh-rsa 2048 aa:bb:cc')
+            $result = @(Test-SFTPConnection -WinSCPPath $StubPath -RepositorySFTPUrl 'sftp://selftest@127.0.0.1/' -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE')
         } catch {
             $thrown = $_.Exception.Message
         }
@@ -1693,3 +1697,321 @@ Test-BRAVOCondition `
     ) `
     -Name 'Archive/LiteralExitCodesAreCanonical' `
     -Failure "кожен літеральний exit <число> у BRAVO.Archive.Runtime.ps1 має бути кодом із BRAVO.ExitCodes; поза контрактом: [$($archiveNonCanonicalExitCodes -join ', ')]; літералів: $($archiveLiteralExitCodes.Count); канонічних кодів: $($archiveCanonicalExitCodes.Count)"
+
+# ============================================================
+# #480 (F3): валідація sftpHostKey у Archive. Невалідний ключ ('*', acceptnew,
+# CRLF-ін'єкція, неповний відбиток) -> Test-SFTPConfig = $false (шлях
+# $sftpConfigurationValid=$false -> SFTP-гілку заблоковано, локальний архів
+# триває, підсумок 30), WinSCP-функції самі fail-closed повертають $false ДО
+# створення командного файлу/процесу, власний лог не вивантажується,
+# -SyncBAZA завершується 30.
+# ============================================================
+
+$archiveHostKeyValid = 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
+$archiveHostKeyInvalidCases = @(
+    @{ Name = 'Star'; Value = '*' }
+    @{ Name = 'AcceptNew'; Value = 'acceptnew' }
+    @{ Name = 'CrLfPut'; Value = "`"ssh-rsa 2048 aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99`"`r`nput C:\x /" }
+    @{ Name = 'ShortFingerprint'; Value = 'ssh-rsa 2048 aa:bb:cc' }
+)
+
+$archiveHostKeyStub = @'
+function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO", [switch]$Secondary)
+    [void]$script:archiveHostKeyLog.Add([pscustomobject]@{ Level = $Level; Message = $Message }) }
+function New-BRAVOWinSCPTemporaryScriptPath {
+    $script:archiveHostKeyScriptCreated++
+    return (Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_hostkey_selftest_' + [guid]::NewGuid().ToString('N') + '.txt'))
+}
+'@
+$archiveHostKeyModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText ($archiveHostKeyStub + "`n" + $archiveScriptText) `
+    -FunctionNames @('Write-BRAVOLog', 'New-BRAVOWinSCPTemporaryScriptPath', 'Get-BRAVOSFTPOrderedDirectorySegments', 'Test-SFTPConfig', 'Test-SFTPConnection', 'Send-FileViaWinSCP', 'Initialize-BRAVOSFTPRemoteDirectories', 'Sync-FolderToSFTP')
+$archiveHostKeyRoot = Join-Path ([IO.Path]::GetTempPath()) "BRAVOSelfTest_ArchiveHostKey_$([Guid]::NewGuid().ToString('N'))"
+[void](New-Item -ItemType Directory -Path $archiveHostKeyRoot -Force)
+try {
+    $archiveHostKeyLocalFile = Join-Path $archiveHostKeyRoot 'payload.bin'
+    [IO.File]::WriteAllText($archiveHostKeyLocalFile, 'payload')
+    $archiveHostKeyProbe = & $archiveHostKeyModule {
+        param($ValidKey, $Cases, $LocalFile, $LocalDirectory)
+        $script:archiveHostKeyLog = New-Object System.Collections.ArrayList
+        $script:archiveHostKeyScriptCreated = 0
+        $script:credentialInitializationError = ''
+        $script:Login = 'selftest'
+        $script:sftpUrl = 'sftp://selftest@127.0.0.1/'
+        $script:winSCPPath = 'C:\Windows\System32\cmd.exe'
+        $script:winSCPScriptEncoding = 'ASCII'
+        $script:winSCPIniPath = 'nul'
+        $script:resolvedSftpHost = '127.0.0.1'
+        $script:sftpPort = 22
+        $script:sftpConnectionTimeoutSeconds = 5
+        $script:sftpSynchronizationOptions = ''
+        $script:sftpDirectories = @{}
+        $script:archiveDefinitions = @()
+        $script:componentSettings = [pscustomobject]@{
+            SFTP = [pscustomobject]@{ ArchiveUpload = $false }
+            Synchronization = [pscustomobject]@{ BAZA_APP_SFTP = $false; BAZA_WWW_SFTP = $false }
+        }
+        $script:synchronizationSafety = [pscustomobject]@{ RequireNonEmptyBAZASource = $false }
+        $script:backupMonitoring = [pscustomobject]@{ SFTP = [pscustomobject]@{ OperationTimeoutSeconds = 5 } }
+        $script:progressSettings = [pscustomobject]@{ Enabled = $false; ShowWinSCPOutput = $false }
+
+        $script:sftpHostKey = $ValidKey
+        $validConfig = Test-SFTPConfig -SynchronizationOnly
+        $rows = @()
+        foreach ($case in $Cases) {
+            $script:archiveHostKeyLog.Clear()
+            $script:archiveHostKeyScriptCreated = 0
+            $script:sftpHostKey = [string]$case.Value
+            $configResult = Test-SFTPConfig -SynchronizationOnly
+            $configLog = @($script:archiveHostKeyLog.ToArray() | ForEach-Object { [string]$_.Message })
+            $script:archiveHostKeyLog.Clear()
+            $connection = @(Test-SFTPConnection -WinSCPPath $script:winSCPPath -RepositorySFTPUrl $script:sftpUrl -HostKey ([string]$case.Value))
+            $send = @(Send-FileViaWinSCP -WinSCPPath $script:winSCPPath -RepositorySFTPUrl $script:sftpUrl -HostKey ([string]$case.Value) -LocalFilePath $LocalFile -RemoteDirectory 'x')
+            $initialize = @(Initialize-BRAVOSFTPRemoteDirectories -WinSCPPath $script:winSCPPath -RepositorySFTPUrl $script:sftpUrl -HostKey ([string]$case.Value) -RemoteDirectories @('x/y'))
+            $sync = @(Sync-FolderToSFTP -WinSCPPath $script:winSCPPath -RepositorySFTPUrl $script:sftpUrl -HostKey ([string]$case.Value) -LocalDirectory $LocalDirectory -RemoteDirectory 'x')
+            $rows += [pscustomobject]@{
+                Name = [string]$case.Name
+                ConfigResult = $configResult
+                ConfigLog = $configLog
+                Connection = $connection
+                Send = $send
+                Initialize = $initialize
+                Sync = $sync
+                ScriptCreated = $script:archiveHostKeyScriptCreated
+                Log = @($script:archiveHostKeyLog.ToArray() | ForEach-Object { [string]$_.Message })
+            }
+        }
+        [pscustomobject]@{ ValidConfig = $validConfig; Rows = $rows }
+    } $archiveHostKeyValid $archiveHostKeyInvalidCases $archiveHostKeyLocalFile $archiveHostKeyRoot
+} finally {
+    Remove-Item -LiteralPath $archiveHostKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Test-BRAVOCondition -Condition ([bool]$archiveHostKeyProbe.ValidConfig) `
+    -Name 'Archive/HostKeyValidFingerprintPassesSftpConfig' `
+    -Failure "Test-SFTPConfig мусить приймати валідний відбиток (ssh-ed25519 255 SHA256:...); інакше SFTP блокується завжди"
+
+$archiveHostKeyConfigFailures = @(
+    $archiveHostKeyProbe.Rows | Where-Object {
+        $_.ConfigResult -ne $false -or
+        @($_.ConfigLog | Where-Object { $_ -like '*SFTP host key*' }).Count -lt 1
+    } | ForEach-Object { $_.Name }
+)
+Test-BRAVOCondition -Condition ($archiveHostKeyConfigFailures.Count -eq 0) `
+    -Name 'Archive/HostKeyInvalidFailsSftpConfig' `
+    -Failure "Test-SFTPConfig мусить повертати `$false і логувати причину для невалідного sftpHostKey (шлях до exit 30 через `$sftpConfigurationValid); збої: $([string]::Join(', ', $archiveHostKeyConfigFailures))"
+
+$archiveHostKeyTransportFailures = @(
+    $archiveHostKeyProbe.Rows | Where-Object {
+        -not ($_.Connection.Count -eq 1 -and $_.Connection[0] -eq $false -and
+            $_.Send.Count -eq 1 -and $_.Send[0] -eq $false -and
+            $_.Sync.Count -eq 1 -and $_.Sync[0] -eq $false -and
+            $_.Initialize.Count -eq 0 -and
+            $_.ScriptCreated -eq 0 -and
+            @($_.Log | Where-Object { $_ -like '*SFTP host key відхилено*' }).Count -eq 4)
+    } | ForEach-Object { $_.Name }
+)
+Test-BRAVOCondition -Condition ($archiveHostKeyTransportFailures.Count -eq 0) `
+    -Name 'Archive/HostKeyInvalidNeverCreatesWinSCPScriptOrProcess' `
+    -Failure "Test-SFTPConnection/Send-FileViaWinSCP/Initialize-BRAVOSFTPRemoteDirectories/Sync-FolderToSFTP з невалідним ключем мусять fail-closed повернутись ДО створення командного файлу WinSCP (жодного скрипта/процесу); збої: $([string]::Join(', ', $archiveHostKeyTransportFailures))"
+
+$archiveHostKeyEchoes = @(
+    $archiveHostKeyProbe.Rows | Where-Object {
+        $row = $_
+        $value = [string](@($archiveHostKeyInvalidCases | Where-Object { $_.Name -eq $row.Name })[0].Value)
+        $value.Length -ge 3 -and $row.Name -ne 'AcceptNew' -and
+        @(@($row.Log) + @($row.ConfigLog) | Where-Object { ([string]$_).Contains($value) }).Count -gt 0
+    } | ForEach-Object { $_.Name }
+)
+Test-BRAVOCondition -Condition ($archiveHostKeyEchoes.Count -eq 0) `
+    -Name 'Archive/HostKeyInvalidIsNotEchoedToLog' `
+    -Failure "журнал не повинен містити сирого значення sftpHostKey; збої: $([string]::Join(', ', $archiveHostKeyEchoes))"
+
+# Власний лог: невалідний ключ -> жодного вивантаження (best-effort WARNING).
+$archiveOwnLogBadKey = Invoke-BRAVOSelfTestArchiveOwnLogUploadScenario -Module $archiveOwnLogModule -Enabled $true -HostKey '*' -LogFilePath $archiveOwnLogFile
+Test-BRAVOCondition -Condition (
+    $archiveOwnLogBadKey.InitDirCalls -eq 0 -and
+    $archiveOwnLogBadKey.SendCalls -eq 0
+) -Name 'Archive/OwnLogUploadSkippedForInvalidHostKey' `
+    -Failure "вивантаження власного логу з sftpHostKey='*' має бути пропущено; факт: init=$($archiveOwnLogBadKey.InitDirCalls) send=$($archiveOwnLogBadKey.SendCalls)"
+
+# -SyncBAZA: невалідна SFTP-конфігурація (зокрема sftpHostKey) -> 30 раніше за SftpFailed.
+$archiveSyncExitModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText $archiveScriptText `
+    -FunctionNames @('Resolve-BRAVOSyncBazaExitCode')
+$archiveSyncExitCodes = & $archiveSyncExitModule {
+    [pscustomobject]@{
+        InvalidConfig = (Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $false -EmptySourceWarningCount 0 -InvalidConfiguration $true)
+        InvalidConfigBeatsSuccess = (Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $true -EmptySourceWarningCount 0 -InvalidConfiguration $true)
+        SftpFailed = (Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $false -EmptySourceWarningCount 0)
+        Clean = (Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $true -EmptySourceWarningCount 0)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $archiveSyncExitCodes.InvalidConfig -eq 30 -and
+    $archiveSyncExitCodes.InvalidConfigBeatsSuccess -eq 30 -and
+    $archiveSyncExitCodes.SftpFailed -eq (Resolve-BRAVOExitCode -SftpFailed) -and
+    $archiveSyncExitCodes.Clean -eq 0 -and
+    $archiveScriptText.Contains('ConfigurationInvalid = $true') -and
+    $archiveScriptText -match '(?s)Resolve-BRAVOSyncBazaExitCode -SyncSucceeded \$manualSyncSuccess -EmptySourceWarningCount \$syncBazaEmptySourceWarned\.Count -InvalidConfiguration'
+) -Name 'Archive/SyncBazaInvalidSftpConfigurationExits30' `
+    -Failure "-SyncBAZA з невалідною SFTP-конфігурацією (sftpHostKey) мусить завершуватись 30 (InvalidConfiguration), а не 50; отримано: $($archiveSyncExitCodes | ConvertTo-Json -Compress)"
+
+# ============================================================
+# #480 (F3): валідація sftpHostKey у Archive. Невалідний ключ ('*', acceptnew,
+# CRLF-ін'єкція, неповний відбиток) -> Test-SFTPConfig = $false (шлях
+# $sftpConfigurationValid=$false -> SFTP-гілку заблоковано, локальний архів
+# триває, підсумок 30), WinSCP-функції самі fail-closed повертають $false ДО
+# створення командного файлу/процесу, власний лог не вивантажується,
+# -SyncBAZA завершується 30.
+# ============================================================
+
+$archiveHostKeyValid = 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
+$archiveHostKeyInvalidCases = @(
+    @{ Name = 'Star'; Value = '*' }
+    @{ Name = 'AcceptNew'; Value = 'acceptnew' }
+    @{ Name = 'CrLfPut'; Value = "`"ssh-rsa 2048 aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99`"`r`nput C:\x /" }
+    @{ Name = 'ShortFingerprint'; Value = 'ssh-rsa 2048 aa:bb:cc' }
+)
+
+$archiveHostKeyStub = @'
+function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO", [switch]$Secondary)
+    [void]$script:archiveHostKeyLog.Add([pscustomobject]@{ Level = $Level; Message = $Message }) }
+function New-BRAVOWinSCPTemporaryScriptPath {
+    $script:archiveHostKeyScriptCreated++
+    return (Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_hostkey_selftest_' + [guid]::NewGuid().ToString('N') + '.txt'))
+}
+'@
+$archiveHostKeyModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText ($archiveHostKeyStub + "`n" + $archiveScriptText) `
+    -FunctionNames @('Write-BRAVOLog', 'New-BRAVOWinSCPTemporaryScriptPath', 'Get-BRAVOSFTPOrderedDirectorySegments', 'Test-SFTPConfig', 'Test-SFTPConnection', 'Send-FileViaWinSCP', 'Initialize-BRAVOSFTPRemoteDirectories', 'Sync-FolderToSFTP')
+$archiveHostKeyRoot = Join-Path ([IO.Path]::GetTempPath()) "BRAVOSelfTest_ArchiveHostKey_$([Guid]::NewGuid().ToString('N'))"
+[void](New-Item -ItemType Directory -Path $archiveHostKeyRoot -Force)
+try {
+    $archiveHostKeyLocalFile = Join-Path $archiveHostKeyRoot 'payload.bin'
+    [IO.File]::WriteAllText($archiveHostKeyLocalFile, 'payload')
+    $archiveHostKeyProbe = & $archiveHostKeyModule {
+        param($ValidKey, $Cases, $LocalFile, $LocalDirectory)
+        $script:archiveHostKeyLog = New-Object System.Collections.ArrayList
+        $script:archiveHostKeyScriptCreated = 0
+        $script:credentialInitializationError = ''
+        $script:Login = 'selftest'
+        $script:sftpUrl = 'sftp://selftest@127.0.0.1/'
+        $script:winSCPPath = 'C:\Windows\System32\cmd.exe'
+        $script:winSCPScriptEncoding = 'ASCII'
+        $script:winSCPIniPath = 'nul'
+        $script:resolvedSftpHost = '127.0.0.1'
+        $script:sftpPort = 22
+        $script:sftpConnectionTimeoutSeconds = 5
+        $script:sftpSynchronizationOptions = ''
+        $script:sftpDirectories = @{}
+        $script:archiveDefinitions = @()
+        $script:componentSettings = [pscustomobject]@{
+            SFTP = [pscustomobject]@{ ArchiveUpload = $false }
+            Synchronization = [pscustomobject]@{ BAZA_APP_SFTP = $false; BAZA_WWW_SFTP = $false }
+        }
+        $script:synchronizationSafety = [pscustomobject]@{ RequireNonEmptyBAZASource = $false }
+        $script:backupMonitoring = [pscustomobject]@{ SFTP = [pscustomobject]@{ OperationTimeoutSeconds = 5 } }
+        $script:progressSettings = [pscustomobject]@{ Enabled = $false; ShowWinSCPOutput = $false }
+
+        $script:sftpHostKey = $ValidKey
+        $validConfig = Test-SFTPConfig -SynchronizationOnly
+        $rows = @()
+        foreach ($case in $Cases) {
+            $script:archiveHostKeyLog.Clear()
+            $script:archiveHostKeyScriptCreated = 0
+            $script:sftpHostKey = [string]$case.Value
+            $configResult = Test-SFTPConfig -SynchronizationOnly
+            $configLog = @($script:archiveHostKeyLog.ToArray() | ForEach-Object { [string]$_.Message })
+            $script:archiveHostKeyLog.Clear()
+            $connection = @(Test-SFTPConnection -WinSCPPath $script:winSCPPath -RepositorySFTPUrl $script:sftpUrl -HostKey ([string]$case.Value))
+            $send = @(Send-FileViaWinSCP -WinSCPPath $script:winSCPPath -RepositorySFTPUrl $script:sftpUrl -HostKey ([string]$case.Value) -LocalFilePath $LocalFile -RemoteDirectory 'x')
+            $initialize = @(Initialize-BRAVOSFTPRemoteDirectories -WinSCPPath $script:winSCPPath -RepositorySFTPUrl $script:sftpUrl -HostKey ([string]$case.Value) -RemoteDirectories @('x/y'))
+            $sync = @(Sync-FolderToSFTP -WinSCPPath $script:winSCPPath -RepositorySFTPUrl $script:sftpUrl -HostKey ([string]$case.Value) -LocalDirectory $LocalDirectory -RemoteDirectory 'x')
+            $rows += [pscustomobject]@{
+                Name = [string]$case.Name
+                ConfigResult = $configResult
+                ConfigLog = $configLog
+                Connection = $connection
+                Send = $send
+                Initialize = $initialize
+                Sync = $sync
+                ScriptCreated = $script:archiveHostKeyScriptCreated
+                Log = @($script:archiveHostKeyLog.ToArray() | ForEach-Object { [string]$_.Message })
+            }
+        }
+        [pscustomobject]@{ ValidConfig = $validConfig; Rows = $rows }
+    } $archiveHostKeyValid $archiveHostKeyInvalidCases $archiveHostKeyLocalFile $archiveHostKeyRoot
+} finally {
+    Remove-Item -LiteralPath $archiveHostKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Test-BRAVOCondition -Condition ([bool]$archiveHostKeyProbe.ValidConfig) `
+    -Name 'Archive/HostKeyValidFingerprintPassesSftpConfig' `
+    -Failure "Test-SFTPConfig мусить приймати валідний відбиток (ssh-ed25519 255 SHA256:...); інакше SFTP блокується завжди"
+
+$archiveHostKeyConfigFailures = @(
+    $archiveHostKeyProbe.Rows | Where-Object {
+        $_.ConfigResult -ne $false -or
+        @($_.ConfigLog | Where-Object { $_ -like '*SFTP host key*' }).Count -lt 1
+    } | ForEach-Object { $_.Name }
+)
+Test-BRAVOCondition -Condition ($archiveHostKeyConfigFailures.Count -eq 0) `
+    -Name 'Archive/HostKeyInvalidFailsSftpConfig' `
+    -Failure "Test-SFTPConfig мусить повертати `$false і логувати причину для невалідного sftpHostKey (шлях до exit 30 через `$sftpConfigurationValid); збої: $([string]::Join(', ', $archiveHostKeyConfigFailures))"
+
+$archiveHostKeyTransportFailures = @(
+    $archiveHostKeyProbe.Rows | Where-Object {
+        -not ($_.Connection.Count -eq 1 -and $_.Connection[0] -eq $false -and
+            $_.Send.Count -eq 1 -and $_.Send[0] -eq $false -and
+            $_.Sync.Count -eq 1 -and $_.Sync[0] -eq $false -and
+            $_.Initialize.Count -eq 0 -and
+            $_.ScriptCreated -eq 0 -and
+            @($_.Log | Where-Object { $_ -like '*SFTP host key відхилено*' }).Count -eq 4)
+    } | ForEach-Object { $_.Name }
+)
+Test-BRAVOCondition -Condition ($archiveHostKeyTransportFailures.Count -eq 0) `
+    -Name 'Archive/HostKeyInvalidNeverCreatesWinSCPScriptOrProcess' `
+    -Failure "Test-SFTPConnection/Send-FileViaWinSCP/Initialize-BRAVOSFTPRemoteDirectories/Sync-FolderToSFTP з невалідним ключем мусять fail-closed повернутись ДО створення командного файлу WinSCP (жодного скрипта/процесу); збої: $([string]::Join(', ', $archiveHostKeyTransportFailures))"
+
+$archiveHostKeyEchoes = @(
+    $archiveHostKeyProbe.Rows | Where-Object {
+        $row = $_
+        $value = [string](@($archiveHostKeyInvalidCases | Where-Object { $_.Name -eq $row.Name })[0].Value)
+        $value.Length -ge 3 -and $row.Name -ne 'AcceptNew' -and
+        @(@($row.Log) + @($row.ConfigLog) | Where-Object { ([string]$_).Contains($value) }).Count -gt 0
+    } | ForEach-Object { $_.Name }
+)
+Test-BRAVOCondition -Condition ($archiveHostKeyEchoes.Count -eq 0) `
+    -Name 'Archive/HostKeyInvalidIsNotEchoedToLog' `
+    -Failure "журнал не повинен містити сирого значення sftpHostKey; збої: $([string]::Join(', ', $archiveHostKeyEchoes))"
+
+# Власний лог: невалідний ключ -> жодного вивантаження (best-effort WARNING).
+$archiveOwnLogBadKey = Invoke-BRAVOSelfTestArchiveOwnLogUploadScenario -Module $archiveOwnLogModule -Enabled $true -HostKey '*' -LogFilePath $archiveOwnLogFile
+Test-BRAVOCondition -Condition (
+    $archiveOwnLogBadKey.InitDirCalls -eq 0 -and
+    $archiveOwnLogBadKey.SendCalls -eq 0
+) -Name 'Archive/OwnLogUploadSkippedForInvalidHostKey' `
+    -Failure "вивантаження власного логу з sftpHostKey='*' має бути пропущено; факт: init=$($archiveOwnLogBadKey.InitDirCalls) send=$($archiveOwnLogBadKey.SendCalls)"
+
+# -SyncBAZA: невалідна SFTP-конфігурація (зокрема sftpHostKey) -> 30 раніше за SftpFailed.
+$archiveSyncExitModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText $archiveScriptText `
+    -FunctionNames @('Resolve-BRAVOSyncBazaExitCode')
+$archiveSyncExitCodes = & $archiveSyncExitModule {
+    [pscustomobject]@{
+        InvalidConfig = (Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $false -EmptySourceWarningCount 0 -InvalidConfiguration $true)
+        InvalidConfigBeatsSuccess = (Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $true -EmptySourceWarningCount 0 -InvalidConfiguration $true)
+        SftpFailed = (Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $false -EmptySourceWarningCount 0)
+        Clean = (Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $true -EmptySourceWarningCount 0)
+    }
+}
+Test-BRAVOCondition -Condition (
+    $archiveSyncExitCodes.InvalidConfig -eq 30 -and
+    $archiveSyncExitCodes.InvalidConfigBeatsSuccess -eq 30 -and
+    $archiveSyncExitCodes.SftpFailed -eq (Resolve-BRAVOExitCode -SftpFailed) -and
+    $archiveSyncExitCodes.Clean -eq 0 -and
+    $archiveScriptText.Contains('ConfigurationInvalid = $true') -and
+    $archiveScriptText -match '(?s)Resolve-BRAVOSyncBazaExitCode -SyncSucceeded \$manualSyncSuccess -EmptySourceWarningCount \$syncBazaEmptySourceWarned\.Count -InvalidConfiguration'
+) -Name 'Archive/SyncBazaInvalidSftpConfigurationExits30' `
+    -Failure "-SyncBAZA з невалідною SFTP-конфігурацією (sftpHostKey) мусить завершуватись 30 (InvalidConfiguration), а не 50; отримано: $($archiveSyncExitCodes | ConvertTo-Json -Compress)"
