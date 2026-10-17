@@ -5819,7 +5819,7 @@ if (-not $environmentPreflight.IsWritable) {
                 -Severity "CRITICAL" `
                 -NotificationMode $NotificationMode `
                 -RoutingTable $backupMonitoring.NotificationRouting
-            $environmentChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $environmentMessage
+            $environmentChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $environmentMessage -OmittedContext "CRITICAL"
             Send-BRAVONotificationChunks `
                 -Provider $NotificationProvider `
                 -WebhookUrl $script:NotificationWebhookUrls[$environmentRoute] `
@@ -6473,7 +6473,7 @@ if ($healthIssues.Count -eq 0) {
                 -Severity $successNotificationSeverity `
                 -NotificationMode $NotificationMode `
                 -RoutingTable $backupMonitoring.NotificationRouting
-            $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage
+            $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage -OmittedContext $successNotificationSeverity
             Send-BRAVONotificationChunks `
                 -Provider $NotificationProvider `
                 -WebhookUrl $script:NotificationWebhookUrls[$successRoute] `
@@ -6691,7 +6691,7 @@ try {
         -Severity "CRITICAL" `
         -NotificationMode $NotificationMode `
         -RoutingTable $backupMonitoring.NotificationRouting
-    $issuesChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $slackMessage
+    $issuesChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $slackMessage -OmittedContext "CRITICAL"
     Send-BRAVONotificationChunks `
         -Provider $NotificationProvider `
         -WebhookUrl $script:NotificationWebhookUrls[$issuesRoute] `

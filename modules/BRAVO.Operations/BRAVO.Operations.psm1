@@ -1397,6 +1397,12 @@ function Add-BRAVOOperationsOutboxItem {
                 }
             )
             LastError = (Protect-BRAVOOperationsFailureText -Text $LastError)
+            # #481 (review F5): усі шляхи, що викликають цю функцію, передають
+            # payload, уже замаскований у Send-BRAVOOperationsEvent. Прапорець
+            # каже дренажу не маскувати item повторно (інакше при тимчасово
+            # недоступному джерелі секретів безпечний item пішов би заглушкою
+            # і був би видалений). Legacy-items без прапорця маскуються при дренажі.
+            EgressMasked = $true
         }
         Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsOutboxItemPath -EventId $EventId) -Object $item
         Write-BRAVOOperationsLog -Level 'WARNING' `
@@ -1961,7 +1967,12 @@ function Invoke-BRAVOOperationsOutboxDrain {
                 # Лише події: heartbeat не несе вільного тексту. Новіші items
                 # уже замасковані — повторне маскування ідемпотентне.
                 $itemKind = Get-BRAVOOperationsJsonPropertyString -Object $item -Name 'Kind'
-                if (($itemKind -eq 'event' -or $itemApiPath -eq '/api/v1/events') -and $requestBodyHashtable.ContainsKey('payload')) {
+                # #481 (F5): item з EgressMasked=$true уже замаскований при постановці
+                # в чергу — повторно не маскується (StrictMode-safe читання).
+                $itemEgressMasked = $false
+                $egressMaskedProperty = $item.PSObject.Properties['EgressMasked']
+                if ($null -ne $egressMaskedProperty -and $egressMaskedProperty.Value -eq $true) { $itemEgressMasked = $true }
+                if (-not $itemEgressMasked -and ($itemKind -eq 'event' -or $itemApiPath -eq '/api/v1/events') -and $requestBodyHashtable.ContainsKey('payload')) {
                     if ($null -eq $drainEgressSecretSet) { $drainEgressSecretSet = Resolve-BRAVOEgressSecretSet }
                     $requestBodyHashtable['payload'] = ConvertTo-BRAVOOperationsEgressValue -Value $requestBodyHashtable['payload'] -SecretSet $drainEgressSecretSet
                 }

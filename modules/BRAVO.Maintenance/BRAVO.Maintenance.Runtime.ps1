@@ -3205,7 +3205,7 @@ function Invoke-NotificationWebhook {
     )
 
     try {
-        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $Message
+        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $Message -OmittedContext "Maintenance"
         Send-BRAVONotificationChunks `
             -Provider $NotificationProvider `
             -WebhookUrl $WebhookUrl `
@@ -3253,19 +3253,6 @@ function Send-SlackAlert {
         "Шлях .* не існує або недоступний"
     )
 
-    # F4/#481: текст алерта проходить єдиний egress-шар ПІСЛЯ $isSpaceError
-    # (регекс працює на сирому локальному тексті) і ДО будь-якої черги
-    # (CriticalErrorsList, NotificationAlertQueue) та негайної відправки:
-    # у чергах, а отже й у Send-FinalReport, лежить уже замаскований текст.
-    # У ізольованому харнесі без Logging — заглушка, а не сирий текст.
-    if (-not [string]::IsNullOrEmpty($Message)) {
-        if ($null -ne (Get-Command -Name Protect-BRAVOEgressText -ErrorAction SilentlyContinue)) {
-            $Message = (Protect-BRAVOEgressText -Text $Message -Channel 'maintenance/alert').Text
-        } else {
-            $Message = '[деталі приховано: маскування секретів не вдалося — див. журнал BRAVO на сервері]'
-        }
-    }
-
     $effectiveSeverity = if ($Severity) {
         $Severity
     } elseif ($IsCritical -or $isSpaceError) {
@@ -3307,6 +3294,20 @@ function Send-SlackAlert {
         -RoutingTable $bravoSettings.NotificationRouting
     if ($notificationRoute -eq "none") {
         return
+    }
+
+    # F4/#481: текст алерта проходить єдиний egress-шар ПІСЛЯ $isSpaceError
+    # та ПІСЛЯ ранніх виходів (SUCCESS/route=none: без зайвих CredRead)
+    # (регекс працює на сирому локальному тексті) і ДО будь-якої черги
+    # (CriticalErrorsList, NotificationAlertQueue) та негайної відправки:
+    # у чергах, а отже й у Send-FinalReport, лежить уже замаскований текст.
+    # У ізольованому харнесі без Logging — заглушка, а не сирий текст.
+    if (-not [string]::IsNullOrEmpty($Message)) {
+        if ($null -ne (Get-Command -Name Protect-BRAVOEgressText -ErrorAction SilentlyContinue)) {
+            $Message = (Protect-BRAVOEgressText -Text $Message -Channel 'maintenance/alert').Text
+        } else {
+            $Message = '[деталі приховано: маскування секретів не вдалося — див. журнал BRAVO на сервері]'
+        }
     }
 
     if ($isSpaceError) {

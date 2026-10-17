@@ -6431,7 +6431,8 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1',
         'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1',
         'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1',
-        'BRAVO_RESTORE_TEST.ps1'
+        'BRAVO_RESTORE_TEST.ps1',
+        'BRAVO_OPERATIONS_HEARTBEAT.ps1'
     )
     $egressRuntimesWithoutRegistration = @($egressRuntimeFiles | Where-Object {
             $egressRuntimeText = [IO.File]::ReadAllText((Join-Path $root $_), [Text.Encoding]::UTF8)
@@ -6441,6 +6442,48 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Condition ($egressRuntimesWithoutRegistration.Count -eq 0) `
         -Name 'Egress/EveryRuntimeRegistersSecretSource' `
         -Failure "кожен runtime (Maintenance/Archive/Health/DataRestore/RESTORE_TEST) мусить реєструвати джерело секретів (Register-BRAVOEgressSecretSource -Resolver { ... Get-BRAVOLogMaskSecretSet ... }); без нього egress маскує лише за шаблонами; не реєструють: $($egressRuntimesWithoutRegistration -join ', ')"
+
+    # --- (6b) F6 (#481 review): ПРОДАКШН-текст resolver-а (рядок реєстрації з
+    # Maintenance runtime, дослівно) виконується в області, де задано
+    # $credentialSettings, а Get-BRAVOLogMaskSecretSet підмінено заглушкою.
+    # Секрет із заглушки мусить дійти до egress-маскування Notifications.
+    $egressProdRuntimeText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $egressProdMatch = [regex]::Match($egressProdRuntimeText, '(?m)^\s*Register-BRAVOEgressSecretSource\s+-Resolver\s+\{(.*)\}\s*$')
+    $egressProdSecret = 'ProdResolverSecret-' + [guid]::NewGuid().ToString('N')
+    $egressProdMarker = [pscustomobject]@{ Marker = 'credential-settings-marker' }
+    $egressProdHadSettings = Test-Path -LiteralPath 'Variable:global:credentialSettings'
+    $egressProdPreviousSettings = if ($egressProdHadSettings) { $global:credentialSettings } else { $null }
+    $egressProdSent = @()
+    try {
+        $global:credentialSettings = $egressProdMarker
+        $global:egressProdStubSecret = $egressProdSecret
+        function global:Get-BRAVOLogMaskSecretSet {
+            param([Alias('CredentialSettings')]$Settings)
+            $secrets = @()
+            if ($null -ne $Settings) { $secrets = @($global:egressProdStubSecret) }
+            return [pscustomobject]@{ Secrets = $secrets }
+        }
+        if ($egressProdMatch.Success) {
+            Register-BRAVOEgressSecretSource -Resolver ([ScriptBlock]::Create($egressProdMatch.Groups[1].Value))
+            & $egressNotificationsModule { $script:egressSent.Clear() }
+            Send-BRAVONotification -Severity ERROR -Message "збій: секрет $egressProdSecret у тексті" -Provider slack -CredentialTargets @{} -WarningAction SilentlyContinue
+            $egressProdSent = @(& $egressNotificationsModule { $script:egressSent.ToArray() })
+        }
+    } finally {
+        Remove-Item -LiteralPath 'Function:\global:Get-BRAVOLogMaskSecretSet' -Force -ErrorAction SilentlyContinue
+        Remove-Variable -Name egressProdStubSecret -Scope Global -Force -ErrorAction SilentlyContinue
+        if ($egressProdHadSettings) { $global:credentialSettings = $egressProdPreviousSettings } else { Remove-Variable -Name credentialSettings -Scope Global -Force -ErrorAction SilentlyContinue }
+        Unregister-BRAVOEgressSecretSource
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $egressProdMatch.Success -and
+            $egressProdSent.Count -eq 1 -and
+            -not $egressProdSent[0].Contains($egressProdSecret) -and
+            $egressProdSent[0].Contains('***')
+        ) `
+        -Name 'Egress/ProductionResolverYieldsCredentialSecrets' `
+        -Failure "продакшн-resolver (дослівний рядок реєстрації з Maintenance runtime) мусить повертати секрети з Get-BRAVOLogMaskSecretSet для `$credentialSettings, а egress -- маскувати їх; рядок знайдено=$($egressProdMatch.Success), надіслано=$($egressProdSent.Count), секрет у повідомленні=$(if ($egressProdSent.Count -ge 1) { $egressProdSent[0].Contains($egressProdSecret) } else { '<немає>' })"
 
     # --- (7) Maintenance: Send-SlackAlert маскує текст ДО черг.
     $egressMaintenanceText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)

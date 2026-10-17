@@ -19,8 +19,14 @@
   шаблонами, винятки CredRead і `EndpointError` теж маскуються.
   `Send-BRAVOOperationsEvent` маскує `message`/`component`/`services`/`details`
   (рекурсивно до глибини 8) до конверта, а `LastError`/`DeadLetterReason`
-  маскуються централізовано; дренаж маскує `payload` застарілих items перед
-  відправкою (файли на диску не переписуються). Коли маскування неможливе,
+  маскуються централізовано; дренаж (у кожному процесі, що дренує outbox, зокрема
+  `BRAVO_OPERATIONS_HEARTBEAT.ps1`, який тепер теж реєструє джерело секретів)
+  маскує `payload` лише застарілих items без `EgressMasked` (файли на диску не
+  переписуються; нові items уже замасковані й несуть `EgressMasked = true`).
+  Прямі виклики `ConvertTo-BRAVONotificationPayloadText` в Archive/Health/
+  Maintenance передають `-OmittedContext` (severity), тож заглушка fail-closed
+  зберігає рівень; `Send-SlackAlert` маскує після ранніх виходів
+  (SUCCESS/`route=none`). Коли маскування неможливе,
   назовні йде заглушка, а в журнал — один WARNING без тексту
   (`-Secondary`, код завершення не змінюється). `Invoke-CommandWithLog`
   маскує вивід і текст винятку; `BRAVO.Operations` тепер сам імпортує

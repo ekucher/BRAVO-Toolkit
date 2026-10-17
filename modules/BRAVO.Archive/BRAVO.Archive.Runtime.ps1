@@ -772,7 +772,7 @@ function Send-ToolIntegrityAlert {
                         -LogPath ([string]$script:logFile) `
                         -LogLabel "Журнал"
 
-                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText -OmittedContext "CRITICAL"
                     Send-BRAVONotificationChunks `
                         -Provider $script:notificationProvider `
                         -WebhookUrl $notificationWebhookUrl `
@@ -879,7 +879,7 @@ function Send-BRAVOArchiveFreeSpaceAlert {
                         -LogPath ([string]$script:logFile) `
                         -LogLabel 'Журнал'
 
-                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText -OmittedContext "CRITICAL"
                     Send-BRAVONotificationChunks `
                         -Provider $script:notificationProvider `
                         -WebhookUrl $notificationWebhookUrl `
@@ -5173,7 +5173,7 @@ function Send-BAZAIncompatibleNameAlert {
             -LogLabel "Повний перелік"
 
             try {
-                $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message
+                $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message -OmittedContext "WARNING"
                 Send-BRAVONotificationChunks `
                     -Provider $script:notificationProvider `
                     -WebhookUrl $notificationWebhookUrl `

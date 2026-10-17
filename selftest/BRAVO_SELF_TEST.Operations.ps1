@@ -2081,6 +2081,53 @@
     ) -Name 'Operations/OutboxItemOnDiskHasNoSecretLegacyDrainMasksBody' `
       -Failure "тіло POST застарілого item (сирий payload на диску) мусить бути замасковане дренажем перед відправкою; викликів з eventId=$($opsEgressLegacyCalls.Count), секрет у тілі=$($opsEgressLegacyBody.Contains($opsEgressSecret)), пароль URL у тілі=$($opsEgressLegacyBody.Contains($opsEgressUrlPassword))"
 
+    # (e) F5 (#481 review): item з EgressMasked=$true уже замаскований при постановці
+    # в чергу; дренаж НЕ маскує його повторно. Тимчасово недоступне джерело
+    # секретів не повинно перетворити безпечний item на заглушку (з наступним
+    # видаленням після доставки).
+    Register-BRAVOEgressSecretSource -Resolver { throw 'джерело секретів тимчасово недоступне' }
+    $opsEgressFlaggedDir = Join-Path $opsSelfTestRoot 'EgressFlaggedDrain'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $opsEgressFlaggedDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'egress-test-api-key' }
+    $opsEgressFlaggedOutbox = Join-Path $opsEgressFlaggedDir 'Outbox'
+    [void][IO.Directory]::CreateDirectory($opsEgressFlaggedOutbox)
+    $opsEgressFlaggedEventId = [guid]::NewGuid().ToString()
+    $opsEgressFlaggedItem = [ordered]@{
+        Kind = 'event'
+        EventId = $opsEgressFlaggedEventId
+        OccurredAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o')
+        SchemaVersion = 1
+        ApiPath = '/api/v1/events'
+        RequestBody = [ordered]@{
+            category = 'backup'
+            severity = 'ERROR'
+            payload = [ordered]@{ message = 'flagged-already-masked-text ***' }
+            eventId = $opsEgressFlaggedEventId
+            occurredAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o')
+            schemaVersion = 1
+        }
+        EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o')
+        AttemptCount = 1
+        NextRetryAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o')
+        LastError = $null
+        EgressMasked = $true
+    }
+    [IO.File]::WriteAllText((Join-Path $opsEgressFlaggedOutbox ($opsEgressFlaggedEventId + '.json')), ($opsEgressFlaggedItem | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }   # дренаж flagged item
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }   # сам heartbeat
+    Send-BRAVOOperationsHeartbeat -OperationsReportingSettings $opsSettings -CredentialTargets $opsCredentialTargets `
+        -InstitutionCode 'INST1' -BravoVersion '9.9.9-egress'
+    $opsEgressFlaggedCalls = @($global:BRAVOOpsSelfTestHttpCalls.ToArray() | Where-Object { [string]$_.BodyText -like "*$opsEgressFlaggedEventId*" })
+    $opsEgressFlaggedBody = if ($opsEgressFlaggedCalls.Count -ge 1) { [string]$opsEgressFlaggedCalls[0].BodyText } else { '' }
+    Test-BRAVOCondition -Condition (
+        $opsEgressFlaggedCalls.Count -eq 1 -and
+        $opsEgressFlaggedBody.Contains('flagged-already-masked-text') -and
+        -not $opsEgressFlaggedBody.Contains('деталі приховано')
+    ) -Name 'Operations/DrainDoesNotRemaskAlreadyMaskedItem' `
+      -Failure "item з EgressMasked=true не маскується повторно: при недоступному джерелі секретів тіло мусить піти без змін, без заглушки; викликів=$($opsEgressFlaggedCalls.Count), тіло=$opsEgressFlaggedBody"
+
     # Недоступне джерело секретів (resolver кидає) -> подія не губиться, але
     # вільний текст замінюється заглушкою, а не йде сирим.
     Register-BRAVOEgressSecretSource -Resolver { throw 'джерело секретів недоступне' }
