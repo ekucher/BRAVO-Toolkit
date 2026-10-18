@@ -15910,11 +15910,85 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Scheduler/HealthScheduleIsConfigOwned" `
         -Failure "інсталятор не повинен змінювати інтервал health-check; джерелом правди є BRAVO.config"
+    # #482: AST-перевірка тіла Set-BRAVOProtectedRuntimeAcl (а не Contains по файлу):
+    # (a) повний обхід дерева (while + Get-ChildItem) завершується ДО циклу застосування ACL;
+    # (b) цикл foreach ($runtimeItem in $runtimeItems) перед Set-Acl викликає
+    #     Get-BRAVOReparsePointInPathChain -Path $runtimeItem;
+    # (c) перевірка ланцюга кореня/предків (з throw) стоїть ДО першого Set-Acl і до обходу.
+    # (e) кожен каталог перед переліком проходить strict-перевірку ланцюга (усередині while).
+    # (d) після повного обходу й ДО циклу застосування є throw (reparse point усередині дерева фатальний).
+    $runtimeAclAstErrors = $null
+    $runtimeAclAst = [Management.Automation.Language.Parser]::ParseInput(
+        $taskInstallScriptText, [ref]$null, [ref]$runtimeAclAstErrors)
+    $runtimeAclFunction = @($runtimeAclAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Set-BRAVOProtectedRuntimeAcl'
+    }, $true) | Select-Object -First 1)
+    $runtimeAclRecursiveOk = $false
+    if ($runtimeAclFunction.Count -eq 1) {
+        $runtimeAclBody = $runtimeAclFunction[0].Body
+        $runtimeAclCommands = @($runtimeAclBody.FindAll({
+            param($node) $node -is [Management.Automation.Language.CommandAst]
+        }, $true))
+        $runtimeAclWhile = @($runtimeAclBody.FindAll({
+            param($node) $node -is [Management.Automation.Language.WhileStatementAst]
+        }, $true) | Where-Object {
+            @($_.Body.FindAll({
+                param($inner)
+                $inner -is [Management.Automation.Language.CommandAst] -and
+                $inner.GetCommandName() -eq 'Get-ChildItem'
+            }, $true)).Count -gt 0
+        } | Select-Object -First 1)
+        $runtimeAclForeach = @($runtimeAclBody.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.ForEachStatementAst] -and
+            $node.Variable.VariablePath.UserPath -eq 'runtimeItem' -and
+            $node.Condition.Extent.Text -eq '$runtimeItems'
+        }, $true) | Select-Object -First 1)
+        $runtimeAclChainCalls = @($runtimeAclCommands | Where-Object {
+            $_.GetCommandName() -eq 'Get-BRAVOReparsePointInPathChain'
+        })
+        $runtimeAclSetAcl = @($runtimeAclCommands | Where-Object { $_.GetCommandName() -eq 'Set-Acl' })
+        if ($runtimeAclWhile.Count -eq 1 -and $runtimeAclForeach.Count -eq 1 -and
+            $runtimeAclChainCalls.Count -ge 2 -and $runtimeAclSetAcl.Count -ge 1) {
+            $rootChain = $runtimeAclChainCalls | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1
+            $itemChain = @($runtimeAclChainCalls | Where-Object {
+                $_.Extent.StartOffset -ge $runtimeAclForeach[0].Body.Extent.StartOffset -and
+                $_.Extent.EndOffset -le $runtimeAclForeach[0].Body.Extent.EndOffset -and
+                $_.Extent.Text -match '-Path\s+\$runtimeItem\b'
+            } | Select-Object -First 1)
+            $firstSetAcl = ($runtimeAclSetAcl | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
+            $rootThrows = @($runtimeAclBody.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.ThrowStatementAst] -and
+                $node.Extent.StartOffset -gt $rootChain.Extent.StartOffset -and
+                $node.Extent.StartOffset -lt $runtimeAclWhile[0].Extent.StartOffset
+            }, $true)).Count -ge 1
+            $whileChainOk = @($runtimeAclWhile[0].Body.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -eq 'Get-BRAVOReparsePointInPathChain' -and
+                $node.Extent.Text -match '-Strict'
+            }, $true)).Count -ge 1
+            $innerThrows = @($runtimeAclBody.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.ThrowStatementAst] -and
+                $node.Extent.StartOffset -ge $runtimeAclWhile[0].Extent.EndOffset -and
+                $node.Extent.StartOffset -lt $runtimeAclForeach[0].Extent.StartOffset
+            }, $true)).Count -ge 1
+            $runtimeAclRecursiveOk = (
+                $itemChain.Count -eq 1 -and $rootThrows -and $innerThrows -and $whileChainOk -and
+                $rootChain.Extent.StartOffset -lt $runtimeAclWhile[0].Extent.StartOffset -and
+                $runtimeAclWhile[0].Extent.EndOffset -le $runtimeAclForeach[0].Extent.StartOffset -and
+                $itemChain[0].Extent.StartOffset -lt $firstSetAcl.Extent.StartOffset -and
+                $firstSetAcl.Extent.StartOffset -ge $runtimeAclForeach[0].Body.Extent.StartOffset -and
+                $firstSetAcl.Extent.EndOffset -le $runtimeAclForeach[0].Body.Extent.EndOffset
+            )
+        }
+    }
     Test-BRAVOCondition `
-        -Condition (
-            $taskInstallScriptText.Contains('Get-ChildItem -LiteralPath $resolvedRoot -Force -Recurse') -and
-            $taskInstallScriptText.Contains('foreach ($runtimeItem in $runtimeItems)')
-        ) `
+        -Condition $runtimeAclRecursiveOk `
         -Name "Scheduler/ProtectedRuntimeRecursiveAcl" `
         -Failure "ACL hardening має застосовуватися до всіх наявних дочірніх файлів runtime"
     Test-BRAVOCondition `

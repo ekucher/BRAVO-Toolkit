@@ -1901,6 +1901,237 @@ try {
             }
         }
     }
+    & {
+        # #482 / P3: Set-BRAVOProtectedRuntimeAcl відмовляє (throw) на reparse point у корені, предках і
+        # БУДЬ-ДЕ всередині дерева ДО будь-якого Set-Acl; звичайний шлях поводиться як раніше.
+        # Set-Acl підміняється записувачем (SetOwner вимагає elevated-токена): реальні ACL не змінюються.
+        # Junction/symlink - справжні (mklink); якщо їх неможливо створити, перевірка позначається
+        # НЕДОСТУПНО з причиною (предикат reparse point НЕ підміняється, окрім окремого тесту підміни
+        # компонента посеред обходу). Scratch лежить поза профілем користувача (%ProgramData%), бо функція
+        # відмовляє для шляхів усередині профілю, а TEMP self-test-а лежить саме в ньому.
+        $acl482Functions = (@(
+                'Test-BRAVOPathIsReparsePoint', 'Get-BRAVOReparsePointInPathChain', 'Set-BRAVOProtectedRuntimeAcl'
+            ) | ForEach-Object {
+                $acl482Ast = & $b7ParseFunction $b7InstallText $_
+                if ($null -ne $acl482Ast) { $acl482Ast.Extent.Text } else { '' }
+            }) -join "`n`n"
+        $acl482Probe = {
+            param([string]$FunctionText, [string]$RuntimeRoot, [string]$FlipAfterFirstSetAclPath = '', [string]$FlipOnSecondQueryPath = '', [string]$DeleteAfterFirstSetAclPath = '')
+            $recordedCalls = New-Object System.Collections.ArrayList
+            $recordedWarnings = New-Object System.Collections.ArrayList
+            . ([scriptblock]::Create($FunctionText))
+            function Set-Acl {
+                param($LiteralPath, $AclObject, $ErrorAction)
+                [void]$recordedCalls.Add([pscustomobject]@{ Path = [string]$LiteralPath; Acl = $AclObject })
+                if ($DeleteAfterFirstSetAclPath -ne '' -and $recordedCalls.Count -eq 1) {
+                    # Лише для тесту зникнення компонента: реальне видалення після першого Set-Acl.
+                    Remove-Item -LiteralPath $DeleteAfterFirstSetAclPath -Force
+                }
+            }
+            function Write-Warning { param($Message) [void]$recordedWarnings.Add([string]$Message) }
+            function Write-Host { param($Object, $ForegroundColor) }
+            if ($FlipAfterFirstSetAclPath -ne '') {
+                # Лише для тесту підміни: після першого Set-Acl компонент стає reparse point.
+                function Test-BRAVOPathIsReparsePoint {
+                    param([string]$Path)
+                    if ($recordedCalls.Count -ge 1 -and $Path.TrimEnd('\') -eq $FlipAfterFirstSetAclPath) { return $true }
+                    try { $attributes = [System.IO.File]::GetAttributes($Path) } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { return $false }
+                    return (([int]$attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0)
+                }
+            }
+            if ($FlipOnSecondQueryPath -ne '') {
+                # Лише для тесту preflight-підміни: каталог перший раз (як дитина під час переліку) не
+                # reparse point, а при другому запиті (strict-перевірка перед його переліком) - вже так.
+                $queryCounts = @{}
+                function Test-BRAVOPathIsReparsePoint {
+                    param([string]$Path)
+                    $key = $Path.TrimEnd('\')
+                    if ($key -eq $FlipOnSecondQueryPath) {
+                        $queryCounts[$key] = 1 + [int]$queryCounts[$key]
+                        if ($queryCounts[$key] -ge 2) { return $true }
+                    }
+                    try { $attributes = [System.IO.File]::GetAttributes($Path) } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { return $false }
+                    return (([int]$attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0)
+                }
+            }
+            $errorMessage = $null
+            try { $null = Set-BRAVOProtectedRuntimeAcl -RuntimeRoot $RuntimeRoot } catch { $errorMessage = $_.Exception.Message }
+            return [pscustomobject]@{ Calls = @($recordedCalls); Warnings = @($recordedWarnings); Error = $errorMessage }
+        }
+        $acl482Scratch = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('bravo-acl482-' + [guid]::NewGuid().ToString('N'))
+        $acl482Junctions = New-Object System.Collections.ArrayList
+        $acl482NewLink = {
+            param([string]$LinkPath, [string]$TargetPath, [string]$Kind)
+            # mklink пише в stderr при невдачі: локальне 'Continue' не дає NativeCommandError перервати
+            # секцію; успіх визначається кодом завершення І наявністю reparse point.
+            $ErrorActionPreference = 'Continue'
+            $mklinkSwitch = if ($Kind -eq 'D') { '/D' } else { '/J' }
+            $null = & cmd.exe /c mklink $mklinkSwitch "$LinkPath" "$TargetPath" 2>&1
+            $mklinkExit = $LASTEXITCODE
+            $created = ($mklinkExit -eq 0) -and [IO.Directory]::Exists($LinkPath) -and
+                (([int][IO.File]::GetAttributes($LinkPath) -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)
+            if ($created) { [void]$acl482Junctions.Add($LinkPath) }
+            return $created
+        }
+        $acl482Refused = {
+            param($Result, [string]$MustMention)
+            return ($Result.Calls.Count -eq 0 -and $null -ne $Result.Error -and
+                $Result.Error.Contains('reparse point') -and $Result.Error.Contains($MustMention))
+        }
+        $acl482NoLinkReason = 'mklink не створив reparse point (немає прав або файлова система не підтримує)'
+        try {
+            [void][IO.Directory]::CreateDirectory($acl482Scratch)
+            # 1) Звичайний шлях: корінь, підкаталог і обидва файли; Users ReadAndExecute, без WARNING.
+            $acl482Runtime = Join-Path $acl482Scratch 'runtime'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482Runtime 'sub'))
+            [IO.File]::WriteAllText((Join-Path $acl482Runtime 'f.ps1'), '# x')
+            [IO.File]::WriteAllText((Join-Path $acl482Runtime 'sub\g.ps1'), '# x')
+            $acl482Normal = & $acl482Probe $acl482Functions $acl482Runtime
+            $acl482NormalPaths = @($acl482Normal.Calls | ForEach-Object { $_.Path } | Sort-Object)
+            $acl482Expected = @($acl482Runtime, (Join-Path $acl482Runtime 'f.ps1'), (Join-Path $acl482Runtime 'sub'), (Join-Path $acl482Runtime 'sub\g.ps1') | Sort-Object)
+            # Права, прочитані з ACE, містять біт Synchronize: маскуємо його.
+            $acl482UsersOk = @($acl482Normal.Calls | Where-Object {
+                    $usersRules = @($_.Acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) |
+                            Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' })
+                    $usersRules.Count -eq 1 -and
+                        ([int]$usersRules[0].FileSystemRights -band 0xFFFFF) -eq [int][Security.AccessControl.FileSystemRights]::ReadAndExecute
+                }).Count -eq 4
+            Test-BRAVOCondition -Condition (
+                $null -eq $acl482Normal.Error -and ($acl482NormalPaths -join '|') -eq ($acl482Expected -join '|') -and
+                $acl482UsersOk -and $acl482Normal.Warnings.Count -eq 0
+            ) -Name 'Scheduler/RuntimeAclNormalPathUnchanged' `
+                -Failure ("звичайний runtime без посилань: Set-Acl для кореня й усіх 3 елементів, Users=ReadAndExecute, без WARNING: " + [string]$acl482Normal.Error + ' | ' + ($acl482NormalPaths -join ', '))
+
+            # Спільна ціль посилань: жоден Set-Acl не повинен її зачепити.
+            $acl482Victim = Join-Path $acl482Scratch 'victim'
+            [void][IO.Directory]::CreateDirectory($acl482Victim)
+            [IO.File]::WriteAllText((Join-Path $acl482Victim 'secret.txt'), 'x')
+            $acl482TouchedVictim = {
+                param($Result)
+                return (@($Result.Calls | Where-Object { $_.Path.StartsWith($acl482Victim, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+            }
+
+            # 2) Junction як runtime-корінь -> throw, жодного Set-Acl, ціль не чіпається.
+            $acl482LinkRoot = Join-Path $acl482Scratch 'junction-root'
+            $acl482RootCreated = & $acl482NewLink $acl482LinkRoot $acl482Victim 'J'
+            $acl482RootResult = if ($acl482RootCreated) { & $acl482Probe $acl482Functions $acl482LinkRoot } else { $null }
+            Test-BRAVOCondition -Condition (
+                $acl482RootCreated -and (& $acl482Refused $acl482RootResult $acl482LinkRoot) -and -not (& $acl482TouchedVictim $acl482RootResult)
+            ) -Name 'Scheduler/RuntimeAclRefusesJunctionRoot' `
+                -Failure ("junction як runtime-корінь має призвести до throw ДО Set-Acl: " + $(if ($acl482RootResult) { [string]$acl482RootResult.Error } else { 'junction не створено' })) `
+                -EnvironmentLimitation $(if ($acl482RootCreated) { '' } else { $acl482NoLinkReason })
+
+            # 3) Junction як ПРЕДОК runtime-кореня -> throw, жодного Set-Acl.
+            $acl482AncestorTarget = Join-Path $acl482Scratch 'ancestor-target'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482AncestorTarget 'rt'))
+            $acl482LinkAncestor = Join-Path $acl482Scratch 'junction-ancestor'
+            $acl482AncestorCreated = & $acl482NewLink $acl482LinkAncestor $acl482AncestorTarget 'J'
+            $acl482AncestorResult = if ($acl482AncestorCreated) { & $acl482Probe $acl482Functions (Join-Path $acl482LinkAncestor 'rt') } else { $null }
+            Test-BRAVOCondition -Condition (
+                $acl482AncestorCreated -and (& $acl482Refused $acl482AncestorResult $acl482LinkAncestor)
+            ) -Name 'Scheduler/RuntimeAclRefusesJunctionAncestor' `
+                -Failure ("junction у предках runtime-кореня має призвести до throw ДО Set-Acl: " + $(if ($acl482AncestorResult) { [string]$acl482AncestorResult.Error } else { 'junction не створено' })) `
+                -EnvironmentLimitation $(if ($acl482AncestorCreated) { '' } else { $acl482NoLinkReason })
+
+            # 4) Дочірній junction -> throw (fail-closed), ЖОДНОГО Set-Acl (навіть для звичайних сусідів),
+            # повідомлення називає шлях; ціль не чіпається.
+            $acl482ChildRoot = Join-Path $acl482Scratch 'child-runtime'
+            [void][IO.Directory]::CreateDirectory($acl482ChildRoot)
+            [IO.File]::WriteAllText((Join-Path $acl482ChildRoot 'real.ps1'), '# x')
+            $acl482ChildLink = Join-Path $acl482ChildRoot 'link'
+            $acl482ChildCreated = & $acl482NewLink $acl482ChildLink $acl482Victim 'J'
+            $acl482ChildResult = if ($acl482ChildCreated) { & $acl482Probe $acl482Functions $acl482ChildRoot } else { $null }
+            Test-BRAVOCondition -Condition (
+                $acl482ChildCreated -and (& $acl482Refused $acl482ChildResult $acl482ChildLink) -and
+                -not (& $acl482TouchedVictim $acl482ChildResult)
+            ) -Name 'Scheduler/RuntimeAclRefusesJunctionChild' `
+                -Failure ("дочірній reparse point має призвести до throw ДО першого Set-Acl, повідомлення називає шлях: " + $(if ($acl482ChildResult) { [string]$acl482ChildResult.Error + ' | calls=' + $acl482ChildResult.Calls.Count } else { 'junction не створено' })) `
+                -EnvironmentLimitation $(if ($acl482ChildCreated) { '' } else { $acl482NoLinkReason })
+
+            # 5) Symlink (каталог) як runtime-корінь і як предок: mklink /D потребує SeCreateSymbolicLinkPrivilege.
+            $acl482SymTarget = Join-Path $acl482Scratch 'sym-target'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482SymTarget 'rt'))
+            $acl482SymLink = Join-Path $acl482Scratch 'symlink-dir'
+            $acl482SymCreated = & $acl482NewLink $acl482SymLink $acl482SymTarget 'D'
+            $acl482SymRootResult = $null
+            $acl482SymAncestorResult = $null
+            if ($acl482SymCreated) {
+                $acl482SymRootResult = & $acl482Probe $acl482Functions $acl482SymLink
+                $acl482SymAncestorResult = & $acl482Probe $acl482Functions (Join-Path $acl482SymLink 'rt')
+            }
+            Test-BRAVOCondition -Condition (
+                $acl482SymCreated -and (& $acl482Refused $acl482SymRootResult $acl482SymLink) -and
+                (& $acl482Refused $acl482SymAncestorResult $acl482SymLink)
+            ) -Name 'Scheduler/RuntimeAclRefusesSymlinkRootAndAncestor' `
+                -Failure ("symlink як runtime-корінь/предок має призвести до throw ДО Set-Acl (symlink створено: $acl482SymCreated)") `
+                -EnvironmentLimitation $(if ($acl482SymCreated) { '' } else { 'mklink /D не створив символічне посилання на каталог (немає SeCreateSymbolicLinkPrivilege)' })
+
+            # 6) Глибокий junction-нащадок + кирилиця й пробіли у шляху -> throw без жодного Set-Acl.
+            $acl482Victim2 = Join-Path $acl482Scratch 'ціль з пробілами'
+            [void][IO.Directory]::CreateDirectory($acl482Victim2)
+            [IO.File]::WriteAllText((Join-Path $acl482Victim2 'secret.txt'), 'x')
+            $acl482UniRoot = Join-Path $acl482Scratch 'рантайм з пробілами'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482UniRoot 'a b\c'))
+            [IO.File]::WriteAllText((Join-Path $acl482UniRoot 'a b\c\x.ps1'), '# x')
+            $acl482DeepLink = Join-Path $acl482UniRoot 'a b\c\посилання'
+            $acl482DeepCreated = & $acl482NewLink $acl482DeepLink $acl482Victim2 'J'
+            $acl482DeepResult = if ($acl482DeepCreated) { & $acl482Probe $acl482Functions $acl482UniRoot } else { $null }
+            Test-BRAVOCondition -Condition (
+                $acl482DeepCreated -and (& $acl482Refused $acl482DeepResult $acl482DeepLink) -and
+                -not (@($acl482DeepResult.Calls | Where-Object { $_.Path.StartsWith($acl482Victim2, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+            ) -Name 'Scheduler/RuntimeAclRefusesDeepJunctionChildNonAsciiPath' `
+                -Failure ("глибокий junction-нащадок (шлях із кирилицею й пробілами) має призвести до throw без жодного Set-Acl: " + $(if ($acl482DeepResult) { [string]$acl482DeepResult.Error + ' | calls=' + $acl482DeepResult.Calls.Count } else { 'junction не створено' })) `
+                -EnvironmentLimitation $(if ($acl482DeepCreated) { '' } else { $acl482NoLinkReason })
+
+            # 7) Підміна компонента посеред обходу: після першого Set-Acl внутрішній каталог стає
+            # reparse point -> throw (не пропуск); обробка зупиняється, Set-Acl по ньому немає.
+            $acl482SwapRoot = Join-Path $acl482Scratch 'swap-runtime'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482SwapRoot 'sub'))
+            [IO.File]::WriteAllText((Join-Path $acl482SwapRoot 'sub\g.ps1'), '# x')
+            $acl482SwapResult = & $acl482Probe $acl482Functions $acl482SwapRoot (Join-Path $acl482SwapRoot 'sub')
+            Test-BRAVOCondition -Condition (
+                $null -ne $acl482SwapResult.Error -and $acl482SwapResult.Error.Contains('reparse point') -and
+                $acl482SwapResult.Error.Contains((Join-Path $acl482SwapRoot 'sub')) -and
+                $acl482SwapResult.Calls.Count -ge 1 -and
+                -not (@($acl482SwapResult.Calls | Where-Object { $_.Path.StartsWith((Join-Path $acl482SwapRoot 'sub'), [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+            ) -Name 'Scheduler/RuntimeAclMidRunSwapThrows' `
+                -Failure ("компонент, що став reparse point після першого Set-Acl, має призвести до throw без Set-Acl по ньому: " + [string]$acl482SwapResult.Error + ' | ' + (($acl482SwapResult.Calls | ForEach-Object { $_.Path }) -join ', '))
+
+            # 8) Підміна ЧЕРГОВОГО каталогу під час preflight-переліку: каталог sub, поставлений у чергу
+            # звичайним, при strict-перевірці ланцюга перед його переліком стає reparse point -> throw,
+            # жодного Set-Acl.
+            $acl482PreRoot = Join-Path $acl482Scratch 'preflight-runtime'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482PreRoot 'sub'))
+            [IO.File]::WriteAllText((Join-Path $acl482PreRoot 'sub\g.ps1'), '# x')
+            $acl482PreResult = & $acl482Probe $acl482Functions $acl482PreRoot '' (Join-Path $acl482PreRoot 'sub')
+            Test-BRAVOCondition -Condition (
+                $acl482PreResult.Calls.Count -eq 0 -and $null -ne $acl482PreResult.Error -and
+                $acl482PreResult.Error.Contains('reparse point') -and $acl482PreResult.Error.Contains((Join-Path $acl482PreRoot 'sub'))
+            ) -Name 'Scheduler/RuntimeAclPreflightEnumerationSwapThrows' `
+                -Failure ("каталог, що став reparse point між постановкою в чергу й переліком, має призвести до throw ДО першого Set-Acl: " + [string]$acl482PreResult.Error + ' | calls=' + $acl482PreResult.Calls.Count)
+
+            # 9) Компонент зникає посеред обходу (реальне видалення після першого Set-Acl): відсутній
+            # компонент НЕ вважається безпечним -> throw (strict), Set-Acl по ньому немає.
+            $acl482GoneRoot = Join-Path $acl482Scratch 'gone-runtime'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482GoneRoot 'sub'))
+            $acl482GoneFile = Join-Path $acl482GoneRoot 'sub\g.ps1'
+            [IO.File]::WriteAllText($acl482GoneFile, '# x')
+            $acl482GoneResult = & $acl482Probe $acl482Functions $acl482GoneRoot '' '' $acl482GoneFile
+            Test-BRAVOCondition -Condition (
+                $null -ne $acl482GoneResult.Error -and $acl482GoneResult.Error.Contains($acl482GoneFile) -and
+                $acl482GoneResult.Error.Contains('зник') -and $acl482GoneResult.Calls.Count -ge 1 -and
+                -not (@($acl482GoneResult.Calls | Where-Object { $_.Path -eq $acl482GoneFile }).Count -gt 0)
+            ) -Name 'Scheduler/RuntimeAclVanishedComponentThrows' `
+                -Failure ("компонент, що зник посеред обходу, не є безпечним: має бути throw без Set-Acl по ньому: " + [string]$acl482GoneResult.Error + ' | ' + (($acl482GoneResult.Calls | ForEach-Object { $_.Path }) -join ', '))
+        } finally {
+            foreach ($acl482Junction in @($acl482Junctions)) {
+                if ([IO.Directory]::Exists($acl482Junction)) { & cmd.exe /c rmdir "$acl482Junction" 2>&1 | Out-Null }
+            }
+            if ([IO.Directory]::Exists($acl482Scratch)) {
+                Remove-Item -LiteralPath $acl482Scratch -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
     Test-BRAVOCondition -Condition (
         $b7InstallText -match '(?s)Set-BRAVOProtectedRuntimeAcl -RuntimeRoot \$runtimeRoot.*?runtimeLogRoot.*?Join-Path \$runtimeRoot ''TEMP''.*?\$global:stateRoot.*?Set-BRAVOProtectedDataDirectoryAcl -Path \$protectedDataDirectory' -and
         $b7InstallText.IndexOf('Не вдалося визначити SID облікового запису завдань', [StringComparison]::Ordinal) -gt 0 -and
