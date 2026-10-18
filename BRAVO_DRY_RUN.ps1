@@ -28,6 +28,9 @@ Import-Module -Name $notificationHelpersPath -ErrorAction Stop
 # BackupRoot readiness, спільна з BRAVO_TASKS_INSTALL.ps1 (не дублюється).
 $dryRunSystemModulePath = Join-Path $PSScriptRoot "modules\BRAVO.System\BRAVO.System.psd1"
 Import-Module -Name $dryRunSystemModulePath -ErrorAction Stop
+# #480: ConvertTo-BRAVOSshHostKeyFingerprint для authenticated SFTP-перевірки.
+$dryRunSchemaModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1"
+Import-Module -Name $dryRunSchemaModulePath -ErrorAction Stop
 
 # Безпечна симуляція BRAVO/VETOFFICE:
 # - не створює архіви, не копіює, не синхронізує і не видаляє файли;
@@ -906,7 +909,7 @@ function Test-SftpDestinationAccess {
         $options.PortNumber = $port
         $options.UserName = $Login
         $options.Password = $Password
-        $options.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+        $options.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $session.Open($options)
         [void]$session.ListDirectory(".")
 

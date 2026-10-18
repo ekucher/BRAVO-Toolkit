@@ -58,6 +58,12 @@ foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.Arc
     }
     Import-Module -Name $modulePath -ErrorAction Stop
 }
+# #480: формат-валідація sftpHostKey (ConvertTo-BRAVOSshHostKeyFingerprint) обов'язкова у кожному споживачі.
+$hostKeySchemaModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+if (-not (Test-Path -LiteralPath $hostKeySchemaModulePath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль схеми конфігурації: $hostKeySchemaModulePath"
+}
+Import-Module -Name $hostKeySchemaModulePath -ErrorAction Stop
 Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $notificationHelpersPath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Notifications\BRAVO.Notifications.psd1'
@@ -2551,11 +2557,13 @@ function Invoke-BRAVODataRestoreWinSCPScript {
     $process = $null
     $outputCapture = $null
     try {
+        # #480: fail-closed ДО створення командного файлу; throw -> існуючий catch.
+        $validatedHostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $temporaryScriptPath = New-BRAVOWinSCPTemporaryScriptPath
         $scriptLines = @(
             "option batch continue",
             "option confirm off",
-            "open $script:dataRestoreSftpUrl -hostkey=$sftpHostKey -timeout=$sftpConnectionTimeoutSeconds"
+            "open $script:dataRestoreSftpUrl -hostkey=`"$validatedHostKey`" -timeout=$sftpConnectionTimeoutSeconds"
         )
         $scriptLines += @($Commands)
         $scriptLines += "exit"

@@ -59,6 +59,13 @@ foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.Arc
     }
     Import-Module -Name $modulePath -ErrorAction Stop
 }
+# #480: формат-валідація sftpHostKey (ConvertTo-/Test-BRAVOSshHostKeyFingerprint) обов'язкова
+# у кожному споживачі: legacy BRAVO.config валідатором авторизації loader-а не покривається.
+$hostKeySchemaModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+if (-not (Test-Path -LiteralPath $hostKeySchemaModulePath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль схеми конфігурації: $hostKeySchemaModulePath"
+}
+Import-Module -Name $hostKeySchemaModulePath -ErrorAction Stop
 Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
@@ -576,9 +583,12 @@ function Resolve-BRAVOSyncBazaExitCode {
     # (10), щоб 4-годинний BAZASync не ховав його за чистим exit 0.
     param(
         [bool]$SyncSucceeded,
-        [int]$EmptySourceWarningCount
+        [int]$EmptySourceWarningCount,
+        # #480: невалідна SFTP-конфігурація (зокрема sftpHostKey) -> 30, раніше за SftpFailed.
+        [bool]$InvalidConfiguration = $false
     )
 
+    if ($InvalidConfiguration) { return (Resolve-BRAVOExitCode -InvalidConfiguration) }
     if (-not $SyncSucceeded) { return (Resolve-BRAVOExitCode -SftpFailed) }
     if ($EmptySourceWarningCount -gt 0) { return (Resolve-BRAVOExitCode -HasWarnings) }
     return 0
@@ -4152,6 +4162,11 @@ function Test-SFTPConfig {
     }
     if ([string]::IsNullOrWhiteSpace($sftpHostKey)) {
         $configurationErrors += "не встановлено SFTP host key"
+    } else {
+        $hostKeyCheck = Test-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
+        if (-not $hostKeyCheck.IsValid) {
+            $configurationErrors += [string]$hostKeyCheck.Message
+        }
     }
     if ([string]::IsNullOrWhiteSpace($winSCPPath) -or -not (Test-Path -Path $winSCPPath -PathType Leaf)) {
         $configurationErrors += "не знайдено WinSCP: $winSCPPath"
@@ -4455,11 +4470,17 @@ function Test-SFTPConnection {
         Write-BRAVOLog -Component 'SFTP' -Message "WinSCP не знайдено: $WinSCPPath" -Level "ERROR"
         return $false
     }
+    try {
+        $HostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "SFTP host key відхилено, перевірку підключення скасовано: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
     
     $testCommand = @"
 option batch abort
 option confirm off
-open $RepositorySFTPUrl -hostkey=$HostKey -timeout=$sftpConnectionTimeoutSeconds
+open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 ls
 exit
 "@
@@ -4594,7 +4615,7 @@ function Get-BAZASFTPComparison {
 
         $sessionOptions = New-Object WinSCP.SessionOptions
         $sessionOptions.ParseUrl($RepositorySFTPUrl)
-        $sessionOptions.SshHostKeyFingerprint = ([string]$HostKey).Trim().Trim('"')
+        $sessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
         $sessionOptions.Timeout = [timespan]::FromSeconds(
             [math]::Max(1, [int]$sftpConnectionTimeoutSeconds)
         )
@@ -5291,11 +5312,18 @@ function Initialize-BRAVOSFTPRemoteDirectories {
 
     Write-BRAVOLog -Component 'SFTP' -Message "Перевiрка/створення потрiбних каталогiв на SFTP: $($orderedDirectories -join ', ')"
 
+    try {
+        $HostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "SFTP host key відхилено, створення каталогів скасовано: $($_.Exception.Message)" -Level "ERROR"
+        return
+    }
+
     $mkdirCommands = ($orderedDirectories | ForEach-Object { "mkdir `"$_`"" }) -join [Environment]::NewLine
     $winscpCommand = @"
 option batch continue
 option confirm off
-open $RepositorySFTPUrl -hostkey=$HostKey -timeout=$sftpConnectionTimeoutSeconds
+open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 $mkdirCommands
 exit
 "@
@@ -5366,11 +5394,18 @@ function Send-FileViaWinSCP {
         return $false
     }
     
+    try {
+        $HostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "SFTP host key відхилено, передачу файлу скасовано: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+
     # Створюємо тимчасовий скрипт для WinSCP
     $winscpCommand = @"
 option batch abort
 option confirm off
-open $RepositorySFTPUrl -hostkey=$HostKey -timeout=$sftpConnectionTimeoutSeconds
+open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 cd /$RemoteDirectory
 put "$LocalFilePath"
 exit
@@ -5527,6 +5562,13 @@ function Sync-FolderToSFTP {
         return $false
     }
 
+    try {
+        $HostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "SFTP host key відхилено, синхронізацію скасовано: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+
     $fileNameUtf8Limit = if (
         [string]$sftpSynchronizationOptions -match '(?i)(^|\s)-resumesupport=on(\s|$)'
     ) {
@@ -5560,7 +5602,7 @@ function Sync-FolderToSFTP {
     # stat однозначно перевіряє каталог і не створює хибної помилки.
     $winscpCommand = @"
 option confirm off
-open $RepositorySFTPUrl -hostkey=$HostKey -timeout=$sftpConnectionTimeoutSeconds
+open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 option batch abort
 stat "$remotePath"
 option batch continue
@@ -6065,7 +6107,7 @@ function Invoke-ManualBAZASFTPSynchronization {
         Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю BAZA_APP / BAZA_WWW зупинено через помилки конфiгурацiї SFTP" -Level "ERROR"
         $manualResults.SFTPConnection.Success = $false
         $manualResults.SFTPConnection.Error = 'SFTP configuration invalid'
-        return [pscustomobject]@{ Success = $false; Results = $manualResults }
+        return [pscustomobject]@{ Success = $false; ConfigurationInvalid = $true; Results = $manualResults }
     }
 
     Show-ScriptProgress -Status "Перевiрка з'єднання з SFTP" -PercentComplete 35
@@ -7256,7 +7298,7 @@ function Main {
         Write-Log "Тривалiсть: $($manualSyncDuration.ToString($durationFormat))" -NoTimestamp
         Write-Log "Лог-файл: $logFile" -NoTimestamp
         # -SyncBAZA — це суто SFTP-операція за визначенням.
-        $script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count
+        $script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count -InvalidConfiguration ([bool]($manualSyncResult.PSObject.Properties['ConfigurationInvalid'] -and $manualSyncResult.ConfigurationInvalid))
         # #292: фінальна Operations-подія -SyncBAZA несе режим і статус
         # канонічного двигуна по кожному компоненту (MUTATION_VIOLATION,
         # REMOTE_CONFLICT, AUDIT_DRIFT, INCOMPATIBLE_NAME ...), а не лише код.
@@ -9608,6 +9650,7 @@ function Invoke-BRAVOArchiveOwnLogUpload {
         }
         if ([string]::IsNullOrWhiteSpace($sftpUrl) -or
             [string]::IsNullOrWhiteSpace($sftpHostKey) -or
+            -not (Test-BRAVOSshHostKeyFingerprint -Value $sftpHostKey).IsValid -or
             [string]::IsNullOrWhiteSpace($winSCPPath) -or
             -not (Test-Path -LiteralPath $script:logFile -PathType Leaf)) {
             Write-BRAVOLog -Component 'SFTP' -Message "Власний лог: SFTP-конфігурація неповна або лог відсутній — вивантаження пропущено" -Level "WARNING"

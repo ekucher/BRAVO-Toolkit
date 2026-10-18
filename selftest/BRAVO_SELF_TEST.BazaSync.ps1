@@ -984,7 +984,7 @@
         # (WinSCP не потрібен: збій lock відбувається ДО відкриття сесії)
         $drP13SessionResult = Invoke-BRAVOBazaComponentSyncSession `
             -Component 'BAZA_APP' -LocalDirectory $drP13AclRoot -RemoteRootPath '/baza_app' `
-            -RepositorySFTPUrl 'sftp://fake' -HostKey 'fake' -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'unused' `
+            -RepositorySFTPUrl 'sftp://fake' -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'unused' `
             -StateRoot $drP13AclRoot
         $drP13SessionHealth = Get-BRAVOBazaFastHealthResult -SyncResult $drP13SessionResult
         Test-BRAVOCondition -Condition (
@@ -2293,7 +2293,7 @@
         # =======================================================================
         $accComStubResult = Invoke-BRAVOBazaComponentSyncSession `
             -Component 'BAZA_APP' -LocalDirectory $bazaSyncTestRoot -RemoteRootPath '/baza_app' `
-            -RepositorySFTPUrl 'sftp://fake' -HostKey 'fake' `
+            -RepositorySFTPUrl 'sftp://fake' -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' `
             -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'C:\fake\Tools\WinSCP.com' `
             -StateRoot (Join-Path $bazaSyncTestRoot "ACC_ComStub")
         Test-BRAVOCondition -Condition (
@@ -2301,6 +2301,33 @@
             $accComStubResult.Error -match 'winscp\.exe' -and
             $accComStubResult.Error -match 'WinSCP\.com'
         ) -Name 'BazaSync/ComStubExecutableFailsFastInsteadOfHanging' -Failure "WinSCP.com як ExecutablePath має давати миттєвий контрольований ERROR з поясненням (потрібен winscp.exe), а не зависання на промпті winscp>; Status=$($accComStubResult.Status) Error=$($accComStubResult.Error)"
+
+        # =======================================================================
+        # #480 (F3): невалідний/accept-any sftpHostKey -> контрольований ERROR ДО
+        # Add-Type і створення WinSCP-сесії (помилка саме про host key, а не про
+        # 'unused' збірку WinSCPnet.dll, яку Add-Type відхилив би першою).
+        # =======================================================================
+        $hkBazaFailures = New-Object System.Collections.Generic.List[string]
+        foreach ($hkBazaCase in @(
+                @{ Name = 'Star'; Value = '*' },
+                @{ Name = 'AcceptNew'; Value = 'acceptnew' },
+                @{ Name = 'CrLfPut'; Value = "ssh-rsa 2048 aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99`r`nput C:\x /" }
+            )) {
+            $hkBazaResult = Invoke-BRAVOBazaComponentSyncSession `
+                -Component 'BAZA_APP' -LocalDirectory $bazaSyncTestRoot -RemoteRootPath '/baza_app' `
+                -RepositorySFTPUrl 'sftp://fake' -HostKey ([string]$hkBazaCase.Value) `
+                -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'C:\fake\Tools\winscp.exe' `
+                -StateRoot (Join-Path $bazaSyncTestRoot "HK480_$($hkBazaCase.Name)")
+            if (-not ($hkBazaResult.Status -eq 'ERROR' -and
+                    [string]$hkBazaResult.Error -match 'SFTP host key' -and
+                    [string]$hkBazaResult.Error -notmatch 'unused' -and
+                    [string]$hkBazaResult.Error -notmatch 'put C:')) {
+                [void]$hkBazaFailures.Add([string]$hkBazaCase.Name)
+            }
+        }
+        Test-BRAVOCondition -Condition ($hkBazaFailures.Count -eq 0) `
+            -Name 'BazaSync/InvalidHostKeyFailsBeforeWinSCPSession' `
+            -Failure "Invoke-BRAVOBazaComponentSyncSession з невалідним sftpHostKey мусить повертати ERROR про host key ДО Add-Type/New-Object WinSCP.Session (без сирого значення); збої: $([string]::Join(', ', $hkBazaFailures))"
 
         Test-BRAVOCondition -Condition (
             $bazaArchiveScriptText.Contains('$winSCPComponents = Get-BRAVOWinSCPDotNetComponents') -and
@@ -2339,7 +2366,7 @@
                 -LocalDirectory 'C:\fake\hr7local' `
                 -RemotePath '/baza_app' `
                 -RepositorySFTPUrl 'sftp://hr7-fake-url' `
-                -HostKey 'hr7-fake-hostkey'
+                -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
         } $hr7Probe
         $hr7Snapshot = [pscustomobject]@{ SnapshotUtc = (Get-Date).ToUniversalTime(); Entries = @{}; Success = $true; Error = $null }
         $hr7ProviderError = $null
@@ -2353,7 +2380,7 @@
             $null -eq $hr7ProviderError -and
             $hr7Probe.Invoked -eq 1 -and
             $hr7Probe.Url -eq 'sftp://hr7-fake-url' -and
-            $hr7Probe.HostKey -eq 'hr7-fake-hostkey' -and
+            $hr7Probe.HostKey -eq 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' -and
             $hr7Probe.LocalPath -eq 'C:\fake\hr7local' -and
             $null -ne $hr7ProviderResult -and [bool]$hr7ProviderResult.Success -eq $true -and
             $null -ne $hr7ProviderResult.PSObject.Properties['PendingItems']
@@ -2404,7 +2431,7 @@
                 -LocalDirectory $LocalDirectory `
                 -RemotePath '/baza_app' `
                 -RepositorySFTPUrl 'sftp://hr7-fake-url' `
-                -HostKey 'hr7-fake-hostkey'
+                -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
         } $hr7RecProbe $hr7RecLocal
         $hr7RecCycle = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr7RecLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr7RecState -BootstrapIfNeeded -FullAuditProvider $hr7RecProvider
         $hr7RecStateAfter = Read-BRAVOBazaState -Path $hr7RecStatePath
@@ -2663,7 +2690,7 @@
                 $script:AuditProvider = $null
                 $script:Messages = New-Object System.Collections.Generic.List[string]
                 $sftpUrl = 'sftp://192.0.2.10'
-                $sftpHostKey = 'ssh-ed25519 256 fake'
+                $sftpHostKey = 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
                 $winSCPPath = 'C:\fake\Tools\WinSCP.com'
                 $winSCPAssemblyPath = 'C:\fake\Tools\WinSCPnet.dll'
                 $sftpConnectionTimeoutSeconds = 30
