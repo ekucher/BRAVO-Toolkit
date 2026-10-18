@@ -37361,25 +37361,30 @@ foreach ($case in $cases) {
         # і батько, і проба «батько зі злитим stderr».
         $suiteProbeHelperText = @'
 function Invoke-SuiteProbeChild {
-    param([string]$HostPath, [string]$ScriptPath, [string]$ArgumentText, [string]$WorkDir)
+    param([string]$HostPath, [string]$ScriptPath, [string]$ArgumentText, [string]$WorkDir, [int]$TimeoutMs = 120000)
     $runId = [guid]::NewGuid().ToString('N')
     $outPath = Join-Path $WorkDir ($runId + '.out')
     $errPath = Join-Path $WorkDir ($runId + '.err')
     $argLine = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $ScriptPath + '" ' + $ArgumentText
     $proc = Start-Process -FilePath $HostPath -ArgumentList $argLine -NoNewWindow -PassThru `
         -RedirectStandardOutput $outPath -RedirectStandardError $errPath
-    $null = $proc.Handle
-    if (-not $proc.WaitForExit(120000)) {
-        try { $proc.Kill(); [void]$proc.WaitForExit(10000) } catch { $null = $_ }
+    try {
+        $null = $proc.Handle
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            try { $proc.Kill(); [void]$proc.WaitForExit(10000) } catch { $null = $_ }
+            throw 'дочірній процес проби не завершився за 120 с'
+        }
+        $proc.WaitForExit()
+        $outLines = @()
+        if ([IO.File]::Exists($outPath)) {
+            $outLines = @([IO.File]::ReadAllLines($outPath) | ForEach-Object { ([string]$_).TrimEnd("`r") })
+        }
+        $exitCode = $proc.ExitCode
+        return [pscustomobject]@{ ExitCode = $exitCode; Lines = $outLines }
+    } finally {
+        # Dispose на КОЖНОМУ шляху виходу; збій очищення не маскує початкову помилку.
         try { $proc.Dispose() } catch { $null = $_ }
-        throw 'дочірній процес проби не завершився за 120 с'
     }
-    $proc.WaitForExit()
-    $outLines = @()
-    if ([IO.File]::Exists($outPath)) {
-        $outLines = @([IO.File]::ReadAllLines($outPath) | ForEach-Object { ([string]$_).TrimEnd("`r") })
-    }
-    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Lines = $outLines }
 }
 '@
         $suiteProbeHelperPath = Join-Path $suiteProbeRoot 'probe-helper.ps1'
