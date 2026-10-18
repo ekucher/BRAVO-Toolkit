@@ -231,9 +231,11 @@ function Assert-BRAVOInstallBundleIntegrity {
 # Import-Module -PassThru, чий Path лежить під $ModuleRoot, і Get-Command має
 # вказувати на цей екземпляр (Codex P2, раунд 4: однойменний модуль з іншого
 # шляху, уже завантажений у сесію, не підміняє перевірку); інакше — відмова.
-# Лише для явного профілю (крок 1 над приватною копією, крок 4 над
-# розгорнутим каталогом), де код комплекту однаково імпортується; неявний
-# шлях не імпортує нічого зайвого.
+# Для явного профілю (крок 1 над приватною копією, крок 4 над розгорнутим
+# каталогом) і для неявного, коли крок 4 мав би засіяти файл (-SeedLocalConfig
+# без наявного BRAVO.local.config): у кроці 1 над приватною копією, з
+# відмовою → копія прикладу замість зупинки. Без seed неявний шлях не
+# імпортує нічого зайвого.
 function Import-BRAVOInstallBackupDestinationModules {
     param(
         [Parameter(Mandatory = $true)][string]$ModuleRoot,
@@ -715,11 +717,20 @@ Write-Ok 'обов''язкові файли комплекту на місці'
 # тут — після SHA-256, провенансу й гейта каналу, але ДО копіювання в каталог
 # інсталяції. Тому відмова не лишає часткового runtime чи VERSION.json, і
 # повторний запуск з тими самими аргументами після виправлення працює.
-# Неявний профіль (без -BackupDestination) цих перевірок не має: комплекти
-# без BRAVO.Configurator встановлюються, як раніше.
+# Неявний профіль (без -BackupDestination) комплект НЕ відхиляє: комплекти
+# без BRAVO.Configurator встановлюються, як раніше. Але коли крок 4 мав би
+# засіяти файл неявним профілем (-SeedLocalConfig, файла ще немає), рішення
+# «канонічний seed чи копія прикладу» приймається ТУТ, ДО копіювання, за тією
+# самою приватною копією й тією самою перевіркою ЕКСПОРТУ, що й для явного
+# профілю (Import-BRAVOInstallBackupDestinationModules): комплект, у якому
+# потрібну функцію визначено, але не експортовано, вважається несумісним, і
+# крок 4 іде старим шляхом (копія прикладу) — як для комплекту без функцій.
 $existingSiteConfig = Join-Path $RuntimeRoot 'BRAVO.local.config'
 $siteConfigCheckedFingerprint = $null
-if ($PSBoundParameters.ContainsKey('BackupDestination')) {
+$implicitProfileUsesExample = $false
+$implicitProfilePreflight = ($SeedLocalConfig -and -not $PSBoundParameters.ContainsKey('BackupDestination') -and
+    -not (Test-Path -LiteralPath $existingSiteConfig -PathType Leaf))
+if ($PSBoundParameters.ContainsKey('BackupDestination') -or $implicitProfilePreflight) {
     # Код комплекту для цієї перевірки не імпортується з $StagingRoot: той
     # каталог може бути створений заздалегідь і доступний на запис звичайному
     # користувачеві, тож файл, підмінений між перевіркою цілісності й
@@ -743,37 +754,60 @@ if ($PSBoundParameters.ContainsKey('BackupDestination')) {
         $verifiedBundle = Join-Path $verifiedBundleRoot 'bundle'
         Expand-Archive -LiteralPath $verifiedZipPath -DestinationPath $verifiedBundle -Force
         $stagedMissingCapabilities = @(Get-BRAVOInstallBackupDestinationMissingCapabilities -ModuleRoot $verifiedBundle)
-        if ($stagedMissingCapabilities.Count -gt 0) {
-            throw ('Комплект ' + $targetVersion + ' не підтримує -BackupDestination ' + $BackupDestination +
-                ': бракує модулів чи функцій BRAVO.Configurator/конфігурації (' + ($stagedMissingCapabilities -join ', ') +
-                '). Нічого не розгорнуто. Вкажіть -Tag або -ZipPath комплекту, що містить BRAVO.Configurator, ' +
-                'або запустіть без -BackupDestination (напрямки потім задає BRAVO_CONFIGURATOR.ps1).')
-        }
-        Write-Ok ('комплект підтримує -BackupDestination ' + $BackupDestination)
-        # Цілісність за RUNTIME_MANIFEST.json — до першого імпорту коду
-        # комплекту нижче і до копіювання (відмова не лишає часткового runtime).
-        Assert-BRAVOInstallBundleIntegrity -BundleRoot $verifiedBundle -BeforeDeploy
-        # BRAVO.local.config читається ОДИН раз: відбиток — з цих байтів,
-        # канонічний reader розбирає їхню копію в приватному каталозі; крок 3
-        # звіряє відбиток з живим файлом перед першим записом у каталог інсталяції.
-        $siteConfigSnapshot = Get-BRAVOInstallSiteConfigSnapshot -Path $existingSiteConfig
-        $siteConfigCheckedFingerprint = $siteConfigSnapshot.Fingerprint
-        if ($siteConfigSnapshot.Exists) {
-            $verifiedSiteConfigDirectory = Join-Path $verifiedBundleRoot 'site'
-            [void](New-Item -ItemType Directory -Path $verifiedSiteConfigDirectory)
-            [System.IO.File]::WriteAllBytes((Join-Path $verifiedSiteConfigDirectory 'BRAVO.local.config'), $siteConfigSnapshot.Bytes)
-            $stagedSiteSettings = Get-BRAVOInstallSiteComponentSettings -ModuleRoot $verifiedBundle -ConfigDirectory $verifiedSiteConfigDirectory `
-                -SiteConfigPath $existingSiteConfig -Destination $BackupDestination -BeforeDeploy
-            $stagedSiteStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings $stagedSiteSettings
-            $stagedSiteSynchronization = Get-BRAVOEffectiveSynchronizationConfiguration -Synchronization $stagedSiteSettings['Synchronization'] `
-                -GlobalSftpEnabled ([bool]$stagedSiteStorage.SFTP.Enabled)
-            Assert-BRAVOInstallBackupDestinationEffective -Destination $BackupDestination `
-                -EffectiveStorage $stagedSiteStorage -EffectiveSynchronization $stagedSiteSynchronization `
-                -SiteConfigPath $existingSiteConfig -BeforeDeploy
+        if ($stagedMissingCapabilities.Count -gt 0 -and $implicitProfilePreflight) {
+            # Неявний профіль: не відмова, а старий шлях (копія прикладу).
+            $implicitProfileUsesExample = $true
+            Write-Note ('комплект ' + $targetVersion + ' без можливостей профілю напрямків (' + ($stagedMissingCapabilities -join ', ') +
+                ') — неявний профіль: BRAVO.local.config буде створено з прикладу')
         } else {
-            # Файла немає (буде -SeedLocalConfig): модулі, якими крок 4 його
-            # засіє й перевірить, звіряються за експортом уже тут, до копіювання.
-            Import-BRAVOInstallBackupDestinationModules -ModuleRoot $verifiedBundle -Destination $BackupDestination -BeforeDeploy
+            if ($stagedMissingCapabilities.Count -gt 0) {
+                throw ('Комплект ' + $targetVersion + ' не підтримує -BackupDestination ' + $BackupDestination +
+                    ': бракує модулів чи функцій BRAVO.Configurator/конфігурації (' + ($stagedMissingCapabilities -join ', ') +
+                    '). Нічого не розгорнуто. Вкажіть -Tag або -ZipPath комплекту, що містить BRAVO.Configurator, ' +
+                    'або запустіть без -BackupDestination (напрямки потім задає BRAVO_CONFIGURATOR.ps1).')
+            }
+            if (-not $implicitProfilePreflight) {
+                Write-Ok ('комплект підтримує -BackupDestination ' + $BackupDestination)
+            }
+            # Цілісність за RUNTIME_MANIFEST.json — до першого імпорту коду
+            # комплекту нижче і до копіювання (відмова не лишає часткового runtime).
+            Assert-BRAVOInstallBundleIntegrity -BundleRoot $verifiedBundle -BeforeDeploy
+            if ($implicitProfilePreflight) {
+                # Файла немає, профіль неявний: та сама звірка ЕКСПОРТУ, що в
+                # кроці 4 для seed. Функцію визначено, але не експортовано (або
+                # модуль не імпортується) -> несумісний комплект -> копія прикладу.
+                try {
+                    Import-BRAVOInstallBackupDestinationModules -ModuleRoot $verifiedBundle -Destination $BackupDestination -BeforeDeploy
+                    Write-Ok 'комплект експортує функції профілю напрямків — неявний профіль засіється канонічним кодом Configurator'
+                } catch {
+                    $implicitProfileUsesExample = $true
+                    Write-Note ('комплект не експортує функцій профілю напрямків (' + $_.Exception.Message +
+                        ') — неявний профіль: BRAVO.local.config буде створено з прикладу')
+                }
+            } else {
+                # BRAVO.local.config читається ОДИН раз: відбиток — з цих байтів,
+                # канонічний reader розбирає їхню копію в приватному каталозі; крок 3
+                # звіряє відбиток з живим файлом перед першим записом у каталог інсталяції.
+                $siteConfigSnapshot = Get-BRAVOInstallSiteConfigSnapshot -Path $existingSiteConfig
+                $siteConfigCheckedFingerprint = $siteConfigSnapshot.Fingerprint
+                if ($siteConfigSnapshot.Exists) {
+                    $verifiedSiteConfigDirectory = Join-Path $verifiedBundleRoot 'site'
+                    [void](New-Item -ItemType Directory -Path $verifiedSiteConfigDirectory)
+                    [System.IO.File]::WriteAllBytes((Join-Path $verifiedSiteConfigDirectory 'BRAVO.local.config'), $siteConfigSnapshot.Bytes)
+                    $stagedSiteSettings = Get-BRAVOInstallSiteComponentSettings -ModuleRoot $verifiedBundle -ConfigDirectory $verifiedSiteConfigDirectory `
+                        -SiteConfigPath $existingSiteConfig -Destination $BackupDestination -BeforeDeploy
+                    $stagedSiteStorage = Get-BRAVOEffectiveStorageConfiguration -ComponentSettings $stagedSiteSettings
+                    $stagedSiteSynchronization = Get-BRAVOEffectiveSynchronizationConfiguration -Synchronization $stagedSiteSettings['Synchronization'] `
+                        -GlobalSftpEnabled ([bool]$stagedSiteStorage.SFTP.Enabled)
+                    Assert-BRAVOInstallBackupDestinationEffective -Destination $BackupDestination `
+                        -EffectiveStorage $stagedSiteStorage -EffectiveSynchronization $stagedSiteSynchronization `
+                        -SiteConfigPath $existingSiteConfig -BeforeDeploy
+                } else {
+                    # Файла немає (буде -SeedLocalConfig): модулі, якими крок 4 його
+                    # засіє й перевірить, звіряються за експортом уже тут, до копіювання.
+                    Import-BRAVOInstallBackupDestinationModules -ModuleRoot $verifiedBundle -Destination $BackupDestination -BeforeDeploy
+                }
+            }
         }
     } finally {
         try {
@@ -880,7 +914,7 @@ if (Test-Path -LiteralPath $localConfig -PathType Leaf) {
     $backupDestinationSkippedExisting = $SeedLocalConfig -and -not $backupDestinationExplicit
 } elseif ($SeedLocalConfig) {
     if (-not $backupDestinationExplicit -and
-        @(Get-BRAVOInstallBackupDestinationMissingCapabilities -ModuleRoot $RuntimeRoot).Count -gt 0) {
+        ($implicitProfileUsesExample -or @(Get-BRAVOInstallBackupDestinationMissingCapabilities -ModuleRoot $RuntimeRoot).Count -gt 0)) {
         # Комплект без можливостей профілю напрямків (старші релізи або знімок
         # developer) і неявний профіль: зворотно сумісна поведінка developer —
         # копія прикладу. Явний профіль сюди не потрапляє: такий комплект

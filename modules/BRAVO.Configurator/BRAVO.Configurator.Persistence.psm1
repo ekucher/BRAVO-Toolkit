@@ -34,6 +34,8 @@ Set-StrictMode -Version 2.0
 $script:DefaultConfigCache = $null
 $script:DefaultConfigCacheTtlSeconds = 600
 $script:DefaultConfigComputationCount = 0
+# Лише для self-test: див. New-BRAVOConfiguratorSeedLocalConfig (шов між Move і верифікацією).
+$script:BRAVOConfiguratorSeedAfterMoveHook = $null
 
 function Get-BRAVOConfiguratorDefaultConfigCacheKey {
     [CmdletBinding()]
@@ -384,8 +386,36 @@ function Test-BRAVOConfiguratorPostApplyVerification {
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [Parameter(Mandatory = $true)][string]$ProductionConfigDirectory,
         [Parameter(Mandatory = $true)][string]$ProductionConfigPath,
-        [string]$BackupPath
+        [string]$BackupPath,
+        # #434: SHA-256 кандидата, який щойно записано. Задано — файл у
+        # ProductionConfigPath мусить бути саме цими байтами: і перед повторним
+        # читанням, і перед успіхом, і перед rollback. Інакше (паралельна заміна
+        # файлу після запису) повертається конфлікт БЕЗ видалення чи відновлення
+        # чогось — чужий файл не приймається за успіх і не знищується.
+        [string]$ExpectedSha256 = ''
     )
+
+    $conflictResult = {
+        param([string]$CurrentHash)
+        return [pscustomobject]@{
+            Applied      = $false
+            Stage        = 'PostApplyConflict'
+            Reasons      = @("BRAVO.local.config ($ProductionConfigPath) не збігається із записаним кандидатом (SHA-256 зараз: $CurrentHash, очікувано: $ExpectedSha256) — файл замінено паралельно. Нічого не видалено й не відновлено; перевірте файл вручну.")
+            BackupPath   = $BackupPath
+        }
+    }
+    $getCurrentHash = {
+        try {
+            return (Get-FileHash -LiteralPath $ProductionConfigPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        } catch {
+            return '<файл недоступний>'
+        }
+    }
+
+    if (-not [string]::IsNullOrEmpty($ExpectedSha256)) {
+        $hashBeforeRead = & $getCurrentHash
+        if ($hashBeforeRead -ine $ExpectedSha256) { return (& $conflictResult $hashBeforeRead) }
+    }
 
     try {
         $loaderPath = Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1'
@@ -394,9 +424,17 @@ function Test-BRAVOConfiguratorPostApplyVerification {
         if (-not $reloadResult.Present) {
             throw 'Щойно записаний BRAVO.local.config не читається повторно.'
         }
+        if (-not [string]::IsNullOrEmpty($ExpectedSha256)) {
+            $hashAfterRead = & $getCurrentHash
+            if ($hashAfterRead -ine $ExpectedSha256) { return (& $conflictResult $hashAfterRead) }
+        }
         return $null
     } catch {
         $verificationError = $_.Exception.Message
+        if (-not [string]::IsNullOrEmpty($ExpectedSha256)) {
+            $hashBeforeRollback = & $getCurrentHash
+            if ($hashBeforeRollback -ine $ExpectedSha256) { return (& $conflictResult $hashBeforeRollback) }
+        }
         $rollbackReasons = New-Object System.Collections.Generic.List[string]
         $rollbackReasons.Add("Щойно записаний BRAVO.local.config не пройшов повторне читання: $verificationError")
         try {
@@ -673,7 +711,9 @@ function New-BRAVOConfiguratorSeedLocalConfig {
         BRAVO.local.config з'явився паралельно.
     .OUTPUTS
         [pscustomobject] { Created; Stage; Path; Reasons; AppliedPaths }
-        Stage: Complete | Exists | Serialization | Write | PostApplyVerification
+        Stage: Complete | Exists | Serialization | Write | Conflict | PostApplyVerification
+        Conflict: після Move файл за шляхом уже не збігається з записаним
+        кандидатом (SHA-256) — його замінили паралельно; нічого не видалено.
     #>
     [CmdletBinding()]
     param(
@@ -710,8 +750,12 @@ function New-BRAVOConfiguratorSeedLocalConfig {
     }
 
     $tempWritePath = "$localConfigPath.tmp-$([Guid]::NewGuid().ToString('N'))"
+    $candidateSha256 = ''
     try {
         [IO.File]::WriteAllText($tempWritePath, $candidateText, (New-Object System.Text.UTF8Encoding($false)))
+        # Хеш кандидата — ДО перенесення: після Move файл за цим шляхом уже
+        # може бути не нашим (паралельна заміна), і верифікація мусить це бачити.
+        $candidateSha256 = (Get-FileHash -LiteralPath $tempWritePath -Algorithm SHA256 -ErrorAction Stop).Hash
         [IO.File]::Move($tempWritePath, $localConfigPath)
     } catch {
         Remove-Item -LiteralPath $tempWritePath -Force -ErrorAction SilentlyContinue
@@ -724,14 +768,22 @@ function New-BRAVOConfiguratorSeedLocalConfig {
         }
     }
 
-    # Порожній BackupPath: до запису файлу не було, тож відкат видаляє його.
+    # Тестовий шов (лише self-test): код, що виконується МІЖ Move і верифікацією,
+    # щоб відтворити паралельну заміну файлу. У production не задано.
+    if ($null -ne $script:BRAVOConfiguratorSeedAfterMoveHook) {
+        & $script:BRAVOConfiguratorSeedAfterMoveHook $localConfigPath
+    }
+
+    # Порожній BackupPath: до запису файлу не було, тож відкат видаляє його —
+    # але лише якщо файл усе ще точно наш кандидат (ExpectedSha256); чужу
+    # заміну верифікація повертає як конфлікт, нічого не видаляючи.
     $postWriteFailure = Test-BRAVOConfiguratorPostApplyVerification `
         -RuntimeRoot $RuntimeRoot -ProductionConfigDirectory $ConfigDirectory `
-        -ProductionConfigPath $localConfigPath -BackupPath ''
+        -ProductionConfigPath $localConfigPath -BackupPath '' -ExpectedSha256 $candidateSha256
     if ($null -ne $postWriteFailure) {
         return [pscustomobject]@{
             Created      = $false
-            Stage        = 'PostApplyVerification'
+            Stage        = $(if ($postWriteFailure.Stage -eq 'PostApplyConflict') { 'Conflict' } else { 'PostApplyVerification' })
             Path         = $localConfigPath
             Reasons      = @($postWriteFailure.Reasons)
             AppliedPaths = @()

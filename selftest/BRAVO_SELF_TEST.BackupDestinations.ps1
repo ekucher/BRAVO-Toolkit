@@ -415,6 +415,50 @@ try {
     }
 }
 
+# #434 (P2): паралельна заміна файлу МІЖ атомарним Move і верифікацією. Seed
+# хешує кандидата до Move і перед успіхом/rollback звіряє поточний файл: чужий
+# файл (валідний чи зіпсований) — це Conflict без видалення й без «успіху».
+# Шов — змінна модуля $script:BRAVOConfiguratorSeedAfterMoveHook.
+$bdConflictModule = Get-Module -Name 'BRAVO.Configurator.Persistence' | Select-Object -First 1
+$bdConflictFailures = @()
+if ($null -eq $bdConflictModule) { $bdConflictFailures += 'модуль BRAVO.Configurator.Persistence не завантажено' }
+foreach ($bdConflictCase in @(
+    @{ Name = 'InvalidForeign'; Text = 'не конфіг {{{ )))' },
+    @{ Name = 'ValidForeign'; Text = "@{`r`n    'pathSettings.BackupRoot' = 'D:\ForeignOwner'`r`n}`r`n" }
+)) {
+    if ($null -eq $bdConflictModule) { break }
+    $bdConflictRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_DEST_SEEDRACE_' + [guid]::NewGuid().ToString('N'))
+    try {
+        [void](New-Item -ItemType Directory -Path $bdConflictRoot -Force)
+        $bdConflictPath = Join-Path $bdConflictRoot 'BRAVO.local.config'
+        $bdForeignBytes = (New-Object Text.UTF8Encoding($false)).GetBytes([string]$bdConflictCase.Text)
+        $bdForeignText = [string]$bdConflictCase.Text
+        $bdConflictHook = { param($path) [IO.File]::WriteAllBytes($path, (New-Object Text.UTF8Encoding($false)).GetBytes($bdForeignText)) }.GetNewClosure()
+        & $bdConflictModule { param($hook) $script:BRAVOConfiguratorSeedAfterMoveHook = $hook } $bdConflictHook
+        try {
+            $bdConflictResult = New-BRAVOConfiguratorSeedLocalConfig -RuntimeRoot $root -ConfigDirectory $bdConflictRoot `
+                -Overrides $bdProfiles['LocalOnly'].Overrides
+        } finally {
+            & $bdConflictModule { $script:BRAVOConfiguratorSeedAfterMoveHook = $null }
+        }
+        $bdConflictAfter = $(if (Test-Path -LiteralPath $bdConflictPath -PathType Leaf) { [IO.File]::ReadAllBytes($bdConflictPath) } else { $null })
+        if ($bdConflictResult.Created -or [string]$bdConflictResult.Stage -ne 'Conflict') {
+            $bdConflictFailures += "$($bdConflictCase.Name): created=$($bdConflictResult.Created) stage=$($bdConflictResult.Stage) (очікувано Conflict)"
+        }
+        if ($null -eq $bdConflictAfter -or [Convert]::ToBase64String($bdConflictAfter) -cne [Convert]::ToBase64String($bdForeignBytes)) {
+            $bdConflictFailures += "$($bdConflictCase.Name): чужий файл змінено або видалено"
+        }
+        if (@(Get-ChildItem -LiteralPath $bdConflictRoot -Force | Where-Object { $_.Name -ne 'BRAVO.local.config' }).Count -ne 0) {
+            $bdConflictFailures += "$($bdConflictCase.Name): у каталозі лишились тимчасові файли"
+        }
+    } finally {
+        if (Test-Path -LiteralPath $bdConflictRoot) { Remove-Item -LiteralPath $bdConflictRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+Test-BRAVOCondition -Condition ($bdConflictFailures.Count -eq 0) `
+    -Name 'BackupDestinations/SeedPostWriteReplacementIsConflictWithoutDeletion' `
+    -Failure "заміна BRAVO.local.config між Move і верифікацією (чужий валідний чи зіпсований файл) має давати Stage=Conflict, Created=false, без видалення чужого файлу й без прийняття його за успіх: $($bdConflictFailures -join ' | ')"
+
 # Фікстура комплекту (#434, Codex P1): RUNTIME_MANIFEST.json над усіма
 # .ps1/.psm1/.psd1 каталогу у форматі, який читає канонічний
 # Test-BRAVORuntimeManifestIntegrity (BRAVO_RUNTIME_GUARD.ps1): ключ —
@@ -494,6 +538,8 @@ try {
         'param([switch]$SeedLocalConfig, [string]$BackupDestination = ''Cloud'', [string]$RuntimeRoot, [string]$OutputLog)',
         'Set-StrictMode -Version 2.0',
         '$ErrorActionPreference = ''Stop''',
+        # Крок 1 (не виконується в цьому харнесі) виставляє це рішення для неявного профілю.
+        '$implicitProfileUsesExample = $false',
         'function Write-StepOutput { param([string]$T) [IO.File]::AppendAllText($OutputLog, ($T + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false))) }',
         'function Write-Ok { param([string]$T) Write-StepOutput (''[OK] '' + $T) }',
         'function Write-Note { param([string]$T) Write-StepOutput (''[..] '' + $T) }',
@@ -1592,6 +1638,30 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerExplicitDestinationRequiresExportedFunctions' `
             -Failure "комплект, модуль якого визначає, але не експортує потрібну функцію (Get-BRAVOConfiguratorBackupDestinationProfile), має відхиляти явний -BackupDestination ДО копіювання (без VERSION.json) з назвою функції в причині: $($bdE2eNoExportFailures -join ' | ')"
 
+# (#434, P2) Неявний профіль (лише -SeedLocalConfig) мусить пройти ту саму
+# звірку ЕКСПОРТУ, що й явний — у кроці 1, з приватної копії, ДО копіювання:
+# самоузгоджений комплект, де функцію визначено, але не експортовано, —
+# несумісний, тож рішення «копія прикладу» ухвалюється до robocopy (раніше
+# крок 4 падав на Import уже після розгортання). Поведінка збігається з
+# комплектом без функцій: код 0, приклад замість seed.
+$bdE2eImplicitNoExportFailures = @()
+$bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot
+$bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eNoExportBundle.ZipPath -Arguments @('-SeedLocalConfig')
+$bdE2eSitePath = Join-Path $bdE2eRuntime 'BRAVO.local.config'
+$bdE2eSiteBytes = $(if (Test-Path -LiteralPath $bdE2eSitePath -PathType Leaf) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdE2eSitePath)) } else { '' })
+$bdE2eDecisionIndex = $bdE2eRun.Output.IndexOf('не експортує функцій профілю напрямків')
+$bdE2eRobocopyIndex = $bdE2eRun.Output.IndexOf('STUB: robocopy')
+if ($bdE2eRun.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json')) -or
+    $bdE2eSiteBytes -cne $bdE2eNoExportBundle.ExampleBytes -or -not $bdE2eRun.Output.Contains('з прикладу')) {
+    $bdE2eImplicitNoExportFailures += "$($bdE2eRun.Label): exit=$($bdE2eRun.ExitCode) файл=приклад:$($bdE2eSiteBytes -ceq $bdE2eNoExportBundle.ExampleBytes) throw='$($bdE2eRun.Throw)'"
+}
+if ($bdE2eDecisionIndex -lt 0 -or $bdE2eRobocopyIndex -lt 0 -or $bdE2eDecisionIndex -gt $bdE2eRobocopyIndex) {
+    $bdE2eImplicitNoExportFailures += "рішення про несумісність (індекс $bdE2eDecisionIndex) має передувати копіюванню (robocopy: $bdE2eRobocopyIndex)"
+}
+Test-BRAVOCondition -Condition ($bdE2eImplicitNoExportFailures.Count -eq 0) `
+    -Name 'BackupDestinations/InstallerImplicitSeedChecksExportedFunctionsBeforeDeploy' `
+    -Failure "неявний -SeedLocalConfig з комплектом, що визначає, але не експортує функцію профілю, має ДО копіювання визнати його несумісним і піти шляхом прикладу (код 0, «з прикладу»), а не падати на імпорті в кроці 4 після розгортання: $($bdE2eImplicitNoExportFailures -join ' | ')"
+
         # (Codex P2, раунд 4) Звірка експорту спирається на екземпляр модуля,
         # який щойно повернув Import-Module -PassThru з $ModuleRoot, а не на
         # Get-Command за ModuleName: однойменний модуль з іншого шляху, уже
@@ -2367,9 +2437,16 @@ function Get-BRAVOSelfTestOutboundGateRegex {
         $changed = $false
         foreach ($variableName in @($assignmentsByVariable.Keys)) {
             if ($derived.ContainsKey($variableName)) { continue }
+            # Похідна змінна — вимикач лише коли КОЖНЕ її присвоєння саме є
+            # позитивним кон'юнктивним вимикачем (вимикач або «вимикач -and
+            # інше», #434 P2): «$x = -not вимикач» чи «$x = вимикач -or інше»
+            # не роблять $x вимикачем, хоч і містять його текст.
             $allGated = $true
             foreach ($assignment in $assignmentsByVariable[$variableName]) {
-                if ($assignment.Right.Extent.Text -notmatch $regex) { $allGated = $false; break }
+                if ($assignment.Operator -ne [Management.Automation.Language.TokenKind]::Equals -or
+                    -not (Test-BRAVOSelfTestOutboundPositiveGate -Condition $assignment.Right -Regex $regex)) {
+                    $allGated = $false; break
+                }
             }
             if ($allGated) {
                 $derived[$variableName] = $true
@@ -2383,16 +2460,53 @@ function Get-BRAVOSelfTestOutboundGateRegex {
     return $regex
 }
 
-function Test-BRAVOSelfTestOutboundStopsFlow {
-    param($Ast)
-    return @($Ast.FindAll({
-        param($node)
-        $node -is [Management.Automation.Language.ReturnStatementAst] -or
-        $node -is [Management.Automation.Language.ExitStatementAst] -or
-        $node -is [Management.Automation.Language.ContinueStatementAst] -or
-        $node -is [Management.Automation.Language.BreakStatementAst] -or
-        $node -is [Management.Automation.Language.ThrowStatementAst]
-    }, $true)).Count -gt 0
+function Test-BRAVOSelfTestOutboundBlockTerminates {
+    # КОЖЕН шлях блоку завершує потік: останній оператор списку — return/exit/
+    # throw/continue/break, або if/elseif/else, усі гілки якого (із обов'язковим
+    # else) завершують потік. Вкладений return десь усередині — недостатньо.
+    param($Block)
+    $statements = @($(if ($Block -is [Management.Automation.Language.StatementBlockAst]) { $Block.Statements }))
+    if ($statements.Count -eq 0) { return $false }
+    $last = $statements[$statements.Count - 1]
+    if ($last -is [Management.Automation.Language.ReturnStatementAst] -or
+        $last -is [Management.Automation.Language.ExitStatementAst] -or
+        $last -is [Management.Automation.Language.ContinueStatementAst] -or
+        $last -is [Management.Automation.Language.BreakStatementAst] -or
+        $last -is [Management.Automation.Language.ThrowStatementAst]) { return $true }
+    if ($last -is [Management.Automation.Language.IfStatementAst] -and $null -ne $last.ElseClause) {
+        foreach ($branch in $last.Clauses) {
+            if (-not (Test-BRAVOSelfTestOutboundBlockTerminates -Block $branch.Item2)) { return $false }
+        }
+        return (Test-BRAVOSelfTestOutboundBlockTerminates -Block $last.ElseClause)
+    }
+    return $false
+}
+
+function Test-BRAVOSelfTestOutboundFalsityProvesGate {
+    # Хибність умови доводить позитивний вимикач: умова — рівно заперечення
+    # (-not/! над позитивним вимикачем) або «-or» принаймні з одним таким
+    # доданком (хибне «A -or B» = хибні і A, і B). Позитивна умова
+    # («if (вимикач) { return }») хибність вимикача не означає.
+    param($Condition, [string]$Regex)
+    $node = $Condition
+    if ($node -is [Management.Automation.Language.PipelineAst]) {
+        if (@($node.PipelineElements).Count -ne 1) { return $false }
+        $node = $node.PipelineElements[0]
+    }
+    if ($node -is [Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression }
+    if ($node -is [Management.Automation.Language.ParenExpressionAst]) {
+        return (Test-BRAVOSelfTestOutboundFalsityProvesGate -Condition $node.Pipeline -Regex $Regex)
+    }
+    if ($node -is [Management.Automation.Language.UnaryExpressionAst]) {
+        if (@([Management.Automation.Language.TokenKind]::Not, [Management.Automation.Language.TokenKind]::Exclaim) -notcontains $node.TokenKind) { return $false }
+        return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Child -Regex $Regex)
+    }
+    if ($node -is [Management.Automation.Language.BinaryExpressionAst] -and
+        $node.Operator -eq [Management.Automation.Language.TokenKind]::Or) {
+        return ((Test-BRAVOSelfTestOutboundFalsityProvesGate -Condition $node.Left -Regex $Regex) -or
+            (Test-BRAVOSelfTestOutboundFalsityProvesGate -Condition $node.Right -Regex $Regex))
+    }
+    return $false
 }
 
 function Test-BRAVOSelfTestOutboundPositiveGate {
@@ -2400,10 +2514,26 @@ function Test-BRAVOSelfTestOutboundPositiveGate {
     # з вимикачем, стоїть не під -not/!, а з іншими термінами поєднаний лише
     # через -and — тож хибний вимикач робить умову хибною. «-not вимикач»,
     # «вимикач -or інше», порівняння й виклики команд не зараховуються.
+    # Уточнення (#434 P2): «-or» зараховується лише тоді, коли ОБИДВА доданки
+    # самі є позитивними вимикачами (хибне «A -or B» = хибні A і B, тож обидва
+    # доданки тримають канал): «$transfer = $archiveUpload -or $bazaSftp».
+    # «вимикач -or інше» (інше — не вимикач) і далі не зараховується.
     param($Condition, [string]$Regex)
     $node = $Condition
     if ($node -is [Management.Automation.Language.PipelineAst]) {
-        if (@($node.PipelineElements).Count -ne 1) { return $false }
+        if (@($node.PipelineElements).Count -ne 1) {
+            # Значення, дістане з об'єкта-вимикача конвеєром
+            # («$bazaSyncEffective.Components | Where-Object {..} | Select-Object
+            # -ExpandProperty SftpEnabled»): перший елемент читає вимикач, а
+            # заперечень у конвеєрі немає.
+            $first = $node.PipelineElements[0]
+            return ($first -is [Management.Automation.Language.CommandExpressionAst] -and
+                $first.Extent.Text -match $Regex -and
+                @($node.FindAll({ param($inner)
+                    $inner -is [Management.Automation.Language.UnaryExpressionAst] -and
+                    @([Management.Automation.Language.TokenKind]::Not, [Management.Automation.Language.TokenKind]::Exclaim) -contains $inner.TokenKind
+                }, $true)).Count -eq 0)
+        }
         $node = $node.PipelineElements[0]
     }
     if ($node -is [Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression }
@@ -2413,6 +2543,20 @@ function Test-BRAVOSelfTestOutboundPositiveGate {
         @($node.CommandElements).Count -eq 2) {
         return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.CommandElements[1] -Regex $Regex)
     }
+    # Test-BRAVOSftpCredentialsRequired (канонічний предикат, тіло якого —
+    # «$SftpEnabled -and (...)»): позитивний вимикач рівно тоді, коли його
+    # -SftpEnabled є позитивним вимикачем.
+    if ($node -is [Management.Automation.Language.CommandAst] -and [string]$node.GetCommandName() -eq 'Test-BRAVOSftpCredentialsRequired') {
+        $elements = @($node.CommandElements)
+        for ($index = 1; $index -lt $elements.Count; $index++) {
+            if ($elements[$index] -is [Management.Automation.Language.CommandParameterAst] -and $elements[$index].ParameterName -eq 'SftpEnabled') {
+                $argument = $(if ($null -ne $elements[$index].Argument) { $elements[$index].Argument } elseif ($index + 1 -lt $elements.Count) { $elements[$index + 1] } else { $null })
+                if ($null -eq $argument) { return $false }
+                return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $argument -Regex $Regex)
+            }
+        }
+        return $false
+    }
     if ($node -is [Management.Automation.Language.ParenExpressionAst]) {
         return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Pipeline -Regex $Regex)
     }
@@ -2420,6 +2564,10 @@ function Test-BRAVOSelfTestOutboundPositiveGate {
         return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Child -Regex $Regex)
     }
     if ($node -is [Management.Automation.Language.BinaryExpressionAst]) {
+        if ($node.Operator -eq [Management.Automation.Language.TokenKind]::Or) {
+            return ((Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Left -Regex $Regex) -and
+                (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Right -Regex $Regex))
+        }
         if ($node.Operator -ne [Management.Automation.Language.TokenKind]::And) { return $false }
         return ((Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Left -Regex $Regex) -or
             (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Right -Regex $Regex))
@@ -2485,9 +2633,22 @@ function Test-BRAVOSelfTestOutboundGated {
             foreach ($statement in $parent.Statements) {
                 if ($statement.Extent.EndOffset -gt $child.Extent.StartOffset) { break }
                 if ($statement -is [Management.Automation.Language.IfStatementAst]) {
-                    foreach ($clause in $statement.Clauses) {
-                        if ($clause.Item1.Extent.Text -match $regex -and (Test-BRAVOSelfTestOutboundStopsFlow -Ast $clause.Item2)) {
-                            return [pscustomobject]@{ Gated = $true; Evidence = "ранній вихід L$($clause.Item1.Extent.StartLineNumber)" }
+                    # Ранній вихід (#434 P2): код ПІСЛЯ if досяжний, лише коли всі
+                    # умови хибні або гілка дійшла до кінця; тож вимикач
+                    # доведено, коли (1) КОЖНА гілка if завершує потік в кінці
+                    # свого списку операторів, і (2) хибність умови принаймні
+                    # однієї гілки означає позитивний вимикач («-not вимикач»,
+                    # «!вимикач», також через -or). «if (вимикач) { return }» чи
+                    # return, що лише десь усередині гілки, не зараховуються.
+                    $allBodiesTerminate = $true
+                    foreach ($earlyClause in $statement.Clauses) {
+                        if (-not (Test-BRAVOSelfTestOutboundBlockTerminates -Block $earlyClause.Item2)) { $allBodiesTerminate = $false; break }
+                    }
+                    if ($allBodiesTerminate) {
+                        foreach ($clause in $statement.Clauses) {
+                            if (Test-BRAVOSelfTestOutboundFalsityProvesGate -Condition $clause.Item1 -Regex $regex) {
+                                return [pscustomobject]@{ Gated = $true; Evidence = "ранній вихід L$($clause.Item1.Extent.StartLineNumber)" }
+                            }
                         }
                     }
                 }
@@ -2615,6 +2776,66 @@ Test-BRAVOCondition -Condition (
 ) -Name 'BackupDestinations/OutboundGuardRequiresPositiveSwitch' `
     -Failure "сторож має зараховувати вимикач лише як позитивну вимогу гілки каналу (не під -not/!, поєднану лише через -and): «if (-not вимикач) { канал }», «if (вимикач -or інше) { канал }» і «(-not вимикач) -and (канал)» — незахищені; «вимикач -and інше» і else після «!вимикач» — захищені: $(@($bdPolaritySites.Values | ForEach-Object { "$($_.Function): gated=$($_.Gated) $($_.Evidence)" }) -join ' | ')"
 
+# #434 (P2): похідні змінні й ранній вихід аналізуються з полярністю.
+#   * похідна змінна — вимикач, лише якщо КОЖНЕ її присвоєння саме є
+#     позитивним кон'юнктивним вимикачем: «= вимикач», «= вимикач -and інше»;
+#     «= -not вимикач», «= вимикач -or інше» чи змішані присвоєння — ні;
+#   * ранній вихід зараховується, лише коли (1) хибність умови доводить
+#     вимикач («-not вимикач», «!вимикач», «-not вимикач -or інше») і (2) КОЖНА
+#     гілка if завершує потік в кінці свого списку операторів; «if (вимикач)
+#     { return }» і return, що стоїть лише десь у вкладеному блоці, — ні.
+$bdDerivedFixture = @(
+    [pscustomobject]@{ File = 'modules\Example\Example.Derived.ps1'; Text = @'
+function Send-ExDerivedPositive { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExDerivedAnd { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExDerivedNegated { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExDerivedOr { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExDerivedMixed { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExExitNegated { if (-not $storageEffective.SFTP.Enabled) { return }; $session = New-Object WinSCP.Session }
+function Send-ExExitBang { if (!$storageEffective.SFTP.Enabled) { Write-Output 'off'; return }; $session = New-Object WinSCP.Session }
+function Send-ExExitNegatedOr { if (-not $storageEffective.SFTP.Enabled -or $exampleOtherFlag) { throw 'off' }; $session = New-Object WinSCP.Session }
+function Send-ExExitIfElse { if (-not $storageEffective.SFTP.Enabled) { if ($exampleOtherFlag) { return } else { exit 1 } }; $session = New-Object WinSCP.Session }
+function Send-ExExitPositive { if ($storageEffective.SFTP.Enabled) { return }; $session = New-Object WinSCP.Session }
+function Send-ExExitNestedOnly { if (-not $storageEffective.SFTP.Enabled) { if ($exampleOtherFlag) { return } }; $session = New-Object WinSCP.Session }
+function Send-ExExitNoStop { if (-not $storageEffective.SFTP.Enabled) { Write-Output 'off' }; $session = New-Object WinSCP.Session }
+function Send-ExDerivedOrOfGates { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExDerivedPredicate { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExDerivedPredicateOff { $session = New-Object WinSCP.Session; $session.Open($null) }
+function Send-ExExitNegatedAnd { if (-not $storageEffective.SFTP.Enabled -and $exampleOtherFlag) { return }; $session = New-Object WinSCP.Session }
+$exDerivedPositive = [bool]$storageEffective.SFTP.Enabled
+$exDerivedAnd = $storageEffective.SFTP.Enabled -and $exampleOtherFlag
+$exDerivedNegated = -not $storageEffective.SFTP.Enabled
+$exDerivedOr = $storageEffective.SFTP.Enabled -or $exampleOtherFlag
+$exDerivedMixed = $storageEffective.SFTP.Enabled
+$exDerivedMixed = -not $storageEffective.SFTP.Enabled
+$exDerivedOrOfGates = ($exDerivedPositive -or $exDerivedAnd)
+$exDerivedPredicate = Test-BRAVOSftpCredentialsRequired -SftpEnabled (Test-SettingEnabled $storageEffective.SFTP.Enabled) -ArchiveUploadEnabled $exampleOtherFlag
+$exDerivedPredicateOff = Test-BRAVOSftpCredentialsRequired -SftpEnabled $true -ArchiveUploadEnabled (Test-SettingEnabled $storageEffective.SFTP.Enabled)
+if ($exDerivedOrOfGates) { Send-ExDerivedOrOfGates }
+if ($exDerivedPredicate) { Send-ExDerivedPredicate }
+if ($exDerivedPredicateOff) { Send-ExDerivedPredicateOff }
+if ($exDerivedPositive) { Send-ExDerivedPositive }
+if ($exDerivedAnd) { Send-ExDerivedAnd }
+if ($exDerivedNegated) { Send-ExDerivedNegated }
+if ($exDerivedOr) { Send-ExDerivedOr }
+if ($exDerivedMixed) { Send-ExDerivedMixed }
+'@ }
+)
+$bdDerivedSites = @{}
+foreach ($bdDerivedSite in @(Get-BRAVOSelfTestOutboundSites -Sources $bdDerivedFixture)) { $bdDerivedSites[$bdDerivedSite.Function] = $bdDerivedSite }
+$bdDerivedExpected = [ordered]@{
+    'Send-ExDerivedPositive' = $true; 'Send-ExDerivedAnd' = $true
+    'Send-ExDerivedOrOfGates' = $true; 'Send-ExDerivedPredicate' = $true; 'Send-ExDerivedPredicateOff' = $false; 'Send-ExDerivedNegated' = $false; 'Send-ExDerivedOr' = $false; 'Send-ExDerivedMixed' = $false
+    'Send-ExExitNegated' = $true; 'Send-ExExitBang' = $true; 'Send-ExExitNegatedOr' = $true; 'Send-ExExitIfElse' = $true
+    'Send-ExExitPositive' = $false; 'Send-ExExitNestedOnly' = $false; 'Send-ExExitNoStop' = $false; 'Send-ExExitNegatedAnd' = $false
+}
+$bdDerivedMismatches = @($bdDerivedExpected.Keys | Where-Object {
+    -not $bdDerivedSites.ContainsKey($_) -or [bool]$bdDerivedSites[$_].Gated -ne [bool]$bdDerivedExpected[$_]
+} | ForEach-Object { "$_ (очікувано gated=$($bdDerivedExpected[$_]), факт: $(if ($bdDerivedSites.ContainsKey($_)) { $bdDerivedSites[$_].Gated } else { 'немає місця' }))" })
+Test-BRAVOCondition -Condition ($bdDerivedSites.Count -eq $bdDerivedExpected.Count -and $bdDerivedMismatches.Count -eq 0) `
+    -Name 'BackupDestinations/OutboundGuardDerivedFlagsAndEarlyExitAreSound' `
+    -Failure "сторож має приймати похідний прапорець лише як позитивний кон'юнктивний вимикач (не «= -not вимикач», не «= вимикач -or інше», не змішані присвоєння), а ранній вихід — лише при запереченні вимикача в умові й завершенні потоку КОЖНОЮ гілкою if (не «if (вимикач) { return }», не вкладений return, не -not вимикач -and інше): $($bdDerivedMismatches -join ' | ')"
+
 $bdOutboundSites = @(Get-BRAVOSelfTestOutboundSites -Sources (Get-BRAVOSelfTestOutboundSourceSet -Root $root))
 $bdUngatedSites = @($bdOutboundSites | Where-Object { -not $_.Gated -and -not (Test-BRAVOSelfTestOutboundException -Site $_) })
 $bdStaleExceptions = @($script:BRAVOSelfTestOutboundExceptions | Where-Object {
@@ -2664,7 +2885,7 @@ Test-BRAVOCondition -Condition (
     -not [bool]$bdBazaOff.ScheduledSftpSyncRequired -and
     @($bdBazaOff.Components | Where-Object { [bool]$_.SftpEnabled }).Count -eq 0 -and
     -not (Test-BRAVOSftpCredentialsRequired -SftpEnabled $false -ArchiveUploadEnabled $true -MaintenanceLogUploadEnabled $true `
-        -ArchiveLogUploadEnabled $true -ScheduledSftpSyncRequired $true -BackupMonitoringSftpEnabled $true) -and
+        -ArchiveLogUploadEnabled $true -RuntimeLogSyncEnabled $true -ScheduledSftpSyncRequired $true -BackupMonitoringSftpEnabled $true) -and
     $bdBazaAssignments.Count -eq 1 -and
     $bdDerivationText -match '(?s)\$global:bazaSyncEffective = Get-BRAVOEffectiveSynchronizationConfiguration[^\r\n]*\r?\n(?:[^\r\n]*\r?\n){0,6}?[^\r\n]*-GlobalSftpEnabled \(\[bool\]\$global:storageEffective\.SFTP\.Enabled\)'
 ) -Name 'BackupDestinations/StorageMasterSwitchesDisableEveryChild' `
