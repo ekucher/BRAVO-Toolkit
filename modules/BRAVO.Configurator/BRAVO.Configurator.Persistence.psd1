@@ -5,7 +5,7 @@
     PowerShellVersion = '5.1'
     # Залежить від BRAVO.Configurator.Effective/Model/Validation — див.
     # пояснення відсутності RequiredModules у BRAVO.Configurator.Model.psd1.
-    FunctionsToExport = @('Get-BRAVOConfiguratorProductionOverrideState', 'Merge-BRAVOConfiguratorCandidateOverrides', 'Test-BRAVOConfiguratorCandidateOverrides', 'ConvertTo-BRAVOConfiguratorLocalConfigText', 'Invoke-BRAVOConfiguratorApply')
+    FunctionsToExport = @('Get-BRAVOConfiguratorProductionOverrideState', 'Merge-BRAVOConfiguratorCandidateOverrides', 'Test-BRAVOConfiguratorCandidateOverrides', 'ConvertTo-BRAVOConfiguratorLocalConfigText', 'Invoke-BRAVOConfiguratorApply', 'New-BRAVOConfiguratorSeedLocalConfig')
     VariablesToExport = @()
     CmdletsToExport = @()
     AliasesToExport = @()
