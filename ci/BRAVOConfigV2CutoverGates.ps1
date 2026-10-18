@@ -663,6 +663,13 @@ function Test-BRAVOConfigV2CutoverGates {
             foreach ($legacyReaderAssignmentAst in $legacyReaderAssignmentAsts) {
                 $assignmentTarget = $legacyReaderAssignmentAst.Left
                 $assignmentValueAst = $legacyReaderAssignmentAst.Right
+                # #239 (прогалина 8): `[string]$reader = '...'` має ціль-
+                # обгортку (ConvertExpressionAst / AttributedExpressionAst
+                # з типом чи атрибутами), а не голу VariableExpressionAst;
+                # розгортаємо обгортки до самої змінної.
+                while ($assignmentTarget -is [System.Management.Automation.Language.AttributedExpressionAst]) {
+                    $assignmentTarget = $assignmentTarget.Child
+                }
                 if ($assignmentTarget -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
                     continue
                 }
@@ -736,10 +743,85 @@ function Test-BRAVOConfigV2CutoverGates {
                 { param($astNode) $astNode -is [System.Management.Automation.Language.CommandAst] },
                 $true
             )
+            # #239 (прогалина 3): `Set-Alias`/`New-Alias` із значенням-
+            # рідером і подальший виклик через ім'я аліаса. Збираємо імена
+            # аліасів файлу (без урахування порядку й scope - свідомо
+            # консервативно: будь-який виклик цього імені у файлі вважається
+            # викликом рідера). Ланцюги аліасів, значення зі змінної, splatting
+            # і Set-Item Alias: - відомі обмеження (матриця, #239).
+            $legacyReaderAliasNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($legacyReaderAliasCommandAst in $legacyReaderCommandAsts) {
+                $aliasCmdlet = $legacyReaderAliasCommandAst.GetCommandName()
+                if (-not [string]::IsNullOrEmpty($aliasCmdlet) -and $aliasCmdlet.Contains('\')) {
+                    # Ім'я з префіксом модуля (Microsoft.PowerShell.Utility\Set-Alias).
+                    $aliasCmdlet = $aliasCmdlet.Substring($aliasCmdlet.LastIndexOf('\') + 1)
+                }
+                if ([string]::IsNullOrEmpty($aliasCmdlet) -or
+                    -not ($aliasCmdlet -ieq 'Set-Alias' -or $aliasCmdlet -ieq 'New-Alias')) {
+                    continue
+                }
+                $aliasNameText = $null
+                $aliasValueText = $null
+                $aliasPositional = New-Object System.Collections.Generic.List[string]
+                $aliasElements = @($legacyReaderAliasCommandAst.CommandElements | Select-Object -Skip 1)
+                for ($aliasElementIndex = 0; $aliasElementIndex -lt $aliasElements.Count; $aliasElementIndex++) {
+                    $aliasElement = $aliasElements[$aliasElementIndex]
+                    if ($aliasElement -is [System.Management.Automation.Language.CommandParameterAst]) {
+                        $aliasParameterName = $aliasElement.ParameterName
+                        $aliasParameterArgument = $aliasElement.Argument
+                        $aliasIsName = $aliasParameterName.Length -gt 0 -and 'Name'.StartsWith($aliasParameterName, [StringComparison]::OrdinalIgnoreCase)
+                        $aliasIsValue = $aliasParameterName.Length -gt 0 -and 'Value'.StartsWith($aliasParameterName, [StringComparison]::OrdinalIgnoreCase)
+                        $aliasIsSwitch = $false
+                        foreach ($aliasSwitchName in @('PassThru', 'Force', 'WhatIf', 'Confirm', 'Verbose', 'Debug')) {
+                            if (-not ($aliasIsName -or $aliasIsValue) -and $aliasParameterName.Length -gt 0 -and $aliasSwitchName.StartsWith($aliasParameterName, [StringComparison]::OrdinalIgnoreCase)) { $aliasIsSwitch = $true }
+                        }
+                        if (-not $aliasParameterArgument -and -not $aliasIsSwitch -and ($aliasElementIndex + 1) -lt $aliasElements.Count) {
+                            # параметр зі значенням у наступному елементі
+                            # (-Name/-Value/-Option/-Scope/-Description).
+                            $aliasElementIndex++
+                            $aliasParameterArgument = $aliasElements[$aliasElementIndex]
+                        }
+                        $aliasArgumentText = $null
+                        if ($aliasParameterArgument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                            $aliasArgumentText = $aliasParameterArgument.Value
+                        }
+                        if ($aliasIsName) { $aliasNameText = $aliasArgumentText }
+                        elseif ($aliasIsValue) { $aliasValueText = $aliasArgumentText }
+                        continue
+                    }
+                    if ($aliasElement -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                        [void]$aliasPositional.Add($aliasElement.Value)
+                    } else {
+                        [void]$aliasPositional.Add($null)
+                    }
+                }
+                # Позиційні аргументи заповнюють лише ще не задані Name, Value.
+                $aliasPositionalIndex = 0
+                if ($null -eq $aliasNameText -and $aliasPositionalIndex -lt $aliasPositional.Count) {
+                    $aliasNameText = $aliasPositional[$aliasPositionalIndex]
+                    $aliasPositionalIndex++
+                }
+                if ($null -eq $aliasValueText -and $aliasPositionalIndex -lt $aliasPositional.Count) {
+                    $aliasValueText = $aliasPositional[$aliasPositionalIndex]
+                }
+                if ([string]::IsNullOrEmpty($aliasNameText) -or [string]::IsNullOrEmpty($aliasValueText)) {
+                    continue
+                }
+                foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                    if ([string]::Equals($aliasValueText, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                        [void]$legacyReaderAliasNames.Add($aliasNameText)
+                    }
+                }
+            }
+
             foreach ($legacyReaderCommandAst in $legacyReaderCommandAsts) {
                 $enclosingFunctionName = Get-BRAVOAstEnclosingFunctionName -AstNode $legacyReaderCommandAst
                 $invokedCommandName = $legacyReaderCommandAst.GetCommandName()
                 if (-not [string]::IsNullOrEmpty($invokedCommandName)) {
+                    if ($legacyReaderAliasNames.Contains($invokedCommandName)) {
+                        [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через alias '$invokedCommandName', що вказує на legacy-рідер)")
+                        continue
+                    }
                     foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
                         if (-not [string]::Equals($invokedCommandName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
                             continue
