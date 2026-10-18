@@ -7480,7 +7480,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     }
     $toolIntegrityExitSegment = Get-MaintenanceEarlyExitSegment `
         -StartMarker 'if ($script:BRAVOToolManifest.ShouldBlock) {' `
-        -EndMarker 'exit (Resolve-BRAVOExitCode -ToolIntegrityViolation)'
+        -EndMarker 'Complete-BRAVOMaintenanceEarlyExit -ExitCode (Resolve-BRAVOExitCode -ToolIntegrityViolation)'
     Test-BRAVOCondition `
         -Condition (
             $null -ne $toolIntegrityExitSegment -and
@@ -7491,7 +7491,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Failure "#299 (рішення власника): блокування через цілісність інструментів має одразу надсилати CRITICAL (Send-SlackAlert -IsCritical + Send-BRAVOMaintenanceEarlyExitAlerts перед exit)"
     $recoveryGuardExitSegment = Get-MaintenanceEarlyExitSegment `
         -StartMarker 'Send-SlackAlert -Message $message -IsCritical' `
-        -EndMarker 'exit 20'
+        -EndMarker 'Complete-BRAVOMaintenanceEarlyExit -ExitCode 20'
     Test-BRAVOCondition `
         -Condition ($null -ne $recoveryGuardExitSegment -and $recoveryGuardExitSegment.Contains('Send-BRAVOMaintenanceEarlyExitAlerts')) `
         -Name "Maintenance/RecoveryGuardExitFlushesCriticalAlert" `
@@ -7505,7 +7505,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Failure "#299: збій запису quiescence-маркера має надіслати CRITICAL до throw"
     $lockBusyExitSegment = Get-MaintenanceEarlyExitSegment `
         -StartMarker 'if (-not $maintenanceLockResult.Success) {' `
-        -EndMarker 'exit (Resolve-BRAVOExitCode -LockBusy)'
+        -EndMarker 'Complete-BRAVOMaintenanceEarlyExit -ExitCode (Resolve-BRAVOExitCode -LockBusy)'
     Test-BRAVOCondition `
         -Condition (
             $null -ne $lockBusyExitSegment -and
@@ -14736,7 +14736,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         # $missedRestoreDue (реставрація реально ще не виконана).
         $recoveryGuardBlock = [regex]::Match(
             $maintenanceRestoreWindowText,
-            '(?s)\$RunMissedRestoreOnly -and \$missedDailyWork.{0,2500}?exit 20'
+            '(?s)\$RunMissedRestoreOnly -and \$missedDailyWork.{0,2500}?Complete-BRAVOMaintenanceEarlyExit -ExitCode 20'
         ).Value
         Test-BRAVOCondition `
             -Condition (
@@ -15664,7 +15664,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         $archiveScriptText.Contains('Write-BRAVOArchiveFatalDiagnostics `') -and
         $archiveScriptText.Contains('не вдалося записати повну діагностику') -and
         $archiveScriptText.Contains('-Reason $fatalMessage') -and
-        $archiveScriptText.Contains('Exit $script:processExitCode')
+        $archiveScriptText.Contains('exit $script:processExitCode')
     )
     Test-BRAVOCondition `
         -Condition (
@@ -16815,7 +16815,7 @@ try {
     # Орієнтир на унікальний коментар перед "try {", а не на точний
     # сусідній текст усередині: коментарі між ними можуть змінюватись.
     $maintenanceOuterTryIndex = $maintenanceRuntimeTextForPause.IndexOf('Пауза при ручному запуску мала охопити')
-    $maintenanceFirstExitIndex = $maintenanceRuntimeTextForPause.IndexOf('Exit $elevatedProcess.ExitCode')
+    $maintenanceFirstExitIndex = $maintenanceRuntimeTextForPause.IndexOf('Complete-BRAVOMaintenanceEarlyExit -ExitCode $elevatedProcess.ExitCode')
     $maintenanceFinallyIndex = $maintenanceRuntimeTextForPause.LastIndexOf('Wait-BRAVOManualExit -NoPause:$NoPause')
     $maintenanceLastExitIndex = $maintenanceRuntimeTextForPause.LastIndexOf('exit 0')
     Test-BRAVOCondition `
@@ -17517,7 +17517,7 @@ function Test-RangeIdUsage { param($Path, $ThresholdPercent, $WaitedForFileSecon
 function Send-FinalReport { param($LOG_FILE) Add-ProbeEvent 'FINAL-REPORT' }
 function Send-BRAVOMaintenanceOperationsEvent { param($ExitCode, $ElapsedTime) }
 function Write-BRAVOTaskExecutionState { param($TaskName) }
-function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
+function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $Status, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
 function Invoke-BRAVOMaintenanceOwnLogUpload { Add-ProbeEvent 'OWNLOG-UPLOAD' }
 # #316: той самий принцип, що Invoke-BRAVOMaintenanceOwnLogUpload вище --
 # пробу цікавить порядок кроків (чи викликається ДО "Зупинка служб" і коли
@@ -17728,6 +17728,15 @@ try {
         if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
             -not $probeStubNames.ContainsKey($probeStatement.Name)) {
             $probeFunctionTexts.Add($probeStatement.Extent.Text)
+        }
+    }
+    # #478: helper'и раннього виходу (статус + exit) визначені ПЕРЕД зовнішнім
+    # try — справжні, їх треба додати окремо, інакше ранній exit проби падає
+    # на CommandNotFound (exit 90).
+    foreach ($probeEarlyExitStatement in @($probeWrapper.Body.EndBlock.Statements)) {
+        if ($probeEarlyExitStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            @('Write-BRAVOMaintenanceEarlyExitStatus', 'Complete-BRAVOMaintenanceEarlyExit') -contains $probeEarlyExitStatement.Name) {
+            $probeFunctionTexts.Add($probeEarlyExitStatement.Extent.Text)
         }
     }
     # Цикл служб і облік відновлення служб (#314) винесено в dot-source
@@ -18913,7 +18922,11 @@ $probeResult | Add-Member -NotePropertyName ProbeLeaks -NotePropertyValue @($pro
                     $maintenanceRecoveryBlocked.ProbeOk -and $maintenanceRecoveryBlocked.ExitCode -eq 10 -and
                     @($maintenanceRecoveryBlocked.Events | Where-Object { $_ -like 'STOP*' -or $_ -like 'START *' -or $_ -match '^STEP [2-8]/8 ' }).Count -eq 0 -and
                     @($maintenanceRecoveryBlocked.Events | Where-Object { $_ -ceq 'LOCK-EXIT' }).Count -eq 1 -and
-                    (& $maintenanceOrchestrationFinallyTail $maintenanceRecoveryBlocked.Events)
+                    # #478: заблокований лімітом вихід (код 10) пише Status (STATUS 10) після звільнення
+                    # lock і до finally; чистий no-op (код 0) статус не пише.
+                    @($maintenanceRecoveryBlocked.Events | Where-Object { $_ -ceq 'STATUS 10' }).Count -eq 1 -and
+                    @($maintenanceRecoveryVeto.Events | Where-Object { $_ -like 'STATUS *' }).Count -eq 0 -and
+                    (& $maintenanceOrchestrationFinallyTail @($maintenanceRecoveryBlocked.Events | Where-Object { $_ -notlike 'STATUS *' }))
                 ) `
                 -Name "Maintenance/RecoveryVetoedAfterLockExitsWithoutWork" `
                 -Failure ("#476: Recovery без пропущеної денної роботи, чия реставрація скасована вето після lock, має завершитись без дій (служби не зупиняються, кроки не друкуються, lock звільняється один раз): код 0, а для блокування лімітом — 10; exit=$($maintenanceRecoveryVeto.ExitCode)/$($maintenanceRecoveryBlocked.ExitCode); події: " + ($maintenanceRecoveryVeto.Events -join ' | '))
@@ -19453,7 +19466,7 @@ function Write-BRAVOStepResult {
     param([int]$Current, [int]$Total, [string]$Name, [string]$Status, [string]$Details, $Duration)
     Add-ProbeEvent ("STEP {0}/{1} {2} {3}" -f $Current, $Total, $Name, $Status)
 }
-function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
+function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $Status, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
 function Get-BRAVORestoreGenerationManifest { param($BackupRoot) throw 'self-test: маніфест поколінь не потрібен' }
 function Get-BRAVORestoreVerifyStatePath { param($StateRoot) return 'self-test-restore-verify.json' }
 function Get-BRAVORestoreVerifyState { param($Path) return [pscustomobject]@{ Exists = $false; Corrupt = $false; State = $null } }
@@ -29440,7 +29453,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     # #438 (P3-1): код завершення тепер обчислюється ($recoveryNoWorkExitCode:
     # 10 для заблокованої лімітом ночі, 0 інакше), тож шукаємо
     # 'exit $recoveryNoWorkExitCode' замість голого 'exit 0'.
-    $recoveryExitIndexInWindow = $recoveryNoWorkWindow.IndexOf('exit $recoveryNoWorkExitCode', [Math]::Max(0, $recoveryFooterIndexInWindow))
+    $recoveryExitIndexInWindow = $recoveryNoWorkWindow.IndexOf('Complete-BRAVOMaintenanceEarlyExit -ExitCode $recoveryNoWorkExitCode', [Math]::Max(0, $recoveryFooterIndexInWindow))
     Test-BRAVOCondition `
         -Condition (
             $recoveryNoWorkIndex -ge 0 -and
@@ -31044,7 +31057,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
             -not $archiveScriptText.Contains('[math]::Max(0, [int]$schedulerSettings.OperationLockWaitMinutes)') -and
             -not $maintenanceScriptText.Contains('[math]::Max(0, [int]$schedulerSettings.OperationLockWaitMinutes)') -and
             $archiveScriptText -match '(?s)\$processLockResult = Enter-BRAVOArchiveProcessLock.{0,600}?\$script:processExitCode = Resolve-BRAVOExitCode -LockBusy' -and
-            $maintenanceScriptText -match '(?s)\$maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock.{0,900}?exit \(Resolve-BRAVOExitCode -LockBusy\)' -and
+            $maintenanceScriptText -match '(?s)\$maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock.{0,1200}?Complete-BRAVOMaintenanceEarlyExit -ExitCode \(Resolve-BRAVOExitCode -LockBusy\)' -and
             $taskInstallerText.Contains('(ConvertTo-BRAVOSchedulerExecutionTimeLimit -Hours $TaskSettings.ExecutionTimeLimitHours)') -and
             -not $taskInstallerText.Contains('[timespan]::FromHours([double]$TaskSettings.ExecutionTimeLimitHours)')
         ) `
@@ -33050,7 +33063,7 @@ function Write-BRAVOLog {
                 "`$script:maintenanceRuntimeExitCode = `$diskPreflightExitCode") -and
             $maintenanceDiskFailureBlock.Contains('Write-BRAVOMaintenanceEarlyFailureSummary') -and
             $maintenanceDiskFailureBlock.Contains("Wait-BRAVOManualExit -NoPause:`$NoPause") -and
-            $maintenanceDiskFailureBlock.Contains("exit `$diskPreflightExitCode") -and
+            $maintenanceDiskFailureBlock.Contains("Complete-BRAVOMaintenanceEarlyExit -ExitCode `$diskPreflightExitCode") -and
             -not $maintenanceDiskFailureBlock.Contains('exit 60') -and
             $maintenanceScriptText.Contains(
                 'Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE')

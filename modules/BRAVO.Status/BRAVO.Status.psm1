@@ -12,8 +12,11 @@
 #   помилку лише логувати WARNING, ніколи не змінюючи exit code чи
 #   результат операції (fail-soft; перевіряється self-test-контрактом).
 # - Exit codes лишаються канонічним класифікатором збою: поле status
-#   (OK|WARNINGS|ERROR) — лише зручна проєкція exitCode для споживача,
-#   деривується ТУТ в одному місці (0→OK, 10→WARNINGS, решта→ERROR).
+#   (OK|WARNINGS|ERROR) — лише зручна проєкція exitCode для споживача.
+#   Модуль НЕ імпортує BRAVO.ExitCodes і власного відображення код→status
+#   не має (#479): call-site обчислює status канонічною
+#   Get-BRAVOExitCodeStatus (BRAVO.ExitCodes) і передає його обов'язковим
+#   параметром -Status; тут він лише валідується за схемою.
 # - Жодних secret-bearing значень у details: call-site передає лише
 #   агрегати (лічильники, ідентифікатори generation, булеві прапорці).
 #
@@ -86,10 +89,14 @@ function Write-BRAVOOperationStatus {
         # Ім'я exit-коду з канонічного BRAVO.ExitCodes; параметр, а не
         # виклик звідси — модуль статусу не тягне залежність на ExitCodes
         # (call-site уже має Get-BRAVOExitCodeName у scope).
-        [AllowNull()][AllowEmptyString()][string]$ExitCodeName
+        [AllowNull()][AllowEmptyString()][string]$ExitCodeName,
+        # Проєкція exit-коду на схему статусу (OK|WARNINGS|ERROR): результат
+        # Get-BRAVOExitCodeStatus, обчислений call-site'ом (#479). Обов'язковий:
+        # запасного відображення тут немає, щоб воно не розійшлося з каноном.
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('OK', 'WARNINGS', 'ERROR')]
+        [string]$Status
     )
-
-    $status = if ($ExitCode -eq 0) { 'OK' } elseif ($ExitCode -eq 10) { 'WARNINGS' } else { 'ERROR' }
 
     $packageVersion = ''
     $packageVersionVariable = Get-Variable -Name 'ScriptVersion' -Scope Global -ErrorAction SilentlyContinue
@@ -102,7 +109,7 @@ function Write-BRAVOOperationStatus {
         host = [string]$env:COMPUTERNAME
         packageVersion = $packageVersion
         operation = $Operation
-        status = $status
+        status = $Status
         exitCode = $ExitCode
         exitCodeName = [string]$ExitCodeName
         startedAt = $StartedAt.ToString('o')

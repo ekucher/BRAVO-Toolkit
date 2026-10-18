@@ -42,6 +42,35 @@ $script:BRAVOExitCodeNames = @{
     90 = "InternalError"
 }
 
+# Канонічна таблиця severity звітності (SUCCESS | WARNING | ERROR | CRITICAL)
+# для КОЖНОГО коду з $script:BRAVOExitCodeNames. Єдине місце, де код
+# відображається на severity, а через Get-BRAVOExitCodeStatus — і на status
+# статус-файла (#479). Hashtable з тієї самої причини, що й таблиця імен.
+# CRITICAL: події безпеки/цілісності (32-35) і HealthCritical (70); 10 і 20
+# (SuccessWithWarnings, SkippedLockBusy) — WARNING; решта відмов — ERROR.
+$script:BRAVOExitCodeSeverities = @{
+    0  = 'SUCCESS'
+    10 = 'WARNING'
+    20 = 'WARNING'
+    30 = 'ERROR'
+    31 = 'ERROR'
+    32 = 'CRITICAL'
+    33 = 'CRITICAL'
+    34 = 'CRITICAL'
+    35 = 'CRITICAL'
+    36 = 'ERROR'
+    37 = 'ERROR'
+    40 = 'ERROR'
+    41 = 'ERROR'
+    42 = 'ERROR'
+    43 = 'ERROR'
+    50 = 'ERROR'
+    51 = 'ERROR'
+    60 = 'ERROR'
+    70 = 'CRITICAL'
+    90 = 'ERROR'
+}
+
 function Resolve-BRAVOExitCode {
     [CmdletBinding()]
     param(
@@ -150,11 +179,39 @@ function Get-BRAVOExitCodeSeverity {
     [OutputType([string])]
     param([Parameter(Mandatory = $true)][int]$Code)
 
-    if ($Code -eq 0) { return 'SUCCESS' }
-    if ($Code -eq 10) { return 'WARNING' }
-    if ($Code -eq 20) { return 'WARNING' }
-    if ($Code -eq 32 -or $Code -eq 33 -or $Code -eq 34 -or $Code -eq 35 -or $Code -eq 70) { return 'CRITICAL' }
+    # Невідомий код (поза $script:BRAVOExitCodeSeverities) — ERROR: fail-closed,
+    # лише для прямого виклику з довільним числом; кожен код таблиці імен
+    # має запис у таблиці severity (pinned-тест ExitCodes/EveryCodeHasSeverity).
+    if ($script:BRAVOExitCodeSeverities.ContainsKey($Code)) {
+        return [string]$script:BRAVOExitCodeSeverities[$Code]
+    }
     return 'ERROR'
+}
+
+function Get-BRAVOExitCodeStatus {
+    <#
+        Канонічна проєкція коду завершення на поле status machine-readable
+        статус-файла (BRAVO.Status; схема OK | WARNINGS | ERROR незмінна).
+
+        Деривується ЛИШЕ з Get-BRAVOExitCodeSeverity — друге незалежне
+        відображення код -> status неприпустиме (#479): SUCCESS -> OK,
+        WARNING -> WARNINGS, ERROR/CRITICAL -> ERROR. Рішення власника D-A:
+        код 20 (SkippedLockBusy) дає WARNINGS, а не ERROR — відкладене
+        виконання не є відмовою.
+
+        BRAVO.Status цю функцію не імпортує (модуль статусу без залежностей):
+        call-site обчислює status тут і передає його в
+        Write-BRAVOOperationStatus параметром -Status.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory = $true)][int]$Code)
+
+    switch (Get-BRAVOExitCodeSeverity -Code $Code) {
+        'SUCCESS' { return 'OK' }
+        'WARNING' { return 'WARNINGS' }
+        default { return 'ERROR' }
+    }
 }
 
 function Get-BRAVOExitCodeName {
@@ -170,5 +227,6 @@ function Get-BRAVOExitCodeName {
 Export-ModuleMember -Function @(
     'Resolve-BRAVOExitCode',
     'Get-BRAVOExitCodeName',
-    'Get-BRAVOExitCodeSeverity'
+    'Get-BRAVOExitCodeSeverity',
+    'Get-BRAVOExitCodeStatus'
 )

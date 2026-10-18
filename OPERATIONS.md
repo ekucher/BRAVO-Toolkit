@@ -2658,7 +2658,8 @@ compatibility-контракт для зовнішніх machine-спожива�
 файли вручну.
 
 - Спільні поля: `schemaVersion`, `host`, `packageVersion`, `operation`,
-  `status` (`OK`/`WARNINGS`/`ERROR` — проєкція exitCode: 0/10/інше),
+  `status` (`OK`/`WARNINGS`/`ERROR` — проєкція exitCode через єдину таблицю severity
+  `BRAVO.ExitCodes`: SUCCESS→`OK`, WARNING (коди 10 і 20)→`WARNINGS`, решта→`ERROR`),
   `exitCode`, `exitCodeName`, `startedAt`/`finishedAt`/`durationSeconds`,
   `details` (операційні агрегати: generation, лічильники кроків,
   verified-прапорці призначень, вік верифікації).
@@ -2672,6 +2673,23 @@ compatibility-контракт для зовнішніх machine-спожива�
   lock зайнятий (exit 20: статус належить екземпляру, що працює), коли
   підхоплення пропущеної копії не потрібне, і в прогонах `-SyncBAZA`
   (файл описує нічну копію; денна синхронізація не має його перезаписувати).
+- Код 20 (`SkippedLockBusy`, відкладене виконання) дає `status` = `WARNINGS`, а не `ERROR`
+  (рішення власника D-A, #479). Відображення код → severity → status існує лише в `BRAVO.ExitCodes`
+  (`Get-BRAVOExitCodeSeverity`, `Get-BRAVOExitCodeStatus`); `BRAVO.Status` приймає готовий `-Status`.
+- Ранні виходи ВСЕРЕДИНІ runtime Maintenance і Archive пишуть статус через helper
+  (`Complete-BRAVOMaintenanceEarlyExit`, `Complete-BRAVOArchiveEarlyExit`): код 32 (ToolIntegrity),
+  recovery-guard (код 20), помилки конфігурації (30/31), disk-preflight тощо, з `details.earlyTermination`
+  і `details.earlyExitReason` (#478). Винятки — явні виходи з `-SkipStatus`, де прогін нічого не виконував
+  або результат належить іншому процесу. Maintenance: код дочірнього елевованого процесу, `-RecoverServices`,
+  lock зайнятий, `ServiceClassificationChanged`, no-op Recovery/veto з кодом 0. Archive: відсутній
+  `BRAVO_HEALTH.ps1`, пересилання `-HealthCheckOnly`, дочірній елевований процес.
+- Помилка конфігурації ДО того, як відомий `stateRoot` (коди 30/31 під час читання та валідації
+  `BRAVO.config`), статус не пише — запис неможливий, тож попередній `OK` може залишитися.
+- Відомі обмеження (статус НЕ пишеться; follow-up): виходи до запуску runtime у кореневих entrypoint-ах
+  `BRAVO_MAINTENANCE.ps1` / `BRAVO_ARCHIV.ps1` (коди 33/34/35/90; 33 — pre-trust за дизайном) і необроблений
+  виняток Maintenance поза бізнес-`try` (код 90 через обгортку модуля), на відміну від fatal-`catch` Archive.
+- Найчастіший автор коду 20 — відкладений (`Deferred`) Health (статус-файл операції `Health`). Recovery-guard
+  Maintenance надсилає CRITICAL-сповіщення, хоча статус показує `WARNINGS` (рішення власника D-A).
 - Секретів у файлах немає за контрактом (перевіряється самотестом).
 - Локальний outbox подій Operations (BSYSTEM) зберігає лише замасковану
   копію тексту: `message`, `component`, `services`, вкладені `details` і

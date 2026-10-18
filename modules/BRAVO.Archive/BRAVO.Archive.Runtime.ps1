@@ -82,6 +82,102 @@ Import-Module -Name $archiveHelpersPath -ErrorAction Stop
 
 
 
+function Write-BRAVOArchiveOperationStatus {
+    # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status) для
+    # Archive: ЄДИНИЙ запис статусу для хвоста Main і контрольованих ранніх
+    # виходів під lock (#291: preflight вільного місця, orphan VSS,
+    # Test-Compatibility). Без нього ранній вихід лишав статус попереднього
+    # прогону, і моніторинг бачив "OK" при щоночному exit 40. Lock busy і
+    # catch-up skip його НЕ викликають навмисно (див. там). Fail-soft:
+    # помилка запису лише логується і ніколи не змінює результат Archive
+    # (інваріант «telemetry не змінює exit code»); exit code — параметром,
+    # уже обчислений викликачем. Визначено на початку runtime (#478), бо
+    # Complete-BRAVOArchiveEarlyExit викликається вже з ранніх виходів
+    # конфігурації; поля generation читаються через Get-Variable — до
+    # ініціалізації Main їх ще немає, а StrictMode не пробачає читання.
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][datetime]$StartedAt,
+        [hashtable]$Details = @{},
+        # Ранній вихід: деталі — ідентифікатор generation і причина
+        # (без сирих повідомлень, шляхів чи секретів).
+        [string]$EarlyExitReason
+    )
+
+    try {
+        # BRAVO_STATUS_Archive.json — статус НІЧНОЇ копії: денна BAZA-
+        # синхронізація (-SyncBAZA) його не перезаписує, інакше вона
+        # приховала б провал нічної копії або зсунула FinishedAt, на який
+        # спирається діагностика Health.
+        if ((Test-Path variable:SyncBAZA) -and $SyncBAZA) { return }
+        $statusDetails = $Details
+        if (-not [string]::IsNullOrWhiteSpace($EarlyExitReason)) {
+            $earlyGenerationId = Get-Variable -Name backupGenerationId -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+            $earlyGenerationStatus = Get-Variable -Name backupGenerationStatus -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+            # Деталі викликача зберігаються; маркери додаються, ключі викликача не перезаписуються.
+            $statusDetails = @{}
+            if ($null -ne $Details) {
+                foreach ($earlyDetailKey in @($Details.Keys)) { $statusDetails[$earlyDetailKey] = $Details[$earlyDetailKey] }
+            }
+            foreach ($earlyMarker in @(
+                    @('generationId', [string]$earlyGenerationId),
+                    @('generationStatus', [string]$earlyGenerationStatus),
+                    @('earlyTermination', $true),
+                    @('earlyExitReason', $EarlyExitReason))) {
+                if (-not $statusDetails.ContainsKey($earlyMarker[0])) { $statusDetails[$earlyMarker[0]] = $earlyMarker[1] }
+            }
+        }
+        Write-BRAVOOperationStatus `
+            -StateRoot $stateRoot `
+            -Operation Archive `
+            -ExitCode $ExitCode `
+            -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
+            -Status (Get-BRAVOExitCodeStatus -Code $ExitCode) `
+            -StartedAt $StartedAt `
+            -Details $statusDetails
+    } catch {
+        # Ранні виходи не мають зовнішнього try: збій самого логування не
+        # повинен перетворити 40/30/32 на 90.
+        try {
+            Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)" -Level "WARNING"
+        } catch {
+            # Телеметрія не змінює exit code.
+        }
+    }
+}
+
+function Complete-BRAVOArchiveEarlyExit {
+    # #478: ЄДИНА точка раннього виходу Archive — спершу status-файл (через
+    # канонічне відображення код -> Status у BRAVO.ExitCodes), лише потім
+    # exit. Раніше частина ранніх виходів завершувала процес без запису, і
+    # BRAVO_STATUS_Archive.json лишався з попереднім "OK". Фінальний
+    # exit Main ($script:processExitCode) — єдиний інший exit у файлі.
+    # -SkipStatus — лише для виходів, що не є прогоном Archive (пересилання
+    # -HealthCheckOnly у BRAVO_HEALTH, який пише власний статус; відсутній
+    # компонент комплекту до завантаження конфігурації).
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [string]$EarlyExitReason,
+        [switch]$SkipStatus
+    )
+
+    # Фінальна Operations-подія у finally читає $script:processExitCode.
+    $script:processExitCode = $ExitCode
+    if (-not $SkipStatus) {
+        $earlyStartedAtVariable = Get-Variable -Name scriptStartTime -ErrorAction SilentlyContinue
+        $earlyStartedAt = if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) {
+            [datetime]$earlyStartedAtVariable.Value
+        } else {
+            Get-Date
+        }
+        Write-BRAVOArchiveOperationStatus `
+            -ExitCode $ExitCode `
+            -StartedAt $earlyStartedAt `
+            -EarlyExitReason $EarlyExitReason
+    }
+    exit $ExitCode
+}
+
 # Compatibility forwarding for callers that still use BRAVO_ARCHIV -HealthCheckOnly.
 # New callers and Task Scheduler use BRAVO_HEALTH.ps1 directly.
 if ($HealthCheckOnly) {
@@ -92,7 +188,7 @@ if ($HealthCheckOnly) {
         # для компонента комплекту, якого бракує вже ПІСЛЯ guard (раніше —
         # голий 1 поза таблицею кодів). У режимі Enforce сюди не дійти:
         # BRAVO_HEALTH.ps1 є в RUNTIME_MANIFEST.json, і guard дає 33.
-        exit 90
+        Complete-BRAVOArchiveEarlyExit -ExitCode 90 -SkipStatus
     }
     # AUTO -> дочірній BRAVO_HEALTH.ps1 сам виконує ту саму auto-derivation
     # проти свого $PSScriptRoot (той самий комплект); EXPLICIT -> точний
@@ -107,7 +203,8 @@ if ($HealthCheckOnly) {
         -NoSlack:$NoSlack `
         -SkipIfBackupTaskRunning:$SkipIfBackupTaskRunning `
         -NoPause:$NoPause
-    exit $LASTEXITCODE
+    # Статус пише сам BRAVO_HEALTH (операція Health), не Archive.
+    Complete-BRAVOArchiveEarlyExit -ExitCode ([int]$LASTEXITCODE) -SkipStatus
 }
 # P0 Configuration Foundation: справжня межа виклику оператора — root
 # entrypoint, і лише ВІН знає, чи -ConfigPath був реально переданий: сюди
@@ -163,8 +260,9 @@ try {
 } catch {
     Write-Host "ПОМИЛКА: Не вдалося завантажити конфiгурацiю: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
     # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration, як у Maintenance
-    # і DataRestore для тієї самої відмови (раніше — голий 1).
-    Exit 30
+    # і DataRestore для тієї самої відмови (раніше — голий 1). #478: статус
+    # пише helper (якщо $stateRoot уже відомий; інакше fail-soft без запису).
+    Complete-BRAVOArchiveEarlyExit -ExitCode 30 -EarlyExitReason 'ConfigurationLoad'
 }
 
 # Archive використовує ту саму політику вільного місця, що й Maintenance.
@@ -223,7 +321,7 @@ try {
     }
 } catch {
     Write-Host "ПОМИЛКА: Некоректна конфігурація перевірки вільного місця: $($_.Exception.Message)" -ForegroundColor Red
-    Exit 30
+    Complete-BRAVOArchiveEarlyExit -ExitCode 30 -EarlyExitReason 'FreeSpaceConfiguration'
 }
 
 # Запит на підвищення дозволу виконання скрипта
@@ -252,12 +350,13 @@ if ($requireAdministrator) {
         try {
             $elevatedProcess = [System.Diagnostics.Process]::Start($processInfo)
             $elevatedProcess.WaitForExit()
-            Exit $elevatedProcess.ExitCode
+            # Код дочірнього елевованого процесу: статус пише він сам.
+            Complete-BRAVOArchiveEarlyExit -ExitCode $elevatedProcess.ExitCode -SkipStatus
         } catch {
             Write-Host "UAC запит вiдхилено або сталася помилка: $($_.Exception.Message)" -ForegroundColor $logColors.ERROR
             Write-Host "Запустiть PowerShell з правами адмiнiстратора вручну" -ForegroundColor $logColors.WARNING
             # Контракт BRAVO.ExitCodes: 36 = PrivilegeRequired (раніше — голий 1).
-            Exit 36
+            Complete-BRAVOArchiveEarlyExit -ExitCode 36 -EarlyExitReason 'PrivilegeRequired'
         }
     }
 }
@@ -455,13 +554,13 @@ if ($credentialHelperLoaded) {
         Write-Host "ПОМИЛКА: Некоректні локальні параметри установи у Credential Manager: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" `
             -ForegroundColor $logColors.ERROR
         # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
-        exit 30
+        Complete-BRAVOArchiveEarlyExit -ExitCode 30 -EarlyExitReason 'InstitutionSettings'
     }
 } elseif ($institutionSettingsRequired) {
     Write-Host "ПОМИЛКА: Не вдалося завантажити локальні параметри установи: $($script:institutionSettingsInitializationError)" `
         -ForegroundColor $logColors.ERROR
     # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
-    exit 30
+    Complete-BRAVOArchiveEarlyExit -ExitCode 30 -EarlyExitReason 'InstitutionSettings'
 }
 
 if ($credentialHelperLoaded -and $archiveCredentialRequired) {
@@ -639,18 +738,14 @@ function Test-Compatibility {
             Write-BRAVOLog -Component 'STARTUP' -Message "$($osSupportTier.Message) Продовжено через BRAVO_ALLOW_UNSUPPORTED_OS=1." -Level "WARNING"
         } else {
             Write-BRAVOLog -Component 'STARTUP' -Message $osSupportTier.Message -Level "ERROR"
-            # #291: exit оминає хвіст Main — статус пишемо тут. Виклик іде з
-            # Main після lock і конфігурації ($stateRoot), тож це статус
-            # саме цього прогону.
-            $unsupportedOsExitCode = Resolve-BRAVOExitCode -InvalidConfiguration
-            # Фінальна Operations-подія у finally читає $script:processExitCode —
-            # без цього вона звітувала б 0 (Success) при exit 30.
-            $script:processExitCode = $unsupportedOsExitCode
-            Write-BRAVOArchiveOperationStatus `
-                -ExitCode $unsupportedOsExitCode `
-                -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
+            # #291/#478: exit оминає хвіст Main — статус (і
+            # $script:processExitCode для фінальної Operations-події у
+            # finally, інакше вона звітувала б 0 при exit 30) пише helper.
+            # Виклик іде з Main після lock і конфігурації ($stateRoot), тож
+            # це статус саме цього прогону.
+            Complete-BRAVOArchiveEarlyExit `
+                -ExitCode (Resolve-BRAVOExitCode -InvalidConfiguration) `
                 -EarlyExitReason 'UnsupportedOperatingSystem'
-            exit $unsupportedOsExitCode
         }
     }
 
@@ -704,14 +799,10 @@ function Test-Compatibility {
 
         if ($script:BRAVOToolManifest.ShouldBlock) {
             Send-ToolIntegrityAlert -Result $script:BRAVOToolManifest
-            # #291: як і для непідтримуваної ОС — статус перед exit.
-            $toolIntegrityExitCode = Resolve-BRAVOExitCode -ToolIntegrityViolation
-            $script:processExitCode = $toolIntegrityExitCode
-            Write-BRAVOArchiveOperationStatus `
-                -ExitCode $toolIntegrityExitCode `
-                -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
+            # #291/#478: як і для непідтримуваної ОС — статус перед exit.
+            Complete-BRAVOArchiveEarlyExit `
+                -ExitCode (Resolve-BRAVOExitCode -ToolIntegrityViolation) `
                 -EarlyExitReason 'ToolIntegrityViolation'
-            exit $toolIntegrityExitCode
         }
     } elseif (-not [string]::IsNullOrWhiteSpace([string]$script:BRAVOToolManifest.Message)) {
         Write-BRAVOLog -Component 'STARTUP' -Message $script:BRAVOToolManifest.Message -Level "WARNING"
@@ -6742,58 +6833,6 @@ function Write-BRAVOArchivePreflightFailureSummary {
     Complete-BRAVOProgress
 }
 
-function Write-BRAVOArchiveOperationStatus {
-    # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status) для
-    # Archive: ЄДИНИЙ запис статусу для хвоста Main і контрольованих ранніх
-    # виходів під lock (#291: preflight вільного місця, orphan VSS,
-    # Test-Compatibility). Без нього ранній вихід лишав статус попереднього
-    # прогону, і моніторинг бачив "OK" при щоночному exit 40. Lock busy і
-    # catch-up skip його НЕ викликають навмисно (див. там). Fail-soft:
-    # помилка запису лише логується і ніколи не змінює результат Archive
-    # (інваріант «telemetry не змінює exit code»); exit code — параметром,
-    # уже обчислений викликачем.
-    param(
-        [Parameter(Mandatory = $true)][int]$ExitCode,
-        [Parameter(Mandatory = $true)][datetime]$StartedAt,
-        [hashtable]$Details = @{},
-        # Ранній вихід: деталі — ідентифікатор generation і причина
-        # (без сирих повідомлень, шляхів чи секретів).
-        [string]$EarlyExitReason
-    )
-
-    try {
-        # BRAVO_STATUS_Archive.json — статус НІЧНОЇ копії: денна BAZA-
-        # синхронізація (-SyncBAZA) його не перезаписує, інакше вона
-        # приховала б провал нічної копії або зсунула FinishedAt, на який
-        # спирається діагностика Health.
-        if ((Test-Path variable:SyncBAZA) -and $SyncBAZA) { return }
-        $statusDetails = $Details
-        if (-not [string]::IsNullOrWhiteSpace($EarlyExitReason)) {
-            $statusDetails = @{
-                generationId = [string]$script:backupGenerationId
-                generationStatus = [string]$script:backupGenerationStatus
-                earlyTermination = $true
-                earlyExitReason = $EarlyExitReason
-            }
-        }
-        Write-BRAVOOperationStatus `
-            -StateRoot $stateRoot `
-            -Operation Archive `
-            -ExitCode $ExitCode `
-            -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
-            -StartedAt $StartedAt `
-            -Details $statusDetails
-    } catch {
-        # Ранні виходи не мають зовнішнього try: збій самого логування не
-        # повинен перетворити 40/30/32 на 90.
-        try {
-            Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)" -Level "WARNING"
-        } catch {
-            # Телеметрія не змінює exit code.
-        }
-    }
-}
-
 function Enter-BRAVOArchiveProcessLock {
     # Спільний lock для BRAVO_ARCHIV і BRAVO_MAINTENANCE. Він не дозволяє
     # maintenance зупиняти служби або змінювати джерела під час backup.
@@ -9814,6 +9853,7 @@ try {
                 -Operation Archive `
                 -ExitCode 90 `
                 -ExitCodeName 'InternalError' `
+                -Status (Get-BRAVOExitCodeStatus -Code 90) `
                 -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
                 -Details @{ fatal = $true }
         } catch {
@@ -9885,10 +9925,8 @@ try {
     Wait-ForManualExit
 }
 
-if ($script:processExitCode -ne 0) {
-    Exit $script:processExitCode
-}
-Exit 0
+# Єдиний канонічний фінальний exit (решта виходів — Complete-BRAVOArchiveEarlyExit, #478).
+exit $script:processExitCode
 }
 # END BRAVO ARCHIVE RUNTIME
 if ($MyInvocation.InvocationName -ne '.') {

@@ -2,6 +2,26 @@
 
 ## Не випущено (developer)
 
+- **Fix: єдине відображення exit-код → severity/Status у `BRAVO.ExitCodes` і запис Status на ранніх виходах (#479, #478).**
+  `BRAVO.ExitCodes` отримав канонічну таблицю severity для кожного коду та `Get-BRAVOExitCodeStatus`
+  (SUCCESS→`OK`, WARNING→`WARNINGS`, ERROR/CRITICAL→`ERROR`); `Get-BRAVOExitCodeSeverity` читає її.
+  `Write-BRAVOOperationStatus` більше не має власного відображення і приймає обов'язковий `-Status`;
+  Archive, Maintenance, Health і RestoreVerify передають результат `Get-BRAVOExitCodeStatus`, а підсумок
+  Maintenance (`Get-BRAVOMaintenanceFinalStatus`) також бере клас результату звідти. Поведінкова зміна
+  (рішення власника D-A): код 20 (`SkippedLockBusy`) тепер дає `status` = `WARNINGS` (раніше `ERROR`).
+  Ранні виходи всередині runtime Maintenance і Archive йдуть через `Complete-BRAVOMaintenanceEarlyExit` /
+  `Complete-BRAVOArchiveEarlyExit`, які пишуть Status (fail-soft) і лише потім виконують `exit`; раніше
+  `BRAVO_STATUS_Maintenance.json` після коду 32, recovery-guard (20) чи помилок конфігурації лишався з
+  попереднім «OK». Без запису (`-SkipStatus`) лишаються: Maintenance — код дочірнього елевованого процесу, `-RecoverServices`,
+  lock зайнятий, `ServiceClassificationChanged`, no-op Recovery/veto з кодом 0; Archive — відсутній
+  `BRAVO_HEALTH.ps1`, пересилання `-HealthCheckOnly`, дочірній елевований процес. Відомі обмеження (follow-up):
+  виходи до запуску runtime у `BRAVO_MAINTENANCE.ps1` / `BRAVO_ARCHIV.ps1` (33/34/35/90) і необроблений виняток
+  Maintenance поза бізнес-`try` (код 90) статус не пишуть. Код 20 найчастіше пише відкладений Health; recovery-guard
+  надсилає CRITICAL при статусі `WARNINGS` (D-A). Self-test: pinned-таблиця кодів,
+  AST-перевірки (немає локального switch по кодах; кожен `exit` через helper) і поведінкові тести
+  ранніх виходів у наборі `Status`. Потрібне приймання на реальному сервері: Task Scheduler, моніторинг
+  статус-файлів.
+
 - **Feat: профілі напрямків резервного копіювання — «куди копіювати» (#282, хвиля 2).**
   Чотири профілі власника відповідають топологіям наявних пресетів Configurator і пишуть лише наявні
   прапорці, без нових ключів конфігурації: `Cloud` (Хмара, дефолт) ~ `LocalPlusSFTP`, `CloudAndSamba` ~
