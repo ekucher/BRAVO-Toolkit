@@ -344,6 +344,617 @@ function Get-BRAVOUsersReadableDataDirectoryFinding {
     return $null
 }
 
+function ConvertFrom-BRAVOWindowsCommandLine {
+    # Розбір рядка аргументів за правилами CommandLineToArgvW (так powershell.exe
+    # отримує Action.Arguments завдання). Лише розбір рядка — нічого не виконується.
+    #  - роздільники: ЛИШЕ пробіл і табуляція (U+00A0, CR/LF — не роздільники);
+    #  - 2N '' + '"' -> N '' і перемикання лапок; 2N+1 '' + '"' -> N '' і літерал '"';
+    #  - усередині лапок `""` -> літерал '"' І вихід з режиму лапок. Це поведінка shell32
+    #    CommandLineToArgvW, звірена нативним оракулом (P/Invoke, harness.ps1) на Windows
+    #    Server 2022; це НЕ варіант msvcrt після 2008 р., де `""` лишає в режимі лапок;
+    #  - поза лапками `""` дає порожній аргумент.
+    # Повертає токени й ознаку збалансованості лапок.
+    param([AllowNull()][AllowEmptyString()][string]$CommandLine)
+
+    $tokens = New-Object 'System.Collections.Generic.List[string]'
+    $length = if ($null -eq $CommandLine) { 0 } else { $CommandLine.Length }
+    $builder = New-Object System.Text.StringBuilder
+    $inQuote = $false
+    $hasToken = $false
+    $index = 0
+    while ($index -lt $length) {
+        $char = $CommandLine[$index]
+        if ($char -eq [char]'\') {
+            $end = $index
+            while ($end -lt $length -and $CommandLine[$end] -eq [char]'\') { $end++ }
+            $slashCount = $end - $index
+            if ($end -lt $length -and $CommandLine[$end] -eq [char]'"') {
+                [void]$builder.Append([char]'\', [int][math]::Floor($slashCount / 2))
+                if (($slashCount % 2) -eq 1) {
+                    [void]$builder.Append([char]'"')
+                    $index = $end + 1
+                } else {
+                    $index = $end
+                }
+            } else {
+                [void]$builder.Append([char]'\', $slashCount)
+                $index = $end
+            }
+            $hasToken = $true
+            continue
+        }
+        if ($char -eq [char]'"') {
+            if ($inQuote -and ($index + 1) -lt $length -and $CommandLine[$index + 1] -eq [char]'"') {
+                [void]$builder.Append([char]'"')
+                $inQuote = $false
+                $hasToken = $true
+                $index += 2
+                continue
+            }
+            $inQuote = -not $inQuote
+            $hasToken = $true
+            $index++
+            continue
+        }
+        if (($char -eq [char]' ' -or $char -eq [char]"`t") -and -not $inQuote) {
+            if ($hasToken) {
+                $tokens.Add($builder.ToString())
+                [void]$builder.Clear()
+                $hasToken = $false
+            }
+            $index++
+            continue
+        }
+        [void]$builder.Append($char)
+        $hasToken = $true
+        $index++
+    }
+    if ($hasToken) { $tokens.Add($builder.ToString()) }
+
+    return [pscustomobject]@{
+        Tokens   = $tokens.ToArray()
+        Balanced = (-not $inQuote)
+    }
+}
+
+function Resolve-BRAVOTaskActionPath {
+    # Шлях з Action (скрипт або значення -ConfigPath) -> повний шлях. Task
+    # Scheduler розкриває %VAR% в аргументах; відносний шлях PowerShell
+    # розв'язує від WorkingDirectory завдання. Якщо однозначно розв'язати
+    # неможливо — $null (викликач класифікує як Unknown).
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Path,
+        [AllowNull()][AllowEmptyString()][string]$WorkingDirectory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    try {
+        $expanded = [Environment]::ExpandEnvironmentVariables($Path.Trim())
+        if ($expanded.Contains('%') -or $expanded.Contains('$')) { return $null }
+        if ([IO.Path]::IsPathRooted($expanded) -and
+            $expanded -notmatch '^[A-Za-z]:(?![\\/])' -and
+            $expanded -notmatch '^[\\/](?![\\/])') {
+            return [IO.Path]::GetFullPath($expanded)
+        }
+        if ($expanded -match '^[A-Za-z]:' -or $expanded -match '^[\\/]') { return $null }
+        if ([string]::IsNullOrWhiteSpace($WorkingDirectory)) { return $null }
+        $expandedWorkingDirectory = [Environment]::ExpandEnvironmentVariables($WorkingDirectory.Trim().Trim('"'))
+        if ($expandedWorkingDirectory.Contains('%') -or -not [IO.Path]::IsPathRooted($expandedWorkingDirectory)) { return $null }
+        return [IO.Path]::GetFullPath((Join-Path -Path $expandedWorkingDirectory -ChildPath $expanded))
+    } catch {
+        return $null
+    }
+}
+
+function Get-BRAVOScriptDeclaredParameter {
+    # Імена параметрів (з alias-ами) скрипта з його param()-блоку — для
+    # відтворення прив'язки скорочень (-Config, -ConfigP...) так, як це робить
+    # PowerShell. Known=$false, коли скрипт недоступний або не розбирається.
+    param([AllowNull()][AllowEmptyString()][string]$ScriptPath)
+
+    $unknown = [pscustomobject]@{ Known = $false; Entries = @() }
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return $unknown }
+    try {
+        if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) { return $unknown }
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$errors)
+        if ($null -eq $ast -or @($errors).Count -gt 0) { return $unknown }
+
+        # Entries: кожне ім'я та alias -> параметр-власник (Owner). Alias-и одного
+        # параметра не створюють неоднозначності, а точний збіг імені/alias виграє.
+        $entries = New-Object 'System.Collections.Generic.List[object]'
+        $addEntry = {
+            param($Name, $Owner)
+            $entries.Add([pscustomobject]@{ Name = [string]$Name; Owner = [string]$Owner })
+        }
+        $paramBlock = $ast.ParamBlock
+        if ($null -ne $paramBlock) {
+            $advanced = $false
+            $supportsShouldProcess = $false
+            foreach ($attribute in @($paramBlock.Attributes)) {
+                if ($attribute.TypeName.Name -ne 'CmdletBinding') { continue }
+                $advanced = $true
+                foreach ($namedArgument in @($attribute.NamedArguments)) {
+                    if ($namedArgument.ArgumentName -eq 'SupportsShouldProcess') { $supportsShouldProcess = $true }
+                }
+            }
+            foreach ($parameter in @($paramBlock.Parameters)) {
+                $ownerName = [string]$parameter.Name.VariablePath.UserPath
+                & $addEntry $ownerName $ownerName
+                foreach ($attribute in @($parameter.Attributes)) {
+                    if ($attribute.TypeName.Name -eq 'Parameter') { $advanced = $true }
+                    if ($attribute.TypeName.Name -ne 'Alias') { continue }
+                    foreach ($aliasArgument in @($attribute.PositionalArguments)) {
+                        if ($aliasArgument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                            & $addEntry ([string]$aliasArgument.Value) $ownerName
+                        }
+                    }
+                }
+            }
+            if ($advanced) {
+                foreach ($common in @('Verbose', 'Debug', 'ErrorAction', 'WarningAction', 'InformationAction',
+                        'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer', 'PipelineVariable')) {
+                    & $addEntry $common $common
+                }
+                if ($supportsShouldProcess) {
+                    & $addEntry 'WhatIf' 'WhatIf'
+                    & $addEntry 'Confirm' 'Confirm'
+                }
+            }
+        }
+        return [pscustomobject]@{ Known = $true; Entries = $entries.ToArray() }
+    } catch {
+        return $unknown
+    }
+}
+
+function Test-BRAVOParameterSpellingBindsConfigPath {
+    # Чи прив'яжеться написання параметра (без дефіса) до -ConfigPath: точний
+    # збіг має перевагу; інакше однозначний префікс (як у PowerShell). Двозначний
+    # префікс, що охоплює ConfigPath, = помилка прив'язки в PowerShell, тож
+    # файл НЕ виконується, але ми повідомляємо про це (Ambiguous).
+    # Без відомого param()-блоку скрипта працює лише евристика за іменем:
+    # префікс ConfigPath довжиною від 4 символів (Evidence='NameOnly').
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Spelling,
+        [Parameter(Mandatory = $true)]$DeclaredParameter
+    )
+
+    $result = [pscustomobject]@{ Binds = $false; Ambiguous = $false; Evidence = 'ScriptParam' }
+    if ([string]::IsNullOrEmpty($Spelling)) { return $result }
+    $canonical = 'ConfigPath'
+
+    if (-not [bool]$DeclaredParameter.Known) {
+        $result.Evidence = 'NameOnly'
+        $result.Binds = ($Spelling.Length -ge 4 -and
+            $canonical.StartsWith($Spelling, [StringComparison]::OrdinalIgnoreCase))
+        return $result
+    }
+
+    $entries = @($DeclaredParameter.Entries | Where-Object { -not [string]::IsNullOrEmpty($_.Name) })
+    $exact = @($entries | Where-Object { [string]::Equals($_.Name, $Spelling, [StringComparison]::OrdinalIgnoreCase) })
+    if ($exact.Count -gt 0) {
+        $result.Binds = [bool](@($exact | Where-Object { [string]::Equals($_.Owner, $canonical, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+        return $result
+    }
+    # Префікс прив'язується, лише якщо ВСІ кандидати належать одному параметру.
+    $prefixOwners = @($entries | Where-Object { $_.Name.StartsWith($Spelling, [StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object { $_.Owner.ToLowerInvariant() } | Select-Object -Unique)
+    if ($prefixOwners.Count -eq 1) {
+        $result.Binds = [string]::Equals($prefixOwners[0], $canonical, [StringComparison]::OrdinalIgnoreCase)
+    } elseif ($prefixOwners.Count -gt 1) {
+        $result.Ambiguous = [bool]($prefixOwners -contains $canonical.ToLowerInvariant())
+    }
+    return $result
+}
+
+function Test-BRAVOScriptPathIsBravoEntrypoint {
+    # Ціль виклику — BRAVO_*.ps1 (за ім'ям файла в шляху). Єдине правило для -File і -Command.
+    param([AllowNull()][AllowEmptyString()][string]$ScriptPath)
+
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return $false }
+    return [bool]($ScriptPath -match '(?i)(^|[\\/])BRAVO_[A-Za-z0-9_]*\.ps1$')
+}
+
+function Get-BRAVOPowerShellInvocationMode {
+    # Перший -File/-Command/-EncodedCommand (будь-яке скорочення) серед токенів
+    # аргументів powershell.exe. Mode=$null, коли форму не розпізнано.
+    param([AllowNull()][string[]]$Tokens)
+
+    $tokenList = @($Tokens)
+    for ($i = 0; $i -lt $tokenList.Count; $i++) {
+        if (-not ($tokenList[$i] -match '^[-/]([A-Za-z]+)$')) { continue }
+        $name = $Matches[1].ToLowerInvariant()
+        if ('file'.StartsWith($name, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Mode = 'File'; Index = $i } }
+        if ('command'.StartsWith($name, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Mode = 'Command'; Index = $i } }
+        if ('encodedcommand'.StartsWith($name, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Mode = 'EncodedCommand'; Index = $i } }
+    }
+    return [pscustomobject]@{ Mode = $null; Index = -1 }
+}
+
+function Get-BRAVOTaskActionConfigPathReference {
+    # Розбирає Action.Arguments powershell.exe і повертає ВСІ входження -ConfigPath
+    # (будь-яке прийнятне написання/скорочення; -File та -Command/-EncodedCommand;
+    # лапки/без). Кожен елемент: Form, ScriptPath, Spelling, RawValue, Problem
+    # (Problem != $null -> значення не вдалося визначити). Лише розбір тексту
+    # (Parser::ParseInput нічого не виконує). Порожній результат = -ConfigPath
+    # немає або форма аргументів не розпізнана (див. Get-BRAVOTaskConfigPathFinding).
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Arguments,
+        [AllowNull()][AllowEmptyString()][string]$WorkingDirectory
+    )
+
+    $references = New-Object 'System.Collections.Generic.List[object]'
+    $newReference = {
+        param($Form, $ScriptPath, $Spelling, $RawValue, $Problem)
+        [pscustomobject]@{
+            Form = $Form
+            ScriptPath = $ScriptPath
+            Spelling = $Spelling
+            RawValue = $RawValue
+            Problem = $Problem
+        }
+    }
+
+    $split = ConvertFrom-BRAVOWindowsCommandLine -CommandLine $Arguments
+    $tokens = @($split.Tokens)
+    if (-not [bool]$split.Balanced) {
+        $references.Add((& $newReference 'Unparsed' $null $null $null 'незбалансовані лапки в аргументах завдання'))
+        return $references.ToArray()
+    }
+
+    $invocation = Get-BRAVOPowerShellInvocationMode -Tokens $tokens
+    $mode = $invocation.Mode
+    $modeIndex = [int]$invocation.Index
+    if ($null -eq $mode) { return $references.ToArray() }
+
+    if ($mode -eq 'File') {
+        if ($modeIndex + 1 -ge $tokens.Count) {
+            $references.Add((& $newReference 'File' $null $null $null '-File без значення'))
+            return $references.ToArray()
+        }
+        $scriptPath = $tokens[$modeIndex + 1]
+        $declared = Get-BRAVOScriptDeclaredParameter -ScriptPath (Resolve-BRAVOTaskActionPath -Path $scriptPath -WorkingDirectory $WorkingDirectory)
+        for ($i = $modeIndex + 2; $i -lt $tokens.Count; $i++) {
+            if (-not ($tokens[$i] -match '^-([A-Za-z][A-Za-z0-9_]*)(:(.*))?$')) { continue }
+            $spelling = $Matches[1]
+            $hasInline = $tokens[$i].Contains(':')
+            $inlineValue = if ($hasInline) { [string]$Matches[3] } else { $null }
+            $binding = Test-BRAVOParameterSpellingBindsConfigPath -Spelling $spelling -DeclaredParameter $declared
+            if ($binding.Ambiguous) {
+                $references.Add((& $newReference 'File' $scriptPath $spelling $null "скорочення -$spelling неоднозначне (збігається з ConfigPath та іншим параметром) — PowerShell відмовить у прив'язці"))
+                continue
+            }
+            if (-not $binding.Binds) { continue }
+            if ($hasInline -and -not [string]::IsNullOrEmpty($inlineValue)) {
+                $references.Add((& $newReference 'File' $scriptPath $spelling $inlineValue $null))
+            } elseif ($i + 1 -lt $tokens.Count -and $tokens[$i + 1] -notmatch '^-[A-Za-z]') {
+                $references.Add((& $newReference 'File' $scriptPath $spelling $tokens[$i + 1] $null))
+                $i++
+            } else {
+                $references.Add((& $newReference 'File' $scriptPath $spelling $null '-ConfigPath без значення'))
+            }
+        }
+        return $references.ToArray()
+    }
+
+    # -Command / -EncodedCommand: текст команди розбираємо парсером PowerShell.
+    $commandText = $null
+    if ($mode -eq 'Command') {
+        $commandText = ($tokens | Select-Object -Skip ($modeIndex + 1)) -join ' '
+    } else {
+        try {
+            if ($modeIndex + 1 -ge $tokens.Count) { throw 'немає значення' }
+            $commandText = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($tokens[$modeIndex + 1]))
+        } catch {
+            $references.Add((& $newReference 'EncodedCommand' $null $null $null "-EncodedCommand не вдалося декодувати: $($_.Exception.Message)"))
+            return $references.ToArray()
+        }
+    }
+    $parseTokens = $null
+    $parseErrors = $null
+    $commandAst = [System.Management.Automation.Language.Parser]::ParseInput([string]$commandText, [ref]$parseTokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -gt 0) {
+        $references.Add((& $newReference $mode $null $null $null "текст -$mode не розібрано: $(@($parseErrors)[0].Message)"))
+        return $references.ToArray()
+    }
+    $commands = @($commandAst.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst]
+            }, $true))
+    foreach ($command in $commands) {
+        $elements = @($command.CommandElements)
+        if ($elements.Count -eq 0) { continue }
+        $first = $elements[0]
+        if ($first -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { continue }
+        $scriptPath = [string]$first.Value
+        # Лише виклики BRAVO_*.ps1: -ConfigPath інших скриптів у тому ж -Command
+        # не належить BRAVO.
+        if (-not (Test-BRAVOScriptPathIsBravoEntrypoint -ScriptPath $scriptPath)) { continue }
+        # Виклик усередині блоку { ... } або тіла функції може не виконатися (або виконатися інакше):
+        # BRAVO-посилання там — Unknown.
+        $insideScriptBlock = $false
+        for ($ancestor = $command.Parent; $null -ne $ancestor; $ancestor = $ancestor.Parent) {
+            if ($ancestor -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -or
+                $ancestor -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $insideScriptBlock = $true; break }
+        }
+        $declared = Get-BRAVOScriptDeclaredParameter -ScriptPath (Resolve-BRAVOTaskActionPath -Path $scriptPath -WorkingDirectory $WorkingDirectory)
+        for ($i = 1; $i -lt $elements.Count; $i++) {
+            $element = $elements[$i]
+            if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+            $spelling = [string]$element.ParameterName
+            $binding = Test-BRAVOParameterSpellingBindsConfigPath -Spelling $spelling -DeclaredParameter $declared
+            if ($binding.Ambiguous) {
+                $references.Add((& $newReference $mode $scriptPath $spelling $null "скорочення -$spelling неоднозначне (збігається з ConfigPath та іншим параметром) — PowerShell відмовить у прив'язці"))
+                continue
+            }
+            if (-not $binding.Binds) { continue }
+            if ($insideScriptBlock) {
+                $references.Add((& $newReference $mode $scriptPath $spelling $null 'виклик BRAVO-скрипта з -ConfigPath усередині блоку { } — чи виконається він, статично не визначити'))
+                continue
+            }
+            $valueExpression = $null
+            if ($null -ne $element.Argument) {
+                $valueExpression = $element.Argument
+            } elseif ($i + 1 -lt $elements.Count -and
+                $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+                $valueExpression = $elements[$i + 1]
+                $i++
+            }
+            if ($null -eq $valueExpression) {
+                $references.Add((& $newReference $mode $scriptPath $spelling $null '-ConfigPath без значення'))
+            } elseif ($valueExpression -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                $references.Add((& $newReference $mode $scriptPath $spelling ([string]$valueExpression.Value) $null))
+            } elseif ($valueExpression -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
+                @($valueExpression.NestedExpressions).Count -eq 0) {
+                $references.Add((& $newReference $mode $scriptPath $spelling ([string]$valueExpression.Value) $null))
+            } else {
+                $references.Add((& $newReference $mode $scriptPath $spelling $null 'значення -ConfigPath обчислюється виразом/змінною — статично не визначити'))
+            }
+        }
+    }
+    return $references.ToArray()
+}
+
+function Get-BRAVOConfigPathTargetClassification {
+    # Класифікація цілі явного -ConfigPath (read-only; файл лише перевіряється
+    # на наявність і, якщо це .config, його ім'я/розширення — файл НЕ читається
+    # і НЕ виконується):
+    #   Missing       — файл не існує;
+    #   Local         — BRAVO.local.config (той самий ім'я, що в
+    #                   Read-BRAVOLocalConfigurationOverrides);
+    #   LegacyPrimary — файл, який loader прийме як legacy primary:
+    #                   Test-BravoLegacyConfiguration (BRAVO_CONFIG_LOADER.ps1)
+    #                   — каноничне правило loader-а, а не власна евристика;
+    #   Unknown       — шлях не розв'язується/не придатний або loader такий
+    #                   файл не прийме (напр. інше розширення).
+    param(
+        [AllowNull()][AllowEmptyString()][string]$RawPath,
+        [AllowNull()][AllowEmptyString()][string]$WorkingDirectory
+    )
+
+    $classify = {
+        param($Class, $ResolvedPath, $Reason)
+        [pscustomobject]@{ Class = $Class; ResolvedPath = $ResolvedPath; Reason = $Reason }
+    }
+    if ([string]::IsNullOrWhiteSpace($RawPath)) {
+        return (& $classify 'Unknown' $null 'порожнє значення -ConfigPath')
+    }
+    $resolved = Resolve-BRAVOTaskActionPath -Path $RawPath -WorkingDirectory $WorkingDirectory
+    if ($null -eq $resolved) {
+        return (& $classify 'Unknown' $null 'шлях не розв''язується однозначно (змінна середовища, відносний шлях без WorkingDirectory або некоректний шлях)')
+    }
+    try {
+        if (Test-Path -LiteralPath $resolved -PathType Container) {
+            return (& $classify 'Unknown' $resolved 'шлях вказує на каталог, а не на файл')
+        }
+        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+            return (& $classify 'Missing' $resolved 'файл не існує')
+        }
+    } catch {
+        return (& $classify 'Unknown' $resolved "не вдалося перевірити файл: $($_.Exception.Message)")
+    }
+    if ([string]::Equals([IO.Path]::GetFileName($resolved), 'BRAVO.local.config', [StringComparison]::OrdinalIgnoreCase)) {
+        return (& $classify 'Local' $resolved 'BRAVO.local.config')
+    }
+    try {
+        Test-BravoLegacyConfiguration -ConfigPath $resolved -ConfigRoot (Split-Path -Path $resolved -Parent)
+    } catch {
+        return (& $classify 'Unknown' $resolved "loader не приймає цей файл як legacy primary: $($_.Exception.Message)")
+    }
+    return (& $classify 'LegacyPrimary' $resolved 'BRAVO.config (legacy primary)')
+}
+
+function Get-BRAVOTaskConfigPathFinding {
+    # Знахідки -ConfigPath для ОДНОГО завдання. Враховуються лише Exec-дії, що
+    # посилаються на BRAVO_*.ps1. Status: NoConfigPath | LegacyPrimary | Local |
+    # Missing | Unknown. Завжди повертає масив (0 для не-BRAVO завдання).
+    param(
+        [AllowNull()][AllowEmptyString()][string]$TaskPath,
+        [AllowNull()][AllowEmptyString()][string]$TaskName,
+        [AllowNull()][object[]]$Actions
+    )
+
+    $findings = New-Object 'System.Collections.Generic.List[object]'
+    $actionIndex = 0
+    foreach ($action in @($Actions)) {
+        $actionIndex++
+        if ($null -eq $action) { continue }
+        $command = [string]$action.Command
+        $arguments = [string]$action.Arguments
+        $workingDirectory = [string]$action.WorkingDirectory
+        $bravoScriptPattern = '(?i)BRAVO_[A-Za-z0-9_]*\.ps1'
+        $rawRelevant = (("$command $arguments") -match $bravoScriptPattern)
+        # -File: релевантна дія лише тоді, коли САМ скрипт-ціль (токен після -File) —
+        # BRAVO_*.ps1; згадка BRAVO_*.ps1 в іншому аргументі (напр. -Label) не рахується.
+        $fileSplit = ConvertFrom-BRAVOWindowsCommandLine -CommandLine $arguments
+        if ([bool]$fileSplit.Balanced) {
+            $fileInvocation = Get-BRAVOPowerShellInvocationMode -Tokens @($fileSplit.Tokens)
+            if ($fileInvocation.Mode -eq 'File' -and ([int]$fileInvocation.Index + 1) -lt @($fileSplit.Tokens).Count) {
+                if (-not (Test-BRAVOScriptPathIsBravoEntrypoint -ScriptPath ([string]@($fileSplit.Tokens)[[int]$fileInvocation.Index + 1]))) { continue }
+                $rawRelevant = $true
+            }
+        }
+        # -EncodedCommand ховає ім'я скрипта в base64: такі дії розбираємо теж і
+        # вважаємо BRAVO-завданням лише якщо декодований текст посилається на BRAVO_*.ps1.
+        if (-not $rawRelevant -and $arguments -notmatch '(?i)(^|\s)[-/]e[a-z]*(\s|$)') { continue }
+
+        $newFinding = {
+            param($Status, $Reference, $Classification, $Detail)
+            [pscustomobject]@{
+                TaskPath = $TaskPath
+                TaskName = $TaskName
+                ActionIndex = $actionIndex
+                Status = $Status
+                Form = if ($null -ne $Reference) { [string]$Reference.Form } else { $null }
+                Spelling = if ($null -ne $Reference) { [string]$Reference.Spelling } else { $null }
+                ConfigPathRaw = if ($null -ne $Reference) { [string]$Reference.RawValue } else { $null }
+                ResolvedPath = if ($null -ne $Classification) { [string]$Classification.ResolvedPath } else { $null }
+                Detail = $Detail
+            }
+        }
+
+        $references = @(Get-BRAVOTaskActionConfigPathReference -Arguments $arguments -WorkingDirectory $workingDirectory)
+        if (-not $rawRelevant -and
+            @($references | Where-Object { $null -ne $_.ScriptPath -and ([string]$_.ScriptPath) -match $bravoScriptPattern }).Count -eq 0) {
+            continue
+        }
+        if ($references.Count -eq 0) {
+            # Fallback лише коли форму виклику не розпізнано (немає -File/-Command/-EncodedCommand);
+            # розібране -File/-Command без -ConfigPath — це NoConfigPath.
+            $formRecognized = ($arguments -match '(?i)(^|\s)[-/](f|fi|fil|file|c|co|com|comm|comma|comman|command|e[a-z]*)(\s|$)')
+            if (-not $formRecognized -and $arguments -match '(?i)config\s*path|[-/]conf') {
+                $findings.Add((& $newFinding 'Unknown' $null $null 'аргументи згадують config, але форму виклику (-File/-Command) не розпізнано'))
+            } else {
+                $findings.Add((& $newFinding 'NoConfigPath' $null $null '-ConfigPath відсутній (AUTO)'))
+            }
+            continue
+        }
+        foreach ($reference in $references) {
+            if ($null -ne $reference.Problem) {
+                $findings.Add((& $newFinding 'Unknown' $reference $null ([string]$reference.Problem)))
+                continue
+            }
+            $classification = Get-BRAVOConfigPathTargetClassification -RawPath $reference.RawValue -WorkingDirectory $workingDirectory
+            $findings.Add((& $newFinding ([string]$classification.Class) $reference $classification ([string]$classification.Reason)))
+        }
+    }
+    return $findings.ToArray()
+}
+
+function ConvertFrom-BRAVOTaskXmlExecAction {
+    # Exec-дії із XML завдання (Task.Xml). Лише читання тексту; DTD заборонено.
+    param([AllowNull()][AllowEmptyString()][string]$TaskXml)
+
+    $actions = New-Object 'System.Collections.Generic.List[object]'
+    if ([string]::IsNullOrWhiteSpace($TaskXml)) { return $actions.ToArray() }
+    $readerSettings = New-Object System.Xml.XmlReaderSettings
+    $readerSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+    $readerSettings.XmlResolver = $null
+    $stringReader = New-Object System.IO.StringReader($TaskXml)
+    $document = New-Object System.Xml.XmlDocument
+    try {
+        $reader = [System.Xml.XmlReader]::Create($stringReader, $readerSettings)
+        try { $document.Load($reader) } finally { $reader.Dispose() }
+    } finally {
+        $stringReader.Dispose()
+    }
+    foreach ($node in @($document.SelectNodes("//*[local-name()='Actions']/*[local-name()='Exec']"))) {
+        $read = {
+            param($ChildName)
+            $child = $node.SelectSingleNode("*[local-name()='$ChildName']")
+            if ($null -eq $child) { '' } else { [string]$child.InnerText }
+        }
+        $actions.Add([pscustomobject]@{
+                Command = (& $read 'Command')
+                Arguments = (& $read 'Arguments')
+                WorkingDirectory = (& $read 'WorkingDirectory')
+            })
+    }
+    return $actions.ToArray()
+}
+
+function Get-BRAVOLegacyConfigPathTaskReport {
+    # Read-only обхід дерева Планувальника (ITaskFolder) від переданої папки:
+    # для кожного завдання читається лише Task.Xml; жодне завдання/файл не
+    # змінюється. Завдання, чий XML недоступний, лише рахуються (Unreadable).
+    param([Parameter(Mandatory = $true)]$TaskFolder)
+
+    $findings = New-Object 'System.Collections.Generic.List[object]'
+    $problems = New-Object 'System.Collections.Generic.List[string]'
+    $scanned = 0
+    $pending = New-Object 'System.Collections.Generic.Queue[object]'
+    $pending.Enqueue($TaskFolder)
+    while ($pending.Count -gt 0) {
+        $folder = $pending.Dequeue()
+        $tasks = @()
+        try {
+            $tasks = @($folder.GetTasks(1))
+        } catch {
+            $problems.Add("папка '$($folder.Path)': не вдалося перелічити завдання: $($_.Exception.Message)")
+        }
+        foreach ($task in $tasks) {
+            $scanned++
+            try {
+                $taskActions = @(ConvertFrom-BRAVOTaskXmlExecAction -TaskXml ([string]$task.Xml))
+                foreach ($finding in @(Get-BRAVOTaskConfigPathFinding -TaskPath ([string]$task.Path) -TaskName ([string]$task.Name) -Actions $taskActions)) {
+                    $findings.Add($finding)
+                }
+            } catch {
+                $problems.Add("завдання '$($task.Path)': не вдалося прочитати визначення: $($_.Exception.Message)")
+            }
+        }
+        try {
+            foreach ($subFolder in @($folder.GetFolders(0))) { $pending.Enqueue($subFolder) }
+        } catch {
+            $problems.Add("папка '$($folder.Path)': не вдалося перелічити підпапки: $($_.Exception.Message)")
+        }
+    }
+    return [pscustomobject]@{
+        Findings = $findings.ToArray()
+        TasksScanned = $scanned
+        Problems = $problems.ToArray()
+    }
+}
+
+function Format-BRAVOConfigPathFindingLine {
+    # Рядок звіту у форматі Diagnose ([INFO]/[PASS]/[WARN]). Level -> колір
+    # виводить викликач. LegacyPrimary/Missing/Unknown — [WARN] і НЕ змінюють
+    # код виходу: це доказ для B5 (#154/#281), а не відмова реєстрації.
+    param([Parameter(Mandatory = $true)]$Finding)
+
+    $subject = "$($Finding.TaskPath)"
+    switch ([string]$Finding.Status) {
+        'NoConfigPath' {
+            return [pscustomobject]@{ Level = 'PASS'; Text = "[PASS] ${subject}: -ConfigPath відсутній (AUTO) — legacy BRAVO.config не виконується." }
+        }
+        'LegacyPrimary' {
+            return [pscustomobject]@{ Level = 'WARN'; Text = (
+                    "[WARN] ${subject}: LegacyPrimary — завдання передає -ConfigPath на legacy BRAVO.config " +
+                    "'$($Finding.ResolvedPath)' (форма $($Finding.Form), написання -$($Finding.Spelling)); loader ВИКОНУЄ цей файл як основний шар. " +
+                    "Дія оператора: занесіть завдання до доказів міграції B5 (#154/#281) і не змінюйте його до рішення власника щодо #281; " +
+                    "для міграції перенесіть site-відмінності у BRAVO.local.config (deploy\Get-BRAVOConfigSiteDelta.ps1) і перевстановіть завдання без -ConfigPath (BRAVO_TASKS_INSTALL.ps1).") }
+        }
+        'Local' {
+            return [pscustomobject]@{ Level = 'INFO'; Text = (
+                    "[INFO] ${subject}: Local — -ConfigPath вказує на BRAVO.local.config '$($Finding.ResolvedPath)' " +
+                    "(не legacy primary; сам -ConfigPath у завданні не потрібен для AUTO-режиму).") }
+        }
+        'Missing' {
+            return [pscustomobject]@{ Level = 'WARN'; Text = (
+                    "[WARN] ${subject}: Missing — -ConfigPath '$($Finding.ConfigPathRaw)' вказує на файл, якого немає " +
+                    "('$($Finding.ResolvedPath)'); явний -ConfigPath вимагає існуючого файлу, тож запуск завдання завершиться помилкою конфігурації. " +
+                    "Дія оператора: відновіть файл або перевстановіть завдання без -ConfigPath (BRAVO_TASKS_INSTALL.ps1).") }
+        }
+        default {
+            return [pscustomobject]@{ Level = 'WARN'; Text = (
+                    "[WARN] ${subject}: Unknown — ціль -ConfigPath не класифіковано: $($Finding.Detail). " +
+                    "Дія оператора: перегляньте Action завдання вручну в Планувальнику й занесіть результат до доказів B5 (#154/#281).") }
+        }
+    }
+}
+
 function Get-BRAVOTaskFolder {
     param($Service, [string]$TaskPath)
     $comPath = if ($TaskPath -eq "\") { "\" } else { $TaskPath.TrimEnd("\") }
@@ -609,6 +1220,46 @@ try {
         "[INFO] MultipleInstances=$($schedulerSettings.MultipleInstances): за політикою IgnoreNew " +
         "новий тригер ПРОПУСКАЄТЬСЯ, якщо попередній екземпляр ще виконується."
     ) -ForegroundColor Gray
+
+    # #281 / #154 (B5): read-only доказ — які завдання BRAVO на цьому хості досі
+    # передають -ConfigPath на legacy BRAVO.config. Нічого не змінює (ні завдань,
+    # ні файлів), не потребує UAC (працює і з -InspectOnly) і НЕ впливає на код
+    # виходу: рішення щодо підтримки -ConfigPath на legacy-файл за власником.
+    Write-Host ""
+    Write-Host "=== LEGACY -ConfigPath У ЗАВДАННЯХ BRAVO (#281 / #154 B5, лише читання) ===" -ForegroundColor Cyan
+    try {
+        $legacyConfigPathScanRoot = $taskService.GetFolder("\")
+        $legacyConfigPathReport = Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $legacyConfigPathScanRoot
+        $legacyConfigPathFindings = @($legacyConfigPathReport.Findings)
+        foreach ($legacyConfigPathFinding in $legacyConfigPathFindings) {
+            $legacyConfigPathLine = Format-BRAVOConfigPathFindingLine -Finding $legacyConfigPathFinding
+            $legacyConfigPathColor = switch ([string]$legacyConfigPathLine.Level) {
+                'PASS' { 'Green' }
+                'WARN' { 'Yellow' }
+                default { 'Gray' }
+            }
+            Write-Host $legacyConfigPathLine.Text -ForegroundColor $legacyConfigPathColor
+        }
+        foreach ($legacyConfigPathProblem in @($legacyConfigPathReport.Problems)) {
+            Write-Host "[WARN] LegacyConfigPath: $legacyConfigPathProblem (потрібні права адміністратора для читання цього завдання?)" -ForegroundColor Yellow
+        }
+        $legacyConfigPathTaskCount = @($legacyConfigPathFindings | ForEach-Object { $_.TaskPath } | Select-Object -Unique).Count
+        Write-Host (
+            "[INFO] LegacyConfigPath: переглянуто завдань Планувальника: $($legacyConfigPathReport.TasksScanned); " +
+            "завдань BRAVO: $legacyConfigPathTaskCount; " +
+            "LegacyPrimary=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'LegacyPrimary' }).Count); " +
+            "Local=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'Local' }).Count); " +
+            "Missing=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'Missing' }).Count); " +
+            "Unknown=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'Unknown' }).Count); " +
+            "без -ConfigPath=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'NoConfigPath' }).Count); " +
+            "не прочитано=$(@($legacyConfigPathReport.Problems).Count)"
+        ) -ForegroundColor Gray
+        if ($legacyConfigPathTaskCount -eq 0) {
+            Write-Host "[INFO] LegacyConfigPath: завдань із Exec-дією BRAVO_*.ps1 на цьому хості не знайдено." -ForegroundColor Gray
+        }
+    } catch {
+        Write-Host "[WARN] LegacyConfigPath: перевірку не виконано: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
 
     if ($InspectOnly) {
         if ($registrationFailed) {

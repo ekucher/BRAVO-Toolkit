@@ -2,6 +2,17 @@
 
 ## Не випущено (developer)
 
+- **Feat: `BRAVO_TASKS_DIAGNOSE.ps1` показує, які завдання BRAVO досі передають `-ConfigPath` на legacy
+  `BRAVO.config` (#281, доказ B5 для #154; лише читання).** Новий розділ
+  `=== LEGACY -ConfigPath У ЗАВДАННЯХ BRAVO ===` обходить дерево Планувальника, читає XML завдань з
+  Exec-дією `BRAVO_*.ps1` і розбирає аргументи: `-File`, `-Command`, `-EncodedCommand`, шлях у лапках і
+  без, будь-яке скорочення, що прив'язується до `-ConfigPath` (за `param()` скрипта з Action). Ціль
+  класифікується: `LegacyPrimary` (існуючий файл, який loader приймає через `Test-BravoLegacyConfiguration`),
+  `Local` (`BRAVO.local.config`), `Missing`, `Unknown`; для `LegacyPrimary` рядок `[WARN]` містить дію
+  оператора. Нічого не змінює (ні завдань, ні файлів), не потребує UAC (працює з `-InspectOnly`), не змінює
+  код виходу. Поведінку loader-а й підтримку `-ConfigPath` на legacy-файл не змінено: рішення #281 за
+  власником. Self-test: `TaskConfigPath/*` на синтетичних XML-завданнях. Порядок використання як доказу —
+  `OPERATIONS.md`, «Завдання, що досі передають `-ConfigPath` на legacy `BRAVO.config`».
 - **Feat: профілі напрямків резервного копіювання — «куди копіювати» (#282, хвиля 2).**
   Чотири профілі власника відповідають топологіям наявних пресетів Configurator і пишуть лише наявні
   прапорці, без нових ключів конфігурації: `Cloud` (Хмара, дефолт) ~ `LocalPlusSFTP`, `CloudAndSamba` ~
