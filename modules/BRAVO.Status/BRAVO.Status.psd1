@@ -6,6 +6,7 @@
     FunctionsToExport = @(
         'Get-BRAVOOperationStatusPath',
         'Get-BRAVOOperationStatus',
+        'Get-BRAVOOperationStatusPreservation',
         'Write-BRAVOOperationStatus'
     )
     VariablesToExport = @()

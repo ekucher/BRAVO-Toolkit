@@ -2,6 +2,19 @@
 
 ## Не випущено (developer)
 
+- **Fix: Recovery-запуск не затирає `ERROR` у `BRAVO_STATUS_Maintenance.json` слабшим статусом (#478, #479).**
+  Ранні виходи Recovery-запуску `BRAVO_RESTORE_RECOVERY` (`RecoveryNoWork` і `RestoreVetoedAfterLock` з кодом 10, `RecoveryGuardServicesRunning`
+  з кодом 20) тепер передають `-PreserveStrongerError`: `Write-BRAVOMaintenanceEarlyExitStatus` перед записом
+  читає наявний статус новою чистою `Get-BRAVOOperationStatusPreservation` (`BRAVO.Status`, без залежності від
+  `BRAVO.ExitCodes`) і, якщо там `ERROR`, а новий статус слабший, пропускає запис та логує один рядок INFO;
+  код завершення не змінюється. Відсутній, нечитний чи пошкоджений файл запис не блокує (fail-soft, причина
+  логується WARNING). Відсутній файл — звичайний запис без примітки. Повні й нічні прогони перезаписують статус як раніше. Self-test
+  (набір `Status`): поведінкові тести у дочірньому процесі з реальними status-файлами (ERROR/OK/WARNINGS/
+  відсутній/пошкоджений × коди 10 і 20); випадки «повний прогін» перевіряють лише helper раннього виходу БЕЗ
+  перемикача (а не справжній фінальний запис Maintenance); AST-перевірка, що збережувальний шлях (виклики
+  `Complete-BRAVOMaintenanceEarlyExit` і `Write-BRAVOMaintenanceEarlyExitStatus`) мають рівно три
+  Recovery-виходи. Потрібне приймання на реальному сервері: Task Scheduler (Recovery після нічного ERROR).
+
 - **Fix: єдине відображення exit-код → severity/Status у `BRAVO.ExitCodes` і запис Status на ранніх виходах (#479, #478).**
   `BRAVO.ExitCodes` отримав канонічну таблицю severity для кожного коду та `Get-BRAVOExitCodeStatus`
   (SUCCESS→`OK`, WARNING→`WARNINGS`, ERROR/CRITICAL→`ERROR`); `Get-BRAVOExitCodeSeverity` читає її.

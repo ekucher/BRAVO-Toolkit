@@ -69,6 +69,50 @@ function Get-BRAVOOperationStatus {
     }
 }
 
+function Get-BRAVOOperationStatusPreservation {
+    # Recovery-тик не повинен затирати слабшим статусом сильніший (інваріант
+    # «never overwrite a stronger state with a weaker one»): ERROR, лишений
+    # попередньою невдалою операцією, зберігається, поки його не замінить
+    # справжній прогін. Це ЧИСТЕ рішення без запису й без ExitCodes:
+    # call-site передає вже обчислений канонічний -NewStatus.
+    # Правило: Preserve = (попередній status == 'ERROR') -and (NewStatus != 'ERROR').
+    # Відсутній / нечитний / зіпсований файл чи невалідне поле status —
+    # НЕ блокують запис (Preserve = $false, fail-soft); причину повертає Note,
+    # щоб call-site залогував її. Не кидає винятків через проблеми файлу/вмісту;
+    # помилки прив'язки параметрів доходять до викликача.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Archive', 'Health', 'Maintenance', 'RestoreVerify')]
+        [string]$Operation,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('OK', 'WARNINGS', 'ERROR')]
+        [string]$NewStatus
+    )
+
+    $result = [pscustomobject]@{ Preserve = $false; PreviousStatus = $null; Note = $null }
+    try {
+        $existing = Get-BRAVOOperationStatus -Path (Get-BRAVOOperationStatusPath -StateRoot $StateRoot -Operation $Operation)
+        if (-not $existing.Exists) { return $result }
+        if ($existing.Corrupt) {
+            $result.Note = "попередній status-файл пошкоджений ($($existing.Reason)) — записується новий"
+            return $result
+        }
+        $previousProperty = $existing.State.PSObject.Properties['status']
+        if ($null -eq $previousProperty -or @('OK', 'WARNINGS', 'ERROR') -cnotcontains [string]$previousProperty.Value) {
+            $result.Note = 'попередній status-файл без валідного поля status — записується новий'
+            return $result
+        }
+        $result.PreviousStatus = [string]$previousProperty.Value
+        $result.Preserve = ($result.PreviousStatus -ceq 'ERROR' -and $NewStatus -cne 'ERROR')
+    } catch {
+        $result.Preserve = $false
+        $result.Note = "не вдалося прочитати попередній status-файл ($($_.Exception.Message)) — записується новий"
+    }
+    return $result
+}
+
 function Write-BRAVOOperationStatus {
     # Atomic write: temp -> [IO.File]::Replace/Move (канонічний прийом
     # Save-BRAVOBazaState / Save-BRAVORestoreVerifyState) — crash посеред

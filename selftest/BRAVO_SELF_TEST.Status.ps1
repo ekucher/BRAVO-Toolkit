@@ -634,6 +634,163 @@ function Run { param($c)
             -Name 'Maintenance/EarlyExitSkipStatusAndMissingStateRootAreFailSoft' `
             -Failure "-SkipStatus не повинен чіпати попередній статус, а відсутній `$stateRoot (ранній вихід конфігурації) не повинен ламати exit: процес=$($maintenanceSkipStatus.ExitCode)/$($maintenanceNoStateRoot.ExitCode)"
 
+        # --- Recovery-тик не затирає ERROR слабшим статусом (-PreserveStrongerError,
+        # Get-BRAVOOperationStatusPreservation). Дочірній процес із реальним
+        # status-файлом у тимчасовому каталозі; Write-Log — заглушка, що пише
+        # в файл, щоб перевірити залоговану примітку.
+        $invokePreserveChild = {
+            param([string]$Label, [string]$Seed, [string]$CallText)
+            $preserveStateRoot = Join-Path $earlyExitBehaviorRoot $Label
+            [void](New-Item -ItemType Directory -Path $preserveStateRoot -Force)
+            $preserveLogPath = Join-Path $earlyExitBehaviorRoot "$Label.log"
+            switch ($Seed) {
+                'ERROR' { Write-BRAVOOperationStatus -StateRoot $preserveStateRoot -Operation Maintenance -ExitCode 32 -ExitCodeName 'ToolIntegrityViolation' -Status 'ERROR' -StartedAt (Get-Date).AddMinutes(-5) }
+                'WARNINGS' { Write-BRAVOOperationStatus -StateRoot $preserveStateRoot -Operation Maintenance -ExitCode 10 -ExitCodeName 'SuccessWithWarnings' -Status 'WARNINGS' -StartedAt (Get-Date).AddMinutes(-90) -Details @{ earlyExitReason = 'SeedMarker' } }
+                'OK' { Write-BRAVOOperationStatus -StateRoot $preserveStateRoot -Operation Maintenance -ExitCode 0 -ExitCodeName 'Success' -Status 'OK' -StartedAt (Get-Date).AddMinutes(-60) -Details @{ earlyExitReason = 'SeedMarker' } }
+                'CORRUPT' {
+                    $corruptStatusPath = Get-BRAVOOperationStatusPath -StateRoot $preserveStateRoot -Operation Maintenance
+                    [void](New-Item -ItemType Directory -Path (Split-Path $corruptStatusPath -Parent) -Force)
+                    [IO.File]::WriteAllText($corruptStatusPath, '{ "schemaVersion": 1, "status": "ERR', (New-Object Text.UTF8Encoding($false)))
+                }
+            }
+            $preserveStatusPath = Get-BRAVOOperationStatusPath -StateRoot $preserveStateRoot -Operation Maintenance
+            $bytesBefore = if ([IO.File]::Exists($preserveStatusPath)) { [IO.File]::ReadAllBytes($preserveStatusPath) } else { $null }
+            $preserveScriptPath = Join-Path $earlyExitBehaviorRoot "$Label.ps1"
+            $preserveScript = @(
+                'Set-StrictMode -Version 2.0'
+                "Import-Module -Name '$exitCodesManifestPath'"
+                "Import-Module -Name '$statusManifestPath'"
+                "`$stateRoot = '$preserveStateRoot'"
+                '$script:ScriptStartTime = (Get-Date).AddSeconds(-3)'
+                "function Write-Log { param([string]`$Message, [string]`$Level = 'INFO') [IO.File]::AppendAllText('$preserveLogPath', ('[{0}] {1}' -f `$Level, `$Message) + [Environment]::NewLine) }"
+                $maintenanceHelperText
+                $CallText
+                'exit 99'
+            ) -join "`r`n"
+            [IO.File]::WriteAllText($preserveScriptPath, $preserveScript, (New-Object Text.UTF8Encoding($true)))
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $preserveScriptPath *> $null
+            $preserveExitCode = $LASTEXITCODE
+            $bytesAfter = if ([IO.File]::Exists($preserveStatusPath)) { [IO.File]::ReadAllBytes($preserveStatusPath) } else { $null }
+            $identical = ($null -ne $bytesBefore -and $null -ne $bytesAfter -and [Convert]::ToBase64String($bytesBefore) -ceq [Convert]::ToBase64String($bytesAfter))
+            return [pscustomobject]@{
+                ExitCode = $preserveExitCode
+                Status = (Get-BRAVOOperationStatus -Path $preserveStatusPath)
+                Identical = $identical
+                Log = $(if ([IO.File]::Exists($preserveLogPath)) { [IO.File]::ReadAllText($preserveLogPath) } else { '' })
+            }
+        }
+        $tickNoWork = "Complete-BRAVOMaintenanceEarlyExit -ExitCode 10 -Reason 'RecoveryNoWork' -PreserveStrongerError"
+        $tickGuard = "Complete-BRAVOMaintenanceEarlyExit -ExitCode 20 -Reason 'RecoveryGuardServicesRunning' -PreserveStrongerError"
+        $preserveErrorTick = & $invokePreserveChild 'PresErrTick10' 'ERROR' $tickNoWork
+        $preserveOkTick = & $invokePreserveChild 'PresOkTick10' 'OK' $tickNoWork
+        $preserveWarnTick = & $invokePreserveChild 'PresWarnTick10' 'WARNINGS' $tickNoWork
+        $preserveMissingTick = & $invokePreserveChild 'PresMissTick10' 'MISSING' $tickNoWork
+        $preserveCorruptTick = & $invokePreserveChild 'PresCorruptTick10' 'CORRUPT' $tickNoWork
+        $preserveErrorGuard = & $invokePreserveChild 'PresErrGuard20' 'ERROR' $tickGuard
+        $preserveOkGuard = & $invokePreserveChild 'PresOkGuard20' 'OK' $tickGuard
+        $preserveWarnGuard = & $invokePreserveChild 'PresWarnGuard20' 'WARNINGS' $tickGuard
+        $preserveMissingGuard = & $invokePreserveChild 'PresMissGuard20' 'MISSING' $tickGuard
+        $preserveFullRunOk = & $invokePreserveChild 'PresFullOk' 'ERROR' "Complete-BRAVOMaintenanceEarlyExit -ExitCode 0 -Reason 'FullRun'"
+        $preserveFullRunWarn = & $invokePreserveChild 'PresFullWarn' 'ERROR' "Complete-BRAVOMaintenanceEarlyExit -ExitCode 10 -Reason 'FullRun'"
+        $preserveErrorTickError = & $invokePreserveChild 'PresErrTick32' 'ERROR' "Complete-BRAVOMaintenanceEarlyExit -ExitCode 32 -Reason 'ToolIntegrityViolation' -PreserveStrongerError"
+        Test-BRAVOCondition `
+            -Condition (
+                $preserveErrorTick.ExitCode -eq 10 -and $preserveErrorTick.Identical -and
+                [string]$preserveErrorTick.Status.State.status -eq 'ERROR' -and
+                [int]$preserveErrorTick.Status.State.exitCode -eq 32 -and
+                $preserveErrorTick.Log -match '\[INFO\].*зберігає попередній ERROR'
+            ) `
+            -Name 'Maintenance/RecoveryTick10PreservesPreviousError' `
+            -Failure "Recovery-тик з кодом 10 не має затирати ERROR: файл має лишитися побайтово незмінним, процес=10, залоговано INFO; процес=$($preserveErrorTick.ExitCode) identical=$($preserveErrorTick.Identical) status=$($preserveErrorTick.Status.State.status) log=$($preserveErrorTick.Log)"
+        Test-BRAVOCondition `
+            -Condition (
+                $preserveOkTick.ExitCode -eq 10 -and -not $preserveOkTick.Identical -and [string]$preserveOkTick.Status.State.status -eq 'WARNINGS' -and [int]$preserveOkTick.Status.State.exitCode -eq 10 -and [string]$preserveOkTick.Status.State.details.earlyExitReason -ceq 'RecoveryNoWork' -and
+                $preserveWarnTick.ExitCode -eq 10 -and -not $preserveWarnTick.Identical -and [string]$preserveWarnTick.Status.State.status -eq 'WARNINGS' -and [int]$preserveWarnTick.Status.State.exitCode -eq 10 -and [string]$preserveWarnTick.Status.State.details.earlyExitReason -ceq 'RecoveryNoWork' -and
+                $preserveMissingTick.ExitCode -eq 10 -and [string]$preserveMissingTick.Status.State.status -eq 'WARNINGS' -and [string]$preserveMissingTick.Status.State.details.earlyExitReason -ceq 'RecoveryNoWork' -and
+                $preserveMissingTick.Log -eq ''
+            ) `
+            -Name 'Maintenance/RecoveryTick10WritesOverOkWarningsAndMissing' `
+            -Failure "Recovery-тик 10 має записувати WARNINGS поверх OK / WARNINGS / відсутнього файла: OK->$($preserveOkTick.Status.State.status) WARNINGS->$($preserveWarnTick.Status.State.status) missing->$($preserveMissingTick.Status.State.status)"
+        Test-BRAVOCondition `
+            -Condition (
+                $preserveCorruptTick.ExitCode -eq 10 -and
+                -not $preserveCorruptTick.Status.Corrupt -and
+                [string]$preserveCorruptTick.Status.State.status -eq 'WARNINGS' -and
+                $preserveCorruptTick.Log -match '\[WARNING\].*пошкоджений'
+            ) `
+            -Name 'Maintenance/RecoveryTickCorruptStatusIsFailSoftAndLogged' `
+            -Failure "зіпсований status-файл не блокує запис Recovery-тика (fail-soft) і залогований як WARNING; процес=$($preserveCorruptTick.ExitCode) corrupt=$($preserveCorruptTick.Status.Corrupt) log=$($preserveCorruptTick.Log)"
+        Test-BRAVOCondition `
+            -Condition (
+                $preserveErrorGuard.ExitCode -eq 20 -and $preserveErrorGuard.Identical -and
+                [string]$preserveErrorGuard.Status.State.status -eq 'ERROR' -and
+                $preserveOkGuard.ExitCode -eq 20 -and -not $preserveOkGuard.Identical -and [string]$preserveOkGuard.Status.State.status -eq 'WARNINGS' -and [int]$preserveOkGuard.Status.State.exitCode -eq 20 -and [string]$preserveOkGuard.Status.State.details.earlyExitReason -ceq 'RecoveryGuardServicesRunning' -and
+                $preserveWarnGuard.ExitCode -eq 20 -and -not $preserveWarnGuard.Identical -and [string]$preserveWarnGuard.Status.State.status -eq 'WARNINGS' -and [string]$preserveWarnGuard.Status.State.details.earlyExitReason -ceq 'RecoveryGuardServicesRunning' -and
+                $preserveMissingGuard.ExitCode -eq 20 -and [string]$preserveMissingGuard.Status.State.status -eq 'WARNINGS' -and [string]$preserveMissingGuard.Status.State.details.earlyExitReason -ceq 'RecoveryGuardServicesRunning'
+            ) `
+            -Name 'Maintenance/RecoveryGuard20PreservesPreviousError' `
+            -Failure "recovery guard (20) не має затирати ERROR (файл незмінний), але має писати WARNINGS поверх OK; ERROR->$($preserveErrorGuard.Status.State.status) identical=$($preserveErrorGuard.Identical) OK->$($preserveOkGuard.Status.State.status)"
+        Test-BRAVOCondition `
+            -Condition (
+                $preserveFullRunOk.ExitCode -eq 0 -and [string]$preserveFullRunOk.Status.State.status -eq 'OK' -and [int]$preserveFullRunOk.Status.State.exitCode -eq 0 -and
+                $preserveFullRunWarn.ExitCode -eq 10 -and [string]$preserveFullRunWarn.Status.State.status -eq 'WARNINGS' -and
+                $preserveErrorTickError.ExitCode -eq 32 -and [string]$preserveErrorTickError.Status.State.status -eq 'ERROR' -and -not $preserveErrorTickError.Identical
+            ) `
+            -Name 'Maintenance/FullRunStillOverwritesErrorAndErrorTickIsWritten' `
+            -Failure "повний прогін (без -PreserveStrongerError) має, як і раніше, затирати ERROR (OK->$($preserveFullRunOk.Status.State.status), 10->$($preserveFullRunWarn.Status.State.status)); Recovery-тик з ERROR (32) теж пишеться (свіжий ERROR): $($preserveErrorTickError.Status.State.status)"
+
+        # Статична перевірка (AST): лише три Recovery-виходи йдуть через
+        # збережувальний шлях, і лише вони; Get-BRAVOOperationStatusPreservation
+        # викликається єдиний раз — у Write-BRAVOMaintenanceEarlyExitStatus
+        # (фінальний запис повного прогону його не використовує).
+        $preserveRuntimeTokens = $null
+        $preserveRuntimeErrors = $null
+        $preserveRuntimeAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [ref]$preserveRuntimeTokens, [ref]$preserveRuntimeErrors)
+        $preserveHelperCalls = @($preserveRuntimeAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and
+                    @('Complete-BRAVOMaintenanceEarlyExit', 'Write-BRAVOMaintenanceEarlyExitStatus') -ccontains $node.GetCommandName()
+                }, $true))
+        $preserveReasonsFound = New-Object 'System.Collections.Generic.List[string]'
+        $preserveReasonsStray = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($preserveCall in $preserveHelperCalls) {
+            # Єдина передача перемикача всередині самого Complete-... (forwarding) — не call-site.
+            $callOwner = $preserveCall.Parent
+            while ($null -ne $callOwner -and $callOwner -isnot [Management.Automation.Language.FunctionDefinitionAst]) { $callOwner = $callOwner.Parent }
+            if ($null -ne $callOwner -and $callOwner.Name -ceq 'Complete-BRAVOMaintenanceEarlyExit') { continue }
+            $callElements = @($preserveCall.CommandElements)
+            $hasPreserve = @($callElements | Where-Object { $_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'PreserveStrongerError' }).Count -gt 0
+            $reasonText = ''
+            for ($elementIndex = 0; $elementIndex -lt ($callElements.Count - 1); $elementIndex++) {
+                if ($callElements[$elementIndex] -is [Management.Automation.Language.CommandParameterAst] -and $callElements[$elementIndex].ParameterName -eq 'Reason') {
+                    $reasonText = [string]$callElements[$elementIndex + 1].Extent.Text.Trim("'")
+                }
+            }
+            if ($hasPreserve) { $preserveReasonsFound.Add($reasonText) }
+            if ($hasPreserve -and @('RecoveryNoWork', 'RestoreVetoedAfterLock', 'RecoveryGuardServicesRunning') -cnotcontains $reasonText) {
+                $preserveReasonsStray.Add($reasonText)
+            }
+        }
+        $preservationCallers = @($preserveRuntimeAst.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Get-BRAVOOperationStatusPreservation'
+                }, $true))
+        $preservationCallerFunctions = @($preservationCallers | ForEach-Object {
+                $ownerNode = $_.Parent
+                while ($null -ne $ownerNode -and $ownerNode -isnot [Management.Automation.Language.FunctionDefinitionAst]) { $ownerNode = $ownerNode.Parent }
+                if ($null -ne $ownerNode) { $ownerNode.Name } else { '<script>' }
+            })
+        Test-BRAVOCondition `
+            -Condition (
+                $preserveRuntimeErrors.Count -eq 0 -and
+                (@($preserveReasonsFound | Sort-Object) -join ',') -ceq 'RecoveryGuardServicesRunning,RecoveryNoWork,RestoreVetoedAfterLock' -and
+                $preserveReasonsStray.Count -eq 0 -and
+                $preservationCallerFunctions.Count -eq 1 -and
+                $preservationCallerFunctions[0] -ceq 'Write-BRAVOMaintenanceEarlyExitStatus'
+            ) `
+            -Name 'Status/RecoveryTickExitsGoThroughPreservingPath' `
+            -Failure "рівно три Recovery-виходи (RecoveryNoWork, RestoreVetoedAfterLock, RecoveryGuardServicesRunning) мають передавати -PreserveStrongerError, інші — ні; Get-BRAVOOperationStatusPreservation — лише у Write-BRAVOMaintenanceEarlyExitStatus; знайдено: [$($preserveReasonsFound -join ',')] сторонні=[$($preserveReasonsStray -join ',')] виклики з=[$($preservationCallerFunctions -join ',')]"
+
         $archiveToolIntegrity = & $invokeEarlyExitChild 'ArchToolIntegrity' $archiveHelperText `
             "Complete-BRAVOArchiveEarlyExit -ExitCode 32 -EarlyExitReason 'ToolIntegrityViolation'" 'Archive' 'seed' ''
         $archiveInstitutionSettings = & $invokeEarlyExitChild 'ArchInstitution' $archiveHelperText `

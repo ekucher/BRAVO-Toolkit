@@ -132,7 +132,10 @@ function Write-BRAVOMaintenanceEarlyExitStatus {
     param(
         [Parameter(Mandatory = $true)][int]$ExitCode,
         [string]$Reason,
-        [hashtable]$Details
+        [hashtable]$Details,
+        # Recovery-тик: не затирати ERROR попередньої операції слабшим статусом
+        # (інваріант «never overwrite a stronger state with a weaker one»).
+        [switch]$PreserveStrongerError
     )
 
     try {
@@ -141,6 +144,32 @@ function Write-BRAVOMaintenanceEarlyExitStatus {
         if (-not [string]::IsNullOrWhiteSpace($earlyStateRoot) -and
             $null -ne (Get-Command -Name Write-BRAVOOperationStatus -CommandType Function -ErrorAction SilentlyContinue)) {
             $earlyStartedAtVariable = Get-Variable -Name ScriptStartTime -Scope Script -ErrorAction SilentlyContinue
+            $earlyNewStatus = Get-BRAVOExitCodeStatus -Code $ExitCode
+            if ($PreserveStrongerError -and
+                $null -ne (Get-Command -Name Get-BRAVOOperationStatusPreservation -CommandType Function -ErrorAction SilentlyContinue)) {
+                $earlyPreservation = Get-BRAVOOperationStatusPreservation -StateRoot $earlyStateRoot -Operation Maintenance -NewStatus $earlyNewStatus
+                $earlyPreservationMessage = $null
+                $earlyPreservationLevel = 'WARNING'
+                if ($earlyPreservation.Preserve) {
+                    $earlyPreservationLevel = 'INFO'
+                    $earlyPreservationMessage = "Recovery-тик завершився кодом $ExitCode ($earlyNewStatus), але status-файл Maintenance зберігає попередній $($earlyPreservation.PreviousStatus) — слабший статус його не затирає"
+                } elseif (-not [string]::IsNullOrEmpty([string]$earlyPreservation.Note)) {
+                    $earlyPreservationMessage = [string]$earlyPreservation.Note
+                }
+                if ($null -ne $earlyPreservationMessage) {
+                    # Збій логування не має ні блокувати, ні змінювати рішення про запис.
+                    try {
+                        if (Get-Command -Name Write-Log -CommandType Function -ErrorAction SilentlyContinue) {
+                            Write-Log -Message $earlyPreservationMessage -Level $earlyPreservationLevel
+                        } else {
+                            Write-Warning $earlyPreservationMessage
+                        }
+                    } catch {
+                        $null = $_
+                    }
+                }
+                if ($earlyPreservation.Preserve) { return }
+            }
             $earlyStartedAt = if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) {
                 [datetime]$earlyStartedAtVariable.Value
             } else {
@@ -160,7 +189,7 @@ function Write-BRAVOMaintenanceEarlyExitStatus {
                 -Operation Maintenance `
                 -ExitCode $ExitCode `
                 -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
-                -Status (Get-BRAVOExitCodeStatus -Code $ExitCode) `
+                -Status $earlyNewStatus `
                 -StartedAt $earlyStartedAt `
                 -Details $earlyStatusDetails
         }
@@ -188,11 +217,12 @@ function Complete-BRAVOMaintenanceEarlyExit {
         [string]$Reason,
         [hashtable]$Details,
         [switch]$SkipStatus,
-        [switch]$StatusWritten
+        [switch]$StatusWritten,
+        [switch]$PreserveStrongerError
     )
 
     if (-not $SkipStatus -and -not $StatusWritten) {
-        Write-BRAVOMaintenanceEarlyExitStatus -ExitCode $ExitCode -Reason $Reason -Details $Details
+        Write-BRAVOMaintenanceEarlyExitStatus -ExitCode $ExitCode -Reason $Reason -Details $Details -PreserveStrongerError:$PreserveStrongerError
     }
     exit $ExitCode
 }
@@ -9657,11 +9687,13 @@ if ($RunMissedRestoreOnly -and -not $missedDailyWork -and -not $missedRestoreAct
     Write-BRAVOResultField -Label 'Код завершення' -Value ("{0} — {1}" -f $recoveryNoWorkExitCode, (Get-BRAVOExitCodeName -Code $recoveryNoWorkExitCode))
     Write-BRAVOResultField -Label 'Результат' -Value $(if ($restoreSkippedByRetryBlock) { 'Автоматичну реставрацію заблоковано — потрібна дія оператора (див. журнал)' } else { 'Пропущених операцій не знайдено' })
     Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
-    # Чистий no-op-тик (код 0) статус не пише: інакше 15-хвилинний Recovery
-    # без роботи щоразу затирав би результат останнього реального прогону
+    # Чистий no-op-тик (код 0) статус не пише: інакше Recovery (boot-запуск
+    # BRAVO_RESTORE_RECOVERY, -RunMissedRestoreOnly) без роботи затирав би результат останнього реального прогону
     # (напр. ERROR нічного Maintenance) станом "OK". Заблокована лімітом ніч
-    # (код 10) — сигнал для оператора, його статус пишемо.
-    Complete-BRAVOMaintenanceEarlyExit -ExitCode $recoveryNoWorkExitCode -Reason 'RecoveryNoWork' -SkipStatus:($recoveryNoWorkExitCode -eq 0)
+    # (код 10) — сигнал для оператора, його статус пишемо, але
+    # -PreserveStrongerError: ERROR попередньої операції не затирається
+    # слабшим WARNINGS (Get-BRAVOOperationStatusPreservation, BRAVO.Status).
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode $recoveryNoWorkExitCode -Reason 'RecoveryNoWork' -PreserveStrongerError -SkipStatus:($recoveryNoWorkExitCode -eq 0)
 }
 Write-Log -Message "Повідомлення: $NotificationProviderDisplayName; режим $(switch ($script:SlackMode) {'none' {'ВИМКНЕНО'} 'errors_only' {'ЛИШЕ ПОМИЛКИ'} 'all' {'УСІ ПОВІДОМЛЕННЯ'}})" -NoTimestamp
 
@@ -10126,8 +10158,9 @@ if ($restoreVeto.Veto) {
         Write-BRAVOResultField -Label 'Результат' -Value $(if ($recoveryVetoBlocked) { 'Автоматичну реставрацію заблоковано — потрібна дія оператора (див. журнал)' } else { "Реставрацію скасовано після lock ($($restoreVeto.ShortReason)); інших операцій немає" })
         Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
         # Скасування без блокування (код 0) статус не пише — та сама причина,
-        # що й для чистого no-op-тика Recovery вище; блокування (10) пишеться.
-        Complete-BRAVOMaintenanceEarlyExit -ExitCode $recoveryVetoExitCode -Reason 'RestoreVetoedAfterLock' -SkipStatus:($recoveryVetoExitCode -eq 0)
+        # що й для чистого no-op-тика Recovery вище; блокування (10) пишеться,
+        # але не затирає попередній ERROR (-PreserveStrongerError).
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode $recoveryVetoExitCode -Reason 'RestoreVetoedAfterLock' -PreserveStrongerError -SkipStatus:($recoveryVetoExitCode -eq 0)
     }
 }
 
@@ -10354,7 +10387,8 @@ if ($RunMissedRestoreOnly -and $missedDailyWork -and -not $bootRestoreIgnoresWin
         Send-BRAVOMaintenanceEarlyExitAlerts -Reason "recovery guard: служби вже працюють"
         # #478: код 20 (SkippedLockBusy, відкладено) => Status WARNINGS
         # (рішення власника D-A); без запису статус лишався б попереднім "OK".
-        Complete-BRAVOMaintenanceEarlyExit -ExitCode 20 -Reason 'RecoveryGuardServicesRunning'
+        # -PreserveStrongerError: попередній ERROR слабшим WARNINGS не затирається.
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode 20 -Reason 'RecoveryGuardServicesRunning' -PreserveStrongerError
     }
 }
 # Ті самі три служби — для циклу зупинка -> журнали -> запуск (#314).
