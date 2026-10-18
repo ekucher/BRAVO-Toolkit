@@ -240,7 +240,10 @@ function Import-BRAVOInstallBackupDestinationModules {
     param(
         [Parameter(Mandatory = $true)][string]$ModuleRoot,
         [Parameter(Mandatory = $true)][string]$Destination,
-        [switch]$BeforeDeploy
+        [switch]$BeforeDeploy,
+        # Профіль не задано оператором (-BackupDestination не передано): у
+        # повідомленні не згадується параметр, якого оператор не вказував.
+        [switch]$ImplicitProfile
     )
     $deployState = $(if ($BeforeDeploy) { ' Нічого не розгорнуто.' } else { '' })
     # Ключ — ім'я модуля (для .psd1 PassThru повертає кореневий модуль з тим
@@ -285,6 +288,10 @@ function Import-BRAVOInstallBackupDestinationModules {
         }
     }
     if ($notExported.Count -gt 0) {
+        if ($ImplicitProfile) {
+            throw ('Комплект не підтримує профіль за замовчуванням (' + $Destination + '): модулі не експортують потрібних функцій (' +
+                ($notExported -join ', ') + ').' + $deployState)
+        }
         throw ('Комплект не підтримує -BackupDestination ' + $Destination + ': модулі не експортують потрібних функцій (' +
             ($notExported -join ', ') + ').' + $deployState + ' Вкажіть -Tag або -ZipPath комплекту, що містить ' +
             'BRAVO.Configurator, або запустіть без -BackupDestination (напрямки потім задає BRAVO_CONFIGURATOR.ps1).')
@@ -777,7 +784,7 @@ if ($PSBoundParameters.ContainsKey('BackupDestination') -or $implicitProfilePref
                 # кроці 4 для seed. Функцію визначено, але не експортовано (або
                 # модуль не імпортується) -> несумісний комплект -> копія прикладу.
                 try {
-                    Import-BRAVOInstallBackupDestinationModules -ModuleRoot $verifiedBundle -Destination $BackupDestination -BeforeDeploy
+                    Import-BRAVOInstallBackupDestinationModules -ModuleRoot $verifiedBundle -Destination $BackupDestination -BeforeDeploy -ImplicitProfile
                     Write-Ok 'комплект експортує функції профілю напрямків — неявний профіль засіється канонічним кодом Configurator'
                 } catch {
                     $implicitProfileUsesExample = $true

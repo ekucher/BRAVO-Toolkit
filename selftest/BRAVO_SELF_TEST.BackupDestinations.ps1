@@ -1638,29 +1638,32 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerExplicitDestinationRequiresExportedFunctions' `
             -Failure "комплект, модуль якого визначає, але не експортує потрібну функцію (Get-BRAVOConfiguratorBackupDestinationProfile), має відхиляти явний -BackupDestination ДО копіювання (без VERSION.json) з назвою функції в причині: $($bdE2eNoExportFailures -join ' | ')"
 
-# (#434, P2) Неявний профіль (лише -SeedLocalConfig) мусить пройти ту саму
-# звірку ЕКСПОРТУ, що й явний — у кроці 1, з приватної копії, ДО копіювання:
-# самоузгоджений комплект, де функцію визначено, але не експортовано, —
-# несумісний, тож рішення «копія прикладу» ухвалюється до robocopy (раніше
-# крок 4 падав на Import уже після розгортання). Поведінка збігається з
-# комплектом без функцій: код 0, приклад замість seed.
-$bdE2eImplicitNoExportFailures = @()
-$bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot
-$bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eNoExportBundle.ZipPath -Arguments @('-SeedLocalConfig')
-$bdE2eSitePath = Join-Path $bdE2eRuntime 'BRAVO.local.config'
-$bdE2eSiteBytes = $(if (Test-Path -LiteralPath $bdE2eSitePath -PathType Leaf) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdE2eSitePath)) } else { '' })
-$bdE2eDecisionIndex = $bdE2eRun.Output.IndexOf('не експортує функцій профілю напрямків')
-$bdE2eRobocopyIndex = $bdE2eRun.Output.IndexOf('STUB: robocopy')
-if ($bdE2eRun.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json')) -or
-    $bdE2eSiteBytes -cne $bdE2eNoExportBundle.ExampleBytes -or -not $bdE2eRun.Output.Contains('з прикладу')) {
-    $bdE2eImplicitNoExportFailures += "$($bdE2eRun.Label): exit=$($bdE2eRun.ExitCode) файл=приклад:$($bdE2eSiteBytes -ceq $bdE2eNoExportBundle.ExampleBytes) throw='$($bdE2eRun.Throw)'"
-}
-if ($bdE2eDecisionIndex -lt 0 -or $bdE2eRobocopyIndex -lt 0 -or $bdE2eDecisionIndex -gt $bdE2eRobocopyIndex) {
-    $bdE2eImplicitNoExportFailures += "рішення про несумісність (індекс $bdE2eDecisionIndex) має передувати копіюванню (robocopy: $bdE2eRobocopyIndex)"
-}
-Test-BRAVOCondition -Condition ($bdE2eImplicitNoExportFailures.Count -eq 0) `
-    -Name 'BackupDestinations/InstallerImplicitSeedChecksExportedFunctionsBeforeDeploy' `
-    -Failure "неявний -SeedLocalConfig з комплектом, що визначає, але не експортує функцію профілю, має ДО копіювання визнати його несумісним і піти шляхом прикладу (код 0, «з прикладу»), а не падати на імпорті в кроці 4 після розгортання: $($bdE2eImplicitNoExportFailures -join ' | ')"
+        # (#434, P2) Неявний профіль (лише -SeedLocalConfig) мусить пройти ту саму
+        # звірку ЕКСПОРТУ, що й явний — у кроці 1, з приватної копії, ДО копіювання:
+        # самоузгоджений комплект, де функцію визначено, але не експортовано, —
+        # несумісний, тож рішення «копія прикладу» ухвалюється до robocopy (раніше
+        # крок 4 падав на Import уже після розгортання). Поведінка збігається з
+        # комплектом без функцій: код 0, приклад замість seed.
+        $bdE2eImplicitNoExportFailures = @()
+        $bdE2eRuntime = New-BRAVOSelfTestE2ERuntimeRoot
+        $bdE2eRun = Invoke-BRAVOSelfTestInstallE2E -RuntimeRoot $bdE2eRuntime -ZipPath $bdE2eNoExportBundle.ZipPath -Arguments @('-SeedLocalConfig')
+        $bdE2eSitePath = Join-Path $bdE2eRuntime 'BRAVO.local.config'
+        $bdE2eSiteBytes = $(if (Test-Path -LiteralPath $bdE2eSitePath -PathType Leaf) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($bdE2eSitePath)) } else { '' })
+        $bdE2eDecisionIndex = $bdE2eRun.Output.IndexOf('не експортує функцій профілю напрямків')
+        $bdE2eRobocopyIndex = $bdE2eRun.Output.IndexOf('STUB: robocopy')
+        if ($bdE2eRun.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $bdE2eRuntime 'VERSION.json')) -or
+            $bdE2eSiteBytes -cne $bdE2eNoExportBundle.ExampleBytes -or -not $bdE2eRun.Output.Contains('з прикладу')) {
+            $bdE2eImplicitNoExportFailures += "$($bdE2eRun.Label): exit=$($bdE2eRun.ExitCode) файл=приклад:$($bdE2eSiteBytes -ceq $bdE2eNoExportBundle.ExampleBytes) throw='$($bdE2eRun.Throw)'"
+        }
+        if ($bdE2eDecisionIndex -lt 0 -or $bdE2eRobocopyIndex -lt 0 -or $bdE2eDecisionIndex -gt $bdE2eRobocopyIndex) {
+            $bdE2eImplicitNoExportFailures += "рішення про несумісність (індекс $bdE2eDecisionIndex) має передувати копіюванню (robocopy: $bdE2eRobocopyIndex)"
+        }
+        if ($bdE2eRun.Output.Contains('не підтримує -BackupDestination') -or -not $bdE2eRun.Output.Contains('профіль за замовчуванням')) {
+            $bdE2eImplicitNoExportFailures += 'повідомлення неявного профілю не має згадувати -BackupDestination, якого оператор не передавав (очікується «профіль за замовчуванням»)'
+        }
+        Test-BRAVOCondition -Condition ($bdE2eImplicitNoExportFailures.Count -eq 0) `
+            -Name 'BackupDestinations/InstallerImplicitSeedChecksExportedFunctionsBeforeDeploy' `
+            -Failure "неявний -SeedLocalConfig з комплектом, що визначає, але не експортує функцію профілю, має ДО копіювання визнати його несумісним і піти шляхом прикладу (код 0, «з прикладу»), а не падати на імпорті в кроці 4 після розгортання: $($bdE2eImplicitNoExportFailures -join ' | ')"
 
         # (Codex P2, раунд 4) Звірка експорту спирається на екземпляр модуля,
         # який щойно повернув Import-Module -PassThru з $ModuleRoot, а не на
@@ -2304,20 +2307,38 @@ Test-BRAVOCondition -Condition (
 #     вимикач; else і пізніші elseif умовою попередньої гілки захищені лише
 #     тоді, коли та умова — рівно заперечення вимикача (-not/! вимикач):
 #     туди потік доходить, лише коли вимикач істинний;
-#   * попередній у тому самому блоці if з вимикачем, що завершує потік
-#     (return/exit/continue/break/throw) — ранній вихід;
+#   * попередній у тому самому блоці if — ранній вихід, коли хибність його
+#     умови доводить вимикач (-not/! вимикач, також через -or) і КОЖНА гілка
+#     if завершує потік в кінці свого списку операторів
+#     (return/exit/continue/break/throw); вкладений return не рахується;
 #   * ліва частина -and, коли місце праворуч.
 # Дійшовши до визначення функції, перевірка повторюється для КОЖНОГО
 # виклику цієї функції в runtime-коді (усі файли); функція без викликів —
 # не захищена. Вимикач — canonical вирази $storageEffective.SFTP.Enabled /
 # .ArchiveUpload, $storageEffective.SMB.Enabled / .ArchiveCopy,
 # $bazaSyncEffective (його SftpEnabled уже містить SFTP.Enabled, див.
-# перевірку нижче), а також змінні файлу, кожне присвоєння яких читає
-# такий вираз (похідні прапорці на кшталт $sftpTransferEnabled).
+# перевірку нижче), а також ПОХІДНІ змінні файлу: змінна, КОЖНЕ присвоєння
+# якої («=», прості чи [bool]/[switch]-типізовані) є позитивним вимикачем:
+# вимикач, «вимикач -and інше» чи «-or» самих вимикачів. Вимикач — лише
+# змінна чи ланцюг властивостей (можна під [bool]/[switch] і Test-SettingEnabled);
+# хеш-таблиця, @(), $(), {}, індекс, виклик методу, [string] — ні, навіть коли
+# їхній текст містить вимикач. Єдиний дозволений конвеєр — точна форма
+# BAZA: $bazaSyncEffective.Components | Where-Object { $_.Name -eq '<літерал>' }
+# | Select-Object -First 1 -ExpandProperty SftpEnabled. Змінну дискваліфікує
+# будь-який інший запис у ТОМУ САМОМУ файлі (область не розрізняється,
+# $script:x == $x, без урахування регістру): типізоване не-bool, множинне
+# присвоєння, зміна через член/індекс, ++/--, [ref], Set-/New-Variable з
+# літеральним іменем, змінна foreach, параметр функції.
 # Межі методу: це перевірка структури, а не семантики (умову з вимикачем,
 # що не блокує канал, вона не відрізнить), і SMB-канал розпізнається за
 # New-PSDrive — єдиним способом, яким runtime підключає NAS з креденшлами.
-# Тому поряд стоять поведінкові перевірки canonical-предикатів.
+# Не індексуються й не аналізуються: тіла trap; непрямі виклики функцій
+# (& $name, Invoke-Expression, .Invoke(), dot-source з динамічного шляху) —
+# такий виклик не додає перевірки викликаючого; Set-Variable з динамічним
+# іменем; name-trusted Test-BRAVOSftpCredentialsRequired (його -SftpEnabled
+# перевіряється, а тіло предиката — ні; воно закріплене поведінковими
+# тестами SftpCredentialsRequired). Тому поряд стоять поведінкові перевірки
+# canonical-предикатів.
 
 $script:BRAVOSelfTestOutboundExceptions = @(
     [pscustomobject]@{
@@ -2413,6 +2434,24 @@ function Get-BRAVOSelfTestOutboundEnclosingFunction {
     return $null
 }
 
+function Get-BRAVOSelfTestOutboundVariableKey {
+    param([string]$Name)
+    return ($Name -replace '^(?i)(global|script|local|private):', '').ToLowerInvariant()
+}
+
+function Get-BRAVOSelfTestOutboundRootVariable {
+    # Змінна, яку змінює запис у ціль: сама змінна, [тип]$x, $x.Член, $x[індекс].
+    param($Node)
+    while ($null -ne $Node) {
+        if ($Node -is [Management.Automation.Language.VariableExpressionAst]) { return $Node }
+        if ($Node -is [Management.Automation.Language.ConvertExpressionAst]) { $Node = $Node.Child; continue }
+        if ($Node -is [Management.Automation.Language.MemberExpressionAst]) { $Node = $Node.Expression; continue }
+        if ($Node -is [Management.Automation.Language.IndexExpressionAst]) { $Node = $Node.Target; continue }
+        return $null
+    }
+    return $null
+}
+
 function Get-BRAVOSelfTestOutboundGateRegex {
     # Canonical вимикачі + похідні змінні файлу (кожне присвоєння читає вимикач).
     param($Node, [string]$Kind, [hashtable]$Context)
@@ -2422,21 +2461,77 @@ function Get-BRAVOSelfTestOutboundGateRegex {
     if ($Context.Regex.ContainsKey($cacheKey)) { return $Context.Regex[$cacheKey] }
 
     $regex = [string]$Context.Canonical[$Kind]
+    # Простір імен — файл (без урахування області): ключ — ім'я без префікса
+    # області, без урахування регістру ($script:x і $x — одна змінна).
+    # Запис, який не є простим присвоєнням «=», робить змінну непридатною
+    # (disqualified): типізоване не-булеве, множинне присвоєння, зміна через
+    # член/індекс, ++/--, [ref], Set-Variable/New-Variable, змінна циклу
+    # foreach, параметр функції з тим самим іменем.
     $assignmentsByVariable = @{}
+    $disqualified = @{}
+    $booleanTypes = @('bool', 'boolean', 'switch')
     foreach ($assignment in @($rootAst.FindAll({
-        param($node)
-        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
-        $node.Left -is [Management.Automation.Language.VariableExpressionAst]
+        param($node) $node -is [Management.Automation.Language.AssignmentStatementAst]
     }, $true))) {
-        $variableName = $assignment.Left.VariablePath.UserPath
+        $left = $assignment.Left
+        if ($left -is [Management.Automation.Language.ArrayLiteralAst]) {
+            foreach ($element in @($left.Elements)) {
+                $elementVariable = Get-BRAVOSelfTestOutboundRootVariable -Node $element
+                if ($null -ne $elementVariable) { $disqualified[(Get-BRAVOSelfTestOutboundVariableKey -Name $elementVariable.VariablePath.UserPath)] = $true }
+            }
+            continue
+        }
+        $rootVariable = Get-BRAVOSelfTestOutboundRootVariable -Node $left
+        if ($null -eq $rootVariable) { continue }
+        $variableName = Get-BRAVOSelfTestOutboundVariableKey -Name $rootVariable.VariablePath.UserPath
+        $plainTarget = ($left -is [Management.Automation.Language.VariableExpressionAst]) -or
+            ($left -is [Management.Automation.Language.ConvertExpressionAst] -and
+                $left.Child -is [Management.Automation.Language.VariableExpressionAst] -and
+                $booleanTypes -contains ([string]$left.Type.TypeName.Name).ToLowerInvariant())
+        if (-not $plainTarget) { $disqualified[$variableName] = $true; continue }
         if (-not $assignmentsByVariable.ContainsKey($variableName)) { $assignmentsByVariable[$variableName] = @() }
         $assignmentsByVariable[$variableName] += $assignment
+    }
+    foreach ($writer in @($rootAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.ParameterAst] -or
+        $node -is [Management.Automation.Language.ForEachStatementAst] -or
+        ($node -is [Management.Automation.Language.UnaryExpressionAst] -and @(
+            [Management.Automation.Language.TokenKind]::PlusPlus, [Management.Automation.Language.TokenKind]::PostfixPlusPlus,
+            [Management.Automation.Language.TokenKind]::MinusMinus, [Management.Automation.Language.TokenKind]::PostfixMinusMinus) -contains $node.TokenKind) -or
+        ($node -is [Management.Automation.Language.ConvertExpressionAst] -and [string]$node.Type.TypeName.Name -ieq 'ref') -or
+        ($node -is [Management.Automation.Language.CommandAst] -and
+            @('set-variable', 'sv', 'set', 'new-variable', 'nv') -contains ([string]$node.GetCommandName()).ToLowerInvariant())
+    }, $true))) {
+        $writtenVariable = $null
+        if ($writer -is [Management.Automation.Language.ParameterAst]) { $writtenVariable = $writer.Name.VariablePath.UserPath }
+        elseif ($writer -is [Management.Automation.Language.ForEachStatementAst]) { $writtenVariable = $writer.Variable.VariablePath.UserPath }
+        elseif ($writer -is [Management.Automation.Language.UnaryExpressionAst] -or $writer -is [Management.Automation.Language.ConvertExpressionAst]) {
+            $childVariable = Get-BRAVOSelfTestOutboundRootVariable -Node $writer.Child
+            if ($null -ne $childVariable) { $writtenVariable = $childVariable.VariablePath.UserPath }
+        } else {
+            $commandElements = @($writer.CommandElements)
+            for ($commandIndex = 1; $commandIndex -lt $commandElements.Count; $commandIndex++) {
+                $element = $commandElements[$commandIndex]
+                if ($element -is [Management.Automation.Language.CommandParameterAst]) {
+                    if ('name'.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase)) {
+                        $nameNode = $(if ($null -ne $element.Argument) { $element.Argument } elseif ($commandIndex + 1 -lt $commandElements.Count) { $commandElements[$commandIndex + 1] })
+                        if ($nameNode -is [Management.Automation.Language.StringConstantExpressionAst]) { $writtenVariable = $nameNode.Value }
+                        break
+                    }
+                } else {
+                    if ($element -is [Management.Automation.Language.StringConstantExpressionAst]) { $writtenVariable = $element.Value }
+                    break
+                }
+            }
+        }
+        if (-not [string]::IsNullOrEmpty($writtenVariable)) { $disqualified[(Get-BRAVOSelfTestOutboundVariableKey -Name $writtenVariable)] = $true }
     }
     $derived = @{}
     for ($pass = 0; $pass -lt 4; $pass++) {
         $changed = $false
         foreach ($variableName in @($assignmentsByVariable.Keys)) {
-            if ($derived.ContainsKey($variableName)) { continue }
+            if ($derived.ContainsKey($variableName) -or $disqualified.ContainsKey($variableName)) { continue }
             # Похідна змінна — вимикач лише коли КОЖНЕ її присвоєння саме є
             # позитивним кон'юнктивним вимикачем (вимикач або «вимикач -and
             # інше», #434 P2): «$x = -not вимикач» чи «$x = вимикач -or інше»
@@ -2451,7 +2546,8 @@ function Get-BRAVOSelfTestOutboundGateRegex {
             if ($allGated) {
                 $derived[$variableName] = $true
                 $changed = $true
-                $regex = $regex + '|(?i)\$' + [regex]::Escape($variableName) + '\b'
+                # Лише сама змінна: не $x.Властивість, $x[..], $x(..).
+                $regex = $regex + '|(?i)\$(?:(?:global|script|local|private):)?' + [regex]::Escape($variableName) + '\b(?![.\[(])'
             }
         }
         if (-not $changed) { break }
@@ -2522,17 +2618,11 @@ function Test-BRAVOSelfTestOutboundPositiveGate {
     $node = $Condition
     if ($node -is [Management.Automation.Language.PipelineAst]) {
         if (@($node.PipelineElements).Count -ne 1) {
-            # Значення, дістане з об'єкта-вимикача конвеєром
-            # («$bazaSyncEffective.Components | Where-Object {..} | Select-Object
-            # -ExpandProperty SftpEnabled»): перший елемент читає вимикач, а
-            # заперечень у конвеєрі немає.
-            $first = $node.PipelineElements[0]
-            return ($first -is [Management.Automation.Language.CommandExpressionAst] -and
-                $first.Extent.Text -match $Regex -and
-                @($node.FindAll({ param($inner)
-                    $inner -is [Management.Automation.Language.UnaryExpressionAst] -and
-                    @([Management.Automation.Language.TokenKind]::Not, [Management.Automation.Language.TokenKind]::Exclaim) -contains $inner.TokenKind
-                }, $true)).Count -eq 0)
+            # Рівно одна дозволена форма (#434 P2): значення дістане з об'єкта-
+            # вимикача конвеєром $bazaSyncEffective.Components | Where-Object
+            # { $_.Name -eq '<літерал>' } | Select-Object -First 1 -ExpandProperty
+            # SftpEnabled. Будь-який інший конвеєр — не вимикач.
+            return (Test-BRAVOSelfTestOutboundBazaComponentPipeline -Pipeline $node -Regex $Regex)
         }
         $node = $node.PipelineElements[0]
     }
@@ -2561,6 +2651,9 @@ function Test-BRAVOSelfTestOutboundPositiveGate {
         return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Pipeline -Regex $Regex)
     }
     if ($node -is [Management.Automation.Language.ConvertExpressionAst]) {
+        # Лише приведення до булевого ([bool]/[boolean]/[switch]); [string]$flag
+        # та інші типи — не вимикач.
+        if (@('bool', 'boolean', 'switch') -notcontains [string]$node.Type.TypeName.Name.ToLowerInvariant()) { return $false }
         return (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Child -Regex $Regex)
     }
     if ($node -is [Management.Automation.Language.BinaryExpressionAst]) {
@@ -2572,10 +2665,60 @@ function Test-BRAVOSelfTestOutboundPositiveGate {
         return ((Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Left -Regex $Regex) -or
             (Test-BRAVOSelfTestOutboundPositiveGate -Condition $node.Right -Regex $Regex))
     }
-    if ($node -is [Management.Automation.Language.UnaryExpressionAst] -or
-        $node -is [Management.Automation.Language.CommandBaseAst] -or
-        $node -is [Management.Automation.Language.PipelineBaseAst]) { return $false }
-    return ($node.Extent.Text -match $Regex)
+    # Решта вузлів (хеш-таблиця, @(), $(), {}, індекс, виклик методу, унарні,
+    # команди) вимикачем не є, навіть коли ТЕКСТ містить вимикач. Зараховується
+    # лише змінна чи ланцюг доступу до властивостей без викликів та індексів.
+    if ($node -is [Management.Automation.Language.VariableExpressionAst]) { return ($node.Extent.Text -match $Regex) }
+    if ($node -is [Management.Automation.Language.MemberExpressionAst] -and
+        -not ($node -is [Management.Automation.Language.InvokeMemberExpressionAst])) {
+        $chain = $node
+        while ($chain -is [Management.Automation.Language.MemberExpressionAst]) {
+            if ($chain -is [Management.Automation.Language.InvokeMemberExpressionAst] -or
+                -not ($chain.Member -is [Management.Automation.Language.StringConstantExpressionAst])) { return $false }
+            $chain = $chain.Expression
+        }
+        if (-not ($chain -is [Management.Automation.Language.VariableExpressionAst])) { return $false }
+        return ($node.Extent.Text -match $Regex)
+    }
+    return $false
+}
+
+function Test-BRAVOSelfTestOutboundBazaComponentPipeline {
+    param($Pipeline, [string]$Regex)
+    $elements = @($Pipeline.PipelineElements)
+    if ($elements.Count -lt 2) { return $false }
+    $first = $elements[0]
+    if (-not ($first -is [Management.Automation.Language.CommandExpressionAst])) { return $false }
+    $source = $first.Expression
+    if (-not ($source -is [Management.Automation.Language.MemberExpressionAst]) -or
+        $source -is [Management.Automation.Language.InvokeMemberExpressionAst] -or $source.Static) { return $false }
+    if (-not ($source.Expression -is [Management.Automation.Language.VariableExpressionAst]) -or
+        (Get-BRAVOSelfTestOutboundVariableKey -Name $source.Expression.VariablePath.UserPath) -ne 'bazasynceffective') { return $false }
+    if (-not ($source.Member -is [Management.Automation.Language.StringConstantExpressionAst]) -or $source.Member.Value -ne 'Components') { return $false }
+    if ($source.Extent.Text -notmatch $Regex) { return $false }
+    $last = $elements[$elements.Count - 1]
+    if (-not ($last -is [Management.Automation.Language.CommandAst]) -or [string]$last.GetCommandName() -ne 'Select-Object' -or
+        ((@($last.CommandElements | Select-Object -Skip 1 | ForEach-Object { $_.Extent.Text }) -join ' ') -ine '-First 1 -ExpandProperty SftpEnabled')) { return $false }
+    for ($index = 1; $index -lt $elements.Count - 1; $index++) {
+        $filter = $elements[$index]
+        if (-not ($filter -is [Management.Automation.Language.CommandAst]) -or [string]$filter.GetCommandName() -ne 'Where-Object' -or
+            @($filter.CommandElements).Count -ne 2 -or
+            -not ($filter.CommandElements[1] -is [Management.Automation.Language.ScriptBlockExpressionAst])) { return $false }
+        $body = $filter.CommandElements[1].ScriptBlock
+        if ($null -ne $body.BeginBlock -or $null -ne $body.ProcessBlock -or $null -ne $body.ParamBlock -or $null -eq $body.EndBlock -or
+            @($body.EndBlock.Statements).Count -ne 1) { return $false }
+        $statement = $body.EndBlock.Statements[0]
+        if (-not ($statement -is [Management.Automation.Language.PipelineAst]) -or @($statement.PipelineElements).Count -ne 1 -or
+            -not ($statement.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst])) { return $false }
+        $comparison = $statement.PipelineElements[0].Expression
+        if (-not ($comparison -is [Management.Automation.Language.BinaryExpressionAst]) -or
+            $comparison.Operator -ne [Management.Automation.Language.TokenKind]::Ieq -or
+            -not ($comparison.Right -is [Management.Automation.Language.StringConstantExpressionAst]) -or
+            -not ($comparison.Left -is [Management.Automation.Language.MemberExpressionAst]) -or
+            $comparison.Left -is [Management.Automation.Language.InvokeMemberExpressionAst] -or
+            $comparison.Left.Extent.Text -ne '$_.Name') { return $false }
+    }
+    return $true
 }
 
 function Test-BRAVOSelfTestOutboundNegatedGate {
@@ -2835,6 +2978,58 @@ $bdDerivedMismatches = @($bdDerivedExpected.Keys | Where-Object {
 Test-BRAVOCondition -Condition ($bdDerivedSites.Count -eq $bdDerivedExpected.Count -and $bdDerivedMismatches.Count -eq 0) `
     -Name 'BackupDestinations/OutboundGuardDerivedFlagsAndEarlyExitAreSound' `
     -Failure "сторож має приймати похідний прапорець лише як позитивний кон'юнктивний вимикач (не «= -not вимикач», не «= вимикач -or інше», не змішані присвоєння), а ранній вихід — лише при запереченні вимикача в умові й завершенні потоку КОЖНОЮ гілкою if (не «if (вимикач) { return }», не вкладений return, не -not вимикач -and інше): $($bdDerivedMismatches -join ' | ')"
+
+# #434 (P2, повторний review): похідний прапорець — лише позитивна змінна чи
+# ланцюг властивостей (без @(), $(), {}, індексу, виклику методу, хеш-таблиці,
+# приведення не до bool), конвеєр — рівно одна форма BAZA, а ім'я змінної не
+# має інших записів у файлі (типізований не-bool, множинне присвоєння,
+# Set-Variable, foreach, параметр). Кожен випадок: одна функція-канал, похідна
+# змінна й виклик під if (змінна); очікування — gated чи ні.
+$bdShapeCases = @(
+    @{ Tag = 'Hashtable'; Gated = $false; Decl = '$vVN = [ordered]@{ Enabled = $storageEffective.SFTP.Enabled }' },
+    @{ Tag = 'StringCast'; Gated = $false; Decl = '$vVN = [string]$storageEffective.SFTP.Enabled' },
+    @{ Tag = 'ScriptBlock'; Gated = $false; Decl = '$vVN = { $storageEffective.SFTP.Enabled }' },
+    @{ Tag = 'SubExpression'; Gated = $false; Decl = '$vVN = $($storageEffective.SFTP.Enabled)' },
+    @{ Tag = 'ToString'; Gated = $false; Decl = '$vVN = $storageEffective.SFTP.Enabled.ToString()' },
+    @{ Tag = 'ArrayExpr'; Gated = $false; Decl = '$vVN = @($storageEffective.SFTP.Enabled)' },
+    @{ Tag = 'Index'; Gated = $false; Decl = '$vVN = $storageEffective.SFTP.Enabled[0]' },
+    @{ Tag = 'BoolCast'; Gated = $true; Decl = '$vVN = [bool]$storageEffective.SFTP.Enabled' },
+    @{ Tag = 'PipeWhereOther'; Gated = $false; Decl = '$vVN = [bool]($bazaSyncEffective.Components | Where-Object { $_.SftpEnabled -eq $false })' },
+    @{ Tag = 'PipeForEach'; Gated = $false; Decl = '$vVN = $bazaSyncEffective.Components | ForEach-Object { $true }' },
+    @{ Tag = 'PipeSelectName'; Gated = $false; Decl = '$vVN = $bazaSyncEffective.Components | Select-Object -First 1 -ExpandProperty Name' },
+    @{ Tag = 'PipeMeasure'; Gated = $false; Decl = '$vVN = $bazaSyncEffective | Measure-Object' },
+    @{ Tag = 'PipeExactBaza'; Gated = $true; Decl = "`$vVN = [bool](`$bazaSyncEffective.Components | Where-Object { `$_.Name -eq 'BAZA_APP' } | Select-Object -First 1 -ExpandProperty SftpEnabled) -and `$exampleOtherFlag" },
+    @{ Tag = 'TypedBool'; Gated = $true; Decl = '[bool]$vVN = $storageEffective.SFTP.Enabled' },
+    @{ Tag = 'TypedString'; Gated = $false; Decl = '[string]$vVN = $storageEffective.SFTP.Enabled' },
+    @{ Tag = 'MultipleAssign'; Gated = $false; Decl = "`$vVN = `$storageEffective.SFTP.Enabled`n`$vVN, `$exampleSecond = `$true, 1" },
+    @{ Tag = 'ScopedOverwrite'; Gated = $false; Decl = "`$vVN = `$storageEffective.SFTP.Enabled`n`$script:vVN = `$true" },
+    @{ Tag = 'ScopedGate'; Gated = $true; Decl = '$script:vVN = $storageEffective.SFTP.Enabled' },
+    @{ Tag = 'SetVariable'; Gated = $false; Decl = "`$vVN = `$storageEffective.SFTP.Enabled`nSet-Variable -Name vVN -Value `$true" },
+    @{ Tag = 'NewVariable'; Gated = $false; Decl = "`$vVN = `$storageEffective.SFTP.Enabled`nNew-Variable vVN `$true -Force" },
+    @{ Tag = 'ForEachVar'; Gated = $false; Decl = "`$vVN = `$storageEffective.SFTP.Enabled`nforeach (`$vVN in 1..2) { }" },
+    @{ Tag = 'ParameterShadow'; Gated = $false; Decl = "`$vVN = `$storageEffective.SFTP.Enabled`nfunction Wrap-ExVN { param([bool]`$vVN) if (`$vVN) { Send-ExVN } }`nWrap-ExVN -vVN `$true"; NoDirectCall = $true },
+    @{ Tag = 'CheckBazaParameter'; Gated = $false; Decl = "`$checkBAZA = `$storageEffective.SFTP.Enabled -and `$exampleOtherFlag`nfunction Test-ExHealthVN { param([bool]`$CheckBAZA) if (`$CheckBAZA) { Send-ExVN } }`nTest-ExHealthVN -CheckBAZA `$true"; Variable = 'checkBAZA'; NoDirectCall = $true }
+)
+$bdShapeText = @()
+$bdShapeExpected = [ordered]@{}
+foreach ($bdShapeCase in $bdShapeCases) {
+    $bdShapeName = 'Send-Ex' + $bdShapeCase.Tag
+    $bdShapeVariable = $(if ($bdShapeCase.ContainsKey('Variable')) { [string]$bdShapeCase.Variable } else { 'v' + $bdShapeCase.Tag })
+    $bdShapeDecl = ([string]$bdShapeCase.Decl).Replace('vVN', $bdShapeVariable).Replace('VN', $bdShapeCase.Tag)
+    $bdShapeText += "function $bdShapeName { `$session = New-Object WinSCP.Session; `$session.Open(`$null) }"
+    $bdShapeText += $bdShapeDecl
+    if (-not $bdShapeCase.ContainsKey('NoDirectCall')) { $bdShapeText += "if (`$$bdShapeVariable) { $bdShapeName }" }
+    $bdShapeExpected[$bdShapeName] = [bool]$bdShapeCase.Gated
+}
+$bdShapeFixture = @([pscustomobject]@{ File = 'modules\Example\Example.Shapes.ps1'; Text = ($bdShapeText -join "`n") })
+$bdShapeSites = @{}
+foreach ($bdShapeSite in @(Get-BRAVOSelfTestOutboundSites -Sources $bdShapeFixture)) { $bdShapeSites[$bdShapeSite.Function] = $bdShapeSite }
+$bdShapeMismatches = @($bdShapeExpected.Keys | Where-Object {
+    -not $bdShapeSites.ContainsKey($_) -or [bool]$bdShapeSites[$_].Gated -ne [bool]$bdShapeExpected[$_]
+} | ForEach-Object { "$_ (очікувано gated=$($bdShapeExpected[$_]), факт: $(if ($bdShapeSites.ContainsKey($_)) { $bdShapeSites[$_].Gated } else { 'немає місця' }))" })
+Test-BRAVOCondition -Condition ($bdShapeSites.Count -eq $bdShapeExpected.Count -and $bdShapeMismatches.Count -eq 0) `
+    -Name 'BackupDestinations/OutboundGuardDerivedShapesAndShadowingAreSound' `
+    -Failure "похідна змінна — вимикач лише як позитивна змінна/ланцюг властивостей або [bool] над ними, конвеєр BAZA — лише точна форма, а інші записи тієї самої змінної (типізований не-bool, множинне присвоєння, Set-/New-Variable, foreach, параметр, `$script:) її дискваліфікують: $($bdShapeMismatches -join ' | ')"
 
 $bdOutboundSites = @(Get-BRAVOSelfTestOutboundSites -Sources (Get-BRAVOSelfTestOutboundSourceSet -Root $root))
 $bdUngatedSites = @($bdOutboundSites | Where-Object { -not $_.Gated -and -not (Test-BRAVOSelfTestOutboundException -Site $_) })
