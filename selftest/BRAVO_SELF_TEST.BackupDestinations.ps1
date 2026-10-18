@@ -2332,7 +2332,8 @@ Test-BRAVOCondition -Condition (
 # Межі методу: це перевірка структури, а не семантики (умову з вимикачем,
 # що не блокує канал, вона не відрізнить), і SMB-канал розпізнається за
 # New-PSDrive — єдиним способом, яким runtime підключає NAS з креденшлами.
-# Не індексуються й не аналізуються: тіла trap; непрямі виклики функцій
+# Аналіз пофайловий: записи змінної з ІНШОГО файлу, dot-source-леного в ту
+# саму область, не видно. Не індексуються й не аналізуються: тіла trap; непрямі виклики функцій
 # (& $name, Invoke-Expression, .Invoke(), dot-source з динамічного шляху) —
 # такий виклик не додає перевірки викликаючого; Set-Variable з динамічним
 # іменем; name-trusted Test-BRAVOSftpCredentialsRequired (його -SftpEnabled
@@ -2369,8 +2370,12 @@ function Get-BRAVOSelfTestOutboundSites {
     param([object[]]$Sources)
 
     $canonical = @{
-        SFTP = '(?i)\$storageEffective\.SFTP\.(Enabled|ArchiveUpload)\b|\$bazaSyncEffective\b'
-        SMB  = '(?i)\$storageEffective\.SMB\.(Enabled|ArchiveCopy)\b'
+        # Правий край закріплено: вимикач — саме це поле, а не його властивість,
+        # індекс чи виклик ($...Enabled.Count, .GetType()). З $bazaSyncEffective
+        # вимикачем є лише .ScheduledSftpSyncRequired (.Components дозволено
+        # тільки у точній формі конвеєра BAZA).
+        SFTP = '(?i)\$(?:(?:global|script):)?storageEffective\.SFTP\.(Enabled|ArchiveUpload)\b(?![.\[(])|\$(?:(?:global|script):)?bazaSyncEffective\.ScheduledSftpSyncRequired\b(?![.\[(])'
+        SMB  = '(?i)\$(?:(?:global|script):)?storageEffective\.SMB\.(Enabled|ArchiveCopy)\b(?![.\[(])'
     }
     $parsed = @()
     foreach ($source in $Sources) {
@@ -2436,7 +2441,7 @@ function Get-BRAVOSelfTestOutboundEnclosingFunction {
 
 function Get-BRAVOSelfTestOutboundVariableKey {
     param([string]$Name)
-    return ($Name -replace '^(?i)(global|script|local|private):', '').ToLowerInvariant()
+    return ($Name -replace '^(?i)(global|script|local|private|variable):', '').ToLowerInvariant()
 }
 
 function Get-BRAVOSelfTestOutboundRootVariable {
@@ -2695,7 +2700,7 @@ function Test-BRAVOSelfTestOutboundBazaComponentPipeline {
     if (-not ($source.Expression -is [Management.Automation.Language.VariableExpressionAst]) -or
         (Get-BRAVOSelfTestOutboundVariableKey -Name $source.Expression.VariablePath.UserPath) -ne 'bazasynceffective') { return $false }
     if (-not ($source.Member -is [Management.Automation.Language.StringConstantExpressionAst]) -or $source.Member.Value -ne 'Components') { return $false }
-    if ($source.Extent.Text -notmatch $Regex) { return $false }
+    if ($Regex -notmatch 'bazaSyncEffective') { return $false }
     $last = $elements[$elements.Count - 1]
     if (-not ($last -is [Management.Automation.Language.CommandAst]) -or [string]$last.GetCommandName() -ne 'Select-Object' -or
         ((@($last.CommandElements | Select-Object -Skip 1 | ForEach-Object { $_.Extent.Text }) -join ' ') -ine '-First 1 -ExpandProperty SftpEnabled')) { return $false }
@@ -2993,6 +2998,14 @@ $bdShapeCases = @(
     @{ Tag = 'ToString'; Gated = $false; Decl = '$vVN = $storageEffective.SFTP.Enabled.ToString()' },
     @{ Tag = 'ArrayExpr'; Gated = $false; Decl = '$vVN = @($storageEffective.SFTP.Enabled)' },
     @{ Tag = 'Index'; Gated = $false; Decl = '$vVN = $storageEffective.SFTP.Enabled[0]' },
+    @{ Tag = 'DirectCount'; Gated = $false; Decl = 'if ($storageEffective.SFTP.Enabled.Count) { Send-ExVN }'; NoDirectCall = $true },
+    @{ Tag = 'DirectGetType'; Gated = $false; Decl = 'if ($storageEffective.SFTP.Enabled.GetType) { Send-ExVN }'; NoDirectCall = $true },
+    @{ Tag = 'DirectBareBaza'; Gated = $false; Decl = 'if ($bazaSyncEffective) { Send-ExVN }'; NoDirectCall = $true },
+    @{ Tag = 'DirectBazaComponents'; Gated = $false; Decl = 'if ($bazaSyncEffective.Components) { Send-ExVN }'; NoDirectCall = $true },
+    @{ Tag = 'DirectBazaArbitrary'; Gated = $false; Decl = 'if ([bool]$bazaSyncEffective.LocalSyncRequired) { Send-ExVN }'; NoDirectCall = $true },
+    @{ Tag = 'DirectBazaScheduled'; Gated = $true; Decl = 'if ([bool]$bazaSyncEffective.ScheduledSftpSyncRequired) { Send-ExVN }'; NoDirectCall = $true },
+    @{ Tag = 'DerivedBazaComponents'; Gated = $false; Decl = '$vVN = $bazaSyncEffective.Components' },
+    @{ Tag = 'VariableDriveWrite'; Gated = $false; Decl = "`$vVN = [bool]`$storageEffective.SFTP.Enabled`n`${variable:vVN} = `$true" },
     @{ Tag = 'BoolCast'; Gated = $true; Decl = '$vVN = [bool]$storageEffective.SFTP.Enabled' },
     @{ Tag = 'PipeWhereOther'; Gated = $false; Decl = '$vVN = [bool]($bazaSyncEffective.Components | Where-Object { $_.SftpEnabled -eq $false })' },
     @{ Tag = 'PipeForEach'; Gated = $false; Decl = '$vVN = $bazaSyncEffective.Components | ForEach-Object { $true }' },
