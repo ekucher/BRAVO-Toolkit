@@ -289,7 +289,7 @@ presets, керуванням Credential Manager, попереднім пере�
 | `maintenanceSettings.Limits` | `MinimumFreeSpaceGB`, `ExcludedDrives`, `MaximumMdFileSizeGB`, опційний `EstimatedSpaceMarginPercent` (розділ 3.3) |
 | `componentSettings` | які архіви, BAZA, SFTP і SMB потрібно виконувати; `SFTP.Enabled`/`SMB.Enabled` — глобальні вимикачі destination (розділ 3.1) |
 | `backupConsistency` | обов'язковий режим `VSS` і контекст `ClientAccessible` для узгоджених архівів |
-| SFTP | `sftpHostTemplate`, порт, fingerprint `sftpHostKey` (формат `ssh-ed25519 255 <43 символи base64>` (префікс `SHA256:` з `ssh-keygen -lf`/WinSCP GUI приймається й відсікається) або `ssh-rsa 2048 aa:bb:…` (16 hex-пар); `*`/`acceptnew` заборонені, невалідне значення → код `30`), віддалені каталоги |
+| SFTP | `sftpHostTemplate`, порт, fingerprint `sftpHostKey` (формат `ssh-ed25519 255 <43 символи base64>` (префікс `SHA256:` з WinSCP GUI приймається й відсікається) або `ssh-rsa 2048 aa:bb:…` (16 hex-пар); `*`/`acceptnew` заборонені, невалідне значення → код `30`), віддалені каталоги |
 | `smbSettings` | реальний UNC-шлях і підкаталоги, якщо `ArchiveCopy = $true` |
 | `backupMonitoring` | `CheckManagedServices`, допустимий вік копій, SHA512-перевірки і частота повторних alert |
 | `schedulerSettings` | час запуску, імена завдань, таймаути і task account |
@@ -1792,7 +1792,7 @@ checks, acceptance) — у `RELEASE_POLICY.md` у корені репозито�
 - не додавайте `-delete` до SFTP-синхронізації BAZA: хмара є накопичувальною;
 - після зміни SFTP fingerprint перевірте його через незалежний довірений канал;
 - `sftpHostKey` обов'язково у форматі `<тип> <біти> <відбиток>` (приклад:
-  `ssh-ed25519 255 <43 символи base64>`; префікс `SHA256:` з `ssh-keygen -lf`/WinSCP GUI
+  `ssh-ed25519 255 <43 символи base64>`; префікс `SHA256:` з WinSCP GUI
   приймається й автоматично відсікається); `*`, `acceptnew` та значення
   з керуючими символами відхиляються, у WinSCP-скриптах значення береться в лапки;
 - пароль 7-Zip передається утиліті лише через redirected standard input і не
