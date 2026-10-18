@@ -24,6 +24,15 @@
 # первинну операцію Archive/Maintenance/Health (операційний інваріант
 # проекту).
 
+# F4/#481: Write-BRAVOOperationsLog нижче викликає Write-BRAVOLog, а
+# Protect-BRAVOEgressText маскує все, що йде в Operations API й у локальний
+# outbox. Без власного імпорту ці команди видимі лише там, де Logging уже
+# імпортовано в глобальну область; під вкладеним імпортом (модуль
+# всередині модуля) виклик падав би з CommandNotFound. BRAVO.Logging —
+# нижчий модуль без власних імпортів (циклу немає).
+$loggingManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Logging\BRAVO.Logging.psd1'
+Import-Module -Name $loggingManifest -ErrorAction Stop
+
 # ---------------------------------------------------------------------
 # STATE: каталоги/шляхи
 # ---------------------------------------------------------------------
@@ -1235,6 +1244,67 @@ function Get-BRAVOOperationsOutboxItemPath {
     return (Join-Path $directory ("$safeName.json"))
 }
 
+function ConvertTo-BRAVOOperationsEgressValue {
+    # F4/#481: рекурсивно (глибина до 8) маскує рядки у вкладеній структурі,
+    # що йде в Operations API й у локальний outbox. Ключі словників лишаються
+    # як є; скаляри (числа, bool, дати, GUID, enum) не змінюються; структура
+    # глибша за межу замінюється заглушкою (fail-closed), а не пропускається.
+    # Повертає НОВУ структуру — оригінал викликача не мутується.
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Value,
+        [Parameter(Mandatory = $true)]$SecretSet,
+        [int]$Depth = 0
+    )
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) {
+        return (Protect-BRAVOEgressText -Text $Value -SecretSet $SecretSet -Channel 'operations').Text
+    }
+    $isScalar = $Value.GetType().IsPrimitive -or $Value.GetType().IsEnum -or
+        $Value -is [decimal] -or $Value -is [datetime] -or $Value -is [datetimeoffset] -or
+        $Value -is [guid] -or $Value -is [timespan]
+    if ($isScalar) { return $Value }
+    if ($Depth -ge 8) {
+        return (Protect-BRAVOEgressText -Text 'depth' -SecretSet $SecretSet -Channel 'operations' -ForceOmit).Text
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $maskedDictionary = @{}
+        foreach ($dictionaryKey in @($Value.Keys)) {
+            $maskedDictionary[$dictionaryKey] = ConvertTo-BRAVOOperationsEgressValue -Value $Value[$dictionaryKey] -SecretSet $SecretSet -Depth ($Depth + 1)
+        }
+        return $maskedDictionary
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $maskedItems = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($enumerableItem in $Value) {
+            $maskedItems.Add((ConvertTo-BRAVOOperationsEgressValue -Value $enumerableItem -SecretSet $SecretSet -Depth ($Depth + 1)))
+        }
+        return ,$maskedItems.ToArray()
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $maskedProperties = [ordered]@{}
+        foreach ($objectProperty in $Value.PSObject.Properties) {
+            $maskedProperties[$objectProperty.Name] = ConvertTo-BRAVOOperationsEgressValue -Value $objectProperty.Value -SecretSet $SecretSet -Depth ($Depth + 1)
+        }
+        return [pscustomobject]$maskedProperties
+    }
+    # Будь-який інший об'єкт (виняток, ErrorRecord, .NET-тип) серіалізувався б
+    # у JSON непередбачувано: маскується його текстове подання.
+    return (Protect-BRAVOEgressText -Text ([string]$Value) -SecretSet $SecretSet -Channel 'operations').Text
+}
+
+function Protect-BRAVOOperationsFailureText {
+    # F4/#481: причина збою (LastError / DeadLetterReason) береться з тексту
+    # винятку HTTP-клієнта й пишеться на диск у outbox/dead-letter; перед
+    # записом проходить той самий egress-шар. Порожнє лишається як є.
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    return (Protect-BRAVOEgressText -Text $Text -Channel 'operations/outbox').Text
+}
+
 function Add-BRAVOOperationsOutboxItem {
     # Кладе подію/heartbeat в durable outbox — викликається, коли негайна
     # спроба відправки впала на transient збої (мережа/timeout/5xx/429).
@@ -1326,7 +1396,13 @@ function Add-BRAVOOperationsOutboxItem {
                     (Get-Date).ToUniversalTime().AddSeconds((Get-BRAVOOperationsOutboxBackoffSeconds -AttemptCount $AttemptCount)).ToString('o')
                 }
             )
-            LastError = $LastError
+            LastError = (Protect-BRAVOOperationsFailureText -Text $LastError)
+            # #481 (review F5): усі шляхи, що викликають цю функцію, передають
+            # payload, уже замаскований у Send-BRAVOOperationsEvent. Прапорець
+            # каже дренажу не маскувати item повторно (інакше при тимчасово
+            # недоступному джерелі секретів безпечний item пішов би заглушкою
+            # і був би видалений). Legacy-items без прапорця маскуються при дренажі.
+            EgressMasked = $true
         }
         Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsOutboxItemPath -EventId $EventId) -Object $item
         Write-BRAVOOperationsLog -Level 'WARNING' `
@@ -1573,7 +1649,7 @@ function Move-BRAVOOperationsOutboxItemToDeadLetter {
             [void](New-Item -ItemType Directory -Path $deadLetterDirectory -Force)
         }
         $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetteredAtUtc' -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force
-        $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetterReason' -Value $Reason -Force
+        $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetterReason' -Value (Protect-BRAVOOperationsFailureText -Text $Reason) -Force
         $Item | Add-Member -MemberType NoteProperty -Name 'DeadLetterKind' -Value $Kind -Force
         # #305: без EventId ім'я dead-letter файлу береться з імені файлу
         # outbox (або нового GUID), щоб карантин не падав сам.
@@ -1649,7 +1725,7 @@ function Update-BRAVOOperationsOutboxItemAfterFailure {
         $nextAttempt = [int]$Item.AttemptCount + 1
         $Item.AttemptCount = $nextAttempt
         $Item.NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds((Get-BRAVOOperationsOutboxBackoffSeconds -AttemptCount $nextAttempt)).ToString('o')
-        $Item.LastError = $LastError
+        $Item.LastError = (Protect-BRAVOOperationsFailureText -Text $LastError)
         $path = if ($Item.PSObject.Properties.Name -contains '__Path') { [string]$Item.__Path } else { Get-BRAVOOperationsOutboxItemPath -EventId (Get-BRAVOOperationsOutboxItemEventId -Item $Item) }
         $toWrite = $Item | Select-Object * -ExcludeProperty __Path
         Write-BRAVOOperationsAtomicJsonFile -Path $path -Object $toWrite
@@ -1800,6 +1876,9 @@ function Invoke-BRAVOOperationsOutboxDrain {
         $drainServerId = $null
         try { $drainServerId = Get-BRAVOOperationsServerId } catch { $drainServerId = $null }
         $now = (Get-Date).ToUniversalTime()
+        # F4/#481: набір секретів для маскування payload застарілих items
+        # (див. нижче) резолвиться ліниво й ОДИН раз на дренаж.
+        $drainEgressSecretSet = $null
         $drainStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $processedCount = 0
         foreach ($item in $items) {
@@ -1881,6 +1960,21 @@ function Invoke-BRAVOOperationsOutboxDrain {
                 }
                 foreach ($property in $item.RequestBody.PSObject.Properties) {
                     $requestBodyHashtable[$property.Name] = $property.Value
+                }
+                # F4/#481 (LEAD G3): items, записані ДО цього виправлення, на
+                # диску містять сирий payload. Файли не переписуються;
+                # маскується копія тіла безпосередньо перед відправкою.
+                # Лише події: heartbeat не несе вільного тексту. Новіші items
+                # уже замасковані — повторне маскування ідемпотентне.
+                $itemKind = Get-BRAVOOperationsJsonPropertyString -Object $item -Name 'Kind'
+                # #481 (F5): item з EgressMasked=$true уже замаскований при постановці
+                # в чергу — повторно не маскується (StrictMode-safe читання).
+                $itemEgressMasked = $false
+                $egressMaskedProperty = $item.PSObject.Properties['EgressMasked']
+                if ($null -ne $egressMaskedProperty -and $egressMaskedProperty.Value -eq $true) { $itemEgressMasked = $true }
+                if (-not $itemEgressMasked -and ($itemKind -eq 'event' -or $itemApiPath -eq '/api/v1/events') -and $requestBodyHashtable.ContainsKey('payload')) {
+                    if ($null -eq $drainEgressSecretSet) { $drainEgressSecretSet = Resolve-BRAVOEgressSecretSet }
+                    $requestBodyHashtable['payload'] = ConvertTo-BRAVOOperationsEgressValue -Value $requestBodyHashtable['payload'] -SecretSet $drainEgressSecretSet
                 }
             } catch {
                 $envelopeError = [string]$_.Exception.Message
@@ -1980,6 +2074,16 @@ function Send-BRAVOOperationsEvent {
         if (-not (Test-BRAVOOperationsSettingEnabled -Value $OperationsReportingSettings.Enabled)) {
             return
         }
+
+        # F4/#481: вільний текст події (message/component/services/details)
+        # маскується ДО побудови конверта й до будь-якого шляху (негайна
+        # відправка, outbox, dead-letter): на диск і в мережу потрапляє лише
+        # замаскована копія. Набір секретів резолвиться раз на подію.
+        $egressSecretSet = Resolve-BRAVOEgressSecretSet
+        $Message = [string](ConvertTo-BRAVOOperationsEgressValue -Value $Message -SecretSet $egressSecretSet)
+        $Component = [string](ConvertTo-BRAVOOperationsEgressValue -Value $Component -SecretSet $egressSecretSet)
+        if ($null -ne $Services) { $Services = [object[]](ConvertTo-BRAVOOperationsEgressValue -Value $Services -SecretSet $egressSecretSet) }
+        if ($null -ne $Details) { $Details = ConvertTo-BRAVOOperationsEgressValue -Value $Details -SecretSet $egressSecretSet }
 
         $envelope = New-BRAVOOperationsEventEnvelope
 
