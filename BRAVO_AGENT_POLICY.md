@@ -113,6 +113,13 @@ Use additional Codex roles when the change warrants them:
 
 A Claude `reviewer` may be used earlier as an internal pre-review, but a successful internal review is not represented as a Codex review.
 
+The bridge is configured per workstation in `.mcp.json`, which is deliberately
+untracked because it carries absolute paths to a local `claude-codex-a2a` build.
+Copy `.mcp.json.example` and substitute the real path. A missing or misconfigured
+`.mcp.json` means the Codex gates are simply unreachable on that machine — that is
+a configuration defect to fix, and section 8.2 does **not** permit it as a fallback
+reason.
+
 ### 8.2 Temporary Claude QA fallback when Codex is unavailable by limits
 
 If Codex QA cannot run **specifically because of quota/usage limit, rate limit, or temporary Codex service unavailability**, a fresh Claude Code `reviewer` may temporarily satisfy the **QA role only**.
@@ -147,6 +154,38 @@ Use proportional review depth:
 - after fixing Codex findings -> Codex Verification on the relevant finding IDs/thread when available.
 
 The orchestrator may increase review depth based on evidence. It must not silently reduce a required gate.
+
+### 9.1 Role/model routing matrix
+
+`.claude/ai-routing.json` is the machine-readable source of truth for which model each role runs on,
+which roles and gates each risk level (`LOW`/`MEDIUM`/`HIGH`/`CRITICAL`) requires, which fallback
+reasons are permitted, and the write boundary of each role. It encodes this policy; it
+does not extend it. Where the matrix and this file could be read as disagreeing, this file wins, and
+the matrix is the defect to fix.
+
+The orchestrator resolves role and model from the matrix instead of asking the owner to pick a model
+per task. The `PreToolUse` hook `.claude/hooks/validate-agent-routing.ps1` runs on the delegation
+tool (`Agent`, historically `Task`), on `Write`/`Edit`/`NotebookEdit`, and on Codex calls, and
+enforces a narrow closed list — model mismatch, a Claude agent briefed as a formal Codex gate, `claude-qa-fallback` without
+one of the three permitted reasons, `documentation` scoped outside its write boundary, and a
+delegated agent's actual `Write`/`Edit`/`NotebookEdit` outside its write boundary — and logs every
+other decision. The acting role for a write comes from the hook payload's `agent_type`; the main
+session has no `agent_type` and is not write-gated, because the system constrains delegated
+executors, not the owner of the process. `Bash` is not gated: a shell command cannot be reliably
+inspected for what it would write, so the boundary is kept by withholding `Bash` from write-bounded
+roles rather than by claiming hook coverage it does not have. Agents absent from the matrix are never
+blocked. When the hook itself cannot decide, gate-critical roles (`reviewer`, `architect`,
+`security-reviewer`) fail closed and everything else fails open with a logged hook error.
+
+`architect` and `security-reviewer` are internal Claude roles. They never satisfy the formal Codex
+`architecture` or `security` gates, and section 8.2 continues to govern what the Claude fallback may
+and may not replace.
+
+The Lead/Orchestrator of section 8 is itself defined as `.claude/agents/lead.md` (role `lead`,
+model `inherit` — the owner's selected model). It runs only as the main session
+(`claude --agent lead`): the matrix marks it `mainSessionOnly`, and the hook denies any delegation
+call with `subagent_type: lead`, so dispatch and A2A routing cannot be nested below the owner's
+session or escape the human merge gate.
 
 ## 10. Reviewer independence and anti-anchoring
 

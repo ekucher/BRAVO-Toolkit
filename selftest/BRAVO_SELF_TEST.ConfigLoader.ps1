@@ -530,6 +530,43 @@ try {
         -Name "Loader/SftpPortOversizedValueFailsClosedWithoutOverflowException" `
         -Failure "sftpPort=[uint64]::MaxValue мусить fail-closed зупинити завантаження КЕРОВАНИМ throw ('неавторизоване перевизначення'), БЕЗ OverflowException; отримано: '$localCfgSftpPortProbeLast'"
 
+    # --- Loader/SftpHostKeyAcceptAnyOverrideFailsClosed (#480, F3) ---
+    # sftpHostKey='*' (accept-any-host-key) у BRAVO.local.config МУСИТЬ зупиняти
+    # завантаження керованим throw валідатора SshHostKeyFingerprint; так само
+    # CRLF-ін'єкція команд WinSCP-скрипта.
+    $localCfgHostKeyCases = @(
+        @{ Name = 'Star'; Literal = "'*'" }
+        @{ Name = 'AcceptNew'; Literal = "'acceptnew'" }
+        @{ Name = 'CrLfPut'; Literal = "'ssh-rsa 2048 aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99`r`nput C:\x /'" }
+    )
+    $localCfgHostKeyFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($localCfgHostKeyCase in $localCfgHostKeyCases) {
+        [IO.File]::WriteAllText($localCfgOverridePath, (
+            "@{`r`n" +
+            "    'sftpHostKey' = $($localCfgHostKeyCase.Literal)`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding $false))
+        $localCfgHostKeyProbe = Invoke-BRAVOConfigLoaderProbe -AsLines -Command (
+                "Set-StrictMode -Version 2.0; " +
+                "try { " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+                "'UNEXPECTED-NOTHREW' " +
+                "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+            )
+        $localCfgHostKeyProbeText = [string]::Join(' ', @($localCfgHostKeyProbe | ForEach-Object { [string]$_ }))
+        if (-not ($localCfgHostKeyProbeText.Contains('CHILD-ERROR:') -and
+                $localCfgHostKeyProbeText.Contains('неавторизоване перевизначення') -and
+                $localCfgHostKeyProbeText.Contains('sftpHostKey') -and
+                -not $localCfgHostKeyProbeText.Contains('UNEXPECTED-NOTHREW'))) {
+            [void]$localCfgHostKeyFailures.Add([string]$localCfgHostKeyCase.Name)
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($localCfgHostKeyFailures.Count -eq 0) `
+        -Name "Loader/SftpHostKeyAcceptAnyOverrideFailsClosed" `
+        -Failure "BRAVO.local.config з sftpHostKey='*'/'acceptnew'/CRLF-ін'єкцією мусить зупиняти Import-BravoConfiguration керованим throw ('неавторизоване перевизначення'); збої: $([string]::Join(', ', $localCfgHostKeyFailures))"
+
     # --- Loader/MaintenanceLoggingSuccessLoadsSuccessfully (PR #224 review,
     # шосте коло, P2 "Restrict maintenance log levels to runtime-supported
     # values"): SUCCESS — runtime-підтримуваний рівень (Maintenance
@@ -2293,7 +2330,20 @@ try {
         'credentialSettings.Targets.OperationsBootstrapSecret',
         # Поріг «малого» файлу MODEL для самоперевірки після bravocmd
         # repair (Compare-FileSizes): новий канонічний лист Restore.
-        'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes'
+        'maintenanceSettings.Restore.IntegritySmallFileThresholdBytes',
+        # #316: закриття клієнтів BIS перед реставрацією — нова вкладена
+        # hashtable (чотири нові канонічні листи всередині) після
+        # заморожування фікстури. Compare-BRAVOConfigurationGraphForParity
+        # перевіряє наявність КЛЮЧА на кожному рівні рекурсії ДО спуску в
+        # нього (рядок "-not $Actual.Contains($key)"), тому відсутній
+        # вузол дає ОДИН diff на самому вузлі, а не чотири на листах —
+        # саме цей шлях (а не дочірні WaitMinutes/ReminderMinutes/
+        # PollSeconds/ProcessNames) і треба дозволити.
+        'maintenanceSettings.Restore.ClientClose',
+        # #364: runtime-синхронізація логів через SFTP — тумблер і каталог
+        # призначення, обидва нові канонічні листи після заморожування фікстури.
+        'componentSettings.SFTP.RuntimeLogSyncEnabled',
+        'sftpDirectories.RuntimeLogs'
     )
     $parityAdditiveAbsenceSuffix = ' : відсутнє в BRAVO.config'
     $parityDiffs = @(@($parityDiffsList.ToArray()) | Where-Object {
@@ -3473,15 +3523,15 @@ if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' -De
 
         $sourcePath = Join-Path $root $RelativePath
         $parseErrors = $null
-        $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$null, [ref]$parseErrors)
+        # Кеш розбору прогону (той самий ParseFile файлу репо, ті самі Errors)
+        # і скомпільований предикат CommandAst; умова на ім'я — та сама.
+        $fileAst = Get-BRAVOSelfTestParsedFileAst -Path $sourcePath -Errors ([ref]$parseErrors)
         if ($parseErrors -and $parseErrors.Count -gt 0) {
             throw "B7: не вдалося розібрати $RelativePath : $($parseErrors[0].Message)"
         }
-        $calls = @($fileAst.FindAll({
-                    param($astNode)
-                    ($astNode -is [System.Management.Automation.Language.CommandAst]) -and
-                    [string]::Equals([string]$astNode.GetCommandName(), 'Import-BravoConfiguration', [StringComparison]::OrdinalIgnoreCase)
-                }, $true))
+        $calls = @($fileAst.FindAll(
+                (Get-BRAVOSelfTestAstTypePredicate -Type @([System.Management.Automation.Language.CommandAst])), $true) |
+                Where-Object { [string]::Equals([string]$_.GetCommandName(), 'Import-BravoConfiguration', [StringComparison]::OrdinalIgnoreCase) })
         if ($calls.Count -ne 1) {
             throw "B7: у $RelativePath очікувався рівно один виклик Import-BravoConfiguration, знайдено $($calls.Count)"
         }

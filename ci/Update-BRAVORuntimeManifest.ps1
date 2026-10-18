@@ -4,7 +4,12 @@ param(
 
     # Без цього перемикача скрипт лише показує розбіжності й нічого не
     # записує.
-    [switch]$Apply
+    [switch]$Apply,
+
+    # Пропускає перевірку EOL (git ls-files --eol) для середовищ без git
+    # (наприклад, розпакований артефакт без .git). У CI і на робочій
+    # станції розробника перемикач НЕ використовується.
+    [switch]$SkipEolCheck
 )
 
 # Оновлення RUNTIME_MANIFEST.json — еталонних SHA-256 усього
@@ -68,6 +73,56 @@ foreach ($fullPath in ($candidates | Sort-Object)) {
         continue
     }
     $currentHashes[$relative] = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash.ToUpperInvariant()
+}
+
+# Передумова хешування: .gitattributes примусово задає eol=crlf, а CI
+# хешує свіжий checkout (CRLF). Новий файл, створений інструментом з
+# LF-кінцями рядків, хешується тут як LF -> маніфест "актуальний"
+# локально, але CI відхиляє його як застарілий (повторювана пастка).
+# Тому до хешування звіряємо кінці рядків робочого дерева з attr.
+if (-not $SkipEolCheck) {
+    if ($null -eq (Get-Command -Name git -ErrorAction SilentlyContinue)) {
+        Write-Host "git не знайдено: перевірку EOL виконати неможливо. Встановіть git або запустіть з -SkipEolCheck." -ForegroundColor Red
+        exit 1
+    }
+    # Один виклик на весь репозиторій (без ліміту довжини командного
+    # рядка): tracked (-c) і ще не додані до індексу (-o) файли.
+    $eolLines = @(& git -c core.quotepath=false -C $Root ls-files --eol -c -o --exclude-standard)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "git ls-files --eol завершився з кодом $LASTEXITCODE (чи є $Root git-репозиторієм?). Запустіть з -SkipEolCheck, якщо git недоступний." -ForegroundColor Red
+        exit 1
+    }
+    $eolByPath = @{}
+    foreach ($eolLine in $eolLines) {
+        # Формат: "i/lf    w/lf    attr/text=auto eol=crlf<TAB>path"
+        $tabIndex = $eolLine.IndexOf("`t")
+        if ($tabIndex -lt 0) { continue }
+        $eolByPath[$eolLine.Substring($tabIndex + 1).Replace('/', '\')] = $eolLine.Substring(0, $tabIndex)
+    }
+    $eolViolations = New-Object System.Collections.ArrayList
+    foreach ($name in $currentHashes.Keys) {
+        if (-not $eolByPath.ContainsKey($name)) { continue }
+        $eolInfo = $eolByPath[$name]
+        if ($eolInfo -match 'attr/[^\t]*eol=crlf' -and $eolInfo -match '\bw/(lf|mixed)\b') {
+            [void]$eolViolations.Add("$name  [$(($eolInfo -replace '\s+', ' ').Trim())]")
+        }
+    }
+    if ($eolViolations.Count -gt 0) {
+        Write-Host "EOL-розбіжність: файли робочого дерева мають LF/змішані кінці рядків, а .gitattributes вимагає eol=crlf." -ForegroundColor Red
+        Write-Host "CI хешує свіжий checkout (CRLF), тож маніфест із такими хешами буде відхилено як застарілий." -ForegroundColor Red
+        foreach ($violation in $eolViolations) {
+            $violationPath = ($violation -split '  \[')[0]
+            $gitPath = $violationPath.Replace('\', '/')
+            Write-Host "  $violation" -ForegroundColor Red
+            # Абсолютний шлях: [IO.File] резолвить відносні шляхи від
+            # [Environment]::CurrentDirectory, який Set-Location у PS 5.1 не оновлює.
+            $winPath = Join-Path $Root $gitPath.Replace('/', '\')
+            $fixCommand = '$f = ''' + $winPath + '''; [IO.File]::WriteAllText($f, ([IO.File]::ReadAllText($f) -replace ''(?<!\r)\n'', "`r`n"), (New-Object Text.UTF8Encoding([IO.File]::ReadAllBytes($f)[0] -eq 0xEF)))'
+            Write-Host "    виправлення (перетворити на CRLF, потім git add -- $gitPath): $fixCommand" -ForegroundColor Yellow
+        }
+        Write-Host "Після виправлення повторіть запуск. Без git: -SkipEolCheck (лише якщо кінці рядків перевірено іншим способом)." -ForegroundColor Yellow
+        exit 1
+    }
 }
 
 $recorded = @{}

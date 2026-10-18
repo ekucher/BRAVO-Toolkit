@@ -59,6 +59,13 @@ foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.Arc
     }
     Import-Module -Name $modulePath -ErrorAction Stop
 }
+# #480: формат-валідація sftpHostKey (ConvertTo-/Test-BRAVOSshHostKeyFingerprint) обов'язкова
+# у кожному споживачі: legacy BRAVO.config валідатором авторизації loader-а не покривається.
+$hostKeySchemaModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+if (-not (Test-Path -LiteralPath $hostKeySchemaModulePath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль схеми конфігурації: $hostKeySchemaModulePath"
+}
+Import-Module -Name $hostKeySchemaModulePath -ErrorAction Stop
 Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
@@ -81,7 +88,11 @@ if ($HealthCheckOnly) {
     $healthScriptPath = Join-Path $bravoScriptDirectory 'BRAVO_HEALTH.ps1'
     if (-not (Test-Path -LiteralPath $healthScriptPath -PathType Leaf)) {
         Write-Error "Не знайдено окремий health-скрипт: $healthScriptPath"
-        exit 1
+        # Контракт BRAVO.ExitCodes: 90 — як у BRAVO_ARCHIV.ps1 / BRAVO_HEALTH.ps1
+        # для компонента комплекту, якого бракує вже ПІСЛЯ guard (раніше —
+        # голий 1 поза таблицею кодів). У режимі Enforce сюди не дійти:
+        # BRAVO_HEALTH.ps1 є в RUNTIME_MANIFEST.json, і guard дає 33.
+        exit 90
     }
     # AUTO -> дочірній BRAVO_HEALTH.ps1 сам виконує ту саму auto-derivation
     # проти свого $PSScriptRoot (той самий комплект); EXPLICIT -> точний
@@ -151,7 +162,9 @@ try {
     Write-Host "Конфiгурацiю завантажено успiшно: $configPath" -ForegroundColor $logColors.SUCCESS
 } catch {
     Write-Host "ПОМИЛКА: Не вдалося завантажити конфiгурацiю: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
-    Exit 1
+    # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration, як у Maintenance
+    # і DataRestore для тієї самої відмови (раніше — голий 1).
+    Exit 30
 }
 
 # Archive використовує ту саму політику вільного місця, що й Maintenance.
@@ -243,7 +256,8 @@ if ($requireAdministrator) {
         } catch {
             Write-Host "UAC запит вiдхилено або сталася помилка: $($_.Exception.Message)" -ForegroundColor $logColors.ERROR
             Write-Host "Запустiть PowerShell з правами адмiнiстратора вручну" -ForegroundColor $logColors.WARNING
-            Exit 1
+            # Контракт BRAVO.ExitCodes: 36 = PrivilegeRequired (раніше — голий 1).
+            Exit 36
         }
     }
 }
@@ -424,6 +438,14 @@ if ($credentialHelperLoaded -and -not $NoPause -and
     }
 }
 
+# F4/#481: джерело секретів для єдиного egress-шару маскування
+# (Protect-BRAVOEgressText). Реєструється одразу після появи
+# $credentialSettings і ДО будь-якого сповіщення; викликається на кожну
+# подію без кешу, тож значення, прочитані пізніше, теж маскуються.
+if ($credentialHelperLoaded) {
+    Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
+}
+
 if ($credentialHelperLoaded) {
     try {
         [void](Import-BRAVOInstitutionSettings `
@@ -432,20 +454,19 @@ if ($credentialHelperLoaded) {
     } catch {
         Write-Host "ПОМИЛКА: Некоректні локальні параметри установи у Credential Manager: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" `
             -ForegroundColor $logColors.ERROR
-        exit 1
+        # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
+        exit 30
     }
 } elseif ($institutionSettingsRequired) {
     Write-Host "ПОМИЛКА: Не вдалося завантажити локальні параметри установи: $($script:institutionSettingsInitializationError)" `
         -ForegroundColor $logColors.ERROR
-    exit 1
+    # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
+    exit 30
 }
 
 if ($credentialHelperLoaded -and $archiveCredentialRequired) {
     try {
         $archiveCredentialTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
-        if ([string]::IsNullOrWhiteSpace($archiveCredentialTarget)) {
-            throw "не вдалося визначити назву запису Credential Manager для пароля архівів"
-        }
         $script:archivePassword = Get-BRAVOCredentialSecret -Target $archiveCredentialTarget
         if ([string]::IsNullOrWhiteSpace($script:archivePassword)) {
             throw "запис Credential Manager '$archiveCredentialTarget' не знайдено або він порожній для $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
@@ -562,9 +583,12 @@ function Resolve-BRAVOSyncBazaExitCode {
     # (10), щоб 4-годинний BAZASync не ховав його за чистим exit 0.
     param(
         [bool]$SyncSucceeded,
-        [int]$EmptySourceWarningCount
+        [int]$EmptySourceWarningCount,
+        # #480: невалідна SFTP-конфігурація (зокрема sftpHostKey) -> 30, раніше за SftpFailed.
+        [bool]$InvalidConfiguration = $false
     )
 
+    if ($InvalidConfiguration) { return (Resolve-BRAVOExitCode -InvalidConfiguration) }
     if (-not $SyncSucceeded) { return (Resolve-BRAVOExitCode -SftpFailed) }
     if ($EmptySourceWarningCount -gt 0) { return (Resolve-BRAVOExitCode -HasWarnings) }
     return 0
@@ -758,7 +782,7 @@ function Send-ToolIntegrityAlert {
                         -LogPath ([string]$script:logFile) `
                         -LogLabel "Журнал"
 
-                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText -OmittedContext "CRITICAL"
                     Send-BRAVONotificationChunks `
                         -Provider $script:notificationProvider `
                         -WebhookUrl $notificationWebhookUrl `
@@ -775,7 +799,7 @@ function Send-ToolIntegrityAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -865,7 +889,7 @@ function Send-BRAVOArchiveFreeSpaceAlert {
                         -LogPath ([string]$script:logFile) `
                         -LogLabel 'Журнал'
 
-                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText -OmittedContext "CRITICAL"
                     Send-BRAVONotificationChunks `
                         -Provider $script:notificationProvider `
                         -WebhookUrl $notificationWebhookUrl `
@@ -888,7 +912,7 @@ function Send-BRAVOArchiveFreeSpaceAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -2161,12 +2185,40 @@ function Sync-Folders {
 
 
 function Write-SevenZipFailureDiagnostics {
-    param([string]$Operation, [string]$StandardOutput, [string]$StandardError)
-    foreach ($line in @($StandardOutput, $StandardError)) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) {
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "${Operation}: $($line.Trim().Substring(0, [math]::Min(4000, $line.Trim().Length)))" -Level 'DEBUG'
-        }
+    # Тонкий адаптер над канонічним Write-BRAVOSevenZipFailureDiagnostics
+    # (BRAVO.ArchiveHelpers — імпортується вище): він володіє і нормалізацією
+    # рядків, і межами, і правилом рівня. Тут лишається лише мостик до
+    # Write-BRAVOLog — рівно той самий logger-скриптблок, що його передає
+    # виклик Test-SevenZipArchiveIntegrity у New-Archive.
+    #
+    # До цього тут було ДВІ незалежні копії правила рівня, і саме так шляхи
+    # create та test розійшлися. Попередня реалізація, окрім DEBUG, мала ще
+    # два дефекти: foreach ішов по ДВОХ ПОТОКАХ, а не по рядках (тому межі
+    # на 20 рядків не було взагалі, а 4000 символів застосовувались до
+    # кожного потоку окремо), і гілки для порожнього виводу не існувало.
+    param(
+        [string]$Operation,
+        [string]$StandardOutput,
+        [string]$StandardError,
+        [ValidateSet('ERROR', 'WARNING')][string]$Level = 'ERROR',
+        [AllowNull()][AllowEmptyString()][string]$EmptyOutputReason
+    )
+    # Пароль архіву — відомий секрет для маскування виводу 7-Zip ще до
+    # першого запису. Читається через Get-Variable: під StrictMode змінна
+    # може бути ще не ініціалізована (ранній збій до читання облікових даних).
+    $archivePasswordVariable = Get-Variable -Name archivePassword -Scope Script -ErrorAction SilentlyContinue
+    $knownSecret = @()
+    if ($null -ne $archivePasswordVariable -and -not [string]::IsNullOrEmpty([string]$archivePasswordVariable.Value)) {
+        $knownSecret = @([string]$archivePasswordVariable.Value)
     }
+    [void](Write-BRAVOSevenZipFailureDiagnostics `
+        -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level } `
+        -Operation $Operation `
+        -StandardOutput $StandardOutput `
+        -StandardError $StandardError `
+        -Level $Level `
+        -EmptyOutputReason $EmptyOutputReason `
+        -KnownSecret $knownSecret)
 }
 
 function Get-BRAVOVSSSnapshotSourcePath {
@@ -2375,12 +2427,61 @@ function New-BRAVOVSSVolumeShadow {
     }
 }
 
+
+# #408: прибирає ланцюжок каталогів, які САМ probe створив (від найглибшого
+# до найвищого), зупиняючись на першому непорожньому чи наявному до probe.
+# Виокремлено з Test-BRAVOFileSystemWriteProbe, щоб алгоритм можна було
+# перевірити напряму на реальних порожніх каталогах, без симуляції збою
+# файлової системи. Той самий алгоритм, що вже проведений у production
+# через BRAVO_DRY_RUN.ps1 (Test-BRAVOFileSystemWriteAccess).
+function Remove-BRAVOWriteProbeCreatedChain {
+    param([AllowNull()][System.Collections.Generic.List[string]]$Chain)
+
+    if ($null -eq $Chain) { return }
+    foreach ($createdItem in $Chain) {
+        if (-not (Test-Path -LiteralPath $createdItem -PathType Container)) {
+            continue
+        }
+        $remainingItems = @(Get-ChildItem -LiteralPath $createdItem -Force -ErrorAction SilentlyContinue)
+        if ($remainingItems.Count -ne 0) {
+            break
+        }
+        try {
+            Remove-Item -LiteralPath $createdItem -Force -ErrorAction Stop
+        } catch {
+            # Не критично для результату probe: сам доступ уже перевірено
+            # (успішно або ні); неможливість прибрати порожній каталог після
+            # себе — залишковий побічний ефект, не провал перевірки прав.
+            break
+        }
+    }
+}
+
 function Test-BRAVOFileSystemWriteProbe {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $probePath = $null
+    # #408: ланцюжок каталогів, яких не існувало ДО цього виклику і які
+    # створив САМЕ ВІН (New-Item -Force створює й відсутніх предків —
+    # probe на <Dest>\.work при відсутньому <Dest> створює обидва). Якщо
+    # сам probe провалиться ПІСЛЯ їхнього створення (запис/читання-назад),
+    # їх треба прибрати — інакше зупинка прогону на preflight лишає на
+    # диску порожні каталоги без жодного архіву. На успіху ланцюжок
+    # лишається: для звичайного прогону ці каталоги одразу потрібні.
+    $createdChain = New-Object System.Collections.Generic.List[string]
     try {
         if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            $chainCursor = $Path
+            try {
+                while (-not [string]::IsNullOrEmpty($chainCursor) -and -not (Test-Path -LiteralPath $chainCursor)) {
+                    $createdChain.Add($chainCursor)
+                    $chainCursor = [IO.Path]::GetDirectoryName($chainCursor)
+                }
+            } catch {
+                # Недоступний предок (напр. UNC без мережі): ланцюжок лишається
+                # тим, що вже зібрано — прибирання на провалі не вийде за його
+                # межі, але принаймні прибере те, що точно зібрано.
+            }
             [void](New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop)
         }
         $probePath = Join-Path $Path ('.bravo_write_probe_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
@@ -2404,6 +2505,25 @@ function Test-BRAVOFileSystemWriteProbe {
         }
         return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null }
     } catch {
+        # Review (P1): catch виконується ПОВНІСТЮ до finally (порядок
+        # PowerShell), тож видалення probe-файлу МАЄ статись тут, ДО
+        # прибирання ланцюжка каталогів — інакше Remove-BRAVOWriteProbeCreatedChain
+        # бачила б probe-файл ще присутнім у $Path (напр. на провалі
+        # read-back ПІСЛЯ успішного запису) і зупинялась би одразу, вважаючи
+        # $Path непорожнім, лишаючи ввесь ланцюжок на диску — саме дефект,
+        # який ця проба мала усунути.
+        if (-not [string]::IsNullOrWhiteSpace($probePath) -and
+            [IO.File]::Exists($probePath)) {
+            try {
+                [IO.File]::Delete($probePath)
+            } catch {
+                # Best-effort; якщо видалення теж не вдалось, прибирання
+                # ланцюжка нижче все одно зупиниться на непорожньому $Path —
+                # той самий безпечний fallback, що для будь-якого стороннього
+                # вмісту.
+            }
+        }
+        Remove-BRAVOWriteProbeCreatedChain -Chain $createdChain
         return [pscustomobject]@{ Success = $false; Path = $Path; Error = $_.Exception.Message }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($probePath) -and
@@ -3521,12 +3641,17 @@ function New-Archive {
         if ($showSevenZipProgress) {
             Show-RunningProgress -Id $sevenZipProgressId -Activity $progressActivity -Completed
         }
-        $lastSevenZipOutput = @($standardOutput -split "\r?\n" | Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_)
-        } | Select-Object -Last 1)
-
         if ($archiveTimedOut) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiвацiю перервано: перевищено таймаут $archiveTimeoutSeconds сек.: $displayName" -Level "ERROR"
+            # 878dd86 логував діагностику 7-Zip і на шляху таймауту; разом
+            # з рештою її прибрав ce4855d. Вивід убитого процесу — єдиний
+            # доказ того, на чому саме він завис; якщо потоки порожні, це
+            # теж тепер видно явно.
+            Write-SevenZipFailureDiagnostics `
+                -Operation "Дiагностика 7-Zip create" `
+                -StandardOutput $standardOutput `
+                -StandardError $errorOutput `
+                -EmptyOutputReason "перевищено таймаут $archiveTimeoutSeconds сек. (процес завершено примусово)"
             if (Test-Path -LiteralPath $fullArchivePath -PathType Leaf) {
                 Remove-Item -LiteralPath $fullArchivePath -Force -ErrorAction SilentlyContinue
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Неповний архiв видалено: $fullArchivePath" -Level "WARNING"
@@ -3578,17 +3703,24 @@ function New-Archive {
         } else {
             $toolExitInfo = Get-BRAVOToolExitCodeDescription -Tool '7-Zip' -ExitCode $process.ExitCode
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї 7-Zip (код: $($process.ExitCode) — $($toolExitInfo.OperatorDescription)): $fullArchivePath" -Level "ERROR"
-            Write-SevenZipFailureDiagnostics -Operation "Дiагностика 7-Zip create" -StandardOutput $standardOutput -StandardError $errorOutput
-            if ($showSevenZipProgress) {
-                if (-not [string]::IsNullOrWhiteSpace($lastSevenZipOutput)) {
-                    Write-BRAVOLog -Component 'ARCHIVE' -Message "Останнiй вивiд 7-Zip: $lastSevenZipOutput" -Level "DEBUG"
-                }
-                if (-not [string]::IsNullOrWhiteSpace($errorOutput)) {
-                    Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка 7-Zip: $errorOutput" -Level "DEBUG"
-                }
-            } else {
-                Write-BRAVOLog -Component 'ARCHIVE' -Message "Деталi: $errorOutput" -Level "DEBUG"
-            }
+            # Звичайний (не timeout) збій створення — найчастіша форма
+            # production-збою, тож діагностика мусить бути й тут, а не лише в
+            # timeout-гілці вище (та гілка повертає раніше і сюди не доходить).
+            Write-SevenZipFailureDiagnostics `
+                -Operation "Дiагностика 7-Zip create" `
+                -StandardOutput $standardOutput `
+                -StandardError $errorOutput `
+                -EmptyOutputReason ("7-Zip завершився з кодом {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription)
+            # Це ЄДИНИЙ запис діагностики на цьому шляху. Три попередні рядки
+            # ("Останнiй вивiд 7-Zip", "Помилка 7-Zip", "Деталi") прибрано:
+            # вони дублювали той самий $standardOutput / $errorOutput на рівні
+            # DEBUG, тобто при канонічному FileLevel=INFO не доходили ні до
+            # файлу, ні до консолі, і водночас суперечили інваріанту
+            # Write-BRAVOSevenZipFailureDiagnostics («НІКОЛИ не пише на
+            # DEBUG»). Разом із ними прибрано й обчислення
+            # $lastSevenZipOutput — це був останній непорожній рядок
+            # $standardOutput, тобто підмножина того, що виклик вище вже
+            # отримує цілим потоком; інших читачів у змінної не було.
             $script:lastArchiveToolFailure = [pscustomobject]@{
                 Tool = '7-Zip'
                 ToolExitCodeText = "{0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
@@ -4030,6 +4162,11 @@ function Test-SFTPConfig {
     }
     if ([string]::IsNullOrWhiteSpace($sftpHostKey)) {
         $configurationErrors += "не встановлено SFTP host key"
+    } else {
+        $hostKeyCheck = Test-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
+        if (-not $hostKeyCheck.IsValid) {
+            $configurationErrors += [string]$hostKeyCheck.Message
+        }
     }
     if ([string]::IsNullOrWhiteSpace($winSCPPath) -or -not (Test-Path -Path $winSCPPath -PathType Leaf)) {
         $configurationErrors += "не знайдено WinSCP: $winSCPPath"
@@ -4333,11 +4470,17 @@ function Test-SFTPConnection {
         Write-BRAVOLog -Component 'SFTP' -Message "WinSCP не знайдено: $WinSCPPath" -Level "ERROR"
         return $false
     }
+    try {
+        $HostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "SFTP host key відхилено, перевірку підключення скасовано: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
     
     $testCommand = @"
 option batch abort
 option confirm off
-open $RepositorySFTPUrl -hostkey=$HostKey -timeout=$sftpConnectionTimeoutSeconds
+open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 ls
 exit
 "@
@@ -4472,7 +4615,7 @@ function Get-BAZASFTPComparison {
 
         $sessionOptions = New-Object WinSCP.SessionOptions
         $sessionOptions.ParseUrl($RepositorySFTPUrl)
-        $sessionOptions.SshHostKeyFingerprint = ([string]$HostKey).Trim().Trim('"')
+        $sessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
         $sessionOptions.Timeout = [timespan]::FromSeconds(
             [math]::Max(1, [int]$sftpConnectionTimeoutSeconds)
         )
@@ -5051,7 +5194,7 @@ function Send-BAZAIncompatibleNameAlert {
             -LogLabel "Повний перелік"
 
             try {
-                $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message
+                $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message -OmittedContext "WARNING"
                 Send-BRAVONotificationChunks `
                     -Provider $script:notificationProvider `
                     -WebhookUrl $notificationWebhookUrl `
@@ -5070,7 +5213,7 @@ function Send-BAZAIncompatibleNameAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -5169,11 +5312,18 @@ function Initialize-BRAVOSFTPRemoteDirectories {
 
     Write-BRAVOLog -Component 'SFTP' -Message "Перевiрка/створення потрiбних каталогiв на SFTP: $($orderedDirectories -join ', ')"
 
+    try {
+        $HostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "SFTP host key відхилено, створення каталогів скасовано: $($_.Exception.Message)" -Level "ERROR"
+        return
+    }
+
     $mkdirCommands = ($orderedDirectories | ForEach-Object { "mkdir `"$_`"" }) -join [Environment]::NewLine
     $winscpCommand = @"
 option batch continue
 option confirm off
-open $RepositorySFTPUrl -hostkey=$HostKey -timeout=$sftpConnectionTimeoutSeconds
+open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 $mkdirCommands
 exit
 "@
@@ -5244,11 +5394,18 @@ function Send-FileViaWinSCP {
         return $false
     }
     
+    try {
+        $HostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "SFTP host key відхилено, передачу файлу скасовано: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+
     # Створюємо тимчасовий скрипт для WinSCP
     $winscpCommand = @"
 option batch abort
 option confirm off
-open $RepositorySFTPUrl -hostkey=$HostKey -timeout=$sftpConnectionTimeoutSeconds
+open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 cd /$RemoteDirectory
 put "$LocalFilePath"
 exit
@@ -5405,6 +5562,13 @@ function Sync-FolderToSFTP {
         return $false
     }
 
+    try {
+        $HostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "SFTP host key відхилено, синхронізацію скасовано: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+
     $fileNameUtf8Limit = if (
         [string]$sftpSynchronizationOptions -match '(?i)(^|\s)-resumesupport=on(\s|$)'
     ) {
@@ -5438,7 +5602,7 @@ function Sync-FolderToSFTP {
     # stat однозначно перевіряє каталог і не створює хибної помилки.
     $winscpCommand = @"
 option confirm off
-open $RepositorySFTPUrl -hostkey=$HostKey -timeout=$sftpConnectionTimeoutSeconds
+open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 option batch abort
 stat "$remotePath"
 option batch continue
@@ -5943,7 +6107,7 @@ function Invoke-ManualBAZASFTPSynchronization {
         Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю BAZA_APP / BAZA_WWW зупинено через помилки конфiгурацiї SFTP" -Level "ERROR"
         $manualResults.SFTPConnection.Success = $false
         $manualResults.SFTPConnection.Error = 'SFTP configuration invalid'
-        return [pscustomobject]@{ Success = $false; Results = $manualResults }
+        return [pscustomobject]@{ Success = $false; ConfigurationInvalid = $true; Results = $manualResults }
     }
 
     Show-ScriptProgress -Status "Перевiрка з'єднання з SFTP" -PercentComplete 35
@@ -7134,7 +7298,7 @@ function Main {
         Write-Log "Тривалiсть: $($manualSyncDuration.ToString($durationFormat))" -NoTimestamp
         Write-Log "Лог-файл: $logFile" -NoTimestamp
         # -SyncBAZA — це суто SFTP-операція за визначенням.
-        $script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count
+        $script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count -InvalidConfiguration ([bool]($manualSyncResult.PSObject.Properties['ConfigurationInvalid'] -and $manualSyncResult.ConfigurationInvalid))
         # #292: фінальна Operations-подія -SyncBAZA несе режим і статус
         # канонічного двигуна по кожному компоненту (MUTATION_VIOLATION,
         # REMOTE_CONFLICT, AUDIT_DRIFT, INCOMPATIBLE_NAME ...), а не лише код.
@@ -9486,6 +9650,7 @@ function Invoke-BRAVOArchiveOwnLogUpload {
         }
         if ([string]::IsNullOrWhiteSpace($sftpUrl) -or
             [string]::IsNullOrWhiteSpace($sftpHostKey) -or
+            -not (Test-BRAVOSshHostKeyFingerprint -Value $sftpHostKey).IsValid -or
             [string]::IsNullOrWhiteSpace($winSCPPath) -or
             -not (Test-Path -LiteralPath $script:logFile -PathType Leaf)) {
             Write-BRAVOLog -Component 'SFTP' -Message "Власний лог: SFTP-конфігурація неповна або лог відсутній — вивантаження пропущено" -Level "WARNING"
@@ -9580,7 +9745,7 @@ function Send-BRAVOArchiveFinalOperationsEvent {
         $finalOperationsSettings = $operationsReportingSettings
         if ($null -eq $finalOperationsSettings) { return }
         if (-not (Test-Path -LiteralPath 'Variable:credentialSettings')) { return }
-        if (-not (Get-Command -Name 'Send-BRAVOOperationsEvent' -ErrorAction SilentlyContinue)) { return }
+        if (-not (Get-Command -Name 'Send-BRAVOOperationsEventSafely' -ErrorAction SilentlyContinue)) { return }
         if (-not (Get-Command -Name 'Get-BRAVOExitCodeSeverity' -ErrorAction SilentlyContinue)) { return }
 
         $finalExitCode = [int]$script:processExitCode
@@ -9605,7 +9770,7 @@ function Send-BRAVOArchiveFinalOperationsEvent {
         $finalDetails['exitCode'] = $finalExitCode
         $finalDetails['exitCodeName'] = [string]$finalExitCodeName
 
-        Send-BRAVOOperationsEvent `
+        Send-BRAVOOperationsEventSafely `
             -OperationsReportingSettings $finalOperationsSettings `
             -CredentialTargets $credentialSettings.Targets `
             -InstitutionCode $finalInstitutionCode `

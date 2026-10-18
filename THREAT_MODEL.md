@@ -126,6 +126,19 @@ toolkit: на SFTP вони вивантажуються лише зашифро
 stdin; без пароля блок Trace не виконується), тому маскування `Protect-BRAVOLogSecret` до них
 свідомо не застосовується (#417).
 
+**Межа довіри: Slack/Discord і Operations (#481).** Сторонні сервіси
+(Slack, Discord, BSYSTEM Operations) — зовнішня довірена зона: усе, що
+туди надіслано, лишає контроль сервера (історія каналів, інтеграції,
+пересилання). Тому текст сповіщень, події Operations і алерти Maintenance
+проходять єдиний egress-шар (`Protect-BRAVOEgressText`, `SECURITY.md`
+розділ 3): маскування ДО обрізання, джерело секретів реєструє кожен
+runtime, а коли маскування неможливе — fail-closed заглушка замість
+тексту. Локальний outbox Operations зберігає лише замасковану копію.
+Залишковий ризик: застарілі файли outbox (до #481) містять сирий payload
+у `%ProgramData%\BRAVO\State\Outbox` (каталог стану під захищеним DACL
+інсталятора: SYSTEM, Administrators, обліковий запис завдань, без `Users`;
+окремого шифрування немає), доки не будуть доставлені чи видалені.
+
 Читання з Credential Manager повертає `SecureString`: декодування йде в
 `char[]` із посимвольним `AppendChar`, обидва масиви зануляються, а
 перетворення в плейнтекст зібрано в одну функцію
@@ -191,7 +204,22 @@ temporary -> create -> `7z t` -> SHA512 -> verify -> final, без overwrite
 призначення — копії йдуть до зловмисника.
 
 **Що реалізовано.** SFTP host key звіряється (`sftpHostKey`), що ловить
-MITM і підміну хоста; connectivity gate перевіряє actual SFTP endpoint,
+MITM і підміну хоста. Формат значення обов'язковий:
+`<тип> <біти> <відбиток>` (наприклад `ssh-ed25519 255 <43 символи
+base64>` або `ssh-rsa 2048 <16 hex-пар через :>`; кілька ключів через `;`;
+префікс `SHA256:` з WinSCP GUI приймається й відсікається автоматично).
+Значення `*`, `acceptnew`/`accept…`, `any`/`none`, порожнє, неповний
+відбиток, керуючі символи (CR/LF/TAB/NUL) та не-ASCII відхиляються
+fail-closed на трьох рівнях: (1) валідатор авторизації `SshHostKeyFingerprint`
+у loader-і для `BRAVO.local.config` (запуск зупиняється з кодом `30`);
+(2) runtime-перевірка в кожному споживачі (Archive, Health, DataRestore,
+BazaSync, Maintenance, `BRAVO_DRY_RUN`, `BRAVO_BAZA_RECONCILE`) через
+`Test-/ConvertTo-BRAVOSshHostKeyFingerprint` — вона ж покриває legacy
+`BRAVO.config`, який валідатор loader-а свідомо не перевіряє; (3) значення
+в WinSCP-скриптах береться у подвійні лапки (`-hostkey="..."`), тому
+пробіл чи перенос рядка не можуть додати параметри або команди (CR/LF
+блокуються ще до цього). Повідомлення про помилку не містить самого значення.
+Connectivity gate перевіряє actual SFTP endpoint,
 а не `google.com` чи generic Internet. Archive upload, BAZA_APP і BAZA_WWW
 мають окремі result states. Health-check перевіряє контрольні суми
 **віддалених** копій, а не лише факт передачі.

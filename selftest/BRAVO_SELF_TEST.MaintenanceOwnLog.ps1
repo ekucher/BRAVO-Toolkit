@@ -515,6 +515,78 @@ Test-BRAVOCondition ($secretMaskPatternMismatches.Count -eq 0) `
     -Name 'Logging/ProtectLogSecretPatternsUnchangedWithoutKnownSecret' `
     -Failure "Protect-BRAVOLogSecret без -KnownSecret має давати рівно ту саму шаблонну масковку, що й до #365; не збіглися очікування: $($secretMaskPatternMismatches -join ' | ')"
 
+# --- (1b) #453: значення в одинарних лапках із пробілом маскуються повністю
+# (не лише до першого пробілу), для всіх трьох шаблонів параметра пароля.
+$secretMaskSingleQuoteCases = @(
+    @{ In = "password='A B'"; Out = 'password=***' },
+    @{ In = "-password='A B'"; Out = '-password=***' },
+    @{ In = " -p'A B'"; Out = ' -p***' }
+)
+$secretMaskSingleQuoteMismatches = New-Object System.Collections.Generic.List[string]
+foreach ($secretMaskCase in $secretMaskSingleQuoteCases) {
+    $secretMaskActual = & $secretMaskProtectOnlyModule { param($t) Protect-BRAVOLogSecret -Text $t } $secretMaskCase.In
+    if ([string]$secretMaskActual -cne [string]$secretMaskCase.Out) {
+        $secretMaskSingleQuoteMismatches.Add("'$($secretMaskCase.In)' -> '$secretMaskActual' (очікувалось '$($secretMaskCase.Out)')")
+    }
+}
+Test-BRAVOCondition ($secretMaskSingleQuoteMismatches.Count -eq 0) `
+    -Name 'Logging/ProtectLogSecretSingleQuotedValueFullyMasked' `
+    -Failure "#453: значення в одинарних лапках із пробілом має маскуватися повністю, а не лише до першого пробілу; розбіжності: $($secretMaskSingleQuoteMismatches -join ' | ')"
+
+# --- (1b-ii) #453 рев'ю (CPR-453-1): межа старту схеми (?<![a-z0-9+.-])
+# не сміє блокувати матч там, де стара (без межі) регулярка його таки
+# знаходила — URL, перед схемою якого стоїть цифра/+/./- без роздільника
+# (напр. у суцільному рядку діагностики), і раніше маскувався.
+$secretMaskUrlBoundaryCases = @(
+    @{ In = '1sftp://u:p@h'; Out = '1sftp://u:***@h' },
+    @{ In = '-sftp://u:p@h'; Out = '-sftp://u:***@h' },
+    @{ In = '.https://u:p@h'; Out = '.https://u:***@h' },
+    @{ In = '+git+ssh://u:p@h'; Out = '+git+ssh://u:***@h' },
+    @{ In = 'remote-https://u:p@h'; Out = 'remote-https://u:***@h' },
+    @{ In = 'x9.http://u:p@h'; Out = 'x9.http://u:***@h' }
+)
+$secretMaskUrlBoundaryMismatches = New-Object System.Collections.Generic.List[string]
+foreach ($secretMaskCase in $secretMaskUrlBoundaryCases) {
+    $secretMaskActual = & $secretMaskProtectOnlyModule { param($t) Protect-BRAVOLogSecret -Text $t } $secretMaskCase.In
+    if ([string]$secretMaskActual -cne [string]$secretMaskCase.Out) {
+        $secretMaskUrlBoundaryMismatches.Add("'$($secretMaskCase.In)' -> '$secretMaskActual' (очікувалось '$($secretMaskCase.Out)')")
+    }
+}
+Test-BRAVOCondition ($secretMaskUrlBoundaryMismatches.Count -eq 0) `
+    -Name 'Logging/ProtectLogSecretUrlPatternMasksNonLetterPrefixedScheme' `
+    -Failure "#453 (CPR-453-1): URL зі схемою, перед якою стоїть цифра/+/./- без роздільника, мусить маскуватися так само, як і без такого префікса; розбіжності: $($secretMaskUrlBoundaryMismatches -join ' | ')"
+
+# --- (1b-iii) #453 рев'ю (CPR-453-2): текст, приклеєний одразу за
+# закриваючою лапкою без пробілу, мусить лишатися замаскованим, а не
+# випливати як хвіст (той самий клас дефекту для обох типів лапок).
+$secretMaskQuoteGlueCases = @(
+    @{ In = "password='abc'def"; Out = 'password=***' },
+    @{ In = 'password="abc"def'; Out = 'password=***' },
+    @{ In = "-password='abc'def ok"; Out = '-password=*** ok' }
+)
+$secretMaskQuoteGlueMismatches = New-Object System.Collections.Generic.List[string]
+foreach ($secretMaskCase in $secretMaskQuoteGlueCases) {
+    $secretMaskActual = & $secretMaskProtectOnlyModule { param($t) Protect-BRAVOLogSecret -Text $t } $secretMaskCase.In
+    if ([string]$secretMaskActual -cne [string]$secretMaskCase.Out) {
+        $secretMaskQuoteGlueMismatches.Add("'$($secretMaskCase.In)' -> '$secretMaskActual' (очікувалось '$($secretMaskCase.Out)')")
+    }
+}
+Test-BRAVOCondition ($secretMaskQuoteGlueMismatches.Count -eq 0) `
+    -Name 'Logging/ProtectLogSecretQuotedValueGluedSuffixMasked' `
+    -Failure "#453 (CPR-453-2): текст, приклеєний одразу за закриваючою лапкою без пробілу, не сміє лишатися незамаскованим хвостом; розбіжності: $($secretMaskQuoteGlueMismatches -join ' | ')"
+
+# --- (1c) #453: шаблон URL-кредів лишається лінійним на суцільному
+# фрагменті без секретів (раніше — O(L^2), фактичне зависання на >=1 000 000).
+$secretMaskSolidRunText = 'U' * 1000000
+$secretMaskSolidRunStopwatch = [Diagnostics.Stopwatch]::StartNew()
+$secretMaskSolidRunResult = & $secretMaskProtectOnlyModule { param($t) Protect-BRAVOLogSecret -Text $t } $secretMaskSolidRunText
+$secretMaskSolidRunStopwatch.Stop()
+$secretMaskSolidRunSeconds = $secretMaskSolidRunStopwatch.Elapsed.TotalSeconds
+Test-BRAVOCondition (
+    [string]$secretMaskSolidRunResult -ceq $secretMaskSolidRunText -and $secretMaskSolidRunSeconds -lt 5
+) -Name 'Logging/ProtectLogSecretUrlPatternLinearOnSolidRun' `
+    -Failure "#453: URL-кредів шаблон має опрацювати суцільний фрагмент 1 000 000 символів за прийнятний час (<5с) без зміни тексту без секретів; фактично: $secretMaskSolidRunSeconds с, текст змінено: $([string]$secretMaskSolidRunResult -cne $secretMaskSolidRunText)"
+
 # --- (2) Сирий секрет без keyword-а маскується точним значенням.
 $secretMaskRawResult = $null
 $secretMaskRawError = $secretMaskSetupError
@@ -1558,7 +1630,8 @@ Test-BRAVOCondition (
 
 # JSON-екранування відрізняється між хостами: Windows PowerShell 5.1
 # (JavaScriptSerializer) додатково екранує & < > ' як \u00XX, PowerShell 7
-# — лише " \ і керівні символи. Перевіряються ОБИДВІ форми, побудовані
+# — " \, керівні символи й U+0085/U+2028/U+2029 (окремий тест нижче).
+# Перевіряються ОБИДВІ форми, побудовані
 # детерміновано, і фактичний вивід ConvertTo-Json поточного хоста.
 $secretMaskJsonSecret = $secretMaskEncodedBase.Substring(0, 5) + [char]34 + $secretMaskEncodedBase.Substring(5, 4) + [char]92 + 'c' + [char]38 + 'd' + [char]60 + [char]39 + $secretMaskEncodedBase.Substring(9)
 $secretMaskJsonStrict = $secretMaskJsonSecret.Replace([string][char]92, '\\').Replace([string][char]34, '\"')
@@ -1580,6 +1653,98 @@ Test-BRAVOCondition (
     [string]$secretMaskJsonResult -ceq '{"k":"***","h":"***","n":"***"}'
 ) -Name 'Logging/KnownSecretJsonEscapedFormMasked' `
     -Failure "JSON-екранована форма відомого секрету (обидва варіанти ConvertTo-Json: PS 5.1 і PS 7) має маскуватись (очікується '{`"k`":`"***`",`"h`":`"***`",`"n`":`"***`"}'); лишились форми: strict=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonStrict)) html=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonHtmlSafe)) native=$(([string]$secretMaskJsonResult).Contains($secretMaskJsonNative)); помилка: $secretMaskJsonError"
+
+# #435: строга JSON-форма (PowerShell 7, Newtonsoft.Json) екранує також
+# U+0085, U+2028 і U+2029 як \u + 4 hex у нижньому регістрі. Секрет із
+# кожним із цих символів має маскуватись і в такій формі, і у фактичному
+# виводі ConvertTo-Json поточного хоста. Символи — лише з кодів, значення
+# будуються під час запуску.
+$secretMaskJsonLineSecrets = New-Object 'System.Collections.Generic.List[string]'
+$secretMaskJsonLineEscaped = New-Object 'System.Collections.Generic.List[string]'
+$secretMaskJsonLineNative = New-Object 'System.Collections.Generic.List[string]'
+foreach ($secretMaskJsonLineCode in @(0x0085, 0x2028, 0x2029)) {
+    $secretMaskJsonLineBase = $secretMaskNewValue.Invoke('Ln' + $secretMaskJsonLineCode.ToString('x4'))[0]
+    $secretMaskJsonLineSecret = $secretMaskJsonLineBase.Substring(0, 6) + [string][char]$secretMaskJsonLineCode + $secretMaskJsonLineBase.Substring(6)
+    $secretMaskJsonLineSecrets.Add($secretMaskJsonLineSecret)
+    $secretMaskJsonLineEscaped.Add($secretMaskJsonLineSecret.Replace([string][char]$secretMaskJsonLineCode, ([string][char]92 + 'u' + $secretMaskJsonLineCode.ToString('x4'))))
+    $secretMaskJsonLineNativeText = [string]($secretMaskJsonLineSecret | ConvertTo-Json -Compress)
+    $secretMaskJsonLineNative.Add($secretMaskJsonLineNativeText.Substring(1, $secretMaskJsonLineNativeText.Length - 2))
+}
+$secretMaskJsonLineText = ''
+for ($secretMaskJsonLineIndex = 0; $secretMaskJsonLineIndex -lt $secretMaskJsonLineSecrets.Count; $secretMaskJsonLineIndex++) {
+    $secretMaskJsonLineText += '{"k":"' + $secretMaskJsonLineEscaped[$secretMaskJsonLineIndex] + '","n":"' + $secretMaskJsonLineNative[$secretMaskJsonLineIndex] + '"} '
+}
+$secretMaskJsonLineResult = $null
+$secretMaskJsonLineError = $secretMaskSetupError
+if ($null -ne $secretMaskModule) {
+    try {
+        $secretMaskJsonLineResult = & $secretMaskModule {
+            param($text, $secrets)
+            Protect-BRAVOLogSecret -Text $text -KnownSecret $secrets
+        } $secretMaskJsonLineText $secretMaskJsonLineSecrets.ToArray()
+    } catch { $secretMaskJsonLineError = $_.Exception.GetType().FullName }
+}
+$secretMaskJsonLineLeft = New-Object 'System.Collections.Generic.List[string]'
+for ($secretMaskJsonLineIndex = 0; $secretMaskJsonLineIndex -lt $secretMaskJsonLineSecrets.Count; $secretMaskJsonLineIndex++) {
+    $secretMaskJsonLineLabel = ([int][char]$secretMaskJsonLineSecrets[$secretMaskJsonLineIndex][6]).ToString('X4')
+    if (([string]$secretMaskJsonLineResult).Contains($secretMaskJsonLineEscaped[$secretMaskJsonLineIndex])) { $secretMaskJsonLineLeft.Add("strict:U+$secretMaskJsonLineLabel") }
+    if (([string]$secretMaskJsonLineResult).Contains($secretMaskJsonLineNative[$secretMaskJsonLineIndex])) { $secretMaskJsonLineLeft.Add("native:U+$secretMaskJsonLineLabel") }
+}
+Test-BRAVOCondition (
+    @($secretMaskJsonLineEscaped | Where-Object { $_.IndexOf([string][char]92 + 'u') -lt 0 }).Count -eq 0 -and
+    [string]$secretMaskJsonLineResult -ceq '{"k":"***","n":"***"} {"k":"***","n":"***"} {"k":"***","n":"***"} '
+) -Name 'Logging/KnownSecretJsonEscapedLineSeparatorsMasked' `
+    -Failure "JSON-екранована форма відомого секрету з U+0085/U+2028/U+2029 (\u0085, \u2028, \u2029 — строга форма PS 7) і фактичний вивід ConvertTo-Json поточного хоста мають маскуватись; лишились форми: $(@($secretMaskJsonLineLeft) -join ', '); помилка: $secretMaskJsonLineError"
+
+# #435: HTML-безпечна JSON-форма (Windows PowerShell 5.1,
+# JavaScriptSerializer -> HttpEncoder.JavaScriptStringEncode) екранує
+# водночас і & ' < >, і U+0085/U+2028/U+2029 — обидва як \u + 4 hex у
+# нижньому регістрі. Секрет, що містить HTML-символ І один із цих
+# роздільників, у виводі PS 5.1 не збігається ні зі строгою формою
+# (там HTML-символ сирий), ні з формою, де екрановано лише HTML-символи,
+# — тож ця форма теж має маскуватись, як і фактичний вивід ConvertTo-Json
+# поточного хоста. Символи — лише з кодів, значення будуються під час
+# запуску.
+$secretMaskJsonMixLineCodes = @(0x0085, 0x2028, 0x2029)
+$secretMaskJsonMixHtmlCodes = @(60, 38, 62)
+$secretMaskJsonMixSecrets = New-Object 'System.Collections.Generic.List[string]'
+$secretMaskJsonMixHtmlSafe = New-Object 'System.Collections.Generic.List[string]'
+$secretMaskJsonMixNative = New-Object 'System.Collections.Generic.List[string]'
+for ($secretMaskJsonMixIndex = 0; $secretMaskJsonMixIndex -lt $secretMaskJsonMixLineCodes.Count; $secretMaskJsonMixIndex++) {
+    $secretMaskJsonMixLineCode = [int]$secretMaskJsonMixLineCodes[$secretMaskJsonMixIndex]
+    $secretMaskJsonMixHtmlCode = [int]$secretMaskJsonMixHtmlCodes[$secretMaskJsonMixIndex]
+    $secretMaskJsonMixBase = $secretMaskNewValue.Invoke('Mx' + $secretMaskJsonMixLineCode.ToString('x4'))[0]
+    $secretMaskJsonMixSecret = $secretMaskJsonMixBase.Substring(0, 5) + [string][char]$secretMaskJsonMixHtmlCode + $secretMaskJsonMixBase.Substring(5, 3) + [string][char]34 + $secretMaskJsonMixBase.Substring(8, 2) + [string][char]$secretMaskJsonMixLineCode + $secretMaskJsonMixBase.Substring(10)
+    $secretMaskJsonMixSecrets.Add($secretMaskJsonMixSecret)
+    $secretMaskJsonMixHtmlSafe.Add($secretMaskJsonMixSecret.Replace([string][char]92, '\\').Replace([string][char]34, '\"').Replace([string][char]$secretMaskJsonMixHtmlCode, ([string][char]92 + 'u' + $secretMaskJsonMixHtmlCode.ToString('x4'))).Replace([string][char]$secretMaskJsonMixLineCode, ([string][char]92 + 'u' + $secretMaskJsonMixLineCode.ToString('x4'))))
+    $secretMaskJsonMixNativeText = [string]($secretMaskJsonMixSecret | ConvertTo-Json -Compress)
+    $secretMaskJsonMixNative.Add($secretMaskJsonMixNativeText.Substring(1, $secretMaskJsonMixNativeText.Length - 2))
+}
+$secretMaskJsonMixText = ''
+for ($secretMaskJsonMixIndex = 0; $secretMaskJsonMixIndex -lt $secretMaskJsonMixSecrets.Count; $secretMaskJsonMixIndex++) {
+    $secretMaskJsonMixText += '{"h":"' + $secretMaskJsonMixHtmlSafe[$secretMaskJsonMixIndex] + '","n":"' + $secretMaskJsonMixNative[$secretMaskJsonMixIndex] + '"} '
+}
+$secretMaskJsonMixResult = $null
+$secretMaskJsonMixError = $secretMaskSetupError
+if ($null -ne $secretMaskModule) {
+    try {
+        $secretMaskJsonMixResult = & $secretMaskModule {
+            param($text, $secrets)
+            Protect-BRAVOLogSecret -Text $text -KnownSecret $secrets
+        } $secretMaskJsonMixText $secretMaskJsonMixSecrets.ToArray()
+    } catch { $secretMaskJsonMixError = $_.Exception.GetType().FullName }
+}
+$secretMaskJsonMixLeft = New-Object 'System.Collections.Generic.List[string]'
+for ($secretMaskJsonMixIndex = 0; $secretMaskJsonMixIndex -lt $secretMaskJsonMixSecrets.Count; $secretMaskJsonMixIndex++) {
+    $secretMaskJsonMixLabel = ([int]$secretMaskJsonMixLineCodes[$secretMaskJsonMixIndex]).ToString('X4') + '+' + ([int]$secretMaskJsonMixHtmlCodes[$secretMaskJsonMixIndex]).ToString('X4')
+    if (([string]$secretMaskJsonMixResult).Contains($secretMaskJsonMixHtmlSafe[$secretMaskJsonMixIndex])) { $secretMaskJsonMixLeft.Add("html:U+$secretMaskJsonMixLabel") }
+    if (([string]$secretMaskJsonMixResult).Contains($secretMaskJsonMixNative[$secretMaskJsonMixIndex])) { $secretMaskJsonMixLeft.Add("native:U+$secretMaskJsonMixLabel") }
+}
+Test-BRAVOCondition (
+    @($secretMaskJsonMixHtmlSafe | Where-Object { ([regex]::Matches($_, '\\u[0-9a-f]{4}')).Count -ne 2 }).Count -eq 0 -and
+    [string]$secretMaskJsonMixResult -ceq '{"h":"***","n":"***"} {"h":"***","n":"***"} {"h":"***","n":"***"} '
+) -Name 'Logging/KnownSecretJsonEscapedHtmlAndSeparatorMasked' `
+    -Failure "HTML-безпечна JSON-форма відомого секрету з HTML-символом (< & >) і U+0085/U+2028/U+2029 (обидва екрановані як \u + 4 hex — форма PS 5.1) і фактичний вивід ConvertTo-Json поточного хоста мають маскуватись; лишились форми: $(@($secretMaskJsonMixLeft) -join ', '); помилка: $secretMaskJsonMixError"
 
 # Регресія: секрет без спецсимволів (закодовані форми збігаються з сирою)
 # маскується рівно як раніше — одне *** на входження, без *** поруч
@@ -1622,6 +1787,12 @@ Remove-Item -LiteralPath $secretMaskTestRoot -Recurse -Force -ErrorAction Silent
 # Передача таблиці цілком (-CredentialTargets $credentialSettings.Targets
 # для BRAVO.Notifications) і перелік її властивостей (.PSObject) — не
 # читання ключа й не порушення.
+# #435: таблицею вважається й змінна-псевдонім, якій присвоєно таблицю
+# ($t = $credentialSettings.Targets, також через [тип], (...), ланцюжок
+# псевдонімів і ланцюжок присвоєнь $t = $u = ... / $t = ($u = ...);
+# обсяг — увесь файл, без урахування областей видимості, тож детектор
+# радше перестрахується). Читання ключа через
+# <таблиця>.PSObject.Properties['X'] / .Item('X') — теж порушення.
 $targetsGuardFindHits = {
     param([string]$SourceText)
     $hits = New-Object System.Collections.Generic.List[int]
@@ -1629,8 +1800,39 @@ $targetsGuardFindHits = {
     $guardErrors = $null
     $guardAst = [System.Management.Automation.Language.Parser]::ParseInput($SourceText, [ref]$guardTokens, [ref]$guardErrors)
     if (@($guardErrors).Count -gt 0) { throw "файл не розбирається ($(@($guardErrors).Count) помилок)" }
+    $aliasNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $getVariableName = {
+        param($variableNode)
+        return (([string]$variableNode.VariablePath.UserPath) -ireplace '^(global|script|local|private):', '')
+    }
+    $unwrapExpression = {
+        param($node)
+        while ($null -ne $node) {
+            # Ланцюжок присвоєнь ($t = $u = X, $t = ($u = X)): значення —
+            # права частина вкладеного присвоєння.
+            if ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) { $node = $node.Right; continue }
+            if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) { $node = $node.Child; continue }
+            if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) { $node = $node.Pipeline; continue }
+            if ($node -is [System.Management.Automation.Language.PipelineAst]) {
+                if (@($node.PipelineElements).Count -ne 1) { break }
+                $node = $node.PipelineElements[0]
+                continue
+            }
+            if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                if (@($node.Redirections).Count -gt 0) { break }
+                $node = $node.Expression
+                continue
+            }
+            break
+        }
+        return $node
+    }
     $isTargetsTable = {
         param($node)
+        $node = & $unwrapExpression $node
+        if ($node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            return $aliasNames.Contains((& $getVariableName $node))
+        }
         if ($node -isnot [System.Management.Automation.Language.MemberExpressionAst]) { return $false }
         if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return $false }
         if ($node.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
@@ -1638,11 +1840,43 @@ $targetsGuardFindHits = {
         if ($node.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
         return ([string]$node.Expression.VariablePath.UserPath -imatch '^((global|script):)?credentialSettings$')
     }
+    $isNamedMember = {
+        param($node, [string]$MemberName)
+        if ($node -isnot [System.Management.Automation.Language.MemberExpressionAst]) { return $false }
+        if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return $false }
+        if ($node.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+        return ([string]$node.Member.Value -ieq $MemberName)
+    }
+    # <таблиця>.PSObject.Properties — колекція властивостей таблиці.
+    $isTargetsPropertyCollection = {
+        param($node)
+        if (-not (& $isNamedMember $node 'Properties')) { return $false }
+        if (-not (& $isNamedMember $node.Expression 'PSObject')) { return $false }
+        return (& $isTargetsTable $node.Expression.Expression)
+    }
+    # Псевдоніми: до нерухомої точки, щоб ланцюжок $u = $t теж ловився.
+    $assignmentNodes = @($guardAst.FindAll({ param($candidate)
+                $candidate -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
+    $aliasAdded = $true
+    while ($aliasAdded) {
+        $aliasAdded = $false
+        foreach ($assignmentNode in $assignmentNodes) {
+            $assignedNode = & $unwrapExpression $assignmentNode.Left
+            if ($assignedNode -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            if (-not (& $isTargetsTable $assignmentNode.Right)) { continue }
+            if ($aliasNames.Add((& $getVariableName $assignedNode))) { $aliasAdded = $true }
+        }
+    }
     foreach ($node in @($guardAst.FindAll({ param($candidate)
                     $candidate -is [System.Management.Automation.Language.MemberExpressionAst] -or
                     $candidate -is [System.Management.Automation.Language.IndexExpressionAst] }, $true))) {
         if ($node -is [System.Management.Automation.Language.IndexExpressionAst]) {
-            if (& $isTargetsTable $node.Target) { $hits.Add($node.Extent.StartLineNumber) }
+            if ((& $isTargetsTable $node.Target) -or (& $isTargetsPropertyCollection $node.Target)) { $hits.Add($node.Extent.StartLineNumber) }
+            continue
+        }
+        if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            (& $isTargetsPropertyCollection $node.Expression)) {
+            $hits.Add($node.Extent.StartLineNumber)
             continue
         }
         if (-not (& $isTargetsTable $node.Expression)) { continue }
@@ -1657,13 +1891,30 @@ $targetsGuardFindHits = {
 # детектор (0 знахідок завжди) мовчки дав би PASS.
 $targetsGuardSelfCheckProblems = New-Object System.Collections.Generic.List[string]
 try {
+    # #435: обходи через псевдонім таблиці ($t = ...Targets; $t.X / $t['X'],
+    # зокрема ланцюжок псевдонімів і ланцюжок присвоєнь $v = $w = ...Targets /
+    # $x = ($y = ...Targets)) і через .PSObject.Properties['X'].Value
+    # — теж читання ключа.
     $targetsGuardPositive = @(& $targetsGuardFindHits ('$a = [string]$credentialSettings.Targets.SFTPLogin' + "`n" +
             '$b = $global:credentialSettings.Targets[''SMBLogin'']' + "`n" +
-            '$c = $CredentialSettings.Targets.ArchivePassword'))
-    if ($targetsGuardPositive.Count -ne 3) { $targetsGuardSelfCheckProblems.Add("позитивні зразки: $($targetsGuardPositive.Count) з 3") }
+            '$c = $CredentialSettings.Targets.ArchivePassword' + "`n" +
+            '$t = $credentialSettings.Targets' + "`n" +
+            '$d = $t.SFTPLogin' + "`n" +
+            '$e = $t[''SMBLogin'']' + "`n" +
+            '$u = ($t)' + "`n" +
+            '$f = [string]$u.SFTPPassword' + "`n" +
+            '$g = $credentialSettings.Targets.PSObject.Properties[''ArchivePassword''].Value' + "`n" +
+            '$h = $t.PSObject.Properties[''SMBPassword''].Value' + "`n" +
+            '$v = $w = $credentialSettings.Targets' + "`n" +
+            '$i = $v.SFTPLogin' + "`n" +
+            '$x = ($y = $credentialSettings.Targets)' + "`n" +
+            '$j = $x.SMBLogin'))
+    if ($targetsGuardPositive.Count -ne 10) { $targetsGuardSelfCheckProblems.Add("позитивні зразки: $($targetsGuardPositive.Count) з 10") }
     $targetsGuardNegative = @(& $targetsGuardFindHits ('Send-X -CredentialTargets $credentialSettings.Targets' + "`n" +
             'foreach ($p in $credentialSettings.Targets.PSObject.Properties) { }' + "`n" +
             '$t = $credentialSettings.Targets' + "`n" +
+            'Send-X -CredentialTargets $t' + "`n" +
+            'foreach ($p in $t.PSObject.Properties) { }' + "`n" +
             '$n = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key ''SFTPLogin'''))
     if ($targetsGuardNegative.Count -ne 0) { $targetsGuardSelfCheckProblems.Add("негативні зразки дали знахідки: $($targetsGuardNegative.Count)") }
 } catch {

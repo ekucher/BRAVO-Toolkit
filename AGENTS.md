@@ -64,6 +64,11 @@ Follow it for agent coordination and reporting. It does not override the
 BRAVO-specific engineering, architecture, security, PowerShell 5.1, or release
 rules defined elsewhere in this file and in `.claude/rules/`.
 
+Role-to-model assignment, per-risk-level gate requirements and fallback limits
+are machine-readable in `.claude/ai-routing.json` and enforced by the
+`PreToolUse` hook `.claude/hooks/validate-agent-routing.ps1`. Resolve a role's
+model from that matrix instead of choosing one per task.
+
 ## Rule loading
 
 Detailed engineering rules for domains this repository has split into a
@@ -83,30 +88,61 @@ before editing; always apply the principles in this file regardless.
 - `.claude/rules/powershell.md`
   - `.ps1`, `.psm1`, `.psd1`
 
-For topics this repository has not (yet) split into a dedicated tracked rule
-file, the authoritative guidance lives inline in this document instead:
+- `.claude/rules/00-workflow.md`
+  - workflow, non-trivial implementation, debugging, refactoring, or analysis
+  - inline summary: "Before changing anything" above
 
-- workflow, non-trivial implementation, debugging, refactoring, or analysis
-  -> "Before changing anything" above
-- change safety, editing existing files, or handling uncommitted changes
-  -> "Change discipline" below
-- Git, commits, branches, staging, history, pull requests, tags, releases
-  -> "Git" below
-- authentication, authorization, external input, networking, filesystem
-  access, shell execution, secrets, public endpoints, privileged code
-  -> "Security" below
-- any code change that can be tested or built -> "Validation" below
-- BRAVO runtime safety behavior (Archive, DataRestore, Maintenance, Health,
-  BazaSync, Scheduler, System, Credentials, configuration/state
-  compatibility, SFTP, service ownership, restore safety, or runtime/tool
-  integrity) -> `BRAVO_AGENT_POLICY.md` and "Non-negotiable repository
-  invariants" below
+- `.claude/rules/01-change-safety.md`
+  - change safety, editing existing files, or handling uncommitted changes
+  - inline summary: "Change discipline" below
 
-Do not claim a dedicated rule file exists for shell scripting, Docker,
-databases, PHP, Python, or config/YAML handling unless one is actually
-tracked under `.claude/rules/` -- none is today. If work in one of those
-areas needs a durable rule, add it to `.claude/rules/` first, then reference
-it here; do not invent an untracked path.
+- `.claude/rules/02-git.md`
+  - Git, commits, branches, staging, history, pull requests, tags, releases
+  - inline summary: "Git" below
+
+- `.claude/rules/03-security.md`
+  - authentication, authorization, external input, networking, filesystem
+    access, shell execution, secrets, public endpoints, privileged code
+  - inline summary: "Security" below
+
+- `.claude/rules/04-testing-validation.md`
+  - any code change that can be tested or built
+  - inline summary: "Validation" below
+
+- `.claude/rules/07-bravo-runtime-invariants.md`
+  - BRAVO runtime safety behavior: Archive, DataRestore, Maintenance, Health,
+    BazaSync, Scheduler, System, Credentials, configuration/state
+    compatibility, SFTP, service ownership, restore safety, runtime/tool
+    integrity
+  - read together with `BRAVO_AGENT_POLICY.md` and "Non-negotiable repository
+    invariants" below
+
+- `.claude/rules/08-documentation-language.md`
+  - README, CHANGELOG, `docs/`, operator runbooks, architecture notes,
+    documentation comments, PR/issue text acting as project documentation
+
+- `.claude/rules/owner-escalation.md`
+  - deciding whether to continue autonomously or stop for an owner decision
+
+Language- and stack-specific rule files, loaded only when the change actually
+touches that stack:
+
+- `.claude/rules/shell.md` -- `.sh`, `.bash`
+- `.claude/rules/php.md` -- `.php`
+- `.claude/rules/python.md` -- `.py`
+- `.claude/rules/docker.md` -- `Dockerfile`, `docker-compose.*`
+- `.claude/rules/database.md` -- schema, migrations, queries
+- `.claude/rules/config-and-yaml.md` -- `.yml`, `.yaml`, `.ini`, `.toml`,
+  structured configuration files
+
+Where both an inline section and a rule file cover the same topic, the inline
+section is the short form and the rule file is the detailed policy; they are
+not independent sources of truth. If they ever disagree, that is a defect to
+report, not a choice to make.
+
+Do not reference a rule path that is not actually tracked under
+`.claude/rules/`. If work needs a durable rule for a topic without one, add
+the file first, then reference it here; do not invent an untracked path.
 
 Do not load every rule file mechanically.
 

@@ -1,0 +1,220 @@
+﻿{
+  "schemaVersion": 1,
+  "description": "Canonical role/model routing matrix for ekucher/BRAVO-Toolkit. Normative agent-orchestration rules live in BRAVO_AGENT_POLICY.md; this file is the machine-readable source of truth for role-to-model assignment, risk-level gates and fallback limits. Operator documentation: docs/ai/MODEL_ROUTING_POLICY.md.",
+  "roles": {
+    "lead": {
+      "model": "inherit",
+      "write": true,
+      "gateCritical": false,
+      "mainSessionOnly": true,
+      "purpose": "Lead/Orchestrator: runs only as the main session (claude --agent lead); plans, classifies risk, dispatches bounded packages, verifies HANDOFFs; never dispatched through the Agent tool",
+      "mainSessionOnlyNote": "BRAVO_AGENT_POLICY.md section 8 makes the main session the orchestrator and keeps all dispatch/A2A routing there. 'inherit' means the owner's selected model. The PreToolUse hook denies Agent calls with subagent_type 'lead' so orchestration cannot be nested."
+    },
+    "scout": {
+      "model": "haiku",
+      "write": false,
+      "gateCritical": false,
+      "purpose": "read-only context gathering"
+    },
+    "worker": {
+      "model": "sonnet",
+      "write": true,
+      "gateCritical": false,
+      "purpose": "bounded implementation inside assigned SCOPE",
+      "writeDenyNote": "No writeAllow: an implementer writes code, so its real boundary is the task SCOPE, which the hook cannot see at write time. These denies are the subset that holds regardless of any brief.",
+      "writeDeny": [
+        "docs/*ACCEPTANCE*",
+        "docs/*RUNBOOK*",
+        "docs/*EVIDENCE*",
+        "docs/*DISPOSITION*",
+        "BRAVO_AGENT_POLICY.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".claude/*",
+        "*MANIFEST*.json",
+        "*INTEGRITY*.json"
+      ]
+    },
+    "tester": {
+      "model": "sonnet",
+      "write": true,
+      "gateCritical": false,
+      "purpose": "test authoring inside assigned SCOPE; never production code",
+      "writeDenyNote": "Same reasoning as worker.",
+      "writeDeny": [
+        "docs/*ACCEPTANCE*",
+        "docs/*RUNBOOK*",
+        "docs/*EVIDENCE*",
+        "docs/*DISPOSITION*",
+        "BRAVO_AGENT_POLICY.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".claude/*",
+        "*MANIFEST*.json",
+        "*INTEGRITY*.json"
+      ]
+    },
+    "documentation": {
+      "model": "sonnet",
+      "write": true,
+      "gateCritical": false,
+      "purpose": "audits code-vs-documentation drift always; writes documentation only under an explicit SCOPE",
+      "writeAllow": [
+        "README.md",
+        "CHANGELOG.md",
+        "docs",
+        "docs/*"
+      ],
+      "writeDeny": [
+        "docs/*ACCEPTANCE*",
+        "docs/*RUNBOOK*",
+        "docs/*EVIDENCE*",
+        "docs/*DISPOSITION*",
+        "BRAVO_AGENT_POLICY.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".claude/*",
+        "ci/*",
+        "*.ps1",
+        "*.psm1",
+        "*.psd1",
+        "*MANIFEST*.json",
+        "*INTEGRITY*.json",
+        "VERSION.json"
+      ]
+    },
+    "reviewer": {
+      "model": "opus",
+      "write": false,
+      "gateCritical": true,
+      "purpose": "fresh Claude internal pre-review, or temporary QA fallback under BRAVO_AGENT_POLICY.md section 8.2"
+    },
+    "architect": {
+      "model": "opus",
+      "write": false,
+      "gateCritical": true,
+      "purpose": "design and architectural risk analysis; never closes the formal Codex architecture gate"
+    },
+    "security-reviewer": {
+      "model": "opus",
+      "write": false,
+      "gateCritical": true,
+      "purpose": "internal security pre-review; never closes the formal Codex security gate"
+    }
+  },
+  "riskLevels": {
+    "LOW": {
+      "examples": "documentation, search, analytics, simple reports",
+      "requiredRoles": [],
+      "requiredGates": [],
+      "codexRequired": false
+    },
+    "MEDIUM": {
+      "examples": "local fixes, small features, tests",
+      "requiredRoles": [],
+      "requiredGates": [
+        "codex-qa"
+      ],
+      "codexRequired": true
+    },
+    "HIGH": {
+      "examples": "cross-module contracts, configuration, installer, significant behavior change",
+      "requiredRoles": [
+        "architect"
+      ],
+      "requiredGates": [
+        "codex-qa",
+        "codex-architecture"
+      ],
+      "codexRequired": true
+    },
+    "CRITICAL": {
+      "examples": "backup/restore, security, integrity, Scheduler/SYSTEM, authentication, data-loss risk",
+      "requiredRoles": [
+        "architect",
+        "security-reviewer"
+      ],
+      "requiredGates": [
+        "codex-qa",
+        "codex-security",
+        "codex-architecture"
+      ],
+      "codexRequired": true
+    }
+  },
+  "fallback": {
+    "claudeFallbackRole": "reviewer",
+    "allowedReasons": [
+      "quota",
+      "rate-limit",
+      "service-unavailable"
+    ],
+    "forbiddenReasons": [
+      "timeout",
+      "mcp-error",
+      "bridge-defect",
+      "configuration-error",
+      "protocol-error",
+      "parse-failure",
+      "not-configured",
+      "convenience"
+    ],
+    "secondLevelFallback": false,
+    "gatesFallbackMayNotSatisfy": [
+      "codex-security",
+      "codex-architecture",
+      "codex-verification"
+    ],
+    "notes": "A forbidden reason is a defect to diagnose, not a fallback trigger (BRAVO_AGENT_POLICY.md section 8.2). When Codex and the Claude fallback reviewer are both unavailable, the gate is reported NOT RUN / blocked; there is no second-level fallback to a weaker model."
+  },
+  "documentationTriggers": {
+    "note": "Any change with one of these externally observable effects requires the documentation role regardless of risk level.",
+    "effects": [
+      "new or changed configuration key",
+      "new or changed exit code",
+      "new or changed CLI parameter or switch",
+      "changed Scheduled Task definition or service behavior",
+      "changed persisted state format or path",
+      "changed notification or log contract relied on operationally"
+    ]
+  },
+  "enforcement": {
+    "hook": ".claude/hooks/validate-agent-routing.ps1",
+    "hookEvent": "PreToolUse",
+    "gatedTools": [
+      "Agent",
+      "Task",
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "mcp__codex-agent__*"
+    ],
+    "delegationToolNote": "The delegation tool is named Agent in Claude Code 2.1.x; Task is kept for versions that named it so. Both must stay gated: a live run on 2026-10-12 showed the hook receives tool_name=Agent, and while only Task was listed every delegation check was skipped as 'not subject to routing policy'.",
+    "writeGate": {
+      "note": "The write boundary is enforced on the actual write, keyed on the acting agent from the PreToolUse agent_type field, not only on the SCOPE text of a delegation brief.",
+      "mainSessionExempt": true,
+      "mainSessionNote": "agent_type is absent in the main session; gating it would block the owner's own work. The system constrains delegated executors, not the owner of the process.",
+      "bashNotGated": true,
+      "bashNote": "Bash is deliberately NOT gated: inspecting an arbitrary command for what it would write is a heuristic with guaranteed bypasses. The answer for Bash is to withhold the tool from write-bounded roles, which is why the documentation role has no Bash."
+    },
+    "unmanagedAgentsIgnored": true,
+    "unmanagedAgentsNote": "Agents absent from roles (Explore, general-purpose, plugin agents) are logged, never blocked.",
+    "failClosedRoles": [
+      "reviewer",
+      "architect",
+      "security-reviewer"
+    ],
+    "failOpenNote": "If the hook itself fails, gate-critical roles are blocked and every other call is allowed with a loud [HOOK-ERROR] log entry.",
+    "auditLog": ".claude/logs/ai-routing.log",
+    "costLog": ".claude/logs/ai-cost.jsonl",
+    "driftDetector": {
+      "hook": ".claude/hooks/record-ai-cost.ps1",
+      "hookEvent": "Stop",
+      "note": "The Stop hook is the only component that sees the actual tool name recorded in the transcript. When a tool_use carries subagent_type but its name is outside the known delegation list, the PreToolUse gate never saw that delegation and enforcement was silently inactive for that session.",
+      "alertSink": ".claude/logs/ai-routing.log",
+      "alertPrefix": "ALERT",
+      "costField": "unknownDelegationTools",
+      "report": "Tools/Get-AICostReport.ps1"
+    }
+  }
+}

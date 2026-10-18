@@ -663,3 +663,29 @@ Existing BRAVO-specific architecture, security, PowerShell 5.1,
 compatibility, Git/GitHub, CI, release, and mutation rules in this
 .claude/CLAUDE.md remain authoritative and are not weakened or replaced
 by the orchestration policy.
+
+## Автоматичне делегування
+
+Власник формулює задачу, а не модель і не склад агентів. Для кожної
+нетривіальної задачі:
+
+1. класифікуй ризик як `LOW`, `MEDIUM`, `HIGH` або `CRITICAL` за
+   `.claude/ai-routing.json`;
+2. візьми з матриці обов'язкові роли та gates для цього рівня;
+3. роль і модель бери з матриці — не питай користувача, яку модель
+   використати, і не підвищуй модель без потреби;
+4. залучай агента `documentation`, коли зміна має зовнішньо спостережуваний
+   ефект (ключ конфігурації, exit-код, параметр CLI, поведінка планувальника,
+   формат persisted state, операційно значущий лог чи сповіщення);
+5. незалежне рев'ю виконує Codex через `codex_delegate`; якщо Codex
+   недоступний саме через `quota`, `rate-limit` або `service-unavailable` —
+   `reviewer` у режимі `claude-qa-fallback` із зафіксованою причиною. Будь-яка
+   інша причина (timeout, збій MCP, помилка конфігурації) — це дефект для
+   діагностики, а не підстава для fallback;
+6. якщо обов'язковий gate не виконано, продовжуй незалежні задачі, але не
+   оголошуй PR готовим до merge.
+
+Деталі політики: `BRAVO_AGENT_POLICY.md` (розділ 9.1), матриця:
+`.claude/ai-routing.json`, операторський опис:
+`docs/ai/MODEL_ROUTING_POLICY.md`. Для повного циклу оркестрації
+використовуй skill `/orchestrate`.

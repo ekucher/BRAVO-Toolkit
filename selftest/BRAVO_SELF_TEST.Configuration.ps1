@@ -1684,7 +1684,20 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         -Name "Authorization/RegistryCoversEveryCanonicalLeaf" `
         -Failure "авторизаційний реєстр мусить мати рівно один запис на кожен канонічний лист: відсутні=$($authMissingLeaves.Count) ($([string]::Join(', ', $authMissingLeaves))), осиротілі=$($authOrphanEntries.Count) ($([string]::Join(', ', $authOrphanEntries)))"
 
-    # --- Authorization/Exactly278CanonicalLeaves ---
+    # --- Authorization/Exactly284CanonicalLeaves ---
+    # 278 -> 282 (#316, закриття клієнтів BIS перед реставрацією):
+    # maintenanceSettings.Restore.ClientClose.{WaitMinutes,ReminderMinutes,
+    # PollSeconds,ProcessNames} — чотири нові канонічні листи, усі
+    # ALLOW_SITE (BRAVO_CONFIG_LOADER.ps1 сам приводить некоректні
+    # значення до безпечних дефолтів); жоден наявний лист класу не змінив
+    # (дельта класів нижче — рівно +4 ALLOW_SITE).
+    #
+    # 282 -> 284 (#364, LogSync): componentSettings.SFTP.RuntimeLogSyncEnabled
+    # (тумблер runtime-синхронізації логів через SFTP, ALLOW_SITE) і
+    # sftpDirectories.RuntimeLogs (каталог призначення на SFTP, ALLOW_SITE) —
+    # два нові канонічні листи з ЯВНИМИ записами у реєстрі; жоден наявний
+    # лист класу не змінив (дельта класів нижче — рівно +2 ALLOW_SITE).
+    #
     # 277 -> 278: maintenanceSettings.Restore.IntegritySmallFileThresholdBytes
     # (поріг «малого» файлу самоперевірки реставрації, ALLOW_SITE) — один
     # новий канонічний лист з ЯВНИМ записом у реєстрі; жоден наявний лист
@@ -1703,9 +1716,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     # Жоден НАЯВНИЙ лист не змінив класу — саме тому дельта класів нижче
     # рівно +3 ALLOW_SITE і +3 ALLOW_WITH_VALIDATOR, а не перерозподіл.
     Test-BRAVOCondition `
-        -Condition ($authLeaves.Count -eq 278) `
-        -Name "Authorization/Exactly278CanonicalLeaves" `
-        -Failure "контракт фіксує рівно 278 канонічних листів (271 Wave 2 + 6 BSYSTEM Operations 5.3.0 + 1 Restore.IntegritySmallFileThresholdBytes); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
+        -Condition ($authLeaves.Count -eq 284) `
+        -Name "Authorization/Exactly284CanonicalLeaves" `
+        -Failure "контракт фіксує рівно 284 канонічних листи (271 Wave 2 + 6 BSYSTEM Operations 5.3.0 + 1 Restore.IntegritySmallFileThresholdBytes + 4 #316 ClientClose + 2 #364 LogSync); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
 
     # --- Authorization/AllClassesRecognized ---
     $authUnrecognizedClasses = @(@($authRegistry.Values) | ForEach-Object { [string]$_.Class } | Where-Object { $authKnownClasses -notcontains $_ } | Select-Object -Unique)
@@ -1749,15 +1762,19 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     #
     # Restore.IntegritySmallFileThresholdBytes: +1 ALLOW_SITE (205->206),
     # TOTAL 277->278.
+    #
+    # #316 (ClientClose): +4 ALLOW_SITE (206->210). TOTAL 278->282.
+    # #364 (LogSync): +2 ALLOW_SITE (210->212) — componentSettings.SFTP.
+    # RuntimeLogSyncEnabled і sftpDirectories.RuntimeLogs. TOTAL 282->284.
     Test-BRAVOCondition `
         -Condition (
-            $authAllowSiteCount -eq 206 -and $authAllowValidatorCount -eq 28 -and
+            $authAllowSiteCount -eq 212 -and $authAllowValidatorCount -eq 28 -and
             $authDenyDerivedCount -eq 0 -and $authDenyCredentialCount -eq 0 -and
             $authDenySecurityCount -eq 6 -and $authDenyExecutionCount -eq 21 -and
             $authDenyInternalCount -eq 17
         ) `
         -Name "Authorization/ClassCountsMatchContract" `
-        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW): ALLOW_SITE=$authAllowSiteCount(206) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(28) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
+        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW, #316 ClientClose і #364 LogSync): ALLOW_SITE=$authAllowSiteCount(212) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(28) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
 
     # --- Authorization/EveryValidatorIdentifierResolves ---
     # Кожен ALLOW_WITH_VALIDATOR-запис мусить посилатись на валідатор,
@@ -1790,6 +1807,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
             $authProbeValue = '\BRAVO\'
         } elseif ($authValidatorId -eq 'NonEmptyString') {
             $authProbeValue = 'probe-value'
+        } elseif ($authValidatorId -eq 'SshHostKeyFingerprint') {
+            $authProbeValue = 'ssh-ed25519 255 AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
         }
         try {
             [void](Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId $authValidatorId -Value $authProbeValue -Path ([string]$authEntry.Key))
@@ -1801,6 +1820,184 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         -Condition ($authUnresolvedValidators.Count -eq 0) `
         -Name "Authorization/EveryValidatorIdentifierResolves" `
         -Failure "кожен Validator-ідентифікатор у реєстрі мусить реально диспетчеруватись Test-BRAVOConfigurationAuthorizationValidatorValue без throw; нерозв'язані: $([string]::Join(' | ', $authUnresolvedValidators))"
+
+    # --- SshHostKey/FormatValidatorTable (#480, F3) ---
+    # Формат-валідація sftpHostKey: єдиний хелпер Test-/ConvertTo-BRAVOSshHostKeyFingerprint.
+    # Fail-closed: '*', accept*, керуючі/не-ASCII символи, неповні відбитки.
+    $hkB64 = 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
+    $hkMd5 = 'aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99'
+    $hkValidCases = @(
+        @{ Name = 'DefaultWithQuotes'; Value = ('"ssh-rsa 2048 ' + $hkMd5 + '"'); Expect = ('ssh-rsa 2048 ' + $hkMd5) }
+        @{ Name = 'Md5Unquoted'; Value = ('ssh-rsa 2048 ' + $hkMd5); Expect = ('ssh-rsa 2048 ' + $hkMd5) }
+        @{ Name = 'Ed25519Base64'; Value = ('ssh-ed25519 255 ' + $hkB64); Expect = ('ssh-ed25519 255 ' + $hkB64) }
+        @{ Name = 'Ed25519Base64Padded'; Value = ('ssh-ed25519 255 ' + $hkB64 + '='); Expect = ('ssh-ed25519 255 ' + $hkB64 + '=') }
+        @{ Name = 'Ed25519Sha256Prefix'; Value = ('ssh-ed25519 255 SHA256:' + $hkB64); Expect = ('ssh-ed25519 255 ' + $hkB64) }
+        @{ Name = 'Ecdsa384'; Value = ('ecdsa-sha2-nistp384 384 SHA256:' + $hkB64); Expect = ('ecdsa-sha2-nistp384 384 ' + $hkB64) }
+        @{ Name = 'TwoEntries'; Value = ('ssh-ed25519 255 SHA256:' + $hkB64 + ';ssh-rsa 2048 ' + $hkMd5); Expect = ('ssh-ed25519 255 ' + $hkB64 + ';ssh-rsa 2048 ' + $hkMd5) }
+        @{ Name = 'OuterSpaces'; Value = ('  ssh-ed25519 255 SHA256:' + $hkB64 + '  '); Expect = ('ssh-ed25519 255 ' + $hkB64) }
+    )
+    $hkInvalidCases = @(
+        @{ Name = 'Star'; Value = '*'; Reason = 'AcceptAnyHostKey' }
+        @{ Name = 'QuotedStar'; Value = '"*"'; Reason = 'AcceptAnyHostKey' }
+        @{ Name = 'AcceptNew'; Value = 'acceptnew'; Reason = 'AcceptAnyHostKey' }
+        @{ Name = 'AcceptNewUpper'; Value = 'ACCEPTNEW'; Reason = 'AcceptAnyHostKey' }
+        @{ Name = 'AcceptDashNew'; Value = 'accept-new'; Reason = 'AcceptAnyHostKey' }
+        @{ Name = 'CrLfInjection'; Value = "x`r`nexit"; Reason = 'ControlOrNonAscii' }
+        @{ Name = 'CrLfPutInjection'; Value = ('"ssh-rsa 2048 ' + $hkMd5 + "`"`r`nput C:\x /"); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'TrailingLf'; Value = ('ssh-ed25519 255 ' + $hkB64 + "`n"); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'Tab'; Value = ("ssh-ed25519`t255 " + $hkB64); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'Nul'; Value = ('ssh-ed25519 255 ' + $hkB64 + [string][char]0); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'LineSeparator'; Value = ('ssh-ed25519 255 ' + $hkB64 + [string][char]0x2028); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'KelvinSignAsciiBarrier'; Value = ('ssh-ed25519 255 ' + $hkB64 + [string][char]0x212A); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'DottedCapitalIAsciiBarrier'; Value = ('ssh-ed25519 255 ' + $hkB64 + [string][char]0x0130); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'Ed448NotAcceptedByWinScpAssembly'; Value = ('ssh-ed448 448 ' + $hkB64); Reason = 'Format' }
+        @{ Name = 'ShortMd5'; Value = 'ssh-rsa 2048 aa:bb:cc'; Reason = 'Format' }
+        @{ Name = 'SelfTestFingerprint'; Value = 'ssh-ed25519 255 self-test'; Reason = 'Format' }
+        @{ Name = 'Fake'; Value = 'fake'; Reason = 'Format' }
+        @{ Name = 'InnerQuote'; Value = ('ssh-rsa 2048 "' + $hkMd5 + '"x'); Reason = 'EmbeddedQuote' }
+        @{ Name = 'EmptyQuotes'; Value = '""'; Reason = 'Empty' }
+        @{ Name = 'Semicolon'; Value = ';'; Reason = 'Format' }
+        @{ Name = 'EmptyMiddleEntry'; Value = 'a;;b'; Reason = 'Format' }
+        @{ Name = 'AliasRsa2048'; Value = ('rsa2048 ' + $hkMd5); Reason = 'Format' }
+        @{ Name = 'BareFingerprint'; Value = $hkMd5; Reason = 'Format' }
+        @{ Name = 'UpperCaseKeyType'; Value = ('SSH-ED25519 255 ' + $hkB64); Reason = 'Format' }
+        @{ Name = 'TooLong'; Value = ('a' * 1025); Reason = 'ControlOrNonAscii' }
+        @{ Name = 'Null'; Value = $null; Reason = 'Empty' }
+        @{ Name = 'Integer'; Value = [int]5; Reason = 'Empty' }
+    )
+    $hkTableFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($hkCase in $hkValidCases) {
+        $hkResult = Test-BRAVOSshHostKeyFingerprint -Value $hkCase.Value
+        if (-not ($hkResult.IsValid -and [string]$hkResult.Normalized -ceq [string]$hkCase.Expect)) {
+            [void]$hkTableFailures.Add("valid:$($hkCase.Name)")
+        }
+        $hkAuth = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'SshHostKeyFingerprint' -Value $hkCase.Value -Path 'sftpHostKey'
+        if (-not $hkAuth.IsValid) { [void]$hkTableFailures.Add("valid-auth:$($hkCase.Name)") }
+        try {
+            if ((ConvertTo-BRAVOSshHostKeyFingerprint -Value $hkCase.Value) -cne [string]$hkCase.Expect) { [void]$hkTableFailures.Add("valid-convert:$($hkCase.Name)") }
+        } catch { [void]$hkTableFailures.Add("valid-convert-threw:$($hkCase.Name)") }
+    }
+    foreach ($hkCase in $hkInvalidCases) {
+        $hkResult = Test-BRAVOSshHostKeyFingerprint -Value $hkCase.Value
+        if ($hkResult.IsValid -or $null -ne $hkResult.Normalized -or [string]$hkResult.Reason -cne [string]$hkCase.Reason) {
+            [void]$hkTableFailures.Add("invalid:$($hkCase.Name)")
+        }
+        if ($hkCase.Value -is [string] -and $hkCase.Value.Length -ge 2 -and $hkCase.Reason -cne 'AcceptAnyHostKey' -and ([string]$hkResult.Message).Contains([string]$hkCase.Value)) {
+            [void]$hkTableFailures.Add("message-echoes-input:$($hkCase.Name)")
+        }
+        $hkAuth = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'SshHostKeyFingerprint' -Value $hkCase.Value -Path 'sftpHostKey'
+        if ($hkAuth.IsValid -or -not ([string]$hkAuth.Message).StartsWith('sftpHostKey: ')) { [void]$hkTableFailures.Add("invalid-auth:$($hkCase.Name)") }
+        $hkThrew = $false
+        try { [void](ConvertTo-BRAVOSshHostKeyFingerprint -Value $hkCase.Value) } catch [System.ArgumentException] { $hkThrew = $true } catch { }
+        if (-not $hkThrew) { [void]$hkTableFailures.Add("invalid-convert-nothrow:$($hkCase.Name)") }
+    }
+    Test-BRAVOCondition `
+        -Condition ($hkTableFailures.Count -eq 0) `
+        -Name "SshHostKey/FormatValidatorTable" `
+        -Failure "Test-/ConvertTo-BRAVOSshHostKeyFingerprint та authorization-валідатор SshHostKeyFingerprint мусять приймати валідні формати й fail-closed відхиляти '*'/accept*/керуючі символи/неповні відбитки без ехо значення у повідомленні; збої: $([string]::Join(', ', $hkTableFailures))"
+
+    # --- SshHostKey/NormalizedValueAcceptedByWinScpAssembly ---
+    # Поведінковий контракт: КОЖНЕ валідне Normalized має прийматися сетером
+    # WinSCP.SessionOptions.SshHostKeyFingerprint із вбудованої Tools\WinSCPnet.dll
+    # (збірка відхиляє 'SHA256:'-префікс і ssh-ed448, на відміну від WinSCP.com).
+    # Окремий powershell.exe: Add-Type не блокує збірку в процесі self-test.
+    $hkAsmDll = Join-Path $root 'Tools\WinSCPnet.dll'
+    $hkAsmLimitation = ''
+    $hkAsmOutput = ''
+    if (-not (Test-Path -LiteralPath $hkAsmDll -PathType Leaf)) {
+        $hkAsmLimitation = 'Tools\WinSCPnet.dll відсутня (НЕДОСТУПНО)'
+    } else {
+        $hkAsmValues = @(foreach ($hkCase in $hkValidCases) { "'" + ([string](Test-BRAVOSshHostKeyFingerprint -Value $hkCase.Value).Normalized) + "'" })
+        $hkAsmCommand = (
+            "`$ErrorActionPreference = 'Stop'; try { " +
+            "Add-Type -Path '" + $hkAsmDll + "'; `$n = 0; " +
+            "foreach (`$v in @(" + ($hkAsmValues -join ',') + ")) { " +
+            "`$o = New-Object WinSCP.SessionOptions; `$o.SshHostKeyFingerprint = `$v; `$n++ }; " +
+            "'ASM-OK:' + `$n } catch { 'ASM-ERROR: ' + `$_.Exception.GetType().FullName }"
+        )
+        $hkAsmOutput = ([string](@(& (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command $hkAsmCommand 2>&1)[-1])).Trim()
+    }
+    Test-BRAVOCondition `
+        -Condition ($hkAsmOutput -ceq ('ASM-OK:' + @($hkValidCases).Count)) `
+        -Name "SshHostKey/NormalizedValueAcceptedByWinScpAssembly" `
+        -EnvironmentLimitation $hkAsmLimitation `
+        -Failure "Normalized-значення Test-BRAVOSshHostKeyFingerprint мусять приймати WinSCP.SessionOptions.SshHostKeyFingerprint (Tools\WinSCPnet.dll); отримано: '$hkAsmOutput'"
+
+    # --- SshHostKey/RegistryUsesFormatValidator ---
+    # Реєстр авторизації мусить вказувати саме SshHostKeyFingerprint, а не NonEmptyString.
+    Test-BRAVOCondition `
+        -Condition ([string]$authRegistry['sftpHostKey'].Validator -ceq 'SshHostKeyFingerprint' -and [string]$authRegistry['sftpHostKey'].Class -ceq 'ALLOW_WITH_VALIDATOR') `
+        -Name "SshHostKey/RegistryUsesFormatValidator" `
+        -Failure "sftpHostKey у реєстрі авторизації мусить мати Validator='SshHostKeyFingerprint' (а не NonEmptyString): '*' та CRLF-ін'єкція інакше проходять loader."
+
+    # --- SshHostKey/EveryConsumerQuotesAndValidatesHostKey (#480, F3) ---
+    # Статичний скан усього продуктового коду поза selftest: кожен
+    # `-hostkey=` у WinSCP-скрипті — лише у лапках зі змінною (`-hostkey="$var"`),
+    # а кожне присвоєння SessionOptions.SshHostKeyFingerprint бере значення з
+    # ConvertTo-BRAVOSshHostKeyFingerprint (прямо або через $validatedHostKey,
+    # який у тому ж файлі отримано з ConvertTo-). Незабезпечене лапками значення
+    # дозволило б ін'єкцію команд через пробіл/CRLF.
+    $hkScanFailures = New-Object System.Collections.Generic.List[string]
+    $hkScanFiles = @(
+        Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $hkScanPath = $_.FullName
+                $hkScanPath -notlike (Join-Path $root 'selftest\*') -and
+                $hkScanPath -notlike (Join-Path $root '.git\*') -and
+                $hkScanPath -notlike (Join-Path $root '.claude\*') -and
+                $hkScanPath -notlike (Join-Path $root 'LOGS\*') -and
+                $_.Name -ne 'BRAVO_SELF_TEST.ps1' -and
+                ($_.Extension -ceq '.ps1' -or $_.Extension -ceq '.psm1')
+            }
+    )
+    $hkScanQuotedCount = 0
+    $hkScanAssignmentCount = 0
+    foreach ($hkScanFile in $hkScanFiles) {
+        $hkScanText = [IO.File]::ReadAllText($hkScanFile.FullName, [Text.Encoding]::UTF8)
+        if ($hkScanText.IndexOf('hostkey', [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $hkScanRelative = $hkScanFile.FullName.Substring($root.Length).TrimStart('\')
+        foreach ($hkScanMatch in [regex]::Matches($hkScanText, '(?i)-hostkey=(?<tail>[^\r\n]{0,24})')) {
+            $hkScanVar = [regex]::Match($hkScanMatch.Groups['tail'].Value, '^`?"\$(?<name>[A-Za-z_][A-Za-z0-9_]*)`?"')
+            if ($hkScanVar.Success) {
+                $hkScanQuotedCount++
+                # Змінна мусить бути присвоєна з ConvertTo- у тому ж файлі ($validatedHostKey — дозволена назва).
+                $hkScanVarName = $hkScanVar.Groups['name'].Value
+                $hkScanVarOk = $hkScanText -cmatch ('\$' + [regex]::Escape($hkScanVarName) + '\s*=\s*ConvertTo-BRAVOSshHostKeyFingerprint\s')
+                if (-not $hkScanVarOk) {
+                    [void]$hkScanFailures.Add("${hkScanRelative}: -hostkey= зі змінною '$hkScanVarName' без присвоєння з ConvertTo-BRAVOSshHostKeyFingerprint")
+                }
+            } else {
+                [void]$hkScanFailures.Add("${hkScanRelative}: -hostkey= без лапок/змінної")
+            }
+        }
+        # Варіанти `-hostkey "` та `/hostkey=` (пробіл замість '=' або слеш-синтаксис) теж заборонені.
+        if ([regex]::IsMatch($hkScanText, '(?i)[-/]hostkey\s+"|/hostkey=')) {
+            [void]$hkScanFailures.Add("${hkScanRelative}: заборонений варіант '-hostkey ' з лапками або '/hostkey=' (дозволено лише -hostkey=...)")
+        }
+        foreach ($hkScanMatch in [regex]::Matches($hkScanText, '(?m)\.SshHostKeyFingerprint\s*=(?!=)\s*(?<rhs>[^\r\n]*)')) {
+            $hkScanAssignmentCount++
+            $hkScanRhs = $hkScanMatch.Groups['rhs'].Value.Trim()
+            $hkScanDirect = $hkScanRhs.StartsWith('ConvertTo-BRAVOSshHostKeyFingerprint ')
+            $hkScanIndirect = $hkScanRhs -ceq '$validatedHostKey' -and
+                $hkScanText -cmatch '\$validatedHostKey\s*=\s*ConvertTo-BRAVOSshHostKeyFingerprint\s'
+            if (-not ($hkScanDirect -or $hkScanIndirect)) {
+                [void]$hkScanFailures.Add("${hkScanRelative}: SshHostKeyFingerprint без ConvertTo-BRAVOSshHostKeyFingerprint")
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($hkScanFailures.Count -eq 0 -and $hkScanQuotedCount -ge 6 -and $hkScanAssignmentCount -ge 8) `
+        -Name "SshHostKey/EveryConsumerQuotesAndValidatesHostKey" `
+        -Failure "кожен -hostkey= у продуктових WinSCP-скриптах має бути у лапках зі змінною (-hostkey=`"`$var`"), а кожне SshHostKeyFingerprint = — брати значення з ConvertTo-BRAVOSshHostKeyFingerprint; знайдено лапкових=$hkScanQuotedCount присвоєнь=$hkScanAssignmentCount; порушення: $([string]::Join('; ', $hkScanFailures))"
+
+    # --- SshHostKey/ReconcileInvalidHostKeyExitsInvalidConfiguration (#480 review, F5) ---
+    # Статична перевірка: невалідний sftpHostKey у BRAVO_BAZA_RECONCILE — код 30, а не 90 зовнішнього catch.
+    $hkReconcileText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_BAZA_RECONCILE.ps1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition ($hkReconcileText -cmatch '(?s)\$validatedHostKey\s*=\s*ConvertTo-BRAVOSshHostKeyFingerprint[^\r\n]*\r?\n\s*\}\s*catch\s*\[System\.ArgumentException\]\s*\{.{0,400}?Resolve-BRAVOExitCode\s+-InvalidConfiguration') `
+        -Name "SshHostKey/ReconcileInvalidHostKeyExitsInvalidConfiguration" `
+        -Failure "BRAVO_BAZA_RECONCILE.ps1: ConvertTo-BRAVOSshHostKeyFingerprint мусить бути в try з catch [System.ArgumentException] -> Resolve-BRAVOExitCode -InvalidConfiguration (30), інакше помилка конфігурації стає внутрішньою (90)."
 
     # --- Authorization/UnknownValidatorIdFailsClosed ---
     $authUnknownValidatorThrew = $false
@@ -2185,7 +2382,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         # проти ОРИГІНАЛЬНОЇ guard-реалізації (до Codex review 5290816507)
         # і МУСИТЬ проходити на поточній.
         $ssgSchemaPath = Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psm1'
-        $ssgLines = Get-Content -LiteralPath $ssgSchemaPath
+        $ssgLines = Get-Content -LiteralPath $ssgSchemaPath -Encoding UTF8
         $ssgRawSrc = [string]::Join([Environment]::NewLine, $ssgLines)
         # ВАЖЛИВО: спершу прибираємо <# ... #> block-коментарі (comment-
         # based help) із СИРОГО тексту, ДО пострядкового `#`-фільтра.

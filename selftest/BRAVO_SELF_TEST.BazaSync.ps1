@@ -386,6 +386,22 @@
             $fastHealthAutoArchive.Message -match 'eqv_11-116\.pdf' -and $fastHealthAutoArchive.Message -notmatch 'ПОТРІБНА ДІЯ'
         ) -Name 'BazaSync/MutationAutoArchivedIsHealthInfoNotCritical' -Failure "MUTATION_AUTO_ARCHIVED має бути INFO/healthy (не блокує): Level=$($fastHealthAutoArchive.Level),Healthy=$($fastHealthAutoArchive.Healthy)"
 
+        # #398 (п.4): MUTATION_AUTO_ARCHIVED — те саме канонічне "успішний"
+        # визначення для remote checkpoint, що й для COMPLETE/Health/Archive
+        # (Test-BRAVOBazaSyncStatusSuccess). Раніше checkpoint публікувався
+        # ЛИШЕ для COMPLETE: цикл, завершений авто-архівуванням, лишав
+        # зовнішнього спостерігача (через checkpoint) із ЗАСТАРІЛОЮ міткою
+        # попереднього COMPLETE-циклу — суто спостережуваність (Health
+        # checkpoint назад не читає, тож на здоров'я це не впливало).
+        $aaOkCheckpointSession = New-BRAVOSelfTestFakeBazaSession
+        $aaOkCheckpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $aaOkCheckpointSession -RemoteRootPath '/baza_app' -SyncResult $aaOkResult2
+        Test-BRAVOCondition -Condition (
+            $aaOkCheckpointOutcome.Attempted -eq $true -and $aaOkCheckpointOutcome.Published -eq $true -and
+            $null -eq $aaOkCheckpointOutcome.Error -and
+            $aaOkCheckpointSession.State.PutFilesCallCount -eq 1 -and
+            $aaOkCheckpointSession.State.MoveFileCalls.Count -eq 1
+        ) -Name 'BazaSync/MutationAutoArchivedPublishesRemoteCheckpoint' -Failure "MUTATION_AUTO_ARCHIVED має публікувати remote checkpoint так само, як COMPLETE (не лишати зовнішнього спостерігача із застарілою міткою); Attempted=$($aaOkCheckpointOutcome.Attempted) Published=$($aaOkCheckpointOutcome.Published) Error=$($aaOkCheckpointOutcome.Error) PutFiles=$($aaOkCheckpointSession.State.PutFilesCallCount)"
+
         # #293: MUTATION_AUTO_ARCHIVED не має ховати remote-конфлікт/audit-drift/
         # несумісні імена ТОГО САМОГО циклу. (a) Fast Health напряму: статус
         # AUTO_ARCHIVED + непорожній RemoteConflicts -> CRITICAL/не healthy, як для
@@ -694,6 +710,48 @@
             -Name 'BazaSync/SyncLockIsIndependentPerComponent' -Failure 'BAZA_APP і BAZA_WWW мають незалежні locks'
         $lock1.Stream.Dispose(); $lock3.Stream.Dispose()
 
+        # #398 (п.5b): BAZA_WWW — другий екземпляр того самого generic
+        # рушія (той самий код, інший Component/RemoteRootPath/StateRoot).
+        # До цього BAZA_WWW фігурував лише в незалежності locks вище і в
+        # статичній перевірці архівного скрипта — жодного прямого
+        # наскрізного тесту через Invoke-BRAVOBazaSynchronization. Перший
+        # цикл (bootstrap) + component-специфічне ім'я файлу стану, що НЕ
+        # перетинається з BAZA_APP.
+        $wwwRoot = Join-Path $bazaSyncTestRoot "BAZA_WWW_Parity"
+        $wwwLocal = Join-Path $wwwRoot "local"
+        $wwwState = Join-Path $wwwRoot "state"
+        New-Item -ItemType Directory -Path $wwwLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $wwwLocal -RelativePath "w1.txt" -SizeBytes 100 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $wwwLocal -RelativePath "sub\w2.txt" -SizeBytes 200 | Out-Null
+        $wwwSession1 = New-BRAVOSelfTestFakeBazaSession
+        $wwwResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_WWW' -LocalDirectory $wwwLocal -RemoteRootPath '/baza_www' -Session $wwwSession1 -StateRoot $wwwState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        $wwwStatePath = Get-BRAVOBazaStatePath -StateRoot $wwwState -Component 'BAZA_WWW'
+        $wwwAppStatePath = Get-BRAVOBazaStatePath -StateRoot $wwwState -Component 'BAZA_APP'
+        Test-BRAVOCondition -Condition (
+            $wwwResult1.Status -eq 'COMPLETE' -and $wwwResult1.Uploaded -eq 2 -and $wwwResult1.Failed -eq 0 -and
+            $wwwSession1.State.PutFilesCallCount -eq 2 -and $wwwResult1.DiscoveredWithinCutoff -eq 2 -and
+            (Split-Path $wwwStatePath -Leaf) -eq 'BAZA_WWW.state.json' -and
+            (Test-Path -LiteralPath $wwwStatePath) -and -not (Test-Path -LiteralPath $wwwAppStatePath)
+        ) -Name 'BazaSync/BAZA_WWW_FirstSyncUploadsAllDiscoveredFiles' -Failure "BAZA_WWW (другий екземпляр, аналог BAZA_APP) має синхронізуватись так само і зберігати власний BAZA_WWW.state.json, не зачіпаючи BAZA_APP.state.json; Status=$($wwwResult1.Status),Uploaded=$($wwwResult1.Uploaded),PutFiles=$($wwwSession1.State.PutFilesCallCount)"
+
+        # #398 (п.5b): той самий аналог для другої половини контракту —
+        # авто-архівування + remote-конфлікт того самого циклу має дати
+        # Status=REMOTE_CONFLICT (не MUTATION_AUTO_ARCHIVED) і CRITICAL
+        # Fast Health так само, як для BAZA_APP вище (BazaSync/
+        # AutoArchiveWithSameCycleRemoteConflictIsNotAutoArchivedStatus) —
+        # підтверджує, що драбина статусів і Fast Health не залежать від
+        # конкретного Component.
+        $wwwLadderNow = (Get-Date).ToUniversalTime()
+        $wwwLadderSynthetic = New-BRAVOBazaSyncResult -Component 'BAZA_WWW' -CycleId (New-BRAVOBazaCycleId) -StartedUtc $wwwLadderNow -CutoffUtc $wwwLadderNow
+        $wwwLadderSynthetic.Status = 'MUTATION_AUTO_ARCHIVED'
+        $wwwLadderSynthetic.MutationViolations = @([pscustomobject]@{ RelativePath = 'w_mut.pdf' })
+        $wwwLadderSynthetic.RemoteConflicts = @([pscustomobject]@{ RelativePath = 'w_conflict.txt'; LocalSize = [int64]100; RemoteSize = [int64]55 })
+        $wwwLadderHealth = Get-BRAVOBazaFastHealthResult -SyncResult $wwwLadderSynthetic
+        Test-BRAVOCondition -Condition (
+            $wwwLadderHealth.Healthy -eq $false -and $wwwLadderHealth.Level -eq 'CRITICAL' -and
+            $wwwLadderHealth.Message -match 'w_conflict\.txt'
+        ) -Name 'BazaSync/BAZA_WWW_AutoArchivedDoesNotMaskRemoteConflictInFastHealth' -Failure "BAZA_WWW: MUTATION_AUTO_ARCHIVED + RemoteConflicts має бути CRITICAL/не healthy (як для BAZA_APP), а не INFO: Level=$($wwwLadderHealth.Level),Healthy=$($wwwLadderHealth.Healthy)"
+
         $skippedResult = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId 'x' -StartedUtc (Get-Date) -CutoffUtc (Get-Date)
         $skippedResult.Status = 'SKIPPED_CONCURRENT'
         $skippedResult.Error = 'lock held'
@@ -926,7 +984,7 @@
         # (WinSCP не потрібен: збій lock відбувається ДО відкриття сесії)
         $drP13SessionResult = Invoke-BRAVOBazaComponentSyncSession `
             -Component 'BAZA_APP' -LocalDirectory $drP13AclRoot -RemoteRootPath '/baza_app' `
-            -RepositorySFTPUrl 'sftp://fake' -HostKey 'fake' -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'unused' `
+            -RepositorySFTPUrl 'sftp://fake' -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'unused' `
             -StateRoot $drP13AclRoot
         $drP13SessionHealth = Get-BRAVOBazaFastHealthResult -SyncResult $drP13SessionResult
         Test-BRAVOCondition -Condition (
@@ -1268,15 +1326,16 @@
         ) -Name 'BazaSync/IncompatibleCandidateDoesNotAdvanceLastSuccessfulSyncUtc' -Failure "LastSuccessfulSyncUtc/LastCycleId НЕ мають просуватись циклом з несумісними іменами; було=$hr2ProvenanceUtc стало=$($hr2StateAfterCycle2.State.LastSuccessfulSyncUtc)"
 
         # checkpoint для такого циклу: Write-BRAVOBazaRemoteCheckpoint сам
-        # відмовляється (Status != COMPLETE -> Attempted=false, нуль
-        # звернень до сесії), а session-обгортка додатково гейтить виклик.
+        # відмовляється (Status не у Test-BRAVOBazaSyncStatusSuccess ->
+        # Attempted=false, нуль звернень до сесії), а session-обгортка
+        # додатково гейтить виклик тим самим канонічним предикатом (#398).
         $hr2CheckpointSession = New-BRAVOSelfTestFakeBazaSession
         $hr2CheckpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $hr2CheckpointSession -RemoteRootPath '/baza_app' -SyncResult $hr2Cycle2Result
         Test-BRAVOCondition -Condition (
             $hr2CheckpointOutcome.Attempted -eq $false -and $hr2CheckpointOutcome.Published -eq $false -and
             $hr2CheckpointSession.State.PutFilesCallCount -eq 0 -and
             $hr2CheckpointSession.State.MoveFileCalls.Count -eq 0 -and
-            $bazaSyncModuleText.Contains('if ($WriteCheckpoint -and $syncResult.Status -eq ''COMPLETE'')')
+            $bazaSyncModuleText.Contains('if ($WriteCheckpoint -and (Test-BRAVOBazaSyncStatusSuccess -Status $syncResult.Status)) {')
         ) -Name 'BazaSync/IncompatibleCandidateDoesNotPublishSuccessfulCheckpoint' -Failure "INCOMPATIBLE_NAME цикл не має публікувати successful checkpoint (обидва gate: сам Write-* і session-обгортка); Attempted=$($hr2CheckpointOutcome.Attempted) PutFiles=$($hr2CheckpointSession.State.PutFilesCallCount)"
 
         # змішаний цикл: сумісний новий файл передається, стан для нього
@@ -2234,7 +2293,7 @@
         # =======================================================================
         $accComStubResult = Invoke-BRAVOBazaComponentSyncSession `
             -Component 'BAZA_APP' -LocalDirectory $bazaSyncTestRoot -RemoteRootPath '/baza_app' `
-            -RepositorySFTPUrl 'sftp://fake' -HostKey 'fake' `
+            -RepositorySFTPUrl 'sftp://fake' -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' `
             -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'C:\fake\Tools\WinSCP.com' `
             -StateRoot (Join-Path $bazaSyncTestRoot "ACC_ComStub")
         Test-BRAVOCondition -Condition (
@@ -2242,6 +2301,33 @@
             $accComStubResult.Error -match 'winscp\.exe' -and
             $accComStubResult.Error -match 'WinSCP\.com'
         ) -Name 'BazaSync/ComStubExecutableFailsFastInsteadOfHanging' -Failure "WinSCP.com як ExecutablePath має давати миттєвий контрольований ERROR з поясненням (потрібен winscp.exe), а не зависання на промпті winscp>; Status=$($accComStubResult.Status) Error=$($accComStubResult.Error)"
+
+        # =======================================================================
+        # #480 (F3): невалідний/accept-any sftpHostKey -> контрольований ERROR ДО
+        # Add-Type і створення WinSCP-сесії (помилка саме про host key, а не про
+        # 'unused' збірку WinSCPnet.dll, яку Add-Type відхилив би першою).
+        # =======================================================================
+        $hkBazaFailures = New-Object System.Collections.Generic.List[string]
+        foreach ($hkBazaCase in @(
+                @{ Name = 'Star'; Value = '*' },
+                @{ Name = 'AcceptNew'; Value = 'acceptnew' },
+                @{ Name = 'CrLfPut'; Value = "ssh-rsa 2048 aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99`r`nput C:\x /" }
+            )) {
+            $hkBazaResult = Invoke-BRAVOBazaComponentSyncSession `
+                -Component 'BAZA_APP' -LocalDirectory $bazaSyncTestRoot -RemoteRootPath '/baza_app' `
+                -RepositorySFTPUrl 'sftp://fake' -HostKey ([string]$hkBazaCase.Value) `
+                -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'C:\fake\Tools\winscp.exe' `
+                -StateRoot (Join-Path $bazaSyncTestRoot "HK480_$($hkBazaCase.Name)")
+            if (-not ($hkBazaResult.Status -eq 'ERROR' -and
+                    [string]$hkBazaResult.Error -match 'SFTP host key' -and
+                    [string]$hkBazaResult.Error -notmatch 'unused' -and
+                    [string]$hkBazaResult.Error -notmatch 'put C:')) {
+                [void]$hkBazaFailures.Add([string]$hkBazaCase.Name)
+            }
+        }
+        Test-BRAVOCondition -Condition ($hkBazaFailures.Count -eq 0) `
+            -Name 'BazaSync/InvalidHostKeyFailsBeforeWinSCPSession' `
+            -Failure "Invoke-BRAVOBazaComponentSyncSession з невалідним sftpHostKey мусить повертати ERROR про host key ДО Add-Type/New-Object WinSCP.Session (без сирого значення); збої: $([string]::Join(', ', $hkBazaFailures))"
 
         Test-BRAVOCondition -Condition (
             $bazaArchiveScriptText.Contains('$winSCPComponents = Get-BRAVOWinSCPDotNetComponents') -and
@@ -2280,7 +2366,7 @@
                 -LocalDirectory 'C:\fake\hr7local' `
                 -RemotePath '/baza_app' `
                 -RepositorySFTPUrl 'sftp://hr7-fake-url' `
-                -HostKey 'hr7-fake-hostkey'
+                -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
         } $hr7Probe
         $hr7Snapshot = [pscustomobject]@{ SnapshotUtc = (Get-Date).ToUniversalTime(); Entries = @{}; Success = $true; Error = $null }
         $hr7ProviderError = $null
@@ -2294,7 +2380,7 @@
             $null -eq $hr7ProviderError -and
             $hr7Probe.Invoked -eq 1 -and
             $hr7Probe.Url -eq 'sftp://hr7-fake-url' -and
-            $hr7Probe.HostKey -eq 'hr7-fake-hostkey' -and
+            $hr7Probe.HostKey -eq 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' -and
             $hr7Probe.LocalPath -eq 'C:\fake\hr7local' -and
             $null -ne $hr7ProviderResult -and [bool]$hr7ProviderResult.Success -eq $true -and
             $null -ne $hr7ProviderResult.PSObject.Properties['PendingItems']
@@ -2345,7 +2431,7 @@
                 -LocalDirectory $LocalDirectory `
                 -RemotePath '/baza_app' `
                 -RepositorySFTPUrl 'sftp://hr7-fake-url' `
-                -HostKey 'hr7-fake-hostkey'
+                -HostKey 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
         } $hr7RecProbe $hr7RecLocal
         $hr7RecCycle = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr7RecLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr7RecState -BootstrapIfNeeded -FullAuditProvider $hr7RecProvider
         $hr7RecStateAfter = Read-BRAVOBazaState -Path $hr7RecStatePath
@@ -2604,7 +2690,7 @@
                 $script:AuditProvider = $null
                 $script:Messages = New-Object System.Collections.Generic.List[string]
                 $sftpUrl = 'sftp://192.0.2.10'
-                $sftpHostKey = 'ssh-ed25519 256 fake'
+                $sftpHostKey = 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
                 $winSCPPath = 'C:\fake\Tools\WinSCP.com'
                 $winSCPAssemblyPath = 'C:\fake\Tools\WinSCPnet.dll'
                 $sftpConnectionTimeoutSeconds = 30

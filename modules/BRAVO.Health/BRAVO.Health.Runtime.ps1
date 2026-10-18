@@ -320,6 +320,12 @@ function Complete-BRAVOHealthResult {
     if ($healthExitCode -eq 0 -and $script:BRAVOWarningCount -gt 0) {
         $healthExitCode = Resolve-BRAVOExitCode -HasWarnings
     }
+    # #480: відхилений форматною валідацією sftpHostKey -> InvalidConfiguration (30),
+    # а не загальний HealthCritical; issue SFTPConnection лишається, щоб алерт ніс причину.
+    $sftpHostKeyRejected = [bool](Get-Variable -Scope Script -Name BRAVOHealthSftpHostKeyRejected -ValueOnly -ErrorAction SilentlyContinue)
+    if ($sftpHostKeyRejected -and $healthExitCode -in @(0, 10, 70)) {
+        $healthExitCode = Resolve-BRAVOExitCode -InvalidConfiguration
+    }
     # Порушення цілісності інструментів перекриває будь-який інший
     # результат Health — те саме застереження, що раніше стояло в кінці
     # файлу, перенесене сюди без зміни умови.
@@ -548,6 +554,15 @@ foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.Arc
     }
     Import-Module -Name $modulePath -ErrorAction Stop
 }
+# #480: формат-валідація sftpHostKey обов'язкова і в Health (legacy BRAVO.config валідатором loader-а не покривається).
+$hostKeySchemaModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+if (-not (Test-Path -LiteralPath $hostKeySchemaModulePath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль схеми конфігурації: $hostKeySchemaModulePath"
+}
+Import-Module -Name $hostKeySchemaModulePath -ErrorAction Stop
+# sftpHostKey відхилено форматною валідацією -> Health exit 30 (InvalidConfiguration).
+# Ініціалізація на старті runtime (StrictMode; Health також викликається вбудовано з Archive).
+$script:BRAVOHealthSftpHostKeyRejected = $false
 Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
@@ -618,6 +633,8 @@ try {
         [void](Import-BRAVOInstitutionSettings `
             -CredentialSettings $credentialSettings `
             -BravoSettings $bravoSettings)
+        # F4/#481: джерело секретів для egress-шару (див. BRAVO.Logging).
+        Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
     }
 } catch {
     Write-Error "Не вдалося завантажити конфігурацію: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)"
@@ -2225,8 +2242,15 @@ function Test-SFTPHealthConfiguration {
     if ([string]::IsNullOrWhiteSpace($sftpUrl) -or -not $sftpUrl.StartsWith("sftp://")) {
         $errors += "не вдалося сформувати SFTP URL із захищених облікових даних"
     }
+    $hostKeyRejected = $false
     if ([string]::IsNullOrWhiteSpace($sftpHostKey)) {
         $errors += "не встановлено SFTP host key"
+    } else {
+        $hostKeyCheck = Test-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
+        if (-not $hostKeyCheck.IsValid) {
+            $errors += [string]$hostKeyCheck.Message
+            $hostKeyRejected = $true
+        }
     }
     if ([string]::IsNullOrWhiteSpace($winSCPPath) -or -not (Test-Path -Path $winSCPPath -PathType Leaf)) {
         $errors += "не знайдено WinSCP"
@@ -2281,6 +2305,7 @@ function Test-SFTPHealthConfiguration {
         # інструментів, — за нею оркестрація не додає окремий issue
         # «Цілісність інструментів» (без дубля в алерті).
         ToolIntegrityBlocked = $toolIntegrityBlocked
+        HostKeyRejected = $hostKeyRejected
     }
 }
 
@@ -2316,7 +2341,7 @@ function Get-SFTPRemoteArchiveChecksumResults {
         }
         $sessionOptions = New-Object WinSCP.SessionOptions
         $sessionOptions.ParseUrl($sftpUrl)
-        $sessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+        $sessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $sessionOptions.Timeout = [timespan]::FromSeconds(
             [math]::Max(1, [int]$sftpConnectionTimeoutSeconds)
         )
@@ -2420,15 +2445,29 @@ function Invoke-WinSCPHealthSession {
     # зі старими версіями клієнта. Тому всі вставлені в нього локальні шляхи,
     # а також службові файли сеансу тримаємо в гарантовано ASCII-каталозі.
     $temporaryRoot = Get-BRAVOHealthTemporaryRoot
-    $temporaryScriptPath = Join-Path $temporaryRoot "$temporaryName.txt"
+    # Командний файл містить SFTP URL з обліковими даними (open ...), тому
+    # його шлях видає canonical New-BRAVOWinSCPTemporaryScriptPath
+    # (BRAVO.ArchiveRuntime, той самий helper, що Archive/DataRestore): файл
+    # одразу створюється з protected DACL (поточний обліковий запис/SYSTEM/
+    # Administrators), без вікна з успадкованими правами (BUILTIN\Users має
+    # ReadAndExecute на корені runtime). XML-журнал секретів не містить і
+    # лишається в ASCII-безпечному temp-каталозі.
+    $temporaryScriptPath = $null
     $temporaryXmlPath = Join-Path $temporaryRoot "$temporaryName.xml"
     $process = $null
 
     try {
+        if ($null -eq (Get-Command -Name 'New-BRAVOWinSCPTemporaryScriptPath' -ErrorAction SilentlyContinue) -or
+            $null -eq (Get-Command -Name 'Remove-BRAVOWinSCPSensitiveTemporaryScript' -ErrorAction SilentlyContinue)) {
+            throw "canonical helper захищеного WinSCP-скрипта (BRAVO.ArchiveRuntime) недоступний; SFTP-перевірку скасовано без запису облікових даних"
+        }
+        # #480: fail-closed ДО створення командного файлу; throw -> існуючий catch.
+        $validatedHostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
+        $temporaryScriptPath = New-BRAVOWinSCPTemporaryScriptPath
         $scriptLines = @(
             "option batch continue",
             "option confirm off",
-            "open $sftpUrl -hostkey=$sftpHostKey -timeout=$sftpConnectionTimeoutSeconds"
+            "open $sftpUrl -hostkey=`"$validatedHostKey`" -timeout=$sftpConnectionTimeoutSeconds"
         )
         $scriptLines += @($Commands)
         $scriptLines += "exit"
@@ -2459,7 +2498,24 @@ function Invoke-WinSCPHealthSession {
                 $process.Kill()
                 [void]$process.WaitForExit(5000)
             } catch {
+                # Процес міг завершитися сам між WaitForExit і Kill().
                 Write-HealthLog "Не вдалося завершити WinSCP після таймауту: $($_.Exception.Message)" -Level "DEBUG"
+            }
+            # Lock звільняється лише після ПІДТВЕРДЖЕНОГО завершення WinSCP (#290):
+            # якщо процес досі живий, наступна операція могла б захопити звільнений
+            # lock і запустити другий WinSCP паралельно з першим.
+            $winSCPExited = $false
+            try {
+                $winSCPExited = [bool]$process.HasExited
+            } catch {
+                $winSCPExited = $false
+            }
+            if (-not $winSCPExited) {
+                # Тримаємо capture (з lock-потоком) у script scope, щоб GC
+                # не звільнив lock, поки WinSCP ще працює.
+                $script:BRAVOHealthWinSCPLockHeldForLiveProcess = $outputCapture
+                Write-HealthLog "Перевищено таймаут SFTP-перевірки, але WinSCP не завершився; BRAVO_WINSCP lock не звільняється" -Level "ERROR"
+                throw "перевищено таймаут SFTP-перевірки ($timeoutSeconds сек.); WinSCP не завершився"
             }
             if ($null -ne $outputCapture) {
                 [void](Complete-BRAVOProcessOutputCapture -Capture $outputCapture)
@@ -2508,7 +2564,14 @@ function Invoke-WinSCPHealthSession {
             Error = $_.Exception.Message
         }
     } finally {
-        foreach ($temporaryPath in @($temporaryScriptPath, $temporaryXmlPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($temporaryScriptPath)) {
+            try {
+                Remove-BRAVOWinSCPSensitiveTemporaryScript -Path $temporaryScriptPath
+            } catch {
+                Write-HealthLog "Не вдалося прибрати тимчасовий WinSCP-скрипт з обліковими даними ($temporaryScriptPath): $($_.Exception.Message). Видаліть файл вручну." "WARNING"
+            }
+        }
+        foreach ($temporaryPath in @($temporaryXmlPath)) {
             if (Test-Path -LiteralPath $temporaryPath) {
                 Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
             }
@@ -3342,7 +3405,7 @@ function Invoke-WinSCPBAZAComparison {
 
         $sessionOptions = New-Object WinSCP.SessionOptions
         $sessionOptions.ParseUrl($sftpUrl)
-        $sessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+        $sessionOptions.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $sessionOptions.Timeout = [timespan]::FromSeconds(
             [math]::Max(1, [int]$sftpConnectionTimeoutSeconds)
         )
@@ -3550,6 +3613,9 @@ function Get-SFTPHealthIssues {
         -CheckBAZA $checkBAZA `
         -CheckBAZAWWW $checkBAZAWWW
     if (-not $configurationResult.Valid) {
+        if ([bool]$configurationResult.HostKeyRejected) {
+            $script:BRAVOHealthSftpHostKeyRejected = $true
+        }
         return @([pscustomobject]@{
             Kind = "SFTPConnection"
             Component = "SFTP"
@@ -5827,7 +5893,7 @@ if (-not $environmentPreflight.IsWritable) {
                 -Severity "CRITICAL" `
                 -NotificationMode $NotificationMode `
                 -RoutingTable $backupMonitoring.NotificationRouting
-            $environmentChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $environmentMessage
+            $environmentChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $environmentMessage -OmittedContext "CRITICAL"
             Send-BRAVONotificationChunks `
                 -Provider $NotificationProvider `
                 -WebhookUrl $script:NotificationWebhookUrls[$environmentRoute] `
@@ -5850,7 +5916,7 @@ if (-not $environmentPreflight.IsWritable) {
     # Operations-звітність — незалежний канал від Slack/Discord-нотифікації.
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -6408,7 +6474,7 @@ if ($healthIssues.Count -eq 0) {
                 -LogWarningCount $script:BRAVOWarningCount
             $operationsHealthSeverity = [string]$operationsHealthVerdict.Severity
             $operationsHealthMessage = [string]$operationsHealthVerdict.Message
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -6481,7 +6547,7 @@ if ($healthIssues.Count -eq 0) {
                 -Severity $successNotificationSeverity `
                 -NotificationMode $NotificationMode `
                 -RoutingTable $backupMonitoring.NotificationRouting
-            $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage
+            $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage -OmittedContext $successNotificationSeverity
             Send-BRAVONotificationChunks `
                 -Provider $NotificationProvider `
                 -WebhookUrl $script:NotificationWebhookUrls[$successRoute] `
@@ -6635,7 +6701,7 @@ $alertFingerprint = Get-AlertFingerprint -Issues $healthIssues
 # тимчасово пригнічено дедуплікацією однакового алерту на цьому сервері.
 if ($null -ne $operationsReportingSettings) {
     try {
-        Send-BRAVOOperationsEvent `
+        Send-BRAVOOperationsEventSafely `
             -OperationsReportingSettings $operationsReportingSettings `
             -CredentialTargets $credentialSettings.Targets `
             -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -6699,7 +6765,7 @@ try {
         -Severity "CRITICAL" `
         -NotificationMode $NotificationMode `
         -RoutingTable $backupMonitoring.NotificationRouting
-    $issuesChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $slackMessage
+    $issuesChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $slackMessage -OmittedContext "CRITICAL"
     Send-BRAVONotificationChunks `
         -Provider $NotificationProvider `
         -WebhookUrl $script:NotificationWebhookUrls[$issuesRoute] `

@@ -3,6 +3,14 @@
 $compatibilityManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Compatibility\BRAVO.Compatibility.psd1'
 Import-Module -Name $compatibilityManifest -ErrorAction Stop
 
+# Get-SanitizedWinSCPDiagnostic маскує вивід WinSCP канонічним
+# Protect-BRAVOLogSecretBounded, тож BRAVO.Logging мусить бути видимим з
+# області ЦЬОГО модуля, а не лише викликача (той самий прийом, що в
+# BRAVO.ArchiveHelpers). BRAVO.Logging — нижчий модуль без власних
+# імпортів, циклу немає; уже завантажений модуль використовується повторно.
+$loggingManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Logging\BRAVO.Logging.psd1'
+Import-Module -Name $loggingManifest -ErrorAction Stop
+
 function Get-BRAVOBazaSyncModeEffective {
     # Одна canonical точка інтерпретації (safety-review ТЗ п.20: "не
     # дублювати business rules у Archive/Health/DryRun/Diagnose — один
@@ -311,6 +319,10 @@ function Get-BRAVOWinSCPBusyMessage {
         -Text "Запуск WinSCP для ${Operation} заблоковано: виявлено активний WinSCP.com ($processDetails)")
 }
 
+# Межа загальної довжини виводу WinSCP для маскування (#463): вивід
+# маскується цілим, тож межа має вміщати великий вивід синхронізації.
+$script:WinSCPDiagnosticMaximumMaskedCharacters = 5000000
+
 function Get-SanitizedWinSCPDiagnostic {
     # Спільна санітизація stdout/stderr WinSCP.com для Archive і Health
     # runtime — раніше була продубльована окремо в кожному з них, тож
@@ -319,18 +331,41 @@ function Get-SanitizedWinSCPDiagnostic {
     param(
         [AllowNull()]
         [string]$Text,
-        [int]$MaximumLines = 80
+        [int]$MaximumLines = 80,
+        [int]$MaximumLineCharacters = 2000
     )
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
         return ""
     }
 
-    $sanitized = $Text
-    $sanitized = $sanitized -replace '(?i)(sftp://)[^@\s]+@', '$1***@'
-    $sanitized = $sanitized -replace '(?i)(-password=)(?:"[^"]*"|\S+)', '$1***'
+    # Маскування — ЛИШЕ канонічне (#461). Власні regex-заміни тут маскували
+    # значення в лапках чи з екрануванням лише до пробілу, а вставлене ними
+    # `***` ще й ламало повторне маскування у Write-BRAVOLog: канонічний
+    # шаблон бачив значенням `***` і лишав хвіст секрету.
+    #
+    # Маскується ВЕСЬ вивід, ДО відкидання рядків, і значення в лапках
+    # переходить через розрив рядка (#463): перенесений рядок
+    # `-password="AA`, розрив, `SECRET"` інакше лишив би `SECRET"`, а зріз
+    # по рядках до маскування міг би відрізати рядок із ключем і лишити
+    # хвіст без контексту. Межа загальної довжини тут вища, ніж типова:
+    # вивід синхронізації великий, а маскування лінійне (суцільні фрагменти,
+    # на яких канонічний шаблон URL квадратичний, обмежені окремо).
+    #
+    # Fail-closed: якщо маскування недоступне, впало чи текст понад межі
+    # вартості — сирий вивід НЕ повертається, лише позначка без вмісту.
+    try {
+        $masked = Protect-BRAVOLogSecretBounded -Text $Text -QuotedValueSpansLines `
+            -MaximumMaskedCharacters $script:WinSCPDiagnosticMaximumMaskedCharacters
+    } catch {
+        return "вивiд WinSCP не записано: маскування секретiв недоступне"
+    }
+    if ($masked.Omitted) {
+        return "вивiд WinSCP ($($masked.Length) символiв) не записано: надто великий або з надто довгим суцiльним фрагментом для безпечного маскування"
+    }
+
     $lines = @(
-        $sanitized -split '\r?\n' |
+        ([string]$masked.Text) -split '\r?\n' |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
 
@@ -342,7 +377,17 @@ function Get-SanitizedWinSCPDiagnostic {
             $lines | Select-Object -Last $safeMaximumLines
         )
     }
-
+    # Межа довжини рядка (#463): вивід без розривів рядка межа рядків не
+    # обмежує, а Write-BRAVOLog маскує кожне повідомлення повторно. Текст
+    # уже замаскований, тож зріз не лишає уламка секрету.
+    $safeMaximumLineCharacters = [math]::Max(100, $MaximumLineCharacters)
+    $lines = @($lines | ForEach-Object {
+        if ($_.Length -gt $safeMaximumLineCharacters) {
+            $_.Substring(0, $safeMaximumLineCharacters) + " ... [обрiзано символiв: $($_.Length - $safeMaximumLineCharacters)]"
+        } else {
+            $_
+        }
+    })
     return ($lines -join [Environment]::NewLine)
 }
 

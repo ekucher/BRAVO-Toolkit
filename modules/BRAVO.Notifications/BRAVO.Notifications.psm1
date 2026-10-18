@@ -6,6 +6,13 @@ Import-Module -Name $compatibilityManifest -ErrorAction Stop
 $credentialsManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Credentials\BRAVO.Credentials.psd1'
 Import-Module -Name $credentialsManifest -ErrorAction Stop
 
+# F4/#481: єдиний шар маскування тексту, що йде назовні (Protect-BRAVOEgressText).
+# BRAVO.Logging — нижчий модуль без власних імпортів (циклу немає); як і в
+# BRAVO.ArchiveHelpers, імпорт потрібен, бо вкладений Import-Module не робить
+# функції видимими глобально.
+$loggingManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Logging\BRAVO.Logging.psd1'
+Import-Module -Name $loggingManifest -ErrorAction Stop
+
 # Безпечна дефолтна routing-таблиця severity -> канал. Використовується,
 # коли викликач не передав -RoutingTable (стара конфігурація без
 # NotificationRouting) або передав щось не-hashtable.
@@ -614,8 +621,11 @@ function Resolve-BRAVONotificationEndpoint {
         }
     }
 
+    # F4/#481: текст винятку CredRead іде далі в EndpointError і в журнали
+    # викликачів — проходить через єдиний egress-шар.
     if ($lastError) {
-        throw "Не вдалося отримати webhook для $Provider/$Route з Credential Manager: $($lastError.Exception.Message)$missingTargetHint"
+        $endpointFailureText = "Не вдалося отримати webhook для $Provider/$Route з Credential Manager: $($lastError.Exception.Message)$missingTargetHint"
+        throw (Protect-BRAVOEgressText -Text $endpointFailureText -Channel "notification/$Provider").Text
     }
     throw "Webhook для $Provider/$Route не налаштовано в Credential Manager (перевірені targets: $($candidateTargetNames -join ', '))$missingTargetHint"
 }
@@ -731,8 +741,29 @@ function ConvertTo-BRAVONotificationPayloadText {
         [string]$Provider,
 
         [Parameter(Mandatory = $true)]
-        [string]$Message
+        [string]$Message,
+
+        # F4/#481: додаткові точні значення секретів поверх зареєстрованого
+        # джерела (Register-BRAVOEgressSecretSource).
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
+
+        # Контекст (severity) для повідомлення-заглушки, коли маскування
+        # пропущено: оператор бачить ЩО сталося, але не текст.
+        [string]$OmittedContext
     )
+
+    # F4/#481: маскування ДО Limit-BRAVONotificationPayload. Обрізання по
+    # довжині на ще не замаскованому тексті могло б розрізати секрет, і
+    # уламок маскувальник уже не впізнав би. Fail-closed: коли маскування
+    # неможливе, замість тексту йде заглушка, а не сирий текст чи порожнеча.
+    $safe = Protect-BRAVOEgressText -Text $Message -KnownSecret $KnownSecret -Channel "notification/$Provider"
+    if ($safe.Omitted) {
+        $omittedPrefix = "⚠️ BRAVO-Toolkit ($([Environment]::MachineName))"
+        if (-not [string]::IsNullOrWhiteSpace($OmittedContext)) { $omittedPrefix += " $OmittedContext" }
+        $Message = "${omittedPrefix}: $($safe.Text)"
+    } else {
+        $Message = $safe.Text
+    }
 
     # Guard ДО провайдер-специфічної обробки: після нього повідомлення
     # гарантовано ≤ safe limit (< 1900), тож Discord-split структурно дає
@@ -769,6 +800,13 @@ function Send-BRAVONotificationChunks {
         [int]$TimeoutSeconds = 30
     )
 
+    # F4/#481 (defence in depth): кожен chunk ще раз проходить шаблонне
+    # маскування безпосередньо перед транспортом — єдина точка виклику
+    # Send-BRAVOWebhookNotification. Набір секретів порожній свідомо: джерело
+    # вже застосовано в ConvertTo-BRAVONotificationPayloadText, а повторний
+    # резолв зробив би заглушку недосяжною, коли джерело недоступне.
+    $patternOnlySecretSet = [pscustomobject]@{ Secrets = [string[]]@(); Available = $true }
+
     # Обмежений пейсинг між chunk-запитами (task item 12) — знижує шанс
     # власне спровокувати 429 на великих багатоchunk-повідомленнях. 429/
     # Retry-After усередині Send-BRAVOWebhookNotification має пріоритет:
@@ -778,7 +816,8 @@ function Send-BRAVONotificationChunks {
     $chunkIndex = 0
     foreach ($chunk in $MessageChunks) {
         $chunkIndex++
-        Send-BRAVOWebhookNotification -Provider $Provider -WebhookUrl $WebhookUrl -Message $chunk -TimeoutSeconds $TimeoutSeconds
+        $safeChunk = (Protect-BRAVOEgressText -Text $chunk -SecretSet $patternOnlySecretSet -Channel "notification/$Provider").Text
+        Send-BRAVOWebhookNotification -Provider $Provider -WebhookUrl $WebhookUrl -Message $safeChunk -TimeoutSeconds $TimeoutSeconds
         if ($chunkIndex -lt $chunkCount) {
             Start-Sleep -Milliseconds $chunkPacingMilliseconds
         }
@@ -808,6 +847,10 @@ function Send-BRAVONotification {
         [hashtable]$CredentialTargets,
 
         [int]$TimeoutSeconds = 30,
+
+        # F4/#481: точні значення секретів операції (наприклад, пароль архіву)
+        # поверх зареєстрованого джерела; маскуються у тексті повідомлення.
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
 
         # BRAVO-T023: частина runtime трактує ненастроєний webhook як
         # штатний пропуск (WARNING у журналі, результат операції не
@@ -846,12 +889,12 @@ function Send-BRAVONotification {
                 Route = $route
                 Reason = 'EndpointUnavailable'
                 ChunkCount = 0
-                EndpointError = [string]$_.Exception.Message
+                EndpointError = (Protect-BRAVOEgressText -Text ([string]$_.Exception.Message) -KnownSecret $KnownSecret -Channel "notification/$Provider").Text
             }
         }
         return $null
     }
-    $chunks = ConvertTo-BRAVONotificationPayloadText -Provider $Provider -Message $Message
+    $chunks = ConvertTo-BRAVONotificationPayloadText -Provider $Provider -Message $Message -KnownSecret $KnownSecret -OmittedContext $Severity
     Send-BRAVONotificationChunks -Provider $Provider -WebhookUrl $webhookUrl -MessageChunks $chunks -TimeoutSeconds $TimeoutSeconds
 
     if ($PassThru) {

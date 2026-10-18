@@ -322,6 +322,16 @@ Test-BRAVOCondition -Condition (
 ) -Name 'BackupScope/EmptyCompositionIsGlobalError' `
     -Failure 'коли жоден увімкнений компонент не встановлено, має бути глобальна помилка складу (Component=BASELINE)'
 
+# (6b) #413 (п.4): коли серед не встановлених немає жодного з порожнім (а
+# не відсутнім) каталогом джерела, повідомлення BASELINE не повинно
+# згадувати порожні каталоги - регресійна сторона зміни тексту.
+$scopeEmptyMessage = [string](@($scopeEmpty.Findings |
+        Where-Object { [string]$_.Component -eq 'BASELINE' } | Select-Object -First 1).Message)
+Test-BRAVOCondition -Condition (
+    $scopeEmptyMessage -notmatch 'порожній'
+) -Name 'BackupScope/EmptyCompositionMessageOmitsEmptySourceWhenNone' `
+    -Failure "коли жоден з не встановлених компонентів не має порожнього (існуючого) каталогу джерела, повідомлення не має згадувати порожні каталоги: '$scopeEmptyMessage'"
+
 # (7) Автоматичне створення й доповнення baseline.
 $scopeStateRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_SCOPE_STATE_' + [guid]::NewGuid().ToString('N'))
 $scopeRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SELFTEST_SCOPE_RUNTIME_' + [guid]::NewGuid().ToString('N'))
@@ -767,6 +777,21 @@ try {
     ) -Name 'BackupScope/DeclaredEmptySourceNeverConfirmedIsSkippedWithInfo' `
         -Failure "оголошений (bravo.ini), але порожній каталог без підтвердження має пропускатись з Info (scope EmptySource), без Error; scope='$($scope301EmptyNew.Components['BLOG'])' threw='$scope301EmptyNewThrew'"
 
+    # (a2) #413 (п.4): MODEL вимкнено, єдиний увімкнений компонент (BLOG) має
+    # існуючий, але порожній каталог - порожній склад, і повідомлення BASELINE
+    # має назвати цей компонент окремо від «не встановлено».
+    $scope301OnlyBlogEnabled = @{ MODEL = $false; BLOG = $true; BRAVOEXCH = $false; BAZA_APP = $false; BAZA_WWW = $false }
+    $scope301EmptyCompositionScope = Resolve-BRAVOBackupComponentScope -DiscoveryResult $scope301EmptyDiscovery `
+        -EnabledComponents $scope301OnlyBlogEnabled
+    $scope301EmptyCompositionMessage = [string](@($scope301EmptyCompositionScope.Findings |
+                Where-Object { [string]$_.Component -eq 'BASELINE' } | Select-Object -First 1).Message)
+    Test-BRAVOCondition -Condition (
+        [bool]$scope301EmptyCompositionScope.EmptyComposition -and
+        $scope301EmptyCompositionMessage -match 'каталог джерела існує, але порожній' -and
+        $scope301EmptyCompositionMessage.Contains('BLOG')
+    ) -Name 'BackupScope/EmptyCompositionMessageMentionsEmptySource' `
+        -Failure "повідомлення BASELINE для порожнього складу має називати компонент з порожнім (не відсутнім) каталогом джерела окремо від 'не встановлено': '$scope301EmptyCompositionMessage'"
+
     # (b) Компонент був підтверджений у baseline, тепер каталог порожній:
     # WARNING на кожному прогоні, без Error і без зупинки.
     $scope301Emptied = Invoke-BRAVOSelfTestScope301Resolve -Discovery $scope301EmptyDiscovery `
@@ -824,7 +849,7 @@ try {
     }
     $scope301BaselinePath = Get-BRAVODiscoveryBaselinePath -StateRoot $scope301State
     Save-BRAVODiscoveryBaseline -DiscoveryResult $scope301SaveDiscovery -BaselinePath $scope301BaselinePath
-    $scope301SavedJson = Get-Content -LiteralPath $scope301BaselinePath -Raw | ConvertFrom-Json
+    $scope301SavedJson = Get-Content -LiteralPath $scope301BaselinePath -Raw -Encoding UTF8 | ConvertFrom-Json
     Test-BRAVOCondition -Condition (
         [string]$scope301SavedJson.BLOG_SOURCE -eq '' -and
         [string]$scope301SavedJson.MODEL_SOURCE -eq 'C:\ExampleLims\Model' -and
@@ -963,6 +988,80 @@ try {
         $scope301RoInfoWarning.Count -eq 0
     ) -Name 'BackupScope/ReadOnlyScopeReportsEmptySourceSeparately' `
         -Failure "Get-BRAVOBackupNotInstalledComponents має повертати EmptySource і EmptySourceWarning окремо від NotInstalled; warn: empty='$($scope301RoWarnEmpty -join ',')' warning='$($scope301RoWarnWarning -join ',')'; info: empty='$($scope301RoInfoEmpty -join ',')' warning='$($scope301RoInfoWarning -join ',')'"
+
+    # (l2) #413 (п.2): рядки Dry Run (BRAVO_DRY_RUN.ps1) і журнальний рядок
+    # Health (BRAVO.Health.Runtime.ps1) для порожнього каталогу джерела -
+    # прямий тест тексту/формату, а не лише читання коду. Склад береться з
+    # уже протестованої вище Get-BRAVOBackupNotInstalledComponents
+    # ($scope301RoWarn - Warning, $scope301RoInfo - лише Info); обидва
+    # foreach-и не є функціями (інлайн-крок головних скриптів), тому їх
+    # дістають з AST за унікальним літералом і виконують із заглушками
+    # Add-DryRunResult/Write-HealthLog, що лише записують виклики.
+    $scope301DryRunAst = Get-BRAVOSelfTestParsedText -Text $dryRunScriptText
+    $scope301DryRunLoopNode = @($scope301DryRunAst.FindAll(
+            { param($node) $node -is [Management.Automation.Language.ForEachStatementAst] }, $true) |
+            Where-Object { $_.Extent.Text.Contains('"Каталог джерела $dryRunEmptySourceComponent"') }) |
+        Select-Object -First 1
+    $scope301DryRunLoopText = $(if ($null -ne $scope301DryRunLoopNode) { $scope301DryRunLoopNode.Extent.Text } else { '' })
+
+    $scope301HealthAst = Get-BRAVOSelfTestParsedText -Text $healthScriptText
+    $scope301HealthLoopNode = @($scope301HealthAst.FindAll(
+            { param($node) $node -is [Management.Automation.Language.ForEachStatementAst] }, $true) |
+            Where-Object { $_.Extent.Text.Contains('Write-HealthLog ("Каталог джерела') }) |
+        Select-Object -First 1
+    $scope301HealthLoopText = $(if ($null -ne $scope301HealthLoopNode) { $scope301HealthLoopNode.Extent.Text } else { '' })
+
+    $scope301RenderModule = New-Module -ScriptBlock {
+        function Add-DryRunResult {
+            param($Status, $Section, $Name, $Detail)
+            [void]$script:dryRunLines.Add("$Status|$Section|$Name|$Detail")
+        }
+        function Write-HealthLog {
+            param([string]$Message, [string]$Level = 'INFO')
+            [void]$script:healthLines.Add("$Level|$Message")
+        }
+    }
+    $scope301RenderErrors = @{}
+    function Invoke-BRAVOSelfTestScope301Render {
+        param([string]$Label, [object[]]$EmptySource, [object[]]$Warning)
+        try {
+            return (& $scope301RenderModule {
+                    param([string]$DryRunLoopText, [string]$HealthLoopText, [string[]]$EmptySourceList, [string[]]$WarningList)
+                    Set-StrictMode -Version Latest
+                    $script:dryRunLines = New-Object System.Collections.Generic.List[string]
+                    $script:healthLines = New-Object System.Collections.Generic.List[string]
+                    $dryRunEmptySourceComponents = @($EmptySourceList)
+                    $dryRunEmptySourceWarningComponents = @($WarningList)
+                    if ($DryRunLoopText.Length -gt 0) { & ([scriptblock]::Create($DryRunLoopText)) }
+                    $script:healthEmptySourceComponents = @($EmptySourceList)
+                    $script:healthEmptySourceWarningComponents = @($WarningList)
+                    if ($HealthLoopText.Length -gt 0) { & ([scriptblock]::Create($HealthLoopText)) }
+                    [pscustomobject]@{ DryRun = @($script:dryRunLines); Health = @($script:healthLines) }
+                } $scope301DryRunLoopText $scope301HealthLoopText @($EmptySource) @($Warning))
+        } catch {
+            $script:scope301RenderErrors[$Label] = $_.Exception.Message
+            return [pscustomobject]@{ DryRun = @(); Health = @() }
+        }
+    }
+    $scope301WarnRender = Invoke-BRAVOSelfTestScope301Render -Label 'Warn' -EmptySource $scope301RoWarnEmpty -Warning $scope301RoWarnWarning
+    $scope301InfoRender = Invoke-BRAVOSelfTestScope301Render -Label 'Info' -EmptySource $scope301RoInfoEmpty -Warning $scope301RoInfoWarning
+    $scope301WarnDryRunLine = [string](@($scope301WarnRender.DryRun) | Select-Object -First 1)
+    $scope301WarnHealthLine = [string](@($scope301WarnRender.Health) | Select-Object -First 1)
+    $scope301InfoDryRunLine = [string](@($scope301InfoRender.DryRun) | Select-Object -First 1)
+    $scope301InfoHealthLine = [string](@($scope301InfoRender.Health) | Select-Object -First 1)
+    Test-BRAVOCondition -Condition (
+        $scope301DryRunLoopText.Length -gt 0 -and $scope301HealthLoopText.Length -gt 0 -and
+        $scope301RenderErrors.Count -eq 0 -and
+        $scope301WarnDryRunLine -eq 'WARN|Склад|Каталог джерела BLOG|порожній, хоча раніше мав дані: не копіюється й не перевіряється' -and
+        $scope301WarnHealthLine -eq ('WARNING|Каталог джерела BLOG порожній, хоча раніше мав дані: компонент не ' +
+            'копіюється й не перевіряється. Якщо зміна легітимна, підтвердіть новий baseline.') -and
+        $scope301InfoDryRunLine -eq 'PASS|Склад|Каталог джерела BLOG|порожній: не копіюється й не перевіряється' -and
+        $scope301InfoHealthLine -eq 'INFO|Каталог джерела BLOG порожній (не копіюється й не перевіряється)'
+    ) -Name 'BackupScope/EmptySourceDryRunAndHealthLogLinesMatchExactText' `
+        -Failure ("рядки Dry Run і журналу Health для порожнього каталога джерела мають точний текст/формат; " +
+            "warn: dryRun='$scope301WarnDryRunLine' health='$scope301WarnHealthLine'; " +
+            "info: dryRun='$scope301InfoDryRunLine' health='$scope301InfoHealthLine'; " +
+            "errors='$(@($scope301RenderErrors.Keys | ForEach-Object { "${_}=$($scope301RenderErrors[$_])" }) -join '; ')'")
 
     # (m) Guard: явне перевизначення шляху на порожній каталог лишається
     # Error (оператор указав шлях свідомо), як і до #301.

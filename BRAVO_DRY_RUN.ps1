@@ -28,6 +28,9 @@ Import-Module -Name $notificationHelpersPath -ErrorAction Stop
 # BackupRoot readiness, спільна з BRAVO_TASKS_INSTALL.ps1 (не дублюється).
 $dryRunSystemModulePath = Join-Path $PSScriptRoot "modules\BRAVO.System\BRAVO.System.psd1"
 Import-Module -Name $dryRunSystemModulePath -ErrorAction Stop
+# #480: ConvertTo-BRAVOSshHostKeyFingerprint для authenticated SFTP-перевірки.
+$dryRunSchemaModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1"
+Import-Module -Name $dryRunSchemaModulePath -ErrorAction Stop
 
 # Безпечна симуляція BRAVO/VETOFFICE:
 # - не створює архіви, не копіює, не синхронізує і не видаляє файли;
@@ -441,6 +444,7 @@ function Get-RequiredCredentialDescriptors {
         -ArchiveUploadEnabled (Test-SettingEnabled $storageEffective.SFTP.ArchiveUpload) `
         -MaintenanceLogUploadEnabled (Test-SettingEnabled $componentSettings.SFTP.MaintenanceLogUploadEnabled) `
         -ArchiveLogUploadEnabled (Test-SettingEnabled $componentSettings.SFTP.ArchiveLogUploadEnabled) `
+        -RuntimeLogSyncEnabled (Test-SettingEnabled $componentSettings.SFTP.RuntimeLogSyncEnabled) `
         -ScheduledSftpSyncRequired ([bool]$bazaSyncEffective.ScheduledSftpSyncRequired) `
         -BackupMonitoringSftpEnabled (Test-SettingEnabled $backupMonitoring.SFTP.Enabled)
     if ($sftpEnabled) {
@@ -544,10 +548,13 @@ function Test-DryRunWebhookCredential {
     # (P2-знахідка acceptance 5.2.0: тест завжди падав у ALERTS, бо
     # 'alerts' стояв першим). В errors_only GENERAL не перевіряється —
     # тестове повідомлення піде в ALERTS (єдиний активний канал режиму).
+    # #449: унарна кома — інакше однолементна гілка @('alerts') колапсує в
+    # скаляр String під StrictMode (вихід if-виразу розгортає масив так само,
+    # як вихід функції/пайплайна).
     $requiredRoutes = if ($NotificationMode -eq 'errors_only') {
-        @('alerts')
+        , @('alerts')
     } else {
-        @('general', 'alerts')
+        , @('general', 'alerts')
     }
     foreach ($route in $requiredRoutes) {
         $secret = $null
@@ -902,7 +909,7 @@ function Test-SftpDestinationAccess {
         $options.PortNumber = $port
         $options.UserName = $Login
         $options.Password = $Password
-        $options.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+        $options.SshHostKeyFingerprint = ConvertTo-BRAVOSshHostKeyFingerprint -Value $sftpHostKey
         $session.Open($options)
         [void]$session.ListDirectory(".")
 
@@ -1498,6 +1505,7 @@ try {
         -ArchiveUploadEnabled (Test-SettingEnabled $storageEffective.SFTP.ArchiveUpload) `
         -MaintenanceLogUploadEnabled (Test-SettingEnabled $componentSettings.SFTP.MaintenanceLogUploadEnabled) `
         -ArchiveLogUploadEnabled (Test-SettingEnabled $componentSettings.SFTP.ArchiveLogUploadEnabled) `
+        -RuntimeLogSyncEnabled (Test-SettingEnabled $componentSettings.SFTP.RuntimeLogSyncEnabled) `
         -ScheduledSftpSyncRequired ([bool]$bazaSyncEffective.ScheduledSftpSyncRequired) `
         -BackupMonitoringSftpEnabled (Test-SettingEnabled $backupMonitoring.SFTP.Enabled)
     if ($sftpConfigured) {

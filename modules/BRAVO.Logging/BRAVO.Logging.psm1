@@ -70,7 +70,19 @@ function Protect-BRAVOLogSecret {
         # ловлять лише "password=...", URL-креди і webhook-и відомих
         # провайдерів; сирий пароль 7-Zip чи API-ключ без контексту вони
         # пропускають. Без параметра поведінка функції незмінна.
-        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
+
+        # Значення в лапках переходить через розрив рядка (див. нижче) — для
+        # недовіреного виводу інструмента цілим текстом, а не для журналу.
+        [switch]$QuotedValueSpansLines,
+
+        # Межа кількості діапазонів маскування (#463; 0 — без межі). Кожен
+        # збіг — діапазон у пам'яті й у сортуванні, тож для недовіреного
+        # виводу з мільйонами коротких збігів (` -px` поспіль) ціна росте з
+        # їх кількістю. Понад межу — System.OverflowException ДО сортування
+        # і без частково замаскованого результату; Protect-BRAVOLogSecretBounded
+        # перетворює її на Omitted (fail-closed).
+        [ValidateRange(0, 2147483647)][int]$MaximumMaskedSpans = 0
     )
 
     if ([string]::IsNullOrEmpty($Text)) {
@@ -78,6 +90,22 @@ function Protect-BRAVOLogSecret {
     }
 
     $sanitized = $Text
+    # ЄДИНА модель заміни: збіги і відомих значень, і шаблонів шукаються в
+    # ОРИГІНАЛЬНОМУ тексті, перекриті й суміжні діапазони зливаються, і
+    # кожен злитий діапазон замінюється одним ***. Послідовна заміна
+    # лишала б фрагмент, бо перша заміна руйнує контекст для наступної:
+    # - між відомими секретами — для частково перекритих (кінець одного —
+    #   початок іншого) перша заміна руйнує збіг другого;
+    # - між відомим секретом і шаблоном — короткий відомий секрет, що
+    #   збігається із синтаксисом значення (пароль `'`), перетворив би
+    #   `token='AAA LEAK'` на `token=***AAA LEAK***`, і шаблон уже не
+    #   впізнав би лапковане значення, лишивши `LEAK`;
+    # - у зворотному порядку (шаблони першими) — `password=my secret` із
+    #   відомим `my secret` дав би `password=*** secret`, і відоме значення
+    #   вже не знайшлося б цілим.
+    $spanStarts = New-Object 'System.Collections.Generic.List[int]'
+    $spanEnds = New-Object 'System.Collections.Generic.List[int]'
+    $spanLimitMessage = "Protect-BRAVOLogSecret: понад $MaximumMaskedSpans діапазонів маскування"
     if ($null -ne $KnownSecret) {
         # Правило значень: порожнє і whitespace-only НЕ маскуються (інакше
         # *** замінило б кожен пробіл, а секрету там немає); будь-яке інше
@@ -101,8 +129,11 @@ function Protect-BRAVOLogSecret {
         # будується детерміновано, а не через ConvertTo-Json, бо хости
         # екранують по-різному: обидва варіанти екранують " \ і керівні
         # символи (\b \f \n \r \t, решта < 0x20 — \u з 4 hex у нижньому
-        # регістрі), Windows PowerShell 5.1 (JavaScriptSerializer)
-        # додатково & ' < > — тому маскуються обидві форми. Base64 свідомо
+        # регістрі), а також U+0085, U+2028 і U+2029 (#435). Строгий
+        # варіант (PowerShell 7, Newtonsoft.Json) іншого не екранує,
+        # HTML-безпечний (Windows PowerShell 5.1, JavaScriptSerializer ->
+        # HttpEncoder.JavaScriptStringEncode) додатково екранує & ' < >;
+        # тому маскуються обидві форми. Base64 свідомо
         # не додається: його підрядки залежать від вирівнювання і не
         # впізнаються надійно. Виняток кодування не перехоплюється — він
         # іде до викликача (New-BRAVOMaskedLogCopy -> нічого не
@@ -122,7 +153,9 @@ function Protect-BRAVOLogSecret {
                     elseif ($secretCharCode -eq 10) { [void]$jsonBuilder.Append('\n') }
                     elseif ($secretCharCode -eq 13) { [void]$jsonBuilder.Append('\r') }
                     elseif ($secretCharCode -eq 9) { [void]$jsonBuilder.Append('\t') }
-                    elseif ($secretCharCode -lt 32 -or ($jsonEscapeHtmlChars -and ($secretCharCode -eq 38 -or $secretCharCode -eq 39 -or $secretCharCode -eq 60 -or $secretCharCode -eq 62))) {
+                    elseif ($secretCharCode -lt 32 -or
+                        $secretCharCode -eq 0x0085 -or $secretCharCode -eq 0x2028 -or $secretCharCode -eq 0x2029 -or
+                        ($jsonEscapeHtmlChars -and ($secretCharCode -eq 38 -or $secretCharCode -eq 39 -or $secretCharCode -eq 60 -or $secretCharCode -eq 62))) {
                         [void]$jsonBuilder.Append([string][char]92 + 'u' + $secretCharCode.ToString('x4'))
                     } else { [void]$jsonBuilder.Append($secretChar) }
                 }
@@ -135,67 +168,347 @@ function Protect-BRAVOLogSecret {
                 }
             }
         }
-        # Збіги ВСІХ варіантів шукаються в ОРИГІНАЛЬНОМУ тексті, перекриті й
-        # суміжні діапазони зливаються, і кожен злитий діапазон замінюється
-        # одним ***. Послідовна заміна лишала б фрагмент: для частково
-        # перекритих секретів (кінець одного — початок іншого) перша заміна
-        # руйнує збіг другого, і його "хвіст" витікав би.
         # IndexOf(..., Ordinal) — без культури і без regex-семантики:
         # спецсимволи в секреті не інтерпретуються.
-        $spanStarts = New-Object 'System.Collections.Generic.List[int]'
-        $spanEnds = New-Object 'System.Collections.Generic.List[int]'
         foreach ($secretVariant in $secretVariants) {
             $matchIndex = $sanitized.IndexOf([string]$secretVariant, 0, [System.StringComparison]::Ordinal)
             while ($matchIndex -ge 0) {
                 $spanStarts.Add($matchIndex)
                 $spanEnds.Add($matchIndex + $secretVariant.Length)
+                if ($MaximumMaskedSpans -gt 0 -and $spanStarts.Count -gt $MaximumMaskedSpans) {
+                    throw (New-Object System.OverflowException $spanLimitMessage)
+                }
                 $matchIndex = $sanitized.IndexOf([string]$secretVariant, $matchIndex + 1, [System.StringComparison]::Ordinal)
             }
         }
-        if ($spanStarts.Count -gt 0) {
-            [int[]]$orderedStarts = $spanStarts.ToArray()
-            [int[]]$orderedEnds = $spanEnds.ToArray()
-            [Array]::Sort($orderedStarts, $orderedEnds)
-            $maskedBuilder = New-Object System.Text.StringBuilder
-            $copiedUpTo = 0
-            $spanIndex = 0
-            while ($spanIndex -lt $orderedStarts.Length) {
-                $mergedStart = $orderedStarts[$spanIndex]
-                $mergedEnd = $orderedEnds[$spanIndex]
-                $spanIndex++
-                while ($spanIndex -lt $orderedStarts.Length -and $orderedStarts[$spanIndex] -le $mergedEnd) {
-                    if ($orderedEnds[$spanIndex] -gt $mergedEnd) { $mergedEnd = $orderedEnds[$spanIndex] }
-                    $spanIndex++
+    }
+    # Шаблони: група `v` — значення, яке маскується; контекст перед нею
+    # (ключ, схема URL) лишається видимим.
+    # Облікові дані всередині URL: sftp://user:password@host -> sftp://user:***@host
+    # Значення шаблонів нижче: у подвійних лапках, в ОДИНАРНИХ лапках (інакше
+    # `token='AAA LEAK'` маскувалось би лише до першого пробілу й лишало
+    # `token=*** LEAK'`) або без лапок до пробілу. Екранована лапка всередині
+    # значення — не кінець значення, в усіх поширених формах: подвоєна
+    # ('' / "", PowerShell, CSV), зі зворотним слешем (\" / \', C-подібні
+    # мови, JSON) і з бектіком (`" — рідне екранування PowerShell). Інакше
+    # `token='AAA'' LEAK'` чи `token="AAA\" LEAK"` давали б
+    # `token=***' LEAK'` / `token=*** LEAK"`. Символ екранування (\ або `)
+    # поглинає наступний символ (будь-який, крім розриву рядка), тож
+    # неоднозначний випадок (`'C:\dir\' tail`) маскує БІЛЬШЕ — до кінця
+    # рядка, — а не менше. Альтернативи `[^"\\`]`, `[\\`].` і `""`
+    # починаються з різних символів і не перетинаються, а завершення
+    # (лапка, розрив рядка чи кінець тексту) досяжне завжди, тож шаблон
+    # лінійний і без відкату.
+    # Значення в лапках не перетинає розрив рядка: New-BRAVOMaskedLogCopy
+    # маскує журнал ЦІЛИМ текстом, і лапка без пари в одному записі інакше
+    # «з'їла» б усі записи до наступної лапки. Незакрита в межах рядка лапка
+    # (обрізаний чи сформований текст) маскує решту рядка: інакше
+    # `token='AAA LEAK` втратив би лише `'AAA`.
+    # Значення без лапок закінчується на пробільному символі, але те саме
+    # правило екранування діє і тут: \ чи ` поглинає наступний символ,
+    # включно з пробілом. Інакше password=my, бектік, пробіл, secret
+    # (екранований пробіл PowerShell) з відомим секретом `my secret`
+    # маскувався б лише до пробілу й лишав `password=*** secret`.
+    # -QuotedValueSpansLines (#463) — для виводу зовнішнього інструмента,
+    # де логічний рядок може бути перенесений (`-password="AA`, розрив,
+    # `SECRET"`): там значення в лапках переходить через розрив рядка, а
+    # незакрита лапка маскує решту тексту. Поза лапками значення так само
+    # закінчується на пробільному символі. Викликач маскує такий вивід
+    # ЦІЛИМ, до будь-яких зрізів по рядках.
+    # (Тут сам regex — у одинарно-лапкованому PowerShell-літералі, тому
+    # кожна його одинарна лапка записана подвоєною.)
+    # #453 (CPR-453-2): \S* одразу за ЗНАЙДЕНОЮ закриваючою лапкою (не в
+    # гілках розриву рядка/кінця тексту) — інакше текст, приклеєний за нею
+    # без пробілу (password='abc'def), лишався б незамаскованим хвостом; той
+    # самий клас дефекту для обох типів лапок і для обох режимів нижче.
+    if ($QuotedValueSpansLines) {
+        $quotedSecretValue = '(?:"(?:[^"\\`]|[\\`][\s\S]?|"")*(?:"\S*|\z)|''(?:[^''\\`]|[\\`][\s\S]?|'''')*(?:''\S*|\z)|(?:[^\s\\`]|[\\`][^\r\n]?)+)'
+    } else {
+        $quotedSecretValue = '(?:"(?:[^"\\`\r\n]|[\\`][^\r\n]?|"")*(?:"\S*|(?=[\r\n])|\z)|''(?:[^''\\`\r\n]|[\\`][^\r\n]?|'''')*(?:''\S*|(?=[\r\n])|\z)|(?:[^\s\\`]|[\\`][^\r\n]?)+)'
+    }
+    $secretPatterns = @(
+        # Логін може бути порожнім (`sftp://:password@host`, #463) — пароль
+        # маскується і тоді. Схема — ЦІЛИЙ ланцюжок `[a-z0-9+.-]` від його
+        # початку, атомарно (#463; та сама вимога лінійності, що й у #453):
+        # спроба лише з початку ланцюжка і без повернення, тож робота
+        # лінійна. Колишня форма `[a-z][a-z0-9+.-]*` пробувала з КОЖНОГО
+        # символу довгого ланцюжка (тисячі імен файлів по 255 символів у
+        # виводі синхронізації — десятки секунд). Цілий ланцюжок охоплює
+        # будь-який колишній збіг, тож маскується не менше.
+        '(?i)(?<![a-z0-9+.\-])(?>[a-z0-9+.\-]+)://[^:/\s@]*:(?<v>[^@\s]+)@',
+        # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
+        ('(?i)-password=(?<v>' + $quotedSecretValue + ')'),
+        # (?!ath|assword) — коротка форма -p, але не -path і не -password=
+        # (той має власний шаблон вище).
+        ('(?i)\s-p(?!ath|assword)(?<v>' + $quotedSecretValue + ')'),
+        ('(?i)(?:password|passwd|secret|token)\s*[:=]\s*(?<v>' + $quotedSecretValue + ')'),
+        # Webhook URL — сам bearer-секрет, без user:pass@; підтримувані провайдери
+        # (Send-BRAVOWebhookNotification -Provider slack|discord) мають токен
+        # прямо у шляху, а не в окремому параметрі.
+        '(?i)hooks\.slack\.com/services/(?<v>\S+)',
+        '(?i)discord(?:app)?\.com/api/webhooks/(?<v>\S+)'
+    )
+    # Збіги перебираються по одному (Match/NextMatch), а не колекцією
+    # Matches: у пам'яті лишаються лише межі діапазонів.
+    foreach ($secretPattern in $secretPatterns) {
+        $patternMatch = [regex]::Match($sanitized, $secretPattern)
+        while ($patternMatch.Success) {
+            $valueGroup = $patternMatch.Groups['v']
+            if ($valueGroup.Success -and $valueGroup.Length -gt 0) {
+                $spanStarts.Add($valueGroup.Index)
+                $spanEnds.Add($valueGroup.Index + $valueGroup.Length)
+                if ($MaximumMaskedSpans -gt 0 -and $spanStarts.Count -gt $MaximumMaskedSpans) {
+                    throw (New-Object System.OverflowException $spanLimitMessage)
                 }
-                [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $mergedStart - $copiedUpTo)
-                [void]$maskedBuilder.Append('***')
-                $copiedUpTo = $mergedEnd
             }
-            [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $sanitized.Length - $copiedUpTo)
-            $sanitized = $maskedBuilder.ToString()
+            $patternMatch = $patternMatch.NextMatch()
         }
     }
-    # Облікові дані всередині URL: sftp://user:password@host -> sftp://user:***@host
-    $sanitized = $sanitized -replace '(?i)([a-z][a-z0-9+.-]*://[^:/\s@]+):[^@\s]+@', '$1:***@'
-    # Явні параметри пароля у командних рядках WinSCP і 7-Zip.
-    $sanitized = $sanitized -replace '(?i)(-password=)(?:"[^"]*"|\S+)', '$1***'
-    # (?!ath|assword) — інакше це правило повторно "з'їдає" вже замасковане
-    # -password=*** з рядка вище, розпізнавши його як коротку форму -p.
-    $sanitized = $sanitized -replace '(?i)(\s-p)(?!ath|assword)(?:"[^"]*"|\S+)', '$1***'
-    $sanitized = $sanitized -replace '(?i)((?:password|passwd|secret|token)\s*[:=]\s*)(?:"[^"]*"|\S+)', '$1***'
-    # Webhook URL — сам bearer-секрет, без user:pass@; підтримувані провайдери
-    # (Send-BRAVOWebhookNotification -Provider slack|discord) мають токен
-    # прямо у шляху, а не в окремому параметрі.
-    $sanitized = $sanitized -replace '(?i)(hooks\.slack\.com/services/)\S+', '$1***'
-    $sanitized = $sanitized -replace '(?i)(discord(?:app)?\.com/api/webhooks/)\S+', '$1***'
+    if ($spanStarts.Count -gt 0) {
+        [int[]]$orderedStarts = $spanStarts.ToArray()
+        [int[]]$orderedEnds = $spanEnds.ToArray()
+        [Array]::Sort($orderedStarts, $orderedEnds)
+        $maskedBuilder = New-Object System.Text.StringBuilder
+        $copiedUpTo = 0
+        $spanIndex = 0
+        while ($spanIndex -lt $orderedStarts.Length) {
+            $mergedStart = $orderedStarts[$spanIndex]
+            $mergedEnd = $orderedEnds[$spanIndex]
+            $spanIndex++
+            while ($spanIndex -lt $orderedStarts.Length -and $orderedStarts[$spanIndex] -le $mergedEnd) {
+                if ($orderedEnds[$spanIndex] -gt $mergedEnd) { $mergedEnd = $orderedEnds[$spanIndex] }
+                $spanIndex++
+            }
+            [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $mergedStart - $copiedUpTo)
+            [void]$maskedBuilder.Append('***')
+            $copiedUpTo = $mergedEnd
+        }
+        [void]$maskedBuilder.Append($sanitized, $copiedUpTo, $sanitized.Length - $copiedUpTo)
+        $sanitized = $maskedBuilder.ToString()
+    }
     return $sanitized
+}
+
+function Protect-BRAVOLogSecretBounded {
+    # Protect-BRAVOLogSecret для недовіреного виводу зовнішніх інструментів
+    # (7-Zip, WinSCP.com) — з межами вартості. Маскується ПОВНИЙ переданий
+    # текст, без власних зрізів: межа, проведена по ще не замаскованому
+    # тексту, може розрізати секрет, і уламок маскувальник уже не впізнав би.
+    #
+    # Ціна маскування повного тексту обмежується двома межами, інакше
+    # обробка збою могла б зависнути саме тоді, коли діагностика потрібна:
+    # - загальна довжина (-MaximumMaskedCharacters): діапазон на кожен збіг
+    #   відомого значення й копії тексту на кожен шаблон;
+    # - довжина суцільного ланцюжка символів схеми URL `[a-z0-9+.-]`
+    #   (-MaximumTokenCharacters): колишня форма шаблону облікових даних в
+    #   URL (`[a-z][a-z0-9+.-]*://…`) поводилась квадратично саме на
+    #   такому ланцюжку (виміряно: 10 тис. символів — ~2 с, 30 тис. —
+    #   ~17 с); схема тепер атомарна й лінійна (#463), межа лишається як
+    #   запобіжник. Будь-який інший символ (`\`, `_`, пробіл,
+    #   лапки) ланцюжок розриває, тож звичайні шляхи й вивід 7-Zip (короткі
+    #   імена записів) обидві межі не досягають;
+    # - довжина суцільного фрагмента без пробільних символів, що містить
+    #   `://` (-MaximumUrlRunCharacters): той самий шаблон після `://…:`
+    #   сканує `[^@\s]+` до кінця фрагмента на КОЖНОМУ входженні, тож текст
+    #   на кшталт `a://b:a://b:…` без `@` квадратичний навіть із короткими
+    #   ланцюжками схеми (виміряно: ~200 тис. символів одним фрагментом —
+    #   ~150 с). Шаблон не перетинає пробільних символів, тож межа на
+    #   фрагмент обмежує роботу лінійно від загальної довжини;
+    # - кількість діапазонів маскування (-MaximumMaskedSpans, #463): кожен
+    #   збіг — діапазон у пам'яті й у сортуванні, тож мільйони коротких
+    #   збігів (` -px` поспіль у сформованому виводі) коштували б секунди
+    #   й сотні МБ навіть у межах загальної довжини.
+    # Текст понад будь-яку межу НЕ маскується і НЕ пишеться (fail-closed):
+    # викликач отримує Omitted і записує лише позначку з довжиною.
+    #
+    # Повертає [pscustomobject]@{ Text; Omitted; Length }.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Text,
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
+        [ValidateRange(1000, 50000000)][int]$MaximumMaskedCharacters = 200000,
+        [ValidateRange(64, 100000)][int]$MaximumTokenCharacters = 256,
+        [ValidateRange(64, 100000)][int]$MaximumUrlRunCharacters = 512,
+        [ValidateRange(100, 10000000)][int]$MaximumMaskedSpans = 10000,
+        [switch]$QuotedValueSpansLines
+    )
+
+    $sourceText = [string]$Text
+    # Обидві перевірки прив'язані до ПОЧАТКУ ланцюжка/фрагмента
+    # (негативний lookbehind), тож самі лінійні: без прив'язки спроба з
+    # кожної позиції всередині довгого ланцюжка знову була б квадратичною.
+    $longTokenPattern = '(?i)(?<![a-z0-9+.\-])[a-z0-9+.\-]{' + ($MaximumTokenCharacters + 1) + '}'
+    $longUrlRunPattern = '(?<!\S)(?=\S*://)\S{' + ($MaximumUrlRunCharacters + 1) + '}'
+    if ($sourceText.Length -gt $MaximumMaskedCharacters -or
+        [regex]::IsMatch($sourceText, $longTokenPattern) -or
+        [regex]::IsMatch($sourceText, $longUrlRunPattern)) {
+        return [pscustomobject]@{ Text = ''; Omitted = $true; Length = $sourceText.Length }
+    }
+    try {
+        $maskedText = [string](Protect-BRAVOLogSecret -Text $sourceText -KnownSecret $KnownSecret `
+            -QuotedValueSpansLines:$QuotedValueSpansLines -MaximumMaskedSpans $MaximumMaskedSpans)
+    } catch [System.OverflowException] {
+        return [pscustomobject]@{ Text = ''; Omitted = $true; Length = $sourceText.Length }
+    }
+    return [pscustomobject]@{
+        Text = $maskedText
+        Omitted = $false
+        Length = $sourceText.Length
+    }
+}
+
+# F4/#481: єдиний шар маскування тексту, що залишає сервер (сповіщення Slack/
+# Discord, події Operations, Slack-алерти Maintenance). Реєстр джерела
+# секретів — callback, як Set-BRAVOLogConsoleWriter: журналювання — нижчий
+# шар і НЕ імпортує BRAVO.Credentials. Кожен runtime реєструє resolver одразу
+# після появи $credentialSettings; resolver викликається на КОЖНУ подію
+# egress (без кешу), тож значення, прочитані пізніше, теж потрапляють у набір.
+$script:BRAVOEgressSecretResolver = $null
+$script:BRAVOEgressPlaceholder = '[деталі приховано: маскування секретів не вдалося — див. журнал BRAVO на сервері]'
+
+function Register-BRAVOEgressSecretSource {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][scriptblock]$Resolver)
+
+    $script:BRAVOEgressSecretResolver = $Resolver
+}
+
+# Для тестів: повертає стан «resolver не зареєстровано».
+function Unregister-BRAVOEgressSecretSource {
+    [CmdletBinding()]
+    param()
+
+    $script:BRAVOEgressSecretResolver = $null
+}
+
+# Повертає @{ Secrets; Available }. Resolver, що кинув виняток, робить
+# Available=$false: набір секретів невідомий, і викликач не має права
+# вважати текст безпечним (fail-closed). Resolver не зареєстровано —
+# Available=$true і лише шаблонне маскування (хелпери без облікових даних).
+function Resolve-BRAVOEgressSecretSet {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret)
+
+    $secrets = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($knownValue in @($KnownSecret)) {
+        if (-not [string]::IsNullOrWhiteSpace($knownValue)) { $secrets.Add([string]$knownValue) }
+    }
+    $available = $true
+    if ($null -ne $script:BRAVOEgressSecretResolver) {
+        try {
+            foreach ($resolvedValue in @(& $script:BRAVOEgressSecretResolver)) {
+                if ($null -ne $resolvedValue -and -not [string]::IsNullOrWhiteSpace([string]$resolvedValue)) {
+                    $secrets.Add([string]$resolvedValue)
+                }
+            }
+        } catch {
+            $available = $false
+        }
+    }
+    return [pscustomobject]@{
+        Secrets = [string[]]$secrets.ToArray()
+        Available = $available
+    }
+}
+
+# Маскує текст, що йде назовні, і ЗАВЖДИ повертає безпечний Text: замаскований
+# або заглушку. Ніколи '' для непорожнього входу і ніколи сирий текст.
+# Заглушка — коли маскування пропущено (Omitted: межі Bounded), будь-який
+# виняток, недоступне джерело секретів або порожній результат для
+# непорожнього входу. Reason: Limit | MaskingError | SecretSourceUnavailable.
+# Про заміну пишеться один WARNING (-Secondary: код завершення не змінюється)
+# без динамічного тексту, що міг би містити секрет.
+function Protect-BRAVOEgressText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Text,
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
+        # Результат Resolve-BRAVOEgressSecretSet (один раз на подію, коли
+        # маскується кілька полів). -KnownSecret додається поверх нього.
+        [AllowNull()][object]$SecretSet,
+        [string]$Channel = 'egress',
+        [ValidateRange(1000, 50000000)][int]$MaximumMaskedCharacters = 200000,
+        # Примусова заглушка (Reason=Limit) без маскування: для структур,
+        # що перевищують межу вкладеності викликача.
+        [switch]$ForceOmit
+    )
+
+    $sourceText = [string]$Text
+    if ([string]::IsNullOrEmpty($sourceText)) {
+        return [pscustomobject]@{ Text = ''; Masked = $false; Omitted = $false; Reason = ''; Length = 0 }
+    }
+
+    $reason = ''
+    $safeText = ''
+    try {
+        $availableSource = $true
+        $secretValues = New-Object 'System.Collections.Generic.List[string]'
+        if ($null -ne $SecretSet) {
+            $availableSource = [bool]$SecretSet.Available
+            foreach ($setValue in @($SecretSet.Secrets)) {
+                if (-not [string]::IsNullOrWhiteSpace($setValue)) { $secretValues.Add([string]$setValue) }
+            }
+            foreach ($knownValue in @($KnownSecret)) {
+                if (-not [string]::IsNullOrWhiteSpace($knownValue)) { $secretValues.Add([string]$knownValue) }
+            }
+        } else {
+            $resolved = Resolve-BRAVOEgressSecretSet -KnownSecret $KnownSecret
+            $availableSource = [bool]$resolved.Available
+            foreach ($resolvedValue in @($resolved.Secrets)) { $secretValues.Add([string]$resolvedValue) }
+        }
+
+        if ($ForceOmit) {
+            $reason = 'Limit'
+        } elseif (-not $availableSource) {
+            $reason = 'SecretSourceUnavailable'
+        } else {
+            # MaximumTokenCharacters 2048 (а не 256 за замовчуванням): довгі
+            # hex/base64-ланцюжки в звичайному повідомленні не повинні давати
+            # хибну заглушку; решта меж — за замовчуванням Bounded.
+            $bounded = Protect-BRAVOLogSecretBounded -Text $sourceText -KnownSecret $secretValues.ToArray() `
+                -MaximumMaskedCharacters $MaximumMaskedCharacters -MaximumTokenCharacters 2048
+            if ($bounded.Omitted) {
+                $reason = 'Limit'
+            } else {
+                $safeText = [string]$bounded.Text
+                if ([string]::IsNullOrEmpty($safeText)) { $reason = 'MaskingError' }
+            }
+        }
+    } catch {
+        $reason = 'MaskingError'
+    }
+
+    if ($reason -ne '') {
+        try {
+            Write-BRAVOLog -Message ("Egress ({0}): текст ({1} симв.) замінено заглушкою: {2}" -f $Channel, $sourceText.Length, $reason) `
+                -Level 'WARNING' -Component 'EGRESS' -Secondary
+        } catch {
+            # Збій журналу не має повертати сирий текст.
+            $null = $_
+        }
+        return [pscustomobject]@{
+            Text = $script:BRAVOEgressPlaceholder
+            Masked = $true
+            Omitted = $true
+            Reason = $reason
+            Length = $sourceText.Length
+        }
+    }
+
+    return [pscustomobject]@{
+        Text = $safeText
+        Masked = [bool]($safeText -cne $sourceText)
+        Omitted = $false
+        Reason = ''
+        Length = $sourceText.Length
+    }
 }
 
 # #365: маскована КОПІЯ журналу для передачі назовні (SFTP). Маскування
 # застосовується саме до байтів, що вивантажуються, а не до локального
 # журналу заднім числом: локальний файл лишається повним джерелом
-# діагностики на сервері, де він і так під тим самим захистом, що й
-# Credential Manager. Копія кладеться в окремий унікальний каталог під тим
+# діагностики на сервері, де доступ до LOGS обмежують SYSTEM/Administrators
+# (захищений DACL без ACE для групи Users, який виставляє BRAVO_TASKS_INSTALL.ps1;
+# BRAVO_TASKS_DIAGNOSE.ps1 попереджає, якщо Users мають читання). Копія кладеться в окремий унікальний каталог під тим
 # самим ім'ям файлу — тому remote-ім'я (WinSCP put бере leaf-ім'я
 # джерела) не змінюється. Будь-яка помилка читання/запису — виняток:
 # викликач НЕ вивантажує нічого (fail-closed), а не оригінал.
@@ -459,6 +772,11 @@ Export-ModuleMember -Function @(
     'Write-BRAVOLog',
     'Write-BRAVOLogException',
     'Protect-BRAVOLogSecret',
+    'Protect-BRAVOLogSecretBounded',
+    'Register-BRAVOEgressSecretSource',
+    'Unregister-BRAVOEgressSecretSource',
+    'Resolve-BRAVOEgressSecretSet',
+    'Protect-BRAVOEgressText',
     'New-BRAVOMaskedLogCopy',
     'Remove-BRAVOMaskedLogCopy',
     'Get-BRAVOLogStatistics',
