@@ -1497,6 +1497,89 @@ try {
     } finally {
         Remove-Item -LiteralPath $configuratorLegacyRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+# ===== #484 (#473): $quoteChildArgument у Invoke-BRAVOConfiguratorEffectiveComputation
+# лапкує кожен аргумент дочірнього powershell.exe за правилами CommandLineToArgvW:
+# кінцеві '\' перед закривальною лапкою подвоюються (інакше '\"' екранує лапку і
+# аргумент зливається з наступним). Справжній scriptblock береться з AST модуля
+# (не копія), а результат звіряється і з точним рядком, і з реальним розбором
+# CommandLineToArgvW (shell32). =====
+& {
+    $quoteModulePath = Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Effective.psm1'
+    $quoteModuleAst = [Management.Automation.Language.Parser]::ParseFile($quoteModulePath, [ref]$null, [ref]$null)
+    $quoteAssignments = @($quoteModuleAst.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left.Extent.Text -ceq '$quoteChildArgument'
+            }, $true))
+    $quoteChildArgument = $null
+    if ($quoteAssignments.Count -eq 1 -and
+        $quoteAssignments[0].Right.Expression -is [Management.Automation.Language.ScriptBlockExpressionAst]) {
+        $quoteChildArgument = $quoteAssignments[0].Right.Expression.ScriptBlock.GetScriptBlock()
+    }
+    Test-BRAVOCondition ($null -ne $quoteChildArgument) `
+        'Configurator/QuoteChildArgument/ScriptBlockFoundInModule' `
+        'у BRAVO.Configurator.Effective.psm1 має бути рівно одне присвоєння $quoteChildArgument = { ... }'
+
+    if ($null -ne $quoteChildArgument) {
+        # Пари @(вхід, очікуваний рядок аргументу): без кінцевого '\', з одним, з двома,
+        # лише '\' та шлях зі пробілом і кінцевим '\'. Знак '\' береться з [char]92
+        # лише для читабельності очікувань.
+        $quoteBs = [string][char]92
+        $quoteMakeCase = { param([string]$Value, [string]$Expected) return , @($Value, $Expected) }
+        $quoteCases = @(
+            (& $quoteMakeCase ('C:' + $quoteBs + 'dir') ('"C:' + $quoteBs + 'dir"')),
+            (& $quoteMakeCase ('C:' + $quoteBs + 'dir' + $quoteBs) ('"C:' + $quoteBs + 'dir' + $quoteBs + $quoteBs + '"')),
+            (& $quoteMakeCase ('C:' + $quoteBs + 'dir' + $quoteBs + $quoteBs) ('"C:' + $quoteBs + 'dir' + ($quoteBs * 4) + '"')),
+            (& $quoteMakeCase $quoteBs ('"' + ($quoteBs * 2) + '"')),
+            (& $quoteMakeCase ('C:' + $quoteBs + 'my dir' + $quoteBs) ('"C:' + $quoteBs + 'my dir' + $quoteBs + $quoteBs + '"'))
+        )
+        Test-BRAVOCondition (@($quoteCases | Where-Object { @($_).Count -ne 2 }).Count -eq 0 -and @($quoteCases).Count -eq 5) `
+            'Configurator/QuoteChildArgument/CaseTableWellFormed' `
+            'кожен випадок має бути парою (вхід, очікуваний рядок); таблиця має 5 випадків'
+        $quoteExactFailures = New-Object System.Collections.Generic.List[string]
+        foreach ($quoteCase in $quoteCases) {
+            $quoteActual = [string](& $quoteChildArgument $quoteCase[0])
+            if ($quoteActual -cne $quoteCase[1]) {
+                [void]$quoteExactFailures.Add("[$($quoteCase[0])] -> [$quoteActual] (очікувалось [$($quoteCase[1])])")
+            }
+        }
+        Test-BRAVOCondition ($quoteExactFailures.Count -eq 0) `
+            'Configurator/QuoteChildArgument/TrailingBackslashesDoubledBeforeClosingQuote' `
+            ('кінцеві \ перед закривальною лапкою мають подвоюватись, решта шляху - без змін: ' + [string]::Join('; ', $quoteExactFailures.ToArray()))
+
+        # Круговий обхід через реальний CommandLineToArgvW: аргумент лишається одним
+        # елементом і точно збігається з початковим значенням.
+        $quoteRoundTripFailures = New-Object System.Collections.Generic.List[string]
+        if ($null -eq ('BRAVOSelfTest.CommandLineNative' -as [type])) {
+            $quoteNativeSource = [string]::Join("`r`n", @(
+                    '[DllImport("shell32.dll", SetLastError = true)]',
+                    'public static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string lpCmdLine, out int pNumArgs);',
+                    '[DllImport("kernel32.dll")]',
+                    'public static extern IntPtr LocalFree(IntPtr hMem);'))
+            Add-Type -Namespace BRAVOSelfTest -Name CommandLineNative -MemberDefinition $quoteNativeSource
+        }
+        foreach ($quoteCase in $quoteCases) {
+            $quoteCommandLine = 'child.exe ' + [string](& $quoteChildArgument $quoteCase[0]) + ' next'
+            $quoteArgc = 0
+            $quoteArgv = [BRAVOSelfTest.CommandLineNative]::CommandLineToArgvW($quoteCommandLine, [ref]$quoteArgc)
+            try {
+                $quoteArgs = New-Object System.Collections.Generic.List[string]
+                for ($quoteIndex = 0; $quoteIndex -lt $quoteArgc; $quoteIndex++) {
+                    [void]$quoteArgs.Add([Runtime.InteropServices.Marshal]::PtrToStringUni(
+                            [Runtime.InteropServices.Marshal]::ReadIntPtr($quoteArgv, $quoteIndex * [IntPtr]::Size)))
+                }
+            } finally {
+                [void][BRAVOSelfTest.CommandLineNative]::LocalFree($quoteArgv)
+            }
+            if ($quoteArgs.Count -ne 3 -or $quoteArgs[1] -cne $quoteCase[0] -or $quoteArgs[2] -cne 'next') {
+                [void]$quoteRoundTripFailures.Add("[$($quoteCase[0])] -> argc=$($quoteArgs.Count): " + [string]::Join('|', $quoteArgs.ToArray()))
+            }
+        }
+        Test-BRAVOCondition ($quoteRoundTripFailures.Count -eq 0) `
+            'Configurator/QuoteChildArgument/RoundTripsThroughCommandLineToArgvW' `
+            ('лапкований аргумент із кінцевим \ мусить розбиратись CommandLineToArgvW у той самий єдиний аргумент, не зливаючись з наступним: ' + [string]::Join('; ', $quoteRoundTripFailures.ToArray()))
+    }
+}
 # ===== Child-script non-ASCII/apostrophe regression: Invoke-EffectiveChild.ps1
 # раніше писався UTF-8 БЕЗ BOM із шляхами (під GetTempPath() профілю оператора)
 # як single-quoted літерали. Windows PowerShell 5.1 читає BOM-less .ps1 в ANSI,

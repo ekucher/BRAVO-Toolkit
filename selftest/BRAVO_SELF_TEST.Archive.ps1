@@ -1683,10 +1683,34 @@ $archiveCanonicalExitCodes = @(
     [regex]::Matches($archiveExitCodesText, '(?m)^\s+(\d+)\s*=\s*"[A-Za-z]+"\s*$') |
         ForEach-Object { [int]$_.Groups[1].Value }
 )
-$archiveLiteralExitCodes = @(
-    [regex]::Matches($archiveScriptText, '(?im)^\s*exit\s+(\d+)\b') |
-        ForEach-Object { [int]$_.Groups[1].Value }
-)
+# #484 (#470): літерали збираються з AST (ExitStatementAst з конвеєром із єдиного
+# цілого літерала), а не regex-ом по рядках: `exit` у рядках, here-string і
+# коментарях не враховується, а `exit` на будь-якому рівні вкладеності (блок,
+# scriptblock, функція) - так.
+$archiveCollectLiteralExitCodes = {
+    param([string]$SourceText)
+    $parseTokens = $null
+    $parseErrors = $null
+    $parsedAst = [Management.Automation.Language.Parser]::ParseInput($SourceText, [ref]$parseTokens, [ref]$parseErrors)
+    $exitNodes = @($parsedAst.FindAll({
+                param($node) $node -is [Management.Automation.Language.ExitStatementAst]
+            }, $true))
+    $codes = New-Object System.Collections.Generic.List[int]
+    foreach ($exitNode in $exitNodes) {
+        $exitPipeline = $exitNode.Pipeline
+        if ($exitPipeline -is [Management.Automation.Language.PipelineAst] -and
+            $exitPipeline.PipelineElements.Count -eq 1 -and
+            $exitPipeline.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) {
+            $exitExpression = $exitPipeline.PipelineElements[0].Expression
+            if ($exitExpression -is [Management.Automation.Language.ConstantExpressionAst] -and
+                $exitExpression.Value -is [int]) {
+                [void]$codes.Add([int]$exitExpression.Value)
+            }
+        }
+    }
+    return $codes.ToArray()
+}
+$archiveLiteralExitCodes = @(& $archiveCollectLiteralExitCodes $archiveScriptText)
 $archiveNonCanonicalExitCodes = @($archiveLiteralExitCodes | Where-Object { $archiveCanonicalExitCodes -notcontains $_ } | Sort-Object -Unique)
 Test-BRAVOCondition `
     -Condition (
@@ -1697,6 +1721,32 @@ Test-BRAVOCondition `
     ) `
     -Name 'Archive/LiteralExitCodesAreCanonical' `
     -Failure "кожен літеральний exit <число> у BRAVO.Archive.Runtime.ps1 має бути кодом із BRAVO.ExitCodes; поза контрактом: [$($archiveNonCanonicalExitCodes -join ', ')]; літералів: $($archiveLiteralExitCodes.Count); канонічних кодів: $($archiveCanonicalExitCodes.Count)"
+
+# Негативна фікстура AST-збирача: `exit` у рядку, here-string і коментарях
+# ігнорується, голий `exit 1` (і вкладений у if/scriptblock) - ловиться, а
+# `exit $code` (не літерал) - ні.
+$archiveExitFixtureText = [string]::Join("`r`n", @(
+        '# exit 2 у коментарі',
+        '$text = ''exit 3''',
+        '$hereText = @"',
+        'exit 4',
+        '"@',
+        '$message = "потім exit 5 у рядку"',
+        '<# exit 6 у блочному коментарі #>',
+        'if ($false) { exit 1 }',
+        '& { exit 7 }',
+        'exit $code'))
+$archiveExitFixtureCodes = @(& $archiveCollectLiteralExitCodes $archiveExitFixtureText)
+Test-BRAVOCondition `
+    -Condition (
+        $archiveExitFixtureCodes.Count -eq 2 -and
+        $archiveExitFixtureCodes -contains 1 -and
+        $archiveExitFixtureCodes -contains 7 -and
+        @(& $archiveCollectLiteralExitCodes "exit 1`r`n").Count -eq 1 -and
+        @(& $archiveCollectLiteralExitCodes "# exit 1`r`n'exit 1'`r`n").Count -eq 0
+    ) `
+    -Name 'Archive/LiteralExitCodesAstIgnoresStringsAndComments' `
+    -Failure "AST-збирач літеральних exit має ігнорувати exit у рядках, here-string і коментарях та ловити голий exit <число>; отримано: [$($archiveExitFixtureCodes -join ', ')] (очікувалось: 1, 7)"
 
 # ============================================================
 # #480 (F3): валідація sftpHostKey у Archive. Невалідний ключ ('*', acceptnew,
