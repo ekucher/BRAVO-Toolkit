@@ -433,7 +433,8 @@ foreach ($bdConflictCase in @(
         $bdConflictPath = Join-Path $bdConflictRoot 'BRAVO.local.config'
         $bdForeignBytes = (New-Object Text.UTF8Encoding($false)).GetBytes([string]$bdConflictCase.Text)
         $bdForeignText = [string]$bdConflictCase.Text
-        $bdConflictHook = { param($path) [IO.File]::WriteAllBytes($path, (New-Object Text.UTF8Encoding($false)).GetBytes($bdForeignText)) }.GetNewClosure()
+        # Closure — у дочірньому scope (Governance/SelfTestClosuresCreatedInNarrowScope).
+        $bdConflictHook = & { param($ForeignText) { param($path) [IO.File]::WriteAllBytes($path, (New-Object Text.UTF8Encoding($false)).GetBytes($ForeignText)) }.GetNewClosure() } $bdForeignText
         & $bdConflictModule { param($hook) $script:BRAVOConfiguratorSeedAfterMoveHook = $hook } $bdConflictHook
         try {
             $bdConflictResult = New-BRAVOConfiguratorSeedLocalConfig -RuntimeRoot $root -ConfigDirectory $bdConflictRoot `
