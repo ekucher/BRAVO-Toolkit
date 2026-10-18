@@ -356,6 +356,153 @@ function Protect-BRAVOLogSecretBounded {
     }
 }
 
+# F4/#481: єдиний шар маскування тексту, що залишає сервер (сповіщення Slack/
+# Discord, події Operations, Slack-алерти Maintenance). Реєстр джерела
+# секретів — callback, як Set-BRAVOLogConsoleWriter: журналювання — нижчий
+# шар і НЕ імпортує BRAVO.Credentials. Кожен runtime реєструє resolver одразу
+# після появи $credentialSettings; resolver викликається на КОЖНУ подію
+# egress (без кешу), тож значення, прочитані пізніше, теж потрапляють у набір.
+$script:BRAVOEgressSecretResolver = $null
+$script:BRAVOEgressPlaceholder = '[деталі приховано: маскування секретів не вдалося — див. журнал BRAVO на сервері]'
+
+function Register-BRAVOEgressSecretSource {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][scriptblock]$Resolver)
+
+    $script:BRAVOEgressSecretResolver = $Resolver
+}
+
+# Для тестів: повертає стан «resolver не зареєстровано».
+function Unregister-BRAVOEgressSecretSource {
+    [CmdletBinding()]
+    param()
+
+    $script:BRAVOEgressSecretResolver = $null
+}
+
+# Повертає @{ Secrets; Available }. Resolver, що кинув виняток, робить
+# Available=$false: набір секретів невідомий, і викликач не має права
+# вважати текст безпечним (fail-closed). Resolver не зареєстровано —
+# Available=$true і лише шаблонне маскування (хелпери без облікових даних).
+function Resolve-BRAVOEgressSecretSet {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret)
+
+    $secrets = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($knownValue in @($KnownSecret)) {
+        if (-not [string]::IsNullOrWhiteSpace($knownValue)) { $secrets.Add([string]$knownValue) }
+    }
+    $available = $true
+    if ($null -ne $script:BRAVOEgressSecretResolver) {
+        try {
+            foreach ($resolvedValue in @(& $script:BRAVOEgressSecretResolver)) {
+                if ($null -ne $resolvedValue -and -not [string]::IsNullOrWhiteSpace([string]$resolvedValue)) {
+                    $secrets.Add([string]$resolvedValue)
+                }
+            }
+        } catch {
+            $available = $false
+        }
+    }
+    return [pscustomobject]@{
+        Secrets = [string[]]$secrets.ToArray()
+        Available = $available
+    }
+}
+
+# Маскує текст, що йде назовні, і ЗАВЖДИ повертає безпечний Text: замаскований
+# або заглушку. Ніколи '' для непорожнього входу і ніколи сирий текст.
+# Заглушка — коли маскування пропущено (Omitted: межі Bounded), будь-який
+# виняток, недоступне джерело секретів або порожній результат для
+# непорожнього входу. Reason: Limit | MaskingError | SecretSourceUnavailable.
+# Про заміну пишеться один WARNING (-Secondary: код завершення не змінюється)
+# без динамічного тексту, що міг би містити секрет.
+function Protect-BRAVOEgressText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Text,
+        [AllowNull()][AllowEmptyCollection()][string[]]$KnownSecret,
+        # Результат Resolve-BRAVOEgressSecretSet (один раз на подію, коли
+        # маскується кілька полів). -KnownSecret додається поверх нього.
+        [AllowNull()][object]$SecretSet,
+        [string]$Channel = 'egress',
+        [ValidateRange(1000, 50000000)][int]$MaximumMaskedCharacters = 200000,
+        # Примусова заглушка (Reason=Limit) без маскування: для структур,
+        # що перевищують межу вкладеності викликача.
+        [switch]$ForceOmit
+    )
+
+    $sourceText = [string]$Text
+    if ([string]::IsNullOrEmpty($sourceText)) {
+        return [pscustomobject]@{ Text = ''; Masked = $false; Omitted = $false; Reason = ''; Length = 0 }
+    }
+
+    $reason = ''
+    $safeText = ''
+    try {
+        $availableSource = $true
+        $secretValues = New-Object 'System.Collections.Generic.List[string]'
+        if ($null -ne $SecretSet) {
+            $availableSource = [bool]$SecretSet.Available
+            foreach ($setValue in @($SecretSet.Secrets)) {
+                if (-not [string]::IsNullOrWhiteSpace($setValue)) { $secretValues.Add([string]$setValue) }
+            }
+            foreach ($knownValue in @($KnownSecret)) {
+                if (-not [string]::IsNullOrWhiteSpace($knownValue)) { $secretValues.Add([string]$knownValue) }
+            }
+        } else {
+            $resolved = Resolve-BRAVOEgressSecretSet -KnownSecret $KnownSecret
+            $availableSource = [bool]$resolved.Available
+            foreach ($resolvedValue in @($resolved.Secrets)) { $secretValues.Add([string]$resolvedValue) }
+        }
+
+        if ($ForceOmit) {
+            $reason = 'Limit'
+        } elseif (-not $availableSource) {
+            $reason = 'SecretSourceUnavailable'
+        } else {
+            # MaximumTokenCharacters 2048 (а не 256 за замовчуванням): довгі
+            # hex/base64-ланцюжки в звичайному повідомленні не повинні давати
+            # хибну заглушку; решта меж — за замовчуванням Bounded.
+            $bounded = Protect-BRAVOLogSecretBounded -Text $sourceText -KnownSecret $secretValues.ToArray() `
+                -MaximumMaskedCharacters $MaximumMaskedCharacters -MaximumTokenCharacters 2048
+            if ($bounded.Omitted) {
+                $reason = 'Limit'
+            } else {
+                $safeText = [string]$bounded.Text
+                if ([string]::IsNullOrEmpty($safeText)) { $reason = 'MaskingError' }
+            }
+        }
+    } catch {
+        $reason = 'MaskingError'
+    }
+
+    if ($reason -ne '') {
+        try {
+            Write-BRAVOLog -Message ("Egress ({0}): текст ({1} симв.) замінено заглушкою: {2}" -f $Channel, $sourceText.Length, $reason) `
+                -Level 'WARNING' -Component 'EGRESS' -Secondary
+        } catch {
+            # Збій журналу не має повертати сирий текст.
+            $null = $_
+        }
+        return [pscustomobject]@{
+            Text = $script:BRAVOEgressPlaceholder
+            Masked = $true
+            Omitted = $true
+            Reason = $reason
+            Length = $sourceText.Length
+        }
+    }
+
+    return [pscustomobject]@{
+        Text = $safeText
+        Masked = [bool]($safeText -cne $sourceText)
+        Omitted = $false
+        Reason = ''
+        Length = $sourceText.Length
+    }
+}
+
 # #365: маскована КОПІЯ журналу для передачі назовні (SFTP). Маскування
 # застосовується саме до байтів, що вивантажуються, а не до локального
 # журналу заднім числом: локальний файл лишається повним джерелом
@@ -626,6 +773,10 @@ Export-ModuleMember -Function @(
     'Write-BRAVOLogException',
     'Protect-BRAVOLogSecret',
     'Protect-BRAVOLogSecretBounded',
+    'Register-BRAVOEgressSecretSource',
+    'Unregister-BRAVOEgressSecretSource',
+    'Resolve-BRAVOEgressSecretSet',
+    'Protect-BRAVOEgressText',
     'New-BRAVOMaskedLogCopy',
     'Remove-BRAVOMaskedLogCopy',
     'Get-BRAVOLogStatistics',

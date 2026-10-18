@@ -292,7 +292,7 @@ try {
     $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 
     $script:restoreDrillRunStartedAt = Get-Date
-    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console', 'BRAVO.Notifications', 'BRAVO.RestoreVerify', 'BRAVO.Status')) {
+    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.Logging', 'BRAVO.ExitCodes', 'BRAVO.Console', 'BRAVO.Notifications', 'BRAVO.RestoreVerify', 'BRAVO.Status')) {
         $modulePath = Join-Path $runtimeRoot "modules\$moduleName\$moduleName.psd1"
         if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
             throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -327,6 +327,9 @@ try {
         -not (Test-Path -LiteralPath $arcPath -PathType Leaf)) {
         throw "7za.exe не знайдено: $arcPath"
     }
+
+    # F4/#481: джерело секретів для egress-шару (див. BRAVO.Logging).
+    Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
 
     $archiveCredentialTarget = Get-BRAVOCredentialTargetName -CredentialSettings $credentialSettings -Key 'ArchivePassword'
     Initialize-BRAVOCredentialManager

@@ -402,6 +402,8 @@ try {
     [void](Import-BRAVOInstitutionSettings `
         -CredentialSettings $credentialSettings `
         -BravoSettings $bravoSettings)
+    # F4/#481: джерело секретів для egress-шару (див. BRAVO.Logging).
+    Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
 
     # Обов'язкові для відновлення значення конфігурації — усі з наявних
     # секцій, жодного нового ключа BRAVO.config цей runtime не вводить.

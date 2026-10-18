@@ -578,6 +578,12 @@ try {
     $ArchiveCredentialError = Protect-BRAVOLogSecret -Text $_.Exception.Message
 }
 
+# F4/#481: джерело секретів для єдиного egress-шару маскування
+# (Protect-BRAVOEgressText). Реєструється одразу після появи
+# $credentialSettings і ДО будь-якого сповіщення; викликається на кожну
+# подію без кешу, тож значення, прочитані пізніше, теж маскуються.
+Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
+
 $RangeIdMonitoringEnabled = [System.Convert]::ToBoolean($MaintenanceConfig.RangeIdMonitoring.Enabled)
 $RangeIdLogPath = if ($RangeIdMonitoringEnabled) {
     Get-BRAVOSystemRangeIdLogPath
@@ -3205,7 +3211,7 @@ function Invoke-NotificationWebhook {
     )
 
     try {
-        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $Message
+        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $Message -OmittedContext "Maintenance"
         Send-BRAVONotificationChunks `
             -Provider $NotificationProvider `
             -WebhookUrl $WebhookUrl `
@@ -3294,6 +3300,20 @@ function Send-SlackAlert {
         -RoutingTable $bravoSettings.NotificationRouting
     if ($notificationRoute -eq "none") {
         return
+    }
+
+    # F4/#481: текст алерта проходить єдиний egress-шар ПІСЛЯ $isSpaceError
+    # та ПІСЛЯ ранніх виходів (SUCCESS/route=none: без зайвих CredRead)
+    # (регекс працює на сирому локальному тексті) і ДО будь-якої черги
+    # (CriticalErrorsList, NotificationAlertQueue) та негайної відправки:
+    # у чергах, а отже й у Send-FinalReport, лежить уже замаскований текст.
+    # У ізольованому харнесі без Logging — заглушка, а не сирий текст.
+    if (-not [string]::IsNullOrEmpty($Message)) {
+        if ($null -ne (Get-Command -Name Protect-BRAVOEgressText -ErrorAction SilentlyContinue)) {
+            $Message = (Protect-BRAVOEgressText -Text $Message -Channel 'maintenance/alert').Text
+        } else {
+            $Message = '[деталі приховано: маскування секретів не вдалося — див. журнал BRAVO на сервері]'
+        }
     }
 
     if ($isSpaceError) {
@@ -7536,7 +7556,21 @@ function Invoke-CommandWithLog {
         $exitCode = if ($completed) { [int]$process.ExitCode } else { 258 }
     } catch {
         $commandStopwatch.Stop()
+        # F7/#481: текст винятку запуску процесу (Win32Exception тощо) може
+        # нести командний рядок із паролем; маскується ДО журналу. Пароль
+        # архіву (StandardInputText) — відоме значення, шаблони ловлять
+        # `-p<пароль>`. Слак додатково маскує Send-SlackAlert.
         $errorMsg = "ПОМИЛКА під час ${Description}: $($_.Exception.Message)"
+        $errorMaskFailed = $false
+        try {
+            $maskedErrorMsg = Protect-BRAVOLogSecretBounded -Text $errorMsg -KnownSecret @($StandardInputText)
+            if ($maskedErrorMsg.Omitted) { $errorMaskFailed = $true } else { $errorMsg = [string]$maskedErrorMsg.Text }
+        } catch {
+            $errorMaskFailed = $true
+        }
+        if ($errorMaskFailed) {
+            $errorMsg = "ПОМИЛКА під час ${Description}: текст помилки не записано (маскування секретів не вдалося)"
+        }
         Write-Log $errorMsg -Level "ERROR"
         Send-SlackAlert -Message $errorMsg -IsCritical
         $script:criticalErrorOccurred = $true
@@ -7563,6 +7597,23 @@ function Invoke-CommandWithLog {
     }
 
     $commandStopwatch.Stop()
+    # F7/#481: вивід 7-Zip/bravocmd містить імена записів і, за збою, може
+    # цитувати командний рядок із паролем. Маскується ЦІЛИМ текстом ДО
+    # Format-CommandOutput (форматування розриває рядки, а маскування
+    # лапкових значень через розрив потребує -QuotedValueSpansLines).
+    # Fail-closed: коли маскування пропущено/впало, пишеться лише
+    # позначка з довжиною, а не сирий вивід.
+    $outputLength = ([string]$output).Length
+    try {
+        $maskedCommandOutput = Protect-BRAVOLogSecretBounded -Text ([string]$output) -KnownSecret @($StandardInputText) -QuotedValueSpansLines
+        if ($maskedCommandOutput.Omitted) {
+            $output = "(вивід $outputLength символів не записано: надто великий або з надто довгим суцільним фрагментом для безпечного маскування)"
+        } else {
+            $output = [string]$maskedCommandOutput.Text
+        }
+    } catch {
+        $output = "(вивід $outputLength символів не записано: маскування секретів недоступне)"
+    }
     $formattedOutput = Format-CommandOutput -Output $output
 
     if ($exitCode -eq 0) {

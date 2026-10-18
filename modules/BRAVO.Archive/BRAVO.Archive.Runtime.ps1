@@ -438,6 +438,14 @@ if ($credentialHelperLoaded -and -not $NoPause -and
     }
 }
 
+# F4/#481: джерело секретів для єдиного egress-шару маскування
+# (Protect-BRAVOEgressText). Реєструється одразу після появи
+# $credentialSettings і ДО будь-якого сповіщення; викликається на кожну
+# подію без кешу, тож значення, прочитані пізніше, теж маскуються.
+if ($credentialHelperLoaded) {
+    Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
+}
+
 if ($credentialHelperLoaded) {
     try {
         [void](Import-BRAVOInstitutionSettings `
@@ -774,7 +782,7 @@ function Send-ToolIntegrityAlert {
                         -LogPath ([string]$script:logFile) `
                         -LogLabel "Журнал"
 
-                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText -OmittedContext "CRITICAL"
                     Send-BRAVONotificationChunks `
                         -Provider $script:notificationProvider `
                         -WebhookUrl $notificationWebhookUrl `
@@ -881,7 +889,7 @@ function Send-BRAVOArchiveFreeSpaceAlert {
                         -LogPath ([string]$script:logFile) `
                         -LogLabel 'Журнал'
 
-                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText -OmittedContext "CRITICAL"
                     Send-BRAVONotificationChunks `
                         -Provider $script:notificationProvider `
                         -WebhookUrl $notificationWebhookUrl `
@@ -5186,7 +5194,7 @@ function Send-BAZAIncompatibleNameAlert {
             -LogLabel "Повний перелік"
 
             try {
-                $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message
+                $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message -OmittedContext "WARNING"
                 Send-BRAVONotificationChunks `
                     -Provider $script:notificationProvider `
                     -WebhookUrl $notificationWebhookUrl `

@@ -591,6 +591,8 @@ try {
         [void](Import-BRAVOInstitutionSettings `
             -CredentialSettings $credentialSettings `
             -BravoSettings $bravoSettings)
+        # F4/#481: джерело секретів для egress-шару (див. BRAVO.Logging).
+        Register-BRAVOEgressSecretSource -Resolver { (Get-BRAVOLogMaskSecretSet -CredentialSettings (Get-Variable -Name credentialSettings -ValueOnly -ErrorAction SilentlyContinue)).Secrets }
     }
 } catch {
     Write-Error "Не вдалося завантажити конфігурацію: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)"
@@ -5845,7 +5847,7 @@ if (-not $environmentPreflight.IsWritable) {
                 -Severity "CRITICAL" `
                 -NotificationMode $NotificationMode `
                 -RoutingTable $backupMonitoring.NotificationRouting
-            $environmentChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $environmentMessage
+            $environmentChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $environmentMessage -OmittedContext "CRITICAL"
             Send-BRAVONotificationChunks `
                 -Provider $NotificationProvider `
                 -WebhookUrl $script:NotificationWebhookUrls[$environmentRoute] `
@@ -6499,7 +6501,7 @@ if ($healthIssues.Count -eq 0) {
                 -Severity $successNotificationSeverity `
                 -NotificationMode $NotificationMode `
                 -RoutingTable $backupMonitoring.NotificationRouting
-            $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage
+            $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage -OmittedContext $successNotificationSeverity
             Send-BRAVONotificationChunks `
                 -Provider $NotificationProvider `
                 -WebhookUrl $script:NotificationWebhookUrls[$successRoute] `
@@ -6717,7 +6719,7 @@ try {
         -Severity "CRITICAL" `
         -NotificationMode $NotificationMode `
         -RoutingTable $backupMonitoring.NotificationRouting
-    $issuesChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $slackMessage
+    $issuesChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $slackMessage -OmittedContext "CRITICAL"
     Send-BRAVONotificationChunks `
         -Provider $NotificationProvider `
         -WebhookUrl $script:NotificationWebhookUrls[$issuesRoute] `
