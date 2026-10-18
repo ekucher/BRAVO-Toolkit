@@ -289,7 +289,7 @@ presets, керуванням Credential Manager, попереднім пере�
 | `maintenanceSettings.Limits` | `MinimumFreeSpaceGB`, `ExcludedDrives`, `MaximumMdFileSizeGB`, опційний `EstimatedSpaceMarginPercent` (розділ 3.3) |
 | `componentSettings` | які архіви, BAZA, SFTP і SMB потрібно виконувати; `SFTP.Enabled`/`SMB.Enabled` — глобальні вимикачі destination (розділ 3.1) |
 | `backupConsistency` | обов'язковий режим `VSS` і контекст `ClientAccessible` для узгоджених архівів |
-| SFTP | `sftpHostTemplate`, порт, fingerprint `sftpHostKey`, віддалені каталоги |
+| SFTP | `sftpHostTemplate`, порт, fingerprint `sftpHostKey` (формат `ssh-ed25519 255 <43 символи base64>` (префікс `SHA256:` з WinSCP GUI приймається й відсікається) або `ssh-rsa 2048 aa:bb:…` (16 hex-пар); `*`/`acceptnew` заборонені, невалідне значення → код `30`), віддалені каталоги |
 | `smbSettings` | реальний UNC-шлях і підкаталоги, якщо `ArchiveCopy = $true` |
 | `backupMonitoring` | `CheckManagedServices`, допустимий вік копій, SHA512-перевірки і частота повторних alert |
 | `schedulerSettings` | час запуску, імена завдань, таймаути і task account |
@@ -1703,7 +1703,7 @@ health > лише попередження. Код `90` має найвищий 
 | `40` | Провал створення архіву 7-Zip, провал archive preflight (зокрема перевірки вільного місця, розділ 3.3), або (Maintenance) провал відновлення з архіву | `[ERROR]` у секції `АРХІВАЦІЯ <компонент>`/`ВІДНОВЛЕННЯ`; останні рядки stdout/stderr 7-Zip записуються одразу після загального повідомлення. При провалі preflight — `Причина: Недостатньо вільного місця...`, архіви не створювались |
 | `41` | `7z test` не підтвердив цілісність | `Перевiрка цiлiсностi 7-Zip не пройдена` у секції `АРХІВАЦІЯ`; final artifact не публікується |
 | `42` | SHA512 generation/verification failed після успішного `7z t` | Компонент `HASH`; тимчасові артефакти поточної generation прибираються, попередній valid backup лишається незмінним |
-| `50` | SFTP: з'єднання, автентифікація або передача файлу | Секція `ЗАВАНТАЖЕННЯ АРХІВІВ НА SFTP` / `СИНХРОНІЗАЦІЯ BAZA НА SFTP`; перевірте `sftpHostKey` fingerprint і мережевий доступ до TCP 22 |
+| `50` | SFTP: з'єднання, автентифікація або передача файлу | Секція `ЗАВАНТАЖЕННЯ АРХІВІВ НА SFTP` / `СИНХРОНІЗАЦІЯ BAZA НА SFTP`; перевірте `sftpHostKey` fingerprint (невалідний формат або `*`/`acceptnew` дають `30`, а не `50`) і мережевий доступ до TCP 22 |
 | `51` | SMB/NAS: недоступний UNC-шлях або облікові дані | Секція `КОПІЮВАННЯ АРХІВІВ НА NAS/SMB`; перевірте доступність UNC-шляху від `SYSTEM` через `BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess` |
 | `60` | Maintenance: служби, диск, файлове господарство — усе, що не потрапляє під `40`/`41` | Секція, де `Результат: ПОМИЛКА` вперше з'являється в `BRAVO_MAINTENANCE_*.log`; часто — недостатньо вільного місця на томі `LIMSRoot` (`BelowFallbackFloorNoEstimate`: точної вимоги в Maintenance немає, тому `Limits.MinimumFreeSpaceGB` там діє як гейт — розділ 3.3) або служба не в стані `Running` |
 | `70` | Health-check: локальні/SFTP/SMB копії застаріли, або керована служба не працює | `BRAVO_ARCHIV_HEALTH_*.log`, рядки `[ERROR] Проблема ...`; дивіться `LocalVerified`/`SftpVerified`/`SmbVerified`, якщо результат читається програмно |
@@ -1791,6 +1791,10 @@ checks, acceptance) — у `RELEASE_POLICY.md` у корені репозито�
 - не вимикайте `RequireProtectedRuntime`, окрім контрольованої міграції;
 - не додавайте `-delete` до SFTP-синхронізації BAZA: хмара є накопичувальною;
 - після зміни SFTP fingerprint перевірте його через незалежний довірений канал;
+- `sftpHostKey` обов'язково у форматі `<тип> <біти> <відбиток>` (приклад:
+  `ssh-ed25519 255 <43 символи base64>`; префікс `SHA256:` з WinSCP GUI
+  приймається й автоматично відсікається); `*`, `acceptnew` та значення
+  з керуючими символами відхиляються, у WinSCP-скриптах значення береться в лапки;
 - пароль 7-Zip передається утиліті лише через redirected standard input і не
   повинен повертатися до аргументів процесу; це контролює self-test;
 - перед production-змінами завжди виконуйте self-test, `-ValidateOnly` і

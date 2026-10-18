@@ -422,6 +422,21 @@ Health-watchdog (виконується під `SYSTEM`, як і решта за
 маркер = watchdog не стартує нічого. Детальніше — `THREAT_MODEL.md`
 §9.
 
+## 4.3. SSH host-key pinning (`sftpHostKey`)
+
+Значення `sftpHostKey` — єдиний захист SFTP-з'єднання від MITM, тому воно
+перевіряється за форматом `<тип> <біти> <відбиток>` (`ssh-ed25519 255
+<43 символи base64>`, `ssh-rsa 2048 <16 hex-пар>`; кілька ключів через
+`;`; префікс `SHA256:` з WinSCP GUI приймається й відсікається
+автоматично). Відхиляються fail-closed: `*`, `acceptnew`/`accept…`, `any`/`none`,
+порожнє значення, неповний відбиток, зайві лапки, керуючі символи
+(CR/LF/TAB/NUL) та не-ASCII (захист від ін'єкції команд у WinSCP-скрипт).
+Перевірка виконується в loader-і (`BRAVO.local.config`) і окремо в кожному
+споживачі, зокрема для legacy `BRAVO.config`; у WinSCP-скриптах значення
+подається в подвійних лапках. Відбиток отримуйте з панелі провайдера або з
+першого підключення WinSCP, звіреного по незалежному каналу; ніколи не
+вказуйте `acceptnew`. Деталі — THREAT_MODEL.md розділ 7, OPERATIONS.md код `30`.
+
 ## 5. Модель ACL
 
 `BRAVO_TASKS_INSTALL.ps1` (за `schedulerSettings.RequireProtectedRuntime`,
