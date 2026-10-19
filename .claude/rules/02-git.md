@@ -2,7 +2,13 @@
 
 - Inspect `git status` before and after significant work.
 - Inspect `git diff` before finalizing changes.
-- Never commit or push unless explicitly requested.
+- Never commit or push unless explicitly requested. Явне доручення issue/завдання є таким запитом
+  для commit і звичайного push власної task-гілки та PR до `developer`; межі — `BRAVO_AGENT_POLICY.md`,
+  розділ 13.
+- Не додавай closing keywords (`Closes`/`Fixes`/`Resolves #N`) у PR і commit-и без окремого дозволу
+  на закриття issue.
+- Оновлюй власну гілку з `origin/developer` звичайним merge; rebase опублікованої гілки — лише з
+  окремого дозволу (це переписування історії).
 - Never stage unrelated files.
 - Never use `git reset --hard`, `git clean -fd`, force-push, or destructive history rewriting without explicit instruction.
 - Do not amend a commit unless explicitly requested.

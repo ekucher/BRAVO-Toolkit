@@ -1,5 +1,22 @@
 # AGENTS.md
 
+## Обов'язковий маршрут читання
+
+Спільні правила для всіх AI-агентів і harness-ів. Перед будь-якою зміною прочитай у такому порядку:
+
+1. `BRAVO_AGENT_POLICY.md` — канонічна агентна політика, зокрема розділ 13 «Постійні повноваження
+   автономної роботи»: що агент робить автономно для дорученого issue/завдання (гілка, worktree,
+   зміни, перевірки, commit, push власної гілки, PR до `developer`, CI) і що потребує окремого
+   дозволу власника (merge, push у `developer`/`master`, force-push, release/tag/deploy, закриття
+   issues, credentials/ACL/CI permissions/оркестратор, послаблення gates).
+2. Цей файл — інженерна дисципліна BRAVO та карта правил `.claude/rules/` (розділ «Rule loading»).
+3. `.claude/CLAUDE.md` — протокол старту/handoff через `.claude/PROJECT_STATE.md` і проектні
+   інструкції (для Claude Code завантажується автоматично).
+4. Застосовні правила `.claude/rules/*.md` для зачеплених доменів.
+
+Паралельних політик повноважень не створюй: зміни меж автономії вносяться лише в розділ 13
+`BRAVO_AGENT_POLICY.md`.
+
 ## Mission
 
 Act as a senior software engineer maintaining an existing production codebase.
@@ -386,6 +403,12 @@ Do not modify runtime merely to compensate for a test/acceptance harness defect.
 Do not commit, push, force-push, amend, reset, rebase, merge, tag, create releases,
 or delete branches unless the user explicitly requests the specific operation.
 
+Явне доручення issue або завдання і є таким запитом для commit, звичайного push власної
+task-гілки, створення/оновлення PR до `developer` і merge `origin/developer` у власну гілку —
+повний перелік і винятки в `BRAVO_AGENT_POLICY.md`, розділ 13. Merge PR, push у
+`developer`/`master`, force-push, rebase опублікованої гілки, tag/release/deploy і закриття issues
+завжди потребують окремого дозволу власника.
+
 Before a requested commit:
 
 - inspect `git status`;
@@ -405,7 +428,8 @@ Before release-related Git operations:
 
 Never rewrite published history without explicit instruction.
 
-Never silently create:
+Never silently create (тобто без звіту; автономні commit-и, гілки й PR за
+`BRAVO_AGENT_POLICY.md`, розділ 13.1, обов'язково фіксуються у звіті):
 
 - commits;
 - branches;
@@ -528,5 +552,6 @@ Unless the user explicitly changes project policy:
 12. Stable promotion and runtime refactoring must not be mixed.
 13. An accepted RC remains immutable until promotion.
 14. Stable becomes the behavioral baseline for the next development cycle.
-15. Git publication and release actions require explicit user authorization.
+15. Git publication and release actions require explicit user authorization
+    (межі постійних повноважень — `BRAVO_AGENT_POLICY.md`, розділ 13).
 16. Editing code is not completion; validation evidence is required.

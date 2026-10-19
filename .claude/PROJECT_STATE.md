@@ -223,7 +223,9 @@ BLOCKED.
   `VERSION.json`, не створювати 5.3 RC.
 * Без явної авторизації користувача в поточному завданні: жодних
   commit, push, force-push, amend, reset, rebase, merge, змін branch
-  protection, tag, release, видалення гілок.
+  protection, tag, release, видалення гілок. Явне доручення issue/завдання
+  авторизує commit, звичайний push власної task-гілки та PR до `developer`
+  (`BRAVO_AGENT_POLICY.md`, розділ 13.1), але не дії розділу 13.2.
 * Merge з автоматичної сесії — лише за явною авторизацією власника на
   конкретний перелік PR або хвилю (як merge train-и 2026-10-01 і
   correctness wave 2026-10-06/07; ці авторизації вичерпано); без неї

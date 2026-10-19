@@ -9,7 +9,9 @@ This repository already carries two authoritative instruction sets — read them
 - `.claude/CLAUDE.md` — project-specific mandatory policy (Ukrainian): startup/handoff protocol via `.claude/PROJECT_STATE.md`, architecture rules, release lifecycle, git authorization gates. This is loaded automatically for Claude Code sessions and takes precedence over anything below.
 - `AGENTS.md` (root) — the same engineering discipline in English, with a rule-loading map into `.claude/rules/*.md` (`00-workflow`, `01-change-safety`, `02-git`, `03-security`, `04-testing-validation`, `05-architecture`, `06-release-lifecycle`, `07-bravo-runtime-invariants`, `08-documentation-language`, plus language-specific rules).
 
-Read `.claude/PROJECT_STATE.md` at the start of a session — it is the handoff between sessions (canonical branch/HEAD, active issue/PR, completed waves, `NEXT ACTION`). It does not itself authorize commit/push/merge/tag/release — those always require explicit user instruction in the current task.
+**Обов'язково:** канонічні правила агентів — `BRAVO_AGENT_POLICY.md`; маршрут читання — на початку `AGENTS.md`. Межі автономної роботи (що робиться без повторного дозволу для дорученого issue/завдання, а що потребує окремого дозволу власника) — `BRAVO_AGENT_POLICY.md`, розділ 13. Цей файл їх не дублює й не змінює.
+
+Read `.claude/PROJECT_STATE.md` at the start of a session — it is the handoff between sessions (canonical branch/HEAD, active issue/PR, completed waves, `NEXT ACTION`). It does not itself authorize commit/push/merge/tag/release — those always require explicit user instruction in the current task; явне доручення завдання авторизує лише дії розділу 13.1 `BRAVO_AGENT_POLICY.md`.
 
 Documentation in this repo (README, CHANGELOG, docs/, operator runbooks, architecture notes) is written in Ukrainian; keep additions consistent with `.claude/rules/08-documentation-language.md`.
 
@@ -69,7 +71,7 @@ thin root *.ps1 entrypoints  →  modules/BRAVO.<Domain>/  →  canonical implem
 
 - `developer` = development/prerelease; `master` = stable only.
 - An accepted RC (release candidate) is immutable evidence — no refactor/optimize/dedupe/cleanup on it in place; stable promotion must be a metadata-only diff from the accepted RC (see `.claude/rules/06-release-lifecycle.md` for the full gate).
-- Git/GitHub state is the source of truth over any recorded plan or handoff note — verify current branch/HEAD/CI before continuing prior work, and never mutate history (commit/push/merge/tag/rebase/reset) without the user's explicit go-ahead in the current task.
+- Git/GitHub state is the source of truth over any recorded plan or handoff note — verify current branch/HEAD/CI before continuing prior work, and never mutate history (commit/push/merge/tag/rebase/reset) without the user's explicit go-ahead in the current task (явне доручення завдання — це go-ahead лише для дій розділу 13.1 `BRAVO_AGENT_POLICY.md`).
 
 ## Windows/PowerShell constraints
 

@@ -17,11 +17,15 @@ Continue working without owner intervention when:
 - a regression can be fixed without changing product policy;
 - refactoring is needed inside the scope of the delegated task;
 - dependencies between repository components can be resolved from the code;
-- a branch needs rebasing or updating from developer;
+- a branch needs updating from developer (ordinary merge of `origin/developer`;
+  rebase of a published branch needs owner permission — `BRAVO_AGENT_POLICY.md`, розділ 13.2);
 - additional regression tests are necessary;
 - a PR requires changes to become green.
 
 Claude should investigate and resolve these cases itself.
+
+Межі того, що агент робить автономно, а що потребує дозволу власника, визначає
+`BRAVO_AGENT_POLICY.md`, розділ 13; цей файл задає лише формат ескалації.
 
 ## Escalate to owner
 
