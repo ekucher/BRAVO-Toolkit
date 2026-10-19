@@ -775,6 +775,14 @@ function Test-BRAVOConfigV2CutoverGates {
                         foreach ($aliasSwitchName in @('PassThru', 'Force', 'WhatIf', 'Confirm', 'Verbose', 'Debug')) {
                             if (-not ($aliasIsName -or $aliasIsValue) -and $aliasParameterName.Length -gt 0 -and $aliasSwitchName.StartsWith($aliasParameterName, [StringComparison]::OrdinalIgnoreCase)) { $aliasIsSwitch = $true }
                         }
+                        # Псевдоніми (aliases) switch-параметрів Set-Alias/New-Alias на PS 5.1
+                        # ((Get-Command Set-Alias).Parameters): Verbose=vb, Debug=db, WhatIf=wi,
+                        # Confirm=cf; вони не споживають наступний елемент. Псевдоніми
+                        # value-параметрів (ea, wa, infa, ev, wv, iv, ov, ob, pv) навмисно не
+                        # перелічені: вони споживають один аргумент за загальним правилом нижче.
+                        if (-not $aliasIsSwitch -and @('vb', 'db', 'wi', 'cf') -contains $aliasParameterName.ToLowerInvariant()) {
+                            $aliasIsSwitch = $true
+                        }
                         if (-not $aliasParameterArgument -and -not $aliasIsSwitch -and ($aliasElementIndex + 1) -lt $aliasElements.Count) {
                             # параметр зі значенням у наступному елементі
                             # (-Name/-Value/-Option/-Scope/-Description).

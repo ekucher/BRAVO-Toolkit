@@ -4,11 +4,12 @@
 
 - **Test/CI: загрозова матриця гейта `LEGACY_READER_ISOLATION` і закриття прогалин alias та типізованої змінної (#239).**
   `docs/design/BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md` описує класи обходу гейта, його результат
-  (DETECTED / MISSED / FALSE-POSITIVE), компенсуючі контролі та рішення. Кожен рядок матриці закріплений
-  характеризаційним self-test `ReleaseGate/LegacyReaderMatrix/*` на синтетичному тексті; відомі обмеження
+  (DETECTED / MISSED / FALSE-POSITIVE), компенсуючі контролі та рішення. Кожен виконуваний рядок матриці (65)
+  закріплений характеризаційним self-test `ReleaseGate/LegacyReaderMatrix/*` на синтетичному тексті, а рядок X2
+  (`Invoke-Expression`) покритий окремо `ci/Test-BRAVOForbiddenPattern.ps1`, який запускає CI; відомі обмеження
   позначені `KnownLimit` і фіксують поточний результат, тож покращення гейта стане свідомим оновленням тесту.
   У `ci/BRAVOConfigV2CutoverGates.ps1` виправлено лише прогалини 3 і 8 з #239: виклик рідера через
-  `Set-Alias`/`New-Alias` (позиційна й іменована форми, `-Option`) і через типізовану змінну
+  `Set-Alias`/`New-Alias` (позиційна й іменована форми, `-Option`, switch-псевдоніми `-vb`/`-db`/`-wi`/`-cf`) і через типізовану змінну
   (`[string]$r = '...'`). Прогалини 1, 2, 4, 5, 6, 7 не змінювались (рішення власника: без dataflow-аналізу).
   Production-дерево проходить гейт без нових хибних спрацювань; runtime-поведінка BRAVO не змінилась.
 
