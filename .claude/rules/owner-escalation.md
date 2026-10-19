@@ -26,6 +26,8 @@ Claude should investigate and resolve these cases itself.
 
 Межі того, що агент робить автономно, а що потребує дозволу власника, визначає
 `BRAVO_AGENT_POLICY.md`, розділ 13; цей файл задає лише формат ескалації.
+Виправлення падінь CI і доведення PR до green — за порядком LOCAL FIRST (розділ 13.12):
+спершу виправлення й перевірка локально, лише потім новий push; CI не є циклом пробних push.
 
 ## Escalate to owner
 

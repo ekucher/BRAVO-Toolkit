@@ -445,7 +445,9 @@ stable" і "Широка модернізація" з `.claude/rules/06-release-
 Явне доручення issue або завдання і є таким проханням для commit,
 звичайного push власної task-гілки, створення/оновлення PR до `developer`
 і merge `origin/developer` у власну гілку (`BRAVO_AGENT_POLICY.md`,
-розділ 13.1). Merge PR, push у `developer`/`master`, force-push, rebase
+розділ 13.1). Порядок — LOCAL FIRST: push, PR (включно з draft) і
+віддалені workflow лише після локального гейту публікації (розділ 13.12);
+віддалений CI не замінює локальних перевірок. Merge PR, push у `developer`/`master`, force-push, rebase
 опублікованої гілки, tag, реліз, деплой і закриття issues — лише з
 окремого дозволу власника (розділ 13.2).
 

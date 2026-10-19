@@ -6,7 +6,8 @@
 
 1. `BRAVO_AGENT_POLICY.md` — канонічна агентна політика, зокрема розділ 13 «Постійні повноваження
    автономної роботи»: що агент робить автономно для дорученого issue/завдання (гілка, worktree,
-   зміни, перевірки, commit, push власної гілки, PR до `developer`, CI) і що потребує окремого
+   зміни, перевірки, commit; push власної гілки, PR до `developer` і CI — лише після локального
+   гейту публікації, порядок LOCAL FIRST, розділ 13.12) і що потребує окремого
    дозволу власника (merge, push у `developer`/`master`, force-push, release/tag/deploy, закриття
    issues, credentials/ACL/CI permissions/оркестратор, послаблення gates).
 2. Цей файл — інженерна дисципліна BRAVO та карта правил `.claude/rules/` (розділ «Rule loading»).
@@ -405,7 +406,8 @@ or delete branches unless the user explicitly requests the specific operation.
 
 Явне доручення issue або завдання і є таким запитом для commit, звичайного push власної
 task-гілки, створення/оновлення PR до `developer` і merge `origin/developer` у власну гілку —
-повний перелік і винятки в `BRAVO_AGENT_POLICY.md`, розділ 13. Merge PR, push у
+повний перелік і винятки в `BRAVO_AGENT_POLICY.md`, розділ 13. Push і PR — лише після
+локального гейту публікації (розділ 13.12, LOCAL FIRST). Merge PR, push у
 `developer`/`master`, force-push, rebase опублікованої гілки, tag/release/deploy і закриття issues
 завжди потребують окремого дозволу власника.
 
