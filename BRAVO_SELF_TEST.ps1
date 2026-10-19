@@ -24401,6 +24401,113 @@ function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, 
                         "пароль витік=$(@($diagFormatRecords | Where-Object { $_.Contains($diagFixtureLegacyPassword) }).Count), " +
                         "записів з розривом рядка=$(@($diagFormatPathRecords | Where-Object { $_ -match '[\r\n]' }).Count)")
 
+                # #452 (пункт 2, рішення власника 2026-10-19): суворе маскування
+                # відомого секрету. Protect-BRAVOLogSecret -KnownSecret маскує КОЖНЕ
+                # входження значення незалежно від довжини (не лише цілі токени і не
+                # лише від мінімальної довжини) — і в локальному журналі діагностики
+                # 7-Zip, і в копії журналу для SFTP. Втрата читабельності при
+                # короткому паролі архіву прийнята свідомо (безпека понад
+                # читабельність); пом'якшення — довший пароль архіву. Тести фіксують
+                # політику: будь-яке послаблення маскування мусить їх зламати.
+                # Значення вигадані.
+                $diagStrictStubs = @'
+function Invoke-BRAVOSevenZipIntegrityTest {
+    param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+    New-Object PSObject -Property @{
+        Success = $false; ExitCode = 2; TimedOut = $false
+        Description = 'сувора політика'; StandardOutput = ''
+        StandardError = "ERROR: CRC Failed : data.txt`r`nERROR: CRC Failed : BRAVO_data.txt"; Error = ''
+    }
+}
+function Test-BRAVOSevenZipArchiveSpecificFailure { param($Result, $ArchivePath) return $true }
+function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, $Collector, $Logger) return $false }
+'@
+                $diagStrictModule = New-BRAVOSelfTestRuntimeModule `
+                    -SourceText (([IO.File]::ReadAllText(
+                        (Join-Path $root 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1'),
+                        [Text.Encoding]::UTF8)) + "`r`n" + $diagStrictStubs) `
+                    -FunctionNames @(
+                        'Write-BRAVOArchiveHelperLog',
+                        'Get-BRAVOSevenZipDiagnosticStreamLines',
+                        'Get-BRAVOSevenZipDiagnosticReasonText',
+                        'Protect-BRAVOSevenZipDiagnosticText',
+                        'ConvertTo-BRAVOSevenZipDiagnosticSafeLine',
+                        'Join-BRAVOSevenZipDiagnosticRecordLines',
+                        'Write-BRAVOSevenZipFailureDiagnostics',
+                        'Format-BRAVOSevenZipLogPath',
+                        'Invoke-BRAVOSevenZipIntegrityTest',
+                        'Test-BRAVOSevenZipArchiveSpecificFailure',
+                        'Register-BRAVOLegacyBomPasswordFallback',
+                        'Test-SevenZipArchiveIntegrity'
+                    ) `
+                    -PreferLastDefinitionOnDuplicate
+                $diagStrictRuns = & $diagStrictModule {
+                    param($ArchiveLeafOne, $SecretOne, $ArchiveLeafTwo, $SecretTwo)
+                    $script:diagStrictCollected = New-Object System.Collections.Generic.List[string]
+                    $diagStrictLogger = { param($Message, $Level) [void]$script:diagStrictCollected.Add([string]$Message) }
+                    [void](Test-SevenZipArchiveIntegrity -SevenZipPath 'C:\nonexistent\7za.exe' `
+                        -ArchivePath ('C:\nonexistent\' + $ArchiveLeafOne) -Password $SecretOne -Logger $diagStrictLogger)
+                    $oneCount = $script:diagStrictCollected.Count
+                    [void](Test-SevenZipArchiveIntegrity -SevenZipPath 'C:\nonexistent\7za.exe' `
+                        -ArchivePath ('C:\nonexistent\' + $ArchiveLeafTwo) -Password $SecretTwo -Logger $diagStrictLogger)
+                    $all = $script:diagStrictCollected.ToArray()
+                    [pscustomobject]@{
+                        One = ($all[0..($oneCount - 1)] -join "`n")
+                        Two = ($all[$oneCount..($all.Count - 1)] -join "`n")
+                        Path = (Format-BRAVOSevenZipLogPath -Path 'C:\nonexistent\bravo-data.7z' -Password $SecretOne)
+                    }
+                } 'data.7z' 'a' 'BRAVO_data.7z' 'BRAVO'
+                # (a) пароль з 1 символу: кожне входження 'a' у записах (вердикт
+                # інструмента, ім'я запису, шлях) замасковане, жодного уламку.
+                # (b) відомий секрет, що збігається з частиною шляху (BRAVO),
+                # маскує і шлях архіву у вступному записі та headline.
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagStrictRuns.One.Contains('CRC F***iled : d***t***.txt') -and
+                        $diagStrictRuns.One.Contains('CRC F***iled : BRAVO_d***t***.txt') -and
+                        $diagStrictRuns.One.Contains('C:\nonexistent\d***t***.7z') -and
+                        -not $diagStrictRuns.One.Contains('data') -and
+                        # case-sensitive: жоден із УСІХ записів функції не містить 'a'
+                        ($diagStrictRuns.One -cnotmatch 'a') -and
+                        ($diagStrictRuns.Path -cnotmatch 'a') -and
+                        ($diagStrictRuns.Path -ceq 'C:\nonexistent\br***vo-d***t***.7z') -and
+                        $diagStrictRuns.Two.Contains('CRC Failed : ***_data.txt') -and
+                        $diagStrictRuns.Two.Contains('C:\nonexistent\***_data.7z') -and
+                        ($diagStrictRuns.Two -cnotmatch 'BRAVO')
+                    ) `
+                    -Name "SevenZipDiagnostics/ShortKnownSecretMaskedEverywhereIncludingPath" `
+                    -Failure ("політика #452 п. 2: відомий секрет маскується в КОЖНОМУ входженні незалежно від довжини — " +
+                        "у діагностиці і в шляху. Запис з паролем 'a': [$($diagStrictRuns.One -replace "`r?`n", ' | ')]; " +
+                        "шлях з паролем 'a': [$($diagStrictRuns.Path)]; запис з паролем 'BRAVO': [$($diagStrictRuns.Two -replace "`r?`n", ' | ')]")
+
+                # (c) та сама суворість для тексту, що йде у SFTP: канонічна функція
+                # New-BRAVOMaskedLogCopy (BRAVO.Logging) будує копію журналу у
+                # тимчасовому каталозі; мережа не використовується. Усі входження 'a'
+                # і 'BRAVO' у копії замасковані, локальний оригінал не змінюється.
+                $diagRemoteSource = Join-Path $b2TestRoot ("diag_remote_{0}.log" -f [guid]::NewGuid().ToString("N"))
+                $diagRemoteOriginal = 'ERROR: CRC Failed : data.txt in C:\nonexistent\BRAVO_data.7z'
+                [IO.File]::WriteAllText($diagRemoteSource, $diagRemoteOriginal, (New-Object System.Text.UTF8Encoding($false)))
+                $diagRemoteCopy = $null
+                $diagRemoteText = ''
+                try {
+                    $diagRemoteCopy = New-BRAVOMaskedLogCopy -Path $diagRemoteSource -KnownSecret @('a', 'BRAVO')
+                    $diagRemoteText = [IO.File]::ReadAllText($diagRemoteCopy)
+                } finally {
+                    if ($null -ne $diagRemoteCopy) { Remove-BRAVOMaskedLogCopy -Path $diagRemoteCopy }
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $diagRemoteText.Length -gt 0 -and
+                        $diagRemoteText -cnotmatch 'a' -and
+                        -not $diagRemoteText.Contains('BRAVO') -and
+                        $diagRemoteText.Contains('CRC F***iled : d***t***.txt') -and
+                        ([IO.File]::ReadAllText($diagRemoteSource) -ceq $diagRemoteOriginal)
+                    ) `
+                    -Name "SevenZipDiagnostics/RemoteLogCopyKeepsStrictShortSecretMasking" `
+                    -Failure ("копія журналу для SFTP (New-BRAVOMaskedLogCopy) мусить маскувати кожне входження короткого " +
+                        "відомого секрету ('a') і секрету, що збігається з частиною шляху (BRAVO), без мінімальної довжини. " +
+                        "Копія: [$diagRemoteText]")
+
                 # Production-топологія модулів. BRAVO_ARCHIV.ps1 імпортує лише
                 # BRAVO.Archive, а той запускає Runtime.ps1 у session state свого
                 # модуля, тож Import-Module BRAVO.Logging там — вкладений, а не

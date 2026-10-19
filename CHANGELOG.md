@@ -171,11 +171,17 @@
   `Write-BRAVOLog`). #452 п. 1: INFO-початок, SUCCESS і headline збою
   перевірки цілісності 7-Zip форматують шлях архіву одним хелпером
   `Format-BRAVOSevenZipLogPath` (маскування пароля, CR/LF -> пробіл); п. 2
-  (політика коротких паролів) лишається відкритим рішенням власника. Тести:
+  (політика коротких паролів): рішення власника (2026-10-19) — лишити суворе
+  маскування, `Protect-BRAVOLogSecret -KnownSecret` маскує кожне входження
+  відомого секрету незалежно від довжини і в локальному журналі, і в копії
+  для SFTP; зміни коду немає, політику задокументовано (`OPERATIONS.md`,
+  `THREAT_MODEL.md`), оператору рекомендовано довший пароль архіву. Тести:
   `Egress/*`, `Operations/OutboxItemOnDiskHasNoSecret*`,
   `Operations/ModuleImportsLogging`, `Maintenance/SendSlackAlertMasksBeforeQueue`,
   `Maintenance/CommandRunnerMasksOutputAndCatch`,
-  `SevenZipDiagnostics/AllRecordsFormatPathIdentically`.
+  `SevenZipDiagnostics/AllRecordsFormatPathIdentically`,
+  `SevenZipDiagnostics/ShortKnownSecretMaskedEverywhereIncludingPath`,
+  `SevenZipDiagnostics/RemoteLogCopyKeepsStrictShortSecretMasking`.
 - **Виправлено (Maintenance, реставрація): рішення про реставрацію перераховується після отримання lock і перед `bravocmd.exe` (#476).**
   `$shouldRestore` і `$missedRestoreDue` обчислювалися один раз до очікування
   lock (до `OperationLockWaitMinutes`, типово 360 хв). Якщо інший прогін за
