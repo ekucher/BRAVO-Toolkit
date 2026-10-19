@@ -571,7 +571,7 @@ function Run { param($c)
                 'exit 99'
             ) -join "`r`n"
             [IO.File]::WriteAllText($childScriptPath, $childScript, (New-Object Text.UTF8Encoding($true)))
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $childScriptPath *> $null
+            & powershell.exe -NoProfile -File $childScriptPath *> $null
             $childExitCode = $LASTEXITCODE
             $childStatus = Get-BRAVOOperationStatus -Path (Get-BRAVOOperationStatusPath -StateRoot $childStateRoot -Operation $Operation)
             return [pscustomobject]@{ ExitCode = $childExitCode; Status = $childStatus }
@@ -668,7 +668,7 @@ function Run { param($c)
                 'exit 99'
             ) -join "`r`n"
             [IO.File]::WriteAllText($preserveScriptPath, $preserveScript, (New-Object Text.UTF8Encoding($true)))
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $preserveScriptPath *> $null
+            & powershell.exe -NoProfile -File $preserveScriptPath *> $null
             $preserveExitCode = $LASTEXITCODE
             $bytesAfter = if ([IO.File]::Exists($preserveStatusPath)) { [IO.File]::ReadAllBytes($preserveStatusPath) } else { $null }
             $identical = ($null -ne $bytesBefore -and $null -ne $bytesAfter -and [Convert]::ToBase64String($bytesBefore) -ceq [Convert]::ToBase64String($bytesAfter))
