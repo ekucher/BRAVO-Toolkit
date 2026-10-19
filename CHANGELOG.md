@@ -4,7 +4,7 @@
 
 - **Test/CI: загрозова матриця гейта `LEGACY_READER_ISOLATION` і закриття прогалин alias та типізованої змінної (#239).**
   `docs/design/BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md` описує класи обходу гейта, його результат
-  (DETECTED / MISSED / FALSE-POSITIVE), компенсуючі контролі та рішення. Кожен виконуваний рядок матриці (65)
+  (DETECTED / MISSED / FALSE-POSITIVE), компенсуючі контролі та рішення. Кожен виконуваний рядок матриці (71)
   закріплений характеризаційним self-test `ReleaseGate/LegacyReaderMatrix/*` на синтетичному тексті, а рядок X2
   (`Invoke-Expression`) покритий окремо `ci/Test-BRAVOForbiddenPattern.ps1`, який запускає CI; відомі обмеження
   позначені `KnownLimit` і фіксують поточний результат, тож покращення гейта стане свідомим оновленням тесту.

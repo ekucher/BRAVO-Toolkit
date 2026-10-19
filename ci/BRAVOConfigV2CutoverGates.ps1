@@ -757,7 +757,7 @@ function Test-BRAVOConfigV2CutoverGates {
                     $aliasCmdlet = $aliasCmdlet.Substring($aliasCmdlet.LastIndexOf('\') + 1)
                 }
                 if ([string]::IsNullOrEmpty($aliasCmdlet) -or
-                    -not ($aliasCmdlet -ieq 'Set-Alias' -or $aliasCmdlet -ieq 'New-Alias')) {
+                    -not ($aliasCmdlet -ieq 'Set-Alias' -or $aliasCmdlet -ieq 'New-Alias' -or $aliasCmdlet -ieq 'sal' -or $aliasCmdlet -ieq 'nal')) {
                     continue
                 }
                 $aliasNameText = $null
