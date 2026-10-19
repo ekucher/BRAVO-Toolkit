@@ -2797,6 +2797,66 @@ Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcrip
 (`Framework/RunStopped`) і збій самого звіту (мінімальний
 `SELF-TEST FAILED: N` з кодом `1`).
 
+## Симуляція календарного retention (Д/Т/М/Р, #381)
+
+**Це лише симуляція. Автоматичного видалення за цією схемою немає і не буде без окремого рішення
+власника.** `enableArchiveDeletion` лишається `$false` за замовчуванням, а модуль
+`BRAVO.BackupRetention` не підключений до `Remove-BRAVOExpiredBackupGenerations` і не містить жодного
+виклику видалення чи запису. Кількості Д/Т/М/Р та `retentionAllCopiesDays` - відкрите рішення власника:
+у комплекті немає значень за замовчуванням, жодне число не вгадується.
+
+Конфігурація (необов'язкові ключі верхнього рівня; дефолт `$null` = «не налаштовано»; допустимі лише цілі
+`0..3650` без лапок):
+
+| Ключ | Зміст |
+|---|---|
+| `retentionDailyCount` | скільки останніх діб (з наявними COMPLETE-копіями) зберігати по одній копії |
+| `retentionWeeklyCount` | скільки останніх ISO-тижнів зберігати по одній копії |
+| `retentionMonthlyCount` | скільки останніх календарних місяців зберігати по одній копії |
+| `retentionYearlyCount` | скільки останніх календарних років зберігати по одній копії |
+| `retentionAllCopiesDays` | вікно, у якому лишаються ВСІ COMPLETE-копії (різниця календарних діб менша за значення; `0` = вікна немає) |
+
+Невалідне значення (від'ємне, дробове, у лапках, `true`/`false`, більше `3650`) відхиляється вже при
+завантаженні конфігурації (`Import-BravoConfiguration`) із назвою ключа. Ключ повертається до «не
+налаштовано» лише **видаленням рядка** з `BRAVO.local.config`: явний `$null` відхиляється. У старому
+`BRAVO.config`/`BRAVO.local.config`, де ключів немає взагалі, значення `$null`, і симуляція має стан
+`NotConfigured`.
+
+Якщо хоча б один із п'яти ключів `$null`, план має стан `NotConfigured`, `WouldDelete = 0`, а кожна
+generation отримує `Keep`.
+
+Правила пропозиції:
+
+- у кошики потрапляють лише generation із записаним статусом manifest-а `COMPLETE`; представник кошика -
+  найновіша така generation; N - це N найновіших кошиків, що мають хоча б одну COMPLETE;
+- generation зі статусом `INCOMPLETE`/`FAILED` завжди `Keep` з причиною `NotComplete` і не займає слотів
+  (їх прибирає окрема гілка `failedArchiveRetentionDays`, не ця схема);
+- manifest без статусу, зі статусом `null` або невідомим статусом - `Keep` з позначкою `UnknownStatus`;
+- `minimumRetainedVerifiedBackups` (читається політикою; або `-MinimumRetainedCount`) захищає N найновіших
+  COMPLETE (`MinimumRetained`); найновіша COMPLETE (`LastRecoverable`) і найновіша generation взагалі
+  (`Newest`) не можуть бути `WouldDelete`;
+- запис без розбірливих `GenerationId`/дати, із датою в майбутньому або з дубльованим `GenerationId`
+  лишається (`Keep`) з позначкою `MalformedIdentity`/`MalformedDate`/`FutureDated`/`DuplicateIdentity`.
+
+**Архіви й hash-файли симуляція не перевіряє.** COMPLETE береться лише із записаного статусу manifest-а,
+тому пошкоджена COMPLETE-копія в симуляції все одно вважається відновлюваною. Вивід
+`Format-BRAVOBackupRetentionPlanLines` прямо про це попереджає.
+
+Запуск (лише читання; конфігурація завантажується канонічним завантажувачем, без нього
+`Get-BRAVOBackupRetentionPolicy` завершується помилкою):
+
+```powershell
+. .\BRAVO_CONFIG_LOADER.ps1
+[void](Import-BravoConfiguration -ConfigRoot $PWD.Path -RuntimeRoot $PWD.Path)
+Import-Module .\modules\BRAVO.BackupRetention\BRAVO.BackupRetention.psd1
+$policy = Get-BRAVOBackupRetentionPolicy
+$plan = Get-BRAVOBackupRetentionSimulation -BackupRoot $global:backupRootPath -Policy $policy
+Format-BRAVOBackupRetentionPlanLines -Plan $plan
+```
+
+Реальне видалення за цією схемою потребує окремої реалізації та real-server acceptance.
+---
+
 ## Регулярна профілактика
 
 | Періодичність | Дія |

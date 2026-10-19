@@ -330,6 +330,15 @@ function Get-BRAVODefaultConfiguration {
         logRetentionDays = 31
         archiveRetentionDays = 183
         enableArchiveDeletion = $false
+        # #381: календарна схема зберігання (Д/Т/М/Р) - ЛИШЕ симуляція.
+        # $null = "не налаштовано" (не вигадані кількості): симуляція тоді
+        # повідомляє NotConfigured і нічого не планує. Кількості визначає
+        # власник; жоден з цих ключів не вмикає видалення.
+        retentionDailyCount = $null
+        retentionWeeklyCount = $null
+        retentionMonthlyCount = $null
+        retentionYearlyCount = $null
+        retentionAllCopiesDays = $null
         minimumRetainedVerifiedBackups = 2
         failedArchiveRetentionDays = 30
         enableFailedArchiveDeletion = $true

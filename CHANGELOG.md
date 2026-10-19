@@ -2,6 +2,26 @@
 
 ## Не випущено (developer)
 
+- **Feat: симуляція календарного retention Д/Т/М/Р (#381) - лише планування, без видалення.**
+  Новий фокусований модуль `BRAVO.BackupRetention` (залежить лише від `BRAVO.ArchiveHelpers`; публічні
+  `Get-BRAVOBackupRetentionPolicy`, `Get-BRAVOBackupRetentionPlan`, `Get-BRAVOBackupRetentionSimulation`,
+  `Format-BRAVOBackupRetentionPlanLines`). Чиста детермінована `Get-BRAVOBackupRetentionPlan` (ін'єктований
+  `-Now`, жодного доступу до файлової системи) повертає для кожної generation `Keep`/`WouldDelete` з причиною
+  кошика (`Daily`/`Weekly` (ISO)/`Monthly`/`Yearly`/`AllCopies`). У кошики потрапляють лише generation із
+  записаним статусом `COMPLETE`; `INCOMPLETE`/`FAILED` - `Keep` (`NotComplete`), відсутній/невідомий статус -
+  `Keep` з позначкою `UnknownStatus`. `-MinimumRetainedCount` (з `minimumRetainedVerifiedBackups`) захищає N
+  найновіших COMPLETE; найновіша generation і остання COMPLETE не можуть бути `WouldDelete`; нерозбірливі,
+  майбутні й дубльовані записи лишаються з позначкою. Читальний вхід `Get-BRAVOBackupRetentionSimulation`
+  читає manifest-и; архіви й hash-файли не перевіряються, і вивід про це попереджає. Нові необов'язкові ключі
+  конфігурації `retentionDailyCount`, `retentionWeeklyCount`, `retentionMonthlyCount`, `retentionYearlyCount`,
+  `retentionAllCopiesDays` мають дефолт `$null` («не налаштовано»; будь-який `$null` дає стан `NotConfigured`
+  без жодного `WouldDelete`), допустимі лише цілі `0..3650`, невалідні значення (і явний `$null`)
+  відхиляються при завантаженні конфігурації; ключі додано до канонічного переліку ефективної конфігурації.
+  `Get-BRAVOBackupRetentionPolicy` без `-Configuration` завершується помилкою, якщо конфігурацію не
+  завантажено завантажувачем. `enableArchiveDeletion` лишається `$false`; модуль не підключено до
+  `Remove-BRAVOExpiredBackupGenerations`. Кількості Д/Т/М/Р - відкрите рішення власника. Контракт
+  `Authorization/Exactly284CanonicalLeaves` -> `Exactly289CanonicalLeaves` (+5 `ALLOW_WITH_VALIDATOR`).
+  Опис і запуск - у `OPERATIONS.md` («Симуляція календарного retention»).
 - **Feat: профілі напрямків резервного копіювання — «куди копіювати» (#282, хвиля 2).**
   Чотири профілі власника відповідають топологіям наявних пресетів Configurator і пишуть лише наявні
   прапорці, без нових ключів конфігурації: `Cloud` (Хмара, дефолт) ~ `LocalPlusSFTP`, `CloudAndSamba` ~

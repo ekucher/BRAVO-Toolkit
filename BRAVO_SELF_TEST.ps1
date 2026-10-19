@@ -37586,9 +37586,11 @@ foreach ($case in $cases) {
 
     # M3. Таблиця модулів закріплена: ПОВНИЙ перелік каталогів modules\BRAVO.* і
     # відповідний suite для кожного. Новий модуль ламає тест і вимагає свідомого
-    # рішення про мапу (станом на #364: 24 модулі, 11 з suite — додано LogSync).
+    # рішення про мапу (станом на #381: 25 модулів, 12 з suite — додано BackupRetention,
+    # тести якого живуть у suite Archive; раніше #364: 24 модулі, 11 з suite — додано LogSync).
     $suiteMapModuleSuites = @{
         'Archive'                = 'Archive'
+        'BackupRetention'        = 'Archive'
         'BazaSync'               = 'BazaSync'
         'Configuration'          = 'Configuration'
         'Configurator'           = 'Configurator'

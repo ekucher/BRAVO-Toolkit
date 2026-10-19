@@ -318,6 +318,10 @@
     # 'archiveRetentionDays' = 183
     # 'enableArchiveDeletion' = $true
     # 'minimumRetainedVerifiedBackups' = 2
+    # Календарна схема Д/Т/М/Р (#381) - ЛИШЕ симуляція, нічого не видаляє.
+    # Дефолт кожного ключа - $null (не налаштовано); значення визначає власник.
+    # Цілі 0..3650: retentionDailyCount, retentionWeeklyCount,
+    # retentionMonthlyCount, retentionYearlyCount, retentionAllCopiesDays.
     # 'failedArchiveRetentionDays' = 30
     # 'enableFailedArchiveDeletion' = $true
     # 'enableOrphanTempCleanup' = $true

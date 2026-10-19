@@ -4065,6 +4065,111 @@ if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' -De
     }
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/ConfigV2RegressionMatrix' } }
+# ============================================================
+# #381: ключі симуляції retention (retentionDailyCount, retentionWeeklyCount,
+# retentionMonthlyCount, retentionYearlyCount, retentionAllCopiesDays) через
+# канонічний завантажувач Import-BravoConfiguration: legacy-конфіг без ключів,
+# межі 0 і 3650, відхилення невалідних типів/діапазонів на завантаженні,
+# публікація глобальних змінних і fail closed без завантаженої конфігурації.
+# Ключ скидається до "не налаштовано" ЛИШЕ видаленням рядка: явний $null у
+# BRAVO.local.config відхиляється (валідатор IntegerRange не приймає $null).
+# ============================================================
+if (Enter-BRAVOSelfTestSection -Name 'ConfigLoader/RetentionKeys') { try {
+# BEGIN-RETENTION-LOADER-381
+& {
+    $retLoaderRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RETENTION_LOADER_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($retLoaderRoot)
+    try {
+        $retLoaderUtf8 = New-Object System.Text.UTF8Encoding($false)
+        $retNewConfigRoot = {
+            param([string]$Name, [string[]]$OverrideLine = @())
+            $configRoot = Join-Path $retLoaderRoot $Name
+            [void][IO.Directory]::CreateDirectory($configRoot)
+            $backupDir = Join-Path $configRoot 'SITE_BACKUP'
+            [void][IO.Directory]::CreateDirectory($backupDir)
+            $body = "@{`r`n    'pathSettings.BackupRoot' = '$($backupDir.Replace("'", "''"))'`r`n"
+            foreach ($line in @($OverrideLine)) { $body += "    $line`r`n" }
+            $body += "}`r`n"
+            [IO.File]::WriteAllText((Join-Path $configRoot 'BRAVO.local.config'), $body, $retLoaderUtf8)
+            return $configRoot
+        }
+        $retLoadProbeTemplate = @'
+. '__ROOT__\BRAVO_CONFIG_LOADER.ps1'
+try {
+    [void](Import-BravoConfiguration -ConfigRoot '__CFG__' -RuntimeRoot '__ROOT__' 3>$null)
+    Import-Module -Name '__ROOT__\modules\BRAVO.BackupRetention\BRAVO.BackupRetention.psd1' -Force
+    $retNames = 'retentionDailyCount', 'retentionWeeklyCount', 'retentionMonthlyCount', 'retentionYearlyCount', 'retentionAllCopiesDays'
+    $retParts = foreach ($retName in $retNames) {
+        $retVar = Get-Variable -Name $retName -Scope Global -ErrorAction SilentlyContinue
+        if ($null -eq $retVar) { "$retName=<unset>" }
+        elseif ($null -eq $retVar.Value) { "$retName=<null>" }
+        else { "$retName=" + $retVar.Value + ':' + $retVar.Value.GetType().Name }
+    }
+    $retPolicy = Get-BRAVOBackupRetentionPolicy
+    'OK|' + ($retParts -join ';') + '|Configured=' + $retPolicy.IsConfigured + '|Min=' + $retPolicy.MinimumRetainedCount +
+        '|Meta=' + ($null -ne (Get-Variable -Name 'BravoConfigurationMetadata' -Scope Global -ErrorAction SilentlyContinue)) +
+        '|DeleteEnabled=' + [string]$global:enableArchiveDeletion
+} catch { 'THREW:' + $_.Exception.Message }
+'@
+        $retRunLoadProbe = {
+            param([string]$ConfigRoot)
+            $command = $retLoadProbeTemplate.Replace('__ROOT__', $root).Replace('__CFG__', $ConfigRoot)
+            ([string](Invoke-BRAVOConfigLoaderProbe -Command $command)).Trim()
+        }
+
+        # Legacy: ключів у конфігурації немає -> опубліковано $null, політика NotConfigured.
+        $retLegacyOut = & $retRunLoadProbe (& $retNewConfigRoot 'legacy')
+        Test-BRAVOCondition -Condition (
+            $retLegacyOut.StartsWith('OK|') -and
+            $retLegacyOut.Contains('retentionDailyCount=<null>;retentionWeeklyCount=<null>;retentionMonthlyCount=<null>;retentionYearlyCount=<null>;retentionAllCopiesDays=<null>') -and
+            $retLegacyOut.Contains('|Configured=False|Min=2|Meta=True|DeleteEnabled=False')
+        ) -Name 'ConfigLoader/RetentionKeysLegacyConfigPublishesNull' `
+            -Failure "legacy-конфігурація без retention-ключів мусить опублікувати `$null для всіх п'яти, політика NotConfigured, minimumRetained=2, enableArchiveDeletion=False; отримано: $retLegacyOut"
+
+        # Межі 0 і 3650 приймаються, публікуються як Int32.
+        $retBoundaryOut = & $retRunLoadProbe (& $retNewConfigRoot 'boundary' @(
+                "'retentionDailyCount' = 0", "'retentionWeeklyCount' = 3650", "'retentionMonthlyCount' = 0",
+                "'retentionYearlyCount' = 3650", "'retentionAllCopiesDays' = 0"))
+        Test-BRAVOCondition -Condition (
+            $retBoundaryOut.StartsWith('OK|') -and
+            $retBoundaryOut.Contains('retentionDailyCount=0:Int32;retentionWeeklyCount=3650:Int32;retentionMonthlyCount=0:Int32;retentionYearlyCount=3650:Int32;retentionAllCopiesDays=0:Int32') -and
+            $retBoundaryOut.Contains('|Configured=True|')
+        ) -Name 'ConfigLoader/RetentionKeysBoundaryValuesAcceptedAndPublished' `
+            -Failure "межі 0 і 3650 мусять прийматись і публікуватись як Int32; політика Configured; отримано: $retBoundaryOut"
+
+        # Невалідні значення відхиляються на завантаженні (fail closed), без часткової публікації.
+        $retInvalidLoaderOk = $true
+        $retInvalidLoaderDetails = @()
+        $retInvalidIndex = 0
+        foreach ($retInvalidLiteral in @('-1', '3651', '2.5', "'5'", '$true', '$null')) {
+            $retInvalidIndex++
+            $retInvalidOut = & $retRunLoadProbe (& $retNewConfigRoot ("invalid$retInvalidIndex") @("'retentionDailyCount' = $retInvalidLiteral"))
+            $retInvalidLoaderDetails += "$retInvalidLiteral=>$retInvalidOut"
+            if (-not ($retInvalidOut.StartsWith('THREW:') -and $retInvalidOut.Contains('retentionDailyCount'))) { $retInvalidLoaderOk = $false }
+        }
+        Test-BRAVOCondition -Condition $retInvalidLoaderOk -Name 'ConfigLoader/RetentionKeysInvalidValuesRejectedAtLoad' `
+            -Failure "-1, 3651, 2.5, рядок, булеве і явний `$null мусять відхилятись Import-BravoConfiguration з назвою ключа retentionDailyCount; отримано: $($retInvalidLoaderDetails -join ' || ')"
+
+        # Без завантаженої конфігурації (немає маркера завантажувача) - fail closed.
+        $retNoMarkerCommand = @'
+try {
+    Import-Module -Name '__ROOT__\modules\BRAVO.BackupRetention\BRAVO.BackupRetention.psd1' -Force
+    [void](Get-BRAVOBackupRetentionPolicy)
+    'NOTHREW'
+} catch { 'THREW:' + $_.Exception.Message }
+'@.Replace('__ROOT__', $root)
+        $retNoMarkerOut = ([string](Invoke-BRAVOConfigLoaderProbe -Command $retNoMarkerCommand)).Trim()
+        Test-BRAVOCondition -Condition (
+            $retNoMarkerOut.StartsWith('THREW:') -and $retNoMarkerOut.Contains('BravoConfigurationMetadata')
+        ) -Name 'ConfigLoader/RetentionPolicyWithoutLoadedConfigurationFailsClosed' `
+            -Failure "Get-BRAVOBackupRetentionPolicy без -Configuration і без маркера завантажувача мусить завершитись помилкою; отримано: $retNoMarkerOut"
+    } finally {
+        Remove-Item -LiteralPath $retLoaderRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+# END-RETENTION-LOADER-381
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'ConfigLoader/RetentionKeys' } }
+
 # Раннер проб зупиняється в ConfigLoader/Authorization; тут — на випадок,
 # коли ту секцію пропущено або вона впала раніше.
 Stop-BRAVOConfigLoaderProbeWorker

@@ -110,6 +110,15 @@ $script:BRAVOConfigurationSchemaUndeterminedLeaf = @{
     'discoverySettings.Sources.BAZA_WWW'    = @{ Kind = 'String'; Nullable = $true }
     'discoverySettings.Sources.BACKUP_ROOT' = @{ Kind = 'String'; Nullable = $true }
 
+    # #381: дефолт $null = "кількість не налаштовано" (симуляція retention
+    # тоді NotConfigured). Рід Number: цілі невід'ємні значення додатково
+    # охороняє IntegerRange-валідатор авторизації й нормалізатор retention.
+    'retentionDailyCount'    = @{ Kind = 'Number'; Nullable = $true }
+    'retentionWeeklyCount'   = @{ Kind = 'Number'; Nullable = $true }
+    'retentionMonthlyCount'  = @{ Kind = 'Number'; Nullable = $true }
+    'retentionYearlyCount'   = @{ Kind = 'Number'; Nullable = $true }
+    'retentionAllCopiesDays' = @{ Kind = 'Number'; Nullable = $true }
+
     # Дефолт @() (канонічно порожній перелік виключених дисків) не несе
     # жодного елемента, з якого можна вивести рід.
     'maintenanceSettings.Limits.ExcludedDrives' = @{ Kind = 'Array'; ElementKind = 'String' }
@@ -870,6 +879,11 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'requireAdministrator' = @{ Class = 'DENY_SECURITY_CONTROL'; WeakeningOverride = 'ExistingSecurityEscapeHatch' }
     'restoreVerifySettings.MaxVerificationAgeHours' = @{ Class = 'ALLOW_SITE' }
     'restoreVerifySettings.MinimumFileCount' = @{ Class = 'ALLOW_SITE' }
+    'retentionAllCopiesDays' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:0,3650' }
+    'retentionDailyCount' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:0,3650' }
+    'retentionMonthlyCount' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:0,3650' }
+    'retentionWeeklyCount' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:0,3650' }
+    'retentionYearlyCount' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:0,3650' }
     'robocopyMaxSuccessExitCode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:0,7' }
     'robocopyOptions' = @{ Class = 'DENY_EXECUTION_CONTROL' }
     'robocopyPath' = @{ Class = 'DENY_EXECUTION_CONTROL' }

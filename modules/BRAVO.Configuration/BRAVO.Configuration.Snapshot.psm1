@@ -14,7 +14,7 @@
 # НАВІЩО ВОНО ІСНУЄ. Критерій приймання міграції site-значень з
 # BRAVO.config у BRAVO.local.config - "ефективні значення не змінились".
 # Довести це можна лише над ПОВНИМ графом: ефективна конфігурація - це
-# 77 іменованих $global:-змінних, а не три корені. Без канонічного
+# 83 іменованих $global:-змінних, а не три корені. Без канонічного
 # переліку кожен інструмент вів би власну копію цього списку, і мовчазне
 # розходження копій знецінило б сам доказ.
 #
@@ -66,7 +66,10 @@ function Get-BRAVOEffectiveConfigurationVariableName {
         'lunchArchiveCleanupPath', 'lunchArchiveRetentionMonths',
         'minimumRetainedVerifiedBackups', 'operationLockSettings',
         'orphanTempRetentionHours', 'progressSettings',
-        'requireAdministrator', 'robocopyMaxSuccessExitCode',
+        'requireAdministrator', 'retentionAllCopiesDays',
+        'retentionDailyCount', 'retentionMonthlyCount',
+        'retentionWeeklyCount', 'retentionYearlyCount',
+        'robocopyMaxSuccessExitCode',
         'robocopyOptions', 'robocopyPath', 'robocopyWindowStyle',
         'sftpConnectionTimeoutSeconds', 'sftpHostKey', 'sftpHostTemplate',
         'sftpPort', 'sftpSynchronizationOptions', 'smbSettings',

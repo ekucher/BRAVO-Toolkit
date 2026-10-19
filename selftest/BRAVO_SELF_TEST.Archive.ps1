@@ -1856,3 +1856,435 @@ Test-BRAVOCondition -Condition (
     $archiveScriptText -match '(?s)Resolve-BRAVOSyncBazaExitCode -SyncSucceeded \$manualSyncSuccess -EmptySourceWarningCount \$syncBazaEmptySourceWarned\.Count -InvalidConfiguration'
 ) -Name 'Archive/SyncBazaInvalidSftpConfigurationExits30' `
     -Failure "-SyncBAZA з невалідною SFTP-конфігурацією (sftpHostKey) мусить завершуватись 30 (InvalidConfiguration), а не 50; отримано: $($archiveSyncExitCodes | ConvertTo-Json -Compress)"
+
+# ============================================================
+# #381: симуляція календарного retention (Д/Т/М/Р), модуль
+# BRAVO.BackupRetention. ЛИШЕ планування: нічого не видаляє,
+# enableArchiveDeletion лишається $false. Значення кількостей у цих
+# тестах - тестові фікстури, а не рекомендація: реальні кількості -
+# відкрите рішення власника.
+# ============================================================
+if (Enter-BRAVOSelfTestSection -Name 'Archive/RetentionSimulation') { try {
+# BEGIN-RETENTION-SIMULATION-381
+& {
+$retModuleDir = Join-Path $root 'modules\BRAVO.BackupRetention'
+$retModulePath = Join-Path $retModuleDir 'BRAVO.BackupRetention.psm1'
+Import-Module -Name (Join-Path $retModuleDir 'BRAVO.BackupRetention.psd1') -Force -ErrorAction Stop
+Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force -ErrorAction Stop
+
+# Помилка всередині сценарію не обриває self-test, а перетворюється на
+# запис Error: інакше відсутня функція ховала б усі наступні перевірки.
+# Тіла scriptblock-ів бачать змінні викликача за динамічним scope.
+$retTry = {
+    param([scriptblock]$Body)
+    try { & $Body } catch { [pscustomobject]@{ Error = $_.Exception.Message } }
+}
+$retNow = [datetime]'2026-10-19T12:00:00'
+$retGen = {
+    param([string]$Id, [datetime]$When, $Complete = $true)
+    [pscustomobject]@{ GenerationId = $Id; Date = $When; IsRecordedComplete = $Complete }
+}
+$retPolicy = {
+    param($D, $W, $M, $Y, $A)
+    [pscustomobject]@{ DailyCount = $D; WeeklyCount = $W; MonthlyCount = $M; YearlyCount = $Y; AllCopiesDays = $A }
+}
+$retPlan = {
+    param($Generations, $Policy)
+    & $retTry { Get-BRAVOBackupRetentionPlan -Generations $Generations -Policy $Policy -Now $retNow }
+}
+$retEntry = {
+    param($Plan, [string]$Id)
+    @($Plan.Entries | Where-Object { $_.GenerationId -ceq $Id })[0]
+}
+$retIsError = { param($Plan) ($null -eq $Plan -or $null -ne $Plan.PSObject.Properties['Error']) }
+
+# 0 generations.
+$retPlan0 = & $retPlan @() (& $retPolicy 3 2 2 1 0)
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlan0) -and $retPlan0.State -eq 'Planned' -and @($retPlan0.Entries).Count -eq 0 -and
+    $retPlan0.WouldDeleteCount -eq 0 -and $retPlan0.DeletionPerformed -eq $false -and $retPlan0.Mode -eq 'Simulation'
+) -Name 'Archive/RetentionSim/ZeroGenerations' `
+    -Failure "0 generation мають давати порожній план без видалень; отримано: $($retPlan0 | ConvertTo-Json -Compress -Depth 4)"
+
+# 1 generation: завжди Keep, причини Newest і LastRecoverable.
+$retPlan1 = & $retPlan @((& $retGen '20260101_020000' ([datetime]'2026-01-01T02:00:00'))) (& $retPolicy 0 0 0 0 0)
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlan1) -and @($retPlan1.Entries).Count -eq 1 -and
+    $retPlan1.Entries[0].Decision -eq 'Keep' -and $retPlan1.Entries[0].Reasons -contains 'Newest' -and
+    $retPlan1.Entries[0].Reasons -contains 'LastRecoverable'
+) -Name 'Archive/RetentionSim/SingleGenerationAlwaysKept' `
+    -Failure "єдина generation не може бути WouldDelete навіть при нульових кількостях; отримано: $($retPlan1 | ConvertTo-Json -Compress -Depth 4)"
+
+# N generations: 40 щоденних копій 2026-09-10..2026-10-19 (19 жовтня - понеділок).
+$retMany = @(0..39 | ForEach-Object {
+    $when = ([datetime]'2026-09-10T02:00:00').AddDays($_)
+    & $retGen ($when.ToString('yyyyMMdd_HHmmss')) $when
+})
+$retPlanN = & $retPlan $retMany (& $retPolicy 3 2 2 1 0)
+$retKeptN = if (& $retIsError $retPlanN) { @() } else {
+    @(@($retPlanN.Entries) | Where-Object { $_.Decision -eq 'Keep' } | ForEach-Object { $_.GenerationId } | Sort-Object)
+}
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlanN) -and
+    ($retKeptN -join ',') -eq '20260930_020000,20261017_020000,20261018_020000,20261019_020000' -and
+    $retPlanN.KeepCount -eq 4 -and $retPlanN.WouldDeleteCount -eq 36 -and
+    (& $retEntry $retPlanN '20261018_020000').Reasons -contains 'Daily 2026-10-18' -and
+    (& $retEntry $retPlanN '20261018_020000').Reasons -contains 'Weekly 2026-W42' -and
+    (& $retEntry $retPlanN '20260930_020000').Reasons -contains 'Monthly 2026-09' -and
+    (& $retEntry $retPlanN '20261019_020000').Reasons -contains 'Yearly 2026'
+) -Name 'Archive/RetentionSim/NGenerationsDailyWeeklyMonthlyYearly' `
+    -Failure "очікувано збережені 20260930/17/18/19 і 36 WouldDelete; отримано: $($retKeptN -join ',')"
+
+# Межа місяця.
+$retMonthGens = @(
+    (& $retGen '20260831_020000' ([datetime]'2026-08-31T02:00:00')),
+    (& $retGen '20260901_020000' ([datetime]'2026-09-01T02:00:00')),
+    (& $retGen '20260930_020000' ([datetime]'2026-09-30T02:00:00')),
+    (& $retGen '20261001_020000' ([datetime]'2026-10-01T02:00:00')))
+$retPlanM = & $retPlan $retMonthGens (& $retPolicy 0 0 3 0 0)
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlanM) -and
+    (& $retEntry $retPlanM '20260831_020000').Decision -eq 'Keep' -and
+    (& $retEntry $retPlanM '20260901_020000').Decision -eq 'WouldDelete' -and
+    (& $retEntry $retPlanM '20260930_020000').Decision -eq 'Keep' -and
+    (& $retEntry $retPlanM '20261001_020000').Decision -eq 'Keep'
+) -Name 'Archive/RetentionSim/MonthBoundary' `
+    -Failure "місячний представник - найновіша копія місяця (08-31, 09-30, 10-01); 09-01 має бути WouldDelete; отримано: $($retPlanM | ConvertTo-Json -Compress -Depth 4)"
+
+# Межа року.
+$retYearGens = @(
+    (& $retGen '20241231_235959' ([datetime]'2024-12-31T23:59:59')),
+    (& $retGen '20251231_235959' ([datetime]'2025-12-31T23:59:59')),
+    (& $retGen '20260101_000000' ([datetime]'2026-01-01T00:00:00')))
+$retPlanY = & $retPlan $retYearGens (& $retPolicy 0 0 0 2 0)
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlanY) -and
+    (& $retEntry $retPlanY '20241231_235959').Decision -eq 'WouldDelete' -and
+    (& $retEntry $retPlanY '20251231_235959').Decision -eq 'Keep' -and
+    (& $retEntry $retPlanY '20260101_000000').Decision -eq 'Keep' -and
+    (& $retEntry $retPlanY '20251231_235959').Reasons -contains 'Yearly 2025'
+) -Name 'Archive/RetentionSim/YearBoundary' `
+    -Failure "31 грудня і 1 січня - різні роки; 2024 має бути WouldDelete при YearlyCount=2; отримано: $($retPlanY | ConvertTo-Json -Compress -Depth 4)"
+
+# Межа ISO-тижня: 2021-01-01 (п'ятниця) ще належить ISO-тижню 2020-W53.
+$retWeekGens = @(
+    (& $retGen '20201230_020000' ([datetime]'2020-12-30T02:00:00')),
+    (& $retGen '20201231_020000' ([datetime]'2020-12-31T02:00:00')),
+    (& $retGen '20210101_020000' ([datetime]'2021-01-01T02:00:00')),
+    (& $retGen '20210104_020000' ([datetime]'2021-01-04T02:00:00')))
+$retPlanW = & $retPlan $retWeekGens (& $retPolicy 0 2 0 0 0)
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlanW) -and
+    (& $retEntry $retPlanW '20210104_020000').Reasons -contains 'Weekly 2021-W01' -and
+    (& $retEntry $retPlanW '20210101_020000').Reasons -contains 'Weekly 2020-W53' -and
+    (& $retEntry $retPlanW '20201231_020000').Decision -eq 'WouldDelete' -and
+    (& $retEntry $retPlanW '20201230_020000').Decision -eq 'WouldDelete'
+) -Name 'Archive/RetentionSim/IsoWeekBoundary' `
+    -Failure "ISO-тиждень 2020-W53 охоплює 2020-12-28..2021-01-03: представник - 2021-01-01; отримано: $($retPlanW | ConvertTo-Json -Compress -Depth 4)"
+
+# Кілька копій за одну добу.
+$retSameDay = @(
+    (& $retGen '20261019_010000' ([datetime]'2026-10-19T01:00:00')),
+    (& $retGen '20261019_130000' ([datetime]'2026-10-19T11:30:00')),
+    (& $retGen '20261019_113000' ([datetime]'2026-10-19T11:30:00')),
+    (& $retGen '20261018_020000' ([datetime]'2026-10-18T02:00:00')))
+$retPlanS = & $retPlan $retSameDay (& $retPolicy 2 0 0 0 0)
+$retPlanSAll = & $retPlan $retSameDay (& $retPolicy 2 0 0 0 1)
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlanS) -and -not (& $retIsError $retPlanSAll) -and
+    (& $retEntry $retPlanS '20261019_130000').Decision -eq 'Keep' -and
+    (& $retEntry $retPlanS '20261019_113000').Decision -eq 'WouldDelete' -and
+    (& $retEntry $retPlanS '20261019_010000').Decision -eq 'WouldDelete' -and
+    (& $retEntry $retPlanS '20261018_020000').Decision -eq 'Keep' -and
+    $retPlanS.WouldDeleteCount -eq 2 -and
+    $retPlanSAll.WouldDeleteCount -eq 0 -and
+    (& $retEntry $retPlanSAll '20261019_010000').Reasons -contains 'AllCopies'
+) -Name 'Archive/RetentionSim/SeveralCopiesSameDay' `
+    -Failure "за добу лишається одна копія (найновіша; рівний час - за більшим GenerationId); у вікні AllCopiesDays=1 лишаються всі; отримано: $($retPlanS | ConvertTo-Json -Compress -Depth 4)"
+
+# #381 P1: у кошики потрапляють лише COMPLETE. FAILED новіша за COMPLETE
+# тієї самої доби не відбирає місце представника; доби лише з FAILED
+# не займають слотів; усі не-COMPLETE - Keep з причиною NotComplete.
+$retStatusGens = @(
+    (& $retGen '20261018_030000' ([datetime]'2026-10-18T03:00:00') $false),
+    (& $retGen '20261018_020000' ([datetime]'2026-10-18T02:00:00') $true),
+    (& $retGen '20261017_020000' ([datetime]'2026-10-17T02:00:00') $false),
+    (& $retGen '20261016_020000' ([datetime]'2026-10-16T02:00:00') $true),
+    (& $retGen '20261015_020000' ([datetime]'2026-10-15T02:00:00') $false),
+    (& $retGen '20261014_020000' ([datetime]'2026-10-14T02:00:00') $true))
+$retPlanC = & $retPlan $retStatusGens (& $retPolicy 2 0 0 0 0)
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlanC) -and
+    (& $retEntry $retPlanC '20261018_020000').Decision -eq 'Keep' -and
+    (& $retEntry $retPlanC '20261018_020000').Reasons -contains 'Daily 2026-10-18' -and
+    (& $retEntry $retPlanC '20261018_030000').Reasons -contains 'NotComplete' -and
+    -not (@((& $retEntry $retPlanC '20261018_030000').Reasons) -like 'Daily*') -and
+    (& $retEntry $retPlanC '20261016_020000').Reasons -contains 'Daily 2026-10-16' -and
+    (& $retEntry $retPlanC '20261014_020000').Decision -eq 'WouldDelete' -and
+    @('20261018_030000', '20261017_020000', '20261015_020000' | Where-Object {
+        (& $retEntry $retPlanC $_).Decision -eq 'Keep' -and (& $retEntry $retPlanC $_).Reasons -contains 'NotComplete' }).Count -eq 3 -and
+    $retPlanC.WouldDeleteCount -eq 1
+) -Name 'Archive/RetentionSim/OnlyCompleteGenerationsFillBuckets' `
+    -Failure "FAILED новіша за COMPLETE тієї ж доби не відбирає представника, доби лише з FAILED не займають слот Daily, не-COMPLETE=Keep+NotComplete; отримано: $($retPlanC | ConvertTo-Json -Compress -Depth 4)"
+
+# Невідомий статус (відсутня властивість, $null, не-bool значення) -> Keep + UnknownStatus.
+$retUnknownGens = @(
+    (& $retGen '20260101_020000' ([datetime]'2026-01-01T02:00:00') $true),
+    (& $retGen '20261019_020000' ([datetime]'2026-10-19T02:00:00') $true),
+    [pscustomobject]@{ GenerationId = 'NO_PROP'; Date = [datetime]'2026-02-01T02:00:00' },
+    [pscustomobject]@{ GenerationId = 'NULL_PROP'; Date = [datetime]'2026-03-01T02:00:00'; IsRecordedComplete = $null },
+    [pscustomobject]@{ GenerationId = 'STRING_PROP'; Date = [datetime]'2026-04-01T02:00:00'; IsRecordedComplete = 'COMPLETE' })
+$retPlanU = & $retPlan $retUnknownGens (& $retPolicy 0 0 0 0 0)
+$retUnknownOk = -not (& $retIsError $retPlanU)
+if ($retUnknownOk) {
+    $retUnknownOk = (& $retEntry $retPlanU '20260101_020000').Decision -eq 'WouldDelete' -and
+        $retPlanU.FlaggedCount -eq 3 -and $retPlanU.WouldDeleteCount -eq 1 -and
+        @('NO_PROP', 'NULL_PROP', 'STRING_PROP' | Where-Object {
+            (& $retEntry $retPlanU $_).Decision -eq 'Keep' -and (& $retEntry $retPlanU $_).Flags -contains 'UnknownStatus' }).Count -eq 3
+}
+Test-BRAVOCondition -Condition $retUnknownOk -Name 'Archive/RetentionSim/UnknownStatusKeptAndFlagged' `
+    -Failure "відсутній/null/не-bool статус мусить бути Keep+UnknownStatus і ніколи WouldDelete; отримано: $($retPlanU | ConvertTo-Json -Compress -Depth 4)"
+
+# Будь-яка null-кількість (або відсутня властивість) => NotConfigured, жодного WouldDelete.
+$retNullPlans = @(
+    (& $retPlan $retMany (& $retPolicy $null 2 2 1 0)),
+    (& $retPlan $retMany (& $retPolicy 3 $null 2 1 0)),
+    (& $retPlan $retMany (& $retPolicy 3 2 $null 1 0)),
+    (& $retPlan $retMany (& $retPolicy 3 2 2 $null 0)),
+    (& $retPlan $retMany (& $retPolicy 3 2 2 1 $null)),
+    (& $retPlan $retMany ([pscustomobject]@{})))
+$retNullOk = $true
+foreach ($retNullPlan in $retNullPlans) {
+    if (& $retIsError $retNullPlan) { $retNullOk = $false; continue }
+    if ($retNullPlan.State -ne 'NotConfigured' -or $retNullPlan.WouldDeleteCount -ne 0 -or
+        @($retNullPlan.Entries).Count -ne 40 -or @($retNullPlan.MissingKeys).Count -lt 1 -or
+        @(@($retNullPlan.Entries) | Where-Object { $_.Decision -ne 'Keep' }).Count -ne 0) { $retNullOk = $false }
+}
+Test-BRAVOCondition -Condition (
+    $retNullOk -and @($retNullPlans[0].MissingKeys) -contains 'retentionDailyCount' -and
+    @($retNullPlans[5].MissingKeys).Count -eq 5
+) -Name 'Archive/RetentionSim/NullCountMeansNotConfigured' `
+    -Failure "null (або відсутня властивість) у будь-якій кількості мусить давати NotConfigured без WouldDelete; отримано: $($retNullPlans | ConvertTo-Json -Compress -Depth 4)"
+
+# Найновіша, остання COMPLETE і MinimumRetainedCount захищені навіть при нульовій політиці.
+$retProtectGens = @(
+    (& $retGen '20260101_020000' ([datetime]'2026-01-01T02:00:00')),
+    (& $retGen '20260301_020000' ([datetime]'2026-03-01T02:00:00')),
+    (& $retGen '20260601_020000' ([datetime]'2026-06-01T02:00:00') $true),
+    (& $retGen '20261001_020000' ([datetime]'2026-10-01T02:00:00') $false))
+$retPlanP = & $retPlan $retProtectGens (& $retPolicy 0 0 0 0 0)
+$retPlanPMin = & $retTry { Get-BRAVOBackupRetentionPlan -Generations $retProtectGens -Policy (& $retPolicy 0 0 0 0 0) -MinimumRetainedCount 2 -Now $retNow }
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retPlanP) -and -not (& $retIsError $retPlanPMin) -and
+    (& $retEntry $retPlanP '20261001_020000').Reasons -contains 'Newest' -and
+    (& $retEntry $retPlanP '20260601_020000').Reasons -contains 'LastRecoverable' -and
+    (& $retEntry $retPlanP '20260301_020000').Decision -eq 'WouldDelete' -and
+    (& $retEntry $retPlanP '20260101_020000').Decision -eq 'WouldDelete' -and
+    $retPlanP.KeepCount -eq 2 -and
+    (& $retEntry $retPlanPMin '20260301_020000').Reasons -contains 'MinimumRetained' -and
+    (& $retEntry $retPlanPMin '20260601_020000').Reasons -contains 'MinimumRetained' -and
+    (& $retEntry $retPlanPMin '20260101_020000').Decision -eq 'WouldDelete' -and
+    $retPlanPMin.WouldDeleteCount -eq 1
+) -Name 'Archive/RetentionSim/NewestAndMinimumRetainedAlwaysKept' `
+    -Failure "найновіша і остання COMPLETE не можуть бути WouldDelete; MinimumRetainedCount=2 захищає 2 найновіші COMPLETE (FAILED не рахується); отримано: $($retPlanPMin | ConvertTo-Json -Compress -Depth 4)"
+
+# Невідомі/пошкоджені записи: лишаються і позначаються.
+$retBadGens = @(
+    (& $retGen '20260101_020000' ([datetime]'2026-01-01T02:00:00')),
+    (& $retGen '20261019_020000' ([datetime]'2026-10-19T02:00:00')),
+    [pscustomobject]@{ GenerationId = ''; Date = [datetime]'2026-02-01T00:00:00'; IsRecordedComplete = $true },
+    [pscustomobject]@{ GenerationId = 'NO_DATE'; Date = $null; IsRecordedComplete = $true },
+    [pscustomobject]@{ GenerationId = 'NOT_A_DATE'; Date = 'вчора'; IsRecordedComplete = $true },
+    [pscustomobject]@{ GenerationId = 'FUTURE'; Date = [datetime]'2027-05-05T00:00:00'; IsRecordedComplete = $true },
+    [pscustomobject]@{ GenerationId = 'DUP'; Date = [datetime]'2026-03-01T00:00:00'; IsRecordedComplete = $true },
+    [pscustomobject]@{ GenerationId = 'DUP'; Date = [datetime]'2026-03-02T00:00:00'; IsRecordedComplete = $true })
+$retPlanB = & $retPlan $retBadGens (& $retPolicy 0 0 0 0 0)
+$retFlagged = if (& $retIsError $retPlanB) { @() } else { @(@($retPlanB.Entries) | Where-Object { @($_.Flags).Count -gt 0 }) }
+$retBadOk = (-not (& $retIsError $retPlanB)) -and $retFlagged.Count -eq 6
+if ($retBadOk) {
+    $retBadOk = @($retFlagged | Where-Object { $_.Decision -ne 'Keep' }).Count -eq 0 -and
+        (& $retEntry $retPlanB '20260101_020000').Decision -eq 'WouldDelete' -and
+        (@($retPlanB.Entries | Where-Object { $_.GenerationId -ceq 'NO_DATE' })[0].Flags -contains 'MalformedDate') -and
+        (@($retPlanB.Entries | Where-Object { $_.GenerationId -ceq 'NOT_A_DATE' })[0].Flags -contains 'MalformedDate') -and
+        (@($retPlanB.Entries | Where-Object { $_.GenerationId -ceq 'FUTURE' })[0].Flags -contains 'FutureDated') -and
+        (@($retPlanB.Entries | Where-Object { $_.GenerationId -ceq 'DUP' })[0].Flags -contains 'DuplicateIdentity') -and
+        (@($retPlanB.Entries | Where-Object { $_.GenerationId -ceq '' })[0].Flags -contains 'MalformedIdentity') -and
+        $retPlanB.FlaggedCount -eq 6
+}
+Test-BRAVOCondition -Condition $retBadOk -Name 'Archive/RetentionSim/MalformedEntriesKeptAndFlagged' `
+    -Failure "порожній id, відсутня/нерозбірлива дата, майбутня дата і дублікат id мусять бути Keep+Flags; валідна стара копія лишається WouldDelete; отримано: $($retPlanB | ConvertTo-Json -Compress -Depth 4)"
+
+# Непорожній, але неканонічний GenerationId з валідною минулою датою і COMPLETE - Keep+MalformedIdentity.
+$retGarbagePlan = & $retPlan @(
+    (& $retGen '20260101_020000' ([datetime]'2026-01-01T02:00:00')),
+    (& $retGen '20261019_020000' ([datetime]'2026-10-19T02:00:00')),
+    (& $retGen 'garbage' ([datetime]'2026-02-01T02:00:00')),
+    (& $retGen '20260301_020000_x' ([datetime]'2026-03-01T02:00:00')),
+    (& $retGen '2026-04-01' ([datetime]'2026-04-01T02:00:00')),
+    (& $retGen '20260501_020000_2' ([datetime]'2026-05-01T02:00:00'))) (& $retPolicy 0 0 0 0 0)
+Test-BRAVOCondition -Condition (
+    -not (& $retIsError $retGarbagePlan) -and
+    @('garbage', '20260301_020000_x', '2026-04-01' | Where-Object {
+        (& $retEntry $retGarbagePlan $_).Decision -eq 'Keep' -and (& $retEntry $retGarbagePlan $_).Flags -contains 'MalformedIdentity' }).Count -eq 3 -and
+    (& $retEntry $retGarbagePlan '20260501_020000_2').Flags.Count -eq 0 -and
+    (& $retEntry $retGarbagePlan '20260501_020000_2').Decision -eq 'WouldDelete' -and
+    (& $retEntry $retGarbagePlan '20260101_020000').Decision -eq 'WouldDelete' -and
+    $retGarbagePlan.FlaggedCount -eq 3
+) -Name 'Archive/RetentionSim/NonCanonicalGenerationIdKeptAndFlagged' `
+    -Failure "непорожній неканонічний GenerationId мусить бути Keep+MalformedIdentity (канонічний yyyyMMdd_HHmmss[_N] лишається валідним); отримано: $($retGarbagePlan | ConvertTo-Json -Compress -Depth 4)"
+
+# -MinimumRetainedCount: сире значення проходить суворий валідатор (планувальник і симуляція).
+$retMinBad = @('2', $true, 2.5, -1, 100000)
+$retMinOk = $true
+$retMinDetails = @()
+foreach ($retMinValue in $retMinBad) {
+    $retMinPlanResult = & $retTry { Get-BRAVOBackupRetentionPlan -Generations $retProtectGens -Policy (& $retPolicy 0 0 0 0 0) -MinimumRetainedCount $retMinValue -Now $retNow }
+    $retMinSimResult = & $retTry { Get-BRAVOBackupRetentionSimulation -BackupRoot ([IO.Path]::GetTempPath()) -Policy (& $retPolicy 0 0 0 0 0) -MinimumRetainedCount $retMinValue -Now $retNow }
+    $retMinDetails += "[$retMinValue]plan=$(& $retIsError $retMinPlanResult) sim=$(& $retIsError $retMinSimResult)"
+    foreach ($retMinResult in @($retMinPlanResult, $retMinSimResult)) {
+        if (-not (& $retIsError $retMinResult) -or -not ([string]$retMinResult.Error).Contains('MinimumRetainedCount')) { $retMinOk = $false }
+    }
+}
+Test-BRAVOCondition -Condition $retMinOk -Name 'Archive/RetentionSim/MinimumRetainedCountStrictlyValidated' `
+    -Failure "рядок, bool, дробове, від'ємне і завелике -MinimumRetainedCount мусять відхилятись помилкою з назвою MinimumRetainedCount і в плані, і в симуляції; отримано: $($retMinDetails -join ' | ')"
+
+# Невалідні значення: чітка помилка з назвою ключа.
+$retInvalidCases = @(
+    @{ Key = 'retentionDailyCount'; Value = -1 },
+    @{ Key = 'retentionWeeklyCount'; Value = 2.5 },
+    @{ Key = 'retentionMonthlyCount'; Value = 'abc' },
+    @{ Key = 'retentionYearlyCount'; Value = $true },
+    @{ Key = 'retentionAllCopiesDays'; Value = 100000 },
+    @{ Key = 'minimumRetainedVerifiedBackups'; Value = -2 })
+$retInvalidOk = $true
+$retInvalidDetails = @()
+foreach ($retInvalidCase in $retInvalidCases) {
+    $retCfg = @{ retentionDailyCount = 1; retentionWeeklyCount = 1; retentionMonthlyCount = 1; retentionYearlyCount = 1; retentionAllCopiesDays = 1; minimumRetainedVerifiedBackups = 2 }
+    $retCfg[$retInvalidCase.Key] = $retInvalidCase.Value
+    $retInvalidResult = & $retTry { Get-BRAVOBackupRetentionPolicy -Configuration $retCfg }
+    $retInvalidMessage = if ($null -ne $retInvalidResult -and $null -ne $retInvalidResult.PSObject.Properties['Error']) { [string]$retInvalidResult.Error } else { '' }
+    $retInvalidDetails += "$($retInvalidCase.Key)=>$retInvalidMessage"
+    if (-not $retInvalidMessage.Contains($retInvalidCase.Key)) { $retInvalidOk = $false }
+}
+$retInvalidPlan = & $retPlan $retMany (& $retPolicy (-3) 2 2 1 0)
+Test-BRAVOCondition -Condition (
+    $retInvalidOk -and (& $retIsError $retInvalidPlan) -and ([string]$retInvalidPlan.Error).Contains('retentionDailyCount')
+) -Name 'Archive/RetentionSim/InvalidValueRejectedWithClearError' `
+    -Failure "від'ємне/дробове/нечислове/булеве/завелике значення мусить відхилятись помилкою з назвою ключа; отримано: $($retInvalidDetails -join ' | ')"
+
+# Legacy-конфігурація без нових ключів (Set-StrictMode) і канонічні дефолти.
+$retDefaults = Get-BRAVODefaultConfiguration
+$retLegacyConfig = @{ archiveRetentionDays = 30; enableArchiveDeletion = $false }
+$retLegacyMerged = Merge-BRAVOConfiguration -Base $retDefaults -Override $retLegacyConfig
+$retLegacyPolicyStrict = & {
+    Set-StrictMode -Version 2.0
+    & $retTry { Get-BRAVOBackupRetentionPolicy -Configuration $retLegacyConfig }
+}
+$retMergedPolicy = & $retTry { Get-BRAVOBackupRetentionPolicy -Configuration $retLegacyMerged }
+$retRetentionKeys = @('retentionDailyCount', 'retentionWeeklyCount', 'retentionMonthlyCount', 'retentionYearlyCount', 'retentionAllCopiesDays')
+$retDefaultsNull = @($retRetentionKeys | Where-Object { $retDefaults.ContainsKey($_) -and $null -eq $retDefaults[$_] }).Count -eq 5
+Test-BRAVOCondition -Condition (
+    $retDefaultsNull -and
+    $retLegacyMerged.archiveRetentionDays -eq 30 -and
+    -not (& $retIsError $retLegacyPolicyStrict) -and $retLegacyPolicyStrict.IsConfigured -eq $false -and
+    @($retLegacyPolicyStrict.MissingKeys).Count -eq 5 -and $null -eq $retLegacyPolicyStrict.MinimumRetainedCount -and
+    -not (& $retIsError $retMergedPolicy) -and $retMergedPolicy.IsConfigured -eq $false -and $retMergedPolicy.MinimumRetainedCount -eq 2
+) -Name 'Archive/RetentionSim/LegacyConfigWithoutKeysIsNotConfigured' `
+    -Failure "канонічні дефолти нових ключів мають бути `$null (не вигадані кількості), а legacy-конфіг без них - NotConfigured під StrictMode; defaultsNull=$retDefaultsNull"
+
+# Читальний вхід: manifest-и на тимчасовому каталозі, нічого не змінюється.
+$retRoot = Join-Path ([IO.Path]::GetTempPath()) ("bravo-ret381-" + [guid]::NewGuid().ToString('N') + " каталог")
+try {
+    $retManifestDir = Join-Path $retRoot 'MANIFESTS'
+    New-Item -ItemType Directory -Path $retManifestDir -Force | Out-Null
+    $retWrite = {
+        param([string]$Dir, [string]$FileId, [string]$Json)
+        [IO.File]::WriteAllText((Join-Path $Dir ("BRAVO_BACKUP_{0}.json" -f $FileId)), $Json, (New-Object Text.UTF8Encoding($false)))
+    }
+    & $retWrite $retManifestDir '20260901_020000' '{"generationId":"20260901_020000","status":"COMPLETE"}'
+    & $retWrite $retManifestDir '20261001_020000' '{"generationId":"20261001_020000","status":"COMPLETE"}'
+    & $retWrite $retManifestDir '20261015_020000' '{"generationId":"20261015_020000","status":"FAILED"}'
+    & $retWrite $retManifestDir '20261016_020000' '{"generationId":"20261099_999999","status":"COMPLETE"}'
+    & $retWrite $retManifestDir '20261017_020000' '{ not json'
+    & $retWrite $retManifestDir '20261018_020000' '{"generationId":"20261018_020000"}'
+    & $retWrite $retManifestDir '20261018_030000' '{"generationId":"20261018_030000","status":null}'
+    & $retWrite $retManifestDir '20261018_040000' '{"generationId":"20261018_040000","status":"WEIRD"}'
+    $retSnapshot = { @(Get-ChildItem -LiteralPath $retManifestDir -File | Sort-Object Name | ForEach-Object { '{0}:{1}:{2}' -f $_.Name, $_.Length, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) }
+    $retBefore = & $retSnapshot
+    $retSim = & $retTry { Get-BRAVOBackupRetentionSimulation -BackupRoot $retRoot -Policy (& $retPolicy 0 0 0 0 0) -Now $retNow }
+    $retSimMin = & $retTry { Get-BRAVOBackupRetentionSimulation -BackupRoot $retRoot -Policy (& $retPolicy 0 0 0 0 0) -MinimumRetainedCount 2 -Now $retNow }
+    $retSimPolicyMin = & $retTry { Get-BRAVOBackupRetentionSimulation -BackupRoot $retRoot -Policy ([pscustomobject]@{ DailyCount = 0; WeeklyCount = 0; MonthlyCount = 0; YearlyCount = 0; AllCopiesDays = 0; MinimumRetainedCount = 2 }) -Now $retNow }
+    $retSimNotConfigured = & $retTry { Get-BRAVOBackupRetentionSimulation -BackupRoot $retRoot -Policy (& $retPolicy $null $null $null $null $null) -Now $retNow }
+    $retAfter = & $retSnapshot
+    $retSimOk = (-not (& $retIsError $retSim)) -and (-not (& $retIsError $retSimMin)) -and (-not (& $retIsError $retSimPolicyMin)) -and (-not (& $retIsError $retSimNotConfigured))
+    if ($retSimOk) {
+        $retSimEntries = @($retSim.Entries)
+        $retSimOk = $retSimEntries.Count -eq 8 -and
+            (@($retSimEntries | Where-Object { $_.GenerationId -ceq '20261001_020000' })[0].Reasons -contains 'LastRecoverable') -and
+            (@($retSimEntries | Where-Object { $_.GenerationId -ceq '20260901_020000' })[0].Decision -eq 'WouldDelete') -and
+            (@($retSimEntries | Where-Object { $_.GenerationId -ceq '20261015_020000' })[0].Reasons -contains 'NotComplete') -and
+            (@($retSimEntries | Where-Object { $_.GenerationId -ceq '20261015_020000' })[0].Reasons -contains 'Newest') -and
+            @($retSimEntries | Where-Object { @($_.Flags).Count -gt 0 -and $_.Decision -eq 'Keep' }).Count -eq 5 -and
+            (@($retSimEntries | Where-Object { $_.GenerationId -ceq '20261018_020000' })[0].Flags -contains 'UnknownStatus') -and
+            (@($retSimEntries | Where-Object { $_.GenerationId -ceq '20261018_030000' })[0].Flags -contains 'UnknownStatus') -and
+            (@($retSimEntries | Where-Object { $_.GenerationId -ceq '20261018_040000' })[0].Flags -contains 'UnknownStatus') -and
+            $retSim.WouldDeleteCount -eq 1 -and
+            $retSimMin.WouldDeleteCount -eq 0 -and
+            (@($retSimMin.Entries | Where-Object { $_.GenerationId -ceq '20260901_020000' })[0].Reasons -contains 'MinimumRetained') -and
+            $retSimPolicyMin.WouldDeleteCount -eq 0 -and
+            $retSimNotConfigured.State -eq 'NotConfigured' -and $retSimNotConfigured.WouldDeleteCount -eq 0
+    }
+    $retFormatText = if ($retSimOk) { (Format-BRAVOBackupRetentionPlanLines -Plan $retSim) -join "`n" } else { '' }
+    Test-BRAVOCondition -Condition (
+        $retSimOk -and ($retBefore -join '|') -eq ($retAfter -join '|') -and
+        $retFormatText.Contains('НЕ перевірялись') -and $retFormatText.Contains('нічого не видалено')
+    ) -Name 'Archive/RetentionSim/ReadOnlyReportFromManifests' `
+        -Failure "читальна симуляція: COMPLETE=відновлювана, FAILED=NotComplete, невідповідний id і битий JSON=MalformedDate, відсутній/null/невідомий статус=UnknownStatus (усі Keep), MinimumRetained з параметра і з політики, файли незмінні, вивід попереджає про неперевірені архіви; отримано: $($retSim | ConvertTo-Json -Compress -Depth 4)"
+} finally {
+    if (Test-Path -LiteralPath $retRoot) { Remove-Item -LiteralPath $retRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# Статична гарантія: нова логіка нічого не видаляє/не пише, ніщо поза власником
+# (модуль, self-test, документація) на неї не посилається, public API - рівно 4 функції.
+$retModuleText = [IO.File]::ReadAllText($retModulePath, [Text.Encoding]::UTF8)
+$retParseTokens = $null
+$retParseErrors = $null
+$retModuleAst = [Management.Automation.Language.Parser]::ParseInput($retModuleText, [ref]$retParseTokens, [ref]$retParseErrors)
+$retExpectedPublic = @('Format-BRAVOBackupRetentionPlanLines', 'Get-BRAVOBackupRetentionPlan', 'Get-BRAVOBackupRetentionPolicy', 'Get-BRAVOBackupRetentionSimulation')
+$retFunctionAsts = @($retModuleAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))
+$retForbiddenCommands = @()
+$retDeleteMethodCalls = @()
+foreach ($retFunctionAst in $retFunctionAsts) {
+    $retForbiddenCommands += @($retFunctionAst.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true) |
+        ForEach-Object { $_.GetCommandName() } |
+        Where-Object { $null -ne $_ -and ($_ -match '^(Remove-|Clear-|Move-|Rename-|Set-Content|Out-File|Add-Content|New-Item|Copy-Item|Start-Process|Stop-Service)' -or
+            @('rd', 'del', 'erase', 'ri', 'rm', 'rmdir') -contains $_ -or $_ -match 'Remove-BRAVOExpiredBackupGenerations|Remove-OldLogsByAge') })
+    $retDeleteMethodCalls += @($retFunctionAst.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] }, $true) |
+        Where-Object { $_.Member.Extent.Text -match '^(Delete|WriteAll|Move|Copy|Create)' })
+}
+$retManifestData = Import-PowerShellDataFile -LiteralPath (Join-Path $retModuleDir 'BRAVO.BackupRetention.psd1')
+$retExportedPublic = @($retManifestData.FunctionsToExport | Sort-Object)
+$retOutsideFiles = @(
+    @(Get-ChildItem -LiteralPath $root -File -Filter '*.ps1' | Where-Object { $_.Name -ne 'BRAVO_SELF_TEST.ps1' })
+    @(foreach ($retScanDir in @('modules', 'deploy', 'ci')) {
+        $retScanPath = Join-Path $root $retScanDir
+        if (Test-Path -LiteralPath $retScanPath -PathType Container) {
+            Get-ChildItem -LiteralPath $retScanPath -Recurse -File |
+                Where-Object { $_.Extension -in @('.ps1', '.psm1', '.psd1') -and
+                    -not $_.FullName.StartsWith($retModuleDir + '\', [StringComparison]::OrdinalIgnoreCase) }
+        }
+    }))
+$retOutsideReferences = @($retOutsideFiles | Where-Object {
+    [IO.File]::ReadAllText($_.FullName, [Text.Encoding]::UTF8) -cmatch 'BRAVO\.BackupRetention|-BRAVOBackupRetention' } | ForEach-Object { $_.FullName.Substring($root.Length) })
+$retDefaultsForGuard = Get-BRAVODefaultConfiguration
+Test-BRAVOCondition -Condition (
+    @($retParseErrors).Count -eq 0 -and $retFunctionAsts.Count -gt 0 -and
+    ($retExportedPublic -join ',') -ceq ($retExpectedPublic -join ',') -and
+    @($retForbiddenCommands).Count -eq 0 -and @($retDeleteMethodCalls).Count -eq 0 -and
+    @($retOutsideReferences).Count -eq 0 -and
+    $retDefaultsForGuard.enableArchiveDeletion -eq $false
+) -Name 'Archive/RetentionSim/NoDeletionCodeAndDeletionDisabledByDefault' `
+    -Failure "симуляція не має викликати видалення/запис, на неї не посилається жоден runtime-файл поза BRAVO.BackupRetention, експорти рівно 4, enableArchiveDeletion за замовчуванням `$false. exports=$($retExportedPublic -join ',') forbidden=$(@($retForbiddenCommands) -join ',') methods=$(@($retDeleteMethodCalls).Count) outside=$(@($retOutsideReferences) -join ',')"
+}
+# END-RETENTION-SIMULATION-381
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Archive/RetentionSimulation' } }

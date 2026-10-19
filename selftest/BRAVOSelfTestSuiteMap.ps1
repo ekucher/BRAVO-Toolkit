@@ -94,6 +94,7 @@ function Get-BRAVOSelfTestSuiteForChangedPath {
     # 2. Доменний модуль -> suite з явної таблиці (ключ - повне ім'я каталогу).
     $moduleSuiteTable = @{
         'Archive'                = 'Archive'
+        'BackupRetention'        = 'Archive'
         'BazaSync'               = 'BazaSync'
         'Configuration'          = 'Configuration'
         'Configurator'           = 'Configurator'
