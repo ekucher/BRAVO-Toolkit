@@ -11,6 +11,10 @@ This repository already carries two authoritative instruction sets — read them
 
 **Обов'язково:** канонічні правила агентів — `BRAVO_AGENT_POLICY.md`; маршрут читання — на початку `AGENTS.md`. Межі автономної роботи (що робиться без повторного дозволу для дорученого issue/завдання, а що потребує окремого дозволу власника) — `BRAVO_AGENT_POLICY.md`, розділ 13; порядок LOCAL FIRST і локальний гейт публікації — розділ 13.12. Цей файл їх не дублює й не змінює.
 
+Claude Code не завантажує `AGENTS.md` автоматично, коли поруч є `CLAUDE.md`, тому канонічна політика імпортується явно (рядок нижче — import, не видаляти):
+
+@BRAVO_AGENT_POLICY.md
+
 Read `.claude/PROJECT_STATE.md` at the start of a session — it is the handoff between sessions (canonical branch/HEAD, active issue/PR, completed waves, `NEXT ACTION`). It does not itself authorize commit/push/merge/tag/release — those always require explicit user instruction in the current task; явне доручення завдання авторизує лише дії розділу 13.1 `BRAVO_AGENT_POLICY.md`.
 
 Documentation in this repo (README, CHANGELOG, docs/, operator runbooks, architecture notes) is written in Ukrainian; keep additions consistent with `.claude/rules/08-documentation-language.md`.
