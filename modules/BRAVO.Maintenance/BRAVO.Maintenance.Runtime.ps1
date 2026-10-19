@@ -8168,6 +8168,10 @@ function Remove-OldRestoreArchives {
     # (захисно, ПІСЛЯ діагностики цілісності вище, але ДО першого
     # Select-Object -First/-Skip $KeepCount: від'ємне значення дає ERROR, а не
     # ParameterBinding exception) retention пропускається цілком.
+    # #494 (Codex P1): guard НЕ переносити перед перевірки SHA512/7z t:
+    # ArchivesKeepCount = 0 проходить preflight (відхиляє лише < 0) і схему
+    # Configurator, а ранній return без сканування лишав би Outcome,
+    # criticalErrorOccurred і restoreIntegrityFailed невиставленими (втрата exit 41).
     if ($KeepCount -lt 1) {
         Write-Log "ArchivesKeepCount = $KeepCount (< 1): retention архівів реставрації ПРОПУЩЕНО, щоб не видалити всі точки відновлення. Вкажіть значення не менше 1." -Level "ERROR"
         return

@@ -2,6 +2,8 @@
 
 ## Не випущено (developer)
 
+- **Test: follow-up self-test (#483, #484).** Проби `Framework/SuiteSelectionContract` (`-File ... -Suite`) запускають дочірній `powershell.exe` через `Start-Process` з перенаправленням stdout/stderr у тимчасові файли, тож результат залежить лише від коду виходу і stdout і не падає, коли батьківський хост зливає stderr (`2>&1 | Out-File` під `ErrorActionPreference = 'Stop'`); додано пробу `Framework/SuiteSelectionContract.MergedStderrParentDoesNotFalseFail` (#483). Configurator: тест `$quoteChildArgument` для аргументу із завершальним `\` (подвоєння перед закривальною лапкою, звірка з `CommandLineToArgvW`) (#473). `Archive/LiteralExitCodesAreCanonical` збирає літеральні `exit` через AST (`ExitStatementAst`), а не regex, з негативною фікстурою (рядки, here-string, коментарі ігноруються) і позитивним випадком (#470). Maintenance: guard `ArchivesKeepCount < 1` у `Remove-OldRestoreArchives` лишається ПІСЛЯ сканування цілісності SHA512/7-Zip (як на developer): `ArchivesKeepCount = 0` проходить preflight і схему Configurator, тож ранній вихід без сканування втрачав би діагностику непридатних точок відновлення (exit 41); семантика «ERROR і нічого не видаляти» (#474) збережена, додано регресійні тести `Maintenance/RetentionKeepCountBelowOneKeepsIntegrityFailure` (#494, Codex P1). Поведінка за допустимого `ArchivesKeepCount` не змінена.
+
 - **Feat: профілі напрямків резервного копіювання — «куди копіювати» (#282, хвиля 2).**
   Чотири профілі власника відповідають топологіям наявних пресетів Configurator і пишуть лише наявні
   прапорці, без нових ключів конфігурації: `Cloud` (Хмара, дефолт) ~ `LocalPlusSFTP`, `CloudAndSamba` ~

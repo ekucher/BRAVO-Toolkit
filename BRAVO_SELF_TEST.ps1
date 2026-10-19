@@ -27767,6 +27767,10 @@ function Get-BRAVOMaintenanceSummaryResult {
     # жодної підтвердженої точки відновлення» через KeepCount більше недосяжна,
     # тому й WARNING «НЕ видалено: ... не лишається жодної підтвердженої» не
     # з'являється. Тест перевіряє новий контракт поведінково.
+    # #494 (Codex P1): guard стоїть ПІСЛЯ сканування цілісності (як на developer),
+    # тож і за KeepCount = 0 перевірки SHA512/7z t виконуються, а доведено
+    # пошкоджена стара сесія дає WARNING «не зараховано»; за наявних придатних
+    # сесій прапорці exit 41 не виставляються.
     $retention422KeepZero = & $retentionFollowupRunScenario 'I422KeepZero' (
         @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-CRC-FAILED' $true)
     ) 0
@@ -27779,10 +27783,36 @@ function Get-BRAVOMaintenanceSummaryResult {
             (& $retention422HasArchive $retention422KeepZero '20260110_0100') -and
             (& $retention422HasArchive $retention422KeepZero '20260111_0100') -and
             [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[ERROR\] ArchivesKeepCount = 0 \(< 1\): retention архівів реставрації ПРОПУЩЕНО') -and
-            -not [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[WARNING\] .*НЕ видалено')
+            -not [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[WARNING\] .*НЕ видалено') -and
+            [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ') -and
+            -not [regex]::IsMatch([string]$retention422KeepZero.Log, 'Не лишилось жодної придатної') -and
+            -not $retention422KeepZero.Critical -and
+            -not $retention422KeepZero.RestoreFailed
         ) `
         -Name "Maintenance/RetentionKeepCountBelowOneRefusesToDeleteAnything" `
         -Failure ("за ArchivesKeepCount = 0 retention має бути пропущено з ERROR, а всі чотири before-архіви (включно з доведено пошкодженою старою сесією) - лишитися; WARNING «НЕ видалено» не очікується; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422KeepZero.Threw, $retention422KeepZero.Remaining, $retention422KeepZero.Log)
+
+    # #494 (Codex P1): KeepCount = 0 і жодної придатної сесії - integrity-діагностика
+    # не втрачається: ERROR «Не лишилось жодної придатної точки відновлення» і
+    # прапорці critical/restoreIntegrityFailed (exit 41), як на developer; на додачу
+    # ERROR про KeepCount, архів не видаляється. Те саме для KeepCount = -1.
+    foreach ($retention494Keep in @(0, -1)) {
+        $retention494Zero = & $retentionFollowupRunScenario ('I494Keep' + ($retention494Keep -replace '-', 'N')) @(
+            (& $retentionFollowupSession '20260111_0100' $retentionFollowupBroken)
+        ) $retention494Keep
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $retention494Zero -and
+                $null -eq $retention494Zero.Threw -and
+                [string]$retention494Zero.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100')) -and
+                $retention494Zero.Critical -and
+                $retention494Zero.RestoreFailed -and
+                [regex]::IsMatch([string]$retention494Zero.Log, '(?m)^\[ERROR\] Не лишилось жодної придатної точки відновлення') -and
+                [regex]::IsMatch([string]$retention494Zero.Log, ('(?m)^\[ERROR\] ArchivesKeepCount = {0} \(< 1\)' -f $retention494Keep))
+            ) `
+            -Name ("Maintenance/RetentionKeepCountBelowOneKeepsIntegrityFailure.K{0}" -f $retention494Keep) `
+            -Failure ("за ArchivesKeepCount = {0} і єдиної зламаної сесії Remove-OldRestoreArchives має зберегти fail-closed діагностику цілісності (critical/restoreIntegrityFailed, exit 41) і ERROR про KeepCount, не видаляючи архів; threw={1}, critical={2}, restoreIntegrityFailed={3}, лишилось=[{4}], журнал: {5}" -f $retention494Keep, $retention494Zero.Threw, $retention494Zero.Critical, $retention494Zero.RestoreFailed, $retention494Zero.Remaining, $retention494Zero.Log)
+    }
 
     # (a'') 7-Zip відхилив пароль (наприклад, після зміни пароля): для
     # класифікатора це archive-specific, але SHA512 архіву збігається з
@@ -37217,6 +37247,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
     $suiteProbeCases = @{}
     $suiteProbeRuns = @{}
     $suiteProbeError = $null
+    $suiteProbeMergedState = $null
     # Id, текст аргументів виклику Invoke-SuiteSelectionCase. Єдине джерело
     # випадків: і драйвер дочірнього процесу, і очікування батька беруть id звідси.
     $suiteProbeCaseTable = @(
@@ -37342,13 +37373,84 @@ foreach ($case in $cases) {
             }
         }
 
-        # Без 2>&1: повідомлення про помилку йде в stderr і тут не перевіряється.
-        $suiteProbeRunA = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $suiteProbeP2Path -Suite NoSuchSuite | ForEach-Object { [string]$_ })
-        $suiteProbeRuns['unknown'] = [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($suiteProbeRunA | ForEach-Object { $_.TrimEnd("`r") }) }
-        $suiteProbeRunB = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $suiteProbeP2Path -Suite 'Paths,Archive' | ForEach-Object { [string]$_ })
-        $suiteProbeRuns['comma'] = [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($suiteProbeRunB | ForEach-Object { $_.TrimEnd("`r") }) }
+        # Дочірні запуски -File (P2) йдуть через Start-Process з перенаправленням
+        # stdout/stderr у тимчасові файли (#483): результат проби залежить лише від
+        # коду виходу і stdout, а stderr дочірнього процесу не потрапляє в потоки
+        # батька, навіть коли батьківський хост зливає stderr (2>&1) під
+        # ErrorActionPreference = Stop (інакше NativeCommandError кидає виняток).
+        # Допоміжна функція живе в окремому файлі (BOM), щоб її спільно використовували
+        # і батько, і проба «батько зі злитим stderr».
+        $suiteProbeHelperText = @'
+function Invoke-SuiteProbeChild {
+    param([string]$HostPath, [string]$ScriptPath, [string]$ArgumentText, [string]$WorkDir, [int]$TimeoutMs = 120000)
+    $runId = [guid]::NewGuid().ToString('N')
+    $outPath = Join-Path $WorkDir ($runId + '.out')
+    $errPath = Join-Path $WorkDir ($runId + '.err')
+    $argLine = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $ScriptPath + '" ' + $ArgumentText
+    $proc = Start-Process -FilePath $HostPath -ArgumentList $argLine -NoNewWindow -PassThru `
+        -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+    try {
+        $null = $proc.Handle
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            try { $proc.Kill(); [void]$proc.WaitForExit(10000) } catch { $null = $_ }
+            throw 'дочірній процес проби не завершився за 120 с'
+        }
+        $proc.WaitForExit()
+        $outLines = @()
+        if ([IO.File]::Exists($outPath)) {
+            $outLines = @([IO.File]::ReadAllLines($outPath) | ForEach-Object { ([string]$_).TrimEnd("`r") })
+        }
+        $exitCode = $proc.ExitCode
+        return [pscustomobject]@{ ExitCode = $exitCode; Lines = $outLines }
+    } finally {
+        # Dispose на КОЖНОМУ шляху виходу; збій очищення не маскує початкову помилку.
+        try { $proc.Dispose() } catch { $null = $_ }
+    }
+}
+'@
+        $suiteProbeHelperPath = Join-Path $suiteProbeRoot 'probe-helper.ps1'
+        [IO.File]::WriteAllText($suiteProbeHelperPath, $suiteProbeHelperText, (New-Object Text.UTF8Encoding($true)))
+        . $suiteProbeHelperPath
+
+        $suiteProbeRuns['unknown'] = Invoke-SuiteProbeChild -HostPath $suiteProbeHost -ScriptPath $suiteProbeP2Path `
+            -ArgumentText '-Suite NoSuchSuite' -WorkDir $suiteProbeRoot
+        $suiteProbeRuns['comma'] = Invoke-SuiteProbeChild -HostPath $suiteProbeHost -ScriptPath $suiteProbeP2Path `
+            -ArgumentText '-Suite Paths,Archive' -WorkDir $suiteProbeRoot
+
+        # Проба «батько зі злитим stderr»: дочірній c.ps1 сам запускає w.ps1 під
+        # ErrorActionPreference = Stop через `2>&1 | Out-File`; w.ps1 виконує ті самі
+        # два P2-запуски тією ж функцією. Результат w.ps1 читається з файлу.
+        $suiteProbeMergedOut = Join-Path $suiteProbeRoot 'merged-out.txt'
+        $suiteProbeWPath = Join-Path $suiteProbeRoot 'probe-w.ps1'
+        $suiteProbeCPath = Join-Path $suiteProbeRoot 'probe-c.ps1'
+        $suiteProbeQ = { param([string]$Value) "'" + $Value.Replace("'", "''") + "'" }
+        $suiteProbeW = "`$ErrorActionPreference = 'Stop'`r`n. " + (& $suiteProbeQ $suiteProbeHelperPath) + "`r`n" +
+            "foreach (`$pair in @(@('unknown', '-Suite NoSuchSuite'), @('comma', '-Suite Paths,Archive'))) {`r`n" +
+            "    `$r = Invoke-SuiteProbeChild -HostPath " + (& $suiteProbeQ $suiteProbeHost) + " -ScriptPath " +
+            (& $suiteProbeQ $suiteProbeP2Path) + " -ArgumentText `$pair[1] -WorkDir " + (& $suiteProbeQ $suiteProbeRoot) + "`r`n" +
+            "    Write-Output ('RUN|' + `$pair[0] + '|' + `$r.ExitCode + '|' + [string]::Join('~', @(`$r.Lines)))`r`n}`r`n"
+        $suiteProbeC = "`$ErrorActionPreference = 'Stop'`r`n" +
+            "try {`r`n    & " + (& $suiteProbeQ $suiteProbeHost) + " -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " +
+            (& $suiteProbeQ $suiteProbeWPath) + " 2>&1 | Out-File -LiteralPath " + (& $suiteProbeQ $suiteProbeMergedOut) +
+            " -Encoding UTF8`r`n} catch {`r`n    Set-Content -LiteralPath " + (& $suiteProbeQ $suiteProbeMergedOut) +
+            " -Value ('CAUGHT|' + `$_.Exception.Message) -Encoding UTF8`r`n}`r`n"
+        [IO.File]::WriteAllText($suiteProbeWPath, $suiteProbeW, (New-Object Text.UTF8Encoding($true)))
+        [IO.File]::WriteAllText($suiteProbeCPath, $suiteProbeC, (New-Object Text.UTF8Encoding($true)))
+        $suiteProbeMergedHost = Invoke-SuiteProbeChild -HostPath $suiteProbeHost -ScriptPath $suiteProbeCPath `
+            -ArgumentText '' -WorkDir $suiteProbeRoot
+        $suiteProbeMergedState = [pscustomobject]@{ HostExit = $suiteProbeMergedHost.ExitCode; Caught = $true; Runs = @{} }
+        if ([IO.File]::Exists($suiteProbeMergedOut)) {
+            $suiteProbeMergedLines = @([IO.File]::ReadAllLines($suiteProbeMergedOut) | ForEach-Object { ([string]$_).TrimEnd("`r") })
+            $suiteProbeMergedState.Caught = (@($suiteProbeMergedLines | Where-Object { $_.StartsWith('CAUGHT|') }).Count -gt 0)
+            foreach ($suiteProbeMergedLine in $suiteProbeMergedLines) {
+                $suiteProbeMergedMatch = [regex]::Match($suiteProbeMergedLine, '^RUN\|([a-z]+)\|(-?\d+)\|(.*)$')
+                if (-not $suiteProbeMergedMatch.Success) { continue }
+                $suiteProbeMergedState.Runs[$suiteProbeMergedMatch.Groups[1].Value] = [pscustomobject]@{
+                    ExitCode = [int]$suiteProbeMergedMatch.Groups[2].Value
+                    Lines    = @($suiteProbeMergedMatch.Groups[3].Value.Split([char]'~') | Where-Object { $_.Length -gt 0 })
+                }
+            }
+        }
     } catch {
         $suiteProbeError = $_.Exception.Message
     } finally {
@@ -37477,10 +37579,28 @@ foreach ($case in $cases) {
     if ($suiteProbeRuns.ContainsKey('unknown')) { $suiteProbeUnknownRun = $suiteProbeRuns['unknown'] }
     $suiteProbeCommaRun = $null
     if ($suiteProbeRuns.ContainsKey('comma')) { $suiteProbeCommaRun = $suiteProbeRuns['comma'] }
-    $suiteProbeUnknownOk = (
-        $null -ne $suiteProbeUnknownRun -and
-        $suiteProbeUnknownRun.ExitCode -eq 1 -and
-        @($suiteProbeUnknownRun.Lines | Where-Object { $_.Contains('PROBE-REACHED') -or $_.Contains('SELF-TEST PASSED') }).Count -eq 0)
+    # Предикати спільні для прямого запуску і для проби «батько зі злитим stderr» (#483).
+    $suiteProbeUnknownEval = {
+        param([object]$Run)
+        return (
+            $null -ne $Run -and
+            $Run.ExitCode -eq 1 -and
+            @($Run.Lines | Where-Object { $_.Contains('PROBE-REACHED') -or $_.Contains('SELF-TEST PASSED') }).Count -eq 0)
+    }
+    $suiteProbeCommaEval = {
+        param([object]$Run)
+        $selected = (
+            $null -ne $Run -and
+            $Run.ExitCode -eq 0 -and
+            $Run.Lines -ccontains 'PROBE-REACHED' -and
+            $Run.Lines -ccontains 'PROBE-SEL=Paths;Archive')
+        $rejected = (
+            $null -ne $Run -and
+            $Run.ExitCode -eq 1 -and
+            $Run.Lines -cnotcontains 'PROBE-REACHED')
+        return ($selected -or $rejected)
+    }
+    $suiteProbeUnknownOk = (& $suiteProbeUnknownEval $suiteProbeUnknownRun)
     $suiteProbeUnknownExit = 'прогін не виконано'
     if ($null -ne $suiteProbeUnknownRun) { $suiteProbeUnknownExit = [string]$suiteProbeUnknownRun.ExitCode }
     Test-BRAVOCondition `
@@ -37497,23 +37617,40 @@ foreach ($case in $cases) {
     # невідомий, код 1 і код далі не виконується.
     # Після першого прогону на Windows CI записати тут, який саме варіант
     # обрав Windows PowerShell 5.1.
-    $suiteProbeCommaSelected = (
-        $null -ne $suiteProbeCommaRun -and
-        $suiteProbeCommaRun.ExitCode -eq 0 -and
-        $suiteProbeCommaRun.Lines -ccontains 'PROBE-REACHED' -and
-        $suiteProbeCommaRun.Lines -ccontains 'PROBE-SEL=Paths;Archive')
-    $suiteProbeCommaRejected = (
-        $null -ne $suiteProbeCommaRun -and
-        $suiteProbeCommaRun.ExitCode -eq 1 -and
-        $suiteProbeCommaRun.Lines -cnotcontains 'PROBE-REACHED')
+
     $suiteProbeCommaExit = 'прогін не виконано'
     if ($null -ne $suiteProbeCommaRun) { $suiteProbeCommaExit = [string]$suiteProbeCommaRun.ExitCode }
     Test-BRAVOCondition `
-        -Condition ($suiteProbeCommaSelected -or $suiteProbeCommaRejected) `
+        -Condition (& $suiteProbeCommaEval $suiteProbeCommaRun) `
         -Name "Framework/SuiteSelectionContract.FileInvocationCommaFormNeverSilentlyMisselects" `
         -EnvironmentLimitation $suiteProbeRestriction `
         -Failure ("-File ... -Suite 'Paths,Archive' мусить дати або вибір Paths;Archive з кодом 0, або відмову з кодом 1 " +
             "без виконання подальшого коду; код: $suiteProbeCommaExit")
+
+    # #483: ті самі два -File-запуски, але з батьківським хостом, що зливає stderr
+    # (`2>&1 | Out-File` під ErrorActionPreference = Stop). Хибний FAIL тут означав би,
+    # що результат проби знову залежить від стану stderr батька, а не від коду виходу і stdout.
+    $suiteProbeMergedRuns = @{}
+    $suiteProbeMergedCaught = $true
+    $suiteProbeMergedHostExit = 'прогін не виконано'
+    if ($null -ne $suiteProbeMergedState) {
+        $suiteProbeMergedRuns = $suiteProbeMergedState.Runs
+        $suiteProbeMergedCaught = $suiteProbeMergedState.Caught
+        $suiteProbeMergedHostExit = [string]$suiteProbeMergedState.HostExit
+    }
+    $suiteProbeMergedUnknown = $null
+    if ($suiteProbeMergedRuns.ContainsKey('unknown')) { $suiteProbeMergedUnknown = $suiteProbeMergedRuns['unknown'] }
+    $suiteProbeMergedComma = $null
+    if ($suiteProbeMergedRuns.ContainsKey('comma')) { $suiteProbeMergedComma = $suiteProbeMergedRuns['comma'] }
+    Test-BRAVOCondition `
+        -Condition ((-not $suiteProbeMergedCaught) -and $suiteProbeMergedHostExit -ceq '0' -and
+            (& $suiteProbeUnknownEval $suiteProbeMergedUnknown) -and (& $suiteProbeCommaEval $suiteProbeMergedComma)) `
+        -Name "Framework/SuiteSelectionContract.MergedStderrParentDoesNotFalseFail" `
+        -EnvironmentLimitation $suiteProbeRestriction `
+        -Failure ("проби -File під батьком зі злитим stderr (2>&1 | Out-File) мусять давати той самий результат без винятку: " +
+            "виняток=$suiteProbeMergedCaught; код хосту=$suiteProbeMergedHostExit; " +
+            "unknown=" + $(if ($null -ne $suiteProbeMergedUnknown) { [string]$suiteProbeMergedUnknown.ExitCode } else { 'немає' }) +
+            "; comma=" + $(if ($null -ne $suiteProbeMergedComma) { [string]$suiteProbeMergedComma.ExitCode } else { 'немає' }))
 }
 & {
     # M1-M9: мапа "змінений файл -> suite" (Get-BRAVOSelfTestSuiteForChangedPath),
