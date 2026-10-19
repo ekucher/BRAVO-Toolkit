@@ -145,7 +145,7 @@ ew-alias` | DETECTED | виправлено |
 | Id | Клас | Приклад | Гейт | Компенсація | Рішення |
 |---|---|---|---|---|---|
 | X1 | Конкатенація імені | `$c = 'Read-BRAVOLegacy' + 'PrimaryRawOverrides'; & $c` | MISSED | K1, K4 | відомий ліміт (обфускація) |
-| X2 | `Invoke-Expression` з літералом | `Invoke-Expression 'Read-BRAVO...'` | MISSED | K1, K4 | відомий ліміт; кандидат на окреме рішення власника |
+| X2 | `Invoke-Expression` з літералом | `Invoke-Expression 'Read-BRAVO...'` | MISSED | `ci/Test-BRAVOForbiddenPattern.ps1` забороняє `Invoke-Expression`/`iex` у всьому репозиторії; K1, K4 | закрито іншим контролем; рядок не виконується в матриці self-test, бо сам літерал заборонений сканером |
 | X3 | `Get-Command` у підвиразі | `& (Get-Command 'Read-BRAVO...')` | MISSED | K1, K4 | відомий ліміт |
 | X4 | Ім'я з префіксом модуля | `Mod\Read-BRAVO...` | MISSED | рідер не експортується модулем (K4) | відомий ліміт |
 | X5 | Файл поза скануваними каталогами | `ci\Rogue.ps1` | MISSED | не production-поверхня; review | відомий ліміт (обсяг сканування) |

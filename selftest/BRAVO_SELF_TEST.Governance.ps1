@@ -3930,7 +3930,7 @@ function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyP
         @{ Id = 'G7b.ScriptQualifiedAssignmentAndCallSameFunction'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$script:r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$script:r }" },
         # --- Додаткові класи, виявлені під час аналізу (не з переліку #239) ---
         @{ Id = 'X1.StringConcatenation'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$c = 'Read-BRAVOLegacy' + 'PrimaryRawOverrides'; & `$c }" },
-        @{ Id = 'X2.InvokeExpressionLiteral'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { Invoke-Expression 'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X' }" },
+        # X2 (Invoke-Expression) не виконується тут: вектор закрито ci/Test-BRAVOForbiddenPattern.ps1 (див. docs/design/BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md).
         @{ Id = 'X3.GetCommandSubexpression'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & (Get-Command 'Read-BRAVOLegacyPrimaryRawOverrides') -ConfigPath X }" },
         @{ Id = 'X4.ModuleQualifiedName'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { BRAVO.Configuration\Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }" },
         @{ Id = 'X5.FileOutsideScanTargets'; Kind = 'MISSED'; Path = 'ci\Rogue.ps1'; Text = 'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X' },
