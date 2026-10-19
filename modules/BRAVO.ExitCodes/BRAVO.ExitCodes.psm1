@@ -191,7 +191,8 @@ function Get-BRAVOExitCodeSeverity {
 function Get-BRAVOExitCodeStatus {
     <#
         Канонічна проєкція коду завершення на поле status machine-readable
-        статус-файла (BRAVO.Status; схема OK | WARNINGS | ERROR незмінна).
+        статус-файла (BRAVO.Status; набір OK | WARNINGS | ERROR незмінний,
+        але з відображенням 20 -> WARNINGS схема статус-файла — v2).
 
         Деривується ЛИШЕ з Get-BRAVOExitCodeSeverity — друге незалежне
         відображення код -> status неприпустиме (#479): SUCCESS -> OK,

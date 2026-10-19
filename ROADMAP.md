@@ -307,7 +307,7 @@ Health-файла. Транспорт/моніторинг поверх файл
 
 Критерії завершення:
 
-- [x] Один versioned schema для machine consumers. *(BRAVO.Status, schemaVersion 1)*
+- [x] Один versioned schema для machine consumers. *(BRAVO.Status, schemaVersion 2; reader приймає 1 і 2)*
 - [x] Жодних secret-bearing values. *(контракт + самотест Status/NoSecretBearingFields)*
 - [x] Exit codes лишаються canonical source of failure class. *(status — проєкція exitCode; fail-soft самотести CallSiteIsFailSoft)*
 - [x] JSON можна використовувати Zabbix/telemetry без парсингу console text. *(4 файли в `STATUS\`; сама інтеграція — P2.2)*

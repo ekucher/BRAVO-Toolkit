@@ -2,6 +2,21 @@
 
 ## Не випущено (developer)
 
+- **Fix: серіалізація preservation+запису status-файла, звірка пари `exitCode`/`status`, `schemaVersion` 2 (PR #493, #478, #479).**
+  (1) Рішення «ERROR не затирається слабшим» і атомарна заміна файла тепер виконуються в `BRAVO.Status` під одним
+  ексклюзивним lock-файлом `<status>.lock` (`FileStream`, `FileShare.None`, опитування кожні 50 мс до таймауту, за замовчуванням 10 с; «зайнято» — лише sharing violation `0x80070020`, будь-яка інша помилка йде шляхом збою). Файл блокування прив'язаний до фізичного файла, тож junction, symlink, 8.3-аліас і регістр не створюють іншого блокування; глобального простору імен немає, тож «squatting» неможливий (`StateRoot` закритий від `BUILTIN\Users`: `Set-BRAVOProtectedDataDirectoryAcl` у `BRAVO_TASKS_INSTALL.ps1`); handle звільняє ОС при завершенні процесу (покинутого блокування не буває); lock-файл не видаляється:
+  `Write-BRAVOOperationStatus -PreserveStrongerError -PassThru` (результат `Written`/`Preserved`/`PreviousStatus`/`TimedOut`/`Note`).
+  Усі writer'и (Archive, Health, Maintenance, RestoreVerify) беруть те саме блокування навколо заміни. Міжсесійна взаємодія SYSTEM ↔ елевований адміністратор лишається пунктом приймання на реальному сервері. За таймауту recovery-запис
+  пропускається й логується (можливий сильніший стан не затирається), звичайний writer кидає виняток, який call-site
+  fail-soft логує WARNING. Runtime Maintenance більше не читає статус окремо від запису. (2) Writer звіряє пару
+  `-ExitCode`/`-Status` з канонічною `Get-BRAVOExitCodeStatus` (`BRAVO.ExitCodes`, late-bound, без залежності в маніфесті):
+  суперечлива пара відхиляється, а недоступність відображення — fail-closed (статус не пишеться).
+  (3) `schemaVersion` піднято до 2, бо в v1 документовано `0`→`OK`, `10`→`WARNINGS`, решта→`ERROR`, а код 20 тепер
+  `WARNINGS`: writer пише v2, reader приймає 1 і 2 (файли v1 лишаються валідними, `status` читається як записано;
+  невідомі версії — `Corrupt`, fail-closed). Self-test (набір `Status`): child-процеси `powershell.exe -NoProfile -File`
+  проти утриманого блокування (серіалізація, таймаут, retry, 0/1/N), відхилення суперечливих пар, v1/v2.
+  Потрібне приймання на реальному сервері: одночасний нічний прогін і Recovery-тик у Task Scheduler.
+
 - **Fix: Recovery-запуск не затирає `ERROR` у `BRAVO_STATUS_Maintenance.json` слабшим статусом (#478, #479).**
   Ранні виходи Recovery-запуску `BRAVO_RESTORE_RECOVERY` (`RecoveryNoWork` і `RestoreVetoedAfterLock` з кодом 10, `RecoveryGuardServicesRunning`
   з кодом 20) тепер передають `-PreserveStrongerError`: `Write-BRAVOMaintenanceEarlyExitStatus` перед записом

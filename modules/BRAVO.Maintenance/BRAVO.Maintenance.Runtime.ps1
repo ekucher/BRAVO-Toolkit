@@ -145,31 +145,6 @@ function Write-BRAVOMaintenanceEarlyExitStatus {
             $null -ne (Get-Command -Name Write-BRAVOOperationStatus -CommandType Function -ErrorAction SilentlyContinue)) {
             $earlyStartedAtVariable = Get-Variable -Name ScriptStartTime -Scope Script -ErrorAction SilentlyContinue
             $earlyNewStatus = Get-BRAVOExitCodeStatus -Code $ExitCode
-            if ($PreserveStrongerError -and
-                $null -ne (Get-Command -Name Get-BRAVOOperationStatusPreservation -CommandType Function -ErrorAction SilentlyContinue)) {
-                $earlyPreservation = Get-BRAVOOperationStatusPreservation -StateRoot $earlyStateRoot -Operation Maintenance -NewStatus $earlyNewStatus
-                $earlyPreservationMessage = $null
-                $earlyPreservationLevel = 'WARNING'
-                if ($earlyPreservation.Preserve) {
-                    $earlyPreservationLevel = 'INFO'
-                    $earlyPreservationMessage = "Recovery-тик завершився кодом $ExitCode ($earlyNewStatus), але status-файл Maintenance зберігає попередній $($earlyPreservation.PreviousStatus) — слабший статус його не затирає"
-                } elseif (-not [string]::IsNullOrEmpty([string]$earlyPreservation.Note)) {
-                    $earlyPreservationMessage = [string]$earlyPreservation.Note
-                }
-                if ($null -ne $earlyPreservationMessage) {
-                    # Збій логування не має ні блокувати, ні змінювати рішення про запис.
-                    try {
-                        if (Get-Command -Name Write-Log -CommandType Function -ErrorAction SilentlyContinue) {
-                            Write-Log -Message $earlyPreservationMessage -Level $earlyPreservationLevel
-                        } else {
-                            Write-Warning $earlyPreservationMessage
-                        }
-                    } catch {
-                        $null = $_
-                    }
-                }
-                if ($earlyPreservation.Preserve) { return }
-            }
             $earlyStartedAt = if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) {
                 [datetime]$earlyStartedAtVariable.Value
             } else {
@@ -184,14 +159,41 @@ function Write-BRAVOMaintenanceEarlyExitStatus {
             }
             if (-not $earlyStatusDetails.ContainsKey('earlyTermination')) { $earlyStatusDetails['earlyTermination'] = $true }
             if (-not $earlyStatusDetails.ContainsKey('earlyExitReason')) { $earlyStatusDetails['earlyExitReason'] = [string]$Reason }
-            Write-BRAVOOperationStatus `
+            # Recovery-тик: рішення «ERROR не затирається слабшим» і атомарна заміна
+            # виконуються writer'ом під одним mutex на status-файл (BRAVO.Status,
+            # без check-then-write вікна). Таймаут блокування — запис пропущено.
+            $earlyWriteResult = Write-BRAVOOperationStatus `
                 -StateRoot $earlyStateRoot `
                 -Operation Maintenance `
                 -ExitCode $ExitCode `
                 -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
                 -Status $earlyNewStatus `
                 -StartedAt $earlyStartedAt `
-                -Details $earlyStatusDetails
+                -Details $earlyStatusDetails `
+                -PreserveStrongerError:$PreserveStrongerError `
+                -PassThru
+            if ($PreserveStrongerError -and $null -ne $earlyWriteResult) {
+                $earlyPreservationMessage = $null
+                $earlyPreservationLevel = 'WARNING'
+                if ($earlyWriteResult.Preserved) {
+                    $earlyPreservationLevel = 'INFO'
+                    $earlyPreservationMessage = "Recovery-тик завершився кодом $ExitCode ($earlyNewStatus), але status-файл Maintenance зберігає попередній $($earlyWriteResult.PreviousStatus) — слабший статус його не затирає"
+                } elseif (-not [string]::IsNullOrEmpty([string]$earlyWriteResult.Note)) {
+                    $earlyPreservationMessage = [string]$earlyWriteResult.Note
+                }
+                if ($null -ne $earlyPreservationMessage) {
+                    # Збій логування не має впливати на результат запису.
+                    try {
+                        if (Get-Command -Name Write-Log -CommandType Function -ErrorAction SilentlyContinue) {
+                            Write-Log -Message $earlyPreservationMessage -Level $earlyPreservationLevel
+                        } else {
+                            Write-Warning $earlyPreservationMessage
+                        }
+                    } catch {
+                        $null = $_
+                    }
+                }
+            }
         }
     } catch {
         # Ранні виходи не мають зовнішнього try, а Write-Log може ще не
