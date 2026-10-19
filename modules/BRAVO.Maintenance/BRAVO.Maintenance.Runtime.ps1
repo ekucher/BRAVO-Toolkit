@@ -7997,18 +7997,6 @@ function Remove-OldRestoreArchives {
         [switch]$ProtectBeforeOnlySessions
     )
 
-    # F8 (security review): KeepCount < 1 за Select-Skip означає "видалити всі
-    # придатні сесії". Fail-closed: схема має відхиляти таке значення, а тут
-    # (захисно) guard стоїть на самому початку функції, ДО переліку та
-    # перебору сесій (#484/#474): за недопустимої конфігурації не виконується
-    # зайва перевірка цілісності 7-Zip і не пишуться WARNING про непридатні
-    # сесії до ERROR; від'ємне значення дає ERROR, а не ParameterBinding
-    # exception. Retention пропускається цілком, нічого не видаляється.
-    if ($KeepCount -lt 1) {
-        Write-Log "ArchivesKeepCount = $KeepCount (< 1): retention архівів реставрації ПРОПУЩЕНО, щоб не видалити всі точки відновлення. Вкажіть значення не менше 1." -Level "ERROR"
-        return
-    }
-
     # Збираємо основні архіви (без контрольних сум). #424 (review): збій
     # переліку чи перевірки наявності каталогу — ERROR і прапорці exit 41
     # уже записано; жодної перевірки чи видалення за неповним переліком.
@@ -8175,6 +8163,19 @@ function Remove-OldRestoreArchives {
         if ($null -ne $Outcome) { $Outcome['IntegrityFailed'] = $true }
     }
 
+    # F8 (security review): KeepCount < 1 за Select-Skip означає "видалити всі
+    # придатні сесії". Fail-closed: схема має відхиляти таке значення, а тут
+    # (захисно, ПІСЛЯ діагностики цілісності вище, але ДО першого
+    # Select-Object -First/-Skip $KeepCount: від'ємне значення дає ERROR, а не
+    # ParameterBinding exception) retention пропускається цілком.
+    # #494 (Codex P1): guard НЕ переносити перед перевірки SHA512/7z t:
+    # ArchivesKeepCount = 0 проходить preflight (відхиляє лише < 0) і схему
+    # Configurator, а ранній return без сканування лишав би Outcome,
+    # criticalErrorOccurred і restoreIntegrityFailed невиставленими (втрата exit 41).
+    if ($KeepCount -lt 1) {
+        Write-Log "ArchivesKeepCount = $KeepCount (< 1): retention архівів реставрації ПРОПУЩЕНО, щоб не видалити всі точки відновлення. Вкажіть значення не менше 1." -Level "ERROR"
+        return
+    }
     $sortedGroups = @($validGroups | Sort-Object Name -Descending)
     if ($ProtectBeforeOnlySessions) {
         $beforeOnlyProtectedGroups = @($sortedGroups | Where-Object {

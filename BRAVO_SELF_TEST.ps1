@@ -27767,10 +27767,10 @@ function Get-BRAVOMaintenanceSummaryResult {
     # жодної підтвердженої точки відновлення» через KeepCount більше недосяжна,
     # тому й WARNING «НЕ видалено: ... не лишається жодної підтвердженої» не
     # з'являється. Тест перевіряє новий контракт поведінково.
-    # #484/#474: guard стоїть на початку функції, тож до ERROR немає ні перевірок
-    # цілісності 7-Zip, ні WARNING про непридатні сесії (доведено пошкоджена стара
-    # сесія тут не дає рядка «не зараховано»), ні прапорців exit 41: журнал
-    # складається рівно з одного рядка - ERROR про KeepCount.
+    # #494 (Codex P1): guard стоїть ПІСЛЯ сканування цілісності (як на developer),
+    # тож і за KeepCount = 0 перевірки SHA512/7z t виконуються, а доведено
+    # пошкоджена стара сесія дає WARNING «не зараховано»; за наявних придатних
+    # сесій прапорці exit 41 не виставляються.
     $retention422KeepZero = & $retentionFollowupRunScenario 'I422KeepZero' (
         @(& $retention422Base) + @(& $retentionFollowupSession $retention422Subject 'BRAVO-SELFTEST-CRC-FAILED' $true)
     ) 0
@@ -27784,14 +27784,35 @@ function Get-BRAVOMaintenanceSummaryResult {
             (& $retention422HasArchive $retention422KeepZero '20260111_0100') -and
             [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[ERROR\] ArchivesKeepCount = 0 \(< 1\): retention архівів реставрації ПРОПУЩЕНО') -and
             -not [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[WARNING\] .*НЕ видалено') -and
-            @(([string]$retention422KeepZero.Log) -split "`n" | Where-Object { $_.Length -gt 0 }).Count -eq 1 -and
-            -not [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[WARNING\] ') -and
-            -not [regex]::IsMatch([string]$retention422KeepZero.Log, 'не зараховано як точку відновлення|Перев[iі]рк[ау] .*7z t|Не лишилось жодної придатної') -and
+            [regex]::IsMatch([string]$retention422KeepZero.Log, '(?m)^\[WARNING\] Архів реставрації не зараховано як точку відновлення: ') -and
+            -not [regex]::IsMatch([string]$retention422KeepZero.Log, 'Не лишилось жодної придатної') -and
             -not $retention422KeepZero.Critical -and
             -not $retention422KeepZero.RestoreFailed
         ) `
         -Name "Maintenance/RetentionKeepCountBelowOneRefusesToDeleteAnything" `
         -Failure ("за ArchivesKeepCount = 0 retention має бути пропущено з ERROR, а всі чотири before-архіви (включно з доведено пошкодженою старою сесією) - лишитися; WARNING «НЕ видалено» не очікується; threw={0}, лишилось=[{1}], журнал: {2}" -f $retention422KeepZero.Threw, $retention422KeepZero.Remaining, $retention422KeepZero.Log)
+
+    # #494 (Codex P1): KeepCount = 0 і жодної придатної сесії - integrity-діагностика
+    # не втрачається: ERROR «Не лишилось жодної придатної точки відновлення» і
+    # прапорці critical/restoreIntegrityFailed (exit 41), як на developer; на додачу
+    # ERROR про KeepCount, архів не видаляється. Те саме для KeepCount = -1.
+    foreach ($retention494Keep in @(0, -1)) {
+        $retention494Zero = & $retentionFollowupRunScenario ('I494Keep' + ($retention494Keep -replace '-', 'N')) @(
+            (& $retentionFollowupSession '20260111_0100' $retentionFollowupBroken)
+        ) $retention494Keep
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $retention494Zero -and
+                $null -eq $retention494Zero.Threw -and
+                [string]$retention494Zero.Remaining -ceq (& $retentionFollowupExpectedFiles @('20260111_0100')) -and
+                $retention494Zero.Critical -and
+                $retention494Zero.RestoreFailed -and
+                [regex]::IsMatch([string]$retention494Zero.Log, '(?m)^\[ERROR\] Не лишилось жодної придатної точки відновлення') -and
+                [regex]::IsMatch([string]$retention494Zero.Log, ('(?m)^\[ERROR\] ArchivesKeepCount = {0} \(< 1\)' -f $retention494Keep))
+            ) `
+            -Name ("Maintenance/RetentionKeepCountBelowOneKeepsIntegrityFailure.K{0}" -f $retention494Keep) `
+            -Failure ("за ArchivesKeepCount = {0} і єдиної зламаної сесії Remove-OldRestoreArchives має зберегти fail-closed діагностику цілісності (critical/restoreIntegrityFailed, exit 41) і ERROR про KeepCount, не видаляючи архів; threw={1}, critical={2}, restoreIntegrityFailed={3}, лишилось=[{4}], журнал: {5}" -f $retention494Keep, $retention494Zero.Threw, $retention494Zero.Critical, $retention494Zero.RestoreFailed, $retention494Zero.Remaining, $retention494Zero.Log)
+    }
 
     # (a'') 7-Zip відхилив пароль (наприклад, після зміни пароля): для
     # класифікатора це archive-specific, але SHA512 архіву збігається з
