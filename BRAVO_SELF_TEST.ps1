@@ -31563,28 +31563,40 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
         -Failure "невідповідний RunLevel має фіксуватися проти expected"
 
     # --- TaskConfigPath/*: #281 / #154 (B5) read-only доказ — які завдання BRAVO
-    # досі передають -ConfigPath на legacy BRAVO.config. Синтетичні XML-завдання
-    # й фальшива папка Планувальника (без справжнього Task Scheduler); реальні
-    # функції Diagnose + канонічний Test-BravoLegacyConfiguration loader-а.
+    # досі передають -ConfigPath на legacy BRAVO.config. Реальний модуль
+    # BRAVO.SchedulerDiagnostics на синтетичних XML-завданнях і фальшивій папці
+    # Планувальника (без справжнього Task Scheduler); правило «legacy primary» —
+    # канонічний Test-BravoLegacyConfiguration loader-а (передається валідатором).
     & {
         $legacyScanFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_SELFTEST_CFGPATH_{0}" -f [guid]::NewGuid().ToString('N'))
         try {
-            $legacyScanModule = New-BRAVOSelfTestRuntimeModule `
-                -SourceText ([IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1'), [Text.Encoding]::UTF8) + "`n" +
-                    [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)) `
-                -FunctionNames @('ConvertFrom-BRAVOWindowsCommandLine', 'Test-BRAVOScriptPathIsBravoEntrypoint', 'Get-BRAVOPowerShellInvocationMode', 'Resolve-BRAVOTaskActionPath', 'Get-BRAVOScriptDeclaredParameter',
-                    'Test-BRAVOParameterSpellingBindsConfigPath', 'Get-BRAVOTaskActionConfigPathReference',
-                    'Get-BRAVOConfigPathTargetClassification', 'Get-BRAVOTaskConfigPathFinding', 'ConvertFrom-BRAVOTaskXmlExecAction',
-                    'Get-BRAVOLegacyConfigPathTaskReport', 'Format-BRAVOConfigPathFindingLine', 'Test-BravoLegacyConfiguration')
+            $scanModule = Import-Module -Name (Join-Path $root 'modules\BRAVO.SchedulerDiagnostics\BRAVO.SchedulerDiagnostics.psd1') -Force -PassThru -ErrorAction Stop
+            $scanLoaderModule = New-BRAVOSelfTestRuntimeModule `
+                -SourceText ([IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)) `
+                -FunctionNames @('Test-BravoLegacyConfiguration')
+            $scanValidator = {
+                param($Path, $Root)
+                & $scanLoaderModule { param($a, $b) Test-BravoLegacyConfiguration -ConfigPath $a -ConfigRoot $b } $Path $Root
+            }.GetNewClosure()
 
             $scanRuntime = Join-Path $legacyScanFixtureRoot 'runtime'
             $scanCfg = Join-Path $legacyScanFixtureRoot 'cfg'
             $scanOdd = Join-Path $legacyScanFixtureRoot 'Конфіг сайту №1'
             foreach ($scanDir in @($scanRuntime, $scanCfg, $scanOdd)) { [void][IO.Directory]::CreateDirectory($scanDir) }
-            [IO.File]::WriteAllText((Join-Path $scanRuntime 'BRAVO_ARCHIV.ps1'), "[CmdletBinding()]`r`nparam([string]`$ConfigPath, [switch]`$NoPause)`r`n", [Text.Encoding]::UTF8)
-            [IO.File]::WriteAllText((Join-Path $scanRuntime 'BRAVO_ALIAS.ps1'), "param([Alias('Cfg', 'Cfgfile')][string]`$ConfigPath, [switch]`$NoPause)`r`n", [Text.Encoding]::UTF8)
-            [IO.File]::WriteAllText((Join-Path $scanRuntime 'BRAVO_ALIAS2.ps1'), "param([string]`$ConfigPath, [Alias('Conf')][string]`$ConfigRoot)`r`n", [Text.Encoding]::UTF8)
-            [IO.File]::WriteAllText((Join-Path $scanRuntime 'BRAVO_AMBIG.ps1'), "param([string]`$ConfigPath, [string]`$ConfigRoot)`r`n", [Text.Encoding]::UTF8)
+            $scanScripts = [ordered]@{
+                'BRAVO_ARCHIV.ps1' = "[CmdletBinding()]`r`nparam([string]`$ConfigPath, [switch]`$NoPause)`r`n"
+                'BRAVO_ALIAS.ps1'  = "param([Alias('Cfg', 'Cfgfile')][string]`$ConfigPath, [switch]`$NoPause)`r`n"
+                'BRAVO_ALIAS2.ps1' = "param([string]`$ConfigPath, [Alias('Conf')][string]`$ConfigRoot)`r`n"
+                'BRAVO_AMBIG.ps1'  = "param([string]`$ConfigPath, [string]`$ConfigRoot)`r`n"
+                'BRAVO_MAINT.ps1'  = "[CmdletBinding()]`r`nparam([switch]`$Force, [string]`$AutoShutdown, [string]`$ConfigPath, [switch]`$NoPause)`r`n"
+                'BRAVO_NOPOS.ps1'  = "[CmdletBinding(PositionalBinding=`$false)]`r`nparam([string]`$ConfigPath)`r`n"
+                'BRAVO_POS.ps1'    = "param([Parameter(Position=1)][string]`$Other, [Parameter(Position=0)][string]`$ConfigPath)`r`n"
+                'BRAVO_SHOULD.ps1' = "[CmdletBinding(SupportsShouldProcess)]`r`nparam([string]`$ConfigPath)`r`n"
+                'BRAVO_SETS.ps1'   = "[CmdletBinding(DefaultParameterSetName='A')]`r`nparam([Parameter(ParameterSetName='A')][string]`$ConfigPath)`r`n"
+            }
+            foreach ($scanScriptName in $scanScripts.Keys) {
+                [IO.File]::WriteAllText((Join-Path $scanRuntime $scanScriptName), $scanScripts[$scanScriptName], [Text.Encoding]::UTF8)
+            }
             $scanLegacy = Join-Path $scanCfg 'BRAVO.config'
             $scanLocal = Join-Path $scanCfg 'BRAVO.local.config'
             $scanText = Join-Path $scanCfg 'site.txt'
@@ -31595,55 +31607,122 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
             [IO.File]::WriteAllText($scanOddConfig, "# fixture`r`n", [Text.Encoding]::UTF8)
             $scanMissing = Join-Path $scanCfg 'NOPE\BRAVO.config'
             $scanArchiv = Join-Path $scanRuntime 'BRAVO_ARCHIV.ps1'
-            $scanAmbig = Join-Path $scanRuntime 'BRAVO_AMBIG.ps1'
             $scanAlias = Join-Path $scanRuntime 'BRAVO_ALIAS.ps1'
             $scanAlias2 = Join-Path $scanRuntime 'BRAVO_ALIAS2.ps1'
+            $scanAmbig = Join-Path $scanRuntime 'BRAVO_AMBIG.ps1'
+            $scanMaint = Join-Path $scanRuntime 'BRAVO_MAINT.ps1'
+            $scanNoPos = Join-Path $scanRuntime 'BRAVO_NOPOS.ps1'
+            $scanPos = Join-Path $scanRuntime 'BRAVO_POS.ps1'
+            $scanShould = Join-Path $scanRuntime 'BRAVO_SHOULD.ps1'
+            $scanSets = Join-Path $scanRuntime 'BRAVO_SETS.ps1'
             $scanGhost = Join-Path $legacyScanFixtureRoot 'ghost\BRAVO_GHOST.ps1'
             $scanQ = '"'
             $scanBase = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass'
+            $scanPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+
             $scanCases = @(
-                @{ Name = 'T01_Legacy'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T02_Auto'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T03_Local'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLocal$scanQ -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T04_Missing'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanMissing$scanQ -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T05_OddPath'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanOddConfig$scanQ -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T06_AbbrevConfig'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -Config $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T07_AbbrevConfigP'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -configp:$scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T08_AmbigConfig'; Arguments = "$scanBase -File $scanQ$scanAmbig$scanQ -Config $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T09_CommandForm'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' -ConfigPath '$scanLegacy' -NoPause$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T10_Unbalanced'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T11_NoValue'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -NoPause -ConfigPath"; Wd = $scanRuntime },
-                @{ Name = 'T12_Variable'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' -ConfigPath `$cfg$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T13_NotBravo'; Arguments = "-NoProfile -File C:\Tools\backup.ps1 -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = '' },
-                @{ Name = 'T14_NonConfigExt'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanText$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T15_Relative'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = $scanRuntime },
-                @{ Name = 'T16_RelativeNoWd'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = '' },
-                @{ Name = 'T17_GhostConf'; Arguments = "$scanBase -File $scanQ$scanGhost$scanQ -Conf $scanQ$scanLegacy$scanQ"; Wd = $legacyScanFixtureRoot },
-                @{ Name = 'T18_GhostCo'; Arguments = "$scanBase -File $scanQ$scanGhost$scanQ -Co $scanQ$scanLegacy$scanQ"; Wd = $legacyScanFixtureRoot },
-                @{ Name = 'T19_EnvVar'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %BRAVO_SELFTEST_UNSET_VAR%\BRAVO.config"; Wd = $scanRuntime },
-                @{ Name = 'T21_AliasExact'; Arguments = "$scanBase -File $scanQ$scanAlias$scanQ -Cfg $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T22_AliasPrefix'; Arguments = "$scanBase -File $scanQ$scanAlias$scanQ -Cfgf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T23_SameParamAliasesNotAmbiguous'; Arguments = "$scanBase -File $scanQ$scanAlias$scanQ -Cf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T24_AliasOfOtherParam'; Arguments = "$scanBase -File $scanQ$scanAlias2$scanQ -Conf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T25_MixedCommandOtherScript'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv'; & 'C:\Tools\OTHER.ps1' -ConfigPath '$scanLegacy'$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T26_UninvokedScriptBlock'; Arguments = "$scanBase -Command $scanQ`$sb = { & '$scanArchiv' -ConfigPath '$scanLegacy' }$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T27_UncalledFunction'; Arguments = "$scanBase -Command $scanQ" + "function NeverCalled { & '$scanArchiv' -ConfigPath '$scanLegacy' }$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T28_FileTargetNotBravo'; Arguments = "$scanBase -File C:\Other.ps1 -ConfigPath $scanQ$scanLegacy$scanQ -Label BRAVO_ARCHIV.ps1"; Wd = $scanRuntime },
-                @{ Name = 'T29_FileBravoWithLabel'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -Label BRAVO_OTHER.ps1"; Wd = $scanRuntime },
-                @{ Name = 'T20_Encoded'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -ConfigPath '$scanLegacy'")); Wd = $scanRuntime }
+                @{ Name = 'T01_Legacy'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T02_Auto'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T03_Local'; Expect = 'Local'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLocal$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T04_Missing'; Expect = 'Missing'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanMissing$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T05_OddPath'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanOddConfig$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T06_AbbrevConfig'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -Config $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T07_AbbrevConfigP'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -configp:$scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T08_AmbigConfig'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanAmbig$scanQ -Config $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T09_CommandForm'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' -ConfigPath '$scanLegacy' -NoPause$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T10_Unbalanced'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T11_NoValue'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -NoPause -ConfigPath"; Wd = $scanRuntime },
+                @{ Name = 'T12_Variable'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' -ConfigPath `$cfg$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T13_NotBravo'; Expect = '<none>'; Arguments = "-NoProfile -File C:\Tools\backup.ps1 -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = '' },
+                @{ Name = 'T14_NonConfigExt'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanText$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T15_Relative'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = $scanRuntime },
+                @{ Name = 'T16_RelativeNoWd'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = '' },
+                @{ Name = 'T17_GhostConf'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanGhost$scanQ -Conf $scanQ$scanLegacy$scanQ"; Wd = $legacyScanFixtureRoot },
+                @{ Name = 'T18_GhostCo'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanGhost$scanQ -Co $scanQ$scanLegacy$scanQ"; Wd = $legacyScanFixtureRoot },
+                @{ Name = 'T18b_GhostCoPlain'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanGhost$scanQ -Co abc"; Wd = $legacyScanFixtureRoot },
+                @{ Name = 'T19_EnvVar'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %BRAVO_SELFTEST_UNSET_VAR%\BRAVO.config"; Wd = $scanRuntime },
+                @{ Name = 'T20_Encoded'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -ConfigPath '$scanLegacy'")); Wd = $scanRuntime },
+                @{ Name = 'T21_AliasExact'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanAlias$scanQ -Cfg $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T22_AliasPrefix'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanAlias$scanQ -Cfgf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T23_SameParamAliasesNotAmbiguous'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanAlias$scanQ -Cf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T24_AliasOfOtherParam'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$scanAlias2$scanQ -Conf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T25_MixedCommandOtherScript'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv'; & 'C:\Tools\OTHER.ps1' -ConfigPath '$scanLegacy'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T26_UninvokedScriptBlock'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ`$sb = { & '$scanArchiv' -ConfigPath '$scanLegacy' }$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T27_UncalledFunction'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "function NeverCalled { & '$scanArchiv' -ConfigPath '$scanLegacy' }$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T28_FileTargetNotBravo'; Expect = 'Unknown'; Arguments = "$scanBase -File C:\Other.ps1 -ConfigPath $scanQ$scanLegacy$scanQ -Label BRAVO_ARCHIV.ps1"; Wd = $scanRuntime },
+                @{ Name = 'T29_FileBravoWithLabel'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -Label BRAVO_OTHER.ps1"; Wd = $scanRuntime },
+                # --- #496, знахідка 1: позиційний ConfigPath ---
+                @{ Name = 'T30_PositionalFirst'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ $scanQ$scanLegacy$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T31_PositionalSecondParam'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanMaint$scanQ on $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T31b_PositionalBindsOtherParam'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$scanMaint$scanQ on"; Wd = $scanRuntime },
+                @{ Name = 'T32_PositionalAfterSwitch'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -NoPause $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T33_PositionalBindingOff'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanNoPos$scanQ $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T34_ExplicitPositionZero'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanPos$scanQ $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T35_ParameterSetsAmbiguous'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanSets$scanQ $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T36_PositionalUnknownScript'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanGhost$scanQ $scanQ$scanLegacy$scanQ"; Wd = $legacyScanFixtureRoot },
+                @{ Name = 'T37_NamedWinsOverPositional'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ extra"; Wd = $scanRuntime },
+                @{ Name = 'T38_PositionalCommandForm'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' '$scanLegacy'$scanQ"; Wd = $scanRuntime },
+                # --- знахідка 2: динамічний виклик у -Command ---
+                @{ Name = 'T39_DynamicVariableInvocation'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ`$s = '$scanArchiv'; & `$s -ConfigPath '$scanLegacy'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T40_StartProcessDynamic'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "Start-Process powershell -ArgumentList '-File','$scanArchiv'$scanQ"; Wd = $scanRuntime },
+                # --- знахідка 4: -EncodedCommand без -ConfigPath ---
+                @{ Name = 'T41_EncodedAuto'; Expect = 'NoConfigPath'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -NoPause")); Wd = $scanRuntime },
+                @{ Name = 'T42_EncodedNotBravo'; Expect = '<none>'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('Get-Date')); Wd = $scanRuntime },
+                # --- знахідка 5: Exec.Command ---
+                @{ Name = 'T43_PythonExecutable'; Expect = '<none>'; Command = 'C:\Python\python.exe'; Arguments = "-File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T44_QuotedSystemRootUpperCase'; Expect = 'LegacyPrimary'; Command = '"%SystemRoot%\System32\WindowsPowerShell\v1.0\POWERSHELL.EXE"'; Arguments = "-File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T45_PwshUnquoted'; Expect = 'LegacyPrimary'; Command = 'pwsh.exe'; Arguments = "-File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T46_CmdWrapper'; Expect = 'Unknown'; Command = 'cmd.exe'; Arguments = "/c powershell -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T47_CmdWithoutPowerShell'; Expect = 'Unknown'; Command = 'cmd.exe'; Arguments = '/c echo BRAVO_ARCHIV.ps1'; Wd = $scanRuntime },
+                # --- #496 раунд 4: allowlist для NoConfigPath ---
+                @{ Name = 'T51_VerboseBeforePositional'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -Verbose $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T52_DebugBeforePositional'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -Debug $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T53_WhatIfBeforePositional'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanShould$scanQ -WhatIf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T54_VbAliasBeforePositional'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -vb $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T55_ErrorActionConsumesItsValue'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ErrorAction Stop $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T56_VerboseThenAuto'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -Verbose -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T57_NestedLauncherInCommand'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "powershell.exe -File '$scanArchiv' -ConfigPath '$scanLegacy'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T58_ModuleQualifiedStartProcess'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "Microsoft.PowerShell.Management\Start-Process powershell -ArgumentList '-File','$scanArchiv','-ConfigPath','$scanLegacy'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T59_BravoFirstThenExtraStatement'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' -NoPause; Write-Host done$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T60_PipelineAfterBravo'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' -NoPause | Out-Null$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T61_RedirectionAfterBravo'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' -NoPause > NUL$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T62_BareWordTarget'; Expect = 'NoConfigPath'; Arguments = "$scanBase -Command $scanQ$scanArchiv -NoPause$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T63_UnknownParameterOnKnownScript'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -Bogus"; Wd = $scanRuntime },
+                @{ Name = 'T64_ValueParameterWithoutValue'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanMaint$scanQ -AutoShutdown"; Wd = $scanRuntime },
+                @{ Name = 'T65_WorkingDirectoryMentionsBravo'; Expect = 'Unknown'; Arguments = "$scanBase -File C:\Tools\backup.ps1"; Wd = 'C:\Tools\BRAVO_ARCHIV.ps1' },
+                @{ Name = 'T66_UnknownLeadingOption'; Expect = 'Unknown'; Arguments = "-NoLogo -Bogus -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                # --- #496 раунд 5 ---
+                @{ Name = 'T67_EmptyInlineValueKeepsPositional'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -Command $scanQ& '$scanAlias2' -ConfigRoot:'' '$scanLegacy'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T68_TrapBeforeBravoCall'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "trap { powershell.exe -File '$scanArchiv' -ConfigPath '$scanLegacy' }; & '$scanArchiv'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T69_BeginProcessBlocks'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "begin { Write-Host x } process { & '$scanArchiv' }$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T70_ParamBlock'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "param(`$x) & '$scanArchiv'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T71_RequiresDirective'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ#requires -Version 3`n& '$scanArchiv'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T72_ConfigPathWithUnknownParameter'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -Bogus"; Wd = $scanRuntime },
+                @{ Name = 'T73_ConfigPathInsideIf'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "if (`$false) { & '$scanArchiv' -ConfigPath '$scanLegacy' }$scanQ"; Wd = $scanRuntime },
+                # --- #496 раунд 6: повторно заданий параметр ---
+                @{ Name = 'T74_DuplicateExact'; Expect = 'Unknown,Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T75_DuplicateViaAlias'; Expect = 'Unknown,Unknown'; Arguments = "$scanBase -File $scanQ$scanAlias$scanQ -Cfg $scanQ$scanLegacy$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T76_DuplicateViaAbbreviation'; Expect = 'Unknown,Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -Config $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                # --- знахідка 6: змінні середовища ---
+                @{ Name = 'T48_UserProfileVariable'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %USERPROFILE%\BRAVO.config"; Wd = $scanRuntime },
+                @{ Name = 'T49_ProgramDataStable'; Expect = 'Missing'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %ProgramData%\BRAVO_NOPE_281\BRAVO.config"; Wd = $scanRuntime },
+                @{ Name = 'T50_AppDataInWorkingDirectory'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = '%APPDATA%\BRAVO' }
             )
+
+
             $scanBefore = @(Get-ChildItem -LiteralPath $legacyScanFixtureRoot -Recurse -Force |
                     ForEach-Object { "$($_.FullName)|$(if ($_.PSIsContainer) { 'dir' } else { "$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })" } | Sort-Object)
 
             $scanError = ''
             $scanResult = $null
             try {
-                $scanResult = & $legacyScanModule {
-                    param($Cases)
-                    function New-ScanTaskXml($Arguments, $WorkingDirectory) {
+                $scanResult = & $scanModule {
+                    param($Cases, $Validator, $DefaultCommand)
+                    function New-ScanTaskXml($Command, $Arguments, $WorkingDirectory) {
                         $escape = { param($value) [Security.SecurityElement]::Escape([string]$value) }
-                        '<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions Context="Author"><Exec><Command>powershell.exe</Command><Arguments>' +
-                        (& $escape $Arguments) + '</Arguments><WorkingDirectory>' + (& $escape $WorkingDirectory) + '</WorkingDirectory></Exec></Actions></Task>'
+                        '<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions Context="Author"><Exec><Command>' +
+                        (& $escape $Command) + '</Command><Arguments>' + (& $escape $Arguments) + '</Arguments><WorkingDirectory>' + (& $escape $WorkingDirectory) + '</WorkingDirectory></Exec></Actions></Task>'
                     }
                     function New-ScanFolder($Path, $Tasks, $SubFolders) {
                         $folder = [pscustomobject]@{ Path = $Path; Tasks = @($Tasks); SubFolders = @($SubFolders) }
@@ -31651,19 +31730,28 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                         Add-Member -InputObject $folder -MemberType ScriptMethod -Name GetFolders -Value { param($flags) , @($this.SubFolders) }
                         $folder
                     }
+                    $takesValidator = (Get-Command Get-BRAVOLegacyConfigPathTaskReport).Parameters.ContainsKey('LegacyConfigurationValidator')
+                    function Invoke-ScanReport($Folder) {
+                        if ($takesValidator) {
+                            Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $Folder -LegacyConfigurationValidator $Validator
+                        } else {
+                            Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $Folder
+                        }
+                    }
                     $tasks = @()
                     foreach ($case in $Cases) {
-                        $tasks += [pscustomobject]@{ Path = '\BRAVO\' + $case.Name; Name = $case.Name; Xml = (New-ScanTaskXml $case.Arguments $case.Wd) }
+                        $command = if ($case.ContainsKey('Command')) { $case.Command } else { $DefaultCommand }
+                        $tasks += [pscustomobject]@{ Path = '\BRAVO\' + $case.Name; Name = $case.Name; Xml = (New-ScanTaskXml $command $case.Arguments $case.Wd) }
                     }
-                    $report = Get-BRAVOLegacyConfigPathTaskReport -TaskFolder (New-ScanFolder '\BRAVO' $tasks @())
+                    $report = Invoke-ScanReport (New-ScanFolder '\BRAVO' $tasks @())
                     [pscustomobject]@{
                         Report = $report
-                        Empty = Get-BRAVOLegacyConfigPathTaskReport -TaskFolder (New-ScanFolder '\' @() @())
-                        Single = Get-BRAVOLegacyConfigPathTaskReport -TaskFolder (New-ScanFolder '\BRAVO' @($tasks[0]) @())
-                        Nested = Get-BRAVOLegacyConfigPathTaskReport -TaskFolder (New-ScanFolder '\' @() @((New-ScanFolder '\BRAVO' @($tasks[0]) @((New-ScanFolder '\BRAVO\Sub' @($tasks[1]) @())))))
+                        Empty = Invoke-ScanReport (New-ScanFolder '\' @() @())
+                        Single = Invoke-ScanReport (New-ScanFolder '\BRAVO' @($tasks[0]) @())
+                        Nested = Invoke-ScanReport (New-ScanFolder '\' @() @((New-ScanFolder '\BRAVO' @($tasks[0]) @((New-ScanFolder '\BRAVO\Sub' @($tasks[1]) @())))))
                         Lines = @($report.Findings | ForEach-Object { Format-BRAVOConfigPathFindingLine -Finding $_ })
                     }
-                } $scanCases
+                } $scanCases $scanValidator $scanPs
             } catch {
                 $scanError = $_.Exception.Message
             }
@@ -31699,51 +31787,49 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                     -Condition ($scanResult.Nested.TasksScanned -eq 2 -and $scanResult.Nested.Findings.Count -eq 2) `
                     -Name 'TaskConfigPath/RecursesIntoSubfolders' `
                     -Failure "обхід має входити в підпапки Планувальника. Scanned=$($scanResult.Nested.TasksScanned) Findings=$($scanResult.Nested.Findings.Count)"
-                $scanExpectations = [ordered]@{
-                    'T01_Legacy'        = 'LegacyPrimary'
-                    'T02_Auto'          = 'NoConfigPath'
-                    'T03_Local'         = 'Local'
-                    'T04_Missing'       = 'Missing'
-                    'T05_OddPath'       = 'LegacyPrimary'
-                    'T06_AbbrevConfig'  = 'LegacyPrimary'
-                    'T07_AbbrevConfigP' = 'LegacyPrimary'
-                    'T08_AmbigConfig'   = 'Unknown'
-                    'T09_CommandForm'   = 'LegacyPrimary'
-                    'T10_Unbalanced'    = 'Unknown'
-                    'T11_NoValue'       = 'Unknown'
-                    'T12_Variable'      = 'Unknown'
-                    'T13_NotBravo'      = '<none>'
-                    'T14_NonConfigExt'  = 'Unknown'
-                    'T15_Relative'      = 'LegacyPrimary'
-                    'T16_RelativeNoWd'  = 'Unknown'
-                    'T17_GhostConf'     = 'LegacyPrimary'
-                    'T18_GhostCo'       = 'NoConfigPath'
-                    'T19_EnvVar'        = 'Unknown'
-                    'T20_Encoded'       = 'LegacyPrimary'
-                    'T21_AliasExact'    = 'LegacyPrimary'
-                    'T22_AliasPrefix'   = 'LegacyPrimary'
-                    'T23_SameParamAliasesNotAmbiguous' = 'LegacyPrimary'
-                    'T24_AliasOfOtherParam' = 'NoConfigPath'
-                    'T25_MixedCommandOtherScript' = 'NoConfigPath'
-                    'T26_UninvokedScriptBlock' = 'Unknown'
-                    'T27_UncalledFunction' = 'Unknown'
-                    'T28_FileTargetNotBravo' = '<none>'
-                    'T29_FileBravoWithLabel' = 'LegacyPrimary'
-                }
-                $scanMisses = @($scanExpectations.Keys | Where-Object { (& $scanStatusOf $_) -ne $scanExpectations[$_] } |
-                        ForEach-Object { "$_ : очікується $($scanExpectations[$_]), отримано $(& $scanStatusOf $_)" })
+                $scanMisses = @($scanCases | Where-Object { (& $scanStatusOf $_.Name) -ne $_.Expect } |
+                        ForEach-Object { "$($_.Name) : очікується $($_.Expect), отримано $(& $scanStatusOf $_.Name)" })
                 Test-BRAVOCondition `
                     -Condition ($scanMisses.Count -eq 0) `
                     -Name 'TaskConfigPath/ClassificationMatrix' `
-                    -Failure ("класифікація -ConfigPath (File/Command/EncodedCommand; лапки з пробілами й не-ASCII шлях; скорочення -Config/-ConfigP, неоднозначне скорочення; Local/Missing/Unknown; відносний шлях; змінна середовища): " + ($scanMisses -join '; '))
-                $scanLegacyLine = @($scanResult.Lines | Where-Object { $_.Text -like '*T01_Legacy*' })
+                    -Failure ("класифікація -ConfigPath (File/Command/EncodedCommand; лапки з пробілами й не-ASCII шлях; скорочення та alias-и; позиційна прив'язка; Local/Missing/Unknown; динамічний виклик; Exec.Command; змінні середовища): " + ($scanMisses -join '; '))
+                $scanFindingOf = {
+                    param($TaskName)
+                    @($scanResult.Report.Findings | Where-Object { $_.TaskName -eq $TaskName }) | Select-Object -First 1
+                }
+                $scanLineOf = {
+                    param($TaskName)
+                    @($scanResult.Lines | Where-Object { $_.Text -like "*$TaskName*" }) | Select-Object -First 1
+                }
+                $scanLegacyLine = & $scanLineOf 'T01_Legacy'
                 Test-BRAVOCondition `
-                    -Condition ($scanLegacyLine.Count -eq 1 -and $scanLegacyLine[0].Level -eq 'WARN' -and $scanLegacyLine[0].Text -like '*Дія оператора*' -and $scanLegacyLine[0].Text -like '*#281*') `
+                    -Condition ($null -ne $scanLegacyLine -and $scanLegacyLine.Level -eq 'WARN' -and $scanLegacyLine.Text -like '*Дія оператора*' -and $scanLegacyLine.Text -like '*#281*') `
                     -Name 'TaskConfigPath/LegacyPrimaryReportsOperatorAction' `
                     -Failure 'рядок LegacyPrimary — [WARN] з дією оператора й посиланням на #281/#154'
+                $scanLocalLine = & $scanLineOf 'T03_Local'
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanLocalLine -and $scanLocalLine.Level -eq 'WARN' -and $scanLocalLine.Text -like '*ВИКОНУЄ*' -and $scanLocalLine.Text -like '*без -ConfigPath*') `
+                    -Name 'TaskConfigPath/LocalIsWarningNotInfo' `
+                    -Failure '#496: явний -ConfigPath на BRAVO.local.config — [WARN] (loader виконує його як legacy primary і завантаження ламається), а не [INFO]'
+                $scanEnvFinding = & $scanFindingOf 'T48_UserProfileVariable'
+                $scanWdFinding = & $scanFindingOf 'T50_AppDataInWorkingDirectory'
+                $scanProgramDataFinding = & $scanFindingOf 'T49_ProgramDataStable'
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanEnvFinding -and $scanEnvFinding.Detail -like '*%USERPROFILE%*' -and $scanEnvFinding.Detail -like '*Task Engine*' -and
+                        $null -ne $scanWdFinding -and $scanWdFinding.Detail -like '*%APPDATA%*' -and
+                        $null -ne $scanProgramDataFinding -and $scanProgramDataFinding.ResolvedPath -like "$([Environment]::GetEnvironmentVariable('ProgramData'))*") `
+                    -Name 'TaskConfigPath/EnvironmentVariablesLimitedToStableOnes' `
+                    -Failure '#496: профільні змінні (%USERPROFILE%, %APPDATA%) дають Unknown з поясненням; %ProgramData% розкривається'
             }
-            # P2-3: CommandLineToArgvW-вектори (еталон — нативний shell32 на Windows Server 2022,
-            # звірений у harness.ps1 через P/Invoke; тут фіксована таблиця).
+            $scanAfter = @(Get-ChildItem -LiteralPath $legacyScanFixtureRoot -Recurse -Force |
+                    ForEach-Object { "$($_.FullName)|$(if ($_.PSIsContainer) { 'dir' } else { "$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })" } | Sort-Object)
+            Test-BRAVOCondition `
+                -Condition (@(Compare-Object $scanBefore $scanAfter).Count -eq 0) `
+                -Name 'TaskConfigPath/ReadOnlyFixturesUntouched' `
+                -Failure 'перевірка -ConfigPath не має змінювати жодного файлу (усі файли фікстури незмінні за іменем, розміром і часом)'
+
+            # CommandLineToArgvW-вектори (еталон — нативний shell32 на Windows Server 2022, звірений
+            # через P/Invoke у standalone-harness; тут фіксована таблиця).
             $argvNbsp = [string][char]0xA0
             $argvVectors = @(
                 @('a "b c" d', '<a><b c><d>'), @('a""b', '<ab>'), @('"a""b" c', '<a"b c>'), @('a\"b', '<a"b>'),
@@ -31754,7 +31840,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
             )
             $argvMisses = @()
             try {
-                $argvMisses = @(& $legacyScanModule {
+                $argvMisses = @(& $scanModule {
                         param($Vectors)
                         foreach ($vector in $Vectors) {
                             $split = ConvertFrom-BRAVOWindowsCommandLine -CommandLine $vector[0]
@@ -31770,32 +31856,31 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 -Name 'TaskConfigPath/CommandLineSplitMatchesCommandLineToArgvW' `
                 -Failure ('розбір аргументів має збігатися з CommandLineToArgvW (суміжні лапки, зворотні скісні перед лапками, порожній "" аргумент, U+00A0 не роздільник, "" у лапках = літерал і вихід з лапок): ' + ($argvMisses -join '; '))
 
-            $scanAfter = @(Get-ChildItem -LiteralPath $legacyScanFixtureRoot -Recurse -Force |
-                    ForEach-Object { "$($_.FullName)|$(if ($_.PSIsContainer) { 'dir' } else { "$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })" } | Sort-Object)
-            Test-BRAVOCondition `
-                -Condition (@(Compare-Object $scanBefore $scanAfter).Count -eq 0) `
-                -Name 'TaskConfigPath/ReadOnlyFixturesUntouched' `
-                -Failure 'перевірка -ConfigPath не має змінювати жодного файлу (усі файли фікстури незмінні за іменем, розміром і часом)'
 
+            # Реєстрація модуля й тонкий entrypoint: Diagnose лише імпортує модуль і друкує розділ.
             $scanDiagnoseText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1'), [Text.Encoding]::UTF8)
+            $scanModuleText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.SchedulerDiagnostics\BRAVO.SchedulerDiagnostics.psm1'), [Text.Encoding]::UTF8)
             $scanParseTokens = $null
             $scanParseErrors = $null
-            $scanDiagnoseAst = [Management.Automation.Language.Parser]::ParseInput($scanDiagnoseText, [ref]$scanParseTokens, [ref]$scanParseErrors)
-            $scanReadOnlyFunctionNames = @('ConvertFrom-BRAVOWindowsCommandLine', 'Test-BRAVOScriptPathIsBravoEntrypoint', 'Get-BRAVOPowerShellInvocationMode', 'Resolve-BRAVOTaskActionPath', 'Get-BRAVOScriptDeclaredParameter',
-                'Test-BRAVOParameterSpellingBindsConfigPath', 'Get-BRAVOTaskActionConfigPathReference',
-                'Get-BRAVOConfigPathTargetClassification', 'Get-BRAVOTaskConfigPathFinding', 'ConvertFrom-BRAVOTaskXmlExecAction',
-                'Get-BRAVOLegacyConfigPathTaskReport', 'Format-BRAVOConfigPathFindingLine')
-            $scanReadOnlyFunctions = @($scanDiagnoseAst.FindAll({
-                        param($node)
-                        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $scanReadOnlyFunctionNames -contains $node.Name
-                    }, $true))
+            $scanModuleAst = [Management.Automation.Language.Parser]::ParseInput($scanModuleText, [ref]$scanParseTokens, [ref]$scanParseErrors)
+            $scanModuleParseErrorCount = @($scanParseErrors).Count
             $scanMutationPattern = 'Register-ScheduledTask|RegisterTaskDefinition|DeleteTask|Unregister-ScheduledTask|Set-ScheduledTask|Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item'
-            $scanMutatingFunctions = @($scanReadOnlyFunctions | Where-Object { $_.Extent.Text -match $scanMutationPattern } | ForEach-Object { $_.Name })
+            $scanModuleFunctions = @($scanModuleAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $false))
+            $scanMutatingFunctions = @($scanModuleFunctions | Where-Object { $_.Extent.Text -match $scanMutationPattern } | ForEach-Object { $_.Name })
+            $scanDiagnoseAst = [Management.Automation.Language.Parser]::ParseInput($scanDiagnoseText, [ref]$scanParseTokens, [ref]$scanParseErrors)
+            $scanDiagnoseScannerFunctions = @($scanDiagnoseAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $false) |
+                    Where-Object { $_.Name -like '*ConfigPath*' -or $_.Name -like '*CommandLine*' } | ForEach-Object { $_.Name })
             Test-BRAVOCondition `
-                -Condition ($scanParseErrors.Count -eq 0 -and $scanReadOnlyFunctions.Count -eq $scanReadOnlyFunctionNames.Count -and
-                    $scanMutatingFunctions.Count -eq 0 -and $scanDiagnoseText.Contains('Get-BRAVOLegacyConfigPathTaskReport -TaskFolder')) `
-                -Name 'TaskConfigPath/DiagnoseWiresCheckAndFunctionsAreReadOnly' `
-                -Failure ("Diagnose мусить викликати Get-BRAVOLegacyConfigPathTaskReport, а функції перевірки не сміють реєструвати/змінювати/видаляти завдання чи файли. Функцій знайдено: $($scanReadOnlyFunctions.Count)/$($scanReadOnlyFunctionNames.Count); змінюючі: " + ($scanMutatingFunctions -join ', '))
+                -Condition ($scanModuleParseErrorCount -eq 0 -and $scanModuleFunctions.Count -gt 0 -and $scanMutatingFunctions.Count -eq 0 -and
+                    @($scanModule.ExportedFunctions.Keys).Count -eq 2 -and
+                    $scanModule.ExportedFunctions.ContainsKey('Get-BRAVOLegacyConfigPathTaskReport') -and
+                    $scanModule.ExportedFunctions.ContainsKey('Format-BRAVOConfigPathFindingLine') -and
+                    $scanDiagnoseText.Contains('BRAVO.SchedulerDiagnostics.psd1') -and
+                    $scanDiagnoseText.Contains('Get-BRAVOLegacyConfigPathTaskReport') -and
+                    $scanDiagnoseScannerFunctions.Count -eq 0) `
+                -Name 'TaskConfigPath/ScannerLivesInModuleAndIsReadOnly' `
+                -Failure ('сканер -ConfigPath мусить жити в modules\BRAVO.SchedulerDiagnostics (експорт: Get-BRAVOLegacyConfigPathTaskReport, Format-BRAVOConfigPathFindingLine), не містити команд, що змінюють завдання/файли, а Diagnose — лише імпортувати його й друкувати розділ. Змінюючі: ' + ($scanMutatingFunctions -join ', ') +
+                    '; функції сканера в Diagnose: ' + ($scanDiagnoseScannerFunctions -join ', '))
         } finally {
             Remove-Item -LiteralPath $legacyScanFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -37825,7 +37910,7 @@ foreach ($case in $cases) {
 
     # M3. Таблиця модулів закріплена: ПОВНИЙ перелік каталогів modules\BRAVO.* і
     # відповідний suite для кожного. Новий модуль ламає тест і вимагає свідомого
-    # рішення про мапу (станом на #364: 24 модулі, 11 з suite — додано LogSync).
+    # рішення про мапу (станом на #364: 24 модулі, 11 з suite — додано LogSync; #281: +SchedulerDiagnostics без suite — тести в кореневому TaskConfigPath/*).
     $suiteMapModuleSuites = @{
         'Archive'                = 'Archive'
         'BazaSync'               = 'BazaSync'
@@ -37840,7 +37925,7 @@ foreach ($case in $cases) {
         'Status'                 = 'Status'
     }
     $suiteMapModulesWithoutSuite = @('ArchiveHelpers', 'ArchiveRuntime', 'Compatibility', 'Console', 'Credentials',
-        'Discovery', 'ExitCodes', 'Health', 'HelperLogging', 'Logging', 'Maintenance', 'Notifications', 'System')
+        'Discovery', 'ExitCodes', 'Health', 'HelperLogging', 'Logging', 'Maintenance', 'Notifications', 'SchedulerDiagnostics', 'System')
     $suiteMapActualModules = [string[]]@(
         [IO.Directory]::GetDirectories((Join-Path $root 'modules')) |
             ForEach-Object { [IO.Path]::GetFileName($_) } |

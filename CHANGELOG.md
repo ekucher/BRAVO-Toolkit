@@ -5,11 +5,16 @@
 - **Feat: `BRAVO_TASKS_DIAGNOSE.ps1` показує, які завдання BRAVO досі передають `-ConfigPath` на legacy
   `BRAVO.config` (#281, доказ B5 для #154; лише читання).** Новий розділ
   `=== LEGACY -ConfigPath У ЗАВДАННЯХ BRAVO ===` обходить дерево Планувальника, читає XML завдань з
-  Exec-дією `BRAVO_*.ps1` і розбирає аргументи: `-File`, `-Command`, `-EncodedCommand`, шлях у лапках і
-  без, будь-яке скорочення, що прив'язується до `-ConfigPath` (за `param()` скрипта з Action). Ціль
-  класифікується: `LegacyPrimary` (існуючий файл, який loader приймає через `Test-BravoLegacyConfiguration`),
-  `Local` (`BRAVO.local.config`), `Missing`, `Unknown`; для `LegacyPrimary` рядок `[WARN]` містить дію
-  оператора. Нічого не змінює (ні завдань, ні файлів), не потребує UAC (працює з `-InspectOnly`), не змінює
+  Exec-дією `powershell.exe`/`pwsh.exe` і `BRAVO_*.ps1` та розбирає аргументи: `-File`, `-Command`,
+  `-EncodedCommand`, шлях у лапках і без, скорочення й alias-и та позиційне значення, що прив'язуються до
+  `-ConfigPath` (за `param()` скрипта з Action). Ціль класифікується: `LegacyPrimary` (існуючий файл, який
+  loader приймає через `Test-BravoLegacyConfiguration`), `Local` (`BRAVO.local.config`; `[WARN]`, бо loader
+  виконує його як legacy primary і завантаження ламається), `Missing`, `Unknown` (зокрема динамічний виклик,
+  `cmd.exe`-обгортка, профільні змінні середовища); для `LegacyPrimary` рядок `[WARN]` містить дію
+  оператора. `[PASS]` без `-ConfigPath` видається лише для повністю змодельованої дії (allowlist: `-File
+  <BRAVO_*.ps1>` або один літеральний виклик у `-Command`, усі токени прив'язано `param()`); решта, що згадує
+  `BRAVO_*.ps1`, — `Unknown`. Логіка винесена в новий модуль `modules/BRAVO.SchedulerDiagnostics`; entrypoint лише друкує
+  розділ. Нічого не змінює (ні завдань, ні файлів), не потребує UAC (працює з `-InspectOnly`), не змінює
   код виходу. Поведінку loader-а й підтримку `-ConfigPath` на legacy-файл не змінено: рішення #281 за
   власником. Self-test: `TaskConfigPath/*` на синтетичних XML-завданнях. Порядок використання як доказу —
   `OPERATIONS.md`, «Завдання, що досі передають `-ConfigPath` на legacy `BRAVO.config`».
