@@ -8998,6 +8998,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             "Send-BRAVONotificationChunks",
             "Test-BAZAPathBlockedByIncompatibleName",
             "Split-BAZAPendingFilesByCompatibility",
+            "Get-BAZAPendingFileCycleClassification",
             "Get-BAZASynchronizationOutcome",
             "Get-BRAVOVSSSnapshotSourcePath",
             "Get-BRAVOVSSVolumeRoot",
