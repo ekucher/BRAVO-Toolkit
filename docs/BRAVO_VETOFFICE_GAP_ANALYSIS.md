@@ -92,8 +92,10 @@ DEV-серверах не виконувались — це окремий кр�
   `PASS | Склад | Не встановлено на цьому сервері | BRAVOEXCH`.
 - Прямий виклик `Test-BRAVODiscoveryResult` з усіма увімкненими компонентами
   повертає помилку «Джерело 'BRAVOEXCH' увімкнено, але шлях не визначено».
-  Чи викликає його `BRAVO_SETUP.ps1:621` без фільтрації за scope, не
-  перевірено (SETUP не запускався, розділ 5).
+  [C] `BRAVO_SETUP.ps1:621-623` передає `-EnabledComponents
+  $discoveryScope.EffectiveEnabledComponents`, з якого `NotInstalled`
+  виключено (`BRAVO.Discovery.psm1:1895`), тому SETUP цієї помилки для
+  BRAVOEXCH видавати не повинен. Виконанням не підтверджено (розділ 5).
 
 ### G3. Відсутня служба exchangAPI (P3)
 
@@ -111,8 +113,9 @@ DEV-серверах не виконувались — це окремий кр�
 
 - Очікування (#486/#487): ServiceCycle коректний для залежної `Apache2.4`.
 - Факт [C]: залежності служб (`DependentServices`/`ServicesDependedOn`) у
-  runtime не використовуються. Пошук дає збіг лише у
-  `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1:192`. Harness [F] показує те саме:
+  runtime не використовуються: `git grep -i` за цими назвами не дає жодного
+  збігу в `.ps1`/`.psm1` комплекту (крім нового harness-а). Harness [F]
+  показує те саме:
   результат Discovery не містить поля залежностей
   (`DiscoveryExposesServiceDependencies = false`).
 - Чинний порядок зупинки: BRAVO Web → exchangAPI → BRAVO
@@ -164,14 +167,19 @@ DEV-серверах не виконувались — це окремий кр�
 
 ### G8. Legacy-архіви (P1 для #487)
 
-- Факт [F]: планувальник добового trace-архіву не чіпає legacy-імена.
-  Для кореня інсталяції backlog містить лише `TraceSRV_20260301_101500.out`
-  → `Trace_20260301.mdz`. Активний `TraceSRV.out` і
-  `ARCHIV\Trace\<дата>\TraceSRV_00000N.out` у backlog не потрапляють.
+- Факт [F]: для кореня інсталяції backlog добового trace-архіву містить
+  лише `TraceSRV_20260301_101500.out` → `Trace_20260301.mdz`. Активний
+  `TraceSRV.out` фільтр імен відкидає.
+- Факт [C]: `ARCHIV\Trace\<дата>\TraceSRV_00000N.out` у backlog не
+  потрапляють, бо перелік плоский, без рекурсії
+  (`BRAVO.Maintenance.Runtime.ps1:4713`), а файли лежать у підкаталогах-датах.
+  Порожній backlog для `ARCHIV\Trace` на фікстурі пояснюється саме цим, а не
+  фільтром імен.
 - Факт [C]: `Compress-OldData` пакує **будь-який** каталог `YYYY-MM-DD` у
   `<SystemLogRoot>\Trace`, старший за `ArchiveDays` (за `CreationTime`), у
   `Trace_YYYY-MM-DD.mdz` і видаляє каталог після успіху
-  (`BRAVO.Maintenance.Runtime.ps1:7738-7776`). `Invoke-BRAVOLegacySweep`
+  (`BRAVO.Maintenance.Runtime.ps1:7738-7800`, видалення — `7796`;
+  `$TRACE_DIR = <SystemLogRoot>\Trace` — `9102`, виклик — `12490`). `Invoke-BRAVOLegacySweep`
   свідомо лишає непорожні legacy-каталоги-дати цьому шляху
   (`BRAVO.Maintenance.Runtime.ps1:11900-11916`). Якщо legacy `ARCHIV\Trace`
   збігається з `<SystemLogRoot>\Trace`, legacy-каталоги буде повторно

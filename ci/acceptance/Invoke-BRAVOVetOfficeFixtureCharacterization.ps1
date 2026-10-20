@@ -73,6 +73,9 @@ $maintenanceRuntimePath = Join-Path $RuntimeRoot 'modules\BRAVO.Maintenance\BRAV
 $parseTokens = $null
 $parseErrors = $null
 $maintenanceAst = [Management.Automation.Language.Parser]::ParseFile($maintenanceRuntimePath, [ref]$parseTokens, [ref]$parseErrors)
+if (@($parseErrors).Count -gt 0) {
+    throw "Не вдалося розібрати $maintenanceRuntimePath (помилок: $(@($parseErrors).Count)): $($parseErrors[0].Message)"
+}
 $backlogFunctionAst = $maintenanceAst.Find({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and

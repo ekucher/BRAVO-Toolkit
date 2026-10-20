@@ -16,4 +16,8 @@ Trace-файли в CP1251 і заглушки `.mdz` генеруються п�
 Їх навмисно немає в репозиторії: `.gitattributes` нормалізує текстові файли
 (`* text=auto eol=crlf`).
 
+`characterization.json` містить абсолютні локальні шляхи (`RuntimeRoot`,
+`RunRoot`, `MaterializedRoot`), які можуть розкривати профіль чи обліковий
+запис. Перед вставленням у issue або PR ці шляхи треба знеособити.
+
 Висновки та прогалини описано в `docs/BRAVO_VETOFFICE_GAP_ANALYSIS.md`.
