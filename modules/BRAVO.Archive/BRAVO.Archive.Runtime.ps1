@@ -5114,14 +5114,16 @@ function Add-BAZASnapshotConsistencyEvidence {
 }
 
 # Об'єкт поза знімком "новий" лише тоді, коли його CreationTime ставить
-# годинник цього тому: шлях від кореня до об'єкта (включно) не проходить
-# через reparse point. Junction/symlink, створений під час неатомарного
-# обходу знімка в уже обійденому каталозі, у ReparsePointDirectoryCount
-# знімка не потрапляє — тому перевіряється живий ланцюг кожного кандидата.
+# годинник цього тому: живий шлях від кореня тому до об'єкта (включно з
+# коренем синхронізації та його предками) не проходить через reparse point.
+# Junction/symlink, створений під час неатомарного обходу знімка в уже
+# обійденому каталозі, у ReparsePointDirectoryCount знімка не потрапляє, а
+# корінь чи його предок може бути замінений після
+# Test-BAZACreationClockTrusted — тому ланцюг перевіряється для кожного
+# кандидата.
 function Test-BAZAPathHasReparsePoint {
     param(
-        [string]$FullPath,
-        [string]$NormalizedRoot
+        [string]$FullPath
     )
 
     try {
@@ -5130,8 +5132,7 @@ function Test-BAZAPathHasReparsePoint {
             return $true
         }
         $directory = if ($item -is [IO.DirectoryInfo]) { $item.Parent } else { $item.Directory }
-        while ($null -ne $directory -and
-            $directory.FullName.TrimEnd('\', '/').Length -gt $NormalizedRoot.Length) {
+        while ($null -ne $directory) {
             if (([int]$directory.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
                 return $true
             }
@@ -5295,7 +5296,7 @@ function Get-BAZAPendingFileCycleClassification {
                 $null -ne $boundaryTicks -and
                 [IO.Directory]::Exists($fullPath) -and
                 -not $LocalSnapshot.Directories.Contains($relativePath) -and
-                -not (Test-BAZAPathHasReparsePoint -FullPath $fullPath -NormalizedRoot $normalizedRoot) -and
+                -not (Test-BAZAPathHasReparsePoint -FullPath $fullPath) -and
                 [IO.Directory]::GetCreationTimeUtc($fullPath).Ticks -gt $boundaryTicks) {
                 $newAfterCutoff.Add($pendingFile)
             } else {
@@ -5320,7 +5321,7 @@ function Get-BAZAPendingFileCycleClassification {
         if ($action -eq 'UploadNew' -and
             $null -ne $boundaryTicks -and
             [IO.File]::Exists($fullPath) -and
-            -not (Test-BAZAPathHasReparsePoint -FullPath $fullPath -NormalizedRoot $normalizedRoot) -and
+            -not (Test-BAZAPathHasReparsePoint -FullPath $fullPath) -and
             [IO.File]::GetCreationTimeUtc($fullPath).Ticks -gt $boundaryTicks) {
             $newAfterCutoff.Add($pendingFile)
         } else {
@@ -5500,9 +5501,32 @@ function Get-BAZASynchronizationOutcome {
         $null
     }
     # Об'єкти, що з'явилися під час циклу, не входили до аудиту ДО і не
-    # зменшують кількість переданих об'єктів знімка.
+    # зменшують кількість переданих об'єктів знімка. Об'єкт аудиту ДО, що
+    # зник/змінився локально без підтвердженої версії у хмарі, теж зникає з
+    # пост-аудиту, але переданим не є — його віднімає порушення знімка.
     $completedCount = if ($null -ne $beforeSplit -and $null -ne $afterSplit) {
-        [math]::Max(0, @($beforeSplit.Retryable).Count - (@($afterSplit.Retryable).Count - [int]$newAfterCutoffCount))
+        $beforePendingPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($beforePending in @($beforeSplit.Retryable)) {
+            $beforePathProperty = $beforePending.PSObject.Properties['Path']
+            if ($null -ne $beforePathProperty -and
+                -not [string]::IsNullOrWhiteSpace([string]$beforePathProperty.Value) -and
+                [IO.Path]::IsPathRooted([string]$beforePathProperty.Value)) {
+                try {
+                    [void]$beforePendingPaths.Add([IO.Path]::GetFullPath([string]$beforePathProperty.Value).TrimEnd('\', '/'))
+                } catch {
+                    continue
+                }
+            }
+        }
+        $untransferredDriftCount = if ($null -ne $cycleClassification) {
+            @(@($cycleClassification.ChangedDuringSync) | Where-Object {
+                @('LocalVanished', 'LocalTypeReplaced', 'LocalModified') -contains [string]$_.Action -and
+                $beforePendingPaths.Contains(([string]$_.Path).TrimEnd('\', '/'))
+            }).Count
+        } else {
+            0
+        }
+        [math]::Max(0, @($beforeSplit.Retryable).Count - (@($afterSplit.Retryable).Count - [int]$newAfterCutoffCount) - $untransferredDriftCount)
     } else {
         $null
     }
@@ -6420,7 +6444,14 @@ exit
             } else {
                 "WARNING"
             }
-            Write-BRAVOLog -Component 'SFTP' -Message "Результат ${ComponentName}: передано або оновлено сумісних об'єктiв: $($syncOutcome.CompletedCount); залишилося несинхронiзованих: $($syncOutcome.RemainingCount)" -Level $resultLevel
+            # Об'єкт знімка, що зник/змінився локально без підтвердженої
+            # версії у хмарі, не є ні переданим, ні залишком пост-аудиту.
+            $driftResultText = if ([int]$syncOutcome.SnapshotDriftViolationCount -gt 0) {
+                "; зникли або змінилися локально без підтвердженої версії у хмарі: $($syncOutcome.SnapshotDriftViolationCount)"
+            } else {
+                ""
+            }
+            Write-BRAVOLog -Component 'SFTP' -Message "Результат ${ComponentName}: передано або оновлено сумісних об'єктiв: $($syncOutcome.CompletedCount); залишилося несинхронiзованих: $($syncOutcome.RemainingCount)$driftResultText" -Level $resultLevel
         }
 
         if ($syncOutcome.IsComplete) {

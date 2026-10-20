@@ -2776,6 +2776,54 @@ try {
         @(& $late501Errors $rf23 | Where-Object { $_.Message -like '*більше за ліміт перевірки 2*' }).Count -eq 1
     ) -Name 'Archive/501/F23VanishedOverProbeLimitIsError' `
       -Failure "понад ліміт stat зниклі об'єкти лишаються помилкою; label=$($rf23.Label) changed=$($rf23.App.ChangedDuringSyncCount)"
+
+    # F24 (Codex, PR #503). Корінь синхронізації чи його предок замінено на
+    # junction після Test-BAZACreationClockTrusted: ланцюг кандидата
+    # перевіряється до кореня тому включно, а не лише нижче кореня.
+    $f24Base = Join-Path $late501Root 'F24'
+    $f24Real = Join-Path $f24Base 'real-volume'
+    [void][IO.Directory]::CreateDirectory((Join-Path $f24Real 'sub'))
+    [IO.File]::WriteAllBytes((Join-Path $f24Real 'root-file.pdf'), [byte[]](1))
+    [IO.File]::WriteAllBytes((Join-Path $f24Real 'sub\nested-file.pdf'), [byte[]](1))
+    $f24RootLink = Join-Path $f24Base 'root-link'
+    $f24AncestorLink = Join-Path $f24Base 'ancestor-link'
+    try {
+        foreach ($f24Link in @($f24RootLink, $f24AncestorLink)) {
+            $f24MklinkOutput = & $env:ComSpec /c mklink /J "$f24Link" "$f24Real" 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "mklink /J не вдався: $f24MklinkOutput" }
+        }
+        $f24 = & $late501Module {
+            param($RootLink, $AncestorLink, $Real)
+            [pscustomobject]@{
+                # Корінь = сам junction, кандидат безпосередньо в ньому.
+                RootJunction = Test-BAZAPathHasReparsePoint -FullPath (Join-Path $RootLink 'root-file.pdf')
+                # Корінь = ancestor-link\sub, junction — предок кореня.
+                AncestorJunction = Test-BAZAPathHasReparsePoint -FullPath (Join-Path $AncestorLink 'sub\nested-file.pdf')
+                # Контроль: той самий файл без reparse point у ланцюгу.
+                Plain = Test-BAZAPathHasReparsePoint -FullPath (Join-Path $Real 'sub\nested-file.pdf')
+            }
+        } $f24RootLink $f24AncestorLink $f24Real
+        Test-BRAVOCondition -Condition (
+            $f24.RootJunction -eq $true -and $f24.AncestorJunction -eq $true -and $f24.Plain -eq $false
+        ) -Name 'Archive/501/F24RootOrAncestorJunctionIsNotTrusted' `
+          -Failure "junction у корені синхронізації чи його предку має знімати довіру до CreationTime; root=$($f24.RootJunction) ancestor=$($f24.AncestorJunction) plain=$($f24.Plain)"
+    } finally {
+        foreach ($f24Link in @($f24RootLink, $f24AncestorLink)) {
+            if ([IO.Directory]::Exists($f24Link)) { [IO.Directory]::Delete($f24Link) }
+        }
+    }
+
+    # F25 (Codex, PR #503). Файл аудиту ДО, зниклий під час синхронізації без
+    # версії у хмарі (F05), не рахується переданим: передано 1 з 2, і рядок
+    # результату називає порушення знімка.
+    $f25ResultLine = @($rf05.Log | Where-Object { $_.Message -like 'Результат BAZA_APP:*' })
+    Test-BRAVOCondition -Condition (
+        $rf05.App.BeforeCount -eq 2 -and $rf05.App.CompletedCount -eq 1 -and
+        $rf05.App.SnapshotDriftViolationCount -eq 1 -and
+        $f25ResultLine.Count -eq 1 -and
+        $f25ResultLine[0].Message -like "*передано або оновлено сумісних об'єктiв: 1;*без підтвердженої версії у хмарі: 1"
+    ) -Name 'Archive/501/F25VanishedPendingFileIsNotCountedAsTransferred' `
+      -Failure "зниклий файл аудиту ДО не можна рахувати переданим; before=$($rf05.App.BeforeCount) completed=$($rf05.App.CompletedCount) drift=$($rf05.App.SnapshotDriftViolationCount) line=$(@($f25ResultLine | ForEach-Object { $_.Message }) -join ' | ')"
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
     # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.
