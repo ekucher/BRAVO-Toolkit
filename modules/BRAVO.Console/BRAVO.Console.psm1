@@ -639,7 +639,7 @@ function Write-BRAVOSummary {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('УСПІШНО', 'ЧАСТКОВО', 'ПОМИЛКА')]
+        [ValidateSet('УСПІШНО', 'ЧАСТКОВО', 'ПОПЕРЕДЖЕННЯ', 'ПОМИЛКА')]
         [string]$Result,
 
         [timespan]$Duration,
@@ -661,6 +661,7 @@ function Write-BRAVOSummary {
     $resultColor = switch ($Result) {
         'УСПІШНО'  { 'Green' }
         'ЧАСТКОВО' { 'Yellow' }
+        'ПОПЕРЕДЖЕННЯ' { 'Yellow' }
         default    { 'Red' }
     }
 
