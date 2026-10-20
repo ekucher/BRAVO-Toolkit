@@ -2,6 +2,10 @@
 
 Останню перевірку виконано: 2026-10-07 (після Autonomous Correctness Green Wave, #412 і #391) (Git + GitHub REST API, лише читання).
 Hotfix 5.2.5 (рядок «Теги» і крок 1 `NEXT ACTION`) перевірено повторно 2026-10-15; решту файлу — ні.
+Розділ «Issue #501», рядки live-стану `origin/developer`, `origin/master`,
+«Відкриті PR», «Відкриті issue» і розділ «Відкриті PR» перевірено повторно
+2026-10-21 (Git + GitHub REST API, лише читання). Решту файлу — ні: 51
+first-parent коміт `2e3a5da..dd4984e` тут не переглянуто, крім PR #502.
 
 Кожне змінне твердження нижче має дату й метод перевірки. Це знімок, а не
 гарантія: **перечитати перед дією**. Порядок джерел істини — розділ
@@ -38,14 +42,14 @@ git rev-parse HEAD origin/developer origin/master
 
 | Об'єкт | Значення | Метод |
 | --- | --- | --- |
-| `origin/developer` | `2e3a5da` | `git rev-parse origin/developer` |
-| `origin/master` | `f8fa5aa` (stable `5.2.4`), не змінювався | `git rev-parse origin/master` |
+| `origin/developer` | `dd4984e` (Merge PR #502), перевірено 2026-10-21; baseline цього файлу — `2e3a5da` | `git ls-remote origin refs/heads/developer` |
+| `origin/master` | `f8fa5aa` (stable `5.2.4`), не змінювався (перевірено 2026-10-21) | `git ls-remote origin refs/heads/master` |
 | `developer` `VERSION.json` | `packageVersion` `5.3.0-dev.3`, `releaseChannel: development`, `sourceCommit` `d77f3b4` (далеко позаду `2e3a5da`) | файл у дереві |
 | CI push-прогін `developer` `2e3a5da` | success (run 37596365619, усі jobs ` (push)`) | `GET /commits/2e3a5da/check-runs` |
 | Теги | `v5.3.0-rc.1`; `v5.2.5-rc.1`…`rc.4` (hotfix); `v5.2.5-rc.5` і `rc.6` не опубліковано (перевірено 2026-10-15) | `git ls-remote --tags` |
 | `origin/hotfix/5.2.5` | `c09a5f6` — на один коміт попереду штампу `5.2.5-rc.6` (перевірено 2026-10-15) | `git rev-parse origin/hotfix/5.2.5` |
-| Відкриті PR | лише цей файл | `GET /pulls?state=open` |
-| Відкриті issue | 17 (без PR) | `GET /issues?state=open` |
+| Відкриті PR | 8: #493, #494, #495, #496, #497, #499, #500, #503 (перевірено 2026-10-21) | `gh pr list --state open` |
+| Відкриті issue | 21 (перевірено 2026-10-21) | `gh issue list --state open` |
 
 ## Branch protection — бажане проти перевіреного
 
@@ -158,9 +162,53 @@ self-test (#367, #368, #370, #371), validation docs (#362), retention
 (#363), B-4/D-1/J-1 (#372–#374), хвиля інтеграції (#376, #377, #379 —
 #314 хвиля 1).
 
-## Відкриті PR (перевірено `GET /pulls?state=open`, 2026-10-07)
+## Issue #501 — legacy BAZA sync (перевірено 2026-10-21)
 
-Відкритий лише PR із цим файлом.
+Проблема: хибна `ПОМИЛКА` legacy-синхронізації BAZA (`Sync-FolderToSFTP`),
+коли LIMS створює файли під час прогону WinSCP. Issue **OPEN** — лишається
+відкритим до production acceptance.
+
+* **PR #502 — MERGED** 2026-10-20 → `developer` `dd4984e`. Класифікація
+  залишку пост-аудиту за знімком циклу: `RealMissing` / `ChangedDuringSync`
+  / `NewAfterCutoff`. Нові файли дають `ПОПЕРЕДЖЕННЯ`/10 (рішення власника —
+  лишити це в legacy). Backport у 5.2.x відкладено.
+* **PR #503 — OPEN, не злито** (`fix/501-snapshot-consistency-followup`, base
+  `developer` `dd4984e`, head `ed64015`, `mergeStateStatus: CLEAN`). Це
+  follow-up до P1/P2 Codex із #502 і ще чотирьох зауважень бота в #503:
+  * межа старту передачі `SyncStartUtc` і довіра до `CreationTimeUtc` лише на
+    Fixed NTFS/ReFS без reparse point до кореня тому;
+  * звіряння знімка з деревом після пост-аудиту (зниклі, змінені й
+    перейменовані об'єкти) з read-only stat у хмарі (ліміт 1000);
+  * збій знімка зі зниклим файлом аудиту ДО дає `ПОМИЛКА`;
+  * `CompletedCount` рахується за шляхами.
+
+  Валідація head `ed64015`:
+  * CI 8/8 success (`GET /commits/ed64015/check-runs`);
+  * повний `BRAVO_SELF_TEST.ps1` на `fb7d226` (останній runtime-код; `ed64015`
+    змінює лише `.md`) — 3858 PASS / 0 FAIL;
+  * блок `Archive/501/*` — 48 перевірок;
+  * рев'ю: Codex QA/Security на кожній дельті, Codex Architecture на дизайні,
+    Claude reviewer — без відкритих P0–P2;
+  * автоматичне рев'ю бота Codex на `ed64015` — `has_unresolved_findings:
+    false`; на всі 6 inline-тредів бота (4 у #503) є відповіді, як resolved у
+    GitHub не позначено.
+
+  Відкриті P3 описано в тілі PR #503:
+  * текст ERROR, коли недоступний аудит ДО;
+  * два тести, яких бракує;
+  * дрібне завищення лічильника переданих.
+* **Не виконано:** real-server acceptance. Потрібні NTFS, справжній
+  WinSCP/SFTP і LIMS, що змінює дерево під час синхронізації: формат шляхів
+  WinSCP, точність mtime, частота ERROR від тимчасових і «гарячих» файлів.
+* Докази поза репозиторієм:
+  `%USERPROFILE%\BRAVO-Agent\evidence\issue-501-followup\` агентського
+  облікового запису dev/test VM.
+
+## Відкриті PR (перевірено `gh pr list --state open`, 2026-10-21)
+
+#493, #494, #495, #496, #497, #499, #500, #503. Стан CI і рев'ю перевірено
+лише для #503 (розділ «Issue #501»); решту з цієї сесії не перевіряли. PR #493
+не змінювати (рішення власника).
 
 ## Issue (перевірено `GET /issues?state=open`, 2026-10-07)
 
@@ -232,6 +280,16 @@ BLOCKED.
 ## NEXT ACTION
 
 ```text
+0. Issue #501 (стан 2026-10-21). PR #503 на head ed64015 — CI 8/8,
+   бот Codex без незакритих зауважень. Merge — лише за явною
+   авторизацією власника. Перед merge перечитати:
+     gh pr view 503 --json headRefOid,mergeStateStatus   # очікується ed64015, CLEAN
+     gh api repos/ekucher/BRAVO-Toolkit/pulls/503/comments   # нові inline-зауваження бота
+   Новий head або нове зауваження бота P0–P2 → виправити в гілці
+   fix/501-snapshot-consistency-followup, не мержити.
+   Після merge: real-server acceptance #501 (NTFS + WinSCP/SFTP + LIMS
+   змінює дерево); #501 не закривати до її результату. Backport у 5.2.x —
+   окреме рішення власника.
 1. Hotfix 5.2.5 (стан 2026-10-15). Кандидат уже не rc.5, а rc.6:
    rc.5 (stamp 9790a50) так і не опубліковано, далі в hotfix/5.2.5
    злито PR #440 (бекпорт #439, поріг малого файлу після реставрації)
