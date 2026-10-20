@@ -1,0 +1,15 @@
+; Знеособлений bravo.ini для characterization-фікстури VetOffice (#486).
+; Структура секцій узята з формату, який покриває ConvertFrom-BRAVOIniFile
+; ([system]/[archiv]/[model]/[net]/[Debug]); значення вигадані.
+; Ключа BEXCH навмисно немає: на VetOffice компонента BRAVOEXCH не очікується.
+[system]
+NAME=Example Vet Lab
+[archiv]
+;PATH={{VETOFFICE_ROOT}}\ARCHIV
+[model]
+MODEL={{VETOFFICE_ROOT}}\Model\VetOffice.md
+BLOG={{VETOFFICE_ROOT}}\BLOG\
+[net]
+PORT=8100
+[Debug]
+FILE=TraceSRV.out

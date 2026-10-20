@@ -1,0 +1,8 @@
+# Знеособлений httpd.conf для characterization-фікстури VetOffice (#486).
+# Лише директиви, які читає Get-BRAVOApacheDocumentRoot; значення вигадані.
+ServerRoot "{{VETOFFICE_ROOT_FWD}}/apache"
+Listen 80
+ServerName vet-app-01.example.test
+DocumentRoot "{{VETOFFICE_ROOT_FWD}}/www"
+ErrorLog "logs/error.log"
+CustomLog "logs/access.log" common
