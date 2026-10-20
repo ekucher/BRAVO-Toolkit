@@ -2285,10 +2285,44 @@ try {
     ) -Name 'Archive/501/S17UnmatchablePathsFailClosed' `
       -Failure "кінцева '.'/' ', неіснуючий об'єкт і '..' мають давати RealMissing; real=$(@($c17Result.RealMissing).Count) new=$(@($c17Result.NewAfterCutoff).Count)"
     foreach ($odd in @('trail.', 'space ')) { [IO.File]::Delete('\\?\' + (Join-Path $c17Dir $odd)) }
+    # 18. Шлях змінив тип під час циклу (каталог знімка замінено файлом і
+    # навпаки) — заміна, а не новий об'єкт: ChangedDuringSync (ERROR).
+    # Контроль: справжні нові файл і каталог лишаються NewAfterCutoff.
+    $c18 = & $late501NewCase 'S18' -SyncedCount 0 -PendingCount 0
+    $c18Dir = Join-Path $c18.App 'KZ\2026'
+    [void][IO.Directory]::CreateDirectory((Join-Path $c18Dir 'swap-dir'))
+    [IO.File]::WriteAllBytes((Join-Path $c18Dir 'swap-file.pdf'), [byte[]](1))
+    $c18Snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $c18.App -IncludeHiddenSystem -IncludeDirectories
+    [IO.Directory]::Delete((Join-Path $c18Dir 'swap-dir'))
+    [IO.File]::WriteAllBytes((Join-Path $c18Dir 'swap-dir'), [byte[]](2))
+    [IO.File]::Delete((Join-Path $c18Dir 'swap-file.pdf'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $c18Dir 'swap-file.pdf'))
+    [IO.File]::WriteAllBytes((Join-Path $c18Dir 'brand-new.pdf'), [byte[]](3))
+    [void][IO.Directory]::CreateDirectory((Join-Path $c18Dir 'brand-new-dir'))
+    $c18Pending = @(
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c18Dir 'swap-dir'); IsDirectory = $false; SizeBytes = 1 },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c18Dir 'swap-file.pdf'); IsDirectory = $true; SizeBytes = $null },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c18Dir 'brand-new.pdf'); IsDirectory = $false; SizeBytes = 1 },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c18Dir 'brand-new-dir'); IsDirectory = $true; SizeBytes = $null }
+    )
+    $c18Result = & $late501Module {
+        param($Pending, $Snapshot, $Root)
+        Get-BAZAPendingFileCycleClassification -PendingFiles $Pending -LocalSnapshot $Snapshot -LocalRoot $Root
+    } $c18Pending $c18Snapshot $c18.App
+    $c18Changed = @(@($c18Result.ChangedDuringSync) | ForEach-Object { Split-Path -Leaf ([string]$_.Path) } | Sort-Object)
+    $c18New = @(@($c18Result.NewAfterCutoff) | ForEach-Object { Split-Path -Leaf ([string]$_.Path) } | Sort-Object)
+    Test-BRAVOCondition -Condition (
+        $c18Changed.Count -eq 2 -and $c18Changed -contains 'swap-dir' -and $c18Changed -contains 'swap-file.pdf' -and
+        $c18New.Count -eq 2 -and $c18New -contains 'brand-new-dir' -and $c18New -contains 'brand-new.pdf' -and
+        @($c18Result.RealMissing).Count -eq 0
+    ) -Name 'Archive/501/S18TypeReplacementIsChangedNotNew' `
+      -Failure "заміна файл<->каталог під час циклу має бути ChangedDuringSync, справжні нові — NewAfterCutoff; changed=$($c18Changed -join ',') new=$($c18New -join ',')"
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
     # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.
     $late501HeaderComponent = & $late501Module { Resolve-BRAVOLogComponentFromHeader -Header '=== ЗАВЕРШЕННЯ РУЧНОЇ СИНХРОНIЗАЦIЇ BAZA_APP / BAZA_WWW ===' }
+    # ЕМУЛЯЦІЯ зовнішнього контракту: шаблон Zabbix поза репозиторієм; мапінг нижче відтворює
+    # описаний в issue #501 regex/мапінг, а production-код перевіряють мітки, компонент рядка і severity.
     $late501Zabbix = {
         param([string]$Line)
         $m = [regex]::Match($Line, '\[BAZA_APP\] Результат: (\S+)')

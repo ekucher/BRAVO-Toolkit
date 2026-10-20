@@ -4908,9 +4908,9 @@ function Split-BAZAPendingFilesByCompatibility {
 # (Get-BRAVOBazaLocalSnapshot), а не за LastWriteTime: новий файл може мати
 # давній час, а старий — щойно змінений.
 #   RealMissing       — об'єкт був у знімку, не змінився, але не переданий;
-#   ChangedDuringSync — об'єкт був у знімку, але його розмір/час змінилися
-#                       або його вже немає (окремий mutation-клас, не
-#                       маскується попередженням);
+#   ChangedDuringSync — об'єкт був у знімку, але його розмір/час змінилися,
+#                       його вже немає або шлях змінив тип (файл <-> каталог)
+#                       (окремий mutation-клас, не маскується попередженням);
 #   NewAfterCutoff    — UploadNew-об'єкт, якого не було у знімку: з'явився
 #                       під час циклу й буде переданий наступним запуском.
 # Усе, що не зіставляється зі знімком однозначно (знімок недоступний,
@@ -4979,6 +4979,14 @@ function Get-BAZAPendingFileCycleClassification {
         }
         if ([string]::IsNullOrEmpty($relativePath)) {
             $realMissing.Add($pendingFile)
+            continue
+        }
+
+        # Шлях, що був у знімку об'єктом іншого типу (каталог замінено файлом
+        # або навпаки), — заміна під час циклу, а не новий об'єкт.
+        if (($isDirectory -and $LocalSnapshot.Entries.ContainsKey($relativePath)) -or
+            (-not $isDirectory -and $LocalSnapshot.Directories.Contains($relativePath))) {
+            $changedDuringSync.Add($pendingFile)
             continue
         }
 
@@ -7644,7 +7652,7 @@ function Main {
         $manualSyncMetrics.Add('Попереджень', [string]$manualSyncStatistics.Warnings)
         $manualSyncMetrics.Add('Помилок', [string]$manualSyncStatistics.Errors)
         Write-BRAVOSummary `
-            -Result $(if (-not $manualSyncSuccess) { 'ПОМИЛКА' } elseif ($manualSyncOutcomeLabel -eq 'ПОПЕРЕДЖЕННЯ') { 'ПОПЕРЕДЖЕННЯ' } else { 'УСПІШНО' }) `
+            -Result $(if (-not $manualSyncSuccess) { 'ПОМИЛКА' } elseif ($manualSyncResult.PSObject.Properties['NewAfterCutoffCount'] -and [int]$manualSyncResult.NewAfterCutoffCount -gt 0) { 'ПОПЕРЕДЖЕННЯ' } else { 'УСПІШНО' }) `
             -Duration $manualSyncDuration `
             -Metrics $manualSyncMetrics `
             -LogFile $script:logFile
