@@ -2002,6 +2002,11 @@ function Get-BRAVOBazaLocalSnapshot {
     param([string]$LocalDirectory, [switch]$IncludeHiddenSystem, [switch]$IncludeDirectories)
     $snapshot = BRAVO.BazaSync\Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -IncludeHiddenSystem:$IncludeHiddenSystem -IncludeDirectories:$IncludeDirectories
     Invoke-Late501Ops -Stage 'Snapshot'
+    # Збій обходу (напр., об'єкт зник під час читання метаданих): та сама
+    # форма результату, що й у catch production-функції.
+    if ($script:late501SnapshotFails) {
+        return [pscustomobject]@{ SnapshotUtc = $snapshot.SnapshotUtc; Entries = @{}; Directories = $snapshot.Directories; ReparsePointDirectoryCount = $snapshot.ReparsePointDirectoryCount; Success = $false; Error = 'симульований збій обходу знімка' }
+    }
     return $snapshot
 }
 # Дії "LIMS" на заданій стадії циклу поточного компонента (дані, без closure).
@@ -2058,11 +2063,13 @@ $late501Run = {
         [switch]$AfterAuditFails,
         [switch]$WithWWW,
         [object[]]$Ops = @(),
-        [int]$ProbeCap = 1000
+        [int]$ProbeCap = 1000,
+        [switch]$SnapshotFails
     )
     & $late501Module {
-        param($CaseRoot, $Remote, $DuringSyncWrites, $FailPaths, $ExitCode, $AfterAuditFails, $WithWWW, $Ops, $ProbeCap)
+        param($CaseRoot, $Remote, $DuringSyncWrites, $FailPaths, $ExitCode, $AfterAuditFails, $WithWWW, $Ops, $ProbeCap, $SnapshotFails)
         $script:late501ProbeCap = $ProbeCap
+        $script:late501SnapshotFails = [bool]$SnapshotFails
         $script:late501Log = New-Object System.Collections.ArrayList
         $script:late501CaseRoot = $CaseRoot
         $script:late501Remote = $Remote
@@ -2120,7 +2127,7 @@ $late501Run = {
             Log = @($script:late501Log.ToArray())
             WinSCPRuns = $script:late501WinSCPRuns
         }
-    } $CaseRoot $Remote @($DuringSyncWrites) $FailPaths $ExitCode ([bool]$AfterAuditFails) ([bool]$WithWWW) @($Ops) $ProbeCap
+    } $CaseRoot $Remote @($DuringSyncWrites) $FailPaths $ExitCode ([bool]$AfterAuditFails) ([bool]$WithWWW) @($Ops) $ProbeCap ([bool]$SnapshotFails)
 }
 
 $late501NewFile = {
@@ -2824,6 +2831,41 @@ try {
         $f25ResultLine[0].Message -like "*передано або оновлено сумісних об'єктiв: 1;*без підтвердженої версії у хмарі: 1"
     ) -Name 'Archive/501/F25VanishedPendingFileIsNotCountedAsTransferred' `
       -Failure "зниклий файл аудиту ДО не можна рахувати переданим; before=$($rf05.App.BeforeCount) completed=$($rf05.App.CompletedCount) drift=$($rf05.App.SnapshotDriftViolationCount) line=$(@($f25ResultLine | ForEach-Object { $_.Message }) -join ' | ')"
+
+    # F26 (Codex, PR #503). Два файли чекали передачі: pending_1 передано, а
+    # pending_2 перейменовано на renamed_2 після сканування WinSCP. Нове ім'я
+    # є в пост-аудиті, а pending_2 — у порушеннях знімка, але це один об'єкт:
+    # передано рівно 1, а не 0.
+    $f26 = & $late501NewCase 'F26'
+    $rf26 = & $late501Run -CaseRoot $f26.Root -Remote $f26.Remote -FailPaths @('KZ\2026\pending_2.pdf') -Ops @(& $late501Op 'Sync' 'Move' (Join-Path $f26.App 'KZ\2026\pending_2.pdf') -Target (Join-Path $f26.App 'KZ\2026\renamed_2.pdf'))
+    Test-BRAVOCondition -Condition (
+        $rf26.Label -eq 'ПОМИЛКА' -and $rf26.App.BeforeCount -eq 2 -and $rf26.App.CompletedCount -eq 1 -and
+        $rf26.App.RealMissingCount -eq 1 -and $rf26.App.SnapshotDriftViolationCount -eq 1
+    ) -Name 'Archive/501/F26RenamedPendingFileCountedOnce' `
+      -Failure "перейменований файл аудиту ДО не може двічі зменшувати кількість переданих; label=$($rf26.Label) before=$($rf26.App.BeforeCount) completed=$($rf26.App.CompletedCount) real=$($rf26.App.RealMissingCount) drift=$($rf26.App.SnapshotDriftViolationCount)"
+
+    # F27 (Codex, PR #503, P1). Знімок циклу не вдався, бо pending_2 зник під
+    # час обходу. WinSCP і пост-аудит його вже не бачать (код 0, залишку
+    # немає), але аудит ДО довів, що файл чекав передачі -> ПОМИЛКА.
+    $f27 = & $late501NewCase 'F27'
+    $rf27 = & $late501Run -CaseRoot $f27.Root -Remote $f27.Remote -SnapshotFails -Ops @(& $late501Op 'Snapshot' 'Delete' (Join-Path $f27.App 'KZ\2026\pending_2.pdf'))
+    Test-BRAVOCondition -Condition (
+        -not $rf27.Manual.Success -and $rf27.Label -eq 'ПОМИЛКА' -and $rf27.ExitCode -eq 50 -and
+        -not $rf27.App.IsComplete -and -not $rf27.App.SnapshotConsistencyVerified -and
+        $rf27.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf27.App.CompletedCount -eq 1 -and
+        @(& $late501Errors $rf27 | Where-Object { $_.Message -like '*BAZA_APP не підтверджено: знімок циклу не створено*pending_2.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F27SnapshotUnavailableVanishedPendingIsError' `
+      -Failure "без знімка зниклий файл аудиту ДО не може дати УСПІШНО; label=$($rf27.Label) exit=$($rf27.ExitCode) verified=$($rf27.App.SnapshotConsistencyVerified) vanished=$($rf27.App.SnapshotUnavailableVanishedCount) completed=$($rf27.App.CompletedCount)"
+
+    # F27b. Контроль: знімок не вдався, але все з аудиту ДО передано й лежить
+    # локально -> УСПІШНО, як і до #501 (збій знімка сам не є аварією).
+    $f27b = & $late501NewCase 'F27b'
+    $rf27b = & $late501Run -CaseRoot $f27b.Root -Remote $f27b.Remote -SnapshotFails
+    Test-BRAVOCondition -Condition (
+        $rf27b.Manual.Success -and $rf27b.Label -eq 'УСПІШНО' -and $rf27b.ExitCode -eq 0 -and
+        $rf27b.App.IsComplete -and $rf27b.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf27b.App.CompletedCount -eq 2
+    ) -Name 'Archive/501/F27bSnapshotUnavailableNothingVanishedIsSuccess' `
+      -Failure "збій знімка без зниклих файлів аудиту ДО лишається УСПІШНО; label=$($rf27b.Label) exit=$($rf27b.ExitCode) completed=$($rf27b.App.CompletedCount)"
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
     # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.

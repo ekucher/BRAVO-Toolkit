@@ -5467,12 +5467,12 @@ function Get-BAZASynchronizationOutcome {
     $snapshotConsistencyVerified = $null -eq $cycleClassification -or
         -not [bool]$cycleClassification.SnapshotAvailable -or
         [bool]$cycleClassification.SnapshotConsistencyVerified
-    $snapshotDriftViolationCount = if ($null -ne $cycleClassification) {
-        @(@($cycleClassification.ChangedDuringSync) | Where-Object { @('LocalVanished', 'LocalTypeReplaced', 'LocalModified') -contains [string]$_.Action }).Count
+    $snapshotDriftViolations = if ($null -ne $cycleClassification) {
+        @(@($cycleClassification.ChangedDuringSync) | Where-Object { @('LocalVanished', 'LocalTypeReplaced', 'LocalModified') -contains [string]$_.Action })
     } else {
-        0
+        @()
     }
-    $snapshotConsistent = $snapshotConsistencyVerified -and $snapshotDriftViolationCount -eq 0
+    $snapshotDriftViolationCount = @($snapshotDriftViolations).Count
     $beforeSplit = if ($null -ne $ComparisonBefore -and $ComparisonBefore.Success) {
         Split-BAZAPendingFilesByCompatibility `
             -PendingFiles @($ComparisonBefore.PendingFiles) `
@@ -5480,6 +5480,65 @@ function Get-BAZASynchronizationOutcome {
     } else {
         $null
     }
+
+    # Повний шлях запису залишку для зіставлення аудиту ДО з пост-аудитом і
+    # порушеннями знімка; $null — запис не зіставляється.
+    $getComparablePendingPath = {
+        param([object]$Entry)
+        $entryPathProperty = if ($null -ne $Entry) { $Entry.PSObject.Properties['Path'] } else { $null }
+        $entryPath = if ($null -ne $entryPathProperty) { [string]$entryPathProperty.Value } else { '' }
+        if ([string]::IsNullOrWhiteSpace($entryPath) -or -not [IO.Path]::IsPathRooted($entryPath)) {
+            return $null
+        }
+        try {
+            return [IO.Path]::GetFullPath($entryPath).TrimEnd('\', '/')
+        } catch {
+            return $null
+        }
+    }
+    $afterPendingPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $afterSplit) {
+        foreach ($afterPending in @($afterSplit.Retryable)) {
+            $afterPendingPath = & $getComparablePendingPath $afterPending
+            if ($null -ne $afterPendingPath) { [void]$afterPendingPaths.Add($afterPendingPath) }
+        }
+    }
+    $driftViolationPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($driftViolation in @($snapshotDriftViolations)) {
+        $driftViolationPath = & $getComparablePendingPath $driftViolation
+        if ($null -ne $driftViolationPath) { [void]$driftViolationPaths.Add($driftViolationPath) }
+    }
+
+    # Знімок циклу запитано, але він не вдався (напр., об'єкт зник під час
+    # обходу): звіряти зникнення нема з чим. Об'єкт аудиту ДО, якого немає в
+    # пост-аудиті й немає локально, міг зникнути до передачі — консистентність
+    # не підтверджено (fail-closed). Без аудиту ДО довести нічого не можна.
+    $snapshotRequestedButFailed = $null -ne $LocalSnapshot -and -not (
+        $null -ne $LocalSnapshot.PSObject.Properties['Success'] -and [bool]$LocalSnapshot.Success
+    )
+    $snapshotUnavailableVanishedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $snapshotUnavailableVanishedCount = 0
+    if ($verificationSucceeded -and $snapshotRequestedButFailed) {
+        if ($null -eq $beforeSplit) {
+            $snapshotConsistencyVerified = $false
+        } else {
+            foreach ($beforePending in @($beforeSplit.Retryable)) {
+                $beforePendingPath = & $getComparablePendingPath $beforePending
+                if ($null -ne $beforePendingPath -and $afterPendingPaths.Contains($beforePendingPath)) {
+                    continue
+                }
+                if ($null -eq $beforePendingPath -or
+                    -not ([IO.File]::Exists($beforePendingPath) -or [IO.Directory]::Exists($beforePendingPath))) {
+                    $snapshotUnavailableVanishedCount++
+                    if ($null -ne $beforePendingPath) { [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath) }
+                }
+            }
+            if ($snapshotUnavailableVanishedCount -gt 0) {
+                $snapshotConsistencyVerified = $false
+            }
+        }
+    }
+    $snapshotConsistent = $snapshotConsistencyVerified -and $snapshotDriftViolationCount -eq 0
     $remainingCount = if ($verificationSucceeded) {
         @($ComparisonAfter.PendingFiles).Count
     } else {
@@ -5500,33 +5559,23 @@ function Get-BAZASynchronizationOutcome {
     } else {
         $null
     }
-    # Об'єкти, що з'явилися під час циклу, не входили до аудиту ДО і не
-    # зменшують кількість переданих об'єктів знімка. Об'єкт аудиту ДО, що
-    # зник/змінився локально без підтвердженої версії у хмарі, теж зникає з
-    # пост-аудиту, але переданим не є — його віднімає порушення знімка.
+    # Передано — об'єкт аудиту ДО, шляху якого немає ні в залишку
+    # пост-аудиту, ні серед порушень знімка, ні серед зниклих без знімка.
+    # Зіставлення за шляхом, а не різниця кількостей: нові та перейменовані
+    # об'єкти пост-аудиту не зменшують кількість переданих, а зниклий об'єкт
+    # аудиту ДО переданим не рахується. Незіставний запис — не переданий.
     $completedCount = if ($null -ne $beforeSplit -and $null -ne $afterSplit) {
-        $beforePendingPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $transferred = 0
         foreach ($beforePending in @($beforeSplit.Retryable)) {
-            $beforePathProperty = $beforePending.PSObject.Properties['Path']
-            if ($null -ne $beforePathProperty -and
-                -not [string]::IsNullOrWhiteSpace([string]$beforePathProperty.Value) -and
-                [IO.Path]::IsPathRooted([string]$beforePathProperty.Value)) {
-                try {
-                    [void]$beforePendingPaths.Add([IO.Path]::GetFullPath([string]$beforePathProperty.Value).TrimEnd('\', '/'))
-                } catch {
-                    continue
-                }
+            $beforePendingPath = & $getComparablePendingPath $beforePending
+            if ($null -ne $beforePendingPath -and
+                -not $afterPendingPaths.Contains($beforePendingPath) -and
+                -not $driftViolationPaths.Contains($beforePendingPath) -and
+                -not $snapshotUnavailableVanishedPaths.Contains($beforePendingPath)) {
+                $transferred++
             }
         }
-        $untransferredDriftCount = if ($null -ne $cycleClassification) {
-            @(@($cycleClassification.ChangedDuringSync) | Where-Object {
-                @('LocalVanished', 'LocalTypeReplaced', 'LocalModified') -contains [string]$_.Action -and
-                $beforePendingPaths.Contains(([string]$_.Path).TrimEnd('\', '/'))
-            }).Count
-        } else {
-            0
-        }
-        [math]::Max(0, @($beforeSplit.Retryable).Count - (@($afterSplit.Retryable).Count - [int]$newAfterCutoffCount) - $untransferredDriftCount)
+        $transferred
     } else {
         $null
     }
@@ -5552,6 +5601,8 @@ function Get-BAZASynchronizationOutcome {
         VanishedAfterBackupCount = $vanishedAfterBackupCount
         SnapshotConsistencyVerified = $snapshotConsistencyVerified
         SnapshotDriftViolationCount = $snapshotDriftViolationCount
+        SnapshotUnavailableVanishedCount = $snapshotUnavailableVanishedCount
+        SnapshotUnavailableVanished = @($snapshotUnavailableVanishedPaths)
         CycleClassification = $cycleClassification
         IsComplete = (
             $WinSCPExitCode -eq 0 -and
@@ -6446,8 +6497,9 @@ exit
             }
             # Об'єкт знімка, що зник/змінився локально без підтвердженої
             # версії у хмарі, не є ні переданим, ні залишком пост-аудиту.
-            $driftResultText = if ([int]$syncOutcome.SnapshotDriftViolationCount -gt 0) {
-                "; зникли або змінилися локально без підтвердженої версії у хмарі: $($syncOutcome.SnapshotDriftViolationCount)"
+            $driftResultCount = [int]$syncOutcome.SnapshotDriftViolationCount + [int]$syncOutcome.SnapshotUnavailableVanishedCount
+            $driftResultText = if ($driftResultCount -gt 0) {
+                "; зникли або змінилися локально без підтвердженої версії у хмарі: $driftResultCount"
             } else {
                 ""
             }
@@ -6495,7 +6547,10 @@ exit
             # Залишку пост-аудиту немає, але знімок циклу порушено: об'єкти
             # знімка зникли/змінили тип без підтвердженої версії у хмарі або
             # звіряння не вдалося.
-            $driftReason = if (-not $syncOutcome.SnapshotConsistencyVerified) {
+            $driftReason = if ([int]$syncOutcome.SnapshotUnavailableVanishedCount -gt 0) {
+                $unavailablePreview = @(@($syncOutcome.SnapshotUnavailableVanished) | Select-Object -First 20) -join '; '
+                "знімок циклу не створено, а об'єкти аудиту ДО зникли локально без підтвердження передачі: $($syncOutcome.SnapshotUnavailableVanishedCount) ($unavailablePreview)"
+            } elseif (-not $syncOutcome.SnapshotConsistencyVerified) {
                 "звіряння знімка циклу з локальним деревом не виконано"
             } else {
                 "об'єкти знімка циклу зникли або змінили тип локально без підтвердженої версії знімка у хмарі: $($syncOutcome.SnapshotDriftViolationCount)"
