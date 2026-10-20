@@ -1896,17 +1896,61 @@ function Initialize-BRAVOSFTPRemoteDirectories { param($WinSCPPath, $RepositoryS
 # Фейк read-only CompareDirectories(Remote, removeFiles=$false): усе локальне,
 # чого немає в хмарі, — UploadNew; інший розмір — UploadUpdate.
 function Get-BAZASFTPComparison {
-    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey)
+    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey, $LocalSnapshot = $null)
     $script:late501ComparisonCalls++
+    $script:late501ComponentComparisons++
     if ($script:late501AfterAuditFails -and $script:late501ComparisonCalls -ge 2) {
         return [pscustomobject]@{ Success = $false; Error = 'аудит недоступний (selftest)'; PendingFiles = @() }
     }
+    $result = Get-Late501RemoteDifference -LocalPath $LocalPath -RemotePath $RemotePath
+    # Пост-аудит зі знімком: та сама production-функція, що й у справжньому
+    # Get-BAZASFTPComparison (звіряння знімка ПІСЛЯ порівняння + stat), лише
+    # сесія — фейкова хмара. Стадія AfterCompare — LIMS діє між локальним
+    # обходом пост-аудиту і звірянням знімка.
+    if ($null -ne $LocalSnapshot) {
+        Invoke-Late501Ops -Stage 'AfterCompare'
+        $result = Add-BAZASnapshotConsistencyEvidence -ComparisonResult $result -Session (New-Late501FakeSession -RemotePath $RemotePath) `
+            -RemotePath $RemotePath -LocalSnapshot $LocalSnapshot -LocalPath $LocalPath -MaximumProbeCount $script:late501ProbeCap
+    }
+    # Перший аудит компонента — ДО синхронізації: LIMS діє вже після нього.
+    if ($script:late501ComponentComparisons -eq 1) { Invoke-Late501Ops -Stage 'BeforeAudit' }
+    return $result
+}
+# Фейкова WinSCP .NET Session над фейковою хмарою: FileExists/GetFileInfo
+# для '/baza_app/KZ/...' (час — з точністю SFTP, секунди).
+function New-Late501FakeSession {
+    param([string]$RemotePath)
+    $session = New-Object psobject
+    $session | Add-Member -NotePropertyName RemoteRoot -NotePropertyValue $RemotePath
+    $session | Add-Member -MemberType ScriptMethod -Name RelativeOf -Value {
+        param($Path) $Path.Substring($this.RemoteRoot.TrimEnd('/').Length + 1).Replace('/', '\')
+    }
+    $session | Add-Member -MemberType ScriptMethod -Name FileExists -Value {
+        param($Path) $script:late501Remote[$this.RemoteRoot].ContainsKey($this.RelativeOf($Path))
+    }
+    $session | Add-Member -MemberType ScriptMethod -Name GetFileInfo -Value {
+        param($Path)
+        $relative = $this.RelativeOf($Path)
+        $length = [long]$script:late501Remote[$this.RemoteRoot][$relative]
+        $times = $script:late501Remote['#times'][$this.RemoteRoot]
+        [pscustomobject]@{
+            IsDirectory = ($length -eq -1)
+            Length = $length
+            LastWriteTime = $(if ($times.ContainsKey($relative)) { New-Object DateTime ([long]$times[$relative]), ([DateTimeKind]::Utc) } else { [datetime]::MinValue })
+        }
+    }
+    return $session
+}
+function Get-Late501RemoteDifference {
+    param($LocalPath, $RemotePath)
     $remote = $script:late501Remote[$RemotePath]
     $rootPath = (Get-Item -LiteralPath $LocalPath).FullName.TrimEnd('\')
     $pending = @()
-    foreach ($item in @(Get-ChildItem -LiteralPath $LocalPath -Recurse -Force)) {
+    # .NET-перелік, як у WinSCP і знімку: заходить у junction (Get-ChildItem
+    # -Recurse у PS 5.1 — ні).
+    foreach ($item in @((New-Object IO.DirectoryInfo($rootPath)).EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories))) {
         $relative = $item.FullName.Substring($rootPath.Length + 1)
-        if ($item.PSIsContainer) {
+        if ($item -is [IO.DirectoryInfo]) {
             if (-not $remote.ContainsKey($relative)) {
                 $pending += [pscustomobject]@{ Action = 'UploadNew'; Reason = 'відсутній у хмарі'; Path = $item.FullName; IsDirectory = $true; SizeBytes = $null }
             }
@@ -1928,8 +1972,9 @@ function Start-BRAVOProcessOutputCapture {
     $remoteKey = $script:late501CurrentRemotePath
     $localRoot = (Get-Item -LiteralPath $script:late501CurrentLocal).FullName.TrimEnd('\')
     $scanned = @(
-        @(Get-ChildItem -LiteralPath $localRoot -Recurse -Force) | ForEach-Object {
-            [pscustomobject]@{ Relative = $_.FullName.Substring($localRoot.Length + 1); IsDirectory = $_.PSIsContainer; Length = $(if ($_.PSIsContainer) { -1 } else { [long]$_.Length }) }
+        @((New-Object IO.DirectoryInfo($localRoot)).EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)) | ForEach-Object {
+            $isDirectory = $_ -is [IO.DirectoryInfo]
+            [pscustomobject]@{ Relative = $_.FullName.Substring($localRoot.Length + 1); IsDirectory = $isDirectory; Length = $(if ($isDirectory) { -1 } else { [long]$_.Length }); Ticks = $_.LastWriteTimeUtc.Ticks }
         }
     )
     foreach ($write in @($script:late501DuringSyncWrites | Where-Object { $_.Component -eq $script:late501CurrentComponent })) {
@@ -1938,9 +1983,12 @@ function Start-BRAVOProcessOutputCapture {
         [IO.File]::WriteAllBytes($write.Path, (New-Object byte[] ([int]$write.Size)))
         if ($null -ne $write.LastWriteUtc) { [IO.File]::SetLastWriteTimeUtc($write.Path, [datetime]$write.LastWriteUtc) }
     }
+    Invoke-Late501Ops -Stage 'Sync'
     foreach ($scannedItem in $scanned) {
         if ($script:late501FailPaths -contains $scannedItem.Relative) { continue }
         $script:late501Remote[$remoteKey][$scannedItem.Relative] = $scannedItem.Length
+        # Хмара зберігає час модифікації з точністю SFTP (секунди).
+        $script:late501Remote['#times'][$remoteKey][$scannedItem.Relative] = $scannedItem.Ticks - ($scannedItem.Ticks % [TimeSpan]::TicksPerSecond)
     }
     $Process.StartInfo.FileName = $env:ComSpec
     $Process.StartInfo.Arguments = "/c exit $script:late501ExitCode"
@@ -1948,6 +1996,37 @@ function Start-BRAVOProcessOutputCapture {
     return $null
 }
 function Complete-BRAVOProcessOutputCapture { param($Capture) return [pscustomobject]@{ StandardOutput = ''; StandardError = '' } }
+# Справжній знімок; дії стадії 'Snapshot' — об'єкти, що з'явилися/зникли вже
+# після обходу свого каталогу, але до старту WinSCP (неатомарний обхід).
+function Get-BRAVOBazaLocalSnapshot {
+    param([string]$LocalDirectory, [switch]$IncludeHiddenSystem, [switch]$IncludeDirectories)
+    $snapshot = BRAVO.BazaSync\Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -IncludeHiddenSystem:$IncludeHiddenSystem -IncludeDirectories:$IncludeDirectories
+    Invoke-Late501Ops -Stage 'Snapshot'
+    return $snapshot
+}
+# Дії "LIMS" на заданій стадії циклу поточного компонента (дані, без closure).
+function Invoke-Late501Ops {
+    param([string]$Stage)
+    foreach ($op in @($script:late501Ops | Where-Object { $_.Stage -eq $Stage -and $_.Component -eq $script:late501CurrentComponent })) {
+        switch ($op.Op) {
+            'Write' {
+                $opDirectory = [IO.Path]::GetDirectoryName($op.Path)
+                if (-not [IO.Directory]::Exists($opDirectory)) { [void][IO.Directory]::CreateDirectory($opDirectory) }
+                [IO.File]::WriteAllBytes($op.Path, (New-Object byte[] ([int]$op.Size)))
+            }
+            'Delete' { [IO.File]::Delete($op.Path) }
+            'DeleteTree' { [IO.Directory]::Delete($op.Path, $true) }
+            'MkDir' { [void][IO.Directory]::CreateDirectory($op.Path) }
+            'Move' { [IO.File]::Move($op.Path, $op.Target) }
+            'SetCreation' { [IO.File]::SetCreationTimeUtc($op.Path, [datetime]$op.Time) }
+            'SetLastWrite' { [IO.File]::SetLastWriteTimeUtc($op.Path, [datetime]$op.Time) }
+            'Junction' {
+                $mklinkOutput = & $env:ComSpec /c mklink /J "$($op.Path)" "$($op.Target)" 2>&1
+                if ($LASTEXITCODE -ne 0) { throw "mklink /J не вдався: $mklinkOutput" }
+            }
+        }
+    }
+}
 '@
 $late501Module = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($late501Stub + "`n" + $archiveScriptText) `
@@ -1957,8 +2036,11 @@ $late501Module = New-BRAVOSelfTestRuntimeModule `
         'Show-ScriptProgress', 'Format-BRAVORunningDetail', 'Get-BAZARemoteNameCompatibilityIssues',
         'Write-BAZARemoteNameCompatibilityAudit', 'Get-BRAVOBazaSyncModeEffective', 'Test-PathWithLog', 'Test-SFTPConfig',
         'Test-SFTPConnection', 'Initialize-BRAVOSFTPRemoteDirectories', 'Get-BAZASFTPComparison',
+        'Get-Late501RemoteDifference', 'Get-BRAVOBazaLocalSnapshot', 'Invoke-Late501Ops',
         'Start-BRAVOProcessOutputCapture', 'Complete-BRAVOProcessOutputCapture',
         'Write-BAZASFTPComparisonAudit', 'Test-BAZAPathBlockedByIncompatibleName', 'Split-BAZAPendingFilesByCompatibility',
+        'Get-BAZASyncStartBoundaryUtc', 'Test-BAZACreationClockTrusted', 'Test-BAZAVanishedSnapshotObjectBackedUp', 'Get-BAZARemoteVanishedProbe',
+        'Add-BAZASnapshotConsistencyEvidence', 'Test-BAZAPathHasReparsePoint', 'New-Late501FakeSession',
         'Get-BAZAPendingFileCycleClassification', 'Get-BAZASynchronizationOutcome', 'Sync-FolderToSFTP',
         'Invoke-BRAVOBazaCanonicalSync', 'New-BRAVOTransferOperationResult', 'Invoke-ManualBAZASFTPSynchronization',
         'Get-BRAVOManualSyncRunOutcomeLabel', 'Resolve-BRAVOSyncBazaExitCode', 'Resolve-BRAVOLogComponentFromHeader'
@@ -1974,14 +2056,19 @@ $late501Run = {
         [string[]]$FailPaths = @(),
         [int]$ExitCode = 0,
         [switch]$AfterAuditFails,
-        [switch]$WithWWW
+        [switch]$WithWWW,
+        [object[]]$Ops = @(),
+        [int]$ProbeCap = 1000
     )
     & $late501Module {
-        param($CaseRoot, $Remote, $DuringSyncWrites, $FailPaths, $ExitCode, $AfterAuditFails, $WithWWW)
+        param($CaseRoot, $Remote, $DuringSyncWrites, $FailPaths, $ExitCode, $AfterAuditFails, $WithWWW, $Ops, $ProbeCap)
+        $script:late501ProbeCap = $ProbeCap
         $script:late501Log = New-Object System.Collections.ArrayList
         $script:late501CaseRoot = $CaseRoot
         $script:late501Remote = $Remote
         $script:late501DuringSyncWrites = @($DuringSyncWrites)
+        $script:late501Ops = @($Ops)
+        $script:late501CurrentComponent = $null
         $script:late501FailPaths = @($FailPaths)
         $script:late501ExitCode = $ExitCode
         $script:late501AfterAuditFails = [bool]$AfterAuditFails
@@ -2011,6 +2098,7 @@ $late501Run = {
             param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $LocalDirectory, $RemoteDirectory, $ComponentName)
             $script:late501CurrentLocal = $LocalDirectory
             $script:late501CurrentComponent = $ComponentName
+            $script:late501ComponentComparisons = 0
             $script:late501CurrentRemotePath = '/' + $RemoteDirectory.Trim('/')
             $result = & $script:late501OriginalSync -WinSCPPath $WinSCPPath -RepositorySFTPUrl $RepositorySFTPUrl -HostKey $HostKey -LocalDirectory $LocalDirectory -RemoteDirectory $RemoteDirectory -ComponentName $ComponentName
             $script:late501Outcomes[$ComponentName] = $script:lastBAZASyncOutcome
@@ -2032,7 +2120,7 @@ $late501Run = {
             Log = @($script:late501Log.ToArray())
             WinSCPRuns = $script:late501WinSCPRuns
         }
-    } $CaseRoot $Remote @($DuringSyncWrites) $FailPaths $ExitCode ([bool]$AfterAuditFails) ([bool]$WithWWW)
+    } $CaseRoot $Remote @($DuringSyncWrites) $FailPaths $ExitCode ([bool]$AfterAuditFails) ([bool]$WithWWW) @($Ops) $ProbeCap
 }
 
 $late501NewFile = {
@@ -2047,7 +2135,7 @@ $late501NewFile = {
 $late501NewCase = {
     param([string]$Name, [int]$SyncedCount = 3, [int]$PendingCount = 2)
     $caseRoot = Join-Path $late501Root $Name
-    $remote = @{ '/baza_app' = @{}; '/baza_www' = @{} }
+    $remote = @{ '/baza_app' = @{}; '/baza_www' = @{}; '#times' = @{ '/baza_app' = @{}; '/baza_www' = @{} } }
     foreach ($component in @('APP', 'WWW')) {
         $componentRoot = Join-Path $caseRoot $component
         [void](New-Item -ItemType Directory -Path (Join-Path $componentRoot 'KZ\2026') -Force)
@@ -2057,6 +2145,8 @@ $late501NewCase = {
         for ($i = 1; $i -le $SyncedCount; $i++) {
             & $late501NewFile (Join-Path $componentRoot "KZ\2026\synced_$i.pdf") 100
             $remote[$remoteKey]["KZ\2026\synced_$i.pdf"] = 100
+            $syncedTicks = [IO.File]::GetLastWriteTimeUtc((Join-Path $componentRoot "KZ\2026\synced_$i.pdf")).Ticks
+            $remote['#times'][$remoteKey]["KZ\2026\synced_$i.pdf"] = $syncedTicks - ($syncedTicks % [TimeSpan]::TicksPerSecond)
         }
         for ($i = 1; $i -le $PendingCount; $i++) {
             & $late501NewFile (Join-Path $componentRoot "KZ\2026\pending_$i.pdf") 200
@@ -2066,6 +2156,10 @@ $late501NewCase = {
 }
 # Запис "LIMS під час WinSCP": дані, які пише фейковий старт процесу (без closure).
 $late501Write = { param([string]$Component, [string]$Path, [int]$Size = 64, $LastWriteUtc = $null) [pscustomobject]@{ Component = $Component; Path = $Path; Size = $Size; LastWriteUtc = $LastWriteUtc } }
+# Дія "LIMS" на стадії циклу: BeforeAudit (після аудиту ДО, ще до знімка),
+# Snapshot (після обходу знімка, до старту WinSCP), Sync (після сканування
+# WinSCP, до передачі).
+$late501Op = { param([string]$Stage, [string]$Op, [string]$Path, [string]$Target = $null, [int]$Size = 64, $Time = $null, [string]$Component = 'BAZA_APP') [pscustomobject]@{ Stage = $Stage; Op = $Op; Path = $Path; Target = $Target; Size = $Size; Time = $Time; Component = $Component } }
 $late501Errors = { param($Run) @($Run.Log | Where-Object { $_.Level -eq 'ERROR' }) }
 $late501Warnings = { param($Run) @($Run.Log | Where-Object { $_.Level -eq 'WARNING' }) }
 
@@ -2307,7 +2401,8 @@ try {
     )
     $c18Result = & $late501Module {
         param($Pending, $Snapshot, $Root)
-        Get-BAZAPendingFileCycleClassification -PendingFiles $Pending -LocalSnapshot $Snapshot -LocalRoot $Root
+        # Межа старту передачі — до створення "справжніх нових" об'єктів.
+        Get-BAZAPendingFileCycleClassification -PendingFiles $Pending -LocalSnapshot $Snapshot -LocalRoot $Root -SyncStartUtc ([datetime]'2000-01-01T00:00:00Z')
     } $c18Pending $c18Snapshot $c18.App
     $c18Changed = @(@($c18Result.ChangedDuringSync) | ForEach-Object { Split-Path -Leaf ([string]$_.Path) } | Sort-Object)
     $c18New = @(@($c18Result.NewAfterCutoff) | ForEach-Object { Split-Path -Leaf ([string]$_.Path) } | Sort-Object)
@@ -2317,6 +2412,370 @@ try {
         @($c18Result.RealMissing).Count -eq 0
     ) -Name 'Archive/501/S18TypeReplacementIsChangedNotNew' `
       -Failure "заміна файл<->каталог під час циклу має бути ChangedDuringSync, справжні нові — NewAfterCutoff; changed=$($c18Changed -join ',') new=$($c18New -join ',')"
+
+    # ------------------------------------------------------------
+    # #501 follow-up: консистентність знімка.
+    #   P2 — обхід знімка неатомарний: об'єкт поза знімком "новий" лише тоді,
+    #        коли створений після межі старту передачі (CreationTimeUtc).
+    #   P1 — об'єкти знімка, що зникли/змінили тип локально, виявляються
+    #        звірянням знімка з живим деревом, а не лише через залишок аудиту.
+    # ------------------------------------------------------------
+    $late501Info = { param($Run) @($Run.Log | Where-Object { $_.Level -eq 'INFO' }) }
+
+    # F01 (P2). Файл з'явився в уже обійденому каталозі під час обходу знімка
+    # (до старту WinSCP), WinSCP пропустив його з кодом 0 -> ПОМИЛКА, не "новий".
+    $f01 = & $late501NewCase 'F01'
+    $f01Late = Join-Path $f01.App 'KZ\2026\during-snapshot.pdf'
+    $rf01 = & $late501Run -CaseRoot $f01.Root -Remote $f01.Remote -FailPaths @('KZ\2026\during-snapshot.pdf') -Ops @(& $late501Op 'Snapshot' 'Write' $f01Late)
+    Test-BRAVOCondition -Condition (
+        -not $rf01.Manual.Success -and $rf01.Label -eq 'ПОМИЛКА' -and $rf01.ExitCode -eq 50 -and
+        $rf01.App.RealMissingCount -eq 1 -and $rf01.App.NewAfterCutoffCount -eq 0 -and
+        @(& $late501Errors $rf01 | Where-Object { $_.Message -like 'AUDIT BAZA_APP*during-snapshot.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F01CreatedDuringSnapshotEnumerationIsError' `
+      -Failure "файл, створений під час обходу знімка й не переданий, — ПОМИЛКА, а не ПОПЕРЕДЖЕННЯ; label=$($rf01.Label) real=$($rf01.App.RealMissingCount) new=$($rf01.App.NewAfterCutoffCount)"
+
+    # F02 (P2). Контроль: такий самий файл WinSCP передав -> УСПІШНО (без хибних помилок).
+    $f02 = & $late501NewCase 'F02'
+    $rf02 = & $late501Run -CaseRoot $f02.Root -Remote $f02.Remote -Ops @(& $late501Op 'Snapshot' 'Write' (Join-Path $f02.App 'KZ\2026\during-snapshot.pdf'))
+    Test-BRAVOCondition -Condition (
+        $rf02.Manual.Success -and $rf02.Label -eq 'УСПІШНО' -and $rf02.ExitCode -eq 0 -and $rf02.App.IsComplete -and
+        @(& $late501Errors $rf02).Count -eq 0
+    ) -Name 'Archive/501/F02CreatedDuringSnapshotAndTransferredIsSuccess' `
+      -Failure "переданий файл, створений під час обходу знімка, не дає помилки; label=$($rf02.Label)"
+
+    # F03 (P2). Новий каталог із файлом з'явився після обходу знімка, до старту
+    # WinSCP; WinSCP пропустив обидва -> ПОМИЛКА (існували до старту передачі).
+    $f03 = & $late501NewCase 'F03'
+    $rf03 = & $late501Run -CaseRoot $f03.Root -Remote $f03.Remote -FailPaths @('KZ\2026\new-dir', 'KZ\2026\new-dir\before-start.pdf') -Ops @(
+        (& $late501Op 'Snapshot' 'MkDir' (Join-Path $f03.App 'KZ\2026\new-dir')),
+        (& $late501Op 'Snapshot' 'Write' (Join-Path $f03.App 'KZ\2026\new-dir\before-start.pdf'))
+    )
+    Test-BRAVOCondition -Condition (
+        $rf03.Label -eq 'ПОМИЛКА' -and $rf03.App.RealMissingCount -eq 2 -and $rf03.App.NewAfterCutoffCount -eq 0
+    ) -Name 'Archive/501/F03DirectoryCreatedBeforeTransferStartIsError' `
+      -Failure "каталог і файл, що існували до старту WinSCP і не передані, — ПОМИЛКА; label=$($rf03.Label) real=$($rf03.App.RealMissingCount) new=$($rf03.App.NewAfterCutoffCount)"
+
+    # F04 (P1). Файл знімка, що чекав передачі, видалено до старту WinSCP -> ПОМИЛКА.
+    $f04 = & $late501NewCase 'F04'
+    $rf04 = & $late501Run -CaseRoot $f04.Root -Remote $f04.Remote -Ops @(& $late501Op 'Snapshot' 'Delete' (Join-Path $f04.App 'KZ\2026\pending_1.pdf'))
+    Test-BRAVOCondition -Condition (
+        -not $rf04.Manual.Success -and $rf04.Label -eq 'ПОМИЛКА' -and $rf04.ExitCode -eq 50 -and
+        $rf04.App.ChangedDuringSyncCount -eq 1 -and -not $rf04.App.IsComplete -and
+        @(& $late501Errors $rf04 | Where-Object { $_.Message -like 'AUDIT BAZA_APP*[ЗМІНЕНО ПІД ЧАС СИНХРОНІЗАЦІЇ]*pending_1.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F04SnapshotFileDeletedBeforeTransferIsError' `
+      -Failure "файл знімка, видалений до передачі, не може дати УСПІШНО; label=$($rf04.Label) changed=$($rf04.App.ChangedDuringSyncCount)"
+
+    # F05 (P1). Файл знімка видалено після сканування WinSCP, до upload (WinSCP
+    # пропустив, код 0, пост-аудит його не бачить) -> ПОМИЛКА.
+    $f05 = & $late501NewCase 'F05'
+    $rf05 = & $late501Run -CaseRoot $f05.Root -Remote $f05.Remote -FailPaths @('KZ\2026\pending_2.pdf') -Ops @(& $late501Op 'Sync' 'Delete' (Join-Path $f05.App 'KZ\2026\pending_2.pdf'))
+    Test-BRAVOCondition -Condition (
+        -not $rf05.Manual.Success -and $rf05.Label -eq 'ПОМИЛКА' -and $rf05.ExitCode -eq 50 -and
+        $rf05.App.ChangedDuringSyncCount -eq 1 -and $rf05.App.RetryableRemainingCount -eq 0 -and
+        @(& $late501Errors $rf05 | Where-Object { $_.Message -like '*BAZA_APP*зникли*' -or $_.Message -like '*BAZA_APP*зник*' }).Count -ge 1
+    ) -Name 'Archive/501/F05SnapshotFileDeletedAfterScanBeforeUploadIsError' `
+      -Failure "файл знімка, зниклий до upload, — ПОМИЛКА навіть без залишку в пост-аудиті; label=$($rf05.Label) changed=$($rf05.App.ChangedDuringSyncCount)"
+
+    # F06 (P1). Перейменування файла знімка під час синхронізації: нове ім'я
+    # зберігає CreationTime -> не "новий" -> ПОМИЛКА.
+    $f06 = & $late501NewCase 'F06'
+    $rf06 = & $late501Run -CaseRoot $f06.Root -Remote $f06.Remote -Ops @(& $late501Op 'Sync' 'Move' (Join-Path $f06.App 'KZ\2026\synced_1.pdf') -Target (Join-Path $f06.App 'KZ\2026\renamed_1.pdf'))
+    Test-BRAVOCondition -Condition (
+        $rf06.Label -eq 'ПОМИЛКА' -and $rf06.App.NewAfterCutoffCount -eq 0 -and $rf06.App.RealMissingCount -eq 1 -and
+        @(& $late501Errors $rf06 | Where-Object { $_.Message -like 'AUDIT BAZA_APP*renamed_1.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F06RenamedSnapshotFileIsNotNew' `
+      -Failure "нове ім'я перейменованого файла знімка не є безпечним NewAfterCutoff; label=$($rf06.Label) new=$($rf06.App.NewAfterCutoffCount) real=$($rf06.App.RealMissingCount)"
+
+    # F07 (P1). Переміщення файла знімка, що чекав передачі, в інший підкаталог -> ПОМИЛКА.
+    $f07 = & $late501NewCase 'F07'
+    $rf07 = & $late501Run -CaseRoot $f07.Root -Remote $f07.Remote -FailPaths @('KZ\2026\pending_1.pdf') -Ops @(& $late501Op 'Sync' 'Move' (Join-Path $f07.App 'KZ\2026\pending_1.pdf') -Target (Join-Path $f07.App 'KZ\pending_1.pdf'))
+    Test-BRAVOCondition -Condition (
+        $rf07.Label -eq 'ПОМИЛКА' -and $rf07.App.NewAfterCutoffCount -eq 0 -and
+        $rf07.App.ChangedDuringSyncCount -eq 1 -and $rf07.App.RealMissingCount -eq 1
+    ) -Name 'Archive/501/F07MovedBetweenDirectoriesIsError' `
+      -Failure "переміщення файла знімка між каталогами — зник (Changed) + поза знімком до старту (RealMissing); changed=$($rf07.App.ChangedDuringSyncCount) real=$($rf07.App.RealMissingCount) new=$($rf07.App.NewAfterCutoffCount)"
+
+    # F08 (P1). Файл знімка замінено каталогом під час синхронізації -> ПОМИЛКА.
+    $f08 = & $late501NewCase 'F08'
+    $f08Path = Join-Path $f08.App 'KZ\2026\synced_2.pdf'
+    $rf08 = & $late501Run -CaseRoot $f08.Root -Remote $f08.Remote -Ops @((& $late501Op 'Sync' 'Delete' $f08Path), (& $late501Op 'Sync' 'MkDir' $f08Path))
+    Test-BRAVOCondition -Condition (
+        $rf08.Label -eq 'ПОМИЛКА' -and $rf08.App.ChangedDuringSyncCount -eq 1 -and $rf08.App.NewAfterCutoffCount -eq 0
+    ) -Name 'Archive/501/F08SnapshotFileReplacedByDirectoryIsError' `
+      -Failure "файл знімка, замінений каталогом, — ChangedDuringSync (один раз); label=$($rf08.Label) changed=$($rf08.App.ChangedDuringSyncCount)"
+
+    # F09 (P1). Каталог знімка замінено файлом -> ПОМИЛКА.
+    $f09 = & $late501NewCase 'F09'
+    $f09Dir = Join-Path $f09.App 'KZ\2026\sub'
+    [void][IO.Directory]::CreateDirectory($f09Dir)
+    $f09.Remote['/baza_app']['KZ\2026\sub'] = -1
+    $rf09 = & $late501Run -CaseRoot $f09.Root -Remote $f09.Remote -Ops @((& $late501Op 'Sync' 'DeleteTree' $f09Dir), (& $late501Op 'Sync' 'Write' $f09Dir))
+    Test-BRAVOCondition -Condition (
+        $rf09.Label -eq 'ПОМИЛКА' -and $rf09.App.ChangedDuringSyncCount -eq 1 -and $rf09.App.NewAfterCutoffCount -eq 0
+    ) -Name 'Archive/501/F09SnapshotDirectoryReplacedByFileIsError' `
+      -Failure "каталог знімка, замінений файлом, — ChangedDuringSync; label=$($rf09.Label) changed=$($rf09.App.ChangedDuringSyncCount)"
+
+    # F10. Одночасно новий файл, видалений файл знімка й справжня непередача -> ПОМИЛКА з усіма класами.
+    $f10 = & $late501NewCase 'F10' -PendingCount 3
+    $rf10 = & $late501Run -CaseRoot $f10.Root -Remote $f10.Remote -FailPaths @('KZ\2026\pending_1.pdf', 'KZ\2026\pending_2.pdf') -Ops @(
+        (& $late501Op 'Sync' 'Delete' (Join-Path $f10.App 'KZ\2026\pending_2.pdf')),
+        (& $late501Op 'Sync' 'Write' (Join-Path $f10.App 'KZ\2026\late.pdf'))
+    )
+    Test-BRAVOCondition -Condition (
+        $rf10.Label -eq 'ПОМИЛКА' -and $rf10.ExitCode -eq 50 -and
+        $rf10.App.RealMissingCount -eq 1 -and $rf10.App.ChangedDuringSyncCount -eq 1 -and $rf10.App.NewAfterCutoffCount -eq 1 -and
+        -not $rf10.App.IsCompleteWithNewAfterCutoff
+    ) -Name 'Archive/501/F10NewDeletedAndRealFailureTogetherIsError' `
+      -Failure "новий + зниклий + непереданий -> ПОМИЛКА з точними лічильниками; real=$($rf10.App.RealMissingCount) changed=$($rf10.App.ChangedDuringSyncCount) new=$($rf10.App.NewAfterCutoffCount)"
+
+    # F11. Незалежні цикли: файл знімка WWW видалено під час синхронізації APP
+    # (до знімка WWW) — не впливає на жоден компонент; новий у APP -> ПОПЕРЕДЖЕННЯ.
+    $f11 = & $late501NewCase 'F11'
+    $rf11 = & $late501Run -CaseRoot $f11.Root -Remote $f11.Remote -WithWWW -Ops @(
+        (& $late501Op 'Sync' 'Delete' (Join-Path $f11.Www 'KZ\2026\pending_1.pdf')),
+        (& $late501Op 'Sync' 'Write' (Join-Path $f11.App 'KZ\2026\late-app.pdf'))
+    )
+    Test-BRAVOCondition -Condition (
+        $rf11.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $rf11.App.NewAfterCutoffCount -eq 1 -and $rf11.App.ChangedDuringSyncCount -eq 0 -and
+        $rf11.Www.IsComplete -and $rf11.Www.ChangedDuringSyncCount -eq 0
+    ) -Name 'Archive/501/F11IndependentComponentSnapshotsWithDrift' `
+      -Failure "зміни дерева WWW до його знімка не впливають на APP/WWW; label=$($rf11.Label) wwwChanged=$($rf11.Www.ChangedDuringSyncCount)"
+
+    # F12. Наступний цикл після гонки (F05): видаленого файла вже немає у знімку -> УСПІШНО.
+    $rf12 = & $late501Run -CaseRoot $f05.Root -Remote $f05.Remote
+    Test-BRAVOCondition -Condition (
+        $rf12.Label -eq 'УСПІШНО' -and $rf12.ExitCode -eq 0 -and $rf12.App.IsComplete -and $rf12.App.ChangedDuringSyncCount -eq 0
+    ) -Name 'Archive/501/F12NextCycleAfterSnapshotRaceSucceeds' `
+      -Failure "наступний цикл після зникнення файла має бути УСПІШНО; label=$($rf12.Label)"
+
+    # F13. Контроль: файл, уже синхронізований ДО циклу, видалено під час
+    # синхронізації — копія в хмарі є (-delete заборонено) -> УСПІШНО, INFO.
+    $f13 = & $late501NewCase 'F13'
+    $rf13 = & $late501Run -CaseRoot $f13.Root -Remote $f13.Remote -Ops @(& $late501Op 'Sync' 'Delete' (Join-Path $f13.App 'KZ\2026\synced_3.pdf'))
+    Test-BRAVOCondition -Condition (
+        $rf13.Manual.Success -and $rf13.Label -eq 'УСПІШНО' -and $rf13.ExitCode -eq 0 -and $rf13.App.IsComplete -and
+        $rf13.App.VanishedAfterBackupCount -eq 1 -and $rf13.App.ChangedDuringSyncCount -eq 0 -and
+        @(& $late501Info $rf13 | Where-Object { $_.Message -like 'AUDIT BAZA_APP*synced_3.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F13DeletedAlreadyBackedUpFileIsNotError' `
+      -Failure "видалення вже зарезервованого файла не є збоєм синхронізації; label=$($rf13.Label) vanishedAfterBackup=$($rf13.App.VanishedAfterBackupCount)"
+
+    # F14. Зарезервований файл змінено після знімка, -mirror перезалив у хмару
+    # нову версію, потім файл видалено: копія в хмарі вже не версія знімка -> ПОМИЛКА.
+    $f14 = & $late501NewCase 'F14'
+    $f14Path = Join-Path $f14.App 'KZ\2026\synced_3.pdf'
+    $rf14 = & $late501Run -CaseRoot $f14.Root -Remote $f14.Remote -Ops @(
+        (& $late501Op 'Snapshot' 'Write' $f14Path -Size 64),
+        (& $late501Op 'Sync' 'Delete' $f14Path)
+    )
+    Test-BRAVOCondition -Condition (
+        $rf14.Label -eq 'ПОМИЛКА' -and $rf14.App.ChangedDuringSyncCount -eq 1 -and $rf14.App.VanishedAfterBackupCount -eq 0
+    ) -Name 'Archive/501/F14ModifiedThenDeletedIsError' `
+      -Failure "зниклий файл знімка, чия копія в хмарі не збігається зі знімком, не може бути 'зарезервованим'; label=$($rf14.Label) changed=$($rf14.App.ChangedDuringSyncCount)"
+
+    # F15. Метадані часу: новий файл зі "старим" CreationTime (копія зі збереженням
+    # часу) -> fail-closed ПОМИЛКА; файл знімка зі зміненим лише LastWriteTime,
+    # не переданий -> ChangedDuringSync.
+    $f15 = & $late501NewCase 'F15'
+    $f15New = Join-Path $f15.App 'KZ\2026\copied-with-times.pdf'
+    $rf15 = & $late501Run -CaseRoot $f15.Root -Remote $f15.Remote -FailPaths @('KZ\2026\pending_1.pdf') -Ops @(
+        (& $late501Op 'Sync' 'Write' $f15New),
+        (& $late501Op 'Sync' 'SetCreation' $f15New -Time ([datetime]'2019-01-01T00:00:00Z')),
+        (& $late501Op 'Sync' 'SetLastWrite' (Join-Path $f15.App 'KZ\2026\pending_1.pdf') -Time ([datetime]'2020-02-02T00:00:00Z'))
+    )
+    Test-BRAVOCondition -Condition (
+        $rf15.Label -eq 'ПОМИЛКА' -and $rf15.App.NewAfterCutoffCount -eq 0 -and
+        $rf15.App.RealMissingCount -eq 1 -and $rf15.App.ChangedDuringSyncCount -eq 1
+    ) -Name 'Archive/501/F15TimeMetadataChangesFailClosed' `
+      -Failure "давній CreationTime нового файла й змінений LastWriteTime файла знімка — помилка, не попередження; real=$($rf15.App.RealMissingCount) changed=$($rf15.App.ChangedDuringSyncCount) new=$($rf15.App.NewAfterCutoffCount)"
+
+    # F16. Обсяг: 3000 синхронізованих, 1000 із них видалено під час циклу,
+    # 500 нових -> точні лічильники, ПОПЕРЕДЖЕННЯ.
+    $f16 = & $late501NewCase 'F16' -SyncedCount 0 -PendingCount 0
+    for ($i = 1; $i -le 3000; $i++) {
+        $f16File = Join-Path $f16.App ("KZ\2026\vol_{0:D5}.pdf" -f $i)
+        [IO.File]::WriteAllBytes($f16File, [byte[]](1))
+        $f16.Remote['/baza_app']["KZ\2026\vol_{0:D5}.pdf" -f $i] = 1
+        $f16Ticks = [IO.File]::GetLastWriteTimeUtc($f16File).Ticks
+        $f16.Remote['#times']['/baza_app']["KZ\2026\vol_{0:D5}.pdf" -f $i] = $f16Ticks - ($f16Ticks % [TimeSpan]::TicksPerSecond)
+    }
+    $f16Ops = @(
+        for ($i = 1; $i -le 1000; $i++) { & $late501Op 'Sync' 'Delete' (Join-Path $f16.App ("KZ\2026\vol_{0:D5}.pdf" -f $i)) }
+        for ($j = 1; $j -le 500; $j++) { & $late501Op 'Sync' 'Write' (Join-Path $f16.App ("KZ\2026\fresh_{0:D5}.pdf" -f $j)) -Size 1 }
+    )
+    $rf16 = & $late501Run -CaseRoot $f16.Root -Remote $f16.Remote -Ops $f16Ops
+    Test-BRAVOCondition -Condition (
+        $rf16.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $rf16.App.NewAfterCutoffCount -eq 500 -and
+        $rf16.App.VanishedAfterBackupCount -eq 1000 -and $rf16.App.ChangedDuringSyncCount -eq 0 -and $rf16.App.RealMissingCount -eq 0
+    ) -Name 'Archive/501/F16LargeVolumeDriftCounts' `
+      -Failure "3000 знімка, 1000 видалених зарезервованих, 500 нових; new=$($rf16.App.NewAfterCutoffCount) vanished=$($rf16.App.VanishedAfterBackupCount) changed=$($rf16.App.ChangedDuringSyncCount)"
+
+    # F17. Звіряння знімка з живим деревом: зниклі, змінені тип/вміст об'єкти;
+    # кирилиця, пробіли, перейменування лише регістром — не зникнення.
+    $f17 = & $late501NewCase 'F17' -SyncedCount 0 -PendingCount 0
+    $f17Dir = Join-Path $f17.App 'KZ\2026'
+    foreach ($n in @('звіт 01.pdf', 'Case.pdf', 'gone.pdf', 'grow.pdf', 'to-dir.pdf')) { [IO.File]::WriteAllBytes((Join-Path $f17Dir $n), [byte[]](1)) }
+    [void][IO.Directory]::CreateDirectory((Join-Path $f17Dir 'папка з пробілом'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $f17Dir 'to-file'))
+    $f17Snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $f17.App -IncludeHiddenSystem -IncludeDirectories
+    [IO.File]::Move((Join-Path $f17Dir 'Case.pdf'), (Join-Path $f17Dir 'case.PDF'))
+    [IO.File]::Delete((Join-Path $f17Dir 'gone.pdf'))
+    [IO.File]::WriteAllBytes((Join-Path $f17Dir 'grow.pdf'), [byte[]](1, 2))
+    [IO.File]::Delete((Join-Path $f17Dir 'to-dir.pdf')); [void][IO.Directory]::CreateDirectory((Join-Path $f17Dir 'to-dir.pdf'))
+    [IO.Directory]::Delete((Join-Path $f17Dir 'to-file')); [IO.File]::WriteAllBytes((Join-Path $f17Dir 'to-file'), [byte[]](1))
+    [IO.Directory]::Delete((Join-Path $f17Dir 'папка з пробілом'))
+    $f17Drift = Compare-BRAVOBazaLocalSnapshotToLiveTree -Snapshot $f17Snapshot -LocalDirectory $f17.App
+    $f17Vanished = @(@($f17Drift.Vanished) | ForEach-Object { $_.RelativePath } | Sort-Object)
+    $f17Type = @(@($f17Drift.TypeReplaced) | ForEach-Object { $_.RelativePath } | Sort-Object)
+    $f17Modified = @(@($f17Drift.Modified) | ForEach-Object { $_.RelativePath })
+    Test-BRAVOCondition -Condition (
+        $f17Drift.Success -and
+        $f17Vanished.Count -eq 2 -and $f17Vanished -contains 'KZ\2026\gone.pdf' -and $f17Vanished -contains 'KZ\2026\папка з пробілом' -and
+        $f17Type.Count -eq 2 -and $f17Type -contains 'KZ\2026\to-dir.pdf' -and $f17Type -contains 'KZ\2026\to-file' -and
+        $f17Modified.Count -eq 1 -and $f17Modified[0] -eq 'KZ\2026\grow.pdf'
+    ) -Name 'Archive/501/F17SnapshotDriftDetection' `
+      -Failure "звіряння знімка: vanished=$($f17Vanished -join ',') type=$($f17Type -join ',') modified=$($f17Modified -join ',')"
+
+    # F18. Довіра до CreationTime: лише локальний том; UNC/мережевий -> ні (fail-closed);
+    # без межі старту передачі об'єкт поза знімком не може бути "новим".
+    $f18 = & $late501NewCase 'F18' -SyncedCount 0 -PendingCount 0
+    $f18Snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $f18.App -IncludeHiddenSystem -IncludeDirectories
+    [IO.File]::WriteAllBytes((Join-Path $f18.App 'KZ\2026\fresh.pdf'), [byte[]](1))
+    $f18Result = & $late501Module {
+        param($Root, $Snapshot)
+        $pending = @([pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $Root 'KZ\2026\fresh.pdf'); IsDirectory = $false; SizeBytes = 1 })
+        [pscustomobject]@{
+            Local = Test-BAZACreationClockTrusted -LocalRoot $Root
+            Unc = Test-BAZACreationClockTrusted -LocalRoot '\\file-server-01\baza\app'
+            NoBoundary = Get-BAZAPendingFileCycleClassification -PendingFiles $pending -LocalSnapshot $Snapshot -LocalRoot $Root
+            OldBoundary = Get-BAZAPendingFileCycleClassification -PendingFiles $pending -LocalSnapshot $Snapshot -LocalRoot $Root -SyncStartUtc ([datetime]'2000-01-01T00:00:00Z')
+        }
+    } $f18.App $f18Snapshot
+    Test-BRAVOCondition -Condition (
+        $f18Result.Local -and -not $f18Result.Unc -and
+        @($f18Result.NoBoundary.NewAfterCutoff).Count -eq 0 -and @($f18Result.NoBoundary.RealMissing).Count -eq 1 -and
+        @($f18Result.OldBoundary.NewAfterCutoff).Count -eq 1
+    ) -Name 'Archive/501/F18CreationClockTrustAndBoundaryRequired' `
+      -Failure "UNC не довіряється, без межі старту немає NewAfterCutoff; local=$($f18Result.Local) unc=$($f18Result.Unc)"
+
+    # F19. Межа старту передачі: строго після будь-якого вже створеного об'єкта.
+    $f19Probe = Join-Path $late501Root 'F19-probe.bin'
+    [IO.File]::WriteAllBytes($f19Probe, [byte[]](1))
+    $f19Boundary = & $late501Module { Get-BAZASyncStartBoundaryUtc }
+    $f19After = Join-Path $late501Root 'F19-after.bin'
+    [IO.File]::WriteAllBytes($f19After, [byte[]](1))
+    Test-BRAVOCondition -Condition (
+        $f19Boundary.Established -and
+        ([IO.File]::GetCreationTimeUtc($f19Probe)).Ticks -lt ([datetime]$f19Boundary.BoundaryUtc).Ticks -and
+        ([IO.File]::GetCreationTimeUtc($f19After)).Ticks -gt ([datetime]$f19Boundary.BoundaryUtc).Ticks
+    ) -Name 'Archive/501/F19SyncStartBoundarySeparatesCreationTimes' `
+      -Failure "межа старту передачі має відокремлювати раніше й пізніше створені файли; boundary=$($f19Boundary.BoundaryUtc)"
+
+    # F20. Read-only stat у хмарі лише для зниклих об'єктів (фейкова сесія
+    # WinSCP .NET) і доказ "версія знімка у хмарі": той самий розмір і час з
+    # точністю до секунди; збій stat або перевищення ліміту — Complete = $false.
+    $f20 = & $late501Module {
+        $remoteTime = New-Object DateTime 2026, 10, 20, 12, 30, 45, ([DateTimeKind]::Utc)
+        $session = New-Object psobject
+        $session | Add-Member -MemberType ScriptMethod -Name FileExists -Value { param($Path) $Path -ne '/baza_app/KZ/missing.pdf' }
+        $session | Add-Member -MemberType ScriptMethod -Name GetFileInfo -Value {
+            param($Path)
+            if ($Path -eq '/baza_app/KZ/broken.pdf') { throw 'stat failed' }
+            [pscustomobject]@{ IsDirectory = ($Path -eq '/baza_app/KZ/dir'); Length = 100; LastWriteTime = (New-Object DateTime 2026, 10, 20, 12, 30, 45, ([DateTimeKind]::Utc)).ToLocalTime() }
+        }
+        $vanished = @(
+            [pscustomobject]@{ RelativePath = 'KZ\same.pdf'; IsDirectory = $false },
+            [pscustomobject]@{ RelativePath = 'KZ\missing.pdf'; IsDirectory = $false },
+            [pscustomobject]@{ RelativePath = 'KZ\dir'; IsDirectory = $true }
+        )
+        $probe = Get-BAZARemoteVanishedProbe -Session $session -RemotePath '/baza_app' -Vanished $vanished
+        $broken = Get-BAZARemoteVanishedProbe -Session $session -RemotePath '/baza_app' -Vanished @([pscustomobject]@{ RelativePath = 'KZ\broken.pdf'; IsDirectory = $false })
+        $overCap = Get-BAZARemoteVanishedProbe -Session $session -RemotePath '/baza_app' -Vanished $vanished -MaximumProbeCount 2
+        $entry = { param($Ms) [pscustomobject]@{ Size = 100; LastWriteTimeUtc = $remoteTime.AddMilliseconds($Ms).ToString('o') } }
+        [pscustomobject]@{
+            Complete = $probe.Complete
+            SameBackedUp = Test-BAZAVanishedSnapshotObjectBackedUp -Vanished $vanished[0] -SnapshotEntry (& $entry 400) -Probe $probe.Entries['KZ\same.pdf']
+            OtherSecond = Test-BAZAVanishedSnapshotObjectBackedUp -Vanished $vanished[0] -SnapshotEntry (& $entry 1400) -Probe $probe.Entries['KZ\same.pdf']
+            OtherSize = Test-BAZAVanishedSnapshotObjectBackedUp -Vanished $vanished[0] -SnapshotEntry ([pscustomobject]@{ Size = 99; LastWriteTimeUtc = $remoteTime.ToString('o') }) -Probe $probe.Entries['KZ\same.pdf']
+            Missing = Test-BAZAVanishedSnapshotObjectBackedUp -Vanished $vanished[1] -SnapshotEntry (& $entry 0) -Probe $probe.Entries['KZ\missing.pdf']
+            Directory = Test-BAZAVanishedSnapshotObjectBackedUp -Vanished $vanished[2] -SnapshotEntry $null -Probe $probe.Entries['KZ\dir']
+            DirAsFile = Test-BAZAVanishedSnapshotObjectBackedUp -Vanished ([pscustomobject]@{ RelativePath = 'KZ\dir'; IsDirectory = $false }) -SnapshotEntry (& $entry 0) -Probe $probe.Entries['KZ\dir']
+            BrokenComplete = $broken.Complete
+            BrokenUnknown = ($null -eq $broken.Entries['KZ\broken.pdf'].Exists)
+            BrokenBackedUp = Test-BAZAVanishedSnapshotObjectBackedUp -Vanished ([pscustomobject]@{ RelativePath = 'KZ\broken.pdf'; IsDirectory = $false }) -SnapshotEntry (& $entry 0) -Probe $broken.Entries['KZ\broken.pdf']
+            BrokenError = [string]$broken.Error
+            OverCapComplete = $overCap.Complete
+            OverCapEntries = $overCap.Entries.Count
+        }
+    }
+    Test-BRAVOCondition -Condition (
+        $f20.Complete -and $f20.SameBackedUp -and -not $f20.OtherSecond -and -not $f20.OtherSize -and -not $f20.Missing -and
+        $f20.Directory -and -not $f20.DirAsFile -and
+        $f20.BrokenComplete -and $f20.BrokenUnknown -and -not $f20.BrokenBackedUp -and $f20.BrokenError -like '*stat failed*' -and
+        -not $f20.OverCapComplete -and $f20.OverCapEntries -eq 0
+    ) -Name 'Archive/501/F20RemoteVanishedProbeAndBackupProof' `
+      -Failure "stat зниклих у хмарі й доказ версії знімка: $($f20 | ConvertTo-Json -Compress)"
+
+    # F21 (рев'ю). Новий файл знімка не переданий (WinSCP пропустив, його
+    # видалено), під час обходу пост-аудиту його немає, а до звіряння знімка
+    # LIMS відтворює його з іншим вмістом: у хмарі немає жодної версії -> ПОМИЛКА.
+    $f21 = & $late501NewCase 'F21'
+    $f21Path = Join-Path $f21.App 'KZ\2026\pending_1.pdf'
+    $rf21 = & $late501Run -CaseRoot $f21.Root -Remote $f21.Remote -FailPaths @('KZ\2026\pending_1.pdf') -Ops @(
+        (& $late501Op 'Sync' 'Delete' $f21Path),
+        (& $late501Op 'AfterCompare' 'Write' $f21Path -Size 77)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf21.Manual.Success -and $rf21.Label -eq 'ПОМИЛКА' -and $rf21.ExitCode -eq 50 -and
+        $rf21.App.ChangedDuringSyncCount -eq 1 -and $rf21.App.RetryableRemainingCount -eq 0 -and
+        @(& $late501Errors $rf21 | Where-Object { $_.Message -like 'AUDIT BAZA_APP*[ЗМІНЕНО ПІД ЧАС СИНХРОНІЗАЦІЇ]*pending_1.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F21ReappearedWithOtherContentBetweenAuditsIsError' `
+      -Failure "файл знімка, відтворений з іншим вмістом між пост-аудитом і звірянням, без копії у хмарі — ПОМИЛКА; label=$($rf21.Label) changed=$($rf21.App.ChangedDuringSyncCount)"
+
+    # F21b. Контроль: файл знімка змінено, і WinSCP передав нову версію (у
+    # хмарі — поточна версія) -> не помилка.
+    $f21b = & $late501NewCase 'F21b'
+    $rf21b = & $late501Run -CaseRoot $f21b.Root -Remote $f21b.Remote -Ops @(& $late501Op 'Snapshot' 'Write' (Join-Path $f21b.App 'KZ\2026\synced_1.pdf') -Size 55)
+    Test-BRAVOCondition -Condition (
+        $rf21b.Manual.Success -and $rf21b.Label -eq 'УСПІШНО' -and $rf21b.App.IsComplete -and $rf21b.App.ChangedDuringSyncCount -eq 0
+    ) -Name 'Archive/501/F21bModifiedAndTransferredIsNotError' `
+      -Failure "змінений і переданий файл знімка не є порушенням; label=$($rf21b.Label) changed=$($rf21b.App.ChangedDuringSyncCount)"
+
+    # F22 (Codex QA-001). Junction, створений під час обходу знімка в уже
+    # обійденому каталозі, веде на дерево з "годинником попереду" (CreationTime
+    # у майбутньому): ReparsePointDirectoryCount знімка = 0, але кандидат іде
+    # через reparse point -> не "новий" -> ПОМИЛКА.
+    $f22 = & $late501NewCase 'F22'
+    $f22Target = Join-Path $f22.Root 'ahead-volume'
+    [void][IO.Directory]::CreateDirectory($f22Target)
+    $f22Ahead = Join-Path $f22Target 'ahead.pdf'
+    [IO.File]::WriteAllBytes($f22Ahead, [byte[]](1))
+    [IO.File]::SetCreationTimeUtc($f22Ahead, [DateTime]::UtcNow.AddHours(1))
+    $f22Link = Join-Path $f22.App 'KZ\2026\link'
+    try {
+        $rf22 = & $late501Run -CaseRoot $f22.Root -Remote $f22.Remote -FailPaths @('KZ\2026\link', 'KZ\2026\link\ahead.pdf') -Ops @(& $late501Op 'Snapshot' 'Junction' $f22Link -Target $f22Target)
+        $f22New = @(@($rf22.App.CycleClassification.NewAfterCutoff) | ForEach-Object { [string]$_.Path })
+        $f22Real = @(@($rf22.App.CycleClassification.RealMissing) | ForEach-Object { [string]$_.Path })
+        Test-BRAVOCondition -Condition (
+            $rf22.Label -eq 'ПОМИЛКА' -and $rf22.App.NewAfterCutoffCount -eq 0 -and
+            @($f22Real | Where-Object { $_ -like '*\link\ahead.pdf' }).Count -eq 1 -and
+            @($f22New | Where-Object { $_ -like '*ahead.pdf' }).Count -eq 0
+        ) -Name 'Archive/501/F22JunctionCreatedDuringSnapshotIsNotTrusted' `
+          -Failure "об'єкт за junction, створеним під час обходу знімка, не може бути 'новим'; label=$($rf22.Label) new=$($f22New -join ',') real=$($f22Real -join ',')"
+    } finally {
+        if ([IO.Directory]::Exists($f22Link)) { [IO.Directory]::Delete($f22Link) }
+    }
+
+    # F23. Зниклих об'єктів більше за ліміт перевірки у хмарі (тут ліміт 2,
+    # зникло 3 уже зарезервованих) -> доказу немає -> ПОМИЛКА, причина в журналі.
+    $f23 = & $late501NewCase 'F23'
+    $rf23 = & $late501Run -CaseRoot $f23.Root -Remote $f23.Remote -ProbeCap 2 -Ops @(
+        foreach ($n in 1..3) { & $late501Op 'Sync' 'Delete' (Join-Path $f23.App "KZ\2026\synced_$n.pdf") }
+    )
+    Test-BRAVOCondition -Condition (
+        $rf23.Label -eq 'ПОМИЛКА' -and $rf23.App.ChangedDuringSyncCount -eq 3 -and $rf23.App.VanishedAfterBackupCount -eq 0 -and
+        @(& $late501Errors $rf23 | Where-Object { $_.Message -like '*більше за ліміт перевірки 2*' }).Count -eq 1
+    ) -Name 'Archive/501/F23VanishedOverProbeLimitIsError' `
+      -Failure "понад ліміт stat зниклі об'єкти лишаються помилкою; label=$($rf23.Label) changed=$($rf23.App.ChangedDuringSyncCount)"
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
     # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.
@@ -2357,6 +2816,10 @@ try {
         $late501SyncText.IndexOf('Get-BRAVOBazaLocalSnapshot') -gt 0 -and
         $late501SyncText.IndexOf('Get-BRAVOBazaLocalSnapshot') -lt $late501SyncText.IndexOf('Start-BRAVOProcessOutputCapture') -and
         $late501SyncText.IndexOf('-LocalSnapshot $cycleSnapshot') -lt $late501SyncText.IndexOf('-Outcome $syncOutcome') -and
+        # Follow-up: межа старту — після знімка й до старту WinSCP; пост-аудит отримує знімок.
+        $late501SyncText.IndexOf('Get-BAZASyncStartBoundaryUtc') -gt $late501SyncText.IndexOf('Get-BRAVOBazaLocalSnapshot') -and
+        $late501SyncText.IndexOf('Get-BAZASyncStartBoundaryUtc') -lt $late501SyncText.IndexOf('Start-BRAVOProcessOutputCapture') -and
+        $late501SyncText.Contains('-LocalSnapshot $(if ($cycleSnapshot.Success) { $cycleSnapshot } else { $null })') -and
         @($r1.Log | Where-Object { $_.Message -like 'Знімок циклу BAZA_APP: CycleId=*; SyncStartUtc=*' }).Count -eq 1 -and
         # Нічний Main: Degraded без несумісних імен називає справжню причину (#501), а не "несумісних імен: 0".
         $archiveScriptText.Contains("об'єкти знімка синхронізовано; нові під час синхронізації буде передано наступним запуском") -and

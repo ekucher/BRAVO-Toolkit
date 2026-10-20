@@ -4597,7 +4597,12 @@ function Get-BAZASFTPComparison {
         [string]$LocalPath,
         [string]$RemotePath,
         [string]$RepositorySFTPUrl,
-        [string]$HostKey
+        [string]$HostKey,
+        # #501 (follow-up): лише для пост-аудиту legacy-циклу. Після
+        # CompareDirectories (його локальний обхід уже завершено) знімок
+        # звіряється з живим деревом, а для зниклих об'єктів робиться
+        # read-only stat у хмарі в цій самій сесії. Без знімка — як раніше.
+        [object]$LocalSnapshot = $null
     )
 
     $components = Get-BRAVOWinSCPDotNetComponents `
@@ -4721,11 +4726,20 @@ function Get-BAZASFTPComparison {
             }
         }
 
-        return [pscustomobject]@{
+        $comparisonResult = [pscustomobject]@{
             Success = $true
             Error = $null
             PendingFiles = @($pendingFiles)
         }
+        if ($null -ne $LocalSnapshot) {
+            $comparisonResult = Add-BAZASnapshotConsistencyEvidence `
+                -ComparisonResult $comparisonResult `
+                -Session $session `
+                -RemotePath $RemotePath `
+                -LocalSnapshot $LocalSnapshot `
+                -LocalPath $LocalPath
+        }
+        return $comparisonResult
     } catch {
         return [pscustomobject]@{
             Success = $false
@@ -4779,7 +4793,15 @@ function Write-BAZASFTPComparisonAudit {
     $incompatiblePendingFiles = @($pendingSplit.Incompatible)
     $missingCount = @($pendingFiles | Where-Object { $_.Action -eq "UploadNew" }).Count
     $updateCount = @($pendingFiles | Where-Object { $_.Action -eq "UploadUpdate" }).Count
-    if ($pendingFiles.Count -eq 0) {
+    # Зниклі/замінені об'єкти знімка (follow-up #501) не входять до залишку
+    # пост-аудиту, тож порожній залишок ще не означає "усе синхронізовано".
+    $snapshotDriftFileCount = 0
+    if ($null -ne $cycleClassification) {
+        $snapshotDriftFileCount = @(@($cycleClassification.ChangedDuringSync) | Where-Object { @('LocalVanished', 'LocalTypeReplaced', 'LocalModified') -contains [string]$_.Action }).Count +
+            @($cycleClassification.VanishedAfterBackup).Count
+    }
+    if ($pendingFiles.Count -eq 0 -and $snapshotDriftFileCount -eq 0 -and
+        ($null -eq $cycleClassification -or [bool]$cycleClassification.SnapshotConsistencyVerified)) {
         Write-BRAVOLog -Component 'SFTP' -Message "Аудит $ComponentName ${stageText}: усi локальнi файли синхронiзованi" -Level "SUCCESS"
         return
     }
@@ -4788,18 +4810,29 @@ function Write-BAZASFTPComparisonAudit {
         $realMissingFiles = @($cycleClassification.RealMissing)
         $changedDuringSyncFiles = @($cycleClassification.ChangedDuringSync)
         $newAfterCutoffFiles = @($cycleClassification.NewAfterCutoff)
-        $summaryLevel = if (($realMissingFiles.Count + $changedDuringSyncFiles.Count) -gt 0) {
+        $vanishedAfterBackupFiles = @($cycleClassification.VanishedAfterBackup)
+        $summaryLevel = if (($realMissingFiles.Count + $changedDuringSyncFiles.Count) -gt 0 -or
+            -not [bool]$cycleClassification.SnapshotConsistencyVerified) {
             "ERROR"
-        } else {
+        } elseif ($newAfterCutoffFiles.Count -gt 0 -or $incompatiblePendingFiles.Count -gt 0) {
             "WARNING"
+        } else {
+            "INFO"
         }
         Write-BRAVOLog -Component 'SFTP' -Message ("Аудит $ComponentName ${stageText}: очiкують передачi: $($pendingFiles.Count) (вiдсутнi у хмарi: $missingCount; потребують оновлення: $updateCount; несумісні імена: $($incompatiblePendingFiles.Count)); " +
             "за знімком циклу: не передано: $($realMissingFiles.Count); змінено під час синхронізації: $($changedDuringSyncFiles.Count); " +
-            "з'явилися під час синхронізації: $($newAfterCutoffFiles.Count)") -Level $summaryLevel
+            "з'явилися під час синхронізації: $($newAfterCutoffFiles.Count); зникли локально, версія знімка у хмарі: $($vanishedAfterBackupFiles.Count)") -Level $summaryLevel
+        if (-not [bool]$cycleClassification.SnapshotConsistencyVerified) {
+            Write-BRAVOLog -Component 'SFTP' -Message "Аудит $ComponentName ${stageText}: звіряння знімка циклу з локальним деревом не виконано ($($cycleClassification.SnapshotConsistencyError)) — зниклі об'єкти знімка не перевірено" -Level "ERROR"
+        }
+        if ($cycleClassification.RemoteProbeError) {
+            Write-BRAVOLog -Component 'SFTP' -Message "Аудит $ComponentName ${stageText}: перевірку зниклих об'єктів знімка у хмарі не завершено ($($cycleClassification.RemoteProbeError)) — їх зараховано до помилок" -Level "ERROR"
+        }
         $classifiedGroups = @(
             [pscustomobject]@{ Files = $realMissingFiles; Level = "ERROR"; Tag = "" },
             [pscustomobject]@{ Files = $changedDuringSyncFiles; Level = "ERROR"; Tag = " [ЗМІНЕНО ПІД ЧАС СИНХРОНІЗАЦІЇ]" },
-            [pscustomobject]@{ Files = $newAfterCutoffFiles; Level = "WARNING"; Tag = " [З'ЯВИВСЯ ПІД ЧАС СИНХРОНІЗАЦІЇ]" }
+            [pscustomobject]@{ Files = $newAfterCutoffFiles; Level = "WARNING"; Tag = " [З'ЯВИВСЯ ПІД ЧАС СИНХРОНІЗАЦІЇ]" },
+            [pscustomobject]@{ Files = $vanishedAfterBackupFiles; Level = "INFO"; Tag = " [ЗНИК ЛОКАЛЬНО, У ХМАРІ Є]" }
         )
         foreach ($classifiedGroup in $classifiedGroups) {
             foreach ($pendingFile in @($classifiedGroup.Files)) {
@@ -4903,6 +4936,245 @@ function Split-BAZAPendingFilesByCompatibility {
     }
 }
 
+# #501 (follow-up): межа старту передачі для класифікації NewAfterCutoff.
+# Обхід знімка неатомарний: об'єкт, що з'явився в уже обійденому каталозі,
+# відсутній у знімку, хоча існував до старту WinSCP. Тому "новим" вважається
+# лише об'єкт, створений СТРОГО ПІСЛЯ цієї межі (CreationTimeUtc > межа).
+# Межа читається на фронті тіку системного годинника (CreationTime NTFS
+# береться з того самого грубого годинника), а WinSCP стартує лише після
+# наступного тіку — файли, створені після старту, мають час більший за межу.
+# Крок годинника назад (звірка з Stopwatch від початку знімка) або годинник,
+# що не рухається, — межу не встановлено: NewAfterCutoff неможливий
+# (fail-closed). Затримка — не більше двох тіків годинника.
+function Get-BAZASyncStartBoundaryUtc {
+    param(
+        [Nullable[datetime]]$ReferenceUtc = $null,
+        [Diagnostics.Stopwatch]$ReferenceStopwatch = $null
+    )
+
+    $notEstablished = { param([string]$Reason) [pscustomobject]@{ Established = $false; BoundaryUtc = $null; Reason = $Reason } }
+    $maximumWaitIterations = 200
+    $first = [DateTime]::UtcNow
+    $boundary = $first
+    $iteration = 0
+    while ($boundary -eq $first -and $iteration -lt $maximumWaitIterations) {
+        [Threading.Thread]::Sleep(1)
+        $boundary = [DateTime]::UtcNow
+        $iteration++
+    }
+    if ($boundary -le $first) {
+        return (& $notEstablished 'системний годинник не рухається вперед')
+    }
+    if ($null -ne $ReferenceUtc -and $null -ne $ReferenceStopwatch) {
+        # Настінний час не може відстати від монотонного Stopwatch більш ніж
+        # на дискретність годинника; більше — крок годинника назад під час
+        # знімка, і час створення файлів уже не зіставний з межею.
+        $wallElapsed = $boundary - ([datetime]$ReferenceUtc).ToUniversalTime()
+        $monotonicElapsed = $ReferenceStopwatch.Elapsed
+        if ($wallElapsed -lt ($monotonicElapsed - [TimeSpan]::FromMilliseconds(100))) {
+            return (& $notEstablished "системний годинник зсунувся назад під час знімка (настінний: $([int]$wallElapsed.TotalMilliseconds) мс; монотонний: $([int]$monotonicElapsed.TotalMilliseconds) мс)")
+        }
+    }
+    $after = $boundary
+    $iteration = 0
+    while ($after -le $boundary -and $iteration -lt $maximumWaitIterations) {
+        [Threading.Thread]::Sleep(1)
+        $after = [DateTime]::UtcNow
+        $iteration++
+    }
+    if ($after -le $boundary) {
+        return (& $notEstablished 'системний годинник не рухається вперед')
+    }
+    return [pscustomobject]@{ Established = $true; BoundaryUtc = $boundary; Reason = $null }
+}
+
+# CreationTimeUtc можна зіставляти з межею старту лише тоді, коли його ставить
+# годинник цього хоста: локальний Fixed-том NTFS/ReFS, без UNC/мережевого
+# диска, без reparse point у корені, його предках і в дереві знімка (за
+# junction/mount point може бути інший том). FAT/exFAT зберігає локальний час
+# (перехід на літній час ламає порівняння). Інакше — недовіра (fail-closed).
+function Test-BAZACreationClockTrusted {
+    param(
+        [string]$LocalRoot,
+        [object]$LocalSnapshot = $null
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LocalRoot) -or $LocalRoot.StartsWith('\\') -or $LocalRoot.StartsWith('//')) {
+        return $false
+    }
+    try {
+        $fullRoot = [IO.Path]::GetFullPath($LocalRoot)
+        if ($fullRoot.StartsWith('\\')) {
+            return $false
+        }
+        $drive = New-Object IO.DriveInfo([IO.Path]::GetPathRoot($fullRoot))
+        if ($drive.DriveType -ne [IO.DriveType]::Fixed -or
+            @('NTFS', 'ReFS') -notcontains [string]$drive.DriveFormat) {
+            return $false
+        }
+        $directory = New-Object IO.DirectoryInfo($fullRoot)
+        while ($null -ne $directory) {
+            if ($directory.Exists -and
+                ([int]$directory.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $false
+            }
+            $directory = $directory.Parent
+        }
+    } catch {
+        return $false
+    }
+    if ($null -ne $LocalSnapshot) {
+        $reparseProperty = $LocalSnapshot.PSObject.Properties['ReparsePointDirectoryCount']
+        if ($null -eq $reparseProperty -or $null -eq $reparseProperty.Value -or [int]$reparseProperty.Value -ne 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
+# Read-only stat у хмарі ЛИШЕ для об'єктів знімка, що зникли локально (не
+# повний обхід хмари). Обмеження кількості: понад нього доказ не збирається,
+# і зниклі об'єкти лишаються помилкою (fail-closed) — масове зникнення
+# локальних файлів аномальне й не повинне розтягувати цикл.
+function Get-BAZARemoteVanishedProbe {
+    param(
+        [object]$Session,
+        [string]$RemotePath,
+        [object[]]$Vanished = @(),
+        [int]$MaximumProbeCount = 1000
+    )
+
+    $entries = @{}
+    $vanishedItems = @($Vanished)
+    if ($vanishedItems.Count -gt $MaximumProbeCount) {
+        return [pscustomobject]@{ Complete = $false; Error = "зниклих або змінених об'єктів знімка $($vanishedItems.Count) — більше за ліміт перевірки $MaximumProbeCount"; Entries = $entries }
+    }
+    $remoteRoot = $RemotePath.TrimEnd('/')
+    $failedCount = 0
+    $firstError = $null
+    foreach ($vanishedItem in $vanishedItems) {
+        $relativePath = [string]$vanishedItem.RelativePath
+        $remoteItemPath = $remoteRoot + '/' + $relativePath.Replace('\', '/')
+        try {
+            if (-not $Session.FileExists($remoteItemPath)) {
+                $entries[$relativePath] = [pscustomobject]@{ Exists = $false; IsDirectory = $false; Size = $null; LastWriteTimeUtc = $null }
+                continue
+            }
+            $remoteInfo = $Session.GetFileInfo($remoteItemPath)
+            $entries[$relativePath] = [pscustomobject]@{
+                Exists = $true
+                IsDirectory = [bool]$remoteInfo.IsDirectory
+                Size = [long]$remoteInfo.Length
+                LastWriteTimeUtc = ([datetime]$remoteInfo.LastWriteTime).ToUniversalTime()
+            }
+        } catch {
+            # Збій stat одного шляху робить невідомим лише цей об'єкт
+            # (Exists = $null -> не доведено -> помилка), а не всю перевірку.
+            $failedCount++
+            if ($null -eq $firstError) { $firstError = "перевірка $remoteItemPath у хмарі: $($_.Exception.Message)" }
+            $entries[$relativePath] = [pscustomobject]@{ Exists = $null; IsDirectory = $false; Size = $null; LastWriteTimeUtc = $null }
+        }
+    }
+    return [pscustomobject]@{
+        Complete = $true
+        Error = $(if ($failedCount -gt 0) { "не перевірено у хмарі: $failedCount; $firstError" } else { $null })
+        Entries = $entries
+    }
+}
+
+# Пост-аудит legacy-циклу (після CompareDirectories, тобто після його
+# локального обходу): звіряння знімка з живим деревом і read-only stat у
+# хмарі для об'єктів знімка, яких пост-аудит міг не побачити — зниклих і
+# змінених (зник під час обходу пост-аудиту й з'явився знову з іншим
+# вмістом). Спільна для справжнього пост-аудиту й self-test (сесія — будь-
+# який об'єкт із FileExists/GetFileInfo WinSCP .NET Session).
+function Add-BAZASnapshotConsistencyEvidence {
+    param(
+        [object]$ComparisonResult,
+        [object]$Session,
+        [string]$RemotePath,
+        [object]$LocalSnapshot,
+        [string]$LocalPath,
+        [int]$MaximumProbeCount = 1000
+    )
+
+    $snapshotDrift = Compare-BRAVOBazaLocalSnapshotToLiveTree -Snapshot $LocalSnapshot -LocalDirectory $LocalPath
+    $remoteProbe = if ([bool]$snapshotDrift.Success) {
+        Get-BAZARemoteVanishedProbe `
+            -Session $Session `
+            -RemotePath $RemotePath `
+            -Vanished (@($snapshotDrift.Vanished) + @($snapshotDrift.Modified)) `
+            -MaximumProbeCount $MaximumProbeCount
+    } else {
+        $null
+    }
+    $ComparisonResult | Add-Member -NotePropertyName SnapshotDrift -NotePropertyValue $snapshotDrift -Force
+    $ComparisonResult | Add-Member -NotePropertyName RemoteProbe -NotePropertyValue $remoteProbe -Force
+    return $ComparisonResult
+}
+
+# Об'єкт поза знімком "новий" лише тоді, коли його CreationTime ставить
+# годинник цього тому: шлях від кореня до об'єкта (включно) не проходить
+# через reparse point. Junction/symlink, створений під час неатомарного
+# обходу знімка в уже обійденому каталозі, у ReparsePointDirectoryCount
+# знімка не потрапляє — тому перевіряється живий ланцюг кожного кандидата.
+function Test-BAZAPathHasReparsePoint {
+    param(
+        [string]$FullPath,
+        [string]$NormalizedRoot
+    )
+
+    try {
+        $item = if ([IO.Directory]::Exists($FullPath)) { New-Object IO.DirectoryInfo($FullPath) } else { New-Object IO.FileInfo($FullPath) }
+        if (-not $item.Exists -or ([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $true
+        }
+        $directory = if ($item -is [IO.DirectoryInfo]) { $item.Parent } else { $item.Directory }
+        while ($null -ne $directory -and
+            $directory.FullName.TrimEnd('\', '/').Length -gt $NormalizedRoot.Length) {
+            if (([int]$directory.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $true
+            }
+            $directory = $directory.Parent
+        }
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+# Зниклий локально об'єкт знімка доведено зарезервований, якщо в хмарі є
+# об'єкт того самого типу, а для файла — той самий розмір і той самий час
+# модифікації з точністю SFTP (секунди) — тобто саме версія знімка. Інакше
+# (немає в хмарі, інша версія — напр. змінений і перезалитий -mirror перед
+# видаленням, перевірка не вдалася) — порушення консистентності знімка.
+function Test-BAZAVanishedSnapshotObjectBackedUp {
+    param(
+        [object]$Vanished,
+        [object]$SnapshotEntry,
+        [object]$Probe
+    )
+
+    if ($null -eq $Probe -or -not [bool]$Probe.Exists -or [bool]$Probe.IsDirectory -ne [bool]$Vanished.IsDirectory) {
+        return $false
+    }
+    if ([bool]$Vanished.IsDirectory) {
+        return $true
+    }
+    if ($null -eq $SnapshotEntry -or $null -eq $Probe.Size -or $null -eq $Probe.LastWriteTimeUtc -or
+        [long]$Probe.Size -ne [long]$SnapshotEntry.Size) {
+        return $false
+    }
+    $snapshotTime = [datetime]::MinValue
+    if (-not [datetime]::TryParse([string]$SnapshotEntry.LastWriteTimeUtc, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$snapshotTime)) {
+        return $false
+    }
+    $snapshotTicks = $snapshotTime.ToUniversalTime().Ticks
+    $remoteTicks = ([datetime]$Probe.LastWriteTimeUtc).ToUniversalTime().Ticks
+    return (($snapshotTicks - ($snapshotTicks % [TimeSpan]::TicksPerSecond)) -eq ($remoteTicks - ($remoteTicks % [TimeSpan]::TicksPerSecond)))
+}
+
 # #501: залишок пост-аудиту legacy-синхронізації класифікується за знімком
 # локального дерева, зробленим безпосередньо перед стартом WinSCP
 # (Get-BRAVOBazaLocalSnapshot), а не за LastWriteTime: новий файл може мати
@@ -4911,22 +5183,41 @@ function Split-BAZAPendingFilesByCompatibility {
 #   ChangedDuringSync — об'єкт був у знімку, але його розмір/час змінилися,
 #                       його вже немає або шлях змінив тип (файл <-> каталог)
 #                       (окремий mutation-клас, не маскується попередженням);
-#   NewAfterCutoff    — UploadNew-об'єкт, якого не було у знімку: з'явився
-#                       під час циклу й буде переданий наступним запуском.
+#   NewAfterCutoff    — UploadNew-об'єкт, якого не було у знімку і який
+#                       створено строго після межі старту передачі
+#                       (Get-BAZASyncStartBoundaryUtc) на томі з довіреним
+#                       годинником: з'явився під час циклу й буде переданий
+#                       наступним запуском.
 # Усе, що не зіставляється зі знімком однозначно (знімок недоступний,
 # невідомий/відносний шлях, шлях поза коренем, UploadUpdate для об'єкта поза
-# знімком), — RealMissing: fail-closed, як до #501. Час порівнюється точно
-# ('o', до тіку), без довільного запасу.
+# знімком, об'єкт поза знімком, створений до межі — пропущений неатомарним
+# обходом, перейменований/переміщений зі збереженням CreationTime, або межу
+# не встановлено), — RealMissing: fail-closed, як до #501. Час порівнюється
+# точно ('o', до тіку), без довільного запасу.
+#
+# Follow-up: SnapshotDrift (Compare-BRAVOBazaLocalSnapshotToLiveTree після
+# пост-аудиту) виявляє об'єкти знімка, яких пост-аудит не бачить, бо їх уже
+# немає локально:
+#   ChangedDuringSync  — шлях знімка змінив тип або зник, а в хмарі немає саме
+#                        версії знімка (RemoteProbe);
+#   VanishedAfterBackup — зник локально, але в хмарі є версія знімка (той
+#                        самий тип, розмір і час): резерв цілий, не помилка.
+# Недоступне звіряння (SnapshotConsistencyVerified = $false) — fail-closed.
 function Get-BAZAPendingFileCycleClassification {
     param(
         [object[]]$PendingFiles = @(),
         [object]$LocalSnapshot,
-        [string]$LocalRoot
+        [string]$LocalRoot,
+        [Nullable[datetime]]$SyncStartUtc = $null,
+        [object]$SnapshotDrift = $null,
+        [object]$RemoteProbe = $null
     )
 
     $realMissing = New-Object System.Collections.Generic.List[object]
     $changedDuringSync = New-Object System.Collections.Generic.List[object]
     $newAfterCutoff = New-Object System.Collections.Generic.List[object]
+    $vanishedAfterBackup = New-Object System.Collections.Generic.List[object]
+    $pendingRelativePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
     $snapshotAvailable = (
         $null -ne $LocalSnapshot -and
@@ -4942,6 +5233,11 @@ function Get-BAZAPendingFileCycleClassification {
         } catch {
             $snapshotAvailable = $false
         }
+    }
+    $boundaryTicks = $null
+    if ($snapshotAvailable -and $null -ne $SyncStartUtc -and
+        (Test-BAZACreationClockTrusted -LocalRoot $LocalRoot -LocalSnapshot $LocalSnapshot)) {
+        $boundaryTicks = ([datetime]$SyncStartUtc).ToUniversalTime().Ticks
     }
 
     foreach ($pendingFile in @($PendingFiles)) {
@@ -4981,6 +5277,7 @@ function Get-BAZAPendingFileCycleClassification {
             $realMissing.Add($pendingFile)
             continue
         }
+        [void]$pendingRelativePaths.Add($relativePath)
 
         # Шлях, що був у знімку об'єктом іншого типу (каталог замінено файлом
         # або навпаки), — заміна під час циклу, а не новий об'єкт.
@@ -4990,12 +5287,16 @@ function Get-BAZAPendingFileCycleClassification {
             continue
         }
 
-        # Новим може бути лише об'єкт, що зараз існує саме за цим шляхом:
-        # інакше шлях від WinSCP не відповідає дереву, і зіставлення ненадійне.
+        # Новим може бути лише об'єкт, що зараз існує саме за цим шляхом
+        # (інакше шлях від WinSCP не відповідає дереву, і зіставлення
+        # ненадійне) і створений строго після межі старту передачі.
         if ($isDirectory) {
             if ($action -eq 'UploadNew' -and
+                $null -ne $boundaryTicks -and
                 [IO.Directory]::Exists($fullPath) -and
-                -not $LocalSnapshot.Directories.Contains($relativePath)) {
+                -not $LocalSnapshot.Directories.Contains($relativePath) -and
+                -not (Test-BAZAPathHasReparsePoint -FullPath $fullPath -NormalizedRoot $normalizedRoot) -and
+                [IO.Directory]::GetCreationTimeUtc($fullPath).Ticks -gt $boundaryTicks) {
                 $newAfterCutoff.Add($pendingFile)
             } else {
                 $realMissing.Add($pendingFile)
@@ -5016,18 +5317,103 @@ function Get-BAZAPendingFileCycleClassification {
             continue
         }
 
-        if ($action -eq 'UploadNew' -and [IO.File]::Exists($fullPath)) {
+        if ($action -eq 'UploadNew' -and
+            $null -ne $boundaryTicks -and
+            [IO.File]::Exists($fullPath) -and
+            -not (Test-BAZAPathHasReparsePoint -FullPath $fullPath -NormalizedRoot $normalizedRoot) -and
+            [IO.File]::GetCreationTimeUtc($fullPath).Ticks -gt $boundaryTicks) {
             $newAfterCutoff.Add($pendingFile)
         } else {
             $realMissing.Add($pendingFile)
         }
     }
 
+    # Об'єкти знімка, яких пост-аудит не повертає (зникли або змінили тип
+    # локально). Шлях, що вже є в залишку пост-аудиту, класифіковано вище.
+    $snapshotConsistencyVerified = $true
+    if ($snapshotAvailable) {
+        $driftAvailable = $null -ne $SnapshotDrift -and [bool]$SnapshotDrift.Success
+        if (-not $driftAvailable) {
+            $snapshotConsistencyVerified = $false
+        } else {
+            foreach ($replaced in @($SnapshotDrift.TypeReplaced)) {
+                $replacedPath = [string]$replaced.RelativePath
+                if ($pendingRelativePaths.Contains($replacedPath)) { continue }
+                $changedDuringSync.Add([pscustomobject]@{
+                    Action = 'LocalTypeReplaced'
+                    Reason = "шлях знімка змінив тип (файл <-> каталог)"
+                    Path = Join-Path -Path $normalizedRoot -ChildPath $replacedPath
+                    IsDirectory = -not [bool]$replaced.WasDirectory
+                    SizeBytes = $null
+                })
+            }
+            $probeComplete = $null -ne $RemoteProbe -and [bool]$RemoteProbe.Complete -and $null -ne $RemoteProbe.Entries
+            foreach ($vanished in @($SnapshotDrift.Vanished)) {
+                $vanishedPath = [string]$vanished.RelativePath
+                if ($pendingRelativePaths.Contains($vanishedPath)) { continue }
+                $snapshotEntry = if ([bool]$vanished.IsDirectory) { $null } else { $LocalSnapshot.Entries[$vanishedPath] }
+                $probe = if ($probeComplete -and $RemoteProbe.Entries.ContainsKey($vanishedPath)) { $RemoteProbe.Entries[$vanishedPath] } else { $null }
+                $vanishedItem = [pscustomobject]@{
+                    Action = 'LocalVanished'
+                    Reason = $null
+                    Path = Join-Path -Path $normalizedRoot -ChildPath $vanishedPath
+                    IsDirectory = [bool]$vanished.IsDirectory
+                    SizeBytes = $(if ($null -ne $snapshotEntry) { [long]$snapshotEntry.Size } else { $null })
+                }
+                if (Test-BAZAVanishedSnapshotObjectBackedUp -Vanished $vanished -SnapshotEntry $snapshotEntry -Probe $probe) {
+                    $vanishedItem.Reason = "зник локально; версія знімка вже є у хмарі"
+                    $vanishedAfterBackup.Add($vanishedItem)
+                } else {
+                    $vanishedItem.Reason = "зник локально під час синхронізації; версії знімка у хмарі не підтверджено"
+                    $changedDuringSync.Add($vanishedItem)
+                }
+            }
+            # Змінений файл знімка без залишку в пост-аудиті: або WinSCP
+            # передав нову версію (у хмарі — поточна версія), або файла не
+            # було під час обходу пост-аудиту й він з'явився знову з іншим
+            # вмістом (у хмарі — нічого). Приймається лише версія знімка або
+            # поточна жива версія у хмарі; інакше — ChangedDuringSync.
+            foreach ($modifiedItem in @($SnapshotDrift.Modified)) {
+                $modifiedPath = [string]$modifiedItem.RelativePath
+                if ($pendingRelativePaths.Contains($modifiedPath)) { continue }
+                $snapshotEntry = $LocalSnapshot.Entries[$modifiedPath]
+                $modifiedFullPath = Join-Path -Path $normalizedRoot -ChildPath $modifiedPath
+                $probe = if ($probeComplete -and $RemoteProbe.Entries.ContainsKey($modifiedPath)) { $RemoteProbe.Entries[$modifiedPath] } else { $null }
+                $liveFile = New-Object IO.FileInfo($modifiedFullPath)
+                $liveEntry = if ($liveFile.Exists) {
+                    [pscustomobject]@{ Size = [long]$liveFile.Length; LastWriteTimeUtc = $liveFile.LastWriteTimeUtc.ToString('o') }
+                } else {
+                    $null
+                }
+                $fileProbeShape = [pscustomobject]@{ RelativePath = $modifiedPath; IsDirectory = $false }
+                $remoteHoldsKnownVersion = (
+                    (Test-BAZAVanishedSnapshotObjectBackedUp -Vanished $fileProbeShape -SnapshotEntry $snapshotEntry -Probe $probe) -or
+                    ($null -ne $liveEntry -and (Test-BAZAVanishedSnapshotObjectBackedUp -Vanished $fileProbeShape -SnapshotEntry $liveEntry -Probe $probe))
+                )
+                if (-not $remoteHoldsKnownVersion) {
+                    $changedDuringSync.Add([pscustomobject]@{
+                        Action = 'LocalModified'
+                        Reason = "змінено локально під час синхронізації; у хмарі немає ні версії знімка, ні поточної версії"
+                        Path = $modifiedFullPath
+                        IsDirectory = $false
+                        SizeBytes = $(if ($null -ne $liveEntry) { [long]$liveEntry.Size } else { $null })
+                    })
+                }
+            }
+        }
+    }
+
     return [pscustomobject]@{
         SnapshotAvailable = $snapshotAvailable
+        SnapshotConsistencyVerified = $snapshotConsistencyVerified
+        SnapshotConsistencyError = $(if ($snapshotAvailable -and -not $snapshotConsistencyVerified) {
+            if ($null -ne $SnapshotDrift -and $null -ne $SnapshotDrift.PSObject.Properties['Error'] -and $SnapshotDrift.Error) { [string]$SnapshotDrift.Error } else { "звіряння знімка з деревом не виконано" }
+        } else { $null })
+        RemoteProbeError = $(if ($null -ne $RemoteProbe -and $RemoteProbe.Error) { [string]$RemoteProbe.Error } else { $null })
         RealMissing = @($realMissing.ToArray())
         ChangedDuringSync = @($changedDuringSync.ToArray())
         NewAfterCutoff = @($newAfterCutoff.ToArray())
+        VanishedAfterBackup = @($vanishedAfterBackup.ToArray())
     }
 }
 
@@ -5042,7 +5428,10 @@ function Get-BAZASynchronizationOutcome {
         # поведінка до #501.
         [object]$LocalSnapshot = $null,
         [string]$LocalRoot = $null,
-        [string]$CycleId = $null
+        [string]$CycleId = $null,
+        # Межа старту передачі (Get-BAZASyncStartBoundaryUtc). Без неї
+        # NewAfterCutoff неможливий: увесь залишок поза знімком — RealMissing.
+        [Nullable[datetime]]$SyncStartUtc = $null
     )
 
     $verificationSucceeded = $null -ne $ComparisonAfter -and $ComparisonAfter.Success
@@ -5053,17 +5442,36 @@ function Get-BAZASynchronizationOutcome {
     } else {
         $null
     }
+    # Звіряння знімка з деревом і stat хмари робить пост-аудит (після
+    # CompareDirectories), тож вони приходять разом із ним.
+    $snapshotDrift = if ($verificationSucceeded -and $null -ne $ComparisonAfter.PSObject.Properties['SnapshotDrift']) { $ComparisonAfter.SnapshotDrift } else { $null }
+    $remoteProbe = if ($verificationSucceeded -and $null -ne $ComparisonAfter.PSObject.Properties['RemoteProbe']) { $ComparisonAfter.RemoteProbe } else { $null }
     $cycleClassification = if ($verificationSucceeded) {
         Get-BAZAPendingFileCycleClassification `
             -PendingFiles @($afterSplit.Retryable) `
             -LocalSnapshot $LocalSnapshot `
-            -LocalRoot $LocalRoot
+            -LocalRoot $LocalRoot `
+            -SyncStartUtc $SyncStartUtc `
+            -SnapshotDrift $snapshotDrift `
+            -RemoteProbe $remoteProbe
     } else {
         $null
     }
     $realMissingCount = if ($null -ne $cycleClassification) { @($cycleClassification.RealMissing).Count } else { $null }
     $changedDuringSyncCount = if ($null -ne $cycleClassification) { @($cycleClassification.ChangedDuringSync).Count } else { $null }
     $newAfterCutoffCount = if ($null -ne $cycleClassification) { @($cycleClassification.NewAfterCutoff).Count } else { $null }
+    $vanishedAfterBackupCount = if ($null -ne $cycleClassification) { @($cycleClassification.VanishedAfterBackup).Count } else { $null }
+    # Порушення консистентності знімка, яких немає в залишку пост-аудиту
+    # (зникнення/заміна типу або неможливість це перевірити): цикл не повний.
+    $snapshotConsistencyVerified = $null -eq $cycleClassification -or
+        -not [bool]$cycleClassification.SnapshotAvailable -or
+        [bool]$cycleClassification.SnapshotConsistencyVerified
+    $snapshotDriftViolationCount = if ($null -ne $cycleClassification) {
+        @(@($cycleClassification.ChangedDuringSync) | Where-Object { @('LocalVanished', 'LocalTypeReplaced', 'LocalModified') -contains [string]$_.Action }).Count
+    } else {
+        0
+    }
+    $snapshotConsistent = $snapshotConsistencyVerified -and $snapshotDriftViolationCount -eq 0
     $beforeSplit = if ($null -ne $ComparisonBefore -and $ComparisonBefore.Success) {
         Split-BAZAPendingFilesByCompatibility `
             -PendingFiles @($ComparisonBefore.PendingFiles) `
@@ -5109,19 +5517,23 @@ function Get-BAZASynchronizationOutcome {
         IncompatibleRemainingCount = $incompatibleRemainingCount
         SnapshotAvailable = ($null -ne $cycleClassification -and [bool]$cycleClassification.SnapshotAvailable)
         CycleId = $CycleId
-        SyncStartUtc = if ($null -ne $LocalSnapshot -and $null -ne $LocalSnapshot.PSObject.Properties['SnapshotUtc']) {
-            ([datetime]$LocalSnapshot.SnapshotUtc).ToUniversalTime().ToString('o')
+        SyncStartUtc = if ($null -ne $SyncStartUtc) {
+            ([datetime]$SyncStartUtc).ToUniversalTime().ToString('o')
         } else {
             $null
         }
         RealMissingCount = $realMissingCount
         ChangedDuringSyncCount = $changedDuringSyncCount
         NewAfterCutoffCount = $newAfterCutoffCount
+        VanishedAfterBackupCount = $vanishedAfterBackupCount
+        SnapshotConsistencyVerified = $snapshotConsistencyVerified
+        SnapshotDriftViolationCount = $snapshotDriftViolationCount
         CycleClassification = $cycleClassification
         IsComplete = (
             $WinSCPExitCode -eq 0 -and
             $verificationSucceeded -and
-            $retryableRemainingCount -eq 0
+            $retryableRemainingCount -eq 0 -and
+            $snapshotConsistent
         )
         # #501: усе зі знімка передано, а залишок — лише об'єкти, що
         # з'явилися під час циклу. Код WinSCP 0 обов'язковий: ненульовий код
@@ -5134,7 +5546,8 @@ function Get-BAZASynchronizationOutcome {
             [bool]$cycleClassification.SnapshotAvailable -and
             $newAfterCutoffCount -gt 0 -and
             $realMissingCount -eq 0 -and
-            $changedDuringSyncCount -eq 0
+            $changedDuringSyncCount -eq 0 -and
+            $snapshotConsistent
         )
         IsDegraded = (
             $WinSCPExitCode -eq 0 -and
@@ -5867,15 +6280,31 @@ exit
         # не зупиняє синхронізацію, але вимикає класифікацію: увесь залишок
         # лишається помилкою, як до #501.
         $cycleId = New-BRAVOBazaCycleId
+        $snapshotStartUtc = [DateTime]::UtcNow
+        $snapshotStopwatch = [Diagnostics.Stopwatch]::StartNew()
         $cycleSnapshot = Get-BRAVOBazaLocalSnapshot `
             -LocalDirectory $LocalDirectory `
             -IncludeHiddenSystem `
             -IncludeDirectories
+        # Follow-up #501: межа старту передачі — після знімка, безпосередньо
+        # перед стартом WinSCP. Новим вважається лише об'єкт, створений після неї.
+        $syncStartBoundary = $null
         if ($cycleSnapshot.Success) {
+            $syncStartBoundary = Get-BAZASyncStartBoundaryUtc -ReferenceUtc $snapshotStartUtc -ReferenceStopwatch $snapshotStopwatch
+            $boundaryText = if ($syncStartBoundary.Established) {
+                ([datetime]$syncStartBoundary.BoundaryUtc).ToString('o')
+            } else {
+                "не встановлено"
+            }
             Write-BRAVOLog -Component 'SFTP' -Message (
-                "Знімок циклу ${ComponentName}: CycleId=$cycleId; SyncStartUtc=$(([datetime]$cycleSnapshot.SnapshotUtc).ToString('o')); " +
+                "Знімок циклу ${ComponentName}: CycleId=$cycleId; SyncStartUtc=$boundaryText; " +
                 "файлів: $($cycleSnapshot.Entries.Count); каталогів: $($cycleSnapshot.Directories.Count)"
             ) -Level "INFO"
+            if (-not $syncStartBoundary.Established) {
+                Write-BRAVOLog -Component 'SFTP' -Message "Межу старту синхронізації $ComponentName не встановлено ($($syncStartBoundary.Reason)): об'єкти, що з'являться під час синхронізації, не відрізнятимуться від непереданих" -Level "WARNING"
+            } elseif (-not (Test-BAZACreationClockTrusted -LocalRoot $LocalDirectory -LocalSnapshot $cycleSnapshot)) {
+                Write-BRAVOLog -Component 'SFTP' -Message "Каталог $ComponentName не на локальному томі NTFS/ReFS або містить junction/mount point: час створення файлів не порівнюється з межею старту, об'єкти, що з'являться під час синхронізації, не відрізнятимуться від непереданих" -Level "WARNING"
+            }
         } else {
             Write-BRAVOLog -Component 'SFTP' -Message "Знімок циклу $ComponentName не створено ($($cycleSnapshot.Error)): об'єкти, що з'являться під час синхронізації, не відрізнятимуться від непереданих" -Level "WARNING"
         }
@@ -5955,11 +6384,14 @@ exit
         # option batch continue може повернути код 0, навіть якщо окремі файли
         # були пропущені. Тому остаточний результат визначає лише повторне
         # read-only порівняння локального каталогу з хмарою.
+        # Зі знімком пост-аудит ще й звіряє знімок із деревом (виявляє об'єкти
+        # знімка, що зникли локально й тому відсутні в його залишку).
         $comparisonAfter = Get-BAZASFTPComparison `
             -LocalPath $LocalDirectory `
             -RemotePath $remotePath `
             -RepositorySFTPUrl $RepositorySFTPUrl `
-            -HostKey $HostKey
+            -HostKey $HostKey `
+            -LocalSnapshot $(if ($cycleSnapshot.Success) { $cycleSnapshot } else { $null })
         $syncOutcome = Get-BAZASynchronizationOutcome `
             -WinSCPExitCode $winSCPExitCode `
             -ComparisonBefore $comparisonBefore `
@@ -5967,7 +6399,8 @@ exit
             -IncompatibleIssues $(if ($nameCompatibility.Success) { @($nameCompatibility.Issues) } else { @() }) `
             -LocalSnapshot $cycleSnapshot `
             -LocalRoot $LocalDirectory `
-            -CycleId $cycleId
+            -CycleId $cycleId `
+            -SyncStartUtc $(if ($null -ne $syncStartBoundary -and $syncStartBoundary.Established) { [datetime]$syncStartBoundary.BoundaryUtc } else { $null })
         $script:lastBAZASyncOutcome = $syncOutcome
         Write-BAZASFTPComparisonAudit `
             -Comparison $comparisonAfter `
@@ -6026,6 +6459,17 @@ exit
                 ""
             }
             Write-BRAVOLog -Component 'SFTP' -Message "WinSCP повернув код 0, але синхронiзацiя $ComponentName часткова: залишилося об'єктiв: $($syncOutcome.RemainingCount)$partialBreakdown" -Level "ERROR"
+        }
+        if ($winSCPExitCode -eq 0 -and -not $syncOutcome.IsPartial) {
+            # Залишку пост-аудиту немає, але знімок циклу порушено: об'єкти
+            # знімка зникли/змінили тип без підтвердженої версії у хмарі або
+            # звіряння не вдалося.
+            $driftReason = if (-not $syncOutcome.SnapshotConsistencyVerified) {
+                "звіряння знімка циклу з локальним деревом не виконано"
+            } else {
+                "об'єкти знімка циклу зникли або змінили тип локально без підтвердженої версії знімка у хмарі: $($syncOutcome.SnapshotDriftViolationCount)"
+            }
+            Write-BRAVOLog -Component 'SFTP' -Message "WinSCP повернув код 0, але синхронiзацiю $ComponentName не підтверджено: $driftReason (див. рядки AUDIT цього циклу)" -Level "ERROR"
         }
         return $false
     } catch {
