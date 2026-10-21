@@ -29,6 +29,7 @@ try {
     }
 
     $dpapiPath = Join-Path $credSandbox 'creds\anthropic-test.dpapi'
+Assert-ApiPoolTestPathInSandbox -Path $dpapiPath
     $provider = New-ApiPoolCredentialProvider -Kind Dpapi -SecretPath $dpapiPath
 
     # ---------------- Missing / empty / corrupted ----------------
@@ -137,13 +138,35 @@ try {
     }
 
     # ---------------- F1-5: SecretPath guard ----------------
+    # Real-system forbidden paths go ONLY to the pure validator first; a write function is invoked only if the
+    # validator rejected the path (Invoke-ApiPoolGuardedRefusal). Relative paths are validator-only (no CWD dependence).
     $credRepoRoot = Split-Path -Parent (Split-Path -Parent $script:ApiRoot)
-    $badSecretPaths = @('creds\relative.dpapi', '\\localhost\C$\x\s.dpapi', '//localhost/C$/x/s.dpapi', '\\?\C:\x\s.dpapi', '\\.\C:\x\s.dpapi', 'C:\ProgramData\BRAVO\s.dpapi', (Join-Path $credRepoRoot 'x\s.dpapi'))
-    foreach ($bad in $badSecretPaths) {
+    $realBadPaths = @('\\localhost\C$\x\s.dpapi', '//localhost/C$/x/s.dpapi', '\\127.0.0.1\c$\x\s.dpapi', '\\?\C:\x\s.dpapi', '\\.\C:\x\s.dpapi', 'C:\ProgramData\BRAVO\s.dpapi', (Join-Path $credRepoRoot 'x\s.dpapi'))
+    foreach ($bad in $realBadPaths) {
         $badSecure = New-CredTestSecure $credFake
-        Assert-ApiPoolThrows { New-ApiPoolCredentialProvider -Kind Dpapi -SecretPath $bad } ('SecretPath/Provider/' + $bad) -ExpectedCode 'STATE_PATH_FORBIDDEN'
-        Assert-ApiPoolThrows { Set-ApiPoolCredential -SecretPath $bad -Secret $badSecure } ('SecretPath/Set/' + $bad) -ExpectedCode 'STATE_PATH_FORBIDDEN'
-        Assert-ApiPoolThrows { Restore-ApiPoolPreviousCredential -SecretPath $bad } ('SecretPath/Restore/' + $bad) -ExpectedCode 'STATE_PATH_FORBIDDEN'
+        Invoke-ApiPoolGuardedRefusal -Path $bad -Name ('SecretPath/Provider/' + $bad) -ScriptBlock { New-ApiPoolCredentialProvider -Kind Dpapi -SecretPath $bad }
+        Invoke-ApiPoolGuardedRefusal -Path $bad -Name ('SecretPath/Set/' + $bad) -ScriptBlock { Set-ApiPoolCredential -SecretPath $bad -Secret $badSecure }
+        Invoke-ApiPoolGuardedRefusal -Path $bad -Name ('SecretPath/Restore/' + $bad) -ScriptBlock { Restore-ApiPoolPreviousCredential -SecretPath $bad }
+    }
+    foreach ($rel in @('creds\relative.dpapi', '.\relative.dpapi', 'relative.dpapi')) {
+        Assert-ApiPoolThrows { Assert-ApiPoolSafePath -Path $rel -Purpose 'SecretPath' } ('SecretPath/RelativeValidator/' + $rel) -ExpectedCode 'STATE_PATH_FORBIDDEN'
+    }
+    # Structural refusal inside the sandbox: a junction ancestor (a regressed guard would write into the sandbox only).
+    $credJTarget = Join-Path $credSandbox 'j-target'
+    $credJLink = Join-Path $credSandbox 'j-link'
+    [void][System.IO.Directory]::CreateDirectory($credJTarget)
+    $null = & cmd.exe /c ('mklink /J "{0}" "{1}"' -f $credJLink, $credJTarget)
+    Assert-ApiPoolTrue ([System.IO.Directory]::Exists($credJLink)) 'SecretPath/JunctionFixtureCreated'
+    try {
+        $jSecret = Join-Path $credJLink 'sub\s.dpapi'
+        $jSecure = New-CredTestSecure $credFake
+        Invoke-ApiPoolSandboxRefusal -Path $jSecret -Name 'SecretPath/Provider/JunctionAncestor' -ScriptBlock { New-ApiPoolCredentialProvider -Kind Dpapi -SecretPath $jSecret }
+        Invoke-ApiPoolSandboxRefusal -Path $jSecret -Name 'SecretPath/Set/JunctionAncestor' -ScriptBlock { Set-ApiPoolCredential -SecretPath $jSecret -Secret $jSecure }
+        Invoke-ApiPoolSandboxRefusal -Path $jSecret -Name 'SecretPath/Restore/JunctionAncestor' -ScriptBlock { Restore-ApiPoolPreviousCredential -SecretPath $jSecret }
+        Assert-ApiPoolEqual 0 @(Get-ChildItem -LiteralPath $credJTarget -Force).Count 'SecretPath/JunctionTargetUntouched'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($credJLink)) { [System.IO.Directory]::Delete($credJLink, $false) }
     }
 
     # ---------------- Mock provider ----------------

@@ -112,6 +112,7 @@ try {
     Assert-ApiPoolThrows { Read-ApiPoolConfig -Path $badJson } 'Config/InvalidJson' -ExpectedCode 'CONFIG_INVALID'
 
     # ---------------- State root guard and context ----------------
+    # Forbidden real-system paths below go only to pure validators / Read-ApiPoolConfig (no state writes).
     $stateOk = Assert-ApiPoolStateRoot -StateRoot (Join-Path $coreSandbox 'sr')
     Assert-ApiPoolTrue ($stateOk -like '*\sr') 'StateRoot/AcceptsSandbox'
     Assert-ApiPoolThrows { Assert-ApiPoolStateRoot -StateRoot (Join-Path $coreSandbox 'sr\x') -RepoRoot $coreSandbox } 'StateRoot/InsideExplicitRepoRoot' -ExpectedCode 'STATE_PATH_FORBIDDEN'
@@ -174,6 +175,7 @@ try {
 
     # ---------------- Atomic write ----------------
     $target = Join-Path $coreSandbox 'atomic\file.txt'
+    Assert-ApiPoolTestPathInSandbox -Path $target
     Write-ApiPoolFileAtomic -Path $target -Content 'first'
     Assert-ApiPoolEqual 'first' ([System.IO.File]::ReadAllText($target)) 'Atomic/NewFile'
     $bytes = [System.IO.File]::ReadAllBytes($target)
@@ -190,6 +192,7 @@ try {
 
     # ---------------- Durable line append ----------------
     $ledgerLike = Join-Path $coreSandbox 'lines\x.jsonl'
+    Assert-ApiPoolTestPathInSandbox -Path $ledgerLike
     Add-ApiPoolLineDurable -Path $ledgerLike -Line '{"a":1}'
     Add-ApiPoolLineDurable -Path $ledgerLike -Line ('second ' + [char]0x0436)
     $lineBytes = [System.IO.File]::ReadAllBytes($ledgerLike)
@@ -199,6 +202,7 @@ try {
 
     # ---------------- File locks ----------------
     $lockPath = Join-Path $coreSandbox 'locks\a.lock'
+    Assert-ApiPoolTestPathInSandbox -Path $lockPath
     $h1 = Enter-ApiPoolFileLock -Path $lockPath -TimeoutMs 500
     Assert-ApiPoolTrue ($null -ne $h1) 'Lock/Acquired'
     $script:CoreSleepCalls = 0

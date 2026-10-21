@@ -98,8 +98,10 @@ try {
     Assert-ApiPoolEqual 5000000 (Get-ApiPoolBudgetStatus -StateRoot $r).GlobalLimitMicroUsd 'Init/LimitUnchangedAfterMismatch'
     $badRoot = New-BudgetRoot
     Assert-ApiPoolEqual 'REQUEST_INVALID' (Get-BudgetErrCode { Initialize-ApiPoolLedger -StateRoot $badRoot -GlobalLimitMicroUsd 0 }) 'Init/ZeroLimitRefused'
-    Assert-ApiPoolEqual 'STATE_PATH_FORBIDDEN' (Get-BudgetErrCode { Get-ApiPoolBudgetStatus -StateRoot 'relative\state' }) 'Init/RelativeStateRootRefused'
-    Assert-ApiPoolEqual 'STATE_PATH_FORBIDDEN' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot 'C:\ProgramData\BRAVO\x' -JobId 'j' -AttemptId 'a' -AmountMicroUsd 1 -PerJobLimitMicroUsd 1 }) 'Init/ProgramDataStateRootRefused'
+    # Real-system paths: validator first; the budget function is invoked only if the validator rejected the path.
+    Assert-ApiPoolThrows { Assert-ApiPoolStateRoot -StateRoot 'relative\state' } 'Init/RelativeStateRootRefused' -ExpectedCode 'STATE_PATH_FORBIDDEN'
+    Invoke-ApiPoolGuardedRefusal -Path 'C:\ProgramData\BRAVO\x' -Name 'Init/ProgramDataStateRootRefused' -ScriptBlock { New-ApiPoolReservation -StateRoot 'C:\ProgramData\BRAVO\x' -JobId 'j' -AttemptId 'a' -AmountMicroUsd 1 -PerJobLimitMicroUsd 1 }
+    Invoke-ApiPoolGuardedRefusal -Path '\\localhost\C$\x' -Name 'Init/UncStateRootRefused' -ScriptBlock { Get-ApiPoolBudgetStatus -StateRoot '\\localhost\C$\x' }
 
     # ---------------- Accounting ----------------
     $r = New-BudgetFixture -Limit 1000

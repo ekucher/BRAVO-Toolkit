@@ -83,10 +83,111 @@ function Assert-ApiPoolThrows {
     Write-ApiPoolTestResult -Name $Name -Passed $ok -Detail $detail
 }
 
+$script:ApiPoolTestSandboxRoots = New-Object System.Collections.ArrayList
+
 function New-ApiPoolTestSandbox {
     $path = Join-Path ([System.IO.Path]::GetTempPath()) ('ApiPoolTests-' + [guid]::NewGuid().ToString('N'))
     [void][System.IO.Directory]::CreateDirectory($path)
+    [void]$script:ApiPoolTestSandboxRoots.Add($path)
     return $path
+}
+
+function Test-ApiPoolTestPathInSandbox {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if ($Path.StartsWith('\\') -or $Path.StartsWith('//')) { return $false }
+    if ($Path -notmatch '^[A-Za-z]:[\\/]') { return $false }
+    try { $full = [System.IO.Path]::GetFullPath($Path) } catch { return $false }
+    $roots = New-Object System.Collections.ArrayList
+    [void]$roots.Add([System.IO.Path]::GetTempPath())
+    foreach ($r in $script:ApiPoolTestSandboxRoots) { [void]$roots.Add($r) }
+    foreach ($root in $roots) {
+        $rootFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\')
+        if ($full.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Assert-ApiPoolTestPathInSandbox {
+    # Throws unless the path is absolute, local and under a test sandbox root (or the temp directory).
+    # Pure string check; performs no IO.
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+
+    if (-not (Test-ApiPoolTestPathInSandbox -Path $Path)) {
+        throw ('TEST SAFETY: path is outside the test sandbox: ' + $Path)
+    }
+}
+
+function Invoke-ApiPoolGuardedRefusal {
+    # For forbidden REAL-SYSTEM paths (ProgramData, UNC, device, repo, relative). The pure validator is asserted
+    # FIRST; the write function is invoked only when the validator itself rejected the path. If the guard has
+    # regressed, the test FAILS and the write function is never called.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$ExpectedCode = 'STATE_PATH_FORBIDDEN',
+        [string]$RepoRoot
+    )
+
+    $validatorCode = $null
+    try {
+        if ([string]::IsNullOrEmpty($RepoRoot)) { $null = Assert-ApiPoolSafePath -Path $Path -Purpose 'TestProbe' }
+        else { $null = Assert-ApiPoolSafePath -Path $Path -Purpose 'TestProbe' -RepoRoot $RepoRoot }
+    }
+    catch { $validatorCode = Get-ApiPoolErrorCode -ErrorRecord $_ }
+    if ($validatorCode -cne $ExpectedCode) {
+        Write-ApiPoolTestResult -Name ($Name + '/ValidatorRejects') -Passed $false -Detail ('path guard did not reject; write function NOT invoked (code=' + [string]$validatorCode + ')')
+        return
+    }
+    Write-ApiPoolTestResult -Name ($Name + '/ValidatorRejects') -Passed $true -Detail ''
+    Assert-ApiPoolThrows $ScriptBlock $Name -ExpectedCode $ExpectedCode
+}
+
+function Invoke-ApiPoolSandboxRefusal {
+    # For forbidden paths that live INSIDE the sandbox (e.g. junction ancestor): the sandbox is asserted
+    # before the write function is invoked.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$ExpectedCode = 'STATE_PATH_FORBIDDEN'
+    )
+
+    if (-not (Test-ApiPoolTestPathInSandbox -Path $Path)) {
+        Write-ApiPoolTestResult -Name ($Name + '/InSandbox') -Passed $false -Detail 'path is outside the test sandbox; write function NOT invoked'
+        return
+    }
+    Assert-ApiPoolThrows $ScriptBlock $Name -ExpectedCode $ExpectedCode
+}
+
+# --- Run-level tripwire: production state and drive-root probes must be untouched by the whole run. ---
+function Get-ApiPoolSafetySnapshot {
+    param([string]$Path)
+
+    if (-not [System.IO.Directory]::Exists($Path)) { return 'ABSENT' }
+    $children = @([System.IO.Directory]::GetFileSystemEntries($Path) | ForEach-Object { [System.IO.Path]::GetFileName($_) } | Sort-Object)
+    return ('PRESENT|{0}|{1}' -f [System.IO.Directory]::GetLastWriteTimeUtc($Path).Ticks, ($children -join ','))
+}
+
+function Start-ApiPoolSafetyTripwire {
+    $script:ApiPoolTripwireBravo = 'C:\ProgramData\BRAVO'
+    $script:ApiPoolTripwireProbes = @('C:\x', 'C:\state', 'C:\ApiPool', 'C:\s.dpapi')
+    $script:ApiPoolTripwireBefore = @{}
+    foreach ($p in (@($script:ApiPoolTripwireBravo) + $script:ApiPoolTripwireProbes)) {
+        $script:ApiPoolTripwireBefore[$p] = Get-ApiPoolSafetySnapshot -Path $p
+    }
+}
+
+function Complete-ApiPoolSafetyTripwire {
+    $previousSuite = $script:ApiPoolTestSuite
+    $script:ApiPoolTestSuite = 'Safety'
+    $after = Get-ApiPoolSafetySnapshot -Path $script:ApiPoolTripwireBravo
+    Assert-ApiPoolTrue ($after -ceq $script:ApiPoolTripwireBefore[$script:ApiPoolTripwireBravo]) 'ProductionStateUntouched' ('C:\ProgramData\BRAVO changed during the run: before=' + $script:ApiPoolTripwireBefore[$script:ApiPoolTripwireBravo] + ' after=' + $after)
+    $changed = @($script:ApiPoolTripwireProbes | Where-Object { (Get-ApiPoolSafetySnapshot -Path $_) -cne $script:ApiPoolTripwireBefore[$_] })
+    Assert-ApiPoolTrue ($changed.Count -eq 0) 'NoDriveRootArtifacts' ('drive-root probe changed: ' + ($changed -join ', '))
+    $script:ApiPoolTestSuite = $previousSuite
 }
 
 function Remove-ApiPoolTestSandbox {
