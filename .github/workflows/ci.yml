@@ -199,6 +199,15 @@ jobs:
           & powershell.exe -NoProfile -File .\.claude\hooks\tests\Test-AIRouting.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # Anthropic API Agent Pool (Tools/ApiPool) — офлайн-тести без мережі й реальних
+      # секретів: fake transport, sandbox-каталоги, затінені мережеві cmdlet-и.
+      - name: API pool offline tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoProfile -File .\Tools\ApiPool\tests\Invoke-ApiPoolTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # Ненав'язливе попередження про можливий дрейф документації. Навмисно
       # НЕ блокуюче: правило евристичне, і блокуючий варіант першого ж дня
       # породив би фіктивні записи в CHANGELOG.md заради зеленого CI.
