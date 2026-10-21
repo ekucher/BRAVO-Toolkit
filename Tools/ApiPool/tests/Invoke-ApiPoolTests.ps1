@@ -32,7 +32,7 @@ try {
     [System.Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', '', 'Process')
 
     # Fixed import order; modules never import each other.
-    foreach ($moduleName in @('Core', 'Credentials', 'Pricing', 'Budget')) {
+    foreach ($moduleName in @('Core', 'Credentials', 'Pricing', 'Budget', 'Transport', 'Adapter')) {
         Import-Module -Name (Join-Path $script:ModulesRoot ('ApiPool.{0}.psm1' -f $moduleName)) -Force -Global -DisableNameChecking
     }
 
