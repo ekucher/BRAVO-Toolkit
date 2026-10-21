@@ -3926,6 +3926,16 @@ function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyP
         @{ Id = 'A37.NalBuiltinAliasNamedWithSwitchAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "nal -vb -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
         @{ Id = 'A38.ModuleQualifiedSalBuiltinAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Microsoft.PowerShell.Utility\sal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
         @{ Id = 'A39.SalAndNalToBenignCommand'; Kind = 'CLEAN'; Path = $matrixModule; Text = "sal rdr Get-ChildItem`nnal rdr2 Get-ChildItem`nfunction F { rdr -Path X; rdr2 -Path X }" },
+        @{ Id = 'A40.ParenthesizedAliasValuePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A41.ParenthesizedAliasValueNamed'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A42.CastAndNestedParenAliasValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr ([string](('Read-BRAVOLegacyPrimaryRawOverrides')))`nfunction F { rdr }" },
+        @{ Id = 'A43.ParenthesizedAliasNameAndValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "sal ('rdr') ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A44.ParenthesizedBenignAliasValue'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr ('Get-ChildItem')`nfunction F { rdr -Path X }" },
+        @{ Id = 'A45.SubExpressionAliasValueNotUnwrapped'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Alias rdr (`$('Read-BRAVOLegacyPrimaryRawOverrides'))`nfunction F { rdr }" },
+        @{ Id = 'T04.ParenthesizedTypedStringVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [string]`$r = ('Read-BRAVOLegacyPrimaryRawOverrides'); & `$r }" },
+        @{ Id = 'T05.ParenthesizedUntypedVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = (('Read-BRAVOLegacyPrimaryRawOverrides')); & `$r }" },
+        @{ Id = 'T06.CastRightHandSideVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = [string]'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r }" },
+        @{ Id = 'T07.ParenthesizedSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$r = ('Get-ChildItem'); & `$r }" },
         @{ Id = 'A17.AliasChain'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Alias a1 Read-BRAVOLegacyPrimaryRawOverrides`nSet-Alias a2 a1`nfunction F { a2 }" },
         @{ Id = 'A18.AliasValueFromVariable'; Kind = 'MISSED'; Path = $matrixModule; Text = "`$v = 'Read-BRAVOLegacyPrimaryRawOverrides'`nSet-Alias rdr `$v`nfunction F { rdr }" },
         @{ Id = 'A19.SetItemAliasProvider'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Item -Path Alias:rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
@@ -3944,7 +3954,9 @@ function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyP
         @{ Id = 'G7b.ScriptQualifiedAssignmentAndCallSameFunction'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$script:r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$script:r }" },
         # --- Додаткові класи, виявлені під час аналізу (не з переліку #239) ---
         @{ Id = 'X1.StringConcatenation'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$c = 'Read-BRAVOLegacy' + 'PrimaryRawOverrides'; & `$c }" },
-        # X2 (Invoke-Expression) не виконується тут: вектор закрито ci/Test-BRAVOForbiddenPattern.ps1 (див. docs/design/BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md).
+        # X2: `& 'iex' '<літерал>'` (квотоване ім'я через оператор виклику) обходить і цей гейт, і
+        # ci/Test-BRAVOForbiddenPattern.ps1 (його регекс вимагає пропуск одразу після iex/Invoke-Expression).
+        @{ Id = 'X2.QuotedInvokeExpressionWithLiteral'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & 'iex' 'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X' }" },
         @{ Id = 'X3.GetCommandSubexpression'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & (Get-Command 'Read-BRAVOLegacyPrimaryRawOverrides') -ConfigPath X }" },
         @{ Id = 'X4.ModuleQualifiedName'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { BRAVO.Configuration\Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }" },
         @{ Id = 'X5.FileOutsideScanTargets'; Kind = 'MISSED'; Path = 'ci\Rogue.ps1'; Text = 'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X' },

@@ -35,9 +35,18 @@ code review, а гейт — лише автоматичний страхува�
   досягається штатно.
 - **K3.** Гейт 4 `CONFIG_LOADER_CALLER_COMPLETENESS` і гейт 5
   `GENERATED_LOADER_CALL_TEXT` (текст згенерованих дочірніх скриптів).
-- **K4.** Code review PR; рідер визначений лише в `BRAVO_CONFIG_LOADER.ps1`, а не
-  в експортованому модулі, тож виклик з іншого місця вимагає ще й dot-source цього
-  файлу, що саме по собі помітно в diff.
+- **K4 (вузький, не загальний).** Code review PR; рідер визначений лише в
+  `BRAVO_CONFIG_LOADER.ps1`, а не в експортованому модулі, тож виклик з іншого місця
+  вимагає ще й dot-source цього файлу, що помітно в diff, **лише там, де loader ще не
+  завантажений**: нові модулі `modules/BRAVO.*` і скрипти `ci/`, які його не підключають.
+  У файлах, що вже штатно dot-source'ять `BRAVO_CONFIG_LOADER.ps1` (наприклад
+  `BRAVO_TASKS_DIAGNOSE.ps1`, `BRAVO_BAZA_RECONCILE.ps1`, `BRAVO_SETUP.ps1` та інші кореневі
+  entrypoint-и, `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1`,
+  `modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1`,
+  `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1`,
+  `modules/BRAVO.Configurator/BRAVO.Configurator.Persistence.psm1`), рідер уже доступний, нового
+  dot-source в diff немає, тож K4 там **не компенсує**: рядки, що посилаються на K4, для таких файлів
+  спираються лише на K1, K2, K5 і звичайне review виклику.
 - **K5.** Ціле дерево `RUNTIME_MANIFEST.json` / інтеграція: зміна tracked-файлу без
   регенерації маніфесту валить runtime-integrity.
 
@@ -48,10 +57,9 @@ code review, а гейт — лише автоматичний страхува�
 - `FALSE-POSITIVE` — гейт провалюється на безпечному коді.
 - `CLEAN` — коректно дозволена конструкція, гейт проходить.
 
-Кожен виконуваний рядок (71 рядок) має тест `ReleaseGate/LegacyReaderMatrix/<Id>.<стан>` у
-`selftest\BRAVO_SELF_TEST.Governance.ps1`. Єдиний невиконуваний рядок X2
-(`Invoke-Expression`) покритий окремо `ci/Test-BRAVOForbiddenPattern.ps1`, який
-CI запускає кроком «Forbidden patterns» (`.github/workflows/ci.yml:121-123`). Рядки `MISSED` і `FALSE-POSITIVE`
+Кожен рядок матриці (82 виконуваних рядки) має тест `ReleaseGate/LegacyReaderMatrix/<Id>.<стан>` у
+`selftest\BRAVO_SELF_TEST.Governance.ps1`. Невиконуваних рядків немає: X2 (`& 'iex' '...'`)
+виконується як `MISSED` і **не** закритий `ci/Test-BRAVOForbiddenPattern.ps1`. Рядки `MISSED` і `FALSE-POSITIVE`
 явно позначені `KnownLimit` у назві тесту. Покращення гейта, яке змінює такий
 результат, мусить **свідомо** оновити і тест, і цей документ.
 
@@ -82,13 +90,13 @@ CI запускає кроком «Forbidden patterns» (`.github/workflows/ci.y
 
 | Id | № у #239 | Клас | Приклад | Гейт | Компенсація | Залишковий ризик | Рішення |
 |---|---|---|---|---|---|---|---|
-| G1 | 1 | Порядок виконання проти текстового offset | `function F { & $cmd }` текстово ПЕРЕД `$cmd = 'Read-...'` | MISSED | K1, K2, K4 | низький: потрібна навмисна перестановка | відомий ліміт (#239) |
-| G2 | 2 | Немає перевірки control-flow guard'а | виклик `Import-BravoLegacyPrimaryConfiguration` в loader поза `if (-not $Disallow...)`, рівно один раз | MISSED | K1 (поведінковий тест отруєного config), K4: loader — єдиний файл із цією парою | середній для loader, але зміна loader проходить review | відомий ліміт (#239) |
+| G1 | 1 | Порядок виконання проти текстового offset | `function F { & $cmd }` текстово ПЕРЕД `$cmd = 'Read-...'` | MISSED | K1, K2, K4 (лише поза файлами, що вже підключають loader) | низький поза файлами з loader; у файлах із loader — лише K1/K2/review, ризик середній: потрібна навмисна перестановка | відомий ліміт (#239) |
+| G2 | 2 | Немає перевірки control-flow guard'а | виклик `Import-BravoLegacyPrimaryConfiguration` в loader поза `if (-not $Disallow...)`, рівно один раз | MISSED | K1 (поведінковий тест отруєного config), K4 застосовний: loader — єдиний файл із цією парою (на сам loader dot-source не потрібен) | середній для loader, але зміна loader проходить review | відомий ліміт (#239) |
 | A* | 3 | Alias | `Set-Alias rdr Read-BRAVO...; rdr` | **DETECTED (виправлено)** | | див. нижче | **виправлено в цьому PR** |
-| G4 | 4 | Взаємовиключні `if`/`else` | `if ($u) { $c='Read-...' } else { $c='Get-ChildItem' }; & $c` | MISSED | K1, K4 | низький | відомий ліміт (#239) |
+| G4 | 4 | Взаємовиключні `if`/`else` | `if ($u) { $c='Read-...' } else { $c='Get-ChildItem' }; & $c` | MISSED | K1, K4 (лише поза файлами з loader) | низький поза файлами з loader; у файлах із loader — лише K1/review (середній) | відомий ліміт (#239) |
 | G5 | 5 | «Рівно один» не діє при Count=0 | у loader видалено санкціонований виклик | MISSED | K1: поведінкові тести loader | не обхід ізоляції; інший клас (власник) | відомий ліміт (#239) |
 | G6 | 6 | Нелітеральне перепризначення не затіняє | `$c='Read-...'; $c = Get-SafeCommand; & $c` | FALSE-POSITIVE | автор рефакторить код або виносить у санкціонований шлях | хибний FAIL, не прогалина безпеки | відомий ліміт (#239) |
-| G7a, G7b | 7 | `$script:` на стороні присвоєння | `function Set-It { $script:r='Read-...' }`, виклик `& $script:r` деінде | MISSED | K1, K4 | низький | відомий ліміт (#239) |
+| G7a, G7b | 7 | `$script:` на стороні присвоєння | `function Set-It { $script:r='Read-...' }`, виклик `& $script:r` деінде | MISSED | K1, K4 (лише поза файлами з loader) | низький поза файлами з loader; у файлах із loader — лише K1/review (середній) | відомий ліміт (#239) |
 | T* | 8 | Типізована змінна | `[string]$r = 'Read-...'; & $r` | **DETECTED (виправлено)** | | див. нижче | **виправлено в цьому PR** |
 
 ### Виправлено: alias (прогалина 3)
@@ -123,6 +131,9 @@ ew-alias` | DETECTED | виправлено |
 | A33 | switch-псевдоніми з аліасом на безпечну команду | CLEAN | захищено від хибних FAIL |
 | A34-A38 | вбудовані псевдоніми PS 5.1 `sal`/`nal` (позиційно, іменовано, у будь-якому регістрі, з `-vb`, з префіксом модуля) замість `Set-Alias`/`New-Alias` | DETECTED | виправлено (GitHub Codex review; набір з `Get-Alias -Definition Set-Alias,New-Alias`) |
 | A39 | `sal`/`nal` на безпечну команду | CLEAN | захищено від хибних FAIL |
+| A40-A43 | значення (і ім'я) аліаса в дужках або з кастом, у т.ч. вкладено: `Set-Alias rdr ('Read-...')`, `-Value ('Read-...')`, `New-Alias rdr ([string](('Read-...')))`, `sal ('rdr') ('Read-...')` | DETECTED | виправлено (рев'ю PR #497) |
+| A44 | значення аліаса в дужках на безпечну команду | CLEAN | захищено від хибних FAIL |
+| A45 | значення аліаса як підвираз `$('Read-...')` | MISSED | відомий ліміт: підвирази/scriptblock не розгортаються (R9) |
 | A14 | аліас на безпечну команду | CLEAN | захищено від хибних FAIL |
 | A15 | аліас на рідер без виклику | CLEAN | свідомо |
 | A16 | loader із санкціонованими викликами + безпечний alias | CLEAN | санкціоновані місця дозволені |
@@ -131,7 +142,7 @@ ew-alias` | DETECTED | виправлено |
 | A19 | `Set-Item Alias:rdr -Value ...` | MISSED | відомий ліміт: інша cmdlet |
 | A20 | splatting `Set-Alias @p` | MISSED | відомий ліміт (dataflow) |
 
-Компенсація для A17-A20: K1, K4 та те, що обхід вимагає навмисної конструкції.
+Компенсація для A17-A20: K1, K4 (лише поза файлами, що вже підключають loader) та те, що обхід вимагає навмисної конструкції.
 
 ### Виправлено: типізована змінна (прогалина 8)
 
@@ -145,6 +156,15 @@ ew-alias` | DETECTED | виправлено |
 | T01 | `[string]$r = 'Read-...'; & $r` | DETECTED | виправлено |
 | T02 | `[ValidateNotNull()][string]$r = ...` | DETECTED | виправлено |
 | T03 | безпечне типізоване перепризначення затіняє ризикове | CLEAN | виправлено (без нього був би новий хибний FAIL) |
+| T04 | `[string]$r = ('Read-...'); & $r` (права частина в дужках) | DETECTED | виправлено (рев'ю PR #497) |
+| T05 | `$r = (('Read-...')); & $r` (вкладені дужки) | DETECTED | виправлено (рев'ю PR #497) |
+| T06 | `$r = [string]'Read-...'; & $r` (каст правої частини) | DETECTED | виправлено (рев'ю PR #497) |
+| T07 | безпечне перепризначення в дужках `$r = ('Get-ChildItem')` затіняє ризикове | CLEAN | виправлено (без нього хибний FAIL) |
+
+Обгортки значення (`ParenExpressionAst`, `PipelineAst` з одним елементом, `CommandExpressionAst`,
+будь-який каст `ConvertExpressionAst` незалежно від типу, а не лише значеннєзберігальний) розгортає **одна спільна** функція `Get-BRAVOAstConstantStringLiteral`
+в `ci/BRAVOConfigV2CutoverGates.ps1`; її використовують і відстеження змінних, і значення/ім'я
+`Set-Alias`/`New-Alias`. Підвирази `$()`, scriptblock-и та конвеєри з кількох елементів не розгортаються.
 
 ### Додаткові класи, знайдені під час аналізу (поза переліком #239)
 
@@ -153,22 +173,22 @@ ew-alias` | DETECTED | виправлено |
 
 | Id | Клас | Приклад | Гейт | Компенсація | Рішення |
 |---|---|---|---|---|---|
-| X1 | Конкатенація імені | `$c = 'Read-BRAVOLegacy' + 'PrimaryRawOverrides'; & $c` | MISSED | K1, K4 | відомий ліміт (обфускація) |
-| X2 | `Invoke-Expression` з літералом | `Invoke-Expression 'Read-BRAVO...'` | MISSED | `ci/Test-BRAVOForbiddenPattern.ps1` забороняє `Invoke-Expression`/`iex` у всьому репозиторії; K1, K4 | закрито іншим контролем; рядок не виконується в матриці self-test, бо сам літерал заборонений сканером |
-| X3 | `Get-Command` у підвиразі | `& (Get-Command 'Read-BRAVO...')` | MISSED | K1, K4 | відомий ліміт |
+| X1 | Конкатенація імені | `$c = 'Read-BRAVOLegacy' + 'PrimaryRawOverrides'; & $c` | MISSED | K1, K4 (лише поза файлами з loader) | відомий ліміт (обфускація) |
+| X2 | `Invoke-Expression`/`iex` з літералом через квотоване ім'я | `& 'iex' 'Read-BRAVO...'` | MISSED | K1, K4 (лише поза файлами з loader). `ci/Test-BRAVOForbiddenPattern.ps1:113` ловить лише `Invoke-Expression`/`iex` з пропуском одразу після імені (`(?i)\b(Invoke-Expression\|iex)\s`), тож форма з квотованим ім'ям, де за `iex` іде лапка, не збігається. Так само обходять регекс дужкові форми `iex('…')` і `Invoke-Expression('…')` (після імені йде `(`, а не пропуск); прості форми `Invoke-Expression 'Read-…'` і `iex 'x'` сканер ЛОВИТЬ | **не закрито**: відомий ліміт; сканер заборонених шаблонів поза обсягом цього PR; виконуваний рядок X2 у self-test фіксує поточний (невиявлений) результат |
+| X3 | `Get-Command` у підвиразі | `& (Get-Command 'Read-BRAVO...')` | MISSED | K1, K4 (лише поза файлами з loader) | відомий ліміт |
 | X4 | Ім'я з префіксом модуля | `Mod\Read-BRAVO...` | MISSED | рідер не експортується модулем (K4) | відомий ліміт |
 | X5 | Файл поза скануваними каталогами | `ci\Rogue.ps1` | MISSED | не production-поверхня; review | відомий ліміт (обсяг сканування) |
 | X6 | Неперевірюваний рядок команди (не виконуваний як написано: дочірній процес не бачить рідера, поки той не завантажено) | `powershell -Command 'Read-BRAVO...'` | MISSED | K3 для згенерованих скриптів | відомий ліміт: гейт не аналізує текст рядків |
-| X7 | Ім'я з параметра | `param($c); & $c` | MISSED | K1, K4 | відомий ліміт (dataflow) |
-| X8 | Член хеш-таблиці | `& $h.c` | MISSED | K1, K4 | відомий ліміт (dataflow) |
+| X7 | Ім'я з параметра | `param($c); & $c` | MISSED | K1, K4 (лише поза файлами з loader) | відомий ліміт (dataflow) |
+| X8 | Член хеш-таблиці | `& $h.c` | MISSED | K1, K4 (лише поза файлами з loader) | відомий ліміт (dataflow) |
 
 ## Підсумок
 
-- Виправлено в цьому PR: прогалини 3 (alias) і 8 (типізована змінна).
+- Виправлено в цьому PR: прогалини 3 (alias) і 8 (типізована змінна), включно з обгортками значення
+  в дужках/касті (рев'ю PR #497).
 - Свідомо не чіпано (потребують control-flow/dataflow, рішення власника в #239):
   1, 2, 4; також 5, 6, 7.
-- Усі 71 виконуваних рядків зафіксовані тестами (X2 покритий окремо
-  `ci/Test-BRAVOForbiddenPattern.ps1`, `.github/workflows/ci.yml:121-123`): майбутнє покращення гейта проявиться як
+- Усі 82 виконуваних рядки зафіксовані тестами (X2 — як відомий ліміт: `ci/Test-BRAVOForbiddenPattern.ps1` його не закриває): майбутнє покращення гейта проявиться як
   навмисне оновлення відповідного `KnownLimit`-тесту та цього документа.
 - Якщо інвестувати далі, рекомендація власника лишається чинною: не точковими
   патчами, а окремим санкціонованим дизайном обмеженого dataflow-проходу.

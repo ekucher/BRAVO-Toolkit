@@ -542,6 +542,40 @@ function Test-BRAVOConfigV2CutoverGates {
         return $UserPath
     }
 
+    # #239 (рев'ю PR #497, F1/F2): значення-літерал може бути обгорнуте в
+    # константні обгортки - `('Read-...')`, `[string]'Read-...'`,
+    # `[string]('Read-...')` (вкладені довільно). Розгортається БУДЬ-ЯКИЙ каст
+    # (ConvertExpressionAst) незалежно від типу, а не лише такі, що зберігають
+    # значення: це свідомо консервативно (краще зайве спрацювання, ніж обхід).
+    # Єдина спільна реалізація розгортання для присвоєнь змінним (R4) і
+    # значення Set-Alias/New-Alias. Розгортаються ЛИШЕ ParenExpressionAst,
+    # PipelineAst із одним CommandExpressionAst, CommandExpressionAst і
+    # ConvertExpressionAst (каст); підвирази `$()`, scriptblock-и,
+    # конвеєри з кількох елементів не розгортаються (див. R9).
+    # Повертає StringConstantExpressionAst або $null.
+    function Get-BRAVOAstConstantStringLiteral {
+        param($AstNode)
+        $current = $AstNode
+        while ($current) {
+            if ($current -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                return $current
+            }
+            if ($current -is [System.Management.Automation.Language.ParenExpressionAst]) {
+                $current = $current.Pipeline
+            } elseif ($current -is [System.Management.Automation.Language.PipelineAst]) {
+                if ($current.PipelineElements.Count -ne 1) { return $null }
+                $current = $current.PipelineElements[0]
+            } elseif ($current -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                $current = $current.Expression
+            } elseif ($current -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+                $current = $current.Child
+            } else {
+                return $null
+            }
+        }
+        return $null
+    }
+
     function Get-BRAVOAstEnclosingFunctionName {
         param($AstNode)
         $current = $AstNode.Parent
@@ -695,18 +729,14 @@ function Test-BRAVOConfigV2CutoverGates {
                 # `$cmd = { 'Read-...' }` записувало ризиковий літерал, хоча
                 # `& $cmd` реально виконує СКРИПТБЛОК (що лише повертає текст,
                 # не викликає команду). "Проста" форма присвоєння тепер
-                # визначена якомога вужче: права частина — це PipelineAst з
-                # РІВНО ОДНИМ CommandExpressionAst, чий вираз — САМЕ
-                # StringConstantExpressionAst (без розпаковування вкладених
-                # scriptblock/підвиразів) — не рекурсивний пошук.
-                $assignmentValueLiteralAst = $null
-                if ($assignmentValueAst -is [System.Management.Automation.Language.CommandExpressionAst]) {
-                    $assignmentValueLiteralAst = $assignmentValueAst.Expression -as [System.Management.Automation.Language.StringConstantExpressionAst]
-                } elseif ($assignmentValueAst -is [System.Management.Automation.Language.PipelineAst] -and
-                    $assignmentValueAst.PipelineElements.Count -eq 1 -and
-                    $assignmentValueAst.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
-                    $assignmentValueLiteralAst = $assignmentValueAst.PipelineElements[0].Expression -as [System.Management.Automation.Language.StringConstantExpressionAst]
-                }
+                # визначена якомога вужче: значення розбирає
+                # Get-BRAVOAstConstantStringLiteral, що розгортає лише
+                # константні обгортки (ParenExpressionAst, PipelineAst з
+                # одним елементом, CommandExpressionAst, будь-який каст
+                # ConvertExpressionAst) до StringConstantExpressionAst і НЕ
+                # заходить у вкладені scriptblock/підвирази `$()` — це не
+                # рекурсивний пошук.
+                $assignmentValueLiteralAst = Get-BRAVOAstConstantStringLiteral -AstNode $assignmentValueAst
                 if (-not $assignmentValueLiteralAst) {
                     continue
                 }
@@ -790,15 +820,17 @@ function Test-BRAVOConfigV2CutoverGates {
                             $aliasParameterArgument = $aliasElements[$aliasElementIndex]
                         }
                         $aliasArgumentText = $null
-                        if ($aliasParameterArgument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
-                            $aliasArgumentText = $aliasParameterArgument.Value
+                        $aliasArgumentLiteral = Get-BRAVOAstConstantStringLiteral -AstNode $aliasParameterArgument
+                        if ($aliasArgumentLiteral) {
+                            $aliasArgumentText = $aliasArgumentLiteral.Value
                         }
                         if ($aliasIsName) { $aliasNameText = $aliasArgumentText }
                         elseif ($aliasIsValue) { $aliasValueText = $aliasArgumentText }
                         continue
                     }
-                    if ($aliasElement -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
-                        [void]$aliasPositional.Add($aliasElement.Value)
+                    $aliasPositionalLiteral = Get-BRAVOAstConstantStringLiteral -AstNode $aliasElement
+                    if ($aliasPositionalLiteral) {
+                        [void]$aliasPositional.Add($aliasPositionalLiteral.Value)
                     } else {
                         [void]$aliasPositional.Add($null)
                     }
