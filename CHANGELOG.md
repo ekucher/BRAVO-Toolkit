@@ -2,6 +2,8 @@
 
 ## Не випущено (developer)
 
+- **Fix: Discovery більше не кидає виняток на відсутньому диску, недосяжному UNC і значеннях `bravo.ini` без каталожної частини.** Стосується `modules/BRAVO.Discovery`. Раніше `Join-Path` на шляху з диска, якого зараз немає, `Test-Path -PathType Container` на недосяжному UNC (`IOException`) і `Split-Path -Parent` для `MODEL=lims` / `D:lims` (порожній результат) переривали `Resolve-BRAVOInstallationDiscovery` та `Test-BRAVODiscoveryResult` аварією. Тепер шляхи на потенційно офлайн-коренях з'єднуються лексично (приватний `Join-BRAVODiscoveryPathLexical`, на наявних дисках результат збігається з `Join-Path`), відсутній диск у `Test-BRAVODiscoverySourceDirectory` дає `Kind = Unreadable` (`Presence = Error`, причина `диск недоступний: X:: <шлях>`) замість хибного `Absent`, явні override (включно з `BravoIniPath`) і перевірки `bravo.ini`/`httpd.conf` на недосяжний UNC повертають `Value = $null` з причиною `вказує на каталог, якого не існує або недоступний (...)`, `Test-BRAVODiscoveryResult` повідомляє звичайну проблему замість винятку, а `MODEL` без каталожної частини стає `Absent` з `AbsenceKind = NoPath`. Значення на наявних дисках, пріоритет джерел, формат baseline, коди завершення та конфігурація не змінені. Self-test: `Discovery/MissingDrive*`. Acceptance на реальному сервері з відключеним диском/недосяжним UNC не виконувався.
+
 - **Fix: legacy-синхронізація BAZA більше не дає хибну `ПОМИЛКА` через файли, створені під час
   прогону (#501).** Стосується лише legacy-шляху `Sync-FolderToSFTP`, до якого `Invoke-BRAVOBazaCanonicalSync`
   доходить за явного `backupMonitoring.SFTP.BAZA.Mode = "Legacy"`; типовий двигун `IncrementalAppendOnly` не

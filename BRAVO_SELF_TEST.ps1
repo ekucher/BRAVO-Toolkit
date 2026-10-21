@@ -21329,6 +21329,269 @@ try {
             -Failure "коли службу BRAVO не встановлено, MODEL/BLOG/BRAVOEXCH мають резолвитись з canonical bravo.ini (незалежне authoritative джерело) — відсутність служби не повинна блокувати ці backup-джерела, лише BRAVO_ROOT (похідне від служби значення)"
 
         # =====================================================================
+        # Discovery/MissingDrive*: відсутній диск / недосяжний UNC / некоректні
+        # шляхи з bravo.ini не повинні перетворюватись на виняток Discovery.
+        # Контракт: Resolve-BRAVOInstallationDiscovery не кидає виняток, а
+        # повертає результат із Presence/Reason (Error для недоступного
+        # носія, Absent/NoPath для шляху без каталогу). Літера "відсутнього"
+        # диска обчислюється під час тесту, нічого не створюється на диску.
+        # =====================================================================
+        $missingDriveUsedLetters = @(
+            @([IO.DriveInfo]::GetDrives() | ForEach-Object { ([string]$_.Name).Substring(0, 1).ToUpperInvariant() }) +
+            @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { ([string]$_.Name).ToUpperInvariant() })
+        )
+        $missingDriveLetter = $null
+        foreach ($missingDriveCandidate in [char[]]([int][char]'D'..[int][char]'Z')) {
+            if ($missingDriveUsedLetters -notcontains ([string]$missingDriveCandidate)) {
+                $missingDriveLetter = [string]$missingDriveCandidate
+                break
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition ($null -ne $missingDriveLetter) `
+            -Name "Discovery/MissingDriveSetupAbsentDriveLetterAvailable" `
+            -Failure "SETUP: усі літери D..Z зайняті на цьому хості — неможливо побудувати детермінований сценарій відсутнього диска; тести Discovery/MissingDrive* не виконувались (це не PASS)"
+
+        if ($null -ne $missingDriveLetter) {
+            $missingDriveBase = Join-Path $discoveryTestRoot "MissingDrive"
+            $missingDriveRoot = ('{0}:\' -f $missingDriveLetter)
+            # Усі вхідні дані передаються параметрами: виклик ізольований
+            # від змінних навколишнього scope.
+            $invokeMissingDriveDiscovery = {
+                param([string]$CaseName, [string[]]$IniLines, [object[]]$Services, [hashtable]$Settings, [string[]]$WebCandidates, [string]$BaseDirectory)
+                $caseSystemRoot = Join-Path $BaseDirectory ($CaseName + "\FixtureWindows")
+                $caseIniDirectory = Join-Path $caseSystemRoot "SysWOW64"
+                [void][IO.Directory]::CreateDirectory($caseIniDirectory)
+                [IO.File]::WriteAllLines((Join-Path $caseIniDirectory "bravo.ini"), $IniLines)
+                $caseOutcome = [pscustomobject]@{ Result = $null; Error = $null }
+                try {
+                    $caseArguments = @{
+                        LimsRoot = $BaseDirectory
+                        BravoServiceName = "BRAVO"
+                        Services = $Services
+                        SystemRoot = $caseSystemRoot
+                        Is64BitOperatingSystem = $true
+                    }
+                    if (@($WebCandidates).Count -gt 0) { $caseArguments['WebServiceCandidates'] = $WebCandidates }
+                    if ($null -ne $Settings) { $caseArguments['DiscoverySettings'] = $Settings }
+                    $caseOutcome.Result = Resolve-BRAVOInstallationDiscovery @caseArguments
+                } catch {
+                    $caseOutcome.Error = ("{0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message)
+                }
+                return $caseOutcome
+            }
+            $newMissingDriveService = {
+                param([string]$Name, [string]$DisplayName, [string]$ExecutablePath)
+                [pscustomobject]@{ Name = $Name; DisplayName = $DisplayName; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $ExecutablePath) }
+            }
+            try {
+                # (a) MODEL/BLOG на відсутньому диску, служб немає.
+                $mdA = & $invokeMissingDriveDiscovery 'a' @(
+                    '[model]',
+                    ('MODEL={0}LIMS\MODEL\lims' -f $missingDriveRoot),
+                    ('BLOG={0}LIMS\BLOG\' -f $missingDriveRoot)) @() $null @() $missingDriveBase
+                $mdAOk = ($null -eq $mdA.Error -and $null -ne $mdA.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdAOk `
+                    -Name "Discovery/MissingDriveIniModelBlogDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для MODEL/BLOG на відсутньому диску ${missingDriveLetter}:; отримано: $($mdA.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdAOk -and
+                        $mdA.Result.MODEL_SOURCE -eq ('{0}LIMS\MODEL' -f $missingDriveRoot) -and
+                        $mdA.Result.BAZA_APP -eq ('{0}LIMS\BAZA' -f $missingDriveRoot) -and
+                        ([string]$mdA.Result.Reasons.BAZA_APP).Contains("MODEL/BLOG з bravo.ini")
+                    ) `
+                    -Name "Discovery/MissingDriveIniModelBlogResolvesLexicalPaths" `
+                    -Failure "для відсутнього диска MODEL_SOURCE/BAZA_APP мають бути лексично виведені з bravo.ini (X:\LIMS\MODEL, X:\LIMS\BAZA), Reasons.BAZA_APP — з поясненням 'MODEL/BLOG з bravo.ini'; помилка: $($mdA.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdAOk -and
+                        $mdA.Result.Components['MODEL'].Presence -eq 'Error' -and
+                        ([string]$mdA.Result.Components['MODEL'].Reason).Contains('диск недоступний') -and
+                        $mdA.Result.Components['BAZA_APP'].Presence -eq 'Error' -and
+                        ([string]$mdA.Result.Components['BAZA_APP'].Reason).Contains('диск недоступний')
+                    ) `
+                    -Name "Discovery/MissingDriveComponentsAreErrorNotAbsent" `
+                    -Failure "MODEL і BAZA_APP на відсутньому диску мають бути Presence='Error' (носій недоступний != компонент не встановлено) з Reason, що містить 'диск недоступний'; помилка: $($mdA.Error)"
+                $mdAValidation = @()
+                if ($mdAOk) {
+                    $mdAValidation = @(Test-BRAVODiscoveryResult -DiscoveryResult $mdA.Result -EnabledComponents @{ BAZA_APP = $true })
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdAOk -and
+                        $mdAValidation.Count -ge 1 -and
+                        @($mdAValidation | Where-Object { ([string]$_).Contains("BAZA_APP") -and ([string]$_).Contains("шлях не існує") }).Count -ge 1
+                    ) `
+                    -Name "Discovery/MissingDriveValidationReportsEnabledBazaAppProblem" `
+                    -Failure "Test-BRAVODiscoveryResult з увімкненим BAZA_APP на відсутньому диску має повідомити проблему (не OK): 'Джерело ''BAZA_APP'' увімкнено, але шлях не існує'; помилка: $($mdA.Error)"
+
+                # (b) служба BRAVO на відсутньому диску, bravo.ini без MODEL, FILE відносний.
+                $mdBService = & $newMissingDriveService 'BRAVO' 'BRAVO Service' ('{0}LIMS\bravo.exe' -f $missingDriveRoot)
+                $mdB = & $invokeMissingDriveDiscovery 'b' @(
+                    '[model]',
+                    '[Debug]',
+                    'FILE=TraceSRV.out') @($mdBService) $null @() $missingDriveBase
+                $mdBOk = ($null -eq $mdB.Error -and $null -ne $mdB.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdBOk `
+                    -Name "Discovery/MissingDriveServiceExeDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для служби BRAVO, чий exe лежить на відсутньому диску; отримано: $($mdB.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdBOk -and
+                        $mdB.Result.BAZA_APP -eq ('{0}LIMS\BAZA' -f $missingDriveRoot) -and
+                        $mdB.Result.TRACE_FILE -eq ('{0}LIMS\TraceSRV.out' -f $missingDriveRoot)
+                    ) `
+                    -Name "Discovery/MissingDriveServiceExeResolvesBazaAppAndTraceFile" `
+                    -Failure "для служби на відсутньому диску BAZA_APP має бути X:\LIMS\BAZA, а відносний TRACE_FILE — X:\LIMS\TraceSRV.out (лексично від каталогу exe); помилка: $($mdB.Error)"
+
+                # (c) Apache на відсутньому диску.
+                $mdCService = & $newMissingDriveService 'Apache2.4' 'Apache2.4' ('{0}web\apache\bin\httpd.exe' -f $missingDriveRoot)
+                $mdC = & $invokeMissingDriveDiscovery 'c' @('[model]') @($mdCService) $null @('Apache2.4') $missingDriveBase
+                $mdCOk = ($null -eq $mdC.Error -and $null -ne $mdC.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdCOk `
+                    -Name "Discovery/MissingDriveApacheDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для Apache-служби на відсутньому диску; отримано: $($mdC.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdCOk -and
+                        $mdC.Result.HttpdConfPath -eq ('{0}web\apache\conf\httpd.conf' -f $missingDriveRoot) -and
+                        $null -eq $mdC.Result.BAZA_WWW -and
+                        $mdC.Result.BAZA_WWW_Presence -ne 'Present' -and
+                        $mdC.Result.Components['BAZA_WWW'].Presence -ne 'Present' -and
+                        $mdC.Result.Components['WEB_ROOT'].Presence -ne 'Present'
+                    ) `
+                    -Name "Discovery/MissingDriveApacheHttpdConfLexicalAndBazaWwwNotPresent" `
+                    -Failure "для Apache на відсутньому диску HttpdConfPath має бути лексично X:\web\apache\conf\httpd.conf, BAZA_WWW=`$null, а BAZA_WWW/WEB_ROOT Presence не 'Present'; помилка: $($mdC.Error)"
+
+                # (d) характеризація: наявний диск (тимчасовий корінь) — значення без змін.
+                $mdDInstall = Join-Path $missingDriveBase "d-install"
+                foreach ($mdDDirectory in @('MODEL', 'BLOG', 'BAZA')) {
+                    $mdDPath = Join-Path $mdDInstall $mdDDirectory
+                    [void][IO.Directory]::CreateDirectory($mdDPath)
+                    [IO.File]::WriteAllText((Join-Path $mdDPath 'placeholder.txt'), 'fixture')
+                }
+                $mdD = & $invokeMissingDriveDiscovery 'd' @(
+                    '[model]',
+                    ('MODEL={0}' -f (Join-Path $mdDInstall 'MODEL\lims')),
+                    ('BLOG={0}\' -f (Join-Path $mdDInstall 'BLOG'))) @() $null @() $missingDriveBase
+                $mdDOk = ($null -eq $mdD.Error -and $null -ne $mdD.Result)
+                $mdDValidation = @('<not-run>')
+                if ($mdDOk) {
+                    $mdDValidation = @(Test-BRAVODiscoveryResult -DiscoveryResult $mdD.Result -EnabledComponents @{ MODEL = $true; BLOG = $true; BAZA_APP = $true })
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdDOk -and
+                        $mdD.Result.MODEL_SOURCE -eq (Join-Path $mdDInstall 'MODEL') -and
+                        $mdD.Result.BLOG_SOURCE -eq (Join-Path $mdDInstall 'BLOG') -and
+                        $mdD.Result.BAZA_APP -eq (Join-Path $mdDInstall 'BAZA') -and
+                        $mdD.Result.Components['MODEL'].Presence -eq 'Present' -and
+                        $mdD.Result.Components['MODEL'].Source -eq 'BravoIni' -and
+                        $mdD.Result.Components['MODEL'].Path -eq (Join-Path $mdDInstall 'MODEL') -and
+                        $mdD.Result.Components['BAZA_APP'].Presence -eq 'Present' -and
+                        $mdD.Result.Components['BAZA_APP'].Path -eq (Join-Path $mdDInstall 'BAZA') -and
+                        ([string]$mdD.Result.Reasons.BAZA_APP).Contains("MODEL/BLOG з bravo.ini") -and
+                        $mdDValidation.Count -eq 0
+                    ) `
+                    -Name "Discovery/MissingDrivePresentDriveCharacterizationUnchanged" `
+                    -Failure "(характеризація, не RED) для наявного диска значення, Presence=Present і валідація мають лишатись як у поточній реалізації; помилка: $($mdD.Error)"
+
+                # (e) недосяжний UNC.
+                $mdEHost = '\\bravo-nonexistent.invalid\share'
+                $mdEIni = @('[model]', ('MODEL={0}\LIMS\MODEL\lims' -f $mdEHost))
+                $mdE = & $invokeMissingDriveDiscovery 'e' $mdEIni @() $null @() $missingDriveBase
+                $mdEOk = ($null -eq $mdE.Error -and $null -ne $mdE.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdEOk `
+                    -Name "Discovery/MissingDriveUncIniDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для недосяжного UNC у MODEL; отримано: $($mdE.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdEOk -and
+                        $mdE.Result.BAZA_APP -eq ('{0}\LIMS\BAZA' -f $mdEHost) -and
+                        $mdE.Result.Components['MODEL'].Presence -ne 'Present' -and
+                        $mdE.Result.Components['BAZA_APP'].Presence -ne 'Present'
+                    ) `
+                    -Name "Discovery/MissingDriveUncIniResolvesLexicalAndNotPresent" `
+                    -Failure "для недосяжного UNC BAZA_APP має бути лексично \\host\share\LIMS\BAZA, а MODEL/BAZA_APP Presence не 'Present'; помилка: $($mdE.Error)"
+                $mdEOverride = & $invokeMissingDriveDiscovery 'e-override' $mdEIni @() @{ Sources = @{ BAZA_APP = ('{0}\BAZA' -f $mdEHost) } } @() $missingDriveBase
+                $mdEOverrideOk = ($null -eq $mdEOverride.Error -and $null -ne $mdEOverride.Result)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdEOverrideOk -and
+                        $null -eq $mdEOverride.Result.BAZA_APP -and
+                        -not [string]::IsNullOrWhiteSpace([string]$mdEOverride.Result.Reasons.BAZA_APP) -and
+                        $mdEOverride.Result.Components['BAZA_APP'].Presence -ne 'Present'
+                    ) `
+                    -Name "Discovery/MissingDriveUncExplicitOverrideYieldsNullValueWithReason" `
+                    -Failure "явний override Sources.BAZA_APP на недосяжний UNC без винятку має давати BAZA_APP=`$null з Reason і Presence не 'Present'; отримано: $($mdEOverride.Error)"
+
+                # (f) недопустимий символ у шляху.
+                $mdF = & $invokeMissingDriveDiscovery 'f' @('[model]', 'MODEL=C:\LI|MS\MODEL\lims') @() $null @() $missingDriveBase
+                $mdFOk = ($null -eq $mdF.Error -and $null -ne $mdF.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdFOk `
+                    -Name "Discovery/MissingDriveInvalidPathCharDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для MODEL з недопустимим символом у шляху; отримано: $($mdF.Error)"
+                Test-BRAVOCondition `
+                    -Condition ($mdFOk -and $mdF.Result.Components['MODEL'].Presence -eq 'Error') `
+                    -Name "Discovery/MissingDriveInvalidPathCharModelPresenceIsError" `
+                    -Failure "MODEL з недопустимим символом у шляху має бути Presence='Error' (шлях не вдалося перевірити), а не Absent; помилка: $($mdF.Error)"
+
+                # (g) MODEL без каталожної частини.
+                $mdG = & $invokeMissingDriveDiscovery 'g' @('[model]', 'MODEL=lims') @() $null @() $missingDriveBase
+                $mdGOk = ($null -eq $mdG.Error -and $null -ne $mdG.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdGOk `
+                    -Name "Discovery/MissingDriveModelWithoutDirectoryDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для MODEL=lims (без каталогу); отримано: $($mdG.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdGOk -and
+                        $mdG.Result.Components['MODEL'].Presence -eq 'Absent' -and
+                        $mdG.Result.Components['MODEL'].AbsenceKind -eq 'NoPath'
+                    ) `
+                    -Name "Discovery/MissingDriveModelWithoutDirectoryIsAbsentNoPath" `
+                    -Failure "MODEL=lims (без каталожної частини) має бути Presence='Absent', AbsenceKind='NoPath'; помилка: $($mdG.Error)"
+
+                # (h) bravo.ini override на недосяжний UNC: без винятку.
+                $mdHIniPath = '\\bravo-nonexistent.invalid\share\bravo.ini'
+                $mdH = & $invokeMissingDriveDiscovery 'h' @('[model]') @() @{ BravoIniPath = $mdHIniPath } @() $missingDriveBase
+                $mdHOk = ($null -eq $mdH.Error -and $null -ne $mdH.Result)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdHOk -and
+                        ([string]$mdH.Result.Reasons.BravoIniPath).Contains($mdHIniPath) -and
+                        (([string]$mdH.Result.Reasons.BravoIniPath).Contains('недоступний') -or ([string]$mdH.Result.Reasons.BravoIniPath).Contains('якого не існує'))
+                    ) `
+                    -Name "Discovery/MissingDriveUncBravoIniOverrideDoesNotThrow" `
+                    -Failure "явний override BravoIniPath на недосяжний UNC не має кидати виняток і має давати структурну Reason (недоступний/не існує); отримано: $($mdH.Error)"
+
+                # (i) Apache-служба з exe на недосяжному UNC: без винятку.
+                $mdIService = & $newMissingDriveService 'Apache2.4' 'Apache2.4' '\\bravo-nonexistent.invalid\share\apache\bin\httpd.exe'
+                $mdI = & $invokeMissingDriveDiscovery 'i' @('[model]') @($mdIService) $null @('Apache2.4') $missingDriveBase
+                $mdIOk = ($null -eq $mdI.Error -and $null -ne $mdI.Result)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdIOk -and
+                        $null -eq $mdI.Result.BAZA_WWW -and
+                        $mdI.Result.BAZA_WWW_Presence -ne 'Present' -and
+                        $mdI.Result.Components['BAZA_WWW'].Presence -ne 'Present'
+                    ) `
+                    -Name "Discovery/MissingDriveUncApacheConfDoesNotThrow" `
+                    -Failure "Apache-служба з exe на недосяжному UNC не має кидати виняток, BAZA_WWW не 'Present'; отримано: $($mdI.Error)"
+            } finally {
+                if (Test-Path -LiteralPath $missingDriveBase) {
+                    Remove-Item -LiteralPath $missingDriveBase -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        # =====================================================================
         # PRODUCTION CONFIG LOADER: service-not-installed acceptance tests
         # =====================================================================
         # Усі тести Discovery/* вище викликають Resolve-BRAVOInstallationDiscovery
