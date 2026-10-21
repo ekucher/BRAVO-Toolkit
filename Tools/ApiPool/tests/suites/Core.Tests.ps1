@@ -294,6 +294,45 @@ try {
         Assert-ApiPoolTrue ($text -match 'Set-StrictMode -Version Latest') ('Static/StrictMode/' + $moduleFile.Name)
         Assert-ApiPoolTrue ($text -notmatch 'Import-Module') ('Static/NoCrossImport/' + $moduleFile.Name)
     }
+
+    # ---------------- F5 SEC-001: Resolve-ApiPoolStatePath (derived state paths) ----------------
+    $rsRoot = Join-Path $coreSandbox 'rs-state'
+    [void][System.IO.Directory]::CreateDirectory($rsRoot)
+    $rsOk = $null
+    try { $rsOk = Resolve-ApiPoolStatePath -StateRoot $rsRoot -RelativePath 'budget\ledger.jsonl' } catch { $rsOk = [string]$_.Exception.Message }
+    Assert-ApiPoolTrue ($rsOk -is [string] -and $rsOk -like '*\rs-state\budget\ledger.jsonl') 'StatePath/JoinsUnderRoot' ([string]$rsOk)
+    $rsOk2 = $null
+    try { $rsOk2 = Resolve-ApiPoolStatePath -StateRoot $rsRoot -RelativePath 'slots/slot-1.lock' } catch { $rsOk2 = [string]$_.Exception.Message }
+    Assert-ApiPoolTrue ($rsOk2 -is [string] -and $rsOk2 -like '*\rs-state\slots\slot-1.lock') 'StatePath/ForwardSlashAccepted' ([string]$rsOk2)
+    foreach ($badRel in @('', '..\x', 'a\..\..\x', '..', 'C:\x', '\x', '/x', 'a\\..\b', 'a:b', 'a\.\b')) {
+        Assert-ApiPoolThrows { Resolve-ApiPoolStatePath -StateRoot $rsRoot -RelativePath $badRel } ('StatePath/RejectsRelative/' + $badRel) -ExpectedCode 'STATE_PATH_FORBIDDEN'
+    }
+    Assert-ApiPoolThrows { Resolve-ApiPoolStatePath -StateRoot 'rel\root' -RelativePath 'budget' } 'StatePath/RejectsBadRoot' -ExpectedCode 'STATE_PATH_FORBIDDEN'
+    $rsTarget = Join-Path $coreSandbox 'rs-target'
+    $rsLink = Join-Path $rsRoot 'budget'
+    [void][System.IO.Directory]::CreateDirectory($rsTarget)
+    $null = & cmd.exe /c ('mklink /J "{0}" "{1}"' -f $rsLink, $rsTarget)
+    Assert-ApiPoolTrue ([System.IO.Directory]::Exists($rsLink)) 'StatePath/JunctionFixtureCreated'
+    try {
+        Assert-ApiPoolThrows { Resolve-ApiPoolStatePath -StateRoot $rsRoot -RelativePath 'budget' } 'StatePath/JunctionLeafRejected' -ExpectedCode 'STATE_PATH_FORBIDDEN'
+        Assert-ApiPoolThrows { Resolve-ApiPoolStatePath -StateRoot $rsRoot -RelativePath 'budget\ledger.lock' } 'StatePath/JunctionComponentRejected' -ExpectedCode 'STATE_PATH_FORBIDDEN'
+        Assert-ApiPoolThrows { Resolve-ApiPoolStatePath -StateRoot $rsRoot -RelativePath 'budget\quarantine\x.jsonl' } 'StatePath/JunctionDeepComponentRejected' -ExpectedCode 'STATE_PATH_FORBIDDEN'
+        $rsSibling = $null
+        try { $rsSibling = Resolve-ApiPoolStatePath -StateRoot $rsRoot -RelativePath 'jobs\a.json' } catch { $rsSibling = [string]$_.Exception.Message }
+        Assert-ApiPoolTrue ($rsSibling -is [string] -and $rsSibling -like '*\rs-state\jobs\a.json') 'StatePath/SiblingOfJunctionAccepted' ([string]$rsSibling)
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($rsLink)) { [System.IO.Directory]::Delete($rsLink, $false) }
+    }
+    Assert-ApiPoolEqual 0 @(Get-ChildItem -LiteralPath $rsTarget -Force).Count 'StatePath/JunctionTargetUntouched'
+
+    # F5 ARCH-002: config schemaVersion other than integer 1 is refused.
+    $svIndex = 0
+    foreach ($badSv in @(2, 0, '1', 1.5)) {
+        $svIndex++
+        $svPath = Write-CoreConfig ('sv-' + $svIndex) @{ schemaVersion = $badSv }
+        Assert-ApiPoolThrows { Read-ApiPoolConfig -Path $svPath } ('Config/SchemaVersionUnsupported/' + [string]$badSv) -ExpectedCode 'CONFIG_INVALID'
+    }
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $coreSandbox

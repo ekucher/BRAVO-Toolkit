@@ -557,6 +557,70 @@ try {
     Assert-ApiPoolEqual 'BUDGET_EXHAUSTED_JOB' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot $r -JobId 'jm' -AttemptId 'a2' -AmountMicroUsd 600 -PerJobLimitMicroUsd 1000 }) 'JobLimitMin/CurrentSmallerLimitStillApplies'
     $other = New-ApiPoolReservation -StateRoot $r -JobId 'jo' -AttemptId 'a1' -AmountMicroUsd 900 -PerJobLimitMicroUsd 1000000
     Assert-ApiPoolTrue ($null -ne $other) 'JobLimitMin/OtherJobUnaffected'
+
+    # ---------------- F5 SEC-001: derived paths under StateRoot must not pass through reparse points ----------------
+    $sjRoot = New-BudgetRoot
+    $sjTarget = Join-Path $budgetSandbox 'sj-target'
+    [void][System.IO.Directory]::CreateDirectory($sjRoot)
+    [void][System.IO.Directory]::CreateDirectory($sjTarget)
+    $sjLink = Join-Path $sjRoot 'budget'
+    $null = & cmd.exe /c ('mklink /J "{0}" "{1}"' -f $sjLink, $sjTarget)
+    Assert-ApiPoolTrue ([System.IO.Directory]::Exists($sjLink)) 'DerivedPath/BudgetJunctionFixtureCreated'
+    try {
+        Invoke-ApiPoolSandboxRefusal -Path $sjRoot -Name 'DerivedPath/InitializeRefusesBudgetJunction' -ScriptBlock { Initialize-ApiPoolLedger -StateRoot $sjRoot -GlobalLimitMicroUsd 1000 }
+        Invoke-ApiPoolSandboxRefusal -Path $sjRoot -Name 'DerivedPath/ReserveRefusesBudgetJunction' -ScriptBlock { New-ApiPoolReservation -StateRoot $sjRoot -JobId 'j' -AttemptId 'a' -AmountMicroUsd 1 -PerJobLimitMicroUsd 1 }
+        Invoke-ApiPoolSandboxRefusal -Path $sjRoot -Name 'DerivedPath/EmergencyStopRefusesBudgetJunction' -ScriptBlock { Set-ApiPoolEmergencyStop -StateRoot $sjRoot -Reason 'x' }
+        Invoke-ApiPoolSandboxRefusal -Path $sjRoot -Name 'DerivedPath/StatusRefusesBudgetJunction' -ScriptBlock { Get-ApiPoolBudgetStatus -StateRoot $sjRoot }
+        Invoke-ApiPoolSandboxRefusal -Path $sjRoot -Name 'DerivedPath/ClearStopRefusesBudgetJunction' -ScriptBlock { Clear-ApiPoolEmergencyStop -StateRoot $sjRoot -Reason 'x' }
+        Invoke-ApiPoolSandboxRefusal -Path $sjRoot -Name 'DerivedPath/RepairRefusesBudgetJunction' -ScriptBlock { Repair-ApiPoolLedger -StateRoot $sjRoot -Reason 'x' }
+        Assert-ApiPoolEqual 0 @(Get-ChildItem -LiteralPath $sjTarget -Force).Count 'DerivedPath/BudgetJunctionTargetStaysEmpty'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($sjLink)) { [System.IO.Directory]::Delete($sjLink, $false) }
+    }
+
+    # Quarantine directory is a junction: Repair must refuse before copying the ledger.
+    $sqRoot = New-BudgetFixture -Limit 10000
+    Add-BudgetRawText -Root $sqRoot -Text '{"seq":2,"torn'
+    $sqTarget = Join-Path $budgetSandbox 'sq-target'
+    [void][System.IO.Directory]::CreateDirectory($sqTarget)
+    $sqLink = Join-Path (Join-Path $sqRoot 'budget') 'quarantine'
+    $null = & cmd.exe /c ('mklink /J "{0}" "{1}"' -f $sqLink, $sqTarget)
+    Assert-ApiPoolTrue ([System.IO.Directory]::Exists($sqLink)) 'DerivedPath/QuarantineJunctionFixtureCreated'
+    try {
+        $sqBefore = Get-BudgetFileBase64 -Path (Get-BudgetLedgerPath -Root $sqRoot)
+        Invoke-ApiPoolSandboxRefusal -Path $sqRoot -Name 'DerivedPath/RepairRefusesQuarantineJunction' -ScriptBlock { Repair-ApiPoolLedger -StateRoot $sqRoot -Reason 'x' }
+        Assert-ApiPoolEqual 0 @(Get-ChildItem -LiteralPath $sqTarget -Force).Count 'DerivedPath/QuarantineJunctionTargetStaysEmpty'
+        Assert-ApiPoolEqual $sqBefore (Get-BudgetFileBase64 -Path (Get-BudgetLedgerPath -Root $sqRoot)) 'DerivedPath/RepairLeftLedgerUntouched'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($sqLink)) { [System.IO.Directory]::Delete($sqLink, $false) }
+    }
+
+    # ---------------- F5 ARCH-002: ledger INIT schema ----------------
+    $lsNew = New-BudgetFixture -Limit 7000
+    Assert-ApiPoolEqual 1 (@(Get-BudgetLedgerRecords -Root $lsNew)[0].data.PSObject.Properties['schemaVersion'].Value) 'LedgerSchema/NewInitCarriesSchemaVersion1'
+    Assert-ApiPoolEqual 'OK' (Get-ApiPoolBudgetStatus -StateRoot $lsNew).State 'LedgerSchema/NewInitIsReadable'
+    $lsCases = @(
+        @{ Name = 'LegacyInitWithoutVersion'; Data = [ordered]@{ globalLimitMicroUsd = 5000 }; State = 'OK' },
+        @{ Name = 'InitVersion1'; Data = [ordered]@{ globalLimitMicroUsd = 5000; schemaVersion = 1 }; State = 'OK' },
+        @{ Name = 'InitVersion2'; Data = [ordered]@{ globalLimitMicroUsd = 5000; schemaVersion = 2 }; State = 'CORRUPT' },
+        @{ Name = 'InitVersionString'; Data = [ordered]@{ globalLimitMicroUsd = 5000; schemaVersion = '1' }; State = 'CORRUPT' },
+        @{ Name = 'InitVersionZero'; Data = [ordered]@{ globalLimitMicroUsd = 5000; schemaVersion = 0 }; State = 'CORRUPT' }
+    )
+    foreach ($case in $lsCases) {
+        $lsRoot = New-BudgetRoot
+        [void][System.IO.Directory]::CreateDirectory((Join-Path $lsRoot 'budget'))
+        $lsLine = New-BudgetForgedLine -Seq 1 -Prev ('0' * 64) -Type 'INIT' -Data $case.Data
+        [System.IO.File]::WriteAllText((Get-BudgetLedgerPath -Root $lsRoot), ($lsLine + "`n"), $budgetUtf8)
+        $lsStatus = Get-ApiPoolBudgetStatus -StateRoot $lsRoot
+        Assert-ApiPoolEqual $case.State $lsStatus.State ('LedgerSchema/' + $case.Name + '/State')
+        if ($case.State -ceq 'CORRUPT') {
+            Assert-ApiPoolTrue ([string]$lsStatus.CorruptReason -like '*unsupported ledger schema*') ('LedgerSchema/' + $case.Name + '/Reason') ([string]$lsStatus.CorruptReason)
+            Assert-ApiPoolEqual 'LEDGER_CORRUPT' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot $lsRoot -JobId 'j' -AttemptId 'a' -AmountMicroUsd 1 -PerJobLimitMicroUsd 1 }) ('LedgerSchema/' + $case.Name + '/ReserveRefused')
+            Assert-ApiPoolEqual 1 @([System.IO.File]::ReadAllText((Get-BudgetLedgerPath -Root $lsRoot)).Split([char]10) | Where-Object { $_ -ne '' }).Count ('LedgerSchema/' + $case.Name + '/NoMutation')
+        }
+    }
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $budgetSandbox

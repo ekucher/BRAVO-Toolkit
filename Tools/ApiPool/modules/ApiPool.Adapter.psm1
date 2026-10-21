@@ -243,7 +243,7 @@ function ConvertTo-ApiPoolPreparedRequest {
         Invoke-ApiPoolThrow -Code 'CONFIG_INVALID' -Message 'The context has no model registry.'
     }
     $model = Get-ApiPoolModel -Registry $Context.Registry -Model ([string]$Request['model'])
-    if ($model.Id -notmatch '^[A-Za-z0-9._-]+$') {
+    if ($model.Id -cnotmatch '^[a-z0-9][a-z0-9\-\.]{0,63}$') {
         Invoke-ApiPoolThrow -Code 'REQUEST_INVALID' -Message 'The model id contains characters that are not allowed.'
     }
     if ([decimal]$Request['max_tokens'] -gt [decimal]$model.MaxOutputTokens) {
@@ -279,11 +279,10 @@ function Enter-ApiPoolSlot {
     $max = [int]$Context.Config.maxConcurrency
     $waitMs = [Math]::Min([int]$Context.Config.timeouts.requestTimeoutSec * 1000, 30000)
     $waited = 0
-    $dir = Join-Path $Context.StateRoot 'slots'
     while ($true) {
         if (Test-ApiPoolCancelled -CancelPath $CancelPath) { return $null }
         for ($n = 1; $n -le $max; $n++) {
-            $path = Join-Path $dir ('slot-{0}.lock' -f $n)
+            $path = Resolve-ApiPoolStatePath -StateRoot $Context.StateRoot -RelativePath ('slots\slot-{0}.lock' -f $n)
             try {
                 return (Enter-ApiPoolFileLock -Path $path -TimeoutMs 1 -TimeoutCode 'SLOT_TIMEOUT')
             }
@@ -302,8 +301,13 @@ function Enter-ApiPoolSlot {
 function Get-ApiPoolRatePath {
     param($Context, [string]$Model)
 
-    $dir = Join-Path $Context.StateRoot 'ratelimit'
-    return [pscustomobject]@{ State = (Join-Path $dir ($Model + '.json')); Lock = (Join-Path $dir ($Model + '.lock')) }
+    if ($Model -cnotmatch '^[a-z0-9][a-z0-9\-\.]{0,63}$') {
+        Invoke-ApiPoolThrow -Code 'REQUEST_INVALID' -Message 'The model id is not a safe state file name.'
+    }
+    return [pscustomobject]@{
+        State = (Resolve-ApiPoolStatePath -StateRoot $Context.StateRoot -RelativePath ('ratelimit\' + $Model + '.json'))
+        Lock  = (Resolve-ApiPoolStatePath -StateRoot $Context.StateRoot -RelativePath ('ratelimit\' + $Model + '.lock'))
+    }
 }
 
 function Read-ApiPoolRateState {
@@ -717,6 +721,10 @@ function Invoke-ApiPoolMessage {
         Invoke-ApiPoolThrow -Code 'INTERNAL_ERROR' -Message 'The context has no supported transport (only Fake exists in this build).'
     }
     $prepared = ConvertTo-ApiPoolPreparedRequest -Context $Context -Request $Request
+    # Derived state directories are validated before any reservation or transport call.
+    foreach ($derived in @('budget', 'slots', 'ratelimit')) {
+        [void](Resolve-ApiPoolStatePath -StateRoot $Context.StateRoot -RelativePath $derived)
+    }
     $perJob = $PerJobLimitMicroUsd
     if (-not $PSBoundParameters.ContainsKey('PerJobLimitMicroUsd')) {
         $perJob = [long][Math]::Floor([decimal]$Context.Config.perJobUsd * 1000000)

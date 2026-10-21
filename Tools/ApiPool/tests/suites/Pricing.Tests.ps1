@@ -137,6 +137,20 @@ try {
     Assert-ApiPoolTrue ($reservedT -ge (Get-ApiPoolActualCost -Model $tm -Usage (New-PricingUsage -In 3000 -Out 500))) 'Reservation/BoundsActual/TieredModel'
     $reservedLow = Get-ApiPoolReservationCost -Model $tm -BodyBytes 100 -MessageCount 1 -MaxTokens 500
     Assert-ApiPoolTrue ($reservedLow -ge (Get-ApiPoolActualCost -Model $tm -Usage (New-PricingUsage -In 100 -Out 500))) 'Reservation/BoundsActual/TieredLowTier'
+
+    # ---------------- F5 ARCH-002: registry schemaVersion ----------------
+    $shippedRegText = [System.IO.File]::ReadAllText((Join-Path $script:ConfigRoot 'models.json'))
+    $svRegIdx = 0
+    foreach ($svJson in @('2', '0', '"1"', '1.5', 'null')) {
+        $svRegIdx++
+        $svRegPath = Join-Path $pricingSandbox ('sv-registry-' + $svRegIdx + '.json')
+        [System.IO.File]::WriteAllText($svRegPath, ($shippedRegText -replace '"schemaVersion":\s*1', ('"schemaVersion": ' + $svJson)))
+        Assert-ApiPoolThrows { Import-ApiPoolModelRegistry -Path $svRegPath } ('Registry/SchemaVersionUnsupported/' + $svJson) -ExpectedCode 'CONFIG_INVALID'
+    }
+    $svRegMissing = Join-Path $pricingSandbox 'sv-registry-missing.json'
+    [System.IO.File]::WriteAllText($svRegMissing, ($shippedRegText -replace '"schemaVersion":\s*1,', ''))
+    Assert-ApiPoolThrows { Import-ApiPoolModelRegistry -Path $svRegMissing } 'Registry/SchemaVersionMissing' -ExpectedCode 'CONFIG_INVALID'
+    Assert-ApiPoolEqual 1 $registry.SchemaVersion 'Registry/ShippedSchemaVersionIsOne'
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $pricingSandbox

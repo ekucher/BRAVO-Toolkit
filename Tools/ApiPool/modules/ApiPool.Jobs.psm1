@@ -42,13 +42,13 @@ function Get-ApiPoolJobPath {
         Invoke-ApiPoolThrow -Code 'REQUEST_INVALID' -Message 'JobId has an invalid format.'
     }
     $root = Assert-ApiPoolStateRoot -StateRoot $StateRoot
-    $dir = Join-Path $root 'jobs'
+    # Every derived path goes through the canonical resolver (reparse points below the root are refused).
     return [pscustomobject]@{
         Root   = $root
-        Dir    = $dir
-        File   = Join-Path $dir ($JobId + '.json')
-        Lock   = Join-Path $dir ($JobId + '.lock')
-        Cancel = Join-Path $dir ($JobId + '.cancel')
+        Dir    = Resolve-ApiPoolStatePath -StateRoot $root -RelativePath 'jobs'
+        File   = Resolve-ApiPoolStatePath -StateRoot $root -RelativePath ('jobs\' + $JobId + '.json')
+        Lock   = Resolve-ApiPoolStatePath -StateRoot $root -RelativePath ('jobs\' + $JobId + '.lock')
+        Cancel = Resolve-ApiPoolStatePath -StateRoot $root -RelativePath ('jobs\' + $JobId + '.cancel')
     }
 }
 
@@ -101,6 +101,11 @@ function Read-ApiPoolJobDocument {
         if ($null -eq $doc.PSObject.Properties[$k]) {
             Invoke-ApiPoolThrow -Code 'JOB_CORRUPT' -Message ("The job file is missing '{0}'." -f $k)
         }
+    }
+    # A newer/unknown format must never be mutated with v1 semantics (central check: every reader goes through here).
+    $sv = $doc.schemaVersion
+    if (-not (($sv -is [int] -or $sv -is [long]) -and [long]$sv -eq 1)) {
+        Invoke-ApiPoolThrow -Code 'JOB_SCHEMA_UNSUPPORTED' -Message 'The job file has an unsupported schemaVersion (expected 1); it is not modified.'
     }
     if (-not ($script:ApiPoolJobAllStates -ccontains [string]$doc.state)) {
         Invoke-ApiPoolThrow -Code 'JOB_CORRUPT' -Message 'The job file has an unknown state.'
@@ -547,8 +552,14 @@ function Get-ApiPoolHealth {
     $counts = [ordered]@{}
     foreach ($s in $script:ApiPoolJobAllStates) { $counts[$s] = 0 }
     $counts['unreadable'] = 0
-    $jobsDir = Join-Path $Context.StateRoot 'jobs'
-    if ([System.IO.Directory]::Exists($jobsDir)) {
+    $jobsDir = $null
+    $jobsSafe = $true
+    try { $jobsDir = Resolve-ApiPoolStatePath -StateRoot $Context.StateRoot -RelativePath 'jobs' }
+    catch {
+        $jobsSafe = $false
+        [void]$issues.Add('jobs directory is not a safe path')
+    }
+    if ($null -ne $jobsDir -and [System.IO.Directory]::Exists($jobsDir)) {
         foreach ($f in [System.IO.Directory]::GetFiles($jobsDir, 'job-*.json')) {
             try {
                 $doc = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($f))
@@ -563,7 +574,7 @@ function Get-ApiPoolHealth {
     if ([int]$counts['unreadable'] -gt 0) { [void]$issues.Add('some job files are unreadable') }
     if ([int]$counts['interrupted'] -gt 0) { [void]$issues.Add('interrupted jobs await resume or cancel') }
 
-    $ok = ($mode -ceq 'offline') -and ([string]$budget['state'] -ceq 'OK') -and $writable
+    $ok = ($mode -ceq 'offline') -and ([string]$budget['state'] -ceq 'OK') -and $writable -and $jobsSafe
     return [pscustomobject]@{
         ok               = [bool]$ok
         mode             = $mode

@@ -674,6 +674,62 @@ try {
     $liveCfg.mode = 'live'
     $liveCtx = [pscustomobject]@{ StateRoot = $envLive.Root; Config = $liveCfg; Registry = $adpRegistry; Transport = $envLive.Transport; CredentialProvider = $null; Clock = $envLive.Context.Clock; Sleep = $envLive.Context.Sleep }
     Assert-ApiPoolThrows { Invoke-ApiPoolMessage -Context $liveCtx -JobId 'j' -Request (New-AdpRequest) } 'Live/AdapterRefusesLiveMode' -ExpectedCode 'LIVE_DISABLED_IN_BUILD'
+
+    # ---------------------------------------------------------------- F5 SEC-001: slots / ratelimit junctions, model id
+    foreach ($dirName in @('slots', 'ratelimit')) {
+        $envJn = New-AdpEnv -Responses @((Get-AdpOk))
+        $jnTarget = Join-Path $adpSandbox ('jn-target-' + $dirName)
+        [void][System.IO.Directory]::CreateDirectory($jnTarget)
+        $jnLink = Join-Path $envJn.Root $dirName
+        $null = & cmd.exe /c ('mklink /J "{0}" "{1}"' -f $jnLink, $jnTarget)
+        Assert-ApiPoolTrue -Condition ([System.IO.Directory]::Exists($jnLink)) -Name ('Junction/' + $dirName + '/FixtureCreated')
+        try {
+            Invoke-ApiPoolSandboxRefusal -Path $envJn.Root -Name ('Junction/' + $dirName + '/MessageRefused') -ScriptBlock { Invoke-AdpMessage -Env $envJn }
+            Assert-ApiPoolEqual -Expected 0 -Actual @(Get-ApiPoolFakeTransportCall -Transport $envJn.Transport).Count -Name ('Junction/' + $dirName + '/NoTransportCall')
+            Assert-ApiPoolEqual -Expected 0 -Actual @(Get-ChildItem -LiteralPath $jnTarget -Force).Count -Name ('Junction/' + $dirName + '/TargetStaysEmpty')
+            Assert-ApiPoolEqual -Expected 'INIT' -Actual ((Get-AdpLedgerRecords -Root $envJn.Root | ForEach-Object { $_.type }) -join ',') -Name ('Junction/' + $dirName + '/NoReservation')
+        }
+        finally {
+            if ([System.IO.Directory]::Exists($jnLink)) { [System.IO.Directory]::Delete($jnLink, $false) }
+        }
+    }
+
+    # A model id that is not a safe file name is refused before any reservation or transport call.
+    $badRegText = [System.IO.File]::ReadAllText((Join-Path $script:ConfigRoot 'models.json')).Replace('"claude-sonnet-5-5"', '"Claude_Sonnet-5-5"')
+    $badRegPath = Join-Path $adpSandbox 'models-unsafe-id.json'
+    [System.IO.File]::WriteAllText($badRegPath, $badRegText)
+    $envMid = New-AdpEnv -Responses @((Get-AdpOk))
+    $envMid.Context.Registry = Import-ApiPoolModelRegistry -Path $badRegPath
+    $midReq = New-AdpRequest
+    $midReq['model'] = 'Claude_Sonnet-5-5'
+    Assert-ApiPoolThrows { Invoke-AdpMessage -Env $envMid -Request $midReq } 'ModelId/UnsafeFileNameRefused' -ExpectedCode 'REQUEST_INVALID'
+    Assert-ApiPoolEqual -Expected 0 -Actual @(Get-ApiPoolFakeTransportCall -Transport $envMid.Transport).Count -Name 'ModelId/NoTransportCall'
+    Assert-ApiPoolEqual -Expected 'INIT' -Actual ((Get-AdpLedgerRecords -Root $envMid.Root | ForEach-Object { $_.type }) -join ',') -Name 'ModelId/NoReservation'
+
+    # ---------------------------------------------------------------- QA-001 follow-up: cancel strictly AFTER the reservation and BEFORE the transport call
+    # The injected clock creates the marker on the first clock read after the rate-limit state file exists. The rate claim
+    # reads the clock first and writes the file afterwards, so the next read is the timestamp of the RESERVE record.
+    $cancelAfterRsv = Join-Path $adpSandbox 'cancel-after-reserve.flag'
+    $envCa = New-AdpEnv -Responses @((Get-AdpOk))
+    $caState = $envCa.State
+    $caRateFile = Join-Path (Join-Path $envCa.Root 'ratelimit') 'claude-sonnet-5-5.json'
+    $caFlag = @{ MarkerWrittenAfterClaim = $false }
+    $envCa.Context.Clock = {
+        if ([System.IO.File]::Exists($caRateFile) -and -not [System.IO.File]::Exists($cancelAfterRsv)) {
+            [System.IO.File]::WriteAllText($cancelAfterRsv, 'x')
+            $caFlag.MarkerWrittenAfterClaim = $true
+        }
+        $caState.Now
+    }.GetNewClosure()
+    $resCa = Invoke-AdpMessage -Env $envCa -CancelPath $cancelAfterRsv
+    Assert-ApiPoolTrue -Condition $caFlag.MarkerWrittenAfterClaim -Name 'CancelAfterReserve/MarkerCreatedAfterRateClaim'
+    Assert-ApiPoolEqual -Expected 'CANCELLED' -Actual $resCa.Code -Name 'CancelAfterReserve/Code'
+    Assert-ApiPoolEqual -Expected 0 -Actual @(Get-ApiPoolFakeTransportCall -Transport $envCa.Transport).Count -Name 'CancelAfterReserve/NoTransportCall'
+    Assert-ApiPoolEqual -Expected 1 -Actual @($resCa.ReservationIds).Count -Name 'CancelAfterReserve/ReservationWasMade'
+    Assert-ApiPoolEqual -Expected 'INIT,RESERVE,UNDO' -Actual ((Get-AdpLedgerRecords -Root $envCa.Root | ForEach-Object { $_.type }) -join ',') -Name 'CancelAfterReserve/ReservationUndone'
+    $caStatus = Get-ApiPoolBudgetStatus -StateRoot $envCa.Root
+    Assert-ApiPoolEqual -Expected 0 -Actual $caStatus.ReservedMicroUsd -Name 'CancelAfterReserve/ReservedZero'
+    Assert-ApiPoolEqual -Expected 0 -Actual $caStatus.CommittedMicroUsd -Name 'CancelAfterReserve/CommittedZero'
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $adpSandbox

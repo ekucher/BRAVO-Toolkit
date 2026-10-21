@@ -319,6 +319,64 @@ try {
         Assert-ApiPoolEqual -Expected 700 -Actual $wo.costMicroUsd -Name 'Restart/ResultPersisted'
         Assert-ApiPoolEqual -Expected 'none' -Actual $wo.reviewSource -Name 'Restart/ForcedFieldPersisted'
     }
+
+    # ---------------------------------------------------------------- F5 ARCH-002: job schemaVersion
+    $e30 = New-JbEnv -Responses @((New-JbOkResp))
+    $j30 = Submit-JbJob -Env $e30 -Key 'schema-v2'
+    $j30Path = Join-Path (Join-Path $e30.Root 'jobs') ($j30.jobId + '.json')
+    foreach ($badVersion in @('2', '0', '"1"', '1.5', 'null', 'true')) {
+        $orig = [System.IO.File]::ReadAllText($j30Path)
+        $mutated = [regex]::Replace($orig, '"schemaVersion":1', ('"schemaVersion":' + $badVersion))
+        Assert-ApiPoolTrue -Condition ($mutated -cne $orig) -Name ('Schema/Fixture/' + $badVersion)
+        [System.IO.File]::WriteAllText($j30Path, $mutated)
+        $beforeBytes = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($j30Path))
+        $callsBefore = Get-JbCalls -Env $e30
+        Assert-ApiPoolThrows { Get-ApiPoolJob -StateRoot $e30.Root -JobId $j30.jobId } ('Schema/StatusRefused/' + $badVersion) -ExpectedCode 'JOB_SCHEMA_UNSUPPORTED'
+        Assert-ApiPoolThrows { Get-ApiPoolJobResult -StateRoot $e30.Root -JobId $j30.jobId } ('Schema/ResultRefused/' + $badVersion) -ExpectedCode 'JOB_SCHEMA_UNSUPPORTED'
+        Assert-ApiPoolThrows { Invoke-ApiPoolJob -Context $e30.Context -JobId $j30.jobId -CatalogPath $jbCatalog } ('Schema/RunRefused/' + $badVersion) -ExpectedCode 'JOB_SCHEMA_UNSUPPORTED'
+        Assert-ApiPoolThrows { Stop-ApiPoolJob -StateRoot $e30.Root -JobId $j30.jobId } ('Schema/CancelRefused/' + $badVersion) -ExpectedCode 'JOB_SCHEMA_UNSUPPORTED'
+        Assert-ApiPoolThrows { Resume-ApiPoolJob -Context $e30.Context -JobId $j30.jobId -Reason 'try' } ('Schema/ResumeRefused/' + $badVersion) -ExpectedCode 'JOB_SCHEMA_UNSUPPORTED'
+        Assert-ApiPoolThrows { Submit-JbJob -Env $e30 -Key 'schema-v2' } ('Schema/ResubmitRefused/' + $badVersion) -ExpectedCode 'JOB_SCHEMA_UNSUPPORTED'
+        Assert-ApiPoolEqual -Expected $beforeBytes -Actual ([System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($j30Path))) -Name ('Schema/FileUntouched/' + $badVersion)
+        Assert-ApiPoolEqual -Expected $callsBefore -Actual (Get-JbCalls -Env $e30) -Name ('Schema/NoTransportCall/' + $badVersion)
+        Assert-ApiPoolEqual -Expected 0 -Actual (Get-JbReserveCount -Env $e30) -Name ('Schema/NoReservation/' + $badVersion)
+        [System.IO.File]::WriteAllText($j30Path, $orig)
+    }
+    $schemaCaught = $null
+    [System.IO.File]::WriteAllText($j30Path, ([System.IO.File]::ReadAllText($j30Path) -replace '"schemaVersion":1', '"schemaVersion":2'))
+    try { $null = Get-ApiPoolJob -StateRoot $e30.Root -JobId $j30.jobId } catch { $schemaCaught = $_ }
+    Assert-ApiPoolTrue -Condition ($null -ne $schemaCaught -and $schemaCaught.TargetObject.Retryable -eq $false) -Name 'Schema/NotRetryable'
+    [System.IO.File]::WriteAllText($j30Path, ([System.IO.File]::ReadAllText($j30Path) -replace '"schemaVersion":2', '"schemaVersion":1'))
+    Assert-ApiPoolEqual -Expected 'queued' -Actual (Get-ApiPoolJob -StateRoot $e30.Root -JobId $j30.jobId).state -Name 'Schema/Version1StillReadable'
+    # A missing schemaVersion stays JOB_CORRUPT (not "unsupported").
+    [System.IO.File]::WriteAllText($j30Path, ([System.IO.File]::ReadAllText($j30Path) -replace '"schemaVersion":1,', ''))
+    Assert-ApiPoolThrows { Get-ApiPoolJob -StateRoot $e30.Root -JobId $j30.jobId } 'Schema/MissingStaysCorrupt' -ExpectedCode 'JOB_CORRUPT'
+
+    # ---------------------------------------------------------------- F5 SEC-001: job id and jobs directory
+    foreach ($badId in @('..\..\evil', 'job-../../../x', 'job-AAAAAAAAAAAAAAAAAAAAAAAA', 'job-0123456789abcdef0123456', 'job-0123456789abcdef012345678', 'job-0123456789abcdef01234567.json')) {
+        Assert-ApiPoolThrows { Get-ApiPoolJob -StateRoot $e30.Root -JobId $badId } ('JobId/StatusRefused/' + $badId) -ExpectedCode 'REQUEST_INVALID'
+        Assert-ApiPoolThrows { Stop-ApiPoolJob -StateRoot $e30.Root -JobId $badId } ('JobId/CancelRefused/' + $badId) -ExpectedCode 'REQUEST_INVALID'
+        Assert-ApiPoolThrows { Invoke-ApiPoolJob -Context $e30.Context -JobId $badId -CatalogPath $jbCatalog } ('JobId/RunRefused/' + $badId) -ExpectedCode 'REQUEST_INVALID'
+        Assert-ApiPoolThrows { Resume-ApiPoolJob -Context $e30.Context -JobId $badId -Reason 'x' } ('JobId/ResumeRefused/' + $badId) -ExpectedCode 'REQUEST_INVALID'
+    }
+    $e31 = New-JbEnv -Responses @((New-JbOkResp))
+    $jobsTarget = Join-Path $jbSandbox 'jobs-target'
+    [void][System.IO.Directory]::CreateDirectory($jobsTarget)
+    $jobsLink = Join-Path $e31.Root 'jobs'
+    $null = & cmd.exe /c ('mklink /J "{0}" "{1}"' -f $jobsLink, $jobsTarget)
+    Assert-ApiPoolTrue -Condition ([System.IO.Directory]::Exists($jobsLink)) -Name 'JobsJunction/FixtureCreated'
+    try {
+        Invoke-ApiPoolSandboxRefusal -Path $e31.Root -Name 'JobsJunction/SubmitRefused' -ScriptBlock { Submit-JbJob -Env $e31 -Key 'junction' }
+        Invoke-ApiPoolSandboxRefusal -Path $e31.Root -Name 'JobsJunction/StatusRefused' -ScriptBlock { Get-ApiPoolJob -StateRoot $e31.Root -JobId ('job-' + ('a' * 24)) }
+        Invoke-ApiPoolSandboxRefusal -Path $e31.Root -Name 'JobsJunction/CancelRefused' -ScriptBlock { Stop-ApiPoolJob -StateRoot $e31.Root -JobId ('job-' + ('a' * 24)) }
+        Invoke-ApiPoolSandboxRefusal -Path $e31.Root -Name 'JobsJunction/RunRefused' -ScriptBlock { Invoke-ApiPoolJob -Context $e31.Context -JobId ('job-' + ('a' * 24)) -CatalogPath $jbCatalog }
+        $healthJ = Get-ApiPoolHealth -Context $e31.Context
+        Assert-ApiPoolTrue -Condition (@($healthJ.issues | Where-Object { $_ -like '*jobs*' }).Count -ge 1) -Name 'JobsJunction/HealthReportsUnsafeJobsDir'
+        Assert-ApiPoolEqual -Expected 0 -Actual @(Get-ChildItem -LiteralPath $jobsTarget -Force).Count -Name 'JobsJunction/TargetStaysEmpty'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($jobsLink)) { [System.IO.Directory]::Delete($jobsLink, $false) }
+    }
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $jbSandbox

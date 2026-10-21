@@ -139,6 +139,10 @@ function Import-ApiPoolModelRegistry {
     try { $doc = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($Path)) } catch {
         Invoke-ApiPoolThrow -Code 'CONFIG_INVALID' -Message ("Model registry is not valid JSON: {0}" -f $Path)
     }
+    $registrySchema = Get-ApiPoolMember -Object $doc -Name 'schemaVersion'
+    if (-not (($registrySchema -is [int] -or $registrySchema -is [long]) -and [long]$registrySchema -eq 1)) {
+        Invoke-ApiPoolThrow -Code 'CONFIG_INVALID' -Message ("Model registry schemaVersion must be 1: {0}" -f $Path)
+    }
     $modelsRaw = Get-ApiPoolMember -Object $doc -Name 'models'
     if ($null -eq $modelsRaw -or $modelsRaw -isnot [System.Management.Automation.PSCustomObject]) {
         Invoke-ApiPoolThrow -Code 'CONFIG_INVALID' -Message "Model registry must contain a 'models' object."

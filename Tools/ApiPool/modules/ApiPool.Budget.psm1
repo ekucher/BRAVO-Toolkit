@@ -30,14 +30,15 @@ $script:ApiPoolOverrunReason = 'automatic: cost bound violated'
 function Get-ApiPoolLedgerPaths {
     param([string]$StateRoot)
 
+    # Every derived path goes through the canonical resolver (reparse points below the root are refused).
     $root = Assert-ApiPoolStateRoot -StateRoot $StateRoot
-    $dir = Join-Path $root 'budget'
+    $dir = Resolve-ApiPoolStatePath -StateRoot $root -RelativePath 'budget'
     return [pscustomobject]@{
         Root       = $root
         Dir        = $dir
-        Ledger     = Join-Path $dir 'ledger.jsonl'
-        Lock       = Join-Path $dir 'ledger.lock'
-        Marker     = Join-Path $dir 'EMERGENCY_STOP'
+        Ledger     = Resolve-ApiPoolStatePath -StateRoot $root -RelativePath 'budget\ledger.jsonl'
+        Lock       = Resolve-ApiPoolStatePath -StateRoot $root -RelativePath 'budget\ledger.lock'
+        Marker     = Resolve-ApiPoolStatePath -StateRoot $root -RelativePath 'budget\EMERGENCY_STOP'
         Quarantine = Join-Path $dir 'quarantine'
     }
 }
@@ -134,7 +135,16 @@ function Test-ApiPoolLedgerLine {
     if ($rec.data -isnot [System.Management.Automation.PSCustomObject]) { return (& $bad 'shape' 'data is not an object') }
     $spec = $script:ApiPoolLedgerTypeSpec[[string]$rec.type]
     $dataNames = @($rec.data.PSObject.Properties | ForEach-Object { $_.Name })
-    if ($dataNames.Count -ne $spec.Count) { return (& $bad 'semantic' ("data of {0} at seq {1} has unexpected fields" -f $rec.type, $ExpectedSeq)) }
+    $specCount = $spec.Count
+    if ($rec.type -ceq 'INIT' -and $dataNames -ccontains 'schemaVersion') {
+        # INIT may carry schemaVersion (new ledgers write 1; a missing field means v1). Anything else is a newer/unknown format.
+        $sv = $rec.data.schemaVersion
+        if (-not (($sv -is [int] -or $sv -is [long]) -and [long]$sv -eq 1)) {
+            return (& $bad 'semantic' 'unsupported ledger schema (INIT schemaVersion must be 1)')
+        }
+        $specCount++
+    }
+    if ($dataNames.Count -ne $specCount) { return (& $bad 'semantic' ("data of {0} at seq {1} has unexpected fields" -f $rec.type, $ExpectedSeq)) }
     foreach ($field in $spec.Keys) {
         if ($dataNames -cnotcontains $field) { return (& $bad 'semantic' ("data of {0} at seq {1} lacks '{2}'" -f $rec.type, $ExpectedSeq, $field)) }
         if (-not (Test-ApiPoolLedgerFieldKind -Value $rec.data.$field -Kind $spec[$field])) {
@@ -386,7 +396,7 @@ function Initialize-ApiPoolLedger {
             }
             return [pscustomobject]@{ Created = $false; GlobalLimitMicroUsd = $ledger.Limit }
         }
-        Add-ApiPoolLedgerRecord -Ledger $ledger -Paths $paths -Clock $Clock -Type 'INIT' -Data ([ordered]@{ globalLimitMicroUsd = $GlobalLimitMicroUsd })
+        Add-ApiPoolLedgerRecord -Ledger $ledger -Paths $paths -Clock $Clock -Type 'INIT' -Data ([ordered]@{ globalLimitMicroUsd = $GlobalLimitMicroUsd; schemaVersion = 1 })
         return [pscustomobject]@{ Created = $true; GlobalLimitMicroUsd = $GlobalLimitMicroUsd }
     }
     finally {
@@ -739,6 +749,8 @@ function Repair-ApiPoolLedger {
 
     $paths = Get-ApiPoolLedgerPaths -StateRoot $StateRoot
     Assert-ApiPoolNonEmptyText -Value $Reason -Name 'Reason'
+    # The quarantine directory is validated before the lock is taken and before anything is copied.
+    $quarantineDir = Resolve-ApiPoolStatePath -StateRoot $paths.Root -RelativePath 'budget\quarantine'
     $lock = Enter-ApiPoolFileLock -Path $paths.Lock -TimeoutMs $LockTimeoutMs
     try {
         $ledger = Read-ApiPoolLedger -Paths $paths
@@ -751,11 +763,11 @@ function Repair-ApiPoolLedger {
         $all = [System.IO.File]::ReadAllBytes($paths.Ledger)
         $prefixLen = [int]$ledger.TornPrefixBytes
         $stamp = (Get-ApiPoolLedgerTimestamp -Clock $Clock).Replace(':', '').Replace('-', '').Replace('.', '')
-        $quarantine = Join-Path $paths.Quarantine ('ledger-{0}.jsonl' -f $stamp)
+        $quarantine = Resolve-ApiPoolStatePath -StateRoot $paths.Root -RelativePath ('budget\quarantine\ledger-{0}.jsonl' -f $stamp)
         if ([System.IO.File]::Exists($quarantine)) {
-            $quarantine = Join-Path $paths.Quarantine ('ledger-{0}-{1}.jsonl' -f $stamp, [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $quarantine = Resolve-ApiPoolStatePath -StateRoot $paths.Root -RelativePath ('budget\quarantine\ledger-{0}-{1}.jsonl' -f $stamp, [guid]::NewGuid().ToString('N').Substring(0, 8))
         }
-        if (-not [System.IO.Directory]::Exists($paths.Quarantine)) { [void][System.IO.Directory]::CreateDirectory($paths.Quarantine) }
+        if (-not [System.IO.Directory]::Exists($quarantineDir)) { [void][System.IO.Directory]::CreateDirectory($quarantineDir) }
         [System.IO.File]::Copy($paths.Ledger, $quarantine, $false)
 
         $kept = New-Object byte[] $prefixLen

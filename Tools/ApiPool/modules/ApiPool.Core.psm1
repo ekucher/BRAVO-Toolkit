@@ -542,6 +542,56 @@ function Assert-ApiPoolStateRoot {
     return (Assert-ApiPoolSafePath -Path $StateRoot -Purpose 'State root' -RepoRoot $RepoRoot)
 }
 
+function Resolve-ApiPoolStatePath {
+    # Canonical resolver for every path DERIVED from the state root (budget\, jobs\, slots\, ratelimit\ ...).
+    # Joins the relative path under the validated root and returns the full path. Rejects (STATE_PATH_FORBIDDEN):
+    # empty/rooted/drive-qualified relative parts, '.', '..' and empty segments, invalid file-name characters,
+    # a result outside the root, and ANY existing component between the root and the leaf (leaf included) that is
+    # a reparse point (junction or symbolic link, including a dangling one). Must run before every open/create/write.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$StateRoot,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$RelativePath
+    )
+
+    $root = Assert-ApiPoolStateRoot -StateRoot $StateRoot
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'A derived state path must not be empty.'
+    }
+    if ($RelativePath.Contains(':') -or $RelativePath.StartsWith('\') -or $RelativePath.StartsWith('/')) {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'A derived state path must be relative to the state root.'
+    }
+    $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+    $current = $root
+    foreach ($part in $RelativePath.Split([char[]]@('\', '/'))) {
+        if ([string]::IsNullOrEmpty($part) -or $part -ceq '.' -or $part -ceq '..' -or $part.TrimEnd('.', ' ') -cne $part -or $part.IndexOfAny($invalidChars) -ge 0) {
+            Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'A derived state path contains a forbidden segment.'
+        }
+        $current = Join-Path $current $part
+        $attrs = $null
+        try { $attrs = [System.IO.File]::GetAttributes($current) }
+        catch [System.IO.FileNotFoundException] { $attrs = $null }
+        catch [System.IO.DirectoryNotFoundException] { $attrs = $null }
+        catch {
+            Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'A derived state path component could not be inspected.'
+        }
+        if ($null -ne $attrs -and (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'A derived state path must not pass through a reparse point (junction or symbolic link).'
+        }
+    }
+    $full = [System.IO.Path]::GetFullPath($current)
+    if (-not $full.StartsWith($root.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'A derived state path escapes the state root.'
+    }
+    return $full
+}
+
 function New-ApiPoolContext {
     [CmdletBinding()]
     param(
@@ -800,6 +850,7 @@ Export-ModuleMember -Function @(
     'Add-ApiPoolLineDurable',
     'Assert-ApiPoolSafePath',
     'Assert-ApiPoolStateRoot',
+    'Resolve-ApiPoolStatePath',
     'New-ApiPoolContext',
     'Read-ApiPoolConfig'
 )

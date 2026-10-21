@@ -172,6 +172,17 @@ try {
     Assert-ApiPoolEqual -Expected 'partial' -Actual $outBadResult.Handoff['result'] -Name 'Malformed/InvalidResultReplaced'
     Assert-ApiPoolTrue -Condition (@($outBadResult.Warnings | Where-Object { $_ -like 'HANDOFF_RESULT_INVALID*' }).Count -eq 1) -Name 'Malformed/InvalidResultWarned'
     Assert-ApiPoolEqual -Expected 'blocked' -Actual (ConvertFrom-ApiPoolAgentOutput -RoleObject $scout -Text "HANDOFF`nresult: blocked").Handoff['result'] -Name 'Malformed/BlockedAccepted'
+
+    # ---------------------------------------------------------------- F5 ARCH-002: catalog schemaVersion
+    $svRole = '"description":"d","model":"claude-sonnet-5-5","maxTokens":100,"systemPrompt":"p","allowedOutputChars":1000'
+    $svIdx = 0
+    foreach ($svJson in @('2', '0', '"1"', '1.5', 'null')) {
+        $svIdx++
+        $svCat = Write-AgCatalog -Name ('sv' + $svIdx + '.json') -Json ('{"schemaVersion":' + $svJson + ',"roles":{"api-x":{' + $svRole + '}}}')
+        Assert-ApiPoolThrows { Get-ApiPoolAgentRole -CatalogPath $svCat -Role 'api-x' } ('Catalog/SchemaVersionUnsupported/' + $svJson) -ExpectedCode 'CONFIG_INVALID'
+    }
+    $svMissing = Write-AgCatalog -Name 'svmissing.json' -Json ('{"roles":{"api-x":{' + $svRole + '}}}')
+    Assert-ApiPoolThrows { Get-ApiPoolAgentRole -CatalogPath $svMissing -Role 'api-x' } 'Catalog/SchemaVersionMissing' -ExpectedCode 'CONFIG_INVALID'
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $agSandbox
