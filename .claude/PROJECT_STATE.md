@@ -301,7 +301,7 @@ BLOCKED.
    бот Codex без незакритих зауважень. Merge — лише за явною
    авторизацією власника. Перед merge перечитати:
      gh pr view 503 --json headRefOid,mergeStateStatus   # очікується ed64015, CLEAN
-     gh api repos/ekucher/BRAVO-Toolkit/pulls/503/comments   # нові inline-зауваження бота
+     gh api --paginate repos/ekucher/BRAVO-Toolkit/pulls/503/comments   # усі сторінки; нові inline-зауваження бота
    Новий head або нове зауваження бота P0–P2 → виправити в гілці
    fix/501-snapshot-consistency-followup, не мержити.
    Порядок merge: спочатку #503, потім #504 (#504 описує #503 як не злитий
