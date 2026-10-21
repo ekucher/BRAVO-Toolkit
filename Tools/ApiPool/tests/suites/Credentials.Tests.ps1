@@ -138,20 +138,17 @@ Assert-ApiPoolTestPathInSandbox -Path $dpapiPath
     }
 
     # ---------------- F1-5: SecretPath guard ----------------
-    # Real-system forbidden paths go ONLY to the pure validator first; a write function is invoked only if the
-    # validator rejected the path (Invoke-ApiPoolGuardedRefusal). Relative paths are validator-only (no CWD dependence).
+    # Real-system forbidden paths are passed ONLY to the pure validator (never to a writer). Writer refusal is
+    # covered below with sandbox-structural paths only.
     $credRepoRoot = Split-Path -Parent (Split-Path -Parent $script:ApiRoot)
-    $realBadPaths = @('\\localhost\C$\x\s.dpapi', '//localhost/C$/x/s.dpapi', '\\127.0.0.1\c$\x\s.dpapi', '\\?\C:\x\s.dpapi', '\\.\C:\x\s.dpapi', 'C:\ProgramData\BRAVO\s.dpapi', (Join-Path $credRepoRoot 'x\s.dpapi'))
+    $realBadPaths = @('\\localhost\C$\x\s.dpapi', '//localhost/C$/x/s.dpapi', '\\127.0.0.1\c$\x\s.dpapi', '\\?\C:\x\s.dpapi', '\\.\C:\x\s.dpapi', 'C:\ProgramData\BRAVO\s.dpapi', (Join-Path $credRepoRoot 'x\s.dpapi'), 'creds\relative.dpapi', '.\relative.dpapi', 'relative.dpapi')
     foreach ($bad in $realBadPaths) {
-        $badSecure = New-CredTestSecure $credFake
-        Invoke-ApiPoolGuardedRefusal -Path $bad -Name ('SecretPath/Provider/' + $bad) -ScriptBlock { New-ApiPoolCredentialProvider -Kind Dpapi -SecretPath $bad }
-        Invoke-ApiPoolGuardedRefusal -Path $bad -Name ('SecretPath/Set/' + $bad) -ScriptBlock { Set-ApiPoolCredential -SecretPath $bad -Secret $badSecure }
-        Invoke-ApiPoolGuardedRefusal -Path $bad -Name ('SecretPath/Restore/' + $bad) -ScriptBlock { Restore-ApiPoolPreviousCredential -SecretPath $bad }
+        Assert-ApiPoolForbiddenPathRejected -Path $bad -Name ('SecretPath/ValidatorRejects/' + $bad)
     }
-    foreach ($rel in @('creds\relative.dpapi', '.\relative.dpapi', 'relative.dpapi')) {
-        Assert-ApiPoolThrows { Assert-ApiPoolSafePath -Path $rel -Purpose 'SecretPath' } ('SecretPath/RelativeValidator/' + $rel) -ExpectedCode 'STATE_PATH_FORBIDDEN'
-    }
-    # Structural refusal inside the sandbox: a junction ancestor (a regressed guard would write into the sandbox only).
+    # Fake repo root inside the sandbox: the validator rejects a path under it (pure check).
+    $credFakeRepo = Join-Path $credSandbox 'fake-repo'
+    Assert-ApiPoolForbiddenPathRejected -Path (Join-Path $credFakeRepo 'sub\s.dpapi') -RepoRoot $credFakeRepo -Name 'SecretPath/ValidatorRejects/InsideFakeRepoRoot'
+    # Writers refuse a junction ancestor that lives INSIDE the sandbox (a regressed guard would write into the sandbox only).
     $credJTarget = Join-Path $credSandbox 'j-target'
     $credJLink = Join-Path $credSandbox 'j-link'
     [void][System.IO.Directory]::CreateDirectory($credJTarget)
@@ -167,6 +164,21 @@ Assert-ApiPoolTestPathInSandbox -Path $dpapiPath
     }
     finally {
         if ([System.IO.Directory]::Exists($credJLink)) { [System.IO.Directory]::Delete($credJLink, $false) }
+    }
+
+    # ---------------- Static self-check: suites never hand real system paths to a writer ----------------
+    $writerNames = @(('Set-ApiPool' + 'Credential'), ('Restore-ApiPool' + 'PreviousCredential'), ('Initialize-ApiPool' + 'Ledger'), ('New-ApiPool' + 'Reservation'), ('Write-ApiPool' + 'FileAtomic'), ('Write-ApiPool' + 'BytesAtomic'), ('Add-ApiPool' + 'LineDurable'), ('Enter-ApiPool' + 'FileLock'), ('Set-ApiPool' + 'EmergencyStop'))
+    $realPathRegex = 'ProgramData|\\\\localhost|\\\\127\.|\\\\\?\\|\\\\\.\\|//localhost|C:\\x\b'
+    $scanLine = {
+        param([string]$Line)
+        foreach ($w in $writerNames) { if ($Line.Contains($w) -and $Line -match $realPathRegex) { return $true } }
+        return $false
+    }
+    $probeLine = ('    ' + $writerNames[0] + ' -SecretPath ' + "'C:\" + "ProgramData\BRAVO\s.dpapi'")
+    Assert-ApiPoolTrue (& $scanLine $probeLine) 'Static/ScannerDetectsWriterWithRealPath'
+    foreach ($suiteFile in @(Get-ChildItem -LiteralPath (Join-Path $script:TestsRoot 'suites') -Filter '*.Tests.ps1')) {
+        $offending = @([System.IO.File]::ReadAllLines($suiteFile.FullName) | Where-Object { & $scanLine $_ })
+        Assert-ApiPoolEqual 0 $offending.Count ('Static/NoWriterWithRealSystemPath/' + $suiteFile.Name)
     }
 
     # ---------------- Mock provider ----------------

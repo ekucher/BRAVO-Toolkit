@@ -98,10 +98,25 @@ try {
     Assert-ApiPoolEqual 5000000 (Get-ApiPoolBudgetStatus -StateRoot $r).GlobalLimitMicroUsd 'Init/LimitUnchangedAfterMismatch'
     $badRoot = New-BudgetRoot
     Assert-ApiPoolEqual 'REQUEST_INVALID' (Get-BudgetErrCode { Initialize-ApiPoolLedger -StateRoot $badRoot -GlobalLimitMicroUsd 0 }) 'Init/ZeroLimitRefused'
-    # Real-system paths: validator first; the budget function is invoked only if the validator rejected the path.
-    Assert-ApiPoolThrows { Assert-ApiPoolStateRoot -StateRoot 'relative\state' } 'Init/RelativeStateRootRefused' -ExpectedCode 'STATE_PATH_FORBIDDEN'
-    Invoke-ApiPoolGuardedRefusal -Path 'C:\ProgramData\BRAVO\x' -Name 'Init/ProgramDataStateRootRefused' -ScriptBlock { New-ApiPoolReservation -StateRoot 'C:\ProgramData\BRAVO\x' -JobId 'j' -AttemptId 'a' -AmountMicroUsd 1 -PerJobLimitMicroUsd 1 }
-    Invoke-ApiPoolGuardedRefusal -Path '\\localhost\C$\x' -Name 'Init/UncStateRootRefused' -ScriptBlock { Get-ApiPoolBudgetStatus -StateRoot '\\localhost\C$\x' }
+    # Real-system paths go ONLY to the pure validator; budget writers never receive them.
+    foreach ($badRoot2 in @('relative\state', 'C:\ProgramData\BRAVO\x', '\\localhost\C$\x', '\\127.0.0.1\c$\x', '\\?\C:\x', '\\.\C:\x')) {
+        Assert-ApiPoolForbiddenPathRejected -Path $badRoot2 -Name ('Init/StateRootValidatorRejects/' + $badRoot2)
+    }
+    # Writer refusal: junction ancestor inside the sandbox.
+    $budJTarget = Join-Path $budgetSandbox 'bj-target'
+    $budJLink = Join-Path $budgetSandbox 'bj-link'
+    [void][System.IO.Directory]::CreateDirectory($budJTarget)
+    $null = & cmd.exe /c ('mklink /J "{0}" "{1}"' -f $budJLink, $budJTarget)
+    Assert-ApiPoolTrue ([System.IO.Directory]::Exists($budJLink)) 'Init/JunctionFixtureCreated'
+    try {
+        $budJRoot = Join-Path $budJLink 'state'
+        Invoke-ApiPoolSandboxRefusal -Path $budJRoot -Name 'Init/InitializeLedgerRefusesJunctionRoot' -ScriptBlock { Initialize-ApiPoolLedger -StateRoot $budJRoot -GlobalLimitMicroUsd 1000 }
+        Invoke-ApiPoolSandboxRefusal -Path $budJRoot -Name 'Init/ReserveRefusesJunctionRoot' -ScriptBlock { New-ApiPoolReservation -StateRoot $budJRoot -JobId 'j' -AttemptId 'a' -AmountMicroUsd 1 -PerJobLimitMicroUsd 1 }
+        Assert-ApiPoolEqual 0 @(Get-ChildItem -LiteralPath $budJTarget -Force).Count 'Init/JunctionTargetUntouched'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($budJLink)) { [System.IO.Directory]::Delete($budJLink, $false) }
+    }
 
     # ---------------- Accounting ----------------
     $r = New-BudgetFixture -Limit 1000

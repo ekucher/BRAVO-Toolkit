@@ -119,30 +119,23 @@ function Assert-ApiPoolTestPathInSandbox {
     }
 }
 
-function Invoke-ApiPoolGuardedRefusal {
-    # For forbidden REAL-SYSTEM paths (ProgramData, UNC, device, repo, relative). The pure validator is asserted
-    # FIRST; the write function is invoked only when the validator itself rejected the path. If the guard has
-    # regressed, the test FAILS and the write function is never called.
+function Assert-ApiPoolForbiddenPathRejected {
+    # VALIDATOR-ONLY check for forbidden REAL-SYSTEM paths (ProgramData, UNC, device, repo, drive roots, relative).
+    # The path is handed to Assert-ApiPoolSafePath and to nothing else: no writer is ever called with it.
     param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
         [Parameter(Mandatory = $true)][string]$Name,
         [string]$ExpectedCode = 'STATE_PATH_FORBIDDEN',
         [string]$RepoRoot
     )
 
-    $validatorCode = $null
+    $code = $null
     try {
         if ([string]::IsNullOrEmpty($RepoRoot)) { $null = Assert-ApiPoolSafePath -Path $Path -Purpose 'TestProbe' }
         else { $null = Assert-ApiPoolSafePath -Path $Path -Purpose 'TestProbe' -RepoRoot $RepoRoot }
     }
-    catch { $validatorCode = Get-ApiPoolErrorCode -ErrorRecord $_ }
-    if ($validatorCode -cne $ExpectedCode) {
-        Write-ApiPoolTestResult -Name ($Name + '/ValidatorRejects') -Passed $false -Detail ('path guard did not reject; write function NOT invoked (code=' + [string]$validatorCode + ')')
-        return
-    }
-    Write-ApiPoolTestResult -Name ($Name + '/ValidatorRejects') -Passed $true -Detail ''
-    Assert-ApiPoolThrows $ScriptBlock $Name -ExpectedCode $ExpectedCode
+    catch { $code = Get-ApiPoolErrorCode -ErrorRecord $_ }
+    Write-ApiPoolTestResult -Name $Name -Passed ($code -ceq $ExpectedCode) -Detail ('validator returned code=' + [string]$code)
 }
 
 function Invoke-ApiPoolSandboxRefusal {
