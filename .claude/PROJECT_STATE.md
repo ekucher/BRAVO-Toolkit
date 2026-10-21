@@ -300,7 +300,9 @@ BLOCKED.
 0. Issue #501 (стан 2026-10-21). PR #503 на head ed64015 — CI 8/8,
    бот Codex без незакритих зауважень. Merge — лише за явною
    авторизацією власника. Перед merge перечитати:
-     gh pr view 503 --json headRefOid,mergeStateStatus   # очікується ed64015, CLEAN
+     gh pr view 503 --json baseRefName,baseRefOid,headRefOid,mergeStateStatus
+       # очікується: baseRefName=developer; baseRefOid = git rev-parse origin/developer
+       # (якщо developer пішов уперед — переоцінити конфлікти й CI); ed64015; CLEAN
      gh api --paginate repos/ekucher/BRAVO-Toolkit/pulls/503/comments   # усі сторінки; нові inline-зауваження бота
    Новий head або нове зауваження бота P0–P2 → виправити в гілці
    fix/501-snapshot-consistency-followup, не мержити.
