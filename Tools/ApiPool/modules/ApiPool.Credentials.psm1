@@ -211,8 +211,21 @@ function Set-ApiPoolOwnerOnlyAcl {
     [System.IO.File]::SetAccessControl($Path, $security)
 }
 
+function Get-ApiPoolCredentialSidecarPath {
+    # Derived files next to a validated secret (<secret>.previous, <secret>.meta.json) get the same guard as the secret:
+    # Core's Assert-ApiPoolSafePath also rejects an existing LEAF that is a reparse point (file symlink or junction),
+    # so rotation can never write through a planted link. Atomic-write temp files are CreateNew GUID names in the
+    # (already validated) parent directory and need no separate check.
+    param([string]$SecretPath, [ValidateSet('previous', 'meta')][string]$Kind)
+
+    $suffix = if ($Kind -eq 'previous') { '.previous' } else { '.meta.json' }
+    return (Assert-ApiPoolSafePath -Path ($SecretPath + $suffix) -Purpose ('SecretPath ' + $suffix))
+}
+
 function Write-ApiPoolCredentialMeta {
     param([string]$SecretPath, [byte[]]$PlainBytes)
+
+    $metaPath = Get-ApiPoolCredentialSidecarPath -SecretPath $SecretPath -Kind meta
 
     # Fingerprint over the UTF-8 bytes (trailing ASCII whitespace trimmed); no managed plaintext string.
     $end = $PlainBytes.Length
@@ -234,7 +247,7 @@ function Write-ApiPoolCredentialMeta {
         rotatedAtUtc = [System.DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
         fingerprint  = $fingerprint
     }
-    Write-ApiPoolFileAtomic -Path ($SecretPath + '.meta.json') -Content (ConvertTo-ApiPoolCanonicalJson -InputObject $meta)
+    Write-ApiPoolFileAtomic -Path $metaPath -Content (ConvertTo-ApiPoolCanonicalJson -InputObject $meta)
 }
 
 function Set-ApiPoolCredential {
@@ -250,6 +263,8 @@ function Set-ApiPoolCredential {
     )
 
     $full = Assert-ApiPoolSafePath -Path $SecretPath -Purpose 'SecretPath'
+    $previousPath = Get-ApiPoolCredentialSidecarPath -SecretPath $full -Kind previous
+    $metaPath = Get-ApiPoolCredentialSidecarPath -SecretPath $full -Kind meta
     $chars = Get-ApiPoolSecureChars -Secret $Secret
     $plainBytes = $null
     try {
@@ -261,11 +276,11 @@ function Set-ApiPoolCredential {
 
         try {
             if ([System.IO.File]::Exists($full)) {
-                [System.IO.File]::Copy($full, ($full + '.previous'), $true)
+                [System.IO.File]::Copy($full, $previousPath, $true)
             }
             Write-ApiPoolBytesAtomic -Path $full -Bytes $protectedBytes
             Write-ApiPoolCredentialMeta -SecretPath $full -PlainBytes $plainBytes
-            foreach ($f in @($full, ($full + '.previous'), ($full + '.meta.json'))) {
+            foreach ($f in @($full, $previousPath, $metaPath)) {
                 if ([System.IO.File]::Exists($f)) { Set-ApiPoolOwnerOnlyAcl -Path $f }
             }
         }
@@ -289,7 +304,8 @@ function Restore-ApiPoolPreviousCredential {
     )
 
     $full = Assert-ApiPoolSafePath -Path $SecretPath -Purpose 'SecretPath'
-    $previousPath = $full + '.previous'
+    $previousPath = Get-ApiPoolCredentialSidecarPath -SecretPath $full -Kind previous
+    $metaPath = Get-ApiPoolCredentialSidecarPath -SecretPath $full -Kind meta
     if (-not [System.IO.File]::Exists($previousPath)) {
         Invoke-ApiPoolThrow -Code 'CREDENTIAL_NOT_FOUND' -Message ("No previous credential exists for {0}." -f $full)
     }
@@ -310,7 +326,7 @@ function Restore-ApiPoolPreviousCredential {
                 Write-ApiPoolBytesAtomic -Path $previousPath -Bytes $currentBytes
             }
             Write-ApiPoolCredentialMeta -SecretPath $full -PlainBytes $plainBytes
-            foreach ($f in @($full, $previousPath, ($full + '.meta.json'))) {
+            foreach ($f in @($full, $previousPath, $metaPath)) {
                 if ([System.IO.File]::Exists($f)) { Set-ApiPoolOwnerOnlyAcl -Path $f }
             }
         }

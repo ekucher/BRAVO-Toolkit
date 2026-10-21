@@ -305,7 +305,8 @@ function Get-ApiPoolActualCost {
         }
     }
 
-    $tier = Get-ApiPoolTierForPrompt -Model $Model -PromptTokens ($in + $cacheCreate + $cacheRead)
+    # The tier follows the RECONCILED cache-creation total (tokens5m + tokens1h), never the possibly smaller reported figure.
+    $tier = Get-ApiPoolTierForPrompt -Model $Model -PromptTokens ($in + $tokens5m + $tokens1h + $cacheRead)
     $micro = ($in * $tier.Input) + ($out * $tier.Output) + ($tokens5m * $tier.CacheWrite5m) + ($tokens1h * $tier.CacheWrite1h) + ($cacheRead * $tier.CacheRead)
     return (ConvertTo-ApiPoolMicroUsd -Value $micro)
 }

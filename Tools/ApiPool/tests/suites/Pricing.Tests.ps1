@@ -83,6 +83,11 @@ try {
     Assert-ApiPoolEqual 3002 (Get-ApiPoolActualCost -Model $tm -Usage (New-PricingUsage -In 1001 -Out 100)) 'Tier/SecondTierJustAbove'
     Assert-ApiPoolEqual 3102 (Get-ApiPoolActualCost -Model $tm -Usage (New-PricingUsage -In 1 -Out 100 -Cc 500 -Cr 500 -Breakdown @{ ephemeral_5m_input_tokens = 0; ephemeral_1h_input_tokens = 500 })) 'Tier/CacheTokensCountTowardsTier'
     Assert-ApiPoolThrows { Get-ApiPoolActualCost -Model $tm -Usage (New-PricingUsage -In 5001) } 'Tier/AboveTopTierRefused' -ExpectedCode 'PRICING_UNKNOWN'
+    # F6-P2-C: with an inconsistent breakdown the tier follows the RECONCILED cache-creation total (1500), not the reported 500.
+    $reconciledConsistent = Get-ApiPoolActualCost -Model $tm -Usage (New-PricingUsage -In 1 -Out 100 -Cc 1500 -Breakdown @{ ephemeral_5m_input_tokens = 0; ephemeral_1h_input_tokens = 1500 })
+    Assert-ApiPoolEqual 7002 $reconciledConsistent 'Tier/Reconciled/ConsistentReferenceIsTierTwo'
+    Assert-ApiPoolEqual 7002 (Get-ApiPoolActualCost -Model $tm -Usage (New-PricingUsage -In 1 -Out 100 -Cc 500 -Breakdown @{ ephemeral_5m_input_tokens = 0; ephemeral_1h_input_tokens = 1500 })) 'Tier/Reconciled/InconsistentBreakdownCrossesBoundary'
+    Assert-ApiPoolEqual 7002 (Get-ApiPoolActualCost -Model $tm -Usage (New-PricingUsage -In 1 -Out 100 -Cc 500 -Breakdown @{ ephemeral_5m_input_tokens = 700; ephemeral_1h_input_tokens = 800 })) 'Tier/Reconciled/SplitBreakdownSumCrossesBoundary'
 
     # Usage validation.
     foreach ($field in @('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens')) {

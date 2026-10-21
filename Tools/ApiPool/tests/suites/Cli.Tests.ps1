@@ -1,5 +1,5 @@
 ﻿# Cli suite. Dot-sourced by Invoke-ApiPoolTests.ps1. Runs Invoke-ApiPool.ps1 in child powershell.exe processes,
-# strictly sequentially (9 children). Every child gets either -StateRoot inside the sandbox or a config override whose stateRoot is inside the sandbox;
+# strictly sequentially (10 children). Every child gets either -StateRoot inside the sandbox or a config override whose stateRoot is inside the sandbox;
 # the real default state directory under LOCALAPPDATA is only stat-ed (existence + LastWriteTimeUtc), never read. Offline; no network.
 # Health convention (documented): an unhealthy report is exit 1 with {ok:false, code:'UNHEALTHY'}.
 
@@ -121,8 +121,32 @@ try {
     Assert-ApiPoolEqual -Expected 'OK' -Actual (Get-ApiPoolBudgetStatus -StateRoot $cliCfgState).State -Name 'StateRoot/ConfigRootLedgerCreated'
     Assert-ApiPoolEqual -Expected $cliDefaultBefore -Actual (Get-CliDefaultStamp) -Name 'StateRoot/RealDefaultNotTouched'
 
-    Assert-ApiPoolTrue -Condition ($c1.Done -and $c2.Done -and $c3.Done -and $c4.Done -and $c5.Done -and $c6.Done -and $c7.Done -and $c8.Done -and $c9.Done) -Name 'Children/AllExitedInTime'
     Assert-ApiPoolTrue -Condition (-not [System.IO.Directory]::Exists((Join-Path $cliState 'jobs'))) -Name 'Orchestrate/NoJobCreatedWhenPoolDisabled'
+
+    # 10. F6-P2-B: strings are redacted BEFORE serialization, so a double-quoted chat URL cannot corrupt the JSON.
+    # The job is created in-process (sandbox state), its stored result is replaced with a hostile string, then the CLI reads it.
+    $cliCfg = Read-ApiPoolConfig -Path (Join-Path $script:ConfigRoot 'apipool.defaults.json')
+    $cliReg = Import-ApiPoolModelRegistry -Path (Join-Path $script:ConfigRoot 'models.json')
+    $cliCtx = New-ApiPoolContext -StateRoot $cliState -Config $cliCfg -Registry $cliReg -Transport $null -CredentialProvider $null
+    $cliJob = Submit-ApiPoolJob -Context $cliCtx -Role 'api-scout' -Brief 'Map.' -ContextData 'x' -IdempotencyKey 'cli-f6' -CatalogPath (Join-Path $script:ConfigRoot 'agents.json')
+    $cliChatHost = 'clau' + 'de.ai'
+    $cliChatUrl = 'https://' + $cliChatHost + '/chat/f6test'
+    $cliJobFile = Join-Path (Join-Path $cliState 'jobs') ($cliJob.jobId + '.json')
+    Assert-ApiPoolTrue -Condition (Test-ApiPoolTestPathInSandbox -Path $cliJobFile) -Name 'RedactJson/JobFileInSandbox'
+    $cliJobDoc = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($cliJobFile))
+    $cliHostile = 'see "' + $cliChatUrl + '" and key ' + $cliFakeKey + ' end'
+    Add-Member -InputObject $cliJobDoc -MemberType NoteProperty -Name 'result' -Value ([pscustomobject]@{ text = $cliHostile }) -Force
+    [System.IO.File]::WriteAllText($cliJobFile, (ConvertTo-Json -InputObject $cliJobDoc -Depth 10 -Compress))
+    $c10 = Invoke-CliChild -CliArgs @('-Command', 'result', '-StateRoot', $cliState, '-JobId', [string]$cliJob.jobId)
+    Assert-ApiPoolTrue -Condition ($null -ne $c10.Json -and $c10.Json.ok -eq $true) -Name 'RedactJson/StdoutParses' -Detail $c10.Stdout
+    Assert-ApiPoolEqual -Expected 0 -Actual $c10.Exit -Name 'RedactJson/ExitZero'
+    Assert-ApiPoolTrue -Condition (-not ($c10.Stdout + $c10.Stderr).Contains($cliFakeKeyTail)) -Name 'RedactJson/KeyRedacted'
+    Assert-ApiPoolTrue -Condition (-not ($c10.Stdout + $c10.Stderr).Contains($cliChatHost)) -Name 'RedactJson/ChatUrlRedacted'
+    if ($null -ne $c10.Json) {
+        Assert-ApiPoolTrue -Condition ([string]$c10.Json.data.Result.text).Contains('[chat-link-redacted]') -Name 'RedactJson/UrlReplacedByMarker' -Detail $c10.Stdout
+    }
+
+    Assert-ApiPoolTrue -Condition ($c1.Done -and $c2.Done -and $c3.Done -and $c4.Done -and $c5.Done -and $c6.Done -and $c7.Done -and $c8.Done -and $c9.Done -and $c10.Done) -Name 'Children/AllExitedInTime'
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $cliSandbox

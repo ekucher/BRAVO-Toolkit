@@ -166,6 +166,66 @@ Assert-ApiPoolTestPathInSandbox -Path $dpapiPath
         if ([System.IO.Directory]::Exists($credJLink)) { [System.IO.Directory]::Delete($credJLink, $false) }
     }
 
+    # ---------------- F6-P2-A: derived paths (.previous, .meta.json) must not be reparse points ----------------
+    # Links live ONLY inside the sandbox. A file symlink is tried first (may need a privilege); if mklink fails, a directory
+    # junction with the same name is used instead (kind recorded in the test names).
+    $lnkDir = Join-Path $credSandbox 'lnk'
+    [void][System.IO.Directory]::CreateDirectory($lnkDir)
+    $lnkCounter = 0
+    function New-CredTestLink {
+        param([string]$Link, [string]$TargetFile, [string]$TargetDir)
+        # stderr is silenced inside cmd (a PowerShell 2>&1 would raise under $ErrorActionPreference = 'Stop').
+        $null = & cmd.exe /c ('mklink "{0}" "{1}" 2>nul' -f $Link, $TargetFile)
+        if ([System.IO.File]::Exists($Link)) { return 'filesymlink' }
+        $null = & cmd.exe /c ('mklink /J "{0}" "{1}" 2>nul' -f $Link, $TargetDir)
+        if ([System.IO.Directory]::Exists($Link)) { return 'junction' }
+        return 'none'
+    }
+    function Remove-CredTestLink {
+        param([string]$Link, [string]$Kind)
+        if ($Kind -eq 'filesymlink') { [System.IO.File]::Delete($Link) }
+        elseif ($Kind -eq 'junction') { [System.IO.Directory]::Delete($Link, $false) }
+    }
+    $lnkKnown = [System.Text.Encoding]::UTF8.GetBytes('KNOWN-TARGET-CONTENT-DO-NOT-OVERWRITE')
+    foreach ($slot in @('previous', 'meta')) {
+        foreach ($op in @('Set', 'Restore')) {
+            $lnkCounter++
+            $lnkSecret = Join-Path $lnkDir ('s{0}.dpapi' -f $lnkCounter)
+            $lnkTargetDir = Join-Path $lnkDir ('t{0}' -f $lnkCounter)
+            [void][System.IO.Directory]::CreateDirectory($lnkTargetDir)
+            $lnkTarget = Join-Path $lnkTargetDir 'target.bin'
+            [System.IO.File]::WriteAllBytes($lnkTarget, $lnkKnown)
+            Set-ApiPoolCredential -SecretPath $lnkSecret -Secret (New-CredTestSecure $credFake)
+            Set-ApiPoolCredential -SecretPath $lnkSecret -Secret (New-CredTestSecure $credFakeB)
+            $lnkLeaf = if ($slot -eq 'previous') { $lnkSecret + '.previous' } else { $lnkSecret + '.meta.json' }
+            $lnkBefore = [System.IO.File]::ReadAllBytes($lnkSecret)
+            [System.IO.File]::Delete($lnkLeaf)
+            $lnkKind = New-CredTestLink -Link $lnkLeaf -TargetFile $lnkTarget -TargetDir $lnkTargetDir
+            $lnkName = 'Reparse/{0}/{1}/{2}' -f $op, $slot, $lnkKind
+            Assert-ApiPoolTrue ($lnkKind -ne 'none') ($lnkName + '/FixtureCreated')
+            if ($lnkKind -ne 'none') {
+                try {
+                    $lnkSecure = New-CredTestSecure $credFake
+                    $lnkSecretCapture = $lnkSecret
+                    if ($op -eq 'Set') {
+                        Invoke-ApiPoolSandboxRefusal -Path $lnkLeaf -Name ($lnkName + '/Refused') -ScriptBlock { Set-ApiPoolCredential -SecretPath $lnkSecretCapture -Secret $lnkSecure }
+                    }
+                    else {
+                        Invoke-ApiPoolSandboxRefusal -Path $lnkLeaf -Name ($lnkName + '/Refused') -ScriptBlock { Restore-ApiPoolPreviousCredential -SecretPath $lnkSecretCapture }
+                    }
+                    if ($lnkKind -eq 'filesymlink') {
+                        Assert-ApiPoolEqual ([System.Convert]::ToBase64String($lnkKnown)) ([System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($lnkTarget))) ($lnkName + '/TargetContentUnchanged')
+                    }
+                    else {
+                        Assert-ApiPoolEqual 1 @(Get-ChildItem -LiteralPath $lnkTargetDir -Force).Count ($lnkName + '/TargetDirUnchanged')
+                    }
+                    Assert-ApiPoolEqual ([System.Convert]::ToBase64String($lnkBefore)) ([System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($lnkSecret))) ($lnkName + '/CurrentSecretUntouched')
+                }
+                finally { Remove-CredTestLink -Link $lnkLeaf -Kind $lnkKind }
+            }
+        }
+    }
+
     # ---------------- Static self-check: suites never hand real system paths to a writer ----------------
     $writerNames = @(('Set-ApiPool' + 'Credential'), ('Restore-ApiPool' + 'PreviousCredential'), ('Initialize-ApiPool' + 'Ledger'), ('New-ApiPool' + 'Reservation'), ('Write-ApiPool' + 'FileAtomic'), ('Write-ApiPool' + 'BytesAtomic'), ('Add-ApiPool' + 'LineDurable'), ('Enter-ApiPool' + 'FileLock'), ('Set-ApiPool' + 'EmergencyStop'))
     $realPathRegex = 'ProgramData|\\\\localhost|\\\\127\.|\\\\\?\\|\\\\\.\\|//localhost|C:\\x\b'

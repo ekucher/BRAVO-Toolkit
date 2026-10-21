@@ -27,11 +27,52 @@ $script:ExitCode = 1
 $script:ModulesReady = $false
 $script:BoundParams = $PSBoundParameters
 
+function Protect-ApiPoolCliValue {
+    # Redacts every string (values and keys) BEFORE serialization; escaping must never be redacted afterwards
+    # (a quoted chat URL followed by an escaped quote would otherwise swallow the backslash and break the JSON).
+    param($Value, [int]$Depth = 0)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) { return (Protect-ApiPoolText -Text $Value) }
+    if ($Value -is [System.ValueType]) { return $Value }
+    if ($Depth -gt 12) { return '[truncated]' }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $map = [ordered]@{}
+        foreach ($k in $Value.Keys) { $map[(Protect-ApiPoolText -Text ([string]$k))] = Protect-ApiPoolCliValue -Value $Value[$k] -Depth ($Depth + 1) }
+        return $map
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = New-Object System.Collections.ArrayList
+        foreach ($item in $Value) { [void]$items.Add((Protect-ApiPoolCliValue -Value $item -Depth ($Depth + 1))) }
+        return , $items.ToArray()
+    }
+    $obj = [ordered]@{}
+    foreach ($p in $Value.PSObject.Properties) {
+        $obj[(Protect-ApiPoolText -Text ([string]$p.Name))] = Protect-ApiPoolCliValue -Value $p.Value -Depth ($Depth + 1)
+    }
+    return $obj
+}
+
+function Test-ApiPoolCliJson {
+    param([string]$Text)
+
+    try { [void](ConvertFrom-Json -InputObject $Text); return $true } catch { return $false }
+}
+
 function Write-ApiPoolCliResult {
     param([bool]$Ok, [string]$Code, $Data, [int]$Exit)
 
+    if ($script:ModulesReady) { $Data = Protect-ApiPoolCliValue -Value $Data }
     $json = ConvertTo-Json -InputObject ([ordered]@{ ok = $Ok; code = $Code; data = $Data }) -Compress -Depth 10
-    if ($script:ModulesReady) { $json = Protect-ApiPoolText -Text $json }
+    if ($script:ModulesReady) {
+        # Extra structural pass (secret-name patterns over the JSON text); used only when the result is still valid JSON.
+        $extra = Protect-ApiPoolText -Text $json
+        if (Test-ApiPoolCliJson -Text $extra) { $json = $extra }
+    }
+    if (-not (Test-ApiPoolCliJson -Text $json)) {
+        $json = '{"ok":false,"code":"INTERNAL_ERROR","data":{"message":"The result could not be serialized safely."}}'
+        $Exit = 1
+    }
     Write-Output $json
     $script:ExitCode = $Exit
 }
