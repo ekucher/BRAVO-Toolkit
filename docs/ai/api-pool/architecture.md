@@ -23,15 +23,14 @@ Agent Pool — це інструментарій для агентів розр�
 | `modules/ApiPool.Budget.psm1` | журнал бюджету (ledger), резервування, аварійна зупинка, ремонт | реалізовано |
 | `modules/ApiPool.Transport.psm1` | транспорт: лише скриптований fake; live-конструктор завжди відмовляє | реалізовано |
 | `modules/ApiPool.Adapter.psm1` | адаптер Messages: allowlist запиту, повтори, слоти, rate limit | реалізовано |
-| `modules/ApiPool.Agents.psm1` | ролі, обрамлення контексту, розбір HANDOFF | W4 |
-| `modules/ApiPool.Jobs.psm1` | завдання, ідемпотентність, `Invoke-ApiPoolOrchestrateJob` | W4 |
-| `Invoke-ApiPool.ps1` | тонка CLI-точка входу (до 250 рядків) | W4 |
-| `README.md` | короткий покажчик на `docs/ai/api-pool/*` | W4 |
+| `modules/ApiPool.Agents.psm1` | ролі, обрамлення контексту, розбір HANDOFF | реалізовано |
+| `modules/ApiPool.Jobs.psm1` | завдання, ідемпотентність, health, capabilities, `Invoke-ApiPoolOrchestrateJob` | реалізовано |
+| `Invoke-ApiPool.ps1` | тонка CLI-точка входу (близько 190 рядків) | реалізовано |
 | `config/apipool.defaults.json`, `config/models.json` | типові налаштування і ціни | реалізовано |
-| `config/agents.json` | визначення ролей | W4 |
-| `tests/Invoke-ApiPoolTests.ps1`, `tests/ApiPool.TestHarness.ps1`, `tests/suites/*.Tests.ps1`, `tests/helpers/*.ps1` | автономні офлайн-тести | реалізовано (набір для Agents/Jobs: W4) |
+| `config/agents.json` | визначення ролей | реалізовано |
+| `tests/Invoke-ApiPoolTests.ps1`, `tests/ApiPool.TestHarness.ps1`, `tests/suites/*.Tests.ps1`, `tests/helpers/*.ps1` | автономні офлайн-тести (усі набори, включно з `Agents`, `Jobs`, `Cli`, `Orchestrate`) | реалізовано |
 
-Статус: реалізація в процесі (W4); звірити з кодом перед публікацією. (Стосується рядків таблиці зі статусом W4.)
+Окремого `README.md` у `Tools/ApiPool` у цій гілці немає: документація зібрана в `docs/ai/api-pool/*`.
 
 ### 2.1. ЗАМОРОЖЕНИЙ набір файлів
 
@@ -50,10 +49,11 @@ Agent Pool — це інструментарій для агентів розр�
 - Модулі ніколи не викликають `Import-Module` один для одного. Точка входу та тестовий runner імпортують їх у глобальну область у фіксованому порядку: `Core`, `Credentials`, `Pricing`, `Budget`, `Transport`, `Adapter`, `Agents`, `Jobs`.
 - Напрямок залежностей без циклів: `Core` <- `Credentials`, `Pricing` <- `Budget` (Core, Pricing) <- `Transport` (Core, Credentials) <- `Adapter` <- `Agents` (Core) <- `Jobs` (Adapter, Agents, Budget).
 - `Core` має закритий список експорту; він не повинен перетворюватися на загальний `Utils`.
+- Усі шляхи, похідні від кореня стану (`budget\`, `budget\quarantine\`, `jobs\`, `slots\`, `ratelimit\`), будуються лише через `Resolve-ApiPoolStatePath` (`Core`): вона відхиляє `..`, кореневі й дисково-кваліфіковані відносні частини, вихід за корінь та будь-який наявний компонент шляху (включно з листом), що є reparse-point (`STATE_PATH_FORBIDDEN`). Перевірка виконується до будь-якого відкриття, створення чи запису.
 - Маніфестів `.psd1` немає. У всіх модулях `Set-StrictMode -Version Latest`. Цільове середовище: Windows PowerShell 5.1.
 - Кожна функція, що змінює стан, приймає явний `-StateRoot` або `-Context`. Модулі ніколи не вибирають типові шляхи: типовий корінь стану (`%LOCALAPPDATA%\BRAVO\ApiPool\state`) визначає лише точка входу.
 - Помилки: `ErrorRecord` з `FullyQualifiedErrorId` вигляду `ApiPool.<CODE>` і повідомленням `[<CODE>] ...` (текст пропускається через редагування секретів). Код помилки читає `Get-ApiPoolErrorCode`. Таблицю кодів наведено в `troubleshooting.md`.
-- Коди завершення точки входу: 0 успіх, 1 помилка, 2 неправильне використання; `BRAVO.ExitCodes` не імпортується (пул не є частиною runtime BRAVO).
+- Коди завершення точки входу: 0 успіх, 1 помилка (зокрема `health` із `UNHEALTHY` і `orchestrate` зі `status = failed`), 2 неправильне використання; `BRAVO.ExitCodes` не імпортується (пул не є частиною runtime BRAVO).
 
 ## 4. Блокування і конкурентність
 
@@ -65,7 +65,7 @@ Agent Pool — це інструментарій для агентів розр�
 | слоти конкурентності | `<stateRoot>/slots/slot-<n>.lock`, `n = 1..maxConcurrency` |
 | rate limit (стан) | `<stateRoot>/ratelimit/<model>.json` |
 | rate limit (замок) | `<stateRoot>/ratelimit/<model>.lock` (незалежний від журналу) |
-| завдання (W4) | `<stateRoot>/jobs/<jobId>.lock` |
+| завдання | `<stateRoot>/jobs/<jobId>.lock` (маркер скасування: `<jobId>.cancel`) |
 
 Другого планувальника немає: виклики синхронні, виконуються в процесі викликача. Фонових служб, Scheduled Task, `Start-Job`, runspace чи відокремлених `Start-Process` пул не створює.
 
@@ -80,8 +80,6 @@ Agent Pool — це інструментарій для агентів розр�
 
 ## 6. Контракт apipool.orchestrate/1
 
-Статус: реалізація в процесі (W4); звірити з кодом перед публікацією.
-
 `Invoke-ApiPoolOrchestrateJob` (у модулі `Jobs`; окремого модуля Orchestrate немає) повертає об'єкт:
 
 | Поле | Значення |
@@ -94,15 +92,15 @@ Agent Pool — це інструментарій для агентів розр�
 | `costMicroUsd` | вартість у micro-USD |
 | `advisoryOnly` | завжди `true` |
 
-`fallback` повертається, коли пул вимкнений, коли офлайн-режим без fake-транспорту, коли `BUDGET_STOPPED`, `LEDGER_CORRUPT` або `BUDGET_EXHAUSTED_*`. Викликач у такому разі продовжує без пулу (наприклад, звичайним маршрутом ролей). У офлайн-збірці через CLI `orchestrate` повертає fallback з `reasonCode` `POOL_DISABLED`.
+`fallback` повертається, коли немає контексту або транспорту (`POOL_DISABLED`), коли бюджет зупинено (`BUDGET_STOPPED`), журнал пошкоджено чи не ініціалізовано (`LEDGER_CORRUPT`, `LEDGER_UNINITIALIZED`), а також коли завдання завершилося помилкою `BUDGET_EXHAUSTED_*`, `BUDGET_STOPPED` або `LEDGER_*`. Викликач у такому разі продовжує без пулу (наприклад, звичайним маршрутом ролей). Інші помилки дають `status = failed` із `reasonCode` (код помилки завдання, а за відсутності помилки `JOB_<СТАН>`, наприклад `JOB_CANCELLED`). У офлайн-збірці через CLI `orchestrate` повертає `fallback` з `reasonCode` `POOL_DISABLED` (код завершення 0); `status = failed` дає код завершення 1.
 
-Завдання (W4): `jobId = 'job-' + sha256(role + "\n" + key)[0..23]`; без ключа використовується GUID (дедуплікації немає). Той самий ключ і той самий хеш корисного навантаження повертають наявне завдання; інше навантаження дає `IDEMPOTENCY_CONFLICT`. Стани: `queued` -> `running` -> `succeeded` | `failed` | `cancelled`. Володар блокування завдання є власником стану `running`; якщо блокування вдається взяти, а стан `running`, завдання вважається перерваним (`interrupted`). Відновлення (`resume`) можливе лише з `interrupted` або `failed` (retryable), з `-Reason`, лічильником спроб і межею `RESUME_LIMIT`; резервування завжди нове; термінальний стан не перезаписується.
+Завдання: `jobId = 'job-' + sha256(role + "\n" + key)[0..23]`; без ключа використовується GUID (дедуплікації немає). Формат ідентифікатора `^job-[0-9a-f]{24}$` перевіряється в кожній операції (`REQUEST_INVALID`), тому символи шляху в ньому неможливі. Той самий ключ і той самий хеш корисного навантаження повертають наявне завдання; інше навантаження дає `IDEMPOTENCY_CONFLICT`. Файл завдання має `schemaVersion = 1`; будь-яке інше значення (або не ціле число) дає `JOB_SCHEMA_UNSUPPORTED` без жодної зміни файлу, і `run`, `resume`, `cancel`, `status`, `result` відмовляють (не повторюється).
+
+Стани: `queued` -> `running` -> `succeeded` | `failed` | `cancelled`, а також `interrupted`. Володар блокування завдання є власником стану `running`; якщо блокування вдається взяти, а стан `running`, завдання позначається `interrupted` і `run` повертає `JOB_INTERRUPTED`: продовжити можна лише явним `resume`. `cancel` для завдання в `queued` чи `interrupted` одразу ставить `cancelled`; для `running` створює маркер `<jobId>.cancel`, який бачить виконавець. Відновлення (`resume`) можливе лише з `interrupted` або `failed` (retryable), з `-Reason`, лічильником спроб (`maxAttempts = 3`) і межею `RESUME_LIMIT`; резервування завжди нове; термінальний стан (`succeeded`, `failed`, `cancelled`) не перезаписується (`JOB_TERMINAL`).
 
 ## 7. Агенти
 
-Статус: реалізація в процесі (W4); звірити з кодом перед публікацією.
-
-Ролі: `api-scout`, `api-pr-analyst`, `api-issues-analyst`, `api-test-designer`, `api-doc-reviewer`, `api-architecture-advisory`. Агенти текстові, без інструментів. Вхідний контекст подається як обмежені недовірені дані, вихід очищується і розбирається до дозволених полів HANDOFF. Докладно: `security.md`.
+Ролі: `api-scout`, `api-pr-analyst`, `api-issues-analyst`, `api-test-designer`, `api-doc-reviewer`, `api-architecture-advisory`. Визначення ролей (`config/agents.json`, `schemaVersion = 1`, інакше `CONFIG_INVALID`) перевіряються суворо: невідомі ключі та будь-які ключі `tools`/`tool_choice`/`mcp*` відхиляються. Агенти текстові, без інструментів. Вхідний контекст (brief до 8000 символів, дані до 200000) подається як обмежені недовірені дані, вихід очищується і розбирається до дозволених полів HANDOFF. Докладно: `security.md`.
 
 ## 8. Інтеграційний пакет .claude/* (ЗАБЛОКОВАНО)
 
@@ -129,6 +127,7 @@ Agent Pool — це інструментарій для агентів розр�
 | `budget/quarantine/ledger-<stamp>.jsonl` | копія журналу перед ремонтом хвоста |
 | `slots/slot-<n>.lock` | слоти конкурентності |
 | `ratelimit/<model>.json`, `<model>.lock` | підказки throttling (не гроші) |
-| `jobs/<jobId>.*` (W4) | стан і результат завдань |
+| `jobs/<jobId>.json` | документ завдання (стан, історія, результат; містить `brief` і `contextData` у відкритому вигляді, див. `security.md`) |
+| `jobs/<jobId>.lock`, `jobs/<jobId>.cancel` | замок виконавця та маркер скасування |
 
 Файл облікових даних живе поза коренем стану: `%LOCALAPPDATA%\BRAVO\ApiPool\anthropic-api-key.dpapi` (див. `installation.md`).

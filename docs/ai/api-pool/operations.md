@@ -1,7 +1,5 @@
 # Anthropic API Agent Pool v1: експлуатація
 
-Статус: реалізація в процесі (W4); звірити з кодом перед публікацією. (Розділи про CLI, завдання й orchestrate описують проєкт точки входу `Invoke-ApiPool.ps1`, яка ще не потрапила до цієї гілки. Розділи про бюджет, аварійну зупинку та ротацію ключа спираються на реалізовані модулі.)
-
 ## 1. CLI
 
 Точка входу: `Tools\ApiPool\Invoke-ApiPool.ps1`, Windows PowerShell 5.1.
@@ -18,9 +16,9 @@ powershell.exe -NoProfile -File Tools\ApiPool\Invoke-ApiPool.ps1 <команда
 | `run` | виконати створене завдання (синхронно) | `-JobId` |
 | `status` | стан завдання | `-JobId` |
 | `result` | результат завершеного завдання | `-JobId` |
-| `cancel` | позначити завдання скасованим | `-JobId` |
+| `cancel` | скасувати завдання: `queued`/`interrupted` стають `cancelled`; для `running` ставиться маркер, який бачить виконавець | `-JobId`, необов'язково `-Reason` |
 | `resume` | відновити перерване або невдале (retryable) завдання | `-JobId`, `-Reason` |
-| `health` | стан пулу: режим, конфігурація, журнал | |
+| `health` | стан пулу: режим, журнал, доступність кореня стану, лічильники завдань | |
 | `capabilities` | можливості збірки: режим, ролі, моделі | |
 | `orchestrate` | викликати контракт `apipool.orchestrate/1` | `-RequestPath` |
 | `budget-status` | поточний стан бюджету | |
@@ -31,8 +29,15 @@ powershell.exe -NoProfile -File Tools\ApiPool\Invoke-ApiPool.ps1 <команда
 | `budget-repair` | відновити обірваний хвіст журналу | `-Reason` |
 | `credential-rotate` | записати або замінити ключ | `-SecretPath` |
 
-Спільні параметри: `-StateRoot` (корінь стану; типово `%LOCALAPPDATA%\BRAVO\ApiPool\state`), `-ConfigPath` (файл перевизначення конфігурації).
+Спільні параметри:
 
+- `-StateRoot`: корінь стану. Пріоритет: `-StateRoot`, потім ключ `stateRoot` конфігурації, потім типовий `%LOCALAPPDATA%\BRAVO\ApiPool\state`.
+- `-ConfigPath`: основний файл конфігурації (типово `config\apipool.defaults.json`).
+- `-OverrideConfigPath`: необов'язковий другий файл, що накладається поверх основного.
+
+Файл запиту (`-RequestPath`, до 1 МіБ) є JSON-об'єктом лише з рядковими полями `role`, `brief`, `contextData`, `idempotencyKey`; інші поля дають `REQUEST_INVALID`.
+
+Увага: документ завдання `jobs\<jobId>.json` зберігає `brief` і `contextData` без редагування (редагуються лише результат і помилки). Не кладіть секрети, ключі, паролі та реальні ідентифікатори у файли запитів і не копіюйте каталог `jobs` за межі профілю користувача. Вивід CLI (`status`, `cancel`, `resume`) тіла запиту не повторює.
 ### 1.2. Вивід і коди завершення
 
 Вивід: один рядок JSON `{ok, code, data}` у stdout. `ok` булеве; `code` відповідає таблиці з `troubleshooting.md` або `OK`.
@@ -40,14 +45,21 @@ powershell.exe -NoProfile -File Tools\ApiPool\Invoke-ApiPool.ps1 <команда
 | Код завершення | Значення |
 |---|---|
 | 0 | успіх (`ok = true`) |
-| 1 | помилка виконання (`ok = false`, `code` описує причину) |
+| 1 | помилка виконання (`ok = false`, `code` описує причину), зокрема `health` з `code = UNHEALTHY` та `orchestrate` зі `status = failed` |
 | 2 | неправильне використання (невідома команда, відсутній обов'язковий параметр) |
 
 ### 1.3. Поведінка офлайн-збірки
 
-- `run` завершується кодом `MODE_OFFLINE`: без live-транспорту завдання виконати не можна.
-- `orchestrate` повертає `status = fallback` з `reasonCode = POOL_DISABLED`; викликач продовжує без пулу.
-- Команди `budget-*`, `health`, `capabilities`, `credential-rotate`, `submit`, `status`, `result`, `cancel` працюють локально без мережі.
+- `run` завершується помилкою `MODE_OFFLINE` (код завершення 1): без live-транспорту завдання виконати не можна; перевірка виконується до читання завдання.
+- `orchestrate` повертає `status = fallback` з `reasonCode = POOL_DISABLED` і кодом завершення 0; викликач продовжує без пулу.
+- Команди `budget-*`, `health`, `capabilities`, `credential-rotate`, `submit`, `status`, `result`, `cancel`, `resume` працюють локально без мережі.
+
+### 1.4. Стани завдань і типові відмови
+
+- `JOB_INTERRUPTED`: завдання було в `running`, але виконавця вже немає. `run` позначає його `interrupted` і відмовляє; далі `resume -Reason "<причина>"` повертає його в `queued`, або `cancel` ставить `cancelled`.
+- `JOB_SCHEMA_UNSUPPORTED`: файл завдання створено іншою (новішою) версією формату. Пул нічого в ньому не змінює; не редагуйте файл вручну, скористайтеся сумісною версією `Tools/ApiPool`.
+- `JOB_TERMINAL`: завдання вже `succeeded`, `failed` або `cancelled`; створіть нове завдання.
+- `RESUME_LIMIT`: використано всі спроби (`maxAttempts = 3`).
 
 ## 2. Моніторинг бюджету
 
@@ -126,7 +138,7 @@ powershell.exe -NoProfile -File Tools\ApiPool\Invoke-ApiPool.ps1 credential-rota
 7. Перший живий smoke-тест лише за явним схваленням власника: мінімальний `max_tokens`, один запит; обов'язкове порівняння запису журналу з даними Console (сума, `requestId`).
 8. Відкат: `budget-stop`, повернути `mode = offline`, відкликати ключ у Console.
 
-Статус: реалізація в процесі (W4); звірити з кодом перед публікацією. (Крок 5 описує майбутній PR; код live-транспорту в v1 відсутній.)
+Крок 5 описує майбутній PR; код live-транспорту в v1 відсутній.
 
 ## 8. Типові операційні перевірки перед роботою
 
