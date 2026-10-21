@@ -28,11 +28,12 @@ $script:SuiteThrew = $false
 $exitCode = 1
 
 try {
+    Start-ApiPoolSafetyTripwire
     [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy('http://127.0.0.1:9')
     [System.Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', '', 'Process')
 
     # Fixed import order; modules never import each other.
-    foreach ($moduleName in @('Core', 'Credentials', 'Pricing', 'Budget', 'Transport', 'Adapter')) {
+    foreach ($moduleName in @('Core', 'Credentials', 'Pricing', 'Budget', 'Transport', 'Adapter', 'Agents', 'Jobs')) {
         Import-Module -Name (Join-Path $script:ModulesRoot ('ApiPool.{0}.psm1' -f $moduleName)) -Force -Global -DisableNameChecking
     }
 
@@ -65,6 +66,7 @@ try {
     $script:ApiPoolTestSuite = 'Environment'
     Assert-ApiPoolTrue -Condition ([string]::IsNullOrEmpty([System.Environment]::GetEnvironmentVariable('ANTHROPIC_API_KEY', 'Process'))) -Name 'AnthropicApiKeyEnvNotConsumed'
 
+    Complete-ApiPoolSafetyTripwire
     Write-Host ('Total: {0}  Failures: {1}' -f $script:ApiPoolTestTotal, $script:ApiPoolTestFailures)
     if ($script:ApiPoolTestFailures -eq 0 -and -not $script:SuiteThrew) { $exitCode = 0 }
 }
