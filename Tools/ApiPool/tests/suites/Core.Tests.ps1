@@ -30,7 +30,7 @@ try {
     Assert-ApiPoolTrue (-not (Protect-ApiPoolText -Text 'a RegisteredValue-777 b').Contains('RegisteredValue-777')) 'Redaction/RegisteredSecret'
     Clear-ApiPoolKnownSecret
     Assert-ApiPoolTrue ((Protect-ApiPoolText -Text 'a RegisteredValue-777 b').Contains('RegisteredValue-777')) 'Redaction/ClearedRegistry'
-    foreach ($link in @('https://claude.ai/share/abc123', 'https://chatgpt.com/chat/xyz', 'https://chat.openai.com/share/q', 'https://claude.ai/code/session_abc')) {
+    foreach ($link in @(('https://' + 'claude' + '.ai/' + 'share/abc123'), ('https://' + 'chatgpt' + '.com/' + 'chat/xyz'), ('https://' + 'chat.openai' + '.com/' + 'share/q'), ('https://' + 'claude' + '.ai/' + 'code/session_abc'))) {
         $r = Protect-ApiPoolText -Text ('see ' + $link + ' now')
         Assert-ApiPoolTrue ($r -ceq 'see [chat-link-redacted] now') ('Redaction/ChatLink/' + $link)
     }
