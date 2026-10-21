@@ -1,5 +1,5 @@
 ﻿# Cli suite. Dot-sourced by Invoke-ApiPoolTests.ps1. Runs Invoke-ApiPool.ps1 in child powershell.exe processes,
-# strictly sequentially (10 children). Every child gets either -StateRoot inside the sandbox or a config override whose stateRoot is inside the sandbox;
+# strictly sequentially (11 children). Every child gets either -StateRoot inside the sandbox or a config override whose stateRoot is inside the sandbox;
 # the real default state directory under LOCALAPPDATA is only stat-ed (existence + LastWriteTimeUtc), never read. Offline; no network.
 # Health convention (documented): an unhealthy report is exit 1 with {ok:false, code:'UNHEALTHY'}.
 
@@ -146,7 +146,37 @@ try {
         Assert-ApiPoolTrue -Condition ([string]$c10.Json.data.Result.text).Contains('[chat-link-redacted]') -Name 'RedactJson/UrlReplacedByMarker' -Detail $c10.Stdout
     }
 
-    Assert-ApiPoolTrue -Condition ($c1.Done -and $c2.Done -and $c3.Done -and $c4.Done -and $c5.Done -and $c6.Done -and $c7.Done -and $c8.Done -and $c9.Done -and $c10.Done) -Name 'Children/AllExitedInTime'
+    # 11. F7-SEC-001: secret-named keys are redacted STRUCTURALLY whatever the value type (number, bool, array, object);
+    # a numeric value is not a string, so text redaction alone would let it through. Fail-closed fallback in Write-ApiPoolCliResult
+    # (non-JSON after the extra text pass -> INTERNAL_ERROR) is not reachable from stored data once strings are redacted before
+    # serialization (the second pass is idempotent over the marker), so only the structural redaction is asserted here.
+    $cliNum = '1234' + '56789'
+    $cliArrA = 'arrval' + 'AAA'
+    $cliArrB = 'arrval' + 'BBB'
+    $cliJobDoc2 = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($cliJobFile))
+    $cliSecretResult = [pscustomobject]@{
+        api_key = [long]$cliNum
+        nested  = [pscustomobject]@{ token = $true; authorization = @($cliArrA, $cliArrB); password = [pscustomobject]@{ inner = 'innerval' + 'CCC' } }
+        note    = 'x-api-key: ' + $cliFakeKey
+    }
+    Add-Member -InputObject $cliJobDoc2 -MemberType NoteProperty -Name 'result' -Value $cliSecretResult -Force
+    [System.IO.File]::WriteAllText($cliJobFile, (ConvertTo-Json -InputObject $cliJobDoc2 -Depth 10 -Compress))
+    $c11 = Invoke-CliChild -CliArgs @('-Command', 'result', '-StateRoot', $cliState, '-JobId', [string]$cliJob.jobId)
+    $c11All = $c11.Stdout + $c11.Stderr
+    Assert-ApiPoolTrue -Condition ($null -ne $c11.Json -and $c11.Json.ok -eq $true) -Name 'RedactStruct/StdoutParses' -Detail $c11.Stdout
+    Assert-ApiPoolEqual -Expected 0 -Actual $c11.Exit -Name 'RedactStruct/ExitZero'
+    Assert-ApiPoolTrue -Condition (-not $c11All.Contains($cliNum)) -Name 'RedactStruct/NumberRedacted'
+    Assert-ApiPoolTrue -Condition (-not $c11All.Contains($cliFakeKeyTail)) -Name 'RedactStruct/NoteKeyRedacted'
+    Assert-ApiPoolTrue -Condition (-not $c11All.Contains($cliArrA) -and -not $c11All.Contains($cliArrB)) -Name 'RedactStruct/ArrayRedacted'
+    Assert-ApiPoolTrue -Condition (-not $c11All.Contains('innerval')) -Name 'RedactStruct/ObjectRedacted'
+    if ($null -ne $c11.Json) {
+        $c11Res = $c11.Json.data.Result
+        Assert-ApiPoolEqual -Expected '***REDACTED***' -Actual ([string]$c11Res.api_key) -Name 'RedactStruct/ApiKeyMarker'
+        Assert-ApiPoolEqual -Expected '***REDACTED***' -Actual ([string]$c11Res.nested.token) -Name 'RedactStruct/TokenMarker'
+        Assert-ApiPoolEqual -Expected '***REDACTED***' -Actual ([string]$c11Res.nested.authorization) -Name 'RedactStruct/AuthorizationMarker'
+    }
+
+    Assert-ApiPoolTrue -Condition ($c1.Done -and $c2.Done -and $c3.Done -and $c4.Done -and $c5.Done -and $c6.Done -and $c7.Done -and $c8.Done -and $c9.Done -and $c10.Done -and $c11.Done) -Name 'Children/AllExitedInTime'
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $cliSandbox

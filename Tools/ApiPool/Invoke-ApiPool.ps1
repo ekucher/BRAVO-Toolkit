@@ -27,6 +27,10 @@ $script:ExitCode = 1
 $script:ModulesReady = $false
 $script:BoundParams = $PSBoundParameters
 
+# Secret-bearing field names (superset of the header/key names in $script:ApiPoolSecretNamePattern of ApiPool.Core.psm1).
+# A value under such a name is replaced WHOLE, whatever its type (number, bool, array, object), because text redaction only sees strings.
+$script:CliSecretNamePattern = '(?i)^(?:x-api-key|anthropic-api-key|api_key|api-key|apikey|authorization|password|secret|token|access_token|refresh_token|client_secret|private_key|credentials?)$'
+
 function Protect-ApiPoolCliValue {
     # Redacts every string (values and keys) BEFORE serialization; escaping must never be redacted afterwards
     # (a quoted chat URL followed by an escaped quote would otherwise swallow the backslash and break the JSON).
@@ -38,7 +42,10 @@ function Protect-ApiPoolCliValue {
     if ($Depth -gt 12) { return '[truncated]' }
     if ($Value -is [System.Collections.IDictionary]) {
         $map = [ordered]@{}
-        foreach ($k in $Value.Keys) { $map[(Protect-ApiPoolText -Text ([string]$k))] = Protect-ApiPoolCliValue -Value $Value[$k] -Depth ($Depth + 1) }
+        foreach ($k in $Value.Keys) {
+            if (([string]$k) -match $script:CliSecretNamePattern) { $map[(Protect-ApiPoolText -Text ([string]$k))] = '***REDACTED***'; continue }
+            $map[(Protect-ApiPoolText -Text ([string]$k))] = Protect-ApiPoolCliValue -Value $Value[$k] -Depth ($Depth + 1)
+        }
         return $map
     }
     if ($Value -is [System.Collections.IEnumerable]) {
@@ -48,6 +55,7 @@ function Protect-ApiPoolCliValue {
     }
     $obj = [ordered]@{}
     foreach ($p in $Value.PSObject.Properties) {
+        if (([string]$p.Name) -match $script:CliSecretNamePattern) { $obj[(Protect-ApiPoolText -Text ([string]$p.Name))] = '***REDACTED***'; continue }
         $obj[(Protect-ApiPoolText -Text ([string]$p.Name))] = Protect-ApiPoolCliValue -Value $p.Value -Depth ($Depth + 1)
     }
     return $obj
@@ -65,9 +73,9 @@ function Write-ApiPoolCliResult {
     if ($script:ModulesReady) { $Data = Protect-ApiPoolCliValue -Value $Data }
     $json = ConvertTo-Json -InputObject ([ordered]@{ ok = $Ok; code = $Code; data = $Data }) -Compress -Depth 10
     if ($script:ModulesReady) {
-        # Extra structural pass (secret-name patterns over the JSON text); used only when the result is still valid JSON.
+        # Extra text pass over the JSON; fail closed: if it changed the text and broke the JSON, the first-pass JSON is never returned.
         $extra = Protect-ApiPoolText -Text $json
-        if (Test-ApiPoolCliJson -Text $extra) { $json = $extra }
+        if ($extra -cne $json) { $json = $extra }
     }
     if (-not (Test-ApiPoolCliJson -Text $json)) {
         $json = '{"ok":false,"code":"INTERNAL_ERROR","data":{"message":"The result could not be serialized safely."}}'
