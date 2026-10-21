@@ -123,6 +123,49 @@ try {
     Assert-ApiPoolThrows { Assert-ApiPoolStateRoot -StateRoot 'C:\ProgramData\bravo\State' } 'StateRoot/ProgramDataCaseInsensitive' -ExpectedCode 'STATE_PATH_FORBIDDEN'
     Assert-ApiPoolThrows { Assert-ApiPoolStateRoot -StateRoot 'C:\ProgramData\BRAVO\..\BRAVO\x' } 'StateRoot/DotDotNormalized' -ExpectedCode 'STATE_PATH_FORBIDDEN'
 
+    # F1-2: UNC, device prefixes and reparse-point ancestors are forbidden.
+    foreach ($bad in @('\\localhost\C$\x', '\\127.0.0.1\c$\x', '\\file-server-01\share\state', '//localhost/C$/x', '\\?\UNC\localhost\C$\x', '\\?\C:\x', '\\.\C:\x')) {
+        Assert-ApiPoolThrows { Assert-ApiPoolStateRoot -StateRoot $bad } ('StateRoot/ForbiddenPrefix/' + $bad) -ExpectedCode 'STATE_PATH_FORBIDDEN'
+    }
+    $jTarget = Join-Path $coreSandbox 'junction-target'
+    $jLink = Join-Path $coreSandbox 'junction-link'
+    [void][System.IO.Directory]::CreateDirectory($jTarget)
+    $null = & cmd.exe /c ('mklink /J "{0}" "{1}"' -f $jLink, $jTarget)
+    Assert-ApiPoolTrue ([System.IO.Directory]::Exists($jLink)) 'StateRoot/JunctionFixtureCreated'
+    try {
+        Assert-ApiPoolThrows { Assert-ApiPoolStateRoot -StateRoot $jLink } 'StateRoot/JunctionItselfRejected' -ExpectedCode 'STATE_PATH_FORBIDDEN'
+        Assert-ApiPoolThrows { Assert-ApiPoolStateRoot -StateRoot (Join-Path $jLink 'not\yet\created') } 'StateRoot/JunctionAncestorRejected' -ExpectedCode 'STATE_PATH_FORBIDDEN'
+        Assert-ApiPoolThrows { Assert-ApiPoolSafePath -Path (Join-Path $jLink 'secret.bin') -Purpose 'SecretPath' } 'SafePath/JunctionAncestorRejected' -ExpectedCode 'STATE_PATH_FORBIDDEN'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($jLink)) { [System.IO.Directory]::Delete($jLink, $false) }
+    }
+    Assert-ApiPoolTrue ([System.IO.Directory]::Exists($jTarget)) 'StateRoot/JunctionTargetSurvivesCleanup'
+    Assert-ApiPoolTrue ((Assert-ApiPoolStateRoot -StateRoot (Join-Path $coreSandbox 'plain\deep')) -like '*\plain\deep') 'StateRoot/OrdinaryNestedPathAccepted'
+    $safeCaught = $null
+    try { Assert-ApiPoolSafePath -Path 'rel\secret.bin' -Purpose 'SecretPath' } catch { $safeCaught = $_ }
+    Assert-ApiPoolTrue ($null -ne $safeCaught -and $safeCaught.Exception.Message.Contains('SecretPath')) 'SafePath/PurposeInMessage'
+
+    # F1-4: redaction of secret-bearing header/parameter names in all common forms.
+    $rv = 'Qq' + 'Zz-fake-' + 'value-4242'
+    $redactForms = @(
+        ('x-api-key: ' + $rv), ('X-API-KEY: ' + $rv), ('anthropic-api-key: ' + $rv), ('api_key=' + $rv), ('api-key: ' + $rv),
+        ('apikey=' + $rv), ('authorization: ' + $rv), ('Authorization: Bearer ' + $rv), ('Authorization: Basic ' + $rv),
+        ('{"x-api-key":"' + $rv + '"}'), ('{"api_key": "' + $rv + '"}'), ('{"x-api-key":["' + $rv + '"]}'),
+        ("{'x-api-key': '" + $rv + "'}"), ("'anthropic-api-key'='" + $rv + "'"),
+        ('GET /v1?x-api-key%3A' + $rv + '&a=1'), ('GET /v1?api_key%3D' + $rv + '&a=1'), ('GET /v1?api_key=' + $rv + '&a=1'),
+        ('{"authorization":"Bearer ' + $rv + '"}')
+    )
+    foreach ($form in $redactForms) {
+        $out = Protect-ApiPoolText -Text $form
+        Assert-ApiPoolTrue (-not $out.Contains($rv)) ('Redaction/Form/' + $form.Replace($rv, '<V>')) ('leaked: ' + $out.Replace($rv, '<V>'))
+    }
+    $spaced = Protect-ApiPoolText -Text ('{"api-key":"two words ' + $rv + ' end","next":"keep"}')
+    Assert-ApiPoolEqual '{"api-key":"***REDACTED***","next":"keep"}' $spaced 'Redaction/QuotedValueWithSpacesUpToClosingQuote'
+    $spacedSingle = Protect-ApiPoolText -Text ("x-api-key = 'two words " + $rv + "' tail")
+    Assert-ApiPoolEqual "x-api-key = '***REDACTED***' tail" $spacedSingle 'Redaction/SingleQuotedValueWithSpaces'
+    Assert-ApiPoolEqual 'monkey: banana status=ok' (Protect-ApiPoolText -Text 'monkey: banana status=ok') 'Redaction/UnrelatedTextUntouched'
+
     $ctx = New-ApiPoolContext -StateRoot (Join-Path $coreSandbox 'ctx') -Config $ok -Registry $null -Transport $null -CredentialProvider $null
     Assert-ApiPoolTrue ($ctx.StateRoot -like '*\ctx' -and $ctx.PSObject.TypeNames -contains 'ApiPool.Context') 'Context/Created'
     Assert-ApiPoolTrue ((& $ctx.Clock) -is [datetime]) 'Context/DefaultClock'

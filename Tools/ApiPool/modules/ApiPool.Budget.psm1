@@ -167,13 +167,21 @@ function Add-ApiPoolLedgerModelRecord {
                 Amount = [long]$data.amount; PerJobLimit = [long]$data.perJobLimit
                 State = 'RESERVED'; Actual = [long]0; Seq = $seq
             }
+            # F1-6: the effective per-job limit is the minimum of every limit ever recorded for the job.
+            $jl = [long]$data.perJobLimit
+            $jk = [string]$data.jobId
+            if (-not $Ledger.JobLimitMin.ContainsKey($jk) -or $jl -lt [long]$Ledger.JobLimitMin[$jk]) { $Ledger.JobLimitMin[$jk] = $jl }
         }
         { $_ -ceq 'COMMIT' -or $_ -ceq 'UNDO' -or $_ -ceq 'UNRECONCILED' } {
             $r = $null
             if ($res.ContainsKey([string]$data.id)) { $r = $res[[string]$data.id] }
             if ($null -eq $r) { return ("{0} for unknown reservation {1} at seq {2}" -f $type, $data.id, $seq) }
             if ($r.State -cne 'RESERVED') { return ("illegal {0} on reservation {1} in state {2} at seq {3}" -f $type, $data.id, $r.State, $seq) }
-            if ($type -ceq 'COMMIT') { $r.State = 'COMMITTED'; $r.Actual = [long]$data.actual }
+            if ($type -ceq 'COMMIT') {
+                $r.State = 'COMMITTED'; $r.Actual = [long]$data.actual
+                # F1-1: an overrun commit blocks spend even when the crash happened before OVERRUN/STOP were appended.
+                if ($r.Actual -gt $r.Amount) { $Ledger.DerivedStop = $true }
+            }
             elseif ($type -ceq 'UNDO') { $r.State = 'UNDONE' }
             else { $r.State = 'UNRECONCILED' }
         }
@@ -186,6 +194,7 @@ function Add-ApiPoolLedgerModelRecord {
             }
             $r.State = 'RESOLVED'
             $r.Actual = [long]$data.actual
+            if ($r.Actual -gt $r.Amount) { $Ledger.DerivedStop = $true }
         }
         'OVERRUN' {
             if (-not $res.ContainsKey([string]$data.id)) { return ("OVERRUN for unknown reservation {0} at seq {1}" -f $data.id, $seq) }
@@ -197,6 +206,7 @@ function Add-ApiPoolLedgerModelRecord {
         'CLEAR' {
             $Ledger.StopRecord = $false
             $Ledger.StopReason = $null
+            $Ledger.DerivedStop = $false
         }
         'REPAIR' { }
     }
@@ -211,6 +221,7 @@ function Read-ApiPoolLedger {
         State = 'ABSENT'; Reason = $null; Torn = $false; TornPrefixBytes = [long]0
         ValidRecords = 0; LastSeq = [long]0; LastHash = $script:ApiPoolLedgerZeroHash
         Limit = [long]0; Reservations = @{}; StopRecord = $false; StopReason = $null
+        DerivedStop = $false; JobLimitMin = @{}
         Committed = [decimal]0; Reserved = [decimal]0; Unreconciled = [decimal]0; JobCost = @{}
     }
     if (-not [System.IO.File]::Exists($Paths.Ledger)) { return $ledger }
@@ -341,7 +352,7 @@ function Get-ApiPoolLedgerReservation {
 }
 
 function Add-ApiPoolOverrunRecords {
-    # Marker first (cheap, always stops new spend), then OVERRUN and STOP records.
+    # Called after the COMMIT/RESOLVE record (spend is already counted); then OVERRUN and STOP records.
     param($Ledger, $Paths, [scriptblock]$Clock, [string]$ReservationId, [long]$Reserved, [long]$Actual)
 
     Add-ApiPoolLedgerRecord -Ledger $Ledger -Paths $Paths -Clock $Clock -Type 'OVERRUN' -Data ([ordered]@{ id = $ReservationId; reserved = $Reserved; actual = $Actual })
@@ -410,13 +421,15 @@ function Get-ApiPoolBudgetStatus {
     }
 
     $recordActive = ($ledger.State -ceq 'OK' -and $ledger.StopRecord)
+    $derivedActive = ($ledger.State -ceq 'OK' -and $ledger.DerivedStop)
     $markerActive = ($null -ne $marker)
     $source = $null
     $reason = $null
     if ($recordActive -and $markerActive) { $source = 'both'; $reason = $marker.Reason }
     elseif ($markerActive) { $source = 'marker'; $reason = $marker.Reason }
     elseif ($recordActive) { $source = 'record'; $reason = $ledger.StopReason }
-    $stop = [pscustomobject]@{ Active = ($recordActive -or $markerActive); Reason = $reason; Source = $source }
+    elseif ($derivedActive) { $source = 'derived'; $reason = $script:ApiPoolOverrunReason }
+    $stop = [pscustomobject]@{ Active = ($recordActive -or $markerActive -or $derivedActive); Reason = $reason; Source = $source }
 
     $status = [pscustomobject]@{
         State                = 'UNINITIALIZED'
@@ -480,7 +493,7 @@ function New-ApiPoolReservation {
         Assert-ApiPoolLedgerUsable -Ledger $ledger
 
         $marker = Read-ApiPoolStopMarker -Paths $paths
-        if ($null -ne $marker -or $ledger.StopRecord) {
+        if ($null -ne $marker -or $ledger.StopRecord -or $ledger.DerivedStop) {
             Invoke-ApiPoolThrow -Code 'BUDGET_STOPPED' -Message 'Budget is stopped (emergency stop is active).'
         }
         $outstanding = $ledger.Committed + $ledger.Reserved + $ledger.Unreconciled
@@ -489,7 +502,9 @@ function New-ApiPoolReservation {
         }
         $jobCost = [decimal]0
         if ($ledger.JobCost.ContainsKey($JobId)) { $jobCost = $ledger.JobCost[$JobId] }
-        if (($jobCost + [decimal]$AmountMicroUsd) -gt [decimal]$PerJobLimitMicroUsd) {
+        $effectiveJobLimit = [long]$PerJobLimitMicroUsd
+        if ($ledger.JobLimitMin.ContainsKey($JobId) -and [long]$ledger.JobLimitMin[$JobId] -lt $effectiveJobLimit) { $effectiveJobLimit = [long]$ledger.JobLimitMin[$JobId] }
+        if (($jobCost + [decimal]$AmountMicroUsd) -gt [decimal]$effectiveJobLimit) {
             Invoke-ApiPoolThrow -Code 'BUDGET_EXHAUSTED_JOB' -Message 'Reservation would exceed the per-job limit.' -Details @{ jobId = $JobId }
         }
 
@@ -531,12 +546,15 @@ function Complete-ApiPoolReservation {
             Invoke-ApiPoolThrow -Code 'RESERVATION_STATE_INVALID' -Message ("Reservation '{0}' is in state {1}; only an open reservation can be completed." -f $ReservationId, $r.State)
         }
         $overrun = ($ActualMicroUsd -gt $r.Amount)
-        if ($overrun) { Write-ApiPoolStopMarker -Paths $paths -Reason $script:ApiPoolOverrunReason -Clock $Clock }
+        $markerError = $null
         Add-ApiPoolLedgerRecord -Ledger $ledger -Paths $paths -Clock $Clock -Type 'COMMIT' -Data ([ordered]@{
                 id = $ReservationId; actual = $ActualMicroUsd; evidence = (ConvertTo-ApiPoolLedgerEvidence -Evidence $Evidence)
             })
         if ($overrun) {
             Add-ApiPoolOverrunRecords -Ledger $ledger -Paths $paths -Clock $Clock -ReservationId $ReservationId -Reserved $r.Amount -Actual $ActualMicroUsd
+            # The marker is a secondary stop signal: its failure never undoes or skips ledger records.
+            try { Write-ApiPoolStopMarker -Paths $paths -Reason $script:ApiPoolOverrunReason -Clock $Clock }
+            catch { $markerError = [string]$_.Exception.Message }
         }
         return [pscustomobject]@{
             ReservationId     = $ReservationId
@@ -544,6 +562,7 @@ function Complete-ApiPoolReservation {
             ActualMicroUsd    = $ActualMicroUsd
             Overrun           = $overrun
             EmergencyStop     = $overrun
+            MarkerError       = $markerError
         }
     }
     finally {
@@ -631,12 +650,15 @@ function Resolve-ApiPoolOrphanReservation {
             Invoke-ApiPoolThrow -Code 'RESERVATION_STATE_INVALID' -Message ("Reservation '{0}' is in state {1}; only an open or unreconciled reservation can be resolved." -f $ReservationId, $r.State)
         }
         $overrun = ($ActualMicroUsd -gt $r.Amount)
-        if ($overrun) { Write-ApiPoolStopMarker -Paths $paths -Reason $script:ApiPoolOverrunReason -Clock $Clock }
+        $markerError = $null
         Add-ApiPoolLedgerRecord -Ledger $ledger -Paths $paths -Clock $Clock -Type 'RESOLVE' -Data ([ordered]@{
                 id = $ReservationId; actual = $ActualMicroUsd; evidence = (ConvertTo-ApiPoolLedgerEvidence -Evidence $Evidence); reason = (Protect-ApiPoolText -Text $Reason)
             })
         if ($overrun) {
             Add-ApiPoolOverrunRecords -Ledger $ledger -Paths $paths -Clock $Clock -ReservationId $ReservationId -Reserved $r.Amount -Actual $ActualMicroUsd
+            # The marker is a secondary stop signal: its failure never undoes or skips ledger records.
+            try { Write-ApiPoolStopMarker -Paths $paths -Reason $script:ApiPoolOverrunReason -Clock $Clock }
+            catch { $markerError = [string]$_.Exception.Message }
         }
         return [pscustomobject]@{
             ReservationId     = $ReservationId
@@ -644,6 +666,7 @@ function Resolve-ApiPoolOrphanReservation {
             ActualMicroUsd    = $ActualMicroUsd
             Overrun           = $overrun
             EmergencyStop     = $overrun
+            MarkerError       = $markerError
         }
     }
     finally {

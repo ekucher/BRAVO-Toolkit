@@ -7,6 +7,8 @@
 # In-process registry of exact secret values used ONLY for redaction.
 $script:ApiPoolKnownSecrets = New-Object System.Collections.ArrayList
 
+$script:ApiPoolSecretNamePattern = '(?i)(?<pre>["'']?\b(?:x-api-key|anthropic-api-key|api_key|api-key|apikey|authorization)["'']?\s*(?:[:=]|%3[AD])\s*(?:\[\s*)?)(?:(?<q>["''])(?:\\.|(?!\k<q>).)*\k<q>|(?:(?:Bearer|Basic)\s+)?[^\s"'',;&\]]+)'
+
 # ---------------------------------------------------------------------------
 # Redaction
 # ---------------------------------------------------------------------------
@@ -74,7 +76,9 @@ function Protect-ApiPoolText {
     }
 
     $result = [regex]::Replace($result, 'sk-ant-[A-Za-z0-9_\-]{8,}', 'sk-ant-***REDACTED***')
-    $result = [regex]::Replace($result, '(?i)(x-api-key["'']?\s*[:=]\s*["'']?)([^\s"'',;]+)', '${1}***REDACTED***')
+    # Secret-bearing header/parameter names: `name: value`, `name=value`, `"name":"value"`, `"name":["value"]`,
+    # `'name': 'value'`, URL-encoded `name%3Avalue` and quoted values containing spaces (redacted up to the closing quote).
+    $result = [regex]::Replace($result, $script:ApiPoolSecretNamePattern, '${pre}${q}***REDACTED***${q}')
     $result = [regex]::Replace($result, '(?i)(\bBearer\s+)([A-Za-z0-9\-._~+/]+=*)', '${1}***REDACTED***')
     $result = [regex]::Replace($result, '(?i)https?://(claude\.ai|chatgpt\.com|chat\.openai\.com)/(share|chat|code/session)[^\s]*', '[chat-link-redacted]')
 
@@ -454,28 +458,40 @@ function Get-ApiPoolLongPath {
     return $current.TrimEnd('\')
 }
 
-function Assert-ApiPoolStateRoot {
+function Assert-ApiPoolSafePath {
+    # Canonical path guard for every ApiPool path that holds state or secrets. Returns the full path.
+    # Rejects: empty, unresolved %VAR%, relative, UNC (\\server\share, \\localhost, \\127.0.0.1), device prefixes
+    # (\\?\ and \\.\), the BRAVO production data directory, the repository tree, and any path with an EXISTING
+    # ancestor that is a reparse point (junction/symlink).
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
-        [string]$StateRoot,
+        [string]$Path,
+
+        [string]$Purpose = 'Path',
 
         [string]$RepoRoot
     )
 
-    if ([string]::IsNullOrWhiteSpace($StateRoot)) {
-        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'State root must not be empty.'
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("{0} must not be empty." -f $Purpose)
     }
-    if ($StateRoot.Contains('%')) {
-        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'State root contains an unresolved environment variable.'
+    if ($Path.Contains('%')) {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("{0} contains an unresolved environment variable." -f $Purpose)
     }
-    if ($StateRoot -notmatch '^([A-Za-z]:[\\/]|\\\\[^\\])') {
-        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'State root must be an absolute path.'
+    if ($Path.StartsWith('\\') -or $Path.StartsWith('//')) {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("{0} must be a local drive path (UNC and device paths are forbidden)." -f $Purpose)
     }
-    try { $full = Get-ApiPoolLongPath -FullPath ([System.IO.Path]::GetFullPath($StateRoot)) } catch {
-        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'State root is not a valid path.'
+    if ($Path -notmatch '^[A-Za-z]:[\\/]') {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("{0} must be an absolute path." -f $Purpose)
+    }
+    try { $full = Get-ApiPoolLongPath -FullPath ([System.IO.Path]::GetFullPath($Path)) } catch {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("{0} is not a valid path." -f $Purpose)
+    }
+    if ($full -notmatch '^[A-Za-z]:\\') {
+        Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("{0} must be a local drive path." -f $Purpose)
     }
 
     if ([string]::IsNullOrEmpty($RepoRoot)) {
@@ -494,10 +510,35 @@ function Assert-ApiPoolStateRoot {
     foreach ($entry in $forbidden) {
         $r = Get-ApiPoolLongPath -FullPath ([System.IO.Path]::GetFullPath($entry[1]))
         if ($full -ieq $r -or $full.StartsWith($r + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-            Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("State root must not be inside {0}." -f $entry[0])
+            Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("{0} must not be inside {1}." -f $Purpose, $entry[0])
         }
     }
+
+    $probe = $full
+    while (-not [string]::IsNullOrEmpty($probe)) {
+        if ([System.IO.File]::Exists($probe) -or [System.IO.Directory]::Exists($probe)) {
+            $attrs = [System.IO.File]::GetAttributes($probe)
+            if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message ("{0} must not pass through a reparse point (junction or symbolic link)." -f $Purpose)
+            }
+        }
+        $probe = [System.IO.Path]::GetDirectoryName($probe)
+    }
     return $full
+}
+
+function Assert-ApiPoolStateRoot {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$StateRoot,
+
+        [string]$RepoRoot
+    )
+
+    return (Assert-ApiPoolSafePath -Path $StateRoot -Purpose 'State root' -RepoRoot $RepoRoot)
 }
 
 function New-ApiPoolContext {
@@ -756,6 +797,7 @@ Export-ModuleMember -Function @(
     'Enter-ApiPoolFileLock',
     'Exit-ApiPoolFileLock',
     'Add-ApiPoolLineDurable',
+    'Assert-ApiPoolSafePath',
     'Assert-ApiPoolStateRoot',
     'New-ApiPoolContext',
     'Read-ApiPoolConfig'

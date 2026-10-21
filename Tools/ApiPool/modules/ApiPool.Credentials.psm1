@@ -9,6 +9,13 @@
 # No entropy is used unless the caller passes one explicitly.
 # The secret is handled as SecureString; plaintext only exists transiently in
 # char[]/byte[] buffers that are zeroed in finally blocks.
+# By design Core's known-secret registry (Register-ApiPoolKnownSecret) keeps the plaintext
+# of every credential read in-process for redaction; that copy is not zeroed.
+# SecretPath is validated by Core's Assert-ApiPoolSafePath (absolute local drive path, no
+# UNC/device prefix, not under the BRAVO data directory or the repository, no reparse ancestors).
+# Written credential files (secret, .previous, .meta.json) get an owner-only ACL: inheritance
+# disabled, FullControl for the current user and SYSTEM only.
+# Restore-ApiPoolPreviousCredential is a two-step swap (secret first, then .previous), NOT atomic.
 
 Add-Type -AssemblyName System.Security
 
@@ -116,7 +123,7 @@ function New-ApiPoolCredentialProvider {
             PSTypeName = 'ApiPool.CredentialProvider'
             Kind       = 'Dpapi'
             Id         = $id
-            SecretPath = [System.IO.Path]::GetFullPath($SecretPath)
+            SecretPath = (Assert-ApiPoolSafePath -Path $SecretPath -Purpose 'SecretPath')
             Entropy    = $Entropy
         }
     }
@@ -189,11 +196,40 @@ function Get-ApiPoolCredential {
     return $secure
 }
 
+function Set-ApiPoolOwnerOnlyAcl {
+    # Protected (non-inherited) DACL: current user and SYSTEM, FullControl.
+    param([string]$Path)
+
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $system = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $security = New-Object System.Security.AccessControl.FileSecurity
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($me, $system)) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule)
+    }
+    [System.IO.File]::SetAccessControl($Path, $security)
+}
+
 function Write-ApiPoolCredentialMeta {
     param([string]$SecretPath, [byte[]]$PlainBytes)
 
-    $text = [System.Text.Encoding]::UTF8.GetString($PlainBytes).TrimEnd()
-    $fingerprint = (Get-ApiPoolSha256Hex -Text $text).Substring(0, 8)
+    # Fingerprint over the UTF-8 bytes (trailing ASCII whitespace trimmed); no managed plaintext string.
+    $end = $PlainBytes.Length
+    while ($end -gt 0 -and ($PlainBytes[$end - 1] -eq 32 -or ($PlainBytes[$end - 1] -ge 9 -and $PlainBytes[$end - 1] -le 13))) { $end-- }
+    $trimmed = New-Object 'byte[]' $end
+    [Array]::Copy($PlainBytes, $trimmed, $end)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($trimmed)
+    }
+    finally {
+        $sha.Dispose()
+        Clear-ApiPoolBuffer -Buffer $trimmed
+    }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($b in $hash) { [void]$sb.Append($b.ToString('x2', [System.Globalization.CultureInfo]::InvariantCulture)) }
+    $fingerprint = $sb.ToString().Substring(0, 8)
     $meta = [ordered]@{
         rotatedAtUtc = [System.DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
         fingerprint  = $fingerprint
@@ -213,7 +249,7 @@ function Set-ApiPoolCredential {
         [byte[]]$Entropy
     )
 
-    $full = [System.IO.Path]::GetFullPath($SecretPath)
+    $full = Assert-ApiPoolSafePath -Path $SecretPath -Purpose 'SecretPath'
     $chars = Get-ApiPoolSecureChars -Secret $Secret
     $plainBytes = $null
     try {
@@ -229,6 +265,9 @@ function Set-ApiPoolCredential {
             }
             Write-ApiPoolBytesAtomic -Path $full -Bytes $protectedBytes
             Write-ApiPoolCredentialMeta -SecretPath $full -PlainBytes $plainBytes
+            foreach ($f in @($full, ($full + '.previous'), ($full + '.meta.json'))) {
+                if ([System.IO.File]::Exists($f)) { Set-ApiPoolOwnerOnlyAcl -Path $f }
+            }
         }
         catch {
             Invoke-ApiPoolThrow -Code 'CREDENTIAL_ROTATION_FAILED' -Message ("Credential rotation failed for {0} ({1})." -f $full, $_.Exception.GetType().Name)
@@ -249,7 +288,7 @@ function Restore-ApiPoolPreviousCredential {
         [byte[]]$Entropy
     )
 
-    $full = [System.IO.Path]::GetFullPath($SecretPath)
+    $full = Assert-ApiPoolSafePath -Path $SecretPath -Purpose 'SecretPath'
     $previousPath = $full + '.previous'
     if (-not [System.IO.File]::Exists($previousPath)) {
         Invoke-ApiPoolThrow -Code 'CREDENTIAL_NOT_FOUND' -Message ("No previous credential exists for {0}." -f $full)
@@ -265,11 +304,15 @@ function Restore-ApiPoolPreviousCredential {
         $currentBytes = $null
         if ([System.IO.File]::Exists($full)) { $currentBytes = [System.IO.File]::ReadAllBytes($full) }
         try {
+            # Two-step swap (secret, then .previous): a crash between the steps leaves both files valid but not exchanged.
             Write-ApiPoolBytesAtomic -Path $full -Bytes $previousBytes
             if ($null -ne $currentBytes) {
                 Write-ApiPoolBytesAtomic -Path $previousPath -Bytes $currentBytes
             }
             Write-ApiPoolCredentialMeta -SecretPath $full -PlainBytes $plainBytes
+            foreach ($f in @($full, $previousPath, ($full + '.meta.json'))) {
+                if ([System.IO.File]::Exists($f)) { Set-ApiPoolOwnerOnlyAcl -Path $f }
+            }
         }
         catch {
             Invoke-ApiPoolThrow -Code 'CREDENTIAL_ROTATION_FAILED' -Message ("Credential restore failed for {0} ({1})." -f $full, $_.Exception.GetType().Name)

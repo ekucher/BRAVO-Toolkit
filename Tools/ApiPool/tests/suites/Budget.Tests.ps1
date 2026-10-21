@@ -469,6 +469,77 @@ try {
     }
     Assert-ApiPoolEqual $sizeBefore ([System.IO.FileInfo](Get-BudgetLedgerPath -Root $r)).Length 'Lock/TimedOutCallWroteNothing'
     Assert-ApiPoolEqual 'OK' (Get-ApiPoolBudgetStatus -StateRoot $r).State 'Lock/UsableAfterRelease'
+
+    # ---------------- F1-1: overrun is recorded even when the stop marker cannot be written ----------------
+    $r = New-BudgetFixture -Limit 10000
+    $rsv = New-ApiPoolReservation -StateRoot $r -JobId 'mk' -AttemptId 'a1' -AmountMicroUsd 1000 -PerJobLimitMicroUsd 5000
+    # A DIRECTORY at the marker path makes the atomic marker write throw.
+    [void][System.IO.Directory]::CreateDirectory((Join-Path (Join-Path $r 'budget') 'EMERGENCY_STOP'))
+    $mkRes = $null
+    try { $mkRes = Complete-ApiPoolReservation -StateRoot $r -ReservationId $rsv.ReservationId -ActualMicroUsd 1500 } catch { $mkRes = $null }
+    $mkStatus = Get-ApiPoolBudgetStatus -StateRoot $r
+    Assert-ApiPoolEqual 1500 $mkStatus.CommittedMicroUsd 'MarkerFailure/CompleteCountsActualSpend'
+    Assert-ApiPoolEqual 'STOPPED' $mkStatus.State 'MarkerFailure/CompleteStatusStopped'
+    Assert-ApiPoolTrue ($null -ne $mkRes -and $mkRes.Overrun -eq $true -and $mkRes.EmergencyStop -eq $true) 'MarkerFailure/CompleteReturnsOverrun'
+    Assert-ApiPoolTrue ($null -ne $mkRes -and -not [string]::IsNullOrEmpty([string]$mkRes.MarkerError)) 'MarkerFailure/CompleteSurfacesMarkerError'
+    Assert-ApiPoolEqual 'BUDGET_STOPPED' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot $r -JobId 'mk' -AttemptId 'a2' -AmountMicroUsd 1 -PerJobLimitMicroUsd 5000 }) 'MarkerFailure/NextReserveRefused'
+    $mkTypes = @(Get-BudgetLedgerRecords -Root $r | ForEach-Object { [string]$_.type })
+    Assert-ApiPoolEqual 'INIT,RESERVE,COMMIT,OVERRUN,STOP' ($mkTypes -join ',') 'MarkerFailure/RecordOrderCommitOverrunStop'
+
+    $r = New-BudgetFixture -Limit 10000
+    $rsv = New-ApiPoolReservation -StateRoot $r -JobId 'mk' -AttemptId 'a1' -AmountMicroUsd 1000 -PerJobLimitMicroUsd 5000
+    [void](Set-ApiPoolReservationUnreconciled -StateRoot $r -ReservationId $rsv.ReservationId -Reason 'test')
+    [void][System.IO.Directory]::CreateDirectory((Join-Path (Join-Path $r 'budget') 'EMERGENCY_STOP'))
+    $mkRes = $null
+    try { $mkRes = Resolve-ApiPoolOrphanReservation -StateRoot $r -ReservationId $rsv.ReservationId -ActualMicroUsd 1500 -Reason 'test' } catch { $mkRes = $null }
+    $mkStatus = Get-ApiPoolBudgetStatus -StateRoot $r
+    Assert-ApiPoolEqual 1500 $mkStatus.CommittedMicroUsd 'MarkerFailure/ResolveCountsActualSpend'
+    Assert-ApiPoolEqual 'STOPPED' $mkStatus.State 'MarkerFailure/ResolveStatusStopped'
+    Assert-ApiPoolTrue ($null -ne $mkRes -and $mkRes.Overrun -eq $true -and -not [string]::IsNullOrEmpty([string]$mkRes.MarkerError)) 'MarkerFailure/ResolveReturnsOverrunAndMarkerError'
+    Assert-ApiPoolEqual 'BUDGET_STOPPED' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot $r -JobId 'mk' -AttemptId 'a2' -AmountMicroUsd 1 -PerJobLimitMicroUsd 5000 }) 'MarkerFailure/ResolveNextReserveRefused'
+
+    # ---------------- F1-1: a crash right after an overrun COMMIT/RESOLVE still blocks spend (derived stop) ----------------
+    foreach ($kind in @('Complete', 'Resolve')) {
+        $r = New-BudgetFixture -Limit 10000
+        $rsv = New-ApiPoolReservation -StateRoot $r -JobId 'dr' -AttemptId 'a1' -AmountMicroUsd 1000 -PerJobLimitMicroUsd 5000
+        if ($kind -ceq 'Complete') {
+            [void](Complete-ApiPoolReservation -StateRoot $r -ReservationId $rsv.ReservationId -ActualMicroUsd 1500)
+            $keep = 3
+        }
+        else {
+            [void](Resolve-ApiPoolOrphanReservation -StateRoot $r -ReservationId $rsv.ReservationId -ActualMicroUsd 1500 -Reason 'test')
+            $keep = 3
+        }
+        $lines = @([System.IO.File]::ReadAllText((Get-BudgetLedgerPath -Root $r)).Split([char]10) | Where-Object { $_ -ne '' })
+        Assert-ApiPoolEqual 5 $lines.Count ('Derived/' + $kind + '/FullRunHasFiveRecords')
+        [System.IO.File]::WriteAllText((Get-BudgetLedgerPath -Root $r), ((@($lines[0..($keep - 1)]) -join "`n") + "`n"), $budgetUtf8)
+        $marker = Join-Path (Join-Path $r 'budget') 'EMERGENCY_STOP'
+        if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
+        $ds = Get-ApiPoolBudgetStatus -StateRoot $r
+        Assert-ApiPoolEqual 'STOPPED' $ds.State ('Derived/' + $kind + '/TruncatedLedgerIsStopped')
+        Assert-ApiPoolEqual 'derived' $ds.EmergencyStop.Source ('Derived/' + $kind + '/SourceDerived')
+        Assert-ApiPoolEqual 1500 $ds.CommittedMicroUsd ('Derived/' + $kind + '/SpendCounted')
+        Assert-ApiPoolEqual 'BUDGET_STOPPED' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot $r -JobId 'dr' -AttemptId 'a2' -AmountMicroUsd 1 -PerJobLimitMicroUsd 5000 }) ('Derived/' + $kind + '/ReserveRefused')
+        [void](Clear-ApiPoolEmergencyStop -StateRoot $r -Reason 'operator reviewed')
+        Assert-ApiPoolEqual 'OK' (Get-ApiPoolBudgetStatus -StateRoot $r).State ('Derived/' + $kind + '/ClearLiftsDerivedStop')
+    }
+    # A non-overrun commit never derives a stop.
+    $r = New-BudgetFixture -Limit 10000
+    $rsv = New-ApiPoolReservation -StateRoot $r -JobId 'nd' -AttemptId 'a1' -AmountMicroUsd 1000 -PerJobLimitMicroUsd 5000
+    [void](Complete-ApiPoolReservation -StateRoot $r -ReservationId $rsv.ReservationId -ActualMicroUsd 1000)
+    Assert-ApiPoolEqual 'OK' (Get-ApiPoolBudgetStatus -StateRoot $r).State 'Derived/ExactCommitDoesNotStop'
+
+    # ---------------- F1-6: per-job limit is the minimum of every limit ever recorded for the job ----------------
+    $r = New-BudgetFixture -Limit 5000000
+    [void](New-ApiPoolReservation -StateRoot $r -JobId 'jl' -AttemptId 'a1' -AmountMicroUsd 600 -PerJobLimitMicroUsd 1000)
+    Assert-ApiPoolEqual 'BUDGET_EXHAUSTED_JOB' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot $r -JobId 'jl' -AttemptId 'a2' -AmountMicroUsd 600 -PerJobLimitMicroUsd 1000000 }) 'JobLimitMin/LaterLargerLimitCannotRaiseCap'
+    $second = New-ApiPoolReservation -StateRoot $r -JobId 'jl' -AttemptId 'a3' -AmountMicroUsd 400 -PerJobLimitMicroUsd 1000000
+    Assert-ApiPoolTrue ($null -ne $second) 'JobLimitMin/FillsUpToRecordedCap'
+    Assert-ApiPoolEqual 'BUDGET_EXHAUSTED_JOB' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot $r -JobId 'jl' -AttemptId 'a4' -AmountMicroUsd 1 -PerJobLimitMicroUsd 1000000 }) 'JobLimitMin/CapHoldsAtExactLimit'
+    [void](New-ApiPoolReservation -StateRoot $r -JobId 'jm' -AttemptId 'a1' -AmountMicroUsd 600 -PerJobLimitMicroUsd 1000000)
+    Assert-ApiPoolEqual 'BUDGET_EXHAUSTED_JOB' (Get-BudgetErrCode { New-ApiPoolReservation -StateRoot $r -JobId 'jm' -AttemptId 'a2' -AmountMicroUsd 600 -PerJobLimitMicroUsd 1000 }) 'JobLimitMin/CurrentSmallerLimitStillApplies'
+    $other = New-ApiPoolReservation -StateRoot $r -JobId 'jo' -AttemptId 'a1' -AmountMicroUsd 900 -PerJobLimitMicroUsd 1000000
+    Assert-ApiPoolTrue ($null -ne $other) 'JobLimitMin/OtherJobUnaffected'
 }
 finally {
     Remove-ApiPoolTestSandbox -Path $budgetSandbox

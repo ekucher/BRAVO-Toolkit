@@ -115,6 +115,37 @@ try {
     Assert-ApiPoolThrows { Set-ApiPoolCredential -SecretPath $dpapiPath -Secret (New-CredTestSecure $credFakeB) } 'Rotation/FailureReported' -ExpectedCode 'CREDENTIAL_ROTATION_FAILED' -MessageMustNotContain @($credFakeB)
     Assert-ApiPoolEqual $credFake (Get-CredTestPlain $provider) 'Rotation/CurrentUntouchedAfterFailedRotation'
 
+    # ---------------- F1-3: fingerprint value is stable (byte-based computation) ----------------
+    Assert-ApiPoolEqual '14e16c60' $meta3.fingerprint 'Meta/FingerprintMatchesPrecomputedSha256Prefix'
+
+    # ---------------- F1-5: owner-only ACL on written files ----------------
+    $aclPath = Join-Path $credSandbox 'creds\acl-test.dpapi'
+    Set-ApiPoolCredential -SecretPath $aclPath -Secret (New-CredTestSecure $credFake)
+    Set-ApiPoolCredential -SecretPath $aclPath -Secret (New-CredTestSecure $credFakeB)
+    Restore-ApiPoolPreviousCredential -SecretPath $aclPath
+    $meSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $systemSid = 'S-1-5-18'
+    foreach ($aclFile in @($aclPath, ($aclPath + '.previous'), ($aclPath + '.meta.json'))) {
+        $acl = [System.IO.File]::GetAccessControl($aclFile)
+        $leaf = Split-Path -Leaf $aclFile
+        Assert-ApiPoolTrue $acl.AreAccessRulesProtected ('Acl/InheritanceDisabled/' + $leaf)
+        $sids = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+        Assert-ApiPoolTrue ($sids -contains $meSid) ('Acl/CurrentUserPresent/' + $leaf)
+        Assert-ApiPoolEqual 0 @($sids | Where-Object { $_ -ne $meSid -and $_ -ne $systemSid }).Count ('Acl/OnlyOwnerAndSystem/' + $leaf)
+        $inherited = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IsInherited })
+        Assert-ApiPoolEqual 0 $inherited.Count ('Acl/NoInheritedRules/' + $leaf)
+    }
+
+    # ---------------- F1-5: SecretPath guard ----------------
+    $credRepoRoot = Split-Path -Parent (Split-Path -Parent $script:ApiRoot)
+    $badSecretPaths = @('creds\relative.dpapi', '\\localhost\C$\x\s.dpapi', '//localhost/C$/x/s.dpapi', '\\?\C:\x\s.dpapi', '\\.\C:\x\s.dpapi', 'C:\ProgramData\BRAVO\s.dpapi', (Join-Path $credRepoRoot 'x\s.dpapi'))
+    foreach ($bad in $badSecretPaths) {
+        $badSecure = New-CredTestSecure $credFake
+        Assert-ApiPoolThrows { New-ApiPoolCredentialProvider -Kind Dpapi -SecretPath $bad } ('SecretPath/Provider/' + $bad) -ExpectedCode 'STATE_PATH_FORBIDDEN'
+        Assert-ApiPoolThrows { Set-ApiPoolCredential -SecretPath $bad -Secret $badSecure } ('SecretPath/Set/' + $bad) -ExpectedCode 'STATE_PATH_FORBIDDEN'
+        Assert-ApiPoolThrows { Restore-ApiPoolPreviousCredential -SecretPath $bad } ('SecretPath/Restore/' + $bad) -ExpectedCode 'STATE_PATH_FORBIDDEN'
+    }
+
     # ---------------- Mock provider ----------------
     $mock = New-ApiPoolCredentialProvider -Kind Mock -MockSecret (New-CredTestSecure $credFake)
     Assert-ApiPoolEqual 'Mock' $mock.Kind 'Mock/Kind'
