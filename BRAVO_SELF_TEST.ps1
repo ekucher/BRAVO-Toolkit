@@ -21408,9 +21408,9 @@ try {
                     -Condition (
                         $mdAOk -and
                         $mdA.Result.Components['MODEL'].Presence -eq 'Error' -and
-                        ([string]$mdA.Result.Components['MODEL'].Reason).Contains('диск недоступний') -and
+                        ([string]$mdA.Result.Components['MODEL'].Reason).Contains(('диск {0}: недоступний' -f $missingDriveLetter)) -and
                         $mdA.Result.Components['BAZA_APP'].Presence -eq 'Error' -and
-                        ([string]$mdA.Result.Components['BAZA_APP'].Reason).Contains('диск недоступний')
+                        ([string]$mdA.Result.Components['BAZA_APP'].Reason).Contains(('диск {0}: недоступний' -f $missingDriveLetter))
                     ) `
                     -Name "Discovery/MissingDriveComponentsAreErrorNotAbsent" `
                     -Failure "MODEL і BAZA_APP на відсутньому диску мають бути Presence='Error' (носій недоступний != компонент не встановлено) з Reason, що містить 'диск недоступний'; помилка: $($mdA.Error)"
@@ -21584,6 +21584,112 @@ try {
                     ) `
                     -Name "Discovery/MissingDriveUncApacheConfDoesNotThrow" `
                     -Failure "Apache-служба з exe на недосяжному UNC не має кидати виняток, BAZA_WWW не 'Present'; отримано: $($mdI.Error)"
+
+                # (j) MODEL з порожнім батьком не віддає пріоритет BLOG: BAZA_APP - від служби BRAVO.
+                $mdJService = & $newMissingDriveService 'BRAVO' 'BRAVO Service' ('{0}LIMS\bravo.exe' -f $missingDriveRoot)
+                $mdJ = & $invokeMissingDriveDiscovery 'j' @(
+                    '[model]',
+                    ('MODEL={0}\lims' -f $env:SystemDrive),
+                    ('BLOG={0}\' -f (Join-Path $missingDriveBase 'j-blog'))) @($mdJService) $null @() $missingDriveBase
+                $mdJOk = ($null -eq $mdJ.Error -and $null -ne $mdJ.Result)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdJOk -and
+                        $mdJ.Result.BAZA_APP -eq ('{0}LIMS\BAZA' -f $missingDriveRoot) -and
+                        ([string]$mdJ.Result.Reasons.BAZA_APP).Contains('service discovery') -and
+                        -not ([string]$mdJ.Result.Reasons.BAZA_APP).Contains('MODEL/BLOG з bravo.ini')
+                    ) `
+                    -Name "Discovery/MissingDriveModelWithoutParentKeepsServicePriority" `
+                    -Failure "MODEL з порожнім батьком (MODEL=<корінь диска>\lims) не має передавати вибір кореня BAZA_APP до BLOG: очікується service discovery X:\LIMS\BAZA; помилка: $($mdJ.Error); Reason: $(if ($mdJOk) { $mdJ.Result.Reasons.BAZA_APP })"
+
+                # (k) характеризація: лексичне з'єднання дорівнює Join-Path на наявному диску.
+                $mdKDrive = $env:SystemDrive
+                $mdKCyr = -join ([char]0x0422, [char]0x0435, [char]0x0441, [char]0x0442)
+                $mdKInputs = @(
+                    @("$mdKDrive\a", 'BAZA'), @("$mdKDrive\a\", 'BAZA'), @("$mdKDrive\a\\", 'BAZA'),
+                    @("$mdKDrive\a", '\BAZA'), @("$mdKDrive\a\", '\BAZA'), @("$mdKDrive\a\\", '\BAZA'),
+                    @("$mdKDrive\a", '/BAZA'), @("$mdKDrive/a/", 'BAZA'), @("$mdKDrive/a/", '/BAZA'),
+                    @("$mdKDrive\a\\", '\\BAZA'), @('\\host-a\share', 'x'), @('\\host-a\share\', '\x'),
+                    @("$mdKDrive\", 'BAZA'), @("$mdKDrive\", '\BAZA'), @($mdKDrive, 'BAZA'),
+                    @("$mdKDrive\a", '..\x'), @("$mdKDrive\a", 'conf\httpd.conf'), @("$mdKDrive\a", 'C:x.out'),
+                    @("$mdKDrive\a/b", 'c/d'), @("$mdKDrive\$mdKCyr\", $mdKCyr), @("$mdKDrive\$mdKCyr", "\$mdKCyr")
+                )
+                $mdKMismatch = New-Object System.Collections.Generic.List[string]
+                foreach ($mdKInput in $mdKInputs) {
+                    $mdKExpected = Join-Path $mdKInput[0] $mdKInput[1]
+                    $mdKActual = & (Get-Module BRAVO.Discovery) { param($p, $c) Join-BRAVODiscoveryPathLexical -Parent $p -Child $c } $mdKInput[0] $mdKInput[1]
+                    if ($mdKActual -cne $mdKExpected) {
+                        $mdKMismatch.Add(("'{0}' + '{1}': очікувалось '{2}', отримано '{3}'" -f $mdKInput[0], $mdKInput[1], $mdKExpected, $mdKActual))
+                    }
+                }
+                Test-BRAVOCondition `
+                    -Condition ($mdKMismatch.Count -eq 0 -and $mdKInputs.Count -ge 12) `
+                    -Name "Discovery/MissingDriveLexicalJoinMatchesJoinPath" `
+                    -Failure "Join-BRAVODiscoveryPathLexical має збігатись із Join-Path на наявному диску; розбіжності: $($mdKMismatch -join ' | ')"
+
+                # (l) IOException у Test-Path перетворюється на Exists=$false + однорядкова Error.
+                $mdLProbe = $null
+                $mdLThrew = $null
+                try {
+                    $mdLProbe = & (Get-Module BRAVO.Discovery) {
+                        function script:Test-Path { throw [System.IO.IOException]::new("перший рядок`r`n   другий рядок") }
+                        try {
+                            Test-BRAVODiscoveryPathProbe -Path '\\host-a\share\x' -PathType Container
+                        } finally {
+                            Remove-Item -LiteralPath 'Function:\Test-Path' -ErrorAction SilentlyContinue
+                        }
+                    }
+                } catch {
+                    $mdLThrew = $_.Exception.Message
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $null -eq $mdLThrew -and
+                        $null -ne $mdLProbe -and
+                        $mdLProbe.Exists -eq $false -and
+                        -not [string]::IsNullOrWhiteSpace([string]$mdLProbe.Error) -and
+                        -not ([string]$mdLProbe.Error -match '[\r\n]')
+                    ) `
+                    -Name "Discovery/MissingDriveProbeIOExceptionYieldsError" `
+                    -Failure "Test-BRAVODiscoveryPathProbe має повертати Exists=`$false і непорожню однорядкову Error при IOException; виняток: $mdLThrew; результат: $($mdLProbe | Out-String)"
+
+                # (m) Test-BRAVODiscoveryResult: недопустимий символ (f) і недосяжний UNC (e) - проблема, не виняток.
+                $mdMThrewF = $null; $mdMF = @()
+                try { $mdMF = @(Test-BRAVODiscoveryResult -DiscoveryResult $mdF.Result -EnabledComponents @{ MODEL = $true }) } catch { $mdMThrewF = $_.Exception.Message }
+                Test-BRAVOCondition `
+                    -Condition ($mdFOk -and $null -eq $mdMThrewF -and $mdMF.Count -ge 1) `
+                    -Name "Discovery/MissingDriveValidationInvalidPathCharReportsProblem" `
+                    -Failure "Test-BRAVODiscoveryResult для MODEL з недопустимим символом не має кидати виняток і має повідомити проблему; виняток: $mdMThrewF; проблем: $($mdMF.Count)"
+                $mdMThrewE = $null; $mdME = @()
+                try { $mdME = @(Test-BRAVODiscoveryResult -DiscoveryResult $mdE.Result -EnabledComponents @{ BAZA_APP = $true }) } catch { $mdMThrewE = $_.Exception.Message }
+                Test-BRAVOCondition `
+                    -Condition ($mdEOk -and $null -eq $mdMThrewE -and @($mdME | Where-Object { ([string]$_).Contains('BAZA_APP') }).Count -ge 1) `
+                    -Name "Discovery/MissingDriveValidationUncReportsProblem" `
+                    -Failure "Test-BRAVODiscoveryResult для BAZA_APP на недосяжному UNC не має кидати виняток і має повідомити проблему; виняток: $mdMThrewE; проблем: $($mdME.Count)"
+
+                # (n) помилка перевірки каталогу призначення - проблема, а не прийняття вищого предка.
+                $mdNErrors = @()
+                $mdNThrew = $null
+                try {
+                    $mdNErrors = @(& (Get-Module BRAVO.Discovery) {
+                        param($r, $d)
+                        function script:Test-Path { throw [System.IO.IOException]::new("мережевий шлях недоступний") }
+                        try {
+                            Test-BRAVODiscoveryResult -DiscoveryResult $r -EnabledComponents @{} -DestinationPaths @{ ARCHIVE = $d }
+                        } finally {
+                            Remove-Item -LiteralPath 'Function:\Test-Path' -ErrorAction SilentlyContinue
+                        }
+                    } $mdD.Result '\\host-a\share\dest')
+                } catch {
+                    $mdNThrew = $_.Exception.Message
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $null -eq $mdNThrew -and
+                        @($mdNErrors | Where-Object { ([string]$_).Contains('недоступний (') }).Count -ge 1
+                    ) `
+                    -Name "Discovery/MissingDriveDestinationProbeErrorReportsProblem" `
+                    -Failure "помилка перевірки каталогу призначення має давати проблему з 'недоступний (...)'; виняток: $mdNThrew; проблеми: $($mdNErrors -join ' | ')"
             } finally {
                 if (Test-Path -LiteralPath $missingDriveBase) {
                     Remove-Item -LiteralPath $missingDriveBase -Recurse -Force -ErrorAction SilentlyContinue
