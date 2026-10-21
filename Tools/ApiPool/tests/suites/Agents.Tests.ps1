@@ -148,6 +148,12 @@ try {
     Assert-ApiPoolTrue -Condition (-not ([string]$outKey.Handoff['findings']).Contains($agFakeKeyTail)) -Name 'Sanitize/KeyRedactedInHandoff'
     $outLink = ConvertFrom-ApiPoolAgentOutput -RoleObject $scout -Text ('see ' + $agChatLink + ' now')
     Assert-ApiPoolTrue -Condition (-not $outLink.Text.Contains('AGFAKE123')) -Name 'Sanitize/ChatLinkRedacted'
+    $agMoreLinks = @(('https://' + 'chatgpt' + '.com/c/' + 'AGFAKE201'), ('https://' + 'gemini.google' + '.com/app/' + 'AGFAKE202'), ('https://' + 'claude' + '.ai/chat/' + 'AGFAKE203'), ('https://' + 'g' + '.co/gemini/share/' + 'AGFAKE204'))
+    $outLinks = ConvertFrom-ApiPoolAgentOutput -RoleObject $scout -Text ('see ' + $agMoreLinks[0] + ' and ' + $agMoreLinks[1] + "`nHANDOFF`nresult: done`nfindings: " + $agMoreLinks[2] + "`nchecks: " + $agMoreLinks[3] + "`nnext: " + $agMoreLinks[0])
+    Assert-ApiPoolTrue -Condition (-not $outLinks.Text.Contains('AGFAKE20')) -Name 'Sanitize/MoreChatLinksRedactedInText' -Detail $outLinks.Text
+    foreach ($hk in @($outLinks.Handoff.Keys)) {
+        Assert-ApiPoolTrue -Condition (-not ([string]$outLinks.Handoff[$hk]).Contains('AGFAKE20')) -Name ('Sanitize/MoreChatLinksRedactedInHandoff/' + $hk)
+    }
     $outBig = ConvertFrom-ApiPoolAgentOutput -RoleObject $scout -Text ('z' * 25000)
     Assert-ApiPoolEqual -Expected 20000 -Actual $outBig.Text.Length -Name 'Sanitize/TruncatedToAllowedChars'
     Assert-ApiPoolTrue -Condition (@($outBig.Warnings | Where-Object { $_ -like 'OUTPUT_TRUNCATED*' }).Count -eq 1) -Name 'Sanitize/TruncationWarned'

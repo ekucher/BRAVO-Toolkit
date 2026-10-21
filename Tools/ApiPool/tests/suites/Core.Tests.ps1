@@ -34,6 +34,24 @@ try {
         $r = Protect-ApiPoolText -Text ('see ' + $link + ' now')
         Assert-ApiPoolTrue ($r -ceq 'see [chat-link-redacted] now') ('Redaction/ChatLink/' + $link)
     }
+    # QA-003: every private conversation URL form on the known chat hosts (URLs built by concatenation only).
+    $coreChatForms = @(
+        @(('claude' + '.ai'), ('/chat/' + 'c0ffee01')), @(('claude' + '.ai'), ('/project/' + 'p0ffee01')), @(('claude' + '.ai'), ('/code/' + 'anything/x?y=1')),
+        @(('chatgpt' + '.com'), ('/c/' + 'c0ffee01')), @(('chat.openai' + '.com'), ('/c/' + 'c0ffee01')),
+        @(('gemini.google' + '.com'), ('/app/' + 'c0ffee01')), @(('g' + '.co'), ('/gemini/share/' + 'c0ffee01')),
+        @(('copilot.microsoft' + '.com'), ('/chats/' + 'c0ffee01')), @(('perplexity' + '.ai'), ('/search/' + 'c0ffee01')),
+        @(('chat.deepseek' + '.com'), ('/a/chat/s/' + 'c0ffee01')), @(('poe' + '.com'), ('/chat/' + 'c0ffee01')), @(('grok' + '.com'), ('/chat/' + 'c0ffee01'))
+    )
+    foreach ($form in $coreChatForms) {
+        foreach ($variant in @(('https://' + $form[0] + $form[1]), ('http://www.' + $form[0] + $form[1]), ('HTTPS://' + $form[0].ToUpperInvariant() + $form[1].ToUpperInvariant()))) {
+            $r = Protect-ApiPoolText -Text ('see ' + $variant + ' now')
+            Assert-ApiPoolTrue ($r -ceq 'see [chat-link-redacted] now') ('Redaction/ChatLinkAllForms/' + $variant)
+        }
+    }
+    $rOther = Protect-ApiPoolText -Text ('docs at https://' + 'example' + '.com/chat/page stay')
+    Assert-ApiPoolTrue ($rOther -ceq ('docs at https://' + 'example' + '.com/chat/page stay')) 'Redaction/ChatLinkOtherHostsUntouched'
+    $rLookalike = Protect-ApiPoolText -Text ('https://' + 'claude' + '.ai.example.org/x')
+    Assert-ApiPoolTrue ($rLookalike -ceq ('https://' + 'claude' + '.ai.example.org/x')) 'Redaction/ChatLinkLookalikeHostUntouched'
     Assert-ApiPoolTrue ([string]::IsNullOrEmpty((Protect-ApiPoolText -Text $null))) 'Redaction/NullYieldsEmpty'
 
     # ---------------- Structured errors ----------------

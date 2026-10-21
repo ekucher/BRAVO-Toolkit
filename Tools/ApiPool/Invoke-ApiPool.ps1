@@ -12,6 +12,7 @@ param(
     [string]$Command,
     [string]$StateRoot,
     [string]$ConfigPath,
+    [string]$OverrideConfigPath,
     [string]$RequestPath,
     [string]$JobId,
     [string]$ReservationId,
@@ -85,15 +86,18 @@ function Invoke-ApiPoolCliCommand {
         return
     }
 
-    # D15: the default state root is chosen here and nowhere else.
+    # D15: the state root is chosen here and nowhere else. Precedence: explicit -StateRoot > config stateRoot
+    # (environment variables already expanded by Read-ApiPoolConfig) > %LOCALAPPDATA%\BRAVO\ApiPool\state.
+    # -OverrideConfigPath is an optional second config file merged over -ConfigPath (defaults file).
+    if ([string]::IsNullOrEmpty($ConfigPath)) { $ConfigPath = Join-Path (Join-Path $apiRoot 'config') 'apipool.defaults.json' }
+    $config = Read-ApiPoolConfig -Path $ConfigPath -OverridePath $OverrideConfigPath
+    if ([string]::IsNullOrEmpty($StateRoot) -and -not [string]::IsNullOrEmpty($config.stateRoot)) { $StateRoot = $config.stateRoot }
     if ([string]::IsNullOrEmpty($StateRoot)) {
         if ([string]::IsNullOrEmpty($env:LOCALAPPDATA)) { Invoke-ApiPoolThrow -Code 'STATE_PATH_FORBIDDEN' -Message 'LOCALAPPDATA is not set; pass -StateRoot.' }
         $StateRoot = Join-Path $env:LOCALAPPDATA 'BRAVO\ApiPool\state'
     }
-    if ([string]::IsNullOrEmpty($ConfigPath)) { $ConfigPath = Join-Path (Join-Path $apiRoot 'config') 'apipool.defaults.json' }
     $repoRoot = Split-Path -Parent (Split-Path -Parent $apiRoot)
     $root = Assert-ApiPoolStateRoot -StateRoot $StateRoot -RepoRoot $repoRoot
-    $config = Read-ApiPoolConfig -Path $ConfigPath
     $registry = Import-ApiPoolModelRegistry -Path (Join-Path (Join-Path $apiRoot 'config') 'models.json')
     # The offline build has no way to construct a live transport: Transport stays $null.
     $ctx = New-ApiPoolContext -StateRoot $root -Config $config -Registry $registry -Transport $null -CredentialProvider $null

@@ -1,7 +1,7 @@
 ﻿Set-StrictMode -Version Latest
 
 # ApiPool.Core: structured errors, redaction, strict config loading, atomic file
-# writes, named-mutex helper, hashing and canonical JSON. No dependency on other
+# writes, file-lock helper, hashing and canonical JSON. No dependency on other
 # ApiPool modules. Not part of the BRAVO production runtime.
 
 # In-process registry of exact secret values used ONLY for redaction.
@@ -80,7 +80,8 @@ function Protect-ApiPoolText {
     # `'name': 'value'`, URL-encoded `name%3Avalue` and quoted values containing spaces (redacted up to the closing quote).
     $result = [regex]::Replace($result, $script:ApiPoolSecretNamePattern, '${pre}${q}***REDACTED***${q}')
     $result = [regex]::Replace($result, '(?i)(\bBearer\s+)([A-Za-z0-9\-._~+/]+=*)', '${1}***REDACTED***')
-    $result = [regex]::Replace($result, '(?i)https?://(claude\.ai|chatgpt\.com|chat\.openai\.com)/(share|chat|code/session)[^\s]*', '[chat-link-redacted]')
+    # Policy: no chat/conversation/session/share link may leave the pool. Conservative: any path on a known chat host.
+    $result = [regex]::Replace($result, '(?i)https?://(?:[a-z0-9-]+\.)*(?:claude\.ai|chatgpt\.com|chat\.openai\.com|gemini\.google\.com|g\.co|copilot\.microsoft\.com|perplexity\.ai|chat\.deepseek\.com|poe\.com|grok\.com)(?![a-z0-9.-])[^\s"''<>)\]]*', '[chat-link-redacted]')
 
     return $result
 }

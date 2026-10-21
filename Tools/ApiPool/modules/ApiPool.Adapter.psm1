@@ -273,13 +273,15 @@ function ConvertTo-ApiPoolPreparedRequest {
 # ---------------------------------------------------------------------------
 
 function Enter-ApiPoolSlot {
-    param($Context)
+    # Returns the slot handle, or $null when the cancel marker appeared while waiting (no slot is taken then).
+    param($Context, [string]$CancelPath)
 
     $max = [int]$Context.Config.maxConcurrency
     $waitMs = [Math]::Min([int]$Context.Config.timeouts.requestTimeoutSec * 1000, 30000)
     $waited = 0
     $dir = Join-Path $Context.StateRoot 'slots'
     while ($true) {
+        if (Test-ApiPoolCancelled -CancelPath $CancelPath) { return $null }
         for ($n = 1; $n -le $max; $n++) {
             $path = Join-Path $dir ('slot-{0}.lock' -f $n)
             try {
@@ -514,12 +516,15 @@ function Invoke-ApiPoolAttempt {
             if (Test-ApiPoolCancelled -CancelPath $CancelPath) {
                 return (New-ApiPoolOutcome -Kind 'Done' -Code 'CANCELLED' -Message 'The job was cancelled.')
             }
-            try { $slot = Enter-ApiPoolSlot -Context $Context }
+            try { $slot = Enter-ApiPoolSlot -Context $Context -CancelPath $CancelPath }
             catch {
                 if ((Get-ApiPoolErrorCode -ErrorRecord $_) -ceq 'SLOT_TIMEOUT') {
                     return (New-ApiPoolOutcome -Kind 'Done' -Code 'SLOT_TIMEOUT' -Message 'No concurrency slot became free in time.')
                 }
                 throw
+            }
+            if ($null -eq $slot) {
+                return (New-ApiPoolOutcome -Kind 'Done' -Code 'CANCELLED' -Message 'The job was cancelled.')
             }
             $wait = Request-ApiPoolRateClaim -Context $Context -Model $Prepared.Model.Id
             if ($wait -le 0) { break }
@@ -535,6 +540,10 @@ function Invoke-ApiPoolAttempt {
             }
         }
 
+        # Last cancel check before any budget is reserved (the slot is released by the finally block).
+        if (Test-ApiPoolCancelled -CancelPath $CancelPath) {
+            return (New-ApiPoolOutcome -Kind 'Done' -Code 'CANCELLED' -Message 'The job was cancelled.')
+        }
         try {
             $rsv = New-ApiPoolReservation -StateRoot $root -JobId $JobId -AttemptId ([string]$Attempt) -AmountMicroUsd $Prepared.ReservationMicroUsd -PerJobLimitMicroUsd $PerJobLimitMicroUsd -Clock $Context.Clock
         }
@@ -548,6 +557,11 @@ function Invoke-ApiPoolAttempt {
         [void]$ReservationIds.Add($rsv.ReservationId)
         $rid = $rsv.ReservationId
 
+        # Re-check right before sending: a cancelled job must not reach the transport; undo the fresh reservation.
+        if (Test-ApiPoolCancelled -CancelPath $CancelPath) {
+            [void](Undo-ApiPoolReservation -StateRoot $root -ReservationId $rid -Reason 'cancelled before send' -Clock $Context.Clock)
+            return (New-ApiPoolOutcome -Kind 'Done' -Code 'CANCELLED' -Message 'The job was cancelled.')
+        }
         $request = @{ Method = 'POST'; Uri = $script:ApiPoolMessageEndpoint; Body = $Prepared.BodyJson; TimeoutSec = [int]$Context.Config.timeouts.requestTimeoutSec }
         $response = $null
         $sendError = $null

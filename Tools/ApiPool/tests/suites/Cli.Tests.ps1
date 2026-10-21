@@ -1,5 +1,6 @@
 ﻿# Cli suite. Dot-sourced by Invoke-ApiPoolTests.ps1. Runs Invoke-ApiPool.ps1 in child powershell.exe processes,
-# strictly sequentially (8 children), always with -StateRoot inside the sandbox. Offline; no network.
+# strictly sequentially (9 children). Every child gets either -StateRoot inside the sandbox or a config override whose stateRoot is inside the sandbox;
+# the real default state directory under LOCALAPPDATA is only stat-ed (existence + LastWriteTimeUtc), never read. Offline; no network.
 # Health convention (documented): an unhealthy report is exit 1 with {ok:false, code:'UNHEALTHY'}.
 
 $cliSandbox = New-ApiPoolTestSandbox
@@ -41,6 +42,22 @@ try {
 
     Assert-ApiPoolTrue -Condition (Test-ApiPoolTestPathInSandbox -Path $cliState) -Name 'Guard/StateRootInSandbox'
 
+    # QA-002 guard: the real default state directory must not be touched by this suite (stat only, contents never read).
+    $cliRealDefault = ''
+    if (-not [string]::IsNullOrEmpty($env:LOCALAPPDATA)) { $cliRealDefault = Join-Path $env:LOCALAPPDATA 'BRAVO\ApiPool\state' }
+    function Get-CliDefaultStamp {
+        if ([string]::IsNullOrEmpty($cliRealDefault)) { return 'unset' }
+        if (-not [System.IO.Directory]::Exists($cliRealDefault)) { return 'absent' }
+        return [System.IO.Directory]::GetLastWriteTimeUtc($cliRealDefault).Ticks.ToString()
+    }
+    $cliDefaultBefore = Get-CliDefaultStamp
+
+    # Override config: stateRoot (inside the sandbox) comes from the config file.
+    $cliCfgState = Join-Path $cliSandbox 'cfg-state'
+    $cliOverride = Join-Path $cliSandbox 'override.json'
+    [System.IO.File]::WriteAllText($cliOverride, (ConvertTo-Json -InputObject ([ordered]@{ stateRoot = $cliCfgState }) -Compress))
+    Assert-ApiPoolTrue -Condition (Test-ApiPoolTestPathInSandbox -Path $cliCfgState) -Name 'Guard/ConfigStateRootInSandbox'
+
     # 1. capabilities
     $c1 = Invoke-CliChild -CliArgs @('-Command', 'capabilities', '-StateRoot', $cliState)
     Assert-ApiPoolEqual -Expected 0 -Actual $c1.Exit -Name 'Capabilities/ExitZero'
@@ -53,11 +70,12 @@ try {
     Assert-ApiPoolEqual -Expected 1 -Actual @($c1.Stdout.Split([char]10) | Where-Object { $_.Trim() -ne '' }).Count -Name 'Capabilities/SingleLineOutput'
 
     # 2. budget-init
-    $c2 = Invoke-CliChild -CliArgs @('-Command', 'budget-init', '-StateRoot', $cliState)
+    $c2 = Invoke-CliChild -CliArgs @('-Command', 'budget-init', '-StateRoot', $cliState, '-OverrideConfigPath', $cliOverride)
     Assert-ApiPoolEqual -Expected 0 -Actual $c2.Exit -Name 'BudgetInit/ExitZero'
     Assert-ApiPoolTrue -Condition ($null -ne $c2.Json -and $c2.Json.ok -eq $true -and $c2.Json.data.GlobalLimitMicroUsd -eq 60000000) -Name 'BudgetInit/Limit60Usd' -Detail $c2.Stdout
     $st = Get-ApiPoolBudgetStatus -StateRoot $cliState
     Assert-ApiPoolEqual -Expected 'OK' -Actual $st.State -Name 'BudgetInit/LedgerInitialized'
+    Assert-ApiPoolTrue -Condition (-not [System.IO.Directory]::Exists($cliCfgState)) -Name 'StateRoot/ExplicitBeatsConfig'
 
     # 3. health (initialized, offline)
     $c3 = Invoke-CliChild -CliArgs @('-Command', 'health', '-StateRoot', $cliState)
@@ -97,7 +115,13 @@ try {
     Assert-ApiPoolEqual -Expected 2 -Actual $c8.Exit -Name 'NoCommand/ExitTwo'
     Assert-ApiPoolTrue -Condition ($null -ne $c8.Json -and $c8.Json.code -ceq 'USAGE') -Name 'NoCommand/UsageJson' -Detail $c8.Stdout
 
-    Assert-ApiPoolTrue -Condition ($c1.Done -and $c2.Done -and $c3.Done -and $c4.Done -and $c5.Done -and $c6.Done -and $c7.Done -and $c8.Done) -Name 'Children/AllExitedInTime'
+    # 9. QA-002: no -StateRoot -> config stateRoot is used (not the LOCALAPPDATA default)
+    $c9 = Invoke-CliChild -CliArgs @('-Command', 'budget-init', '-OverrideConfigPath', $cliOverride)
+    Assert-ApiPoolEqual -Expected 0 -Actual $c9.Exit -Name 'StateRoot/ConfigRootExitZero'
+    Assert-ApiPoolEqual -Expected 'OK' -Actual (Get-ApiPoolBudgetStatus -StateRoot $cliCfgState).State -Name 'StateRoot/ConfigRootLedgerCreated'
+    Assert-ApiPoolEqual -Expected $cliDefaultBefore -Actual (Get-CliDefaultStamp) -Name 'StateRoot/RealDefaultNotTouched'
+
+    Assert-ApiPoolTrue -Condition ($c1.Done -and $c2.Done -and $c3.Done -and $c4.Done -and $c5.Done -and $c6.Done -and $c7.Done -and $c8.Done -and $c9.Done) -Name 'Children/AllExitedInTime'
     Assert-ApiPoolTrue -Condition (-not [System.IO.Directory]::Exists((Join-Path $cliState 'jobs'))) -Name 'Orchestrate/NoJobCreatedWhenPoolDisabled'
 }
 finally {

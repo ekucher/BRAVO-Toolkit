@@ -588,6 +588,49 @@ try {
     Assert-ApiPoolTrue -Condition $resSl3.Ok -Name 'Slots/SecondSlotUsed' -Detail ([string]$resSl3.Code)
     Assert-ApiPoolEqual -Expected 0 -Actual $envSl2.Sleeps.Count -Name 'Slots/NoWaitWhenSlotFree'
 
+    # ---------------------------------------------------------------- QA-001 cancellation while waiting / before reserve / before send
+    $cancelSlot = Join-Path $adpSandbox 'cancel-slot.flag'
+    $slotHold = @{ Handle = $null; Polls = 0 }
+    $envCs = New-AdpEnv -Responses @((Get-AdpOk)) -Configure { param($c) $c.maxConcurrency = 1; $c.timeouts.requestTimeoutSec = 30 } -OnSleep {
+        param($ms)
+        $slotHold.Polls++
+        if ($slotHold.Polls -eq 1) { [System.IO.File]::WriteAllText($cancelSlot, 'x') }
+        elseif ($slotHold.Polls -eq 2 -and $null -ne $slotHold.Handle) { Exit-ApiPoolFileLock -Handle $slotHold.Handle; $slotHold.Handle = $null }
+    }
+    $slotHold.Handle = Enter-ApiPoolFileLock -Path (Join-Path (Join-Path $envCs.Root 'slots') 'slot-1.lock') -TimeoutMs 1000
+    try {
+        $resCs = Invoke-AdpMessage -Env $envCs -CancelPath $cancelSlot
+    }
+    finally {
+        if ($null -ne $slotHold.Handle) { Exit-ApiPoolFileLock -Handle $slotHold.Handle; $slotHold.Handle = $null }
+    }
+    Assert-ApiPoolEqual -Expected 'CANCELLED' -Actual $resCs.Code -Name 'CancelWhileWaitingForSlot/Code'
+    Assert-ApiPoolEqual -Expected 0 -Actual @(Get-ApiPoolFakeTransportCall -Transport $envCs.Transport).Count -Name 'CancelWhileWaitingForSlot/NoTransportCall'
+    Assert-ApiPoolEqual -Expected 'INIT' -Actual ((Get-AdpLedgerRecords -Root $envCs.Root | ForEach-Object { $_.type }) -join ',') -Name 'CancelWhileWaitingForSlot/NoReservation'
+    Assert-ApiPoolEqual -Expected 0 -Actual @($resCs.ReservationIds).Count -Name 'CancelWhileWaitingForSlot/NoReservationIds'
+
+    # Cancel marker appears during the rate-limit wait of a second call that shares the state root.
+    $cancelRate = Join-Path $adpSandbox 'cancel-rate.flag'
+    $envCr1 = New-AdpEnv -Responses @((New-AdpResp -Status 429 -Headers @{ 'retry-after' = '5' }), (Get-AdpOk))
+    $resCr1 = Invoke-AdpMessage -Env $envCr1
+    Assert-ApiPoolTrue -Condition $resCr1.Ok -Name 'CancelDuringRateWait/Setup' -Detail ([string]$resCr1.Code)
+    $envCr1.State.Now = New-Object System.DateTime(2030, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc)
+    $envCr2 = New-AdpEnv -Responses @((Get-AdpOk)) -Root $envCr1.Root -State $envCr1.State -OnSleep { param($ms) [System.IO.File]::WriteAllText($cancelRate, 'x') }
+    $resCr2 = Invoke-AdpMessage -Env $envCr2 -CancelPath $cancelRate
+    Assert-ApiPoolEqual -Expected 'CANCELLED' -Actual $resCr2.Code -Name 'CancelDuringRateWait/Code'
+    Assert-ApiPoolEqual -Expected 0 -Actual @(Get-ApiPoolFakeTransportCall -Transport $envCr2.Transport).Count -Name 'CancelDuringRateWait/NoTransportCall'
+    Assert-ApiPoolEqual -Expected 0 -Actual @($resCr2.ReservationIds).Count -Name 'CancelDuringRateWait/NoReservation'
+
+    # Cancel marker appears while the reservation is being made (injected clock): no budget left reserved, no transport call.
+    $cancelRsv = Join-Path $adpSandbox 'cancel-reserve.flag'
+    $envCv = New-AdpEnv -Responses @((Get-AdpOk))
+    $cvState = $envCv.State
+    $envCv.Context.Clock = { [System.IO.File]::WriteAllText($cancelRsv, 'x'); $cvState.Now }.GetNewClosure()
+    $resCv = Invoke-AdpMessage -Env $envCv -CancelPath $cancelRsv
+    Assert-ApiPoolEqual -Expected 'CANCELLED' -Actual $resCv.Code -Name 'CancelBeforeSend/Code'
+    Assert-ApiPoolEqual -Expected 0 -Actual @(Get-ApiPoolFakeTransportCall -Transport $envCv.Transport).Count -Name 'CancelBeforeSend/NoTransportCall'
+    Assert-ApiPoolEqual -Expected 0 -Actual (Get-ApiPoolBudgetStatus -StateRoot $envCv.Root).ReservedMicroUsd -Name 'CancelBeforeSend/NothingLeftReserved'
+
     # ---------------------------------------------------------------- rate limit shared through the state file
     $envRl1 = New-AdpEnv -Responses @((New-AdpResp -Status 429 -Headers @{ 'retry-after' = '5' }), (Get-AdpOk))
     $resRl1 = Invoke-AdpMessage -Env $envRl1
