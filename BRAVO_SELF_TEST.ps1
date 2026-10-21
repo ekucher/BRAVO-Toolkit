@@ -31672,7 +31672,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 # --- знахідка 5: Exec.Command ---
                 @{ Name = 'T43_PythonExecutable'; Expect = '<none>'; Command = 'C:\Python\python.exe'; Arguments = "-File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
                 @{ Name = 'T44_QuotedSystemRootUpperCase'; Expect = 'LegacyPrimary'; Command = '"%SystemRoot%\System32\WindowsPowerShell\v1.0\POWERSHELL.EXE"'; Arguments = "-File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T45_PwshUnquoted'; Expect = 'LegacyPrimary'; Command = 'pwsh.exe'; Arguments = "-File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T45_PwshUnquoted'; Expect = 'Unknown'; Command = 'pwsh.exe'; Arguments = "-File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
                 @{ Name = 'T46_CmdWrapper'; Expect = 'Unknown'; Command = 'cmd.exe'; Arguments = "/c powershell -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
                 @{ Name = 'T47_CmdWithoutPowerShell'; Expect = 'Unknown'; Command = 'cmd.exe'; Arguments = '/c echo BRAVO_ARCHIV.ps1'; Wd = $scanRuntime },
                 # --- #496 раунд 4: allowlist для NoConfigPath ---
@@ -31707,7 +31707,24 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 # --- знахідка 6: змінні середовища ---
                 @{ Name = 'T48_UserProfileVariable'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %USERPROFILE%\BRAVO.config"; Wd = $scanRuntime },
                 @{ Name = 'T49_ProgramDataStable'; Expect = 'Missing'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %ProgramData%\BRAVO_NOPE_281\BRAVO.config"; Wd = $scanRuntime },
-                @{ Name = 'T50_AppDataInWorkingDirectory'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = '%APPDATA%\BRAVO' }
+                @{ Name = 'T50_AppDataInWorkingDirectory'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = '%APPDATA%\BRAVO' },
+                # --- #496 раунд 7 ---
+                # Без -NoProfile профіль акаунта завдання може задати $PSDefaultParameterValues['BRAVO_*.ps1:ConfigPath'].
+                @{ Name = 'T77_NoProfileAbsentNotCertified'; Expect = 'Unknown'; Arguments = "-NoLogo -NonInteractive -ExecutionPolicy Bypass -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T78_NoProfileAbbreviationCertified'; Expect = 'NoConfigPath'; Arguments = "-NoLogo -nop -NonInteractive -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                # PowerShell не шукає голе ім'я команди в поточному каталозі; лише явний шлях (.\ чи абсолютний).
+                @{ Name = 'T79_BareNameNotResolvedAgainstWorkingDirectory'; Expect = 'Unknown'; Arguments = "$scanBase -Command ${scanQ}BRAVO_ARCHIV.ps1 -NoPause$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T80_DotSlashRelativeCertified'; Expect = 'NoConfigPath'; Arguments = "$scanBase -Command $scanQ.\BRAVO_ARCHIV.ps1 -NoPause$scanQ"; Wd = $scanRuntime },
+                # Подвоєні лапки в -Command: реальний powershell.exe (shell32-розбір) склеює "& ""C:\BRAVO Runtime\..." в одне ім'я
+                # і відмовляє — це не виклик із -ConfigPath, тож Unknown (а не LegacyPrimary) правильно.
+                @{ Name = 'T81_DoubledQuotesCommandMatchesRealPowerShell'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ& $scanQ$scanQ$scanArchiv$scanQ$scanQ -ConfigPath $scanQ$scanQ$scanLegacy$scanQ$scanQ$scanQ"; Wd = $scanRuntime },
+                # --- #496 раунд 8 (архітектор): одна модель опцій, pwsh, мінімальні префікси 5.1 ---
+                @{ Name = 'T82_NopIsExecutionPolicyValue'; Expect = 'Unknown'; Arguments = "-NoLogo -NonInteractive -ExecutionPolicy -nop -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T83_PwshNotModelled'; Expect = 'Unknown'; Command = 'pwsh.exe'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T84_NonTooShortPrefix'; Expect = 'Unknown'; Arguments = "-non -NoProfile -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T85_NoTooShortPrefix'; Expect = 'Unknown'; Arguments = "-no -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T86_PSConsoleFileNotModelled'; Expect = 'Unknown'; Arguments = "-NoProfile -PSConsoleFile x.psc1 -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T87_SlashNopCertified'; Expect = 'NoConfigPath'; Arguments = "/nol /nop /noni -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime }
             )
 
 
@@ -31856,6 +31873,64 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 -Name 'TaskConfigPath/CommandLineSplitMatchesCommandLineToArgvW' `
                 -Failure ('розбір аргументів має збігатися з CommandLineToArgvW (суміжні лапки, зворотні скісні перед лапками, порожній "" аргумент, U+00A0 не роздільник, "" у лапках = літерал і вихід з лапок): ' + ($argvMisses -join '; '))
 
+
+            # --- #496 раунд 7: помилка доступу -> Unknown (не Missing); ActionIndex у рядку звіту.
+            # Test-Path без -ErrorAction Stop на помилці доступу дає $false (-> хибне Missing), тому
+            # провайдер імітується: Test-Path віддає $false, якщо немає Stop; Get-Item завжди кидає.
+            $scanDeniedClass = ''
+            $scanMultiLines = @()
+            $scanMultiError = ''
+            try {
+                $scanDeniedClass = & $scanModule {
+                    param($Validator, $Path, $Wd)
+                    function script:Test-Path {
+                        [CmdletBinding()]
+                        param([string]$LiteralPath, [string]$PathType)
+                        if ($PSBoundParameters.ContainsKey('ErrorAction') -and $ErrorActionPreference -eq 'Stop') { throw (New-Object System.UnauthorizedAccessException('Access denied (імітація)')) }
+                        return $false
+                    }
+                    function script:Get-Item {
+                        [CmdletBinding()]
+                        param([string]$LiteralPath, [switch]$Force)
+                        throw (New-Object System.UnauthorizedAccessException('Access denied (імітація)'))
+                    }
+                    try {
+                        (Get-BRAVOConfigPathTargetClassification -RawPath $Path -WorkingDirectory $Wd -LegacyConfigurationValidator $Validator).Class
+                    } finally {
+                        # імітації живуть у стані модуля; нижче модуль імпортується заново (-Force)
+                    }
+                } $scanValidator $scanLegacy $scanRuntime
+                $scanModule = Import-Module -Name (Join-Path $root 'modules\BRAVO.SchedulerDiagnostics\BRAVO.SchedulerDiagnostics.psd1') -Force -PassThru -ErrorAction Stop
+                $scanMultiLines = @(& $scanModule {
+                        param($Validator, $Command, $ArgsOne, $ArgsTwo, $Wd)
+                        $exec = { param($a) "<Exec><Command>$([Security.SecurityElement]::Escape($Command))</Command><Arguments>$([Security.SecurityElement]::Escape($a))</Arguments><WorkingDirectory>$([Security.SecurityElement]::Escape($Wd))</WorkingDirectory></Exec>" }
+                        $xml = '<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions Context="Author">' + (& $exec $ArgsOne) + (& $exec $ArgsTwo) + '</Actions></Task>'
+                        $task = [pscustomobject]@{ Path = '\BRAVO\Multi'; Name = 'Multi'; Xml = $xml }
+                        $folder = [pscustomobject]@{ Path = '\BRAVO'; Tasks = @($task) }
+                        Add-Member -InputObject $folder -MemberType ScriptMethod -Name GetTasks -Value { param($flags) , @($this.Tasks) }
+                        Add-Member -InputObject $folder -MemberType ScriptMethod -Name GetFolders -Value { param($flags) , @() }
+                        $report = Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $folder -LegacyConfigurationValidator $Validator
+                        @($report.Findings | ForEach-Object { (Format-BRAVOConfigPathFindingLine -Finding $_).Text })
+                    } $scanValidator $scanPs `
+                        "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ" `
+                        "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanMissing$scanQ" $scanRuntime)
+            } catch {
+                $scanMultiError = $_.Exception.Message
+            }
+            Test-BRAVOCondition `
+                -Condition ($scanDeniedClass -eq 'Unknown') `
+                -Name 'TaskConfigPath/AccessDeniedIsUnknownNotMissing' `
+                -Failure "#496: помилка доступу під час перевірки файлу -ConfigPath має давати Unknown, а не Missing. Отримано: '$scanDeniedClass' $scanMultiError"
+            Test-BRAVOCondition `
+                -Condition ($scanMultiLines.Count -eq 2 -and $scanMultiLines[0].Contains('[action 1]') -and $scanMultiLines[1].Contains('[action 2]') -and
+                    $scanMultiLines[0] -like '*LegacyPrimary*' -and $scanMultiLines[1] -like '*Missing*') `
+                -Name 'TaskConfigPath/MultiActionLinesCarryActionIndex' `
+                -Failure ("#496: у завданні з кількома діями рядок звіту має містити номер дії. Отримано: " + ($scanMultiLines -join ' || ') + " $scanMultiError")
+            $scanSingleLine = & $scanLineOf 'T01_Legacy'
+            Test-BRAVOCondition `
+                -Condition ($null -ne $scanSingleLine -and -not $scanSingleLine.Text.Contains('[action')) `
+                -Name 'TaskConfigPath/SingleActionLineFormatUnchanged' `
+                -Failure '#496: для однодієвого завдання формат рядка без номера дії лишається незмінним'
 
             # Реєстрація модуля й тонкий entrypoint: Diagnose лише імпортує модуль і друкує розділ.
             $scanDiagnoseText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1'), [Text.Encoding]::UTF8)

@@ -349,7 +349,8 @@ function Get-BRAVOActionExecutableKind {
     if ([string]::IsNullOrWhiteSpace($Command)) { return 'Other' }
     $text = $Command.Trim().Trim('"').Trim()
     $leaf = ($text -split '[\\/]')[-1].Trim().Trim('"').ToLowerInvariant()
-    if ($leaf -eq 'powershell.exe' -or $leaf -eq 'powershell' -or $leaf -eq 'pwsh.exe' -or $leaf -eq 'pwsh') { return 'PowerShell' }
+    if ($leaf -eq 'powershell.exe' -or $leaf -eq 'powershell') { return 'PowerShell' }
+    if ($leaf -eq 'pwsh.exe' -or $leaf -eq 'pwsh') { return 'Pwsh' }
     if ($leaf -eq 'cmd.exe' -or $leaf -eq 'cmd') { return 'Cmd' }
     return 'Other'
 }
@@ -556,31 +557,37 @@ function Get-BRAVOConfigPathReferenceFromItem {
 }
 
 function Test-BRAVOPowerShellLeadingOptionsModelled {
-    # Опції powershell.exe ДО -File/-Command/-EncodedCommand мусять бути впізнаними
-    # (NoLogo, NoProfile, NonInteractive, ExecutionPolicy X, WindowStyle X, ...): невідомий
-    # токен означає, що форму виклику статично не змоделювати.
+    # Єдина модель опцій Windows PowerShell 5.1 ДО -File/-Command/-EncodedCommand. Опція має бути
+    # впізнана однозначно за мінімальним префіксом 5.1 (напр. -nop, -nol, -noe, -noni; коротші
+    # -no/-non відхиляються), інакше форму статично не змоделювати (Modelled=$false).
+    # NoProfile=$true лише коли токен класифіковано саме як прапорець NoProfile, а НЕ як значення
+    # опції (напр. `-ExecutionPolicy -nop` споживає -nop як значення, профіль завантажиться).
+    # -PSConsoleFile/-ConfigurationName не моделюються (завантажують snap-ін/кінцеву точку).
     param(
         [AllowNull()][string[]]$Tokens,
         [int]$ModeIndex
     )
 
     $tokenList = @($Tokens)
-    $flags = @('nologo', 'noexit', 'noprofile', 'noninteractive', 'mta', 'sta')
-    $withValue = @('executionpolicy', 'windowstyle', 'version', 'inputformat', 'outputformat', 'psconsolefile', 'configurationname')
+    # Ім'я -> мінімальна довжина префікса (5.1).
+    $flags = @{ nologo = 3; noexit = 3; noprofile = 3; noninteractive = 4; mta = 3; sta = 3 }
+    $withValue = @{ executionpolicy = 2; windowstyle = 2; version = 2; inputformat = 2; outputformat = 2 }
+    $noProfile = $false
     for ($i = 0; $i -lt $ModeIndex; $i++) {
-        if (-not ($tokenList[$i] -match '^[-/]([A-Za-z]+)$')) { return $false }
+        if (-not ($tokenList[$i] -match '^[-/]([A-Za-z]+)$')) { return [pscustomobject]@{ Modelled = $false; NoProfile = $false } }
         $name = $Matches[1].ToLowerInvariant()
-        $flagMatches = @($flags | Where-Object { $_ -eq $name -or ($name.Length -ge 3 -and $_.StartsWith($name, [StringComparison]::Ordinal)) })
-        $valueMatches = @($withValue | Where-Object { $_ -eq $name -or ($name.Length -ge 2 -and $_.StartsWith($name, [StringComparison]::Ordinal)) })
-        if ($flagMatches.Count + $valueMatches.Count -ne 1) { return $false }
+        $flagMatches = @($flags.Keys | Where-Object { $name.Length -ge $flags[$_] -and ([string]$_).StartsWith($name, [StringComparison]::Ordinal) })
+        $valueMatches = @($withValue.Keys | Where-Object { $name.Length -ge $withValue[$_] -and ([string]$_).StartsWith($name, [StringComparison]::Ordinal) })
+        if ($flagMatches.Count + $valueMatches.Count -ne 1) { return [pscustomobject]@{ Modelled = $false; NoProfile = $false } }
         if ($valueMatches.Count -eq 1) {
             $i++
-            if ($i -ge $ModeIndex) { return $false }
+            if ($i -ge $ModeIndex) { return [pscustomobject]@{ Modelled = $false; NoProfile = $false } }
+        } elseif ($flagMatches[0] -eq 'noprofile') {
+            $noProfile = $true
         }
     }
-    return $true
+    return [pscustomobject]@{ Modelled = $true; NoProfile = $noProfile }
 }
-
 function Get-BRAVOTaskActionConfigPathReference {
     # Усі входження -ConfigPath (іменовані й позиційні) у визначенні дії PowerShell +
     # ознака Modelled: дію ПОВНІСТЮ змодельовано (allowlist для NoConfigPath):
@@ -600,9 +607,10 @@ function Get-BRAVOTaskActionConfigPathReference {
         param($Form, $ScriptPath, $Problem)
         [pscustomobject]@{ Form = $Form; ScriptPath = $ScriptPath; Spelling = $null; RawValue = $null; Problem = $Problem }
     }
+    $noProfile = $false
     $result = {
         param($Modelled, $Reason)
-        [pscustomobject]@{ References = $references.ToArray(); Modelled = [bool]$Modelled; Reason = $Reason }
+        [pscustomobject]@{ References = $references.ToArray(); Modelled = [bool]$Modelled; Reason = $Reason; NoProfile = [bool]$noProfile }
     }
     if ($null -ne $Definition.Problem) {
         $references.Add((& $problemReference $(if ($null -ne $Definition.Mode) { [string]$Definition.Mode } else { 'Unparsed' }) $null $Definition.Problem))
@@ -613,7 +621,9 @@ function Get-BRAVOTaskActionConfigPathReference {
     }
     $mode = [string]$Definition.Mode
     $tokens = @($Definition.Tokens)
-    if (-not (Test-BRAVOPowerShellLeadingOptionsModelled -Tokens $tokens -ModeIndex ([int]$Definition.ModeIndex))) {
+    $options = Test-BRAVOPowerShellLeadingOptionsModelled -Tokens $tokens -ModeIndex ([int]$Definition.ModeIndex)
+    $noProfile = [bool]$options.NoProfile
+    if (-not [bool]$options.Modelled) {
         return (& $result $false 'невідома опція powershell.exe перед -File/-Command/-EncodedCommand')
     }
 
@@ -691,6 +701,10 @@ function Get-BRAVOTaskActionConfigPathReference {
             $structureReason = 'ціль команди не є літералом (змінна/вираз)'
         } elseif (-not (Test-BRAVOScriptPathIsBravoEntrypoint -ScriptPath ([string]@($candidate.CommandElements)[0].Value))) {
             $structureReason = 'ціль команди не BRAVO_*.ps1 (вкладений запуск/лаунчер/інша команда), а текст згадує BRAVO_*.ps1'
+        } elseif (([string]@($candidate.CommandElements)[0].Value) -notmatch '[\\/]') {
+            # PowerShell не шукає голе ім'я команди в поточному каталозі (лише в PATH/командах сесії):
+            # без явного шляху (.\ чи абсолютного) невідомо, що саме буде запущено.
+            $structureReason = 'ціль команди — голе ім''я BRAVO_*.ps1 без шляху: PowerShell не шукає його в WorkingDirectory (лише .\ чи абсолютний шлях), тож що саме запуститься — статично не визначити'
         } else {
             $soleCommand = $candidate
         }
@@ -803,11 +817,21 @@ function Get-BRAVOConfigPathTargetClassification {
     }
     $resolved = [string]$resolution.Path
     try {
-        if (Test-Path -LiteralPath $resolved -PathType Container) {
-            return (& $classify 'Unknown' $resolved 'шлях вказує на каталог, а не на файл')
-        }
-        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        # Get-Item -ErrorAction Stop: помилка доступу/вводу-виводу кидає виняток (Unknown), а не
+        # мовчки дає $false, як Test-Path (інакше файл без права доступу хибно вважався б Missing).
+        $item = $null
+        try {
+            $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
+        } catch [System.Management.Automation.DriveNotFoundException] {
+            return (& $classify 'Unknown' $resolved "диск/ресурс недоступний, наявність файлу невідома: $($_.Exception.Message)")
+        } catch [System.Management.Automation.ItemNotFoundException] {
+            if ($resolved.StartsWith('\\', [StringComparison]::Ordinal)) {
+                return (& $classify 'Unknown' $resolved 'мережевий (UNC) шлях недосяжний чи відсутній — наявність файлу не підтверджено')
+            }
             return (& $classify 'Missing' $resolved 'файл не існує')
+        }
+        if ($item.PSIsContainer) {
+            return (& $classify 'Unknown' $resolved 'шлях вказує на каталог, а не на файл')
         }
     } catch {
         return (& $classify 'Unknown' $resolved "не вдалося перевірити файл: $($_.Exception.Message)")
@@ -856,6 +880,7 @@ function Get-BRAVOTaskConfigPathFinding {
                 TaskPath = $TaskPath
                 TaskName = $TaskName
                 ActionIndex = $actionIndex
+                ActionCount = @($Actions).Count
                 Status = $Status
                 Form = if ($null -ne $Reference) { [string]$Reference.Form } else { $null }
                 Spelling = if ($null -ne $Reference) { [string]$Reference.Spelling } else { $null }
@@ -878,12 +903,20 @@ function Get-BRAVOTaskConfigPathFinding {
         $mention = ($arguments -match $bravoPattern -or $workingDirectory -match $bravoPattern -or
             ($null -ne $definition.CommandText -and [string]$definition.CommandText -match $bravoPattern))
         if (-not $mention) { continue }
+        if ($kind -eq 'Pwsh') {
+            $findings.Add((& $newFinding 'Unknown' $null $null 'pwsh.exe не моделюється (інші правила розбору аргументів і опцій, ніж у Windows PowerShell 5.1) — аргументи статично не розібрано'))
+            continue
+        }
 
         $analysis = Get-BRAVOTaskActionConfigPathReference -Definition $definition -WorkingDirectory $workingDirectory
         $references = @($analysis.References)
         if ($references.Count -eq 0) {
             if ([bool]$analysis.Modelled) {
-                $findings.Add((& $newFinding 'NoConfigPath' $null $null '-ConfigPath відсутній (AUTO); дію повністю змодельовано'))
+                if (-not [bool]$analysis.NoProfile) {
+                    $findings.Add((& $newFinding 'Unknown' $null $null 'powershell.exe запущено без -NoProfile: профіль облікового запису завдання може задати ConfigPath через $PSDefaultParameterValues, тож відсутність -ConfigPath (AUTO) не підтверджується'))
+                } else {
+                    $findings.Add((& $newFinding 'NoConfigPath' $null $null '-ConfigPath відсутній (AUTO); дію повністю змодельовано'))
+                }
             } else {
                 $findings.Add((& $newFinding 'Unknown' $null $null ([string]$analysis.Reason)))
             }
@@ -993,7 +1026,12 @@ function Format-BRAVOConfigPathFindingLine {
     # це доказ для B5 (#154/#281), а не відмова реєстрації.
     param([Parameter(Mandatory = $true)]$Finding)
 
+    # Завдання з кількома діями: без номера дії знахідки різних дій були б нерозрізнювані.
+    # Для однодієвого завдання формат лишається без змін.
     $subject = "$($Finding.TaskPath)"
+    if ($Finding.PSObject.Properties['ActionCount'] -and [int]$Finding.ActionCount -gt 1) {
+        $subject += " [action $([int]$Finding.ActionIndex)]"
+    }
     switch ([string]$Finding.Status) {
         'NoConfigPath' {
             return [pscustomobject]@{ Level = 'PASS'; Text = "[PASS] ${subject}: -ConfigPath відсутній (AUTO) — legacy BRAVO.config не виконується." }

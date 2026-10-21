@@ -13,7 +13,11 @@
   `cmd.exe`-обгортка, профільні змінні середовища); для `LegacyPrimary` рядок `[WARN]` містить дію
   оператора. `[PASS]` без `-ConfigPath` видається лише для повністю змодельованої дії (allowlist: `-File
   <BRAVO_*.ps1>` або один літеральний виклик у `-Command`, усі токени прив'язано `param()`); решта, що згадує
-  `BRAVO_*.ps1`, — `Unknown`. Логіка винесена в новий модуль `modules/BRAVO.SchedulerDiagnostics`; entrypoint лише друкує
+  `BRAVO_*.ps1`, — `Unknown` (зокрема `powershell.exe` без `-NoProfile`, бо профіль акаунта завдання може задати
+  `ConfigPath` через `$PSDefaultParameterValues`; голе ім'я `BRAVO_*.ps1` у `-Command` без `.\` чи абсолютного
+  шляху; помилка доступу чи вводу-виводу під час перевірки файлу `-ConfigPath` — це `Unknown`, а не `Missing`).
+  Дії `pwsh.exe` не моделюються (`Unknown`); опції `powershell.exe` розпізнаються за мінімальними префіксами 5.1,
+  `-PSConsoleFile` — `Unknown`. У завданні з кількома діями рядок звіту містить номер дії (`[action N]`). Логіка винесена в новий модуль `modules/BRAVO.SchedulerDiagnostics`; entrypoint лише друкує
   розділ. Нічого не змінює (ні завдань, ні файлів), не потребує UAC (працює з `-InspectOnly`), не змінює
   код виходу. Поведінку loader-а й підтримку `-ConfigPath` на legacy-файл не змінено: рішення #281 за
   власником. Self-test: `TaskConfigPath/*` на синтетичних XML-завданнях. Порядок використання як доказу —
