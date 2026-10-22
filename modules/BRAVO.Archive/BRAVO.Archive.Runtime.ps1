@@ -5546,8 +5546,35 @@ function Get-BAZASynchronizationOutcome {
                 if ($null -ne $snapshotCoverageRoot -and $null -ne $beforePendingPath -and
                     $beforePendingPath.StartsWith($snapshotCoverageRoot + '\',[StringComparison]::OrdinalIgnoreCase)) {
                     $beforeRelativePath = $beforePendingPath.Substring($snapshotCoverageRoot.Length + 1)
+                    # Покриття = той самий вид об'єкта (файл/каталог) і для файлу
+                    # розмір у знімку не менший за розмір в аудиті ДО (зростання —
+                    # звичайне дописування LIMS, його перевіряє звіряння знімка;
+                    # зменшення = заміна чи мутація). Інших полів аудит ДО не має,
+                    # тож заміна більшим чи рівним за розміром файлом непомітна.
+                    # Заміна за тим самим шляхом (напр., файл -> каталог)
+                    # оригіналу не захоплює: це зникнення, а не покриття.
+                    $beforeIsDirectoryProperty = $beforePending.PSObject.Properties['IsDirectory']
+                    $beforeIsDirectory = $null -ne $beforeIsDirectoryProperty -and [bool]$beforeIsDirectoryProperty.Value
+                    $beforeSizeProperty = $beforePending.PSObject.Properties['SizeBytes']
+                    $beforeSize = if ($null -ne $beforeSizeProperty) { $beforeSizeProperty.Value } else { $null }
+                    if ($beforeIsDirectory) {
+                        $beforeCovered = $LocalSnapshot.Directories.Contains($beforeRelativePath) -and
+                            -not $LocalSnapshot.Entries.ContainsKey($beforeRelativePath)
+                    } else {
+                        $beforeCovered = $LocalSnapshot.Entries.ContainsKey($beforeRelativePath) -and
+                            -not $LocalSnapshot.Directories.Contains($beforeRelativePath)
+                        if ($beforeCovered -and $null -ne $beforeSize) {
+                            $beforeCovered = [int64]$LocalSnapshot.Entries[$beforeRelativePath].Size -ge [int64]$beforeSize
+                        }
+                    }
+                    if ($beforeCovered) {
+                        continue
+                    }
                     if ($LocalSnapshot.Entries.ContainsKey($beforeRelativePath) -or
                         $LocalSnapshot.Directories.Contains($beforeRelativePath)) {
+                        # Шлях зайнятий іншим об'єктом: оригінал не захоплено.
+                        $snapshotUnavailableVanishedCount++
+                        [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath)
                         continue
                     }
                 }
@@ -6574,7 +6601,7 @@ exit
             $driftReason = if ([int]$syncOutcome.SnapshotUnavailableVanishedCount -gt 0) {
                 $unavailablePreview = @(@($syncOutcome.SnapshotUnavailableVanished) | Select-Object -First 20) -join '; '
                 $unavailableCause = if ($syncOutcome.SnapshotAvailable) { "знімок циклу не містить об'єктів аудиту ДО" } else { "знімок циклу не створено" }
-                "${unavailableCause}, а об'єкти аудиту ДО зникли локально без підтвердження передачі: $($syncOutcome.SnapshotUnavailableVanishedCount) ($unavailablePreview)"
+                "${unavailableCause}, а об'єкти аудиту ДО зникли або замінені локально без підтвердження передачі: $($syncOutcome.SnapshotUnavailableVanishedCount) ($unavailablePreview)"
             } elseif (-not $syncOutcome.SnapshotConsistencyVerified) {
                 "звіряння знімка циклу з локальним деревом не виконано"
             } else {

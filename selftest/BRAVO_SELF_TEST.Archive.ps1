@@ -2895,6 +2895,58 @@ try {
         $rf28b.App.IsComplete -and $rf28b.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf28b.App.CompletedCount -eq 2
     ) -Name 'Archive/501/F28bSnapshotMissingButPresentAndTransferredIsSuccess' `
       -Failure "файл аудиту ДО, якого немає у знімку, але який є локально і переданий, не є помилкою; label=$($rf28b.Label) exit=$($rf28b.ExitCode) vanished=$($rf28b.App.SnapshotUnavailableVanishedCount) completed=$($rf28b.App.CompletedCount)"
+
+    # F29 (Codex, PR #503, P1). pending_2 замінено за тим самим шляхом ДО обходу
+    # знімка: каталогом (F29) або меншим файлом (F29b). Шлях є у знімку,
+    # але це не той об'єкт, що в аудиті ДО: оригінал не захоплено -> ПОМИЛКА,
+    # переданим він не рахується. F29c — контроль: незмінений файл покритий.
+    $f29 = & $late501NewCase 'F29'
+    $f29Path = Join-Path $f29.App 'KZ\2026\pending_2.pdf'
+    $rf29 = & $late501Run -CaseRoot $f29.Root -Remote $f29.Remote -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f29Path),
+        (& $late501Op 'BeforeAudit' 'MkDir' $f29Path)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf29.Manual.Success -and $rf29.Label -eq 'ПОМИЛКА' -and $rf29.ExitCode -eq 50 -and
+        $rf29.App.SnapshotAvailable -and -not $rf29.App.IsComplete -and
+        $rf29.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf29.App.CompletedCount -eq 1 -and
+        @(& $late501Errors $rf29 | Where-Object { $_.Message -like '*BAZA_APP не підтверджено:*pending_2.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F29FileReplacedByDirectoryBeforeSnapshotIsError' `
+      -Failure "файл аудиту ДО, замінений каталогом до знімка, не покритий знімком; label=$($rf29.Label) exit=$($rf29.ExitCode) vanished=$($rf29.App.SnapshotUnavailableVanishedCount) completed=$($rf29.App.CompletedCount)"
+
+    $f29b = & $late501NewCase 'F29b'
+    $f29bPath = Join-Path $f29b.App 'KZ\2026\pending_2.pdf'
+    $rf29b = & $late501Run -CaseRoot $f29b.Root -Remote $f29b.Remote -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f29bPath),
+        (& $late501Op 'BeforeAudit' 'Write' $f29bPath -Size 77)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf29b.Manual.Success -and $rf29b.Label -eq 'ПОМИЛКА' -and $rf29b.ExitCode -eq 50 -and
+        -not $rf29b.App.IsComplete -and $rf29b.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf29b.App.CompletedCount -eq 1
+    ) -Name 'Archive/501/F29bFileReplacedBySmallerFileBeforeSnapshotIsError' `
+      -Failure "файл аудиту ДО, замінений меншим файлом до знімка, не покритий знімком; label=$($rf29b.Label) exit=$($rf29b.ExitCode) vanished=$($rf29b.App.SnapshotUnavailableVanishedCount) completed=$($rf29b.App.CompletedCount)"
+
+    $f29c = & $late501NewCase 'F29c'
+    $f29cPath = Join-Path $f29c.App 'KZ\2026\pending_2.pdf'
+    $rf29c = & $late501Run -CaseRoot $f29c.Root -Remote $f29c.Remote -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f29cPath),
+        (& $late501Op 'BeforeAudit' 'Write' $f29cPath -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        $rf29c.Manual.Success -and $rf29c.Label -eq 'УСПІШНО' -and $rf29c.ExitCode -eq 0 -and
+        $rf29c.App.IsComplete -and $rf29c.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf29c.App.CompletedCount -eq 2
+    ) -Name 'Archive/501/F29cSameKindAndSizeCoveredBySnapshotIsSuccess' `
+      -Failure "об'єкт аудиту ДО того ж виду й розміру покритий знімком; label=$($rf29c.Label) exit=$($rf29c.ExitCode) vanished=$($rf29c.App.SnapshotUnavailableVanishedCount) completed=$($rf29c.App.CompletedCount)"
+
+    # F29d. Контроль: файл аудиту ДО дописано (виріс 200 -> 300) до знімка — звичайна
+    # динаміка append-only. Більшу версію знімка перевіряє звіряння знімка -> УСПІШНО.
+    $f29d = & $late501NewCase 'F29d'
+    $rf29d = & $late501Run -CaseRoot $f29d.Root -Remote $f29d.Remote -Ops @(& $late501Op 'BeforeAudit' 'Write' (Join-Path $f29d.App 'KZ\2026\pending_2.pdf') -Size 300)
+    Test-BRAVOCondition -Condition (
+        $rf29d.Manual.Success -and $rf29d.Label -eq 'УСПІШНО' -and $rf29d.ExitCode -eq 0 -and
+        $rf29d.App.IsComplete -and $rf29d.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf29d.App.CompletedCount -eq 2
+    ) -Name 'Archive/501/F29dGrownFileBeforeSnapshotIsNotError' `
+      -Failure "дописаний до знімка файл аудиту ДО не є помилкою; label=$($rf29d.Label) exit=$($rf29d.ExitCode) vanished=$($rf29d.App.SnapshotUnavailableVanishedCount) completed=$($rf29d.App.CompletedCount)"
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
     # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.
