@@ -752,6 +752,7 @@ function Test-BRAVOConfigV2CutoverGates {
                     ScriptBlock        = (Get-BRAVOAstEnclosingScriptBlock -AstNode $legacyReaderAssignmentAst)
                     StartOffset        = $legacyReaderAssignmentAst.Extent.StartOffset
                     ReaderFunctionName = $matchedReaderFunctionName
+                    LiteralValue       = $assignmentValueLiteralAst.Value
                 })
             }
 
@@ -922,6 +923,17 @@ function Test-BRAVOConfigV2CutoverGates {
                     if ($nearestPrecedingAssignment) {
                         break
                     }
+                }
+                # #239 (QA-001): змінна з літералом-ІМЕНЕМ ALIAS-а рідера
+                # (`Set-Alias rdr Read-...; $cmd = 'rdr'; & $cmd` або `. $cmd`)
+                # теж є викликом рідера. Alias-імена зібрано вище; зіставлення
+                # з літералом найближчого попереднього присвоєння.
+                if ($nearestPrecedingAssignment -and
+                    -not $nearestPrecedingAssignment.ReaderFunctionName -and
+                    -not [string]::IsNullOrEmpty($nearestPrecedingAssignment.LiteralValue) -and
+                    $legacyReaderAliasNames.Contains($nearestPrecedingAssignment.LiteralValue)) {
+                    [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через змінну `$$($firstCommandElement.VariablePath.UserPath), присвоєну імені alias-а legacy-рідера '$($nearestPrecedingAssignment.LiteralValue)')")
+                    continue
                 }
                 if (-not $nearestPrecedingAssignment -or -not $nearestPrecedingAssignment.ReaderFunctionName) {
                     continue
