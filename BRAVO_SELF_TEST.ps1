@@ -31986,6 +31986,13 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 'BRAVO_VPAT.ps1'   = 'param([ValidatePattern(''^[a-z]+$'')][string]$Label, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
                 'BRAVO_VNE.ps1'    = 'param([ValidateNotNullOrEmpty()][string]$Label, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
                 'BRAVO_VALLOW.ps1' = 'param([AllowNull()][string]$Label, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
+                # --- #496 (раунд 11): Mandatory-параметри та тип параметра (з доведеним cutover) ---
+                'BRAVO_MAND.ps1'   = 'param([Parameter(Mandatory)][string]$Component, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
+                'BRAVO_MANDT.ps1'  = 'param([Parameter(Mandatory=$true)][string]$Component, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
+                'BRAVO_MANDF.ps1'  = 'param([Parameter(Mandatory=$false)][string]$Component, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
+                'BRAVO_MANDX.ps1'  = 'param([Parameter(Mandatory=(1 -eq 1))][string]$Component, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
+                'BRAVO_TYPED.ps1'  = 'param([int]$TimeoutSeconds, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
+                'BRAVO_TYPEDX.ps1' = 'param([datetime]$Since, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
             }
             foreach ($scanScriptName in $scanScripts.Keys) {
                 [IO.File]::WriteAllText((Join-Path $scanRuntime $scanScriptName), $scanScripts[$scanScriptName], [Text.Encoding]::UTF8)
@@ -32280,7 +32287,24 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T145_FlagExpression'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_FLAGEXPR.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
                 @{ Name = 'T146_FlagOnlyInSplat'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_FLAGSPLAT.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
                 @{ Name = 'T147_FlagExplicitTrueControl'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_FLAGTRUE.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T148_FlagParenthesizedTrueControl'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_FLAGTRUEPAREN.ps1')$scanQ -NoPause"; Wd = $scanRuntime }
+                @{ Name = 'T148_FlagParenthesizedTrueControl'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_FLAGTRUEPAREN.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                # #496 раунд 11 (1): Mandatory-параметр без прив'язки -> PowerShell відмовить до запуску скрипта (до loader-а).
+                @{ Name = 'T149_MandatoryUnboundWithConfigPath'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_MAND.ps1')$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T150_MandatoryTrueUnboundNoConfigPath'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_MANDT.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T151_MandatoryBoundByNameControl'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_MAND.ps1')$scanQ -Component x -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T152_MandatoryBoundPositionallyControl'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_MAND.ps1')$scanQ x -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T153_MandatoryFalseUnboundControl'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_MANDF.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T154_MandatoryNonLiteralUnbound'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_MANDX.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                # #496 раунд 11 (2): значення параметра не конвертується в його тип ([int]) -> прив'язка не відбудеться.
+                @{ Name = 'T155_IntParameterNonNumeric'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_TYPED.ps1')$scanQ -TimeoutSeconds nope -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T156_IntParameterNumericControl'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_TYPED.ps1')$scanQ -TimeoutSeconds 30 -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T157_DateTimeParameterNotProven'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_TYPEDX.ps1')$scanQ -Since 2026-01-01 -NoPause"; Wd = $scanRuntime },
+                # #496 раунд 11 (3): прямий powershell.exe з -EncodedCommand (будь-який префікс) і нерозкритою змінною середовища -> Unknown, не мовчазний пропуск.
+                @{ Name = 'T158_DirectEncodedCommandEnvPayload'; Expect = 'Unknown'; Arguments = '-NoProfile -EncodedCommand %BRAVO_PAYLOAD%'; Wd = '' },
+                @{ Name = 'T159_DirectEcAliasEnvPayload'; Expect = 'Unknown'; Arguments = '-NoProfile -ec %BRAVO_PAYLOAD%'; Wd = '' },
+                @{ Name = 'T160_DirectSlashEncAbbreviationEnvPayload'; Expect = 'Unknown'; Arguments = '-NoProfile /enc %BRAVO_PAYLOAD%'; Wd = '' },
+                @{ Name = 'T161_DirectCommandEnvWithoutBravoSkipped'; Expect = '<none>'; Arguments = '-NoProfile -Command %BRAVO_PAYLOAD%'; Wd = '' },
+                @{ Name = 'T162_DirectEncodedStableEnvNotBravoSkipped'; Expect = '<none>'; Arguments = '-NoProfile -EncodedCommand %SystemRoot%'; Wd = '' }
             )
 
 
@@ -32374,6 +32398,29 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                         ResolveRootRelativeWd = Resolve-BRAVOTaskActionPath -Path 'BRAVO_ARCHIV.ps1' -WorkingDirectory '\BRAVO'
                         ResolveDriveRelativeWd = Resolve-BRAVOTaskActionPath -Path 'BRAVO_ARCHIV.ps1' -WorkingDirectory 'C:BRAVO'
                         ResolveFullWd = Resolve-BRAVOTaskActionPath -Path 'BRAVO_ARCHIV.ps1' -WorkingDirectory 'C:\BRAVO'
+                        # #496 раунд 11 (4): позиція дії рахується серед УСІХ дій Actions (не лише Exec).
+                        MultiAction = & {
+                            $maExec = '<Exec><Command>' + $DefaultCommand + '</Command><Arguments>' +
+                            [Security.SecurityElement]::Escape('-NoProfile -File "' + (Join-Path $TrustedRoot 'BRAVO_ARCHIV.ps1') + '" -ConfigPath "' + (Join-Path $OtherRoot 'BRAVO.config') + '"') +
+                            '</Arguments><WorkingDirectory>' + [Security.SecurityElement]::Escape($TrustedRoot) + '</WorkingDirectory></Exec>'
+                            $maCom = '<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler>'
+                            $maReport = {
+                                param($Body, $Name)
+                                $maXml = '<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions Context="Author">' + $Body + '</Actions></Task>'
+                                $maTask = [pscustomobject]@{ Path = '\BRAVO' + $Name; Name = $Name; Xml = $maXml }
+                                $maFindings = @((Invoke-ScanReport (New-ScanFolder '\BRAVO' @($maTask) @())).Findings)
+                                [pscustomobject]@{
+                                    Index = (@($maFindings | ForEach-Object { [int]$_.ActionIndex }) -join ',')
+                                    Count = (@($maFindings | ForEach-Object { [int]$_.ActionCount }) -join ',')
+                                    Lines = @($maFindings | ForEach-Object { (Format-BRAVOConfigPathFindingLine -Finding $_).Text })
+                                }
+                            }
+                            [pscustomobject]@{
+                                ComExecExec = (& $maReport ($maCom + $maExec + $maExec) 'MA1')
+                                ComExec = (& $maReport ($maCom + $maExec) 'MA2')
+                                ExecOnly = (& $maReport $maExec 'MA3')
+                            }
+                        }
                         DefQuoted = (& $definitionOf '-NoProfile -File "%ProgramFiles%\BRAVO\BRAVO_ARCHIV.ps1" -NoPause')
                         DefUnquoted = (& $definitionOf '-NoProfile -File %ProgramFiles%\BRAVO\BRAVO_ARCHIV.ps1 -ConfigPath C:\site\BRAVO.config')
                         DefUnsupported = (& $definitionOf '-NoProfile -File C:\BRAVO\BRAVO_ARCHIV.ps1 -ConfigPath %USERPROFILE%\BRAVO.config')
@@ -32447,6 +32494,14 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                     -Condition ($scanResult.Report.TasksScanned -eq $scanCases.Count) `
                     -Name 'TaskConfigPath/MixedScansEveryTask' `
                     -Failure "N змішаних завдань: усі переглянуто. Scanned=$($scanResult.Report.TasksScanned), очікується $($scanCases.Count)"
+                Test-BRAVOCondition `
+                    -Condition ($scanResult.MultiAction.ComExecExec.Index -eq '2,3' -and $scanResult.MultiAction.ComExecExec.Count -eq '3,3' -and
+                        $scanResult.MultiAction.ComExecExec.Lines[0] -like '*[[]action 2]*' -and $scanResult.MultiAction.ComExecExec.Lines[1] -like '*[[]action 3]*' -and
+                        $scanResult.MultiAction.ComExec.Index -eq '2' -and $scanResult.MultiAction.ComExec.Count -eq '2' -and $scanResult.MultiAction.ComExec.Lines[0] -like '*[[]action 2]*' -and
+                        $scanResult.MultiAction.ExecOnly.Index -eq '1' -and $scanResult.MultiAction.ExecOnly.Count -eq '1' -and $scanResult.MultiAction.ExecOnly.Lines[0] -notlike '*[[]action*') `
+                    -Name 'TaskConfigPath/ActionPositionCountsNonExecActions' `
+                    -Failure ("#496 раунд 11: позиція [action N] — серед усіх дій Actions (ComHandler+Exec+Exec -> 2,3; ComHandler+Exec -> 2); одна дія без суфікса. Отримано: " +
+                        "A=$($scanResult.MultiAction.ComExecExec.Index)/$($scanResult.MultiAction.ComExecExec.Count) B=$($scanResult.MultiAction.ComExec.Index)/$($scanResult.MultiAction.ComExec.Count) C=$($scanResult.MultiAction.ExecOnly.Index)/$($scanResult.MultiAction.ExecOnly.Count)")
                 Test-BRAVOCondition `
                     -Condition ($scanResult.Nested.TasksScanned -eq 2 -and $scanResult.Nested.Findings.Count -eq 2) `
                     -Name 'TaskConfigPath/RecursesIntoSubfolders' `

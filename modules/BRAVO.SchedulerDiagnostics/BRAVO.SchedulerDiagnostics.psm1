@@ -405,6 +405,8 @@ function Get-BRAVOScriptDeclaredParameter {
     #  PositionalOrder — власники у порядку позиційної прив'язки;
     #  PositionalAmbiguous — позицію статично не визначити (набори параметрів, змішані
     #                   явні/неявні Position, ValueFromRemainingArguments).
+    #  MandatoryOwners — #496: параметри з Mandatory (літерал чи будь-яке значення, крім $false — fail closed);
+    #  TypedOwners     — #496: власник -> 'Int32'|'Int64'|'Other' для типів, крім string/object/switch.
     # Known=$false, коли скрипт недоступний або не розбирається.
     param(
         [AllowNull()][AllowEmptyString()][string]$ScriptPath,
@@ -412,7 +414,7 @@ function Get-BRAVOScriptDeclaredParameter {
     )
 
     $unknown = [pscustomobject]@{
-        Known = $false; Entries = @(); SwitchOwners = @(); PositionalOrder = @(); PositionalAmbiguous = $true; Validation = @{}
+        Known = $false; Entries = @(); SwitchOwners = @(); PositionalOrder = @(); PositionalAmbiguous = $true; Validation = @{}; MandatoryOwners = @(); TypedOwners = @{}
     }
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return $unknown }
     try {
@@ -430,6 +432,8 @@ function Get-BRAVOScriptDeclaredParameter {
         $switchOwners = New-Object 'System.Collections.Generic.List[string]'
         $positional = New-Object 'System.Collections.Generic.List[object]'
         $validation = @{}
+        $mandatoryOwners = New-Object 'System.Collections.Generic.List[string]'
+        $typedOwners = @{}
         $ambiguous = $false
         $positionalBinding = $true
         $paramBlock = $ast.ParamBlock
@@ -453,6 +457,9 @@ function Get-BRAVOScriptDeclaredParameter {
                 $entries.Add([pscustomobject]@{ Name = $ownerName; Owner = $ownerName })
                 $isSwitch = ($parameter.StaticType -eq [System.Management.Automation.SwitchParameter])
                 if ($isSwitch) { $switchOwners.Add($ownerName) }
+                elseif ($parameter.StaticType -ne [string] -and $parameter.StaticType -ne [object]) {
+                    $typedOwners[$ownerName] = $(if ($parameter.StaticType -eq [int]) { 'Int32' } elseif ($parameter.StaticType -eq [long]) { 'Int64' } else { 'Other' })
+                }
                 $explicitPosition = $null
                 $parameterRules = New-Object 'System.Collections.Generic.List[object]'
                 foreach ($attribute in @($parameter.Attributes)) {
@@ -471,6 +478,9 @@ function Get-BRAVOScriptDeclaredParameter {
                                 }
                             }
                             if ($namedArgument.ArgumentName -eq 'ParameterSetName') { $ambiguous = $true }
+                            if ($namedArgument.ArgumentName -eq 'Mandatory' -and $namedArgument.Argument.Extent.Text -notmatch '^\$false$') {
+                                $mandatoryOwners.Add($ownerName)
+                            }
                             if ($namedArgument.ArgumentName -eq 'ValueFromRemainingArguments' -and
                                 $namedArgument.Argument.Extent.Text -notmatch '^\$false$') { $ambiguous = $true }
                         }
@@ -535,6 +545,8 @@ function Get-BRAVOScriptDeclaredParameter {
             PositionalOrder = @($order)
             PositionalAmbiguous = $ambiguous
             Validation = $validation
+            MandatoryOwners = $mandatoryOwners.ToArray()
+            TypedOwners = $typedOwners
         }
     } catch {
         return $unknown
@@ -765,6 +777,15 @@ function Get-BRAVOConfigPathReferenceFromItem {
     $checkValidation = {
         param($Owner, $Value, $HasValue)
         if (-not [bool]$Declared.Known) { return }
+        # #496: тип, відмінний від string/object/switch: значення має довести конвертацію ([int]/[long] — інваріантно), інакше Unknown.
+        if ($HasValue -and $Declared.TypedOwners.ContainsKey($Owner)) {
+            $parsed32 = 0
+            $parsed64 = [long]0
+            $typeKind = [string]$Declared.TypedOwners[$Owner]
+            $converts = (($typeKind -eq 'Int32' -and [int]::TryParse([string]$Value, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed32)) -or
+                ($typeKind -eq 'Int64' -and [long]::TryParse([string]$Value, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed64)))
+            if (-not $converts) { & $fail "значення параметра -$Owner не доведено сумісним із його типом (значення не виводиться): PowerShell може відмовити у прив'язці до запуску скрипта" }
+        }
         $rules = @()
         if ($null -ne $Declared.Validation -and $Declared.Validation.ContainsKey($Owner)) { $rules = @($Declared.Validation[$Owner]) }
         if ($rules.Count -eq 0) { return }
@@ -874,6 +895,18 @@ function Get-BRAVOConfigPathReferenceFromItem {
             }
             foreach ($leftoverItem in $leftover) {
                 if ($null -ne $leftoverItem.Reason) { & $fail 'позиційне значення динамічне' }
+            }
+        }
+    }
+    # #496: Mandatory-параметр без прив'язки (ні іменований, ні позиційний) -> PowerShell відмовить до запуску скрипта.
+    if ([bool]$Declared.Known) {
+        $positionallyBound = @()
+        if ($leftover.Count -gt 0 -and -not [bool]$Declared.PositionalAmbiguous) {
+            $positionallyBound = @(@($Declared.PositionalOrder) | Where-Object { -not $boundOwners.Contains([string]$_) } | Select-Object -First $leftover.Count)
+        }
+        foreach ($mandatoryOwner in @($Declared.MandatoryOwners)) {
+            if (-not $boundOwners.Contains([string]$mandatoryOwner) -and @($positionallyBound) -notcontains [string]$mandatoryOwner) {
+                & $fail "обов'язковий параметр -$mandatoryOwner (Mandatory) не прив'язано: PowerShell відмовить у прив'язці до запуску скрипта"
             }
         }
     }
@@ -1406,7 +1439,13 @@ function Get-BRAVOTaskConfigPathFinding {
         $definition = Get-BRAVOPowerShellActionDefinition -Arguments $arguments
         $mention = ($arguments -match $bravoPattern -or $workingDirectory -match $bravoPattern -or
             ($null -ne $definition.CommandText -and [string]$definition.CommandText -match $bravoPattern))
-        if (-not $mention) { continue }
+        if (-not $mention) {
+            # #496: нерозкрита змінна середовища + -EncodedCommand (будь-який префікс): payload не декодовано, BRAVO_*.ps1 у ньому не виключено.
+            if ($encodedWrapper -and @((Expand-BRAVOTaskActionVariable -Text $arguments -NamePattern '[^%]+').Unsupported).Count -gt 0) {
+                $findings.Add((& $newFinding 'Unknown' $null $null 'аргументи powershell.exe містять -EncodedCommand (або його скорочення) і змінну середовища, яку статично не розкрити: payload не декодовано, згадка BRAVO_*.ps1 у ньому не виключена — що саме запуститься, статично не визначити'))
+            }
+            continue
+        }
         if ($kind -eq 'PowerShellUnverified') {
             $findings.Add((& $newFinding 'Unknown' $null $null 'powershell.exe запущено не зі штатного розташування Windows PowerShell 5.1 (%SystemRoot%\System32 або %SystemRoot%\SysWOW64, WindowsPowerShell\v1.0) — голе ім''я (пошук у PATH) чи інший каталог: який бінарник запуститься й як він розбере аргументи, статично не визначити'))
             continue
@@ -1495,7 +1534,9 @@ function ConvertFrom-BRAVOTaskXmlExecAction {
     } finally {
         $stringReader.Dispose()
     }
-    foreach ($node in @($document.SelectNodes("//*[local-name()='Actions']/*[local-name()='Exec']"))) {
+    foreach ($node in @($document.SelectNodes("//*[local-name()='Actions']/*"))) {
+        # #496: позиція дії рахується серед УСІХ дій Actions; не-Exec дія займає слот ($null), який сканер пропускає.
+        if ($node.LocalName -ne 'Exec') { $actions.Add($null); continue }
         $read = {
             param($ChildName)
             $child = $node.SelectSingleNode("*[local-name()='$ChildName']")
