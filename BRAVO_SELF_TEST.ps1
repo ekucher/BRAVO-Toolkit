@@ -31997,10 +31997,37 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 'BRAVO_PSETS.ps1'  = "[CmdletBinding()]`r`nparam([Parameter(ParameterSetName='A')][string]`$ConfigPath, [Parameter(ParameterSetName='B')][string]`$Other, [switch]`$NoPause)`r`n" + $scanGuardedCall
                 'BRAVO_PSDEF.ps1'  = "[CmdletBinding(DefaultParameterSetName='A')]`r`nparam([string]`$ConfigPath, [switch]`$NoPause)`r`n" + $scanGuardedCall
                 'BRAVO_PSALL.ps1'  = "[CmdletBinding()]`r`nparam([Parameter(ParameterSetName='__AllParameterSets')][string]`$ConfigPath, [switch]`$NoPause)`r`n" + $scanGuardedCall
+                # --- #496 (раунд 13): F1 неоднозначний шлях виклику loader-а; F3 значення SupportsShouldProcess ---
+                'BRAVO_DEADGUARD.ps1' = "param([string]`$ConfigPath, [switch]`$NoPause)`r`nif (`$false) { " + $scanGuardedCall + "}`r`n`$cmd = Get-Command ('Import-Bravo' + 'Configuration')`r`n& `$cmd -ConfigRoot `$PSScriptRoot -ConfigPath `$ConfigPath`r`n"
+                'BRAVO_DEADDYN.ps1'   = "param([string]`$ConfigPath, [switch]`$NoPause)`r`nif (`$false) { " + $scanGuardedCall + "}`r`n`$n = 'Import-Bravo' + 'Configuration'`r`n& `$n -ConfigRoot `$PSScriptRoot -ConfigPath `$ConfigPath`r`n"
+                'BRAVO_DEADIEX.ps1'   = "param([string]`$ConfigPath, [switch]`$NoPause)`r`nif (`$false) { " + $scanGuardedCall + "}`r`nInvoke-Expression 'Import-BravoConfiguration -ConfigRoot x'`r`n"
+                'BRAVO_DEADDOT.ps1'   = "param([string]`$ConfigPath, [switch]`$NoPause)`r`nif (`$false) { " + $scanGuardedCall + "}`r`n. `$ConfigPath`r`n"
+                'BRAVO_SBVAR.ps1'     = "param([string]`$ConfigPath, [switch]`$NoPause)`r`n`$log = { param(`$m) `$m }`r`n& `$log 'start'`r`n" + $scanGuardedCall
+                'BRAVO_SPFALSE.ps1'   = "[CmdletBinding(SupportsShouldProcess=`$false)]`r`nparam([string]`$ConfigPath)`r`n"
+                'BRAVO_SPTRUE.ps1'    = "[CmdletBinding(SupportsShouldProcess=`$true)]`r`nparam([string]`$ConfigPath)`r`n"
+                'BRAVO_SPEXPR.ps1'    = "[CmdletBinding(SupportsShouldProcess=1)]`r`nparam([string]`$ConfigPath)`r`n"
+                # --- #496 (рішення власника): обходи AST-аналізу (guarded виклик у мертвому коді + динамічний виклик за іменем з шаблоном/Split-Path); поза маніфестом -> Unknown ---
+                'BRAVO_BYPASSWILD.ps1'  = "param([string]`$ConfigPath, [switch]`$NoPause)`r`nif (`$false) { " + $scanGuardedCall + "}`r`n`$n = Get-Command 'Import-BravoConfiguratio?'`r`n& `$n -ConfigRoot `$PSScriptRoot -ConfigPath `$ConfigPath`r`n"
+                'BRAVO_BYPASSSPLIT.ps1' = "param([string]`$ConfigPath, [switch]`$NoPause)`r`nif (`$false) { " + $scanGuardedCall + "}`r`n`$n = Split-Path -Leaf ('C:\x\Import-Bravo' + 'Configuration')`r`n& `$n -ConfigRoot `$PSScriptRoot -ConfigPath `$ConfigPath`r`n"
             }
             foreach ($scanScriptName in $scanScripts.Keys) {
                 [IO.File]::WriteAllText((Join-Path $scanRuntime $scanScriptName), $scanScripts[$scanScriptName], [Text.Encoding]::UTF8)
             }
+            # #496 (рішення власника): NoConfigPath лише для незміненого канонічного entrypoint-а — SHA-256 файла має дорівнювати
+            # запису RUNTIME_MANIFEST.json каталогу runtime. Фікстури, що мають бути «канонічними», перелічуються у власному
+            # маніфесті фікстури; обходи AST (DEAD*, BYPASS*) навмисно НЕ перелічено -> Unknown.
+            $scanWriteManifest = {
+                param($Dir, [string[]]$Exclude)
+                $manifestFiles = [ordered]@{}
+                foreach ($manifestFile in @(Get-ChildItem -LiteralPath $Dir -Recurse -File | Where-Object { @('.ps1', '.psm1') -contains $_.Extension.ToLowerInvariant() })) {
+                    $manifestRelative = $manifestFile.FullName.Substring($Dir.TrimEnd('\').Length + 1)
+                    if (@($Exclude) -contains $manifestRelative) { continue }
+                    $manifestFiles[$manifestRelative] = (Get-FileHash -LiteralPath $manifestFile.FullName -Algorithm SHA256).Hash
+                }
+                $manifestJson = [pscustomobject]@{ schemaVersion = 1; files = [pscustomobject]$manifestFiles } | ConvertTo-Json -Depth 4
+                [IO.File]::WriteAllText((Join-Path $Dir 'RUNTIME_MANIFEST.json'), $manifestJson, [Text.Encoding]::UTF8)
+            }
+            & $scanWriteManifest $scanRuntime @('BRAVO_DEADGUARD.ps1', 'BRAVO_DEADDYN.ps1', 'BRAVO_DEADIEX.ps1', 'BRAVO_DEADDOT.ps1', 'BRAVO_BYPASSWILD.ps1', 'BRAVO_BYPASSSPLIT.ps1')
             # --- #496 раунд 10 (B3): КОПІЇ справжніх тонких entrypoint-ів і доменних runtime-файлів поточного комплекту.
             # realruntime — канонічний стан; realnoflag — у runtime-файлах виклик loader-а без прапорця (:$false); realnoruntime — без modules\.
             $scanRealRoot = Join-Path $legacyScanFixtureRoot 'realruntime'
@@ -32025,6 +32052,27 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                     [IO.File]::WriteAllText($scanRealTarget, $scanRealVariant.Text, [Text.Encoding]::UTF8)
                 }
             }
+            foreach ($scanRealDir in @($scanRealRoot, $scanRealNoFlagRoot, $scanRealNoRuntimeRoot)) { & $scanWriteManifest $scanRealDir @() }
+            # Порушення цілісності при чинному маніфесті: один байт у entrypoint-і; файл поза маніфестом; без маніфесту;
+            # пошкоджений JSON; один байт у доменному runtime-файлі.
+            foreach ($scanVariantName in @('realtampered', 'realnotlisted', 'realnomanifest', 'realcorrupt', 'realruntimetampered')) {
+                Copy-Item -LiteralPath $scanRealRoot -Destination (Join-Path $legacyScanFixtureRoot $scanVariantName) -Recurse
+            }
+            $scanAppendByte = {
+                param($FilePath)
+                $appendStream = [IO.File]::Open($FilePath, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+                try { $appendStream.WriteByte(32) } finally { $appendStream.Dispose() }
+            }
+            $scanTamperedRoot = Join-Path $legacyScanFixtureRoot 'realtampered'
+            $scanNotListedRoot = Join-Path $legacyScanFixtureRoot 'realnotlisted'
+            $scanNoManifestRoot = Join-Path $legacyScanFixtureRoot 'realnomanifest'
+            $scanCorruptRoot = Join-Path $legacyScanFixtureRoot 'realcorrupt'
+            $scanRuntimeTamperedRoot = Join-Path $legacyScanFixtureRoot 'realruntimetampered'
+            & $scanAppendByte (Join-Path $scanTamperedRoot 'BRAVO_ARCHIV.ps1')
+            & $scanWriteManifest $scanNotListedRoot @('BRAVO_ARCHIV.ps1')
+            Remove-Item -LiteralPath (Join-Path $scanNoManifestRoot 'RUNTIME_MANIFEST.json') -Force
+            [IO.File]::WriteAllText((Join-Path $scanCorruptRoot 'RUNTIME_MANIFEST.json'), '{ "schemaVersion": 1, "files": { not json', [Text.Encoding]::UTF8)
+            & $scanAppendByte (Join-Path $scanRuntimeTamperedRoot 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1')
             $scanLegacy = Join-Path $scanCfg 'BRAVO.config'
             $scanLocal = Join-Path $scanCfg 'BRAVO.local.config'
             $scanText = Join-Path $scanCfg 'site.txt'
@@ -32049,6 +32097,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 $scanAclDir = Join-Path $scanAclBase $scanAclName
                 [void][IO.Directory]::CreateDirectory($scanAclDir)
                 [IO.File]::WriteAllText((Join-Path $scanAclDir 'BRAVO_ARCHIV.ps1'), $scanScripts['BRAVO_ARCHIV.ps1'], [Text.Encoding]::UTF8)
+                & $scanWriteManifest $scanAclDir @()
             }
             & $scanAddAclRule (Join-Path $scanAclBase 'readonly') 'ReadAndExecute' 'ContainerInherit,ObjectInherit'
             & $scanAddAclRule (Join-Path $scanAclBase 'write') 'Write' 'ContainerInherit,ObjectInherit'
@@ -32334,7 +32383,25 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T181_CmdWrapperEnvPayloadUnknown'; Expect = 'Unknown'; Command = 'cmd.exe'; Arguments = '/c %BRAVO_CMD%'; Wd = '' },
                 @{ Name = 'T182_OtherEnvCommandEnvPayloadUnknown'; Expect = 'Unknown'; Command = '%BRAVO_LAUNCHER%'; Arguments = '-NoProfile -Command %BRAVO_PAYLOAD%'; Wd = '' },
                 @{ Name = 'T183_OtherLiteralStableEnvSkippedControl'; Expect = '<none>'; Command = 'C:\Tools\runner.exe'; Arguments = '-NoProfile -File %SystemRoot%\Tools\backup.ps1'; Wd = '' },
-                @{ Name = 'T184_CmdStableEnvNoBravoSkippedControl'; Expect = '<none>'; Command = 'cmd.exe'; Arguments = '/c echo %SystemRoot%'; Wd = '' }
+                @{ Name = 'T184_CmdStableEnvNoBravoSkippedControl'; Expect = '<none>'; Command = 'cmd.exe'; Arguments = '/c echo %SystemRoot%'; Wd = '' },
+                # #496 (раунд 13) F1 / рішення власника: guarded виклик лише в мертвому коді, ефективний виклик динамічний; скрипт поза маніфестом -> Unknown (не NoConfigPath).
+                @{ Name = 'T185_DeadGuardedCallGetCommandDynamic'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_DEADGUARD.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T186_DeadGuardedCallVariableNameDynamic'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_DEADDYN.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T187_DeadGuardedCallInvokeExpression'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_DEADIEX.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T188_DeadGuardedCallDotSourceDynamic'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_DEADDOT.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T189_StaticGuardedWithLocalScriptBlockControl'; Expect = 'NoConfigPath'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_SBVAR.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                # #496 (раунд 13) F2: пробіл на краях значення в лапках не обрізається.
+                @{ Name = 'T190_ConfigPathLeadingSpaceUnknown'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ $scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T191_ConfigPathTrailingSpaceUnknown'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy $scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T192_FileTargetLeadingSpaceUnknown'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ $scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T193_QuotedConfigPathNoSurroundingSpaceControl'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                # #496 (раунд 13) F3: значення SupportsShouldProcess.
+                @{ Name = 'T194_SupportsShouldProcessFalseWhatIfNotModelled'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_SPFALSE.ps1')$scanQ -WhatIf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T195_SupportsShouldProcessTrueWhatIfControl'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_SPTRUE.ps1')$scanQ -WhatIf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T196_SupportsShouldProcessNonBooleanLiteralUnknown'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_SPEXPR.ps1')$scanQ -WhatIf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                # #496 (рішення власника): обходи provenance-аналізу не сертифікуються — скрипт не є незміненим канонічним entrypoint-ом.
+                @{ Name = 'T197_BypassGetCommandWildcardNotCanonical'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_BYPASSWILD.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T198_BypassSplitPathLeafNotCanonical'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_BYPASSSPLIT.ps1')$scanQ -NoPause"; Wd = $scanRuntime }
             )
 
 
@@ -32356,7 +32423,12 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 (& $scanRealCase 'R08_RestoreVerifyDirectLoaderCall' $scanRealRoot 'BRAVO_RESTORE_TEST.ps1' '-NoPause -NotifyOnSuccess' 'NoConfigPath'),
                 (& $scanRealCase 'R09_DataRestoreEntrypoint' $scanRealRoot 'BRAVO_DATA_RESTORE.ps1' '-NoPause' 'NoConfigPath'),
                 (& $scanRealCase 'R10_DomainRuntimeLoaderCallWithoutFlag' $scanRealNoFlagRoot 'BRAVO_ARCHIV.ps1' '-NoPause' 'Unknown'),
-                (& $scanRealCase 'R11_DomainRuntimeFileMissing' $scanRealNoRuntimeRoot 'BRAVO_ARCHIV.ps1' '-NoPause' 'Unknown')
+                (& $scanRealCase 'R11_DomainRuntimeFileMissing' $scanRealNoRuntimeRoot 'BRAVO_ARCHIV.ps1' '-NoPause' 'Unknown'),
+                (& $scanRealCase 'R12_EntrypointOneByteChanged' $scanTamperedRoot 'BRAVO_ARCHIV.ps1' '-NoPause' 'Unknown'),
+                (& $scanRealCase 'R13_EntrypointNotInManifest' $scanNotListedRoot 'BRAVO_ARCHIV.ps1' '-NoPause' 'Unknown'),
+                (& $scanRealCase 'R14_ManifestMissing' $scanNoManifestRoot 'BRAVO_ARCHIV.ps1' '-NoPause' 'Unknown'),
+                (& $scanRealCase 'R15_ManifestCorruptJson' $scanCorruptRoot 'BRAVO_ARCHIV.ps1' '-NoPause' 'Unknown'),
+                (& $scanRealCase 'R16_DomainRuntimeHashMismatch' $scanRuntimeTamperedRoot 'BRAVO_ARCHIV.ps1' '-NoPause' 'Unknown')
             )
 
             $scanBefore = @(Get-ChildItem -LiteralPath $legacyScanFixtureRoot -Recurse -Force |
@@ -32738,9 +32810,10 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 $scanCutoverMisses = @($scanResult.Real | Where-Object { $_.Actual -ne $_.Expect } |
                         ForEach-Object { "$($_.Name): очікується $($_.Expect), отримано $($_.Actual) [$($_.Detail)]" })
                 Test-BRAVOCondition `
-                    -Condition (@($scanResult.Real).Count -eq 11 -and $scanCutoverMisses.Count -eq 0) `
+                    -Condition (@($scanResult.Real).Count -eq 16 -and $scanCutoverMisses.Count -eq 0 -and
+                        @($scanResult.Real | Where-Object { $_.Name -match '^R1[2-6]_' -and $_.Detail -notlike '*RUNTIME_MANIFEST.json*' }).Count -eq 0) `
                     -Name 'TaskConfigPath/RealEntrypointCopiesCertifiedOnlyWithProvenLoaderCall' `
-                    -Failure ('#496 B3: копії справжніх entrypoint-ів з канонічними аргументами інсталятора (Archive/Maintenance/Health/DataRestore через доменний runtime, RestoreTest — прямий виклик) дають NoConfigPath; runtime без прапорця чи без файла — Unknown. ' + ($scanCutoverMisses -join '; '))
+                    -Failure ('#496 B3: копії справжніх entrypoint-ів з канонічними аргументами інсталятора (Archive/Maintenance/Health/DataRestore через доменний runtime, RestoreTest — прямий виклик) і чинним RUNTIME_MANIFEST.json дають NoConfigPath; runtime без прапорця чи без файла, змінений на 1 байт entrypoint/runtime, файл поза маніфестом, відсутній чи пошкоджений маніфест — Unknown з причиною про RUNTIME_MANIFEST.json. ' + ($scanCutoverMisses -join '; '))
                 $scanStaleFindings = @(@('T124_SameDirStaleLoaderWithoutFlag', 'T125_SameDirNoLoaderCallAtAll', 'T126_SameDirLoaderFlagExplicitFalse') | ForEach-Object { & $scanFindingOf $_ })
                 Test-BRAVOCondition `
                     -Condition ($scanStaleFindings.Count -eq 3 -and

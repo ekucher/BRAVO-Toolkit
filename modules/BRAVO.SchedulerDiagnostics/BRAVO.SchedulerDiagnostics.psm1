@@ -293,7 +293,9 @@ function Resolve-BRAVOTaskActionPath {
     }
 
     try {
-        $expanded = & $expand $Path.Trim()
+        # #496 F2: значення не обрізається — пробіл на краях у лапках PowerShell зберігає, обрізання дало б інший шлях.
+        if ($Path -ne $Path.Trim()) { return (& $failure 'шлях має пробіли на початку чи в кінці значення — вони є частиною значення в PowerShell, тож діагностика не може довести, який шлях буде використано') }
+        $expanded = & $expand $Path
         if (@($expanded.Unsupported).Count -gt 0) { return (& $failure (& $unsupportedReason $expanded.UnsupportedPositions)) }
         $text = $expanded.Text
         $remoteReason = 'шлях не є локальним шляхом із літерою диска (мережевий/UNC/пристрій) — не перевірявся'
@@ -457,7 +459,14 @@ function Get-BRAVOScriptDeclaredParameter {
                 if ($attribute.TypeName.Name -ne 'CmdletBinding') { continue }
                 $advanced = $true
                 foreach ($namedArgument in @($attribute.NamedArguments)) {
-                    if ($namedArgument.ArgumentName -eq 'SupportsShouldProcess') { $supportsShouldProcess = $true }
+                    if ($namedArgument.ArgumentName -eq 'SupportsShouldProcess') {
+                        # #496 F3: голий атрибут чи літерал $true — підтримується; літерал $false — ні;
+                        # будь-яке інше значення не моделюється (fail closed: модель параметрів відкидається).
+                        if ($namedArgument.ExpressionOmitted) { $supportsShouldProcess = $true }
+                        elseif ($namedArgument.Argument.Extent.Text -match '^\$true$') { $supportsShouldProcess = $true }
+                        elseif ($namedArgument.Argument.Extent.Text -match '^\$false$') { $supportsShouldProcess = $false }
+                        else { return $unknown }
+                    }
                     if ($namedArgument.ArgumentName -eq 'DefaultParameterSetName') { $ambiguous = $true; $hasParameterSets = $true }
                     if ($namedArgument.ArgumentName -eq 'PositionalBinding' -and
                         $namedArgument.Argument.Extent.Text -match '^\$false$') { $positionalBinding = $false }
@@ -1296,11 +1305,76 @@ function Get-BRAVOEntrypointRuntimeDelegation {
     }
 }
 
+function Test-BRAVOCanonicalRuntimeFile {
+    # #496 (рішення власника): позитивний вердикт NoConfigPath дозволений лише для НЕЗМІНЕНОГО канонічного entrypoint-а:
+    # SHA-256 кожного файла, на який спирається доказ (цільовий скрипт і, для тонкого entrypoint-а, його доменний
+    # runtime-файл), має дорівнювати запису RUNTIME_MANIFEST.json каталогу поточного runtime (TrustedRuntimeRoot).
+    # Ключі маніфесту — відносні шляхи з '\'; шлях порівнюється без урахування регістру, хеш — точно. Лише читання,
+    # без мережі; відсутній/нечитабельний/пошкоджений маніфест, файл поза маніфестом, розбіжність хешу чи будь-яка
+    # помилка вводу-виводу = не канонічний (fail closed). Значення (шляхи, хеші) у причині не виводяться.
+    # Маніфест і хеш читаються тут напряму (SHA-256 через .NET, як Get-BRAVORuntimeFileHash у BRAVO_RUNTIME_GUARD.ps1),
+    # а не через guard: guard — кореневий pre-trust скрипт, який dot-source-ять entrypoint-и, тож модуль (нижчий шар)
+    # не може його підключати; Test-BRAVORuntimeManifestIntegrity перевіряє весь комплект, а тут потрібен вердикт
+    # про окремі файли. Єдина канонічна політика цілісності лишається в guard; це її read-only відображення.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot,
+        [string[]]$RelativePath
+    )
+
+    $verdict = {
+        param($Canonical, $Reason)
+        [pscustomobject]@{ Canonical = [bool]$Canonical; Reason = $Reason }
+    }
+    $unverified = 'не вдалося безпечно прочитати RUNTIME_MANIFEST.json або обчислити хеш файла'
+    if ([string]::IsNullOrWhiteSpace($TrustedRuntimeRoot) -or @($RelativePath).Count -eq 0) {
+        return (& $verdict $false 'довірений каталог runtime або перелік файлів для перевірки цілісності не передано')
+    }
+    $sha256 = $null
+    try {
+        $manifestPath = Join-Path -Path $TrustedRuntimeRoot -ChildPath 'RUNTIME_MANIFEST.json'
+        if (-not (Test-BRAVOTaskLocalPathSafe -Path $manifestPath -TrustedRoot $TrustedRuntimeRoot).Safe) { return (& $verdict $false $unverified) }
+        if (-not [IO.File]::Exists($manifestPath)) { return (& $verdict $false 'RUNTIME_MANIFEST.json відсутній у каталозі поточного runtime') }
+        $parsed = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ($null -eq $parsed -or $null -eq $parsed.PSObject.Properties['files'] -or $null -eq $parsed.files) {
+            return (& $verdict $false 'RUNTIME_MANIFEST.json не містить розділу files')
+        }
+        $expected = @{}
+        foreach ($property in $parsed.files.PSObject.Properties) {
+            $key = ([string]$property.Name).Replace('/', '\')
+            if ($expected.ContainsKey($key)) { return (& $verdict $false 'RUNTIME_MANIFEST.json містить дубльований запис') }
+            $expected[$key] = ([string]$property.Value).Trim()
+        }
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        foreach ($relative in @($RelativePath)) {
+            if (-not $expected.ContainsKey($relative)) {
+                return (& $verdict $false 'файл, на який спирається доказ, не перелічений у RUNTIME_MANIFEST.json')
+            }
+            $fullPath = Join-Path -Path $TrustedRuntimeRoot -ChildPath $relative
+            if (-not (Test-BRAVOTaskLocalPathSafe -Path $fullPath -TrustedRoot $TrustedRuntimeRoot).Safe) { return (& $verdict $false $unverified) }
+            $stream = [IO.File]::Open($fullPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+                $actual = ([BitConverter]::ToString($sha256.ComputeHash($stream)) -replace '-', '')
+            } finally {
+                $stream.Dispose()
+            }
+            if (-not [string]::Equals($expected[$relative], $actual, [StringComparison]::OrdinalIgnoreCase)) {
+                return (& $verdict $false 'вміст файла, на який спирається доказ, не збігається з RUNTIME_MANIFEST.json (файл змінено або не з цього комплекту)')
+            }
+        }
+    } catch {
+        return (& $verdict $false $unverified)
+    } finally {
+        if ($null -ne $sha256) { $sha256.Dispose() }
+    }
+    return (& $verdict $true $null)
+}
+
 function Get-BRAVOScriptLoaderCallEvidence {
     # #496 B3: AST-докази з тексту скрипта (лише розбір, файл не виконується; SEC-001: лише всередині
     # TrustedRuntimeRoot, до і після розбору). Кожен виклик Import-BravoConfiguration класифікується за ТИМ САМИМ
     # правилом, що й канонічний гейт (ci\BRAVOConfigV2CutoverGates.ps1): -DisallowLegacyPrimaryAutoDetect має бути
-    # прив'язаний явно й не як :$false / :0; splat без явного прапорця = не доведено.
+    # прив'язаний явно й не як :$false / :0; splat без явного прапорця = не доведено. Це захист у глибину:
+    # вирішальна умова — збіг хешу з RUNTIME_MANIFEST.json (Test-BRAVOCanonicalRuntimeFile), AST не аналізує досяжність.
     param(
         [AllowNull()][AllowEmptyString()][string]$ScriptPath,
         [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot
@@ -1356,12 +1430,15 @@ function Get-BRAVOScriptLoaderCallEvidence {
 }
 
 function Test-BRAVOScriptDisallowsLegacyAutoDetect {
-    # #496 B3: NoConfigPath (PASS «legacy BRAVO.config не виконується») можна видати лише для скрипта, у тексті якого
-    # доведено, що завантаження конфігурації не виконує auto-derived BRAVO.config:
-    #  (а) скрипт сам викликає Import-BravoConfiguration, і КОЖЕН виклик прив'язує -DisallowLegacyPrimaryAutoDetect; або
-    #  (б) це відомий тонкий entrypoint (Get-BRAVOEntrypointRuntimeDelegation), що викликає Invoke-BRAVO<Domain>Entrypoint,
-    #      а його доменний runtime-файл поруч (modules\...) викликає loader так само (а).
-    # Усе інше (застарілий/довільний BRAVO_*.ps1 у тому ж каталозі, виклик без прапорця, нечитабельний файл) — не доведено.
+    # #496 (рішення власника): NoConfigPath (PASS «legacy BRAVO.config не виконується») лише для НЕЗМІНЕНОГО канонічного
+    # entrypoint-а. Умови (усі):
+    #  (1) цільовий скрипт (файл у TrustedRuntimeRoot; викликач перевіряє, що його каталог = TrustedRuntimeRoot) має
+    #      SHA-256 із RUNTIME_MANIFEST.json цього каталогу — будь-який інший скрипт (змінений, невідомий, поза
+    #      маніфестом) не сертифікується, що закриває клас обходів AST-аналізу;
+    #  (2) захист у глибину (AST): скрипт сам викликає Import-BravoConfiguration і КОЖЕН виклик прив'язує
+    #      -DisallowLegacyPrimaryAutoDetect; або це відомий тонкий entrypoint (Get-BRAVOEntrypointRuntimeDelegation),
+    #      що викликає Invoke-BRAVO<Domain>Entrypoint, а його доменний runtime-файл (теж із збігом хешу) викликає
+    #      loader так само.
     # Межа: статичний AST не доводить, що виклик досяжний у runtime і що модуль, який імпортує entrypoint, — той самий файл.
     param(
         [AllowNull()][AllowEmptyString()][string]$ScriptPath,
@@ -1371,6 +1448,11 @@ function Test-BRAVOScriptDisallowsLegacyAutoDetect {
     $verdict = {
         param($Proven, $Reason)
         [pscustomobject]@{ Proven = [bool]$Proven; Reason = $Reason }
+    }
+    $entryName = [IO.Path]::GetFileName($ScriptPath)
+    $integrity = Test-BRAVOCanonicalRuntimeFile -TrustedRuntimeRoot $TrustedRuntimeRoot -RelativePath @($entryName)
+    if (-not [bool]$integrity.Canonical) {
+        return (& $verdict $false ('цільовий скрипт не підтверджено як незмінений канонічний entrypoint комплекту: ' + [string]$integrity.Reason + ' — виклик loader-а з -DisallowLegacyPrimaryAutoDetect не підтверджено'))
     }
     $own = Get-BRAVOScriptLoaderCallEvidence -ScriptPath $ScriptPath -TrustedRuntimeRoot $TrustedRuntimeRoot
     if (-not [bool]$own.Read) {
@@ -1383,7 +1465,6 @@ function Test-BRAVOScriptDisallowsLegacyAutoDetect {
         return (& $verdict $true $null)
     }
     $delegation = Get-BRAVOEntrypointRuntimeDelegation
-    $entryName = [IO.Path]::GetFileName($ScriptPath)
     if (-not $delegation.ContainsKey($entryName)) {
         return (& $verdict $false 'цільовий скрипт не містить виклику Import-BravoConfiguration і не є відомим тонким entrypoint-ом, що делегує завантаження конфігурації доменному runtime — cutover не підтверджено')
     }
@@ -1391,6 +1472,10 @@ function Test-BRAVOScriptDisallowsLegacyAutoDetect {
     $callsDomain = @($own.CommandName | Where-Object { [string]::Equals([string]$_, [string]$entry.Command, [StringComparison]::OrdinalIgnoreCase) })
     if ($callsDomain.Count -eq 0) {
         return (& $verdict $false "цільовий скрипт не викликає $($entry.Command) — делегування доменному runtime не підтверджено")
+    }
+    $runtimeIntegrity = Test-BRAVOCanonicalRuntimeFile -TrustedRuntimeRoot $TrustedRuntimeRoot -RelativePath @([string]$entry.Runtime)
+    if (-not [bool]$runtimeIntegrity.Canonical) {
+        return (& $verdict $false ('доменний runtime-файл entrypoint-а не підтверджено як незмінений канонічний: ' + [string]$runtimeIntegrity.Reason + ' — cutover не підтверджено'))
     }
     $runtimePath = Join-Path -Path (Split-Path -Path $ScriptPath -Parent) -ChildPath ([string]$entry.Runtime)
     $runtimeEvidence = Get-BRAVOScriptLoaderCallEvidence -ScriptPath $runtimePath -TrustedRuntimeRoot $TrustedRuntimeRoot
@@ -1521,8 +1606,8 @@ function Get-BRAVOTaskConfigPathFinding {
                             if (-not [string]::Equals($trustedFull, $scriptParent, [StringComparison]::OrdinalIgnoreCase)) {
                                 $trustReason = "ціль '$($scriptResolution.Path)' лежить в іншій інсталяції, ніж поточний runtime '$trustedFull' — cutover (без автозавантаження legacy BRAVO.config) цього runtime не перевірено"
                             } else {
-                                # #496 B3: той самий каталог — ще не доказ: застарілий/довільний BRAVO_*.ps1 міг лишитися поруч.
-                                # Cutover доводиться текстом самої цілі (виклик loader-а з -DisallowLegacyPrimaryAutoDetect).
+                                # #496: той самий каталог — ще не доказ: застарілий/довільний BRAVO_*.ps1 міг лишитися поруч.
+                                # Позитивний вердикт — лише для незміненого канонічного entrypoint-а (хеш = RUNTIME_MANIFEST.json) з доведеним викликом loader-а.
                                 $cutover = Test-BRAVOScriptDisallowsLegacyAutoDetect -ScriptPath ([string]$scriptResolution.Path) -TrustedRuntimeRoot $TrustedRuntimeRoot
                                 if (-not [bool]$cutover.Proven) { $trustReason = [string]$cutover.Reason }
                             }
