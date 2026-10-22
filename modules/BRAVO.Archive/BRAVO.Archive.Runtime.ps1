@@ -684,12 +684,16 @@ function Resolve-BRAVOSyncBazaExitCode {
         [bool]$SyncSucceeded,
         [int]$EmptySourceWarningCount,
         # #480: невалідна SFTP-конфігурація (зокрема sftpHostKey) -> 30, раніше за SftpFailed.
-        [bool]$InvalidConfiguration = $false
+        [bool]$InvalidConfiguration = $false,
+        # #501: об'єкти, що з'явилися під час успішного legacy-циклу, —
+        # попередження (10), як і порожнє джерело; реальний збій лишається 50.
+        [int]$NewAfterCutoffCount = 0
     )
 
     if ($InvalidConfiguration) { return (Resolve-BRAVOExitCode -InvalidConfiguration) }
     if (-not $SyncSucceeded) { return (Resolve-BRAVOExitCode -SftpFailed) }
     if ($EmptySourceWarningCount -gt 0) { return (Resolve-BRAVOExitCode -HasWarnings) }
+    if ($NewAfterCutoffCount -gt 0) { return (Resolve-BRAVOExitCode -HasWarnings) }
     return 0
 }
 
@@ -4832,13 +4836,25 @@ function Write-BAZASFTPComparisonAudit {
         [ValidateSet("Before", "After")]
         [string]$Stage,
         [string]$ComponentName = "BAZA",
-        [object[]]$IncompatibleIssues = @()
+        [object[]]$IncompatibleIssues = @(),
+        # #501: результат Get-BAZASynchronizationOutcome зі знімком циклу.
+        # Лише для After: об'єкти, що з'явилися під час синхронізації,
+        # пишуться як WARNING, а не ERROR.
+        [object]$Outcome = $null
     )
 
     $stageText = if ($Stage -eq "Before") {
         "ДО СИНХРОНIЗАЦIЇ"
     } else {
         "ПIСЛЯ СИНХРОНIЗАЦIЇ"
+    }
+    $cycleClassification = $null
+    if ($Stage -eq "After" -and
+        $null -ne $Outcome -and
+        $null -ne $Outcome.PSObject.Properties['CycleClassification'] -and
+        $null -ne $Outcome.CycleClassification -and
+        [bool]$Outcome.CycleClassification.SnapshotAvailable) {
+        $cycleClassification = $Outcome.CycleClassification
     }
 
     if (-not $Comparison.Success) {
@@ -4856,6 +4872,40 @@ function Write-BAZASFTPComparisonAudit {
     $updateCount = @($pendingFiles | Where-Object { $_.Action -eq "UploadUpdate" }).Count
     if ($pendingFiles.Count -eq 0) {
         Write-BRAVOLog -Component 'SFTP' -Message "Аудит $ComponentName ${stageText}: усi локальнi файли синхронiзованi" -Level "SUCCESS"
+        return
+    }
+
+    if ($null -ne $cycleClassification) {
+        $realMissingFiles = @($cycleClassification.RealMissing)
+        $changedDuringSyncFiles = @($cycleClassification.ChangedDuringSync)
+        $newAfterCutoffFiles = @($cycleClassification.NewAfterCutoff)
+        $summaryLevel = if (($realMissingFiles.Count + $changedDuringSyncFiles.Count) -gt 0) {
+            "ERROR"
+        } else {
+            "WARNING"
+        }
+        Write-BRAVOLog -Component 'SFTP' -Message ("Аудит $ComponentName ${stageText}: очiкують передачi: $($pendingFiles.Count) (вiдсутнi у хмарi: $missingCount; потребують оновлення: $updateCount; несумісні імена: $($incompatiblePendingFiles.Count)); " +
+            "за знімком циклу: не передано: $($realMissingFiles.Count); змінено під час синхронізації: $($changedDuringSyncFiles.Count); " +
+            "з'явилися під час синхронізації: $($newAfterCutoffFiles.Count)") -Level $summaryLevel
+        $classifiedGroups = @(
+            [pscustomobject]@{ Files = $realMissingFiles; Level = "ERROR"; Tag = "" },
+            [pscustomobject]@{ Files = $changedDuringSyncFiles; Level = "ERROR"; Tag = " [ЗМІНЕНО ПІД ЧАС СИНХРОНІЗАЦІЇ]" },
+            [pscustomobject]@{ Files = $newAfterCutoffFiles; Level = "WARNING"; Tag = " [З'ЯВИВСЯ ПІД ЧАС СИНХРОНІЗАЦІЇ]" }
+        )
+        foreach ($classifiedGroup in $classifiedGroups) {
+            foreach ($pendingFile in @($classifiedGroup.Files)) {
+                $itemType = if ($pendingFile.IsDirectory) { "КАТАЛОГ" } else { "ФАЙЛ" }
+                $sizeText = if ($null -ne $pendingFile.SizeBytes) {
+                    "; байт: $($pendingFile.SizeBytes)"
+                } else {
+                    ""
+                }
+                Write-BRAVOLog -Component 'SFTP' -Message "AUDIT $ComponentName $stageText [$itemType] [$($pendingFile.Reason)]$($classifiedGroup.Tag) $($pendingFile.Path)$sizeText" -Level $classifiedGroup.Level -NoConsole
+            }
+        }
+        foreach ($pendingFile in $incompatiblePendingFiles) {
+            Write-BRAVOLog -Component 'SFTP' -Message "AUDIT $ComponentName $stageText [ПРОПУЩЕНО: НЕСУМІСНЕ ІМ'Я] $($pendingFile.Path)" -Level "WARNING" -NoConsole
+        }
         return
     }
 
@@ -4944,12 +4994,146 @@ function Split-BAZAPendingFilesByCompatibility {
     }
 }
 
+# #501: залишок пост-аудиту legacy-синхронізації класифікується за знімком
+# локального дерева, зробленим безпосередньо перед стартом WinSCP
+# (Get-BRAVOBazaLocalSnapshot), а не за LastWriteTime: новий файл може мати
+# давній час, а старий — щойно змінений.
+#   RealMissing       — об'єкт був у знімку, не змінився, але не переданий;
+#   ChangedDuringSync — об'єкт був у знімку, але його розмір/час змінилися,
+#                       його вже немає або шлях змінив тип (файл <-> каталог)
+#                       (окремий mutation-клас, не маскується попередженням);
+#   NewAfterCutoff    — UploadNew-об'єкт, якого не було у знімку: з'явився
+#                       під час циклу й буде переданий наступним запуском.
+# Усе, що не зіставляється зі знімком однозначно (знімок недоступний,
+# невідомий/відносний шлях, шлях поза коренем, UploadUpdate для об'єкта поза
+# знімком), — RealMissing: fail-closed, як до #501. Час порівнюється точно
+# ('o', до тіку), без довільного запасу.
+function Get-BAZAPendingFileCycleClassification {
+    param(
+        [object[]]$PendingFiles = @(),
+        [object]$LocalSnapshot,
+        [string]$LocalRoot
+    )
+
+    $realMissing = New-Object System.Collections.Generic.List[object]
+    $changedDuringSync = New-Object System.Collections.Generic.List[object]
+    $newAfterCutoff = New-Object System.Collections.Generic.List[object]
+
+    $snapshotAvailable = (
+        $null -ne $LocalSnapshot -and
+        [bool]$LocalSnapshot.Success -and
+        $null -ne $LocalSnapshot.PSObject.Properties['Directories'] -and
+        $null -ne $LocalSnapshot.Directories -and
+        -not [string]::IsNullOrWhiteSpace($LocalRoot)
+    )
+    $normalizedRoot = $null
+    if ($snapshotAvailable) {
+        try {
+            $normalizedRoot = [IO.Path]::GetFullPath($LocalRoot).TrimEnd('\', '/')
+        } catch {
+            $snapshotAvailable = $false
+        }
+    }
+
+    foreach ($pendingFile in @($PendingFiles)) {
+        if ($null -eq $pendingFile) {
+            continue
+        }
+        if (-not $snapshotAvailable) {
+            $realMissing.Add($pendingFile)
+            continue
+        }
+
+        $actionProperty = $pendingFile.PSObject.Properties['Action']
+        $action = if ($null -ne $actionProperty) { [string]$actionProperty.Value } else { '' }
+        $isDirectoryProperty = $pendingFile.PSObject.Properties['IsDirectory']
+        $isDirectory = $null -ne $isDirectoryProperty -and [bool]$isDirectoryProperty.Value
+        $pathProperty = $pendingFile.PSObject.Properties['Path']
+        $pendingPath = if ($null -ne $pathProperty) { [string]$pathProperty.Value } else { '' }
+
+        $fullPath = $null
+        $relativePath = $null
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($pendingPath) -and [IO.Path]::IsPathRooted($pendingPath)) {
+                $fullPath = [IO.Path]::GetFullPath($pendingPath)
+                # GetFullPath нормалізує не лише роздільники: обрізає кінцеві
+                # '.'/' ' імен і згортає '..'. Такий шлях уже не той об'єкт, що
+                # у знімку, — зіставляти його не можна (fail-closed).
+                if (-not [string]::Equals($fullPath, $pendingPath.Replace('/', '\'), [StringComparison]::OrdinalIgnoreCase)) {
+                    $fullPath = $null
+                } elseif ($fullPath.StartsWith($normalizedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    $relativePath = $fullPath.Substring($normalizedRoot.Length + 1).TrimEnd('\', '/')
+                }
+            }
+        } catch {
+            $relativePath = $null
+        }
+        if ([string]::IsNullOrEmpty($relativePath)) {
+            $realMissing.Add($pendingFile)
+            continue
+        }
+
+        # Шлях, що був у знімку об'єктом іншого типу (каталог замінено файлом
+        # або навпаки), — заміна під час циклу, а не новий об'єкт.
+        if (($isDirectory -and $LocalSnapshot.Entries.ContainsKey($relativePath)) -or
+            (-not $isDirectory -and $LocalSnapshot.Directories.Contains($relativePath))) {
+            $changedDuringSync.Add($pendingFile)
+            continue
+        }
+
+        # Новим може бути лише об'єкт, що зараз існує саме за цим шляхом:
+        # інакше шлях від WinSCP не відповідає дереву, і зіставлення ненадійне.
+        if ($isDirectory) {
+            if ($action -eq 'UploadNew' -and
+                [IO.Directory]::Exists($fullPath) -and
+                -not $LocalSnapshot.Directories.Contains($relativePath)) {
+                $newAfterCutoff.Add($pendingFile)
+            } else {
+                $realMissing.Add($pendingFile)
+            }
+            continue
+        }
+
+        if ($LocalSnapshot.Entries.ContainsKey($relativePath)) {
+            $snapshotEntry = $LocalSnapshot.Entries[$relativePath]
+            $currentFile = New-Object IO.FileInfo($fullPath)
+            if (-not $currentFile.Exists -or
+                [int64]$currentFile.Length -ne [int64]$snapshotEntry.Size -or
+                $currentFile.LastWriteTimeUtc.ToString('o') -ne [string]$snapshotEntry.LastWriteTimeUtc) {
+                $changedDuringSync.Add($pendingFile)
+            } else {
+                $realMissing.Add($pendingFile)
+            }
+            continue
+        }
+
+        if ($action -eq 'UploadNew' -and [IO.File]::Exists($fullPath)) {
+            $newAfterCutoff.Add($pendingFile)
+        } else {
+            $realMissing.Add($pendingFile)
+        }
+    }
+
+    return [pscustomobject]@{
+        SnapshotAvailable = $snapshotAvailable
+        RealMissing = @($realMissing.ToArray())
+        ChangedDuringSync = @($changedDuringSync.ToArray())
+        NewAfterCutoff = @($newAfterCutoff.ToArray())
+    }
+}
+
 function Get-BAZASynchronizationOutcome {
     param(
         [int]$WinSCPExitCode,
         [object]$ComparisonBefore,
         [object]$ComparisonAfter,
-        [object[]]$IncompatibleIssues = @()
+        [object[]]$IncompatibleIssues = @(),
+        # #501: знімок локального дерева перед стартом WinSCP. Без нього
+        # (або якщо знімок не вдався) увесь залишок — RealMissing, тобто
+        # поведінка до #501.
+        [object]$LocalSnapshot = $null,
+        [string]$LocalRoot = $null,
+        [string]$CycleId = $null
     )
 
     $verificationSucceeded = $null -ne $ComparisonAfter -and $ComparisonAfter.Success
@@ -4960,6 +5144,17 @@ function Get-BAZASynchronizationOutcome {
     } else {
         $null
     }
+    $cycleClassification = if ($verificationSucceeded) {
+        Get-BAZAPendingFileCycleClassification `
+            -PendingFiles @($afterSplit.Retryable) `
+            -LocalSnapshot $LocalSnapshot `
+            -LocalRoot $LocalRoot
+    } else {
+        $null
+    }
+    $realMissingCount = if ($null -ne $cycleClassification) { @($cycleClassification.RealMissing).Count } else { $null }
+    $changedDuringSyncCount = if ($null -ne $cycleClassification) { @($cycleClassification.ChangedDuringSync).Count } else { $null }
+    $newAfterCutoffCount = if ($null -ne $cycleClassification) { @($cycleClassification.NewAfterCutoff).Count } else { $null }
     $beforeSplit = if ($null -ne $ComparisonBefore -and $ComparisonBefore.Success) {
         Split-BAZAPendingFilesByCompatibility `
             -PendingFiles @($ComparisonBefore.PendingFiles) `
@@ -4987,8 +5182,10 @@ function Get-BAZASynchronizationOutcome {
     } else {
         $null
     }
+    # Об'єкти, що з'явилися під час циклу, не входили до аудиту ДО і не
+    # зменшують кількість переданих об'єктів знімка.
     $completedCount = if ($null -ne $beforeSplit -and $null -ne $afterSplit) {
-        [math]::Max(0, @($beforeSplit.Retryable).Count - @($afterSplit.Retryable).Count)
+        [math]::Max(0, @($beforeSplit.Retryable).Count - (@($afterSplit.Retryable).Count - [int]$newAfterCutoffCount))
     } else {
         $null
     }
@@ -5001,10 +5198,34 @@ function Get-BAZASynchronizationOutcome {
         RemainingCount = $remainingCount
         RetryableRemainingCount = $retryableRemainingCount
         IncompatibleRemainingCount = $incompatibleRemainingCount
+        SnapshotAvailable = ($null -ne $cycleClassification -and [bool]$cycleClassification.SnapshotAvailable)
+        CycleId = $CycleId
+        SyncStartUtc = if ($null -ne $LocalSnapshot -and $null -ne $LocalSnapshot.PSObject.Properties['SnapshotUtc']) {
+            ([datetime]$LocalSnapshot.SnapshotUtc).ToUniversalTime().ToString('o')
+        } else {
+            $null
+        }
+        RealMissingCount = $realMissingCount
+        ChangedDuringSyncCount = $changedDuringSyncCount
+        NewAfterCutoffCount = $newAfterCutoffCount
+        CycleClassification = $cycleClassification
         IsComplete = (
             $WinSCPExitCode -eq 0 -and
             $verificationSucceeded -and
             $retryableRemainingCount -eq 0
+        )
+        # #501: усе зі знімка передано, а залишок — лише об'єкти, що
+        # з'явилися під час циклу. Код WinSCP 0 обов'язковий: ненульовий код
+        # лишається помилкою незалежно від класифікації. IsPartial (сумісність)
+        # тоді теж true — викликач перевіряє цей прапорець раніше за IsPartial.
+        IsCompleteWithNewAfterCutoff = (
+            $WinSCPExitCode -eq 0 -and
+            $verificationSucceeded -and
+            $null -ne $cycleClassification -and
+            [bool]$cycleClassification.SnapshotAvailable -and
+            $newAfterCutoffCount -gt 0 -and
+            $realMissingCount -eq 0 -and
+            $changedDuringSyncCount -eq 0
         )
         IsDegraded = (
             $WinSCPExitCode -eq 0 -and
@@ -5731,6 +5952,24 @@ exit
             Write-BRAVOLog -Component 'SFTP' -Message (Get-BRAVOWinSCPBusyMessage -Availability $winSCPAvailability -Operation "синхронізація $ComponentName") -Level "ERROR"
             return $false
         }
+        # #501: знімок локального дерева — безпосередньо перед стартом WinSCP,
+        # окремо для кожного компонента. Пост-аудит класифікує залишок за ним:
+        # чого не було у знімку, те з'явилося під час циклу. Невдалий знімок
+        # не зупиняє синхронізацію, але вимикає класифікацію: увесь залишок
+        # лишається помилкою, як до #501.
+        $cycleId = New-BRAVOBazaCycleId
+        $cycleSnapshot = Get-BRAVOBazaLocalSnapshot `
+            -LocalDirectory $LocalDirectory `
+            -IncludeHiddenSystem `
+            -IncludeDirectories
+        if ($cycleSnapshot.Success) {
+            Write-BRAVOLog -Component 'SFTP' -Message (
+                "Знімок циклу ${ComponentName}: CycleId=$cycleId; SyncStartUtc=$(([datetime]$cycleSnapshot.SnapshotUtc).ToString('o')); " +
+                "файлів: $($cycleSnapshot.Entries.Count); каталогів: $($cycleSnapshot.Directories.Count)"
+            ) -Level "INFO"
+        } else {
+            Write-BRAVOLog -Component 'SFTP' -Message "Знімок циклу $ComponentName не створено ($($cycleSnapshot.Error)): об'єкти, що з'являться під час синхронізації, не відрізнятимуться від непереданих" -Level "WARNING"
+        }
         $outputCapture = Start-BRAVOProcessOutputCapture -Process $process
         $syncStarted = Get-Date
         $configuredSynchronizationTimeout = [int](
@@ -5812,18 +6051,21 @@ exit
             -RemotePath $remotePath `
             -RepositorySFTPUrl $RepositorySFTPUrl `
             -HostKey $HostKey
-        Write-BAZASFTPComparisonAudit `
-            -Comparison $comparisonAfter `
-            -Stage "After" `
-            -ComponentName $ComponentName `
-            -IncompatibleIssues $(if ($nameCompatibility.Success) { @($nameCompatibility.Issues) } else { @() })
-
         $syncOutcome = Get-BAZASynchronizationOutcome `
             -WinSCPExitCode $winSCPExitCode `
             -ComparisonBefore $comparisonBefore `
             -ComparisonAfter $comparisonAfter `
-            -IncompatibleIssues $(if ($nameCompatibility.Success) { @($nameCompatibility.Issues) } else { @() })
+            -IncompatibleIssues $(if ($nameCompatibility.Success) { @($nameCompatibility.Issues) } else { @() }) `
+            -LocalSnapshot $cycleSnapshot `
+            -LocalRoot $LocalDirectory `
+            -CycleId $cycleId
         $script:lastBAZASyncOutcome = $syncOutcome
+        Write-BAZASFTPComparisonAudit `
+            -Comparison $comparisonAfter `
+            -Stage "After" `
+            -ComponentName $ComponentName `
+            -IncompatibleIssues $(if ($nameCompatibility.Success) { @($nameCompatibility.Issues) } else { @() }) `
+            -Outcome $syncOutcome
 
         if (-not $syncOutcome.VerificationSucceeded) {
             Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося пiдтвердити результат синхронiзацiї $ComponentName повторним порiвнянням; результат вважається помилкою" -Level "ERROR"
@@ -5848,8 +6090,33 @@ exit
             return $true
         }
 
+        if ($syncOutcome.IsCompleteWithNewAfterCutoff) {
+            $newAfterCutoffPaths = @(
+                @($syncOutcome.CycleClassification.NewAfterCutoff) | ForEach-Object { [string]$_.Path }
+            )
+            $newAfterCutoffPreviewLimit = 20
+            $newAfterCutoffPreview = @($newAfterCutoffPaths | Select-Object -First $newAfterCutoffPreviewLimit) -join '; '
+            $newAfterCutoffRest = $newAfterCutoffPaths.Count - $newAfterCutoffPreviewLimit
+            $newAfterCutoffRestText = if ($newAfterCutoffRest -gt 0) {
+                "; ще $newAfterCutoffRest — див. рядки AUDIT цього циклу"
+            } else {
+                ""
+            }
+            Write-BRAVOLog -Component 'SFTP' -Message (
+                "Каталог ${ComponentName}: усі об'єкти знімка циклу $($syncOutcome.CycleId) синхронізовано з $remotePath; " +
+                "$($syncOutcome.NewAfterCutoffCount) об'єктів з'явилися після старту синхронізації ($($syncOutcome.SyncStartUtc)) " +
+                "і будуть передані наступним запуском: $newAfterCutoffPreview$newAfterCutoffRestText"
+            ) -Level "WARNING"
+            return $true
+        }
+
         if ($winSCPExitCode -eq 0 -and $syncOutcome.IsPartial) {
-            Write-BRAVOLog -Component 'SFTP' -Message "WinSCP повернув код 0, але синхронiзацiя $ComponentName часткова: залишилося об'єктiв: $($syncOutcome.RemainingCount)" -Level "ERROR"
+            $partialBreakdown = if ($syncOutcome.SnapshotAvailable) {
+                " (не передано зі знімка циклу: $($syncOutcome.RealMissingCount); змінено під час синхронізації: $($syncOutcome.ChangedDuringSyncCount); з'явилися під час синхронізації: $($syncOutcome.NewAfterCutoffCount))"
+            } else {
+                ""
+            }
+            Write-BRAVOLog -Component 'SFTP' -Message "WinSCP повернув код 0, але синхронiзацiя $ComponentName часткова: залишилося об'єктiв: $($syncOutcome.RemainingCount)$partialBreakdown" -Level "ERROR"
         }
         return $false
     } catch {
@@ -6067,6 +6334,9 @@ function Invoke-BRAVOBazaCanonicalSync {
         Completed = 0
         Remaining = 0
         IncompatibleNames = 0
+        # #501 (лише Legacy): об'єкти, що з'явилися під час успішного циклу
+        # і будуть передані наступним запуском — попередження, не помилка.
+        NewAfterCutoff = 0
         Error = $null
     }
 
@@ -6106,6 +6376,11 @@ function Invoke-BRAVOBazaCanonicalSync {
             $outcome.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
             $outcome.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
             $outcome.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
+            $lateOutcomeProperty = $script:lastBAZASyncOutcome.PSObject.Properties['IsCompleteWithNewAfterCutoff']
+            if ($outcome.Success -and $null -ne $lateOutcomeProperty -and [bool]$lateOutcomeProperty.Value) {
+                $outcome.NewAfterCutoff = [int]$script:lastBAZASyncOutcome.NewAfterCutoffCount
+                $outcome.Degraded = $true
+            }
         }
         if (-not $outcome.Success) { $outcome.Error = 'post-sync verification failed' }
     } else {
@@ -6124,6 +6399,11 @@ function Get-BRAVOManualSyncRunOutcomeLabel {
     $skippedProperty = $ManualSyncResult.PSObject.Properties['Skipped']
     if ($null -ne $skippedProperty -and [bool]$skippedProperty.Value) {
         return 'ПРОПУЩЕНО (інший процес синхронізує компонент)'
+    }
+    # #501: одне слово без пробілів — моніторинг читає "Результат: (\S+)".
+    $newAfterCutoffProperty = $ManualSyncResult.PSObject.Properties['NewAfterCutoffCount']
+    if ($null -ne $newAfterCutoffProperty -and [int]$newAfterCutoffProperty.Value -gt 0) {
+        return 'ПОПЕРЕДЖЕННЯ'
     }
     return 'УСПІШНО'
 }
@@ -6223,6 +6503,7 @@ function Invoke-ManualBAZASFTPSynchronization {
 
     $syncFailed = $sourceConfigurationFailed
     $anySyncSkipped = $false
+    $newAfterCutoffCount = 0
     $syncIndex = 0
     foreach ($syncTarget in $syncTargets) {
         $syncIndex++
@@ -6253,6 +6534,12 @@ function Invoke-ManualBAZASFTPSynchronization {
             $targetResult.Error = 'пропущено: інший процес синхронізує компонент (lock зайнято)'
             Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю $($syncTarget.Name) пропущено: інший процес зараз синхронізує компонент; наступний цикл BAZASync повторить" -Level "INFO"
         } elseif ($syncSuccess) {
+            $targetNewAfterCutoffProperty = $canonicalOutcome.PSObject.Properties['NewAfterCutoff']
+            $targetNewAfterCutoff = if ($null -ne $targetNewAfterCutoffProperty) { [int]$targetNewAfterCutoffProperty.Value } else { 0 }
+            $newAfterCutoffCount += $targetNewAfterCutoff
+            if ($targetNewAfterCutoff -gt 0) {
+                $targetResult.Error = "з'явилися під час синхронізації: $targetNewAfterCutoff (буде передано наступним запуском)"
+            }
             Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю $($syncTarget.Name) на SFTP завершено успiшно ($($canonicalOutcome.Mode): $($canonicalOutcome.Status))" -Level "SUCCESS"
         } else {
             $syncFailed = $true
@@ -6263,7 +6550,9 @@ function Invoke-ManualBAZASFTPSynchronization {
 
     # Skipped: хоча б один компонент SKIPPED_CONCURRENT — exit 0 (не збій), але
     # результат запуску НЕ "УСПІШНО": нічого не передано, хмарна копія не оновлена.
-    return [pscustomobject]@{ Success = (-not $syncFailed); Skipped = $anySyncSkipped; Results = $manualResults }
+    # NewAfterCutoffCount (#501): об'єкти, що з'явилися під час успішного
+    # legacy-циклу, — підсумок ПОПЕРЕДЖЕННЯ і код 10, не збій.
+    return [pscustomobject]@{ Success = (-not $syncFailed); Skipped = $anySyncSkipped; NewAfterCutoffCount = $newAfterCutoffCount; Results = $manualResults }
 }
 
 function Get-BRAVOArchiveFreeSpaceResult {
@@ -7337,7 +7626,7 @@ function Main {
         Write-Log "Тривалiсть: $($manualSyncDuration.ToString($durationFormat))" -NoTimestamp
         Write-Log "Лог-файл: $logFile" -NoTimestamp
         # -SyncBAZA — це суто SFTP-операція за визначенням.
-        $script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count -InvalidConfiguration ([bool]($manualSyncResult.PSObject.Properties['ConfigurationInvalid'] -and $manualSyncResult.ConfigurationInvalid))
+        $script:processExitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $manualSyncSuccess -EmptySourceWarningCount $syncBazaEmptySourceWarned.Count -InvalidConfiguration ([bool]($manualSyncResult.PSObject.Properties['ConfigurationInvalid'] -and $manualSyncResult.ConfigurationInvalid)) -NewAfterCutoffCount $(if ($manualSyncResult.PSObject.Properties['NewAfterCutoffCount']) { [int]$manualSyncResult.NewAfterCutoffCount } else { 0 })
         # #292: фінальна Operations-подія -SyncBAZA несе режим і статус
         # канонічного двигуна по кожному компоненту (MUTATION_VIOLATION,
         # REMOTE_CONFLICT, AUDIT_DRIFT, INCOMPATIBLE_NAME ...), а не лише код.
@@ -7351,6 +7640,7 @@ function Main {
                     status = [string]$manualOutcome.Status
                     success = [bool]$manualOutcome.Success
                     error = [string]$manualOutcome.Error
+                    newAfterCutoff = $(if ($manualOutcome.PSObject.Properties['NewAfterCutoff']) { [int]$manualOutcome.NewAfterCutoff } else { 0 })
                 }
             }
             $manualEventStatuses = @(
@@ -7401,7 +7691,7 @@ function Main {
         $manualSyncMetrics.Add('Попереджень', [string]$manualSyncStatistics.Warnings)
         $manualSyncMetrics.Add('Помилок', [string]$manualSyncStatistics.Errors)
         Write-BRAVOSummary `
-            -Result $(if ($manualSyncSuccess) { 'УСПІШНО' } else { 'ПОМИЛКА' }) `
+            -Result $(if (-not $manualSyncSuccess) { 'ПОМИЛКА' } elseif ($manualSyncResult.PSObject.Properties['NewAfterCutoffCount'] -and [int]$manualSyncResult.NewAfterCutoffCount -gt 0) { 'ПОПЕРЕДЖЕННЯ' } else { 'УСПІШНО' }) `
             -Duration $manualSyncDuration `
             -Metrics $manualSyncMetrics `
             -LogFile $script:logFile
@@ -9143,7 +9433,11 @@ function Main {
         } else {
             'OK'
         }
-        $transferStepDetails = if ([bool]$transferResult.Degraded) {
+        # Degraded без несумісних імен — лише legacy BAZA з об'єктами, що
+        # з'явилися під час синхронізації (#501).
+        $transferStepDetails = if ([bool]$transferResult.Degraded -and [int]$transferResult.IncompatibleNames -eq 0) {
+            "об'єкти знімка синхронізовано; нові під час синхронізації буде передано наступним запуском"
+        } elseif ([bool]$transferResult.Degraded) {
             "сумісні об'єкти синхронізовано; несумісних імен: $($transferResult.IncompatibleNames)"
         } else {
             [string]$transferResult.Error
@@ -9611,6 +9905,8 @@ function Main {
         if (-not [bool]$transferResult.Enabled) { continue }
         $transferValue = if (-not [bool]$transferResult.Success) {
             'ERROR'
+        } elseif ([bool]$transferResult.Degraded -and [int]$transferResult.IncompatibleNames -eq 0) {
+            "WARNING (нові під час синхронізації — наступним запуском)"
         } elseif ([bool]$transferResult.Degraded) {
             "WARNING (несумісних імен: $($transferResult.IncompatibleNames))"
         } else { 'OK' }

@@ -1861,3 +1861,513 @@ Test-BRAVOCondition -Condition (
     $archiveScriptText -match '(?s)Resolve-BRAVOSyncBazaExitCode -SyncSucceeded \$manualSyncSuccess -EmptySourceWarningCount \$syncBazaEmptySourceWarned\.Count -InvalidConfiguration'
 ) -Name 'Archive/SyncBazaInvalidSftpConfigurationExits30' `
     -Failure "-SyncBAZA з невалідною SFTP-конфігурацією (sftpHostKey) мусить завершуватись 30 (InvalidConfiguration), а не 50; отримано: $($archiveSyncExitCodes | ConvertTo-Json -Compress)"
+
+# ============================================================
+# #501: legacy-синхронізація BAZA (Sync-FolderToSFTP) класифікує залишок
+# пост-аудиту за знімком локального дерева перед стартом WinSCP. Об'єкти,
+# що з'явилися під час циклу, — ПОПЕРЕДЖЕННЯ (код 10), а не ПОМИЛКА; не
+# передані об'єкти знімка, змінені під час передачі, ненульовий код WinSCP і
+# недоступний аудит лишаються помилкою.
+#
+# Справжні Sync-FolderToSFTP -> Invoke-BRAVOBazaCanonicalSync ->
+# Invoke-ManualBAZASFTPSynchronization; фейкові лише процес WinSCP (cmd.exe
+# /c exit N) і read-only порівняння з хмарою. Гонку моделює крок "LIMS пише
+# після сканування WinSCP" усередині фейкового старту процесу — без Start-Sleep.
+# ============================================================
+
+Import-Module -Name (Join-Path $root 'modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1') -ErrorAction Stop
+Import-Module -Name (Join-Path $root 'modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1') -ErrorAction Stop
+
+$late501Stub = @'
+function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO", [switch]$NoConsole, [switch]$NoTimestamp)
+    [void]$script:late501Log.Add([pscustomobject]@{ Level = $Level; Message = $Message }) }
+function New-BRAVOWinSCPTemporaryScriptPath {
+    return (Join-Path $script:late501CaseRoot ('winscp_' + [guid]::NewGuid().ToString('N') + '.txt'))
+}
+function Remove-BRAVOWinSCPSensitiveTemporaryScript { param([string]$Path) Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+function Test-BRAVOWinSCPAvailable { param($WinSCPPath) return [pscustomobject]@{ Available = $true } }
+function Get-BRAVOWinSCPBusyMessage { param($Availability, $Operation) return 'busy' }
+function Get-SanitizedWinSCPDiagnostic { param($Text) return [string]$Text }
+function Show-RunningProgress { param($Id, $Activity, $Status, [switch]$Completed) }
+function Show-ScriptProgress { param($Status, $PercentComplete, [switch]$Completed) }
+function Format-BRAVORunningDetail { param($ElapsedSeconds) return '' }
+function Get-BAZARemoteNameCompatibilityIssues { param($LocalPath, $MaximumFileUtf8Bytes, $MaximumDirectoryUtf8Bytes) return [pscustomobject]@{ Success = $true; Issues = @() } }
+function Write-BAZARemoteNameCompatibilityAudit { param($CompatibilityResult, $ComponentName) }
+function Get-BRAVOBazaSyncModeEffective { return 'Legacy' }
+function Test-PathWithLog { param($Path, $Description, $CreateIfMissing) return (Test-Path -LiteralPath $Path) }
+function Test-SFTPConfig { param([switch]$SynchronizationOnly, [string[]]$NotInstalledComponents) return $true }
+function Test-SFTPConnection { param($WinSCPPath, $RepositorySFTPUrl, $HostKey) return $true }
+function Initialize-BRAVOSFTPRemoteDirectories { param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $RemoteDirectories) }
+# Фейк read-only CompareDirectories(Remote, removeFiles=$false): усе локальне,
+# чого немає в хмарі, — UploadNew; інший розмір — UploadUpdate.
+function Get-BAZASFTPComparison {
+    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey)
+    $script:late501ComparisonCalls++
+    if ($script:late501AfterAuditFails -and $script:late501ComparisonCalls -ge 2) {
+        return [pscustomobject]@{ Success = $false; Error = 'аудит недоступний (selftest)'; PendingFiles = @() }
+    }
+    $remote = $script:late501Remote[$RemotePath]
+    $rootPath = (Get-Item -LiteralPath $LocalPath).FullName.TrimEnd('\')
+    $pending = @()
+    foreach ($item in @(Get-ChildItem -LiteralPath $LocalPath -Recurse -Force)) {
+        $relative = $item.FullName.Substring($rootPath.Length + 1)
+        if ($item.PSIsContainer) {
+            if (-not $remote.ContainsKey($relative)) {
+                $pending += [pscustomobject]@{ Action = 'UploadNew'; Reason = 'відсутній у хмарі'; Path = $item.FullName; IsDirectory = $true; SizeBytes = $null }
+            }
+            continue
+        }
+        if (-not $remote.ContainsKey($relative)) {
+            $pending += [pscustomobject]@{ Action = 'UploadNew'; Reason = 'відсутній у хмарі'; Path = $item.FullName; IsDirectory = $false; SizeBytes = [long]$item.Length }
+        } elseif ([long]$remote[$relative] -ne [long]$item.Length) {
+            $pending += [pscustomobject]@{ Action = 'UploadUpdate'; Reason = 'потребує оновлення у хмарі'; Path = $item.FullName; IsDirectory = $false; SizeBytes = [long]$item.Length }
+        }
+    }
+    return [pscustomobject]@{ Success = $true; Error = $null; PendingFiles = @($pending) }
+}
+# Фейковий WinSCP: (1) сканує локальне дерево, (2) LIMS пише ПІСЛЯ
+# сканування, (3) передає просканований стан, крім late501FailPaths.
+function Start-BRAVOProcessOutputCapture {
+    param([System.Diagnostics.Process]$Process)
+    $script:late501WinSCPRuns++
+    $remoteKey = $script:late501CurrentRemotePath
+    $localRoot = (Get-Item -LiteralPath $script:late501CurrentLocal).FullName.TrimEnd('\')
+    $scanned = @(
+        @(Get-ChildItem -LiteralPath $localRoot -Recurse -Force) | ForEach-Object {
+            [pscustomobject]@{ Relative = $_.FullName.Substring($localRoot.Length + 1); IsDirectory = $_.PSIsContainer; Length = $(if ($_.PSIsContainer) { -1 } else { [long]$_.Length }) }
+        }
+    )
+    foreach ($write in @($script:late501DuringSyncWrites | Where-Object { $_.Component -eq $script:late501CurrentComponent })) {
+        $writeDirectory = [IO.Path]::GetDirectoryName($write.Path)
+        if (-not [IO.Directory]::Exists($writeDirectory)) { [void][IO.Directory]::CreateDirectory($writeDirectory) }
+        [IO.File]::WriteAllBytes($write.Path, (New-Object byte[] ([int]$write.Size)))
+        if ($null -ne $write.LastWriteUtc) { [IO.File]::SetLastWriteTimeUtc($write.Path, [datetime]$write.LastWriteUtc) }
+    }
+    foreach ($scannedItem in $scanned) {
+        if ($script:late501FailPaths -contains $scannedItem.Relative) { continue }
+        $script:late501Remote[$remoteKey][$scannedItem.Relative] = $scannedItem.Length
+    }
+    $Process.StartInfo.FileName = $env:ComSpec
+    $Process.StartInfo.Arguments = "/c exit $script:late501ExitCode"
+    [void]$Process.Start()
+    return $null
+}
+function Complete-BRAVOProcessOutputCapture { param($Capture) return [pscustomobject]@{ StandardOutput = ''; StandardError = '' } }
+'@
+$late501Module = New-BRAVOSelfTestRuntimeModule `
+    -SourceText ($late501Stub + "`n" + $archiveScriptText) `
+    -FunctionNames @(
+        'Write-BRAVOLog', 'New-BRAVOWinSCPTemporaryScriptPath', 'Remove-BRAVOWinSCPSensitiveTemporaryScript',
+        'Test-BRAVOWinSCPAvailable', 'Get-BRAVOWinSCPBusyMessage', 'Get-SanitizedWinSCPDiagnostic', 'Show-RunningProgress',
+        'Show-ScriptProgress', 'Format-BRAVORunningDetail', 'Get-BAZARemoteNameCompatibilityIssues',
+        'Write-BAZARemoteNameCompatibilityAudit', 'Get-BRAVOBazaSyncModeEffective', 'Test-PathWithLog', 'Test-SFTPConfig',
+        'Test-SFTPConnection', 'Initialize-BRAVOSFTPRemoteDirectories', 'Get-BAZASFTPComparison',
+        'Start-BRAVOProcessOutputCapture', 'Complete-BRAVOProcessOutputCapture',
+        'Write-BAZASFTPComparisonAudit', 'Test-BAZAPathBlockedByIncompatibleName', 'Split-BAZAPendingFilesByCompatibility',
+        'Get-BAZAPendingFileCycleClassification', 'Get-BAZASynchronizationOutcome', 'Sync-FolderToSFTP',
+        'Invoke-BRAVOBazaCanonicalSync', 'New-BRAVOTransferOperationResult', 'Invoke-ManualBAZASFTPSynchronization',
+        'Get-BRAVOManualSyncRunOutcomeLabel', 'Resolve-BRAVOSyncBazaExitCode', 'Resolve-BRAVOLogComponentFromHeader'
+    )
+
+# Один прогін -SyncBAZA (або лише Sync-FolderToSFTP): повертає результат,
+# мітку, код завершення, outcome-и компонентів і журнал.
+$late501Run = {
+    param(
+        [string]$CaseRoot,
+        [hashtable]$Remote,
+        [object[]]$DuringSyncWrites = @(),
+        [string[]]$FailPaths = @(),
+        [int]$ExitCode = 0,
+        [switch]$AfterAuditFails,
+        [switch]$WithWWW
+    )
+    & $late501Module {
+        param($CaseRoot, $Remote, $DuringSyncWrites, $FailPaths, $ExitCode, $AfterAuditFails, $WithWWW)
+        $script:late501Log = New-Object System.Collections.ArrayList
+        $script:late501CaseRoot = $CaseRoot
+        $script:late501Remote = $Remote
+        $script:late501DuringSyncWrites = @($DuringSyncWrites)
+        $script:late501FailPaths = @($FailPaths)
+        $script:late501ExitCode = $ExitCode
+        $script:late501AfterAuditFails = [bool]$AfterAuditFails
+        $script:late501ComparisonCalls = 0
+        $script:late501WinSCPRuns = 0
+        $script:winSCPPath = $env:ComSpec
+        $script:winSCPAssemblyPath = 'C:\fake\WinSCPnet.dll'
+        $script:sftpUrl = 'sftp://selftest@192.0.2.10/'
+        $script:sftpHostKey = 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
+        $script:sftpConnectionTimeoutSeconds = 5
+        $script:sftpSynchronizationOptions = '-mirror -criteria=time,size -resumesupport=on'
+        $script:winSCPScriptEncoding = 'ASCII'
+        $script:winSCPIniPath = 'nul'
+        $script:synchronizationSafety = [pscustomobject]@{ RequireNonEmptyBAZASource = $false }
+        $script:progressSettings = [pscustomobject]@{ Enabled = $false; ShowWinSCPOutput = $false }
+        $script:backupMonitoring = [pscustomobject]@{ SFTP = [pscustomobject]@{ SynchronizationTimeoutSeconds = 60; OperationTimeoutSeconds = 60 } }
+        $script:componentSettings = @{ Synchronization = @{ BAZA_APP_SFTP = $true; BAZA_WWW_SFTP = [bool]$WithWWW } }
+        $script:bazaAppPaths = @{ Source = (Join-Path $CaseRoot 'APP') }
+        $script:bazaWWWPaths = @{ Source = (Join-Path $CaseRoot 'WWW') }
+        $script:bazaWWWDetection = @{ Success = $true; Reason = '' }
+        $script:sftpDirectories = @{ BAZA = 'baza_app'; BAZAWWW = 'baza_www' }
+        # Фейковий старт процесу бере поточні шлях/компонент звідси; ім'я компонента
+        # і шлях для кожного виклику Sync-FolderToSFTP ставить обгортка нижче.
+        $script:late501Outcomes = @{}
+        $script:late501OriginalSync = ${function:script:Sync-FolderToSFTP}
+        ${function:script:Sync-FolderToSFTP} = {
+            param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $LocalDirectory, $RemoteDirectory, $ComponentName)
+            $script:late501CurrentLocal = $LocalDirectory
+            $script:late501CurrentComponent = $ComponentName
+            $script:late501CurrentRemotePath = '/' + $RemoteDirectory.Trim('/')
+            $result = & $script:late501OriginalSync -WinSCPPath $WinSCPPath -RepositorySFTPUrl $RepositorySFTPUrl -HostKey $HostKey -LocalDirectory $LocalDirectory -RemoteDirectory $RemoteDirectory -ComponentName $ComponentName
+            $script:late501Outcomes[$ComponentName] = $script:lastBAZASyncOutcome
+            return $result
+        }
+        try {
+            $manual = Invoke-ManualBAZASFTPSynchronization -BazaAppEnabled $true -BazaWWWEnabled ([bool]$WithWWW)
+        } finally {
+            ${function:script:Sync-FolderToSFTP} = $script:late501OriginalSync
+        }
+        $label = Get-BRAVOManualSyncRunOutcomeLabel -ManualSyncResult $manual
+        $exitCode = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded ([bool]$manual.Success) -EmptySourceWarningCount 0 -NewAfterCutoffCount $(if ($manual.PSObject.Properties['NewAfterCutoffCount']) { [int]$manual.NewAfterCutoffCount } else { 0 })
+        return [pscustomobject]@{
+            Manual = $manual
+            Label = $label
+            ExitCode = $exitCode
+            App = $script:late501Outcomes['BAZA_APP']
+            Www = $(if ($script:late501Outcomes.ContainsKey('BAZA_WWW')) { $script:late501Outcomes['BAZA_WWW'] } else { $null })
+            Log = @($script:late501Log.ToArray())
+            WinSCPRuns = $script:late501WinSCPRuns
+        }
+    } $CaseRoot $Remote @($DuringSyncWrites) $FailPaths $ExitCode ([bool]$AfterAuditFails) ([bool]$WithWWW)
+}
+
+$late501NewFile = {
+    param([string]$Path, [int]$Size = 64, [Nullable[datetime]]$LastWriteUtc = $null)
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory -Force) }
+    [IO.File]::WriteAllBytes($Path, (New-Object byte[] $Size))
+    if ($null -ne $LastWriteUtc) { [IO.File]::SetLastWriteTimeUtc($Path, [datetime]$LastWriteUtc) }
+}
+# Новий кейс: APP (і WWW) з базовими файлами, хмара вже має все, крім
+# $PendingCount файлів, які чекають першої передачі.
+$late501NewCase = {
+    param([string]$Name, [int]$SyncedCount = 3, [int]$PendingCount = 2)
+    $caseRoot = Join-Path $late501Root $Name
+    $remote = @{ '/baza_app' = @{}; '/baza_www' = @{} }
+    foreach ($component in @('APP', 'WWW')) {
+        $componentRoot = Join-Path $caseRoot $component
+        [void](New-Item -ItemType Directory -Path (Join-Path $componentRoot 'KZ\2026') -Force)
+        $remoteKey = if ($component -eq 'APP') { '/baza_app' } else { '/baza_www' }
+        $remote[$remoteKey]['KZ'] = -1
+        $remote[$remoteKey]['KZ\2026'] = -1
+        for ($i = 1; $i -le $SyncedCount; $i++) {
+            & $late501NewFile (Join-Path $componentRoot "KZ\2026\synced_$i.pdf") 100
+            $remote[$remoteKey]["KZ\2026\synced_$i.pdf"] = 100
+        }
+        for ($i = 1; $i -le $PendingCount; $i++) {
+            & $late501NewFile (Join-Path $componentRoot "KZ\2026\pending_$i.pdf") 200
+        }
+    }
+    return [pscustomobject]@{ Root = $caseRoot; App = (Join-Path $caseRoot 'APP'); Www = (Join-Path $caseRoot 'WWW'); Remote = $remote }
+}
+# Запис "LIMS під час WinSCP": дані, які пише фейковий старт процесу (без closure).
+$late501Write = { param([string]$Component, [string]$Path, [int]$Size = 64, $LastWriteUtc = $null) [pscustomobject]@{ Component = $Component; Path = $Path; Size = $Size; LastWriteUtc = $LastWriteUtc } }
+$late501Errors = { param($Run) @($Run.Log | Where-Object { $_.Level -eq 'ERROR' }) }
+$late501Warnings = { param($Run) @($Run.Log | Where-Object { $_.Level -eq 'WARNING' }) }
+
+$late501Root = Join-Path ([IO.Path]::GetTempPath()) "BRAVOSelfTest_Late501_$([Guid]::NewGuid().ToString('N'))"
+[void](New-Item -ItemType Directory -Path $late501Root -Force)
+try {
+    # 1. Усі об'єкти знімка передано, нових немає -> УСПІШНО, код 0.
+    $c1 = & $late501NewCase 'S01'
+    $r1 = & $late501Run -CaseRoot $c1.Root -Remote $c1.Remote
+    Test-BRAVOCondition -Condition (
+        $r1.Manual.Success -and $r1.Label -eq 'УСПІШНО' -and $r1.ExitCode -eq 0 -and
+        $r1.App.IsComplete -and -not $r1.App.IsCompleteWithNewAfterCutoff -and $r1.App.SnapshotAvailable -and
+        $r1.App.CompletedCount -eq 2 -and @(& $late501Errors $r1).Count -eq 0
+    ) -Name 'Archive/501/S01SnapshotCompleteNoNewIsSuccess' `
+      -Failure "повна передача знімка без нових об'єктів має давати УСПІШНО/0; label=$($r1.Label) exit=$($r1.ExitCode) completed=$($r1.App.CompletedCount)"
+
+    # 2. Новий файл з'явився під час WinSCP -> ПОПЕРЕДЖЕННЯ, код 10, без ERROR.
+    $c2 = & $late501NewCase 'S02'
+    $r2 = & $late501Run -CaseRoot $c2.Root -Remote $c2.Remote -DuringSyncWrites @(& $late501Write 'BAZA_APP' (Join-Path $c2.App 'KZ\2026\late.pdf') 50)
+
+    Test-BRAVOCondition -Condition (
+        $r2.Manual.Success -and $r2.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $r2.ExitCode -eq 10 -and
+        $r2.App.IsCompleteWithNewAfterCutoff -and $r2.App.NewAfterCutoffCount -eq 1 -and $r2.App.RealMissingCount -eq 0 -and
+        @(& $late501Errors $r2).Count -eq 0 -and
+        @(& $late501Warnings $r2 | Where-Object { $_.Message -like "*з'явилися після старту синхронізації*late.pdf*" }).Count -eq 1 -and
+        $r2.Manual.Results.BAZA_APP.Degraded -and $r2.Manual.Results.SyncOutcomes['BAZA_APP'].NewAfterCutoff -eq 1
+    ) -Name 'Archive/501/S02NewFileDuringSyncIsWarning' `
+      -Failure "файл, створений під час WinSCP, має давати ПОПЕРЕДЖЕННЯ/10 без ERROR; label=$($r2.Label) exit=$($r2.ExitCode) errors=$((& $late501Errors $r2 | ForEach-Object { $_.Message }) -join ' | ')"
+
+    # 3. Відтворення інциденту #501: шість нових PDF із кириличними іменами (імена вигадані).
+    $c3 = & $late501NewCase 'S03' -SyncedCount 4 -PendingCount 8
+    $late501IncidentNames = @(
+        '900001_пм_26_20990101-100001.pdf', '900002_пм_26_20990101-100002.pdf', '900003_пм_26_20990101-100003.pdf',
+        '900004_пм_26_20990101-100004.pdf', '900005_пм_26_20990101-100005.pdf', '900006_пм_26_20990101-100006.pdf'
+    )
+    $r3 = & $late501Run -CaseRoot $c3.Root -Remote $c3.Remote -DuringSyncWrites @(foreach ($n in $late501IncidentNames) { & $late501Write 'BAZA_APP' (Join-Path $c3.App "KZ\2026\$n") 4096 })
+
+    Test-BRAVOCondition -Condition (
+        $r3.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $r3.ExitCode -eq 10 -and
+        $r3.App.NewAfterCutoffCount -eq 6 -and $r3.App.RealMissingCount -eq 0 -and $r3.App.ChangedDuringSyncCount -eq 0 -and
+        $r3.App.BeforeCount -eq 8 -and $r3.App.CompletedCount -eq 8 -and $r3.App.RetryableRemainingCount -eq 6 -and
+        @(& $late501Errors $r3).Count -eq 0 -and
+        @($r3.Log | Where-Object { $_.Level -eq 'WARNING' -and $_.Message -like "AUDIT BAZA_APP*[З'ЯВИВСЯ ПІД ЧАС СИНХРОНІЗАЦІЇ]*_пм_26_*" }).Count -eq 6
+    ) -Name 'Archive/501/S03IncidentSixNewPdfIsWarning' `
+      -Failure "інцидент #501 (6 нових PDF після старту) має давати ПОПЕРЕДЖЕННЯ, CompletedCount=8, а не ПОМИЛКА; label=$($r3.Label) new=$($r3.App.NewAfterCutoffCount) completed=$($r3.App.CompletedCount)"
+
+    # 4. Старий файл не переданий -> ПОМИЛКА, код 50.
+    $c4 = & $late501NewCase 'S04'
+    $r4 = & $late501Run -CaseRoot $c4.Root -Remote $c4.Remote -FailPaths @('KZ\2026\pending_1.pdf')
+    Test-BRAVOCondition -Condition (
+        -not $r4.Manual.Success -and $r4.Label -eq 'ПОМИЛКА' -and $r4.ExitCode -eq 50 -and
+        $r4.App.RealMissingCount -eq 1 -and -not $r4.App.IsCompleteWithNewAfterCutoff -and
+        @(& $late501Errors $r4 | Where-Object { $_.Message -like '*WinSCP повернув код 0, але синхронiзацiя BAZA_APP часткова*не передано зі знімка циклу: 1*' }).Count -eq 1
+    ) -Name 'Archive/501/S04OldFileNotTransferredIsError' `
+      -Failure "непереданий файл знімка має лишатися ПОМИЛКА/50; label=$($r4.Label) exit=$($r4.ExitCode)"
+
+    # 5. NEGATIVE CONTROL: старий файл не переданий, поруч з'явився новий -> ПОМИЛКА.
+    $c5 = & $late501NewCase 'S05'
+    $r5 = & $late501Run -CaseRoot $c5.Root -Remote $c5.Remote -FailPaths @('KZ\2026\pending_2.pdf') -DuringSyncWrites @(& $late501Write 'BAZA_APP' (Join-Path $c5.App 'KZ\2026\late.pdf') 50)
+
+    Test-BRAVOCondition -Condition (
+        -not $r5.Manual.Success -and $r5.Label -eq 'ПОМИЛКА' -and $r5.ExitCode -eq 50 -and
+        $r5.App.RealMissingCount -eq 1 -and $r5.App.NewAfterCutoffCount -eq 1 -and -not $r5.App.IsCompleteWithNewAfterCutoff -and
+        @(& $late501Errors $r5 | Where-Object { $_.Message -like 'AUDIT BAZA_APP*pending_2.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/S05NegativeControlOldMissingWithNewStaysError' `
+      -Failure "НЕГАТИВНИЙ КОНТРОЛЬ: непереданий старий файл лишається ПОМИЛКА навіть поруч із новим; label=$($r5.Label) real=$($r5.App.RealMissingCount) new=$($r5.App.NewAfterCutoffCount)"
+
+    # 6. Новий файл із давнім LastWriteTime -> класифікується за знімком (ПОПЕРЕДЖЕННЯ).
+    $c6 = & $late501NewCase 'S06'
+    $r6 = & $late501Run -CaseRoot $c6.Root -Remote $c6.Remote -DuringSyncWrites @(& $late501Write 'BAZA_APP' (Join-Path $c6.App 'KZ\2026\old-stamp.pdf') 50 ([datetime]'2019-01-01T00:00:00Z'))
+
+    Test-BRAVOCondition -Condition (
+        $r6.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $r6.App.NewAfterCutoffCount -eq 1 -and $r6.App.RealMissingCount -eq 0
+    ) -Name 'Archive/501/S06NewFileWithOldTimestampClassifiedBySnapshot' `
+      -Failure "новий файл з давнім LastWriteTime має класифікуватись за знімком, а не за часом; label=$($r6.Label)"
+
+    # 7. Старий файл змінено після сканування WinSCP -> окремий mutation-клас, ПОМИЛКА.
+    $c7 = & $late501NewCase 'S07'
+    $r7 = & $late501Run -CaseRoot $c7.Root -Remote $c7.Remote -DuringSyncWrites @(& $late501Write 'BAZA_APP' (Join-Path $c7.App 'KZ\2026\pending_1.pdf') 333)
+
+    Test-BRAVOCondition -Condition (
+        -not $r7.Manual.Success -and $r7.Label -eq 'ПОМИЛКА' -and
+        $r7.App.ChangedDuringSyncCount -eq 1 -and $r7.App.RealMissingCount -eq 0 -and $r7.App.NewAfterCutoffCount -eq 0 -and
+        @(& $late501Errors $r7 | Where-Object { $_.Message -like 'AUDIT BAZA_APP*[ЗМІНЕНО ПІД ЧАС СИНХРОНІЗАЦІЇ]*pending_1.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/S07ChangedDuringSyncIsSeparateErrorClass' `
+      -Failure "файл знімка, змінений під час передачі, — окремий клас і лишається помилкою; label=$($r7.Label) changed=$($r7.App.ChangedDuringSyncCount)"
+
+    # 8. WinSCP повернув ненульовий код (лише нові об'єкти в залишку) -> ПОМИЛКА.
+    $c8 = & $late501NewCase 'S08'
+    $r8 = & $late501Run -CaseRoot $c8.Root -Remote $c8.Remote -ExitCode 1 -DuringSyncWrites @(& $late501Write 'BAZA_APP' (Join-Path $c8.App 'KZ\2026\late.pdf') 50)
+
+    Test-BRAVOCondition -Condition (
+        -not $r8.Manual.Success -and $r8.Label -eq 'ПОМИЛКА' -and $r8.ExitCode -eq 50 -and
+        -not $r8.App.IsCompleteWithNewAfterCutoff -and
+        @(& $late501Errors $r8 | Where-Object { $_.Message -like '*Помилка SFTP-синхронiзацiї BAZA_APP (код: 1)*' }).Count -eq 1
+    ) -Name 'Archive/501/S08WinSCPTransportFailureStaysError' `
+      -Failure "ненульовий код WinSCP лишається ПОМИЛКА незалежно від класифікації; label=$($r8.Label)"
+
+    # 9. Код 0, але реально бракує прихованого файла знімка в підкаталозі -> ПОМИЛКА.
+    $c9 = & $late501NewCase 'S09'
+    $hiddenOld = Join-Path $c9.App 'KZ\2026\hidden-old.pdf'
+    & $late501NewFile $hiddenOld 77
+    (Get-Item -LiteralPath $hiddenOld -Force).Attributes = 'Hidden'
+    $r9 = & $late501Run -CaseRoot $c9.Root -Remote $c9.Remote -FailPaths @('KZ\2026\hidden-old.pdf')
+    Test-BRAVOCondition -Condition (
+        -not $r9.Manual.Success -and $r9.Label -eq 'ПОМИЛКА' -and $r9.App.RealMissingCount -eq 1 -and $r9.App.NewAfterCutoffCount -eq 0
+    ) -Name 'Archive/501/S09ExitZeroButHiddenSnapshotFileMissingIsError' `
+      -Failure "прихований файл знімка, якого бракує після коду 0, не може стати 'новим'; label=$($r9.Label) new=$($r9.App.NewAfterCutoffCount)"
+
+    # 10. Пост-аудит недоступний -> ПОМИЛКА (VerificationSucceeded = false).
+    $c10 = & $late501NewCase 'S10'
+    $r10 = & $late501Run -CaseRoot $c10.Root -Remote $c10.Remote -AfterAuditFails
+    Test-BRAVOCondition -Condition (
+        -not $r10.Manual.Success -and $r10.Label -eq 'ПОМИЛКА' -and -not $r10.App.VerificationSucceeded -and
+        $null -eq $r10.App.NewAfterCutoffCount -and -not $r10.App.IsCompleteWithNewAfterCutoff
+    ) -Name 'Archive/501/S10AfterAuditUnavailableIsError' `
+      -Failure "недоступний пост-аудит лишається ПОМИЛКА; label=$($r10.Label)"
+
+    # 11. BAZA_APP і BAZA_WWW мають власні знімки: файл, створений у WWW під час
+    # синхронізації APP, належить знімку WWW і передається; новий у APP — попередження.
+    $c11 = & $late501NewCase 'S11'
+    $r11 = & $late501Run -CaseRoot $c11.Root -Remote $c11.Remote -WithWWW -DuringSyncWrites @(
+        (& $late501Write 'BAZA_APP' (Join-Path $c11.App 'KZ\2026\late-app.pdf') 50),
+        (& $late501Write 'BAZA_APP' (Join-Path $c11.Www 'KZ\2026\written-during-app.pdf') 50)
+    )
+    Test-BRAVOCondition -Condition (
+        $r11.Manual.Success -and $r11.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $r11.ExitCode -eq 10 -and
+        $r11.App.NewAfterCutoffCount -eq 1 -and $r11.Www.IsComplete -and $r11.Www.NewAfterCutoffCount -eq 0 -and
+        $r11.App.CycleId -ne $r11.Www.CycleId -and
+        ([datetime]$r11.Www.SyncStartUtc) -gt ([datetime]$r11.App.SyncStartUtc) -and
+        $c11.Remote['/baza_www'].ContainsKey('KZ\2026\written-during-app.pdf')
+    ) -Name 'Archive/501/S11AppAndWwwHaveIndependentCutoffs' `
+      -Failure "кожен компонент має власні CycleId/SyncStartUtc; app=$($r11.App.CycleId)@$($r11.App.SyncStartUtc) www=$($r11.Www.CycleId)@$($r11.Www.SyncStartUtc)"
+
+    # 12. Наступний цикл передає нові файли -> УСПІШНО.
+    $r12 = & $late501Run -CaseRoot $c2.Root -Remote $c2.Remote
+    Test-BRAVOCondition -Condition (
+        $r12.Manual.Success -and $r12.Label -eq 'УСПІШНО' -and $r12.ExitCode -eq 0 -and $r12.App.IsComplete -and
+        $c2.Remote['/baza_app'].ContainsKey('KZ\2026\late.pdf')
+    ) -Name 'Archive/501/S12NextCycleTransfersLateFilesSuccess' `
+      -Failure "наступний цикл має передати нові файли й дати УСПІШНО; label=$($r12.Label)"
+
+    # 13. Перерваний цикл (WinSCP код 1, нічого не передано) -> ПОМИЛКА; повторний запуск -> УСПІШНО.
+    $c13 = & $late501NewCase 'S13'
+    $r13a = & $late501Run -CaseRoot $c13.Root -Remote $c13.Remote -ExitCode 1 -FailPaths @('KZ\2026\pending_1.pdf', 'KZ\2026\pending_2.pdf')
+    $r13b = & $late501Run -CaseRoot $c13.Root -Remote $c13.Remote
+    Test-BRAVOCondition -Condition (
+        $r13a.Label -eq 'ПОМИЛКА' -and $r13a.ExitCode -eq 50 -and $r13a.App.RealMissingCount -eq 2 -and
+        $r13b.Label -eq 'УСПІШНО' -and $r13b.ExitCode -eq 0 -and $r13b.App.IsComplete
+    ) -Name 'Archive/501/S13InterruptedThenRetrySucceeds' `
+      -Failure "перерваний цикл — ПОМИЛКА, повтор — УСПІШНО; a=$($r13a.Label) b=$($r13b.Label)"
+
+    # 14. Сумісність: старий виклик Get-BAZASynchronizationOutcome (без знімка)
+    # дає попередню семантику; типовий Get-BRAVOBazaLocalSnapshot не змінився;
+    # старий shape результату -SyncBAZA (без NewAfterCutoffCount) -> УСПІШНО/0.
+    $compat = & $late501Module {
+        param($LocalRoot)
+        $after = [pscustomobject]@{ Success = $true; PendingFiles = @([pscustomobject]@{ Action = 'UploadNew'; Path = (Join-Path $LocalRoot 'x.pdf'); IsDirectory = $false }) }
+        $before = [pscustomobject]@{ Success = $true; PendingFiles = @() }
+        [pscustomobject]@{
+            Outcome = Get-BAZASynchronizationOutcome -WinSCPExitCode 0 -ComparisonBefore $before -ComparisonAfter $after
+            Label = Get-BRAVOManualSyncRunOutcomeLabel -ManualSyncResult ([pscustomobject]@{ Success = $true; Skipped = $false; Results = $null })
+            Exit = Resolve-BRAVOSyncBazaExitCode -SyncSucceeded $true -EmptySourceWarningCount 0
+        }
+    } $c1.App
+    $hiddenDefault = Join-Path $c1.App 'KZ\2026\hidden-default.pdf'
+    & $late501NewFile $hiddenDefault 10
+    (Get-Item -LiteralPath $hiddenDefault -Force).Attributes = 'Hidden'
+    $defaultSnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $c1.App
+    $extendedSnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $c1.App -IncludeHiddenSystem -IncludeDirectories
+    Test-BRAVOCondition -Condition (
+        $compat.Outcome.IsPartial -and -not $compat.Outcome.IsCompleteWithNewAfterCutoff -and -not $compat.Outcome.SnapshotAvailable -and
+        $compat.Outcome.RealMissingCount -eq 1 -and $compat.Outcome.NewAfterCutoffCount -eq 0 -and
+        $compat.Label -eq 'УСПІШНО' -and $compat.Exit -eq 0 -and
+        $null -eq $defaultSnapshot.Directories -and -not $defaultSnapshot.Entries.ContainsKey('KZ\2026\hidden-default.pdf') -and
+        $extendedSnapshot.Entries.ContainsKey('KZ\2026\hidden-default.pdf') -and $extendedSnapshot.Directories.Contains('KZ\2026') -and
+        $extendedSnapshot.Directories.Contains('kz\2026')
+    ) -Name 'Archive/501/S14BackwardCompatibleContracts' `
+      -Failure "виклики без знімка, типовий знімок і старий shape результату -SyncBAZA мають зберегти попередню поведінку"
+
+    # 15. Великий обсяг: 3000 об'єктів знімка + 2000 нових під час циклу —
+    # точні лічильники без втрат (класифікація по хешу, не по масиву).
+    $c15 = & $late501NewCase 'S15' -SyncedCount 0 -PendingCount 0
+    for ($i = 1; $i -le 3000; $i++) {
+        $p = Join-Path $c15.App ("KZ\2026\big_{0:D5}.pdf" -f $i)
+        [IO.File]::WriteAllBytes($p, [byte[]](1))
+        $c15.Remote['/baza_app']["KZ\2026\big_{0:D5}.pdf" -f $i] = 1
+    }
+    $r15 = & $late501Run -CaseRoot $c15.Root -Remote $c15.Remote -DuringSyncWrites @(for ($j = 1; $j -le 2000; $j++) { & $late501Write 'BAZA_APP' (Join-Path $c15.App ("KZ\2026\late_{0:D5}.pdf" -f $j)) 1 })
+    Test-BRAVOCondition -Condition (
+        $r15.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $r15.App.NewAfterCutoffCount -eq 2000 -and $r15.App.RealMissingCount -eq 0 -and
+        @($r15.Log | Where-Object { $_.Message -like "*з'явилися після старту*ще 1980 — див. рядки AUDIT*" }).Count -eq 1
+    ) -Name 'Archive/501/S15LargeVolumeCountsAndCappedSummary' `
+      -Failure "2000 нових серед 3000 знімка: точні лічильники й обмежений перелік у підсумку; new=$($r15.App.NewAfterCutoffCount)"
+
+    # 17. Шлях, який GetFullPath змінює не лише роздільниками (кінцева '.'/' '
+    # імені), або об'єкт, якого зараз немає за шляхом WinSCP, не може стати
+    # "новим": інакше постійна непередача щоразу ставала б ПОПЕРЕДЖЕННЯМ.
+    $c17 = & $late501NewCase 'S17' -SyncedCount 0 -PendingCount 0
+    $c17Dir = Join-Path $c17.App 'KZ\2026'
+    foreach ($odd in @('trail.', 'space ')) { [IO.File]::WriteAllBytes(('\\?\' + (Join-Path $c17Dir $odd)), [byte[]](7)) }
+    $c17Snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $c17.App -IncludeHiddenSystem -IncludeDirectories
+    $c17Pending = @(
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c17Dir 'trail.'); IsDirectory = $false; SizeBytes = 1 },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c17Dir 'space '); IsDirectory = $false; SizeBytes = 1 },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c17Dir 'no-such-file.pdf'); IsDirectory = $false; SizeBytes = 1 },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c17Dir 'no-such-dir'); IsDirectory = $true; SizeBytes = $null },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = ($c17Dir + '\sub\..\x.pdf'); IsDirectory = $false; SizeBytes = 1 }
+    )
+    $c17Result = & $late501Module {
+        param($Pending, $Snapshot, $Root)
+        Get-BAZAPendingFileCycleClassification -PendingFiles $Pending -LocalSnapshot $Snapshot -LocalRoot $Root
+    } $c17Pending $c17Snapshot $c17.App
+    Test-BRAVOCondition -Condition (
+        $c17Snapshot.Entries.ContainsKey('KZ\2026\trail.') -and
+        @($c17Result.RealMissing).Count -eq 5 -and @($c17Result.NewAfterCutoff).Count -eq 0
+    ) -Name 'Archive/501/S17UnmatchablePathsFailClosed' `
+      -Failure "кінцева '.'/' ', неіснуючий об'єкт і '..' мають давати RealMissing; real=$(@($c17Result.RealMissing).Count) new=$(@($c17Result.NewAfterCutoff).Count)"
+    foreach ($odd in @('trail.', 'space ')) { [IO.File]::Delete('\\?\' + (Join-Path $c17Dir $odd)) }
+    # 18. Шлях змінив тип під час циклу (каталог знімка замінено файлом і
+    # навпаки) — заміна, а не новий об'єкт: ChangedDuringSync (ERROR).
+    # Контроль: справжні нові файл і каталог лишаються NewAfterCutoff.
+    $c18 = & $late501NewCase 'S18' -SyncedCount 0 -PendingCount 0
+    $c18Dir = Join-Path $c18.App 'KZ\2026'
+    [void][IO.Directory]::CreateDirectory((Join-Path $c18Dir 'swap-dir'))
+    [IO.File]::WriteAllBytes((Join-Path $c18Dir 'swap-file.pdf'), [byte[]](1))
+    $c18Snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $c18.App -IncludeHiddenSystem -IncludeDirectories
+    [IO.Directory]::Delete((Join-Path $c18Dir 'swap-dir'))
+    [IO.File]::WriteAllBytes((Join-Path $c18Dir 'swap-dir'), [byte[]](2))
+    [IO.File]::Delete((Join-Path $c18Dir 'swap-file.pdf'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $c18Dir 'swap-file.pdf'))
+    [IO.File]::WriteAllBytes((Join-Path $c18Dir 'brand-new.pdf'), [byte[]](3))
+    [void][IO.Directory]::CreateDirectory((Join-Path $c18Dir 'brand-new-dir'))
+    $c18Pending = @(
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c18Dir 'swap-dir'); IsDirectory = $false; SizeBytes = 1 },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c18Dir 'swap-file.pdf'); IsDirectory = $true; SizeBytes = $null },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c18Dir 'brand-new.pdf'); IsDirectory = $false; SizeBytes = 1 },
+        [pscustomobject]@{ Action = 'UploadNew'; Reason = 'x'; Path = (Join-Path $c18Dir 'brand-new-dir'); IsDirectory = $true; SizeBytes = $null }
+    )
+    $c18Result = & $late501Module {
+        param($Pending, $Snapshot, $Root)
+        Get-BAZAPendingFileCycleClassification -PendingFiles $Pending -LocalSnapshot $Snapshot -LocalRoot $Root
+    } $c18Pending $c18Snapshot $c18.App
+    $c18Changed = @(@($c18Result.ChangedDuringSync) | ForEach-Object { Split-Path -Leaf ([string]$_.Path) } | Sort-Object)
+    $c18New = @(@($c18Result.NewAfterCutoff) | ForEach-Object { Split-Path -Leaf ([string]$_.Path) } | Sort-Object)
+    Test-BRAVOCondition -Condition (
+        $c18Changed.Count -eq 2 -and $c18Changed -contains 'swap-dir' -and $c18Changed -contains 'swap-file.pdf' -and
+        $c18New.Count -eq 2 -and $c18New -contains 'brand-new-dir' -and $c18New -contains 'brand-new.pdf' -and
+        @($c18Result.RealMissing).Count -eq 0
+    ) -Name 'Archive/501/S18TypeReplacementIsChangedNotNew' `
+      -Failure "заміна файл<->каталог під час циклу має бути ChangedDuringSync, справжні нові — NewAfterCutoff; changed=$($c18Changed -join ',') new=$($c18New -join ',')"
+    # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
+    # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
+    # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.
+    $late501HeaderComponent = & $late501Module { Resolve-BRAVOLogComponentFromHeader -Header '=== ЗАВЕРШЕННЯ РУЧНОЇ СИНХРОНIЗАЦIЇ BAZA_APP / BAZA_WWW ===' }
+    # ЕМУЛЯЦІЯ зовнішнього контракту: шаблон Zabbix поза репозиторієм; мапінг нижче відтворює
+    # описаний в issue #501 regex/мапінг, а production-код перевіряють мітки, компонент рядка і severity.
+    $late501Zabbix = {
+        param([string]$Line)
+        $m = [regex]::Match($Line, '\[BAZA_APP\] Результат: (\S+)')
+        if (-not $m.Success) { return $null }
+        $v = $m.Groups[1].Value
+        if ($v -like 'УСП*') { return 1 }
+        if ($v -like '*ПОПЕРЕДЖ*' -or $v -like '*WARN*') { return 2 }
+        return 0
+    }
+    $late501ZabbixValues = @{}
+    foreach ($pair in @(@('S01', $r1), @('S02', $r2), @('S04', $r4), @('S11', $r11))) {
+        $late501ZabbixValues[$pair[0]] = & $late501Zabbix "2026-10-20 16:18:11 [INFO] [$late501HeaderComponent] Результат: $($pair[1].Label)"
+    }
+    $late501ErrorAndWarning = & $late501Module {
+        Get-BRAVOManualSyncRunOutcomeLabel -ManualSyncResult ([pscustomobject]@{ Success = $false; Skipped = $false; NewAfterCutoffCount = 3; Results = $null })
+    }
+    # -SyncBAZA не пише BRAVO_STATUS_Archive; його код 10 — канонічна severity WARNING.
+    $late501Severity = Get-BRAVOExitCodeSeverity -Code $r2.ExitCode
+    Test-BRAVOCondition -Condition (
+        $late501HeaderComponent -eq 'BAZA_APP' -and
+        $late501ZabbixValues['S01'] -eq 1 -and $late501ZabbixValues['S02'] -eq 2 -and
+        $late501ZabbixValues['S04'] -eq 0 -and $late501ZabbixValues['S11'] -eq 2 -and
+        ($r2.Label -notmatch '\s') -and $late501ErrorAndWarning -eq 'ПОМИЛКА' -and
+        $r2.ExitCode -eq 10 -and [string]$late501Severity -eq 'WARNING' -and
+        $archiveScriptText.Contains('Write-Log "Результат: $manualSyncOutcomeLabel" -NoTimestamp')
+    ) -Name 'Archive/501/S16MonitoringParsingSeverityAndStatus' `
+      -Failure "Zabbix: УСПІШНО->1, ПОПЕРЕДЖЕННЯ->2, ПОМИЛКА->0, одне слово; ERROR переважає WARNING; код 10 -> severity WARNING; значення: $($late501ZabbixValues | ConvertTo-Json -Compress) severity=$late501Severity"
+
+    # Структура: знімок береться до старту процесу WinSCP, класифікація — до запису пост-аудиту.
+    $late501SyncText = & $late501Module { ${function:Sync-FolderToSFTP}.ToString() }
+    Test-BRAVOCondition -Condition (
+        $late501SyncText.IndexOf('Get-BRAVOBazaLocalSnapshot') -gt 0 -and
+        $late501SyncText.IndexOf('Get-BRAVOBazaLocalSnapshot') -lt $late501SyncText.IndexOf('Start-BRAVOProcessOutputCapture') -and
+        $late501SyncText.IndexOf('-LocalSnapshot $cycleSnapshot') -lt $late501SyncText.IndexOf('-Outcome $syncOutcome') -and
+        @($r1.Log | Where-Object { $_.Message -like 'Знімок циклу BAZA_APP: CycleId=*; SyncStartUtc=*' }).Count -eq 1 -and
+        # Нічний Main: Degraded без несумісних імен називає справжню причину (#501), а не "несумісних імен: 0".
+        $archiveScriptText.Contains("об'єкти знімка синхронізовано; нові під час синхронізації буде передано наступним запуском") -and
+        $archiveScriptText.Contains('WARNING (нові під час синхронізації — наступним запуском)')
+    ) -Name 'Archive/501/SnapshotTakenBeforeWinSCPStart' `
+      -Failure 'знімок циклу має братися до старту WinSCP і передаватися в класифікацію до запису пост-аудиту'
+} finally {
+    Remove-Item -LiteralPath $late501Root -Recurse -Force -ErrorAction SilentlyContinue
+}
