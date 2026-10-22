@@ -53,9 +53,13 @@ code review, а гейт — лише автоматичний страхува�
   `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1`,
   `modules/BRAVO.Configurator/BRAVO.Configurator.Persistence.psm1`), рідер уже доступний, нового
   dot-source в diff немає, тож K4 там **не компенсує**: рядки, що посилаються на K4, для таких файлів
-  спираються лише на K5 і звичайне review виклику (K1 і K2 там не компенсують пропущену форму, див. їхні межі вище).
-- **K5.** Ціле дерево `RUNTIME_MANIFEST.json` / інтеграція: зміна tracked-файлу без
-  регенерації маніфесту валить runtime-integrity.
+  спираються лише на звичайне review виклику (K1, K2 і K5 не компенсують пропущену форму, див. їхні межі в описі цих контролів).
+- **K5 (вузький, не компенсує обходи на рівні коду).** `RUNTIME_MANIFEST.json` / runtime-integrity:
+  зміна tracked-файлу **після встановлення** без регенерації маніфесту валить перевірку цілісності.
+  Контриб'ютор, який додає обхід у вихідний код, штатно регенерує маніфест
+  (`ci\Update-BRAVORuntimeManifest.ps1 -Apply`; ця процедура задокументована в самому маніфесті
+  та в CLAUDE.md), тому K5 **не** компенсує пропущену форму в PR; він захищає лише від
+  непомічених змін уже розгорнутого дерева.
 
 ## Стани
 
@@ -64,7 +68,7 @@ code review, а гейт — лише автоматичний страхува�
 - `FALSE-POSITIVE` — гейт провалюється на безпечному коді.
 - `CLEAN` — коректно дозволена конструкція, гейт проходить.
 
-Кожен рядок матриці (100 виконуваних рядків) має тест `ReleaseGate/LegacyReaderMatrix/<Id>.<стан>` у
+Кожен рядок матриці (122 виконуваних рядки) має тест `ReleaseGate/LegacyReaderMatrix/<Id>.<стан>` у
 `selftest\BRAVO_SELF_TEST.Governance.ps1`. Невиконуваних рядків немає: X2 (`& 'iex' '...'`)
 виконується як `MISSED` і **не** закритий `ci/Test-BRAVOForbiddenPattern.ps1`. Рядки `MISSED` і `FALSE-POSITIVE`
 явно позначені `KnownLimit` у назві тесту. Покращення гейта, яке змінює такий
@@ -179,7 +183,35 @@ common-набору й їхні псевдоніми (`-ea`, `-wa`, `-infa`, `-e
 | T16 | `& ('Get-Date')` | CLEAN | без хибного FAIL |
 | T17 | `Set-Alias gci2 Get-ChildItem; & ('gci2')` | CLEAN | без хибного FAIL |
 | T18 | `$cmd = 'other'; & ($cmd)` при наявному аліасі рідера | CLEAN | без хибного FAIL |
+| T19 | `$cmd = 'Read-...'; & ([string]$cmd)` (каст у дужках навколо змінної) | DETECTED | виправлено (друге рев'ю PR #497, G1) |
+| T20 | `& (([string]($cmd)))` (вкладені дужки й каст) | DETECTED | виправлено (G1) |
+| T21 | `$cmd = 'Get-Date'; & ([string]$cmd)` | CLEAN | без хибного FAIL |
+| T22 | `& ('Set-Alias') rdr Read-...; rdr` (сеттер аліаса в дужках) | DETECTED | виправлено (G2) |
+| T23 | `& ([string]'New-Alias') rdr Read-...; rdr` (сеттер із кастом) | DETECTED | виправлено (G2) |
+| T24 | `& ('Microsoft.PowerShell.Utility\Set-Alias') rdr Read-...; rdr` | DETECTED | виправлено (G2) |
+| T25 | `& ('sal') -Name rdr -Value Read-...; rdr` | DETECTED | виправлено (G2) |
+| T26 | `& ('Set-Alias') gci2 Get-ChildItem; gci2 -Path X` | CLEAN | без хибного FAIL |
+| T27 | `& $function:Read-BRAVO... -ConfigPath X` (без фігурних дужок) | CLEAN | не є викликом рідера: `-` обриває ім'я змінної, парсер дає ім'я `$function:Read` (порожнє) плюс текст; зафіксовано як контроль (G3) |
+| T28 | `& ${function:Read-BRAVO...}` (function-drive у фігурних дужках) | DETECTED | виправлено (G3) |
+| T29 | `. ${function:Import-BravoLegacyPrimaryConfiguration}` | DETECTED | виправлено (G3) |
+| T30 | `& $function:Get-Foo` (без дужок, парситься як рядок) | CLEAN | без хибного FAIL |
+| T31 | `& ${function:global:Read-...}` | DETECTED | виправлено (третє рев'ю PR #497) |
+| T32 | `& ${function:script:Read-...}` | DETECTED | виправлено |
+| T33 | `& ${function:\Read-...}` | DETECTED | виправлено |
+| T34 | `. ${function:global:Read-...}` | DETECTED | виправлено |
+| T35 | `Set-Alias zz Read-...; & ${alias:zz}` | DETECTED | виправлено |
+| T36 | `Set-Alias zz Get-ChildItem; & ${alias:zz}` | CLEAN | без хибного FAIL |
+| T37 | `& ${function:Get-Foo}` | CLEAN | без хибного FAIL |
+| T38 | `& ${function:global:Get-Foo}` | CLEAN | без хибного FAIL |
+| G8 | `$f = ${function:Read-...}; & $f` (function-drive у змінну) | MISSED | відомий ліміт (dataflow) |
+| G9 | `${function:Read-...}.Invoke()` (виклик методом) | MISSED | відомий ліміт: не CommandAst |
 
+Ціль команди (дужки, лапки, касти) для проходу визначення аліасів і проходу викликів розв'язує одна
+функція `Get-BRAVOAstResolvedCommandTarget` (`Name` для константи, `Variable` для змінної). Виклик через
+drive визначається для форм `${function:<ім'я рідера>}` і `${alias:<аліас рідера>}`; залишок після `drive:`
+нормалізується (початковий `\` чи `/`, scope-кваліфікатори `global:`/`script:`/`local:`/`private:`).
+Залишкові ліміти: dataflow-форми (`$f = ${function:R}; & $f`, G8) і виклик методом
+(`${function:R}.Invoke()`, G9) гейт не бачить.
 Розгортання цілі команди в дужках (`& ('rdr')`, `& ($cmd)`) виконує гейт у циклі пошуку
 викликів: константна ціль йде через `Get-BRAVOAstConstantStringLiteral`, ціль-змінна
 розгортається до `VariableExpressionAst` і далі обробляється наявною гілкою змінної. Рядок у
@@ -212,7 +244,7 @@ common-набору й їхні псевдоніми (`-ea`, `-wa`, `-infa`, `-e
   в дужках/касті (рев'ю PR #497).
 - Свідомо не чіпано (потребують control-flow/dataflow, рішення власника в #239):
   1, 2, 4; також 5, 6, 7.
-- Усі 100 виконуваних рядків зафіксовані тестами (X2 — як відомий ліміт: `ci/Test-BRAVOForbiddenPattern.ps1` його не закриває): майбутнє покращення гейта проявиться як
+- Усі 122 виконуваних рядків зафіксовані тестами (X2 — як відомий ліміт: `ci/Test-BRAVOForbiddenPattern.ps1` його не закриває): майбутнє покращення гейта проявиться як
   навмисне оновлення відповідного `KnownLimit`-тесту та цього документа.
 - Якщо інвестувати далі, рекомендація власника лишається чинною: не точковими
   патчами, а окремим санкціонованим дизайном обмеженого dataflow-проходу.

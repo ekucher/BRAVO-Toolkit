@@ -584,6 +584,42 @@ function Test-BRAVOConfigV2CutoverGates {
         return $null
     }
 
+    # #239 (рев'ю PR #497, G1/G2): єдине розв'язання цілі команди для обох
+    # проходів (визначення аліасів і виклики). GetCommandName() повертає null,
+    # коли ціль - дужки/лапки/каст. Повертає @{ Name; Variable }: Name -
+    # константне ім'я (в т.ч. з дужок, лапок, кастів), Variable -
+    # VariableExpressionAst після розгортання дужок і кастів (`& ($cmd)`,
+    # `& ([string]$cmd)`); обидва $null, якщо ціль неконстантна й не змінна.
+    function Get-BRAVOAstResolvedCommandTarget {
+        param($CommandAst)
+        $resolvedName = $CommandAst.GetCommandName()
+        $resolvedVariable = $null
+        if ([string]::IsNullOrEmpty($resolvedName)) {
+            $resolvedName = $null
+            $first = $CommandAst.CommandElements | Select-Object -First 1
+            if ($first -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                $resolvedVariable = $first
+            } elseif ($first) {
+                $literal = Get-BRAVOAstConstantStringLiteral -AstNode $first
+                if ($literal) {
+                    $resolvedName = $literal.Value
+                } elseif ($first -is [System.Management.Automation.Language.ParenExpressionAst] -or
+                          $first -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+                    $walk = $first
+                    while ($walk) {
+                        if ($walk -is [System.Management.Automation.Language.VariableExpressionAst]) { $resolvedVariable = $walk; break }
+                        if ($walk -is [System.Management.Automation.Language.ParenExpressionAst]) { $walk = $walk.Pipeline }
+                        elseif ($walk -is [System.Management.Automation.Language.PipelineAst] -and $walk.PipelineElements.Count -eq 1) { $walk = $walk.PipelineElements[0] }
+                        elseif ($walk -is [System.Management.Automation.Language.CommandExpressionAst]) { $walk = $walk.Expression }
+                        elseif ($walk -is [System.Management.Automation.Language.ConvertExpressionAst]) { $walk = $walk.Child }
+                        else { $walk = $null }
+                    }
+                }
+            }
+        }
+        return [pscustomobject]@{ Name = $resolvedName; Variable = $resolvedVariable }
+    }
+
     function Get-BRAVOAstEnclosingFunctionName {
         param($AstNode)
         $current = $AstNode.Parent
@@ -790,7 +826,9 @@ function Test-BRAVOConfigV2CutoverGates {
             # і Set-Item Alias: - відомі обмеження (матриця, #239).
             $legacyReaderAliasNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             foreach ($legacyReaderAliasCommandAst in $legacyReaderCommandAsts) {
-                $aliasCmdlet = $legacyReaderAliasCommandAst.GetCommandName()
+                # #239 (рев'ю PR #497, G2): `& ('Set-Alias') rdr Read-...` -
+                # ім'я сеттера теж розв'язується через дужки/лапки/касти.
+                $aliasCmdlet = (Get-BRAVOAstResolvedCommandTarget -CommandAst $legacyReaderAliasCommandAst).Name
                 if (-not [string]::IsNullOrEmpty($aliasCmdlet) -and $aliasCmdlet.Contains('\')) {
                     # Ім'я з префіксом модуля (Microsoft.PowerShell.Utility\Set-Alias).
                     $aliasCmdlet = $aliasCmdlet.Substring($aliasCmdlet.LastIndexOf('\') + 1)
@@ -865,30 +903,11 @@ function Test-BRAVOConfigV2CutoverGates {
 
             foreach ($legacyReaderCommandAst in $legacyReaderCommandAsts) {
                 $enclosingFunctionName = Get-BRAVOAstEnclosingFunctionName -AstNode $legacyReaderCommandAst
-                $invokedCommandName = $legacyReaderCommandAst.GetCommandName()
-                # #239 (рев'ю PR #497, F2): GetCommandName() повертає null,
-                # коли ціль команди - ParenExpressionAst (`& ('rdr')`) чи
-                # вираз у подвійних лапках (`& "rdr"`). Константну ціль
-                # розгортаємо спільним helper-ом; ціль `& ($cmd)` розгортається
-                # до змінної й далі йде звичайною гілкою змінної.
-                $firstCommandElement = $legacyReaderCommandAst.CommandElements | Select-Object -First 1
-                if ([string]::IsNullOrEmpty($invokedCommandName) -and
-                    $firstCommandElement -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
-                    $unwrappedCommandTarget = Get-BRAVOAstConstantStringLiteral -AstNode $firstCommandElement
-                    if ($unwrappedCommandTarget) {
-                        $invokedCommandName = $unwrappedCommandTarget.Value
-                    } elseif ($firstCommandElement -is [System.Management.Automation.Language.ParenExpressionAst]) {
-                        $parenTarget = $firstCommandElement
-                        while ($parenTarget) {
-                            if ($parenTarget -is [System.Management.Automation.Language.VariableExpressionAst]) { break }
-                            if ($parenTarget -is [System.Management.Automation.Language.ParenExpressionAst]) { $parenTarget = $parenTarget.Pipeline }
-                            elseif ($parenTarget -is [System.Management.Automation.Language.PipelineAst] -and $parenTarget.PipelineElements.Count -eq 1) { $parenTarget = $parenTarget.PipelineElements[0] }
-                            elseif ($parenTarget -is [System.Management.Automation.Language.CommandExpressionAst]) { $parenTarget = $parenTarget.Expression }
-                            else { $parenTarget = $null }
-                        }
-                        if ($parenTarget) { $firstCommandElement = $parenTarget }
-                    }
-                }
+                # #239 (рев'ю PR #497, F2/G1): ціль команди в дужках/лапках/касті
+                # розв'язується спільним helper-ом (див. вище).
+                $resolvedCommandTarget = Get-BRAVOAstResolvedCommandTarget -CommandAst $legacyReaderCommandAst
+                $invokedCommandName = $resolvedCommandTarget.Name
+                $firstCommandElement = $resolvedCommandTarget.Variable
                 if (-not [string]::IsNullOrEmpty($invokedCommandName)) {
                     if ($legacyReaderAliasNames.Contains($invokedCommandName)) {
                         [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через alias '$invokedCommandName', що вказує на legacy-рідер)")
@@ -911,7 +930,30 @@ function Test-BRAVOConfigV2CutoverGates {
                 if ($firstCommandElement -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
                     continue
                 }
-                # R6: перевіряємо КОЖЕН рівень охоплюючого scope (від
+                # #239 (рев'ю PR #497, G3): `& ${function:Read-...}` виконує вже
+                # завантажену функцію через function-drive, а `& ${alias:<аліас>}` -
+                # аліас рідера через alias-drive (лише у формі з фігурними
+                # дужками: в `$function:Read-...` без дужок `-` обриває ім'я).
+                # Залишок після `drive:` нормалізується: початковий `\`/`/` і
+                # scope-кваліфікатори (global:/script:/local:/private:) знімаються.
+                $driveUserPath = [string]$firstCommandElement.VariablePath.UserPath
+                if ($driveUserPath -match '^(?i)(?<d>function|alias):(?<n>.+)$') {
+                    $driveKind = $Matches['d'].ToLowerInvariant()
+                    $driveName = $Matches['n'].TrimStart('\', '/')
+                    do {
+                        $driveNameBefore = $driveName
+                        $driveName = (Get-BRAVOAstNormalizedVariableName -UserPath $driveName).TrimStart('\', '/')
+                    } while ($driveName -ne $driveNameBefore)
+                    $driveHit = $false
+                    foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                        if ([string]::Equals($driveName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) { $driveHit = $true }
+                    }
+                    if ($driveKind -eq 'alias' -and $legacyReaderAliasNames.Contains($driveName)) { $driveHit = $true }
+                    if ($driveHit) {
+                        [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через drive `$$driveUserPath, що вказує на legacy-рідер)")
+                        continue
+                    }
+                }                # R6: перевіряємо КОЖЕН рівень охоплюючого scope (від
                 # найглибшого до кореня файлу) — лексичний scoping
                 # PowerShell резолвить змінну назовні, якщо в поточній
                 # функції немає власного присвоєння; перший рівень із
