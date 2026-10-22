@@ -4604,7 +4604,11 @@ function Get-BAZASFTPComparison {
         # read-only stat у хмарі в цій самій сесії. Без знімка — як раніше.
         [object]$LocalSnapshot = $null,
         # Залишок аудиту ДО (див. Add-BAZASnapshotConsistencyEvidence).
-        [object[]]$PreAuditPending = @()
+        [object[]]$PreAuditPending = @(),
+        # Знімок циклу запитано, але він не вдався: LocalSnapshot тоді $null,
+        # а об'єкти аудиту ДО перевіряються у хмарі в цій самій сесії
+        # (Add-BAZASnapshotUnavailableEvidence).
+        [switch]$SnapshotUnavailable
     )
 
     $components = Get-BRAVOWinSCPDotNetComponents `
@@ -4739,6 +4743,13 @@ function Get-BAZASFTPComparison {
                 -Session $session `
                 -RemotePath $RemotePath `
                 -LocalSnapshot $LocalSnapshot `
+                -LocalPath $LocalPath `
+                -PreAuditPending @($PreAuditPending)
+        } elseif ($SnapshotUnavailable) {
+            $comparisonResult = Add-BAZASnapshotUnavailableEvidence `
+                -ComparisonResult $comparisonResult `
+                -Session $session `
+                -RemotePath $RemotePath `
                 -LocalPath $LocalPath `
                 -PreAuditPending @($PreAuditPending)
         }
@@ -5044,13 +5055,27 @@ function Get-BAZARemoteVanishedProbe {
         [object]$Session,
         [string]$RemotePath,
         [object[]]$Vanished = @(),
-        [int]$MaximumProbeCount = 1000
+        [int]$MaximumProbeCount = 1000,
+        # Локальний корінь: якщо задано, для кожного об'єкта ПЕРЕД його stat у
+        # хмарі знімається локальний stat (LocalExists/LocalIsDirectory/
+        # LocalSize/LocalLastWriteTimeUtc) і зберігається в записі проби.
+        # Класифікація порівнює хмару саме з цим знімком, а не з диском пізніше.
+        [string]$LocalRoot = '',
+        # SnapshotUnavailable: об'єкти — аудит ДО, що потребують підтвердження
+        # передачі у хмарі (знімок циклу не вдався); змінює лише текст помилки.
+        [ValidateSet('Snapshot', 'SnapshotUnavailable')]
+        [string]$Context = 'Snapshot'
     )
 
     $entries = @{}
     $vanishedItems = @($Vanished)
     if ($vanishedItems.Count -gt $MaximumProbeCount) {
-        return [pscustomobject]@{ Complete = $false; Error = "зниклих або змінених об'єктів знімка $($vanishedItems.Count) — більше за ліміт перевірки $MaximumProbeCount"; Entries = $entries }
+        $overLimitText = if ($Context -eq 'SnapshotUnavailable') {
+            "об'єктів аудиту ДО, передачу яких потрібно підтвердити у хмарі (знімок циклу не створено), $($vanishedItems.Count) — більше за ліміт перевірки $MaximumProbeCount"
+        } else {
+            "зниклих або змінених об'єктів знімка $($vanishedItems.Count) — більше за ліміт перевірки $MaximumProbeCount"
+        }
+        return [pscustomobject]@{ Complete = $false; Error = $overLimitText; Entries = $entries }
     }
     $remoteRoot = $RemotePath.TrimEnd('/')
     $failedCount = 0
@@ -5058,25 +5083,52 @@ function Get-BAZARemoteVanishedProbe {
     foreach ($vanishedItem in $vanishedItems) {
         $relativePath = [string]$vanishedItem.RelativePath
         $remoteItemPath = $remoteRoot + '/' + $relativePath.Replace('\', '/')
+        # Локальний stat безпосередньо перед stat у хмарі. Збій читання =
+        # LocalExists $false (fail-closed: передачу не буде доведено).
+        $localStat = $null
+        if (-not [string]::IsNullOrWhiteSpace($LocalRoot)) {
+            $localStat = [ordered]@{ LocalExists = $false; LocalIsDirectory = $false; LocalSize = $null; LocalLastWriteTimeUtc = $null }
+            try {
+                $localFullPath = [IO.Path]::Combine($LocalRoot, $relativePath)
+                if ([IO.Directory]::Exists($localFullPath)) {
+                    $localStat.LocalExists = $true
+                    $localStat.LocalIsDirectory = $true
+                } else {
+                    $localFileInfo = New-Object IO.FileInfo($localFullPath)
+                    if ($localFileInfo.Exists) {
+                        $localStat.LocalExists = $true
+                        $localStat.LocalSize = [long]$localFileInfo.Length
+                        $localStat.LocalLastWriteTimeUtc = $localFileInfo.LastWriteTimeUtc.ToString('o')
+                    }
+                }
+            } catch {
+                $localStat = [ordered]@{ LocalExists = $false; LocalIsDirectory = $false; LocalSize = $null; LocalLastWriteTimeUtc = $null }
+            }
+        }
         try {
             if (-not $Session.FileExists($remoteItemPath)) {
-                $entries[$relativePath] = [pscustomobject]@{ Exists = $false; IsDirectory = $false; Size = $null; LastWriteTimeUtc = $null }
-                continue
-            }
-            $remoteInfo = $Session.GetFileInfo($remoteItemPath)
-            $entries[$relativePath] = [pscustomobject]@{
-                Exists = $true
-                IsDirectory = [bool]$remoteInfo.IsDirectory
-                Size = [long]$remoteInfo.Length
-                LastWriteTimeUtc = ([datetime]$remoteInfo.LastWriteTime).ToUniversalTime()
+                $entry = [ordered]@{ Exists = $false; IsDirectory = $false; Size = $null; LastWriteTimeUtc = $null }
+            } else {
+                $remoteInfo = $Session.GetFileInfo($remoteItemPath)
+                $entry = [ordered]@{
+                    Exists = $true
+                    IsDirectory = [bool]$remoteInfo.IsDirectory
+                    Size = [long]$remoteInfo.Length
+                    LastWriteTimeUtc = ([datetime]$remoteInfo.LastWriteTime).ToUniversalTime()
+                }
             }
         } catch {
             # Збій stat одного шляху робить невідомим лише цей об'єкт
             # (Exists = $null -> не доведено -> помилка), а не всю перевірку.
             $failedCount++
-            if ($null -eq $firstError) { $firstError = "перевірка $remoteItemPath у хмарі: $($_.Exception.Message)" }
-            $entries[$relativePath] = [pscustomobject]@{ Exists = $null; IsDirectory = $false; Size = $null; LastWriteTimeUtc = $null }
+            $itemError = "перевірка $remoteItemPath у хмарі: $($_.Exception.Message)"
+            if ($null -eq $firstError) { $firstError = $itemError }
+            $entry = [ordered]@{ Exists = $null; IsDirectory = $false; Size = $null; LastWriteTimeUtc = $null; Error = $itemError }
         }
+        if ($null -ne $localStat) {
+            foreach ($localKey in @($localStat.Keys)) { $entry[$localKey] = $localStat[$localKey] }
+        }
+        $entries[$relativePath] = [pscustomobject]$entry
     }
     return [pscustomobject]@{
         Complete = $true
@@ -5139,11 +5191,72 @@ function Add-BAZASnapshotConsistencyEvidence {
             -Session $Session `
             -RemotePath $RemotePath `
             -Vanished @($probeItems.ToArray()) `
-            -MaximumProbeCount $MaximumProbeCount
+            -MaximumProbeCount $MaximumProbeCount `
+            -LocalRoot $LocalPath
     } else {
         $null
     }
     $ComparisonResult | Add-Member -NotePropertyName SnapshotDrift -NotePropertyValue $snapshotDrift -Force
+    $ComparisonResult | Add-Member -NotePropertyName RemoteProbe -NotePropertyValue $remoteProbe -Force
+    return $ComparisonResult
+}
+
+# Пост-аудит, коли знімок циклу запитано, але він не вдався: звіряти зникнення
+# нема з чим, тож для об'єктів аудиту ДО, яких немає в залишку пост-аудиту,
+# збирається той самий read-only stat у хмарі (Get-BAZARemoteVanishedProbe) в
+# цій самій сесії. Наявність на диску зараз не доводить передачі: файл міг
+# зникнути до WinSCP і бути відтворений після порівняння.
+function Add-BAZASnapshotUnavailableEvidence {
+    param(
+        [object]$ComparisonResult,
+        [object]$Session,
+        [string]$RemotePath,
+        [string]$LocalPath,
+        [int]$MaximumProbeCount = 1000,
+        [object[]]$PreAuditPending = @()
+    )
+
+    $probeItems = New-Object System.Collections.Generic.List[object]
+    $probeSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $probeError = $null
+    try {
+        $coverageRoot = [IO.Path]::GetFullPath($LocalPath).TrimEnd('\', '/')
+        $afterPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($afterItem in @($ComparisonResult.PendingFiles)) {
+            $afterPathProperty = if ($null -ne $afterItem) { $afterItem.PSObject.Properties['Path'] } else { $null }
+            $afterPath = if ($null -ne $afterPathProperty) { [string]$afterPathProperty.Value } else { '' }
+            if ([string]::IsNullOrWhiteSpace($afterPath) -or -not [IO.Path]::IsPathRooted($afterPath)) { continue }
+            [void]$afterPaths.Add([IO.Path]::GetFullPath($afterPath).TrimEnd('\', '/'))
+        }
+        foreach ($preAuditItem in @($PreAuditPending)) {
+            $preAuditPathProperty = if ($null -ne $preAuditItem) { $preAuditItem.PSObject.Properties['Path'] } else { $null }
+            $preAuditPath = if ($null -ne $preAuditPathProperty) { [string]$preAuditPathProperty.Value } else { '' }
+            if ([string]::IsNullOrWhiteSpace($preAuditPath) -or -not [IO.Path]::IsPathRooted($preAuditPath)) { continue }
+            $preAuditFullPath = [IO.Path]::GetFullPath($preAuditPath).TrimEnd('\', '/')
+            if (-not $preAuditFullPath.StartsWith($coverageRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($afterPaths.Contains($preAuditFullPath)) { continue }
+            $preAuditRelative = $preAuditFullPath.Substring($coverageRoot.Length + 1)
+            if (-not $probeSeen.Add($preAuditRelative)) { continue }
+            $preAuditDirectoryProperty = $preAuditItem.PSObject.Properties['IsDirectory']
+            $probeItems.Add([pscustomobject]@{
+                RelativePath = $preAuditRelative
+                IsDirectory = ($null -ne $preAuditDirectoryProperty -and [bool]$preAuditDirectoryProperty.Value)
+            })
+        }
+    } catch {
+        $probeError = "не вдалося визначити об'єкти аудиту ДО для перевірки у хмарі: $($_.Exception.Message)"
+    }
+    $remoteProbe = if ($null -ne $probeError) {
+        [pscustomobject]@{ Complete = $false; Error = $probeError; Entries = @{} }
+    } else {
+        Get-BAZARemoteVanishedProbe `
+            -Session $Session `
+            -RemotePath $RemotePath `
+            -Vanished @($probeItems.ToArray()) `
+            -MaximumProbeCount $MaximumProbeCount `
+            -LocalRoot $LocalPath `
+            -Context 'SnapshotUnavailable'
+    }
     $ComparisonResult | Add-Member -NotePropertyName RemoteProbe -NotePropertyValue $remoteProbe -Force
     return $ComparisonResult
 }
@@ -5566,8 +5679,44 @@ function Get-BAZASynchronizationOutcome {
             $snapshotCoverageRoot = $null
         }
     }
+    # Об'єкт аудиту ДО, якого немає в залишку пост-аудиту, доведено переданим
+    # лише хмарою: повний RemoteProbe пост-аудиту має запис того самого виду, а
+    # для файла — той самий розмір і час (з точністю SFTP) локальної версії,
+    # знятої В ТІЙ САМІЙ пробі безпосередньо перед stat у хмарі (LocalExists/
+    # LocalIsDirectory/LocalSize/LocalLastWriteTimeUtc). Диск тут НЕ перечитується:
+    # зміна чи видалення файла після проби (LIMS дописує) не робить переданий
+    # об'єкт хибною помилкою. Без проби, при неповній пробі, збої stat, відсутніх
+    # збережених локальних полях чи розбіжності — $false (fail-closed).
+    $testPreAuditObjectBackedUp = {
+        param([string]$Path, [string]$RelativePath, [bool]$IsDirectory)
+        try {
+            $probeComplete = $null -ne $remoteProbe -and [bool]$remoteProbe.Complete -and $null -ne $remoteProbe.Entries
+            if (-not ($probeComplete -and $remoteProbe.Entries.ContainsKey($RelativePath))) { return $false }
+            $entryProbe = $remoteProbe.Entries[$RelativePath]
+            foreach ($requiredLocalField in @('LocalExists', 'LocalIsDirectory', 'LocalSize', 'LocalLastWriteTimeUtc')) {
+                if ($null -eq $entryProbe.PSObject.Properties[$requiredLocalField]) { return $false }
+            }
+            if (-not [bool]$entryProbe.LocalExists) { return $false }
+            if ([bool]$entryProbe.LocalIsDirectory -ne $IsDirectory) { return $false }
+            if ($IsDirectory) {
+                $localEntry = $null
+            } else {
+                if ($null -eq $entryProbe.LocalSize -or [string]::IsNullOrWhiteSpace([string]$entryProbe.LocalLastWriteTimeUtc)) { return $false }
+                $localEntry = [pscustomobject]@{ Size = [long]$entryProbe.LocalSize; LastWriteTimeUtc = [string]$entryProbe.LocalLastWriteTimeUtc }
+            }
+            return [bool](Test-BAZAVanishedSnapshotObjectBackedUp `
+                -Vanished ([pscustomobject]@{ RelativePath = $RelativePath; IsDirectory = $IsDirectory }) `
+                -SnapshotEntry $localEntry `
+                -Probe $entryProbe)
+        } catch {
+            return $false
+        }
+    }
     $snapshotUnavailableVanishedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $snapshotUnavailableVanishedCount = 0
+    # Відносні шляхи недоведених об'єктів: з них визначається, чи помилку проби
+    # (stat у хмарі) можна віднести до цих об'єктів.
+    $snapshotUnavailableRelatives = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     if ($verificationSucceeded -and $snapshotRequested) {
         if ($null -eq $beforeSplit) {
             $snapshotConsistencyVerified = $false
@@ -5610,6 +5759,7 @@ function Get-BAZASynchronizationOutcome {
                         # Шлях зайнятий іншим об'єктом: оригінал не захоплено.
                         $snapshotUnavailableVanishedCount++
                         [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath)
+                        [void]$snapshotUnavailableRelatives.Add($beforeRelativePath)
                         continue
                     }
                     # Об'єкт аудиту ДО відсутній у успішному знімку й у залишку
@@ -5619,43 +5769,38 @@ function Get-BAZASynchronizationOutcome {
                     # пост-аудиті): той самий вид, для файла той самий розмір і час
                     # (з точністю SFTP) поточної локальної версії. Інакше —
                     # не доведено (fail-closed), без звернення до голого Exists.
-                    $omittedProven = $false
-                    try {
-                        $omittedProbeComplete = $null -ne $remoteProbe -and [bool]$remoteProbe.Complete -and $null -ne $remoteProbe.Entries
-                        if ($omittedProbeComplete -and $remoteProbe.Entries.ContainsKey($beforeRelativePath)) {
-                            $omittedProbe = $remoteProbe.Entries[$beforeRelativePath]
-                            if ($beforeIsDirectory) {
-                                $omittedLocalExists = [IO.Directory]::Exists($beforePendingPath)
-                                $omittedLocalEntry = $null
-                            } else {
-                                $omittedFile = New-Object IO.FileInfo($beforePendingPath)
-                                $omittedLocalExists = $omittedFile.Exists
-                                $omittedLocalEntry = if ($omittedLocalExists) {
-                                    [pscustomobject]@{ Size = [long]$omittedFile.Length; LastWriteTimeUtc = $omittedFile.LastWriteTimeUtc.ToString('o') }
-                                } else {
-                                    $null
-                                }
-                            }
-                            if ($omittedLocalExists) {
-                                $omittedProven = Test-BAZAVanishedSnapshotObjectBackedUp `
-                                    -Vanished ([pscustomobject]@{ RelativePath = $beforeRelativePath; IsDirectory = $beforeIsDirectory }) `
-                                    -SnapshotEntry $omittedLocalEntry `
-                                    -Probe $omittedProbe
-                            }
-                        }
-                    } catch {
-                        $omittedProven = $false
-                    }
+                    $omittedProven = & $testPreAuditObjectBackedUp $beforePendingPath $beforeRelativePath $beforeIsDirectory
                     if (-not $omittedProven) {
                         $snapshotUnavailableVanishedCount++
                         [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath)
+                        [void]$snapshotUnavailableRelatives.Add($beforeRelativePath)
                     }
                     continue
                 }
-                if ($null -eq $beforePendingPath -or
-                    -not ([IO.File]::Exists($beforePendingPath) -or [IO.Directory]::Exists($beforePendingPath))) {
-                    $snapshotUnavailableVanishedCount++
-                    if ($null -ne $beforePendingPath) { [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath) }
+                # Знімок запитано, але не вдався (або успішний, та покриття
+                # визначити не вдалося): голе Exists не доводить передачі (файл
+                # міг бути відтворений після пост-аудиту), тож потрібен той самий
+                # доказ у хмарі, що й для успішного знімка; інакше — fail-closed.
+                if ($true) {
+                    $failedProven = $false
+                    $failedRelative = $null
+                    $failedRootFull = $null
+                    if ($null -ne $beforePendingPath -and -not [string]::IsNullOrWhiteSpace($LocalRoot)) {
+                        try { $failedRootFull = [IO.Path]::GetFullPath($LocalRoot).TrimEnd('\', '/') } catch { $failedRootFull = $null }
+                    }
+                    if ($null -ne $failedRootFull -and
+                        $beforePendingPath.StartsWith($failedRootFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                        $failedIsDirectoryProperty = $beforePending.PSObject.Properties['IsDirectory']
+                        $failedIsDirectory = $null -ne $failedIsDirectoryProperty -and [bool]$failedIsDirectoryProperty.Value
+                        $failedRelative = $beforePendingPath.Substring($failedRootFull.Length + 1)
+                        $failedProven = & $testPreAuditObjectBackedUp $beforePendingPath $failedRelative $failedIsDirectory
+                    }
+                    if (-not $failedProven) {
+                        $snapshotUnavailableVanishedCount++
+                        if ($null -ne $beforePendingPath) { [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath) }
+                        if ($null -ne $failedRelative) { [void]$snapshotUnavailableRelatives.Add($failedRelative) }
+                    }
+                    continue
                 }
             }
             if ($snapshotUnavailableVanishedCount -gt 0) {
@@ -5664,6 +5809,37 @@ function Get-BAZASynchronizationOutcome {
         }
     }
     $snapshotConsistent = $snapshotConsistencyVerified -and $snapshotDriftViolationCount -eq 0
+    # Причина, з якої хмарою не вдалося довести передачу (ліміт перевірки,
+    # збій stat, проби немає): потрапляє в ERROR замість загального «зникли».
+    # Помилка проби приписується лише тим об'єктам, яких вона стосується: неповна
+    # проба (ліміт, збій підготовки) — усім; повна — лише об'єктам із записом
+    # Exists = $null (stat не вдався). Об'єкт, якого просто немає в хмарі, або
+    # чия локальна версія розійшлася з хмарою, чужою помилкою не позначається.
+    $snapshotProbeError = $null
+    if ($snapshotUnavailableVanishedCount -gt 0) {
+        $snapshotProbeError = if ($null -eq $remoteProbe) {
+            'доказ у хмарі не зібрано'
+        } elseif ([string]::IsNullOrWhiteSpace([string]$remoteProbe.Error)) {
+            $null
+        } elseif (-not [bool]$remoteProbe.Complete -or $null -eq $remoteProbe.Entries) {
+            [string]$remoteProbe.Error
+        } else {
+            $attributedErrors = New-Object System.Collections.Generic.List[string]
+            foreach ($unavailableRelative in @($snapshotUnavailableRelatives)) {
+                if (-not $remoteProbe.Entries.ContainsKey($unavailableRelative)) { continue }
+                $unavailableEntry = $remoteProbe.Entries[$unavailableRelative]
+                $existsProperty = $unavailableEntry.PSObject.Properties['Exists']
+                if ($null -eq $existsProperty -or $null -ne $existsProperty.Value) { continue }
+                $entryErrorProperty = $unavailableEntry.PSObject.Properties['Error']
+                $attributedErrors.Add($(if ($null -ne $entryErrorProperty -and -not [string]::IsNullOrWhiteSpace([string]$entryErrorProperty.Value)) { [string]$entryErrorProperty.Value } else { $unavailableRelative }))
+            }
+            if ($attributedErrors.Count -gt 0) {
+                "не перевірено у хмарі: $($attributedErrors.Count); $($attributedErrors[0])"
+            } else {
+                $null
+            }
+        }
+    }
     $remainingCount = if ($verificationSucceeded) {
         @($ComparisonAfter.PendingFiles).Count
     } else {
@@ -5728,6 +5904,7 @@ function Get-BAZASynchronizationOutcome {
         SnapshotDriftViolationCount = $snapshotDriftViolationCount
         SnapshotUnavailableVanishedCount = $snapshotUnavailableVanishedCount
         SnapshotUnavailableVanished = @($snapshotUnavailableVanishedPaths)
+        SnapshotProbeError = $snapshotProbeError
         CycleClassification = $cycleClassification
         IsComplete = (
             $WinSCPExitCode -eq 0 -and
@@ -6592,7 +6769,8 @@ exit
             -RepositorySFTPUrl $RepositorySFTPUrl `
             -HostKey $HostKey `
             -LocalSnapshot $(if ($cycleSnapshot.Success) { $cycleSnapshot } else { $null }) `
-            -PreAuditPending $(if ($null -ne $comparisonBefore -and $comparisonBefore.Success) { @($comparisonBefore.PendingFiles) } else { @() })
+            -PreAuditPending $(if ($null -ne $comparisonBefore -and $comparisonBefore.Success) { @($comparisonBefore.PendingFiles) } else { @() }) `
+            -SnapshotUnavailable:(-not $cycleSnapshot.Success)
         $syncOutcome = Get-BAZASynchronizationOutcome `
             -WinSCPExitCode $winSCPExitCode `
             -ComparisonBefore $comparisonBefore `
@@ -6676,7 +6854,12 @@ exit
             $driftReason = if ([int]$syncOutcome.SnapshotUnavailableVanishedCount -gt 0) {
                 $unavailablePreview = @(@($syncOutcome.SnapshotUnavailableVanished) | Select-Object -First 20) -join '; '
                 $unavailableCause = if ($syncOutcome.SnapshotAvailable) { "знімок циклу не містить об'єктів аудиту ДО" } else { "знімок циклу не створено" }
-                "${unavailableCause}, а об'єкти аудиту ДО зникли або замінені локально без підтвердження передачі: $($syncOutcome.SnapshotUnavailableVanishedCount) ($unavailablePreview)"
+                if (-not [string]::IsNullOrWhiteSpace([string]$syncOutcome.SnapshotProbeError)) {
+                    $unavailableAction = if ($syncOutcome.SnapshotAvailable) { 'повторіть цикл' } else { 'повторіть цикл або усуньте причину збою знімка' }
+                    "${unavailableCause}, а передачу об'єктів аудиту ДО у хмарі не підтверджено (причина: $($syncOutcome.SnapshotProbeError)): $($syncOutcome.SnapshotUnavailableVanishedCount) ($unavailablePreview); $unavailableAction"
+                } else {
+                    "${unavailableCause}, а об'єкти аудиту ДО зникли або замінені локально без підтвердження передачі: $($syncOutcome.SnapshotUnavailableVanishedCount) ($unavailablePreview)"
+                }
             } elseif (-not $syncOutcome.SnapshotConsistencyVerified) {
                 "звіряння знімка циклу з локальним деревом не виконано"
             } else {

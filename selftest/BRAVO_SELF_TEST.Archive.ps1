@@ -1896,7 +1896,7 @@ function Initialize-BRAVOSFTPRemoteDirectories { param($WinSCPPath, $RepositoryS
 # Фейк read-only CompareDirectories(Remote, removeFiles=$false): усе локальне,
 # чого немає в хмарі, — UploadNew; інший розмір — UploadUpdate.
 function Get-BAZASFTPComparison {
-    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey, $LocalSnapshot = $null)
+    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey, $LocalSnapshot = $null, [object[]]$PreAuditPending = @(), [switch]$SnapshotUnavailable)
     $script:late501ComparisonCalls++
     $script:late501ComponentComparisons++
     if ($script:late501AfterAuditFails -and $script:late501ComparisonCalls -ge 2) {
@@ -1913,7 +1913,20 @@ function Get-BAZASFTPComparison {
         Invoke-Late501Ops -Stage 'AfterCompare'
         $result = Add-BAZASnapshotConsistencyEvidence -ComparisonResult $result -Session (New-Late501FakeSession -RemotePath $RemotePath) `
             -RemotePath $RemotePath -LocalSnapshot $LocalSnapshot -LocalPath $LocalPath -MaximumProbeCount $script:late501ProbeCap `
-            -PreAuditPending @($script:late501PreAuditPending)
+            -PreAuditPending @($PreAuditPending)
+        # Стадія AfterProbe: LIMS діє ПІСЛЯ збору проби (локальний + хмарний stat),
+        # але до класифікації результату.
+        Invoke-Late501Ops -Stage 'AfterProbe'
+    }
+    # Знімок запитано, але не вдався (LocalSnapshot $null): та сама production-
+    # функція збирає stat у хмарі для об'єктів аудиту ДО, LIMS діє на стадії
+    # AfterCompare між порівнянням і збиранням доказу.
+    if ($null -eq $LocalSnapshot -and $SnapshotUnavailable) {
+        Invoke-Late501Ops -Stage 'AfterCompare'
+        $result = Add-BAZASnapshotUnavailableEvidence -ComparisonResult $result -Session (New-Late501FakeSession -RemotePath $RemotePath) `
+            -RemotePath $RemotePath -LocalPath $LocalPath -MaximumProbeCount $script:late501ProbeCap `
+            -PreAuditPending @($PreAuditPending)
+        Invoke-Late501Ops -Stage 'AfterProbe'
     }
     # Перший аудит компонента — ДО синхронізації: LIMS діє вже після нього.
     if ($script:late501ComponentComparisons -eq 1) { Invoke-Late501Ops -Stage 'BeforeAudit' }
@@ -2051,7 +2064,7 @@ $late501Module = New-BRAVOSelfTestRuntimeModule `
         'Start-BRAVOProcessOutputCapture', 'Complete-BRAVOProcessOutputCapture',
         'Write-BAZASFTPComparisonAudit', 'Test-BAZAPathBlockedByIncompatibleName', 'Split-BAZAPendingFilesByCompatibility',
         'Get-BAZASyncStartBoundaryUtc', 'Test-BAZACreationClockTrusted', 'Test-BAZAVanishedSnapshotObjectBackedUp', 'Get-BAZARemoteVanishedProbe',
-        'Add-BAZASnapshotConsistencyEvidence', 'Test-BAZAPathHasReparsePoint', 'New-Late501FakeSession',
+        'Add-BAZASnapshotConsistencyEvidence', 'Add-BAZASnapshotUnavailableEvidence', 'Test-BAZAPathHasReparsePoint', 'New-Late501FakeSession',
         'Get-BAZAPendingFileCycleClassification', 'Get-BAZASynchronizationOutcome', 'Sync-FolderToSFTP',
         'Invoke-BRAVOBazaCanonicalSync', 'New-BRAVOTransferOperationResult', 'Invoke-ManualBAZASFTPSynchronization',
         'Get-BRAVOManualSyncRunOutcomeLabel', 'Resolve-BRAVOSyncBazaExitCode', 'Resolve-BRAVOLogComponentFromHeader'
@@ -2999,6 +3012,213 @@ try {
         -not $rf30c.App.IsComplete -and $rf30c.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf30c.App.CompletedCount -eq 1
     ) -Name 'Archive/501/F30cSnapshotOmittedOverProbeLimitIsError' `
       -Failure "понад ліміт перевірки у хмарі об'єкт поза знімком лишається помилкою; label=$($rf30c.Label) exit=$($rf30c.ExitCode) vanished=$($rf30c.App.SnapshotUnavailableVanishedCount) completed=$($rf30c.App.CompletedCount)"
+
+    # F31 (Codex, PR #503, P1). Знімок запитано, але не вдався; pending_2 зник ДО
+    # WinSCP (і до пост-аудиту), а LIMS відтворив його ПІСЛЯ порівняння: на диску
+    # він є, у залишку пост-аудиту й у хмарі його немає. Голе Exists не доводить
+    # передачі -> не рахується переданим, ПОМИЛКА.
+    $f31 = & $late501NewCase 'F31'
+    $f31Path = Join-Path $f31.App 'KZ\2026\pending_2.pdf'
+    $rf31 = & $late501Run -CaseRoot $f31.Root -Remote $f31.Remote -SnapshotFails -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f31Path),
+        (& $late501Op 'AfterCompare' 'Write' $f31Path -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf31.Manual.Success -and $rf31.Label -eq 'ПОМИЛКА' -and $rf31.ExitCode -eq 50 -and
+        -not $rf31.App.IsComplete -and -not $rf31.App.SnapshotConsistencyVerified -and
+        $rf31.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf31.App.CompletedCount -eq 1 -and
+        @(& $late501Errors $rf31 | Where-Object { $_.Message -like '*BAZA_APP не підтверджено: знімок циклу не створено*pending_2.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F31SnapshotFailedReappearedPendingWithoutCloudEvidenceIsError' `
+      -Failure "без знімка відтворений після пост-аудиту файл аудиту ДО без версії у хмарі не є переданим; label=$($rf31.Label) exit=$($rf31.ExitCode) complete=$($rf31.App.IsComplete) vanished=$($rf31.App.SnapshotUnavailableVanishedCount) completed=$($rf31.App.CompletedCount)"
+
+    # F31b. Контроль: знімок не вдався, pending_2 відтворено до старту WinSCP й
+    # передано; повна проба в тій самій сесії підтверджує той самий розмір і час
+    # -> передано, УСПІШНО.
+    $f31b = & $late501NewCase 'F31b'
+    $f31bPath = Join-Path $f31b.App 'KZ\2026\pending_2.pdf'
+    $rf31b = & $late501Run -CaseRoot $f31b.Root -Remote $f31b.Remote -SnapshotFails -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f31bPath),
+        (& $late501Op 'Snapshot' 'Write' $f31bPath -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        $rf31b.Manual.Success -and $rf31b.Label -eq 'УСПІШНО' -and $rf31b.ExitCode -eq 0 -and
+        $rf31b.App.IsComplete -and $rf31b.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf31b.App.CompletedCount -eq 2
+    ) -Name 'Archive/501/F31bSnapshotFailedPendingConfirmedInCloudIsSuccess' `
+      -Failure "без знімка файл аудиту ДО з підтвердженою у хмарі версією рахується переданим; label=$($rf31b.Label) exit=$($rf31b.ExitCode) vanished=$($rf31b.App.SnapshotUnavailableVanishedCount) completed=$($rf31b.App.CompletedCount)"
+
+    # F31c. Те саме, але ліміт перевірки у хмарі 0 -> проба неповна -> ПОМИЛКА.
+    $f31c = & $late501NewCase 'F31c'
+    $f31cPath = Join-Path $f31c.App 'KZ\2026\pending_2.pdf'
+    $rf31c = & $late501Run -CaseRoot $f31c.Root -Remote $f31c.Remote -SnapshotFails -ProbeCap 0 -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f31cPath),
+        (& $late501Op 'Snapshot' 'Write' $f31cPath -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf31c.Manual.Success -and $rf31c.Label -eq 'ПОМИЛКА' -and $rf31c.ExitCode -eq 50 -and
+        -not $rf31c.App.IsComplete -and $rf31c.App.SnapshotUnavailableVanishedCount -eq 2 -and $rf31c.App.CompletedCount -eq 0 -and
+        @(& $late501Errors $rf31c | Where-Object { $_.Message -like '*BAZA_APP не підтверджено: знімок циклу не створено*причина:*більше за ліміт перевірки 0*повторіть цикл*' }).Count -eq 1
+    ) -Name 'Archive/501/F31cSnapshotFailedOverProbeLimitIsError' `
+      -Failure "без знімка понад ліміт перевірки у хмарі лишається помилкою; label=$($rf31c.Label) exit=$($rf31c.ExitCode) vanished=$($rf31c.App.SnapshotUnavailableVanishedCount) completed=$($rf31c.App.CompletedCount)"
+
+    # F31d. Те саме, але stat у хмарі для pending_2 не вдався -> версію не доведено.
+    $f31d = & $late501NewCase 'F31d'
+    $f31dPath = Join-Path $f31d.App 'KZ\2026\pending_2.pdf'
+    $rf31d = & $late501Run -CaseRoot $f31d.Root -Remote $f31d.Remote -SnapshotFails -ProbeErrorPaths @('KZ\2026\pending_2.pdf') -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f31dPath),
+        (& $late501Op 'Snapshot' 'Write' $f31dPath -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf31d.Manual.Success -and $rf31d.Label -eq 'ПОМИЛКА' -and $rf31d.ExitCode -eq 50 -and
+        -not $rf31d.App.IsComplete -and $rf31d.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf31d.App.CompletedCount -eq 1 -and
+        @(& $late501Errors $rf31d | Where-Object { $_.Message -like '*BAZA_APP не підтверджено: знімок циклу не створено*причина:*симульований збій stat*pending_2.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F31dSnapshotFailedProbeErrorIsError' `
+      -Failure "без знімка збій stat у хмарі не дає доказу; label=$($rf31d.Label) exit=$($rf31d.ExitCode) vanished=$($rf31d.App.SnapshotUnavailableVanishedCount) completed=$($rf31d.App.CompletedCount)"
+
+    # F31e. Контроль для каталогу: знімок не вдався, новий каталог аудиту ДО
+    # передано, проба підтверджує той самий вид -> передано, УСПІШНО.
+    $f31e = & $late501NewCase 'F31e'
+    [void](New-Item -ItemType Directory -Path (Join-Path $f31e.App 'KZ\newdir') -Force)
+    $rf31e = & $late501Run -CaseRoot $f31e.Root -Remote $f31e.Remote -SnapshotFails
+    Test-BRAVOCondition -Condition (
+        $rf31e.Manual.Success -and $rf31e.Label -eq 'УСПІШНО' -and $rf31e.App.IsComplete -and
+        $rf31e.App.BeforeCount -eq 3 -and $rf31e.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf31e.App.CompletedCount -eq 3
+    ) -Name 'Archive/501/F31eSnapshotFailedDirectoryConfirmedInCloudIsSuccess' `
+      -Failure "без знімка каталог аудиту ДО з підтвердженим у хмарі видом рахується переданим; label=$($rf31e.Label) before=$($rf31e.App.BeforeCount) vanished=$($rf31e.App.SnapshotUnavailableVanishedCount) completed=$($rf31e.App.CompletedCount)"
+
+    # F31f. Каталог аудиту ДО зник до WinSCP і відтворений після пост-аудиту:
+    # у хмарі його немає -> не передано, ПОМИЛКА.
+    $f31f = & $late501NewCase 'F31f'
+    $f31fDir = Join-Path $f31f.App 'KZ\newdir'
+    [void](New-Item -ItemType Directory -Path $f31fDir -Force)
+    $rf31f = & $late501Run -CaseRoot $f31f.Root -Remote $f31f.Remote -SnapshotFails -Ops @(
+        (& $late501Op 'BeforeAudit' 'DeleteTree' $f31fDir),
+        (& $late501Op 'AfterCompare' 'MkDir' $f31fDir)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf31f.Manual.Success -and $rf31f.Label -eq 'ПОМИЛКА' -and -not $rf31f.App.IsComplete -and
+        $rf31f.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf31f.App.CompletedCount -eq 2
+    ) -Name 'Archive/501/F31fSnapshotFailedReappearedDirectoryWithoutCloudEvidenceIsError' `
+      -Failure "без знімка відтворений каталог аудиту ДО без версії у хмарі не є переданим; label=$($rf31f.Label) vanished=$($rf31f.App.SnapshotUnavailableVanishedCount) completed=$($rf31f.App.CompletedCount)"
+
+    # F32 (Codex, PR #503, P2). Доказ передачі об'єкта аудиту ДО — локальний stat,
+    # знятий у пробі безпосередньо перед stat у хмарі, а не повторне читання диска
+    # пізніше. Знімок не вдався; pending_2 (UploadUpdate: у хмарі стара версія) передано;
+    # проба бачить у хмарі ту саму версію, а ПІСЛЯ проби LIMS дописує файл (F32a) або
+    # видаляє його (F32b) -> передача була, це не ПОМИЛКА.
+    $f32a = & $late501NewCase 'F32a'
+    $f32aPath = Join-Path $f32a.App 'KZ\2026\pending_2.pdf'
+    $f32a.Remote['/baza_app']['KZ\2026\pending_2.pdf'] = 150
+    $rf32a = & $late501Run -CaseRoot $f32a.Root -Remote $f32a.Remote -SnapshotFails -Ops @(& $late501Op 'AfterProbe' 'Write' $f32aPath -Size 300)
+    Test-BRAVOCondition -Condition (
+        $rf32a.Manual.Success -and $rf32a.Label -eq 'УСПІШНО' -and $rf32a.ExitCode -eq 0 -and
+        $rf32a.App.IsComplete -and $rf32a.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf32a.App.CompletedCount -eq 2 -and
+        @(& $late501Errors $rf32a).Count -eq 0
+    ) -Name 'Archive/501/F32aSnapshotFailedTransferredThenAppendedAfterProbeIsNotError' `
+      -Failure "файл аудиту ДО, переданий і дописаний ПІСЛЯ проби, не є помилкою; label=$($rf32a.Label) exit=$($rf32a.ExitCode) vanished=$($rf32a.App.SnapshotUnavailableVanishedCount) completed=$($rf32a.App.CompletedCount) errors=$((& $late501Errors $rf32a | ForEach-Object { $_.Message }) -join ' | ')"
+
+    $f32b = & $late501NewCase 'F32b'
+    $f32bPath = Join-Path $f32b.App 'KZ\2026\pending_2.pdf'
+    $f32b.Remote['/baza_app']['KZ\2026\pending_2.pdf'] = 150
+    $rf32b = & $late501Run -CaseRoot $f32b.Root -Remote $f32b.Remote -SnapshotFails -Ops @(& $late501Op 'AfterProbe' 'Delete' $f32bPath)
+    Test-BRAVOCondition -Condition (
+        $rf32b.Manual.Success -and $rf32b.Label -eq 'УСПІШНО' -and $rf32b.ExitCode -eq 0 -and
+        $rf32b.App.IsComplete -and $rf32b.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf32b.App.CompletedCount -eq 2 -and
+        @(& $late501Errors $rf32b).Count -eq 0
+    ) -Name 'Archive/501/F32bSnapshotFailedTransferredThenDeletedAfterProbeIsNotError' `
+      -Failure "файл аудиту ДО, переданий і видалений ПІСЛЯ проби, не є помилкою; label=$($rf32b.Label) exit=$($rf32b.ExitCode) vanished=$($rf32b.App.SnapshotUnavailableVanishedCount) completed=$($rf32b.App.CompletedCount) errors=$((& $late501Errors $rf32b | ForEach-Object { $_.Message }) -join ' | ')"
+
+    # F32c. Контроль fail-closed: те саме, але файл ЗМІНЕНО ДО проби (після
+    # порівняння; локальний stat проби розходиться з хмарою) -> не доведено -> ПОМИЛКА.
+    $f32c = & $late501NewCase 'F32c'
+    $f32cPath = Join-Path $f32c.App 'KZ\2026\pending_2.pdf'
+    $rf32c = & $late501Run -CaseRoot $f32c.Root -Remote $f32c.Remote -SnapshotFails -Ops @(& $late501Op 'AfterCompare' 'Write' $f32cPath -Size 300)
+    Test-BRAVOCondition -Condition (
+        -not $rf32c.Manual.Success -and $rf32c.Label -eq 'ПОМИЛКА' -and $rf32c.ExitCode -eq 50 -and
+        $rf32c.App.SnapshotUnavailableVanishedCount -eq 1
+    ) -Name 'Archive/501/F32cSnapshotFailedModifiedBeforeProbeStaysError' `
+      -Failure "файл, змінений до проби (інша версія, ніж у хмарі), лишається помилкою; label=$($rf32c.Label) exit=$($rf32c.ExitCode) vanished=$($rf32c.App.SnapshotUnavailableVanishedCount)"
+
+    # F32d. Змішана причина (знімок не вдався): pending_1 відтворено після порівняння
+    # (у хмарі його немає), для pending_2 stat у хмарі не вдався. Помилку проби
+    # віднесено лише до pending_2, суфікс про збій знімка є (знімок справді не вдався).
+    $f32d = & $late501NewCase 'F32d'
+    $f32d1 = Join-Path $f32d.App 'KZ\2026\pending_1.pdf'
+    $f32d2 = Join-Path $f32d.App 'KZ\2026\pending_2.pdf'
+    $rf32d = & $late501Run -CaseRoot $f32d.Root -Remote $f32d.Remote -SnapshotFails -ProbeErrorPaths @('KZ\2026\pending_2.pdf') -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f32d1),
+        (& $late501Op 'AfterCompare' 'Write' $f32d1 -Size 200),
+        (& $late501Op 'BeforeAudit' 'Delete' $f32d2),
+        (& $late501Op 'Snapshot' 'Write' $f32d2 -Size 200)
+    )
+    $f32dErrors = @(& $late501Errors $rf32d | Where-Object { $_.Message -like '*BAZA_APP не підтверджено: знімок циклу не створено*' })
+    Test-BRAVOCondition -Condition (
+        -not $rf32d.Manual.Success -and $rf32d.ExitCode -eq 50 -and $rf32d.App.SnapshotUnavailableVanishedCount -eq 2 -and
+        $rf32d.App.SnapshotProbeError -like '*не перевірено у хмарі: 1;*pending_2.pdf*' -and
+        $rf32d.App.SnapshotProbeError -notlike '*pending_1.pdf*' -and
+        $f32dErrors.Count -eq 1 -and $f32dErrors[0].Message -like '*(причина: не перевірено у хмарі: 1;*pending_2.pdf*)*усуньте причину збою знімка*'
+    ) -Name 'Archive/501/F32dMixedCauseProbeErrorAttributedOnlyToStatFailedObject' `
+      -Failure "помилка проби має стосуватися лише об'єкта зі збоєм stat; probeError=$($rf32d.App.SnapshotProbeError) msg=$(@($f32dErrors | ForEach-Object { $_.Message }) -join ' | ')"
+
+    # F32e. УСПІШНИЙ знімок: pending_1 відтворено після порівняння (поза знімком, у
+    # хмарі немає), synced_1 зник після знімка, а stat у хмарі для synced_1 не вдався.
+    # Помилка проби стосується synced_1 (порушення знімка), а не pending_1: у причині
+    # недоведеного об'єкта її немає; суфікса про збій знімка теж немає.
+    $f32e = & $late501NewCase 'F32e'
+    $f32e1 = Join-Path $f32e.App 'KZ\2026\pending_1.pdf'
+    $rf32e = & $late501Run -CaseRoot $f32e.Root -Remote $f32e.Remote -ProbeErrorPaths @('KZ\2026\synced_1.pdf') -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f32e1),
+        (& $late501Op 'AfterCompare' 'Write' $f32e1 -Size 200),
+        (& $late501Op 'Sync' 'Delete' (Join-Path $f32e.App 'KZ\2026\synced_1.pdf'))
+    )
+    $f32eErrors = @(& $late501Errors $rf32e | Where-Object { $_.Message -like '*BAZA_APP не підтверджено:*' })
+    Test-BRAVOCondition -Condition (
+        -not $rf32e.Manual.Success -and $rf32e.App.SnapshotAvailable -and $rf32e.App.SnapshotUnavailableVanishedCount -eq 1 -and
+        $null -eq $rf32e.App.SnapshotProbeError -and
+        $f32eErrors.Count -eq 1 -and $f32eErrors[0].Message -notlike '*причина:*' -and $f32eErrors[0].Message -notlike '*збою знімка*'
+    ) -Name 'Archive/501/F32eProbeErrorOfOtherObjectIsNotBlamedOnUnavailableObject' `
+      -Failure "помилка stat іншого об'єкта не відноситься до недоведеного pending_1; probeError=$($rf32e.App.SnapshotProbeError) msg=$(@($f32eErrors | ForEach-Object { $_.Message }) -join ' | ')"
+
+    # F32f. Успішний знімок + збій stat саме недоведеного об'єкта (F30b): причина є,
+    # а "збою знімка" немає — знімок не падав.
+    $f32fErrors = @(& $late501Errors $rf30b | Where-Object { $_.Message -like '*BAZA_APP не підтверджено:*' })
+    Test-BRAVOCondition -Condition (
+        $rf30b.App.SnapshotAvailable -and $f32fErrors.Count -eq 1 -and
+        $f32fErrors[0].Message -like '*(причина: не перевірено у хмарі: 1;*pending_2.pdf*); повторіть цикл*' -and
+        $f32fErrors[0].Message -notlike '*збою знімка*'
+    ) -Name 'Archive/501/F32fSuccessfulSnapshotProbeErrorHasNoSnapshotFailureSuffix' `
+      -Failure "за успішного знімка в помилці не має бути 'збою знімка'; msg=$(@($f32fErrors | ForEach-Object { $_.Message }) -join ' | ')"
+
+    # F32g. Зберігання локального stat у записі проби і контракт Get-BAZASynchronizationOutcome:
+    # без збережених локальних полів / LocalExists $false / розбіжність розміру -> не доведено;
+    # повний запис -> доведено (диск не читається: шляхів на диску не існує).
+    $f32g = & $late501Module {
+        $root = 'C:\selftest-f32g\root'
+        $time = New-Object DateTime 2026, 10, 20, 12, 30, 45, ([DateTimeKind]::Utc)
+        $mk = {
+            param([hashtable]$Local)
+            $entry = [ordered]@{ Exists = $true; IsDirectory = $false; Size = 200; LastWriteTimeUtc = $time }
+            foreach ($key in $Local.Keys) { $entry[$key] = $Local[$key] }
+            $probe = [pscustomobject]@{ Complete = $true; Error = $null; Entries = @{ 'KZ\a.pdf' = [pscustomobject]$entry } }
+            $before = [pscustomobject]@{ Success = $true; PendingFiles = @([pscustomobject]@{ Action = 'UploadUpdate'; Path = "$root\KZ\a.pdf"; IsDirectory = $false; SizeBytes = 200 }) }
+            $after = [pscustomobject]@{ Success = $true; PendingFiles = @(); RemoteProbe = $probe }
+            (Get-BAZASynchronizationOutcome -WinSCPExitCode 0 -ComparisonBefore $before -ComparisonAfter $after `
+                -LocalSnapshot ([pscustomobject]@{ Success = $false; Error = 'selftest' }) -LocalRoot $root).SnapshotUnavailableVanishedCount
+        }
+        $stored = @{ LocalExists = $true; LocalIsDirectory = $false; LocalSize = 200; LocalLastWriteTimeUtc = $time.ToString('o') }
+        [pscustomobject]@{
+            Full = (& $mk $stored)
+            NoFields = (& $mk @{})
+            PartialFields = (& $mk @{ LocalExists = $true; LocalIsDirectory = $false })
+            LocalMissing = (& $mk @{ LocalExists = $false; LocalIsDirectory = $false; LocalSize = $null; LocalLastWriteTimeUtc = $null })
+            SizeMismatch = (& $mk @{ LocalExists = $true; LocalIsDirectory = $false; LocalSize = 300; LocalLastWriteTimeUtc = $time.ToString('o') })
+            KindMismatch = (& $mk @{ LocalExists = $true; LocalIsDirectory = $true; LocalSize = $null; LocalLastWriteTimeUtc = $null })
+        }
+    }
+    Test-BRAVOCondition -Condition (
+        $f32g.Full -eq 0 -and $f32g.NoFields -eq 1 -and $f32g.PartialFields -eq 1 -and
+        $f32g.LocalMissing -eq 1 -and $f32g.SizeMismatch -eq 1 -and $f32g.KindMismatch -eq 1
+    ) -Name 'Archive/501/F32gPreAuditProofUsesOnlyStoredLocalStatAndFailsClosed' `
+      -Failure "доказ лише зі збереженого локального stat: $($f32g | ConvertTo-Json -Compress)"
 
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
