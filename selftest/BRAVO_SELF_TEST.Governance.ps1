@@ -3837,6 +3837,187 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         Remove-Item -LiteralPath $legacyReaderExplicitScopeFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # ======================================================================
+    # ReleaseGate/LegacyReaderMatrix/* (issue #239): загрозо-орієнтована
+    # матриця обходів гейта LEGACY_READER_ISOLATION. Кожен клас обходу з
+    # docs\design\BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md має тут рядок-
+    # характеризацію на синтетичному тексті скрипта (у тимчасовому корені,
+    # продакшн-файли не чіпаються).
+    #   DETECTED       - гейт ловить обхід (регресія гейта провалить тест).
+    #   CLEAN          - коректно дозволена конструкція (немає хибного FAIL).
+    #   MISSED         - ВІДОМЕ ОБМЕЖЕННЯ: гейт обхід НЕ бачить. Рядок
+    #                    фіксує поточну поведінку; покращення гейта мусить
+    #                    свідомо змінити цей рядок разом з матрицею.
+    #   FALSE-POSITIVE - ВІДОМЕ ОБМЕЖЕННЯ: гейт хибно провалює безпечний код.
+    # Рішення власника про зупинку ітерацій над гейтом - issue #239.
+    # ======================================================================
+    function Get-BRAVOLegacyReaderMatrixVerdict {
+        param([string]$RelativePath, [string]$Text)
+        $matrixRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+        try {
+            $matrixFilePath = Join-Path $matrixRoot $RelativePath
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $matrixFilePath))
+            [IO.File]::WriteAllText($matrixFilePath, $Text, (New-Object Text.UTF8Encoding($false)))
+            $matrixResult = Test-BRAVOConfigV2CutoverGates -Root $matrixRoot -ProductionEntryPointRelativePath @('entry.ps1')
+            return (@($matrixResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains($RelativePath + ' (') }).Count -gt 0)
+        } finally {
+            Remove-Item -LiteralPath $matrixRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $matrixModule = 'modules\BRAVO.Matrix\BRAVO.Matrix.psm1'
+    $matrixLoader = 'BRAVO_CONFIG_LOADER.ps1'
+    $matrixSanctionedLoader = @'
+function Read-BRAVOLegacyPrimaryRawOverrides { param($ConfigPath) }
+function Import-BravoLegacyPrimaryConfiguration { param($ConfigPath); $x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath $ConfigPath }
+function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyPrimaryAutoDetect); if (-not $DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } }
+'@
+    $matrixRows = @(
+        # --- Виявлені класи ---
+        @{ Id = 'D01.DirectCall'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }' },
+        @{ Id = 'D02.DirectCallOtherCase'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { read-bravolegacyprimaryrawoverrides -ConfigPath X }' },
+        @{ Id = 'D03.SecondReaderFunction'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { Import-BravoLegacyPrimaryConfiguration -ConfigPath X }' },
+        @{ Id = 'D04.QuotedCallOperator'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & 'Read-BRAVOLegacyPrimaryRawOverrides' -ConfigPath X }" },
+        @{ Id = 'D05.NestedScriptBlock'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { Invoke-Command -ScriptBlock { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X } }' },
+        @{ Id = 'D06.StringVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r -ConfigPath X }" },
+        @{ Id = 'D07.DotSourceVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; . `$r -ConfigPath X }" },
+        @{ Id = 'D08.ParentScopeVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "`$r = 'Read-BRAVOLegacyPrimaryRawOverrides'`nfunction F { & `$r }" },
+        @{ Id = 'D09.ScriptQualifiedCallAtRoot'; Kind = 'DETECTED'; Path = $matrixModule; Text = "`$r = 'Read-BRAVOLegacyPrimaryRawOverrides'`nfunction F { & `$script:r }" },
+        @{ Id = 'D10.ParseErrorFailsClosed'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { if ( ' },
+        @{ Id = 'D11.SecondCallFromSanctionedCaller'; Kind = 'DETECTED'; Path = $matrixLoader; Text = ($matrixSanctionedLoader + "`nfunction Import-BravoLegacyPrimaryConfiguration { `$y = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath Z }") },
+        @{ Id = 'D12.UnsanctionedCallInsideLoader'; Kind = 'DETECTED'; Path = $matrixLoader; Text = ($matrixSanctionedLoader + "`nfunction Invoke-Rogue { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath Y }") },
+        # --- Коректно дозволене ---
+        @{ Id = 'C01.SanctionedLoaderCallSites'; Kind = 'CLEAN'; Path = $matrixLoader; Text = $matrixSanctionedLoader },
+        @{ Id = 'C02.CommentAndStringMention'; Kind = 'CLEAN'; Path = $matrixModule; Text = "# Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { 'Read-BRAVOLegacyPrimaryRawOverrides' }" },
+        @{ Id = 'C03.SafeReassignmentShadowsRiskyLiteral'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$c = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$c = 'Get-ChildItem'; & `$c }" },
+        # --- Gap 3: alias (виправлено в цьому PR) ---
+        @{ Id = 'A01.SetAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr -ConfigPath X }" },
+        @{ Id = 'A02.NewAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr -ConfigPath X }" },
+        @{ Id = 'A03.NamedNameValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A04.NamedValueBeforeName'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -Value Read-BRAVOLegacyPrimaryRawOverrides -Name rdr`nfunction F { rdr }" },
+        @{ Id = 'A05.ColonBoundParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name:rdr -Value:Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A06.NamedWithOptionAndForce'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides -Option ReadOnly -Force`nfunction F { rdr }" },
+        @{ Id = 'A07.PositionalWithTrailingOption'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides -Option AllScope`nfunction F { rdr }" },
+        @{ Id = 'A08.OptionBeforePositionalValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Option ReadOnly rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A09.AliasToSecondReaderFunction'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias imp Import-BravoLegacyPrimaryConfiguration`nfunction F { imp -ConfigPath X }" },
+        @{ Id = 'A10.CallThroughCallOperator'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { & rdr }" },
+        @{ Id = 'A11.QuotedArguments'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name 'rdr' -Value 'read-bravolegacyprimaryrawoverrides'`nfunction F { RDR }" },
+        @{ Id = 'A12.AbbreviatedParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Na rdr -Va Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A13.CallBeforeDefinitionOffset'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { rdr }`nSet-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides" },
+        @{ Id = 'A14.AliasToBenignCommand'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Get-ChildItem`nfunction F { rdr -Path X }" },
+        @{ Id = 'A15.AliasDefinedButNeverCalled'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides" },
+        @{ Id = 'A16.SanctionedLoaderWithBenignAlias'; Kind = 'CLEAN'; Path = $matrixLoader; Text = ($matrixSanctionedLoader + "`nSet-Alias gci2 Get-ChildItem") },
+        @{ Id = 'A21.VerboseSwitchBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Verbose rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A22.DebugAndWhatIfAndConfirmSwitches'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -Debug -WhatIf -Confirm:`$false rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A23.VerboseSwitchWithNamedParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Verbose -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A24.ModuleQualifiedSetAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Microsoft.PowerShell.Utility\Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A25.ModuleQualifiedNewAliasOtherCase'; Kind = 'DETECTED'; Path = $matrixModule; Text = "microsoft.powershell.utility\new-alias -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A26.VerboseAliasVbBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -vb rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A27.DebugAliasDbBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -db rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A28.WhatIfAliasWiBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -wi rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A29.ConfirmAliasCfBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -cf rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A30.SwitchAliasesBetweenNamedParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Value Read-BRAVOLegacyPrimaryRawOverrides -VB -DB -WI -Name rdr`nfunction F { rdr }" },
+        @{ Id = 'A31.ValueTypedErrorActionAliasConsumesValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -ea SilentlyContinue rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A32.ValueTypedVariableAliasesConsumeValues'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -ev e1 -ov o1 -pv p1 -ob 2 -infa Ignore rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A33.SwitchAliasesWithBenignAliasTarget'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias -vb -db -wi -cf rdr Get-ChildItem`nfunction F { rdr -Path X }" },
+        @{ Id = 'A34.SalBuiltinAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "sal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A35.NalBuiltinAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "nal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A36.SalBuiltinAliasNamed'; Kind = 'DETECTED'; Path = $matrixModule; Text = "SAL -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A37.NalBuiltinAliasNamedWithSwitchAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "nal -vb -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A38.ModuleQualifiedSalBuiltinAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Microsoft.PowerShell.Utility\sal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A39.SalAndNalToBenignCommand'; Kind = 'CLEAN'; Path = $matrixModule; Text = "sal rdr Get-ChildItem`nnal rdr2 Get-ChildItem`nfunction F { rdr -Path X; rdr2 -Path X }" },
+        @{ Id = 'A40.ParenthesizedAliasValuePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A41.ParenthesizedAliasValueNamed'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A42.CastAndNestedParenAliasValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr ([string](('Read-BRAVOLegacyPrimaryRawOverrides')))`nfunction F { rdr }" },
+        @{ Id = 'A43.ParenthesizedAliasNameAndValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "sal ('rdr') ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A44.ParenthesizedBenignAliasValue'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr ('Get-ChildItem')`nfunction F { rdr -Path X }" },
+        @{ Id = 'A45.SubExpressionAliasValueNotUnwrapped'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Alias rdr (`$('Read-BRAVOLegacyPrimaryRawOverrides'))`nfunction F { rdr }" },
+        @{ Id = 'T04.ParenthesizedTypedStringVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [string]`$r = ('Read-BRAVOLegacyPrimaryRawOverrides'); & `$r }" },
+        @{ Id = 'T05.ParenthesizedUntypedVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = (('Read-BRAVOLegacyPrimaryRawOverrides')); & `$r }" },
+        @{ Id = 'T06.CastRightHandSideVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = [string]'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r }" },
+        @{ Id = 'T07.ParenthesizedSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$r = ('Get-ChildItem'); & `$r }" },
+        # --- QA-001: літерал-змінна з іменем alias-а рідера (виправлено в цьому PR) ---
+        @{ Id = 'A46.AliasNameInLiteralVariableCallOperator'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; `$cmd = 'rdr'; & `$cmd" },
+        @{ Id = 'A47.AliasNameInLiteralVariableNewAliasInFunction'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'rdr'; & `$cmd -ConfigPath X }" },
+        @{ Id = 'A48.AliasNameInLiteralVariableNalDotInvocation'; Kind = 'DETECTED'; Path = $matrixModule; Text = "nal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'rdr'; . `$cmd }" },
+        @{ Id = 'A49.AliasNameInTypedParenVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { [string]`$cmd = ('rdr'); & `$cmd }" },
+        @{ Id = 'A50.AliasNameVariableNotAssignedToReaderAlias'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'other'; & `$cmd }" },
+        @{ Id = 'A51.UnrelatedAliasNameInVariable'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias gci2 Get-ChildItem`nfunction F { `$cmd = 'gci2'; & `$cmd -Path X }" },
+        @{ Id = 'A52.AliasNameVariableSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'rdr'; `$cmd = 'Get-ChildItem'; & `$cmd }" },
+        # --- рев'ю PR #497 (F1/F2): рядки в подвійних лапках та параметризована ціль команди ---
+        @{ Id = 'T08.DoubleQuotedAliasValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr `"Read-BRAVOLegacyPrimaryRawOverrides`"; rdr" },
+        @{ Id = 'T09.DoubleQuotedTypedRightHandSide'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [string]`$r = `"Read-BRAVOLegacyPrimaryRawOverrides`"; & `$r }" },
+        @{ Id = 'T10.DoubleQuotedUntypedRightHandSide'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = `"Read-BRAVOLegacyPrimaryRawOverrides`"; & `$r }" },
+        @{ Id = 'T11.ParenthesizedAliasNameAfterSetAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; & ('rdr')" },
+        @{ Id = 'T12.ParenthesizedLiteralVariableCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; `$cmd = 'rdr'; & (`$cmd)" },
+        @{ Id = 'T13.ParenthesizedDirectReaderName'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & ('Read-BRAVOLegacyPrimaryRawOverrides') -ConfigPath X }" },
+        @{ Id = 'T14.DoubleQuotedDirectReaderCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `"Read-BRAVOLegacyPrimaryRawOverrides`" -ConfigPath X }" },
+        @{ Id = 'T15.ExpandableStringWithNestedExpressionBenignName'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$n = 'Get'; `$r = `"`$n-ChildItem`"; & `$r }" },
+        @{ Id = 'T16.ParenthesizedBenignCommandName'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & ('Get-Date') }" },
+        @{ Id = 'T17.ParenthesizedBenignAlias'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias gci2 Get-ChildItem; & ('gci2') -Path X" },
+        @{ Id = 'T18.ParenthesizedVariableOfBenignLiteral'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; `$cmd = 'other'; & (`$cmd)" }
+        # --- друге рев'ю PR #497 (G1/G2/G3): каст у дужках, сеттер аліаса в дужках, function-drive ---
+        @{ Id = 'T19.CastVariableCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; & ([string]`$cmd) }" },
+        @{ Id = 'T20.NestedCastParenVariableCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; & (([string](`$cmd))) }" },
+        @{ Id = 'T21.CastVariableBenignLiteral'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$cmd = 'Get-Date'; & ([string]`$cmd) }" },
+        @{ Id = 'T22.ParenthesizedSetAliasSetter'; Kind = 'DETECTED'; Path = $matrixModule; Text = "& ('Set-Alias') rdr Read-BRAVOLegacyPrimaryRawOverrides; rdr" },
+        @{ Id = 'T23.CastNewAliasSetter'; Kind = 'DETECTED'; Path = $matrixModule; Text = "& ([string]'New-Alias') rdr Read-BRAVOLegacyPrimaryRawOverrides; rdr" },
+        @{ Id = 'T24.ParenthesizedModuleQualifiedSetAliasSetter'; Kind = 'DETECTED'; Path = $matrixModule; Text = "& ('Microsoft.PowerShell.Utility\Set-Alias') rdr Read-BRAVOLegacyPrimaryRawOverrides; rdr" },
+        @{ Id = 'T25.ParenthesizedShortSetterWithNamedParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "& ('sal') -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides; rdr" },
+        @{ Id = 'T26.ParenthesizedSetAliasBenign'; Kind = 'CLEAN'; Path = $matrixModule; Text = "& ('Set-Alias') gci2 Get-ChildItem; gci2 -Path X" },
+        @{ Id = 'T27.FunctionDriveUnbracedHyphenNameIsNotReaderCall'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & `$function:Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }" },
+        @{ Id = 'T28.FunctionDriveReaderBracedName'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `${function:Read-BRAVOLegacyPrimaryRawOverrides} -ConfigPath X }" },
+        @{ Id = 'T29.FunctionDriveReaderDotSource'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { . `${function:Import-BravoLegacyPrimaryConfiguration} -ConfigPath X }" },
+        @{ Id = 'T30.FunctionDriveBenignFunction'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & `$function:Get-Foo }" },
+        # --- третє рев'ю PR #497: нормалізація drive-залишку, alias-drive, залишкові ліміти ---
+        @{ Id = 'T31.FunctionDriveGlobalQualified'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `${function:global:Read-BRAVOLegacyPrimaryRawOverrides} }" },
+        @{ Id = 'T32.FunctionDriveScriptQualified'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `${function:script:Read-BRAVOLegacyPrimaryRawOverrides} }" },
+        @{ Id = 'T33.FunctionDriveLeadingBackslash'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `${function:\Read-BRAVOLegacyPrimaryRawOverrides} }" },
+        @{ Id = 'T34.FunctionDriveGlobalDotSource'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { . `${function:global:Read-BRAVOLegacyPrimaryRawOverrides} }" },
+        @{ Id = 'T35.AliasDriveReaderAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias zz Read-BRAVOLegacyPrimaryRawOverrides; function F { & `${alias:zz} }" },
+        @{ Id = 'T36.AliasDriveBenignAlias'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias zz Get-ChildItem; function F { & `${alias:zz} }" },
+        @{ Id = 'T37.FunctionDriveBracedBenignFunction'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & `${function:Get-Foo} }" },
+        @{ Id = 'T38.FunctionDriveBracedBenignGlobalQualified'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & `${function:global:Get-Foo} }" },
+        @{ Id = 'G8.FunctionDriveStoredInVariable'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$f = `${function:Read-BRAVOLegacyPrimaryRawOverrides}; & `$f }" },
+        @{ Id = 'G9.FunctionDriveInvokeMethod'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `${function:Read-BRAVOLegacyPrimaryRawOverrides}.Invoke() }" },
+        @{ Id = 'A17.AliasChain'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Alias a1 Read-BRAVOLegacyPrimaryRawOverrides`nSet-Alias a2 a1`nfunction F { a2 }" },
+        @{ Id = 'A18.AliasValueFromVariable'; Kind = 'MISSED'; Path = $matrixModule; Text = "`$v = 'Read-BRAVOLegacyPrimaryRawOverrides'`nSet-Alias rdr `$v`nfunction F { rdr }" },
+        @{ Id = 'A19.SetItemAliasProvider'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Item -Path Alias:rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A20.SplattedSetAlias'; Kind = 'MISSED'; Path = $matrixModule; Text = "`$p = @{ Name = 'rdr'; Value = 'Read-BRAVOLegacyPrimaryRawOverrides' }`nSet-Alias @p`nfunction F { rdr }" },
+        # --- Gap 8: типізована змінна (виправлено в цьому PR) ---
+        @{ Id = 'T01.TypedStringVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [string]`$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r }" },
+        @{ Id = 'T02.TypedWithValidationAttribute'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [ValidateNotNull()][string]`$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r }" },
+        @{ Id = 'T03.TypedSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; [string]`$r = 'Get-ChildItem'; & `$r }" },
+        # --- Відомі обмеження (рішення власника, issue #239) ---
+        @{ Id = 'G1.ExecutionOrderVsTextOffset'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & `$cmd }`n`$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'`nF" },
+        @{ Id = 'G2.NoGuardControlFlowCheck'; Kind = 'MISSED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`nfunction Import-BravoConfiguration { param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect); Import-BravoLegacyPrimaryConfiguration -ConfigPath X }" },
+        @{ Id = 'G4.MutuallyExclusiveIfElse'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { param(`$u); if (`$u) { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides' } else { `$cmd = 'Get-ChildItem' }; & `$cmd }" },
+        @{ Id = 'G5.SanctionedCallRemovedCountZero'; Kind = 'MISSED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath) }`nfunction Import-BravoConfiguration { param(`$ConfigRoot) }" },
+        @{ Id = 'G6.NonLiteralReassignmentDoesNotShadow'; Kind = 'FALSE-POSITIVE'; Path = $matrixModule; Text = "function F { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$cmd = Get-SafeCommand; & `$cmd }" },
+        @{ Id = 'G7a.ScriptQualifiedAssignmentInFunctionCalledElsewhere'; Kind = 'MISSED'; Path = $matrixModule; Text = "function Set-It { `$script:r = 'Read-BRAVOLegacyPrimaryRawOverrides' }`nfunction Use-It { & `$script:r }" },
+        @{ Id = 'G7b.ScriptQualifiedAssignmentAndCallSameFunction'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$script:r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$script:r }" },
+        # --- Додаткові класи, виявлені під час аналізу (не з переліку #239) ---
+        @{ Id = 'X1.StringConcatenation'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$c = 'Read-BRAVOLegacy' + 'PrimaryRawOverrides'; & `$c }" },
+        # X2: `& 'iex' '<літерал>'` (квотоване ім'я через оператор виклику) обходить і цей гейт, і
+        # ci/Test-BRAVOForbiddenPattern.ps1 (його регекс вимагає пропуск одразу після iex/Invoke-Expression).
+        @{ Id = 'X2.QuotedInvokeExpressionWithLiteral'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & 'iex' 'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X' }" },
+        @{ Id = 'X3.GetCommandSubexpression'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & (Get-Command 'Read-BRAVOLegacyPrimaryRawOverrides') -ConfigPath X }" },
+        @{ Id = 'X4.ModuleQualifiedName'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { BRAVO.Configuration\Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }" },
+        @{ Id = 'X5.FileOutsideScanTargets'; Kind = 'MISSED'; Path = 'ci\Rogue.ps1'; Text = 'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X' },
+        @{ Id = 'X6.UninspectedCommandStringNotExecutableAsWritten'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { powershell.exe -NoProfile -Command 'Read-BRAVOLegacyPrimaryRawOverrides' }" },
+        @{ Id = 'X7.ParameterSuppliedName'; Kind = 'MISSED'; Path = $matrixModule; Text = 'function F { param($c); & $c }' },
+        @{ Id = 'X8.HashtableMemberAsCommand'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$h = @{ c = 'Read-BRAVOLegacyPrimaryRawOverrides' }; & `$h.c }" }
+    )
+    foreach ($matrixRow in $matrixRows) {
+        $matrixViolation = Get-BRAVOLegacyReaderMatrixVerdict -RelativePath $matrixRow.Path -Text $matrixRow.Text
+        $matrixExpectViolation = ($matrixRow.Kind -eq 'DETECTED' -or $matrixRow.Kind -eq 'FALSE-POSITIVE')
+        $matrixLabel = if ($matrixRow.Kind -eq 'MISSED' -or $matrixRow.Kind -eq 'FALSE-POSITIVE') { 'KnownLimit.' + $matrixRow.Kind } else { $matrixRow.Kind }
+        Test-BRAVOCondition `
+            -Condition ($matrixViolation -eq $matrixExpectViolation) `
+            -Name ("ReleaseGate/LegacyReaderMatrix/" + $matrixRow.Id + "." + $matrixLabel) `
+            -Failure ("рядок матриці " + $matrixRow.Id + " (" + $matrixRow.Kind + "): очікувано violation=" + $matrixExpectViolation + ", отримано " + $matrixViolation + ". Для KnownLimit-рядків зміну результату (покращення гейта) треба свідомо відобразити тут і в docs\design\BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md (issue #239)")
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну

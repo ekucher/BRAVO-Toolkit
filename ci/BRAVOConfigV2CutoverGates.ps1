@@ -542,6 +542,84 @@ function Test-BRAVOConfigV2CutoverGates {
         return $UserPath
     }
 
+    # #239 (рев'ю PR #497, F1/F2): значення-літерал може бути обгорнуте в
+    # константні обгортки - `('Read-...')`, `[string]'Read-...'`,
+    # `[string]('Read-...')` (вкладені довільно). Розгортається БУДЬ-ЯКИЙ каст
+    # (ConvertExpressionAst) незалежно від типу, а не лише такі, що зберігають
+    # значення: це свідомо консервативно (краще зайве спрацювання, ніж обхід).
+    # Єдина спільна реалізація розгортання для присвоєнь змінним (R4) і
+    # значення Set-Alias/New-Alias. Розгортаються ЛИШЕ ParenExpressionAst,
+    # PipelineAst із одним CommandExpressionAst, CommandExpressionAst і
+    # ConvertExpressionAst (каст); підвирази `$()`, scriptblock-и,
+    # конвеєри з кількох елементів не розгортаються (див. R9).
+    # Повертає StringConstantExpressionAst або $null.
+    function Get-BRAVOAstConstantStringLiteral {
+        param($AstNode)
+        $current = $AstNode
+        while ($current) {
+            if ($current -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                return $current
+            }
+            # #239 (рев'ю PR #497, F1): на PS 5.1 "Read-..." у подвійних лапках без
+            # $-розширень парситься як StringConstantExpressionAst (перевірено); захисна
+            # гілка: Expandable без вкладених виразів теж константа (споживачі читають .Value).
+            # З вкладеними виразами ("$x") лишається неконстантною.
+            if ($current -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+                if ($current.NestedExpressions.Count -eq 0) { return $current }
+                return $null
+            }
+            if ($current -is [System.Management.Automation.Language.ParenExpressionAst]) {
+                $current = $current.Pipeline
+            } elseif ($current -is [System.Management.Automation.Language.PipelineAst]) {
+                if ($current.PipelineElements.Count -ne 1) { return $null }
+                $current = $current.PipelineElements[0]
+            } elseif ($current -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                $current = $current.Expression
+            } elseif ($current -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+                $current = $current.Child
+            } else {
+                return $null
+            }
+        }
+        return $null
+    }
+
+    # #239 (рев'ю PR #497, G1/G2): єдине розв'язання цілі команди для обох
+    # проходів (визначення аліасів і виклики). GetCommandName() повертає null,
+    # коли ціль - дужки/лапки/каст. Повертає @{ Name; Variable }: Name -
+    # константне ім'я (в т.ч. з дужок, лапок, кастів), Variable -
+    # VariableExpressionAst після розгортання дужок і кастів (`& ($cmd)`,
+    # `& ([string]$cmd)`); обидва $null, якщо ціль неконстантна й не змінна.
+    function Get-BRAVOAstResolvedCommandTarget {
+        param($CommandAst)
+        $resolvedName = $CommandAst.GetCommandName()
+        $resolvedVariable = $null
+        if ([string]::IsNullOrEmpty($resolvedName)) {
+            $resolvedName = $null
+            $first = $CommandAst.CommandElements | Select-Object -First 1
+            if ($first -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                $resolvedVariable = $first
+            } elseif ($first) {
+                $literal = Get-BRAVOAstConstantStringLiteral -AstNode $first
+                if ($literal) {
+                    $resolvedName = $literal.Value
+                } elseif ($first -is [System.Management.Automation.Language.ParenExpressionAst] -or
+                          $first -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+                    $walk = $first
+                    while ($walk) {
+                        if ($walk -is [System.Management.Automation.Language.VariableExpressionAst]) { $resolvedVariable = $walk; break }
+                        if ($walk -is [System.Management.Automation.Language.ParenExpressionAst]) { $walk = $walk.Pipeline }
+                        elseif ($walk -is [System.Management.Automation.Language.PipelineAst] -and $walk.PipelineElements.Count -eq 1) { $walk = $walk.PipelineElements[0] }
+                        elseif ($walk -is [System.Management.Automation.Language.CommandExpressionAst]) { $walk = $walk.Expression }
+                        elseif ($walk -is [System.Management.Automation.Language.ConvertExpressionAst]) { $walk = $walk.Child }
+                        else { $walk = $null }
+                    }
+                }
+            }
+        }
+        return [pscustomobject]@{ Name = $resolvedName; Variable = $resolvedVariable }
+    }
+
     function Get-BRAVOAstEnclosingFunctionName {
         param($AstNode)
         $current = $AstNode.Parent
@@ -663,6 +741,13 @@ function Test-BRAVOConfigV2CutoverGates {
             foreach ($legacyReaderAssignmentAst in $legacyReaderAssignmentAsts) {
                 $assignmentTarget = $legacyReaderAssignmentAst.Left
                 $assignmentValueAst = $legacyReaderAssignmentAst.Right
+                # #239 (прогалина 8): `[string]$reader = '...'` має ціль-
+                # обгортку (ConvertExpressionAst / AttributedExpressionAst
+                # з типом чи атрибутами), а не голу VariableExpressionAst;
+                # розгортаємо обгортки до самої змінної.
+                while ($assignmentTarget -is [System.Management.Automation.Language.AttributedExpressionAst]) {
+                    $assignmentTarget = $assignmentTarget.Child
+                }
                 if ($assignmentTarget -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
                     continue
                 }
@@ -688,18 +773,14 @@ function Test-BRAVOConfigV2CutoverGates {
                 # `$cmd = { 'Read-...' }` записувало ризиковий літерал, хоча
                 # `& $cmd` реально виконує СКРИПТБЛОК (що лише повертає текст,
                 # не викликає команду). "Проста" форма присвоєння тепер
-                # визначена якомога вужче: права частина — це PipelineAst з
-                # РІВНО ОДНИМ CommandExpressionAst, чий вираз — САМЕ
-                # StringConstantExpressionAst (без розпаковування вкладених
-                # scriptblock/підвиразів) — не рекурсивний пошук.
-                $assignmentValueLiteralAst = $null
-                if ($assignmentValueAst -is [System.Management.Automation.Language.CommandExpressionAst]) {
-                    $assignmentValueLiteralAst = $assignmentValueAst.Expression -as [System.Management.Automation.Language.StringConstantExpressionAst]
-                } elseif ($assignmentValueAst -is [System.Management.Automation.Language.PipelineAst] -and
-                    $assignmentValueAst.PipelineElements.Count -eq 1 -and
-                    $assignmentValueAst.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
-                    $assignmentValueLiteralAst = $assignmentValueAst.PipelineElements[0].Expression -as [System.Management.Automation.Language.StringConstantExpressionAst]
-                }
+                # визначена якомога вужче: значення розбирає
+                # Get-BRAVOAstConstantStringLiteral, що розгортає лише
+                # константні обгортки (ParenExpressionAst, PipelineAst з
+                # одним елементом, CommandExpressionAst, будь-який каст
+                # ConvertExpressionAst) до StringConstantExpressionAst і НЕ
+                # заходить у вкладені scriptblock/підвирази `$()` — це не
+                # рекурсивний пошук.
+                $assignmentValueLiteralAst = Get-BRAVOAstConstantStringLiteral -AstNode $assignmentValueAst
                 if (-not $assignmentValueLiteralAst) {
                     continue
                 }
@@ -715,6 +796,7 @@ function Test-BRAVOConfigV2CutoverGates {
                     ScriptBlock        = (Get-BRAVOAstEnclosingScriptBlock -AstNode $legacyReaderAssignmentAst)
                     StartOffset        = $legacyReaderAssignmentAst.Extent.StartOffset
                     ReaderFunctionName = $matchedReaderFunctionName
+                    LiteralValue       = $assignmentValueLiteralAst.Value
                 })
             }
 
@@ -736,10 +818,101 @@ function Test-BRAVOConfigV2CutoverGates {
                 { param($astNode) $astNode -is [System.Management.Automation.Language.CommandAst] },
                 $true
             )
+            # #239 (прогалина 3): `Set-Alias`/`New-Alias` із значенням-
+            # рідером і подальший виклик через ім'я аліаса. Збираємо імена
+            # аліасів файлу (без урахування порядку й scope - свідомо
+            # консервативно: будь-який виклик цього імені у файлі вважається
+            # викликом рідера). Ланцюги аліасів, значення зі змінної, splatting
+            # і Set-Item Alias: - відомі обмеження (матриця, #239).
+            $legacyReaderAliasNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($legacyReaderAliasCommandAst in $legacyReaderCommandAsts) {
+                # #239 (рев'ю PR #497, G2): `& ('Set-Alias') rdr Read-...` -
+                # ім'я сеттера теж розв'язується через дужки/лапки/касти.
+                $aliasCmdlet = (Get-BRAVOAstResolvedCommandTarget -CommandAst $legacyReaderAliasCommandAst).Name
+                if (-not [string]::IsNullOrEmpty($aliasCmdlet) -and $aliasCmdlet.Contains('\')) {
+                    # Ім'я з префіксом модуля (Microsoft.PowerShell.Utility\Set-Alias).
+                    $aliasCmdlet = $aliasCmdlet.Substring($aliasCmdlet.LastIndexOf('\') + 1)
+                }
+                if ([string]::IsNullOrEmpty($aliasCmdlet) -or
+                    -not ($aliasCmdlet -ieq 'Set-Alias' -or $aliasCmdlet -ieq 'New-Alias' -or $aliasCmdlet -ieq 'sal' -or $aliasCmdlet -ieq 'nal')) {
+                    continue
+                }
+                $aliasNameText = $null
+                $aliasValueText = $null
+                $aliasPositional = New-Object System.Collections.Generic.List[string]
+                $aliasElements = @($legacyReaderAliasCommandAst.CommandElements | Select-Object -Skip 1)
+                for ($aliasElementIndex = 0; $aliasElementIndex -lt $aliasElements.Count; $aliasElementIndex++) {
+                    $aliasElement = $aliasElements[$aliasElementIndex]
+                    if ($aliasElement -is [System.Management.Automation.Language.CommandParameterAst]) {
+                        $aliasParameterName = $aliasElement.ParameterName
+                        $aliasParameterArgument = $aliasElement.Argument
+                        $aliasIsName = $aliasParameterName.Length -gt 0 -and 'Name'.StartsWith($aliasParameterName, [StringComparison]::OrdinalIgnoreCase)
+                        $aliasIsValue = $aliasParameterName.Length -gt 0 -and 'Value'.StartsWith($aliasParameterName, [StringComparison]::OrdinalIgnoreCase)
+                        $aliasIsSwitch = $false
+                        foreach ($aliasSwitchName in @('PassThru', 'Force', 'WhatIf', 'Confirm', 'Verbose', 'Debug')) {
+                            if (-not ($aliasIsName -or $aliasIsValue) -and $aliasParameterName.Length -gt 0 -and $aliasSwitchName.StartsWith($aliasParameterName, [StringComparison]::OrdinalIgnoreCase)) { $aliasIsSwitch = $true }
+                        }
+                        # Псевдоніми (aliases) switch-параметрів Set-Alias/New-Alias на PS 5.1
+                        # ((Get-Command Set-Alias).Parameters): Verbose=vb, Debug=db, WhatIf=wi,
+                        # Confirm=cf; вони не споживають наступний елемент. Псевдоніми
+                        # value-параметрів (ea, wa, infa, ev, wv, iv, ov, ob, pv) навмисно не
+                        # перелічені: вони споживають один аргумент за загальним правилом нижче.
+                        if (-not $aliasIsSwitch -and @('vb', 'db', 'wi', 'cf') -contains $aliasParameterName.ToLowerInvariant()) {
+                            $aliasIsSwitch = $true
+                        }
+                        if (-not $aliasParameterArgument -and -not $aliasIsSwitch -and ($aliasElementIndex + 1) -lt $aliasElements.Count) {
+                            # параметр зі значенням у наступному елементі
+                            # (-Name/-Value/-Option/-Scope/-Description).
+                            $aliasElementIndex++
+                            $aliasParameterArgument = $aliasElements[$aliasElementIndex]
+                        }
+                        $aliasArgumentText = $null
+                        $aliasArgumentLiteral = Get-BRAVOAstConstantStringLiteral -AstNode $aliasParameterArgument
+                        if ($aliasArgumentLiteral) {
+                            $aliasArgumentText = $aliasArgumentLiteral.Value
+                        }
+                        if ($aliasIsName) { $aliasNameText = $aliasArgumentText }
+                        elseif ($aliasIsValue) { $aliasValueText = $aliasArgumentText }
+                        continue
+                    }
+                    $aliasPositionalLiteral = Get-BRAVOAstConstantStringLiteral -AstNode $aliasElement
+                    if ($aliasPositionalLiteral) {
+                        [void]$aliasPositional.Add($aliasPositionalLiteral.Value)
+                    } else {
+                        [void]$aliasPositional.Add($null)
+                    }
+                }
+                # Позиційні аргументи заповнюють лише ще не задані Name, Value.
+                $aliasPositionalIndex = 0
+                if ($null -eq $aliasNameText -and $aliasPositionalIndex -lt $aliasPositional.Count) {
+                    $aliasNameText = $aliasPositional[$aliasPositionalIndex]
+                    $aliasPositionalIndex++
+                }
+                if ($null -eq $aliasValueText -and $aliasPositionalIndex -lt $aliasPositional.Count) {
+                    $aliasValueText = $aliasPositional[$aliasPositionalIndex]
+                }
+                if ([string]::IsNullOrEmpty($aliasNameText) -or [string]::IsNullOrEmpty($aliasValueText)) {
+                    continue
+                }
+                foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                    if ([string]::Equals($aliasValueText, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                        [void]$legacyReaderAliasNames.Add($aliasNameText)
+                    }
+                }
+            }
+
             foreach ($legacyReaderCommandAst in $legacyReaderCommandAsts) {
                 $enclosingFunctionName = Get-BRAVOAstEnclosingFunctionName -AstNode $legacyReaderCommandAst
-                $invokedCommandName = $legacyReaderCommandAst.GetCommandName()
+                # #239 (рев'ю PR #497, F2/G1): ціль команди в дужках/лапках/касті
+                # розв'язується спільним helper-ом (див. вище).
+                $resolvedCommandTarget = Get-BRAVOAstResolvedCommandTarget -CommandAst $legacyReaderCommandAst
+                $invokedCommandName = $resolvedCommandTarget.Name
+                $firstCommandElement = $resolvedCommandTarget.Variable
                 if (-not [string]::IsNullOrEmpty($invokedCommandName)) {
+                    if ($legacyReaderAliasNames.Contains($invokedCommandName)) {
+                        [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через alias '$invokedCommandName', що вказує на legacy-рідер)")
+                        continue
+                    }
                     foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
                         if (-not [string]::Equals($invokedCommandName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
                             continue
@@ -754,11 +927,33 @@ function Test-BRAVOConfigV2CutoverGates {
                     }
                     continue
                 }
-                $firstCommandElement = $legacyReaderCommandAst.CommandElements | Select-Object -First 1
                 if ($firstCommandElement -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
                     continue
                 }
-                # R6: перевіряємо КОЖЕН рівень охоплюючого scope (від
+                # #239 (рев'ю PR #497, G3): `& ${function:Read-...}` виконує вже
+                # завантажену функцію через function-drive, а `& ${alias:<аліас>}` -
+                # аліас рідера через alias-drive (лише у формі з фігурними
+                # дужками: в `$function:Read-...` без дужок `-` обриває ім'я).
+                # Залишок після `drive:` нормалізується: початковий `\`/`/` і
+                # scope-кваліфікатори (global:/script:/local:/private:) знімаються.
+                $driveUserPath = [string]$firstCommandElement.VariablePath.UserPath
+                if ($driveUserPath -match '^(?i)(?<d>function|alias):(?<n>.+)$') {
+                    $driveKind = $Matches['d'].ToLowerInvariant()
+                    $driveName = $Matches['n'].TrimStart('\', '/')
+                    do {
+                        $driveNameBefore = $driveName
+                        $driveName = (Get-BRAVOAstNormalizedVariableName -UserPath $driveName).TrimStart('\', '/')
+                    } while ($driveName -ne $driveNameBefore)
+                    $driveHit = $false
+                    foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                        if ([string]::Equals($driveName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) { $driveHit = $true }
+                    }
+                    if ($driveKind -eq 'alias' -and $legacyReaderAliasNames.Contains($driveName)) { $driveHit = $true }
+                    if ($driveHit) {
+                        [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через drive `$$driveUserPath, що вказує на legacy-рідер)")
+                        continue
+                    }
+                }                # R6: перевіряємо КОЖЕН рівень охоплюючого scope (від
                 # найглибшого до кореня файлу) — лексичний scoping
                 # PowerShell резолвить змінну назовні, якщо в поточній
                 # функції немає власного присвоєння; перший рівень із
@@ -800,6 +995,17 @@ function Test-BRAVOConfigV2CutoverGates {
                     if ($nearestPrecedingAssignment) {
                         break
                     }
+                }
+                # #239 (QA-001): змінна з літералом-ІМЕНЕМ ALIAS-а рідера
+                # (`Set-Alias rdr Read-...; $cmd = 'rdr'; & $cmd` або `. $cmd`)
+                # теж є викликом рідера. Alias-імена зібрано вище; зіставлення
+                # з літералом найближчого попереднього присвоєння.
+                if ($nearestPrecedingAssignment -and
+                    -not $nearestPrecedingAssignment.ReaderFunctionName -and
+                    -not [string]::IsNullOrEmpty($nearestPrecedingAssignment.LiteralValue) -and
+                    $legacyReaderAliasNames.Contains($nearestPrecedingAssignment.LiteralValue)) {
+                    [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через змінну `$$($firstCommandElement.VariablePath.UserPath), присвоєну імені alias-а legacy-рідера '$($nearestPrecedingAssignment.LiteralValue)')")
+                    continue
                 }
                 if (-not $nearestPrecedingAssignment -or -not $nearestPrecedingAssignment.ReaderFunctionName) {
                     continue
