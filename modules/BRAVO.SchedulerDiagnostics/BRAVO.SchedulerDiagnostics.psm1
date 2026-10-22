@@ -384,6 +384,18 @@ function Test-BRAVOParameterValueValidation {
                     return [pscustomobject]@{ Accepted = $false; Reason = 'значення не входить до ValidateSet параметра (значення не виводиться): PowerShell відмовить у прив''язці до запуску скрипта' }
                 }
             }
+            'ActionPreference' {
+                $member = @($rule.Values | Where-Object { [string]::Equals([string]$_, $Value, [StringComparison]::OrdinalIgnoreCase) })
+                if ($member.Count -eq 0) {
+                    return [pscustomobject]@{ Accepted = $false; Reason = 'значення не доведено допустимою назвою ActionPreference для цього загального параметра Windows PowerShell 5.1 (значення не виводиться; числові форми й скорочення не моделюються): PowerShell може відмовити у прив''язці до запуску скрипта' }
+                }
+            }
+            'NonNegativeInt32' {
+                $parsedBuffer = 0
+                if (-not [int]::TryParse([string]$Value, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsedBuffer) -or $parsedBuffer -lt 0) {
+                    return [pscustomobject]@{ Accepted = $false; Reason = 'значення не доведено невід''ємним Int32 (значення не виводиться): PowerShell відмовить у прив''язці до запуску скрипта' }
+                }
+            }
             'NotNull' { }
             'NotNullOrEmpty' {
                 if ([string]::IsNullOrEmpty($Value)) {
@@ -414,7 +426,7 @@ function Get-BRAVOScriptDeclaredParameter {
     )
 
     $unknown = [pscustomobject]@{
-        Known = $false; Entries = @(); SwitchOwners = @(); PositionalOrder = @(); PositionalAmbiguous = $true; Validation = @{}; MandatoryOwners = @(); TypedOwners = @{}
+        Known = $false; Entries = @(); SwitchOwners = @(); PositionalOrder = @(); PositionalAmbiguous = $true; Validation = @{}; MandatoryOwners = @(); TypedOwners = @{}; HasParameterSets = $false
     }
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return $unknown }
     try {
@@ -435,6 +447,7 @@ function Get-BRAVOScriptDeclaredParameter {
         $mandatoryOwners = New-Object 'System.Collections.Generic.List[string]'
         $typedOwners = @{}
         $ambiguous = $false
+        $hasParameterSets = $false
         $positionalBinding = $true
         $paramBlock = $ast.ParamBlock
         if ($null -ne $paramBlock) {
@@ -445,7 +458,7 @@ function Get-BRAVOScriptDeclaredParameter {
                 $advanced = $true
                 foreach ($namedArgument in @($attribute.NamedArguments)) {
                     if ($namedArgument.ArgumentName -eq 'SupportsShouldProcess') { $supportsShouldProcess = $true }
-                    if ($namedArgument.ArgumentName -eq 'DefaultParameterSetName') { $ambiguous = $true }
+                    if ($namedArgument.ArgumentName -eq 'DefaultParameterSetName') { $ambiguous = $true; $hasParameterSets = $true }
                     if ($namedArgument.ArgumentName -eq 'PositionalBinding' -and
                         $namedArgument.Argument.Extent.Text -match '^\$false$') { $positionalBinding = $false }
                 }
@@ -477,7 +490,15 @@ function Get-BRAVOScriptDeclaredParameter {
                                     $ambiguous = $true
                                 }
                             }
-                            if ($namedArgument.ArgumentName -eq 'ParameterSetName') { $ambiguous = $true }
+                            if ($namedArgument.ArgumentName -eq 'ParameterSetName') {
+                                $ambiguous = $true
+                                # #496: лише літерал __AllParameterSets не створює набору; будь-що інше — набори параметрів не моделюються (fail closed).
+                                $setArgument = $namedArgument.Argument
+                                if (-not ($setArgument -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                                        [string]::Equals([string]$setArgument.Value, '__AllParameterSets', [StringComparison]::OrdinalIgnoreCase))) {
+                                    $hasParameterSets = $true
+                                }
+                            }
                             if ($namedArgument.ArgumentName -eq 'Mandatory' -and $namedArgument.Argument.Extent.Text -notmatch '^\$false$') {
                                 $mandatoryOwners.Add($ownerName)
                             }
@@ -521,6 +542,15 @@ function Get-BRAVOScriptDeclaredParameter {
                     }
                     if ([bool]$common[1]) { $switchOwners.Add([string]$common[0]) }
                 }
+                # #496: значення модельованих загальних параметрів має бути доведено допустимим (перевірено пробами powershell.exe 5.1:
+                # Stop/Continue/SilentlyContinue/Inquire/Ignore приймаються, Suspend/Break/Bogus/число 5 відхиляються; числа й скорочення не моделюємо).
+                # Параметр, оголошений самим скриптом із тією ж назвою, не перекривається.
+                $actionRule = [pscustomobject]@{ Kind = 'ActionPreference'; Name = 'ActionPreference'; Values = @('Stop', 'Continue', 'SilentlyContinue', 'Inquire', 'Ignore') }
+                $bufferRule = [pscustomobject]@{ Kind = 'NonNegativeInt32'; Name = 'OutBuffer'; Values = @() }
+                foreach ($actionOwner in @('ErrorAction', 'WarningAction', 'InformationAction')) {
+                    if (-not $validation.ContainsKey($actionOwner)) { $validation[$actionOwner] = @($actionRule) }
+                }
+                if (-not $validation.ContainsKey('OutBuffer')) { $validation['OutBuffer'] = @($bufferRule) }
             }
             $explicitPositional = @($positional | Where-Object { $null -ne $_.Explicit })
             if ($positionalBinding -and $explicitPositional.Count -gt 0 -and $explicitPositional.Count -ne $positional.Count) {
@@ -547,6 +577,7 @@ function Get-BRAVOScriptDeclaredParameter {
             Validation = $validation
             MandatoryOwners = $mandatoryOwners.ToArray()
             TypedOwners = $typedOwners
+            HasParameterSets = $hasParameterSets
         }
     } catch {
         return $unknown
@@ -770,6 +801,8 @@ function Get-BRAVOConfigPathReferenceFromItem {
     $boundOwners = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
     if (-not [bool]$Declared.Known) { & $fail 'param() скрипта недоступний — аргументи статично не змоделювати' }
+    # #496: набори параметрів (ParameterSetName/DefaultParameterSetName) не моделюються: сумісність параметрів різних наборів статично не доводиться.
+    if ([bool]$Declared.Known -and [bool]$Declared.HasParameterSets) { & $fail 'скрипт оголошує набори параметрів (ParameterSetName/DefaultParameterSetName): сумісність параметрів і вибір набору не моделюються' }
 
     # #496 B6: параметр із атрибутами перевірки значення (ValidateSet тощо). Значення, яке PowerShell відхилить, або
     # атрибут, результат якого статично не визначити, -> Modelled=$false (Unknown): інакше скрипт міг би не запуститися
@@ -1417,6 +1450,9 @@ function Get-BRAVOTaskConfigPathFinding {
         $kind = Get-BRAVOActionExecutableKind -Command $command
         # #496 B2: -EncodedCommand (будь-який префікс) в обгортці: payload не декодується, BRAVO_*.ps1 у ньому не виключено.
         $encodedWrapper = Test-BRAVOArgumentsHaveEncodedCommandToken -Arguments $arguments
+        # #496 (P2-1): предикат «аргументи містять %VAR%, яку статично не розкрити» обчислюється ОДИН раз на дію й
+        # однаково застосовується до обгорток cmd.exe, Other-дій із %VAR%-командою та powershell.exe (значення не виводиться).
+        $unsupportedEnv = (@((Expand-BRAVOTaskActionVariable -Text $arguments -NamePattern '[^%]+').Unsupported).Count -gt 0)
         if ($kind -eq 'Other') {
             # Exec.Command із %VAR% (напр. %ComSpec%) Task Scheduler розкриває у своєму середовищі:
             # що саме запуститься — невідомо. Якщо дія згадує BRAVO_*.ps1 — Unknown, а не мовчазний пропуск.
@@ -1424,6 +1460,8 @@ function Get-BRAVOTaskConfigPathFinding {
                 $findings.Add((& $newFinding 'Unknown' $null $null 'Exec.Command залежить від змінної середовища (розкривається Task Scheduler у власному середовищі), а аргументи/WorkingDirectory згадують BRAVO_*.ps1 — що саме запуститься, статично не визначити'))
             } elseif ($command -match '%[^%]+%' -and $encodedWrapper) {
                 $findings.Add((& $newFinding 'Unknown' $null $null 'Exec.Command залежить від змінної середовища (розкривається Task Scheduler у власному середовищі), а аргументи містять -EncodedCommand (або його скорочення): декодований вміст не розібрано, згадка BRAVO_*.ps1 у ньому не виключена — що саме запуститься, статично не визначити'))
+            } elseif ($command -match '%[^%]+%' -and $unsupportedEnv) {
+                $findings.Add((& $newFinding 'Unknown' $null $null 'Exec.Command залежить від змінної середовища, а аргументи містять змінну середовища, яку статично не розкрити (значення не виводиться): після розкриття Task Scheduler може запуститися виклик BRAVO_*.ps1 — що саме запуститься, статично не визначити'))
             }
             continue
         }
@@ -1432,6 +1470,8 @@ function Get-BRAVOTaskConfigPathFinding {
                 $findings.Add((& $newFinding 'Unknown' $null $null 'обгортка cmd.exe, що згадує BRAVO_*.ps1 — аргументи статично не розібрано'))
             } elseif ($encodedWrapper) {
                 $findings.Add((& $newFinding 'Unknown' $null $null 'обгортка cmd.exe з -EncodedCommand (або його скороченням) в аргументах: декодований вміст не розібрано, згадка BRAVO_*.ps1 у ньому не виключена — аргументи статично не розібрано'))
+            } elseif ($unsupportedEnv) {
+                $findings.Add((& $newFinding 'Unknown' $null $null 'обгортка cmd.exe: аргументи містять змінну середовища, яку статично не розкрити (значення не виводиться): після розкриття у ній може опинитися виклик BRAVO_*.ps1 — аргументи статично не розібрано'))
             }
             continue
         }
@@ -1441,8 +1481,11 @@ function Get-BRAVOTaskConfigPathFinding {
             ($null -ne $definition.CommandText -and [string]$definition.CommandText -match $bravoPattern))
         if (-not $mention) {
             # #496: нерозкрита змінна середовища + -EncodedCommand (будь-який префікс): payload не декодовано, BRAVO_*.ps1 у ньому не виключено.
-            if ($encodedWrapper -and @((Expand-BRAVOTaskActionVariable -Text $arguments -NamePattern '[^%]+').Unsupported).Count -gt 0) {
+            if ($encodedWrapper -and $unsupportedEnv) {
                 $findings.Add((& $newFinding 'Unknown' $null $null 'аргументи powershell.exe містять -EncodedCommand (або його скорочення) і змінну середовища, яку статично не розкрити: payload не декодовано, згадка BRAVO_*.ps1 у ньому не виключена — що саме запуститься, статично не визначити'))
+            } elseif ($unsupportedEnv) {
+                # #496: Task Scheduler розкриває %VAR% до запуску powershell.exe: у -Command/-File може опинитися виклик BRAVO_*.ps1 (значення змінної не виводиться).
+                $findings.Add((& $newFinding 'Unknown' $null $null 'аргументи powershell.exe містять змінну середовища, яку статично не розкрити (значення не виводиться): після розкриття Task Scheduler у -Command/-File може опинитися виклик BRAVO_*.ps1 — що саме запуститься, статично не визначити'))
             }
             continue
         }

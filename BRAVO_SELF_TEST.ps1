@@ -31993,6 +31993,10 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 'BRAVO_MANDX.ps1'  = 'param([Parameter(Mandatory=(1 -eq 1))][string]$Component, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
                 'BRAVO_TYPED.ps1'  = 'param([int]$TimeoutSeconds, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
                 'BRAVO_TYPEDX.ps1' = 'param([datetime]$Since, [string]$ConfigPath, [switch]$NoPause)' + "`r`n" + $scanGuardedCall
+                # --- #496 (раунд 12): набори параметрів не моделюються -> будь-який виклик Unknown; __AllParameterSets — не набір ---
+                'BRAVO_PSETS.ps1'  = "[CmdletBinding()]`r`nparam([Parameter(ParameterSetName='A')][string]`$ConfigPath, [Parameter(ParameterSetName='B')][string]`$Other, [switch]`$NoPause)`r`n" + $scanGuardedCall
+                'BRAVO_PSDEF.ps1'  = "[CmdletBinding(DefaultParameterSetName='A')]`r`nparam([string]`$ConfigPath, [switch]`$NoPause)`r`n" + $scanGuardedCall
+                'BRAVO_PSALL.ps1'  = "[CmdletBinding()]`r`nparam([Parameter(ParameterSetName='__AllParameterSets')][string]`$ConfigPath, [switch]`$NoPause)`r`n" + $scanGuardedCall
             }
             foreach ($scanScriptName in $scanScripts.Keys) {
                 [IO.File]::WriteAllText((Join-Path $scanRuntime $scanScriptName), $scanScripts[$scanScriptName], [Text.Encoding]::UTF8)
@@ -32219,10 +32223,10 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T91_UnsupportedVariableInArguments'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanMaint$scanQ -AutoShutdown %USERPROFILE% -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
                 # --- #496 QA-001: ім'я змінної з пробілом; підтримувана змінна без пробілів лишається certifiable ---
                 @{ Name = 'T92_VariableNameWithSpaceIsUnknown'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction ${scanQ}%QA EXTRA%$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T93_StableVariableNoSpaceStillCertified'; Expect = 'NoConfigPath'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction ${scanQ}%SystemDrive%$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T93_StableVariableNoSpaceStillCertified'; Expect = 'NoConfigPath'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -OutVariable ${scanQ}%SystemDrive%$scanQ"; Wd = $scanRuntime },
                 @{ Name = 'T94_LeadingSpaceVariableNameIsUnknown'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction ${scanQ}% QA EXTRA%$scanQ"; Wd = $scanRuntime },
                 @{ Name = 'T95_TrailingSpaceVariableNameIsUnknown'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction ${scanQ}%QA EXTRA %$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T96_LonePercentInCommandStillCertified'; Expect = 'NoConfigPath'; Arguments = "-NoProfile -Command $scanQ.\BRAVO_ARCHIV.ps1 -NoPause -ErrorAction '5%'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T96_LonePercentInCommandStillCertified'; Expect = 'NoConfigPath'; Arguments = "-NoProfile -Command $scanQ.\BRAVO_ARCHIV.ps1 -NoPause -OutVariable '5%'$scanQ"; Wd = $scanRuntime },
                 # --- #496 SEC-001/SEC-002: віддалені/пристрійні шляхи, reparse point, відсутність ехо аргументів ---
                 @{ Name = 'T97_UncScriptPath'; Expect = 'Unknown'; Arguments = "-NoProfile -File ${scanQ}\\192.0.2.1\share\BRAVO_ARCHIV.ps1$scanQ -NoPause"; Wd = $scanRuntime },
                 @{ Name = 'T98_ExtendedUncScriptPath'; Expect = 'Unknown'; Arguments = "-NoProfile -File ${scanQ}\\?\UNC\192.0.2.1\share\BRAVO_ARCHIV.ps1$scanQ -NoPause"; Wd = $scanRuntime },
@@ -32303,8 +32307,34 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T158_DirectEncodedCommandEnvPayload'; Expect = 'Unknown'; Arguments = '-NoProfile -EncodedCommand %BRAVO_PAYLOAD%'; Wd = '' },
                 @{ Name = 'T159_DirectEcAliasEnvPayload'; Expect = 'Unknown'; Arguments = '-NoProfile -ec %BRAVO_PAYLOAD%'; Wd = '' },
                 @{ Name = 'T160_DirectSlashEncAbbreviationEnvPayload'; Expect = 'Unknown'; Arguments = '-NoProfile /enc %BRAVO_PAYLOAD%'; Wd = '' },
-                @{ Name = 'T161_DirectCommandEnvWithoutBravoSkipped'; Expect = '<none>'; Arguments = '-NoProfile -Command %BRAVO_PAYLOAD%'; Wd = '' },
-                @{ Name = 'T162_DirectEncodedStableEnvNotBravoSkipped'; Expect = '<none>'; Arguments = '-NoProfile -EncodedCommand %SystemRoot%'; Wd = '' }
+                @{ Name = 'T161_DirectCommandEnvPayloadUnknown'; Expect = 'Unknown'; Arguments = '-NoProfile -Command %BRAVO_PAYLOAD%'; Wd = '' },
+                @{ Name = 'T162_DirectEncodedStableEnvNotBravoSkipped'; Expect = '<none>'; Arguments = '-NoProfile -EncodedCommand %SystemRoot%'; Wd = '' },
+                # #496 раунд 12 (1): stock powershell.exe з нерозкритою змінною середовища в -Command/-File: payload може містити BRAVO-виклик -> Unknown.,
+                @{ Name = 'T163_DirectCommandQuotedEnvPayloadUnknown'; Expect = 'Unknown'; Arguments = '-NoProfile -Command "%BRAVO_PAYLOAD%"'; Wd = '' },
+                @{ Name = 'T164_DirectFileEnvTargetUnknown'; Expect = 'Unknown'; Arguments = '-NoProfile -File %BRAVO_PAYLOAD%'; Wd = '' },
+                @{ Name = 'T165_DirectCommandNoEnvNoBravoSkippedControl'; Expect = '<none>'; Arguments = '-NoProfile -Command Get-Date'; Wd = '' },
+                @{ Name = 'T166_DirectFileStableEnvNoBravoSkippedControl'; Expect = '<none>'; Arguments = '-NoProfile -File %SystemRoot%\Tools\backup.ps1'; Wd = '' },
+                # #496 раунд 12 (2): значення загальних параметрів із значенням перевіряються (PowerShell 5.1 відхиляє до запуску скрипта).,
+                @{ Name = 'T167_ErrorActionBogus'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ErrorAction Bogus -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T168_ErrorActionAliasNumericNotProven'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ea 2 -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T169_WarningActionSuspendRejected'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -WarningAction Suspend -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T170_InformationActionAliasBogus'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -infa Bogus -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T171_OutBufferNegative'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -OutBuffer:-1 -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T172_OutBufferAliasNonNumeric'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ob abc -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T173_ErrorActionBogusNoConfigPath'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ErrorAction Bogus -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T174_ErrorActionValidAnyCaseControl'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ErrorAction sTOP -WarningAction SilentlyContinue -InformationAction Continue -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T175_OutBufferValidControl'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ob 5 -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                # #496 раунд 12 (3): скрипт з наборами параметрів (ParameterSetName/DefaultParameterSetName) не моделюється -> Unknown навіть для іменованих аргументів.,
+                @{ Name = 'T176_ParameterSetsNamedArguments'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_PSETS.ps1')$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -Other x"; Wd = $scanRuntime },
+                @{ Name = 'T177_ParameterSetsConfigPathOnly'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_PSETS.ps1')$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T178_DefaultParameterSetNameNamed'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_PSDEF.ps1')$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T179_ParameterSetsNoConfigPath'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_PSETS.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T180_AllParameterSetsLiteralControl'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_PSALL.ps1')$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                # #496 раунд 13 (P2-1): нерозкрита %VAR% в обгортках cmd.exe / %VAR%-команді без згадки BRAVO -> Unknown; стабільні змінні -> без знахідки.
+                @{ Name = 'T181_CmdWrapperEnvPayloadUnknown'; Expect = 'Unknown'; Command = 'cmd.exe'; Arguments = '/c %BRAVO_CMD%'; Wd = '' },
+                @{ Name = 'T182_OtherEnvCommandEnvPayloadUnknown'; Expect = 'Unknown'; Command = '%BRAVO_LAUNCHER%'; Arguments = '-NoProfile -Command %BRAVO_PAYLOAD%'; Wd = '' },
+                @{ Name = 'T183_OtherLiteralStableEnvSkippedControl'; Expect = '<none>'; Command = 'C:\Tools\runner.exe'; Arguments = '-NoProfile -File %SystemRoot%\Tools\backup.ps1'; Wd = '' },
+                @{ Name = 'T184_CmdStableEnvNoBravoSkippedControl'; Expect = '<none>'; Command = 'cmd.exe'; Arguments = '/c echo %SystemRoot%'; Wd = '' }
             )
 
 
