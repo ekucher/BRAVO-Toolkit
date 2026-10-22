@@ -22,7 +22,11 @@ function ConvertFrom-BRAVOWindowsCommandLine {
     #    CommandLineToArgvW, звірена нативним оракулом (P/Invoke) на Windows Server 2022;
     #    це НЕ варіант msvcrt після 2008 р., де `""` лишає в режимі лапок;
     #  - поза лапками `""` дає порожній аргумент.
-    # Повертає токени й ознаку збалансованості лапок.
+    #  - `""` усередині лапок у реалізації CRT (msvcrt після 2008 р.) НЕ виходить з режиму лапок,
+    #    тож межі токенів залежать від того, чий розбір застосує цільовий виконуваний файл.
+    #    Ця неоднозначність не розв'язується статично: DoubledQuoteInQuote=$true, і
+    #    Get-BRAVOPowerShellActionDefinition не сертифікує такий рядок (Unknown).
+    # Повертає токени, ознаку збалансованості лапок і DoubledQuoteInQuote.
     param([AllowNull()][AllowEmptyString()][string]$CommandLine)
 
     $tokens = New-Object 'System.Collections.Generic.List[string]'
@@ -30,6 +34,7 @@ function ConvertFrom-BRAVOWindowsCommandLine {
     $builder = New-Object System.Text.StringBuilder
     $inQuote = $false
     $hasToken = $false
+    $doubledQuoteInQuote = $false
     $index = 0
     while ($index -lt $length) {
         $char = $CommandLine[$index]
@@ -56,6 +61,7 @@ function ConvertFrom-BRAVOWindowsCommandLine {
             if ($inQuote -and ($index + 1) -lt $length -and $CommandLine[$index + 1] -eq [char]'"') {
                 [void]$builder.Append([char]'"')
                 $inQuote = $false
+                $doubledQuoteInQuote = $true
                 $hasToken = $true
                 $index += 2
                 continue
@@ -83,7 +89,162 @@ function ConvertFrom-BRAVOWindowsCommandLine {
     return [pscustomobject]@{
         Tokens   = $tokens.ToArray()
         Balanced = (-not $inQuote)
+        DoubledQuoteInQuote = $doubledQuoteInQuote
     }
+}
+
+function Expand-BRAVOTaskActionVariable {
+    # Розкриття %VAR% у тексті Action. Task Scheduler розкриває змінні у СВОЄМУ середовищі,
+    # тому розкриваються лише машинно-стабільні (SystemRoot, windir, ProgramData, ProgramFiles,
+    # SystemDrive); решта потрапляє в Unsupported. NamePattern — що вважати іменем змінної між
+    # '%': за замовчуванням будь-що без символів \ і /; для командних рядків (де '%' може бути
+    # псевдонімом ForEach-Object) викликач передає суворіший шаблон без пробілів.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Text,
+        [string]$NamePattern = '[^%\\/]+'
+    )
+
+    $stableVariables = @('SystemRoot', 'windir', 'ProgramData', 'ProgramFiles', 'SystemDrive')
+    $unsupported = New-Object 'System.Collections.Generic.List[string]'
+    $unsupportedPositions = New-Object 'System.Collections.Generic.List[int]'
+    $result = [string]$Text
+    foreach ($match in [regex]::Matches($result, "%($NamePattern)%")) {
+        $variableName = $match.Groups[1].Value
+        $value = $null
+        if ($stableVariables -contains $variableName) {
+            $value = [Environment]::GetEnvironmentVariable($variableName)
+        }
+        if ([string]::IsNullOrEmpty($value)) {
+            $unsupported.Add($variableName)
+            $unsupportedPositions.Add([int]$match.Index + 1)
+        } else {
+            $result = $result.Replace($match.Value, $value)
+        }
+    }
+    # Unsupported/UnsupportedPositions: ім'я лишається лише для логіки викликача; У ЗВІТ воно не потрапляє
+    # (вираз між '%' може містити секрет, напр. %password=...%) — виводиться лише позиція (1-based) у рядку.
+    return [pscustomobject]@{ Text = $result; Unsupported = $unsupported.ToArray(); UnsupportedPositions = $unsupportedPositions.ToArray() }
+}
+
+function Test-BRAVOTaskLocalPathSafe {
+    # SEC-001: єдина перевірка перед БУДЬ-ЯКИМ зверненням до файлової системи зі шляхом із Task.Xml
+    # (Test-Path / Get-Item / ParseFile / читання валідатором). Шлях керується завданням, тож діагностика
+    # (від імені оператора) не повинна ініціювати вихідний SMB/NTLM-запит і не повинна йти через reparse point.
+    #
+    # Файлова система відкривається ЛИШЕ для шляхів усередині TrustedRoot (каталог поточного runtime) і лише
+    # якщо кожен компонент захищений від підміни (див. нижче); шляхи поза ним НІКОЛИ не відкриваються.
+    # ЛЕКСИЧНО/за метаданими (без звернення до диска): шлях і root — лише `X:\...`/`X:/...` (UNC, `//`, `\\?\`,
+    # `\\.\`, відносні — відхиляються); нормалізація GetFullPath; префікс за межею компонента, без урахування регістру
+    # (`C:\BRAVO2` НЕ всередині `C:\BRAVO`); літера диска не мережева ([IO.DriveInfo].DriveType читає локальну таблицю
+    # підключень, до сервера не звертається). Порожній/неприйнятний TrustedRoot = жодного доступу.
+    #
+    # ОДИН обхід згори вниз (корінь диска -> ціль). Кожен компонент i ПОВНІСТЮ перевіряється ДО будь-якого виклику
+    # файлової системи, що проходить через нього (тобто до GetAttributes(i+1)):
+    #  1) GetAttributes(i): перший неіснуючий компонент зупиняє обхід (нижче нічого немає); reparse point -> відмова;
+    #  2) Get-Acl(i) (будь-яка помилка = недовірений, fail closed): власник довірений; жоден недовірений Allow-ACE
+    #     не дає Delete/ChangePermissions/TakeOwnership; для каталогу — DeleteSubdirectoriesAndFiles; для компонентів
+    #     на рівні TrustedRoot і нижче додатково WriteData/CreateFiles, AppendData/CreateDirectories, WriteAttributes,
+    #     WriteExtendedAttributes. Відмова -> негайно, i+1 не чіпаємо.
+    # Чому це стабільно: батько i уже перевірений (ніхто недовірений не видалить дочірній компонент), а в самого i
+    # немає недовірених прав Delete/власника/DACL, тож i не можна замінити після перевірки, і розв'язання i+1
+    # детерміноване. Модель загроз: непривілейований обліковий запис не може створити symlink на віддалену ціль без
+    # SeCreateSymbolicLinkPrivilege, а junction не може вказувати на UNC; отже, щоб направити шлях назовні, треба
+    # замінити існуючий компонент — а це за умов вище недоступно недовіреним суб'єктам. Вище root створення нових
+    # сусідів (напр. Authenticated Users «create folders» на C:\) допустиме.
+    # NULL DACL компонента = недовіреним дозволено все -> відмова (порожній DACL допустимий).
+    # Довірені суб'єкти (за SID; неперекладний = недовірений): SYSTEM (S-1-5-18), BUILTIN\Administrators
+    # (S-1-5-32-544), NT SERVICE\TrustedInstaller та поточний користувач процесу. Враховуються лише Allow-ACE, що
+    # діють на сам об'єкт (InheritOnly пропускаються); Deny ігноруються (консервативно).
+    # (Архітектурний борг: політику ACL runtime-каталогу ПИШУТЬ функції Set-* у BRAVO_TASKS_INSTALL.ps1; це лише
+    # read-only верифікатор, локальний для сканера.)
+    # Викликач після використання (ParseFile/Get-Item/валідатор) повторює перевірку — захист у глибину.
+    # Safe=$false -> Reason без вмісту шляху (узагальнене пояснення), шлях не читається.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Path,
+        [AllowNull()][AllowEmptyString()][string]$TrustedRoot
+    )
+
+    $reject = {
+        param($Reason)
+        [pscustomobject]@{ Safe = $false; Reason = $Reason }
+    }
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -notmatch '^[A-Za-z]:[\\/]') {
+        return (& $reject 'шлях не є локальним шляхом із літерою диска (мережевий/UNC/пристрій/відносний) — не перевірявся')
+    }
+    if ([string]::IsNullOrWhiteSpace($TrustedRoot) -or $TrustedRoot -notmatch '^[A-Za-z]:[\\/]') {
+        return (& $reject 'каталог довіреного runtime не задано або він не є локальним шляхом — файлова система не відкривається')
+    }
+    $aclReason = 'ACL шляху не підтверджує захист від підміни компонентів недовіреними суб''єктами — не перевірявся'
+    $reparseReason = 'компонент шляху є reparse point (junction/symlink) — ціль могла б бути віддаленою, не перевірявся'
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd([char]92, [char]47)
+        $fullRoot = [IO.Path]::GetFullPath($TrustedRoot).TrimEnd([char]92, [char]47)
+        if ($fullPath -notmatch '^[A-Za-z]:' -or $fullRoot -notmatch '^[A-Za-z]:') {
+            return (& $reject 'шлях не є локальним шляхом із літерою диска (мережевий/UNC/пристрій/відносний) — не перевірявся')
+        }
+        $inside = [string]::Equals($fullPath, $fullRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            $fullPath.StartsWith($fullRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+        if (-not $inside) {
+            return (& $reject 'шлях поза каталогом довіреного runtime — не відкривається (наявність і вміст не перевірялися)')
+        }
+        $driveType = (New-Object System.IO.DriveInfo ($fullRoot.Substring(0, 1))).DriveType
+        if ($driveType -eq [System.IO.DriveType]::Network) {
+            return (& $reject 'шлях на мережевому диску — не перевірявся')
+        }
+
+        $trusted = @(
+            'S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464',
+            [string][System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        )
+        $genericAll = 0x10000000
+        $coreMask = 0x10000 -bor 0x40000 -bor 0x80000 -bor $genericAll         # Delete, ChangePermissions, TakeOwnership
+        $deleteChildMask = 0x40 -bor $genericAll                                # DeleteSubdirectoriesAndFiles
+        $writeMask = 0x2 -bor 0x4 -bor 0x100 -bor 0x10 -bor $genericAll -bor 0x40000000  # data/append/attrs/ext attrs/GenericWrite
+        $inheritOnly = [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
+        $sidType = [System.Security.Principal.SecurityIdentifier]
+
+        $segments = @($fullPath.Substring(3) -split '[\\/]' | Where-Object { $_ -ne '' })
+        $component = $fullPath.Substring(0, 3)
+        $index = -1
+        while ($true) {
+            if ($index -ge 0) {
+                if ($index -ge $segments.Count) { break }
+                $component = Join-Path -Path $component -ChildPath $segments[$index]
+            }
+            $index++
+            # (1) атрибути компонента i: його предки вже повністю перевірені.
+            try {
+                $attributes = [System.IO.File]::GetAttributes($component)
+            } catch [System.IO.FileNotFoundException] {
+                break
+            } catch [System.IO.DirectoryNotFoundException] {
+                break
+            }
+            if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return (& $reject $reparseReason) }
+            # (2) ACL компонента i — ДО будь-якого звернення до i+1.
+            $isDirectory = [bool]($attributes -band [System.IO.FileAttributes]::Directory)
+            $belowRoot = ($component.Length -ge $fullRoot.Length)
+            $acl = Get-Acl -LiteralPath $component -ErrorAction Stop
+            # NULL DACL (необмежений доступ для всіх) не дає жодного правила в GetAccessRules, але НЕ є порожнім DACL
+            # (порожній = доступу немає ні в кого, це допустимо). Розрізняємо за сирим дескриптором: DiscretionaryAcl = $null.
+            $rawDescriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($acl.GetSecurityDescriptorBinaryForm(), 0)
+            if ($null -eq $rawDescriptor.DiscretionaryAcl) { return (& $reject $aclReason) }
+            $owner = $acl.GetOwner($sidType)
+            if ($null -eq $owner -or $trusted -notcontains [string]$owner.Value) { return (& $reject $aclReason) }
+            foreach ($rule in @($acl.GetAccessRules($true, $true, $sidType))) {
+                if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+                if (([int]$rule.PropagationFlags -band $inheritOnly) -ne 0) { continue }
+                if ($trusted -contains [string]$rule.IdentityReference.Value) { continue }
+                $rights = [int]$rule.FileSystemRights
+                if (($rights -band $coreMask) -ne 0) { return (& $reject $aclReason) }
+                if ($isDirectory -and ($rights -band $deleteChildMask) -ne 0) { return (& $reject $aclReason) }
+                if ($belowRoot -and ($rights -band $writeMask) -ne 0) { return (& $reject $aclReason) }
+            }
+        }
+    } catch {
+        return (& $reject 'не вдалося безпечно перевірити шлях (локальна перевірка не підтвердила його безпеку) — не перевірявся')
+    }
+    return [pscustomobject]@{ Safe = $true; Reason = $null }
 }
 
 function Resolve-BRAVOTaskActionPath {
@@ -105,40 +266,30 @@ function Resolve-BRAVOTaskActionPath {
     }
     if ([string]::IsNullOrWhiteSpace($Path)) { return (& $failure 'порожній шлях') }
 
-    $stableVariables = @('SystemRoot', 'windir', 'ProgramData', 'ProgramFiles', 'SystemDrive')
     $expand = {
         param($Text)
-        $unsupported = New-Object 'System.Collections.Generic.List[string]'
-        $result = $Text
-        foreach ($match in [regex]::Matches($Text, '%([^%\\/]+)%')) {
-            $variableName = $match.Groups[1].Value
-            $value = $null
-            if ($stableVariables -contains $variableName) {
-                $value = [Environment]::GetEnvironmentVariable($variableName)
-            }
-            if ([string]::IsNullOrEmpty($value)) {
-                $unsupported.Add($variableName)
-            } else {
-                $result = $result.Replace($match.Value, $value)
-            }
-        }
-        [pscustomobject]@{ Text = $result; Unsupported = $unsupported.ToArray() }
+        Expand-BRAVOTaskActionVariable -Text $Text
     }
     $unsupportedReason = {
-        param($Names)
-        'шлях залежить від змінної середовища ' + ((@($Names) | Select-Object -Unique | ForEach-Object { "%$_%" }) -join ', ') +
-        ', яку Task Engine бере зі свого (кешованого) середовища, а діагностика не може його відтворити; ' +
+        param($Positions)
+        'шлях залежить від змінної середовища (позиція ' + (@($Positions) -join ', ') + ' у рядку; вираз не виводиться), ' +
+        'яку Task Engine бере зі свого (кешованого) середовища, а діагностика не може його відтворити; ' +
         'розкриваються лише %SystemRoot%, %windir%, %ProgramData%, %ProgramFiles%, %SystemDrive%'
     }
 
     try {
         $expanded = & $expand $Path.Trim()
-        if (@($expanded.Unsupported).Count -gt 0) { return (& $failure (& $unsupportedReason $expanded.Unsupported)) }
+        if (@($expanded.Unsupported).Count -gt 0) { return (& $failure (& $unsupportedReason $expanded.UnsupportedPositions)) }
         $text = $expanded.Text
+        $remoteReason = 'шлях не є локальним шляхом із літерою диска (мережевий/UNC/пристрій) — не перевірявся'
+        # SEC-001: лексична відмова ДО GetFullPath/звернення до диска: `\\host\share`, `//host`, `\\?\`, `\\.\`.
+        if ($text -match '^[\\/]{2}') { return (& $failure $remoteReason) }
         if ([IO.Path]::IsPathRooted($text) -and
             $text -notmatch '^[A-Za-z]:(?![\\/])' -and
             $text -notmatch '^[\\/](?![\\/])') {
-            return [pscustomobject]@{ Path = [IO.Path]::GetFullPath($text); Reason = $null }
+            $fullRooted = [IO.Path]::GetFullPath($text)
+            if ($fullRooted -notmatch '^[A-Za-z]:[\\/]') { return (& $failure $remoteReason) }
+            return [pscustomobject]@{ Path = $fullRooted; Reason = $null }
         }
         if ($text -match '^[A-Za-z]:' -or $text -match '^[\\/]') {
             return (& $failure 'шлях залежить від поточного диска/каталогу (X:foo або \foo)')
@@ -148,8 +299,9 @@ function Resolve-BRAVOTaskActionPath {
         }
         $expandedWorkingDirectory = & $expand $WorkingDirectory.Trim().Trim('"')
         if (@($expandedWorkingDirectory.Unsupported).Count -gt 0) {
-            return (& $failure (& $unsupportedReason $expandedWorkingDirectory.Unsupported))
+            return (& $failure (& $unsupportedReason $expandedWorkingDirectory.UnsupportedPositions))
         }
+        if ($expandedWorkingDirectory.Text -match '^[\\/]{2}') { return (& $failure $remoteReason) }
         if (-not [IO.Path]::IsPathRooted($expandedWorkingDirectory.Text)) {
             return (& $failure 'WorkingDirectory завдання не є абсолютним шляхом')
         }
@@ -158,7 +310,7 @@ function Resolve-BRAVOTaskActionPath {
             Reason = $null
         }
     } catch {
-        return (& $failure "некоректний шлях: $($_.Exception.Message)")
+        return (& $failure 'некоректний шлях (не розібрано)')
     }
 }
 
@@ -170,18 +322,25 @@ function Get-BRAVOScriptDeclaredParameter {
     #  PositionalAmbiguous — позицію статично не визначити (набори параметрів, змішані
     #                   явні/неявні Position, ValueFromRemainingArguments).
     # Known=$false, коли скрипт недоступний або не розбирається.
-    param([AllowNull()][AllowEmptyString()][string]$ScriptPath)
+    param(
+        [AllowNull()][AllowEmptyString()][string]$ScriptPath,
+        [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot
+    )
 
     $unknown = [pscustomobject]@{
         Known = $false; Entries = @(); SwitchOwners = @(); PositionalOrder = @(); PositionalAmbiguous = $true
     }
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return $unknown }
     try {
+        # SEC-001: скрипт поза TrustedRuntimeRoot не відкривається й не розбирається.
+        if (-not (Test-BRAVOTaskLocalPathSafe -Path $ScriptPath -TrustedRoot $TrustedRuntimeRoot).Safe) { return $unknown }
         if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) { return $unknown }
         $tokens = $null
         $errors = $null
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$errors)
         if ($null -eq $ast -or @($errors).Count -gt 0) { return $unknown }
+        # Повторна перевірка після використання (захист у глибину): шлях змінився -> результат відкидається.
+        if (-not (Test-BRAVOTaskLocalPathSafe -Path $ScriptPath -TrustedRoot $TrustedRuntimeRoot).Safe) { return $unknown }
 
         $entries = New-Object 'System.Collections.Generic.List[object]'
         $switchOwners = New-Object 'System.Collections.Generic.List[string]'
@@ -376,7 +535,16 @@ function Get-BRAVOPowerShellActionDefinition {
     # (для -EncodedCommand — ДЕКОДОВАНИЙ), помилки розбору. Нічого не виконується.
     param([AllowNull()][AllowEmptyString()][string]$Arguments)
 
-    $split = ConvertFrom-BRAVOWindowsCommandLine -CommandLine $Arguments
+    # Task Scheduler розкриває %VAR% в Arguments ДО запуску процесу, тож межі токенів
+    # визначає розкритий рядок (шлях зі стабільної змінної з пробілом без лапок розривається).
+    # Нестабільна змінна (%USERPROFILE% тощо) — межі токенів невідомі: Problem (Unknown).
+    # Рішення (fail closed): Task Scheduler розкриває %ім'я% в Arguments незалежно від того, чи powershell.exe потім
+    # сприйме текст як код -Command (на кшталт ExpandEnvironmentStrings: визначені імена підставляються, невизначені лишаються
+    # дослівно). Тому будь-яка пара '%...%' з непорожнім іменем без '%' (пробіли, у тому числі на краях, та '=' не виключаємо)
+    # вважається посиланням; не з підтримуваних стабільних -> Problem (Unknown), у т.ч. пара '%' як псевдонім ForEach-Object
+    # усередині -Command. Одинокий '%' без пари посиланням не є.
+    $expansion = Expand-BRAVOTaskActionVariable -Text $Arguments -NamePattern '[^%]+'
+    $split = ConvertFrom-BRAVOWindowsCommandLine -CommandLine $expansion.Text
     $tokens = @($split.Tokens)
     $definition = [pscustomobject]@{
         Balanced = [bool]$split.Balanced
@@ -387,8 +555,17 @@ function Get-BRAVOPowerShellActionDefinition {
         CommandText = $null
         Problem = $null
     }
+    if (@($expansion.Unsupported).Count -gt 0) {
+        $definition.Problem = 'аргументи залежать від змінної середовища (позиція ' + (@($expansion.UnsupportedPositions) -join ', ') +
+            ' у рядку; вираз не виводиться), яку Task Engine бере зі свого (кешованого) середовища: межі токенів статично не визначити'
+        return $definition
+    }
     if (-not $definition.Balanced) {
         $definition.Problem = 'незбалансовані лапки в аргументах завдання'
+        return $definition
+    }
+    if ([bool]$split.DoubledQuoteInQuote) {
+        $definition.Problem = 'подвоєні лапки всередині лапок в аргументах: межі токенів залежать від реалізації розбору argv (CommandLineToArgvW чи CRT), статично не визначити'
         return $definition
     }
     $invocation = Get-BRAVOPowerShellInvocationMode -Tokens $tokens
@@ -407,7 +584,7 @@ function Get-BRAVOPowerShellActionDefinition {
             if ($valueIndex -ge $tokens.Count) { throw 'немає значення' }
             $definition.CommandText = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([string]$tokens[$valueIndex]))
         } catch {
-            $definition.Problem = "-EncodedCommand не вдалося декодувати: $($_.Exception.Message)"
+            $definition.Problem = "-EncodedCommand не вдалося декодувати (не base64/UTF-16LE)"
         }
     }
     return $definition
@@ -483,11 +660,11 @@ function Get-BRAVOConfigPathReferenceFromItem {
         $hasNextValue = (($i + 1) -lt $items.Count -and $items[$i + 1].Kind -eq 'Value')
         if ($null -eq $owner) {
             # Параметр, якого ми не знаємо: чи споживає він наступне значення — невідомо.
-            & $fail "параметр -$($current.Spelling) не розпізнано за param() скрипта"
+            & $fail "параметр (елемент №$($i + 1)) не розпізнано за param() скрипта"
             if ($hasNextValue) {
                 $nextText = [string]$items[$i + 1].Text
                 if (-not [bool]$Declared.Known -and ($null -eq $items[$i + 1].Text -or $nextText -match '(?i)\.config$')) {
-                    $references.Add((& $newReference $current.Spelling $null "параметр -$($current.Spelling) невідомий (param() скрипта недоступний); наступне значення могло б бути -ConfigPath"))
+                    $references.Add((& $newReference $current.Spelling $null "параметр (елемент №$($i + 1)) невідомий (param() скрипта недоступний); наступне значення могло б бути -ConfigPath"))
                 }
                 [void]$consumed.Add($i + 1)
             }
@@ -571,7 +748,17 @@ function Test-BRAVOPowerShellLeadingOptionsModelled {
     $tokenList = @($Tokens)
     # Ім'я -> мінімальна довжина префікса (5.1).
     $flags = @{ nologo = 3; noexit = 3; noprofile = 3; noninteractive = 4; mta = 3; sta = 3 }
-    $withValue = @{ executionpolicy = 2; windowstyle = 2; version = 2; inputformat = 2; outputformat = 2 }
+    # -Version навмисно НЕ моделюється (значення, прийнятні цільовим powershell.exe, не верифіковано) -> Modelled=$false.
+    $withValue = @{ executionpolicy = 2; windowstyle = 2; inputformat = 2; outputformat = 2 }
+    # Значення, які powershell.exe 5.1 приймає (перевірено пробами: Bogus/скорочення -InputFormat/-OutputFormat/-WindowStyle
+    # відхиляються з кодом -196608, повні імена будь-якого регістру приймаються). Інше значення — Modelled=$false (Unknown):
+    # інакше скрипт міг би не запуститися взагалі, а дія отримала б визначену класифікацію.
+    $allowedValues = @{
+        executionpolicy = @('restricted', 'allsigned', 'remotesigned', 'unrestricted', 'bypass', 'undefined', 'default')
+        windowstyle = @('normal', 'minimized', 'maximized', 'hidden')
+        inputformat = @('text', 'xml')
+        outputformat = @('text', 'xml')
+    }
     $noProfile = $false
     for ($i = 0; $i -lt $ModeIndex; $i++) {
         if (-not ($tokenList[$i] -match '^[-/]([A-Za-z]+)$')) { return [pscustomobject]@{ Modelled = $false; NoProfile = $false } }
@@ -582,6 +769,9 @@ function Test-BRAVOPowerShellLeadingOptionsModelled {
         if ($valueMatches.Count -eq 1) {
             $i++
             if ($i -ge $ModeIndex) { return [pscustomobject]@{ Modelled = $false; NoProfile = $false } }
+            if (@($allowedValues[[string]$valueMatches[0]]) -notcontains ([string]$tokenList[$i]).ToLowerInvariant()) {
+                return [pscustomobject]@{ Modelled = $false; NoProfile = $false }
+            }
         } elseif ($flagMatches[0] -eq 'noprofile') {
             $noProfile = $true
         }
@@ -599,7 +789,8 @@ function Get-BRAVOTaskActionConfigPathReference {
     # Лише розбір тексту (Parser::ParseInput нічого не виконує).
     param(
         [Parameter(Mandatory = $true)]$Definition,
-        [AllowNull()][AllowEmptyString()][string]$WorkingDirectory
+        [AllowNull()][AllowEmptyString()][string]$WorkingDirectory,
+        [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot
     )
 
     $references = New-Object 'System.Collections.Generic.List[object]'
@@ -608,9 +799,10 @@ function Get-BRAVOTaskActionConfigPathReference {
         [pscustomobject]@{ Form = $Form; ScriptPath = $ScriptPath; Spelling = $null; RawValue = $null; Problem = $Problem }
     }
     $noProfile = $false
+    $targetScript = $null
     $result = {
         param($Modelled, $Reason)
-        [pscustomobject]@{ References = $references.ToArray(); Modelled = [bool]$Modelled; Reason = $Reason; NoProfile = [bool]$noProfile }
+        [pscustomobject]@{ References = $references.ToArray(); Modelled = [bool]$Modelled; Reason = $Reason; NoProfile = [bool]$noProfile; TargetScript = $targetScript }
     }
     if ($null -ne $Definition.Problem) {
         $references.Add((& $problemReference $(if ($null -ne $Definition.Mode) { [string]$Definition.Mode } else { 'Unparsed' }) $null $Definition.Problem))
@@ -629,17 +821,18 @@ function Get-BRAVOTaskActionConfigPathReference {
 
     if ($mode -eq 'File') {
         $scriptPath = [string]$Definition.FileTarget
+        $targetScript = $scriptPath
         if (-not (Test-BRAVOScriptPathIsBravoEntrypoint -ScriptPath $scriptPath)) {
             return (& $result $false '-File вказує не на BRAVO_*.ps1, а дія згадує BRAVO_*.ps1 в аргументах/каталозі')
         }
-        $declared = Get-BRAVOScriptDeclaredParameter -ScriptPath (Resolve-BRAVOTaskActionPath -Path $scriptPath -WorkingDirectory $WorkingDirectory).Path
+        $declared = Get-BRAVOScriptDeclaredParameter -ScriptPath (Resolve-BRAVOTaskActionPath -Path $scriptPath -WorkingDirectory $WorkingDirectory).Path -TrustedRuntimeRoot $TrustedRuntimeRoot
         $items = New-Object 'System.Collections.Generic.List[object]'
         for ($i = $Definition.ModeIndex + 2; $i -lt $tokens.Count; $i++) {
             if ($tokens[$i] -match '^-([A-Za-z][A-Za-z0-9_]*)(:(.*))?$') {
                 $hasInline = $tokens[$i].Contains(':')
                 if ($hasInline -and [string]$Matches[3] -eq '') {
                     # '-Param:' без значення в тому ж токені: чи візьме PowerShell наступний токен — не змоделювати.
-                    $items.Add([pscustomobject]@{ Kind = 'Opaque'; Text = $null; Reason = "токен '$($tokens[$i])' має порожнє inline-значення" })
+                    $items.Add([pscustomobject]@{ Kind = 'Opaque'; Text = $null; Reason = "токен №$($i + 1) має порожнє inline-значення" })
                     continue
                 }
                 $items.Add([pscustomobject]@{
@@ -647,7 +840,7 @@ function Get-BRAVOTaskActionConfigPathReference {
                         Text = $(if ($hasInline) { [string]$Matches[3] } else { $null }); Reason = $null
                     })
             } elseif ($tokens[$i].StartsWith('-', [StringComparison]::Ordinal)) {
-                $items.Add([pscustomobject]@{ Kind = 'Opaque'; Text = $null; Reason = "токен '$($tokens[$i])' не змодельовано" })
+                $items.Add([pscustomobject]@{ Kind = 'Opaque'; Text = $null; Reason = "токен №$($i + 1) не змодельовано" })
             } else {
                 $items.Add([pscustomobject]@{ Kind = 'Value'; Text = [string]$tokens[$i]; Reason = $null })
             }
@@ -666,7 +859,7 @@ function Get-BRAVOTaskActionConfigPathReference {
     $parseErrors = $null
     $commandAst = [System.Management.Automation.Language.Parser]::ParseInput([string]$Definition.CommandText, [ref]$parseTokens, [ref]$parseErrors)
     if (@($parseErrors).Count -gt 0) {
-        $problem = "текст -$mode не розібрано: $(@($parseErrors)[0].Message)"
+        $problem = "текст -$mode не розібрано (помилка розбору у позиції $(@($parseErrors)[0].Extent.StartColumnNumber); вміст не виводиться)"
         $references.Add((& $problemReference $mode $null $problem))
         return (& $result $false $problem)
     }
@@ -707,6 +900,7 @@ function Get-BRAVOTaskActionConfigPathReference {
             $structureReason = 'ціль команди — голе ім''я BRAVO_*.ps1 без шляху: PowerShell не шукає його в WorkingDirectory (лише .\ чи абсолютний шлях), тож що саме запуститься — статично не визначити'
         } else {
             $soleCommand = $candidate
+            $targetScript = [string]@($candidate.CommandElements)[0].Value
         }
     }
 
@@ -739,7 +933,7 @@ function Get-BRAVOTaskActionConfigPathReference {
             if ($ancestor -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -or
                 $ancestor -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $insideScriptBlock = $true; break }
         }
-        $declared = Get-BRAVOScriptDeclaredParameter -ScriptPath (Resolve-BRAVOTaskActionPath -Path $scriptPath -WorkingDirectory $WorkingDirectory).Path
+        $declared = Get-BRAVOScriptDeclaredParameter -ScriptPath (Resolve-BRAVOTaskActionPath -Path $scriptPath -WorkingDirectory $WorkingDirectory).Path -TrustedRuntimeRoot $TrustedRuntimeRoot
         $items = New-Object 'System.Collections.Generic.List[object]'
         $splatted = $false
         for ($i = 1; $i -lt $elements.Count; $i++) {
@@ -801,7 +995,8 @@ function Get-BRAVOConfigPathTargetClassification {
     param(
         [AllowNull()][AllowEmptyString()][string]$RawPath,
         [AllowNull()][AllowEmptyString()][string]$WorkingDirectory,
-        [Parameter(Mandatory = $true)][scriptblock]$LegacyConfigurationValidator
+        [Parameter(Mandatory = $true)][scriptblock]$LegacyConfigurationValidator,
+        [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot
     )
 
     $classify = {
@@ -816,6 +1011,13 @@ function Get-BRAVOConfigPathTargetClassification {
         return (& $classify 'Unknown' $null ([string]$resolution.Reason))
     }
     $resolved = [string]$resolution.Path
+    # Ціль поза TrustedRuntimeRoot (або будь-яка небезпечна) НЕ відкривається: явний -ConfigPath лишається
+    # знахідкою Unknown (WARN, не PASS) — клас не присвоюється, бо без читання файлу його не визначити
+    # (LegacyPrimary вимагає перевірки валідатором loader-а, Missing — перевірки наявності).
+    $pathSafety = Test-BRAVOTaskLocalPathSafe -Path $resolved -TrustedRoot $TrustedRuntimeRoot
+    if (-not $pathSafety.Safe) {
+        return (& $classify 'Unknown' $null ([string]$pathSafety.Reason))
+    }
     try {
         # Get-Item -ErrorAction Stop: помилка доступу/вводу-виводу кидає виняток (Unknown), а не
         # мовчки дає $false, як Test-Path (інакше файл без права доступу хибно вважався б Missing).
@@ -833,6 +1035,10 @@ function Get-BRAVOConfigPathTargetClassification {
         if ($item.PSIsContainer) {
             return (& $classify 'Unknown' $resolved 'шлях вказує на каталог, а не на файл')
         }
+        # Повторна перевірка після використання (захист у глибину).
+        if (-not (Test-BRAVOTaskLocalPathSafe -Path $resolved -TrustedRoot $TrustedRuntimeRoot).Safe) {
+            return (& $classify 'Unknown' $null 'шлях змінився під час перевірки (небезпечний компонент) — результат відкинуто')
+        }
     } catch {
         return (& $classify 'Unknown' $resolved "не вдалося перевірити файл: $($_.Exception.Message)")
     }
@@ -842,7 +1048,10 @@ function Get-BRAVOConfigPathTargetClassification {
     try {
         & $LegacyConfigurationValidator $resolved (Split-Path -Path $resolved -Parent)
     } catch {
-        return (& $classify 'Unknown' $resolved "loader не приймає цей файл як legacy primary: $($_.Exception.Message)")
+        return (& $classify 'Unknown' $resolved "loader не приймає цей файл як legacy primary (текст помилки loader-а не виводиться)")
+    }
+    if (-not (Test-BRAVOTaskLocalPathSafe -Path $resolved -TrustedRoot $TrustedRuntimeRoot).Safe) {
+        return (& $classify 'Unknown' $null 'шлях змінився під час перевірки (небезпечний компонент) — результат відкинуто')
     }
     return (& $classify 'LegacyPrimary' $resolved 'BRAVO.config (legacy primary)')
 }
@@ -861,7 +1070,8 @@ function Get-BRAVOTaskConfigPathFinding {
         [AllowNull()][AllowEmptyString()][string]$TaskPath,
         [AllowNull()][AllowEmptyString()][string]$TaskName,
         [AllowNull()][object[]]$Actions,
-        [Parameter(Mandatory = $true)][scriptblock]$LegacyConfigurationValidator
+        [Parameter(Mandatory = $true)][scriptblock]$LegacyConfigurationValidator,
+        [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot
     )
 
     $findings = New-Object 'System.Collections.Generic.List[object]'
@@ -884,14 +1094,21 @@ function Get-BRAVOTaskConfigPathFinding {
                 Status = $Status
                 Form = if ($null -ne $Reference) { [string]$Reference.Form } else { $null }
                 Spelling = if ($null -ne $Reference) { [string]$Reference.Spelling } else { $null }
-                ConfigPathRaw = if ($null -ne $Reference) { [string]$Reference.RawValue } else { $null }
+                ConfigPathRaw = if ($null -ne $Reference -and $null -ne $Classification -and $Classification.Class -ne 'Unknown') { [string]$Reference.RawValue } else { $null }
                 ResolvedPath = if ($null -ne $Classification) { [string]$Classification.ResolvedPath } else { $null }
                 Detail = $Detail
             }
         }
 
         $kind = Get-BRAVOActionExecutableKind -Command $command
-        if ($kind -eq 'Other') { continue }
+        if ($kind -eq 'Other') {
+            # Exec.Command із %VAR% (напр. %ComSpec%) Task Scheduler розкриває у своєму середовищі:
+            # що саме запуститься — невідомо. Якщо дія згадує BRAVO_*.ps1 — Unknown, а не мовчазний пропуск.
+            if ($command -match '%[^%]+%' -and ($arguments -match $bravoPattern -or $workingDirectory -match $bravoPattern)) {
+                $findings.Add((& $newFinding 'Unknown' $null $null 'Exec.Command залежить від змінної середовища (розкривається Task Scheduler у власному середовищі), а аргументи/WorkingDirectory згадують BRAVO_*.ps1 — що саме запуститься, статично не визначити'))
+            }
+            continue
+        }
         if ($kind -eq 'Cmd') {
             if ($arguments -match $bravoPattern -or $workingDirectory -match $bravoPattern) {
                 $findings.Add((& $newFinding 'Unknown' $null $null 'обгортка cmd.exe, що згадує BRAVO_*.ps1 — аргументи статично не розібрано'))
@@ -908,14 +1125,38 @@ function Get-BRAVOTaskConfigPathFinding {
             continue
         }
 
-        $analysis = Get-BRAVOTaskActionConfigPathReference -Definition $definition -WorkingDirectory $workingDirectory
+        $analysis = Get-BRAVOTaskActionConfigPathReference -Definition $definition -WorkingDirectory $workingDirectory -TrustedRuntimeRoot $TrustedRuntimeRoot
         $references = @($analysis.References)
         if ($references.Count -eq 0) {
             if ([bool]$analysis.Modelled) {
                 if (-not [bool]$analysis.NoProfile) {
                     $findings.Add((& $newFinding 'Unknown' $null $null 'powershell.exe запущено без -NoProfile: профіль облікового запису завдання може задати ConfigPath через $PSDefaultParameterValues, тож відсутність -ConfigPath (AUTO) не підтверджується'))
                 } else {
-                    $findings.Add((& $newFinding 'NoConfigPath' $null $null '-ConfigPath відсутній (AUTO); дію повністю змодельовано'))
+                    # «legacy BRAVO.config не виконується» гарантує лише runtime із cutover (entrypoint викликає
+                    # Import-BravoConfiguration -DisallowLegacyPrimaryAutoDetect; перевіряється ci/BRAVOConfigV2CutoverGates.ps1
+                    # для ПОТОЧНОГО комплекту). Ціль в іншій (старішій) інсталяції цієї гарантії не має -> Unknown.
+                    $scriptResolution = Resolve-BRAVOTaskActionPath -Path ([string]$analysis.TargetScript) -WorkingDirectory $workingDirectory
+                    $trustReason = $null
+                    if ([string]::IsNullOrWhiteSpace($TrustedRuntimeRoot)) {
+                        $trustReason = 'довірений каталог поточного runtime не передано — cutover цільового скрипта не перевірено'
+                    } elseif ($null -eq $scriptResolution.Path) {
+                        $trustReason = "шлях цільового скрипта не розв'язано ($($scriptResolution.Reason)) — cutover не перевірено"
+                    } else {
+                        try {
+                            $trustedFull = [IO.Path]::GetFullPath($TrustedRuntimeRoot).TrimEnd([char]92, [char]47)
+                            $scriptParent = ([IO.Path]::GetDirectoryName([string]$scriptResolution.Path)).TrimEnd([char]92, [char]47)
+                            if (-not [string]::Equals($trustedFull, $scriptParent, [StringComparison]::OrdinalIgnoreCase)) {
+                                $trustReason = "ціль '$($scriptResolution.Path)' лежить в іншій інсталяції, ніж поточний runtime '$trustedFull' — cutover (без автозавантаження legacy BRAVO.config) цього runtime не перевірено"
+                            }
+                        } catch {
+                            $trustReason = "не вдалося порівняти каталог цілі з поточним runtime (шлях не нормалізовано)"
+                        }
+                    }
+                    if ($null -ne $trustReason) {
+                        $findings.Add((& $newFinding 'Unknown' $null $null ('-ConfigPath відсутній, але ' + $trustReason)))
+                    } else {
+                        $findings.Add((& $newFinding 'NoConfigPath' $null $null '-ConfigPath відсутній (AUTO); дію повністю змодельовано'))
+                    }
                 }
             } else {
                 $findings.Add((& $newFinding 'Unknown' $null $null ([string]$analysis.Reason)))
@@ -930,11 +1171,11 @@ function Get-BRAVOTaskConfigPathFinding {
             if (-not [bool]$analysis.Modelled) {
                 # Позитивні класи (LegacyPrimary/Local/Missing) — лише для повністю змодельованої дії:
                 # інакше невідомо, чи цей -ConfigPath взагалі буде прив'язано/виконано.
-                $findings.Add((& $newFinding 'Unknown' $reference $null ("знайдено -ConfigPath '$($reference.RawValue)', але дію не змодельовано повністю ($($analysis.Reason)) — клас не присвоюється")))
+                $findings.Add((& $newFinding 'Unknown' $reference $null ("знайдено -ConfigPath, але дію не змодельовано повністю ($($analysis.Reason)) — клас не присвоюється; значення не виводиться")))
                 continue
             }
             $classification = Get-BRAVOConfigPathTargetClassification -RawPath $reference.RawValue -WorkingDirectory $workingDirectory `
-                -LegacyConfigurationValidator $LegacyConfigurationValidator
+                -LegacyConfigurationValidator $LegacyConfigurationValidator -TrustedRuntimeRoot $TrustedRuntimeRoot
             $findings.Add((& $newFinding ([string]$classification.Class) $reference $classification ([string]$classification.Reason)))
         }
     }
@@ -977,9 +1218,12 @@ function Get-BRAVOLegacyConfigPathTaskReport {
     # Read-only обхід дерева Планувальника (ITaskFolder) від переданої папки: для кожного
     # завдання читається лише Task.Xml; жодне завдання/файл не змінюється. Завдання, чий
     # XML недоступний, потрапляють у Problems.
+    # TrustedRuntimeRoot — каталог ПОТОЧНОГО комплекту: лише скрипти з нього можуть дістати
+    # NoConfigPath (cutover перевірено CI-gate-ом); цілі деінде або порожній параметр -> Unknown.
     param(
         [Parameter(Mandatory = $true)]$TaskFolder,
-        [Parameter(Mandatory = $true)][scriptblock]$LegacyConfigurationValidator
+        [Parameter(Mandatory = $true)][scriptblock]$LegacyConfigurationValidator,
+        [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot
     )
 
     $findings = New-Object 'System.Collections.Generic.List[object]'
@@ -1000,7 +1244,8 @@ function Get-BRAVOLegacyConfigPathTaskReport {
             try {
                 $taskActions = @(ConvertFrom-BRAVOTaskXmlExecAction -TaskXml ([string]$task.Xml))
                 foreach ($finding in @(Get-BRAVOTaskConfigPathFinding -TaskPath ([string]$task.Path) -TaskName ([string]$task.Name) `
-                            -Actions $taskActions -LegacyConfigurationValidator $LegacyConfigurationValidator)) {
+                            -Actions $taskActions -LegacyConfigurationValidator $LegacyConfigurationValidator `
+                            -TrustedRuntimeRoot $TrustedRuntimeRoot)) {
                     $findings.Add($finding)
                 }
             } catch {

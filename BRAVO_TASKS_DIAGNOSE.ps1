@@ -631,7 +631,8 @@ try {
         }
         $legacyConfigPathReport = Get-BRAVOLegacyConfigPathTaskReport `
             -TaskFolder $legacyConfigPathScanRoot `
-            -LegacyConfigurationValidator $legacyConfigPathValidator
+            -LegacyConfigurationValidator $legacyConfigPathValidator `
+            -TrustedRuntimeRoot $scriptRoot
         $legacyConfigPathFindings = @($legacyConfigPathReport.Findings)
         foreach ($legacyConfigPathFinding in $legacyConfigPathFindings) {
             $legacyConfigPathLine = Format-BRAVOConfigPathFindingLine -Finding $legacyConfigPathFinding

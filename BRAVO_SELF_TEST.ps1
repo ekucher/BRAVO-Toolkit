@@ -31950,9 +31950,13 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
             }.GetNewClosure()
 
             $scanRuntime = Join-Path $legacyScanFixtureRoot 'runtime'
-            $scanCfg = Join-Path $legacyScanFixtureRoot 'cfg'
-            $scanOdd = Join-Path $legacyScanFixtureRoot 'Конфіг сайту №1'
-            foreach ($scanDir in @($scanRuntime, $scanCfg, $scanOdd)) { [void][IO.Directory]::CreateDirectory($scanDir) }
+            # SEC-001: файлову систему сканер відкриває лише всередині TrustedRuntimeRoot ($scanRuntime) — конфігурації
+            # фікстури лежать під ним; $scanOutside (поза коренем) і $scanRuntime2 (спільний префікс імені) — ні.
+            $scanCfg = Join-Path $scanRuntime 'cfg'
+            $scanOdd = Join-Path $scanRuntime 'Конфіг сайту №1'
+            $scanOutside = Join-Path $legacyScanFixtureRoot 'outside'
+            $scanRuntime2 = $scanRuntime + '2'
+            foreach ($scanDir in @($scanRuntime, $scanCfg, $scanOdd, $scanOutside, $scanRuntime2)) { [void][IO.Directory]::CreateDirectory($scanDir) }
             $scanScripts = [ordered]@{
                 'BRAVO_ARCHIV.ps1' = "[CmdletBinding()]`r`nparam([string]`$ConfigPath, [switch]`$NoPause)`r`n"
                 'BRAVO_ALIAS.ps1'  = "param([Alias('Cfg', 'Cfgfile')][string]`$ConfigPath, [switch]`$NoPause)`r`n"
@@ -31975,6 +31979,54 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
             [IO.File]::WriteAllText($scanLocal, "@{}`r`n", [Text.Encoding]::UTF8)
             [IO.File]::WriteAllText($scanText, "x`r`n", [Text.Encoding]::UTF8)
             [IO.File]::WriteAllText($scanOddConfig, "# fixture`r`n", [Text.Encoding]::UTF8)
+            $scanOutsideConfig = Join-Path $scanOutside 'BRAVO.config'
+            [IO.File]::WriteAllText($scanOutsideConfig, "# fixture`r`n", [Text.Encoding]::UTF8)
+            # SEC-001 (ACL): каталоги з додатковим Allow-ACE для Authenticated Users (S-1-5-11); корінь сканування = сам каталог.
+            $scanAclBase = Join-Path $legacyScanFixtureRoot 'acl'
+            $scanAddAclRule = {
+                param($Path, $Rights, $Inherit)
+                $aclObject = Get-Acl -LiteralPath $Path
+                $aclRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    ([System.Security.Principal.SecurityIdentifier]'S-1-5-11'), $Rights, $Inherit, 'None', 'Allow')
+                $aclObject.AddAccessRule($aclRule)
+                Set-Acl -LiteralPath $Path -AclObject $aclObject
+            }
+            foreach ($scanAclName in @('plain', 'readonly', 'write', 'modify', 'parent\sub')) {
+                $scanAclDir = Join-Path $scanAclBase $scanAclName
+                [void][IO.Directory]::CreateDirectory($scanAclDir)
+                [IO.File]::WriteAllText((Join-Path $scanAclDir 'BRAVO_ARCHIV.ps1'), $scanScripts['BRAVO_ARCHIV.ps1'], [Text.Encoding]::UTF8)
+            }
+            & $scanAddAclRule (Join-Path $scanAclBase 'readonly') 'ReadAndExecute' 'ContainerInherit,ObjectInherit'
+            & $scanAddAclRule (Join-Path $scanAclBase 'write') 'Write' 'ContainerInherit,ObjectInherit'
+            & $scanAddAclRule (Join-Path $scanAclBase 'modify') 'Modify' 'ContainerInherit,ObjectInherit'
+            & $scanAddAclRule (Join-Path $scanAclBase 'parent') 'DeleteSubdirectoriesAndFiles' 'None'
+            # Порядок обходу: проміжний каталог дає недовіреному Delete, а нижче — junction. Відмова має статися на каталозі
+            # (ACL), ДО звернення до компонента під ним (junction).
+            $scanAclOrderMid = Join-Path $scanAclBase 'order\mid'
+            [void][IO.Directory]::CreateDirectory($scanAclOrderMid)
+            [void](New-Item -ItemType Junction -Path (Join-Path $scanAclOrderMid 'link') -Target (Join-Path $scanAclBase 'plain') -ErrorAction Stop)
+            & $scanAddAclRule $scanAclOrderMid 'Modify' 'None'
+            # NULL DACL (необмежений доступ) і порожній DACL; власник — поточний користувач (довірений), тож лише
+            # правило null-DACL може відхилити. ACL відновлюються перед Remove-Item у finally.
+            $scanAclNullDir = Join-Path $scanAclBase 'nulldacl'
+            # Порожній DACL забороняє навіть перелік каталогу (знімок фікстур нижче), тож він живе в ОКРЕМОМУ тимчасовому корені.
+            $scanEmptyDaclRoot = $legacyScanFixtureRoot + '_EMPTYDACL'
+            $scanAclEmptyDir = Join-Path $scanEmptyDaclRoot 'emptydacl'
+            foreach ($scanAclSpecial in @($scanAclNullDir, $scanAclEmptyDir)) { [void][IO.Directory]::CreateDirectory($scanAclSpecial) }
+            $scanSetDacl = {
+                param($Path, $Sddl)
+                $securityObject = New-Object System.Security.AccessControl.DirectorySecurity
+                $securityObject.SetSecurityDescriptorSddlForm($Sddl, [System.Security.AccessControl.AccessControlSections]::Access)
+                [System.IO.Directory]::SetAccessControl($Path, $securityObject)
+            }
+            & $scanSetDacl $scanAclNullDir 'D:NO_ACCESS_CONTROL'
+            & $scanSetDacl $scanAclEmptyDir 'D:PAI'
+            foreach ($scanForeignDir in @($scanOutside, $scanRuntime2)) {
+                [IO.File]::WriteAllText((Join-Path $scanForeignDir 'BRAVO_ARCHIV.ps1'), $scanScripts['BRAVO_ARCHIV.ps1'], [Text.Encoding]::UTF8)
+            }
+            # SEC-001: локальний junction на каталог конфігурації (reparse point у шляху -> Unknown).
+            $scanJunction = Join-Path $scanRuntime 'cfglink'
+            [void](New-Item -ItemType Junction -Path $scanJunction -Target $scanCfg -ErrorAction Stop)
             $scanMissing = Join-Path $scanCfg 'NOPE\BRAVO.config'
             $scanArchiv = Join-Path $scanRuntime 'BRAVO_ARCHIV.ps1'
             $scanAlias = Join-Path $scanRuntime 'BRAVO_ALIAS.ps1'
@@ -32006,7 +32058,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T12_Variable'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ& '$scanArchiv' -ConfigPath `$cfg$scanQ"; Wd = $scanRuntime },
                 @{ Name = 'T13_NotBravo'; Expect = '<none>'; Arguments = "-NoProfile -File C:\Tools\backup.ps1 -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = '' },
                 @{ Name = 'T14_NonConfigExt'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanText$scanQ"; Wd = $scanRuntime },
-                @{ Name = 'T15_Relative'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = $scanRuntime },
+                @{ Name = 'T15_Relative'; Expect = 'LegacyPrimary'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\runtime\cfg\BRAVO.config"; Wd = $scanRuntime },
                 @{ Name = 'T16_RelativeNoWd'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = '' },
                 @{ Name = 'T17_GhostConf'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanGhost$scanQ -Conf $scanQ$scanLegacy$scanQ"; Wd = $legacyScanFixtureRoot },
                 @{ Name = 'T18_GhostCo'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanGhost$scanQ -Co $scanQ$scanLegacy$scanQ"; Wd = $legacyScanFixtureRoot },
@@ -32076,7 +32128,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T76_DuplicateViaAbbreviation'; Expect = 'Unknown,Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ -Config $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
                 # --- знахідка 6: змінні середовища ---
                 @{ Name = 'T48_UserProfileVariable'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %USERPROFILE%\BRAVO.config"; Wd = $scanRuntime },
-                @{ Name = 'T49_ProgramDataStable'; Expect = 'Missing'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %ProgramData%\BRAVO_NOPE_281\BRAVO.config"; Wd = $scanRuntime },
+                @{ Name = 'T49_ProgramDataStable'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath %ProgramData%\BRAVO_NOPE_281\BRAVO.config"; Wd = $scanRuntime },
                 @{ Name = 'T50_AppDataInWorkingDirectory'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath ..\cfg\BRAVO.config"; Wd = '%APPDATA%\BRAVO' },
                 # --- #496 раунд 7 ---
                 # Без -NoProfile профіль акаунта завдання може задати $PSDefaultParameterValues['BRAVO_*.ps1:ConfigPath'].
@@ -32094,7 +32146,38 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T84_NonTooShortPrefix'; Expect = 'Unknown'; Arguments = "-non -NoProfile -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
                 @{ Name = 'T85_NoTooShortPrefix'; Expect = 'Unknown'; Arguments = "-no -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
                 @{ Name = 'T86_PSConsoleFileNotModelled'; Expect = 'Unknown'; Arguments = "-NoProfile -PSConsoleFile x.psc1 -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T87_SlashNopCertified'; Expect = 'NoConfigPath'; Arguments = "/nol /nop /noni -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime }
+                @{ Name = 'T87_SlashNopCertified'; Expect = 'NoConfigPath'; Arguments = "/nol /nop /noni -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                # --- #496 раунд 9: Command через змінну середовища; розкриття змінних ДО розбору аргументів ---
+                @{ Name = 'T88_EnvVarCommandMentionsBravo'; Expect = 'Unknown'; Command = '%ComSpec%'; Arguments = '/c powershell.exe -NoProfile -File C:\X\BRAVO_ARCHIV.ps1 -ConfigPath C:\site\BRAVO.config'; Wd = '' },
+                @{ Name = 'T89_EnvVarCommandNoBravo'; Expect = '<none>'; Command = '%ComSpec%'; Arguments = '/c dir C:\'; Wd = '' },
+                @{ Name = 'T90_UnquotedProgramFilesSplitsAtSpace'; Expect = 'Unknown'; Arguments = "$scanBase -File %ProgramFiles%\BRAVO\BRAVO_ARCHIV.ps1 -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T91_UnsupportedVariableInArguments'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$scanMaint$scanQ -AutoShutdown %USERPROFILE% -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                # --- #496 QA-001: ім'я змінної з пробілом; підтримувана змінна без пробілів лишається certifiable ---
+                @{ Name = 'T92_VariableNameWithSpaceIsUnknown'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction ${scanQ}%QA EXTRA%$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T93_StableVariableNoSpaceStillCertified'; Expect = 'NoConfigPath'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction ${scanQ}%SystemDrive%$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T94_LeadingSpaceVariableNameIsUnknown'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction ${scanQ}% QA EXTRA%$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T95_TrailingSpaceVariableNameIsUnknown'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction ${scanQ}%QA EXTRA %$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T96_LonePercentInCommandStillCertified'; Expect = 'NoConfigPath'; Arguments = "-NoProfile -Command $scanQ.\BRAVO_ARCHIV.ps1 -NoPause -ErrorAction '5%'$scanQ"; Wd = $scanRuntime },
+                # --- #496 SEC-001/SEC-002: віддалені/пристрійні шляхи, reparse point, відсутність ехо аргументів ---
+                @{ Name = 'T97_UncScriptPath'; Expect = 'Unknown'; Arguments = "-NoProfile -File ${scanQ}\\192.0.2.1\share\BRAVO_ARCHIV.ps1$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T98_ExtendedUncScriptPath'; Expect = 'Unknown'; Arguments = "-NoProfile -File ${scanQ}\\?\UNC\192.0.2.1\share\BRAVO_ARCHIV.ps1$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T99_DeviceScriptPath'; Expect = 'Unknown'; Arguments = "-NoProfile -File ${scanQ}\\.\C:\BRAVO\BRAVO_ARCHIV.ps1$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T100_UncConfigPath'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ConfigPath ${scanQ}\\192.0.2.1\share\BRAVO.config$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T101_JunctionInConfigPath'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanJunction\BRAVO.config$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T102_UnsupportedTokenSecretNotEchoed'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ --password=secret123 -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T103_UnknownParameterSecretNotEchoed'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -secret123 -NoPause"; Wd = $scanRuntime },
+                # --- #496 SEC-001 (звуження): поза TrustedRuntimeRoot файли не відкриваються ---
+                @{ Name = 'T104_ScriptOutsideTrustedRootNotParsed'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$(Join-Path $scanOutside 'BRAVO_ARCHIV.ps1')$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T105_ConfigOutsideTrustedRootNotOpened'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanOutsideConfig$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T106_SiblingPrefixRootIsOutside'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$(Join-Path $scanRuntime2 'BRAVO_ARCHIV.ps1')$scanQ -ConfigPath $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
+                # --- #496 QA-001/QA-002: значення опцій хоста powershell.exe; вираз %...% не виводиться ---
+                @{ Name = 'T107_InputFormatBogus'; Expect = 'Unknown'; Arguments = "-NoProfile -InputFormat Bogus -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T108_OutputFormatBogus'; Expect = 'Unknown'; Arguments = "-NoProfile -OutputFormat Bogus -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T109_ExecutionPolicyBogus'; Expect = 'Unknown'; Arguments = "-NoProfile -ExecutionPolicy Bogus -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T110_WindowStyleBogus'; Expect = 'Unknown'; Arguments = "-NoProfile -WindowStyle Bogus -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T111_VersionNotModelled'; Expect = 'Unknown'; Arguments = "-NoProfile -Version 5.1 -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T112_ValidHostOptionValuesCertified'; Expect = 'NoConfigPath'; Arguments = "-NoProfile -InputFormat xml -OutputFormat Text -ExecutionPolicy remotesigned -WindowStyle Hidden -File $scanQ$scanArchiv$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T113_EnvExpressionWithSecretNotEchoed'; Expect = 'Unknown'; Arguments = "-NoProfile -File $scanQ$scanArchiv$scanQ -ErrorAction %password=secret123%"; Wd = $scanRuntime }
             )
 
 
@@ -32105,7 +32188,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
             $scanResult = $null
             try {
                 $scanResult = & $scanModule {
-                    param($Cases, $Validator, $DefaultCommand)
+                    param($Cases, $Validator, $DefaultCommand, $TrustedRoot, $OtherRoot, $Junction, $SiblingRoot, $AclBase, $EmptyDaclDir)
                     function New-ScanTaskXml($Command, $Arguments, $WorkingDirectory) {
                         $escape = { param($value) [Security.SecurityElement]::Escape([string]$value) }
                         '<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions Context="Author"><Exec><Command>' +
@@ -32118,13 +32201,18 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                         $folder
                     }
                     $takesValidator = (Get-Command Get-BRAVOLegacyConfigPathTaskReport).Parameters.ContainsKey('LegacyConfigurationValidator')
-                    function Invoke-ScanReport($Folder) {
-                        if ($takesValidator) {
+                    $takesTrustedRoot = (Get-Command Get-BRAVOLegacyConfigPathTaskReport).Parameters.ContainsKey('TrustedRuntimeRoot')
+                    function Invoke-ScanReport($Folder, $Root = $TrustedRoot) {
+                        if ($takesTrustedRoot) {
+                            Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $Folder -LegacyConfigurationValidator $Validator -TrustedRuntimeRoot $Root
+                        } elseif ($takesValidator) {
                             Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $Folder -LegacyConfigurationValidator $Validator
                         } else {
                             Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $Folder
                         }
                     }
+                    $stableProgramFiles = [Environment]::GetEnvironmentVariable('ProgramFiles')
+                    $definitionOf = { param($Arguments) Get-BRAVOPowerShellActionDefinition -Arguments $Arguments }
                     $tasks = @()
                     foreach ($case in $Cases) {
                         $command = if ($case.ContainsKey('Command')) { $case.Command } else { $DefaultCommand }
@@ -32137,8 +32225,52 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                         Single = Invoke-ScanReport (New-ScanFolder '\BRAVO' @($tasks[0]) @())
                         Nested = Invoke-ScanReport (New-ScanFolder '\' @() @((New-ScanFolder '\BRAVO' @($tasks[0]) @((New-ScanFolder '\BRAVO\Sub' @($tasks[1]) @())))))
                         Lines = @($report.Findings | ForEach-Object { Format-BRAVOConfigPathFindingLine -Finding $_ })
+                        TrustedOther = Invoke-ScanReport (New-ScanFolder '\BRAVO' @($tasks | Where-Object { $_.Name -eq 'T02_Auto' }) @()) $OtherRoot
+                        TrustedEmpty = Invoke-ScanReport (New-ScanFolder '\BRAVO' @($tasks | Where-Object { $_.Name -eq 'T02_Auto' }) @()) ''
+                        TrustedNormalized = Invoke-ScanReport (New-ScanFolder '\BRAVO' @($tasks | Where-Object { $_.Name -eq 'T02_Auto' }) @()) ($TrustedRoot.ToUpperInvariant() + '\')
+                        StableProgramFiles = $stableProgramFiles
+                        DefQuoted = (& $definitionOf '-NoProfile -File "%ProgramFiles%\BRAVO\BRAVO_ARCHIV.ps1" -NoPause')
+                        DefUnquoted = (& $definitionOf '-NoProfile -File %ProgramFiles%\BRAVO\BRAVO_ARCHIV.ps1 -ConfigPath C:\site\BRAVO.config')
+                        DefUnsupported = (& $definitionOf '-NoProfile -File C:\BRAVO\BRAVO_ARCHIV.ps1 -ConfigPath %USERPROFILE%\BRAVO.config')
+                        DefPercentAlias = (& $definitionOf '-NoProfile -Command "gci | % { $_ } | % { 1 }"')
+                        DefLonePercent = (& $definitionOf '-NoProfile -Command "gci | % { $_ }"')
+                        RemoteResolve = @(
+                            '\\192.0.2.1\share\BRAVO_ARCHIV.ps1', '//192.0.2.1/share/BRAVO_ARCHIV.ps1',
+                            '\\?\UNC\192.0.2.1\share\BRAVO_ARCHIV.ps1', '\\.\C:\BRAVO\BRAVO_ARCHIV.ps1'
+                        ) | ForEach-Object { Resolve-BRAVOTaskActionPath -Path $_ -WorkingDirectory 'C:\' }
+                        RemoteWorkingDirectory = (Resolve-BRAVOTaskActionPath -Path 'BRAVO_ARCHIV.ps1' -WorkingDirectory '\\192.0.2.1\share')
+                        JunctionSafety = (Test-BRAVOTaskLocalPathSafe -Path (Join-Path $Junction 'BRAVO.config') -TrustedRoot $TrustedRoot)
+                        PlainSafety = (Test-BRAVOTaskLocalPathSafe -Path (Join-Path $OtherRoot 'BRAVO.config') -TrustedRoot $TrustedRoot)
+                        SiblingSafety = (Test-BRAVOTaskLocalPathSafe -Path (Join-Path $SiblingRoot 'BRAVO_ARCHIV.ps1') -TrustedRoot $TrustedRoot)
+                        TraversalSafety = (Test-BRAVOTaskLocalPathSafe -Path (Join-Path $TrustedRoot '..\outside\BRAVO.config') -TrustedRoot $TrustedRoot)
+                        EmptyRootSafety = (Test-BRAVOTaskLocalPathSafe -Path (Join-Path $TrustedRoot 'BRAVO_ARCHIV.ps1') -TrustedRoot '')
+                        Acl = & {
+                            $aclScan = {
+                                param($Dir)
+                                $aclXml = New-ScanTaskXml $DefaultCommand ('-NoProfile -File "' + (Join-Path $Dir 'BRAVO_ARCHIV.ps1') + '" -NoPause') $Dir
+                                $aclTask = [pscustomobject]@{ Path = '\BRAVO\Acl'; Name = 'Acl'; Xml = $aclXml }
+                                @((Invoke-ScanReport (New-ScanFolder '\BRAVO' @($aclTask) @()) $Dir).Findings) | Select-Object -First 1
+                            }
+                            [pscustomobject]@{
+                                Plain = & $aclScan (Join-Path $AclBase 'plain')
+                                ReadOnly = & $aclScan (Join-Path $AclBase 'readonly')
+                                Write = & $aclScan (Join-Path $AclBase 'write')
+                                Modify = & $aclScan (Join-Path $AclBase 'modify')
+                                ParentDeleteChild = & $aclScan (Join-Path $AclBase 'parent\sub')
+                            }
+                        }
+                        AclNullDacl = (Test-BRAVOTaskLocalPathSafe -Path (Join-Path $AclBase 'nulldacl') -TrustedRoot (Join-Path $AclBase 'nulldacl'))
+                        AclEmptyDacl = (Test-BRAVOTaskLocalPathSafe -Path $EmptyDaclDir -TrustedRoot $EmptyDaclDir)
+                        AclOrder = (Test-BRAVOTaskLocalPathSafe -Path (Join-Path $AclBase 'order\mid\link\BRAVO_ARCHIV.ps1') -TrustedRoot (Join-Path $AclBase 'order'))
+                        EmptyRootLegacy = Invoke-ScanReport (New-ScanFolder '\BRAVO' @($tasks | Where-Object { $_.Name -eq 'T01_Legacy' }) @()) ''
+                        RemoteTimed = & {
+                            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+                            $remoteReport = Invoke-ScanReport (New-ScanFolder '\BRAVO' @($tasks | Where-Object { $_.Name -match '^T(97|98|99|100)_' }) @())
+                            $stopwatch.Stop()
+                            [pscustomobject]@{ Report = $remoteReport; Milliseconds = $stopwatch.ElapsedMilliseconds }
+                        }
                     }
-                } $scanCases $scanValidator $scanPs
+                } $scanCases $scanValidator $scanPs $scanRuntime $scanCfg $scanJunction $scanRuntime2 $scanAclBase $scanAclEmptyDir
             } catch {
                 $scanError = $_.Exception.Message
             }
@@ -32202,11 +32334,156 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 $scanWdFinding = & $scanFindingOf 'T50_AppDataInWorkingDirectory'
                 $scanProgramDataFinding = & $scanFindingOf 'T49_ProgramDataStable'
                 Test-BRAVOCondition `
-                    -Condition ($null -ne $scanEnvFinding -and $scanEnvFinding.Detail -like '*%USERPROFILE%*' -and $scanEnvFinding.Detail -like '*Task Engine*' -and
-                        $null -ne $scanWdFinding -and $scanWdFinding.Detail -like '*%APPDATA%*' -and
-                        $null -ne $scanProgramDataFinding -and $scanProgramDataFinding.ResolvedPath -like "$([Environment]::GetEnvironmentVariable('ProgramData'))*") `
+                    -Condition ($null -ne $scanEnvFinding -and $scanEnvFinding.Detail -like '*змінної середовища*' -and $scanEnvFinding.Detail -like '*Task Engine*' -and $scanEnvFinding.Detail -notlike '*USERPROFILE*' -and
+                        $null -ne $scanWdFinding -and $scanWdFinding.Detail -like '*змінної середовища*' -and $scanWdFinding.Detail -notlike '*APPDATA*' -and
+                        $null -ne $scanProgramDataFinding -and [string]$scanProgramDataFinding.Detail -like '*поза каталогом довіреного runtime*' -and [string]$scanProgramDataFinding.Detail -notlike '*змінної середовища*') `
                     -Name 'TaskConfigPath/EnvironmentVariablesLimitedToStableOnes' `
-                    -Failure '#496: профільні змінні (%USERPROFILE%, %APPDATA%) дають Unknown з поясненням; %ProgramData% розкривається'
+                    -Failure '#496: профільні змінні (%USERPROFILE%, %APPDATA%) дають Unknown з поясненням; %ProgramData% розкривається лексично, але шлях поза TrustedRuntimeRoot не відкривається (Unknown, не Missing)'
+
+                # --- #496 раунд 9 (A): Exec.Command через змінну середовища.
+                $scanEnvCommandFinding = & $scanFindingOf 'T88_EnvVarCommandMentionsBravo'
+                Test-BRAVOCondition `
+                    -Condition (@($scanResult.Report.Findings | Where-Object { $_.TaskName -eq 'T88_EnvVarCommandMentionsBravo' }).Count -eq 1 -and
+                        $null -ne $scanEnvCommandFinding -and $scanEnvCommandFinding.Status -eq 'Unknown' -and $scanEnvCommandFinding.Detail -like '*змінн*середовища*') `
+                    -Name 'TaskConfigPath/EnvVarCommandMentioningBravoIsUnknown' `
+                    -Failure '#496: Command=%ComSpec% (змінна середовища) з BRAVO_*.ps1 в аргументах — рівно одна знахідка Unknown з поясненням про змінну середовища, а не мовчазний пропуск'
+                Test-BRAVOCondition `
+                    -Condition ((& $scanStatusOf 'T89_EnvVarCommandNoBravo') -eq '<none>' -and (& $scanStatusOf 'T43_PythonExecutable') -eq '<none>') `
+                    -Name 'TaskConfigPath/EnvVarCommandWithoutBravoIsSkipped' `
+                    -Failure '#496: команда через змінну середовища без згадки BRAVO_*.ps1 (і звичайний сторонній виконуваний файл) не дає знахідок'
+
+                # --- (A2): `""` усередині лапок — розбір argv неоднозначний (CommandLineToArgvW vs CRT): Unknown з цією причиною.
+                $scanDoubledFinding = & $scanFindingOf 'T81_DoubledQuotesCommandMatchesRealPowerShell'
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanDoubledFinding -and $scanDoubledFinding.Status -eq 'Unknown' -and $scanDoubledFinding.Detail -like '*подвоєні лапки*argv*') `
+                    -Name 'TaskConfigPath/DoubledQuotesInQuotesAreAmbiguousUnknown' `
+                    -Failure ('#496: подвоєні лапки всередині лапок не розбираються однозначно — Unknown з поясненням про неоднозначність argv. Отримано: ' + [string]$(if ($null -ne $scanDoubledFinding) { $scanDoubledFinding.Detail } else { '<none>' }))
+
+                # --- (B): розкриття стабільних змінних ДО розбору аргументів.
+                $scanProgramFilesPrefix = [string]$scanResult.StableProgramFiles
+                Test-BRAVOCondition `
+                    -Condition ((& $scanStatusOf 'T90_UnquotedProgramFilesSplitsAtSpace') -eq 'Unknown') `
+                    -Name 'TaskConfigPath/UnquotedProgramFilesVariableSplitsAtSpace' `
+                    -Failure ('#496: неоточений %ProgramFiles%\...\BRAVO_ARCHIV.ps1 розкривається Task Scheduler ДО розбору — шлях розривається на пробілі, тому LegacyPrimary/Local/Missing/NoConfigPath недопустимі. Отримано: ' + (& $scanStatusOf 'T90_UnquotedProgramFilesSplitsAtSpace'))
+                Test-BRAVOCondition `
+                    -Condition ((& $scanStatusOf 'T91_UnsupportedVariableInArguments') -eq 'Unknown') `
+                    -Name 'TaskConfigPath/UnsupportedVariableInArgumentsIsUnknown' `
+                    -Failure ('#496: нестабільна змінна (%USERPROFILE%) будь-де в Arguments унеможливлює визначення меж токенів — Unknown. Отримано: ' + (& $scanStatusOf 'T91_UnsupportedVariableInArguments'))
+                $scanDefQuoted = $scanResult.DefQuoted
+                $scanDefUnquoted = $scanResult.DefUnquoted
+                Test-BRAVOCondition `
+                    -Condition ($null -eq $scanDefQuoted.Problem -and [string]$scanDefQuoted.FileTarget -eq ($scanProgramFilesPrefix + '\BRAVO\BRAVO_ARCHIV.ps1') -and
+                        $scanProgramFilesPrefix -match ' ' -and
+                        $null -eq $scanDefUnquoted.Problem -and [string]$scanDefUnquoted.FileTarget -eq (($scanProgramFilesPrefix -split ' ')[0]) -and
+                        $null -ne $scanResult.DefUnsupported.Problem -and $scanResult.DefUnsupported.Problem -like '*змінної середовища*' -and $scanResult.DefUnsupported.Problem -notlike '*USERPROFILE*') `
+                    -Name 'TaskConfigPath/EnvironmentExpansionPrecedesTokenization' `
+                    -Failure ("#496: у лапках %ProgramFiles%\... лишається одним токеном після розкриття; без лапок розривається на пробілі; нестабільна змінна — Problem. Quoted='$($scanDefQuoted.FileTarget)' Unquoted='$($scanDefUnquoted.FileTarget)'")
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanResult.DefPercentAlias.Problem -and $scanResult.DefPercentAlias.Problem -like '*змінн*середовища*' -and
+                        $null -eq $scanResult.DefLonePercent.Problem -and [string]$scanResult.DefLonePercent.CommandText -eq 'gci | % { $_ }') `
+                    -Name 'TaskConfigPath/PercentAliasPairInCommandIsUnknown' `
+                    -Failure ('#496: пара % у -Command (навіть як псевдонім ForEach-Object) — fail closed, Unknown; одинокий % — не посилання. Pair.Problem=' + [string]$scanResult.DefPercentAlias.Problem + ' Lone.Problem=' + [string]$scanResult.DefLonePercent.Problem)
+
+                # --- SEC-001: віддалені/пристрійні шляхи відхиляються лексично, без звернення до диска/мережі.
+                $scanRemoteResolve = @($scanResult.RemoteResolve)
+                $scanRemoteFindings = @($scanResult.RemoteTimed.Report.Findings)
+                Test-BRAVOCondition `
+                    -Condition ($scanRemoteResolve.Count -eq 4 -and @($scanRemoteResolve | Where-Object { $null -ne $_.Path }).Count -eq 0 -and
+                        $null -eq $scanResult.RemoteWorkingDirectory.Path -and
+                        $scanRemoteFindings.Count -eq 4 -and @($scanRemoteFindings | Where-Object { $_.Status -ne 'Unknown' }).Count -eq 0 -and
+                        $scanResult.RemoteTimed.Milliseconds -lt 2000) `
+                    -Name 'TaskConfigPath/RemoteAndDevicePathsRejectedWithoutProbe' `
+                    -Failure ('#496 SEC-001: UNC, //, \\?\UNC, \\.\ (скрипт, WorkingDirectory) мають давати Path=$null (лексично) і Unknown без звернення до мережі (192.0.2.1 — TEST-NET). Знахідок=' + $scanRemoteFindings.Count + ' мс=' + $scanResult.RemoteTimed.Milliseconds)
+                $scanUncConfigFinding = & $scanFindingOf 'T100_UncConfigPath'
+                $scanJunctionFinding = & $scanFindingOf 'T101_JunctionInConfigPath'
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanUncConfigFinding -and $scanUncConfigFinding.Status -eq 'Unknown' -and [string]::IsNullOrEmpty([string]$scanUncConfigFinding.ResolvedPath) -and
+                        [string]$scanUncConfigFinding.Detail -notlike '*192.0.2.1*' -and [string]$scanUncConfigFinding.ConfigPathRaw -eq '' -and
+                        $null -ne $scanJunctionFinding -and $scanJunctionFinding.Status -eq 'Unknown' -and [string]$scanJunctionFinding.Detail -like '*reparse*') `
+                    -Name 'TaskConfigPath/UncAndReparseConfigPathUnknownGenericReason' `
+                    -Failure '#496 SEC-001: UNC -ConfigPath і шлях через junction -> Unknown із узагальненою причиною (без адреси хоста, ResolvedPath/ConfigPathRaw порожні)'
+                Test-BRAVOCondition `
+                    -Condition ($scanResult.JunctionSafety.Safe -eq $false -and $scanResult.PlainSafety.Safe -eq $true) `
+                    -Name 'TaskConfigPath/LocalPathSafetyHelper' `
+                    -Failure '#496 SEC-001: Test-BRAVOTaskLocalPathSafe — junction небезпечний, звичайний локальний шлях безпечний'
+
+                # --- SEC-001 (звуження): файлова система відкривається лише всередині TrustedRuntimeRoot.
+                $scanOutsideScriptFinding = & $scanFindingOf 'T104_ScriptOutsideTrustedRootNotParsed'
+                $scanOutsideConfigFinding = & $scanFindingOf 'T105_ConfigOutsideTrustedRootNotOpened'
+                $scanSiblingFinding = & $scanFindingOf 'T106_SiblingPrefixRootIsOutside'
+                $scanEmptyRootLegacy = @($scanResult.EmptyRootLegacy.Findings) | Select-Object -First 1
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanOutsideScriptFinding -and $scanOutsideScriptFinding.Status -eq 'Unknown' -and
+                        $null -ne $scanSiblingFinding -and $scanSiblingFinding.Status -eq 'Unknown' -and
+                        $null -ne $scanOutsideConfigFinding -and $scanOutsideConfigFinding.Status -eq 'Unknown' -and
+                        [string]$scanOutsideConfigFinding.Detail -like '*поза каталогом довіреного runtime*' -and
+                        [string]::IsNullOrEmpty([string]$scanOutsideConfigFinding.ResolvedPath)) `
+                    -Name 'TaskConfigPath/OutsideTrustedRootNeverOpened' `
+                    -Failure '#496 SEC-001: скрипт/-ConfigPath поза TrustedRuntimeRoot (і сусідній каталог зі спільним префіксом імені) не відкриваються й не розбираються -> Unknown (інакше це були б LegacyPrimary)'
+                Test-BRAVOCondition `
+                    -Condition ($scanResult.SiblingSafety.Safe -eq $false -and $scanResult.TraversalSafety.Safe -eq $false -and
+                        $scanResult.EmptyRootSafety.Safe -eq $false -and
+                        $null -ne $scanEmptyRootLegacy -and $scanEmptyRootLegacy.Status -eq 'Unknown') `
+                    -Name 'TaskConfigPath/TrustedRootBoundaryAndEmptyRootFailClosed' `
+                    -Failure '#496 SEC-001: префіксна плутанина (root2 vs root), вихід через .. та порожній TrustedRuntimeRoot — Safe=$false, жодного доступу до файлів (T01_Legacy при порожньому корені -> Unknown)'
+
+                # --- SEC-001 (ACL): шлях має бути захищений від підміни недовіреними суб'єктами (Authenticated Users S-1-5-11).
+                $scanAcl = $scanResult.Acl
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanAcl.Plain -and $scanAcl.Plain.Status -eq 'NoConfigPath' -and
+                        $null -ne $scanAcl.ReadOnly -and $scanAcl.ReadOnly.Status -eq 'NoConfigPath') `
+                    -Name 'TaskConfigPath/AclReadOnlyAceForUntrustedStillCertifiable' `
+                    -Failure ('#496 SEC-001: каталог власника без додаткових ACE і з ReadAndExecute для Authenticated Users лишається certifiable. Plain=' + [string]$scanAcl.Plain.Status + ' ReadOnly=' + [string]$scanAcl.ReadOnly.Status)
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanAcl.Write -and $scanAcl.Write.Status -eq 'Unknown' -and
+                        $null -ne $scanAcl.Modify -and $scanAcl.Modify.Status -eq 'Unknown' -and
+                        $null -ne $scanAcl.ParentDeleteChild -and $scanAcl.ParentDeleteChild.Status -eq 'Unknown') `
+                    -Name 'TaskConfigPath/AclWritableByUntrustedIsUnknown' `
+                    -Failure ('#496 SEC-001: Write/Modify для Authenticated Users на каталозі скрипта та DeleteSubdirectoriesAndFiles на батьківському каталозі -> Unknown (ACL не підтверджує захист). Write=' + [string]$scanAcl.Write.Status + ' Modify=' + [string]$scanAcl.Modify.Status + ' ParentDeleteChild=' + [string]$scanAcl.ParentDeleteChild.Status + ' | ' + [string]$scanAcl.Write.Detail + ' | ' + [string]$scanAcl.Modify.Detail + ' | ' + [string]$scanAcl.ParentDeleteChild.Detail)
+
+                Test-BRAVOCondition `
+                    -Condition ($scanResult.AclOrder.Safe -eq $false -and [string]$scanResult.AclOrder.Reason -like '*ACL*' -and [string]$scanResult.AclOrder.Reason -notlike '*reparse*') `
+                    -Name 'TaskConfigPath/AclRejectionPrecedesDescendantAccess' `
+                    -Failure ('#496 SEC-001: проміжний каталог з недовіреним Delete над junction має відхилятися за ACL до звернення до junction (один обхід згори вниз). Reason=' + [string]$scanResult.AclOrder.Reason)
+
+                Test-BRAVOCondition `
+                    -Condition ($scanResult.AclNullDacl.Safe -eq $false -and [string]$scanResult.AclNullDacl.Reason -like '*ACL*' -and $scanResult.AclEmptyDacl.Safe -eq $true) `
+                    -Name 'TaskConfigPath/AclNullDaclRejectedEmptyDaclAccepted' `
+                    -Failure ('#496 SEC-001: каталог з NULL DACL (власник — довірений користувач) має відхилятися за ACL; порожній DACL (доступу немає ні в кого) — допустимий. Null.Safe=' + [string]$scanResult.AclNullDacl.Safe + ' Empty.Safe=' + [string]$scanResult.AclEmptyDacl.Safe + ' Empty.Reason=' + [string]$scanResult.AclEmptyDacl.Reason)
+
+                # --- SEC-002: сирі токени/аргументи не потрапляють у Detail.
+                $scanEnvSecretFinding = & $scanFindingOf 'T113_EnvExpressionWithSecretNotEchoed'
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanEnvSecretFinding -and $scanEnvSecretFinding.Status -eq 'Unknown' -and [string]$scanEnvSecretFinding.Detail -notlike '*secret123*' -and
+                        [string]$scanEnvSecretFinding.Detail -like '*змінної середовища*' -and
+                        @($scanResult.Lines | Where-Object { [string]$_.Text -like '*secret123*' }).Count -eq 0) `
+                    -Name 'TaskConfigPath/EnvExpressionContentsNotEchoed' `
+                    -Failure '#496 QA-002: вираз %password=secret123% у Arguments не повинен потрапляти у Detail/рядки звіту (лише позиція)'
+                $scanSecretFinding = & $scanFindingOf 'T102_UnsupportedTokenSecretNotEchoed'
+                $scanSecretFinding2 = & $scanFindingOf 'T103_UnknownParameterSecretNotEchoed'
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanSecretFinding -and $null -ne $scanSecretFinding2 -and
+                        [string]$scanSecretFinding.Detail -notlike '*secret123*' -and [string]$scanSecretFinding2.Detail -notlike '*secret123*' -and
+                        @($scanResult.Lines | Where-Object { $_ -like '*secret123*' -or $_.Text -like '*secret123*' }).Count -eq 0) `
+                    -Name 'TaskConfigPath/RawArgumentsNotEchoedInDetail' `
+                    -Failure '#496 SEC-002: невідомий токен (--password=secret123, -secret123) не повинен потрапляти у Detail/рядки звіту'
+
+                # --- (C): NoConfigPath лише для скрипта з довіреного RuntimeRoot.
+                $scanOtherFinding = @($scanResult.TrustedOther.Findings) | Select-Object -First 1
+                $scanEmptyFinding = @($scanResult.TrustedEmpty.Findings) | Select-Object -First 1
+                $scanNormalizedFinding = @($scanResult.TrustedNormalized.Findings) | Select-Object -First 1
+                Test-BRAVOCondition `
+                    -Condition ((& $scanStatusOf 'T02_Auto') -eq 'NoConfigPath' -and $null -ne $scanNormalizedFinding -and $scanNormalizedFinding.Status -eq 'NoConfigPath') `
+                    -Name 'TaskConfigPath/NoConfigPathRequiresTrustedRuntimeRoot' `
+                    -Failure '#496: змодельована дія з -NoProfile, скрипт якої лежить у TrustedRuntimeRoot (також з іншим регістром і кінцевим роздільником), — NoConfigPath'
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanOtherFinding -and $scanOtherFinding.Status -eq 'Unknown') `
+                    -Name 'TaskConfigPath/NoConfigPathOtherInstallationIsUnknown' `
+                    -Failure ('#496: той самий скрипт в іншому каталозі, ніж TrustedRuntimeRoot, — Unknown (cutover чужої інсталяції не перевірено). Отримано: ' + [string]$scanOtherFinding.Status + ' ' + [string]$scanOtherFinding.Detail)
+                Test-BRAVOCondition `
+                    -Condition ($null -ne $scanEmptyFinding -and $scanEmptyFinding.Status -eq 'Unknown') `
+                    -Name 'TaskConfigPath/NoConfigPathEmptyTrustedRootIsUnknown' `
+                    -Failure ('#496: порожній TrustedRuntimeRoot — NoConfigPath не видається (fail closed), а Unknown. Отримано: ' + [string]$scanEmptyFinding.Status)
             }
             $scanAfter = @(Get-ChildItem -LiteralPath $legacyScanFixtureRoot -Recurse -Force |
                     ForEach-Object { "$($_.FullName)|$(if ($_.PSIsContainer) { 'dir' } else { "$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })" } | Sort-Object)
@@ -32265,7 +32542,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                         throw (New-Object System.UnauthorizedAccessException('Access denied (імітація)'))
                     }
                     try {
-                        (Get-BRAVOConfigPathTargetClassification -RawPath $Path -WorkingDirectory $Wd -LegacyConfigurationValidator $Validator).Class
+                        (Get-BRAVOConfigPathTargetClassification -RawPath $Path -WorkingDirectory $Wd -LegacyConfigurationValidator $Validator -TrustedRuntimeRoot $Wd).Class
                     } finally {
                         # імітації живуть у стані модуля; нижче модуль імпортується заново (-Force)
                     }
@@ -32279,7 +32556,7 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                         $folder = [pscustomobject]@{ Path = '\BRAVO'; Tasks = @($task) }
                         Add-Member -InputObject $folder -MemberType ScriptMethod -Name GetTasks -Value { param($flags) , @($this.Tasks) }
                         Add-Member -InputObject $folder -MemberType ScriptMethod -Name GetFolders -Value { param($flags) , @() }
-                        $report = Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $folder -LegacyConfigurationValidator $Validator
+                        $report = Get-BRAVOLegacyConfigPathTaskReport -TaskFolder $folder -LegacyConfigurationValidator $Validator -TrustedRuntimeRoot $Wd
                         @($report.Findings | ForEach-Object { (Format-BRAVOConfigPathFindingLine -Finding $_).Text })
                     } $scanValidator $scanPs `
                         "$scanBase -File $scanQ$scanArchiv$scanQ -ConfigPath $scanQ$scanLegacy$scanQ" `
@@ -32327,7 +32604,21 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 -Failure ('сканер -ConfigPath мусить жити в modules\BRAVO.SchedulerDiagnostics (експорт: Get-BRAVOLegacyConfigPathTaskReport, Format-BRAVOConfigPathFindingLine), не містити команд, що змінюють завдання/файли, а Diagnose — лише імпортувати його й друкувати розділ. Змінюючі: ' + ($scanMutatingFunctions -join ', ') +
                     '; функції сканера в Diagnose: ' + ($scanDiagnoseScannerFunctions -join ', '))
         } finally {
+            # Повернути звичайні ACL нестандартним каталогам (NULL/порожній DACL) ДО видалення: власник завжди має WriteDacl.
+            foreach ($scanAclRestore in @((Join-Path $legacyScanFixtureRoot 'acl\nulldacl'), (Join-Path ($legacyScanFixtureRoot + '_EMPTYDACL') 'emptydacl'))) {
+                if (Test-Path -LiteralPath $scanAclRestore) {
+                    try {
+                        $scanRestoreSecurity = New-Object System.Security.AccessControl.DirectorySecurity
+                        $scanRestoreSecurity.SetSecurityDescriptorSddlForm(('D:PAI(A;OICI;FA;;;' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value + ')'), [System.Security.AccessControl.AccessControlSections]::Access)
+                        [System.IO.Directory]::SetAccessControl($scanAclRestore, $scanRestoreSecurity)
+                    } catch {
+                        # Прибирання фікстури best-effort: не вдалося відновити ACL — Remove-Item нижче теж best-effort
+                        # (SilentlyContinue), тимчасовий каталог у %TEMP%; логувати в self-test нічого.
+                    }
+                }
+            }
             Remove-Item -LiteralPath $legacyScanFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath ($legacyScanFixtureRoot + '_EMPTYDACL') -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
