@@ -382,6 +382,7 @@ function Complete-BRAVOHealthResult {
                 -Operation Health `
                 -ExitCode $healthExitCode `
                 -ExitCodeName (Get-BRAVOExitCodeName -Code $healthExitCode) `
+                -Status (Get-BRAVOExitCodeStatus -Code $healthExitCode) `
                 -StartedAt $healthCheckStarted `
                 -Details $statusDetails
         } catch {

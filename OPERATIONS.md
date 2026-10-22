@@ -2662,17 +2662,23 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
 
 Кожна з чотирьох основних операцій після обчислення коду завершення
 пише machine-readable статус свого прогону (модуль `BRAVO.Status`,
-schemaVersion 1) у
+schemaVersion 2; reader приймає 1 і 2) у
 `%ProgramData%\BRAVO\State\STATUS\BRAVO_STATUS_<Operation>.json`
 (`Archive`, `Health`, `Maintenance`, `RestoreVerify`). Це
 compatibility-контракт для зовнішніх machine-споживачів — не редагуйте
 файли вручну.
 
 - Спільні поля: `schemaVersion`, `host`, `packageVersion`, `operation`,
-  `status` (`OK`/`WARNINGS`/`ERROR` — проєкція exitCode: 0/10/інше),
+  `status` (`OK`/`WARNINGS`/`ERROR` — проєкція exitCode через єдину таблицю severity
+  `BRAVO.ExitCodes`: SUCCESS→`OK`, WARNING (коди 10 і 20)→`WARNINGS`, решта→`ERROR`),
   `exitCode`, `exitCodeName`, `startedAt`/`finishedAt`/`durationSeconds`,
   `details` (операційні агрегати: generation, лічильники кроків,
   verified-прапорці призначень, вік верифікації).
+- Версії схеми: **v1** (до виправлення #479: `0`→`OK`, `10`→`WARNINGS`, решта, зокрема `20`, →`ERROR`) і **v2** (код `20`→`WARNINGS`,
+  рішення D-A). Writer пише v2 і відхиляє пару `exitCode`/`status`, що суперечить `Get-BRAVOExitCodeStatus` (`BRAVO.ExitCodes`);
+  reader приймає v1 і v2, а файли v1 не мігруються (`status` читається як записано; `exitCode` 20 зі `status` `ERROR` у v1 —
+  валідний). Інша `schemaVersion` — `Corrupt` (fail-closed). Споживачам, що перевіряють відповідність `exitCode`↔`status`,
+  треба враховувати версію.
 - Канонічним класифікатором збою лишаються **коди завершення**
   (`BRAVO.ExitCodes`); статус-файл — зручна проєкція, не заміна.
 - Запис fail-soft: помилка запису лише логується як WARNING і ніколи не
@@ -2683,6 +2689,38 @@ compatibility-контракт для зовнішніх machine-спожива�
   lock зайнятий (exit 20: статус належить екземпляру, що працює), коли
   підхоплення пропущеної копії не потрібне, і в прогонах `-SyncBAZA`
   (файл описує нічну копію; денна синхронізація не має його перезаписувати).
+- Код 20 (`SkippedLockBusy`, відкладене виконання) дає `status` = `WARNINGS`, а не `ERROR`
+  (рішення власника D-A, #479). Відображення код → severity → status існує лише в `BRAVO.ExitCodes`
+  (`Get-BRAVOExitCodeSeverity`, `Get-BRAVOExitCodeStatus`); `BRAVO.Status` приймає готовий `-Status`.
+- Ранні виходи ВСЕРЕДИНІ runtime Maintenance і Archive пишуть статус через helper
+  (`Complete-BRAVOMaintenanceEarlyExit`, `Complete-BRAVOArchiveEarlyExit`): код 32 (ToolIntegrity),
+  recovery-guard (код 20), помилки конфігурації (30/31), disk-preflight тощо, з `details.earlyTermination`
+  і `details.earlyExitReason` (#478). Винятки — явні виходи з `-SkipStatus`, де прогін нічого не виконував
+  або результат належить іншому процесу. Maintenance: код дочірнього елевованого процесу, `-RecoverServices`,
+  lock зайнятий, `ServiceClassificationChanged`, no-op Recovery/veto з кодом 0. Archive: відсутній
+  `BRAVO_HEALTH.ps1`, пересилання `-HealthCheckOnly`, дочірній елевований процес.
+- Recovery-запуск `BRAVO_RESTORE_RECOVERY` (`-RunMissedRestoreOnly`; лише boot-тригер, без repetition) НЕ затирає
+  `ERROR` попередньої невдалої операції слабшим статусом (інваріант «сильніший стан не перезаписується слабшим»).
+  Правило: три ранні виходи Recovery — `RecoveryNoWork` (блокування лімітом, код 10), `RestoreVetoedAfterLock`
+  (блокування/пошкоджений стан, код 10) і `RecoveryGuardServicesRunning` (код 20) — перед записом читають
+  наявний статус через `Get-BRAVOOperationStatusPreservation` (`BRAVO.Status`); якщо там `status` = `ERROR`,
+  а новий статус слабший (`WARNINGS`), файл лишається побайтово незмінним, у журнал пишеться один рядок INFO,
+  а код завершення процесу не змінюється. Відсутній файл (норма для свіжої інсталяції) — звичайний
+  запис без примітки. Нечитний, пошкоджений чи з невалідним полем `status` файл запис НЕ блокує (fail-soft):
+  статус записується, а причина логується як WARNING. Поверх `OK` і `WARNINGS` запуск пише як завжди.
+  Recovery-запуск, що виконав реальну роботу, пише фінальний статус як звичайно (він може замінити `ERROR`).
+  15-хвилинні тики — це `BRAVO_SERVICE_RECOVERY` (`-RecoverServices`, `-SkipStatus`): статус вони не чіпають. Повні й нічні прогони Maintenance правило не застосовують і, як раніше, перезаписують `ERROR`
+  (зокрема успішний прогін `OK` замінює `ERROR`). Читання статусу, рішення про збереження й атомарна заміна файла виконуються
+  в `BRAVO.Status` під ексклюзивним lock-файлом `<status>.lock` поруч зі status-файлом (`FileStream`, `FileShare.None`; опитування кожні 50 мс до 10 с; «зайнято» — лише sharing violation, будь-яка інша помилка відкриття йде тим самим шляхом, що й таймаут). Блокування прив'язане до фізичного файла, тож junction/symlink/8.3-аліас і регістр `Operation` не створюють іншого блокування; глобального простору імен немає, тому «squatting» неможливий — каталог `State` закритий від `BUILTIN\Users` (`Set-BRAVOProtectedDataDirectoryAcl`, `BRAVO_TASKS_INSTALL.ps1`: SYSTEM і Administrators — FullControl, обліковий запис завдань — Modify). Handle звільняє ОС при завершенні процесу (покинутого блокування не буває); lock-файл не видаляється й не є станом. Усі writer'и, зокрема нічні прогони, беруть те саме блокування, тож Recovery-запуск, що збігся в часі з нічним прогоном, не може затерти щойно записаний `ERROR`. **Потрібне приймання на реальному сервері:** міжсесійна взаємодія SYSTEM (завдання) ↔ інтерактивний елевований адміністратор над lock-файлом. Якщо блокування не отримано за таймаут,
+  Recovery-запис пропускається
+  (WARNING у журналі, файл незмінний), а звичайний writer завершується винятком, який call-site лише логує.
+- Помилка конфігурації ДО того, як відомий `stateRoot` (коди 30/31 під час читання та валідації
+  `BRAVO.config`), статус не пише — запис неможливий, тож попередній `OK` може залишитися.
+- Відомі обмеження (статус НЕ пишеться; follow-up): виходи до запуску runtime у кореневих entrypoint-ах
+  `BRAVO_MAINTENANCE.ps1` / `BRAVO_ARCHIV.ps1` (коди 33/34/35/90; 33 — pre-trust за дизайном) і необроблений
+  виняток Maintenance поза бізнес-`try` (код 90 через обгортку модуля), на відміну від fatal-`catch` Archive.
+- Найчастіший автор коду 20 — відкладений (`Deferred`) Health (статус-файл операції `Health`). Recovery-guard
+  Maintenance надсилає CRITICAL-сповіщення, хоча статус показує `WARNINGS` (рішення власника D-A).
 - Секретів у файлах немає за контрактом (перевіряється самотестом).
 - Локальний outbox подій Operations (BSYSTEM) зберігає лише замасковану
   копію тексту: `message`, `component`, `services`, вкладені `details` і

@@ -109,6 +109,126 @@ if (-not (Test-Path -LiteralPath $notificationHelpersPath -PathType Leaf)) {
 }
 Import-Module -Name $notificationHelpersPath -ErrorAction Stop
 
+# #478: ЄДИНА точка раннього виходу Maintenance — спершу machine-readable
+# status-файл (status деривується канонічною Get-BRAVOExitCodeStatus з
+# BRAVO.ExitCodes), лише потім exit. Раніше ранні виходи (ToolIntegrity 32,
+# recovery guard 20, помилки конфігурації тощо) завершували процес без
+# запису, і BRAVO_STATUS_Maintenance.json лишався з попереднім "OK", хоча
+# Task Scheduler показував ненульовий код. Єдиний інший exit у файлі —
+# канонічний фінальний (exit $script:maintenanceRuntimeExitCode).
+# Визначено ДО розбору конфігурації: перші виходи (код 30) трапляються ще
+# до визначення $stateRoot — тоді запис просто неможливий і пропускається
+# (fail-soft: телеметрія не змінює exit code). -SkipStatus — для виходів,
+# які не є результатом цього прогону Maintenance і не повинні затирати
+# статус останнього реального прогону: lock зайнятий / вихід без дій
+# (Recovery-тик нічого не робив), режим -RecoverServices (окрема операція),
+# код дочірнього елевованого процесу. -Details замінює типові деталі
+# раннього виходу (disk-preflight передає свої лічильники кроків).
+function Write-BRAVOMaintenanceEarlyExitStatus {
+    # Запис статусу раннього виходу — окремою функцією, бо disk-preflight
+    # мусить записати статус ДО друку підсумку й паузи (як і раніше), а сам
+    # exit виконати вже після них. Решта виходів викликає лише
+    # Complete-BRAVOMaintenanceEarlyExit, який пише статус сам.
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [string]$Reason,
+        [hashtable]$Details,
+        # Recovery-тик: не затирати ERROR попередньої операції слабшим статусом
+        # (інваріант «never overwrite a stronger state with a weaker one»).
+        [switch]$PreserveStrongerError
+    )
+
+    try {
+        $earlyStateRootVariable = Get-Variable -Name stateRoot -ErrorAction SilentlyContinue
+        $earlyStateRoot = if ($null -ne $earlyStateRootVariable) { [string]$earlyStateRootVariable.Value } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($earlyStateRoot) -and
+            $null -ne (Get-Command -Name Write-BRAVOOperationStatus -CommandType Function -ErrorAction SilentlyContinue)) {
+            $earlyStartedAtVariable = Get-Variable -Name ScriptStartTime -Scope Script -ErrorAction SilentlyContinue
+            $earlyNewStatus = Get-BRAVOExitCodeStatus -Code $ExitCode
+            $earlyStartedAt = if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) {
+                [datetime]$earlyStartedAtVariable.Value
+            } else {
+                Get-Date
+            }
+            # Маркери раннього виходу завжди присутні; деталі викликача (напр.
+            # лічильники disk-preflight) зберігаються, ключі викликача не
+            # перезаписуються. Без сирих повідомлень, шляхів чи секретів.
+            $earlyStatusDetails = @{}
+            if ($null -ne $Details) {
+                foreach ($earlyDetailKey in @($Details.Keys)) { $earlyStatusDetails[$earlyDetailKey] = $Details[$earlyDetailKey] }
+            }
+            if (-not $earlyStatusDetails.ContainsKey('earlyTermination')) { $earlyStatusDetails['earlyTermination'] = $true }
+            if (-not $earlyStatusDetails.ContainsKey('earlyExitReason')) { $earlyStatusDetails['earlyExitReason'] = [string]$Reason }
+            # Recovery-тик: рішення «ERROR не затирається слабшим» і атомарна заміна
+            # виконуються writer'ом під одним mutex на status-файл (BRAVO.Status,
+            # без check-then-write вікна). Таймаут блокування — запис пропущено.
+            $earlyWriteResult = Write-BRAVOOperationStatus `
+                -StateRoot $earlyStateRoot `
+                -Operation Maintenance `
+                -ExitCode $ExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
+                -Status $earlyNewStatus `
+                -StartedAt $earlyStartedAt `
+                -Details $earlyStatusDetails `
+                -PreserveStrongerError:$PreserveStrongerError `
+                -PassThru
+            if ($PreserveStrongerError -and $null -ne $earlyWriteResult) {
+                $earlyPreservationMessage = $null
+                $earlyPreservationLevel = 'WARNING'
+                if ($earlyWriteResult.Preserved) {
+                    $earlyPreservationLevel = 'INFO'
+                    $earlyPreservationMessage = "Recovery-тик завершився кодом $ExitCode ($earlyNewStatus), але status-файл Maintenance зберігає попередній $($earlyWriteResult.PreviousStatus) — слабший статус його не затирає"
+                } elseif (-not [string]::IsNullOrEmpty([string]$earlyWriteResult.Note)) {
+                    $earlyPreservationMessage = [string]$earlyWriteResult.Note
+                }
+                if ($null -ne $earlyPreservationMessage) {
+                    # Збій логування не має впливати на результат запису.
+                    try {
+                        if (Get-Command -Name Write-Log -CommandType Function -ErrorAction SilentlyContinue) {
+                            Write-Log -Message $earlyPreservationMessage -Level $earlyPreservationLevel
+                        } else {
+                            Write-Warning $earlyPreservationMessage
+                        }
+                    } catch {
+                        $null = $_
+                    }
+                }
+            }
+        }
+    } catch {
+        # Ранні виходи не мають зовнішнього try, а Write-Log може ще не
+        # існувати: збій телеметрії не повинен змінити код завершення.
+        $earlyStatusFailureMessage = "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Maintenance: $($_.Exception.Message)"
+        try {
+            if (Get-Command -Name Write-Log -CommandType Function -ErrorAction SilentlyContinue) {
+                Write-Log -Message $earlyStatusFailureMessage
+            } else {
+                Write-Warning $earlyStatusFailureMessage
+            }
+        } catch {
+            $null = $_
+        }
+    }
+}
+
+function Complete-BRAVOMaintenanceEarlyExit {
+    # -StatusWritten: статус цього виходу вже записано явно (disk-preflight
+    # робить це до друку підсумку й паузи) — не дублювати.
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [string]$Reason,
+        [hashtable]$Details,
+        [switch]$SkipStatus,
+        [switch]$StatusWritten,
+        [switch]$PreserveStrongerError
+    )
+
+    if (-not $SkipStatus -and -not $StatusWritten) {
+        Write-BRAVOMaintenanceEarlyExitStatus -ExitCode $ExitCode -Reason $Reason -Details $Details -PreserveStrongerError:$PreserveStrongerError
+    }
+    exit $ExitCode
+}
+
 # Пауза при ручному запуску мала охопити геть усі точки виходу нижче
 # (їх багато, розкидані по всьому файлу), а не лише останню. exit
 # всередині try ГАРАНТОВАНО проходить крізь усі finally на своєму шляху
@@ -156,7 +276,7 @@ If (-not $isLocalSystem -and -not $currentPrincipal.IsInRole([Security.Principal
         $elevatedArguments += @("-ConfigPath", "`"$ConfigPath`"")
     }
 	$elevatedProcess = Start-Process powershell.exe -ArgumentList $elevatedArguments -Verb RunAs -Wait -PassThru
-	Exit $elevatedProcess.ExitCode
+	Complete-BRAVOMaintenanceEarlyExit -ExitCode $elevatedProcess.ExitCode -SkipStatus
 }
 
 # Вмикаємо TLS 1.2 АДИТИВНО (канонічний Enable-BRAVOTls12 з BRAVO.Compatibility,
@@ -248,7 +368,7 @@ try {
     }
 } catch {
     Write-Host "ПОМИЛКА читання конфігурації '$ConfigPath': $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'ConfigurationLoad'
 }
 
 $requiredConfigPaths = @(
@@ -280,14 +400,14 @@ foreach ($requiredPath in $requiredConfigPaths) {
         if ($currentNode -is [System.Collections.IDictionary]) {
             if (-not $currentNode.Contains($segment) -or $null -eq $currentNode[$segment]) {
                 Write-Host "ПОМИЛКА: У конфігурації відсутній обов'язковий параметр '$requiredPath'" -ForegroundColor Red
-                exit 30
+                Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'MissingConfigParameter'
             }
             $currentNode = $currentNode[$segment]
         } else {
             $property = $currentNode.PSObject.Properties[$segment]
             if ($null -eq $property -or $null -eq $property.Value) {
                 Write-Host "ПОМИЛКА: У конфігурації відсутній обов'язковий параметр '$requiredPath'" -ForegroundColor Red
-                exit 30
+                Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'MissingConfigParameter'
             }
             $currentNode = $property.Value
         }
@@ -952,28 +1072,28 @@ if ([string]::IsNullOrWhiteSpace($script:ObjectName) -or
     $script:LogLevel -notin @("DEBUG", "INFO", "WARNING", "ERROR", "SUCCESS") -or
     $arcCommonParams.Count -eq 0) {
     Write-Host "ПОМИЛКА: BRAVO.config містить некоректні значення" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'InvalidConfigValues'
 }
 
 if ($invalidExcludedDrives.Count -gt 0) {
     Write-Host "ПОМИЛКА: Некоректні значення Limits.ExcludedDrives: $($invalidExcludedDrives -join ', ')" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'InvalidExcludedDrives'
 }
 
 if ($RangeIdMonitoringEnabled -and [string]::IsNullOrWhiteSpace($RangeIdLogPath)) {
     Write-Host "ПОМИЛКА: Не вдалося визначити системний шлях до файлу контролю діапазонів ID" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'RangeIdLogPathUndefined'
 }
 
 if ($archivePasswordPresentInConfig) {
     Write-Host "ПОМИЛКА: Видаліть параметр -p<пароль> із Maintenance.Archiver.Parameters у BRAVO.config. Пароль має зберігатися лише у Credential Manager." -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'ArchivePasswordInConfig'
 }
 
 if ([string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
     $archiveCredentialDetails = if ($ArchiveCredentialError) { ": $ArchiveCredentialError" } else { "" }
     Write-Host "ПОМИЛКА: Не знайдено пароль архівів 7-Zip у Credential Manager$archiveCredentialDetails" -ForegroundColor Red
-    exit 31
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 31 -Reason 'ArchivePasswordMissing'
 }
 
 if ($script:SlackMode -ne "none") {
@@ -995,7 +1115,7 @@ if ($script:SlackMode -ne "none") {
     if (-not $notificationConfigurationValid) {
         $credentialDetails = if ($NotificationCredentialError) { ": $NotificationCredentialError" } else { "" }
         Write-Host "ПОМИЛКА: Для каналу $NotificationProviderDisplayName не знайдено коректний HTTPS webhook у Credential Manager$credentialDetails" -ForegroundColor Red
-        exit 31
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode 31 -Reason 'NotificationWebhookMissing'
     }
 }
 
@@ -1603,7 +1723,7 @@ if ($PSBoundParameters.ContainsKey('AutoShutdown')) {
 
 if ($AutoShutdown -notin @("on", "off")) {
     Write-Host "ПОМИЛКА: Параметр AutoShutdown має бути 'on' або 'off'. Поточне значення: $AutoShutdown" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'InvalidAutoShutdown'
 }
 
 $script:EnableAutoShutdown = ($AutoShutdown -eq "on")
@@ -1620,7 +1740,7 @@ if ($PSBoundParameters.ContainsKey('ArchiveAfterMaintenance')) {
 
 if ($ArchiveAfterMaintenance -notin @("on", "off")) {
     Write-Host "ПОМИЛКА: Параметр ArchiveAfterMaintenance має бути 'on' або 'off'. Поточне значення: $ArchiveAfterMaintenance" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'InvalidArchiveAfterMaintenance'
 }
 
 $script:EnableArchiveAfterMaintenance = ($ArchiveAfterMaintenance -eq "on")
@@ -1763,14 +1883,18 @@ function Get-BRAVOMaintenanceResolvedExitCode {
 function Get-BRAVOMaintenanceFinalStatus {
     param([Parameter(Mandatory = $true)][int]$ExitCode)
 
-    switch (Get-BRAVOExitCodeName -Code $ExitCode) {
-        'Success' {
+    # #479: клас результату бере з канонічного Get-BRAVOExitCodeStatus
+    # (BRAVO.ExitCodes), а не з власного переліку імен кодів — інакше код 20
+    # (SkippedLockBusy, Status WARNINGS за рішенням D-A) тут лишався б
+    # 'ПОМИЛКА' і розходився зі статус-файлом.
+    switch (Get-BRAVOExitCodeStatus -Code $ExitCode) {
+        'OK' {
             return [pscustomobject]@{
                 Text = 'УСПІШНО'
                 Color = [ConsoleColor]::Green
             }
         }
-        'SuccessWithWarnings' {
+        'WARNINGS' {
             return [pscustomobject]@{
                 Text = 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'
                 Color = [ConsoleColor]::Yellow
@@ -8990,14 +9114,14 @@ function Send-BRAVOMaintenanceOperationsEvent {
 # Планувальника, навіть якщо роль Administrators не відобразилась через UAC API.
 if (-not $isLocalSystem -and -not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "ЗАПУСТІТЬ СКРИПТ ВІД ІМЕНІ АДМІНІСТРАТОРА!" -ForegroundColor Red
-    exit 90
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'AdministratorRequired'
 }
 
 # Перевірка версії PowerShell. Для PowerShell 3.0 використовується сумісна
 # реалізація SHA512 та доступні в цій версії системні командлети.
 if ($PSVersionTable.PSVersion.Major -lt 3) {
     Write-Host "ПОМИЛКА: Необхідна версія PowerShell 3.0 або вище. Поточна версія: $($PSVersionTable.PSVersion)" -ForegroundColor Red
-    exit 90
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'PowerShellVersion'
 }
 if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Host "УВАГА: PowerShell $($PSVersionTable.PSVersion) — увімкнено режим сумісності." -ForegroundColor Yellow
@@ -9006,7 +9130,7 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 # Перевірка архітектури ОС
 if (-not [Environment]::Is64BitOperatingSystem) {
     Write-Host "ПОМИЛКА: Скрипт працює тільки на 64-бітних системах" -ForegroundColor Red
-    exit 90
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'Unsupported32BitOS'
 }
 
 # Перевірка версії ОС. Environment.OSVersion без application manifest може
@@ -9015,7 +9139,7 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 $osVersion = [System.Environment]::OSVersion.Version
 if ($osVersion.Major -lt 6 -or ($osVersion.Major -eq 6 -and $osVersion.Minor -lt 1)) {
     Write-Host "ПОМИЛКА: Необхідна Windows 7/Windows Server 2008 R2 або новіша версія" -ForegroundColor Red
-    exit 90
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'UnsupportedWindowsVersion'
 }
 if ($osVersion.Major -eq 6 -and $osVersion.Minor -lt 3) {
     Write-Host "УВАГА: Windows версії $osVersion — увімкнено сумісний режим роботи." -ForegroundColor Yellow
@@ -9051,7 +9175,7 @@ $SYSTEM_LOG_ROOT = [string]$systemLogRoot
 if ([string]::IsNullOrWhiteSpace($ROOT_LIMS) -or
     [string]::IsNullOrWhiteSpace($SYSTEM_LOG_ROOT)) {
     Write-Host "ПОМИЛКА: У BRAVO.config не визначено EffectiveLIMSRoot або SystemLogRoot" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'EffectiveRootsUndefined'
 }
 # Похідні шляхи
 # MODEL_PATH: джерело істини — Resolve-BRAVOInstallationDiscovery
@@ -9148,7 +9272,7 @@ if (-not (Test-Path $LOG_DIR)) {
     }
     catch {
         Write-Host "Не вдалося створити директорію для логів $LOG_DIR : $($_.Exception.Message)" -ForegroundColor Red
-        exit 90
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'LogDirectoryCreateFailed'
     }
 }
 
@@ -9303,7 +9427,9 @@ $freeSpaceExclusionsText = if ($FREE_SPACE_EXCLUDED_DRIVES.Count -gt 0) {
 }
 
 if ($RecoverServices) {  # #314 FR-3: лише відновлення впалих служб.
-    exit (Invoke-BRAVOMaintenanceRecoverServicesProfile -ForceRestore:$ForceRestore -RunMissedRestoreOnly:$RunMissedRestoreOnly)
+    # -SkipStatus: окрема операція відновлення служб, не прогін Maintenance —
+    # вона не повинна затирати статус останнього реального прогону.
+    Complete-BRAVOMaintenanceEarlyExit -SkipStatus -ExitCode (Invoke-BRAVOMaintenanceRecoverServicesProfile -ForceRestore:$ForceRestore -RunMissedRestoreOnly:$RunMissedRestoreOnly)
 }
 # ===== СТВОРЕННЯ НЕОБХІДНИХ ДИРЕКТОРІЙ =====
 # ===== ПОЧАТОК ВИКОНАННЯ =====
@@ -9463,7 +9589,7 @@ if ($script:BRAVOOSSupportTier.Tier -eq "LegacyBestEffort") {
         Write-Log -Message "$($script:BRAVOOSSupportTier.Message) Продовжено через BRAVO_ALLOW_UNSUPPORTED_OS=1." -Level "WARNING"
     } else {
         Write-Log -Message $script:BRAVOOSSupportTier.Message -Level "ERROR"
-        exit (Resolve-BRAVOExitCode -InvalidConfiguration)
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode (Resolve-BRAVOExitCode -InvalidConfiguration) -Reason 'UnsupportedOperatingSystem'
     }
 }
 $script:BRAVOToolIntegrity = Get-BRAVOToolIntegrityRecommendation `
@@ -9504,7 +9630,7 @@ if (-not $script:BRAVOToolManifest.IsValid) {
         # а не лише рядок ERROR у лозі.
         Send-SlackAlert -Message "Обслуговування заблоковано перевіркою цілісності інструментів: $($script:BRAVOToolManifest.Message)" -IsCritical
         Send-BRAVOMaintenanceEarlyExitAlerts -Reason "перевірка цілісності інструментів"
-        exit (Resolve-BRAVOExitCode -ToolIntegrityViolation)
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode (Resolve-BRAVOExitCode -ToolIntegrityViolation) -Reason 'ToolIntegrityViolation'
     }
 } elseif (-not [string]::IsNullOrWhiteSpace([string]$script:BRAVOToolManifest.Message)) {
     Write-Log -Message $script:BRAVOToolManifest.Message -Level "WARNING"
@@ -9563,7 +9689,13 @@ if ($RunMissedRestoreOnly -and -not $missedDailyWork -and -not $missedRestoreAct
     Write-BRAVOResultField -Label 'Код завершення' -Value ("{0} — {1}" -f $recoveryNoWorkExitCode, (Get-BRAVOExitCodeName -Code $recoveryNoWorkExitCode))
     Write-BRAVOResultField -Label 'Результат' -Value $(if ($restoreSkippedByRetryBlock) { 'Автоматичну реставрацію заблоковано — потрібна дія оператора (див. журнал)' } else { 'Пропущених операцій не знайдено' })
     Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
-    exit $recoveryNoWorkExitCode
+    # Чистий no-op-тик (код 0) статус не пише: інакше Recovery (boot-запуск
+    # BRAVO_RESTORE_RECOVERY, -RunMissedRestoreOnly) без роботи затирав би результат останнього реального прогону
+    # (напр. ERROR нічного Maintenance) станом "OK". Заблокована лімітом ніч
+    # (код 10) — сигнал для оператора, його статус пишемо, але
+    # -PreserveStrongerError: ERROR попередньої операції не затирається
+    # слабшим WARNINGS (Get-BRAVOOperationStatusPreservation, BRAVO.Status).
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode $recoveryNoWorkExitCode -Reason 'RecoveryNoWork' -PreserveStrongerError -SkipStatus:($recoveryNoWorkExitCode -eq 0)
 }
 Write-Log -Message "Повідомлення: $NotificationProviderDisplayName; режим $(switch ($script:SlackMode) {'none' {'ВИМКНЕНО'} 'errors_only' {'ЛИШЕ ПОМИЛКИ'} 'all' {'УСІ ПОВІДОМЛЕННЯ'}})" -NoTimestamp
 
@@ -9790,31 +9922,27 @@ if (-not $spaceCheckResult) {
     # попередження, а потім упав на місці, показував би "Попереджень: 0".
     [void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
     # Ранній вихід оминає фінальний блок — machine-readable статус (P2.1)
-    # пишеться й тут, fail-soft (див. коментар у фінальному блоці).
-    try {
-        Write-BRAVOOperationStatus `
-            -StateRoot $stateRoot `
-            -Operation Maintenance `
-            -ExitCode $diskPreflightExitCode `
-            -ExitCodeName (Get-BRAVOExitCodeName -Code $diskPreflightExitCode) `
-            -StartedAt $script:ScriptStartTime `
-            -Details @{
-                stepsTotal = [int]$script:BRAVOMaintenanceStepLog.Count
-                stepsOk = [int]$script:BRAVOMaintenanceStepOkCount
-                stepsWarning = [int]$script:BRAVOMaintenanceStepWarnCount
-                stepsSkipped = [int]$script:BRAVOMaintenanceStepSkippedCount
-                stepsError = [int]$script:BRAVOMaintenanceStepFailCount
-                criticalErrorOccurred = [bool]$script:criticalErrorOccurred
-            }
-    } catch {
-        Write-Log -Message "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Maintenance: $($_.Exception.Message)"
+    # пишеться й тут (#478), fail-soft, ДО друку підсумку й паузи; деталі —
+    # лічильники кроків, як у фінальному блоці. Сам exit — через
+    # Complete-BRAVOMaintenanceEarlyExit (-StatusWritten: без дубля запису).
+    $diskPreflightStatusDetails = @{
+        stepsTotal = [int]$script:BRAVOMaintenanceStepLog.Count
+        stepsOk = [int]$script:BRAVOMaintenanceStepOkCount
+        stepsWarning = [int]$script:BRAVOMaintenanceStepWarnCount
+        stepsSkipped = [int]$script:BRAVOMaintenanceStepSkippedCount
+        stepsError = [int]$script:BRAVOMaintenanceStepFailCount
+        criticalErrorOccurred = [bool]$script:criticalErrorOccurred
     }
+    Write-BRAVOMaintenanceEarlyExitStatus `
+        -ExitCode $diskPreflightExitCode `
+        -Reason 'DiskSpacePreflight' `
+        -Details $diskPreflightStatusDetails
     Write-BRAVOMaintenanceEarlyFailureSummary `
         -EndedAt (Get-Date) `
         -ExitCode $diskPreflightExitCode
     Complete-BRAVOProgress
     Wait-BRAVOManualExit -NoPause:$NoPause
-    exit $diskPreflightExitCode
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode $diskPreflightExitCode -Reason 'DiskSpacePreflight' -StatusWritten
 }
 Write-BRAVOMaintenanceStep `
     -Name 'Перевірка вільного місця' `
@@ -9924,7 +10052,10 @@ if (-not $maintenanceLockResult.Success) {
     # Код з канонічного контракту BRAVO.ExitCodes (SkippedLockBusy = 20),
     # а не літерал: ця ж гілка тепер завершує й вичерпаний бюджет очікування
     # lock (T025) замість примусового зупинення задачі Планувальником.
-    exit (Resolve-BRAVOExitCode -LockBusy)
+    # -SkipStatus: пропущений тик, нічого не виконано — статус не пишемо
+    # (як Archive на lock busy), щоб він не затер результат прогону, який
+    # тримає lock або щойно завершився.
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode (Resolve-BRAVOExitCode -LockBusy) -Reason 'OperationLockBusy' -SkipStatus
 }
 $script:maintenanceOperationLock = $maintenanceLockResult.Stream
 $script:maintenanceOperationLockPath = $maintenanceLockResult.Path
@@ -9963,7 +10094,8 @@ if ([string]$script:startModeRepairResult.Status -eq 'OwnerAlive') {
         Send-BRAVOMaintenanceSkippedRunAlert -Message "Класифікація служб змінилась, поки очікувався lock (#297); наступний запуск повторить." -Reason "класифікація служб змінилась під час очікування lock" -RecoveryTick:$RunMissedRestoreOnly
         Exit-BRAVOMaintenanceOperationLock
         Complete-BRAVOProgress
-        exit (Resolve-BRAVOExitCode -LockBusy)
+        # -SkipStatus: той самий пропущений тик, що й lock busy вище.
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode (Resolve-BRAVOExitCode -LockBusy) -Reason 'ServiceClassificationChanged' -SkipStatus
     }
 }
 
@@ -10027,7 +10159,10 @@ if ($restoreVeto.Veto) {
         Write-BRAVOResultField -Label 'Код завершення' -Value ("{0} — {1}" -f $recoveryVetoExitCode, (Get-BRAVOExitCodeName -Code $recoveryVetoExitCode))
         Write-BRAVOResultField -Label 'Результат' -Value $(if ($recoveryVetoBlocked) { 'Автоматичну реставрацію заблоковано — потрібна дія оператора (див. журнал)' } else { "Реставрацію скасовано після lock ($($restoreVeto.ShortReason)); інших операцій немає" })
         Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
-        exit $recoveryVetoExitCode
+        # Скасування без блокування (код 0) статус не пише — та сама причина,
+        # що й для чистого no-op-тика Recovery вище; блокування (10) пишеться,
+        # але не затирає попередній ERROR (-PreserveStrongerError).
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode $recoveryVetoExitCode -Reason 'RestoreVetoedAfterLock' -PreserveStrongerError -SkipStatus:($recoveryVetoExitCode -eq 0)
     }
 }
 
@@ -10252,7 +10387,10 @@ if ($RunMissedRestoreOnly -and $missedDailyWork -and -not $bootRestoreIgnoresWin
         }
         Send-SlackAlert -Message $message -IsCritical
         Send-BRAVOMaintenanceEarlyExitAlerts -Reason "recovery guard: служби вже працюють"
-        exit 20
+        # #478: код 20 (SkippedLockBusy, відкладено) => Status WARNINGS
+        # (рішення власника D-A); без запису статус лишався б попереднім "OK".
+        # -PreserveStrongerError: попередній ERROR слабшим WARNINGS не затирається.
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode 20 -Reason 'RecoveryGuardServicesRunning' -PreserveStrongerError
     }
 }
 # Ті самі три служби — для циклу зупинка -> журнали -> запуск (#314).
@@ -12886,6 +13024,7 @@ try {
         -Operation Maintenance `
         -ExitCode $script:maintenanceRuntimeExitCode `
         -ExitCodeName (Get-BRAVOExitCodeName -Code $script:maintenanceRuntimeExitCode) `
+        -Status (Get-BRAVOExitCodeStatus -Code $script:maintenanceRuntimeExitCode) `
         -StartedAt $script:ScriptStartTime `
         -FinishedAt $maintenanceEndedAt `
         -Details @{

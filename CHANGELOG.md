@@ -2,6 +2,54 @@
 
 ## Не випущено (developer)
 
+- **Fix: серіалізація preservation+запису status-файла, звірка пари `exitCode`/`status`, `schemaVersion` 2 (PR #493, #478, #479).**
+  (1) Рішення «ERROR не затирається слабшим» і атомарна заміна файла тепер виконуються в `BRAVO.Status` під одним
+  ексклюзивним lock-файлом `<status>.lock` (`FileStream`, `FileShare.None`, опитування кожні 50 мс до таймауту, за замовчуванням 10 с; «зайнято» — лише sharing violation `0x80070020`, будь-яка інша помилка йде шляхом збою). Файл блокування прив'язаний до фізичного файла, тож junction, symlink, 8.3-аліас і регістр не створюють іншого блокування; глобального простору імен немає, тож «squatting» неможливий (`StateRoot` закритий від `BUILTIN\Users`: `Set-BRAVOProtectedDataDirectoryAcl` у `BRAVO_TASKS_INSTALL.ps1`); handle звільняє ОС при завершенні процесу (покинутого блокування не буває); lock-файл не видаляється:
+  `Write-BRAVOOperationStatus -PreserveStrongerError -PassThru` (результат `Written`/`Preserved`/`PreviousStatus`/`TimedOut`/`Note`).
+  Усі writer'и (Archive, Health, Maintenance, RestoreVerify) беруть те саме блокування навколо заміни. Міжсесійна взаємодія SYSTEM ↔ елевований адміністратор лишається пунктом приймання на реальному сервері. За таймауту recovery-запис
+  пропускається й логується (можливий сильніший стан не затирається), звичайний writer кидає виняток, який call-site
+  fail-soft логує WARNING. Runtime Maintenance більше не читає статус окремо від запису. (2) Writer звіряє пару
+  `-ExitCode`/`-Status` з канонічною `Get-BRAVOExitCodeStatus` (`BRAVO.ExitCodes`, late-bound, без залежності в маніфесті):
+  суперечлива пара відхиляється, а недоступність відображення — fail-closed (статус не пишеться).
+  (3) `schemaVersion` піднято до 2, бо в v1 документовано `0`→`OK`, `10`→`WARNINGS`, решта→`ERROR`, а код 20 тепер
+  `WARNINGS`: writer пише v2, reader приймає 1 і 2 (файли v1 лишаються валідними, `status` читається як записано;
+  невідомі версії — `Corrupt`, fail-closed). Self-test (набір `Status`): child-процеси `powershell.exe -NoProfile -File`
+  проти утриманого блокування (серіалізація, таймаут, retry, 0/1/N), відхилення суперечливих пар, v1/v2.
+  Потрібне приймання на реальному сервері: одночасний нічний прогін і Recovery-тик у Task Scheduler.
+
+- **Fix: Recovery-запуск не затирає `ERROR` у `BRAVO_STATUS_Maintenance.json` слабшим статусом (#478, #479).**
+  Ранні виходи Recovery-запуску `BRAVO_RESTORE_RECOVERY` (`RecoveryNoWork` і `RestoreVetoedAfterLock` з кодом 10, `RecoveryGuardServicesRunning`
+  з кодом 20) тепер передають `-PreserveStrongerError`: `Write-BRAVOMaintenanceEarlyExitStatus` перед записом
+  читає наявний статус новою чистою `Get-BRAVOOperationStatusPreservation` (`BRAVO.Status`, без залежності від
+  `BRAVO.ExitCodes`) і, якщо там `ERROR`, а новий статус слабший, пропускає запис та логує один рядок INFO;
+  код завершення не змінюється. Відсутній, нечитний чи пошкоджений файл запис не блокує (fail-soft, причина
+  логується WARNING). Відсутній файл — звичайний запис без примітки. Повні й нічні прогони перезаписують статус як раніше. Self-test
+  (набір `Status`): поведінкові тести у дочірньому процесі з реальними status-файлами (ERROR/OK/WARNINGS/
+  відсутній/пошкоджений × коди 10 і 20); випадки «повний прогін» перевіряють лише helper раннього виходу БЕЗ
+  перемикача (а не справжній фінальний запис Maintenance); AST-перевірка, що збережувальний шлях (виклики
+  `Complete-BRAVOMaintenanceEarlyExit` і `Write-BRAVOMaintenanceEarlyExitStatus`) мають рівно три
+  Recovery-виходи. Потрібне приймання на реальному сервері: Task Scheduler (Recovery після нічного ERROR).
+
+- **Fix: єдине відображення exit-код → severity/Status у `BRAVO.ExitCodes` і запис Status на ранніх виходах (#479, #478).**
+  `BRAVO.ExitCodes` отримав канонічну таблицю severity для кожного коду та `Get-BRAVOExitCodeStatus`
+  (SUCCESS→`OK`, WARNING→`WARNINGS`, ERROR/CRITICAL→`ERROR`); `Get-BRAVOExitCodeSeverity` читає її.
+  `Write-BRAVOOperationStatus` більше не має власного відображення і приймає обов'язковий `-Status`;
+  Archive, Maintenance, Health і RestoreVerify передають результат `Get-BRAVOExitCodeStatus`, а підсумок
+  Maintenance (`Get-BRAVOMaintenanceFinalStatus`) також бере клас результату звідти. Поведінкова зміна
+  (рішення власника D-A): код 20 (`SkippedLockBusy`) тепер дає `status` = `WARNINGS` (раніше `ERROR`).
+  Ранні виходи всередині runtime Maintenance і Archive йдуть через `Complete-BRAVOMaintenanceEarlyExit` /
+  `Complete-BRAVOArchiveEarlyExit`, які пишуть Status (fail-soft) і лише потім виконують `exit`; раніше
+  `BRAVO_STATUS_Maintenance.json` після коду 32, recovery-guard (20) чи помилок конфігурації лишався з
+  попереднім «OK». Без запису (`-SkipStatus`) лишаються: Maintenance — код дочірнього елевованого процесу, `-RecoverServices`,
+  lock зайнятий, `ServiceClassificationChanged`, no-op Recovery/veto з кодом 0; Archive — відсутній
+  `BRAVO_HEALTH.ps1`, пересилання `-HealthCheckOnly`, дочірній елевований процес. Відомі обмеження (follow-up):
+  виходи до запуску runtime у `BRAVO_MAINTENANCE.ps1` / `BRAVO_ARCHIV.ps1` (33/34/35/90) і необроблений виняток
+  Maintenance поза бізнес-`try` (код 90) статус не пишуть. Код 20 найчастіше пише відкладений Health; recovery-guard
+  надсилає CRITICAL при статусі `WARNINGS` (D-A). Self-test: pinned-таблиця кодів,
+  AST-перевірки (немає локального switch по кодах; кожен `exit` через helper) і поведінкові тести
+  ранніх виходів у наборі `Status`. Потрібне приймання на реальному сервері: Task Scheduler, моніторинг
+  статус-файлів.
+
 - **Fix: Discovery більше не кидає виняток на відсутньому диску, недосяжному UNC і значеннях `bravo.ini` без каталожної частини.** Стосується `modules/BRAVO.Discovery`. Раніше `Join-Path` на шляху з диска, якого зараз немає, `Test-Path -PathType Container` на недосяжному UNC (`IOException`) і `Split-Path -Parent` для `MODEL=lims` / `D:lims` (порожній результат) переривали `Resolve-BRAVOInstallationDiscovery` та `Test-BRAVODiscoveryResult` аварією. Тепер шляхи на потенційно офлайн-коренях з'єднуються лексично (приватний `Join-BRAVODiscoveryPathLexical`, на наявних дисках результат збігається з `Join-Path`), відсутній диск у `Test-BRAVODiscoverySourceDirectory` дає `Kind = Unreadable` (`Presence = Error`, причина `диск X: недоступний: <шлях>`) замість хибного `Absent`, явні override (включно з `BravoIniPath`) і перевірки `bravo.ini`/`httpd.conf` на недосяжний UNC повертають `Value = $null` з причиною `вказує на каталог, якого не існує або недоступний (...)`, `Test-BRAVODiscoveryResult` повідомляє звичайну проблему замість винятку, помилка перевірки каталогу призначення (самого чи його предка) тепер окрема проблема, а не прийняття вищого предка, і обхід предків зупиняється на першій помилці, а `MODEL` без каталожної частини стає `Absent` з `AbsenceKind = NoPath`. Значення на наявних дисках, пріоритет джерел, формат baseline, коди завершення та конфігурація не змінені. Self-test: `Discovery/MissingDrive*`. Acceptance на реальному сервері з відключеним диском/недосяжним UNC не виконувався.
 
 - **Fix: legacy-синхронізація BAZA більше не дає хибну `ПОМИЛКА` через файли, створені під час

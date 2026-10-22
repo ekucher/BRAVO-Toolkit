@@ -1015,7 +1015,7 @@ function Invoke-BRAVOHealthCheck {
 function Write-BRAVOBackupExecutionState { Add-ProbeEvent 'EXECUTION-STATE' }
 function Send-BRAVOArchiveLegacyBomFallbackAlert { param($Results) }
 function Write-BRAVOOperationStatus {
-    param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details)
+    param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $Status, $StartedAt, $FinishedAt, $Details)
     Add-ProbeEvent "STATUS $ExitCode"
 }
 function Send-BRAVOOperationsEventSafely {
@@ -1109,13 +1109,22 @@ try {
         }) | Select-Object -First 1
     if ($null -eq $probeWrapper) { throw 'у runtime немає функції Invoke-BRAVOArchive' }
     $probeStatements = @($probeWrapper.Body.EndBlock.Statements)
+    # #478: helper'и раннього виходу (статус + exit) визначені на самому
+    # початку тіла — ДО preamble, бо ними користуються ранні виходи
+    # конфігурації. Регіон проби стартує з першої ІНШОЇ функції, а ці дві
+    # (справжні) додаються перед ним окремо.
+    $probeEarlyHelperNames = @('Write-BRAVOArchiveOperationStatus', 'Complete-BRAVOArchiveEarlyExit')
     $probeRegionStartIndex = -1
     for ($probeIndex = 0; $probeIndex -lt $probeStatements.Count; $probeIndex++) {
-        if ($probeStatements[$probeIndex] -is [Management.Automation.Language.FunctionDefinitionAst]) {
+        if ($probeStatements[$probeIndex] -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $probeEarlyHelperNames -notcontains $probeStatements[$probeIndex].Name) {
             $probeRegionStartIndex = $probeIndex
             break
         }
     }
+    $probeEarlyHelperText = (@($probeStatements | Where-Object {
+                $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $probeEarlyHelperNames -contains $_.Name
+            } | ForEach-Object { $_.Extent.Text }) -join "`n")
     if ($probeRegionStartIndex -lt 0) { throw 'у тілі Invoke-BRAVOArchive немає визначень функцій' }
     $probeOuterTry = @($probeStatements | Where-Object { $_ -is [Management.Automation.Language.TryStatementAst] }) | Select-Object -Last 1
     if ($null -eq $probeOuterTry -or $null -eq $probeOuterTry.Finally -or $probeOuterTry.Body.Extent.Text -notmatch '^\{\s*Main\s*\}$') {
@@ -1170,6 +1179,7 @@ try {
         $probeStubs,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
+        $probeEarlyHelperText,
         $probeRegion.ToString(),
         '}',
         'Invoke-BRAVOArchiveOrchestrationProbe'
@@ -1479,46 +1489,39 @@ try {
                 param($node)
                 $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-Compatibility'
             }, $true)) | Select-Object -First 1
+    # #478: кожен вихід у Test-Compatibility — виклик Complete-BRAVOArchiveEarlyExit
+    # (статус + $script:processExitCode + exit в одному місці) з -ExitCode та
+    # -EarlyExitReason, без -SkipStatus і без голого exit.
     $compatExits = @(if ($null -ne $compatFunction) {
             $compatFunction.Body.FindAll({ param($node) $node -is [Management.Automation.Language.ExitStatementAst] }, $true)
         })
+    $compatHelperCalls = @(if ($null -ne $compatFunction) {
+            $compatFunction.Body.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Complete-BRAVOArchiveEarlyExit'
+                }, $true)
+        })
     $compatUncoveredExits = @()
-    foreach ($compatExit in $compatExits) {
-        $compatExitCodeText = if ($null -ne $compatExit.Pipeline) { [string]$compatExit.Pipeline.Extent.Text } else { '' }
-        $compatPreviousText = ''
-        $compatExitCodeAssignText = ''
-        if ($compatExit.Parent -is [Management.Automation.Language.StatementBlockAst]) {
-            $compatSiblings = @($compatExit.Parent.Statements)
-            for ($compatIndex = 1; $compatIndex -lt $compatSiblings.Count; $compatIndex++) {
-                if ([object]::ReferenceEquals($compatSiblings[$compatIndex], $compatExit)) {
-                    $compatPreviousText = [string]$compatSiblings[$compatIndex - 1].Extent.Text
-                    if ($compatIndex -ge 2) {
-                        $compatExitCodeAssignText = [string]$compatSiblings[$compatIndex - 2].Extent.Text
-                    }
-                    break
-                }
-            }
-        }
-        $compatCovered = (
-            $compatExitCodeText -match '^\$[A-Za-z]\w*$' -and
-            $compatPreviousText -match '^Write-BRAVOArchiveOperationStatus\b' -and
-            $compatPreviousText -match ('-ExitCode\s+' + [regex]::Escape($compatExitCodeText) + '(?!\w)') -and
-            # Фінальна Operations-подія у finally читає $script:processExitCode.
-            $compatExitCodeAssignText -match ('^\$script:processExitCode\s*=\s*' + [regex]::Escape($compatExitCodeText) + '\s*$')
-        )
-        if (-not $compatCovered) {
-            $compatUncoveredExits += [string]$compatExit.Extent.Text
+    foreach ($compatHelperCall in $compatHelperCalls) {
+        $compatParameterNames = @($compatHelperCall.CommandElements |
+                Where-Object { $_ -is [Management.Automation.Language.CommandParameterAst] } |
+                ForEach-Object { $_.ParameterName })
+        if ($compatParameterNames -notcontains 'ExitCode' -or
+            $compatParameterNames -notcontains 'EarlyExitReason' -or
+            $compatParameterNames -contains 'SkipStatus') {
+            $compatUncoveredExits += [string]$compatHelperCall.Extent.Text
         }
     }
     Test-BRAVOCondition `
         -Condition (
             @($compatParseErrors).Count -eq 0 -and
             $null -ne $compatFunction -and
-            $compatExits.Count -ge 2 -and
+            $compatExits.Count -eq 0 -and
+            $compatHelperCalls.Count -ge 2 -and
             $compatUncoveredExits.Count -eq 0
         ) `
         -Name 'Archive/CompatibilityExitsWriteStatusBeforeExit' `
-        -Failure "кожен exit у Test-Compatibility має безпосередньо після запису статусу (Write-BRAVOArchiveOperationStatus -ExitCode <той самий код>, перед ним `$script:processExitCode = <той самий код>) завершувати процес, інакше моніторинг бачить застарілий статус; без статусу: $($compatUncoveredExits -join ' | ')"
+        -Failure "кожен вихід у Test-Compatibility має бути викликом Complete-BRAVOArchiveEarlyExit -ExitCode <код> -EarlyExitReason <причина> (статус + exit), без голого exit і без -SkipStatus; голих exit: $($compatExits.Count); без статусу: $($compatUncoveredExits -join ' | ')"
 }
 
 
@@ -1683,8 +1686,10 @@ $archiveCanonicalExitCodes = @(
     [regex]::Matches($archiveExitCodesText, '(?m)^\s+(\d+)\s*=\s*"[A-Za-z]+"\s*$') |
         ForEach-Object { [int]$_.Groups[1].Value }
 )
+# #478: ранні виходи йдуть через Complete-BRAVOArchiveEarlyExit -ExitCode <число>
+# — його літерали теж мусять бути канонічними кодами.
 $archiveLiteralExitCodes = @(
-    [regex]::Matches($archiveScriptText, '(?im)^\s*exit\s+(\d+)\b') |
+    [regex]::Matches($archiveScriptText, '(?im)^\s*(?:exit\s+|Complete-BRAVOArchiveEarlyExit\s+-ExitCode\s+)(\d+)\b') |
         ForEach-Object { [int]$_.Groups[1].Value }
 )
 $archiveNonCanonicalExitCodes = @($archiveLiteralExitCodes | Where-Object { $archiveCanonicalExitCodes -notcontains $_ } | Sort-Object -Unique)

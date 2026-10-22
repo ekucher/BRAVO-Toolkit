@@ -607,6 +607,7 @@ try {
             -Operation RestoreVerify `
             -ExitCode $drillExitCodeForState `
             -ExitCodeName (Get-BRAVOExitCodeName -Code $drillExitCodeForState) `
+            -Status (Get-BRAVOExitCodeStatus -Code $drillExitCodeForState) `
             -StartedAt $script:restoreDrillRunStartedAt `
             -Details @{
                 generationId = [string]$script:selectedRestoreGenerationId

@@ -540,7 +540,7 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
         # служби — вихід 20 до фази зупинки.
         & $serviceRecoveryCheck 'SRRunMissedRestoreOnlyServicesRunning' 20 @(
             'LOG-WARNING Пропущені Backup/Maintenance не виконані: уже працюють служби BRAVO, exchangAPI, BravoWeb. Recovery не зупиняє служби. Реставрація слоту вже виконана раніше — її стан не змінюється.'
-            'LOCK-EXIT'; 'OWNLOG-UPLOAD'; 'MANUAL-EXIT NoPause=True'
+            'STATUS 20'; 'LOCK-EXIT'; 'OWNLOG-UPLOAD'; 'MANUAL-EXIT NoPause=True'
         ) 'ServiceRecovery/CycleRunMissedRestoreOnlyNeverStopsRunningServices' '-RunMissedRestoreOnly при працюючих службах завершується кодом 20 без зупинки й запуску служб'
 
         # (7a) Рев'ю PR #432 (B-P3-5): -RunMissedRestoreOnly, усі служби
@@ -1088,7 +1088,7 @@ $script:ProbeRecoveryStatePath = Join-Path (Join-Path $probeWorkRoot 'state') 'B
                 $recoverRuntimeText.Contains('if ($RecoverServices) { $elevatedArguments += "-RecoverServices" }') -and
                 $recoverRuntimeText.Contains("'BRAVO.Maintenance.RecoverServices.ps1'") -and
                 $recoverLogFileIndex -ge 0 -and $recoverBranchIndex -gt $recoverLogFileIndex -and $recoverBranchIndex -lt $recoverStepsIndex -and
-                $recoverBranchText -match 'exit \(Invoke-BRAVOMaintenanceRecoverServicesProfile -ForceRestore:\$ForceRestore -RunMissedRestoreOnly:\$RunMissedRestoreOnly\)'
+                $recoverBranchText -match 'Complete-BRAVOMaintenanceEarlyExit -SkipStatus -ExitCode \(Invoke-BRAVOMaintenanceRecoverServicesProfile -ForceRestore:\$ForceRestore -RunMissedRestoreOnly:\$RunMissedRestoreOnly\)'
             ) `
             -Name 'ServiceRecovery/RecoverServicesWiredThroughEntrypointAndRuntime' `
             -Failure "#314 FR-3: -RecoverServices — switch тонкого entrypoint (≤250 рядків, зараз $recoverEntryLines), той самий switch у param() runtime (скрипт і функція: $recoverRuntimeParamCount з 2) і в аргументах елевації, профіль підключено з BRAVO.Maintenance.RecoverServices.ps1 і викликано до кроків нічного прогону (після визначення шляхів журналів), код завершення — його"
