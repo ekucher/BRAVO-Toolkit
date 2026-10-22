@@ -4602,7 +4602,9 @@ function Get-BAZASFTPComparison {
         # CompareDirectories (його локальний обхід уже завершено) знімок
         # звіряється з живим деревом, а для зниклих об'єктів робиться
         # read-only stat у хмарі в цій самій сесії. Без знімка — як раніше.
-        [object]$LocalSnapshot = $null
+        [object]$LocalSnapshot = $null,
+        # Залишок аудиту ДО (див. Add-BAZASnapshotConsistencyEvidence).
+        [object[]]$PreAuditPending = @()
     )
 
     $components = Get-BRAVOWinSCPDotNetComponents `
@@ -4737,7 +4739,8 @@ function Get-BAZASFTPComparison {
                 -Session $session `
                 -RemotePath $RemotePath `
                 -LocalSnapshot $LocalSnapshot `
-                -LocalPath $LocalPath
+                -LocalPath $LocalPath `
+                -PreAuditPending @($PreAuditPending)
         }
         return $comparisonResult
     } catch {
@@ -5095,15 +5098,47 @@ function Add-BAZASnapshotConsistencyEvidence {
         [string]$RemotePath,
         [object]$LocalSnapshot,
         [string]$LocalPath,
-        [int]$MaximumProbeCount = 1000
+        [int]$MaximumProbeCount = 1000,
+        # Залишок аудиту ДО: об'єкти під коренем, яких немає у знімку (зникли
+        # до обходу), теж перевіряються у хмарі — наявність на диску зараз
+        # не доводить, що їх передано.
+        [object[]]$PreAuditPending = @()
     )
 
     $snapshotDrift = Compare-BRAVOBazaLocalSnapshotToLiveTree -Snapshot $LocalSnapshot -LocalDirectory $LocalPath
+    $snapshotOmitted = New-Object System.Collections.Generic.List[object]
+    if ([bool]$snapshotDrift.Success -and -not [string]::IsNullOrWhiteSpace($LocalPath) -and
+        $null -ne $LocalSnapshot.PSObject.Properties['Directories'] -and $null -ne $LocalSnapshot.Directories) {
+        try {
+            $coverageRoot = [IO.Path]::GetFullPath($LocalPath).TrimEnd('\', '/')
+            foreach ($preAuditItem in @($PreAuditPending)) {
+                $preAuditPathProperty = if ($null -ne $preAuditItem) { $preAuditItem.PSObject.Properties['Path'] } else { $null }
+                $preAuditPath = if ($null -ne $preAuditPathProperty) { [string]$preAuditPathProperty.Value } else { '' }
+                if ([string]::IsNullOrWhiteSpace($preAuditPath) -or -not [IO.Path]::IsPathRooted($preAuditPath)) { continue }
+                $preAuditFullPath = [IO.Path]::GetFullPath($preAuditPath).TrimEnd('\', '/')
+                if (-not $preAuditFullPath.StartsWith($coverageRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+                $preAuditRelative = $preAuditFullPath.Substring($coverageRoot.Length + 1)
+                if ($LocalSnapshot.Entries.ContainsKey($preAuditRelative) -or $LocalSnapshot.Directories.Contains($preAuditRelative)) { continue }
+                $preAuditDirectoryProperty = $preAuditItem.PSObject.Properties['IsDirectory']
+                $snapshotOmitted.Add([pscustomobject]@{
+                    RelativePath = $preAuditRelative
+                    IsDirectory = ($null -ne $preAuditDirectoryProperty -and [bool]$preAuditDirectoryProperty.Value)
+                })
+            }
+        } catch {
+            # Не вдалося визначити шлях — об'єкт без доказу лишиться помилкою.
+        }
+    }
     $remoteProbe = if ([bool]$snapshotDrift.Success) {
+        $probeItems = New-Object System.Collections.Generic.List[object]
+        $probeSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($probeItem in (@($snapshotDrift.Vanished) + @($snapshotDrift.Modified) + @($snapshotOmitted.ToArray()))) {
+            if ($null -ne $probeItem -and $probeSeen.Add([string]$probeItem.RelativePath)) { $probeItems.Add($probeItem) }
+        }
         Get-BAZARemoteVanishedProbe `
             -Session $Session `
             -RemotePath $RemotePath `
-            -Vanished (@($snapshotDrift.Vanished) + @($snapshotDrift.Modified)) `
+            -Vanished @($probeItems.ToArray()) `
             -MaximumProbeCount $MaximumProbeCount
     } else {
         $null
@@ -5577,6 +5612,45 @@ function Get-BAZASynchronizationOutcome {
                         [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath)
                         continue
                     }
+                    # Об'єкт аудиту ДО відсутній у успішному знімку й у залишку
+                    # пост-аудиту. Наявність на диску зараз не доводить передачі:
+                    # файл міг бути відтворений вже після пост-аудиту. Доказ —
+                    # лише хмара (RemoteProbe, зібраний для таких об'єктів у
+                    # пост-аудиті): той самий вид, для файла той самий розмір і час
+                    # (з точністю SFTP) поточної локальної версії. Інакше —
+                    # не доведено (fail-closed), без звернення до голого Exists.
+                    $omittedProven = $false
+                    try {
+                        $omittedProbeComplete = $null -ne $remoteProbe -and [bool]$remoteProbe.Complete -and $null -ne $remoteProbe.Entries
+                        if ($omittedProbeComplete -and $remoteProbe.Entries.ContainsKey($beforeRelativePath)) {
+                            $omittedProbe = $remoteProbe.Entries[$beforeRelativePath]
+                            if ($beforeIsDirectory) {
+                                $omittedLocalExists = [IO.Directory]::Exists($beforePendingPath)
+                                $omittedLocalEntry = $null
+                            } else {
+                                $omittedFile = New-Object IO.FileInfo($beforePendingPath)
+                                $omittedLocalExists = $omittedFile.Exists
+                                $omittedLocalEntry = if ($omittedLocalExists) {
+                                    [pscustomobject]@{ Size = [long]$omittedFile.Length; LastWriteTimeUtc = $omittedFile.LastWriteTimeUtc.ToString('o') }
+                                } else {
+                                    $null
+                                }
+                            }
+                            if ($omittedLocalExists) {
+                                $omittedProven = Test-BAZAVanishedSnapshotObjectBackedUp `
+                                    -Vanished ([pscustomobject]@{ RelativePath = $beforeRelativePath; IsDirectory = $beforeIsDirectory }) `
+                                    -SnapshotEntry $omittedLocalEntry `
+                                    -Probe $omittedProbe
+                            }
+                        }
+                    } catch {
+                        $omittedProven = $false
+                    }
+                    if (-not $omittedProven) {
+                        $snapshotUnavailableVanishedCount++
+                        [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath)
+                    }
+                    continue
                 }
                 if ($null -eq $beforePendingPath -or
                     -not ([IO.File]::Exists($beforePendingPath) -or [IO.Directory]::Exists($beforePendingPath))) {
@@ -6517,7 +6591,8 @@ exit
             -RemotePath $remotePath `
             -RepositorySFTPUrl $RepositorySFTPUrl `
             -HostKey $HostKey `
-            -LocalSnapshot $(if ($cycleSnapshot.Success) { $cycleSnapshot } else { $null })
+            -LocalSnapshot $(if ($cycleSnapshot.Success) { $cycleSnapshot } else { $null }) `
+            -PreAuditPending $(if ($null -ne $comparisonBefore -and $comparisonBefore.Success) { @($comparisonBefore.PendingFiles) } else { @() })
         $syncOutcome = Get-BAZASynchronizationOutcome `
             -WinSCPExitCode $winSCPExitCode `
             -ComparisonBefore $comparisonBefore `

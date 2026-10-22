@@ -1903,6 +1903,8 @@ function Get-BAZASFTPComparison {
         return [pscustomobject]@{ Success = $false; Error = 'аудит недоступний (selftest)'; PendingFiles = @() }
     }
     $result = Get-Late501RemoteDifference -LocalPath $LocalPath -RemotePath $RemotePath
+    # Перший аудит компонента — аудит ДО: його залишок передається пост-аудиту.
+    if ($script:late501ComponentComparisons -eq 1) { $script:late501PreAuditPending = @($result.PendingFiles) }
     # Пост-аудит зі знімком: та сама production-функція, що й у справжньому
     # Get-BAZASFTPComparison (звіряння знімка ПІСЛЯ порівняння + stat), лише
     # сесія — фейкова хмара. Стадія AfterCompare — LIMS діє між локальним
@@ -1910,7 +1912,8 @@ function Get-BAZASFTPComparison {
     if ($null -ne $LocalSnapshot) {
         Invoke-Late501Ops -Stage 'AfterCompare'
         $result = Add-BAZASnapshotConsistencyEvidence -ComparisonResult $result -Session (New-Late501FakeSession -RemotePath $RemotePath) `
-            -RemotePath $RemotePath -LocalSnapshot $LocalSnapshot -LocalPath $LocalPath -MaximumProbeCount $script:late501ProbeCap
+            -RemotePath $RemotePath -LocalSnapshot $LocalSnapshot -LocalPath $LocalPath -MaximumProbeCount $script:late501ProbeCap `
+            -PreAuditPending @($script:late501PreAuditPending)
     }
     # Перший аудит компонента — ДО синхронізації: LIMS діє вже після нього.
     if ($script:late501ComponentComparisons -eq 1) { Invoke-Late501Ops -Stage 'BeforeAudit' }
@@ -1926,7 +1929,10 @@ function New-Late501FakeSession {
         param($Path) $Path.Substring($this.RemoteRoot.TrimEnd('/').Length + 1).Replace('/', '\')
     }
     $session | Add-Member -MemberType ScriptMethod -Name FileExists -Value {
-        param($Path) $script:late501Remote[$this.RemoteRoot].ContainsKey($this.RelativeOf($Path))
+        param($Path)
+        $relative = $this.RelativeOf($Path)
+        if (@($script:late501ProbeErrorPaths) -contains $relative) { throw 'симульований збій stat у хмарі (selftest)' }
+        $script:late501Remote[$this.RemoteRoot].ContainsKey($relative)
     }
     $session | Add-Member -MemberType ScriptMethod -Name GetFileInfo -Value {
         param($Path)
@@ -2064,11 +2070,14 @@ $late501Run = {
         [switch]$WithWWW,
         [object[]]$Ops = @(),
         [int]$ProbeCap = 1000,
-        [switch]$SnapshotFails
+        [switch]$SnapshotFails,
+        [string[]]$ProbeErrorPaths = @()
     )
     & $late501Module {
-        param($CaseRoot, $Remote, $DuringSyncWrites, $FailPaths, $ExitCode, $AfterAuditFails, $WithWWW, $Ops, $ProbeCap, $SnapshotFails)
+        param($CaseRoot, $Remote, $DuringSyncWrites, $FailPaths, $ExitCode, $AfterAuditFails, $WithWWW, $Ops, $ProbeCap, $SnapshotFails, $ProbeErrorPaths)
         $script:late501ProbeCap = $ProbeCap
+        $script:late501ProbeErrorPaths = @($ProbeErrorPaths)
+        $script:late501PreAuditPending = @()
         $script:late501SnapshotFails = [bool]$SnapshotFails
         $script:late501Log = New-Object System.Collections.ArrayList
         $script:late501CaseRoot = $CaseRoot
@@ -2127,7 +2136,7 @@ $late501Run = {
             Log = @($script:late501Log.ToArray())
             WinSCPRuns = $script:late501WinSCPRuns
         }
-    } $CaseRoot $Remote @($DuringSyncWrites) $FailPaths $ExitCode ([bool]$AfterAuditFails) ([bool]$WithWWW) @($Ops) $ProbeCap ([bool]$SnapshotFails)
+    } $CaseRoot $Remote @($DuringSyncWrites) $FailPaths $ExitCode ([bool]$AfterAuditFails) ([bool]$WithWWW) @($Ops) $ProbeCap ([bool]$SnapshotFails) @($ProbeErrorPaths)
 }
 
 $late501NewFile = {
@@ -2947,6 +2956,50 @@ try {
         $rf29d.App.IsComplete -and $rf29d.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf29d.App.CompletedCount -eq 2
     ) -Name 'Archive/501/F29dGrownFileBeforeSnapshotIsNotError' `
       -Failure "дописаний до знімка файл аудиту ДО не є помилкою; label=$($rf29d.Label) exit=$($rf29d.ExitCode) vanished=$($rf29d.App.SnapshotUnavailableVanishedCount) completed=$($rf29d.App.CompletedCount)"
+    # F30 (Codex, PR #503, P1). pending_2 зник до знімка, WinSCP і пост-аудит його
+    # не бачили, а LIMS відтворив його вже ПІСЛЯ пост-аудиту (стадія AfterCompare):
+    # на диску він є, у знімку й залишку його немає, у хмарі його немає ->
+    # передачу не доведено -> ПОМИЛКА, переданим не рахується.
+    $f30 = & $late501NewCase 'F30'
+    $f30Path = Join-Path $f30.App 'KZ\2026\pending_2.pdf'
+    $rf30 = & $late501Run -CaseRoot $f30.Root -Remote $f30.Remote -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f30Path),
+        (& $late501Op 'AfterCompare' 'Write' $f30Path -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf30.Manual.Success -and $rf30.Label -eq 'ПОМИЛКА' -and $rf30.ExitCode -eq 50 -and
+        $rf30.App.SnapshotAvailable -and -not $rf30.App.IsComplete -and -not $rf30.App.SnapshotConsistencyVerified -and
+        $rf30.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf30.App.CompletedCount -eq 1
+    ) -Name 'Archive/501/F30SnapshotOmittedReappearedPendingIsError' `
+      -Failure "файл аудиту ДО поза знімком, відтворений після пост-аудиту й відсутній у хмарі, не є переданим; label=$($rf30.Label) exit=$($rf30.ExitCode) verified=$($rf30.App.SnapshotConsistencyVerified) vanished=$($rf30.App.SnapshotUnavailableVanishedCount) completed=$($rf30.App.CompletedCount)"
+
+    # F30b. Як F28b (відтворено до старту WinSCP, передано), але stat у хмарі для
+    # цього шляху не вдався -> версію не доведено -> ПОМИЛКА.
+    $f30b = & $late501NewCase 'F30b'
+    $f30bPath = Join-Path $f30b.App 'KZ\2026\pending_2.pdf'
+    $rf30b = & $late501Run -CaseRoot $f30b.Root -Remote $f30b.Remote -ProbeErrorPaths @('KZ\2026\pending_2.pdf') -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f30bPath),
+        (& $late501Op 'Snapshot' 'Write' $f30bPath -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf30b.Manual.Success -and $rf30b.Label -eq 'ПОМИЛКА' -and $rf30b.ExitCode -eq 50 -and
+        -not $rf30b.App.IsComplete -and $rf30b.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf30b.App.CompletedCount -eq 1
+    ) -Name 'Archive/501/F30bSnapshotOmittedProbeErrorIsError' `
+      -Failure "збій stat у хмарі для об'єкта поза знімком не дає доказу; label=$($rf30b.Label) exit=$($rf30b.ExitCode) vanished=$($rf30b.App.SnapshotUnavailableVanishedCount) completed=$($rf30b.App.CompletedCount)"
+
+    # F30c. Те саме, але ліміт перевірки у хмарі 0 -> доказ не збирається -> ПОМИЛКА.
+    $f30c = & $late501NewCase 'F30c'
+    $f30cPath = Join-Path $f30c.App 'KZ\2026\pending_2.pdf'
+    $rf30c = & $late501Run -CaseRoot $f30c.Root -Remote $f30c.Remote -ProbeCap 0 -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f30cPath),
+        (& $late501Op 'Snapshot' 'Write' $f30cPath -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf30c.Manual.Success -and $rf30c.Label -eq 'ПОМИЛКА' -and $rf30c.ExitCode -eq 50 -and
+        -not $rf30c.App.IsComplete -and $rf30c.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf30c.App.CompletedCount -eq 1
+    ) -Name 'Archive/501/F30cSnapshotOmittedOverProbeLimitIsError' `
+      -Failure "понад ліміт перевірки у хмарі об'єкт поза знімком лишається помилкою; label=$($rf30c.Label) exit=$($rf30c.ExitCode) vanished=$($rf30c.App.SnapshotUnavailableVanishedCount) completed=$($rf30c.App.CompletedCount)"
+
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
     # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.
