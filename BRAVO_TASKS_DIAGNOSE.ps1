@@ -658,7 +658,16 @@ try {
             "не прочитано=$(@($legacyConfigPathReport.Problems).Count)"
         ) -ForegroundColor Gray
         if ($legacyConfigPathTaskCount -eq 0) {
-            Write-Host "[INFO] LegacyConfigPath: завдань із Exec-дією BRAVO_*.ps1 на цьому хості не знайдено." -ForegroundColor Gray
+            if (@($legacyConfigPathReport.Problems).Count -eq 0) {
+                Write-Host "[INFO] LegacyConfigPath: завдань із Exec-дією BRAVO_*.ps1 на цьому хості не знайдено." -ForegroundColor Gray
+            } else {
+                # Неповне сканування: відсутність знахідок не доводить відсутності завдань BRAVO.
+                Write-Host (
+                    "[WARN] LegacyConfigPath: серед успішно прочитаних визначень завдань із Exec-дією BRAVO_*.ps1 не знайдено, " +
+                    "але не вдалося прочитати елементів Планувальника: $(@($legacyConfigPathReport.Problems).Count) — " +
+                    "це не доказ відсутності таких завдань на цьому хості."
+                ) -ForegroundColor Yellow
+            }
         }
     } catch {
         Write-Host "[WARN] LegacyConfigPath: перевірку не виконано: $($_.Exception.Message)" -ForegroundColor Yellow

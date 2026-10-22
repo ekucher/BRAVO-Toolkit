@@ -93,15 +93,24 @@ function ConvertFrom-BRAVOWindowsCommandLine {
     }
 }
 
+function Test-BRAVODiagnosticProcessIsWow64 {
+    # Діагностика запущена як 32-бітний процес на 64-бітній ОС (WOW64): тут %ProgramFiles% дорівнює
+    # "Program Files (x86)", а 64-бітний Task Engine / цільовий процес отримає "Program Files".
+    return [bool]([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess)
+}
+
 function Expand-BRAVOTaskActionVariable {
     # Розкриття %VAR% у тексті Action. Task Scheduler розкриває змінні у СВОЄМУ середовищі,
     # тому розкриваються лише машинно-стабільні (SystemRoot, windir, ProgramData, ProgramFiles,
     # SystemDrive); решта потрапляє в Unsupported. NamePattern — що вважати іменем змінної між
     # '%': за замовчуванням будь-що без символів \ і /; для командних рядків (де '%' може бути
     # псевдонімом ForEach-Object) викликач передає суворіший шаблон без пробілів.
+    # ProgramFilesArchitectureUnknown (#496, B4): у WOW64-процесі діагностики %ProgramFiles% залежить від
+    # архітектури процесу діагностики, а не завдання; архітектуру цілі не вгадуємо -> %ProgramFiles% = Unsupported.
     param(
         [AllowNull()][AllowEmptyString()][string]$Text,
-        [string]$NamePattern = '[^%\\/]+'
+        [string]$NamePattern = '[^%\\/]+',
+        [bool]$ProgramFilesArchitectureUnknown = (Test-BRAVODiagnosticProcessIsWow64)
     )
 
     $stableVariables = @('SystemRoot', 'windir', 'ProgramData', 'ProgramFiles', 'SystemDrive')
@@ -113,6 +122,9 @@ function Expand-BRAVOTaskActionVariable {
         $value = $null
         if ($stableVariables -contains $variableName) {
             $value = [Environment]::GetEnvironmentVariable($variableName)
+            if ($ProgramFilesArchitectureUnknown -and [string]::Equals($variableName, 'ProgramFiles', [StringComparison]::OrdinalIgnoreCase)) {
+                $value = $null
+            }
         }
         if ([string]::IsNullOrEmpty($value)) {
             $unsupported.Add($variableName)
@@ -274,7 +286,10 @@ function Resolve-BRAVOTaskActionPath {
         param($Positions)
         'шлях залежить від змінної середовища (позиція ' + (@($Positions) -join ', ') + ' у рядку; вираз не виводиться), ' +
         'яку Task Engine бере зі свого (кешованого) середовища, а діагностика не може його відтворити; ' +
-        'розкриваються лише %SystemRoot%, %windir%, %ProgramData%, %ProgramFiles%, %SystemDrive%'
+        'розкриваються лише %SystemRoot%, %windir%, %ProgramData%, %ProgramFiles%, %SystemDrive%' +
+        $(if (Test-BRAVODiagnosticProcessIsWow64) {
+                ' (%ProgramFiles% не розкривається, бо діагностику запущено як 32-бітний процес на 64-бітній ОС: архітектура цільового процесу невідома)'
+            } else { '' })
     }
 
     try {
@@ -302,8 +317,11 @@ function Resolve-BRAVOTaskActionPath {
             return (& $failure (& $unsupportedReason $expandedWorkingDirectory.UnsupportedPositions))
         }
         if ($expandedWorkingDirectory.Text -match '^[\\/]{2}') { return (& $failure $remoteReason) }
-        if (-not [IO.Path]::IsPathRooted($expandedWorkingDirectory.Text)) {
-            return (& $failure 'WorkingDirectory завдання не є абсолютним шляхом')
+        # #496 B5: лише повна форма `X:\...` (так само, як для цільового шляху). Кореневий `\BRAVO` і `X:foo`
+        # IsPathRooted вважає абсолютними, але GetFullPath розв'язав би їх щодо диска/каталогу ПРОЦЕСУ діагностики,
+        # а не завдання (lpCurrentDirectory у CreateProcess — повний шлях).
+        if ($expandedWorkingDirectory.Text -notmatch '^[A-Za-z]:[\\/]') {
+            return (& $failure 'WorkingDirectory завдання не є повним шляхом із літерою диска (X:\...) — розв''язати відносний шлях неможливо')
         }
         return [pscustomobject]@{
             Path = [IO.Path]::GetFullPath((Join-Path -Path $expandedWorkingDirectory.Text -ChildPath $text))
@@ -312,6 +330,72 @@ function Resolve-BRAVOTaskActionPath {
     } catch {
         return (& $failure 'некоректний шлях (не розібрано)')
     }
+}
+
+function Get-BRAVOParameterValidationRule {
+    # #496 B6: атрибут параметра param()-блоку -> правило, яке сканер уміє оцінити статично.
+    #  $null  — атрибут не впливає на прийняття значення (Parameter, Alias, ArgumentCompleter, Obsolete, PSDefaultValue);
+    #  Set    — ValidateSet із літеральних рядків для [string]-параметра без іменованих аргументів (IgnoreCase тощо);
+    #  NotNull/NotNullOrEmpty — для [string]-параметра (рішення тривіальне для літерального значення);
+    #  Opaque — усе інше (ValidateScript/Pattern/Range/Length/Count, Allow*, ArgumentTransformation, довільні атрибути,
+    #           недетермінований ValidateSet): результат статично не визначити (fail closed).
+    param($Attribute, $StaticType)
+
+    # Ограничення типу ([string]) — теж елемент Attributes параметра, але не атрибут (TypeConstraintAst).
+    if ($Attribute -isnot [System.Management.Automation.Language.AttributeAst]) { return $null }
+    $name = ([string]$Attribute.TypeName.Name -split '\.')[-1]
+    if ($name -match '(?i)Attribute$') { $name = $name.Substring(0, $name.Length - 9) }
+    if ($name -match '(?i)^(Parameter|Alias|ArgumentCompleter|Obsolete|PSDefaultValue)$') { return $null }
+    $opaque = [pscustomobject]@{ Kind = 'Opaque'; Name = $name; Values = @() }
+    if ($name -ieq 'ValidateSet') {
+        $values = New-Object 'System.Collections.Generic.List[string]'
+        $decidable = ($StaticType -eq [string]) -and @($Attribute.NamedArguments).Count -eq 0 -and @($Attribute.PositionalArguments).Count -gt 0
+        foreach ($argument in @($Attribute.PositionalArguments)) {
+            if ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                $values.Add([string]$argument.Value)
+            } else {
+                $decidable = $false
+            }
+        }
+        if ($decidable) { return [pscustomobject]@{ Kind = 'Set'; Name = $name; Values = $values.ToArray() } }
+        return $opaque
+    }
+    if (($name -ieq 'ValidateNotNull' -or $name -ieq 'ValidateNotNullOrEmpty') -and
+        $StaticType -eq [string] -and @($Attribute.NamedArguments).Count -eq 0 -and @($Attribute.PositionalArguments).Count -eq 0) {
+        return [pscustomobject]@{ Kind = $(if ($name -ieq 'ValidateNotNull') { 'NotNull' } else { 'NotNullOrEmpty' }); Name = $name; Values = @() }
+    }
+    return $opaque
+}
+
+function Test-BRAVOParameterValueValidation {
+    # #496 B6: чи пройде літеральне значення перевірки атрибутів параметра. Accepted=$false і для відхилення
+    # (значення поза ValidateSet), і для неоцінюваного атрибута; Reason не містить значення (воно може бути секретом).
+    param(
+        [AllowNull()][object[]]$Rule,
+        [AllowNull()][AllowEmptyString()][string]$Value
+    )
+
+    foreach ($rule in @($Rule)) {
+        if ($null -eq $rule) { continue }
+        switch ([string]$rule.Kind) {
+            'Set' {
+                $member = @($rule.Values | Where-Object { [string]::Equals([string]$_, $Value, [StringComparison]::OrdinalIgnoreCase) })
+                if ($member.Count -eq 0) {
+                    return [pscustomobject]@{ Accepted = $false; Reason = 'значення не входить до ValidateSet параметра (значення не виводиться): PowerShell відмовить у прив''язці до запуску скрипта' }
+                }
+            }
+            'NotNull' { }
+            'NotNullOrEmpty' {
+                if ([string]::IsNullOrEmpty($Value)) {
+                    return [pscustomobject]@{ Accepted = $false; Reason = 'порожнє значення відхиляється ValidateNotNullOrEmpty: PowerShell відмовить у прив''язці до запуску скрипта' }
+                }
+            }
+            default {
+                return [pscustomobject]@{ Accepted = $false; Reason = "параметр має атрибут перевірки/перетворення значення ($($rule.Name)), результат якого статично не визначити" }
+            }
+        }
+    }
+    return [pscustomobject]@{ Accepted = $true; Reason = $null }
 }
 
 function Get-BRAVOScriptDeclaredParameter {
@@ -328,7 +412,7 @@ function Get-BRAVOScriptDeclaredParameter {
     )
 
     $unknown = [pscustomobject]@{
-        Known = $false; Entries = @(); SwitchOwners = @(); PositionalOrder = @(); PositionalAmbiguous = $true
+        Known = $false; Entries = @(); SwitchOwners = @(); PositionalOrder = @(); PositionalAmbiguous = $true; Validation = @{}
     }
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return $unknown }
     try {
@@ -345,6 +429,7 @@ function Get-BRAVOScriptDeclaredParameter {
         $entries = New-Object 'System.Collections.Generic.List[object]'
         $switchOwners = New-Object 'System.Collections.Generic.List[string]'
         $positional = New-Object 'System.Collections.Generic.List[object]'
+        $validation = @{}
         $ambiguous = $false
         $positionalBinding = $true
         $paramBlock = $ast.ParamBlock
@@ -369,7 +454,10 @@ function Get-BRAVOScriptDeclaredParameter {
                 $isSwitch = ($parameter.StaticType -eq [System.Management.Automation.SwitchParameter])
                 if ($isSwitch) { $switchOwners.Add($ownerName) }
                 $explicitPosition = $null
+                $parameterRules = New-Object 'System.Collections.Generic.List[object]'
                 foreach ($attribute in @($parameter.Attributes)) {
+                    $validationRule = Get-BRAVOParameterValidationRule -Attribute $attribute -StaticType $parameter.StaticType
+                    if ($null -ne $validationRule) { $parameterRules.Add($validationRule) }
                     if ($attribute.TypeName.Name -eq 'Parameter') {
                         $advanced = $true
                         foreach ($namedArgument in @($attribute.NamedArguments)) {
@@ -394,6 +482,7 @@ function Get-BRAVOScriptDeclaredParameter {
                         }
                     }
                 }
+                if ($parameterRules.Count -gt 0) { $validation[$ownerName] = $parameterRules.ToArray() }
                 if ($null -ne $explicitPosition) { $explicitCount++ }
                 if (-not $isSwitch) {
                     $positional.Add([pscustomobject]@{ Owner = $ownerName; Explicit = $explicitPosition; Index = $declarationIndex })
@@ -445,6 +534,7 @@ function Get-BRAVOScriptDeclaredParameter {
             SwitchOwners = $switchOwners.ToArray()
             PositionalOrder = @($order)
             PositionalAmbiguous = $ambiguous
+            Validation = $validation
         }
     } catch {
         return $unknown
@@ -499,16 +589,42 @@ function Test-BRAVOScriptPathIsBravoEntrypoint {
     return [bool]($ScriptPath -match '(?i)(^|[\\/])BRAVO_[A-Za-z0-9_]*\.ps1$')
 }
 
+function Test-BRAVOStockWindowsPowerShellPath {
+    # #496 B1: Exec.Command — рівно штатний Windows PowerShell 5.1: %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe
+    # або %SystemRoot%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe (після розкриття стабільних змінних, без урахування
+    # регістру, щодо справжнього SystemRoot). Голе `powershell`/`powershell.exe` (пошук у PATH), довільний каталог
+    # (напр. C:\Tools\powershell.exe), нерозкриті змінні, `..` — не штатні. Інсталятор реєструє завдання з повним
+    # шляхом System32 (BRAVO.Configuration.Derivation: PowerShellExecutable = Join-Path $env:SystemRoot ...).
+    param([AllowNull()][AllowEmptyString()][string]$Command)
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
+    $expanded = Expand-BRAVOTaskActionVariable -Text $Command.Trim().Trim('"').Trim()
+    if (@($expanded.Unsupported).Count -gt 0) { return $false }
+    $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+    if ([string]::IsNullOrWhiteSpace($systemRoot)) { return $false }
+    $candidate = ([string]$expanded.Text).Replace('/', '\')
+    foreach ($architectureDirectory in @('System32', 'SysWOW64')) {
+        $stock = $systemRoot.TrimEnd([char]92, [char]47) + '\' + $architectureDirectory + '\WindowsPowerShell\v1.0\powershell.exe'
+        if ([string]::Equals($candidate, $stock, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 function Get-BRAVOActionExecutableKind {
-    # Exec.Command -> PowerShell | Cmd | Other (за ім'ям файла, без урахування регістру,
+    # Exec.Command -> PowerShell | PowerShellUnverified | Cmd | Other (за ім'ям файла, без урахування регістру,
     # у лапках чи без, зі шляхом (%SystemRoot%\...) чи без). Аргументи розбираються як
     # синтаксис PowerShell лише для PowerShell; cmd.exe — обгортка, яку статично не розбираємо.
+    # PowerShell — лише штатний Windows PowerShell 5.1 (Test-BRAVOStockWindowsPowerShellPath); powershell(.exe) з
+    # іншого каталогу чи з PATH — PowerShellUnverified (який бінарник і як він розбере аргументи — невідомо).
     param([AllowNull()][AllowEmptyString()][string]$Command)
 
     if ([string]::IsNullOrWhiteSpace($Command)) { return 'Other' }
     $text = $Command.Trim().Trim('"').Trim()
     $leaf = ($text -split '[\\/]')[-1].Trim().Trim('"').ToLowerInvariant()
-    if ($leaf -eq 'powershell.exe' -or $leaf -eq 'powershell') { return 'PowerShell' }
+    if ($leaf -eq 'powershell.exe' -or $leaf -eq 'powershell') {
+        if (Test-BRAVOStockWindowsPowerShellPath -Command $text) { return 'PowerShell' }
+        return 'PowerShellUnverified'
+    }
     if ($leaf -eq 'pwsh.exe' -or $leaf -eq 'pwsh') { return 'Pwsh' }
     if ($leaf -eq 'cmd.exe' -or $leaf -eq 'cmd') { return 'Cmd' }
     return 'Other'
@@ -525,7 +641,8 @@ function Get-BRAVOPowerShellInvocationMode {
         $name = $Matches[1].ToLowerInvariant()
         if ('file'.StartsWith($name, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Mode = 'File'; Index = $i } }
         if ('command'.StartsWith($name, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Mode = 'Command'; Index = $i } }
-        if ('encodedcommand'.StartsWith($name, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Mode = 'EncodedCommand'; Index = $i } }
+        # -ec — окремий alias powershell.exe (не префікс слова EncodedCommand), поруч із префіксами -e, -en, -enc, ...
+        if ('encodedcommand'.StartsWith($name, [StringComparison]::Ordinal) -or $name -eq 'ec') { return [pscustomobject]@{ Mode = 'EncodedCommand'; Index = $i } }
     }
     return [pscustomobject]@{ Mode = $null; Index = -1 }
 }
@@ -642,6 +759,23 @@ function Get-BRAVOConfigPathReferenceFromItem {
 
     if (-not [bool]$Declared.Known) { & $fail 'param() скрипта недоступний — аргументи статично не змоделювати' }
 
+    # #496 B6: параметр із атрибутами перевірки значення (ValidateSet тощо). Значення, яке PowerShell відхилить, або
+    # атрибут, результат якого статично не визначити, -> Modelled=$false (Unknown): інакше скрипт міг би не запуститися
+    # взагалі, а дія отримала б визначений клас. Значення в причину не потрапляє (воно може бути секретом).
+    $checkValidation = {
+        param($Owner, $Value, $HasValue)
+        if (-not [bool]$Declared.Known) { return }
+        $rules = @()
+        if ($null -ne $Declared.Validation -and $Declared.Validation.ContainsKey($Owner)) { $rules = @($Declared.Validation[$Owner]) }
+        if ($rules.Count -eq 0) { return }
+        if (-not $HasValue) {
+            & $fail "параметр -$Owner має атрибути перевірки значення, а передано лише прапорець — результат статично не визначити"
+            return
+        }
+        $verdict = Test-BRAVOParameterValueValidation -Rule $rules -Value $Value
+        if (-not [bool]$verdict.Accepted) { & $fail "параметр -${Owner}: $($verdict.Reason)" }
+    }
+
     for ($i = 0; $i -lt $items.Count; $i++) {
         $current = $items[$i]
         if ($current.Kind -eq 'Opaque') { & $fail ([string]$current.Reason); continue }
@@ -683,6 +817,16 @@ function Get-BRAVOConfigPathReferenceFromItem {
             $valueItem = $items[$i + 1]
             [void]$consumed.Add($i + 1)
         }
+        # #496 B7: Windows PowerShell 5.1 не передає явний Boolean у script switch через -File (`-NoPause:$false`):
+        # прив'язка завершується помилкою до запуску скрипта.
+        if ($Form -eq 'File' -and $isSwitch -and [bool]$current.HasInline) {
+            & $fail "switch-параметр -$($current.Spelling) із inline-значенням у режимі -File: powershell.exe 5.1 не передає явний Boolean у switch скрипта через -File, прив'язка завершиться помилкою"
+        }
+        if ($isSwitch) {
+            & $checkValidation $owner $null $false
+        } elseif ($null -ne $valueItem -and $null -eq $valueItem.Reason) {
+            & $checkValidation $owner ([string]$valueItem.Text) $true
+        }
         if (-not $isConfig) {
             if (-not $isSwitch -and $null -eq $valueItem) { & $fail "параметр -$($current.Spelling) без значення" }
             if ($null -ne $valueItem -and $null -ne $valueItem.Reason) { & $fail "значення параметра -$($current.Spelling) динамічне" }
@@ -715,6 +859,9 @@ function Get-BRAVOConfigPathReferenceFromItem {
         } else {
             $order = @(@($Declared.PositionalOrder) | Where-Object { -not $boundOwners.Contains([string]$_) })
             if ($leftover.Count -gt $order.Count) { & $fail 'зайвий позиційний аргумент без слота в param() скрипта' }
+            for ($k = 0; $k -lt $leftover.Count -and $k -lt $order.Count; $k++) {
+                if ($null -eq $leftover[$k].Reason) { & $checkValidation ([string]$order[$k]) ([string]$leftover[$k].Text) $true }
+            }
             if (-not $boundOwners.Contains($canonical)) {
                 for ($k = 0; $k -lt $leftover.Count -and $k -lt $order.Count; $k++) {
                     if (-not [string]::Equals([string]$order[$k], $canonical, [StringComparison]::OrdinalIgnoreCase)) { continue }
@@ -1056,6 +1203,140 @@ function Get-BRAVOConfigPathTargetClassification {
     return (& $classify 'LegacyPrimary' $resolved 'BRAVO.config (legacy primary)')
 }
 
+function Test-BRAVOArgumentsHaveEncodedCommandToken {
+    # #496 B2: у аргументах є токен -EncodedCommand (будь-який префікс powershell.exe 5.1: -e, -ec, -en, -enc, ...).
+    # Для обгорток (cmd.exe, %ComSpec%) вміст такого токена не декодується: BRAVO_*.ps1 може ховатися в payload.
+    param([AllowNull()][AllowEmptyString()][string]$Arguments)
+
+    foreach ($match in [regex]::Matches([string]$Arguments, '(?<![A-Za-z0-9_])[-/]([A-Za-z]+)(?![A-Za-z0-9_])')) {
+        $tokenName = $match.Groups[1].Value.ToLowerInvariant()
+        if ('encodedcommand'.StartsWith($tokenName, [StringComparison]::Ordinal) -or $tokenName -eq 'ec') { return $true }
+    }
+    return $false
+}
+
+function Get-BRAVOEntrypointRuntimeDelegation {
+    # #496 B3: тонкі кореневі entrypoint-и, які самі НЕ викликають Import-BravoConfiguration, а делегують це доменному
+    # runtime-файлу (Invoke-BRAVO<Domain>Entrypoint -> modules\BRAVO.<Domain>\BRAVO.<Domain>.Runtime.ps1). Канонічне
+    # правило «production-код викликає loader з -DisallowLegacyPrimaryAutoDetect» і його перелік належать
+    # ci\BRAVOConfigV2CutoverGates.ps1 (Get-BRAVOProductionEntryPointRelativePath); модуль не може його імпортувати
+    # (сканує все дерево; ci\ не гарантовано поруч), тому тут лише відображення entrypoint -> runtime-файл. Дрейф
+    # із канонічним переліком ловить TaskConfigPath/EntrypointDelegationMatchesCutoverGateList у self-test.
+    return @{
+        'BRAVO_ARCHIV.ps1'       = @{ Command = 'Invoke-BRAVOArchiveEntrypoint'; Runtime = 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1' }
+        'BRAVO_MAINTENANCE.ps1'  = @{ Command = 'Invoke-BRAVOMaintenanceEntrypoint'; Runtime = 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1' }
+        'BRAVO_HEALTH.ps1'       = @{ Command = 'Invoke-BRAVOHealthEntrypoint'; Runtime = 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1' }
+        'BRAVO_DATA_RESTORE.ps1' = @{ Command = 'Invoke-BRAVODataRestoreEntrypoint'; Runtime = 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1' }
+    }
+}
+
+function Get-BRAVOScriptLoaderCallEvidence {
+    # #496 B3: AST-докази з тексту скрипта (лише розбір, файл не виконується; SEC-001: лише всередині
+    # TrustedRuntimeRoot, до і після розбору). Кожен виклик Import-BravoConfiguration класифікується за ТИМ САМИМ
+    # правилом, що й канонічний гейт (ci\BRAVOConfigV2CutoverGates.ps1): -DisallowLegacyPrimaryAutoDetect має бути
+    # прив'язаний явно й не як :$false / :0; splat без явного прапорця = не доведено.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$ScriptPath,
+        [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot
+    )
+
+    $unreadable = [pscustomobject]@{ Read = $false; LoaderCallCount = 0; UnguardedCallCount = 0; CommandName = @() }
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return $unreadable }
+    try {
+        if (-not (Test-BRAVOTaskLocalPathSafe -Path $ScriptPath -TrustedRoot $TrustedRuntimeRoot).Safe) { return $unreadable }
+        if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) { return $unreadable }
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$errors)
+        if ($null -eq $ast -or @($errors).Count -gt 0) { return $unreadable }
+        if (-not (Test-BRAVOTaskLocalPathSafe -Path $ScriptPath -TrustedRoot $TrustedRuntimeRoot).Safe) { return $unreadable }
+
+        $loaderCalls = 0
+        $unguardedCalls = 0
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        $commands = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst]
+                }, $true))
+        foreach ($command in $commands) {
+            $commandName = [string]$command.GetCommandName()
+            if ([string]::IsNullOrEmpty($commandName)) { continue }
+            $names.Add($commandName)
+            if (-not [string]::Equals($commandName, 'Import-BravoConfiguration', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $loaderCalls++
+            $flagBound = $false
+            foreach ($element in @($command.CommandElements)) {
+                if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and
+                    [string]::Equals($element.ParameterName, 'DisallowLegacyPrimaryAutoDetect', [StringComparison]::OrdinalIgnoreCase)) {
+                    $argumentText = if ($null -ne $element.Argument) { [string]$element.Argument.Extent.Text } else { '' }
+                    # Лише ствердне доведення: голий switch або літерал $true (дужки навколо допустимі). Усе інше
+                    # (:$false, :($false), :$змінна, :(вираз), :0, :1) — не доведено.
+                    $flagBound = $false
+                    if ($null -eq $element.Argument) {
+                        $flagBound = $true
+                    } else {
+                        $proofText = $argumentText.Trim()
+                        while ($proofText -match '^\((.*)\)$') { $proofText = $Matches[1].Trim() }
+                        $flagBound = [string]::Equals($proofText, '$true', [StringComparison]::OrdinalIgnoreCase)
+                    }
+                }
+            }
+            if (-not $flagBound) { $unguardedCalls++ }
+        }
+        return [pscustomobject]@{ Read = $true; LoaderCallCount = $loaderCalls; UnguardedCallCount = $unguardedCalls; CommandName = $names.ToArray() }
+    } catch {
+        return $unreadable
+    }
+}
+
+function Test-BRAVOScriptDisallowsLegacyAutoDetect {
+    # #496 B3: NoConfigPath (PASS «legacy BRAVO.config не виконується») можна видати лише для скрипта, у тексті якого
+    # доведено, що завантаження конфігурації не виконує auto-derived BRAVO.config:
+    #  (а) скрипт сам викликає Import-BravoConfiguration, і КОЖЕН виклик прив'язує -DisallowLegacyPrimaryAutoDetect; або
+    #  (б) це відомий тонкий entrypoint (Get-BRAVOEntrypointRuntimeDelegation), що викликає Invoke-BRAVO<Domain>Entrypoint,
+    #      а його доменний runtime-файл поруч (modules\...) викликає loader так само (а).
+    # Усе інше (застарілий/довільний BRAVO_*.ps1 у тому ж каталозі, виклик без прапорця, нечитабельний файл) — не доведено.
+    # Межа: статичний AST не доводить, що виклик досяжний у runtime і що модуль, який імпортує entrypoint, — той самий файл.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$ScriptPath,
+        [AllowNull()][AllowEmptyString()][string]$TrustedRuntimeRoot
+    )
+
+    $verdict = {
+        param($Proven, $Reason)
+        [pscustomobject]@{ Proven = [bool]$Proven; Reason = $Reason }
+    }
+    $own = Get-BRAVOScriptLoaderCallEvidence -ScriptPath $ScriptPath -TrustedRuntimeRoot $TrustedRuntimeRoot
+    if (-not [bool]$own.Read) {
+        return (& $verdict $false 'цільовий скрипт не вдалося безпечно прочитати й розібрати — виклик loader-а з -DisallowLegacyPrimaryAutoDetect не підтверджено')
+    }
+    if ([int]$own.LoaderCallCount -gt 0) {
+        if ([int]$own.UnguardedCallCount -gt 0) {
+            return (& $verdict $false 'цільовий скрипт містить виклик Import-BravoConfiguration без -DisallowLegacyPrimaryAutoDetect (відсутній, або значення не є голим switch чи літералом $true: :$false, :($false), :$змінна, :(вираз)) — auto-derived legacy BRAVO.config міг би виконуватися')
+        }
+        return (& $verdict $true $null)
+    }
+    $delegation = Get-BRAVOEntrypointRuntimeDelegation
+    $entryName = [IO.Path]::GetFileName($ScriptPath)
+    if (-not $delegation.ContainsKey($entryName)) {
+        return (& $verdict $false 'цільовий скрипт не містить виклику Import-BravoConfiguration і не є відомим тонким entrypoint-ом, що делегує завантаження конфігурації доменному runtime — cutover не підтверджено')
+    }
+    $entry = $delegation[$entryName]
+    $callsDomain = @($own.CommandName | Where-Object { [string]::Equals([string]$_, [string]$entry.Command, [StringComparison]::OrdinalIgnoreCase) })
+    if ($callsDomain.Count -eq 0) {
+        return (& $verdict $false "цільовий скрипт не викликає $($entry.Command) — делегування доменному runtime не підтверджено")
+    }
+    $runtimePath = Join-Path -Path (Split-Path -Path $ScriptPath -Parent) -ChildPath ([string]$entry.Runtime)
+    $runtimeEvidence = Get-BRAVOScriptLoaderCallEvidence -ScriptPath $runtimePath -TrustedRuntimeRoot $TrustedRuntimeRoot
+    if (-not [bool]$runtimeEvidence.Read) {
+        return (& $verdict $false 'доменний runtime-файл entrypoint-а відсутній або його не вдалося безпечно прочитати й розібрати — cutover не підтверджено')
+    }
+    if ([int]$runtimeEvidence.LoaderCallCount -eq 0 -or [int]$runtimeEvidence.UnguardedCallCount -gt 0) {
+        return (& $verdict $false 'доменний runtime-файл entrypoint-а не викликає Import-BravoConfiguration з -DisallowLegacyPrimaryAutoDetect у кожному виклику — cutover не підтверджено')
+    }
+    return (& $verdict $true $null)
+}
+
 function Get-BRAVOTaskConfigPathFinding {
     # Знахідки -ConfigPath для ОДНОГО завдання. Status: NoConfigPath | LegacyPrimary |
     # Local | Missing | Unknown. Завжди повертає масив (0 для не-BRAVO завдання).
@@ -1101,17 +1382,23 @@ function Get-BRAVOTaskConfigPathFinding {
         }
 
         $kind = Get-BRAVOActionExecutableKind -Command $command
+        # #496 B2: -EncodedCommand (будь-який префікс) в обгортці: payload не декодується, BRAVO_*.ps1 у ньому не виключено.
+        $encodedWrapper = Test-BRAVOArgumentsHaveEncodedCommandToken -Arguments $arguments
         if ($kind -eq 'Other') {
             # Exec.Command із %VAR% (напр. %ComSpec%) Task Scheduler розкриває у своєму середовищі:
             # що саме запуститься — невідомо. Якщо дія згадує BRAVO_*.ps1 — Unknown, а не мовчазний пропуск.
             if ($command -match '%[^%]+%' -and ($arguments -match $bravoPattern -or $workingDirectory -match $bravoPattern)) {
                 $findings.Add((& $newFinding 'Unknown' $null $null 'Exec.Command залежить від змінної середовища (розкривається Task Scheduler у власному середовищі), а аргументи/WorkingDirectory згадують BRAVO_*.ps1 — що саме запуститься, статично не визначити'))
+            } elseif ($command -match '%[^%]+%' -and $encodedWrapper) {
+                $findings.Add((& $newFinding 'Unknown' $null $null 'Exec.Command залежить від змінної середовища (розкривається Task Scheduler у власному середовищі), а аргументи містять -EncodedCommand (або його скорочення): декодований вміст не розібрано, згадка BRAVO_*.ps1 у ньому не виключена — що саме запуститься, статично не визначити'))
             }
             continue
         }
         if ($kind -eq 'Cmd') {
             if ($arguments -match $bravoPattern -or $workingDirectory -match $bravoPattern) {
                 $findings.Add((& $newFinding 'Unknown' $null $null 'обгортка cmd.exe, що згадує BRAVO_*.ps1 — аргументи статично не розібрано'))
+            } elseif ($encodedWrapper) {
+                $findings.Add((& $newFinding 'Unknown' $null $null 'обгортка cmd.exe з -EncodedCommand (або його скороченням) в аргументах: декодований вміст не розібрано, згадка BRAVO_*.ps1 у ньому не виключена — аргументи статично не розібрано'))
             }
             continue
         }
@@ -1120,6 +1407,10 @@ function Get-BRAVOTaskConfigPathFinding {
         $mention = ($arguments -match $bravoPattern -or $workingDirectory -match $bravoPattern -or
             ($null -ne $definition.CommandText -and [string]$definition.CommandText -match $bravoPattern))
         if (-not $mention) { continue }
+        if ($kind -eq 'PowerShellUnverified') {
+            $findings.Add((& $newFinding 'Unknown' $null $null 'powershell.exe запущено не зі штатного розташування Windows PowerShell 5.1 (%SystemRoot%\System32 або %SystemRoot%\SysWOW64, WindowsPowerShell\v1.0) — голе ім''я (пошук у PATH) чи інший каталог: який бінарник запуститься й як він розбере аргументи, статично не визначити'))
+            continue
+        }
         if ($kind -eq 'Pwsh') {
             $findings.Add((& $newFinding 'Unknown' $null $null 'pwsh.exe не моделюється (інші правила розбору аргументів і опцій, ніж у Windows PowerShell 5.1) — аргументи статично не розібрано'))
             continue
@@ -1147,6 +1438,11 @@ function Get-BRAVOTaskConfigPathFinding {
                             $scriptParent = ([IO.Path]::GetDirectoryName([string]$scriptResolution.Path)).TrimEnd([char]92, [char]47)
                             if (-not [string]::Equals($trustedFull, $scriptParent, [StringComparison]::OrdinalIgnoreCase)) {
                                 $trustReason = "ціль '$($scriptResolution.Path)' лежить в іншій інсталяції, ніж поточний runtime '$trustedFull' — cutover (без автозавантаження legacy BRAVO.config) цього runtime не перевірено"
+                            } else {
+                                # #496 B3: той самий каталог — ще не доказ: застарілий/довільний BRAVO_*.ps1 міг лишитися поруч.
+                                # Cutover доводиться текстом самої цілі (виклик loader-а з -DisallowLegacyPrimaryAutoDetect).
+                                $cutover = Test-BRAVOScriptDisallowsLegacyAutoDetect -ScriptPath ([string]$scriptResolution.Path) -TrustedRuntimeRoot $TrustedRuntimeRoot
+                                if (-not [bool]$cutover.Proven) { $trustReason = [string]$cutover.Reason }
                             }
                         } catch {
                             $trustReason = "не вдалося порівняти каталог цілі з поточним runtime (шлях не нормалізовано)"
