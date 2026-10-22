@@ -440,10 +440,12 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         $test4SystemRoot = Join-Path $rotationTestRoot "test04\Windows"
         $test4InstallDirectory = Join-Path $rotationTestRoot "test04\LIMS-NEW"
         [void](New-BRAVOLogRotationFixture -Directory $test4InstallDirectory -Name "bravo.exe" -Content "exe")
+        # Лексичний шлях під тестовим коренем: нічого не створюється на диску й не залежить від літер дисків хоста.
+        $test4ModelProjectFile = Join-Path $rotationTestRoot "test04\LIMS\MODEL\lims"
         [void](New-BRAVOLogRotationFixture `
             -Directory (Join-Path $test4SystemRoot "SysWOW64") `
             -Name "bravo.ini" `
-            -Content "[model]`r`nMODEL=D:\LIMS\MODEL\lims`r`n[Debug]`r`nFILE= `"TraceSRV.out`" `r`n")
+            -Content "[model]`r`nMODEL=$test4ModelProjectFile`r`n[Debug]`r`nFILE= `"TraceSRV.out`" `r`n")
         $test4Discovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $test4InstallDirectory `
             -Services @(New-BRAVOSyntheticBravoService -ExecutablePath (Join-Path $test4InstallDirectory "bravo.exe")) `
@@ -481,10 +483,11 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
 
         # --- Test 6: [Debug] без FILE -> помилка з назвами bravo.ini/[Debug]/FILE ---
         $test6SystemRoot = Join-Path $rotationTestRoot "test06\Windows"
+        $test6ModelProjectFile = Join-Path $rotationTestRoot "test06\LIMS\MODEL\lims"
         [void](New-BRAVOLogRotationFixture `
             -Directory (Join-Path $test6SystemRoot "SysWOW64") `
             -Name "bravo.ini" `
-            -Content "[model]`r`nMODEL=D:\LIMS\MODEL\lims`r`n[Debug]`r`n")
+            -Content "[model]`r`nMODEL=$test6ModelProjectFile`r`n[Debug]`r`n")
         $test6Discovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $rotationTestRoot `
             -Services @() `
