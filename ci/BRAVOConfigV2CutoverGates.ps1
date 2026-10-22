@@ -560,6 +560,14 @@ function Test-BRAVOConfigV2CutoverGates {
             if ($current -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
                 return $current
             }
+            # #239 (рев'ю PR #497, F1): на PS 5.1 "Read-..." у подвійних лапках без
+            # $-розширень парситься як StringConstantExpressionAst (перевірено); захисна
+            # гілка: Expandable без вкладених виразів теж константа (споживачі читають .Value).
+            # З вкладеними виразами ("$x") лишається неконстантною.
+            if ($current -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+                if ($current.NestedExpressions.Count -eq 0) { return $current }
+                return $null
+            }
             if ($current -is [System.Management.Automation.Language.ParenExpressionAst]) {
                 $current = $current.Pipeline
             } elseif ($current -is [System.Management.Automation.Language.PipelineAst]) {
@@ -858,6 +866,29 @@ function Test-BRAVOConfigV2CutoverGates {
             foreach ($legacyReaderCommandAst in $legacyReaderCommandAsts) {
                 $enclosingFunctionName = Get-BRAVOAstEnclosingFunctionName -AstNode $legacyReaderCommandAst
                 $invokedCommandName = $legacyReaderCommandAst.GetCommandName()
+                # #239 (рев'ю PR #497, F2): GetCommandName() повертає null,
+                # коли ціль команди - ParenExpressionAst (`& ('rdr')`) чи
+                # вираз у подвійних лапках (`& "rdr"`). Константну ціль
+                # розгортаємо спільним helper-ом; ціль `& ($cmd)` розгортається
+                # до змінної й далі йде звичайною гілкою змінної.
+                $firstCommandElement = $legacyReaderCommandAst.CommandElements | Select-Object -First 1
+                if ([string]::IsNullOrEmpty($invokedCommandName) -and
+                    $firstCommandElement -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+                    $unwrappedCommandTarget = Get-BRAVOAstConstantStringLiteral -AstNode $firstCommandElement
+                    if ($unwrappedCommandTarget) {
+                        $invokedCommandName = $unwrappedCommandTarget.Value
+                    } elseif ($firstCommandElement -is [System.Management.Automation.Language.ParenExpressionAst]) {
+                        $parenTarget = $firstCommandElement
+                        while ($parenTarget) {
+                            if ($parenTarget -is [System.Management.Automation.Language.VariableExpressionAst]) { break }
+                            if ($parenTarget -is [System.Management.Automation.Language.ParenExpressionAst]) { $parenTarget = $parenTarget.Pipeline }
+                            elseif ($parenTarget -is [System.Management.Automation.Language.PipelineAst] -and $parenTarget.PipelineElements.Count -eq 1) { $parenTarget = $parenTarget.PipelineElements[0] }
+                            elseif ($parenTarget -is [System.Management.Automation.Language.CommandExpressionAst]) { $parenTarget = $parenTarget.Expression }
+                            else { $parenTarget = $null }
+                        }
+                        if ($parenTarget) { $firstCommandElement = $parenTarget }
+                    }
+                }
                 if (-not [string]::IsNullOrEmpty($invokedCommandName)) {
                     if ($legacyReaderAliasNames.Contains($invokedCommandName)) {
                         [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через alias '$invokedCommandName', що вказує на legacy-рідер)")
@@ -877,7 +908,6 @@ function Test-BRAVOConfigV2CutoverGates {
                     }
                     continue
                 }
-                $firstCommandElement = $legacyReaderCommandAst.CommandElements | Select-Object -First 1
                 if ($firstCommandElement -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
                     continue
                 }

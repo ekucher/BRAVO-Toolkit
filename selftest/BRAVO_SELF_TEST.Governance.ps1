@@ -3944,6 +3944,18 @@ function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyP
         @{ Id = 'A50.AliasNameVariableNotAssignedToReaderAlias'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'other'; & `$cmd }" },
         @{ Id = 'A51.UnrelatedAliasNameInVariable'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias gci2 Get-ChildItem`nfunction F { `$cmd = 'gci2'; & `$cmd -Path X }" },
         @{ Id = 'A52.AliasNameVariableSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'rdr'; `$cmd = 'Get-ChildItem'; & `$cmd }" },
+        # --- рев'ю PR #497 (F1/F2): рядки в подвійних лапках та параметризована ціль команди ---
+        @{ Id = 'T08.DoubleQuotedAliasValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr `"Read-BRAVOLegacyPrimaryRawOverrides`"; rdr" },
+        @{ Id = 'T09.DoubleQuotedTypedRightHandSide'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [string]`$r = `"Read-BRAVOLegacyPrimaryRawOverrides`"; & `$r }" },
+        @{ Id = 'T10.DoubleQuotedUntypedRightHandSide'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = `"Read-BRAVOLegacyPrimaryRawOverrides`"; & `$r }" },
+        @{ Id = 'T11.ParenthesizedAliasNameAfterSetAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; & ('rdr')" },
+        @{ Id = 'T12.ParenthesizedLiteralVariableCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; `$cmd = 'rdr'; & (`$cmd)" },
+        @{ Id = 'T13.ParenthesizedDirectReaderName'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & ('Read-BRAVOLegacyPrimaryRawOverrides') -ConfigPath X }" },
+        @{ Id = 'T14.DoubleQuotedDirectReaderCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `"Read-BRAVOLegacyPrimaryRawOverrides`" -ConfigPath X }" },
+        @{ Id = 'T15.ExpandableStringWithNestedExpressionBenignName'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$n = 'Get'; `$r = `"`$n-ChildItem`"; & `$r }" },
+        @{ Id = 'T16.ParenthesizedBenignCommandName'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & ('Get-Date') }" },
+        @{ Id = 'T17.ParenthesizedBenignAlias'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias gci2 Get-ChildItem; & ('gci2') -Path X" },
+        @{ Id = 'T18.ParenthesizedVariableOfBenignLiteral'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; `$cmd = 'other'; & (`$cmd)" }
         @{ Id = 'A17.AliasChain'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Alias a1 Read-BRAVOLegacyPrimaryRawOverrides`nSet-Alias a2 a1`nfunction F { a2 }" },
         @{ Id = 'A18.AliasValueFromVariable'; Kind = 'MISSED'; Path = $matrixModule; Text = "`$v = 'Read-BRAVOLegacyPrimaryRawOverrides'`nSet-Alias rdr `$v`nfunction F { rdr }" },
         @{ Id = 'A19.SetItemAliasProvider'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Item -Path Alias:rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
