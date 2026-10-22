@@ -5359,7 +5359,11 @@ function Get-BAZAPendingFileCycleClassification {
         [string]$LocalRoot,
         [Nullable[datetime]]$SyncStartUtc = $null,
         [object]$SnapshotDrift = $null,
-        [object]$RemoteProbe = $null
+        [object]$RemoteProbe = $null,
+        # Залишок пост-аудиту з SFTP-несумісними іменами: не передається за
+        # дизайном (degraded), тож зміна такого файла під час циклу — не
+        # drift-порушення (як до #501).
+        [object[]]$IncompatiblePendingFiles = @()
     )
 
     $realMissing = New-Object System.Collections.Generic.List[object]
@@ -5381,6 +5385,26 @@ function Get-BAZAPendingFileCycleClassification {
             $normalizedRoot = [IO.Path]::GetFullPath($LocalRoot).TrimEnd('\', '/')
         } catch {
             $snapshotAvailable = $false
+        }
+    }
+    $incompatiblePendingRelativePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if ($snapshotAvailable) {
+        foreach ($incompatiblePending in @($IncompatiblePendingFiles)) {
+            if ($null -eq $incompatiblePending) { continue }
+            $incompatiblePathProperty = $incompatiblePending.PSObject.Properties['Path']
+            $incompatiblePath = if ($null -ne $incompatiblePathProperty) { [string]$incompatiblePathProperty.Value } else { '' }
+            try {
+                if (-not [string]::IsNullOrWhiteSpace($incompatiblePath) -and [IO.Path]::IsPathRooted($incompatiblePath)) {
+                    $incompatibleFull = [IO.Path]::GetFullPath($incompatiblePath).TrimEnd('\', '/')
+                    if ($incompatibleFull.StartsWith($normalizedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                        [void]$incompatiblePendingRelativePaths.Add($incompatibleFull.Substring($normalizedRoot.Length + 1))
+                    }
+                }
+            } catch {
+                # Невалідний шлях несумісного запису не зіставляється зі знімком:
+                # drift-виняток для нього не діє (fail-closed).
+                continue
+            }
         }
     }
     $boundaryTicks = $null
@@ -5525,6 +5549,9 @@ function Get-BAZAPendingFileCycleClassification {
             foreach ($modifiedItem in @($SnapshotDrift.Modified)) {
                 $modifiedPath = [string]$modifiedItem.RelativePath
                 if ($pendingRelativePaths.Contains($modifiedPath)) { continue }
+                # Несумісний файл, що досі в залишку, змінений під час циклу:
+                # не передається за дизайном, це degraded, а не drift.
+                if ($incompatiblePendingRelativePaths.Contains($modifiedPath)) { continue }
                 $snapshotEntry = $LocalSnapshot.Entries[$modifiedPath]
                 $modifiedFullPath = Join-Path -Path $normalizedRoot -ChildPath $modifiedPath
                 $probe = if ($probeComplete -and $RemoteProbe.Entries.ContainsKey($modifiedPath)) { $RemoteProbe.Entries[$modifiedPath] } else { $null }
@@ -5598,6 +5625,7 @@ function Get-BAZASynchronizationOutcome {
     $cycleClassification = if ($verificationSucceeded) {
         Get-BAZAPendingFileCycleClassification `
             -PendingFiles @($afterSplit.Retryable) `
+            -IncompatiblePendingFiles @($afterSplit.Incompatible) `
             -LocalSnapshot $LocalSnapshot `
             -LocalRoot $LocalRoot `
             -SyncStartUtc $SyncStartUtc `
@@ -5651,6 +5679,16 @@ function Get-BAZASynchronizationOutcome {
             if ($null -ne $afterPendingPath) { [void]$afterPendingPaths.Add($afterPendingPath) }
         }
     }
+    # Усі об'єкти пост-аудиту (і сумісні, і несумісні): об'єкт аудиту ДО,
+    # що досі в залишку, не зник. Несумісний об'єкт, якого вже немає, не
+    # можна довести у хмарі — це зникнення (ERROR), а не тихе зменшення залишку.
+    $afterAllPendingPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $afterSplit) {
+        foreach ($afterPending in @(@($afterSplit.Retryable) + @($afterSplit.Incompatible))) {
+            $afterPendingPath = & $getComparablePendingPath $afterPending
+            if ($null -ne $afterPendingPath) { [void]$afterAllPendingPaths.Add($afterPendingPath) }
+        }
+    }
     $driftViolationPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($driftViolation in @($snapshotDriftViolations)) {
         $driftViolationPath = & $getComparablePendingPath $driftViolation
@@ -5688,7 +5726,7 @@ function Get-BAZASynchronizationOutcome {
     # об'єкт хибною помилкою. Без проби, при неповній пробі, збої stat, відсутніх
     # збережених локальних полях чи розбіжності — $false (fail-closed).
     $testPreAuditObjectBackedUp = {
-        param([string]$Path, [string]$RelativePath, [bool]$IsDirectory)
+        param([string]$Path, [string]$RelativePath, [bool]$IsDirectory, [Nullable[long]]$BeforeSizeBytes = $null)
         try {
             $probeComplete = $null -ne $remoteProbe -and [bool]$remoteProbe.Complete -and $null -ne $remoteProbe.Entries
             if (-not ($probeComplete -and $remoteProbe.Entries.ContainsKey($RelativePath))) { return $false }
@@ -5702,6 +5740,10 @@ function Get-BAZASynchronizationOutcome {
                 $localEntry = $null
             } else {
                 if ($null -eq $entryProbe.LocalSize -or [string]::IsNullOrWhiteSpace([string]$entryProbe.LocalLastWriteTimeUtc)) { return $false }
+                # Зменшення файла відносно аудиту ДО = заміна чи мутація, а не
+                # передача (так само, як покриття успішним знімком); зростання
+                # (дописування LIMS) допустиме.
+                if ($null -ne $BeforeSizeBytes -and [long]$entryProbe.LocalSize -lt [long]$BeforeSizeBytes) { return $false }
                 $localEntry = [pscustomobject]@{ Size = [long]$entryProbe.LocalSize; LastWriteTimeUtc = [string]$entryProbe.LocalLastWriteTimeUtc }
             }
             return [bool](Test-BAZAVanishedSnapshotObjectBackedUp `
@@ -5721,9 +5763,9 @@ function Get-BAZASynchronizationOutcome {
         if ($null -eq $beforeSplit) {
             $snapshotConsistencyVerified = $false
         } else {
-            foreach ($beforePending in @($beforeSplit.Retryable)) {
+            foreach ($beforePending in @(@($beforeSplit.Retryable) + @($beforeSplit.Incompatible))) {
                 $beforePendingPath = & $getComparablePendingPath $beforePending
-                if ($null -ne $beforePendingPath -and $afterPendingPaths.Contains($beforePendingPath)) {
+                if ($null -ne $beforePendingPath -and $afterAllPendingPaths.Contains($beforePendingPath)) {
                     continue
                 }
                 # Покритий успішним знімком об'єкт перевіряє звіряння знімка.
@@ -5769,7 +5811,7 @@ function Get-BAZASynchronizationOutcome {
                     # пост-аудиті): той самий вид, для файла той самий розмір і час
                     # (з точністю SFTP) поточної локальної версії. Інакше —
                     # не доведено (fail-closed), без звернення до голого Exists.
-                    $omittedProven = & $testPreAuditObjectBackedUp $beforePendingPath $beforeRelativePath $beforeIsDirectory
+                    $omittedProven = & $testPreAuditObjectBackedUp $beforePendingPath $beforeRelativePath $beforeIsDirectory $beforeSize
                     if (-not $omittedProven) {
                         $snapshotUnavailableVanishedCount++
                         [void]$snapshotUnavailableVanishedPaths.Add($beforePendingPath)
@@ -5793,7 +5835,9 @@ function Get-BAZASynchronizationOutcome {
                         $failedIsDirectoryProperty = $beforePending.PSObject.Properties['IsDirectory']
                         $failedIsDirectory = $null -ne $failedIsDirectoryProperty -and [bool]$failedIsDirectoryProperty.Value
                         $failedRelative = $beforePendingPath.Substring($failedRootFull.Length + 1)
-                        $failedProven = & $testPreAuditObjectBackedUp $beforePendingPath $failedRelative $failedIsDirectory
+                        $failedBeforeSizeProperty = $beforePending.PSObject.Properties['SizeBytes']
+                        $failedBeforeSize = if ($null -ne $failedBeforeSizeProperty) { $failedBeforeSizeProperty.Value } else { $null }
+                        $failedProven = & $testPreAuditObjectBackedUp $beforePendingPath $failedRelative $failedIsDirectory $failedBeforeSize
                     }
                     if (-not $failedProven) {
                         $snapshotUnavailableVanishedCount++

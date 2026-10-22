@@ -3220,6 +3220,134 @@ try {
     ) -Name 'Archive/501/F32gPreAuditProofUsesOnlyStoredLocalStatAndFailsClosed' `
       -Failure "доказ лише зі збереженого локального stat: $($f32g | ConvertTo-Json -Compress)"
 
+    # F28c/F31g/F31h (follow-up, P2). Об'єкт аудиту ДО, якого немає в успішному
+    # (F28c) чи невдалому (F31g) знімку, замінено МЕНШИМ файлом після обходу
+    # знімка; WinSCP його передав. Зменшення = заміна чи мутація, не передача
+    # -> ПОМИЛКА (як F29b). F31h — контроль: дописаний (виріс) файл -> УСПІШНО.
+    $f28c = & $late501NewCase 'F28c'
+    $f28cPath = Join-Path $f28c.App 'KZ\2026\pending_2.pdf'
+    $rf28c = & $late501Run -CaseRoot $f28c.Root -Remote $f28c.Remote -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f28cPath),
+        (& $late501Op 'Snapshot' 'Write' $f28cPath -Size 77)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf28c.Manual.Success -and $rf28c.Label -eq 'ПОМИЛКА' -and $rf28c.ExitCode -eq 50 -and
+        -not $rf28c.App.IsComplete -and $rf28c.App.SnapshotUnavailableVanishedCount -eq 1
+    ) -Name 'Archive/501/F28cSnapshotOmittedObjectShrunkAfterWalkIsError' `
+      -Failure "об'єкт аудиту ДО поза знімком, зменшений після обходу, не доведений переданим; label=$($rf28c.Label) exit=$($rf28c.ExitCode) vanished=$($rf28c.App.SnapshotUnavailableVanishedCount)"
+
+    $f31g = & $late501NewCase 'F31g'
+    $f31gPath = Join-Path $f31g.App 'KZ\2026\pending_2.pdf'
+    $rf31g = & $late501Run -CaseRoot $f31g.Root -Remote $f31g.Remote -SnapshotFails -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f31gPath),
+        (& $late501Op 'Snapshot' 'Write' $f31gPath -Size 77)
+    )
+    Test-BRAVOCondition -Condition (
+        -not $rf31g.Manual.Success -and $rf31g.Label -eq 'ПОМИЛКА' -and $rf31g.ExitCode -eq 50 -and
+        -not $rf31g.App.IsComplete -and $rf31g.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf31g.App.CompletedCount -eq 1 -and
+        @(& $late501Errors $rf31g | Where-Object { $_.Message -like '*знімок циклу не створено*' }).Count -ge 1
+    ) -Name 'Archive/501/F31gSnapshotFailedPreAuditObjectShrunkIsError' `
+      -Failure "без знімка зменшений відносно аудиту ДО файл не є переданим; label=$($rf31g.Label) exit=$($rf31g.ExitCode) complete=$($rf31g.App.IsComplete) vanished=$($rf31g.App.SnapshotUnavailableVanishedCount) completed=$($rf31g.App.CompletedCount)"
+
+    $f31h = & $late501NewCase 'F31h'
+    $f31hPath = Join-Path $f31h.App 'KZ\2026\pending_2.pdf'
+    $rf31h = & $late501Run -CaseRoot $f31h.Root -Remote $f31h.Remote -SnapshotFails -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f31hPath),
+        (& $late501Op 'Snapshot' 'Write' $f31hPath -Size 300)
+    )
+    Test-BRAVOCondition -Condition (
+        $rf31h.Manual.Success -and $rf31h.Label -eq 'УСПІШНО' -and $rf31h.ExitCode -eq 0 -and
+        $rf31h.App.IsComplete -and $rf31h.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf31h.App.CompletedCount -eq 2
+    ) -Name 'Archive/501/F31hSnapshotFailedPreAuditObjectGrownIsSuccess' `
+      -Failure "без знімка дописаний відносно аудиту ДО файл, переданий і підтверджений у хмарі, не є помилкою; label=$($rf31h.Label) exit=$($rf31h.ExitCode) vanished=$($rf31h.App.SnapshotUnavailableVanishedCount) completed=$($rf31h.App.CompletedCount)"
+
+    # F32h. Одиничний контракт: розмір аудиту ДО проти збереженого локального розміру проби.
+    $f32h = & $late501Module {
+        $root = 'C:\selftest-f32h\root'
+        $time = New-Object DateTime 2026, 10, 20, 12, 30, 45, ([DateTimeKind]::Utc)
+        $mk = {
+            param($PreSize, [long]$LocalSize)
+            $entry = [pscustomobject]@{
+                Exists = $true; IsDirectory = $false; Size = $LocalSize; LastWriteTimeUtc = $time
+                LocalExists = $true; LocalIsDirectory = $false; LocalSize = $LocalSize; LocalLastWriteTimeUtc = $time.ToString('o')
+            }
+            $probe = [pscustomobject]@{ Complete = $true; Error = $null; Entries = @{ 'KZ\a.pdf' = $entry } }
+            $before = [pscustomobject]@{ Success = $true; PendingFiles = @([pscustomobject]@{ Action = 'UploadUpdate'; Path = "$root\KZ\a.pdf"; IsDirectory = $false; SizeBytes = $PreSize }) }
+            $after = [pscustomobject]@{ Success = $true; PendingFiles = @(); RemoteProbe = $probe }
+            (Get-BAZASynchronizationOutcome -WinSCPExitCode 0 -ComparisonBefore $before -ComparisonAfter $after `
+                -LocalSnapshot ([pscustomobject]@{ Success = $false; Error = 'selftest' }) -LocalRoot $root).SnapshotUnavailableVanishedCount
+        }
+        [pscustomobject]@{ Shrunk = (& $mk 200 150); Grown = (& $mk 200 250); NoPreSize = (& $mk $null 150) }
+    }
+    Test-BRAVOCondition -Condition (
+        $f32h.Shrunk -eq 1 -and $f32h.Grown -eq 0 -and $f32h.NoPreSize -eq 0
+    ) -Name 'Archive/501/F32hPreAuditProofRejectsShrinkOnly' `
+      -Failure "зменшення відносно аудиту ДО не доводить передачі, зростання/невідомий розмір доводить: $($f32h | ConvertTo-Json -Compress)"
+
+    # B1-B4, D1-D2. Несумісне за іменем ('inc.pdf') не передається за дизайном:
+    # залишок лишається degraded, зникнення — ПОМИЛКА, зміна під час циклу, поки
+    # файл досі в залишку, — не drift-порушення; зникнення/заміна типу лишаються ПОМИЛКОЮ.
+    $f501Inc = & $late501Module {
+        $root = 'C:\selftest-incompat\root'
+        $incPath = "$root\KZ\inc.pdf"
+        $time = New-Object DateTime 2026, 10, 20, 12, 30, 45, ([DateTimeKind]::Utc)
+        $issues = @([pscustomobject]@{ Path = $incPath; IsDirectory = $false })
+        $incItem = { param([long]$Size) [pscustomobject]@{ Action = 'UploadUpdate'; Path = $incPath; IsDirectory = $false; SizeBytes = $Size } }
+        $before = [pscustomobject]@{ Success = $true; PendingFiles = @(& $incItem 200) }
+        $failedSnapshot = [pscustomobject]@{ Success = $false; Error = 'selftest' }
+        $mkSnapshot = {
+            param([bool]$WithInc)
+            $entries = @{}
+            if ($WithInc) { $entries['KZ\inc.pdf'] = [pscustomobject]@{ Size = 200; LastWriteTimeUtc = $time.ToString('o') } }
+            $dirs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            [void]$dirs.Add('KZ')
+            [pscustomobject]@{ Success = $true; Entries = $entries; Directories = $dirs }
+        }
+        $noDrift = [pscustomobject]@{ Success = $true; TypeReplaced = @(); Vanished = @(); Modified = @() }
+        $run = {
+            param($Snapshot, $AfterPending, $Drift)
+            $after = [pscustomobject]@{ Success = $true; PendingFiles = @($AfterPending); RemoteProbe = $null }
+            if ($null -ne $Drift) { $after | Add-Member -NotePropertyName SnapshotDrift -NotePropertyValue $Drift }
+            Get-BAZASynchronizationOutcome -WinSCPExitCode 0 -ComparisonBefore $before -ComparisonAfter $after `
+                -IncompatibleIssues $issues -LocalSnapshot $Snapshot -LocalRoot $root
+        }
+        [pscustomobject]@{
+            B1 = (& $run $failedSnapshot @() $null)
+            B2 = (& $run $failedSnapshot @(& $incItem 200) $null)
+            B3 = (& $run (& $mkSnapshot $false) @() $noDrift)
+            B4 = (& $run (& $mkSnapshot $true) @(& $incItem 200) $noDrift)
+            D1 = (& $run (& $mkSnapshot $true) @(& $incItem 260) ([pscustomobject]@{ Success = $true; TypeReplaced = @(); Vanished = @(); Modified = @([pscustomobject]@{ RelativePath = 'KZ\inc.pdf' }) }))
+            D2 = (& $run (& $mkSnapshot $true) @(& $incItem 200) ([pscustomobject]@{ Success = $true; TypeReplaced = @(); Vanished = @([pscustomobject]@{ RelativePath = 'KZ\inc.pdf'; IsDirectory = $false }); Modified = @() }))
+        }
+    }
+    Test-BRAVOCondition -Condition (
+        $f501Inc.B1.SnapshotUnavailableVanishedCount -eq 1 -and -not $f501Inc.B1.IsComplete
+    ) -Name 'Archive/501/B1FailedSnapshotVanishedIncompatibleIsError' `
+      -Failure "зниклий несумісний об'єкт аудиту ДО (знімок не вдався) має бути помилкою; vanished=$($f501Inc.B1.SnapshotUnavailableVanishedCount) complete=$($f501Inc.B1.IsComplete)"
+    Test-BRAVOCondition -Condition (
+        $f501Inc.B2.SnapshotUnavailableVanishedCount -eq 0 -and $f501Inc.B2.IsDegraded -and $f501Inc.B2.IncompatibleRemainingCount -eq 1
+    ) -Name 'Archive/501/B2FailedSnapshotStillPendingIncompatibleStaysDegraded' `
+      -Failure "несумісний об'єкт, що досі в залишку, не зник; vanished=$($f501Inc.B2.SnapshotUnavailableVanishedCount) degraded=$($f501Inc.B2.IsDegraded)"
+    Test-BRAVOCondition -Condition (
+        $f501Inc.B3.SnapshotUnavailableVanishedCount -eq 1 -and -not $f501Inc.B3.IsComplete -and -not $f501Inc.B3.SnapshotConsistencyVerified
+    ) -Name 'Archive/501/B3SuccessfulSnapshotOmittedVanishedIncompatibleIsError' `
+      -Failure "несумісний об'єкт поза успішним знімком, якого немає в залишку, — помилка; vanished=$($f501Inc.B3.SnapshotUnavailableVanishedCount) complete=$($f501Inc.B3.IsComplete)"
+    Test-BRAVOCondition -Condition (
+        $f501Inc.B4.SnapshotUnavailableVanishedCount -eq 0 -and $f501Inc.B4.SnapshotDriftViolationCount -eq 0 -and
+        $f501Inc.B4.IsComplete -and $f501Inc.B4.IsDegraded
+    ) -Name 'Archive/501/B4SuccessfulSnapshotStillPendingIncompatibleStaysDegraded' `
+      -Failure "незмінений несумісний об'єкт зі знімка лишається degraded; vanished=$($f501Inc.B4.SnapshotUnavailableVanishedCount) violations=$($f501Inc.B4.SnapshotDriftViolationCount) degraded=$($f501Inc.B4.IsDegraded)"
+    Test-BRAVOCondition -Condition (
+        $f501Inc.D1.ChangedDuringSyncCount -eq 0 -and $f501Inc.D1.SnapshotDriftViolationCount -eq 0 -and
+        $f501Inc.D1.IsComplete -and $f501Inc.D1.IsDegraded
+    ) -Name 'Archive/501/D1ModifiedStillPendingIncompatibleIsDegradedNotDrift' `
+      -Failure "змінений під час циклу несумісний об'єкт, що досі в залишку, — degraded, не drift; changed=$($f501Inc.D1.ChangedDuringSyncCount) violations=$($f501Inc.D1.SnapshotDriftViolationCount) complete=$($f501Inc.D1.IsComplete)"
+    Test-BRAVOCondition -Condition (
+        $f501Inc.D2.SnapshotDriftViolationCount -eq 1 -and -not $f501Inc.D2.IsComplete -and
+        @($f501Inc.D2.CycleClassification.ChangedDuringSync | Where-Object { $_.Action -eq 'LocalVanished' }).Count -eq 1
+    ) -Name 'Archive/501/D2VanishedIncompatibleStaysError' `
+      -Failure "зниклий під час циклу несумісний об'єкт лишається ПОМИЛКОЮ; violations=$($f501Inc.D2.SnapshotDriftViolationCount) complete=$($f501Inc.D2.IsComplete)"
+
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
     # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.
