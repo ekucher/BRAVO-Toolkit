@@ -253,32 +253,60 @@ function Get-BRAVOBazaLocalSnapshot {
     # усе, що з'явиться ПІСЛЯ (виявлене пізнішим переліком, напр. під час
     # Health) — NewAfterCutoff. Це НЕ залежить від LastWriteTime файла (ТЗ
     # п.7) — залежить лише від моменту самого переліку.
+    #
+    # #501: legacy-шлях (Sync-FolderToSFTP) класифікує залишок пост-аудиту
+    # WinSCP за цим самим знімком. WinSCP бачить і приховані/системні
+    # файли, і каталоги, тому для нього потрібні -IncludeHiddenSystem та
+    # -IncludeDirectories: об'єкт, якого немає у знімку, вважається новим,
+    # і неповний знімок перетворив би справжню непередачу на попередження.
+    # Типовий виклик (без прапорців) не змінюється: Directories = $null.
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$LocalDirectory)
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalDirectory,
+        [switch]$IncludeHiddenSystem,
+        [switch]$IncludeDirectories
+    )
 
     $snapshotUtc = (Get-Date).ToUniversalTime()
     $entries = @{}
+    # Пряме присвоєння, не вираз if: колекція лишається одним об'єктом.
+    $directories = $null
+    if ($IncludeDirectories) {
+        $directories = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    }
     if (-not [IO.Directory]::Exists($LocalDirectory)) {
-        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Success = $false; Error = "каталог не знайдено: $LocalDirectory" }
+        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; Success = $false; Error = "каталог не знайдено: $LocalDirectory" }
     }
     try {
         $rootInfo = New-Object IO.DirectoryInfo($LocalDirectory)
         $normalizedRoot = $rootInfo.FullName.TrimEnd('\', '/')
-        foreach ($file in $rootInfo.EnumerateFiles('*', [IO.SearchOption]::AllDirectories)) {
-            if (([int]$file.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) -ne 0) {
+        # Пряме присвоєння результату методу зберігає лінивий перелік; вираз
+        # if { ... } розгорнув би все дерево в масив до початку циклу.
+        if ($IncludeDirectories) {
+            $items = $rootInfo.EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)
+        } else {
+            $items = $rootInfo.EnumerateFiles('*', [IO.SearchOption]::AllDirectories)
+        }
+        foreach ($item in $items) {
+            if (-not $IncludeHiddenSystem -and
+                ([int]$item.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) -ne 0) {
                 continue
             }
-            $relativePath = $file.FullName.Substring($normalizedRoot.Length).TrimStart('\', '/')
+            $relativePath = $item.FullName.Substring($normalizedRoot.Length).TrimStart('\', '/')
+            if ($item -is [IO.DirectoryInfo]) {
+                [void]$directories.Add($relativePath)
+                continue
+            }
             $entries[$relativePath] = [pscustomobject]@{
                 RelativePath = $relativePath
-                Size = [int64]$file.Length
-                LastWriteTimeUtc = $file.LastWriteTimeUtc.ToString('o')
-                FullPath = $file.FullName
+                Size = [int64]$item.Length
+                LastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o')
+                FullPath = $item.FullName
             }
         }
-        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Success = $true; Error = $null }
+        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; Success = $true; Error = $null }
     } catch {
-        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Success = $false; Error = $_.Exception.Message }
+        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; Success = $false; Error = $_.Exception.Message }
     }
 }
 
