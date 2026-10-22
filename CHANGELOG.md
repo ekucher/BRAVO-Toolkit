@@ -36,8 +36,11 @@
   рахується переданим, а перейменований рахується один раз. Рядок `Результат <компонент>: …` називає
   кількість таких об'єктів.
   Якщо знімок циклу не створено, об'єкт аудиту ДО, якого немає ні в пост-аудиті, ні локально, дає
-  ERROR. Раніше код WinSCP `0` з порожнім пост-аудитом давав `УСПІШНО`. Нові поля outcome —
-  `SnapshotUnavailableVanishedCount` і `SnapshotUnavailableVanished` (шляхи).
+  ERROR. Раніше код WinSCP `0` з порожнім пост-аудитом давав `УСПІШНО`. Те саме для успішного
+  знімка: об'єкт аудиту ДО, що зник до обходу знімка (його немає у знімку, в пост-аудиті й
+  локально), не рахується переданим і дає ERROR; об'єкти, що Є в успішному знімку, лишаються на
+  звіряння знімка. Нові поля outcome — `SnapshotUnavailableVanishedCount` і
+  `SnapshotUnavailableVanished` (шляхи) — несуть зниклі об'єкти в обох випадках.
   `Get-BRAVOBazaLocalSnapshot` отримав додаткову властивість `ReparsePointDirectoryCount` (лише з
   `-IncludeDirectories`). Outcome legacy-циклу отримав нові поля: `VanishedAfterBackupCount`,
   `SnapshotConsistencyVerified`, `SnapshotDriftViolationCount`. `SyncStartUtc` тепер означає межу

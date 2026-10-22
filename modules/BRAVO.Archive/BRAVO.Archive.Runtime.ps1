@@ -5510,15 +5510,30 @@ function Get-BAZASynchronizationOutcome {
     }
 
     # Знімок циклу запитано, але він не вдався (напр., об'єкт зник під час
-    # обходу): звіряти зникнення нема з чим. Об'єкт аудиту ДО, якого немає в
-    # пост-аудиті й немає локально, міг зникнути до передачі — консистентність
-    # не підтверджено (fail-closed). Без аудиту ДО довести нічого не можна.
-    $snapshotRequestedButFailed = $null -ne $LocalSnapshot -and -not (
+    # обходу), або вдався, але не містить об'єкта аудиту ДО (той зник між
+    # аудитом ДО і обходом знімка): звіряти зникнення нема з чим. Об'єкт аудиту
+    # ДО, якого немає в пост-аудиті, немає у знімку (або знімка немає) й немає
+    # локально, міг зникнути до передачі — консистентність не підтверджено
+    # (fail-closed). Об'єкти, що Є в успішному знімку, лишаються на звірянні
+    # знімка (SnapshotDrift). Без аудиту ДО довести нічого не можна.
+    $snapshotRequested = $null -ne $LocalSnapshot
+    $snapshotRequestedButFailed = $snapshotRequested -and -not (
         $null -ne $LocalSnapshot.PSObject.Properties['Success'] -and [bool]$LocalSnapshot.Success
     )
+    $snapshotCoverageRoot = $null
+    if ($snapshotRequested -and -not $snapshotRequestedButFailed -and
+        $null -ne $LocalSnapshot.PSObject.Properties['Entries'] -and $null -ne $LocalSnapshot.Entries -and
+        $null -ne $LocalSnapshot.PSObject.Properties['Directories'] -and $null -ne $LocalSnapshot.Directories -and
+        -not [string]::IsNullOrWhiteSpace($LocalRoot)) {
+        try {
+            $snapshotCoverageRoot = [IO.Path]::GetFullPath($LocalRoot).TrimEnd('\', '/')
+        } catch {
+            $snapshotCoverageRoot = $null
+        }
+    }
     $snapshotUnavailableVanishedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $snapshotUnavailableVanishedCount = 0
-    if ($verificationSucceeded -and $snapshotRequestedButFailed) {
+    if ($verificationSucceeded -and $snapshotRequested) {
         if ($null -eq $beforeSplit) {
             $snapshotConsistencyVerified = $false
         } else {
@@ -5526,6 +5541,15 @@ function Get-BAZASynchronizationOutcome {
                 $beforePendingPath = & $getComparablePendingPath $beforePending
                 if ($null -ne $beforePendingPath -and $afterPendingPaths.Contains($beforePendingPath)) {
                     continue
+                }
+                # Покритий успішним знімком об'єкт перевіряє звіряння знімка.
+                if ($null -ne $snapshotCoverageRoot -and $null -ne $beforePendingPath -and
+                    $beforePendingPath.StartsWith($snapshotCoverageRoot + '\',[StringComparison]::OrdinalIgnoreCase)) {
+                    $beforeRelativePath = $beforePendingPath.Substring($snapshotCoverageRoot.Length + 1)
+                    if ($LocalSnapshot.Entries.ContainsKey($beforeRelativePath) -or
+                        $LocalSnapshot.Directories.Contains($beforeRelativePath)) {
+                        continue
+                    }
                 }
                 if ($null -eq $beforePendingPath -or
                     -not ([IO.File]::Exists($beforePendingPath) -or [IO.Directory]::Exists($beforePendingPath))) {
@@ -6549,7 +6573,8 @@ exit
             # звіряння не вдалося.
             $driftReason = if ([int]$syncOutcome.SnapshotUnavailableVanishedCount -gt 0) {
                 $unavailablePreview = @(@($syncOutcome.SnapshotUnavailableVanished) | Select-Object -First 20) -join '; '
-                "знімок циклу не створено, а об'єкти аудиту ДО зникли локально без підтвердження передачі: $($syncOutcome.SnapshotUnavailableVanishedCount) ($unavailablePreview)"
+                $unavailableCause = if ($syncOutcome.SnapshotAvailable) { "знімок циклу не містить об'єктів аудиту ДО" } else { "знімок циклу не створено" }
+                "${unavailableCause}, а об'єкти аудиту ДО зникли локально без підтвердження передачі: $($syncOutcome.SnapshotUnavailableVanishedCount) ($unavailablePreview)"
             } elseif (-not $syncOutcome.SnapshotConsistencyVerified) {
                 "звіряння знімка циклу з локальним деревом не виконано"
             } else {

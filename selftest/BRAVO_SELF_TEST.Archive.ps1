@@ -2866,6 +2866,35 @@ try {
         $rf27b.App.IsComplete -and $rf27b.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf27b.App.CompletedCount -eq 2
     ) -Name 'Archive/501/F27bSnapshotUnavailableNothingVanishedIsSuccess' `
       -Failure "збій знімка без зниклих файлів аудиту ДО лишається УСПІШНО; label=$($rf27b.Label) exit=$($rf27b.ExitCode) completed=$($rf27b.App.CompletedCount)"
+
+    # F28 (Codex, PR #503, P1). Знімок циклу УСПІШНИЙ, але pending_2 зник між
+    # аудитом ДО і обходом знімка: у знімку його немає, пост-аудит порожній.
+    # Звіряння знімка його не бачить, тож без окремої перевірки цикл був би
+    # УСПІШНО попри втрачений файл -> ПОМИЛКА.
+    $f28 = & $late501NewCase 'F28'
+    $rf28 = & $late501Run -CaseRoot $f28.Root -Remote $f28.Remote -Ops @(& $late501Op 'BeforeAudit' 'Delete' (Join-Path $f28.App 'KZ\2026\pending_2.pdf'))
+    Test-BRAVOCondition -Condition (
+        -not $rf28.Manual.Success -and $rf28.Label -eq 'ПОМИЛКА' -and $rf28.ExitCode -eq 50 -and
+        $rf28.App.SnapshotAvailable -and -not $rf28.App.IsComplete -and -not $rf28.App.SnapshotConsistencyVerified -and
+        $rf28.App.SnapshotUnavailableVanishedCount -eq 1 -and $rf28.App.CompletedCount -eq 1 -and
+        @(& $late501Errors $rf28 | Where-Object { $_.Message -like '*BAZA_APP не підтверджено: знімок циклу не містить об*pending_2.pdf*' }).Count -eq 1
+    ) -Name 'Archive/501/F28SnapshotSucceededButMissingVanishedPendingIsError' `
+      -Failure "успішний знімок без зниклого файлу аудиту ДО не може дати УСПІШНО; label=$($rf28.Label) exit=$($rf28.ExitCode) available=$($rf28.App.SnapshotAvailable) verified=$($rf28.App.SnapshotConsistencyVerified) vanished=$($rf28.App.SnapshotUnavailableVanishedCount) completed=$($rf28.App.CompletedCount)"
+
+    # F28b. Контроль: pending_2 зник до знімка, але до старту WinSCP LIMS
+    # відтворив його (є локально, у знімку немає) -> WinSCP передав його, залишку
+    # немає, файл існує -> УСПІШНО, без хибної помилки.
+    $f28b = & $late501NewCase 'F28b'
+    $f28bPath = Join-Path $f28b.App 'KZ\2026\pending_2.pdf'
+    $rf28b = & $late501Run -CaseRoot $f28b.Root -Remote $f28b.Remote -Ops @(
+        (& $late501Op 'BeforeAudit' 'Delete' $f28bPath),
+        (& $late501Op 'Snapshot' 'Write' $f28bPath -Size 200)
+    )
+    Test-BRAVOCondition -Condition (
+        $rf28b.Manual.Success -and $rf28b.Label -eq 'УСПІШНО' -and $rf28b.ExitCode -eq 0 -and
+        $rf28b.App.IsComplete -and $rf28b.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf28b.App.CompletedCount -eq 2
+    ) -Name 'Archive/501/F28bSnapshotMissingButPresentAndTransferredIsSuccess' `
+      -Failure "файл аудиту ДО, якого немає у знімку, але який є локально і переданий, не є помилкою; label=$($rf28b.Label) exit=$($rf28b.ExitCode) vanished=$($rf28b.App.SnapshotUnavailableVanishedCount) completed=$($rf28b.App.CompletedCount)"
     # 16. Моніторинг: рядок "[BAZA_APP] Результат: <СЛОВО>" (заголовок ЗАВЕРШЕННЯ
     # РУЧНОЇ СИНХРОНIЗАЦIЇ дає компонент BAZA_APP), regex \S+ і мапінг шаблону;
     # пріоритет агрегації ERROR > WARNING > SUCCESS; код 10 = severity WARNING.
