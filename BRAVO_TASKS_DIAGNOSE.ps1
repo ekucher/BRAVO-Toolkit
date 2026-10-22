@@ -31,6 +31,12 @@ if (-not (Test-Path -LiteralPath $compatibilityHelpersPath -PathType Leaf)) {
     throw "Не знайдено PowerShell-модуль сумісності: $compatibilityHelpersPath"
 }
 Import-Module -Name $compatibilityHelpersPath -ErrorAction Stop
+# #281 / #154 (B5): read-only діагностика -ConfigPath у зареєстрованих завданнях.
+$schedulerDiagnosticsPath = Join-Path $scriptRoot 'modules\BRAVO.SchedulerDiagnostics\BRAVO.SchedulerDiagnostics.psd1'
+if (-not (Test-Path -LiteralPath $schedulerDiagnosticsPath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль діагностики Планувальника: $schedulerDiagnosticsPath"
+}
+Import-Module -Name $schedulerDiagnosticsPath -ErrorAction Stop
 # P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
 # ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту.
 $configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
@@ -609,6 +615,63 @@ try {
         "[INFO] MultipleInstances=$($schedulerSettings.MultipleInstances): за політикою IgnoreNew " +
         "новий тригер ПРОПУСКАЄТЬСЯ, якщо попередній екземпляр ще виконується."
     ) -ForegroundColor Gray
+
+    # #281 / #154 (B5): read-only доказ — які завдання BRAVO на цьому хості досі
+    # передають -ConfigPath на legacy BRAVO.config. Нічого не змінює (ні завдань,
+    # ні файлів), не потребує UAC (працює і з -InspectOnly) і НЕ впливає на код
+    # виходу: рішення щодо підтримки -ConfigPath на legacy-файл за власником.
+    Write-Host ""
+    Write-Host "=== LEGACY -ConfigPath У ЗАВДАННЯХ BRAVO (#281 / #154 B5, лише читання) ===" -ForegroundColor Cyan
+    try {
+        $legacyConfigPathScanRoot = $taskService.GetFolder("\")
+        # Правило «що loader приймає як legacy primary» належить loader-у: передаємо його валідатор.
+        $legacyConfigPathValidator = {
+            param($ConfigPath, $ConfigRoot)
+            Test-BravoLegacyConfiguration -ConfigPath $ConfigPath -ConfigRoot $ConfigRoot
+        }
+        $legacyConfigPathReport = Get-BRAVOLegacyConfigPathTaskReport `
+            -TaskFolder $legacyConfigPathScanRoot `
+            -LegacyConfigurationValidator $legacyConfigPathValidator `
+            -TrustedRuntimeRoot $scriptRoot
+        $legacyConfigPathFindings = @($legacyConfigPathReport.Findings)
+        foreach ($legacyConfigPathFinding in $legacyConfigPathFindings) {
+            $legacyConfigPathLine = Format-BRAVOConfigPathFindingLine -Finding $legacyConfigPathFinding
+            $legacyConfigPathColor = switch ([string]$legacyConfigPathLine.Level) {
+                'PASS' { 'Green' }
+                'WARN' { 'Yellow' }
+                default { 'Gray' }
+            }
+            Write-Host $legacyConfigPathLine.Text -ForegroundColor $legacyConfigPathColor
+        }
+        foreach ($legacyConfigPathProblem in @($legacyConfigPathReport.Problems)) {
+            Write-Host "[WARN] LegacyConfigPath: $legacyConfigPathProblem (потрібні права адміністратора для читання цього завдання?)" -ForegroundColor Yellow
+        }
+        $legacyConfigPathTaskCount = @($legacyConfigPathFindings | ForEach-Object { $_.TaskPath } | Select-Object -Unique).Count
+        Write-Host (
+            "[INFO] LegacyConfigPath: переглянуто завдань Планувальника: $($legacyConfigPathReport.TasksScanned); " +
+            "завдань BRAVO: $legacyConfigPathTaskCount; " +
+            "LegacyPrimary=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'LegacyPrimary' }).Count); " +
+            "Local=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'Local' }).Count); " +
+            "Missing=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'Missing' }).Count); " +
+            "Unknown=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'Unknown' }).Count); " +
+            "без -ConfigPath=$(@($legacyConfigPathFindings | Where-Object { $_.Status -eq 'NoConfigPath' }).Count); " +
+            "не прочитано=$(@($legacyConfigPathReport.Problems).Count)"
+        ) -ForegroundColor Gray
+        if ($legacyConfigPathTaskCount -eq 0) {
+            if (@($legacyConfigPathReport.Problems).Count -eq 0) {
+                Write-Host "[INFO] LegacyConfigPath: завдань із Exec-дією BRAVO_*.ps1 на цьому хості не знайдено." -ForegroundColor Gray
+            } else {
+                # Неповне сканування: відсутність знахідок не доводить відсутності завдань BRAVO.
+                Write-Host (
+                    "[WARN] LegacyConfigPath: серед успішно прочитаних визначень завдань із Exec-дією BRAVO_*.ps1 не знайдено, " +
+                    "але не вдалося прочитати елементів Планувальника: $(@($legacyConfigPathReport.Problems).Count) — " +
+                    "це не доказ відсутності таких завдань на цьому хості."
+                ) -ForegroundColor Yellow
+            }
+        }
+    } catch {
+        Write-Host "[WARN] LegacyConfigPath: перевірку не виконано: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
 
     if ($InspectOnly) {
         if ($registrationFailed) {
