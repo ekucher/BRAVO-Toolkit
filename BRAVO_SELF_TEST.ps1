@@ -4062,6 +4062,12 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             "Test-BAZAPathBlockedByIncompatibleName",
             "Split-BAZAPendingFilesByCompatibility",
             "Get-BAZASynchronizationOutcome",
+            # #501 (backport): Get-BAZASynchronizationOutcome тепер викликає
+            # класифікатор циклу та його допоміжні функції.
+            "Get-BAZAPendingFileCycleClassification",
+            "Test-BAZACreationClockTrusted",
+            "Test-BAZAPathHasReparsePoint",
+            "Test-BAZAVanishedSnapshotObjectBackedUp",
             "Get-BRAVOVSSSnapshotSourcePath",
             "Get-BRAVOVSSVolumeRoot",
             "Get-BRAVOUniqueVSSVolumes",
@@ -15923,6 +15929,11 @@ function Write-BRAVOLog {
     # MaintenanceDiskSpace: M1-M11, реальний виклик-сайт BRAVO_MAINTENANCE
     # (Invoke-BRAVOMaintenanceDiskSpaceCheck).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1')
+    # BazaLegacySync501: backport #501 на 5.2.x -- legacy Sync-FolderToSFTP
+    # класифікує залишок пост-аудиту за знімком (пізні файли = ПОПЕРЕДЖЕННЯ/10,
+    # не ПОМИЛКА/50); справжні Sync-FolderToSFTP ->
+    # Invoke-ManualBAZASFTPSynchronization, фейкові лише WinSCP і хмара.
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaLegacySync501.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
