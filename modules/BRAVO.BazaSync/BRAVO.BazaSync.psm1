@@ -260,6 +260,9 @@ function Get-BRAVOBazaLocalSnapshot {
     # -IncludeDirectories: об'єкт, якого немає у знімку, вважається новим,
     # і неповний знімок перетворив би справжню непередачу на попередження.
     # Типовий виклик (без прапорців) не змінюється: Directories = $null.
+    # ReparsePointDirectoryCount (лише з -IncludeDirectories) — кількість
+    # каталогів-junction/mount point у дереві: за ними може бути інший том із
+    # власним годинником, тож legacy-шлях тоді не довіряє CreationTime.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$LocalDirectory,
@@ -271,11 +274,13 @@ function Get-BRAVOBazaLocalSnapshot {
     $entries = @{}
     # Пряме присвоєння, не вираз if: колекція лишається одним об'єктом.
     $directories = $null
+    $reparsePointDirectoryCount = $null
     if ($IncludeDirectories) {
         $directories = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $reparsePointDirectoryCount = 0
     }
     if (-not [IO.Directory]::Exists($LocalDirectory)) {
-        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; Success = $false; Error = "каталог не знайдено: $LocalDirectory" }
+        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; ReparsePointDirectoryCount = $reparsePointDirectoryCount; Success = $false; Error = "каталог не знайдено: $LocalDirectory" }
     }
     try {
         $rootInfo = New-Object IO.DirectoryInfo($LocalDirectory)
@@ -295,6 +300,9 @@ function Get-BRAVOBazaLocalSnapshot {
             $relativePath = $item.FullName.Substring($normalizedRoot.Length).TrimStart('\', '/')
             if ($item -is [IO.DirectoryInfo]) {
                 [void]$directories.Add($relativePath)
+                if (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    $reparsePointDirectoryCount++
+                }
                 continue
             }
             $entries[$relativePath] = [pscustomobject]@{
@@ -304,10 +312,95 @@ function Get-BRAVOBazaLocalSnapshot {
                 FullPath = $item.FullName
             }
         }
-        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; Success = $true; Error = $null }
+        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; ReparsePointDirectoryCount = $reparsePointDirectoryCount; Success = $true; Error = $null }
     } catch {
-        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; Success = $false; Error = $_.Exception.Message }
+        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; ReparsePointDirectoryCount = $reparsePointDirectoryCount; Success = $false; Error = $_.Exception.Message }
     }
+}
+
+function Compare-BRAVOBazaLocalSnapshotToLiveTree {
+    # #501 (follow-up): звіряє знімок (з -IncludeDirectories) із живим деревом
+    # тим самим .NET-переліком. Пост-аудит WinSCP порівнює лише ЖИВЕ локальне
+    # дерево з хмарою, тож об'єкт знімка, який зник локально, у ньому не
+    # з'являється взагалі — виявити його можна лише тут.
+    #   Vanished     — шляху знімка в дереві більше немає;
+    #   TypeReplaced — шлях є, але іншого типу (файл <-> каталог);
+    #   Modified     — файл знімка є, але інші розмір або LastWriteTimeUtc.
+    # Один потоковий прохід; пам'ять — HashSet побачених ключів, для файлів
+    # той самий екземпляр рядка, що й у знімку (без копій). Нових об'єктів
+    # (поза знімком) функція не перелічує — їх класифікує пост-аудит.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Snapshot,
+        [Parameter(Mandatory = $true)][string]$LocalDirectory
+    )
+
+    $vanished = New-Object System.Collections.Generic.List[object]
+    $typeReplaced = New-Object System.Collections.Generic.List[object]
+    $modified = New-Object System.Collections.Generic.List[object]
+    $result = {
+        param([bool]$Success, [string]$ErrorText)
+        [pscustomobject]@{
+            Success = $Success
+            Error = $ErrorText
+            CheckedUtc = (Get-Date).ToUniversalTime()
+            Vanished = $vanished.ToArray()
+            TypeReplaced = $typeReplaced.ToArray()
+            Modified = $modified.ToArray()
+        }
+    }
+    if ($null -eq $Snapshot -or -not [bool]$Snapshot.Success -or
+        $null -eq $Snapshot.PSObject.Properties['Directories'] -or $null -eq $Snapshot.Directories) {
+        return (& $result $false 'знімок недоступний або без каталогів (-IncludeDirectories)')
+    }
+    if (-not [IO.Directory]::Exists($LocalDirectory)) {
+        return (& $result $false "каталог не знайдено: $LocalDirectory")
+    }
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    try {
+        $rootInfo = New-Object IO.DirectoryInfo($LocalDirectory)
+        $normalizedRoot = $rootInfo.FullName.TrimEnd('\', '/')
+        $items = $rootInfo.EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)
+        foreach ($item in $items) {
+            $relativePath = $item.FullName.Substring($normalizedRoot.Length).TrimStart('\', '/')
+            if ($item -is [IO.DirectoryInfo]) {
+                if ($Snapshot.Directories.Contains($relativePath)) {
+                    [void]$seen.Add($relativePath)
+                } elseif ($Snapshot.Entries.ContainsKey($relativePath)) {
+                    $snapshotKey = [string]$Snapshot.Entries[$relativePath].RelativePath
+                    [void]$seen.Add($snapshotKey)
+                    $typeReplaced.Add([pscustomobject]@{ RelativePath = $snapshotKey; WasDirectory = $false })
+                }
+                continue
+            }
+            if ($Snapshot.Entries.ContainsKey($relativePath)) {
+                $snapshotEntry = $Snapshot.Entries[$relativePath]
+                [void]$seen.Add([string]$snapshotEntry.RelativePath)
+                if ([int64]$item.Length -ne [int64]$snapshotEntry.Size -or
+                    $item.LastWriteTimeUtc.ToString('o') -ne [string]$snapshotEntry.LastWriteTimeUtc) {
+                    $modified.Add([pscustomobject]@{ RelativePath = [string]$snapshotEntry.RelativePath; IsDirectory = $false })
+                }
+            } elseif ($Snapshot.Directories.Contains($relativePath)) {
+                [void]$seen.Add($relativePath)
+                $typeReplaced.Add([pscustomobject]@{ RelativePath = $relativePath; WasDirectory = $true })
+            }
+        }
+    } catch {
+        return (& $result $false $_.Exception.Message)
+    }
+
+    foreach ($relativePath in $Snapshot.Entries.Keys) {
+        if (-not $seen.Contains($relativePath)) {
+            $vanished.Add([pscustomobject]@{ RelativePath = [string]$relativePath; IsDirectory = $false })
+        }
+    }
+    foreach ($relativePath in $Snapshot.Directories) {
+        if (-not $seen.Contains($relativePath)) {
+            $vanished.Add([pscustomobject]@{ RelativePath = [string]$relativePath; IsDirectory = $true })
+        }
+    }
+    return (& $result $true $null)
 }
 
 function Get-BRAVOBazaSyncPlan {
@@ -2389,6 +2482,7 @@ Export-ModuleMember -Function @(
     'Save-BRAVOBazaState',
     'New-BRAVOBazaCycleId',
     'Get-BRAVOBazaLocalSnapshot',
+    'Compare-BRAVOBazaLocalSnapshotToLiveTree',
     'Get-BRAVOBazaSyncPlan',
     'Test-BRAVOBazaRemoteNameCompatibility',
     'Test-BRAVOBazaRemoteDirectoryExists',
