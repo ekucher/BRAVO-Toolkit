@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "mode": "offline",
+  "budgetUsd": 60,
+  "perJobUsd": 2,
+  "maxConcurrency": 2,
+  "leaseSeconds": 900,
+  "retry": {
+    "maxAttempts": 4,
+    "baseDelayMs": 500,
+    "maxDelayMs": 20000,
+    "maxRetryAfterSec": 60
+  },
+  "timeouts": {
+    "requestTimeoutSec": 120
+  },
+  "minRequestIntervalMs": 250
+}
