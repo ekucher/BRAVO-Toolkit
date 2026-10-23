@@ -40,9 +40,14 @@ Role/model routing is defined by `.claude/ai-routing.json`; the full orchestrati
    confirm `PASS` vs `NOT RUN` yourself before relaying a result.
 5. **One full self-test at a time** on a machine; concurrent `BRAVO_SELF_TEST.ps1` runs flake.
    Regenerate `RUNTIME_MANIFEST.json` only through `ci\Update-BRAVORuntimeManifest.ps1 -Apply`.
-6. **Human-gated merge.** Branches, commits, pushes and draft PRs are yours; merging into
-   `developer`/`master`, force-push, closing issues, production config, backups and secrets require
-   the owner's explicit, scoped authorization each time.
+6. **Local-first publication, human-gated merge.** Task branches and local commits are yours at any
+   point of local work, including before the gate. Push and any PR, draft included, are yours only
+   after the local publication gate of `BRAVO_AGENT_POLICY.md` §13.12 has passed. Any `FAIL` of a
+   mandatory local check blocks publication. A mandatory check that is `NOT RUN` or `BLOCKED`, or a
+   `FAIL` reproduced on the base SHA with evidence of both runs, forbids publication without a
+   separate owner decision. Remote CI runs after the local gate and never replaces it.
+   Merging into `developer`/`master`, force-push, closing issues, production config, backups and
+   secrets require the owner's explicit, scoped authorization each time.
 7. **Commit hygiene.** No AI-authorship trailers in commit messages (`Tools\Check-AgentPolicy.ps1`
    blocks them in CI). Never publish chat/session links anywhere.
 8. **Report in the owner's language** (Ukrainian), short, with issue/PR/commit references and the
