@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Fix: Maintenance: невдалий `-ForceRestore` без стану чи з пошкодженим станом писав файл без полів слоту (#438).**
+  `BRAVO_RESTORE_STATE.json` тоді містив лише лічильник, без `Status`/`ScheduledOccurrence`/`Reason`. Читач
+  `5.2.4` звертається до `$restoreState.Status` напряму під StrictMode 2.0, тож після rollback на `5.2.4`
+  Maintenance падав би на кожному прогоні. Тепер відсутні поля слоту пишуться порожніми (як у
+  `Write-BRAVORestoreForcedOutcome`); `Pending` для слоту примусовий шлях і далі не створює. Перенесено з
+  `hotfix/5.2.5` (`1df6268`, знахідка рев'ю бекпорту #438). Перевірку
+  `Maintenance/RestoreBeginThenForceFailureSemanticsAndNoSlotFieldsFromForce` розширено: виразом читача `5.2.4` під
+  StrictMode 2.0 для відсутнього і пошкодженого стану.
+
 - **Security: runtime guard: ідентифікатор SemVer із кінцевим переносом рядка проходив як числовий.**
   У `ConvertTo-BRAVOComparableVersion` і `Compare-BRAVOComparableVersion` валідація та класифікація
   prerelease/build-ідентифікаторів закінчувалась якорем `$`, який у .NET збігається і перед кінцевим `\n`.

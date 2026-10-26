@@ -13749,10 +13749,13 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 # Дизайн: Force не пише write-ahead (Phase Begin + Force ->
                 # Write=false); збій Force рахується окремою спробою, але
                 # ніколи не знижує досягнутий ліміт (Write=false, стан
-                # незмінний). Невдалий Force БЕЗ наявного стану створює файл
-                # лише з полями лічильника/класу (без Status/
-                # ScheduledOccurrence/Reason — інакше 'Pending' замовляв би
-                # автоматичну реставрацію).
+                # незмінний). Невдалий Force БЕЗ наявного стану (або з
+                # пошкодженим) не вигадує 'Pending' для слоту (це замовляло б
+                # автоматичну реставрацію): Status/ScheduledOccurrence/Reason
+                # пишуться порожніми рядками, як у Write-BRAVORestoreForcedOutcome.
+                # Поля мусять БУТИ: читач v5.2.4 під StrictMode 2.0 звертається
+                # до $restoreState.Status напряму, і без поля rollback на 5.2.4
+                # падав би на кожному прогоні Maintenance.
                 $retry438BeginForce = & $retry438Module {
                     param($stateDir, $slot)
                     Set-StrictMode -Version 2.0
@@ -13785,6 +13788,30 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $r.ForceOnlyHasStatus = ($null -ne $forceOnlyState.PSObject.Properties['Status'])
                     $r.ForceOnlyHasSlot = ($null -ne $forceOnlyState.PSObject.Properties['ScheduledOccurrence'])
                     $r.ForceOnlyHasReason = ($null -ne $forceOnlyState.PSObject.Properties['Reason'])
+                    $r.ForceOnlySlotFieldsEmpty = $r.ForceOnlyHasStatus -and $r.ForceOnlyHasSlot -and $r.ForceOnlyHasReason -and
+                        ([string]$forceOnlyState.Status -ceq '') -and ([string]$forceOnlyState.ScheduledOccurrence -ceq '') -and ([string]$forceOnlyState.Reason -ceq '')
+                    # Вираз $scheduledSucceeded з v5.2.4 (без PSObject-guard) під
+                    # StrictMode 2.0: rollback-сумісність файлу стану.
+                    $legacy524Reader = {
+                        param($legacyState)
+                        try {
+                            $null = ($null -ne $legacyState -and
+                                [string]$legacyState.Status -eq 'Succeeded' -and
+                                [string]$legacyState.ScheduledOccurrence -eq $slot.ToString('o'))
+                            $true
+                        } catch { $false }
+                    }
+                    $r.ForceOnlyLegacy524ReaderOk = & $legacy524Reader $forceOnlyState
+                    # Пошкоджений стан + невдалий Force: quarantine, ліміт, поля слоту є.
+                    $script:stateRoot = Join-Path $stateDir 'corruptforce'
+                    [void](New-Item -ItemType Directory -Path $script:stateRoot -Force)
+                    [IO.File]::WriteAllText((Join-Path $script:stateRoot 'BRAVO_RESTORE_STATE.json'), '{"Status":', (New-Object Text.UTF8Encoding($false)))
+                    [void](Register-BRAVORestoreAttemptFailure -ScheduledOccurrence $slot -Fingerprint 'FILES:a.md||MISSING:' -ForceRestore $true -Limit 2)
+                    $corruptForceState = Read-BRAVORestoreState
+                    $r.CorruptForceCount = Get-BRAVORestoreRollbackRetryCount -State $corruptForceState
+                    $r.CorruptForceStatus = $(if ($null -ne $corruptForceState -and $null -ne $corruptForceState.PSObject.Properties['Status']) { [string]$corruptForceState.Status } else { '<absent>' })
+                    $r.CorruptForceLegacy524ReaderOk = & $legacy524Reader $corruptForceState
+                    $r.CorruptForceCopyCount = @(Get-ChildItem -LiteralPath $script:stateRoot -Filter 'BRAVO_RESTORE_STATE.json.corrupt-*').Count
                     # Автоматичний збій без стану лишається з Pending + слот (контраст).
                     $script:stateRoot = Join-Path $stateDir 'autoonly'
                     [void](Register-BRAVORestoreAttemptFailure -ScheduledOccurrence $slot -Fingerprint 'FILES:a.md||MISSING:' -Limit 2)
@@ -13799,11 +13826,13 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                         -not $retry438BeginForce.InProgressAfterForceFailure -and
                         -not $retry438BeginForce.ForceAtCapWrote -and $retry438BeginForce.StateUnchangedAtCap -and $retry438BeginForce.CountAtCap -eq 2 -and
                         $retry438BeginForce.ForceOnlyCount -eq 1 -and
-                        -not $retry438BeginForce.ForceOnlyHasStatus -and -not $retry438BeginForce.ForceOnlyHasSlot -and -not $retry438BeginForce.ForceOnlyHasReason -and
+                        $retry438BeginForce.ForceOnlySlotFieldsEmpty -and $retry438BeginForce.ForceOnlyLegacy524ReaderOk -and
+                        $retry438BeginForce.CorruptForceCount -eq 2 -and $retry438BeginForce.CorruptForceStatus -ceq '' -and
+                        $retry438BeginForce.CorruptForceLegacy524ReaderOk -and $retry438BeginForce.CorruptForceCopyCount -eq 1 -and
                         $retry438BeginForce.AutoOnlyStatus -ceq 'Pending'
                     ) `
                     -Name "Maintenance/RestoreBeginThenForceFailureSemanticsAndNoSlotFieldsFromForce" `
-                    -Failure "#438 (P2-2/P3-4): Force не пише write-ahead; Force-збій після авто-Begin дає лічильник 2 (окремі спроби) і гасить прапорець; Force-збій при досягнутому ліміті нічого не пише; Force-збій без стану не створює Status/ScheduledOccurrence/Reason (авто-збій створює Pending); факти: $($retry438BeginForce | ConvertTo-Json -Compress)"
+                    -Failure "#438 (P2-2/P3-4): Force не пише write-ahead; Force-збій після авто-Begin дає лічильник 2 (окремі спроби) і гасить прапорець; Force-збій при досягнутому ліміті нічого не пише; Force-збій без стану або з пошкодженим не вигадує Pending: Status/ScheduledOccurrence/Reason порожні, але присутні (читач v5.2.4 під StrictMode 2.0 не падає; пошкоджений стан — quarantine-копія і лічильник = ліміт); авто-збій створює Pending; факти: $($retry438BeginForce | ConvertTo-Json -Compress)"
 
                 # 4c. HoldServices-гейт Recovery (P2-3): реальні
                 # Get-BRAVOMaintenanceRecoverRestorePending +

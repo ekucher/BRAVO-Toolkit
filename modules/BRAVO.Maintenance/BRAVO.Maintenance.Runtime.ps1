@@ -763,8 +763,9 @@ function Get-BRAVOMaintenanceRestoreDecisionSnapshot {
     $todayMarkerPresent = (Test-Path -LiteralPath $TodayMarkerFile)
     $scheduledSucceeded = (Test-Path -LiteralPath $ScheduledMarkerFile) -or (
         $null -ne $restoreState -and
-        # #438 (P3-4): стан може не мати Status/ScheduledOccurrence (його створив
-        # невдалий -ForceRestore лише з лічильником) — StrictMode-безпечне читання.
+        # #438 (P3-4): StrictMode-безпечне читання — стан, записаний вручну
+        # оператором, може не мати Status/ScheduledOccurrence (BRAVO сам пише їх
+        # завжди, при невдалому -ForceRestore — порожніми).
         $null -ne $restoreState.PSObject.Properties['Status'] -and
         $null -ne $restoreState.PSObject.Properties['ScheduledOccurrence'] -and
         [string]$restoreState.Status -eq 'Succeeded' -and
@@ -2761,13 +2762,18 @@ function Write-BRAVORestoreRetryState {
         Write-Log -Message "restore state пошкоджено ($($readResult.Error)); копію збережено: $corruptCopyPath. Блокування автоматичної реставрації збережено." -Level 'ERROR'
     }
     $map = ConvertTo-BRAVORestoreStateMap -State $readResult.State
-    # #438 (P3-4): примусовий шлях НІКОЛИ не створює поля слоту
-    # (ScheduledOccurrence/Status/Reason): невдалий -ForceRestore при
-    # відсутньому стані не повинен вигадувати 'Pending' для планового слоту
-    # (це замовляло б автоматичну реставрацію). Лише лічильник/клас/
-    # write-ahead. Читач слоту (Main, $scheduledSucceeded) StrictMode-безпечний
-    # до відсутності цих полів.
-    if (-not $ForceRestore) {
+    # #438 (P3-4): примусовий шлях НІКОЛИ не вигадує слот: невдалий
+    # -ForceRestore при відсутньому чи пошкодженому стані не пише 'Pending'
+    # для планового слоту (це замовляло б автоматичну реставрацію). Відсутні
+    # поля слоту (ScheduledOccurrence/Status/Reason) він створює ПОРОЖНІМИ,
+    # як Write-BRAVORestoreForcedOutcome: читач v5.2.4 звертається до
+    # $restoreState.Status напряму під StrictMode 2.0, і файл без цих полів
+    # ламав би кожен прогін Maintenance після rollback на 5.2.4.
+    if ($ForceRestore) {
+        foreach ($legacyKey in @('ScheduledOccurrence', 'Status', 'Reason')) {
+            if (-not $map.Contains($legacyKey)) { $map[$legacyKey] = '' }
+        }
+    } else {
         if (-not $map.Contains('ScheduledOccurrence')) { $map['ScheduledOccurrence'] = $ScheduledOccurrence.ToString('o') }
         if (-not $map.Contains('Status')) { $map['Status'] = 'Pending' }
         if (-not $map.Contains('Reason')) { $map['Reason'] = $Reason }
