@@ -64,6 +64,25 @@ Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.
   `minimumRetainedVerifiedBackups` типово `2` і рахується по generation). Тимчасова мітигація для `5.2.4` —
   `enableFailedArchiveDeletion = $false` у local config. Перенесено з developer (PR #344, #363). Дефект
   присутній у `5.2.4`.
+- **Fix: Archive, Health: таймаут перевірки SFTP і lock `BRAVO_WINSCP` (#290).**
+  `Test-SFTPConnection` (Archive) після таймауту вбивала WinSCP і кидала виняток раніше, ніж
+  `Complete-BRAVOProcessOutputCapture` звільняла lock `BRAVO_WINSCP`. Викликачі (ручний `-SyncBAZA` і `Main`)
+  не мають `try`, тому прогін завершувався кодом 90 замість шляху «SFTP недоступний», а lock лишався
+  захопленим. Тепер при таймауті ресурси звільняються, у журнал пишеться ERROR, функція повертає `$false`, і
+  діє наявна обробка збою SFTP з кодом 50. Значення кодів завершення не змінено. В Archive і в SFTP-перевірці
+  Health (`Invoke-WinSCPHealthSession`) lock звільняється лише після підтвердженого завершення WinSCP: якщо
+  процес не завершився, lock лишається до завершення процесу BRAVO, а прогін іде фатальним шляхом, щоб не
+  запустити другий WinSCP паралельно. Регресія: `Archive/SftpConnectionTimeoutReturnsFalse`,
+  `Archive/SftpConnectionTimeoutReleasesWinSCPLock`, `Archive/SftpConnectionTimeoutLogsError`,
+  `Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive`, `Health/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive`.
+  Перенесено з developer (PR #387, #446).
+- **Security: Health: WinSCP-скрипт з обліковими даними створюється з захищеним DACL (#469).**
+  Командний файл SFTP-перевірки Health містить SFTP URL з обліковими даними і раніше створювався в
+  temp-каталозі з успадкованими правами. Тепер його шлях видає canonical `New-BRAVOWinSCPTemporaryScriptPath`
+  (`BRAVO.ArchiveRuntime`, той самий helper, що в Archive/DataRestore): файл одразу має protected DACL
+  (поточний обліковий запис, SYSTEM, Administrators) і прибирається через
+  `Remove-BRAVOWinSCPSensitiveTemporaryScript`. Якщо helper недоступний, SFTP-перевірка скасовується без
+  запису облікових даних. Регресія: `Health/WinSCPScriptUsesProtectedHelper`. Перенесено з developer (PR #469).
 - **Fix: Maintenance: рішення про реставрацію перевіряється після lock і перед `bravocmd.exe` (#476).**
   Рішення про реставрацію обчислювалось один раз до очікування lock (до `OperationLockWaitMinutes`). Якщо інший
   прогін за цей час виконав той самий слот, спожив тижневу квоту примусовою реставрацією, вичерпав ліміт повторів чи
