@@ -4,8 +4,8 @@
   "configSchemaVersion": 1,
   "stateSchemaVersion": 1,
   "updaterVersion": "1.0.0",
-  "releaseDate": "2026-10-08",
+  "releaseDate": "2026-10-26",
   "releaseChannel": "prerelease",
-  "buildId": "f414fad",
-  "sourceCommit": "f414fad056c1719e229132acd900ae5dcaea8757"
+  "buildId": "f9fded3",
+  "sourceCommit": "f9fded30182473836e887411a175ab08b07dcfde"
 }
