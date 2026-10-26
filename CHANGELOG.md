@@ -2,6 +2,14 @@
 
 ## Не випущено (developer)
 
+- **Fix: Archive: retention видаляв прострочену неперевірену COMPLETE generation, коли перевірених копій менше за мінімум (#335).**
+  COMPLETE generation, яку через транзієнтну помилку читання (ACL, зайнятий файл) не вдалося перевірити, не
+  потрапляла до захищених і видалялась за віком. Якщо перевірених копій менше за `minimumRetainedVerifiedBackups`,
+  це могла бути остання ціла копія. Тепер, поки захищених копій менше за мінімум, жодна COMPLETE за віком не
+  видаляється (WARNING «строк зберігання минув, але перевірених копій … менше за …»); коли мінімум виконано,
+  поведінка не змінилась. Перенесено з `hotfix/5.2.5` (`935ee07`, знахідка рев'ю бекпорту #335). Нова перевірка:
+  `BackupConsistency/ExpiredUnverifiedCompleteKeptWhileProtectedBelowMinimum`.
+
 - **Fix: Maintenance: невдалий `-ForceRestore` без стану чи з пошкодженим станом писав файл без полів слоту (#438).**
   `BRAVO_RESTORE_STATE.json` тоді містив лише лічильник, без `Status`/`ScheduledOccurrence`/`Reason`. Читач
   `5.2.4` звертається до `$restoreState.Status` напряму під StrictMode 2.0, тож після rollback на `5.2.4`
