@@ -20,7 +20,10 @@ Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.
   `VersionState/UnparsableVersionFailsClosed`, `VersionState/PrereleaseRecordsFullAndLegacyBase`,
   `VersionState/HugeNumericPrereleaseComparesNumerically`, `VersionState/PrereleaseAndBuildSyntaxValidated`,
   `VersionState/MalformedPrereleaseFailsClosed`, `VersionState/StateJsonAlwaysParseable`. Перенесено з developer
-  (`ebaef1f`, `5d9f86a`). Дефект присутній у `5.2.4` і `5.2.5-rc.1`–`rc.7`.
+  (`ebaef1f`, `5d9f86a`). Додатково до developer: ідентифікатори prerelease/build валідуються з якорем кінця рядка
+  `\z` замість `$` — інакше ідентифікатор із кінцевим переносом рядка (`5.2.5-rc.1`, `\n` перед `+build`)
+  проходив як числовий і міг виглядати новішим за записаний (`VersionState/NewlineInIdentifierFailsClosed`).
+  Дефект присутній у `5.2.4` і `5.2.5-rc.1`–`rc.7`.
 
 ## 5.2.5-rc.7 — 2026-10-26
 
