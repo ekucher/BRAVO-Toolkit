@@ -1,5 +1,58 @@
 # Changelog
 
+## 5.2.5 — 2026-10-26
+
+Stable promotion від прийнятого `5.2.5-rc.8` (тег `v5.2.5-rc.8`, коміт-stamp `8aacaac`, sourceCommit `36541ea`) —
+hotfix від stable `5.2.4` (RELEASE_POLICY §12). Промоція лише метаданих: функціональних runtime-змін відносно
+`5.2.5-rc.8` немає; `.ps1`/`.psm1`/`.psd1` не змінювались, `ModuleVersion` модулів уже дорівнює базовій версії
+`5.2.5`, `configSchemaVersion` і `stateSchemaVersion` не змінено.
+
+Зміст 5.2.5 відносно 5.2.4 — розділи `5.2.5-rc.1`–`5.2.5-rc.8` нижче. Головне:
+
+- runtime guard: SemVer-перевірка відкату версії для prerelease (rc.8);
+- ліміт повторів автоматичної реставрації після відкоту (#438), рішення про реставрацію після lock (#476),
+  код `43` і заборона старту служб після винятку `bravocmd.exe` (#477) (rc.7);
+- retention не видаляє повну (COMPLETE) резервну копію як «невдалу» (#335) (rc.7);
+- WinSCP: таймаут перевірки SFTP і lock до виходу процесу (#290), захищений DACL скрипта Health (#469) (rc.7);
+- хибний відкат моделі після реставрації (exit `43`) і порядок перевірки розмірів `.md` (rc.5, rc.6);
+- сумісність з Windows Server 2012/2012 R2 і .NET Framework < 4.6.1 (rc.2, rc.3), недосяжний UNC у DataRestore
+  (rc.1).
+
+### Результат acceptance `5.2.5-rc.8`
+
+Тестовий хост HOST-01 (Windows Server 2022, Windows PowerShell 5.1, .NET release 528449), production не задіяно.
+Кроки з правами адміністратора виконувались вручну та обмеженим runner-ом під `SYSTEM`.
+
+| Перевірка | Результат |
+|---|---|
+| T1: `BRAVO_SETUP -ValidateOnly`, `BRAVO_DRY_RUN` (зокрема `-TestAccess`), `BRAVO_SELF_TEST` — на `5.2.4` і на rc.8 | PASS |
+| T2: оновлення `5.2.4` → rc.8 зі збереженням `BRAVO.config` і `BRAVO.local.config`; відкат на `5.2.4` блокується кодом `35`; свідомий відкат (`BRAVO_ALLOW_DOWNGRADE=1`) і повторне оновлення на rc.8 | PASS |
+| T3: Archive, перелік generation, OutOfPlace-відновлення, Maintenance | PASS |
+| T3, #438: два невдалі відкоти → автоматичну реставрацію заблоковано; `-ForceRestore` (bravocmd `0`, `MainModel=OK`, `Rollback=NONE`) скидає лічильник | PASS |
+| T4: завдання Планувальника під `SYSTEM` за розкладом (Archive, Health, Maintenance) | PASS |
+| T5: runtime guard — `33` (змінений файл, сторонній скрипт), `34` (`Mode=Warn`), `35` (відкат) | PASS |
+
+### Межі доказу
+
+- Сценарій #335 на живому хості (транзієнтна помилка читання архіву простроченої generation) не відтворювався;
+  поведінку покривають регресійні перевірки self-test.
+- Для rc.8 не повторено прогони на Windows Server 2012/2012 R2 і на хості з .NET Framework 4.5.x.
+
+**Відомі проблеми (не виправлено в 5.2.5):**
+
+- Ті самі, що для `5.2.5-rc.7` (див. розділ нижче): #422 (з мітигацією
+  `'maintenanceSettings.Retention.FailedArchiveDays'`), #300, #501 і retention backup generation після перенесення
+  сховища.
+- **VSS при ручному запуску Archive з профілю з не-ASCII шляхом.** Сценарій `diskshadow` і metadata `.cab`
+  створюються в `%TEMP%` поточного користувача; сценарій записується в UTF-8 без BOM, а `diskshadow` читає його як
+  ANSI, тож кириличний шлях профілю в `SET METADATA` ламається: `diskshadow` повертає `3`, Archive — `40`. Завдання
+  Планувальника під `SYSTEM` (`%TEMP%` = `C:\Windows\Temp`) не зачеплені. Обхід для ручного запуску: перед
+  запуском задати ASCII-каталог у `TEMP`/`TMP`. Є і в `5.2.4`.
+- **Maintenance у режимі лише локальних копій щоночі завершується кодом `10`.** При
+  `componentSettings.SFTP.Enabled = $false` архівація Trace/exchangAPI для кожної групи пише WARNING «SFTP-сесія
+  недоступна — передачу відкладено», хоча для режиму без SFTP очікується PASS/SKIPPED. Дані не втрачаються:
+  локальні добові архіви створюються, джерела зберігаються. Є і в `5.2.4` (з `5.2.2`).
+
 ## 5.2.5-rc.8 — 2026-10-26
 
 Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.7` (нижче).
