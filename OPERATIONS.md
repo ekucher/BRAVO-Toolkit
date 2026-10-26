@@ -751,7 +751,10 @@ Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='disk','Ntfs'} -M
 >   остання повна пара `before`/`after` переживає.
 > - **Сумісність.** Файл стану без нових полів (`RollbackRetryCount`,
 >   `RollbackSignature`, `RestoreAttemptInProgress`) означає 0 спроб; повернення
->   на `5.2.4` чи `5.2.5-rc.6` лічильник не використовує й втрачає.
+>   на `5.2.4` чи `5.2.5-rc.6` лічильник не використовує й втрачає. Поля
+>   `Status`, `ScheduledOccurrence` і `Reason` BRAVO пише завжди (після
+>   невдалого `-ForceRestore` без попереднього стану — порожніми), тож `5.2.4`
+>   після rollback читає файл без помилок.
 
 **Симптом.** `BRAVO_DATA_RESTORE.ps1` завершився кодом `43`; у підсумку
 компоненти мають статус `ПОМИЛКА`, `ВІДКОЧЕНО` або `ПОМИЛКА ВІДКАТУ`.
