@@ -1211,7 +1211,7 @@ try {
         $readOut = $null
         $readErrorType = ''
         try { $readOut = Get-BRAVOCredentialSecret -Target $sftpTarget } catch { $readErrorType = $_.Exception.GetType().FullName }
-        # Codex P1: пошкоджений реєстр ЛИШАЄТЬСЯ в стані модуля (як у
+        # рев'ю P1: пошкоджений реєстр ЛИШАЄТЬСЯ в стані модуля (як у
         # реальному процесі). Набір маскування має кинути фіксоване
         # повідомлення, а не виняток самого реєстру (у ньому — секрет).
         $maskThrew = $false
@@ -1292,7 +1292,7 @@ try {
         $readOut = $null
         $readErrorType = ''
         try { $readOut = Get-BRAVOCredentialSecret -Target $sftpTarget } catch { $readErrorType = $_.Exception.GetType().FullName }
-        # Codex P1: пошкоджений реєстр лишається в стані модуля.
+        # рев'ю P1: пошкоджений реєстр лишається в стані модуля.
         $invokeError = ''
         try {
             Invoke-BRAVOMaintenanceOwnLogUpload

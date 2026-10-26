@@ -2179,7 +2179,7 @@ function Invoke-BRAVOBazaMutationAcceptanceCore {
     #      атомарна точка Save-BRAVOBazaState).
     # Семантика rename-not-delete і fail-closed на першій помилці —
     # незмінна: одна канонічна реалізація, без дублювання policy
-    # (.claude/rules/05-architecture.md, "Single implementation policy").
+    # (docs/engineering/architecture.md, "Single implementation policy").
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$State,

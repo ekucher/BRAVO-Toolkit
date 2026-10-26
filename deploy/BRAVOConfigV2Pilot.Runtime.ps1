@@ -27,7 +27,7 @@
 # означало б або (а) дублювати canonical merge/delta/schema-алгоритм
 # другий раз, або (б) виконувати його проти ЧУЖОГО $InstallRoot з
 # підмінених модулів — обидва варіанти забороняє
-# .claude/rules/05-architecture.md ("Політика єдиної реалізації"). Preflight
+# docs/engineering/architecture.md ("Політика єдиної реалізації"). Preflight
 # (Invoke-BRAVOPilotPreflight) явно й fail-closed перевіряє наявність усіх
 # перелічених вище canonical інструментів на сервері ПЕРЕД будь-якою
 # mutating-операцією.

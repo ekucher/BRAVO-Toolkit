@@ -181,8 +181,7 @@ capture + переписаний loader без mandatory `BRAVO.config` + Config
 DefaultValue adapter + security-invariant integration + 25
 regression-тестів + real-server acceptance checklist) має надто великий
 blast radius для одного review-циклу і суперечить принципу "мінімальний
-повний зворотно-сумісний крок" (`.claude/CLAUDE.md`, "Minimal scope of
-change"). Тому:
+повний зворотно-сумісний крок" (`docs/engineering/README.md`, «Дисципліна змін»). Тому:
 
 - **PR A (цей PR):** `modules/BRAVO.Configuration` — canonical
   `Get-BRAVODefaultConfiguration` (built-in raw defaults, включно з

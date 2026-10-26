@@ -180,30 +180,10 @@ jobs:
           }
           if ($failed) { exit 1 }
 
-      # Агентна політика та маршрутизація моделей — блокуючі перевірки.
-      # Check-AgentPolicy.ps1 охороняє канонічну поверхню політики (включно з
-      # межами fallback і узгодженістю .claude/ai-routing.json з файлами
-      # агентів), Test-AIRouting.ps1 — фактичну поведінку PreToolUse-хука
-      # .claude/hooks/validate-agent-routing.ps1 через реальні exit-коди.
-      - name: Agent policy / AI routing matrix
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & powershell.exe -NoProfile -File .\Tools\Check-AgentPolicy.ps1
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: AI routing hook tests
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & powershell.exe -NoProfile -File .\.claude\hooks\tests\Test-AIRouting.ps1
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
       # Ненав'язливе попередження про можливий дрейф документації. Навмисно
       # НЕ блокуюче: правило евристичне, і блокуючий варіант першого ж дня
       # породив би фіктивні записи в CHANGELOG.md заради зеленого CI.
-      # Рішення, чи потрібен запис, лишається за людиною або агентом
-      # documentation.
+      # Рішення, чи потрібен запис, лишається за автором змін.
       - name: Документація — попередження про дрейф (не блокує)
         if: github.event_name == 'pull_request'
         shell: powershell
@@ -223,7 +203,7 @@ jobs:
           })
           $changelogTouched = @($changed | Where-Object { $_ -ceq 'CHANGELOG.md' }).Count -gt 0
           if ($observable.Count -gt 0 -and -not $changelogTouched) {
-              Write-Host "::warning::Files with a potentially observable effect changed ($($observable -join ', ')) but CHANGELOG.md was not touched in this PR. Dispatch the documentation agent, or confirm that no entry is needed."
+              Write-Host "::warning::Files with a potentially observable effect changed ($($observable -join ', ')) but CHANGELOG.md was not touched in this PR. Add an entry, or confirm that no entry is needed."
           }
           exit 0
 

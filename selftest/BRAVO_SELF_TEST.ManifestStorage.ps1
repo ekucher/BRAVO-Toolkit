@@ -968,7 +968,7 @@ function Get-BRAVOFileHash {
             -Name "BackupConsistency/UnknownComponentTypeKeepsGenerationAndWarns" `
             -Failure "generation з типом компонента, відсутнім в ArchiveDefinitions, не повинна ні видалятися, ні мовчки випадати з retention: manifest і архіви мають лишитися, а WARNING називати тип"
 
-        # Сценарій 7 (Codex на #344): перебудова шляхів fail-closed.
+        # Сценарій 7 (рев'ю #344): перебудова шляхів fail-closed.
         # 7a: прострочений FAILED manifest у перенесеному сховищі посилається
         # на ім'я ІНШОЇ (поточної) generation. Перебудова дала б канонічний
         # шлях чужого архіву, і retention видалив би його в обхід поточної

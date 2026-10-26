@@ -7910,11 +7910,11 @@ function Get-BRAVORestoreArchiveMainFiles {
 
     $enumeratedFiles = @()
     try {
-        # Codex P2 (раунд 2): Test-Path за ACL / збою провайдера може
+        # рев'ю P2 (раунд 2): Test-Path за ACL / збою провайдера може
         # записати non-terminating error і нічого не повернути — це не
         # доказ відсутності каталогу, тож -ErrorAction Stop веде в той
         # самий fail-closed catch, що й збій Get-ChildItem.
-        # Codex P2 (раунд 3): налаштований каталог — буквальний шлях
+        # рев'ю P2 (раунд 3): налаштований каталог — буквальний шлях
         # (-LiteralPath): з -Path символи [ / ] у назві каталогу були б
         # шаблоном (наявний каталог «відсутній» чи збіг із сусіднім).
         # Шаблон імені файлу лишається в -Filter.
@@ -7984,7 +7984,7 @@ function Remove-OldRestoreArchives {
         # 7z t, ті самі WARNING/ERROR і прапорці exit 41), БЕЗ жодного
         # видалення. Main використовує його, коли сесій ≤ ArchivesKeepCount.
         [switch]$ReportOnly,
-        # #424 (Codex P2, раунд 3): необов'язковий облік кроку очистки:
+        # #424 (рев'ю P2, раунд 3): необов'язковий облік кроку очистки:
         # IntegrityFailed = $true, коли цей виклик виставив прапорці exit 41
         # (збій переліку, 7z t, жодної підтвердженої точки відновлення).
         # Глобальний Boolean не показує нового збою, якщо попередня фаза
@@ -8151,7 +8151,7 @@ function Remove-OldRestoreArchives {
     # #300 / #424: жодної придатної точки відновлення не лишилось —
     # критично (exit 41) незалежно від етапу, на якому забраковано сесії
     # (SHA512 чи 7z t), навіть якщо окремі збої старіших сесій були лише
-    # WARNING. Codex P1 (раунд 3): раніше умова вимагала збою 7z t, і сесії,
+    # WARNING. рев'ю P1 (раунд 3): раніше умова вимагала збою 7z t, і сесії,
     # забраковані вже на SHA512 (hash-файл відсутній / некоректний / не
     # збігається / не читається), давали лише exit 10. Видалення це не
     # розширює: без підтвердженої точки $groupsToKeep і $groupsToDelete
@@ -8263,7 +8263,7 @@ function Remove-OldRestoreArchives {
         Write-Log "Видалення сесії: $sessionTime ($($group.Count) файлів)..." -Level "INFO"
         
         # Видаляємо всі файли цієї сесії (основні архіви та контрольні суми)
-        # #424 (Codex P2, раунд 3): -LiteralPath — той самий буквальний
+        # #424 (рев'ю P2, раунд 3): -LiteralPath — той самий буквальний
         # каталог, який перевіряв Get-BRAVORestoreArchiveMainFiles, а не
         # сусідній, що збігся б із шаблоном [ / ].
         $sessionFiles = Get-ChildItem -LiteralPath $Path -ErrorAction SilentlyContinue | 
@@ -12325,7 +12325,7 @@ $restoreArchiveDeleteCandidateGroups = @()
 # #424: кількість усіх сесій архівів реставрації (без валідації) — для
 # гілки «лише перевірка», коли сесій ≤ ArchivesKeepCount.
 $restoreArchiveGroupCount = 0
-# #424 (Codex P2, раунд 3): власний облік збою цілісності архівів
+# #424 (рев'ю P2, раунд 3): власний облік збою цілісності архівів
 # реставрації для статусу кроку очистки (Remove-OldRestoreArchives -Outcome
 # і збій переліку нижче). Глобальний criticalErrorOccurred не показує нового
 # збою, якщо його вже виставила попередня фаза.
@@ -12584,7 +12584,7 @@ $cleanupOperationFileCandidateCount = $traceOldLogs.Count + $expiredCompressedLo
 $cleanupOperationStatus = Get-BRAVOMaintenanceStepStatus `
     -CriticalBefore $cleanupCriticalBefore `
     -WarningsBefore $cleanupWarningsBefore
-# #424 (Codex P2, раунд 3): збій цілісності архівів реставрації в цьому
+# #424 (рев'ю P2, раунд 3): збій цілісності архівів реставрації в цьому
 # кроці — FAIL і тоді, коли criticalErrorOccurred уже виставила попередня
 # фаза (снепшот $cleanupCriticalBefore тоді не бачить нового збою).
 if ([bool]$restoreArchiveIntegrityOutcome['IntegrityFailed']) {

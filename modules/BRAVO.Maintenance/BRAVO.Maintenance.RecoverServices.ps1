@@ -164,7 +164,7 @@ function Test-BRAVOServiceRecoveryArchiveLockHolder {
     # (Archive / BackupCatchUp / BAZASync: запис operation=Archive з pid і
     # processStartTime, процес живий — Test-BRAVOProcessAlive). Лише для
     # тексту INFO і WARNING «відновлення відкладено до завершення бекапу»:
-    # відновлення без lock-а немає (рев'ю PR #432, Codex раунд 2).
+    # відновлення без lock-а немає (рев'ю PR #432, раунд 2).
     param(
         [AllowNull()][object]$Holder,
         [Parameter(Mandatory = $true)][string]$HostName
@@ -297,7 +297,7 @@ function Send-BRAVOMaintenanceServiceRecoveryNotification {
 }
 
 function Send-BRAVOMaintenanceServiceRecoveryBackupDeferralWarning {
-    # Рев'ю PR #432 (Codex, раунд 2, P1): operation-lock тримає живий
+    # Рев'ю PR #432 (раунд 2, P1): operation-lock тримає живий
     # BRAVO_ARCHIV, а -FailedKeys не працюють — WARNING «служба не працює;
     # відновлення відкладено до завершення бекапу» не частіше разу на
     # BackupDeferralWarningMinutes на службу. Lock не наш, тож state-файл
@@ -559,13 +559,13 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
         return 0
     }
 
-    # Рев'ю PR #432 (A-P3-4 / B-P3-3, Codex P1): перші хвилини після старту
+    # Рев'ю PR #432 (A-P3-4 / B-P3-3, рев'ю P1): перші хвилини після старту
     # ОС служби піднімає boot-тригер (-RunMissedRestoreOnly, з урахуванням
     # HoldServices); event- чи daily-тригер профілю не випереджає його. Для
     # HoldServices вікно виводиться із затримки boot-тригера Recovery
     # (Restore.StartupDelayMinutes), а поки пропущена реставрація чекає
     # ($automaticRestoreDue runtime: персистентний BRAVO_RESTORE_STATE.json),
-    # гейт закритий без обмеження часу (Codex, раунд 2).
+    # гейт закритий без обмеження часу (раунд 2).
     $restoreSettings = $null
     $maintenanceSettingsValue = Get-Variable -Name maintenanceSettings -ValueOnly -ErrorAction SilentlyContinue
     if ($null -ne $maintenanceSettingsValue -and $maintenanceSettingsValue -is [System.Collections.IDictionary] -and $maintenanceSettingsValue.Contains('Restore')) { $restoreSettings = $maintenanceSettingsValue.Restore }
@@ -595,7 +595,7 @@ function Invoke-BRAVOMaintenanceRecoverServicesSteps {
     }
 
     # Крок 3: operation-lock без очікування; зайнятий — код 20 без змін служб.
-    # Рев'ю PR #432 (Codex, раунд 2, P1): відновлення без lock-а немає навіть
+    # Рев'ю PR #432 (раунд 2, P1): відновлення без lock-а немає навіть
     # під BRAVO_ARCHIV — той може звільнити lock посеред циклу, і тоді на
     # профіль накладуться нічний Maintenance чи DataRestore. Для живого
     # BRAVO_ARCHIV — WARNING «відновлення відкладено до завершення бекапу»
@@ -867,7 +867,7 @@ function Invoke-BRAVOMaintenanceServiceRecoveryUnderLock {
     # Маркер знімається, коли кожну службу, яку профіль зупинив, знову
     # запущено: впалі до профілю служби профіль не зупиняв, їх наступну
     # спробу веде пауза FR-5 (маркер затулив би їх як OwnedByBravo).
-    # Рев'ю PR #432 (Codex, P2): службу міг запустити хтось інший (оператор,
+    # Рев'ю PR #432 (P2): службу міг запустити хтось інший (оператор,
     # SCM) поки збирались журнали — тоді цикл її не запускав, але вона
     # працює. Фінальний стан перечитується: Running — не збій; нечитабельний
     # стан — як і раніше, «зупинено, але не запущено».

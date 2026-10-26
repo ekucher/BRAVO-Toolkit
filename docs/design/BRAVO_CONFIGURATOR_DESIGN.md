@@ -1,4 +1,4 @@
-# BRAVO Configurator — заморозка архітектури (Agent 0)
+# BRAVO Configurator — заморозка архітектури (етап 0)
 
 > Статус (оновлено): architecture freeze (§1-9) завершено, і весь описаний
 > цикл реалізовано й змерджено в `developer`: PR #112 (P0 backend), PR #113
@@ -30,7 +30,7 @@
 > acceptance-запису.
 >
 > Розділи нижче (початково §9 "Відкрите питання для власника перед стартом
-> Agent 1-6", і end-of-§12.6 "STOP після звіту, без merge") збережено як
+> етапів 1-6", і end-of-§12.6 "STOP після звіту, без merge") збережено як
 > historical design-gate record того, що обговорювалось/вирішувалось на
 > кожному етапі; в частині "implementation merged" вони більше не
 > відображають поточний production-стан (backend/UI/Presets/Credentials/
@@ -52,7 +52,7 @@
 > як опис стану до Issue #216.
 
 Статус (первинний): **DRAFT — architecture freeze для перегляду перед
-стартом Agent 1-6.**
+стартом етапів 1-6.**
 Гілка: `feat/bravo-configurator` (первинно базована на `origin/developer` @
 `9d0ece8`; перебазована на `origin/developer` @ `0e63fdc` після інтеграції
 `hotfix/5.2.2` — PR #111, "P0 reconciliation after 5.2.2" нижче, §2).
@@ -98,7 +98,7 @@
 - Заборонені для override (явно в шаблоні): похідні блоки (`sourcePaths`,
   `archiveDirs`, `bazaAppPaths`, `bazaWWWPaths`, `archiveDefinitions`),
   `discoverySettings`, `toolIntegritySettings`, runtime-шляхи
-  (`ScriptPath`/`HelperPath`). Schema-inventory (Agent 1) повинен
+  (`ScriptPath`/`HelperPath`). Schema-inventory (етап 1) повинен
   класифікувати ці шляхи як `ReadOnly=$true`/non-configurable, не як
   "забуті" — вони показуються в Effective view, але без editor control.
 
@@ -120,7 +120,7 @@ SFTP/SMB master-child семантики. `Get-BRAVOEffectiveSynchronizationConf
 вимагає canonical resolver. Централізація цієї логіки в новий
 `Get-BRAVOEffective*` API була визнана окремим, ризикованим, cross-cutting
 рефакторингом, який не варто змішувати з фіче-роботою Configurator
-(`.claude/CLAUDE.md`, розділ «Рефакторинг»: «Не поєднуй широкий
+(`docs/engineering/README.md`, розділ «Рефакторинг»: «Не поєднуй широкий
 рефакторинг з непов'язаними фічами, фіксами, промоцією релізу,
 оптимізацією чи форматуванням»).
 
@@ -197,7 +197,7 @@ modules/BRAVO.Configurator/
   BRAVO.Configurator.Persistence.psm1     — baseline-hash, atomic apply, rollback
   BRAVO.Configurator.Presets.psd1         — preset definitions (data-only)
   BRAVO.Configurator.Presets.psm1         — preset application onto Model
-  BRAVO.Configurator.Credentials.psm1     — Credential Manager status adapter (Agent 6)
+  BRAVO.Configurator.Credentials.psm1     — Credential Manager status adapter (етап 6)
   BRAVO.Configurator.UI.psm1              — WinForms shell, schema-driven controls
 ```
 
@@ -207,7 +207,7 @@ Model → {Schema, Effective, Validation} → Persistence`. UI ніколи не
 не є новим "Common/Utils" dumping-ground — кожен має один чіткий контракт
 нижче.
 
-## 4. Контракт schema-дескриптора (Agent 1)
+## 4. Контракт schema-дескриптора (етап 1)
 
 ```powershell
 @{
@@ -230,7 +230,7 @@ Model → {Schema, Effective, Validation} → Persistence`. UI ніколи не
 `BRAVO.local.config.example`/`BRAVO.config`; не вигадувати нові формулювання,
 що суперечать існуючій документації.
 
-## 5. Контракт Model API (Agent 2)
+## 5. Контракт Model API (етап 2)
 
 Одна `Setting` (immutable snapshot + explicit mutation function, без
 прихованого стану):
@@ -252,7 +252,7 @@ Clear-BRAVOConfiguratorOverride -Model -Path        -> Model'  (OverridePresent=
 Update-BRAVOConfiguratorEffective -Model            -> Model'  (перераховує §2 child-процесом; batched, не per-keystroke)
 ```
 
-## 6. Persistence-транзакція (Agent 3)
+## 6. Persistence-транзакція (етап 3)
 
 15-крокова pipeline із задачі §5.2: Load → baseline hash → candidate (temp,
 зі збереженням невідомих/newer ключів — §5.1) → parse
@@ -340,7 +340,7 @@ config-семантичної валідації; вона й далі відс�
 Console-Logging / Credentials / Effective configuration) — узгоджується з
 138-key inventory (§1, після P0 reconciliation).
 
-## 8. План тестування (Agent 7)
+## 8. План тестування (етап 7)
 
 Мінімум із §22 вихідного документа, плюс: **regression test для §2 Effective
 child-process механізму** — canonical loader, викликаний Configurator-ом,
@@ -348,13 +348,13 @@ child-process механізму** — canonical loader, викликаний Co
 `BRAVO_ARCHIV.ps1`/`BRAVO_DRY_RUN.ps1` на ідентичному fixture
 (характеризаційний тест, не дублюючий reimplementation).
 
-## 9. Відкрите питання для власника перед стартом Agent 1-6
+## 9. Відкрите питання для власника перед стартом етапів 1-6
 
 Обсяг цієї задачі (§18-22 вихідного документа: ~9 модулів, WinForms UI,
 persistence, presets, credentials-адаптер, повний test suite, docs) —
 багатоденний обсяг роботи. Architecture freeze (цей документ) завершено;
 перед масовим кодуванням потрібне рішення власника про темп/розбивку
-подальшої роботи на окремі review-порції (Agent 1+2+3 backend спочатку,
+подальшої роботи на окремі review-порції (етапи 1+2+3 backend спочатку,
 або паралельний запуск усіх — впливає на розмір і кількість наступних
 PR-ів згідно §20 задачі). **Вирішено: backend спочатку (P0, завершено й
 merged), UI/Presets/Credentials/Preview — окрема ітерація (P1, цей

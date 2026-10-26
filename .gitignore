@@ -38,17 +38,17 @@ artifacts/
 # BRAVO.local.config.example.
 BRAVO.local.config
 
-# Claude Code local runtime state — генерується інструментом на робочій
-# станції розробника (журнали хуків, збережені транскрипти/задачі сесій,
-# особисті permission-override'и, git worktree-метадані самого Claude
-# Code, lock-файл scheduled tasks). Нічого з цього не є частиною
-# комплекту BRAVO і може містити вміст приватних сесій — не повинно
-# потрапити в git при випадковому `git add -A`.
-.claude/logs/
-.claude/task-history/
-.claude/worktrees/
-.claude/settings.local.json
-.claude/scheduled_tasks.lock
+# Локальний стан інструментів розробника — генерується на робочій станції
+# (журнали, збережені задачі, особисті налаштування, worktree-метадані,
+# конфігурації локальних інструментів з абсолютними шляхами). Нічого з
+# цього не є частиною комплекту BRAVO і може містити приватний вміст — не
+# повинно потрапити в git при випадковому `git add -A`.
+.claude/
+.codex/
+.agents/
+.mcp.json
+/CLAUDE.md
+/AGENTS.md
 
 # Робочий каталог сторонньої аудит-прогонки (unlazy): власний формат звітів
 # і findings, не формат acceptance-доказів цього репозиторію. Лежить у корені
@@ -57,8 +57,3 @@ BRAVO.local.config
 .unlazy/
 .unlazy.zip
 
-# Конфігурація MCP-серверів Claude Code — містить абсолютні шляхи до збірок
-# на КОНКРЕТНІЙ робочій станції (той самий клас, що BRAVO.local.config і
-# WinSCP.ini вище). Трекається лише шаблон .mcp.json.example; без локального
-# .mcp.json bridge codex-agent не стартує й гейти codex-* недосяжні.
-.mcp.json
