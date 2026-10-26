@@ -48,9 +48,8 @@ Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
 $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-# Свіжість накопичувальних оновлень Windows тут навмисно НЕ перевіряється:
-# це health-метрика, а не умова виконання обслуговування. Її місце в
-# BRAVO_HEALTH, який для цього й існує. Тут вона лише додавала WARNING (а
+# Свіжість накопичувальних оновлень Windows Toolkit не перевіряє ніде
+# (ні тут, ні в BRAVO_HEALTH). Тут вона лише додавала WARNING (а
 # отже, ненульовий код завершення 10) до операції, на результат якої вік
 # патчів не впливає. Перевірки платформи (ОС, build, PowerShell, .NET,
 # архітектура, API) лишаються вище й на місці.
@@ -254,6 +253,54 @@ $RestoreWindowEnd = if ($MaintenanceConfig.Restore -is [System.Collections.IDict
     "03:00"
 }
 $RESTORE_ARCHIVES_KEEP_COUNT = [int]$MaintenanceConfig.Restore.ArchivesKeepCount
+# Поріг «малого» файлу MODEL для самоперевірки реставрації (Compare-FileSizes).
+# Файли, менші за поріг ДО реставрації, НЕ оцінюються відсотковим правилом
+# (>= 50%) і правилом «після <= MinSizeBytes»: легітимне ущільнення
+# невеликої таблиці під час repair (реальний випадок: 4,5 КБ -> 2,0 КБ,
+# -55,6%) давало хибний CRITICAL, відкат моделі й exit 43. Критичними для
+# малих файлів лишаються лише зникнення файлу (незмінна логіка відсутніх
+# файлів) та обнулення до 0 байт. Файли від порогу й більші перевіряються
+# незмінним правилом (>= 50% або <= MinSizeBytes після реставрації).
+#
+# Fail-closed: некоректне значення (не ціле число, від'ємне, понад 100 МБ)
+# НЕ вимикає перевірку і НЕ розширює послаблення на великі файли — замість
+# нього діє типовий поріг 1 МБ, а викликач логує WARNING. 0 — найсуворіший
+# режим: відсоткове правило для всіх файлів, як до цього порогу. Верхня
+# межа 100 МБ гарантує, що основна модель (гігабайтні .md) ніколи не
+# потрапить під послаблене правило через помилку в конфігурації.
+function Resolve-BRAVORestoreSmallFileThresholdBytes {
+    param([AllowNull()]$Value)
+
+    $defaultBytes = [long]1048576
+    $maximumBytes = [long]104857600
+    if ($null -eq $Value) {
+        return [pscustomobject]@{ ThresholdBytes = $defaultBytes; InvalidValue = $null }
+    }
+    $valueText = ([string]$Value).Trim()
+    $parsedBytes = [long]0
+    $isValid = (
+        -not ($Value -is [bool]) -and
+        -not ($Value -is [array]) -and
+        -not [string]::IsNullOrWhiteSpace($valueText) -and
+        [long]::TryParse(
+            $valueText,
+            [System.Globalization.NumberStyles]::Integer,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedBytes) -and
+        $parsedBytes -ge 0 -and
+        $parsedBytes -le $maximumBytes
+    )
+    if (-not $isValid) {
+        return [pscustomobject]@{ ThresholdBytes = $defaultBytes; InvalidValue = $valueText }
+    }
+    return [pscustomobject]@{ ThresholdBytes = $parsedBytes; InvalidValue = $null }
+}
+$restoreSmallFileThresholdRawValue = $null
+if ($MaintenanceConfig.Restore -is [System.Collections.IDictionary] -and
+    $MaintenanceConfig.Restore.Contains("IntegritySmallFileThresholdBytes")) {
+    $restoreSmallFileThresholdRawValue = $MaintenanceConfig.Restore["IntegritySmallFileThresholdBytes"]
+}
+$RestoreSmallFileThreshold = Resolve-BRAVORestoreSmallFileThresholdBytes -Value $restoreSmallFileThresholdRawValue
 $ARCHIVE_RETENTION_DAYS = [int]$MaintenanceConfig.Retention.ArchiveDays
 $LOG_RETENTION_DAYS = [int]$MaintenanceConfig.Retention.LogDays
 # Скільки днів зберігати вже стиснуті .mdz програмних журналів. Окрема
@@ -533,6 +580,197 @@ function Test-BRAVORestoreExecutionStillAllowed {
     return Test-BRAVORestoreTimeWindow -Now $now -WindowStart $WindowStart -WindowEnd $WindowEnd
 }
 
+# Знімок рішення про реставрацію (#476). Чиста функція: читає лише ФАЙЛИ
+# (restore state, два маркери), нічого не логує й не пише. Усі похідні від
+# часу значення (день/час/вікно/boot-профіль) передаються ЗАМОРОЖЕНИМИ з
+# початку прогону, тож два знімки одного прогону відрізняються лише тим, що
+# за цей час змінили інші прогони у файлах. Той самий код рахує знімок ДО
+# lock (PreLock — джерело рішення прогону), ПІСЛЯ lock (PostLock — єдине
+# авторитетне джерело перед 'Pending' і зупинкою клієнтів) та безпосередньо
+# перед bravocmd.exe (PreDestructive). Тіло — рівно та логіка, що раніше
+# стояла в Main; імена локальних змінних збережено навмисно.
+function Get-BRAVOMaintenanceRestoreDecisionSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('PreLock', 'PostLock', 'PreDestructive')][string]$Purpose,
+        [Parameter(Mandatory = $true)][datetime]$ScheduledOccurrence,
+        [Parameter(Mandatory = $true)][string]$ScheduledMarkerFile,
+        [Parameter(Mandatory = $true)][string]$TodayMarkerFile,
+        [bool]$IsRestoreDay,
+        [bool]$IsAfterRestoreTime,
+        [bool]$RestoreWindowOpen,
+        [bool]$BootRestoreIgnoresWindow,
+        [bool]$ForceRestore,
+        [bool]$BravoMaintenanceEnabled,
+        [int]$Limit = 2
+    )
+    # Імена параметрів збігаються з локальними іменами тіла (PowerShell не
+    # розрізняє регістр): $scheduledOccurrence, $restoreWindowOpen,
+    # $bootRestoreIgnoresWindow, $ForceRestore читаються прямо з параметрів.
+    $RestoreRollbackRetryLimit = $Limit
+    # #438 (P2-2): пошкоджений (існує, але не читається) restore state — НЕ
+    # "стану немає": лічильник невідомий, автоматична реставрація блокується.
+    $restoreStateReadResult = Get-BRAVORestoreStateReadResult
+    $restoreState = $restoreStateReadResult.State
+    $restoreStateCorrupt = ($restoreStateReadResult.Status -ceq 'Corrupt')
+    $todayMarkerPresent = (Test-Path -LiteralPath $TodayMarkerFile)
+    $scheduledSucceeded = (Test-Path -LiteralPath $ScheduledMarkerFile) -or (
+        $null -ne $restoreState -and
+        # #438 (P3-4): StrictMode-безпечне читання — стан, записаний вручну
+        # оператором, може не мати Status/ScheduledOccurrence (BRAVO сам пише їх
+        # завжди, при невдалому -ForceRestore — порожніми).
+        $null -ne $restoreState.PSObject.Properties['Status'] -and
+        $null -ne $restoreState.PSObject.Properties['ScheduledOccurrence'] -and
+        [string]$restoreState.Status -eq 'Succeeded' -and
+        [string]$restoreState.ScheduledOccurrence -eq $scheduledOccurrence.ToString('o')
+    )
+    $missedRestore = -not $scheduledSucceeded
+    $scheduledRestoreDue = $IsRestoreDay -and $IsAfterRestoreTime -and -not $todayMarkerPresent
+    $missedRestoreDue = $missedRestore
+    # Тижнева квота: АВТОМАТИЧНА реставрація виконується не частіше разу на
+    # тиждень, і успішна ПРИМУСОВА зараховується в цей самий тиждень. Успішний
+    # -ForceRestore записує слот, який він покриває (наступний плановий);
+    # квота вважається спожитою для поточного слоту, якщо він <= покритого
+    # (Test-BRAVORestoreWeeklyQuotaConsumed): це закриває і «пропущений»
+    # МИНУЛИЙ слот (строга рівність тут давала подвійну реставрацію в один
+    # вечір — інцидент 2026-08-26), і сам покритий; наступний слот (+7 днів)
+    # строго більший — квота знімається вчасно, без арифметики
+    # "різниця < 7 діб" з її межовою помилкою.
+    #
+    # Гейт стоїть саме на $automaticRestoreDue, а не всередині
+    # $scheduledSucceeded: $scheduledRestoreDue рахується від СЬОГОДНІШНЬОГО
+    # маркера, а не від персистованого стану, тож обійшов би правило в сам
+    # плановий день.
+    #
+    # -ForceRestore квотою НЕ обмежується (окремий диз'юнкт у $shouldRestore
+    # нижче): свідома дія оператора може повторюватись будь-скільки разів.
+    $forcedRestoreCoveredSlot = Get-BRAVORestoreForcedCoveredSlot -State $restoreState
+    $weeklyRestoreQuotaConsumed = Test-BRAVORestoreWeeklyQuotaConsumed `
+        -ForcedCoveredSlot $forcedRestoreCoveredSlot `
+        -ScheduledOccurrence $scheduledOccurrence
+    $automaticRestoreDue = ($scheduledRestoreDue -or $missedRestoreDue) -and -not $weeklyRestoreQuotaConsumed
+    # #438: ліміт поспіль-відкотів на ТОМУ САМОМУ наборі критичних файлів.
+    # Без цього "Rollback=SUCCESS, модель консистентна" (repair не вдався, але
+    # цілісність доведено) ніколи не пише Status='Succeeded' — $missedRestoreDue
+    # лишається true назавжди, і автоматичний шлях зупиняє служби й запускає
+    # bravocmd r щоночі без кінця (реальний інцидент, Issue #438). Поріг і
+    # fingerprint-логіка підтверджені власником (N=2); -ForceRestore не
+    # обмежується (окремий диз'юнкт у $shouldRestore нижче).
+    $restoreRetryDecision = Get-BRAVORestoreRollbackRetryDecision -State $restoreState -Phase 'Evaluate' `
+        -StateCorrupt $restoreStateCorrupt -Limit $RestoreRollbackRetryLimit
+    # Явний прапорець "автоматична реставрація заблокована лімітом" (P2-1):
+    # служби НЕ утримуються заради заблокованої реставрації (модель не змінюється).
+    $automaticRestoreRetryBlocked = [bool]$restoreRetryDecision.Blocked
+    $restoreSkippedByWindow = $automaticRestoreDue -and -not $restoreWindowOpen -and -not $ForceRestore -and -not $bootRestoreIgnoresWindow
+    # #438: той самий диз'юнкт, що $restoreSkippedByWindow, але для причини
+    # "ліміт поспіль-відкотів", а не "поза вікном" — текст і severity у Main
+    # свідомо РІЗНІ (це не штатна відкладена ситуація).
+    $restoreSkippedByRetryBlock = $automaticRestoreDue -and $automaticRestoreRetryBlocked -and -not $ForceRestore
+    $restoreRetryBlockedMessage = if ($automaticRestoreRetryBlocked) {
+        Get-BRAVORestoreRetryBlockedMessage -Count $restoreRetryDecision.Count -Limit $RestoreRollbackRetryLimit `
+            -StateCorrupt $restoreStateCorrupt -Signature (Get-BRAVORestoreRollbackSignature -State $restoreState)
+    } else { '' }
+    # #438: -ForceRestore НЕ обмежується (окремий диз'юнкт); автоматичний шлях
+    # не виконується, поки ліміт відкотів досягнуто.
+    $shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and -not $automaticRestoreRetryBlocked -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)))
+    return [pscustomobject]@{
+        Purpose = $Purpose
+        ScheduledOccurrence = $scheduledOccurrence
+        StateStatus = [string]$restoreStateReadResult.Status
+        StateCorrupt = [bool]$restoreStateCorrupt
+        StateError = [string]$restoreStateReadResult.Error
+        State = $restoreState
+        TodayMarkerPresent = [bool]$todayMarkerPresent
+        ScheduledSucceeded = [bool]$scheduledSucceeded
+        MissedRestoreDue = [bool]$missedRestoreDue
+        ScheduledRestoreDue = [bool]$scheduledRestoreDue
+        ForcedCoveredSlot = $forcedRestoreCoveredSlot
+        WeeklyQuotaConsumed = [bool]$weeklyRestoreQuotaConsumed
+        AutomaticRestoreDue = [bool]$automaticRestoreDue
+        RetryDecision = $restoreRetryDecision
+        AutomaticRestoreRetryBlocked = [bool]$automaticRestoreRetryBlocked
+        RestoreSkippedByWindow = [bool]$restoreSkippedByWindow
+        RestoreSkippedByRetryBlock = [bool]$restoreSkippedByRetryBlock
+        RetryBlockedMessage = [string]$restoreRetryBlockedMessage
+        ShouldRestore = [bool]$shouldRestore
+    }
+}
+
+# Порівняння знімка ДО lock зі знімком після lock / перед bravocmd (#476).
+# Чиста функція. Вето лише в бік ЗАБОРОНИ: було "реставрувати", стало "ні" —
+# тоді інший прогін, поки цей очікував lock, уже виконав слот, спожив квоту,
+# заблокував ліміт чи пошкодив стан. Перехід false -> true реставрацію НІКОЛИ
+# не вмикає (рішення про старт приймає лише знімок до lock). -ForceRestore —
+# свідома дія оператора, вето не стосується. Причина — за пріоритетом:
+# StateCorrupt > RetryBlocked > SucceededByOtherRun > WeeklyQuotaConsumed >
+# NoLongerDue (пошкоджений стан / вичерпаний ліміт не ховаються за INFO
+# "слот виконано іншим прогоном").
+function Get-BRAVOMaintenanceRestoreSnapshotVeto {
+    param(
+        [Parameter(Mandatory = $true)]$Before,
+        [Parameter(Mandatory = $true)]$After,
+        [bool]$ForceRestore
+    )
+    $veto = [bool]($Before.ShouldRestore -and -not $After.ShouldRestore -and -not $ForceRestore)
+    if (-not $veto) {
+        return [pscustomobject]@{ Veto = $false; Reason = 'None'; ShortReason = ''; Level = 'INFO'; Message = '' }
+    }
+    $slotText = ([datetime]$After.ScheduledOccurrence).ToString('yyyy-MM-dd HH:mm')
+    if ($After.StateCorrupt) {
+        $reason = 'StateCorrupt'
+        $shortReason = 'restore state пошкоджено'
+        $level = 'WARNING'
+        $message = "Реставрацію скасовано після отримання lock. $($After.RetryBlockedMessage)"
+    } elseif ($After.AutomaticRestoreRetryBlocked) {
+        $reason = 'RetryBlocked'
+        $shortReason = 'ліміт поспіль-невдалих спроб'
+        $level = 'WARNING'
+        $message = "Реставрацію скасовано після отримання lock. $($After.RetryBlockedMessage)"
+    } elseif ($After.ScheduledSucceeded -or $After.TodayMarkerPresent) {
+        $reason = 'SucceededByOtherRun'
+        $shortReason = 'слот уже виконано іншим прогоном'
+        $level = 'INFO'
+        $message = "Реставрацію скасовано після отримання lock: слот $slotText уже виконано іншим прогоном, поки цей очікував lock (маркер / BRAVO_RESTORE_STATE.json Status=Succeeded). bravocmd.exe не викликається; решта обслуговування продовжується."
+    } elseif ($After.WeeklyQuotaConsumed) {
+        $reason = 'WeeklyQuotaConsumed'
+        $shortReason = 'тижнева квота спожита примусовою'
+        $level = 'INFO'
+        $coveredText = if ($null -ne $After.ForcedCoveredSlot) { ([datetime]$After.ForcedCoveredSlot).ToString('yyyy-MM-dd HH:mm') } else { 'невідомо' }
+        $message = "Реставрацію скасовано після отримання lock: тижневу квоту спожито примусовою реставрацією іншого прогону (покритий слот $coveredText); слот $slotText більше не потребує реставрації. bravocmd.exe не викликається; решта обслуговування продовжується."
+    } else {
+        $reason = 'NoLongerDue'
+        $shortReason = 'слот більше не потребує реставрації'
+        $level = 'INFO'
+        $message = "Реставрацію скасовано після отримання lock: слот $slotText більше не потребує реставрації (стан змінився, поки цей прогін очікував lock). bravocmd.exe не викликається; решта обслуговування продовжується."
+    }
+    return [pscustomobject]@{ Veto = $true; Reason = $reason; ShortReason = $shortReason; Level = $level; Message = $message }
+}
+
+# Класифікація винятку у фазі реставрації (#477). Чиста функція. Виняток ПІСЛЯ
+# запуску bravocmd.exe, коли цілісність моделі не встановлено, — це НЕ збій
+# створення архіву (40): деструктив міг тривати чи завершитись, модель може бути
+# напіввідновленою. Тоді (Unverified) код = 43 (RestoreFailed), прапорці
+# архіву/цілісності повертаються до значень ДО сесії, спробу рахує облік
+# (клас CLASS:EXCEPTION-AFTER-BRAVOCMD, якщо ще не пораховано). Інакше —
+# попередня поведінка (код 40): RestoreArchiveFailed=true, інші прапорці не
+# змінюються (повертається $null).
+function Get-BRAVORestoreExceptionDisposition {
+    param(
+        [bool]$DestructiveStarted,
+        [bool]$IntegrityEstablished,
+        [bool]$AlreadyAccounted,
+        [bool]$ArchiveFailedBefore,
+        [bool]$IntegrityFailedBefore
+    )
+    $unverified = [bool]($DestructiveStarted -and -not $IntegrityEstablished)
+    return [pscustomobject]@{
+        Unverified = $unverified
+        RestoreFailed = $unverified
+        RestoreArchiveFailed = $(if ($unverified) { [bool]$ArchiveFailedBefore } else { $true })
+        RestoreIntegrityFailed = $(if ($unverified) { [bool]$IntegrityFailedBefore } else { $null })
+        AccountingFingerprint = $(if ($unverified -and -not $AlreadyAccounted) { 'CLASS:EXCEPTION-AFTER-BRAVOCMD' } else { $null })
+    }
+}
+
 $parsedRestoreTime = [TimeSpan]::Zero
 $parsedRestoreWindowStart = [TimeSpan]::Zero
 $parsedRestoreWindowEnd = [TimeSpan]::Zero
@@ -696,15 +934,25 @@ if ($BravoWebComponentEnabled -and -not $ApacheService) {
     }
 }
 
+function Test-BRAVOServiceDisabledBySystem {
+    # StartType відсутній у ServiceController на .NET < 4.6.1 (#319), тож
+    # читається лише через Get-BRAVOServiceStartMode (під StrictMode 2.0
+    # пряме звернення кинуло б виняток ще до рішення про керування службою).
+    # CIM StartMode уже отриманий викликачем — другий WMI-запит не потрібен.
+    param($Service, [string]$CimStartMode)
+
+    if ($CimStartMode -ieq "Disabled") { return $true }
+    $startModeResult = Get-BRAVOServiceStartMode -Service $Service -NoWmiQuery
+    return ($startModeResult.StartMode -eq "Disabled")
+}
+
 $ApacheServiceExists = ($null -ne $ApacheService)
 $BravoWebServiceDisabledBySystem = $false
 if ($ApacheServiceExists) {
     $cimStartMode = if ($ApacheServiceInfo) { [string]$ApacheServiceInfo.StartMode } else { "" }
-    $serviceStartType = [string]$ApacheService.StartType
-    $BravoWebServiceDisabledBySystem = (
-        $cimStartMode -ieq "Disabled" -or
-        $serviceStartType -ieq "Disabled"
-    )
+    $BravoWebServiceDisabledBySystem = Test-BRAVOServiceDisabledBySystem `
+        -Service $ApacheService `
+        -CimStartMode $cimStartMode
 }
 function Get-BRAVOBravoWebComponentPlan {
     [CmdletBinding()]
@@ -775,7 +1023,8 @@ function Get-ConfiguredServiceState {
         $startMode = if ($serviceInfo) {
             [string]$serviceInfo.StartMode
         } else {
-            [string]$service.StartType
+            # StartType відсутній на .NET < 4.6.1 (#319): безпечне читання.
+            [string](Get-BRAVOServiceStartMode -Service $service -NoWmiQuery).StartMode
         }
     }
 
@@ -919,8 +1168,14 @@ $script:restoreFailed = $false
 # коли реставрації не було, або вона успішна/успішно відкочена — модель
 # консистентна. false лише коли деструктив виконувався, а цілісність НЕ
 # встановлено (відкат провалився або before-архів невалідний) — тоді служби
-# НЕ піднімати (гейт нижче), fail-closed.
+# НЕ піднімати (гейт нижче), fail-closed. false також від миті запуску
+# bravocmd.exe до результату recovery (песимістично, #477): виняток посеред
+# деструктивної фази не лишає прапорець у хибному true.
 $script:modelIntegrityEstablished = $true
+# true лише з моменту, коли деструктивний bravocmd.exe вже запускався (#477).
+# Разом із modelIntegrityEstablished відрізняє виняток ДО деструктиву (модель
+# не торкнута, код 40) від винятку ПІСЛЯ нього (цілісність не перевірено, код 43).
+$script:restoreDestructiveStarted = $false
 
 function Enter-BRAVOMaintenanceOperationLock {
     $lockPath = [string]$operationLockSettings.Path
@@ -1599,11 +1854,49 @@ function Get-BRAVORestoreScheduledOccurrence {
     return $candidate
 }
 
-function Read-BRAVORestoreState {
+# Результат читання restore state: Status = Missing (файлу немає), Ok або
+# Corrupt (файл є, але порожній / не читається / не парситься / не є
+# JSON-об'єктом). Функція без логування і без запису — наслідки Corrupt
+# визначає викликач.
+# #438 (P2-2): Corrupt — це НЕ "стану немає". Лічильник поспіль-відкотів
+# у такому файлі невідомий, тож автоматична реставрація блокується
+# (fail-closed), а файл не перезаписується без quarantine-копії.
+function Get-BRAVORestoreStateReadResult {
     $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    try { return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
-    catch { Write-Log -Message "Не вдалося прочитати restore state: $($_.Exception.Message)" -Level 'WARNING'; return $null }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [pscustomobject]@{ Status = 'Missing'; State = $null; Path = $path; Error = '' }
+    }
+    try {
+        $rawStateText = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace([string]$rawStateText)) { throw 'файл порожній' }
+        $parsedState = $rawStateText | ConvertFrom-Json -ErrorAction Stop
+        if ($parsedState -isnot [System.Management.Automation.PSCustomObject]) { throw 'вміст не є JSON-об''єктом' }
+        return [pscustomobject]@{ Status = 'Ok'; State = $parsedState; Path = $path; Error = '' }
+    } catch {
+        return [pscustomobject]@{ Status = 'Corrupt'; State = $null; Path = $path; Error = [string]$_.Exception.Message }
+    }
+}
+
+# Сумісний читач: пошкоджений стан -> $null + один WARNING (поведінка
+# для читачів, яким важлива лише дата останньої реставрації / квота).
+# Рішення про блокування автоматичної реставрації приймає Main за
+# Get-BRAVORestoreStateReadResult, а не за цим $null.
+function Read-BRAVORestoreState {
+    $readResult = Get-BRAVORestoreStateReadResult
+    if ($readResult.Status -ceq 'Corrupt') {
+        Write-Log -Message "Не вдалося прочитати restore state: $($readResult.Error)" -Level 'WARNING'
+    }
+    return $readResult.State
+}
+
+# #438 (P2-2): quarantine-копія пошкодженого стану перед будь-яким
+# записом. Помилка копіювання пробивається викликачеві: без копії
+# пошкоджений файл не перезаписується (доказ для оператора не губиться).
+function Save-BRAVORestoreStateCorruptCopy {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $copyPath = '{0}.corrupt-{1}' -f $Path, (Get-Date).ToString('yyyyMMdd_HHmmss_fff')
+    [IO.File]::Copy($Path, $copyPath, $false)
+    return $copyPath
 }
 
 # Слот, покритий успішною ПРИМУСОВОЮ реставрацією (тижнева квота).
@@ -1680,6 +1973,12 @@ function Get-BRAVORestoreLastSuccessfulAt {
 # лишаються за автоматичним шляхом), тому записати сюди поточний слот зі
 # старим Status='Succeeded' не можна — $scheduledSucceeded помилково визнав
 # би поточний слот виконаним.
+# #438 (P2-6): read-merge-write — невідомі/нові поля стану переносяться
+# без змін. Лічильник відкотів скидається ЯВНО: успішна примусова
+# реставрація довела, що модель відновлюється, тож блокування автоматичної
+# реставрації знімається (це рішення, а не побічний ефект фіксованого
+# набору полів, як було раніше). Пошкоджений стан спершу копіюється в
+# BRAVO_RESTORE_STATE.json.corrupt-<мітка>.
 function Write-BRAVORestoreForcedOutcome {
     param(
         [Parameter(Mandatory = $true)][datetime]$CoveredSlot,
@@ -1690,23 +1989,233 @@ function Write-BRAVORestoreForcedOutcome {
     if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
     }
-    $existing = Read-BRAVORestoreState
-    $state = [pscustomobject]@{
-        ScheduledOccurrence = [string]$(if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['ScheduledOccurrence']) { $existing.ScheduledOccurrence } else { $null })
-        Status = [string]$(if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['Status']) { $existing.Status } else { $null })
-        Reason = [string]$(if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['Reason']) { $existing.Reason } else { $null })
-        ForcedRestoreCoversSlot = $CoveredSlot.ToString('o')
-        LastSuccessfulRestoreAt = $CompletedAt.ToString('o')
-        UpdatedAt = ([datetime]::Now).ToString('o')
+    $readResult = Get-BRAVORestoreStateReadResult
+    if ($readResult.Status -ceq 'Corrupt') {
+        $corruptCopyPath = Save-BRAVORestoreStateCorruptCopy -Path $path
+        Write-Log -Message "restore state пошкоджено ($($readResult.Error)); копію збережено: $corruptCopyPath. Успішна примусова реставрація записує новий стан." -Level 'ERROR'
     }
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+    $map = ConvertTo-BRAVORestoreStateMap -State $readResult.State
+    foreach ($legacyKey in @('ScheduledOccurrence', 'Status', 'Reason')) {
+        if (-not $map.Contains($legacyKey)) { $map[$legacyKey] = '' }
+    }
+    $map['ForcedRestoreCoversSlot'] = $CoveredSlot.ToString('o')
+    $map['LastSuccessfulRestoreAt'] = $CompletedAt.ToString('o')
+    $map['RollbackRetryCount'] = 0
+    $map['RollbackSignature'] = ''
+    $map['RestoreAttemptInProgress'] = $null
+    $map['UpdatedAt'] = ([datetime]::Now).ToString('o')
+    Write-BRAVOStateFileAtomic -Path $path -Text ($map | ConvertTo-Json -Depth 10)
+}
+
+
+# ===== #438: ліміт поспіль-невдалих автоматичних реставрацій =====
+#
+# ЩО РАХУЄТЬСЯ СПРОБОЮ. Спроба починається в момент, коли лічильник
+# записано write-ahead (атомарно, у той самий BRAVO_RESTORE_STATE.json)
+# НЕПОСЕРЕДНЬО перед деструктивним `bravocmd r`. Усе, що відбулося ПІСЛЯ
+# цієї точки й не завершилось чистим успіхом, лишається в лічильнику:
+# жорстке переривання процесу, `bravocmd` з кодом != 0 без відкату
+# (RollbackStatus='NONE'), відкат моделі, збій відкату, не готовий
+# after-архів. Припинення ДО цієї точки (немає lock, вікно закрилось,
+# before-архів не створено, службу не зупинено, quiescence-маркер не
+# переведено в suppressed) спробою НЕ є: модель не торкнута.
+# Чистий результат (модель відреставрована й after-архів готовий)
+# скидає лічильник: автоматичний шлях — Status='Succeeded'
+# (Write-BRAVORestoreState), примусовий — Write-BRAVORestoreForcedOutcome.
+#
+# ЯК ЗНІМАЄТЬСЯ БЛОКУВАННЯ. Лише дією оператора: успішний -ForceRestore
+# (скидає лічильник) або обнулення RollbackRetryCount у
+# BRAVO_RESTORE_STATE.json. Сам по собі інший набір файлів, нова ніч чи
+# новий плановий слот блокування НЕ знімають: заблокований автоматичний
+# шлях взагалі не виконує реставрацію, тож нової класифікації збою немає.
+# Лічильник переживає зміну планового слоту — РІШЕННЯ ВЛАСНИКА ЩЕ
+# ОЧІКУЄТЬСЯ (чи скидати лічильник при переході на новий слот); поки
+# поведінка саме така.
+#
+# ЩО ТАКЕ "ТОЙ САМИЙ ЗБІЙ". Клас збою = Get-BRAVORestoreRollbackFingerprint:
+# відсортований набір імен критичних файлів + підмножина Missing, БЕЗ
+# розмірів (розміри на робочій моделі LIMS змінюються щоночі, і fingerprint
+# з ними скидав би лічильник на 1 щоразу). Ранні виходи Compare-FileSizes
+# (немає before-CSV, порожній before-CSV, порожній каталог MODEL, виняток)
+# не мають файлів — для них клас задається ПРИЧИНОЮ (CLASS:EMPTY-MODEL
+# тощо) і порожній клас НЕ скидає лічильник. Невизначений попередній клас
+# (спробу перервано до класифікації) зливається з наступним.
+function Get-BRAVORestoreRollbackRetryLimit { return 2 }
+
+# StrictMode-безпечне читання (той самий ідіом, що
+# Get-BRAVORestoreForcedCoveredSlot вище): стан, збережений попередньою
+# версією, цього поля не має — відсутність означає "лічильник = 0", тобто
+# точну попередню поведінку.
+function Get-BRAVORestoreRollbackRetryCount {
+    param($State)
+    if ($null -eq $State) { return 0 }
+    if ($null -eq $State.PSObject.Properties['RollbackRetryCount']) { return 0 }
+    [int]$parsed = 0
+    if ([int]::TryParse([string]$State.RollbackRetryCount, [ref]$parsed) -and $parsed -ge 0) { return $parsed }
+    return 0
+}
+
+function Get-BRAVORestoreRollbackSignature {
+    param($State)
+    if ($null -eq $State) { return '' }
+    if ($null -eq $State.PSObject.Properties['RollbackSignature']) { return '' }
+    return [string]$State.RollbackSignature
+}
+
+# Write-ahead прапорець: попередня спроба стартувала, але не завершилась
+# чистим результатом (мітка часу старту; порожньо/відсутньо = немає).
+function Get-BRAVORestoreAttemptInProgress {
+    param($State)
+    if ($null -eq $State) { return $false }
+    if ($null -eq $State.PSObject.Properties['RestoreAttemptInProgress']) { return $false }
+    return (-not [string]::IsNullOrWhiteSpace([string]$State.RestoreAttemptInProgress))
+}
+
+# Детерміністичний fingerprint КЛАСУ збою. Без розмірів (див. вище).
+# Формат: 'FILES:<f1>|<f2>||MISSING:<f1>' — '|' не може бути в імені
+# файлу Windows, тож роздільники однозначні (на відміну від ';', який
+# допустимий в іменах). Імена нормалізуються до нижнього регістру
+# (NTFS регістронезалежна) і сортуються Ordinal. Без файлів — причина
+# ('CLASS:<ПРИЧИНА>'; порожня причина -> COMPARE-FAILED), ніколи не ''.
+function Get-BRAVORestoreRollbackFingerprint {
+    param(
+        [array]$CriticalFiles = @(),
+        [AllowEmptyString()][string]$FailureClass = ''
+    )
+    $items = @($CriticalFiles | Where-Object { $null -ne $_ })
+    if ($items.Count -eq 0) {
+        $reasonToken = if ([string]::IsNullOrWhiteSpace($FailureClass)) { 'COMPARE-FAILED' } else { $FailureClass.Trim().ToUpperInvariant() }
+        return "CLASS:$reasonToken"
+    }
+    $allNames = New-Object 'System.Collections.Generic.SortedSet[string]' ([StringComparer]::Ordinal)
+    $missingNames = New-Object 'System.Collections.Generic.SortedSet[string]' ([StringComparer]::Ordinal)
+    foreach ($item in $items) {
+        $fileName = ([string]$item.File).ToLowerInvariant()
+        [void]$allNames.Add($fileName)
+        $isMissing = ($null -ne $item.PSObject.Properties['Missing']) -and [bool]$item.Missing
+        if ($isMissing) { [void]$missingNames.Add($fileName) }
+    }
+    return ('FILES:{0}||MISSING:{1}' -f [string]::Join('|', @($allNames)), [string]::Join('|', @($missingNames)))
+}
+
+# Клас збою спроби за результатом Invoke-BRAVOModelRestoreRecovery.
+# Файлові збої -> fingerprint набору; решта -> причина.
+function Get-BRAVORestoreAttemptFailureClass {
+    param(
+        [AllowEmptyString()][string]$RollbackStatus = 'NONE',
+        [bool]$HasCriticalChanges = $false,
+        [bool]$IntegrityEstablished = $true,
+        [array]$CriticalFiles = @(),
+        [AllowEmptyString()][string]$FailureClass = ''
+    )
+    if ($RollbackStatus -ceq 'FAILED') { return 'CLASS:ROLLBACK-FAILED' }
+    if ($HasCriticalChanges) {
+        return (Get-BRAVORestoreRollbackFingerprint -CriticalFiles $CriticalFiles -FailureClass $FailureClass)
+    }
+    if (-not $IntegrityEstablished) { return 'CLASS:INTEGRITY-NOT-ESTABLISHED' }
+    return 'CLASS:BRAVOCMD-FAILED'
+}
+
+# ЧИСТЕ рішення про лічильник (без IO) — єдине місце арифметики.
+#   Phase Evaluate : поточний стан, Blocked = Count >= Limit.
+#   Phase Begin    : write-ahead ПЕРЕД bravocmd (лише автоматичний шлях;
+#                    примусовий не пише write-ahead — оператор присутній).
+#                    Count+1, клас не змінюється, AttemptInProgress=true.
+#   Phase Failed   : підтвердження збою спроби з класом -Fingerprint.
+#                    Той самий клас (або невизначений попередній) —
+#                    лічильник лишається/зростає, інший клас — 1.
+#                    -ForceRestore НІКОЛИ не знижує вже досягнутий ліміт:
+#                    при Count >= Limit стан не змінюється (Write=false).
+#   Phase Clean    : чистий успіх — повний скид.
+# -StateCorrupt: лічильник невідомий -> Blocked, ліміт ніколи не знижується.
+function Get-BRAVORestoreRollbackRetryDecision {
+    param(
+        [AllowNull()]$State,
+        [ValidateSet('Evaluate', 'Begin', 'Failed', 'Clean')][string]$Phase = 'Evaluate',
+        [AllowEmptyString()][string]$Fingerprint = '',
+        [bool]$ForceRestore = $false,
+        [bool]$StateCorrupt = $false,
+        [int]$Limit = 2
+    )
+    $priorCount = Get-BRAVORestoreRollbackRetryCount -State $State
+    $priorSignature = Get-BRAVORestoreRollbackSignature -State $State
+    $priorInProgress = Get-BRAVORestoreAttemptInProgress -State $State
+    $count = $priorCount
+    $signature = $priorSignature
+    $inProgress = $priorInProgress
+    $write = $false
+
+    if ($Phase -ceq 'Clean') {
+        $count = 0
+        $signature = ''
+        $inProgress = $false
+        $write = $true
+    } elseif ($StateCorrupt) {
+        $count = $Limit
+        $signature = 'CORRUPT-STATE-QUARANTINED'
+        $inProgress = $false
+        $write = ($Phase -ceq 'Failed')
+    } elseif ($Phase -ceq 'Begin') {
+        if (-not $ForceRestore) {
+            $count = $priorCount + 1
+            $inProgress = $true
+            $write = $true
+        }
+    } elseif ($Phase -ceq 'Failed') {
+        if ($ForceRestore -and $priorCount -ge $Limit) {
+            $write = $false
+        } else {
+            $failureClass = if ([string]::IsNullOrWhiteSpace($Fingerprint)) { 'CLASS:UNCLASSIFIED' } else { $Fingerprint }
+            $sameClass = ($failureClass -ceq $priorSignature) -or ([string]::IsNullOrEmpty($priorSignature) -and $priorCount -gt 0)
+            $alreadyCounted = $priorInProgress -and -not $ForceRestore
+            if ($alreadyCounted) {
+                $count = if ($sameClass) { $priorCount } else { 1 }
+            } else {
+                $count = if ($sameClass -and $priorCount -gt 0) { $priorCount + 1 } else { 1 }
+            }
+            $signature = $failureClass
+            $inProgress = $false
+            $write = $true
+        }
+    }
+    return [pscustomobject]@{
+        Phase = $Phase
+        Count = [int]$count
+        Signature = [string]$signature
+        AttemptInProgress = [bool]$inProgress
+        Blocked = [bool]($count -ge $Limit)
+        Write = [bool]$write
+    }
+}
+
+# Захист retention (P2-3): поки лічильник > 0 (або спробу перервано, або
+# стан пошкоджено), before-only сесії не рахуються до KeepCount і не
+# видаляються — інакше щонічна невдала спроба (before-архів без after)
+# витісняє останню повну пару before/after.
+function Test-BRAVORestoreRetentionProtectionActive {
+    param([AllowNull()]$State, [bool]$StateCorrupt = $false)
+    if ($StateCorrupt) { return $true }
+    return [bool]((Get-BRAVORestoreRollbackRetryCount -State $State) -gt 0 -or (Get-BRAVORestoreAttemptInProgress -State $State))
+}
+
+# Копія всіх полів стану в упорядкований словник — основа read-merge-write:
+# невідомі/нові поля (іншої версії BRAVO) не губляться при записі.
+function ConvertTo-BRAVORestoreStateMap {
+    param([AllowNull()]$State)
+    $map = [ordered]@{}
+    if ($null -ne $State) {
+        foreach ($property in $State.PSObject.Properties) { $map[[string]$property.Name] = $property.Value }
+    }
+    return $map
 }
 
 function Write-BRAVORestoreState {
     param(
         [datetime]$ScheduledOccurrence,
         [string]$Status,
-        [string]$Reason
+        [string]$Reason,
+        [int]$RollbackRetryCount,
+        [string]$RollbackSignature
     )
     $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
     if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
@@ -1716,7 +2225,16 @@ function Write-BRAVORestoreState {
     # 'Pending' (постановка слоту на паузу), і зі 'Succeeded'. Без цього
     # переносу будь-який із них тихо стер би тижневу квоту, і планова
     # реставрація виконалась би вдруге за тиждень.
-    $existingRestoreState = Read-BRAVORestoreState
+    # #438 (P2-2/P2-6): read-merge-write; пошкоджений стан спершу
+    # копіюється в .corrupt-<мітка> (без копії запису немає).
+    $readResult = Get-BRAVORestoreStateReadResult
+    $existingStateCorrupt = ($readResult.Status -ceq 'Corrupt')
+    if ($existingStateCorrupt) {
+        $corruptCopyPath = Save-BRAVORestoreStateCorruptCopy -Path $path
+        Write-Log -Message "restore state пошкоджено ($($readResult.Error)); копію збережено: $corruptCopyPath" -Level 'ERROR'
+    }
+    $existingRestoreState = $readResult.State
+    $map = ConvertTo-BRAVORestoreStateMap -State $existingRestoreState
     $preservedForcedCoversSlot = Get-BRAVORestoreForcedCoveredSlot -State $existingRestoreState
     # Дата останньої успішної реставрації оновлюється САМЕ тут для
     # автоматичного шляху (Status='Succeeded'); при 'Pending' переноситься
@@ -1727,15 +2245,203 @@ function Write-BRAVORestoreState {
     } else {
         Get-BRAVORestoreLastSuccessfulAt -State $existingRestoreState
     }
-    $state = [pscustomobject]@{
-        ScheduledOccurrence = $ScheduledOccurrence.ToString('o')
-        Status = $Status
-        Reason = $Reason
-        ForcedRestoreCoversSlot = $(if ($null -ne $preservedForcedCoversSlot) { ([datetime]$preservedForcedCoversSlot).ToString('o') } else { $null })
-        LastSuccessfulRestoreAt = $(if ($null -ne $lastSuccessfulRestoreAt) { ([datetime]$lastSuccessfulRestoreAt).ToString('o') } else { $null })
-        UpdatedAt = ([datetime]::Now).ToString('o')
+    # Status='Succeeded' завжди скидає лічильник/клас/write-ahead —
+    # проблему вирішено. Якщо викликач ці параметри не передав (наприклад,
+    # 'Pending' при lock-skip), значення зберігається. Пошкоджений
+    # попередній стан не знижує блокування: лічильник = ліміт.
+    $resolvedRollbackRetryCount = if ($Status -eq 'Succeeded') {
+        0
+    } elseif ($PSBoundParameters.ContainsKey('RollbackRetryCount')) {
+        $RollbackRetryCount
+    } elseif ($existingStateCorrupt) {
+        Get-BRAVORestoreRollbackRetryLimit
+    } else {
+        Get-BRAVORestoreRollbackRetryCount -State $existingRestoreState
     }
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+    $resolvedRollbackSignature = if ($Status -eq 'Succeeded') {
+        ''
+    } elseif ($PSBoundParameters.ContainsKey('RollbackSignature')) {
+        $RollbackSignature
+    } elseif ($existingStateCorrupt) {
+        'CORRUPT-STATE-QUARANTINED'
+    } else {
+        Get-BRAVORestoreRollbackSignature -State $existingRestoreState
+    }
+    $resolvedAttemptInProgress = if ($Status -eq 'Succeeded') {
+        $null
+    } elseif ($map.Contains('RestoreAttemptInProgress')) {
+        $map['RestoreAttemptInProgress']
+    } else {
+        $null
+    }
+    $map['ScheduledOccurrence'] = $ScheduledOccurrence.ToString('o')
+    $map['Status'] = $Status
+    $map['Reason'] = $Reason
+    $map['ForcedRestoreCoversSlot'] = $(if ($null -ne $preservedForcedCoversSlot) { ([datetime]$preservedForcedCoversSlot).ToString('o') } else { $null })
+    $map['LastSuccessfulRestoreAt'] = $(if ($null -ne $lastSuccessfulRestoreAt) { ([datetime]$lastSuccessfulRestoreAt).ToString('o') } else { $null })
+    $map['RollbackRetryCount'] = $resolvedRollbackRetryCount
+    $map['RollbackSignature'] = $resolvedRollbackSignature
+    $map['RestoreAttemptInProgress'] = $resolvedAttemptInProgress
+    $map['UpdatedAt'] = ([datetime]::Now).ToString('o')
+    Write-BRAVOStateFileAtomic -Path $path -Text ($map | ConvertTo-Json -Depth 10)
+}
+
+# #438: запис ЛИШЕ лічильника/класу/write-ahead за рішенням
+# Get-BRAVORestoreRollbackRetryDecision. ScheduledOccurrence/Status/Reason
+# наявного стану НЕ чіпаються (ні в автоматичному, ні в примусовому шляху):
+# 'Succeeded' слоту не можна знижувати до 'Pending' — це дало б ще одну
+# автоматичну реставрацію тієї ж ночі (клас інциденту guard-а
+# "recovery guard" у Main). Якщо стану ще немає, автоматичний шлях створює
+# мінімальний запис (поточний слот, Status='Pending'); примусовий шлях
+# (-ForceRestore) поля слоту не створює взагалі. Пошкоджений стан копіюється в
+# .corrupt-<мітка> і записується з лічильником = ліміт (блок лишається).
+function Write-BRAVORestoreRetryState {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$ScheduledOccurrence,
+        [Parameter(Mandatory = $true)]$Decision,
+        [string]$Reason = '',
+        [bool]$ForceRestore = $false
+    )
+    $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
+    if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
+    }
+    $readResult = Get-BRAVORestoreStateReadResult
+    if ($readResult.Status -ceq 'Corrupt') {
+        $corruptCopyPath = Save-BRAVORestoreStateCorruptCopy -Path $path
+        Write-Log -Message "restore state пошкоджено ($($readResult.Error)); копію збережено: $corruptCopyPath. Блокування автоматичної реставрації збережено." -Level 'ERROR'
+    }
+    $map = ConvertTo-BRAVORestoreStateMap -State $readResult.State
+    # #438 (P3-4): примусовий шлях НІКОЛИ не вигадує слот: невдалий
+    # -ForceRestore при відсутньому чи пошкодженому стані не пише 'Pending'
+    # для планового слоту (це замовляло б автоматичну реставрацію). Відсутні
+    # поля слоту (ScheduledOccurrence/Status/Reason) він створює ПОРОЖНІМИ,
+    # як Write-BRAVORestoreForcedOutcome: читач v5.2.4 звертається до
+    # $restoreState.Status напряму під StrictMode 2.0, і файл без цих полів
+    # ламав би кожен прогін Maintenance після rollback на 5.2.4.
+    if ($ForceRestore) {
+        foreach ($legacyKey in @('ScheduledOccurrence', 'Status', 'Reason')) {
+            if (-not $map.Contains($legacyKey)) { $map[$legacyKey] = '' }
+        }
+    } else {
+        if (-not $map.Contains('ScheduledOccurrence')) { $map['ScheduledOccurrence'] = $ScheduledOccurrence.ToString('o') }
+        if (-not $map.Contains('Status')) { $map['Status'] = 'Pending' }
+        if (-not $map.Contains('Reason')) { $map['Reason'] = $Reason }
+    }
+    if (-not $map.Contains('ForcedRestoreCoversSlot')) { $map['ForcedRestoreCoversSlot'] = $null }
+    if (-not $map.Contains('LastSuccessfulRestoreAt')) { $map['LastSuccessfulRestoreAt'] = $null }
+    $map['RollbackRetryCount'] = [int]$Decision.Count
+    $map['RollbackSignature'] = [string]$Decision.Signature
+    $map['RestoreAttemptInProgress'] = $(if ([bool]$Decision.AttemptInProgress) { ([datetime]::Now).ToString('o') } else { $null })
+    $map['UpdatedAt'] = ([datetime]::Now).ToString('o')
+    Write-BRAVOStateFileAtomic -Path $path -Text ($map | ConvertTo-Json -Depth 10)
+}
+
+# #438: чесний текст про блокування (лог + Slack). Блок знімає ЛИШЕ оператор.
+function Get-BRAVORestoreRetryBlockedMessage {
+    param(
+        [int]$Count,
+        [int]$Limit,
+        [bool]$StateCorrupt = $false,
+        [AllowEmptyString()][string]$Signature = '',
+        [bool]$Escalation = $false
+    )
+    if ($StateCorrupt) {
+        return (
+            "Автоматичну реставрацію ЗАБЛОКОВАНО: файл BRAVO_RESTORE_STATE.json існує, але не читається " +
+            "(пошкоджений чи порожній), тож лічильник невдалих спроб невідомий (fail-closed, Issue #438). " +
+            "Ця перевірка файл не змінює; будь-який наступний запис стану спершу зберігає копію BRAVO_RESTORE_STATE.json.corrupt-<мітка>. " +
+            "Служби не зупиняються заради реставрації, модель не змінюється. ПОТРІБНА ДІЯ ОПЕРАТОРА: " +
+            "блок знімає лише оператор — виправте чи видаліть файл, або запустіть реставрацію вручну " +
+            "(-ForceRestore; перед записом нового стану пошкоджений файл копіюється як " +
+            "BRAVO_RESTORE_STATE.json.corrupt-<мітка>)."
+        )
+    }
+    $signatureText = if ([string]::IsNullOrWhiteSpace($Signature)) { 'невідомий' } elseif ($Signature.Length -gt 300) { $Signature.Substring(0, 300) + '...' } else { $Signature }
+    $escalationText = if ($Escalation) { 'Ліміт досягнуто під час цього прогону. ' } else { '' }
+    return (
+        "Автоматичну реставрацію ЗАБЛОКОВАНО: $Count поспіль невдалих спроб (ліміт $Limit; клас збою: $signatureText), " +
+        "Issue #438. ${escalationText}Служби не зупиняються заради реставрації, модель не змінюється. ПОТРІБНА ДІЯ ОПЕРАТОРА: " +
+        "дослідити причину; блок знімає лише оператор — запустіть реставрацію вручну (-ForceRestore; " +
+        "успішний запуск скидає лічильник) або обнуліть RollbackRetryCount у BRAVO_RESTORE_STATE.json " +
+        "після розбору. Нова ніч, новий плановий слот чи інший набір файлів блок НЕ знімають."
+    )
+}
+
+# #438: write-ahead — лічильник спроби атомарно записується НЕПОСЕРЕДНЬО
+# перед bravocmd (див. блок-коментар вище). Помилка пробивається
+# викликачеві, який скасовує реставрацію ДО деструктивного кроку.
+function Register-BRAVORestoreAttemptBegin {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$ScheduledOccurrence,
+        [string]$Reason = '',
+        [int]$Limit = 2
+    )
+    $readResult = Get-BRAVORestoreStateReadResult
+    $stateCorrupt = ($readResult.Status -ceq 'Corrupt')
+    $decision = Get-BRAVORestoreRollbackRetryDecision -State $readResult.State -Phase 'Begin' -StateCorrupt $stateCorrupt -Limit $Limit
+    if (-not $decision.Write) {
+        throw 'restore state пошкоджено: write-ahead лічильника неможливий (fail-closed)'
+    }
+    # Ліміт перевіряється повторно по ЩОЙНО перечитаному стану: рішення в
+    # Main ухвалено до очікування Maintenance-lock, а інший прогон міг тим
+    # часом досягти ліміту. Стан при цьому НЕ записується.
+    $freshEvaluation = Get-BRAVORestoreRollbackRetryDecision -State $readResult.State -Phase 'Evaluate' -Limit $Limit
+    if ($freshEvaluation.Blocked) {
+        throw "Ліміт повторів реставрації вже досягнуто іншим прогоном (RollbackRetryCount=$($freshEvaluation.Count), ліміт $Limit); автоматичну реставрацію скасовано до втручання оператора (bravocmd). Стан не змінено."
+    }
+    Write-BRAVORestoreRetryState -ScheduledOccurrence $ScheduledOccurrence -Decision $decision -Reason $Reason
+    return $decision
+}
+
+# #438: підтвердження збою спроби з класом -Fingerprint (авто і Force).
+function Register-BRAVORestoreAttemptFailure {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$ScheduledOccurrence,
+        [Parameter(Mandatory = $true)][string]$Fingerprint,
+        [bool]$ForceRestore = $false,
+        [string]$Reason = '',
+        [int]$Limit = 2
+    )
+    $readResult = Get-BRAVORestoreStateReadResult
+    $stateCorrupt = ($readResult.Status -ceq 'Corrupt')
+    $decision = Get-BRAVORestoreRollbackRetryDecision -State $readResult.State -Phase 'Failed' -Fingerprint $Fingerprint `
+        -ForceRestore $ForceRestore -StateCorrupt $stateCorrupt -Limit $Limit
+    if ($decision.Write) {
+        Write-BRAVORestoreRetryState -ScheduledOccurrence $ScheduledOccurrence -Decision $decision -Reason $Reason -ForceRestore $ForceRestore
+    }
+    return $decision
+}
+
+# #438: облік збою спроби для Main. Збій ЗАПИСУ лічильника не кидає
+# виняток (інакше зовнішній catch реставрації підмінив би код завершення
+# 43 на 40): ERROR + критичний алерт, код завершення лишається за
+# restoreFailed. Ескалація (критичний алерт) — коли ліміт досягнуто цим
+# записом.
+function Invoke-BRAVORestoreAttemptFailureAccounting {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$ScheduledOccurrence,
+        [Parameter(Mandatory = $true)][string]$Fingerprint,
+        [bool]$ForceRestore = $false,
+        [string]$Reason = '',
+        [int]$Limit = 2
+    )
+    $decision = $null
+    try {
+        $decision = Register-BRAVORestoreAttemptFailure -ScheduledOccurrence $ScheduledOccurrence -Fingerprint $Fingerprint `
+            -ForceRestore $ForceRestore -Reason $Reason -Limit $Limit
+    } catch {
+        $accountingErrorMessage = "Не вдалося записати лічильник невдалих спроб реставрації (Issue #438) у BRAVO_RESTORE_STATE.json: $($_.Exception.Message). Код завершення не змінюється; автоматичний ліміт може не спрацювати — перевірте стан вручну."
+        Write-Log -Message $accountingErrorMessage -Level 'ERROR'
+        Send-SlackAlert -Message $accountingErrorMessage -IsCritical
+        return $null
+    }
+    if ($decision.Write -and $decision.Blocked) {
+        $escalationMessage = Get-BRAVORestoreRetryBlockedMessage -Count $decision.Count -Limit $Limit -Signature $decision.Signature -Escalation $true
+        Write-Log -Message "КРИТИЧНО: $escalationMessage" -Level 'ERROR'
+        Send-SlackAlert -Message $escalationMessage -IsCritical
+    }
+    return $decision
 }
 
 function Get-BRAVOTaskExecutionState {
@@ -4920,14 +5626,26 @@ function New-BRAVOCompareFileSizesResult {
         [bool]$HasCriticalChanges,
         [array]$CriticalFiles = @(),
         [array]$RemovedByRepairFiles = @(),
-        [bool]$MainModelValid = $true
+        [bool]$MainModelValid = $true,
+        [array]$SmallFileReductionFiles = @(),
+        # #438: ранні виходи Compare-FileSizes (немає/порожній before-CSV,
+        # порожній каталог MODEL, виняток) повертають HasCriticalChanges
+        # БЕЗ списку файлів. Причина тут дає викликачеві стабільний клас
+        # збою для лічильника відкотів (інакше порожній fingerprint
+        # скидав би лічильник щоразу).
+        [AllowEmptyString()][string]$FailureClass = ''
     )
     return [PSCustomObject]@{
         HasCriticalChanges = $HasCriticalChanges
+        FailureClass = $FailureClass
         CriticalFiles = @($CriticalFiles)
         RemovedByRepairFiles = @($RemovedByRepairFiles)
         RemovedByRepairCount = @($RemovedByRepairFiles).Count
         MainModelValid = $MainModelValid
+        # Малі файли (до реставрації < SmallFileThresholdBytes), що
+        # зменшились за старим правилом, але НЕ є критичними — лише INFO.
+        SmallFileReductionFiles = @($SmallFileReductionFiles)
+        SmallFileReductionCount = @($SmallFileReductionFiles).Count
     }
 }
 
@@ -4936,15 +5654,24 @@ function Compare-FileSizes {
         [string]$BeforeFile,
         [string]$ModelPath,
         [int]$MinSizeBytes = 2048,
-        [AllowNull()][string]$MainModelRelativePath = $null
+        [AllowNull()][string]$MainModelRelativePath = $null,
+        # Поріг «малого» файлу (байти, розмір ДО реставрації): для файлів,
+        # менших за нього, критичними є лише зникнення та обнулення (0 байт);
+        # див. Resolve-BRAVORestoreSmallFileThresholdBytes. Від'ємне значення
+        # трактується як типовий 1 МБ (fail-closed), 0 — правило для всіх.
+        [long]$SmallFileThresholdBytes = 1048576
     )
+
+    if ($SmallFileThresholdBytes -lt 0) {
+        $SmallFileThresholdBytes = 1048576
+    }
 
     try {
         if (-not (Test-Path $BeforeFile)) {
             Write-Log "Файл з початковими розмірами не знайдено: $BeforeFile" -Level "ERROR"
             $script:criticalErrorOccurred = $true
             $script:restoreIntegrityFailed = $true
-            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
+            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false -FailureClass 'BEFORE-CSV-MISSING'
         }
 
         $initialData = @(Import-Csv -Path $BeforeFile)
@@ -4952,7 +5679,7 @@ function Compare-FileSizes {
             Write-Log "Початковий список файлів MODEL порожній; цілісність після реставрації неможливо підтвердити" -Level "ERROR"
             $script:criticalErrorOccurred = $true
             $script:restoreIntegrityFailed = $true
-            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
+            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false -FailureClass 'BEFORE-CSV-EMPTY'
         }
 
         # Fail-closed guard: hint передано, але його немає у before-CSV —
@@ -4980,6 +5707,7 @@ function Compare-FileSizes {
 
         $criticalFiles = @()
         $removedByRepairFiles = @()
+        $smallFileReductionFiles = @()
         $mainModelValid = $true
         $missingFileCount = 0
         $currentLookup = @{}
@@ -4998,7 +5726,7 @@ function Compare-FileSizes {
             Send-SlackAlert -Message $errorMsg -IsCritical
             $script:criticalErrorOccurred = $true
             $script:restoreIntegrityFailed = $true
-            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
+            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false -FailureClass 'EMPTY-MODEL'
         }
 
         # Перевіряємо початковий набір, а не лише поточні файли. Інакше повністю
@@ -5022,11 +5750,30 @@ function Compare-FileSizes {
             } else {
                 100
             }
-            $isCriticalReduction = (
+            $isSizeRuleReduction = (
                 $initialSizeBytes -gt $MinSizeBytes -and
                 $currentSizeBytes -lt $initialSizeBytes -and
                 ($currentSizeBytes -le $MinSizeBytes -or $reductionPercent -ge 50)
             )
+            # Малий файл (до реставрації < SmallFileThresholdBytes): відсоткове
+            # правило і «<= MinSizeBytes» не застосовуються — repair штатно
+            # ущільнює невеликі таблиці (4,5 КБ -> 2,0 КБ = -55,6% без втрати
+            # даних). Критичним лишається обнулення наявного файлу; зникнення
+            # обробляє незмінна логіка відсутніх файлів нижче. Великі файли —
+            # без змін.
+            $isSmallFile = (
+                $SmallFileThresholdBytes -gt 0 -and
+                $initialSizeBytes -lt $SmallFileThresholdBytes
+            )
+            if ($isSmallFile) {
+                $isCriticalReduction = (
+                    -not $isMissing -and
+                    $initialSizeBytes -gt $MinSizeBytes -and
+                    $currentSizeBytes -eq 0
+                )
+            } else {
+                $isCriticalReduction = $isSizeRuleReduction
+            }
             # Fail-closed: без відомого MainModelRelativePath (викликач не
             # зміг визначити основну модель) будь-який відсутній файл лишається
             # критичним — стара поведінка. З відомим MainModelRelativePath
@@ -5052,6 +5799,15 @@ function Compare-FileSizes {
                     BeforeSizeBytes = $initialSizeBytes
                 }
                 continue
+            }
+
+            if ($isSmallFile -and $isSizeRuleReduction -and -not $isMissing -and -not $isCriticalReduction) {
+                $smallFileReductionFiles += [PSCustomObject]@{
+                    File = $relativePath
+                    BeforeSizeBytes = $initialSizeBytes
+                    AfterSizeBytes = $currentSizeBytes
+                    ReductionPercent = $reductionPercent
+                }
             }
 
             if ($isCriticalMissing -or $isCriticalReduction) {
@@ -5086,6 +5842,19 @@ function Compare-FileSizes {
                 $removedSummary += " - $($file.File) (було: $(Format-FileSize $file.BeforeSizeBytes))`n"
             }
             Write-Log $removedSummary -Level "INFO"
+        }
+
+        # Малі файли, що зменшились за старим правилом: оператор бачить їх у
+        # журналі, але це НЕ критична зміна — без alert і без відкату.
+        if (@($smallFileReductionFiles).Count -gt 0) {
+            $smallFileSummary = ("Зменшення розміру малих файлів MODEL після реставрації (до реставрації менше " +
+                "$(Format-FileSize $SmallFileThresholdBytes); критичним НЕ вважається, відкат не потрібен): " +
+                "$(@($smallFileReductionFiles).Count) файл(ів):`n")
+            foreach ($file in $smallFileReductionFiles) {
+                $smallFileSummary += (" - $($file.File): $(Format-FileSize $file.BeforeSizeBytes) → " +
+                    "$(Format-FileSize $file.AfterSizeBytes) (-$(([double]$file.ReductionPercent).ToString('0.0'))%)`n")
+            }
+            Write-Log $smallFileSummary -Level "INFO"
         }
 
         if ($criticalFiles.Count -gt 0) {
@@ -5146,13 +5915,15 @@ function Compare-FileSizes {
                 -HasCriticalChanges $true `
                 -CriticalFiles $criticalFiles `
                 -RemovedByRepairFiles $removedByRepairFiles `
-                -MainModelValid $mainModelValid
+                -MainModelValid $mainModelValid `
+                -SmallFileReductionFiles $smallFileReductionFiles
         } else {
             Write-Log "Критичних змін розміру не знайдено (RemovedByRepair: $(@($removedByRepairFiles).Count))" -Level "INFO"
             return New-BRAVOCompareFileSizesResult `
                 -HasCriticalChanges $false `
                 -RemovedByRepairFiles $removedByRepairFiles `
-                -MainModelValid $mainModelValid
+                -MainModelValid $mainModelValid `
+                -SmallFileReductionFiles $smallFileReductionFiles
         }
     }
     catch {
@@ -5164,7 +5935,7 @@ function Compare-FileSizes {
         # Неможливість довести цілісність MODEL є критичною подією. Повертаємо
         # HasCriticalChanges = $true, щоб викликач виконав відкат і не
         # створив маркер успіху.
-        return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
+        return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false -FailureClass 'COMPARE-FAILED'
     }
 }
 
@@ -5285,14 +6056,16 @@ function Invoke-BRAVOModelRestoreRecovery {
         [AllowNull()][string]$MainModelRelativePath = $null,
         [Parameter(Mandatory = $true)][string]$BeforeArchivePath,
         [Parameter(Mandatory = $true)]$ARC_PATH,
-        [int]$MinSizeBytes = 2048
+        [int]$MinSizeBytes = 2048,
+        [long]$SmallFileThresholdBytes = 1048576
     )
 
     $compare = Compare-FileSizes `
         -BeforeFile $BeforeFile `
         -ModelPath $ModelPath `
         -MinSizeBytes $MinSizeBytes `
-        -MainModelRelativePath $MainModelRelativePath
+        -MainModelRelativePath $MainModelRelativePath `
+        -SmallFileThresholdBytes $SmallFileThresholdBytes
 
     $rollbackStatus = 'NONE'
     $integrityEstablished = -not $compare.HasCriticalChanges -and $compare.MainModelValid
@@ -5310,7 +6083,8 @@ function Invoke-BRAVOModelRestoreRecovery {
                 -BeforeFile $BeforeFile `
                 -ModelPath $ModelPath `
                 -MinSizeBytes $MinSizeBytes `
-                -MainModelRelativePath $MainModelRelativePath
+                -MainModelRelativePath $MainModelRelativePath `
+                -SmallFileThresholdBytes $SmallFileThresholdBytes
             if (-not $postRollback.HasCriticalChanges -and $postRollback.MainModelValid) {
                 Write-Log -Message "Модель успішно відновлена з before-архіву; консистентність підтверджено" -Level "SUCCESS"
                 $rollbackStatus = 'SUCCESS'
@@ -5340,6 +6114,14 @@ function Invoke-BRAVOModelRestoreRecovery {
         HasCriticalChanges   = $compare.HasCriticalChanges
         RemovedByRepairCount = $compare.RemovedByRepairCount
         CriticalCount        = @($compare.CriticalFiles).Count
+        # #438: file-level деталі (File/BeforeSizeBytes/AfterSizeBytes/Missing)
+        # потрібні викликачу для Get-BRAVORestoreRollbackFingerprint — лише
+        # CriticalCount не розрізняє "той самий" набір файлів від "іншого"
+        # набору того самого розміру.
+        CriticalFiles        = @($compare.CriticalFiles)
+        # #438: причина для ранніх виходів Compare-FileSizes без файлів
+        # (див. New-BRAVOCompareFileSizesResult); порожньо, коли файли є.
+        FailureClass         = $(if ($null -ne $compare.PSObject.Properties['FailureClass']) { [string]$compare.FailureClass } else { '' })
         MainModelValid       = $compare.MainModelValid
     }
 }
@@ -5676,7 +6458,12 @@ function Remove-OldRestoreArchives {
         [string]$Path,
         [string]$ArchivePrefix,
         [int]$KeepCount = 2,
-        [int]$InvalidRetentionDays = 30
+        [int]$InvalidRetentionDays = 30,
+        # #438 (P2-3): поки активний лічильник невдалих реставрацій, сесії
+        # БЕЗ after-архіву (before-only: невдала спроба) не зараховуються до
+        # KeepCount і не видаляються — інакше щонічна невдала спроба
+        # витісняє останню повну пару before/after, з якої можна відновитись.
+        [switch]$ProtectBeforeOnlySessions
     )
 
     if (-not (Test-Path $Path)) {
@@ -5754,6 +6541,17 @@ function Remove-OldRestoreArchives {
     }
 
     $sortedGroups = @($validGroups | Sort-Object Name -Descending)
+    if ($ProtectBeforeOnlySessions) {
+        $beforeOnlyProtectedGroups = @($sortedGroups | Where-Object {
+                @($_.Group | Where-Object { $_.Name -like "*_after_*" }).Count -eq 0
+            })
+        if ($beforeOnlyProtectedGroups.Count -gt 0) {
+            Write-Log "Retention: активний лічильник невдалих реставрацій (Issue #438) — before-only сесії ($($beforeOnlyProtectedGroups.Count)) не зараховуються до KeepCount і не видаляються" -Level "INFO"
+        }
+        $sortedGroups = @($sortedGroups | Where-Object {
+                @($_.Group | Where-Object { $_.Name -like "*_after_*" }).Count -gt 0
+            })
+    }
     $groupsToKeep = @($sortedGroups | Select-Object -First $KeepCount)
     $groupsToDelete = @($sortedGroups | Select-Object -Skip $KeepCount)
     $invalidCutoff = (Get-Date).AddDays(-[math]::Max(1, $InvalidRetentionDays))
@@ -6130,6 +6928,74 @@ function Check-MdFileSizes {
     }
 }
 
+# Блок "Виконано:" (статуси всіх етапів прогону) для фінального сповіщення.
+# Винесено з Send-FinalReport, щоб той самий блок потрапляв у КОЖНУ гілку
+# звіту, а не лише в успішну: раніше, щойно Test-RangeIdUsage клав запис у
+# CriticalErrorsList (перевищення порогу діапазонів ID), фінальне
+# сповіщення містило ЛИШЕ цей запис — статуси реставрації, .md, trace,
+# очистки, вільного місця і попередження з NotificationAlertQueue
+# оператор не бачив.
+function Get-BRAVOMaintenanceFinalReportCheckLines {
+    $completedCheckLines = New-Object 'System.Collections.Generic.List[string]'
+    $lastRestoreTime = $restoreCompletedAt
+    # Персистована дата — джерело істини для ОБОХ шляхів: маркери
+    # restore_done_*.marker бачать лише автоматичну реставрацію
+    # (примусова їх свідомо не створює), тому реальне повідомлення
+    # показувало "ще не виконувалася" через 20 хвилин після успішної
+    # примусової. Маркери лишаються legacy-fallback для станів,
+    # записаних попередніми версіями.
+    if ($null -eq $lastRestoreTime) {
+        $lastRestoreTime = Get-BRAVORestoreLastSuccessfulAt -State (Read-BRAVORestoreState)
+    }
+    if ($null -eq $lastRestoreTime) {
+        $lastRestoreMarker = @(Get-BRAVOFiles -Path $LOG_DIR -Filter "restore_done_*.marker" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1)
+        if ($lastRestoreMarker.Count -gt 0) {
+            $lastRestoreTime = [datetime]$lastRestoreMarker[0].LastWriteTime
+        }
+    }
+    $lastRestoreText = if ($null -ne $lastRestoreTime) {
+        $lastRestoreTime.ToString("dd.MM.yyyy HH:mm")
+    } elseif (-not $BravoMaintenanceEnabled) {
+        "немає даних (компонент BRAVO вимкнено)"
+    } else {
+        "ще не виконувалася"
+    }
+    # Блок будується з ФАКТИЧНИХ статусів етапів (див.
+    # New-BRAVOMaintenanceCompletedLines): збійний етап отримує ❌/⚠️
+    # і причину, а не ✅ від самої лише наявності компонента.
+    $traceCountText = if ($BravoMaintenanceEnabled -and $traceOutputProcessed) {
+        Format-BRAVOUkrainianCount -Count $traceOutputProcessedCount -One "файл" -Few "файли" -Many "файлів"
+    } else {
+        $null
+    }
+    $exchangeCountText = if ($exchangAPILogsProcessedCount -gt 0) {
+        Format-BRAVOUkrainianCount -Count $exchangAPILogsProcessedCount -One "файл" -Few "файли" -Many "файлів"
+    } else {
+        $null
+    }
+    foreach ($completedLine in @(New-BRAVOMaintenanceCompletedLines `
+            -LastRestoreText $lastRestoreText `
+            -FreeSpaceInlineText (Get-MaintenanceFreeSpaceInlineText) `
+            -TraceCountText $traceCountText `
+            -ExchangeCountText $exchangeCountText)) {
+        $completedCheckLines.Add([string]$completedLine)
+    }
+    return $completedCheckLines.ToArray()
+}
+
+# Для гілок з проблемами: збій побудови блоку статусів не повинен
+# забрати в оператора саме сповіщення про проблему.
+function Get-BRAVOMaintenanceFinalReportCheckLinesSafe {
+    try {
+        return @(Get-BRAVOMaintenanceFinalReportCheckLines)
+    } catch {
+        Write-Log -Message "Не вдалося додати статуси етапів до фінального сповіщення: $($_.Exception.Message)" -Level "WARNING"
+        return @()
+    }
+}
+
 # Функція для відправки фінального звіту
 function Send-FinalReport {
     param(
@@ -6153,7 +7019,9 @@ function Send-FinalReport {
             -TitleEmoji ":rotating_light:" `
             -Severity "CRITICAL" `
             -Duration $elapsedTime `
-            -Details @($script:CriticalErrorsList.ToArray()) `
+            -Details (@($script:CriticalErrorsList.ToArray()) +
+                @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
+                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
             -LogPath $LOG_FILE
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
@@ -6197,59 +7065,15 @@ function Send-FinalReport {
             -TitleEmoji $alertQueueTitleEmoji `
             -Severity $notificationSeverity `
             -Duration $elapsedTime `
-            -Details @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) `
+            -Details (@($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) +
+                @(Get-BRAVOMaintenanceFinalReportCheckLinesSafe)) `
             -LogPath $LOG_FILE
         $shouldSend = $true
     }
     else {
         # Немає критичних помилок - відправляємо тільки в режимі "all"
         if ($script:SlackMode -eq "all") {
-            $completedCheckLines = [System.Collections.Generic.List[string]]::new()
-            $lastRestoreTime = $restoreCompletedAt
-            # Персистована дата — джерело істини для ОБОХ шляхів: маркери
-            # restore_done_*.marker бачать лише автоматичну реставрацію
-            # (примусова їх свідомо не створює), тому реальне повідомлення
-            # показувало "ще не виконувалася" через 20 хвилин після успішної
-            # примусової. Маркери лишаються legacy-fallback для станів,
-            # записаних попередніми версіями.
-            if ($null -eq $lastRestoreTime) {
-                $lastRestoreTime = Get-BRAVORestoreLastSuccessfulAt -State (Read-BRAVORestoreState)
-            }
-            if ($null -eq $lastRestoreTime) {
-                $lastRestoreMarker = @(Get-BRAVOFiles -Path $LOG_DIR -Filter "restore_done_*.marker" |
-                    Sort-Object LastWriteTime -Descending |
-                    Select-Object -First 1)
-                if ($lastRestoreMarker.Count -gt 0) {
-                    $lastRestoreTime = [datetime]$lastRestoreMarker[0].LastWriteTime
-                }
-            }
-            $lastRestoreText = if ($null -ne $lastRestoreTime) {
-                $lastRestoreTime.ToString("dd.MM.yyyy HH:mm")
-            } elseif (-not $BravoMaintenanceEnabled) {
-                "немає даних (компонент BRAVO вимкнено)"
-            } else {
-                "ще не виконувалася"
-            }
-            # Блок будується з ФАКТИЧНИХ статусів етапів (див.
-            # New-BRAVOMaintenanceCompletedLines): збійний етап отримує ❌/⚠️
-            # і причину, а не ✅ від самої лише наявності компонента.
-            $traceCountText = if ($BravoMaintenanceEnabled -and $traceOutputProcessed) {
-                Format-BRAVOUkrainianCount -Count $traceOutputProcessedCount -One "файл" -Few "файли" -Many "файлів"
-            } else {
-                $null
-            }
-            $exchangeCountText = if ($exchangAPILogsProcessedCount -gt 0) {
-                Format-BRAVOUkrainianCount -Count $exchangAPILogsProcessedCount -One "файл" -Few "файли" -Many "файлів"
-            } else {
-                $null
-            }
-            foreach ($completedLine in @(New-BRAVOMaintenanceCompletedLines `
-                    -LastRestoreText $lastRestoreText `
-                    -FreeSpaceInlineText (Get-MaintenanceFreeSpaceInlineText) `
-                    -TraceCountText $traceCountText `
-                    -ExchangeCountText $exchangeCountText)) {
-                $completedCheckLines.Add([string]$completedLine)
-            }
+            $completedCheckLines = @(Get-BRAVOMaintenanceFinalReportCheckLines)
 
             # dev.19 (виправлено): той самий канонічний
             # Get-BRAVOMaintenanceFinalStatus, що ЛОГ/консоль — раніше
@@ -6298,7 +7122,7 @@ function Send-FinalReport {
                 -Severity $notificationSeverity `
                 -Duration $elapsedTime `
                 -StatusLines @() `
-                -Details @($completedCheckLines.ToArray()) `
+                -Details $completedCheckLines `
                 -LogPath $LOG_FILE
             $shouldSend = $true
         } else {
@@ -6522,13 +7346,6 @@ $MARKER_FILE = "$LOG_DIR\restore_done_$YYYY$MM$DD.marker"
 
 $scheduledOccurrence = Get-BRAVORestoreScheduledOccurrence -Now $currentDate
 $scheduledMarkerFile = Join-Path $LOG_DIR ('restore_done_{0}.marker' -f $scheduledOccurrence.ToString('yyyyMMdd'))
-$restoreState = Read-BRAVORestoreState
-$scheduledSucceeded = (Test-Path -LiteralPath $scheduledMarkerFile) -or (
-    $null -ne $restoreState -and
-    [string]$restoreState.Status -eq 'Succeeded' -and
-    [string]$restoreState.ScheduledOccurrence -eq $scheduledOccurrence.ToString('o')
-)
-$missedRestore = -not $scheduledSucceeded
 $taskExecutionState = Get-BRAVOTaskExecutionState
 function Test-BRAVOTaskWasMissed {
     param([string]$TaskName, [string]$ScheduledTime)
@@ -6568,7 +7385,23 @@ $maintenanceDailyAtInsideRestoreWindow = [TimeSpan]::TryParse([string]$scheduler
 # зранку одразу після вмикання сервера — задумана поведінка, і клієнтів у
 # програмі ще немає, бо служби (Automatic Delayed Start) утримуються
 # зупиненими до її завершення.
-$scheduledRestoreDue = $isRestoreDay -and $isAfterRestoreTime -and -not (Test-Path $MARKER_FILE)
+# Профіль сервера РОБОЧОГО ЧАСУ (Restore.BootRestoreMode="HoldServices"):
+# Recovery-прогін, запущений boot-тригером, ігнорує вікно реставрації —
+# служби (Automatic Delayed Start) ще не запущені, клієнтів у програмі
+# немає, і іншої нагоди виконати пропущений слот такий сервер не матиме
+# (його вимикають до нічного вікна). На 24/7-профілі ("None")
+# -RunMissedRestoreOnly поводиться як раніше — вікно обов'язкове.
+$bootRestoreIgnoresWindow = $RunMissedRestoreOnly -and
+    ([string]$maintenanceSettings.Restore.BootRestoreMode -eq 'HoldServices')
+$RestoreRollbackRetryLimit = Get-BRAVORestoreRollbackRetryLimit
+# #476: рішення про реставрацію рахує Get-BRAVOMaintenanceRestoreDecisionSnapshot
+# (restore state, маркери, тижнева квота, ліміт поспіль-відкотів, вікно).
+# Цей знімок ДО lock визначає, чи прогін ВЗАГАЛІ планує реставрацію; після
+# Enter-BRAVOMaintenanceOperationLock той самий розрахунок виконується ЗАНОВО
+# ($postLockRestoreSnapshot) і може лише ЗАБОРОНИТИ реставрацію, якщо інший
+# прогін виконав слот, поки цей очікував lock. Час (день/година/вікно/boot-профіль)
+# заморожено з початку прогону.
+#
 # НЕ прив'язуємо до -RunMissedRestoreOnly: той прапорець позначає лише те,
 # що цей конкретний прогін BRAVO_MAINTENANCE.ps1 стартував через
 # Recovery-завдання (5.2.0: єдиний його тригер — boot, профіль робочого
@@ -6578,39 +7411,38 @@ $scheduledRestoreDue = $isRestoreDay -and $isAfterRestoreTime -and -not (Test-Pa
 # старту сервера. $missedRestore сам по собі персистентний
 # (BRAVO_RESTORE_STATE.json / маркер конкретного $scheduledOccurrence),
 # тому перевірка на будь-якому з цих прогонів не створює дублювання.
+$preLockRestoreSnapshot = Get-BRAVOMaintenanceRestoreDecisionSnapshot `
+    -Purpose 'PreLock' `
+    -ScheduledOccurrence $scheduledOccurrence `
+    -ScheduledMarkerFile $scheduledMarkerFile `
+    -TodayMarkerFile $MARKER_FILE `
+    -IsRestoreDay ([bool]$isRestoreDay) `
+    -IsAfterRestoreTime ([bool]$isAfterRestoreTime) `
+    -RestoreWindowOpen ([bool]$restoreWindowOpen) `
+    -BootRestoreIgnoresWindow ([bool]$bootRestoreIgnoresWindow) `
+    -ForceRestore ([bool]$ForceRestore) `
+    -BravoMaintenanceEnabled ([bool]$BravoMaintenanceEnabled) `
+    -Limit $RestoreRollbackRetryLimit
+$restoreState = $preLockRestoreSnapshot.State
+$restoreStateCorrupt = [bool]$preLockRestoreSnapshot.StateCorrupt
+if ($restoreStateCorrupt) {
+    Write-Log -Message "BRAVO_RESTORE_STATE.json пошкоджено або не читається ($($preLockRestoreSnapshot.StateError)); автоматична реставрація заблокована (fail-closed); ця перевірка файл не змінює (наступний запис стану спершу збереже копію .corrupt-<мітка>)." -Level "ERROR"
+}
+$scheduledSucceeded = [bool]$preLockRestoreSnapshot.ScheduledSucceeded
+$missedRestore = -not $scheduledSucceeded
 $missedRestoreDue = $missedRestore
-# Тижнева квота: АВТОМАТИЧНА реставрація виконується не частіше разу на
-# тиждень, і успішна ПРИМУСОВА зараховується в цей самий тиждень. Успішний
-# -ForceRestore записує слот, який він покриває (наступний плановий);
-# квота вважається спожитою для поточного слоту, якщо він <= покритого
-# (Test-BRAVORestoreWeeklyQuotaConsumed): це закриває і «пропущений»
-# МИНУЛИЙ слот (строга рівність тут давала подвійну реставрацію в один
-# вечір — інцидент 2026-08-26), і сам покритий; наступний слот (+7 днів)
-# строго більший — квота знімається вчасно, без арифметики
-# "різниця < 7 діб" з її межовою помилкою.
-#
-# Гейт стоїть саме на $automaticRestoreDue, а не всередині
-# $scheduledSucceeded: $scheduledRestoreDue рахується від СЬОГОДНІШНЬОГО
-# маркера, а не від персистованого стану, тому обійшов би правило в сам
-# плановий день.
-#
-# -ForceRestore квотою НЕ обмежується (окремий диз'юнкт у $shouldRestore
-# нижче): свідома дія оператора може повторюватись будь-скільки разів.
-$forcedRestoreCoveredSlot = Get-BRAVORestoreForcedCoveredSlot -State $restoreState
-$weeklyRestoreQuotaConsumed = Test-BRAVORestoreWeeklyQuotaConsumed `
-    -ForcedCoveredSlot $forcedRestoreCoveredSlot `
-    -ScheduledOccurrence $scheduledOccurrence
-$automaticRestoreDue = ($scheduledRestoreDue -or $missedRestoreDue) -and -not $weeklyRestoreQuotaConsumed
-# Профіль сервера РОБОЧОГО ЧАСУ (Restore.BootRestoreMode="HoldServices"):
-# Recovery-прогін, запущений boot-тригером, ігнорує вікно реставрації —
-# служби (Automatic Delayed Start) ще не запущені, клієнтів у програмі
-# немає, і іншої нагоди виконати пропущений слот такий сервер не матиме
-# (його вимикають до нічного вікна). На 24/7-профілі ("None")
-# -RunMissedRestoreOnly поводиться як раніше — вікно обов'язкове.
-$bootRestoreIgnoresWindow = $RunMissedRestoreOnly -and
-    ([string]$maintenanceSettings.Restore.BootRestoreMode -eq 'HoldServices')
-$restoreSkippedByWindow = $automaticRestoreDue -and -not $restoreWindowOpen -and -not $ForceRestore -and -not $bootRestoreIgnoresWindow
-$shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)))
+$weeklyRestoreQuotaConsumed = [bool]$preLockRestoreSnapshot.WeeklyQuotaConsumed
+$automaticRestoreDue = [bool]$preLockRestoreSnapshot.AutomaticRestoreDue
+$restoreRetryDecision = $preLockRestoreSnapshot.RetryDecision
+$automaticRestoreRetryBlocked = [bool]$preLockRestoreSnapshot.AutomaticRestoreRetryBlocked
+$restoreSkippedByWindow = [bool]$preLockRestoreSnapshot.RestoreSkippedByWindow
+$restoreSkippedByRetryBlock = [bool]$preLockRestoreSnapshot.RestoreSkippedByRetryBlock
+$restoreRetryBlockedMessage = [string]$preLockRestoreSnapshot.RetryBlockedMessage
+$shouldRestore = [bool]$preLockRestoreSnapshot.ShouldRestore
+# #476: причина, з якої реставрацію скасовано ПІСЛЯ отримання lock (текст
+# вето). Ініціалізується безумовно — Set-StrictMode не дозволяє читати
+# невстановлену змінну в SKIPPED-деталях нижче.
+$restoreVetoedAfterLockReason = $null
 $restoreReason = if ($ForceRestore) { "Примусово" } elseif ($missedRestoreDue) { "Пропущений плановий слот $($scheduledOccurrence.ToString('yyyy-MM-dd HH:mm'))$(if ($bootRestoreIgnoresWindow -and -not $restoreWindowOpen) { ' (boot-recovery поза вікном, профіль робочого часу)' })" } else { "$RestoreDayName, після $RestoreTime" }
 $CheckSize = -not $DisableSizeCheck
 if ($RunMissedRestoreOnly -and $missedDailyWork) {
@@ -6685,8 +7517,8 @@ $script:BRAVOMaintenanceMigrationStepEnabled = ($script:BRAVOMaintenanceLegacyMi
 #   [1/8] Перевірка вільного місця
 #   [2/8] Створення необхідних директорій
 #   [3/8] Зупинка служб
-#   [4/8] Перевірка розмірів .md
-#   [5/8] Реставрація моделі
+#   [4/8] Реставрація моделі
+#   [5/8] Перевірка розмірів .md
 #   [6/8] Обробка trace і логів
 #   [7/8] Відновлення стану служб
 #   [8/8] Контроль діапазонів ID
@@ -6852,9 +7684,17 @@ Write-Log -Message "Час: $($currentDate.ToString('HH:mm:ss'))" -NoTimestamp
 # «поза вікном» тепер можлива лише при РУЧНОМУ -RunMissedRestoreOnly на
 # 24/7-профілі: Scheduler-Repetition 15-хвилинних повторів прибрано у
 # 5.2.0, тому жодного «повторна спроба за N хв» тут більше немає.
-$missedRestoreActionableNow = $missedRestoreDue -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)
+# #438 (P2-1): заблокована лімітом реставрація не "дійсна зараз" — інакше
+# boot-прогін HoldServices щоранку зупиняв/запускав служби заради
+# реставрації, яка не виконається. -ForceRestore ліміт не обмежує.
+$missedRestoreActionableNow = $missedRestoreDue -and (-not $automaticRestoreRetryBlocked -or $ForceRestore) -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)
 if ($RunMissedRestoreOnly -and -not $missedDailyWork -and -not $missedRestoreActionableNow) {
-    if ($missedRestoreDue) {
+    if ($restoreSkippedByRetryBlock) {
+        # #438 (P2-4): заблокована ніч НЕ мовчазна — WARNING у журналі й
+        # критичний алерт тим самим хелпером, що й ніч ескалації.
+        Write-Log -Message "Recovery: $restoreRetryBlockedMessage" -Level 'WARNING'
+        Send-SlackAlert -Message $restoreRetryBlockedMessage -IsCritical
+    } elseif ($missedRestoreDue) {
         Write-Log -Message "Recovery: пропущена реставрація поза вікном $RestoreWindowStart-$RestoreWindowEnd; вона виконається у вікні (плановим Maintenance) або запустіть -ForceRestore свідомо" -Level 'INFO'
     } else {
         Write-Log -Message "Recovery: пропущених Backup/Maintenance не знайдено; завершення без дій" -Level 'INFO'
@@ -6868,15 +7708,21 @@ if ($RunMissedRestoreOnly -and -not $missedDailyWork -and -not $missedRestoreAct
     # Зовнішній try/finally (рядок ~55) все одно охоплює цей exit —
     # Wait-BRAVOManualExit спрацьовує так само, як і завжди.
     Complete-BRAVOProgress
+    # #438 (P3-1): заблокована лімітом ніч — НЕ чистий успіх (WARNING у
+    # журналі + критичний алерт вище), тож підсумок жовтий, а код завершення
+    # 10 (SuccessWithWarnings) через канонічний Resolve-BRAVOExitCode.
+    # Прогін без блокування лишається чистим успіхом: код 0.
+    $recoveryNoWorkExitCode = $(if ($restoreSkippedByRetryBlock) { Resolve-BRAVOExitCode -HasWarnings } else { Resolve-BRAVOExitCode })
+    $recoveryNoWorkStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $recoveryNoWorkExitCode
     Write-BRAVOFinalSummaryHeader `
         -Title 'BRAVO MAINTENANCE' `
-        -Status 'УСПІШНО' `
-        -StatusColor Green
-    Write-BRAVOResultField -Label 'Статус' -Value 'УСПІШНО' -Color Green
-    Write-BRAVOResultField -Label 'Код завершення' -Value ("0 — {0}" -f (Get-BRAVOExitCodeName -Code 0))
-    Write-BRAVOResultField -Label 'Результат' -Value 'Пропущених операцій не знайдено'
+        -Status $recoveryNoWorkStatus.Text `
+        -StatusColor $recoveryNoWorkStatus.Color
+    Write-BRAVOResultField -Label 'Статус' -Value $recoveryNoWorkStatus.Text -Color $recoveryNoWorkStatus.Color
+    Write-BRAVOResultField -Label 'Код завершення' -Value ("{0} — {1}" -f $recoveryNoWorkExitCode, (Get-BRAVOExitCodeName -Code $recoveryNoWorkExitCode))
+    Write-BRAVOResultField -Label 'Результат' -Value $(if ($restoreSkippedByRetryBlock) { 'Автоматичну реставрацію заблоковано — потрібна дія оператора (див. журнал)' } else { 'Пропущених операцій не знайдено' })
     Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
-    exit 0
+    exit $recoveryNoWorkExitCode
 }
 Write-Log -Message "Повідомлення: $NotificationProviderDisplayName; режим $(switch ($script:SlackMode) {'none' {'ВИМКНЕНО'} 'errors_only' {'ЛИШЕ ПОМИЛКИ'} 'all' {'УСІ ПОВІДОМЛЕННЯ'}})" -NoTimestamp
 
@@ -6936,6 +7782,16 @@ if ($BravoMaintenanceEnabled) {
             "$RestoreWindowStart-$RestoreWindowEnd. Слот буде підхоплено автоматично у вікні; " +
             "для позапланового запуску зараз використайте -ForceRestore."
         ) -Level "INFO"
+    }
+    # #438: WARNING, не INFO — на відміну від $restoreSkippedByWindow вище,
+    # це НЕ штатна відкладена ситуація: автоматичні повтори зупинено, і
+    # слот сам по собі не виконається — блок знімає лише оператор
+    # (-ForceRestore або обнулення RollbackRetryCount). Тому кожна
+    # заблокована ніч — ще й критичний алерт (P2-4), а не лише рядок у
+    # журналі з exit 10.
+    if ($restoreSkippedByRetryBlock) {
+        Write-Log -Message "Реставрацію пропущено. $restoreRetryBlockedMessage" -Level "WARNING"
+        Send-SlackAlert -Message $restoreRetryBlockedMessage -IsCritical
     }
     if ($ForceRestore -and -not $restoreWindowOpen) {
         # INFO, не WARNING: це констатація СВІДОМОЇ дії оператора (він сам
@@ -7151,6 +8007,69 @@ if (-not $maintenanceLockResult.Success) {
 }
 $script:maintenanceOperationLock = $maintenanceLockResult.Stream
 $script:maintenanceOperationLockPath = $maintenanceLockResult.Path
+
+# #476 (клас гонитви "очікування lock"): $shouldRestore і $missedRestoreDue
+# обчислені ДО Enter-BRAVOMaintenanceOperationLock, а очікування lock триває
+# до OperationLockWaitMinutes (типово 360 хв). Інший прогін (Maintenance чи
+# Recovery) за цей час міг ВИКОНАТИ той самий слот (маркер, Status=Succeeded),
+# спожити тижневу квоту примусовою реставрацією, вичерпати ліміт
+# поспіль-невдалих спроб або залишити пошкоджений стан — а цей прогін,
+# діючи за застарілим знімком, повторив би деструктивну реставрацію
+# (клієнтів уже вигнано, служби зупинено, модель вдруге перезаписано).
+# Тому відразу після отримання lock рішення рахується ЗАНОВО з тих самих
+# файлів і тих самих заморожених часових вхідних; цей знімок — єдине
+# авторитетне джерело (до запису 'Pending' і до вигнання клієнтів). Він може
+# лише ЗАБОРОНИТИ реставрацію (вето); перехід "не планувалась -> тепер потрібна"
+# реставрацію не вмикає. -ForceRestore вето не стосується.
+$postLockRestoreSnapshot = Get-BRAVOMaintenanceRestoreDecisionSnapshot `
+    -Purpose 'PostLock' `
+    -ScheduledOccurrence $scheduledOccurrence `
+    -ScheduledMarkerFile $scheduledMarkerFile `
+    -TodayMarkerFile $MARKER_FILE `
+    -IsRestoreDay ([bool]$isRestoreDay) `
+    -IsAfterRestoreTime ([bool]$isAfterRestoreTime) `
+    -RestoreWindowOpen ([bool]$restoreWindowOpen) `
+    -BootRestoreIgnoresWindow ([bool]$bootRestoreIgnoresWindow) `
+    -ForceRestore ([bool]$ForceRestore) `
+    -BravoMaintenanceEnabled ([bool]$BravoMaintenanceEnabled) `
+    -Limit $RestoreRollbackRetryLimit
+# Повторна перевірка лише ВЕТУЄ (strict): pre=false/post=true не вмикає реставрацію.
+$missedRestoreDue = $missedRestoreDue -and [bool]$postLockRestoreSnapshot.MissedRestoreDue
+$restoreVeto = Get-BRAVOMaintenanceRestoreSnapshotVeto `
+    -Before $preLockRestoreSnapshot -After $postLockRestoreSnapshot -ForceRestore ([bool]$ForceRestore)
+if ($restoreVeto.Veto) {
+    $shouldRestore = $false
+    $restoreVetoedAfterLockReason = [string]$restoreVeto.Message
+    Write-Log -Message $restoreVeto.Message -Level $restoreVeto.Level
+    if ($restoreVeto.Reason -ceq 'RetryBlocked' -or $restoreVeto.Reason -ceq 'StateCorrupt') {
+        # Заблокована лімітом чи пошкодженим станом ніч — не штатна ситуація:
+        # критичний алерт (окрема змінна, щоб не змішувати з алертами
+        # $restoreRetryBlockedMessage вище).
+        $restoreVetoMessage = [string]$restoreVeto.Message
+        Send-SlackAlert -Message $restoreVetoMessage -IsCritical
+    }
+    # Recovery без пропущеної денної роботи прийшов сюди лише заради цієї
+    # реставрації. Її скасовано — дій немає: lock звільняється, служби не
+    # чіпаються, compact-підсумок (без [1/8]...[8/8]) і код 0 (10, коли
+    # скасування — блокування лімітом чи пошкоджений стан, як у ранньому
+    # виході Recovery вище).
+    if ($RunMissedRestoreOnly -and -not $missedDailyWork) {
+        Exit-BRAVOMaintenanceOperationLock
+        Complete-BRAVOProgress
+        $recoveryVetoBlocked = ($restoreVeto.Reason -ceq 'RetryBlocked' -or $restoreVeto.Reason -ceq 'StateCorrupt')
+        $recoveryVetoExitCode = $(if ($recoveryVetoBlocked) { 10 } else { 0 })
+        $recoveryVetoStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $recoveryVetoExitCode
+        Write-BRAVOFinalSummaryHeader `
+            -Title 'BRAVO MAINTENANCE' `
+            -Status $recoveryVetoStatus.Text `
+            -StatusColor $recoveryVetoStatus.Color
+        Write-BRAVOResultField -Label 'Статус' -Value $recoveryVetoStatus.Text -Color $recoveryVetoStatus.Color
+        Write-BRAVOResultField -Label 'Код завершення' -Value ("{0} — {1}" -f $recoveryVetoExitCode, (Get-BRAVOExitCodeName -Code $recoveryVetoExitCode))
+        Write-BRAVOResultField -Label 'Результат' -Value $(if ($recoveryVetoBlocked) { 'Автоматичну реставрацію заблоковано — потрібна дія оператора (див. журнал)' } else { "Реставрацію скасовано після lock ($($restoreVeto.ShortReason)); інших операцій немає" })
+        Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
+        exit $recoveryVetoExitCode
+    }
+}
 
 $bravoLogRotationLogger = { param($Message, $Level) Write-Log -Message $Message -Level $Level }
 
@@ -7566,28 +8485,8 @@ Write-BRAVOMaintenanceStep `
         -WarningsBefore $stopServicesWarningsBefore `
         -Skipped:(-not $stopServicesRequired))
 
-# ===== ПЕРЕВІРКА РОЗМІРІВ ФАЙЛІВ .md =====
-Write-BRAVOProgressPhase -Phase 'Перевірка розмірів .md' -PercentComplete 35
-$checkSizeCriticalBefore = $script:criticalErrorOccurred
-$checkSizeWarningsBefore = $script:BRAVOWarningCount
-# dev.15: крок завжди рендериться (стабільна нумерація [N/8]) — SKIPPED
-# 'вимкнено', коли перевірку розмірів вимкнено, а не пропуск номера кроку.
-if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
-    Check-MdFileSizes -MODEL_PATH $MODEL_PATH -MAX_MD_FILE_SIZE $MAX_MD_FILE_SIZE -ExcludePatterns $MD_FILE_SIZE_EXCLUSIONS
-    Write-BRAVOMaintenanceStep `
-        -Name 'Перевірка розмірів .md' `
-        -Status (Get-BRAVOMaintenanceStepStatus `
-            -CriticalBefore $checkSizeCriticalBefore `
-            -WarningsBefore $checkSizeWarningsBefore)
-} else {
-    Write-BRAVOMaintenanceStep `
-        -Name 'Перевірка розмірів .md' `
-        -Status 'SKIPPED' `
-        -Details 'вимкнено'
-}
-
 # ===== ОПЕРАЦІЇ ПІСЛЯ ЗУПИНКИ СЕРВІСІВ =====
-Write-BRAVOProgressPhase -Phase 'Реставрація моделі' -PercentComplete 45
+Write-BRAVOProgressPhase -Phase 'Реставрація моделі' -PercentComplete 35
 $restoreCriticalBefore = $script:criticalErrorOccurred
 $restoreWarningsBefore = $script:BRAVOWarningCount
 $restoreStepReported = $false
@@ -7615,6 +8514,14 @@ $restoreMainModelValid = $true
 # ownership-маркера в suppressed (fail-closed, критична помилка вже
 # зарапортована в місці скасування).
 $restoreAbortedBeforeDestructivePhase = $false
+# true = реставрацію скасовано безпосередньо перед bravocmd.exe, бо повторне
+# читання стану (бар'єр 2, #476) показало, що слот уже виконано чи заблоковано
+# іншим прогоном. Це не збій: bravocmd.exe не викликався, модель не торкнута,
+# прапорці помилок не виставляються.
+$restoreVetoedBeforeBravocmd = $false
+# true = невдалу спробу цієї restore-сесії вже пораховано обліком
+# (Invoke-BRAVORestoreAttemptFailureAccounting); catch не додає другу (#477).
+$restoreFailureAccounted = $false
 # Базові лічильники етапу «Обробка trace і логів» — до розгалуження за
 # станом служби: підсумок етапу друкується в усіх гілках, зокрема й тоді,
 # коли BRAVO зупинити не вдалося. Тут лише ІНІЦІАЛІЗАЦІЯ (щоб під
@@ -7623,7 +8530,11 @@ $restoreAbortedBeforeDestructivePhase = $false
 $logsCriticalBefore = $script:criticalErrorOccurred
 $logsWarningsBefore = $script:BRAVOWarningCount
 $bravoStatus = if ($BravoMaintenanceEnabled) { (Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
-if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
+# Один знімок дозволу на файлові операції BRAVO для обох фаз нижче
+# (реставрація, потім trace): між ними тепер стоїть перевірка розмірів .md,
+# і обидві гілки мусять бачити той самий стан служби.
+$bravoFilePhaseAllowed = ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running")
+if ($bravoFilePhaseAllowed) {
     # P0 TOCTOU barrier 1 (перед входом у restore sequence): $shouldRestore
     # обчислений задовго до цього місця (до Enter-BRAVOMaintenanceOperationLock,
     # тобто до OperationLockWaitMinutes очікування, і до зупинки служб вище)
@@ -7723,6 +8634,26 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 # довго) — вікно могло закритися саме тут. Барʼєром не
                 # обмежуються -ForceRestore і boot-recovery профілю робочого
                 # часу ($bootRestoreIgnoresWindow).
+                #
+                # #476: той самий бар'єр перечитує й СТАН реставрації (маркер,
+                # restore state, ліміт, квота): за час архівації моделі інший
+                # прогін міг виконати слот чи вичерпати ліміт. Знімок рахується
+                # заново з тих самих заморожених часових вхідних і порівнюється зі
+                # знімком ДО lock; лише в бік заборони. -ForceRestore не обмежується.
+                $preDestructiveRestoreSnapshot = Get-BRAVOMaintenanceRestoreDecisionSnapshot `
+                    -Purpose 'PreDestructive' `
+                    -ScheduledOccurrence $scheduledOccurrence `
+                    -ScheduledMarkerFile $scheduledMarkerFile `
+                    -TodayMarkerFile $MARKER_FILE `
+                    -IsRestoreDay ([bool]$isRestoreDay) `
+                    -IsAfterRestoreTime ([bool]$isAfterRestoreTime) `
+                    -RestoreWindowOpen ([bool]$restoreWindowOpen) `
+                    -BootRestoreIgnoresWindow ([bool]$bootRestoreIgnoresWindow) `
+                    -ForceRestore ([bool]$ForceRestore) `
+                    -BravoMaintenanceEnabled ([bool]$BravoMaintenanceEnabled) `
+                    -Limit $RestoreRollbackRetryLimit
+                $preDestructiveVeto = Get-BRAVOMaintenanceRestoreSnapshotVeto `
+                    -Before $preLockRestoreSnapshot -After $preDestructiveRestoreSnapshot -ForceRestore ([bool]$ForceRestore)
                 if (-not $bootRestoreIgnoresWindow -and
                     -not (Test-BRAVORestoreExecutionStillAllowed `
                         -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd `
@@ -7735,6 +8666,14 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                         "реставрацією. bravocmd.exe НЕ викликано; архів перед реставрацією збережено: " +
                         "$beforeArchivePath. Плановий слот лишається непозначеним як виконаний — " +
                         "наступний плановий Maintenance повторить спробу в межах вікна."
+                    ) -Level "WARNING"
+                } elseif (-not $ForceRestore -and $preDestructiveVeto.Veto) {
+                    $restoreVetoedBeforeBravocmd = $true
+                    $exitCode = $null
+                    Write-Log -Message (
+                        "Реставрацію скасовано безпосередньо перед bravocmd.exe: стан реставрації змінився " +
+                        "під час архівації моделі ($($preDestructiveVeto.ShortReason)). bravocmd.exe НЕ викликано; " +
+                        "модель не торкнута; архів перед реставрацією збережено: $beforeArchivePath."
                     ) -Level "WARNING"
                 } else {
                     # Suppressed-фаза (quiescence): на час деструктивного
@@ -7761,7 +8700,51 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             $script:restoreArchiveFailed = $true
                         }
                     }
+                    # #438 (P1-3): write-ahead лічильника спроби — атомарно, в
+                    # той самий BRAVO_RESTORE_STATE.json, НЕПОСЕРЕДНЬО перед
+                    # деструктивним bravocmd. Жорстке переривання, bravocmd
+                    # exit != 0 без відкату чи не готовий after-архів після цієї
+                    # точки лишаються в лічильнику (чистий результат його
+                    # скидає). Збій запису = реставрація НЕ починається
+                    # (модель ще не торкнута). Примусовий шлях write-ahead не
+                    # пише: оператор присутній і ліміт його не обмежує.
+                    if ($quiescenceSuppressionReady -and -not $ForceRestore) {
+                        try {
+                            $restoreAttemptBegin = Register-BRAVORestoreAttemptBegin `
+                                -ScheduledOccurrence $scheduledOccurrence -Reason $restoreReason -Limit $RestoreRollbackRetryLimit
+                            Write-Log -Message "Лічильник спроби реставрації записано перед bravocmd.exe (write-ahead): спроба $($restoreAttemptBegin.Count) з $RestoreRollbackRetryLimit до блокування автоматичних повторів." -Level "INFO"
+                        } catch {
+                            $quiescenceSuppressionReady = $false
+                            $restoreAbortedBeforeDestructivePhase = $true
+                            $exitCode = $null
+                            $errorMsg = if ($_.Exception.Message -clike 'Ліміт повторів реставрації вже досягнуто*') {
+                                "Реставрацію скасовано перед bravocmd.exe (Issue #438): $($_.Exception.Message) bravocmd.exe НЕ викликано; модель не торкнута; архів перед реставрацією збережено: $beforeArchivePath"
+                            } else {
+                                "Реставрацію скасовано перед bravocmd.exe (Issue #438): не вдалося атомарно записати лічильник спроби (write-ahead) у BRAVO_RESTORE_STATE.json: $($_.Exception.Message). bravocmd.exe НЕ викликано; модель не торкнута; архів перед реставрацією збережено: $beforeArchivePath"
+                            }
+                            Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+                            Send-SlackAlert -Message $errorMsg -IsCritical
+                            $script:criticalErrorOccurred = $true
+                            $script:restoreArchiveFailed = $true
+                            # #438 (P3-3): модель не торкнута, а маркер уже
+                            # переведено в suppressed — повертаємо право
+                            # автостарту (no-op, якщо маркер не suppressed).
+                            # Менша й безпечніша зміна, ніж переставляти
+                            # write-ahead ПЕРЕД suppression: тоді збій
+                            # suppression лишав би лічильник збільшеним без
+                            # жодної спроби bravocmd.
+                            Restore-BRAVOMaintenanceQuiescenceAutostart
+                        }
+                    }
                     if ($quiescenceSuppressionReady) {
+                        # #477: від цієї миті деструктив ПОЧАТО, а цілісність моделі
+                        # НЕ доведено — аж до результату Invoke-BRAVOModelRestoreRecovery
+                        # (він поверне true лише з доведеною цілісністю). Виняток
+                        # посеред цієї фази (Invoke-CommandWithLog, recovery, після-
+                        # архівація) тоді не лишить прапорець у хибному true: служби
+                        # не стартують над напіввідновленою моделлю (fail-closed).
+                        $script:restoreDestructiveStarted = $true
+                        $script:modelIntegrityEstablished = $false
                         # Виконання реставрації через bravocmd.exe (як в еталоні)
                         $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
                         # Без суфікса продукту в описі: проєкт моделі може бути
@@ -7772,10 +8755,10 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     }
                 }
 
-                if ($restorePostponedByWindowClosing -or $restoreAbortedBeforeDestructivePhase) {
-                    # bravocmd не викликаний (пауза через вікно — не помилка;
-                    # скасування через suppression уже зарапортоване вище як
-                    # критичне), маркер/state не пишуться, гілки exitCode
+                if ($restorePostponedByWindowClosing -or $restoreAbortedBeforeDestructivePhase -or $restoreVetoedBeforeBravocmd) {
+                    # bravocmd не викликаний (пауза через вікно чи вето за станом
+                    # реставрації — не помилка; скасування через suppression уже
+                    # зарапортоване вище як критичне), маркер/state не пишуться, гілки exitCode
                     # -eq/-ne 0 нижче свідомо не виконуються (exitCode -eq
                     # $null для обох).
                 } else {
@@ -7805,6 +8788,14 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                         $mainModelRelativeHint = $null
                     }
 
+                    if ($null -ne $RestoreSmallFileThreshold.InvalidValue) {
+                        Write-Log -Message ("Некоректне значення Restore.IntegritySmallFileThresholdBytes " +
+                            "'$($RestoreSmallFileThreshold.InvalidValue)' (очікується ціле число байт від 0 до 104857600); " +
+                            "використано типовий поріг $($RestoreSmallFileThreshold.ThresholdBytes) байт") -Level "WARNING"
+                    }
+                    Write-Log -Message ("Поріг малого файлу для перевірки розмірів MODEL: " +
+                        "$($RestoreSmallFileThreshold.ThresholdBytes) байт (менші файли критичні лише при зникненні або обнуленні)") -Level "INFO"
+
                     # Механізм перевірки+відкату — невідʼємна частина реставрації,
                     # виконується завжди (незалежно від -DisableSizeCheck).
                     $recovery = Invoke-BRAVOModelRestoreRecovery `
@@ -7814,7 +8805,8 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                         -MainModelRelativePath $mainModelRelativeHint `
                         -BeforeArchivePath "$ARC_DIR\$ARCH_NAME1" `
                         -ARC_PATH $ARC_PATH `
-                        -MinSizeBytes 2048
+                        -MinSizeBytes 2048 `
+                        -SmallFileThresholdBytes $RestoreSmallFileThreshold.ThresholdBytes
                     $restoreRemovedByRepairCount = $recovery.RemovedByRepairCount
                     $restoreCriticalCount = $recovery.CriticalCount
                     $restoreMainModelValid = $recovery.MainModelValid
@@ -7883,6 +8875,16 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             Send-SlackAlert -Message $errorMsg -IsCritical
                             $script:criticalErrorOccurred = $true
                             $script:restoreArchiveFailed = $true
+                            # #438 (P1-3): слот не закрито (маркер/Succeeded не
+                            # створюються) — без обліку така ніч повторювалась би
+                            # щоночі без ліміту. Це спроба, що не завершилась чистим
+                            # результатом.
+                            # Прапорець — ДО виклику: виняток із хвоста обліку не має
+                            # призвести до другого обліку (скидання ліміту спроб).
+                            $restoreFailureAccounted = $true
+                            [void](Invoke-BRAVORestoreAttemptFailureAccounting `
+                                -ScheduledOccurrence $scheduledOccurrence -Fingerprint 'CLASS:AFTER-ARCHIVE-NOT-READY' `
+                                -ForceRestore ([bool]$ForceRestore) -Reason $restoreReason -Limit $RestoreRollbackRetryLimit)
                         }
                         
                         # Створення маркера ЛИШЕ при успішній реставрації без критичних змін
@@ -7951,18 +8953,84 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             # before-архів невалідний) — служби НЕ піднімати
                             # (гейт нижче), потрібне ручне відновлення.
                             # CRITICAL-алерт уже надіслано у Invoke-BRAVOModelRestoreRecovery.
+                            # Код завершення — RestoreFailed (43), а не 40: ненульовий
+                            # код bravocmd.exe виставляє restoreArchiveFailed як побічний
+                            # ефект Invoke-CommandWithLog (а в Resolve-BRAVOExitCode
+                            # 40 стоїть вище за 43), хоча before-архів створено успішно.
+                            # Повертаємо ОБИДВА прапорці до значень ДО сесії. Compare-FileSizes
+                            # /відкат виставляють restoreIntegrityFailed (41) ще до провалу
+                            # відкату (CRITICAL-алерти вже надіслано), а Resolve-BRAVOExitCode
+                            # перевіряє 40 -> 41 -> 43: без скидання найнебезпечніший стан
+                            # (модель не верифіковано, служби утримано, маркер suppressed)
+                            # звітувався б як 41, тоді як OPERATIONS і catch-шлях (#477) кажуть
+                            # 43. Справжній 41 лишається, лише коли деструктивну фазу
+                            # не було розпочато.
+                            $script:restoreArchiveFailed = $restoreArchiveFailedBefore
+                            $script:restoreIntegrityFailed = $restoreIntegrityFailedBefore
                             Write-Log -Message "Реставрація провалилась і цілісність моделі НЕ встановлено (rollback=$restoreRollbackStatus). Служби BRAVO не піднімаються — потрібне ручне відновлення з $ARC_DIR\$ARCH_NAME1." -Level "ERROR"
                         }
+                        # #438 (P1-1/P1-3): КОЖНА невдала спроба після початку
+                        # деструктивного кроку підтверджує свій клас збою (набір
+                        # критичних файлів без розмірів, або причина для ранніх
+                        # виходів порівняння / bravocmd exit != 0 без відкату /
+                        # збою відкату). Write-ahead уже порахував спробу; тут
+                        # лише уточнюється клас. Збій запису лічильника не
+                        # змінює код завершення (43 лишається за restoreFailed).
+                        $restoreFailureClass = Get-BRAVORestoreAttemptFailureClass `
+                            -RollbackStatus ([string]$restoreRollbackStatus) `
+                            -HasCriticalChanges ([bool]$recovery.HasCriticalChanges) `
+                            -IntegrityEstablished ([bool]$recovery.IntegrityEstablished) `
+                            -CriticalFiles @($recovery.CriticalFiles) `
+                            -FailureClass ([string]$recovery.FailureClass)
+                        # Прапорець — ДО виклику (див. вище): другий облік недопустимий.
+                        $restoreFailureAccounted = $true
+                        [void](Invoke-BRAVORestoreAttemptFailureAccounting `
+                            -ScheduledOccurrence $scheduledOccurrence -Fingerprint $restoreFailureClass `
+                            -ForceRestore ([bool]$ForceRestore) -Reason $restoreReason -Limit $RestoreRollbackRetryLimit)
                     }
                 }
             }
         }
         catch {
-            $errorMsg = "Критична помилка під час реставрації: $($_.Exception.Message)"
-            Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-            Send-SlackAlert -Message $errorMsg -IsCritical
-            $script:criticalErrorOccurred = $true
-            $script:restoreArchiveFailed = $true
+            $restoreExceptionText = $_.Exception.Message
+            # #477: виняток ПІСЛЯ запуску bravocmd.exe, коли цілісність моделі не
+            # встановлено, — не збій архівації (40), а невірифікована деструктивна
+            # фаза: модель може бути напіввідновленою. Класифікує чиста функція.
+            $restoreExceptionDisposition = Get-BRAVORestoreExceptionDisposition `
+                -DestructiveStarted ([bool]$script:restoreDestructiveStarted) `
+                -IntegrityEstablished ([bool]$script:modelIntegrityEstablished) `
+                -AlreadyAccounted ([bool]$restoreFailureAccounted) `
+                -ArchiveFailedBefore ([bool]$restoreArchiveFailedBefore) `
+                -IntegrityFailedBefore ([bool]$restoreIntegrityFailedBefore)
+            if ($restoreExceptionDisposition.Unverified) {
+                # Прапорці — першими, ще до обліку: збій обліку не повинен
+                # змінити код завершення. Прапорці архіву/цілісності повертаються
+                # до значень ДО сесії (побічні ефекти Invoke-CommandWithLog), тож
+                # код — RestoreFailed (43). Рекавері тут не викликається: стан
+                # моделі невідомий, служби не стартують, quiescence-маркер лишається
+                # suppressed (Restore-BRAVOMaintenanceQuiescenceAutostart не викликається).
+                $script:restoreFailed = $true
+                $script:criticalErrorOccurred = $true
+                $script:restoreArchiveFailed = $restoreExceptionDisposition.RestoreArchiveFailed
+                $script:restoreIntegrityFailed = $restoreExceptionDisposition.RestoreIntegrityFailed
+                if ($null -ne $restoreExceptionDisposition.AccountingFingerprint) {
+                    # Прапорець — ДО виклику: виняток із хвоста обліку (лог/алерт)
+                    # не має призвести до другого обліку (скидання ліміту спроб).
+                    $restoreFailureAccounted = $true
+                    [void](Invoke-BRAVORestoreAttemptFailureAccounting `
+                        -ScheduledOccurrence $scheduledOccurrence -Fingerprint 'CLASS:EXCEPTION-AFTER-BRAVOCMD' `
+                        -ForceRestore ([bool]$ForceRestore) -Reason $restoreReason -Limit $RestoreRollbackRetryLimit)
+                }
+                $errorMsg = "КРИТИЧНО: виняток після запуску bravocmd.exe (деструктивна фаза реставрації): $restoreExceptionText. Цілісність моделі НЕ перевірено — служби BRAVO не стартують (fail-closed), quiescence-маркер лишається suppressed. Потрібне ручне відновлення MODEL з before-архіву $ARC_DIR\$ARCH_NAME1."
+                Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+                Send-SlackAlert -Message $errorMsg -IsCritical
+            } else {
+                $errorMsg = "Критична помилка під час реставрації: $restoreExceptionText"
+                Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+                Send-SlackAlert -Message $errorMsg -IsCritical
+                $script:criticalErrorOccurred = $true
+                $script:restoreArchiveFailed = $true
+            }
         }
         # Retention-гейт (task item 9): знімок ДО/ПІСЛЯ (той самий ідіом, що
         # $restoreCriticalBefore/$restoreWarningsBefore вище) — а не сирі
@@ -7972,9 +9040,13 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
         # потрібно — лише на збій САМЕ цієї restore-сесії.
         # Умова обчислюється всередині if ($shouldRestore) — додатковий
         # $shouldRestore тут завжди був true.
+        # #477: невірифікована деструктивна фаза (цілісність моделі не
+        # встановлено) теж небезпечна для retention — навіть коли прапорці
+        # архіву/цілісності повернуто до значень ДО сесії (код 43).
         $restoreSessionUnsafeForRetention = (
             ($script:restoreArchiveFailed -and -not $restoreArchiveFailedBefore) -or
-            ($script:restoreIntegrityFailed -and -not $restoreIntegrityFailedBefore)
+            ($script:restoreIntegrityFailed -and -not $restoreIntegrityFailedBefore) -or
+            (-not $script:modelIntegrityEstablished)
         )
         # Компактні деталі кроку (task item 13) — повний файловий список
         # лишається лише в Write-Log/Send-SlackAlert вище (authoritative log).
@@ -7986,6 +9058,9 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 "| Critical=$restoreCriticalCount | Rollback=$restoreRollbackStatus | MainModel=$mainModelStatusText"
             )
         }
+        if ($restoreVetoedBeforeBravocmd) {
+            $restoreStepDetails += " | скасовано перед bravocmd: $($preDestructiveVeto.ShortReason)"
+        }
         Write-BRAVOMaintenanceStep `
             -Name 'Реставрація моделі' `
             -Status (Get-BRAVOMaintenanceStepStatus `
@@ -7994,18 +9069,78 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
             -Details $restoreStepDetails
         $restoreStepReported = $true
     }
+}
 
-    # Обробка Trace належить лише до компонента основної служби BRAVO.
-    #
-    # Зріз лічильників пересвіжується САМЕ ТУТ, після завершення
-    # реставрації: початкова ініціалізація вище знімається ДО неї, тому
-    # критична помилка реставрації опинялася "новою" для цього етапу і
-    # фарбувала його в FAIL. Реальний DEV-LIMS негативний прогін 19:48
-    # (bravocmd вбито -> exit 43) показав [6/8] FAIL з деталями
-    # "оброблено файлів: 2" — тобто етап відпрацював, а червоним був через
-    # чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.
-    $logsCriticalBefore = $script:criticalErrorOccurred
-    $logsWarningsBefore = $script:BRAVOWarningCount
+# Реставрація моделі — стабільний крок [4/8], завжди рендериться, і має
+# рендеритись ДО «Перевірка розмірів .md» [5/8] і «Обробка trace і логів»
+# [6/8] — той самий порядок, що в затвердженому operator contract,
+# незалежно від того, чи справді
+# виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
+# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з трьох причин,
+# які варто розрізняти в Details:
+# - вікно закрилося під час очікування lock/підготовки (Barrier 1) — було
+#   заплановано, безпечно відкладено, наступний daily Recovery повторить;
+# - $shouldRestore було true, але службу BRAVO не вдалося зупинити —
+#   заплановане й невиконане, а не «не настав час»;
+# - $shouldRestore було false від самого початку — реставрація цього
+#   прогону не планувалась взагалі (dev.15: раніше цей випадок не
+#   рендерив крок взагалі, номер кроку "з'їдався").
+# dev.15 (виправлення порядку): цей fallback раніше стояв ПІСЛЯ рендеру
+# «Обробка trace і логів» нижче — коли $shouldRestore=false (типовий
+# щоденний прогін без запланованої реставрації), Logs встигав зайняти
+# номер [5/8], а Restore-SKIPPED зсувався на [6/8], міняючи затверджений
+# порядок місцями. Переміщено вище рендеру Logs, щоб порядок номерів
+# лишався стабільним у БУДЬ-якому сценарії.
+if (-not $restoreStepReported) {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Реставрація моделі' `
+        -Status 'SKIPPED' `
+        -Details $(
+            if ($restorePostponedByWindowClosing) { 'вікно закрилося під час очікування lock/підготовки' }
+            elseif ($restoreVetoedAfterLockReason) { "скасовано після lock: $($restoreVeto.ShortReason)" }
+            elseif ($shouldRestore) { 'службу BRAVO не було зупинено' }
+            elseif ($weeklyRestoreQuotaConsumed) { 'цього тижня вже виконано примусову' }
+            else { 'не заплановано на цей запуск' }
+        )
+}
+
+# ===== ПЕРЕВІРКА РОЗМІРІВ ФАЙЛІВ .md =====
+# Виконується ПІСЛЯ реставрації: bravocmd repair штатно стискає .md
+# (реальний прогін: 1,64 ГБ до реставрації -> 1,21 ГБ після), тож знімок
+# до неї давав хибну тривогу «.md > ліміт» про файл, який реставрація
+# щойно зменшила. Зменшення файлу тут не тривога; зниклий чи обнулений
+# після repair файл ловить самоперевірка реставрації (Compare-FileSizes).
+Write-BRAVOProgressPhase -Phase 'Перевірка розмірів .md' -PercentComplete 55
+$checkSizeCriticalBefore = $script:criticalErrorOccurred
+$checkSizeWarningsBefore = $script:BRAVOWarningCount
+# dev.15: крок завжди рендериться (стабільна нумерація [N/8]) — SKIPPED
+# 'вимкнено', коли перевірку розмірів вимкнено, а не пропуск номера кроку.
+if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
+    Check-MdFileSizes -MODEL_PATH $MODEL_PATH -MAX_MD_FILE_SIZE $MAX_MD_FILE_SIZE -ExcludePatterns $MD_FILE_SIZE_EXCLUSIONS
+    Write-BRAVOMaintenanceStep `
+        -Name 'Перевірка розмірів .md' `
+        -Status (Get-BRAVOMaintenanceStepStatus `
+            -CriticalBefore $checkSizeCriticalBefore `
+            -WarningsBefore $checkSizeWarningsBefore)
+} else {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Перевірка розмірів .md' `
+        -Status 'SKIPPED' `
+        -Details 'вимкнено'
+}
+
+# Обробка Trace належить лише до компонента основної служби BRAVO.
+#
+# Зріз лічильників пересвіжується САМЕ ТУТ, після реставрації і перевірки
+# розмірів .md: початкова ініціалізація вище знімається ДО них, тому
+# критична помилка реставрації опинялася "новою" для цього етапу і
+# фарбувала його в FAIL. Реальний DEV-LIMS негативний прогін 19:48
+# (bravocmd вбито -> exit 43) показав [6/8] FAIL з деталями
+# "оброблено файлів: 2" — тобто етап відпрацював, а червоним був через
+# чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.
+$logsCriticalBefore = $script:criticalErrorOccurred
+$logsWarningsBefore = $script:BRAVOWarningCount
+if ($bravoFilePhaseAllowed) {
     Write-BRAVOProgressPhase -Phase 'Обробка trace і логів' -PercentComplete 60
     try {
         if ($BravoMaintenanceEnabled) {
@@ -8131,37 +9266,6 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
     } else {
         Write-Log -Message "Ротацію логів BRAVO Web пропущено: службу $BravoWebServiceName не зупинено (стан: $bravoWebStatus)" -Level "WARNING"
     }
-}
-
-# Реставрація моделі — стабільний крок [5/8], завжди рендериться, і має
-# рендеритись ДО «Обробка trace і логів» [6/8] — той самий порядок, що в
-# затвердженому operator contract, незалежно від того, чи справді
-# виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
-# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з трьох причин,
-# які варто розрізняти в Details:
-# - вікно закрилося під час очікування lock/підготовки (Barrier 1) — було
-#   заплановано, безпечно відкладено, наступний daily Recovery повторить;
-# - $shouldRestore було true, але службу BRAVO не вдалося зупинити —
-#   заплановане й невиконане, а не «не настав час»;
-# - $shouldRestore було false від самого початку — реставрація цього
-#   прогону не планувалась взагалі (dev.15: раніше цей випадок не
-#   рендерив крок взагалі, номер кроку "з'їдався").
-# dev.15 (виправлення порядку): цей fallback раніше стояв ПІСЛЯ рендеру
-# «Обробка trace і логів» нижче — коли $shouldRestore=false (типовий
-# щоденний прогін без запланованої реставрації), Logs встигав зайняти
-# номер [5/8], а Restore-SKIPPED зсувався на [6/8], міняючи затверджений
-# порядок місцями. Переміщено вище рендеру Logs, щоб порядок номерів
-# лишався стабільним у БУДЬ-якому сценарії.
-if (-not $restoreStepReported) {
-    Write-BRAVOMaintenanceStep `
-        -Name 'Реставрація моделі' `
-        -Status 'SKIPPED' `
-        -Details $(
-            if ($restorePostponedByWindowClosing) { 'вікно закрилося під час очікування lock/підготовки' }
-            elseif ($shouldRestore) { 'службу BRAVO не було зупинено' }
-            elseif ($weeklyRestoreQuotaConsumed) { 'цього тижня вже виконано примусову' }
-            else { 'не заплановано на цей запуск' }
-        )
 }
 
 # Підсумковий рядок етапу — поза блоком BRAVO Web. Раніше він стояв
@@ -8852,12 +9956,18 @@ if ($COMPRESSED_LOG_DELETION_ENABLED -and $expiredCompressedLogCount -gt 0) {
 # restore-сесія (якщо вона була цього циклу) завершилась чисто успішно —
 # інакше pruning під час аварійного run міг би зачепити щойно створені
 # діагностичні before/after-архіви цієї ж сесії (task item 9).
+# #438 (P2-3): стан читається ТУТ (після реставрації цього прогону), а не
+# зі знімка на старті — щойно записаний лічильник теж захищає сесії.
+$restoreRetentionStateRead = Get-BRAVORestoreStateReadResult
+$restoreRetentionProtectBeforeOnly = Test-BRAVORestoreRetentionProtectionActive `
+    -State $restoreRetentionStateRead.State -StateCorrupt ($restoreRetentionStateRead.Status -ceq 'Corrupt')
 if ($BravoMaintenanceEnabled -and $restoreArchiveDeleteCandidateGroups.Count -gt 0 -and -not $restoreSessionUnsafeForRetention) {
     Remove-OldRestoreArchives `
         -Path $ARC_DIR `
         -ArchivePrefix $ArchivePrefix `
         -KeepCount $RESTORE_ARCHIVES_KEEP_COUNT `
-        -InvalidRetentionDays $FAILED_ARCHIVE_RETENTION_DAYS
+        -InvalidRetentionDays $FAILED_ARCHIVE_RETENTION_DAYS `
+        -ProtectBeforeOnlySessions:$restoreRetentionProtectBeforeOnly
 } elseif ($restoreSessionUnsafeForRetention) {
     Write-Log -Message "Retention архівів реставрації пропущено: поточна restore-сесія завершилась помилкою або rollback." -Level "WARNING"
 }

@@ -17,6 +17,28 @@ function Assert-BRAVOPowerShellCompatibility {
     }
 }
 
+# Чи безпечно перемикати кодову сторінку самої консолі. На Windows до 10
+# (Server 2012/2012 R2, Windows 8.1) консоль із кодовою сторінкою 65001
+# не може вивести не-ASCII текст: WriteConsole повертає ERROR_GEN_FAILURE
+# (31, "A device attached to the system is not functioning"), і перший же
+# Write-Host з кирилицею обриває скрипт. У ручному запуску консоль із
+# TrueType-шрифтом це переживає, а консоль SYSTEM у сесії 0 (заплановані
+# завдання) — ні: завдання завершувались з кодом 1 ще до відкриття логу.
+# Тому на старих ОС у неінтерактивній сесії кодову сторінку консолі не
+# чіпаємо: Write-Host виводить Unicode через WriteConsoleW і без неї.
+function Test-BRAVOConsoleCodePageChangeSafe {
+    [CmdletBinding()]
+    param(
+        [int]$CodePage = 65001,
+        [Version]$OSVersion = [Environment]::OSVersion.Version,
+        [bool]$UserInteractive = [Environment]::UserInteractive
+    )
+
+    if ($CodePage -ne 65001) { return $true }
+    if ($OSVersion.Major -ge 10) { return $true }
+    return $UserInteractive
+}
+
 function Initialize-BRAVOConsoleEncoding {
     [CmdletBinding()]
     param([int]$CodePage = 65001)
@@ -33,6 +55,9 @@ function Initialize-BRAVOConsoleEncoding {
         # програмами, а Console.OutputEncoding узгоджує кодову сторінку
         # самого вікна консолі. Помилка в сеансі без консолі не є критичною.
         $global:OutputEncoding = $consoleEncoding
+        if (-not (Test-BRAVOConsoleCodePageChangeSafe -CodePage $CodePage)) {
+            return $false
+        }
         try {
             [Console]::OutputEncoding = $consoleEncoding
         } catch {
@@ -343,100 +368,6 @@ function Get-BRAVOPowerShellUpdateRecommendation {
         DotNetRelease = $DotNetRelease
         HasRequiredDotNet = $hasRequiredDotNet
         IsServer = $isServer
-        Message = $message
-    }
-}
-
-function Get-BRAVOWindowsPatchLevelRecommendation {
-    [CmdletBinding()]
-    param(
-        # Дозволяє підставити тестові дані замість реального Get-HotFix.
-        [object[]]$InstalledHotfixes,
-
-        [datetime]$Now = (Get-Date),
-
-        # Скільки днів без оновлень вважати приводом для попередження.
-        # Не привʼязано до конкретних KB чи дат випуску Microsoft, тому
-        # перевірка лишається чинною без ручного супроводу цього коду.
-        [ValidateRange(1, 3650)]
-        [int]$StaleAfterDays = 120
-    )
-
-    $osVersion = [Environment]::OSVersion.Version
-    $osCaption = $null
-    $updateBuildRevision = $null
-    try {
-        $currentVersionKey = Get-ItemProperty `
-            -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" `
-            -ErrorAction Stop
-        $osCaption = [string]$currentVersionKey.ProductName
-        if ($null -ne $currentVersionKey.UBR) {
-            $updateBuildRevision = [int]$currentVersionKey.UBR
-        }
-    } catch {
-        $osCaption = [Environment]::OSVersion.VersionString
-    }
-    $buildDescription = if ($null -ne $updateBuildRevision) {
-        "{0}.{1}" -f $osVersion.Build, $updateBuildRevision
-    } else {
-        [string]$osVersion.Build
-    }
-
-    if ($null -eq $InstalledHotfixes) {
-        try {
-            $InstalledHotfixes = @(Get-HotFix -ErrorAction Stop)
-        } catch {
-            $InstalledHotfixes = @()
-        }
-    }
-    $lastInstalledOn = $InstalledHotfixes |
-        Where-Object { $null -ne $_.InstalledOn } |
-        Sort-Object -Property InstalledOn -Descending |
-        Select-Object -First 1 -ExpandProperty InstalledOn
-
-    if ($null -eq $lastInstalledOn) {
-        return New-Object PSObject -Property @{
-            IsUpdateRecommended = $true
-            LastInstalledOn = $null
-            DaysSinceLastUpdate = $null
-            OperatingSystem = $osCaption
-            Build = $buildDescription
-            Message = (
-                "Не вдалося визначити дату останнього оновлення Windows на цьому " +
-                "комп'ютері (ОС: $osCaption, білд $buildDescription). Перевірте " +
-                "історію оновлень вручну через Windows Update і встановіть " +
-                "найновіші оновлення, якщо давно цього не робили. Пакети " +
-                "завантажуйте лише з офіційного Microsoft Update Catalog " +
-                "(catalog.update.microsoft.com). Скрипт продовжує роботу, " +
-                "автоматичне встановлення не виконується."
-            )
-        }
-    }
-
-    $daysSinceLastUpdate = [int]($Now - $lastInstalledOn).TotalDays
-    $isStale = $daysSinceLastUpdate -gt $StaleAfterDays
-
-    $message = if ($isStale) {
-        (
-            "Останнє оновлення Windows встановлено {0:yyyy-MM-dd} ({1} дн. тому) " +
-            "на комп'ютері з ОС {2}, білд {3}. Застарілі накопичувальні оновлення " +
-            "підвищують ризик відомих і вже виправлених дефектів .NET/CLR " +
-            "(включно з аварійним завершенням powershell.exe під час рекурсивного " +
-            "обходу каталогів). Рекомендовано встановити найновіше кумулятивне " +
-            "оновлення через Windows Update або Microsoft Update Catalog " +
-            "(catalog.update.microsoft.com), після цього перезавантажити " +
-            "комп'ютер. Скрипт продовжує роботу, автоматичне встановлення не виконується."
-        ) -f $lastInstalledOn, $daysSinceLastUpdate, $osCaption, $buildDescription
-    } else {
-        $null
-    }
-
-    return New-Object PSObject -Property @{
-        IsUpdateRecommended = $isStale
-        LastInstalledOn = $lastInstalledOn
-        DaysSinceLastUpdate = $daysSinceLastUpdate
-        OperatingSystem = $osCaption
-        Build = $buildDescription
         Message = $message
     }
 }

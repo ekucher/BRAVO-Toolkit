@@ -1,5 +1,322 @@
 # Changelog
 
+## 5.2.5 — 2026-10-26
+
+Stable promotion від прийнятого `5.2.5-rc.8` (тег `v5.2.5-rc.8`, коміт-stamp `8aacaac`, sourceCommit `36541ea`) —
+hotfix від stable `5.2.4` (RELEASE_POLICY §12). Промоція лише метаданих: функціональних runtime-змін відносно
+`5.2.5-rc.8` немає; `.ps1`/`.psm1`/`.psd1` не змінювались, `ModuleVersion` модулів уже дорівнює базовій версії
+`5.2.5`, `configSchemaVersion` і `stateSchemaVersion` не змінено.
+
+Зміст 5.2.5 відносно 5.2.4 — розділи `5.2.5-rc.1`–`5.2.5-rc.8` нижче. Головне:
+
+- runtime guard: SemVer-перевірка відкату версії для prerelease (rc.8);
+- ліміт повторів автоматичної реставрації після відкоту (#438), рішення про реставрацію після lock (#476),
+  код `43` і заборона старту служб після винятку `bravocmd.exe` (#477) (rc.7);
+- retention не видаляє повну (COMPLETE) резервну копію як «невдалу» (#335) (rc.7);
+- WinSCP: таймаут перевірки SFTP і lock до виходу процесу (#290), захищений DACL скрипта Health (#469) (rc.7);
+- хибний відкат моделі після реставрації (exit `43`) і порядок перевірки розмірів `.md` (rc.5, rc.6);
+- сумісність з Windows Server 2012/2012 R2 і .NET Framework < 4.6.1 (rc.2, rc.3), недосяжний UNC у DataRestore
+  (rc.1).
+
+### Результат acceptance `5.2.5-rc.8`
+
+Тестовий хост HOST-01 (Windows Server 2022, Windows PowerShell 5.1, .NET release 528449), production не задіяно.
+Кроки з правами адміністратора виконувались вручну та обмеженим runner-ом під `SYSTEM`.
+
+| Перевірка | Результат |
+|---|---|
+| T1: `BRAVO_SETUP -ValidateOnly`, `BRAVO_DRY_RUN` (зокрема `-TestAccess`), `BRAVO_SELF_TEST` — на `5.2.4` і на rc.8 | PASS |
+| T2: оновлення `5.2.4` → rc.8 зі збереженням `BRAVO.config` і `BRAVO.local.config`; відкат на `5.2.4` блокується кодом `35`; свідомий відкат (`BRAVO_ALLOW_DOWNGRADE=1`) і повторне оновлення на rc.8 | PASS |
+| T3: Archive, перелік generation, OutOfPlace-відновлення, Maintenance | PASS |
+| T3, #438: два невдалі відкоти → автоматичну реставрацію заблоковано; `-ForceRestore` (bravocmd `0`, `MainModel=OK`, `Rollback=NONE`) скидає лічильник | PASS |
+| T4: завдання Планувальника під `SYSTEM` за розкладом (Archive, Health, Maintenance) | PASS |
+| T5: runtime guard — `33` (змінений файл, сторонній скрипт), `34` (`Mode=Warn`), `35` (відкат) | PASS |
+
+### Межі доказу
+
+- Сценарій #335 на живому хості (транзієнтна помилка читання архіву простроченої generation) не відтворювався;
+  поведінку покривають регресійні перевірки self-test.
+- Для rc.8 не повторено прогони на Windows Server 2012/2012 R2 і на хості з .NET Framework 4.5.x.
+
+**Відомі проблеми (не виправлено в 5.2.5):**
+
+- Ті самі, що для `5.2.5-rc.7` (див. розділ нижче): #422 (з мітигацією
+  `'maintenanceSettings.Retention.FailedArchiveDays'`), #300, #501 і retention backup generation після перенесення
+  сховища.
+- **VSS при ручному запуску Archive з профілю з не-ASCII шляхом.** Сценарій `diskshadow` і metadata `.cab`
+  створюються в `%TEMP%` поточного користувача; сценарій записується в UTF-8 без BOM, а `diskshadow` читає його як
+  ANSI, тож кириличний шлях профілю в `SET METADATA` ламається: `diskshadow` повертає `3`, Archive — `40`. Завдання
+  Планувальника під `SYSTEM` (`%TEMP%` = `C:\Windows\Temp`) не зачеплені. Обхід для ручного запуску: перед
+  запуском задати ASCII-каталог у `TEMP`/`TMP`. Є і в `5.2.4`.
+- **Maintenance у режимі лише локальних копій щоночі завершується кодом `10`.** При
+  `componentSettings.SFTP.Enabled = $false` архівація Trace/exchangAPI для кожної групи пише WARNING «SFTP-сесія
+  недоступна — передачу відкладено», хоча для режиму без SFTP очікується PASS/SKIPPED. Дані не втрачаються:
+  локальні добові архіви створюються, джерела зберігаються. Є і в `5.2.4` (з `5.2.2`).
+
+## 5.2.5-rc.8 — 2026-10-26
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.7` (нижче).
+
+- **Security: runtime guard: захист від відкату версії не працював для prerelease-версій.**
+  `Test-BRAVOVersionDowngrade` розбирав `packageVersion` через `[version]`, який не приймає prerelease-суфікс
+  (`5.2.5-rc.7`). Виняток мовчки перехоплювався, тож для будь-якого RC перевірка відкату пропускалась, а
+  `BRAVO_VERSION_STATE.json` не оновлювався: RC запускався на сервері, де вже працювала новіша версія, і відкат з
+  RC на попередню stable не блокувався кодом `35`. Виявлено smoke-перевіркою пакета `5.2.5-rc.7`. Тепер
+  `ConvertTo-BRAVOComparableVersion`/`Compare-BRAVOComparableVersion` порівнюють версії за SemVer: база `X.Y.Z`;
+  за однакової бази stable старша за prerelease; prerelease — за dot-ідентифікаторами, числові як рядки цифр
+  довільної довжини. Непарсибельна чи синтаксично некоректна `packageVersion` — fail-closed за режимом (`Enforce`
+  блокує кодом `35`, `Warn` попереджає; `BRAVO_ALLOW_DOWNGRADE=1` діє як і раніше). Стан пише `highestVersion` (база
+  `X.Y.Z`, сумісна з guard 5.2.4) і `highestVersionFull`; пошкоджений стан і далі не блокує. Для stable-версій
+  поведінка незмінна. Наслідок для оновлення: якщо на сервері вже запускали новішу версію (напр., `5.3.0-dev`),
+  rc.8 тепер блокується кодом `35`. Нові перевірки: `VersionState/PrereleaseNewerThanRecordedPasses`,
+  `VersionState/PrereleaseDowngradeBlocks`, `VersionState/PrereleaseOverrideAllowsDowngrade`,
+  `VersionState/UnparsableVersionFailsClosed`, `VersionState/PrereleaseRecordsFullAndLegacyBase`,
+  `VersionState/HugeNumericPrereleaseComparesNumerically`, `VersionState/PrereleaseAndBuildSyntaxValidated`,
+  `VersionState/MalformedPrereleaseFailsClosed`, `VersionState/StateJsonAlwaysParseable`. Перенесено з developer
+  (`ebaef1f`, `5d9f86a`). Додатково до developer: ідентифікатори prerelease/build валідуються з якорем кінця рядка
+  `\z` замість `$` — інакше ідентифікатор із кінцевим переносом рядка (`5.2.5-rc.1`, `\n` перед `+build`)
+  проходив як числовий і міг виглядати новішим за записаний (`VersionState/NewlineInIdentifierFailsClosed`).
+  Дефект присутній у `5.2.4` і `5.2.5-rc.1`–`rc.7`.
+
+**Відомі проблеми (не виправлено в 5.2.5-rc.8):** ті самі, що для `5.2.5-rc.7` (див. розділ нижче): #422 (з
+  мітигацією `'maintenanceSettings.Retention.FailedArchiveDays'`), #300, #501 і retention backup generation після
+  перенесення сховища.
+
+## 5.2.5-rc.7 — 2026-10-26
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.6` (нижче).
+
+- **Fix: Maintenance: автоматична реставрація після відкоту повторювалась щоночі без ліміту (#438).**
+  Коли `bravocmd r` давав критичні зміни моделі й виконувався успішний відкат (`rollback=SUCCESS`), плановий
+  слот лишався невиконаним, і кожна наступна ніч знову зупиняла служби, запускала `bravocmd r` і відкочувала.
+  Тепер `BRAVO_RESTORE_STATE.json` веде лічильник невдалих спроб; після **2** поспіль відкотів з однаковим
+  відбитком збою (`RollbackSignature` — відсортований набір імен критичних файлів і підмножина відсутніх,
+  або клас збою для ранніх виходів порівняння; розміри файлів не враховуються) автоматична реставрація
+  блокується: служби заради неї не зупиняються і не утримуються, модель не змінюється. Нові поля стану:
+  `RollbackRetryCount`, `RollbackSignature`, `RestoreAttemptInProgress`; старий файл стану без них
+  поводиться як раніше (0 спроб), а повернення на `5.2.5-rc.6` / `5.2.4` ігнорує ці поля й втрачає лічильник.
+  Лічильник записується write-ahead (атомарно, перед `bravocmd r`): перервана на цьому етапі спроба теж
+  рахується. Спроба, припинена до деструктивного кроку (немає lock, вікно закрилось, before-архів не створено,
+  службу не зупинено, не вдалося записати лічильник), не рахується. Кожна заблокована ніч не мовчазна:
+  `WARNING` у журналі Maintenance і критичне сповіщення, доки блок діє; ніч, на якій ліміт досягнуто,
+  завершується кодом `43` з критичним сповіщенням. Recovery-завдання, якому на заблокованій ночі більше нічого
+  робити, завершується кодом `10` (`SuccessWithWarnings`, жовтий підсумок), а не `0`, як раніше; без блокування
+  поведінка не змінилась (код `0`).
+  `-ForceRestore` ліміт не обмежує. Успішна примусова або звичайна реставрація скидає лічильник; невдалий
+  `-ForceRestore` змінює лише поля лічильника (наявні `Status`/`ScheduledOccurrence` не чіпає, відсутні
+  створює порожніми, щоб файл стану лишався читабельним для `5.2.4` після rollback) і ніколи не знижує
+  вже досягнутий ліміт. Лічильник не скидається ні новою ніччю, ні зміною планового слоту реставрації, ні
+  іншим набором критичних файлів.
+  **Як зняти блок (дія оператора).** Спершу з'ясуйте причину збою за журналом Maintenance (`rollback=SUCCESS`,
+  перелік критичних файлів у критичному сповіщенні). Потім або запустіть `.\BRAVO_MAINTENANCE.ps1 -ForceRestore`
+  (успішна реставрація скидає лічильник), або зупиніть Maintenance/Recovery і обнуліть поле `RollbackRetryCount`
+  у `%ProgramData%\BRAVO\State\BRAVO_RESTORE_STATE.json`; після цього наступний плановий слот знову виконається
+  автоматично.
+  **Пошкоджений стан.** Якщо `BRAVO_RESTORE_STATE.json` існує, але не читається (порожній, обірваний JSON),
+  автоматична реставрація блокується (fail-closed, `ERROR` у журналі); сама перевірка файл не змінює, а перед
+  будь-яким наступним записом стану його копіюють як `BRAVO_RESTORE_STATE.json.corrupt-<yyyyMMdd_HHmmss_fff>`.
+  Блок знімається так само: виправте чи видаліть файл, або успішний `-ForceRestore`.
+  **Retention:** поки лічильник > 0, сесії архівів реставрації, що мають лише `before` (невдалі спроби), не
+  зараховуються до `Restore.ArchivesKeepCount` і не видаляються — остання повна пара `before`/`after` переживає.
+  Стан реставрації тепер записується атомарно (тимчасовий файл + заміна), а читається з явним UTF-8; запис
+  більше не лишає обірваний файл при збої. Нового ключа конфігурації немає. Перенесено з developer (PR #456;
+  атомарний запис стану — з bf8e958). Дефект присутній і в `5.2.4`.
+- **Fix: Archive: retention видаляв повну (COMPLETE) резервну копію як «невдалу» (#335).**
+  `Remove-BRAVOExpiredBackupGenerations` відносила generation до гілки `failedArchiveRetentionDays` за
+  результатом сьогоднішньої повторної перевірки, а не за записаним статусом. COMPLETE копія, яку в момент
+  retention не вдалось перевірити (один пошкоджений архів, транзієнтна помилка читання), через 30 днів
+  видалялась разом із цілими архівами інших компонентів навіть при `enableArchiveDeletion = $false` і без
+  попередження. Тепер гілку визначає записаний статус: COMPLETE видаляється лише за `archiveRetentionDays` і
+  лише при `enableArchiveDeletion`; пошкодження COMPLETE дає WARNING «Пошкоджена резервна копія» і не веде до
+  видалення. Повний SHA512 рахується лише для вибору `minimumRetainedVerifiedBackups` захищених, коли
+  `enableArchiveDeletion = $true` і є прострочені COMPLETE generation; для WARNING — дешева перевірка без
+  читання вмісту. Шляхи архівів перебудовуються як у відновленні (fail-closed): після перенесення сховища
+  manifest-и не стираються, а архіви не лишаються сиротами. Manifest видаляється останнім і лише після своїх
+  архівів; помилка на одній generation не зупиняє решту. Generation з типом компонента, якого немає в
+  поточних налаштуваннях, не видаляється (WARNING). Архіви без manifest-а лише рахуються в рядку «Аудит
+  retention». Видалено мертву `Remove-OldBackupSets`.
+  Додатково до developer: поки перевірених (SHA512) COMPLETE generation менше за
+  `minimumRetainedVerifiedBackups`, retention не видаляє жодної COMPLETE за віком (WARNING) — неперевірена
+  через транзієнтну помилку читання копія може бути останньою цілою.
+  Також (#363): generation з відсутнім, `null`, порожнім чи нерозбірливим `startedAt` не видаляється жодною
+  гілкою і не витісняє захищені (WARNING); гілка невдалих застосовується лише до статусів `FAILED` і
+  `INCOMPLETE`, інший не-COMPLETE статус (порожній, `RUNNING`, значення майбутньої версії) зберігається з
+  WARNING. Час `\/Date(ms)\/` розбирається як відомий; UTC переводиться в локальний час перед порівнянням.
+  Нових ключів конфігурації немає, значення за замовчуванням не змінились (README виправлено: захист
+  `minimumRetainedVerifiedBackups` типово `2` і рахується по generation). Тимчасова мітигація для `5.2.4` —
+  `enableFailedArchiveDeletion = $false` у local config. Перенесено з developer (PR #344, #363). Дефект
+  присутній у `5.2.4`.
+- **Fix: Archive, Health: таймаут перевірки SFTP і lock `BRAVO_WINSCP` (#290).**
+  `Test-SFTPConnection` (Archive) після таймауту вбивала WinSCP і кидала виняток раніше, ніж
+  `Complete-BRAVOProcessOutputCapture` звільняла lock `BRAVO_WINSCP`. Викликачі (ручний `-SyncBAZA` і `Main`)
+  не мають `try`, тому прогін завершувався кодом 90 замість шляху «SFTP недоступний», а lock лишався
+  захопленим. Тепер при таймауті ресурси звільняються, у журнал пишеться ERROR, функція повертає `$false`, і
+  діє наявна обробка збою SFTP з кодом 50. Значення кодів завершення не змінено. В Archive і в SFTP-перевірці
+  Health (`Invoke-WinSCPHealthSession`) lock звільняється лише після підтвердженого завершення WinSCP: якщо
+  процес не завершився, lock лишається до завершення процесу BRAVO, а прогін іде фатальним шляхом, щоб не
+  запустити другий WinSCP паралельно. Регресія: `Archive/SftpConnectionTimeoutReturnsFalse`,
+  `Archive/SftpConnectionTimeoutReleasesWinSCPLock`, `Archive/SftpConnectionTimeoutLogsError`,
+  `Archive/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive`, `Health/SftpConnectionTimeoutKeepsLockWhileWinSCPAlive`.
+  Перенесено з developer (PR #387, #446).
+- **Security: Health: WinSCP-скрипт з обліковими даними створюється з захищеним DACL (#469).**
+  Командний файл SFTP-перевірки Health містить SFTP URL з обліковими даними і раніше створювався в
+  temp-каталозі з успадкованими правами. Тепер його шлях видає canonical `New-BRAVOWinSCPTemporaryScriptPath`
+  (`BRAVO.ArchiveRuntime`, той самий helper, що в Archive/DataRestore): файл одразу має protected DACL
+  (поточний обліковий запис, SYSTEM, Administrators) і прибирається через
+  `Remove-BRAVOWinSCPSensitiveTemporaryScript`. Якщо helper недоступний, SFTP-перевірка скасовується без
+  запису облікових даних. Регресія: `Health/WinSCPScriptUsesProtectedHelper`. Перенесено з developer (PR #469).
+- **Fix: Maintenance: рішення про реставрацію перевіряється після lock і перед `bravocmd.exe` (#476).**
+  Рішення про реставрацію обчислювалось один раз до очікування lock (до `OperationLockWaitMinutes`). Якщо інший
+  прогін за цей час виконав той самий слот, спожив тижневу квоту примусовою реставрацією, вичерпав ліміт повторів чи
+  пошкодив `BRAVO_RESTORE_STATE.json`, цей прогін повторював деструктивну реставрацію за застарілим знімком. Тепер
+  рішення рахує чиста `Get-BRAVOMaintenanceRestoreDecisionSnapshot` (час заморожено, читає лише файли) до lock, одразу
+  після нього (до запису `Pending` і зупинки служб) і безпосередньо перед `bravocmd.exe`;
+  `Get-BRAVOMaintenanceRestoreSnapshotVeto` може лише заборонити реставрацію (`SucceededByOtherRun`, `StateCorrupt`,
+  `RetryBlocked`, `WeeklyQuotaConsumed`, `NoLongerDue`), `-ForceRestore` вето не підлягає. Скасування через ліміт чи
+  пошкоджений стан — `WARNING` і критичне сповіщення; Recovery без іншої роботи після скасування завершується кодом
+  `0` (`10` для ліміту чи пошкодженого стану).
+- **Fix: Maintenance: виняток після запуску `bravocmd.exe` — код `43`, служби не стартують (#477).**
+  Виняток посеред деструктивної фази потрапляв у загальний `catch` як збій архівації (код `40`), а
+  `modelIntegrityEstablished` лишався `true` — служби піднімалися над напіввідновленою моделлю. Тепер прапорець
+  цілісності стає `false` з моменту запуску `bravocmd.exe` до результату перевірки/відкату. Виняток після запуску:
+  код `43`, спробу пораховано (клас `CLASS:EXCEPTION-AFTER-BRAVOCMD`, рівно один раз), служби не стартують,
+  quiescence-маркер лишається suppressed, retention архівів реставрації пропускається. Те саме для `rollback=FAILED`:
+  ненульовий код `bravocmd.exe` чи прапорець перевірки розмірів більше не підміняють `43` на `40`/`41`. Виняток до
+  запуску `bravocmd.exe` — як раніше, код `40`.
+  Перенесено з developer (PR #485) з адаптацією до 5.2.x: без #321 (реставрація при Disabled-службі), #297
+  (повторне самовідновлення типів запуску після lock) і #316 (закриття клієнтів); повторна перевірка ліміту у
+  write-ahead лишається з #438. Нових ключів конфігурації немає.
+**Відомі проблеми (не виправлено в 5.2.5-rc.7):**
+
+- **Retention архівів реставрації може видалити старі «непридатні» сесії без доказу пошкодження (#422).**
+  `Remove-OldRestoreArchives` вважає непридатною сесію, жоден архів якої не пройшов перевірку, незалежно від
+  причини (таймаут чи відсутність 7-Zip, ACL, `Wrong password` після ротації пароля архіву), і видаляє її, коли
+  вона старша за `Retention.FailedArchiveDays` (типово 30). Виправлення спирається на зміни 5.3 (#300) і
+  перенесено в 5.3 (рішення власника). Тимчасова мітигація: збільшити
+  `'maintenanceSettings.Retention.FailedArchiveDays'` у `BRAVO.local.config` (напр., `365`) і не змінювати пароль
+  архіву без перевірки старих сесій реставрації.
+- **Старий пошкоджений архів у retention Maintenance дає код `41` щоночі (#300).** Перенесено в 5.3.
+- **Синхронізація BAZA_APP у режимі `BAZA.Mode=Legacy`: файли, створені під час синхронізації, дають хибний
+  результат ПОМИЛКА (#501).** Не входить у 5.2.5 (рішення власника).
+- **Retention backup generation після перенесення сховища.** Якщо записаний у manifest шлях архіву тимчасово
+  недоступний (диск офлайн, ACL), retention шукає файл у канонічному каталозі компонента, як і відновлення. Для
+  простроченої generation це може видалити manifest і лишити архів за старим шляхом без посилання (дані не
+  видаляються). Відрізнити тимчасово недоступний старий диск від перенесеного сховища неможливо.
+
+## 5.2.5-rc.6 — 2026-10-08
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.5` (нижче).
+
+- **Fix: Maintenance: хибний відкат моделі після реставрації через ущільнення малих файлів (exit 43).**
+  Самоперевірка реставрації (`Compare-FileSizes`) оголошувала критичною зміну невеликого табличного файлу,
+  який `bravocmd` repair штатно ущільнив (4,5 КБ → 2,0 КБ, -55,6%), — і `Invoke-BRAVOModelRestoreRecovery`
+  відкочував модель із before-архіву, прогін завершувався кодом 43. Тепер для файлів, менших за поріг до
+  реставрації (новий ключ `maintenanceSettings.Restore.IntegritySmallFileThresholdBytes`, типово 1048576 байт
+  = 1 МБ), відсоткове правило й правило «≤ 2048 байт після» не застосовуються: критичними для них лишаються
+  лише зникнення (логіка відсутніх файлів без змін) та обнулення до 0 байт. Помітне зменшення такого файлу
+  видно в журналі рядком `[INFO]` «Зменшення розміру малих файлів MODEL …» — без сповіщення й без відкату.
+  Файли від порогу й більші перевіряються незмінним правилом (зменшення на 50% і більше або до ≤ 2048 байт —
+  критично). Некоректне значення ключа (не ціле, від'ємне, понад 104857600) не вимикає перевірку: діє
+  типовий 1 МБ і `[WARNING]` у журналі; `0` — правило 50% для всіх файлів. Ключ додано в `BRAVO.config`
+  (`maintenanceSettings.Restore`) і `BRAVO.local.config.example`; відсутній ключ у старій конфігурації =
+  типовий 1 МБ. Перенесено з developer (PR #439). Дефект присутній і в `5.2.4`.
+
+## 5.2.5-rc.5 — 2026-10-06
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.4` (нижче).
+
+- **Fix: Maintenance: перевірка розмірів `.md` виконується після реставрації моделі, а не до неї.**
+  bravocmd repair штатно стискає `.md`: у реальному прогоні файл 1,64 ГБ (понад ліміт 1536 МБ) після
+  реставрації став 1,21 ГБ, але сповіщення «.md перевищує ліміт» уже пішло, бо перевірка стояла перед
+  реставрацією. Тепер порядок кроків: `[4/8]` Реставрація моделі, `[5/8]` Перевірка розмірів `.md`
+  (раніше навпаки), решта нумерації без змін. Дозвіл на файлові операції BRAVO (реставрація і trace)
+  обчислюється один раз (`$bravoFilePhaseAllowed`), тож обидві фази бачать той самий стан служби.
+  Самоперевірка реставрації (`Compare-FileSizes`: зниклий або обнулений файл, зменшення на 50% і
+  більше) не змінена. Перенесено з developer (PR #376). Дефект присутній і в `5.2.4`.
+
+- **Change: прибрано нагадування про застарілі оновлення Windows (перенесено з developer, PR #377).**
+  BRAVO_HEALTH у кожному прогоні писав WARNING «Останнє оновлення Windows встановлено … дн. тому»
+  (або «Не вдалося визначити дату останнього оновлення Windows»), якщо останній hotfix старший за
+  120 днів. На результат і код завершення нагадування не впливало, але повторювалось щоразу в
+  консолі та журналі Health. Виклик прибрано з Health, а функцію
+  `Get-BRAVOWindowsPatchLevelRecommendation` — з модуля `BRAVO.Compatibility`. Перевірки платформи
+  (ОС, build, рівень підтримки ОС, PowerShell, .NET) і нагадування про застарілий PowerShell лишились
+  без змін. Перевірку `Compatibility/WindowsPatchLevelRecommendation` видалено,
+  `Runtime/WindowsPatchLevelOnlyInHealth` замінено на `Runtime/NoWindowsPatchLevelReminder`.
+
+## 5.2.5-rc.4 — 2026-10-04
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.3` (нижче).
+
+- **Fix: перевищення порогу діапазонів ID більше не ховає решту перевірок Maintenance у сповіщенні.**
+  Коли `Test-RangeIdUsage` фіксував перевищення порогу (`range_id_log.json`), запис потрапляв у
+  `CriticalErrorsList`, і `Send-FinalReport` будував фінальне сповіщення ЛИШЕ з цього списку:
+  статуси реставрації, `.md`, trace, очистки, вільного місця, проблемні етапи ("Також потребує
+  уваги") і попередження з `NotificationAlertQueue` до оператора не доходили, хоча самі перевірки
+  виконувались. Тепер блок "Виконано:" будує окремий helper
+  `Get-BRAVOMaintenanceFinalReportCheckLines`, і він додається в КОЖНУ гілку фінального звіту:
+  критична гілка містить записи `CriticalErrorsList`, попередження з черги і статуси етапів;
+  гілка черги попереджень — попередження і статуси етапів. Збій побудови блоку статусів лише
+  логується (`Get-BRAVOMaintenanceFinalReportCheckLinesSafe`) і не забирає саме сповіщення про
+  проблему. Дефект присутній і в `5.2.4`. Нові перевірки:
+  `Maintenance/RangeIdAlertKeepsOtherChecksInFinalReport`,
+  `Maintenance/AlertQueueFinalReportIncludesCheckStatuses`,
+  `Maintenance/FinalReportCheckLinesFailureKeepsAlert`.
+
+## 5.2.5-rc.3 — 2026-10-02
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.2` (нижче).
+
+- **Fix: на Windows Server 2012/2012 R2 заплановані завдання завершувались з кодом 1 без логу.**
+  Runtime перемикав кодову сторінку консолі на UTF-8 (65001). У консолі SYSTEM (сесія 0)
+  на Windows до 10 після цього перший `Write-Host` з кирилицею падав з Win32 `0x1F`
+  ("A device attached to the system is not functioning"), тож `BRAVO_ARCHIV`,
+  `BRAVO_ARCHIV_HEALTH` і `BRAVO_MAINTENANCE` гинули до відкриття журналу. Ручний запуск
+  з консолі адміністратора дефекту не показував. Новий `Test-BRAVOConsoleCodePageChangeSafe`
+  (BRAVO.Compatibility): на Windows < 10 у неінтерактивній сесії кодова сторінка консолі не
+  змінюється (`$OutputEncoding` для зовнішніх програм — як і раніше); Windows 10+ та
+  інтерактивні запуски — без змін. Дефект присутній і в `5.2.4`.
+
+## 5.2.5-rc.2 — 2026-10-01
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.1` (нижче).
+
+- **Fix: на хостах з .NET Framework < 4.6.1 `BRAVO_SETUP -Action Scheduler` зупинявся на
+  dry-run (#319).** `ServiceController.StartType` з'явилась лише в .NET 4.6.1; на Windows
+  PowerShell 5.1 поверх .NET 4.5.x пряме `$service.StartType` під `Set-StrictMode -Version 2.0`
+  кидає `PropertyNotFoundStrict`, тож `BRAVO_DRY_RUN.ps1` завершувався
+  `[FAIL] Dry-run: The property 'StartType' cannot be found` і Setup зупиняв усі етапи
+  (fail-closed). Дефект присутній і в `5.2.4`. Перенесено з `developer` канонічний
+  `Get-BRAVOServiceStartMode` (BRAVO.System): `StartType` читається через
+  `PSObject.Properties`, далі — вже отриманий `Win32_Service.StartMode` або WMI через
+  `Get-BRAVOWmiInstance`; невідомий тип запуску -> `Unknown`, а не виняток. На нього
+  переведено dry-run, Maintenance (Apache і керовані служби), DataRestore і
+  `Set-BRAVOBootRestoreServiceStartType` (невідомий тип запуску службу не змінює; у режимі
+  утримання служб — класифікований збій).
+- **Fix: Health на тих самих хостах завершувався з exit 90 (#295).** `Get-ManagedServiceHealthIssues`
+  читає `StartType` через `PSObject.Properties`, тож WMI-fallback знову виконується.
+
+## 5.2.5-rc.1 — 2026-10-01
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12).
+
+- **Fix: недосяжний UNC більше не обриває DataRestore і self-test ("The network path was not found").**
+  На доменному сервері з Windows PowerShell 5.1 `Test-Path` по недосяжному UNC-хосту
+  піднімає помилку провайдера замість `$false`; під `$ErrorActionPreference = 'Stop'`
+  self-test 5.2.4 обривався з `[FAIL] Fatal` одразу після
+  `DataRestore/PlanInPlaceUsesDiscoveryAndPrerestoreName`, а решта DataRestore-перевірок не
+  виконувалась. Windows CI цього не бачив: там тестове ім'я хоста не резолвиться.
+  Додано helper `Get-BRAVODataRestorePathProbe` (`-ErrorAction Stop` + try/catch ->
+  `Exists`/`Error`); через нього йдуть write-probe free-space preflight (з захистом від
+  нескінченного циклу на корені тому/share), перевірка `-TargetPath` і цілі компонента в
+  `Get-BRAVODataRestorePlan` (недоступність -> класифікована відмова плану, fail-closed) та
+  перевірка out-of-place кореня перед створенням (`RestoreFailed` замість некатегоризованого
+  винятку). Self-test імітує недосяжний хост заглушкою `Test-Path` у script-scope
+  self-test-модуля, тож CI проходить той самий шлях, що й доменний сервер. Нові перевірки:
+  `DataRestore/PlanClassifiesUnreachableUncTarget`,
+  `DataRestore/UnreachableUncTargetIsClassifiedNotFatal`,
+  `DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors`.
+
 ## 5.2.4 — 2026-09-13
 
 Stable promotion від прийнятого `5.2.4-rc.1` (нижче) — real-server acceptance
