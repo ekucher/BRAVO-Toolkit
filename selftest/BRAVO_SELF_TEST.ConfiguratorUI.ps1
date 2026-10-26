@@ -161,7 +161,7 @@ Test-BRAVOCondition ($configuratorUISec1.Count -eq 1 -and $configuratorUISec1[0]
     "Sec1.DescriptorCount=$($configuratorUISec1[0].DescriptorCount)"
 
 # =====================================================================
-# Codex review PR #224 (P2, thread lGNJ9, "Rebuild the category tree
+# Рев'ю PR #224 (P2, thread lGNJ9, "Rebuild the category tree
 # after refreshing the schema"): Reload перераховував $state.SchemaCatalog
 # (динамічні recovery-категорії ValidatorRejected/DeniedOverride/
 # EscapableOverride можуть з'явитись/зникнути), але TreeView.Nodes

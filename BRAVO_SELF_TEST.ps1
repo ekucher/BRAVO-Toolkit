@@ -5038,7 +5038,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # restoreIntegrityFailed, коли після збою 7z t не лишилось жодної
             # придатної точки відновлення (старіші сесії перевіряються з
             # -NoFailureFlags, тож цей backstop — окрема точка).
-            # +1 integrity (#300, Claude QA 386-Q2): retention виставляє
+            # +1 integrity (#300, QA 386-Q2): retention виставляє
             # restoreIntegrityFailed, коли сама перевірка 7z t кинула виняток
             # (перевірку не виконано — fail-closed і для старших сесій).
             # +1 integrity (#424): канонічний перелік архівів реставрації
@@ -11012,7 +11012,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # Тест структурний (AST/текст) — той самий підхід, що й усі сусідні
     # Discovery/Console/* перевірки цього файлу для Archive.Runtime.ps1;
     # runtime-контракт SFTP/WinSCP self-test навмисно не виконує наживо
-    # (див. .claude/rules — CI-докази не замінюють real-server acceptance
+    # (див. docs/engineering/testing-validation.md — CI-докази не замінюють real-server acceptance
     # для WinSCP/SFTP-поведінки).
     Test-BRAVOCondition `
         -Condition (
@@ -15306,7 +15306,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/EmptySourceReportedSeparatelyFromNotInstalled' `
         -Failure "Health має показувати порожній каталог джерела окремо від «не встановлено», з :warning: для компонента, що мав дані: $emptySourceSuccess"
-    # #301 (рев'ю #391, Codex 510e35e): прогін без issue, але з WARNING у
+    # #301 (рев'ю #391, 510e35e): прогін без issue, але з WARNING у
     # журналі (порожній каталог, що мав дані) завершується кодом 10, тож
     # Operations-подія не може рапортувати SUCCESS. Severity береться з того
     # самого лічильника, що й код завершення.
@@ -15335,7 +15335,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/CleanRunOperationsEventFollowsWarningExitCode' `
         -Failure "Operations-подія Health без issue має бути WARNING, коли журнал має WARNING (код 10), і CRITICAL при ShouldBlock: clean='$($cleanRunVerdicts['Clean'])' warned='$($cleanRunVerdicts['Warned'])' blocked='$($cleanRunVerdicts['Blocked'])' error='$cleanRunVerdictError'"
-    # #301 (рев'ю #391, Codex 5f0dc37): прогін без issue, але з порожнім
+    # #301 (рев'ю #391, 5f0dc37): прогін без issue, але з порожнім
     # каталогом, що мав дані, - це WARNING і для Slack/Discord: звіт іде
     # маршрутом alerts і в режимі errors_only, незалежно від NotifyOnSuccess.
     # Відбиток дедуплікації містить ці компоненти, тож зникнення попередження
@@ -19999,7 +19999,7 @@ try {
                     @($healthToolIntegrityAlerts | Where-Object { $_.Contains('TOOLS_MANIFEST.json') }).Count -eq 1 -and
                     @($healthToolIntegrityAlerts | Where-Object { $_.StartsWith('ALERT-ISSUE Цілісність інструментів | ') }).Count -eq 0 -and
                     $healthToolIntegrityAlerts[0].StartsWith('ALERT-ISSUE SFTP | ') -and
-                    # Codex P2: дія алерту — про інструменти, не «перевірити SFTP-з'єднання».
+                    # рев'ю P2: дія алерту — про інструменти, не «перевірити SFTP-з'єднання».
                     (& $healthOrchestrationSelect $healthToolIntegrityEvents '^ALERT-ACTION ') -ceq 'ALERT-ACTION перевірити каталог Tools і TOOLS_MANIFEST.json: можлива підміна 7za.exe/WinSCP.com' -and
                     (& $healthOrchestrationSelect $healthToolIntegrityEvents '^(NOTIFY-|ALERT-STATE-|SUCCESS-STATE-SAVE$|STATUS )') -ceq 'NOTIFY-ROUTE CRITICAL|NOTIFY-SEND https://self-test.invalid/alerts self-test alert|ALERT-STATE-SAVE|STATUS 32'
                 ) `
@@ -20114,7 +20114,7 @@ try {
         }
     }
 
-    # CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md: автоматичний Discovery джерел
+    # ТЗ ARCHIV_LIMS_MONOLITH: автоматичний Discovery джерел
     # (BRAVO_ROOT/WEB_ROOT/MODEL/BLOG/BRAVOEXCH/BAZA_APP/BAZA_WWW) за
     # встановленою службою BRAVO і активним bravo.ini, з повним ручним
     # перевизначенням через BRAVO.config.
@@ -20359,7 +20359,7 @@ try {
             -Name "Discovery/BazaWwwUsesHttpdConfDocumentRoot" `
             -Failure "BAZA_WWW має братись з DocumentRoot реального httpd.conf встановленої Apache-служби, а не з фолбек-здогадки <WEB_ROOT>\www"
 
-        # #301 (рев'ю #391, Codex 64d0e94): порожній <DocumentRoot>\BAZA - це
+        # #301 (рев'ю #391, 64d0e94): порожній <DocumentRoot>\BAZA - це
         # той самий «каталог є, але порожній», що й для компонентів з bravo.ini.
         # Presence-запис має нести AbsenceKind 'Empty', і підтверджений раніше
         # BAZA_WWW дає Warning (EmptySource), а не Error.
@@ -20407,7 +20407,7 @@ try {
             -Name "Discovery/EmptyBazaWwwDocumentRootIsEmptySourceWarning" `
             -Failure "порожній <DocumentRoot>\BAZA має дати Absent з AbsenceKind 'Empty', а підтверджений раніше BAZA_WWW - EmptySource з Warning без Error; absenceKind='$emptyBazaWwwAbsenceKind' scope='$emptyBazaWwwScopeValue' findings='$(@($emptyBazaWwwFindings | ForEach-Object { [string]$_.Severity }) -join ',')' error='$emptyBazaWwwError'"
 
-        # #301 (рев'ю #391, Codex 5f0dc37): BAZA_WWW, відомий лише з останнього
+        # #301 (рев'ю #391, 5f0dc37): BAZA_WWW, відомий лише з останнього
         # COMPLETE manifest. Сире поле BAZA_WWW для порожнього каталогу - $null,
         # тож доказ має перейти в baseline шляхом кандидата; інакше Warning
         # другої ночі тихо став би Info.
@@ -27711,7 +27711,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             # FailPathLookup — Test-Path каталогу архівів (без -PathType)
             # пише non-terminating error (ACL / збій провайдера) і нічого не повертає.
             [bool]$FailPathLookup = $false,
-            # #424 (Codex P2, раунд 3): PriorCritical — до кроку очистки
+            # #424 (рев'ю P2, раунд 3): PriorCritical — до кроку очистки
             # якась попередня фаза вже виставила criticalErrorOccurred.
             [bool]$PriorCritical = $false)
         $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
@@ -27748,7 +27748,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                         } elseif ($scenarioArchive['HashMode'] -ceq 'Malformed') {
                             $hash = 'not-a-sha512-value'
                         }
-                        # -LiteralPath: каталог сценарію може містити [ / ] (#424, Codex P2, раунд 3).
+                        # -LiteralPath: каталог сценарію може містити [ / ] (#424, рев'ю P2, раунд 3).
                         "$hash *$fileName" | Out-File -LiteralPath "$archivePath.sha512" -Encoding ASCII
                         if ($scenarioArchive['HashMode'] -ceq 'Locked') {
                             [void]$scenarioHashLocks.Add([IO.File]::Open("$archivePath.sha512", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None))
@@ -27808,7 +27808,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                 if ($CriticalBeforeCleanup) {
                     $script:criticalErrorOccurred = $true
                 }
-                # #424 (Codex P2, раунд 3): власний облік збою цілісності
+                # #424 (рев'ю P2, раунд 3): власний облік збою цілісності
                 # кроку очистки, як у Main ($restoreArchiveIntegrityOutcome).
                 $restoreArchiveIntegrityOutcome = @{ IntegrityFailed = $false }
                 $retentionThrew = $null
@@ -27995,7 +27995,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags" `
         -Failure ("збій виконання 7z t (не archive-specific: таймаут) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorTimeout.Critical, $retentionFollowupValidatorTimeout.RestoreFailed, $retentionFollowupValidatorTimeout.Threw, $retentionFollowupValidatorTimeout.Log)
 
-    # (e) #300 (Codex 386-C4): код 2 з локалізованим текстом відмови доступу
+    # (e) #300 (рев'ю 386-C4): код 2 з локалізованим текстом відмови доступу
     # без власних повідомлень 7-Zip про вміст — збій виконання, не доказ
     # пошкодження: навіть на старій сесії це ERROR і прапорці.
     $retentionFollowupLocalizedDenied = & $retentionFollowupRunScenario 'LocalizedAccessDenied' @(
@@ -28014,7 +28014,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags" `
         -Failure ("код 2 без власних повідомлень 7-Zip про вміст (локалізована відмова доступу) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupLocalizedDenied.Critical, $retentionFollowupLocalizedDenied.RestoreFailed, $retentionFollowupLocalizedDenied.Threw, $retentionFollowupLocalizedDenied.Log)
 
-    # (e2) #300 (Claude QA 386-Q2): перевірка 7z t старої сесії кинула
+    # (e2) #300 (QA 386-Q2): перевірка 7z t старої сесії кинула
     # виняток замість результату — перевірку не виконано, це збій виконання:
     # прапорці виставляються навіть на старій сесії (fail-closed).
     $retentionFollowupValidatorThrows = & $retentionFollowupRunScenario 'ValidatorThrows' @(
@@ -28506,7 +28506,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("гейт Main має за сесій ≤ ArchivesKeepCount викликати Remove-OldRestoreArchives лише з -ReportOnly, за сесій > ArchivesKeepCount — звичайний retention без -ReportOnly (обидва — з -Outcome `$restoreArchiveIntegrityOutcome), а для unsafe-сесії, вимкненого Maintenance чи відсутності сесій — не викликати нічого; Main має рахувати сесії в `$restoreArchiveGroupCount; if-гейтів={0}, лічильник={1}, ≤1/1=[{2}], ≤2/2=[{3}], >3/1=[{4}], unsafe=[{5}], вимкнено=[{6}], порожньо=[{7}]" -f $retention424GateIfs.Count, $retention424GroupCountAssigned, $retention424GateWithin, $retention424GateWithinTwo, $retention424GateBeyond, $retention424GateUnsafe, $retention424GateDisabled, $retention424GateEmpty)
 
     # ================================================================
-    # #424 (review Codex P2): статус кроку «Очистка старих даних/логів».
+    # #424 (рев'ю P2): статус кроку «Очистка старих даних/логів».
     # Гілка «лише перевірка» не робить $hasDataToClean істинним, тож
     # раніше статус ставав SKIPPED ще до урахування WARN/FAIL: крок і
     # лічильник stepsError приховували збій цілісності (exit 41). Справжній
@@ -28575,7 +28575,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("за сесій ≤ ArchivesKeepCount крок «Очистка старих даних/логів» має бути FAIL (stepsError ≥ 1), коли перевірка лише-перевірки виставила прапорці exit 41, і WARN за WARNING без critical; без жодної проблеми — SKIPPED, як і раніше; фрагмент знайдено={0}; зламана: статус=[{1}], stepsError={2}, critical={3}; UNKNOWN: статус=[{4}], stepsError={5}; чиста: статус=[{6}], stepsError={7}, журнал: {8}" -f (-not [string]::IsNullOrEmpty($retention424CleanupStatusText)), $retention424StepBroken.CleanupStatus, $retention424StepBroken.StepsError, $retention424StepBroken.Critical, $retention424StepStale.CleanupStatus, $retention424StepStale.StepsError, $retention424StepClean.CleanupStatus, $retention424StepClean.StepsError, $retention424StepClean.Log)
 
     # ================================================================
-    # #424 (review Codex P2): збій переліку архівів реставрації (відмова
+    # #424 (рев'ю P2): збій переліку архівів реставрації (відмова
     # доступу тощо) не можна плутати з порожнім каталогом. Раніше
     # Get-ChildItem -ErrorAction SilentlyContinue давав 0 (або лише частину)
     # архівів: нічна перевірка мовчки пропускалась, а частковий перелік ще
@@ -28609,7 +28609,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Maintenance/RestoreArchiveEnumerationFailureNoDeletion" `
         -Failure ("збій переліку архівів реставрації має дати ERROR і прапорці critical/restoreIntegrityFailed (exit 41) без жодного видалення, крок очистки — FAIL; контроль без збою видаляє сесії понад KeepCount, як і раніше; збій: threw={0}, лишилось=[{1}], critical={2}, restoreIntegrityFailed={3}, статус=[{4}], журнал: {5}; контроль: threw={6}, лишилось=[{7}]" -f $retention424EnumFailed.Threw, $retention424EnumFailed.Remaining, $retention424EnumFailed.Critical, $retention424EnumFailed.RestoreFailed, $retention424EnumFailed.CleanupStatus, $retention424EnumFailed.Log, $retention424EnumControl.Threw, $retention424EnumControl.Remaining)
 
-    # (e2) Codex P2 (раунд 2): каталог існує, але сам Test-Path пише
+    # (e2) рев'ю P2 (раунд 2): каталог існує, але сам Test-Path пише
     # non-terminating error (ACL / збій провайдера) і нічого не повертає.
     # Раніше це вважалось відсутнім каталогом: ні ERROR, ні exit 41, і
     # перевірка мовчки пропускалась. Тепер — той самий fail-closed шлях.
@@ -28691,7 +28691,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         [IO.File]::WriteAllText((Join-Path $retention424EnumRoot 'RETFUP_before_20260111_0100.mdz'), 'synthetic-ok')
         $retention424EnumOk = & $retention424EnumDirect $retention424EnumRoot $false
         $retention424EnumDenied = & $retention424EnumDirect $retention424EnumRoot $true
-        # Codex P2 (раунд 2): збій самого Test-Path каталогу (ACL / провайдер).
+        # рев'ю P2 (раунд 2): збій самого Test-Path каталогу (ACL / провайдер).
         $retention424EnumLookup = & $retention424EnumDirect $retention424EnumRoot $false $true
         # #428: цільовий підкаталог відсутній, і БАТЬКІВСЬКИЙ каталог теж не
         # існує (жодного 'missing-parent' тут не створено) — ознака ширшої
@@ -28777,7 +28777,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("Main має переліковувати архіви реставрації в ARC_DIR рівно одним викликом Get-BRAVORestoreArchiveMainFiles і без прямого Get-ChildItem по `$ARC_DIR; викликів={0}, прямих Get-ChildItem={1}" -f $retention424MainEnumCalls.Count, $retention424MainRawArcDirScans.Count)
 
     # ================================================================
-    # #424 (Codex P1, раунд 3): «немає жодної підтвердженої точки
+    # #424 (рев'ю P1, раунд 3): «немає жодної підтвердженої точки
     # відновлення» не залежить від того, на якому етапі перевірки
     # забраковано сесію. Раніше ERROR і прапорці exit 41 з'являлись лише
     # тоді, коли хоча б одна сесія дійшла до 7z t; сесія, забракована вже
@@ -28842,7 +28842,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("звичайний retention, коли всі сесії забраковано на SHA512, має записати ERROR «Не лишилось жодної придатної точки відновлення» і виставити critical/restoreIntegrityFailed (exit 41), не видаляючи жодної сесії, і WARNING «НЕ видалено» для кожної; threw={0}, critical={1}, restoreIntegrityFailed={2}, лишилось=[{3}], журнал: {4}" -f $retention424NormalNoValid.Threw, $retention424NormalNoValid.Critical, $retention424NormalNoValid.RestoreFailed, $retention424NormalNoValid.Remaining, $retention424NormalNoValid.Log)
 
     # ================================================================
-    # #424 (Codex P2, раунд 3): статус кроку очистки не спирається лише на
+    # #424 (рев'ю P2, раунд 3): статус кроку очистки не спирається лише на
     # глобальний Boolean criticalErrorOccurred. Якщо попередня фаза вже
     # виставила його, новий збій цілісності в кроці очистки раніше давав
     # WARN (не FAIL) і не рахувався в stepsError. Тепер крок бере власний
@@ -28889,7 +28889,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("коли попередня фаза вже виставила criticalErrorOccurred, крок «Очистка старих даних/логів» має бути FAIL (stepsError ≥ 1) за нового збою цілісності архівів реставрації (7z t, SHA512, перелік), WARN — лише за WARNING без збою цілісності, SKIPPED — без жодної проблеми; Main має позначати збій власного переліку в `$restoreArchiveIntegrityOutcome ({0}); 7z t: статус=[{1}], stepsError={2}; SHA512: статус=[{3}], stepsError={4}; перелік: статус=[{5}], stepsError={6}; чиста: статус=[{7}], stepsError={8}; UNKNOWN: статус=[{9}], stepsError={10}" -f $retention424MainMarksEnumFailure, $retention424PriorBroken.CleanupStatus, $retention424PriorBroken.StepsError, $retention424PriorHashOnly.CleanupStatus, $retention424PriorHashOnly.StepsError, $retention424PriorEnumFailed.CleanupStatus, $retention424PriorEnumFailed.StepsError, $retention424PriorClean.CleanupStatus, $retention424PriorClean.StepsError, $retention424PriorStale.CleanupStatus, $retention424PriorStale.StepsError)
 
     # ================================================================
-    # #424 (Codex P2, раунд 3): налаштований каталог архівів реставрації —
+    # #424 (рев'ю P2, раунд 3): налаштований каталог архівів реставрації —
     # буквальний шлях. З -Path символи [ / ] у назві каталогу були
     # шаблоном: наявний каталог вважався відсутнім (нічна перевірка мовчки
     # пропускалась), а перелік чи видалення могли зачепити сусідній
@@ -35699,7 +35699,7 @@ Test-BRAVOCondition -Condition ($leakProbeLeakedNames.Count -eq 0 -and $leakProb
     -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites' `
     -Failure "після закриття suite вбудовані команди мають резолвитися як до нього; витекло: $($leakProbeLeakedNames -join '; ')"
 
-# Codex P1 на #340: suite може затінити й ті cmdlet-и, якими реалізоване саме
+# рев'ю P1 на #340: suite може затінити й ті cmdlet-и, якими реалізоване саме
 # відновлення (Get-Item, Remove-Item, Set-Item, Get-ChildItem, Remove-Module,
 # New-Object, Write-Host). Restore має їх зняти, а не працювати через
 # заглушки: Get-Item-заглушка, що повертає $null, раніше давала хибне
@@ -35760,7 +35760,7 @@ Test-BRAVOCondition -Condition (
         $primitiveProbeBeforeCount, $primitiveProbeDuringCount, $primitiveProbeNames.Count, $primitiveProbeAfterCount,
         [string]::Join('; ', [string[]]$primitiveProbeResidualProblems))
 
-# Codex P2 на #340 (1): функція, що з'явилась під уже наявним аліасом, теж
+# рев'ю P2 на #340 (1): функція, що з'явилась під уже наявним аліасом, теж
 # змінює стан і знімається; аліас лишається. Раніше стан фіксував лише
 # «переможний» аліас, і прихована функція витікала.
 $hiddenProbeName = 'Get-Date'
@@ -35799,7 +35799,7 @@ Test-BRAVOCondition -Condition (
     -Failure ("функція під наявним аліасом має бути знята, аліас — лишитись: під час={0}, функція після={1}, аліас після={2}, залишки: {3}" -f
         $hiddenProbeFunctionDuring, $hiddenProbeFunctionAfter, $hiddenProbeAliasAfter, [string]::Join('; ', [string[]]$hiddenProbeResidualProblems))
 
-# Codex P2 на #340 (2): запис реєстру, прибирання якого кинуло, не
+# рев'ю P2 на #340 (2): запис реєстру, прибирання якого кинуло, не
 # позначається Cleaned, тож фінальний прохід повторить його.
 $failedCleanupEntry = [pscustomobject]@{ Module = [pscustomobject]@{ Name = ('probe-' + [guid]::NewGuid().ToString('N')) }; FunctionNames = @() }
 $failedCleanupIndex = $script:BRAVOSelfTestOwnedRuntimeModules.Count
@@ -35817,7 +35817,7 @@ Test-BRAVOCondition -Condition ($failedCleanupThrew -and -not $failedCleanupMark
     -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FailedCleanupNotMarkedCleaned' `
     -Failure "невдале прибирання runtime-модуля має повідомити про збій і лишити запис для повтору (кинуло=$failedCleanupThrew, Cleaned=$failedCleanupMarked)"
 
-# Codex P2 на #340 (3): аліас повертається з початковими Options і
+# рев'ю P2 на #340 (3): аліас повертається з початковими Options і
 # Description, а не як стандартний записуваний аліас.
 $aliasMetaProbeName = 'Send-MailMessage'
 $aliasMetaProbeRestored = $null
@@ -35851,7 +35851,7 @@ Test-BRAVOCondition -Condition (
         $(if ($null -ne $aliasMetaProbeRestored) { '{0} [{1}] "{2}"' -f $aliasMetaProbeRestored.Definition, $aliasMetaProbeRestored.Options, $aliasMetaProbeRestored.Description } else { 'аліаса немає' }),
         [string]::Join('; ', [string[]]$aliasMetaProbeResidualProblems))
 
-# Codex P2 на #340 (5): глобальна функція повертається з початковими Options.
+# рев'ю P2 на #340 (5): глобальна функція повертається з початковими Options.
 $functionOptionsProbeName = 'Restart-Service'
 $functionOptionsProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $functionOptionsProbeName) -ErrorAction SilentlyContinue)
 $functionOptionsProbeRestored = $null
@@ -35884,7 +35884,7 @@ Test-BRAVOCondition -Condition (
         $(if ($null -ne $functionOptionsProbeRestored) { [string]$functionOptionsProbeRestored.Options } else { 'функції немає' }),
         [string]::Join('; ', [string[]]$functionOptionsProbeResidualProblems))
 
-# Codex P2 на #340 (6): функція, експортована модулем, повертається як
+# рев'ю P2 на #340 (6): функція, експортована модулем, повертається як
 # запис того самого модуля (ModuleName збігається), а не відірвана копія.
 # Set-Item з ScriptBlock модуля зберігає прив'язку — guard фіксує це.
 $moduleOwnedProbeName = 'Restart-Service'
@@ -35925,7 +35925,7 @@ Test-BRAVOCondition -Condition (
         $(if ($null -ne $moduleOwnedProbeRestored) { [string]$moduleOwnedProbeRestored.ModuleName } else { 'функції немає' }),
         [string]::Join('; ', [string[]]$moduleOwnedProbeResidualProblems))
 
-# Codex P2 на #340 (7): AllScope-аліас. Читання global щоразу новим
+# рев'ю P2 на #340 (7): AllScope-аліас. Читання global щоразу новим
 # модулем бачить актуальну копію, тож заміну помічено; якщо точне
 # відновлення неможливе, це видимий залишок, а не тихий успіх.
 $allScopeProbeName = 'Stop-Service'
@@ -35961,7 +35961,7 @@ Test-BRAVOCondition -Condition (
     -Failure ("заміна AllScope-аліаса має бути відновлена або видимо зафіксована: знімок '{0}', після '{1}', залишків {2}" -f
         $allScopeProbeSnapshotKey, $allScopeProbeDefinitionAfter, $allScopeProbeResidualProblems.Count)
 
-# Codex P2 на #340 (4): global-заглушка (голий New-Module) під уже наявною
+# рев'ю P2 на #340 (4): global-заглушка (голий New-Module) під уже наявною
 # script-функцією з тим самим ім'ям знімається; script-функція лишається.
 $scopeProbeName = 'Wait-Process'
 $scopeProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $scopeProbeName) -ErrorAction SilentlyContinue)
@@ -38340,7 +38340,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan') { try {
     & $affExpect 'B25 ToolsManifest' (& $affPlanPlain @('Tools/TOOLS_MANIFEST.json')) 'V3|'
     & $affExpect 'B26 VERSION' (& $affPlanPlain @('VERSION.json')) 'V3|'
     & $affExpect 'ToolsDirectory' (& $affPlanPlain @('Tools/WinSCP/WinSCP.com')) 'V3|'
-    & $affExpect 'ClaudeDirectory' (& $affPlanPlain @('.claude/rules/05-architecture.md')) 'V3|'
+    & $affExpect 'EngineeringDocument' (& $affPlanPlain @('docs/engineering/architecture.md')) 'V3|'
     & $affExpect 'DeployScript' (& $affPlanPlain @('deploy/Install-BRAVOServer.ps1')) 'V3|'
     & $affExpect 'FragmentBackupFile' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.Paths.ps1.bak')) 'V3|'
     & $affExpect 'UnknownFragmentName' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.NoSuch.ps1')) 'V3|'

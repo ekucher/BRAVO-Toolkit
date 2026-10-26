@@ -259,7 +259,7 @@ Test-BRAVOCondition -Condition ($bdEffectiveCheckFailures.Count -eq 0) `
     -Name 'BackupDestinations/EffectiveDestinationCheckMatchesProfiles' `
     -Failure "Test-BRAVOConfiguratorBackupDestinationEffective має визнавати відповідність профілю лише за ефективними SFTP.Enabled/SMB.Enabled і fail-closed без ефективних значень: $($bdEffectiveCheckFailures -join ' | ')"
 
-# (2b) Codex P1: SFTP.Enabled = $true сам по собі не вивантажує архів.
+# (2b) рев'ю P1: SFTP.Enabled = $true сам по собі не вивантажує архів.
 # Профіль із хмарою (Cloud/CloudAndSamba) «в силі» лише тоді, коли ефективний
 # SFTP.ArchiveUpload той самий, що дав би свіжий seed профілю (seed його не
 # пише -> дефолт BRAVO.Configuration). Для профілів без SFTP (SambaOnly,
@@ -290,7 +290,7 @@ Test-BRAVOCondition -Condition ($bdUploadFailures.Count -eq 0) `
     -Name 'BackupDestinations/EffectiveDestinationCheckComparesArchiveUpload' `
     -Failure "Test-BRAVOConfiguratorBackupDestinationEffective: Cloud/CloudAndSamba при SFTP.Enabled=`$true, але ефективному SFTP.ArchiveUpload=`$false не «в силі» (канал SFTP, причина з ArchiveUpload); SambaOnly/LocalOnly від ArchiveUpload не залежать: $($bdUploadFailures -join ' | ')"
 
-# (2c) Codex Security P1 (#434): профілі без SFTP (SambaOnly, LocalOnly)
+# (2c) security-рев'ю P1 (#434): профілі без SFTP (SambaOnly, LocalOnly)
 # засівають BAZA_APP_LOCAL/BAZA_WWW_LOCAL = $true, бо BAZA-over-SMB не існує, а
 # BAZA_*_SFTP при вимкненому SFTP ефективно вимкнені. Наявний файл, з яким
 # ефективний BAZA_*_LOCAL = $false, лишив би BAZA без жодного каналу копії, тож
@@ -460,7 +460,7 @@ Test-BRAVOCondition -Condition ($bdConflictFailures.Count -eq 0) `
     -Name 'BackupDestinations/SeedPostWriteReplacementIsConflictWithoutDeletion' `
     -Failure "заміна BRAVO.local.config між Move і верифікацією (чужий валідний чи зіпсований файл) має давати Stage=Conflict, Created=false, без видалення чужого файлу й без прийняття його за успіх: $($bdConflictFailures -join ' | ')"
 
-# Фікстура комплекту (#434, Codex P1): RUNTIME_MANIFEST.json над усіма
+# Фікстура комплекту (#434, рев'ю P1): RUNTIME_MANIFEST.json над усіма
 # .ps1/.psm1/.psd1 каталогу у форматі, який читає канонічний
 # Test-BRAVORuntimeManifestIntegrity (BRAVO_RUNTIME_GUARD.ps1): ключ —
 # відносний шлях із роздільником платформи, значення — SHA-256. Інсталятор
@@ -561,7 +561,7 @@ try {
     ) -join "`r`n"
     [IO.File]::WriteAllText($bdChildPath, $bdChildText, (New-Object Text.UTF8Encoding($true)))
     # Розгорнутий каталог має бути цілісним комплектом: крок 4 перевіряє його
-    # канонічним guard-ом до імпорту модулів Configurator (#434, Codex P1).
+    # канонічним guard-ом до імпорту модулів Configurator (#434, рев'ю P1).
     Copy-Item -LiteralPath (Join-Path $root 'BRAVO_RUNTIME_GUARD.ps1') -Destination $bdInstallRoot -Force
     Write-BRAVOSelfTestBundleManifest -BundleRoot $bdInstallRoot
     $bdHostPath = (Get-Process -Id $PID).Path
@@ -748,7 +748,7 @@ try {
         , @('-BackupDestination', 'LocalOnly')
     )) {
         # Профіль LocalOnly у силі лише з BAZA_APP_LOCAL/BAZA_WWW_LOCAL = $true
-        # (Codex Security P1, #434: без SFTP це єдиний канал копії BAZA), тож
+        # (security-рев'ю P1, #434: без SFTP це єдиний канал копії BAZA), тож
         # сумісний файл несе й їх — як seed профілю.
         Set-BRAVOSelfTestLocalConfigFixture -Lines @(
             "'pathSettings.BackupRoot' = 'D:\ExampleArchive'",
@@ -915,7 +915,7 @@ Test-BRAVOCondition -Condition (
         $bdE2eHelpers = @($bdInstallAst.EndBlock.Statements | Where-Object {
             $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $bdE2eHelperNames -notcontains $_.Name
         } | ForEach-Object { $_.Extent.Text })
-        # (Codex P1, раунд 3) Приватний каталог кроку 1 інсталятор створює з
+        # (рев'ю P1, раунд 3) Приватний каталог кроку 1 інсталятор створює з
         # DACL лише для BUILTIN\Administrators і SYSTEM — це можливо лише в
         # елевованому процесі Windows. Харнес і так підставляє $isElevated =
         # $true, тож поза елевованим Windows (Linux, неелевована консоль)
@@ -1024,7 +1024,7 @@ function robocopy.exe {
             Copy-Item -LiteralPath (Join-Path $root 'BRAVO_CONFIG_LOADER.ps1') -Destination $bundleDir -Force
             Copy-Item -LiteralPath (Join-Path $root 'BRAVO.local.config.example') -Destination $bundleDir -Force
             if (-not [string]::IsNullOrEmpty($SiteConfigText)) {
-                # Комплект із кореневим BRAVO.local.config (Codex Security P1, #434):
+                # Комплект із кореневим BRAVO.local.config (security-рев'ю P1, #434):
                 # RUNTIME_MANIFEST.json його не охоплює, тож комплект лишається цілісним.
                 [IO.File]::WriteAllText((Join-Path $bundleDir 'BRAVO.local.config'), $SiteConfigText, $utf8)
             }
@@ -1359,7 +1359,7 @@ function robocopy.exe {
             @{ Destination = 'CloudAndSamba'; Arguments = @('-BackupDestination', 'CloudAndSamba', '-Force')
                Lines = @("'componentSettings.SFTP.Enabled' = `$true", "'componentSettings.SMB.Enabled' = `$true", "'componentSettings.SMB.ArchiveCopy' = `$false")
                Channels = @('SMB') },
-            # Codex P1: SFTP увімкнено, але архів у хмару ефективно не
+            # рев'ю P1: SFTP увімкнено, але архів у хмару ефективно не
             # вивантажується (SFTP.ArchiveUpload = $false) — «Хмара» не в силі.
             @{ Destination = 'Cloud'; Arguments = @('-BackupDestination', 'Cloud', '-Force')
                Lines = @("'componentSettings.SFTP.Enabled' = `$true", "'componentSettings.SFTP.ArchiveUpload' = `$false", "'componentSettings.SMB.Enabled' = `$false")
@@ -1491,7 +1491,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerExplicitDestinationWithoutSiteConfigFailsAtStep0' `
             -Failure "явний -BackupDestination (будь-який) без -SeedLocalConfig і без BRAVO.local.config лишає дефолти, що суперечать профілю, — відмова в кроці 0 (до staging/завантаження) з українською причиною (профіль, -SeedLocalConfig): $($bdE2eStepZeroFailures -join ' | ')"
 
-        # (Codex P1) Комплект, чий архів і .sha256 узгоджені, але модулі не
+        # (рев'ю P1) Комплект, чий архів і .sha256 узгоджені, але модулі не
         # збігаються з його RUNTIME_MANIFEST.json (локальний архів зі «своїм»
         # .sha256 або підміна staged-файлів): код комплекту не імпортується до
         # канонічної перевірки цілісності. Явний профіль — відмова ДО копіювання
@@ -1526,7 +1526,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerRefusesTamperedBundleBeforeImport' `
             -Failure "комплект, модулі якого не збігаються з RUNTIME_MANIFEST.json (архів і .sha256 узгоджені), не можна імпортувати: явний -BackupDestination — відмова ДО копіювання з українською причиною (RUNTIME_MANIFEST.json, підмінений файл), неявний -SeedLocalConfig — зупинка до імпорту Configurator без створення BRAVO.local.config: $($bdE2eTamperFailures -join ' | ')"
 
-        # (Codex P1, раунд 2) TOCTOU: $StagingRoot може бути доступний на запис
+        # (рев'ю P1, раунд 2) TOCTOU: $StagingRoot може бути доступний на запис
         # звичайному користувачеві, тож код комплекту для перевірки кроку 1 не
         # імпортується звідти. Маркер у кожному .psm1 записує каталог імпорту:
         # жодного імпорту з $StagingRoot, імпорт кроку 1 — з окремого
@@ -1550,7 +1550,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerStep1ImportsFromPrivateVerifiedCopy' `
             -Failure "явний -BackupDestination: код комплекту для перевірки кроку 1 не імпортується з `$StagingRoot (доступний на запис іншим — підміна між перевіркою цілісності й Import-Module), а з приватної перевіреної копії, яку видалено після перевірки: $($bdE2ePrivateFailures -join ' | ')"
 
-        # (Codex P2, раунд 2) BRAVO.local.config, змінений МІЖ перевіркою кроку 1
+        # (рев'ю P2, раунд 2) BRAVO.local.config, змінений МІЖ перевіркою кроку 1
         # і копіюванням (гачок харнеса в Write-Step '2.'), — відмова ДО першого
         # запису в каталог інсталяції: без VERSION.json і без копіювання; файл
         # лишається таким, яким його залишили.
@@ -1575,7 +1575,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerSiteConfigChangedAfterCheckRefusedBeforeCopy' `
             -Failure "BRAVO.local.config, змінений чи створений після перевірки -BackupDestination у кроці 1, має зупинити інсталяцію ДО першого запису в каталог інсталяції (без VERSION.json і копіювання) з українською причиною, файл не змінено: $($bdE2eMutationFailures -join ' | ')"
 
-        # (Codex P2, раунд 2) Можливості BRAVO.Configuration/BRAVO.Discovery
+        # (рев'ю P2, раунд 2) Можливості BRAVO.Configuration/BRAVO.Discovery
         # звіряються за визначеннями функцій, а не лише за наявністю .psd1:
         # комплект без Get-BRAVOEffectiveStorageConfiguration — явний профіль
         # відхиляється ДО копіювання з назвою відсутньої функції.
@@ -1607,7 +1607,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerExplicitDestinationRequiresConfigurationFunctions' `
             -Failure "комплект без функції BRAVO.Discovery/BRAVO.Configuration, яку викликає перевірка профілю (Get-BRAVOEffectiveStorageConfiguration), має відхиляти явний -BackupDestination ДО копіювання з назвою функції в причині: $($bdE2eNoStorageFailures -join ' | ')"
 
-        # (Codex P2, раунд 3) Можливість — це ЕКСПОРТОВАНА функція: визначення,
+        # (рев'ю P2, раунд 3) Можливість — це ЕКСПОРТОВАНА функція: визначення,
         # якого модуль не експортує (Export-ModuleMember/FunctionsToExport),
         # викликати не можна. Явний профіль: після імпорту приватної копії
         # Get-Command мусить знайти кожну потрібну функцію з її модуля; інакше
@@ -1666,7 +1666,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerImplicitSeedChecksExportedFunctionsBeforeDeploy' `
             -Failure "неявний -SeedLocalConfig з комплектом, що визначає, але не експортує функцію профілю, має ДО копіювання визнати його несумісним і піти шляхом прикладу (код 0, «з прикладу»), а не падати на імпорті в кроці 4 після розгортання: $($bdE2eImplicitNoExportFailures -join ' | ')"
 
-        # (Codex P2, раунд 4) Звірка експорту спирається на екземпляр модуля,
+        # (рев'ю P2, раунд 4) Звірка експорту спирається на екземпляр модуля,
         # який щойно повернув Import-Module -PassThru з $ModuleRoot, а не на
         # Get-Command за ModuleName: однойменний модуль з іншого шляху, уже
         # завантажений у сесію, не повинен «закрити» функцію, якої свіжий
@@ -1737,7 +1737,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerExportCheckIgnoresStaleSameNameModule' `
             -Failure "звірка експорту має спиратися на щойно імпортований з `$ModuleRoot екземпляр модуля, а не на однойменний модуль з іншого шляху, уже завантажений у сесію: $($bdE2eStaleFailures -join ' | ')"
 
-        # (Codex P2, раунд 3) Відбиток BRAVO.local.config і те, що прочитав
+        # (рев'ю P2, раунд 3) Відбиток BRAVO.local.config і те, що прочитав
         # канонічний reader у кроці 1, — ті самі байти. Фікстура: імпорт
         # Persistence.psm1 (між зняттям знімка й читанням) підміняє живий файл
         # (сумісний LocalOnly) на суперечливий. Рішення кроку 1 має спиратися на
@@ -1760,7 +1760,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerStep1ReadsFingerprintedSiteConfigSnapshot' `
             -Failure "крок 1 має читати знімок BRAVO.local.config, з байтів якого знято відбиток, а зміну живого файла після знімка — зупиняти перед першим записом у каталог інсталяції («змінився»): $($bdE2eSnapshotFailures -join ' | ')"
 
-        # (Codex P1, раунд 3) Приватний каталог перевірки кроку 1 лежить у
+        # (рев'ю P1, раунд 3) Приватний каталог перевірки кроку 1 лежить у
         # $env:SystemRoot\Temp (не %TEMP% користувача, де той має FILE_DELETE_CHILD
         # і міг би перейменувати каталог) і без явного DACL успадкував би права:
         # процес того самого користувача без елевації підмінив би .psm1 між
@@ -1933,7 +1933,7 @@ function robocopy.exe {
         }, $true) | Where-Object { $bdE2eChannelGate.Count -ne 1 -or $_.Extent.StartOffset -lt $bdE2eChannelGate[0].Extent.StartOffset })
         if ($bdE2eChannelGate.Count -ne 1) { $bdE2eTrustFailures += 'Get-BRAVODeployReleaseChannelDecision не знайдено' }
         foreach ($bdE2eImport in $bdE2eEarlyStagedImports) { $bdE2eTrustFailures += "рядок $($bdE2eImport.Extent.StartLineNumber): $($bdE2eImport.Extent.Text)" }
-        # (Codex P1) Кожен імпорт коду комплекту в головному try (Import-Module,
+        # (рев'ю P1) Кожен імпорт коду комплекту в головному try (Import-Module,
         # dot-source, Get-BRAVOInstallSiteComponentSettings,
         # Import-BRAVOInstallBackupDestinationModules) має бути домінований
         # викликом Assert-BRAVOInstallBundleIntegrity над тим самим коренем:
@@ -1952,7 +1952,7 @@ function robocopy.exe {
                 $node.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Dot) -and
             $node.Extent.Text -match '(?i)\$(staged|StagingRoot|RuntimeRoot|configuratorModuleRoot|verifiedBundle)\b'
         }, $true))
-        # (Codex P1, раунд 2) Корінь імпорту — змінна аргументу -ModuleRoot чи
+        # (рев'ю P1, раунд 2) Корінь імпорту — змінна аргументу -ModuleRoot чи
         # -Name (перша змінна); $configuratorModuleRoot = $RuntimeRoot. Корінь
         # не може походити з $StagingRoot/$staged (транзитивно за присвоєннями):
         # той каталог може бути доступний на запис іншим. Імпорт кроку 1 — з
@@ -2035,7 +2035,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerNeverImportsBundleBeforeTrustGates' `
             -Failure "модулі розпакованого чи розгорнутого комплекту не можна імпортувати до перевірки SHA-256, провенансу, каналу релізу й цілісності за RUNTIME_MANIFEST.json: $($bdE2eTrustFailures -join ' | ')"
 
-        # (Codex Security P1, #434) BRAVO.local.config у КОМПЛЕКТІ. RUNTIME_MANIFEST.json
+        # (security-рев'ю P1, #434) BRAVO.local.config у КОМПЛЕКТІ. RUNTIME_MANIFEST.json
         # покриває лише .ps1/.psm1/.psd1, тож комплект із кореневим
         # BRAVO.local.config цілісний; robocopy /E після звірки відбитка кроку 3
         # переписав би ним site-файл. Вимога власника: наявний BRAVO.local.config
@@ -2112,7 +2112,7 @@ function robocopy.exe {
             -Name 'BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle' `
             -Failure "BRAVO.local.config з комплекту не стає site-файлом: -SeedLocalConfig [-BackupDestination] пише seed профілю, без -SeedLocalConfig файла немає; або відмова ДО копіювання без жодного файла в каталозі інсталяції: $($bdE2eShipSeedFailures -join ' | ')"
 
-        # (Codex Security P1, #434) BAZA для профілів без SFTP: наявний файл, сумісний
+        # (security-рев'ю P1, #434) BAZA для профілів без SFTP: наявний файл, сумісний
         # з LocalOnly/SambaOnly за SFTP/SMB, але з ефективним BAZA_APP_LOCAL чи
         # BAZA_WWW_LOCAL = $false лишає BAZA без каналу копії — відмова ДО копіювання
         # з причиною, що називає ключ; файл не змінено. Контракт функції — (2c).
@@ -2612,7 +2612,7 @@ function Test-BRAVOSelfTestOutboundFalsityProvesGate {
 }
 
 function Test-BRAVOSelfTestOutboundPositiveGate {
-    # Умова вимагає вимикач ПОЗИТИВНО (Codex P2, раунд 2): термін, що збігається
+    # Умова вимагає вимикач ПОЗИТИВНО (рев'ю P2, раунд 2): термін, що збігається
     # з вимикачем, стоїть не під -not/!, а з іншими термінами поєднаний лише
     # через -and — тож хибний вимикач робить умову хибною. «-not вимикач»,
     # «вимикач -or інше», порівняння й виклики команд не зараховуються.
@@ -2863,7 +2863,7 @@ Test-BRAVOCondition -Condition (
 ) -Name 'BackupDestinations/OutboundGuardDetectsUngatedChannel' `
     -Failure "сторож має розпізнати захищений (похідний прапорець, ранній вихід) і незахищений канали на синтетичному файлі: $(@($bdGuardFixtureSites | ForEach-Object { "$($_.Function): gated=$($_.Gated) $($_.Evidence)" }) -join ' | ')"
 
-# Codex P2: умова захищає лише ТЕЛО своєї гілки. Канал у else чи в пізнішій
+# рев'ю P2: умова захищає лише ТЕЛО своєї гілки. Канал у else чи в пізнішій
 # elseif-гілці не захищений вимикачем з умови попередньої гілки; канал у тілі
 # elseif із власною умовою-вимикачем — захищений; else після умови «-not
 # вимикач» (форма BRAVO.Maintenance.Runtime.ps1) — захищений.
@@ -2895,7 +2895,7 @@ Test-BRAVOCondition -Condition (
 ) -Name 'BackupDestinations/OutboundGuardCountsOnlyOwnBranchCondition' `
     -Failure "сторож має зараховувати вимикач лише з умови гілки, у тілі якої стоїть канал: else і пізніша elseif — незахищені (крім else після рівно «-not вимикач»), if і elseif із власною умовою — захищені: $(@($bdBranchSites.Values | ForEach-Object { "$($_.Function): gated=$($_.Gated) $($_.Evidence)" }) -join ' | ')"
 
-# Codex P2 (раунд 2): полярність. Вимикач зараховується лише як позитивна
+# рев'ю P2 (раунд 2): полярність. Вимикач зараховується лише як позитивна
 # вимога на власній гілці каналу: «-not вимикач» у тілі й «вимикач -or інше»
 # каналу не захищають; «вимикач -and інше» — захищає; else після рівно
 # «-not вимикач» лишається захищеним.

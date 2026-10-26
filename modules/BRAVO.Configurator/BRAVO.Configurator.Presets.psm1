@@ -400,7 +400,7 @@ function Test-BRAVOConfiguratorBackupDestinationEffective {
     }
 
     if ($null -ne $EffectiveSynchronization) {
-        # BAZA для профілів без SFTP (#434, Codex Security P1): єдиний канал
+        # BAZA для профілів без SFTP (#434, security-рев'ю P1): єдиний канал
         # копії — локальна синхронізація BAZA_*_LOCAL. Відсутній компонент чи
         # Components — ефективно вимкнено (fail closed).
         $bazaConflict = $false

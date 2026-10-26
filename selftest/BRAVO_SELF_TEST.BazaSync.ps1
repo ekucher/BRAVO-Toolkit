@@ -347,7 +347,7 @@
             $aaOkSession2.State.PutFilesCallCount -eq 1
         ) -Name 'BazaSync/AutoArchiveBelowThresholdRenamesAndClearsState' -Failure "мутація <= порогу має автоматично rename-archive: Status=$($aaOkResult2.Status),Accepted=$($aaOkResult2.AutoArchivedMutations.Accepted.Count),MoveFile=$($aaOkSession2.State.MoveFileCalls.Count),PutFiles=$($aaOkSession2.State.PutFilesCallCount)"
 
-        # #285 (Codex 388-C1): збій фінального Save-BRAVOBazaState після
+        # #285 (рев'ю 388-C1): збій фінального Save-BRAVOBazaState після
         # авто-архівування. Remote уже перейменовано, а зміну стану не
         # збережено — цикл не може лишатися MUTATION_AUTO_ARCHIVED (успіх
         # для -SyncBAZA/Archive); той самий downgrade, що й для COMPLETE.

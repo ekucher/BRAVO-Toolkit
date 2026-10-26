@@ -2,6 +2,20 @@
 
 ## Не випущено (developer)
 
+- **Інженерні правила для розробників — у `docs/engineering/`.** Правила
+  архітектури, життєвого циклу релізу, інваріантів безпеки runtime,
+  PowerShell 5.1, безпеки, тестування, конфігурації й мовної політики
+  документації тепер живуть у нейтральних документах
+  `docs/engineering/*.md` (індекс — `docs/engineering/README.md`);
+  посилання в коментарях коду, self-test і design-документах оновлено. Із
+  дерева прибрано службові файли локальних інструментів розробки, що не
+  входять у продукт, разом із двома службовими скриптами `Tools\` (не
+  runtime) і їхніми записами в `RUNTIME_MANIFEST.json`; відповідні два
+  кроки CI видалено. Runtime-поведінка не змінювалась: зміни в `*.ps1` /
+  `*.psm1` — лише коментарі, а в self-test — ще й тексти повідомлень.
+  Жоден опублікований тег цих двох скриптів не містив, тож оновлення
+  сервера з релізного комплекту «сиріт» не залишає.
+
 - **Fix: консистентність знімка legacy-синхронізації BAZA (follow-up #501).** Закрито дві прогалини
   класифікації з PR #502, обидві fail-open.
   1. Обхід знімка неатомарний. Файл, що з'явився в уже обійденому каталозі до старту WinSCP і був
@@ -470,16 +484,6 @@
   процесом, і так трактує будь-який код, окрім `0`/`10`, як помилку. Додано
   статичну перевірку: кожен `exit <число>` у Archive.Runtime мусить бути з
   множини `BRAVO.ExitCodes`.
-
-- **Агентна оркестрація: роль `lead` як визначення агента.** Lead/Orchestrator
-  з `BRAVO_AGENT_POLICY.md` §8 тепер існує як `.claude/agents/lead.md` і роль
-  `lead` у `.claude/ai-routing.json` (`model: inherit` — модель, обрана
-  власником; `mainSessionOnly`). Сесію оркестрації запускають
-  `claude --agent lead`. Хук `validate-agent-routing.ps1` блокує виклик
-  `Agent` із `subagent_type: lead`, щоб оркестрація не вкладалась і не обходила
-  людський merge-gate; тест у `Test-AIRouting.ps1`. Оновлено
-  `docs/ai/MODEL_ROUTING_POLICY.md`, `.claude/skills/orchestrate/SKILL.md`,
-  `.claude/README.md` і §9.1 політики. Runtime-код не змінювався.
 
 - **Виправлено: вивід WinSCP маскується цілим (#461).**
   `Get-SanitizedWinSCPDiagnostic` (stdout/stderr WinSCP.com для SFTP-передачі,
@@ -2170,7 +2174,7 @@
   (`-Preflight`, `-Prepare`, `-Status` тощо) лишились як є.
 
   Виправлено слова, у яких латинські літери стояли замість кириличних:
-  «моноліт» у `.claude/CLAUDE.md` і `.claude/rules/05-architecture.md`
+  «моноліт» в інженерних правилах архітектури
   (суто орфографія, без зміни змісту правил), «задане» в `README.md`,
   слова в `docs/design/BRAVO_CONFIGURATOR_DESIGN.md`,
   `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md` і двох runbook-ах.
@@ -2925,7 +2929,7 @@
   оголошені в робочому коді, не stub-и self-test-ів), шляхи репозиторію
   (зокрема `скрипт.ps1 -Аргумент` і `*.json`) й модулі `BRAVO.*` в
   inline-коді живих документів
-  (історичні CHANGELOG/ROADMAP/`docs/`/`.claude/`, fenced-приклади,
+  (історичні CHANGELOG/ROADMAP/`docs/`, fenced-приклади,
   placeholder-и й runtime-шляхи не перевіряються за побудовою);
   `Documentation/InlineReferenceExceptionsAreCurrent` — реєстр
   історичних/запланованих/зовнішніх згадок із категоріями не накопичує

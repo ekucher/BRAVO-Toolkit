@@ -1,5 +1,5 @@
 ﻿# Домен-фрагмент self-test: BRAVO.Configurator backend
-# (Schema/Model/Effective/Validation/Persistence) — GUI (Agent 4-7 з
+# (Schema/Model/Effective/Validation/Persistence) — GUI (етапи 4-7 з
 # docs/design/BRAVO_CONFIGURATOR_DESIGN.md) поки не реалізовано, тут
 # перевіряється лише backend-контракт.
 #
@@ -2622,7 +2622,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configurator/MutationPolicyRecoveryDescrip
 if (Enter-BRAVOSelfTestSection -Name 'Configurator/MultiRepresentationValidFlatInvalidNestedProducesRecoveryRow' -DependsOn 'Configurator/Schema1') { try {
 
 # =====================================================================
-# Codex review PR #224 (P2, "Inspect every representation when
+# Рев'ю PR #224 (P2, "Inspect every representation when
 # generating recovery rows"): Get-BRAVOConfiguratorSessionSchemaCatalog
 # раніше викликала Resolve-BRAVOConfiguratorSuppliedLeafOverride, яка
 # повертає ЛИШЕ ОДНЕ (найдовше/пріоритетне) supplied-представлення
@@ -3088,7 +3088,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configurator/MultiRepresentationValidFlatI
         [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $dnEscOriginalEnv)
     }
 
-    # ===== Codex review PR #224 (P2, "Preserve typed values in synthesized
+    # ===== Рев'ю PR #224 (P2, "Preserve typed values in synthesized
     # recovery rows"): синтезований recovery-дескриптор МУСИТЬ мати Type,
     # що відповідає РЕАЛЬНОМУ .NET-типу supplied-значення — раніше Type
     # був захардкожений 'String' для КОЖНОГО recovery-рядка незалежно від
@@ -3567,7 +3567,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configurator/OversizedCatalogIntegerOverri
 }
 
 # =====================================================================
-# Codex review PR #224 (P1, "Import authorization modules into the UI
+# Рев'ю PR #224 (P1, "Import authorization modules into the UI
 # scope unconditionally"): та сама РЕАЛЬНА private-session-state умова,
 # що блок вище для Model (New-Module foreign loader у ІЗОЛЬОВАНОМУ
 # дочірньому процесі, команди BRAVO.Configuration/Schema лишаються
@@ -3867,7 +3867,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configurator/OversizedCatalogIntegerOverri
 if (Enter-BRAVOSelfTestSection -Name 'Configurator/Merge' -DependsOn 'Configurator/Schema1') { try {
 
 # =====================================================================
-# Codex review PR #224 (P2, "Remove nested duplicates when clearing a
+# Рев'ю PR #224 (P2, "Remove nested duplicates when clearing a
 # flat override"): Merge-BRAVOConfiguratorCandidateOverrides раніше
 # обробляла плоский top-level ключ і одразу `continue`-ила — НІКОЛИ не
 # перевіряючи, чи той самий canonical leaf ТАКОЖ представлений
@@ -3996,7 +3996,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configurator/Merge' -DependsOn 'Configurat
 }
 
 # =====================================================================
-# Codex review PR #224 (P2, thread lGNJ5, "Flatten every nested
+# Рев'ю PR #224 (P2, thread lGNJ5, "Flatten every nested
 # representation when clearing a leaf"): попередній односхідчастий
 # Resolve+Convert (виправлений блоком вище — лише ОДИН рівень
 # вкладеності) зупинявся на НАЙДОВШОМУ присутньому префіксі й ніколи не

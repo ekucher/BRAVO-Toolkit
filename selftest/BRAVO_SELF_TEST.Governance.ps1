@@ -1444,7 +1444,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
 #     що вважається функцією — див. Find-BRAVODocReferenceProblem),
 #     файл/каталог — tracked, модуль — каталогом у modules/.
 #     Історичні документи (CHANGELOG, ROADMAP, TODO_FEATURES, docs/ з
-#     датованими evidence/runbook/design і .claude/) свідомо називають
+#     датованими evidence/runbook/design) свідомо називають
 #     старі й заплановані назви та не перевіряються.
 #  3. Літеральний приклад — fenced-блок (зокрема в пункті списку),
 #     HTML-коментар, екранована розмітка (`\[`), placeholder (<...>, %VAR%,
@@ -3343,7 +3343,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateDetectsLegacyReaderCallCaseInsensitively ---
-    # Codex-знахідка (gate-review): PowerShell розв'язує імена команд
+    # Знахідка рев'ю (gate-review): PowerShell розв'язує імена команд
     # регістронезалежно, тож інший регістр символів мусить так само
     # провалювати гейт, а не пройти через ordinal-порівняння.
     $legacyReaderCaseInsensitiveFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
@@ -3368,7 +3368,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateScansAllRootEntryScriptsNotOnlyAutoexecList ---
-    # Codex-знахідка (gate-review): попередня версія сканувала лише 14
+    # Знахідка рев'ю (gate-review): попередня версія сканувала лише 14
     # AUTOEXEC-цілей (Get-BRAVOProductionEntryPointRelativePath), пропускаючи
     # кореневі тонкі entrypoint-обгортки поза цим списком (напр.
     # BRAVO_ARCHIV.ps1/BRAVO_HEALTH.ps1/BRAVO_MAINTENANCE.ps1/
@@ -3395,7 +3395,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateIgnoresCommentOnlyLegacyReaderMention ---
-    # Codex-знахідка (gate-review, R3): текстовий пошук бачив би цю появу
+    # Знахідка рев'ю (gate-review, R3): текстовий пошук бачив би цю появу
     # назви функції в коментарі як FAIL, хоча жодного виклику команди тут
     # немає — гейт мусить розбирати AST і зіставляти лише СПРАВЖНІ виклики
     # команд, а не будь-яку текстову появу імені.
@@ -3421,7 +3421,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateScansDeployDirectoryForLegacyReaderCalls ---
-    # Codex-знахідка (gate-review): deploy\ раніше не сканувався ЗОВСІМ —
+    # Знахідка рев'ю (gate-review): deploy\ раніше не сканувався ЗОВСІМ —
     # не-migration скрипт (напр. deploy\Install-BRAVOServer.ps1) міг би
     # напряму викликати legacy-рідер без жодного FAIL.
     $legacyReaderDeployFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
@@ -3476,7 +3476,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateDetectsSimpleVariableIndirectionLegacyReaderCall ---
-    # Codex-знахідка (gate-review, R4): `$reader = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $reader`
+    # Знахідка рев'ю (gate-review, R4): `$reader = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $reader`
     # обходить пряме зіставлення CommandAst.GetCommandName() (повертає null
     # для команди-змінної). Гейт мусить ловити принаймні цю просту форму
     # непрямого виклику через локальне присвоєння рядкового літералу.
@@ -3527,7 +3527,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateIgnoresReassignedIndirectionVariable ---
-    # Codex-знахідка (gate-review, R5): попередня версія тримала плаский
+    # Знахідка рев'ю (gate-review, R5): попередня версія тримала плаский
     # HashSet імен змінних на весь файл — reassignment тієї самої змінної
     # на щось безпечне ПІСЛЯ ризикового присвоєння хибно провалював би
     # гейт, хоча реально виконується лише безпечна команда.
@@ -3578,7 +3578,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateNarrowsCanonicalLoaderExemptionToSanctionedCallSites ---
-    # Codex-знахідка (gate-review, R5): попередня версія повністю
+    # Знахідка рев'ю (gate-review, R5): попередня версія повністю
     # виключала BRAVO_CONFIG_LOADER.ps1 зі сканування, ховаючи МАЙБУТНІЙ
     # негвардований виклик десь-інде в тому самому файлі. Тепер файл
     # сканується, як усі інші, але звіряється проти точного переліку
@@ -3635,7 +3635,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateResolvesIndirectionThroughParentScope ---
-    # Codex-знахідка (gate-review, R6): попередня версія вимагала точної
+    # Знахідка рев'ю (gate-review, R6): попередня версія вимагала точної
     # рівності ScriptBlockAst — присвоєння на рівні модуля/скрипта й
     # виклик через ту саму змінну ВСЕРЕДИНІ вкладеної функції реально
     # резолвиться лексично (PowerShell читає змінну з батьківського
@@ -3691,7 +3691,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateDetectsSecondUnguardedCallFromSanctionedCaller ---
-    # Codex-знахідка (gate-review, R7): перевірка санкціонованої пари за
+    # Знахідка рев'ю (gate-review, R7): перевірка санкціонованої пари за
     # ІМЕНЕМ охоплюючої функції не бачить, що конкретний виклик реально
     # guard'ований — другий, негвардований виклик Import-BravoLegacyPrimaryConfiguration
     # десь-інде всередині ТІЄЇ Ж Import-BravoConfiguration проходив би
@@ -3724,7 +3724,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateTreatsCompoundAssignmentAsNonReplacing ---
-    # Codex-знахідка (gate-review, R8) — РЕАЛЬНИЙ баг у самій реалізації
+    # Знахідка рев'ю (gate-review, R8) — РЕАЛЬНИЙ баг у самій реалізації
     # гейту (не крайовий випадок статичного аналізу): складене присвоєння
     # (`+=`) не ЗАМІНЮЄ значення змінної, а доповнює його, але попередня
     # версія записувала будь-який AssignmentStatementAst як повну заміну —
@@ -3753,7 +3753,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateIgnoresScriptBlockLiteralAssignment ---
-    # Codex-знахідка (gate-review, R9) — РЕАЛЬНИЙ false-positive баг у
+    # Знахідка рев'ю (gate-review, R9) — РЕАЛЬНИЙ false-positive баг у
     # самій реалізації гейту: рекурсивний FindAll шукав StringConstantExpressionAst
     # будь-де в правій частині присвоєння, включно з УСЕРЕДИНІ вкладеного
     # scriptblock-виразу. `$cmd = { 'Read-...' }` записувало ризиковий
@@ -3782,7 +3782,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateNormalizesScopeQualifiedVariableName ---
-    # Codex-знахідка (gate-review, R9): VariablePath.UserPath включає
+    # Знахідка рев'ю (gate-review, R9): VariablePath.UserPath включає
     # scope-префікс (`script:`) як частину рядка — `$script:reader` і
     # `$reader` (яке PowerShell реально резолвить з батьківського scope
     # до того самого значення) порівнювались як РІЗНІ імена, тож ця
@@ -3809,7 +3809,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateRespectsExplicitScriptScopeQualifierAtCallSite ---
-    # Codex-знахідка (gate-review, R10) — прямий регрес від R9: нормалізація
+    # Знахідка рев'ю (gate-review, R10) — прямий регрес від R9: нормалізація
     # scope-префіксу знімала ЗМІСТ явного кваліфікатора В МІСЦІ ВИКЛИКУ.
     # `& $script:reader` ЦІЛЕСПРЯМОВАНО звертається лише до script-scope
     # (кореня файлу), навіть коли вкладена функція має власне
@@ -4682,13 +4682,13 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/ValidateOnlyNeverPersistsDiscov
         -Name "Governance/ValidateOnlyDiscoveryBaselineGuardPatternIsMeaningful" `
         -Failure "перевірка вище не відрізняє захищений виклик від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
 
-    # Регресія на ГЛИБШИЙ P1-дефект того самого класу (незалежний Codex
-    # review PR #207, знайдений ПІСЛЯ фіксу вище): Import-
+    # Регресія на ГЛИБШИЙ P1-дефект того самого класу (незалежне
+    # рев'ю PR #207, знайдений ПІСЛЯ фіксу вище): Import-
     # BRAVODiscoveryBaseline сам може мігрувати legacy-baseline файл у
     # canonical розташування (запис у $StateRoot) незалежно від
     # -ConfirmDiscoveryBaseline — на самому лише виклику під час читання.
     # Перевірка вище (Save-BRAVODiscoveryBaseline guard) цей шлях не
-    # покриває: Codex явно вказав, що "the new regex test also misses
+    # покриває: рев'ю явно вказало, що "the new regex test also misses
     # this path". -ReadOnly:$ValidateOnly у виклику нижче — фікс.
     Test-BRAVOCondition `
         -Condition (

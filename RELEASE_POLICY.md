@@ -1019,7 +1019,7 @@ branch protection зіставляє required checks за ІМЕНЕМ, і пі�
 | rulesets гілки (`GET /rules/branches/{b}`) | немає (`[]`) | немає (`[]`) |
 | required status checks | 6, перелік нижче | немає (`contexts: []`) |
 | `Config parity (BRAVO_CONFIG_LOADER)` серед required | ні | ні |
-| `strict`, `enforce_admins`, вимога PR, заборона force push і видалення | **не перевірено**: `GET /branches/master/protection` → HTTP 403 (токен сесії не має `administration=read`) | відсутні — protection немає |
+| `strict`, `enforce_admins`, вимога PR, заборона force push і видалення | **не перевірено**: `GET /branches/master/protection` → HTTP 403 (токен перевірки не має `administration=read`) | відсутні — protection немає |
 
 Required checks `master` за live-відповіддю
 (`protection.required_status_checks`, `enforcement_level: everyone`) —
@@ -1040,7 +1040,7 @@ ruleset (чи існував захист 2026-08-26 і був згодом зн
 встановити не можна — важливий поточний стан). Отже зараз
 **ніщо технічно не блокує merge у `developer` з червоним CI** — зелений
 CI там тримається лише дисципліною. Для `master` ті самі `strict` і
-`enforce_admins` з цієї сесії не перевірювані (HTTP 403), тож їх не
+`enforce_admins` цим токеном не перевірювані (HTTP 403), тож їх не
 записано ані як увімкнені, ані як вимкнені. Створення захисту
 `developer` — дія власника, §13.4.
 
@@ -1075,8 +1075,8 @@ CI там тримається лише дисципліною. Для `master` 
 
 ### 13.4. OWNER ACTION REQUIRED: захист `developer`
 
-Статус: **не застосовано** (live 2026-09-30, §13.3). Автоматична сесія
-цього зробити не може: токен інтеграції не має дозволу Administration
+Статус: **не застосовано** (live 2026-09-30, §13.3). Токеном без
+дозволу Administration цього зробити не можна
 (`GET`/`PUT .../branches/{b}/protection` → HTTP 403), тож дію виконує
 власник — у GitHub UI або через `gh` під власним обліковим записом.
 
@@ -1160,13 +1160,12 @@ curl -sS https://api.github.com/repos/<owner>/BRAVO-Toolkit/branches/developer
 
 Очікувано `protected: true` і рівно сім імен у
 `protection.required_status_checks.contexts`. Лише тоді оновлюються
-таблиця live-стану в §13.3 (з датою), абзац про `Config parity` і
-`.claude/PROJECT_STATE.md`.
+таблиця live-стану в §13.3 (з датою) і абзац про `Config parity`.
 
 **Необов'язкове рішення власника: `Config parity` на `master`.** Не
 застосовано й не є частиною обов'язкової дії вище. Якщо власник вирішить
 додати перевірку й на `master`, змінювати треба **лише** перелік
-required checks, не чіпаючи налаштувань, яких сесія не бачить (`strict`,
+required checks, не чіпаючи налаштувань, яких токен без admin-прав не бачить (`strict`,
 `enforce_admins`, вимога PR). Спершу зберегти поточний стан
 (`gh api repos/<owner>/BRAVO-Toolkit/branches/master/protection`), потім:
 

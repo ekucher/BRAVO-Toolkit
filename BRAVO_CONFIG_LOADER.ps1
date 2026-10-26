@@ -1168,7 +1168,7 @@ function Complete-BRAVOConfigurationLoad {
             #             (сьогодні: BAZA.Mode/MutationPolicy — append-
             #             only/mutation-detection цілісність BAZA, той
             #             самий клас гарантії, що
-            #             .claude/rules/07-bravo-runtime-invariants.md
+            #             docs/engineering/runtime-invariants.md
             #             вимагає окремого свідомого рішення власника для
             #             послаблення), або тому, що оператор ще не
             #             підтвердив послаблення поточним процесом.

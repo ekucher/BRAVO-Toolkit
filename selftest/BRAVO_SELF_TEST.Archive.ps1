@@ -1639,7 +1639,7 @@ try {
 }
 
 # ============================================================
-# #290 (Codex P1): BRAVO_WINSCP lock звільняється лише після підтвердженого
+# #290 (рев'ю P1): BRAVO_WINSCP lock звільняється лише після підтвердженого
 # завершення WinSCP. Якщо Kill()/WaitForExit не завершили процес, гілка
 # таймауту НЕ викликає Complete-BRAVOProcessOutputCapture (він звільняє lock)
 # і йде фатальним шляхом (throw), інакше наступна операція запустила б другий
@@ -2769,7 +2769,7 @@ try {
     ) -Name 'Archive/501/F21bModifiedAndTransferredIsNotError' `
       -Failure "змінений і переданий файл знімка не є порушенням; label=$($rf21b.Label) changed=$($rf21b.App.ChangedDuringSyncCount)"
 
-    # F22 (Codex QA-001). Junction, створений під час обходу знімка в уже
+    # F22 (QA-001). Junction, створений під час обходу знімка в уже
     # обійденому каталозі, веде на дерево з "годинником попереду" (CreationTime
     # у майбутньому): ReparsePointDirectoryCount знімка = 0, але кандидат іде
     # через reparse point -> не "новий" -> ПОМИЛКА.
@@ -2806,7 +2806,7 @@ try {
     ) -Name 'Archive/501/F23VanishedOverProbeLimitIsError' `
       -Failure "понад ліміт stat зниклі об'єкти лишаються помилкою; label=$($rf23.Label) changed=$($rf23.App.ChangedDuringSyncCount)"
 
-    # F24 (Codex, PR #503). Корінь синхронізації чи його предок замінено на
+    # F24 (рев'ю PR #503). Корінь синхронізації чи його предок замінено на
     # junction після Test-BAZACreationClockTrusted: ланцюг кандидата
     # перевіряється до кореня тому включно, а не лише нижче кореня.
     $f24Base = Join-Path $late501Root 'F24'
@@ -2842,7 +2842,7 @@ try {
         }
     }
 
-    # F25 (Codex, PR #503). Файл аудиту ДО, зниклий під час синхронізації без
+    # F25 (рев'ю PR #503). Файл аудиту ДО, зниклий під час синхронізації без
     # версії у хмарі (F05), не рахується переданим: передано 1 з 2, і рядок
     # результату називає порушення знімка.
     $f25ResultLine = @($rf05.Log | Where-Object { $_.Message -like 'Результат BAZA_APP:*' })
@@ -2854,7 +2854,7 @@ try {
     ) -Name 'Archive/501/F25VanishedPendingFileIsNotCountedAsTransferred' `
       -Failure "зниклий файл аудиту ДО не можна рахувати переданим; before=$($rf05.App.BeforeCount) completed=$($rf05.App.CompletedCount) drift=$($rf05.App.SnapshotDriftViolationCount) line=$(@($f25ResultLine | ForEach-Object { $_.Message }) -join ' | ')"
 
-    # F26 (Codex, PR #503). Два файли чекали передачі: pending_1 передано, а
+    # F26 (рев'ю PR #503). Два файли чекали передачі: pending_1 передано, а
     # pending_2 перейменовано на renamed_2 після сканування WinSCP. Нове ім'я
     # є в пост-аудиті, а pending_2 — у порушеннях знімка, але це один об'єкт:
     # передано рівно 1, а не 0.
@@ -2866,7 +2866,7 @@ try {
     ) -Name 'Archive/501/F26RenamedPendingFileCountedOnce' `
       -Failure "перейменований файл аудиту ДО не може двічі зменшувати кількість переданих; label=$($rf26.Label) before=$($rf26.App.BeforeCount) completed=$($rf26.App.CompletedCount) real=$($rf26.App.RealMissingCount) drift=$($rf26.App.SnapshotDriftViolationCount)"
 
-    # F27 (Codex, PR #503, P1). Знімок циклу не вдався, бо pending_2 зник під
+    # F27 (рев'ю PR #503, P1). Знімок циклу не вдався, бо pending_2 зник під
     # час обходу. WinSCP і пост-аудит його вже не бачать (код 0, залишку
     # немає), але аудит ДО довів, що файл чекав передачі -> ПОМИЛКА.
     $f27 = & $late501NewCase 'F27'
@@ -2889,7 +2889,7 @@ try {
     ) -Name 'Archive/501/F27bSnapshotUnavailableNothingVanishedIsSuccess' `
       -Failure "збій знімка без зниклих файлів аудиту ДО лишається УСПІШНО; label=$($rf27b.Label) exit=$($rf27b.ExitCode) completed=$($rf27b.App.CompletedCount)"
 
-    # F28 (Codex, PR #503, P1). Знімок циклу УСПІШНИЙ, але pending_2 зник між
+    # F28 (рев'ю PR #503, P1). Знімок циклу УСПІШНИЙ, але pending_2 зник між
     # аудитом ДО і обходом знімка: у знімку його немає, пост-аудит порожній.
     # Звіряння знімка його не бачить, тож без окремої перевірки цикл був би
     # УСПІШНО попри втрачений файл -> ПОМИЛКА.
@@ -2918,7 +2918,7 @@ try {
     ) -Name 'Archive/501/F28bSnapshotMissingButPresentAndTransferredIsSuccess' `
       -Failure "файл аудиту ДО, якого немає у знімку, але який є локально і переданий, не є помилкою; label=$($rf28b.Label) exit=$($rf28b.ExitCode) vanished=$($rf28b.App.SnapshotUnavailableVanishedCount) completed=$($rf28b.App.CompletedCount)"
 
-    # F29 (Codex, PR #503, P1). pending_2 замінено за тим самим шляхом ДО обходу
+    # F29 (рев'ю PR #503, P1). pending_2 замінено за тим самим шляхом ДО обходу
     # знімка: каталогом (F29) або меншим файлом (F29b). Шлях є у знімку,
     # але це не той об'єкт, що в аудиті ДО: оригінал не захоплено -> ПОМИЛКА,
     # переданим він не рахується. F29c — контроль: незмінений файл покритий.
@@ -2969,7 +2969,7 @@ try {
         $rf29d.App.IsComplete -and $rf29d.App.SnapshotUnavailableVanishedCount -eq 0 -and $rf29d.App.CompletedCount -eq 2
     ) -Name 'Archive/501/F29dGrownFileBeforeSnapshotIsNotError' `
       -Failure "дописаний до знімка файл аудиту ДО не є помилкою; label=$($rf29d.Label) exit=$($rf29d.ExitCode) vanished=$($rf29d.App.SnapshotUnavailableVanishedCount) completed=$($rf29d.App.CompletedCount)"
-    # F30 (Codex, PR #503, P1). pending_2 зник до знімка, WinSCP і пост-аудит його
+    # F30 (рев'ю PR #503, P1). pending_2 зник до знімка, WinSCP і пост-аудит його
     # не бачили, а LIMS відтворив його вже ПІСЛЯ пост-аудиту (стадія AfterCompare):
     # на диску він є, у знімку й залишку його немає, у хмарі його немає ->
     # передачу не доведено -> ПОМИЛКА, переданим не рахується.
@@ -3013,7 +3013,7 @@ try {
     ) -Name 'Archive/501/F30cSnapshotOmittedOverProbeLimitIsError' `
       -Failure "понад ліміт перевірки у хмарі об'єкт поза знімком лишається помилкою; label=$($rf30c.Label) exit=$($rf30c.ExitCode) vanished=$($rf30c.App.SnapshotUnavailableVanishedCount) completed=$($rf30c.App.CompletedCount)"
 
-    # F31 (Codex, PR #503, P1). Знімок запитано, але не вдався; pending_2 зник ДО
+    # F31 (рев'ю PR #503, P1). Знімок запитано, але не вдався; pending_2 зник ДО
     # WinSCP (і до пост-аудиту), а LIMS відтворив його ПІСЛЯ порівняння: на диску
     # він є, у залишку пост-аудиту й у хмарі його немає. Голе Exists не доводить
     # передачі -> не рахується переданим, ПОМИЛКА.
@@ -3100,7 +3100,7 @@ try {
     ) -Name 'Archive/501/F31fSnapshotFailedReappearedDirectoryWithoutCloudEvidenceIsError' `
       -Failure "без знімка відтворений каталог аудиту ДО без версії у хмарі не є переданим; label=$($rf31f.Label) vanished=$($rf31f.App.SnapshotUnavailableVanishedCount) completed=$($rf31f.App.CompletedCount)"
 
-    # F32 (Codex, PR #503, P2). Доказ передачі об'єкта аудиту ДО — локальний stat,
+    # F32 (рев'ю PR #503, P2). Доказ передачі об'єкта аудиту ДО — локальний stat,
     # знятий у пробі безпосередньо перед stat у хмарі, а не повторне читання диска
     # пізніше. Знімок не вдався; pending_2 (UploadUpdate: у хмарі стара версія) передано;
     # проба бачить у хмарі ту саму версію, а ПІСЛЯ проби LIMS дописує файл (F32a) або
