@@ -3862,6 +3862,27 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "VersionState/MalformedPrereleaseFailsClosed" `
         -Failure 'malformed prerelease-суфікс (5.3.0-rc"oops) має блокувати в Enforce, попереджати у Warn і поважати BRAVO_ALLOW_DOWNGRADE=1 — не прийматися і не псувати state'
 
+    # 5.2.5-rc.8 (рев'ю бекпорту, перенесено з hotfix/5.2.5): перенос рядка в кінці ідентифікатора.
+    # .NET-якір `$` збігається ПЕРЕД кінцевим `\n`, тож '1`n' проходив
+    # валідацію і класифікацію як числовий (довжина 2 > 1): malformed
+    # 5.2.5-rc.1`n+build виглядав новішим за записаний 5.2.5-rc.2.
+    # Ідентифікатори мають закінчуватись абсолютним кінцем рядка (\z).
+    $newlineVersionContent = '{"packageVersion": "5.2.5-rc.1\n+build"}'
+    $newlineStateContent = '{"highestVersion": "5.2.5", "highestVersionFull": "5.2.5-rc.2"}'
+    $newlineEnforce = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $root -StatePath 'synthetic' `
+        -VersionContent $newlineVersionContent -StateContent $newlineStateContent `
+        -Mode Enforce -AllowDowngrade '' -NoWrite
+    $newlineIdentifierParsed = ConvertTo-BRAVOComparableVersion -Text ("5.2.5-rc.1" + "`n" + "+build")
+    $trailingNewlineIdentifierParsed = ConvertTo-BRAVOComparableVersion -Text ("5.2.5-rc." + "1`n" + ".x")
+    Test-BRAVOCondition `
+        -Condition (
+            -not $newlineEnforce.IsValid -and $newlineEnforce.ShouldBlock -and
+            $null -eq $newlineIdentifierParsed -and $null -eq $trailingNewlineIdentifierParsed
+        ) `
+        -Name "VersionState/NewlineInIdentifierFailsClosed" `
+        -Failure ("prerelease/build-ідентифікатор із переносом рядка має відхилятись (fail-closed у Enforce), а не класифікуватись як числовий; факти: IsValid=$($newlineEnforce.IsValid) ShouldBlock=$($newlineEnforce.ShouldBlock) parsed1=$($null -ne $newlineIdentifierParsed) parsed2=$($null -ne $trailingNewlineIdentifierParsed)")
+
     # Не-канонічний core (4 компоненти) — malformed fail-closed шлях, а
     # НЕ запис у state: інакше '5.3.0.1' став би high-water mark і
     # коректний '5.3.0' блокувався б як «відкат».
