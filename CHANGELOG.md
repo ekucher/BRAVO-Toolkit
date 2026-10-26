@@ -25,6 +25,10 @@ Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.
   проходив як числовий і міг виглядати новішим за записаний (`VersionState/NewlineInIdentifierFailsClosed`).
   Дефект присутній у `5.2.4` і `5.2.5-rc.1`–`rc.7`.
 
+**Відомі проблеми (не виправлено в 5.2.5-rc.8):** ті самі, що для `5.2.5-rc.7` (див. розділ нижче): #422 (з
+  мітигацією `'maintenanceSettings.Retention.FailedArchiveDays'`), #300, #501 і retention backup generation після
+  перенесення сховища.
+
 ## 5.2.5-rc.7 — 2026-10-26
 
 Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.6` (нижче).
