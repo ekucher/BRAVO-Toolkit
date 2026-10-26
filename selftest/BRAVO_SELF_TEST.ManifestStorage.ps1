@@ -1081,6 +1081,55 @@ function Get-BRAVOFileHash {
             -Name "BackupConsistency/UnreadableArchiveMetadataIsIsolatedPerGeneration" `
             -Failure "збій читання метаданих архіву однієї generation має давати WARNING лише для неї; прострочена невдала generation має видалятися в тому ж прогоні"
 
+        # 7e (5.2.5-rc.7): транзієнтна помилка читання ПРОСТРОЧЕНОЇ цілої
+        # COMPLETE при нестачі захищених. Перевірених копій менше за
+        # minimumRetainedVerifiedBackups (лише поточна), тож неперевірена
+        # прострочена COMPLETE може бути останньою цілою копією: retention її
+        # не видаляє навіть при enableArchiveDeletion=$true і
+        # enableFailedArchiveDeletion=$false (WARNING лишається).
+        $savedEnableArchiveDeletion = $global:enableArchiveDeletion
+        $savedEnableFailedArchiveDeletion = $global:enableFailedArchiveDeletion
+        $global:enableArchiveDeletion = $true
+        $global:enableFailedArchiveDeletion = $false
+        $lastCopyRoot = Join-Path $retentionStatusTestRoot 'last-copy-ioerror'
+        [void](New-BRAVORetentionComponentFixture -Root $lastCopyRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $lastCopyManifest = New-BRAVORetentionComponentFixture -Root $lastCopyRoot `
+            -GenerationId '20260301_230000' -StartedAt (Get-Date).AddDays(-200)
+        $global:BRAVORetentionUnreadablePath = Join-Path (Join-Path $lastCopyRoot 'MODEL') 'MODEL_20260301_230000.mdz'
+        function global:New-Object {
+            param(
+                [Parameter(Position = 0)][string]$TypeName,
+                [Parameter(Position = 1)][object[]]$ArgumentList,
+                [System.Collections.IDictionary]$Property,
+                [switch]$Strict
+            )
+            if ($TypeName -eq 'System.IO.FileInfo' -and @($ArgumentList).Count -gt 0 -and
+                [string]$ArgumentList[0] -eq $global:BRAVORetentionUnreadablePath) {
+                throw 'The process cannot access the file because it is being used by another process.'
+            }
+            Microsoft.PowerShell.Utility\New-Object @PSBoundParameters
+        }
+        $lastCopyOk = $null
+        try {
+            $lastCopyOk = Invoke-BRAVORetentionFixtureCleanup -Root $lastCopyRoot `
+                -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $lastCopyRoot)
+        } finally {
+            $global:BRAVORetentionUnreadablePath = $null
+            Microsoft.PowerShell.Management\Remove-Item -Path Function:\New-Object -ErrorAction SilentlyContinue
+            $global:enableArchiveDeletion = $savedEnableArchiveDeletion
+            $global:enableFailedArchiveDeletion = $savedEnableFailedArchiveDeletion
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $lastCopyOk -eq $true -and
+                (Test-Path -LiteralPath $lastCopyManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $lastCopyRoot 'MODEL') 'MODEL_20260301_230000.mdz')) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $lastCopyRoot 'BLOG') 'BLOG_20260301_230000.mdz')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'метадані архіву не прочитано')
+            ) `
+            -Name "BackupConsistency/ExpiredUnverifiedCompleteKeptWhileProtectedBelowMinimum" `
+            -Failure "прострочена COMPLETE generation, яку через транзієнтну помилку читання не вдалося перевірити, не повинна видалятися, поки перевірених копій менше за minimumRetainedVerifiedBackups (це може бути остання ціла копія)"
+
         # Сценарій 8 (L1/L2): час запуску невідомий або статус невідомий -
         # generation не видаляється, а LastWriteTime файлу видалення не
         # дозволяє. Усі виклики - під Set-StrictMode -Version 2.0, як у
