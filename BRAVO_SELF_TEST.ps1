@@ -7234,7 +7234,8 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         # позначку "виконано".
         # 5.2.0: гілка паузи охоплює і скасування перед bravocmd через збій
         # suppression quiescence-маркера ($restoreAbortedBeforeDestructivePhase).
-        $postponedBranchIndex = $maintenanceRestoreWindowText.IndexOf('if ($restorePostponedByWindowClosing -or $restoreAbortedBeforeDestructivePhase) {')
+        # #476: і вето за станом реставрації перед bravocmd ($restoreVetoedBeforeBravocmd).
+        $postponedBranchIndex = $maintenanceRestoreWindowText.IndexOf('if ($restorePostponedByWindowClosing -or $restoreAbortedBeforeDestructivePhase -or $restoreVetoedBeforeBravocmd) {')
         $successStateWriteIndex = $maintenanceRestoreWindowText.IndexOf(
             "Write-BRAVORestoreState -ScheduledOccurrence `$scheduledOccurrence -Status 'Succeeded'"
         )
@@ -7630,7 +7631,10 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 # Канонічний атомарний запис живе в BRAVO.System; текст модуля
                 # додається до джерела, щоб тест не залежав від глобального
                 # імпорту.
-                'Write-BRAVOStateFileAtomic', 'Write-BRAVOStateTemporaryText'
+                'Write-BRAVOStateFileAtomic', 'Write-BRAVOStateTemporaryText',
+                # #476/#477: повторне рішення після lock і класифікація винятку після bravocmd.
+                'Get-BRAVOMaintenanceRestoreDecisionSnapshot', 'Get-BRAVOMaintenanceRestoreSnapshotVeto',
+                'Get-BRAVORestoreExceptionDisposition', 'Test-BRAVORestoreWeeklyQuotaConsumed'
             )
             $retry438Module = New-BRAVOSelfTestRuntimeModule -SourceText ($RuntimeText + "`r`n" + $SystemText) -FunctionNames $retry438Names
             $retry438Root = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RESTORE_RETRY438_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -7639,7 +7643,9 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             # Реальна формула $shouldRestore з runtime-тексту (рядок
             # присвоєння; `$shouldRestore = `$false` у гілці бар'єра не
             # збігається з шаблоном). Виконується з вхідними змінними.
-            $retry438FormulaMatch = [regex]::Match($RuntimeText, '(?m)^\$shouldRestore = (?<Expr>\$BravoMaintenanceEnabled -and \(\$ForceRestore -or .+)\r?$')
+            # #476: формула живе в Get-BRAVOMaintenanceRestoreDecisionSnapshot
+            # (з відступом), тому відступ перед присвоєнням допустимий.
+            $retry438FormulaMatch = [regex]::Match($RuntimeText, '(?m)^[ \t]*\$shouldRestore = (?<Expr>\$BravoMaintenanceEnabled -and \(\$ForceRestore -or .+)\r?$')
             $retry438FormulaExpr = if ($retry438FormulaMatch.Success) { $retry438FormulaMatch.Groups['Expr'].Value } else { '$false' }
             $retry438ShouldRestore = {
                 param($Expr, $BravoMaintenanceEnabled, $ForceRestore, $automaticRestoreDue, $restoreWindowOpen, $bootRestoreIgnoresWindow, $automaticRestoreRetryBlocked)
@@ -8236,6 +8242,259 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 }
             }
 
+            # 8a. #476 (клас гонитви "очікування lock"): рішення про реставрацію,
+            # прийняте до lock, перераховується після нього з тих самих файлів.
+            # Поведінково: реальні Get-BRAVOMaintenanceRestoreDecisionSnapshot і
+            # Get-BRAVOMaintenanceRestoreSnapshotVeto над реальними файлами стану
+            # й маркерів у тимчасовому каталозі; "інший прогін" імітується записом
+            # цих файлів між двома знімками. Час заморожено (день/година/вікно).
+            $retry476Snapshot = & $retry438Module {
+                param($rootDir, $slot)
+                Set-StrictMode -Version 2.0
+                function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp) $null = $Message; $null = $Level }
+                function New-Retry476Dir { param([string]$Name) $d = Join-Path $rootDir $Name; [void](New-Item -ItemType Directory -Path $d -Force); $script:stateRoot = $d; return $d }
+                $schedMarker = Join-Path $rootDir 'restore_done_slot.marker'
+                $todayMarker = Join-Path $rootDir 'restore_done_today.marker'
+                $snap = {
+                    param($Purpose, $IsRestoreDay = $true, $Force = $false)
+                    Get-BRAVOMaintenanceRestoreDecisionSnapshot -Purpose $Purpose -ScheduledOccurrence $slot `
+                        -ScheduledMarkerFile $schedMarker -TodayMarkerFile $todayMarker `
+                        -IsRestoreDay ([bool]$IsRestoreDay) -IsAfterRestoreTime $true -RestoreWindowOpen $true -BootRestoreIgnoresWindow $false `
+                        -ForceRestore ([bool]$Force) -BravoMaintenanceEnabled $true -Limit 2
+                }
+                $clean = { foreach ($m in @($schedMarker, $todayMarker)) { if (Test-Path -LiteralPath $m) { Remove-Item -LiteralPath $m -Force } } }
+                $r = [ordered]@{}
+
+                # (1a) Плановий день: інший прогін виконав слот (маркери + Status=Succeeded).
+                & $clean
+                $d = New-Retry476Dir 'a'
+                $preA = & $snap 'PreLock'
+                [IO.File]::WriteAllText($schedMarker, 'done'); [IO.File]::WriteAllText($todayMarker, 'done')
+                Write-BRAVORestoreState -ScheduledOccurrence $slot -Status 'Succeeded' -Reason 'other run'
+                $postA = & $snap 'PostLock'
+                $vetoA = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preA -After $postA -ForceRestore $false
+                $r.A_PreShould = [bool]$preA.ShouldRestore
+                $r.A_PostShould = [bool]$postA.ShouldRestore
+                $r.A_PostMissedDue = [bool]$postA.MissedRestoreDue
+                $r.A_PostPurpose = [string]$postA.Purpose
+                $r.A_Veto = [bool]$vetoA.Veto
+                $r.A_Reason = [string]$vetoA.Reason
+                $r.A_Level = [string]$vetoA.Level
+                $r.A_MessageSlot = $vetoA.Message.Contains($slot.ToString('yyyy-MM-dd HH:mm')) -and $vetoA.Message.Contains('bravocmd.exe не викликається')
+
+                # (1b) 24/7-профіль, не плановий день: слот закрито лише станом Succeeded (без маркерів).
+                & $clean
+                [void](New-Retry476Dir 'b')
+                $preB = & $snap 'PreLock' $false
+                Write-BRAVORestoreState -ScheduledOccurrence $slot -Status 'Succeeded' -Reason 'other run'
+                $postB = & $snap 'PostLock' $false
+                $vetoB = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preB -After $postB -ForceRestore $false
+                $r.B_PreShould = [bool]$preB.ShouldRestore
+                $r.B_Veto = [bool]$vetoB.Veto
+                $r.B_Reason = [string]$vetoB.Reason
+
+                # (2) Ліміт досягнуто іншим прогоном (RollbackRetryCount=2): RetryBlocked, WARNING.
+                & $clean
+                $d = New-Retry476Dir 'c'
+                $preC = & $snap 'PreLock'
+                [IO.File]::WriteAllText((Join-Path $d 'BRAVO_RESTORE_STATE.json'), '{"RollbackRetryCount":2,"RollbackSignature":"FILES:a.md||MISSING:"}', (New-Object Text.UTF8Encoding($false)))
+                $postC = & $snap 'PostLock'
+                $vetoC = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preC -After $postC -ForceRestore $false
+                $r.C_PreShould = [bool]$preC.ShouldRestore
+                $r.C_Veto = [bool]$vetoC.Veto
+                $r.C_Reason = [string]$vetoC.Reason
+                $r.C_Level = [string]$vetoC.Level
+                $r.C_MessageBlocked = $vetoC.Message.Contains('ЗАБЛОКОВАНО')
+
+                # (3) Стан пошкоджено іншим прогоном: StateCorrupt, WARNING; знімок файлів не змінює.
+                & $clean
+                $d = New-Retry476Dir 'd'
+                $preD = & $snap 'PreLock'
+                [IO.File]::WriteAllText((Join-Path $d 'BRAVO_RESTORE_STATE.json'), 'not json {', (New-Object Text.UTF8Encoding($false)))
+                $postD = & $snap 'PostLock'
+                $vetoD = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preD -After $postD -ForceRestore $false
+                $r.D_Veto = [bool]$vetoD.Veto
+                $r.D_Reason = [string]$vetoD.Reason
+                $r.D_Level = [string]$vetoD.Level
+                $r.D_FilesAfterSnapshots = @(Get-ChildItem -LiteralPath $d -Force).Count
+
+                # (3b) Маркер присутній І стан пошкоджено: пріоритет StateCorrupt (WARNING), а не
+                # INFO "слот виконано іншим прогоном" (пошкоджений стан не ховається за маркером).
+                & $clean
+                $d = New-Retry476Dir 'd2'
+                $preD2 = & $snap 'PreLock'
+                [IO.File]::WriteAllText($schedMarker, 'done'); [IO.File]::WriteAllText($todayMarker, 'done')
+                [IO.File]::WriteAllText((Join-Path $d 'BRAVO_RESTORE_STATE.json'), 'not json {', (New-Object Text.UTF8Encoding($false)))
+                $postD2 = & $snap 'PostLock'
+                $vetoD2 = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preD2 -After $postD2 -ForceRestore $false
+                $r.D2_MarkerPresent = [bool]$postD2.TodayMarkerPresent
+                $r.D2_Veto = [bool]$vetoD2.Veto
+                $r.D2_Reason = [string]$vetoD2.Reason
+                $r.D2_Level = [string]$vetoD2.Level
+
+                # (4) -ForceRestore вето не підлягає ніколи.
+                & $clean
+                $d = New-Retry476Dir 'e'
+                $preE = & $snap 'PreLock' $true $true
+                [IO.File]::WriteAllText($schedMarker, 'done'); [IO.File]::WriteAllText($todayMarker, 'done')
+                Write-BRAVORestoreState -ScheduledOccurrence $slot -Status 'Succeeded' -Reason 'other run'
+                $postE = & $snap 'PostLock' $true $true
+                $vetoE = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preE -After $postE -ForceRestore $true
+                $vetoEForcedOverride = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preE -After (& $snap 'PostLock') -ForceRestore $true
+                $r.E_PostShould = [bool]$postE.ShouldRestore
+                $r.E_Veto = [bool]$vetoE.Veto
+                $r.E_ForcedOverrideVeto = [bool]$vetoEForcedOverride.Veto
+                $r.E_AutoPostShould = [bool](& $snap 'PostLock').ShouldRestore
+
+                # (5) false -> true реставрацію НІКОЛИ не вмикає: було "ні" (слот виконано), стало "так" (стан зник).
+                & $clean
+                $d = New-Retry476Dir 'f'
+                [IO.File]::WriteAllText($schedMarker, 'done'); [IO.File]::WriteAllText($todayMarker, 'done')
+                Write-BRAVORestoreState -ScheduledOccurrence $slot -Status 'Succeeded' -Reason 'earlier'
+                $preF = & $snap 'PreLock'
+                & $clean
+                Remove-Item -LiteralPath (Join-Path $d 'BRAVO_RESTORE_STATE.json') -Force
+                $postF = & $snap 'PostLock'
+                $vetoF = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preF -After $postF -ForceRestore $false
+                $r.F_PreShould = [bool]$preF.ShouldRestore
+                $r.F_PostShould = [bool]$postF.ShouldRestore
+                $r.F_Veto = [bool]$vetoF.Veto
+                $r.F_Reason = [string]$vetoF.Reason
+
+                # (6) Без змін між знімками вето немає.
+                & $clean
+                [void](New-Retry476Dir 'g')
+                $preG = & $snap 'PreLock'
+                $postG = & $snap 'PostLock'
+                $r.G_Veto = [bool](Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preG -After $postG -ForceRestore $false).Veto
+                $r.G_Should = [bool]$postG.ShouldRestore
+
+                # (7) Інший прогін виконав ПРИМУСОВУ реставрацію (покрито слот +7 днів): квота спожита.
+                & $clean
+                [void](New-Retry476Dir 'h')
+                $preH = & $snap 'PreLock'
+                Write-BRAVORestoreForcedOutcome -CoveredSlot $slot.AddDays(7) -CompletedAt ([datetime]'2026-10-12 01:00:00')
+                $postH = & $snap 'PostLock'
+                $vetoH = Get-BRAVOMaintenanceRestoreSnapshotVeto -Before $preH -After $postH -ForceRestore $false
+                $r.H_PreShould = [bool]$preH.ShouldRestore
+                $r.H_Veto = [bool]$vetoH.Veto
+                $r.H_Reason = [string]$vetoH.Reason
+                $r.H_Level = [string]$vetoH.Level
+                [pscustomobject]$r
+            } (Join-Path $retry438Root 'snapshot476') $retry438Slot
+            Test-BRAVOCondition `
+                -Condition (
+                    $retry476Snapshot.A_PreShould -and -not $retry476Snapshot.A_PostShould -and -not $retry476Snapshot.A_PostMissedDue -and
+                    $retry476Snapshot.A_PostPurpose -ceq 'PostLock' -and
+                    $retry476Snapshot.A_Veto -and $retry476Snapshot.A_Reason -ceq 'SucceededByOtherRun' -and
+                    $retry476Snapshot.A_Level -ceq 'INFO' -and $retry476Snapshot.A_MessageSlot -and
+                    $retry476Snapshot.B_PreShould -and $retry476Snapshot.B_Veto -and $retry476Snapshot.B_Reason -ceq 'SucceededByOtherRun' -and
+                    $retry476Snapshot.C_PreShould -and $retry476Snapshot.C_Veto -and $retry476Snapshot.C_Reason -ceq 'RetryBlocked' -and
+                    $retry476Snapshot.C_Level -ceq 'WARNING' -and $retry476Snapshot.C_MessageBlocked -and
+                    $retry476Snapshot.D_Veto -and $retry476Snapshot.D_Reason -ceq 'StateCorrupt' -and $retry476Snapshot.D_Level -ceq 'WARNING' -and
+                    $retry476Snapshot.D_FilesAfterSnapshots -eq 1 -and
+                    $retry476Snapshot.D2_MarkerPresent -and $retry476Snapshot.D2_Veto -and $retry476Snapshot.D2_Reason -ceq 'StateCorrupt' -and $retry476Snapshot.D2_Level -ceq 'WARNING' -and
+                    $retry476Snapshot.H_PreShould -and $retry476Snapshot.H_Veto -and $retry476Snapshot.H_Reason -ceq 'WeeklyQuotaConsumed' -and
+                    $retry476Snapshot.H_Level -ceq 'INFO'
+                ) `
+                -Name "Maintenance/RestoreDecisionRecheckedAfterLockVetoesCompletedSlot" `
+                -Failure "#476: знімок рішення після lock має ЗАБОРОНЯТИ реставрацію, яку інший прогін виконав (маркер/Status=Succeeded: SucceededByOtherRun, INFO), чи заблокував (RollbackRetryCount=2: RetryBlocked, WARNING; пошкоджений стан: StateCorrupt, WARNING) за час очікування lock; знімок файлів не змінює; факти: $($retry476Snapshot | ConvertTo-Json -Compress)"
+            Test-BRAVOCondition `
+                -Condition (
+                    $retry476Snapshot.E_PostShould -and -not $retry476Snapshot.E_Veto -and -not $retry476Snapshot.E_ForcedOverrideVeto -and
+                    -not $retry476Snapshot.E_AutoPostShould -and
+                    -not $retry476Snapshot.F_PreShould -and $retry476Snapshot.F_PostShould -and -not $retry476Snapshot.F_Veto -and
+                    $retry476Snapshot.F_Reason -ceq 'None' -and
+                    -not $retry476Snapshot.G_Veto -and $retry476Snapshot.G_Should
+                ) `
+                -Name "Maintenance/RestoreVetoNeverEnablesAndNeverBlocksForce" `
+                -Failure "#476: вето — лише в бік заборони (було 'реставрувати', стало 'ні'); -ForceRestore вето не підлягає; перехід false->true реставрацію НЕ вмикає; без змін між знімками вето немає; факти: $($retry476Snapshot | ConvertTo-Json -Compress)"
+
+            # 8b. #476: write-ahead (Register-BRAVORestoreAttemptBegin) перечитує
+            # стан і відхиляє спробу, коли ліміт уже досягнуто (інший прогін, поки
+            # цей очікував lock чи архівував модель). Файл стану не змінюється.
+            $retry476Begin = & $retry438Module {
+                param($rootDir, $slot)
+                Set-StrictMode -Version 2.0
+                function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp) $null = $Message; $null = $Level }
+                $r = [ordered]@{}
+                $blockedDir = Join-Path $rootDir 'blocked'
+                [void](New-Item -ItemType Directory -Path $blockedDir -Force)
+                $script:stateRoot = $blockedDir
+                $statePath = Join-Path $blockedDir 'BRAVO_RESTORE_STATE.json'
+                [IO.File]::WriteAllText($statePath, '{"RollbackRetryCount":2,"RollbackSignature":"FILES:a.md||MISSING:"}', (New-Object Text.UTF8Encoding($false)))
+                $bytesBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath))
+                $r.BlockedThrew = $false
+                $r.BlockedMessage = ''
+                try { [void](Register-BRAVORestoreAttemptBegin -ScheduledOccurrence $slot -Reason 'late' -Limit 2) }
+                catch { $r.BlockedThrew = $true; $r.BlockedMessage = [string]$_.Exception.Message }
+                $r.BlockedBytesUnchanged = ($bytesBefore -ceq [Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath)))
+                # Контроль: один невдалий запуск (лічильник 1) ще дозволяє спробу -> лічильник 2.
+                $openDir = Join-Path $rootDir 'open'
+                [void](New-Item -ItemType Directory -Path $openDir -Force)
+                $script:stateRoot = $openDir
+                [IO.File]::WriteAllText((Join-Path $openDir 'BRAVO_RESTORE_STATE.json'), '{"RollbackRetryCount":1,"RollbackSignature":"FILES:a.md||MISSING:"}', (New-Object Text.UTF8Encoding($false)))
+                $allowed = Register-BRAVORestoreAttemptBegin -ScheduledOccurrence $slot -Reason 'ok' -Limit 2
+                $r.ControlCount = [int]$allowed.Count
+                $r.ControlOnDisk = Get-BRAVORestoreRollbackRetryCount -State (Read-BRAVORestoreState)
+                [pscustomobject]$r
+            } (Join-Path $retry438Root 'begin476') $retry438Slot
+            Test-BRAVOCondition `
+                -Condition (
+                    $retry476Begin.BlockedThrew -and $retry476Begin.BlockedMessage.StartsWith('Ліміт повторів реставрації вже досягнуто', [StringComparison]::Ordinal) -and
+                    $retry476Begin.BlockedMessage.Contains('RollbackRetryCount=2, ліміт 2') -and $retry476Begin.BlockedBytesUnchanged -and
+                    $retry476Begin.ControlCount -eq 2 -and $retry476Begin.ControlOnDisk -eq 2
+                ) `
+                -Name "Maintenance/RestoreWriteAheadRejectedWhenCapReachedAfterLock" `
+                -Failure "#476: Register-BRAVORestoreAttemptBegin має відхиляти write-ahead (виняток, файл стану не змінено), коли ліміт поспіль-невдалих спроб уже досягнуто, і пропускати при лічильнику нижче ліміту; факти: $($retry476Begin | ConvertTo-Json -Compress)"
+
+            # 8c. #477: виняток ПІСЛЯ запуску bravocmd.exe, коли цілісність моделі не
+            # встановлено, — це 43 (RestoreFailed), а не 40 (збій архівації); спроба
+            # рахується (клас CLASS:EXCEPTION-AFTER-BRAVOCMD), Begin+облік = РІВНО 1.
+            $retry477 = & $retry438Module {
+                param($rootDir, $slot)
+                Set-StrictMode -Version 2.0
+                function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp) $null = $Message; $null = $Level }
+                function Send-SlackAlert { param([string]$Message, [switch]$IsCritical) $null = $Message; $null = $IsCritical }
+                $r = [ordered]@{}
+                $table = @(
+                    @{ Key = 'BeforeDestructive'; Started = $false; Integrity = $true;  Accounted = $false }
+                    @{ Key = 'AfterDestructiveUnverified'; Started = $true; Integrity = $false; Accounted = $false }
+                    @{ Key = 'AfterDestructiveAlreadyAccounted'; Started = $true; Integrity = $false; Accounted = $true }
+                    @{ Key = 'AfterDestructiveVerified'; Started = $true; Integrity = $true; Accounted = $false }
+                )
+                foreach ($row in $table) {
+                    $d = Get-BRAVORestoreExceptionDisposition -DestructiveStarted $row.Started -IntegrityEstablished $row.Integrity `
+                        -AlreadyAccounted $row.Accounted -ArchiveFailedBefore $false -IntegrityFailedBefore $true
+                    $r[$row.Key] = '{0}|{1}|{2}|{3}|{4}' -f $d.Unverified, $d.RestoreFailed, $d.RestoreArchiveFailed, $d.RestoreIntegrityFailed, $d.AccountingFingerprint
+                }
+                $dir = Join-Path $rootDir 'accounting'
+                [void](New-Item -ItemType Directory -Path $dir -Force)
+                $script:stateRoot = $dir
+                [void](Register-BRAVORestoreAttemptBegin -ScheduledOccurrence $slot -Reason 'attempt' -Limit 2)
+                $r.InProgressAfterBegin = Get-BRAVORestoreAttemptInProgress -State (Read-BRAVORestoreState)
+                $accounted = Invoke-BRAVORestoreAttemptFailureAccounting -ScheduledOccurrence $slot -Fingerprint 'CLASS:EXCEPTION-AFTER-BRAVOCMD' `
+                    -ForceRestore $false -Reason 'attempt' -Limit 2
+                $afterState = Read-BRAVORestoreState
+                $r.CountAfterAccounting = Get-BRAVORestoreRollbackRetryCount -State $afterState
+                $r.SignatureAfterAccounting = Get-BRAVORestoreRollbackSignature -State $afterState
+                $r.InProgressAfterAccounting = Get-BRAVORestoreAttemptInProgress -State $afterState
+                $r.AccountingWrote = [bool]$accounted.Write
+                [pscustomobject]$r
+            } (Join-Path $retry438Root 'exception477') $retry438Slot
+            Test-BRAVOCondition `
+                -Condition (
+                    $retry477.BeforeDestructive -ceq 'False|False|True||' -and
+                    $retry477.AfterDestructiveUnverified -ceq 'True|True|False|True|CLASS:EXCEPTION-AFTER-BRAVOCMD' -and
+                    $retry477.AfterDestructiveAlreadyAccounted -ceq 'True|True|False|True|' -and
+                    $retry477.AfterDestructiveVerified -ceq 'False|False|True||' -and
+                    $retry477.InProgressAfterBegin -and
+                    $retry477.AccountingWrote -and $retry477.CountAfterAccounting -eq 1 -and
+                    $retry477.SignatureAfterAccounting -ceq 'CLASS:EXCEPTION-AFTER-BRAVOCMD' -and -not $retry477.InProgressAfterAccounting
+                ) `
+                -Name "Maintenance/RestoreExceptionAfterBravocmdIsUnverifiedFailureCountedOnce" `
+                -Failure "#477: виняток після запуску bravocmd.exe при невстановленій цілісності має бути Unverified (RestoreFailed=43, прапорці архіву/цілісності — зі значень ДО сесії, облік CLASS:EXCEPTION-AFTER-BRAVOCMD якщо ще не пораховано); до bravocmd чи при доведеній цілісності — попередня поведінка (40); Begin + облік дають РІВНО 1 спробу; факти: $($retry477 | ConvertTo-Json -Compress)"
+
             # 9. Структурні інваріанти проводки (Main): write-ahead СТОЇТЬ
             # перед деструктивним bravocmd; гілка невдачі не пише Pending
             # напряму (лише через облік, що не чіпає Status/слот); блокування
@@ -8255,7 +8514,10 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                     $retry438WriteAheadIndex -ge 0 -and $retry438BravocmdIndex -gt $retry438WriteAheadIndex -and
                     $retry438FailureBranch.Contains('Invoke-BRAVORestoreAttemptFailureAccounting') -and
                     -not $retry438FailureBranch.Contains('Write-BRAVORestoreState') -and
-                    ([regex]::Matches($RuntimeText, [regex]::Escape('Invoke-BRAVORestoreAttemptFailureAccounting `'))).Count -eq 2 -and
+                    # 2 -> 3 (#477): третій виклик обліку — catch після запуску bravocmd.exe
+                    # (клас CLASS:EXCEPTION-AFTER-BRAVOCMD); решта двох — гілка невдачі й
+                    # не готовий after-архів (без змін).
+                    ([regex]::Matches($RuntimeText, [regex]::Escape('Invoke-BRAVORestoreAttemptFailureAccounting `'))).Count -eq 3 -and
                     $RuntimeText.Contains("CLASS:AFTER-ARCHIVE-NOT-READY") -and
                     $RuntimeText.Contains('$missedRestoreActionableNow = $missedRestoreDue -and (-not $automaticRestoreRetryBlocked -or $ForceRestore)') -and
                     ([regex]::Matches($RuntimeText, [regex]::Escape('Send-SlackAlert -Message $restoreRetryBlockedMessage -IsCritical'))).Count -eq 2 -and
@@ -8269,6 +8531,65 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 ) `
                 -Name "Maintenance/RestoreRetryCapIsWiredBeforeBravocmdAndVisible" `
                 -Failure "#438: write-ahead (Register-BRAVORestoreAttemptBegin) має стояти ПЕРЕД Invoke-CommandWithLog -Command `$BRAVOCMD_PATH; гілка невдачі рахує спробу лише через Invoke-BRAVORestoreAttemptFailureAccounting (без прямого Write-BRAVORestoreState/Pending) і ще раз для не готового after-архіву; заблокована ніч — критичний алерт у 2 місцях (звичайний прогін і ранній вихід Recovery); `$missedRestoreActionableNow враховує блокування; retention отримує -ProtectBeforeOnlySessions; факти: writeAhead=$retry438WriteAheadIndex bravocmd=$retry438BravocmdIndex"
+
+            # 10. #476/#477: структурна проводка (порядок у тексті Main). Знімок
+            # рішення після lock стоїть ПІСЛЯ отримання lock і ДО запису 'Pending';
+            # знімок перед bravocmd — ДО write-ahead (вигнання клієнтів на 5.2.x
+            # немає); песимістичний прапорець цілісності — між write-ahead і
+            # bravocmd, а результат recovery його встановлює. Поведінку ці місця
+            # доводять тести вище; тут — лише що проводка не зникла й не переставлена.
+            $retry476WiringMarkers = @(
+                '$maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock',
+                '$postLockRestoreSnapshot = Get-BRAVOMaintenanceRestoreDecisionSnapshot',
+                "-Status 'Pending'",
+                '$preDestructiveRestoreSnapshot =',
+                'Register-BRAVORestoreAttemptBegin `',
+                '$script:modelIntegrityEstablished = $false',
+                'Invoke-CommandWithLog -Command $BRAVOCMD_PATH',
+                '$script:modelIntegrityEstablished = $recovery.IntegrityEstablished'
+            )
+            $retry476WiringPositions = New-Object System.Collections.Generic.List[int]
+            $retry476WiringCursor = -1
+            foreach ($retry476WiringMarker in $retry476WiringMarkers) {
+                $retry476WiringCursor = $RuntimeText.IndexOf($retry476WiringMarker, $retry476WiringCursor + 1, [StringComparison]::Ordinal)
+                $retry476WiringPositions.Add($retry476WiringCursor)
+                if ($retry476WiringCursor -lt 0) { break }
+            }
+            $retry476CatchStart = $RuntimeText.IndexOf('$restoreExceptionText = $_.Exception.Message')
+            $retry476CatchEnd = if ($retry476CatchStart -ge 0) { $RuntimeText.IndexOf('# Retention-гейт (task item 9)', $retry476CatchStart) } else { -1 }
+            $retry476CatchText = if ($retry476CatchStart -ge 0 -and $retry476CatchEnd -gt $retry476CatchStart) {
+                $RuntimeText.Substring($retry476CatchStart, $retry476CatchEnd - $retry476CatchStart)
+            } else { '' }
+            $retry476GateStart = $RuntimeText.IndexOf('$restoreSessionUnsafeForRetention = (')
+            $retry476GateText = if ($retry476GateStart -ge 0) { $RuntimeText.Substring($retry476GateStart, [Math]::Min(500, $RuntimeText.Length - $retry476GateStart)) } else { '' }
+            Test-BRAVOCondition `
+                -Condition (
+                    $retry476WiringPositions.Count -eq $retry476WiringMarkers.Count -and
+                    @($retry476WiringPositions | Where-Object { $_ -lt 0 }).Count -eq 0 -and
+                    # #477: catch після bravocmd — класифікація, облік і код 43; без recovery і без
+                    # повернення права автостарту (рядкові виклики, не згадки в коментарях).
+                    $retry476CatchText.Contains("'CLASS:EXCEPTION-AFTER-BRAVOCMD'") -and
+                    $retry476CatchText.Contains('Get-BRAVORestoreExceptionDisposition') -and
+                    $retry476CatchText.Contains('$script:restoreFailed = $true') -and
+                    $retry476CatchText -notmatch '(?m)^\s*Restore-BRAVOMaintenanceQuiescenceAutostart' -and
+                    $retry476CatchText -notmatch 'Invoke-BRAVOModelRestoreRecovery' -and
+                    # #477: невірифікована фаза небезпечна для retention.
+                    $retry476GateText.Contains('-not $script:modelIntegrityEstablished') -and
+                    # Сесія з невстановленою цілісністю (rollback=FAILED) повертає restoreArchiveFailed до
+                    # значення ДО сесії (Resolve-BRAVOExitCode: 40 вище за 43), справжній 41 лишається.
+                    $retry438FailureBranch.Contains('$script:restoreArchiveFailed = $restoreArchiveFailedBefore') -and
+                    # ...і так само restoreIntegrityFailed (інакше 41 перекрив би 43 для невірифікованої моделі).
+                    $retry438FailureBranch.Contains('$script:restoreIntegrityFailed = $restoreIntegrityFailedBefore') -and
+                    # Повторна перевірка після lock лише ВЕТУЄ: pre=false/post=true лишає false.
+                    $RuntimeText.Contains('$missedRestoreDue = $missedRestoreDue -and [bool]$postLockRestoreSnapshot.MissedRestoreDue') -and
+                    # Прапорець обліку виставляється ДО виклику обліку (виняток з хвоста не дає другого обліку).
+                    [regex]::Matches($RuntimeText, '\$restoreFailureAccounted = \$true\s+(?:#[^\r\n]*\s+)*\[void\]\(Invoke-BRAVORestoreAttemptFailureAccounting').Count -eq 3 -and
+                    # #476: Recovery без пропущеної денної роботи після вето виходить без дій.
+                    $RuntimeText.Contains('if ($RunMissedRestoreOnly -and -not $missedDailyWork) {') -and
+                    $RuntimeText.Contains('$recoveryVetoExitCode')
+                ) `
+                -Name "Maintenance/RestoreRecheckAndFailClosedAreWiredInOrder" `
+                -Failure "#476/#477: у Main порядок має бути: Enter-lock -> `$postLockRestoreSnapshot -> 'Pending' -> `$preDestructiveRestoreSnapshot -> write-ahead -> `$script:modelIntegrityEstablished = `$false -> bravocmd -> результат recovery; catch після bravocmd має класифікувати виняток (CLASS:EXCEPTION-AFTER-BRAVOCMD) без повернення автостарту; retention-гейт враховує modelIntegrityEstablished; позиції: $($retry476WiringPositions -join ',')"
 
             # P525-438: catch write-ahead (скасування за ліміт іншого прогону)
             # стоїть ПЕРЕД bravocmd, ставить критичність, гасить гейт
@@ -16528,10 +16849,12 @@ function Write-BRAVOLog {
     # статусу 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' (як STRING-літерал в AST, не
     # рахуючи пояснювальні коментарі) має існувати РІВНО один раз —
     # усередині самої Get-BRAVOMaintenanceFinalStatus, — а сама функція
-    # має викликатися рівно п'ять разів поза власним визначенням (звичайні
+    # має викликатися рівно шість разів поза власним визначенням (звичайні
     # ЛОГ/консоль/notification Title + ранній disk-preflight summary +
     # #438 Recovery без роботи: заблокована retry-cap реставрація повертає
-    # 10 і бере текст «УСПІШНО З ПОПЕРЕДЖЕННЯМИ» з того самого резолвера).
+    # 10 і бере текст «УСПІШНО З ПОПЕРЕДЖЕННЯМИ» з того самого резолвера, +
+    # #476 Recovery після вето знімка рішення за lock: реставрацію скасовано,
+    # дій немає, compact-підсумок бере статус для коду 0/10 з того самого резолвера).
     $maintenanceTotalTokens = $null
     $maintenanceTotalErrors = $null
     $maintenanceTotalAst = [Management.Automation.Language.Parser]::ParseInput(
@@ -16556,7 +16879,7 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $maintenanceSuccessWithWarningsLiteralAsts.Count -eq 1 -and
-            $maintenanceFinalStatusCallAsts.Count -eq 5
+            $maintenanceFinalStatusCallAsts.Count -eq 6
         ) `
         -Name 'Maintenance/FinalStatusDoesNotCallIndependentWarningPolicy' `
         -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 5 разів (ЛОГ/консоль/notification/ранній disk-preflight summary/#438 Recovery без роботи), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
