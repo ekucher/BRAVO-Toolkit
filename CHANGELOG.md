@@ -1,5 +1,27 @@
 # Changelog
 
+## 5.2.5-rc.8 — 2026-10-26
+
+Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.7` (нижче).
+
+- **Security: runtime guard: захист від відкату версії не працював для prerelease-версій.**
+  `Test-BRAVOVersionDowngrade` розбирав `packageVersion` через `[version]`, який не приймає prerelease-суфікс
+  (`5.2.5-rc.7`). Виняток мовчки перехоплювався, тож для будь-якого RC перевірка відкату пропускалась, а
+  `BRAVO_VERSION_STATE.json` не оновлювався: RC запускався на сервері, де вже працювала новіша версія, і відкат з
+  RC на попередню stable не блокувався кодом `35`. Виявлено smoke-перевіркою пакета `5.2.5-rc.7`. Тепер
+  `ConvertTo-BRAVOComparableVersion`/`Compare-BRAVOComparableVersion` порівнюють версії за SemVer: база `X.Y.Z`;
+  за однакової бази stable старша за prerelease; prerelease — за dot-ідентифікаторами, числові як рядки цифр
+  довільної довжини. Непарсибельна чи синтаксично некоректна `packageVersion` — fail-closed за режимом (`Enforce`
+  блокує кодом `35`, `Warn` попереджає; `BRAVO_ALLOW_DOWNGRADE=1` діє як і раніше). Стан пише `highestVersion` (база
+  `X.Y.Z`, сумісна з guard 5.2.4) і `highestVersionFull`; пошкоджений стан і далі не блокує. Для stable-версій
+  поведінка незмінна. Наслідок для оновлення: якщо на сервері вже запускали новішу версію (напр., `5.3.0-dev`),
+  rc.8 тепер блокується кодом `35`. Нові перевірки: `VersionState/PrereleaseNewerThanRecordedPasses`,
+  `VersionState/PrereleaseDowngradeBlocks`, `VersionState/PrereleaseOverrideAllowsDowngrade`,
+  `VersionState/UnparsableVersionFailsClosed`, `VersionState/PrereleaseRecordsFullAndLegacyBase`,
+  `VersionState/HugeNumericPrereleaseComparesNumerically`, `VersionState/PrereleaseAndBuildSyntaxValidated`,
+  `VersionState/MalformedPrereleaseFailsClosed`, `VersionState/StateJsonAlwaysParseable`. Перенесено з developer
+  (`ebaef1f`, `5d9f86a`). Дефект присутній у `5.2.4` і `5.2.5-rc.1`–`rc.7`.
+
 ## 5.2.5-rc.7 — 2026-10-26
 
 Hotfix від stable `5.2.4` (RELEASE_POLICY §12); містить усе з `5.2.5-rc.6` (нижче).
