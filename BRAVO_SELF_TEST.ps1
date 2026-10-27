@@ -37640,6 +37640,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
     $suiteProbeCases = @{}
     $suiteProbeRuns = @{}
     $suiteProbeError = $null
+    $suiteProbeMergedOutput = $null
     # Id, текст аргументів виклику Invoke-SuiteSelectionCase. Єдине джерело
     # випадків: і драйвер дочірнього процесу, і очікування батька беруть id звідси.
     $suiteProbeCaseTable = @(
@@ -37749,8 +37750,23 @@ foreach ($case in $cases) {
         [IO.File]::WriteAllText($suiteProbeP2Path, $suiteProbeP2, (New-Object Text.UTF8Encoding($true)))
         $suiteProbeHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 
-        $suiteProbeP1Lines = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $suiteProbeP1Path | ForEach-Object { [string]$_ })
+        # Єдиний запуск дочірнього процесу для всіх проб секції. Результат залежить лише від
+        # коду завершення та stdout дитини. EAP=Continue у власній області scriptblock-а
+        # (конвенція навколо native-викликів, див. releasePolicy-фікстури) разом із 2>$null:
+        # якщо self-test запущено in-process під батьком із 2>&1 (powershell -Command
+        # "& .\BRAVO_SELF_TEST.ps1 2>&1 | ..."), stderr дитини інакше стає NativeCommandError,
+        # а під глобальним Stop кидається в catch проби (#483).
+        $suiteProbeInvokeChild = {
+            param([string]$HostPath, [string[]]$Arguments)
+            $ErrorActionPreference = 'Continue'
+            $childLines = @(& $HostPath @Arguments 2>$null | ForEach-Object { [string]$_ })
+            $childExitCode = $LASTEXITCODE
+            return [pscustomobject]@{ ExitCode = $childExitCode; Lines = $childLines }
+        }
+        $suiteProbeChildBase = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass')
+
+        $suiteProbeP1Run = & $suiteProbeInvokeChild $suiteProbeHost ($suiteProbeChildBase + @('-File', $suiteProbeP1Path))
+        $suiteProbeP1Lines = @($suiteProbeP1Run.Lines)
         foreach ($suiteProbeLine in $suiteProbeP1Lines) {
             $suiteProbeMatch = [regex]::Match($suiteProbeLine.TrimEnd("`r"), '^CASE\|([^|]+)\|SEL=([^|]*)\|POST=([^|]*)\|ERR=(.*)$')
             if (-not $suiteProbeMatch.Success) { continue }
@@ -37765,13 +37781,30 @@ foreach ($case in $cases) {
             }
         }
 
-        # Без 2>&1: повідомлення про помилку йде в stderr і тут не перевіряється.
-        $suiteProbeRunA = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $suiteProbeP2Path -Suite NoSuchSuite | ForEach-Object { [string]$_ })
-        $suiteProbeRuns['unknown'] = [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($suiteProbeRunA | ForEach-Object { $_.TrimEnd("`r") }) }
-        $suiteProbeRunB = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $suiteProbeP2Path -Suite 'Paths,Archive' | ForEach-Object { [string]$_ })
-        $suiteProbeRuns['comma'] = [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($suiteProbeRunB | ForEach-Object { $_.TrimEnd("`r") }) }
+        # stderr дитини відкидається хелпером (2>$null): повідомлення про помилку тут не перевіряється.
+        $suiteProbeRunA = & $suiteProbeInvokeChild $suiteProbeHost ($suiteProbeChildBase + @('-File', $suiteProbeP2Path, '-Suite', 'NoSuchSuite'))
+        $suiteProbeRuns['unknown'] = [pscustomobject]@{ ExitCode = $suiteProbeRunA.ExitCode; Lines = @($suiteProbeRunA.Lines | ForEach-Object { $_.TrimEnd("`r") }) }
+        $suiteProbeRunB = & $suiteProbeInvokeChild $suiteProbeHost ($suiteProbeChildBase + @('-File', $suiteProbeP2Path, '-Suite', 'Paths,Archive'))
+        $suiteProbeRuns['comma'] = [pscustomobject]@{ ExitCode = $suiteProbeRunB.ExitCode; Lines = @($suiteProbeRunB.Lines | ForEach-Object { $_.TrimEnd("`r") }) }
+
+        # Регресія #483: батько зі $ErrorActionPreference = 'Stop' і зовнішнім 2>&1 (in-process
+        # запуск self-test під `-Command "... 2>&1 | ..."`) викликає РЕАЛЬНИЙ текст хелпера на
+        # дитині, що пише в stderr. Очікується код 1 без винятку.
+        $suiteProbeParentPath = Join-Path $suiteProbeRoot 'probe-parent.ps1'
+        $suiteProbeParentText = "`$ErrorActionPreference = 'Stop'`r`n" +
+            "`$childInvoke = [scriptblock]::Create(@'`r`n" + $suiteProbeInvokeChild.ToString() + "`r`n'@)`r`n" +
+            "try {`r`n" +
+            "    `$r = & `$childInvoke '" + $suiteProbeHost.Replace("'", "''") + "' @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', '" +
+            $suiteProbeP2Path.Replace("'", "''") + "', '-Suite', 'NoSuchSuite')`r`n" +
+            "    `$reached = @(`$r.Lines | Where-Object { `$_.Contains('PROBE-REACHED') }).Count`r`n" +
+            "    Write-Output ('PARENT-OK|' + `$r.ExitCode + '|' + `$reached)`r`n" +
+            "} catch {`r`n" +
+            "    Write-Output ('PARENT-CAUGHT|' + `$_.FullyQualifiedErrorId)`r`n" +
+            "}`r`n"
+        [IO.File]::WriteAllText($suiteProbeParentPath, $suiteProbeParentText, (New-Object Text.UTF8Encoding($true)))
+        $suiteProbeMergedRun = & $suiteProbeInvokeChild $suiteProbeHost ($suiteProbeChildBase +
+            @('-Command', ("& '" + $suiteProbeParentPath.Replace("'", "''") + "' 2>&1 | Out-String")))
+        $suiteProbeMergedOutput = [string]::Join("`n", @($suiteProbeMergedRun.Lines))
     } catch {
         $suiteProbeError = $_.Exception.Message
     } finally {
@@ -37937,6 +37970,16 @@ foreach ($case in $cases) {
         -EnvironmentLimitation $suiteProbeRestriction `
         -Failure ("-File ... -Suite 'Paths,Archive' мусить дати або вибір Paths;Archive з кодом 0, або відмову з кодом 1 " +
             "без виконання подальшого коду; код: $suiteProbeCommaExit")
+
+    # #483: хелпер запуску дитини не залежить від stderr і зовнішнього 2>&1 батька.
+    $suiteProbeMergedShown = 'прогін не виконано'
+    if ($null -ne $suiteProbeMergedOutput) { $suiteProbeMergedShown = $suiteProbeMergedOutput.Trim() }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $suiteProbeMergedOutput -and $suiteProbeMergedOutput.Contains('PARENT-OK|1|0')) `
+        -Name "Framework/SuiteSelectionContract.ProbeChildSurvivesMergedParentStderr" `
+        -EnvironmentLimitation $suiteProbeRestriction `
+        -Failure ("батько з `$ErrorActionPreference = 'Stop' і 2>&1 мусить отримати код дитини 1 без NativeCommandError " +
+            "(очікується PARENT-OK|1|0); вивід: $suiteProbeMergedShown")
 }
 & {
     # M1-M9: мапа "змінений файл -> suite" (Get-BRAVOSelfTestSuiteForChangedPath),

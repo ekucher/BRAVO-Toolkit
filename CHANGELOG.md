@@ -2,6 +2,9 @@
 
 ## Не випущено (developer)
 
+- **Fix: self-test: проби `Framework/SuiteSelectionContract` падали при in-process запуску під батьком із `2>&1` (#483).**
+  Зовнішній `2>&1` потрапляв на native-виклики дочірніх процесів проб, stderr дитини ставав `NativeCommandError` і під `Stop` кидався в catch проби (`ProbeExecution`, `UnknownSuiteExitsNonZeroUnderFile`, `FileInvocationCommaFormNeverSilentlyMisselects`). Тепер усі запуски йдуть через один хелпер з `EAP=Continue` і `2>$null`: результат залежить лише від коду завершення й stdout. Нова перевірка: `Framework/SuiteSelectionContract.ProbeChildSurvivesMergedParentStderr`.
+
 - **Security: guard проти повернення файлів AI-агентів у продуктове дерево.**
   Нова канонічна політика `ci/BRAVOAgentFilePolicy.ps1` позначає (без урахування регістру, на будь-якій глибині)
   каталоги `.claude` і `.codex` та файли `AGENTS.md`, `CLAUDE.md`, `.mcp.json`; схожі імена
