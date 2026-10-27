@@ -6826,10 +6826,11 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/NoAgentFilesInTree') { try {
 . (Join-Path $root 'ci\BRAVOAgentFilePolicy.ps1')
 
 function Get-BRAVOSelfTestAgentFileScan {
-    param([Parameter(Mandatory = $true)][string]$TreeRoot)
+    # GitCommandName існує лише для проби відсутнього git (без зміни PATH self-test).
+    param([Parameter(Mandatory = $true)][string]$TreeRoot, [string]$GitCommandName = 'git')
 
     $scan = [pscustomobject]@{ Mode = ''; Violations = @(); Error = '' }
-    $gitCommand = @(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue)
+    $gitCommand = @(Get-Command -Name $GitCommandName -CommandType Application -ErrorAction SilentlyContinue)
     $useGit = $false
     $previousErrorAction = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
@@ -6944,12 +6945,46 @@ Test-BRAVOCondition `
 # Production-сервери запускають self-test без git: тоді перевірка позначається
 # НЕДОСТУПНО через -EnvironmentLimitation (існуюча конвенція, див.
 # ReleaseArtifact/RejectsStaleProvenanceContent), а не мовчки проходить.
+# Спершу доводимо наявність git: без нього жоден git-залежний фікстурний крок
+# (включно з builder-фікстурами нижче) не виконується - виклик відсутньої
+# команди дав би CommandNotFoundException і обірвав би секцію ДО перевірки
+# реального дерева.
+$agentGitAvailable = (@(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue).Count -gt 0)
+$agentNoGitLimitation = ''
+if (-not $agentGitAvailable) { $agentNoGitLimitation = 'git відсутній на цьому хості (встановлений комплект без git); git-залежні фікстури не виконувались' }
+
+# Проба відсутнього git (незалежно від наявності справжнього): корінь із каталогом
+# .git та неіснуючою командою git мусить перевірятись у режимі filesystem без
+# винятку - так поводиться встановлений комплект без git.
+$agentNoGitProbeRoot = ''
+$agentNoGitDirtyScan = $null
+$agentNoGitCleanScan = $null
+try {
+    $agentNoGitProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_NOGIT_{0}" -f [guid]::NewGuid().ToString('N'))
+    $agentNoGitBogus = 'no-such-git-' + [guid]::NewGuid().ToString('N')
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'clean\.git'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'dirty\.git'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'dirty\.claude'))
+    $agentNoGitCleanScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentNoGitProbeRoot 'clean') -GitCommandName $agentNoGitBogus
+    $agentNoGitDirtyScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentNoGitProbeRoot 'dirty') -GitCommandName $agentNoGitBogus
+} finally {
+    if (-not [string]::IsNullOrEmpty($agentNoGitProbeRoot)) { Remove-Item -LiteralPath $agentNoGitProbeRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $agentNoGitCleanScan -and $agentNoGitCleanScan.Mode -eq 'filesystem' -and $agentNoGitCleanScan.Error -eq '' -and @($agentNoGitCleanScan.Violations).Count -eq 0 -and
+        $null -ne $agentNoGitDirtyScan -and $agentNoGitDirtyScan.Mode -eq 'filesystem' -and $agentNoGitDirtyScan.Error -eq '' -and @($agentNoGitDirtyScan.Violations).Count -eq 1
+    ) `
+    -Name 'Governance/NoAgentFilesInTree.GitAbsentFallsBackToFilesystemWithoutException' `
+    -Failure "без git (імітація неіснуючою командою) перевірка мусить іти у режимі filesystem без винятку; очікується: clean=0 (.git не порушення), dirty=1 (.claude). Отримано clean=$(if ($null -ne $agentNoGitCleanScan) { @($agentNoGitCleanScan.Violations).Count } else { '<немає>' }) dirty=$(if ($null -ne $agentNoGitDirtyScan) { @($agentNoGitDirtyScan.Violations).Count } else { '<немає>' })"
+
 $agentGitFixture = ''
-$agentGitLimitation = ''
+$agentGitLimitation = $agentNoGitLimitation
 $agentGitReady = $false
 $agentGitUntrackedScan = $null
 $agentGitTrackedScan = $null
 $agentGitSubdirScan = $null
+if ($agentGitAvailable) {
 try {
     $agentGitFixture = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_GIT_{0}" -f [guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($agentGitFixture)
@@ -6989,6 +7024,7 @@ try {
 } finally {
     if (-not [string]::IsNullOrEmpty($agentGitFixture)) { Remove-Item -LiteralPath $agentGitFixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
+}
 $agentGitUntrackedOk = ($null -ne $agentGitUntrackedScan -and $agentGitUntrackedScan.Mode -eq 'git-index' -and $agentGitUntrackedScan.Error -eq '' -and @($agentGitUntrackedScan.Violations).Count -eq 0)
 $agentGitTrackedOk = ($null -ne $agentGitTrackedScan -and $agentGitTrackedScan.Mode -eq 'git-index' -and $agentGitTrackedScan.Error -eq '' -and
     @($agentGitTrackedScan.Violations).Count -eq 1 -and @($agentGitTrackedScan.Violations)[0] -eq 'CLAUDE.md')
@@ -7010,10 +7046,11 @@ Test-BRAVOCondition `
 # (змінені лише VERSION.json і RUNTIME_MANIFEST.json), щоб провенанс пройшов
 # і збірка дійшла до розпакованого staging. Маркер ASCII (кодова сторінка
 # stderr дочірнього процесу), як у ReleaseArtifact/RejectsStaleProvenanceContent.
-$agentBuilderLimitation = ''
+$agentBuilderLimitation = $agentNoGitLimitation
 $agentBuilderDirtyOutput = ''
 $agentBuilderCleanOutput = ''
 $agentBuilderRoots = @('', '')
+if ($agentGitAvailable) {
 try {
     $agentBuilderRoots = @(
         (Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_ART_D_{0}" -f [guid]::NewGuid().ToString('N'))),
@@ -7054,16 +7091,17 @@ try {
         if (-not [string]::IsNullOrEmpty($agentBuilderCleanup)) { Remove-Item -LiteralPath $agentBuilderCleanup -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
+}
 Test-BRAVOCondition `
     -Condition ($agentBuilderDirtyOutput.Contains('AGENT_FILES_IN_ARTIFACT:') -and $agentBuilderDirtyOutput.Contains('CLAUDE.md')) `
     -Name 'Governance/NoAgentFilesInTree.ReleaseArtifactRejectsCommittedAgentFile' `
     -EnvironmentLimitation $agentBuilderLimitation `
     -Failure "ci\New-BRAVOReleaseArtifact.ps1 мусить відмовляти (маркер AGENT_FILES_IN_ARTIFACT з іменем файлу), коли ref містить закомічений CLAUDE.md; вивід: $agentBuilderDirtyOutput"
 Test-BRAVOCondition `
-    -Condition (-not $agentBuilderCleanOutput.Contains('AGENT_FILES_IN_ARTIFACT:')) `
+    -Condition (-not $agentBuilderCleanOutput.Contains('AGENT_FILES_IN_ARTIFACT:') -and $agentBuilderCleanOutput.Contains('AGENT_FILES_IN_ARTIFACT (')) `
     -Name 'Governance/NoAgentFilesInTree.ReleaseArtifactAcceptsTreeWithoutAgentFiles' `
     -EnvironmentLimitation $agentBuilderLimitation `
-    -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має спрацьовувати AGENT_FILES_IN_ARTIFACT на дереві без файлів агентів; вивід: $agentBuilderCleanOutput"
+    -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має спрацьовувати AGENT_FILES_IN_ARTIFACT на дереві без файлів агентів, а гейт мусить явно підтвердити проходження (рядок 'Гейт AGENT_FILES_IN_ARTIFACT (...)', ASCII-маркер 'AGENT_FILES_IN_ARTIFACT ('); вивід: $agentBuilderCleanOutput"
 
 # --- Реальне дерево ---
 $agentRealScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $root
