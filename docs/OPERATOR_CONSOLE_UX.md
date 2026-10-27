@@ -87,7 +87,7 @@ Health використовує checklist-oriented UX. Основний рядо
 ============================================================
  BRAVO Health <packageVersion>
  TEST-COMPANY [1234567890]
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: MANUAL
 ============================================================
 
@@ -138,7 +138,7 @@ Restore Test використовує component-oriented UX. Для кожног
 ============================================================
  BRAVO Restore Test <packageVersion>
  TEST-COMPANY [1234567890]
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: READ-ONLY / ISOLATED RESTORE
 ============================================================
 
@@ -184,7 +184,7 @@ Maintenance має plan-first UX, бо сценарій може змінюва�
 ============================================================
  BRAVO Maintenance <packageVersion>
  TEST-COMPANY [1234567890]
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: MANUAL
 ============================================================
 
@@ -233,7 +233,7 @@ Dry Run зберігає власну семантику `PASS`, `WARN`, `FAIL`,
 ============================================================
  BRAVO Dry Run <packageVersion>
  TEST-COMPANY [1234567890]
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: READ-ONLY
 ============================================================
 
@@ -285,7 +285,7 @@ Setup має wizard/stage-oriented UX. Детальний discovery-блок д�
 ============================================================
  BRAVO Setup <packageVersion>
  TEST-COMPANY [1234567890]
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: FULL
 ============================================================
 
@@ -323,7 +323,7 @@ Credentials UX ніколи не показує secret value. Показують
 ```text
 ============================================================
  BRAVO Credentials Setup <packageVersion>
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: TEST
 ============================================================
 
@@ -364,7 +364,7 @@ Tasks Install показує окремо infrastructure stages і резуль�
 ```text
 ============================================================
  BRAVO Tasks Setup <packageVersion>
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: INSTALL
 ============================================================
 

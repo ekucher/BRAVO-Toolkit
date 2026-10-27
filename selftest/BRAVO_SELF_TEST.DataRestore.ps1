@@ -1673,7 +1673,7 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         -Name "DataRestore/ListGenerationsDoesNotRequireSevenZip" `
         -Failure "required tools мають похідати з фактичної операції: -ListGenerations (Local або SFTP) ніколи не має вимагати 7za.exe; лише реальне відновлення (не -ListGenerations) додає 7za.exe, а SFTP окремо додає WinSCP.com"
 
-    # --- 6.13b. DEV-LIMS acceptance defect (5.1.0-rc.2, exit 90): для
+    # --- 6.13b. HOST-11 acceptance defect (5.1.0-rc.2, exit 90): для
     # -ListGenerations -Source Local $requiredTools legitimately обчислюється
     # як порожній масив (див. 6.13 вище), але Test-BRAVODataRestoreToolIntegrity
     # мала [Parameter(Mandatory=$true)][string[]]$ToolNames БЕЗ

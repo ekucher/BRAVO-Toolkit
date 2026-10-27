@@ -1,7 +1,7 @@
-# BRAVO DataRestore 5.1.0-rc.2 — Acceptance Runbook (готовність до наступного DEV-LIMS прогону)
+# BRAVO DataRestore 5.1.0-rc.2 — Acceptance Runbook (готовність до наступного HOST-11 прогону)
 
 Цей документ — підготовка до наступного реального acceptance-прогону на
-DEV-LIMS, **не сам прогін і не evidence**. Він фіксує: (1) що змінилось з
+HOST-11, **не сам прогін і не evidence**. Він фіксує: (1) що змінилось з
 моменту останнього NO-GO вердикту, (2) відтворені процедури для сценаріїв, чиє
 визначення підтверджено в репозиторії/історії PR, (3) явну прогалину для
 сценаріїв, чиє визначення в репозиторії відсутнє, (4) чек-лист перед стартом.
@@ -34,10 +34,10 @@ docs-only) — **обов'язково перестемпити** (`ci\Update-BR
 |---|---|
 | PR #40 (`497e7b1`…`f142b38`) | Детермінований B20 failpoint (`BRAVO_DATARESTORE_TEST_HOOKS=ACCEPTANCE_ONLY` + `BRAVO_DATARESTORE_TEST_FAILPOINT=Point:Component`, default OFF, без нових CLI-параметрів) + 6 раундів review, 37 findings (кілька P1: move-aside-armed guard проти видалення непорушеної live-директорії, generationId-injection захист, ACL-copy тепер fatal, WinSCP script permissions, rollback-failure gate на service-restart). |
 | PR #41 (`f142b38`+7) | Сьомий review-раунд, 7 findings (2 P1: fail-open service-state check, хибне повідомлення про наявність prerestore-копії при rollback). |
-| PR #42 | Реальний DEV-LIMS-знайдений дефект: **кожен `-Source SFTP` restore падав з exit 90** на staging free-space preflight (`ProbeDirectory` не оголошено на staging-requirement). Виправлено + regression-тест. Це прямо стосується сценарію "PHASE 3/B4" з попереднього прогону. |
-| PR #43/#44 | `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1` — автоматизована E2E-матриця, **Source=Local лише**, синтетичні фікстури, 16 комбінацій (`Component` × `Mode` × сценарій), тепер у CI на кожен PR. Це **не замінює** реальний DEV-LIMS/SFTP acceptance, але знімає частину ручного навантаження для Local-комбінацій. |
+| PR #42 | Реальний HOST-11-знайдений дефект: **кожен `-Source SFTP` restore падав з exit 90** на staging free-space preflight (`ProbeDirectory` не оголошено на staging-requirement). Виправлено + regression-тест. Це прямо стосується сценарію "PHASE 3/B4" з попереднього прогону. |
+| PR #43/#44 | `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1` — автоматизована E2E-матриця, **Source=Local лише**, синтетичні фікстури, 16 комбінацій (`Component` × `Mode` × сценарій), тепер у CI на кожен PR. Це **не замінює** реальний HOST-11/SFTP acceptance, але знімає частину ручного навантаження для Local-комбінацій. |
 
-Отже: сам B20-механізм детермінізовано, знайдений і виправлений реальний SFTP-дефект (B4-клас), і пройшло 44+ review-виправлень — але **жодного повторного PASS-вердикту на DEV-LIMS не задокументовано** після цих змін.
+Отже: сам B20-механізм детермінізовано, знайдений і виправлений реальний SFTP-дефект (B4-клас), і пройшло 44+ review-виправлень — але **жодного повторного PASS-вердикту на HOST-11 не задокументовано** після цих змін.
 
 ## 3. Відтворені процедури (з попереднього evidence + опису PR — підтверджено)
 
@@ -57,7 +57,7 @@ PHASE-кроків у репозиторії немає (лише підсумо
 фактичного стану SFTP-джерела).
 **Статус:** regression-тест `DataRestore/SftpStagingFreeSpaceRequirementDeclaresProbeDirectory`
 у `BRAVO_SELF_TEST.ps1` підтверджує механізм статично; **реальний SFTP
-прогін на DEV-LIMS ще не виконувався** після фіксу.
+прогін на HOST-11 ще не виконувався** після фіксу.
 
 ### B15 — single-component InPlace
 **Процедура (з `33c5aca`):** `-Component <X> -Mode InPlace`, підтвердити:
@@ -97,7 +97,7 @@ acceptance harness only — not part of this repository"). Визначено
 наново на основі підтвердженої білої плями: **жодна з 16 комбінацій
 CI-матриці (PR #43/44) не використовує `Source=SFTP`** — CI повністю
 Local-only, тому SFTP-шлях (де й стався реальний дефект PR #42) можна
-підтвердити лише на реальному DEV-LIMS.
+підтвердити лише на реальному HOST-11.
 
 ### B17 — SFTP-source restore success
 
@@ -160,7 +160,7 @@ polling що 30с до `schedulerSettings.OperationLockWaitMinutes`, потім
 ## 6. Чек-лист перед стартом (з `dev-lims-environment-facts` пам'яті сесії)
 
 - [ ] `developer` re-stamp актуальний на момент старту (звірити HEAD == `sourceCommit`).
-- [ ] Оператор на DEV-LIMS — саме `BSYSTEM\e.kucher` (домен `BSYSTEM`, не WORKGROUP).
+- [ ] Оператор на HOST-11 — саме `BSYSTEM\e.kucher` (домен `BSYSTEM`, не WORKGROUP).
 - [ ] Runtime/BackupRoot: `E:\ARCHIV_LIMS_MONOLITH` (не застарілий `D:\BRAVO`/`D:\LIMS` шлях dev.19-стенду).
 - [ ] Config: `E:\ARCHIV_LIMS_MONOLITH\BRAVO.config`.
 - [ ] Є хоча б одна `COMPLETE` generation manifest для реального restore-тесту.

@@ -399,7 +399,7 @@ Test-BRAVOCondition `
 # ============================================================
 # S63 — production-шлях health-only БЕЗ інжектованих -Drives
 # ============================================================
-# Регресія реального дефекту, знайденого acceptance rc.3 на LIMS-TOP
+# Регресія реального дефекту, знайденого acceptance rc.3 на HOST-12
 # (13.09.2026): у health-only гілці Test-BRAVODiskSpaceEntity capacity
 # читався викликом з безумовним -Drives @(). Оскільки
 # Get-BRAVODiskSpaceCapacityObservation трактує ЗВ'ЯЗАНИЙ -Drives як
