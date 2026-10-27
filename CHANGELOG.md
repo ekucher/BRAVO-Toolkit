@@ -1,5 +1,18 @@
 # Changelog
 
+## 5.2.6-rc.1 — 2026-10-27
+
+Hotfix від stable `5.2.5` (RELEASE_POLICY §12) за рішенням власника D7: лише знеособлення реальних ідентифікаторів
+майданчиків у пакеті. Функціональних runtime-змін немає: у `modules/*`, `BRAVO.config`, `BRAVO_CONFIG_LOADER.ps1`
+змінено лише коментарі; `ModuleVersion` модулів піднято до базової версії `5.2.6`; `configSchemaVersion` і
+`stateSchemaVersion` не змінено.
+
+- Документи пакета, коментарі коду, fixture і перевірки self-test: назви установ замінено на `SITE-A`…`SITE-F`,
+  імена хостів — на `HOST-11`…`HOST-15`, код ЄДРПОУ — на `00000000`, IP-адреси — на приватні та RFC 5737.
+- `ci/Test-BRAVOForbiddenPattern.ps1`: guard повторного потрапляння знеособлених значень (за SHA-256 токенів, зокрема
+  всередині складених токенів і в UTF-16-файлах); self-test `StaticAnalysis/SiteIdentifierGuard[*]`.
+- Опубліковані теги й Release `5.2.4`, `5.2.5` не змінювались.
+
 ## 5.2.5 — 2026-10-26
 
 Stable promotion від прийнятого `5.2.5-rc.8` (тег `v5.2.5-rc.8`, коміт-stamp `8aacaac`, sourceCommit `36541ea`) —
