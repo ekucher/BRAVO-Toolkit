@@ -6802,3 +6802,276 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope') { try {
 }
 
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope' } }
+if (Enter-BRAVOSelfTestSection -Name 'Governance/NoAgentFilesInTree') { try {
+
+# =====================================================================
+# У продуктовому дереві немає файлів AI-агентів
+# =====================================================================
+# Файли агентів (.claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json) вилучено
+# з репозиторію; цей guard не дає їм повернутись. Політика - єдина
+# канонічна реалізація ci\BRAVOAgentFilePolicy.ps1 (її ж застосовує гейт
+# AGENT_FILES_IN_ARTIFACT у ci\New-BRAVOReleaseArtifact.ps1).
+#
+# Джерело істини:
+#   * корінь є верхом git work tree (git доступний) -> git-індекс
+#     (git ls-files): на машині розробника ігнорований/неперевіряний локальний
+#     .claude\ легітимний, неприпустимо лише щоб файл знову став tracked.
+#     Збій git у цьому режимі - FAIL (fail closed), а не пропуск;
+#   * інакше (встановлений комплект / staging без git, git відсутній, корінь
+#     не верх репозиторію) -> файлова система під коренем (разом із
+#     порожніми й прихованими каталогами).
+# Верх work tree визначається порожнім `git rev-parse --show-prefix`, а не
+# порівнянням рядків шляху: тимчасові каталоги Windows мають короткі (8.3)
+# імена, і рядкове порівняння з довгим шляхом від git давало б хибний режим.
+. (Join-Path $root 'ci\BRAVOAgentFilePolicy.ps1')
+
+function Get-BRAVOSelfTestAgentFileScan {
+    param([Parameter(Mandatory = $true)][string]$TreeRoot)
+
+    $scan = [pscustomobject]@{ Mode = ''; Violations = @(); Error = '' }
+    $gitCommand = @(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue)
+    $useGit = $false
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($gitCommand.Count -gt 0) {
+            $insideOutput = (& git -C $TreeRoot rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+            $insideExit = $LASTEXITCODE
+            if ($insideExit -eq 0 -and $insideOutput -eq 'true') {
+                $prefixOutput = (& git -C $TreeRoot rev-parse --show-prefix 2>$null | Out-String).Trim()
+                if ($LASTEXITCODE -ne 0) {
+                    $scan.Error = "git rev-parse --show-prefix завершився з кодом $LASTEXITCODE"
+                    return $scan
+                }
+                $useGit = ($prefixOutput.Length -eq 0)
+            } elseif (Test-Path -LiteralPath (Join-Path $TreeRoot '.git')) {
+                # Є ознака репозиторію, але git його не розпізнав: не вгадуємо.
+                $scan.Error = "у корені є .git, але git rev-parse завершився з кодом $insideExit (вивід: '$insideOutput')"
+                return $scan
+            }
+        }
+
+        if ($useGit) {
+            $scan.Mode = 'git-index'
+            $listing = & git -C $TreeRoot -c core.quotepath=off ls-files -z 2>$null | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                $scan.Error = "git ls-files -z завершився з кодом $LASTEXITCODE"
+                return $scan
+            }
+            $trackedPaths = @($listing.Split([char]0) | Where-Object { $_.Length -gt 0 })
+            $scan.Violations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath $trackedPaths)
+        } else {
+            $scan.Mode = 'filesystem'
+            try {
+                $scan.Violations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath (Get-BRAVOAgentFilePolicyTreePath -Root $TreeRoot))
+            } catch {
+                $scan.Error = "не вдалося перелічити дерево: $($_.Exception.Message)"
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    return $scan
+}
+
+# --- Чиста політика: заборонені форми ---
+$agentPolicyForbidden = @(
+    '.claude', '.claude/settings.json', '.claude\settings.json', 'sub/.CLAUDE/x', 'a\b\.codex', '.codex/config.toml',
+    'CLAUDE.md', 'claude.md', 'sub/AGENTS.md', 'docs\Agents.MD', '.mcp.json', 'x/y/.MCP.JSON'
+)
+$agentPolicyLookalikes = @(
+    'docs/agents/issue-tracker.md', 'CLAUDE.md.example', 'my.claude/x', 'x.codex', 'x.codex/y.txt', 'docs/AGENTS-notes.md',
+    'docs\CLAUDE-notes.md', 'claude.md.txt', 'mcp.json', '.mcp.json.bak', 'docs/claude/x.md', 'README.md', ''
+)
+$agentPolicyForbiddenHit = @(Get-BRAVOAgentFilePolicyViolation -RelativePath $agentPolicyForbidden)
+$agentPolicyLookalikeHit = @(Get-BRAVOAgentFilePolicyViolation -RelativePath $agentPolicyLookalikes)
+Test-BRAVOCondition `
+    -Condition ($agentPolicyForbiddenHit.Count -eq $agentPolicyForbidden.Count) `
+    -Name 'Governance/NoAgentFilesInTree.PolicyFlagsEveryForbiddenForm' `
+    -Failure ("політика мусить позначати КОЖНУ заборонену форму (обидва роздільники, будь-який регістр, будь-яка глибина); позначено " +
+        "$($agentPolicyForbiddenHit.Count) з $($agentPolicyForbidden.Count): [" + [string]::Join(', ', $agentPolicyForbiddenHit) + "]")
+Test-BRAVOCondition `
+    -Condition ($agentPolicyLookalikeHit.Count -eq 0) `
+    -Name 'Governance/NoAgentFilesInTree.PolicyIgnoresLookalikes' `
+    -Failure ("схожі імена (CLAUDE.md.example, my.claude/x, x.codex, docs/agents/..., docs/AGENTS-notes.md) НЕ є порушенням; хибно позначено: [" +
+        [string]::Join(', ', $agentPolicyLookalikeHit) + "]")
+
+# --- Режим файлової системи: фікстура у TEMP ---
+$agentFixtureDirty = ''
+$agentFixtureClean = ''
+$agentFixtureDirtyScan = $null
+$agentFixtureCleanScan = $null
+try {
+    $agentFixtureDirty = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_DIRTY_{0}" -f [guid]::NewGuid().ToString('N'))
+    $agentFixtureClean = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_CLEAN_{0}" -f [guid]::NewGuid().ToString('N'))
+    $agentUtf8NoBom = New-Object Text.UTF8Encoding($false)
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureDirty '.claude'))
+    [IO.File]::WriteAllText((Join-Path $agentFixtureDirty '.claude\settings.json'), "{}`r`n", $agentUtf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $agentFixtureDirty 'CLAUDE.md'), "x`r`n", $agentUtf8NoBom)
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureDirty 'sub\.codex'))
+    [IO.File]::WriteAllText((Join-Path $agentFixtureDirty 'ok.txt'), "x`r`n", $agentUtf8NoBom)
+
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureClean 'docs\agents'))
+    [IO.File]::WriteAllText((Join-Path $agentFixtureClean 'docs\agents\issue-tracker.md'), "x`r`n", $agentUtf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $agentFixtureClean 'CLAUDE.md.example'), "x`r`n", $agentUtf8NoBom)
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureClean 'my.claude'))
+    [IO.File]::WriteAllText((Join-Path $agentFixtureClean 'my.claude\x'), "x`r`n", $agentUtf8NoBom)
+
+    $agentFixtureDirtyScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentFixtureDirty
+    $agentFixtureCleanScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentFixtureClean
+} finally {
+    if (-not [string]::IsNullOrEmpty($agentFixtureDirty)) { Remove-Item -LiteralPath $agentFixtureDirty -Recurse -Force -ErrorAction SilentlyContinue }
+    if (-not [string]::IsNullOrEmpty($agentFixtureClean)) { Remove-Item -LiteralPath $agentFixtureClean -Recurse -Force -ErrorAction SilentlyContinue }
+}
+$agentFixtureDirtyHit = if ($null -ne $agentFixtureDirtyScan) { @($agentFixtureDirtyScan.Violations) } else { @() }
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $agentFixtureDirtyScan -and $agentFixtureDirtyScan.Mode -eq 'filesystem' -and $agentFixtureDirtyScan.Error -eq '' -and
+        $agentFixtureDirtyHit.Count -eq 4 -and
+        ($agentFixtureDirtyHit -contains '.claude') -and ($agentFixtureDirtyHit -contains '.claude\settings.json') -and
+        ($agentFixtureDirtyHit -contains 'CLAUDE.md') -and ($agentFixtureDirtyHit -contains 'sub\.codex')
+    ) `
+    -Name 'Governance/NoAgentFilesInTree.FilesystemFixtureFlagged' `
+    -Failure ("фікстура без git (.claude\settings.json, CLAUDE.md, порожній sub\.codex) мусить давати рівно 4 порушення в режимі filesystem; отримано: [" +
+        [string]::Join(', ', $agentFixtureDirtyHit) + "] режим=$(if ($null -ne $agentFixtureDirtyScan) { $agentFixtureDirtyScan.Mode } else { '<немає>' }) помилка=$(if ($null -ne $agentFixtureDirtyScan) { $agentFixtureDirtyScan.Error } else { '' })")
+Test-BRAVOCondition `
+    -Condition ($null -ne $agentFixtureCleanScan -and $agentFixtureCleanScan.Mode -eq 'filesystem' -and $agentFixtureCleanScan.Error -eq '' -and @($agentFixtureCleanScan.Violations).Count -eq 0) `
+    -Name 'Governance/NoAgentFilesInTree.FilesystemCleanFixtureNotFlagged' `
+    -Failure ("чиста фікстура (лише схожі імена) не повинна давати порушень; отримано: [" +
+        $(if ($null -ne $agentFixtureCleanScan) { [string]::Join(', ', @($agentFixtureCleanScan.Violations)) } else { '<немає>' }) + "]")
+
+# --- Режим git-індексу: тимчасовий репозиторій ---
+# Production-сервери запускають self-test без git: тоді перевірка позначається
+# НЕДОСТУПНО через -EnvironmentLimitation (існуюча конвенція, див.
+# ReleaseArtifact/RejectsStaleProvenanceContent), а не мовчки проходить.
+$agentGitFixture = ''
+$agentGitLimitation = ''
+$agentGitReady = $false
+$agentGitUntrackedScan = $null
+$agentGitTrackedScan = $null
+$agentGitSubdirScan = $null
+try {
+    $agentGitFixture = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_GIT_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($agentGitFixture)
+    $agentUtf8NoBomGit = New-Object Text.UTF8Encoding($false)
+    $previousErrorActionAgentGit = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $null = & git -C $agentGitFixture -c init.defaultBranch=master init --quiet 2>&1
+        $agentGitReady = ($LASTEXITCODE -eq 0)
+        if ($agentGitReady) {
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture '.gitignore'), ".claude/`r`n", $agentUtf8NoBomGit)
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture 'ok.txt'), "x`r`n", $agentUtf8NoBomGit)
+            [void][IO.Directory]::CreateDirectory((Join-Path $agentGitFixture '.claude'))
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture '.claude\settings.json'), "{}`r`n", $agentUtf8NoBomGit)
+            [void][IO.Directory]::CreateDirectory((Join-Path $agentGitFixture 'sub'))
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture 'sub\a.txt'), "x`r`n", $agentUtf8NoBomGit)
+            $null = & git -C $agentGitFixture add -A 2>&1
+            $agentGitReady = ($LASTEXITCODE -eq 0)
+        }
+        if ($agentGitReady) {
+            # Ігнорований untracked .claude\ є, але в індексі його немає.
+            $agentGitUntrackedScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentGitFixture
+            # Підкаталог репозиторію не є верхом work tree -> режим файлової системи.
+            $agentGitSubdirScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentGitFixture 'sub')
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture 'CLAUDE.md'), "x`r`n", $agentUtf8NoBomGit)
+            $null = & git -C $agentGitFixture add -f CLAUDE.md 2>&1
+            $agentGitReady = ($LASTEXITCODE -eq 0)
+        }
+        if ($agentGitReady) {
+            $agentGitTrackedScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentGitFixture
+        } else {
+            $agentGitLimitation = 'git недоступний або не може створити тимчасовий репозиторій'
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionAgentGit
+    }
+} finally {
+    if (-not [string]::IsNullOrEmpty($agentGitFixture)) { Remove-Item -LiteralPath $agentGitFixture -Recurse -Force -ErrorAction SilentlyContinue }
+}
+$agentGitUntrackedOk = ($null -ne $agentGitUntrackedScan -and $agentGitUntrackedScan.Mode -eq 'git-index' -and $agentGitUntrackedScan.Error -eq '' -and @($agentGitUntrackedScan.Violations).Count -eq 0)
+$agentGitTrackedOk = ($null -ne $agentGitTrackedScan -and $agentGitTrackedScan.Mode -eq 'git-index' -and $agentGitTrackedScan.Error -eq '' -and
+    @($agentGitTrackedScan.Violations).Count -eq 1 -and @($agentGitTrackedScan.Violations)[0] -eq 'CLAUDE.md')
+$agentGitSubdirOk = ($null -ne $agentGitSubdirScan -and $agentGitSubdirScan.Mode -eq 'filesystem' -and $agentGitSubdirScan.Error -eq '')
+Test-BRAVOCondition `
+    -Condition ($agentGitUntrackedOk -and $agentGitTrackedOk) `
+    -Name 'Governance/NoAgentFilesInTree.GitIndexFlagsTrackedIgnoresIgnoredUntracked' `
+    -EnvironmentLimitation $agentGitLimitation `
+    -Failure ("у git-режимі tracked CLAUDE.md мусить бути порушенням, а ігнорований untracked .claude\ - ні. untracked-ok=$agentGitUntrackedOk (режим=$(if ($null -ne $agentGitUntrackedScan) { $agentGitUntrackedScan.Mode } else { '<немає>' }), помилка=$(if ($null -ne $agentGitUntrackedScan) { $agentGitUntrackedScan.Error } else { '' })), " +
+        "tracked-ok=$agentGitTrackedOk (порушень=$(if ($null -ne $agentGitTrackedScan) { [string]::Join(', ', @($agentGitTrackedScan.Violations)) } else { '<немає>' }))")
+Test-BRAVOCondition `
+    -Condition $agentGitSubdirOk `
+    -Name 'Governance/NoAgentFilesInTree.SubdirectoryOfRepoUsesFilesystemMode' `
+    -EnvironmentLimitation $agentGitLimitation `
+    -Failure "корінь, що не є верхом git work tree (підкаталог репозиторію), мусить перевірятись у режимі filesystem; режим=$(if ($null -ne $agentGitSubdirScan) { $agentGitSubdirScan.Mode } else { '<немає>' })"
+
+# --- Гейт AGENT_FILES_IN_ARTIFACT у ci\New-BRAVOReleaseArtifact.ps1 ---
+# Фікстура-репозиторій: база з (або без) CLAUDE.md + чистий коміт-штамп
+# (змінені лише VERSION.json і RUNTIME_MANIFEST.json), щоб провенанс пройшов
+# і збірка дійшла до розпакованого staging. Маркер ASCII (кодова сторінка
+# stderr дочірнього процесу), як у ReleaseArtifact/RejectsStaleProvenanceContent.
+$agentBuilderLimitation = ''
+$agentBuilderDirtyOutput = ''
+$agentBuilderCleanOutput = ''
+$agentBuilderRoots = @('', '')
+try {
+    $agentBuilderRoots = @(
+        (Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_ART_D_{0}" -f [guid]::NewGuid().ToString('N'))),
+        (Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_ART_C_{0}" -f [guid]::NewGuid().ToString('N')))
+    )
+    $agentBuilderUtf8 = New-Object Text.UTF8Encoding($false)
+    $previousErrorActionAgentBuilder = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        for ($agentBuilderIndex = 0; $agentBuilderIndex -lt 2; $agentBuilderIndex++) {
+            $agentBuilderRoot = $agentBuilderRoots[$agentBuilderIndex]
+            [void][IO.Directory]::CreateDirectory($agentBuilderRoot)
+            $null = & git -C $agentBuilderRoot -c init.defaultBranch=master init --quiet 2>&1
+            if ($LASTEXITCODE -ne 0) { $agentBuilderLimitation = 'git недоступний або не може створити коміт у тимчасовому репозиторії'; break }
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'code.txt'), "v1`r`n", $agentBuilderUtf8)
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'RUNTIME_MANIFEST.json'), "{}`r`n", $agentBuilderUtf8)
+            if ($agentBuilderIndex -eq 0) { [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'CLAUDE.md'), "x`r`n", $agentBuilderUtf8) }
+            $zeroCommit = '0000000000000000000000000000000000000000'
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'VERSION.json'),
+                ('{{"product":"BRAVO-Toolkit","packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"2026-08-05","buildId":"{0}","sourceCommit":"{1}"}}' -f $zeroCommit.Substring(0, 7), $zeroCommit), $agentBuilderUtf8)
+            $null = & git -C $agentBuilderRoot add -A 2>&1
+            $null = & git -C $agentBuilderRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'code' --quiet 2>&1
+            $agentBuilderBase = (& git -C $agentBuilderRoot rev-parse HEAD 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $agentBuilderBase -notmatch '^[0-9a-f]{40}$') { $agentBuilderLimitation = 'git недоступний або не може створити коміт у тимчасовому репозиторії'; break }
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'VERSION.json'),
+                ('{{"product":"BRAVO-Toolkit","packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"2026-08-05","buildId":"{0}","sourceCommit":"{1}"}}' -f $agentBuilderBase.Substring(0, 7), $agentBuilderBase), $agentBuilderUtf8)
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'RUNTIME_MANIFEST.json'), "{ }`r`n", $agentBuilderUtf8)
+            $null = & git -C $agentBuilderRoot add -A 2>&1
+            $null = & git -C $agentBuilderRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'stamp' --quiet 2>&1
+            $agentBuilderOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $agentBuilderRoot -Ref 'HEAD' -OutputDir (Join-Path $agentBuilderRoot 'out') 2>&1 | Out-String
+            if ($agentBuilderIndex -eq 0) { $agentBuilderDirtyOutput = $agentBuilderOutput } else { $agentBuilderCleanOutput = $agentBuilderOutput }
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionAgentBuilder
+    }
+} finally {
+    foreach ($agentBuilderCleanup in $agentBuilderRoots) {
+        if (-not [string]::IsNullOrEmpty($agentBuilderCleanup)) { Remove-Item -LiteralPath $agentBuilderCleanup -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+Test-BRAVOCondition `
+    -Condition ($agentBuilderDirtyOutput.Contains('AGENT_FILES_IN_ARTIFACT:') -and $agentBuilderDirtyOutput.Contains('CLAUDE.md')) `
+    -Name 'Governance/NoAgentFilesInTree.ReleaseArtifactRejectsCommittedAgentFile' `
+    -EnvironmentLimitation $agentBuilderLimitation `
+    -Failure "ci\New-BRAVOReleaseArtifact.ps1 мусить відмовляти (маркер AGENT_FILES_IN_ARTIFACT з іменем файлу), коли ref містить закомічений CLAUDE.md; вивід: $agentBuilderDirtyOutput"
+Test-BRAVOCondition `
+    -Condition (-not $agentBuilderCleanOutput.Contains('AGENT_FILES_IN_ARTIFACT:')) `
+    -Name 'Governance/NoAgentFilesInTree.ReleaseArtifactAcceptsTreeWithoutAgentFiles' `
+    -EnvironmentLimitation $agentBuilderLimitation `
+    -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має спрацьовувати AGENT_FILES_IN_ARTIFACT на дереві без файлів агентів; вивід: $agentBuilderCleanOutput"
+
+# --- Реальне дерево ---
+$agentRealScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $root
+$agentRealHit = @($agentRealScan.Violations)
+Test-BRAVOCondition `
+    -Condition ($agentRealScan.Error -eq '' -and $agentRealHit.Count -eq 0) `
+    -Name 'Governance/NoAgentFilesInTree.RealTreeHasNoAgentFiles' `
+    -Failure ("продуктове дерево (режим: $($agentRealScan.Mode)) не повинно містити файлів AI-агентів (.claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json); " +
+        "порушення ($($agentRealHit.Count)): [" + [string]::Join(', ', @($agentRealHit | Select-Object -First 10)) + "] помилка перевірки: '$($agentRealScan.Error)'")
+
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/NoAgentFilesInTree' } }
