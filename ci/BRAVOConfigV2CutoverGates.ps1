@@ -587,7 +587,7 @@ function Test-BRAVOConfigV2CutoverGates {
     # BRAVO_ARCHIV.ps1, BRAVO_HEALTH.ps1, BRAVO_MAINTENANCE.ps1,
     # BRAVO_DATA_RESTORE.ps1, BRAVO_CONFIGURATOR.ps1) — усі кореневі
     # BRAVO_*.ps1-скрипти є production/operator-поверхнею репозиторію
-    # (архітектурна політика 05-architecture.md), тому скануються всі, не
+    # (архітектурна політика docs/engineering/architecture.md), тому скануються всі, не
     # лише підмножина з AUTOEXEC-переліку.
     # R3 (issue #216, gate-review): deploy\ раніше не сканувався ЗОВСІМ —
     # додано, щоб deploy\Install-BRAVOServer.ps1 та інші не-migration
