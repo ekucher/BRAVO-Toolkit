@@ -1878,9 +1878,20 @@ function Remove-BRAVOExpiredBackupGenerations {
             # перевірка (#335).
             $deleteGeneration = $false
             if ($record.IsComplete) {
+                # Поки перевірених копій менше за мінімум, жодна COMPLETE не
+                # видаляється: неперевірена (транзієнтна помилка читання, ACL)
+                # може бути останньою цілою копією.
                 $deleteGeneration = [bool]$enableArchiveDeletion -and
                     $record.StartedAt -lt $validCutoff -and
-                    $record.GenerationId -notin $protectedGenerationIds
+                    $record.GenerationId -notin $protectedGenerationIds -and
+                    $protectedGenerationIds.Count -ge $minimumRetainedCount
+                if ([bool]$enableArchiveDeletion -and $record.StartedAt -lt $validCutoff -and
+                    $record.GenerationId -notin $protectedGenerationIds -and -not $deleteGeneration) {
+                    Write-BRAVOLog -Component 'CLEANUP' -Message (
+                        "Резервна копія $($record.GenerationId): строк зберігання минув, але перевірених копій " +
+                        "($($protectedGenerationIds.Count)) менше за $minimumRetainedCount. Retention її не чіпає"
+                    ) -Level 'WARNING'
+                }
             } elseif ($record.Status -eq 'FAILED' -or $record.Status -eq 'INCOMPLETE') {
                 $deleteGeneration = [bool]$enableFailedArchiveDeletion -and
                     $record.StartedAt -lt $invalidCutoff
