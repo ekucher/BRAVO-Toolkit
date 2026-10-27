@@ -39,7 +39,7 @@
 
         # GetTempPath, не $env:TEMP: TEMP сесії може бути 8.3-коротким
         # (C:\Users\E980D~1.KUC\...), а Remove-Item -LiteralPath у PS 5.1
-        # падає на короткому сегменті (реальний випадок: DEV-LIMS).
+        # падає на короткому сегменті (реальний випадок: HOST-11).
         $bazaSyncTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("bazasynctest_" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $bazaSyncTestRoot -Force | Out-Null
 
@@ -825,7 +825,7 @@
             Test-BRAVOCondition -Condition ($bazaIncrementalBranchText.Contains('$script:bazaSyncResults') -and $bazaIncrementalBranchText.Contains('ContainsKey($folderCheck.ComponentKey)')) `
                 -Name 'BazaSync/HealthChecksArchivePassedResultFirst' -Failure 'Health must check $script:bazaSyncResults (Archive-provided) before falling back to its own sync'
 
-            # Acceptance DEV-LIMS знахідка #5: fallback-шлях Health передавав
+            # Acceptance HOST-11 знахідка #5: fallback-шлях Health передавав
             # сирий $winSCPPath (WinSCP.com) у двигун -- guard session-функції
             # зловив це в production (fail-fast замість зависання), але wiring
             # мусить резолвити пару dll+exe так само, як Archive.
@@ -2288,7 +2288,7 @@
         ) -Name 'BazaSync/PendingAuditMarkerClearsOnlyAfterSuccessfulFinalSave' -Failure "маркер знімається ЛИШЕ успішним фінальним збереженням: після збою -- true, після успішної реконсиляції -- false; AfterC=$($hr6MkStateAfterC.State.AuditReconciliationPending) AfterE=$($hr6MkStateAfterE.State.AuditReconciliationPending)"
 
         # =======================================================================
-        # ACCEPTANCE DEV-LIMS: WinSCP.com-стаб замість winscp.exe -- сесія
+        # ACCEPTANCE HOST-11: WinSCP.com-стаб замість winscp.exe -- сесія
         # зависала на інтерактивному промпті "winscp>" (CPU~0)
         # =======================================================================
         $accComStubResult = Invoke-BRAVOBazaComponentSyncSession `
@@ -2337,7 +2337,7 @@
         ) -Name 'BazaSync/ArchiveWiringResolvesRealWinSCPExeForEngine' -Failure 'Invoke-BRAVOBazaIncrementalSync має резолвити пару dll+exe через Get-BRAVOWinSCPDotNetComponents (та сама, що legacy Get-BAZASFTPComparison), а НЕ передавати сирий $winSCPPath (WinSCP.com) у -WinSCPExecutablePath'
 
         # =======================================================================
-        # ACCEPTANCE DEV-LIMS blocker #4: .GetNewClosure() на PS 5.1 губить
+        # ACCEPTANCE HOST-11 blocker #4: .GetNewClosure() на PS 5.1 губить
         # command-lookup ПРИВАТНИХ функцій runtime (Get-BAZASFTPComparison) --
         # провайдер, викликаний через межу модуля BRAVO.BazaSync, падав
         # CommandNotFoundException. Поведінковий тест іде через РЕАЛЬНУ
@@ -2545,7 +2545,7 @@
             $null -eq $mrStateAfterAbsent.State.Files['keep.txt']
         ) -Name 'BazaSync/ReconcileRemoteAbsentSkipsRenameStillRemovesEntry' -Failure 'відсутній remote-файл: rename пропускається (RemoteAbsent), ключ видаляється, результат успішний'
 
-        # Регресія польового дефекту DEV-LIMS E2E (2026-08-21): присвоєння
+        # Регресія польового дефекту HOST-11 E2E (2026-08-21): присвоєння
         # `$acceptList = if (...) {...} else { @($Accept) }` йде через
         # пайплайн і РОЗГОРТАЄ одноелементний масив у скаляр — .Count на
         # ньому падає під успадкованим StrictMode 2.0 (exit 90 після вже

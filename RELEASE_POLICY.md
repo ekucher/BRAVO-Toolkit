@@ -1733,10 +1733,10 @@ Compare-FileSizes-фікси з локальної незапушеної гіл
 (зміст уже в developer іншими комітами).
 
 Stable `5.1.0` промотовано 2026-08-20 з прийнятого `5.1.0-rc.4`
-(stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО DEV-LIMS
+(stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО HOST-11
 acceptance того ж дня (evidence
-`docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md`, гілка
-`evidence/219c55b-rc4-devlims-acceptance-pass`). Шлях циклу:
+`docs/BRAVO_DATA_RESTORE_RC4_HOST11_ACCEPTANCE_20260820.md`, гілка
+`evidence/219c55b-rc4-host11-acceptance-pass`). Шлях циклу:
 rc.1 (інвалідовано фічею DATA_RESTORE) → rc.2 (acceptance PASS, але
 промоцію скасовано: виявлено відсутність порту severity-routing
 PR #39) → rc.3 (порт routing; на acceptance виявлено, що DataRestore
@@ -1792,10 +1792,10 @@ required checks гілки master, merge PR #61 виконано admin-обхо�
   став тонким адаптером над канонічною `Get-BRAVOSevenZipArchiveEntries`;
   гейт `Secrets/SevenZipPasswordUsesStdin` розширено на DataRestore.)*
 
-### Функціональна зміна дефолту під час DEV-LIMS acceptance `5.2.0-rc.1`
+### Функціональна зміна дефолту під час HOST-11 acceptance `5.2.0-rc.1`
 
 - **`RepeatAlertAfterHours` (health-alert дедуп): дефолт `6` → `0`.**
-  Виявлено під час реального DEV-LIMS acceptance (ЛАБОРАТОРІЯ-6,
+  Виявлено під час реального HOST-11 acceptance (ЛАБОРАТОРІЯ-6,
   2026-08-23): при увімкненому `AutoArchiveMutationThreshold` оператор
   спостерігав лише перше сповіщення про `MUTATION_VIOLATION`, повторний
   ідентичний alert протягом наступних до 6 год. мовчав

@@ -445,7 +445,7 @@ function Assert-BravoLoadedConfiguration {
             # $maintenanceSettings.Restore.BootRestoreMode напряму й під
             # StrictMode падали на відсутньому ключі ("property cannot be
             # found"), всупереч обіцянці «застарілий ключ ігнорується»
-            # (реальний випадок: DEV-LIMS, site-config rc.4-ери). Дефолт —
+            # (реальний випадок: HOST-11, site-config rc.4-ери). Дефолт —
             # безпечний 24/7-профіль 'None'.
             $restoreSettingsForValidation.BootRestoreMode = 'None'
         }

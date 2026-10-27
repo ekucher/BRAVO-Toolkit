@@ -1520,7 +1520,7 @@ function Enter-BRAVOMaintenanceOperationLock {
                         # Оператор бачив лише мовчазний Start-Sleep до
                         # OperationLockWaitMinutes і жодного натяку, хто саме
                         # тримає lock, хоча holder уже пише в цей файл JSON із
-                        # operation/pid/hostname/generationId (DEV-LIMS
+                        # operation/pid/hostname/generationId (HOST-11
                         # acceptance 2026-08-23). Читання — best-effort: holder
                         # тримає файл із FileShare.Read, тому в звичайному разі
                         # peek вдається; вузьке вікно між OpenOrCreate і Write
@@ -1757,7 +1757,7 @@ function Get-BRAVOMaintenanceResolvedExitCode {
 # Get-BRAVOExitCodeName (BRAVO.ExitCodes, те саме джерело істини, що
 # вже показує "Код завершення:" у РЕЗУЛЬТАТ нижче). default-гілка
 # покриває 40/41/60 і будь-який інший неуспішний/не-warning код без
-# перелічення кожного окремо. Реальний DEV-LIMS запуск: відсутній
+# перелічення кожного окремо. Реальний HOST-11 запуск: відсутній
 # Range ID log (WARN-only, семантика НЕ змінена) -> exit 10
 # (SuccessWithWarnings), але ЛОГ і фінальне повідомлення раніше
 # незалежно показували "УСПІШНО" без жодної згадки про попередження.
@@ -1830,7 +1830,7 @@ function Register-BRAVOMaintenanceArchiveChildResult {
 # рендерів: Write-BRAVOMaintenanceStep (пронумеровані [N/Total]) і
 # Write-BRAVOMaintenanceOperation (ненумеровані операції).
 #
-# Реальний DEV-LIMS прогін 19:26 показав, чому облік мусить бути спільним:
+# Реальний HOST-11 прогін 19:26 показав, чому облік мусить бути спільним:
 # ненумеровані операції рендерилися прямо через Write-BRAVOOperationResult
 # (BRAVO.Console), тому FAIL-операція "Trace: добовий архів і SFTP" не
 # потрапляла ані в лічильники (підсумок брехав "Помилок: 0" при exit 60),
@@ -2083,7 +2083,7 @@ function Write-Log {
     # задають етапи (Write-BRAVOMaintenanceStep), тому в консоль вони більше
     # не йдуть.
     # dev.19: голий роздільник "==="/"=" БІЛЬШЕ НЕ пише окремий запис у
-    # журнал (той самий підхід, що вже Archive dev.18). Реальний DEV-LIMS
+    # журнал (той самий підхід, що вже Archive dev.18). Реальний HOST-11
     # лог показав рядки лише зі 100 символами "=" між звичайними секціями
     # — без жодної діагностичної цінності, бо кожен такий виклик стоїть
     # безпосередньо перед "=== ЗАГОЛОВОК ===", який і так фіксує ту саму
@@ -5244,7 +5244,7 @@ function Send-BRAVOTraceArchive {
         $remoteRoot = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { '' } else { "/$normalizedRemoteDirectory" }
         $remoteArchivePath = "$remoteRoot/$([System.IO.Path]::GetFileName($ArchivePath))"
         # session.PutFiles НЕ створює відсутні remote-каталоги: реальний
-        # DEV-LIMS прогін падав на кожному запуску з "Cannot create remote
+        # HOST-11 прогін падав на кожному запуску з "Cannot create remote
         # file '/trace/Trace_YYYYMMDD.mdz.new.filepart'. No such file or
         # directory", бо /trace/ на сервері не існував — і це давало exit 60
         # обслуговування, яке насправді відпрацювало. Канонічний рекурсивний
@@ -6954,7 +6954,7 @@ function Compare-FileSizes {
         [int]$MinSizeBytes = 2048,
         [AllowNull()][string]$MainModelRelativePath = $null,
         # Settle-retry (порт 67f3ad3+e2c61e1 з backup/local-developer-rc2-line):
-        # двічі підтверджено на реальному DEV-LIMS (2026-08-23/24, byte-точний
+        # двічі підтверджено на реальному HOST-11 (2026-08-23/24, byte-точний
         # збіг розмірів на диску одразу після хибного rollback) — активний
         # антивірус із real-time захистом тримав щойно записані гігабайтні
         # .md залоченими одразу після bravocmd repair/екстракції, і
@@ -8254,7 +8254,7 @@ function Remove-OldRestoreArchives {
         # результат, pipeline віддає скалярний FileInfo замість масиву, і
         # .Count на ньому кидає "The property 'Count' cannot be found on
         # this object": підтверджено реальним acceptance-прогоном dev.15
-        # на DEV-LIMS (виняток після [8/8], перехоплений fail-safe catch).
+        # на HOST-11 (виняток після [8/8], перехоплений fail-safe catch).
         $beforeCount = @($group.Group | Where-Object { $_.Name -like "*_before_*" }).Count
         $afterCount = @($group.Group | Where-Object { $_.Name -like "*_after_*" }).Count
         Write-Log "  - $sessionTime (before: $beforeCount, after: $afterCount)" -Level "DEBUG"
@@ -9652,7 +9652,7 @@ if ($BravoMaintenanceEnabled) {
         # INFO, не WARNING: це констатація СВІДОМОЇ дії оператора (він сам
         # передав -ForceRestore), а не аномалія. Будь-який WARNING інкрементує
         # $script:BRAVOWarningCount (Write-Log вище), а той піднімає severity
-        # сповіщення й дає exit 10 (SuccessWithWarnings) — реальний DEV-LIMS
+        # сповіщення й дає exit 10 (SuccessWithWarnings) — реальний HOST-11
         # прогін 20:29 показав оператору жовте "ПОТРІБНА ДІЯ: перевірити
         # журнал" при повністю зеленому списку етапів, без жодної підказки,
         # що саме не так. Текст лишається в лозі повністю — змінюється лише
@@ -11418,7 +11418,7 @@ if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
 # Зріз лічильників пересвіжується САМЕ ТУТ, після реставрації і перевірки
 # розмірів .md: початкова ініціалізація вище знімається ДО них, тому
 # критична помилка реставрації опинялася "новою" для цього етапу і
-# фарбувала його в FAIL. Реальний DEV-LIMS негативний прогін 19:48
+# фарбувала його в FAIL. Реальний HOST-11 негативний прогін 19:48
 # (bravocmd вбито -> exit 43) показав [6/8] FAIL з деталями
 # "оброблено файлів: 2" — тобто етап відпрацював, а червоним був через
 # чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.

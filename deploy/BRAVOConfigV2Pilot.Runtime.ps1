@@ -168,7 +168,7 @@ function Assert-BRAVOPilotTextSecretSafe {
     # string.") — а захоплений вивід дочірнього процесу (BRAVO_SETUP.ps1
     # тощо) майже завжди містить порожні рядки для порожніх рядків
     # консольного виводу. Відтворено й підтверджено на реальному сервері
-    # (DEV-LIMS) 2026-09-29: перший реальний прогін -Validate впав саме на
+    # (HOST-11) 2026-09-29: перший реальний прогін -Validate впав саме на
     # цьому.
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
@@ -215,7 +215,7 @@ function Write-BRAVOPilotEvidenceText {
     # відхиляє й будь-який непорожній масив із порожнім рядком-елементом
     # (звичайна річ у захопленому консольному виводі) — той самий клас
     # дефекту, що описаний вище для порожнього масиву в цілому. Відтворено
-    # й підтверджено на реальному сервері (DEV-LIMS) 2026-09-29.
+    # й підтверджено на реальному сервері (HOST-11) 2026-09-29.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -611,7 +611,7 @@ function Invoke-BRAVOPilotHealthSnapshot {
     # З 2>&1 evidence лишався порожнім, а [FAIL]/[НЕДОСТУПНО]/деградації
     # мовчки не детектувались (stub-и self-test-у використовують
     # Write-Output, тому дефект там не відтворювався). Відтворено на
-    # реальному сервері (DEV-LIMS) 2026-09-29. Write-Host у ForEach-Object
+    # реальному сервері (HOST-11) 2026-09-29. Write-Host у ForEach-Object
     # зберігає живий консольний вивід для оператора, як і раніше.
     $output = @(& $healthPath -NoPause *>&1 | ForEach-Object { $line = [string]$_; Write-Host $line; $line })
     $exitCode = Get-BRAVOPilotSafeLastExitCode
@@ -635,7 +635,7 @@ function Get-BRAVOPilotHealthDegradationLines {
     # [AllowEmptyString()] обов'язковий поруч: mandatory [string[]] окремо
     # відхиляє й будь-який непорожній масив із порожнім рядком-елементом —
     # той самий клас дефекту, що й вище; health-вивід рясніє порожніми
-    # рядками. Відтворено й підтверджено на реальному сервері (DEV-LIMS)
+    # рядками. Відтворено й підтверджено на реальному сервері (HOST-11)
     # 2026-09-29.
     param(
         [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$BeforeLines,

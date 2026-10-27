@@ -4387,7 +4387,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         }
     }
 
-    # Acceptance DEV-LIMS (2026-08-13): `[int]( if ... )` у
+    # Acceptance HOST-11 (2026-08-13): `[int]( if ... )` у
     # Invoke-BRAVOBazaIncrementalSync ВАЛІДНО парсився (if у звичайних
     # дужках — це КОМАНДА з іменем "if", не keyword) і падав лише в
     # рантаймі CommandNotFoundException на першому реальному прогоні —
@@ -4400,7 +4400,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Diagnostics/NoKeywordParsedAsCommand" `
         -Failure "statement-keyword у позиції команди (напр. if усередині (...) замість `$(...)) валідно парситься і падає ЛИШЕ в рантаймі CommandNotFoundException; знайдено: $($keywordAsCommandFindings.ToArray() -join ', ')"
 
-    # Acceptance DEV-LIMS (знахідки #3 і #5): сирий $winSCPPath (Tools\
+    # Acceptance HOST-11 (знахідки #3 і #5): сирий $winSCPPath (Tools\
     # WinSCP.com -- CLI-стаб legacy-шляхів) НЕ сміє потрапляти у
     # -WinSCPExecutablePath двигуна В ЖОДНОМУ call-site комплекту: .NET-
     # асемблі потрібен winscp.exe (пара резолвиться через
@@ -4420,7 +4420,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Diagnostics/NoRawWinSCPComPathPassedToEngine" `
         -Failure "жоден call-site не сміє передавати сирий `$winSCPPath у -WinSCPExecutablePath (WinSCP.com != winscp.exe; резолвіть пару через Get-BRAVOWinSCPDotNetComponents); знайдено: $($rawComPathFindings.ToArray() -join ', ')"
 
-    # Acceptance DEV-LIMS (2026-08-13, той самий прогін): "a{0}" + "b{3}" -f args
+    # Acceptance HOST-11 (2026-08-13, той самий прогін): "a{0}" + "b{3}" -f args
     # форматує ЛИШЕ правий рядок (-f зв'язується сильніше за +) — перша
     # половина retention-аудиту вийшла в лог з літеральними {0}/{1}/{2}.
     # Guard: жодного Plus-виразу, чий ПРАВИЙ операнд — Format (-f), а лівий
@@ -5443,12 +5443,12 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Failure "Get-HostInformation при lookupEnabled=true має намагатись отримати публічну IP (не хардкодити 'вимкнено'), доки це не вимкнено свідомо через PublicIPLookupEnabled"
 
     $notifyHostOff = [pscustomobject]@{
-        MachineName = "DEV-LIMS"
+        MachineName = "HOST-11"
         LocalIP = "192.0.2.102"
         PublicIP = "вимкнено"
     }
     $notifyHostUnavailable = [pscustomobject]@{
-        MachineName = "DEV-LIMS"
+        MachineName = "HOST-11"
         LocalIP = "192.0.2.102"
         PublicIP = "недоступна"
     }
@@ -5515,7 +5515,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     Test-BRAVOCondition -Condition ($notifySuccess.Contains("Дій не потрібно")) -Name "Notifications/SuccessUsesNoActionRequired" -Failure "SUCCESS notification має явно казати, що дія не потрібна"
     Test-BRAVOCondition -Condition ($notifyWarning.Contains("Потрібна дія: перевірити виконання BRAVO_ARCHIV")) -Name "Notifications/WarningUsesConcreteAction" -Failure "WARNING/CRITICAL notification має показувати конкретну дію"
     Test-BRAVOCondition -Condition ($notifySuccess.Contains(":office: TEST-COMPANY [1234567890]")) -Name "Notifications/InstitutionUsesOfficeEmoji" -Failure "institution line має використовувати office token"
-    Test-BRAVOCondition -Condition (-not $notifySuccess.Contains("Публічна IP") -and -not $notifySuccess.Contains("IP-адреси:") -and $notifySuccess.Contains("DEV-LIMS") -and $notifySuccess.Contains("192.0.2.102")) -Name "Notifications/DisabledPublicIpIsOmitted" -Failure "PublicIP=вимкнено не має показуватись у штатному повідомленні"
+    Test-BRAVOCondition -Condition (-not $notifySuccess.Contains("Публічна IP") -and -not $notifySuccess.Contains("IP-адреси:") -and $notifySuccess.Contains("HOST-11") -and $notifySuccess.Contains("192.0.2.102")) -Name "Notifications/DisabledPublicIpIsOmitted" -Failure "PublicIP=вимкнено не має показуватись у штатному повідомленні"
     Test-BRAVOCondition -Condition (-not $notifyUnavailable.Contains("Публічна IP")) -Name "Notifications/UnavailablePublicIpIsOmitted" -Failure "PublicIP=недоступна не має показуватись у штатному повідомленні"
     Test-BRAVOCondition -Condition ($notifyPublic.Contains("Публічна IP: 198.51.100.44") -and $notifyPublic.Contains("DATA-SERVER · 192.0.2.102 · 192.0.2.236")) -Name "Notifications/AvailablePublicIpIsShown" -Failure "valid Public IP має показуватись окремим рядком"
     Test-BRAVOCondition -Condition ($notifySuccess.Contains("Остання резервна копія:")) -Name "Notifications/HealthSuccessUsesLastBackupTerm" -Failure "Health SUCCESS має використовувати термін Остання резервна копія"
@@ -5857,7 +5857,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Condition (
             $dryRunDiscordRendered.Contains("✅ BRAVO DRY RUN — ТЕСТОВЕ СПОВІЩЕННЯ") -and
             $dryRunDiscordRendered.Contains("🏢 TEST-COMPANY [1234567890]") -and
-            $dryRunDiscordRendered.Contains("🖥️ DEV-LIMS") -and
+            $dryRunDiscordRendered.Contains("🖥️ HOST-11") -and
             -not $dryRunDiscordRendered.Contains(":white_check_mark:") -and
             -not $dryRunDiscordRendered.Contains(":office:") -and
             -not $dryRunDiscordRendered.Contains(":desktop_computer:")
@@ -8491,7 +8491,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Health/GenericEnvironmentFailureClassification" `
         -Failure "IOException (диск повний тощо) НЕ повинен класифікуватися як privilege-відмова"
 
-    # --- Компактні операторські сповіщення (запит оператора, DEV-LIMS
+    # --- Компактні операторські сповіщення (запит оператора, HOST-11
     # 2026-08-21): watchdog-issue несе ВЛАСНИЙ ActionText (Component там —
     # опис події, і шаблон «запустити або перевірити службу <Component>»
     # давав зламану фразу «...службу Служби після аварії BRAVO_...»);
@@ -8540,7 +8540,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # містити 8.3-коротку форму профілю (C:\Users\E980D~1.KUC\...), а
     # Remove-Item -LiteralPath у PS 5.1 падає на короткому сегменті з
     # PSArgumentException «object at the specified path does not exist»
-    # (реальний випадок: DEV-LIMS, Server 2022). GetTempPath повертає
+    # (реальний випадок: HOST-11, Server 2022). GetTempPath повертає
     # нормалізовану довгу форму.
     $preflightWritableDir = Join-Path ([IO.Path]::GetTempPath()) (
         "bravo_selftest_preflight_{0}" -f ([guid]::NewGuid().ToString("N"))
@@ -27272,7 +27272,7 @@ function Get-BRAVOMaintenanceSummaryResult {
 
     # ================================================================
     # dev.16: Remove-OldRestoreArchives — scalar .Count під Set-StrictMode.
-    # Реальний DEV-LIMS acceptance-прогін dev.15 підтвердив [1/8]..[8/8]/
+    # Реальний HOST-11 acceptance-прогін dev.15 підтвердив [1/8]..[8/8]/
     # Restore SKIPPED/Range ID single render/final summary before pause —
     # усе PASS, але після [8/8] cleanup кинув "The property 'Count' cannot
     # be found on this object": під PowerShell 5.1 + Set-StrictMode
@@ -27281,7 +27281,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # один. dev.15 fail-safe catch перетворив це на exit 60 і все одно
     # показав summary — правильно, але сам виняток лишався. Тести нижче —
     # РЕАЛЬНА функція (ізольована AST-екстракція), синтетичний TEMP-каталог
-    # (НЕ production DEV-LIMS), справжній Set-StrictMode -Version Latest
+    # (НЕ production HOST-11), справжній Set-StrictMode -Version Latest
     # усередині виклику — відтворення точної причини, не симуляція.
     # ================================================================
     $restoreCleanupModule = New-BRAVOSelfTestRuntimeModule `
@@ -29333,7 +29333,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     # Write-BRAVOMaintenanceOperation, не Write-BRAVOMaintenanceStep.
     # Обгортка навколо Write-BRAVOOperationResult (BRAVO.Console): той самий
     # консольний рендер БЕЗ [N/8], але з обліком у StepLog/лічильниках —
-    # без нього реальний DEV-LIMS прогін показував "Помилок: 0" при FAIL
+    # без нього реальний HOST-11 прогін показував "Помилок: 0" при FAIL
     # ненумерованої операції Trace і "✅ Trace" у Discord.
     foreach ($unnumberedOp in @(
         @{ Name = 'Міграція старих журналів'; TestName = 'Maintenance/MigrationOperationResultIsUnnumbered' },
@@ -29399,7 +29399,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Maintenance/UnnumberedOperationsDoNotChangeStepCounters" `
         -Failure "Write-BRAVOOperationResult (будь-який статус) не повинен змінювати BRAVOMaintenanceStepCurrent/OkCount/WarnCount/SkippedCount/FailCount"
 
-    # --- РЕГРЕСІЯ (реальний DEV-LIMS прогін 19:26, exit 60): ненумерована
+    # --- РЕГРЕСІЯ (реальний HOST-11 прогін 19:26, exit 60): ненумерована
     # операція "Trace: добовий архів і SFTP" впала, а підсумковий блок
     # показав "Помилок: 0" і Discord показав "✅ Trace" — бо рендер ішов
     # прямо через Write-BRAVOOperationResult (BRAVO.Console), який не веде
@@ -29439,7 +29439,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
             $maintenanceOperationAccounting.Current, $maintenanceOperationAccounting.Ok, $maintenanceOperationAccounting.Fail,
             $maintenanceOperationAccounting.LogCount, $maintenanceOperationAccounting.TraceStatus, $maintenanceOperationAccounting.CleanupStatus)
 
-    # --- РЕГРЕСІЯ (реальний DEV-LIMS прогін 20:29, exit 10): -ForceRestore
+    # --- РЕГРЕСІЯ (реальний HOST-11 прогін 20:29, exit 10): -ForceRestore
     # поза вікном логувався як WARNING, тому інкрементував BRAVOWarningCount
     # -> severity сповіщення WARNING -> оператор бачив жовте "ПОТРІБНА ДІЯ:
     # перевірити журнал" при повністю зеленому списку етапів. Це констатація
@@ -29472,7 +29472,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Maintenance/RestoreWindowSkipsAreInfoNotWarning" `
         -Failure "обидві гілки поза вікном ('Примусова реставрація...' і 'Реставрацію пропущено...') мають логуватись як INFO — слот не втрачається (нічний Maintenance/boot-Recovery), а WARNING давав хибне «ПОТРІБНА ДІЯ» з exit 10 при зеленому прогоні (Лабораторія-12 2026-08-26)"
 
-    # --- РЕГРЕСІЯ (реальний DEV-LIMS прогін 20:29): підсумок показав
+    # --- РЕГРЕСІЯ (реальний HOST-11 прогін 20:29): підсумок показав
     # "Кроків: 8" при "Успішно: 9" + "Пропущено: 4" — арифметично
     # неспроможно, бо "Кроків" брався з нумератора [N/8], а решта лічильників
     # уже враховувала ненумеровані операції. Сума OK+WARN+SKIPPED+FAIL має
@@ -29496,7 +29496,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("підсумкове 'Кроків' має братися з BRAVOMaintenanceStepLog.Count (а не з нумератора [N/8]), інакше воно не дорівнює сумі Успішно+Попереджень+Пропущено+Помилок; факт: Log={0} Сума={1}" -f
             $maintenanceSummaryTotals.LogCount, $maintenanceSummaryTotals.Sum)
 
-    # --- РЕГРЕСІЯ (реальний DEV-LIMS негативний прогін 19:48, exit 43):
+    # --- РЕГРЕСІЯ (реальний HOST-11 негативний прогін 19:48, exit 43):
     # зріз лічильників етапу логів знімався ДО реставрації, тому критична
     # помилка реставрації робила [6/8] "Обробка trace і логів" червоним,
     # хоча етап відпрацював ("оброблено файлів: 2"). Зріз мусить братися
@@ -30361,7 +30361,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $normalizedOutput }
     }
 
-    # РЕГРЕСІЯ (DEV-LIMS, 2026-08-21): site-config 5.0/5.1 БЕЗ
+    # РЕГРЕСІЯ (HOST-11, 2026-08-21): site-config 5.0/5.1 БЕЗ
     # Restore.BootRestoreMode (лише застарілий RunMissedOnStartup) валив
     # BRAVO_TASKS_INSTALL під StrictMode ("property 'BootRestoreMode'
     # cannot be found") усупереч обіцянці loader-а «застарілий ключ
@@ -32627,7 +32627,7 @@ function Write-BRAVOLog {
 
     # --- Archive: dev.18 — очищення старих журналів мігрувало на numbered
     # Write-BRAVOArchiveStep (раніше unnumbered Write-BRAVOOperationResult
-    # — реальний DEV-LIMS вивід показав цю операцію поза [N/TOTAL]).
+    # — реальний HOST-11 вивід показав цю операцію поза [N/TOTAL]).
     $archiveLogCleanupIndex = $archiveScriptText.IndexOf('-Name ''Очищення старих журналів''')
     $archiveLogCleanupWindow = if ($archiveLogCleanupIndex -ge 0) {
         $archiveScriptText.Substring([Math]::Max(0, $archiveLogCleanupIndex - 400), [Math]::Min(1000, $archiveScriptText.Length - [Math]::Max(0, $archiveLogCleanupIndex - 400)))
@@ -33024,7 +33024,7 @@ function Write-BRAVOLog {
         -Failure 'SuppressHeader має приглушувати і План перевірок, і стандалон-підсумок (Write-BRAVOResultHeader); $script:BRAVOHealthSftpStepEnabled — той самий сигнал для обох (нового split-гейту й старого summary-footer)'
 
     #####################################################################
-    # dev.17: реальний DEV-LIMS acceptance (generation 20260810_185725) —
+    # dev.17: реальний HOST-11 acceptance (generation 20260810_185725) —
     # Get-BRAVOHealthLatestBackupSummary.TimestampText показував UTC як
     # локальний час (15:57 замість фактичних 18:57), хоча AgeText (той
     # самий summary, той самий $healthCheckStartedUtc) рахувався правильно.
@@ -33044,7 +33044,7 @@ function Write-BRAVOLog {
             'Format-BRAVOOperatorStatusLine'
         )
     $latestBackupSummaryProbe = & $latestBackupSummaryModule {
-        # Ті самі числа, що реальний DEV-LIMS acceptance: generation
+        # Ті самі числа, що реальний HOST-11 acceptance: generation
         # 20260810_185725, backup 18:57 local (== 15:57 UTC на UTC+3
         # сервері), Health-перевірка о 19:02:55 local (== 16:02:55 UTC).
         # SpecifyKind, а не залежність від timezone тестового runner-а —
@@ -33075,7 +33075,7 @@ function Write-BRAVOLog {
             # від джерела — детерміновано в будь-якій timezone тестового
             # runner-а (не hardcode ніякого конкретного offset/рядка):
             # якщо джерело справді конвертує, обидва значення завжди
-            # збігаються, хоч би яка timezone була в CI/DEV-LIMS/локально.
+            # збігаються, хоч би яка timezone була в CI/HOST-11/локально.
             ExpectedLocalText = $simulatedBackupUtc.ToLocalTime().ToString('dd.MM.yyyy HH:mm')
             # AgeText — чиста UTC-минус-UTC арифметика (не залежить від
             # timezone runner-а за визначенням), обчислена тут із тих
@@ -33093,7 +33093,7 @@ function Write-BRAVOLog {
             -not $healthScriptText.Contains('TimestampText = $latestTimestamp.ToString(')
         ) `
         -Name 'Health/LatestBackupTimestampRendersLocalTime' `
-        -Failure 'Get-BRAVOHealthLatestBackupSummary.TimestampText має форматуватися ПІСЛЯ .ToLocalTime() — інакше оператор бачить внутрішній UTC як локальний час сервера (реальний DEV-LIMS acceptance: generation 18:57 local показувалась як 15:57); production Timestamp/Kind не повинні мутуватися'
+        -Failure 'Get-BRAVOHealthLatestBackupSummary.TimestampText має форматуватися ПІСЛЯ .ToLocalTime() — інакше оператор бачить внутрішній UTC як локальний час сервера (реальний HOST-11 acceptance: generation 18:57 local показувалась як 15:57); production Timestamp/Kind не повинні мутуватися'
 
     Test-BRAVOCondition `
         -Condition (
@@ -33122,7 +33122,7 @@ function Write-BRAVOLog {
         -Failure 'success- і problem-повідомлення мають отримувати TimestampText з ОДНОГО виклику Get-BRAVOHealthLatestBackupSummary; .ToLocalTime() має існувати рівно в ОДНІЙ точці джерела (не дубльований у двох message builders)'
 
     #####################################################################
-    # dev.18: реальний DEV-LIMS ручний BRAVO_ARCHIV прогін виявив три
+    # dev.18: реальний HOST-11 ручний BRAVO_ARCHIV прогін виявив три
     # пов'язані дефекти operator-flow/observability: (1) MANUAL-консоль
     # закривалась без паузи через IsInputRedirected; (2) очищення
     # журналів/backup generation рендерились ПОЗА канонічною [N/M]
@@ -33366,7 +33366,7 @@ function Write-BRAVOLog {
         -Failure '"=== ЗАГОЛОВОК ===" записи мають і надалі писатись у журнал повним текстом — незмінено'
 
     #####################################################################
-    # dev.19: два реальні DEV-LIMS acceptance-прогони виявили чотири
+    # dev.19: два реальні HOST-11 acceptance-прогони виявили чотири
     # окремі observability/correctness дефекти: (1) Maintenance фінальний
     # людський статус (ЛОГ/консоль/success-notification) ігнорував
     # $script:BRAVOWarningCount і завжди показував "УСПІШНО", навіть коли
@@ -33417,7 +33417,7 @@ function Write-BRAVOLog {
             (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 10 }).Color -eq [ConsoleColor]::Yellow
         ) `
         -Name 'Maintenance/Exit10RendersSuccessWithWarnings' `
-        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 10 (SuccessWithWarnings) має повертати Text='УСПІШНО З ПОПЕРЕДЖЕННЯМИ'/Color=Yellow — реальний DEV-LIMS запуск (LastTaskResult=10, відсутній Range ID log) раніше показував 'УСПІШНО' без жодної згадки про попередження"
+        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 10 (SuccessWithWarnings) має повертати Text='УСПІШНО З ПОПЕРЕДЖЕННЯМИ'/Color=Yellow — реальний HOST-11 запуск (LastTaskResult=10, відсутній Range ID log) раніше показував 'УСПІШНО' без жодної згадки про попередження"
 
     Test-BRAVOCondition `
         -Condition (
@@ -33871,7 +33871,7 @@ function Write-BRAVOLog {
     # Група 2 — Maintenance: голий "==="-роздільник більше не пише
     # окремий рядок у журнал (та сама ідея, що Archive dev.18, але
     # Maintenance має власну, окрему реалізацію Write-Log/SeparatorLength
-    # — реальний DEV-LIMS лог показував рядки зі 100 символами "=" між
+    # — реальний HOST-11 лог показував рядки зі 100 символами "=" між
     # звичайними секціями).
     # ================================================================
     $maintenanceBareLogSeparatorBranchMatch = [regex]::Match(
@@ -33885,7 +33885,7 @@ function Write-BRAVOLog {
             $maintenanceBareLogSeparatorBranchText.Contains('return')
         ) `
         -Name 'Maintenance/SectionSeparatorsDoNotEmitBareLogRecords' `
-        -Failure 'голий роздільник "==="/"=" у Maintenance Write-Log має лише return, без Write-BRAVOMaintenanceLogFile — реальний DEV-LIMS лог показував рядки зі 100 символами "=" між звичайними секціями без жодної діагностичної цінності'
+        -Failure 'голий роздільник "==="/"=" у Maintenance Write-Log має лише return, без Write-BRAVOMaintenanceLogFile — реальний HOST-11 лог показував рядки зі 100 символами "=" між звичайними секціями без жодної діагностичної цінності'
 
     # #314 (хвиля 2): заголовки обробки trace/exchangAPI пише винесений цикл
     # служб (BRAVO.Maintenance.ServiceCycle.ps1), dot-source-нутий у scope
@@ -34112,7 +34112,7 @@ function Write-BRAVOLog {
             $archiveHashHeadingCallAst.Extent.StartOffset -lt $archiveHashWorkCallAst.Extent.StartOffset
         ) `
         -Name 'Archive/HashHeadingPrecedesHashWork' `
-        -Failure '"=== СТВОРЕННЯ ХЕШУ ... ===" має друкуватись ДО першого виклику New-SHA512Hash всередині Invoke-BRAVOComponentBackup — реальний DEV-LIMS лог показував заголовок ПІСЛЯ вже виконаної роботи (заголовок друкувався в Main, після повного завершення виклику)'
+        -Failure '"=== СТВОРЕННЯ ХЕШУ ... ===" має друкуватись ДО першого виклику New-SHA512Hash всередині Invoke-BRAVOComponentBackup — реальний HOST-11 лог показував заголовок ПІСЛЯ вже виконаної роботи (заголовок друкувався в Main, після повного завершення виклику)'
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance.CompletedLinesShowSkippedRestoreWithReason' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' -DependsOn 'Root/Maintenance.CompletedLinesShowSkippedRestoreWithReason') { try {
 
@@ -34258,7 +34258,7 @@ function Write-BRAVOLog {
     # RestoreSynthetic: наскрізний синтетичний тест відкату — справжній
     # tools\7za.exe (архів + цілісність + екстракція) на синтетичній моделі,
     # SHA256-верифікація відновлення, fail-closed на пошкодженому/відсутньому
-    # архіві. Приймальну перевірку на DEV-LIMS не замінює.
+    # архіві. Приймальну перевірку на HOST-11 не замінює.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'RestoreSynthetic') {
         Enter-BRAVOSelfTestSuite -Name 'RestoreSynthetic'
         if (Enter-BRAVOSelfTestSection -Name 'Suite/RestoreSynthetic') { try {
