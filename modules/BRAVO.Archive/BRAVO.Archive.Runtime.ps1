@@ -873,7 +873,7 @@ function Write-Log {
     # Роздільники й заголовки формували структуру старої консолі. Тепер її
     # задають етапи (Write-BRAVOStepResult), тому в консоль вони не йдуть.
     # dev.18: голий роздільник "==="/"=" БІЛЬШЕ НЕ пише окремий запис у
-    # журнал. Реальний DEV-LIMS лог показав структуровані записи з
+    # журнал. Реальний HOST-11 лог показав структуровані записи з
     # timestamp/level/component, але порожнім Message — саме цей виклик
     # (кожен голий "===" стоїть безпосередньо перед "=== ЗАГОЛОВОК ===",
     # який і так фіксує ту саму мить і компонент повноцінним текстом;
@@ -1812,7 +1812,7 @@ function Remove-BRAVOExpiredBackupGenerations {
         # причиною. Доповнює вже наявні per-deletion рядки вище, не замінює.
         # Внутрішні дужки навколо конкатенації обов'язкові: -f зв'язується
         # сильніше за +, тому без них форматувався ЛИШЕ другий рядок — в
-        # операторському лозі DEV-LIMS перша половина вийшла з літеральними
+        # операторському лозі HOST-11 перша половина вийшла з літеральними
         # "{0}/{1}/{2}" (діагностика без чисел, помічено на acceptance).
         Write-BRAVOLog -Component 'CLEANUP' -Message (
             ("Аудит retention: generation оцінено={0}; захищено (verified)={1} [{2}]; " +
@@ -2535,7 +2535,7 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     # (NN-DD.MM.YYYY-HH_--_HOSTNAME.cab) у ПОТОЧНИЙ РОБОЧИЙ КАТАЛОГ
     # процесу — для планової задачі це каталог комплекту, і файли
     # накопичувались у C:\Program Files\BRAVO-Toolkit з кожної
-    # багатотомної архівації (реальний звіт SERVER-01/Тернопіль
+    # багатотомної архівації (реальний звіт SERVER-01/SITE-D
     # 2026-08-26). BRAVO ці метадані не використовує (контекст
     # NOWRITERS), тому файл спрямовується в TEMP і прибирається у finally
     # разом зі сценарієм.
@@ -3569,7 +3569,7 @@ function Invoke-BRAVOComponentBackup {
         # dev.19: заголовок секції HASH — САМЕ ТУТ, безпосередньо перед
         # першою дією хешування (New-SHA512Hash нижче), а не в Main ПІСЛЯ
         # завершення всього Invoke-BRAVOComponentBackup (де раніше стояв
-        # Write-Log "=== СТВОРЕННЯ ХЕШУ ===" — реальний DEV-LIMS лог
+        # Write-Log "=== СТВОРЕННЯ ХЕШУ ===" — реальний HOST-11 лог
         # показував заголовок ПІСЛЯ вже виконаної роботи). Той самий
         # Write-Log (не окрема реалізація), тому Resolve-BRAVOLogComponentFromHeader
         # так само переводить $script:BRAVOLogComponent на HASH. Друкується
@@ -5414,7 +5414,7 @@ exit
 }
 
 function New-BRAVOBazaArchiveFullAuditProvider {
-    # Acceptance DEV-LIMS blocker #4 (2026-08-13): на Windows PowerShell 5.1
+    # Acceptance HOST-11 blocker #4 (2026-08-13): на Windows PowerShell 5.1
     # .GetNewClosure() прив'язує scriptblock до НОВОГО dynamic module —
     # захоплені ЗМІННІ копіюються, але command-lookup приватних функцій
     # цього runtime (Get-BAZASFTPComparison — script-scope, не exported)
@@ -5506,7 +5506,7 @@ function Invoke-BRAVOBazaIncrementalSync {
     # $(...), не (...): усередині звичайних дужок if парситься як КОМАНДА
     # з іменем "if" (валідно для парсера!) і падає лише в рантаймі
     # CommandNotFoundException — саме так упав перший реальний прогін
-    # BRAVO_ARCHIV на DEV-LIMS (SFTP acceptance, сценарій 1). Guard на цей
+    # BRAVO_ARCHIV на HOST-11 (SFTP acceptance, сценарій 1). Guard на цей
     # клас: Diagnostics/NoKeywordParsedAsCommand у BRAVO_SELF_TEST.
     $operationTimeoutSeconds = [int]$(
         if ([int]$backupMonitoring.SFTP.SynchronizationTimeoutSeconds -gt 0) {
@@ -5516,7 +5516,7 @@ function Invoke-BRAVOBazaIncrementalSync {
         }
     )
 
-    # Acceptance DEV-LIMS (2026-08-13): .NET-асемблі потрібен winscp.exe,
+    # Acceptance HOST-11 (2026-08-13): .NET-асемблі потрібен winscp.exe,
     # а $winSCPPath комплекту — це Tools\WinSCP.com (CLI-стаб для
     # legacy-шляхів): із ним Session.Open зависав на інтерактивному
     # промпті "winscp>" (CPU~0, лог мовчить). Резолвимо ТУ САМУ пару
@@ -6889,7 +6889,7 @@ function Main {
     }
 
     # dev.18: numbered [N/TOTAL] крок (Write-BRAVOArchiveStep) — раніше
-    # unnumbered Write-BRAVOOperationResult; реальний DEV-LIMS вивід
+    # unnumbered Write-BRAVOOperationResult; реальний HOST-11 вивід
     # показав цю операцію ПОЗА канонічною нумерацією, хоча вона реально
     # виконується щоразу. Позиція виклику (до "Перевірка середовища")
     # не змінена — той самий порядок виконання, лише інший renderer.

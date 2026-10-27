@@ -155,7 +155,7 @@ BRAVO exit code та native tool exit code не змішуються.
 ============================================================
  BRAVO Archive <packageVersion>
  TEST-COMPANY [1234567890]
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: MANUAL
 ============================================================
 
@@ -200,7 +200,7 @@ BRAVO exit code та native tool exit code не змішуються.
 ============================================================
  BRAVO Archive <packageVersion>
  TEST-COMPANY [1234567890]
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: MANUAL
 ============================================================
 
@@ -252,7 +252,7 @@ BRAVO exit code та native tool exit code не змішуються.
 ============================================================
  BRAVO Archive <packageVersion>
  TEST-COMPANY [1234567890]
- WIN-44OBNQ3R3OB
+ HOST-13
  Режим: MANUAL
 ============================================================
 

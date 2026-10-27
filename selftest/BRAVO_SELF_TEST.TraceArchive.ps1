@@ -271,7 +271,7 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             [string]$taSendSession.State.LastResumeSupportState -eq 'On'
         ) -Name 'TraceArchive/SftpPublishGoesThroughVerifiedTempName' -Failure "успішна публікація: передача у .new (Resume=On), verify, звільнення старої версії, rename, фінальний розмір 300/140; факт: $($taSendResult.Error)"
 
-        # --- РЕГРЕСІЯ (реальний DEV-LIMS): remote-каталог /trace/ не існував,
+        # --- РЕГРЕСІЯ (реальний HOST-11): remote-каталог /trace/ не існував,
         # session.PutFiles його НЕ створює, і кожен прогін падав із
         # "Cannot create remote file '/trace/....new.filepart'. No such file
         # or directory" -> exit 60 обслуговування, яке відпрацювало. Каталог

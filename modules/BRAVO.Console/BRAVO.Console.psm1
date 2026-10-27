@@ -908,7 +908,7 @@ function Write-BRAVOResultFooter {
 #   3. [Environment]::UserInteractive — false в сесії 0 (SYSTEM-завдання
 #      "Run whether user is logged on or not").
 # dev.18: [Console]::IsInputRedirected навмисно БІЛЬШЕ НЕ окрема
-# самостійна причина пропустити паузу. Реальний ручний DEV-LIMS запуск
+# самостійна причина пропустити паузу. Реальний ручний HOST-11 запуск
 # (заголовок MANUAL, справжня консоль оператора) показав
 # IsInputRedirected=true — і вікно мовчки закривалось одразу після
 # РЕЗУЛЬТАТ, хоча RawUI.ReadKey нижче спрацював би штатно.
