@@ -162,6 +162,23 @@ if ([string]$stagedVersion.packageVersion -ne $packageVersion) {
     throw "packageVersion у розпакованому комплекті ('$($stagedVersion.packageVersion)') не збігається з '$packageVersion'."
 }
 
+# --- 3-pre. Гейт AGENT_FILES_IN_ARTIFACT: у продуктовому комплекті немає ---
+#     файлів AI-агентів (.claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json) ---
+#
+# Перевірка на РЕАЛЬНОМУ розпакованому дереві (режим файлової системи, разом
+# із порожніми й прихованими каталогами); політика - єдина канонічна
+# реалізація в ci\BRAVOAgentFilePolicy.ps1, її ж застосовує self-test
+# Governance/NoAgentFilesInTree.*. Стоїть ДО перевірки манифестів і запису
+# release-manifest.json: артефакт із такими файлами не публікується.
+. (Join-Path $PSScriptRoot 'BRAVOAgentFilePolicy.ps1')
+$agentFileViolations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath (Get-BRAVOAgentFilePolicyTreePath -Root $stagingDir))
+if ($agentFileViolations.Count -gt 0) {
+    throw ("AGENT_FILES_IN_ARTIFACT: у комплекті артефакту знайдено файли/каталоги AI-агентів (" + $agentFileViolations.Count + "): " +
+        ([string]::Join(', ', ($agentFileViolations | Select-Object -First 10))) +
+        ". Продуктове дерево не повинно містити .claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json - приберіть їх з git-індексу ref '$Ref'.")
+}
+Write-Host 'Гейт AGENT_FILES_IN_ARTIFACT (AI-агенти): у staged-комплекті немає файлів AI-агентів (.claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json).'
+
 Push-Location $stagingDir
 try {
     & .\ci\Update-BRAVOToolsManifest.ps1

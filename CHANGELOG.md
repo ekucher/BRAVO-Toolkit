@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Security: guard проти повернення файлів AI-агентів у продуктове дерево.**
+  Нова канонічна політика `ci/BRAVOAgentFilePolicy.ps1` позначає (без урахування регістру, на будь-якій глибині)
+  каталоги `.claude` і `.codex` та файли `AGENTS.md`, `CLAUDE.md`, `.mcp.json`; схожі імена
+  (`CLAUDE.md.example`, `my.claude/x`, `docs/agents/...`) не збігаються. Застосовується у двох місцях: self-test
+  `Governance/NoAgentFilesInTree.*` (корінь є верхом git work tree - перевіряється git-індекс, збій git є FAIL;
+  інакше, зокрема у встановленому комплекті без git, - файлова система) і гейт `AGENT_FILES_IN_ARTIFACT` у
+  `ci/New-BRAVOReleaseArtifact.ps1` (перевірка розпакованого staging до манифестів; збірка падає зі списком до 10
+  шляхів). `RUNTIME_MANIFEST.json` перегенеровано штатним скриптом.
+
 - **Fix: Archive: retention видаляв прострочену неперевірену COMPLETE generation, коли перевірених копій менше за мінімум (#335).**
   COMPLETE generation, яку через транзієнтну помилку читання (ACL, зайнятий файл) не вдалося перевірити, не
   потрапляла до захищених і видалялась за віком. Якщо перевірених копій менше за `minimumRetainedVerifiedBackups`,
