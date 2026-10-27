@@ -183,7 +183,7 @@ $taskInstallerText = [IO.File]::ReadAllText(
         ) `
         -Name "ConsoleUX/12-NoPauseSkipsWait" `
         -Failure "Wait-BRAVOManualExit має негайно повертатись при -NoPause"
-    # dev.18: реальний DEV-LIMS ручний (MANUAL) запуск довів, що
+    # dev.18: реальний HOST-11 ручний (MANUAL) запуск довів, що
     # [Console]::IsInputRedirected сам по собі помилково відхиляв
     # справжню операторську консоль ДО спроби RawUI.ReadKey — вікно
     # закривалось одразу після РЕЗУЛЬТАТ замість очікування. Тепер

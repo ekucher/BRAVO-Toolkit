@@ -3023,7 +3023,7 @@ function Get-SFTPHealthIssues {
         return @()
     }
 
-    # 5.2.1 (реальний алерт SERV_HRDL_1 23:03): активний WinSCP.com іншої
+    # 5.2.1 (реальний алерт HOST-14 23:03): активний WinSCP.com іншої
     # BRAVO-операції (паралельна передача/затяжна синхронізація) робив
     # SFTP-перевірку CRITICAL «ПОТРІБНА ДІЯ», хоча це transient-конкуренція,
     # а не збій SFTP. Тепер зайнятий WinSCP = ВІДКЛАДЕННЯ: WARNING у лозі
@@ -3267,7 +3267,7 @@ function Get-SFTPHealthIssues {
                 $bazaSyncResult = $script:bazaSyncResults[$folderCheck.ComponentKey]
             }
             if ($null -eq $bazaSyncResult) {
-                # Acceptance DEV-LIMS (2026-08-13, знахідка #5): .NET-асемблі
+                # Acceptance HOST-11 (2026-08-13, знахідка #5): .NET-асемблі
                 # потрібен winscp.exe, а $winSCPPath — це Tools\WinSCP.com;
                 # цей fallback-шлях зазвичай не виконується (Health
                 # переви­користовує SyncResult від Archive), тому дефект
@@ -3949,7 +3949,7 @@ function Get-BRAVOHealthLatestBackupSummary {
     # правильно рахується у UTC-арифметиці й лишається незмінним. Але
     # human-facing TimestampText раніше форматував це саме UTC-значення
     # напряму — оператор бачив UTC замість локального часу сервера
-    # (реальний DEV-LIMS acceptance: generation 18:57 local показувалась
+    # (реальний HOST-11 acceptance: generation 18:57 local показувалась
     # як 15:57). Конвертація в локальний час сервера — єдина зміна:
     # внутрішня модель лишається UTC, сама конвертація відбувається лише
     # тут, у presentation layer, в ОДНІЙ спільній точці для обох
@@ -4037,7 +4037,7 @@ function New-SlackAlertMessage {
         "BRAVO BACKUP — ПОТРІБНА ДІЯ"
     }
     $latestBackup = Get-BRAVOHealthLatestBackupSummary
-    # Компактність (запит оператора, DEV-LIMS 2026-08-21): повний Reason
+    # Компактність (запит оператора, HOST-11 2026-08-21): повний Reason
     # з'являється в повідомленні РІВНО ОДИН РАЗ — у тематичній секції нижче.
     # Шапка причин — лише перелік проблемних компонентів одним рядком
     # (до 4 імен, далі «та ще N»); раніше сюди дублювався повний текст
@@ -4693,7 +4693,7 @@ if ($SkipIfBackupTaskRunning) {
     # 5.2.1: BAZASync (BRAVO_ARCHIV -SyncBAZA, кожні 4 год о :00) на
     # реальних серверах тримає lock архівації ~16-17 хв і систематично
     # накривав слот Health :15 — КОЖЕН денний health-прогін відкладався без
-    # повтору (доведено логами ДНДІЛДВСЕ 25-27.08.2026). Замість негайного
+    # повтору (доведено логами SITE-A 25-27.08.2026). Замість негайного
     # відкладення Health обмежено чекає звільнення архівації
     # (schedulerSettings.Health.BusyWaitMinutes, loader-дефолт 60 хв;
     # 0 = стара поведінка) і лише після вичерпання ліміту відкладається

@@ -1,4 +1,4 @@
-# BRAVO 5.2.5 — архівація, обслуговування та контроль резервних копій
+# BRAVO 5.2.6-rc.1 — архівація, обслуговування та контроль резервних копій
 
 Цей комплект автоматизує:
 
@@ -1371,7 +1371,7 @@ technical evidence stays in the referenced log file.
 - 🚨 CRITICAL: backup, integrity, credentials or maintenance safety is at
   risk, with the reason and action at the top.
 
-Host information is compact: `🖥️ SERVER · 10.10.150.102`. Public IP is shown
+Host information is compact: `🖥️ SERVER · 10.0.0.10`. Public IP is shown
 only when lookup is enabled and a valid address is returned. Institution lines
 use `🏢`.
 

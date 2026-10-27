@@ -552,7 +552,7 @@ Warning reminder: рідше або disabled
 ✅ BRAVO — СТАН СИСТЕМИ
 
 🏢 TEST-COMPANY [1234567890]
-🖥 DEV-LIMS
+🖥 HOST-11
 
 Система
 Windows Server 2022

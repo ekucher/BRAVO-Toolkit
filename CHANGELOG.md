@@ -1,5 +1,18 @@
 # Changelog
 
+## 5.2.6-rc.1 — 2026-10-27
+
+Hotfix від stable `5.2.5` (RELEASE_POLICY §12) за рішенням власника D7: лише знеособлення реальних ідентифікаторів
+майданчиків у пакеті. Функціональних runtime-змін немає: у `modules/*`, `BRAVO.config`, `BRAVO_CONFIG_LOADER.ps1`
+змінено лише коментарі; `ModuleVersion` модулів піднято до базової версії `5.2.6`; `configSchemaVersion` і
+`stateSchemaVersion` не змінено.
+
+- Документи пакета, коментарі коду, fixture і перевірки self-test: назви установ замінено на `SITE-A`…`SITE-F`,
+  імена хостів — на `HOST-11`…`HOST-15`, код ЄДРПОУ — на `00000000`, IP-адреси — на приватні та RFC 5737.
+- `ci/Test-BRAVOForbiddenPattern.ps1`: guard повторного потрапляння знеособлених значень (за SHA-256 токенів, зокрема
+  всередині складених токенів і в UTF-16-файлах); self-test `StaticAnalysis/SiteIdentifierGuard[*]`.
+- Опубліковані теги й Release `5.2.4`, `5.2.5` не змінювались.
+
 ## 5.2.5 — 2026-10-26
 
 Stable promotion від прийнятого `5.2.5-rc.8` (тег `v5.2.5-rc.8`, коміт-stamp `8aacaac`, sourceCommit `36541ea`) —
@@ -320,7 +333,7 @@ Hotfix від stable `5.2.4` (RELEASE_POLICY §12).
 ## 5.2.4 — 2026-09-13
 
 Stable promotion від прийнятого `5.2.4-rc.1` (нижче) — real-server acceptance
-на `LIMS-TOP` (ВІННИЦЬКА ФВЛ [38511934]). Зведені докази —
+на `HOST-12` (SITE-C [00000000]). Зведені докази —
 `docs/BRAVO_524_RC1_ACCEPTANCE_EVIDENCE_20260913.md`.
 
 Промоція лише метаданих: жодної функціональної runtime-зміни відносно
@@ -376,7 +389,7 @@ Hotfix-кандидат до 5.2.3. Одна змістовна зміна: **`M
 ### Що було не так
 
 5.2.3 перетворила поріг вільного місця з захисту здоров'я тому на гейт
-операції. Наслідок відтворений на `LIMS-TOP` 13.09.2026: 715.46 GB
+операції. Наслідок відтворений на `HOST-12` 13.09.2026: 715.46 GB
 вільного, розрахункова потреба 0.0686 GB — і `exit 40`, бо поріг стояв
 вище за вільне місце.
 
@@ -433,7 +446,7 @@ Real-server acceptance (`RELEASE_POLICY.md` §9) — окремий крок,
 ## 5.2.3 — 2026-09-13
 
 Stable promotion від прийнятого `5.2.3-rc.6` (нижче) — real-server acceptance
-на `LIMS-TOP` (ВІННИЦЬКА ФВЛ [38511934]), де раніше провалився rc.3. Усі
+на `HOST-12` (SITE-C [00000000]), де раніше провалився rc.3. Усі
 обов'язкові перевірки `RELEASE_POLICY.md` §9.1 закриті; зведені докази —
 `docs/BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md`.
 
@@ -483,7 +496,7 @@ RUNTIME_MANIFEST.json регенеровано. Жодних функціона�
 механізмом; за основу взято лінію з підтвердженням (CI + real-server), а з
 локальної перенесено те, чого в ній не було — fixture-банери самотесту
 (`43b6f04`) і `Reason` для dead-code access-гілки. Деталі — коміт `460df95`.
-Кандидат після **FAIL acceptance rc.3** на `LIMS-TOP` (ВІННИЦЬКА ФВЛ,
+Кандидат після **FAIL acceptance rc.3** на `HOST-12` (SITE-C,
 13.09.2026). Три фікси; production-логіку зачіпає лише перший.
 
 - **FIX (disk-space, production):** health-only гілка
@@ -519,7 +532,7 @@ RUNTIME_MANIFEST.json регенеровано. Жодних функціона�
   `BRAVO.config` належить рівно BAZASync і є ASCII (не залежить від кодової
   сторінки консолі).
 
-### Acceptance rc.3 — FAIL (13.09.2026, `LIMS-TOP`)
+### Acceptance rc.3 — FAIL (13.09.2026, `HOST-12`)
 
 - Archive і Maintenance відпрацювали функціонально без помилок (3 з 3
   архівів, VSS, SHA512, SFTP 7/7, BAZA APP, exchangAPI, health 0 errors),
@@ -529,7 +542,7 @@ RUNTIME_MANIFEST.json регенеровано. Жодних функціона�
   (`Scheduler/BazaSyncTaskSkippedWhenSftpGloballyDisabled`).
 
 Перевірено після фіксів: CI зелений на `1855891` (усі 5 задач, включно з
-повним self-test і DataRestore matrix), self-test на `LIMS-TOP` —
+повним self-test і DataRestore matrix), self-test на `HOST-12` —
 **1535 PASS / 0 FAIL** (03:01, 13.09.2026), тобто на машині, де завдання
 BAZASync зареєстроване й де обидві знахідки відтворювались.
 
@@ -560,7 +573,7 @@ Real-server acceptance rc.4 (`RELEASE_POLICY.md` §9) — окремий кро�
 ## 5.2.3-rc.3 — 2026-09-02
 
 Hotfix-кандидат: rc.2 + fixture-only фікс шуму self-test, знайдений і
-підтверджений на реальному сервері `LIMS-TOP` (real-server acceptance
+підтверджений на реальному сервері `HOST-12` (real-server acceptance
 `RELEASE_POLICY.md` §9 — rc.2 проходив 1532/0, але з 36 рядками
 діагностичного шуму навколо Archive/Maintenance disk-space-тестів).
 
@@ -588,13 +601,13 @@ Hotfix-кандидат: rc.2 + fixture-only фікс шуму self-test, зна
 Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1533 PASS / 0 FAIL — +1 новий
 regression-тест). Пошук "Cannot bind argument to parameter 'Path'" і
 "Помилка запису у файл логу" у новому логу self-test — 0 входжень.
-Real-server acceptance для rc.3 на `LIMS-TOP` — окремий крок, продовжується
+Real-server acceptance для rc.3 на `HOST-12` — окремий крок, продовжується
 з місця зупинки rc.2.
 
 ## 5.2.3-rc.2 — 2026-09-02 (superseded by rc.3)
 
 Hotfix-кандидат: rc.1 + вузький фікс self-test-ізоляції, знайдений і
-підтверджений на реальному сервері `LIMS-TOP` (real-server acceptance
+підтверджений на реальному сервері `HOST-12` (real-server acceptance
 `RELEASE_POLICY.md` §9, не через локальний self-test — там rc.1 проходив
 чисто).
 
@@ -606,7 +619,7 @@ Hotfix-кандидат: rc.1 + вузький фікс self-test-ізоляці
   `DriveType`/`AvailableFreeSpace`. Тому результат 11 self-test сценаріїв
   (`DiskSpace/S16` ×2, `Archive/A4,A5,A9,A10,A14,A17,A19,A24,A25`) залежав
   від того, чи фізично існують диски `D:`/`E:` на хості, що запускає
-  self-test — на `LIMS-TOP` (лише `C:`) усі 11 падали з
+  self-test — на `HOST-12` (лише `C:`) усі 11 падали з
   `Reason=VolumeResolutionFailed`, хоча той самий коміт `5270280` проходив
   1532/0 на dev-машині з дисками `D:`/`E:`. Тепер bootstrap-перевірка
   існування довіряє мок-масиву, коли `-Drives` інжектовано; виробнича
@@ -617,8 +630,8 @@ Hotfix-кандидат: rc.1 + вузький фікс self-test-ізоляці
   шляхи з конфігурації, де реальний `Test-Path` є очікуваною поведінкою.
 
 Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1532 PASS / 0 FAIL, ті самі
-11 сценаріїв, що впали на `LIMS-TOP`, тепер PASS). Real-server acceptance
-для rc.2 на `LIMS-TOP` — окремий крок, продовжується з місця зупинки rc.1.
+11 сценаріїв, що впали на `HOST-12`, тепер PASS). Real-server acceptance
+для rc.2 на `HOST-12` — окремий крок, продовжується з місця зупинки rc.1.
 
 ## 5.2.3-rc.1 — 2026-08-31 (superseded by rc.2)
 
@@ -883,7 +896,7 @@ list). No outstanding blocking findings.
 ## 5.2.1-rc.9 — 2026-08-27 (hotfix candidate, pending acceptance)
 
 Кандидат = rc.8 + фікс систематичного пропуску денних health-прогонів
-(доведено логами ДНДІЛДВСЕ 25-27.08.2026) + повний каталог
+(доведено логами SITE-A 25-27.08.2026) + повний каталог
 `BRAVO.local.config.example`:
 
 - **FIX (health/scheduler): денний слот health-прогону систематично
@@ -915,7 +928,7 @@ Acceptance rc.9 додатково включає: re-run `BRAVO_TASKS_INSTALL`
 ## 5.2.1-rc.8 — 2026-08-27 (hotfix candidate, pending acceptance)
 
 Кандидат = rc.7 + фікс хибного ERROR у сповіщенні про несумісні імена
-(знайдено аналізом acceptance-логів ХРДЛ 27.08: rc.5/rc.6 -SyncBAZA):
+(знайдено аналізом acceptance-логів SITE-B 27.08: rc.5/rc.6 -SyncBAZA):
 
 - **FIX (notifications): одно-chunk результат
   `ConvertTo-BRAVONotificationPayloadText` втрачав масивність.**
@@ -950,7 +963,7 @@ Acceptance rc.9 додатково включає: re-run `BRAVO_TASKS_INSTALL`
   валідаційному інструментарії; runtime-поведінка rc.7 коректна.
 
 Acceptance rc.8 (додатково до rc.7): на інсталяції з несумісними
-іменами BAZA (напр., ХРДЛ) прогнати `-SyncBAZA` → у лозі SUCCESS
+іменами BAZA (напр., SITE-B) прогнати `-SyncBAZA` → у лозі SUCCESS
 «Сповіщення про N несумісних імен … відправлено», без ERROR
 «Не вдалося відправити…: Не удается найти свойство "Count"».
 
@@ -988,7 +1001,7 @@ Acceptance rc.7 (додатково до rc.6): на нетиповій інст
 ## 5.2.1-rc.6 — 2026-08-27 (hotfix candidate, NOT accepted — superseded by rc.7)
 
 Кандидат = rc.5 + свідома зміна дефолту порогу авто-архівування BAZA
-(реальний алерт ДНДІЛДВСЕ 23:00: 18 легітимних мутацій PDF-звітів →
+(реальний алерт SITE-A 23:00: 18 легітимних мутацій PDF-звітів →
 CRITICAL «ПОТРІБНА ДІЯ», хоча механізм auto-archive існує з 5.2.0, але
 був вимкнений дефолтом 0):
 
@@ -1004,7 +1017,7 @@ CRITICAL «ПОТРІБНА ДІЯ», хоча механізм auto-archive і�
   (OPERATIONS/THREAT_MODEL/README/конфіг-коментар) синхронізовано;
   залишковий ризик per-cycle порогу зафіксовано там само.
 
-Acceptance rc.6 (додатково до rc.5): на ДНДІЛДВСЕ після оновлення
+Acceptance rc.6 (додатково до rc.5): на SITE-A після оновлення
 конфіга — наступний цикл авто-архівує ≤25 мутацій (INFO, без
 «ПОТРІБНА ДІЯ»), старі remote-версії з суфіксом `.replaced_*`.
 
@@ -1013,7 +1026,7 @@ Acceptance rc.6 (додатково до rc.5): на ДНДІЛДВСЕ післ
 ## 5.2.1-rc.5 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.6)
 
 Кандидат = rc.4 + фікс хибного CRITICAL при зайнятому WinSCP (реальний
-алерт SERV_HRDL_1/ХЕРСОНСЬКА РДЛ 23:03: «Запуск WinSCP для SFTP
+алерт HOST-14/SITE-B 23:03: «Запуск WinSCP для SFTP
 health-check заблоковано: виявлено активний WinSCP.com»):
 
 - **FIX (health, операторський UX): зайнятий WinSCP = відкладення, а не
@@ -1033,7 +1046,7 @@ SKIPPED; без конкуренції — звичайна повна пере�
 ## 5.2.1-rc.4 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.5)
 
 Кандидат = rc.3 + фікс накопичення diskshadow metadata-.cab (реальний
-звіт SERVER-01/Тернопіль: файли `NN-DD.MM.YYYY-HH_--_SERVER-01.cab` у
+звіт SERVER-01/SITE-D: файли `NN-DD.MM.YYYY-HH_--_SERVER-01.cab` у
 `C:\Program Files\BRAVO-Toolkit` після кожної багатотомної архівації):
 
 - **FIX (archive/VSS): metadata-.cab diskshadow — у TEMP і прибирається.**
@@ -1075,7 +1088,7 @@ Acceptance rc.3 (додатково до сценаріїв rc.2): на legacy-�
 ## 5.2.1-rc.2 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.3)
 
 Hotfix-кандидат лінії 5.2.x = rc.1 + другий операторський фікс,
-відтворений власником на тому самому сервері (Тернопіль):
+відтворений власником на тому самому сервері (SITE-D):
 
 - **FIX (dry-run, операторський UX):** тестове повідомлення
   `-SendTestNotification` надходило в ALERTS замість GENERAL —
@@ -1101,7 +1114,7 @@ Hotfix-кандидат лінії 5.2.x (гілка `hotfix/5.2.1` від stabl
 
 - **FIX (maintenance, операторський UX):** «Реставрацію пропущено: ...
   поза дозволеним вікном» — рівень WARNING → INFO (реальний денний
-  ручний прогін ТЕРНОПІЛЬСЬКА РДЛ 2026-08-26: хибний алерт
+  ручний прогін SITE-D 2026-08-26: хибний алерт
   «ПОТРІБНА ДІЯ» з exit 10 при повністю зеленому прогоні; рішення
   власника — це штатна поведінка, слот не втрачається: підхоплюється
   нічним Maintenance у вікні або boot-Recovery). Текст у лозі доповнено
@@ -1126,7 +1139,7 @@ accepted 5.2.0-rc.13 candidate: rc stamp `0247ac3` (sourceCommit
 `12e6370`), artifact BRAVO-Toolkit-5.2.0-rc.13.zip sha256
 `6eac9695ed6053e7156ff843d8b4aed8522b4627d65c95bace1bc3de5a42af22`.
 
-Real-server acceptance rc.13: PASS 2026-08-26 (`LIMS`/ДНДІЛДВСЕ —
+Real-server acceptance rc.13: PASS 2026-08-26 (`LIMS`/SITE-A —
 повний maintenance-цикл з реставрацією, logs pipeline v2, компактні
 алерти, негативний сценарій forced+normal без повторної реставрації)
 плюс A2-encoding протокол (RELEASE_CHECKLIST §1.1) PASS в обох
@@ -1385,7 +1398,7 @@ acceptance: нові SFTP-каталоги `logs/*`, WinSCP MoveFile-мігра�
 ## 5.2.0-rc.8 — 2026-08-25 (candidate, acceptance passed)
 
 **UPD (2026-08-25 22:03-22:24): real-server acceptance реставрації
-ПРОЙДЕНО на сервері інциденту** (`LIMS`/ДНДІЛДВСЕ, `BRAVO_MAINTENANCE
+ПРОЙДЕНО на сервері інциденту** (`LIMS`/SITE-A, `BRAVO_MAINTENANCE
 -ForceRestore`): `[5/8] Реставрація моделі OK 19:22 — bravocmd exit=0 |
 RemovedByRepair=0 | Critical=0 | Rollback=NONE | MainModel=OK`; фінал
 УСПІШНО/exit 0, служби відновлено автоматично, Trace-pipeline (добовий
@@ -1394,7 +1407,7 @@ RemovedByRepair=0 | Critical=0 | Rollback=NONE | MainModel=OK`; фінал
 
 Кандидат = зміст прийнятого `v5.2.0-rc.7` (`5.2.0-rc.5` + розрахункова
 перевірка вільного місця з floor-override; повний end-to-end acceptance
-2026-08-25 на `WIN-42Q5558LQC9`) + `fix(maintenance)` нижче (PR #86).
+2026-08-25 на `HOST-15`) + `fix(maintenance)` нижче (PR #86).
 Перший формальний build із гілки `developer` після злиття PR #83/#84:
 rc.6/rc.7 збирались з інтеграційної гілки `rc6-merge`, функціональний
 runtime-diff `developer` проти `v5.2.0-rc.7` до PR #86 був порожній.
@@ -1403,7 +1416,7 @@ acceptance у складі rc.7; новий у цьому кандидаті —
 
 - **FIX (data-integrity, restore/maintenance): хибний тотальний провал
   перевірки цілісності моделі після repair через регістр шляху MODEL.**
-  Реальний інцидент (ДНДІЛДВСЕ, 2026-08-25, exit 43): `bravocmd r`
+  Реальний інцидент (SITE-A, 2026-08-25, exit 43): `bravocmd r`
   завершується успішно, але `Compare-FileSizes` оголошував УСІ файли
   before-CSV відсутніми (364 CRITICAL + 182 RemovedByRepair) і після
   успішного відкату повторна перевірка знову провалювалась —
@@ -1497,8 +1510,7 @@ acceptance у складі rc.7; новий у цьому кандидаті —
 Кандидат = `5.2.0-rc.4` (нижче) + три cherry-picked фікси з локальної гілки
 `developer`, перевірені на відсутність дублювання з уже прийнятими
 origin-змінами. Acceptance пройдено на двох реальних серверах:
-`SERV_HRDL_1` (ХЕРСОНСЬКА РДЛ, rc.4) і `WIN-44OBNQ3R3OB` (МИКОЛАЇВСЬКА
-РДЛ, rc.5) — повний `BRAVO_SELF_TEST.ps1` PASSED, `BRAVO_DRY_RUN.ps1
+`HOST-14` (SITE-B, rc.4) і `HOST-13` (SITE-F, rc.5) — повний `BRAVO_SELF_TEST.ps1` PASSED, `BRAVO_DRY_RUN.ps1
 -TestAccess` без жодного FAIL, `BRAVO_TASKS_INSTALL.ps1 -ValidateOnly`
 успішний.
 
@@ -1635,7 +1647,7 @@ origin-змінами. Acceptance пройдено на двох реальни�
 ## 5.2.0-rc.3 — 2026-08-24 (candidate, pending acceptance)
 
 Кандидат зі стабілізаційними виправленнями за логами реального сервера
-(`SERV_HRDL_1`, 2026-08-24) і двома змінами поведінки на запит власника.
+(`HOST-14`, 2026-08-24) і двома змінами поведінки на запит власника.
 Нових функцій немає — усе нижче або виправляє дефект, або змінює рівень/
 видимість уже наявної поведінки (розділ 3.2 `RELEASE_POLICY.md`).
 
@@ -2091,7 +2103,7 @@ Runtime.ps1 decomposition.
   РУЧНЕ втручання за кодом 43 (автостарт заборонено); лог: <шлях>");
   the internal restartSuppressed jargon and the triple restatement
   stay only in the detailed Health log line.
-- Compact operator alerts (operator request from the DEV-LIMS field
+- Compact operator alerts (operator request from the HOST-11 field
   test): the Health problem notification shows the full issue Reason
   exactly once (in its thematic section) — the header reason block now
   carries only a compact component list (up to 4 names) instead of
@@ -2108,14 +2120,14 @@ Runtime.ps1 decomposition.
   Previously BRAVO_TASKS_INSTALL (and any other direct consumer)
   crashed under StrictMode with "property 'BootRestoreMode' cannot be
   found" despite the loader's own "the stale key is ignored" warning
-  (real case: DEV-LIMS site config from the rc.4 era). Regression test
+  (real case: HOST-11 site config from the rc.4 era). Regression test
   ConfigurationLoader/MissingBootRestoreModeDefaultsToNone builds a
   legacy-shaped fixture and validates both the loader default and the
   installer run.
 - Self-test: temporary directories are created under
   [IO.Path]::GetTempPath() instead of raw $env:TEMP. On servers where
   the session TEMP variable carries the 8.3 short profile form
-  (C:\Users\E980D~1.KUC\..., real case: DEV-LIMS / Server 2022),
+  (C:\Users\E980D~1.KUC\..., real case: HOST-11 / Server 2022),
   Remove-Item -LiteralPath in Windows PowerShell 5.1 fails on the
   short segment with PSArgumentException and aborted the whole
   self-test run in the environment-preflight block.
@@ -2237,10 +2249,10 @@ accepted 5.1.0-rc.4 candidate: deploy/stamp commit `219c55b`
 push CI run 32346213433 SUCCESS (self-test, DataRestore E2E matrix,
 PSScriptAnalyzer, parser/BOM/JSON, gitleaks).
 
-Real-server acceptance: full DEV-LIMS run 2026-08-20 (11:18–13:42),
+Real-server acceptance: full HOST-11 run 2026-08-20 (11:18–13:42),
 evidence document
-`docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md` (branch
-`evidence/219c55b-rc4-devlims-acceptance-pass`, commit `8efb95e`). All
+`docs/BRAVO_DATA_RESTORE_RC4_HOST11_ACCEPTANCE_20260820.md` (branch
+`evidence/219c55b-rc4-host11-acceptance-pass`, commit `8efb95e`). All
 runbook scenarios PASS: Setup/Archive/Health, B4+B17 (real SFTP-source
 restore), B15, B16 (incl. a bonus fail-closed free-space abort), B19
 and B20 (deterministic failpoint rollbacks, incl. cross-component),
@@ -2264,14 +2276,14 @@ Headline changes since stable 5.0.2:
 ## 5.1.0-rc.4 — 2026-08-20 (candidate, ACCEPTED 2026-08-20 — released as 5.1.0)
 
 Fourth release candidate of the 5.1.0 line. Opened because the rc.3
-DEV-LIMS acceptance run found that BRAVO_DATA_RESTORE notifications
+HOST-11 acceptance run found that BRAVO_DATA_RESTORE notifications
 still went through the legacy single webhook without severity routing:
 a FAILED restore report (exit 43) landed in the GENERAL channel instead
 of ALERTS. Not a regression (DataRestore does not exist in 5.0.x and
 the PR #39 port covered Archive/Health/Maintenance only), but the
 project decided to fix it now rather than document it as a known
 limitation. This is a functional runtime change, so the partial rc.3
-acceptance evidence is discarded: **rc.4 requires a new full DEV-LIMS
+acceptance evidence is discarded: **rc.4 requires a new full HOST-11
 acceptance run** before any stable promotion.
 
 - DataRestore notifications routed through the canonical
@@ -2293,8 +2305,8 @@ historically entered master directly, bypassing developer. rc.3 ports
 that feature into the 5.1.0 line via a reviewed master->developer
 merge, together with the overdue metadata sync of the 5.0.1/5.0.2
 hotfix sections. This is a functional runtime change, so the full
-DEV-LIMS acceptance PASS recorded for rc.2 (candidate 10e9973,
-docs/BRAVO_DATA_RESTORE_RC2_DEVLIMS_ACCEPTANCE_20260819_PASS.md) no
+HOST-11 acceptance PASS recorded for rc.2 (candidate 10e9973,
+docs/BRAVO_DATA_RESTORE_RC2_HOST11_ACCEPTANCE_20260819_PASS.md) no
 longer covers the runtime: **rc.3 requires a new acceptance run**
 before any stable promotion.
 
@@ -2316,7 +2328,7 @@ carries a functional addition: completion of BRAVO_DATA_RESTORE, which
 the project decided to ship inside stable 5.1.0. Because of this
 functional change, the 5.1.0-rc.1 acceptance evidence no longer covers
 the runtime: **rc.2 requires a new full acceptance run** (including the
-real DEV-LIMS restore acceptance) before any stable promotion. This
+real HOST-11 restore acceptance) before any stable promotion. This
 candidate has NOT been accepted yet. The earlier local, unpublished
 5.1.0 stable promotion produced from rc.1 (commit `ac07f55`) is
 superseded and must not be pushed, merged, tagged, or released; the
@@ -2373,7 +2385,7 @@ candidate (accepted HEAD `852a0b9`, CI run 31755546128 SUCCESS,
 real-server acceptance verdict PROMOTE). The candidate passed the
 complete Windows CI pipeline and real-server acceptance on Windows
 PowerShell 5.1, including real-SFTP BAZA acceptance across all 10
-scenarios (DEV-LIMS, 2026-08-13 — see `docs/BAZA_SFTP_ACCEPTANCE.md`
+scenarios (HOST-11, 2026-08-13 — see `docs/BAZA_SFTP_ACCEPTANCE.md`
 section 13). This promotion contains no functional runtime changes
 relative to the accepted candidate: it removes the prerelease suffix,
 sets the stable release channel, updates operator documentation
@@ -2962,7 +2974,7 @@ Invariants below).
   (`CrashAfterRemoteUploadBeforeStateCommitDoesNotReupload`) is
   re-modeled as the ordinary-cycle scenario it always described and
   still passes. 14 new behavioral self-tests.
-- Fix the first real-SFTP acceptance blocker (DEV-LIMS, scenario 1):
+- Fix the first real-SFTP acceptance blocker (HOST-11, scenario 1):
   `BRAVO_ARCHIV` crashed with exit 90 (`The term 'if' is not
   recognized…`) before the BAZA sync phase ever ran.
   `Invoke-BRAVOBazaIncrementalSync` computed its operation timeout as
@@ -2979,7 +2991,7 @@ Invariants below).
   (`if`/`elseif`/`else`/`switch`/`while`/`do`/`try`/`catch`/`finally`/`until`;
   `foreach`/`where` deliberately excluded as valid pipeline aliases) —
   this guard would have caught the bug at commit time.
-- Fix a second defect visible in the same DEV-LIMS acceptance log: the
+- Fix a second defect visible in the same HOST-11 acceptance log: the
   per-run retention audit line printed literal `{0}/{1}/{2}` placeholders
   for its first half (`Аудит retention: generation оцінено={0}; …`) —
   `-f` binds tighter than `+`, so only the second concatenated string was
@@ -2987,7 +2999,7 @@ Invariants below).
   guard (`Diagnostics/NoHalfFormattedStringConcatenation`) now fails on
   any `+` expression whose right operand is a `-f` format while the left
   side still contains unformatted `{N}` placeholders.
-- Fix the third real-SFTP acceptance blocker (DEV-LIMS, scenario 1
+- Fix the third real-SFTP acceptance blocker (HOST-11, scenario 1
   retry): after the if-as-command fix the BAZA phase started but hung
   indefinitely — bare interactive `winscp>` prompts leaked to the
   operator console, spawned WinSCP processes sat at ~0 CPU and the log
@@ -3006,7 +3018,7 @@ Invariants below).
   explanatory `ERROR` instead of hanging. Behavioral + structural tests
   added (`ComStubExecutableFailsFastInsteadOfHanging`,
   `ArchiveWiringResolvesRealWinSCPExeForEngine`).
-- Fix the fourth real-SFTP acceptance blocker (DEV-LIMS, 2026-08-13,
+- Fix the fourth real-SFTP acceptance blocker (HOST-11, 2026-08-13,
   scenario 1 retry after the winscp.exe fix). Run facts: MODEL/BLOG/
   BRAVOEXCH archives 3/3, generation COMPLETE, VSS OK, archive SFTP
   upload OK, the WinSCP .NET session reached the real BAZA Full Audit
@@ -3031,7 +3043,7 @@ Invariants below).
   exception into a structured audit failure (`Success=$false`,
   exact cause in `FullAuditError`) instead of a generic session error;
   the write-ahead `AuditReconciliationPending` order is unchanged, so
-  the failed DEV-LIMS run correctly left the marker fail-closed on disk
+  the failed HOST-11 run correctly left the marker fail-closed on disk
   and the next Archive run force-reconciles. New behavioral tests: the
   production provider is created inside a module with a private fake
   comparison and executed across the module boundary
@@ -3040,7 +3052,7 @@ Invariants below).
   pending-marker recovery chain is re-verified end-to-end with the
   production provider boundary
   (`PendingMarkerRecoveryWorksWithProductionProviderBoundary`).
-- Fix the fifth real-SFTP acceptance finding (DEV-LIMS, 2026-08-13):
+- Fix the fifth real-SFTP acceptance finding (HOST-11, 2026-08-13):
   the standalone-fallback BAZA sync in `BRAVO.Health.Runtime` passed the
   raw bundle `$winSCPPath` (`Tools\WinSCP.com`) into the engine's
   `-WinSCPExecutablePath` — the same defect as acceptance blocker #3,
@@ -3078,7 +3090,7 @@ Invariants below).
   formats and the component-not-files wiring.
 - Maintenance no longer emits a false `WARNING` when
   `range_id_log.json` is checked seconds after this run itself started
-  the BRAVO service (observed on the DEV-LIMS acceptance run right after
+  the BRAVO service (observed on the HOST-11 acceptance run right after
   a full model restore: service started at 00:09:24, warning at
   00:09:26, file present again minutes later — the service creates the
   file asynchronously after startup). The `[8/8]` range-ID step now
@@ -3272,7 +3284,7 @@ changed during promotion.
 
 ## 5.0.0-dev.19 — 2026-08-11
 
-Minimal observability/correctness release, from two real DEV-LIMS
+Minimal observability/correctness release, from two real HOST-11
 acceptance runs of 5.0.0-dev.18, with a review pass applied before
 release that replaced an initial, still-independent status-classification
 design with one that consumes the actual resolved BRAVO exit code (see
@@ -3409,7 +3421,7 @@ changed; Range ID missing-file warning-only semantics untouched.
 ## 5.0.0-dev.18 — 2026-08-10
 
 Minimal operator-flow/observability correctness release, from a real
-manual DEV-LIMS `BRAVO_ARCHIV` 5.0.0-dev.17 run. Three related defects,
+manual HOST-11 `BRAVO_ARCHIV` 5.0.0-dev.17 run. Three related defects,
 tightly scoped — no backup, VSS, retention-policy, MANIFESTS, transfer,
 notification, scheduler, or exit-code semantics changed. (A separate,
 already-known factual VSS diagnostic-wording issue — "Узгодженість
@@ -3493,7 +3505,7 @@ worth a follow-up look separately.
 
 ## 5.0.0-dev.17 — 2026-08-10
 
-Minimal correctness fix on top of dev.16, from a real DEV-LIMS
+Minimal correctness fix on top of dev.16, from a real HOST-11
 acceptance run (generation `20260810_185725`, backup ~18:57 local
 server time). Health confirmed all components and SFTP `OK` for that
 generation — but the Discord success notification showed `🕒 Остання
@@ -3518,7 +3530,7 @@ timestamp was wrong — it rendered the internally normalized UTC value
   PASS/WARN/FAIL logic, notification routing/mode, and exit codes are
   all unchanged.
 - Tests: `Health/LatestBackupTimestampRendersLocalTime` (functional —
-  reproduces the exact DEV-LIMS numbers via `[datetime]::SpecifyKind`,
+  reproduces the exact HOST-11 numbers via `[datetime]::SpecifyKind`,
   timezone-independent, no hardcoded UTC+3),
   `Health/BackupAgeStillUsesUtcSemantics` (confirms `AgeText` is
   unaffected), `Health/SuccessAndProblemNotificationsReuseLatestBackupTimestamp`
@@ -3531,7 +3543,7 @@ Minimal PowerShell 5.1 / `Set-StrictMode` reliability fix on top of the
 published dev.15: no operator-console/UX change, no MANIFESTS/retention
 policy/business-semantics change.
 
-Real DEV-LIMS dev.15 acceptance confirmed `[1/8]`..`[8/8]`, the `[5/8]`
+Real HOST-11 dev.15 acceptance confirmed `[1/8]`..`[8/8]`, the `[5/8]`
 Restore `SKIPPED` line, the `[8/8]` Range ID single-render, and the final
 summary printing before the manual pause — all as designed. But after
 `[8/8]`, cleanup threw `The property 'Count' cannot be found on this
@@ -3566,7 +3578,7 @@ fixed at its root cause.
   future one.
 - Tests: 4 new isolated regression checks for `Remove-OldRestoreArchives`
   (real function via AST extraction, synthetic TEMP directories — never
-  production DEV-LIMS paths — running under a real `Set-StrictMode
+  production HOST-11 paths — running under a real `Set-StrictMode
   -Version Latest` inside the invocation, reproducing the exact failure
   condition rather than simulating it): a single-result `before`/`after`
   count each reads back as `1` without throwing, a single remaining file
