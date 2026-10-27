@@ -227,7 +227,7 @@ foreach ($identifierHash in @($identifierHashes) + @($ExtraIdentifierHash | ForE
 $identifierTokenPattern = '[\p{L}\p{Nd}_\-]+(?:\.[\p{L}\p{Nd}_\-]+)*'
 $identifierMaxParts = 4
 $identifierSha256 = [Security.Cryptography.SHA256]::Create()
-$identifierTokenCache = @{}
+$identifierTokenVerdict = @{}
 $identifierFileCount = 0
 $identifierRoot = (Resolve-Path -LiteralPath $Root).Path
 $identifierFiles = @(Get-ChildItem -LiteralPath $identifierRoot -Recurse -Force -File | Where-Object {
@@ -253,31 +253,34 @@ foreach ($file in $identifierFiles) {
     $lines = $text -split "`r?`n"
     for ($index = 0; $index -lt $lines.Length; $index++) {
         foreach ($tokenMatch in [regex]::Matches($lines[$index], $identifierTokenPattern)) {
-            # Частини разом із роздільниками: 'A-B_c.d' -> A,-,B,_,c,.,d.
-            $tokenParts = [regex]::Split($tokenMatch.Value, '([._\-])')
-            $candidates = New-Object System.Collections.Generic.List[string]
-            for ($start = 0; $start -lt $tokenParts.Length; $start += 2) {
-                $candidate = ''
-                for ($end = $start; $end -lt $tokenParts.Length -and $end -lt $start + 2 * $identifierMaxParts; $end += 2) {
-                    if ($end -gt $start) {
-                        $candidate += $tokenParts[$end - 1]
+            # Токени в тексті повторюються багато разів, тому вердикт
+            # кешується для всього токена, а розбиття й хешування —
+            # лише для нових.
+            $tokenKey = $tokenMatch.Value.ToUpperInvariant()
+            if (-not $identifierTokenVerdict.ContainsKey($tokenKey)) {
+                $isIdentifier = $false
+                # Частини разом із роздільниками: 'A-B_C.D' -> A,-,B,_,C,.,D.
+                $tokenParts = [regex]::Split($tokenKey, '([._\-])')
+                for ($start = 0; $start -lt $tokenParts.Length -and -not $isIdentifier; $start += 2) {
+                    $candidate = ''
+                    for ($end = $start; $end -lt $tokenParts.Length -and $end -lt $start + 2 * $identifierMaxParts; $end += 2) {
+                        if ($end -gt $start) {
+                            $candidate += $tokenParts[$end - 1]
+                        }
+                        $candidate += $tokenParts[$end]
+                        $hashBytes = $identifierSha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($candidate))
+                        if ($identifierHashSet.ContainsKey([BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant())) {
+                            $isIdentifier = $true
+                            break
+                        }
                     }
-                    $candidate += $tokenParts[$end]
-                    $candidates.Add($candidate)
                 }
+                $identifierTokenVerdict[$tokenKey] = $isIdentifier
             }
-            foreach ($candidate in $candidates) {
-                $normalized = $candidate.ToUpperInvariant()
-                if (-not $identifierTokenCache.ContainsKey($normalized)) {
-                    $hashBytes = $identifierSha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($normalized))
-                    $identifierTokenCache[$normalized] = (-join ($hashBytes | ForEach-Object { $_.ToString('x2') }))
-                }
-                if ($identifierHashSet.ContainsKey($identifierTokenCache[$normalized])) {
-                    # Значення не виводиться: лише файл, рядок і позиція.
-                    Write-Host "::error file=$($file.FullName),line=$($index + 1)::Реальний ідентифікатор майданчика (позиція $($tokenMatch.Index + 1)): замініть заглушкою (HOST-NN, SITE-X, 00000000, RFC 5737)."
-                    $violationCount++
-                    break
-                }
+            if ($identifierTokenVerdict[$tokenKey]) {
+                # Значення не виводиться: лише файл, рядок і позиція.
+                Write-Host "::error file=$($file.FullName),line=$($index + 1)::Реальний ідентифікатор майданчика (позиція $($tokenMatch.Index + 1)): замініть заглушкою (HOST-NN, SITE-X, 00000000, RFC 5737)."
+                $violationCount++
             }
         }
     }
