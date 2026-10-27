@@ -527,3 +527,57 @@
         -Condition ($foundStaleClaims.Count -eq 0) `
         -Name "Documentation/ThreatModelHasNoStaleResidualRisk" `
         -Failure "THREAT_MODEL.md містить твердження про залишковий ризик, який код уже закрив: $($foundStaleClaims -join '; ')"
+
+    # 5.2.6 (D7): guard реальних ідентифікаторів майданчиків у
+    # ci\Test-BRAVOForbiddenPattern.ps1 має ловити значення і всередині
+    # складених токенів (суфікс, розширення, UNC-шлях), і в UTF-16-файлах,
+    # але не заглушки. Перевірка на СИНТЕТИЧНИХ токенах через
+    # -ExtraIdentifierHash: справжні значення в self-test не потрапляють.
+    $identifierGuardScript = Join-Path $root 'ci\Test-BRAVOForbiddenPattern.ps1'
+    $identifierProbeSha256 = [Security.Cryptography.SHA256]::Create()
+    $identifierProbeHashes = @(
+        foreach ($probeToken in @('ZZPROBE-HOST', '198.51.100.77')) {
+            -join ($identifierProbeSha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($probeToken.ToUpperInvariant())) | ForEach-Object { $_.ToString('x2') })
+        }
+    )
+    $identifierProbeSha256.Dispose()
+    $identifierProbeScenarios = @(
+        @{ Label = 'PlaceholderOnly'; Encoding = 'UTF8'; Text = "Хост HOST-11, майданчик SITE-A, адреса 203.0.113.10."; ExpectViolation = $false },
+        @{ Label = 'ExactToken'; Encoding = 'UTF8'; Text = "Прогін на zzprobe-host завершився."; ExpectViolation = $true },
+        @{ Label = 'UnderscoreSuffix'; Encoding = 'UTF8'; Text = "Копія ZZPROBE-HOST_backup створена."; ExpectViolation = $true },
+        @{ Label = 'UncPathWithDomain'; Encoding = 'UTF8'; Text = "Шлях \\ZZPROBE-HOST.example.invalid\share\BRAVO"; ExpectViolation = $true },
+        @{ Label = 'IpWithExtension'; Encoding = 'UTF8'; Text = "Файл 198.51.100.77.log збережено."; ExpectViolation = $true },
+        @{ Label = 'Utf16Le'; Encoding = 'Unicode'; Text = "Звіт з ZZPROBE-HOST у UTF-16."; ExpectViolation = $true }
+    )
+    $identifierProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_IDENTIFIER_GUARD_PROBE_{0}" -f [guid]::NewGuid().ToString('N'))
+    $identifierProbeResults = @{}
+    try {
+        [void][IO.Directory]::CreateDirectory($identifierProbeRoot)
+        # Маркер кореня репозиторію для власної перевірки скрипта.
+        [IO.File]::WriteAllText((Join-Path $identifierProbeRoot 'BRAVO_SELF_TEST.ps1'), '', (New-Object Text.UTF8Encoding($true)))
+        $probeDocPath = Join-Path $identifierProbeRoot 'PROBE.md'
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            foreach ($scenario in $identifierProbeScenarios) {
+                if ($scenario.Encoding -eq 'Unicode') {
+                    [IO.File]::WriteAllText($probeDocPath, $scenario.Text, [Text.Encoding]::Unicode)
+                } else {
+                    [IO.File]::WriteAllText($probeDocPath, $scenario.Text, (New-Object Text.UTF8Encoding($false)))
+                }
+                $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $identifierGuardScript -Root $identifierProbeRoot -ExtraIdentifierHash ($identifierProbeHashes -join ',') 2>&1
+                $identifierProbeResults[$scenario.Label] = $LASTEXITCODE
+            }
+        } finally {
+            $ErrorActionPreference = $previousErrorAction
+        }
+    } finally {
+        Remove-Item -LiteralPath $identifierProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($scenario in $identifierProbeScenarios) {
+        $probeExitCode = $identifierProbeResults[$scenario.Label]
+        Test-BRAVOCondition `
+            -Condition ((($probeExitCode -ne 0) -eq $scenario.ExpectViolation) -and $null -ne $probeExitCode) `
+            -Name "StaticAnalysis/SiteIdentifierGuard[$($scenario.Label)]" `
+            -Failure "ci\Test-BRAVOForbiddenPattern.ps1: сценарій $($scenario.Label) — очікувалось $(if ($scenario.ExpectViolation) { 'порушення (код не 0)' } else { 'чистий прохід (код 0)' }), отримано код $probeExitCode"
+    }

@@ -1064,8 +1064,8 @@ Compare-FileSizes-фікси з локальної незапушеної гіл
 Stable `5.1.0` промотовано 2026-08-20 з прийнятого `5.1.0-rc.4`
 (stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО HOST-11
 acceptance того ж дня (evidence
-`docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md`, гілка
-`evidence/219c55b-rc4-devlims-acceptance-pass`). Шлях циклу:
+`docs/BRAVO_DATA_RESTORE_RC4_HOST11_ACCEPTANCE_20260820.md`, гілка
+`evidence/219c55b-rc4-host11-acceptance-pass`). Шлях циклу:
 rc.1 (інвалідовано фічею DATA_RESTORE) → rc.2 (acceptance PASS, але
 промоцію скасовано: виявлено відсутність порту severity-routing
 PR #39) → rc.3 (порт routing; на acceptance виявлено, що DataRestore

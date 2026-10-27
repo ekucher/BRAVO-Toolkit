@@ -2238,8 +2238,8 @@ PSScriptAnalyzer, parser/BOM/JSON, gitleaks).
 
 Real-server acceptance: full HOST-11 run 2026-08-20 (11:18–13:42),
 evidence document
-`docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md` (branch
-`evidence/219c55b-rc4-devlims-acceptance-pass`, commit `8efb95e`). All
+`docs/BRAVO_DATA_RESTORE_RC4_HOST11_ACCEPTANCE_20260820.md` (branch
+`evidence/219c55b-rc4-host11-acceptance-pass`, commit `8efb95e`). All
 runbook scenarios PASS: Setup/Archive/Health, B4+B17 (real SFTP-source
 restore), B15, B16 (incl. a bonus fail-closed free-space abort), B19
 and B20 (deterministic failpoint rollbacks, incl. cross-component),
@@ -2293,7 +2293,7 @@ that feature into the 5.1.0 line via a reviewed master->developer
 merge, together with the overdue metadata sync of the 5.0.1/5.0.2
 hotfix sections. This is a functional runtime change, so the full
 HOST-11 acceptance PASS recorded for rc.2 (candidate 10e9973,
-docs/BRAVO_DATA_RESTORE_RC2_DEVLIMS_ACCEPTANCE_20260819_PASS.md) no
+docs/BRAVO_DATA_RESTORE_RC2_HOST11_ACCEPTANCE_20260819_PASS.md) no
 longer covers the runtime: **rc.3 requires a new acceptance run**
 before any stable promotion.
 

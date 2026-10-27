@@ -7,7 +7,7 @@ HOST-11, **не сам прогін і не evidence**. Він фіксує: (1)
 сценаріїв, чиє визначення в репозиторії відсутнє, (4) чек-лист перед стартом.
 Заповнювати результатами реального прогону варто в окремому файлі за зразком
 `docs/BRAVO_DATA_RESTORE_RC2_ACCEPTANCE_20260815.md` (гілка
-`evidence/33c5aca-rc2-devlims-acceptance`), а не в цьому.
+`evidence/33c5aca-rc2-host11-acceptance`), а не в цьому.
 
 ## 1. Candidate identity (на момент підготовки цього runbook)
 
@@ -157,7 +157,7 @@ polling що 30с до `schedulerSettings.OperationLockWaitMinutes`, потім
 4. Повторити **B15/B16/B19** для підтвердження, що жоден з 44+
    review-фіксів не порушив раніше PASS-сценарії.
 
-## 6. Чек-лист перед стартом (з `dev-lims-environment-facts` пам'яті сесії)
+## 6. Чек-лист перед стартом (з `host-11-environment-facts` пам'яті сесії)
 
 - [ ] `developer` re-stamp актуальний на момент старту (звірити HEAD == `sourceCommit`).
 - [ ] Оператор на HOST-11 — саме `BSYSTEM\e.kucher` (домен `BSYSTEM`, не WORKGROUP).
