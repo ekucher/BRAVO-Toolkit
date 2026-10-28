@@ -22,7 +22,7 @@ name: HOST-11 self-test
 #   репозиторію виконується на HOST-11 із правами облікового запису
 #   служби раннера - це окрема межа довіри (див. опис PR).
 # - Повний вивід self-test пишеться у локальний файл на HOST-11
-#   (%ProgramData%\BRAVO-DevLimsAcceptance\<run>), а в публічну консоль
+#   (%ProgramData%\BRAVO-Host11Acceptance\<run>), а в публічну консоль
 #   задачі потрапляє лише підсумок: SHA, версія PowerShell, кількість
 #   PASS/FAIL, імена провалених перевірок (без повідомлень), exit code,
 #   тривалість. Лог НЕ вивантажується артефактом.
@@ -105,7 +105,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Write-Host ("PowerShell " + $PSVersionTable.PSVersion.ToString() + " / " + $PSVersionTable.PSEdition)
-          $logRoot = Join-Path $env:ProgramData 'BRAVO-DevLimsAcceptance'
+          $logRoot = Join-Path $env:ProgramData 'BRAVO-Host11Acceptance'
           if (-not (Test-Path -LiteralPath $logRoot)) {
               [void][IO.Directory]::CreateDirectory($logRoot)
               # Local log holds host details (user, computer, paths): only
@@ -173,7 +173,7 @@ jobs:
           }
           Write-Host ("Exit code:         " + $exitCode)
           Write-Host ("Duration:          " + $duration.ToString('hh\:mm\:ss'))
-          Write-Host "Full log is kept on the runner host only (ProgramData\BRAVO-DevLimsAcceptance)."
+          Write-Host "Full log is kept on the runner host only (ProgramData\BRAVO-Host11Acceptance)."
           Write-Host ("::" + $stopToken + "::")
           if ($timedOut) {
               Write-Host "::error::self-test timed out and was terminated"

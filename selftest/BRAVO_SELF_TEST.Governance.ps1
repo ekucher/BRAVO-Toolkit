@@ -7118,13 +7118,13 @@ if (Enter-BRAVOSelfTestSection -Name 'StaticAnalysis/SiteIdentifierGuard') { try
 
     # 5.2.6 (D7): guard реальних ідентифікаторів майданчиків у
     # ci\Test-BRAVOForbiddenPattern.ps1 має ловити значення і всередині
-    # складених токенів (суфікс, розширення, UNC-шлях), і в UTF-16-файлах,
-    # але не заглушки. Перевірка на СИНТЕТИЧНИХ токенах через
+    # складених токенів (суфікс, розширення, UNC-шлях, злиття з іншим
+    # словом на межі регістру), і в UTF-16-файлах, але не заглушки. Перевірка на СИНТЕТИЧНИХ токенах через
     # -ExtraIdentifierHash: справжні значення в self-test не потрапляють.
     $identifierGuardScript = Join-Path $root 'ci\Test-BRAVOForbiddenPattern.ps1'
     $identifierProbeSha256 = [Security.Cryptography.SHA256]::Create()
     $identifierProbeHashes = @(
-        foreach ($probeToken in @('ZZPROBE-HOST', '198.51.100.77')) {
+        foreach ($probeToken in @('ZZPROBE-HOST', '198.51.100.77', 'ZZPROBEHOST')) {
             -join ($identifierProbeSha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($probeToken.ToUpperInvariant())) | ForEach-Object { $_.ToString('x2') })
         }
     )
@@ -7135,7 +7135,14 @@ if (Enter-BRAVOSelfTestSection -Name 'StaticAnalysis/SiteIdentifierGuard') { try
         @{ Label = 'UnderscoreSuffix'; Encoding = 'UTF8'; Text = "Копія ZZPROBE-HOST_backup створена."; ExpectViolation = $true },
         @{ Label = 'UncPathWithDomain'; Encoding = 'UTF8'; Text = "Шлях \\ZZPROBE-HOST.example.invalid\share\BRAVO"; ExpectViolation = $true },
         @{ Label = 'IpWithExtension'; Encoding = 'UTF8'; Text = "Файл 198.51.100.77.log збережено."; ExpectViolation = $true },
-        @{ Label = 'Utf16Le'; Encoding = 'Unicode'; Text = "Звіт з ZZPROBE-HOST у UTF-16."; ExpectViolation = $true }
+        @{ Label = 'Utf16Le'; Encoding = 'Unicode'; Text = "Звіт з ZZPROBE-HOST у UTF-16."; ExpectViolation = $true },
+        @{ Label = 'CamelCaseCompound'; Encoding = 'UTF8'; Text = "Каталог BRAVO-ZzprobeHostAcceptance створено."; ExpectViolation = $true },
+        @{ Label = 'UpperPrefixCompound'; Encoding = 'UTF8'; Text = "Каталог BRAVOZzprobeHostLogs створено."; ExpectViolation = $true },
+        # Межа регістру всередині слова не ділить: 'Hosting' — не 'Host'.
+        @{ Label = 'CamelCaseNoBoundary'; Encoding = 'UTF8'; Text = "Сервіс ZzprobeHosting працює."; ExpectViolation = $false },
+        # Кеш вердиктів чутливий до регістру: той самий токен в одному
+        # регістрі раніше в тексті не ховає злиття на межі регістру.
+        @{ Label = 'CaseSensitiveCache'; Encoding = 'UTF8'; Text = "Каталоги ZZPROBEHOSTLOGS і ZzprobeHostLogs."; ExpectViolation = $true }
     )
     $identifierProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_IDENTIFIER_GUARD_PROBE_{0}" -f [guid]::NewGuid().ToString('N'))
     $identifierProbeResults = @{}

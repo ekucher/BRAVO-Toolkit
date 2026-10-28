@@ -295,11 +295,20 @@ foreach ($identifierHash in @($identifierHashes) + @($ExtraIdentifierHash | ForE
 # бути частиною довшого токена (суфікс `_backup`, розширення `.log`,
 # домен), тому перевіряються всі неперервні послідовності до
 # $identifierMaxParts частин між роздільниками: найдовше значення в
-# списку — IPv4 з чотирьох частин.
+# списку — IPv4 з чотирьох частин. Другий прохід ділить токен ще й на
+# межах регістру ('BRAVO-HostNameLogs' -> BRAVO, Host, Name, Logs):
+# значення буває злите з іншим словом без роздільника. Злиття в одному
+# регістрі ('HOSTNAMELOGS') не розпізнається — це обмеження перевірки.
 $identifierTokenPattern = '[\p{L}\p{Nd}_\-]+(?:\.[\p{L}\p{Nd}_\-]+)*'
+$identifierSplitPatterns = @(
+    '([._\-])',
+    '([._\-]|(?<=\p{Ll})(?=\p{Lu})|(?<=\p{Lu})(?=\p{Lu}\p{Ll}))'
+)
 $identifierMaxParts = 4
 $identifierSha256 = [Security.Cryptography.SHA256]::Create()
-$identifierTokenVerdict = @{}
+# Розбиття залежить від регістру, тому кеш вердиктів чутливий до регістру
+# (ключі @{} — ні: 'HostName' дістав би вердикт 'HOSTNAME').
+$identifierTokenVerdict = New-Object 'System.Collections.Generic.Dictionary[string,bool]' ([StringComparer]::Ordinal)
 $identifierFileCount = 0
 $identifierRoot = (Resolve-Path -LiteralPath $Root).Path
 $identifierFiles = @(Get-ChildItem -LiteralPath $identifierRoot -Recurse -Force -File | Where-Object {
@@ -328,23 +337,29 @@ foreach ($file in $identifierFiles) {
             # Токени в тексті повторюються багато разів, тому вердикт
             # кешується для всього токена, а розбиття й хешування —
             # лише для нових.
-            $tokenKey = $tokenMatch.Value.ToUpperInvariant()
+            $tokenKey = $tokenMatch.Value
             if (-not $identifierTokenVerdict.ContainsKey($tokenKey)) {
                 $isIdentifier = $false
-                # Частини разом із роздільниками: 'A-B_C.D' -> A,-,B,_,C,.,D.
-                $tokenParts = [regex]::Split($tokenKey, '([._\-])')
-                for ($start = 0; $start -lt $tokenParts.Length -and -not $isIdentifier; $start += 2) {
-                    $candidate = ''
-                    for ($end = $start; $end -lt $tokenParts.Length -and $end -lt $start + 2 * $identifierMaxParts; $end += 2) {
-                        if ($end -gt $start) {
-                            $candidate += $tokenParts[$end - 1]
+                foreach ($identifierSplitPattern in $identifierSplitPatterns) {
+                    # Частини разом із роздільниками: 'A-B_C.D' -> A,-,B,_,C,.,D;
+                    # межа регістру дає порожній роздільник.
+                    $tokenParts = [regex]::Split($tokenKey, $identifierSplitPattern)
+                    for ($start = 0; $start -lt $tokenParts.Length -and -not $isIdentifier; $start += 2) {
+                        $candidate = ''
+                        for ($end = $start; $end -lt $tokenParts.Length -and $end -lt $start + 2 * $identifierMaxParts; $end += 2) {
+                            if ($end -gt $start) {
+                                $candidate += $tokenParts[$end - 1]
+                            }
+                            $candidate += $tokenParts[$end]
+                            $hashBytes = $identifierSha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($candidate.ToUpperInvariant()))
+                            if ($identifierHashSet.ContainsKey([BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant())) {
+                                $isIdentifier = $true
+                                break
+                            }
                         }
-                        $candidate += $tokenParts[$end]
-                        $hashBytes = $identifierSha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($candidate))
-                        if ($identifierHashSet.ContainsKey([BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant())) {
-                            $isIdentifier = $true
-                            break
-                        }
+                    }
+                    if ($isIdentifier) {
+                        break
                     }
                 }
                 $identifierTokenVerdict[$tokenKey] = $isIdentifier
