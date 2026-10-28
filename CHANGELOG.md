@@ -2,6 +2,14 @@
 
 ## Не випущено (developer)
 
+- **Release: збирання з lightweight-тега відхиляється (D8).**
+  `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
+  `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не
+  перевіряє. `release-artifact.yml` перед збиранням перечитує тег із remote, щоб перевірка не залежала від того,
+  як локальний ref створив checkout. `RELEASE_POLICY.md` 15: вимога стосується всіх релізних тегів (dev, RC,
+  stable); наявні в історії lightweight-теги лишаються як є. Self-test
+  `ReleaseArtifact/RejectsLightweightReleaseTag`, `ReleaseArtifact/AcceptsAnnotatedReleaseTag`.
+
 - **Fix(security): `Set-BRAVOProtectedRuntimeAcl` fail-closed на reparse point (#482).** Функція дотримується
   того самого reparse-КОНТРАКТУ, що й `Set-BRAVOProtectedDataDirectoryAcl` (спільний предикат
   `Test-BRAVOPathIsReparsePoint`, перевірка кожного компонента шляху окремо), але не тієї самої схеми.
