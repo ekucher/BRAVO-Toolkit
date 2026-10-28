@@ -1910,7 +1910,8 @@ try {
         # компонента посеред обходу). Scratch лежить поза профілем користувача (%ProgramData%), бо функція
         # відмовляє для шляхів усередині профілю, а TEMP self-test-а лежить саме в ньому.
         $acl482Functions = (@(
-                'Test-BRAVOPathIsReparsePoint', 'Get-BRAVOReparsePointInPathChain', 'Set-BRAVOProtectedRuntimeAcl'
+                'Test-BRAVOPathIsReparsePoint', 'Get-BRAVOReparsePointInPathChain', 'Set-BRAVOProtectedRuntimeAcl',
+                'Get-BRAVORuntimeRootReparseWarning'
             ) | ForEach-Object {
                 $acl482Ast = & $b7ParseFunction $b7InstallText $_
                 if ($null -ne $acl482Ast) { $acl482Ast.Extent.Text } else { '' }
@@ -2141,6 +2142,37 @@ try {
                 $acl482DotResult.Error.Contains((Join-Path $acl482DotRoot 'y '))
             ) -Name 'Scheduler/RuntimeAclRefusesTrailingDotOrSpaceName' `
                 -Failure ("елемент з крапкою/пробілом у кінці імені має призвести до throw ДО першого Set-Acl: " + [string]$acl482DotResult.Error + ' | calls=' + $acl482DotResult.Calls.Count)
+
+            # 11) Зарезервовані імена пристроїв (створені через \\?\): Win32-шлях 'NUL' / 'com1.txt' веде на
+            # пристрій, а не на файл -> throw без жодного Set-Acl.
+            $acl482DevRoot = Join-Path $acl482Scratch 'device-runtime'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482DevRoot 'x'))
+            [IO.File]::WriteAllText('\\?\' + (Join-Path $acl482DevRoot 'NUL'), '# x')
+            [IO.File]::WriteAllText('\\?\' + (Join-Path $acl482DevRoot 'com1.txt'), '# x')
+            $acl482DevResult = & $acl482Probe $acl482Functions $acl482DevRoot
+            Test-BRAVOCondition -Condition (
+                $acl482DevResult.Calls.Count -eq 0 -and $null -ne $acl482DevResult.Error -and
+                $acl482DevResult.Error.Contains((Join-Path $acl482DevRoot 'NUL')) -and
+                $acl482DevResult.Error.Contains((Join-Path $acl482DevRoot 'com1.txt'))
+            ) -Name 'Scheduler/RuntimeAclRefusesReservedDeviceName' `
+                -Failure ("елемент із зарезервованим іменем пристрою має призвести до throw ДО першого Set-Acl: " + [string]$acl482DevResult.Error + ' | calls=' + $acl482DevResult.Calls.Count)
+
+            # 12) -ValidateOnly не викликає Set-BRAVOProtectedRuntimeAcl, тож reparse point на шляху
+            # runtime має дати попередження вже на гейті, а не лише відмову кроку Scheduler оновлення.
+            $acl482Warn = {
+                param([string]$FunctionText, [string]$RuntimeRoot)
+                . ([scriptblock]::Create($FunctionText))
+                return (Get-BRAVORuntimeRootReparseWarning -RuntimeRoot $RuntimeRoot)
+            }
+            $acl482WarnNormal = & $acl482Warn $acl482Functions $acl482Runtime
+            $acl482WarnLinked = if ($acl482AncestorCreated) { & $acl482Warn $acl482Functions (Join-Path $acl482LinkAncestor 'rt') } else { $null }
+            Test-BRAVOCondition -Condition (
+                $acl482AncestorCreated -and $acl482WarnNormal -eq '' -and
+                ([string]$acl482WarnLinked).Contains($acl482LinkAncestor) -and ([string]$acl482WarnLinked).Contains('reparse point') -and
+                $b7InstallText -match '(?s)if \(\$ValidateOnly\) \{\s*\$reparseRuntimeMessage = Get-BRAVORuntimeRootReparseWarning -RuntimeRoot \$runtimeRoot\s*if \(\$reparseRuntimeMessage -ne ''''\) \{ Write-Warning \$reparseRuntimeMessage \}'
+            ) -Name 'Scheduler/RuntimeAclValidateOnlyWarnsOnReparseRoot' `
+                -Failure ("-ValidateOnly має попереджати про reparse point на шляху runtime (і мовчати на звичайному): normal='" + [string]$acl482WarnNormal + "' linked='" + [string]$acl482WarnLinked + "'") `
+                -EnvironmentLimitation $(if ($acl482AncestorCreated) { '' } else { $acl482NoLinkReason })
         } finally {
             foreach ($acl482Junction in @($acl482Junctions)) {
                 if ([IO.Directory]::Exists($acl482Junction)) { & cmd.exe /c rmdir "$acl482Junction" 2>&1 | Out-Null }

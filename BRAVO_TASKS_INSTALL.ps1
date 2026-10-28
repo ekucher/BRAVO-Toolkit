@@ -150,7 +150,10 @@ function Set-BRAVOProtectedRuntimeAcl {
             # Ім'я з крапкою/пробілом у кінці (створюється лише через \\?\) Win32
             # нормалізує до іншого імені: перевірки й Set-Acl діяли б на сусіда, а
             # вміст самого елемента лишився б неперевіреним. Фатально, як reparse point.
-            if ($child.Name.EndsWith('.') -or $child.Name.EndsWith(' ')) {
+            # Так само зарезервовані імена пристроїв (CON, NUL, COM1, 'nul.txt' тощо):
+            # Win32-шлях до них веде на пристрій, а не на файл.
+            if ($child.Name.EndsWith('.') -or $child.Name.EndsWith(' ') -or
+                $child.Name -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$') {
                 $unsafeRuntimeNames.Add($childPath)
                 continue
             }
@@ -172,7 +175,7 @@ function Set-BRAVOProtectedRuntimeAcl {
     }
     if ($unsafeRuntimeNames.Count -gt 0) {
         throw (
-            "Небезпечний вміст runtime: знайдено елементи з крапкою або пробілом у кінці імені усередині '$resolvedRoot': " +
+            "Небезпечний вміст runtime: знайдено елементи з крапкою або пробілом у кінці імені чи із зарезервованим іменем пристрою усередині '$resolvedRoot': " +
             ($unsafeRuntimeNames -join '; ') + ". Windows звертається до них під іншим іменем, тому ACL не можна " +
             "застосувати надійно. Встановлення перервано до зміни ACL. Видаліть ці елементи від імені " +
             "адміністратора (шлях із префіксом \\?\) і повторіть."
@@ -281,6 +284,21 @@ function Get-BRAVOReparsePointInPathChain {
         $cursor = $parentPath
     }
     return ''
+}
+
+function Get-BRAVORuntimeRootReparseWarning {
+    # #482: попередження для -ValidateOnly - той самий strict-ланцюг, що й у
+    # Set-BRAVOProtectedRuntimeAcl; '' - якщо шлях runtime безпечний.
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+
+    $reparseComponent = Get-BRAVOReparsePointInPathChain -Path $RuntimeRoot -Strict
+    if ($reparseComponent -eq '') { return '' }
+    return (
+        "Небезпечний шлях runtime: '$reparseComponent' є reparse point (junction/symlink/mount point) " +
+        "або недоступний на шляху '$RuntimeRoot'. Фактична інсталяція чи оновлення (крок " +
+        "BRAVO_SETUP -Action Scheduler) буде відхилена до зміни ACL, а оновлення відкотиться; " +
+        "перенесіть комплект на шлях без reparse point."
+    )
 }
 
 function Get-BRAVOPathOwnerSid {
@@ -1348,6 +1366,14 @@ try {
             } else {
                 throw $unsafeRuntimeMessage
             }
+        }
+        # #482: фактичну відмову через reparse point дає Set-BRAVOProtectedRuntimeAcl,
+        # який під -ValidateOnly не виконується; без цього попередження гейти
+        # Install/Update-BRAVOServer (-ValidateOnly) пройшли б, а крок Scheduler
+        # оновлення впав би й запустив відкат.
+        if ($ValidateOnly) {
+            $reparseRuntimeMessage = Get-BRAVORuntimeRootReparseWarning -RuntimeRoot $runtimeRoot
+            if ($reparseRuntimeMessage -ne '') { Write-Warning $reparseRuntimeMessage }
         }
     }
     if ($ValidateOnly) {

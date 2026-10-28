@@ -19,14 +19,19 @@
   завершується встановлення, де junction створено ВСЕРЕДИНІ runtime-дерева (наприклад, `LOGS`, перенесений на
   інший том через junction): раніше `Set-Acl` проходив крізь таке посилання, тепер - `throw` з назвою шляху.
   Елементи runtime з крапкою або пробілом у кінці імені (створюються лише через `\\?\`; Windows звертається до них
-  під іншим іменем) теж призводять до відмови ДО першого `Set-Acl`. Поведінка для
+  під іншим іменем) і елементи із зарезервованими іменами пристроїв (`CON`, `NUL`, `COM1`, `nul.txt` тощо) теж
+  призводять до відмови ДО першого `Set-Acl`. `BRAVO_TASKS_INSTALL.ps1 -ValidateOnly` (гейти `Install-BRAVOServer` /
+  `Update-BRAVOServer`) не застосовує ACL, тому тепер попереджає (`WARNING`) про reparse point на шляху runtime;
+  без цього гейт проходив, а крок `BRAVO_SETUP -Action Scheduler` оновлення падав і запускав відкат при кожному
+  оновленні. Поведінка для
   звичайних шляхів та `Set-BRAVOProtectedDataDirectoryAcl` не змінена. OPERATIONS: дескриптори, відкриті до
   зачистки ACL, лишаються чинними - зупиняти завдання/сесії на час перевстановлення; THREAT_MODEL: hardlink
-  (обидва напрямки) - залишковий ризик, `fsutil behavior` не змінюється. Відкрита знахідка (вікно між перевіркою й `Set-Acl`) очікує рішення власника, див. THREAT_MODEL. Self-test: 10 нових перевірок
+  (обидва напрямки) - залишковий ризик, `fsutil behavior` не змінюється. Відкрита знахідка (вікно між перевіркою й `Set-Acl`) очікує рішення власника, див. THREAT_MODEL. Self-test: 12 нових перевірок
   `Scheduler/RuntimeAclNormalPathUnchanged`, `RuntimeAclRefusesJunctionRoot`, `RuntimeAclRefusesJunctionAncestor`,
   `RuntimeAclRefusesJunctionChild`, `RuntimeAclRefusesSymlinkRootAndAncestor`,
   `RuntimeAclRefusesDeepJunctionChildNonAsciiPath`, `RuntimeAclMidRunSwapThrows`,
-  `RuntimeAclPreflightEnumerationSwapThrows`, `RuntimeAclVanishedComponentThrows`, `RuntimeAclRefusesTrailingDotOrSpaceName`; `Scheduler/ProtectedRuntimeRecursiveAcl`
+  `RuntimeAclPreflightEnumerationSwapThrows`, `RuntimeAclVanishedComponentThrows`, `RuntimeAclRefusesTrailingDotOrSpaceName`,
+  `RuntimeAclRefusesReservedDeviceName`, `RuntimeAclValidateOnlyWarnsOnReparseRoot`; `Scheduler/ProtectedRuntimeRecursiveAcl`
   перевизначено як AST-перевірку тіла функції (повний обхід, перевірка ланцюга перед кожним `Set-Acl`).
 
 - **Security: guard ідентифікаторів ловить значення, злите з іншим словом на межі регістру.**
