@@ -2,6 +2,14 @@
 
 ## Не випущено (developer)
 
+- **Release: збирання з lightweight-тега відхиляється (D8).**
+  `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
+  `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не
+  перевіряє. `release-artifact.yml` перед збиранням перечитує тег із remote, щоб перевірка не залежала від того,
+  як локальний ref створив checkout. `RELEASE_POLICY.md` 15: вимога стосується всіх релізних тегів (dev, RC,
+  stable); наявні в історії lightweight-теги лишаються як є. Self-test
+  `ReleaseArtifact/RejectsLightweightReleaseTag`, `ReleaseArtifact/AcceptsAnnotatedReleaseTag`.
+
 - **Security: guard ідентифікаторів ловить значення, злите з іншим словом на межі регістру.**
   `ci/Test-BRAVOForbiddenPattern.ps1` другим проходом ділить токен ще й на межах регістру (`BRAVO-HostNameLogs` ->
   `BRAVO`, `Host`, `Name`, `Logs`); кеш вердиктів тепер чутливий до регістру. Знайдений так залишок у

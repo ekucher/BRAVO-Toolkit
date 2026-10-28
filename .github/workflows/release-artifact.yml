@@ -49,6 +49,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:GITHUB_REF_TYPE -eq 'tag') {
+              # The builder rejects a lightweight release tag (RELEASE_POLICY.md
+              # section 15). Re-fetch the tag object exactly as it is on the
+              # remote, so the check does not depend on how checkout created
+              # the local ref.
+              git fetch --force --no-tags origin ("+refs/tags/{0}:refs/tags/{0}" -f $env:GITHUB_REF_NAME)
+              if ($LASTEXITCODE -ne 0) { exit 1 }
               .\ci\New-BRAVOReleaseArtifact.ps1 -Ref $env:GITHUB_REF_NAME -ExpectedTag $env:GITHUB_REF_NAME
           } else {
               .\ci\New-BRAVOReleaseArtifact.ps1 -Ref $env:GITHUB_SHA

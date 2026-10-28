@@ -1033,6 +1033,8 @@
     $artifactProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_ARTIFACT_PROV_{0}" -f [guid]::NewGuid().ToString('N'))
     $artifactProbeStale = ''
     $artifactProbeFresh = ''
+    $artifactProbeLightweightTag = ''
+    $artifactProbeAnnotatedTag = ''
     $artifactProbeLimitation = ''
     $artifactProbeReady = $false
     try {
@@ -1068,6 +1070,14 @@
                 $null = & git -C $artifactProbeRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'stamp' --quiet 2>&1
                 $artifactProbeFresh = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $artifactProbeRoot -Ref 'HEAD' -OutputDir (Join-Path $artifactProbeRoot 'out') 2>&1 | Out-String
 
+                # Тег релізу (D8): на тому самому чистому штампі lightweight-тег
+                # відхиляється, annotated — ні.
+                $null = & git -C $artifactProbeRoot tag v4.5.0 2>&1
+                $artifactProbeLightweightTag = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $artifactProbeRoot -Ref 'v4.5.0' -ExpectedTag 'v4.5.0' -OutputDir (Join-Path $artifactProbeRoot 'out') 2>&1 | Out-String
+                $null = & git -C $artifactProbeRoot tag -d v4.5.0 2>&1
+                $null = & git -C $artifactProbeRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' tag -a v4.5.0 -m 'BRAVO-Toolkit 4.5.0' 2>&1
+                $artifactProbeAnnotatedTag = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $artifactProbeRoot -Ref 'v4.5.0' -ExpectedTag 'v4.5.0' -OutputDir (Join-Path $artifactProbeRoot 'out') 2>&1 | Out-String
+
                 # СТАЛЕ: штамп зачіпає ще й код, тобто провенанс його не описує.
                 [IO.File]::WriteAllText((Join-Path $artifactProbeRoot 'code.txt'), "v2`r`n", $utf8NoBomArtifact)
                 $null = & git -C $artifactProbeRoot add -A 2>&1
@@ -1094,6 +1104,21 @@
         -Name "ReleaseArtifact/AcceptsCleanStampProvenance" `
         -EnvironmentLimitation $artifactProbeLimitation `
         -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має відхиляти чистий коміт-штамп (змінені лише VERSION.json і RUNTIME_MANIFEST.json); вивід: $artifactProbeFresh"
+
+    Test-BRAVOCondition `
+        -Condition ($artifactProbeLightweightTag.Contains('RELEASE_TAG_NOT_ANNOTATED')) `
+        -Name "ReleaseArtifact/RejectsLightweightReleaseTag" `
+        -EnvironmentLimitation $artifactProbeLimitation `
+        -Failure "ci\New-BRAVOReleaseArtifact.ps1 з -ExpectedTag має відмовляти на lightweight-тегу (маркер RELEASE_TAG_NOT_ANNOTATED, RELEASE_POLICY.md 15); вивід: $artifactProbeLightweightTag"
+
+    # Annotated-тег проходить перевірку тега й доходить до провенансу:
+    # позитивний випадок — відсутність обох маркерів, а не код виходу
+    # (фікстура не є справжнім комплектом).
+    Test-BRAVOCondition `
+        -Condition (-not $artifactProbeAnnotatedTag.Contains('RELEASE_TAG_NOT_ANNOTATED') -and -not $artifactProbeAnnotatedTag.Contains('PROVENANCE_')) `
+        -Name "ReleaseArtifact/AcceptsAnnotatedReleaseTag" `
+        -EnvironmentLimitation $artifactProbeLimitation `
+        -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має відхиляти annotated-тег на чистому штампі; вивід: $artifactProbeAnnotatedTag"
 
     # ROADMAP P0.2: гейт master-промоції має вимагати СЕМАНТИЧНЕ збільшення
     # stable-версії, а не лише нерівність рядків (стара реалізація
