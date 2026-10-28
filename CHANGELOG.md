@@ -2,6 +2,29 @@
 
 ## Не випущено (developer)
 
+- **Fix(security): `Set-BRAVOProtectedRuntimeAcl` fail-closed на reparse point (#482).** Функція дотримується
+  того самого reparse-КОНТРАКТУ, що й `Set-BRAVOProtectedDataDirectoryAcl` (спільний предикат
+  `Test-BRAVOPathIsReparsePoint`, перевірка кожного компонента шляху окремо), але не тієї самої схеми.
+  Відмінності: (1) дерево спочатку повністю перелічується, і лише потім починається `Set-Acl`;
+  (2) ланцюг перевіряється до кореня диска (новий `Get-BRAVOReparsePointInPathChain`); (3) перевірки власника
+  компонентів немає; (4) reparse point усередині дерева тепер ФАТАЛЬНИЙ (data-directory helper пропускає такі
+  елементи з `WARNING`). Якщо runtime-корінь, будь-який його предок або будь-який елемент усередині дерева
+  є junction/symlink, інсталятор кидає помилку з назвою шляху й дією оператора ДО першого `Set-Acl`; той самий
+  ланцюг перевіряється strict-режимом (`-Strict`: зниклий компонент теж небезпечний; семантика
+  `Test-BRAVOPathIsReparsePoint` для data-directory helper-а не змінена) безпосередньо перед переліком кожного
+  каталогу й повторно перед кожним `Set-Acl`, і зміна на будь-якому рівні також перериває встановлення (throw, не
+  пропуск). Комплект не постачає reparse point, а runtime виконує SYSTEM.
+  Вплив на сумісність: встановлення, де шлях runtime-кореня містить reparse point у предках (mount point,
+  junctioned-шлях), тепер завершується відмовою - перенесіть runtime на шлях без посилань. Поведінка для
+  звичайних шляхів та `Set-BRAVOProtectedDataDirectoryAcl` не змінена. OPERATIONS: дескриптори, відкриті до
+  зачистки ACL, лишаються чинними - зупиняти завдання/сесії на час перевстановлення; THREAT_MODEL: hardlink
+  (обидва напрямки) - залишковий ризик, `fsutil behavior` не змінюється. Відкрита знахідка (вікно між перевіркою й `Set-Acl`) очікує рішення власника, див. THREAT_MODEL. Self-test: 9 нових перевірок
+  `Scheduler/RuntimeAclNormalPathUnchanged`, `RuntimeAclRefusesJunctionRoot`, `RuntimeAclRefusesJunctionAncestor`,
+  `RuntimeAclRefusesJunctionChild`, `RuntimeAclRefusesSymlinkRootAndAncestor`,
+  `RuntimeAclRefusesDeepJunctionChildNonAsciiPath`, `RuntimeAclMidRunSwapThrows`,
+  `RuntimeAclPreflightEnumerationSwapThrows`, `RuntimeAclVanishedComponentThrows`; `Scheduler/ProtectedRuntimeRecursiveAcl`
+  перевизначено як AST-перевірку тіла функції (повний обхід, перевірка ланцюга перед кожним `Set-Acl`).
+
 - **Security: guard ідентифікаторів ловить значення, злите з іншим словом на межі регістру.**
   `ci/Test-BRAVOForbiddenPattern.ps1` другим проходом ділить токен ще й на межах регістру (`BRAVO-HostNameLogs` ->
   `BRAVO`, `Host`, `Name`, `Logs`); кеш вердиктів тепер чутливий до регістру. Знайдений так залишок у

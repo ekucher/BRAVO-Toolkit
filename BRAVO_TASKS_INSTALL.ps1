@@ -65,9 +65,42 @@ $ErrorActionPreference = "Stop"
 
 
 function Set-BRAVOProtectedRuntimeAcl {
+    # #482 / P3 (після security-ревю #474): контракт щодо reparse point
+    # узгоджений з Set-BRAVOProtectedDataDirectoryAcl, але ЖОРСТКІШИЙ для
+    # вмісту (runtime виконує SYSTEM, комплект не постачає жодного reparse
+    # point, тому будь-який такий елемент - підозрілий).
+    # (1) Якщо сам runtime-корінь або БУДЬ-ЯКИЙ предок його шляху (до кореня
+    # диска) є reparse point (junction/symlink) - throw ДО першого Set-Acl:
+    # Set-Acl через посилання змінив би ACL стороннього каталогу, а
+    # інсталятор працює elevated. Resolve-Path посилання не розкриває, тож
+    # перевірка йде по кожному компоненту окремо
+    # (Get-BRAVOReparsePointInPathChain; для runtime з -Strict: зниклий
+    # компонент теж небезпечний).
+    # (2) Дерево СПОЧАТКУ повністю перелічується (без Set-Acl); reparse point
+    # на будь-якій глибині -> throw ДО першого Set-Acl з назвою шляху. Явний
+    # власний обхід потрібен, бо Get-ChildItem -Recurse у PS 5.1 перелічує
+    # саме посилання як елемент, а Set-Acl -LiteralPath пішов би крізь нього
+    # в чужий каталог.
+    # (3) ПЕРЕД кожним Set-Acl ланцюг елемента до кореня диска
+    # перевіряється повторно (підміна компонента посеред обходу): reparse
+    # point на БУДЬ-ЯКОМУ рівні (корінь, предок, внутрішній компонент) ->
+    # throw (fail-closed), ніколи пропуск. На відміну від data-directory
+    # helper-а: немає другої фази (runtime не видає додаткових ACE), немає
+    # перевірки власника, ланцюг іде до кореня диска, а внутрішній reparse
+    # point фатальний. Дескриптори, відкриті до зачистки ACL, і hardlink-и
+    # див. OPERATIONS.md / THREAT_MODEL.md (#482).
     param([string]$RuntimeRoot)
 
     $resolvedRoot = (Resolve-Path -LiteralPath $RuntimeRoot).Path
+    $reparseComponent = Get-BRAVOReparsePointInPathChain -Path $resolvedRoot -Strict
+    if ($reparseComponent -ne '') {
+        throw (
+            "Небезпечний шлях runtime: '$reparseComponent' є reparse point (junction/symlink) " +
+            "на шляху '$resolvedRoot'. Встановлення перервано до зміни ACL (Set-Acl через " +
+            "посилання змінив би сторонній каталог). Видаліть посилання від імені " +
+            "адміністратора й повторіть."
+        )
+    }
     $resolvedUserProfile = [IO.Path]::GetFullPath(
         [Environment]::GetFolderPath("UserProfile")
     ).TrimEnd("\") + "\"
@@ -93,11 +126,52 @@ function Set-BRAVOProtectedRuntimeAcl {
     # дозвіл запису до того, як комплект був перенесений у runtime. SYSTEM
     # запускає ці файли з ExecutionPolicy Bypass, тому кожен із них має
     # отримати власний закритий ACL.
-    $runtimeItems = @($resolvedRoot) + @(
-        Get-ChildItem -LiteralPath $resolvedRoot -Force -Recurse -ErrorAction Stop |
-            ForEach-Object { $_.FullName }
-    )
+    $innerReparsePoints = New-Object 'System.Collections.Generic.List[string]'
+    $runtimeItems = New-Object 'System.Collections.Generic.List[string]'
+    $runtimeItems.Add($resolvedRoot)
+    $pendingRuntimeDirectories = New-Object 'System.Collections.Generic.Stack[string]'
+    $pendingRuntimeDirectories.Push($resolvedRoot)
+    while ($pendingRuntimeDirectories.Count -gt 0) {
+        $enumeratedDirectory = $pendingRuntimeDirectories.Pop()
+        # Підміна черговий каталог між постановкою в чергу й переліком: ланцюг (strict)
+        # перевіряється безпосередньо ПЕРЕД Get-ChildItem; reparse point або зниклий
+        # компонент -> throw (ще до будь-якого Set-Acl).
+        $preflightComponent = Get-BRAVOReparsePointInPathChain -Path $enumeratedDirectory -Strict
+        if ($preflightComponent -ne '') {
+            throw (
+                "Небезпечний шлях runtime: '$preflightComponent' став reparse point або зник під час " +
+                "попереднього переліку (каталог '$enumeratedDirectory', корінь '$resolvedRoot'). " +
+                "Встановлення перервано до зміни ACL; перевірте походження змін і повторіть."
+            )
+        }
+        foreach ($child in @(Get-ChildItem -LiteralPath $enumeratedDirectory -Force -ErrorAction Stop)) {
+            $childPath = [string]$child.FullName
+            if (Test-BRAVOPathIsReparsePoint -Path $childPath) {
+                $innerReparsePoints.Add($childPath)
+                continue
+            }
+            $runtimeItems.Add($childPath)
+            if ($child.PSIsContainer) { $pendingRuntimeDirectories.Push($childPath) }
+        }
+    }
+    if ($innerReparsePoints.Count -gt 0) {
+        throw (
+            "Небезпечний вміст runtime: знайдено reparse point (junction/symlink) усередині '$resolvedRoot': " +
+            ($innerReparsePoints -join '; ') + ". Комплект не постачає reparse point, а runtime " +
+            "виконує SYSTEM. Встановлення перервано до зміни ACL. Перевірте походження посилань і " +
+            "видаліть їх від імені адміністратора (rmdir для junction), після чого повторіть."
+        )
+    }
     foreach ($runtimeItem in $runtimeItems) {
+        $changedComponent = Get-BRAVOReparsePointInPathChain -Path $runtimeItem -Strict
+        if ($changedComponent -ne '') {
+            throw (
+                "Небезпечний шлях runtime: '$changedComponent' став reparse point або зник під час " +
+                "встановлення (елемент '$runtimeItem', корінь '$resolvedRoot'). ACL застосовано " +
+                "частково; зупиніть завдання, видаліть посилання від імені адміністратора й " +
+                "повторіть встановлення."
+            )
+        }
         # Прапорці успадкування допустимі лише для каталогів. Для файлу
         # FileSystemAccessRule кидає "No flags can be set", через що весь
         # hardening ACL зривався на першому ж дочірньому файлі.
@@ -163,6 +237,34 @@ function Test-BRAVOPathIsReparsePoint {
         return $false
     }
     return (([int]$attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Get-BRAVOReparsePointInPathChain {
+    # #482: перший (найглибший) компонент шляху, що є reparse point,
+    # від Path до кореня диска (сам корінь диска reparse point бути не може);
+    # '' - якщо жоден. Кожен компонент перевіряється окремо:
+    # GetAttributes на повному шляху пройшов би крізь junction проміжного
+    # каталогу.
+    # -Strict (runtime-шлях): компонент, якого більше немає, теж небезпечний
+    # (повертається як знайдений) - зниклий компонент не вважається безпечним.
+    # Без -Strict поведінка Test-BRAVOPathIsReparsePoint (відсутній шлях - не
+    # reparse point) не змінюється.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Strict
+    )
+
+    $cursor = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    while ($true) {
+        $parentPath = [System.IO.Path]::GetDirectoryName($cursor)
+        if ([string]::IsNullOrEmpty($parentPath)) { break }
+        if (Test-BRAVOPathIsReparsePoint -Path $cursor) { return [string]$cursor }
+        if ($Strict -and -not ([System.IO.Directory]::Exists($cursor) -or [System.IO.File]::Exists($cursor))) {
+            return [string]$cursor
+        }
+        $cursor = $parentPath
+    }
+    return ''
 }
 
 function Get-BRAVOPathOwnerSid {
