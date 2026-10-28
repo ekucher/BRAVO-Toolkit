@@ -127,6 +127,7 @@ function Set-BRAVOProtectedRuntimeAcl {
     # запускає ці файли з ExecutionPolicy Bypass, тому кожен із них має
     # отримати власний закритий ACL.
     $innerReparsePoints = New-Object 'System.Collections.Generic.List[string]'
+    $unsafeRuntimeNames = New-Object 'System.Collections.Generic.List[string]'
     $runtimeItems = New-Object 'System.Collections.Generic.List[string]'
     $runtimeItems.Add($resolvedRoot)
     $pendingRuntimeDirectories = New-Object 'System.Collections.Generic.Stack[string]'
@@ -146,6 +147,13 @@ function Set-BRAVOProtectedRuntimeAcl {
         }
         foreach ($child in @(Get-ChildItem -LiteralPath $enumeratedDirectory -Force -ErrorAction Stop)) {
             $childPath = [string]$child.FullName
+            # Ім'я з крапкою/пробілом у кінці (створюється лише через \\?\) Win32
+            # нормалізує до іншого імені: перевірки й Set-Acl діяли б на сусіда, а
+            # вміст самого елемента лишився б неперевіреним. Фатально, як reparse point.
+            if ($child.Name.EndsWith('.') -or $child.Name.EndsWith(' ')) {
+                $unsafeRuntimeNames.Add($childPath)
+                continue
+            }
             if (Test-BRAVOPathIsReparsePoint -Path $childPath) {
                 $innerReparsePoints.Add($childPath)
                 continue
@@ -160,6 +168,14 @@ function Set-BRAVOProtectedRuntimeAcl {
             ($innerReparsePoints -join '; ') + ". Комплект не постачає reparse point, а runtime " +
             "виконує SYSTEM. Встановлення перервано до зміни ACL. Перевірте походження посилань і " +
             "видаліть їх від імені адміністратора (rmdir для junction), після чого повторіть."
+        )
+    }
+    if ($unsafeRuntimeNames.Count -gt 0) {
+        throw (
+            "Небезпечний вміст runtime: знайдено елементи з крапкою або пробілом у кінці імені усередині '$resolvedRoot': " +
+            ($unsafeRuntimeNames -join '; ') + ". Windows звертається до них під іншим іменем, тому ACL не можна " +
+            "застосувати надійно. Встановлення перервано до зміни ACL. Видаліть ці елементи від імені " +
+            "адміністратора (шлях із префіксом \\?\) і повторіть."
         )
     }
     foreach ($runtimeItem in $runtimeItems) {

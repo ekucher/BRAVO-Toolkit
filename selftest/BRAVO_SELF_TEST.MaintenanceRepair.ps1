@@ -1966,13 +1966,16 @@ try {
             # секцію; успіх визначається кодом завершення І наявністю reparse point.
             $ErrorActionPreference = 'Continue'
             $mklinkSwitch = if ($Kind -eq 'D') { '/D' } else { '/J' }
-            $null = & cmd.exe /c mklink $mklinkSwitch "$LinkPath" "$TargetPath" 2>&1
+            $mklinkOutput = (@(& cmd.exe /c mklink $mklinkSwitch "$LinkPath" "$TargetPath" 2>&1) | ForEach-Object { [string]$_ }) -join ' '
             $mklinkExit = $LASTEXITCODE
             $created = ($mklinkExit -eq 0) -and [IO.Directory]::Exists($LinkPath) -and
                 (([int][IO.File]::GetAttributes($LinkPath) -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)
             if ($created) { [void]$acl482Junctions.Add($LinkPath) }
+            # Причину недоступності беремо з фактичного виводу mklink, а не припускаємо.
+            $acl482LinkFailure.Value = if ($created) { '' } else { "mklink $mklinkSwitch exit=$mklinkExit`: $mklinkOutput".Trim() }
             return $created
         }
+        $acl482LinkFailure = [ref]''
         $acl482Refused = {
             param($Result, [string]$MustMention)
             return ($Result.Calls.Count -eq 0 -and $null -ne $Result.Error -and
@@ -2064,7 +2067,7 @@ try {
                 (& $acl482Refused $acl482SymAncestorResult $acl482SymLink)
             ) -Name 'Scheduler/RuntimeAclRefusesSymlinkRootAndAncestor' `
                 -Failure ("symlink як runtime-корінь/предок має призвести до throw ДО Set-Acl (symlink створено: $acl482SymCreated)") `
-                -EnvironmentLimitation $(if ($acl482SymCreated) { '' } else { 'mklink /D не створив символічне посилання на каталог (немає SeCreateSymbolicLinkPrivilege)' })
+                -EnvironmentLimitation $(if ($acl482SymCreated) { '' } else { 'mklink /D не створив символічне посилання на каталог: ' + $acl482LinkFailure.Value })
 
             # 6) Глибокий junction-нащадок + кирилиця й пробіли у шляху -> throw без жодного Set-Acl.
             $acl482Victim2 = Join-Path $acl482Scratch 'ціль з пробілами'
@@ -2123,12 +2126,32 @@ try {
                 -not (@($acl482GoneResult.Calls | Where-Object { $_.Path -eq $acl482GoneFile }).Count -gt 0)
             ) -Name 'Scheduler/RuntimeAclVanishedComponentThrows' `
                 -Failure ("компонент, що зник посеред обходу, не є безпечним: має бути throw без Set-Acl по ньому: " + [string]$acl482GoneResult.Error + ' | ' + (($acl482GoneResult.Calls | ForEach-Object { $_.Path }) -join ', '))
+
+            # 10) Ім'я з крапкою / пробілом у кінці (створене через \\?\) поруч зі звичайним 'x': Win32
+            # нормалізує 'x.' до 'x', тож вміст 'x.' лишився б неперевіреним -> throw без жодного Set-Acl.
+            $acl482DotRoot = Join-Path $acl482Scratch 'dot-runtime'
+            [void][IO.Directory]::CreateDirectory((Join-Path $acl482DotRoot 'x'))
+            [void][IO.Directory]::CreateDirectory('\\?\' + (Join-Path $acl482DotRoot 'x.'))
+            [IO.File]::WriteAllText('\\?\' + (Join-Path $acl482DotRoot 'x.\hidden.ps1'), '# x')
+            [IO.File]::WriteAllText('\\?\' + (Join-Path $acl482DotRoot 'y '), '# x')
+            $acl482DotResult = & $acl482Probe $acl482Functions $acl482DotRoot
+            Test-BRAVOCondition -Condition (
+                $acl482DotResult.Calls.Count -eq 0 -and $null -ne $acl482DotResult.Error -and
+                $acl482DotResult.Error.Contains((Join-Path $acl482DotRoot 'x.')) -and
+                $acl482DotResult.Error.Contains((Join-Path $acl482DotRoot 'y '))
+            ) -Name 'Scheduler/RuntimeAclRefusesTrailingDotOrSpaceName' `
+                -Failure ("елемент з крапкою/пробілом у кінці імені має призвести до throw ДО першого Set-Acl: " + [string]$acl482DotResult.Error + ' | calls=' + $acl482DotResult.Calls.Count)
         } finally {
             foreach ($acl482Junction in @($acl482Junctions)) {
                 if ([IO.Directory]::Exists($acl482Junction)) { & cmd.exe /c rmdir "$acl482Junction" 2>&1 | Out-Null }
             }
             if ([IO.Directory]::Exists($acl482Scratch)) {
-                Remove-Item -LiteralPath $acl482Scratch -Recurse -Force -ErrorAction SilentlyContinue
+                # Елемент 'x.' (тест 10) дає Remove-Item термінальний Win32Exception навіть з SilentlyContinue.
+                try { Remove-Item -LiteralPath $acl482Scratch -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+            }
+            # Елементи з крапкою/пробілом у кінці (тест 10) видаляються лише через \\?\; junction-и вже прибрано вище.
+            if ([IO.Directory]::Exists($acl482Scratch)) {
+                try { [IO.Directory]::Delete('\\?\' + $acl482Scratch, $true) } catch { Write-Host "[WARN] не вдалося прибрати $acl482Scratch`: $($_.Exception.Message)" -ForegroundColor Yellow }
             }
         }
     }

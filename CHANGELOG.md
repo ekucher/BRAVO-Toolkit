@@ -15,14 +15,18 @@
   каталогу й повторно перед кожним `Set-Acl`, і зміна на будь-якому рівні також перериває встановлення (throw, не
   пропуск). Комплект не постачає reparse point, а runtime виконує SYSTEM.
   Вплив на сумісність: встановлення, де шлях runtime-кореня містить reparse point у предках (mount point,
-  junctioned-шлях), тепер завершується відмовою - перенесіть runtime на шлях без посилань. Поведінка для
+  junctioned-шлях), тепер завершується відмовою - перенесіть runtime на шлях без посилань. Так само відмовою
+  завершується встановлення, де junction створено ВСЕРЕДИНІ runtime-дерева (наприклад, `LOGS`, перенесений на
+  інший том через junction): раніше `Set-Acl` проходив крізь таке посилання, тепер - `throw` з назвою шляху.
+  Елементи runtime з крапкою або пробілом у кінці імені (створюються лише через `\\?\`; Windows звертається до них
+  під іншим іменем) теж призводять до відмови ДО першого `Set-Acl`. Поведінка для
   звичайних шляхів та `Set-BRAVOProtectedDataDirectoryAcl` не змінена. OPERATIONS: дескриптори, відкриті до
   зачистки ACL, лишаються чинними - зупиняти завдання/сесії на час перевстановлення; THREAT_MODEL: hardlink
-  (обидва напрямки) - залишковий ризик, `fsutil behavior` не змінюється. Відкрита знахідка (вікно між перевіркою й `Set-Acl`) очікує рішення власника, див. THREAT_MODEL. Self-test: 9 нових перевірок
+  (обидва напрямки) - залишковий ризик, `fsutil behavior` не змінюється. Відкрита знахідка (вікно між перевіркою й `Set-Acl`) очікує рішення власника, див. THREAT_MODEL. Self-test: 10 нових перевірок
   `Scheduler/RuntimeAclNormalPathUnchanged`, `RuntimeAclRefusesJunctionRoot`, `RuntimeAclRefusesJunctionAncestor`,
   `RuntimeAclRefusesJunctionChild`, `RuntimeAclRefusesSymlinkRootAndAncestor`,
   `RuntimeAclRefusesDeepJunctionChildNonAsciiPath`, `RuntimeAclMidRunSwapThrows`,
-  `RuntimeAclPreflightEnumerationSwapThrows`, `RuntimeAclVanishedComponentThrows`; `Scheduler/ProtectedRuntimeRecursiveAcl`
+  `RuntimeAclPreflightEnumerationSwapThrows`, `RuntimeAclVanishedComponentThrows`, `RuntimeAclRefusesTrailingDotOrSpaceName`; `Scheduler/ProtectedRuntimeRecursiveAcl`
   перевизначено як AST-перевірку тіла функції (повний обхід, перевірка ланцюга перед кожним `Set-Acl`).
 
 - **Security: guard ідентифікаторів ловить значення, злите з іншим словом на межі регістру.**
