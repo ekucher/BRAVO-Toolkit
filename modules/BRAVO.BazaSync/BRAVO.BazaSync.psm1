@@ -2402,7 +2402,7 @@ function Invoke-BRAVOBazaComponentSyncSession {
     try {
         # #480: невалідний/accept-any host key -> throw ДО Add-Type і створення WinSCP-сесії (catch -> ERROR).
         $validatedHostKey = ConvertTo-BRAVOSshHostKeyFingerprint -Value $HostKey
-        # Guard (acceptance DEV-LIMS, 2026-08-13): .NET-асемблі потрібен
+        # Guard (acceptance HOST-11, 2026-08-13): .NET-асемблі потрібен
         # САМЕ winscp.exe. Якщо сюди передати WinSCP.com (консольний
         # CLI-стаб), Session.Open запускає ІНТЕРАКТИВНУ консоль — у вікні
         # оператора з'являється голий промпт "winscp>", а сесія висне з

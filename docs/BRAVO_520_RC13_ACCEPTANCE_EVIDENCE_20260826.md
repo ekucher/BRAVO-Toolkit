@@ -135,7 +135,7 @@ Scheduler на серверах). Варіант A додатково показ
 
 Буквальна форма вимагає OutOfPlace-restore реальної generation,
 створеної stable 5.1.0, через `BRAVO_DATA_RESTORE.ps1` +
-`BRAVO_RESTORE_TEST.ps1` на DEV-LIMS. Такої generation на
+`BRAVO_RESTORE_TEST.ps1` на HOST-11. Такої generation на
 контрольованому сервері вже не існує (production-сервери працюють на
 rc-лінії; їх generations створені rc-кандидатами). Компенсатори:
 

@@ -346,7 +346,7 @@ function Get-BRAVODirectories {
             (@($taMaskSession.State.MoveFileCalls) -contains '/trace/Trace[[]1].mdz.new -> /trace/Trace[1].mdz')
         ) -Name 'TraceArchive/SftpPublishEscapesWinSCPFileMasks' -Failure "ім'я з [ ] має передаватись у WinSCP екранованим (PutFiles-джерело, RemoveFiles, MoveFile-джерело), сусідній Trace1.mdz недоторканий; факт: error=$($taMaskResult.Error) final=$($taMaskSession.State.RemoteSizes['/trace/Trace[1].mdz']) decoy=$($taMaskSession.State.RemoteSizes['/trace/Trace1.mdz']) put=$(@($taMaskSession.State.PutFilesLocalArgs) -join ',') rm=$(@($taMaskSession.State.RemoveFilesCalls) -join ',') mv=$(@($taMaskSession.State.MoveFileCalls) -join ',')"
 
-        # --- РЕГРЕСІЯ (реальний DEV-LIMS): remote-каталог /trace/ не існував,
+        # --- РЕГРЕСІЯ (реальний HOST-11): remote-каталог /trace/ не існував,
         # session.PutFiles його НЕ створює, і кожен прогін падав із
         # "Cannot create remote file '/trace/....new.filepart'. No such file
         # or directory" -> exit 60 обслуговування, яке відпрацювало. Каталог

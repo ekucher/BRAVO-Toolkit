@@ -1,6 +1,6 @@
-name: DEV-LIMS self-test
+name: HOST-11 self-test
 
-# Ручний прогін повного BRAVO_SELF_TEST.ps1 на self-hosted раннері DEV-LIMS
+# Ручний прогін повного BRAVO_SELF_TEST.ps1 на self-hosted раннері HOST-11
 # (Windows PowerShell 5.1 на реальному цільовому хості, а не windows-latest).
 # Це ДОДАТКОВИЙ acceptance-рівень: він не замінює звичайний CI (ci.yml).
 #
@@ -19,9 +19,9 @@ name: DEV-LIMS self-test
 # - Запуск і повторний запуск - лише власник (github.actor і
 #   github.triggering_actor == ekucher); для інших задача skipped.
 # - permissions: contents: read обмежує ЛИШЕ GITHUB_TOKEN. Код із
-#   репозиторію виконується на DEV-LIMS із правами облікового запису
+#   репозиторію виконується на HOST-11 із правами облікового запису
 #   служби раннера - це окрема межа довіри (див. опис PR).
-# - Повний вивід self-test пишеться у локальний файл на DEV-LIMS
+# - Повний вивід self-test пишеться у локальний файл на HOST-11
 #   (%ProgramData%\BRAVO-DevLimsAcceptance\<run>), а в публічну консоль
 #   задачі потрапляє лише підсумок: SHA, версія PowerShell, кількість
 #   PASS/FAIL, імена провалених перевірок (без повідомлень), exit code,
@@ -30,7 +30,7 @@ name: DEV-LIMS self-test
 # - checkout clean: true очищає лише робочу теку Git, а не стан хоста.
 # - Не змінює -Suite: прогін завжди повний канонічний.
 #
-# Раннер обирається за окремою custom-міткою dev-lims (плюс self-hosted,
+# Раннер обирається за окремою custom-міткою host-11 (плюс self-hosted,
 # Windows, X64), тож задача ніколи не потрапить на інший self-hosted раннер.
 
 on:
@@ -50,17 +50,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: dev-lims-selftest
+  group: host-11-selftest
   cancel-in-progress: false
 
 jobs:
   self-test:
-    name: BRAVO_SELF_TEST.ps1 (DEV-LIMS)
+    name: BRAVO_SELF_TEST.ps1 (HOST-11)
     if: >
       github.repository == 'ekucher/BRAVO-Toolkit' &&
       github.actor == 'ekucher' &&
       github.triggering_actor == 'ekucher'
-    runs-on: [self-hosted, Windows, X64, dev-lims]
+    runs-on: [self-hosted, Windows, X64, host-11]
     timeout-minutes: 120
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}

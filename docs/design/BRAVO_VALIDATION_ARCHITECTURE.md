@@ -34,7 +34,7 @@ Repository acceptance
 Specialized integration / CI
        |
        v
-DEV-LIMS / release acceptance за потреби
+HOST-11 / release acceptance за потреби
 
 Встановлення
        |
@@ -97,7 +97,7 @@ C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json
 - тематичні скрипти у `selftest/`;
 - спеціалізовані test entrypoints, зокрема для configuration і data restore;
 - стандартна GitHub Actions validation: `.github/workflows/ci.yml` (Full на кожен PR без `paths:`) і `.github/workflows/config-parity.yml` (required check створюється завжди, рішення про релевантність приймається всередині job);
-- DEV-LIMS workflow для Full Self-Test acceptance;
+- HOST-11 workflow для Full Self-Test acceptance;
 - вибірковий developer-прогін `-Suite` у `BRAVO_SELF_TEST.ps1` (не acceptance; друкує `SELF-TEST PARTIAL` замість `SELF-TEST PASSED`; невідоме ім'я suite завершується помилкою; Full лишається типовим режимом).
 
 Наявні guard-и CI: `Framework/CiWorkflowNeverNarrowsSelfTest` (ci.yml не звужує Self-Test) і `Governance/RequiredChecksListCoversCiWorkflowJobs` (pull_request-job-и ci.yml відповідають переліку required checks у `RELEASE_POLICY.md`).
@@ -160,7 +160,7 @@ Full обов'язковий щонайменше коли:
 - змінюється широкий/shared component і dependency model не дозволяє безпечно обмежити affected set;
 - acceptance policy PR/release прямо вимагає Full;
 - суттєва інтеграційна зміна або зміна бази робить попередні докази Full неактуальними;
-- DEV-LIMS або release acceptance прямо вимагає канонічну Full-команду.
+- HOST-11 або release acceptance прямо вимагає канонічну Full-команду.
 
 Нормальний цикл розробки:
 
@@ -472,7 +472,7 @@ READY  BLOCKED
 | Affected | Чи працює відома залежна поведінка? | development / pre-review |
 | Full Self-Test | Чи проходить повний repository Self-Test contract? | development / CI / acceptance |
 | Specialized tests | Чи проходить спеціалізований integration contract? | CI / acceptance |
-| DEV-LIMS acceptance | Чи проходить exact candidate необхідний real-host acceptance? | controlled acceptance host |
+| HOST-11 acceptance | Чи проходить exact candidate необхідний real-host acceptance? | controlled acceptance host |
 | Post-Install Verify | Чи має конкретна installation статус READY? | installed host |
 | Health / Maintenance | Чи є встановлена система здоровою під час operation? | operational host |
 
@@ -528,7 +528,7 @@ Self-Test evolution    Installer MVP
 - duplicated harness behavior;
 - ordering dependencies;
 - logging, counters та exit behavior;
-- CI і DEV-LIMS consumers.
+- CI і HOST-11 consumers.
 
 Результат: ownership/dependency inventory.
 
@@ -695,9 +695,9 @@ Full валідний лише якщо: exit 0, маркер `SELF-TEST PASSED`
 
 Оцінка: 2–4 години.
 
-### ACC-03 — DEV-LIMS Acceptance
+### ACC-03 — HOST-11 Acceptance
 
-Коли це потрібно і operational gates дозволяють, виконати exact-SHA canonical Full acceptance у контрольованому DEV-LIMS environment. Той самий критерій валідності Full, що й в ACC-01 (exit 0, `SELF-TEST PASSED`, 0 `[НЕДОСТУПНО]`, 0 перерваних/пропущених секцій), застосовується тут; exit 0 і маркер самі по собі недостатні.
+Коли це потрібно і operational gates дозволяють, виконати exact-SHA canonical Full acceptance у контрольованому HOST-11 environment. Той самий критерій валідності Full, що й в ACC-01 (exit 0, `SELF-TEST PASSED`, 0 `[НЕДОСТУПНО]`, 0 перерваних/пропущених секцій), застосовується тут; exit 0 і маркер самі по собі недостатні.
 
 Завершення попередніх задач саме по собі не авторизує цю дію.
 
