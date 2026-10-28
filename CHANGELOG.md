@@ -2,6 +2,17 @@
 
 ## Не випущено (developer)
 
+- **Fix: `BRAVO_DRY_RUN.ps1` більше не обривається, коли перелік служб Windows недоступний.**
+  Пошук опціональних служб (BravoWeb, exchangAPI) у `Get-BRAVODryRunConfiguredServiceState` викликав
+  `Get-Service` без `-Name`. Без права `SC_MANAGER_ENUMERATE_SERVICE` (напр. обліковий запис у
+  batch-сесії без групи INTERACTIVE/SERVICE у токені) Windows PowerShell 5.1 кидає тоді термінальний
+  виняток «Cannot open Service Control Manager», який `-ErrorAction SilentlyContinue` не придушує, і
+  весь Dry Run завершувався `[FAIL] Dry-run — Фатальна помилка` без жодної подальшої перевірки.
+  Тепер збій переліку повертається як `EnumerationError`, компонент вважається відсутнім, а Dry Run
+  показує окремий `[WARN] Служби` з причиною і продовжує решту перевірок. Поведінка з доступним
+  переліком служб не змінилась. Регресія: self-test `DryRun/ServiceEnumerationDeniedIsWarnNotFatal`
+  (suite `ServiceQuiescence`); наскрізно — `LocalOnly/DryRunRendersExplicitDisabledForBothDestinations`.
+
 - **Security: guard ідентифікаторів ловить значення, злите з іншим словом на межі регістру.**
   `ci/Test-BRAVOForbiddenPattern.ps1` другим проходом ділить токен ще й на межах регістру (`BRAVO-HostNameLogs` ->
   `BRAVO`, `Host`, `Name`, `Logs`); кеш вердиктів тепер чутливий до регістру. Знайдений так залишок у
