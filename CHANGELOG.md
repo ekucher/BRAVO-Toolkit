@@ -2,6 +2,14 @@
 
 ## Не випущено (developer)
 
+- **Release: збирання з lightweight-тега відхиляється (D8).**
+  `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
+  `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не
+  перевіряє. `release-artifact.yml` перед збиранням перечитує тег із remote, щоб перевірка не залежала від того,
+  як локальний ref створив checkout. `RELEASE_POLICY.md` 15: вимога стосується всіх релізних тегів (dev, RC,
+  stable); наявні в історії lightweight-теги лишаються як є. Self-test
+  `ReleaseArtifact/RejectsLightweightReleaseTag`, `ReleaseArtifact/AcceptsAnnotatedReleaseTag`.
+
 - **Fix: `BRAVO_DRY_RUN.ps1` більше не обривається, коли перелік служб Windows недоступний.**
   Пошук опціональних служб (BravoWeb, exchangAPI) у `Get-BRAVODryRunConfiguredServiceState` викликав
   `Get-Service` без `-Name`. Без права `SC_MANAGER_ENUMERATE_SERVICE` (напр. обліковий запис у
