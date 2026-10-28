@@ -10,6 +10,17 @@
   stable); наявні в історії lightweight-теги лишаються як є. Self-test
   `ReleaseArtifact/RejectsLightweightReleaseTag`, `ReleaseArtifact/AcceptsAnnotatedReleaseTag`.
 
+- **Fix: `BRAVO_DRY_RUN.ps1` більше не обривається, коли перелік служб Windows недоступний.**
+  Пошук опціональних служб (BravoWeb, exchangAPI) у `Get-BRAVODryRunConfiguredServiceState` викликав
+  `Get-Service` без `-Name`. Без права `SC_MANAGER_ENUMERATE_SERVICE` (напр. обліковий запис у
+  batch-сесії без групи INTERACTIVE/SERVICE у токені) Windows PowerShell 5.1 кидає тоді термінальний
+  виняток «Cannot open Service Control Manager», який `-ErrorAction SilentlyContinue` не придушує, і
+  весь Dry Run завершувався `[FAIL] Dry-run — Фатальна помилка` без жодної подальшої перевірки.
+  Тепер збій переліку повертається як `EnumerationError`, компонент вважається відсутнім, а Dry Run
+  показує окремий `[WARN] Служби` з причиною і продовжує решту перевірок. Поведінка з доступним
+  переліком служб не змінилась. Регресія: self-test `DryRun/ServiceEnumerationDeniedIsWarnNotFatal`
+  (suite `ServiceQuiescence`); наскрізно — `LocalOnly/DryRunRendersExplicitDisabledForBothDestinations`.
+
 - **Fix(security): `Set-BRAVOProtectedRuntimeAcl` fail-closed на reparse point (#482).** Функція дотримується
   того самого reparse-КОНТРАКТУ, що й `Set-BRAVOProtectedDataDirectoryAcl` (спільний предикат
   `Test-BRAVOPathIsReparsePoint`, перевірка кожного компонента шляху окремо), але не тієї самої схеми.
