@@ -23,6 +23,18 @@ foreach ($policyFile in $script:BRAVOUpdateSharedPolicyFiles) {
     . $policyFile
 }
 
+# Спільні модулі toolkit, потрібні частинам (BRAVO.Logging: Protect-BRAVOLogSecret
+# для звітів; BRAVO.ExitCodes: канонічні коди завершення). Імпортуються ОДИН раз
+# тут, до частин, у область модуля (-Global:$false: не засмічуємо сесію
+# викликача); відсутній модуль — fail closed, без «лінивих» імпортів у частинах.
+foreach ($sharedModuleRelativePath in @('modules\BRAVO.Logging\BRAVO.Logging.psd1', 'modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1')) {
+    $sharedModulePath = Join-Path $script:BRAVOUpdateToolkitRoot $sharedModuleRelativePath
+    if (-not (Test-Path -LiteralPath $sharedModulePath -PathType Leaf)) {
+        throw "BRAVO.Update: shared module not found: $sharedModulePath"
+    }
+    Import-Module -Name $sharedModulePath -DisableNameChecking -Global:$false -ErrorAction Stop
+}
+
 $script:BRAVOUpdateParts = @(
     'BRAVO.Update.Paths.ps1',
     'BRAVO.Update.Contracts.ps1',

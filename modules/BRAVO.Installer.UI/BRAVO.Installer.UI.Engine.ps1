@@ -5,6 +5,9 @@
 # Побудова команд — чисті функції (тестуються без процесів); запуск — тонкий.
 # Секретів у аргументах немає за конструкцією: жоден параметр їх не приймає.
 
+# Корінь комплекту: <toolkit>\modules\BRAVO.Installer.UI\<ця частина>.
+$script:BRAVOInstallerToolkitRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+
 function ConvertTo-BRAVOInstallerQuotedArgument {
     # Один аргумент командного рядка Windows. Шлях з пробілами/кирилицею
     # береться в лапки; лапка всередині недопустима (fail closed — нема
@@ -253,34 +256,44 @@ function Get-BRAVOInstallerEngineJobStatus {
         ExitCode = $Handle.Process.ExitCode; StdOut = $stdout; StdErr = $stderr; Data = $data; Error = $errorText }
 }
 
+function Import-BRAVOInstallerUpdateModule {
+    <#
+    .SYNOPSIS
+        Підключає модуль BRAVO.Update з КОРЕНЯ комплекту цього інсталятора
+        (одна канонічна реалізація читання прогресу й контрактів) і повертає
+        його. Fail closed: немає маніфесту або імпорт не вдався -> виняток;
+        власного запасного читача JSONL у GUI немає.
+    #>
+    [CmdletBinding()]
+    param([string]$ToolkitRoot = $script:BRAVOInstallerToolkitRoot)
+
+    $loaded = Get-Module -Name 'BRAVO.Update'
+    if ($null -ne $loaded) { return $loaded }
+    $manifest = Join-Path $ToolkitRoot 'modules\BRAVO.Update\BRAVO.Update.psd1'
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+        throw "BRAVO.Installer.UI: модуль BRAVO.Update не знайдено ($manifest)."
+    }
+    # -Global:$false — модуль доступний лише всередині UI-модуля, сесію
+    # оператора не засмічуємо.
+    Import-Module -Name $manifest -DisableNameChecking -Global:$false -ErrorAction Stop
+    $imported = Get-Module -Name 'BRAVO.Update'
+    if ($null -eq $imported) { throw 'BRAVO.Installer.UI: модуль BRAVO.Update не завантажився.' }
+    return $imported
+}
+
 function Read-BRAVOInstallerProgress {
     <#
     .SYNOPSIS
-        Читає progress.jsonl (лише читання). Основний шлях — канонічний
-        Read-BRAVOUpdateProgressEvents з BRAVO.Update, якщо модуль завантажено;
-        інакше — мінімальний толерантний data-only розбір JSONL (без політики).
+        Читає progress.jsonl (лише читання) канонічним
+        Read-BRAVOUpdateProgressEvents з BRAVO.Update (модуль імпортується
+        з кореня комплекту, fail closed). Нечитабельні/«рвані» рядки пропускає
+        сам канонічний читач.
     #>
     [CmdletBinding()]
     param([AllowNull()][string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
-    if (Get-Command -Name 'Read-BRAVOUpdateProgressEvents' -ErrorAction SilentlyContinue) {
-        try { return @(Read-BRAVOUpdateProgressEvents -Path $Path) } catch { $null = $_ }
-    }
-    $events = @()
-    $stream = $null
-    $reader = $null
-    try {
-        # Engine пише в цей файл паралельно: відкриваємо з FileShare.ReadWrite.
-        $stream = New-Object System.IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-        $reader = New-Object System.IO.StreamReader($stream, [Text.Encoding]::UTF8)
-        while ($null -ne ($line = $reader.ReadLine())) {
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            try { $events += ($line | ConvertFrom-Json) } catch { $null = $_ }   # частково записаний останній рядок ігноруємо
-        }
-    } catch {
-        return @()
-    } finally {
-        if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() }
-    }
-    @($events)
+    $updateModule = Import-BRAVOInstallerUpdateModule
+    # Виклик у контексті модуля: Read-BRAVOUpdateProgressEvents — функція
+    # модуля незалежно від того, чи вона вже в FunctionsToExport.
+    return @(& $updateModule { param($ProgressPath) Read-BRAVOUpdateProgressEvents -Path $ProgressPath } $Path)
 }

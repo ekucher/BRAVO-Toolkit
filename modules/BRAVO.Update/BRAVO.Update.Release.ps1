@@ -23,27 +23,6 @@ $script:BRAVOReleaseArtifactNamePattern = '^BRAVO-Toolkit-[0-9A-Za-z.\-]+\.zip$'
 # Службове обмеження: VERSION.json — крихітний файл; більший вважаємо підміною.
 $script:BRAVOReleaseMaxVersionJsonBytes = 65536
 
-function New-BRAVOReleaseFinding {
-    <#
-        Єдина точка створення Finding у цій частині: контракт Finding
-        (docs\installer\CONTRACTS.md, п.2) належить частині Contracts, тут лише
-        викликається New-BRAVOUpdateFinding.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][string]$Id,
-        [Parameter(Mandatory = $true)][ValidateSet('Ok', 'Warning', 'Blocker', 'NotApplicable')][string]$Severity,
-        [Parameter(Mandatory = $true)][string]$Title,
-        [string]$Meaning = '',
-        [string]$Action = '',
-        [string]$Details = '',
-        [AllowNull()][object]$ExitCodeHint = $null
-    )
-
-    return (New-BRAVOUpdateFinding -Id $Id -Severity $Severity -Title $Title `
-            -Meaning $Meaning -Action $Action -Details $Details -ExitCodeHint $ExitCodeHint)
-}
-
 function Get-BRAVOReleaseCandidate {
     [CmdletBinding()]
     param(
@@ -246,24 +225,12 @@ function Get-BRAVOOfflineReleaseSource {
     return $result
 }
 
-function Get-BRAVOReleaseGuardPath {
-    [CmdletBinding()]
-    param()
-
-    $guardPath = Join-Path $script:BRAVOUpdateToolkitRoot 'BRAVO_RUNTIME_GUARD.ps1'
-    if (-not [System.IO.File]::Exists($guardPath)) {
-        throw ('Довірений BRAVO_RUNTIME_GUARD.ps1 не знайдено: {0}' -f $guardPath)
-    }
-    return $guardPath
-}
-
 function Compare-BRAVOReleaseVersionText {
     <#
-        Порівняння версій довіреним guard-ом ПОТОЧНОГО комплекту (не staged).
-        Dot-source guard-а лише оголошує функції (основний блок guard-а
-        спрацьовує тільки при прямому запуску), а оголошені функції та його
-        param-змінні лишаються в області цієї helper-функції й не забруднюють
-        область модуля. Повертає -1/0/1 або $null, якщо версію не розпізнано.
+        Порівняння версій довіреним guard-ом ПОТОЧНОГО комплекту (не staged)
+        через канонічний Import-BRAVOUpdateTrustedGuardFunctions (Paths).
+        Повертає -1/0/1 або $null, якщо версію не розпізнано; відсутній guard
+        -> виняток (викликач перетворює його на finding).
     #>
     [CmdletBinding()]
     param(
@@ -271,7 +238,7 @@ function Compare-BRAVOReleaseVersionText {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RightText
     )
 
-    . (Get-BRAVOReleaseGuardPath)
+    Import-BRAVOUpdateTrustedGuardFunctions
     $left = ConvertTo-BRAVOComparableVersion -Text $LeftText
     $right = ConvertTo-BRAVOComparableVersion -Text $RightText
     if ($null -eq $left -or $null -eq $right) { return $null }
@@ -289,7 +256,7 @@ function Test-BRAVOReleaseTrustedIntegrity {
         [Parameter(Mandatory = $true)][string]$IntegrityManifestPath
     )
 
-    . (Get-BRAVOReleaseGuardPath)
+    Import-BRAVOUpdateTrustedGuardFunctions
     return (Test-BRAVORuntimeManifestIntegrity -RuntimeRoot $StagedRoot -ManifestPath $IntegrityManifestPath -Mode Enforce)
 }
 
@@ -392,7 +359,7 @@ function Test-BRAVOReleaseArtifact {
 
     $addBlocker = {
         param($Id, $Title, $Meaning, $Details, $Hint)
-        [void]$findings.Add((New-BRAVOReleaseFinding -Id $Id -Severity Blocker -Title $Title -Meaning $Meaning `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id $Id -Severity Blocker -Title $Title -Meaning $Meaning `
                     -Action $blockerAction -Details ([string]$Details) -ExitCodeHint $Hint))
     }
     $finish = {
@@ -444,7 +411,7 @@ function Test-BRAVOReleaseArtifact {
         }
     }
     if ($checksumOk) {
-        [void]$findings.Add((New-BRAVOReleaseFinding -Id 'Release.ArtifactHash' -Severity Ok -Title 'SHA-256 архіва збігається' -Details $computedHash))
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Release.ArtifactHash' -Severity Ok -Title 'SHA-256 архіва збігається' -Details $computedHash))
     }
 
     # --- 2. release-manifest.json -------------------------------------------
@@ -527,7 +494,7 @@ function Test-BRAVOReleaseArtifact {
             if (-not $provenance.IsValid) {
                 & $addBlocker 'Release.Provenance' 'Провенанс релізу не підтверджено' 'VERSION.json не узгоджується з незалежним release-manifest.json.' ([string]::Join('; ', @($provenance.Problems))) 42
             } else {
-                [void]$findings.Add((New-BRAVOReleaseFinding -Id 'Release.Provenance' -Severity Ok -Title 'Провенанс підтверджено release-manifest.json' -Details ([string]$provenance.Message)))
+                [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Release.Provenance' -Severity Ok -Title 'Провенанс підтверджено release-manifest.json' -Details ([string]$provenance.Message)))
             }
         }
 
@@ -536,7 +503,7 @@ function Test-BRAVOReleaseArtifact {
         if (-not $channelDecision.Allowed) {
             & $addBlocker 'Release.Channel' 'Канал релізу не дозволено' 'Не-stable реліз розгортається лише за явним рішенням оператора.' $channelDecision.Message 42
         } elseif ($channelDecision.Severity -eq 'Warning') {
-            [void]$findings.Add((New-BRAVOReleaseFinding -Id 'Release.Channel' -Severity Warning -Title 'Не-stable реліз за явним дозволом' `
+            [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Release.Channel' -Severity Warning -Title 'Не-stable реліз за явним дозволом' `
                         -Meaning 'Prerelease розгортається за рішенням оператора.' -Action 'Зафіксуйте рішення в журналі.' -Details ([string]$channelDecision.Message)))
         }
         if ($isPrereleaseTag -and -not $AllowPrerelease) {
@@ -613,7 +580,7 @@ function Test-BRAVOStagedRuntime {
     $findings = New-Object System.Collections.Generic.List[object]
     $addBlocker = {
         param($Id, $Title, $Meaning, $Details, $Hint)
-        [void]$findings.Add((New-BRAVOReleaseFinding -Id $Id -Severity Blocker -Title $Title -Meaning $Meaning `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id $Id -Severity Blocker -Title $Title -Meaning $Meaning `
                     -Action 'Не продовжуйте розгортання; отримайте й розпакуйте релізний артефакт знову.' -Details ([string]$Details) -ExitCodeHint $Hint))
     }
     $finish = {
@@ -666,7 +633,7 @@ function Test-BRAVOStagedRuntime {
             if (-not $integrity.IsValid) {
                 & $addBlocker 'Staged.Integrity' 'Цілісність staged-комплекту порушено' 'Файли комплекту не збігаються з RUNTIME_MANIFEST.json.' ([string]$integrity.Message) 33
             } else {
-                [void]$findings.Add((New-BRAVOReleaseFinding -Id 'Staged.Integrity' -Severity Ok -Title 'Цілісність staged-комплекту підтверджено' -Details ('перевірено файлів: {0}' -f $integrity.CheckedCount)))
+                [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Staged.Integrity' -Severity Ok -Title 'Цілісність staged-комплекту підтверджено' -Details ('перевірено файлів: {0}' -f $integrity.CheckedCount)))
             }
         } catch {
             & $addBlocker 'Staged.IntegrityGuard' 'Не вдалося виконати перевірку цілісності' 'Довірений guard недоступний.' $_.Exception.Message 33

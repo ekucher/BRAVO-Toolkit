@@ -24,24 +24,6 @@ function Get-BRAVOUpdateDiagValue {
     return $property.Value
 }
 
-function Initialize-BRAVOUpdateDiagLogging {
-    # Protect-BRAVOLogSecret живе в BRAVO.Logging. Part не може змінити
-    # psm1, тому підключаємо модуль ліниво (pure-функція, без побічних
-    # ефектів). Відсутній модуль — fail closed: звіт без маскування секретів
-    # не створюється.
-    [CmdletBinding()]
-    param()
-
-    if ($null -ne (Get-Command -Name 'Protect-BRAVOLogSecret' -ErrorAction SilentlyContinue)) {
-        return
-    }
-    $loggingManifest = Join-Path $script:BRAVOUpdateToolkitRoot 'modules\BRAVO.Logging\BRAVO.Logging.psd1'
-    if (-not (Test-Path -LiteralPath $loggingManifest -PathType Leaf)) {
-        throw "BRAVO.Update: BRAVO.Logging не знайдено ($loggingManifest); звіт без маскування секретів не створюється."
-    }
-    Import-Module -Name $loggingManifest -DisableNameChecking -ErrorAction Stop
-}
-
 function Invoke-BRAVOUpdateReportRedaction {
     # Повертає { Text; Counts } — Counts: kind -> кількість замін. Порядок
     # кроків важливий: спочатку конкретніші форми (секрети, fingerprint,
@@ -61,7 +43,9 @@ function Invoke-BRAVOUpdateReportRedaction {
         return [pscustomobject]@{ Text = $Text; Counts = $counts }
     }
 
-    Initialize-BRAVOUpdateDiagLogging
+    # Protect-BRAVOLogSecret надає BRAVO.Logging, імпортований psm1 один раз
+    # (fail closed: без модуля логування звіт без маскування секретів не
+    # створюється, модуль взагалі не завантажується).
     $value = [string]$Text
 
     # 1) Секрети за шаблонами спільного маскувальника (***).
@@ -417,10 +401,7 @@ function Get-BRAVOUpdateDiagMarkerText {
         'NotApplicable' { 'Не застосовується' }
         default { $Severity }
     }
-    $marker = $null
-    if ($null -ne (Get-Command -Name 'Format-BRAVOUpdateFindingMarker' -ErrorAction SilentlyContinue)) {
-        $marker = [string](Format-BRAVOUpdateFindingMarker -Severity $Severity)
-    }
+    $marker = [string](Format-BRAVOUpdateFindingMarker -Severity $Severity)
     if ([string]::IsNullOrEmpty($marker)) { $marker = '?' }
     return ($marker + ' ' + $text)
 }
@@ -484,11 +465,9 @@ function Save-BRAVODiagnosticReport {
     $forbidden = New-Object System.Collections.Generic.List[string]
     foreach ($r in @($RuntimeRoot)) { if (-not [string]::IsNullOrWhiteSpace($r)) { $forbidden.Add($r) } }
     $forbidden.Add($script:BRAVOUpdateToolkitRoot)
-    if ($null -ne (Get-Command -Name 'Get-BRAVOUpdateDefaultPaths' -ErrorAction SilentlyContinue)) {
-        $defaults = Get-BRAVOUpdateDefaultPaths
-        $defaultRuntime = Get-BRAVOUpdateDiagValue -Object $defaults -Name 'RuntimeRoot'
-        if ($null -ne $defaultRuntime) { $forbidden.Add([string]$defaultRuntime) }
-    }
+    $defaults = Get-BRAVOUpdateDefaultPaths
+    $defaultRuntime = Get-BRAVOUpdateDiagValue -Object $defaults -Name 'RuntimeRoot'
+    if ($null -ne $defaultRuntime) { $forbidden.Add([string]$defaultRuntime) }
     foreach ($candidate in $forbidden) {
         $rootFull = [IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
         if ($fullPath.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or

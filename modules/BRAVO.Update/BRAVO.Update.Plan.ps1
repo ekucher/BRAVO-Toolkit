@@ -20,35 +20,15 @@ Set-StrictMode -Version 2.0
 # по-різному трактуватимуть, що належить сайту.
 $script:BRAVOUpdateSiteOwnedFiles = @('BRAVO.config', 'BRAVO.local.config', 'TOOLS_INTEGRITY.json',
                                       'WinSCP.ini', 'BRAVO_OPERATION.lock')
-$script:BRAVOUpdateSiteOwnedDirs = @('LOGS', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA', 'BAZA_WWW', 'artifacts')
+# 'local-backups', '.git', '.vscode' не належать артефакту: guard (BRAVO_RUNTIME_GUARD.ps1,
+# рядок виключень) і генератор manifest (ci\Update-BRAVORuntimeManifest.ps1,
+# $excludedDirectoryPattern) уже виключають їх з цілісності; deploy/backup/delta
+# мають бачити той самий набір.
+$script:BRAVOUpdateSiteOwnedDirs = @('LOGS', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA', 'BAZA_WWW', 'artifacts',
+                                     'local-backups', '.git', '.vscode')
 
 # Резерв вільного місця на томі (CONTRACTS §5 / план): 512 MB.
 $script:BRAVOUpdateFootprintReserveBytes = 512MB
-
-# --- Порівняння версій: довірені функції guard ------------------------------
-# Compare-BRAVOComparableVersion живе в BRAVO_RUNTIME_GUARD.ps1, а сам файл
-# guard — виконуваний скрипт (dot-source запустив би його). Тому, як і
-# self-test, витягаємо з AST лише потрібні визначення функцій і підключаємо їх
-# у область модуля; політика SemVer лишається в одному місці. Відсутній guard
-# не валить завантаження модуля: порівняння версій тоді fail closed (Blocker).
-if ($null -eq (Get-Command -Name 'Compare-BRAVOComparableVersion' -CommandType Function -ErrorAction SilentlyContinue)) {
-    $planGuardPath = Join-Path $script:BRAVOUpdateToolkitRoot 'BRAVO_RUNTIME_GUARD.ps1'
-    if (Test-Path -LiteralPath $planGuardPath -PathType Leaf) {
-        $planGuardTokens = $null
-        $planGuardErrors = $null
-        $planGuardAst = [System.Management.Automation.Language.Parser]::ParseFile($planGuardPath, [ref]$planGuardTokens, [ref]$planGuardErrors)
-        foreach ($planGuardFunction in @('ConvertTo-BRAVOComparableVersion', 'Compare-BRAVOComparableVersion')) {
-            $planGuardName = $planGuardFunction
-            $planGuardNode = $planGuardAst.Find({
-                    param($node)
-                    ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($node.Name -eq $planGuardName)
-                }, $true)
-            if ($null -ne $planGuardNode) {
-                . ([scriptblock]::Create($planGuardNode.Extent.Text))
-            }
-        }
-    }
-}
 
 function Get-BRAVOUpdateSiteOwnedPaths {
     # Єдиний accessor до набору site-owned (копії, щоб виклик не міг змінити константу).
@@ -61,30 +41,6 @@ function Get-BRAVOUpdateSiteOwnedPaths {
 }
 
 # --- Приватні допоміжні функції ----------------------------------------------
-
-function New-BRAVOUpdatePlanFinding {
-    # Finding за CONTRACTS §2. Локальний конструктор: форма фіксована
-    # контрактом, а Blocker без action недопустимий.
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][string]$Id,
-        [Parameter(Mandatory = $true)][ValidateSet('Ok', 'Warning', 'Blocker', 'NotApplicable')][string]$Severity,
-        [Parameter(Mandatory = $true)][string]$Title,
-        [string]$Meaning = '',
-        [string]$Action = '',
-        [string]$Details = '',
-        [object]$ExitCodeHint = $null
-    )
-    return [pscustomobject][ordered]@{
-        id           = $Id
-        severity     = $Severity
-        title        = $Title
-        meaning      = $Meaning
-        action       = $Action
-        details      = $Details
-        exitCodeHint = $ExitCodeHint
-    }
-}
 
 function Get-BRAVOUpdatePlanFileSha256 {
     # SHA-256 (UPPER) файлу або 'absent'. Нечитабельний файл -> 'unreadable',
@@ -141,36 +97,24 @@ function Get-BRAVOUpdatePlanManagedTaskList {
 }
 
 function Get-BRAVOUpdatePlanOpenJournalId {
-    # Ідентифікатори відкритих журналів у <StateRoot>\Journal. Журнал, який не
-    # вдалося розібрати, рахується відкритим ('corrupt:<файл>'): fail closed,
-    # бо пошкоджений журнал може приховувати перерване розгортання.
+    # Ідентифікатори відкритих журналів через канонічний Get-BRAVOUpdateOpenJournal.
+    # Пошкоджений/нечитабельний журнал рахується відкритим ('corrupt:<файл>'):
+    # fail closed, бо він може приховувати перерване розгортання.
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$StateRoot)
-    $journalDir = Join-Path $StateRoot 'Journal'
     $ids = New-Object System.Collections.Generic.List[string]
-    if (-not [System.IO.Directory]::Exists($journalDir)) { return @() }
-    foreach ($file in [System.IO.Directory]::GetFiles($journalDir, '*.json')) {
-        $leaf = [System.IO.Path]::GetFileNameWithoutExtension($file)
-        try {
-            $journal = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($null -eq $journal) { throw 'порожній журнал' }
-            $stateProperty = $journal.PSObject.Properties['state']
-            if ($null -eq $stateProperty) { throw 'немає state' }
-            if ([string]$stateProperty.Value -eq 'Open') {
-                $idProperty = $journal.PSObject.Properties['operationId']
-                if ($null -ne $idProperty -and -not [string]::IsNullOrEmpty([string]$idProperty.Value)) {
-                    [void]$ids.Add([string]$idProperty.Value)
-                } else {
-                    [void]$ids.Add($leaf)
-                }
-            }
-        } catch {
-            [void]$ids.Add('corrupt:' + $leaf)
+    foreach ($entry in @(Get-BRAVOUpdateOpenJournal -StateRoot $StateRoot)) {
+        if ($null -eq $entry) { continue }
+        if ([bool]$entry.IsCorrupt) {
+            [void]$ids.Add('corrupt:' + [System.IO.Path]::GetFileNameWithoutExtension([string]$entry.Path))
+        } elseif (-not [string]::IsNullOrEmpty([string]$entry.OperationId)) {
+            [void]$ids.Add([string]$entry.OperationId)
+        } else {
+            [void]$ids.Add([System.IO.Path]::GetFileNameWithoutExtension([string]$entry.Path))
         }
     }
     return @($ids.ToArray() | Sort-Object)
 }
-
 function Get-BRAVOUpdateTreeBytes {
     # Сумарний розмір файлів дерева з урахуванням виключень (семантика robocopy
     # /XF /XD з Get-BRAVODeployTreeKeys). Зниклий під час обходу файл = 0.
@@ -218,10 +162,14 @@ function Get-BRAVOUpdateVersionOrdering {
     param([string]$Current, [string]$Target)
     $problem = $null
     $result = $null
-    if ($null -eq (Get-Command -Name 'Compare-BRAVOComparableVersion' -CommandType Function -ErrorAction SilentlyContinue) -or
-        $null -eq (Get-Command -Name 'ConvertTo-BRAVOComparableVersion' -CommandType Function -ErrorAction SilentlyContinue)) {
-        $problem = 'функції порівняння версій guard недоступні'
-    } else {
+    $guardReady = $true
+    try {
+        Import-BRAVOUpdateTrustedGuardFunctions
+    } catch {
+        $guardReady = $false
+        $problem = 'функції порівняння версій guard недоступні: ' + $_.Exception.Message
+    }
+    if ($guardReady) {
         $left = ConvertTo-BRAVOComparableVersion -Text $Current
         $right = ConvertTo-BRAVOComparableVersion -Text $Target
         if ($null -eq $left) { $problem = 'поточна версія не є коректною: ' + $Current }
@@ -466,7 +414,7 @@ function New-BRAVODeploymentPlan {
     # --- Правила дії/версії ---
     $hasTarget = (-not [string]::IsNullOrWhiteSpace($targetVersion))
     if (-not $hasTarget) {
-        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.TargetVersionMissing' -Severity 'Blocker' `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.TargetVersionMissing' -Severity 'Blocker' `
                 -Title 'У джерелі не вказано версію пакета' `
                 -Meaning 'Без цільової версії неможливо порівняти її з встановленою.' `
                 -Action 'Повторіть отримання релізу, щоб отримати коректний маніфест.'))
@@ -477,7 +425,7 @@ function New-BRAVODeploymentPlan {
             if ($null -ne $installState) { $alreadyInstalled = ($installState -ne 'NotInstalled') }
             elseif ($null -ne $currentVersion) { $alreadyInstalled = $true }
             if ($alreadyInstalled) {
-                [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.InstallOnExisting' -Severity 'Blocker' `
+                [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.InstallOnExisting' -Severity 'Blocker' `
                         -Title 'Сервер уже має встановлений BRAVO Toolkit' `
                         -Meaning 'Чиста інсталяція можлива лише там, де Toolkit ще не встановлено.' `
                         -Action 'Виберіть «Оновити» або «Відновити» замість «Встановити».' `
@@ -486,21 +434,21 @@ function New-BRAVODeploymentPlan {
         }
         default {
             if ($null -eq $currentVersion) {
-                [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.CurrentVersionUnknown' -Severity 'Blocker' `
+                [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.CurrentVersionUnknown' -Severity 'Blocker' `
                         -Title 'Не вдалося визначити встановлену версію' `
                         -Meaning 'Без поточної версії неможливо перевірити напрям зміни (оновлення чи відкат).' `
                         -Action 'Перевірте VERSION.json у каталозі встановлення або виконайте відновлення з повного пакета.'))
             } elseif ($hasTarget) {
                 $ordering = Get-BRAVOUpdateVersionOrdering -Current $currentVersion -Target $targetVersion
                 if ($null -eq $ordering.Result) {
-                    [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.VersionCompareFailed' -Severity 'Blocker' `
+                    [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.VersionCompareFailed' -Severity 'Blocker' `
                             -Title 'Не вдалося порівняти версії' `
                             -Meaning 'Напрям зміни версії не доведено, тому розгортання заблоковано.' `
                             -Action 'Перевірте формат версій (X.Y.Z[-prerelease]).' `
                             -Details $ordering.Problem))
                 } elseif ($Action -eq 'Repair') {
                     if ($ordering.Result -ne 0) {
-                        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.RepairVersionMismatch' -Severity 'Blocker' `
+                        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.RepairVersionMismatch' -Severity 'Blocker' `
                                 -Title 'відновлення не виконує оновлення версії' `
                                 -Meaning 'Відновлення перевстановлює ту саму версію, що вже встановлена.' `
                                 -Action 'Для зміни версії скористайтеся «Оновити»; для відновлення вкажіть пакет тієї самої версії.' `
@@ -509,13 +457,13 @@ function New-BRAVODeploymentPlan {
                 } else {
                     # Update: потрібна строго новіша цільова версія.
                     if ($ordering.Result -eq 0) {
-                        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.UpdateSameVersion' -Severity 'Blocker' `
+                        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.UpdateSameVersion' -Severity 'Blocker' `
                                 -Title 'Встановлена версія збігається з пакетом' `
                                 -Meaning 'Оновлювати нічого: версії однакові.' `
                                 -Action 'Якщо потрібно перевстановити файли тієї самої версії, виберіть «Відновити».' `
                                 -Details ('версія=' + $currentVersion)))
                     } elseif ($ordering.Result -gt 0) {
-                        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.UpdateDowngrade' -Severity 'Blocker' `
+                        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.UpdateDowngrade' -Severity 'Blocker' `
                                 -Title 'Пакет старіший за встановлену версію' `
                                 -Meaning 'Відкат версії через оновлення заборонено: це знижує захист від регресій.' `
                                 -Action 'Використайте пакет новішої версії.' `
@@ -529,7 +477,7 @@ function New-BRAVODeploymentPlan {
 
     # --- Prerelease без дозволу ---
     if ($hasTarget -and ([string]$sourceValues['releaseChannel']) -ne 'stable' -and -not $sourceValues['prereleaseAuthorized']) {
-        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.PrereleaseNotAuthorized' -Severity 'Blocker' `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.PrereleaseNotAuthorized' -Severity 'Blocker' `
                 -Title 'Пакет не зі стабільного каналу, а дозволу немає' `
                 -Meaning 'Попередні (prerelease) збірки встановлюються лише з явного дозволу оператора.' `
                 -Action 'Використайте stable-реліз або явно дозвольте prerelease.' `
@@ -539,7 +487,7 @@ function New-BRAVODeploymentPlan {
     # --- Збіг версії staged із джерелом ---
     $stagedVersion = Get-BRAVOUpdatePlanVersionText -Root $StagedRoot
     if ($hasTarget -and $null -ne $stagedVersion -and $stagedVersion -ne $targetVersion) {
-        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.StagedVersionMismatch' -Severity 'Blocker' `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.StagedVersionMismatch' -Severity 'Blocker' `
                 -Title 'Версія staged-пакета не збігається з джерелом' `
                 -Meaning 'Розпакований пакет не відповідає манифесту релізу.' `
                 -Action 'Очистіть staging і отримайте пакет повторно.' `
@@ -551,14 +499,14 @@ function New-BRAVODeploymentPlan {
     try {
         $delta = Get-BRAVODeploymentFileDelta -RuntimeRoot $RuntimeRoot -StagedRoot $StagedRoot
     } catch {
-        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.DeltaFailed' -Severity 'Blocker' `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.DeltaFailed' -Severity 'Blocker' `
                 -Title 'Не вдалося порахувати зміни файлів' `
                 -Meaning 'Без integrity-манифесту staged-пакета склад змін не доведено.' `
                 -Action 'Очистіть staging і отримайте пакет повторно.' `
                 -Details $_.Exception.Message))
     }
     if ($null -ne $delta -and -not $delta.RuntimeManifestPresent -and $Action -ne 'Install') {
-        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.RuntimeManifestMissing' -Severity 'Warning' `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.RuntimeManifestMissing' -Severity 'Warning' `
                 -Title 'У чинному встановленні немає RUNTIME_MANIFEST.json' `
                 -Meaning 'Кількість змінених і видалених файлів неточна: усі файли пакета вважаються доданими.' `
                 -Action 'Після розгортання перевірте цілісність.'))
@@ -569,7 +517,7 @@ function New-BRAVODeploymentPlan {
     try {
         $footprint = Get-BRAVODeploymentFootprint -StagedRoot $StagedRoot -RuntimeRoot $RuntimeRoot -StagingRoot $StagingRoot -BackupRoot $BackupRoot
     } catch {
-        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.FootprintFailed' -Severity 'Blocker' `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.FootprintFailed' -Severity 'Blocker' `
                 -Title 'Не вдалося оцінити потрібне місце на диску' `
                 -Meaning 'Без оцінки розміру не можна гарантувати, що розгортання завершиться.' `
                 -Action 'Перевірте доступність каталогів staging, backup і встановлення.' `
@@ -577,12 +525,12 @@ function New-BRAVODeploymentPlan {
     }
     if ($null -ne $footprint) {
         if ($null -eq $footprint.availableFreeBytes) {
-            [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.DiskSpaceUnknown' -Severity 'Warning' `
+            [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.DiskSpaceUnknown' -Severity 'Warning' `
                     -Title 'Не вдалося визначити вільне місце на томі' `
                     -Meaning 'Достатність місця не перевірена.' `
                     -Details ('том=' + $footprint.volume)))
         } elseif ($footprint.availableFreeBytes -lt $footprint.requiredFreeBytes) {
-            [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.DiskSpace' -Severity 'Blocker' `
+            [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.DiskSpace' -Severity 'Blocker' `
                     -Title 'Недостатньо вільного місця на диску' `
                     -Meaning 'Staging, резервна копія й нові файли не поміщаються разом із резервом.' `
                     -Action 'Звільніть місце або вкажіть інший том для резервних копій.' `
@@ -597,7 +545,7 @@ function New-BRAVODeploymentPlan {
         if ($null -ne $preflightProperty) { $preflightFindings = @($preflightProperty.Value) }
     }
     if ($null -eq $preflightFindings) {
-        [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.PreflightMissing' -Severity 'Blocker' `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.PreflightMissing' -Severity 'Blocker' `
                 -Title 'Немає результату preflight' `
                 -Meaning 'План не можна затвердити без перевірки передумов.' `
                 -Action 'Виконайте preflight і побудуйте план знову.'))
@@ -615,7 +563,7 @@ function New-BRAVODeploymentPlan {
             $hasBlocker = $false
             foreach ($item in $findings) { if ($item.severity -eq 'Blocker') { $hasBlocker = $true } }
             if (-not $hasBlocker) {
-                [void]$findings.Add((New-BRAVOUpdatePlanFinding -Id 'Plan.PreflightNotProceed' -Severity 'Blocker' `
+                [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Plan.PreflightNotProceed' -Severity 'Blocker' `
                         -Title 'Preflight не дозволяє продовжити' `
                         -Meaning 'Результат preflight має canProceed = false без деталізації.' `
                         -Action 'Повторіть preflight.'))
@@ -662,55 +610,38 @@ function New-BRAVODeploymentPlan {
     $filesAdded = 0; $filesChanged = 0; $filesRemoved = 0
     if ($null -ne $delta) { $filesAdded = $delta.FilesAdded; $filesChanged = $delta.FilesChanged; $filesRemoved = $delta.FilesRemoved }
 
-    $plan = [pscustomobject][ordered]@{
-        schemaVersion            = 1
-        planId                   = [guid]::NewGuid().ToString('D').ToLowerInvariant()
-        operationId              = [guid]::NewGuid().ToString('D').ToLowerInvariant()
-        action                   = $Action
-        createdUtc               = $nowUtc.ToString('o')
-        expiresUtc               = $nowUtc.AddMinutes($TtlMinutes).ToString('o')
-        runtimeRoot              = $RuntimeRoot
-        stagingRoot              = $StagingRoot
-        backupRoot               = $BackupRoot
-        source                   = [pscustomobject]$sourceValues
-        currentVersion           = $currentVersion
-        targetVersion            = $targetVersion
-        footprint                = $footprint
-        changes                  = [pscustomobject][ordered]@{
-            filesAdded    = $filesAdded
-            filesChanged  = $filesChanged
-            filesRemoved  = $filesRemoved
-            configuration = [pscustomobject][ordered]@{
-                localConfigPreserved  = $localConfigPresent
-                legacyConfigPreserved = $legacyConfigPresent
-                delta                 = @()
-                note                  = 'BRAVO.local.config зберігається побайтово'
-            }
-            scheduler     = [pscustomobject][ordered]@{
-                tasks            = $planTasks
-                activationPolicy = 'ActivateOnSuccessOnly'
-            }
+    $planChanges = [pscustomobject][ordered]@{
+        filesAdded    = $filesAdded
+        filesChanged  = $filesChanged
+        filesRemoved  = $filesRemoved
+        configuration = [pscustomobject][ordered]@{
+            localConfigPreserved  = $localConfigPresent
+            legacyConfigPreserved = $legacyConfigPresent
+            delta                 = @()
+            note                  = 'BRAVO.local.config зберігається побайтово'
         }
-        preserved                = $preserved
-        tests                    = [pscustomobject][ordered]@{ planned = $planned; skipped = $skipped }
-        findings                 = @($findings.ToArray())
-        preconditionsFingerprint = $fingerprint
-        requiresConfirmation     = $true
+        scheduler     = [pscustomobject][ordered]@{
+            tasks            = $planTasks
+            activationPolicy = 'ActivateOnSuccessOnly'
+        }
     }
+    $planTests = [pscustomobject][ordered]@{ planned = $planned; skipped = $skipped }
 
-    # Структурна валідація контрактним валідатором, якщо W1 його надав:
-    # невалідний план не повертаємо мовчки.
-    $validator = Get-Command -Name 'Test-BRAVOUpdateDeploymentPlan' -CommandType Function -ErrorAction SilentlyContinue
-    if ($null -ne $validator) {
-        $validation = & $validator -Plan $plan
-        if ($null -ne $validation -and $null -ne $validation.PSObject.Properties['IsValid'] -and -not $validation.IsValid) {
-            $details = (@($validation.Problems) -join '; ')
-            $plan.findings = @($plan.findings) + @(New-BRAVOUpdatePlanFinding -Id 'Plan.ContractInvalid' -Severity 'Blocker' `
-                    -Title 'План не відповідає контракту' -Meaning 'Внутрішня помилка побудови плану.' `
-                    -Action 'Повідомте розробників.' -Details $details)
-        }
-    }
-    return $plan
+    # Канонічний конструктор (форма й planId/operationId/TTL — в одному місці).
+    $plan = New-BRAVOUpdateDeploymentPlan -Action $Action -RuntimeRoot $RuntimeRoot -StagingRoot $StagingRoot -BackupRoot $BackupRoot `
+        -Source ([pscustomobject]$sourceValues) -CurrentVersion $currentVersion -TargetVersion $targetVersion `
+        -Footprint $footprint -Changes $planChanges -Preserved $preserved -Tests $planTests `
+        -Findings @($findings.ToArray()) -PreconditionsFingerprint $fingerprint `
+        -CreatedUtc $nowUtc.ToString('o') -TtlMinutes $TtlMinutes
+
+    # Невалідний план не повертаємо мовчки: контрактний валідатор додає Blocker.
+    $validation = Test-BRAVOUpdateDeploymentPlan -InputObject $plan
+    if (-not $validation.IsValid) {
+        $details = (@($validation.Problems) -join '; ')
+        $plan.findings = @($plan.findings) + @(New-BRAVOUpdateFinding -Id 'Plan.ContractInvalid' -Severity 'Blocker' `
+                -Title 'План не відповідає контракту' -Meaning 'Внутрішня помилка побудови плану.' `
+                -Action 'Повідомте розробників.' -Details $details)
+    }    return $plan
 }
 
 function Test-BRAVODeploymentPlanCurrent {
