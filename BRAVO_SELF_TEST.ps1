@@ -37282,6 +37282,43 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
                 })
         }
 
+        # Ключ може дати знахідку лише якщо його читає одиниця з іншого suite,
+        # ніж принаймні одна одиниця-визначник (власник із suite == споживач
+        # пропускається). Для решти ключів визначення нічого не вирішують, тож
+        # їх контекст не обчислюється. Мітка suite: '' - корінь, '*' - кілька
+        # різних suite. Порівняння імен - без урахування регістру, як у
+        # $fragmentOwners (hashtable) нижче.
+        $useSuiteByKey = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+        $defSuiteByKey = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($facts in $unitFacts) {
+            $suiteLabel = if ($null -eq $facts.Unit.Suite) { '' } else { [string]$facts.Unit.Suite }
+            foreach ($useKeyItem in $facts.UseKeys) {
+                $knownLabel = $null
+                if (-not $useSuiteByKey.TryGetValue([string]$useKeyItem, [ref]$knownLabel)) {
+                    $useSuiteByKey[[string]$useKeyItem] = $suiteLabel
+                } elseif ($knownLabel -ne '*' -and $knownLabel -ne $suiteLabel) {
+                    $useSuiteByKey[[string]$useKeyItem] = '*'
+                }
+            }
+            if ($null -eq $facts.Unit.Suite) { continue }
+            foreach ($definitionItem in $facts.DefinitionNodes) {
+                $knownLabel = $null
+                if (-not $defSuiteByKey.TryGetValue([string]$definitionItem.Key, [ref]$knownLabel)) {
+                    $defSuiteByKey[[string]$definitionItem.Key] = $suiteLabel
+                } elseif ($knownLabel -ne '*' -and $knownLabel -ne $suiteLabel) {
+                    $defSuiteByKey[[string]$definitionItem.Key] = '*'
+                }
+            }
+        }
+        $relevantKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($definedKey in $defSuiteByKey.Keys) {
+            $usedLabel = $null
+            if (-not $useSuiteByKey.TryGetValue($definedKey, [ref]$usedLabel)) { continue }
+            $definedLabel = $defSuiteByKey[$definedKey]
+            if ($definedLabel -ne '*' -and $usedLabel -eq $definedLabel) { continue }
+            [void]$relevantKeys.Add($definedKey)
+        }
+
         # Визначення: у scope файлу (разом із $script:/$global:) чи локальне
         # в дочірньому scriptblock/функції. Спершу фрагменти; для кореня
         # потрібні лише імена, які визначає хоч один фрагмент.
@@ -37291,6 +37328,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
                 $isRootUnit = $null -eq $facts.Unit.Suite
                 if (($pass -eq 'Root') -ne $isRootUnit) { continue }
                 foreach ($definitionNode in $facts.DefinitionNodes) {
+                    if (-not $relevantKeys.Contains($definitionNode.Key)) { continue }
                     if ($isRootUnit -and -not $fragmentDefinedKeys.Contains($definitionNode.Key)) { continue }
                     # Контекст без виклику scriptblock-а на кожен вузол: підйом до
                     # найближчого scope-блока тут, а $getContext - лише коли контекст
