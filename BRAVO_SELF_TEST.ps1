@@ -34364,6 +34364,50 @@ function Write-BRAVOLog {
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/MaintenanceDiskSpace' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    # Installer v1 (docs\installer\CONTRACTS.md): engine BRAVO.Update і GUI
+    # BRAVO.Installer.UI. Фрагменти працюють лише в sandbox-каталогах TEMP.
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateStaging') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateStaging'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateStaging') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateStaging.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateStaging' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateRelease') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateRelease'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateRelease') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateRelease.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateRelease' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateDiscovery') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateDiscovery'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateDiscovery') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateDiscovery.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateDiscovery' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdatePlan') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdatePlan'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdatePlan') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdatePlan.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdatePlan' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateDiagnostics') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateDiagnostics'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateDiagnostics') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateDiagnostics.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateDiagnostics' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'InstallerUI') {
+        Enter-BRAVOSelfTestSuite -Name 'InstallerUI'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/InstallerUI') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.InstallerUI.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/InstallerUI' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 } catch {
     # #219 (частина B): сюди доходять лише маркери глобальних меж і винятки
     # з коду МІЖ секціями. Register-BRAVOSelfTestGlobalFatal реєструє
@@ -38067,7 +38111,8 @@ foreach ($case in $cases) {
         'Status'                 = 'Status'
     }
     $suiteMapModulesWithoutSuite = @('ArchiveHelpers', 'ArchiveRuntime', 'Compatibility', 'Console', 'Credentials',
-        'Discovery', 'ExitCodes', 'Health', 'HelperLogging', 'Logging', 'Maintenance', 'Notifications', 'System')
+        'Discovery', 'ExitCodes', 'Health', 'HelperLogging', 'Installer.UI', 'Logging', 'Maintenance', 'Notifications',
+        'System', 'Update')
     $suiteMapActualModules = [string[]]@(
         [IO.Directory]::GetDirectories((Join-Path $root 'modules')) |
             ForEach-Object { [IO.Path]::GetFileName($_) } |
