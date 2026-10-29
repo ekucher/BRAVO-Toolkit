@@ -8,8 +8,11 @@ Set-StrictMode -Version 2.0
 
 $script:BRAVOInstallerUIParts = @(
     'BRAVO.Installer.UI.ViewModel.ps1',
+    'BRAVO.Installer.UI.WizardModel.ps1',
     'BRAVO.Installer.UI.Engine.ps1',
-    'BRAVO.Installer.UI.Screens.ps1'
+    'BRAVO.Installer.UI.WizardEngine.ps1',
+    'BRAVO.Installer.UI.Screens.ps1',
+    'BRAVO.Installer.UI.WizardScreens.ps1'
 )
 foreach ($part in $script:BRAVOInstallerUIParts) {
     $partPath = Join-Path $PSScriptRoot $part

@@ -6,7 +6,11 @@
 # (замикання ламає резолв приватних функцій модуля). Стан передається через
 # $form.Tag (Context), який обробник бере з $sender.FindForm() / $sender.Tag.
 
-$script:BRAVOInstallerScreenNames = @('Home', 'Preflight', 'Settings', 'Diagnostics', 'Logs')
+# Екрани лівої навігації й екрани майстра (3–10): майстер відкривається діями
+# Головної/Maintenance Center і не має власних пунктів навігації.
+$script:BRAVOInstallerNavScreenNames = @('Home', 'Preflight', 'Settings', 'Diagnostics', 'Logs')
+$script:BRAVOInstallerWizardScreenNames = @('Source', 'Directories', 'Backup', 'Credentials', 'Schedule', 'Plan', 'Progress', 'Result')
+$script:BRAVOInstallerScreenNames = @($script:BRAVOInstallerNavScreenNames) + @($script:BRAVOInstallerWizardScreenNames)
 
 function Initialize-BRAVOInstallerWinForms {
     [CmdletBinding()]
@@ -201,6 +205,12 @@ function New-BRAVOInstallerScreenSettings {
         'Налаштування виконує канонічний BRAVO Configurator. Він відкривається в окремому вікні; Installer не змінює конфігурацію сам.'))
     [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Settings.Open' -Text 'Відкрити &Configurator' `
         -AccessibleName 'Відкрити Configurator' -Key 'OpenConfigurator'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerLabel -Context $Context -Name 'Settings.RepairNote' -Text ''))
+    [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Settings.Repair' -Text '&Відновити компоненти' `
+        -AccessibleName 'Відновити компоненти' -Key 'Repair'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Settings.Credentials' -Text 'Ввести об&лікові дані' `
+        -AccessibleName 'Ввести облікові дані' -Key 'EnterCredentials'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerLabel -Context $Context -Name 'Settings.Reasons' -Text ''))
     [void]$panel.Controls.Add($flow)
     $panel
 }
@@ -219,6 +229,12 @@ function New-BRAVOInstallerScreenDiagnostics {
     [void]$flow.Controls.Add((New-BRAVOInstallerReadOnlyBox -Context $Context -Name 'Diagnostics.Raw' -AccessibleName 'Відповідь engine' -Lines 12))
     [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Diagnostics.Refresh' -Text 'Оновити &діагностику' `
         -AccessibleName 'Оновити діагностику' -Key 'Retry'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Diagnostics.Run' -Text 'Запустити діагностику &engine' `
+        -AccessibleName 'Запустити діагностику engine' -Key 'RunDiagnose'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerLabel -Context $Context -Name 'Diagnostics.PreviewCaption' -Text 'Попередній перегляд звіту (секрети замасковано; нічого не надсилається):'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerReadOnlyBox -Context $Context -Name 'Diagnostics.Preview' -AccessibleName 'Попередній перегляд діагностичного звіту' -Lines 10))
+    [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Diagnostics.Save' -Text '&Зберегти звіт…' `
+        -AccessibleName 'Зберегти діагностичний звіт' -Key 'SaveDiagnostics'))
     [void]$panel.Controls.Add($flow)
     $panel
 }
@@ -232,6 +248,19 @@ function New-BRAVOInstallerScreenLogs {
     [void]$flow.Controls.Add((New-BRAVOInstallerLabel -Context $Context -Name 'Logs.Path' -Text ''))
     [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Logs.Open' -Text 'Відкрити &папку журналів' `
         -AccessibleName 'Відкрити папку журналів' -Key 'OpenLogsFolder'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerLabel -Context $Context -Name 'Logs.ListCaption' -Text 'Журнали (лише перегляд, найновіші першими):'))
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Height = 140
+    $list.Width = 560
+    $list.Tag = 'fill'
+    $list.AccessibleName = 'Список журналів'
+    $list.AccessibleRole = [System.Windows.Forms.AccessibleRole]::List
+    [void](Register-BRAVOInstallerControl -Context $Context -Name 'Logs.List' -Control $list)
+    [void]$flow.Controls.Add($list)
+    [void]$flow.Controls.Add((New-BRAVOInstallerLabel -Context $Context -Name 'Logs.TailCaption' -Text 'Останні рядки найновіших журналів:'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerReadOnlyBox -Context $Context -Name 'Logs.Tail' -AccessibleName 'Останні рядки журналів' -Lines 12))
+    [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Logs.Refresh' -Text '&Оновити список' `
+        -AccessibleName 'Оновити список журналів' -Key 'RefreshLogs'))
     [void]$panel.Controls.Add($flow)
     $panel
 }
@@ -273,7 +302,7 @@ function Update-BRAVOInstallerHomeScreen {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][hashtable]$Context)
     $c = $Context.Controls
-    $viewModel = ConvertTo-BRAVOInstallerHomeViewModel -State $Context.State -EngineError $Context.EngineError
+    $viewModel = ConvertTo-BRAVOInstallerHomeViewModel -State $Context.State -EngineError $Context.EngineError -RepeatBlocked:([bool]$Context.RepeatBlocked)
     $Context.HomeViewModel = $viewModel
     $c['Home.Title'].Text = $viewModel.Title
     $c['Home.Version'].Text = $viewModel.VersionText
@@ -365,6 +394,8 @@ function Update-BRAVOInstallerAllScreens {
     Update-BRAVOInstallerPreflightScreen -Context $Context
     Update-BRAVOInstallerDiagnosticsScreen -Context $Context
     Update-BRAVOInstallerLogsScreen -Context $Context
+    Update-BRAVOInstallerSettingsScreen -Context $Context
+    Update-BRAVOInstallerWizardScreens -Context $Context
 }
 
 function Show-BRAVOInstallerScreen {
@@ -374,6 +405,7 @@ function Show-BRAVOInstallerScreen {
     foreach ($screen in $script:BRAVOInstallerScreenNames) {
         $isActive = ($screen -eq $Name)
         $Context.Controls["Screen.$screen"].Visible = $isActive
+        if (-not $Context.Controls.ContainsKey("Nav.$screen")) { continue }   # екрани майстра без пункту навігації
         $nav = $Context.Controls["Nav.$screen"]
         # Поточний екран позначаємо жирним шрифтом і AccessibleDescription (не лише кольором).
         $style = if ($isActive) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
@@ -382,6 +414,7 @@ function Show-BRAVOInstallerScreen {
     }
     $Context.CurrentScreen = $Name
     Set-BRAVOInstallerWrapWidth -Container $Context.Controls["Screen.$Name"]
+    if ($Name -eq 'Logs') { Update-BRAVOInstallerLogsContent -Context $Context }
 }
 
 function Hide-BRAVOInstallerError {
@@ -418,7 +451,7 @@ function Set-BRAVOInstallerBusy {
 
 function Start-BRAVOInstallerRefresh {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][hashtable]$Context, [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight')][string]$Action)
+    param([Parameter(Mandatory = $true)][hashtable]$Context, [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Diagnose')][string]$Action)
     if ($Context.Busy) { return }
     Hide-BRAVOInstallerError -Context $Context
     if (-not (Test-BRAVOInstallerEngineAvailable -ToolkitRoot $Context.ToolkitRoot)) {
@@ -437,17 +470,19 @@ function Start-BRAVOInstallerRefresh {
         Update-BRAVOInstallerAllScreens -Context $Context
         return
     }
-    $caption = if ($Action -eq 'State') { 'Визначаємо стан встановлення…' } else { 'Виконується перевірка сервера…' }
+    $caption = switch ($Action) { 'State' { 'Визначаємо стан встановлення…' } 'Diagnose' { 'Виконується діагностика…' } default { 'Виконується перевірка сервера…' } }
     Set-BRAVOInstallerBusy -Context $Context -Busy $true -Text $caption
-    $Context.Timer.Start()
+    $Context.Timer.Enabled = $true   # не .Start(): governance-гард забороняє інстансний .Start()
 }
 
 function Update-BRAVOInstallerJobPoll {
     # Викликається таймером (UI-потік); нічого не блокує довше за миттєвий опит.
+    # Зупинкою таймера керує Update-BRAVOInstallerTick (виконання й консольні
+    # вікна можуть тривати після завершення read-only job).
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][hashtable]$Context)
     $job = $Context.Job
-    if ($null -eq $job) { $Context.Timer.Stop(); return }
+    if ($null -eq $job) { return }
     $status = Get-BRAVOInstallerEngineJobStatus -Handle $job
     if (-not $status.Completed) {
         $progress = ConvertTo-BRAVOInstallerProgressViewModel -ProgressEvent @(Read-BRAVOInstallerProgress -Path $job.ProgressPath)
@@ -463,11 +498,15 @@ function Update-BRAVOInstallerJobPoll {
         }
         return
     }
-    $Context.Timer.Stop()
     $Context.Job = $null
     Remove-BRAVOInstallerPrivateDirectory -Path $job.PrivateDir
     $errorSummary = ''
-    if ($null -ne $status.Data) {
+    if ($job.Action -eq 'Plan') {
+        Complete-BRAVOInstallerPlanJob -Context $Context -Status $status
+    } elseif ($job.Action -eq 'Diagnose') {
+        Complete-BRAVOInstallerDiagnoseJob -Context $Context -Status $status
+        if ($null -eq $status.Data) { $errorSummary = if ($status.Error) { $status.Error } else { 'Engine не повернув даних діагностики.' } }
+    } elseif ($null -ne $status.Data) {
         if ($job.Action -eq 'State') { $Context.State = $status.Data; $Context.EngineError = '' }
         else { $Context.Preflight = $status.Data }
     } else {
@@ -480,6 +519,22 @@ function Update-BRAVOInstallerJobPoll {
         $technical = "Код завершення engine: $($status.ExitCode)" + [Environment]::NewLine + "stderr:" + [Environment]::NewLine + $status.StdErr + [Environment]::NewLine + "stdout:" + [Environment]::NewLine + $status.StdOut
         Show-BRAVOInstallerError -Context $Context -Summary $errorSummary -Technical $technical
     }
+    if ($job.Action -eq 'State' -and [bool]$Context.PendingPreflight) {
+        # Після консольного вікна облікових даних: State, потім Preflight.
+        $Context.PendingPreflight = $false
+        Start-BRAVOInstallerRefresh -Context $Context -Action 'Preflight'
+    }
+}
+
+function Update-BRAVOInstallerTick {
+    # Єдиний обробник таймера: read-only job, виконання операції, консольне
+    # вікно. Таймер зупиняється, коли активних джерел немає.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
+    if ($null -ne $Context.Job) { Update-BRAVOInstallerJobPoll -Context $Context }
+    if ($null -ne $Context.Exec) { Update-BRAVOInstallerExecutionPoll -Context $Context }
+    if ($null -ne $Context.Console) { Update-BRAVOInstallerConsolePoll -Context $Context }
+    if ($null -eq $Context.Job -and $null -eq $Context.Exec -and $null -eq $Context.Console) { $Context.Timer.Stop() }
 }
 
 function Invoke-BRAVOInstallerAction {
@@ -519,8 +574,10 @@ function Invoke-BRAVOInstallerAction {
             }
         }
         default {
-            # Mutation-дії в прототипі вимкнені; сюди потрапити не повинні.
-            Show-BRAVOInstallerError -Context $Context -Summary $script:BRAVOInstallerPrototypeReason -Technical "Дія: $Key"
+            # Дії майстра й Maintenance Center; невідомий ключ — помилка, а не мовчання.
+            if (-not (Invoke-BRAVOInstallerWizardAction -Context $Context -Key $Key)) {
+                Show-BRAVOInstallerError -Context $Context -Summary 'Невідома дія інтерфейсу.' -Technical "Дія: $Key"
+            }
         }
     }
 }
@@ -541,6 +598,8 @@ function New-BRAVOInstallerMainForm {
         ToolkitRoot = $ToolkitRoot; RuntimeRoot = $RuntimeRoot; Controls = @{}
         State = $null; Preflight = $null; EngineError = ''; Job = $null; Busy = $false
         Loading = $true; CurrentScreen = 'Home'; HomeViewModel = $null
+        Wizard = (New-BRAVOInstallerWizardState); Exec = $null; Console = $null; RepeatBlocked = $false
+        PendingPreflight = $false; DiagnosticData = $null; DiagnosticText = ''; LastResultViewModel = $null; StateRootOverride = ''
         ToolTip = (New-Object System.Windows.Forms.ToolTip); Timer = $null
     }
 
@@ -620,7 +679,15 @@ function New-BRAVOInstallerMainForm {
         (New-BRAVOInstallerScreenPreflight -Context $context),
         (New-BRAVOInstallerScreenSettings -Context $context),
         (New-BRAVOInstallerScreenDiagnostics -Context $context),
-        (New-BRAVOInstallerScreenLogs -Context $context))) {
+        (New-BRAVOInstallerScreenLogs -Context $context),
+        (New-BRAVOInstallerScreenSource -Context $context),
+        (New-BRAVOInstallerScreenDirectories -Context $context),
+        (New-BRAVOInstallerScreenBackup -Context $context),
+        (New-BRAVOInstallerScreenCredentials -Context $context),
+        (New-BRAVOInstallerScreenSchedule -Context $context),
+        (New-BRAVOInstallerScreenPlan -Context $context),
+        (New-BRAVOInstallerScreenProgress -Context $context),
+        (New-BRAVOInstallerScreenResult -Context $context))) {
         [void]$host_.Controls.Add($screen)
     }
     [void]$inner.Controls.Add($nav, 0, 0)
@@ -671,12 +738,25 @@ function New-BRAVOInstallerMainForm {
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 300
     $timer.Tag = $context
-    $timer.add_Tick({ param($sender, $e) Update-BRAVOInstallerJobPoll -Context $sender.Tag })
+    $timer.add_Tick({ param($sender, $e) Update-BRAVOInstallerTick -Context $sender.Tag })
     $context.Timer = $timer
 
     $form.add_Shown({
         param($sender, $e)
         Start-BRAVOInstallerRefresh -Context $sender.Tag -Action 'State'
+    })
+    $form.add_FormClosing({
+        param($sender, $e)
+        # Закриття під час виконання не зупиняє engine (він працює окремим
+        # процесом під UAC): попереджаємо й даємо передумати.
+        $ctx = $sender.Tag
+        if ($null -ne $ctx.Exec) {
+            $vm = ConvertTo-BRAVOInstallerExecutionViewModel -ProgressEvent @()
+            $answer = [System.Windows.Forms.MessageBox]::Show($sender,
+                ('Операція BRAVO ще виконується. ' + $vm.CloseWarning + [Environment]::NewLine + [Environment]::NewLine + 'Закрити вікно (операція триватиме)?'),
+                'BRAVO Installer', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true }
+        }
     })
     $form.add_FormClosed({
         param($sender, $e)

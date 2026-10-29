@@ -53,7 +53,7 @@ function New-BRAVOInstallerEngineCommand {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$ToolkitRoot,
-        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight')][string]$Action,
+        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Diagnose')][string]$Action,
         [Parameter(Mandatory = $true)][string]$ResultPath,
         [string]$RuntimeRoot,
         [string]$PowerShellPath = (Get-BRAVOInstallerPowerShellPath)
@@ -156,9 +156,10 @@ function Start-BRAVOInstallerEngineJob {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$ToolkitRoot,
-        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight')][string]$Action,
+        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Diagnose', 'Plan')][string]$Action,
         [string]$RuntimeRoot,
-        [string]$ProgressPath
+        [string]$ProgressPath,
+        [hashtable]$PlanOption = @{}
     )
     if (-not (Test-BRAVOInstallerEngineAvailable -ToolkitRoot $ToolkitRoot)) {
         throw 'Engine недоступний: BRAVO_UPDATE.ps1 не знайдено в каталозі комплекту.'
@@ -166,8 +167,13 @@ function Start-BRAVOInstallerEngineJob {
     $privateDir = New-BRAVOInstallerPrivateDirectory
     try {
         $resultPath = Join-Path $privateDir 'result.json'
-        $command = New-BRAVOInstallerEngineCommand -ToolkitRoot $ToolkitRoot -Action $Action `
-            -ResultPath $resultPath -RuntimeRoot $RuntimeRoot
+        if ($Action -eq 'Plan') {
+            # Plan: параметри джерела й операції передає майстер (PlanOption).
+            $command = New-BRAVOInstallerPlanCommand -ToolkitRoot $ToolkitRoot -ResultPath $resultPath -RuntimeRoot $RuntimeRoot @PlanOption
+        } else {
+            $command = New-BRAVOInstallerEngineCommand -ToolkitRoot $ToolkitRoot -Action $Action `
+                -ResultPath $resultPath -RuntimeRoot $RuntimeRoot
+        }
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $command.FilePath
         $psi.Arguments = $command.ArgumentString
@@ -176,12 +182,10 @@ function Start-BRAVOInstallerEngineJob {
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
-        $psi.RedirectStandardInput = $true
         $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
         $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
         $process = [System.Diagnostics.Process]::Start($psi)
-        # -NonInteractive + закритий stdin: engine не може зависнути на запиті.
-        $process.StandardInput.Close()
+        # stdin не перенаправляємо (governance); -NonInteractive не дає engine чекати на запит.
         [pscustomobject]@{
             Action       = $Action
             Process      = $process
@@ -203,11 +207,11 @@ function Resolve-BRAVOInstallerPayload {
     # Engine може загорнути дані; приймаємо документований «голий» об'єкт і
     # кілька очевидних обгорток, інакше повертаємо як є.
     [CmdletBinding()]
-    param([AllowNull()][object]$Data, [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight')][string]$Kind)
-    $marker = if ($Kind -eq 'State') { 'state' } else { 'findings' }
+    param([AllowNull()][object]$Data, [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Diagnose', 'Plan')][string]$Kind)
+    $marker = switch ($Kind) { 'State' { 'state' } 'Diagnose' { 'sections' } 'Plan' { 'planId' } default { 'findings' } }
     if ($null -eq $Data) { return $null }
     if ($null -ne $Data.PSObject.Properties[$marker]) { return $Data }
-    foreach ($wrapper in @('result', 'data', 'installationState', 'preflight')) {
+    foreach ($wrapper in @('result', 'data', 'installationState', 'preflight', 'plan', 'report')) {
         $inner = Get-BRAVOInstallerProperty -InputObject $Data -Name $wrapper
         if ($null -ne $inner -and $null -ne $inner.PSObject.Properties[$marker]) { return $inner }
     }
@@ -261,10 +265,12 @@ function Read-BRAVOInstallerProgress {
         інакше — мінімальний толерантний data-only розбір JSONL (без політики).
     #>
     [CmdletBinding()]
-    param([AllowNull()][string]$Path)
+    param([AllowNull()][string]$Path, [string]$ToolkitRoot = '')
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
-    if (Get-Command -Name 'Read-BRAVOUpdateProgressEvents' -ErrorAction SilentlyContinue) {
-        try { return @(Read-BRAVOUpdateProgressEvents -Path $Path) } catch { $null = $_ }
+    # Канонічний читач engine (через read-only міст); недоступний модуль або
+    # будь-яка помилка = толерантний data-only розбір нижче.
+    if (-not [string]::IsNullOrWhiteSpace($ToolkitRoot) -and ($null -ne (Get-BRAVOInstallerUpdateModule -ToolkitRoot $ToolkitRoot))) {
+        try { return @(Invoke-BRAVOInstallerUpdateRead -ToolkitRoot $ToolkitRoot -Name 'Read-BRAVOUpdateProgressEvents' -Argument @{ Path = $Path }) } catch { $null = $_ }
     }
     $events = @()
     $stream = $null
