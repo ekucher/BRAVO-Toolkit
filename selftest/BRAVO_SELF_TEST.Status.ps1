@@ -229,7 +229,11 @@
             '}'
         )
         [IO.File]::WriteAllLines($statusCleanScript, $statusCleanLines, (New-Object Text.UTF8Encoding($true)))
-        $statusCleanOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $statusCleanScript `
+        # Без -ExecutionPolicy: дочірній процес успадковує політику прогону
+        # self-test через PSExecutionPolicyPreference (той самий патерн, що
+        # дочірні BRAVO_SELF_TEST.ps1 у моноліті); Bypass поза allowlist
+        # заборонено ci\Test-BRAVOForbiddenPattern.ps1.
+        $statusCleanOutput = @(& powershell.exe -NoProfile -File $statusCleanScript `
                 -StatusModule (Join-Path $root 'modules\BRAVO.Status\BRAVO.Status.psd1') -StateRoot $statusLockBusyRoot 2>&1 |
             ForEach-Object { [string]$_ })
         $statusCleanExit = $LASTEXITCODE
@@ -418,7 +422,7 @@
                 ) -join "`r`n"
                 [IO.File]::WriteAllText($statusEarlyScriptPath, $statusEarlyScript, (New-Object Text.UTF8Encoding($true)))
                 try {
-                    [void](& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $statusEarlyScriptPath 2>&1)
+                    [void](& powershell.exe -NoProfile -File $statusEarlyScriptPath 2>&1)
                     $statusEarlyExit = $LASTEXITCODE
                 } finally {
                     if ($null -ne $statusEarlyHeldLock) { $statusEarlyHeldLock.Dispose() }
