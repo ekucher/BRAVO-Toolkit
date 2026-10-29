@@ -83,13 +83,14 @@ function New-BRAVOInstallerPlanCommand {
         [string]$Tag,
         [switch]$AllowPrerelease,
         [ValidateSet('', 'Cloud', 'CloudAndSamba', 'SambaOnly', 'LocalOnly')][string]$BackupDestination = '',
+        [ValidateSet('', 'Include', 'Skip')][string]$SelfTest = '',
         [string]$RuntimeRoot,
         [string]$PowerShellPath = (Get-BRAVOInstallerPowerShellPath)
     )
     $hasSource = -not [string]::IsNullOrWhiteSpace($SourcePath)
     $hasTag = -not [string]::IsNullOrWhiteSpace($Tag)
     if ($hasSource -and $hasTag) { throw 'Вкажіть або локальний ZIP, або тег, але не обидва одразу.' }
-    if ($hasTag -and $Tag.Trim() -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z][0-9A-Za-z.\-]*)?$') { throw "Недопустимий тег: $Tag" }
+    if ($hasTag -and $Tag.Trim() -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') { throw "Недопустимий тег: $Tag" }
     $script = Join-Path $ToolkitRoot 'BRAVO_UPDATE.ps1'
     $arguments = @(
         '-NoProfile', '-NonInteractive',
@@ -100,6 +101,8 @@ function New-BRAVOInstallerPlanCommand {
     if ($hasSource) { $arguments += @('-SourcePath', (ConvertTo-BRAVOInstallerQuotedArgument -Value $SourcePath.Trim())) }
     if ($hasTag) { $arguments += @('-Tag', (ConvertTo-BRAVOInstallerQuotedArgument -Value $Tag.Trim())) }
     if ($AllowPrerelease) { $arguments += '-AllowPrerelease' }
+    # Вибір самотесту стає частиною плану (engine відхиляє запит, що йому суперечить).
+    if (-not [string]::IsNullOrEmpty($SelfTest)) { $arguments += @('-SelfTest', $SelfTest) }
     if (-not [string]::IsNullOrEmpty($BackupDestination)) { $arguments += @('-BackupDestination', $BackupDestination) }
     if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) { $arguments += @('-RuntimeRoot', (ConvertTo-BRAVOInstallerQuotedArgument -Value $RuntimeRoot)) }
     $arguments += @('-AsJson', '-ResultPath', (ConvertTo-BRAVOInstallerQuotedArgument -Value $ResultPath))

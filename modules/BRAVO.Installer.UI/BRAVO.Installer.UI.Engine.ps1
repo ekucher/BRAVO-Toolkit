@@ -274,4 +274,4 @@ function Read-BRAVOInstallerProgress {
     param([AllowNull()][string]$Path, [string]$ToolkitRoot = $script:BRAVOInstallerToolkitRoot)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
     return @(Invoke-BRAVOInstallerUpdateRead -ToolkitRoot $ToolkitRoot -Name 'Read-BRAVOUpdateProgressEvents' -Argument @{ Path = $Path })
-}
+}

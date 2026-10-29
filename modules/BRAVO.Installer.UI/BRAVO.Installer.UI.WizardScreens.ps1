@@ -14,7 +14,7 @@ function New-BRAVOInstallerWizardState {
         Operation = 'Install'; Screen = 'Source'; Updating = $false
         SourceKind = 'Online'; Tag = ''; ZipPath = ''
         AdvancedExpanded = $false; AllowPrerelease = $false; PrereleaseAck = $false
-        RuntimeRoot = ''; BackupMode = 'Cloud'; RunSelfTest = $false
+        RuntimeRoot = ''; BackupMode = 'Cloud'; RunSelfTest = $true; PlanSelfTest = $true
         Plan = $null; PlanPayload = $null; PlanLines = @(); PlanError = ''; PlanConfirmed = $false
     }
 }
@@ -286,7 +286,7 @@ function New-BRAVOInstallerScreenPlan {
     $Context.Controls['Plan.Findings'] = $rows
     [void]$flow.Controls.Add($rows)
     [void]$flow.Controls.Add((New-BRAVOInstallerLabel -Context $Context -Name 'Plan.Uac' -Text ''))
-    [void]$flow.Controls.Add((New-BRAVOInstallerCheckBox -Context $Context -Name 'Plan.SelfTest' -Text 'Після розгортання виконати повний самотест (довше)' -AccessibleName 'Виконати самотест після розгортання'))
+    [void]$flow.Controls.Add((New-BRAVOInstallerCheckBox -Context $Context -Name 'Plan.SelfTest' -Text 'Виконати повний самотест після розгортання (зміна перебудовує план)' -AccessibleName 'Виконати самотест після розгортання'))
     [void]$flow.Controls.Add((New-BRAVOInstallerCheckBox -Context $Context -Name 'Plan.Confirm' -Text 'Я переглянув план' -AccessibleName 'Я переглянув план'))
     [void]$flow.Controls.Add((New-BRAVOInstallerLabel -Context $Context -Name 'Plan.Reason' -Text ''))
     [void]$flow.Controls.Add((New-BRAVOInstallerButton -Context $Context -Name 'Plan.Rebuild' -Text '&Сформувати план знову' `
@@ -396,6 +396,12 @@ function Update-BRAVOInstallerWizardInput {
     param([Parameter(Mandatory = $true)][hashtable]$Context)
     if ($Context.Wizard.Updating) { return }
     Sync-BRAVOInstallerWizardInput -Context $Context
+    # Вибір самотесту входить у план: зміна галочки = новий план і нове підтвердження.
+    if ($Context.Wizard.Screen -eq 'Plan' -and -not $Context.Busy -and $null -ne $Context.Wizard.Plan -and
+        [bool]$Context.Wizard.RunSelfTest -ne [bool]$Context.Wizard.PlanSelfTest) {
+        Start-BRAVOInstallerPlan -Context $Context
+        return
+    }
     Update-BRAVOInstallerWizardScreens -Context $Context
 }
 
@@ -513,7 +519,8 @@ function Update-BRAVOInstallerPlanScreen {
     $confirm.Text = $vm.ConfirmText
     $confirm.Enabled = ($vm.CanConfirm -and -not $Context.Busy)
     if ($confirm.Checked -ne [bool]$w.PlanConfirmed) { $confirm.Checked = [bool]$w.PlanConfirmed }
-    $c['Plan.SelfTest'].Enabled = $vm.CanConfirm
+    if ($c['Plan.SelfTest'].Checked -ne [bool]$w.RunSelfTest) { $c['Plan.SelfTest'].Checked = [bool]$w.RunSelfTest }
+    $c['Plan.SelfTest'].Enabled = (-not $Context.Busy)
     $c['Plan.Reason'].Text = $(if ($vm.ExecuteAction.Reason) { $vm.ExecuteAction.Label + ': ' + $vm.ExecuteAction.Reason } else { '' })
     $c['Plan.Rebuild'].Enabled = (-not $Context.Busy)
     Set-BRAVOInstallerWizardFooter -Context $Context -Screen 'Plan' -NextEnabled $vm.ExecuteAction.Enabled -NextReason $vm.ExecuteAction.Reason -NextLabel $vm.ExecuteAction.Label
@@ -664,6 +671,9 @@ function Enter-BRAVOInstallerWizard {
     param([Parameter(Mandatory = $true)][hashtable]$Context, [Parameter(Mandatory = $true)][ValidateSet('Install', 'Update', 'Repair')][string]$Operation)
     $state = New-BRAVOInstallerWizardState
     $state.Operation = $Operation
+    # Самотест за замовчуванням: Install/Update — так, Repair — ні (як Default у Plan).
+    $state.RunSelfTest = ($Operation -ne 'Repair')
+    $state.PlanSelfTest = $state.RunSelfTest
     if ($Operation -eq 'Repair') {
         # Відновлення не змінює версію: пропонуємо тег поточної версії.
         $current = [string](Get-BRAVOInstallerProperty -InputObject (Get-BRAVOInstallerProperty -InputObject $Context.State -Name 'version') -Name 'packageVersion' -Default '')
@@ -688,7 +698,8 @@ function Start-BRAVOInstallerPlan {
         Show-BRAVOInstallerWizardStep -Context $Context -Screen 'Plan'
         return
     }
-    $option = @{ Operation = $w.Operation; AllowPrerelease = [bool]$source.PrereleaseEffective }
+    $w.PlanSelfTest = [bool]$w.RunSelfTest
+    $option = @{ Operation = $w.Operation; AllowPrerelease = [bool]$source.PrereleaseEffective; SelfTest = $(if ($w.PlanSelfTest) { 'Include' } else { 'Skip' }) }
     if ($source.SourceKind -eq 'Local') { $option['SourcePath'] = $source.ZipPath }
     elseif (-not [string]::IsNullOrEmpty($source.Tag)) { $option['Tag'] = $source.Tag }
     if ($w.Operation -eq 'Install') { $option['BackupDestination'] = [string]$w.BackupMode }
@@ -769,7 +780,7 @@ function Start-BRAVOInstallerExecution {
         $sourcePath = $null
         if ($source.SourceKind -eq 'Local') { $sourcePath = $source.ZipPath }
         $request = New-BRAVOInstallerExecutionRequest -Plan $w.Plan -ConfirmedPlanShortId $vm.ShortId `
-            -PrereleaseAuthorized ([bool]$source.PrereleaseEffective) -RunSelfTest ([bool]$w.RunSelfTest) -BackupDestination $backup -SourcePath $sourcePath
+            -PrereleaseAuthorized ([bool]$source.PrereleaseEffective) -RunSelfTest (Get-BRAVOInstallerPlanSelfTest -Plan $w.Plan -Fallback ([bool]$w.PlanSelfTest)) -BackupDestination $backup -SourcePath $sourcePath
         $requestPath = Write-BRAVOInstallerExecutionRequest -Request $request -StateRoot $stateRoot -ToolkitRoot $Context.ToolkitRoot
     } catch {
         $preparationError = $_.Exception
