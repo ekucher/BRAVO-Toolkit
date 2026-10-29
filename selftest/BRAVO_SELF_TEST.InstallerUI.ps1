@@ -174,7 +174,7 @@
             $jsonlP = Join-Path $tmpP 'progress.jsonl'
             [IO.File]::WriteAllText($jsonlP, ('{"sequence":1,"phase":"Preflight","status":"Started","percent":null,"message":"a"}' + "`n" + '{"sequence":2,"phase":"Stage","status":"Running","percent":40,"message":"b"}' + "`n"), (New-Object Text.UTF8Encoding $false))
             $viaUi = @(Read-BRAVOInstallerProgress -Path $jsonlP)
-            $updateModule = Get-Module -Name 'BRAVO.Update'
+            $updateModule = & (Get-Module BRAVO.Installer.UI) { Get-Module -Name 'BRAVO.Update' }
             $direct = @(& $updateModule { param($x) Read-BRAVOUpdateProgressEvents -Path $x } $jsonlP)
             Test-BRAVOCondition -Condition ($null -ne $updateModule -and $viaUi.Count -eq 2 -and $viaUi.Count -eq $direct.Count -and [long]$viaUi[1].sequence -eq 2) `
                 -Name 'InstallerUI/Progress/UsesCanonicalReader' -Failure "UI=$($viaUi.Count) canonical=$($direct.Count)"
@@ -182,7 +182,7 @@
             Test-BRAVOCondition -Condition (-not $hasOwnReader) -Name 'InstallerUI/Progress/NoOwnJsonlReader' -Failure 'у Engine-частині UI лишився власний читач JSONL'
             # Fail closed: без модуля BRAVO.Update і без маніфесту — виняток, а не мовчазний fallback.
             $thrown = $false
-            Remove-Module -Name 'BRAVO.Update' -Force -ErrorAction SilentlyContinue
+            & (Get-Module BRAVO.Installer.UI) { Remove-Module -Name 'BRAVO.Update' -Force -ErrorAction SilentlyContinue }
             try {
                 & (Get-Module BRAVO.Installer.UI) { param($d) Import-BRAVOInstallerUpdateModule -ToolkitRoot $d } $tmpP
             } catch { $thrown = $true }
