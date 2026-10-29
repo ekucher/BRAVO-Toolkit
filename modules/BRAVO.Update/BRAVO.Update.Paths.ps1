@@ -184,10 +184,23 @@ function Invoke-BRAVOUpdateChildProcess {
         }
     }
 
+    # Запуск процесу лише через канонічний Start-BRAVOProcessWithBomFreeInput
+    # (governance Secrets/StdinProcessStartOnlyViaBomFreeHelper). Stdin тут НЕ
+    # перенаправляється (RedirectStandardInput за замовчуванням $false), дитина
+    # працює з -NonInteractive. BRAVO.Compatibility підключається ліниво.
+    if ($null -eq (Get-Command -Name 'Start-BRAVOProcessWithBomFreeInput' -ErrorAction SilentlyContinue)) {
+        $compatibilityManifest = Join-Path $script:BRAVOUpdateToolkitRoot 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1'
+        try {
+            Import-Module -Name $compatibilityManifest -DisableNameChecking -ErrorAction Stop
+        } catch {
+            return [pscustomobject]@{ ExitCode = -1; Output = 'BRAVO.Compatibility недоступний: запуск дочірнього процесу відхилено (fail closed).'; TimedOut = $false; LogPath = $null }
+        }
+    }
+
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     try {
-        [void]$process.Start()
+        Start-BRAVOProcessWithBomFreeInput -Process $process
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
@@ -218,12 +231,16 @@ function New-BRAVOUpdateDefaultAdapter {
         ключами.
     .DESCRIPTION
         Сигнатури scriptblock-ів (повертають PSCustomObject):
-          InvokeGuard            param([string]$RuntimeRoot)
-                                 -> { ExitCode, Output, TimedOut }
-          InvokeSetupScheduler   param([string]$RuntimeRoot)   (BRAVO_SETUP.ps1 -Action Scheduler -NoPause)
-          InvokeSetupValidate    param([string]$RuntimeRoot)   (BRAVO_SETUP.ps1 -ValidateOnly -SkipAccessTest -SkipTestNotification -NoPause)
-          InvokeSelfTest         param([string]$RuntimeRoot)   (BRAVO_SELF_TEST.ps1 -NoPause)
-                                 -> { ExitCode, Output, TimedOut }
+          InvokeGuard            param([string]$RuntimeRoot, [string]$LogPath)
+                                 -> { ExitCode, Output, TimedOut, LogPath }
+                                 (прямий запуск guard сам працює з -NoWrite, F5)
+          InvokeSetupScheduler   param([string]$RuntimeRoot, [string]$LogPath)
+                                 (BRAVO_SETUP.ps1 -Action Scheduler -SkipTestNotification -NoElevation -NoPause)
+          InvokeSetupValidate    param([string]$RuntimeRoot, [string]$LogPath)
+                                 (BRAVO_SETUP.ps1 -ValidateOnly -SkipAccessTest -SkipTestNotification -NoElevation -NoPause)
+          InvokeSelfTest         param([string]$RuntimeRoot, [string]$LogPath)   (BRAVO_SELF_TEST.ps1 -NoPause)
+                                 -> { ExitCode, Output, TimedOut, LogPath }
+          Вивід дочірніх процесів маскується Protect-BRAVOLogSecret; -ExecutionPolicy RemoteSigned.
           GetManagedTasks        param([string]$TaskPath, [string]$RuntimeRoot)   (обидва необов'язкові)
                                  -> масив { Name, Path, Exists, State, Enabled, actionPath } (порожній, якщо задач немає);
                                  COM Schedule.Service, лише TaskPath і імена з ефективної конфігурації
