@@ -127,6 +127,24 @@ function New-BRAVOInstallerExecuteCommand {
     $command | Add-Member -NotePropertyName Verb -NotePropertyValue 'RunAs' -PassThru
 }
 
+function New-BRAVOInstallerInitializeCommand {
+    <#
+    .SYNOPSIS
+        powershell.exe -NoProfile -File <toolkit>\BRAVO_UPDATE.ps1 -Action Initialize
+        -NoPause через UAC: елевований engine створює каталоги стану з належним
+        власником/ACL (H1). Чиста функція; GUI каталогів сам не створює.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ToolkitRoot,
+        [string]$PowerShellPath = (Get-BRAVOInstallerPowerShellPath)
+    )
+    $script = Join-Path $ToolkitRoot 'BRAVO_UPDATE.ps1'
+    $command = New-BRAVOInstallerCommand -FilePath $PowerShellPath -Argument @(
+        '-NoProfile', '-File', (ConvertTo-BRAVOInstallerQuotedArgument -Value $script), '-Action', 'Initialize', '-NoPause')
+    $command | Add-Member -NotePropertyName Verb -NotePropertyValue 'RunAs' -PassThru
+}
+
 function New-BRAVOInstallerRecoverCommand {
     # Відновлення після переривання/відкат: engine сам читає журнал; GUI
     # лише запускає його через UAC у видимому вікні.
@@ -237,12 +255,27 @@ function Write-BRAVOInstallerExecutionRequest {
     $encoding = New-Object System.Text.UTF8Encoding($false)
     if ($encoding.GetByteCount($json) -gt 1048576) { throw 'Запит перевищує 1 МіБ і не записаний.' }
     $directory = Join-Path $StateRoot 'Requests'
-    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { [void](New-Item -ItemType Directory -Path $directory -Force) }
+    # H1: GUI (без прав) НІКОЛИ не створює каталоги стану: у ProgramData їх міг би підкласти
+    # будь-хто, а створений неелевованим процесом каталог належав би користувачу. Каталог
+    # запитів створює лише елевований engine (-Action Initialize).
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        $notInitialized = New-Object System.InvalidOperationException('Потрібне первинне налаштування з правами адміністратора: каталог запитів engine ще не створено.')
+        $notInitialized.Data['BRAVOInstallerKind'] = 'StateNotInitialized'
+        throw $notInitialized
+    }
     $path = Join-Path $directory ($requestId + '.json')
     if (Test-Path -LiteralPath $path) { throw "Файл запиту вже існує: $path" }
-    $temporary = $path + '.tmp'
-    [IO.File]::WriteAllText($temporary, $json, $encoding)
-    [IO.File]::Move($temporary, $path)
+    # Каталог Requests — drop box (Users лише створюють файли, без права видалення/перейменування),
+    # тому запис одразу у фінальне ім'я (CreateNew), без тимчасового файла й Move. Engine читає
+    # запит лише після запуску через UAC, коли запис уже завершено.
+    $stream = New-Object System.IO.FileStream($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $bytes = $encoding.GetBytes($json)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
     $path
 }
 

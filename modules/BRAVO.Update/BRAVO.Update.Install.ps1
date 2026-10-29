@@ -32,15 +32,19 @@ function Get-BRAVOInstallAdapter {
           GetUserProfileRoots param() -> string[] (каталоги, у які не можна встановлювати)
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][hashtable]$Adapter)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Adapter,
+        # Корінь staging для робочого каталогу дочірнього скрипта сіяння (H1); порожній = типовий engine.
+        [string]$StagingRoot = ''
+    )
 
     $full = @{}
     foreach ($key in @($Adapter.Keys)) { $full[$key] = $Adapter[$key] }
     if (-not $full.ContainsKey('SeedLocalConfig')) {
         $full['SeedLocalConfig'] = {
             param([string]$RuntimeRoot, [string]$BackupDestination)
-            Invoke-BRAVOInstallSeedLocalConfigDefault -RuntimeRoot $RuntimeRoot -BackupDestination $BackupDestination
-        }
+            Invoke-BRAVOInstallSeedLocalConfigDefault -RuntimeRoot $RuntimeRoot -BackupDestination $BackupDestination -StagingRoot $StagingRoot
+        }.GetNewClosure()
     }
     if (-not $full.ContainsKey('GetUserProfileRoots')) {
         $full['GetUserProfileRoots'] = {
@@ -150,95 +154,24 @@ function New-BRAVOInstallProtectedDirectory {
     .DESCRIPTION
         Правила ідентичні BRAVO_TASKS_INSTALL.ps1:67-153 (ті самі SID і права; для
         дочірніх елементів — ContainerInherit|ObjectInherit). Відмінність лише для
-        неелевованого процесу (тести): власника Administrators призначити неможливо, а
-        поточний користувач не мав би запису — тому він додається з FullControl (так само,
-        як у New-BRAVOUpdatePrivateDirectory). У production worker елевований, додаткового
-        принципала немає. Повторне hardening усіх файлів робить Scheduler-крок.
-        Set-Acl не використовується: потребує SeSecurityPrivilege.
+        процесу без прав адміністратора (тести): власника Administrators призначити
+        неможливо, а поточний користувач не мав би запису — тому він додається з
+        FullControl. Реалізація — єдина New-BRAVOUpdateProtectedDirectory (Paths, H1):
+        тут лише набір правил (Kind Operation = Administrators/SYSTEM FC + Users RX).
+        Повторне hardening усіх файлів робить Scheduler-крок. Set-Acl не
+        використовується: потребує SeSecurityPrivilege.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    $problems = New-Object System.Collections.Generic.List[string]
     try {
-        $fullPath = [IO.Path]::GetFullPath($Path)
-        $exists = [IO.Directory]::Exists($fullPath)
-        $administrators = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
-        $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
-        $users = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
-        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
-        $isElevatedAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        $currentSid = $currentIdentity.User
-
-        $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-        $propagation = [Security.AccessControl.PropagationFlags]::None
-        $allow = [Security.AccessControl.AccessControlType]::Allow
-        $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
-        $readExecute = [Security.AccessControl.FileSystemRights]::ReadAndExecute
-
-        $expected = New-Object System.Collections.Generic.List[object]
-        [void]$expected.Add(@{ Sid = $administrators; Rights = $fullControl })
-        [void]$expected.Add(@{ Sid = $system; Rights = $fullControl })
-        [void]$expected.Add(@{ Sid = $users; Rights = $readExecute })
-        if (-not $isElevatedAdmin -and $currentSid.Value -ne $system.Value -and $currentSid.Value -ne $administrators.Value) {
-            [void]$expected.Add(@{ Sid = $currentSid; Rights = $fullControl })
-        }
-
-        $security = New-Object Security.AccessControl.DirectorySecurity
-        $security.SetAccessRuleProtection($true, $false)
-        if ($isElevatedAdmin) { $security.SetOwner($administrators) }
-        foreach ($item in $expected) {
-            $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($item.Sid, $item.Rights, $inheritance, $propagation, $allow)))
-        }
-
-        if ($exists) {
-            if (@(Get-ChildItem -LiteralPath $fullPath -Force).Count -gt 0) { throw 'каталог не порожній.' }
-            $directoryInfo = New-Object System.IO.DirectoryInfo($fullPath)
-            $existingAcl = $directoryInfo.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
-            $existingAcl.SetAccessRuleProtection($true, $false)
-            foreach ($oldRule in @($existingAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
-                [void]$existingAcl.RemoveAccessRuleSpecific($oldRule)
-            }
-            foreach ($newRule in @($security.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
-                $existingAcl.AddAccessRule($newRule)
-            }
-            $directoryInfo.SetAccessControl($existingAcl)
-        } else {
-            $createWithSecurity = [IO.Directory].GetMethod('CreateDirectory', [Type[]]@([string], [Security.AccessControl.DirectorySecurity]))
-            if ($null -ne $createWithSecurity) {
-                [void][IO.Directory]::CreateDirectory($fullPath, $security)
-            } else {
-                [void][IO.FileSystemAclExtensions]::CreateDirectory($security, $fullPath)
-            }
-        }
-
-        # Перевірка результату: рівно очікуваний набір явних правил.
-        $actual = Get-Acl -LiteralPath $fullPath
-        if (-not $actual.AreAccessRulesProtected) { [void]$problems.Add('успадкування прав не вимкнено') }
-        $rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-        foreach ($rule in $rules) {
-            $match = $null
-            foreach ($item in $expected) { if ([string]$rule.IdentityReference.Value -eq $item.Sid.Value) { $match = $item } }
-            if ($rule.IsInherited -or $null -eq $match -or $rule.AccessControlType -ne $allow -or
-                (($rule.FileSystemRights -band $match.Rights) -ne $match.Rights)) {
-                [void]$problems.Add('зайве або неповне правило ' + [string]$rule.IdentityReference.Value + ' ' + [string]$rule.FileSystemRights)
-            }
-        }
-        foreach ($item in $expected) {
-            if (@($rules | Where-Object { [string]$_.IdentityReference.Value -eq $item.Sid.Value }).Count -eq 0) {
-                [void]$problems.Add('немає правила для ' + $item.Sid.Value)
-            }
-        }
-        if ($problems.Count -gt 0) {
-            # Створений нами порожній каталог із хибним DACL не лишаємо (лише порожній, нерекурсивно).
-            if (-not $exists) { try { [IO.Directory]::Delete($fullPath, $false) } catch { $null = $_ } }
-            return [pscustomobject]@{ Success = $false; Path = $fullPath; Problems = $problems.ToArray() }
-        }
-        return [pscustomobject]@{ Success = $true; Path = $fullPath; Problems = @() }
+        $includeCurrent = Test-BRAVOUpdateTrustCurrentUser
+        $rule = @(Get-BRAVOUpdateWorkerAclRule -Kind Operation -IncludeCurrentUser:$includeCurrent)
+        $result = New-BRAVOUpdateProtectedDirectory -Path $Path -Rule $rule
+        if ($result.Success) { return $result }
+        return [pscustomobject]@{ Success = $false; Path = $result.Path; Problems = @($result.Problems | ForEach-Object { 'Каталог встановлення ' + $Path + ': ' + [string]$_ }) }
     } catch {
-        [void]$problems.Add('Каталог встановлення ' + $Path + ' не створено: ' + $_.Exception.Message)
-        return [pscustomobject]@{ Success = $false; Path = $Path; Problems = $problems.ToArray() }
+        return [pscustomobject]@{ Success = $false; Path = $Path; Problems = @('Каталог встановлення ' + $Path + ' не створено: ' + $_.Exception.Message) }
     }
 }
 
@@ -321,7 +254,8 @@ function Invoke-BRAVOInstallSeedLocalConfigDefault {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-        [Parameter(Mandatory = $true)][ValidateSet('Cloud', 'CloudAndSamba', 'SambaOnly', 'LocalOnly')][string]$BackupDestination
+        [Parameter(Mandatory = $true)][ValidateSet('Cloud', 'CloudAndSamba', 'SambaOnly', 'LocalOnly')][string]$BackupDestination,
+        [string]$StagingRoot = ''
     )
 
     $localConfigPath = Join-Path $RuntimeRoot 'BRAVO.local.config'
@@ -333,8 +267,12 @@ function Invoke-BRAVOInstallSeedLocalConfigDefault {
     if (-not $integrity.IsMatch) {
         return (& $fail 'Integrity' ('Цілісність розгорнутого runtime не підтверджена: ' + (@($integrity.Problems) -join '; ')))
     }
-    $workDir = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_UPDATE_SEED_' + [guid]::NewGuid().ToString('N'))
-    [void][IO.Directory]::CreateDirectory($workDir)
+    # H1: скрипт сіяння виконується елевованим процесом, тож лежить лише у захищеному
+    # робочому каталозі під staging engine (не в %TEMP%) і видаляється guarded-видалювачем.
+    if ([string]::IsNullOrWhiteSpace($StagingRoot)) { $StagingRoot = [string](Get-BRAVOUpdateDefaultPaths).StagingRoot }
+    $work = New-BRAVOUpdateChildWorkDirectory -Root $StagingRoot
+    if (-not $work.Success) { return (& $fail 'WorkDirectory' ('Робочий каталог не створено: ' + (@($work.Problems) -join '; '))) }
+    $workDir = $work.WorkDirectory
     try {
         $childPath = Join-Path $workDir 'Seed-LocalConfig.ps1'
         $resultPath = Join-Path $workDir 'seed.json'
@@ -362,9 +300,7 @@ function Invoke-BRAVOInstallSeedLocalConfigDefault {
         $parsed = [IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
         return [pscustomobject]@{ Created = [bool]$parsed.Created; Stage = [string]$parsed.Stage; Path = [string]$parsed.Path; Reasons = @($parsed.Reasons) }
     } finally {
-        if ((Test-BRAVOUpdatePathIsUnder -Path $workDir -Root ([IO.Path]::GetTempPath())) -and [IO.Directory]::Exists($workDir)) {
-            Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        Remove-BRAVOUpdateChildWorkDirectory -WorkInfo $work
     }
 }
 
@@ -433,7 +369,7 @@ function Install-BRAVOToolkit {
         return (& $earlyFail 'Blocked' (New-BRAVOUpdateFinding -Id 'Install.WrongPlanAction' -Severity Blocker -Title 'План не є планом чистого встановлення' `
                     -Meaning 'Install-BRAVOToolkit приймає лише план з action=Install.' -Action 'Побудуйте новий план для встановлення.'))
     }
-    $fullAdapter = Get-BRAVOInstallAdapter -Adapter $Adapter
+    $fullAdapter = Get-BRAVOInstallAdapter -Adapter $Adapter -StagingRoot $StagingRoot
     $profileRoots = @(& $fullAdapter.GetUserProfileRoots)
     $installPolicy = Test-BRAVOInstallRuntimeRootPolicy -RuntimeRoot $RuntimeRoot -StateRoot $StateRoot -StagingRoot $StagingRoot -BackupRoot $BackupRoot -LockRoot $LockRoot -ProfileRoot $profileRoots
     if (-not $installPolicy.IsValid) {
@@ -621,7 +557,7 @@ function Install-BRAVOToolkit {
             [void](Set-BRAVOUpdateJournalState -Journal $context.Journal -State Committed -StateRoot $StateRoot)
             Close-BRAVOUpdateOperationHandles -Context $context
             try {
-                $removal = Remove-BRAVOUpdateOperationDirectory -Path (Join-Path $StagingRoot $context.OperationId) -ExpectedParent $StagingRoot -OperationId $context.OperationId
+                $removal = Remove-BRAVOUpdateOperationDirectory -Path (Join-Path $StagingRoot $context.OperationId) -ExpectedParent $StagingRoot -OperationId $context.OperationId -AllowedRoot @($StagingRoot)
                 if (@($removal.Problems).Count -gt 0) {
                     Add-BRAVOUpdateContextFinding -Context $context -Finding (New-BRAVOUpdateFinding -Id 'Commit.StagingNotRemoved' -Severity Warning -Title 'Staging операції видалено не повністю' `
                             -Meaning 'Залишки не впливають на роботу; їх можна видалити вручну.' -Details ((@($removal.Problems) | Select-Object -First 5) -join '; '))
