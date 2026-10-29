@@ -63,9 +63,9 @@ function Get-BRAVOCommitAttributionViolation {
         # Футер - рядок, де перед "Generated" немає літер (емодзі, пробіли); інакше
         # опис самого правила в прозі ("пояснює, чому Generated with ... заборонено")
         # давав би хибне спрацювання.
-        'GENERATED_BY_AI'     = '(?im)^[^\p{L}\r\n]*generated[ \t]+(?:with|by)[ \t]+\[?[ \t]*' + $aiTool
+        # "GitHub Copilot" - назва продукту з префіксом (Codex QA-001, PR #531).
+        'GENERATED_BY_AI'     = '(?im)^[^\p{L}\r\n]*generated[ \t]+(?:with|by)[ \t]+\[?[ \t]*(?:github[ \t]+)?' + $aiTool
         'AI_SESSION_LINK'     = '(?i)https?://(?:www\.)?(?:claude\.ai/(?:code|chat|share|project)|claude\.com/claude-code|chatgpt\.com/(?:c|share|codex)/)'
-        'AI_NOREPLY_ADDRESS'  = '(?i)noreply@anthropic\.com'
     }
 
     $violations = New-Object System.Collections.Generic.List[string]
@@ -80,12 +80,27 @@ function Get-BRAVOCommitAttributionViolation {
             break
         }
     }
+    # Службова AI-адреса рахується лише як ідентичність у трейлері ("Ключ: Ім'я <адреса>"),
+    # а не будь-де в тексті: опис правила в прозі не є атрибуцією (Codex QA-002, PR #531).
+    foreach ($trailer in [regex]::Matches($text, '(?im)^[ \t]*[a-z][a-z0-9-]*:[^<\r\n]*<([^>\r\n]*)>[ \t]*\r?$')) {
+        if ($trailer.Groups[1].Value.Trim() -match $aiCoAuthorEmail) {
+            [void]$violations.Add('AI_NOREPLY_ADDRESS')
+            break
+        }
+    }
     foreach ($rule in $rules.Keys) {
         if ($text -match $rules[$rule]) { [void]$violations.Add($rule) }
     }
     foreach ($identity in @(@{ Name = 'AUTHOR'; Email = $AuthorEmail }, @{ Name = 'COMMITTER'; Email = $CommitterEmail })) {
+        if ([string]::IsNullOrEmpty($identity.Email)) { continue }
+        # Керівні символи в адресі git зберігає, але вони роблять поле неоднозначним:
+        # fail closed (Codex SEC-001, PR #531).
+        if ($identity.Email -match '[\x00-\x1f\x7f]') {
+            [void]$violations.Add('MALFORMED_' + $identity.Name + '_IDENTITY')
+            continue
+        }
         # Та сама політика службових адрес, що й для співавторів (PR #531, P2).
-        if (-not [string]::IsNullOrEmpty($identity.Email) -and ($identity.Email.Trim() -match $aiCoAuthorEmail -or $identity.Email -match $rules['AI_NOREPLY_ADDRESS'])) {
+        if ($identity.Email.Trim() -match $aiCoAuthorEmail) {
             [void]$violations.Add('AI_' + $identity.Name + '_IDENTITY')
         }
     }
@@ -209,21 +224,28 @@ Write-Host "Комітів у діапазоні: $($shas.Count)"
 
 $failed = 0
 foreach ($sha in $shas) {
-    $ErrorActionPreference = 'Continue'
-    try {
-        # %x1f відділяє адреси від повідомлення; core.quotepath не впливає на %B.
-        $raw = (& git -C $Root -c i18n.logOutputEncoding=UTF-8 show -s --no-show-signature '--format=%ae%x1f%ce%x1f%B' $sha 2>$null | Out-String)
-        $showExit = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorAction
+    # Кожне поле - окремим викликом: роздільник в одному форматі можна підробити
+    # тим самим символом усередині адреси й зсунути поля (Codex SEC-001, PR #531).
+    $fields = @{}
+    $readFailed = $false
+    foreach ($field in @(@{ Key = 'Author'; Format = '--format=%ae' }, @{ Key = 'Committer'; Format = '--format=%ce' }, @{ Key = 'Message'; Format = '--format=%B' })) {
+        $ErrorActionPreference = 'Continue'
+        try {
+            $value = (& git -C $Root -c i18n.logOutputEncoding=UTF-8 show -s --no-show-signature $field.Format $sha 2>$null | Out-String)
+            $showExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorAction
+        }
+        if ($showExit -ne 0) { $readFailed = $true; break }
+        # Out-String додає кінцевий розрив рядка; для адрес він не належить полю.
+        $fields[$field.Key] = if ($field.Key -eq 'Message') { $value } else { $value.TrimEnd("`r", "`n") }
     }
-    if ($showExit -ne 0) {
+    if ($readFailed) {
         Write-Host "::error::COMMIT_ATTRIBUTION_READ_FAILED: $sha (git show, код $showExit)"
         $failed++
         continue
     }
-    $parts = $raw -split [char]0x1f, 3
-    $hits = @(Get-BRAVOCommitAttributionViolation -AuthorEmail $parts[0] -CommitterEmail $(if ($parts.Count -gt 1) { $parts[1] } else { '' }) -Message $(if ($parts.Count -gt 2) { $parts[2] } else { '' }))
+    $hits = @(Get-BRAVOCommitAttributionViolation -AuthorEmail $fields['Author'] -CommitterEmail $fields['Committer'] -Message $fields['Message'])
     if ($hits.Count -gt 0) {
         Write-Host ("::error::COMMIT_ATTRIBUTION_FORBIDDEN: {0} [{1}]" -f $sha.Substring(0, 12), ($hits -join ', '))
         $failed++
