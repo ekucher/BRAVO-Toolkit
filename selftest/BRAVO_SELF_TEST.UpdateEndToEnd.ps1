@@ -207,7 +207,9 @@ try {
                 RuntimeRoot = $runtime; StateRoot = (Join-Path $base 'state'); LockRoot = (Join-Path $base 'locks'); StagingRoot = (Join-Path $base 'staging')
                 BackupRoot = (Join-Path $base 'backup'); OperationLockPath = (Join-Path $base 'locks\BRAVO_OPERATION.lock'); VersionStatePath = (Join-Path $base 'state\BRAVO_VERSION_STATE.json')
             }
-            foreach ($dir in @($paths.StateRoot, $paths.LockRoot)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+            # H1: корені engine створює лише Initialize-BRAVOUpdateProtectedRoots (власник/ACL за моделлю загрози).
+            $roots = Initialize-BRAVOUpdateProtectedRoots -Paths $paths
+            if (-not $roots.Success) { throw ("Sandbox: корені engine не створено: " + ($roots.Problems -join "; ")) }
             $work = Join-Path $base 'work'
             [void](New-Item -ItemType Directory -Path $work -Force)
             if ($null -ne $Installed) {
@@ -992,6 +994,34 @@ try {
             $replay = Invoke-T1Worker -Sandbox $sb -Plan $plan -RequestPath $worker.RequestPath
             Test-BRAVOCondition -Condition (($replay.Result.status -ceq 'Failed') -and ($replay.Result.reasonCode -ceq 'PlanStale') -and ((Get-T1FindingIds -Result $replay.Result) -contains 'Worker.PlanReplay') -and (@(Get-T1SnapshotDiff -Before $postWorker -After (Get-T1Snapshot -Sandbox $sb)).Count -eq 0)) `
                 -Name 'UpdateEndToEnd/Worker/ReplayIsPlanStale' -Failure (Format-T1Result -Result $replay.Result)
+        }
+
+        # ================================================================
+        # 14. Crash -> CLI-рівня Recover -> RolledBack (корінь установки й staging/backup engine знаходить CLI)
+        # ================================================================
+        & {
+            foreach ($crashKey in @('Deploy.AfterSideEffect', 'Backup.AfterIntent')) {
+                $case = New-T1UpdateCase -Name 'cli-recover'
+                $sb = $case.Sb
+                $thrown = ''
+                try { [void](Invoke-T1Update -Sandbox $sb -Plan $case.Plan -Release $releaseN1 -Fault @{ $crashKey = 'Crash' }) } catch { $thrown = [string]$_.Exception.Message }
+                $name = 'UpdateEndToEnd/CliRecover/' + $crashKey
+                Test-BRAVOCondition -Condition ($thrown.StartsWith('BRAVOUpdate.SimulatedCrash', [StringComparison]::Ordinal) -and ((Get-T1JournalState -Sandbox $sb -Plan $case.Plan) -ceq 'Open')) -Name ($name + '/CrashLeavesJournalOpen') -Failure ('thrown=' + $thrown)
+                # Без -RuntimeRoot: CLI сам знаходить встановлення (кандидати) і бере Staging/Backup з Paths engine.
+                $cli = Invoke-BRAVOUpdateCliAction -Action Recover -Paths $sb.Paths -Adapter $sb.Adapter -IsAdministrator $true -CandidateRoots @($sb.Runtime)
+                $expectStatus = 'RolledBack'; $expectExit = 81
+                if ($crashKey -ceq 'Backup.AfterIntent') { $expectStatus = 'Failed'; $expectExit = 80 }
+                $diff = @(Get-T1SnapshotDiff -Before $case.Pre -After (Get-T1Snapshot -Sandbox $sb))
+                $problems = New-Object System.Collections.Generic.List[string]
+                if ([string]$cli.Result.status -cne $expectStatus) { $problems.Add('status=' + $cli.Result.status + ' (очікувалось ' + $expectStatus + ')') }
+                if ([int]$cli.ExitCode -ne $expectExit) { $problems.Add('exit=' + $cli.ExitCode + ' (очікувалось ' + $expectExit + ')') }
+                if ($diff.Count -gt 0) { $problems.Add('змінено: ' + ($diff -join ',')) }
+                $expectJournal = 'RolledBack'; if ($crashKey -ceq 'Backup.AfterIntent') { $expectJournal = 'Abandoned' }
+                if ((Get-T1JournalState -Sandbox $sb -Plan $case.Plan) -cne $expectJournal) { $problems.Add('журнал=' + (Get-T1JournalState -Sandbox $sb -Plan $case.Plan)) }
+                Test-BRAVOCondition -Condition ($problems.Count -eq 0) -Name ($name + '/RecoverRestoresPreUpdateState') -Failure (($problems -join '; ') + ' | ' + (Format-T1Result -Result $cli.Result))
+                $second = Invoke-BRAVOUpdateCliAction -Action Recover -Paths $sb.Paths -Adapter $sb.Adapter -IsAdministrator $true -CandidateRoots @($sb.Runtime)
+                Test-BRAVOCondition -Condition (([int]$second.ExitCode -eq 0) -and ([string]$second.Result.status -ceq 'Success')) -Name ($name + '/SecondRecoverNoOp') -Failure (Format-T1Result -Result $second.Result)
+            }
         }
 
         # ================================================================
