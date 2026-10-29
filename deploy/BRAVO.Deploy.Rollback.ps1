@@ -149,9 +149,31 @@ function Get-BRAVODeployOwnedKeys {
         [Parameter(Mandatory = $true)][string]$StagedRoot,
         [Parameter(Mandatory = $true)][string]$BackupRoot,
         [string[]]$ExcludeFiles = @(),
-        [string[]]$ExcludeDirs = @()
+        [string[]]$ExcludeDirs = @(),
+        # ADDITIVE (Installer v1): явний перелік ключів, якими володіє розгортання
+        # (deploy-keys.json операції). Без параметра поведінка legacy НЕЗМІННА.
+        # З параметром staged-дерево НЕ обходиться (його вже може не існувати), а
+        # owned = OwnedKeyList ∪ ключі manifest-у backup (файли, які розгортання
+        # видалило, теж мають бути відновлені), мінус виключення.
+        [string[]]$OwnedKeyList
     )
     $owned = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if ($PSBoundParameters.ContainsKey('OwnedKeyList')) {
+        foreach ($listed in @($OwnedKeyList)) {
+            # Небезпечний ключ відхиляється гучно (виняток), як і ключі manifest-у.
+            $k = ConvertTo-BRAVODeployRelativeKey -Path $listed
+            if (Test-BRAVODeployPathExcluded -RelativeKey $k -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs) { continue }
+            [void]$owned.Add($k)
+        }
+        $backupManifestPath = Join-Path $BackupRoot 'RUNTIME_MANIFEST.json'
+        if ([System.IO.File]::Exists($backupManifestPath)) {
+            foreach ($k in @((Get-BRAVODeployManifestHashes -ManifestPath $backupManifestPath).Keys)) {
+                if (Test-BRAVODeployPathExcluded -RelativeKey $k -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs) { continue }
+                [void]$owned.Add($k)
+            }
+        }
+        return @($owned)
+    }
     foreach ($k in (Get-BRAVODeployTreeKeys -Root $StagedRoot -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs)) {
         [void]$owned.Add($k)
     }
@@ -174,7 +196,9 @@ function Invoke-BRAVODeployExactRestore {
         [Parameter(Mandatory = $true)][string]$BackupRoot,
         [Parameter(Mandatory = $true)][string]$StagedRoot,
         [string[]]$ExcludeFiles = @(),
-        [string[]]$ExcludeDirs = @()
+        [string[]]$ExcludeDirs = @(),
+        # ADDITIVE: див. Get-BRAVODeployOwnedKeys. Без параметра — legacy.
+        [string[]]$OwnedKeyList
     )
     $restored = New-Object System.Collections.Generic.List[string]
     $removed = New-Object System.Collections.Generic.List[string]
@@ -182,8 +206,24 @@ function Invoke-BRAVODeployExactRestore {
     $runtimeBase = $RuntimeRoot.TrimEnd('\', '/')
     $backupBase = $BackupRoot.TrimEnd('\', '/')
 
-    $owned = @(Get-BRAVODeployOwnedKeys -StagedRoot $StagedRoot -BackupRoot $BackupRoot `
-        -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs)
+    if ($PSBoundParameters.ContainsKey('OwnedKeyList')) {
+        # Небезпечний ключ у списку = відкат НЕ вдався (Errors), а не виняток.
+        try {
+            $owned = @(Get-BRAVODeployOwnedKeys -StagedRoot $StagedRoot -BackupRoot $BackupRoot `
+                -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs -OwnedKeyList $OwnedKeyList)
+        } catch {
+            [void]$errors.Add('OwnedKeyList: ' + $_.Exception.Message)
+            return [pscustomobject]@{
+                OwnedCount = 0
+                Restored   = @()
+                Removed    = @()
+                Errors     = @($errors.ToArray())
+            }
+        }
+    } else {
+        $owned = @(Get-BRAVODeployOwnedKeys -StagedRoot $StagedRoot -BackupRoot $BackupRoot `
+            -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs)
+    }
 
     foreach ($key in $owned) {
         try {
