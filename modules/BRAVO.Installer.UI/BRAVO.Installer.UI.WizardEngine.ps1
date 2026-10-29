@@ -1,4 +1,4 @@
-# BRAVO.Installer.UI.WizardEngine — команди engine для майстра (Plan, Execute
+﻿# BRAVO.Installer.UI.WizardEngine — команди engine для майстра (Plan, Execute
 # через UAC, Recover, облікові дані), запис запиту, читання стану операції й
 # запит скасування. Побудова команд — чисті функції; запуск — тонкий.
 #

@@ -423,7 +423,7 @@ function ConvertTo-BRAVOInstallerPlanViewModel {
         [AllowNull()][object]$Plan = $null,
         [AllowNull()][string[]]$PlanLine = @(),
         [bool]$Confirmed = $false,
-        [AllowNull()][Nullable[datetime]]$NowUtc = $null,
+        [AllowNull()][object]$NowUtc = $null,
         [string]$ErrorText = '',
         [ValidateSet('Install', 'Update', 'Repair')][string]$Operation = 'Install'
     )
@@ -444,7 +444,7 @@ function ConvertTo-BRAVOInstallerPlanViewModel {
         $style = [Globalization.DateTimeStyles]::RoundtripKind
         if ([datetime]::TryParse($expiresText, [Globalization.CultureInfo]::InvariantCulture, $style, [ref]$expires)) {
             $now = [datetime]::UtcNow
-            if ($null -ne $NowUtc) { $now = $NowUtc.Value }
+            if ($null -ne $NowUtc) { $now = ([datetime]$NowUtc) }
             if ($now.ToUniversalTime() -gt $expires.ToUniversalTime()) { $expired = $true }
         }
     }
@@ -637,15 +637,15 @@ function ConvertTo-BRAVOInstallerExecutionViewModel {
     [CmdletBinding()]
     param(
         [AllowNull()][object[]]$ProgressEvent = @(),
-        [AllowNull()][Nullable[datetime]]$StartedUtc = $null,
-        [AllowNull()][Nullable[datetime]]$NowUtc = $null,
+        [AllowNull()][object]$StartedUtc = $null,
+        [AllowNull()][object]$NowUtc = $null,
         [bool]$MutationStarted = $false,
         [bool]$CancelRequested = $false,
         [bool]$Finished = $false,
         [int]$StaleAfterSeconds = 120
     )
     $now = [datetime]::UtcNow
-    if ($null -ne $NowUtc) { $now = $NowUtc.Value.ToUniversalTime() }
+    if ($null -ne $NowUtc) { $now = ([datetime]$NowUtc).ToUniversalTime() }
     $events = @($ProgressEvent | Where-Object { $null -ne $_ })
 
     $phaseKeys = New-Object System.Collections.Generic.List[object]
@@ -702,7 +702,7 @@ function ConvertTo-BRAVOInstallerExecutionViewModel {
         $message = [string](Get-BRAVOInstallerProperty -InputObject $last -Name 'messageKey' -Default '')
     }
     $elapsedText = 'Минуло: —'
-    if ($null -ne $StartedUtc) { $elapsedText = 'Минуло: ' + (Format-BRAVOInstallerElapsed -Span ($now - $StartedUtc.Value.ToUniversalTime())) }
+    if ($null -ne $StartedUtc) { $elapsedText = 'Минуло: ' + (Format-BRAVOInstallerElapsed -Span ($now - ([datetime]$StartedUtc).ToUniversalTime())) }
 
     $heartbeatText = 'Очікуємо першу відповідь engine…'
     $stale = $false

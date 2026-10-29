@@ -182,12 +182,10 @@ function Start-BRAVOInstallerEngineJob {
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
-        $psi.RedirectStandardInput = $true
         $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
         $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
         $process = [System.Diagnostics.Process]::Start($psi)
-        # -NonInteractive + закритий stdin: engine не може зависнути на запиті.
-        $process.StandardInput.Close()
+        # stdin не перенаправляємо (governance); -NonInteractive не дає engine чекати на запит.
         [pscustomobject]@{
             Action       = $Action
             Process      = $process
