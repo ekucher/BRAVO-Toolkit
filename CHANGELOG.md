@@ -2,6 +2,17 @@
 
 ## Не випущено (developer)
 
+- **CI: ранні гейти файлів агентів і AI-атрибуції в комітах (AUD-08, AUD-12).**
+  У `static-checks` до парсера додано два кроки. `Agent files policy` (`ci/Test-BRAVOAgentFilePolicy.ps1`)
+  за секунди відхиляє повернення `.claude/`, `.codex/`, `AGENTS.md`, `CLAUDE.md`, `.mcp.json` у дерево; раніше
+  це ловив лише повний self-test у кінці прогону. Скан дерева перенесено з self-test у
+  `ci/BRAVOAgentFilePolicy.ps1` (`Get-BRAVOAgentFileScan`), тож self-test і крок CI користуються одним кодом.
+  `Commit attribution policy` (`ci/Test-BRAVOCommitAttribution.ps1`) перевіряє повідомлення й адреси авторів
+  нових комітів PR чи push. Він відхиляє трейлери співавторства AI-інструментів, сесійні трейлери, футери
+  «Generated with/by» AI-інструментів, посилання на сесії й чати та службову адресу AI-провайдера. Історія до
+  гейту виключена фіксованою базовою лінією; невизначений діапазон чи відсутня базова лінія — помилка (fail
+  closed). Self-test `Governance/CommitAttribution.*`, `Governance/NoAgentFilesInTree.EarlyCiStep*`.
+
 - **Release: збирання з lightweight-тега відхиляється (D8).**
   `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
   `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не

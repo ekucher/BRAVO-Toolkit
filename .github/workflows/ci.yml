@@ -62,6 +62,25 @@ jobs:
           # на місці.
           fetch-depth: 0
 
+      # Fail-fast: AI agent files (.claude/, .codex/, AGENTS.md, CLAUDE.md,
+      # .mcp.json) must not return to the product tree. The full self-test
+      # checks the same policy (Governance/NoAgentFilesInTree), but only at
+      # the end of a long run; this step fails in seconds. Same policy code:
+      # ci\BRAVOAgentFilePolicy.ps1. Keep `run:` ASCII (see below).
+      - name: Agent files policy
+        shell: powershell
+        run: .\ci\Test-BRAVOAgentFilePolicy.ps1
+
+      # AI attribution (Co-Authored-By an AI tool, session trailers,
+      # "Generated with" footers, session/chat links, AI noreply identity)
+      # is forbidden in commit messages. Only the commits of this PR or push
+      # are scanned (fetch-depth: 0 above makes the range resolvable); an
+      # unresolvable range fails closed. History before the gate is excluded
+      # by a fixed baseline inside the script.
+      - name: Commit attribution policy
+        shell: powershell
+        run: .\ci\Test-BRAVOCommitAttribution.ps1
+
       - name: PowerShell parser (усі .ps1/.psm1/.psd1)
         shell: powershell
         run: |
