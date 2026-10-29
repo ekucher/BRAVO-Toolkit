@@ -25,7 +25,7 @@ $script:BRAVOUpdateSiteOwnedFiles = @('BRAVO.config', 'BRAVO.local.config', 'TOO
 # $excludedDirectoryPattern) уже виключають їх з цілісності; deploy/backup/delta
 # мають бачити той самий набір.
 $script:BRAVOUpdateSiteOwnedDirs = @('LOGS', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA', 'BAZA_WWW', 'artifacts',
-                                     'local-backups', '.git', '.vscode')
+                                     'local-backups', '.git', '.vscode', '.claude')
 
 # Резерв вільного місця на томі (CONTRACTS §5 / план): 512 MB.
 $script:BRAVOUpdateFootprintReserveBytes = 512MB

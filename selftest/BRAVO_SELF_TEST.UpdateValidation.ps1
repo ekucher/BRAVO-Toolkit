@@ -69,9 +69,9 @@ function New-BRAVOValTestContext {
 }
 
 function Invoke-BRAVOValTest {
-    param($Context, [string]$Mode, [string]$Version, [string]$Manifest, $GuardBaseline = $null)
+    param($Context, [string]$ValidationMode, [string]$Version, [string]$Manifest, $GuardBaseline = $null)
     return (Invoke-BRAVOValTestCall -Name 'Test-BRAVODeploymentValidation' -Params @{
-            Context = $Context; Mode = $Mode; ExpectedVersion = $Version; ExpectedManifestPath = $Manifest
+            Context = $Context; Mode = $ValidationMode; ExpectedVersion = $Version; ExpectedManifestPath = $Manifest
             SiteBaseline = [pscustomobject]@{ marker = 'baseline' }; GuardBaselineExitCode = $GuardBaseline
         })
 }
@@ -115,7 +115,7 @@ try {
         if ($null -eq $valSiteOriginal) {
             $calls = @{}
             $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $runtime
-            $res = Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest
+            $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest
             Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'SiteConfigPreserved') -eq 'Fail' -and $res.Status -eq 'Fail') `
                 -Name 'UpdateValidation/SiteConfigFunctionMissingFailsClosed' -Failure 'без Test-BRAVOSiteConfigurationPreserved результат має бути Fail'
         } else {
@@ -129,7 +129,7 @@ try {
     & {
         $calls = @{}
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $runtime -OperationDirectory $opDir -SelfTestPlanned
-        $res = Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest
+        $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest
         Test-BRAVOCondition -Condition ($res.Status -eq 'Pass') -Name 'UpdateValidation/DeployAllPass' -Failure ('очікувано Pass: ' + (($res.Items | ForEach-Object { $_.name + '=' + $_.status }) -join ','))
         $names = @($res.Items | ForEach-Object { $_.name })
         Test-BRAVOCondition -Condition (($names -join ',') -eq 'VersionJson,RuntimeManifest,Guard,SetupValidate,SelfTest,SiteConfigPreserved') `
@@ -148,7 +148,7 @@ try {
         & {
             $calls = @{}
             $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls -Guard $guardCode) -RuntimeRoot $runtime
-            $res = Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest
+            $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest
             $expected = if ($guardCode -eq 0) { 'Pass' } else { 'Fail' }
             Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'Guard') -eq $expected) `
                 -Name "UpdateValidation/GuardCode$guardCode" -Failure "guard $guardCode -> $expected"
@@ -162,24 +162,24 @@ try {
     & {
         $calls = @{}
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls -GuardTimedOut) -RuntimeRoot $runtime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Fail') `
             -Name 'UpdateValidation/GuardTimedOutFails' -Failure 'TimedOut -> Fail'
 
         $adapter = New-BRAVOValTestAdapter -Calls $calls
         $adapter.Remove('InvokeGuard')
         $ctx = New-BRAVOValTestContext -Adapter $adapter -RuntimeRoot $runtime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Fail') `
             -Name 'UpdateValidation/GuardMissingAdapterKeyFails' -Failure 'немає InvokeGuard -> Fail'
 
         $adapter = New-BRAVOValTestAdapter -Calls $calls
         $adapter.InvokeGuard = { param([string]$RuntimeRoot) throw 'імітація збою адаптера' }
         $ctx = New-BRAVOValTestContext -Adapter $adapter -RuntimeRoot $runtime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Fail') `
             -Name 'UpdateValidation/GuardAdapterThrowsFails' -Failure 'виняток адаптера -> Fail'
 
         $adapter.InvokeGuard = { param([string]$RuntimeRoot) [pscustomobject]@{ Output = 'x' } }
         $ctx = New-BRAVOValTestContext -Adapter $adapter -RuntimeRoot $runtime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Fail') `
             -Name 'UpdateValidation/GuardNoExitCodeFails' -Failure 'результат без ExitCode -> Fail'
     }
 
@@ -187,14 +187,14 @@ try {
     & {
         $calls = @{}
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls -Guard 35) -RuntimeRoot $runtime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Rollback -Version '5.3.0' -Manifest $manifest -GuardBaseline 35) 'Guard') -eq 'Pass') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Rollback -Version '5.3.0' -Manifest $manifest -GuardBaseline 35) 'Guard') -eq 'Pass') `
             -Name 'UpdateValidation/RollbackGuardEqualsBaselinePasses' -Failure 'guard 35 == baseline 35 -> Pass'
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Rollback -Version '5.3.0' -Manifest $manifest -GuardBaseline 0) 'Guard') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Rollback -Version '5.3.0' -Manifest $manifest -GuardBaseline 0) 'Guard') -eq 'Fail') `
             -Name 'UpdateValidation/RollbackGuardDiffersFromBaselineFails' -Failure 'guard 35 != baseline 0 -> Fail'
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest -GuardBaseline 35) 'Guard') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest -GuardBaseline 35) 'Guard') -eq 'Fail') `
             -Name 'UpdateValidation/DeployIgnoresGuardBaseline' -Failure 'baseline діє лише в Rollback'
         $ctx0 = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls -Guard 0) -RuntimeRoot $runtime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx0 -Mode Rollback -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Pass') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx0 -ValidationMode Rollback -Version '5.3.0' -Manifest $manifest) 'Guard') -eq 'Pass') `
             -Name 'UpdateValidation/RollbackWithoutBaselineExpectsZero' -Failure 'без baseline очікується 0'
     }
 
@@ -205,19 +205,19 @@ try {
         Repair   = @{ 0 = 'Pass'; 10 = 'Warn'; 1 = 'Fail' }
         Install  = @{ 0 = 'Pass'; 10 = 'Warn'; 1 = 'Warn' }
     }
-    foreach ($mode in @('Deploy', 'Rollback', 'Repair', 'Install')) {
+    foreach ($valModeName in @('Deploy', 'Rollback', 'Repair', 'Install')) {
         foreach ($setupCode in @(0, 10, 1)) {
             & {
                 $calls = @{}
                 $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls -Setup $setupCode) -RuntimeRoot $runtime
-                $res = Invoke-BRAVOValTest -Context $ctx -Mode $mode -Version '5.3.0' -Manifest $manifest
-                $expected = $setupExpect[$mode][$setupCode]
+                $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode $valModeName -Version '5.3.0' -Manifest $manifest
+                $expected = $setupExpect[$valModeName][$setupCode]
                 Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'SetupValidate') -eq $expected) `
-                    -Name "UpdateValidation/Setup${setupCode}In$mode" -Failure "setup $setupCode у $mode -> $expected"
+                    -Name "UpdateValidation/Setup${setupCode}In${valModeName}" -Failure "setup $setupCode у $valModeName -> $expected"
                 $overall = switch ($expected) { 'Pass' { 'Pass' } 'Warn' { 'Warn' } default { 'Fail' } }
                 # Install: credentials Found -> без додаткових Warn; загальний статус = статус setup.
                 Test-BRAVOCondition -Condition ($res.Status -eq $overall) `
-                    -Name "UpdateValidation/Setup${setupCode}In${mode}Overall" -Failure "загальний статус $overall, фактично $($res.Status)"
+                    -Name "UpdateValidation/Setup${setupCode}In${valModeName}Overall" -Failure "загальний статус $overall, фактично $($res.Status)"
             }
         }
     }
@@ -228,9 +228,9 @@ try {
         $adapter = New-BRAVOValTestAdapter -Calls $calls
         $adapter.InvokeSetupValidate = { param([string]$RuntimeRoot) [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $true } }
         $ctx = New-BRAVOValTestContext -Adapter $adapter -RuntimeRoot $runtime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest) 'SetupValidate') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest) 'SetupValidate') -eq 'Fail') `
             -Name 'UpdateValidation/SetupTimeoutDeployFails' -Failure 'таймаут setup у Deploy -> Fail'
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Install -Version '5.3.0' -Manifest $manifest) 'SetupValidate') -eq 'Warn') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Install -Version '5.3.0' -Manifest $manifest) 'SetupValidate') -eq 'Warn') `
             -Name 'UpdateValidation/SetupTimeoutInstallWarns' -Failure 'таймаут setup в Install -> Warn'
     }
 
@@ -238,18 +238,18 @@ try {
     & {
         $calls = @{}
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $runtime
-        $res = Invoke-BRAVOValTest -Context $ctx -Mode Repair -Version '5.3.0' -Manifest $manifest
+        $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Repair -Version '5.3.0' -Manifest $manifest
         Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'SelfTest') -eq 'Skipped' -and -not $calls.ContainsKey('SelfTest')) `
             -Name 'UpdateValidation/SelfTestSkippedWhenNotPlanned' -Failure 'не заплановано -> Skipped, адаптер не викликано'
 
         $calls = @{}
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls -SelfTest 1) -RuntimeRoot $runtime -SelfTestPlanned
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest) 'SelfTest') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest) 'SelfTest') -eq 'Fail') `
             -Name 'UpdateValidation/SelfTestNonZeroFails' -Failure 'self-test 1 -> Fail'
 
         $calls = @{}
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $runtime -SelfTestPlanned
-        $res = Invoke-BRAVOValTest -Context $ctx -Mode Rollback -Version '5.3.0' -Manifest $manifest
+        $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Rollback -Version '5.3.0' -Manifest $manifest
         Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'SelfTest') -eq 'Skipped' -and -not $calls.ContainsKey('SelfTest')) `
             -Name 'UpdateValidation/SelfTestNotRunOnRollback' -Failure 'Rollback не запускає self-test'
     }
@@ -259,7 +259,7 @@ try {
         & {
             $calls = @{}
             $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls -Presence $presence) -RuntimeRoot $runtime
-            $res = Invoke-BRAVOValTest -Context $ctx -Mode Install -Version '5.3.0' -Manifest $manifest
+            $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Install -Version '5.3.0' -Manifest $manifest
             $expected = if ($presence -eq 'Found') { 'Pass' } else { 'Warn' }
             Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'TestCredentialPresence') -eq $expected) `
                 -Name "UpdateValidation/InstallCredentials$presence" -Failure "credentials $presence -> $expected"
@@ -271,7 +271,7 @@ try {
     & {
         $calls = @{}
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $runtime
-        $res = Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest
+        $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest
         Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'TestCredentialPresence') -eq 'ABSENT') `
             -Name 'UpdateValidation/CredentialsOnlyInInstall' -Failure 'credentials перевіряються лише в Install'
     }
@@ -280,14 +280,14 @@ try {
     & {
         $calls = @{}
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $runtime
-        $res = Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '9.9.9' -Manifest $manifest
+        $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '9.9.9' -Manifest $manifest
         Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'VersionJson') -eq 'Fail' -and $res.Status -eq 'Fail') `
             -Name 'UpdateValidation/VersionMismatchFails' -Failure 'версія не збігається -> Fail'
 
         $noVersionRuntime = Join-Path $valTestRoot 'без версії'
         $noVersionManifest = New-BRAVOValTestRuntime -Path $noVersionRuntime -Version '5.3.0' -NoVersionJson
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $noVersionRuntime
-        $res = Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $noVersionManifest
+        $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $noVersionManifest
         Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'VersionJson') -eq 'Fail' -and $res.Status -eq 'Fail' -and ($res.Items | Where-Object { $_.name -eq 'Guard' })) `
             -Name 'UpdateValidation/MissingVersionJsonFails' -Failure 'немає VERSION.json -> Fail, решта перевірок усе одно виконана'
 
@@ -295,7 +295,7 @@ try {
         $badVersionManifest = New-BRAVOValTestRuntime -Path $badVersionRuntime -Version '5.3.0'
         [IO.File]::WriteAllText((Join-Path $badVersionRuntime 'VERSION.json'), '{ не json', (New-Object Text.UTF8Encoding $false))
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $badVersionRuntime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $badVersionManifest) 'VersionJson') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $badVersionManifest) 'VersionJson') -eq 'Fail') `
             -Name 'UpdateValidation/CorruptVersionJsonFails' -Failure 'пошкоджений VERSION.json -> Fail'
     }
 
@@ -305,16 +305,16 @@ try {
         $driftRuntime = Join-Path $valTestRoot 'дрейф'
         $driftManifest = New-BRAVOValTestRuntime -Path $driftRuntime -Version '5.3.0'
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $driftRuntime
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $driftManifest) 'RuntimeManifest') -eq 'Pass') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $driftManifest) 'RuntimeManifest') -eq 'Pass') `
             -Name 'UpdateValidation/ManifestMatchesPasses' -Failure 'чистий runtime -> Pass'
         [IO.File]::WriteAllText((Join-Path $driftRuntime 'a.ps1'), 'Write-Output 2', (New-Object Text.UTF8Encoding $false))
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $driftManifest) 'RuntimeManifest') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $driftManifest) 'RuntimeManifest') -eq 'Fail') `
             -Name 'UpdateValidation/ManifestModifiedFileFails' -Failure 'змінений файл -> Fail'
         [IO.File]::WriteAllText((Join-Path $driftRuntime 'a.ps1'), 'Write-Output 1', (New-Object Text.UTF8Encoding $false))
         [IO.File]::WriteAllText((Join-Path $driftRuntime 'stranger.ps1'), 'Write-Output 3', (New-Object Text.UTF8Encoding $false))
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $driftManifest) 'RuntimeManifest') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $driftManifest) 'RuntimeManifest') -eq 'Fail') `
             -Name 'UpdateValidation/ManifestStrangerScriptFails' -Failure 'сторонній скрипт -> Fail'
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest (Join-Path $driftRuntime 'немає.json')) 'RuntimeManifest') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest (Join-Path $driftRuntime 'немає.json')) 'RuntimeManifest') -eq 'Fail') `
             -Name 'UpdateValidation/ManifestMissingFails' -Failure 'немає маніфесту -> Fail'
     }
 
@@ -323,14 +323,14 @@ try {
         $calls = @{}
         Set-BRAVOValTestSiteStub -Body $valSiteFail
         $ctx = New-BRAVOValTestContext -Adapter (New-BRAVOValTestAdapter -Calls $calls) -RuntimeRoot $runtime
-        $res = Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest
+        $res = Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest
         Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus $res 'SiteConfigPreserved') -eq 'Fail' -and $res.Status -eq 'Fail') `
             -Name 'UpdateValidation/SiteConfigDriftFails' -Failure 'розбіжність site config -> Fail'
         Set-BRAVOValTestSiteStub -Body { param([string]$RuntimeRoot, $Baseline) throw 'імітація збою' }
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest) 'SiteConfigPreserved') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest) 'SiteConfigPreserved') -eq 'Fail') `
             -Name 'UpdateValidation/SiteConfigThrowsFails' -Failure 'виняток -> Fail'
         Set-BRAVOValTestSiteStub -Body { param([string]$RuntimeRoot, $Baseline) 'сміття' }
-        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -Mode Deploy -Version '5.3.0' -Manifest $manifest) 'SiteConfigPreserved') -eq 'Fail') `
+        Test-BRAVOCondition -Condition ((Get-BRAVOValTestItemStatus (Invoke-BRAVOValTest -Context $ctx -ValidationMode Deploy -Version '5.3.0' -Manifest $manifest) 'SiteConfigPreserved') -eq 'Fail') `
             -Name 'UpdateValidation/SiteConfigGarbageFails' -Failure 'нерозпізнаний результат -> Fail'
         Set-BRAVOValTestSiteStub -Body $valSitePass
     }
@@ -343,7 +343,7 @@ try {
         $childLines = @(
             'param([string]$Mode)',
             'if ($Mode -eq ''Sleep'') { Start-Sleep -Seconds 60; exit 0 }',
-            'Write-Output ''ПОЧАТОК виводу''',
+            'Write-Output ''CHILD-OUTPUT-START''',
             'Write-Output ''password=HunterFakeSecret42 token=FAKEtokenValue123456''',
             '[Console]::Error.WriteLine(''stderr password=HunterFakeSecret42'')',
             'exit 7'
@@ -355,12 +355,12 @@ try {
             ScriptPath = $childScript; ScriptArgument = @('-Mode', 'Print'); TimeoutSeconds = 60; LogPath = $logPath
         }
         Test-BRAVOCondition -Condition ($run.ExitCode -eq 7 -and -not $run.TimedOut) -Name 'UpdateValidation/ChildExitCodePropagated' -Failure "ExitCode=$($run.ExitCode) TimedOut=$($run.TimedOut)"
-        Test-BRAVOCondition -Condition ([string]$run.Output -match 'ПОЧАТОК виводу') -Name 'UpdateValidation/ChildOutputCaptured' -Failure 'вивід дитини не повернуто'
+        Test-BRAVOCondition -Condition ([string]$run.Output -match 'CHILD-OUTPUT-START') -Name 'UpdateValidation/ChildOutputCaptured' -Failure 'вивід дитини не повернуто'
         Test-BRAVOCondition -Condition ([string]$run.Output -notmatch 'HunterFakeSecret42' -and [string]$run.Output -notmatch 'FAKEtokenValue123456') `
             -Name 'UpdateValidation/ChildOutputSecretMasked' -Failure 'секрет у поверненому виводі'
         $logText = ''
         if (Test-Path -LiteralPath $logPath) { $logText = [IO.File]::ReadAllText($logPath) }
-        Test-BRAVOCondition -Condition ($run.LogPath -eq $logPath -and $logText -match 'ПОЧАТОК виводу' -and $logText -notmatch 'HunterFakeSecret42' -and $logText -notmatch 'FAKEtokenValue123456') `
+        Test-BRAVOCondition -Condition ($run.LogPath -eq $logPath -and $logText -match 'CHILD-OUTPUT-START' -and $logText -notmatch 'HunterFakeSecret42' -and $logText -notmatch 'FAKEtokenValue123456') `
             -Name 'UpdateValidation/ChildLogWrittenAndMasked' -Failure 'лог відсутній або містить секрет'
 
         $watch = [Diagnostics.Stopwatch]::StartNew()

@@ -437,15 +437,6 @@ function ConvertTo-BRAVOUpdateNormalizedObject {
 # Коди завершення
 # ---------------------------------------------------------------------------
 
-function Initialize-BRAVOUpdateExitCodeModule {
-    [CmdletBinding()]
-    param()
-
-    if ($null -ne (Get-Command -Name 'Get-BRAVOExitCodeName' -ErrorAction SilentlyContinue)) { return }
-    $manifest = Join-Path $script:BRAVOUpdateToolkitRoot 'modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1'
-    Import-Module -Name $manifest -ErrorAction Stop
-}
-
 function ConvertTo-BRAVOUpdateExitCode {
     <#
     .SYNOPSIS
@@ -487,7 +478,7 @@ function New-BRAVOUpdateInstallationState {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][ValidateSet('NotInstalled', 'Installed', 'UpdateAvailable', 'PrereleaseInstalled', 'Degraded', 'RepairRequired', 'InterruptedUpdate', 'RollbackRequired', 'Unsupported', 'Ambiguous')][string]$State,
-        [AllowNull()][string]$RuntimeRoot = $null,
+        [AllowNull()][object]$RuntimeRoot = $null,
         [string[]]$CandidateRoots = @(),
         [AllowNull()]$Version = $null,
         $Integrity = $null,
@@ -501,7 +492,7 @@ function New-BRAVOUpdateInstallationState {
         [string]$GeneratedUtc = ''
     )
 
-    if ([string]::IsNullOrEmpty($RuntimeRoot)) { $RuntimeRoot = $null }
+    if ($null -eq $RuntimeRoot -or [string]::IsNullOrEmpty([string]$RuntimeRoot)) { $RuntimeRoot = $null } else { $RuntimeRoot = [string]$RuntimeRoot }
     if ($null -eq $Integrity) { $Integrity = [pscustomobject][ordered]@{ status = 'Unknown'; checkedCount = 0; mismatchedCount = 0; missingCount = 0; unknownCount = 0; message = '' } }
     if ($null -eq $VersionState) { $VersionState = [pscustomobject][ordered]@{ recordedVersion = $null; statePathKind = 'Production' } }
     if ($null -eq $Configuration) { $Configuration = [pscustomobject][ordered]@{ localConfigPresent = $false; legacyConfigPresent = $false; localConfigSchemaValid = $true; migrationBlocker = [pscustomobject][ordered]@{ blocked = $false; reasons = @() } } }
@@ -564,15 +555,15 @@ function New-BRAVOUpdatePreflightResult {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][ValidateSet('Install', 'Update', 'Repair', 'Diagnose')][string]$Operation,
-        [AllowNull()][string]$RuntimeRoot = $null,
+        [AllowNull()][object]$RuntimeRoot = $null,
         [object[]]$Findings = @(),
-        [AllowNull()][string]$Fingerprint = $null,
+        [AllowNull()][object]$Fingerprint = $null,
         [string]$GeneratedUtc = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($GeneratedUtc)) { $GeneratedUtc = Get-BRAVOUpdateUtcNowText }
-    if ([string]::IsNullOrEmpty($RuntimeRoot)) { $RuntimeRoot = $null }
-    if ([string]::IsNullOrEmpty($Fingerprint)) { $Fingerprint = $null }
+    if ($null -eq $RuntimeRoot -or [string]::IsNullOrEmpty([string]$RuntimeRoot)) { $RuntimeRoot = $null } else { $RuntimeRoot = [string]$RuntimeRoot }
+    if ($null -eq $Fingerprint -or [string]::IsNullOrEmpty([string]$Fingerprint)) { $Fingerprint = $null } else { $Fingerprint = [string]$Fingerprint }
     $summary = Get-BRAVOUpdateFindingSummary -Findings $Findings
     return [pscustomobject][ordered]@{
         schemaVersion = 1
@@ -966,7 +957,6 @@ function New-BRAVOUpdateDeploymentResult {
         finishedUtc      = $FinishedUtc
     }
     # Код — лише через відображення §7 і BRAVO.ExitCodes (явний -ExitCode має бути узгодженим, інакше валідатор відхилить).
-    Initialize-BRAVOUpdateExitCodeModule
     if ($null -eq $ExitCode) { $ExitCode = ConvertTo-BRAVOUpdateExitCode -Result $result }
     $result.exitCode = [int]$ExitCode
     $result.exitCodeName = Get-BRAVOExitCodeName -Code ([int]$ExitCode)
