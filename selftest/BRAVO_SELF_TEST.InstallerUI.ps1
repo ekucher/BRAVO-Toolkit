@@ -166,6 +166,35 @@
         }
     }
 
+    # --- Прогрес: лише канонічний читач BRAVO.Update, без власного запасного ---
+    & {
+        $tmpP = Join-Path ([IO.Path]::GetTempPath()) ('INSTALLERUI_TEST_' + [guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Path $tmpP -Force)
+        try {
+            $jsonlP = Join-Path $tmpP 'progress.jsonl'
+            [IO.File]::WriteAllText($jsonlP, ('{"sequence":1,"phase":"Preflight","status":"Started","percent":null,"message":"a"}' + "`n" + '{"sequence":2,"phase":"Stage","status":"Running","percent":40,"message":"b"}' + "`n"), (New-Object Text.UTF8Encoding $false))
+            $viaUi = @(Read-BRAVOInstallerProgress -Path $jsonlP)
+            $updateModule = Get-Module -Name 'BRAVO.Update'
+            $direct = @(& $updateModule { param($x) Read-BRAVOUpdateProgressEvents -Path $x } $jsonlP)
+            Test-BRAVOCondition -Condition ($null -ne $updateModule -and $viaUi.Count -eq 2 -and $viaUi.Count -eq $direct.Count -and [long]$viaUi[1].sequence -eq 2) `
+                -Name 'InstallerUI/Progress/UsesCanonicalReader' -Failure "UI=$($viaUi.Count) canonical=$($direct.Count)"
+            $hasOwnReader = ((Get-Content -LiteralPath (Join-Path $root 'modules\BRAVO.Installer.UI\BRAVO.Installer.UI.Engine.ps1') -Raw) -match 'StreamReader')
+            Test-BRAVOCondition -Condition (-not $hasOwnReader) -Name 'InstallerUI/Progress/NoOwnJsonlReader' -Failure 'у Engine-частині UI лишився власний читач JSONL'
+            # Fail closed: без модуля BRAVO.Update і без маніфесту — виняток, а не мовчазний fallback.
+            $thrown = $false
+            Remove-Module -Name 'BRAVO.Update' -Force -ErrorAction SilentlyContinue
+            try {
+                & (Get-Module BRAVO.Installer.UI) { param($d) Import-BRAVOInstallerUpdateModule -ToolkitRoot $d } $tmpP
+            } catch { $thrown = $true }
+            Test-BRAVOCondition -Condition $thrown -Name 'InstallerUI/Progress/FailsClosedWithoutUpdateModule' -Failure 'відсутній BRAVO.Update має давати виняток'
+            $again = @(Read-BRAVOInstallerProgress -Path $jsonlP)
+            Test-BRAVOCondition -Condition ($again.Count -eq 2 -and $null -ne (& (Get-Module BRAVO.Installer.UI) { Get-Module -Name 'BRAVO.Update' })) -Name 'InstallerUI/Progress/ImportsUpdateModuleFromToolkit' -Failure 'UI має сам імпортувати BRAVO.Update з кореня комплекту'
+        } finally {
+            if ($tmpP.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -LiteralPath $tmpP -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
     # --- Головна форма без ShowDialog ---
     $formResult = $null
     $formError = ''

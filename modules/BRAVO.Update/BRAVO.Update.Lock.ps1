@@ -263,7 +263,13 @@ function Test-BRAVOUpdateOperationLockActive {
     if (-not (Test-Path -LiteralPath $OperationLockPath -PathType Leaf)) {
         return [pscustomobject]@{ Active = $false; Holder = $null }
     }
+    # ВАЖЛИВО: без типізованих catch із return всередині. У Windows PowerShell
+    # 5.1 після кількох викликів (скомпільований scriptblock) такий варіант
+    # хибно повертав Active=$false при зайнятому lock-і (fail open!). Один
+    # універсальний catch + розбір типу + єдиний return поводиться однаково
+    # в інтерпретованому й скомпільованому режимах.
     $active = $false
+    $missing = $false
     try {
         $probe = [System.IO.File]::Open(
             $OperationLockPath,
@@ -272,13 +278,16 @@ function Test-BRAVOUpdateOperationLockActive {
             [System.IO.FileShare]::ReadWrite
         )
         $probe.Dispose()
-    } catch [System.IO.FileNotFoundException] {
-        return [pscustomobject]@{ Active = $false; Holder = $null }
-    } catch [System.IO.DirectoryNotFoundException] {
-        return [pscustomobject]@{ Active = $false; Holder = $null }
     } catch {
-        $active = $true
+        $failure = $_.Exception
+        if ($null -ne $failure.InnerException) { $failure = $failure.InnerException }
+        if (($failure -is [System.IO.FileNotFoundException]) -or ($failure -is [System.IO.DirectoryNotFoundException])) {
+            $missing = $true
+        } else {
+            $active = $true
+        }
     }
+    if ($missing) { return [pscustomobject]@{ Active = $false; Holder = $null } }
     $holder = $null
     if ($active) { $holder = Read-BRAVOUpdateOperationLockHolder -OperationLockPath $OperationLockPath }
     return [pscustomobject]@{ Active = $active; Holder = $holder }

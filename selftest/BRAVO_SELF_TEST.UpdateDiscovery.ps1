@@ -46,9 +46,15 @@
         }
     }
 
+    # Кожен створений discovery стан проходить канонічний Test-BRAVOUpdateInstallationState
+    # (перевіряється наприкінці): форма контракту належить конструктору Contracts.
+    $discoveryValidations = New-Object System.Collections.Generic.List[object]
     function Invoke-DiscoveryState {
         param([hashtable]$Parameters)
-        return (& $updateModule { param($p) Get-BRAVOInstallationState @p } $Parameters)
+        $built = (& $updateModule { param($p) Get-BRAVOInstallationState @p } $Parameters)
+        $check = (& $updateModule { param($s) Test-BRAVOUpdateInstallationState -InputObject $s } $built)
+        $discoveryValidations.Add([pscustomobject]@{ State = [string]$built.state; IsValid = [bool]$check.IsValid; Problems = (@($check.Problems) -join '; ') })
+        return $built
     }
 
     function Get-DiscoveryParameters {
@@ -97,14 +103,14 @@
             $snapshotBefore = Get-DiscoverySnapshot -Path $discoveryBase
 
             $s0 = Invoke-DiscoveryState -Parameters ($p + @{ CandidateRoots = @($emptyRoot) })
-            Test-BRAVOCondition -Condition ($s0.state -eq 'NotInstalled' -and $null -eq $s0.runtimeRoot -and @($s0.candidateRoots).Count -eq 0) -Name 'UpdateDiscovery/NotInstalled' -Failure "state=$($s0.state)"
+            Test-BRAVOCondition -Condition ($s0.state -eq 'NotInstalled' -and [string]::IsNullOrEmpty($s0.runtimeRoot) -and @($s0.candidateRoots).Count -eq 0) -Name 'UpdateDiscovery/NotInstalled' -Failure "state=$($s0.state)"
 
             $s1 = Invoke-DiscoveryState -Parameters ($p + @{ CandidateRoots = @($emptyRoot, $goodRoot) })
             Test-BRAVOCondition -Condition ($s1.state -eq 'Installed' -and $s1.runtimeRoot -eq $goodRoot -and @($s1.candidateRoots).Count -eq 1) -Name 'UpdateDiscovery/SingleCandidateInstalled' -Failure "state=$($s1.state) root=$($s1.runtimeRoot)"
             Test-BRAVOCondition -Condition ($s1.schemaVersion -eq 1 -and $s1.version.packageVersion -eq '5.3.0' -and $s1.version.releaseChannel -eq 'stable' -and $s1.version.buildId -eq 'abc1234') -Name 'UpdateDiscovery/VersionParsedAsData' -Failure ($s1.version | Out-String)
             Test-BRAVOCondition -Condition ($s1.integrity.status -eq 'Valid' -and $s1.integrity.checkedCount -eq 1 -and $s1.integrity.mismatchedCount -eq 0) -Name 'UpdateDiscovery/IntegrityValid' -Failure ($s1.integrity | Out-String)
             Test-BRAVOCondition -Condition ($s1.credentials.status -eq 'Unknown' -and $s1.scheduler.status -eq 'Unknown' -and $s1.lifecycleLock.held -eq $false) -Name 'UpdateDiscovery/DefaultsUnknownScheduler' -Failure ($s1 | Out-String)
-            Test-BRAVOCondition -Condition ($s1.configuration.migrationBlocker.blocked -eq $null -and @($s1.configuration.migrationBlocker.reasons) -contains 'not evaluated') -Name 'UpdateDiscovery/MigrationBlockerNotEvaluated' -Failure ($s1.configuration | Out-String)
+            Test-BRAVOCondition -Condition ($s1.configuration.migrationBlocker.blocked -eq $false -and @($s1.configuration.migrationBlocker.reasons).Count -eq 0) -Name 'UpdateDiscovery/MigrationBlockerEvaluatedClean' -Failure ($s1.configuration | Out-String)
             # a-other створено до знімка
             # explicit RuntimeRoot перемагає, навіть коли кандидатів кілька.
             $other = Join-Path $discoveryBase 'a-other'
@@ -115,7 +121,7 @@
 
             # N кандидатів без явного root -> Ambiguous (не вгадуємо).
             $sAmbiguous = Invoke-DiscoveryState -Parameters ($p + @{ CandidateRoots = @($goodRoot, $other) })
-            Test-BRAVOCondition -Condition ($sAmbiguous.state -eq 'Ambiguous' -and $null -eq $sAmbiguous.runtimeRoot -and @($sAmbiguous.candidateRoots).Count -eq 2) -Name 'UpdateDiscovery/TwoRootsAmbiguous' -Failure "state=$($sAmbiguous.state)"
+            Test-BRAVOCondition -Condition ($sAmbiguous.state -eq 'Ambiguous' -and [string]::IsNullOrEmpty($sAmbiguous.runtimeRoot) -and @($sAmbiguous.candidateRoots).Count -eq 2) -Name 'UpdateDiscovery/TwoRootsAmbiguous' -Failure "state=$($sAmbiguous.state)"
             # той самий шлях двічі (інший регістр/слеш) — не два кандидати.
             $sDupe = Invoke-DiscoveryState -Parameters ($p + @{ CandidateRoots = @($goodRoot, ($goodRoot.ToUpperInvariant() + '\')) })
             Test-BRAVOCondition -Condition ($sDupe.state -eq 'Installed' -and @($sDupe.candidateRoots).Count -eq 1) -Name 'UpdateDiscovery/DuplicateCandidatesDeduplicated' -Failure "state=$($sDupe.state) count=$(@($sDupe.candidateRoots).Count)"
@@ -242,17 +248,25 @@
             $sCorruptJournal = Invoke-DiscoveryState -Parameters ($p2 + @{ RuntimeRoot = $goodRoot })
             Test-BRAVOCondition -Condition ($sCorruptJournal.state -eq 'RollbackRequired' -and $sCorruptJournal.interruptedOperation.operationId -eq $corruptId) -Name 'UpdateDiscovery/CorruptJournalFailClosed' -Failure "state=$($sCorruptJournal.state)"
 
-            # Інтеграція з W1-функцією (stub у scope модуля): її результат використовується.
-            & $updateModule {
-                function script:Get-BRAVOUpdateOpenJournal { param([string]$StateRoot) return [pscustomobject]@{ operationId = 'stub-op'; action = 'Repair'; lastCompletedPhase = 'Stage'; mutationStarted = $false } }
-            }
-            try {
-                $p3 = Get-DiscoveryParameters -Name 'e3'
-                $sStub = Invoke-DiscoveryState -Parameters ($p3 + @{ RuntimeRoot = $goodRoot })
-                Test-BRAVOCondition -Condition ($sStub.state -eq 'InterruptedUpdate' -and $sStub.interruptedOperation.operationId -eq 'stub-op' -and $sStub.interruptedOperation.action -eq 'Repair') -Name 'UpdateDiscovery/UsesOpenJournalFunction' -Failure "state=$($sStub.state)"
-            } finally {
-                & $updateModule { Remove-Item -LiteralPath 'Function:\Get-BRAVOUpdateOpenJournal' -ErrorAction SilentlyContinue }
-            }
+            # Реальний Get-BRAVOUpdateOpenJournal: чистий Open + пошкоджений журнал разом
+            # -> береться найнебезпечніший (пошкоджений = mutationStarted, fail closed).
+            $p3 = Get-DiscoveryParameters -Name 'e3'
+            $cleanOpenId = [guid]::NewGuid().ToString()
+            $brokenId = [guid]::NewGuid().ToString()
+            Write-DiscoveryJournal -StateRoot $p3.StateRoot -OperationId $cleanOpenId -State 'Open' -MutationStarted $false
+            Write-DiscoveryJournal -StateRoot $p3.StateRoot -OperationId $brokenId -RawText '{ broken'
+            $sMixed = Invoke-DiscoveryState -Parameters ($p3 + @{ RuntimeRoot = $goodRoot })
+            Test-BRAVOCondition -Condition ($sMixed.state -eq 'RollbackRequired' -and $sMixed.interruptedOperation.operationId -eq $brokenId -and $sMixed.interruptedOperation.mutationStarted -eq $true) -Name 'UpdateDiscovery/CorruptBeatsCleanOpenJournal' -Failure "state=$($sMixed.state) op=$($sMixed.interruptedOperation.operationId)"
+            $openFinding = @($sMixed.findings | Where-Object { $_.id -eq 'Discovery.Journal' -and $_.severity -eq 'Blocker' })
+            Test-BRAVOCondition -Condition ($openFinding.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace($openFinding[0].action)) -Name 'UpdateDiscovery/JournalBlockerHasAction' -Failure ($sMixed.findings | Out-String)
+
+            # Легасі BRAVO.config -> міграційний бар'єр (Test-BRAVOConfigMigrationBlocker) -> Degraded.
+            $p4 = Get-DiscoveryParameters -Name 'e4'
+            $legacyRoot = Join-Path $discoveryBase 'e4-root'
+            New-DiscoveryRoot -Path $legacyRoot
+            [IO.File]::WriteAllText((Join-Path $legacyRoot 'BRAVO.config'), '# legacy', (New-Object Text.UTF8Encoding $false))
+            $sLegacy = Invoke-DiscoveryState -Parameters ($p4 + @{ RuntimeRoot = $legacyRoot })
+            Test-BRAVOCondition -Condition ($sLegacy.configuration.migrationBlocker.blocked -eq $true -and $sLegacy.state -eq 'Degraded' -and @($sLegacy.findings | Where-Object { $_.id -eq 'Discovery.MigrationBlocker' }).Count -eq 1) -Name 'UpdateDiscovery/LegacyConfigMigrationBlocker' -Failure "state=$($sLegacy.state)"
         }
 
         # ===== scheduler / credentials через adapter =====
@@ -336,16 +350,10 @@
             $sCfg = Invoke-DiscoveryState -Parameters ($p + @{ RuntimeRoot = $goodRoot })
             Test-BRAVOCondition -Condition ($sCfg.configuration.localConfigPresent -eq $true -and $sCfg.configuration.legacyConfigPresent -eq $true -and $sCfg.configuration.localConfigSchemaValid -eq 'Unknown' -and -not (Test-Path -LiteralPath $sentinel)) -Name 'UpdateDiscovery/ConfigPresenceOnlyNeverExecuted' -Failure ($sCfg.configuration | Out-String)
 
-            # Migration blocker (stub W5 у scope модуля) -> Degraded.
-            & $updateModule {
-                function script:Test-BRAVOConfigMigrationBlocker { param([string]$RuntimeRoot) return [pscustomobject]@{ Blocked = $true; Reasons = @('legacy BRAVO.config'); Findings = @() } }
-            }
-            try {
-                $sBlock = Invoke-DiscoveryState -Parameters ($p + @{ RuntimeRoot = $goodRoot })
-                Test-BRAVOCondition -Condition ($sBlock.state -eq 'Degraded' -and $sBlock.configuration.migrationBlocker.blocked -eq $true -and @($sBlock.configuration.migrationBlocker.reasons) -contains 'legacy BRAVO.config') -Name 'UpdateDiscovery/MigrationBlockerDegraded' -Failure "state=$($sBlock.state)"
-            } finally {
-                & $updateModule { Remove-Item -LiteralPath 'Function:\Test-BRAVOConfigMigrationBlocker' -ErrorAction SilentlyContinue }
-            }
+            # Migration blocker: реальний Test-BRAVOConfigMigrationBlocker (Preflight);
+            # legacy BRAVO.config без доказу міграції -> blocked -> Degraded.
+            $sBlock = Invoke-DiscoveryState -Parameters ($p + @{ RuntimeRoot = $goodRoot })
+            Test-BRAVOCondition -Condition ($sBlock.state -eq 'Degraded' -and $sBlock.configuration.migrationBlocker.blocked -eq $true -and @($sBlock.configuration.migrationBlocker.reasons).Count -ge 1) -Name 'UpdateDiscovery/MigrationBlockerDegraded' -Failure "state=$($sBlock.state)"
         }
 
         # ===== Unsupported OS =====
@@ -395,6 +403,8 @@
             $sNoLock = Invoke-DiscoveryState -Parameters ($p2 + @{ RuntimeRoot = $goodRoot })
             Test-BRAVOCondition -Condition ($sNoLock.lifecycleLock.held -eq $false -and -not [IO.Directory]::Exists($p2.LockRoot) -and -not [IO.Directory]::Exists($p2.StateRoot)) -Name 'UpdateDiscovery/MissingStateAndLockRootsNotCreated' -Failure 'discovery створив каталоги стану/lock'
         }
+        $invalidStates = @($discoveryValidations.ToArray() | Where-Object { -not $_.IsValid })
+        Test-BRAVOCondition -Condition ($discoveryValidations.Count -gt 20 -and $invalidStates.Count -eq 0) -Name 'UpdateDiscovery/AllStatesPassContractValidator' -Failure (($invalidStates | ForEach-Object { $_.State + ': ' + $_.Problems }) -join ' | ')
     } finally {
         if ($discoveryBase.StartsWith($discoveryTempPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $discoveryBase)) {
             Remove-Item -LiteralPath $discoveryBase -Recurse -Force -ErrorAction SilentlyContinue

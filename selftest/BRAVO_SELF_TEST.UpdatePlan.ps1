@@ -115,7 +115,7 @@ try {
         $owned = Invoke-BRAVOPlanTestCall -Name 'Get-BRAVOUpdateSiteOwnedPaths'
         Test-BRAVOCondition -Condition (@($owned.Files).Count -eq 5 -and @($owned.Files) -contains 'BRAVO.local.config' -and @($owned.Files) -contains 'BRAVO_OPERATION.lock' -and @($owned.Files) -contains 'WinSCP.ini' -and @($owned.Files) -contains 'TOOLS_INTEGRITY.json' -and @($owned.Files) -contains 'BRAVO.config') `
             -Name 'UpdatePlan/SiteOwnedFiles' -Failure 'набір site-owned файлів мусить збігатися з robocopy /XF розгортання'
-        Test-BRAVOCondition -Condition (@($owned.Dirs).Count -eq 7 -and @($owned.Dirs) -contains 'artifacts' -and @($owned.Dirs) -contains 'LOGS' -and @($owned.Dirs) -contains 'BAZA_WWW') `
+        Test-BRAVOCondition -Condition (@($owned.Dirs).Count -eq 10 -and @($owned.Dirs) -contains 'artifacts' -and @($owned.Dirs) -contains 'LOGS' -and @($owned.Dirs) -contains 'BAZA_WWW' -and @($owned.Dirs) -contains 'local-backups' -and @($owned.Dirs) -contains '.git' -and @($owned.Dirs) -contains '.vscode') `
             -Name 'UpdatePlan/SiteOwnedDirs' -Failure 'набір site-owned каталогів мусить збігатися з robocopy /XD розгортання'
         $owned.Files[0] = 'змінено'
         $again = Invoke-BRAVOPlanTestCall -Name 'Get-BRAVOUpdateSiteOwnedPaths'
@@ -402,15 +402,21 @@ try {
         # Відкритий журнал змінює fingerprint
         $journalDir = Join-Path $stateRoot 'Journal'
         New-Item -ItemType Directory -Path $journalDir -Force | Out-Null
-        [IO.File]::WriteAllText((Join-Path $journalDir 'closed.json'), '{"operationId":"closed","state":"Committed"}', (New-Object Text.UTF8Encoding $false))
+        # Журнали створюються канонічними конструкторами Journal (валідна форма контракту).
+        $closedJournal = Invoke-BRAVOPlanTestCall -Name 'New-BRAVOUpdateJournal' -Params @{ StateRoot = $stateRoot; Action = 'Update'; RuntimeRoot = $runtime }
+        [void](Invoke-BRAVOPlanTestCall -Name 'Set-BRAVOUpdateJournalState' -Params @{ Journal = $closedJournal; State = 'Committed'; StateRoot = $stateRoot })
         $closedOnly = Invoke-BRAVOPlanTestCall -Name 'Test-BRAVODeploymentPlanCurrent' -Params @{ Plan = $plan; RuntimeRoot = $runtime; StateRoot = $stateRoot; Adapter = $adapter; Now = $fixedNow }
         Test-BRAVOCondition -Condition ($closedOnly.IsCurrent -eq $true) `
             -Name 'UpdatePlan/ClosedJournalDoesNotInvalidate' -Failure 'закритий журнал не впливає на fingerprint'
-        [IO.File]::WriteAllText((Join-Path $journalDir 'open-1.json'), '{"operationId":"open-1","state":"Open"}', (New-Object Text.UTF8Encoding $false))
+        $openJournal = Invoke-BRAVOPlanTestCall -Name 'New-BRAVOUpdateJournal' -Params @{ StateRoot = $stateRoot; Action = 'Update'; RuntimeRoot = $runtime }
+        $openJournalFile = Join-Path $journalDir ($openJournal.operationId + '.json')
         $withOpen = Invoke-BRAVOPlanTestCall -Name 'Test-BRAVODeploymentPlanCurrent' -Params @{ Plan = $plan; RuntimeRoot = $runtime; StateRoot = $stateRoot; Adapter = $adapter; Now = $fixedNow }
         Test-BRAVOCondition -Condition ($withOpen.FingerprintMatches -eq $false) `
             -Name 'UpdatePlan/OpenJournalInvalidatesPlan' -Failure 'відкритий журнал має інвалідувати план'
-        Remove-Item -LiteralPath (Join-Path $journalDir 'open-1.json') -Force
+        $preOpen = Invoke-BRAVOPlanTestCall -Name 'Get-BRAVODeploymentPreconditions' -Params @{ RuntimeRoot = $runtime; StateRoot = $stateRoot; Adapter = $adapter }
+        Test-BRAVOCondition -Condition (@($preOpen.openJournalIds) -contains $openJournal.operationId -and @($preOpen.openJournalIds).Count -eq 1) `
+            -Name 'UpdatePlan/OpenJournalIdFromCanonicalReader' -Failure 'відкритий журнал має входити в openJournalIds рівно один раз (закритий — ні)'
+        Remove-Item -LiteralPath $openJournalFile -Force
         [IO.File]::WriteAllText((Join-Path $journalDir 'bad.json'), '{ пошкоджено', (New-Object Text.UTF8Encoding $false))
         $pre = Invoke-BRAVOPlanTestCall -Name 'Get-BRAVODeploymentPreconditions' -Params @{ RuntimeRoot = $runtime; StateRoot = $stateRoot; Adapter = $adapter }
         Test-BRAVOCondition -Condition (@($pre.openJournalIds) -contains 'corrupt:bad') `
