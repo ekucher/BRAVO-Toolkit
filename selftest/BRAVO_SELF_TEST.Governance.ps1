@@ -6804,9 +6804,16 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope') { try {
         $closureProbe = & {
             param([int]$GlobalLimit)
             $MaximumVariableCount = $GlobalLimit * 4
+            # Змінні створюються звичайними присвоєннями (dot-source згенерованого
+            # блоку в ЦІЙ області), а не Set-Variable -Name у циклі: Set-Variable
+            # трактує -Name як шаблон і щоразу скануює всі змінні області —
+            # квадратична вартість (~19 с на 8448 змінних проти ~0.3 с). Кількість,
+            # імена й значення змінних, область і ефект на closure ті самі.
+            $closurePadBuilder = New-Object System.Text.StringBuilder
             for ($padIndex = 0; $padIndex -lt ($GlobalLimit + 256); $padIndex++) {
-                Set-Variable -Name ("closurePad$padIndex") -Value $padIndex
+                [void]$closurePadBuilder.Append('$closurePad').Append($padIndex).Append('=').Append($padIndex).Append(';')
             }
+            . ([scriptblock]::Create($closurePadBuilder.ToString()))
             $closureDependency = New-Object System.Collections.Generic.List[string]
             $directCallback = { param($Message) if ($null -ne $closureDependency) { [void]$closureDependency.Add($Message) } }.GetNewClosure()
             $narrowCallback = & { param($closureDependency) { param($Message) if ($null -ne $closureDependency) { [void]$closureDependency.Add($Message) } }.GetNewClosure() } $closureDependency
