@@ -38,30 +38,25 @@ production acceptance і не дає дозволу на deployment, merge, rele
 | INS-050…052 | Транзакційний відкат, знімок і відновлення version-state (D13), відкат clean install | `.Rollback.ps1` | `UpdateRollback` |
 | INS-053, INS-054 | Виявлення перерваної операції, recovery до known-good | `.Recovery.ps1` | `UpdateRecovery` |
 | INS-070…074 | Same-version repair (обгортка над ядром deploy) | `.Repair.ps1` | `UpdateRecovery` |
-| INS-080…083, INS-100 | WinForms-каркас GUI, read-only прототип (лише `State`/`Preflight`; mutation-кнопки вимкнені) | `BRAVO_INSTALLER.ps1`, `modules/BRAVO.Installer.UI` | `InstallerUI` |
+| INS-042, INS-044 | Mutation boundary, фазовий двигун, orchestrator `Invoke-BRAVODeployment` (U0–U19), cancel через `control\cancel`, replay-захист `ConsumedPlans` | `.Deploy.ps1` | `UpdateDeploy` |
+| INS-055 | Наскрізний sandbox-suite: install, upgrade, downgrade, prerelease, tamper, кожна fault-точка, crash → recovery (зокрема через CLI Recover), rollback failure, repair, worker, сканування секретів | — | `UpdateEndToEnd` |
+| INS-060…065 | Clean install `Install-BRAVOToolkit`: політика кореня, захищений ACL, seed `BRAVO.local.config`, scheduler лише за наявних credentials, задачі неактивні | `.Install.ps1` | `UpdateInstall` |
+| — | Захищені корені стану engine (власник/ACL/reparse), дія `Initialize` (D14) | `.Paths.ps1`, `.Worker.ps1` | `UpdateStaging`, `UpdateWorker`, `UpdatePreflight` |
+| INS-080…092, INS-100…104 | GUI на WinForms: головна, перевірка, майстер 3–10, виконання через UAC, прогрес і результат (5 статусів), Maintenance Center (журнали, діагностика, Configurator, Repair) | `BRAVO_INSTALLER.ps1`, `modules/BRAVO.Installer.UI` | `InstallerUI` |
 
 Інструкція оператора — [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md).
 
-### Ще не в цьому знімку гілки
+### Перевірки та відкриті пункти
 
-Частини, від яких залежать Update/Install/Repair end-to-end; на момент
-цього оновлення документації вони в окремих гілках на інтеграції:
+Повний `BRAVO_SELF_TEST.ps1 -NoPause` на голові `f1a5d839`: 5542 PASS / 1 FAIL —
+`Archive/SftpConnectionTimeoutLogsError` через сторонній активний `WinSCP.com` на
+хості (Archive гілкою не змінювався; окремий прогін `-Suite Archive` на тій самій
+голові — 1748 PASS / 0 FAIL). Повна таблиця по INS — `IMPLEMENTATION_PLAN.md`,
+розділ 1.1.
 
-- INS-044, INS-042 — ядро розгортання `Invoke-BRAVODeployment` (крок U3
-  `ConsumedPlans`, cancel через `control\cancel`, mutation boundary);
-  `BRAVO.Update.Deploy.ps1` поки порожній, suite `UpdateDeploy` не
-  зареєстровано. Без нього `-Action Update` завершується
-  `Failed/Error` (`Worker.DispatchFailed`), а Repair — blocker-ом
-  `Repair.CoreUnavailable`;
-- INS-060…065 — clean install `Install-BRAVOToolkit`;
-  `BRAVO.Update.Install.ps1` поки порожній, suite `UpdateInstall` не
-  зареєстровано;
-- INS-055 — наскрізний failure injection по фазах deploy (fault points є
-  лише у відкаті й recovery);
-- INS-084…092, INS-101…104 — екрани майстра, виконання через UAC, екрани
-  результату й Maintenance Center у GUI (у прототипі є лише read-only
-  каркас екранів «Діагностика», «Налаштування», «Журнали»).
-
+Потребують реального хоста або VM: COM Task Scheduler (увімкнення/вимкнення
+задач), ACL під SYSTEM і UAC-токеном, справжній UAC-потік GUI, `File.Replace`
+для version-state, DPI/RDP і доступність GUI.
 Рішення, закладені за замовчуванням і ще не затверджені власником, — у
 [DECISIONS.md](DECISIONS.md) (зокрема відкриті R1–R7).
 

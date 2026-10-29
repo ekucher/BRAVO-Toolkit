@@ -42,9 +42,9 @@ Issues доцільно створювати хвилями після стаб�
 | 4 | 046 Scheduler reconciliation | ◐ | Через canonical `BRAVO_SETUP`; повторне вимкнення після реєстрації (F1); COM-шлях не перевірено на VM |
 | 4 | 047 Post-deployment validation | ✓ | suite `UpdateValidation` |
 | 5 | 050–052 Rollback / validation / Critical | ✓ | Quiesce перед відкатом, reparse-перевірки, довіра до журналу, version-state транзакція; suite `UpdateRollback` |
-| 5 | 053–054 Interrupted detection / crash recovery | ◐ | suite `UpdateRecovery`, `UpdateEndToEnd`; production-шлях CLI Recover ще не передає корені (Codex P1, у роботі) |
-| 5 | 055 Failure injection suite | ✓ | `UpdateEndToEnd`: кожна fault-точка, crash, cancel, rollback failure (suite ще не зареєстрований) |
-| 5 | Gate: security + architecture + behavioral review | ◐ | Codex ×3; internal security pre-review = reject → P1 журналу виправлено; захищені корені стану (P1) і 3×P2 у роботі; повторний security review не виконано |
+| 5 | 053–054 Interrupted detection / crash recovery | ✓ | suite `UpdateRecovery`, `UpdateEndToEnd` (зокрема crash → CLI Recover → RolledBack; CLI сам знаходить встановлення й передає корені engine) |
+| 5 | 055 Failure injection suite | ✓ | `UpdateEndToEnd` (195 перевірок): кожна fault-точка, crash, cancel, rollback failure, сканування секретів |
+| 5 | Gate: security + architecture + behavioral review | ◐ | Codex: 6 раундів, усі P1 виправлено, останнє підтвердження — «нових P0–P2 немає». Internal security pre-review: reject → після виправлень accept-with-fixes; N1–N3 і P3 #9 виправлено, повторно не переглядалось. Формальний codex-security gate не виконувався; прийняті залишкові ризики — D14 |
 | 6 | 060–065 Clean install | ◐ | `Install-BRAVOToolkit`, root policy, seed config, scheduler deferred без credentials; suite `UpdateInstall`. Seed/COM/UAC реально не перевірено |
 | 7 | 070–074 Repair | ✓ | `Repair-BRAVOInstallation -Scope`, без implicit upgrade; suite `UpdateRecovery`, `UpdateEndToEnd` |
 | 8 | 080–092 Installer GUI | ◐ | WinForms (D3 — відхилення від WPF, чекає затвердження); suite `InstallerUI` (view-model і побудова форми). DPI/RDP/keyboard/usability не перевірено |
@@ -52,8 +52,8 @@ Issues доцільно створювати хвилями після стаб�
 | 10 | 110–120 Scheduled update | — | Виключено з v1 (D1) |
 | 11 | 130–137 VM acceptance | ✗ | Є лише sandbox-аналоги в `UpdateEndToEnd`; VM не виконувалась |
 | 11 | 138–140 Scheduled modes | — | Виключено з v1 |
-| 11 | 141 Full BRAVO self-test | ◐ | Прогін на 9e468db1: 5292 PASS / 6 FAIL (частину спричинило злиття під час прогону); виправлення в роботі, повторний прогін не виконано |
-| 11 | 142 Fresh independent review | ◐ | Codex-рев'ю кожної хвилі виконано; фінальне після hardening — ні |
+| 11 | 141 Full BRAVO self-test | ◐ | Повний `BRAVO_SELF_TEST.ps1 -NoPause` на f1a5d839: 5542 PASS / 1 FAIL — `Archive/SftpConnectionTimeoutLogsError` через сторонній активний `WinSCP.com` на хості (Archive гілкою не змінювався; окремий прогін `-Suite Archive` на тій самій голові: 1748 PASS / 0 FAIL). Чистого повного прогону без збою середовища ще немає; CI не запускався |
+| 11 | 142 Fresh independent review | ◐ | Codex-рев'ю кожної хвилі й фінальної дельти виконано; незалежне рев'ю людиною — ні |
 | 12 | 150–155 Real-host pilot | ✗ | Рішення й доступ власника |
 
 Рішення D1–D13 та R1–R7 (`DECISIONS.md`) мають статус «Запропоновано — чекає затвердження
