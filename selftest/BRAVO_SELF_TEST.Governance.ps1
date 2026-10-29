@@ -4666,6 +4666,164 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/Deploy') { try {
         -Failure "матриця §9.4 мусить окремо класифікувати недоступність self-test на жорстко налаштованому хості — інакше провал приймання й обмеження хоста виглядають однаково"
 }
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/Deploy' } }
+
+if (Enter-BRAVOSelfTestSection -Name 'Governance/Deploy52FleetUpgrade') { try {
+
+# deploy\Update-BRAVO52.ps1 + UPDATE-BRAVO52.cmd — оновлення парку 5.2.x до
+# stable 5.2.5+ однією дією оператора. Розгортання цілком делеговано
+# Update-BRAVOServer.ps1 (гейти й відкат перевіряє секція Governance/Deploy);
+# тут — те, що обгортка додає: рішення про оновлення, захист від пакета
+# всередині комплекту, прибирання мітигації #335 і -CheckOnly без змін.
+# Функції обгортки завантажуються dot-source у власній області (& { ... }):
+# основний блок скрипта при цьому не виконується.
+
+& {
+    $deploy52Path = Join-Path $root 'deploy\Update-BRAVO52.ps1'
+    $deploy52LauncherPath = Join-Path $root 'deploy\UPDATE-BRAVO52.cmd'
+    $deploy52Text = [IO.File]::ReadAllText($deploy52Path, [Text.Encoding]::UTF8)
+
+    Test-BRAVOCondition `
+        -Condition (
+            $deploy52Text.Contains("Join-Path `$PSScriptRoot 'Update-BRAVOServer.ps1'") -and
+            $deploy52Text.Contains('& $script:UpdaterPath -RuntimeRoot $RuntimeRoot -Tag $Tag -NoElevation -NoPause @zipArguments')
+        ) `
+        -Name "Deploy52/DelegatesDeploymentToUpdateServer" `
+        -Failure "deploy\Update-BRAVO52.ps1 мусить розгортати лише через Update-BRAVOServer.ps1 поруч (-NoElevation -NoPause), а не власною копією backup/копіювання/відкату"
+
+    . $deploy52Path
+
+    $deploy52Cases = @(
+        @('5.2.4', '5.2.6', 'Update'), @('5.2.5', '5.2.6', 'Update'), @('5.2.6-rc.1', '5.2.6', 'Update'),
+        @('5.2.6', '5.2.6', 'UpToDate'), @('5.2.3', '5.2.6', 'Stop'), @('5.2.7', '5.2.6', 'Stop'),
+        @('5.3.0-dev.1', '5.2.6', 'Stop'), @('4.2.1', '5.2.6', 'Stop'), @('5.2.4', '5.2.6-rc.1', 'Stop'),
+        @('5.2.4', '5.2.4', 'Stop'), @("5.2.4`n", '5.2.6', 'Stop')
+    )
+    $deploy52Mismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($deploy52Case in $deploy52Cases) {
+        $deploy52Decision = Get-BRAVO52UpgradeDecision -CurrentVersion $deploy52Case[0] -TargetVersion $deploy52Case[1]
+        if ($deploy52Decision.Action -ne $deploy52Case[2]) {
+            [void]$deploy52Mismatches.Add(('{0} -> {1}: {2}, очікувалось {3}' -f ($deploy52Case[0] -replace "`n", '\n'), $deploy52Case[1], $deploy52Decision.Action, $deploy52Case[2]))
+        }
+    }
+    if ((Get-BRAVO52UpgradeDecision -CurrentVersion '5.2.3' -TargetVersion '5.2.6' -AllowUntestedSource).Action -ne 'Update') {
+        [void]$deploy52Mismatches.Add('5.2.3 -> 5.2.6 з -AllowUntestedSource: очікувалось Update')
+    }
+    Test-BRAVOCondition `
+        -Condition ($deploy52Mismatches.Count -eq 0) `
+        -Name "Deploy52/UpgradeDecisionOnlyForwardWithinLine52" `
+        -Failure ("рішення про оновлення: лише 5.2.4+ (5.2.0–5.2.3 — з -AllowUntestedSource) вгору до stable 5.2.5+; розбіжності: " + [string]::Join('; ', $deploy52Mismatches.ToArray()))
+
+    Test-BRAVOCondition `
+        -Condition (
+            (Test-BRAVO52PathInside -Path 'C:\Program Files\BRAVO-Toolkit\pack' -Root 'C:\Program Files\BRAVO-Toolkit') -and
+            -not (Test-BRAVO52PathInside -Path 'C:\Program Files\BRAVO-Toolkit.old_5.2.4_20261029' -Root 'C:\Program Files\BRAVO-Toolkit') -and
+            $deploy52Text.IndexOf('Test-BRAVO52PathInside -Path $PSScriptRoot -Root $RuntimeRoot') -gt 0 -and
+            $deploy52Text.IndexOf('Test-BRAVO52PathInside -Path $PSScriptRoot -Root $RuntimeRoot') -lt $deploy52Text.IndexOf('& $script:UpdaterPath')
+        ) `
+        -Name "Deploy52/RejectsPackInsideRuntimeBeforeUpdate" `
+        -Failure "пакет оновлення всередині комплекту має зупиняти обгортку ДО Update-BRAVOServer.ps1 (його скрипти були б сторонніми для guard, код 33); сусідній каталог <runtime>.old_* не є вкладеним"
+
+    $deploy52Tmp = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_DEPLOY52_' + [guid]::NewGuid().ToString('N'))
+    $deploy52Problems = New-Object System.Collections.Generic.List[string]
+    try {
+        [void][IO.Directory]::CreateDirectory($deploy52Tmp)
+        $deploy52Config = Join-Path $deploy52Tmp 'BRAVO.local.config'
+        $deploy52Bom = New-Object Text.UTF8Encoding($true)
+
+        [IO.File]::WriteAllText($deploy52Config, "@{`r`n    'pathSettings.BackupRoot' = 'E:\ARCHIV'`r`n    'enableFailedArchiveDeletion' = `$false   # #335`r`n    'archiveRetentionDays' = 30`r`n}`r`n", $deploy52Bom)
+        $deploy52Found = Get-BRAVO52Mitigation335 -LocalConfigPath $deploy52Config
+        if ($deploy52Found.Status -ne 'Removable' -or $deploy52Found.StartLine -ne 3) {
+            [void]$deploy52Problems.Add('власний рядок: ' + $deploy52Found.Status + ' / рядок ' + $deploy52Found.StartLine)
+        } else {
+            Remove-BRAVO52LinesPreservingEncoding -Path $deploy52Config -StartLine $deploy52Found.StartLine -EndLine $deploy52Found.EndLine
+            $deploy52Bytes = [IO.File]::ReadAllBytes($deploy52Config)
+            if (-not ($deploy52Bytes[0] -eq 0xEF -and $deploy52Bytes[1] -eq 0xBB -and $deploy52Bytes[2] -eq 0xBF)) { [void]$deploy52Problems.Add('BOM втрачено') }
+            if ([IO.File]::ReadAllText($deploy52Config) -ne "@{`r`n    'pathSettings.BackupRoot' = 'E:\ARCHIV'`r`n    'archiveRetentionDays' = 30`r`n}`r`n") { [void]$deploy52Problems.Add('після видалення змінено інші рядки або CRLF') }
+        }
+
+        $deploy52Expected = @(
+            @("@{ 'a' = 1; 'enableFailedArchiveDeletion' = `$false }`r`n", 'Manual', 'в одному рядку з іншим ключем'),
+            @("@{`r`n    'enableFailedArchiveDeletion' = `$true`r`n}`r`n", 'Absent', 'значення $true'),
+            @("@{`r`n    'enableFailedArchiveDeletion' = `$false`r`n    'enableFailedArchiveDeletion' = `$false`r`n}`r`n", 'Manual', 'повторний ключ'),
+            @("@{`r`n    'enableFailedArchiveDeletion' = `$false`r`n", 'Manual', 'файл не розбирається')
+        )
+        foreach ($deploy52Item in $deploy52Expected) {
+            [IO.File]::WriteAllText($deploy52Config, $deploy52Item[0], $deploy52Bom)
+            $deploy52Status = (Get-BRAVO52Mitigation335 -LocalConfigPath $deploy52Config).Status
+            if ($deploy52Status -ne $deploy52Item[1]) { [void]$deploy52Problems.Add($deploy52Item[2] + ': ' + $deploy52Status + ', очікувалось ' + $deploy52Item[1]) }
+        }
+
+        # Файл, який не можна записати назад байт-у-байт, не правиться.
+        $deploy52Pair = "    'enableFailedArchiveDeletion' = `$false"
+        $deploy52Unwritable = @(
+            # Дужки обов'язкові: кома зв'язує сильніше за +.
+            @(([byte[]]([Text.Encoding]::Unicode.GetPreamble() + [Text.Encoding]::Unicode.GetBytes("@{`r`n$deploy52Pair`r`n}`r`n"))), 'UTF-16'),
+            @(([Text.Encoding]::GetEncoding(1251).GetBytes("@{`r`n    # мітигація`r`n$deploy52Pair`r`n}`r`n")), 'ANSI'),
+            @(([Text.Encoding]::UTF8.GetBytes("@{`r$deploy52Pair`r}`r")), 'CR-only'),
+            @(([Text.Encoding]::UTF8.GetBytes("@{`r`n$deploy52Pair`n}`r`n")), 'змішані CRLF/LF')
+        )
+        foreach ($deploy52Item in $deploy52Unwritable) {
+            [IO.File]::WriteAllBytes($deploy52Config, [byte[]]$deploy52Item[0])
+            $deploy52Before = [IO.File]::ReadAllBytes($deploy52Config)
+            $deploy52Status = (Get-BRAVO52Mitigation335 -LocalConfigPath $deploy52Config).Status
+            if ($deploy52Status -ne 'Manual') { [void]$deploy52Problems.Add($deploy52Item[1] + ': ' + $deploy52Status + ', очікувалось Manual') }
+            if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($deploy52Config)) -ne [Convert]::ToBase64String($deploy52Before)) { [void]$deploy52Problems.Add($deploy52Item[1] + ': файл змінено перевіркою') }
+        }
+    } finally {
+        Remove-Item -LiteralPath $deploy52Tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Test-BRAVOCondition `
+        -Condition ($deploy52Problems.Count -eq 0) `
+        -Name "Deploy52/Mitigation335RemovedOnlyWhenUnambiguous" `
+        -Failure ("мітигація #335 прибирається лише як власні рядки пари 'enableFailedArchiveDeletion' = `$false (BOM, CRLF і решта ключів без змін), інакше — ручна дія: " + [string]::Join('; ', $deploy52Problems.ToArray()))
+
+    $deploy52CheckOnlyIndex = $deploy52Text.IndexOf('if ($CheckOnly) {' + "`r`n" + '        # Вже актуальна версія з -CheckOnly')
+    $deploy52RemoveIndex = $deploy52Text.IndexOf('Remove-BRAVO52LinesPreservingEncoding -Path $localConfigPath')
+    $deploy52UpdaterIndex = $deploy52Text.IndexOf('& $script:UpdaterPath')
+    $deploy52ElseIfCheckOnly = $deploy52Text.IndexOf('} elseif ($CheckOnly) {')
+    Test-BRAVOCondition `
+        -Condition (
+            $deploy52CheckOnlyIndex -gt 0 -and $deploy52CheckOnlyIndex -lt $deploy52RemoveIndex -and
+            $deploy52ElseIfCheckOnly -gt 0 -and $deploy52ElseIfCheckOnly -lt $deploy52UpdaterIndex -and
+            $deploy52Text.Contains('if (-not $CheckOnly -and -not $isElevated) {')
+        ) `
+        -Name "Deploy52/CheckOnlyChangesNothing" `
+        -Failure "-CheckOnly має виходити до Update-BRAVOServer.ps1 і до правки BRAVO.local.config (зокрема на вже оновленому сервері) і не вимагати прав адміністратора"
+
+    # Відновлення BRAVO.local.config з копії — і за кодом перевірки, і за
+    # винятком: правка й перевірка в одному try, відновлення — після нього.
+    $deploy52EditTry = $deploy52Text.IndexOf('Remove-BRAVO52LinesPreservingEncoding -Path $localConfigPath')
+    $deploy52EditCatch = $deploy52Text.IndexOf('$editFailure = $_.Exception.Message')
+    $deploy52Restore = $deploy52Text.IndexOf('Copy-Item -LiteralPath $copyPath -Destination $localConfigPath -Force')
+    $deploy52Quoted = @(
+        (ConvertTo-BRAVO52QuotedArgument 'C:\Program Files\BRAVO-Toolkit\'),
+        (ConvertTo-BRAVO52QuotedArgument 'C:\Program Files\BRAVO-Toolkit'),
+        (ConvertTo-BRAVO52QuotedArgument 'v5.2.6')
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $deploy52EditTry -gt 0 -and $deploy52EditCatch -gt $deploy52EditTry -and $deploy52Restore -gt $deploy52EditCatch -and
+            $deploy52Quoted[0] -eq '"C:\Program Files\BRAVO-Toolkit\\"' -and
+            $deploy52Quoted[1] -eq '"C:\Program Files\BRAVO-Toolkit"' -and
+            $deploy52Quoted[2] -eq '"v5.2.6"' -and
+            $deploy52Text.Contains("'-RuntimeRoot'); [void]`$argumentParts.Add((ConvertTo-BRAVO52QuotedArgument `$RuntimeRoot))")
+        ) `
+        -Name "Deploy52/ConfigRestoredOnAnyFailureAndRelaunchArgumentsQuoted" `
+        -Failure ("BRAVO.local.config має повертатися з копії і при винятку правки/перевірки, а не лише за кодом; аргументи UAC-перезапуску — з подвоєними кінцевими зворотними слешами; отримано: " + [string]::Join(' | ', $deploy52Quoted))
+
+    $deploy52LauncherBytes = [IO.File]::ReadAllBytes($deploy52LauncherPath)
+    $deploy52LauncherText = [Text.Encoding]::ASCII.GetString($deploy52LauncherBytes)
+    Test-BRAVOCondition `
+        -Condition (
+            @($deploy52LauncherBytes | Where-Object { $_ -gt 127 }).Count -eq 0 -and
+            $deploy52LauncherText.Contains('-ExecutionPolicy Bypass -File "%~dp0Update-BRAVO52.ps1" %*') -and
+            $deploy52LauncherText.Contains('exit /b %BRAVO_UPDATE_EXIT%')
+        ) `
+        -Name "Deploy52/LauncherAsciiProcessScopedBypassKeepsExitCode" `
+        -Failure "deploy\UPDATE-BRAVO52.cmd: лише ASCII (cmd.exe читає OEM-кодування), Bypass лише для процесу через -File поруч зі скриптом, код завершення передається далі"
+}
+
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/Deploy52FleetUpgrade' } }
 if (Enter-BRAVOSelfTestSection -Name 'Governance/ValidateOnlyNeverPersistsDiscoveryBaseline') { try {
 
 & {
