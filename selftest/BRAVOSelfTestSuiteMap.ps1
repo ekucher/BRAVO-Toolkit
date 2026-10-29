@@ -26,8 +26,8 @@ $script:BRAVOSelfTestSuiteCatalog = @(
     'DiskSpace', 'Governance', 'InstallerUI', 'LogRotation', 'LogSync', 'MaintenanceDiskSpace',
     'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
     'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence', 'ServiceRecovery',
-    'SftpCredentialsRequired', 'Status', 'TraceArchive', 'UpdateDiagnostics', 'UpdateDiscovery', 'UpdatePlan',
-    'UpdateRelease', 'UpdateStaging'
+    'SftpCredentialsRequired', 'Status', 'TraceArchive', 'UpdateContracts', 'UpdateDiagnostics', 'UpdateDiscovery', 'UpdatePlan',
+    'UpdatePreflight', 'UpdateRelease', 'UpdateStaging'
 )
 
 function ConvertTo-BRAVOSelfTestNormalizedChangedPath {
