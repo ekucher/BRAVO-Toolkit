@@ -180,10 +180,11 @@ function New-BRAVOUpdateDefaultAdapter {
           InvokeSetupValidate    param([string]$RuntimeRoot)   (BRAVO_SETUP.ps1 -ValidateOnly -SkipAccessTest -SkipTestNotification -NoPause)
           InvokeSelfTest         param([string]$RuntimeRoot)   (BRAVO_SELF_TEST.ps1 -NoPause)
                                  -> { ExitCode, Output, TimedOut }
-          GetManagedTasks        param([string]$TaskPath)
-                                 -> масив { Name, Path, Exists, State, Enabled } (порожній, якщо задач немає)
-          SetTaskEnabled         param([string]$TaskPath, [string]$Name, [bool]$Enabled)
-                                 -> { Success, Message }
+          GetManagedTasks        param([string]$TaskPath, [string]$RuntimeRoot)   (обидва необов'язкові)
+                                 -> масив { Name, Path, Exists, State, Enabled, actionPath } (порожній, якщо задач немає);
+                                 COM Schedule.Service, лише TaskPath і імена з ефективної конфігурації
+          SetTaskEnabled         param([string]$TaskPath, [string]$Name, [bool]$Enabled, [string]$RuntimeRoot)
+                                 -> { Success, Message }; TaskPath/ім'я поза ефективною конфігурацією -> виняток
           TestCredentialPresence param([string]$RuntimeRoot, [string]$Component)
                                  -> { Component, Presence (Found|Missing|Unknown), ExitCode }
                                  (BRAVO_CREDENTIALS_SETUP.ps1 -Action Test; код 0 = Found; секрет не читається й не передається)
@@ -226,39 +227,97 @@ function New-BRAVOUpdateDefaultAdapter {
         Invoke-BRAVOUpdateChildProcess -ScriptPath (Join-Path $RuntimeRoot 'BRAVO_SELF_TEST.ps1') `
             -ScriptArgument @('-NoPause') -TimeoutSeconds 3600
     }
+    # Посилання на фінальний (замкнений) adapter: GetManagedTasks/SetTaskEnabled
+    # викликають його GetEffectiveConfiguration, щоб область задач (TaskPath +
+    # імена) визначав канонічний loader, а не hardcode (ENGINE_DESIGN.md, 5).
+    $holder = @{ Adapter = $null }
+
     $adapter.GetManagedTasks = {
-        param([string]$TaskPath)
-        $normalized = '\' + $TaskPath.Trim('\') + '\'
-        $found = @()
-        try {
-            $found = @(Get-ScheduledTask -TaskPath $normalized -ErrorAction Stop)
-        } catch {
-            # Немає такого каталогу задач або немає доступу: порожній результат;
-            # викликач відрізняє «немає» від «невідомо» своїми finding-ами.
-            $found = @()
+        param([string]$TaskPath, [string]$RuntimeRoot)
+        if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = $ToolkitRoot }
+        $getConfiguration = $holder.Adapter['GetEffectiveConfiguration']
+        $effective = & $getConfiguration $RuntimeRoot
+        if (($null -eq $effective) -or (-not [bool]$effective.Success)) {
+            throw 'BRAVO.Update: ефективну конфігурацію scheduler не прочитано (fail closed).'
         }
-        foreach ($task in $found) {
-            [pscustomobject]@{
-                Name    = [string]$task.TaskName
-                Path    = [string]$task.TaskPath
-                Exists  = $true
-                State   = [string]$task.State
-                Enabled = ([string]$task.State -ne 'Disabled')
-            }
+        $scope = Get-BRAVOUpdateManagedTaskScope -Configuration $effective.Configuration
+        # Явний TaskPath поза ефективним — не наша область: виняток, а не порожній результат.
+        if ((-not [string]::IsNullOrWhiteSpace($TaskPath)) -and
+            (-not [string]::Equals((ConvertTo-BRAVOUpdateTaskPath -TaskPath $TaskPath), $scope.TaskPath, [StringComparison]::OrdinalIgnoreCase))) {
+            throw "BRAVO.Update: TaskPath '$TaskPath' не є каталогом керованих задач."
         }
+        $comPath = $scope.TaskPath
+        if ($comPath -ne '\') { $comPath = $comPath.TrimEnd('\') }
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        $folder = $null
+        try { $folder = $service.GetFolder($comPath) } catch { $folder = $null }
+        if ($null -eq $folder) { return @() }
+        $stateNames = @{ 0 = 'Unknown'; 1 = 'Disabled'; 2 = 'Queued'; 3 = 'Ready'; 4 = 'Running' }
+        $rows = New-Object System.Collections.Generic.List[object]
+        foreach ($name in $scope.Names) {
+            $task = $null
+            try { $task = $folder.GetTask($name) } catch { $task = $null }
+            if ($null -eq $task) { continue }
+            # Шлях скрипта з аргументів дії (-File "..."): Discovery виводить із нього кандидатів root.
+            $actionPath = ''
+            try {
+                foreach ($action in $task.Definition.Actions) {
+                    if ([int]$action.Type -ne 0) { continue }
+                    $arguments = [string]$action.Arguments
+                    if ($arguments -match '-File\s+"([^"]+)"') { $actionPath = $Matches[1] }
+                    elseif ($arguments -match '-File\s+(\S+)') { $actionPath = $Matches[1] }
+                    else { $actionPath = [string]$action.Path }
+                    break
+                }
+            } catch { $actionPath = '' }
+            $stateValue = [int]$task.State
+            $stateText = 'Unknown'
+            if ($stateNames.ContainsKey($stateValue)) { $stateText = [string]$stateNames[$stateValue] }
+            $rows.Add([pscustomobject]@{
+                Name       = [string]$name
+                Path       = $scope.TaskPath
+                Exists     = $true
+                State      = $stateText
+                Enabled    = [bool]$task.Enabled
+                actionPath = $actionPath
+            })
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($task)
+        }
+        return @($rows.ToArray())
     }
     $adapter.SetTaskEnabled = {
-        param([string]$TaskPath, [string]$Name, [bool]$Enabled)
-        $normalized = '\' + $TaskPath.Trim('\') + '\'
+        param([string]$TaskPath, [string]$Name, [bool]$Enabled, [string]$RuntimeRoot)
+        if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = $ToolkitRoot }
+        $getConfiguration = $holder.Adapter['GetEffectiveConfiguration']
+        $effective = & $getConfiguration $RuntimeRoot
+        if (($null -eq $effective) -or (-not [bool]$effective.Success)) {
+            throw 'BRAVO.Update: ефективну конфігурацію scheduler не прочитано (fail closed).'
+        }
+        $scope = Get-BRAVOUpdateManagedTaskScope -Configuration $effective.Configuration
+        # Лише TaskPath з ефективної конфігурації і лише керовані імена, інакше виняток.
+        if (-not [string]::Equals((ConvertTo-BRAVOUpdateTaskPath -TaskPath $TaskPath), $scope.TaskPath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "BRAVO.Update: TaskPath '$TaskPath' не є каталогом керованих задач."
+        }
+        $managed = $false
+        foreach ($known in $scope.Names) { if ([string]::Equals($known, $Name, [StringComparison]::OrdinalIgnoreCase)) { $managed = $true } }
+        if (-not $managed) { throw "BRAVO.Update: задача '$Name' не є керованою." }
+        $comPath = $scope.TaskPath
+        if ($comPath -ne '\') { $comPath = $comPath.TrimEnd('\') }
+        $task = $null
         try {
-            if ($Enabled) {
-                [void](Enable-ScheduledTask -TaskPath $normalized -TaskName $Name -ErrorAction Stop)
-            } else {
-                [void](Disable-ScheduledTask -TaskPath $normalized -TaskName $Name -ErrorAction Stop)
-            }
+            $service = New-Object -ComObject 'Schedule.Service'
+            $service.Connect()
+            $task = $service.GetFolder($comPath).GetTask($Name)
+            $task.Enabled = $Enabled
+            # Перевірка наслідку: COM міг не застосувати зміну без винятку.
+            $confirmed = ([bool]$service.GetFolder($comPath).GetTask($Name).Enabled -eq $Enabled)
+            if (-not $confirmed) { return [pscustomobject]@{ Success = $false; Message = "Task Scheduler не підтвердив зміну стану '$Name'." } }
             [pscustomobject]@{ Success = $true; Message = '' }
         } catch {
             [pscustomobject]@{ Success = $false; Message = [string]$_.Exception.Message }
+        } finally {
+            if ($null -ne $task) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($task) }
         }
     }
     $adapter.TestCredentialPresence = {
@@ -318,5 +377,6 @@ function New-BRAVOUpdateDefaultAdapter {
     # й бачать Invoke-BRAVOUpdateChildProcess.
     $closed = @{}
     foreach ($key in @($adapter.Keys)) { $closed[$key] = $adapter[$key].GetNewClosure() }
+    $holder.Adapter = $closed
     return $closed
 }
