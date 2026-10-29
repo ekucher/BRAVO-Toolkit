@@ -2,6 +2,18 @@
 
 ## Не випущено (developer)
 
+- **Fix: status-файли — код 20 дає `WARNINGS`, ранні виходи не лишають старий `OK` (#479, #478; мінімальний
+  порт PR #493 у схемі v1).** Нова `Get-BRAVOExitCodeStatus` (`BRAVO.ExitCodes`) — єдине відображення код ->
+  `status`, деривоване з severity: 0 -> `OK`, 10 і 20 -> `WARNINGS`, решта -> `ERROR`. Раніше Health, відкладений
+  через зайнятий ресурс (20), писав `ERROR`, хоча severity — WARNING (рішення власника D-A). `BRAVO.Status` сам
+  імпортує `BRAVO.ExitCodes`, тож запис статусу не залежить від сесії викликача. Ранні виходи Maintenance
+  (конфігурація 30, креденшли 31, цілісність інструментів 32, середовище 90) і Archive (конфігурація 30, права 36)
+  тепер пишуть статус із `details.earlyTermination`, коли каталог стану вже відомий; помилка запису не змінює код
+  завершення. `schemaVersion` лишається 1, набір значень `status` не змінено. Не входять (відкладено до 5.3):
+  запис статусу прогонами `-RecoverServices` без роботи/заблокованими, міжпроцесне блокування статус-файла і
+  збереження сильнішої помилки. Self-test `Status/*` (мапінг, exit 20, чистий runspace без ExitCodes, статичні
+  allowlist-и сирих exit, fail-soft helper-и).
+
 - **Release: збирання з lightweight-тега відхиляється (D8).**
   `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
   `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не
