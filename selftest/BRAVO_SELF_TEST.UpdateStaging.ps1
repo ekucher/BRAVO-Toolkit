@@ -8,6 +8,20 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $updStagingTempPrefix = Join-Path ([System.IO.Path]::GetTempPath()) ('bravo-updstg-' + [guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $updStagingTempPrefix -Force)
 
+# Явно призначає власником особистий SID поточного користувача (файл або каталог). Дозволено без привілеїв.
+# Тести не покладаються на default owner: елевований токен створює об'єкти з власником BUILTIN\Administrators,
+# неелевований - з особистим SID, тому «чужий/особистий» власник у фікстурі задається лише так.
+function Set-UpdStagingTestOwnerPersonal {
+    param([string]$Path)
+    $personal = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $isDirectory = [System.IO.Directory]::Exists($Path)
+    $item = $null
+    if ($isDirectory) { $item = New-Object System.IO.DirectoryInfo($Path) } else { $item = New-Object System.IO.FileInfo($Path) }
+    $security = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner)
+    $security.SetOwner($personal)
+    $item.SetAccessControl($security)
+}
+
 # Будує ZIP із довільними іменами entry: @( @{ Name; Text } ... ).
 function New-UpdStagingTestZip {
     param([string]$Path, [object[]]$Items)
@@ -78,8 +92,10 @@ try {
         $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
         Test-BRAVOCondition -Condition (@($rules | Where-Object { $_.IsInherited }).Count -eq 0) -Name 'UpdateStaging/PrivateDirNoInheritedRules' -Failure 'не має бути успадкованих правил'
         $sids = @($rules | ForEach-Object { [string]$_.IdentityReference.Value })
-        $currentSidValue = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        Test-BRAVOCondition -Condition (($sids -contains 'S-1-5-32-544') -and ($sids -contains 'S-1-5-18') -and ($sids -contains $currentSidValue) -and (@($sids | Where-Object { $_ -notin @('S-1-5-32-544', 'S-1-5-18', $currentSidValue) }).Count -eq 0)) -Name 'UpdateStaging/PrivateDirTrustedOnly' -Failure 'мають бути лише Administrators, SYSTEM і поточний користувач'
+        # Очікуваний довірений набір залежить від елевації процесу (елевований: лише Administrators/SYSTEM; без прав: + особистий SID),
+        # тому обчислюється канонічною Get-BRAVOUpdateTrustedSid, а не хардкодом «поточний користувач присутній».
+        $expectedSids = @(& (Get-Module BRAVO.Update) { Get-BRAVOUpdateTrustedSid })
+        Test-BRAVOCondition -Condition (($expectedSids.Count -gt 0) -and (@($expectedSids | Where-Object { $sids -notcontains $_ }).Count -eq 0) -and (@($sids | Where-Object { $expectedSids -notcontains $_ }).Count -eq 0)) -Name 'UpdateStaging/PrivateDirTrustedOnly' -Failure ('очікувано ' + ($expectedSids -join ',') + ', у каталозі ' + ($sids -join ','))
         # Наявний порожній каталог допустимий, непорожній — ні.
         $again = New-BRAVOUpdatePrivateDirectory -Path $dir
         Test-BRAVOCondition -Condition ($again.Success) -Name 'UpdateStaging/PrivateDirExistingEmptyOk' -Failure 'наявний порожній каталог має прийматися'
@@ -313,9 +329,22 @@ try {
         $made = New-BRAVOUpdatePrivateDirectory -Path $h1Private
         $okProblems = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $h1Private)
         Test-BRAVOCondition -Condition ($made.Success -and $okProblems.Count -eq 0) -Name 'UpdateStaging/H1/ValidatorAcceptsPrivateDirectory' -Failure ($okProblems -join '; ')
-        $asElevated = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private -AdminCheck { $true } } $h1Private)
+        # Фікстура задає власника й ACE особистого SID ЯВНО (default owner елевованого токена - Administrators, тож «приватний» каталог
+        # елевованого процесу особистого SID не містить): така директорія для елевованого engine має бути відхилена.
+        $personalDir = Join-Path $h1Base 'особистий'
+        [void](New-Item -ItemType Directory -Path $personalDir -Force)
+        $personalSecurity = New-Object System.Security.AccessControl.DirectorySecurity
+        $personalSecurity.SetAccessRuleProtection($true, $false)
+        foreach ($personalAceSid in @((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')), (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), [System.Security.Principal.WindowsIdentity]::GetCurrent().User)) {
+            $personalSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($personalAceSid, [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit), [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)))
+        }
+        $personalSecurity.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
+        (New-Object System.IO.DirectoryInfo($personalDir)).SetAccessControl($personalSecurity)
+        $asElevated = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private -AdminCheck { $true } } $personalDir)
+        $asUnelevated = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private -AdminCheck { $false } } $personalDir)
         $personalIsAdminLike = (@('S-1-5-18', 'S-1-5-32-544') -contains $currentSidText)
-        Test-BRAVOCondition -Condition ($personalIsAdminLike -or ($asElevated.Count -gt 0)) -Name 'UpdateStaging/H1/ValidatorRejectsPersonalSidWhenElevated' -Failure 'особистий SID (власник/ACE) не має довірятись елевованому процесу'
+        Test-BRAVOCondition -Condition ($personalIsAdminLike -or (($asElevated.Count -gt 0) -and (@($asElevated | Where-Object { $_ -like 'власник*' }).Count -gt 0) -and ($asUnelevated.Count -eq 0))) -Name 'UpdateStaging/H1/ValidatorRejectsPersonalSidWhenElevated' -Failure ('elevated=' + ($asElevated -join '; ') + ' | unelevated=' + ($asUnelevated -join '; '))
         & $h1AddUsersAce $h1Private ([System.Security.AccessControl.FileSystemRights]::Write)
         $usersWrite = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $h1Private)
         Test-BRAVOCondition -Condition (@($usersWrite | Where-Object { $_ -like '*S-1-5-32-545*' }).Count -gt 0) -Name 'UpdateStaging/H1/ValidatorRejectsUsersWrite' -Failure ($usersWrite -join '; ')
@@ -356,6 +385,9 @@ try {
         $fixed = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p } $h1Roots
         Test-BRAVOCondition -Condition ($fixed.Success -and (@($fixed.Reapplied) -contains $requestsPath)) -Name 'UpdateStaging/H1/TrustedOwnerDaclReapplied' -Failure ($fixed.Problems -join '; ')
         if (-not $personalIsAdminLike) {
+            # Власник = особистий SID явно: для (симульованого) елевованого процесу він «чужий» і при реальній елевації теж
+            # (default owner там Administrators, тож без явного SetOwner сценарій був би порожнім).
+            Set-UpdStagingTestOwnerPersonal -Path $requestsPath
             & $h1AddUsersAce $requestsPath ([System.Security.AccessControl.FileSystemRights]::Modify)
             $foreign = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p -AdminCheck { $true } } $h1Roots
             $stillBad = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Requests } $requestsPath)
@@ -462,6 +494,8 @@ try {
         [void](New-Item -ItemType Directory -Path (Join-Path $contentDir 'id1') -Force)
         [IO.File]::WriteAllText((Join-Path $contentDir 'marker.json'), '{}')
         [IO.File]::WriteAllText((Join-Path $contentDir 'id1\result.json'), '{}')
+        # Явний власник = особистий SID (елевований процес створив би об'єкти з власником Administrators, і скан нічого б не знайшов).
+        foreach ($contentItem in @((Join-Path $contentDir 'id1'), (Join-Path $contentDir 'marker.json'), (Join-Path $contentDir 'id1\result.json'))) { Set-UpdStagingTestOwnerPersonal -Path $contentItem }
         $ownedByMeUnelevated = @(& $h1Module { param($p) Get-BRAVOUpdateUntrustedContentOwner -Path $p -Depth 2 -AdminCheck { $false } } $contentDir)
         $ownedByMeElevated = @(& $h1Module { param($p) Get-BRAVOUpdateUntrustedContentOwner -Path $p -Depth 2 -AdminCheck { $true } } $contentDir)
         $depthOne = @(& $h1Module { param($p) Get-BRAVOUpdateUntrustedContentOwner -Path $p -Depth 1 -AdminCheck { $true } } $contentDir)
@@ -479,6 +513,9 @@ try {
         $journalBad = & $r2Sddl $journalDir
         if (-not $meIsAdminLike) {
             [IO.File]::WriteAllText((Join-Path $journalDir 'x.json'), '{}')
+            # Вміст належить особистому SID явно. Власник самого каталогу: без прав - особистий (симуляція відхиляє вже за власником),
+            # з правами - Administrators (відхиляє саме скан вмісту); в обох випадках DACL лишається незмінним.
+            Set-UpdStagingTestOwnerPersonal -Path (Join-Path $journalDir 'x.json')
             $simulated = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p -AdminCheck { $true } } $scanRoots
             Test-BRAVOCondition -Condition ((-not $simulated.Success) -and ((& $r2Sddl $journalDir) -ceq $journalBad)) -Name 'UpdateStaging/H1/ForeignContentBlocksReAcl' -Failure ('Success=' + $simulated.Success)
         }
@@ -544,13 +581,22 @@ try {
         $aclDeniedSec.SetAccessRuleProtection($true, $false)
         $aclDeniedSec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), 'FullControl', 'Allow')))
         $aclDeniedSec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-3-4')), 'ReadData', 'Allow')))
+        # Власник явно = особистий SID: OWNER RIGHTS (ReadData) тоді обмежує неявні права власника; Administrators-членство
+        # (елевований токен CI) не дає READ_CONTROL, бо групи Administrators у DACL немає.
+        $aclDeniedSec.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
         (New-Object System.IO.DirectoryInfo($aclDeniedDir)).SetAccessControl($aclDeniedSec)
+        $realAclDenied = $false
+        try { [void](Get-Acl -LiteralPath $aclDeniedDir -ErrorAction Stop) } catch [System.UnauthorizedAccessException] { $realAclDenied = $true } catch { $realAclDenied = $false }
         $aclDeniedProblems = @(& (Get-Module BRAVO.Update) { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $aclDeniedDir)
         $aclDeniedPrefix = & (Get-Module BRAVO.Update) { $script:BRAVOUpdateAclDeniedPrefix }
+        # Якщо Get-Acl справді відмовив - рівно одна проблема з префіксом відмови (клас «відкласти»). Якщо Get-Acl вдався (привілеї
+        # backup тощо) - відкладення не стверджуємо, але валідатор НІКОЛИ не повертає успіх для каталогу з OWNER RIGHTS-only DACL.
+        $aclDeniedOk = $false
+        if ($realAclDenied) { $aclDeniedOk = ($aclDeniedProblems.Count -eq 1 -and ([string]$aclDeniedProblems[0]).StartsWith([string]$aclDeniedPrefix)) } else { $aclDeniedOk = ($aclDeniedProblems.Count -ge 1) }
         Test-BRAVOCondition `
-            -Condition ($aclDeniedProblems.Count -eq 1 -and ([string]$aclDeniedProblems[0]).StartsWith([string]$aclDeniedPrefix)) `
+            -Condition $aclDeniedOk `
             -Name 'UpdateStaging/H1/RealGetAclAccessDeniedClassifiedAsDeferred' `
-            -Failure ('справжня відмова Get-Acl має дати рівно одну проблему з префіксом відмови доступу; отримано: ' + ($aclDeniedProblems -join ' | '))
+            -Failure ('realAclDenied=' + $realAclDenied + '; отримано: ' + ($aclDeniedProblems -join ' | '))
     } finally {
         if ([IO.Directory]::Exists($aclDeniedDir) -and ([IO.Path]::GetFileName($aclDeniedDir)).StartsWith('BRAVO_UPDSTG_ACLDENY_')) {
             [IO.Directory]::Delete($aclDeniedDir)
