@@ -3401,3 +3401,70 @@ try {
 } finally {
     Remove-Item -LiteralPath $late501Root -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# ============================================================
+# 5.2.6 known issue: diskshadow читає сценарій як ANSI/OEM, тому
+# сценарій і metadata-.cab мусять лежати в каталозі з ASCII-шляхом
+# (ручний запуск з профілю з кириличним TEMP). Admin-free: diskshadow
+# не запускається, перевіряється лише вибір каталогу і текст функції.
+# ============================================================
+$vssWorkDirModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText $archiveScriptText `
+    -FunctionNames @('Get-BRAVOVSSDiskshadowWorkDirectory')
+# ASCII-фікстури мусять мати ASCII-батьківський шлях: на установці з
+# кириличним %TEMP% (саме цей сценарій виправляється) корінь у GetTempPath()
+# зробив би не-ASCII і "ASCII"-кандидатів, і тест падав би при коректному
+# хелпері. Як у ManualLaunchers: C:\Windows\Temp завжди ASCII.
+$vssWorkDirTempBase = [IO.Path]::GetTempPath()
+if ($vssWorkDirTempBase -cmatch '[^\x00-\x7F]') {
+    $vssWorkDirTempBase = Join-Path $env:SystemRoot 'Temp'
+}
+$vssWorkDirRoot = Join-Path $vssWorkDirTempBase ('BRAVO_VSS_WORKDIR_SELF_TEST_{0}' -f [guid]::NewGuid().ToString('N'))
+try {
+    $vssAsciiTemp = Join-Path $vssWorkDirRoot 'AsciiTemp'
+    $vssFakeSystemRoot = Join-Path $vssWorkDirRoot 'FakeWindows'
+    $vssFakeSystemTemp = Join-Path $vssFakeSystemRoot 'Temp'
+    $vssCyrillicTemp = Join-Path $vssWorkDirRoot ('Тест Кирилиця' + '\Temp')
+    $vssCyrillicSystemRoot = Join-Path $vssWorkDirRoot 'Вінда'
+    foreach ($vssDir in @($vssAsciiTemp, $vssFakeSystemTemp, $vssCyrillicTemp, (Join-Path $vssCyrillicSystemRoot 'Temp'))) {
+        [void][IO.Directory]::CreateDirectory($vssDir)
+    }
+
+    $vssWorkDirProbe = & $vssWorkDirModule {
+        param($AsciiTemp, $CyrillicTemp, $FakeSystemRoot, $CyrillicSystemRoot)
+        [pscustomobject]@{
+            AsciiUsed = Get-BRAVOVSSDiskshadowWorkDirectory -TempPath $AsciiTemp -SystemRootPath $FakeSystemRoot
+            NonAscii = Get-BRAVOVSSDiskshadowWorkDirectory -TempPath $CyrillicTemp -SystemRootPath $FakeSystemRoot
+            NoCandidate = Get-BRAVOVSSDiskshadowWorkDirectory -TempPath $CyrillicTemp -SystemRootPath $CyrillicSystemRoot
+        }
+    } $vssAsciiTemp $vssCyrillicTemp $vssFakeSystemRoot $vssCyrillicSystemRoot
+
+    Test-BRAVOCondition -Condition (
+        $vssWorkDirProbe.AsciiUsed -eq $vssAsciiTemp
+    ) -Name 'Archive/VSSDiskshadowWorkDirAsciiTempUsedAsIs' `
+      -Failure 'ASCII TEMP має використовуватися як є'
+    Test-BRAVOCondition -Condition (
+        $vssWorkDirProbe.NonAscii -eq $vssFakeSystemTemp -and
+        $vssWorkDirProbe.NonAscii -cmatch '^[\x20-\x7E]+$'
+    ) -Name 'Archive/VSSDiskshadowWorkDirNonAsciiTempFallsBack' `
+      -Failure 'не-ASCII TEMP має замінюватися на ASCII-каталог SystemRoot\Temp і ніколи не повертатися'
+    Test-BRAVOCondition -Condition (
+        $null -eq $vssWorkDirProbe.NoCandidate
+    ) -Name 'Archive/VSSDiskshadowWorkDirNoAsciiCandidateReturnsNull' `
+      -Failure 'коли обидва кандидати не-ASCII, має повертатися $null (fail-closed, без live-fallback)'
+} finally {
+    Remove-Item -LiteralPath $vssWorkDirRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$vssDiskshadowFunctionText = [regex]::Match(
+    $archiveScriptText,
+    '(?s)function New-BRAVOVSSDiskshadowSnapshotSet \{.*?\r?\n\}\r?\n'
+).Value
+Test-BRAVOCondition -Condition (
+    -not [string]::IsNullOrWhiteSpace($vssDiskshadowFunctionText) -and
+    -not $vssDiskshadowFunctionText.Contains('GetTempPath') -and
+    $vssDiskshadowFunctionText.Contains('Get-BRAVOVSSDiskshadowWorkDirectory') -and
+    $vssDiskshadowFunctionText.Contains('WriteAllLines($scriptPath, $lines.ToArray(), [Text.Encoding]::ASCII)') -and
+    $vssDiskshadowFunctionText.Contains('^[\x20-\x7E]*$')
+) -Name 'Archive/VSSDiskshadowScriptIsAsciiInAsciiDirectory' `
+  -Failure 'New-BRAVOVSSDiskshadowSnapshotSet має брати каталог з Get-BRAVOVSSDiskshadowWorkDirectory (без прямого GetTempPath), перевіряти ASCII-чистоту сценарію і писати його ASCII-кодуванням'
