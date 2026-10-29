@@ -501,8 +501,13 @@ function Invoke-BRAVOInstallRollback {
     $runtimeBase = Get-BRAVOUpdateFullPath -Path $runtimeRoot
 
     # Задачі вимикаємо ПЕРШИМИ: файли, які вони запускають, зникнуть нижче.
+    # Результат Disable-BRAVOAllManagedTasks не можна лишати в pipeline:
+    # він потрапив би у вихід функції й зламав би форму результату.
     try {
-        Disable-BRAVOAllManagedTasks -Adapter $Adapter
+        $installDisable = Disable-BRAVOAllManagedTasks -Adapter $Adapter
+        if ($null -ne $installDisable -and $installDisable.PSObject.Properties['IsComplete'] -and -not $installDisable.IsComplete) {
+            [void]$problems.Add('Не всі створені задачі вдалося вимкнути.')
+        }
     } catch {
         [void]$problems.Add('Не вдалося вимкнути створені задачі: ' + $_.Exception.Message)
     }
@@ -956,7 +961,10 @@ function Invoke-BRAVORollback {
     # Critical: задачі лишаються вимкненими, журнал Critical, backup і знімки зберігаються.
     $disableNote = ''
     try {
-        Disable-BRAVOAllManagedTasks -Adapter $Adapter
+        $criticalDisable = Disable-BRAVOAllManagedTasks -Adapter $Adapter
+        if ($null -ne $criticalDisable -and $criticalDisable.PSObject.Properties['IsComplete'] -and -not $criticalDisable.IsComplete) {
+            $disableNote = ' Не всі керовані задачі вдалося вимкнути.'
+        }
     } catch {
         $disableNote = ' Не вдалося вимкнути задачі: ' + [string]$_.Exception.Message
     }
