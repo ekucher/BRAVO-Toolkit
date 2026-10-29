@@ -41252,10 +41252,24 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
             }
             return $parameterValues
         }
+        # Предикати зібрано в .NET-делегати один раз (Get-BRAVOSelfTestAstTypePredicate):
+        # виклик PowerShell-scriptblock-а на кожному вузлі файлу дорожчий за сам розбір.
+        $commandNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @([Management.Automation.Language.CommandAst])
+        $unitNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
+            [Management.Automation.Language.IfStatementAst],
+            [Management.Automation.Language.CommandAst],
+            [Management.Automation.Language.BreakStatementAst],
+            [Management.Automation.Language.ContinueStatementAst],
+            [Management.Automation.Language.ExitStatementAst],
+            [Management.Automation.Language.ReturnStatementAst])
+        $boundaryCallNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($boundaryCallName in @('Enter-BRAVOSelfTestSection', 'Register-BRAVOSelfTestSectionFault', 'Complete-BRAVOSelfTestSection')) {
+            [void]$boundaryCallNames.Add($boundaryCallName)
+        }
         $isSectionIf = {
             param($Node)
             if (-not ($Node -is [Management.Automation.Language.IfStatementAst]) -or $Node.Clauses.Count -lt 1) { return $false }
-            $conditionCommand = $Node.Clauses[0].Item1.Find({ param($inner) $inner -is [Management.Automation.Language.CommandAst] }, $true)
+            $conditionCommand = $Node.Clauses[0].Item1.Find($commandNodePredicate, $true)
             return ($null -ne $conditionCommand -and $conditionCommand.GetCommandName() -eq 'Enter-BRAVOSelfTestSection')
         }
         $analyzeUnit = {
@@ -41264,18 +41278,29 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
             # ОДИН обхід дерева на одиницю: FindAll викликає предикат на КОЖЕН
             # вузол, тож предикат — лише дешеві перевірки типу, а класифікація
             # — уже по відібраних вузлах (див. Perf/SingleAstPassOverRepositoryFiles).
-            $unitNodes = @($UnitAst.FindAll({ param($node)
-                        $node -is [Management.Automation.Language.IfStatementAst] -or
-                        $node -is [Management.Automation.Language.CommandAst] -or
-                        $node -is [Management.Automation.Language.BreakStatementAst] -or
-                        $node -is [Management.Automation.Language.ContinueStatementAst] -or
-                        $node -is [Management.Automation.Language.ExitStatementAst] -or
-                        $node -is [Management.Automation.Language.ReturnStatementAst] }, $true))
-            $unitSectionIfs = @($unitNodes | Where-Object { $_ -is [Management.Automation.Language.IfStatementAst] -and (& $isSectionIf $_) })
-            $unitBoundaryCalls = @($unitNodes | Where-Object { $_ -is [Management.Automation.Language.CommandAst] -and
-                    @('Enter-BRAVOSelfTestSection', 'Register-BRAVOSelfTestSectionFault', 'Complete-BRAVOSelfTestSection') -contains $_.GetCommandName() })
-            $unitJumps = @($unitNodes | Where-Object { -not ($_ -is [Management.Automation.Language.IfStatementAst]) -and
-                    -not ($_ -is [Management.Automation.Language.CommandAst]) })
+            $unitNodes = @($UnitAst.FindAll($unitNodePredicate, $true))
+            # Один прохід замість трьох Where-Object. $sectionIfSet — межі-секції
+            # цієї одиниці: кожен предок-if належить $unitNodes, тож "предок є
+            # межею" рівнозначне членству в наборі й не потребує повторного
+            # виклику $isSectionIf на кожному предку кожного вузла (виклик
+            # scriptblock-а на кожному кроці підйому давав тисячі зайвих
+            # scope-ів і GC-пауз на великому купі повного прогону).
+            $unitSectionIfs = New-Object System.Collections.Generic.List[object]
+            $unitBoundaryCalls = New-Object System.Collections.Generic.List[object]
+            $unitJumps = New-Object System.Collections.Generic.List[object]
+            $sectionIfSet = New-Object 'System.Collections.Generic.HashSet[object]'
+            foreach ($unitNode in $unitNodes) {
+                if ($unitNode -is [Management.Automation.Language.IfStatementAst]) {
+                    if (& $isSectionIf $unitNode) {
+                        $unitSectionIfs.Add($unitNode)
+                        [void]$sectionIfSet.Add($unitNode)
+                    }
+                } elseif ($unitNode -is [Management.Automation.Language.CommandAst]) {
+                    if ($boundaryCallNames.Contains($unitNode.GetCommandName())) { $unitBoundaryCalls.Add($unitNode) }
+                } else {
+                    $unitJumps.Add($unitNode)
+                }
+            }
             foreach ($sectionIf in $unitSectionIfs) {
                 $sectionProblem = ''
                 $sectionName = ''
@@ -41322,7 +41347,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
                             $Label, $sectionIf.Extent.StartLineNumber, $sectionName, $sectionPolicy, [string]::Join(', ', $GlobalFatalAllowList)))
                 }
                 $parentSection = $sectionIf.Parent
-                while ($null -ne $parentSection -and -not (& $isSectionIf $parentSection)) { $parentSection = $parentSection.Parent }
+                while ($null -ne $parentSection -and -not $sectionIfSet.Contains($parentSection)) { $parentSection = $parentSection.Parent }
                 [void]$unitSections.Add([pscustomobject]@{
                         Name      = $sectionName
                         DependsOn = $sectionDependsOn
@@ -41340,7 +41365,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
                 while ($null -ne $owningFunction -and -not ($owningFunction -is [Management.Automation.Language.FunctionDefinitionAst])) { $owningFunction = $owningFunction.Parent }
                 if ($null -ne $owningFunction) { continue }
                 $owningSection = $boundaryCall.Parent
-                while ($null -ne $owningSection -and -not (& $isSectionIf $owningSection)) { $owningSection = $owningSection.Parent }
+                while ($null -ne $owningSection -and -not $sectionIfSet.Contains($owningSection)) { $owningSection = $owningSection.Parent }
                 $isCanonicalCall = $false
                 if ($null -ne $owningSection) {
                     $owningTry = $owningSection.Clauses[0].Item2.Statements | Select-Object -First 1
@@ -41363,7 +41388,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
                     $jumpContained = $false
                     $jumpInSection = ($Domain -ne 'root')
                     while ($null -ne $jumpAncestor) {
-                        if (-not $jumpInSection -and $jumpAncestor -is [Management.Automation.Language.IfStatementAst] -and (& $isSectionIf $jumpAncestor)) {
+                        if (-not $jumpInSection -and $jumpAncestor -is [Management.Automation.Language.IfStatementAst] -and $sectionIfSet.Contains($jumpAncestor)) {
                             $jumpInSection = $true
                         }
                         if ($jumpAncestor -is [Management.Automation.Language.FunctionDefinitionAst] -or
