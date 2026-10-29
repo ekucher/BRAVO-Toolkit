@@ -8,6 +8,33 @@
 
 Поточні `deploy/Install-BRAVOServer.ps1` і `deploy/Update-BRAVOServer.ps1` залишаються чинними operator-facing deployment helpers до появи та acceptance канонічного lifecycle engine.
 
+## Стан реалізації (гілка feature/installer-v1)
+
+Реалізацію Installer v1 розпочато в гілці `feature/installer-v1`. Цей розділ
+відділяє те, що вже є в коді, від того, що лишається design.
+
+Реалізовано в коді гілки:
+
+- каркас модуля `modules/BRAVO.Update/` і контракти engine (INS-010…014) —
+  форми даних і назви функцій у [CONTRACTS.md](CONTRACTS.md);
+- коди завершення `80`/`81`/`82` у `modules/BRAVO.ExitCodes`.
+
+У роботі (хвилі B–J детального плану; фінальний перелік оновлює lead під час
+інтеграції): read-only discovery/preflight/plan, acquisition і verification,
+backup/deploy/reconcile, rollback і recovery, clean install, repair,
+`BRAVO_UPDATE.ps1`, GUI.
+
+Рішення, закладені за замовчуванням і ще не затверджені власником, — у
+[DECISIONS.md](DECISIONS.md).
+
+Явно **не виконано**:
+
+- fleet inventory і Config v2 fleet migration (INS-001, INS-002);
+- VM acceptance (INS-130…142);
+- pilot і рішення про rollout (INS-150…155).
+
+Ніщо в цій гілці не є production acceptance і не дає дозволу на deployment.
+
 ## Мета
 
 Перетворити встановлення, оновлення, відновлення та діагностику BRAVO Toolkit з набору окремих операторських сценаріїв на один безпечний lifecycle:
@@ -32,6 +59,8 @@ GUI не є власником deployment policy. Він відображає с
 - [ARCHITECTURE.md](ARCHITECTURE.md) — архітектура, trust boundary, deployment transaction, rollback/recovery, configuration, credentials та scheduled update.
 - [UX.md](UX.md) — затверджений UX baseline Installer/Maintenance Center і поведінка всіх основних екранів.
 - [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — поетапний implementation train, залежності, gates, acceptance та Definition of Done.
+- [CONTRACTS.md](CONTRACTS.md) — implementation contract engine Installer v1 (State, Plan, Progress, Result, Journal, lock, worker protocol).
+- [DECISIONS.md](DECISIONS.md) — рішення Installer v1 (ADR), що чекають затвердження власником.
 
 ## Основні інваріанти
 
