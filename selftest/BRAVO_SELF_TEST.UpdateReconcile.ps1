@@ -430,13 +430,13 @@ try {
         Test-BRAVOCondition -Condition (($r.TaskActivation.state -ceq 'Unchanged') -and (@(Get-ReconcileTestSetCalls -Stub $b.Case.Stub).Count -eq 0)) -Name 'UpdateReconcile/Activation.NothingEnabledBeforeIsUnchanged' -Failure 'якщо до операції нічого не було увімкнено: Unchanged без змін'
 
         $c = & $newActivationCase @('BRAVO-Backup') @()
-        $r = Invoke-ReconcileTestCall -Name 'Set-BRAVOTaskActivation' -Params @{ Policy = 'ActivateOnSuccessOnly'; Snapshot = $c.Snapshot; Adapter = $c.Case.Adapter; OutcomeStatus = 'SuccessWithWarnings'; Action = 'Update' }
-        Test-BRAVOCondition -Condition (($r.TaskActivation.state -ceq 'Inactive') -and (@($r.Findings | Where-Object { $_.id -ceq 'Activation.HeldByWarnings' -and $_.severity -ceq 'Warning' }).Count -eq 1) -and ((& $enabledState $c.Case) -ceq 'False,False,False')) -Name 'UpdateReconcile/Activation.UpdateWarningsHeld' -Failure 'Update+SuccessWithWarnings: Inactive + finding'
-        Test-BRAVOCondition -Condition (@(Get-ReconcileTestSetCalls -Stub $c.Case.Stub | Where-Object { $_ -like '*|True' }).Count -eq 0) -Name 'UpdateReconcile/Activation.UpdateWarningsNeverEnables' -Failure 'утримання не вмикає задачі'
+        $r = Invoke-ReconcileTestCall -Name 'Set-BRAVOTaskActivation' -Params @{ Policy = 'ActivateOnSuccessOnly'; Snapshot = $c.Snapshot; Adapter = $c.Case.Adapter; OutcomeStatus = 'SuccessWithWarnings'; Action = 'Update'; WarningText = @('SFTP недоступний') }
+        Test-BRAVOCondition -Condition (($r.TaskActivation.state -ceq 'Active') -and (@($r.Findings | Where-Object { $_.id -ceq 'Activation.RestoredWithWarnings' -and $_.severity -ceq 'Warning' -and $_.details -like '*SFTP*' }).Count -eq 1) -and ((& $enabledState $c.Case) -ceq 'True,False,False')) -Name 'UpdateReconcile/Activation.UpdateWarningsRestoresPrevious' -Failure 'Update+SuccessWithWarnings: попередній стан + Warning finding (D6)'
+        Test-BRAVOCondition -Condition (@(Get-ReconcileTestSetCalls -Stub $c.Case.Stub | Where-Object { $_ -like '*|True' }).Count -eq 1) -Name 'UpdateReconcile/Activation.UpdateWarningsEnablesOnlyPrevious' -Failure 'вмикається лише задача, що була активна'
 
         $d = & $newActivationCase @('BRAVO-Backup') @()
-        $r = Invoke-ReconcileTestCall -Name 'Set-BRAVOTaskActivation' -Params @{ Policy = 'ActivateOnWarnings'; Snapshot = $d.Snapshot; Adapter = $d.Case.Adapter; OutcomeStatus = 'SuccessWithWarnings'; Action = 'Update' }
-        Test-BRAVOCondition -Condition (($r.TaskActivation.state -ceq 'Active') -and ((& $enabledState $d.Case) -ceq 'True,False,False')) -Name 'UpdateReconcile/Activation.ActivateOnWarningsRestores' -Failure 'ActivateOnWarnings: попередній стан відновлюється й за warnings'
+        $r = Invoke-ReconcileTestCall -Name 'Set-BRAVOTaskActivation' -Params @{ Policy = 'ActivateOnSuccessOnly'; Snapshot = $d.Snapshot; Adapter = $d.Case.Adapter; OutcomeStatus = 'SuccessWithWarnings'; Action = 'Update' }
+        Test-BRAVOCondition -Condition (($r.TaskActivation.state -ceq 'Active') -and ((& $enabledState $d.Case) -ceq 'True,False,False')) -Name 'UpdateReconcile/Activation.UpdateWarningsPolicyIndependent' -Failure 'результат не залежить від рядка політики'
 
         # Install: завжди Inactive; задачі, що були ввімкнені (поза очікуваннями), вимикаються.
         $e = & $newActivationCase @() @('BRAVO-Health')
@@ -473,7 +473,7 @@ try {
         Test-BRAVOCondition -Condition (($r.TaskActivation.state -ceq 'Unknown') -and (@(Get-ReconcileTestSetCalls -Stub $l.Case.Stub).Count -eq 0)) -Name 'UpdateReconcile/Activation.InvalidSnapshotIsUnknown' -Failure 'порожній знімок -> Unknown без змін'
         $m = & $newActivationCase @() @()
         $m.Case.Stub.GetFail = $true
-        $r = Invoke-ReconcileTestCall -Name 'Set-BRAVOTaskActivation' -Params @{ Policy = 'ActivateOnSuccessOnly'; Snapshot = $m.Snapshot; Adapter = $m.Case.Adapter; OutcomeStatus = 'SuccessWithWarnings'; Action = 'Update' }
+        $r = Invoke-ReconcileTestCall -Name 'Set-BRAVOTaskActivation' -Params @{ Policy = 'ActivateOnSuccessOnly'; Snapshot = $m.Snapshot; Adapter = $m.Case.Adapter; OutcomeStatus = 'Critical'; Action = 'Update' }
         Test-BRAVOCondition -Condition ($r.TaskActivation.state -ceq 'Unknown') -Name 'UpdateReconcile/Activation.UnreadableIsUnknown' -Failure 'нечитабельний scheduler -> Unknown'
         $contractCheck = Invoke-ReconcileTestCall -Name 'New-BRAVOUpdateDeploymentResult' -Params @{ OperationId = [guid]::NewGuid().ToString(); Action = 'Update'; Status = 'Success'; TaskActivation = $a.Case.Stub.Names.Count }
         # (не використовується) — результат Set-BRAVOTaskActivation вкладається в DeploymentResult.taskActivation

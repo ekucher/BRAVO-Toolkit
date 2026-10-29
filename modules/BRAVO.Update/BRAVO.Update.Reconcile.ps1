@@ -718,7 +718,7 @@ function Set-BRAVOTaskActivation {
         перекриває Policy.action; без жодного — Update.
         Правила (ENGINE_DESIGN.md, розділ 5):
           Update/Repair + Success            -> відновити попередній стан;
-          Update/Repair + SuccessWithWarnings -> Inactive + finding, якщо немає ActivateOnWarnings;
+          Update/Repair + SuccessWithWarnings -> відновити попередній стан + Warning finding (D6);
           Update/Repair + Failed/RolledBack  -> відновити попередній стан (D6);
           Install (будь-який результат)       -> Inactive;
           Critical                            -> ніколи не вмикати (лише вимкнути).
@@ -731,7 +731,8 @@ function Set-BRAVOTaskActivation {
         [Parameter(Mandatory = $true)][AllowNull()]$Snapshot,
         [Parameter(Mandatory = $true)]$Adapter,
         [Parameter(Mandatory = $true)][ValidateSet('Success', 'SuccessWithWarnings', 'Failed', 'RolledBack', 'Critical')][string]$OutcomeStatus,
-        [ValidateSet('', 'Install', 'Update', 'Repair')][string]$Action = ''
+        [ValidateSet('', 'Install', 'Update', 'Repair')][string]$Action = '',
+        [string[]]$WarningText = @()
     )
 
     $activationPolicy = 'ActivateOnSuccessOnly'
@@ -745,7 +746,6 @@ function Set-BRAVOTaskActivation {
     $effectiveAction = $Action
     if ($effectiveAction -eq '') { $effectiveAction = $policyAction }
     if (@('Install', 'Update', 'Repair') -notcontains $effectiveAction) { $effectiveAction = 'Update' }
-    $activateOnWarnings = ($activationPolicy -ceq 'ActivateOnWarnings')
 
     $findings = New-Object System.Collections.Generic.List[object]
     $restore = $null
@@ -779,13 +779,13 @@ function Set-BRAVOTaskActivation {
         'SuccessWithWarnings' {
             if ($effectiveAction -eq 'Install') {
                 $restorePrevious = $false
-            } elseif ($activateOnWarnings) {
-                $restorePrevious = $true
             } else {
-                $restorePrevious = $false
-                $findings.Add((New-BRAVOUpdateFinding -Id 'Activation.HeldByWarnings' -Severity Warning -Title 'Задачі лишаються неактивними через попередження' `
-                    -Meaning 'Операція завершилась із попередженнями; автоматичні задачі не вмикаються без підтвердження оператора.' `
-                    -Action 'Перегляньте попередження й увімкніть задачі вручну або повторіть операцію з політикою ActivateOnWarnings.'))
+                # D6: попередній enabled-стан зберігається; попередження лише повідомляємо.
+                $restorePrevious = $true
+                $warningDetails = (@($WarningText | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join '; ')
+                $findings.Add((New-BRAVOUpdateFinding -Id 'Activation.RestoredWithWarnings' -Severity Warning -Title 'Задачі відновлено в попередньому стані, операція мала попередження' `
+                    -Meaning 'Операція завершилась із попередженнями; задачі повернено до стану до операції, нові задачі не активовано.' `
+                    -Action 'Перегляньте попередження операції й за потреби перевірте задачі в Планувальнику завдань.' -Details $warningDetails))
             }
         }
         default {
