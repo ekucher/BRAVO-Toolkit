@@ -6061,6 +6061,12 @@ function Invoke-BRAVOTraceArchiveMaintenance {
         [int]$IntegrityTimeoutSeconds = 43200,
         [AllowNull()]$Session,
         [string]$RemoteDirectory,
+        # SFTP свідомо вимкнено конфігурацією (componentSettings.SFTP.Enabled
+        # = false): $Session=$null тут — не збій, а local-only режим, тож
+        # відкладення передачі логується INFO і не інкрементує лічильник
+        # попереджень (інакше щоночі exit 10). Без прапорця (SFTP увімкнено,
+        # але сесії немає: креденшли/WinSCP/мережа) — WARNING, як і раніше.
+        [switch]$RemoteDisabled,
         # R3-2 (PR #136, третє коло review): ідентичність SFTP-призначення
         # (типово "логін@хост") цього $Session — записується у grace-
         # completion state РАЗОМ із RemoteDirectory, щоб зміна акаунта чи
@@ -6243,8 +6249,13 @@ function Invoke-BRAVOTraceArchiveMaintenance {
 
             if ($null -eq $Session) {
                 $result.UploadsDeferred++
-                Write-BRAVOLogRotationMessage -Logger $Logger `
-                    -Message "${ComponentLabel}: SFTP-сесія недоступна — передачу $($group.ArchiveName) відкладено; джерельні файли збережено для наступного прогону" -Level "WARNING"
+                if ($RemoteDisabled) {
+                    Write-BRAVOLogRotationMessage -Logger $Logger `
+                        -Message "${ComponentLabel}: SFTP вимкнено конфігурацією — передачу $($group.ArchiveName) відкладено; джерельні файли збережено (local-only)" -Level "INFO"
+                } else {
+                    Write-BRAVOLogRotationMessage -Logger $Logger `
+                        -Message "${ComponentLabel}: SFTP-сесія недоступна — передачу $($group.ArchiveName) відкладено; джерельні файли збережено для наступного прогону" -Level "WARNING"
+                }
                 continue
             }
 
@@ -12188,6 +12199,7 @@ if (-not $BravoMaintenanceEnabled) {
             -CommandTimeoutSeconds $NativeCommandTimeoutSeconds `
             -IntegrityTimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
             -Session $traceSftpSession `
+            -RemoteDisabled:(-not [bool]$storageEffective.SFTP.Enabled) `
             -RemoteDirectory $traceSftpRemoteDirectory `
             -DestinationIdentity $traceDestinationIdentity `
             -RawSourceRetentionDays $RAW_SOURCE_GRACE_DAYS `
@@ -12211,6 +12223,7 @@ if (-not $BravoMaintenanceEnabled) {
                 -CommandTimeoutSeconds $NativeCommandTimeoutSeconds `
                 -IntegrityTimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
                 -Session $traceSftpSession `
+                -RemoteDisabled:(-not [bool]$storageEffective.SFTP.Enabled) `
                 -RemoteDirectory $exchangeApiSftpRemoteDirectory `
                 -DestinationIdentity $traceDestinationIdentity `
                 -ComponentLabel 'exchangAPI' `
