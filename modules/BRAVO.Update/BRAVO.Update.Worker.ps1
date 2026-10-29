@@ -945,9 +945,19 @@ function New-BRAVOUpdateCliPlan {
         [scriptblock]$Downloader,
         [object]$Now = $null
     )
-    if ([string]::IsNullOrWhiteSpace($WorkRoot)) { $WorkRoot = [System.IO.Path]::GetTempPath() }
-    $workDirectory = Join-Path $WorkRoot ($script:BRAVOUpdateWorkerPlanWorkPrefix + [guid]::NewGuid().ToString('N'))
-    $private = New-BRAVOUpdatePrivateDirectory -Path $workDirectory
+    # N2: елевований процес без явного WorkRoot будує план у захищеному <StagingRoot>\<guid>\work (після перевірки
+    # контейнерів ProgramData), а не у %TEMP% з особистим SID оператора.
+    $planWork = Resolve-BRAVOUpdatePlanWorkRoot -WorkRoot $WorkRoot -StagingRoot ([string]$Paths.StagingRoot) -IsAdministrator ([bool](Test-BRAVOUpdateWorkerIsAdministrator))
+    $childWork = $null
+    if ($planWork.UseChildWorkDirectory) {
+        $childWork = New-BRAVOUpdateChildWorkDirectory -Root $planWork.Root
+        $workDirectory = [string]$childWork.WorkDirectory
+        $private = [pscustomobject]@{ Success = [bool]$childWork.Success; Problems = @($childWork.Problems) }
+    } else {
+        $WorkRoot = $planWork.Root
+        $workDirectory = Join-Path $WorkRoot ($script:BRAVOUpdateWorkerPlanWorkPrefix + [guid]::NewGuid().ToString('N'))
+        $private = New-BRAVOUpdatePrivateDirectory -Path $workDirectory
+    }
     if (-not $private.Success) {
         return [pscustomobject]@{ Plan = $null; Findings = @(New-BRAVOUpdateWorkerFinding -Id 'Plan.WorkDirectory' -Title 'Не вдалося створити робочий каталог плану' -Details ($private.Problems -join '; ') `
                     -Action 'Перевірте доступ до тимчасового каталогу.') }
@@ -984,7 +994,7 @@ function New-BRAVOUpdateCliPlan {
         return [pscustomobject]@{ Plan = $null; Findings = @(New-BRAVOUpdateWorkerFinding -Id 'Plan.Unexpected' -Title 'План не вдалося побудувати' -Details $_.Exception.Message `
                     -Action 'Усуньте причину й повторіть побудову плану.') }
     } finally {
-        Remove-BRAVOUpdateWorkerPlanWorkDirectory -Path $workDirectory -WorkRoot $WorkRoot
+        if ($null -ne $childWork) { Remove-BRAVOUpdateChildWorkDirectory -WorkInfo $childWork } else { Remove-BRAVOUpdateWorkerPlanWorkDirectory -Path $workDirectory -WorkRoot $WorkRoot }
     }
 }
 
@@ -1347,6 +1357,16 @@ function Invoke-BRAVOUpdateCliAction {
         param([string]$Title, [string]$Details)
         $finding = New-BRAVOUpdateWorkerFinding -Id 'Cli.Usage' -Title $Title -Details $Details -Action 'Перевірте параметри (див. docs\installer\ENGINE_DESIGN.md, розділ 10.2).'
         & $done 80 (New-BRAVOUpdateCliUsageResult -Action $Action -Finding @($finding))
+    }
+    # N1: елевований процес ПЕРШИМ кроком перевіряє корені engine разом із контейнерами ProgramData для КОЖНОЇ дії (навіть
+    # read-only: GetEffectiveConfiguration виконує згенерований скрипт). Mutation-дії ще й створюють/виправляють корені;
+    # read-only лише перевіряють. Неелевований процес нічого не створює й не перевіряє тут (user work dir).
+    if ($isAdmin -and (@('Initialize') -cnotcontains $Action)) {
+        $topMutating = (@('Execute', 'Install', 'Update', 'Repair', 'Recover') -contains $Action)
+        $topRoots = Initialize-BRAVOUpdateProtectedRoots -Paths $Paths -Validate:(-not $topMutating)
+        if (-not $topRoots.Success) {
+            return (& $done 80 (New-BRAVOUpdateCliUsageResult -Action $Action -Finding @($topRoots.Findings)))
+        }
     }
     $stateArguments = @{ RuntimeRoot = $RuntimeRoot; CandidateRoots = $CandidateRoots; Paths = $Paths; Adapter = $Adapter; IncludeScheduler = $useDefaultAdapter }
     $preflightFor = {

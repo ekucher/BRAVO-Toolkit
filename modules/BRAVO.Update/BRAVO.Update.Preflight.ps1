@@ -766,8 +766,18 @@ function Test-BRAVODeploymentPreflight {
     # процес довіряє особистому SID (див. Get-BRAVOUpdateTrustedSid), елевований engine
     # перевіряє суворіше й підтвердить або заблокує остаточно.
     try {
-        $rootCheck = Initialize-BRAVOUpdateProtectedRoots -Validate -Paths ([pscustomobject]@{ StateRoot = $StateRoot; LockRoot = $LockRoot; StagingRoot = $StagingRoot; BackupRoot = $BackupRoot })
-        if ($rootCheck.Success) {
+        $rootArguments = @{ Validate = $true; Paths = ([pscustomobject]@{ StateRoot = $StateRoot; LockRoot = $LockRoot; StagingRoot = $StagingRoot; BackupRoot = $BackupRoot }) }
+        # Seam тестів (adapter): імітація читача ACL, який кидає UnauthorizedAccessException.
+        if ($adapterTable.ContainsKey('ReadRootAcl') -and ($adapterTable['ReadRootAcl'] -is [scriptblock])) { $rootArguments['AclReader'] = $adapterTable['ReadRootAcl'] }
+        if ($adapterTable.ContainsKey('RootAdminCheck') -and ($adapterTable['RootAdminCheck'] -is [scriptblock])) { $rootArguments['AdminCheck'] = $adapterTable['RootAdminCheck'] }
+        $rootCheck = Initialize-BRAVOUpdateProtectedRoots @rootArguments
+        if ($rootCheck.Success -and @($rootCheck.Deferred).Count -gt 0) {
+            Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.StateRootsDeferred' -Severity 'Warning' `
+                -Title 'Перевірку власника/прав каталогів стану буде виконано elevated worker-ом' `
+                -Meaning 'Неелевований процес не може прочитати права каталогів, закритих для Administrators/SYSTEM; це не ознака небезпеки.' `
+                -Action 'Продовжуйте: elevated worker перевірить каталоги перед виконанням і заблокує операцію, якщо вони небезпечні.' `
+                -Details ('відкладено: ' + @($rootCheck.Deferred).Count)
+        } elseif ($rootCheck.Success) {
             Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.StateRoots' -Severity 'Ok' `
                 -Title 'Каталоги стану engine мають довіреного власника й права' -Meaning 'Перевірено власника, успадкування, права Users і reparse points наявних каталогів.' `
                 -Details ('відсутні (створить engine): ' + @($rootCheck.Missing).Count)

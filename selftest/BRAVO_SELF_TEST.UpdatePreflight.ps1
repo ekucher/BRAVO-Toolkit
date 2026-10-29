@@ -70,6 +70,22 @@
         & {
             $r = & $call $null
             Test-BRAVOCondition -Condition (@(@($r.findings) | Where-Object { $_.id -ceq 'Preflight.StateRoots' -and $_.severity -ceq 'Ok' }).Count -eq 1) -Name 'UpdatePreflight/StateRootsValidatedOk' -Failure 'Захищені корені мають давати Ok-finding Preflight.StateRoots'
+            # Відмова читання ACL кореня: неелевований процес -> Warning (перевірку виконає worker), елевований -> Blocker.
+            $denyReader = { param($Path) throw (New-Object System.UnauthorizedAccessException('READ_CONTROL denied')) }
+            foreach ($elevatedCase in @($false, $true)) {
+                $isElevatedCase = $elevatedCase
+                $adminCheck = { $isElevatedCase }.GetNewClosure()
+                $deniedArgs = @{ Operation = 'Update'; RuntimeRoot = $rt; StateRoot = $st; LockRoot = $lk; OperationLockPath = $opLock
+                    StagingRoot = $sg; BackupRoot = $bk; Adapter = @{ GetPreflightEnvironment = $envOk; GetManagedTasks = { @() }; ReadRootAcl = $denyReader; RootAdminCheck = $adminCheck } }
+                $denied = & $pfTModule { param($x) Test-BRAVODeploymentPreflight @x } $deniedArgs
+                $deferredFinding = @(@($denied.findings) | Where-Object { $_.id -ceq 'Preflight.StateRootsDeferred' })
+                $blockedFinding = @(@($denied.findings) | Where-Object { $_.id -ceq 'Preflight.StateRoots' -and $_.severity -ceq 'Blocker' })
+                if (-not $isElevatedCase) {
+                    Test-BRAVOCondition -Condition (($deferredFinding.Count -eq 1) -and ($deferredFinding[0].severity -ceq 'Warning') -and ($blockedFinding.Count -eq 0)) -Name 'UpdatePreflight/StateRootsAclDeniedUnelevatedDeferred' -Failure ('deferred=' + $deferredFinding.Count + ' blocker=' + $blockedFinding.Count)
+                } else {
+                    Test-BRAVOCondition -Condition (($blockedFinding.Count -eq 1) -and ($deferredFinding.Count -eq 0) -and (-not $denied.canProceed)) -Name 'UpdatePreflight/StateRootsAclDeniedElevatedBlocks' -Failure ('deferred=' + $deferredFinding.Count + ' blocker=' + $blockedFinding.Count)
+                }
+            }
             Test-BRAVOCondition -Condition ($r.canProceed -and $r.blockerCount -eq 0) -Name 'UpdatePreflight/HealthyUpdateProceeds' -Failure 'Здорове оновлення має проходити без blocker-ів'
             Test-BRAVOCondition -Condition ($r.operation -eq 'Update' -and $r.runtimeRoot -eq $rt) -Name 'UpdatePreflight/ResultShape' -Failure 'operation/runtimeRoot не відображено'
             $allPrefixed = $true; $blockerActionOk = $true

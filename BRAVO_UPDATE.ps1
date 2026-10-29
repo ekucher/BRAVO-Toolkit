@@ -54,6 +54,53 @@ function Wait-BRAVOEarlyManualExit {
     }
 }
 
+function Test-BRAVOUpdateScriptRootTrusted {
+    # H1/P3 #9: елевований процес не повинен виконувати код (guard, модулі BRAVO.Update) із каталогу, який може змінити
+    # звичайний користувач. Перевіряємо сам каталог і КОЖНОГО предка: власник Administrators/SYSTEM/TrustedInstaller,
+    # немає reparse point, немає Allow-ACE недовірених із правами запису/видалення/зміни прав (InheritOnly не рахується;
+    # на предках допустиме лише створення нових елементів — типово для кореня диска). Дублюється свідомо: модуль BRAVO.Update
+    # ще не імпортований (імпорт із недовіреного каталогу і є ризиком), тому це єдина функція entrypoint-а без залежностей.
+    # -AclReader — seam тестів (param($Path) -> ACL).
+    param([Parameter(Mandatory = $true)][string]$Path, [scriptblock]$AclReader = $null)
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $trusted = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464', 'S-1-3-4')
+    $rights = [System.Security.AccessControl.FileSystemRights]
+    $writeMask = [int]($rights::WriteData -bor $rights::AppendData -bor $rights::WriteExtendedAttributes -bor $rights::WriteAttributes -bor $rights::DeleteSubdirectoriesAndFiles -bor $rights::Delete -bor $rights::ChangePermissions -bor $rights::TakeOwnership)
+    $createMask = [int]($rights::WriteData -bor $rights::AppendData)
+    try {
+        $current = [System.IO.Path]::GetFullPath($Path)
+        if ($current.Length -gt [System.IO.Path]::GetPathRoot($current).Length) { $current = $current.TrimEnd('\') }
+        $isSelf = $true
+        while (-not [string]::IsNullOrEmpty($current)) {
+            try {
+                if (([System.IO.File]::GetAttributes($current) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $problems.Add('reparse point: ' + $current) }
+                $acl = $null
+                if ($null -ne $AclReader) { $acl = & $AclReader $current } else { $acl = Get-Acl -LiteralPath $current }
+                $ownerSid = [string]$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+                if ($trusted -notcontains $ownerSid) { $problems.Add('власник ' + $ownerSid + ': ' + $current) }
+                foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+                    if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+                    if ($trusted -contains [string]$rule.IdentityReference.Value) { continue }
+                    if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+                    $bits = ([int]$rule.FileSystemRights) -band $writeMask
+                    if (-not $isSelf) { $bits = $bits -band (-bnot $createMask) }
+                    if ($bits -ne 0) { $problems.Add('запис для ' + [string]$rule.IdentityReference.Value + ' (' + [string]$rule.FileSystemRights + '): ' + $current) }
+                }
+            } catch {
+                $problems.Add('не вдалося перевірити ' + $current + ': ' + $_.Exception.Message)
+            }
+            $isSelf = $false
+            $parent = [System.IO.Path]::GetDirectoryName($current)
+            if ([string]::IsNullOrEmpty($parent) -or $parent -eq $current) { break }
+            $current = $parent
+        }
+    } catch {
+        $problems.Add('шлях не розібрано: ' + $_.Exception.Message)
+    }
+    return [pscustomobject]@{ IsTrusted = ($problems.Count -eq 0); Problems = $problems.ToArray() }
+}
+
 function Invoke-BRAVOUpdateEntryGuard {
     # Guard-блок (патерн BRAVO_CONFIGURATOR.ps1) в ІЗОЛЬОВАНІЙ області функції:
     # dot-source guard-скрипта виконує його param-блок (RuntimeRoot, Mode тощо)
@@ -86,6 +133,26 @@ function Invoke-BRAVOUpdateEntryGuard {
         -Mode $guardMode -NoWrite
     if ((-not $versionState.IsValid) -and $versionState.ShouldBlock) { return [pscustomobject]@{ Code = 35; Message = [string]$versionState.Message } }
     return [pscustomobject]@{ Code = 0; Message = '' }
+}
+
+# H1/P3 #9: mutation з правами адміністратора лише з каталогу, який не може змінити звичайний користувач. Перевірка
+# ДО guard і імпорту модуля (обидва виконують код із цього каталогу). Read-only дії дозволені.
+if (@('Execute', 'Install', 'Update', 'Repair', 'Recover', 'Initialize') -contains $Action) {
+    $scriptIsElevated = $false
+    try {
+        $scriptIsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        $scriptIsElevated = $true
+    }
+    if ($scriptIsElevated) {
+        $scriptRootTrust = Test-BRAVOUpdateScriptRootTrusted -Path $PSScriptRoot
+        if (-not $scriptRootTrust.IsTrusted) {
+            Write-Host 'Запустіть з захищеного каталогу (Program Files або розпакований носій з правами лише адміністраторів): поточний каталог комплекту доступний на запис не лише адміністраторам.' -ForegroundColor Red
+            if (-not $AsJson) { foreach ($trustProblem in @($scriptRootTrust.Problems | Select-Object -First 5)) { Write-Host ('  ' + $trustProblem) -ForegroundColor Yellow } }
+            Wait-BRAVOEarlyManualExit -NoPause:(-not $pauseAllowed)
+            exit 80
+        }
+    }
 }
 
 $entryGuard = Invoke-BRAVOUpdateEntryGuard -ToolkitRoot $PSScriptRoot
