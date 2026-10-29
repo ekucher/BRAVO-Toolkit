@@ -1,4 +1,4 @@
-# Suite UpdateDeploy: фазовий двигун, файловий набір, перевірене копіювання і
+﻿# Suite UpdateDeploy: фазовий двигун, файловий набір, перевірене копіювання і
 # orchestrator Update/Repair (INS-042/044, ENGINE_DESIGN розділи 2 і 4).
 # Усе в sandbox у тимчасовому каталозі з унікальним GUID (пробіли й кирилиця в
 # шляхах); adapter завжди stub; Task Scheduler, credentials і C:\ProgramData\BRAVO
@@ -101,7 +101,7 @@ function script:Invoke-BRAVORollback {
     $runtime = [string]$Journal.runtimeRoot
     $backupRuntime = Join-Path ([string]$Journal.backup.path) 'runtime'
     $keysDoc = Get-Content -LiteralPath (Join-Path $Context.OperationDirectory 'deploy-keys.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    foreach ($p in $keysDoc.keys.PSObject.Properties) {
+    foreach ($p in $keysDoc.deployKeys.PSObject.Properties) {
         $inBackup = Join-Path $backupRuntime ($p.Name -replace '/', '\')
         $target = Join-Path $runtime ($p.Name -replace '/', '\')
         if (-not [IO.File]::Exists($inBackup) -and [IO.File]::Exists($target)) { [IO.File]::Delete($target) }
@@ -230,7 +230,7 @@ function script:Invoke-BRAVORollback {
         }
 
         function New-E2Sandbox {
-            param([string]$Name, $Release, [ValidateSet('Update', 'Repair')][string]$Action = 'Update', [string]$InstalledVersion = '5.2.6', [switch]$WithUnknownOther, [switch]$WithRogueScript, [string]$RepairReleaseStage = '')
+            param([string]$Name, $Release, [ValidateSet('Update', 'Repair')][string]$Action = 'Update', [string]$InstalledVersion = '5.2.6', [switch]$WithUnknownOther, [switch]$WithRogueScript, [string]$RepairReleaseStage = '', [switch]$NoCorrupt)
             $base = Join-Path $deployTestRoot ($Name + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
             $runtime = Join-Path $base 'Програми Toolkit\runtime'
             if ($Action -eq 'Update') {
@@ -240,7 +240,7 @@ function script:Invoke-BRAVORollback {
                 [void](New-Item -ItemType Directory -Path $runtime -Force)
                 Copy-Item -Path (Join-Path $RepairReleaseStage '*') -Destination $runtime -Recurse -Force
                 Add-E2SiteFiles -Runtime $runtime
-                Write-E2File (Join-Path $runtime 'BRAVO_RUNTIME_GUARD.ps1') '# CORRUPTED guard'
+                if (-not $NoCorrupt) { Write-E2File (Join-Path $runtime 'BRAVO_RUNTIME_GUARD.ps1') '# CORRUPTED guard' }
             }
             $sb = [ordered]@{
                 Base = $base; Runtime = $runtime
@@ -250,17 +250,17 @@ function script:Invoke-BRAVORollback {
             [void](New-Item -ItemType Directory -Path $sb.State -Force)
             [void](New-Item -ItemType Directory -Path $sb.Lock -Force)
             Write-E2File $sb.VersionState '{"highestVersion":"5.2.6","highestVersionFull":"5.2.6"}'
-            $state = @{ Hook = $null; Offset = 0 }
+            $state = @{ Hook = $null; Offset = 0; Running = $false; Tasks = @{ BRAVO_A = $true; BRAVO_B = $false } }
             $sb['AdapterState'] = $state
             $sb['Adapter'] = @{
-                GetManagedTasks       = { if ($null -ne $state.Hook) { & $state.Hook }; @([pscustomobject]@{ Name = 'BRAVO_A'; Path = '\BRAVO\'; Exists = $true; State = 'Ready'; Enabled = $true }, [pscustomobject]@{ Name = 'BRAVO_B'; Path = '\BRAVO\'; Exists = $true; State = 'Ready'; Enabled = $false }) }.GetNewClosure()
-                SetTaskEnabled        = { param($TaskPath, $Name, $Enabled) [pscustomobject]@{ Success = $true; Message = '' } }
+                GetManagedTasks       = { param($TaskPath, $RuntimeRoot) if ($null -ne $state.Hook) { & $state.Hook }; $st = 'Ready'; if ($state.Running) { $st = 'Running' }; @(foreach ($n in @('BRAVO_A', 'BRAVO_B')) { [pscustomobject]@{ Name = $n; Path = '\BRAVO\'; Exists = $true; State = $st; Enabled = [bool]$state.Tasks[$n] } }) }.GetNewClosure()
+                SetTaskEnabled        = { param($TaskPath, $Name, $Enabled) $state.Tasks[$Name] = [bool]$Enabled; [pscustomobject]@{ Success = $true; Message = '' } }.GetNewClosure()
                 InvokeGuard           = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = 0; Output = ''; TimedOut = $false } }
                 InvokeSetupScheduler  = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = 0; Output = ''; TimedOut = $false } }
                 InvokeSetupValidate   = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = 0; Output = ''; TimedOut = $false } }
                 InvokeSelfTest        = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = 0; Output = ''; TimedOut = $false } }
                 TestCredentialPresence = { param($RuntimeRoot, $Component) [pscustomobject]@{ Component = $Component; Presence = 'Found'; ExitCode = 0 } }
-                GetEffectiveConfiguration = { param($RuntimeRoot) [pscustomobject]@{ Success = $true; ExitCode = 0; Configuration = $null; Message = '' } }
+                GetEffectiveConfiguration = { param($RuntimeRoot) [pscustomobject]@{ Success = $true; ExitCode = 0; Message = ''; Configuration = [pscustomobject]@{ schedulerSettings = [pscustomobject]@{ TaskPath = '\BRAVO\'; Backup = [pscustomobject]@{ TaskName = 'BRAVO_A'; Enabled = $true }; Maintenance = [pscustomobject]@{ TaskName = 'BRAVO_B'; Enabled = $false } } } } }
                 Now                   = { [datetime]::UtcNow.AddMinutes($state.Offset) }.GetNewClosure()
             }
             $source = [pscustomobject][ordered]@{ kind = 'Offline'; tag = $Release.Tag; artifactName = $Release.ZipName; artifactSha256 = $Release.ZipSha; manifestSha256 = $Release.ManifestSha
@@ -293,7 +293,18 @@ function script:Invoke-BRAVORollback {
             return (Read-BRAVOUpdateJournal -Path (Get-BRAVOUpdateJournalPath -StateRoot $Sandbox.State -OperationId ([string]$Sandbox.Plan.operationId))).Journal
         }
         function Get-E2CallList { return @(& $deployTestModule $getCalls) }
-        function Test-E2LocksFree {
+        function Get-E2RollbackCount {
+            # Заглушка пише виклики в E2Calls; реальний Rollback лишає слід у журналі (стан/rollbackAttempts).
+            param($Sandbox)
+            $stubCalls = @(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count
+            if ($stubCalls -gt 0) { return $stubCalls }
+            $journalPath = Get-BRAVOUpdateJournalPath -StateRoot $Sandbox.State -OperationId ([string]$Sandbox.Plan.operationId)
+            if (-not [IO.File]::Exists($journalPath)) { return 0 }
+            $journal = (Read-BRAVOUpdateJournal -Path $journalPath).Journal
+            if ($null -eq $journal) { return 0 }
+            if (@('RolledBack', 'Critical') -contains [string]$journal.state) { return 1 }
+            return 0
+        }        function Test-E2LocksFree {
             param($Sandbox)
             $life = Enter-BRAVOUpdateLifecycleLock -LockRoot $Sandbox.Lock -OperationId ([guid]::NewGuid().ToString())
             $op = Enter-BRAVOUpdateOperationLock -OperationLockPath $Sandbox.OpLock -OperationId ([guid]::NewGuid().ToString()) -PackageVersion '0'
@@ -405,7 +416,7 @@ function script:Invoke-BRAVORollback {
             $opDir = Join-Path $deployTestRoot 'opdir keys'
             $keys = Save-BRAVODeploymentKeySet -FileSet $set -OperationDirectory $opDir
             $parsed = Get-Content -LiteralPath $keys.Path -Raw -Encoding UTF8 | ConvertFrom-Json
-            Test-BRAVOCondition -Condition (($keys.Sha256 -eq (Get-E2Sha -Path $keys.Path)) -and ($parsed.schemaVersion -eq 1) -and (@($parsed.remove).Count -eq 2) -and ($null -ne $parsed.keys.PSObject.Properties['VERSION.json'])) -Name 'UpdateDeploy/KeySet-Saved' -Failure 'deploy-keys.json: схема, ключі, remove, SHA-256 файлу.'
+            Test-BRAVOCondition -Condition (($keys.Sha256 -eq (Get-E2Sha -Path $keys.Path)) -and ($parsed.schemaVersion -eq 1) -and (@($parsed.remove).Count -eq 2) -and ($null -ne $parsed.deployKeys.PSObject.Properties['VERSION.json'])) -Name 'UpdateDeploy/KeySet-Saved' -Failure 'deploy-keys.json: схема, ключі, remove, SHA-256 файлу.'
         }
 
         # ================================================================
@@ -512,7 +523,7 @@ function script:Invoke-BRAVORollback {
             $siteSha = Get-E2TreeHash -Root (Join-Path $sb.Runtime 'LOGS')
             $result = Invoke-E2Deploy -Sandbox $sb
             $validity = Test-BRAVOUpdateDeploymentResult -InputObject $result
-            Test-BRAVOCondition -Condition (($result.status -eq 'Success') -and ($result.exitCode -eq 0) -and $validity.IsValid) -Name 'UpdateDeploy/Orchestrator-Success' -Failure ('Повний успіх очікується; status=' + $result.status + ' findings=' + ((Get-E2FindingIds -Result $result) -join ',') + ' problems=' + ($validity.Problems -join ';'))
+            Test-BRAVOCondition -Condition (($result.status -eq 'Success') -and ($result.exitCode -eq 0) -and $validity.IsValid) -Name 'UpdateDeploy/Orchestrator-Success' -Failure ('Повний успіх очікується; status=' + $result.status + ' findings=' + ((@($result.findings) | ForEach-Object { $_.id + '[' + $_.details + ']' }) -join ',') + ' problems=' + ($validity.Problems -join ';'))
             $match = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $sb.Runtime -ManifestPath (Join-Path $release.Stage 'RUNTIME_MANIFEST.json') -ExcludeDirs @((Get-BRAVOUpdateSiteOwnedPaths).Dirs)
             Test-BRAVOCondition -Condition ($match.IsMatch -and ($siteSha -eq (Get-E2TreeHash -Root (Join-Path $sb.Runtime 'LOGS')))) -Name 'UpdateDeploy/Orchestrator-RuntimeAndSiteState' -Failure 'Runtime == staged, LOGS без змін.'
             $journal = Read-E2Journal -Sandbox $sb
@@ -525,7 +536,7 @@ function script:Invoke-BRAVORollback {
             $monotonic = $true; for ($i = 1; $i -lt $events.Count; $i++) { if ([long]$events[$i].sequence -le [long]$events[$i - 1].sequence) { $monotonic = $false } }
             Test-BRAVOCondition -Condition (($events.Count -gt 10) -and $monotonic -and ($events[$events.Count - 1].phase -eq 'Commit') -and ($events[$events.Count - 1].status -eq 'Completed')) -Name 'UpdateDeploy/Orchestrator-ProgressMonotonic' -Failure 'Прогрес: sequence зростає, останнє — Commit/Completed.'
             Test-BRAVOCondition -Condition ([IO.File]::Exists((Join-Path $opDir 'deploy-keys.json')) -and [IO.File]::Exists((Join-Path $opDir 'scheduler-snapshot.json'))) -Name 'UpdateDeploy/Orchestrator-OperationDirArtifacts' -Failure 'deploy-keys.json і scheduler-snapshot.json у каталозі операції.'
-            Test-BRAVOCondition -Condition (@(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count -eq 0 -or $stubbed -notcontains 'Invoke-BRAVORollback') -Name 'UpdateDeploy/Orchestrator-NoRollbackOnSuccess' -Failure 'Rollback не викликається при успіху.'
+            Test-BRAVOCondition -Condition ((Get-E2RollbackCount -Sandbox $sb) -eq 0 -or $stubbed -notcontains 'Invoke-BRAVORollback') -Name 'UpdateDeploy/Orchestrator-NoRollbackOnSuccess' -Failure 'Rollback не викликається при успіху.'
 
             # Replay того самого плану
             $again = Invoke-E2Deploy -Sandbox $sb
@@ -606,9 +617,7 @@ function script:Invoke-BRAVORollback {
 
             # керована задача виконується
             $rt = New-E2Sandbox -Name 'taskrunning' -Release $release
-            $rtState = $rt.AdapterState
-            $rtState['Calls'] = 0
-            $rt.Adapter['GetManagedTasks'] = { $rtState['Calls'] = [int]$rtState['Calls'] + 1; $st = 'Ready'; if ([int]$rtState['Calls'] -ge 2) { $st = 'Running' }; @([pscustomobject]@{ Name = 'BRAVO_A'; Path = '\BRAVO\'; Exists = $true; State = $st; Enabled = $true }) }.GetNewClosure()
+            $rt.AdapterState['Running'] = $true
             $rtBefore = Get-E2TreeHash -Root $rt.Runtime
             $rtr = Invoke-E2Deploy -Sandbox $rt
             Assert-E2PreMutationFailure -Name 'TaskRunning' -Sandbox $rt -Result $rtr -Reason 'Blocked' -Before $rtBefore
@@ -650,7 +659,7 @@ function script:Invoke-BRAVORollback {
                 $sb = New-E2Sandbox -Name ('throw-' + $phaseName) -Release $release
                 $before = Get-E2TreeHash -Root $sb.Runtime
                 $r = Invoke-E2Deploy -Sandbox $sb -Fault @{ ($phaseName + '.Before') = 'Throw' }
-                $rollbackCalls = @(Get-E2CallList | Where-Object { $_ -like 'Rollback*' })
+                $rollbackCalls = @(for ($ri = 0; $ri -lt (Get-E2RollbackCount -Sandbox $sb); $ri++) { $ri })
                 Test-BRAVOCondition -Condition (($r.status -eq 'Failed') -and ($r.reasonCode -eq 'Error') -and (-not $r.mutationStarted) -and ($before -eq (Get-E2TreeHash -Root $sb.Runtime)) -and ($rollbackCalls.Count -eq 0)) -Name ('UpdateDeploy/Throw-' + $phaseName + '-Before-PreMutation') -Failure ('Throw у ' + $phaseName + ' до межі: Failed/Error, runtime незмінний, rollback не викликано; status=' + $r.status + '/' + $r.reasonCode)
                 $journal = Read-E2Journal -Sandbox $sb
                 Test-BRAVOCondition -Condition (([string]$journal.state -eq 'Abandoned') -and (Test-E2LocksFree -Sandbox $sb)) -Name ('UpdateDeploy/Throw-' + $phaseName + '-AbandonedLocksFree') -Failure 'Журнал Abandoned, lock-и вільні.'
@@ -668,7 +677,7 @@ function script:Invoke-BRAVORollback {
                 $sb = New-E2Sandbox -Name ('throw-' + $phaseName) -Release $release
                 $before = Get-E2TreeHash -Root $sb.Runtime
                 $r = Invoke-E2Deploy -Sandbox $sb -Fault @{ ($phaseName + '.Before') = 'Throw' }
-                $rollbackCalls = @(Get-E2CallList | Where-Object { $_ -like 'Rollback*' })
+                $rollbackCalls = @(for ($ri = 0; $ri -lt (Get-E2RollbackCount -Sandbox $sb); $ri++) { $ri })
                 Test-BRAVOCondition -Condition (($r.status -eq 'RolledBack') -and ($r.exitCode -eq 81) -and $r.mutationStarted -and ($rollbackCalls.Count -eq 1)) -Name ('UpdateDeploy/Throw-' + $phaseName + '-RollbackInvoked') -Failure ('Throw у ' + $phaseName + ' після межі: RolledBack, Invoke-BRAVORollback викликано один раз; status=' + $r.status + ' calls=' + $rollbackCalls.Count)
                 if ($stubbed -contains 'Invoke-BRAVORollback') {
                     Test-BRAVOCondition -Condition ($before -eq (Get-E2TreeHash -Root $sb.Runtime)) -Name ('UpdateDeploy/Throw-' + $phaseName + '-RuntimeRestored') -Failure 'Після відкату runtime == початковий (за хешем).'
@@ -690,7 +699,7 @@ function script:Invoke-BRAVORollback {
             $pf = New-E2Sandbox -Name 'partial' -Release $release
             $pfBefore = Get-E2TreeHash -Root $pf.Runtime
             $pr = Invoke-E2Deploy -Sandbox $pf -Fault @{ 'Deploy.AfterFileCount' = 2 }
-            Test-BRAVOCondition -Condition (($pr.status -eq 'RolledBack') -and (@(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count -eq 1)) -Name 'UpdateDeploy/Throw-PartialDeploy-RolledBack' -Failure 'Збій посеред копіювання: RolledBack.'
+            Test-BRAVOCondition -Condition (($pr.status -eq 'RolledBack') -and ((Get-E2RollbackCount -Sandbox $pf) -eq 1)) -Name 'UpdateDeploy/Throw-PartialDeploy-RolledBack' -Failure 'Збій посеред копіювання: RolledBack.'
             if ($stubbed -contains 'Invoke-BRAVORollback') { Test-BRAVOCondition -Condition ($pfBefore -eq (Get-E2TreeHash -Root $pf.Runtime)) -Name 'UpdateDeploy/Throw-PartialDeploy-Restored' -Failure 'Після часткового розгортання й відкату runtime повернувся.' }
 
             # Activate: збій після успішної Validate не відкочує
@@ -699,7 +708,7 @@ function script:Invoke-BRAVORollback {
             $avr = Invoke-E2Deploy -Sandbox $av -Fault @{ 'Activate.Before' = 'Throw' }
             $avJournal = Read-E2Journal -Sandbox $av
             $avMatch = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $av.Runtime -ManifestPath (Join-Path $release.Stage 'RUNTIME_MANIFEST.json') -ExcludeDirs @((Get-BRAVOUpdateSiteOwnedPaths).Dirs)
-            Test-BRAVOCondition -Condition (($avr.status -eq 'SuccessWithWarnings') -and ($avr.taskActivation.state -eq 'Unknown') -and ([string]$avJournal.state -eq 'Committed') -and $avMatch.IsMatch -and (@(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count -eq 0)) -Name 'UpdateDeploy/Throw-Activate-NoRollback' -Failure ('Збій Activate: SuccessWithWarnings, Unknown, Committed, без rollback; status=' + $avr.status)
+            Test-BRAVOCondition -Condition (($avr.status -eq 'SuccessWithWarnings') -and ($avr.taskActivation.state -eq 'Unknown') -and ([string]$avJournal.state -eq 'Committed') -and $avMatch.IsMatch -and ((Get-E2RollbackCount -Sandbox $av) -eq 0)) -Name 'UpdateDeploy/Throw-Activate-NoRollback' -Failure ('Збій Activate: SuccessWithWarnings, Unknown, Committed, без rollback; status=' + $avr.status)
         }
 
         # ================================================================
@@ -711,13 +720,9 @@ function script:Invoke-BRAVORollback {
             $before = Get-E2TreeHash -Root $sb.Runtime
             $tamperState = @{ Count = 0 }
             $stagedTarget = Join-Path $sb.Staging ($sb.Plan.operationId + '\runtime\BRAVO_CONFIG_LOADER.ps1')
-            $sb.Adapter['GetManagedTasks'] = {
-                $tamperState['Count'] = [int]$tamperState['Count'] + 1
-                if ([IO.File]::Exists($stagedTarget)) { [IO.File]::WriteAllText($stagedTarget, '# TAMPERED', (New-Object System.Text.UTF8Encoding($false))) }
-                @([pscustomobject]@{ Name = 'BRAVO_A'; Path = '\BRAVO\'; Exists = $true; State = 'Ready'; Enabled = $true })
-            }.GetNewClosure()
+            $sb.AdapterState['Hook'] = { if ([IO.File]::Exists($stagedTarget)) { [IO.File]::WriteAllText($stagedTarget, '# TAMPERED', (New-Object System.Text.UTF8Encoding($false))) } }.GetNewClosure()
             $r = Invoke-E2Deploy -Sandbox $sb
-            Test-BRAVOCondition -Condition (($r.status -eq 'RolledBack') -and (@(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count -eq 1)) -Name 'UpdateDeploy/Tamper-StagedAfterVerify-RolledBack' -Failure ('Підміна staged між перевіркою й копіюванням: RolledBack; status=' + $r.status)
+            Test-BRAVOCondition -Condition (($r.status -eq 'RolledBack') -and ((Get-E2RollbackCount -Sandbox $sb) -eq 1)) -Name 'UpdateDeploy/Tamper-StagedAfterVerify-RolledBack' -Failure ('Підміна staged між перевіркою й копіюванням: RolledBack; status=' + $r.status)
             if ($stubbed -contains 'Invoke-BRAVORollback') { Test-BRAVOCondition -Condition ($before -eq (Get-E2TreeHash -Root $sb.Runtime)) -Name 'UpdateDeploy/Tamper-StagedAfterVerify-Restored' -Failure 'Runtime відновлено.' }
 
             # Suspend / Reconcile / Validation збої -> rollback
@@ -735,7 +740,7 @@ function script:Invoke-BRAVORollback {
             & $deployTestModule $clearState
             $gv = New-E2Sandbox -Name 'guardfail' -Release $release
             $gvState = @{ Calls = 0 }
-            $gv.Adapter['InvokeGuard'] = { param($RuntimeRoot, $LogPath) $gvState['Calls'] = [int]$gvState['Calls'] + 1; $code = 0; if ([int]$gvState['Calls'] -ge 2) { $code = 33 }; [pscustomobject]@{ ExitCode = $code; Output = ''; TimedOut = $false } }.GetNewClosure()
+            $gv.Adapter['InvokeGuard'] = { param($RuntimeRoot, $LogPath) $gvState['Calls'] = [int]$gvState['Calls'] + 1; $code = 0; if ([int]$gvState['Calls'] -eq 2) { $code = 33 }; [pscustomobject]@{ ExitCode = $code; Output = ''; TimedOut = $false } }.GetNewClosure()
             $gvr = Invoke-E2Deploy -Sandbox $gv
             Test-BRAVOCondition -Condition (($gvr.status -eq 'RolledBack') -and (@($gvr.validation | Where-Object { $_.name -eq 'Guard' -and $_.status -eq 'Fail' }).Count -ge 1)) -Name 'UpdateDeploy/ValidationFail-RolledBackWithItems' -Failure ('Guard!=0 після Deploy: RolledBack, validation містить Guard/Fail; status=' + $gvr.status)
 
@@ -756,7 +761,7 @@ function script:Invoke-BRAVORollback {
             $crashed = $false
             try { [void](Invoke-E2Deploy -Sandbox $cs -Fault @{ 'Deploy.AfterSideEffect' = 'Crash' }) } catch { if ((Get-BRAVOUpdateExceptionKind -ErrorRecord $_).Kind -eq 'Crash') { $crashed = $true } }
             $csj = Read-E2Journal -Sandbox $cs
-            Test-BRAVOCondition -Condition ($crashed -and ([string]$csj.state -eq 'Open') -and $csj.mutationStarted -and (Test-E2LocksFree -Sandbox $cs) -and (@(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count -eq 0)) -Name 'UpdateDeploy/Crash-NoRollbackJournalOpen' -Failure 'Crash: виняток, журнал Open з mutationStarted, rollback не викликано, lock-и звільнені.'
+            Test-BRAVOCondition -Condition ($crashed -and ([string]$csj.state -eq 'Open') -and $csj.mutationStarted -and (Test-E2LocksFree -Sandbox $cs) -and ((Get-E2RollbackCount -Sandbox $cs) -eq 0)) -Name 'UpdateDeploy/Crash-NoRollbackJournalOpen' -Failure 'Crash: виняток, журнал Open з mutationStarted, rollback не викликано, lock-и звільнені.'
             if ($null -ne (Get-Command -Name 'Invoke-BRAVORecovery' -ErrorAction SilentlyContinue)) {
                 $rec = Invoke-BRAVORecovery -StateRoot $cs.State -LockRoot $cs.Lock -OperationLockPath $cs.OpLock -Adapter $cs.Adapter -VersionStatePath $cs.VersionState
                 $csj2 = Read-E2Journal -Sandbox $cs
@@ -776,13 +781,13 @@ function script:Invoke-BRAVORollback {
             $c1r = Invoke-E2Deploy -Sandbox $c1 -Fault @{ 'Backup.AfterComplete' = 'Cancel' }
             Assert-E2PreMutationFailure -Name 'CancelBefore' -Sandbox $c1 -Result $c1r -Reason 'Cancelled' -Before $c1Before
             Assert-E2Abandoned -Name 'CancelBefore' -Sandbox $c1
-            Test-BRAVOCondition -Condition (@(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count -eq 0) -Name 'UpdateDeploy/CancelBefore-NoRollback' -Failure 'Cancel до межі не викликає rollback.'
+            Test-BRAVOCondition -Condition ((Get-E2RollbackCount -Sandbox $c1) -eq 0) -Name 'UpdateDeploy/CancelBefore-NoRollback' -Failure 'Cancel до межі не викликає rollback.'
             # Cancel після межі
             & $deployTestModule $clearState
             $c2 = New-E2Sandbox -Name 'cancel-after' -Release $release
             $c2Before = Get-E2TreeHash -Root $c2.Runtime
             $c2r = Invoke-E2Deploy -Sandbox $c2 -Fault @{ 'Deploy.AfterComplete' = 'Cancel' }
-            Test-BRAVOCondition -Condition (($c2r.status -eq 'RolledBack') -and ((Get-E2FindingIds -Result $c2r) -contains 'Operation.CancelledAfterMutation') -and (@(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count -eq 1)) -Name 'UpdateDeploy/CancelAfter-RolledBack' -Failure ('Cancel після межі: RolledBack + Operation.CancelledAfterMutation; status=' + $c2r.status)
+            Test-BRAVOCondition -Condition (($c2r.status -eq 'RolledBack') -and ((Get-E2FindingIds -Result $c2r) -contains 'Operation.CancelledAfterMutation') -and ((Get-E2RollbackCount -Sandbox $c2) -eq 1)) -Name 'UpdateDeploy/CancelAfter-RolledBack' -Failure ('Cancel після межі: RolledBack + Operation.CancelledAfterMutation; status=' + $c2r.status)
             if ($stubbed -contains 'Invoke-BRAVORollback') { Test-BRAVOCondition -Condition ($c2Before -eq (Get-E2TreeHash -Root $c2.Runtime)) -Name 'UpdateDeploy/CancelAfter-Restored' -Failure 'Runtime відновлено.' }
             # Cancel перед Activate (U16)
             & $deployTestModule $clearState
@@ -793,7 +798,7 @@ function script:Invoke-BRAVORollback {
             & $deployTestModule $clearState
             $c4 = New-E2Sandbox -Name 'cancel-activate' -Release $release
             $c4r = Invoke-E2Deploy -Sandbox $c4 -Fault @{ 'Activate.AfterIntent' = 'Cancel' }
-            Test-BRAVOCondition -Condition (($c4r.status -eq 'SuccessWithWarnings') -and ((Get-E2FindingIds -Result $c4r) -contains 'Operation.CancelIgnored') -and (@(Get-E2CallList | Where-Object { $_ -like 'Rollback*' }).Count -eq 0)) -Name 'UpdateDeploy/CancelDuringActivate-Ignored' -Failure ('Cancel під час Activate ігнорується з finding; status=' + $c4r.status)
+            Test-BRAVOCondition -Condition (($c4r.status -eq 'SuccessWithWarnings') -and ((Get-E2FindingIds -Result $c4r) -contains 'Operation.CancelIgnored') -and ((Get-E2RollbackCount -Sandbox $c4) -eq 0)) -Name 'UpdateDeploy/CancelDuringActivate-Ignored' -Failure ('Cancel під час Activate ігнорується з finding; status=' + $c4r.status)
         }
 
         # ================================================================
@@ -818,7 +823,7 @@ function script:Invoke-BRAVORollback {
 
             # Scope Scheduler: без staging/backup/deploy
             & $deployTestModule $clearState
-            $ss = New-E2Sandbox -Name 'repair-sched' -Release $releaseRepair -Action Repair -InstalledVersion '5.2.6' -RepairReleaseStage $releaseRepair.Stage
+            $ss = New-E2Sandbox -Name 'repair-sched' -Release $releaseRepair -Action Repair -InstalledVersion '5.2.6' -RepairReleaseStage $releaseRepair.Stage -NoCorrupt
             $ssBefore = Get-E2TreeHash -Root $ss.Runtime
             $ssr = Invoke-E2Deploy -Sandbox $ss -Scope Scheduler -NoSource
             $ssj = Read-E2Journal -Sandbox $ss

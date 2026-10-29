@@ -24,8 +24,8 @@
 #     Invoke-BRAVORuntimeDeploy / Copy-BRAVOUpdateVerifiedFile — файлова частина.
 #   * Remove-BRAVOUpdateOperationDirectory — ЄДИНИЙ дозволений рекурсивний delete
 #     (Recovery викликає його на <journal.stagingRoot|backupRoot>\<opId>).
-#   * Set-BRAVOUpdateJournalField — додаткові поля журналу (baseline, deployKeys,
-#     createdTasks, rollbackAttempts ...) без зміни валідатора контрактів.
+#   * Set-BRAVOUpdateJournalField (частина Rollback, E5) — додаткові поля журналу
+#     (baseline, deployKeys, versionState, createdTasks, rollbackAttempts).
 #
 # LOCK-и і Rollback: orchestrator тримає lifecycle lock і operation lock і
 # викликає Invoke-BRAVORollback з -Context (Context.Handles.LifecycleLock /
@@ -34,8 +34,8 @@
 #
 # Нові поля журналу (поза CONTRACTS §8, валідатор їх пропускає): deployKeys
 # { path, sha256 } — шлях і SHA-256 deploy-keys.json; baseline { siteConfig,
-# versionState, guardExitCode }; createdTasks. Інші частини додають свої через
-# Set-BRAVOUpdateJournalField.
+# guardExitCode }; versionState { present, sha256, recordedVersion, snapshotPath };
+# createdTasks.
 #
 # Фазові виклики лишають проміжні значення у Context.Data (hashtable):
 #   StagingDirectory, StagedRoot, Payload, Verification, FileSet, KeySet, Backup,
@@ -93,6 +93,8 @@ function Get-BRAVOUpdateExceptionKind {
     if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $exception = $ErrorRecord.Exception } elseif ($ErrorRecord -is [System.Exception]) { $exception = $ErrorRecord }
     if ($null -eq $exception) { return $info }
     $info.Message = [string]$exception.Message
+    # Конвенція E5/E6: імітація смерті процесу = повідомлення з цим префіксом.
+    if ($info.Message.StartsWith('BRAVOUpdate.SimulatedCrash', [StringComparison]::Ordinal)) { $info.Kind = 'Crash'; return $info }
     $depth = 0
     while (($null -ne $exception) -and ($depth -lt 8)) {
         if ($exception.Data.Contains('BRAVOUpdateKind')) {
@@ -311,33 +313,6 @@ function Invoke-BRAVOUpdatePhase {
     Invoke-BRAVOUpdateFaultPoint -Context $Context -Point ($Phase + '.AfterComplete')
     if ($phOutput.Count -eq 0) { return $null }
     return $phOutput[$phOutput.Count - 1]
-}
-
-function Set-BRAVOUpdateJournalField {
-    <#
-    .SYNOPSIS
-        Додає/змінює додаткове поле журналу (baseline, deployKeys, createdTasks,
-        rollbackAttempts ...) і персистить через Write-BRAVOUpdateJournal.
-    .DESCRIPTION
-        Валідатор журналу вимагає лише обов'язкові поля CONTRACTS §8 і перевіряє
-        відсутність секретних імен, тому додаткові поля сумісні з Read/Open.
-        Ядрові поля змінювати цією функцією заборонено.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]$Journal,
-        [Parameter(Mandatory = $true)][string]$StateRoot,
-        [Parameter(Mandatory = $true)][string]$Name,
-        [AllowNull()]$Value
-    )
-
-    $coreFields = @('schemaVersion', 'operationId', 'planId', 'action', 'state', 'runtimeRoot', 'stagingRoot', 'backupRoot', 'artifactSha256', 'sourceVersion', 'targetVersion', 'mutationStarted', 'phases', 'lastCompletedPhase', 'backup', 'schedulerSnapshot', 'createdOwnership', 'createdUtc', 'updatedUtc')
-    if ($Name -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') { throw "BRAVO.Update: некоректне ім'я поля журналу '$Name'." }
-    if ($coreFields -ccontains $Name) { throw "BRAVO.Update: ядрове поле журналу '$Name' змінюється лише власним мутатором." }
-    $existing = $Journal.PSObject.Properties[$Name]
-    if ($null -ne $existing) { $existing.Value = $Value } else { Add-Member -InputObject $Journal -MemberType NoteProperty -Name $Name -Value $Value }
-    [void](Write-BRAVOUpdateJournal -Journal $Journal -StateRoot $StateRoot)
-    return $Journal
 }
 
 function Get-BRAVOUpdateArrayProperty {
@@ -599,7 +574,7 @@ function Save-BRAVODeploymentKeySet {
     .SYNOPSIS
         Зберігає deploy-keys.json у каталозі операції атомарно: { Path, Sha256 }.
     .DESCRIPTION
-        Формат: { schemaVersion, keys { ключ: SHA-256 }, remove [ключі] }. Rollback
+        Формат: { schemaVersion, deployKeys { ключ: SHA-256 }, remove [ключі] }. Rollback
         (-OwnedKeyList) читає цей файл; SHA-256 файлу фіксується в журналі, щоб
         підміна набору між deploy і rollback була помітною.
     #>
@@ -611,7 +586,7 @@ function Save-BRAVODeploymentKeySet {
 
     $document = [pscustomobject][ordered]@{
         schemaVersion = 1
-        keys          = $FileSet.DeployKeys
+        deployKeys    = $FileSet.DeployKeys
         remove        = @($FileSet.Remove)
     }
     $path = Join-Path $OperationDirectory 'deploy-keys.json'
@@ -976,6 +951,15 @@ function Open-BRAVOUpdateOperation {
 
         # --- U4: каталог операції, журнал, контекст ---
         $operationDirectory = Join-Path (Join-Path $Paths.StateRoot 'Operations') $operationId
+        if ([IO.Directory]::Exists($operationDirectory)) {
+            # Worker міг заздалегідь створити каталог лише з request.json і control\; будь-що інше = Blocked.
+            $foreign = @([IO.Directory]::GetFileSystemEntries($operationDirectory) | Where-Object { @('request.json', 'control') -cnotcontains [IO.Path]::GetFileName($_) })
+            if ($foreign.Count -gt 0) {
+                Exit-BRAVOUpdateLifecycleLock -Lock $lifecycle
+                return (& $fail 'Blocked' (New-BRAVOUpdateFinding -Id 'Operation.DirectoryNotClean' -Severity Blocker -Title 'Каталог операції вже містить сторонні файли' `
+                            -Meaning 'Очікувалися лише request.json і control; стан каталогу не довірений.' -Action 'Побудуйте новий план (новий operationId).' -Details (($foreign | ForEach-Object { [IO.Path]::GetFileName($_) }) -join ', ')))
+            }
+        }
         [void][IO.Directory]::CreateDirectory($operationDirectory)
         if (([IO.File]::GetAttributes($operationDirectory) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "BRAVO.Update: каталог операції є reparse point: $operationDirectory" }
         [void][IO.Directory]::CreateDirectory((Join-Path $operationDirectory 'control'))
@@ -1197,9 +1181,7 @@ function Invoke-BRAVOUpdateCaptureBaseline {
             param($Context)
             $siteBaseline = Get-BRAVOSiteConfigurationBaseline -RuntimeRoot $Context.Paths.RuntimeRoot
             $schedulerSnapshot = Get-BRAVOSchedulerSnapshot -Adapter $Context.Adapter -RuntimeRoot $Context.Paths.RuntimeRoot
-            $snapshotPath = Join-Path $Context.OperationDirectory 'scheduler-snapshot.json'
-            Write-BRAVOUpdateFileAtomic -Path $snapshotPath -Text (ConvertTo-BRAVOUpdateJson -InputObject $schedulerSnapshot)
-            [void](Set-BRAVOUpdateJournalSchedulerSnapshot -Journal $Context.Journal -Path $snapshotPath -StateRoot $Context.Paths.StateRoot)
+            [void](Save-BRAVOSchedulerSnapshot -Snapshot $schedulerSnapshot -OperationDirectory $Context.OperationDirectory -Journal $Context.Journal -StateRoot $Context.Paths.StateRoot)
             $versionSnapshot = Get-BRAVOVersionStateSnapshot -VersionStatePath $Context.Paths.VersionStatePath -OperationDirectory $Context.OperationDirectory
             $guardExitCode = $null
             if ($Context.Adapter.ContainsKey('InvokeGuard') -and $null -ne $Context.Adapter['InvokeGuard']) {
@@ -1215,16 +1197,13 @@ function Invoke-BRAVOUpdateCaptureBaseline {
             $Context.Data['SchedulerSnapshot'] = $schedulerSnapshot
             $Context.Data['VersionStateSnapshot'] = $versionSnapshot
             $Context.Data['GuardBaselineExitCode'] = $guardExitCode
-            $baseline = [pscustomobject][ordered]@{
-                siteConfig    = $siteBaseline
-                versionState  = [pscustomobject][ordered]@{
-                    present         = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'present')
-                    sha256          = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'sha256')
-                    recordedVersion = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'recordedVersion')
-                    snapshotPath    = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'snapshotPath')
-                }
-                guardExitCode = $guardExitCode
-            }
+            [void](Set-BRAVOUpdateJournalField -Journal $Context.Journal -StateRoot $Context.Paths.StateRoot -Name 'versionState' -Value ([pscustomobject][ordered]@{
+                        present         = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'present')
+                        sha256          = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'sha256')
+                        recordedVersion = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'recordedVersion')
+                        snapshotPath    = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'snapshotPath')
+                    }))
+            $baseline = [pscustomobject][ordered]@{ siteConfig = $siteBaseline; guardExitCode = $guardExitCode }
             [void](Set-BRAVOUpdateJournalField -Journal $Context.Journal -StateRoot $Context.Paths.StateRoot -Name 'baseline' -Value $baseline)
         })
 }
@@ -1546,10 +1525,12 @@ function Invoke-BRAVODeployment {
             $activationPolicy = [string](Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $Plan -Name 'changes') -Name 'scheduler') -Name 'activationPolicy' -Default 'ActivateOnSuccessOnly')
             $taskActivation = $null
             try {
-                $taskActivation = Invoke-BRAVOUpdatePhase -Context $context -Phase 'Activate' -ProgressPhase Activate -Durable -IgnoreCancel -Percent 94 -Action {
+                $activation = Invoke-BRAVOUpdatePhase -Context $context -Phase 'Activate' -ProgressPhase Activate -Durable -IgnoreCancel -Percent 94 -Action {
                     param($Context)
-                    Set-BRAVOTaskActivation -Policy $activationPolicy -Snapshot $Context.Data['SchedulerSnapshot'] -Adapter $Context.Adapter -OutcomeStatus $outcomeStatus
+                    Set-BRAVOTaskActivation -Policy $activationPolicy -Snapshot $Context.Data['SchedulerSnapshot'] -Adapter $Context.Adapter -OutcomeStatus $outcomeStatus -Action $planAction
                 }
+                $taskActivation = Get-BRAVOUpdatePropertyValue -InputObject $activation -Name 'TaskActivation'
+                foreach ($activationFinding in @(Get-BRAVOUpdateArrayProperty -InputObject $activation -Name 'Findings')) { Add-BRAVOUpdateContextFinding -Context $context -Finding $activationFinding }
             } catch {
                 # Після успішної Validate збій Activate не відкочує розгортання: файли вже
                 # перевірені, тож задачі лишаються вимкненими, а оператор бачить Unknown.
