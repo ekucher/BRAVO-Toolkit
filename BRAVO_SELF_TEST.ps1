@@ -16427,6 +16427,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # Пошук по AST, а не підрядком: інакше тест ловив би власні пояснювальні
     # коментарі — на цих граблях ця гілка вже стояла двічі.
     $collapsedJsonUsages = @()
+    $jsonArrayExpressionPredicate = Get-BRAVOSelfTestAstTypePredicate -Type @([System.Management.Automation.Language.ArrayExpressionAst])
+    $jsonPipelinePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @([System.Management.Automation.Language.PipelineAst])
     # -Include мовчки ігнорується разом із -LiteralPath, тому фільтруємо
     # розширення самі; LOGS виключено окремо — там лежить відкритий
     # transcript цього ж прогону.
@@ -16436,31 +16438,34 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $_.FullName -notlike '*\local-backups\*' -and
             $_.FullName -notlike '*\LOGS\*'
         })) {
-        $jsonScriptAst = [System.Management.Automation.Language.Parser]::ParseFile(
-            $jsonScriptPath.FullName, [ref]$null, [ref]$null
-        )
-        $collapsedNode = $jsonScriptAst.Find(
-            {
-                param($node)
-                if ($node -isnot [System.Management.Automation.Language.ArrayExpressionAst]) {
-                    return $false
+        # Файли, які Root/Parser уже розібрав, беруться з кешу прогону; решта
+        # (ci, deploy, Tools...) розбирається напряму й не потрапляє в кеш, щоб
+        # не роздувати купу.
+        if ($script:BRAVOSelfTestParsedFileCache.ContainsKey($jsonScriptPath.FullName)) {
+            $jsonScriptAst = (Get-BRAVOSelfTestParsedFile -Path $jsonScriptPath.FullName).Ast
+        } else {
+            $jsonScriptAst = [System.Management.Automation.Language.Parser]::ParseFile(
+                $jsonScriptPath.FullName, [ref]$null, [ref]$null
+            )
+        }
+        # Предикат на кожному вузлі файлу - виклик scriptblock-а на мільйонах
+        # вузлів; тип вузла відбирає компільований делегат, а сама умова
+        # перевіряється лише на знайдених @(...) / конвеєрах. Результат той
+        # самий: перший за обходом @(...), у якому є потрібний конвеєр.
+        $collapsedNode = $null
+        foreach ($arrayNode in @($jsonScriptAst.FindAll($jsonArrayExpressionPredicate, $true))) {
+            # Всередині @() шукаємо конвеєр, останній елемент якого —
+            # виклик ConvertFrom-Json. Саме він і згортає масив.
+            foreach ($pipelineNode in @($arrayNode.SubExpression.FindAll($jsonPipelinePredicate, $true))) {
+                if ($pipelineNode.PipelineElements.Count -gt 1 -and
+                    ($pipelineNode.PipelineElements[-1] -is [System.Management.Automation.Language.CommandAst]) -and
+                    ([string]$pipelineNode.PipelineElements[-1].GetCommandName()) -eq 'ConvertFrom-Json') {
+                    $collapsedNode = $arrayNode
+                    break
                 }
-                # Всередині @() шукаємо конвеєр, останній елемент якого —
-                # виклик ConvertFrom-Json. Саме він і згортає масив.
-                $inner = $node.SubExpression.Find(
-                    {
-                        param($pipelineNode)
-                        $pipelineNode -is [System.Management.Automation.Language.PipelineAst] -and
-                        $pipelineNode.PipelineElements.Count -gt 1 -and
-                        ($pipelineNode.PipelineElements[-1] -is [System.Management.Automation.Language.CommandAst]) -and
-                        ([string]$pipelineNode.PipelineElements[-1].GetCommandName()) -eq 'ConvertFrom-Json'
-                    },
-                    $true
-                )
-                return ($null -ne $inner)
-            },
-            $true
-        )
+            }
+            if ($null -ne $collapsedNode) { break }
+        }
         if ($null -ne $collapsedNode) {
             $collapsedJsonUsages += $jsonScriptPath.Name
         }
