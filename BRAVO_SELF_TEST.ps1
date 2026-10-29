@@ -19744,11 +19744,33 @@ $credentialSettings = $null
 $operationsReportingSettings = $null
 '@
             $healthOrchestrationProbeScript = @'
+param([string]$Scenarios, [string]$RepositoryRoot, [string]$ProbeParent)
+# Усі сценарії в ОДНОМУ дочірньому процесі (раніше: процес на сценарій; OPT-08).
+# Ізоляція сценарію: власний дочірній scope (& { }), власні ProbeRoot, runtime.ps1
+# і result.json, свіжий Import-Module -Force, глобальні змінні сценарію
+# прибираються перед наступним (так само, як у пробі Maintenance). Канарки
+# ізоляції: сценарій, що побачив слід попереднього, пише ProbeError (fail-closed).
+$probeBaselineGlobals = @{}
+foreach ($probeGlobal in @(Get-Variable -Scope Global)) { $probeBaselineGlobals[$probeGlobal.Name] = $true }
+foreach ($probeScenarioName in @($Scenarios -split ',')) {
+    do {
+        try {
+            & {
 param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
 $ErrorActionPreference = 'Stop'
+$probeLeaks = @()
+if ($null -ne (Get-Variable -Name 'probeIsolationCanary' -ErrorAction SilentlyContinue)) { $probeLeaks += 'probeIsolationCanary' }
+if ($null -ne (Get-Variable -Name 'BRAVOOrchestrationProbeCanary' -Scope Global -ErrorAction SilentlyContinue)) { $probeLeaks += 'global:BRAVOOrchestrationProbeCanary' }
+$probeIsolationCanary = $Scenario
+$global:BRAVOOrchestrationProbeCanary = $Scenario
 $probeResultPath = Join-Path $ProbeRoot 'result.json'
 $probeUtf8 = New-Object Text.UTF8Encoding($false)
 try {
+    # Похідні рядки з незмінних файлів репозиторію будуються один раз на дочірній
+    # процес (рядки, не AST); збій побудови не кешується (кожен сценарій знову
+    # отримає ту саму помилку). runtime.ps1, seed, Import-Module -Force і точка
+    # входу лишаються посценарними.
+    if ($null -eq $script:probeShared) {
     $probeRuntimeText = [IO.File]::ReadAllText(
         (Join-Path $RepositoryRoot 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'), [Text.Encoding]::UTF8)
     $probeParseErrors = $null
@@ -19811,6 +19833,17 @@ try {
         [void]$probeRegion.Remove($probeDefinition.Extent.StartOffset - $probeRegionStart, $probeLength)
         [void]$probeRegion.Insert($probeDefinition.Extent.StartOffset - $probeRegionStart, (' ' * $probeLength))
     }
+    $script:probeShared = @{
+        ParamBlockText = [string]$probeAst.ParamBlock.Extent.Text
+        WrapperParamText = [string]$probeWrapper.Body.ParamBlock.Extent.Text
+        LeadingText = [string]($probeLeadingTexts -join "`n")
+        FunctionTexts = [string]($probeFunctionTexts -join "`n`n")
+        Stubs = [string]$probeStubs
+        RegionText = [string]$probeRegion.ToString()
+        GuardText = [string]$probeGuard.Extent.Text
+    }
+    }
+    $probeShared = $script:probeShared
 
     $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
     $probeTemporaryRoot = Join-Path $ProbeRoot 'TEMP'
@@ -19840,18 +19873,18 @@ try {
         ('$probeHostKey = ''{0}''' -f $(if ($Scenario -eq 'InvalidHostKey') { 'ssh-ed25519 255 self-test' } else { 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' }))
     ) -join "`n"
     $probeGenerated = @(
-        $probeAst.ParamBlock.Extent.Text,
+        $probeShared.ParamBlockText,
         'function Invoke-BRAVOHealth {',
-        $probeWrapper.Body.ParamBlock.Extent.Text,
+        $probeShared.WrapperParamText,
         'Set-StrictMode -Version 2.0',
-        ($probeLeadingTexts -join "`n"),
-        ($probeFunctionTexts -join "`n`n"),
-        $probeStubs,
+        $probeShared.LeadingText,
+        $probeShared.FunctionTexts,
+        $probeShared.Stubs,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
-        $probeRegion.ToString(),
+        $probeShared.RegionText,
         '}',
-        $probeGuard.Extent.Text
+        $probeShared.GuardText
     ) -join "`n"
     $probeGeneratedPath = Join-Path $ProbeRoot 'runtime.ps1'
     [IO.File]::WriteAllText($probeGeneratedPath, $probeGenerated, (New-Object Text.UTF8Encoding($true)))
@@ -19895,7 +19928,22 @@ try {
 } catch {
     $probeResult = [pscustomobject]@{ ProbeError = [string]$_.Exception.Message }
 }
+if (@($probeLeaks).Count -gt 0) {
+    $probeResult = [pscustomobject]@{ ProbeError = ('ізоляцію сценарію порушено: ' + (@($probeLeaks) -join ', ')) }
+}
 [IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
+            } -Scenario $probeScenarioName -RepositoryRoot $RepositoryRoot -ProbeRoot (Join-Path $ProbeParent $probeScenarioName)
+        } catch {
+            # result.json не записано: батьківська частина дасть ProbeError.
+            $null = $_
+        }
+    } while ($false)
+    foreach ($probeGlobal in @(Get-Variable -Scope Global)) {
+        if (-not $probeBaselineGlobals.ContainsKey($probeGlobal.Name)) {
+            Remove-Variable -Name $probeGlobal.Name -Scope Global -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 '@
             $healthOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
             [IO.File]::WriteAllText((Join-Path $healthOrchestrationRoot 'stubs.ps1'), $healthOrchestrationStubs, $healthOrchestrationUtf8)
@@ -19904,17 +19952,21 @@ try {
             [IO.File]::WriteAllText($healthOrchestrationProbePath, $healthOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $healthOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $healthOrchestrationResults = @{}
-            foreach ($healthOrchestrationScenario in @(
-                    'Happy', 'HappyNoSlack', 'Failures', 'FailuresNoSlack', 'ToolIntegrity',
-                    'ToolIntegritySftpDisabled', 'ToolIntegrityWinScpBusy',
-                    'WinScpBusy', 'NotificationFailure', 'EnvironmentPrivilege', 'MonitoringDisabled', 'InsecureWebhook',
-                    'InvalidHostKey'
-                )) {
+            $healthOrchestrationScenarios = @(
+                'Happy', 'HappyNoSlack', 'Failures', 'FailuresNoSlack', 'ToolIntegrity',
+                'ToolIntegritySftpDisabled', 'ToolIntegrityWinScpBusy',
+                'WinScpBusy', 'NotificationFailure', 'EnvironmentPrivilege', 'MonitoringDisabled', 'InsecureWebhook',
+                'InvalidHostKey'
+            )
+            foreach ($healthOrchestrationScenario in $healthOrchestrationScenarios) {
+                [void][IO.Directory]::CreateDirectory((Join-Path $healthOrchestrationRoot $healthOrchestrationScenario))
+            }
+            # Один дочірній процес на всі сценарії (ізоляція сценаріїв — у probe.ps1).
+            $null = & $healthOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $healthOrchestrationProbePath `
+                -Scenarios ($healthOrchestrationScenarios -join ',') -RepositoryRoot $root -ProbeParent $healthOrchestrationRoot
+            foreach ($healthOrchestrationScenario in $healthOrchestrationScenarios) {
                 $healthOrchestrationScenarioRoot = Join-Path $healthOrchestrationRoot $healthOrchestrationScenario
-                [void][IO.Directory]::CreateDirectory($healthOrchestrationScenarioRoot)
-                $null = & $healthOrchestrationHost -NoLogo -NoProfile -NonInteractive `
-                    -ExecutionPolicy Bypass -File $healthOrchestrationProbePath `
-                    -Scenario $healthOrchestrationScenario -RepositoryRoot $root -ProbeRoot $healthOrchestrationScenarioRoot
                 $healthOrchestrationResultPath = Join-Path $healthOrchestrationScenarioRoot 'result.json'
                 $healthOrchestrationResults[$healthOrchestrationScenario] = if (Test-Path -LiteralPath $healthOrchestrationResultPath -PathType Leaf) {
                     [IO.File]::ReadAllText($healthOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
