@@ -242,6 +242,12 @@ function Invoke-BRAVORecovery {
             return (New-BRAVOUpdateRecoveryResult -OperationId $entryOperationId -Status Critical -Findings $found -JournalPath ([string]$entry.Path) -StartedUtc $startedUtc)
         }
 
+        if ([string]$entry.State -ceq 'Critical') {
+            # Журнал Critical: попередній відкат не вдався. Автоматичне відновлення (і повторний
+            # відкат) у v1 не виконується: потрібне ручне втручання, жодних змін не вносимо.
+            return (New-BRAVOUpdateRecoveryResult -OperationId $entryOperationId -Status Critical -Findings @($entry.Finding) -JournalPath ([string]$entry.Path) -StartedUtc $startedUtc)
+        }
+
         $journal = $entry.Journal
         $journalPath = [string]$entry.Path
         $operationId = [string]$journal.operationId

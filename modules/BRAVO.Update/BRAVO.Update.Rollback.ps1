@@ -807,7 +807,8 @@ function Test-BRAVORollbackBackupFiles {
         [Parameter(Mandatory = $true)]$Layout,
         [Parameter(Mandatory = $true)][hashtable]$DeployKeys,
         [string[]]$ExcludeFiles = @(),
-        [string[]]$ExcludeDirs = @()
+        [string[]]$ExcludeDirs = @(),
+        [string]$Action = ''
     )
 
     $problems = New-Object System.Collections.Generic.List[string]
@@ -841,7 +842,13 @@ function Test-BRAVORollbackBackupFiles {
         if ([IO.File]::Exists((Resolve-BRAVODeployTargetPath -Root $RuntimeRoot -Key $safeKey))) { [void]$problems.Add('зайвий (додано розгортанням): ' + $safeKey) }
     }
     $backupManifest = Join-Path $Layout.RuntimeDir 'RUNTIME_MANIFEST.json'
-    if ([IO.File]::Exists($backupManifest)) {
+    if ($Action -ceq 'Repair') {
+        # Repair пошкодженого runtime: до-операційний стан НЕ відповідає здоровому
+        # RUNTIME_MANIFEST.json, тож еталон — сам backup (backup-manifest.json: той самий
+        # формат files{ключ:SHA}); runtime лишається пошкодженим РІВНО як до repair.
+        $match = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $RuntimeRoot -ManifestPath $Layout.ManifestPath -ExcludeDirs $ExcludeDirs
+        foreach ($problem in @($match.Problems)) { [void]$problems.Add([string]$problem) }
+    } elseif ([IO.File]::Exists($backupManifest)) {
         $match = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $RuntimeRoot -ManifestPath $backupManifest -ExcludeDirs $ExcludeDirs
         foreach ($problem in @($match.Problems)) { [void]$problems.Add([string]$problem) }
     } else {
@@ -1099,7 +1106,7 @@ function Invoke-BRAVORollback {
                 if ($null -eq $rb.Layout) { return }
                 $keys = $rb.DeployKeys
                 if ($null -eq $keys) { $keys = Get-BRAVORollbackDeployKeySet -Journal $rb.Journal -OperationDirectory $rb.OperationDirectory }
-                $problems = @(Test-BRAVORollbackBackupFiles -RuntimeRoot $rb.RuntimeRoot -Layout $rb.Layout -DeployKeys $keys -ExcludeFiles @($rb.SiteOwned.Files) -ExcludeDirs @($rb.SiteOwned.Dirs))
+                $problems = @(Test-BRAVORollbackBackupFiles -RuntimeRoot $rb.RuntimeRoot -Layout $rb.Layout -DeployKeys $keys -ExcludeFiles @($rb.SiteOwned.Files) -ExcludeDirs @($rb.SiteOwned.Dirs) -Action $rb.Action)
                 if ($problems.Count -gt 0) { throw ('Верифікація відкату не пройшла: ' + ($problems -join '; ')) }
             })
 
@@ -1124,7 +1131,11 @@ function Invoke-BRAVORollback {
                 $expectedVersion = [string](Get-BRAVOUpdatePropertyValue -InputObject $rb.Journal -Name 'sourceVersion' -Default '')
                 if ([string]::IsNullOrWhiteSpace($expectedVersion)) { $expectedVersion = [string](Get-BRAVOUpdatePropertyValue -InputObject $rb.Journal -Name 'targetVersion' -Default '') }
                 $manifestPath = Join-Path $rb.RuntimeRoot 'RUNTIME_MANIFEST.json'
-                if ($null -ne $rb.Layout) { $manifestPath = Join-Path $rb.Layout.RuntimeDir 'RUNTIME_MANIFEST.json' }
+                if ($null -ne $rb.Layout) {
+                    $manifestPath = Join-Path $rb.Layout.RuntimeDir 'RUNTIME_MANIFEST.json'
+                    # Repair: пошкоджений до-операційний стан звіряється з backup-manifest.json.
+                    if ($rb.Action -ceq 'Repair') { $manifestPath = $rb.Layout.ManifestPath }
+                }
                 $site = Get-BRAVOUpdatePropertyValue -InputObject $baseline -Name 'siteConfig'
                 $arguments = @{ Context = $rb.Context; Mode = 'Rollback'; ExpectedVersion = $expectedVersion; ExpectedManifestPath = $manifestPath; SiteBaseline = $site }
                 $guardBaseline = Get-BRAVOUpdatePropertyValue -InputObject $baseline -Name 'guardExitCode'
@@ -1164,6 +1175,11 @@ function Invoke-BRAVORollback {
     }
 
     if ($null -eq $criticalMessage) {
+        if ($action -ceq 'Repair') {
+            [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Repair.RuntimeStillDamaged' -Severity Warning -Title 'Repair не виконано: runtime лишився пошкодженим, як і до repair' `
+                -Meaning 'Відкат повернув стан до початку repair; пошкодження, через які його запускали, не усунуто.' `
+                -Action 'Повторіть Repair після усунення причини збою.'))
+        }
         return (& $buildResult 'RolledBack' '' 'Попередній стан відновлено й перевірено.' $activation (& $lastPhaseName))
     }
 
