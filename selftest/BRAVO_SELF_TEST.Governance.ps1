@@ -7149,15 +7149,18 @@ $attributionScenarios = @(
     @{ Label = 'GeneratedFooter'; Message = "fix: x`n`nGenerated with [Claude Code](https://claude.com/claude-code)"; Author = 'dev@example.invalid'; Expect = @('GENERATED_BY_AI', 'AI_SESSION_LINK') }
     @{ Label = 'ChatLink'; Message = "docs: x`n`nДив. https://chatgpt.com/c/0000"; Author = 'dev@example.invalid'; Expect = @('AI_SESSION_LINK') }
     @{ Label = 'AiAuthorIdentity'; Message = 'fix: x'; Author = 'noreply@anthropic.com'; Expect = @('AI_AUTHOR_IDENTITY') }
+    @{ Label = 'AiAuthorOtherProviderIdentity'; Message = 'fix: x'; Author = 'noreply@openai.com'; Expect = @('AI_AUTHOR_IDENTITY') }
+    @{ Label = 'AiCommitterGitHubBotIdentity'; Message = 'fix: x'; Author = 'dev@example.invalid'; Committer = '175728472+Copilot@users.noreply.github.com'; Expect = @('AI_COMMITTER_IDENTITY') }
+    @{ Label = 'HumanAuthorAtAiCompanyAllowed'; Message = 'fix: x'; Author = 'jane@openai.com'; Expect = @() }
     @{ Label = 'RuleMentionedInProseAllowed'; Message = "ci: гейт забороняє трейлер Co-Authored-By: на AI-інструмент і футер Generated with"; Author = 'dev@example.invalid'; Expect = @() }
     @{ Label = 'GeneratedWithToolInProseAllowed'; Message = "docs: explain why Generated with Claude footers are forbidden"; Author = 'dev@example.invalid'; Expect = @() }
     @{ Label = 'GeneratedFooterWithEmoji'; Message = "fix: x`n`n" + [char]::ConvertFromUtf32(0x1F916) + " Generated with Codex"; Author = 'dev@example.invalid'; Expect = @('GENERATED_BY_AI') }
 )
 foreach ($scenario in $attributionScenarios) {
     $scenarioHits = @(& $attributionModule {
-        param($ScenarioMessage, $ScenarioAuthor)
-        Get-BRAVOCommitAttributionViolation -Message $ScenarioMessage -AuthorEmail $ScenarioAuthor -CommitterEmail 'dev@example.invalid'
-    } $scenario.Message $scenario.Author)
+        param($ScenarioMessage, $ScenarioAuthor, $ScenarioCommitter)
+        Get-BRAVOCommitAttributionViolation -Message $ScenarioMessage -AuthorEmail $ScenarioAuthor -CommitterEmail $ScenarioCommitter
+    } $scenario.Message $scenario.Author $(if ($scenario.ContainsKey('Committer')) { $scenario.Committer } else { 'dev@example.invalid' }))
     $scenarioExpected = @($scenario.Expect)
     $scenarioMatches = ($scenarioHits.Count -eq $scenarioExpected.Count) -and (@($scenarioExpected | Where-Object { $scenarioHits -notcontains $_ }).Count -eq 0)
     Test-BRAVOCondition `

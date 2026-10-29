@@ -84,7 +84,8 @@ function Get-BRAVOCommitAttributionViolation {
         if ($text -match $rules[$rule]) { [void]$violations.Add($rule) }
     }
     foreach ($identity in @(@{ Name = 'AUTHOR'; Email = $AuthorEmail }, @{ Name = 'COMMITTER'; Email = $CommitterEmail })) {
-        if (-not [string]::IsNullOrEmpty($identity.Email) -and $identity.Email -match $rules['AI_NOREPLY_ADDRESS']) {
+        # Та сама політика службових адрес, що й для співавторів (PR #531, P2).
+        if (-not [string]::IsNullOrEmpty($identity.Email) -and ($identity.Email.Trim() -match $aiCoAuthorEmail -or $identity.Email -match $rules['AI_NOREPLY_ADDRESS'])) {
             [void]$violations.Add('AI_' + $identity.Name + '_IDENTITY')
         }
     }
