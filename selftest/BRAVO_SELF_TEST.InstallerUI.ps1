@@ -259,7 +259,7 @@
         -not $progressStep.ShowNavigation -and $null -eq $progressStep.PreviousKey) -Name 'InstallerUI/Wizard/Steps' -Failure "Install=$($installSteps.Count) Update=$($updateSteps.Count)"
 
     # --- Екран 3: джерело ---
-    $s0 = ConvertTo-BRAVOInstallerSourceViewModel -Operation Install
+    $s0 = ConvertTo-BRAVOInstallerSourceViewModel -Operation Install -Tag 'v5.3.0'
     Test-BRAVOCondition -Condition (-not $s0.PrereleaseControlsVisible -and -not $s0.PrereleaseEffective -and $s0.CanContinue -and $s0.TagVisible -and -not $s0.ZipVisible) `
         -Name 'InstallerUI/Source/PrereleaseHiddenByDefault' -Failure 'Prerelease має бути прихований за замовчуванням.'
     Test-BRAVOCondition -Condition (-not (ConvertTo-BRAVOInstallerSourceViewModel -Operation Install -Tag 'v5.x').CanContinue -and (ConvertTo-BRAVOInstallerSourceViewModel -Operation Install -Tag 'v5.3.0').CanContinue) `
@@ -536,6 +536,24 @@
     $diagCmd = New-BRAVOInstallerEngineCommand -ToolkitRoot 'C:\t' -Action Diagnose -ResultPath 'C:\r.json'
     Test-BRAVOCondition -Condition ($diagCmd.ArgumentString -match '-Action Diagnose -AsJson') -Name 'InstallerUI/Command/Diagnose' -Failure $diagCmd.ArgumentString
 
+
+    # --- P2: тег обов'язковий; самотест входить у план ---
+    $emptyTags = @('Install', 'Update', 'Repair' | ForEach-Object { (ConvertTo-BRAVOInstallerSourceViewModel -Operation $_).CanContinue })
+    $hintVm = ConvertTo-BRAVOInstallerSourceViewModel -Operation Install
+    Test-BRAVOCondition -Condition (-not ($emptyTags -contains $true) -and ($hintVm.Problems -join ' ') -match 'явною версією' -and $hintVm.OnlineHint -notmatch 'порожнім' -and $hintVm.OnlineHint -match 'явну версію' -and
+        (ConvertTo-BRAVOInstallerSourceViewModel -Operation Update -Tag 'v5.3.0').CanContinue -and -not (ConvertTo-BRAVOInstallerSourceViewModel -Operation Update -Tag 'latest').CanContinue) `
+        -Name 'InstallerUI/Source/OnlineTagRequired' -Failure 'Порожній онлайн-тег має відхилятись для Install/Update/Repair.'
+    $stCmd = New-BRAVOInstallerPlanCommand -ToolkitRoot 'C:\t' -Operation Install -ResultPath 'C:\r.json' -Tag 'v5.3.0' -SelfTest Include
+    $skCmd = New-BRAVOInstallerPlanCommand -ToolkitRoot 'C:\t' -Operation Repair -ResultPath 'C:\r.json' -Tag 'v5.3.0' -SelfTest Skip
+    $noStCmd = New-BRAVOInstallerPlanCommand -ToolkitRoot 'C:\t' -Operation Update -ResultPath 'C:\r.json' -Tag 'v5.3.0'
+    $badSt = $false
+    try { [void](New-BRAVOInstallerPlanCommand -ToolkitRoot 'C:\t' -Operation Install -ResultPath 'C:\r.json' -Tag 'v5.3.0' -SelfTest 'Maybe') } catch { $badSt = $true }
+    Test-BRAVOCondition -Condition ($stCmd.ArgumentString -like '*-Tag "v5.3.0" -SelfTest Include -AsJson*' -and $skCmd.ArgumentString -like '*-SelfTest Skip*' -and $noStCmd.ArgumentString -notmatch 'SelfTest' -and $badSt) `
+        -Name 'InstallerUI/Command/PlanSelfTest' -Failure $stCmd.ArgumentString
+    $planWithSt = [pscustomobject]@{ tests = [pscustomobject]@{ planned = @([pscustomobject]@{ id = 'Validate.Integrity'; title = 'Цілісність' }, [pscustomobject]@{ id = 'Validate.SelfTest'; title = 'Самотест' }); skipped = @() } }
+    $planNoSt = [pscustomobject]@{ tests = [pscustomobject]@{ planned = @([pscustomobject]@{ id = 'Validate.Integrity'; title = 'Цілісність' }); skipped = @([pscustomobject]@{ title = 'Самотест'; reason = 'пропущено за запитом' }) } }
+    Test-BRAVOCondition -Condition ((Get-BRAVOInstallerPlanSelfTest -Plan $planWithSt -Fallback $false) -and -not (Get-BRAVOInstallerPlanSelfTest -Plan $planNoSt -Fallback $true) -and (Get-BRAVOInstallerPlanSelfTest -Plan $plan -Fallback $true) -and -not (Get-BRAVOInstallerPlanSelfTest -Plan $null -Fallback $false)) `
+        -Name 'InstallerUI/Request/RunSelfTestFollowsPlanTests' -Failure 'options.runSelfTest має відповідати plan.tests.'
     # --- Форма: нові екрани ---
     $wizardForm = $null
     $wizardFormError = ''
@@ -569,6 +587,13 @@
             }
             Test-BRAVOCondition -Condition ($missingScreens.Count -eq 0 -and $problems.Count -eq 0) -Name 'InstallerUI/Wizard/FormAccessibleNamesTabIndex' -Failure ("missing=$($missingScreens -join ',') problems=$($problems -join '; ')")
             Test-BRAVOCondition -Condition (-not $ctx.Controls['Source.AdvancedGroup'].Visible -and -not $ctx.RepeatBlocked -and $null -eq $ctx.Exec) -Name 'InstallerUI/Wizard/FormPrereleaseHiddenInitially' -Failure 'Prerelease-група прихована до «Розширено».'
+    $wizardDefaults = & $mod {
+        param($c)
+        $out = @()
+        foreach ($op in @('Install', 'Update', 'Repair')) { Enter-BRAVOInstallerWizard -Context $c -Operation $op; $out += ($op + '=' + $c.Wizard.RunSelfTest + '/' + $c.Wizard.PlanSelfTest) }
+        $out
+    } $ctx
+    Test-BRAVOCondition -Condition (($wizardDefaults -join ',') -eq 'Install=True/True,Update=True/True,Repair=False/False') -Name 'InstallerUI/Wizard/SelfTestDefaults' -Failure ($wizardDefaults -join ',')
 
             # Прогін екранів майстра без показу форми: жодних винятків, коректні тексти.
             $walk = & $mod {
