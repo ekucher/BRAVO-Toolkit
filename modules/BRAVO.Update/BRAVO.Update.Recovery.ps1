@@ -143,7 +143,12 @@ function Remove-BRAVORecoveryOperationArtifact {
         лишається Open для ручного аналізу.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)]$Journal)
+    param(
+        [Parameter(Mandatory = $true)]$Journal,
+        # Корені engine (ті самі, з якими перевірено довіру до журналу): передаються в -AllowedRoot.
+        [string]$StagingRoot = '',
+        [string]$BackupRoot = ''
+    )
 
     $operationId = [string]$Journal.operationId
     $runtimeRoot = [string](Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'runtimeRoot' -Default '')
@@ -159,7 +164,7 @@ function Remove-BRAVORecoveryOperationArtifact {
         }
         $directory = Join-Path $root $operationId
         if (-not [IO.Directory]::Exists($directory)) { continue }
-        Remove-BRAVOUpdateOperationDirectory -Path $directory -ExpectedParent $root -OperationId $operationId
+        Remove-BRAVOUpdateOperationDirectory -Path $directory -ExpectedParent $root -OperationId $operationId -AllowedRoot @(@($StagingRoot, $BackupRoot) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         $removed.Add($directory)
     }
     return $removed.ToArray()
@@ -271,7 +276,7 @@ function Invoke-BRAVORecovery {
         Invoke-BRAVORecoveryFaultPoint -FaultInjection $FaultInjection -Name 'Recovery.Start'
 
         if ($journal.mutationStarted -ne $true) {
-            return (Invoke-BRAVORecoveryAbandon -Journal $journal -JournalPath $journalPath -StateRoot $StateRoot -FaultInjection $FaultInjection -StartedUtc $startedUtc)
+            return (Invoke-BRAVORecoveryAbandon -Journal $journal -JournalPath $journalPath -StateRoot $StateRoot -FaultInjection $FaultInjection -StartedUtc $startedUtc -StagingRoot $StagingRoot -BackupRoot $BackupRoot)
         }
         return (Invoke-BRAVORecoveryRollback -Journal $journal -JournalPath $journalPath -StateRoot $StateRoot -LockRoot $LockRoot -OperationLockPath $OperationLockPath -Adapter $Adapter -VersionStatePath $VersionStatePath -FaultInjection $FaultInjection -RuntimeRoot $RuntimeRoot -StagingRoot $StagingRoot -BackupRoot $BackupRoot -StartedUtc $startedUtc)
     } catch {
@@ -304,7 +309,9 @@ function Invoke-BRAVORecoveryAbandon {
         [Parameter(Mandatory = $true)][string]$JournalPath,
         [Parameter(Mandatory = $true)][string]$StateRoot,
         [AllowNull()]$FaultInjection,
-        [Parameter(Mandatory = $true)][string]$StartedUtc
+        [Parameter(Mandatory = $true)][string]$StartedUtc,
+        [string]$StagingRoot = '',
+        [string]$BackupRoot = ''
     )
 
     $operationId = [string]$Journal.operationId
@@ -317,7 +324,7 @@ function Invoke-BRAVORecoveryAbandon {
     if (-not $hasOpenRecovery) { [void](Add-BRAVOUpdateJournalPhaseIntent -Journal $Journal -Phase 'Recovery' -StateRoot $StateRoot) }
     Invoke-BRAVORecoveryFaultPoint -FaultInjection $FaultInjection -Name 'Recovery.AfterIntent'
 
-    $removed = @(Remove-BRAVORecoveryOperationArtifact -Journal $Journal)
+    $removed = @(Remove-BRAVORecoveryOperationArtifact -Journal $Journal -StagingRoot $StagingRoot -BackupRoot $BackupRoot)
     Invoke-BRAVORecoveryFaultPoint -FaultInjection $FaultInjection -Name 'Recovery.AfterCleanup'
 
     [void](Complete-BRAVOUpdateJournalPhase -Journal $Journal -Phase 'Recovery' -Outcome 'Succeeded' -StateRoot $StateRoot)
