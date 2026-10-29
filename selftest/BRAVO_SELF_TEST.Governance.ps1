@@ -6850,56 +6850,6 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/NoAgentFilesInTree') { try {
 # імена, і рядкове порівняння з довгим шляхом від git давало б хибний режим.
 . (Join-Path $root 'ci\BRAVOAgentFilePolicy.ps1')
 
-function Get-BRAVOSelfTestAgentFileScan {
-    # GitCommandName існує лише для проби відсутнього git (без зміни PATH self-test).
-    param([Parameter(Mandatory = $true)][string]$TreeRoot, [string]$GitCommandName = 'git')
-
-    $scan = [pscustomobject]@{ Mode = ''; Violations = @(); Error = '' }
-    $gitCommand = @(Get-Command -Name $GitCommandName -CommandType Application -ErrorAction SilentlyContinue)
-    $useGit = $false
-    $previousErrorAction = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        if ($gitCommand.Count -gt 0) {
-            $insideOutput = (& git -C $TreeRoot rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
-            $insideExit = $LASTEXITCODE
-            if ($insideExit -eq 0 -and $insideOutput -eq 'true') {
-                $prefixOutput = (& git -C $TreeRoot rev-parse --show-prefix 2>$null | Out-String).Trim()
-                if ($LASTEXITCODE -ne 0) {
-                    $scan.Error = "git rev-parse --show-prefix завершився з кодом $LASTEXITCODE"
-                    return $scan
-                }
-                $useGit = ($prefixOutput.Length -eq 0)
-            } elseif (Test-Path -LiteralPath (Join-Path $TreeRoot '.git')) {
-                # Є ознака репозиторію, але git його не розпізнав: не вгадуємо.
-                $scan.Error = "у корені є .git, але git rev-parse завершився з кодом $insideExit (вивід: '$insideOutput')"
-                return $scan
-            }
-        }
-
-        if ($useGit) {
-            $scan.Mode = 'git-index'
-            $listing = & git -C $TreeRoot -c core.quotepath=off ls-files -z 2>$null | Out-String
-            if ($LASTEXITCODE -ne 0) {
-                $scan.Error = "git ls-files -z завершився з кодом $LASTEXITCODE"
-                return $scan
-            }
-            $trackedPaths = @($listing.Split([char]0) | Where-Object { $_.Length -gt 0 })
-            $scan.Violations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath $trackedPaths)
-        } else {
-            $scan.Mode = 'filesystem'
-            try {
-                $scan.Violations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath (Get-BRAVOAgentFilePolicyTreePath -Root $TreeRoot))
-            } catch {
-                $scan.Error = "не вдалося перелічити дерево: $($_.Exception.Message)"
-            }
-        }
-    } finally {
-        $ErrorActionPreference = $previousErrorAction
-    }
-    return $scan
-}
-
 # --- Чиста політика: заборонені форми ---
 $agentPolicyForbidden = @(
     '.claude', '.claude/settings.json', '.claude\settings.json', 'sub/.CLAUDE/x', 'a\b\.codex', '.codex/config.toml',
@@ -6943,8 +6893,8 @@ try {
     [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureClean 'my.claude'))
     [IO.File]::WriteAllText((Join-Path $agentFixtureClean 'my.claude\x'), "x`r`n", $agentUtf8NoBom)
 
-    $agentFixtureDirtyScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentFixtureDirty
-    $agentFixtureCleanScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentFixtureClean
+    $agentFixtureDirtyScan = Get-BRAVOAgentFileScan -TreeRoot $agentFixtureDirty
+    $agentFixtureCleanScan = Get-BRAVOAgentFileScan -TreeRoot $agentFixtureClean
 } finally {
     if (-not [string]::IsNullOrEmpty($agentFixtureDirty)) { Remove-Item -LiteralPath $agentFixtureDirty -Recurse -Force -ErrorAction SilentlyContinue }
     if (-not [string]::IsNullOrEmpty($agentFixtureClean)) { Remove-Item -LiteralPath $agentFixtureClean -Recurse -Force -ErrorAction SilentlyContinue }
@@ -6990,8 +6940,8 @@ try {
     [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'clean\.git'))
     [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'dirty\.git'))
     [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'dirty\.claude'))
-    $agentNoGitCleanScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentNoGitProbeRoot 'clean') -GitCommandName $agentNoGitBogus
-    $agentNoGitDirtyScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentNoGitProbeRoot 'dirty') -GitCommandName $agentNoGitBogus
+    $agentNoGitCleanScan = Get-BRAVOAgentFileScan -TreeRoot (Join-Path $agentNoGitProbeRoot 'clean') -GitCommandName $agentNoGitBogus
+    $agentNoGitDirtyScan = Get-BRAVOAgentFileScan -TreeRoot (Join-Path $agentNoGitProbeRoot 'dirty') -GitCommandName $agentNoGitBogus
 } finally {
     if (-not [string]::IsNullOrEmpty($agentNoGitProbeRoot)) { Remove-Item -LiteralPath $agentNoGitProbeRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
@@ -7031,15 +6981,15 @@ try {
         }
         if ($agentGitReady) {
             # Ігнорований untracked .claude\ є, але в індексі його немає.
-            $agentGitUntrackedScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentGitFixture
+            $agentGitUntrackedScan = Get-BRAVOAgentFileScan -TreeRoot $agentGitFixture
             # Підкаталог репозиторію не є верхом work tree -> режим файлової системи.
-            $agentGitSubdirScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentGitFixture 'sub')
+            $agentGitSubdirScan = Get-BRAVOAgentFileScan -TreeRoot (Join-Path $agentGitFixture 'sub')
             [IO.File]::WriteAllText((Join-Path $agentGitFixture 'CLAUDE.md'), "x`r`n", $agentUtf8NoBomGit)
             $null = & git -C $agentGitFixture add -f CLAUDE.md 2>&1
             $agentGitReady = ($LASTEXITCODE -eq 0)
         }
         if ($agentGitReady) {
-            $agentGitTrackedScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentGitFixture
+            $agentGitTrackedScan = Get-BRAVOAgentFileScan -TreeRoot $agentGitFixture
         } else {
             $agentGitLimitation = 'git недоступний або не може створити тимчасовий репозиторій'
         }
@@ -7128,8 +7078,40 @@ Test-BRAVOCondition `
     -EnvironmentLimitation $agentBuilderLimitation `
     -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має спрацьовувати AGENT_FILES_IN_ARTIFACT на дереві без файлів агентів, а гейт мусить явно підтвердити проходження (рядок 'Гейт AGENT_FILES_IN_ARTIFACT (...)', ASCII-маркер 'AGENT_FILES_IN_ARTIFACT ('); вивід: $agentBuilderCleanOutput"
 
+# --- Ранній CI-крок ci\Test-BRAVOAgentFilePolicy.ps1 (AUD-12) ---
+# Той самий скан, що й нижче для реального дерева, але окремим процесом, як у
+# static-checks: порушення -> exit 1 з маркером AGENT_FILES_IN_TREE:, чисте
+# дерево -> exit 0 з підтвердженням 'AGENT_FILES_IN_TREE ('. Фікстури без git
+# (режим filesystem) з маркером кореня BRAVO_SELF_TEST.ps1.
+$agentGateRoots = @('', '')
+$agentGateOutputs = @('', '')
+$agentGateExits = @(-1, -1)
+try {
+    for ($agentGateIndex = 0; $agentGateIndex -lt 2; $agentGateIndex++) {
+        $agentGateRoots[$agentGateIndex] = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTGATE_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory((Join-Path $agentGateRoots[$agentGateIndex] 'docs\agents'))
+        [IO.File]::WriteAllText((Join-Path $agentGateRoots[$agentGateIndex] 'BRAVO_SELF_TEST.ps1'), "# marker`r`n", (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText((Join-Path $agentGateRoots[$agentGateIndex] 'docs\agents\issue-tracker.md'), "x`r`n", (New-Object Text.UTF8Encoding($false)))
+        if ($agentGateIndex -eq 0) { [IO.File]::WriteAllText((Join-Path $agentGateRoots[$agentGateIndex] 'docs\AGENTS.md'), "x`r`n", (New-Object Text.UTF8Encoding($false))) }
+        $agentGateOutputs[$agentGateIndex] = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\Test-BRAVOAgentFilePolicy.ps1') -Root $agentGateRoots[$agentGateIndex] 2>&1 | Out-String
+        $agentGateExits[$agentGateIndex] = $LASTEXITCODE
+    }
+} finally {
+    foreach ($agentGateCleanup in $agentGateRoots) {
+        if (-not [string]::IsNullOrEmpty($agentGateCleanup)) { Remove-Item -LiteralPath $agentGateCleanup -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+Test-BRAVOCondition `
+    -Condition ($agentGateExits[0] -eq 1 -and $agentGateOutputs[0].Contains('AGENT_FILES_IN_TREE: docs\AGENTS.md') -and -not $agentGateOutputs[0].Contains('issue-tracker')) `
+    -Name 'Governance/NoAgentFilesInTree.EarlyCiStepRejectsAgentFile' `
+    -Failure "ci\Test-BRAVOAgentFilePolicy.ps1 мусить завершуватись кодом 1 з маркером 'AGENT_FILES_IN_TREE: docs\AGENTS.md' (і не позначати docs\agents\...); код $($agentGateExits[0]), вивід: $($agentGateOutputs[0])"
+Test-BRAVOCondition `
+    -Condition ($agentGateExits[1] -eq 0 -and $agentGateOutputs[1].Contains('AGENT_FILES_IN_TREE (0)')) `
+    -Name 'Governance/NoAgentFilesInTree.EarlyCiStepAcceptsCleanTree' `
+    -Failure "ci\Test-BRAVOAgentFilePolicy.ps1 на дереві без файлів агентів мусить завершуватись кодом 0 з підтвердженням 'AGENT_FILES_IN_TREE (0)'; код $($agentGateExits[1]), вивід: $($agentGateOutputs[1])"
+
 # --- Реальне дерево ---
-$agentRealScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $root
+$agentRealScan = Get-BRAVOAgentFileScan -TreeRoot $root
 $agentRealHit = @($agentRealScan.Violations)
 Test-BRAVOCondition `
     -Condition ($agentRealScan.Error -eq '' -and $agentRealHit.Count -eq 0) `
@@ -7138,6 +7120,173 @@ Test-BRAVOCondition `
         "порушення ($($agentRealHit.Count)): [" + [string]::Join(', ', @($agentRealHit | Select-Object -First 10)) + "] помилка перевірки: '$($agentRealScan.Error)'")
 
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/NoAgentFilesInTree' } }
+if (Enter-BRAVOSelfTestSection -Name 'Governance/CommitAttribution') { try {
+
+# =====================================================================
+# AI-атрибуція в повідомленнях комітів (AUD-08)
+# =====================================================================
+# Гейт ci\Test-BRAVOCommitAttribution.ps1 (крок 'Commit attribution policy' у
+# static-checks) перевіряє коміти PR/push. Правила й визначення діапазону
+# екстрагуються з канонічного скрипта - жодної другої копії правил.
+$attributionScriptText = [IO.File]::ReadAllText((Join-Path $root 'ci\Test-BRAVOCommitAttribution.ps1'), [Text.Encoding]::UTF8)
+$attributionModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText $attributionScriptText `
+    -FunctionNames @('Get-BRAVOCommitAttributionViolation', 'Get-BRAVOCommitAttributionRange')
+
+# --- Правила: заборонені форми й те, що забороненим НЕ є ---
+$attributionScenarios = @(
+    @{ Label = 'CleanMessage'; Message = "fix: звичайний коміт`n`nОпис зміни."; Author = 'dev@example.invalid'; Expect = @() }
+    @{ Label = 'CoAuthoredByAiWithNoreply'; Message = "fix: x`n`nCo-Authored-By: Claude <noreply@anthropic.com>"; Author = 'dev@example.invalid'; Expect = @('CO_AUTHORED_BY_AI', 'AI_NOREPLY_ADDRESS') }
+    @{ Label = 'CoAuthoredByAiLowerCase'; Message = "fix: x`n`nco-authored-by: codex <bot@example.invalid>"; Author = 'dev@example.invalid'; Expect = @('CO_AUTHORED_BY_AI') }
+    @{ Label = 'CoAuthoredByHumanAllowed'; Message = "fix: x`n`nCo-Authored-By: Jane Doe <jane@example.invalid>"; Author = 'dev@example.invalid'; Expect = @() }
+    @{ Label = 'SessionTrailerAndLink'; Message = "fix: x`n`nClaude-Session: https://claude.ai/code/session_0000"; Author = 'dev@example.invalid'; Expect = @('SESSION_TRAILER', 'AI_SESSION_LINK') }
+    @{ Label = 'AiAssistedTrailer'; Message = "fix: x`n`nAI-assisted: yes"; Author = 'dev@example.invalid'; Expect = @('AI_ASSISTED_TRAILER') }
+    @{ Label = 'GeneratedFooter'; Message = "fix: x`n`nGenerated with [Claude Code](https://claude.com/claude-code)"; Author = 'dev@example.invalid'; Expect = @('GENERATED_BY_AI', 'AI_SESSION_LINK') }
+    @{ Label = 'ChatLink'; Message = "docs: x`n`nДив. https://chatgpt.com/c/0000"; Author = 'dev@example.invalid'; Expect = @('AI_SESSION_LINK') }
+    @{ Label = 'AiAuthorIdentity'; Message = 'fix: x'; Author = 'noreply@anthropic.com'; Expect = @('AI_AUTHOR_IDENTITY') }
+    @{ Label = 'RuleMentionedInProseAllowed'; Message = "ci: гейт забороняє трейлер Co-Authored-By: на AI-інструмент і футер Generated with"; Author = 'dev@example.invalid'; Expect = @() }
+)
+foreach ($scenario in $attributionScenarios) {
+    $scenarioHits = @(& $attributionModule {
+        param($ScenarioMessage, $ScenarioAuthor)
+        Get-BRAVOCommitAttributionViolation -Message $ScenarioMessage -AuthorEmail $ScenarioAuthor -CommitterEmail 'dev@example.invalid'
+    } $scenario.Message $scenario.Author)
+    $scenarioExpected = @($scenario.Expect)
+    $scenarioMatches = ($scenarioHits.Count -eq $scenarioExpected.Count) -and (@($scenarioExpected | Where-Object { $scenarioHits -notcontains $_ }).Count -eq 0)
+    Test-BRAVOCondition `
+        -Condition $scenarioMatches `
+        -Name "Governance/CommitAttribution.Rules[$($scenario.Label)]" `
+        -Failure "Get-BRAVOCommitAttributionViolation ($($scenario.Label)) має дати [$($scenarioExpected -join ', ')]; отримано [$($scenarioHits -join ', ')]"
+}
+
+# --- Діапазон із події GitHub ---
+$attributionEventDir = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_ATTRIBUTION_EVENT_{0}" -f [guid]::NewGuid().ToString('N'))
+$attributionRangeResults = @{}
+try {
+    [void][IO.Directory]::CreateDirectory($attributionEventDir)
+    $shaA = 'a' * 40
+    $shaB = 'b' * 40
+    $attributionPayloads = @(
+        @{ Label = 'PullRequest'; Event = 'pull_request'; Json = ('{{"pull_request":{{"base":{{"sha":"{0}"}},"head":{{"sha":"{1}"}}}}}}' -f $shaA, $shaB) }
+        @{ Label = 'PullRequestWithoutSha'; Event = 'pull_request'; Json = '{"pull_request":{"base":{},"head":{}}}' }
+        @{ Label = 'Push'; Event = 'push'; Json = ('{{"before":"{0}","after":"{1}"}}' -f $shaA, $shaB) }
+        @{ Label = 'PushNewBranch'; Event = 'push'; Json = ('{{"before":"{0}","after":"{1}"}}' -f ('0' * 40), $shaB) }
+        @{ Label = 'PushDeleteBranch'; Event = 'push'; Json = ('{{"before":"{0}","after":"{1}"}}' -f $shaA, ('0' * 40)) }
+        @{ Label = 'WorkflowDispatch'; Event = 'workflow_dispatch'; Json = '{}' }
+    )
+    foreach ($payload in $attributionPayloads) {
+        $payloadPath = Join-Path $attributionEventDir ($payload.Label + '.json')
+        [IO.File]::WriteAllText($payloadPath, $payload.Json, (New-Object Text.UTF8Encoding($false)))
+        $attributionRangeResults[$payload.Label] = & $attributionModule {
+            param($EventNameArg, $EventPathArg)
+            Get-BRAVOCommitAttributionRange -EventName $EventNameArg -EventPath $EventPathArg -RefName 'feature/x'
+        } $payload.Event $payloadPath
+    }
+    $attributionRangeResults['PushWithoutEventPath'] = & $attributionModule {
+        Get-BRAVOCommitAttributionRange -EventName 'push' -EventPath '' -RefName 'developer'
+    }
+} finally {
+    Remove-Item -LiteralPath $attributionEventDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+$rangeText = { param($Label) if ($attributionRangeResults.ContainsKey($Label)) { (@($attributionRangeResults[$Label].Range) -join ' ') + ' | error=' + $attributionRangeResults[$Label].Error } else { '<немає>' } }
+Test-BRAVOCondition `
+    -Condition ((@($attributionRangeResults['PullRequest'].Range) -join ' ') -eq ('a' * 40 + '..' + 'b' * 40) -and $attributionRangeResults['PullRequest'].Error -eq '') `
+    -Name 'Governance/CommitAttribution.RangePullRequestIsBaseToHead' `
+    -Failure "діапазон pull_request мусить бути base.sha..head.sha; отримано: $(& $rangeText 'PullRequest')"
+Test-BRAVOCondition `
+    -Condition ((@($attributionRangeResults['Push'].Range) -join ' ') -eq ('a' * 40 + '..' + 'b' * 40)) `
+    -Name 'Governance/CommitAttribution.RangePushIsBeforeToAfter' `
+    -Failure "діапазон push мусить бути before..after; отримано: $(& $rangeText 'Push')"
+Test-BRAVOCondition `
+    -Condition ((@($attributionRangeResults['PushNewBranch'].Range) -join ' ') -eq ('b' * 40 + ' --not --exclude=refs/remotes/origin/feature/x --remotes=origin')) `
+    -Name 'Governance/CommitAttribution.RangeNewBranchExcludesOtherRemoteBranches' `
+    -Failure "push нової гілки мусить перевіряти коміти, яких немає в інших гілках origin; отримано: $(& $rangeText 'PushNewBranch')"
+Test-BRAVOCondition `
+    -Condition (@($attributionRangeResults['PushDeleteBranch'].Range).Count -eq 0 -and $attributionRangeResults['PushDeleteBranch'].Error -eq '' -and
+        @($attributionRangeResults['WorkflowDispatch'].Range).Count -eq 0 -and $attributionRangeResults['WorkflowDispatch'].Error -eq '') `
+    -Name 'Governance/CommitAttribution.RangeEmptyForDeleteAndDispatch' `
+    -Failure "видалення гілки й workflow_dispatch не несуть нових комітів; отримано: delete=$(& $rangeText 'PushDeleteBranch') dispatch=$(& $rangeText 'WorkflowDispatch')"
+Test-BRAVOCondition `
+    -Condition ($attributionRangeResults['PullRequestWithoutSha'].Error -ne '' -and $attributionRangeResults['PushWithoutEventPath'].Error -ne '') `
+    -Name 'Governance/CommitAttribution.RangeUnknownFailsClosed' `
+    -Failure "невизначений діапазон (payload без sha, подія без GITHUB_EVENT_PATH) мусить давати помилку, а не порожній діапазон; отримано: pr=$(& $rangeText 'PullRequestWithoutSha') push=$(& $rangeText 'PushWithoutEventPath')"
+
+# --- Наскрізно: тимчасовий репозиторій ---
+# Базова лінія тимчасового репозиторію передається через -Baseline (канонічної
+# у ньому немає). Без git перевірка позначається НЕДОСТУПНО.
+$attributionRepo = ''
+$attributionLimitation = ''
+$attributionDirtyOutput = ''; $attributionDirtyExit = -1
+$attributionCleanOutput = ''; $attributionCleanExit = -1
+$attributionMissingBaselineOutput = ''; $attributionMissingBaselineExit = -1
+$attributionDirtySha = ''
+if (@(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue).Count -eq 0) {
+    $attributionLimitation = 'git відсутній на цьому хості (встановлений комплект без git)'
+} else {
+    $previousErrorActionAttribution = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $attributionRepo = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_ATTRIBUTION_REPO_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($attributionRepo)
+        [IO.File]::WriteAllText((Join-Path $attributionRepo 'BRAVO_SELF_TEST.ps1'), "# marker`r`n", (New-Object Text.UTF8Encoding($false)))
+        $null = & git -C $attributionRepo -c init.defaultBranch=master init --quiet 2>&1
+        $attributionCommit = {
+            param($MessageText)
+            $messageFile = Join-Path $attributionRepo '.git\SELFTEST_MSG'
+            [IO.File]::WriteAllText($messageFile, $MessageText, (New-Object Text.UTF8Encoding($false)))
+            $null = & git -C $attributionRepo add -A 2>&1
+            $null = & git -C $attributionRepo -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit --allow-empty -F $messageFile --quiet 2>&1
+            (& git -C $attributionRepo rev-parse HEAD 2>&1 | Out-String).Trim()
+        }
+        $attributionBase = & $attributionCommit 'base'
+        $attributionCleanSha = & $attributionCommit "fix: clean`n`nCo-Authored-By: Jane Doe <jane@example.invalid>"
+        $attributionDirtySha = & $attributionCommit "fix: dirty`n`nCo-Authored-By: Claude <noreply@anthropic.com>"
+        if ($attributionBase -notmatch '^[0-9a-f]{40}$' -or $attributionDirtySha -notmatch '^[0-9a-f]{40}$') {
+            $attributionLimitation = 'git не може створити коміт у тимчасовому репозиторії'
+        } else {
+            $attributionScript = Join-Path $root 'ci\Test-BRAVOCommitAttribution.ps1'
+            $attributionDirtyOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $attributionScript -Root $attributionRepo -Range "$attributionBase..HEAD" -Baseline $attributionBase 2>&1 | Out-String
+            $attributionDirtyExit = $LASTEXITCODE
+            $attributionCleanOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $attributionScript -Root $attributionRepo -Range "$attributionBase..$attributionCleanSha" -Baseline $attributionBase 2>&1 | Out-String
+            $attributionCleanExit = $LASTEXITCODE
+            # Неіснуюча базова лінія -> fail closed, а не перевірка всієї історії.
+            $attributionMissingBaselineOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $attributionScript -Root $attributionRepo -Range 'HEAD' -Baseline ('c' * 40) 2>&1 | Out-String
+            $attributionMissingBaselineExit = $LASTEXITCODE
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionAttribution
+        if (-not [string]::IsNullOrEmpty($attributionRepo)) { Remove-Item -LiteralPath $attributionRepo -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+Test-BRAVOCondition `
+    -Condition ($attributionDirtyExit -eq 1 -and $attributionDirtySha.Length -eq 40 -and $attributionDirtyOutput.Contains('COMMIT_ATTRIBUTION_FORBIDDEN: ' + $attributionDirtySha.Substring(0, 12)) -and $attributionDirtyOutput.Contains('CO_AUTHORED_BY_AI')) `
+    -Name 'Governance/CommitAttribution.GateRejectsAttributedCommit' `
+    -EnvironmentLimitation $attributionLimitation `
+    -Failure "гейт мусить завершуватись кодом 1 з маркером COMMIT_ATTRIBUTION_FORBIDDEN і SHA коміту з AI-трейлером; код $attributionDirtyExit, вивід: $attributionDirtyOutput"
+Test-BRAVOCondition `
+    -Condition ($attributionCleanExit -eq 0 -and $attributionCleanOutput.Contains('COMMIT_ATTRIBUTION (1)')) `
+    -Name 'Governance/CommitAttribution.GateAcceptsCleanRangeAndExcludesBaseline' `
+    -EnvironmentLimitation $attributionLimitation `
+    -Failure "діапазон із одним чистим комітом (базова лінія виключена) мусить проходити з 'COMMIT_ATTRIBUTION (1)'; код $attributionCleanExit, вивід: $attributionCleanOutput"
+Test-BRAVOCondition `
+    -Condition ($attributionMissingBaselineExit -eq 1 -and $attributionMissingBaselineOutput.Contains('COMMIT_ATTRIBUTION_RANGE_UNKNOWN')) `
+    -Name 'Governance/CommitAttribution.GateFailsClosedWithoutBaseline' `
+    -EnvironmentLimitation $attributionLimitation `
+    -Failure "без базового коміту в історії гейт мусить падати з COMMIT_ATTRIBUTION_RANGE_UNKNOWN; код $attributionMissingBaselineExit, вивід: $attributionMissingBaselineOutput"
+
+# --- Кроки в ci.yml: обидва ранні гейти до парсера, у static-checks ---
+$attributionWorkflow = [IO.File]::ReadAllText((Join-Path $root '.github\workflows\ci.yml'), [Text.Encoding]::UTF8)
+$attributionAgentStep = $attributionWorkflow.IndexOf('run: .\ci\Test-BRAVOAgentFilePolicy.ps1')
+$attributionCommitStep = $attributionWorkflow.IndexOf('run: .\ci\Test-BRAVOCommitAttribution.ps1')
+$attributionParserStep = $attributionWorkflow.IndexOf('- name: PowerShell parser')
+$attributionStaticJob = $attributionWorkflow.IndexOf('static-checks:')
+Test-BRAVOCondition `
+    -Condition ($attributionStaticJob -ge 0 -and $attributionAgentStep -gt $attributionStaticJob -and $attributionCommitStep -gt $attributionStaticJob -and
+        $attributionParserStep -gt $attributionAgentStep -and $attributionParserStep -gt $attributionCommitStep) `
+    -Name 'Governance/CommitAttribution.EarlyGatesWiredIntoStaticChecks' `
+    -Failure "ci.yml: кроки 'Agent files policy' (ci\Test-BRAVOAgentFilePolicy.ps1) і 'Commit attribution policy' (ci\Test-BRAVOCommitAttribution.ps1) мусять бути в static-checks до парсера; позиції: static-checks=$attributionStaticJob agent=$attributionAgentStep commit=$attributionCommitStep parser=$attributionParserStep"
+
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/CommitAttribution' } }
 
 if (Enter-BRAVOSelfTestSection -Name 'StaticAnalysis/SiteIdentifierGuard') { try {
 

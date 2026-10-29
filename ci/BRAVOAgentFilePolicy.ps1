@@ -65,3 +65,63 @@ function Get-BRAVOAgentFilePolicyTreePath {
     }
     return $result.ToArray()
 }
+
+function Get-BRAVOAgentFileScan {
+    <#
+        Скан дерева за політикою вище; спільний для self-test
+        (Governance/NoAgentFilesInTree.*) і раннього CI-кроку
+        ci\Test-BRAVOAgentFilePolicy.ps1, щоб правило не мало другої копії.
+
+        Джерело істини: верх git work tree -> git-індекс (git ls-files; збій git
+        - Error, fail closed); інакше файлова система під коренем. Повертає
+        { Mode = 'git-index'|'filesystem'; Violations; Error } - непорожній
+        Error означає, що дерево не перевірено.
+    #>
+    # GitCommandName існує лише для проби відсутнього git (без зміни PATH self-test).
+    param([Parameter(Mandatory = $true)][string]$TreeRoot, [string]$GitCommandName = 'git')
+
+    $scan = [pscustomobject]@{ Mode = ''; Violations = @(); Error = '' }
+    $gitCommand = @(Get-Command -Name $GitCommandName -CommandType Application -ErrorAction SilentlyContinue)
+    $useGit = $false
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($gitCommand.Count -gt 0) {
+            $insideOutput = (& git -C $TreeRoot rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+            $insideExit = $LASTEXITCODE
+            if ($insideExit -eq 0 -and $insideOutput -eq 'true') {
+                $prefixOutput = (& git -C $TreeRoot rev-parse --show-prefix 2>$null | Out-String).Trim()
+                if ($LASTEXITCODE -ne 0) {
+                    $scan.Error = "git rev-parse --show-prefix завершився з кодом $LASTEXITCODE"
+                    return $scan
+                }
+                $useGit = ($prefixOutput.Length -eq 0)
+            } elseif (Test-Path -LiteralPath (Join-Path $TreeRoot '.git')) {
+                # Є ознака репозиторію, але git його не розпізнав: не вгадуємо.
+                $scan.Error = "у корені є .git, але git rev-parse завершився з кодом $insideExit (вивід: '$insideOutput')"
+                return $scan
+            }
+        }
+
+        if ($useGit) {
+            $scan.Mode = 'git-index'
+            $listing = & git -C $TreeRoot -c core.quotepath=off ls-files -z 2>$null | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                $scan.Error = "git ls-files -z завершився з кодом $LASTEXITCODE"
+                return $scan
+            }
+            $trackedPaths = @($listing.Split([char]0) | Where-Object { $_.Length -gt 0 })
+            $scan.Violations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath $trackedPaths)
+        } else {
+            $scan.Mode = 'filesystem'
+            try {
+                $scan.Violations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath (Get-BRAVOAgentFilePolicyTreePath -Root $TreeRoot))
+            } catch {
+                $scan.Error = "не вдалося перелічити дерево: $($_.Exception.Message)"
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    return $scan
+}
