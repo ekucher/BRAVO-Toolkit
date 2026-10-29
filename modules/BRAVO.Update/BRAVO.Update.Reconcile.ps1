@@ -317,7 +317,7 @@ function Save-BRAVOSchedulerSnapshot {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)][AllowNull()]$Snapshot,
         [Parameter(Mandatory = $true)][string]$OperationDirectory,
         $Journal = $null,
         [string]$StateRoot = ''
@@ -439,7 +439,7 @@ function Suspend-BRAVOManagedTasks {
         Будь-який Failed = збій фази для викликача.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)]$Snapshot, [Parameter(Mandatory = $true)]$Adapter)
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [Parameter(Mandatory = $true)]$Adapter)
 
     $disabled = New-Object System.Collections.Generic.List[object]
     $failed = New-Object System.Collections.Generic.List[object]
@@ -472,7 +472,7 @@ function Restore-BRAVOManagedTaskState {
         (fail closed), а не «нічого відновлювати».
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)]$Snapshot, [Parameter(Mandatory = $true)]$Adapter)
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [Parameter(Mandatory = $true)]$Adapter)
 
     $restored = New-Object System.Collections.Generic.List[object]
     $failed = New-Object System.Collections.Generic.List[object]
@@ -502,7 +502,7 @@ function Disable-BRAVOAllManagedTasks {
     .DESCRIPTION
         Область беремо зі знімка (якщо є), інакше з ефективної конфігурації RuntimeRoot.
         Якщо живе читання вдалось — вимикаємо всі існуючі керовані задачі (зокрема
-        створені після знімка). Якщо ні — вимикаємо все зі знімка наосліп, а збій по
+        створені після знімка). Якщо ні — вимикаємо наосліп усе, що існувало у знімку, а збій по
         задачі лишається в Failed: мовчки вважати її вимкненою не можна.
     #>
     [CmdletBinding()]
@@ -537,7 +537,7 @@ function Disable-BRAVOAllManagedTasks {
                 if ([bool]$task.exists) { $targets.Add([pscustomobject]@{ path = [string]$task.path; name = [string]$task.name }) }
             }
         } elseif ($null -ne $snapshotScope) {
-            foreach ($name in $snapshotScope.Names) { $targets.Add([pscustomobject]@{ path = $snapshotScope.TaskPath; name = [string]$name }) }
+            foreach ($task in @($Snapshot.tasks)) { if ([bool]$task.exists) { $targets.Add([pscustomobject]@{ path = $snapshotScope.TaskPath; name = [string]$task.name }) } }
         } else {
             $failed.Add([pscustomobject][ordered]@{ path = ''; name = ''; message = "Не вдалося визначити керовані задачі: $liveError" })
         }
@@ -728,7 +728,7 @@ function Set-BRAVOTaskActivation {
     [CmdletBinding()]
     param(
         [AllowNull()]$Policy,
-        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)][AllowNull()]$Snapshot,
         [Parameter(Mandatory = $true)]$Adapter,
         [Parameter(Mandatory = $true)][ValidateSet('Success', 'SuccessWithWarnings', 'Failed', 'RolledBack', 'Critical')][string]$OutcomeStatus,
         [ValidateSet('', 'Install', 'Update', 'Repair')][string]$Action = ''
