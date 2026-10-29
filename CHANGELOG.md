@@ -2,24 +2,68 @@
 
 ## Не випущено (developer)
 
-- **Installer v1: engine `BRAVO.Update`, CLI `BRAVO_UPDATE.ps1` і прототип GUI (гілка `feature/installer-v1`; не прийнято для production).**
-  Новий модуль `modules/BRAVO.Update`: контракти State/Preflight/Plan/Progress/Result/Journal з валідаторами й
-  забороною секретних полів, write-ahead журнал з атомарним записом, lifecycle-lock і канонічний `BRAVO_OPERATION.lock`,
-  read-only discovery, preflight і бар'єр міграції конфігурації, план із fingerprint передумов і TTL, отримання релізу
-  (online за тегом, offline zip + `.sha256` + обов'язковий `release-manifest.json`) з єдиним конвеєром верифікації,
-  приватний staging, верифікований backup, reconcile задач (знімок, призупинення, відновлення, активація за D6),
-  post-deployment validation через adapter дочірніх процесів (`-ExecutionPolicy RemoteSigned`, маскування виводу),
-  транзакційний відкат зі знімком і відновленням version-state, відкат clean install за `createdOwnership`, recovery
-  перерваної операції, same-version repair і діагностичний звіт з редакцією. `BRAVO_UPDATE.ps1` — тонкий CLI
-  (`State`, `Preflight`, `Plan`, `Install`/`Update`/`Repair` з підтвердженням коротким id плану, `Recover`,
-  `Diagnose`, `-AsJson`); mutation виконує worker після UAC за недовіреним запитом у `State\Update\Requests`.
-  `BRAVO_INSTALLER.ps1` — read-only WinForms-прототип (стан і preflight; mutation-кнопки вимкнені). Нові коди
-  завершення `80 DeploymentFailed`, `81 DeploymentRolledBack`, `82 DeploymentCritical` у `BRAVO.ExitCodes`. Ядро
-  розгортання й clean install у цьому знімку ще не інтегровано. Документація: `docs/installer/CONTRACTS.md`,
-  `ENGINE_DESIGN.md`, `DECISIONS.md`, нова `OPERATOR_GUIDE.md`. Self-test suites `UpdateContracts`, `UpdateDiscovery`,
-  `UpdatePreflight`, `UpdatePlan`, `UpdateDiagnostics`, `UpdateRelease`, `UpdateStaging`, `UpdateBackup`,
-  `UpdateReconcile`, `UpdateValidation`, `UpdateRollback`, `UpdateRecovery`, `UpdateWorker`, `InstallerUI`. VM- і
-  real-host acceptance не виконано.
+- **Installer v1: engine `BRAVO.Update`, CLI `BRAVO_UPDATE.ps1` і WinForms GUI `BRAVO_INSTALLER.ps1` (гілка `feature/installer-v1`; не прийнято для production).**
+  Новий модуль `modules/BRAVO.Update`: контракти State/Preflight/Plan/Progress/Result/Journal з забороною секретних
+  полів, атомарний write-ahead журнал, lifecycle-lock і канонічний `BRAVO_OPERATION.lock`, read-only discovery,
+  preflight і бар'єр legacy-конфігурації, план із fingerprint і TTL, отримання релізу (online за явним тегом, offline
+  zip + `.sha256` + обов'язковий `release-manifest.json`) з єдиним конвеєром верифікації, безпечне розпакування,
+  верифікований backup, orchestrator `Invoke-BRAVODeployment` з межею mutation, reconcile конфігурації й задач,
+  post-deployment validation, транзакційний відкат з відновленням version-state, recovery, same-version repair,
+  clean install і захищені корені стану engine. `BRAVO_UPDATE.ps1` — тонкий CLI (`State`, `Preflight`, `Plan`,
+  `Install`/`Update`/`Repair` з підтвердженням коротким id плану, `Recover`, `Diagnose`, `Initialize`); mutation
+  виконує worker після UAC. GUI: майстер, прогрес і результат, Maintenance Center. Нові коди завершення
+  `80 DeploymentFailed`, `81 DeploymentRolledBack`, `82 DeploymentCritical`. Документація `docs/installer/`
+  (CONTRACTS, ENGINE_DESIGN, DECISIONS, OPERATOR_GUIDE). 17 нових self-test suite-ів (`Update*`, `InstallerUI`).
+  VM- і real-host acceptance не виконано; рішення D1–D14 чекають затвердження власником.
+
+- **Fix: спостережуваність retention — видимий прогрес аудиту generation і перевірки SHA512 (#498).**
+  `Remove-BRAVOExpiredBackupGenerations` тепер пише INFO про старт аудиту ще до переліку й читання
+  manifest-ів, а потім підсумок інвентаризації: кількість generation, з них COMPLETE, прострочені за віком
+  до захисту N (COMPLETE і failed/incomplete), окремо стан прапорців видалення (`enableArchiveDeletion`,
+  `enableFailedArchiveDeletion`) і причину, чому повна перевірка SHA512 потрібна або не потрібна. Прострочені,
+  дозволені до видалення та фактично видалені — різні величини: фактично видалені показує лише підсумок
+  «Аудит retention». Перед
+  кожною повною перевіркою SHA512 лог містить generation ID, номер спроби, скільки verified знайдено з N і
+  логічний обсяг архівів; після неї — результат і тривалість (Stopwatch). Фінальний рядок «Аудит retention»
+  зберігає всі наявні поля та їхній порядок; у кінець дописано: перевірено SHA512 (generation), логічний
+  обсяг перевірених архівів (сума розмірів файлів, а не виміряний дисковий I/O), тривалість SHA512 і
+  тривалість retention. Рішення про видалення чи захист не змінено: lazy-hash уже був у developer — SHA512
+  рахується лише при `enableArchiveDeletion = $true` і наявності простроченої COMPLETE, від найновіших до N
+  verified; issue описує стару 5.2.4 (f8fa5aa). Гарантії безпеки #335 без змін, нових ключів конфігурації
+  немає. Self-test: розширено fixture-тести реальної функції в `selftest/BRAVO_SELF_TEST.ManifestStorage.ps1`
+  (облік конкретних хешованих шляхів, свіжі generation без жодного SHA512, сценарії пошкоджених та
+  недостатньо verified generation, пошкоджена COMPLETE між порогами під час активного SHA512, збій читання
+  всередині `Get-BRAVOFileHash`, перевірка логів).
+
+- **Fix: retention backup generation fail-closed для недоступного каталогу компонента і чужого імені за записаним
+  шляхом.** `Resolve-BRAVORetentionGenerationManifest` мав дві прогалини (присутні й у 5.2.6):
+  (1) якщо записаний у manifest шлях збігався з канонічним, файла за ним не було, а каталог компонента був
+  недоступний (відключений том, мережевий шлях), файл рахувався «уже видаленим» — manifest простроченої generation
+  видалявся з SUCCESS «файлів, яких уже не було: N», і архів на недоступному томі ставав сиротою. Тепер такий
+  компонент дає WARNING «каталог компонента недоступний», generation не видаляється; коли каталог доступний, а
+  файла немає, поведінка без змін. (2) Існуючий файл за записаним шляхом приймався без identity-gate за
+  NameTemplate, тож пошкоджений або підмінений manifest простроченої generation міг видалити архів поточної. Тепер
+  діє той самий gate, що для перебудованого шляху і для відновлення (`Get-BRAVOVerifiedGenerationArchive`);
+  без NameTemplate поведінка не змінилась. Self-test
+  `BackupConsistency/SameRecordedPathUnavailableDestinationKeepsManifest`,
+  `BackupConsistency/SameRecordedPathAvailableDestinationMissingFileStillDeletes`,
+  `ManifestStorage/ExistingRecordedPathStillChecksNameTemplate`.
+
+- **Fix: багатотомний VSS (diskshadow) при ручному запуску з профілю з не-ASCII `%TEMP%`.** Відомий дефект
+  5.2.5/5.2.6: сценарій diskshadow (UTF-8 без BOM) і `SET METADATA` у `%TEMP%` diskshadow читає як ANSI/OEM,
+  кирилиця в шляху ламала сценарій (diskshadow 3 -> Archive 40). Тепер сценарій і metadata-.cab кладуться в
+  `%TEMP%`, лише якщо шлях ASCII, інакше в `%SystemRoot%\Temp` (з пробою запису); якщо придатного каталогу немає —
+  керована помилка VSS без live-архівації. Сценарій перевіряється на ASCII-чистоту і пишеться ASCII. Завдання
+  Планувальника під SYSTEM не зачеплені. Обхід для 5.2.6 (ASCII `TEMP`/`TMP` або запуск завданням) більше не
+  потрібен. Self-test `Archive/VSSDiskshadowWorkDir*`, `Archive/VSSDiskshadowScriptIsAsciiInAsciiDirectory`.
+
+- **Fix: Maintenance у local-only конфігурації більше не завершується кодом 10 через відкладену передачу Trace.**
+  При `componentSettings.SFTP.Enabled = false` добові архіви Trace і exchangAPI оновлюються локально, а передача
+  відкладається; раніше це логувалося WARNING «SFTP-сесія недоступна» для кожної дати backlog, і Maintenance щоночі
+  давав `SuccessWithWarnings` (10). Тепер для свідомо вимкненого SFTP це INFO «SFTP вимкнено конфігурацією»; при
+  увімкненому, але недоступному SFTP WARNING лишається. Джерела `.out` і надалі не видаляються без підтвердженої
+  передачі (політику не змінено). Self-test `TraceArchive/RemoteDisabledDeferralLogsInfoNotWarning`,
+  `TraceArchive/SessionUnavailableStillWarns`, `TraceArchive/RuntimeCallsPassRemoteDisabledFromStorageEffective`.
 
 - **Release: збирання з lightweight-тега відхиляється (D8).**
   `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
