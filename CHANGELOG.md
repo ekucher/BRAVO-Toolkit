@@ -2,6 +2,36 @@
 
 ## Не випущено (developer)
 
+- **Fix: retention backup generation fail-closed для недоступного каталогу компонента і чужого імені за записаним
+  шляхом.** `Resolve-BRAVORetentionGenerationManifest` мав дві прогалини (присутні й у 5.2.6):
+  (1) якщо записаний у manifest шлях збігався з канонічним, файла за ним не було, а каталог компонента був
+  недоступний (відключений том, мережевий шлях), файл рахувався «уже видаленим» — manifest простроченої generation
+  видалявся з SUCCESS «файлів, яких уже не було: N», і архів на недоступному томі ставав сиротою. Тепер такий
+  компонент дає WARNING «каталог компонента недоступний», generation не видаляється; коли каталог доступний, а
+  файла немає, поведінка без змін. (2) Існуючий файл за записаним шляхом приймався без identity-gate за
+  NameTemplate, тож пошкоджений або підмінений manifest простроченої generation міг видалити архів поточної. Тепер
+  діє той самий gate, що для перебудованого шляху і для відновлення (`Get-BRAVOVerifiedGenerationArchive`);
+  без NameTemplate поведінка не змінилась. Self-test
+  `BackupConsistency/SameRecordedPathUnavailableDestinationKeepsManifest`,
+  `BackupConsistency/SameRecordedPathAvailableDestinationMissingFileStillDeletes`,
+  `ManifestStorage/ExistingRecordedPathStillChecksNameTemplate`.
+
+- **Fix: багатотомний VSS (diskshadow) при ручному запуску з профілю з не-ASCII `%TEMP%`.** Відомий дефект
+  5.2.5/5.2.6: сценарій diskshadow (UTF-8 без BOM) і `SET METADATA` у `%TEMP%` diskshadow читає як ANSI/OEM,
+  кирилиця в шляху ламала сценарій (diskshadow 3 -> Archive 40). Тепер сценарій і metadata-.cab кладуться в
+  `%TEMP%`, лише якщо шлях ASCII, інакше в `%SystemRoot%\Temp` (з пробою запису); якщо придатного каталогу немає —
+  керована помилка VSS без live-архівації. Сценарій перевіряється на ASCII-чистоту і пишеться ASCII. Завдання
+  Планувальника під SYSTEM не зачеплені. Обхід для 5.2.6 (ASCII `TEMP`/`TMP` або запуск завданням) більше не
+  потрібен. Self-test `Archive/VSSDiskshadowWorkDir*`, `Archive/VSSDiskshadowScriptIsAsciiInAsciiDirectory`.
+
+- **Fix: Maintenance у local-only конфігурації більше не завершується кодом 10 через відкладену передачу Trace.**
+  При `componentSettings.SFTP.Enabled = false` добові архіви Trace і exchangAPI оновлюються локально, а передача
+  відкладається; раніше це логувалося WARNING «SFTP-сесія недоступна» для кожної дати backlog, і Maintenance щоночі
+  давав `SuccessWithWarnings` (10). Тепер для свідомо вимкненого SFTP це INFO «SFTP вимкнено конфігурацією»; при
+  увімкненому, але недоступному SFTP WARNING лишається. Джерела `.out` і надалі не видаляються без підтвердженої
+  передачі (політику не змінено). Self-test `TraceArchive/RemoteDisabledDeferralLogsInfoNotWarning`,
+  `TraceArchive/SessionUnavailableStillWarns`, `TraceArchive/RuntimeCallsPassRemoteDisabledFromStorageEffective`.
+
 - **Release: збирання з lightweight-тега відхиляється (D8).**
   `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
   `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не
