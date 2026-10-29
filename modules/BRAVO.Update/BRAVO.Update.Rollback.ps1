@@ -1033,7 +1033,7 @@ function Invoke-BRAVORollback {
             # Крок 2: відкат install (§9.3).
             [void](& $step 'Rollback.InstallCleanup' {
                 $cleanup = Invoke-BRAVOInstallRollback -Journal $rb.Journal -Adapter $rb.Adapter -StateRoot $rb.StateRoot
-                foreach ($f in @($cleanup.Findings)) { [void]$rb.Findings.Add($f) }
+                foreach ($f in (Get-BRAVOUpdateArrayProperty -InputObject $cleanup -Name 'Findings')) { [void]$rb.Findings.Add($f) }
                 if (-not $cleanup.Success) {
                     throw ('Відкат install не завершено, лишилися створені операцією елементи: ' + ((@($cleanup.OurRemaining) + @($cleanup.Problems)) -join '; '))
                 }

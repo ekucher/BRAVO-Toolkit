@@ -325,7 +325,8 @@ function Get-BRAVOUpdateArrayProperty {
     if ($InputObject -is [System.Collections.IDictionary]) { $raw = $InputObject[$Name] } else { $raw = $InputObject.PSObject.Properties[$Name].Value }
     if ($null -eq $raw) { return @() }
     $items = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($item in @($raw)) { if ($null -ne $item) { $items.Add($item) } }
+    # foreach напряму, без @(): @(<List[object]>) кидає 'Argument types do not match' у PS 5.1.
+    foreach ($item in $raw) { if ($null -ne $item) { $items.Add($item) } }
     return $items.ToArray()
 }
 
@@ -1038,7 +1039,7 @@ function Invoke-BRAVOUpdateAcquireStage {
             if ((Get-BRAVOUpdatePropertyValue -InputObject $source -Name 'prereleaseAuthorized' -Default $false) -eq $true) { $verifyArgs['AllowPrerelease'] = $true }
             $verification = Test-BRAVOReleaseArtifact @verifyArgs
             $firstBlocker = $null
-            foreach ($finding in @($verification.Findings)) {
+            foreach ($finding in (Get-BRAVOUpdateArrayProperty -InputObject $verification -Name 'Findings')) {
                 if ($finding.severity -ceq 'Blocker') { if ($null -eq $firstBlocker) { $firstBlocker = $finding }; $Context.Findings.Add($finding) }
                 elseif ($finding.severity -ceq 'Warning') { $Context.Findings.Add($finding) }
             }
@@ -1071,7 +1072,7 @@ function Invoke-BRAVOUpdateAcquireStage {
             $targetVersion = [string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'targetVersion' -Default '')
             $stagedCheck = Test-BRAVOStagedRuntime -StagedRoot $stagedDir -ExpectedVersion $targetVersion
             $firstBlocker = $null
-            foreach ($finding in @($stagedCheck.Findings)) {
+            foreach ($finding in (Get-BRAVOUpdateArrayProperty -InputObject $stagedCheck -Name 'Findings')) {
                 if ($finding.severity -ceq 'Blocker') { if ($null -eq $firstBlocker) { $firstBlocker = $finding }; $Context.Findings.Add($finding) }
             }
             if ((-not $stagedCheck.IsValid) -or ($null -ne $firstBlocker)) {
