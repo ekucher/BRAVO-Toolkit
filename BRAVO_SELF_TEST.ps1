@@ -34455,6 +34455,14 @@ function Write-BRAVOLog {
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateReconcile' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateRollback') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateRollback'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateRollback') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateRollback.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateRollback' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 } catch {
     # #219 (частина B): сюди доходять лише маркери глобальних меж і винятки
     # з коду МІЖ секціями. Register-BRAVOSelfTestGlobalFatal реєструє
