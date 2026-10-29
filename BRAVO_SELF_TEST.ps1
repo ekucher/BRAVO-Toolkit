@@ -3862,6 +3862,27 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "VersionState/MalformedPrereleaseFailsClosed" `
         -Failure 'malformed prerelease-суфікс (5.3.0-rc"oops) має блокувати в Enforce, попереджати у Warn і поважати BRAVO_ALLOW_DOWNGRADE=1 — не прийматися і не псувати state'
 
+    # 5.2.5-rc.8 (рев'ю бекпорту, перенесено з hotfix/5.2.5): перенос рядка в кінці ідентифікатора.
+    # .NET-якір `$` збігається ПЕРЕД кінцевим `\n`, тож '1`n' проходив
+    # валідацію і класифікацію як числовий (довжина 2 > 1): malformed
+    # 5.2.5-rc.1`n+build виглядав новішим за записаний 5.2.5-rc.2.
+    # Ідентифікатори мають закінчуватись абсолютним кінцем рядка (\z).
+    $newlineVersionContent = '{"packageVersion": "5.2.5-rc.1\n+build"}'
+    $newlineStateContent = '{"highestVersion": "5.2.5", "highestVersionFull": "5.2.5-rc.2"}'
+    $newlineEnforce = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $root -StatePath 'synthetic' `
+        -VersionContent $newlineVersionContent -StateContent $newlineStateContent `
+        -Mode Enforce -AllowDowngrade '' -NoWrite
+    $newlineIdentifierParsed = ConvertTo-BRAVOComparableVersion -Text ("5.2.5-rc.1" + "`n" + "+build")
+    $trailingNewlineIdentifierParsed = ConvertTo-BRAVOComparableVersion -Text ("5.2.5-rc." + "1`n" + ".x")
+    Test-BRAVOCondition `
+        -Condition (
+            -not $newlineEnforce.IsValid -and $newlineEnforce.ShouldBlock -and
+            $null -eq $newlineIdentifierParsed -and $null -eq $trailingNewlineIdentifierParsed
+        ) `
+        -Name "VersionState/NewlineInIdentifierFailsClosed" `
+        -Failure ("prerelease/build-ідентифікатор із переносом рядка має відхилятись (fail-closed у Enforce), а не класифікуватись як числовий; факти: IsValid=$($newlineEnforce.IsValid) ShouldBlock=$($newlineEnforce.ShouldBlock) parsed1=$($null -ne $newlineIdentifierParsed) parsed2=$($null -ne $trailingNewlineIdentifierParsed)")
+
     # Не-канонічний core (4 компоненти) — malformed fail-closed шлях, а
     # НЕ запис у state: інакше '5.3.0.1' став би high-water mark і
     # коректний '5.3.0' блокувався б як «відкат».
@@ -4366,7 +4387,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         }
     }
 
-    # Acceptance DEV-LIMS (2026-08-13): `[int]( if ... )` у
+    # Acceptance HOST-11 (2026-08-13): `[int]( if ... )` у
     # Invoke-BRAVOBazaIncrementalSync ВАЛІДНО парсився (if у звичайних
     # дужках — це КОМАНДА з іменем "if", не keyword) і падав лише в
     # рантаймі CommandNotFoundException на першому реальному прогоні —
@@ -4379,7 +4400,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Diagnostics/NoKeywordParsedAsCommand" `
         -Failure "statement-keyword у позиції команди (напр. if усередині (...) замість `$(...)) валідно парситься і падає ЛИШЕ в рантаймі CommandNotFoundException; знайдено: $($keywordAsCommandFindings.ToArray() -join ', ')"
 
-    # Acceptance DEV-LIMS (знахідки #3 і #5): сирий $winSCPPath (Tools\
+    # Acceptance HOST-11 (знахідки #3 і #5): сирий $winSCPPath (Tools\
     # WinSCP.com -- CLI-стаб legacy-шляхів) НЕ сміє потрапляти у
     # -WinSCPExecutablePath двигуна В ЖОДНОМУ call-site комплекту: .NET-
     # асемблі потрібен winscp.exe (пара резолвиться через
@@ -4399,7 +4420,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Diagnostics/NoRawWinSCPComPathPassedToEngine" `
         -Failure "жоден call-site не сміє передавати сирий `$winSCPPath у -WinSCPExecutablePath (WinSCP.com != winscp.exe; резолвіть пару через Get-BRAVOWinSCPDotNetComponents); знайдено: $($rawComPathFindings.ToArray() -join ', ')"
 
-    # Acceptance DEV-LIMS (2026-08-13, той самий прогін): "a{0}" + "b{3}" -f args
+    # Acceptance HOST-11 (2026-08-13, той самий прогін): "a{0}" + "b{3}" -f args
     # форматує ЛИШЕ правий рядок (-f зв'язується сильніше за +) — перша
     # половина retention-аудиту вийшла в лог з літеральними {0}/{1}/{2}.
     # Guard: жодного Plus-виразу, чий ПРАВИЙ операнд — Format (-f), а лівий
@@ -5038,7 +5059,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # restoreIntegrityFailed, коли після збою 7z t не лишилось жодної
             # придатної точки відновлення (старіші сесії перевіряються з
             # -NoFailureFlags, тож цей backstop — окрема точка).
-            # +1 integrity (#300, Claude QA 386-Q2): retention виставляє
+            # +1 integrity (#300, QA 386-Q2): retention виставляє
             # restoreIntegrityFailed, коли сама перевірка 7z t кинула виняток
             # (перевірку не виконано — fail-closed і для старших сесій).
             # +1 integrity (#424): канонічний перелік архівів реставрації
@@ -5422,12 +5443,12 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Failure "Get-HostInformation при lookupEnabled=true має намагатись отримати публічну IP (не хардкодити 'вимкнено'), доки це не вимкнено свідомо через PublicIPLookupEnabled"
 
     $notifyHostOff = [pscustomobject]@{
-        MachineName = "DEV-LIMS"
+        MachineName = "HOST-11"
         LocalIP = "192.0.2.102"
         PublicIP = "вимкнено"
     }
     $notifyHostUnavailable = [pscustomobject]@{
-        MachineName = "DEV-LIMS"
+        MachineName = "HOST-11"
         LocalIP = "192.0.2.102"
         PublicIP = "недоступна"
     }
@@ -5494,7 +5515,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     Test-BRAVOCondition -Condition ($notifySuccess.Contains("Дій не потрібно")) -Name "Notifications/SuccessUsesNoActionRequired" -Failure "SUCCESS notification має явно казати, що дія не потрібна"
     Test-BRAVOCondition -Condition ($notifyWarning.Contains("Потрібна дія: перевірити виконання BRAVO_ARCHIV")) -Name "Notifications/WarningUsesConcreteAction" -Failure "WARNING/CRITICAL notification має показувати конкретну дію"
     Test-BRAVOCondition -Condition ($notifySuccess.Contains(":office: TEST-COMPANY [1234567890]")) -Name "Notifications/InstitutionUsesOfficeEmoji" -Failure "institution line має використовувати office token"
-    Test-BRAVOCondition -Condition (-not $notifySuccess.Contains("Публічна IP") -and -not $notifySuccess.Contains("IP-адреси:") -and $notifySuccess.Contains("DEV-LIMS") -and $notifySuccess.Contains("192.0.2.102")) -Name "Notifications/DisabledPublicIpIsOmitted" -Failure "PublicIP=вимкнено не має показуватись у штатному повідомленні"
+    Test-BRAVOCondition -Condition (-not $notifySuccess.Contains("Публічна IP") -and -not $notifySuccess.Contains("IP-адреси:") -and $notifySuccess.Contains("HOST-11") -and $notifySuccess.Contains("192.0.2.102")) -Name "Notifications/DisabledPublicIpIsOmitted" -Failure "PublicIP=вимкнено не має показуватись у штатному повідомленні"
     Test-BRAVOCondition -Condition (-not $notifyUnavailable.Contains("Публічна IP")) -Name "Notifications/UnavailablePublicIpIsOmitted" -Failure "PublicIP=недоступна не має показуватись у штатному повідомленні"
     Test-BRAVOCondition -Condition ($notifyPublic.Contains("Публічна IP: 198.51.100.44") -and $notifyPublic.Contains("DATA-SERVER · 192.0.2.102 · 192.0.2.236")) -Name "Notifications/AvailablePublicIpIsShown" -Failure "valid Public IP має показуватись окремим рядком"
     Test-BRAVOCondition -Condition ($notifySuccess.Contains("Остання резервна копія:")) -Name "Notifications/HealthSuccessUsesLastBackupTerm" -Failure "Health SUCCESS має використовувати термін Остання резервна копія"
@@ -5836,7 +5857,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Condition (
             $dryRunDiscordRendered.Contains("✅ BRAVO DRY RUN — ТЕСТОВЕ СПОВІЩЕННЯ") -and
             $dryRunDiscordRendered.Contains("🏢 TEST-COMPANY [1234567890]") -and
-            $dryRunDiscordRendered.Contains("🖥️ DEV-LIMS") -and
+            $dryRunDiscordRendered.Contains("🖥️ HOST-11") -and
             -not $dryRunDiscordRendered.Contains(":white_check_mark:") -and
             -not $dryRunDiscordRendered.Contains(":office:") -and
             -not $dryRunDiscordRendered.Contains(":desktop_computer:")
@@ -8470,7 +8491,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Health/GenericEnvironmentFailureClassification" `
         -Failure "IOException (диск повний тощо) НЕ повинен класифікуватися як privilege-відмова"
 
-    # --- Компактні операторські сповіщення (запит оператора, DEV-LIMS
+    # --- Компактні операторські сповіщення (запит оператора, HOST-11
     # 2026-08-21): watchdog-issue несе ВЛАСНИЙ ActionText (Component там —
     # опис події, і шаблон «запустити або перевірити службу <Component>»
     # давав зламану фразу «...службу Служби після аварії BRAVO_...»);
@@ -8519,7 +8540,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # містити 8.3-коротку форму профілю (C:\Users\E980D~1.KUC\...), а
     # Remove-Item -LiteralPath у PS 5.1 падає на короткому сегменті з
     # PSArgumentException «object at the specified path does not exist»
-    # (реальний випадок: DEV-LIMS, Server 2022). GetTempPath повертає
+    # (реальний випадок: HOST-11, Server 2022). GetTempPath повертає
     # нормалізовану довгу форму.
     $preflightWritableDir = Join-Path ([IO.Path]::GetTempPath()) (
         "bravo_selftest_preflight_{0}" -f ([guid]::NewGuid().ToString("N"))
@@ -8998,6 +9019,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             "Send-BRAVONotificationChunks",
             "Test-BAZAPathBlockedByIncompatibleName",
             "Split-BAZAPendingFilesByCompatibility",
+            "Test-BAZACreationClockTrusted",
+            "Test-BAZAPathHasReparsePoint",
+            "Test-BAZAVanishedSnapshotObjectBackedUp",
+            "Get-BAZAPendingFileCycleClassification",
             "Get-BAZASynchronizationOutcome",
             "Get-BRAVOVSSSnapshotSourcePath",
             "Get-BRAVOVSSVolumeRoot",
@@ -11008,7 +11033,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # Тест структурний (AST/текст) — той самий підхід, що й усі сусідні
     # Discovery/Console/* перевірки цього файлу для Archive.Runtime.ps1;
     # runtime-контракт SFTP/WinSCP self-test навмисно не виконує наживо
-    # (див. .claude/rules — CI-докази не замінюють real-server acceptance
+    # (див. docs/engineering/testing-validation.md — CI-докази не замінюють real-server acceptance
     # для WinSCP/SFTP-поведінки).
     Test-BRAVOCondition `
         -Condition (
@@ -13724,10 +13749,13 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 # Дизайн: Force не пише write-ahead (Phase Begin + Force ->
                 # Write=false); збій Force рахується окремою спробою, але
                 # ніколи не знижує досягнутий ліміт (Write=false, стан
-                # незмінний). Невдалий Force БЕЗ наявного стану створює файл
-                # лише з полями лічильника/класу (без Status/
-                # ScheduledOccurrence/Reason — інакше 'Pending' замовляв би
-                # автоматичну реставрацію).
+                # незмінний). Невдалий Force БЕЗ наявного стану (або з
+                # пошкодженим) не вигадує 'Pending' для слоту (це замовляло б
+                # автоматичну реставрацію): Status/ScheduledOccurrence/Reason
+                # пишуться порожніми рядками, як у Write-BRAVORestoreForcedOutcome.
+                # Поля мусять БУТИ: читач v5.2.4 під StrictMode 2.0 звертається
+                # до $restoreState.Status напряму, і без поля rollback на 5.2.4
+                # падав би на кожному прогоні Maintenance.
                 $retry438BeginForce = & $retry438Module {
                     param($stateDir, $slot)
                     Set-StrictMode -Version 2.0
@@ -13760,6 +13788,30 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $r.ForceOnlyHasStatus = ($null -ne $forceOnlyState.PSObject.Properties['Status'])
                     $r.ForceOnlyHasSlot = ($null -ne $forceOnlyState.PSObject.Properties['ScheduledOccurrence'])
                     $r.ForceOnlyHasReason = ($null -ne $forceOnlyState.PSObject.Properties['Reason'])
+                    $r.ForceOnlySlotFieldsEmpty = $r.ForceOnlyHasStatus -and $r.ForceOnlyHasSlot -and $r.ForceOnlyHasReason -and
+                        ([string]$forceOnlyState.Status -ceq '') -and ([string]$forceOnlyState.ScheduledOccurrence -ceq '') -and ([string]$forceOnlyState.Reason -ceq '')
+                    # Вираз $scheduledSucceeded з v5.2.4 (без PSObject-guard) під
+                    # StrictMode 2.0: rollback-сумісність файлу стану.
+                    $legacy524Reader = {
+                        param($legacyState)
+                        try {
+                            $null = ($null -ne $legacyState -and
+                                [string]$legacyState.Status -eq 'Succeeded' -and
+                                [string]$legacyState.ScheduledOccurrence -eq $slot.ToString('o'))
+                            $true
+                        } catch { $false }
+                    }
+                    $r.ForceOnlyLegacy524ReaderOk = & $legacy524Reader $forceOnlyState
+                    # Пошкоджений стан + невдалий Force: quarantine, ліміт, поля слоту є.
+                    $script:stateRoot = Join-Path $stateDir 'corruptforce'
+                    [void](New-Item -ItemType Directory -Path $script:stateRoot -Force)
+                    [IO.File]::WriteAllText((Join-Path $script:stateRoot 'BRAVO_RESTORE_STATE.json'), '{"Status":', (New-Object Text.UTF8Encoding($false)))
+                    [void](Register-BRAVORestoreAttemptFailure -ScheduledOccurrence $slot -Fingerprint 'FILES:a.md||MISSING:' -ForceRestore $true -Limit 2)
+                    $corruptForceState = Read-BRAVORestoreState
+                    $r.CorruptForceCount = Get-BRAVORestoreRollbackRetryCount -State $corruptForceState
+                    $r.CorruptForceStatus = $(if ($null -ne $corruptForceState -and $null -ne $corruptForceState.PSObject.Properties['Status']) { [string]$corruptForceState.Status } else { '<absent>' })
+                    $r.CorruptForceLegacy524ReaderOk = & $legacy524Reader $corruptForceState
+                    $r.CorruptForceCopyCount = @(Get-ChildItem -LiteralPath $script:stateRoot -Filter 'BRAVO_RESTORE_STATE.json.corrupt-*').Count
                     # Автоматичний збій без стану лишається з Pending + слот (контраст).
                     $script:stateRoot = Join-Path $stateDir 'autoonly'
                     [void](Register-BRAVORestoreAttemptFailure -ScheduledOccurrence $slot -Fingerprint 'FILES:a.md||MISSING:' -Limit 2)
@@ -13774,11 +13826,13 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                         -not $retry438BeginForce.InProgressAfterForceFailure -and
                         -not $retry438BeginForce.ForceAtCapWrote -and $retry438BeginForce.StateUnchangedAtCap -and $retry438BeginForce.CountAtCap -eq 2 -and
                         $retry438BeginForce.ForceOnlyCount -eq 1 -and
-                        -not $retry438BeginForce.ForceOnlyHasStatus -and -not $retry438BeginForce.ForceOnlyHasSlot -and -not $retry438BeginForce.ForceOnlyHasReason -and
+                        $retry438BeginForce.ForceOnlySlotFieldsEmpty -and $retry438BeginForce.ForceOnlyLegacy524ReaderOk -and
+                        $retry438BeginForce.CorruptForceCount -eq 2 -and $retry438BeginForce.CorruptForceStatus -ceq '' -and
+                        $retry438BeginForce.CorruptForceLegacy524ReaderOk -and $retry438BeginForce.CorruptForceCopyCount -eq 1 -and
                         $retry438BeginForce.AutoOnlyStatus -ceq 'Pending'
                     ) `
                     -Name "Maintenance/RestoreBeginThenForceFailureSemanticsAndNoSlotFieldsFromForce" `
-                    -Failure "#438 (P2-2/P3-4): Force не пише write-ahead; Force-збій після авто-Begin дає лічильник 2 (окремі спроби) і гасить прапорець; Force-збій при досягнутому ліміті нічого не пише; Force-збій без стану не створює Status/ScheduledOccurrence/Reason (авто-збій створює Pending); факти: $($retry438BeginForce | ConvertTo-Json -Compress)"
+                    -Failure "#438 (P2-2/P3-4): Force не пише write-ahead; Force-збій після авто-Begin дає лічильник 2 (окремі спроби) і гасить прапорець; Force-збій при досягнутому ліміті нічого не пише; Force-збій без стану або з пошкодженим не вигадує Pending: Status/ScheduledOccurrence/Reason порожні, але присутні (читач v5.2.4 під StrictMode 2.0 не падає; пошкоджений стан — quarantine-копія і лічильник = ліміт); авто-збій створює Pending; факти: $($retry438BeginForce | ConvertTo-Json -Compress)"
 
                 # 4c. HoldServices-гейт Recovery (P2-3): реальні
                 # Get-BRAVOMaintenanceRecoverRestorePending +
@@ -15302,7 +15356,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/EmptySourceReportedSeparatelyFromNotInstalled' `
         -Failure "Health має показувати порожній каталог джерела окремо від «не встановлено», з :warning: для компонента, що мав дані: $emptySourceSuccess"
-    # #301 (рев'ю #391, Codex 510e35e): прогін без issue, але з WARNING у
+    # #301 (рев'ю #391, 510e35e): прогін без issue, але з WARNING у
     # журналі (порожній каталог, що мав дані) завершується кодом 10, тож
     # Operations-подія не може рапортувати SUCCESS. Severity береться з того
     # самого лічильника, що й код завершення.
@@ -15331,7 +15385,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/CleanRunOperationsEventFollowsWarningExitCode' `
         -Failure "Operations-подія Health без issue має бути WARNING, коли журнал має WARNING (код 10), і CRITICAL при ShouldBlock: clean='$($cleanRunVerdicts['Clean'])' warned='$($cleanRunVerdicts['Warned'])' blocked='$($cleanRunVerdicts['Blocked'])' error='$cleanRunVerdictError'"
-    # #301 (рев'ю #391, Codex 5f0dc37): прогін без issue, але з порожнім
+    # #301 (рев'ю #391, 5f0dc37): прогін без issue, але з порожнім
     # каталогом, що мав дані, - це WARNING і для Slack/Discord: звіт іде
     # маршрутом alerts і в режимі errors_only, незалежно від NotifyOnSuccess.
     # Відбиток дедуплікації містить ці компоненти, тож зникнення попередження
@@ -19995,7 +20049,7 @@ try {
                     @($healthToolIntegrityAlerts | Where-Object { $_.Contains('TOOLS_MANIFEST.json') }).Count -eq 1 -and
                     @($healthToolIntegrityAlerts | Where-Object { $_.StartsWith('ALERT-ISSUE Цілісність інструментів | ') }).Count -eq 0 -and
                     $healthToolIntegrityAlerts[0].StartsWith('ALERT-ISSUE SFTP | ') -and
-                    # Codex P2: дія алерту — про інструменти, не «перевірити SFTP-з'єднання».
+                    # рев'ю P2: дія алерту — про інструменти, не «перевірити SFTP-з'єднання».
                     (& $healthOrchestrationSelect $healthToolIntegrityEvents '^ALERT-ACTION ') -ceq 'ALERT-ACTION перевірити каталог Tools і TOOLS_MANIFEST.json: можлива підміна 7za.exe/WinSCP.com' -and
                     (& $healthOrchestrationSelect $healthToolIntegrityEvents '^(NOTIFY-|ALERT-STATE-|SUCCESS-STATE-SAVE$|STATUS )') -ceq 'NOTIFY-ROUTE CRITICAL|NOTIFY-SEND https://self-test.invalid/alerts self-test alert|ALERT-STATE-SAVE|STATUS 32'
                 ) `
@@ -20110,7 +20164,7 @@ try {
         }
     }
 
-    # CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md: автоматичний Discovery джерел
+    # ТЗ ARCHIV_LIMS_MONOLITH: автоматичний Discovery джерел
     # (BRAVO_ROOT/WEB_ROOT/MODEL/BLOG/BRAVOEXCH/BAZA_APP/BAZA_WWW) за
     # встановленою службою BRAVO і активним bravo.ini, з повним ручним
     # перевизначенням через BRAVO.config.
@@ -20355,7 +20409,7 @@ try {
             -Name "Discovery/BazaWwwUsesHttpdConfDocumentRoot" `
             -Failure "BAZA_WWW має братись з DocumentRoot реального httpd.conf встановленої Apache-служби, а не з фолбек-здогадки <WEB_ROOT>\www"
 
-        # #301 (рев'ю #391, Codex 64d0e94): порожній <DocumentRoot>\BAZA - це
+        # #301 (рев'ю #391, 64d0e94): порожній <DocumentRoot>\BAZA - це
         # той самий «каталог є, але порожній», що й для компонентів з bravo.ini.
         # Presence-запис має нести AbsenceKind 'Empty', і підтверджений раніше
         # BAZA_WWW дає Warning (EmptySource), а не Error.
@@ -20403,7 +20457,7 @@ try {
             -Name "Discovery/EmptyBazaWwwDocumentRootIsEmptySourceWarning" `
             -Failure "порожній <DocumentRoot>\BAZA має дати Absent з AbsenceKind 'Empty', а підтверджений раніше BAZA_WWW - EmptySource з Warning без Error; absenceKind='$emptyBazaWwwAbsenceKind' scope='$emptyBazaWwwScopeValue' findings='$(@($emptyBazaWwwFindings | ForEach-Object { [string]$_.Severity }) -join ',')' error='$emptyBazaWwwError'"
 
-        # #301 (рев'ю #391, Codex 5f0dc37): BAZA_WWW, відомий лише з останнього
+        # #301 (рев'ю #391, 5f0dc37): BAZA_WWW, відомий лише з останнього
         # COMPLETE manifest. Сире поле BAZA_WWW для порожнього каталогу - $null,
         # тож доказ має перейти в baseline шляхом кандидата; інакше Warning
         # другої ночі тихо став би Info.
@@ -21326,6 +21380,375 @@ try {
             ) `
             -Name "Discovery/BravoServiceAbsentModelBlogBravoexchResolveFromIni" `
             -Failure "коли службу BRAVO не встановлено, MODEL/BLOG/BRAVOEXCH мають резолвитись з canonical bravo.ini (незалежне authoritative джерело) — відсутність служби не повинна блокувати ці backup-джерела, лише BRAVO_ROOT (похідне від служби значення)"
+
+        # =====================================================================
+        # Discovery/MissingDrive*: відсутній диск / недосяжний UNC / некоректні
+        # шляхи з bravo.ini не повинні перетворюватись на виняток Discovery.
+        # Контракт: Resolve-BRAVOInstallationDiscovery не кидає виняток, а
+        # повертає результат із Presence/Reason (Error для недоступного
+        # носія, Absent/NoPath для шляху без каталогу). Літера "відсутнього"
+        # диска обчислюється під час тесту, нічого не створюється на диску.
+        # =====================================================================
+        $missingDriveUsedLetters = @(
+            @([IO.DriveInfo]::GetDrives() | ForEach-Object { ([string]$_.Name).Substring(0, 1).ToUpperInvariant() }) +
+            @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { ([string]$_.Name).ToUpperInvariant() })
+        )
+        $missingDriveLetter = $null
+        foreach ($missingDriveCandidate in [char[]]([int][char]'D'..[int][char]'Z')) {
+            if ($missingDriveUsedLetters -notcontains ([string]$missingDriveCandidate)) {
+                $missingDriveLetter = [string]$missingDriveCandidate
+                break
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition ($null -ne $missingDriveLetter) `
+            -Name "Discovery/MissingDriveSetupAbsentDriveLetterAvailable" `
+            -Failure "SETUP: усі літери D..Z зайняті на цьому хості — неможливо побудувати детермінований сценарій відсутнього диска; тести Discovery/MissingDrive* не виконувались (це не PASS)"
+
+        if ($null -ne $missingDriveLetter) {
+            $missingDriveBase = Join-Path $discoveryTestRoot "MissingDrive"
+            $missingDriveRoot = ('{0}:\' -f $missingDriveLetter)
+            # Усі вхідні дані передаються параметрами: виклик ізольований
+            # від змінних навколишнього scope.
+            $invokeMissingDriveDiscovery = {
+                param([string]$CaseName, [string[]]$IniLines, [object[]]$Services, [hashtable]$Settings, [string[]]$WebCandidates, [string]$BaseDirectory)
+                $caseSystemRoot = Join-Path $BaseDirectory ($CaseName + "\FixtureWindows")
+                $caseIniDirectory = Join-Path $caseSystemRoot "SysWOW64"
+                [void][IO.Directory]::CreateDirectory($caseIniDirectory)
+                [IO.File]::WriteAllLines((Join-Path $caseIniDirectory "bravo.ini"), $IniLines)
+                $caseOutcome = [pscustomobject]@{ Result = $null; Error = $null }
+                try {
+                    $caseArguments = @{
+                        LimsRoot = $BaseDirectory
+                        BravoServiceName = "BRAVO"
+                        Services = $Services
+                        SystemRoot = $caseSystemRoot
+                        Is64BitOperatingSystem = $true
+                    }
+                    if (@($WebCandidates).Count -gt 0) { $caseArguments['WebServiceCandidates'] = $WebCandidates }
+                    if ($null -ne $Settings) { $caseArguments['DiscoverySettings'] = $Settings }
+                    $caseOutcome.Result = Resolve-BRAVOInstallationDiscovery @caseArguments
+                } catch {
+                    $caseOutcome.Error = ("{0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message)
+                }
+                return $caseOutcome
+            }
+            $newMissingDriveService = {
+                param([string]$Name, [string]$DisplayName, [string]$ExecutablePath)
+                [pscustomobject]@{ Name = $Name; DisplayName = $DisplayName; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $ExecutablePath) }
+            }
+            try {
+                # (a) MODEL/BLOG на відсутньому диску, служб немає.
+                $mdA = & $invokeMissingDriveDiscovery 'a' @(
+                    '[model]',
+                    ('MODEL={0}LIMS\MODEL\lims' -f $missingDriveRoot),
+                    ('BLOG={0}LIMS\BLOG\' -f $missingDriveRoot)) @() $null @() $missingDriveBase
+                $mdAOk = ($null -eq $mdA.Error -and $null -ne $mdA.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdAOk `
+                    -Name "Discovery/MissingDriveIniModelBlogDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для MODEL/BLOG на відсутньому диску ${missingDriveLetter}:; отримано: $($mdA.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdAOk -and
+                        $mdA.Result.MODEL_SOURCE -eq ('{0}LIMS\MODEL' -f $missingDriveRoot) -and
+                        $mdA.Result.BAZA_APP -eq ('{0}LIMS\BAZA' -f $missingDriveRoot) -and
+                        ([string]$mdA.Result.Reasons.BAZA_APP).Contains("MODEL/BLOG з bravo.ini")
+                    ) `
+                    -Name "Discovery/MissingDriveIniModelBlogResolvesLexicalPaths" `
+                    -Failure "для відсутнього диска MODEL_SOURCE/BAZA_APP мають бути лексично виведені з bravo.ini (X:\LIMS\MODEL, X:\LIMS\BAZA), Reasons.BAZA_APP — з поясненням 'MODEL/BLOG з bravo.ini'; помилка: $($mdA.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdAOk -and
+                        $mdA.Result.Components['MODEL'].Presence -eq 'Error' -and
+                        ([string]$mdA.Result.Components['MODEL'].Reason).Contains(('диск {0}: недоступний' -f $missingDriveLetter)) -and
+                        $mdA.Result.Components['BAZA_APP'].Presence -eq 'Error' -and
+                        ([string]$mdA.Result.Components['BAZA_APP'].Reason).Contains(('диск {0}: недоступний' -f $missingDriveLetter))
+                    ) `
+                    -Name "Discovery/MissingDriveComponentsAreErrorNotAbsent" `
+                    -Failure "MODEL і BAZA_APP на відсутньому диску мають бути Presence='Error' (носій недоступний != компонент не встановлено) з Reason, що містить 'диск недоступний'; помилка: $($mdA.Error)"
+                $mdAValidation = @()
+                if ($mdAOk) {
+                    $mdAValidation = @(Test-BRAVODiscoveryResult -DiscoveryResult $mdA.Result -EnabledComponents @{ BAZA_APP = $true })
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdAOk -and
+                        $mdAValidation.Count -ge 1 -and
+                        @($mdAValidation | Where-Object { ([string]$_).Contains("BAZA_APP") -and ([string]$_).Contains("шлях не існує") }).Count -ge 1
+                    ) `
+                    -Name "Discovery/MissingDriveValidationReportsEnabledBazaAppProblem" `
+                    -Failure "Test-BRAVODiscoveryResult з увімкненим BAZA_APP на відсутньому диску має повідомити проблему (не OK): 'Джерело ''BAZA_APP'' увімкнено, але шлях не існує'; помилка: $($mdA.Error)"
+
+                # (b) служба BRAVO на відсутньому диску, bravo.ini без MODEL, FILE відносний.
+                $mdBService = & $newMissingDriveService 'BRAVO' 'BRAVO Service' ('{0}LIMS\bravo.exe' -f $missingDriveRoot)
+                $mdB = & $invokeMissingDriveDiscovery 'b' @(
+                    '[model]',
+                    '[Debug]',
+                    'FILE=TraceSRV.out') @($mdBService) $null @() $missingDriveBase
+                $mdBOk = ($null -eq $mdB.Error -and $null -ne $mdB.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdBOk `
+                    -Name "Discovery/MissingDriveServiceExeDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для служби BRAVO, чий exe лежить на відсутньому диску; отримано: $($mdB.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdBOk -and
+                        $mdB.Result.BAZA_APP -eq ('{0}LIMS\BAZA' -f $missingDriveRoot) -and
+                        $mdB.Result.TRACE_FILE -eq ('{0}LIMS\TraceSRV.out' -f $missingDriveRoot)
+                    ) `
+                    -Name "Discovery/MissingDriveServiceExeResolvesBazaAppAndTraceFile" `
+                    -Failure "для служби на відсутньому диску BAZA_APP має бути X:\LIMS\BAZA, а відносний TRACE_FILE — X:\LIMS\TraceSRV.out (лексично від каталогу exe); помилка: $($mdB.Error)"
+
+                # (c) Apache на відсутньому диску.
+                $mdCService = & $newMissingDriveService 'Apache2.4' 'Apache2.4' ('{0}web\apache\bin\httpd.exe' -f $missingDriveRoot)
+                $mdC = & $invokeMissingDriveDiscovery 'c' @('[model]') @($mdCService) $null @('Apache2.4') $missingDriveBase
+                $mdCOk = ($null -eq $mdC.Error -and $null -ne $mdC.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdCOk `
+                    -Name "Discovery/MissingDriveApacheDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для Apache-служби на відсутньому диску; отримано: $($mdC.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdCOk -and
+                        $mdC.Result.HttpdConfPath -eq ('{0}web\apache\conf\httpd.conf' -f $missingDriveRoot) -and
+                        $null -eq $mdC.Result.BAZA_WWW -and
+                        $mdC.Result.BAZA_WWW_Presence -ne 'Present' -and
+                        $mdC.Result.Components['BAZA_WWW'].Presence -ne 'Present' -and
+                        $mdC.Result.Components['WEB_ROOT'].Presence -ne 'Present'
+                    ) `
+                    -Name "Discovery/MissingDriveApacheHttpdConfLexicalAndBazaWwwNotPresent" `
+                    -Failure "для Apache на відсутньому диску HttpdConfPath має бути лексично X:\web\apache\conf\httpd.conf, BAZA_WWW=`$null, а BAZA_WWW/WEB_ROOT Presence не 'Present'; помилка: $($mdC.Error)"
+
+                # (d) характеризація: наявний диск (тимчасовий корінь) — значення без змін.
+                $mdDInstall = Join-Path $missingDriveBase "d-install"
+                foreach ($mdDDirectory in @('MODEL', 'BLOG', 'BAZA')) {
+                    $mdDPath = Join-Path $mdDInstall $mdDDirectory
+                    [void][IO.Directory]::CreateDirectory($mdDPath)
+                    [IO.File]::WriteAllText((Join-Path $mdDPath 'placeholder.txt'), 'fixture')
+                }
+                $mdD = & $invokeMissingDriveDiscovery 'd' @(
+                    '[model]',
+                    ('MODEL={0}' -f (Join-Path $mdDInstall 'MODEL\lims')),
+                    ('BLOG={0}\' -f (Join-Path $mdDInstall 'BLOG'))) @() $null @() $missingDriveBase
+                $mdDOk = ($null -eq $mdD.Error -and $null -ne $mdD.Result)
+                $mdDValidation = @('<not-run>')
+                if ($mdDOk) {
+                    $mdDValidation = @(Test-BRAVODiscoveryResult -DiscoveryResult $mdD.Result -EnabledComponents @{ MODEL = $true; BLOG = $true; BAZA_APP = $true })
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdDOk -and
+                        $mdD.Result.MODEL_SOURCE -eq (Join-Path $mdDInstall 'MODEL') -and
+                        $mdD.Result.BLOG_SOURCE -eq (Join-Path $mdDInstall 'BLOG') -and
+                        $mdD.Result.BAZA_APP -eq (Join-Path $mdDInstall 'BAZA') -and
+                        $mdD.Result.Components['MODEL'].Presence -eq 'Present' -and
+                        $mdD.Result.Components['MODEL'].Source -eq 'BravoIni' -and
+                        $mdD.Result.Components['MODEL'].Path -eq (Join-Path $mdDInstall 'MODEL') -and
+                        $mdD.Result.Components['BAZA_APP'].Presence -eq 'Present' -and
+                        $mdD.Result.Components['BAZA_APP'].Path -eq (Join-Path $mdDInstall 'BAZA') -and
+                        ([string]$mdD.Result.Reasons.BAZA_APP).Contains("MODEL/BLOG з bravo.ini") -and
+                        $mdDValidation.Count -eq 0
+                    ) `
+                    -Name "Discovery/MissingDrivePresentDriveCharacterizationUnchanged" `
+                    -Failure "(характеризація, не RED) для наявного диска значення, Presence=Present і валідація мають лишатись як у поточній реалізації; помилка: $($mdD.Error)"
+
+                # (e) недосяжний UNC.
+                $mdEHost = '\\bravo-nonexistent.invalid\share'
+                $mdEIni = @('[model]', ('MODEL={0}\LIMS\MODEL\lims' -f $mdEHost))
+                $mdE = & $invokeMissingDriveDiscovery 'e' $mdEIni @() $null @() $missingDriveBase
+                $mdEOk = ($null -eq $mdE.Error -and $null -ne $mdE.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdEOk `
+                    -Name "Discovery/MissingDriveUncIniDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для недосяжного UNC у MODEL; отримано: $($mdE.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdEOk -and
+                        $mdE.Result.BAZA_APP -eq ('{0}\LIMS\BAZA' -f $mdEHost) -and
+                        $mdE.Result.Components['MODEL'].Presence -ne 'Present' -and
+                        $mdE.Result.Components['BAZA_APP'].Presence -ne 'Present'
+                    ) `
+                    -Name "Discovery/MissingDriveUncIniResolvesLexicalAndNotPresent" `
+                    -Failure "для недосяжного UNC BAZA_APP має бути лексично \\host\share\LIMS\BAZA, а MODEL/BAZA_APP Presence не 'Present'; помилка: $($mdE.Error)"
+                $mdEOverride = & $invokeMissingDriveDiscovery 'e-override' $mdEIni @() @{ Sources = @{ BAZA_APP = ('{0}\BAZA' -f $mdEHost) } } @() $missingDriveBase
+                $mdEOverrideOk = ($null -eq $mdEOverride.Error -and $null -ne $mdEOverride.Result)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdEOverrideOk -and
+                        $null -eq $mdEOverride.Result.BAZA_APP -and
+                        -not [string]::IsNullOrWhiteSpace([string]$mdEOverride.Result.Reasons.BAZA_APP) -and
+                        $mdEOverride.Result.Components['BAZA_APP'].Presence -ne 'Present'
+                    ) `
+                    -Name "Discovery/MissingDriveUncExplicitOverrideYieldsNullValueWithReason" `
+                    -Failure "явний override Sources.BAZA_APP на недосяжний UNC без винятку має давати BAZA_APP=`$null з Reason і Presence не 'Present'; отримано: $($mdEOverride.Error)"
+
+                # (f) недопустимий символ у шляху.
+                $mdF = & $invokeMissingDriveDiscovery 'f' @('[model]', 'MODEL=C:\LI|MS\MODEL\lims') @() $null @() $missingDriveBase
+                $mdFOk = ($null -eq $mdF.Error -and $null -ne $mdF.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdFOk `
+                    -Name "Discovery/MissingDriveInvalidPathCharDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для MODEL з недопустимим символом у шляху; отримано: $($mdF.Error)"
+                Test-BRAVOCondition `
+                    -Condition ($mdFOk -and $mdF.Result.Components['MODEL'].Presence -eq 'Error') `
+                    -Name "Discovery/MissingDriveInvalidPathCharModelPresenceIsError" `
+                    -Failure "MODEL з недопустимим символом у шляху має бути Presence='Error' (шлях не вдалося перевірити), а не Absent; помилка: $($mdF.Error)"
+
+                # (g) MODEL без каталожної частини.
+                $mdG = & $invokeMissingDriveDiscovery 'g' @('[model]', 'MODEL=lims') @() $null @() $missingDriveBase
+                $mdGOk = ($null -eq $mdG.Error -and $null -ne $mdG.Result)
+                Test-BRAVOCondition `
+                    -Condition $mdGOk `
+                    -Name "Discovery/MissingDriveModelWithoutDirectoryDoesNotThrow" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery не має кидати виняток для MODEL=lims (без каталогу); отримано: $($mdG.Error)"
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdGOk -and
+                        $mdG.Result.Components['MODEL'].Presence -eq 'Absent' -and
+                        $mdG.Result.Components['MODEL'].AbsenceKind -eq 'NoPath'
+                    ) `
+                    -Name "Discovery/MissingDriveModelWithoutDirectoryIsAbsentNoPath" `
+                    -Failure "MODEL=lims (без каталожної частини) має бути Presence='Absent', AbsenceKind='NoPath'; помилка: $($mdG.Error)"
+
+                # (h) bravo.ini override на недосяжний UNC: без винятку.
+                $mdHIniPath = '\\bravo-nonexistent.invalid\share\bravo.ini'
+                $mdH = & $invokeMissingDriveDiscovery 'h' @('[model]') @() @{ BravoIniPath = $mdHIniPath } @() $missingDriveBase
+                $mdHOk = ($null -eq $mdH.Error -and $null -ne $mdH.Result)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdHOk -and
+                        ([string]$mdH.Result.Reasons.BravoIniPath).Contains($mdHIniPath) -and
+                        (([string]$mdH.Result.Reasons.BravoIniPath).Contains('недоступний') -or ([string]$mdH.Result.Reasons.BravoIniPath).Contains('якого не існує'))
+                    ) `
+                    -Name "Discovery/MissingDriveUncBravoIniOverrideDoesNotThrow" `
+                    -Failure "явний override BravoIniPath на недосяжний UNC не має кидати виняток і має давати структурну Reason (недоступний/не існує); отримано: $($mdH.Error)"
+
+                # (i) Apache-служба з exe на недосяжному UNC: без винятку.
+                $mdIService = & $newMissingDriveService 'Apache2.4' 'Apache2.4' '\\bravo-nonexistent.invalid\share\apache\bin\httpd.exe'
+                $mdI = & $invokeMissingDriveDiscovery 'i' @('[model]') @($mdIService) $null @('Apache2.4') $missingDriveBase
+                $mdIOk = ($null -eq $mdI.Error -and $null -ne $mdI.Result)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdIOk -and
+                        $null -eq $mdI.Result.BAZA_WWW -and
+                        $mdI.Result.BAZA_WWW_Presence -ne 'Present' -and
+                        $mdI.Result.Components['BAZA_WWW'].Presence -ne 'Present'
+                    ) `
+                    -Name "Discovery/MissingDriveUncApacheConfDoesNotThrow" `
+                    -Failure "Apache-служба з exe на недосяжному UNC не має кидати виняток, BAZA_WWW не 'Present'; отримано: $($mdI.Error)"
+
+                # (j) MODEL з порожнім батьком не віддає пріоритет BLOG: BAZA_APP - від служби BRAVO.
+                $mdJService = & $newMissingDriveService 'BRAVO' 'BRAVO Service' ('{0}LIMS\bravo.exe' -f $missingDriveRoot)
+                $mdJ = & $invokeMissingDriveDiscovery 'j' @(
+                    '[model]',
+                    ('MODEL={0}\lims' -f $env:SystemDrive),
+                    ('BLOG={0}\' -f (Join-Path $missingDriveBase 'j-blog'))) @($mdJService) $null @() $missingDriveBase
+                $mdJOk = ($null -eq $mdJ.Error -and $null -ne $mdJ.Result)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $mdJOk -and
+                        $mdJ.Result.BAZA_APP -eq ('{0}LIMS\BAZA' -f $missingDriveRoot) -and
+                        ([string]$mdJ.Result.Reasons.BAZA_APP).Contains('service discovery') -and
+                        -not ([string]$mdJ.Result.Reasons.BAZA_APP).Contains('MODEL/BLOG з bravo.ini')
+                    ) `
+                    -Name "Discovery/MissingDriveModelWithoutParentKeepsServicePriority" `
+                    -Failure "MODEL з порожнім батьком (MODEL=<корінь диска>\lims) не має передавати вибір кореня BAZA_APP до BLOG: очікується service discovery X:\LIMS\BAZA; помилка: $($mdJ.Error); Reason: $(if ($mdJOk) { $mdJ.Result.Reasons.BAZA_APP })"
+
+                # (k) характеризація: лексичне з'єднання дорівнює Join-Path на наявному диску.
+                $mdKDrive = $env:SystemDrive
+                $mdKCyr = -join ([char]0x0422, [char]0x0435, [char]0x0441, [char]0x0442)
+                $mdKInputs = @(
+                    @("$mdKDrive\a", 'BAZA'), @("$mdKDrive\a\", 'BAZA'), @("$mdKDrive\a\\", 'BAZA'),
+                    @("$mdKDrive\a", '\BAZA'), @("$mdKDrive\a\", '\BAZA'), @("$mdKDrive\a\\", '\BAZA'),
+                    @("$mdKDrive\a", '/BAZA'), @("$mdKDrive/a/", 'BAZA'), @("$mdKDrive/a/", '/BAZA'),
+                    @("$mdKDrive\a\\", '\\BAZA'), @('\\host-a\share', 'x'), @('\\host-a\share\', '\x'),
+                    @("$mdKDrive\", 'BAZA'), @("$mdKDrive\", '\BAZA'), @($mdKDrive, 'BAZA'),
+                    @("$mdKDrive\a", '..\x'), @("$mdKDrive\a", 'conf\httpd.conf'), @("$mdKDrive\a", 'C:x.out'),
+                    @("$mdKDrive\a/b", 'c/d'), @("$mdKDrive\$mdKCyr\", $mdKCyr), @("$mdKDrive\$mdKCyr", "\$mdKCyr")
+                )
+                $mdKMismatch = New-Object System.Collections.Generic.List[string]
+                foreach ($mdKInput in $mdKInputs) {
+                    $mdKExpected = Join-Path $mdKInput[0] $mdKInput[1]
+                    $mdKActual = & (Get-Module BRAVO.Discovery) { param($p, $c) Join-BRAVODiscoveryPathLexical -Parent $p -Child $c } $mdKInput[0] $mdKInput[1]
+                    if ($mdKActual -cne $mdKExpected) {
+                        $mdKMismatch.Add(("'{0}' + '{1}': очікувалось '{2}', отримано '{3}'" -f $mdKInput[0], $mdKInput[1], $mdKExpected, $mdKActual))
+                    }
+                }
+                Test-BRAVOCondition `
+                    -Condition ($mdKMismatch.Count -eq 0 -and $mdKInputs.Count -ge 12) `
+                    -Name "Discovery/MissingDriveLexicalJoinMatchesJoinPath" `
+                    -Failure "Join-BRAVODiscoveryPathLexical має збігатись із Join-Path на наявному диску; розбіжності: $($mdKMismatch -join ' | ')"
+
+                # (l) IOException у Test-Path перетворюється на Exists=$false + однорядкова Error.
+                $mdLProbe = $null
+                $mdLThrew = $null
+                try {
+                    $mdLProbe = & (Get-Module BRAVO.Discovery) {
+                        function script:Test-Path { throw [System.IO.IOException]::new("перший рядок`r`n   другий рядок") }
+                        try {
+                            Test-BRAVODiscoveryPathProbe -Path '\\host-a\share\x' -PathType Container
+                        } finally {
+                            Remove-Item -LiteralPath 'Function:\Test-Path' -ErrorAction SilentlyContinue
+                        }
+                    }
+                } catch {
+                    $mdLThrew = $_.Exception.Message
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $null -eq $mdLThrew -and
+                        $null -ne $mdLProbe -and
+                        $mdLProbe.Exists -eq $false -and
+                        -not [string]::IsNullOrWhiteSpace([string]$mdLProbe.Error) -and
+                        -not ([string]$mdLProbe.Error -match '[\r\n]')
+                    ) `
+                    -Name "Discovery/MissingDriveProbeIOExceptionYieldsError" `
+                    -Failure "Test-BRAVODiscoveryPathProbe має повертати Exists=`$false і непорожню однорядкову Error при IOException; виняток: $mdLThrew; результат: $($mdLProbe | Out-String)"
+
+                # (m) Test-BRAVODiscoveryResult: недопустимий символ (f) і недосяжний UNC (e) - проблема, не виняток.
+                $mdMThrewF = $null; $mdMF = @()
+                try { $mdMF = @(Test-BRAVODiscoveryResult -DiscoveryResult $mdF.Result -EnabledComponents @{ MODEL = $true }) } catch { $mdMThrewF = $_.Exception.Message }
+                Test-BRAVOCondition `
+                    -Condition ($mdFOk -and $null -eq $mdMThrewF -and $mdMF.Count -ge 1) `
+                    -Name "Discovery/MissingDriveValidationInvalidPathCharReportsProblem" `
+                    -Failure "Test-BRAVODiscoveryResult для MODEL з недопустимим символом не має кидати виняток і має повідомити проблему; виняток: $mdMThrewF; проблем: $($mdMF.Count)"
+                $mdMThrewE = $null; $mdME = @()
+                try { $mdME = @(Test-BRAVODiscoveryResult -DiscoveryResult $mdE.Result -EnabledComponents @{ BAZA_APP = $true }) } catch { $mdMThrewE = $_.Exception.Message }
+                Test-BRAVOCondition `
+                    -Condition ($mdEOk -and $null -eq $mdMThrewE -and @($mdME | Where-Object { ([string]$_).Contains('BAZA_APP') }).Count -ge 1) `
+                    -Name "Discovery/MissingDriveValidationUncReportsProblem" `
+                    -Failure "Test-BRAVODiscoveryResult для BAZA_APP на недосяжному UNC не має кидати виняток і має повідомити проблему; виняток: $mdMThrewE; проблем: $($mdME.Count)"
+
+                # (n) помилка перевірки каталогу призначення - проблема, а не прийняття вищого предка.
+                $mdNErrors = @()
+                $mdNThrew = $null
+                try {
+                    $mdNErrors = @(& (Get-Module BRAVO.Discovery) {
+                        param($r, $d)
+                        function script:Test-Path { throw [System.IO.IOException]::new("мережевий шлях недоступний") }
+                        try {
+                            Test-BRAVODiscoveryResult -DiscoveryResult $r -EnabledComponents @{} -DestinationPaths @{ ARCHIVE = $d }
+                        } finally {
+                            Remove-Item -LiteralPath 'Function:\Test-Path' -ErrorAction SilentlyContinue
+                        }
+                    } $mdD.Result '\\host-a\share\dest')
+                } catch {
+                    $mdNThrew = $_.Exception.Message
+                }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $null -eq $mdNThrew -and
+                        @($mdNErrors | Where-Object { ([string]$_).Contains('недоступний (') }).Count -ge 1
+                    ) `
+                    -Name "Discovery/MissingDriveDestinationProbeErrorReportsProblem" `
+                    -Failure "помилка перевірки каталогу призначення має давати проблему з 'недоступний (...)'; виняток: $mdNThrew; проблеми: $($mdNErrors -join ' | ')"
+            } finally {
+                if (Test-Path -LiteralPath $missingDriveBase) {
+                    Remove-Item -LiteralPath $missingDriveBase -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
 
         # =====================================================================
         # PRODUCTION CONFIG LOADER: service-not-installed acceptance tests
@@ -26849,7 +27272,7 @@ function Get-BRAVOMaintenanceSummaryResult {
 
     # ================================================================
     # dev.16: Remove-OldRestoreArchives — scalar .Count під Set-StrictMode.
-    # Реальний DEV-LIMS acceptance-прогін dev.15 підтвердив [1/8]..[8/8]/
+    # Реальний HOST-11 acceptance-прогін dev.15 підтвердив [1/8]..[8/8]/
     # Restore SKIPPED/Range ID single render/final summary before pause —
     # усе PASS, але після [8/8] cleanup кинув "The property 'Count' cannot
     # be found on this object": під PowerShell 5.1 + Set-StrictMode
@@ -26858,7 +27281,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # один. dev.15 fail-safe catch перетворив це на exit 60 і все одно
     # показав summary — правильно, але сам виняток лишався. Тести нижче —
     # РЕАЛЬНА функція (ізольована AST-екстракція), синтетичний TEMP-каталог
-    # (НЕ production DEV-LIMS), справжній Set-StrictMode -Version Latest
+    # (НЕ production HOST-11), справжній Set-StrictMode -Version Latest
     # усередині виклику — відтворення точної причини, не симуляція.
     # ================================================================
     $restoreCleanupModule = New-BRAVOSelfTestRuntimeModule `
@@ -27338,7 +27761,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             # FailPathLookup — Test-Path каталогу архівів (без -PathType)
             # пише non-terminating error (ACL / збій провайдера) і нічого не повертає.
             [bool]$FailPathLookup = $false,
-            # #424 (Codex P2, раунд 3): PriorCritical — до кроку очистки
+            # #424 (рев'ю P2, раунд 3): PriorCritical — до кроку очистки
             # якась попередня фаза вже виставила criticalErrorOccurred.
             [bool]$PriorCritical = $false)
         $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
@@ -27375,7 +27798,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                         } elseif ($scenarioArchive['HashMode'] -ceq 'Malformed') {
                             $hash = 'not-a-sha512-value'
                         }
-                        # -LiteralPath: каталог сценарію може містити [ / ] (#424, Codex P2, раунд 3).
+                        # -LiteralPath: каталог сценарію може містити [ / ] (#424, рев'ю P2, раунд 3).
                         "$hash *$fileName" | Out-File -LiteralPath "$archivePath.sha512" -Encoding ASCII
                         if ($scenarioArchive['HashMode'] -ceq 'Locked') {
                             [void]$scenarioHashLocks.Add([IO.File]::Open("$archivePath.sha512", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None))
@@ -27435,7 +27858,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                 if ($CriticalBeforeCleanup) {
                     $script:criticalErrorOccurred = $true
                 }
-                # #424 (Codex P2, раунд 3): власний облік збою цілісності
+                # #424 (рев'ю P2, раунд 3): власний облік збою цілісності
                 # кроку очистки, як у Main ($restoreArchiveIntegrityOutcome).
                 $restoreArchiveIntegrityOutcome = @{ IntegrityFailed = $false }
                 $retentionThrew = $null
@@ -27622,7 +28045,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/RetentionOldArchiveValidatorTimeoutSetsFailureFlags" `
         -Failure ("збій виконання 7z t (не archive-specific: таймаут) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupValidatorTimeout.Critical, $retentionFollowupValidatorTimeout.RestoreFailed, $retentionFollowupValidatorTimeout.Threw, $retentionFollowupValidatorTimeout.Log)
 
-    # (e) #300 (Codex 386-C4): код 2 з локалізованим текстом відмови доступу
+    # (e) #300 (рев'ю 386-C4): код 2 з локалізованим текстом відмови доступу
     # без власних повідомлень 7-Zip про вміст — збій виконання, не доказ
     # пошкодження: навіть на старій сесії це ERROR і прапорці.
     $retentionFollowupLocalizedDenied = & $retentionFollowupRunScenario 'LocalizedAccessDenied' @(
@@ -27641,7 +28064,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/RetentionOldArchiveLocalizedAccessFailureSetsFailureFlags" `
         -Failure ("код 2 без власних повідомлень 7-Zip про вміст (локалізована відмова доступу) на старій сесії має виставляти `$script:criticalErrorOccurred і `$script:restoreIntegrityFailed і писати ERROR; critical={0}, restoreIntegrityFailed={1}, threw={2}, журнал: {3}" -f $retentionFollowupLocalizedDenied.Critical, $retentionFollowupLocalizedDenied.RestoreFailed, $retentionFollowupLocalizedDenied.Threw, $retentionFollowupLocalizedDenied.Log)
 
-    # (e2) #300 (Claude QA 386-Q2): перевірка 7z t старої сесії кинула
+    # (e2) #300 (QA 386-Q2): перевірка 7z t старої сесії кинула
     # виняток замість результату — перевірку не виконано, це збій виконання:
     # прапорці виставляються навіть на старій сесії (fail-closed).
     $retentionFollowupValidatorThrows = & $retentionFollowupRunScenario 'ValidatorThrows' @(
@@ -28133,7 +28556,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("гейт Main має за сесій ≤ ArchivesKeepCount викликати Remove-OldRestoreArchives лише з -ReportOnly, за сесій > ArchivesKeepCount — звичайний retention без -ReportOnly (обидва — з -Outcome `$restoreArchiveIntegrityOutcome), а для unsafe-сесії, вимкненого Maintenance чи відсутності сесій — не викликати нічого; Main має рахувати сесії в `$restoreArchiveGroupCount; if-гейтів={0}, лічильник={1}, ≤1/1=[{2}], ≤2/2=[{3}], >3/1=[{4}], unsafe=[{5}], вимкнено=[{6}], порожньо=[{7}]" -f $retention424GateIfs.Count, $retention424GroupCountAssigned, $retention424GateWithin, $retention424GateWithinTwo, $retention424GateBeyond, $retention424GateUnsafe, $retention424GateDisabled, $retention424GateEmpty)
 
     # ================================================================
-    # #424 (review Codex P2): статус кроку «Очистка старих даних/логів».
+    # #424 (рев'ю P2): статус кроку «Очистка старих даних/логів».
     # Гілка «лише перевірка» не робить $hasDataToClean істинним, тож
     # раніше статус ставав SKIPPED ще до урахування WARN/FAIL: крок і
     # лічильник stepsError приховували збій цілісності (exit 41). Справжній
@@ -28202,7 +28625,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("за сесій ≤ ArchivesKeepCount крок «Очистка старих даних/логів» має бути FAIL (stepsError ≥ 1), коли перевірка лише-перевірки виставила прапорці exit 41, і WARN за WARNING без critical; без жодної проблеми — SKIPPED, як і раніше; фрагмент знайдено={0}; зламана: статус=[{1}], stepsError={2}, critical={3}; UNKNOWN: статус=[{4}], stepsError={5}; чиста: статус=[{6}], stepsError={7}, журнал: {8}" -f (-not [string]::IsNullOrEmpty($retention424CleanupStatusText)), $retention424StepBroken.CleanupStatus, $retention424StepBroken.StepsError, $retention424StepBroken.Critical, $retention424StepStale.CleanupStatus, $retention424StepStale.StepsError, $retention424StepClean.CleanupStatus, $retention424StepClean.StepsError, $retention424StepClean.Log)
 
     # ================================================================
-    # #424 (review Codex P2): збій переліку архівів реставрації (відмова
+    # #424 (рев'ю P2): збій переліку архівів реставрації (відмова
     # доступу тощо) не можна плутати з порожнім каталогом. Раніше
     # Get-ChildItem -ErrorAction SilentlyContinue давав 0 (або лише частину)
     # архівів: нічна перевірка мовчки пропускалась, а частковий перелік ще
@@ -28236,7 +28659,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Maintenance/RestoreArchiveEnumerationFailureNoDeletion" `
         -Failure ("збій переліку архівів реставрації має дати ERROR і прапорці critical/restoreIntegrityFailed (exit 41) без жодного видалення, крок очистки — FAIL; контроль без збою видаляє сесії понад KeepCount, як і раніше; збій: threw={0}, лишилось=[{1}], critical={2}, restoreIntegrityFailed={3}, статус=[{4}], журнал: {5}; контроль: threw={6}, лишилось=[{7}]" -f $retention424EnumFailed.Threw, $retention424EnumFailed.Remaining, $retention424EnumFailed.Critical, $retention424EnumFailed.RestoreFailed, $retention424EnumFailed.CleanupStatus, $retention424EnumFailed.Log, $retention424EnumControl.Threw, $retention424EnumControl.Remaining)
 
-    # (e2) Codex P2 (раунд 2): каталог існує, але сам Test-Path пише
+    # (e2) рев'ю P2 (раунд 2): каталог існує, але сам Test-Path пише
     # non-terminating error (ACL / збій провайдера) і нічого не повертає.
     # Раніше це вважалось відсутнім каталогом: ні ERROR, ні exit 41, і
     # перевірка мовчки пропускалась. Тепер — той самий fail-closed шлях.
@@ -28318,7 +28741,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         [IO.File]::WriteAllText((Join-Path $retention424EnumRoot 'RETFUP_before_20260111_0100.mdz'), 'synthetic-ok')
         $retention424EnumOk = & $retention424EnumDirect $retention424EnumRoot $false
         $retention424EnumDenied = & $retention424EnumDirect $retention424EnumRoot $true
-        # Codex P2 (раунд 2): збій самого Test-Path каталогу (ACL / провайдер).
+        # рев'ю P2 (раунд 2): збій самого Test-Path каталогу (ACL / провайдер).
         $retention424EnumLookup = & $retention424EnumDirect $retention424EnumRoot $false $true
         # #428: цільовий підкаталог відсутній, і БАТЬКІВСЬКИЙ каталог теж не
         # існує (жодного 'missing-parent' тут не створено) — ознака ширшої
@@ -28404,7 +28827,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("Main має переліковувати архіви реставрації в ARC_DIR рівно одним викликом Get-BRAVORestoreArchiveMainFiles і без прямого Get-ChildItem по `$ARC_DIR; викликів={0}, прямих Get-ChildItem={1}" -f $retention424MainEnumCalls.Count, $retention424MainRawArcDirScans.Count)
 
     # ================================================================
-    # #424 (Codex P1, раунд 3): «немає жодної підтвердженої точки
+    # #424 (рев'ю P1, раунд 3): «немає жодної підтвердженої точки
     # відновлення» не залежить від того, на якому етапі перевірки
     # забраковано сесію. Раніше ERROR і прапорці exit 41 з'являлись лише
     # тоді, коли хоча б одна сесія дійшла до 7z t; сесія, забракована вже
@@ -28469,7 +28892,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("звичайний retention, коли всі сесії забраковано на SHA512, має записати ERROR «Не лишилось жодної придатної точки відновлення» і виставити critical/restoreIntegrityFailed (exit 41), не видаляючи жодної сесії, і WARNING «НЕ видалено» для кожної; threw={0}, critical={1}, restoreIntegrityFailed={2}, лишилось=[{3}], журнал: {4}" -f $retention424NormalNoValid.Threw, $retention424NormalNoValid.Critical, $retention424NormalNoValid.RestoreFailed, $retention424NormalNoValid.Remaining, $retention424NormalNoValid.Log)
 
     # ================================================================
-    # #424 (Codex P2, раунд 3): статус кроку очистки не спирається лише на
+    # #424 (рев'ю P2, раунд 3): статус кроку очистки не спирається лише на
     # глобальний Boolean criticalErrorOccurred. Якщо попередня фаза вже
     # виставила його, новий збій цілісності в кроці очистки раніше давав
     # WARN (не FAIL) і не рахувався в stepsError. Тепер крок бере власний
@@ -28516,7 +28939,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("коли попередня фаза вже виставила criticalErrorOccurred, крок «Очистка старих даних/логів» має бути FAIL (stepsError ≥ 1) за нового збою цілісності архівів реставрації (7z t, SHA512, перелік), WARN — лише за WARNING без збою цілісності, SKIPPED — без жодної проблеми; Main має позначати збій власного переліку в `$restoreArchiveIntegrityOutcome ({0}); 7z t: статус=[{1}], stepsError={2}; SHA512: статус=[{3}], stepsError={4}; перелік: статус=[{5}], stepsError={6}; чиста: статус=[{7}], stepsError={8}; UNKNOWN: статус=[{9}], stepsError={10}" -f $retention424MainMarksEnumFailure, $retention424PriorBroken.CleanupStatus, $retention424PriorBroken.StepsError, $retention424PriorHashOnly.CleanupStatus, $retention424PriorHashOnly.StepsError, $retention424PriorEnumFailed.CleanupStatus, $retention424PriorEnumFailed.StepsError, $retention424PriorClean.CleanupStatus, $retention424PriorClean.StepsError, $retention424PriorStale.CleanupStatus, $retention424PriorStale.StepsError)
 
     # ================================================================
-    # #424 (Codex P2, раунд 3): налаштований каталог архівів реставрації —
+    # #424 (рев'ю P2, раунд 3): налаштований каталог архівів реставрації —
     # буквальний шлях. З -Path символи [ / ] у назві каталогу були
     # шаблоном: наявний каталог вважався відсутнім (нічна перевірка мовчки
     # пропускалась), а перелік чи видалення могли зачепити сусідній
@@ -28910,7 +29333,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
     # Write-BRAVOMaintenanceOperation, не Write-BRAVOMaintenanceStep.
     # Обгортка навколо Write-BRAVOOperationResult (BRAVO.Console): той самий
     # консольний рендер БЕЗ [N/8], але з обліком у StepLog/лічильниках —
-    # без нього реальний DEV-LIMS прогін показував "Помилок: 0" при FAIL
+    # без нього реальний HOST-11 прогін показував "Помилок: 0" при FAIL
     # ненумерованої операції Trace і "✅ Trace" у Discord.
     foreach ($unnumberedOp in @(
         @{ Name = 'Міграція старих журналів'; TestName = 'Maintenance/MigrationOperationResultIsUnnumbered' },
@@ -28976,7 +29399,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Maintenance/UnnumberedOperationsDoNotChangeStepCounters" `
         -Failure "Write-BRAVOOperationResult (будь-який статус) не повинен змінювати BRAVOMaintenanceStepCurrent/OkCount/WarnCount/SkippedCount/FailCount"
 
-    # --- РЕГРЕСІЯ (реальний DEV-LIMS прогін 19:26, exit 60): ненумерована
+    # --- РЕГРЕСІЯ (реальний HOST-11 прогін 19:26, exit 60): ненумерована
     # операція "Trace: добовий архів і SFTP" впала, а підсумковий блок
     # показав "Помилок: 0" і Discord показав "✅ Trace" — бо рендер ішов
     # прямо через Write-BRAVOOperationResult (BRAVO.Console), який не веде
@@ -29016,7 +29439,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
             $maintenanceOperationAccounting.Current, $maintenanceOperationAccounting.Ok, $maintenanceOperationAccounting.Fail,
             $maintenanceOperationAccounting.LogCount, $maintenanceOperationAccounting.TraceStatus, $maintenanceOperationAccounting.CleanupStatus)
 
-    # --- РЕГРЕСІЯ (реальний DEV-LIMS прогін 20:29, exit 10): -ForceRestore
+    # --- РЕГРЕСІЯ (реальний HOST-11 прогін 20:29, exit 10): -ForceRestore
     # поза вікном логувався як WARNING, тому інкрементував BRAVOWarningCount
     # -> severity сповіщення WARNING -> оператор бачив жовте "ПОТРІБНА ДІЯ:
     # перевірити журнал" при повністю зеленому списку етапів. Це констатація
@@ -29049,7 +29472,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Name "Maintenance/RestoreWindowSkipsAreInfoNotWarning" `
         -Failure "обидві гілки поза вікном ('Примусова реставрація...' і 'Реставрацію пропущено...') мають логуватись як INFO — слот не втрачається (нічний Maintenance/boot-Recovery), а WARNING давав хибне «ПОТРІБНА ДІЯ» з exit 10 при зеленому прогоні (Лабораторія-12 2026-08-26)"
 
-    # --- РЕГРЕСІЯ (реальний DEV-LIMS прогін 20:29): підсумок показав
+    # --- РЕГРЕСІЯ (реальний HOST-11 прогін 20:29): підсумок показав
     # "Кроків: 8" при "Успішно: 9" + "Пропущено: 4" — арифметично
     # неспроможно, бо "Кроків" брався з нумератора [N/8], а решта лічильників
     # уже враховувала ненумеровані операції. Сума OK+WARN+SKIPPED+FAIL має
@@ -29073,7 +29496,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         -Failure ("підсумкове 'Кроків' має братися з BRAVOMaintenanceStepLog.Count (а не з нумератора [N/8]), інакше воно не дорівнює сумі Успішно+Попереджень+Пропущено+Помилок; факт: Log={0} Сума={1}" -f
             $maintenanceSummaryTotals.LogCount, $maintenanceSummaryTotals.Sum)
 
-    # --- РЕГРЕСІЯ (реальний DEV-LIMS негативний прогін 19:48, exit 43):
+    # --- РЕГРЕСІЯ (реальний HOST-11 негативний прогін 19:48, exit 43):
     # зріз лічильників етапу логів знімався ДО реставрації, тому критична
     # помилка реставрації робила [6/8] "Обробка trace і логів" червоним,
     # хоча етап відпрацював ("оброблено файлів: 2"). Зріз мусить братися
@@ -29938,7 +30361,7 @@ $FAILED_ARCHIVE_RETENTION_DAYS = 30
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $normalizedOutput }
     }
 
-    # РЕГРЕСІЯ (DEV-LIMS, 2026-08-21): site-config 5.0/5.1 БЕЗ
+    # РЕГРЕСІЯ (HOST-11, 2026-08-21): site-config 5.0/5.1 БЕЗ
     # Restore.BootRestoreMode (лише застарілий RunMissedOnStartup) валив
     # BRAVO_TASKS_INSTALL під StrictMode ("property 'BootRestoreMode'
     # cannot be found") усупереч обіцянці loader-а «застарілий ключ
@@ -32204,7 +32627,7 @@ function Write-BRAVOLog {
 
     # --- Archive: dev.18 — очищення старих журналів мігрувало на numbered
     # Write-BRAVOArchiveStep (раніше unnumbered Write-BRAVOOperationResult
-    # — реальний DEV-LIMS вивід показав цю операцію поза [N/TOTAL]).
+    # — реальний HOST-11 вивід показав цю операцію поза [N/TOTAL]).
     $archiveLogCleanupIndex = $archiveScriptText.IndexOf('-Name ''Очищення старих журналів''')
     $archiveLogCleanupWindow = if ($archiveLogCleanupIndex -ge 0) {
         $archiveScriptText.Substring([Math]::Max(0, $archiveLogCleanupIndex - 400), [Math]::Min(1000, $archiveScriptText.Length - [Math]::Max(0, $archiveLogCleanupIndex - 400)))
@@ -32601,7 +33024,7 @@ function Write-BRAVOLog {
         -Failure 'SuppressHeader має приглушувати і План перевірок, і стандалон-підсумок (Write-BRAVOResultHeader); $script:BRAVOHealthSftpStepEnabled — той самий сигнал для обох (нового split-гейту й старого summary-footer)'
 
     #####################################################################
-    # dev.17: реальний DEV-LIMS acceptance (generation 20260810_185725) —
+    # dev.17: реальний HOST-11 acceptance (generation 20260810_185725) —
     # Get-BRAVOHealthLatestBackupSummary.TimestampText показував UTC як
     # локальний час (15:57 замість фактичних 18:57), хоча AgeText (той
     # самий summary, той самий $healthCheckStartedUtc) рахувався правильно.
@@ -32621,7 +33044,7 @@ function Write-BRAVOLog {
             'Format-BRAVOOperatorStatusLine'
         )
     $latestBackupSummaryProbe = & $latestBackupSummaryModule {
-        # Ті самі числа, що реальний DEV-LIMS acceptance: generation
+        # Ті самі числа, що реальний HOST-11 acceptance: generation
         # 20260810_185725, backup 18:57 local (== 15:57 UTC на UTC+3
         # сервері), Health-перевірка о 19:02:55 local (== 16:02:55 UTC).
         # SpecifyKind, а не залежність від timezone тестового runner-а —
@@ -32652,7 +33075,7 @@ function Write-BRAVOLog {
             # від джерела — детерміновано в будь-якій timezone тестового
             # runner-а (не hardcode ніякого конкретного offset/рядка):
             # якщо джерело справді конвертує, обидва значення завжди
-            # збігаються, хоч би яка timezone була в CI/DEV-LIMS/локально.
+            # збігаються, хоч би яка timezone була в CI/HOST-11/локально.
             ExpectedLocalText = $simulatedBackupUtc.ToLocalTime().ToString('dd.MM.yyyy HH:mm')
             # AgeText — чиста UTC-минус-UTC арифметика (не залежить від
             # timezone runner-а за визначенням), обчислена тут із тих
@@ -32670,7 +33093,7 @@ function Write-BRAVOLog {
             -not $healthScriptText.Contains('TimestampText = $latestTimestamp.ToString(')
         ) `
         -Name 'Health/LatestBackupTimestampRendersLocalTime' `
-        -Failure 'Get-BRAVOHealthLatestBackupSummary.TimestampText має форматуватися ПІСЛЯ .ToLocalTime() — інакше оператор бачить внутрішній UTC як локальний час сервера (реальний DEV-LIMS acceptance: generation 18:57 local показувалась як 15:57); production Timestamp/Kind не повинні мутуватися'
+        -Failure 'Get-BRAVOHealthLatestBackupSummary.TimestampText має форматуватися ПІСЛЯ .ToLocalTime() — інакше оператор бачить внутрішній UTC як локальний час сервера (реальний HOST-11 acceptance: generation 18:57 local показувалась як 15:57); production Timestamp/Kind не повинні мутуватися'
 
     Test-BRAVOCondition `
         -Condition (
@@ -32699,7 +33122,7 @@ function Write-BRAVOLog {
         -Failure 'success- і problem-повідомлення мають отримувати TimestampText з ОДНОГО виклику Get-BRAVOHealthLatestBackupSummary; .ToLocalTime() має існувати рівно в ОДНІЙ точці джерела (не дубльований у двох message builders)'
 
     #####################################################################
-    # dev.18: реальний DEV-LIMS ручний BRAVO_ARCHIV прогін виявив три
+    # dev.18: реальний HOST-11 ручний BRAVO_ARCHIV прогін виявив три
     # пов'язані дефекти operator-flow/observability: (1) MANUAL-консоль
     # закривалась без паузи через IsInputRedirected; (2) очищення
     # журналів/backup generation рендерились ПОЗА канонічною [N/M]
@@ -32943,7 +33366,7 @@ function Write-BRAVOLog {
         -Failure '"=== ЗАГОЛОВОК ===" записи мають і надалі писатись у журнал повним текстом — незмінено'
 
     #####################################################################
-    # dev.19: два реальні DEV-LIMS acceptance-прогони виявили чотири
+    # dev.19: два реальні HOST-11 acceptance-прогони виявили чотири
     # окремі observability/correctness дефекти: (1) Maintenance фінальний
     # людський статус (ЛОГ/консоль/success-notification) ігнорував
     # $script:BRAVOWarningCount і завжди показував "УСПІШНО", навіть коли
@@ -32994,7 +33417,7 @@ function Write-BRAVOLog {
             (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 10 }).Color -eq [ConsoleColor]::Yellow
         ) `
         -Name 'Maintenance/Exit10RendersSuccessWithWarnings' `
-        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 10 (SuccessWithWarnings) має повертати Text='УСПІШНО З ПОПЕРЕДЖЕННЯМИ'/Color=Yellow — реальний DEV-LIMS запуск (LastTaskResult=10, відсутній Range ID log) раніше показував 'УСПІШНО' без жодної згадки про попередження"
+        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 10 (SuccessWithWarnings) має повертати Text='УСПІШНО З ПОПЕРЕДЖЕННЯМИ'/Color=Yellow — реальний HOST-11 запуск (LastTaskResult=10, відсутній Range ID log) раніше показував 'УСПІШНО' без жодної згадки про попередження"
 
     Test-BRAVOCondition `
         -Condition (
@@ -33448,7 +33871,7 @@ function Write-BRAVOLog {
     # Група 2 — Maintenance: голий "==="-роздільник більше не пише
     # окремий рядок у журнал (та сама ідея, що Archive dev.18, але
     # Maintenance має власну, окрему реалізацію Write-Log/SeparatorLength
-    # — реальний DEV-LIMS лог показував рядки зі 100 символами "=" між
+    # — реальний HOST-11 лог показував рядки зі 100 символами "=" між
     # звичайними секціями).
     # ================================================================
     $maintenanceBareLogSeparatorBranchMatch = [regex]::Match(
@@ -33462,7 +33885,7 @@ function Write-BRAVOLog {
             $maintenanceBareLogSeparatorBranchText.Contains('return')
         ) `
         -Name 'Maintenance/SectionSeparatorsDoNotEmitBareLogRecords' `
-        -Failure 'голий роздільник "==="/"=" у Maintenance Write-Log має лише return, без Write-BRAVOMaintenanceLogFile — реальний DEV-LIMS лог показував рядки зі 100 символами "=" між звичайними секціями без жодної діагностичної цінності'
+        -Failure 'голий роздільник "==="/"=" у Maintenance Write-Log має лише return, без Write-BRAVOMaintenanceLogFile — реальний HOST-11 лог показував рядки зі 100 символами "=" між звичайними секціями без жодної діагностичної цінності'
 
     # #314 (хвиля 2): заголовки обробки trace/exchangAPI пише винесений цикл
     # служб (BRAVO.Maintenance.ServiceCycle.ps1), dot-source-нутий у scope
@@ -33689,7 +34112,7 @@ function Write-BRAVOLog {
             $archiveHashHeadingCallAst.Extent.StartOffset -lt $archiveHashWorkCallAst.Extent.StartOffset
         ) `
         -Name 'Archive/HashHeadingPrecedesHashWork' `
-        -Failure '"=== СТВОРЕННЯ ХЕШУ ... ===" має друкуватись ДО першого виклику New-SHA512Hash всередині Invoke-BRAVOComponentBackup — реальний DEV-LIMS лог показував заголовок ПІСЛЯ вже виконаної роботи (заголовок друкувався в Main, після повного завершення виклику)'
+        -Failure '"=== СТВОРЕННЯ ХЕШУ ... ===" має друкуватись ДО першого виклику New-SHA512Hash всередині Invoke-BRAVOComponentBackup — реальний HOST-11 лог показував заголовок ПІСЛЯ вже виконаної роботи (заголовок друкувався в Main, після повного завершення виклику)'
     } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Root/Maintenance.CompletedLinesShowSkippedRestoreWithReason' } }
     if (Enter-BRAVOSelfTestSection -Name 'Root/Archive.HashHeadingPrecedesHashWorkForAllEnabledComponents' -DependsOn 'Root/Maintenance.CompletedLinesShowSkippedRestoreWithReason') { try {
 
@@ -33835,7 +34258,7 @@ function Write-BRAVOLog {
     # RestoreSynthetic: наскрізний синтетичний тест відкату — справжній
     # tools\7za.exe (архів + цілісність + екстракція) на синтетичній моделі,
     # SHA256-верифікація відновлення, fail-closed на пошкодженому/відсутньому
-    # архіві. Приймальну перевірку на DEV-LIMS не замінює.
+    # архіві. Приймальну перевірку на HOST-11 не замінює.
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'RestoreSynthetic') {
         Enter-BRAVOSelfTestSuite -Name 'RestoreSynthetic'
         if (Enter-BRAVOSelfTestSection -Name 'Suite/RestoreSynthetic') { try {
@@ -35326,7 +35749,7 @@ Test-BRAVOCondition -Condition ($leakProbeLeakedNames.Count -eq 0 -and $leakProb
     -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites' `
     -Failure "після закриття suite вбудовані команди мають резолвитися як до нього; витекло: $($leakProbeLeakedNames -join '; ')"
 
-# Codex P1 на #340: suite може затінити й ті cmdlet-и, якими реалізоване саме
+# рев'ю P1 на #340: suite може затінити й ті cmdlet-и, якими реалізоване саме
 # відновлення (Get-Item, Remove-Item, Set-Item, Get-ChildItem, Remove-Module,
 # New-Object, Write-Host). Restore має їх зняти, а не працювати через
 # заглушки: Get-Item-заглушка, що повертає $null, раніше давала хибне
@@ -35387,7 +35810,7 @@ Test-BRAVOCondition -Condition (
         $primitiveProbeBeforeCount, $primitiveProbeDuringCount, $primitiveProbeNames.Count, $primitiveProbeAfterCount,
         [string]::Join('; ', [string[]]$primitiveProbeResidualProblems))
 
-# Codex P2 на #340 (1): функція, що з'явилась під уже наявним аліасом, теж
+# рев'ю P2 на #340 (1): функція, що з'явилась під уже наявним аліасом, теж
 # змінює стан і знімається; аліас лишається. Раніше стан фіксував лише
 # «переможний» аліас, і прихована функція витікала.
 $hiddenProbeName = 'Get-Date'
@@ -35426,7 +35849,7 @@ Test-BRAVOCondition -Condition (
     -Failure ("функція під наявним аліасом має бути знята, аліас — лишитись: під час={0}, функція після={1}, аліас після={2}, залишки: {3}" -f
         $hiddenProbeFunctionDuring, $hiddenProbeFunctionAfter, $hiddenProbeAliasAfter, [string]::Join('; ', [string[]]$hiddenProbeResidualProblems))
 
-# Codex P2 на #340 (2): запис реєстру, прибирання якого кинуло, не
+# рев'ю P2 на #340 (2): запис реєстру, прибирання якого кинуло, не
 # позначається Cleaned, тож фінальний прохід повторить його.
 $failedCleanupEntry = [pscustomobject]@{ Module = [pscustomobject]@{ Name = ('probe-' + [guid]::NewGuid().ToString('N')) }; FunctionNames = @() }
 $failedCleanupIndex = $script:BRAVOSelfTestOwnedRuntimeModules.Count
@@ -35444,7 +35867,7 @@ Test-BRAVOCondition -Condition ($failedCleanupThrew -and -not $failedCleanupMark
     -Name 'Framework/BuiltinCommandStubsDoNotLeakAcrossSuites.FailedCleanupNotMarkedCleaned' `
     -Failure "невдале прибирання runtime-модуля має повідомити про збій і лишити запис для повтору (кинуло=$failedCleanupThrew, Cleaned=$failedCleanupMarked)"
 
-# Codex P2 на #340 (3): аліас повертається з початковими Options і
+# рев'ю P2 на #340 (3): аліас повертається з початковими Options і
 # Description, а не як стандартний записуваний аліас.
 $aliasMetaProbeName = 'Send-MailMessage'
 $aliasMetaProbeRestored = $null
@@ -35478,7 +35901,7 @@ Test-BRAVOCondition -Condition (
         $(if ($null -ne $aliasMetaProbeRestored) { '{0} [{1}] "{2}"' -f $aliasMetaProbeRestored.Definition, $aliasMetaProbeRestored.Options, $aliasMetaProbeRestored.Description } else { 'аліаса немає' }),
         [string]::Join('; ', [string[]]$aliasMetaProbeResidualProblems))
 
-# Codex P2 на #340 (5): глобальна функція повертається з початковими Options.
+# рев'ю P2 на #340 (5): глобальна функція повертається з початковими Options.
 $functionOptionsProbeName = 'Restart-Service'
 $functionOptionsProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $functionOptionsProbeName) -ErrorAction SilentlyContinue)
 $functionOptionsProbeRestored = $null
@@ -35511,7 +35934,7 @@ Test-BRAVOCondition -Condition (
         $(if ($null -ne $functionOptionsProbeRestored) { [string]$functionOptionsProbeRestored.Options } else { 'функції немає' }),
         [string]::Join('; ', [string[]]$functionOptionsProbeResidualProblems))
 
-# Codex P2 на #340 (6): функція, експортована модулем, повертається як
+# рев'ю P2 на #340 (6): функція, експортована модулем, повертається як
 # запис того самого модуля (ModuleName збігається), а не відірвана копія.
 # Set-Item з ScriptBlock модуля зберігає прив'язку — guard фіксує це.
 $moduleOwnedProbeName = 'Restart-Service'
@@ -35552,7 +35975,7 @@ Test-BRAVOCondition -Condition (
         $(if ($null -ne $moduleOwnedProbeRestored) { [string]$moduleOwnedProbeRestored.ModuleName } else { 'функції немає' }),
         [string]::Join('; ', [string[]]$moduleOwnedProbeResidualProblems))
 
-# Codex P2 на #340 (7): AllScope-аліас. Читання global щоразу новим
+# рев'ю P2 на #340 (7): AllScope-аліас. Читання global щоразу новим
 # модулем бачить актуальну копію, тож заміну помічено; якщо точне
 # відновлення неможливе, це видимий залишок, а не тихий успіх.
 $allScopeProbeName = 'Stop-Service'
@@ -35588,7 +36011,7 @@ Test-BRAVOCondition -Condition (
     -Failure ("заміна AllScope-аліаса має бути відновлена або видимо зафіксована: знімок '{0}', після '{1}', залишків {2}" -f
         $allScopeProbeSnapshotKey, $allScopeProbeDefinitionAfter, $allScopeProbeResidualProblems.Count)
 
-# Codex P2 на #340 (4): global-заглушка (голий New-Module) під уже наявною
+# рев'ю P2 на #340 (4): global-заглушка (голий New-Module) під уже наявною
 # script-функцією з тим самим ім'ям знімається; script-функція лишається.
 $scopeProbeName = 'Wait-Process'
 $scopeProbePreexisting = $null -ne (Microsoft.PowerShell.Management\Get-Item -LiteralPath ('function:' + $scopeProbeName) -ErrorAction SilentlyContinue)
@@ -37217,6 +37640,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SuiteSelectionContract') { 
     $suiteProbeCases = @{}
     $suiteProbeRuns = @{}
     $suiteProbeError = $null
+    $suiteProbeMergedOutput = $null
     # Id, текст аргументів виклику Invoke-SuiteSelectionCase. Єдине джерело
     # випадків: і драйвер дочірнього процесу, і очікування батька беруть id звідси.
     $suiteProbeCaseTable = @(
@@ -37326,8 +37750,23 @@ foreach ($case in $cases) {
         [IO.File]::WriteAllText($suiteProbeP2Path, $suiteProbeP2, (New-Object Text.UTF8Encoding($true)))
         $suiteProbeHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 
-        $suiteProbeP1Lines = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $suiteProbeP1Path | ForEach-Object { [string]$_ })
+        # Єдиний запуск дочірнього процесу для всіх проб секції. Результат залежить лише від
+        # коду завершення та stdout дитини. EAP=Continue у власній області scriptblock-а
+        # (конвенція навколо native-викликів, див. releasePolicy-фікстури) разом із 2>$null:
+        # якщо self-test запущено in-process під батьком із 2>&1 (powershell -Command
+        # "& .\BRAVO_SELF_TEST.ps1 2>&1 | ..."), stderr дитини інакше стає NativeCommandError,
+        # а під глобальним Stop кидається в catch проби (#483).
+        $suiteProbeInvokeChild = {
+            param([string]$HostPath, [string[]]$Arguments)
+            $ErrorActionPreference = 'Continue'
+            $childLines = @(& $HostPath @Arguments 2>$null | ForEach-Object { [string]$_ })
+            $childExitCode = $LASTEXITCODE
+            return [pscustomobject]@{ ExitCode = $childExitCode; Lines = $childLines }
+        }
+        $suiteProbeChildBase = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass')
+
+        $suiteProbeP1Run = & $suiteProbeInvokeChild $suiteProbeHost ($suiteProbeChildBase + @('-File', $suiteProbeP1Path))
+        $suiteProbeP1Lines = @($suiteProbeP1Run.Lines)
         foreach ($suiteProbeLine in $suiteProbeP1Lines) {
             $suiteProbeMatch = [regex]::Match($suiteProbeLine.TrimEnd("`r"), '^CASE\|([^|]+)\|SEL=([^|]*)\|POST=([^|]*)\|ERR=(.*)$')
             if (-not $suiteProbeMatch.Success) { continue }
@@ -37342,13 +37781,30 @@ foreach ($case in $cases) {
             }
         }
 
-        # Без 2>&1: повідомлення про помилку йде в stderr і тут не перевіряється.
-        $suiteProbeRunA = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $suiteProbeP2Path -Suite NoSuchSuite | ForEach-Object { [string]$_ })
-        $suiteProbeRuns['unknown'] = [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($suiteProbeRunA | ForEach-Object { $_.TrimEnd("`r") }) }
-        $suiteProbeRunB = @(& $suiteProbeHost -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $suiteProbeP2Path -Suite 'Paths,Archive' | ForEach-Object { [string]$_ })
-        $suiteProbeRuns['comma'] = [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($suiteProbeRunB | ForEach-Object { $_.TrimEnd("`r") }) }
+        # stderr дитини відкидається хелпером (2>$null): повідомлення про помилку тут не перевіряється.
+        $suiteProbeRunA = & $suiteProbeInvokeChild $suiteProbeHost ($suiteProbeChildBase + @('-File', $suiteProbeP2Path, '-Suite', 'NoSuchSuite'))
+        $suiteProbeRuns['unknown'] = [pscustomobject]@{ ExitCode = $suiteProbeRunA.ExitCode; Lines = @($suiteProbeRunA.Lines | ForEach-Object { $_.TrimEnd("`r") }) }
+        $suiteProbeRunB = & $suiteProbeInvokeChild $suiteProbeHost ($suiteProbeChildBase + @('-File', $suiteProbeP2Path, '-Suite', 'Paths,Archive'))
+        $suiteProbeRuns['comma'] = [pscustomobject]@{ ExitCode = $suiteProbeRunB.ExitCode; Lines = @($suiteProbeRunB.Lines | ForEach-Object { $_.TrimEnd("`r") }) }
+
+        # Регресія #483: батько зі $ErrorActionPreference = 'Stop' і зовнішнім 2>&1 (in-process
+        # запуск self-test під `-Command "... 2>&1 | ..."`) викликає РЕАЛЬНИЙ текст хелпера на
+        # дитині, що пише в stderr. Очікується код 1 без винятку.
+        $suiteProbeParentPath = Join-Path $suiteProbeRoot 'probe-parent.ps1'
+        $suiteProbeParentText = "`$ErrorActionPreference = 'Stop'`r`n" +
+            "`$childInvoke = [scriptblock]::Create(@'`r`n" + $suiteProbeInvokeChild.ToString() + "`r`n'@)`r`n" +
+            "try {`r`n" +
+            "    `$r = & `$childInvoke '" + $suiteProbeHost.Replace("'", "''") + "' @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', '" +
+            $suiteProbeP2Path.Replace("'", "''") + "', '-Suite', 'NoSuchSuite')`r`n" +
+            "    `$reached = @(`$r.Lines | Where-Object { `$_.Contains('PROBE-REACHED') }).Count`r`n" +
+            "    Write-Output ('PARENT-OK|' + `$r.ExitCode + '|' + `$reached)`r`n" +
+            "} catch {`r`n" +
+            "    Write-Output ('PARENT-CAUGHT|' + `$_.FullyQualifiedErrorId)`r`n" +
+            "}`r`n"
+        [IO.File]::WriteAllText($suiteProbeParentPath, $suiteProbeParentText, (New-Object Text.UTF8Encoding($true)))
+        $suiteProbeMergedRun = & $suiteProbeInvokeChild $suiteProbeHost ($suiteProbeChildBase +
+            @('-Command', ("& '" + $suiteProbeParentPath.Replace("'", "''") + "' 2>&1 | Out-String")))
+        $suiteProbeMergedOutput = [string]::Join("`n", @($suiteProbeMergedRun.Lines))
     } catch {
         $suiteProbeError = $_.Exception.Message
     } finally {
@@ -37514,6 +37970,16 @@ foreach ($case in $cases) {
         -EnvironmentLimitation $suiteProbeRestriction `
         -Failure ("-File ... -Suite 'Paths,Archive' мусить дати або вибір Paths;Archive з кодом 0, або відмову з кодом 1 " +
             "без виконання подальшого коду; код: $suiteProbeCommaExit")
+
+    # #483: хелпер запуску дитини не залежить від stderr і зовнішнього 2>&1 батька.
+    $suiteProbeMergedShown = 'прогін не виконано'
+    if ($null -ne $suiteProbeMergedOutput) { $suiteProbeMergedShown = $suiteProbeMergedOutput.Trim() }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $suiteProbeMergedOutput -and $suiteProbeMergedOutput.Contains('PARENT-OK|1|0')) `
+        -Name "Framework/SuiteSelectionContract.ProbeChildSurvivesMergedParentStderr" `
+        -EnvironmentLimitation $suiteProbeRestriction `
+        -Failure ("батько з `$ErrorActionPreference = 'Stop' і 2>&1 мусить отримати код дитини 1 без NativeCommandError " +
+            "(очікується PARENT-OK|1|0); вивід: $suiteProbeMergedShown")
 }
 & {
     # M1-M9: мапа "змінений файл -> suite" (Get-BRAVOSelfTestSuiteForChangedPath),
@@ -37967,7 +38433,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.AffectedPlan') { try {
     & $affExpect 'B25 ToolsManifest' (& $affPlanPlain @('Tools/TOOLS_MANIFEST.json')) 'V3|'
     & $affExpect 'B26 VERSION' (& $affPlanPlain @('VERSION.json')) 'V3|'
     & $affExpect 'ToolsDirectory' (& $affPlanPlain @('Tools/WinSCP/WinSCP.com')) 'V3|'
-    & $affExpect 'ClaudeDirectory' (& $affPlanPlain @('.claude/rules/05-architecture.md')) 'V3|'
+    & $affExpect 'EngineeringDocument' (& $affPlanPlain @('docs/engineering/architecture.md')) 'V3|'
     & $affExpect 'DeployScript' (& $affPlanPlain @('deploy/Install-BRAVOServer.ps1')) 'V3|'
     & $affExpect 'FragmentBackupFile' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.Paths.ps1.bak')) 'V3|'
     & $affExpect 'UnknownFragmentName' (& $affPlanPlain @('selftest/BRAVO_SELF_TEST.NoSuch.ps1')) 'V3|'

@@ -1090,7 +1090,7 @@ try {
         @(Get-BRAVOSelfTestScope301Findings -Scope $scope301ModelConfirmed -Component 'MODEL' -Severity 'Error').Count -ge 1
     ) -Name 'BackupScope/ConfirmedModelEmptySourceStaysError' `
         -Failure "підтверджений у baseline MODEL з порожнім каталогом має бути Missing (Error); scope='$($scope301ModelConfirmed.Components['MODEL'])'"
-    # (o) Рев'ю #391 (Codex 510e35e): оператор підтвердив baseline, поки
+    # (o) Рев'ю #391 (510e35e): оператор підтвердив baseline, поки
     # архівація ще йшла. Перенесення доказу з manifest не має повертати сирий
     # шлях у свідомо порожнє поле нового baseline. Два варіанти: на початку
     # прогону baseline не було, і baseline був, але старший за manifest.
@@ -1133,7 +1133,7 @@ try {
     ) -Name 'BackupScope/ConcurrentBaselineConfirmationKeepsEmptyField' `
         -Failure "baseline, підтверджений під час прогону, не має отримати сирий шлях порожнього каталогу: без baseline BLOG='$scope301ConfirmNoneBlog' ($scope301ConfirmNoneError); старий baseline BLOG='$scope301ConfirmStaleBlog' ($scope301ConfirmStaleError)"
 
-    # (p) Рев'ю #391 (Codex 5f0dc37): -SyncBAZA бере попередження про
+    # (p) Рев'ю #391 (5f0dc37): -SyncBAZA бере попередження про
     # порожній BAZA-каталог з того самого складу, що й нічний Archive, і
     # завершується кодом попередження, а не чистим SKIPPED/exit 0.
     $scope301WarnedAll = @()

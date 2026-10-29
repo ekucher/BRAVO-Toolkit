@@ -332,6 +332,55 @@ function Get-BRAVOApacheDocumentRoot {
     return $null
 }
 
+function Join-BRAVODiscoveryPathLexical {
+    # Суто лексичне з'єднання шляхів без доступу до файлової системи. На
+    # відміну від Join-Path, не кидає DriveNotFoundException для диска, якого
+    # зараз немає (офлайн-том, відключений мережевий диск), і не кидає виняток
+    # на недопустимих символах. На наявних дисках результат збігається з
+    # Join-Path. Не використовує [IO.Path]::Combine: той кидає на недопустимих
+    # символах, а rooted-child підміняє parent. Приватна функція модуля.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Parent,
+        [Parameter(Mandatory = $true)][string]$Child
+    )
+
+    # Правило Join-Path (звірено емпірично на наявних дисках): '/' -> '\' в обох
+    # частинах; роздільник додається, лише коли його немає в жодній частині;
+    # коли він є в обох - відкидається рівно один (із child). Кілька
+    # роздільників наприкінці parent зберігаються.
+    $lexicalParent = $Parent.Replace('/', '\')
+    $lexicalChild = $Child.Replace('/', '\')
+    if ($lexicalParent.EndsWith('\') -and $lexicalChild.StartsWith('\')) {
+        $lexicalChild = $lexicalChild.Substring(1)
+    } elseif (-not $lexicalParent.EndsWith('\') -and -not $lexicalChild.StartsWith('\')) {
+        $lexicalParent = $lexicalParent + '\'
+    }
+    return ($lexicalParent + $lexicalChild)
+}
+
+function Test-BRAVODiscoveryPathProbe {
+    # Test-Path з розрізненням «достовірно немає» і «не вдалося перевірити»:
+    # недосяжний UNC кидає IOException, який тут перетворюється на структурний
+    # результат (Error = текст винятку), а не на аварію Discovery. Нічого не
+    # приховується: виняток повертається в Error і потрапляє в Reason/помилку.
+    # Приватна функція модуля.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateSet('Any', 'Container', 'Leaf')][string]$PathType = 'Any'
+    )
+
+    try {
+        $exists = [bool](Test-Path -LiteralPath $Path -PathType $PathType -ErrorAction Stop)
+        return [pscustomobject]@{ Exists = $exists; Error = $null }
+    } catch {
+        $probeMessage = ([string]$_.Exception.Message) -replace '\s*[\r\n]+\s*', ' '
+        if ([string]::IsNullOrWhiteSpace($probeMessage)) { $probeMessage = [string]$_.Exception.GetType().Name }
+        return [pscustomobject]@{ Exists = $false; Error = $probeMessage.Trim() }
+    }
+}
+
 function Test-BRAVODiscoverySourceDirectory {
     # Канонічна структурна перевірка каталогу-кандидата для БУДЬ-ЯКОГО
     # компонента discovery (#158, етап 2). Раніше рівно ця логіка існувала
@@ -363,6 +412,12 @@ function Test-BRAVODiscoverySourceDirectory {
     try {
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     } catch {
+        # Офлайн/відсутній диск - це «не вдалося прочитати», а не «каталогу
+        # немає»: перевіряється ДО загального мапінгу not-found.
+        if ($_.Exception -is [System.Management.Automation.DriveNotFoundException]) {
+            $driveQualifier = $(if ($Path -match '^[A-Za-z]:') { $Path.Substring(0, 2) } else { $Path })
+            return [pscustomobject]@{ Valid = $false; Kind = 'Unreadable'; Reason = "диск $driveQualifier недоступний: $Path" }
+        }
         $isNotFound = ($_.Exception -is [System.Management.Automation.ItemNotFoundException] -or
             $_.Exception -is [System.IO.DirectoryNotFoundException] -or
             $_.Exception -is [System.IO.FileNotFoundException] -or
@@ -570,7 +625,7 @@ function Resolve-BRAVODiscoveryPathComponentPresence {
 }
 
 function Resolve-BRAVOInstallationDiscovery {
-    # Пріоритетний ланцюг (аудит/ТЗ CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md):
+    # Пріоритетний ланцюг (аудит/ТЗ ARCHIV_LIMS_MONOLITH):
     # 1. CLI-параметри runtime-скриптів — не реалізовано в цій ітерації.
     # 2. Явний override у BRAVO.config (-DiscoverySettings) — виграє й
     #    ніколи не замінюється автоматично знайденим значенням.
@@ -701,8 +756,8 @@ function Resolve-BRAVOInstallationDiscovery {
         # прийняття хибного шляху.
         if (-not (Test-BRAVOAbsolutePath -Path $bravoRootOverride)) {
             $bravoRootReason = "явний override discoverySettings.BravoRoot не є absolute шляхом: $bravoRootOverride"
-        } elseif (-not (Test-Path -LiteralPath $bravoRootOverride -PathType Container)) {
-            $bravoRootReason = "явний override discoverySettings.BravoRoot вказує на каталог, якого не існує: $bravoRootOverride"
+        } elseif (-not ($bravoRootProbe = Test-BRAVODiscoveryPathProbe -Path $bravoRootOverride -PathType Container).Exists) {
+            $bravoRootReason = "явний override discoverySettings.BravoRoot вказує на каталог, якого не існує$(if ($bravoRootProbe.Error) { " або недоступний ($($bravoRootProbe.Error))" }): $bravoRootOverride"
         } else {
             $bravoRoot = $bravoRootOverride
             $bravoRootReason = "явний override discoverySettings.BravoRoot"
@@ -742,19 +797,19 @@ function Resolve-BRAVOInstallationDiscovery {
         # BravoRoot вище: невалідний override не приймається мовчки.
         if (-not (Test-BRAVOAbsolutePath -Path $bravoIniPathOverride)) {
             $bravoIniReason = "явний override discoverySettings.BravoIniPath не є absolute шляхом: $bravoIniPathOverride"
-        } elseif (-not (Test-Path -LiteralPath $bravoIniPathOverride -PathType Leaf)) {
-            $bravoIniReason = "явний override discoverySettings.BravoIniPath вказує на файл, якого не існує: $bravoIniPathOverride"
+        } elseif (-not ($bravoIniOverrideProbe = Test-BRAVODiscoveryPathProbe -Path $bravoIniPathOverride -PathType Leaf).Exists) {
+            $bravoIniReason = "явний override discoverySettings.BravoIniPath вказує на файл, якого не існує$(if ($bravoIniOverrideProbe.Error) { " або недоступний ($($bravoIniOverrideProbe.Error))" }): $bravoIniPathOverride"
         } else {
             $bravoIniPath = $bravoIniPathOverride
             $bravoIniReason = "явний override discoverySettings.BravoIniPath"
         }
     } elseif ([string]::IsNullOrWhiteSpace($systemBravoIniPath)) {
         $bravoIniReason = "не вдалося визначити системний каталог Windows (%SystemRoot%), тому очікуваний шлях bravo.ini невідомий"
-    } elseif (Test-Path -LiteralPath $systemBravoIniPath -PathType Leaf) {
+    } elseif (($systemBravoIniProbe = Test-BRAVODiscoveryPathProbe -Path $systemBravoIniPath -PathType Leaf).Exists) {
         $bravoIniPath = $systemBravoIniPath
         $bravoIniReason = "системний каталог Windows за архітектурою ОС: $systemBravoIniPath"
     } else {
-        $bravoIniReason = "bravo.ini відсутній за єдиним очікуваним для цієї архітектури ОС шляхом: $systemBravoIniPath"
+        $bravoIniReason = "bravo.ini відсутній$(if ($systemBravoIniProbe.Error) { " або недоступний ($($systemBravoIniProbe.Error))" }) за єдиним очікуваним для цієї архітектури ОС шляхом: $systemBravoIniPath"
     }
     $reasons["BravoIniPath"] = $bravoIniReason
 
@@ -786,17 +841,21 @@ function Resolve-BRAVOInstallationDiscovery {
             if (-not (Test-BRAVOAbsolutePath -Path $overrideValue)) {
                 return [pscustomobject]@{
                     Value = $null
+                    FromIni = $false
                     Reason = "явний override discoverySettings.Sources.$FieldName не є absolute шляхом: $overrideValue"
                 }
             }
-            if (-not (Test-Path -LiteralPath $overrideValue -PathType Container)) {
+            $overrideProbe = Test-BRAVODiscoveryPathProbe -Path $overrideValue -PathType Container
+            if (-not $overrideProbe.Exists) {
                 return [pscustomobject]@{
                     Value = $null
-                    Reason = "явний override discoverySettings.Sources.$FieldName вказує на каталог, якого не існує: $overrideValue"
+                    FromIni = $false
+                    Reason = "явний override discoverySettings.Sources.$FieldName вказує на каталог, якого не існує$(if ($overrideProbe.Error) { " або недоступний ($($overrideProbe.Error))" }): $overrideValue"
                 }
             }
             return [pscustomobject]@{
                 Value = $overrideValue
+                FromIni = $false
                 Reason = "явний override discoverySettings.Sources.$FieldName"
             }
         }
@@ -809,6 +868,7 @@ function Resolve-BRAVOInstallationDiscovery {
             }
             return [pscustomobject]@{
                 Value = $derived
+                FromIni = $true
                 Reason = "bravo.ini [$IniSection] $IniKey=$iniValue"
             }
         }
@@ -817,7 +877,7 @@ function Resolve-BRAVOInstallationDiscovery {
         } else {
             "у canonical bravo.ini '$bravoIniPath' немає непорожнього ключа [$IniSection] $IniKey"
         }
-        return [pscustomobject]@{ Value = $null; Reason = $missingReason }
+        return [pscustomobject]@{ Value = $null; FromIni = $false; Reason = $missingReason }
     }
 
     $modelResolved = Resolve-BRAVOSourceField `
@@ -862,7 +922,7 @@ function Resolve-BRAVOInstallationDiscovery {
                 $traceFileResolved = $null
                 $traceFileReason = "ключ FILE секції [Debug] у '$bravoIniPath' задано відносним шляхом ('$traceFileRawValue'), але каталог інсталяції BRAVO невизначений: $bravoRootReason"
             } else {
-                $traceFileResolved = Join-Path $bravoRoot $traceFileNormalized
+                $traceFileResolved = Join-BRAVODiscoveryPathLexical -Parent $bravoRoot -Child $traceFileNormalized
                 $traceFileResolvedFrom = "відносний шлях від каталогу інсталяції BRAVO ($bravoRoot)"
             }
         }
@@ -902,12 +962,25 @@ function Resolve-BRAVOInstallationDiscovery {
     # випадок: службу BRAVO не встановлено (лише canonical bravo.ini на
     # диску). У такому разі BRAVO_ROOT лишається невизначеним, але шлях
     # MODEL/BLOG все одно дає контрольоване джерело для BAZA_APP.
-    $iniInstallationRoot = if ($modelResolved.Reason -like "bravo.ini *") {
-        Split-Path -Path $modelResolved.Value -Parent
-    } elseif ($blogResolved.Reason -like "bravo.ini *") {
-        Split-Path -Path $blogResolved.Value -Parent
+    # Значення без каталожної частини (MODEL=lims, D:lims) не дає кореня:
+    # Split-Path -Parent повертає порожній рядок, який далі кидав би виняток,
+    # тому такий source пропускається і береться наступний.
+    # Пріоритет незмінний: MODEL, а BLOG лише коли MODEL не з bravo.ini.
+    # Порожній батько MODEL (напр. MODEL=C:\lims) -> $null -> BRAVO_ROOT, а не BLOG.
+    $iniRootSource = if ($modelResolved.FromIni) {
+        $modelResolved
+    } elseif ($blogResolved.FromIni) {
+        $blogResolved
     } else {
         $null
+    }
+    $iniInstallationRoot = $null
+    if ($null -ne $iniRootSource -and
+        -not [string]::IsNullOrWhiteSpace([string]$iniRootSource.Value)) {
+        $iniRootCandidate = [string](Split-Path -Path ([string]$iniRootSource.Value) -Parent)
+        if (-not [string]::IsNullOrWhiteSpace($iniRootCandidate)) {
+            $iniInstallationRoot = $iniRootCandidate
+        }
     }
     $bazaAppOverrideValue = if ($sourceOverrides.Contains("BAZA_APP") -and
         -not [string]::IsNullOrWhiteSpace([string]$sourceOverrides["BAZA_APP"])) {
@@ -924,10 +997,10 @@ function Resolve-BRAVOInstallationDiscovery {
                 Value = $null
                 Reason = "явний override discoverySettings.Sources.BAZA_APP не є absolute шляхом: $bazaAppOverrideValue"
             }
-        } elseif (-not (Test-Path -LiteralPath $bazaAppOverrideValue -PathType Container)) {
+        } elseif (-not ($bazaAppProbe = Test-BRAVODiscoveryPathProbe -Path $bazaAppOverrideValue -PathType Container).Exists) {
             [pscustomobject]@{
                 Value = $null
-                Reason = "явний override discoverySettings.Sources.BAZA_APP вказує на каталог, якого не існує: $bazaAppOverrideValue"
+                Reason = "явний override discoverySettings.Sources.BAZA_APP вказує на каталог, якого не існує$(if ($bazaAppProbe.Error) { " або недоступний ($($bazaAppProbe.Error))" }): $bazaAppOverrideValue"
             }
         } else {
             [pscustomobject]@{
@@ -937,12 +1010,12 @@ function Resolve-BRAVOInstallationDiscovery {
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($iniInstallationRoot)) {
         [pscustomobject]@{
-            Value = Join-Path $iniInstallationRoot "BAZA"
+            Value = Join-BRAVODiscoveryPathLexical -Parent $iniInstallationRoot -Child "BAZA"
             Reason = "поруч із MODEL/BLOG з bravo.ini: $iniInstallationRoot"
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($bravoRoot)) {
         [pscustomobject]@{
-            Value = Join-Path $bravoRoot "BAZA"
+            Value = Join-BRAVODiscoveryPathLexical -Parent $bravoRoot -Child "BAZA"
             Reason = "service discovery: каталог інсталяції BRAVO ($bravoRoot)"
         }
     } else {
@@ -1003,8 +1076,8 @@ function Resolve-BRAVOInstallationDiscovery {
         # BravoRoot вище.
         if (-not (Test-BRAVOAbsolutePath -Path $webRootOverride)) {
             $webRootReason = "явний override discoverySettings.WebRoot не є absolute шляхом: $webRootOverride"
-        } elseif (-not (Test-Path -LiteralPath $webRootOverride -PathType Container)) {
-            $webRootReason = "явний override discoverySettings.WebRoot вказує на каталог, якого не існує: $webRootOverride"
+        } elseif (-not ($webRootProbe = Test-BRAVODiscoveryPathProbe -Path $webRootOverride -PathType Container).Exists) {
+            $webRootReason = "явний override discoverySettings.WebRoot вказує на каталог, якого не існує$(if ($webRootProbe.Error) { " або недоступний ($($webRootProbe.Error))" }): $webRootOverride"
         } else {
             $webRoot = $webRootOverride
             $webRootReason = "явний override discoverySettings.WebRoot"
@@ -1041,8 +1114,9 @@ function Resolve-BRAVOInstallationDiscovery {
     $apacheDocumentRoot = $null
     $documentRootReason = $null
     if (-not [string]::IsNullOrWhiteSpace($apacheServerRoot)) {
-        $httpdConfPath = Join-Path $apacheServerRoot "conf\httpd.conf"
-        if (Test-Path -LiteralPath $httpdConfPath -PathType Leaf) {
+        $httpdConfPath = Join-BRAVODiscoveryPathLexical -Parent $apacheServerRoot -Child "conf\httpd.conf"
+        $httpdConfProbe = Test-BRAVODiscoveryPathProbe -Path $httpdConfPath -PathType Leaf
+        if ($httpdConfProbe.Exists) {
             $apacheDocumentRoot = Get-BRAVOApacheDocumentRoot -Path $httpdConfPath
             if (-not [string]::IsNullOrWhiteSpace($apacheDocumentRoot)) {
                 $documentRootReason = "httpd.conf: DocumentRoot=$apacheDocumentRoot ($httpdConfPath)"
@@ -1050,7 +1124,7 @@ function Resolve-BRAVOInstallationDiscovery {
                 $documentRootReason = "DocumentRoot не знайдено в httpd.conf: $httpdConfPath"
             }
         } else {
-            $documentRootReason = "httpd.conf не знайдено за очікуваним шляхом: $httpdConfPath"
+            $documentRootReason = "httpd.conf не знайдено$(if ($httpdConfProbe.Error) { " або недоступний ($($httpdConfProbe.Error))" }) за очікуваним шляхом: $httpdConfPath"
         }
     } elseif ([string]::IsNullOrWhiteSpace($webRootOverride)) {
         # Apache-службу взагалі не знайдено (не Disabled — просто немає
@@ -1089,9 +1163,9 @@ function Resolve-BRAVOInstallationDiscovery {
         if (-not (Test-BRAVOAbsolutePath -Path $bazaWwwOverride)) {
             $bazaWwwPresence = 'Error'
             $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "явний override discoverySettings.Sources.BAZA_WWW не є absolute шляхом: $bazaWwwOverride" }
-        } elseif (-not (Test-Path -LiteralPath $bazaWwwOverride -PathType Container)) {
+        } elseif (-not ($bazaWwwProbe = Test-BRAVODiscoveryPathProbe -Path $bazaWwwOverride -PathType Container).Exists) {
             $bazaWwwPresence = 'Error'
-            $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "явний override discoverySettings.Sources.BAZA_WWW вказує на каталог, якого не існує: $bazaWwwOverride" }
+            $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "явний override discoverySettings.Sources.BAZA_WWW вказує на каталог, якого не існує$(if ($bazaWwwProbe.Error) { " або недоступний ($($bazaWwwProbe.Error))" }): $bazaWwwOverride" }
         } else {
             $bazaWwwPresence = 'Present'
             $bazaWwwResolved = [pscustomobject]@{ Value = $bazaWwwOverride; Reason = 'явний override discoverySettings.Sources.BAZA_WWW' }
@@ -1107,7 +1181,7 @@ function Resolve-BRAVOInstallationDiscovery {
         $bazaWwwPresence = 'Ambiguous'
         $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "кілька Apache-подібних служб з різними виконуваними файлами — неможливо визначити authoritative BAZA_WWW ($($distinctWebExecutables -join '; '))" }
     } elseif (-not [string]::IsNullOrWhiteSpace($apacheDocumentRoot)) {
-        $bazaWwwCandidate = Join-Path $apacheDocumentRoot 'BAZA'
+        $bazaWwwCandidate = Join-BRAVODiscoveryPathLexical -Parent $apacheDocumentRoot -Child 'BAZA'
         $bazaWwwStructural = Test-BRAVOBazaWwwInstallation -Path $bazaWwwCandidate
         $bazaWwwSource = 'ApacheConfig'
         if ($bazaWwwStructural.Valid) {
@@ -1189,7 +1263,11 @@ function Resolve-BRAVOInstallationDiscovery {
             return Resolve-BRAVODiscoveryPathComponentPresence -Component $Component `
                 -Path ([string]$Resolved.Value) -Source 'ExplicitOverride' -Reason ([string]$Resolved.Reason)
         }
-        if (-not [string]::IsNullOrWhiteSpace([string]$Resolved.Value)) {
+        # Ключ у bravo.ini є, але похідне значення порожнє (MODEL=lims без
+        # каталожної частини): це не «ключа немає», а шлях без каталогу -
+        # той самий шлях NoPath, що й для не-absolute значення.
+        if (-not [string]::IsNullOrWhiteSpace([string]$Resolved.Value) -or
+            [bool]$Resolved.FromIni) {
             return Resolve-BRAVODiscoveryPathComponentPresence -Component $Component `
                 -Path ([string]$Resolved.Value) -Source 'BravoIni' -Reason ([string]$Resolved.Reason)
         }
@@ -1430,8 +1508,9 @@ function Test-BRAVODiscoveryResult {
             continue
         }
         $sourceForTest = ([string]$sourceValue).TrimEnd("*", "\")
-        if (-not (Test-Path -LiteralPath $sourceForTest)) {
-            $errors.Add("Джерело '$componentName' увімкнено, але шлях не існує: $sourceValue")
+        $sourceProbe = Test-BRAVODiscoveryPathProbe -Path $sourceForTest
+        if (-not $sourceProbe.Exists) {
+            $errors.Add("Джерело '$componentName' увімкнено, але шлях не існує$(if ($sourceProbe.Error) { " або недоступний ($($sourceProbe.Error))" }): $sourceValue")
         }
     }
 
@@ -1447,15 +1526,29 @@ function Test-BRAVODiscoveryResult {
         if ([string]::IsNullOrWhiteSpace($destinationValue)) {
             continue
         }
-        if (-not (Test-Path -LiteralPath $destinationValue -PathType Container)) {
+        $destinationProbe = Test-BRAVODiscoveryPathProbe -Path $destinationValue -PathType Container
+        if (-not $destinationProbe.Exists) {
             # #282: перевірка нічого не створює (контракт -ValidateOnly).
             # Каталог створить перший справжній прогін; тут достатньо, щоб
             # існував найближчий батьківський каталог (диск або корінь).
+            # Помилка перевірки (недосяжний UNC тощо) - це проблема, а не
+            # «каталогу ще немає»: вищий існуючий предок не приймається, а обхід
+            # зупиняється на першій помилці (без серії SMB-таймаутів).
+            if ($destinationProbe.Error) {
+                $errors.Add("Каталог призначення '$componentName' недоступний ($($destinationProbe.Error)): $destinationValue")
+                continue
+            }
             $existingAncestor = $null
+            $ancestorProbeFailure = $null
             try {
                 $ancestorCandidate = Split-Path -Path $destinationValue -Parent
                 while (-not [string]::IsNullOrWhiteSpace($ancestorCandidate)) {
-                    if (Test-Path -LiteralPath $ancestorCandidate -PathType Container) {
+                    $ancestorProbe = Test-BRAVODiscoveryPathProbe -Path $ancestorCandidate -PathType Container
+                    if ($ancestorProbe.Error) {
+                        $ancestorProbeFailure = "батьківський каталог '$ancestorCandidate' недоступний ($($ancestorProbe.Error))"
+                        break
+                    }
+                    if ($ancestorProbe.Exists) {
                         $existingAncestor = $ancestorCandidate
                         break
                     }
@@ -1465,6 +1558,10 @@ function Test-BRAVODiscoveryResult {
                 }
             } catch {
                 $existingAncestor = $null
+            }
+            if ($null -ne $ancestorProbeFailure) {
+                $errors.Add("Каталог призначення '$componentName' не існує, а $ancestorProbeFailure`: $destinationValue")
+                continue
             }
             if ($null -eq $existingAncestor) {
                 $errors.Add("Каталог призначення '$componentName' не існує, і жоден його батьківський каталог недоступний: $destinationValue")

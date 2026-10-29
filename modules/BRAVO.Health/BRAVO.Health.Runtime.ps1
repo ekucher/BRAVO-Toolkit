@@ -3836,7 +3836,7 @@ function Get-SFTPHealthIssues {
                 $bazaSyncResult = $script:bazaSyncResults[$folderCheck.ComponentKey]
             }
             if ($null -eq $bazaSyncResult) {
-                # Acceptance DEV-LIMS (2026-08-13, знахідка #5): .NET-асемблі
+                # Acceptance HOST-11 (2026-08-13, знахідка #5): .NET-асемблі
                 # потрібен winscp.exe, а $winSCPPath — це Tools\WinSCP.com;
                 # цей fallback-шлях зазвичай не виконується (Health
                 # переви­користовує SyncResult від Archive), тому дефект
@@ -4773,7 +4773,7 @@ function Get-BRAVOHealthLatestBackupSummary {
     # правильно рахується у UTC-арифметиці й лишається незмінним. Але
     # human-facing TimestampText раніше форматував це саме UTC-значення
     # напряму — оператор бачив UTC замість локального часу сервера
-    # (реальний DEV-LIMS acceptance: generation 18:57 local показувалась
+    # (реальний HOST-11 acceptance: generation 18:57 local показувалась
     # як 15:57). Конвертація в локальний час сервера — єдина зміна:
     # внутрішня модель лишається UTC, сама конвертація відбувається лише
     # тут, у presentation layer, в ОДНІЙ спільній точці для обох
@@ -4865,7 +4865,7 @@ function New-SlackAlertMessage {
         "BRAVO BACKUP — ПОТРІБНА ДІЯ"
     }
     $latestBackup = Get-BRAVOHealthLatestBackupSummary
-    # Компактність (запит оператора, DEV-LIMS 2026-08-21): повний Reason
+    # Компактність (запит оператора, HOST-11 2026-08-21): повний Reason
     # з'являється в повідомленні РІВНО ОДИН РАЗ — у тематичній секції нижче.
     # Шапка причин — лише перелік проблемних компонентів одним рядком
     # (до 4 імен, далі «та ще N»); раніше сюди дублювався повний текст

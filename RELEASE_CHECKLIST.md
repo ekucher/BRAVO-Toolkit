@@ -100,7 +100,7 @@ stdin, чи будь-яку іншу поведінку, що впливає н�
 існуючих** production-архівів (приклад: BOM-fallback для legacy
 паролів, 5.2.0-rc.1) — не лише для новостворених:
 
-- [ ] На DEV-LIMS або іншому контрольованому сервері перевірено
+- [ ] На HOST-11 або іншому контрольованому сервері перевірено
       generation, реально створену **попередньою** stable-версією
       (не свіжостворену цим релізом): `BRAVO_DATA_RESTORE.ps1
       -ListGenerations`, потім OutOfPlace restore цього generation,
@@ -125,8 +125,8 @@ stdin, чи будь-яку іншу поведінку, що впливає н�
   Branch protection (перевірено через GitHub REST API 2026-09-30,
   мусить бути перечитано перед рішенням): `master` — protected, шість
   required checks з канону `RELEASE_POLICY.md` §13.3; його `strict`,
-  `enforce_admins`, вимогу PR і заборону force push/видалення з
-  автоматичної сесії не перевірено (HTTP 403). `developer` — **не
+  `enforce_admins`, вимогу PR і заборону force push/видалення токеном
+  без admin-прав не перевірено (HTTP 403). `developer` — **не
   protected** (ні правила, ні ruleset); бажана політика і процедура
   власника — `RELEASE_POLICY.md` §13.4 (OWNER ACTION REQUIRED).
 - Tools hashes (`TOOLS_INTEGRITY.json`) — TOFU, не еталонний release

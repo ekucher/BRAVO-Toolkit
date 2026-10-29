@@ -763,8 +763,9 @@ function Get-BRAVOMaintenanceRestoreDecisionSnapshot {
     $todayMarkerPresent = (Test-Path -LiteralPath $TodayMarkerFile)
     $scheduledSucceeded = (Test-Path -LiteralPath $ScheduledMarkerFile) -or (
         $null -ne $restoreState -and
-        # #438 (P3-4): стан може не мати Status/ScheduledOccurrence (його створив
-        # невдалий -ForceRestore лише з лічильником) — StrictMode-безпечне читання.
+        # #438 (P3-4): StrictMode-безпечне читання — стан, записаний вручну
+        # оператором, може не мати Status/ScheduledOccurrence (BRAVO сам пише їх
+        # завжди, при невдалому -ForceRestore — порожніми).
         $null -ne $restoreState.PSObject.Properties['Status'] -and
         $null -ne $restoreState.PSObject.Properties['ScheduledOccurrence'] -and
         [string]$restoreState.Status -eq 'Succeeded' -and
@@ -1519,7 +1520,7 @@ function Enter-BRAVOMaintenanceOperationLock {
                         # Оператор бачив лише мовчазний Start-Sleep до
                         # OperationLockWaitMinutes і жодного натяку, хто саме
                         # тримає lock, хоча holder уже пише в цей файл JSON із
-                        # operation/pid/hostname/generationId (DEV-LIMS
+                        # operation/pid/hostname/generationId (HOST-11
                         # acceptance 2026-08-23). Читання — best-effort: holder
                         # тримає файл із FileShare.Read, тому в звичайному разі
                         # peek вдається; вузьке вікно між OpenOrCreate і Write
@@ -1756,7 +1757,7 @@ function Get-BRAVOMaintenanceResolvedExitCode {
 # Get-BRAVOExitCodeName (BRAVO.ExitCodes, те саме джерело істини, що
 # вже показує "Код завершення:" у РЕЗУЛЬТАТ нижче). default-гілка
 # покриває 40/41/60 і будь-який інший неуспішний/не-warning код без
-# перелічення кожного окремо. Реальний DEV-LIMS запуск: відсутній
+# перелічення кожного окремо. Реальний HOST-11 запуск: відсутній
 # Range ID log (WARN-only, семантика НЕ змінена) -> exit 10
 # (SuccessWithWarnings), але ЛОГ і фінальне повідомлення раніше
 # незалежно показували "УСПІШНО" без жодної згадки про попередження.
@@ -1829,7 +1830,7 @@ function Register-BRAVOMaintenanceArchiveChildResult {
 # рендерів: Write-BRAVOMaintenanceStep (пронумеровані [N/Total]) і
 # Write-BRAVOMaintenanceOperation (ненумеровані операції).
 #
-# Реальний DEV-LIMS прогін 19:26 показав, чому облік мусить бути спільним:
+# Реальний HOST-11 прогін 19:26 показав, чому облік мусить бути спільним:
 # ненумеровані операції рендерилися прямо через Write-BRAVOOperationResult
 # (BRAVO.Console), тому FAIL-операція "Trace: добовий архів і SFTP" не
 # потрапляла ані в лічильники (підсумок брехав "Помилок: 0" при exit 60),
@@ -2082,7 +2083,7 @@ function Write-Log {
     # задають етапи (Write-BRAVOMaintenanceStep), тому в консоль вони більше
     # не йдуть.
     # dev.19: голий роздільник "==="/"=" БІЛЬШЕ НЕ пише окремий запис у
-    # журнал (той самий підхід, що вже Archive dev.18). Реальний DEV-LIMS
+    # журнал (той самий підхід, що вже Archive dev.18). Реальний HOST-11
     # лог показав рядки лише зі 100 символами "=" між звичайними секціями
     # — без жодної діагностичної цінності, бо кожен такий виклик стоїть
     # безпосередньо перед "=== ЗАГОЛОВОК ===", який і так фіксує ту саму
@@ -2761,13 +2762,18 @@ function Write-BRAVORestoreRetryState {
         Write-Log -Message "restore state пошкоджено ($($readResult.Error)); копію збережено: $corruptCopyPath. Блокування автоматичної реставрації збережено." -Level 'ERROR'
     }
     $map = ConvertTo-BRAVORestoreStateMap -State $readResult.State
-    # #438 (P3-4): примусовий шлях НІКОЛИ не створює поля слоту
-    # (ScheduledOccurrence/Status/Reason): невдалий -ForceRestore при
-    # відсутньому стані не повинен вигадувати 'Pending' для планового слоту
-    # (це замовляло б автоматичну реставрацію). Лише лічильник/клас/
-    # write-ahead. Читач слоту (Main, $scheduledSucceeded) StrictMode-безпечний
-    # до відсутності цих полів.
-    if (-not $ForceRestore) {
+    # #438 (P3-4): примусовий шлях НІКОЛИ не вигадує слот: невдалий
+    # -ForceRestore при відсутньому чи пошкодженому стані не пише 'Pending'
+    # для планового слоту (це замовляло б автоматичну реставрацію). Відсутні
+    # поля слоту (ScheduledOccurrence/Status/Reason) він створює ПОРОЖНІМИ,
+    # як Write-BRAVORestoreForcedOutcome: читач v5.2.4 звертається до
+    # $restoreState.Status напряму під StrictMode 2.0, і файл без цих полів
+    # ламав би кожен прогін Maintenance після rollback на 5.2.4.
+    if ($ForceRestore) {
+        foreach ($legacyKey in @('ScheduledOccurrence', 'Status', 'Reason')) {
+            if (-not $map.Contains($legacyKey)) { $map[$legacyKey] = '' }
+        }
+    } else {
         if (-not $map.Contains('ScheduledOccurrence')) { $map['ScheduledOccurrence'] = $ScheduledOccurrence.ToString('o') }
         if (-not $map.Contains('Status')) { $map['Status'] = 'Pending' }
         if (-not $map.Contains('Reason')) { $map['Reason'] = $Reason }
@@ -5238,7 +5244,7 @@ function Send-BRAVOTraceArchive {
         $remoteRoot = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { '' } else { "/$normalizedRemoteDirectory" }
         $remoteArchivePath = "$remoteRoot/$([System.IO.Path]::GetFileName($ArchivePath))"
         # session.PutFiles НЕ створює відсутні remote-каталоги: реальний
-        # DEV-LIMS прогін падав на кожному запуску з "Cannot create remote
+        # HOST-11 прогін падав на кожному запуску з "Cannot create remote
         # file '/trace/Trace_YYYYMMDD.mdz.new.filepart'. No such file or
         # directory", бо /trace/ на сервері не існував — і це давало exit 60
         # обслуговування, яке насправді відпрацювало. Канонічний рекурсивний
@@ -6948,7 +6954,7 @@ function Compare-FileSizes {
         [int]$MinSizeBytes = 2048,
         [AllowNull()][string]$MainModelRelativePath = $null,
         # Settle-retry (порт 67f3ad3+e2c61e1 з backup/local-developer-rc2-line):
-        # двічі підтверджено на реальному DEV-LIMS (2026-08-23/24, byte-точний
+        # двічі підтверджено на реальному HOST-11 (2026-08-23/24, byte-точний
         # збіг розмірів на диску одразу після хибного rollback) — активний
         # антивірус із real-time захистом тримав щойно записані гігабайтні
         # .md залоченими одразу після bravocmd repair/екстракції, і
@@ -7910,11 +7916,11 @@ function Get-BRAVORestoreArchiveMainFiles {
 
     $enumeratedFiles = @()
     try {
-        # Codex P2 (раунд 2): Test-Path за ACL / збою провайдера може
+        # рев'ю P2 (раунд 2): Test-Path за ACL / збою провайдера може
         # записати non-terminating error і нічого не повернути — це не
         # доказ відсутності каталогу, тож -ErrorAction Stop веде в той
         # самий fail-closed catch, що й збій Get-ChildItem.
-        # Codex P2 (раунд 3): налаштований каталог — буквальний шлях
+        # рев'ю P2 (раунд 3): налаштований каталог — буквальний шлях
         # (-LiteralPath): з -Path символи [ / ] у назві каталогу були б
         # шаблоном (наявний каталог «відсутній» чи збіг із сусіднім).
         # Шаблон імені файлу лишається в -Filter.
@@ -7984,7 +7990,7 @@ function Remove-OldRestoreArchives {
         # 7z t, ті самі WARNING/ERROR і прапорці exit 41), БЕЗ жодного
         # видалення. Main використовує його, коли сесій ≤ ArchivesKeepCount.
         [switch]$ReportOnly,
-        # #424 (Codex P2, раунд 3): необов'язковий облік кроку очистки:
+        # #424 (рев'ю P2, раунд 3): необов'язковий облік кроку очистки:
         # IntegrityFailed = $true, коли цей виклик виставив прапорці exit 41
         # (збій переліку, 7z t, жодної підтвердженої точки відновлення).
         # Глобальний Boolean не показує нового збою, якщо попередня фаза
@@ -8151,7 +8157,7 @@ function Remove-OldRestoreArchives {
     # #300 / #424: жодної придатної точки відновлення не лишилось —
     # критично (exit 41) незалежно від етапу, на якому забраковано сесії
     # (SHA512 чи 7z t), навіть якщо окремі збої старіших сесій були лише
-    # WARNING. Codex P1 (раунд 3): раніше умова вимагала збою 7z t, і сесії,
+    # WARNING. рев'ю P1 (раунд 3): раніше умова вимагала збою 7z t, і сесії,
     # забраковані вже на SHA512 (hash-файл відсутній / некоректний / не
     # збігається / не читається), давали лише exit 10. Видалення це не
     # розширює: без підтвердженої точки $groupsToKeep і $groupsToDelete
@@ -8248,7 +8254,7 @@ function Remove-OldRestoreArchives {
         # результат, pipeline віддає скалярний FileInfo замість масиву, і
         # .Count на ньому кидає "The property 'Count' cannot be found on
         # this object": підтверджено реальним acceptance-прогоном dev.15
-        # на DEV-LIMS (виняток після [8/8], перехоплений fail-safe catch).
+        # на HOST-11 (виняток після [8/8], перехоплений fail-safe catch).
         $beforeCount = @($group.Group | Where-Object { $_.Name -like "*_before_*" }).Count
         $afterCount = @($group.Group | Where-Object { $_.Name -like "*_after_*" }).Count
         Write-Log "  - $sessionTime (before: $beforeCount, after: $afterCount)" -Level "DEBUG"
@@ -8263,7 +8269,7 @@ function Remove-OldRestoreArchives {
         Write-Log "Видалення сесії: $sessionTime ($($group.Count) файлів)..." -Level "INFO"
         
         # Видаляємо всі файли цієї сесії (основні архіви та контрольні суми)
-        # #424 (Codex P2, раунд 3): -LiteralPath — той самий буквальний
+        # #424 (рев'ю P2, раунд 3): -LiteralPath — той самий буквальний
         # каталог, який перевіряв Get-BRAVORestoreArchiveMainFiles, а не
         # сусідній, що збігся б із шаблоном [ / ].
         $sessionFiles = Get-ChildItem -LiteralPath $Path -ErrorAction SilentlyContinue | 
@@ -9646,7 +9652,7 @@ if ($BravoMaintenanceEnabled) {
         # INFO, не WARNING: це констатація СВІДОМОЇ дії оператора (він сам
         # передав -ForceRestore), а не аномалія. Будь-який WARNING інкрементує
         # $script:BRAVOWarningCount (Write-Log вище), а той піднімає severity
-        # сповіщення й дає exit 10 (SuccessWithWarnings) — реальний DEV-LIMS
+        # сповіщення й дає exit 10 (SuccessWithWarnings) — реальний HOST-11
         # прогін 20:29 показав оператору жовте "ПОТРІБНА ДІЯ: перевірити
         # журнал" при повністю зеленому списку етапів, без жодної підказки,
         # що саме не так. Текст лишається в лозі повністю — змінюється лише
@@ -11412,7 +11418,7 @@ if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
 # Зріз лічильників пересвіжується САМЕ ТУТ, після реставрації і перевірки
 # розмірів .md: початкова ініціалізація вище знімається ДО них, тому
 # критична помилка реставрації опинялася "новою" для цього етапу і
-# фарбувала його в FAIL. Реальний DEV-LIMS негативний прогін 19:48
+# фарбувала його в FAIL. Реальний HOST-11 негативний прогін 19:48
 # (bravocmd вбито -> exit 43) показав [6/8] FAIL з деталями
 # "оброблено файлів: 2" — тобто етап відпрацював, а червоним був через
 # чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.
@@ -12325,7 +12331,7 @@ $restoreArchiveDeleteCandidateGroups = @()
 # #424: кількість усіх сесій архівів реставрації (без валідації) — для
 # гілки «лише перевірка», коли сесій ≤ ArchivesKeepCount.
 $restoreArchiveGroupCount = 0
-# #424 (Codex P2, раунд 3): власний облік збою цілісності архівів
+# #424 (рев'ю P2, раунд 3): власний облік збою цілісності архівів
 # реставрації для статусу кроку очистки (Remove-OldRestoreArchives -Outcome
 # і збій переліку нижче). Глобальний criticalErrorOccurred не показує нового
 # збою, якщо його вже виставила попередня фаза.
@@ -12584,7 +12590,7 @@ $cleanupOperationFileCandidateCount = $traceOldLogs.Count + $expiredCompressedLo
 $cleanupOperationStatus = Get-BRAVOMaintenanceStepStatus `
     -CriticalBefore $cleanupCriticalBefore `
     -WarningsBefore $cleanupWarningsBefore
-# #424 (Codex P2, раунд 3): збій цілісності архівів реставрації в цьому
+# #424 (рев'ю P2, раунд 3): збій цілісності архівів реставрації в цьому
 # кроці — FAIL і тоді, коли criticalErrorOccurred уже виставила попередня
 # фаза (снепшот $cleanupCriticalBefore тоді не бачить нового збою).
 if ([bool]$restoreArchiveIntegrityOutcome['IntegrityFailed']) {

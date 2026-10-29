@@ -274,7 +274,7 @@ function Invoke-BRAVOConfiguratorEffectiveComputation {
         return $resultObject
     }
     finally {
-        # P2 (незалежний review, Agent D): -ErrorAction SilentlyContinue тут
+        # P2 (незалежне рев'ю D): -ErrorAction SilentlyContinue тут
         # свідомо, не недбало — AV lock/ще-не-звільнений handle на щойно
         # завершеному дочірньому процесі не повинні перетворювати успішний
         # Effective-результат на помилку. Рідкісний залишений
