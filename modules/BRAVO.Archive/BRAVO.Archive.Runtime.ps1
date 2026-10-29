@@ -1466,7 +1466,27 @@ function Resolve-BRAVORetentionGenerationManifest {
             if ($null -eq $recordedProperty) { continue }
             $recordedPath = [string]$recordedProperty.Value
             if ([string]::IsNullOrWhiteSpace($recordedPath)) { continue }
+            # Суфікс імені, який NameTemplate дає для ЦІЄЇ generation (той
+            # самий identity gate, що в Get-BRAVOVerifiedGenerationArchive).
+            $expectedSuffix = ''
+            if (-not [string]::IsNullOrWhiteSpace($nameTemplate)) {
+                try { $expectedSuffix = $nameTemplate -f '', $generationId } catch { $expectedSuffix = '' }
+            }
+            if ($fieldName -eq 'HashPath' -and -not [string]::IsNullOrEmpty($expectedSuffix)) {
+                $expectedSuffix += $hashExtension
+            }
             if (Test-Path -LiteralPath $recordedPath -PathType Leaf) {
+                # Існуючий записаний файл теж перевіряється за NameTemplate:
+                # підмінений manifest із ім'ям архіву іншої (поточної)
+                # generation інакше видалив би чужий архів. Без NameTemplate
+                # (порожній суфікс) перевірити нічого - поведінка без змін.
+                $existingLeaf = [IO.Path]::GetFileName($recordedPath)
+                if (-not [string]::IsNullOrEmpty($expectedSuffix) -and
+                    ($existingLeaf.Length -le $expectedSuffix.Length -or
+                    -not $existingLeaf.EndsWith($expectedSuffix, [StringComparison]::Ordinal))) {
+                    $unresolvedReasons += "${componentName}: ім'я '$existingLeaf' не належить generation $generationId за NameTemplate"
+                    continue
+                }
                 if (Test-BRAVOBackupArtifactPathSafe -Path $recordedPath -BackupRoot $BackupRoot) {
                     $resolvedComponent.$fieldName = $recordedPath
                 } else {
@@ -1483,16 +1503,15 @@ function Resolve-BRAVORetentionGenerationManifest {
             $recordedFull = try { [IO.Path]::GetFullPath($recordedPath) } catch { $recordedPath }
             $canonicalFull = try { [IO.Path]::GetFullPath($canonicalPath) } catch { $canonicalPath }
             if ([string]::Equals($recordedFull, $canonicalFull, [StringComparison]::OrdinalIgnoreCase)) {
-                # Перебудови немає: файла просто вже немає (як до #335).
+                # Перебудови немає: файла за записаним шляхом немає. "Уже
+                # видалено" це доводить лише доступний каталог компонента
+                # (як до #335); недоступний том осиротив би архів.
+                if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+                    $unresolvedReasons += "${componentName}: каталог компонента недоступний ($destination)"
+                    continue
+                }
                 $resolvedComponent.$fieldName = $recordedPath
                 continue
-            }
-            $expectedSuffix = ''
-            if (-not [string]::IsNullOrWhiteSpace($nameTemplate)) {
-                try { $expectedSuffix = $nameTemplate -f '', $generationId } catch { $expectedSuffix = '' }
-            }
-            if ($fieldName -eq 'HashPath' -and -not [string]::IsNullOrEmpty($expectedSuffix)) {
-                $expectedSuffix += $hashExtension
             }
             if ([string]::IsNullOrEmpty($expectedSuffix) -or
                 $leaf.Length -le $expectedSuffix.Length -or
