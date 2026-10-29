@@ -2799,6 +2799,47 @@ function Remove-BRAVOVSSDiskshadowOrphanedShadow {
     }
 }
 
+function Get-BRAVOVSSDiskshadowWorkDirectory {
+    # diskshadow.exe читає сценарій (/s) як ANSI/OEM, а не UTF-8: шлях зі
+    # SET METADATA з кирилицею (ручний запуск з профілю з не-ASCII %TEMP%)
+    # ламається і дає diskshadow exit 3 -> Archive 40. Тому сценарій і
+    # metadata-.cab кладуться лише в каталог із ПОВНІСТЮ ASCII-шляхом:
+    # %TEMP%, якщо він ASCII, інакше %SystemRoot%\Temp (diskshadow і так
+    # потребує адмін-прав; завдання Планувальника під SYSTEM мають
+    # TEMP=C:\Windows\Temp). Той самий принцип ASCII-перевірки, що й у
+    # New-BRAVOManualLaunchers. Немає придатного каталогу -> $null, і
+    # викликач зупиняється керованою помилкою (live-fallback не існує).
+    param(
+        [string]$TempPath = [IO.Path]::GetTempPath(),
+        [string]$SystemRootPath = $env:SystemRoot
+    )
+
+    $asciiPattern = '^[\x20-\x7E]+$'
+    if (-not [string]::IsNullOrWhiteSpace($TempPath) -and $TempPath -cmatch $asciiPattern) {
+        return $TempPath
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SystemRootPath)) {
+        return $null
+    }
+    $systemTemp = Join-Path $SystemRootPath 'Temp'
+    if ($systemTemp -cmatch $asciiPattern -and (Test-Path -LiteralPath $systemTemp -PathType Container)) {
+        $probePath = Join-Path $systemTemp ("BRAVO_diskshadow_probe_{0}.tmp" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [IO.File]::WriteAllText($probePath, 'probe')
+            return $systemTemp
+        } catch {
+            # Каталог недоступний для запису: кандидата відхилено.
+            return $null
+        } finally {
+            if (Test-Path -LiteralPath $probePath -PathType Leaf) {
+                Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    return $null
+}
+
 function New-BRAVOVSSDiskshadowSnapshotSet {
     param([Parameter(Mandatory = $true)][string[]]$VolumeRoots)
 
@@ -2811,7 +2852,16 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
         )
     }
 
-    $scriptPath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_diskshadow_{0}.txt" -f [guid]::NewGuid().ToString("N"))
+    $workDirectory = Get-BRAVOVSSDiskshadowWorkDirectory
+    if ([string]::IsNullOrWhiteSpace($workDirectory)) {
+        throw (
+            "Багатотомний VSS Snapshot Set потребує diskshadow.exe, який читає сценарій лише в ANSI/OEM, " +
+            "а ні TEMP ($env:TEMP), ні %SystemRoot%\Temp не є доступним каталогом з ASCII-шляхом " +
+            "(типово: ручний запуск з профілю з кирилицею у шляху). Live-архівацію без знімка не виконано. " +
+            "Запустіть архівацію завданням Планувальника (SYSTEM) або задайте ASCII-шлях у TEMP/TMP поточного користувача."
+        )
+    }
+    $scriptPath = Join-Path $workDirectory ("BRAVO_diskshadow_{0}.txt" -f [guid]::NewGuid().ToString("N"))
     # SET METADATA обов'язковий (5.2.1): без нього diskshadow.exe у
     # backup-контексті пише VSS writer metadata .cab з автоіменем
     # (NN-DD.MM.YYYY-HH_--_HOSTNAME.cab) у ПОТОЧНИЙ РОБОЧИЙ КАТАЛОГ
@@ -2821,7 +2871,7 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     # 2026-08-26). BRAVO ці метадані не використовує (контекст
     # NOWRITERS), тому файл спрямовується в TEMP і прибирається у finally
     # разом зі сценарієм.
-    $metadataPath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_diskshadow_meta_{0}.cab" -f [guid]::NewGuid().ToString("N"))
+    $metadataPath = Join-Path $workDirectory ("BRAVO_diskshadow_meta_{0}.cab" -f [guid]::NewGuid().ToString("N"))
 
     # Одноразове best-effort прибирання ВЖЕ накопичених metadata-.cab від
     # попередніх версій (до SET METADATA вище): у каталозі комплекту вони
@@ -2860,11 +2910,21 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     # навіть тоді, коли Snapshot Set створено успішно.
     $lines.Add("EXIT")
 
+    # У сценарії лише літери томів (Get-BRAVOVSSVolumeRoot приймає тільки
+    # X:\), alias і шляхи з $workDirectory — усе ASCII, тож ASCII-кодування
+    # дає ті самі байти, що й UTF-8 без BOM. Перевірка fail-closed: будь-який
+    # інший символ зупинив би запуск до diskshadow, а не зіпсував би шлях.
+    foreach ($scriptLine in $lines) {
+        if ($scriptLine -cnotmatch '^[\x20-\x7E]*$') {
+            throw "Сценарій diskshadow містить не-ASCII символи, які diskshadow.exe прочитає некоректно: $scriptLine"
+        }
+    }
+
     $volumeShadows = $null
     $snapshotSetId = $null
     $knownShadowIds = Get-BRAVOVSSExistingShadowIdMap
     try {
-        [IO.File]::WriteAllLines($scriptPath, $lines.ToArray(), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllLines($scriptPath, $lines.ToArray(), [Text.Encoding]::ASCII)
 
         $processInfo = New-Object System.Diagnostics.ProcessStartInfo
         $processInfo.FileName = $diskshadowPath
