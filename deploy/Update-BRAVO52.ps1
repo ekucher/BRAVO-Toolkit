@@ -153,6 +153,26 @@ function Get-BRAVO52Mitigation335 {
     if (-not (Test-Path -LiteralPath $LocalConfigPath -PathType Leaf)) {
         return [pscustomobject]@{ Status = 'Absent'; Message = 'BRAVO.local.config немає'; StartLine = 0; EndLine = 0 }
     }
+    # Видалення рядків переписує файл, тож автоматично правиться лише те, що
+    # можна записати назад байт-у-байт: коректний UTF-8 (з BOM чи без) з
+    # однорідними кінцями рядків CRLF або LF. UTF-16, ANSI, CR-only чи змішані
+    # кінці рядків — ручна дія, а не ризик зіпсувати робочу конфігурацію.
+    $rawBytes = [IO.File]::ReadAllBytes($LocalConfigPath)
+    if ($rawBytes.Length -ge 2 -and (($rawBytes[0] -eq 0xFF -and $rawBytes[1] -eq 0xFE) -or ($rawBytes[0] -eq 0xFE -and $rawBytes[1] -eq 0xFF))) {
+        $encodingProblem = 'кодування UTF-16'
+    } else {
+        $encodingProblem = ''
+        $offset = $(if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) { 3 } else { 0 })
+        try {
+            $rawText = (New-Object Text.UTF8Encoding($false, $true)).GetString($rawBytes, $offset, $rawBytes.Length - $offset)
+            $crlfCount = ([regex]::Matches($rawText, "`r`n")).Count
+            $loneCrCount = ([regex]::Matches($rawText, "`r(?!`n)")).Count
+            $loneLfCount = ([regex]::Matches($rawText, "(?<!`r)`n")).Count
+            if ($loneCrCount -gt 0 -or ($crlfCount -gt 0 -and $loneLfCount -gt 0)) { $encodingProblem = 'змішані або CR-only кінці рядків' }
+        } catch {
+            $encodingProblem = 'не UTF-8 (напр., ANSI)'
+        }
+    }
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($LocalConfigPath, [ref]$tokens, [ref]$parseErrors)
@@ -185,6 +205,9 @@ function Get-BRAVO52Mitigation335 {
     $endLine = $pair.Item2.Extent.EndLineNumber
     $before = $lines[$startLine - 1].Substring(0, $pair.Item1.Extent.StartColumnNumber - 1)
     $after = $lines[$endLine - 1].Substring($pair.Item2.Extent.EndColumnNumber - 1)
+    if ($encodingProblem) {
+        return [pscustomobject]@{ Status = 'Manual'; Message = ('мітигація #335 у рядку ' + $startLine + ', але BRAVO.local.config має ' + $encodingProblem + ' — приберіть її вручну'); StartLine = $startLine; EndLine = $endLine }
+    }
     if ($before.Trim() -ne '' -or $after -notmatch '^\s*;?\s*(#.*)?$') {
         return [pscustomobject]@{ Status = 'Manual'; Message = ('мітигація #335 у рядку ' + $startLine + ' змішана з іншим текстом — приберіть її вручну'); StartLine = $startLine; EndLine = $endLine }
     }
@@ -202,6 +225,15 @@ function Remove-BRAVO52LinesPreservingEncoding {
     $lines.AddRange([string[]]($text -split "`r?`n"))
     $lines.RemoveRange($StartLine - 1, $EndLine - $StartLine + 1)
     [IO.File]::WriteAllText($Path, ($lines -join $newline), (New-Object Text.UTF8Encoding($hasBom)))
+}
+
+function ConvertTo-BRAVO52QuotedArgument {
+    # Аргумент командного рядка в лапках за правилами CommandLineToArgvW:
+    # зворотні слеші перед закривною лапкою подвоюються, інакше
+    # 'C:\Program Files\BRAVO-Toolkit\' перетворився б на екрановану лапку і
+    # поглинув би наступні параметри UAC-перезапуску.
+    param([string]$Value)
+    return '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
 }
 
 function Invoke-BRAVO52Setup {
@@ -262,10 +294,10 @@ try {
         $argumentParts = New-Object System.Collections.Generic.List[string]
         # Process-scope Bypass, як у UPDATE-BRAVO52.cmd: пакет оновлення
         # приходить з інтернету, і RemoteSigned заблокував би його скрипти.
-        foreach ($fixed in @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $PSCommandPath + '"'), '-Tag', ('"' + $Tag + '"'))) {
+        foreach ($fixed in @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (ConvertTo-BRAVO52QuotedArgument $PSCommandPath), '-Tag', (ConvertTo-BRAVO52QuotedArgument $Tag))) {
             [void]$argumentParts.Add($fixed)
         }
-        if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) { [void]$argumentParts.Add('-RuntimeRoot'); [void]$argumentParts.Add('"' + $RuntimeRoot + '"') }
+        if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) { [void]$argumentParts.Add('-RuntimeRoot'); [void]$argumentParts.Add((ConvertTo-BRAVO52QuotedArgument $RuntimeRoot)) }
         if ($KeepMitigation335) { [void]$argumentParts.Add('-KeepMitigation335') }
         if ($AllowUntestedSource) { [void]$argumentParts.Add('-AllowUntestedSource') }
         if ($NoPause) { [void]$argumentParts.Add('-NoPause') }
@@ -388,15 +420,25 @@ try {
         $copyPath = Join-Path $script:UpgradeRoot ('BRAVO.local.config.before-335-' + $script:Stamp)
         Copy-Item -LiteralPath $localConfigPath -Destination $copyPath -Force
         Write-Note ('копія: ' + $copyPath)
-        Remove-BRAVO52LinesPreservingEncoding -Path $localConfigPath -StartLine $mitigation.StartLine -EndLine $mitigation.EndLine
-        $validateCode = Invoke-BRAVO52Setup -Root $RuntimeRoot -Arguments @('-ValidateOnly', '-NoPause')
-        if ($validateCode -eq 0 -or $validateCode -eq 10) {
+        # Будь-який збій після копії — і код перевірки, і виняток (запис, запуск
+        # BRAVO_SETUP) — повертає файл з копії: конфігурація сервера не може
+        # лишитися обірваною чи без перевірки.
+        $validateCode = $null
+        $editFailure = ''
+        try {
+            Remove-BRAVO52LinesPreservingEncoding -Path $localConfigPath -StartLine $mitigation.StartLine -EndLine $mitigation.EndLine
+            $validateCode = Invoke-BRAVO52Setup -Root $RuntimeRoot -Arguments @('-ValidateOnly', '-NoPause')
+        } catch {
+            $editFailure = $_.Exception.Message
+        }
+        if ($editFailure -eq '' -and ($validateCode -eq 0 -or $validateCode -eq 10)) {
             Write-Ok ('рядок прибрано, BRAVO_SETUP -ValidateOnly: exit ' + $validateCode)
             $summary.mitigation335After = 'Removed'
         } else {
             Copy-Item -LiteralPath $copyPath -Destination $localConfigPath -Force
-            Write-Bad ('BRAVO_SETUP -ValidateOnly після правки: exit ' + $validateCode + ' — BRAVO.local.config повернуто з копії')
-            $summary.mitigation335After = 'RestoredAfterValidationFailure'
+            $reason = $(if ($editFailure) { 'виняток: ' + $editFailure } else { 'BRAVO_SETUP -ValidateOnly: exit ' + $validateCode })
+            Write-Bad ('мітигацію не прибрано (' + $reason + ') — BRAVO.local.config повернуто з копії')
+            $summary.mitigation335After = 'RestoredAfterFailure'
             $script:ExitCode = 3
         }
     } elseif ($mitigation.Status -eq 'Manual') {
