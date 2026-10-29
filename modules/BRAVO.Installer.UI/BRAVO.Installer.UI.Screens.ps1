@@ -6,7 +6,11 @@
 # (замикання ламає резолв приватних функцій модуля). Стан передається через
 # $form.Tag (Context), який обробник бере з $sender.FindForm() / $sender.Tag.
 
-$script:BRAVOInstallerScreenNames = @('Home', 'Preflight', 'Settings', 'Diagnostics', 'Logs')
+# Екрани лівої навігації й екрани майстра (3–10): майстер відкривається діями
+# Головної/Maintenance Center і не має власних пунктів навігації.
+$script:BRAVOInstallerNavScreenNames = @('Home', 'Preflight', 'Settings', 'Diagnostics', 'Logs')
+$script:BRAVOInstallerWizardScreenNames = @('Source', 'Directories', 'Backup', 'Credentials', 'Schedule', 'Plan', 'Progress', 'Result')
+$script:BRAVOInstallerScreenNames = @($script:BRAVOInstallerNavScreenNames) + @($script:BRAVOInstallerWizardScreenNames)
 
 function Initialize-BRAVOInstallerWinForms {
     [CmdletBinding()]
