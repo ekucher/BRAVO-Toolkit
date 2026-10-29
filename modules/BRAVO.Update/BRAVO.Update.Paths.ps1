@@ -271,7 +271,7 @@ function Get-BRAVOUpdateProtectedRootProblem {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [ValidateSet('Private', 'ReadOnly', 'Requests')][string]$Kind = 'Private',
+        [ValidateSet('Private', 'ReadOnly', 'Requests', 'Container')][string]$Kind = 'Private',
         [switch]$Lenient,
         [scriptblock]$AdminCheck = $null,
         # Seam тестів: param($Path) -> об'єкт ACL (типово Get-Acl). Кидає UnauthorizedAccessException для імітації відмови.
@@ -289,8 +289,12 @@ function Get-BRAVOUpdateProtectedRootProblem {
         switch ($Kind) {
             'ReadOnly' { $allowedMask = [int]($rights::ReadAndExecute -bor $rights::Synchronize) }
             'Requests' { $allowedMask = [int]($rights::CreateFiles -bor $rights::ExecuteFile -bor $rights::ReadAttributes -bor $rights::Synchronize) }
+            # Container (предки коренів engine, валідуються БЕЗ зміни): читання/обхід і створення НОВИХ елементів допустимі
+            # (типовий ACL ProgramData), але видалення/перейменування чужих елементів, зміна прав і власника — ні.
+            'Container' { $allowedMask = [int]($rights::ReadAndExecute -bor $rights::Synchronize -bor $rights::CreateFiles -bor $rights::CreateDirectories) }
             default { $allowedMask = 0 }
         }
+        if ($Kind -eq 'Container') { $trusted = @($trusted) + @('S-1-3-4') }
         $acl = $null
         try {
             if ($null -ne $AclReader) { $acl = & $AclReader $Path } else { $acl = Get-Acl -LiteralPath $Path }
@@ -308,9 +312,14 @@ function Get-BRAVOUpdateProtectedRootProblem {
             if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
             if ((-not $Lenient) -and $rule.IsInherited) { $problems.Add('успадковане правило ' + $ruleSid + ': ' + $Path) }
             if ($trusted -contains $ruleSid) { continue }
+            # TrustedInstaller (NT SERVICE) довірений у контейнерах (Program Files тощо); InheritOnly-правило не діє на сам каталог.
+            if ($Kind -eq 'Container') {
+                if ($ruleSid.StartsWith('S-1-5-80-', [StringComparison]::Ordinal)) { continue }
+                if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+            }
             $ruleMask = [int]$rule.FileSystemRights
             $maskAllowed = 0
-            if ($ruleSid -eq $usersSid) { $maskAllowed = $allowedMask }
+            if (($ruleSid -eq $usersSid) -or ($Kind -eq 'Container')) { $maskAllowed = $allowedMask }
             if (($ruleMask -band (-bnot $maskAllowed)) -ne 0) {
                 $problems.Add('ACE для недовіреного ' + $ruleSid + ' (' + [string]$rule.FileSystemRights + ') перевищує дозволене: ' + $Path)
             }
@@ -346,7 +355,7 @@ function Get-BRAVOUpdateProtectedRootSpec {
     $leaves.Add([pscustomobject]@{ Path = (Join-Path $stateRoot 'Operations'); Kind = 'ReadOnly'; Role = 'Operations' })
     $leaves.Add([pscustomobject]@{ Path = (Join-Path $stateRoot 'ConsumedPlans'); Kind = 'Private'; Role = 'ConsumedPlans' })
     $leaves.Add([pscustomobject]@{ Path = (Join-Path $stateRoot 'Requests'); Kind = 'Requests'; Role = 'Requests' })
-    $leaves.Add([pscustomobject]@{ Path = (Get-BRAVOUpdateFullPath -Path ([string]$Paths.LockRoot)); Kind = 'Private'; Role = 'LockRoot' })
+    $leaves.Add([pscustomobject]@{ Path = (Get-BRAVOUpdateFullPath -Path ([string]$Paths.LockRoot)); Kind = 'Container'; Role = 'LockRoot'; CreateKind = 'Private' })
     $leaves.Add([pscustomobject]@{ Path = (Get-BRAVOUpdateFullPath -Path ([string]$Paths.StagingRoot)); Kind = 'Private'; Role = 'StagingRoot' })
     $leaves.Add([pscustomobject]@{ Path = (Get-BRAVOUpdateFullPath -Path ([string]$Paths.BackupRoot)); Kind = 'Private'; Role = 'BackupRoot' })
 
@@ -355,9 +364,10 @@ function Get-BRAVOUpdateProtectedRootSpec {
     foreach ($leaf in $leaves) {
         $ancestor = [System.IO.Path]::GetDirectoryName($leaf.Path)
         while ((-not [string]::IsNullOrEmpty($ancestor)) -and (Test-BRAVOUpdatePathIsUnder -Path $ancestor -Root $ProgramDataRoot)) {
-            $kind = 'ReadOnly'
-            if ([string]::Equals($ancestor, $stateParent, [StringComparison]::OrdinalIgnoreCase)) { $kind = 'Private' }
-            $containers[$ancestor.ToLowerInvariant()] = [pscustomobject]@{ Path = $ancestor; Kind = $kind; Role = 'Container' }
+            # Відсутній контейнер створюється захищеним; BRAVO\State — лише Administrators/SYSTEM (як Protect-BRAVOMachineStateRoot).
+            $createKind = 'ReadOnly'
+            if ([string]::Equals($ancestor, $stateParent, [StringComparison]::OrdinalIgnoreCase)) { $createKind = 'Private' }
+            $containers[$ancestor.ToLowerInvariant()] = [pscustomobject]@{ Path = $ancestor; Kind = 'Container'; Role = 'Container'; CreateKind = $createKind }
             $ancestor = [System.IO.Path]::GetDirectoryName($ancestor)
         }
     }
@@ -372,6 +382,64 @@ function Get-BRAVOUpdateProtectedRootSpec {
         $ordered.Add($leaf)
     }
     return $ordered.ToArray()
+}
+
+function Get-BRAVOUpdateUntrustedContentOwner {
+    # Проблеми власників вмісту каталогу (N3): безпосередні елементи й, для Depth 2, елементи першого рівня підкаталогів.
+    # Reparse point у вмісті теж проблема. Помилка читання власника = проблема (fail closed).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path, [int]$Depth = 1, [scriptblock]$AdminCheck = $null)
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $trusted = @(Get-BRAVOUpdateTrustedSid -AdminCheck $AdminCheck)
+    $queue = New-Object 'System.Collections.Generic.Queue[object]'
+    $queue.Enqueue(@($Path, 1))
+    while ($queue.Count -gt 0) {
+        $item = $queue.Dequeue()
+        $entries = @()
+        try { $entries = @([System.IO.Directory]::GetFileSystemEntries([string]$item[0])) } catch { $problems.Add('вміст не прочитано: ' + [string]$item[0]); continue }
+        foreach ($entry in $entries) {
+            try {
+                $attributes = [System.IO.File]::GetAttributes($entry)
+                if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $problems.Add('reparse point у вмісті: ' + $entry); continue }
+                $ownerSid = [string](Get-Acl -LiteralPath $entry).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+                if ($trusted -notcontains $ownerSid) { $problems.Add('власник ' + $ownerSid + ' елемента не з довіреного списку: ' + $entry) }
+                if ((($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) -and ([int]$item[1] -lt $Depth)) { $queue.Enqueue(@($entry, ([int]$item[1] + 1))) }
+            } catch {
+                $problems.Add('власник не прочитано: ' + $entry)
+            }
+        }
+    }
+    return $problems.ToArray()
+}
+
+function Get-BRAVOUpdateAncestorProblem {
+    # Перевірка предків шляху всередині ProgramData (validate-only, Kind Container): власник, reparse, недовірені
+    # записувачі. Відсутні предки пропускаються. Шлях поза ProgramData — предків для перевірки немає.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path, [string]$ProgramDataRoot = '', [scriptblock]$AdminCheck = $null)
+
+    if ([string]::IsNullOrWhiteSpace($ProgramDataRoot)) { $ProgramDataRoot = [Environment]::GetFolderPath('CommonApplicationData') }
+    $problems = New-Object System.Collections.Generic.List[string]
+    $ancestor = [System.IO.Path]::GetDirectoryName((Get-BRAVOUpdateFullPath -Path $Path))
+    while ((-not [string]::IsNullOrEmpty($ancestor)) -and (Test-BRAVOUpdatePathIsUnder -Path $ancestor -Root $ProgramDataRoot)) {
+        if ([System.IO.Directory]::Exists($ancestor)) {
+            foreach ($item in @(Get-BRAVOUpdateProtectedRootProblem -Path $ancestor -Kind Container -Lenient -AdminCheck $AdminCheck)) { $problems.Add([string]$item) }
+        }
+        $ancestor = [System.IO.Path]::GetDirectoryName($ancestor)
+    }
+    return $problems.ToArray()
+}
+
+function Resolve-BRAVOUpdatePlanWorkRoot {
+    # N2: де будувати робочий каталог плану. Елевований процес без явного WorkRoot використовує захищений StagingRoot
+    # (через New-BRAVOUpdateChildWorkDirectory), а не %TEMP% (особистий SID оператора, доступний неелевованому коду).
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$WorkRoot = '', [Parameter(Mandatory = $true)][string]$StagingRoot, [Parameter(Mandatory = $true)][bool]$IsAdministrator)
+
+    if ((-not [string]::IsNullOrWhiteSpace($WorkRoot))) { return [pscustomobject]@{ Root = $WorkRoot; UseChildWorkDirectory = $false } }
+    if ($IsAdministrator) { return [pscustomobject]@{ Root = $StagingRoot; UseChildWorkDirectory = $true } }
+    return [pscustomobject]@{ Root = [System.IO.Path]::GetTempPath(); UseChildWorkDirectory = $false }
 }
 
 function Initialize-BRAVOUpdateProtectedRoots {
@@ -410,14 +478,15 @@ function Initialize-BRAVOUpdateProtectedRoots {
     $spec = @()
     try {
         $spec = @(Get-BRAVOUpdateProtectedRootSpec -Paths $Paths -ProgramDataRoot $ProgramDataRoot)
-        if (@($Only).Count -gt 0) { $spec = @($spec | Where-Object { @($Only) -contains [string]$_.Role }) }
+        # Контейнери (предки в ProgramData) лишаються в переліку навіть з -Only: їх перевірка обов'язкова.
+        if (@($Only).Count -gt 0) { $spec = @($spec | Where-Object { (@($Only) -contains [string]$_.Role) -or ([string]$_.Role -eq 'Container') }) }
     } catch {
         $problems.Add('Корені engine не визначено: ' + $_.Exception.Message)
     }
     $ruleFor = {
         param([string]$Kind)
         $ruleKind = 'Private'
-        if ($Kind -eq 'ReadOnly') { $ruleKind = 'Operation' } elseif ($Kind -eq 'Requests') { $ruleKind = 'Requests' }
+        if ($Kind -eq 'ReadOnly') { $ruleKind = 'Operation' } elseif ($Kind -eq 'Container') { $ruleKind = 'Operation' } elseif ($Kind -eq 'Requests') { $ruleKind = 'Requests' }
         Get-BRAVOUpdateWorkerAclRule -Kind $ruleKind -IncludeCurrentUser:$includeCurrent
     }
     foreach ($entry in $spec) {
@@ -427,12 +496,22 @@ function Initialize-BRAVOUpdateProtectedRoots {
             if (-not [System.IO.Directory]::Exists($path)) {
                 if (Test-Path -LiteralPath $path) { $problems.Add('шлях існує і не є каталогом: ' + $path); continue }
                 if ($Validate) { $missing.Add($path); continue }
-                $made = New-BRAVOUpdateProtectedDirectory -Path $path -Rule @(& $ruleFor ([string]$entry.Kind)) -AdminCheck $AdminCheck
+                $createKind = [string]$entry.Kind
+                if ($null -ne $entry.PSObject.Properties['CreateKind']) { $createKind = [string]$entry.CreateKind }
+                $made = New-BRAVOUpdateProtectedDirectory -Path $path -Rule @(& $ruleFor $createKind) -AdminCheck $AdminCheck
                 if ($made.Success) { $created.Add($path) } else { foreach ($item in $made.Problems) { $problems.Add([string]$item) } }
                 continue
             }
-            $found = @(Get-BRAVOUpdateProtectedRootProblem -Path $path -Kind ([string]$entry.Kind) -AdminCheck $AdminCheck -AclReader $AclReader)
+            $found = @(Get-BRAVOUpdateProtectedRootProblem -Path $path -Kind ([string]$entry.Kind) -AdminCheck $AdminCheck -AclReader $AclReader -Lenient:([string]$entry.Kind -eq 'Container'))
             if ($found.Count -eq 0) { continue }
+            # Контейнери й спільний каталог locks належать іншим компонентам toolkit: ТІЛЬКИ перевірка (власник, reparse,
+            # недовірені записувачі); DACL і успадкування на їхніх наявних нащадків не змінюємо.
+            if ([string]$entry.Kind -eq 'Container') {
+                foreach ($item in $found) {
+                    if ($includeCurrent -and ([string]$item).StartsWith($script:BRAVOUpdateAclDeniedPrefix, [StringComparison]::Ordinal)) { $deferred.Add($path) } else { $problems.Add([string]$item) }
+                }
+                continue
+            }
             if ($Validate) {
                 foreach ($item in $found) {
                     # Неелевований -Validate: відмова читання ACL ≠ небезпечний корінь (Private-корені читає лише
@@ -446,6 +525,14 @@ function Initialize-BRAVOUpdateProtectedRoots {
                 $problems.Add('каталог не змінено: власник недовірений, потрібне ручне прибирання (могло бути підкинуто вміст): ' + $path)
                 continue
             }
+            # N3: каталог із довіреним власником міг мати вміст, створений іншими: перед re-ACL перевіряємо власників
+            # безпосереднього вмісту (для Operations — ще й рівень <id>); недовірений = Blocker без зміни прав.
+            $foreignContent = @(Get-BRAVOUpdateUntrustedContentOwner -Path $path -Depth $(if ([string]$entry.Role -eq 'Operations') { 2 } else { 1 }) -AdminCheck $AdminCheck)
+            if ($foreignContent.Count -gt 0) {
+                foreach ($item in $foreignContent) { $problems.Add([string]$item) }
+                $problems.Add('DACL не змінено: у каталозі є вміст недовіреного власника (ручне прибирання): ' + $path)
+                continue
+            }
             $applied = Set-BRAVOUpdateDirectoryAcl -Path $path -Rule @(& $ruleFor ([string]$entry.Kind))
             $after = @(Get-BRAVOUpdateProtectedRootProblem -Path $path -Kind ([string]$entry.Kind) -AdminCheck $AdminCheck)
             if ($applied.Success -and $after.Count -eq 0) { $reapplied.Add($path) } else {
@@ -453,6 +540,17 @@ function Initialize-BRAVOUpdateProtectedRoots {
             }
         } catch {
             $problems.Add('Корінь ' + $path + ' не оброблено: ' + $_.Exception.Message)
+        }
+    }
+    # Окремі файли поза коренями engine, яким довіряє engine: файл version-state і lock-файл оновлення.
+    foreach ($filePath in @($(if ($null -ne $Paths.PSObject.Properties['VersionStatePath']) { [string]$Paths.VersionStatePath }), $(if ([System.IO.Directory]::Exists([string]$Paths.LockRoot)) { Join-Path ([string]$Paths.LockRoot) 'BRAVO_UPDATE.lock' }))) {
+        if ([string]::IsNullOrWhiteSpace($filePath) -or -not [System.IO.File]::Exists($filePath)) { continue }
+        try {
+            $fileOwner = [string](Get-Acl -LiteralPath $filePath).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            if ((Get-BRAVOUpdateTrustedSid -AdminCheck $AdminCheck) -notcontains $fileOwner) { $problems.Add('власник ' + $fileOwner + ' файлу не з довіреного списку: ' + $filePath) }
+        } catch {
+            # Неелевований процес може не прочитати власника — відкладається; елевований — fail closed.
+            if (-not $includeCurrent) { $problems.Add('власник файлу не прочитано: ' + $filePath) }
         }
     }
     $findings = New-Object System.Collections.Generic.List[object]
@@ -485,13 +583,23 @@ function New-BRAVOUpdateChildWorkDirectory {
         Видаляється лише Remove-BRAVOUpdateChildWorkDirectory.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Root, [scriptblock]$AdminCheck = $null)
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [scriptblock]$AdminCheck = $null,
+        [string]$ProgramDataRoot = ''
+    )
 
     $fail = {
         param([string[]]$Message)
         [pscustomobject]@{ Success = $false; Root = $Root; OperationDirectory = $null; WorkDirectory = $null; OperationId = $null; Problems = @($Message) }
     }
     try {
+        # N1: елевований процес виконує скрипт із цього каталогу, тож предки кореня в ProgramData (BRAVO, Update, ...)
+        # теж мусять бути довіреними (підкинутий C:\ProgramData\BRAVO дозволив би підміну скрипта). Неелевований — ні.
+        if (-not (Test-BRAVOUpdateTrustCurrentUser -AdminCheck $AdminCheck)) {
+            $containerProblems = @(Get-BRAVOUpdateAncestorProblem -Path $Root -ProgramDataRoot $ProgramDataRoot -AdminCheck $AdminCheck)
+            if ($containerProblems.Count -gt 0) { return (& $fail @($containerProblems)) }
+        }
         if (-not [System.IO.Directory]::Exists($Root)) {
             $rootRules = @(Get-BRAVOUpdateWorkerAclRule -Kind Private -IncludeCurrentUser:(Test-BRAVOUpdateTrustCurrentUser -AdminCheck $AdminCheck))
             $rootMade = New-BRAVOUpdateProtectedDirectory -Path $Root -Rule $rootRules -AdminCheck $AdminCheck

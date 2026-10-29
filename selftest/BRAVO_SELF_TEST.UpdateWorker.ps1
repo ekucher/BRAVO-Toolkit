@@ -39,7 +39,8 @@
             BackupRoot = (Join-Path $wkRoot 'backup'); RuntimeRoot = $runtime
             OperationLockPath = (Join-Path $wkRoot 'locks\BRAVO_OPERATION.lock'); VersionStatePath = (Join-Path $wkRoot 'state\version.json')
         }
-        foreach ($dir in @($runtime, $staged, $paths.LockRoot, $paths.StagingRoot, $paths.BackupRoot)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+        # LockRoot не створюється звичайним New-Item: спільний каталог лише ВАЛІДУЄТЬСЯ (Container), відсутній — створює Initialize.
+        foreach ($dir in @($runtime, $staged, $paths.StagingRoot, $paths.BackupRoot)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
 
         $writeTree = {
             param([string]$Path, [hashtable]$Files)
@@ -396,6 +397,21 @@
             $discoveredRoot = [string]$discovered.runtimeRoot
             $recWithRoot = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $true; CandidateRoots = @($runtime); Operations = @{ Recover = $recorderOp } }
             Test-BRAVOCondition -Condition (($recWithRoot.ExitCode -eq 0) -and ($null -ne $recorded.Args) -and ($recorded.Args.StagingRoot -ceq [string]$paths.StagingRoot) -and ($recorded.Args.BackupRoot -ceq [string]$paths.BackupRoot) -and ($recorded.Args.RuntimeRoot -ceq $discoveredRoot) -and ($discoveredRoot -ne '')) -Name 'UpdateWorker/H1/RecoverPassesDiscoveredRootAndEngineRoots' -Failure ('код ' + $recWithRoot.ExitCode + ' root=' + $discoveredRoot)
+            # N1: елевований CLI перевіряє корені (read-only дії — лише валідація) ДО будь-якої дії; небезпечний корінь = 80.
+            $unsafeStaging = Join-Path $wkRoot 'unsafe-staging'
+            [void](New-Item -ItemType Directory -Path $unsafeStaging -Force)
+            $unsafeInfo = New-Object System.IO.DirectoryInfo($unsafeStaging)
+            $unsafeAcl = $unsafeInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+            $unsafeAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')), [System.Security.AccessControl.FileSystemRights]::Modify,
+                    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit), [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)))
+            $unsafeInfo.SetAccessControl($unsafeAcl)
+            $unsafePaths = $paths.PSObject.Copy()
+            $unsafePaths.StagingRoot = $unsafeStaging
+            $stateUnsafe = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'State'; Paths = $unsafePaths; Adapter = $adapter; IsAdministrator = $true; CandidateRoots = @($runtime) }
+            $stateUnsafeIds = @(@($stateUnsafe.Result.findings) | ForEach-Object { [string]$_.id })
+            $stateSafe = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'State'; Paths = $paths; Adapter = $adapter; IsAdministrator = $true; CandidateRoots = @($runtime) }
+            $stateUnelevated = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'State'; Paths = $unsafePaths; Adapter = $adapter; IsAdministrator = $false; CandidateRoots = @($runtime) }
+            Test-BRAVOCondition -Condition (($stateUnsafe.ExitCode -eq 80) -and ($stateUnsafeIds -contains 'State.RootUnsafe') -and ($stateSafe.ExitCode -eq 0) -and ($stateUnelevated.ExitCode -eq 0)) -Name 'UpdateWorker/H1/ElevatedReadOnlyActionChecksRootsFirst' -Failure ('unsafe=' + $stateUnsafe.ExitCode + ' safe=' + $stateSafe.ExitCode + ' unelevated=' + $stateUnelevated.ExitCode)
             $recorded.Args = $null
             $recForeign = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $true; CandidateRoots = @($runtime); RuntimeRoot = (Join-Path $wkRoot 'not-discovered'); Operations = @{ Recover = $recorderOp } }
             Test-BRAVOCondition -Condition (($recForeign.ExitCode -eq 80) -and ($null -eq $recorded.Args)) -Name 'UpdateWorker/H1/RecoverRejectsUndiscoveredRuntimeRoot' -Failure ('код ' + $recForeign.ExitCode)
