@@ -108,8 +108,10 @@ function Test-BRAVOInstallerSourceInput {
     if ($SourceKind -eq 'Online') {
         $tagText = $Tag.Trim()
         if ([string]::IsNullOrEmpty($tagText)) {
-            if ($Operation -eq 'Repair') { [void]$problems.Add('Вкажіть тег поточної версії для відновлення (наприклад, v5.3.0).') }
-        } elseif ($tagText -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z][0-9A-Za-z.\-]*)?$') {
+            $tagHint = 'Вкажіть тег версії (наприклад, v5.3.0): engine працює лише з явною версією.'
+            if ($Operation -eq 'Repair') { $tagHint = 'Вкажіть тег поточної версії для відновлення (наприклад, v5.3.0).' }
+            [void]$problems.Add($tagHint)
+        } elseif ($tagText -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
             [void]$problems.Add('Тег має вигляд vX.Y.Z (наприклад, v5.3.0).')
         } elseif ($tagText.Contains('-') -and -not $PrereleaseEffective) {
             [void]$problems.Add('Це тег попередньої версії. Він доступний лише в «Розширено» з явним підтвердженням ризику.')
@@ -161,7 +163,7 @@ function ConvertTo-BRAVOInstallerSourceViewModel {
         'Update'  { 'До якої версії оновити?' }
         default   { 'Яку версію використати для відновлення?' }
     }
-    $onlineHint = 'Залиште тег порожнім: engine обере рекомендований stable-реліз і зафіксує точний тег, файл і хеш у плані.'
+    $onlineHint = 'Вкажіть явну версію (тег vX.Y.Z). Engine перевірить походження пакета й зафіксує точний тег, файл і хеш у плані; вибору «останньої» версії немає.'
     if ($Operation -eq 'Repair') { $onlineHint = 'Вкажіть тег поточної версії: відновлення не змінює версію.' }
     [pscustomobject]@{
         Operation                 = $Operation
@@ -979,4 +981,23 @@ function ConvertTo-BRAVOInstallerMaintenanceViewModel {
         CredentialsAction = (New-BRAVOInstallerAction -Key 'EnterCredentials' -Label 'Ввести облікові дані' -Enabled ([string]::IsNullOrEmpty($credReason)) -Reason $credReason)
         RepairNote        = 'Відновлення проходить той самий шлях, що й оновлення: перевірка, план, підтвердження. Конфігурація сервера зберігається.'
     }
+}
+
+function Get-BRAVOInstallerPlanSelfTest {
+    <#
+    .SYNOPSIS
+        Чи входить самотест у plan.tests.planned. Запит (options.runSelfTest)
+        має збігатися з планом, інакше worker його відхилить, тому значення
+        береться з ПЛАНУ; лише якщо списку тестів у плані нема — з вибору,
+        з яким план було побудовано ($Fallback).
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object]$Plan, [bool]$Fallback = $false)
+    $tests = Get-BRAVOInstallerProperty -InputObject $Plan -Name 'tests'
+    if ($null -eq $tests -or $null -eq $tests.PSObject.Properties['planned']) { return $Fallback }
+    foreach ($item in @($tests.planned | Where-Object { $null -ne $_ })) {
+        $text = [string](Get-BRAVOInstallerProperty -InputObject $item -Name 'id' -Default '') + ' ' + [string](Get-BRAVOInstallerProperty -InputObject $item -Name 'title' -Default '')
+        if ($text -match '(?i)self.?test|самотест') { return $true }
+    }
+    $false
 }
