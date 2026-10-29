@@ -76,7 +76,7 @@ function Test-BRAVOUpdateScriptRootTrusted {
             try {
                 if (([System.IO.File]::GetAttributes($current) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $problems.Add('reparse point: ' + $current) }
                 $acl = $null
-                if ($null -ne $AclReader) { $acl = & $AclReader $current } else { $acl = Get-Acl -LiteralPath $current }
+                if ($null -ne $AclReader) { $acl = & $AclReader $current } else { $acl = Get-Acl -LiteralPath $current -ErrorAction Stop }
                 $ownerSid = [string]$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
                 if ($trusted -notcontains $ownerSid) { $problems.Add('власник ' + $ownerSid + ': ' + $current) }
                 foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {

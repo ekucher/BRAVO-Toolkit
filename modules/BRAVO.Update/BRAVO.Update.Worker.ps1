@@ -175,7 +175,7 @@ function Set-BRAVOUpdateDirectoryAcl {
                 [System.Security.AccessControl.AccessControlType]::Allow)))
         }
         $directoryInfo.SetAccessControl($acl)
-        $actual = Get-Acl -LiteralPath $Path
+        $actual = Get-Acl -LiteralPath $Path -ErrorAction Stop
         $problems = New-Object System.Collections.Generic.List[string]
         if (-not $actual.AreAccessRulesProtected) { $problems.Add('успадкування прав не вимкнено') }
         $expected = @($Rule | ForEach-Object { $_.Sid.Value })

@@ -60,7 +60,7 @@ function Get-BRAVOUpdateDirectoryAclProblem {
     $problems = @()
     try {
         $trusted = @(Get-BRAVOUpdateTrustedSid -AdminCheck $AdminCheck)
-        $acl = Get-Acl -LiteralPath $Path
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
         if (-not $acl.AreAccessRulesProtected) { $problems += 'успадкування прав не вимкнено' }
         $ownerSid = [string]$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
         if ($trusted -notcontains $ownerSid) { $problems += ('власник ' + $ownerSid + ' не з довіреного списку') }

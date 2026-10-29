@@ -531,3 +531,29 @@ try {
         Remove-Item -LiteralPath $updStagingTempPrefix -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+# Codex P1 (фінальне рев'ю): справжня відмова Get-Acl (не throwing-seam) має
+# класифікуватися як "доступ до ACL заборонено" (відкладення для неелевованого
+# preflight), а не як загальна проблема. OWNER RIGHTS без READ_CONTROL забирає
+# неявне право власника читати DACL — це відтворює фільтрований UAC-токен.
+& {
+    $aclDeniedDir = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_UPDSTG_ACLDENY_' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($aclDeniedDir)
+    try {
+        $aclDeniedSec = New-Object System.Security.AccessControl.DirectorySecurity
+        $aclDeniedSec.SetAccessRuleProtection($true, $false)
+        $aclDeniedSec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), 'FullControl', 'Allow')))
+        $aclDeniedSec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-3-4')), 'ReadData', 'Allow')))
+        (New-Object System.IO.DirectoryInfo($aclDeniedDir)).SetAccessControl($aclDeniedSec)
+        $aclDeniedProblems = @(& (Get-Module BRAVO.Update) { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $aclDeniedDir)
+        $aclDeniedPrefix = & (Get-Module BRAVO.Update) { $script:BRAVOUpdateAclDeniedPrefix }
+        Test-BRAVOCondition `
+            -Condition ($aclDeniedProblems.Count -eq 1 -and ([string]$aclDeniedProblems[0]).StartsWith([string]$aclDeniedPrefix)) `
+            -Name 'UpdateStaging/H1/RealGetAclAccessDeniedClassifiedAsDeferred' `
+            -Failure ('справжня відмова Get-Acl має дати рівно одну проблему з префіксом відмови доступу; отримано: ' + ($aclDeniedProblems -join ' | '))
+    } finally {
+        if ([IO.Directory]::Exists($aclDeniedDir) -and ([IO.Path]::GetFileName($aclDeniedDir)).StartsWith('BRAVO_UPDSTG_ACLDENY_')) {
+            [IO.Directory]::Delete($aclDeniedDir)
+        }
+    }
+}

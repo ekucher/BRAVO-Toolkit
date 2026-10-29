@@ -155,7 +155,7 @@ function Test-BRAVOUpdateOwnerTrusted {
     param([Parameter(Mandatory = $true)][string]$Path, [scriptblock]$AdminCheck = $null)
 
     try {
-        $owner = [string](Get-Acl -LiteralPath $Path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        $owner = [string](Get-Acl -LiteralPath $Path -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
         return ((Get-BRAVOUpdateTrustedSid -AdminCheck $AdminCheck) -contains $owner)
     } catch {
         return $false
@@ -223,7 +223,7 @@ function New-BRAVOUpdateProtectedDirectory {
             $created = $true
         }
 
-        $actual = Get-Acl -LiteralPath $fullPath
+        $actual = Get-Acl -LiteralPath $fullPath -ErrorAction Stop
         if (-not $actual.AreAccessRulesProtected) { $problems.Add('успадкування прав не вимкнено') }
         $ownerValue = [string]$actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
         if ($trusted -notcontains $ownerValue) { $problems.Add('власник ' + $ownerValue + ' не з довіреного списку') }
@@ -297,11 +297,24 @@ function Get-BRAVOUpdateProtectedRootProblem {
         if ($Kind -eq 'Container') { $trusted = @($trusted) + @('S-1-3-4') }
         $acl = $null
         try {
-            if ($null -ne $AclReader) { $acl = & $AclReader $Path } else { $acl = Get-Acl -LiteralPath $Path }
+            if ($null -ne $AclReader) { $acl = & $AclReader $Path } else { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop }
         } catch [System.UnauthorizedAccessException] {
             # Відмову читання ACL окремо маркуємо: неелевований процес (фільтрований токен не бачить ACE Administrators)
             # не може її трактувати як доказ небезпеки, а елевований — трактує (fail closed).
             $problems.Add($script:BRAVOUpdateAclDeniedPrefix + $Path)
+            return $problems.ToArray()
+        } catch {
+            # Get-Acl може загорнути відмову доступу в інший тип винятку; шукаємо
+            # UnauthorizedAccessException у ланцюжку InnerException. Будь-яка інша
+            # помилка читання ACL — звичайна проблема (fail closed), а не відкладення.
+            $aclError = $_.Exception
+            $aclDenied = $false
+            while ($null -ne $aclError) {
+                if ($aclError -is [System.UnauthorizedAccessException]) { $aclDenied = $true; break }
+                $aclError = $aclError.InnerException
+            }
+            if ($aclDenied) { $problems.Add($script:BRAVOUpdateAclDeniedPrefix + $Path) }
+            else { $problems.Add('не вдалося прочитати ACL: ' + $Path + ' (' + $_.Exception.Message + ')') }
             return $problems.ToArray()
         }
         if ((-not $Lenient) -and (-not $acl.AreAccessRulesProtected)) { $problems.Add('успадкування прав не вимкнено: ' + $Path) }
@@ -402,7 +415,7 @@ function Get-BRAVOUpdateUntrustedContentOwner {
             try {
                 $attributes = [System.IO.File]::GetAttributes($entry)
                 if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $problems.Add('reparse point у вмісті: ' + $entry); continue }
-                $ownerSid = [string](Get-Acl -LiteralPath $entry).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+                $ownerSid = [string](Get-Acl -LiteralPath $entry -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
                 if ($trusted -notcontains $ownerSid) { $problems.Add('власник ' + $ownerSid + ' елемента не з довіреного списку: ' + $entry) }
                 if ((($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) -and ([int]$item[1] -lt $Depth)) { $queue.Enqueue(@($entry, ([int]$item[1] + 1))) }
             } catch {
@@ -546,7 +559,7 @@ function Initialize-BRAVOUpdateProtectedRoots {
     foreach ($filePath in @($(if ($null -ne $Paths.PSObject.Properties['VersionStatePath']) { [string]$Paths.VersionStatePath }), $(if ([System.IO.Directory]::Exists([string]$Paths.LockRoot)) { Join-Path ([string]$Paths.LockRoot) 'BRAVO_UPDATE.lock' }))) {
         if ([string]::IsNullOrWhiteSpace($filePath) -or -not [System.IO.File]::Exists($filePath)) { continue }
         try {
-            $fileOwner = [string](Get-Acl -LiteralPath $filePath).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            $fileOwner = [string](Get-Acl -LiteralPath $filePath -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
             if ((Get-BRAVOUpdateTrustedSid -AdminCheck $AdminCheck) -notcontains $fileOwner) { $problems.Add('власник ' + $fileOwner + ' файлу не з довіреного списку: ' + $filePath) }
         } catch {
             # Неелевований процес може не прочитати власника — відкладається; елевований — fail closed.
