@@ -233,7 +233,8 @@
                 $paths2 = $paths.PSObject.Copy()
                 $paths2.StateRoot = $state2
                 $viaJunction = Join-Path $wkJunction ([IO.Path]::GetFileName($path))
-                & $check 'TamperReparseRequestPath' 'Worker.RequestReparse' (& $runWorker $viaJunction $paths2)
+                # H1: junction на місці Requests тепер відсікається ще раніше — перевіркою коренів engine (до читання запиту).
+                & $check 'TamperReparseRequestPath' 'State.RootUnsafe' (& $runWorker $viaJunction $paths2)
             } else {
                 Test-BRAVOCondition -Condition $true -EnvironmentLimitation -Name 'UpdateWorker/TamperReparseRequestPath' -Failure 'junction не створено'
             }
@@ -360,6 +361,44 @@
             Test-BRAVOCondition -Condition ($recover.ExitCode -eq 0 -and $calls.Recover -eq 1) -Name 'UpdateWorker/CliRecoverAdmin' -Failure ('код ' + $recover.ExitCode)
             $recoverCancel = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $false; Operations = @{ Recover = $recoverOp }; ElevatedLauncher = $cancel; ScriptPath = 'C:\x\BRAVO_UPDATE.ps1'; WorkRoot = $wkRoot }
             Test-BRAVOCondition -Condition ($recoverCancel.ExitCode -eq 36 -and $calls.Recover -eq 1) -Name 'UpdateWorker/CliRecoverNonAdminElevates' -Failure ('код ' + $recoverCancel.ExitCode)
+            # H1/5: елевований Recover пише результат у Operations/<recoveryId>/result.json під StateRoot, а не в шлях викликача.
+            $recoverIdSeen = @{ Value = ''; Args = '' }
+            # GetNewClosure захоплює лише локальні змінні поточної області: копіюємо потрібне явно.
+            $closureCall = $call; $closurePaths = $paths; $closureAdapter = $adapter; $closureRecoverOp = $recoverOp
+            $recoverLauncher = {
+                param($ArgumentList)
+                $joined = [string]::Join(' ', $ArgumentList)
+                $recoverIdSeen.Args = $joined
+                if ($joined -match '-RecoveryId "([0-9a-f-]{36})"') {
+                    $recoverIdSeen.Value = $Matches[1]
+                    # Імітація елевованого процесу: той самий диспетчер із RecoveryId.
+                    try { $null = & $closureCall 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $closurePaths; Adapter = $closureAdapter; IsAdministrator = $true; Operations = @{ Recover = $closureRecoverOp }; RecoveryId = $Matches[1] } } catch { $recoverIdSeen.Args = 'ERR ' + $_.Exception.Message }
+                }
+                [pscustomobject]@{ Launched = $true; ExitCode = 0; Error = '' }
+            }.GetNewClosure()
+            $viaElevation = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $false; Operations = @{ Recover = $recoverOp }; ElevatedLauncher = $recoverLauncher; ScriptPath = 'C:\Тест папка\BRAVO_UPDATE.ps1' }
+            $recoverResultFile = Join-Path (Join-Path (Join-Path $paths.StateRoot 'Operations') $recoverIdSeen.Value) 'result.json'
+            Test-BRAVOCondition -Condition (($viaElevation.ExitCode -eq 0) -and ($recoverIdSeen.Value -ne '') -and (Test-Path -LiteralPath $recoverResultFile) -and ($recoverIdSeen.Args -notmatch '-ResultPath')) -Name 'UpdateWorker/H1/ElevatedRecoverResultUnderStateRoot' -Failure ('код ' + $viaElevation.ExitCode + '; args=' + $recoverIdSeen.Args)
+            $badRecovery = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $true; Operations = @{ Recover = $recoverOp }; RecoveryId = '..\..\evil' }
+            Test-BRAVOCondition -Condition ($badRecovery.ExitCode -eq 80) -Name 'UpdateWorker/H1/RecoveryIdMustBeGuid' -Failure ('код ' + $badRecovery.ExitCode)
+            $initAdmin = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Initialize'; Paths = $paths; Adapter = $adapter; IsAdministrator = $true }
+            $initUser = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Initialize'; Paths = $paths; Adapter = $adapter; IsAdministrator = $false }
+            Test-BRAVOCondition -Condition (($initAdmin.ExitCode -eq 0) -and ($initUser.ExitCode -eq 36)) -Name 'UpdateWorker/H1/InitializeActionNeedsAdmin' -Failure ('admin=' + $initAdmin.ExitCode + ' user=' + $initUser.ExitCode)
+
+            # Recover: корені для Invoke-BRAVORecovery (контракт E5) визначає виявлення, а не запит; staging/backup — типові корені engine.
+            $recorded = @{ Args = $null }
+            $recorderOp = {
+                param([string]$StateRoot, [string]$LockRoot, [string]$OperationLockPath, $Adapter, [string]$VersionStatePath, [string]$RuntimeRoot, [string]$StagingRoot, [string]$BackupRoot)
+                $recorded.Args = @{ RuntimeRoot = $RuntimeRoot; StagingRoot = $StagingRoot; BackupRoot = $BackupRoot }
+                New-BRAVOUpdateDeploymentResult -OperationId ([guid]::NewGuid().ToString()) -Action Recovery -Status Success
+            }.GetNewClosure()
+            $discovered = & $call 'Get-BRAVOUpdateCliState' @{ CandidateRoots = @($runtime); Paths = $paths; Adapter = $adapter }
+            $discoveredRoot = [string]$discovered.runtimeRoot
+            $recWithRoot = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $true; CandidateRoots = @($runtime); Operations = @{ Recover = $recorderOp } }
+            Test-BRAVOCondition -Condition (($recWithRoot.ExitCode -eq 0) -and ($null -ne $recorded.Args) -and ($recorded.Args.StagingRoot -ceq [string]$paths.StagingRoot) -and ($recorded.Args.BackupRoot -ceq [string]$paths.BackupRoot) -and ($recorded.Args.RuntimeRoot -ceq $discoveredRoot) -and ($discoveredRoot -ne '')) -Name 'UpdateWorker/H1/RecoverPassesDiscoveredRootAndEngineRoots' -Failure ('код ' + $recWithRoot.ExitCode + ' root=' + $discoveredRoot)
+            $recorded.Args = $null
+            $recForeign = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $true; CandidateRoots = @($runtime); RuntimeRoot = (Join-Path $wkRoot 'not-discovered'); Operations = @{ Recover = $recorderOp } }
+            Test-BRAVOCondition -Condition (($recForeign.ExitCode -eq 80) -and ($null -eq $recorded.Args)) -Name 'UpdateWorker/H1/RecoverRejectsUndiscoveredRuntimeRoot' -Failure ('код ' + $recForeign.ExitCode)
         }
     } finally {
         if ($null -ne $wkValidatorOriginal) {

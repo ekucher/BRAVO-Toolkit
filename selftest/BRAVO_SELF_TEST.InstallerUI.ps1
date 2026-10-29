@@ -356,7 +356,19 @@
     try {
         $written = $null
         $writeError = ''
-        try { $written = Write-BRAVOInstallerExecutionRequest -Request $req -StateRoot (Join-Path $stateDir 'Стан з пробілом') -ToolkitRoot $root } catch { $writeError = $_.Exception.Message }
+        # H1: GUI каталогів стану не створює — Requests має підготувати engine (тут: вручну).
+        $missingStateRoot = Join-Path $stateDir 'Стан без Requests'
+        $missingKind = ''
+        try { [void](Write-BRAVOInstallerExecutionRequest -Request $req -StateRoot $missingStateRoot -ToolkitRoot $root) } catch { $missingKind = [string]$_.Exception.Data['BRAVOInstallerKind'] }
+        Test-BRAVOCondition -Condition (($missingKind -ceq 'StateNotInitialized') -and -not (Test-Path -LiteralPath $missingStateRoot)) -Name 'InstallerUI/Request/NeverCreatesStateDirectories' -Failure ('kind=' + $missingKind + '; StateRoot створено: ' + (Test-Path -LiteralPath $missingStateRoot))
+        $guiSource = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Installer.UI\BRAVO.Installer.UI.WizardEngine.ps1'))
+        Test-BRAVOCondition -Condition (($guiSource -notmatch 'New-Item\s+-ItemType\s+Directory') -and ($guiSource -notmatch 'CreateDirectory')) -Name 'InstallerUI/Request/WizardEngineHasNoDirectoryCreation' -Failure 'WizardEngine не повинен створювати каталоги (grep)'
+        # Функція приватна (не експортується): викликаємо у scope модуля.
+        $initCommand = & (Get-Module BRAVO.Installer.UI) { New-BRAVOInstallerInitializeCommand -ToolkitRoot 'C:\Теку Тест\BRAVO Toolkit' -PowerShellPath 'C:\Windows\powershell.exe' }
+        Test-BRAVOCondition -Condition (($initCommand.Verb -eq 'RunAs') -and ($initCommand.ArgumentString -like '*-Action Initialize -NoPause')) -Name 'InstallerUI/Request/InitializeCommandIsElevated' -Failure ([string]$initCommand.ArgumentString)
+        $readyStateRoot = Join-Path $stateDir 'Стан з пробілом'
+        [void](New-Item -ItemType Directory -Path (Join-Path $readyStateRoot 'Requests') -Force)
+        try { $written = Write-BRAVOInstallerExecutionRequest -Request $req -StateRoot $readyStateRoot -ToolkitRoot $root } catch { $writeError = $_.Exception.Message }
         $bytes = @()
         if ($written -and (Test-Path -LiteralPath $written)) { $bytes = [IO.File]::ReadAllBytes($written) }
         $hasBom = ($bytes.Count -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB)

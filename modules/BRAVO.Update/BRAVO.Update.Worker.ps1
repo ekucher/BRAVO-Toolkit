@@ -1433,6 +1433,35 @@ function Invoke-BRAVOUpdateCliAction {
                     return (& $done 80 (New-BRAVOUpdateWorkerFailureResult -OperationId '' -PlanId '' -Action 'Recovery' -Finding @($recoverRoots.Findings)))
                 }
                 $recoveryArguments = @{ StateRoot = [string]$Paths.StateRoot; LockRoot = [string]$Paths.LockRoot; OperationLockPath = [string]$Paths.OperationLockPath; Adapter = $Adapter; VersionStatePath = [string]$Paths.VersionStatePath }
+                # Контракт E5: Recovery для Update/Repair вимагає знайдений корінь установки й корені staging/backup engine
+                # (journal.stagingRoot має дорівнювати StagingRoot engine); викликається ПІСЛЯ перевірки захищених коренів.
+                # Корінь установки визначається НЕЗАЛЕЖНИМ виявленням (Get-BRAVOInstallationState); явний -RuntimeRoot
+                # приймається лише якщо його знайшло виявлення. Валідатор Recovery не послаблюється.
+                $recoverRuntime = ''
+                $recoverCandidates = @()
+                try {
+                    # Без явного RuntimeRoot: виявлення незалежне від того, що вказав викликач.
+                    $independentArguments = @{}
+                    foreach ($argumentKey in $stateArguments.Keys) { $independentArguments[$argumentKey] = $stateArguments[$argumentKey] }
+                    $independentArguments['RuntimeRoot'] = ''
+                    $recoverState = Get-BRAVOUpdateCliState @independentArguments
+                    $recoverRuntime = [string](Get-BRAVOUpdatePropertyValue -InputObject $recoverState -Name 'runtimeRoot' -Default '')
+                    $recoverCandidates = @(@(Get-BRAVOUpdatePropertyValue -InputObject $recoverState -Name 'candidateRoots' -Default @()) | ForEach-Object { [string]$_ })
+                } catch { $recoverRuntime = ''; $recoverCandidates = @() }
+                if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+                    $explicitFound = @($recoverCandidates | Where-Object { Test-BRAVOUpdateWorkerSamePath -Left $_ -Right $RuntimeRoot })
+                    if (($explicitFound.Count -eq 0) -and -not (Test-BRAVOUpdateWorkerSamePath -Left $recoverRuntime -Right $RuntimeRoot)) {
+                        $foreignRecover = New-BRAVOUpdateWorkerFinding -Id 'Cli.RecoverRuntimeRoot' -Title 'Вказаний -RuntimeRoot не є знайденим встановленням BRAVO' -Details $RuntimeRoot -Action 'Не вказуйте -RuntimeRoot або вкажіть каталог, який знайшов engine.'
+                        return (& $done 80 (New-BRAVOUpdateWorkerFailureResult -OperationId '' -PlanId '' -Action 'Recovery' -Finding @($foreignRecover)))
+                    }
+                    $recoverRuntime = $RuntimeRoot
+                }
+                $recoveryArguments['StagingRoot'] = [string]$Paths.StagingRoot
+                $recoveryArguments['BackupRoot'] = [string]$Paths.BackupRoot
+                if (-not [string]::IsNullOrWhiteSpace($recoverRuntime)) { $recoveryArguments['RuntimeRoot'] = $recoverRuntime }
+                foreach ($optionalName in @('RuntimeRoot', 'StagingRoot', 'BackupRoot')) {
+                    if ($recoveryArguments.ContainsKey($optionalName) -and -not (Test-BRAVOUpdateWorkerAcceptsParameter -Operation $target -Name $optionalName)) { $recoveryArguments.Remove($optionalName) }
+                }
                 $outcome = $null
                 try {
                     $outcome = @(& $target @recoveryArguments) | Where-Object { ($null -ne $_) -and ($null -ne $_.PSObject.Properties['status']) -and ($null -ne $_.PSObject.Properties['operationId']) } | Select-Object -Last 1
