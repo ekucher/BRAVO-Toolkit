@@ -212,6 +212,8 @@ GUI не парсить декоративний console output. Structured prog
 
 GUI technology не змінює вимогу Windows PowerShell 5.1 для BRAVO product/test validation.
 
+Installer v1 використовує Windows PowerShell 5.1 + WinForms замість WPF — див. [DECISIONS.md](DECISIONS.md) D3.
+
 ## 16. Acceptance boundary
 
 ```text
