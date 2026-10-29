@@ -2,6 +2,16 @@
 
 ## Не випущено (developer)
 
+- **Deploy: оновлення парку 5.2.x до stable 5.2.5+ однією дією оператора.**
+  `deploy/UPDATE-BRAVO52.cmd` (подвійний клік, UAC) запускає `deploy/Update-BRAVO52.ps1`, який визначає каталог
+  комплекту за завданнями Планувальника `\BRAVO\`, дозволяє лише оновлення 5.2.4+ вгору (5.2.0–5.2.3 — з
+  `-AllowUntestedSource`), відмовляє, якщо пакет лежить усередині комплекту, бере архів поруч або завантажує ассети
+  релізу і делегує розгортання `deploy/Update-BRAVOServer.ps1` (preflight, провенанс, backup, гейти, точний відкат).
+  Після успіху прибирає тимчасову мітигацію #335 (`'enableFailedArchiveDeletion' = $false` у `BRAVO.local.config`;
+  розбір в AST, копія файлу, повторний `-ValidateOnly`), пише журнал і JSON-підсумок у `%ProgramData%\BRAVO\Upgrade`.
+  `-CheckOnly` нічого не змінює і не потребує прав адміністратора. Runbook —
+  `docs/BRAVO_526_FLEET_UPGRADE_RUNBOOK_20261029.md`. Self-test `Deploy52/*`.
+
 - **Release: збирання з lightweight-тега відхиляється (D8).**
   `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
   `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не
