@@ -204,9 +204,10 @@ manifest при збереженні невідомого не-скрипта.
   лише керовані імена, інакше виняток.
 - `Set-BRAVOTaskActivation -Policy -Snapshot -Adapter -OutcomeStatus` →
   `taskActivation` (D6): Update/Repair + Success → відновити попередній стан;
-  Update/Repair + SuccessWithWarnings → `Inactive` + finding, якщо план не має
-  `activationPolicy = ActivateOnWarnings`; Install → `Inactive`; Critical →
-  ніколи не вмикати.
+  Update/Repair + SuccessWithWarnings → теж відновити попередній стан + finding
+  з переліком попереджень (рішення lead: для backup-системи вимкнений розклад
+  після успішного оновлення небезпечніший за попередження; затверджує
+  власник у D6); Install → `Inactive`; Critical → ніколи не вмикати.
 
 ## 6. Validation
 

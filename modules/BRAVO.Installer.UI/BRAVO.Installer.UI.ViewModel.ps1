@@ -3,7 +3,7 @@
 # hash/provenance чи exit-кодів; лише відображення даних engine (InstallationState,
 # PreflightResult) у текст + маркер + дозволені дії (docs\installer\CONTRACTS.md).
 
-$script:BRAVOInstallerPrototypeReason = 'Доступно після приймання engine'
+$script:BRAVOInstallerRepeatBlockedReason = 'Повторну операцію заблоковано: після критичного результату потрібна ручна перевірка.'
 
 function Get-BRAVOInstallerProperty {
     # StrictMode 2.0: доступ до відсутньої властивості PSCustomObject кидає
@@ -36,13 +36,19 @@ function New-BRAVOInstallerAction {
 }
 
 function New-BRAVOInstallerMutationAction {
-    # Усі mutation-дії в прототипі вимкнені (engine ще не прийнято).
+    # Mutation-дії лише ВІДКРИВАЮТЬ майстер або запускають engine через UAC:
+    # самі вони нічого не змінюють. -BlockedReason (напр. після Critical)
+    # вимикає дію з видимою причиною (fail closed).
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Key,
-        [Parameter(Mandatory = $true)][string]$Label
+        [Parameter(Mandatory = $true)][string]$Label,
+        [string]$BlockedReason = ''
     )
-    New-BRAVOInstallerAction -Key $Key -Label $Label -Enabled $false -Reason $script:BRAVOInstallerPrototypeReason
+    if ($BlockedReason) {
+        return (New-BRAVOInstallerAction -Key $Key -Label $Label -Enabled $false -Reason $BlockedReason)
+    }
+    New-BRAVOInstallerAction -Key $Key -Label $Label -Enabled $true
 }
 
 function Get-BRAVOInstallerSecondaryAction {
@@ -72,8 +78,14 @@ function ConvertTo-BRAVOInstallerHomeViewModel {
     [CmdletBinding()]
     param(
         [AllowNull()][object]$State = $null,
-        [string]$EngineError = ''
+        [string]$EngineError = '',
+        [switch]$RepeatBlocked
     )
+
+    # Після Critical (або невідомого результату) повторні Install/Update/Repair
+    # заблоковані до ручної перевірки (план §5 екран 10); Recover лишається.
+    $blocked = ''
+    if ($RepeatBlocked) { $blocked = $script:BRAVOInstallerRepeatBlockedReason }
 
     $stateKey = [string](Get-BRAVOInstallerProperty -InputObject $State -Name 'state' -Default '')
     $root = Get-BRAVOInstallerProperty -InputObject $State -Name 'runtimeRoot'
@@ -107,39 +119,39 @@ function ConvertTo-BRAVOInstallerHomeViewModel {
             'NotInstalled' {
                 $marker = '—'
                 $statusText = 'BRAVO Toolkit не встановлено.'
-                $primary = New-BRAVOInstallerMutationAction -Key 'Install' -Label 'Встановити'
+                $primary = New-BRAVOInstallerMutationAction -Key 'Install' -Label 'Встановити' -BlockedReason $blocked
             }
             'Installed' {
                 if ($integrity -eq 'Valid') { $marker = '✓'; $statusText = 'Встановлено. Цілісність підтверджена.' }
                 else { $marker = '!'; $statusText = 'Встановлено, але цілісність не підтверджена.' }
-                $primary = New-BRAVOInstallerMutationAction -Key 'CheckUpdates' -Label 'Перевірити оновлення'
+                $primary = New-BRAVOInstallerMutationAction -Key 'CheckUpdates' -Label 'Перевірити оновлення' -BlockedReason $blocked
             }
             'PrereleaseInstalled' {
                 $marker = '!'
                 $statusText = 'Встановлено попередню (не stable) версію.'
-                $primary = New-BRAVOInstallerMutationAction -Key 'CheckUpdates' -Label 'Перевірити оновлення'
+                $primary = New-BRAVOInstallerMutationAction -Key 'CheckUpdates' -Label 'Перевірити оновлення' -BlockedReason $blocked
             }
             'UpdateAvailable' {
                 $marker = '!'
                 if ($targetVersion) {
                     # Назву «Оновити до» показуємо лише коли engine довів ціль (план §5).
                     $statusText = "Доступне оновлення до $targetVersion."
-                    $primary = New-BRAVOInstallerMutationAction -Key 'Update' -Label "Оновити до $targetVersion"
+                    $primary = New-BRAVOInstallerMutationAction -Key 'Update' -Label "Оновити до $targetVersion" -BlockedReason $blocked
                 } else {
                     $statusText = 'Є ознаки оновлення, але цільову версію не підтверджено.'
-                    $primary = New-BRAVOInstallerMutationAction -Key 'CheckUpdates' -Label 'Перевірити оновлення'
+                    $primary = New-BRAVOInstallerMutationAction -Key 'CheckUpdates' -Label 'Перевірити оновлення' -BlockedReason $blocked
                 }
             }
             'Degraded' {
                 $marker = '!'
                 $statusText = 'Встановлено з проблемами: потрібна увага оператора.'
                 $primary = New-BRAVOInstallerAction -Key 'ViewProblems' -Label 'Переглянути проблеми' -Enabled $true
-                $secondaryExtra = @(New-BRAVOInstallerMutationAction -Key 'Repair' -Label 'Відновити компоненти')
+                $secondaryExtra = @(New-BRAVOInstallerMutationAction -Key 'Repair' -Label 'Відновити компоненти' -BlockedReason $blocked)
             }
             'RepairRequired' {
                 $marker = '×'
                 $statusText = 'Потрібне відновлення: цілісність комплекту порушена.'
-                $primary = New-BRAVOInstallerMutationAction -Key 'Repair' -Label 'Відновити компоненти'
+                $primary = New-BRAVOInstallerMutationAction -Key 'Repair' -Label 'Відновити компоненти' -BlockedReason $blocked
                 $secondaryExtra = @(New-BRAVOInstallerAction -Key 'ViewProblems' -Label 'Переглянути проблеми' -Enabled $true)
             }
             'InterruptedUpdate' {

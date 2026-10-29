@@ -56,7 +56,7 @@ function New-BRAVOInstallerEngineCommand {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$ToolkitRoot,
-        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight')][string]$Action,
+        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Diagnose')][string]$Action,
         [Parameter(Mandatory = $true)][string]$ResultPath,
         [string]$RuntimeRoot,
         [string]$PowerShellPath = (Get-BRAVOInstallerPowerShellPath)
@@ -159,9 +159,10 @@ function Start-BRAVOInstallerEngineJob {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$ToolkitRoot,
-        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight')][string]$Action,
+        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Diagnose', 'Plan')][string]$Action,
         [string]$RuntimeRoot,
-        [string]$ProgressPath
+        [string]$ProgressPath,
+        [hashtable]$PlanOption = @{}
     )
     if (-not (Test-BRAVOInstallerEngineAvailable -ToolkitRoot $ToolkitRoot)) {
         throw 'Engine недоступний: BRAVO_UPDATE.ps1 не знайдено в каталозі комплекту.'
@@ -169,8 +170,13 @@ function Start-BRAVOInstallerEngineJob {
     $privateDir = New-BRAVOInstallerPrivateDirectory
     try {
         $resultPath = Join-Path $privateDir 'result.json'
-        $command = New-BRAVOInstallerEngineCommand -ToolkitRoot $ToolkitRoot -Action $Action `
-            -ResultPath $resultPath -RuntimeRoot $RuntimeRoot
+        if ($Action -eq 'Plan') {
+            # Plan: параметри джерела й операції передає майстер (PlanOption).
+            $command = New-BRAVOInstallerPlanCommand -ToolkitRoot $ToolkitRoot -ResultPath $resultPath -RuntimeRoot $RuntimeRoot @PlanOption
+        } else {
+            $command = New-BRAVOInstallerEngineCommand -ToolkitRoot $ToolkitRoot -Action $Action `
+                -ResultPath $resultPath -RuntimeRoot $RuntimeRoot
+        }
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $command.FilePath
         $psi.Arguments = $command.ArgumentString
@@ -205,11 +211,11 @@ function Resolve-BRAVOInstallerPayload {
     # Engine може загорнути дані; приймаємо документований «голий» об'єкт і
     # кілька очевидних обгорток, інакше повертаємо як є.
     [CmdletBinding()]
-    param([AllowNull()][object]$Data, [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight')][string]$Kind)
-    $marker = if ($Kind -eq 'State') { 'state' } else { 'findings' }
+    param([AllowNull()][object]$Data, [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Diagnose', 'Plan')][string]$Kind)
+    $marker = switch ($Kind) { 'State' { 'state' } 'Diagnose' { 'sections' } 'Plan' { 'planId' } default { 'findings' } }
     if ($null -eq $Data) { return $null }
     if ($null -ne $Data.PSObject.Properties[$marker]) { return $Data }
-    foreach ($wrapper in @('result', 'data', 'installationState', 'preflight')) {
+    foreach ($wrapper in @('result', 'data', 'installationState', 'preflight', 'plan', 'report')) {
         $inner = Get-BRAVOInstallerProperty -InputObject $Data -Name $wrapper
         if ($null -ne $inner -and $null -ne $inner.PSObject.Properties[$marker]) { return $inner }
     }
@@ -255,44 +261,17 @@ function Get-BRAVOInstallerEngineJobStatus {
         ExitCode = $Handle.Process.ExitCode; StdOut = $stdout; StdErr = $stderr; Data = $data; Error = $errorText }
 }
 
-function Import-BRAVOInstallerUpdateModule {
-    <#
-    .SYNOPSIS
-        Підключає модуль BRAVO.Update з КОРЕНЯ комплекту цього інсталятора
-        (одна канонічна реалізація читання прогресу й контрактів) і повертає
-        його. Fail closed: немає маніфесту або імпорт не вдався -> виняток;
-        власного запасного читача JSONL у GUI немає.
-    #>
-    [CmdletBinding()]
-    param([string]$ToolkitRoot = $script:BRAVOInstallerToolkitRoot)
-
-    $loaded = Get-Module -Name 'BRAVO.Update'
-    if ($null -ne $loaded) { return $loaded }
-    $manifest = Join-Path $ToolkitRoot 'modules\BRAVO.Update\BRAVO.Update.psd1'
-    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
-        throw "BRAVO.Installer.UI: модуль BRAVO.Update не знайдено ($manifest)."
-    }
-    # -Global:$false — модуль доступний лише всередині UI-модуля, сесію
-    # оператора не засмічуємо.
-    Import-Module -Name $manifest -DisableNameChecking -Global:$false -ErrorAction Stop
-    $imported = Get-Module -Name 'BRAVO.Update'
-    if ($null -eq $imported) { throw 'BRAVO.Installer.UI: модуль BRAVO.Update не завантажився.' }
-    return $imported
-}
-
 function Read-BRAVOInstallerProgress {
     <#
     .SYNOPSIS
-        Читає progress.jsonl (лише читання) канонічним
-        Read-BRAVOUpdateProgressEvents з BRAVO.Update (модуль імпортується
-        з кореня комплекту, fail closed). Нечитабельні/«рвані» рядки пропускає
-        сам канонічний читач.
+        Читає progress.jsonl (лише читання) ЛИШЕ канонічним
+        Read-BRAVOUpdateProgressEvents з BRAVO.Update через read-only міст
+        Invoke-BRAVOInstallerUpdateRead (WizardEngine). Власного запасного
+        читача JSONL немає: недоступний модуль engine = виняток (fail closed).
+        Нечитабельні/«рвані» рядки пропускає сам канонічний читач.
     #>
     [CmdletBinding()]
-    param([AllowNull()][string]$Path)
+    param([AllowNull()][string]$Path, [string]$ToolkitRoot = $script:BRAVOInstallerToolkitRoot)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
-    $updateModule = Import-BRAVOInstallerUpdateModule
-    # Виклик у контексті модуля: Read-BRAVOUpdateProgressEvents — функція
-    # модуля незалежно від того, чи вона вже в FunctionsToExport.
-    return @(& $updateModule { param($ProgressPath) Read-BRAVOUpdateProgressEvents -Path $ProgressPath } $Path)
+    return @(Invoke-BRAVOInstallerUpdateRead -ToolkitRoot $ToolkitRoot -Name 'Read-BRAVOUpdateProgressEvents' -Argument @{ Path = $Path })
 }

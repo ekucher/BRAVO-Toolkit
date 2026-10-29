@@ -4,7 +4,7 @@ param(
     [switch]$NoPause
 )
 
-# Тонкий entrypoint BRAVO Installer (прототип INS-080): жодної бізнес-логіки —
+# Тонкий entrypoint BRAVO Installer (майстер v1, INS-080…092): жодної бізнес-логіки —
 # лише guard, імпорт модуля й показ форми. Уся логіка живе в
 # modules\BRAVO.Installer.UI\*; дані про стан дає engine (BRAVO_UPDATE.ps1)
 # в окремому процесі. GUI не мутує систему й не потребує elevation.
@@ -35,6 +35,9 @@ function Wait-BRAVOEarlyManualExit {
 
 # ===== Runtime/tool integrity guard (той самий 3-перевірковий контракт,
 # що BRAVO_HEALTH.ps1/BRAVO_ARCHIV.ps1/BRAVO_CONFIGURATOR.ps1) =====
+# Guard має власний param-блок (RuntimeRoot): dot-source перезаписує $RuntimeRoot.
+# Зберігаємо значення оператора під іншим ім'ям і відновлюємо після завантаження.
+$installerRequestedRuntimeRoot = $RuntimeRoot
 $runtimeGuardPath = Join-Path $PSScriptRoot 'BRAVO_RUNTIME_GUARD.ps1'
 if (Test-Path -LiteralPath $runtimeGuardPath -PathType Leaf) {
     try {
@@ -44,6 +47,7 @@ if (Test-Path -LiteralPath $runtimeGuardPath -PathType Leaf) {
         Wait-BRAVOEarlyManualExit -NoPause:$NoPause
         exit 33
     }
+    $RuntimeRoot = $installerRequestedRuntimeRoot
     foreach ($guardFunction in @(
         'Test-BRAVORuntimeManifestIntegrity',
         'Test-BRAVORuntimeSecuritySettings',
@@ -77,6 +81,7 @@ if (Test-Path -LiteralPath $runtimeGuardPath -PathType Leaf) {
     $versionState = Test-BRAVOVersionDowngrade `
         -RuntimeRoot $PSScriptRoot `
         -StatePath (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'BRAVO\State\BRAVO_VERSION_STATE.json') `
+        -NoWrite `
         -Mode $runtimeIntegrityMode
     if (-not $versionState.IsValid) {
         $versionColor = if ($versionState.ShouldBlock) { 'Red' } else { 'Yellow' }

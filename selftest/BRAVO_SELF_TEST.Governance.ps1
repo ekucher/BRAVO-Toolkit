@@ -2491,9 +2491,6 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         @{ Kind = 'Historical'; Target = 'BRAVO_ARCHIVE_HELPERS.ps1' },
         @{ Kind = 'Historical'; Target = 'BRAVO_ARCHIV_RUNTIME.ps1' },
         @{ Kind = 'Historical'; Target = 'BRAVO_SYSTEM_HELPERS.ps1' },
-        # ROADMAP P3.2a, ще не реалізовано.
-        @{ Kind = 'Planned'; Target = 'BRAVO_UPDATE.ps1' },
-        @{ Kind = 'Planned'; Target = 'modules/BRAVO.Update' },
         # Evidence у гілці evidence/219c55b-rc4-host11-acceptance-pass.
         @{ Kind = 'ExternalBranch'; Target = 'docs/BRAVO_DATA_RESTORE_RC4_HOST11_ACCEPTANCE_20260820.md' },
         # TOFU-базова лінія, створюється на кожному сервері (.gitignore).

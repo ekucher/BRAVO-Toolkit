@@ -2,6 +2,25 @@
 
 ## Не випущено (developer)
 
+- **Installer v1: engine `BRAVO.Update`, CLI `BRAVO_UPDATE.ps1` і прототип GUI (гілка `feature/installer-v1`; не прийнято для production).**
+  Новий модуль `modules/BRAVO.Update`: контракти State/Preflight/Plan/Progress/Result/Journal з валідаторами й
+  забороною секретних полів, write-ahead журнал з атомарним записом, lifecycle-lock і канонічний `BRAVO_OPERATION.lock`,
+  read-only discovery, preflight і бар'єр міграції конфігурації, план із fingerprint передумов і TTL, отримання релізу
+  (online за тегом, offline zip + `.sha256` + обов'язковий `release-manifest.json`) з єдиним конвеєром верифікації,
+  приватний staging, верифікований backup, reconcile задач (знімок, призупинення, відновлення, активація за D6),
+  post-deployment validation через adapter дочірніх процесів (`-ExecutionPolicy RemoteSigned`, маскування виводу),
+  транзакційний відкат зі знімком і відновленням version-state, відкат clean install за `createdOwnership`, recovery
+  перерваної операції, same-version repair і діагностичний звіт з редакцією. `BRAVO_UPDATE.ps1` — тонкий CLI
+  (`State`, `Preflight`, `Plan`, `Install`/`Update`/`Repair` з підтвердженням коротким id плану, `Recover`,
+  `Diagnose`, `-AsJson`); mutation виконує worker після UAC за недовіреним запитом у `State\Update\Requests`.
+  `BRAVO_INSTALLER.ps1` — read-only WinForms-прототип (стан і preflight; mutation-кнопки вимкнені). Нові коди
+  завершення `80 DeploymentFailed`, `81 DeploymentRolledBack`, `82 DeploymentCritical` у `BRAVO.ExitCodes`. Ядро
+  розгортання й clean install у цьому знімку ще не інтегровано. Документація: `docs/installer/CONTRACTS.md`,
+  `ENGINE_DESIGN.md`, `DECISIONS.md`, нова `OPERATOR_GUIDE.md`. Self-test suites `UpdateContracts`, `UpdateDiscovery`,
+  `UpdatePreflight`, `UpdatePlan`, `UpdateDiagnostics`, `UpdateRelease`, `UpdateStaging`, `UpdateBackup`,
+  `UpdateReconcile`, `UpdateValidation`, `UpdateRollback`, `UpdateRecovery`, `UpdateWorker`, `InstallerUI`. VM- і
+  real-host acceptance не виконано.
+
 - **Release: збирання з lightweight-тега відхиляється (D8).**
   `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
   `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не

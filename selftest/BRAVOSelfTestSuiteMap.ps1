@@ -21,13 +21,14 @@
 # ============================================================
 
 $script:BRAVOSelfTestSuiteCatalog = @(
-    'Archive', 'ArchiveDiskSpace', 'BackupDestinations', 'BackupScope', 'BazaSync', 'ClientGate', 'ConfigIntent', 'ConfigLoader',
-    'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
-    'DiskSpace', 'Governance', 'InstallerUI', 'LogRotation', 'LogSync', 'MaintenanceDiskSpace',
-    'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
-    'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence', 'ServiceRecovery',
-    'SftpCredentialsRequired', 'Status', 'TraceArchive', 'UpdateContracts', 'UpdateDiagnostics', 'UpdateDiscovery', 'UpdatePlan',
-    'UpdatePreflight', 'UpdateRelease', 'UpdateStaging'
+    'Archive', 'ArchiveDiskSpace', 'BackupDestinations', 'BackupScope', 'BazaSync', 'ClientGate', 'ConfigIntent',
+    'ConfigLoader', 'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore', 'DiskSpace',
+    'Governance', 'InstallerUI', 'LogRotation', 'LogSync', 'MaintenanceDiskSpace', 'MaintenanceOwnLog',
+    'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths', 'RestoreSynthetic', 'RestoreVerify',
+    'ServiceQuiescence', 'ServiceRecovery', 'SftpCredentialsRequired', 'Status', 'TraceArchive', 'UpdateBackup',
+    'UpdateContracts', 'UpdateDiagnostics', 'UpdateDiscovery', 'UpdateInstall', 'UpdatePlan', 'UpdatePreflight',
+    'UpdateReconcile', 'UpdateRecovery', 'UpdateRelease', 'UpdateRollback', 'UpdateStaging', 'UpdateValidation',
+    'UpdateWorker'
 )
 
 function ConvertTo-BRAVOSelfTestNormalizedChangedPath {

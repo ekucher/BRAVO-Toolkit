@@ -175,14 +175,27 @@ pipeline (ARCHITECTURE §7). Authenticode-підпису поки немає.
 **Контекст.** Детальний план §12 п. 6 вимагає policy для
 `SuccessWithWarnings` і мережевих проблем.
 
-**Рішення.**
+**Рішення.** Реалізація — `Set-BRAVOTaskActivation`
+(`modules/BRAVO.Update/BRAVO.Update.Reconcile.ps1`). Під час операції engine
+вимикає лише задачі, що були `enabled = true` у знімку scheduler, а після
+неї діє таблиця:
 
 | Результат | Install | Update / Repair |
 |---|---|---|
-| `Success` | задачі за канонічною конфігурацією scheduler | задачі за канонічною конфігурацією scheduler |
-| `SuccessWithWarnings` | задачі лишаються неактивними до підтвердження оператором | зберігається попередній enabled-стан |
-| `Failed` / `RolledBack` | не активуються | відновлюється попередній стан зі snapshot журналу |
-| `Critical` / невідомий runtime | ніколи не активуються | ніколи не активуються |
+| `Success` | задачі лишаються неактивними (`Inactive`) до явної активації оператором | відновлюється попередній enabled-стан зі знімка scheduler |
+| `SuccessWithWarnings` | задачі лишаються неактивними (`Inactive`) | відновлюється попередній enabled-стан + Warning finding з переліком попереджень |
+| `Failed` / `RolledBack` | не активуються | відновлюється попередній стан зі знімка scheduler |
+| `Critical` / невідомий runtime | ніколи не активуються (лише вимикаються) | ніколи не активуються (лише вимикаються) |
+
+`Inactive` перевіряється читанням стану задач; якщо перевірити чи вимкнути
+не вдалося, результат — `Unknown` з Warning, а не вигаданий `Inactive`.
+
+**Рішення lead щодо `SuccessWithWarnings` для Update/Repair (чекає
+затвердження власником).** Попередній enabled-стан задач відновлюється так
+само, як при `Success`, а попередження виносяться окремим finding-ом. Причина:
+для системи резервного копіювання вимкнений розклад після фактично успішного
+оновлення небезпечніший за попередження (архівація мовчки зупинилася б).
+Альтернатива — лишати задачі вимкненими до підтвердження оператором.
 
 Warnings, що стосуються лише мережі (SFTP/SMB недоступні), активацію не
 блокують: відсутність мережі не означає зіпсовану локальну інсталяцію.
@@ -305,4 +318,64 @@ SFTP не пишуть BAZA-прапорців; `BAZA_WWW_SFTP` за замов�
 
 **Статус:** Запропоновано — чекає затвердження власником.
 
-**Рішення.** Див. `docs/installer/ENGINE_DESIGN.md`.
+**Контекст.** `%ProgramData%\BRAVO\State\BRAVO_VERSION_STATE.json`
+(`highestVersionFull`/`highestVersion`) пише будь-який entrypoint, що
+викликає guard без `-NoWrite`, і пише ще до перевірки lock-а
+(ENGINE_DESIGN §1, F5). Якщо під час оновлення задача, ввімкнена
+канонічною реєстрацією, або ручний запуск оператора зафіксує цільову версію,
+відновлений старий runtime блокувався б кодом 35, а обхід через
+`BRAVO_ALLOW_DOWNGRADE=1` заборонено. Деталі — ENGINE_DESIGN §7.1–7.2.
+
+**Рішення.** Реалізація — `Get-BRAVOVersionStateSnapshot` і
+`Restore-BRAVOVersionState` (`modules/BRAVO.Update/BRAVO.Update.Rollback.ps1`).
+
+1. Engine нічого не пише в version-state; validation запускає guard лише
+   прямим запуском (`-NoWrite`), `BRAVO_UPDATE.ps1` викликає
+   `Test-BRAVOVersionDowngrade -NoWrite`.
+2. Перед mutation (крок U10) знімаються точні байти файлу в
+   `<StateRoot>\Operations\<operationId>\version-state.snapshot` (або маркер
+   «файлу не було»); у журнал пишеться `versionState { present, sha256,
+   recordedVersion, snapshotPath }`. Повторний знімок для тієї самої операції
+   заборонено: після початку mutation він зафіксував би вже змінений стан.
+3. Крок відкату `Rollback.RestoreVersionState`:
+   - поточний файл побайтово збігається зі знімком (або обидва відсутні) →
+     `NoChange`;
+   - записана версія більша за цільову → `Refused`: після target справді
+     запускалася новіша версія, відкат нижче небезпечний — rollback
+     завершується `Critical`;
+   - записана версія не більша за цільову (зокрема дорівнює їй), файл
+     відсутній або пошкоджений → атомарне побайтове повернення знімка
+     (tmp у тому ж каталозі з `WriteThrough`, далі `File.Replace`/`File.Move`)
+     або видалення файлу, якщо знімок «файлу не було» → `Restored`;
+   - будь-яка невизначеність (знімок пошкоджений чи відсутній, цільову версію
+     не розпізнано, поточний файл нечитабельний) → `Refused`, а не вгадування.
+4. `BRAVO_ALLOW_DOWNGRADE` engine ніде не встановлює; worker і
+   `Invoke-BRAVORollback` відмовляють (blocker, hint 35), якщо змінна є в
+   середовищі процесу, і нічого не змінюють.
+
+**Ризики.** Залежність від формату state-файлу guard-а; ACL файлу після
+`File.Replace` треба перевірити на VM. Нового класу загрози немає:
+адміністратор і так може змінити цей файл (`THREAT_MODEL.md`).
+
+**Альтернативи.** Тимчасово ставити `BRAVO_ALLOW_DOWNGRADE` на час відкату —
+відхилено: вимикає захист для всіх процесів середовища. Не чіпати state —
+відхилено: відкат міг би лишити сервер, що блокується кодом 35.
+
+**Як змінити.** Зміна формату чи шляху version-state — узгоджена зміна guard-а
+(`BRAVO_RUNTIME_GUARD.ps1`), `Get-BRAVOUpdateDefaultPaths` і цих двох функцій.
+
+## Відкриті рішення R1–R7
+
+Рішення з ENGINE_DESIGN §13, які engine зараз реалізує (або планує) за
+наведеною пропозицією. **Статус кожного: відкрите — чекає рішення
+власника.** Жодне з них не затверджене.
+
+| # | Питання | Пропозиція (поточний default) | Де в коді / дизайні |
+|---|---|---|---|
+| R1 | Crash після `Validate` або під час `Activate`: rollback чи commit без активації | rollback: recovery знає лише факт `mutationStarted` | `Invoke-BRAVORecovery` |
+| R2 | Чи дозволяти Repair при журналі `Critical` з явним `-AcknowledgeCriticalOperationId` | дозволяти | не реалізовано (потрібне ядро deploy) |
+| R3 | Repair при нечитаному `VERSION.json` | blocker (`Repair.IdentityUnproven`) | `Repair-BRAVOInstallation` |
+| R4 | Задачі, створені невдалою операцією: вимикати чи видаляти | вимикати (`createdTasks` лишаються вимкненими) | `Add-BRAVOUpdateJournalCreatedTask`, `Invoke-BRAVORollback` |
+| R5 | Retention backup-ів `<BackupRoot>\<operationId>` | ручне прибирання; engine backup-и не видаляє | — |
+| R6 | `-RegisterDisabled` у scheduler-домені (реєстрація задач без увімкнення) | окремий пакет scheduler-домену; поки engine вимикає задачі одразу після реєстрації | ENGINE_DESIGN §11 |
+| R7 | `Warn`-режим перевірки downgrade для `Recover` | винести на security-рев'ю; поки CLI завжди `Enforce` | `BRAVO_UPDATE.ps1` |
