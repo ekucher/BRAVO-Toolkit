@@ -7145,6 +7145,8 @@ $attributionScenarios = @(
     @{ Label = 'ChatLink'; Message = "docs: x`n`nДив. https://chatgpt.com/c/0000"; Author = 'dev@example.invalid'; Expect = @('AI_SESSION_LINK') }
     @{ Label = 'AiAuthorIdentity'; Message = 'fix: x'; Author = 'noreply@anthropic.com'; Expect = @('AI_AUTHOR_IDENTITY') }
     @{ Label = 'RuleMentionedInProseAllowed'; Message = "ci: гейт забороняє трейлер Co-Authored-By: на AI-інструмент і футер Generated with"; Author = 'dev@example.invalid'; Expect = @() }
+    @{ Label = 'GeneratedWithToolInProseAllowed'; Message = "docs: explain why Generated with Claude footers are forbidden"; Author = 'dev@example.invalid'; Expect = @() }
+    @{ Label = 'GeneratedFooterWithEmoji'; Message = "fix: x`n`n" + [char]::ConvertFromUtf32(0x1F916) + " Generated with Codex"; Author = 'dev@example.invalid'; Expect = @('GENERATED_BY_AI') }
 )
 foreach ($scenario in $attributionScenarios) {
     $scenarioHits = @(& $attributionModule {
@@ -7198,7 +7200,7 @@ Test-BRAVOCondition `
     -Name 'Governance/CommitAttribution.RangePushIsBeforeToAfter' `
     -Failure "діапазон push мусить бути before..after; отримано: $(& $rangeText 'Push')"
 Test-BRAVOCondition `
-    -Condition ((@($attributionRangeResults['PushNewBranch'].Range) -join ' ') -eq ('b' * 40 + ' --not --exclude=refs/remotes/origin/feature/x --remotes=origin')) `
+    -Condition ((@($attributionRangeResults['PushNewBranch'].Range) -join ' ') -eq ('b' * 40 + ' --not --exclude=origin/feature/x --remotes=origin')) `
     -Name 'Governance/CommitAttribution.RangeNewBranchExcludesOtherRemoteBranches' `
     -Failure "push нової гілки мусить перевіряти коміти, яких немає в інших гілках origin; отримано: $(& $rangeText 'PushNewBranch')"
 Test-BRAVOCondition `
@@ -7220,6 +7222,9 @@ $attributionDirtyOutput = ''; $attributionDirtyExit = -1
 $attributionCleanOutput = ''; $attributionCleanExit = -1
 $attributionMissingBaselineOutput = ''; $attributionMissingBaselineExit = -1
 $attributionDirtySha = ''
+$attributionCleanSha = ''
+$attributionBase = ''
+$attributionNewBranchShas = @()
 if (@(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue).Count -eq 0) {
     $attributionLimitation = 'git відсутній на цьому хості (встановлений комплект без git)'
 } else {
@@ -7252,6 +7257,17 @@ if (@(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyCont
             # Неіснуюча базова лінія -> fail closed, а не перевірка всієї історії.
             $attributionMissingBaselineOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $attributionScript -Root $attributionRepo -Range 'HEAD' -Baseline ('c' * 40) 2>&1 | Out-String
             $attributionMissingBaselineExit = $LASTEXITCODE
+            # Push нової гілки: діапазон мусить реально вибирати її коміти, а не
+            # виключати їх самою гілкою (Codex QA-001) - перевіряється git rev-list.
+            $null = & git -C $attributionRepo update-ref refs/remotes/origin/developer $attributionBase 2>&1
+            $null = & git -C $attributionRepo update-ref refs/remotes/origin/feature/x $attributionDirtySha 2>&1
+            $attributionNewBranchEvent = Join-Path $attributionRepo '.git\SELFTEST_EVENT.json'
+            [IO.File]::WriteAllText($attributionNewBranchEvent, ('{{"before":"{0}","after":"{1}"}}' -f ('0' * 40), $attributionDirtySha), (New-Object Text.UTF8Encoding($false)))
+            $attributionNewBranchRange = & $attributionModule {
+                param($EventPathArg)
+                Get-BRAVOCommitAttributionRange -EventName 'push' -EventPath $EventPathArg -RefName 'feature/x'
+            } $attributionNewBranchEvent
+            $attributionNewBranchShas = @(& git -C $attributionRepo rev-list @($attributionNewBranchRange.Range) 2>&1 | ForEach-Object { ([string]$_).Trim() })
         }
     } finally {
         $ErrorActionPreference = $previousErrorActionAttribution
@@ -7273,6 +7289,12 @@ Test-BRAVOCondition `
     -Name 'Governance/CommitAttribution.GateFailsClosedWithoutBaseline' `
     -EnvironmentLimitation $attributionLimitation `
     -Failure "без базового коміту в історії гейт мусить падати з COMMIT_ATTRIBUTION_RANGE_UNKNOWN; код $attributionMissingBaselineExit, вивід: $attributionMissingBaselineOutput"
+Test-BRAVOCondition `
+    -Condition ($attributionDirtySha.Length -eq 40 -and ($attributionNewBranchShas -contains $attributionDirtySha) -and ($attributionNewBranchShas -contains $attributionCleanSha) -and
+        -not ($attributionNewBranchShas -contains $attributionBase)) `
+    -Name 'Governance/CommitAttribution.NewBranchRangeSelectsItsOwnCommits' `
+    -EnvironmentLimitation $attributionLimitation `
+    -Failure "push нової гілки (origin/feature/x уже у fetch) мусить вибирати її власні коміти й не вибирати коміти origin/developer; git rev-list повернув: [$($attributionNewBranchShas -join ', ')]"
 
 # --- Кроки в ci.yml: обидва ранні гейти до парсера, у static-checks ---
 $attributionWorkflow = [IO.File]::ReadAllText((Join-Path $root '.github\workflows\ci.yml'), [Text.Encoding]::UTF8)

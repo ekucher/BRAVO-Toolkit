@@ -55,7 +55,10 @@ function Get-BRAVOCommitAttributionViolation {
         'CO_AUTHORED_BY_AI'   = '(?im)^[ \t]*co-authored-by:[^\r\n]*' + $aiTool
         'SESSION_TRAILER'     = '(?im)^[ \t]*claude-session:'
         'AI_ASSISTED_TRAILER' = '(?im)^[ \t]*ai-assisted:'
-        'GENERATED_BY_AI'     = '(?im)generated[ \t]+(?:with|by)[ \t]+\[?[ \t]*' + $aiTool
+        # Футер - рядок, де перед "Generated" немає літер (емодзі, пробіли); інакше
+        # опис самого правила в прозі ("пояснює, чому Generated with ... заборонено")
+        # давав би хибне спрацювання.
+        'GENERATED_BY_AI'     = '(?im)^[^\p{L}\r\n]*generated[ \t]+(?:with|by)[ \t]+\[?[ \t]*' + $aiTool
         'AI_SESSION_LINK'     = '(?i)https?://(?:www\.)?(?:claude\.ai/(?:code|chat|share|project)|claude\.com/claude-code|chatgpt\.com/(?:c|share|codex)/)'
         'AI_NOREPLY_ADDRESS'  = '(?i)noreply@anthropic\.com'
     }
@@ -126,7 +129,9 @@ function Get-BRAVOCommitAttributionRange {
         $result.Error = 'push нової гілки без GITHUB_REF_NAME'
         return $result
     }
-    $result.Range = @($after, '--not', "--exclude=refs/remotes/origin/$RefName", '--remotes=origin')
+    # Шаблон --exclude для --remotes пишеться без префікса refs/remotes/; із
+    # префіксом сама нова гілка лишалась би негативною й ховала всі свої коміти.
+    $result.Range = @($after, '--not', "--exclude=origin/$RefName", '--remotes=origin')
     return $result
 }
 
