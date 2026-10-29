@@ -416,6 +416,57 @@
             $recForeign = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $true; CandidateRoots = @($runtime); RuntimeRoot = (Join-Path $wkRoot 'not-discovered'); Operations = @{ Recover = $recorderOp } }
             Test-BRAVOCondition -Condition (($recForeign.ExitCode -eq 80) -and ($null -eq $recorded.Args)) -Name 'UpdateWorker/H1/RecoverRejectsUndiscoveredRuntimeRoot' -Failure ('код ' + $recForeign.ExitCode)
         }
+
+        # --- Контекст discovery при запуску з каталогу toolkit != runtime (Codex P1) ---
+        & {
+            $callsBefore = $calls.Update
+            $plan = & $newPlan
+            $path = & $writeRequest $plan $null
+            $viaDefault = & $call 'Invoke-BRAVOUpdateWorker' @{ RequestPath = $path; Adapter = $adapter; Paths = $paths; Operations = $ops; IsAdministrator = $true }
+            Test-BRAVOCondition -Condition ($viaDefault.ExitCode -eq 0 -and $calls.Update -eq ($callsBefore + 1)) -Name 'UpdateWorker/ToolkitDirNotRuntimeStillDiscovered' `
+                -Failure ('код ' + $viaDefault.ExitCode + ' [' + ((& $findingIds $viaDefault) -join ',') + ']')
+            $otherPaths = $paths.PSObject.Copy()
+            $otherPaths.RuntimeRoot = (Join-Path $wkRoot 'інший runtime')
+            $plan = & $newPlan
+            $path = & $writeRequest $plan $null
+            $notFound = & $call 'Invoke-BRAVOUpdateWorker' @{ RequestPath = $path; Adapter = $adapter; Paths = $otherPaths; Operations = $ops; IsAdministrator = $true }
+            Test-BRAVOCondition -Condition ($notFound.ExitCode -eq 80 -and ((& $findingIds $notFound) -contains 'Worker.ForeignRoot') -and $calls.Update -eq ($callsBefore + 1)) -Name 'UpdateWorker/UndiscoveredRuntimeStillRejected' `
+                -Failure 'root поза знайденими кандидатами мусить відхилятись'
+        }
+
+        # --- Self-test як частина підтвердженого плану (Codex P2) ---
+        & {
+            $planWith = {
+                param([string]$Action, [string]$SelfTest)
+                $preflight = [pscustomobject]@{ findings = @(); canProceed = $true; blockerCount = 0; warningCount = 0 }
+                & $call 'New-BRAVODeploymentPlan' @{ Action = $Action; RuntimeRoot = $runtime; StagingRoot = $paths.StagingRoot; BackupRoot = $paths.BackupRoot; StateRoot = $paths.StateRoot
+                    Source = $source; StagedRoot = $staged; Preflight = $preflight; Adapter = $adapter; SelfTest = $SelfTest }
+            }
+            $hasPlanned = { param($Plan) @(@($Plan.tests.planned) | Where-Object { $_.id -eq 'SelfTest' }).Count -eq 1 }
+            $skippedItem = { param($Plan) @(@($Plan.tests.skipped) | Where-Object { $_.id -eq 'SelfTest' }) }
+            $updateDefault = & $planWith 'Update' 'Default'
+            $updateSkip = & $planWith 'Update' 'Skip'
+            $repairDefault = & $planWith 'Repair' 'Default'
+            $repairInclude = & $planWith 'Repair' 'Include'
+            Test-BRAVOCondition -Condition ((& $hasPlanned $updateDefault) -and -not (& $hasPlanned $updateSkip) -and -not (& $hasPlanned $repairDefault) -and (& $hasPlanned $repairInclude)) `
+                -Name 'UpdateWorker/PlanSelfTestSelection' -Failure 'Default/Include/Skip мають визначати plan.tests.planned'
+            Test-BRAVOCondition -Condition (((& $skippedItem $updateSkip)[0].reason) -ceq 'вимкнено оператором' -and (@(& $skippedItem $repairInclude)).Count -eq 0) -Name 'UpdateWorker/PlanSelfTestSkippedReason' -Failure 'причина пропуску'
+
+            $callsBefore = $calls.Update
+            $plan = & $newPlan
+            $path = & $writeRequest $plan { param($r) $r.options.runSelfTest = $false }
+            $mismatch = & $runWorker $path
+            Test-BRAVOCondition -Condition ($mismatch.ExitCode -eq 80 -and ((& $findingIds $mismatch) -contains 'Request.OptionMismatch') -and $calls.Update -eq $callsBefore) -Name 'UpdateWorker/RunSelfTestMismatchRejected' `
+                -Failure ('код ' + $mismatch.ExitCode + ' [' + ((& $findingIds $mismatch) -join ',') + ']')
+            $skipPlan = & $planWith 'Update' 'Skip'
+            $skipRequest = & $call 'New-BRAVOUpdateRequest' @{ Plan = $skipPlan; ConfirmedPlanShortId = $skipPlan.planId.Substring(0, 8) }
+            Test-BRAVOCondition -Condition ($skipRequest.options.runSelfTest -eq $false) -Name 'UpdateWorker/RequestDefaultsRunSelfTestFromPlan' -Failure 'runSelfTest за замовчуванням береться з плану'
+
+            $stagedCopy = $staged; $sourceCopy = $source
+            $acquire = @{ Stage = { param($Tag, $SourcePath, $AllowPrerelease, $WorkDirectory) [pscustomobject]@{ Success = $true; Findings = @(); Source = $sourceCopy; StagedRoot = $stagedCopy } }.GetNewClosure() }
+            $cliPlan = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Plan'; Operation = 'Update'; SelfTest = 'Skip'; Paths = $paths; Adapter = $adapter; CandidateRoots = @($runtime); Acquire = $acquire; WorkRoot = $wkRoot; RuntimeRoot = $runtime }
+            Test-BRAVOCondition -Condition ($null -ne $cliPlan.Result -and -not (& $hasPlanned $cliPlan.Result) -and (@(& $skippedItem $cliPlan.Result)).Count -eq 1) -Name 'UpdateWorker/CliPlanSelfTestSkip' -Failure 'CLI -SelfTest Skip мусить потрапити в план'
+        }
     } finally {
         if ($null -ne $wkValidatorOriginal) {
             & $wkModule { param($Original) Set-Item -Path Function:\Test-BRAVOUpdateDeploymentPlan -Value $Original } $wkValidatorOriginal

@@ -53,6 +53,7 @@ powershell.exe -NoProfile -File .\BRAVO_INSTALLER.ps1 [-RuntimeRoot <шлях>] 
 | `-AllowPrerelease` | Явний дозвіл prerelease (інакше prerelease відхиляється) |
 | `-BackupDestination` | `Cloud`, `CloudAndSamba`, `SambaOnly`, `LocalOnly` — обов'язковий для `Install` |
 | `-Scope` | `All` (типово), `Runtime`, `Scheduler` — для `Repair` |
+| `-SelfTest` | `Default` (типово: self-test увімкнено для `Install`/`Update`, вимкнено для `Repair`), `Include`, `Skip` — для `Plan`/`Install`/`Update`/`Repair`. Вибір входить у підтверджений план (`plan.tests`); запит `options.runSelfTest` мусить йому відповідати, інакше worker відхиляє запит (`Request.OptionMismatch`) |
 | `-PlanPath` | Збережений план (JSON) для неінтерактивного виконання |
 | `-ConfirmPlanId` | Короткий id плану (перші 8 hex `planId`) — підтвердження без діалогу |
 | `-RequestPath` | Лише для `-Action Execute` |

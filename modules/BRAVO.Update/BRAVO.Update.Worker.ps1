@@ -125,6 +125,17 @@ function Test-BRAVOUpdateWorkerSamePath {
     }
 }
 
+function Test-BRAVOUpdateWorkerPlanHasSelfTest {
+    # $true, якщо підтверджений план передбачає self-test (plan.tests.planned містить SelfTest).
+    [CmdletBinding()]
+    param([AllowNull()]$Plan)
+    $tests = Get-BRAVOUpdatePropertyValue -InputObject $Plan -Name 'tests'
+    foreach ($item in @(Get-BRAVOUpdatePropertyValue -InputObject $tests -Name 'planned' -Default @())) {
+        if ([string](Get-BRAVOUpdatePropertyValue -InputObject $item -Name 'id' -Default '') -ceq 'SelfTest') { return $true }
+    }
+    return $false
+}
+
 function Test-BRAVOUpdateWorkerAcceptsParameter {
     # Чи прийме операція параметр: scriptblock-seam — за AST param-блока,
     # ім'я функції — за метаданими команди. Невідомо = $false.
@@ -335,10 +346,12 @@ function New-BRAVOUpdateRequest {
     }
     if ([string]::IsNullOrWhiteSpace($RequestId)) { $RequestId = [guid]::NewGuid().ToString() }
     if ([string]::IsNullOrWhiteSpace($RequestedUtc)) { $RequestedUtc = Get-BRAVOUpdateUtcNowText }
+    # runSelfTest за замовчуванням береться З ПЛАНУ (plan.tests): оператор підтверджує саме план.
+    $plannedSelfTest = Test-BRAVOUpdateWorkerPlanHasSelfTest -Plan $Plan
     $options = [ordered]@{
         prereleaseAuthorized = $false
         activationPolicy     = ''
-        runSelfTest          = $false
+        runSelfTest          = $plannedSelfTest
         backupDestination    = ''
         sourcePath           = ''
         scope                = 'All'
@@ -572,7 +585,6 @@ function Invoke-BRAVOUpdateWorker {
         [object]$Now = $null
     )
     $startedUtc = Get-BRAVOUpdateUtcNowText
-    $useDefaultAdapter = ($null -eq $Adapter)
     if ($null -eq $Paths) { $Paths = Get-BRAVOUpdateDefaultPaths }
     if ($null -eq $Adapter) { $Adapter = New-BRAVOUpdateDefaultAdapter -StagingRoot ([string]$Paths.StagingRoot) }
     $stateRoot = [string]$Paths.StateRoot
@@ -649,6 +661,14 @@ function Invoke-BRAVOUpdateWorker {
     $attestation = ('Елевований engine виконує план ' + $planId.Substring(0, [Math]::Min(8, $planId.Length)) + ' (' + $action + '), цільова версія ' +
         [string](Get-BRAVOUpdatePropertyValue -InputObject $planSourceInfo -Name 'packageVersion' -Default '?') + ', sha256 джерела ' + $attestationSha + '...')
 
+    # Вибір self-test належить підтвердженому плану: запит не може йому суперечити.
+    $requestedSelfTest = [bool](Get-BRAVOUpdatePropertyValue -InputObject $options -Name 'runSelfTest' -Default $false)
+    if ($requestedSelfTest -ne (Test-BRAVOUpdateWorkerPlanHasSelfTest -Plan $plan)) {
+        return (& $fail @(New-BRAVOUpdateWorkerFinding -Id 'Request.OptionMismatch' -Title 'Опція runSelfTest суперечить підтвердженому плану' `
+                    -Details ('runSelfTest запиту: ' + $requestedSelfTest + '; self-test у плані: ' + (-not $requestedSelfTest)) `
+                    -Action 'Побудуйте новий план із потрібним вибором self-test (-SelfTest) і підтвердіть його.') 'PlanStale' $plan '' $action)
+    }
+
     # 4. Корені не беруться на віру з запиту.
     $rootProblems = New-Object System.Collections.Generic.List[string]
     if (-not (Test-BRAVOUpdateWorkerSamePath -Left ([string](Get-BRAVOUpdatePropertyValue -InputObject $plan -Name 'stagingRoot')) -Right ([string]$Paths.StagingRoot))) {
@@ -666,11 +686,15 @@ function Invoke-BRAVOUpdateWorker {
     }
     $installationState = $null
     if ($rootProblems.Count -eq 0 -and $action -ne 'Install') {
+        # Контекст production-discovery зберігається незалежно від того, хто передав adapter і
+        # звідки запущено CLI: entrypoint явних кандидатів не задає, тож береться типовий
+        # runtime + корінь toolkit; задачі планувальника додає -IncludeScheduler. Запитаний root усе
+        # одно мусить бути ЗНАЙДЕНИМ встановленням (запиту не вірять).
         $candidates = @($CandidateRoots)
         if ($candidates.Count -eq 0) { $candidates = @([string]$Paths.RuntimeRoot, [string]$script:BRAVOUpdateToolkitRoot) }
         try {
             $installationState = Get-BRAVOInstallationState -CandidateRoots $candidates -StateRoot $stateRoot -VersionStatePath ([string]$Paths.VersionStatePath) `
-                -OperationLockPath ([string]$Paths.OperationLockPath) -LockRoot ([string]$Paths.LockRoot) -Adapter $Adapter -IncludeScheduler:$useDefaultAdapter
+                -OperationLockPath ([string]$Paths.OperationLockPath) -LockRoot ([string]$Paths.LockRoot) -Adapter $Adapter -IncludeScheduler
             $found = @(@($installationState.candidateRoots) | Where-Object { Test-BRAVOUpdateWorkerSamePath -Left ([string]$_) -Right $planRuntime })
             if ($found.Count -eq 0) { $rootProblems.Add('runtimeRoot плану не є знайденим встановленням BRAVO') }
         } catch {
@@ -940,6 +964,7 @@ function New-BRAVOUpdateCliPlan {
         [string]$Tag = '',
         [string]$SourcePath = '',
         [switch]$AllowPrerelease,
+        [ValidateSet('Default', 'Include', 'Skip')][string]$SelfTest = 'Default',
         [string]$WorkRoot = '',
         [hashtable]$Acquire = $null,
         [scriptblock]$Downloader,
@@ -984,7 +1009,7 @@ function New-BRAVOUpdateCliPlan {
         $planArguments = @{
             Action = $Operation; RuntimeRoot = $RuntimeRoot; StagingRoot = [string]$Paths.StagingRoot; BackupRoot = [string]$Paths.BackupRoot
             StateRoot = [string]$Paths.StateRoot; Source = $acquired.Source; StagedRoot = [string]$acquired.StagedRoot
-            Preflight = $preflight; Adapter = $Adapter
+            Preflight = $preflight; Adapter = $Adapter; SelfTest = $SelfTest
         }
         if ($null -ne $InstallationState) { $planArguments['InstallationState'] = $InstallationState }
         if ($null -ne $Now) { $planArguments['Now'] = $Now }
@@ -1009,6 +1034,7 @@ function Invoke-BRAVOUpdateCliPlanStep {
         [string]$Tag = '',
         [string]$SourcePath = '',
         [switch]$AllowPrerelease,
+        [ValidateSet('Default', 'Include', 'Skip')][string]$SelfTest = 'Default',
         [string]$WorkRoot = '',
         [hashtable]$Acquire = $null,
         [scriptblock]$Downloader,
@@ -1026,7 +1052,7 @@ function Invoke-BRAVOUpdateCliPlanStep {
         }
     }
     return (New-BRAVOUpdateCliPlan -Operation $Operation -RuntimeRoot $root -Paths $Paths -Adapter $Adapter -InstallationState $state -Tag $Tag -SourcePath $SourcePath `
-            -AllowPrerelease:$AllowPrerelease -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now)
+            -AllowPrerelease:$AllowPrerelease -SelfTest $SelfTest -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now)
 }
 
 # ---------------------------------------------------------------------------
@@ -1166,6 +1192,7 @@ function Invoke-BRAVOUpdateCliMutation {
         [string]$Tag = '',
         [string]$SourcePath = '',
         [switch]$AllowPrerelease,
+        [ValidateSet('Default', 'Include', 'Skip')][string]$SelfTest = 'Default',
         [string]$BackupDestination = '',
         [string]$Scope = 'All',
         [string]$PlanPath = '',
@@ -1208,7 +1235,7 @@ function Invoke-BRAVOUpdateCliMutation {
         if ([string]$plan.action -cne $Action) { return (& $refuse 'Cli.PlanAction' 'Дія плану не збігається з -Action' ('план: ' + [string]$plan.action) $plan $null 'Blocked') }
     } else {
         $built = Invoke-BRAVOUpdateCliPlanStep -Operation $Action -StateArguments $StateArguments -Paths $Paths -Adapter $Adapter -Tag $Tag -SourcePath $SourcePath `
-            -AllowPrerelease:$AllowPrerelease -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now
+            -AllowPrerelease:$AllowPrerelease -SelfTest $SelfTest -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now
         if ($null -eq $built.Plan) {
             $code = Get-BRAVOUpdateWorkerHintExitCode -Finding @($built.Findings)
             if ($code -le 10) { $code = 80 }
@@ -1249,7 +1276,7 @@ function Invoke-BRAVOUpdateCliMutation {
     $scheduler = Get-BRAVOUpdatePropertyValue -InputObject $changes -Name 'scheduler'
     $activation = [string](Get-BRAVOUpdatePropertyValue -InputObject $scheduler -Name 'activationPolicy' -Default '')
     $options = @{
-        prereleaseAuthorized = [bool]$AllowPrerelease; activationPolicy = $activation; runSelfTest = $false
+        prereleaseAuthorized = [bool]$AllowPrerelease; activationPolicy = $activation; runSelfTest = (Test-BRAVOUpdateWorkerPlanHasSelfTest -Plan $plan)
         backupDestination = $BackupDestination; sourcePath = $SourcePath; scope = $Scope
     }
     $requestPath = $null
@@ -1320,6 +1347,7 @@ function Invoke-BRAVOUpdateCliAction {
         [string]$SourcePath = '',
         [string]$Tag = '',
         [switch]$AllowPrerelease,
+        [ValidateSet('Default', 'Include', 'Skip')][string]$SelfTest = 'Default',
         [string]$BackupDestination = '',
         [ValidateSet('All', 'Runtime', 'Scheduler')][string]$Scope = 'All',
         [string]$PlanPath = '',
@@ -1341,12 +1369,12 @@ function Invoke-BRAVOUpdateCliAction {
         [scriptblock]$Downloader = $null,
         [object]$Now = $null
     )
-    $useDefaultAdapter = ($null -eq $Adapter)
     if ($null -eq $Paths) { $Paths = Get-BRAVOUpdateDefaultPaths }
     if ($null -eq $Adapter) { $Adapter = New-BRAVOUpdateDefaultAdapter -StagingRoot ([string]$Paths.StagingRoot) }
     $isAdmin = $IsAdministrator
     if ($null -eq $isAdmin) { $isAdmin = Test-BRAVOUpdateWorkerIsAdministrator }
     $isAdmin = [bool]$isAdmin
+    # Без явних кандидатів: типовий runtime + корінь toolkit (entrypoint кандидатів не задає); задачі планувальника додає -IncludeScheduler.
     if (@($CandidateRoots).Count -eq 0) { $CandidateRoots = @([string]$Paths.RuntimeRoot, [string]$script:BRAVOUpdateToolkitRoot) }
 
     $done = {
@@ -1368,7 +1396,7 @@ function Invoke-BRAVOUpdateCliAction {
             return (& $done 80 (New-BRAVOUpdateCliUsageResult -Action $Action -Finding @($topRoots.Findings)))
         }
     }
-    $stateArguments = @{ RuntimeRoot = $RuntimeRoot; CandidateRoots = $CandidateRoots; Paths = $Paths; Adapter = $Adapter; IncludeScheduler = $useDefaultAdapter }
+    $stateArguments = @{ RuntimeRoot = $RuntimeRoot; CandidateRoots = $CandidateRoots; Paths = $Paths; Adapter = $Adapter; IncludeScheduler = $true }
     $preflightFor = {
         param([string]$PreflightOperation, $State, [string]$Root)
         Test-BRAVODeploymentPreflight -Operation $PreflightOperation -RuntimeRoot $Root -StateRoot ([string]$Paths.StateRoot) -LockRoot ([string]$Paths.LockRoot) `
@@ -1411,7 +1439,7 @@ function Invoke-BRAVOUpdateCliAction {
         'Plan' {
             if ([string]::IsNullOrEmpty($Operation)) { return (& $usage 'Для -Action Plan потрібен -Operation Install|Update|Repair' '') }
             $built = Invoke-BRAVOUpdateCliPlanStep -Operation $Operation -StateArguments $stateArguments -Paths $Paths -Adapter $Adapter -Tag $Tag -SourcePath $SourcePath `
-                -AllowPrerelease:$AllowPrerelease -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now
+                -AllowPrerelease:$AllowPrerelease -SelfTest $SelfTest -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now
             if ($null -eq $built.Plan) {
                 $failedPreflight = New-BRAVOUpdatePreflightResult -Operation $Operation -Findings @($built.Findings)
                 return (& $done (Get-BRAVOUpdateWorkerHintExitCode -Finding @($built.Findings)) $failedPreflight)
@@ -1505,7 +1533,7 @@ function Invoke-BRAVOUpdateCliAction {
         }
         default {
             return (Invoke-BRAVOUpdateCliMutation -Action $Action -StateArguments $stateArguments -Paths $Paths -Adapter $Adapter -Operations $Operations -Acquire $Acquire `
-                    -Tag $Tag -SourcePath $SourcePath -AllowPrerelease:$AllowPrerelease -BackupDestination $BackupDestination -Scope $Scope -PlanPath $PlanPath `
+                    -Tag $Tag -SourcePath $SourcePath -AllowPrerelease:$AllowPrerelease -SelfTest $SelfTest -BackupDestination $BackupDestination -Scope $Scope -PlanPath $PlanPath `
                     -ConfirmPlanId $ConfirmPlanId -NonInteractive:$NonInteractive -IsAdministrator $isAdmin -Prompt $Prompt -Report $Report `
                     -ElevatedLauncher $ElevatedLauncher -ScriptPath $ScriptPath -WorkRoot $WorkRoot -Downloader $Downloader -Now $Now -CandidateRoots $CandidateRoots)
         }

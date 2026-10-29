@@ -376,7 +376,10 @@ function New-BRAVODeploymentPlan {
         $InstallationState = $null,
         [hashtable]$Adapter = $null,
         [ValidateRange(1, 1440)][int]$TtlMinutes = 30,
-        [object]$Now = $null
+        [object]$Now = $null,
+        # Вибір self-test є частиною ПІДТВЕРДЖЕНОГО плану, а не вільною опцією запиту:
+        # Default = Include для Install/Update, Skip для Repair.
+        [ValidateSet('Default', 'Include', 'Skip')][string]$SelfTest = 'Default'
     )
     $findings = New-Object System.Collections.Generic.List[object]
     $nowUtc = Get-BRAVOUpdatePlanNow -Now $Now -Adapter $Adapter
@@ -590,10 +593,15 @@ function New-BRAVODeploymentPlan {
         [pscustomobject][ordered]@{ id = 'SchedulerReconcile'; title = 'Звірка планувальника задач' }
     )
     $skipped = @()
-    if ($Action -eq 'Repair') {
-        $skipped = @([pscustomobject][ordered]@{ id = 'SelfTest'; title = 'Self-test'; reason = 'Відновлення не змінює версію; повний self-test не запускається, цілісність перевіряють guard і валідація.' })
-    } else {
+    $includeSelfTest = ($Action -ne 'Repair')
+    if ($SelfTest -eq 'Include') { $includeSelfTest = $true }
+    if ($SelfTest -eq 'Skip') { $includeSelfTest = $false }
+    if ($includeSelfTest) {
         $planned += [pscustomobject][ordered]@{ id = 'SelfTest'; title = 'Self-test' }
+    } else {
+        $selfTestReason = 'вимкнено оператором'
+        if ($SelfTest -eq 'Default') { $selfTestReason = 'Відновлення не змінює версію; повний self-test не запускається, цілісність перевіряють guard і валідація.' }
+        $skipped = @([pscustomobject][ordered]@{ id = 'SelfTest'; title = 'Self-test'; reason = $selfTestReason })
     }
 
     $preserved = @(
