@@ -253,6 +253,12 @@ function Get-BRAVOUpdateOpenJournal {
                 $finding = New-BRAVOUpdateFinding -Id 'Journal.Open' -Severity Blocker -Title 'Знайдено незавершену операцію оновлення' `
                     -Meaning 'Нові операції заблоковано, доки попередню не відновлено.' -Action 'Запустіть відновлення (Recovery) для цієї операції.' -Details ("operationId=$baseName")
                 $entries.Add([pscustomobject]@{ OperationId = $baseName; Path = $file.FullName; State = 'Open'; IsCorrupt = $false; Journal = $read.Journal; Problems = @(); Finding = $finding })
+            } elseif ([string]$read.Journal.state -ceq 'Critical') {
+                # Critical = відкат не вдався, сервер у невизначеному стані: блокує нові
+                # операції так само, як Open; автоматичного виходу в v1 немає.
+                $finding = New-BRAVOUpdateFinding -Id 'Journal.Critical' -Severity Blocker -Title 'Попередня операція завершилась критичною помилкою' `
+                    -Meaning 'Відкат не вдався, сервер може бути у невизначеному стані; нові операції заблоковано.' -Action 'Потрібне ручне втручання: збережіть журнал і backup операції та зверніться до адміністратора.' -Details ("operationId=$baseName")
+                $entries.Add([pscustomobject]@{ OperationId = $baseName; Path = $file.FullName; State = 'Critical'; IsCorrupt = $false; Journal = $read.Journal; Problems = @(); Finding = $finding })
             }
             continue
         }

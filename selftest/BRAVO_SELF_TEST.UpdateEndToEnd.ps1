@@ -277,7 +277,7 @@ try {
         }
         function Invoke-T1Recovery {
             param($Sandbox, [hashtable]$Fault = $null)
-            $arguments = @{ StateRoot = $Sandbox.State; LockRoot = $Sandbox.Lock; OperationLockPath = $Sandbox.OpLock; Adapter = $Sandbox.Adapter; VersionStatePath = $Sandbox.VersionState }
+            $arguments = @{ StateRoot = $Sandbox.State; LockRoot = $Sandbox.Lock; OperationLockPath = $Sandbox.OpLock; Adapter = $Sandbox.Adapter; VersionStatePath = $Sandbox.VersionState; RuntimeRoot = $Sandbox.Runtime; StagingRoot = $Sandbox.Staging; BackupRoot = $Sandbox.Backup }
             if ($null -ne $Fault) { $arguments['FaultInjection'] = $Fault }
             return (Invoke-BRAVORecovery @arguments)
         }

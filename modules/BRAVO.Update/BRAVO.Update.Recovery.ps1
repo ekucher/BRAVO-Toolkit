@@ -185,7 +185,13 @@ function Invoke-BRAVORecovery {
         [Parameter(Mandatory = $true)][string]$OperationLockPath,
         [Parameter(Mandatory = $true)][hashtable]$Adapter,
         [string]$VersionStatePath = '',
-        [hashtable]$FaultInjection = $null
+        [hashtable]$FaultInjection = $null,
+        # Корені engine для перевірки довіри до журналу (Test-BRAVORollbackJournalTrust).
+        # RuntimeRoot — виявлена установка (worker/CLI); без нього відкат Update/Repair
+        # відмовляє (fail closed). Staging/Backup за замовчуванням — Get-BRAVOUpdateDefaultPaths.
+        [string]$RuntimeRoot = '',
+        [string]$StagingRoot = '',
+        [string]$BackupRoot = ''
     )
 
     $startedUtc = Get-BRAVOUpdateUtcNowText
@@ -236,16 +242,38 @@ function Invoke-BRAVORecovery {
             return (New-BRAVOUpdateRecoveryResult -OperationId $entryOperationId -Status Critical -Findings $found -JournalPath ([string]$entry.Path) -StartedUtc $startedUtc)
         }
 
+        if ([string]$entry.State -ceq 'Critical') {
+            # Журнал Critical: попередній відкат не вдався. Автоматичне відновлення (і повторний
+            # відкат) у v1 не виконується: потрібне ручне втручання, жодних змін не вносимо.
+            return (New-BRAVOUpdateRecoveryResult -OperationId $entryOperationId -Status Critical -Findings @($entry.Finding) -JournalPath ([string]$entry.Path) -StartedUtc $startedUtc)
+        }
+
         $journal = $entry.Journal
         $journalPath = [string]$entry.Path
         $operationId = [string]$journal.operationId
+        # Довіра до журналу ДО будь-якої дії (прибирання staging/backup, відкат, задачі, state):
+        # журнал пише й непривілегований користувач. Недовірений -> Critical без змін.
+        if ([string]::IsNullOrWhiteSpace($StagingRoot)) { $StagingRoot = [string](Get-BRAVOUpdateDefaultPaths).StagingRoot }
+        if ([string]::IsNullOrWhiteSpace($BackupRoot)) { $BackupRoot = [string](Get-BRAVOUpdateDefaultPaths).BackupRoot }
+        $trustArguments = @{ Journal = $journal; StateRoot = $StateRoot; RuntimeRoot = $RuntimeRoot; StagingRoot = $StagingRoot; BackupRoot = $BackupRoot; LockRoot = $LockRoot; JournalPath = $journalPath }
+        # До mutation корінь установки не використовується (лише прибирання staging/backup).
+        if (($journal.mutationStarted -ne $true) -and [string]::IsNullOrWhiteSpace($RuntimeRoot)) { $trustArguments['AllowUnsuppliedRoots'] = $true; $trustArguments['StagingRoot'] = $StagingRoot; $trustArguments['BackupRoot'] = $BackupRoot }
+        $recoveryTrust = Test-BRAVORollbackJournalTrust @trustArguments
+        if (-not $recoveryTrust.IsTrusted) {
+            $untrusted = New-BRAVOUpdateFinding -Id 'Recovery.JournalUntrusted' -Severity Blocker `
+                -Title 'Журнал незавершеної операції не пройшов перевірку довіри' `
+                -Meaning 'Шляхи в журналі не відповідають кореням engine (журнал могли підмінити); жодних змін не внесено.' `
+                -Action 'Не запускайте відновлення з цього журналу; збережіть його й зверніться до адміністратора.' `
+                -Details (@($recoveryTrust.Problems) -join '; ') -ExitCodeHint 82
+            return (New-BRAVOUpdateRecoveryResult -OperationId $entryOperationId -Status Critical -Findings @($untrusted) -JournalPath $journalPath -StartedUtc $startedUtc)
+        }
         Send-BRAVORecoveryProgress -StateRoot $StateRoot -OperationId $operationId -Status Started -MessageKey 'Recovery.Started' -Message 'Відновлення після перерваної операції.'
         Invoke-BRAVORecoveryFaultPoint -FaultInjection $FaultInjection -Name 'Recovery.Start'
 
         if ($journal.mutationStarted -ne $true) {
             return (Invoke-BRAVORecoveryAbandon -Journal $journal -JournalPath $journalPath -StateRoot $StateRoot -FaultInjection $FaultInjection -StartedUtc $startedUtc)
         }
-        return (Invoke-BRAVORecoveryRollback -Journal $journal -JournalPath $journalPath -StateRoot $StateRoot -LockRoot $LockRoot -OperationLockPath $OperationLockPath -Adapter $Adapter -VersionStatePath $VersionStatePath -FaultInjection $FaultInjection -StartedUtc $startedUtc)
+        return (Invoke-BRAVORecoveryRollback -Journal $journal -JournalPath $journalPath -StateRoot $StateRoot -LockRoot $LockRoot -OperationLockPath $OperationLockPath -Adapter $Adapter -VersionStatePath $VersionStatePath -FaultInjection $FaultInjection -RuntimeRoot $RuntimeRoot -StagingRoot $StagingRoot -BackupRoot $BackupRoot -StartedUtc $startedUtc)
     } catch {
         if (Test-BRAVORecoveryIsSimulatedCrash -ErrorRecord $_) { throw }
         # Неочікуваний збій ДО mutation-кроків: журнал лишається Open, можна повторити.
@@ -324,7 +352,10 @@ function Invoke-BRAVORecoveryRollback {
         [Parameter(Mandatory = $true)][hashtable]$Adapter,
         [string]$VersionStatePath = '',
         [AllowNull()]$FaultInjection,
-        [Parameter(Mandatory = $true)][string]$StartedUtc
+        [Parameter(Mandatory = $true)][string]$StartedUtc,
+        [string]$RuntimeRoot = '',
+        [string]$StagingRoot = '',
+        [string]$BackupRoot = ''
     )
 
     $operationId = [string]$Journal.operationId
@@ -344,6 +375,10 @@ function Invoke-BRAVORecoveryRollback {
             LockRoot          = $LockRoot
             OperationLockPath = $OperationLockPath
             VersionStatePath  = $VersionStatePath
+            RuntimeRoot       = $RuntimeRoot
+            StagingRoot       = $StagingRoot
+            BackupRoot        = $BackupRoot
+            JournalPath       = $JournalPath
         }
         if ($null -ne $FaultInjection) { $rollbackArguments['FaultInjection'] = $FaultInjection }
         $rollbackResult = Invoke-BRAVORollback @rollbackArguments

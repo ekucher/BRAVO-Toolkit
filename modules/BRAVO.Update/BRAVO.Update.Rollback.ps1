@@ -462,6 +462,120 @@ function Restore-BRAVOVersionState {
 # Відкат clean install (ENGINE_DESIGN §9.3)
 # ---------------------------------------------------------------------------
 
+function Test-BRAVORollbackJournalTrust {
+    <#
+    .SYNOPSIS
+        ЄДИНИЙ валідатор довіри до журналу перед відкатом/recovery:
+        { IsTrusted, Problems[] }. Не кидає і не має побічних ефектів.
+    .DESCRIPTION
+        Журнал лежить у каталозі, куди може писати непривілегований користувач;
+        elevated відкат довіряє шляхам із нього. Тому до будь-якої дії (файли,
+        задачі, state, дочірні процеси) перевіряється:
+        - operationId = GUID у нижньому регістрі й збігається з іменем файлу
+          журналу (якщо -JournalPath задано);
+        - stagingRoot/backupRoot журналу == корені, передані викликачем
+          (production: Get-BRAVOUpdateDefaultPaths), backup.path == <BackupRoot>\<opId>;
+        - versionState.snapshotPath, schedulerSnapshot.path (і deployKeys.path, якщо є)
+          строго всередині <StateRoot>\Operations\<opId>;
+        - runtimeRoot: Update/Repair == корінь, переданий викликачем; Install —
+          Test-BRAVOInstallRuntimeRootPolicy (непорожність кореня при відкаті
+          очікувана і не є помилкою).
+        -AllowUnsuppliedRoots: корені, яких викликач не передав, не порівнюються
+        (лише для внутрішнього виклику, коли Invoke-BRAVORollback уже перевірив усе).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Journal,
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [string]$RuntimeRoot = '',
+        [string]$StagingRoot = '',
+        [string]$BackupRoot = '',
+        [string]$LockRoot = '',
+        [string]$JournalPath = '',
+        [switch]$AllowUnsuppliedRoots
+    )
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $sameRoot = {
+        param([string]$Left, [string]$Right)
+        if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) { return $false }
+        try { return [string]::Equals((Get-BRAVOUpdateFullPath -Path $Left), (Get-BRAVOUpdateFullPath -Path $Right), [StringComparison]::OrdinalIgnoreCase) } catch { return $false }
+    }
+    $operationId = [string](Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'operationId' -Default '')
+    if (-not (Test-BRAVOUpdateGuidText -Value $operationId)) {
+        [void]$problems.Add('operationId журналу не є GUID у нижньому регістрі.')
+        return [pscustomobject]@{ IsTrusted = $false; Problems = @($problems.ToArray()) }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($JournalPath)) {
+        $journalDirectory = Get-BRAVOUpdateJournalDirectory -StateRoot $StateRoot
+        if (([IO.Path]::GetFileName($JournalPath) -cne ($operationId + '.json')) -or -not (Test-BRAVOUpdatePathIsUnder -Path $JournalPath -Root $journalDirectory)) {
+            [void]$problems.Add('operationId не збігається з іменем файлу журналу або файл поза каталогом журналів.')
+        }
+    }
+    $operationDirectory = Get-BRAVORollbackOperationDirectory -StateRoot $StateRoot -OperationId $operationId
+    $action = [string](Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'action' -Default '')
+
+    $rootChecks = @(
+        @{ Name = 'stagingRoot'; Supplied = $StagingRoot; Value = [string](Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'stagingRoot' -Default '') },
+        @{ Name = 'backupRoot'; Supplied = $BackupRoot; Value = [string](Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'backupRoot' -Default '') }
+    )
+    foreach ($check in $rootChecks) {
+        if ([string]::IsNullOrWhiteSpace($check.Supplied)) {
+            if (-not $AllowUnsuppliedRoots) { [void]$problems.Add("Корінь $($check.Name) не передано викликачем: довіряти журналу не можна.") }
+        } elseif (-not (& $sameRoot $check.Value $check.Supplied)) {
+            [void]$problems.Add("journal.$($check.Name) ('$($check.Value)') не збігається з коренем engine ('$($check.Supplied)').")
+        }
+    }
+    $backup = Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'backup'
+    if ($null -ne $backup) {
+        $backupPath = [string](Get-BRAVOUpdatePropertyValue -InputObject $backup -Name 'path' -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($BackupRoot)) {
+            if (-not (& $sameRoot $backupPath (Join-Path $BackupRoot $operationId))) { [void]$problems.Add("journal.backup.path ('$backupPath') не дорівнює <BackupRoot>\<operationId>.") }
+        } elseif (-not $AllowUnsuppliedRoots) {
+            [void]$problems.Add('BackupRoot не передано: backup.path перевірити неможливо.')
+        }
+    }
+    $insideChecks = @(
+        @{ Name = 'versionState.snapshotPath'; Value = [string](Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'versionState') -Name 'snapshotPath' -Default '') },
+        @{ Name = 'schedulerSnapshot.path'; Value = [string](Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'schedulerSnapshot') -Name 'path' -Default '') },
+        @{ Name = 'deployKeys.path'; Value = [string](Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'deployKeys') -Name 'path' -Default '') }
+    )
+    foreach ($check in $insideChecks) {
+        if ([string]::IsNullOrWhiteSpace($check.Value)) { continue }
+        if (-not (Test-BRAVOUpdatePathIsUnder -Path $check.Value -Root $operationDirectory)) {
+            [void]$problems.Add("journal.$($check.Name) ('$($check.Value)') поза каталогом операції $operationDirectory.")
+        }
+    }
+
+    $journalRuntime = [string](Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'runtimeRoot' -Default '')
+    if ([string]::IsNullOrWhiteSpace($journalRuntime)) {
+        [void]$problems.Add('У журналі немає runtimeRoot.')
+    } elseif ($action -ceq 'Install') {
+        if ((-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) -and -not (& $sameRoot $journalRuntime $RuntimeRoot)) {
+            [void]$problems.Add("journal.runtimeRoot ('$journalRuntime') не збігається з коренем установки викликача ('$RuntimeRoot').")
+        } elseif ([string]::IsNullOrWhiteSpace($RuntimeRoot) -and -not $AllowUnsuppliedRoots) {
+            [void]$problems.Add('Корінь установки не передано викликачем.')
+        }
+        if ($null -eq (Get-Command -Name 'Test-BRAVOInstallRuntimeRootPolicy' -CommandType Function -ErrorAction SilentlyContinue)) {
+            [void]$problems.Add('Test-BRAVOInstallRuntimeRootPolicy недоступна: політику кореня перевірити неможливо (fail closed).')
+        } else {
+            $policy = Test-BRAVOInstallRuntimeRootPolicy -RuntimeRoot $journalRuntime -StateRoot $StateRoot -StagingRoot $StagingRoot -BackupRoot $BackupRoot -LockRoot $LockRoot
+            foreach ($policyProblem in @($policy.Problems)) {
+                # Корінь, що вже містить створену установку, при відкаті — норма.
+                if ([string]$policyProblem -like '*вже існує і не порожній*') { continue }
+                [void]$problems.Add('Політика кореня установки: ' + [string]$policyProblem)
+            }
+        }
+    } else {
+        if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+            if (-not (& $sameRoot $journalRuntime $RuntimeRoot)) { [void]$problems.Add("journal.runtimeRoot ('$journalRuntime') не збігається з виявленим коренем установки ('$RuntimeRoot').") }
+        } elseif (-not $AllowUnsuppliedRoots) {
+            [void]$problems.Add('Корінь установки не передано викликачем: runtimeRoot із журналу не можна довіряти.')
+        }
+    }
+    return [pscustomobject]@{ IsTrusted = ($problems.Count -eq 0); Problems = @($problems.ToArray()) }
+}
+
 function Invoke-BRAVOInstallRollback {
     <#
     .SYNOPSIS
@@ -485,9 +599,18 @@ function Invoke-BRAVOInstallRollback {
     param(
         [Parameter(Mandatory = $true)]$Journal,
         [Parameter(Mandatory = $true)][hashtable]$Adapter,
-        [Parameter(Mandatory = $true)][string]$StateRoot
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [string]$RuntimeRoot = '',
+        [string]$StagingRoot = '',
+        [string]$BackupRoot = '',
+        [string]$LockRoot = ''
     )
 
+    # Довіра до журналу ДО будь-якої дії (задачі, файли): див. Test-BRAVORollbackJournalTrust.
+    $trust = Test-BRAVORollbackJournalTrust -Journal $Journal -StateRoot $StateRoot -RuntimeRoot $RuntimeRoot -StagingRoot $StagingRoot -BackupRoot $BackupRoot -LockRoot $LockRoot -AllowUnsuppliedRoots
+    if (-not $trust.IsTrusted) {
+        return [pscustomobject]@{ Success = $false; Removed = @(); Left = @(); OurRemaining = @(); Findings = @(); Problems = @($trust.Problems) }
+    }
     $removed = New-Object System.Collections.Generic.List[string]
     $left = New-Object System.Collections.Generic.List[string]
     $ours = New-Object System.Collections.Generic.List[string]
@@ -684,7 +807,8 @@ function Test-BRAVORollbackBackupFiles {
         [Parameter(Mandatory = $true)]$Layout,
         [Parameter(Mandatory = $true)][hashtable]$DeployKeys,
         [string[]]$ExcludeFiles = @(),
-        [string[]]$ExcludeDirs = @()
+        [string[]]$ExcludeDirs = @(),
+        [string]$Action = ''
     )
 
     $problems = New-Object System.Collections.Generic.List[string]
@@ -718,7 +842,13 @@ function Test-BRAVORollbackBackupFiles {
         if ([IO.File]::Exists((Resolve-BRAVODeployTargetPath -Root $RuntimeRoot -Key $safeKey))) { [void]$problems.Add('зайвий (додано розгортанням): ' + $safeKey) }
     }
     $backupManifest = Join-Path $Layout.RuntimeDir 'RUNTIME_MANIFEST.json'
-    if ([IO.File]::Exists($backupManifest)) {
+    if ($Action -ceq 'Repair') {
+        # Repair пошкодженого runtime: до-операційний стан НЕ відповідає здоровому
+        # RUNTIME_MANIFEST.json, тож еталон — сам backup (backup-manifest.json: той самий
+        # формат files{ключ:SHA}); runtime лишається пошкодженим РІВНО як до repair.
+        $match = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $RuntimeRoot -ManifestPath $Layout.ManifestPath -ExcludeDirs $ExcludeDirs
+        foreach ($problem in @($match.Problems)) { [void]$problems.Add([string]$problem) }
+    } elseif ([IO.File]::Exists($backupManifest)) {
         $match = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $RuntimeRoot -ManifestPath $backupManifest -ExcludeDirs $ExcludeDirs
         foreach ($problem in @($match.Problems)) { [void]$problems.Add([string]$problem) }
     } else {
@@ -753,13 +883,25 @@ function Invoke-BRAVORollback {
         [string]$LockRoot = '',
         [Parameter(Mandatory = $true)][string]$OperationLockPath,
         [Parameter(Mandatory = $true)][string]$VersionStatePath,
-        [AllowNull()]$FaultInjection = $null
+        [AllowNull()]$FaultInjection = $null,
+        # Корені engine для перевірки довіри до журналу (Test-BRAVORollbackJournalTrust).
+        # Порожні -> Context.Paths; staging/backup далі -> Get-BRAVOUpdateDefaultPaths.
+        # RuntimeRoot без Context викликач (worker/CLI/Recovery) ЗОБОВ'ЯЗАНИЙ передати.
+        [string]$RuntimeRoot = '',
+        [string]$StagingRoot = '',
+        [string]$BackupRoot = '',
+        [string]$JournalPath = ''
     )
 
     $startedUtc = Get-BRAVOUpdateUtcNowText
     $operationId = [string]$Journal.operationId
+    $trustedOperationId = $operationId
+    if (-not (Test-BRAVOUpdateGuidText -Value $operationId)) { $trustedOperationId = '00000000-0000-0000-0000-000000000000' }
     $action = [string]$Journal.action
-    $journalPath = Get-BRAVOUpdateJournalPath -StateRoot $StateRoot -OperationId $operationId
+    $journalFilePath = $null
+    if ($trustedOperationId -ceq $operationId) { $journalFilePath = Get-BRAVOUpdateJournalPath -StateRoot $StateRoot -OperationId $operationId }
+    $planForResult = [string]$Journal.planId
+    if (-not (Test-BRAVOUpdateGuidText -Value $planForResult)) { $planForResult = $null }
     $findings = New-Object System.Collections.Generic.List[object]
     $validation = New-Object System.Collections.Generic.List[object]
 
@@ -769,13 +911,13 @@ function Invoke-BRAVORollback {
         if ($Status -eq 'RolledBack') { $rollbackStatus = 'Succeeded' } elseif ($Status -eq 'Critical') { $rollbackStatus = 'Failed' }
         $installed = $null
         if ($Status -eq 'RolledBack') { $installed = Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'sourceVersion' }
-        New-BRAVOUpdateDeploymentResult -OperationId $operationId -PlanId ([string]$Journal.planId) -Action 'Rollback' -Status $Status -ReasonCode $Reason `
+        New-BRAVOUpdateDeploymentResult -OperationId $trustedOperationId -PlanId $planForResult -Action 'Rollback' -Status $Status -ReasonCode $Reason `
             -SourceVersion (Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'sourceVersion') `
             -TargetVersion (Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'targetVersion') -InstalledVersion $installed `
             -LastPhase $LastPhase -MutationStarted ([bool]$Journal.mutationStarted) -Validation @($validation.ToArray()) `
             -Rollback ([pscustomobject][ordered]@{ attempted = ($Status -ne 'Failed'); status = $rollbackStatus; message = $Message }) `
             -TaskActivation ([pscustomobject][ordered]@{ state = $ActivationState; tasks = @() }) `
-            -Findings @($findings.ToArray()) -JournalPath $journalPath -StartedUtc $startedUtc
+            -Findings @($findings.ToArray()) -JournalPath $journalFilePath -StartedUtc $startedUtc
     }
     $lastPhaseName = {
         $names = @($Journal.phases)
@@ -790,6 +932,29 @@ function Invoke-BRAVORollback {
             -Meaning 'Engine не виконує відкат із вимкненим захистом від зниження версії; нічого не змінено.' `
             -Action 'Приберіть змінну BRAVO_ALLOW_DOWNGRADE зі середовища процесу й повторіть відновлення.' -ExitCodeHint 35))
         return (& $buildResult 'Failed' 'Blocked' 'Відкат не виконано: встановлено BRAVO_ALLOW_DOWNGRADE.' 'Unchanged' $null)
+    }
+
+    # Довіра до журналу — ДО будь-якої дії. Журнал пише й непривілегований користувач,
+    # тож шляхи з нього (runtimeRoot, backup, знімки) перевіряються проти коренів engine.
+    # Недовірений журнал -> Critical БЕЗ жодних побічних ефектів: ні задач (adapter), ні
+    # файлів, ні state, ні дочірніх процесів, ні запису в сам журнал (його шлях виводиться
+    # з operationId, якому довіряти не можна).
+    $contextPaths = Get-BRAVOUpdatePropertyValue -InputObject $Context -Name 'Paths'
+    $defaultPaths = Get-BRAVOUpdateDefaultPaths
+    $trustRuntime = $RuntimeRoot
+    if ([string]::IsNullOrWhiteSpace($trustRuntime)) { $trustRuntime = [string](Get-BRAVOUpdatePropertyValue -InputObject $contextPaths -Name 'RuntimeRoot' -Default '') }
+    $trustStaging = $StagingRoot
+    if ([string]::IsNullOrWhiteSpace($trustStaging)) { $trustStaging = [string](Get-BRAVOUpdatePropertyValue -InputObject $contextPaths -Name 'StagingRoot' -Default '') }
+    if ([string]::IsNullOrWhiteSpace($trustStaging)) { $trustStaging = [string]$defaultPaths.StagingRoot }
+    $trustBackup = $BackupRoot
+    if ([string]::IsNullOrWhiteSpace($trustBackup)) { $trustBackup = [string](Get-BRAVOUpdatePropertyValue -InputObject $contextPaths -Name 'BackupRoot' -Default '') }
+    if ([string]::IsNullOrWhiteSpace($trustBackup)) { $trustBackup = [string]$defaultPaths.BackupRoot }
+    $trust = Test-BRAVORollbackJournalTrust -Journal $Journal -StateRoot $StateRoot -RuntimeRoot $trustRuntime -StagingRoot $trustStaging -BackupRoot $trustBackup -LockRoot $LockRoot -JournalPath $JournalPath
+    if (-not $trust.IsTrusted) {
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Rollback.JournalUntrusted' -Severity Blocker -Title 'Журнал операції не пройшов перевірку довіри: відкат не виконано' `
+            -Meaning 'Шляхи в журналі не відповідають кореням engine (журнал могли підмінити); жодних змін не зроблено.' `
+            -Action 'Не запускайте відновлення з цього журналу; зверніться до адміністратора й перевірте каталог журналів.' -Details ($trust.Problems -join '; ') -ExitCodeHint 82))
+        return (& $buildResult 'Critical' '' ('Недовірений журнал: ' + ($trust.Problems -join '; ')) 'Unchanged' $null)
     }
 
     $state = [string]$Journal.state
@@ -839,6 +1004,31 @@ function Invoke-BRAVORollback {
             $rb.OwnedLock = $lock
         })
 
+        # Знімок scheduler читається ДО будь-яких змін (потрібен і quiesce, і RestoreTasks).
+        $schedulerSnapshot = $null
+        $snapshotRef = Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'schedulerSnapshot'
+        $snapshotFile = [string](Get-BRAVOUpdatePropertyValue -InputObject $snapshotRef -Name 'path' -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($snapshotFile)) { $schedulerSnapshot = Read-BRAVORollbackJsonFile -Path $snapshotFile }
+        $rb.SchedulerSnapshot = $schedulerSnapshot
+
+        # Крок 1б: durable quiesce ПЕРЕД будь-якою зміною файлів, на кожному (пере)запуску.
+        # Після crash між Activate і Committed (або у Rollback.RestoreTasks) задачі можуть
+        # бути УВІМКНЕНІ: відкат файлів під працюючими задачами дав би змішаний runtime.
+        # Вимикаємо все керованe, перечитуємо живий стан; не підтверджено -> збій (Critical).
+        [void](& $step 'Rollback.QuiesceTasks' {
+            $disableArguments = @{ Adapter = $rb.Adapter; RuntimeRoot = $rb.RuntimeRoot }
+            if ($null -ne $rb.SchedulerSnapshot) { $disableArguments.Snapshot = $rb.SchedulerSnapshot }
+            $disableResult = Disable-BRAVOAllManagedTasks @disableArguments
+            if (-not [bool](Get-BRAVOUpdatePropertyValue -InputObject $disableResult -Name 'IsComplete' -Default $false)) {
+                throw ('Не вдалося вимкнути керовані задачі перед відкатом: ' + (@(Get-BRAVOUpdatePropertyValue -InputObject $disableResult -Name 'Failed' -Default @() | ForEach-Object { [string](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'message' -Default '') }) -join '; '))
+            }
+            $live = Get-BRAVOSchedulerSnapshot -Adapter $rb.Adapter -RuntimeRoot $rb.RuntimeRoot
+            $stillEnabled = @(@(Get-BRAVOUpdatePropertyValue -InputObject $live -Name 'tasks' -Default @()) | Where-Object { [bool](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'exists' -Default $false) -and [bool](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'enabled' -Default $false) })
+            if ($stillEnabled.Count -gt 0) {
+                throw ('Після вимкнення задачі лишаються увімкненими: ' + (@($stillEnabled | ForEach-Object { [string](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'name' -Default '') }) -join ', '))
+            }
+        })
+
         if ($action -ceq 'Install') {
             # Крок 2: відкат install (§9.3).
             [void](& $step 'Rollback.InstallCleanup' {
@@ -868,6 +1058,31 @@ function Invoke-BRAVORollback {
                 $rb.DeployKeys = $keys
                 $stagedRoot = [string](Get-BRAVOUpdatePropertyValue -InputObject $rb.Journal -Name 'stagingRoot' -Default '')
                 if ([string]::IsNullOrWhiteSpace($stagedRoot)) { $stagedRoot = $rb.Layout.Directory }
+                # Backup перевіряється ДО першої зміни runtime: manifest за хешем із журналу,
+                # байти копії за manifest-ом (підміна backup не має стати джерелом відновлення).
+                if ([string]::IsNullOrWhiteSpace($rb.Layout.ManifestSha256)) { throw 'У журналі немає SHA-256 backup-manifest.json: backup не можна довести.' }
+                $backupCheck = Test-BRAVORuntimeBackup -BackupPath $rb.Layout.Directory -ManifestPath $rb.Layout.ManifestPath -ExpectedManifestSha256 $rb.Layout.ManifestSha256
+                if (-not $backupCheck.IsValid) { throw ('Backup не пройшов перевірку, відновлення зупинено без змін: ' + ((@($backupCheck.Problems) | Select-Object -First 5) -join '; ')) }
+                # Reparse-перевірка КОЖНОЇ складової шляхів runtime і backup для ключів, які
+                # буде скопійовано/видалено: File.Copy/Delete йдуть крізь junction, а
+                # Resolve-BRAVODeployTargetPath перевіряє лише лексично. Будь-який reparse
+                # = fail closed ДО першої зміни (перенаправлені цілі не чіпаються).
+                $siteFiles = @($rb.SiteOwned.Files)
+                $siteDirs = @($rb.SiteOwned.Dirs)
+                $ownedKeys = @(Get-BRAVODeployOwnedKeys -StagedRoot $stagedRoot -BackupRoot $rb.Layout.RuntimeDir -ExcludeFiles $siteFiles -ExcludeDirs $siteDirs -OwnedKeyList @($keys.Keys))
+                $redirected = New-Object System.Collections.Generic.List[string]
+                $runtimeBase = Get-BRAVOUpdateFullPath -Path $rb.RuntimeRoot
+                $backupBase = Get-BRAVOUpdateFullPath -Path $rb.Layout.RuntimeDir
+                foreach ($ownedKey in $ownedKeys) {
+                    $runtimeTarget = Resolve-BRAVODeployTargetPath -Root $runtimeBase -Key $ownedKey
+                    $backupTarget = Resolve-BRAVODeployTargetPath -Root $backupBase -Key $ownedKey
+                    if ((Test-BRAVOUpdatePathHasReparsePoint -Path $runtimeTarget -StopAt $runtimeBase) -or (Test-BRAVOUpdatePathHasReparsePoint -Path $backupTarget -StopAt $backupBase)) {
+                        [void]$redirected.Add($ownedKey)
+                    }
+                }
+                if ($redirected.Count -gt 0) {
+                    throw ('Шлях містить reparse point (junction/symlink), відновлення зупинено без змін: ' + ((@($redirected.ToArray()) | Select-Object -First 5) -join ', '))
+                }
                 $report = Invoke-BRAVODeployExactRestore -RuntimeRoot $rb.RuntimeRoot -BackupRoot $rb.Layout.RuntimeDir -StagedRoot $stagedRoot `
                     -ExcludeFiles @($rb.SiteOwned.Files) -ExcludeDirs @($rb.SiteOwned.Dirs) -OwnedKeyList @($keys.Keys)
                 if (@($report.Errors).Count -gt 0) { throw ('Точне відновлення файлів завершилося помилками: ' + (@($report.Errors) -join '; ')) }
@@ -891,21 +1106,17 @@ function Invoke-BRAVORollback {
                 if ($null -eq $rb.Layout) { return }
                 $keys = $rb.DeployKeys
                 if ($null -eq $keys) { $keys = Get-BRAVORollbackDeployKeySet -Journal $rb.Journal -OperationDirectory $rb.OperationDirectory }
-                $problems = @(Test-BRAVORollbackBackupFiles -RuntimeRoot $rb.RuntimeRoot -Layout $rb.Layout -DeployKeys $keys -ExcludeFiles @($rb.SiteOwned.Files) -ExcludeDirs @($rb.SiteOwned.Dirs))
+                $problems = @(Test-BRAVORollbackBackupFiles -RuntimeRoot $rb.RuntimeRoot -Layout $rb.Layout -DeployKeys $keys -ExcludeFiles @($rb.SiteOwned.Files) -ExcludeDirs @($rb.SiteOwned.Dirs) -Action $rb.Action)
                 if ($problems.Count -gt 0) { throw ('Верифікація відкату не пройшла: ' + ($problems -join '; ')) }
             })
-
-            $schedulerSnapshot = $null
-            $snapshotRef = Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'schedulerSnapshot'
-            $snapshotFile = [string](Get-BRAVOUpdatePropertyValue -InputObject $snapshotRef -Name 'path' -Default '')
-            if (-not [string]::IsNullOrWhiteSpace($snapshotFile)) { $schedulerSnapshot = Read-BRAVORollbackJsonFile -Path $snapshotFile }
-            $rb.SchedulerSnapshot = $schedulerSnapshot
 
             # Крок 6: scheduler лише якщо ConfigureScheduler мав intent.
             $configureIntent = $false
             foreach ($phaseEntry in @($Journal.phases)) { if ([string]$phaseEntry.phase -ceq 'ConfigureScheduler') { $configureIntent = $true } }
             if ($configureIntent) {
                 [void](& $step 'Rollback.Scheduler' {
+                    # Mandatory-параметри передаємо ЗАВЖДИ явно: $null у Mandatory = запит у консолі.
+                    if ($null -eq $rb.SchedulerSnapshot) { throw 'Знімок scheduler відсутній: повторне налаштування неможливе.' }
                     $reconcile = Invoke-BRAVOSchedulerReconcile -Context $rb.Context -Snapshot $rb.SchedulerSnapshot
                     if (([string]$reconcile.Verdict) -ceq 'FAIL') { throw ('Повторне налаштування scheduler зі старого runtime не вдалося: ' + (@($reconcile.Problems) -join '; ')) }
                 })
@@ -914,10 +1125,19 @@ function Invoke-BRAVORollback {
             # Крок 7: валідація відкату.
             [void](& $step 'Rollback.Validate' {
                 $baseline = Get-BRAVOUpdatePropertyValue -InputObject $rb.Journal -Name 'baseline'
-                $arguments = @{ Context = $rb.Context; Mode = 'Rollback'; ExpectedVersion = [string](Get-BRAVOUpdatePropertyValue -InputObject $rb.Journal -Name 'sourceVersion' -Default '') }
-                if ($null -ne $rb.Layout) { $arguments.ExpectedManifestPath = (Join-Path $rb.Layout.RuntimeDir 'RUNTIME_MANIFEST.json') }
+                # Усі Mandatory-параметри Test-BRAVODeploymentValidation передаються явно (інакше
+                # Mandatory без значення = інтерактивний запит). Без backup (Repair -Scope
+                # Scheduler) файли не змінювались: еталон — власний RUNTIME_MANIFEST.json runtime.
+                $expectedVersion = [string](Get-BRAVOUpdatePropertyValue -InputObject $rb.Journal -Name 'sourceVersion' -Default '')
+                if ([string]::IsNullOrWhiteSpace($expectedVersion)) { $expectedVersion = [string](Get-BRAVOUpdatePropertyValue -InputObject $rb.Journal -Name 'targetVersion' -Default '') }
+                $manifestPath = Join-Path $rb.RuntimeRoot 'RUNTIME_MANIFEST.json'
+                if ($null -ne $rb.Layout) {
+                    $manifestPath = Join-Path $rb.Layout.RuntimeDir 'RUNTIME_MANIFEST.json'
+                    # Repair: пошкоджений до-операційний стан звіряється з backup-manifest.json.
+                    if ($rb.Action -ceq 'Repair') { $manifestPath = $rb.Layout.ManifestPath }
+                }
                 $site = Get-BRAVOUpdatePropertyValue -InputObject $baseline -Name 'siteConfig'
-                if ($null -ne $site) { $arguments.SiteBaseline = $site }
+                $arguments = @{ Context = $rb.Context; Mode = 'Rollback'; ExpectedVersion = $expectedVersion; ExpectedManifestPath = $manifestPath; SiteBaseline = $site }
                 $guardBaseline = Get-BRAVOUpdatePropertyValue -InputObject $baseline -Name 'guardExitCode'
                 if (($rb.Action -ceq 'Repair') -and ($null -ne $guardBaseline)) { $arguments.GuardBaselineExitCode = [int]$guardBaseline }
                 $verdict = Test-BRAVODeploymentValidation @arguments
@@ -955,6 +1175,11 @@ function Invoke-BRAVORollback {
     }
 
     if ($null -eq $criticalMessage) {
+        if ($action -ceq 'Repair') {
+            [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Repair.RuntimeStillDamaged' -Severity Warning -Title 'Repair не виконано: runtime лишився пошкодженим, як і до repair' `
+                -Meaning 'Відкат повернув стан до початку repair; пошкодження, через які його запускали, не усунуто.' `
+                -Action 'Повторіть Repair після усунення причини збою.'))
+        }
         return (& $buildResult 'RolledBack' '' 'Попередній стан відновлено й перевірено.' $activation (& $lastPhaseName))
     }
 
