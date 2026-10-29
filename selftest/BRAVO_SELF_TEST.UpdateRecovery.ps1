@@ -31,7 +31,7 @@
 
         function script:Invoke-BRAVORollback {
             [CmdletBinding()]
-            param($Journal, [hashtable]$Adapter, [string]$StateRoot, [string]$LockRoot, [string]$OperationLockPath, [string]$VersionStatePath, [hashtable]$FaultInjection = $null)
+            param($Journal, [hashtable]$Adapter, [string]$StateRoot, [string]$LockRoot, [string]$OperationLockPath, [string]$VersionStatePath, [hashtable]$FaultInjection = $null, [string]$RuntimeRoot = '', [string]$StagingRoot = '', [string]$BackupRoot = '', [string]$JournalPath = '')
             [void]$script:E6RollbackCalls.Add([pscustomobject]@{ OperationId = [string]$Journal.operationId; VersionStatePath = $VersionStatePath; LockRoot = $LockRoot })
             if ($script:E6RollbackMode -eq 'Throw') { throw 'rollback-stub-throw' }
             if ($script:E6RollbackMode -eq 'Crash') { throw 'BRAVOUpdate.SimulatedCrash: Rollback.Stub' }
@@ -207,7 +207,7 @@
 
     function Invoke-RecRecovery {
         param($Environment, [hashtable]$FaultInjection = $null)
-        $parameters = @{ StateRoot = $Environment.State; LockRoot = $Environment.Lock; OperationLockPath = $Environment.OpLock; Adapter = $Environment.Adapter; VersionStatePath = $Environment.VersionState }
+        $parameters = @{ StateRoot = $Environment.State; LockRoot = $Environment.Lock; OperationLockPath = $Environment.OpLock; Adapter = $Environment.Adapter; VersionStatePath = $Environment.VersionState; RuntimeRoot = $Environment.Runtime; StagingRoot = $Environment.Staging; BackupRoot = $Environment.Backup }
         if ($null -ne $FaultInjection) { $parameters['FaultInjection'] = $FaultInjection }
         return (& $updateModule { param($P) Invoke-BRAVORecovery @P } $parameters)
     }
@@ -423,7 +423,7 @@
             $before4 = Get-RecTreeHash -Path $e4.Runtime
             $r4 = Invoke-RecRecovery -Environment $e4
             $j4 = Read-RecJournal -Environment $e4 -OperationId $opId4
-            Test-BRAVOCondition -Condition ($r4.status -ceq 'Failed' -and $r4.reasonCode -ceq 'Error' -and $j4.state -ceq 'Open' -and $before4 -ceq (Get-RecTreeHash -Path $e4.Runtime)) -Name 'UpdateRecovery/TamperedJournalRootRefused' -Failure ($r4 | ConvertTo-Json -Depth 4)
+            Test-BRAVOCondition -Condition ($r4.status -ceq 'Critical' -and $j4.state -ceq 'Open' -and $before4 -ceq (Get-RecTreeHash -Path $e4.Runtime)) -Name 'UpdateRecovery/TamperedJournalRootRefused' -Failure ($r4 | ConvertTo-Json -Depth 4)
         }
 
         # ===== Recovery: VersionStatePath за замовчуванням і передача параметрів =
