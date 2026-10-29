@@ -106,6 +106,11 @@ $writeArchiveEarlyExitStatus = {
         # невизначений стан — fail-closed: не пишемо, лише лог.
         $earlyLockStream = $null
         try {
+            # Як в Enter-BRAVOArchiveProcessLock: на свіжій установці каталогу lock ще немає.
+            $earlyLockDirectory = Split-Path -Path ([string]$operationLockSettings.Path) -Parent
+            if (-not (Test-Path -LiteralPath $earlyLockDirectory -PathType Container)) {
+                [void](New-Item -ItemType Directory -Path $earlyLockDirectory -Force -ErrorAction Stop)
+            }
             $earlyLockStream = [System.IO.File]::Open([string]$operationLockSettings.Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
         } catch {
             throw 'operation lock зайнятий іншим екземпляром або недоступний — статус не записано (захист від перезапису статусу іншого екземпляра)'

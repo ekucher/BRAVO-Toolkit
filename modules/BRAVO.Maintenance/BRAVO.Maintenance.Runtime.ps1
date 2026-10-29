@@ -159,6 +159,11 @@ function Write-BRAVOMaintenanceEarlyExitStatus {
         }
         $earlyLockStream = $null
         try {
+            # Як в Enter-BRAVOMaintenanceOperationLock: на свіжій установці каталогу lock ще немає.
+            $earlyLockDirectory = Split-Path -Path $earlyLockPath -Parent
+            if (-not (Test-Path -LiteralPath $earlyLockDirectory -PathType Container)) {
+                [void](New-Item -ItemType Directory -Path $earlyLockDirectory -Force -ErrorAction Stop)
+            }
             $earlyLockStream = [System.IO.File]::Open($earlyLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
         } catch {
             throw 'operation lock зайнятий іншим екземпляром або недоступний — статус не записано (захист від перезапису статусу іншого екземпляра)'

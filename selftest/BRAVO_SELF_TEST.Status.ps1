@@ -172,7 +172,7 @@
     $archiveUnguardedStatusCount = 0
     foreach ($archiveRawStatusIndex in $archiveRawStatusIndexes) {
         $archiveGuardIndex = $archiveStatusText.LastIndexOf($archiveSyncBazaGuardText, $archiveRawStatusIndex)
-        if ($archiveGuardIndex -lt 0 -or ($archiveRawStatusIndex - $archiveGuardIndex) -gt 1500) {
+        if ($archiveGuardIndex -lt 0 -or ($archiveRawStatusIndex - $archiveGuardIndex) -gt 2200) {
             $archiveUnguardedStatusCount++
         }
     }
@@ -358,8 +358,8 @@
             @(Compare-Object -ReferenceObject $statusArchiveExpectedNumericExits -DifferenceObject $statusArchiveNumericExits).Count -eq 0 -and
             $statusArchiveBlockIndex -ge 0 -and
             $statusArchiveBlockIndex -lt $statusArchiveText.IndexOf('& $writeArchiveEarlyExitStatus 30 ''ConfigurationLoad''') -and
-            $statusArchiveText.Substring($statusArchiveBlockIndex, 1800) -match '(?s)try\s*\{.*Write-BRAVOOperationStatus.*\}\s*catch\s*\{.*Write-Log' -and
-            $statusArchiveText.Substring($statusArchiveBlockIndex, 1800).Contains('(Test-Path variable:SyncBAZA) -and $SyncBAZA')
+            $statusArchiveText.Substring($statusArchiveBlockIndex, 3000) -match '(?s)try\s*\{.*Write-BRAVOOperationStatus.*\}\s*catch\s*\{.*Write-Log' -and
+            $statusArchiveText.Substring($statusArchiveBlockIndex, 3000).Contains('(Test-Path variable:SyncBAZA) -and $SyncBAZA')
         ) `
         -Name 'Status/ArchiveEarlyExitsWriteStatus' `
         -Failure "Archive: ранні виходи конфігурації (#478) мають писати статус через `$writeArchiveEarlyExitStatus перед буквальним Exit; пари: $($statusArchiveEarlyPairs -join ','); числові exit: $($statusArchiveNumericExits -join ',')"
@@ -387,16 +387,23 @@
         )
         foreach ($statusEarlyCase in $statusEarlyCases) {
             $statusEarlyResults = @()
-            foreach ($statusEarlyMode in 'valid', 'locked', 'unwritable', 'undefined') {
+            foreach ($statusEarlyMode in 'valid', 'locked', 'nolockdir', 'unwritable', 'undefined') {
                 $statusEarlyStateRoot = Join-Path $statusEarlyBehaviorRoot ("{0}-{1}" -f $statusEarlyCase.Label, $statusEarlyMode)
                 $statusEarlyScriptPath = Join-Path $statusEarlyBehaviorRoot ("early-{0}-{1}.ps1" -f $statusEarlyCase.Label, $statusEarlyMode)
                 # ARCH-001: спільний operation lock (файл; Open ReadWrite/FileShare.Read,
                 # як в Enter-*OperationLock). 'locked' — його утримує цей (інший) процес.
                 $statusEarlyLockDirectory = Join-Path $statusEarlyBehaviorRoot ("lock-{0}-{1}" -f $statusEarlyCase.Label, $statusEarlyMode)
-                [void](New-Item -ItemType Directory -Path $statusEarlyLockDirectory -Force)
+                # 'nolockdir' — свіжа установка: каталогу lock немає, helper має створити його сам.
+                if ($statusEarlyMode -eq 'nolockdir') {
+                    $statusEarlyLockDirectory = Join-Path $statusEarlyLockDirectory 'Locks'
+                } else {
+                    [void](New-Item -ItemType Directory -Path $statusEarlyLockDirectory -Force)
+                }
+                $statusEarlyLockDirExistedBefore = [IO.Directory]::Exists($statusEarlyLockDirectory)
                 $statusEarlyLockPath = Join-Path $statusEarlyLockDirectory 'BRAVO_OPERATION.lock'
                 $statusEarlyStateLine = switch ($statusEarlyMode) {
                     'valid' { '$stateRoot = ''{0}''' -f $statusEarlyStateRoot }
+                    'nolockdir' { '$stateRoot = ''{0}''' -f $statusEarlyStateRoot }
                     'locked' { '$stateRoot = ''{0}''' -f $statusEarlyStateRoot }
                     'unwritable' { '$stateRoot = ''{0}''' -f $statusEarlyFileRoot }
                     default { '' }
@@ -437,6 +444,8 @@
                 $statusEarlyResults += [pscustomobject]@{
                     Mode = $statusEarlyMode
                     Unchanged = $statusEarlyUnchanged
+                    LockDirExistedBefore = $statusEarlyLockDirExistedBefore
+                    LockDirExistsAfter = [IO.Directory]::Exists($statusEarlyLockDirectory)
                     Exit = $statusEarlyExit
                     Status = if ($null -ne $statusEarlyParsed -and -not $statusEarlyParsed.Corrupt) { [string]$statusEarlyParsed.State.status } else { '' }
                     Early = if ($null -ne $statusEarlyParsed -and -not $statusEarlyParsed.Corrupt) { ($null -ne $statusEarlyParsed.State.details.PSObject.Properties['earlyTermination']) } else { $false }
@@ -444,12 +453,16 @@
                 }
             }
             $statusEarlyValid = $statusEarlyResults | Where-Object { $_.Mode -eq 'valid' }
+            $statusEarlyNoDir = $statusEarlyResults | Where-Object { $_.Mode -eq 'nolockdir' }
             Test-BRAVOCondition `
                 -Condition (
                     @($statusEarlyResults | Where-Object { $_.Exit -ne $statusEarlyCase.Code }).Count -eq 0 -and
                     $statusEarlyValid.Status -ceq 'ERROR' -and $statusEarlyValid.Early -and $statusEarlyValid.Schema -eq 1 -and
                     # ARCH-001: lock утримує інший процес -> існуючий статус не змінено (байти до == після).
-                    [bool]($statusEarlyResults | Where-Object { $_.Mode -eq 'locked' }).Unchanged
+                    [bool]($statusEarlyResults | Where-Object { $_.Mode -eq 'locked' }).Unchanged -and
+                    # Свіжа установка: каталогу lock не було заздалегідь -> helper створив його і записав статус.
+                    -not [bool]$statusEarlyNoDir.LockDirExistedBefore -and [bool]$statusEarlyNoDir.LockDirExistsAfter -and
+                    $statusEarlyNoDir.Status -ceq 'ERROR' -and $statusEarlyNoDir.Early -and $statusEarlyNoDir.Schema -eq 1
                 ) `
                 -Name "Status/EarlyExitHelperBehavior[$($statusEarlyCase.Label)]" `
                 -Failure "$($statusEarlyCase.Label): helper раннього виходу має записати ERROR/schema 1 (valid) і зберегти exit code $($statusEarlyCase.Code) також при недоступному/невизначеному stateRoot; факт: $(($statusEarlyResults | ForEach-Object { '{0}:exit={1},status={2}' -f $_.Mode, $_.Exit, $_.Status }) -join '; ')"
